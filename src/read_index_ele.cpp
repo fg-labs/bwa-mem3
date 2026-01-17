@@ -28,14 +28,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 *****************************************************************************************/
 
 #include "read_index_ele.h"
-#ifdef __cplusplus
-extern "C" {
-#endif
-#include "safe_mem_lib.h"
-#include "safe_str_lib.h"
-#ifdef __cplusplus
-}
-#endif
+#include "safestringlib.h"
 
 indexEle::indexEle()
 {

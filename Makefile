@@ -38,12 +38,34 @@ ifeq ($(CXX), icpc)
 	CC= icc
 else ifeq ($(CXX), g++)
 	CC=gcc
-endif		
-ARCH_FLAGS=	-msse -msse2 -msse3 -mssse3 -msse4.1
+endif
+
+# Detect architecture
+UNAME_M := $(shell uname -m)
+UNAME_S := $(shell uname -s)
+
+# ARM/Apple Silicon support
+ifeq ($(UNAME_M),arm64)
+    ARCH_FLAGS = -DAPPLE_SILICON=1
+    # sse2neon flags - define SSE feature macros for translation
+    SSE2NEON_FLAGS = -D__SSE__=1 -D__SSE2__=1 -D__SSE3__=1 -D__SSSE3__=1 -D__SSE4_1__=1 -D__SSE4_2__=1
+    SSE2NEON_INCLUDES = -Iext/sse2neon
+    CPPFLAGS += $(SSE2NEON_FLAGS)
+    INCLUDES += $(SSE2NEON_INCLUDES)
+    # Apple Silicon uses 128-byte cache lines
+    CPPFLAGS += -DCACHE_LINE_BYTES=128
+    # Link Accelerate framework on macOS for potential BLAS/vecLib usage
+    ifeq ($(UNAME_S),Darwin)
+        LIBS_EXTRA = -framework Accelerate
+    endif
+else
+    ARCH_FLAGS = -msse -msse2 -msse3 -mssse3 -msse4.1
+endif
+
 MEM_FLAGS=	-DSAIS=1
-CPPFLAGS+=	-DENABLE_PREFETCH -DV17=1 -DMATE_SORT=0 $(MEM_FLAGS) 
-INCLUDES=   -Isrc -Iext/safestringlib/include
-LIBS=		-lpthread -lm -lz -L. -lbwa -Lext/safestringlib -lsafestring $(STATIC_GCC)
+CPPFLAGS+=	-DENABLE_PREFETCH -DV17=1 -DMATE_SORT=0 $(MEM_FLAGS)
+INCLUDES+=   -Isrc -Iext/safestringlib/include
+LIBS=		-lpthread -lm -lz -L. -lbwa -Lext/safestringlib -lsafestring $(STATIC_GCC) $(LIBS_EXTRA)
 OBJS=		src/fastmap.o src/bwtindex.o src/utils.o src/memcpy_bwamem.o src/kthread.o \
 			src/kstring.o src/ksw.o src/bntseq.o src/bwamem.o src/profiling.o src/bandedSWA.o \
 			src/FMI_search.o src/read_index_ele.o src/bwamem_pair.o src/kswv.o src/bwa.o \
@@ -51,6 +73,8 @@ OBJS=		src/fastmap.o src/bwtindex.o src/utils.o src/memcpy_bwamem.o src/kthread.
 BWA_LIB=    libbwa.a
 SAFE_STR_LIB=    ext/safestringlib/libsafestring.a
 
+# Architecture-specific builds (x86 only, ARM uses default from above)
+ifneq ($(UNAME_M),arm64)
 ifeq ($(arch),sse41)
 	ifeq ($(CXX), icpc)
 		ARCH_FLAGS=-msse4.1
@@ -58,7 +82,7 @@ ifeq ($(arch),sse41)
 		ARCH_FLAGS=-msse -msse2 -msse3 -mssse3 -msse4.1
 	endif
 else ifeq ($(arch),sse42)
-	ifeq ($(CXX), icpc)	
+	ifeq ($(CXX), icpc)
 		ARCH_FLAGS=-msse4.2
 	else
 		ARCH_FLAGS=-msse -msse2 -msse3 -mssse3 -msse4.1 -msse4.2
@@ -66,19 +90,19 @@ else ifeq ($(arch),sse42)
 else ifeq ($(arch),avx)
 	ifeq ($(CXX), icpc)
 		ARCH_FLAGS=-mavx ##-xAVX
-	else	
+	else
 		ARCH_FLAGS=-mavx
 	endif
 else ifeq ($(arch),avx2)
 	ifeq ($(CXX), icpc)
 		ARCH_FLAGS=-march=core-avx2 #-xCORE-AVX2
-	else	
+	else
 		ARCH_FLAGS=-mavx2
 	endif
 else ifeq ($(arch),avx512)
 	ifeq ($(CXX), icpc)
 		ARCH_FLAGS=-xCORE-AVX512
-	else	
+	else
 		ARCH_FLAGS=-mavx512bw
 	endif
 else ifeq ($(arch),native)
@@ -88,6 +112,16 @@ else ifneq ($(arch),)
 	ARCH_FLAGS=$(arch)
 else
 myall:multi
+endif
+endif
+
+# ARM64/Apple Silicon single-binary build
+ifeq ($(UNAME_M),arm64)
+ifeq ($(arch),arm64)
+    ARCH_FLAGS = -DAPPLE_SILICON=1
+else ifeq ($(arch),)
+myall:arm64
+endif
 endif
 
 CXXFLAGS+=	-g -O3 -fpermissive $(ARCH_FLAGS) #-Wall ##-xSSE2
@@ -101,6 +135,10 @@ CXXFLAGS+=	-g -O3 -fpermissive $(ARCH_FLAGS) #-Wall ##-xSSE2
 all:$(EXE)
 
 multi:
+ifeq ($(UNAME_M),arm64)
+	@echo "ARM64 detected - building single arm64 binary instead of multi"
+	$(MAKE) arm64
+else
 	rm -f src/*.o $(BWA_LIB); cd ext/safestringlib/ && $(MAKE) clean;
 	$(MAKE) arch=sse41    EXE=bwa-mem2.sse41    CXX=$(CXX) all
 	rm -f src/*.o $(BWA_LIB); cd ext/safestringlib/ && $(MAKE) clean;
@@ -112,6 +150,13 @@ multi:
 	rm -f src/*.o $(BWA_LIB); cd ext/safestringlib/ && $(MAKE) clean;
 	$(MAKE) arch=avx512 EXE=bwa-mem2.avx512bw CXX=$(CXX) all
 	$(CXX) -Wall -O3 src/runsimd.cpp -Iext/safestringlib/include -Lext/safestringlib/ -lsafestring $(STATIC_GCC) -o bwa-mem2
+endif
+
+# ARM64/Apple Silicon build target - single binary, no multi-binary launcher needed
+arm64:
+	rm -f src/*.o $(BWA_LIB); cd ext/safestringlib/ && $(MAKE) clean;
+	$(MAKE) arch=arm64 EXE=bwa-mem2.arm64 CXX=$(CXX) all
+	ln -sf bwa-mem2.arm64 bwa-mem2
 
 
 $(EXE):$(BWA_LIB) $(SAFE_STR_LIB) src/main.o
@@ -120,12 +165,37 @@ $(EXE):$(BWA_LIB) $(SAFE_STR_LIB) src/main.o
 $(BWA_LIB):$(OBJS)
 	ar rcs $(BWA_LIB) $(OBJS)
 
+# On macOS, safestringlib needs stdlib.h for abort() and the memset_s
+# declaration conflicts with macOS C11 Annex K (different signature).
+SAFE_EXTRA_CFLAGS =
+ifeq ($(UNAME_S),Darwin)
+    SAFE_EXTRA_CFLAGS = -include stdlib.h -Dmemset_s=_safestringlib_memset_s
+endif
+
 $(SAFE_STR_LIB):
-	cd ext/safestringlib/ && $(MAKE) clean && $(MAKE) CC=$(CC) directories libsafestring.a
+	cd ext/safestringlib/ && $(MAKE) clean && $(MAKE) CC=$(CC) CFLAGS="-Iinclude -Isafeclib $(SAFE_EXTRA_CFLAGS) -fstack-protector-strong -fPIE -fPIC -O2" directories libsafestring.a
 
 clean:
-	rm -fr src/*.o $(BWA_LIB) $(EXE) bwa-mem2.sse41 bwa-mem2.sse42 bwa-mem2.avx bwa-mem2.avx2 bwa-mem2.avx512bw
+	rm -fr src/*.o $(BWA_LIB) $(EXE) bwa-mem2.sse41 bwa-mem2.sse42 bwa-mem2.avx bwa-mem2.avx2 bwa-mem2.avx512bw bwa-mem2.arm64
 	cd ext/safestringlib/ && $(MAKE) clean
+
+# Profile-Guided Optimization (PGO) targets for Apple Silicon
+# Usage: make pgo-generate && <run training workload> && make pgo-use
+PGO_PROFILE_DIR=pgo_profiles
+
+pgo-generate:
+	rm -f src/*.o $(BWA_LIB); cd ext/safestringlib/ && $(MAKE) clean;
+	$(MAKE) arch=arm64 EXE=bwa-mem2.pgo-instr CXXFLAGS="-g -O3 -fpermissive $(ARCH_FLAGS) -fprofile-generate=$(PGO_PROFILE_DIR)" CXX=$(CXX) all
+	@echo "PGO instrumented binary built. Run training workload with bwa-mem2.pgo-instr"
+	@echo "Then run: make pgo-use"
+
+pgo-use:
+	rm -f src/*.o $(BWA_LIB); cd ext/safestringlib/ && $(MAKE) clean;
+	$(MAKE) arch=arm64 EXE=bwa-mem2.pgo CXXFLAGS="-g -O3 -fpermissive $(ARCH_FLAGS) -fprofile-use=$(PGO_PROFILE_DIR) -fprofile-correction" CXX=$(CXX) all
+	@echo "PGO optimized binary built: bwa-mem2.pgo"
+
+pgo-clean:
+	rm -rf $(PGO_PROFILE_DIR) bwa-mem2.pgo-instr bwa-mem2.pgo
 
 depend:
 	(LC_ALL=C; export LC_ALL; makedepend -Y -- $(CXXFLAGS) $(CPPFLAGS) -I. -- src/*.cpp)

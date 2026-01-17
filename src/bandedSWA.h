@@ -36,12 +36,20 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include <assert.h>
 #include "macro.h"
 
-#if (__AVX512BW__ || __AVX2__)
-#include <immintrin.h>
+/* SIMD compatibility layer for ARM/x86 */
+#if defined(__ARM_NEON) || defined(__aarch64__) || defined(APPLE_SILICON)
+    /* ARM/Apple Silicon - use sse2neon for SSE translation */
+    #include "simd_compat.h"
+#elif (__AVX512BW__ || __AVX2__)
+    #include <immintrin.h>
 #else
-#include <smmintrin.h>  // for SSE4.1
-#define __mmask8 uint8_t
-#define __mmask16 uint16_t
+    #include <smmintrin.h>  // for SSE4.1
+    #ifndef __mmask8
+    #define __mmask8 uint8_t
+    #endif
+    #ifndef __mmask16
+    #define __mmask16 uint16_t
+    #endif
 #endif
 
 #define MAX_SEQ_LEN_REF 256
@@ -55,25 +63,32 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 
 
 // SIMD_WIDTH in bits
+// ARM64/NEON (128-bit vectors)
+#if defined(__ARM_NEON) || defined(__aarch64__) || defined(APPLE_SILICON)
+#ifndef SIMD_WIDTH8
+#define SIMD_WIDTH8 16    // 128-bit / 8-bit = 16 elements
+#endif
+#ifndef SIMD_WIDTH16
+#define SIMD_WIDTH16 8    // 128-bit / 16-bit = 8 elements
+#endif
+
 // AVX2
-#if ((!__AVX512BW__) & (__AVX2__))
+#elif ((!__AVX512BW__) & (__AVX2__))
 #define SIMD_WIDTH8 32
 #define SIMD_WIDTH16 16
-#endif
 
 // AVX512
-#if __AVX512BW__
+#elif __AVX512BW__
 #define SIMD_WIDTH8 64
 #define SIMD_WIDTH16 32
-#endif
 
-#if ((!__AVX512BW__) & (!__AVX2__) & (__SSE2__))
+// SSE2
+#elif ((!__AVX512BW__) & (!__AVX2__) & (__SSE2__))
 #define SIMD_WIDTH8 16
 #define SIMD_WIDTH16 8
-#endif
 
 // Scalar
-#if ((!__AVX512BW__) & (!__AVX2__) & (!__SSE2__))
+#else
 #define SIMD_WIDTH8 1
 #define SIMD_WIDTH16 1
 #endif
@@ -134,9 +149,10 @@ public:
                                 int nthreads,
                                 int32_t w);
 
-#if ((!__AVX512BW__) & (!__AVX2__) & (__SSE2__))
-    // AVX256 is not updated for banding and separate ins/del in the inner loop.
-    // 8 bit vector code section    
+#if (defined(__ARM_NEON) || defined(__aarch64__) || defined(APPLE_SILICON)) || ((!__AVX512BW__) & (!__AVX2__) & (__SSE2__))
+    // On ARM: use SSE2 path via sse2neon translation
+    // On x86 SSE2: native SSE2 implementation
+    // 8 bit vector code section
     void getScores8(SeqPair *pairArray,
                     uint8_t *seqBufRef,
                     uint8_t *seqBufQer,
@@ -191,8 +207,9 @@ public:
                              uint16_t qlen[],
                              uint16_t myband[]);
     
-#endif  //SSE2
+#endif  // ARM/SSE2
 
+#if !defined(__ARM_NEON) && !defined(__aarch64__) && !defined(APPLE_SILICON)
 #if ((!__AVX512BW__) & (__AVX2__))
     // AVX256 is not updated for banding and separate ins/del in the inner loop.
     // 8 bit vector code section    
@@ -250,8 +267,10 @@ public:
                              uint16_t qlen[],
                              uint16_t myband[]);
     
-#endif  //axv2
+#endif  //avx2
+#endif  // !ARM guard for AVX2
 
+#if !defined(__ARM_NEON) && !defined(__aarch64__) && !defined(APPLE_SILICON)
 #if __AVX512BW__
     // 8 bit vector code section    
     void getScores8(SeqPair *pairArray,
@@ -308,7 +327,8 @@ public:
                              int32_t w,
                              uint16_t qlen[],
                              uint16_t myband[]);
-#endif
+#endif  // __AVX512BW__
+#endif  // !ARM guard for AVX512
 
     int64_t getTicks();
     

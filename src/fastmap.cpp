@@ -48,6 +48,81 @@ int affy[256];
 extern uint64_t tprof[LIM_R][LIM_C];
 // ---------------
 
+#if defined(__ARM_NEON) || defined(__aarch64__) || defined(APPLE_SILICON)
+/* ARM/Apple Silicon - no CPUID instruction, use system calls */
+
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#endif
+
+void __cpuid(unsigned int i, unsigned int cpuid[4]) {
+    /* ARM doesn't have CPUID - return zeros */
+    cpuid[0] = cpuid[1] = cpuid[2] = cpuid[3] = 0;
+}
+
+/* Get L2 cache size in bytes (for dynamic tuning) */
+static int64_t get_l2_cache_size() {
+#ifdef __APPLE__
+    int64_t l2_size = 0;
+    size_t size = sizeof(l2_size);
+    if (sysctlbyname("hw.l2cachesize", &l2_size, &size, NULL, 0) == 0) {
+        return l2_size;
+    }
+#endif
+    return 4 * 1024 * 1024;  /* Default 4MB */
+}
+
+/* Get optimal batch size based on L2 cache */
+int get_dynamic_batch_size() {
+    int64_t l2_size = get_l2_cache_size();
+    /* Heuristic: ~1KB working set per read pair, use 1/4 of L2 for batching
+     * to leave room for other data structures */
+    int batch_size = (int)(l2_size / 4 / 1024);
+    /* Clamp to reasonable range */
+    if (batch_size < 256) batch_size = 256;
+    if (batch_size > 4096) batch_size = 4096;
+    /* Round down to power of 2 for alignment */
+    int pow2 = 256;
+    while (pow2 * 2 <= batch_size) pow2 *= 2;
+    return pow2;
+}
+
+int HTStatus()
+{
+    /* ARM/Apple Silicon doesn't have hyperthreading in the x86 sense.
+     * Apple Silicon has P-cores and E-cores, which we handle differently.
+     * Return 0 to indicate no HT (we handle core types via QoS instead).
+     */
+#ifdef __APPLE__
+    int pcore_count = 0, ecore_count = 0;
+    size_t size = sizeof(int);
+
+    /* Try to get P-core and E-core counts on Apple Silicon */
+    if (sysctlbyname("hw.perflevel0.physicalcpu", &pcore_count, &size, NULL, 0) == 0) {
+        sysctlbyname("hw.perflevel1.physicalcpu", &ecore_count, &size, NULL, 0);
+        fprintf(stderr, "Platform vendor: Apple Silicon.\n");
+        fprintf(stderr, "P-cores: %d, E-cores: %d\n", pcore_count, ecore_count);
+    } else {
+        /* Fallback for older macOS or non-Apple Silicon */
+        int total_cores = 0;
+        sysctlbyname("hw.physicalcpu", &total_cores, &size, NULL, 0);
+        fprintf(stderr, "Platform: ARM64, Physical CPUs: %d\n", total_cores);
+    }
+
+    /* Report L2 cache and dynamic batch size */
+    int64_t l2_size = get_l2_cache_size();
+    int dynamic_batch = get_dynamic_batch_size();
+    fprintf(stderr, "L2 Cache: %lld MB, Dynamic batch size: %d (compile-time: %d)\n",
+            l2_size / (1024 * 1024), dynamic_batch, BATCH_SIZE);
+#else
+    fprintf(stderr, "Platform vendor: ARM64.\n");
+#endif
+    return 0;  /* No hyperthreading on ARM */
+}
+
+#else
+/* x86 CPUID implementation */
+
 void __cpuid(unsigned int i, unsigned int cpuid[4]) {
 #ifdef _WIN32
     __cpuid((int *) cpuid, (int)i);
@@ -94,6 +169,8 @@ int HTStatus()
 
     return ht;
 }
+
+#endif /* ARM vs x86 */
 
 
 /*** Memory pre-allocations ***/
@@ -392,6 +469,11 @@ static int process(void *shared, gzFile gfp, gzFile gfp2, int pipe_threads)
         numa_bind(mask);
         numa_bitmask_free(mask);
     }
+#else
+    /* Report platform info on non-NUMA systems (e.g., macOS/Apple Silicon) */
+#if defined(__ARM_NEON) || defined(__aarch64__) || defined(APPLE_SILICON)
+    HTStatus();
+#endif
 #endif
 #if AFF && (__linux__)
     { // Affinity/HT stuff

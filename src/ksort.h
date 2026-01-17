@@ -70,12 +70,19 @@
 #  include "malloc_wrap.h"
 #endif
 
+/* C++17 deprecates 'register' keyword - use empty macro */
+#if __cplusplus >= 201703L
+#define KSORT_REGISTER
+#else
+#define KSORT_REGISTER register
+#endif
+
 typedef struct {
 	void *left, *right;
 	int depth;
 } ks_isort_stack_t;
 
-#define KSORT_SWAP(type_t, a, b) { register type_t t=(a); (a)=(b); (b)=t; }
+#define KSORT_SWAP(type_t, a, b) { KSORT_REGISTER type_t t=(a); (a)=(b); (b)=t; }
 
 #define KSORT_INIT(name, type_t, __sort_lt)								\
 	void ks_mergesort_##name(size_t n, type_t array[], type_t temp[])	\

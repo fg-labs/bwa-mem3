@@ -49,13 +49,7 @@
 #endif
 
 #include "memcpy_bwamem.h"
-#ifdef __cplusplus
-extern "C" {
-#endif
-#include "safe_str_lib.h"
-#ifdef __cplusplus
-}
-#endif
+#include "safestringlib.h"
 
 #ifdef _WIN32
 #define _KO_NO_NET

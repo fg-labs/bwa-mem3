@@ -3360,12 +3360,20 @@ void BandedPairWiseSW::smithWaterman512_16(uint16_t seq1SoA[],
 /**************** SSE2 code ******************/
 #if ((!__AVX512BW__) && (!__AVX2__) && (__SSE2__))
 
-// SSE2 =- 16 bit version
+// SSE2/NEON - 16 bit blendv
 static inline __m128i
 _mm_blendv_epi16(__m128i x, __m128i y, __m128i mask)
 {
-    // Replace bit in x with bit in y when matching bit in mask is set:
+#if defined(__ARM_NEON) || defined(__aarch64__) || defined(APPLE_SILICON)
+    // Use NEON vbsl (bitwise select) - more efficient than AND/OR/ANDNOT
+    return vreinterpretq_m128i_s16(
+        vbslq_s16(vreinterpretq_u16_m128i(mask),
+                  vreinterpretq_s16_m128i(y),
+                  vreinterpretq_s16_m128i(x)));
+#else
+    // x86 SSE2: Replace bit in x with bit in y when matching bit in mask is set
     return _mm_or_si128(_mm_andnot_si128(mask, x), _mm_and_si128(mask, y));
+#endif
 }
 
 #define ZSCORE16(i4_128, y4_128)                                            \

@@ -39,7 +39,11 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "ksw.h"
 #include "bandedSWA.h"
 #else
-#include <immintrin.h>
+    #if defined(__ARM_NEON) || defined(__aarch64__) || defined(APPLE_SILICON)
+        #include "simd_compat.h"
+    #else
+        #include <immintrin.h>
+    #endif
 #endif
 
 #ifdef __GNUC__
@@ -67,9 +71,18 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 
 #define MAX_SEQ_LEN_EXT 256
 
-#if __AVX512BW__
-#define SIMD_WIDTH8 64
-#define SIMD_WIDTH16 32
+/* SIMD width definitions based on architecture */
+#if defined(__ARM_NEON) || defined(__aarch64__) || defined(APPLE_SILICON)
+    /* ARM/Apple Silicon - 128-bit NEON vectors */
+    #ifndef SIMD_WIDTH8
+    #define SIMD_WIDTH8 16   /* 128-bit / 8-bit = 16 elements */
+    #endif
+    #ifndef SIMD_WIDTH16
+    #define SIMD_WIDTH16 8   /* 128-bit / 16-bit = 8 elements */
+    #endif
+#elif __AVX512BW__
+    #define SIMD_WIDTH8 64
+    #define SIMD_WIDTH16 32
 #endif
 
 #define max(x, y) ((x)>(y)?(x):(y))
@@ -159,7 +172,47 @@ public:
 	kswq_t* ksw_qinit(int size, int qlen, uint8_t *query, int m, const int8_t *mat);
 	
 private:
-#if __AVX512BW__
+#if defined(__ARM_NEON) || defined(__aarch64__) || defined(APPLE_SILICON)
+	/* ARM/NEON implementations (native NEON for hot paths) */
+	void kswvBatchWrapper8(SeqPair *pairArray,
+						   uint8_t *seqBufRef,
+						   uint8_t *seqBufQer,
+						   kswr_t* aln,
+						   int32_t numPairs,
+						   uint16_t numThreads,
+						   int phase);
+
+	int kswv_neon_u8(uint8_t seq1SoA[],
+				     uint8_t seq2SoA[],
+				     int16_t nrow,
+				     int16_t ncol,
+				     SeqPair *p,
+				     kswr_t *aln,
+				     int po_ind,
+				     uint16_t tid,
+				     int32_t numPairs,
+				     int phase);
+
+	void kswvBatchWrapper16(SeqPair *pairArray,
+							uint8_t *seqBufRef,
+							uint8_t *seqBufQer,
+							kswr_t* aln,
+							int32_t numPairs,
+							uint16_t numThreads,
+							int phase);
+
+	int kswv_neon_16(int16_t seq1SoA[],
+                     int16_t seq2SoA[],
+                     int16_t nrow,
+                     int16_t ncol,
+                     SeqPair *p,
+                     kswr_t* aln,
+                     int po_ind,
+                     uint16_t tid,
+                     int32_t numPairs,
+                     int phase);
+
+#elif __AVX512BW__
 	void kswvBatchWrapper8(SeqPair *pairArray,
 						   uint8_t *seqBufRef,
 						   uint8_t *seqBufQer,
@@ -178,7 +231,7 @@ private:
 				   uint16_t tid,
 				   int32_t numPairs,
 				   int phase);
-    
+
 	void kswvBatchWrapper16(SeqPair *pairArray,
 							uint8_t *seqBufRef,
 							uint8_t *seqBufQer,
@@ -186,7 +239,7 @@ private:
 							int32_t numPairs,
 							uint16_t numThreads,
 							int phase);
-	
+
 	int kswv512_16(int16_t seq1SoA[],
                    int16_t seq2SoA[],
                    int16_t nrow,

@@ -34,8 +34,14 @@ Authors: Sanchit Misra <sanchit.misra@intel.com>; Vasimuddin Md <vasimuddin.md@i
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
-#include <immintrin.h>
 #include <limits.h>
+
+/* SIMD compatibility for ARM/x86 */
+#if defined(__ARM_NEON) || defined(__aarch64__) || defined(APPLE_SILICON)
+    #include "simd_compat.h"
+#else
+    #include <immintrin.h>
+#endif
 #include <fstream>
 
 #include "read_index_ele.h"

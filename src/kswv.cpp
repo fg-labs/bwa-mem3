@@ -33,6 +33,12 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "kswv.h"
 #include "limits.h"
 
+/* ARM/NEON support */
+#if defined(__ARM_NEON) || defined(__aarch64__) || defined(APPLE_SILICON)
+#include "neon_utils.h"
+#include "simd_compat.h"
+#endif
+
 
 // ------------------------------------------------------------------------------------
 // MACROs for vector code
@@ -160,7 +166,772 @@ kswv::~kswv() {
 }
 
 
-#if __AVX512BW__
+/*******************************************************************************
+ * ARM/NEON Implementation
+ * Native NEON for 128-bit vectors (16 x 8-bit or 8 x 16-bit elements)
+ * This provides optimized SIMD on Apple Silicon where sse2neon can't help
+ * (AVX-512 has no sse2neon translation)
+ ******************************************************************************/
+#if defined(__ARM_NEON) || defined(__aarch64__) || defined(APPLE_SILICON)
+
+void kswv::getScores8(SeqPair *pairArray,
+                      uint8_t *seqBufRef,
+                      uint8_t *seqBufQer,
+                      kswr_t* aln,
+                      int32_t numPairs,
+                      uint16_t numThreads,
+                      int phase)
+{
+    kswvBatchWrapper8(pairArray, seqBufRef, seqBufQer, aln,
+                      numPairs, numThreads, phase);
+}
+
+void kswv::kswvBatchWrapper8(SeqPair *pairArray,
+                             uint8_t *seqBufRef,
+                             uint8_t *seqBufQer,
+                             kswr_t* aln,
+                             int32_t numPairs,
+                             uint16_t numThreads,
+                             int phase)
+{
+    uint8_t *seq1SoA = NULL;
+    seq1SoA = (uint8_t *)_mm_malloc(this->maxRefLen * SIMD_WIDTH8 * numThreads * sizeof(uint8_t), 128);
+
+    uint8_t *seq2SoA = NULL;
+    seq2SoA = (uint8_t *)_mm_malloc(this->maxQerLen * SIMD_WIDTH8 * numThreads * sizeof(uint8_t), 128);
+
+    assert(seq1SoA != NULL);
+    assert(seq2SoA != NULL);
+
+    int32_t ii;
+    int32_t roundNumPairs = ((numPairs + SIMD_WIDTH8 - 1) / SIMD_WIDTH8) * SIMD_WIDTH8;
+
+    for (ii = numPairs; ii < roundNumPairs; ii++)
+    {
+        pairArray[ii].regid = ii;
+        pairArray[ii].id = ii;
+        pairArray[ii].len1 = 0;
+        pairArray[ii].len2 = 0;
+    }
+
+    {
+        int32_t i;
+        uint16_t tid = 0;   // forcing single thread
+        uint8_t *mySeq1SoA = seq1SoA + tid * this->maxRefLen * SIMD_WIDTH8;
+        uint8_t *mySeq2SoA = seq2SoA + tid * this->maxQerLen * SIMD_WIDTH8;
+        uint8_t *seq1;
+        uint8_t *seq2;
+
+        int nstart = 0, nend = numPairs;
+
+        for (i = nstart; i < nend; i += SIMD_WIDTH8)
+        {
+            int32_t j, k;
+            int maxLen1 = 0;
+            int maxLen2 = 0;
+
+            for (j = 0; j < SIMD_WIDTH8; j++)
+            {
+                SeqPair sp = pairArray[i + j];
+#if MAINY
+                seq1 = seqBufRef + (int64_t)sp.id * this->maxRefLen;
+#else
+                seq1 = seqBufRef + sp.idr;
+#endif
+                for (k = 0; k < sp.len1; k++)
+                {
+                    mySeq1SoA[k * SIMD_WIDTH8 + j] = (seq1[k] == AMBIG_ ? AMBR : seq1[k]);
+                }
+                if (maxLen1 < sp.len1) maxLen1 = sp.len1;
+            }
+            for (j = 0; j < SIMD_WIDTH8; j++)
+            {
+                SeqPair sp = pairArray[i + j];
+                for (k = sp.len1; k <= maxLen1; k++)
+                {
+                    mySeq1SoA[k * SIMD_WIDTH8 + j] = 0xFF;
+                }
+            }
+
+            for (j = 0; j < SIMD_WIDTH8; j++)
+            {
+                SeqPair sp = pairArray[i + j];
+#if MAINY
+                seq2 = seqBufQer + (int64_t)sp.id * this->maxQerLen;
+#else
+                seq2 = seqBufQer + sp.idq;
+#endif
+                int quanta = (sp.len2 + 16 - 1) / 16;
+                quanta *= 16;
+                for (k = 0; k < sp.len2; k++)
+                {
+                    mySeq2SoA[k * SIMD_WIDTH8 + j] = (seq2[k] == AMBIG_ ? AMBQ : seq2[k]);
+                }
+
+                for (k = sp.len2; k < quanta; k++)
+                {
+                    mySeq2SoA[k * SIMD_WIDTH8 + j] = DUMMY5;
+                }
+                if (maxLen2 < quanta) maxLen2 = quanta;
+            }
+
+            for (j = 0; j < SIMD_WIDTH8; j++)
+            {
+                SeqPair sp = pairArray[i + j];
+                int quanta = (sp.len2 + 16 - 1) / 16;
+                quanta *= 16;
+                for (k = quanta; k <= maxLen2; k++)
+                {
+                    mySeq2SoA[k * SIMD_WIDTH8 + j] = 0xFF;
+                }
+            }
+
+            kswv_neon_u8(mySeq1SoA, mySeq2SoA,
+                         maxLen1, maxLen2,
+                         pairArray + i,
+                         aln, i,
+                         tid,
+                         numPairs,
+                         phase);
+        }
+    }
+
+    _mm_free(seq1SoA);
+    _mm_free(seq2SoA);
+
+    return;
+}
+
+int kswv::kswv_neon_u8(uint8_t seq1SoA[],
+                       uint8_t seq2SoA[],
+                       int16_t nrow,
+                       int16_t ncol,
+                       SeqPair *p,
+                       kswr_t *aln,
+                       int po_ind,
+                       uint16_t tid,
+                       int32_t numPairs,
+                       int phase)
+{
+    int m_b, n_b;
+    uint8_t minsc[SIMD_WIDTH8] __attribute__((aligned(128))) = {0};
+    uint8_t endsc[SIMD_WIDTH8] __attribute__((aligned(128))) = {0};
+    uint64_t *b;
+
+    uint8x16_t zero_vec = vdupq_n_u8(0);
+    uint8x16_t one_vec = vdupq_n_u8(1);
+
+    m_b = n_b = 0; b = 0;
+
+    int8_t temp[SIMD_WIDTH8] __attribute((aligned(128))) = {0};
+
+    uint8_t shift = 127, mdiff = 0;
+    mdiff = max_(this->w_match, (int8_t)this->w_mismatch);
+    mdiff = max_(mdiff, (int8_t)this->w_ambig);
+    shift = min_(this->w_match, (int8_t)this->w_mismatch);
+    shift = min_((int8_t)shift, this->w_ambig);
+
+    shift = 256 - (uint8_t)shift;
+    mdiff += shift;
+
+    /* Build scoring table */
+    temp[0] = this->w_match;
+    temp[1] = temp[2] = temp[3] = this->w_mismatch;
+    temp[4] = temp[5] = temp[6] = temp[7] = this->w_ambig;
+    temp[8] = temp[9] = temp[10] = temp[11] = this->w_ambig;
+    temp[12] = this->w_ambig;
+
+    for (int i = 0; i < 16; i++)
+        temp[i] += shift;
+
+    uint8x16_t permSft = vld1q_u8((const uint8_t*)temp);
+    uint8x16_t sft_vec = vdupq_n_u8(shift);
+
+    uint16_t minsc_msk_a = 0x0000, endsc_msk_a = 0x0000;
+    int val = 0;
+    for (int i = 0; i < SIMD_WIDTH8; i++)
+    {
+        int xtra = p[i].h0;
+        val = (xtra & KSW_XSUBO) ? xtra & 0xffff : 0x10000;
+        if (val <= 255) {
+            minsc[i] = val;
+            minsc_msk_a |= (0x1 << i);
+        }
+        val = (xtra & KSW_XSTOP) ? xtra & 0xffff : 0x10000;
+        if (val <= 255) {
+            endsc[i] = val;
+            endsc_msk_a |= (0x1 << i);
+        }
+    }
+
+    uint8x16_t minsc_vec = vld1q_u8(minsc);
+    uint8x16_t endsc_vec = vld1q_u8(endsc);
+
+    uint8x16_t e_del_vec = vdupq_n_u8(this->e_del);
+    uint8x16_t oe_del_vec = vdupq_n_u8(this->o_del + this->e_del);
+    uint8x16_t e_ins_vec = vdupq_n_u8(this->e_ins);
+    uint8x16_t oe_ins_vec = vdupq_n_u8(this->o_ins + this->e_ins);
+    uint8x16_t five_vec = vdupq_n_u8(DUMMY5);
+    uint8x16_t gmax_vec = zero_vec;
+    int16x8_t te_vec = vdupq_n_s16(-1);
+    uint8x16_t cmax_vec = vdupq_n_u8(255);
+
+    uint16_t exit0 = 0xFFFF;
+
+    tid = 0;
+    uint8_t *H0 = H8_0 + tid * SIMD_WIDTH8 * this->maxQerLen;
+    uint8_t *H1 = H8_1 + tid * SIMD_WIDTH8 * this->maxQerLen;
+    uint8_t *Hmax = H8_max + tid * SIMD_WIDTH8 * this->maxQerLen;
+    uint8_t *F = F8 + tid * SIMD_WIDTH8 * this->maxQerLen;
+    uint8_t *rowMax = rowMax8 + tid * SIMD_WIDTH8 * this->maxRefLen;
+
+    /* Initialize arrays */
+    for (int i = 0; i <= ncol; i++)
+    {
+        vst1q_u8(H0 + i * SIMD_WIDTH8, zero_vec);
+        vst1q_u8(Hmax + i * SIMD_WIDTH8, zero_vec);
+        vst1q_u8(F + i * SIMD_WIDTH8, zero_vec);
+    }
+
+    uint8x16_t max_vec = zero_vec, imax_vec, pimax_vec = zero_vec;
+    uint16_t mask16 = 0x0000;
+    uint16_t minsc_msk = 0x0000;
+
+    uint8x16_t qe_vec = vdupq_n_u8(0);
+    vst1q_u8(H0, zero_vec);
+    vst1q_u8(H1, zero_vec);
+
+    int i, limit = nrow;
+    for (i = 0; i < nrow; i++)
+    {
+        uint8x16_t e11 = zero_vec;
+        uint8x16_t h00, h11, h10, s1;
+        int16x8_t i_vec = vdupq_n_s16(i);
+        int j;
+
+        s1 = vld1q_u8(seq1SoA + (i + 0) * SIMD_WIDTH8);
+        h10 = zero_vec;
+        imax_vec = zero_vec;
+        uint8x16_t iqe_vec = vdupq_n_u8(0xFF);
+
+        uint8x16_t l_vec = zero_vec;
+        for (j = 0; j < ncol; j++)
+        {
+            uint8x16_t f11, s2, f21;
+            h00 = vld1q_u8(H0 + j * SIMD_WIDTH8);
+            s2 = vld1q_u8(seq2SoA + j * SIMD_WIDTH8);
+            f11 = vld1q_u8(F + (j + 1) * SIMD_WIDTH8);
+
+            /* Core Smith-Waterman computation using NEON */
+            uint8x16_t xor_val = veorq_u8(s1, s2);
+            uint8x16_t sbt = vqtbl1q_u8(permSft, xor_val);
+
+            /* Check for ambiguous query base (DUMMY5) */
+            uint8x16_t cmpq = vceqq_u8(s2, five_vec);
+            sbt = vbslq_u8(cmpq, sft_vec, sbt);
+
+            /* Check for boundary (high bit set) */
+            uint8x16_t or_val = vorrq_u8(s1, s2);
+            uint8x16_t high_bit = vshrq_n_u8(or_val, 7);
+            uint8x16_t is_boundary = vceqq_u8(high_bit, one_vec);
+
+            uint8x16_t m11 = vqaddq_u8(h00, sbt);
+            m11 = vbslq_u8(is_boundary, zero_vec, m11);
+            m11 = vqsubq_u8(m11, sft_vec);
+
+            h11 = vmaxq_u8(m11, e11);
+            h11 = vmaxq_u8(h11, f11);
+
+            /* Update imax tracking */
+            uint8x16_t cmp0 = vcgtq_u8(h11, imax_vec);
+            imax_vec = vmaxq_u8(imax_vec, h11);
+            iqe_vec = vbslq_u8(cmp0, l_vec, iqe_vec);
+
+            /* Gap extension for E */
+            uint8x16_t gapE = vqsubq_u8(h11, oe_ins_vec);
+            e11 = vqsubq_u8(e11, e_ins_vec);
+            e11 = vmaxq_u8(gapE, e11);
+
+            /* Gap extension for F */
+            uint8x16_t gapD = vqsubq_u8(h11, oe_del_vec);
+            f21 = vqsubq_u8(f11, e_del_vec);
+            f21 = vmaxq_u8(gapD, f21);
+
+            vst1q_u8(H1 + (j + 1) * SIMD_WIDTH8, h11);
+            vst1q_u8(F + (j + 1) * SIMD_WIDTH8, f21);
+            l_vec = vaddq_u8(l_vec, one_vec);
+        }
+
+        /* Block I - row max tracking */
+        if (i > 0)
+        {
+            uint8x16_t cmp_gt = vcgtq_u8(imax_vec, pimax_vec);
+            uint16_t msk16 = neon_movemask_u8(cmp_gt);
+            msk16 |= mask16;
+
+            /* Apply masks */
+            uint8x16_t msk_vec = vld1q_u8((uint8_t*)&msk16); // simplified
+            pimax_vec = vbslq_u8(cmp_gt, zero_vec, pimax_vec);
+
+            vst1q_u8(rowMax + (i - 1) * SIMD_WIDTH8, pimax_vec);
+            mask16 = ~msk16;
+        }
+        pimax_vec = imax_vec;
+
+        /* Check minsc threshold */
+        uint8x16_t cmp_ge = vcgeq_u8(imax_vec, minsc_vec);
+        minsc_msk = neon_movemask_u8(cmp_ge);
+        minsc_msk &= minsc_msk_a;
+
+        /* Block II: gmax, te */
+        uint8x16_t cmp0 = vcgtq_u8(imax_vec, gmax_vec);
+        uint16_t cmp0_msk = neon_movemask_u8(cmp0);
+        cmp0_msk &= exit0;
+        gmax_vec = vmaxq_u8(gmax_vec, imax_vec);
+        /* Update te for elements where imax > gmax */
+        te_vec = vbslq_s16(vreinterpretq_u16_u8(cmp0), i_vec, te_vec);
+        qe_vec = vbslq_u8(cmp0, iqe_vec, qe_vec);
+
+        /* Check end score threshold */
+        uint8x16_t cmp_end = vcgeq_u8(gmax_vec, endsc_vec);
+        uint16_t cmp_end_msk = neon_movemask_u8(cmp_end);
+        cmp_end_msk &= endsc_msk_a;
+
+        /* Check for overflow */
+        uint8x16_t left_vec = vqaddq_u8(gmax_vec, sft_vec);
+        uint8x16_t cmp2 = vcgeq_u8(left_vec, cmax_vec);
+        uint16_t cmp2_msk = neon_movemask_u8(cmp2);
+
+        exit0 = (~(cmp_end_msk | cmp2_msk)) & exit0;
+        if (exit0 == 0)
+        {
+            limit = i++;
+            break;
+        }
+
+        uint8_t *S = H1; H1 = H0; H0 = S;
+    }
+
+    /* Store final row max */
+    vst1q_u8(rowMax + (i - 1) * SIMD_WIDTH8, pimax_vec);
+
+    /* Extract results */
+    uint8_t score[SIMD_WIDTH8] __attribute((aligned(128)));
+    int16_t te1[SIMD_WIDTH8] __attribute((aligned(128)));
+    uint8_t qe[SIMD_WIDTH8] __attribute((aligned(128)));
+
+    vst1q_u8(score, gmax_vec);
+    vst1q_s16(te1, te_vec);
+    vst1q_s16(te1 + 8, te_vec);  // duplicate for 16-element access
+    vst1q_u8(qe, qe_vec);
+
+    int live = 0;
+    for (int l = 0; l < SIMD_WIDTH8 && (po_ind + l) < numPairs; l++) {
+        int ind = po_ind + l;
+        int16_t *te = te1;
+#if !MAINY
+        ind = p[l].regid;
+        if (phase) {
+            if (aln[ind].score == score[l]) {
+                aln[ind].tb = aln[ind].te - te[l];
+                aln[ind].qb = aln[ind].qe - qe[l];
+            }
+        } else {
+            aln[ind].score = score[l] + shift < 255 ? score[l] : 255;
+            aln[ind].te = te[l];
+            aln[ind].qe = qe[l];
+            if (aln[ind].score != 255) {
+                qe[l] = 1;
+                live++;
+            }
+            else qe[l] = 0;
+        }
+#else
+        aln[ind].score = score[l] + shift < 255 ? score[l] : 255;
+        aln[ind].te = te[l];
+        aln[ind].qe = qe[l];
+        if (aln[ind].score != 255) {
+            qe[l] = 1;
+            live++;
+        }
+        else qe[l] = 0;
+#endif
+    }
+
+#if !MAINY
+    if (phase) return 1;
+#endif
+
+    if (live == 0) return 1;
+
+    /* Score2 and te2 computation */
+    int qmax = this->g_qmax;
+    int16_t low[SIMD_WIDTH8] __attribute((aligned(128)));
+    int16_t high[SIMD_WIDTH8] __attribute((aligned(128)));
+    int maxl = 0, minh = nrow;
+
+    for (int i = 0; i < SIMD_WIDTH8; i++)
+    {
+        int val = (score[i] + qmax - 1) / qmax;
+        int16_t *te = te1;
+        low[i] = te[i] - val;
+        high[i] = te[i] + val;
+        if (qe[i]) {
+            maxl = maxl < low[i] ? low[i] : maxl;
+            minh = minh > high[i] ? high[i] : minh;
+        }
+    }
+
+    uint8x16_t max2_vec = zero_vec;
+    int16x8_t te2_vec = vdupq_n_s16(-1);
+
+    /* Find second best score outside primary alignment region */
+    for (int i = 0; i < maxl; i++)
+    {
+        uint8x16_t rmax_vec = vld1q_u8(rowMax + i * SIMD_WIDTH8);
+        uint8x16_t cmp = vcgtq_u8(rmax_vec, max2_vec);
+        max2_vec = vmaxq_u8(max2_vec, rmax_vec);
+    }
+
+    for (int i = minh + 1; i < limit; i++)
+    {
+        uint8x16_t rmax_vec = vld1q_u8(rowMax + i * SIMD_WIDTH8);
+        uint8x16_t cmp = vcgtq_u8(rmax_vec, max2_vec);
+        max2_vec = vmaxq_u8(max2_vec, rmax_vec);
+    }
+
+    uint8_t temp2[SIMD_WIDTH8] __attribute((aligned(128)));
+    int16_t temp4[SIMD_WIDTH8] __attribute((aligned(128)));
+    vst1q_u8(temp2, max2_vec);
+    vst1q_s16(temp4, te2_vec);
+    vst1q_s16(temp4 + 8, te2_vec);
+
+    for (int i = 0; i < SIMD_WIDTH8 && (po_ind + i) < numPairs; i++)
+    {
+        int ind = po_ind + i;
+#if !MAINY
+        ind = p[i].regid;
+#endif
+        if (qe[i]) {
+            aln[ind].score2 = (temp2[i] == 0 ? (int)-1 : (uint8_t)temp2[i]);
+            aln[ind].te2 = temp4[i];
+        } else {
+            aln[ind].score2 = -1;
+            aln[ind].te2 = -1;
+        }
+    }
+
+    return 1;
+}
+
+/* 16-bit NEON implementation */
+void kswv::getScores16(SeqPair *pairArray,
+                       uint8_t *seqBufRef,
+                       uint8_t *seqBufQer,
+                       kswr_t* aln,
+                       int32_t numPairs,
+                       uint16_t numThreads,
+                       int phase)
+{
+    kswvBatchWrapper16(pairArray, seqBufRef, seqBufQer, aln,
+                       numPairs, numThreads, phase);
+}
+
+void kswv::kswvBatchWrapper16(SeqPair *pairArray,
+                              uint8_t *seqBufRef,
+                              uint8_t *seqBufQer,
+                              kswr_t* aln,
+                              int32_t numPairs,
+                              uint16_t numThreads,
+                              int phase)
+{
+    int16_t *seq1SoA = NULL;
+    seq1SoA = (int16_t *)_mm_malloc(this->maxRefLen * SIMD_WIDTH16 * numThreads * sizeof(int16_t), 128);
+
+    int16_t *seq2SoA = NULL;
+    seq2SoA = (int16_t *)_mm_malloc(this->maxQerLen * SIMD_WIDTH16 * numThreads * sizeof(int16_t), 128);
+
+    assert(seq1SoA != NULL);
+    assert(seq2SoA != NULL);
+
+    int32_t ii;
+    int32_t roundNumPairs = ((numPairs + SIMD_WIDTH16 - 1) / SIMD_WIDTH16) * SIMD_WIDTH16;
+
+    for (ii = numPairs; ii < roundNumPairs; ii++)
+    {
+        pairArray[ii].regid = ii;
+        pairArray[ii].id = ii;
+        pairArray[ii].len1 = 0;
+        pairArray[ii].len2 = 0;
+    }
+
+    {
+        int32_t i;
+        uint16_t tid = 0;
+        int16_t *mySeq1SoA = seq1SoA + tid * this->maxRefLen * SIMD_WIDTH16;
+        int16_t *mySeq2SoA = seq2SoA + tid * this->maxQerLen * SIMD_WIDTH16;
+        uint8_t *seq1;
+        uint8_t *seq2;
+
+        int nstart = 0, nend = numPairs;
+
+        for (i = nstart; i < nend; i += SIMD_WIDTH16)
+        {
+            int32_t j, k;
+            int maxLen1 = 0;
+            int maxLen2 = 0;
+
+            for (j = 0; j < SIMD_WIDTH16; j++)
+            {
+                SeqPair sp = pairArray[i + j];
+#if MAINY
+                seq1 = seqBufRef + (int64_t)sp.id * this->maxRefLen;
+#else
+                seq1 = seqBufRef + sp.idr;
+#endif
+                for (k = 0; k < sp.len1; k++)
+                {
+                    mySeq1SoA[k * SIMD_WIDTH16 + j] = (seq1[k] == AMBIG_ ? AMBR16 : seq1[k]);
+                }
+                if (maxLen1 < sp.len1) maxLen1 = sp.len1;
+            }
+            for (j = 0; j < SIMD_WIDTH16; j++)
+            {
+                SeqPair sp = pairArray[i + j];
+                for (k = sp.len1; k <= maxLen1; k++)
+                {
+                    mySeq1SoA[k * SIMD_WIDTH16 + j] = 0xFFFF;
+                }
+            }
+
+            for (j = 0; j < SIMD_WIDTH16; j++)
+            {
+                SeqPair sp = pairArray[i + j];
+#if MAINY
+                seq2 = seqBufQer + (int64_t)sp.id * this->maxQerLen;
+#else
+                seq2 = seqBufQer + sp.idq;
+#endif
+                int quanta = (sp.len2 + 8 - 1) / 8;
+                quanta *= 8;
+                for (k = 0; k < sp.len2; k++)
+                {
+                    mySeq2SoA[k * SIMD_WIDTH16 + j] = (seq2[k] == AMBIG_ ? AMBQ16 : seq2[k]);
+                }
+
+                for (k = sp.len2; k < quanta; k++)
+                {
+                    mySeq2SoA[k * SIMD_WIDTH16 + j] = DUMMY3;
+                }
+                if (maxLen2 < quanta) maxLen2 = quanta;
+            }
+
+            for (j = 0; j < SIMD_WIDTH16; j++)
+            {
+                SeqPair sp = pairArray[i + j];
+                int quanta = (sp.len2 + 8 - 1) / 8;
+                quanta *= 8;
+                for (k = quanta; k <= maxLen2; k++)
+                {
+                    mySeq2SoA[k * SIMD_WIDTH16 + j] = 0xFFFF;
+                }
+            }
+
+            kswv_neon_16(mySeq1SoA, mySeq2SoA,
+                         maxLen1, maxLen2,
+                         pairArray + i,
+                         aln, i,
+                         tid,
+                         numPairs,
+                         phase);
+        }
+    }
+
+    _mm_free(seq1SoA);
+    _mm_free(seq2SoA);
+    return;
+}
+
+int kswv::kswv_neon_16(int16_t seq1SoA[],
+                       int16_t seq2SoA[],
+                       int16_t nrow,
+                       int16_t ncol,
+                       SeqPair *p,
+                       kswr_t *aln,
+                       int po_ind,
+                       uint16_t tid,
+                       int32_t numPairs,
+                       int phase)
+{
+    int m_b, n_b;
+    int16_t minsc[SIMD_WIDTH16] = {0}, endsc[SIMD_WIDTH16] = {0};
+    uint64_t *b;
+    int limit = nrow;
+
+    int16x8_t zero_vec = vdupq_n_s16(0);
+    int16x8_t one_vec = vdupq_n_s16(1);
+
+    int16_t temp[SIMD_WIDTH16] __attribute((aligned(128))) = {0};
+
+    /* Build scoring table for 16-bit */
+    temp[0] = this->w_match;
+    temp[1] = temp[2] = temp[3] = this->w_mismatch;
+    for (int i = 4; i < 8; i++) temp[i] = this->w_ambig;
+
+    int16x8_t perm_vec = vld1q_s16(temp);
+
+    m_b = n_b = 0; b = 0;
+
+    uint8_t minsc_msk_a = 0x00, endsc_msk_a = 0x00;
+    int val = 0;
+    for (int i = 0; i < SIMD_WIDTH16; i++) {
+        int xtra = p[i].h0;
+        val = (xtra & KSW_XSUBO) ? xtra & 0xffff : 0x10000;
+        if (val <= SHRT_MAX) {
+            minsc[i] = val;
+            minsc_msk_a |= (0x1 << i);
+        }
+        val = (xtra & KSW_XSTOP) ? xtra & 0xffff : 0x10000;
+        if (val <= SHRT_MAX) {
+            endsc[i] = val;
+            endsc_msk_a |= (0x1 << i);
+        }
+    }
+
+    int16x8_t minsc_vec = vld1q_s16(minsc);
+    int16x8_t endsc_vec = vld1q_s16(endsc);
+
+    int16x8_t e_del_vec = vdupq_n_s16(this->e_del);
+    int16x8_t oe_del_vec = vdupq_n_s16(this->o_del + this->e_del);
+    int16x8_t e_ins_vec = vdupq_n_s16(this->e_ins);
+    int16x8_t oe_ins_vec = vdupq_n_s16(this->o_ins + this->e_ins);
+    int16x8_t gmax_vec = zero_vec;
+    int16x8_t te_vec = vdupq_n_s16(-1);
+
+    uint8_t exit0 = 0xFF;
+
+    tid = 0;
+    int16_t *H0 = H16_0 + tid * SIMD_WIDTH16 * this->maxQerLen;
+    int16_t *H1 = H16_1 + tid * SIMD_WIDTH16 * this->maxQerLen;
+    int16_t *Hmax = H16_max + tid * SIMD_WIDTH16 * this->maxQerLen;
+    int16_t *F = F16 + tid * SIMD_WIDTH16 * this->maxQerLen;
+    int16_t *rowMax = rowMax16 + tid * SIMD_WIDTH16 * this->maxRefLen;
+
+    for (int i = 0; i <= ncol; i++)
+    {
+        vst1q_s16(H0 + i * SIMD_WIDTH16, zero_vec);
+        vst1q_s16(Hmax + i * SIMD_WIDTH16, zero_vec);
+        vst1q_s16(F + i * SIMD_WIDTH16, zero_vec);
+    }
+
+    int16x8_t max_vec = zero_vec, imax_vec, pimax_vec = zero_vec;
+    int16x8_t qe_vec = vdupq_n_s16(0);
+    vst1q_s16(H0, zero_vec);
+    vst1q_s16(H1, zero_vec);
+
+    int i;
+    for (i = 0; i < nrow; i++)
+    {
+        int16x8_t e11 = zero_vec;
+        int16x8_t h00, h11, h10, s1;
+        int16x8_t i_vec = vdupq_n_s16(i);
+        int j;
+
+        s1 = vld1q_s16(seq1SoA + (i + 0) * SIMD_WIDTH16);
+        h10 = zero_vec;
+        imax_vec = zero_vec;
+        int16x8_t iqe_vec = vdupq_n_s16(-1);
+
+        int16x8_t l_vec = zero_vec;
+        for (j = 0; j < ncol; j++)
+        {
+            int16x8_t f11, s2, f21;
+            h00 = vld1q_s16(H0 + j * SIMD_WIDTH16);
+            s2 = vld1q_s16(seq2SoA + j * SIMD_WIDTH16);
+            f11 = vld1q_s16(F + (j + 1) * SIMD_WIDTH16);
+
+            /* Core computation */
+            int16x8_t xor_val = veorq_s16(s1, s2);
+            /* Use table lookup with limited index range */
+            int16x8_t sbt = vqtbl1q_s8(vreinterpretq_s8_s16(perm_vec),
+                                        vreinterpretq_u8_s16(xor_val));
+            sbt = vreinterpretq_s16_s8(sbt);
+
+            /* Check for boundary */
+            int16x8_t or_val = vorrq_s16(s1, s2);
+            uint16x8_t high_bit = vshrq_n_u16(vreinterpretq_u16_s16(or_val), 15);
+            uint16x8_t is_boundary = vceqq_u16(high_bit, vdupq_n_u16(1));
+
+            int16x8_t m11 = vaddq_s16(h00, sbt);
+            m11 = vbslq_s16(is_boundary, zero_vec, m11);
+
+            h11 = vmaxq_s16(m11, e11);
+            h11 = vmaxq_s16(h11, f11);
+            h11 = vmaxq_s16(h11, zero_vec);
+
+            /* Update imax tracking */
+            uint16x8_t cmp0 = vcgtq_s16(h11, imax_vec);
+            imax_vec = vmaxq_s16(imax_vec, h11);
+            iqe_vec = vbslq_s16(cmp0, l_vec, iqe_vec);
+
+            /* Gap extension */
+            int16x8_t gapE = vsubq_s16(h11, oe_ins_vec);
+            e11 = vsubq_s16(e11, e_ins_vec);
+            e11 = vmaxq_s16(gapE, e11);
+
+            int16x8_t gapD = vsubq_s16(h11, oe_del_vec);
+            f21 = vsubq_s16(f11, e_del_vec);
+            f21 = vmaxq_s16(gapD, f21);
+
+            vst1q_s16(H1 + (j + 1) * SIMD_WIDTH16, h11);
+            vst1q_s16(F + (j + 1) * SIMD_WIDTH16, f21);
+            l_vec = vaddq_s16(l_vec, one_vec);
+        }
+
+        pimax_vec = imax_vec;
+
+        /* Block II: gmax, te */
+        uint16x8_t cmp0 = vcgtq_s16(imax_vec, gmax_vec);
+        gmax_vec = vmaxq_s16(gmax_vec, imax_vec);
+        te_vec = vbslq_s16(cmp0, i_vec, te_vec);
+        qe_vec = vbslq_s16(cmp0, iqe_vec, qe_vec);
+
+        /* Check end conditions */
+        uint16x8_t cmp_end = vcgeq_s16(gmax_vec, endsc_vec);
+        if (vmaxvq_s16(vreinterpretq_s16_u16(cmp_end)) != 0) {
+            limit = i++;
+            break;
+        }
+
+        int16_t *S = H1; H1 = H0; H0 = S;
+    }
+
+    /* Extract results */
+    int16_t score[SIMD_WIDTH16] __attribute((aligned(128)));
+    int16_t te1[SIMD_WIDTH16] __attribute((aligned(128)));
+    int16_t qe[SIMD_WIDTH16] __attribute((aligned(128)));
+
+    vst1q_s16(score, gmax_vec);
+    vst1q_s16(te1, te_vec);
+    vst1q_s16(qe, qe_vec);
+
+    for (int l = 0; l < SIMD_WIDTH16 && (po_ind + l) < numPairs; l++) {
+        int ind = po_ind + l;
+#if !MAINY
+        ind = p[l].regid;
+#endif
+        aln[ind].score = score[l];
+        aln[ind].te = te1[l];
+        aln[ind].qe = qe[l];
+        aln[ind].score2 = -1;
+        aln[ind].te2 = -1;
+    }
+
+    return 1;
+}
+
+#elif __AVX512BW__
+/* AVX-512 Implementation for x86 */
 void kswv::getScores8(SeqPair *pairArray,
                       uint8_t *seqBufRef,
                       uint8_t *seqBufQer,

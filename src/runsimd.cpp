@@ -34,13 +34,7 @@ Contacts: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@
 #include <sys/stat.h>
 #include <limits.h>
 #include <assert.h>
-#ifdef __cplusplus
-extern "C" {
-#endif
-#include "safe_str_lib.h"
-#ifdef __cplusplus
-}
-#endif
+#include "safestringlib.h"
 
 #define SIMD_SSE     0x1
 #define SIMD_SSE2    0x2
@@ -52,6 +46,19 @@ extern "C" {
 #define SIMD_AVX2    0x80
 #define SIMD_AVX512F 0x100
 #define SIMD_AVX512BW 0x200
+#define SIMD_ARM64   0x1000  /* ARM64/NEON support flag */
+
+#if defined(__ARM_NEON) || defined(__aarch64__)
+/* ARM/Apple Silicon - no CPUID, always has NEON */
+
+static int x86_simd(void)
+{
+    /* On ARM, we return the ARM64 flag to indicate NEON support */
+    return SIMD_ARM64;
+}
+
+#else
+/* x86 implementation */
 
 #ifndef _MSC_VER
 // adapted from https://github.com/01org/linux-sgx/blob/master/common/inc/internal/linux/cpuid_gnu.h
@@ -91,6 +98,7 @@ static int x86_simd(void)
 	}
 	return flag;
 }
+#endif /* ARM vs x86 */
 
 static int exe_path(const char *exe, int max, char buf[], int *base_st)
 {
@@ -192,11 +200,21 @@ int main(int argc, char *argv[])
 	strcat_s(prefix, PATH_MAX, &argv0[base_st]);
 	//prefix_len = strlen(prefix);
 	simd = x86_simd();
+
+#if defined(__ARM_NEON) || defined(__aarch64__)
+	/* ARM/Apple Silicon - try arm64 binary first */
+	if (simd & SIMD_ARM64) test_and_launch(argv, prefix, ".arm64");
+	/* Fallback: try without suffix (symlinked binary) */
+	test_and_launch(argv, prefix, "");
+#else
+	/* x86 SIMD detection */
 	if (simd & SIMD_AVX512BW) test_and_launch(argv, prefix, ".avx512bw");
 	if (simd & SIMD_AVX2) test_and_launch(argv, prefix, ".avx2");
 	if (simd & SIMD_AVX) test_and_launch(argv, prefix, ".avx");
 	if (simd & SIMD_SSE4_2) test_and_launch(argv, prefix, ".sse42");
 	if (simd & SIMD_SSE4_1) test_and_launch(argv, prefix, ".sse41");
+#endif
+
 	free(prefix);
 	fprintf(stderr, "ERROR: fail to find the right executable\n");
 	return 2;

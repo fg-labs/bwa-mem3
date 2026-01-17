@@ -45,8 +45,18 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #define SEEDS_PER_READ 500           /* Avg seeds per read */
 #define MAX_SEEDS_PER_READ 500       /* Max seeds per read */
 #define AVG_SEEDS_PER_READ 64        /* Used for storing seeds in chains*/
-#define BATCH_SIZE 512               /* Block of reads alloacted to a thread for processing*/
+
+/* Apple Silicon has larger L2 caches (4-16MB per cluster) and benefits from
+ * larger batch sizes to better utilize cache locality. M1/M2/M3/M4 all have
+ * significantly more L2 cache per core than typical x86 consumer CPUs. */
+#if defined(APPLE_SILICON) || defined(__aarch64__) || defined(__ARM_NEON)
+#define BATCH_SIZE 1024              /* Larger batch for Apple Silicon's big L2 cache */
+#define BATCH_MUL 40                 /* Also scale BATCH_MUL proportionally */
+#else
+#define BATCH_SIZE 512               /* Block of reads allocated to a thread for processing */
 #define BATCH_MUL 20
+#endif /* APPLE_SILICON batch size */
+
 #define SEEDS_PER_CHAIN 1
 #define N_SMEM_KERNEL 3
 #define READ_LEN 151

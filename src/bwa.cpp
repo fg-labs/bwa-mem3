@@ -40,13 +40,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "kvec.h"
 #include <string>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-#include "safe_str_lib.h"
-#ifdef __cplusplus
-}
-#endif
+#include "safestringlib.h"
 
 int bwa_verbose = 3;
 char bwa_rg_id[256];

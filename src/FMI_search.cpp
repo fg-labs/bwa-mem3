@@ -33,13 +33,7 @@ Authors: Sanchit Misra <sanchit.misra@intel.com>; Vasimuddin Md <vasimuddin.md@i
 #include "memcpy_bwamem.h"
 #include "profiling.h"
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-#include "safe_str_lib.h"
-#ifdef __cplusplus
-}
-#endif
+#include "safestringlib.h"
 
 FMI_search::FMI_search(const char *fname)
 {
