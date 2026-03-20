@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch_flag: "sse41"
+            name: "Linux x86_64 SSE4.1"
+          - os: ubuntu-latest
+            arch_flag: "avx2"
+            name: "Linux x86_64 AVX2"
+          - os: macos-latest
+            arch_flag: ""
+            name: "macOS ARM64"
+
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev bwa
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install bwa
+
+      - name: Build bwa-mem2
+        run: |
+          if [ "${{ matrix.arch_flag }}" = "" ]; then
+            make -j$(nproc 2>/dev/null || sysctl -n hw.ncpu) CXX=g++
+          else
+            make -j$(nproc) arch=${{ matrix.arch_flag }} CXX=g++
+          fi
+
+      - name: Verify binary
+        run: ./bwa-mem2 version
+
+      - name: Build dwgsim
+        run: |
+          git clone --recursive https://github.com/nh13/DWGSIM.git /tmp/dwgsim-src
+          cd /tmp/dwgsim-src
+          make -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
+
+      - name: Download phiX174 reference
+        run: |
+          mkdir -p /tmp/ci-test
+          curl -sL "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/819/615/GCF_000819615.1_ViralProj14015/GCF_000819615.1_ViralProj14015_genomic.fna.gz" \
+            | gunzip > /tmp/ci-test/phix174.fa
+
+      - name: Simulate reads with dwgsim
+        run: |
+          /tmp/dwgsim-src/dwgsim \
+            -N 500 -1 150 -2 150 \
+            -r 0.001 -S 2 \
+            /tmp/ci-test/phix174.fa \
+            /tmp/ci-test/reads
+
+      - name: Index and align with bwa
+        run: |
+          cd /tmp/ci-test
+          cp phix174.fa bwa_phix174.fa
+          bwa index bwa_phix174.fa
+          bwa mem bwa_phix174.fa reads.bwa.read1.fastq.gz reads.bwa.read2.fastq.gz > bwa.sam 2>bwa.log
+
+      - name: Index and align with bwa-mem2
+        run: |
+          cd /tmp/ci-test
+          cp phix174.fa bwamem2_phix174.fa
+          $GITHUB_WORKSPACE/bwa-mem2 index bwamem2_phix174.fa
+          $GITHUB_WORKSPACE/bwa-mem2 mem bwamem2_phix174.fa reads.bwa.read1.fastq.gz reads.bwa.read2.fastq.gz > bwamem2.sam 2>bwamem2.log
+
+      - name: Compare bwa and bwa-mem2 output
+        run: |
+          cd /tmp/ci-test
+
+          # Strip @PG and @HD headers (tool-specific), and MQ tag (added in bwa >0.7.17)
+          normalize() {
+            grep -v '^@PG' "$1" | grep -v '^@HD' | sed 's/\tMQ:i:[0-9]*//'
+          }
+
+          normalize bwa.sam | sort > bwa.normalized.sam
+          normalize bwamem2.sam | sort > bwamem2.normalized.sam
+
+          echo "bwa aligned records: $(grep -cv '^@' bwa.normalized.sam)"
+          echo "bwa-mem2 aligned records: $(grep -cv '^@' bwamem2.normalized.sam)"
+
+          if diff bwa.normalized.sam bwamem2.normalized.sam > /dev/null 2>&1; then
+            echo "PASS: bwa and bwa-mem2 output is identical (after normalizing headers and MQ tag)"
+          else
+            echo "FAIL: bwa and bwa-mem2 output differs"
+            diff bwa.normalized.sam bwamem2.normalized.sam | head -40
+            exit 1
+          fi
