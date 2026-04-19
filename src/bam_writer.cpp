@@ -6,6 +6,8 @@
 #include "htslib/kstring.h"
 
 #include "bam_writer.h"
+#include "cigar_util.h"
+#include "utils.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -81,10 +83,6 @@ int bam_writer_close(bam_writer_t *w)
 /* mem_aln_t -> bam1_t                                                  */
 /* ------------------------------------------------------------------- */
 
-/* bwa-mem2 CIGAR op encoding is 0=M,1=I,2=D,3=S,4=H. BAM's is
- * 0=M,1=I,2=D,3=N,4=S,5=H. Remap on emit. */
-static const uint32_t BAM_OP_FROM_MEM[5] = { 0, 1, 2, 4, 5 };
-
 /* Append SAM-text aux fields ("TAG:TYPE:VALUE" tokens, TAB-separated) onto
  * `b` as packed BAM aux. Mirrors the literal s->comment append that
  * mem_aln2sam does on the SAM path so --bam preserves -C output. Only TAB
@@ -152,19 +150,6 @@ static void append_sam_aux_tokens(struct bam1_t *b, const char *s)
                 break;
         }
     }
-}
-
-/* Reference-consumed length summed across a bwa-mem2-encoded CIGAR. Only
- * M (0) and D (2) consume ref; S/H are soft/hard clips. Matches get_rlen()
- * in bwamem.cpp. */
-static int64_t cigar_ref_len_mem(const uint32_t *cigar, int n)
-{
-    int64_t l = 0;
-    for (int i = 0; i < n; ++i) {
-        int op = cigar[i] & 0xf;
-        if (op == 0 || op == 2) l += cigar[i] >> 4;
-    }
-    return l;
 }
 
 int mem_aln_to_bam(struct bam1_t *b,
@@ -337,19 +322,33 @@ int mem_aln_to_bam(struct bam1_t *b,
         bam_aux_append(b, "XA", 'Z', (int)strlen(p.XA) + 1, (const uint8_t *)p.XA);
     }
 
-    /* FASTQ-carried tags (-C). mem_aln2sam appends s->comment literally to
-     * the SAM line; here we parse it as SAM-text aux tokens and emit each as
-     * a packed BAM aux so the BAM and SAM paths carry the same tags. */
+    bam_writer_append_generic_aux(b, s, opt, bns, p.rid);
+
+    return 0;
+}
+
+extern "C" void bam_writer_append_generic_aux(struct bam1_t *b,
+                                              const bseq1_t *s,
+                                              const mem_opt_t *opt,
+                                              const bntseq_t *bns,
+                                              int rid)
+{
+    if (b == NULL || s == NULL || opt == NULL) return;
+
+    /* FASTQ-carried tags (-C; also YS:Z/YC:Z in --meth mode). mem_aln2sam
+     * appends s->comment literally to the SAM line; here we parse it as
+     * SAM-text aux tokens and emit each as a packed BAM aux so the BAM and
+     * SAM paths carry the same tags. */
     if (s->comment != NULL && s->comment[0] != '\0') {
         append_sam_aux_tokens(b, s->comment);
     }
 
     /* Reference annotation (-V / MEM_F_REF_HDR). Mirrors mem_aln2sam: emit
-     * bns->anns[p.rid].anno as XR:Z, replacing TAB with SPACE. */
-    if ((opt->flag & MEM_F_REF_HDR) && p.rid >= 0 &&
-        bns != NULL && bns->anns[p.rid].anno != NULL &&
-        bns->anns[p.rid].anno[0] != '\0') {
-        const char *anno = bns->anns[p.rid].anno;
+     * bns->anns[rid].anno as XR:Z, replacing TAB with SPACE. */
+    if ((opt->flag & MEM_F_REF_HDR) && rid >= 0 &&
+        bns != NULL && bns->anns[rid].anno != NULL &&
+        bns->anns[rid].anno[0] != '\0') {
+        const char *anno = bns->anns[rid].anno;
         size_t alen = strlen(anno);
         char *xr = (char *)malloc(alen + 1);
         if (xr != NULL) {
@@ -360,8 +359,22 @@ int mem_aln_to_bam(struct bam1_t *b,
             free(xr);
         }
     }
+}
 
-    return 0;
+extern "C" void bam_writer_bseq_push(bseq1_t *s, struct bam1_t *b)
+{
+    if (s == NULL || b == NULL) return;
+    if (s->n_bams == s->cap_bams) {
+        int new_cap = s->cap_bams ? s->cap_bams * 2 : 4;
+        void **nb = (void **)realloc(s->bams, (size_t)new_cap * sizeof(void *));
+        if (nb == NULL) {
+            bam_destroy1(b);
+            err_fatal(__func__, "out of memory growing per-read BAM list");
+        }
+        s->bams = nb;
+        s->cap_bams = new_cap;
+    }
+    s->bams[s->n_bams++] = (void *)b;
 }
 
 int bam_writer_push_aln(bseq1_t *s,
@@ -376,13 +389,6 @@ int bam_writer_push_aln(bseq1_t *s,
         bam_destroy1(b);
         return -1;
     }
-    if (s->n_bams == s->cap_bams) {
-        int new_cap = s->cap_bams ? s->cap_bams * 2 : 4;
-        void **nb = (void **)realloc(s->bams, (size_t)new_cap * sizeof(void *));
-        if (nb == NULL) { bam_destroy1(b); return -1; }
-        s->bams = nb;
-        s->cap_bams = new_cap;
-    }
-    s->bams[s->n_bams++] = (void *)b;
+    bam_writer_bseq_push(s, b);
     return 0;
 }

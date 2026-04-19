@@ -59,9 +59,9 @@ typedef struct {
 typedef struct {
 	int l_seq, id;
 	char *name, *comment, *seq, *qual, *sam;
-	/* --bam output: per-read list of bam1_t* produced by the worker
-	 * instead of SAM text. Typed as void* to keep htslib out of this
-	 * header. Populated only when opt->bam_mode is set. */
+	/* BAM output: per-read list of bam1_t* accumulated by worker threads
+	 * (used by --bam and --meth alike). Typed as void* to keep htslib out
+	 * of this header. */
 	void **bams;
 	int    n_bams;
 	int    cap_bams;

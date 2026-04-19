@@ -39,6 +39,9 @@ int bam_writer_close(bam_writer_t *w);
 struct bam1_t *bam_writer_alloc(void);
 void           bam_writer_free(struct bam1_t *b);
 
+/* Append `b` to `s->bams`, growing the array as needed. On OOM, frees `b`. */
+void bam_writer_bseq_push(bseq1_t *s, struct bam1_t *b);
+
 /* Convert a mem_aln_t to a bam1_t. Analogous to mem_aln2sam but emits a
  * bam1_t directly with no SAM-text intermediate. Caller owns `b`. */
 int mem_aln_to_bam(struct bam1_t *b,
@@ -52,6 +55,21 @@ int bam_writer_push_aln(bseq1_t *s,
                         const mem_opt_t *opt, const bntseq_t *bns,
                         int n_alns, const mem_aln_t *list, int which,
                         const mem_aln_t *m);
+
+/* Append two groups of aux tags that mem_aln2sam emits unconditionally from
+ * the SAM-text path (so BAM and SAM carry the same auxiliary information):
+ *   1. Tags parsed from `s->comment` (FASTQ-carried SAM tokens under -C; in
+ *      --meth mode this is where YS:Z/YC:Z live too).
+ *   2. XR:Z from `bns->anns[rid].anno` when MEM_F_REF_HDR is set (-V).
+ *
+ * Factored out so both the generic bam_writer path and the meth_bam path
+ * produce identical output for --bam vs --meth. `rid` is the bwa-mem2
+ * internal contig index (bns-relative), not a post-remap output tid. */
+void bam_writer_append_generic_aux(struct bam1_t *b,
+                                   const bseq1_t *s,
+                                   const mem_opt_t *opt,
+                                   const bntseq_t *bns,
+                                   int rid);
 
 #ifdef __cplusplus
 }
