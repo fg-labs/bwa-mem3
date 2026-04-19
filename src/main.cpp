@@ -37,7 +37,8 @@ Contacts: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@
 
 
 // ----------------------------------
-uint64_t proc_freq, tprof[LIM_R][LIM_C], prof[LIM_R];
+// Profiling globals are now defined in profiling.cpp so they live in
+// libbwa.a and are visible to library consumers that don't link main.o.
 // ----------------------------------
 
 int usage()

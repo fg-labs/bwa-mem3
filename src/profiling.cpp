@@ -33,6 +33,13 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include <assert.h>
 #include "profiling.h"
 
+// Profiling globals. Defined here rather than in main.cpp so they are part of
+// libbwa.a and visible to consumers that link the library without pulling in
+// main.o (e.g. language bindings).
+uint64_t proc_freq = 0;
+uint64_t tprof[LIM_R][LIM_C] = {{0}};
+uint64_t prof[LIM_R] = {0};
+
 int find_opt(uint64_t *a, int len, uint64_t *max, uint64_t *min, double *avg)
 {
     *max = 0;
