@@ -55,7 +55,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 
 extern uint64_t tprof[LIM_R][LIM_C];
 
-static inline int mem_infer_dir(int64_t l_pac, int64_t b1, int64_t b2, int64_t *dist)
+int mem_infer_dir(int64_t l_pac, int64_t b1, int64_t b2, int64_t *dist)
 {
     int64_t p2;
     int r1 = (b1 >= l_pac), r2 = (b2 >= l_pac);
