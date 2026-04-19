@@ -265,8 +265,15 @@ int mem_kernel1_core(FMI_search *fmi, const mem_opt_t *opt,
                      bseq1_t *seq_,
                      int nseq,
                      mem_chain_v *chain_ar,
+                     mem_seed_t *seedBuf,
+                     int64_t seedBufSize,
                      mem_cache *mmc,
                      int tid);
+
+int mem_kernel2_core(FMI_search *fmi, const mem_opt_t *opt,
+                     bseq1_t *seq_, mem_alnreg_v *regs, int nseq,
+                     mem_chain_v *chain_ar, mem_cache *mmc,
+                     uint8_t *ref_string, int tid);
 
 void* _mm_realloc(void *ptr, int64_t csize, int64_t nsize, int16_t dsize);
 
