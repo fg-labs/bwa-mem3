@@ -294,6 +294,13 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                          mem_alnreg_v *ma, mem_cache *mmc, int pcnt, int32_t gcnt,
                          int32_t &maxRefLen, int32_t &maxQerLen, int32_t tid);
 
+/* Given two alignment begin positions (rb) on the 2-bit-packed concat-with-
+ * reverse-complement index, infer the pair orientation (0=FF, 1=FR, 2=RF,
+ * 3=RR) and the distance between 5' ends. Exposed so that external consumers
+ * can share the same proper-pair classification used by mem_sam_pe's
+ * no_pairing fallback. */
+int mem_infer_dir(int64_t l_pac, int64_t b1, int64_t b2, int64_t *dist);
+
 int mem_sam_pe_batch(const mem_opt_t *opt, mem_cache *mmc,
                      int64_t &pcnt, int64_t &pcnt8, kswr_t *aln,
                      int32_t, int32_t, int tid);
