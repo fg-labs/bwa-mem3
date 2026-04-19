@@ -52,6 +52,9 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 
 KSEQ_DECLARE(gzFile)
 
+/* Forward-declared — keeps htslib out of this header. */
+struct bam_writer_s;
+
 typedef struct {
 	kseq_t *ks, *ks2;
 	mem_opt_t *opt;
@@ -64,7 +67,8 @@ typedef struct {
 	int64_t actual_chunk_size;
 	FILE *fp;
 	uint8_t *ref_string;
-	FMI_search *fmi;	
+	FMI_search *fmi;
+	struct bam_writer_s *bam_writer;  /* non-NULL when opt->bam_mode is set */
 } ktp_aux_t;
 
 typedef struct {

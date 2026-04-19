@@ -35,11 +35,11 @@ jobs:
 
       - name: Install dependencies (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev bwa
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev bwa autoconf automake
 
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
-        run: brew install bwa
+        run: brew install bwa autoconf automake
 
       - name: Build bwa-mem2
         run: |

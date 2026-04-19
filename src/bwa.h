@@ -59,6 +59,12 @@ typedef struct {
 typedef struct {
 	int l_seq, id;
 	char *name, *comment, *seq, *qual, *sam;
+	/* --bam output: per-read list of bam1_t* produced by the worker
+	 * instead of SAM text. Typed as void* to keep htslib out of this
+	 * header. Populated only when opt->bam_mode is set. */
+	void **bams;
+	int    n_bams;
+	int    cap_bams;
 } bseq1_t;
 
 extern int bwa_verbose;

@@ -1,0 +1,60 @@
+/* SPDX-License-Identifier: MIT */
+#ifndef BWAMEM2_BAM_WRITER_H
+#define BWAMEM2_BAM_WRITER_H
+
+#include <stdint.h>
+#include "bwa.h"
+#include "bwamem.h"
+#include "bntseq.h"
+
+/* htslib/sam.h and bwa-mem2's kstring.h share the KSTRING_H guard, so htslib
+ * headers are only included inside src/bam_writer.cpp. Callers get a
+ * forward-declared bam1_t and opaque writer handle. */
+struct bam1_t;
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct bam_writer_s bam_writer_t;
+
+/* Open a BAM writer at `path` ("-" for stdout). compression_level 0 = no
+ * deflate (fast, same size as SAM), 1..9 = BGZF deflate levels. @SQ is
+ * built directly from `bns->anns`. `hdr_line` carries user-supplied header
+ * lines (e.g., `@RG` from `-R` and `-H` insertions, as accumulated by
+ * bwa_insert_header); it is inserted before `@PG`. `bwa_pg` is inserted
+ * as-is. Both may be NULL. Returns NULL on failure. */
+bam_writer_t *bam_writer_open(const char *path, const bntseq_t *bns,
+                              const char *hdr_line, const char *bwa_pg,
+                              int compression_level);
+
+/* Write one record. Returns 0 on success, -1 on error. */
+int bam_writer_write(bam_writer_t *w, struct bam1_t *b);
+
+/* Close the writer (flushes BGZF EOF marker). Returns 0 on success. */
+int bam_writer_close(bam_writer_t *w);
+
+/* bam1_t allocation wrappers — keep htslib out of callers that can't include
+ * <htslib/sam.h> because of the kstring.h guard collision. */
+struct bam1_t *bam_writer_alloc(void);
+void           bam_writer_free(struct bam1_t *b);
+
+/* Convert a mem_aln_t to a bam1_t. Analogous to mem_aln2sam but emits a
+ * bam1_t directly with no SAM-text intermediate. Caller owns `b`. */
+int mem_aln_to_bam(struct bam1_t *b,
+                   const mem_opt_t *opt, const bntseq_t *bns,
+                   const bseq1_t *s, int n_alns,
+                   const mem_aln_t *list, int which,
+                   const mem_aln_t *m);
+
+/* Allocate a bam1_t, fill via mem_aln_to_bam, and append to s->bams. */
+int bam_writer_push_aln(bseq1_t *s,
+                        const mem_opt_t *opt, const bntseq_t *bns,
+                        int n_alns, const mem_aln_t *list, int which,
+                        const mem_aln_t *m);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif

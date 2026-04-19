@@ -105,6 +105,8 @@ typedef struct mem_opt_t {
     int max_matesw;         // perform maximally max_matesw rounds of mate-SW for each end
     int max_XA_hits, max_XA_hits_alt; // if there are max_hits or fewer, output them all
     int8_t mat[25];         // scoring matrix; mat[0] == 0 if unset
+    int    bam_mode;        // 1 = emit BAM instead of SAM text (--bam)
+    int    bam_level;       // 0..9, BGZF deflate level (0 = uncompressed)
 } mem_opt_t;
 
 
