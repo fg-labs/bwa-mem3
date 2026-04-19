@@ -66,7 +66,14 @@ jobs:
 
       - name: Simulate reads with dwgsim
         run: |
+          # Pin -z so the simulated reads are reproducible across CI runs.
+          # Without this, each job gets a different time-seeded batch and a
+          # stray read spanning the phiX174 circular origin can produce a
+          # byte-level diff vs bwa, flaking the comparison step. See issue
+          # #11 for plans to replace this test with a curated dataset
+          # (via holodeck) and drop dwgsim entirely.
           /tmp/dwgsim-src/dwgsim \
+            -z 42 \
             -N 500 -1 150 -2 150 \
             -r 0.001 -S 2 \
             /tmp/ci-test/phix174.fa \
