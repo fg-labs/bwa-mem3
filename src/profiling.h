@@ -30,6 +30,10 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #ifndef _PROFILE_HPP
 #define _PROFILE_HPP
 
+#include <stdint.h>
+#include "macro.h"
+
 int display_stats(int );
 extern uint64_t proc_freq, tprof[LIM_R][LIM_C];
+extern uint64_t prof[LIM_R];
 #endif
