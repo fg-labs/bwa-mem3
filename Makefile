@@ -43,9 +43,11 @@ endif
 # Detect architecture
 UNAME_M := $(shell uname -m)
 UNAME_S := $(shell uname -s)
+# Treat macOS ("arm64") and Linux ("aarch64") as the same ARM build target.
+IS_ARM := $(filter $(UNAME_M),arm64 aarch64)
 
 # ARM/Apple Silicon support
-ifeq ($(UNAME_M),arm64)
+ifneq ($(IS_ARM),)
     ARCH_FLAGS = -DAPPLE_SILICON=1
     # sse2neon flags - define SSE feature macros for translation
     SSE2NEON_FLAGS = -D__SSE__=1 -D__SSE2__=1 -D__SSE3__=1 -D__SSSE3__=1 -D__SSE4_1__=1 -D__SSE4_2__=1
@@ -74,7 +76,7 @@ BWA_LIB=    libbwa.a
 SAFE_STR_LIB=    ext/safestringlib/libsafestring.a
 
 # Architecture-specific builds (x86 only, ARM uses default from above)
-ifneq ($(UNAME_M),arm64)
+ifeq ($(IS_ARM),)
 ifeq ($(arch),sse41)
 	ifeq ($(CXX), icpc)
 		ARCH_FLAGS=-msse4.1
@@ -116,7 +118,7 @@ endif
 endif
 
 # ARM64/Apple Silicon single-binary build
-ifeq ($(UNAME_M),arm64)
+ifneq ($(IS_ARM),)
 ifeq ($(arch),arm64)
     ARCH_FLAGS = -DAPPLE_SILICON=1
 else ifeq ($(arch),)
@@ -135,7 +137,7 @@ CXXFLAGS+=	-g -O3 -fpermissive $(ARCH_FLAGS) #-Wall ##-xSSE2
 all:$(EXE)
 
 multi:
-ifeq ($(UNAME_M),arm64)
+ifneq ($(IS_ARM),)
 	@echo "ARM64 detected - building single arm64 binary instead of multi"
 	$(MAKE) arm64
 else

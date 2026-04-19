@@ -852,10 +852,13 @@ int kswv::kswv_neon_16(int16_t seq1SoA[],
 
             /* Core computation */
             int16x8_t xor_val = veorq_s16(s1, s2);
-            /* Use table lookup with limited index range */
-            int16x8_t sbt = vqtbl1q_s8(vreinterpretq_s8_s16(perm_vec),
-                                        vreinterpretq_u8_s16(xor_val));
-            sbt = vreinterpretq_s16_s8(sbt);
+            /* Table lookup with limited index range. vqtbl1q_s8 returns
+             * int8x16_t; reinterpret to int16x8_t so downstream arithmetic
+             * on `sbt` (vaddq_s16, etc.) types correctly. Apple's clang
+             * accepts the implicit conversion; gcc aarch64 does not. */
+            int16x8_t sbt = vreinterpretq_s16_s8(
+                vqtbl1q_s8(vreinterpretq_s8_s16(perm_vec),
+                           vreinterpretq_u8_s16(xor_val)));
 
             /* Check for boundary */
             int16x8_t or_val = vorrq_s16(s1, s2);
