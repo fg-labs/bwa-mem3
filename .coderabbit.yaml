@@ -1,0 +1,10 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+#
+# Review PRs targeting our fg-main integration branch in addition to the
+# repository's default branch (master). The default branch is always
+# reviewed; this list adds extra base branches.
+language: "en"
+reviews:
+  auto_review:
+    base_branches:
+      - "fg-main"
