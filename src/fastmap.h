@@ -78,4 +78,22 @@ void *kopen(const char *fn, int *_fd);
 int kclose(void *a);
 int main_mem(int argc, char *argv[]);
 
+// Allocate all per-worker scratch buffers (chaining arrays, BSW buffers, BWT
+// scratch) on `w`, sized for `nreads` and `nthreads`. Exposed so that
+// consumers of libbwa.a that build their own worker_t (e.g. language
+// bindings) can reuse the exact same allocation layout as the bwa-mem2
+// pipeline and stay in sync across future changes. Records `nthreads` on
+// `w.nthreads` so the matching worker_free can validate the pairing. Prints
+// a small summary to stderr. Asserts on allocation failure (matching the
+// rest of bwa-mem2).
+void worker_alloc(const mem_opt_t *opt, worker_t &w, int32_t nreads, int32_t nthreads);
+
+// Release all per-worker scratch buffers previously allocated by
+// worker_alloc. `nthreads` must match the value passed to the paired
+// worker_alloc call (asserted against `w.nthreads`) so the per-thread loops
+// iterate over exactly the slots that were populated. Exposed as the public
+// counterpart to worker_alloc so external consumers don't need to duplicate
+// the teardown logic.
+void worker_free(worker_t &w, int32_t nthreads);
+
 #endif
