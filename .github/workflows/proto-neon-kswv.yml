@@ -1,0 +1,308 @@
+name: proto-neon-kswv
+
+# Correctness + perf harness for wiring NEON kswv into the mate-rescue path
+# on ARM. Runs on the proto/neon-kswv-* branches only. Not gated on main.
+#
+# Jobs:
+#   selftest-perf-arm  — build port + control, run kswv_selftest, run mem
+#                         on dwgsim/chr17 with both builds, report speedup.
+#   reference-x86      — build AVX-512 reference, run mem, produce reference SAM.
+#   sam-identity       — diff md5 of sorted SAM from arm (port build) vs x86.
+
+on:
+  push:
+    branches:
+      - 'proto/neon-kswv-**'
+  pull_request:
+    branches:
+      - 'fg-main'
+    paths:
+      - 'src/**'
+      - 'test/kswv_selftest.cpp'
+      - '.github/workflows/proto-neon-kswv.yml'
+      - 'Makefile'
+  workflow_dispatch:
+
+env:
+  CHR17_URL: "https://hgdownload.soe.ucsc.edu/goldenpath/hg38/chromosomes/chr17.fa.gz"
+  CHR17_MD5: "023ccefd298db339159a446e88d742ac"  # UCSC hg38 chr17.fa.gz, verified 2026-04-19
+  N_PAIRS: "100000"  # adaptive: bump to 500000 once the harness is green
+  N_REPS: "3"
+
+jobs:
+  selftest-perf-arm:
+    name: ARM selftest + port/control perf
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          submodules: recursive
+
+      - name: Install apt dependencies
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev samtools
+
+      - name: Build dwgsim
+        run: |
+          git clone --recursive https://github.com/nh13/DWGSIM.git /tmp/dwgsim-src
+          make -C /tmp/dwgsim-src -j"$(nproc)"
+
+      - name: Cache chr17 reference
+        id: cache-chr17
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: /tmp/ci-ref/chr17.fa
+          key: chr17-${{ env.CHR17_MD5 }}
+
+      - name: Download chr17 if cache miss
+        if: steps.cache-chr17.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p /tmp/ci-ref
+          curl -sL "$CHR17_URL" -o /tmp/ci-ref/chr17.fa.gz
+          got_md5="$(md5sum /tmp/ci-ref/chr17.fa.gz | awk '{print $1}')"
+          if [ "$got_md5" != "$CHR17_MD5" ]; then
+            echo "chr17.fa.gz md5 mismatch: expected $CHR17_MD5, got $got_md5"
+            exit 1
+          fi
+          gunzip /tmp/ci-ref/chr17.fa.gz
+
+      - name: Build port (gates widened; no-op on this branch until the port lands)
+        run: |
+          make clean
+          make -j"$(nproc)" CXX=g++
+          mv bwa-mem2.arm64 bwa-mem2.port
+          cp libbwa.a libbwa.port.a
+
+      - name: Build control (DISABLE_BATCHED_MATESW=1)
+        run: |
+          make clean
+          make -j"$(nproc)" DISABLE_BATCHED_MATESW=1 CXX=g++
+          mv bwa-mem2.arm64 bwa-mem2.control
+
+      - name: Build kswv_selftest
+        run: |
+          # Use the 'port' libbwa; the selftest only exercises kswv regardless.
+          cp libbwa.port.a libbwa.a
+          make arch=arm64 kswv_selftest CXX=g++
+
+      - name: Run kswv_selftest
+        id: selftest
+        continue-on-error: true  # iterating; surface result without gating CI yet
+        run: |
+          ./kswv_selftest 2>&1 | tee /tmp/selftest.log
+          status=${PIPESTATUS[0]}
+          echo "selftest_exit=$status" >> "$GITHUB_OUTPUT"
+          tail -25 /tmp/selftest.log >> "$GITHUB_STEP_SUMMARY"
+          exit $status
+
+      - name: Cache chr17 bwa-mem2 index
+        id: cache-chr17-index
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            /tmp/ci-ref/chr17.fa.0123
+            /tmp/ci-ref/chr17.fa.amb
+            /tmp/ci-ref/chr17.fa.ann
+            /tmp/ci-ref/chr17.fa.bwt.2bit.64
+            /tmp/ci-ref/chr17.fa.pac
+          key: chr17-bwamem2-index-${{ env.CHR17_MD5 }}
+
+      - name: Build chr17 index if cache miss
+        if: steps.cache-chr17-index.outputs.cache-hit != 'true'
+        run: ./bwa-mem2.port index /tmp/ci-ref/chr17.fa
+
+      - name: Simulate dwgsim reads
+        run: |
+          mkdir -p /tmp/ci-reads
+          /tmp/dwgsim-src/dwgsim \
+            -z 42 \
+            -N "$N_PAIRS" -1 100 -2 100 \
+            -e 0.01 -E 0.01 -r 0.001 -R 0 \
+            /tmp/ci-ref/chr17.fa \
+            /tmp/ci-reads/reads
+
+      - name: Run mem (port build)
+        run: |
+          mkdir -p /tmp/ci-out
+          for rep in $(seq 1 "$N_REPS"); do
+            /usr/bin/time -v ./bwa-mem2.port mem -t "$(nproc)" \
+              /tmp/ci-ref/chr17.fa \
+              /tmp/ci-reads/reads.bwa.read1.fastq.gz /tmp/ci-reads/reads.bwa.read2.fastq.gz \
+              > /tmp/ci-out/port.rep${rep}.sam \
+              2> /tmp/ci-out/port.rep${rep}.time
+          done
+
+      - name: Run mem (control build)
+        run: |
+          for rep in $(seq 1 "$N_REPS"); do
+            /usr/bin/time -v ./bwa-mem2.control mem -t "$(nproc)" \
+              /tmp/ci-ref/chr17.fa \
+              /tmp/ci-reads/reads.bwa.read1.fastq.gz /tmp/ci-reads/reads.bwa.read2.fastq.gz \
+              > /tmp/ci-out/control.rep${rep}.sam \
+              2> /tmp/ci-out/control.rep${rep}.time
+          done
+
+      - name: Report speedup
+        run: |
+          extract_elapsed() {
+            awk '/Elapsed \(wall clock\) time/ { split($NF, t, ":"); if (length(t)==3) print t[1]*3600+t[2]*60+t[3]; else print t[1]*60+t[2] }' "$1"
+          }
+          median3() {
+            awk '{print $1}' "$1" | sort -n | head -2 | tail -1
+          }
+          {
+            echo "## ARM perf A/B (port vs control, DISABLE_BATCHED_MATESW)"
+            echo ""
+            echo "| rep | port (s) | control (s) |"
+            echo "| --- | --------:| -----------:|"
+            for rep in $(seq 1 "$N_REPS"); do
+              p=$(extract_elapsed /tmp/ci-out/port.rep${rep}.time)
+              c=$(extract_elapsed /tmp/ci-out/control.rep${rep}.time)
+              echo "| $rep | $p | $c |"
+              echo "$p" >> /tmp/ci-out/port.elapsed
+              echo "$c" >> /tmp/ci-out/control.elapsed
+            done
+            pm=$(median3 /tmp/ci-out/port.elapsed)
+            cm=$(median3 /tmp/ci-out/control.elapsed)
+            echo ""
+            echo "median port: ${pm}s, median control: ${cm}s"
+            if [ -n "$pm" ] && [ -n "$cm" ] && [ "$pm" != "0" ]; then
+              speedup=$(awk -v p="$pm" -v c="$cm" 'BEGIN { printf "%.2f", c/p }')
+              pct=$(awk -v p="$pm" -v c="$cm" 'BEGIN { printf "%+.1f%%", 100*(c-p)/c }')
+              echo "speedup (control / port): ${speedup}x  (${pct})"
+            fi
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Sort + md5 port SAM for identity check
+        run: |
+          samtools sort -@ "$(nproc)" -n /tmp/ci-out/port.rep1.sam -o /tmp/ci-out/port.sorted.bam
+          samtools view /tmp/ci-out/port.sorted.bam | md5sum | awk '{print $1}' > /tmp/ci-out/port.sam.md5
+          echo "ARM port SAM md5: $(cat /tmp/ci-out/port.sam.md5)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: arm-outputs
+          path: |
+            /tmp/ci-out/port.sam.md5
+            /tmp/ci-out/port.rep1.sam
+            /tmp/selftest.log
+
+  reference-x86:
+    name: x86 reference SAM (AVX-512)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          submodules: recursive
+
+      - name: Install apt dependencies
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev samtools
+
+      - name: Check AVX-512 availability
+        run: |
+          if ! grep -q avx512bw /proc/cpuinfo; then
+            echo "::warning::AVX-512BW not available on this runner; falling back to AVX2 reference"
+            echo "USE_AVX=avx2" >> "$GITHUB_ENV"
+          else
+            echo "USE_AVX=avx512" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build dwgsim
+        run: |
+          git clone --recursive https://github.com/nh13/DWGSIM.git /tmp/dwgsim-src
+          make -C /tmp/dwgsim-src -j"$(nproc)"
+
+      - name: Cache chr17 reference
+        id: cache-chr17
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: /tmp/ci-ref/chr17.fa
+          key: chr17-${{ env.CHR17_MD5 }}
+
+      - name: Download chr17 if cache miss
+        if: steps.cache-chr17.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p /tmp/ci-ref
+          curl -sL "$CHR17_URL" -o /tmp/ci-ref/chr17.fa.gz
+          got_md5="$(md5sum /tmp/ci-ref/chr17.fa.gz | awk '{print $1}')"
+          if [ "$got_md5" != "$CHR17_MD5" ]; then
+            echo "chr17.fa.gz md5 mismatch: expected $CHR17_MD5, got $got_md5"
+            exit 1
+          fi
+          gunzip /tmp/ci-ref/chr17.fa.gz
+
+      - name: Build bwa-mem2 (x86 reference)
+        run: make -j"$(nproc)" arch="$USE_AVX" CXX=g++
+
+      - name: Index chr17
+        run: ./bwa-mem2 index /tmp/ci-ref/chr17.fa
+
+      - name: Simulate dwgsim reads (same params as ARM job)
+        run: |
+          mkdir -p /tmp/ci-reads
+          /tmp/dwgsim-src/dwgsim \
+            -z 42 \
+            -N "$N_PAIRS" -1 100 -2 100 \
+            -e 0.01 -E 0.01 -r 0.001 -R 0 \
+            /tmp/ci-ref/chr17.fa \
+            /tmp/ci-reads/reads
+
+      - name: Run mem + sort + md5
+        run: |
+          mkdir -p /tmp/ci-out
+          ./bwa-mem2 mem -t "$(nproc)" \
+            /tmp/ci-ref/chr17.fa \
+            /tmp/ci-reads/reads.bwa.read1.fastq.gz /tmp/ci-reads/reads.bwa.read2.fastq.gz \
+            > /tmp/ci-out/x86.sam
+          samtools sort -@ "$(nproc)" -n /tmp/ci-out/x86.sam -o /tmp/ci-out/x86.sorted.bam
+          samtools view /tmp/ci-out/x86.sorted.bam | md5sum | awk '{print $1}' > /tmp/ci-out/x86.sam.md5
+          echo "x86 reference (${USE_AVX}) SAM md5: $(cat /tmp/ci-out/x86.sam.md5)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: x86-outputs
+          path: |
+            /tmp/ci-out/x86.sam.md5
+            /tmp/ci-out/x86.sam
+
+  sam-identity:
+    name: cross-arch SAM identity
+    needs: [selftest-perf-arm, reference-x86]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download ARM outputs
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: arm-outputs
+          path: /tmp/arm-outputs
+
+      - name: Download x86 outputs
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: x86-outputs
+          path: /tmp/x86-outputs
+
+      - name: Diff md5s
+        run: |
+          arm_md5="$(cat /tmp/arm-outputs/port.sam.md5)"
+          x86_md5="$(cat /tmp/x86-outputs/x86.sam.md5)"
+          {
+            echo "## Cross-arch SAM identity"
+            echo ""
+            echo "- ARM (port): \`$arm_md5\`"
+            echo "- x86 (reference): \`$x86_md5\`"
+            echo ""
+            if [ "$arm_md5" = "$x86_md5" ]; then
+              echo "PASS: byte-identical sorted SAM across arches."
+            else
+              echo "FAIL: SAM md5 differs. Expected on scaffolding PR before port lands."
+            fi
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          # Soft-fail on scaffolding; the divergence is expected (ARM scalar
+          # mem_sam_pe vs x86 batched mem_sam_pe_batch produce equivalent but
+          # not byte-identical SAM in some rare PE cases). Flip to strict once
+          # the port lands.
+          if [ "$arm_md5" != "$x86_md5" ]; then exit 0; fi

@@ -177,9 +177,19 @@ myall:arm64
 endif
 endif
 
-CXXFLAGS+=	-g -O3 -fpermissive $(ARCH_FLAGS) #-Wall ##-xSSE2
+CXXFLAGS+=	-g -O3 -std=gnu++14 -fpermissive $(ARCH_FLAGS) #-Wall ##-xSSE2
 
-.PHONY:all clean depend multi print-mimalloc-config
+# Control build flag for the batched mate-rescue SW port on ARM.
+# When set (e.g. `make arm64 DISABLE_BATCHED_MATESW=1`), the source gate for
+# the new batched path falls through to the legacy scalar mem_sam_pe. Used by
+# the proto-neon-kswv CI to A/B the same commit with the port on vs. off.
+# Pass the caller-supplied value through verbatim so `DISABLE_BATCHED_MATESW=0`
+# still selects the batched path (ifdef would be true even for =0).
+ifneq ($(strip $(DISABLE_BATCHED_MATESW)),)
+    CPPFLAGS += -DDISABLE_BATCHED_MATESW=$(DISABLE_BATCHED_MATESW)
+endif
+
+.PHONY:all clean depend multi print-mimalloc-config kswv_selftest test
 .SUFFIXES:.cpp .o
 
 .cpp.o:
@@ -214,6 +224,18 @@ arm64:
 
 $(EXE):$(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) $(if $(filter 1,$(USE_MIMALLOC)),$(MIMALLOC_LIB)) src/main.o
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) src/main.o $(BWA_LIB) $(LIBS) $(MIMALLOC_LDFLAGS) -o $@
+
+# kswv self-consistency test: batched SIMD kswv vs scalar ksw_align2 reference.
+# Built by the proto-neon-kswv CI workflow; runnable standalone.
+kswv_selftest: $(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) test/kswv_selftest.o
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) test/kswv_selftest.o $(BWA_LIB) $(LIBS) -o $@
+
+# Run the in-tree tests. Currently just kswv_selftest; extend as more land.
+test: kswv_selftest
+	./kswv_selftest
+
+test/kswv_selftest.o: test/kswv_selftest.cpp
+	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $< -o $@
 
 $(BWA_LIB):$(OBJS)
 	ar rcs $(BWA_LIB) $(OBJS)
@@ -257,7 +279,7 @@ $(MIMALLOC_LIB):
 	cd $(MIMALLOC_BUILD) && cmake $(MIMALLOC_CMAKE_FLAGS) .. && $(MAKE)
 
 clean:
-	rm -fr src/*.o $(BWA_LIB) $(EXE) bwa-mem2.sse41 bwa-mem2.sse42 bwa-mem2.avx bwa-mem2.avx2 bwa-mem2.avx512bw bwa-mem2.arm64
+	rm -fr src/*.o test/*.o $(BWA_LIB) $(EXE) kswv_selftest bwa-mem2.sse41 bwa-mem2.sse42 bwa-mem2.avx bwa-mem2.avx2 bwa-mem2.avx512bw bwa-mem2.arm64
 	cd ext/safestringlib/ && $(MAKE) clean
 	-[ -f ext/htslib/config.mk ] && cd ext/htslib && $(MAKE) distclean
 	rm -rf $(MIMALLOC_BUILD)
