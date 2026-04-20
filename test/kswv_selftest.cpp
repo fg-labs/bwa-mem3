@@ -188,6 +188,18 @@ static BatchResult run_batched(const std::vector<TestPair> &pairs,
     pwsw->getScores8(pairArray.data(), seqBufRef.data(), seqBufQer.data(),
                      out.aln.data(), n, 1, 0);
 
+    // Diagnostic: capture phase-0 output before phase 1 runs so we can
+    // distinguish "phase 0 never set te/qe" from "phase 1 clobbered them".
+    if (const char *dbg = getenv("KSWV_SELFTEST_DEBUG_PHASE0")) {
+        (void)dbg;
+        int nprint = (n < 5) ? n : 5;
+        for (int i = 0; i < nprint; i++) {
+            fprintf(stderr, "[debug-phase0] pair %d: score=%d te=%d qe=%d tb=%d qb=%d\n",
+                    i, out.aln[i].score, out.aln[i].te, out.aln[i].qe,
+                    out.aln[i].tb, out.aln[i].qb);
+        }
+    }
+
     // Between passes: replicate the production code at bwamem_pair.cpp:661-683.
     // For each pair, reverse seq prefixes up to (te+1, qe+1), set h0 to
     // KSW_XSTOP | score, trim len2 to qe+1, keep the pair in the batch.
