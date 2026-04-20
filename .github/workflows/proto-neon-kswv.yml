@@ -14,6 +14,7 @@ on:
     branches:
       - 'proto/neon-kswv-**'
       - 'proto/avx2-kswv-**'
+      - 'proto/avx512-kswv-**'
   pull_request:
     branches:
       - 'fg-main'
@@ -269,10 +270,9 @@ jobs:
           make arch="$USE_AVX" kswv_selftest CXX=g++
 
       - name: Run kswv_selftest (x86)
-        # AVX2 kernel has all four NEON fixes pre-applied and passes cleanly.
-        # AVX-512BW is still carrying the pre-existing bug class we fixed
-        # in NEON — soft-fail only when running against the AVX-512 kernel.
-        continue-on-error: ${{ env.USE_AVX == 'avx512' }}
+        # Strict gate for both AVX2 and AVX-512BW: all four NEON fixes
+        # (te split, freeze, per-lane score2, minsc filter) are applied
+        # on both paths — AVX2 from PR 20, AVX-512BW by this PR.
         run: ./kswv_selftest
 
       - name: Index chr17
@@ -378,7 +378,7 @@ jobs:
             echo "## Cross-arch SAM identity"
             echo ""
             echo "- ARM (port, NEON batched mate-rescue): \`$arm_md5\`"
-            echo "- x86 (reference, scalar mate-rescue on AVX2 runners): \`$x86_md5\`"
+            echo "- x86 (port build; batched on AVX-512, scalar on AVX2 runners): \`$x86_md5\`"
             echo ""
             if [ "$arm_md5" = "$x86_md5" ]; then
               echo "PASS: byte-identical sorted SAM across arches."
