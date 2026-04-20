@@ -49,8 +49,8 @@ int usage()
 {
     fprintf(stderr, "Usage: bwa-mem2 <command> <arguments>\n");
     fprintf(stderr, "Commands:\n");
-    fprintf(stderr, "  index         create index\n");
-    fprintf(stderr, "  mem           alignment\n");
+    fprintf(stderr, "  index         create index (add --meth to build a bwameth-style doubled c2t reference)\n");
+    fprintf(stderr, "  mem           alignment (add --meth for bisulfite-seq: inline c2t + BAM output)\n");
     fprintf(stderr, "  version       print version number\n");
     return 1;
 }
@@ -118,7 +118,8 @@ int main(int argc, char* argv[])
         }
 #endif
         return 0;
-    } else {
+    }
+    else {
         fprintf(stderr, "ERROR: unknown command '%s'\n", argv[1]);
         return 1;
     }

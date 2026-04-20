@@ -32,6 +32,11 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "FMI_search.h"
 #include "memcpy_bwamem.h"
 #include "bam_writer.h"
+#include "meth_bam.h"
+/* Not including <htslib/sam.h>: its kstring.h shares the KSTRING_H guard
+ * with bwa-mem2's. Opaque bam1_t wrappers live in bam_writer.h. */
+
+meth_chrom_map_t *g_meth_cmap = NULL;
 
 //----------------
 extern uint64_t tprof[LIM_R][LIM_C];
@@ -1562,17 +1567,10 @@ void mem_reg2sam(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
         mem_aln_t t;
         t = mem_reg2aln(opt, bns, pac, s->l_seq, s->seq, 0);
         t.flag |= extra_flag;
-        if (opt->bam_mode)
-            bam_writer_push_aln(s, opt, bns, 1, &t, 0, m);
-        else
-            mem_aln2sam(opt, bns, &str, s, 1, &t, 0, m);
+        mem_aln2sam(opt, bns, &str, s, 1, &t, 0, m);
     } else {
-        for (k = 0; k < aa.n; ++k) {
-            if (opt->bam_mode)
-                bam_writer_push_aln(s, opt, bns, aa.n, aa.a, k, m);
-            else
-                mem_aln2sam(opt, bns, &str, s, aa.n, aa.a, k, m);
-        }
+        for (k = 0; k < aa.n; ++k)
+            mem_aln2sam(opt, bns, &str, s, aa.n, aa.a, k, m);
         for (k = 0; k < aa.n; ++k) free(aa.a[k].cigar);
         free(aa.a);
     }
@@ -1599,6 +1597,26 @@ static inline void add_cigar(const mem_opt_t *opt, mem_aln_t *p, kstring_t *str,
 void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str,
                  bseq1_t *s, int n, const mem_aln_t *list, int which, const mem_aln_t *m_)
 {
+    /* BAM short-circuit: meth_mode applies the bisulfite overlay (chrom
+     * consolidation, YD:Z, chimera QC), plain bam_mode uses the generic
+     * writer. Either path leaves `str` untouched. */
+    if (opt->meth_mode && g_meth_cmap != NULL) {
+        struct bam1_t *b = bam_writer_alloc();
+        if (b == NULL)
+            err_fatal(__func__, "out of memory allocating bam1_t for meth record");
+        if (meth_mem_aln_to_bam(b, opt, bns, s, n, list, which, m_, g_meth_cmap) != 0) {
+            bam_writer_free(b);
+            err_fatal(__func__, "meth BAM conversion failed for read \"%s\"", s->name);
+        }
+        bam_writer_bseq_push(s, b);
+        return;
+    }
+    if (opt->bam_mode) {
+        if (bam_writer_push_aln(s, opt, bns, n, list, which, m_) != 0)
+            err_fatal(__func__, "BAM conversion failed for read \"%s\"", s->name);
+        return;
+    }
+
     int i, l_name;
     mem_aln_t ptmp = list[which], *p = &ptmp, mtmp, *m = 0; // make a copy of the alignment to convert
 

@@ -1,0 +1,12 @@
+ref.fa
+ref.fa.*
+ref.c2t.fasta*
+ref_idx.fa*
+t_R1.fastq.gz
+t_R2.fastq.gz
+*.bam
+*.sorted.bam
+*.sorted.bam.bai
+# pixi environments
+.pixi/*
+!.pixi/config.toml

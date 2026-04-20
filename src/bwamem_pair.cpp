@@ -564,14 +564,19 @@ int mem_sam_pe(const mem_opt_t *opt, const bntseq_t *bns,
                 aa[i][n_aa[i]++] = g[i];
             }
         }
+        for (i = 0; i < n_aa[0]; ++i)
+            mem_aln2sam(opt, bns, &str, &s[0], n_aa[0], aa[0], i, &h[1]);
+
         if (opt->bam_mode) {
-            for (i = 0; i < n_aa[0]; ++i)
-                bam_writer_push_aln(&s[0], opt, bns, n_aa[0], aa[0], i, &h[1]);
+            /* BAM path (meth or generic): mem_aln2sam short-circuited
+             * into s->bams, leaving str untouched. Skip the str.s dance. */
+            s[0].sam = NULL;
+            str.l = 0;
             for (i = 0; i < n_aa[1]; ++i)
-                bam_writer_push_aln(&s[1], opt, bns, n_aa[1], aa[1], i, &h[0]);
+                mem_aln2sam(opt, bns, &str, &s[1], n_aa[1], aa[1], i, &h[0]);
+            s[1].sam = NULL;
+            free(str.s); str.s = NULL; str.m = 0;
         } else {
-            for (i = 0; i < n_aa[0]; ++i)
-                mem_aln2sam(opt, bns, &str, &s[0], n_aa[0], aa[0], i, &h[1]); // write read1 hits
             assert(str.s != 0);
             s[0].sam = strdup(str.s); str.l = 0;
             for (i = 0; i < n_aa[1]; ++i)
@@ -947,14 +952,19 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                 aa[i][n_aa[i]++] = g[i];
             }
         }
+        for (i = 0; i < n_aa[0]; ++i)
+            mem_aln2sam(opt, bns, &str, &s[0], n_aa[0], aa[0], i, &h[1]);
+
         if (opt->bam_mode) {
-            for (i = 0; i < n_aa[0]; ++i)
-                bam_writer_push_aln(&s[0], opt, bns, n_aa[0], aa[0], i, &h[1]);
+            /* BAM path (meth or generic): mem_aln2sam short-circuited
+             * into s->bams, leaving str untouched. Skip the str.s dance. */
+            s[0].sam = NULL;
+            str.l = 0;
             for (i = 0; i < n_aa[1]; ++i)
-                bam_writer_push_aln(&s[1], opt, bns, n_aa[1], aa[1], i, &h[0]);
+                mem_aln2sam(opt, bns, &str, &s[1], n_aa[1], aa[1], i, &h[0]);
+            s[1].sam = NULL;
+            free(str.s); str.s = NULL; str.m = 0;
         } else {
-            for (i = 0; i < n_aa[0]; ++i)
-                mem_aln2sam(opt, bns, &str, &s[0], n_aa[0], aa[0], i, &h[1]);
             assert(str.s != 0);
             s[0].sam = strdup(str.s); str.l = 0;
             for (i = 0; i < n_aa[1]; ++i)

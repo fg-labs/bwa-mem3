@@ -30,11 +30,23 @@
 
 
 EXE=		fmi_test smem2_test bwt_seed_strategy_test sa2ref_test xeonbsw
-CXX=		icpc
-CXXFLAGS=	-std=c++11 -fopenmp -mtune=native -march=native
+
+# On Apple Silicon (and any non-icpc host), use the system compiler and drop
+# -fopenmp / -march=native. Override with `make CXX=icpc` to restore the
+# original Intel toolchain configuration.
+UNAME_M := $(shell uname -m)
+ifeq ($(UNAME_M),arm64)
+    CXX ?=      clang++
+    CXXFLAGS ?= -std=c++11 -O2
+    LIBS ?=     -L.. -lz -lbwa ../ext/safestringlib/libsafestring.a
+else
+    CXX ?=      icpc
+    CXXFLAGS ?= -std=c++11 -fopenmp -mtune=native -march=native
+    LIBS ?=     -L.. -fopenmp -lz -lbwa ../ext/safestringlib/libsafestring.a
+endif
+
 CPPFLAGS=	-DENABLE_PREFETCH
-INCLUDES=	-I../src
-LIBS=		-L.. -fopenmp -lz -lbwa ../ext/safestringlib/libsafestring.a
+INCLUDES=	-I../src -I../ext/safestringlib/include
 
 .PHONY:all clean depend
 .SUFFIXES:.cpp .o

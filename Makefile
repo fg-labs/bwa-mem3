@@ -121,7 +121,7 @@ LIBS=		-lpthread -lm -lz -L. -lbwa -Lext/safestringlib -lsafestring -Lext/htslib
 OBJS=		src/fastmap.o src/bwtindex.o src/utils.o src/memcpy_bwamem.o src/kthread.o \
 			src/kstring.o src/ksw.o src/bntseq.o src/bwamem.o src/profiling.o src/bandedSWA.o \
 			src/FMI_search.o src/read_index_ele.o src/bwamem_pair.o src/kswv.o src/bwa.o \
-			src/bwamem_extra.o src/kopen.o src/bam_writer.o
+			src/bwamem_extra.o src/kopen.o src/bam_writer.o src/meth_bam.o
 BWA_LIB=    libbwa.a
 SAFE_STR_LIB=    ext/safestringlib/libsafestring.a
 HTS_LIB=    ext/htslib/libhts.a
@@ -217,6 +217,13 @@ $(EXE):$(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) $(if $(filter 1,$(USE_MIMALLOC)),$(
 
 $(BWA_LIB):$(OBJS)
 	ar rcs $(BWA_LIB) $(OBJS)
+
+$(HTS_LIB):
+	cd ext/htslib && \
+	    ([ -f Makefile ] || (autoreconf -i && \
+	        ./configure --disable-lzma --disable-libcurl --disable-gcs \
+	                    --disable-s3 --disable-plugins --disable-bz2)) && \
+	    $(MAKE) libhts.a
 
 # On macOS, safestringlib needs stdlib.h for abort() and the memset_s
 # declaration conflicts with macOS C11 Annex K (different signature).
@@ -322,3 +329,4 @@ src/read_index_ele.o: src/macro.h
 src/utils.o: src/utils.h src/ksort.h src/kseq.h
 src/memcpy_bwamem.o: src/memcpy_bwamem.h
 src/bam_writer.o: src/bam_writer.h src/bwamem.h src/bwa.h src/bntseq.h
+src/meth_bam.o: src/meth_bam.h src/bwamem.h src/bwa.h src/bntseq.h

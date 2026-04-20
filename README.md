@@ -178,6 +178,78 @@ The following are the highlights of the ert based bwa-mem2 tool:
 6. The code is present in ert branch: https://github.com/bwa-mem2/bwa-mem2/tree/ert
 
 
+## Bisulfite-Sequencing Mode (fork)
+
+This fork (`nh13/bwa-mem2`, branch `meth`) is a **single-binary drop-in
+replacement for the `bwameth.py` pipeline**. No Python, no bwameth.py, no
+piped preprocessing — one `bwa-mem2 index --meth` for the reference, one
+`bwa-mem2 mem --meth` for alignment.
+
+### Usage
+
+Build a c2t doubled reference once:
+```sh
+bwa-mem2 index --meth ref.fa
+# writes ref.fa.bwameth.c2t and its FMI alongside the input FASTA
+```
+
+Align raw FASTQs (paired-end or single-end):
+```sh
+bwa-mem2 mem --meth -t 16 ref.fa R1.fq.gz R2.fq.gz \
+  | samtools sort -o out.bam
+samtools index out.bam
+```
+
+`--meth` turns on:
+- **Inline c2t read conversion** — R1 gets `C→T`, R2 gets `G→A`, with the
+  original sequence stashed as a `YS:Z:` comment tag and the conversion
+  direction as `YC:Z:` (bwameth.py convention; both pass through to SAM).
+- **Auto-append `.bwameth.c2t`** to the reference path so the user passes
+  the original FASTA prefix, not the c2t file.
+- **bwameth.py-equivalent flag defaults:** `-B 2 -L 10 -U 100 -T 40 -CM`.
+  Users can still override any of them.
+- **Inline BAM post-processing:** strips `f`/`r` prefix from `@SQ`/`RNAME`
+  consolidating to one `@SQ` per real chromosome, emits `YD:Z:{f,r}` on
+  mapped records, chimera QC (longest `M`/`=`/`X` run < 44% of read length
+  → `0x200`, clear `0x2`, cap MAPQ at 1), pair-level QC-fail propagation,
+  and a `@PG ID:bwa-mem2-meth` entry. Output is uncompressed BAM via
+  htslib (`wb0`) — near-free CPU cost, fully readable by `samtools`.
+
+On the `bwa-meth/example/` fixture, `bwa-mem2 mem --meth` produces SAM
+output that is **byte-for-byte equivalent to `bwameth.py` end-to-end**:
+same record count, same chrom+pos, same CIGAR for every mapped primary.
+
+### Additional options
+
+- `--set-as-failed {f,r}` — flag alignments aligned to the given strand as QC-fail (`0x200`).
+- `--do-not-penalize-chimeras` — skip the longest-match < 44% chimera heuristic.
+
+### Legacy bwameth.py-compatible invocation
+
+For callers that already do their own c2t conversion (e.g. bwameth.py's
+internal `bwameth.py c2t ... | bwa-mem2 mem ...` pipeline), pass the c2t
+reference path directly — `mem --meth` detects the `.bwameth.c2t` suffix
+and skips the auto-append:
+```sh
+bwameth.py c2t R1.fq.gz R2.fq.gz \
+  | bwa-mem2 mem --meth -p -t 16 ref.fa.bwameth.c2t /dev/stdin \
+  | samtools sort -o out.bam
+```
+
+### Build notes
+
+This fork pulls in [htslib](https://github.com/samtools/htslib) as a git submodule (at `ext/htslib`, pinned to v1.21) for BAM I/O. htslib is configured with a minimal feature set (no lzma, no libcurl, no S3/GCS/plugins, no bz2) so the only runtime dependency remains zlib, which `bwa-mem2` already requires. The submodule is fetched and built automatically by `make`.
+
+Clone with submodules:
+```sh
+git clone --recursive --branch meth git@github.com:nh13/bwa-mem2.git
+```
+
+Or if you already cloned without `--recursive`:
+```sh
+git submodule update --init --recursive
+```
+
 ## Citation
 
 Vasimuddin Md, Sanchit Misra, Heng Li, Srinivas Aluru.
