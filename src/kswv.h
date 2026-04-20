@@ -83,6 +83,11 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #elif __AVX512BW__
     #define SIMD_WIDTH8 64
     #define SIMD_WIDTH16 32
+#elif __AVX2__
+    /* AVX2 - 256-bit vectors. Stub kernel for now (phase 1); the real
+     * vector kernel lands on the c6i iteration in phase 2. */
+    #define SIMD_WIDTH8 32
+    #define SIMD_WIDTH16 16
 #endif
 
 #define max(x, y) ((x)>(y)?(x):(y))

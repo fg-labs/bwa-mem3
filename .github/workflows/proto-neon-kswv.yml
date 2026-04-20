@@ -250,6 +250,16 @@ jobs:
       - name: Build bwa-mem2 (x86 reference)
         run: make -j"$(nproc)" arch="$USE_AVX" CXX=g++
 
+      - name: Build kswv_selftest (x86)
+        # Exercises the x86 kswv kernel (AVX-512BW if available, else the
+        # AVX2 stub added in this branch). Failure here catches link issues
+        # in the AVX2 path before mem runs and also verifies the stub's
+        # scalar-fallback output matches ksw_align2.
+        run: make arch="$USE_AVX" kswv_selftest CXX=g++
+
+      - name: Run kswv_selftest (x86)
+        run: ./kswv_selftest
+
       - name: Index chr17
         run: ./bwa-mem2 index /tmp/ci-ref/chr17.fa
 

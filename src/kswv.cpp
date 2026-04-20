@@ -1061,6 +1061,92 @@ int kswv::kswv_neon_16(int16_t seq1SoA[],
     return 1;
 }
 
+#elif __AVX2__
+/* AVX2 stub kernel (phase 1 of the AVX2 port).
+ *
+ * Provides correct but unvectorized implementations of getScores8/16 so
+ * that arch=avx2 builds link and the batched mate-rescue path exercises
+ * all the infrastructure (selftest harness, CI gates, DISABLE_BATCHED_
+ * MATESW control flag). Each pair is processed serially through
+ * ksw_align2 — same output as scalar mem_sam_pe, just reached via the
+ * batched caller. Expected perf: no speedup over DISABLE_BATCHED_MATESW
+ * on AVX2 builds until the real 256-bit kernel lands in phase 2.
+ *
+ * Phase 2 replaces these stubs with a proper 32-lane u8 / 16-lane s16
+ * AVX2 kernel, modeled on the corrected NEON kernel above, not the
+ * AVX-512 kernel below (NEON passes the selftest byte-exactly; AVX-512
+ * hasn't been re-validated against the new selftest yet). */
+
+static void avx2_stub_getScores(SeqPair *pairArray,
+                                uint8_t *seqBufRef,
+                                uint8_t *seqBufQer,
+                                kswr_t *aln,
+                                int32_t numPairs,
+                                int8_t w_match, int8_t w_mismatch, int8_t w_ambig,
+                                int o_del, int e_del, int o_ins, int e_ins,
+                                int /*phase*/)
+{
+    /* Construct the 5x5 scoring matrix the same way mem_matesw does in
+     * production (via bwa_fill_scmat). Match scalar mem_sam_pe's defaults
+     * so output is bit-identical to the DISABLE_BATCHED_MATESW build. */
+    int8_t mat[25];
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 4; j++) {
+            mat[i*5 + j] = (i == j) ? w_match : w_mismatch;
+        }
+        mat[i*5 + 4] = w_ambig;
+        mat[4*5 + i] = w_ambig;
+    }
+    mat[24] = w_ambig;
+
+    for (int i = 0; i < numPairs; i++) {
+        SeqPair *p = pairArray + i;
+        kswr_t *myaln = aln + p->regid;
+
+        uint8_t *target = seqBufRef + p->idr;
+        uint8_t *query  = seqBufQer + p->idq;
+
+        kswr_t ks = ksw_align2(p->len2, query, p->len1, target, 5, mat,
+                               o_del, e_del, o_ins, e_ins, p->h0, nullptr);
+
+        myaln->score  = ks.score;
+        myaln->qe     = ks.qe;
+        myaln->te     = ks.te;
+        myaln->qb     = ks.qb;
+        myaln->tb     = ks.tb;
+        myaln->score2 = ks.score2;
+        myaln->te2    = ks.te2;
+    }
+}
+
+void kswv::getScores8(SeqPair *pairArray,
+                      uint8_t *seqBufRef,
+                      uint8_t *seqBufQer,
+                      kswr_t *aln,
+                      int32_t numPairs,
+                      uint16_t /*numThreads*/,
+                      int phase)
+{
+    avx2_stub_getScores(pairArray, seqBufRef, seqBufQer, aln, numPairs,
+                        this->w_match, this->w_mismatch, this->w_ambig,
+                        this->o_del, this->e_del, this->o_ins, this->e_ins,
+                        phase);
+}
+
+void kswv::getScores16(SeqPair *pairArray,
+                       uint8_t *seqBufRef,
+                       uint8_t *seqBufQer,
+                       kswr_t *aln,
+                       int32_t numPairs,
+                       uint16_t /*numThreads*/,
+                       int phase)
+{
+    avx2_stub_getScores(pairArray, seqBufRef, seqBufQer, aln, numPairs,
+                        this->w_match, this->w_mismatch, this->w_ambig,
+                        this->o_del, this->e_del, this->o_ins, this->e_ins,
+                        phase);
+}
+
 #elif __AVX512BW__
 /* AVX-512 Implementation for x86 */
 void kswv::getScores8(SeqPair *pairArray,
