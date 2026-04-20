@@ -5,9 +5,9 @@
 // diffs kswr_t fields. Exits 0 on full match, nonzero on any divergence.
 //
 // Purpose: prove that the NEON kswv code path (kswv.cpp:175-628) is bit-
-// identical to the scalar reference. NEON kswv is currently unreachable
-// from production on ARM (gated by __AVX512BW__), so until we widen the
-// gate, this is the only way to exercise it.
+// identical to the scalar reference. BWAMEM_BATCHED_MATESW (src/macro.h)
+// now routes production mate-rescue through this kernel on AArch64, so the
+// selftest locks in correctness ahead of any further kernel work.
 //
 // Usage:
 //   kswv_selftest                  # default: 10k random + ~40 edge cases

@@ -46,6 +46,26 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #define MAX_SEEDS_PER_READ 500       /* Max seeds per read */
 #define AVG_SEEDS_PER_READ 64        /* Used for storing seeds in chains*/
 
+/* BWAMEM_BATCHED_MATESW:
+ *   1 -> worker_sam takes the batched mate-rescue SW path
+ *        (mem_sam_pe_batch_pre / mem_sam_pe_batch / mem_sam_pe_batch_post,
+ *        feeding kswv::getScores8 / getScores16).
+ *   0 -> worker_sam takes the legacy scalar mem_sam_pe + ksw_align2 path.
+ *
+ * Historically gated on __AVX512BW__ only, which routed all non-AVX-512
+ * builds (ARM included) to the scalar path even though NEON kswv kernels
+ * exist. DISABLE_BATCHED_MATESW is an escape hatch for the A/B test in
+ * the proto-neon-kswv CI workflow. */
+#ifndef BWAMEM_BATCHED_MATESW
+  #if DISABLE_BATCHED_MATESW
+    #define BWAMEM_BATCHED_MATESW 0
+  #elif __AVX512BW__ || defined(__aarch64__) || defined(APPLE_SILICON)
+    #define BWAMEM_BATCHED_MATESW 1
+  #else
+    #define BWAMEM_BATCHED_MATESW 0
+  #endif
+#endif
+
 /* Apple Silicon has larger L2 caches (4-16MB per cluster) and benefits from
  * larger batch sizes to better utilize cache locality. M1/M2/M3/M4 all have
  * significantly more L2 cache per core than typical x86 consumer CPUs. */
