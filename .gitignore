@@ -3,3 +3,8 @@
 *.dSYM
 .*.swp
 a.out
+# Accelerator test binaries + intermediates
+test/accel_cache_test
+test/*.o
+ext/sha256/*.o
+src/accel_cache.o

@@ -29,8 +29,10 @@
 ##*****************************************************************************************/
 
 
-EXE=		fmi_test smem2_test bwt_seed_strategy_test sa2ref_test xeonbsw
-CXX=		icpc
+EXE=		fmi_test smem2_test bwt_seed_strategy_test sa2ref_test xeonbsw accel_cache_test
+# Default to the platform's system compiler (was icpc; not available on arm64).
+# Override with `make CXX=icpc` when building on Intel for maximum performance.
+CXX?=		c++
 CXXFLAGS=	-std=c++11 -fopenmp -mtune=native -march=native
 CPPFLAGS=	-DENABLE_PREFETCH
 INCLUDES=	-I../src
@@ -59,8 +61,26 @@ bwt_seed_strategy_test:bwt_seed_strategy_test.o
 xeonbsw:main_banded.o
 	$(CXX) -o $@ $^ $(LIBS)
 
+# Phase-1 accelerator tests. Self-contained — doesn't depend on libbwa
+# or safestringlib (hence the targeted flags, not $(CXXFLAGS) which
+# includes -fopenmp that clang on macOS doesn't ship).
+ACCEL_CXXFLAGS=	-std=c++11 -O2 -Wall
+ACCEL_CFLAGS=	-O2 -Wall
+
+accel_cache_test: accel_cache_test.o ../src/accel_cache.o ../ext/sha256/sha-256.o
+	$(CXX) $(ACCEL_CXXFLAGS) -o $@ $^
+
+accel_cache_test.o: accel_cache_test.cpp ../src/accel_cache.h
+	$(CXX) -c $(ACCEL_CXXFLAGS) -I../src accel_cache_test.cpp -o accel_cache_test.o
+
+../src/accel_cache.o: ../src/accel_cache.cpp ../src/accel_cache.h
+	$(CXX) -c $(ACCEL_CXXFLAGS) ../src/accel_cache.cpp -o ../src/accel_cache.o
+
+../ext/sha256/sha-256.o: ../ext/sha256/sha-256.c ../ext/sha256/sha-256.h
+	$(CC) -c $(ACCEL_CFLAGS) ../ext/sha256/sha-256.c -o ../ext/sha256/sha-256.o
+
 clean:
-	rm -fr *.o $(EXE)
+	rm -fr *.o $(EXE) ../src/accel_cache.o ../ext/sha256/sha-256.o
 
 
 # DO NOT DELETE
