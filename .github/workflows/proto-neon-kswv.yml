@@ -135,6 +135,11 @@ jobs:
               > /tmp/ci-out/port.rep${rep}.sam \
               2> /tmp/ci-out/port.rep${rep}.time || true
           done
+          echo "--- port rep1 tail (last 40 lines of stderr + timing) ---"
+          tail -40 /tmp/ci-out/port.rep1.time || true
+          echo "--- port rep1 SAM size + first 3 records ---"
+          wc -l /tmp/ci-out/port.rep1.sam || true
+          head -3 /tmp/ci-out/port.rep1.sam || true
 
       - name: Run mem (control build)
         run: |
