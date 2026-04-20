@@ -799,51 +799,86 @@ int64_t FMI_search::bwtSeedStrategyAllPosOneThread(uint8_t *enc_qdb,
                 smem.l = count[3 - a];
                 smem.s = count[a+1] - count[a];
 
-
-                int j;
-                for(j = x + 1; j < readlength; j++)
-                {
-                    next_x = j + 1;
-                    // a = enc_qdb[i * readlength + j];
-                    a = enc_qdb[offset + j];
-                    if(a < 4)
-                    {
-                        SMEM smem_ = smem;
-
-                        // Forward extension is backward extension with the BWT of reverse complement
-                        smem_.k = smem.l;
-                        smem_.l = smem.k;
-                        SMEM newSmem_ = backwardExt(smem_, 3 - a);
-                        //SMEM smem = backwardExt(smem, 3 - a);
-                        //smem.n = j;
-                        SMEM newSmem = newSmem_;
-                        newSmem.k = newSmem_.l;
-                        newSmem.l = newSmem_.k;
-                        newSmem.n = j;
-                        smem = newSmem;
-#ifdef ENABLE_PREFETCH
-                        _mm_prefetch((const char *)(&cp_occ[(smem.k) >> CP_SHIFT]), _MM_HINT_T0);
-                        _mm_prefetch((const char *)(&cp_occ[(smem.l) >> CP_SHIFT]), _MM_HINT_T0);
-#endif
-
-
-                        if((smem.s < max_intv_array[i]) && ((smem.n - smem.m + 1) >= minSeedLen))
-                        {
-
-                            if(smem.s > 0)
-                            {
+                // -- Target-region accelerator walk ------------------
+                // Stock break condition: extend base-by-base; when
+                // smem.s < max_intv AND length >= minSeedLen, save and
+                // break. Our walk mirrors that: at each L we set smem
+                // to the cached state and check the same break clause.
+                int j_start = x + 1;
+                bool walk_broke = false;
+                if (this->accel != nullptr && this->accel->enabled()) {
+                    const uint32_t kmax = this->accel->k_max();
+                    for (uint32_t L = 2; L <= kmax && x + (int)L <= readlength; ++L) {
+                        uint64_t fwd = accel_pack_forward(&enc_qdb[offset + x], L);
+                        if (fwd == UINT64_MAX) break;
+                        bool is_rc = false;
+                        uint64_t canon = accel_canonicalize(fwd, L, &is_rc);
+                        AccelLookupResult r = this->accel->probe(L, canon);
+                        if (!r.hit) break;
+                        smem.k = is_rc ? r.sa_l : r.sa_k;
+                        smem.l = is_rc ? r.sa_k : r.sa_l;
+                        smem.s = r.sa_s;
+                        int j_here = x + (int)L - 1;
+                        smem.n = j_here;
+                        next_x = j_here + 1;
+                        j_start = x + (int)L;
+                        if ((smem.s < max_intv_array[i])
+                                && ((smem.n - smem.m + 1) >= minSeedLen)) {
+                            if (smem.s > 0) {
                                 matchArray[numTotalSeed++] = smem;
                             }
+                            walk_broke = true;
                             break;
                         }
                     }
-                    else
-                    {
+                }
+                // -- End accelerator walk ----------------------------
 
-                        break;
+                int j = j_start;
+                if (!walk_broke) {
+                    for(; j < readlength; j++)
+                    {
+                        next_x = j + 1;
+                        // a = enc_qdb[i * readlength + j];
+                        a = enc_qdb[offset + j];
+                        if(a < 4)
+                        {
+                            SMEM smem_ = smem;
+
+                            // Forward extension is backward extension with the BWT of reverse complement
+                            smem_.k = smem.l;
+                            smem_.l = smem.k;
+                            SMEM newSmem_ = backwardExt(smem_, 3 - a);
+                            //SMEM smem = backwardExt(smem, 3 - a);
+                            //smem.n = j;
+                            SMEM newSmem = newSmem_;
+                            newSmem.k = newSmem_.l;
+                            newSmem.l = newSmem_.k;
+                            newSmem.n = j;
+                            smem = newSmem;
+#ifdef ENABLE_PREFETCH
+                            _mm_prefetch((const char *)(&cp_occ[(smem.k) >> CP_SHIFT]), _MM_HINT_T0);
+                            _mm_prefetch((const char *)(&cp_occ[(smem.l) >> CP_SHIFT]), _MM_HINT_T0);
+#endif
+
+
+                            if((smem.s < max_intv_array[i]) && ((smem.n - smem.m + 1) >= minSeedLen))
+                            {
+
+                                if(smem.s > 0)
+                                {
+                                    matchArray[numTotalSeed++] = smem;
+                                }
+                                break;
+                            }
+                        }
+                        else
+                        {
+
+                            break;
+                        }
                     }
                 }
-
             }
             x = next_x;
         }
