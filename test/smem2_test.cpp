@@ -107,6 +107,7 @@ int main(int argc, char **argv) {
     bseq1_t *seqs = (bseq1_t *)_mm_malloc(numReads * sizeof(bseq1_t), 64);
 
     FMI_search *fmiSearch = new FMI_search(argv[1]);
+    fmiSearch->load_index();
 
     uint8_t *enc_qdb=(uint8_t *)malloc(numReads*readlength*sizeof(uint8_t));
 

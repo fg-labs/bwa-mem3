@@ -20,8 +20,10 @@ land upstream.
 - **Vendored mimalloc allocator**: `ext/mimalloc` is pinned at `v3.3.0` and
   linked into every binary by default (`USE_MIMALLOC=1`). Linux uses
   `--whole-archive` static linkage; macOS uses dyld-interposed shared linkage.
-  Set `USE_MIMALLOC=0` at build time to opt out. See `README.md` → "Memory
-  allocator" for details.
+  `USE_MIMALLOC=1` is the supported and recommended default on all
+  platforms; `USE_MIMALLOC=0` is provided as a best-effort opt-out and is
+  CI-gated on Linux x86 only. See `README.md` → "Memory allocator" for
+  details.
 
 [pr288]: https://github.com/bwa-mem2/bwa-mem2/pull/288
 
