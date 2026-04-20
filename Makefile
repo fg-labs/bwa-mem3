@@ -156,7 +156,16 @@ else ifeq ($(arch),avx512)
 	ifeq ($(CXX), icpc)
 		ARCH_FLAGS=-xCORE-AVX512
 	else
-		ARCH_FLAGS=-mavx512bw
+		ARCH_FLAGS=-mavx512f -mavx512bw
+	endif
+else ifeq ($(arch),avx512bw)
+	# Explicit BW target: double the lane width vs AVX2 (64x8-bit / 32x16-bit).
+	# AVX-512BW implies AVX-512F; -mavx512bw alone enables BW+F on gcc/clang
+	# but we list both flags for clarity.
+	ifeq ($(CXX), icpc)
+		ARCH_FLAGS=-xCORE-AVX512
+	else
+		ARCH_FLAGS=-mavx512f -mavx512bw
 	endif
 else ifeq ($(arch),native)
 	ARCH_FLAGS=-march=native
@@ -211,7 +220,7 @@ else
 	rm -f src/*.o $(BWA_LIB); cd ext/safestringlib/ && $(MAKE) clean;
 	$(MAKE) arch=avx2   EXE=bwa-mem2.avx2     CXX=$(CXX) all
 	rm -f src/*.o $(BWA_LIB); cd ext/safestringlib/ && $(MAKE) clean;
-	$(MAKE) arch=avx512 EXE=bwa-mem2.avx512bw CXX=$(CXX) all
+	$(MAKE) arch=avx512bw EXE=bwa-mem2.avx512bw CXX=$(CXX) all
 	$(CXX) -Wall -O3 src/runsimd.cpp -Iext/safestringlib/include -Lext/safestringlib/ -lsafestring $(STATIC_GCC) -o bwa-mem2
 endif
 
