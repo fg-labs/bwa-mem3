@@ -8,3 +8,7 @@ test/accel_cache_test
 test/*.o
 ext/sha256/*.o
 src/accel_cache.o
+
+# Gitignored docs/superpowers/ already covered by global ignore; this is
+# explicit belt-and-suspenders for clarity.
+docs/superpowers/
