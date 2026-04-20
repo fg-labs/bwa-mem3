@@ -90,6 +90,15 @@ typedef struct smem_struct
 
 #define SAL_PFD 16
 
+/* Batch size for cross-read prefetch in SMEM extension. Each "read slot" in
+ * the batch contributes ~2 prefetches per step; a small window (8) is enough
+ * to keep the L1/L2 pipeline busy without blowing out the prefetch queue or
+ * evicting useful lines. Set to 1 to disable batched prefetch and fall back
+ * to the per-read scalar path. */
+#ifndef SMEM_BATCH_SIZE
+#define SMEM_BATCH_SIZE 8
+#endif
+
 class FMI_search: public indexEle
 {
     public:
@@ -121,7 +130,26 @@ class FMI_search: public indexEle
                                  int32_t minSeedLen,
                                  SMEM *matchArray,
                                  int64_t *__numTotalSmem);
-    
+
+    /* Batched variant of getSMEMsOnePosOneThread: per-read algorithm is
+     * byte-identical to the scalar path, but the outer loop pipelines the
+     * cp_occ cache-line fetches across a window of up to SMEM_BATCH_SIZE
+     * reads. The extension work itself is still scalar; only the prefetch
+     * pattern changes. Output in matchArray is written in the same
+     * (read, smem) order as the scalar path. */
+    void getSMEMsOnePosOneThread_batch(uint8_t *enc_qdb,
+                                       int16_t *query_pos_array,
+                                       int32_t *min_intv_array,
+                                       int32_t *rid_array,
+                                       int32_t numReads,
+                                       int32_t batch_size,
+                                       const bseq1_t *seq_,
+                                       int32_t *query_cum_len_ar,
+                                       int32_t  max_readlength,
+                                       int32_t minSeedLen,
+                                       SMEM *matchArray,
+                                       int64_t *__numTotalSmem);
+
     void getSMEMsAllPosOneThread(uint8_t *enc_qdb,
                                  int32_t *min_intv_array,
                                  int32_t *rid_array,

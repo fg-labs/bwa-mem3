@@ -676,7 +676,7 @@ void FMI_search::getSMEMsAllPosOneThread(uint8_t *enc_qdb,
                                          int64_t *__numTotalSmem)
 {
     int16_t *query_pos_array = (int16_t *)_mm_malloc(numReads * sizeof(int16_t), 64);
-    
+
     int32_t i;
     for(i = 0; i < numReads; i++)
         query_pos_array[i] = 0;
@@ -696,9 +696,23 @@ void FMI_search::getSMEMsAllPosOneThread(uint8_t *enc_qdb,
                 rid_array[tail] = rid_array[head];
                 query_pos_array[tail] = query_pos_array[head];
                 min_intv_array[tail] = min_intv_array[head];
-                tail++;             
-            }               
+                tail++;
+            }
         }
+#if SMEM_BATCH_SIZE > 1
+        getSMEMsOnePosOneThread_batch(enc_qdb,
+                                      query_pos_array,
+                                      min_intv_array,
+                                      rid_array,
+                                      tail,
+                                      batch_size,
+                                      seq_,
+                                      query_cum_len_ar,
+                                      max_readlength,
+                                      minSeedLen,
+                                      matchArray,
+                                      __numTotalSmem);
+#else
         getSMEMsOnePosOneThread(enc_qdb,
                                 query_pos_array,
                                 min_intv_array,
@@ -711,10 +725,248 @@ void FMI_search::getSMEMsAllPosOneThread(uint8_t *enc_qdb,
                                 minSeedLen,
                                 matchArray,
                                 __numTotalSmem);
+#endif
         numActive = tail;
     } while(numActive > 0);
 
     _mm_free(query_pos_array);
+}
+
+/*
+ * Batched variant of getSMEMsOnePosOneThread.
+ *
+ * Correctness: per-read computation is bit-identical to the scalar path; we
+ * only alter the prefetch pattern so cache-line fetches of cp_occ for reads
+ * i+1..i+SMEM_BATCH_SIZE-1 overlap with the compute-bound walk of read i.
+ * Writes into matchArray are in the same (read-major, seed-minor) order as
+ * the scalar path.
+ */
+void FMI_search::getSMEMsOnePosOneThread_batch(uint8_t *enc_qdb,
+                                               int16_t *query_pos_array,
+                                               int32_t *min_intv_array,
+                                               int32_t *rid_array,
+                                               int32_t numReads,
+                                               int32_t batch_size,
+                                               const bseq1_t *seq_,
+                                               int32_t *query_cum_len_ar,
+                                               int32_t max_readlength,
+                                               int32_t minSeedLen,
+                                               SMEM *matchArray,
+                                               int64_t *__numTotalSmem)
+{
+    int64_t numTotalSmem = *__numTotalSmem;
+    SMEM prevArray[max_readlength];
+
+#ifdef ENABLE_PREFETCH
+    /* Pre-prime: prefetch the initial cp_occ cache lines for the first
+     * SMEM_BATCH_SIZE reads. For read i, the starting bounds feed
+     * backwardExt(smem, 3-a) where smem.k = count[a], smem.l = count[3-a],
+     * smem.s = count[a+1]-count[a]. The first GET_OCC touches
+     * cp_occ[smem.k >> CP_SHIFT] and cp_occ[(smem.k+smem.s) >> CP_SHIFT]
+     * (i.e. cp_occ[count[a] >> CP_SHIFT] and cp_occ[count[a+1] >> CP_SHIFT]).
+     * The l-side (on the reverse-complement BWT) mirrors with count[3-a].
+     * Since count[] is small we simply prefetch both k and l planes. */
+    {
+        int32_t prime_upto = numReads < SMEM_BATCH_SIZE ? numReads : SMEM_BATCH_SIZE;
+        for(int32_t p = 0; p < prime_upto; p++)
+        {
+            int32_t rid_p = rid_array[p];
+            int x_p = query_pos_array[p];
+            int32_t offset_p = query_cum_len_ar[rid_p];
+            uint8_t a_p = enc_qdb[offset_p + x_p];
+            if(a_p < 4)
+            {
+                int64_t k0 = count[a_p];
+                int64_t k1 = count[a_p + 1];
+                int64_t l0 = count[3 - a_p];
+                int64_t l1 = count[3 - a_p + 1];
+                _mm_prefetch((const char *)(&cp_occ[k0 >> CP_SHIFT]), _MM_HINT_T0);
+                _mm_prefetch((const char *)(&cp_occ[k1 >> CP_SHIFT]), _MM_HINT_T0);
+                _mm_prefetch((const char *)(&cp_occ[l0 >> CP_SHIFT]), _MM_HINT_T0);
+                _mm_prefetch((const char *)(&cp_occ[l1 >> CP_SHIFT]), _MM_HINT_T0);
+            }
+        }
+    }
+#endif
+
+    uint32_t i;
+    // Perform SMEM for original reads
+    for(i = 0; i < numReads; i++)
+    {
+#ifdef ENABLE_PREFETCH
+        /* Slide the prefetch window forward: for read (i + SMEM_BATCH_SIZE),
+         * issue the same starting-position prefetches we primed above so that
+         * by the time the outer loop reaches it the cp_occ lines are warm. */
+        {
+            int32_t la = i + SMEM_BATCH_SIZE;
+            if((uint32_t)la < numReads)
+            {
+                int32_t rid_la = rid_array[la];
+                int x_la = query_pos_array[la];
+                int32_t offset_la = query_cum_len_ar[rid_la];
+                uint8_t a_la = enc_qdb[offset_la + x_la];
+                if(a_la < 4)
+                {
+                    int64_t k0 = count[a_la];
+                    int64_t k1 = count[a_la + 1];
+                    int64_t l0 = count[3 - a_la];
+                    int64_t l1 = count[3 - a_la + 1];
+                    _mm_prefetch((const char *)(&cp_occ[k0 >> CP_SHIFT]), _MM_HINT_T0);
+                    _mm_prefetch((const char *)(&cp_occ[k1 >> CP_SHIFT]), _MM_HINT_T0);
+                    _mm_prefetch((const char *)(&cp_occ[l0 >> CP_SHIFT]), _MM_HINT_T0);
+                    _mm_prefetch((const char *)(&cp_occ[l1 >> CP_SHIFT]), _MM_HINT_T0);
+                }
+            }
+        }
+#endif
+
+        int x = query_pos_array[i];
+        int32_t rid = rid_array[i];
+        int next_x = x + 1;
+
+        int readlength = seq_[rid].l_seq;
+        int offset = query_cum_len_ar[rid];
+        uint8_t a = enc_qdb[offset + x];
+
+        if(a < 4)
+        {
+            SMEM smem;
+            smem.rid = rid;
+            smem.m = x;
+            smem.n = x;
+            smem.k = count[a];
+            smem.l = count[3 - a];
+            smem.s = count[a+1] - count[a];
+            int numPrev = 0;
+
+            int j;
+            for(j = x + 1; j < readlength; j++)
+            {
+                a = enc_qdb[offset + j];
+                next_x = j + 1;
+                if(a < 4)
+                {
+                    SMEM smem_ = smem;
+
+                    // Forward extension is backward extension with the BWT of reverse complement
+                    smem_.k = smem.l;
+                    smem_.l = smem.k;
+                    SMEM newSmem_ = backwardExt(smem_, 3 - a);
+                    SMEM newSmem = newSmem_;
+                    newSmem.k = newSmem_.l;
+                    newSmem.l = newSmem_.k;
+                    newSmem.n = j;
+
+                    int32_t s_neq_mask = newSmem.s != smem.s;
+
+                    prevArray[numPrev] = smem;
+                    numPrev += s_neq_mask;
+                    if(newSmem.s < min_intv_array[i])
+                    {
+                        next_x = j;
+                        break;
+                    }
+                    smem = newSmem;
+#ifdef ENABLE_PREFETCH
+                    _mm_prefetch((const char *)(&cp_occ[(smem.k) >> CP_SHIFT]), _MM_HINT_T0);
+                    _mm_prefetch((const char *)(&cp_occ[(smem.l) >> CP_SHIFT]), _MM_HINT_T0);
+#endif
+                }
+                else
+                {
+                    break;
+                }
+            }
+            if(smem.s >= min_intv_array[i])
+            {
+                prevArray[numPrev] = smem;
+                numPrev++;
+            }
+
+            SMEM *prev;
+            prev = prevArray;
+
+            int p;
+            for(p = 0; p < (numPrev/2); p++)
+            {
+                SMEM temp = prev[p];
+                prev[p] = prev[numPrev - p - 1];
+                prev[numPrev - p - 1] = temp;
+            }
+
+            // Backward search
+            int cur_j = readlength;
+            for(j = x - 1; j >= 0; j--)
+            {
+                int numCurr = 0;
+                int curr_s = -1;
+                a = enc_qdb[offset + j];
+
+                if(a > 3)
+                {
+                    break;
+                }
+                for(p = 0; p < numPrev; p++)
+                {
+                    SMEM smem = prev[p];
+                    SMEM newSmem = backwardExt(smem, a);
+                    newSmem.m = j;
+
+                    if((newSmem.s < min_intv_array[i]) && ((smem.n - smem.m + 1) >= minSeedLen))
+                    {
+                        cur_j = j;
+
+                        matchArray[numTotalSmem++] = smem;
+                        break;
+                    }
+                    if((newSmem.s >= min_intv_array[i]) && (newSmem.s != curr_s))
+                    {
+                        curr_s = newSmem.s;
+                        prev[numCurr++] = newSmem;
+#ifdef ENABLE_PREFETCH
+                        _mm_prefetch((const char *)(&cp_occ[(newSmem.k) >> CP_SHIFT]), _MM_HINT_T0);
+                        _mm_prefetch((const char *)(&cp_occ[(newSmem.k + newSmem.s) >> CP_SHIFT]), _MM_HINT_T0);
+#endif
+                        break;
+                    }
+                }
+                p++;
+                for(; p < numPrev; p++)
+                {
+                    SMEM smem = prev[p];
+
+                    SMEM newSmem = backwardExt(smem, a);
+                    newSmem.m = j;
+
+                    if((newSmem.s >= min_intv_array[i]) && (newSmem.s != curr_s))
+                    {
+                        curr_s = newSmem.s;
+                        prev[numCurr++] = newSmem;
+#ifdef ENABLE_PREFETCH
+                        _mm_prefetch((const char *)(&cp_occ[(newSmem.k) >> CP_SHIFT]), _MM_HINT_T0);
+                        _mm_prefetch((const char *)(&cp_occ[(newSmem.k + newSmem.s) >> CP_SHIFT]), _MM_HINT_T0);
+#endif
+                    }
+                }
+                numPrev = numCurr;
+                if(numCurr == 0)
+                {
+                    break;
+                }
+            }
+            if(numPrev != 0)
+            {
+                SMEM smem = prev[0];
+                if(((smem.n - smem.m + 1) >= minSeedLen))
+                {
+                    matchArray[numTotalSmem++] = smem;
+                }
+                numPrev = 0;
+            }
+        }
+        query_pos_array[i] = next_x;
+    }
+    (*__numTotalSmem) = numTotalSmem;
 }
 
 int64_t FMI_search::bwtSeedStrategyAllPosOneThread(uint8_t *enc_qdb,
