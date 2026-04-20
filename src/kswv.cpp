@@ -1084,8 +1084,17 @@ static void avx2_stub_getScores(SeqPair *pairArray,
                                 int32_t numPairs,
                                 int8_t w_match, int8_t w_mismatch, int8_t w_ambig,
                                 int o_del, int e_del, int o_ins, int e_ins,
-                                int /*phase*/)
+                                int phase)
 {
+    /* NEON/AVX-512 kernels are structured as a two-pass algorithm:
+     *   phase 0: forward pass -> score, qe, te
+     *   phase 1: reverse pass on reversed inputs -> fills qb, tb
+     * ksw_align2 runs its own two-pass internally in a single call, so
+     * phase 0 already produces complete (score, qb, qe, tb, te). Phase 1
+     * would then run ksw_align2 on the already-reversed buffers and write
+     * garbage into aln. Skip it. */
+    if (phase != 0) return;
+
     /* Construct the 5x5 scoring matrix the same way mem_matesw does in
      * production (via bwa_fill_scmat). Match scalar mem_sam_pe's defaults
      * so output is bit-identical to the DISABLE_BATCHED_MATESW build. */
