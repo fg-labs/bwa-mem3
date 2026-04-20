@@ -67,6 +67,18 @@ public:
     // Probe the terminal table at length k_max.
     AccelLookupResult probe_terminal(uint64_t kmer_canonical) const;
 
+    // Print hit/miss counters to stderr. Counters are approximate
+    // (non-atomic increments for cheapness on the hot path); the final
+    // line is for user confirmation that the accelerator fired, not a
+    // precise measurement.
+    void print_stats() const;
+
+    // Counters — public and non-atomic. Call sites increment directly
+    // so no cross-TU function call overhead on the hot path. Race-
+    // induced undercounts are acceptable for diagnostics.
+    mutable uint64_t stat_probes   = 0;
+    mutable uint64_t stat_hits     = 0;
+
 private:
     uint32_t k_min_;
     uint32_t k_max_;

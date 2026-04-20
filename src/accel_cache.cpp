@@ -81,6 +81,15 @@ static AccelLookupResult probe_table(const AccelLevelTable &t, uint64_t k) {
     }
 }
 
+void AccelCache::print_stats() const {
+    if (!enabled()) return;
+    double rate = stat_probes ? 100.0 * (double)stat_hits / (double)stat_probes : 0.0;
+    fprintf(stderr, "[accel] probes=%llu hits=%llu hit_rate=%.2f%%\n",
+            (unsigned long long)stat_probes,
+            (unsigned long long)stat_hits,
+            rate);
+}
+
 // -- Cache lifecycle --------------------------------------------------
 
 AccelCache::AccelCache()
@@ -211,10 +220,16 @@ bool AccelCache::load(const char *path, const uint8_t ref_sha256[32]) {
 
 AccelLookupResult AccelCache::probe(uint32_t L, uint64_t kmer_canonical) const {
     if (!enabled() || L < k_min_ || L > k_max_) return {false, 0, 0, 0};
-    return probe_table(levels_[L], kmer_canonical);
+    stat_probes++;
+    AccelLookupResult r = probe_table(levels_[L], kmer_canonical);
+    if (r.hit) stat_hits++;
+    return r;
 }
 
 AccelLookupResult AccelCache::probe_terminal(uint64_t kmer_canonical) const {
     if (!enabled()) return {false, 0, 0, 0};
-    return probe_table(terminal_, kmer_canonical);
+    stat_probes++;
+    AccelLookupResult r = probe_table(terminal_, kmer_canonical);
+    if (r.hit) stat_hits++;
+    return r;
 }

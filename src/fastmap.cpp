@@ -1088,6 +1088,9 @@ int main_mem(int argc, char *argv[])
         fclose(aux.fp);
     }
 
+    // Accelerator stats (no-op when cache wasn't loaded).
+    g_accel_cache.print_stats();
+
     // new bwt/FMI
     delete(aux.fmi);
 
