@@ -4,3 +4,6 @@
 [submodule "ext/sse2neon"]
 	path = ext/sse2neon
 	url = https://github.com/DLTcollab/sse2neon.git
+[submodule "ext/htslib"]
+	path = ext/htslib
+	url = https://github.com/samtools/htslib.git

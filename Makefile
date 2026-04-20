@@ -66,14 +66,15 @@ endif
 
 MEM_FLAGS=	-DSAIS=1
 CPPFLAGS+=	-DENABLE_PREFETCH -DV17=1 -DMATE_SORT=0 $(MEM_FLAGS)
-INCLUDES+=   -Isrc -Iext/safestringlib/include
-LIBS=		-lpthread -lm -lz -L. -lbwa -Lext/safestringlib -lsafestring $(STATIC_GCC) $(LIBS_EXTRA)
+INCLUDES+=   -Isrc -Iext/safestringlib/include -Iext/htslib
+LIBS=		-lpthread -lm -lz -L. -lbwa -Lext/safestringlib -lsafestring -Lext/htslib -lhts $(STATIC_GCC) $(LIBS_EXTRA)
 OBJS=		src/fastmap.o src/bwtindex.o src/utils.o src/memcpy_bwamem.o src/kthread.o \
 			src/kstring.o src/ksw.o src/bntseq.o src/bwamem.o src/profiling.o src/bandedSWA.o \
 			src/FMI_search.o src/read_index_ele.o src/bwamem_pair.o src/kswv.o src/bwa.o \
-			src/bwamem_extra.o src/kopen.o
+			src/bwamem_extra.o src/kopen.o src/bam_writer.o
 BWA_LIB=    libbwa.a
 SAFE_STR_LIB=    ext/safestringlib/libsafestring.a
+HTS_LIB=    ext/htslib/libhts.a
 
 # Architecture-specific builds (x86 only, ARM uses default from above)
 ifeq ($(IS_ARM),)
@@ -161,7 +162,7 @@ arm64:
 	ln -sf bwa-mem2.arm64 bwa-mem2
 
 
-$(EXE):$(BWA_LIB) $(SAFE_STR_LIB) src/main.o
+$(EXE):$(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) src/main.o
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) src/main.o $(BWA_LIB) $(LIBS) -o $@
 
 $(BWA_LIB):$(OBJS)
@@ -177,9 +178,20 @@ endif
 $(SAFE_STR_LIB):
 	cd ext/safestringlib/ && $(MAKE) clean && $(MAKE) CC=$(CC) CFLAGS="-Iinclude -Isafeclib $(SAFE_EXTRA_CFLAGS) -fstack-protector-strong -fPIE -fPIC -O2" directories libsafestring.a
 
+# htslib: minimal configure (no lzma/bz2/curl/S3/GCS/plugins), zlib only.
+# Guard on config.mk (only created by ./configure) rather than Makefile, which
+# is checked into the htslib tree and would make the guard a no-op.
+$(HTS_LIB):
+	cd ext/htslib && \
+	    ([ -f config.mk ] || (autoreconf -i && \
+	        ./configure --disable-lzma --disable-libcurl --disable-gcs \
+	                    --disable-s3 --disable-plugins --disable-bz2)) && \
+	    $(MAKE) libhts.a
+
 clean:
 	rm -fr src/*.o $(BWA_LIB) $(EXE) bwa-mem2.sse41 bwa-mem2.sse42 bwa-mem2.avx bwa-mem2.avx2 bwa-mem2.avx512bw bwa-mem2.arm64
 	cd ext/safestringlib/ && $(MAKE) clean
+	-[ -f ext/htslib/config.mk ] && cd ext/htslib && $(MAKE) distclean
 
 # Profile-Guided Optimization (PGO) targets for Apple Silicon
 # Usage: make pgo-generate && <run training workload> && make pgo-use
@@ -243,3 +255,4 @@ src/read_index_ele.o: src/read_index_ele.h src/utils.h src/bntseq.h
 src/read_index_ele.o: src/macro.h
 src/utils.o: src/utils.h src/ksort.h src/kseq.h
 src/memcpy_bwamem.o: src/memcpy_bwamem.h
+src/bam_writer.o: src/bam_writer.h src/bwamem.h src/bwa.h src/bntseq.h

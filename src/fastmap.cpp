@@ -36,8 +36,10 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include <numa.h>
 #endif
 #include <sstream>
+#include <getopt.h>
 #include "fastmap.h"
 #include "FMI_search.h"
+#include "bam_writer.h"
 
 #if AFF && (__linux__)
 #include <sys/sysinfo.h>
@@ -399,8 +401,14 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
                                  0,
                                  w);
 
-                for (int i = 0; i < n_sep[0]; ++i)
-                    ret->seqs[sep[0][i].id].sam = sep[0][i].sam;
+                for (int i = 0; i < n_sep[0]; ++i) {
+                    bseq1_t *dst = &ret->seqs[sep[0][i].id];
+                    bseq1_t *src = &sep[0][i];
+                    dst->sam      = src->sam;      src->sam      = NULL;
+                    dst->bams     = src->bams;     src->bams     = NULL;
+                    dst->n_bams   = src->n_bams;   src->n_bams   = 0;
+                    dst->cap_bams = src->cap_bams; src->cap_bams = 0;
+                }
             }
             if (n_sep[1]) {
                 tmp_opt.flag |= MEM_F_PE;
@@ -412,8 +420,14 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
                                  aux->pes0,
                                  w);
 
-                for (int i = 0; i < n_sep[1]; ++i)
-                    ret->seqs[sep[1][i].id].sam = sep[1][i].sam;
+                for (int i = 0; i < n_sep[1]; ++i) {
+                    bseq1_t *dst = &ret->seqs[sep[1][i].id];
+                    bseq1_t *src = &sep[1][i];
+                    dst->sam      = src->sam;      src->sam      = NULL;
+                    dst->bams     = src->bams;     src->bams     = NULL;
+                    dst->n_bams   = src->n_bams;   src->n_bams   = 0;
+                    dst->cap_bams = src->cap_bams; src->cap_bams = 0;
+                }
             }
             free(sep[0]); free(sep[1]);
         }
@@ -438,8 +452,27 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
 
         for (int i = 0; i < ret->n_seqs; ++i)
         {
-            if (ret->seqs[i].sam) {
-                // err_fputs(ret->seqs[i].sam, stderr);
+            if (aux->bam_writer != NULL) {
+                /* BAM path: write each accumulated bam1_t* and free. A short
+                 * write here (broken pipe, full disk, BGZF error, ...) means
+                 * downstream output is corrupt; treat it as fatal rather than
+                 * silently dropping records. */
+                for (int j = 0; j < ret->seqs[i].n_bams; ++j) {
+                    struct bam1_t *b = (struct bam1_t *)ret->seqs[i].bams[j];
+                    if (bam_writer_write(aux->bam_writer, b) < 0) {
+                        fprintf(stderr,
+                                "[bam_writer] FATAL: write failed for read '%s' "
+                                "(record %d/%d) — aborting to avoid silent "
+                                "data loss.\n",
+                                ret->seqs[i].name ? ret->seqs[i].name : "?",
+                                j + 1, ret->seqs[i].n_bams);
+                        bam_writer_free(b);
+                        exit(EXIT_FAILURE);
+                    }
+                    bam_writer_free(b);
+                }
+                free(ret->seqs[i].bams);
+            } else if (ret->seqs[i].sam) {
                 fputs(ret->seqs[i].sam, aux->fp);
             }
             free(ret->seqs[i].name); free(ret->seqs[i].comment);
@@ -679,6 +712,8 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  Algorithm options:\n");
     fprintf(stderr, "    -o STR        Output SAM file name\n");
+    fprintf(stderr, "    --bam[=N]     Emit BAM instead of SAM text. N=0 (default) = uncompressed;\n");
+    fprintf(stderr, "                  1..9 = BGZF deflate levels. Writes to stdout; redirect with `>`.\n");
     fprintf(stderr, "    -t INT        number of threads [%d]\n", opt->n_threads);
     fprintf(stderr, "    -k INT        minimum seed length [%d]\n", opt->min_seed_len);
     fprintf(stderr, "    -w INT        band width for banded alignment [%d]\n", opt->w);
@@ -690,7 +725,6 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "    -W INT        discard a chain if seeded bases shorter than INT [0]\n");
     fprintf(stderr, "    -m INT        perform at most INT rounds of mate rescues for each read [%d]\n", opt->max_matesw);
     fprintf(stderr, "    -S            skip mate rescue\n");
-    fprintf(stderr, "    -o            output file name missing\n");
     fprintf(stderr, "    -P            skip pairing; mate rescue performed unless -S also in use\n");
     fprintf(stderr, "Scoring options:\n");
     fprintf(stderr, "   -A INT        score for a sequence match, which scales options -TdBOELU unless overridden [%d]\n", opt->a);
@@ -739,7 +773,9 @@ int main_mem(int argc, char *argv[])
     int           fd, fd2;
     mem_pestat_t  pes[4];
     ktp_aux_t     aux;
-    bool          is_o    = 0;
+    bool          is_o       = 0;
+    const char   *out_path   = NULL;   /* -o/-f path; opened lazily so --bam can claim it */
+    bool          out_opened = false;  /* true iff aux.fp is a real fopen()'d FILE* we own */
     uint8_t      *ref_string;
 
     memset(&aux, 0, sizeof(ktp_aux_t));
@@ -753,7 +789,17 @@ int main_mem(int argc, char *argv[])
 
     /* Parse input arguments */
     // comment: added option '5' in the list
-    while ((c = getopt(argc, argv, "51qpaMCSPVYjk:c:v:s:r:t:R:A:B:O:E:U:w:L:d:T:Q:D:m:I:N:W:x:G:h:y:K:X:H:o:f:")) >= 0)
+    // --bam[=LEVEL]: emit uncompressed (or BGZF-deflated) BAM instead of SAM text.
+    //   Without the optional =LEVEL, defaults to 0 (uncompressed, near-free CPU
+    //   and ~same size as SAM but binary — parses faster by downstream tools).
+    //   Levels 1..9 trigger BGZF deflate (slower, smaller).
+    enum { OPT_BAM = 1000 };
+    static struct option long_opts[] = {
+        {"bam", optional_argument, 0, OPT_BAM},
+        {0, 0, 0, 0}
+    };
+    while ((c = getopt_long(argc, argv, "51qpaMCSPVYjk:c:v:s:r:t:R:A:B:O:E:U:w:L:d:T:Q:D:m:I:N:W:x:G:h:y:K:X:H:o:f:",
+                            long_opts, NULL)) >= 0)
     {
         if (c == 'k') opt->min_seed_len = atoi(optarg), opt0.min_seed_len = 1;
         else if (c == '1') no_mt_io = 1;
@@ -768,13 +814,11 @@ int main_mem(int argc, char *argv[])
             opt->n_threads = atoi(optarg), opt->n_threads = opt->n_threads > 1? opt->n_threads : 1, assert(opt->n_threads >= INT_MIN && opt->n_threads <= INT_MAX);
         else if (c == 'o' || c == 'f')
         {
+            /* Capture the path; defer opening until after --bam is parsed so
+             * BAM mode can hand the path to htslib instead of truncating it
+             * here as a SAM-text FILE*. */
             is_o = 1;
-            aux.fp = fopen(optarg, "w");
-            if (aux.fp == NULL) {
-                fprintf(stderr, "Error: can't open %s input file\n", optarg);
-                exit(EXIT_FAILURE);
-            }
-            /*fclose(aux.fp);*/
+            out_path = optarg;
         }
         else if (c == 'P') opt->flag |= MEM_F_NOPAIRING;
         else if (c == 'a') opt->flag |= MEM_F_ALL;
@@ -843,7 +887,7 @@ int main_mem(int argc, char *argv[])
         {
             if ((rg_line = bwa_set_rg(optarg)) == 0) {
                 free(opt);
-                if (is_o)
+                if (out_opened)
                     fclose(aux.fp);
                 return 1;
             }
@@ -870,6 +914,20 @@ int main_mem(int argc, char *argv[])
                 }
             } else hdr_line = bwa_insert_header(optarg, hdr_line);
         }
+        else if (c == OPT_BAM) {
+            opt->bam_mode = 1;
+            opt->bam_level = 0;
+            if (optarg != NULL && optarg[0] != '\0') {
+                int lvl = atoi(optarg);
+                if (lvl < 0 || lvl > 9) {
+                    fprintf(stderr, "ERROR: --bam level must be 0..9 (got '%s')\n", optarg);
+                    free(opt);
+                    if (out_opened) fclose(aux.fp);
+                    return 1;
+                }
+                opt->bam_level = lvl;
+            }
+        }
         else if (c == 'I')
         {
             aux.pes0 = pes;
@@ -888,7 +946,7 @@ int main_mem(int argc, char *argv[])
         }
         else {
             free(opt);
-            if (is_o)
+            if (out_opened)
                 fclose(aux.fp);
             return 1;
         }
@@ -905,7 +963,7 @@ int main_mem(int argc, char *argv[])
     if (optind + 2 != argc && optind + 3 != argc) {
         usage(opt);
         free(opt);
-        if (is_o)
+        if (out_opened)
             fclose(aux.fp);
         return 1;
     }
@@ -949,7 +1007,7 @@ int main_mem(int argc, char *argv[])
         {
             fprintf(stderr, "[E::%s] unknown read type '%s'\n", __func__, mode);
             free(opt);
-            if (is_o)
+            if (out_opened)
                 fclose(aux.fp);
             return 1;
         }
@@ -1009,7 +1067,7 @@ int main_mem(int argc, char *argv[])
 	if (ko == 0) {
 		fprintf(stderr, "[E::%s] fail to open file `%s'.\n", __func__, argv[optind + 1]);
         free(opt);
-        if (is_o)
+        if (out_opened)
             fclose(aux.fp);
         delete aux.fmi;
         // kclose(ko);
@@ -1036,7 +1094,7 @@ int main_mem(int argc, char *argv[])
                 free(ko);
                 err_gzclose(fp);
                 kseq_destroy(aux.ks);
-                if (is_o)
+                if (out_opened)
                     fclose(aux.fp);
                 delete aux.fmi;
                 kclose(ko);
@@ -1051,7 +1109,39 @@ int main_mem(int argc, char *argv[])
         }
     }
 
-    bwa_print_sam_hdr(aux.fmi->idx->bns, hdr_line, aux.fp);
+    /* Output header:
+     *  - SAM text: open -o/-f path (if any) as a FILE* now and run
+     *    bwa_print_sam_hdr to it; otherwise write to stdout.
+     *  - BAM: hand the -o/-f path (or "-" for stdout) directly to htslib;
+     *    bam_writer_open writes its own @HD + @SQ + @PG header. aux.fp is
+     *    left as stdout and unused in this branch. */
+    bam_writer_t *bam_writer = NULL;
+    if (opt->bam_mode) {
+        const char *bam_path = is_o ? out_path : "-";
+        extern char *bwa_pg;
+        bam_writer = bam_writer_open(bam_path, aux.fmi->idx->bns, hdr_line,
+                                     bwa_pg, opt->bam_level);
+        if (bam_writer == NULL) {
+            fprintf(stderr, "ERROR: failed to open BAM writer at '%s'\n", bam_path);
+            free(opt);
+            delete aux.fmi;
+            return 1;
+        }
+        aux.bam_writer = bam_writer;
+    } else {
+        aux.bam_writer = NULL;
+        if (is_o) {
+            aux.fp = fopen(out_path, "w");
+            if (aux.fp == NULL) {
+                fprintf(stderr, "Error: can't open %s output file\n", out_path);
+                free(opt);
+                delete aux.fmi;
+                return 1;
+            }
+            out_opened = true;
+        }
+        bwa_print_sam_hdr(aux.fmi->idx->bns, hdr_line, aux.fp);
+    }
 
     if (fixed_chunk_size > 0)
         aux.task_size = fixed_chunk_size;
@@ -1082,8 +1172,14 @@ int main_mem(int argc, char *argv[])
         err_gzclose(fp2); kclose(ko2);
     }
 
-    if (is_o) {
+    if (out_opened) {
         fclose(aux.fp);
+    }
+
+    if (bam_writer != NULL) {
+        if (bam_writer_close(bam_writer) != 0)
+            fprintf(stderr, "[bam_writer] WARNING: close returned non-zero\n");
+        aux.bam_writer = NULL;
     }
 
     // new bwt/FMI
