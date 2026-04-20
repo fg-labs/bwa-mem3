@@ -28,12 +28,73 @@ Authors: Sanchit Misra <sanchit.misra@intel.com>; Vasimuddin Md <vasimuddin.md@i
 *****************************************************************************************/
 
 #include <stdio.h>
+#include <stdlib.h>
+#include <errno.h>
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
 #include "sais.h"
 #include "FMI_search.h"
 #include "memcpy_bwamem.h"
 #include "profiling.h"
 
 #include "safestringlib.h"
+
+// ---------------------------------------------------------------------------
+// Huge-page allocation helpers for the FM-index hot regions.
+//
+// The FM-index's cp_occ (checkpoint blocks) and suffix-array arrays (sa_ms_byte
+// / sa_ls_word) are multi-GB on whole-genome references and accessed in a
+// near-random pattern during seeding. That pattern thrashes the TLB at the
+// default 4 KiB page size. Aligning the allocation to 2 MiB and advising the
+// kernel with MADV_HUGEPAGE lets transparent huge pages (THP) promote these
+// regions on demand, reducing TLB misses by ~512x.
+//
+// The madvise call is a hint only — if THP is disabled or unsupported the
+// allocation still works, we just don't get the speedup. On non-Linux
+// platforms (macOS / FreeBSD) MADV_HUGEPAGE does not exist, so we fall back
+// to the standard _mm_malloc / _mm_free path to keep the code portable.
+// ---------------------------------------------------------------------------
+
+// Use 2 MiB alignment (x86_64 and aarch64 THP size) when the region is large
+// enough to benefit; below this threshold we'd just waste memory on padding.
+#define FMI_HUGEPAGE_ALIGN  (2ULL * 1024ULL * 1024ULL)
+#define FMI_HUGEPAGE_THRESH (2ULL * 1024ULL * 1024ULL)
+
+static void *fmi_alloc_hugepage(size_t size)
+{
+#if defined(__linux__)
+    void *ptr = NULL;
+    // Round size up to the alignment so madvise covers the full mapping.
+    size_t rounded = (size + FMI_HUGEPAGE_ALIGN - 1) &
+                     ~(FMI_HUGEPAGE_ALIGN - 1);
+    int rc = posix_memalign(&ptr, FMI_HUGEPAGE_ALIGN, rounded);
+    if (rc != 0 || ptr == NULL) {
+        errno = rc;
+        return NULL;
+    }
+    // madvise is a hint; ignore failures (e.g. THP disabled system-wide)
+    // or when size is below the kernel's effective hugepage threshold.
+    if (size >= FMI_HUGEPAGE_THRESH) {
+        (void)madvise(ptr, rounded, MADV_HUGEPAGE);
+    }
+    return ptr;
+#else
+    // Fallback on non-Linux (macOS / FreeBSD): standard 64-byte aligned.
+    return _mm_malloc(size, 64);
+#endif
+}
+
+static void fmi_free_hugepage(void *ptr)
+{
+    if (ptr == NULL) return;
+#if defined(__linux__)
+    // posix_memalign pairs with free().
+    free(ptr);
+#else
+    _mm_free(ptr);
+#endif
+}
 
 FMI_search::FMI_search(const char *fname)
 {
@@ -51,12 +112,14 @@ FMI_search::FMI_search(const char *fname)
 
 FMI_search::~FMI_search()
 {
+    // sa_ms_byte / sa_ls_word / cp_occ are allocated via fmi_alloc_hugepage
+    // in load_index(); free via the matching helper.
     if(sa_ms_byte)
-        _mm_free(sa_ms_byte);
+        fmi_free_hugepage(sa_ms_byte);
     if(sa_ls_word)
-        _mm_free(sa_ls_word);
+        fmi_free_hugepage(sa_ls_word);
     if(cp_occ)
-        _mm_free(cp_occ);
+        fmi_free_hugepage(cp_occ);
     if(one_hot_mask_array)
         _mm_free(one_hot_mask_array);
 }
@@ -417,7 +480,7 @@ void FMI_search::load_index()
     cp_occ = NULL;
 
     err_fread_noeof(&count[0], sizeof(int64_t), 5, cpstream);
-    if ((cp_occ = (CP_OCC *)_mm_malloc(cp_occ_size * sizeof(CP_OCC), 64)) == NULL) {
+    if ((cp_occ = (CP_OCC *)fmi_alloc_hugepage(cp_occ_size * sizeof(CP_OCC))) == NULL) {
         fprintf(stderr, "ERROR! unable to allocated cp_occ memory\n");
         exit(EXIT_FAILURE);
     }
@@ -432,15 +495,19 @@ void FMI_search::load_index()
     #if SA_COMPRESSION
 
     int64_t reference_seq_len_ = (reference_seq_len >> SA_COMPX) + 1;
-    sa_ms_byte = (int8_t *)_mm_malloc(reference_seq_len_ * sizeof(int8_t), 64);
-    sa_ls_word = (uint32_t *)_mm_malloc(reference_seq_len_ * sizeof(uint32_t), 64);
+    sa_ms_byte = (int8_t *)fmi_alloc_hugepage(reference_seq_len_ * sizeof(int8_t));
+    sa_ls_word = (uint32_t *)fmi_alloc_hugepage(reference_seq_len_ * sizeof(uint32_t));
+    assert_not_null(sa_ms_byte, reference_seq_len_ * sizeof(int8_t), index_alloc);
+    assert_not_null(sa_ls_word, reference_seq_len_ * sizeof(uint32_t), index_alloc);
     err_fread_noeof(sa_ms_byte, sizeof(int8_t), reference_seq_len_, cpstream);
     err_fread_noeof(sa_ls_word, sizeof(uint32_t), reference_seq_len_, cpstream);
-    
+
     #else
-    
-    sa_ms_byte = (int8_t *)_mm_malloc(reference_seq_len * sizeof(int8_t), 64);
-    sa_ls_word = (uint32_t *)_mm_malloc(reference_seq_len * sizeof(uint32_t), 64);
+
+    sa_ms_byte = (int8_t *)fmi_alloc_hugepage(reference_seq_len * sizeof(int8_t));
+    sa_ls_word = (uint32_t *)fmi_alloc_hugepage(reference_seq_len * sizeof(uint32_t));
+    assert_not_null(sa_ms_byte, reference_seq_len * sizeof(int8_t), index_alloc);
+    assert_not_null(sa_ls_word, reference_seq_len * sizeof(uint32_t), index_alloc);
     err_fread_noeof(sa_ms_byte, sizeof(int8_t), reference_seq_len, cpstream);
     err_fread_noeof(sa_ls_word, sizeof(uint32_t), reference_seq_len, cpstream);
 
