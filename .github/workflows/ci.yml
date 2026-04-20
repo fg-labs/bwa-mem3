@@ -13,16 +13,24 @@ jobs:
         include:
           - os: ubuntu-latest
             arch_flag: "sse41"
-            name: "Linux x86_64 SSE4.1"
+            use_mimalloc: "1"
+            name: "Linux x86_64 SSE4.1 (mimalloc)"
           - os: ubuntu-latest
             arch_flag: "avx2"
-            name: "Linux x86_64 AVX2"
+            use_mimalloc: "1"
+            name: "Linux x86_64 AVX2 (mimalloc)"
+          - os: ubuntu-latest
+            arch_flag: "avx2"
+            use_mimalloc: "0"
+            name: "Linux x86_64 AVX2 (no-mimalloc)"
           - os: ubuntu-24.04-arm
             arch_flag: ""
-            name: "Linux ARM64"
+            use_mimalloc: "1"
+            name: "Linux ARM64 (mimalloc)"
           - os: macos-latest
             arch_flag: ""
-            name: "macOS ARM64"
+            use_mimalloc: "1"
+            name: "macOS ARM64 (mimalloc)"
 
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
@@ -41,16 +49,35 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install bwa autoconf automake
 
+      - name: Verify CMake is available
+        run: cmake --version
+
       - name: Build bwa-mem2
         run: |
           if [ "${{ matrix.arch_flag }}" = "" ]; then
-            make -j$(nproc 2>/dev/null || sysctl -n hw.ncpu) CXX=g++
+            make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)" \
+              CXX=g++ USE_MIMALLOC=${{ matrix.use_mimalloc }}
           else
-            make -j$(nproc) arch=${{ matrix.arch_flag }} CXX=g++
+            make -j"$(nproc)" \
+              arch=${{ matrix.arch_flag }} \
+              CXX=g++ USE_MIMALLOC=${{ matrix.use_mimalloc }}
           fi
 
       - name: Verify binary
         run: ./bwa-mem2 version
+
+      - name: Verify mimalloc is linked (when enabled)
+        if: matrix.use_mimalloc == '1'
+        run: test/mimalloc_loaded_test.sh ./bwa-mem2
+
+      - name: Verify mimalloc is NOT linked (when disabled)
+        if: matrix.use_mimalloc == '0'
+        run: |
+          if test/mimalloc_loaded_test.sh ./bwa-mem2; then
+            echo "FAIL: USE_MIMALLOC=0 build should NOT report mimalloc" >&2
+            exit 1
+          fi
+          echo "PASS: no-mimalloc build correctly omits mimalloc"
 
       - name: Build dwgsim
         run: |

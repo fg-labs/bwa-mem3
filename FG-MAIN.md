@@ -15,6 +15,14 @@ land upstream.
 | `490502b` | `fix`: drop unused global `stat` that shadows libc              | fork-only       |
 <!-- FG-MAIN-TABLE:end -->
 
+### Additional fork-level changes
+
+- **Vendored mimalloc allocator**: `ext/mimalloc` is pinned at `v3.3.0` and
+  linked into every binary by default (`USE_MIMALLOC=1`). Linux uses
+  `--whole-archive` static linkage; macOS uses dyld-interposed shared linkage.
+  Set `USE_MIMALLOC=0` at build time to opt out. See `README.md` → "Memory
+  allocator" for details.
+
 [pr288]: https://github.com/bwa-mem2/bwa-mem2/pull/288
 
 ## Branching and update policy

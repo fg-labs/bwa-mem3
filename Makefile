@@ -40,11 +40,58 @@ else ifeq ($(CXX), g++)
 	CC=gcc
 endif
 
+# mimalloc integration. Default on — see FG-MAIN.md.
+# Override with USE_MIMALLOC=0 to build a stock bwa-mem2 without mimalloc.
+USE_MIMALLOC ?= 1
+
 # Detect architecture
 UNAME_M := $(shell uname -m)
 UNAME_S := $(shell uname -s)
 # Treat macOS ("arm64") and Linux ("aarch64") as the same ARM build target.
 IS_ARM := $(filter $(UNAME_M),arm64 aarch64)
+
+# Where mimalloc lives and where its CMake build writes artifacts.
+MIMALLOC_SRC   = ext/mimalloc
+MIMALLOC_BUILD = $(MIMALLOC_SRC)/build
+
+# Per-platform library basename. Linux: static archive. macOS: dynamic lib
+# (mimalloc's malloc override on macOS requires a dylib + dyld interposing).
+ifeq ($(UNAME_S),Darwin)
+    MIMALLOC_LIB = $(MIMALLOC_BUILD)/libmimalloc.dylib
+    MIMALLOC_CMAKE_FLAGS = -DMI_BUILD_SHARED=ON -DMI_BUILD_STATIC=OFF \
+                           -DMI_BUILD_OBJECT=OFF -DMI_BUILD_TESTS=OFF \
+                           -DMI_OVERRIDE=ON -DCMAKE_BUILD_TYPE=Release
+else
+    MIMALLOC_LIB = $(MIMALLOC_BUILD)/libmimalloc.a
+    MIMALLOC_CMAKE_FLAGS = -DMI_BUILD_SHARED=OFF -DMI_BUILD_STATIC=ON \
+                           -DMI_BUILD_OBJECT=OFF -DMI_BUILD_TESTS=OFF \
+                           -DMI_OVERRIDE=ON -DCMAKE_BUILD_TYPE=Release
+endif
+
+# Link flags that inject mimalloc's malloc overrides.
+# On Linux, --whole-archive forces the linker to keep symbols it would
+# otherwise drop (malloc/free would come from libc first). On macOS, we
+# just link the dylib; dyld interposes at load time — no --whole-archive
+# equivalent is needed (and -force_load does NOT enable malloc interpose).
+#
+# On macOS we set two rpaths: @executable_path/. is the portable one used
+# when the binary ships alongside libmimalloc.dylib; the $(abspath ...)
+# rpath is a dev-only fallback that lets the binary run in-tree without
+# first copying the dylib. For distribution, the @executable_path rpath
+# resolves first and the abspath is harmlessly ignored (or can be removed
+# with `install_name_tool -delete_rpath`).
+ifeq ($(USE_MIMALLOC),1)
+    ifeq ($(UNAME_S),Darwin)
+        MIMALLOC_LDFLAGS = -L$(MIMALLOC_BUILD) -lmimalloc \
+                           -Wl,-rpath,@executable_path/. \
+                           -Wl,-rpath,$(abspath $(MIMALLOC_BUILD))
+    else
+        MIMALLOC_LDFLAGS = -Wl,--whole-archive $(MIMALLOC_LIB) -Wl,--no-whole-archive
+    endif
+    CPPFLAGS += -DUSE_MIMALLOC=1
+else
+    MIMALLOC_LDFLAGS =
+endif
 
 # ARM/Apple Silicon support
 ifneq ($(IS_ARM),)
@@ -67,6 +114,9 @@ endif
 MEM_FLAGS=	-DSAIS=1
 CPPFLAGS+=	-DENABLE_PREFETCH -DV17=1 -DMATE_SORT=0 $(MEM_FLAGS)
 INCLUDES+=   -Isrc -Iext/safestringlib/include -Iext/htslib
+ifeq ($(USE_MIMALLOC),1)
+    INCLUDES += -Iext/mimalloc/include
+endif
 LIBS=		-lpthread -lm -lz -L. -lbwa -Lext/safestringlib -lsafestring -Lext/htslib -lhts $(STATIC_GCC) $(LIBS_EXTRA)
 OBJS=		src/fastmap.o src/bwtindex.o src/utils.o src/memcpy_bwamem.o src/kthread.o \
 			src/kstring.o src/ksw.o src/bntseq.o src/bwamem.o src/profiling.o src/bandedSWA.o \
@@ -129,7 +179,7 @@ endif
 
 CXXFLAGS+=	-g -O3 -fpermissive $(ARCH_FLAGS) #-Wall ##-xSSE2
 
-.PHONY:all clean depend multi
+.PHONY:all clean depend multi print-mimalloc-config
 .SUFFIXES:.cpp .o
 
 .cpp.o:
@@ -137,7 +187,7 @@ CXXFLAGS+=	-g -O3 -fpermissive $(ARCH_FLAGS) #-Wall ##-xSSE2
 
 all:$(EXE)
 
-multi:
+multi: $(if $(filter 1,$(USE_MIMALLOC)),$(MIMALLOC_LIB))
 ifneq ($(IS_ARM),)
 	@echo "ARM64 detected - building single arm64 binary instead of multi"
 	$(MAKE) arm64
@@ -162,8 +212,8 @@ arm64:
 	ln -sf bwa-mem2.arm64 bwa-mem2
 
 
-$(EXE):$(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) src/main.o
-	$(CXX) $(CXXFLAGS) $(LDFLAGS) src/main.o $(BWA_LIB) $(LIBS) -o $@
+$(EXE):$(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) $(if $(filter 1,$(USE_MIMALLOC)),$(MIMALLOC_LIB)) src/main.o
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) src/main.o $(BWA_LIB) $(LIBS) $(MIMALLOC_LDFLAGS) -o $@
 
 $(BWA_LIB):$(OBJS)
 	ar rcs $(BWA_LIB) $(OBJS)
@@ -188,10 +238,22 @@ $(HTS_LIB):
 	                    --disable-s3 --disable-plugins --disable-bz2)) && \
 	    $(MAKE) libhts.a
 
+# Build mimalloc via its own CMake system. Shells out to cmake once and
+# caches the build tree under ext/mimalloc/build. This rule always builds
+# when invoked; USE_MIMALLOC=0 consumers simply don't depend on it.
+$(MIMALLOC_LIB):
+	@if [ ! -f $(MIMALLOC_SRC)/CMakeLists.txt ]; then \
+		echo "ERROR: $(MIMALLOC_SRC) is empty. Run: git submodule update --init --recursive"; \
+		exit 1; \
+	fi
+	mkdir -p $(MIMALLOC_BUILD)
+	cd $(MIMALLOC_BUILD) && cmake $(MIMALLOC_CMAKE_FLAGS) .. && $(MAKE)
+
 clean:
 	rm -fr src/*.o $(BWA_LIB) $(EXE) bwa-mem2.sse41 bwa-mem2.sse42 bwa-mem2.avx bwa-mem2.avx2 bwa-mem2.avx512bw bwa-mem2.arm64
 	cd ext/safestringlib/ && $(MAKE) clean
 	-[ -f ext/htslib/config.mk ] && cd ext/htslib && $(MAKE) distclean
+	rm -rf $(MIMALLOC_BUILD)
 
 # Profile-Guided Optimization (PGO) targets for Apple Silicon
 # Usage: make pgo-generate && <run training workload> && make pgo-use
@@ -210,6 +272,10 @@ pgo-use:
 
 pgo-clean:
 	rm -rf $(PGO_PROFILE_DIR) bwa-mem2.pgo-instr bwa-mem2.pgo
+
+# Print the effective mimalloc setting. Used by CI and humans.
+print-mimalloc-config:
+	@echo "USE_MIMALLOC=$(USE_MIMALLOC)"
 
 depend:
 	(LC_ALL=C; export LC_ALL; makedepend -Y -- $(CXXFLAGS) $(CPPFLAGS) -I. -- src/*.cpp)

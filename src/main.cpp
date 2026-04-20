@@ -35,6 +35,10 @@ Contacts: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@
 #define PACKAGE_VERSION "2.2.1"
 #endif
 
+#ifdef USE_MIMALLOC
+#include <mimalloc.h>
+#endif
+
 
 // ----------------------------------
 // Profiling globals are now defined in profiling.cpp so they live in
@@ -107,6 +111,12 @@ int main(int argc, char* argv[])
     else if (strcmp(argv[1], "version") == 0)
     {
         puts(PACKAGE_VERSION);
+#ifdef USE_MIMALLOC
+        {
+            int mv = mi_version();
+            fprintf(stderr, "mimalloc %d.%d.%d\n", mv / 10000, (mv / 100) % 100, mv % 100);
+        }
+#endif
         return 0;
     } else {
         fprintf(stderr, "ERROR: unknown command '%s'\n", argv[1]);
