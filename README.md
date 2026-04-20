@@ -42,6 +42,26 @@ make
 ./bwa-mem2
 ```
 
+## Memory allocator
+
+This fork bundles [mimalloc](https://github.com/microsoft/mimalloc) (pinned to
+`v3.3.0`) and links it into every binary by default. On a 16-thread
+paired-end exome alignment (29M 150bp pairs vs GRCh38) on AWS Graviton3
+(c7g.4xlarge), `USE_MIMALLOC=1` is 24.5% faster wall-clock (528 s → 425 s)
+and uses 21.7% less user CPU time vs the same build with `USE_MIMALLOC=0`.
+Peak RSS is ~3 GiB higher (20 → 23 GiB). Your results will vary with
+thread count, read depth, and dataset; measure before claiming.
+
+To build a stock `bwa-mem2` without mimalloc, pass `USE_MIMALLOC=0`:
+
+```sh
+make -j USE_MIMALLOC=0
+```
+
+To confirm mimalloc is active, run `bwa-mem2 version` — a line like
+`mimalloc 3.3.0` is printed when the allocator is linked in. To print
+mimalloc's own heap statistics on exit, set `MIMALLOC_SHOW_STATS=1`.
+
 ## Introduction
 
 The tool bwa-mem2 is the next version of the bwa-mem algorithm in [bwa][bwa]. It
