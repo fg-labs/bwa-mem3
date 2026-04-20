@@ -718,12 +718,12 @@ int mem_sam_pe_batch(const mem_opt_t *opt, mem_cache *mmc,
     for (int i=0; i<pcnt-pcnt8; i++)
         seqPairArray[pcnt + MAX_LINE_LEN - 1 - i] = seqPairArray[pcnt-i-1];
     
-#if __AVX512BW__    
+#if BWAMEM_BATCHED_MATESW
     pwsw->getScores8(seqPairArray, seqBufRef, seqBufQer, aln, pcnt8, nthreads, 0);
     pwsw->getScores16(seqPairArray + pcnt8 + MAX_LINE_LEN, seqBufRef, seqBufQer,
                       aln, pcnt-pcnt8, nthreads, 0);
 #else
-    fprintf(stderr, "Error: This should not have happened!! \nPlease look in to AVX512 macros\n");
+    fprintf(stderr, "Error: mem_sam_pe_batch reached without a batched kswv kernel\n");
     exit(EXIT_FAILURE);
 #endif
 
@@ -767,11 +767,11 @@ int mem_sam_pe_batch(const mem_opt_t *opt, mem_cache *mmc,
     int pcnt2 = pos;
     assert(pos8 + pos16 == pcnt2);
 
-#if __AVX512BW__
+#if BWAMEM_BATCHED_MATESW
     pwsw->getScores16(seqPairArray + pos8, seqBufRef, seqBufQer, aln, pos16, nthreads, 1);
     pwsw->getScores8(seqPairArray, seqBufRef, seqBufQer, aln, pos8, nthreads, 1);
 #else
-    fprintf(stderr, "Error: This should not have happened!! \nPlease look in to AVX512 macros\n");
+    fprintf(stderr, "Error: mem_sam_pe_batch reached without a batched kswv kernel\n");
     exit(EXIT_FAILURE);
 #endif
     

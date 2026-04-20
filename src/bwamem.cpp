@@ -1258,7 +1258,10 @@ static void worker_sam(void *data, int seqid, int batch_size, int tid)
         int end = seqid + batch_size;
         int pos = start >> 1;
 
-#if (((!__AVX512BW__) && (!__AVX2__)) || ((!__AVX512BW__) && (__AVX2__)))
+#if !BWAMEM_BATCHED_MATESW
+        // Scalar mem_sam_pe path. Selected when no SIMD kswv kernel is
+        // available (e.g. plain SSE2/AVX2 x86 builds, or forced via
+        // DISABLE_BATCHED_MATESW=1 for the proto-neon-kswv CI A/B).
         for (int i=start; i< end; i+=2)
         {
             // orig mem_sam_pe() function
