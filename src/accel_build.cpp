@@ -526,6 +526,12 @@ int accel_build_main(int argc, char **argv) {
                 bwt_path.c_str(), strerror(errno));
         return 2;
     }
+    {
+        char hex[65];
+        for (int i = 0; i < 32; ++i) snprintf(hex + 2*i, 3, "%02x", ref_sha[i]);
+        hex[64] = 0;
+        fprintf(stderr, "[build-accel] ref sha256 = %s\n", hex);
+    }
 
     // Load FM-index.
     FMI_search *fmi = new FMI_search(opt.ref_path.c_str());
