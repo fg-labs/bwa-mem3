@@ -174,9 +174,21 @@ int HTStatus()
 
 
 /*** Memory pre-allocations ***/
-void memoryAlloc(ktp_aux_t *aux, worker_t &w, int32_t nreads, int32_t nthreads)
+// Core allocation routine, parameterised only on mem_opt_t. Exposed so that
+// library consumers which build up a worker_t themselves (e.g. language
+// bindings that don't construct a ktp_aux_t) can reuse the exact same
+// allocation sequence instead of re-implementing it and drifting out of sync.
+void worker_alloc(const mem_opt_t *opt, worker_t &w, int32_t nreads, int32_t nthreads)
 {
-    mem_opt_t *opt = aux->opt;
+    assert(opt != NULL);
+    assert(nreads >= 0);
+    assert(nthreads > 0);
+
+    // Record the thread count on the worker so worker_free can validate the
+    // paired call and the per-thread loops can never walk past the slots
+    // populated here.
+    w.nthreads = nthreads;
+
     int32_t memSize = nreads;
     int32_t readLen = READ_LEN;
 
@@ -261,6 +273,49 @@ void memoryAlloc(ktp_aux_t *aux, worker_t &w, int32_t nreads, int32_t nthreads)
         nthreads * (BATCH_SIZE + 32) * sizeof(int32_t);
     fprintf(stderr, "3. Memory pre-allocation for BWT: %0.4lf MB\n", allocMem/1e6);
     fprintf(stderr, "------------------------------------------\n");
+}
+
+// Release every per-worker scratch buffer allocated by worker_alloc. The
+// nthreads argument must match the value passed to the paired worker_alloc
+// call so the per-thread loops iterate over exactly the slots that were
+// populated.
+void worker_free(worker_t &w, int32_t nthreads)
+{
+    assert(nthreads > 0);
+    // Catch mismatched alloc/free pairs before they drive out-of-bounds frees.
+    assert(w.nthreads == nthreads);
+
+    free(w.chain_ar);
+    free(w.regs);
+    free(w.seedBuf);
+
+    for(int l=0; l<nthreads; l++) {
+        _mm_free(w.mmc.seqBufLeftRef[l*CACHE_LINE]);
+        _mm_free(w.mmc.seqBufRightRef[l*CACHE_LINE]);
+        _mm_free(w.mmc.seqBufLeftQer[l*CACHE_LINE]);
+        _mm_free(w.mmc.seqBufRightQer[l*CACHE_LINE]);
+    }
+
+    for(int l=0; l<nthreads; l++) {
+        free(w.mmc.seqPairArrayAux[l]);
+        free(w.mmc.seqPairArrayLeft128[l]);
+        free(w.mmc.seqPairArrayRight128[l]);
+    }
+
+    for(int l=0; l<nthreads; l++) {
+        _mm_free(w.mmc.matchArray[l]);
+        free(w.mmc.min_intv_ar[l]);
+        free(w.mmc.query_pos_ar[l]);
+        free(w.mmc.enc_qdb[l]);
+        free(w.mmc.rid[l]);
+        _mm_free(w.mmc.lim[l]);
+    }
+}
+
+// Back-compat wrapper used by the bwa-mem2 pipeline.
+void memoryAlloc(ktp_aux_t *aux, worker_t &w, int32_t nreads, int32_t nthreads)
+{
+    worker_alloc(aux->opt, w, nreads, nthreads);
 }
 
 ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, worker_t &w)
@@ -596,32 +651,8 @@ static int process(void *shared, gzFile gfp, gzFile gfp2, int pipe_threads)
 
     fprintf(stderr, "[0000] Computation ends..\n");
 
-    /* Dealloc memory allcoated in the header section */
-    free(w.chain_ar);
-    free(w.regs);
-    free(w.seedBuf);
-
-    for(int l=0; l<nthreads; l++) {
-        _mm_free(w.mmc.seqBufLeftRef[l*CACHE_LINE]);
-        _mm_free(w.mmc.seqBufRightRef[l*CACHE_LINE]);
-        _mm_free(w.mmc.seqBufLeftQer[l*CACHE_LINE]);
-        _mm_free(w.mmc.seqBufRightQer[l*CACHE_LINE]);
-    }
-
-    for(int l=0; l<nthreads; l++) {
-        free(w.mmc.seqPairArrayAux[l]);
-        free(w.mmc.seqPairArrayLeft128[l]);
-        free(w.mmc.seqPairArrayRight128[l]);
-    }
-
-    for(int l=0; l<nthreads; l++) {
-        _mm_free(w.mmc.matchArray[l]);
-        free(w.mmc.min_intv_ar[l]);
-        free(w.mmc.query_pos_ar[l]);
-        free(w.mmc.enc_qdb[l]);
-        free(w.mmc.rid[l]);
-        _mm_free(w.mmc.lim[l]);
-    }
+    /* Dealloc per-worker scratch buffers allocated in the header section */
+    worker_free(w, nthreads);
 
     return 0;
 }
