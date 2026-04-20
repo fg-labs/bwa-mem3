@@ -29,10 +29,14 @@
 // Scoring (matches bwa-mem2 defaults)
 static const int8_t SCORE_MATCH    = 1;
 static const int8_t SCORE_MISMATCH = 4;
+static const int8_t SCORE_AMBIG    = 1;  // matches kswv's DEFAULT_AMBIG = -1 penalty
 static const int    GAP_OPEN       = 6;
 static const int    GAP_EXT        = 1;
 
-// 5x5 substitution matrix for ACGTN encoding 0..4
+// 5x5 substitution matrix for ACGTN encoding 0..4. N-cells use -SCORE_AMBIG
+// to match kswv's internal w_ambig = -1 rather than ksw_align2's default
+// mat behaviour; keeping the two code paths aligned is what lets the
+// selftest compare apples to apples.
 static int8_t g_mat[25];
 
 static void build_mat() {
@@ -40,10 +44,10 @@ static void build_mat() {
         for (int j = 0; j < 4; j++) {
             g_mat[i*5 + j] = (i == j) ? SCORE_MATCH : -SCORE_MISMATCH;
         }
-        g_mat[i*5 + 4] = 0;
-        g_mat[4*5 + i] = 0;
+        g_mat[i*5 + 4] = -SCORE_AMBIG;
+        g_mat[4*5 + i] = -SCORE_AMBIG;
     }
-    g_mat[24] = 0;
+    g_mat[24] = -SCORE_AMBIG;
 }
 
 struct TestPair {
@@ -144,6 +148,11 @@ static BatchResult run_batched(const std::vector<TestPair> &pairs,
     std::vector<uint8_t> seqBufQer(qer_total, 0);
     std::vector<SeqPair> pairArray(n + SIMD_WIDTH8);
 
+    // Production mate-rescue uses KSW_XBYTE (8-bit kernel) for short reads
+    // where `l_ms * w_match < 250`. With w_match=1 and qlen<=128 that covers
+    // all our test pairs; route everything through getScores8.
+    const int xtra_flags = KSW_XSUBO | KSW_XSTART | KSW_XBYTE;
+
     size_t ref_off = 0, qer_off = 0;
     for (int i = 0; i < n; i++) {
         const auto &p = pairs[i];
@@ -155,7 +164,7 @@ static BatchResult run_batched(const std::vector<TestPair> &pairs,
         sp.id     = i;
         sp.len1   = (int32_t)p.ref.size();
         sp.len2   = (int32_t)p.qry.size();
-        sp.h0     = KSW_XSTART | KSW_XSUBO;
+        sp.h0     = xtra_flags;
         sp.seqid  = i;
         sp.regid  = i;
         pairArray[i] = sp;
@@ -165,8 +174,8 @@ static BatchResult run_batched(const std::vector<TestPair> &pairs,
 
     kswv *pwsw = new kswv(GAP_OPEN, GAP_EXT, GAP_OPEN, GAP_EXT,
                           SCORE_MATCH, -SCORE_MISMATCH, 1, maxRefLen, maxQerLen);
-    pwsw->getScores16(pairArray.data(), seqBufRef.data(), seqBufQer.data(),
-                      out.aln.data(), n, 1, 0);
+    pwsw->getScores8(pairArray.data(), seqBufRef.data(), seqBufQer.data(),
+                     out.aln.data(), n, 1, 0);
     delete pwsw;
     out.aln.resize(n);
     return out;

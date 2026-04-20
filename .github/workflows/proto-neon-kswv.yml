@@ -87,7 +87,6 @@ jobs:
 
       - name: Run kswv_selftest
         id: selftest
-        continue-on-error: true  # iterating; surface result without gating CI yet
         run: |
           mkdir -p /tmp/ci-out
           ./kswv_selftest 2>&1 | tee /tmp/ci-out/selftest.log
