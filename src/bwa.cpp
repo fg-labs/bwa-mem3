@@ -61,6 +61,11 @@ static inline void trim_readno(kstring_t *s)
 
 static inline void kseq2bseq1(const kseq_t *ks, bseq1_t *s)
 { // TODO: it would be better to allocate one chunk of memory, but probably it does not matter in practice
+    // bseq_read/bseq_read_orig grow `seqs` with realloc, which leaves the
+    // new entries uninitialized. Zero first so sam/bams/n_bams/cap_bams
+    // start well-defined — the output loop at fastmap.cpp free()s them
+    // unconditionally, so garbage from realloc would otherwise be freed.
+    memset(s, 0, sizeof(*s));
     s->name = strdup(ks->name.s);
     s->comment = ks->comment.l? strdup(ks->comment.s) : 0;
     s->seq = strdup(ks->seq.s);
