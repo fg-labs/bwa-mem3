@@ -38,6 +38,9 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include <sstream>
 #include "fastmap.h"
 #include "FMI_search.h"
+#include "accel_cache.h"
+#include <getopt.h>
+#include <limits.h>
 
 #if AFF && (__linux__)
 #include <sys/sysinfo.h>
@@ -701,6 +704,7 @@ int main_mem(int argc, char *argv[])
     int          fixed_chunk_size          = -1;
     char        *p, *rg_line               = 0, *hdr_line = 0;
     const char  *mode                      = 0;
+    const char  *accel_cache_path          = nullptr;
 
     mem_opt_t    *opt, opt0;
     gzFile        fp, fp2 = 0;
@@ -720,9 +724,17 @@ int main_mem(int argc, char *argv[])
     aux.opt = opt = mem_opt_init();
     memset(&opt0, 0, sizeof(mem_opt_t));
 
+    // Long options, used alongside the existing short-option scheme.
+    // Values >= 1000 are reserved for long-only options.
+    static const struct option long_opts[] = {
+        {"accel-cache", required_argument, 0, 1000},
+        {0, 0, 0, 0}
+    };
+
     /* Parse input arguments */
     // comment: added option '5' in the list
-    while ((c = getopt(argc, argv, "51qpaMCSPVYjk:c:v:s:r:t:R:A:B:O:E:U:w:L:d:T:Q:D:m:I:N:W:x:G:h:y:K:X:H:o:f:")) >= 0)
+    while ((c = getopt_long(argc, argv, "51qpaMCSPVYjk:c:v:s:r:t:R:A:B:O:E:U:w:L:d:T:Q:D:m:I:N:W:x:G:h:y:K:X:H:o:f:",
+                            long_opts, NULL)) >= 0)
     {
         if (c == 'k') opt->min_seed_len = atoi(optarg), opt0.min_seed_len = 1;
         else if (c == '1') no_mt_io = 1;
@@ -855,6 +867,9 @@ int main_mem(int argc, char *argv[])
             if (*p != 0 && ispunct(*p) && isdigit(p[1]))
                 pes[1].low  = (int)(strtod(p+1, &p) + .499);
         }
+        else if (c == 1000) { // --accel-cache
+            accel_cache_path = optarg;
+        }
         else {
             free(opt);
             if (is_o)
@@ -934,6 +949,24 @@ int main_mem(int argc, char *argv[])
     aux.fmi = new FMI_search(argv[optind]);
     aux.fmi->load_index();
     tprof[FMI][0] += __rdtsc() - tim;
+
+    // Optional target-region fast-path accelerator. Owned by main_mem;
+    // pointer stashed into the FMI_search object for hot-path probes.
+    AccelCache g_accel_cache;
+    if (accel_cache_path) {
+        char bwt_path[PATH_MAX];
+        snprintf(bwt_path, sizeof(bwt_path), "%s.bwt.2bit.64", argv[optind]);
+        uint8_t ref_sha[32];
+        if (!accel_sha256_file(bwt_path, ref_sha)) {
+            fprintf(stderr, "[accel] could not hash %s; accelerator disabled\n", bwt_path);
+        } else if (!g_accel_cache.load(accel_cache_path, ref_sha)) {
+            fprintf(stderr, "[accel] cache load failed; accelerator disabled\n");
+        } else {
+            aux.fmi->accel = &g_accel_cache;
+            fprintf(stderr, "[accel] enabled via %s (k=[%u..%u])\n",
+                    accel_cache_path, g_accel_cache.k_min(), g_accel_cache.k_max());
+        }
+    }
 
     // reading ref string from the file
     tim = __rdtsc();

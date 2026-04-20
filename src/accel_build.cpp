@@ -286,23 +286,23 @@ static void unpack_bases(uint64_t packed, int k, uint8_t *out) {
     }
 }
 
-// Walk one terminal canonical k-mer. Returns trajectory[L=1..k_max]:
-// vector of (canonical_L_mer, k, l, s). Length = k_max.
+// Walk one k-mer (bases given) and record the trajectory at each L=1..k_max.
+// SA intervals (k, l) are for the forward strand of the INPUT bases.
 //
-// The accelerator is keyed by canonical form but we walk the FORWARD
-// strand through backwardExt. For a canonical kmer, the forward form is
-// either kmer_canonical itself (if lex-min is fwd) or its RC. We walk
-// the forward form.
-static void walk_trajectory(FMI_search *fmi,
-                            uint64_t canonical_kmer,
-                            int k_max,
-                            std::vector<LevelRecord> &out) {
+// At each level L, records:
+//   - canonical(bases[0..L-1])
+//   - the (k, l) that correspond to that canonical form (swapped from
+//     the input-forward (k, l) if canonical != input-forward)
+// This way, a runtime probe using canonicalize(read[x..x+L-1]) will get
+// back (k, l) that the runtime can swap based on its own is_rc flag —
+// the same swap semantics as FMI_search.cpp:541-547.
+static void walk_bases(FMI_search *fmi,
+                       const uint8_t *bases,
+                       int k_max,
+                       std::vector<LevelRecord> &out) {
     out.clear();
     out.resize((size_t)k_max);
-    uint8_t bases[64];
-    unpack_bases(canonical_kmer, k_max, bases);
 
-    // Initialize at length 1 using count[], mirroring FMI_search.cpp:525-527.
     const int64_t *count = fmi->accel_count();
     SMEM smem;
     smem.rid = 0;
@@ -315,15 +315,18 @@ static void walk_trajectory(FMI_search *fmi,
 
     // Record L=1.
     {
-        uint64_t c1 = accel_canonicalize(accel_pack_forward(bases, 1), 1);
-        out[0] = {c1, smem.k, smem.l, smem.s};
+        uint64_t fwd1 = accel_pack_forward(bases, 1);
+        bool is_rc = false;
+        uint64_t c1 = accel_canonicalize(fwd1, 1, &is_rc);
+        // (k_canonical, l_canonical) = swap if is_rc
+        int64_t k_c = is_rc ? smem.l : smem.k;
+        int64_t l_c = is_rc ? smem.k : smem.l;
+        out[0] = {c1, k_c, l_c, smem.s};
     }
 
-    // Forward extension for L=2..k_max. Mirrors FMI_search.cpp:538-547.
     for (int L = 2; L <= k_max; ++L) {
         uint8_t next_base = bases[L - 1];
         SMEM smem_ = smem;
-        // RC trick.
         smem_.k = smem.l;
         smem_.l = smem.k;
         SMEM newSmem_ = fmi->accel_backwardExt(smem_, (uint8_t)(3 - next_base));
@@ -331,21 +334,49 @@ static void walk_trajectory(FMI_search *fmi,
         newSmem.k = newSmem_.l;
         newSmem.l = newSmem_.k;
         newSmem.n = L - 1;
-
         smem = newSmem;
 
-        uint64_t cL = accel_canonicalize(accel_pack_forward(bases, (uint32_t)L), (uint32_t)L);
-        out[(size_t)(L - 1)] = {cL, smem.k, smem.l, smem.s};
+        uint64_t fwdL = accel_pack_forward(bases, (uint32_t)L);
+        bool is_rc = false;
+        uint64_t cL = accel_canonicalize(fwdL, (uint32_t)L, &is_rc);
+        int64_t k_c = is_rc ? smem.l : smem.k;
+        int64_t l_c = is_rc ? smem.k : smem.l;
+        out[(size_t)(L - 1)] = {cL, k_c, l_c, smem.s};
 
         if (smem.s == 0) {
-            // K-mer doesn't exist in the reference beyond this length.
-            // Trajectory is cut short; fill remaining with "s=0" markers.
             for (int L2 = L + 1; L2 <= k_max; ++L2) {
                 out[(size_t)(L2 - 1)] = {0, 0, 0, 0};
             }
             return;
         }
     }
+}
+
+// For a canonical 18-mer, walk BOTH the forward (canonical bases) and
+// reverse-complement (RC of canonical) orientations. Runtime reads may
+// arrive in either orientation, and the L-mer prefixes of the two
+// orientations canonicalize to DIFFERENT canonical forms in general
+// (they only coincide for palindromes). We therefore need both
+// trajectories to cover both possible read orientations at the per-L
+// tables.
+//
+// `traj_fwd` and `traj_rc` are filled with the length-k_max trajectories
+// for canonical's bases and RC(canonical)'s bases respectively.
+static void walk_both_orientations(FMI_search *fmi,
+                                   uint64_t canonical_kmer,
+                                   int k_max,
+                                   std::vector<LevelRecord> &traj_fwd,
+                                   std::vector<LevelRecord> &traj_rc) {
+    uint8_t bases[64];
+    unpack_bases(canonical_kmer, k_max, bases);
+    walk_bases(fmi, bases, k_max, traj_fwd);
+
+    // RC bases: reverse order and complement each.
+    uint8_t rc_bases[64];
+    for (int i = 0; i < k_max; ++i) {
+        rc_bases[i] = (uint8_t)(bases[k_max - 1 - i] ^ 0x3u);
+    }
+    walk_bases(fmi, rc_bases, k_max, traj_rc);
 }
 
 // -- Aggregation -------------------------------------------------------
@@ -520,12 +551,13 @@ int accel_build_main(int argc, char **argv) {
 
     size_t done = 0;
     size_t kept = 0;
-    std::vector<LevelRecord> traj;
+    std::vector<LevelRecord> traj_fwd, traj_rc;
     for (uint64_t km : kmers) {
-        walk_trajectory(fmi, km, opt.k_max, traj);
-        const LevelRecord &term = traj[(size_t)(opt.k_max - 1)];
+        walk_both_orientations(fmi, km, opt.k_max, traj_fwd, traj_rc);
+        const LevelRecord &term = traj_fwd[(size_t)(opt.k_max - 1)];
         if (term.s > 0) {
-            aggregate(traj, opt.k_min, opt.k_max, opt.collapse_thresh, agg);
+            aggregate(traj_fwd, opt.k_min, opt.k_max, opt.collapse_thresh, agg);
+            aggregate(traj_rc,  opt.k_min, opt.k_max, opt.collapse_thresh, agg);
             kept++;
         }
         done++;

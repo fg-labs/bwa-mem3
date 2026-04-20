@@ -30,6 +30,7 @@ Authors: Sanchit Misra <sanchit.misra@intel.com>; Vasimuddin Md <vasimuddin.md@i
 #include <stdio.h>
 #include "sais.h"
 #include "FMI_search.h"
+#include "accel_cache.h"
 #include "memcpy_bwamem.h"
 #include "profiling.h"
 
@@ -526,45 +527,90 @@ void FMI_search::getSMEMsOnePosOneThread(uint8_t *enc_qdb,
             smem.l = count[3 - a];
             smem.s = count[a+1] - count[a];
             int numPrev = 0;
-            
-            int j;
-            for(j = x + 1; j < readlength; j++)
-            {
-                // a = enc_qdb[rid * readlength + j];
-                a = enc_qdb[offset + j];
-                next_x = j + 1;
-                if(a < 4)
-                {
-                    SMEM smem_ = smem;
 
-                    // Forward extension is backward extension with the BWT of reverse complement
-                    smem_.k = smem.l;
-                    smem_.l = smem.k;
-                    SMEM newSmem_ = backwardExt(smem_, 3 - a);
-                    //SMEM newSmem_ = forwardExt(smem_, 3 - a);
-                    SMEM newSmem = newSmem_;
-                    newSmem.k = newSmem_.l;
-                    newSmem.l = newSmem_.k;
-                    newSmem.n = j;
+            // -- Target-region accelerator forward-extension walk ------
+            // Mirror the stock per-iteration bookkeeping exactly:
+            //   (a) compute the would-be newSmem at length L,
+            //   (b) save prev[numPrev] = smem (pre-extension), numPrev += (s changed),
+            //   (c) if newSmem.s < min_intv: next_x = (j at L) and BREAK,
+            //   (d) else smem = newSmem; advance to L+1.
+            // Any miss / non-ACGT / out-of-range bails to the stock loop,
+            // which resumes from the correct j.
+            int j_start = x + 1;
+            bool walk_broke = false;
+            if (this->accel != nullptr && this->accel->enabled()) {
+                const uint32_t kmax = this->accel->k_max();
+                for (uint32_t L = 2; L <= kmax && x + (int)L <= readlength; ++L) {
+                    uint64_t fwd = accel_pack_forward(&enc_qdb[offset + x], L);
+                    if (fwd == UINT64_MAX) break; // N in the window; fall through
+                    bool is_rc = false;
+                    uint64_t canon = accel_canonicalize(fwd, L, &is_rc);
+                    AccelLookupResult r = this->accel->probe(L, canon);
+                    if (!r.hit) break; // fall through to stock loop at j_start
+                    int64_t nk = is_rc ? r.sa_l : r.sa_k;
+                    int64_t nl = is_rc ? r.sa_k : r.sa_l;
+                    int64_t ns = r.sa_s;
 
-                    int32_t s_neq_mask = newSmem.s != smem.s;
-
+                    int32_t s_neq_mask = (ns != smem.s) ? 1 : 0;
                     prevArray[numPrev] = smem;
                     numPrev += s_neq_mask;
-                    if(newSmem.s < min_intv_array[i])
-                    {
-                        next_x = j;
+                    int j_here = x + (int)L - 1;
+                    if (ns < min_intv_array[i]) {
+                        next_x = j_here;
+                        walk_broke = true;
                         break;
                     }
-                    smem = newSmem;
-#ifdef ENABLE_PREFETCH
-                    _mm_prefetch((const char *)(&cp_occ[(smem.k) >> CP_SHIFT]), _MM_HINT_T0);
-                    _mm_prefetch((const char *)(&cp_occ[(smem.l) >> CP_SHIFT]), _MM_HINT_T0);
-#endif
+                    smem.k = nk;
+                    smem.l = nl;
+                    smem.s = ns;
+                    smem.n = j_here;
+                    j_start = x + (int)L;
+                    // next_x tracks the would-be-last-considered position.
+                    next_x = j_here + 1;
                 }
-                else
+            }
+            // -- End accelerator walk ----------------------------------
+
+            int j = j_start;
+            if (!walk_broke) {
+                for(; j < readlength; j++)
                 {
-                    break;
+                    // a = enc_qdb[rid * readlength + j];
+                    a = enc_qdb[offset + j];
+                    next_x = j + 1;
+                    if(a < 4)
+                    {
+                        SMEM smem_ = smem;
+
+                        // Forward extension is backward extension with the BWT of reverse complement
+                        smem_.k = smem.l;
+                        smem_.l = smem.k;
+                        SMEM newSmem_ = backwardExt(smem_, 3 - a);
+                        //SMEM newSmem_ = forwardExt(smem_, 3 - a);
+                        SMEM newSmem = newSmem_;
+                        newSmem.k = newSmem_.l;
+                        newSmem.l = newSmem_.k;
+                        newSmem.n = j;
+
+                        int32_t s_neq_mask = newSmem.s != smem.s;
+
+                        prevArray[numPrev] = smem;
+                        numPrev += s_neq_mask;
+                        if(newSmem.s < min_intv_array[i])
+                        {
+                            next_x = j;
+                            break;
+                        }
+                        smem = newSmem;
+#ifdef ENABLE_PREFETCH
+                        _mm_prefetch((const char *)(&cp_occ[(smem.k) >> CP_SHIFT]), _MM_HINT_T0);
+                        _mm_prefetch((const char *)(&cp_occ[(smem.l) >> CP_SHIFT]), _MM_HINT_T0);
+#endif
+                    }
+                    else
+                    {
+                        break;
+                    }
                 }
             }
             if(smem.s >= min_intv_array[i])
