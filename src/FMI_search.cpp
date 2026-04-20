@@ -647,7 +647,38 @@ void FMI_search::getSMEMsOnePosOneThread(uint8_t *enc_qdb,
                 for(p = 0; p < numPrev; p++)
                 {
                     SMEM smem = prev[p];
-                    SMEM newSmem = backwardExt(smem, a);
+                    // -- Accelerator probe for backward extension ---
+                    // Try the cache before calling backwardExt. The new
+                    // SMEM covers read[j .. smem.n], length smem.n - j + 1.
+                    // If the canonical form of that window is in the
+                    // per-level table, we get the same SA interval that
+                    // backwardExt would compute, saving one LF-map.
+                    SMEM newSmem;
+                    bool probed_hit = false;
+                    if (this->accel != nullptr && this->accel->enabled()) {
+                        int new_len = smem.n - j + 1;
+                        if ((uint32_t)new_len >= this->accel->k_min()
+                            && (uint32_t)new_len <= this->accel->k_max()) {
+                            uint64_t fwd = accel_pack_forward(&enc_qdb[offset + j], (uint32_t)new_len);
+                            if (fwd != UINT64_MAX) {
+                                bool is_rc = false;
+                                uint64_t canon = accel_canonicalize(fwd, (uint32_t)new_len, &is_rc);
+                                AccelLookupResult r = this->accel->probe((uint32_t)new_len, canon);
+                                if (r.hit) {
+                                    newSmem.rid = smem.rid;
+                                    newSmem.k = is_rc ? r.sa_l : r.sa_k;
+                                    newSmem.l = is_rc ? r.sa_k : r.sa_l;
+                                    newSmem.s = r.sa_s;
+                                    newSmem.m = smem.m;
+                                    newSmem.n = smem.n;
+                                    probed_hit = true;
+                                }
+                            }
+                        }
+                    }
+                    if (!probed_hit) {
+                        newSmem = backwardExt(smem, a);
+                    }
                     newSmem.m = j;
 
                     if((newSmem.s < min_intv_array[i]) && ((smem.n - smem.m + 1) >= minSeedLen))
