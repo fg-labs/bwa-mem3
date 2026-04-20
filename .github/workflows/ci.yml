@@ -115,3 +115,14 @@ jobs:
             diff bwa.normalized.sam bwamem2.normalized.sam | head -40
             exit 1
           fi
+
+      - name: Accelerator parity (R1) test
+        run: |
+          cd /tmp/ci-test
+          # Use the bwa-mem2 index we just built. Convert the simulated
+          # FASTQ pair into a single interleaved FASTQ for the R1 test.
+          gunzip -k reads.bwa.read1.fastq.gz
+          WORK=/tmp/accel_parity_ci \
+          REF=/tmp/ci-test/bwamem2_phix174.fa \
+          FQ=/tmp/ci-test/reads.bwa.read1.fastq \
+            bash $GITHUB_WORKSPACE/test/accel_parity.sh

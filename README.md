@@ -85,6 +85,41 @@ Where
 Where <prefix> is the prefix specified when creating the index or the path to the reference fasta file in case no prefix was provided.
 ```
 
+## Target-region fast-path accelerator (fg-main)
+
+`bwa-mem2` in this fork ships a k-mer accelerator that short-circuits SMEM
+extension LF-maps for targeted workloads (WES, panels, capture). Output is
+bit-identical to stock bwa-mem2 (R1); the accelerator is a strict hash-table
+accelerator over the same full-genome FM-index.
+
+Build a cache once per reference + panel:
+
+```sh
+bwa-mem2 build-accel \
+    --ref ref.fa \
+    --bed panel.bed \
+    --out panel.cache
+
+# Or from representative reads (no BED needed):
+bwa-mem2 build-accel --ref ref.fa --reads sample_R1.fq.gz --reads sample_R2.fq.gz --out kit.cache
+
+# Or union of both for best coverage:
+bwa-mem2 build-accel --ref ref.fa --bed panel.bed --reads sample_R1.fq.gz --out kit.cache
+```
+
+Then map with the accelerator:
+
+```sh
+bwa-mem2 mem --accel-cache panel.cache ref.fa r1.fq r2.fq
+```
+
+The cache verifies a SHA-256 of `ref.fa.bwt.2bit.64` at load and refuses a
+mismatched cache. If `--accel-cache` is omitted, `bwa-mem2 mem` behaves
+exactly as before.
+
+See `docs/superpowers/specs/2026-04-20-target-region-fast-path-design.md`
+for the design; `test/accel_parity.sh` for the R1 parity test run in CI.
+
 ## Performance
 
 Datasets:  
