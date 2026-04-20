@@ -13,9 +13,11 @@ on:
   push:
     branches:
       - 'proto/neon-kswv-**'
+      - 'proto/avx2-kswv-**'
   pull_request:
     branches:
       - 'fg-main'
+      - 'proto/neon-kswv-**'
     paths:
       - 'src/**'
       - 'test/kswv_selftest.cpp'
