@@ -89,10 +89,11 @@ jobs:
         id: selftest
         continue-on-error: true  # iterating; surface result without gating CI yet
         run: |
-          ./kswv_selftest 2>&1 | tee /tmp/selftest.log
+          mkdir -p /tmp/ci-out
+          ./kswv_selftest 2>&1 | tee /tmp/ci-out/selftest.log
           status=${PIPESTATUS[0]}
           echo "selftest_exit=$status" >> "$GITHUB_OUTPUT"
-          tail -25 /tmp/selftest.log >> "$GITHUB_STEP_SUMMARY"
+          tail -25 /tmp/ci-out/selftest.log >> "$GITHUB_STEP_SUMMARY"
           exit $status
 
       - name: Cache chr17 bwa-mem2 index
@@ -183,10 +184,12 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: arm-outputs
+          # All under /tmp/ci-out so the archive flattens to bare filenames
+          # rather than preserving a /tmp/... prefix.
           path: |
             /tmp/ci-out/port.sam.md5
             /tmp/ci-out/port.rep1.sam
-            /tmp/selftest.log
+            /tmp/ci-out/selftest.log
 
   reference-x86:
     name: x86 reference SAM (AVX-512)
@@ -202,6 +205,13 @@ jobs:
 
       - name: Check AVX-512 availability
         run: |
+          # AVX-512BW is required for the x86 batched mate-rescue path (gated
+          # by __AVX512BW__ in bwamem.cpp:1255 and bwamem_pair.cpp:657). Free
+          # GH runners typically do not expose it. When it's missing we fall
+          # back to AVX2, which takes the same scalar mem_sam_pe path as ARM
+          # today — so the cross-arch "SAM identity" step is then testing
+          # scalar-vs-scalar, not batched-vs-scalar. That's still useful once
+          # the port lands (ARM batched vs x86 scalar cross-check) but noted.
           if ! grep -q avx512bw /proc/cpuinfo; then
             echo "::warning::AVX-512BW not available on this runner; falling back to AVX2 reference"
             echo "USE_AVX=avx2" >> "$GITHUB_ENV"
