@@ -373,8 +373,32 @@ int kswv::kswv_neon_u8(uint8_t seq1SoA[],
     uint8x16_t oe_ins_vec = vdupq_n_u8(this->o_ins + this->e_ins);
     uint8x16_t five_vec = vdupq_n_u8(DUMMY5);
     uint8x16_t gmax_vec = zero_vec;
-    int16x8_t te_vec = vdupq_n_s16(-1);
+    // 8-bit SW processes 16 pairs per SIMD batch, but te must be tracked in
+    // 16-bit precision (ref positions > 255 are possible). Use two
+    // int16x8 vectors — _lo for pairs 0-7, _hi for pairs 8-15 — so every
+    // pair has its own te slot. The earlier single int16x8 te_vec plus
+    // hacky "duplicate on store" only tracked pairs 0-7 correctly; pairs
+    // 8-15 got copies of the wrong pair's te.
+    int16x8_t te_vec_lo = vdupq_n_s16(-1);
+    int16x8_t te_vec_hi = vdupq_n_s16(-1);
     uint8x16_t cmax_vec = vdupq_n_u8(255);
+    // "Frozen" mask: tracks which pairs have hit their KSW_XSTOP target
+    // in a prior row. Once frozen, a pair's gmax/te/qe must not be updated
+    // — otherwise later rows (which may contain untouched ref bytes when
+    // the caller only partially reversed the buffer) can add spurious
+    // matches, pushing phase-1's score above phase-0's and breaking the
+    // write-back gate `aln[ind].score == score[l]` at line ~538.
+    uint8x16_t frozen_vec = zero_vec;
+
+    /* Per-lane mask of "this lane has a real KSW_XSTOP target set" (derived
+     * from endsc_msk_a). endsc[i] defaults to 0 for lanes without a target,
+     * which would otherwise make vcgeq_u8(gmax, endsc_vec) trivially true
+     * and cause premature freezing. */
+    uint8_t _has_endsc_bytes[SIMD_WIDTH8];
+    for (int _i = 0; _i < SIMD_WIDTH8; _i++) {
+        _has_endsc_bytes[_i] = (endsc_msk_a & (1 << _i)) ? 0xFF : 0x00;
+    }
+    uint8x16_t has_endsc_vec = vld1q_u8(_has_endsc_bytes);
 
     uint16_t exit0 = 0xFFFF;
 
@@ -487,15 +511,51 @@ int kswv::kswv_neon_u8(uint8_t seq1SoA[],
         uint8x16_t cmp0 = vcgtq_u8(imax_vec, gmax_vec);
         uint16_t cmp0_msk = neon_movemask_u8(cmp0);
         cmp0_msk &= exit0;
-        gmax_vec = vmaxq_u8(gmax_vec, imax_vec);
-        /* Update te for elements where imax > gmax */
-        te_vec = vbslq_s16(vreinterpretq_u16_u8(cmp0), i_vec, te_vec);
-        qe_vec = vbslq_u8(cmp0, iqe_vec, qe_vec);
+
+        /* 16-bit-wide comparison mirrors cmp0 but with 0xFFFF/0x0000 per
+         * 16-bit lane, suitable for updating the two halves of te. Must be
+         * computed BEFORE the vmaxq_u8 update of gmax_vec (same as cmp0). */
+        uint16x8_t cmp_lo_16 = vcgtq_u16(vmovl_u8(vget_low_u8(imax_vec)),
+                                         vmovl_u8(vget_low_u8(gmax_vec)));
+        uint16x8_t cmp_hi_16 = vcgtq_u16(vmovl_u8(vget_high_u8(imax_vec)),
+                                         vmovl_u8(vget_high_u8(gmax_vec)));
+
+        /* 16-bit frozen masks (0xFFFF per lane where frozen, else 0x0000).
+         * Widen 0xFF/0x00 bytes: vtstq_u8-style check, but we can use
+         * vmovl_u8 + vcgtq to turn non-zero into 0xFFFF. */
+        uint16x8_t frozen_lo_16 = vcgtq_u16(
+            vmovl_u8(vget_low_u8(frozen_vec)), vdupq_n_u16(0));
+        uint16x8_t frozen_hi_16 = vcgtq_u16(
+            vmovl_u8(vget_high_u8(frozen_vec)), vdupq_n_u16(0));
+
+        /* Combine "imax > gmax" with "not frozen" for the final update masks */
+        cmp_lo_16 = vbicq_u16(cmp_lo_16, frozen_lo_16);
+        cmp_hi_16 = vbicq_u16(cmp_hi_16, frozen_hi_16);
+        uint8x16_t cmp0_active = vbicq_u8(cmp0, frozen_vec);
+
+        /* gmax: pick new max for active lanes, keep frozen lanes' stored
+         * value. This is what prevents later rows from inflating a lane's
+         * score beyond its phase-0 target once it's already "done". */
+        uint8x16_t new_gmax = vmaxq_u8(gmax_vec, imax_vec);
+        gmax_vec = vbslq_u8(frozen_vec, gmax_vec, new_gmax);
+
+        /* Update te/qe only for active lanes (imax > gmax AND not frozen) */
+        te_vec_lo = vbslq_s16(cmp_lo_16, i_vec, te_vec_lo);
+        te_vec_hi = vbslq_s16(cmp_hi_16, i_vec, te_vec_hi);
+        qe_vec = vbslq_u8(cmp0_active, iqe_vec, qe_vec);
 
         /* Check end score threshold */
         uint8x16_t cmp_end = vcgeq_u8(gmax_vec, endsc_vec);
         uint16_t cmp_end_msk = neon_movemask_u8(cmp_end);
         cmp_end_msk &= endsc_msk_a;
+
+        /* Freeze any lane that just hit its KSW_XSTOP target. From the
+         * next row onwards, frozen lanes will skip the gmax/te/qe updates
+         * above. has_endsc_vec ensures we only freeze lanes that actually
+         * set a target (endsc_vec defaults to 0 otherwise, which would
+         * match cmp_end trivially). */
+        uint8x16_t just_hit = vandq_u8(cmp_end, has_endsc_vec);
+        frozen_vec = vorrq_u8(frozen_vec, just_hit);
 
         /* Check for overflow */
         uint8x16_t left_vec = vqaddq_u8(gmax_vec, sft_vec);
@@ -521,8 +581,8 @@ int kswv::kswv_neon_u8(uint8_t seq1SoA[],
     uint8_t qe[SIMD_WIDTH8] __attribute((aligned(128)));
 
     vst1q_u8(score, gmax_vec);
-    vst1q_s16(te1, te_vec);
-    vst1q_s16(te1 + 8, te_vec);  // duplicate for 16-element access
+    vst1q_s16(te1, te_vec_lo);       // pairs 0-7
+    vst1q_s16(te1 + 8, te_vec_hi);   // pairs 8-15
     vst1q_u8(qe, qe_vec);
 
     int live = 0;
@@ -583,28 +643,96 @@ int kswv::kswv_neon_u8(uint8_t seq1SoA[],
     }
 
     uint8x16_t max2_vec = zero_vec;
-    int16x8_t te2_vec = vdupq_n_s16(-1);
+    /* te2 is per-lane int16 so ref positions > 255 round-trip correctly.
+     * Split into lo (lanes 0..7) and hi (lanes 8..15) to mirror the split
+     * te_vec_{lo,hi} tracking used in the primary-score loop. */
+    int16x8_t te2_vec_lo = vdupq_n_s16(-1);
+    int16x8_t te2_vec_hi = vdupq_n_s16(-1);
 
-    /* Find second best score outside primary alignment region */
-    for (int i = 0; i < maxl; i++)
-    {
-        uint8x16_t rmax_vec = vld1q_u8(rowMax + i * SIMD_WIDTH8);
-        uint8x16_t cmp = vcgtq_u8(rmax_vec, max2_vec);
-        max2_vec = vmaxq_u8(max2_vec, rmax_vec);
+    /* Per-lane scan vectors for correct score2 across heterogeneous
+     * batches. Three constraints per lane:
+     *   (1) i < len1[lane]            — in the pair's real ref
+     *   (2) i < low[lane]  OR  i > high[lane]
+     *                                  — outside the pair's own primary
+     *                                    region (low/high are precomputed
+     *                                    above as `te +/- val`)
+     *   (3) qe[lane] != 0             — the pair found a valid primary
+     * Updating max2_vec from rowMax[i] must respect all three. The earlier
+     * scan used a single `[minh+1, limit)` range derived from per-lane
+     * maxl/minh aggregates, which leaked one pair's primary-region scores
+     * into another pair's score2. That produced score2 == score on many
+     * batches, collapsing MAPQ to 0 downstream.
+     */
+    int16_t _len1_arr[SIMD_WIDTH8] __attribute__((aligned(16))) = {0};
+    for (int _l = 0; _l < SIMD_WIDTH8; _l++) {
+        _len1_arr[_l] = (int16_t)p[_l].len1;
     }
+    int16x8_t len1_lo = vld1q_s16(_len1_arr);
+    int16x8_t len1_hi = vld1q_s16(_len1_arr + 8);
+    int16x8_t low_lo  = vld1q_s16(low);
+    int16x8_t low_hi  = vld1q_s16(low + 8);
+    int16x8_t high_lo = vld1q_s16(high);
+    int16x8_t high_hi = vld1q_s16(high + 8);
 
-    for (int i = minh + 1; i < limit; i++)
-    {
+    /* qe_mask[lane] = 0xFF if qe[lane] != 0 else 0x00; used to zero out
+     * contributions from lanes without a primary alignment. */
+    uint8_t _qe_mask_arr[SIMD_WIDTH8] __attribute__((aligned(16)));
+    for (int _l = 0; _l < SIMD_WIDTH8; _l++) _qe_mask_arr[_l] = qe[_l] ? 0xFF : 0x00;
+    uint8x16_t qe_mask_vec = vld1q_u8(_qe_mask_arr);
+
+    auto scan_row = [&](int i) {
         uint8x16_t rmax_vec = vld1q_u8(rowMax + i * SIMD_WIDTH8);
-        uint8x16_t cmp = vcgtq_u8(rmax_vec, max2_vec);
+        int16x8_t iv = vdupq_n_s16((int16_t)i);
+
+        /* (1) in_bounds: len1 > i */
+        uint16x8_t ib_lo = vcgtq_s16(len1_lo, iv);
+        uint16x8_t ib_hi = vcgtq_s16(len1_hi, iv);
+
+        /* (2) outside primary region: i < low OR i > high */
+        uint16x8_t below_lo = vcltq_s16(iv, low_lo);
+        uint16x8_t below_hi = vcltq_s16(iv, low_hi);
+        uint16x8_t above_lo = vcgtq_s16(iv, high_lo);
+        uint16x8_t above_hi = vcgtq_s16(iv, high_hi);
+        uint16x8_t outside_lo = vorrq_u16(below_lo, above_lo);
+        uint16x8_t outside_hi = vorrq_u16(below_hi, above_hi);
+
+        uint16x8_t ok_lo = vandq_u16(ib_lo, outside_lo);
+        uint16x8_t ok_hi = vandq_u16(ib_hi, outside_hi);
+
+        uint8x16_t ok = vcombine_u8(vmovn_u16(ok_lo), vmovn_u16(ok_hi));
+        /* (3) only consider lanes with a valid primary */
+        ok = vandq_u8(ok, qe_mask_vec);
+
+        rmax_vec = vandq_u8(rmax_vec, ok);
+
+        /* (4) enforce minsc threshold: scalar ksw_align2 only records
+         * (score, te) pairs where gmax >= minsc. Our rowMax is dense
+         * (captures every row) so a late-stage plateau below minsc would
+         * otherwise leak in. Drop those to match scalar's behaviour. */
+        uint8x16_t ge_minsc = vcgeq_u8(rmax_vec, minsc_vec);
+        rmax_vec = vandq_u8(rmax_vec, ge_minsc);
+
+        /* Lanes where rmax strictly beats max2 take this row's i as their
+         * new te2. Widen the 8-bit per-lane mask to 16-bit halves so
+         * vbslq_s16 selects on the int16 te2 tracking vectors. */
+        uint8x16_t better = vcgtq_u8(rmax_vec, max2_vec);
+        uint16x8_t better_lo = vmovl_u8(vget_low_u8(better));
+        uint16x8_t better_hi = vmovl_u8(vget_high_u8(better));
+        te2_vec_lo = vbslq_s16(better_lo, iv, te2_vec_lo);
+        te2_vec_hi = vbslq_s16(better_hi, iv, te2_vec_hi);
+
         max2_vec = vmaxq_u8(max2_vec, rmax_vec);
-    }
+    };
+
+    /* Scan every row up to `limit` once, per-lane masking handles region. */
+    for (int i = 0; i < limit; i++) scan_row(i);
+    (void)maxl; (void)minh;  // now implicit in per-lane low/high
 
     uint8_t temp2[SIMD_WIDTH8] __attribute((aligned(128)));
     int16_t temp4[SIMD_WIDTH8] __attribute((aligned(128)));
     vst1q_u8(temp2, max2_vec);
-    vst1q_s16(temp4, te2_vec);
-    vst1q_s16(temp4 + 8, te2_vec);
+    vst1q_s16(temp4, te2_vec_lo);
+    vst1q_s16(temp4 + 8, te2_vec_hi);
 
     for (int i = 0; i < SIMD_WIDTH8 && (po_ind + i) < numPairs; i++)
     {

@@ -122,10 +122,6 @@ jobs:
             /tmp/ci-reads/reads
 
       - name: Run mem (port build)
-        # Port currently asserts in mem_reg2aln because NEON kswv phase=1
-        # (start-position pass) isn't producing correct qb/tb — the selftest
-        # only exercises phase=0 score correctness. `|| true` preserves CI
-        # signal while we iterate on the phase=1 fix.
         run: |
           mkdir -p /tmp/ci-out
           for rep in $(seq 1 "$N_REPS"); do
@@ -133,13 +129,8 @@ jobs:
               /tmp/ci-ref/chr17.fa \
               /tmp/ci-reads/reads.bwa.read1.fastq.gz /tmp/ci-reads/reads.bwa.read2.fastq.gz \
               > /tmp/ci-out/port.rep${rep}.sam \
-              2> /tmp/ci-out/port.rep${rep}.time || true
+              2> /tmp/ci-out/port.rep${rep}.time
           done
-          echo "--- port rep1 tail (last 40 lines of stderr + timing) ---"
-          tail -40 /tmp/ci-out/port.rep1.time || true
-          echo "--- port rep1 SAM size + first 3 records ---"
-          wc -l /tmp/ci-out/port.rep1.sam || true
-          head -3 /tmp/ci-out/port.rep1.sam || true
 
       - name: Run mem (control build)
         run: |
@@ -184,17 +175,9 @@ jobs:
 
       - name: Sort + md5 port SAM for identity check
         run: |
-          # Graceful no-op if port crashed and produced no usable SAM; the
-          # sam-identity job then reports the missing artifact rather than
-          # failing here.
-          if [ -s /tmp/ci-out/port.rep1.sam ] && grep -q '^[^@]' /tmp/ci-out/port.rep1.sam; then
-            samtools sort -@ "$(nproc)" -n /tmp/ci-out/port.rep1.sam -o /tmp/ci-out/port.sorted.bam
-            samtools view /tmp/ci-out/port.sorted.bam | md5sum | awk '{print $1}' > /tmp/ci-out/port.sam.md5
-            echo "ARM port SAM md5: $(cat /tmp/ci-out/port.sam.md5)" >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "(port build produced no alignment records — port crash expected during iteration)" > /tmp/ci-out/port.sam.md5
-            echo "ARM port SAM: (empty — port crashed before producing records)" >> "$GITHUB_STEP_SUMMARY"
-          fi
+          samtools sort -@ "$(nproc)" -n /tmp/ci-out/port.rep1.sam -o /tmp/ci-out/port.sorted.bam
+          samtools view /tmp/ci-out/port.sorted.bam | md5sum | awk '{print $1}' > /tmp/ci-out/port.sam.md5
+          echo "ARM port SAM md5: $(cat /tmp/ci-out/port.sam.md5)" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -318,17 +301,13 @@ jobs:
           {
             echo "## Cross-arch SAM identity"
             echo ""
-            echo "- ARM (port): \`$arm_md5\`"
-            echo "- x86 (reference): \`$x86_md5\`"
+            echo "- ARM (port, NEON batched mate-rescue): \`$arm_md5\`"
+            echo "- x86 (reference, scalar mate-rescue on AVX2 runners): \`$x86_md5\`"
             echo ""
             if [ "$arm_md5" = "$x86_md5" ]; then
               echo "PASS: byte-identical sorted SAM across arches."
             else
-              echo "FAIL: SAM md5 differs. Expected on scaffolding PR before port lands."
+              echo "FAIL: SAM md5 differs."
             fi
           } | tee -a "$GITHUB_STEP_SUMMARY"
-          # Soft-fail on scaffolding; the divergence is expected (ARM scalar
-          # mem_sam_pe vs x86 batched mem_sam_pe_batch produce equivalent but
-          # not byte-identical SAM in some rare PE cases). Flip to strict once
-          # the port lands.
-          if [ "$arm_md5" != "$x86_md5" ]; then exit 0; fi
+          [ "$arm_md5" = "$x86_md5" ] || exit 1

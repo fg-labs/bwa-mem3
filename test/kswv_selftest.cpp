@@ -116,12 +116,18 @@ static TestPair gen_with_n_bases(std::mt19937 &rng, int qlen, int rlen, int n_fr
 
 // --- runners ----------------------------------------------------------------
 
+// Scalar reference — pass the same xtra flags as the batched path so that
+// the minsc threshold (low 16 bits) filters score2 identically in both.
+static const int MIN_SEED_LEN = 19;
+static const int SELF_XTRA    = KSW_XSUBO | KSW_XSTART | KSW_XBYTE
+                                | (MIN_SEED_LEN * SCORE_MATCH);
+
 static kswr_t run_scalar(const TestPair &p) {
     // ksw_align2 expects non-const pointers, but does not mutate.
     return ksw_align2(p.qry.size(), const_cast<uint8_t*>(p.qry.data()),
                       p.ref.size(), const_cast<uint8_t*>(p.ref.data()),
                       5, g_mat, GAP_OPEN, GAP_EXT, GAP_OPEN, GAP_EXT,
-                      KSW_XSTART | KSW_XSUBO, nullptr);
+                      SELF_XTRA, nullptr);
 }
 
 // Pack a batch of pairs into kswv's flat seqBuf layout and run getScores8.
@@ -157,10 +163,11 @@ static BatchResult run_batched(const std::vector<TestPair> &pairs,
     std::vector<uint8_t> seqBufQer(qer_total, 0);
     std::vector<SeqPair> pairArray(n + SIMD_WIDTH8);
 
-    // Production mate-rescue uses KSW_XBYTE (8-bit kernel) for short reads
-    // where `l_ms * w_match < 250`. With w_match=1 and qlen<=128 that covers
-    // all our test pairs; route everything through getScores8.
-    const int xtra_flags = KSW_XSUBO | KSW_XSTART | KSW_XBYTE;
+    // Match production's mate-rescue h0 (bwamem_pair.cpp:1004):
+    //   KSW_XSUBO | KSW_XSTART | (l_ms*a<250 ? KSW_XBYTE : 0) | (min_seed_len*a)
+    // The low 16 bits carry the minsc threshold that gates which score2
+    // candidates the kernel admits — matching scalar ksw_align2.
+    const int xtra_flags = SELF_XTRA;
 
     size_t ref_off = 0, qer_off = 0;
     for (int i = 0; i < n; i++) {
@@ -200,12 +207,16 @@ static BatchResult run_batched(const std::vector<TestPair> &pairs,
         }
     }
 
-    // Between passes: replicate the production code at bwamem_pair.cpp:661-683.
+    // Between passes: replicate the production code at bwamem_pair.cpp:660-676.
     // For each pair, reverse seq prefixes up to (te+1, qe+1), set h0 to
-    // KSW_XSTOP | score, trim len2 to qe+1, keep the pair in the batch.
+    // KSW_XSTOP | score, trim len2 to qe+1. Repack survivors to the front of
+    // pairArray (copy, not reference) so phase 1 sees the same lane mix
+    // production builds — lane-mixing masking/freezing regressions only
+    // surface under the compacted layout.
+    int pos = 0;
     for (int i = 0; i < n; i++) {
         kswr_t r = out.aln[i];
-        SeqPair &sp = pairArray[i];
+        SeqPair sp = pairArray[i];
         int xtra = sp.h0;
         if ((xtra & KSW_XSTART) == 0 ||
             ((xtra & KSW_XSUBO) && r.score < (xtra & 0xffff))) {
@@ -217,11 +228,33 @@ static BatchResult run_batched(const std::vector<TestPair> &pairs,
         uint8_t *rs = seqBufRef.data() + sp.idr;
         revseq(r.qe + 1, qs);
         revseq(r.te + 1, rs);
+        pairArray[pos++] = sp;
     }
 
     // Phase 1: reverse pass → fills tb, qb by subtraction inside the kernel.
+    // For diagnosis, save pre-phase-1 kswr_t so we can see whether phase 1's
+    // score differs from the stored phase-0 score (that equality gates the
+    // tb/qb write-back at kswv.cpp:535).
+    std::vector<kswr_t> pre_phase1(out.aln.begin(), out.aln.begin() + n);
     pwsw->getScores8(pairArray.data(), seqBufRef.data(), seqBufQer.data(),
-                     out.aln.data(), n, 1, 1);
+                     out.aln.data(), pos, 1, 1);
+
+    if (const char *dbg = getenv("KSWV_SELFTEST_DEBUG_PHASE1")) {
+        (void)dbg;
+        int dumped = 0;
+        for (int i = 0; i < n && dumped < 10; i++) {
+            if (out.aln[i].tb == -1 && pre_phase1[i].score > 0) {
+                fprintf(stderr, "[debug-phase1] pair %d: phase0{score=%d te=%d qe=%d} "
+                        "post_phase1{score=%d te=%d qe=%d tb=%d qb=%d} "
+                        "len1_after_trim=%d len2_after_trim=%d\n",
+                        i, pre_phase1[i].score, pre_phase1[i].te, pre_phase1[i].qe,
+                        out.aln[i].score, out.aln[i].te, out.aln[i].qe,
+                        out.aln[i].tb, out.aln[i].qb,
+                        pairArray[i].len1, pairArray[i].len2);
+                dumped++;
+            }
+        }
+    }
 
     delete pwsw;
     out.aln.resize(n);
@@ -246,7 +279,22 @@ static bool kswr_eq_score(const kswr_t &a, const kswr_t &b) {
 // the kernel may not bother filling those.
 static bool kswr_eq_coords(const kswr_t &scalar, const kswr_t &batched) {
     if (scalar.score == 0) return true;  // degenerate, skip
+    // Scalar ksw_align2 short-circuits phase 2 when `score < minsc`
+    // (ksw.cpp:374), leaving tb/qb at -1. Production's downstream filter
+    // `aln.score >= opt->min_seed_len` drops these pairs before tb/qb is
+    // consulted. Exclude from the coord diff to match that reality.
+    if (scalar.score < MIN_SEED_LEN) return true;
     return scalar.qb == batched.qb && scalar.tb == batched.tb;
+}
+
+static bool kswr_eq_score2(const kswr_t &scalar, const kswr_t &batched) {
+    if (scalar.score == 0) return true;
+    // score2 is the sub-optimal score from KSW_XSUBO; it feeds MAPQ
+    // downstream via mem_alnreg_t::csub. Scalar sets -1 when absent;
+    // batched kernel may use 0 or -1; treat both as "no suboptimal".
+    int a = (scalar.score2 <= 0) ? -1 : scalar.score2;
+    int b = (batched.score2 <= 0) ? -1 : batched.score2;
+    return a == b;
 }
 
 int main(int argc, char **argv) {
@@ -299,9 +347,10 @@ int main(int argc, char **argv) {
     // Batched (NEON kswv on ARM; AVX-512 kswv on x86)
     BatchResult br = run_batched(pairs, maxRefLen, maxQerLen);
 
-    // Diff: both score and start-position correctness.
+    // Diff: score, start-position, and score2 (suboptimal) correctness.
     std::vector<Mismatch> score_mism;
     std::vector<Mismatch> coord_mism;
+    std::vector<Mismatch> score2_mism;
     for (size_t i = 0; i < pairs.size(); i++) {
         if (!kswr_eq_score(scalar_aln[i], br.aln[i])) {
             score_mism.push_back({(int)i, pairs[i].tag, scalar_aln[i], br.aln[i]});
@@ -309,13 +358,17 @@ int main(int argc, char **argv) {
         if (!kswr_eq_coords(scalar_aln[i], br.aln[i])) {
             coord_mism.push_back({(int)i, pairs[i].tag, scalar_aln[i], br.aln[i]});
         }
+        if (!kswr_eq_score2(scalar_aln[i], br.aln[i])) {
+            score2_mism.push_back({(int)i, pairs[i].tag, scalar_aln[i], br.aln[i]});
+        }
     }
 
     fprintf(stderr, "kswv_selftest: %zu pairs tested (%d random + %zu edge)\n"
                     "  score mismatches: %zu\n"
-                    "  coord (tb/qb) mismatches: %zu\n",
+                    "  coord (tb/qb) mismatches: %zu\n"
+                    "  score2 (suboptimal) mismatches: %zu\n",
             pairs.size(), n_random, pairs.size() - (size_t)n_random,
-            score_mism.size(), coord_mism.size());
+            score_mism.size(), coord_mism.size(), score2_mism.size());
 
     auto dump_mism = [](const char *label, const std::vector<Mismatch> &mism) {
         if (mism.empty()) return;
@@ -327,28 +380,23 @@ int main(int argc, char **argv) {
                 break;
             }
             ++printed;
-            fprintf(stderr, "  [%d] tag=%s  scalar{score=%d,tb=%d,te=%d,qb=%d,qe=%d}  "
-                            "batched{score=%d,tb=%d,te=%d,qb=%d,qe=%d}\n",
+            fprintf(stderr, "  [%d] tag=%s  scalar{s=%d,tb=%d,te=%d,qb=%d,qe=%d,s2=%d,te2=%d}  "
+                            "batched{s=%d,tb=%d,te=%d,qb=%d,qe=%d,s2=%d,te2=%d}\n",
                     m.idx, m.tag.c_str(),
                     m.scalar.score, m.scalar.tb, m.scalar.te, m.scalar.qb, m.scalar.qe,
-                    m.batched.score, m.batched.tb, m.batched.te, m.batched.qb, m.batched.qe);
+                    m.scalar.score2, m.scalar.te2,
+                    m.batched.score, m.batched.tb, m.batched.te, m.batched.qb, m.batched.qe,
+                    m.batched.score2, m.batched.te2);
         }
     };
     dump_mism("score", score_mism);
     dump_mism("coord", coord_mism);
+    dump_mism("score2", score2_mism);
 
-    // Gating: score correctness is required (proven working in earlier
-    // iteration). Coord correctness is currently broken on NEON phase=1 —
-    // reported as diagnostic, not gated. Once NEON kswv phase=1 is fixed,
-    // remove this soft-fail so coord mismatches also block CI.
-    if (!score_mism.empty()) {
-        fprintf(stderr, "\nkswv_selftest: FAIL (score mismatches present)\n");
+    if (!score_mism.empty() || !coord_mism.empty() || !score2_mism.empty()) {
+        fprintf(stderr, "\nkswv_selftest: FAIL\n");
         return 1;
     }
-    if (!coord_mism.empty()) {
-        fprintf(stderr, "\nkswv_selftest: partial OK — score correct, phase-1 coord bug known\n");
-        return 0;
-    }
-    fprintf(stderr, "kswv_selftest: OK (score + coord match)\n");
+    fprintf(stderr, "kswv_selftest: OK (score + coord + score2 match)\n");
     return 0;
 }
