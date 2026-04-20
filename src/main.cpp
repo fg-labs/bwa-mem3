@@ -30,6 +30,7 @@ Contacts: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@
 
 // ----------------------------------
 #include "main.h"
+#include "accel_build.h"
 
 #ifndef PACKAGE_VERSION
 #define PACKAGE_VERSION "2.2.1"
@@ -47,6 +48,7 @@ int usage()
     fprintf(stderr, "Commands:\n");
     fprintf(stderr, "  index         create index\n");
     fprintf(stderr, "  mem           alignment\n");
+    fprintf(stderr, "  build-accel   build target-region fast-path cache\n");
     fprintf(stderr, "  version       print version number\n");
     return 1;
 }
@@ -103,6 +105,11 @@ int main(int argc, char* argv[])
         
         /** Enable this return to avoid printing of the runtime profiling **/
         //return ret;
+    }
+    else if (strcmp(argv[1], "build-accel") == 0)
+    {
+        ret = accel_build_main(argc - 1, argv + 1);
+        return ret;
     }
     else if (strcmp(argv[1], "version") == 0)
     {

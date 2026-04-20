@@ -71,7 +71,8 @@ LIBS=		-lpthread -lm -lz -L. -lbwa -Lext/safestringlib -lsafestring $(STATIC_GCC
 OBJS=		src/fastmap.o src/bwtindex.o src/utils.o src/memcpy_bwamem.o src/kthread.o \
 			src/kstring.o src/ksw.o src/bntseq.o src/bwamem.o src/profiling.o src/bandedSWA.o \
 			src/FMI_search.o src/read_index_ele.o src/bwamem_pair.o src/kswv.o src/bwa.o \
-			src/bwamem_extra.o src/kopen.o
+			src/bwamem_extra.o src/kopen.o \
+			src/accel_cache.o src/accel_build.o ext/sha256/sha-256.o
 BWA_LIB=    libbwa.a
 SAFE_STR_LIB=    ext/safestringlib/libsafestring.a
 
@@ -133,6 +134,10 @@ CXXFLAGS+=	-g -O3 -fpermissive $(ARCH_FLAGS) #-Wall ##-xSSE2
 
 .cpp.o:
 	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $< -o $@
+
+# Vendored SHA-256 is C, not C++.
+ext/sha256/sha-256.o: ext/sha256/sha-256.c ext/sha256/sha-256.h
+	$(CC) -c -O2 -Wall ext/sha256/sha-256.c -o ext/sha256/sha-256.o
 
 all:$(EXE)
 

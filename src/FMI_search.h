@@ -172,6 +172,18 @@ class FMI_search: public indexEle
     
     int64_t reference_seq_len;
     int64_t sentinel_index;
+
+    // -- Target-region fast path accelerator ---------------------------
+    // Set by fastmap at startup if --accel-cache was given. Probed from
+    // the SMEM hooks in FMI_search.cpp; the accelerator is a strict
+    // accelerator over this same FM-index (R1-safe).
+    class AccelCache *accel = nullptr;
+
+    // Read-only accessors exposed for the build-accel subcommand, which
+    // needs to walk backwardExt to populate the cache's SA intervals.
+    const int64_t *accel_count() const { return count; }
+    SMEM           accel_backwardExt(SMEM s, uint8_t a) { return backwardExt(s, a); }
+
 private:
         char file_name[PATH_MAX];
         int64_t index_alloc;
