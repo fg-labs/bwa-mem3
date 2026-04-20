@@ -249,27 +249,35 @@ jobs:
           fi
           gunzip /tmp/ci-ref/chr17.fa.gz
 
-      - name: Build bwa-mem2 (x86 reference)
-        run: make -j"$(nproc)" arch="$USE_AVX" CXX=g++
+      - name: Build x86 port (batched mate-rescue enabled)
+        run: |
+          make -j"$(nproc)" arch="$USE_AVX" CXX=g++
+          mv bwa-mem2 bwa-mem2.port 2>/dev/null || true
+          cp libbwa.a libbwa.port.a
+
+      - name: Build x86 control (DISABLE_BATCHED_MATESW=1)
+        run: |
+          make clean
+          make -j"$(nproc)" arch="$USE_AVX" DISABLE_BATCHED_MATESW=1 CXX=g++
+          mv bwa-mem2 bwa-mem2.control 2>/dev/null || true
 
       - name: Build kswv_selftest (x86)
-        # Exercises the x86 kswv kernel (AVX-512BW if available, else the
-        # AVX2 stub added in this branch). Link failure here would catch
-        # missing declarations in the AVX2 path.
-        run: make arch="$USE_AVX" kswv_selftest CXX=g++
+        # Rebuild against the port libbwa so the selftest exercises the
+        # new kswv kernel, not the control build's scalar fallback.
+        run: |
+          cp libbwa.port.a libbwa.a
+          make arch="$USE_AVX" kswv_selftest CXX=g++
 
       - name: Run kswv_selftest (x86)
-        # Soft-fail for AVX-512: the existing AVX-512BW kernel has not
-        # been re-validated against the new selftest yet. First runs show
-        # ~6 coord (tb/qb) mismatches — looks like the same freeze-mask /
-        # te-tracking bug class we just fixed in NEON on PR 18. Tracked as
-        # a follow-up. For the AVX2 stub this should pass cleanly since
-        # it delegates to scalar ksw_align2.
-        continue-on-error: true
+        # AVX2 kernel has all four NEON fixes pre-applied and passes cleanly.
+        # AVX-512BW is still carrying the pre-existing bug class we fixed
+        # in NEON — soft-fail only when running against the AVX-512 kernel.
+        continue-on-error: ${{ env.USE_AVX == 'avx512' }}
         run: ./kswv_selftest
 
       - name: Index chr17
-        run: ./bwa-mem2 index /tmp/ci-ref/chr17.fa
+        # Use the port binary for indexing (indexing code is arch-agnostic).
+        run: ./bwa-mem2.port index /tmp/ci-ref/chr17.fa
 
       - name: Simulate dwgsim reads (same params as ARM job)
         run: |
@@ -281,16 +289,61 @@ jobs:
             /tmp/ci-ref/chr17.fa \
             /tmp/ci-reads/reads
 
-      - name: Run mem + sort + md5
+      - name: Run mem (x86 port build)
         run: |
           mkdir -p /tmp/ci-out
-          ./bwa-mem2 mem -t "$(nproc)" \
-            /tmp/ci-ref/chr17.fa \
-            /tmp/ci-reads/reads.bwa.read1.fastq.gz /tmp/ci-reads/reads.bwa.read2.fastq.gz \
-            > /tmp/ci-out/x86.sam
-          samtools sort -@ "$(nproc)" -n /tmp/ci-out/x86.sam -o /tmp/ci-out/x86.sorted.bam
+          for rep in $(seq 1 "$N_REPS"); do
+            /usr/bin/time -v ./bwa-mem2.port mem -t "$(nproc)" \
+              /tmp/ci-ref/chr17.fa \
+              /tmp/ci-reads/reads.bwa.read1.fastq.gz /tmp/ci-reads/reads.bwa.read2.fastq.gz \
+              > /tmp/ci-out/x86_port.rep${rep}.sam \
+              2> /tmp/ci-out/x86_port.rep${rep}.time
+          done
+
+      - name: Run mem (x86 control build)
+        run: |
+          for rep in $(seq 1 "$N_REPS"); do
+            /usr/bin/time -v ./bwa-mem2.control mem -t "$(nproc)" \
+              /tmp/ci-ref/chr17.fa \
+              /tmp/ci-reads/reads.bwa.read1.fastq.gz /tmp/ci-reads/reads.bwa.read2.fastq.gz \
+              > /tmp/ci-out/x86_control.rep${rep}.sam \
+              2> /tmp/ci-out/x86_control.rep${rep}.time
+          done
+
+      - name: Report x86 speedup
+        run: |
+          extract_elapsed() {
+            awk '/Elapsed \(wall clock\) time/ { split($NF, t, ":"); if (length(t)==3) print t[1]*3600+t[2]*60+t[3]; else print t[1]*60+t[2] }' "$1"
+          }
+          median3() { awk '{print $1}' "$1" | sort -n | head -2 | tail -1; }
+          {
+            echo "## x86 ($USE_AVX) perf A/B (port vs control)"
+            echo ""
+            echo "| rep | port (s) | control (s) |"
+            echo "| --- | --------:| -----------:|"
+            for rep in $(seq 1 "$N_REPS"); do
+              p=$(extract_elapsed /tmp/ci-out/x86_port.rep${rep}.time)
+              c=$(extract_elapsed /tmp/ci-out/x86_control.rep${rep}.time)
+              echo "| $rep | $p | $c |"
+              echo "$p" >> /tmp/ci-out/x86_port.elapsed
+              echo "$c" >> /tmp/ci-out/x86_control.elapsed
+            done
+            pm=$(median3 /tmp/ci-out/x86_port.elapsed)
+            cm=$(median3 /tmp/ci-out/x86_control.elapsed)
+            echo ""
+            echo "median port: ${pm}s, median control: ${cm}s"
+            if [ -n "$pm" ] && [ -n "$cm" ] && [ "$pm" != "0" ]; then
+              speedup=$(awk -v p="$pm" -v c="$cm" 'BEGIN { printf "%.2f", c/p }')
+              pct=$(awk -v p="$pm" -v c="$cm" 'BEGIN { printf "%+.1f%%", 100*(c-p)/c }')
+              echo "speedup (control / port): ${speedup}x  (${pct})"
+            fi
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Sort + md5 x86 port SAM for identity check
+        run: |
+          samtools sort -@ "$(nproc)" -n /tmp/ci-out/x86_port.rep1.sam -o /tmp/ci-out/x86.sorted.bam
           samtools view /tmp/ci-out/x86.sorted.bam | md5sum | awk '{print $1}' > /tmp/ci-out/x86.sam.md5
-          echo "x86 reference (${USE_AVX}) SAM md5: $(cat /tmp/ci-out/x86.sam.md5)" >> "$GITHUB_STEP_SUMMARY"
+          echo "x86 port ($USE_AVX) SAM md5: $(cat /tmp/ci-out/x86.sam.md5)" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -298,7 +351,7 @@ jobs:
           name: x86-outputs
           path: |
             /tmp/ci-out/x86.sam.md5
-            /tmp/ci-out/x86.sam
+            /tmp/ci-out/x86_port.rep1.sam
 
   sam-identity:
     name: cross-arch SAM identity
