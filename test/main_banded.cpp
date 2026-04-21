@@ -157,8 +157,13 @@ int loadPairs(SeqPair *seqPairArray, uint8_t *seqBufRef, uint8_t* seqBufQer)
 			seq2[l] -= 48;
 
 		// sp.idr = sp.idq = 0;
-		sp.seqid = sp.regid = sp.score = sp.tle = sp.gtle = sp.qle = -1;
+		sp.seqid = sp.score = sp.tle = sp.gtle = sp.qle = -1;
 		sp.gscore = sp.max_off = -1;
+		// Initialize regid to the original pair index. BandedPairWiseSW
+		// doesn't use regid for write-back today, but kswv-style kernels
+		// (src/kswv.cpp) do, so this keeps the fixture safe if this test
+		// is ever retargeted to those kernels.
+		sp.regid = numPairs;
 		
         seqPairArray[numPairs] = sp;
         numPairs++;
@@ -257,6 +262,14 @@ int main(int argc, char *argv[])
 		// printf("Executing scalar code...\n");
 		bsw->scalarBandedSWAWrapper(seqPairArray, seqBufRef, seqBufQer, numPairs, 1, w);
 #endif
+		/* Emit per-pair SW output fields to fksw.txt for regression diffing.
+		   Fields match SeqPair in src/bandedSWA.h. Line-per-pair so the file
+		   is deterministic and diffable. */
+		for (int32_t i = 0; i < numPairs; i++) {
+			SeqPair *p = &seqPairArray[i];
+			fprintf(fksw, "%d\t%d\t%d\t%d\t%d\t%d\n",
+					p->score, p->tle, p->gtle, p->qle, p->gscore, p->max_off);
+		}
 		totalTicks += __rdtsc() - startTick;
 		
 		uint64_t tim = _rdtsc();
@@ -319,5 +332,5 @@ int main(int argc, char *argv[])
 	
 	fclose(pairFile);
 	fclose(fksw);
-	return 1;
+	return 0;
 }

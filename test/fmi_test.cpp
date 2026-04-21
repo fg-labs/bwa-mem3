@@ -248,7 +248,9 @@ int main(int argc, char **argv) {
     }
     printf("totalSmems = %ld\n", totalSmem);
 
-    #ifdef PRINT_OUTPUT
+    /* SMEM output is emitted by default so this binary is diff-able for
+       regression testing. The enclosing `#ifdef PRINT_OUTPUT` guard has
+       been removed. */
     int32_t prevRid = -1;
     for(batch_id = 0; batch_id < num_batches; batch_id++)
     {
@@ -280,7 +282,6 @@ int main(int argc, char **argv) {
             printf("\n");
         }
     }
-#endif
     _mm_free(query_cum_len_ar);
     free(enc_qdb);
     for(int tid = 0; tid < numthreads; tid++)

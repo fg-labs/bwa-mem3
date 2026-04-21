@@ -58,6 +58,11 @@ To build a stock `bwa-mem2` without mimalloc, pass `USE_MIMALLOC=0`:
 make -j USE_MIMALLOC=0
 ```
 
+`USE_MIMALLOC=1` is the supported and recommended default on all platforms.
+`USE_MIMALLOC=0` is provided for users who need to opt out (e.g. allocator
+conflicts with a profiler or sanitizer); it is CI-gated on Linux x86 only
+— other-platform `=0` builds are best-effort.
+
 To confirm mimalloc is active, run `bwa-mem2 version` — a line like
 `mimalloc 3.3.0` is printed when the allocator is linked in. To print
 mimalloc's own heap statistics on exit, set `MIMALLOC_SHOW_STATS=1`.
