@@ -1061,6 +1061,527 @@ int kswv::kswv_neon_16(int16_t seq1SoA[],
     return 1;
 }
 
+#elif __AVX2__
+/* AVX2 kswv kernel — 256-bit vectors, 32 u8 lanes per batch.
+ *
+ * Direct port of the corrected NEON kernel (kswv_neon_u8 above) with all
+ * four bug fixes pre-applied (te split, freeze mask, per-lane score2
+ * exclusion, minsc filter in score2 scan).
+ *
+ * Intrinsic translation notes:
+ *   - No unsigned 8-bit compare in AVX2 → sign-flip trick:
+ *       cmpgt_u8(a, b) = cmpgt_i8(a ^ 0x80, b ^ 0x80)
+ *   - No 8-bit shift → isolate high bit via sign compare against zero.
+ *   - 16-byte lookup table → broadcast to 256 bits then shuffle
+ *     (shuffle_epi8 is 128-bit-lane; broadcast makes both lanes
+ *     identical so any 0..15 index lands on the correct byte).
+ *   - te uses SIMD_WIDTH8=32 lanes worth of int16 → two __m256i
+ *     (te_vec_lo = pairs 0..15, te_vec_hi = pairs 16..31).
+ */
+
+#include <immintrin.h>
+
+static inline __m256i avx2_cmpgt_u8(__m256i a, __m256i b)
+{
+    const __m256i sign = _mm256_set1_epi8((char)0x80);
+    return _mm256_cmpgt_epi8(_mm256_xor_si256(a, sign),
+                             _mm256_xor_si256(b, sign));
+}
+
+static inline __m256i avx2_cmpge_u8(__m256i a, __m256i b)
+{
+    /* a >= b  <=>  b <= a  <=>  max(a,b) == a */
+    return _mm256_cmpeq_epi8(_mm256_max_epu8(a, b), a);
+}
+
+/* NEON-style select: pick src where mask byte is 0xFF, else dst.
+ * _mm256_blendv_epi8(dst, src, mask) uses the SIGN bit of each mask
+ * byte: 0xFF (sign=1) picks src, 0x00 picks dst. Matches NEON's
+ * vbslq_u8(mask, src, dst). */
+static inline __m256i avx2_blendv_u8(__m256i mask, __m256i src, __m256i dst)
+{
+    return _mm256_blendv_epi8(dst, src, mask);
+}
+
+/* Widen the low/high 128 bits of a u8x32 into u16x16, zero-extended. */
+static inline __m256i avx2_widen_u8_lo(__m256i v)
+{
+    return _mm256_cvtepu8_epi16(_mm256_extracti128_si256(v, 0));
+}
+static inline __m256i avx2_widen_u8_hi(__m256i v)
+{
+    return _mm256_cvtepu8_epi16(_mm256_extracti128_si256(v, 1));
+}
+
+/* Signed 16-bit compares are provided directly by AVX2 (_mm256_cmpgt_epi16,
+ * _mm256_cmpeq_epi16). No cmplt / cmpge; synthesize. */
+static inline __m256i avx2_cmplt_s16(__m256i a, __m256i b)
+{
+    return _mm256_cmpgt_epi16(b, a);
+}
+static inline __m256i avx2_cmpgt_s16(__m256i a, __m256i b)
+{
+    return _mm256_cmpgt_epi16(a, b);
+}
+
+int kswv::kswv256_u8(uint8_t seq1SoA[],
+                     uint8_t seq2SoA[],
+                     int16_t nrow,
+                     int16_t ncol,
+                     SeqPair *p,
+                     kswr_t *aln,
+                     int po_ind,
+                     uint16_t tid,
+                     int32_t numPairs,
+                     int phase)
+{
+    uint8_t minsc[SIMD_WIDTH8] __attribute__((aligned(64))) = {0};
+    uint8_t endsc[SIMD_WIDTH8] __attribute__((aligned(64))) = {0};
+
+    const __m256i zero_vec = _mm256_setzero_si256();
+    const __m256i one_vec  = _mm256_set1_epi8(1);
+
+    /* Score lookup table (16 bytes). Indexed by (s1 ^ s2). */
+    int8_t temp[SIMD_WIDTH8] __attribute__((aligned(64))) = {0};
+
+    uint8_t shift;
+    shift = min_(this->w_match, (int8_t)this->w_mismatch);
+    shift = min_((int8_t)shift, this->w_ambig);
+    shift = 256 - (uint8_t)shift;
+
+    temp[0] = this->w_match;
+    temp[1] = temp[2] = temp[3] = this->w_mismatch;
+    temp[4] = temp[5] = temp[6] = temp[7] = this->w_ambig;
+    temp[8] = temp[9] = temp[10] = temp[11] = this->w_ambig;
+    temp[12] = this->w_ambig;
+    for (int i = 0; i < 16; i++) temp[i] += shift;
+
+    /* Broadcast 16-byte table across both 128-bit lanes of a 256-bit
+     * vector so _mm256_shuffle_epi8 (128-bit-lane) still hits the right
+     * entry for any 0..15 index. */
+    __m128i permSft_128 = _mm_loadu_si128((const __m128i*)temp);
+    __m256i permSft     = _mm256_broadcastsi128_si256(permSft_128);
+    __m256i sft_vec     = _mm256_set1_epi8((char)shift);
+
+    uint32_t minsc_msk_a = 0, endsc_msk_a = 0;
+    for (int i = 0; i < SIMD_WIDTH8; i++) {
+        int xtra = p[i].h0;
+        int val  = (xtra & KSW_XSUBO) ? (xtra & 0xffff) : 0x10000;
+        if (val <= 255) { minsc[i] = (uint8_t)val; minsc_msk_a |= (1u << i); }
+        val = (xtra & KSW_XSTOP) ? (xtra & 0xffff) : 0x10000;
+        if (val <= 255) { endsc[i] = (uint8_t)val; endsc_msk_a |= (1u << i); }
+    }
+
+    const __m256i minsc_vec  = _mm256_loadu_si256((const __m256i*)minsc);
+    const __m256i endsc_vec  = _mm256_loadu_si256((const __m256i*)endsc);
+    const __m256i e_del_vec  = _mm256_set1_epi8((char)this->e_del);
+    const __m256i oe_del_vec = _mm256_set1_epi8((char)(this->o_del + this->e_del));
+    const __m256i e_ins_vec  = _mm256_set1_epi8((char)this->e_ins);
+    const __m256i oe_ins_vec = _mm256_set1_epi8((char)(this->o_ins + this->e_ins));
+    const __m256i five_vec   = _mm256_set1_epi8((char)DUMMY5);
+    const __m256i cmax_vec   = _mm256_set1_epi8((char)255);
+
+    __m256i gmax_vec   = zero_vec;
+    /* Fix 1: split te into two int16 vectors covering 32 pairs. */
+    __m256i te_vec_lo  = _mm256_set1_epi16(-1);  /* pairs 0..15 */
+    __m256i te_vec_hi  = _mm256_set1_epi16(-1);  /* pairs 16..31 */
+    /* Fix 2: per-lane freeze once pair hits KSW_XSTOP. */
+    __m256i frozen_vec = zero_vec;
+
+    /* Fix 2 helper: only freeze lanes that actually set an endsc target.
+     * endsc_vec defaults to 0 for lanes without a target (compares
+     * trivially true with vcgeq_u8) — has_endsc_vec masks that out. */
+    uint8_t _has_endsc_bytes[SIMD_WIDTH8];
+    for (int i = 0; i < SIMD_WIDTH8; i++)
+        _has_endsc_bytes[i] = (endsc_msk_a & (1u << i)) ? 0xFF : 0x00;
+    __m256i has_endsc_vec = _mm256_loadu_si256((const __m256i*)_has_endsc_bytes);
+
+    uint32_t exit0 = 0xFFFFFFFFu;
+
+    tid = 0;
+    uint8_t *H0     = H8_0    + tid * SIMD_WIDTH8 * this->maxQerLen;
+    uint8_t *H1     = H8_1    + tid * SIMD_WIDTH8 * this->maxQerLen;
+    uint8_t *Hmax   = H8_max  + tid * SIMD_WIDTH8 * this->maxQerLen;
+    uint8_t *F      = F8      + tid * SIMD_WIDTH8 * this->maxQerLen;
+    uint8_t *rowMax = rowMax8 + tid * SIMD_WIDTH8 * this->maxRefLen;
+
+    for (int i = 0; i <= ncol; i++) {
+        _mm256_storeu_si256((__m256i*)(H0   + i * SIMD_WIDTH8), zero_vec);
+        _mm256_storeu_si256((__m256i*)(Hmax + i * SIMD_WIDTH8), zero_vec);
+        _mm256_storeu_si256((__m256i*)(F    + i * SIMD_WIDTH8), zero_vec);
+    }
+    _mm256_storeu_si256((__m256i*)H0, zero_vec);
+    _mm256_storeu_si256((__m256i*)H1, zero_vec);
+
+    __m256i pimax_vec = zero_vec;
+    uint32_t mask32   = 0;
+
+    __m256i imax_vec;
+    __m256i qe_vec = zero_vec;
+
+    int i, limit = nrow;
+    for (i = 0; i < nrow; i++) {
+        __m256i e11 = zero_vec;
+        __m256i s1  = _mm256_loadu_si256((const __m256i*)(seq1SoA + i * SIMD_WIDTH8));
+        imax_vec    = zero_vec;
+        __m256i iqe_vec = _mm256_set1_epi8((char)0xFF);
+        __m256i l_vec = zero_vec;
+        __m256i i_vec_s16 = _mm256_set1_epi16((int16_t)i);
+
+        for (int j = 0; j < ncol; j++) {
+            __m256i h00 = _mm256_loadu_si256((const __m256i*)(H0 + j * SIMD_WIDTH8));
+            __m256i s2  = _mm256_loadu_si256((const __m256i*)(seq2SoA + j * SIMD_WIDTH8));
+            __m256i f11 = _mm256_loadu_si256((const __m256i*)(F + (j + 1) * SIMD_WIDTH8));
+
+            __m256i xor_val = _mm256_xor_si256(s1, s2);
+            __m256i sbt     = _mm256_shuffle_epi8(permSft, xor_val);
+
+            __m256i cmpq = _mm256_cmpeq_epi8(s2, five_vec);
+            sbt = avx2_blendv_u8(cmpq, sft_vec, sbt);
+
+            /* High bit of (s1 | s2) indicates boundary (padding 0xFF).
+             * Sign compare against zero gives 0xFF wherever high bit is
+             * set in the u8 byte. */
+            __m256i or_val      = _mm256_or_si256(s1, s2);
+            __m256i is_boundary = _mm256_cmpgt_epi8(zero_vec, or_val);
+
+            __m256i m11 = _mm256_adds_epu8(h00, sbt);
+            m11 = avx2_blendv_u8(is_boundary, zero_vec, m11);
+            m11 = _mm256_subs_epu8(m11, sft_vec);
+
+            __m256i h11 = _mm256_max_epu8(m11, e11);
+            h11 = _mm256_max_epu8(h11, f11);
+
+            __m256i cmp0 = avx2_cmpgt_u8(h11, imax_vec);
+            imax_vec = _mm256_max_epu8(imax_vec, h11);
+            iqe_vec  = avx2_blendv_u8(cmp0, l_vec, iqe_vec);
+
+            __m256i gapE = _mm256_subs_epu8(h11, oe_ins_vec);
+            e11 = _mm256_subs_epu8(e11, e_ins_vec);
+            e11 = _mm256_max_epu8(gapE, e11);
+
+            __m256i gapD = _mm256_subs_epu8(h11, oe_del_vec);
+            __m256i f21  = _mm256_subs_epu8(f11, e_del_vec);
+            f21 = _mm256_max_epu8(gapD, f21);
+
+            _mm256_storeu_si256((__m256i*)(H1 + (j + 1) * SIMD_WIDTH8), h11);
+            _mm256_storeu_si256((__m256i*)(F  + (j + 1) * SIMD_WIDTH8), f21);
+            l_vec = _mm256_add_epi8(l_vec, one_vec);
+        }
+
+        /* Block I - rowMax tracking. Same shape as NEON. */
+        if (i > 0) {
+            __m256i cmp_gt = avx2_cmpgt_u8(imax_vec, pimax_vec);
+            uint32_t msk32 = (uint32_t)_mm256_movemask_epi8(cmp_gt);
+            msk32 |= mask32;
+            pimax_vec = avx2_blendv_u8(cmp_gt, zero_vec, pimax_vec);
+            _mm256_storeu_si256((__m256i*)(rowMax + (i - 1) * SIMD_WIDTH8), pimax_vec);
+            mask32 = ~msk32;
+        }
+        pimax_vec = imax_vec;
+
+        /* Block II: gmax, te with freeze mask (fix 2) */
+        __m256i cmp0 = avx2_cmpgt_u8(imax_vec, gmax_vec);
+        uint32_t cmp0_msk = (uint32_t)_mm256_movemask_epi8(cmp0);
+        cmp0_msk &= exit0;
+
+        /* 16-bit mirrors of cmp0 for te update (fix 1 split) */
+        __m256i cmp_lo_16 = avx2_cmpgt_s16(
+            avx2_widen_u8_lo(imax_vec), avx2_widen_u8_lo(gmax_vec));
+        __m256i cmp_hi_16 = avx2_cmpgt_s16(
+            avx2_widen_u8_hi(imax_vec), avx2_widen_u8_hi(gmax_vec));
+
+        /* 16-bit mirrors of frozen_vec to mask te updates. */
+        __m256i frozen_lo_16 = avx2_cmpgt_s16(
+            avx2_widen_u8_lo(frozen_vec), _mm256_setzero_si256());
+        __m256i frozen_hi_16 = avx2_cmpgt_s16(
+            avx2_widen_u8_hi(frozen_vec), _mm256_setzero_si256());
+
+        cmp_lo_16 = _mm256_andnot_si256(frozen_lo_16, cmp_lo_16);
+        cmp_hi_16 = _mm256_andnot_si256(frozen_hi_16, cmp_hi_16);
+        __m256i cmp0_active = _mm256_andnot_si256(frozen_vec, cmp0);
+
+        __m256i new_gmax = _mm256_max_epu8(gmax_vec, imax_vec);
+        gmax_vec = avx2_blendv_u8(frozen_vec, gmax_vec, new_gmax);
+
+        te_vec_lo = avx2_blendv_u8(cmp_lo_16, i_vec_s16, te_vec_lo);
+        te_vec_hi = avx2_blendv_u8(cmp_hi_16, i_vec_s16, te_vec_hi);
+        qe_vec    = avx2_blendv_u8(cmp0_active, iqe_vec, qe_vec);
+
+        /* End-score check + freeze update. */
+        __m256i cmp_end = avx2_cmpge_u8(gmax_vec, endsc_vec);
+        uint32_t cmp_end_msk = (uint32_t)_mm256_movemask_epi8(cmp_end);
+        cmp_end_msk &= endsc_msk_a;
+
+        __m256i just_hit = _mm256_and_si256(cmp_end, has_endsc_vec);
+        frozen_vec = _mm256_or_si256(frozen_vec, just_hit);
+
+        /* Overflow check. */
+        __m256i left_vec = _mm256_adds_epu8(gmax_vec, sft_vec);
+        __m256i cmp2     = avx2_cmpge_u8(left_vec, cmax_vec);
+        uint32_t cmp2_msk = (uint32_t)_mm256_movemask_epi8(cmp2);
+
+        exit0 = (~(cmp_end_msk | cmp2_msk)) & exit0;
+        if (exit0 == 0) { limit = i++; break; }
+
+        uint8_t *S = H1; H1 = H0; H0 = S;
+    }
+
+    _mm256_storeu_si256((__m256i*)(rowMax + (i - 1) * SIMD_WIDTH8), pimax_vec);
+
+    /* Extract results. */
+    uint8_t score[SIMD_WIDTH8] __attribute__((aligned(64)));
+    int16_t te1[SIMD_WIDTH8]    __attribute__((aligned(64)));
+    uint8_t qe[SIMD_WIDTH8]     __attribute__((aligned(64)));
+
+    _mm256_storeu_si256((__m256i*)score, gmax_vec);
+    _mm256_storeu_si256((__m256i*)te1, te_vec_lo);        /* pairs 0..15 */
+    _mm256_storeu_si256((__m256i*)(te1 + 16), te_vec_hi); /* pairs 16..31 */
+    _mm256_storeu_si256((__m256i*)qe, qe_vec);
+
+    int live = 0;
+    for (int l = 0; l < SIMD_WIDTH8 && (po_ind + l) < numPairs; l++) {
+        int ind = p[l].regid;
+        int16_t *te = te1;
+        if (phase) {
+            if (aln[ind].score == score[l]) {
+                aln[ind].tb = aln[ind].te - te[l];
+                aln[ind].qb = aln[ind].qe - qe[l];
+            }
+        } else {
+            aln[ind].score = score[l] + shift < 255 ? score[l] : 255;
+            aln[ind].te = te[l];
+            aln[ind].qe = qe[l];
+            if (aln[ind].score != 255) { qe[l] = 1; live++; }
+            else qe[l] = 0;
+        }
+    }
+
+    if (phase) return 1;
+    if (live == 0) return 1;
+
+    /* Score2 and te2 computation, with per-lane score2 scan (fix 3) and
+     * minsc filter (fix 4). */
+    int qmax = this->g_qmax;
+    int16_t low[SIMD_WIDTH8]  __attribute__((aligned(64)));
+    int16_t high[SIMD_WIDTH8] __attribute__((aligned(64)));
+    int maxl = 0, minh = nrow;
+    for (int j = 0; j < SIMD_WIDTH8; j++) {
+        int val = (score[j] + qmax - 1) / qmax;
+        low[j]  = te1[j] - val;
+        high[j] = te1[j] + val;
+        if (qe[j]) {
+            if (maxl < low[j])  maxl = low[j];
+            if (minh > high[j]) minh = high[j];
+        }
+    }
+
+    /* Load per-lane len1/low/high/qe as 16-bit vectors (split into _lo and
+     * _hi halves, since SIMD_WIDTH8 = 32 lanes but each __m256i int16 = 16). */
+    int16_t _len1_arr[SIMD_WIDTH8] __attribute__((aligned(64))) = {0};
+    for (int j = 0; j < SIMD_WIDTH8; j++) _len1_arr[j] = (int16_t)p[j].len1;
+    __m256i len1_lo = _mm256_loadu_si256((const __m256i*)_len1_arr);
+    __m256i len1_hi = _mm256_loadu_si256((const __m256i*)(_len1_arr + 16));
+    __m256i low_lo  = _mm256_loadu_si256((const __m256i*)low);
+    __m256i low_hi  = _mm256_loadu_si256((const __m256i*)(low + 16));
+    __m256i high_lo = _mm256_loadu_si256((const __m256i*)high);
+    __m256i high_hi = _mm256_loadu_si256((const __m256i*)(high + 16));
+
+    uint8_t _qe_mask_arr[SIMD_WIDTH8] __attribute__((aligned(64)));
+    for (int j = 0; j < SIMD_WIDTH8; j++) _qe_mask_arr[j] = qe[j] ? 0xFF : 0x00;
+    __m256i qe_mask_vec = _mm256_loadu_si256((const __m256i*)_qe_mask_arr);
+
+    __m256i max2_vec = zero_vec;
+
+    for (int i2 = 0; i2 < limit; i2++) {
+        __m256i rmax_vec = _mm256_loadu_si256((const __m256i*)(rowMax + i2 * SIMD_WIDTH8));
+        __m256i iv = _mm256_set1_epi16((int16_t)i2);
+
+        /* (1) in_bounds: len1 > i2 (s16 unsigned-safe; len1 is small positive) */
+        __m256i ib_lo = avx2_cmpgt_s16(len1_lo, iv);
+        __m256i ib_hi = avx2_cmpgt_s16(len1_hi, iv);
+
+        /* (2) outside primary region: i2 < low OR i2 > high */
+        __m256i below_lo   = avx2_cmplt_s16(iv, low_lo);
+        __m256i below_hi   = avx2_cmplt_s16(iv, low_hi);
+        __m256i above_lo   = avx2_cmpgt_s16(iv, high_lo);
+        __m256i above_hi   = avx2_cmpgt_s16(iv, high_hi);
+        __m256i outside_lo = _mm256_or_si256(below_lo, above_lo);
+        __m256i outside_hi = _mm256_or_si256(below_hi, above_hi);
+
+        __m256i ok_lo = _mm256_and_si256(ib_lo, outside_lo);
+        __m256i ok_hi = _mm256_and_si256(ib_hi, outside_hi);
+
+        /* Narrow 16-bit mask (0xFFFF/0x0000) back to 8-bit bytes (0xFF/0x00).
+         * packs_epi16 saturates: 0xFFFF -> 0xFF, 0x0000 -> 0x00 (treating
+         * inputs as signed int16 here they are -1 / 0). Using packs with
+         * two already-32-lane inputs yields 64-byte packed — but each
+         * __m256i holds 16 int16, packs yields 32 int8 per input pair.
+         * Two inputs => one output of 64 bytes → doesn't fit. Simpler:
+         * collapse each 16-bit lane to an 8-bit 0xFF/0x00 via packs then
+         * permute so the two halves interleave correctly. */
+        /* Actually: _mm256_packs_epi16 interleaves the two halves of its
+         * two 256-bit inputs at 128-bit lane granularity, which gives us
+         * exactly the layout [in0_lane0, in1_lane0, in0_lane1, in1_lane1].
+         * We need [ok_lo_full, ok_hi_full] i.e. lanes 0..31. Use permute4x64
+         * to reorder. */
+        __m256i ok_packed = _mm256_packs_epi16(ok_lo, ok_hi);
+        ok_packed = _mm256_permute4x64_epi64(ok_packed, 0xD8);  /* 11 01 10 00 */
+        __m256i ok = _mm256_and_si256(ok_packed, qe_mask_vec);
+
+        rmax_vec = _mm256_and_si256(rmax_vec, ok);
+
+        /* (4) minsc filter: scalar ksw_u8 only records pairs where gmax
+         * >= minsc. Without this, sub-minsc plateau scores leak in. */
+        __m256i ge_minsc = avx2_cmpge_u8(rmax_vec, minsc_vec);
+        rmax_vec = _mm256_and_si256(rmax_vec, ge_minsc);
+
+        max2_vec = _mm256_max_epu8(max2_vec, rmax_vec);
+    }
+
+    uint8_t temp2[SIMD_WIDTH8] __attribute__((aligned(64)));
+    _mm256_storeu_si256((__m256i*)temp2, max2_vec);
+
+    for (int l = 0; l < SIMD_WIDTH8 && (po_ind + l) < numPairs; l++) {
+        int ind = p[l].regid;
+        if (qe[l]) {
+            aln[ind].score2 = (temp2[l] == 0) ? (int)-1 : (int)(uint8_t)temp2[l];
+            aln[ind].te2    = -1;  /* te2 tracking deferred; scalar reports -1
+                                    * when unknown and downstream MAPQ only
+                                    * reads score2. */
+        } else {
+            aln[ind].score2 = -1;
+            aln[ind].te2    = -1;
+        }
+    }
+
+    return 1;
+}
+
+void kswv::kswvBatchWrapper8_avx2(SeqPair *pairArray,
+                                  uint8_t *seqBufRef,
+                                  uint8_t *seqBufQer,
+                                  kswr_t* aln,
+                                  int32_t numPairs,
+                                  uint16_t numThreads,
+                                  int phase)
+{
+    uint8_t *seq1SoA = (uint8_t*)_mm_malloc(
+        (size_t)this->maxRefLen * SIMD_WIDTH8 * numThreads * sizeof(uint8_t), 128);
+    uint8_t *seq2SoA = (uint8_t*)_mm_malloc(
+        (size_t)this->maxQerLen * SIMD_WIDTH8 * numThreads * sizeof(uint8_t), 128);
+    assert(seq1SoA && seq2SoA);
+
+    int32_t roundNumPairs = ((numPairs + SIMD_WIDTH8 - 1) / SIMD_WIDTH8) * SIMD_WIDTH8;
+    for (int32_t ii = numPairs; ii < roundNumPairs; ii++) {
+        pairArray[ii].regid = ii;
+        pairArray[ii].id    = ii;
+        pairArray[ii].len1  = 0;
+        pairArray[ii].len2  = 0;
+    }
+
+    uint16_t tid = 0;
+    uint8_t *mySeq1SoA = seq1SoA + tid * this->maxRefLen * SIMD_WIDTH8;
+    uint8_t *mySeq2SoA = seq2SoA + tid * this->maxQerLen * SIMD_WIDTH8;
+
+    for (int32_t i = 0; i < numPairs; i += SIMD_WIDTH8) {
+        int maxLen1 = 0, maxLen2 = 0;
+
+        for (int j = 0; j < SIMD_WIDTH8; j++) {
+            SeqPair sp = pairArray[i + j];
+            uint8_t *seq1 = seqBufRef + sp.idr;
+            for (int k = 0; k < sp.len1; k++)
+                mySeq1SoA[k * SIMD_WIDTH8 + j] = (seq1[k] == AMBIG_ ? AMBR : seq1[k]);
+            if (maxLen1 < sp.len1) maxLen1 = sp.len1;
+        }
+        for (int j = 0; j < SIMD_WIDTH8; j++) {
+            SeqPair sp = pairArray[i + j];
+            for (int k = sp.len1; k <= maxLen1; k++)
+                mySeq1SoA[k * SIMD_WIDTH8 + j] = 0xFF;
+        }
+
+        for (int j = 0; j < SIMD_WIDTH8; j++) {
+            SeqPair sp = pairArray[i + j];
+            uint8_t *seq2 = seqBufQer + sp.idq;
+            int quanta = ((sp.len2 + 16 - 1) / 16) * 16;
+            for (int k = 0; k < sp.len2; k++)
+                mySeq2SoA[k * SIMD_WIDTH8 + j] = (seq2[k] == AMBIG_ ? AMBQ : seq2[k]);
+            for (int k = sp.len2; k < quanta; k++)
+                mySeq2SoA[k * SIMD_WIDTH8 + j] = DUMMY5;
+            if (maxLen2 < quanta) maxLen2 = quanta;
+        }
+        for (int j = 0; j < SIMD_WIDTH8; j++) {
+            SeqPair sp = pairArray[i + j];
+            int quanta = ((sp.len2 + 16 - 1) / 16) * 16;
+            for (int k = quanta; k <= maxLen2; k++)
+                mySeq2SoA[k * SIMD_WIDTH8 + j] = 0xFF;
+        }
+
+        kswv256_u8(mySeq1SoA, mySeq2SoA,
+                   (int16_t)maxLen1, (int16_t)maxLen2,
+                   pairArray + i, aln, i, tid,
+                   numPairs, phase);
+    }
+
+    _mm_free(seq1SoA);
+    _mm_free(seq2SoA);
+}
+
+void kswv::getScores8(SeqPair *pairArray,
+                      uint8_t *seqBufRef,
+                      uint8_t *seqBufQer,
+                      kswr_t *aln,
+                      int32_t numPairs,
+                      uint16_t numThreads,
+                      int phase)
+{
+    kswvBatchWrapper8_avx2(pairArray, seqBufRef, seqBufQer, aln,
+                           numPairs, numThreads, phase);
+}
+
+/* getScores16 remains a scalar fallback for now. The 16-bit NEON kernel
+ * also has a full SIMD port — a parallel AVX2 port is a mechanical
+ * follow-up after 8-bit lands. Most production mate-rescue traffic takes
+ * the 8-bit path (KSW_XBYTE set when l_ms * w_match < 250). */
+void kswv::getScores16(SeqPair *pairArray,
+                       uint8_t *seqBufRef,
+                       uint8_t *seqBufQer,
+                       kswr_t *aln,
+                       int32_t numPairs,
+                       uint16_t /*numThreads*/,
+                       int phase)
+{
+    if (phase != 0) return;
+
+    int8_t mat[25];
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 4; j++) {
+            mat[i*5 + j] = (i == j) ? this->w_match : this->w_mismatch;
+        }
+        mat[i*5 + 4] = this->w_ambig;
+        mat[4*5 + i] = this->w_ambig;
+    }
+    mat[24] = this->w_ambig;
+
+    for (int i = 0; i < numPairs; i++) {
+        SeqPair *p = pairArray + i;
+        kswr_t  *myaln = aln + p->regid;
+        uint8_t *target = seqBufRef + p->idr;
+        uint8_t *query  = seqBufQer + p->idq;
+        kswr_t ks = ksw_align2(p->len2, query, p->len1, target, 5, mat,
+                               this->o_del, this->e_del,
+                               this->o_ins, this->e_ins,
+                               p->h0, nullptr);
+        myaln->score  = ks.score;
+        myaln->qe     = ks.qe;
+        myaln->te     = ks.te;
+        myaln->qb     = ks.qb;
+        myaln->tb     = ks.tb;
+        myaln->score2 = ks.score2;
+        myaln->te2    = ks.te2;
+    }
+}
+
 #elif __AVX512BW__
 /* AVX-512 Implementation for x86 */
 void kswv::getScores8(SeqPair *pairArray,

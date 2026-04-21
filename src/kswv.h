@@ -83,6 +83,11 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #elif __AVX512BW__
     #define SIMD_WIDTH8 64
     #define SIMD_WIDTH16 32
+#elif __AVX2__
+    /* AVX2 - 256-bit vectors. Stub kernel for now (phase 1); the real
+     * vector kernel lands on the c6i iteration in phase 2. */
+    #define SIMD_WIDTH8 32
+    #define SIMD_WIDTH16 16
 #endif
 
 #define max(x, y) ((x)>(y)?(x):(y))
@@ -211,6 +216,35 @@ private:
                      uint16_t tid,
                      int32_t numPairs,
                      int phase);
+
+#elif __AVX2__
+	/* AVX2 (256-bit, 32-lane u8) batched mate-rescue SW kernel.
+	 * Modeled on the corrected NEON kernel (not AVX-512, which has a
+	 * pre-existing coord/score2 bug class that the NEON port uncovered
+	 * and fixed; see PR 18). All four NEON bug fixes are pre-applied:
+	 *  (1) te tracked in two half-width int16 vectors (_lo/_hi), since
+	 *      32 u8 lanes need 32 int16 slots but a __m256i int16 holds 16.
+	 *  (2) per-lane freeze mask once a pair hits KSW_XSTOP.
+	 *  (3) score2 scan with per-lane len1/low/high/qe exclusion.
+	 *  (4) minsc filter on rowMax in the score2 scan. */
+	void kswvBatchWrapper8_avx2(SeqPair *pairArray,
+								uint8_t *seqBufRef,
+								uint8_t *seqBufQer,
+								kswr_t* aln,
+								int32_t numPairs,
+								uint16_t numThreads,
+								int phase);
+
+	int kswv256_u8(uint8_t seq1SoA[],
+				   uint8_t seq2SoA[],
+				   int16_t nrow,
+				   int16_t ncol,
+				   SeqPair *p,
+				   kswr_t *aln,
+				   int po_ind,
+				   uint16_t tid,
+				   int32_t numPairs,
+				   int phase);
 
 #elif __AVX512BW__
 	void kswvBatchWrapper8(SeqPair *pairArray,
