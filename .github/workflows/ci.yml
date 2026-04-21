@@ -18,6 +18,7 @@ jobs:
           - os: ubuntu-latest
             arch_flag: "avx2"
             use_mimalloc: "1"
+            canonical: true
             name: "Linux x86_64 AVX2 (mimalloc)"
           - os: ubuntu-latest
             arch_flag: "avx2"
@@ -31,6 +32,15 @@ jobs:
             arch_flag: ""
             use_mimalloc: "1"
             name: "macOS ARM64 (mimalloc)"
+          - os: ubuntu-latest
+            arch_flag: "multi"
+            use_mimalloc: "1"
+            name: "Linux x86_64 multi (mimalloc)"
+          - os: ubuntu-latest
+            arch_flag: "avx2"
+            use_mimalloc: "1"
+            cxx: "clang++"
+            name: "Linux x86_64 AVX2 clang (mimalloc)"
 
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
@@ -43,7 +53,7 @@ jobs:
 
       - name: Install dependencies (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev bwa autoconf automake
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev bwa autoconf automake samtools
 
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
@@ -56,11 +66,14 @@ jobs:
         run: |
           if [ "${{ matrix.arch_flag }}" = "" ]; then
             make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)" \
-              CXX=g++ USE_MIMALLOC=${{ matrix.use_mimalloc }}
+              CXX=${{ matrix.cxx || 'g++' }} USE_MIMALLOC=${{ matrix.use_mimalloc }}
+          elif [ "${{ matrix.arch_flag }}" = "multi" ]; then
+            make -j"$(nproc)" multi \
+              CXX=${{ matrix.cxx || 'g++' }} USE_MIMALLOC=${{ matrix.use_mimalloc }}
           else
             make -j"$(nproc)" \
               arch=${{ matrix.arch_flag }} \
-              CXX=g++ USE_MIMALLOC=${{ matrix.use_mimalloc }}
+              CXX=${{ matrix.cxx || 'g++' }} USE_MIMALLOC=${{ matrix.use_mimalloc }}
           fi
 
       - name: Verify binary
@@ -142,3 +155,161 @@ jobs:
             diff bwa.normalized.sam bwamem2.normalized.sam | head -40
             exit 1
           fi
+
+      - name: Run unit-test harness
+        if: matrix.canonical == true || matrix.arch_flag == 'sse41'
+        run: |
+          bash test/run_unit_tests.sh
+
+      - name: --bam=6 roundtrip smoke (phiX)
+        if: matrix.canonical == true
+        run: |
+          cd /tmp/ci-test
+          $GITHUB_WORKSPACE/bwa-mem2 mem --bam=6 bwamem2_phix174.fa \
+            reads.bwa.read1.fastq.gz reads.bwa.read2.fastq.gz > bwamem2.bam 2>/dev/null
+          # BAM must decode cleanly and match record count of SAM path
+          samtools quickcheck bwamem2.bam
+          sam_records=$(grep -cv '^@' bwamem2.sam)
+          bam_records=$(samtools view -c bwamem2.bam)
+          if [ "$sam_records" != "$bam_records" ]; then
+            echo "FAIL: SAM ($sam_records) vs --bam=6 BAM ($bam_records) record count mismatch"
+            exit 1
+          fi
+          echo "PASS: --bam=6 roundtrip ($bam_records records)"
+
+      - name: Thread-determinism smoke (phiX, -t 1 vs -t 4)
+        if: matrix.canonical == true
+        run: |
+          cd /tmp/ci-test
+          $GITHUB_WORKSPACE/bwa-mem2 mem -t 1 bwamem2_phix174.fa \
+            reads.bwa.read1.fastq.gz reads.bwa.read2.fastq.gz 2>/dev/null \
+            | grep -v '^@PG' | sort > t1.sam
+          $GITHUB_WORKSPACE/bwa-mem2 mem -t 4 bwamem2_phix174.fa \
+            reads.bwa.read1.fastq.gz reads.bwa.read2.fastq.gz 2>/dev/null \
+            | grep -v '^@PG' | sort > t4.sam
+          if ! diff t1.sam t4.sam > /dev/null 2>&1; then
+            echo "FAIL: -t 1 and -t 4 outputs differ after sort"
+            diff t1.sam t4.sam | head -20
+            exit 1
+          fi
+          echo "PASS: thread-determinism ($(wc -l < t1.sam) records)"
+
+      - name: Cache chr22 reference
+        if: matrix.canonical == true
+        id: cache-chr22
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: /tmp/chr22
+          key: chr22-hg38-ucsc-v1
+
+      - name: Download chr22 reference (hg38)
+        if: matrix.canonical == true && steps.cache-chr22.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p /tmp/chr22
+          curl -sL "https://hgdownload.soe.ucsc.edu/goldenPath/hg38/chromosomes/chr22.fa.gz" \
+            | gunzip > /tmp/chr22/chr22.fa
+          test -s /tmp/chr22/chr22.fa
+          echo "chr22.fa bytes: $(wc -c < /tmp/chr22/chr22.fa)"
+
+      - name: Build chr22 FMI index
+        if: matrix.canonical == true
+        run: |
+          cd /tmp/chr22
+          $GITHUB_WORKSPACE/bwa-mem2 index chr22.fa
+          ls chr22.fa.*
+
+      - name: Simulate chr22 reads with dwgsim
+        if: matrix.canonical == true
+        run: |
+          mkdir -p /tmp/chr22-sim
+          /tmp/dwgsim-src/dwgsim \
+            -z 42 \
+            -N 50000 -1 150 -2 150 \
+            -r 0.001 -S 2 \
+            /tmp/chr22/chr22.fa /tmp/chr22-sim/reads
+
+      - name: Index chr22 with bwa and align
+        if: matrix.canonical == true
+        run: |
+          cp /tmp/chr22/chr22.fa /tmp/chr22-sim/bwa_chr22.fa
+          bwa index /tmp/chr22-sim/bwa_chr22.fa
+          bwa mem -t 4 /tmp/chr22-sim/bwa_chr22.fa \
+            /tmp/chr22-sim/reads.bwa.read1.fastq.gz /tmp/chr22-sim/reads.bwa.read2.fastq.gz \
+            > /tmp/chr22-sim/bwa.sam 2>/tmp/chr22-sim/bwa.log
+
+      - name: Align chr22 with bwa-mem2
+        if: matrix.canonical == true
+        run: |
+          $GITHUB_WORKSPACE/bwa-mem2 mem -t 4 /tmp/chr22/chr22.fa \
+            /tmp/chr22-sim/reads.bwa.read1.fastq.gz /tmp/chr22-sim/reads.bwa.read2.fastq.gz \
+            > /tmp/chr22-sim/bwamem2.sam 2>/tmp/chr22-sim/bwamem2.log
+
+      - name: Compare chr22 bwa vs bwa-mem2 (parity)
+        if: matrix.canonical == true
+        run: |
+          cd /tmp/chr22-sim
+          normalize() { grep -v '^@PG' "$1" | grep -v '^@HD' | sed 's/\tMQ:i:[0-9]*//'; }
+          normalize bwa.sam | sort > bwa.normalized.sam
+          normalize bwamem2.sam | sort > bwamem2.normalized.sam
+          echo "bwa records: $(grep -cv '^@' bwa.normalized.sam)"
+          echo "bwa-mem2 records: $(grep -cv '^@' bwamem2.normalized.sam)"
+          if diff bwa.normalized.sam bwamem2.normalized.sam > /dev/null 2>&1; then
+            echo "PASS: bwa == bwa-mem2 on chr22 (50k PE reads)"
+          else
+            echo "FAIL: chr22 parity diff; first 40 lines:"
+            diff bwa.normalized.sam bwamem2.normalized.sam | head -40
+            exit 1
+          fi
+
+      - name: SE alignment smoke (chr22)
+        if: matrix.canonical == true
+        run: |
+          $GITHUB_WORKSPACE/bwa-mem2 mem -t 4 /tmp/chr22/chr22.fa \
+            /tmp/chr22-sim/reads.bwa.read1.fastq.gz > /tmp/chr22-sim/se.sam 2>/dev/null
+          records=$(grep -cv '^@' /tmp/chr22-sim/se.sam)
+          [ "$records" -gt 0 ] || { echo "FAIL: SE alignment produced zero records"; exit 1; }
+          grep -q '^@PG.*bwa-mem2' /tmp/chr22-sim/se.sam || { echo "FAIL: SE missing @PG"; exit 1; }
+          echo "PASS: SE smoke ($records records)"
+
+      - name: Interleaved alignment smoke (chr22)
+        if: matrix.canonical == true
+        run: |
+          # Interleave R1 and R2 into a single FASTQ
+          paste <(zcat /tmp/chr22-sim/reads.bwa.read1.fastq.gz) \
+                <(zcat /tmp/chr22-sim/reads.bwa.read2.fastq.gz) \
+            | tr '\t' '\n' > /tmp/chr22-sim/interleaved.fq
+          $GITHUB_WORKSPACE/bwa-mem2 mem -p -t 4 /tmp/chr22/chr22.fa \
+            /tmp/chr22-sim/interleaved.fq > /tmp/chr22-sim/p.sam 2>/dev/null
+          records=$(grep -cv '^@' /tmp/chr22-sim/p.sam)
+          [ "$records" -gt 0 ] || { echo "FAIL: interleaved alignment produced zero records"; exit 1; }
+          echo "PASS: interleaved smoke ($records records)"
+
+      - name: Install pixi (for --meth oracle)
+        if: matrix.canonical == true
+        uses: prefix-dev/setup-pixi@1b2de7f3351f171c8b4dfeb558c639cb58ed4ec0 # v0.9.5
+        with:
+          pixi-version: v0.49.0
+          manifest-path: test/meth/pyproject.toml
+          cache: true
+
+      - name: Checkout bwa-meth oracle
+        if: matrix.canonical == true
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: brentp/bwa-meth
+          path: bwa-meth-oracle
+
+      - name: Copy bwa-meth fixtures into test/meth/
+        if: matrix.canonical == true
+        run: |
+          cp bwa-meth-oracle/example/ref.fa test/meth/
+          cp bwa-meth-oracle/example/t_R1.fastq.gz test/meth/
+          cp bwa-meth-oracle/example/t_R2.fastq.gz test/meth/
+          ls -la test/meth/
+
+      - name: Run --meth Layers 1-3
+        if: matrix.canonical == true
+        env:
+          BWAMETH_DIR: ${{ github.workspace }}/bwa-meth-oracle
+        run: |
+          bash test/meth/test.sh
