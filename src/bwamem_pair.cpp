@@ -595,20 +595,24 @@ int mem_sam_pe(const mem_opt_t *opt, const bntseq_t *bns,
     }
 
     // no_pairing
+    int which[2] = { -1, -1 };
     for (i = 0; i < 2; ++i) {
-        int which = -1;
         if (a[i].n) {
-            if (a[i].a[0].score >= opt->T) which = 0;
+            if (a[i].a[0].score >= opt->T) which[i] = 0;
             else if (n_pri[i] < a[i].n && a[i].a[n_pri[i]].score >= opt->T)
-                which = n_pri[i];
+                which[i] = n_pri[i];
         }
-        if (which >= 0) h[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, &a[i].a[which]);
+        if (which[i] >= 0) h[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, &a[i].a[which[i]]);
         else h[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, 0);
     }
-    if (!(opt->flag & MEM_F_NOPAIRING) && h[0].rid == h[1].rid && h[0].rid >= 0) { // if the top hits from the two ends constitute a proper pair, flag it.
+    // Proper-pair flag must be computed from the same alignments that were just
+    // emitted via mem_reg2aln — i.e. a[i].a[which[i]]. Using a[i].a[0] here is
+    // wrong when which[i] == n_pri[i] (below-T primary + above-T ALT case).
+    if (!(opt->flag & MEM_F_NOPAIRING) && which[0] >= 0 && which[1] >= 0 &&
+        h[0].rid == h[1].rid && h[0].rid >= 0) {
         int64_t dist;
         int d;
-        d = mem_infer_dir(bns->l_pac, a[0].a[0].rb, a[1].a[0].rb, &dist);
+        d = mem_infer_dir(bns->l_pac, a[0].a[which[0]].rb, a[1].a[which[1]].rb, &dist);
         if (!pes[d].failed && dist >= pes[d].low && dist <= pes[d].high) extra_flag |= 2;
     }
     mem_reg2sam(opt, bns, pac, &s[0], &a[0], 0x41|extra_flag, &h[1]);
@@ -983,20 +987,24 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
     return n;
 
 no_pairing:
+    int which[2] = { -1, -1 };
     for (i = 0; i < 2; ++i) {
-        int which = -1;
         if (a[i].n) {
-            if (a[i].a[0].score >= opt->T) which = 0;
+            if (a[i].a[0].score >= opt->T) which[i] = 0;
             else if (n_pri[i] < a[i].n && a[i].a[n_pri[i]].score >= opt->T)
-                which = n_pri[i];
+                which[i] = n_pri[i];
         }
-        if (which >= 0) h[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, &a[i].a[which]);
+        if (which[i] >= 0) h[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, &a[i].a[which[i]]);
         else h[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, 0);
     }
-    if (!(opt->flag & MEM_F_NOPAIRING) && h[0].rid == h[1].rid && h[0].rid >= 0) { // if the top hits from the two ends constitute a proper pair, flag it.
+    // Proper-pair flag must be computed from the same alignments that were just
+    // emitted via mem_reg2aln — i.e. a[i].a[which[i]]. Using a[i].a[0] here is
+    // wrong when which[i] == n_pri[i] (below-T primary + above-T ALT case).
+    if (!(opt->flag & MEM_F_NOPAIRING) && which[0] >= 0 && which[1] >= 0 &&
+        h[0].rid == h[1].rid && h[0].rid >= 0) {
         int64_t dist;
         int d;
-        d = mem_infer_dir(bns->l_pac, a[0].a[0].rb, a[1].a[0].rb, &dist);
+        d = mem_infer_dir(bns->l_pac, a[0].a[which[0]].rb, a[1].a[which[1]].rb, &dist);
         if (!pes[d].failed && dist >= pes[d].low && dist <= pes[d].high) extra_flag |= 2;
     }
     mem_reg2sam(opt, bns, pac, &s[0], &a[0], 0x41|extra_flag, &h[1]);
@@ -1004,7 +1012,7 @@ no_pairing:
     if (strcmp(s[0].name, s[1].name) != 0)
         err_fatal(__func__, "paired reads have different names: \"%s\", \"%s\"\n",
                   s[0].name, s[1].name);
-    
+
     free(h[0].cigar); free(h[1].cigar);
     return n;
 }
