@@ -2056,6 +2056,25 @@ int kswv::kswv512_u8(uint8_t seq1SoA[],
     __m512i high512_ = _mm512_load_si512((__m512i*) (high + SIMD_WIDTH16));  // int16
 
     
+    /* Per-lane "this lane has a valid primary with qe set" mask. Lanes
+     * without a primary shouldn't contribute rowMax values to score2
+     * (matches NEON's qe_mask_vec logic). */
+    uint8_t _qe_mask_bytes[SIMD_WIDTH8] __attribute((aligned(64)));
+    for (int j = 0; j < SIMD_WIDTH8; j++)
+        _qe_mask_bytes[j] = qe[j] ? 0xFF : 0x00;
+    __m512i qe_mask_vec = _mm512_load_si512((__m512i*) _qe_mask_bytes);
+    __mmask64 qe_mask = _mm512_test_epi8_mask(qe_mask_vec, qe_mask_vec);
+
+    /* Per-lane len1 vectors — needed by BOTH loops, not just the second.
+     * Previously rlen512 was only constructed before Loop 2, leaving
+     * Loop 1 without a len1 check. That was fine only because Loop 1
+     * covers rows 0..maxl which are always < len1, but add it anyway for
+     * symmetry with NEON and defence against future maxl drift. */
+    int16_t rlen[SIMD_WIDTH8] __attribute((aligned(64)));
+    for (int i=0; i<SIMD_WIDTH8; i++) rlen[i] = p[i].len1;
+    __m512i rlen512 = _mm512_load_si512(rlen);
+    __m512i rlen512_ = _mm512_load_si512(rlen + SIMD_WIDTH16);
+
     __m512i rmax512;
     for (int i=0; i< maxl; i++)
     {
@@ -2065,22 +2084,28 @@ int kswv::kswv512_u8(uint8_t seq1SoA[],
         __mmask64 mask11 = _mm512_cmpgt_epi16_mask(low512, i512);
         __mmask64 mask12 = _mm512_cmpgt_epi16_mask(low512_, i512);
         __mmask64 mask2 = _mm512_cmpgt_epu8_mask(rmax512, max512);
-        __mmask64 mask1 = mask11 | (mask12 << SIMD_WIDTH16);        
+        __mmask64 mask1 = mask11 | (mask12 << SIMD_WIDTH16);
         mask2 &= mask1;
+        /* Fix 3: require in-bounds vs each lane's own len1. */
+        __mmask64 mask11_ = _mm512_cmpgt_epi16_mask(rlen512, i512);
+        __mmask64 mask12_ = _mm512_cmpgt_epi16_mask(rlen512_, i512);
+        mask2 &= (mask11_ | (mask12_ << SIMD_WIDTH16));
+        /* Fix 3b: lane must have a valid primary (qe != 0). */
+        mask2 &= qe_mask;
+        /* Fix 4: minsc filter — only consider rmax >= minsc per lane.
+         * Matches scalar ksw_u8's behavior of only recording (score, te)
+         * pairs where gmax reaches minsc. Without this, sub-minsc plateau
+         * scores (which scalar never records) leak in as false suboptimals
+         * and collapse MAPQ downstream. */
+        __mmask64 minsc_ok = _mm512_cmpge_epu8_mask(rmax512, minsc512);
+        mask2 &= minsc_ok;
+
         max512 = _mm512_mask_blend_epi8(mask2, max512, rmax512);
         te512  = _mm512_mask_blend_epi16(mask2, te512, i512);
         te512_ = _mm512_mask_blend_epi16(mask2 >> SIMD_WIDTH16, te512_, i512);
-    }   
+    }
 
-    // Added new block -- due to bug
-    int16_t rlen[SIMD_WIDTH8] __attribute((aligned(64)));
-    for (int i=0; i<SIMD_WIDTH8; i++) rlen[i] = p[i].len1;
-    __m512i rlen512 = _mm512_load_si512(rlen);
-    __m512i rlen512_ = _mm512_load_si512(rlen + SIMD_WIDTH16);
-
-    static bool flg = 1;
     for (int i=minh+1; i<limit; i++)
-    //for (int i=minh; i<limit; i++)
     {
         __m512i i512 = _mm512_set1_epi16(i);
         rmax512 = _mm512_load_si512((__m512i*) (rowMax + i*SIMD_WIDTH8));
@@ -2089,11 +2114,17 @@ int kswv::kswv512_u8(uint8_t seq1SoA[],
         __mmask64 mask2 = _mm512_cmpgt_epu8_mask(rmax512, max512);
         __mmask64 mask1 = mask11 | (mask12 << SIMD_WIDTH16);
         mask2 &= mask1;
-        // new, bug
+        /* Fix 3: in-bounds vs each lane's len1. */
         __mmask64 mask11_ = _mm512_cmpgt_epi16_mask(rlen512, i512);
         __mmask64 mask12_ = _mm512_cmpgt_epi16_mask(rlen512_, i512);
         __mmask64 mask1_ = mask11_ | (mask12_ << SIMD_WIDTH16);
-        mask2 &= mask1_;        
+        mask2 &= mask1_;
+        /* Fix 3b: valid primary only. */
+        mask2 &= qe_mask;
+        /* Fix 4: minsc filter — match scalar's b[] threshold. */
+        __mmask64 minsc_ok = _mm512_cmpge_epu8_mask(rmax512, minsc512);
+        mask2 &= minsc_ok;
+
         max512 = _mm512_mask_blend_epi8(mask2, max512, rmax512);
         te512 = _mm512_mask_blend_epi16(mask2, te512, i512);
         te512_ = _mm512_mask_blend_epi16(mask2 >> SIMD_WIDTH16, te512_, i512);
