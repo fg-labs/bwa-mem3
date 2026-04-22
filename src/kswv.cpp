@@ -1061,7 +1061,7 @@ int kswv::kswv_neon_16(int16_t seq1SoA[],
     return 1;
 }
 
-#elif __AVX2__
+#elif ((!__AVX512BW__) & (__AVX2__))
 /* AVX2 kswv kernel — 256-bit vectors, 32 u8 lanes per batch.
  *
  * Direct port of the corrected NEON kernel (kswv_neon_u8 above) with all

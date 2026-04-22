@@ -217,7 +217,7 @@ private:
                      int32_t numPairs,
                      int phase);
 
-#elif __AVX2__
+#elif ((!__AVX512BW__) & (__AVX2__))
 	/* AVX2 (256-bit, 32-lane u8) batched mate-rescue SW kernel.
 	 * Modeled on the corrected NEON kernel (not AVX-512, which has a
 	 * pre-existing coord/score2 bug class that the NEON port uncovered
