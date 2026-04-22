@@ -2504,71 +2504,103 @@ int kswv::kswv512_16(int16_t seq1SoA[],
     if (phase) return 1;
 #endif
 
-    /*************** Score2 and te2 *******************/
-    int qmax = this->g_qmax;    
-    int maxl = 0 , minh = nrow;
-    for (int i=0; i<SIMD_WIDTH16; i++)
-    {
-        int val = (score[i] + qmax - 1) / qmax;
-        low[i] = te[i] - val;
-        high[i] = te[i] + val;
-        maxl = maxl < low[i] ? low[i] : maxl;
-        minh = minh > high[i] ? high[i] : minh;
-    }
-    max512 = _mm512_set1_epi16(-1);
-    te512 = _mm512_set1_epi16(-1);
-    __m512i low512 = _mm512_load_si512((__m512i*) low);
-    __m512i high512 = _mm512_load_si512((__m512i*) high);
-
-    __m512i rmax512;
-    for (int i=0; i< maxl; i++)
-    {
-        __m512i i512 = _mm512_set1_epi16(i);
-        rmax512 = _mm512_load_si512((__m512i*) (rowMax + i*SIMD_WIDTH16));
-        __mmask32 mask1 = _mm512_cmpgt_epi16_mask(low512, i512);
-        __mmask32 mask2 = _mm512_cmpgt_epi16_mask(rmax512, max512);
-        mask2 &= mask1;
-        max512 = _mm512_mask_blend_epi16(mask2, max512, rmax512);
-        te512 = _mm512_mask_blend_epi16(mask2, te512, i512);
-    }   
-
-    // New, due to latest bug
-    int16_t rlen[SIMD_WIDTH16] __attribute((aligned(64)));
-    for (int i=0; i<SIMD_WIDTH16; i++) rlen[i] = p[i].len1;
-    __m512i rlen512 = _mm512_load_si512(rlen);
-
-
-    for (int i=minh+1; i<limit; i++)
-    {
-        __m512i i512 = _mm512_set1_epi16(i);
-        rmax512 = _mm512_load_si512((__m512i*) (rowMax + i*SIMD_WIDTH16));
-        __mmask32 mask1 = _mm512_cmpgt_epi16_mask(i512, high512);
-        __mmask32 mask2 = _mm512_cmpgt_epi16_mask(rmax512, max512);
-        mask2 &= mask1;
-        // new, due to latest bug
-        __mmask32 mask1_ = _mm512_cmpgt_epi16_mask(rlen512, i512);
-        mask2 &= mask1_;
-        max512 = _mm512_mask_blend_epi16(mask2, max512, rmax512);
-        te512 = _mm512_mask_blend_epi16(mask2, te512, i512);    
+    /*************** Score2 and te2 — per-lane scalar emulation *******************
+     *
+     * Same b[]-consolidation fix as the 8-bit kernels (see kswv256_u8 for
+     * full rationale). Additionally fixes three pre-existing bugs the
+     * pre-fix 16-bit kernel carried but 8-bit did not:
+     *
+     *   (a) aggregate maxl/minh bounds — the same fix-3 issue PR #21
+     *       addressed on the AVX-512BW 8-bit kernel; this 16-bit one
+     *       never got it. A lane with a tight primary region would see
+     *       rows inside its own [low, high] count as score2 candidates
+     *       because the outer loop used the batch-wide max(low) /
+     *       min(high) instead of per-lane bounds.
+     *   (b) no minsc filter — scalar ksw_i16 records b[] entries only
+     *       when imax >= minsc; pre-fix 16-bit had no such gate,
+     *       leaking sub-minsc plateau scores into max2.
+     *   (c) no qe mask — lanes without a valid primary (qe == 0) could
+     *       contribute spurious rmax values since their rowMax was
+     *       never zeroed.
+     *
+     * All three fall out of the per-lane scalar loop naturally. */
+    int qmax = this->g_qmax;
+    for (int j = 0; j < SIMD_WIDTH16; j++) {
+        int val = (score[j] + qmax - 1) / qmax;
+        low[j]  = te[j] - val;
+        high[j] = te[j] + val;
     }
 
-    // _mm512_store_si512((__m512i *) temp, max512_);
-    _mm512_store_si512((__m512i *) temp1, max512);
-    _mm512_store_si512((__m512i *) temp2, te512);
+    /* rowMax entries produced: i == limit on normal completion, and
+     * i == limit + 1 after early exit (limit = i++ stores old i). Using i
+     * directly gives a single expression that covers both exit paths and
+     * includes the terminating row stored at rowMax[limit]. */
+    const int processed_rows = i;
 
-    for (int i=0; i<SIMD_WIDTH16 && (po_ind + i) < numPairs; i++) {    
-        int ind = po_ind + i;
-#if !MAINY
-        ind = p[i].regid;    // index of corr. aln
-#endif      
-        aln[ind].score2 = temp1[i];
-        aln[ind].te2 = temp2[i];
-        
-#if MAXI
-        fprintf(stderr, "score: %d, te: %d, qe: %d, score2: %d, te2: %d\n",
-                aln[ind].score, aln[ind].te, aln[ind].qe, temp1[i], temp2[i]);
-#endif
+    for (int l = 0; l < SIMD_WIDTH16 && (po_ind + l) < numPairs; l++) {
+        int ind = p[l].regid;
+        /* Match scalar ksw_i16: when KSW_XSUBO is absent, minsc = 0x10000
+         * (> SHRT_MAX) so b[] never starts and score2/te2 stay at -1.
+         * minsc_msk_a tracks lanes with KSW_XSUBO set; lanes not in the
+         * mask have minsc[l] zero-initialized and must skip the scan.
+         *
+         * Inactive-lane check is te[l] < 0, not !qe[l]: unlike the 8-bit
+         * kernels, 16-bit qe[l] is the real query-end coordinate and
+         * qe == 0 is a valid endpoint (best cell at query column 0).
+         * te[l] is initialized to -1 and only overwritten when a new
+         * gmax is recorded, so te[l] < 0 cleanly marks lanes with no
+         * primary alignment. */
+        if (te[l] < 0 || !(minsc_msk_a & ((__mmask32)1 << l))) {
+            aln[ind].score2 = -1;
+            aln[ind].te2    = -1;
+            continue;
+        }
+
+        int len1_l  = (int)p[l].len1;
+        int low_l   = (int)low[l];
+        int high_l  = (int)high[l];
+        int minsc_l = (int)minsc[l];
+        int score2  = -1;
+        int te2     = -1;
+        /* b_pos = -2 sentinel: (-2 + 1) != any real row, forces "append"
+         * on the first qualifying row. */
+        int b_score = -1;
+        int b_pos   = -2;
+
+        int nrows = processed_rows < len1_l ? processed_rows : len1_l;
+        for (int i2 = 0; i2 < nrows; i2++) {
+            int imax = (int)rowMax[i2 * SIMD_WIDTH16 + l];
+            if (imax < minsc_l) continue;
+
+            if (b_pos + 1 != i2) {
+                /* APPEND: flush outgoing b[] entry to score2 first. */
+                if (b_pos >= 0 &&
+                    (b_pos < low_l || b_pos > high_l) &&
+                    b_score > score2) {
+                    score2 = b_score;
+                    te2    = b_pos;
+                }
+                b_score = imax;
+                b_pos   = i2;
+            } else if (b_score < imax) {
+                /* UPDATE: strict greater extends the run's anchor. */
+                b_score = imax;
+                b_pos   = i2;
+            }
+        }
+
+        /* Flush trailing b[] entry. */
+        if (b_pos >= 0 &&
+            (b_pos < low_l || b_pos > high_l) &&
+            b_score > score2) {
+            score2 = b_score;
+            te2    = b_pos;
+        }
+
+        aln[ind].score2 = score2;
+        aln[ind].te2    = te2;
     }
+
     return 1;
 }
 
