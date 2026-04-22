@@ -52,16 +52,18 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
  *        feeding kswv::getScores8 / getScores16).
  *   0 -> worker_sam takes the legacy scalar mem_sam_pe + ksw_align2 path.
  *
- * Historically gated on __AVX512BW__ only, which routed non-AVX-512 builds
- * (ARM, AVX2-only x86) to the scalar path even though batched kernels can
- * be implemented for those architectures. As of the NEON + AVX2 ports this
- * gate accepts any arch with a batched kswv kernel.
+ * Enabled on architectures whose batched kswv kernel has been validated
+ * end-to-end against scalar ksw_align2 on real reads: AVX-512BW (original
+ * upstream path) and NEON / Apple Silicon. AVX2 is intentionally held on
+ * the scalar path — the 256-bit kernel added in PR #20 passed
+ * kswv_selftest but diverged from bwa-mem2 v2.2.1 on smoke-1M with MAPQ
+ * regressions on 4/64763 reads via inflated mate-rescue `sub` scores;
+ * re-enable once the AVX2 kernel is bit-identical to scalar on real reads.
  * DISABLE_BATCHED_MATESW is an escape hatch for the A/B test in CI. */
 #ifndef BWAMEM_BATCHED_MATESW
   #if DISABLE_BATCHED_MATESW
     #define BWAMEM_BATCHED_MATESW 0
-  #elif __AVX512BW__ || __AVX2__ \
-        || defined(__ARM_NEON) || defined(__aarch64__) || defined(APPLE_SILICON)
+  #elif __AVX512BW__ || defined(__ARM_NEON) || defined(__aarch64__) || defined(APPLE_SILICON)
     #define BWAMEM_BATCHED_MATESW 1
   #else
     #define BWAMEM_BATCHED_MATESW 0
