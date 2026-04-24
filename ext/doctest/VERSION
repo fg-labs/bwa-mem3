@@ -1,0 +1,7 @@
+doctest single-header distribution
+upstream: https://github.com/doctest/doctest
+tag:      v2.4.11
+sha256:   44faa038e9c3f9728efbda143748d01124ea0a27f4bf78f35a15d8fab2e039fb
+fetched:  2026-04-22
+
+Upgrade procedure: see test/TESTING.md "Upgrading doctest".
