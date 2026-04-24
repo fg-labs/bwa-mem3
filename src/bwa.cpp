@@ -521,7 +521,7 @@ int bwa_idx2mem(bwaidx_t *idx)
 
 void bwa_print_sam_hdr(const bntseq_t *bns, const char *hdr_line, FILE *fp)
 {
-    int i, n_SQ = 0;
+    int i, n_SQ = 0, n_HD = 0;
     extern char *bwa_pg;
     if (hdr_line) {
         const char *p = hdr_line;
@@ -529,7 +529,21 @@ void bwa_print_sam_hdr(const bntseq_t *bns, const char *hdr_line, FILE *fp)
             if (p == hdr_line || *(p-1) == '\n') ++n_SQ;
             p += 4;
         }
+        p = hdr_line;
+        while ((p = strstr(p, "@HD\t")) != 0) {
+            if (p == hdr_line || *(p-1) == '\n') ++n_HD;
+            p += 4;
+        }
+        // emit the user-supplied @HD first if present
+        if (n_HD > 0) {
+            err_fputs(hdr_line, fp);
+            err_fputs("\n", fp);
+        }
     }
+    // emit a default @HD when the user did not supply one
+    if (n_HD == 0)
+        err_fputs("@HD\tVN:1.5\tSO:unsorted\tGO:query\n", fp);
+    // @SQ lines follow @HD
     if (n_SQ == 0) {
         for (i = 0; i < bns->n_seqs; ++i) {
 #if ORIG
@@ -550,17 +564,14 @@ void bwa_print_sam_hdr(const bntseq_t *bns, const char *hdr_line, FILE *fp)
     } else if (n_SQ != bns->n_seqs && bwa_verbose >= 2)
         fprintf(stderr, "[W::%s] %d @SQ lines provided with -H; %d sequences in the index. "
                "Continue anyway.\n", __func__, n_SQ, bns->n_seqs);
-    
-#if ORIG
-    if (hdr_line) err_printf("%s\n", hdr_line);
-    if (bwa_pg) err_printf("%s\n", bwa_pg);
-#else
-    if (hdr_line) {
+
+    // emit the rest of hdr_line (e.g. @CO, @RG, @PG) after @SQ, but only
+    // when it did not already carry an @HD that we printed up front.
+    if (hdr_line && n_HD == 0) {
         err_fputs(hdr_line, fp);
         err_fputs("\n", fp);
     }
     if (bwa_pg) err_fputs(bwa_pg, fp);
-#endif
 }
 
 static char *bwa_escape(char *s)
