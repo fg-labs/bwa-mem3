@@ -79,6 +79,30 @@ jobs:
       - name: Verify binary
         run: ./bwa-mem2 version
 
+      - name: Build doctest framework and unit binary
+        run: make -C test framework unit
+
+      - name: Run unit tests (all rows)
+        env:
+          BWA_MEM2_TEST_MATRIX_ROW: ${{ matrix.name }}
+        # `--reporters=junit --out=…` writes JUnit XML to the file and
+        # nothing to stdout, so on failure dump the XML to the job log to
+        # surface failing assertions inline. (`--reporters=console,junit`
+        # would interleave console output into the same `--out` file and
+        # corrupt the JUnit XML, so the reporters must run separately.)
+        run: |
+          ./test/bwa_mem2_tests_unit \
+            --reporters=junit \
+            --out=unit-results-${{ strategy.job-index }}.xml \
+          || { cat unit-results-${{ strategy.job-index }}.xml; exit 1; }
+
+      - name: Upload unit-test results
+        if: always()
+        uses: actions/upload-artifact@0b7f8abb1508181956e8e162db84b466c27e18ce # v4.3.3
+        with:
+          name: unit-results-${{ matrix.name }}
+          path: unit-results-*.xml
+
       - name: Verify mimalloc is linked (when enabled)
         if: matrix.use_mimalloc == '1'
         run: test/mimalloc_loaded_test.sh ./bwa-mem2
