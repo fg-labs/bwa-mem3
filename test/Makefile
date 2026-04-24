@@ -90,8 +90,18 @@ $(FRAMEWORK_DIR)/%.o: $(FRAMEWORK_DIR)/%.cpp
 
 # -- Doctest unit/integration binaries (populated in Task 12 + 13) ---------
 
-unit: $(FRAMEWORK_LIB)
-	@echo "unit target — no test sources yet (will be populated in Task 12)"
+UNIT_DIR  := unit
+UNIT_SRCS := $(wildcard $(UNIT_DIR)/test_*.cpp)
+UNIT_OBJS := $(UNIT_SRCS:.cpp=.o)
+UNIT_BIN  := bwa_mem2_tests_unit
+
+unit: $(UNIT_BIN)
+
+$(UNIT_BIN): $(UNIT_OBJS) $(FRAMEWORK_LIB)
+	$(CXX) -o $@ $(UNIT_OBJS) $(FRAMEWORK_LIB) $(LIBS)
+
+$(UNIT_DIR)/%.o: $(UNIT_DIR)/%.cpp
+	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(FRAMEWORK_INCLUDES) $< -o $@
 
 integration: $(FRAMEWORK_LIB)
 	@echo "integration target — no test sources yet (will be populated in Task 13)"
@@ -164,7 +174,7 @@ $(INTEGRATION_DIR)/%.o: $(INTEGRATION_DIR)/%.cpp
 
 
 clean:
-	rm -f *.o $(INTEGRATION_DIR)/*.o $(FRAMEWORK_OBJS) $(FRAMEWORK_LIB) $(EXE) $(DOCTEST_BINS)
+	rm -f *.o $(INTEGRATION_DIR)/*.o $(UNIT_DIR)/*.o $(FRAMEWORK_OBJS) $(FRAMEWORK_LIB) $(EXE) $(DOCTEST_BINS)
 
 # DO NOT DELETE
 integration/bwt_seed_strategy_test.o: ../src/FMI_search.h ../src/bntseq.h ../src/read_index_ele.h
