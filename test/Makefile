@@ -67,6 +67,11 @@ FRAMEWORK_LIB  := $(FRAMEWORK_DIR)/libbwa_test_framework.a
 
 FRAMEWORK_INCLUDES := $(INCLUDES) -I$(FRAMEWORK_DIR)
 
+# Legacy integration-binary sources live under integration/ after the
+# Task 11 migration. We still emit their binaries at test/<name> so that
+# run_unit_tests.sh and the proto-neon-kswv.yml workflow keep working.
+vpath %.cpp integration
+
 .PHONY: all framework unit integration clean libsais-objs
 .SUFFIXES: .cpp .o
 
@@ -91,7 +96,9 @@ unit: $(FRAMEWORK_LIB)
 integration: $(FRAMEWORK_LIB)
 	@echo "integration target — no test sources yet (will be populated in Task 13)"
 
-# -- Legacy per-binary tests (MIGRATED ONE-BY-ONE IN FOLLOW-UP PRS) -------
+# -- Legacy per-binary tests (sources under integration/; binaries emit in test/) -
+
+INTEGRATION_DIR := integration
 
 .cpp.o:
 	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $< -o $@
@@ -110,25 +117,25 @@ libsais-objs:
 
 $(EXE): | libsais-objs
 
-fmi_test: fmi_test.o
+fmi_test: $(INTEGRATION_DIR)/fmi_test.o
 	$(CXX) -o $@ $^ $(LIBS)
 
-smem2_test: smem2_test.o
+smem2_test: $(INTEGRATION_DIR)/smem2_test.o
 	$(CXX) -o $@ $^ $(LIBS)
 
-sa2ref_test: sa2ref_test.o
+sa2ref_test: $(INTEGRATION_DIR)/sa2ref_test.o
 	$(CXX) -o $@ $^ $(LIBS)
 
-bwt_seed_strategy_test: bwt_seed_strategy_test.o
+bwt_seed_strategy_test: $(INTEGRATION_DIR)/bwt_seed_strategy_test.o
 	$(CXX) -o $@ $^ $(LIBS)
 
-xeonbsw: main_banded.o
+xeonbsw: $(INTEGRATION_DIR)/main_banded.o
 	$(CXX) -o $@ $^ $(LIBS)
 
 smem_lockstep_parity_test: smem_lockstep_parity_test.o
 	$(CXX) -o $@ $^ $(LIBS)
 
-header_insert_test:header_insert_test.o
+header_insert_test: header_insert_test.o
 	$(CXX) -o $@ $^ $(LIBS)
 
 # Build test-local copies of packed_text.cpp / system.cpp into test/
@@ -152,20 +159,23 @@ system_test.o: ../src/system.h
 system_lib.o: ../src/system.cpp ../src/system.h
 	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $< -o $@
 
+$(INTEGRATION_DIR)/%.o: $(INTEGRATION_DIR)/%.cpp
+	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $< -o $@
+
 
 clean:
-	rm -f *.o $(FRAMEWORK_OBJS) $(FRAMEWORK_LIB) $(EXE) $(DOCTEST_BINS)
+	rm -f *.o $(INTEGRATION_DIR)/*.o $(FRAMEWORK_OBJS) $(FRAMEWORK_LIB) $(EXE) $(DOCTEST_BINS)
 
 # DO NOT DELETE
-bwt_seed_strategy_test.o: ../src/FMI_search.h ../src/bntseq.h ../src/read_index_ele.h
-bwt_seed_strategy_test.o: ../src/bwa.h ../src/bwt.h ../src/utils.h ../src/macro.h
-fmi_test.o: ../src/FMI_search.h ../src/bntseq.h ../src/read_index_ele.h
-fmi_test.o: ../src/bwa.h ../src/bwt.h ../src/utils.h ../src/macro.h
-main_banded.o: ../src/bandedSWA.h ../src/macro.h
-sa2ref_test.o: ../src/FMI_search.h ../src/bntseq.h ../src/read_index_ele.h
-sa2ref_test.o: ../src/bwa.h ../src/bwt.h ../src/utils.h ../src/macro.h
-smem2_test.o: ../src/FMI_search.h ../src/bntseq.h ../src/read_index_ele.h
-smem2_test.o: ../src/bwa.h ../src/bwt.h ../src/utils.h ../src/macro.h
+integration/bwt_seed_strategy_test.o: ../src/FMI_search.h ../src/bntseq.h ../src/read_index_ele.h
+integration/bwt_seed_strategy_test.o: ../src/bwa.h ../src/bwt.h ../src/utils.h ../src/macro.h
+integration/fmi_test.o: ../src/FMI_search.h ../src/bntseq.h ../src/read_index_ele.h
+integration/fmi_test.o: ../src/bwa.h ../src/bwt.h ../src/utils.h ../src/macro.h
+integration/main_banded.o: ../src/bandedSWA.h ../src/macro.h
+integration/sa2ref_test.o: ../src/FMI_search.h ../src/bntseq.h ../src/read_index_ele.h
+integration/sa2ref_test.o: ../src/bwa.h ../src/bwt.h ../src/utils.h ../src/macro.h
+integration/smem2_test.o: ../src/FMI_search.h ../src/bntseq.h ../src/read_index_ele.h
+integration/smem2_test.o: ../src/bwa.h ../src/bwt.h ../src/utils.h ../src/macro.h
 smem_lockstep_parity_test.o: ../src/FMI_search.h ../src/bntseq.h ../src/read_index_ele.h
 smem_lockstep_parity_test.o: ../src/bwa.h ../src/bwt.h ../src/utils.h ../src/macro.h
 header_insert_test.o: ../src/bwa.h
