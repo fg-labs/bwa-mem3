@@ -55,6 +55,21 @@ int usage()
     return 1;
 }
 
+// Append a single argv token to the @PG CL: value. Tabs inside the token
+// (common when the caller passes e.g. `-R $'@RG\tID:x\tSM:y'`) would
+// otherwise bleed into the @PG line as extra tag-separators, producing
+// SAM that strict validators reject (issue #45 / upstream bwa-mem2#293).
+// Newlines and carriage returns would be worse still: a literal \n
+// terminates the @PG record mid-line and corrupts the whole header.
+// Replace any of these with a single space; do not mutate argv itself.
+static void append_pg_cl_arg(kstring_t *pg, const char *arg)
+{
+    kputc(' ', pg);
+    for (const char *c = arg; *c != '\0'; ++c) {
+        kputc((*c == '\t' || *c == '\n' || *c == '\r') ? ' ' : *c, pg);
+    }
+}
+
 int main(int argc, char* argv[])
 {
         
@@ -99,7 +114,7 @@ int main(int argc, char* argv[])
         
         ksprintf(&pg, "@PG\tID:bwa-mem2\tPN:bwa-mem2\tVN:%s\tCL:%s", PACKAGE_VERSION, argv[0]);
 
-        for (int i = 1; i < argc; ++i) ksprintf(&pg, " %s", argv[i]);
+        for (int i = 1; i < argc; ++i) append_pg_cl_arg(&pg, argv[i]);
         ksprintf(&pg, "\n");
         bwa_pg = pg.s;
         ret = main_mem(argc-1, argv+1);
