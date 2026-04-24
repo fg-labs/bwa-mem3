@@ -277,6 +277,10 @@ int mem_aln_to_bam(struct bam1_t *b,
             bam_aux_append(b, "MC", 'Z', (int)mc.l + 1, (const uint8_t *)mc.s);
         free(mc.s);
     }
+    if (mp) {
+        int32_t mq = (int32_t)mp->mapq;
+        bam_aux_append(b, "MQ", 'i', sizeof(mq), (const uint8_t *)&mq);
+    }
     if (p.score >= 0) {
         int32_t as = (int32_t)p.score;
         bam_aux_append(b, "AS", 'i', sizeof(as), (const uint8_t *)&as);
