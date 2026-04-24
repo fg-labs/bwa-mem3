@@ -56,6 +56,14 @@ endif
 FRAMEWORK_DIR   := framework
 INTEGRATION_DIR := integration
 UNIT_DIR        := unit
+
+# COVERAGE=1 augments CXXFLAGS/LDFLAGS with --coverage and overrides -O2 with
+# -O0 so gcov line numbers correspond 1:1 with source. Consumed by the CI
+# `coverage` job. Matches the parent Makefile's coverage plumbing.
+ifneq ($(COVERAGE),)
+    CXXFLAGS += -O0 --coverage
+    LDFLAGS  += --coverage
+endif
 FRAMEWORK_SRCS := $(FRAMEWORK_DIR)/scoring.cpp \
                   $(FRAMEWORK_DIR)/seqpair_gen.cpp \
                   $(FRAMEWORK_DIR)/seqpair_batch.cpp \
@@ -96,10 +104,25 @@ UNIT_SRCS := $(wildcard $(UNIT_DIR)/test_*.cpp)
 UNIT_OBJS := $(UNIT_SRCS:.cpp=.o)
 UNIT_BIN  := bwa_mem2_tests_unit
 
+# Fail fast if no test_*.cpp files are present in unit/. The link line
+# would otherwise pull only test_main.o out of the framework lib and
+# silently produce a binary with zero TEST_CASEs that reports "no
+# assertions" as a green CI run.
+#
+# Gate the check on the active goals so `make clean` (and other
+# non-build targets) still works on a checkout with no unit tests yet.
+# `$(error ...)` is evaluated at parse time, regardless of the requested
+# goal, so without the MAKECMDGOALS filter every invocation would abort.
+ifeq ($(strip $(UNIT_SRCS)),)
+  ifneq ($(filter unit all,$(or $(MAKECMDGOALS),all)),)
+    $(error No test_*.cpp sources found in $(UNIT_DIR)/. Add a unit test or pick a different target (e.g. `make -C test clean`).)
+  endif
+endif
+
 unit: $(UNIT_BIN)
 
 $(UNIT_BIN): $(UNIT_OBJS) $(FRAMEWORK_LIB)
-	$(CXX) -o $@ $(UNIT_OBJS) $(FRAMEWORK_LIB) $(LIBS)
+	$(CXX) $(LDFLAGS) -o $@ $(UNIT_OBJS) $(FRAMEWORK_LIB) $(LIBS)
 
 $(UNIT_DIR)/%.o: $(UNIT_DIR)/%.cpp
 	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(FRAMEWORK_INCLUDES) $< -o $@
@@ -112,7 +135,7 @@ INTEGRATION_BIN       := bwa_mem2_tests_integration
 integration: $(INTEGRATION_BIN)
 
 $(INTEGRATION_BIN): $(INTEGRATION_TEST_OBJS) $(FRAMEWORK_LIB)
-	$(CXX) -o $@ $(INTEGRATION_TEST_OBJS) $(FRAMEWORK_LIB) $(LIBS)
+	$(CXX) $(LDFLAGS) -o $@ $(INTEGRATION_TEST_OBJS) $(FRAMEWORK_LIB) $(LIBS)
 
 # Integration tests use the framework headers; override the generic
 # integration/%.o rule added in Task 12 for test_* / placeholder files.
@@ -189,6 +212,9 @@ $(INTEGRATION_DIR)/%.o: $(INTEGRATION_DIR)/%.cpp
 
 clean:
 	rm -f *.o $(INTEGRATION_DIR)/*.o $(UNIT_DIR)/*.o $(FRAMEWORK_OBJS) $(FRAMEWORK_LIB) $(EXE) $(DOCTEST_BINS)
+	rm -f *.gcno *.gcda $(INTEGRATION_DIR)/*.gcno $(INTEGRATION_DIR)/*.gcda \
+	      $(UNIT_DIR)/*.gcno $(UNIT_DIR)/*.gcda \
+	      $(FRAMEWORK_DIR)/*.gcno $(FRAMEWORK_DIR)/*.gcda
 
 # DO NOT DELETE
 integration/bwt_seed_strategy_test.o: ../src/FMI_search.h ../src/bntseq.h ../src/read_index_ele.h

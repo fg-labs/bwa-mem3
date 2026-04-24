@@ -299,3 +299,49 @@ jobs:
         env:
           BWAMETH_DIR: ${{ github.workspace }}/bwa-meth-oracle
         run: bash test/regression/meth_oracle.sh
+
+  coverage:
+    name: Coverage (Linux AVX2, gcov → Codecov)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev autoconf automake gcovr
+
+      - name: Build libbwa.a with coverage
+        run: make -j"$(nproc)" arch=avx2 CXX=g++ USE_MIMALLOC=0 COVERAGE=1
+
+      - name: Build test binaries with coverage
+        # Go through the parent test-binaries target so ARCH_FLAGS_FROM_PARENT
+        # propagates and the test TU sees the same __AVX2__ / __AVX512BW__
+        # surface libbwa.a was compiled with. COVERAGE=1 still flows in via
+        # MAKEFLAGS.
+        run: make test-binaries arch=avx2 CXX=g++ COVERAGE=1
+
+      - name: Run unit tests
+        run: ./test/bwa_mem2_tests_unit
+
+      - name: Run integration tests
+        run: ./test/bwa_mem2_tests_integration
+
+      - name: Collect coverage into Cobertura XML
+        # gcovr walks the tree, runs gcov on each .gcda, and emits a
+        # single Cobertura XML that Codecov can consume directly. Limit
+        # to src/ and test/ (skip vendored htslib / mimalloc / etc.).
+        run: |
+          gcovr --root . \
+                --filter 'src/' --filter 'test/framework/' \
+                --filter 'test/unit/' --filter 'test/integration/' \
+                --print-summary \
+                --xml coverage.xml
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@57e3a136b779b570ffcdbf80b3bdc90e7fab3de2 # v6.0.0
+        with:
+          files: coverage.xml
+          fail_ci_if_error: false
+          verbose: true
