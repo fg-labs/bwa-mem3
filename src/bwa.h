@@ -32,6 +32,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #define BWA_H_
 
 #include <stdint.h>
+#include <stdio.h>
 #include <zlib.h>
 #include "bntseq.h"
 #include "bwt.h"
@@ -110,6 +111,7 @@ extern "C" {
 	void bwa_print_sam_hdr(const bntseq_t *bns, const char *hdr_line, FILE *fp);
 	char *bwa_set_rg(const char *s);
 	char *bwa_insert_header(const char *s, char *hdr);
+	char *bwa_insert_header_file(FILE *fp, char *hdr);
 #ifdef __cplusplus
 }
 #endif

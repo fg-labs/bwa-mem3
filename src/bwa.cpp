@@ -622,3 +622,60 @@ char *bwa_insert_header(const char *s, char *hdr)
     bwa_escape(hdr + len);
     return hdr;
 }
+
+char *bwa_insert_header_file(FILE *fp, char *hdr)
+{
+    // Batched counterpart to bwa_insert_header: copy every @-prefixed line
+    // from fp into a single buffer, then call bwa_insert_header once on the
+    // whole thing. The per-line loop in fastmap.cpp was O(n^2) because
+    // bwa_insert_header strlen's and realloc's hdr on every call — this
+    // makes ingestion of large (~70 MB, ~1.5 M-line) headers linear.
+    //
+    // Semantics match the old loop: non-@ lines are dropped; bwa_escape is
+    // applied to the assembled string (equivalent to per-line because
+    // bwa_escape only rewrites backslash-escape pairs and copies every other
+    // byte through).
+    long file_size;
+    if (fseek(fp, 0L, SEEK_END) != 0) return hdr;
+    file_size = ftell(fp);
+    rewind(fp);
+    if (file_size <= 0) return hdr;
+
+    char *buf = (char *) calloc(1, (size_t) file_size + 1);
+    assert(buf != NULL);
+    char *p = buf;
+    // Budget for the per-call fgets: use LINE_MAX'ish 64 KiB minus 1 to
+    // match the pre-patch loop. Bound each read by the remaining buffer so
+    // a pathologically long line cannot overrun the file-sized allocation.
+    while (1) {
+        long remaining = (buf + file_size + 1) - p;
+        if (remaining <= 1) break;
+        int cap = (remaining > 0xffff) ? 0xffff : (int) remaining;
+        if (fgets(p, cap, fp) == NULL) break;
+        size_t i = strlen(p);
+        // If we hit the 64 KiB per-call budget without seeing a newline,
+        // the line is too long to fit in one fgets call. The next chunk
+        // would not start with '@' and would be silently dropped,
+        // truncating the line. Match the pre-patch assert(buf[i-1] ==
+        // '\n') behavior and fail loudly. (We only check this when cap
+        // was bounded by the 0xffff budget, not when it was bounded by
+        // the remaining buffer — the latter case is the legitimate
+        // no-trailing-newline-on-last-line scenario.)
+        if (cap >= 0xffff && i > 0 && p[i - 1] != '\n') {
+            err_fatal(__func__, "header line exceeds %d-byte read budget", cap - 1);
+        }
+        if (p[0] == '@') {
+            // bwa_insert_header strips the trailing '\n' from its input
+            // before concatenating, so preserving the newline here is what
+            // produces the between-line separator in the assembled buffer.
+            // Lines without a trailing newline (last line of a file that
+            // lacks one) are kept as-is; the final p[-1] fixup below only
+            // triggers when the final byte we wrote is '\n'.
+            p += i;
+        }
+    }
+    if (p != buf && p[-1] == '\n') p[-1] = '\0';
+    hdr = bwa_insert_header(buf, hdr);
+    free(buf);
+    return hdr;
+}
