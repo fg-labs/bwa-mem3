@@ -90,6 +90,10 @@ typedef struct smem_struct
 
 #define SAL_PFD 16
 
+#ifndef SMEM_LOCKSTEP_N
+#define SMEM_LOCKSTEP_N 4
+#endif
+
 class FMI_search: public indexEle
 {
     public:
@@ -121,7 +125,27 @@ class FMI_search: public indexEle
                                  int32_t minSeedLen,
                                  SMEM *matchArray,
                                  int64_t *__numTotalSmem);
-    
+
+    /* Lockstep-batched variant of getSMEMsOnePosOneThread: advances
+     * SMEM_LOCKSTEP_N reads' SMEM walks in slot-interleaved order to expose
+     * N independent backwardExt dependency chains to the CPU's out-of-order
+     * engine. Per-read algorithm is byte-identical to the scalar path; only
+     * the cross-read interleaving is new. Output in matchArray is written
+     * in the same (read, smem) order as the scalar path via per-slot match
+     * buffers flushed by input-index cursor. */
+    void getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
+                                          int16_t *query_pos_array,
+                                          int32_t *min_intv_array,
+                                          int32_t *rid_array,
+                                          int32_t numReads,
+                                          int32_t batch_size,
+                                          const bseq1_t *seq_,
+                                          int32_t *query_cum_len_ar,
+                                          int32_t  max_readlength,
+                                          int32_t minSeedLen,
+                                          SMEM *matchArray,
+                                          int64_t *__numTotalSmem);
+
     void getSMEMsAllPosOneThread(uint8_t *enc_qdb,
                                  int32_t *min_intv_array,
                                  int32_t *rid_array,
@@ -191,6 +215,25 @@ private:
                                int64_t *sa_bwt,
                                int64_t *count);
         SMEM backwardExt(SMEM smem, uint8_t a);
+
+    // ----- Lockstep SMEM batching internals -----
+    // Defined in FMI_search.cpp. Phases and per-slot state are scoped to
+    // the lockstep driver; not used anywhere else.
+    struct BatchSlot;
+
+    void ls_init_slot(BatchSlot *s, int32_t input_idx,
+                      const int16_t *query_pos_array,
+                      const int32_t *min_intv_array,
+                      const int32_t *rid_array,
+                      const bseq1_t *seq_,
+                      const int32_t *query_cum_len_ar,
+                      const uint8_t *enc_qdb);
+    void ls_prefetch_cp_occ(const BatchSlot *s);
+    void ls_advance_forward_step(BatchSlot *s, const uint8_t *enc_qdb);
+    void ls_prepare_backward(BatchSlot *s);
+    void ls_advance_backward_step(BatchSlot *s,
+                                  const uint8_t *enc_qdb,
+                                  int32_t minSeedLen);
 };
 
 #endif
