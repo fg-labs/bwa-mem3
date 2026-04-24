@@ -127,7 +127,9 @@ static inline int get_pri_idx(double XA_drop_ratio, const mem_alnreg_t *a, int i
 }
 
 // Okay, returning strings is bad, but this has happened a lot elsewhere. If I have time, I need serious code cleanup.
-char **mem_gen_alt(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, const mem_alnreg_v *a, int l_query, const char *query) // ONLY work after mem_mark_primary_se()
+// When out_hn is non-NULL, it is set to a newly-allocated int[a->n] of per-primary
+// hit counts (cnt[r]) so callers can emit the HN:i tag; caller owns the buffer.
+char **mem_gen_alt(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, const mem_alnreg_v *a, int l_query, const char *query, int **out_hn) // ONLY work after mem_mark_primary_se()
 {
 	int i, k, r, *cnt, tot;
 	kstring_t *aln = 0, str = {0,0,0};
@@ -143,6 +145,15 @@ char **mem_gen_alt(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac
 			++cnt[r], ++tot;
 			if (a->a[i].is_alt) has_alt[r] = 1;
 		}
+	}
+	// Publish per-primary hit counts for HN:i emission before the XA_hits cap
+	// can truncate the XA string; HN should reflect what *would* have been in
+	// XA, not what was actually emitted.
+	if (out_hn) {
+		int *hn = (int *) calloc(a->n, sizeof(int));
+		assert(hn != NULL);
+		for (i = 0; i < a->n; ++i) hn[i] = cnt[i];
+		*out_hn = hn;
 	}
 	if (tot == 0) goto end_gen_alt;
 	aln = (kstring_t*) calloc(a->n, sizeof(kstring_t));

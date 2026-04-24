@@ -137,9 +137,13 @@ jobs:
         run: |
           cd /tmp/ci-test
 
-          # Strip @PG and @HD headers (tool-specific), and MQ tag (added in bwa >0.7.17)
+          # Strip @PG and @HD headers (tool-specific), and MQ / HN tags
+          # (MQ was added in bwa >0.7.17; HN is a bwa-mem2-only aggregate of
+          # hits-under-XA-drop-ratio and has no analog in lh3/bwa mem).
           normalize() {
-            grep -v '^@PG' "$1" | grep -v '^@HD' | sed 's/\tMQ:i:[0-9]*//'
+            grep -v '^@PG' "$1" | grep -v '^@HD' \
+              | sed 's/\tMQ:i:[0-9]*//' \
+              | sed 's/\tHN:i:[0-9]*//'
           }
 
           normalize bwa.sam | sort > bwa.normalized.sam
@@ -248,7 +252,7 @@ jobs:
         if: matrix.canonical == true
         run: |
           cd /tmp/chr22-sim
-          normalize() { grep -v '^@PG' "$1" | grep -v '^@HD' | sed 's/\tMQ:i:[0-9]*//'; }
+          normalize() { grep -v '^@PG' "$1" | grep -v '^@HD' | sed 's/\tMQ:i:[0-9]*//' | sed 's/\tHN:i:[0-9]*//'; }
           normalize bwa.sam | sort > bwa.normalized.sam
           normalize bwamem2.sam | sort > bwamem2.normalized.sam
           echo "bwa records: $(grep -cv '^@' bwa.normalized.sam)"

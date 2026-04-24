@@ -1548,9 +1548,10 @@ void mem_reg2sam(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
     kvec_t(mem_aln_t) aa;
     int k, l;
     char **XA = 0;
+    int *HN = 0;
 
     if (!(opt->flag & MEM_F_ALL))
-        XA = mem_gen_alt(opt, bns, pac, a, s->l_seq, s->seq);
+        XA = mem_gen_alt(opt, bns, pac, a, s->l_seq, s->seq, &HN);
 
     kv_init(aa);
     str.l = str.m = 0; str.s = 0;
@@ -1569,6 +1570,7 @@ void mem_reg2sam(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
         *q = mem_reg2aln(opt, bns, pac, s->l_seq, s->seq, p);
         assert(q->rid >= 0); // this should not happen with the new code
         q->XA = XA? XA[k] : 0;
+        q->HN = HN? HN[k] : -1;
         q->flag |= extra_flag; // flag secondary
         if (p->secondary >= 0) q->sub = -1; // don't output sub-optimal score
         if (l && p->secondary < 0) // if supplementary
@@ -1597,6 +1599,7 @@ void mem_reg2sam(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
         for (k = 0; k < a->n; ++k) free(XA[k]);
         free(XA);
     }
+    free(HN);
 }
 
 static inline void add_cigar(const mem_opt_t *opt, mem_aln_t *p, kstring_t *str, int which)
@@ -1759,6 +1762,7 @@ void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str,
     }
 
     if (p->XA) { kputsn("\tXA:Z:", 6, str); kputs(p->XA, str); }
+    if (p->HN >= 0) { kputsn("\tHN:i:", 6, str); kputw(p->HN, str); }
 
     if (s->comment) { kputc('\t', str); kputs(s->comment, str); }
     if ((opt->flag&MEM_F_REF_HDR) && p->rid >= 0 && bns->anns[p->rid].anno != 0 && bns->anns[p->rid].anno[0] != 0) {
@@ -1780,6 +1784,7 @@ mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *
     uint8_t *query;
 
     memset(&a, 0, sizeof(mem_aln_t));
+    a.HN = -1; // sentinel: HN not computed unless caller fills from mem_gen_alt out_hn
     if (ar == 0 || ar->rb < 0 || ar->re < 0) { // generate an unmapped record
         a.rid = -1; a.pos = -1; a.flag |= 0x4;
         return a;

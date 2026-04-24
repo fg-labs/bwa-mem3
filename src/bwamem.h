@@ -178,6 +178,7 @@ typedef struct { // This struct is only used for the convenience of API.
     int n_cigar;     // number of CIGAR operations
     uint32_t *cigar; // CIGAR in the BAM encoding: opLen<<4|op; op to integer mapping: MIDSH=>01234
     char *XA;        // alternative mappings
+    int HN;          // total # of hits clustered with this primary under XA_drop_ratio; -1 when not computed (e.g., MEM_F_ALL)
 
     int score, sub, alt_sc;
 } mem_aln_t;
@@ -259,7 +260,8 @@ int mem_mark_primary_se(const mem_opt_t *opt, int n, mem_alnreg_t *a, int64_t id
 static void mem_mark_primary_se_core(const mem_opt_t *opt, int n, mem_alnreg_t *a, int_v *z);
 
 char **mem_gen_alt(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
-                   const mem_alnreg_v *a, int l_query, const char *query); // ONLY work after mem_mark_primary_se()
+                   const mem_alnreg_v *a, int l_query, const char *query,
+                   int **out_hn); // ONLY work after mem_mark_primary_se(); out_hn may be NULL
 void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str, bseq1_t *s,
                  int n, const mem_aln_t *list, int which, const mem_aln_t *m_);
 
