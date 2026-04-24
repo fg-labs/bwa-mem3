@@ -3,6 +3,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
 
 #include "kswv.h"
 #include "seqpair_batch.h"
@@ -34,10 +35,14 @@ std::vector<kswr_t> run_kswv_batch(const std::vector<TestPair> &pairs,
         }
     }
 
-    kswv *pwsw = new kswv(gap_open, gap_extend, gap_open, gap_extend,
-                          mat[0],   // match weight (diagonal entry)
-                          -mat[1],  // mismatch magnitude (off-diagonal sign)
-                          1, maxRefLen, maxQerLen);
+    // C++11 throughout this tree, so spell out the unique_ptr ctor
+    // rather than std::make_unique. RAII guarantees pwsw is destroyed
+    // even if a later step (prepare_phase1, vector copy) throws.
+    std::unique_ptr<kswv> pwsw(new kswv(
+        gap_open, gap_extend, gap_open, gap_extend,
+        mat[0],   // match weight (diagonal entry, +match)
+        mat[1],   // mismatch weight (off-diagonal, -mismatch)
+        1, maxRefLen, maxQerLen));
 
     // Phase 0: forward pass.
     pwsw->getScores8(bb.pairs(), bb.ref_buf(), bb.qer_buf(),
@@ -57,15 +62,20 @@ std::vector<kswr_t> run_kswv_batch(const std::vector<TestPair> &pairs,
     // Phase 0 → 1 transition: revseq + compact survivors.
     int pos = bb.prepare_phase1();
 
-    // Snapshot phase-0 result to allow phase-1 diagnostics to compare.
-    std::vector<kswr_t> pre_phase1(bb.aln(), bb.aln() + bb.n());
+    // Snapshot phase-0 result so phase-1 diagnostics can compare. Only
+    // populated when BWA_TESTS_DEBUG_PHASE1 is set — copying ~10k kswr_t
+    // per call adds up in the bulk-random unit test.
+    const char *dbg1 = std::getenv("BWA_TESTS_DEBUG_PHASE1");
+    std::vector<kswr_t> pre_phase1;
+    if (dbg1) {
+        pre_phase1.assign(bb.aln(), bb.aln() + bb.n());
+    }
 
     // Phase 1: reverse pass fills tb/qb.
     pwsw->getScores8(bb.pairs(), bb.ref_buf(), bb.qer_buf(),
                      bb.aln(), pos, 1, 1);
 
-    if (const char *dbg = std::getenv("BWA_TESTS_DEBUG_PHASE1")) {
-        (void)dbg;
+    if (dbg1) {
         int dumped = 0;
         for (int i = 0; i < bb.n() && dumped < 10; i++) {
             kswr_t r = bb.aln()[i];
@@ -79,8 +89,6 @@ std::vector<kswr_t> run_kswv_batch(const std::vector<TestPair> &pairs,
             }
         }
     }
-
-    delete pwsw;
 
     std::vector<kswr_t> out(bb.aln(), bb.aln() + bb.n());
     return out;
