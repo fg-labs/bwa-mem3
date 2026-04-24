@@ -663,6 +663,271 @@ void FMI_search::getSMEMsOnePosOneThread(uint8_t *enc_qdb,
     (*__numTotalSmem) = numTotalSmem;
 }
 
+// ===== Lockstep SMEM batching (scaffolding — see plan Task 5) =====
+// Per-slot state for the lockstep SMEM walk. One instance per in-flight read
+// in the batch. Every field mirrors a per-read local in the scalar
+// getSMEMsOnePosOneThread body, so parity with the scalar path follows from
+// composing the existing primitives (backwardExt, count[], cp_occ) in the
+// same sequence the scalar would.
+//
+// MAX_READ_LEN_FOR_LOCKSTEP caps per-slot buffer sizes so the whole slot
+// lives on the caller's stack. Override via -DMAX_READ_LEN_FOR_LOCKSTEP=N
+// at build time if running with reads longer than the default.
+#ifndef MAX_READ_LEN_FOR_LOCKSTEP
+#define MAX_READ_LEN_FOR_LOCKSTEP 512
+#endif
+
+enum LockstepPhase : uint8_t {
+    PH_FWD      = 0,  // forward extension inner loop active
+    PH_BWD_INIT = 1,  // between-phases housekeeping pending
+    PH_BWD      = 2,  // backward search outer loop active
+    PH_DONE     = 3   // slot finished; match_buf ready for flush
+};
+
+struct FMI_search::BatchSlot {
+    // Input identity — copied at init, never mutated thereafter.
+    int32_t input_idx;           // index into the caller's input arrays
+    int32_t rid;                 // rid_array[input_idx]
+    int16_t start_pos;           // query_pos_array[input_idx] (saved for bwd init)
+    int32_t min_intv;            // min_intv_array[input_idx]
+    int32_t readlength;          // seq_[rid].l_seq
+    int32_t offset;              // query_cum_len_ar[rid]
+
+    // Output for query_pos_array[input_idx] write-back at flush time.
+    int16_t next_x;
+
+    // Walk state (mirrors scalar locals).
+    SMEM smem;                   // current SA interval
+    int32_t j;                   // current query position in the active phase's inner loop
+    int32_t cur_j;               // backward phase bookkeeping (scalar's cur_j)
+    LockstepPhase phase;
+
+    // Backward-search state. numCurr/curr_s are loop-local in
+    // ls_advance_backward_step — they don't live across outer-j steps,
+    // so they don't appear here.
+    int32_t numPrev;
+    SMEM    prev[MAX_READ_LEN_FOR_LOCKSTEP];
+
+    // Per-slot match buffer + reorder-buffer ready flag for in-order flush.
+    SMEM    match_buf[MAX_READ_LEN_FOR_LOCKSTEP];
+    int32_t match_count;
+    bool    ready;
+};
+
+void FMI_search::ls_prefetch_cp_occ(const BatchSlot *s)
+{
+#ifdef ENABLE_PREFETCH
+    _mm_prefetch((const char *)(&cp_occ[(s->smem.k) >> CP_SHIFT]), _MM_HINT_T0);
+    _mm_prefetch((const char *)(&cp_occ[(s->smem.l) >> CP_SHIFT]), _MM_HINT_T0);
+    _mm_prefetch((const char *)(&cp_occ[(s->smem.k + s->smem.s) >> CP_SHIFT]), _MM_HINT_T0);
+    _mm_prefetch((const char *)(&cp_occ[(s->smem.l + s->smem.s) >> CP_SHIFT]), _MM_HINT_T0);
+#else
+    (void)s;
+#endif
+}
+
+// Populate a slot from the caller's input arrays at the given input_idx.
+// After this call either:
+//   phase == PH_FWD  — slot is ready to step the forward-extension inner loop
+//   phase == PH_DONE — the first base is non-ACGT; scalar skips this read, so
+//                      we match that (zero matches emitted, ready to flush).
+void FMI_search::ls_init_slot(BatchSlot *s,
+                              int32_t input_idx,
+                              const int16_t *query_pos_array,
+                              const int32_t *min_intv_array,
+                              const int32_t *rid_array,
+                              const bseq1_t *seq_,
+                              const int32_t *query_cum_len_ar,
+                              const uint8_t *enc_qdb)
+{
+    s->input_idx   = input_idx;
+    s->rid         = rid_array[input_idx];
+    s->start_pos   = query_pos_array[input_idx];
+    s->min_intv    = min_intv_array[input_idx];
+    s->readlength  = seq_[s->rid].l_seq;
+    assert(s->readlength <= MAX_READ_LEN_FOR_LOCKSTEP &&
+           "SMEM lockstep buffer overflow: recompile with -DMAX_READ_LEN_FOR_LOCKSTEP=<n>");
+    s->offset      = query_cum_len_ar[s->rid];
+    s->next_x      = s->start_pos + 1;
+    s->numPrev     = 0;
+    s->match_count = 0;
+    s->ready       = false;
+
+    int32_t x = s->start_pos;
+    uint8_t a = enc_qdb[s->offset + x];
+    if (a < 4) {
+        s->smem.rid = s->rid;
+        s->smem.m   = x;
+        s->smem.n   = x;
+        s->smem.k   = count[a];
+        s->smem.l   = count[3 - a];
+        s->smem.s   = count[a + 1] - count[a];
+        s->j        = x + 1;
+        s->phase    = PH_FWD;
+    } else {
+        // Scalar path skips the whole read when the first base is N.
+        // Match that by going straight to DONE with zero matches.
+        s->phase = PH_DONE;
+        s->ready = true;
+    }
+}
+// Advance one slot through one step of forward extension.
+// Mirrors the inner j-loop body of the scalar getSMEMsOnePosOneThread
+// (src/FMI_search.cpp — the for(j = x+1; j < readlength; j++) loop).
+// On the step that exits forward-ext (end-of-read, non-ACGT at j, or
+// s < min_intv), transitions phase to PH_BWD_INIT.
+void FMI_search::ls_advance_forward_step(BatchSlot *s, const uint8_t *enc_qdb)
+{
+    if (s->j >= s->readlength) {
+        // Ran off the end of the read; keep the still-valid smem if any.
+        if (s->smem.s >= s->min_intv) {
+            s->prev[s->numPrev++] = s->smem;
+        }
+        s->phase = PH_BWD_INIT;
+        return;
+    }
+
+    uint8_t a = enc_qdb[s->offset + s->j];
+    s->next_x = s->j + 1;
+    if (a >= 4) {
+        // Non-ACGT base terminates forward ext.
+        if (s->smem.s >= s->min_intv) {
+            s->prev[s->numPrev++] = s->smem;
+        }
+        s->phase = PH_BWD_INIT;
+        return;
+    }
+
+    SMEM smem_ = s->smem;
+    smem_.k = s->smem.l;
+    smem_.l = s->smem.k;
+    SMEM newSmem_ = backwardExt(smem_, 3 - a);
+    SMEM newSmem  = newSmem_;
+    newSmem.k = newSmem_.l;
+    newSmem.l = newSmem_.k;
+    newSmem.n = s->j;
+
+    int32_t s_neq_mask = (newSmem.s != s->smem.s);
+    s->prev[s->numPrev] = s->smem;
+    s->numPrev += s_neq_mask;
+
+    if (newSmem.s < s->min_intv) {
+        s->next_x = s->j;
+        s->phase = PH_BWD_INIT;
+        return;
+    }
+
+    s->smem = newSmem;
+    s->j++;
+#ifdef ENABLE_PREFETCH
+    _mm_prefetch((const char *)(&cp_occ[(s->smem.k) >> CP_SHIFT]), _MM_HINT_T0);
+    _mm_prefetch((const char *)(&cp_occ[(s->smem.l) >> CP_SHIFT]), _MM_HINT_T0);
+#endif
+}
+
+// Between-phases housekeeping: reverse prev[] and set up backward-phase
+// cursors. After this call the slot is either PH_BWD (ready for
+// ls_advance_backward_step) or PH_DONE (nothing to do — backward outer
+// loop would terminate on the first step, so we short-circuit to the
+// final prev[0] emit and done).
+void FMI_search::ls_prepare_backward(BatchSlot *s)
+{
+    // Reverse prev[] in place (matches scalar behavior before backward loop).
+    for (int p = 0; p < (s->numPrev / 2); p++) {
+        SMEM tmp = s->prev[p];
+        s->prev[p] = s->prev[s->numPrev - p - 1];
+        s->prev[s->numPrev - p - 1] = tmp;
+    }
+    s->cur_j = s->readlength;
+    s->j = s->start_pos - 1;  // first position for the backward outer loop
+
+    if (s->numPrev == 0) {
+        // Nothing to emit; scalar's final `if (numPrev != 0)` block is a no-op.
+        s->phase = PH_DONE;
+        s->ready = true;
+        return;
+    }
+    if (s->j < 0) {
+        // Backward outer loop cannot execute (start_pos == 0). Transition to
+        // PH_BWD so the first ls_advance_backward_step call sees j < 0, jumps
+        // to DONE, and runs the final prev[0] emit with the correct minSeedLen.
+        s->phase = PH_BWD;
+        return;
+    }
+    s->phase = PH_BWD;
+}
+
+// Advance one slot through ONE outer-j iteration of backward search.
+// Mirrors the body of the scalar `for (j = x-1; j >= 0; j--)` outer loop
+// in getSMEMsOnePosOneThread. On terminating conditions (numCurr == 0,
+// j < 0 after decrement, or non-ACGT at j), runs the scalar's final
+// prev[0] emit and transitions to PH_DONE.
+void FMI_search::ls_advance_backward_step(BatchSlot *s,
+                                          const uint8_t *enc_qdb,
+                                          int32_t minSeedLen)
+{
+    if (s->j < 0) goto DONE;
+
+    {
+        int32_t numCurr = 0;
+        int32_t curr_s = -1;
+        uint8_t a = enc_qdb[s->offset + s->j];
+        if (a > 3) goto DONE;
+
+        int p;
+        for (p = 0; p < s->numPrev; p++) {
+            SMEM smem = s->prev[p];
+            SMEM newSmem = backwardExt(smem, a);
+            newSmem.m = s->j;
+            if ((newSmem.s < s->min_intv) && ((smem.n - smem.m + 1) >= minSeedLen)) {
+                s->cur_j = s->j;
+                s->match_buf[s->match_count++] = smem;
+                break;
+            }
+            if ((newSmem.s >= s->min_intv) && (newSmem.s != curr_s)) {
+                curr_s = newSmem.s;
+                s->prev[numCurr++] = newSmem;
+#ifdef ENABLE_PREFETCH
+                _mm_prefetch((const char *)(&cp_occ[(newSmem.k) >> CP_SHIFT]), _MM_HINT_T0);
+                _mm_prefetch((const char *)(&cp_occ[(newSmem.k + newSmem.s) >> CP_SHIFT]), _MM_HINT_T0);
+#endif
+                break;
+            }
+        }
+        p++;
+        for (; p < s->numPrev; p++) {
+            SMEM smem = s->prev[p];
+            SMEM newSmem = backwardExt(smem, a);
+            newSmem.m = s->j;
+            if ((newSmem.s >= s->min_intv) && (newSmem.s != curr_s)) {
+                curr_s = newSmem.s;
+                s->prev[numCurr++] = newSmem;
+#ifdef ENABLE_PREFETCH
+                _mm_prefetch((const char *)(&cp_occ[(newSmem.k) >> CP_SHIFT]), _MM_HINT_T0);
+                _mm_prefetch((const char *)(&cp_occ[(newSmem.k + newSmem.s) >> CP_SHIFT]), _MM_HINT_T0);
+#endif
+            }
+        }
+        s->numPrev = numCurr;
+        s->j--;                // advance for the next outer step
+        if (numCurr == 0) goto DONE;
+        return;                // stay in PH_BWD; next call continues
+    }
+
+DONE:
+    // Scalar end-of-function final prev[0] emit (lines ~650-659 of scalar).
+    if (s->numPrev != 0) {
+        SMEM smem = s->prev[0];
+        if ((smem.n - smem.m + 1) >= minSeedLen) {
+            s->match_buf[s->match_count++] = smem;
+        }
+        s->numPrev = 0;
+    }
+    s->phase = PH_DONE;
+    s->ready = true;
+}
+// ===== End lockstep scaffolding =====
+
 void FMI_search::getSMEMsAllPosOneThread(uint8_t *enc_qdb,
                                          int32_t *min_intv_array,
                                          int32_t *rid_array,
@@ -699,6 +964,20 @@ void FMI_search::getSMEMsAllPosOneThread(uint8_t *enc_qdb,
                 tail++;             
             }               
         }
+#if SMEM_LOCKSTEP_N > 1
+        getSMEMsOnePosOneThread_lockstep(enc_qdb,
+                                         query_pos_array,
+                                         min_intv_array,
+                                         rid_array,
+                                         tail,
+                                         batch_size,
+                                         seq_,
+                                         query_cum_len_ar,
+                                         max_readlength,
+                                         minSeedLen,
+                                         matchArray,
+                                         __numTotalSmem);
+#else
         getSMEMsOnePosOneThread(enc_qdb,
                                 query_pos_array,
                                 min_intv_array,
@@ -711,10 +990,112 @@ void FMI_search::getSMEMsAllPosOneThread(uint8_t *enc_qdb,
                                 minSeedLen,
                                 matchArray,
                                 __numTotalSmem);
+#endif
         numActive = tail;
     } while(numActive > 0);
 
     _mm_free(query_pos_array);
+}
+
+void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
+                                                   int16_t *query_pos_array,
+                                                   int32_t *min_intv_array,
+                                                   int32_t *rid_array,
+                                                   int32_t numReads,
+                                                   int32_t batch_size,
+                                                   const bseq1_t *seq_,
+                                                   int32_t *query_cum_len_ar,
+                                                   int32_t max_readlength,
+                                                   int32_t minSeedLen,
+                                                   SMEM *matchArray,
+                                                   int64_t *__numTotalSmem)
+{
+    (void)batch_size;
+    (void)max_readlength;
+
+    if (numReads == 0) return;
+
+    const int32_t N = SMEM_LOCKSTEP_N;
+    // Stack footprint: each BatchSlot holds two SMEM[MAX_READ_LEN_FOR_LOCKSTEP]
+    // buffers (SMEM ≈ 32 B), so default N=4 × 512 ≈ 128 KB on the stack.
+    // Bumping both knobs scales multiplicatively: e.g., N=8 + readlen=4096
+    // ≈ 2 MB, which can exceed some OMP/container/embedded stack limits.
+    BatchSlot slots[SMEM_LOCKSTEP_N];
+
+    // Seed the first min(N, numReads) slots.
+    int32_t initial = (numReads < N) ? numReads : N;
+    for (int32_t s = 0; s < initial; s++) {
+        ls_init_slot(&slots[s], s, query_pos_array, min_intv_array,
+                     rid_array, seq_, query_cum_len_ar, enc_qdb);
+        if (slots[s].phase == PH_FWD) ls_prefetch_cp_occ(&slots[s]);
+    }
+    // Any unused slots (numReads < N) are marked DONE with invalid input_idx
+    // so the stepping pass skips them and the flush pass ignores them.
+    for (int32_t s = initial; s < N; s++) {
+        slots[s].phase = PH_DONE;
+        slots[s].ready = false;
+        slots[s].input_idx = -1;
+    }
+
+    int32_t next_input   = initial;
+    int32_t flush_cursor = 0;
+    int64_t numTotalSmem = *__numTotalSmem;
+
+    while (flush_cursor < numReads) {
+        // --- Stepping pass: advance each non-DONE slot by one phase-step. ---
+        for (int32_t s = 0; s < N; s++) {
+            switch (slots[s].phase) {
+                case PH_FWD:
+                    ls_advance_forward_step(&slots[s], enc_qdb);
+                    // If forward just transitioned to PH_BWD_INIT, run the
+                    // between-phases housekeeping immediately. prepare_backward
+                    // may transition straight to PH_DONE (e.g. empty prev[]).
+                    if (slots[s].phase == PH_BWD_INIT) {
+                        ls_prepare_backward(&slots[s]);
+                    }
+                    break;
+                case PH_BWD_INIT:
+                    ls_prepare_backward(&slots[s]);
+                    break;
+                case PH_BWD:
+                    ls_advance_backward_step(&slots[s], enc_qdb, minSeedLen);
+                    break;
+                case PH_DONE:
+                    break;
+            }
+        }
+
+        // --- Flush pass: in-order emit + slot recycle. ---
+        bool progress = true;
+        while (progress) {
+            progress = false;
+            for (int32_t s = 0; s < N; s++) {
+                if (slots[s].phase == PH_DONE &&
+                    slots[s].ready &&
+                    slots[s].input_idx == flush_cursor) {
+                    for (int32_t m = 0; m < slots[s].match_count; m++) {
+                        matchArray[numTotalSmem++] = slots[s].match_buf[m];
+                    }
+                    query_pos_array[slots[s].input_idx] = slots[s].next_x;
+                    flush_cursor++;
+
+                    if (next_input < numReads) {
+                        ls_init_slot(&slots[s], next_input,
+                                     query_pos_array, min_intv_array,
+                                     rid_array, seq_, query_cum_len_ar, enc_qdb);
+                        if (slots[s].phase == PH_FWD) ls_prefetch_cp_occ(&slots[s]);
+                        next_input++;
+                    } else {
+                        slots[s].input_idx = -1;  // retired
+                        slots[s].ready = false;
+                    }
+                    progress = true;
+                }
+            }
+        }
+    }
+
+    *__numTotalSmem = numTotalSmem;
 }
 
 int64_t FMI_search::bwtSeedStrategyAllPosOneThread(uint8_t *enc_qdb,

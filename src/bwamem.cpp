@@ -744,6 +744,20 @@ SMEM *mem_collect_smem(FMI_search *fmi, const mem_opt_t *opt,
     }
     #endif
     
+#if SMEM_LOCKSTEP_N > 1
+    fmi->getSMEMsOnePosOneThread_lockstep(enc_qdb,
+                                          query_pos_ar,
+                                          min_intv_ar,
+                                          rid,
+                                          pos,
+                                          pos,
+                                          seq_,
+                                          query_cum_len_ar,
+                                          max_readlength,
+                                          opt->min_seed_len,
+                                          matchArray + num_smem1,
+                                          &num_smem2);
+#else
     fmi->getSMEMsOnePosOneThread(enc_qdb,
                                  query_pos_ar,
                                  min_intv_ar,
@@ -756,6 +770,7 @@ SMEM *mem_collect_smem(FMI_search *fmi, const mem_opt_t *opt,
                                  opt->min_seed_len,
                                  matchArray + num_smem1,
                                  &num_smem2);
+#endif
     // assert(mmc->wsize_mem[tid] > (num_smem1 + num_smem2));
     // fprintwsize_mem_rf(stderr, "num_smem2: %d\n", num_smem2);
     if (opt->max_mem_intv > 0)
