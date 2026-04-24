@@ -62,8 +62,15 @@ UNIT_DIR        := unit
 # __AVX512BW__ / APPLE_SILICON macros as libbwa.a. Required for the
 # BWA_TESTS_HAVE_KSWV macro in kswv_runner.h to evaluate consistently
 # between libbwa.a and the test binary.
+#
+# IMPORTANT: we also strip -march=native / -mtune=native from the
+# default CXXFLAGS. Those flags enable every feature the runner CPU
+# supports (so e.g. an AVX2-capable runner silently defines __AVX2__
+# even on the `sse41` matrix row) and GCC only has -mno-<feat> to
+# disable, not -m<arch-only>. Stripping + re-adding the parent's
+# arch flags gives the test build the same ISA surface libbwa.a saw.
 ifneq ($(ARCH_FLAGS_FROM_PARENT),)
-    CXXFLAGS += $(ARCH_FLAGS_FROM_PARENT)
+    CXXFLAGS := $(filter-out -march=native -mtune=native,$(CXXFLAGS)) $(ARCH_FLAGS_FROM_PARENT)
 endif
 
 # COVERAGE=1 augments CXXFLAGS/LDFLAGS with --coverage and overrides -O2 with
