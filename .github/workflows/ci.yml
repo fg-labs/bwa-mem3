@@ -5,6 +5,13 @@ on:
     branches: [master, fg-main]
   pull_request:
 
+env:
+  # Pin dwgsim so simulated reads are reproducible and the CI cache key
+  # (keyed on this ref) is valid.
+  DWGSIM_REF: "dwgsim.0.1.16"
+  # phiX174 genome URL (NCBI, immutable content).
+  PHIX_URL: "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/819/615/GCF_000819615.1_ViralProj14015/GCF_000819615.1_ViralProj14015_genomic.fna.gz"
+
 jobs:
   build-and-test:
     strategy:
@@ -57,7 +64,13 @@ jobs:
 
       - name: Install dependencies (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev bwa autoconf automake samtools libomp-dev
+        # libomp-dev is required so `clang++ -fopenmp` can find -lomp when
+        # building the test framework on the AVX2 clang matrix row. On g++
+        # rows it's unused — libgomp ships with g++.
+        uses: awalsh128/cache-apt-pkgs-action@acb598e5ddbc6f68a970c5da0688d2f3a9f04d05 # v1.6.0
+        with:
+          packages: zlib1g-dev bwa autoconf automake samtools libomp-dev
+          version: 1.0
 
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
@@ -164,17 +177,35 @@ jobs:
           fi
           echo "PASS: no-mimalloc build correctly omits mimalloc"
 
+      - name: Cache dwgsim binary
+        id: cache-dwgsim
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: /tmp/dwgsim-src/dwgsim
+          key: dwgsim-${{ runner.os }}-${{ runner.arch }}-${{ env.DWGSIM_REF }}
+
       - name: Build dwgsim
+        if: steps.cache-dwgsim.outputs.cache-hit != 'true'
         run: |
-          git clone --recursive https://github.com/nh13/DWGSIM.git /tmp/dwgsim-src
-          cd /tmp/dwgsim-src
-          make -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
+          git clone https://github.com/nh13/DWGSIM.git /tmp/dwgsim-src
+          git -C /tmp/dwgsim-src checkout --detach "$DWGSIM_REF"
+          git -C /tmp/dwgsim-src submodule update --init --recursive
+          make -C /tmp/dwgsim-src -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
+
+      - name: Cache phiX174 reference
+        id: cache-phix
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: /tmp/ci-test/phix174.fa
+          # NCBI phiX174 reference is immutable. Bump the suffix if
+          # PHIX_URL ever changes.
+          key: phix174-ncbi-v1
 
       - name: Download phiX174 reference
+        if: steps.cache-phix.outputs.cache-hit != 'true'
         run: |
           mkdir -p /tmp/ci-test
-          curl -sL "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/819/615/GCF_000819615.1_ViralProj14015/GCF_000819615.1_ViralProj14015_genomic.fna.gz" \
-            | gunzip > /tmp/ci-test/phix174.fa
+          curl -sL "$PHIX_URL" | gunzip > /tmp/ci-test/phix174.fa
 
       - name: Simulate reads with dwgsim
         run: |
@@ -332,7 +363,10 @@ jobs:
           submodules: recursive
 
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev autoconf automake gcovr
+        uses: awalsh128/cache-apt-pkgs-action@acb598e5ddbc6f68a970c5da0688d2f3a9f04d05 # v1.6.0
+        with:
+          packages: zlib1g-dev autoconf automake gcovr
+          version: 1.0
 
       - name: Build libbwa.a with coverage
         run: make -j"$(nproc)" arch=avx2 CXX=g++ USE_MIMALLOC=0 COVERAGE=1
