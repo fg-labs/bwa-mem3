@@ -53,7 +53,9 @@ else
     INCLUDES = -I../src -I../ext/safestringlib/include -I../ext
 endif
 
-FRAMEWORK_DIR  := framework
+FRAMEWORK_DIR   := framework
+INTEGRATION_DIR := integration
+UNIT_DIR        := unit
 FRAMEWORK_SRCS := $(FRAMEWORK_DIR)/scoring.cpp \
                   $(FRAMEWORK_DIR)/seqpair_gen.cpp \
                   $(FRAMEWORK_DIR)/seqpair_batch.cpp \
@@ -90,7 +92,6 @@ $(FRAMEWORK_DIR)/%.o: $(FRAMEWORK_DIR)/%.cpp
 
 # -- Doctest unit/integration binaries (populated in Task 12 + 13) ---------
 
-UNIT_DIR  := unit
 UNIT_SRCS := $(wildcard $(UNIT_DIR)/test_*.cpp)
 UNIT_OBJS := $(UNIT_SRCS:.cpp=.o)
 UNIT_BIN  := bwa_mem2_tests_unit
@@ -103,12 +104,25 @@ $(UNIT_BIN): $(UNIT_OBJS) $(FRAMEWORK_LIB)
 $(UNIT_DIR)/%.o: $(UNIT_DIR)/%.cpp
 	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(FRAMEWORK_INCLUDES) $< -o $@
 
-integration: $(FRAMEWORK_LIB)
-	@echo "integration target — no test sources yet (will be populated in Task 13)"
+INTEGRATION_TEST_SRCS := $(wildcard $(INTEGRATION_DIR)/test_*.cpp) \
+                         $(wildcard $(INTEGRATION_DIR)/placeholder.cpp)
+INTEGRATION_TEST_OBJS := $(INTEGRATION_TEST_SRCS:.cpp=.o)
+INTEGRATION_BIN       := bwa_mem2_tests_integration
+
+integration: $(INTEGRATION_BIN)
+
+$(INTEGRATION_BIN): $(INTEGRATION_TEST_OBJS) $(FRAMEWORK_LIB)
+	$(CXX) -o $@ $(INTEGRATION_TEST_OBJS) $(FRAMEWORK_LIB) $(LIBS)
+
+# Integration tests use the framework headers; override the generic
+# integration/%.o rule added in Task 12 for test_* / placeholder files.
+$(INTEGRATION_DIR)/test_%.o: $(INTEGRATION_DIR)/test_%.cpp
+	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(FRAMEWORK_INCLUDES) $< -o $@
+
+$(INTEGRATION_DIR)/placeholder.o: $(INTEGRATION_DIR)/placeholder.cpp
+	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(FRAMEWORK_INCLUDES) $< -o $@
 
 # -- Legacy per-binary tests (sources under integration/; binaries emit in test/) -
-
-INTEGRATION_DIR := integration
 
 .cpp.o:
 	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $< -o $@
