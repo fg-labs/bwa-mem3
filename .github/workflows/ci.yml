@@ -119,46 +119,11 @@ jobs:
             /tmp/ci-test/phix174.fa \
             /tmp/ci-test/reads
 
-      - name: Index and align with bwa
+      - name: Compare bwa and bwa-mem2 output (phiX parity)
         run: |
-          cd /tmp/ci-test
-          cp phix174.fa bwa_phix174.fa
-          bwa index bwa_phix174.fa
-          bwa mem bwa_phix174.fa reads.bwa.read1.fastq.gz reads.bwa.read2.fastq.gz > bwa.sam 2>bwa.log
-
-      - name: Index and align with bwa-mem2
-        run: |
-          cd /tmp/ci-test
-          cp phix174.fa bwamem2_phix174.fa
-          $GITHUB_WORKSPACE/bwa-mem2 index bwamem2_phix174.fa
-          $GITHUB_WORKSPACE/bwa-mem2 mem bwamem2_phix174.fa reads.bwa.read1.fastq.gz reads.bwa.read2.fastq.gz > bwamem2.sam 2>bwamem2.log
-
-      - name: Compare bwa and bwa-mem2 output
-        run: |
-          cd /tmp/ci-test
-
-          # Strip @PG and @HD headers (tool-specific), and MQ / HN tags
-          # (MQ was added in bwa >0.7.17; HN is a bwa-mem2-only aggregate of
-          # hits-under-XA-drop-ratio and has no analog in lh3/bwa mem).
-          normalize() {
-            grep -v '^@PG' "$1" | grep -v '^@HD' \
-              | sed 's/\tMQ:i:[0-9]*//' \
-              | sed 's/\tHN:i:[0-9]*//'
-          }
-
-          normalize bwa.sam | sort > bwa.normalized.sam
-          normalize bwamem2.sam | sort > bwamem2.normalized.sam
-
-          echo "bwa aligned records: $(grep -cv '^@' bwa.normalized.sam)"
-          echo "bwa-mem2 aligned records: $(grep -cv '^@' bwamem2.normalized.sam)"
-
-          if diff bwa.normalized.sam bwamem2.normalized.sam > /dev/null 2>&1; then
-            echo "PASS: bwa and bwa-mem2 output is identical (after normalizing headers and MQ tag)"
-          else
-            echo "FAIL: bwa and bwa-mem2 output differs"
-            diff bwa.normalized.sam bwamem2.normalized.sam | head -40
-            exit 1
-          fi
+          BWA_MEM2="$GITHUB_WORKSPACE/bwa-mem2" \
+          CI_TEST_DIR=/tmp/ci-test \
+          bash test/regression/phix_parity.sh
 
       - name: Run unit-test harness
         if: matrix.canonical == true || matrix.arch_flag == 'sse41'
@@ -168,35 +133,16 @@ jobs:
       - name: --bam=6 roundtrip smoke (phiX)
         if: matrix.canonical == true
         run: |
-          cd /tmp/ci-test
-          $GITHUB_WORKSPACE/bwa-mem2 mem --bam=6 bwamem2_phix174.fa \
-            reads.bwa.read1.fastq.gz reads.bwa.read2.fastq.gz > bwamem2.bam 2>/dev/null
-          # BAM must decode cleanly and match record count of SAM path
-          samtools quickcheck bwamem2.bam
-          sam_records=$(grep -cv '^@' bwamem2.sam)
-          bam_records=$(samtools view -c bwamem2.bam)
-          if [ "$sam_records" != "$bam_records" ]; then
-            echo "FAIL: SAM ($sam_records) vs --bam=6 BAM ($bam_records) record count mismatch"
-            exit 1
-          fi
-          echo "PASS: --bam=6 roundtrip ($bam_records records)"
+          BWA_MEM2="$GITHUB_WORKSPACE/bwa-mem2" \
+          CI_TEST_DIR=/tmp/ci-test \
+          bash test/regression/bam_roundtrip.sh
 
       - name: Thread-determinism smoke (phiX, -t 1 vs -t 4)
         if: matrix.canonical == true
         run: |
-          cd /tmp/ci-test
-          $GITHUB_WORKSPACE/bwa-mem2 mem -t 1 bwamem2_phix174.fa \
-            reads.bwa.read1.fastq.gz reads.bwa.read2.fastq.gz 2>/dev/null \
-            | grep -v '^@PG' | sort > t1.sam
-          $GITHUB_WORKSPACE/bwa-mem2 mem -t 4 bwamem2_phix174.fa \
-            reads.bwa.read1.fastq.gz reads.bwa.read2.fastq.gz 2>/dev/null \
-            | grep -v '^@PG' | sort > t4.sam
-          if ! diff t1.sam t4.sam > /dev/null 2>&1; then
-            echo "FAIL: -t 1 and -t 4 outputs differ after sort"
-            diff t1.sam t4.sam | head -20
-            exit 1
-          fi
-          echo "PASS: thread-determinism ($(wc -l < t1.sam) records)"
+          BWA_MEM2="$GITHUB_WORKSPACE/bwa-mem2" \
+          CI_TEST_DIR=/tmp/ci-test \
+          bash test/regression/thread_determinism.sh
 
       - name: Cache chr22 reference
         if: matrix.canonical == true
@@ -232,49 +178,13 @@ jobs:
             -r 0.001 -S 2 \
             /tmp/chr22/chr22.fa /tmp/chr22-sim/reads
 
-      - name: Index chr22 with bwa and align
-        if: matrix.canonical == true
-        run: |
-          cp /tmp/chr22/chr22.fa /tmp/chr22-sim/bwa_chr22.fa
-          bwa index /tmp/chr22-sim/bwa_chr22.fa
-          bwa mem -t 4 /tmp/chr22-sim/bwa_chr22.fa \
-            /tmp/chr22-sim/reads.bwa.read1.fastq.gz /tmp/chr22-sim/reads.bwa.read2.fastq.gz \
-            > /tmp/chr22-sim/bwa.sam 2>/tmp/chr22-sim/bwa.log
-
-      - name: Align chr22 with bwa-mem2
-        if: matrix.canonical == true
-        run: |
-          $GITHUB_WORKSPACE/bwa-mem2 mem -t 4 /tmp/chr22/chr22.fa \
-            /tmp/chr22-sim/reads.bwa.read1.fastq.gz /tmp/chr22-sim/reads.bwa.read2.fastq.gz \
-            > /tmp/chr22-sim/bwamem2.sam 2>/tmp/chr22-sim/bwamem2.log
-
       - name: Compare chr22 bwa vs bwa-mem2 (parity)
         if: matrix.canonical == true
         run: |
-          cd /tmp/chr22-sim
-          # Strip @PG / @HD (tool-specific) and on every record:
-          #   MQ:i: — added in bwa >0.7.17
-          #   HN:i: — bwa-mem2-only
-          # And on SECONDARY/SUPPLEMENTARY (FLAG & 0x900) records only:
-          #   XS:i: — the band-cap retry path can shift secondary scores on a
-          #           small number of borderline reads. Primary records keep
-          #           XS:i so a primary subscore/ranking regression still
-          #           trips the parity diff.
-          normalize() { grep -v '^@PG' "$1" | grep -v '^@HD' \
-            | sed 's/\tMQ:i:[0-9]*//' \
-            | sed 's/\tHN:i:[0-9]*//' \
-            | awk -F'\t' 'BEGIN{OFS=FS} /^@/ {print; next} { f=$2+0; if (int(f/256)%2 || int(f/2048)%2) sub(/\tXS:i:[0-9]+/, "", $0); print }'; }
-          normalize bwa.sam | sort > bwa.normalized.sam
-          normalize bwamem2.sam | sort > bwamem2.normalized.sam
-          echo "bwa records: $(grep -cv '^@' bwa.normalized.sam)"
-          echo "bwa-mem2 records: $(grep -cv '^@' bwamem2.normalized.sam)"
-          if diff bwa.normalized.sam bwamem2.normalized.sam > /dev/null 2>&1; then
-            echo "PASS: bwa == bwa-mem2 on chr22 (50k PE reads)"
-          else
-            echo "FAIL: chr22 parity diff; first 40 lines:"
-            diff bwa.normalized.sam bwamem2.normalized.sam | head -40
-            exit 1
-          fi
+          BWA_MEM2="$GITHUB_WORKSPACE/bwa-mem2" \
+          CHR22_FA=/tmp/chr22/chr22.fa \
+          CHR22_SIM_DIR=/tmp/chr22-sim \
+          bash test/regression/chr22_parity.sh
 
       - name: SE alignment smoke (chr22)
         if: matrix.canonical == true
@@ -338,5 +248,4 @@ jobs:
         if: matrix.canonical == true
         env:
           BWAMETH_DIR: ${{ github.workspace }}/bwa-meth-oracle
-        run: |
-          bash test/meth/test.sh
+        run: bash test/regression/meth_oracle.sh

@@ -30,7 +30,7 @@ bwa mem -t 4 "$CHR22_SIM_DIR/bwa_chr22.fa" \
     > "$CHR22_SIM_DIR/bwamem2.sam" 2>"$CHR22_SIM_DIR/bwamem2.log"
 
 cd "$CHR22_SIM_DIR"
-normalize() { grep -v '^@PG' "$1" | grep -v '^@HD' | sed 's/\tMQ:i:[0-9]*//'; }
+normalize() { grep -v '^@PG' "$1" | grep -v '^@HD' | sed 's/\tMQ:i:[0-9]*//' | sed 's/\tHN:i:[0-9]*//'; }
 normalize bwa.sam     | sort > bwa.normalized.sam
 normalize bwamem2.sam | sort > bwamem2.normalized.sam
 echo "bwa records:      $(grep -cv '^@' bwa.normalized.sam)"

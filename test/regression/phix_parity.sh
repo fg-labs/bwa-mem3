@@ -31,7 +31,9 @@ cp phix174.fa bwamem2_phix174.fa
     > bwamem2.sam 2>bwamem2.log
 
 normalize() {
-    grep -v '^@PG' "$1" | grep -v '^@HD' | sed 's/\tMQ:i:[0-9]*//'
+    grep -v '^@PG' "$1" | grep -v '^@HD' \
+        | sed 's/\tMQ:i:[0-9]*//' \
+        | sed 's/\tHN:i:[0-9]*//'
 }
 normalize bwa.sam     | sort > bwa.normalized.sam
 normalize bwamem2.sam | sort > bwamem2.normalized.sam
