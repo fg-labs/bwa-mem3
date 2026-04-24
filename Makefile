@@ -40,6 +40,19 @@ else ifeq ($(CXX), g++)
 	CC=gcc
 endif
 
+# AddressSanitizer support for catching kswv rowMax / SIMD store overruns
+# in regression tests (e.g. kswv_nrow_zero_test). Opt-in with `make ASAN=1 ...`
+# Forces USE_MIMALLOC off: mimalloc's malloc override interposes before asan
+# and the two can't coexist cleanly. Must be set before the mimalloc block so
+# USE_MIMALLOC=0 actually takes effect there. CXXFLAGS picks up $(ASAN_FLAGS)
+# unconditionally later in the file; it stays empty when ASAN is unset.
+ifneq ($(strip $(ASAN)),)
+    USE_MIMALLOC = 0
+    ASAN_FLAGS   = -fsanitize=address -fno-omit-frame-pointer -O1
+    LDFLAGS     += -fsanitize=address
+    CFLAGS      += $(ASAN_FLAGS)
+endif
+
 # mimalloc integration. Default on — see FG-MAIN.md.
 # Override with USE_MIMALLOC=0 to build a stock bwa-mem2 without mimalloc.
 USE_MIMALLOC ?= 1
@@ -186,7 +199,7 @@ myall:arm64
 endif
 endif
 
-CXXFLAGS+=	-g -O3 -std=gnu++14 -fpermissive $(ARCH_FLAGS) #-Wall ##-xSSE2
+CXXFLAGS+=	-g -O3 -std=gnu++14 -fpermissive $(ARCH_FLAGS) $(ASAN_FLAGS) #-Wall ##-xSSE2
 
 # Control build flag for the batched mate-rescue SW port on ARM.
 # When set (e.g. `make arm64 DISABLE_BATCHED_MATESW=1`), the source gate for
@@ -198,7 +211,7 @@ ifneq ($(strip $(DISABLE_BATCHED_MATESW)),)
     CPPFLAGS += -DDISABLE_BATCHED_MATESW=$(DISABLE_BATCHED_MATESW)
 endif
 
-.PHONY:all clean depend multi print-mimalloc-config kswv_selftest test
+.PHONY:all clean depend multi print-mimalloc-config kswv_selftest kswv_nrow_zero_test test
 .SUFFIXES:.cpp .o
 
 .cpp.o:
@@ -239,11 +252,24 @@ $(EXE):$(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) $(if $(filter 1,$(USE_MIMALLOC)),$(
 kswv_selftest: $(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) test/kswv_selftest.o
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) test/kswv_selftest.o $(BWA_LIB) $(LIBS) -o $@
 
-# Run the in-tree tests. Currently just kswv_selftest; extend as more land.
-test: kswv_selftest
+# Regression test for issue 38 / upstream PR 289: exercises an all-len1==0
+# batch that drives each SIMD kswv kernel through the nrow==0 path. Without
+# the post-loop `if (i > 0)` guard, the rowMax store writes SIMD_WIDTH* bytes
+# before the allocation and aborts at a later allocator operation; under
+# asan the write is reported directly.
+kswv_nrow_zero_test: $(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) test/kswv_nrow_zero_test.o
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) test/kswv_nrow_zero_test.o $(BWA_LIB) $(LIBS) -o $@
+
+# Run the in-tree tests. Currently kswv_selftest + kswv_nrow_zero_test;
+# extend as more land.
+test: kswv_selftest kswv_nrow_zero_test
 	./kswv_selftest
+	./kswv_nrow_zero_test
 
 test/kswv_selftest.o: test/kswv_selftest.cpp
+	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $< -o $@
+
+test/kswv_nrow_zero_test.o: test/kswv_nrow_zero_test.cpp
 	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $< -o $@
 
 $(BWA_LIB):$(OBJS)
@@ -288,7 +314,7 @@ $(MIMALLOC_LIB):
 	cd $(MIMALLOC_BUILD) && cmake $(MIMALLOC_CMAKE_FLAGS) .. && $(MAKE)
 
 clean:
-	rm -fr src/*.o test/*.o $(BWA_LIB) $(EXE) kswv_selftest bwa-mem2.sse41 bwa-mem2.sse42 bwa-mem2.avx bwa-mem2.avx2 bwa-mem2.avx512bw bwa-mem2.arm64
+	rm -fr src/*.o test/*.o $(BWA_LIB) $(EXE) kswv_selftest kswv_nrow_zero_test bwa-mem2.sse41 bwa-mem2.sse42 bwa-mem2.avx bwa-mem2.avx2 bwa-mem2.avx512bw bwa-mem2.arm64
 	cd ext/safestringlib/ && $(MAKE) clean
 	-[ -f ext/htslib/config.mk ] && cd ext/htslib && $(MAKE) distclean
 	rm -rf $(MIMALLOC_BUILD)

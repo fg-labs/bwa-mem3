@@ -572,8 +572,12 @@ int kswv::kswv_neon_u8(uint8_t seq1SoA[],
         uint8_t *S = H1; H1 = H0; H0 = S;
     }
 
-    /* Store final row max */
-    vst1q_u8(rowMax + (i - 1) * SIMD_WIDTH8, pimax_vec);
+    /* Store final row max. Guard on i > 0: when every pair in the batch
+     * has len1 == 0, nrow == 0, the DP loop never runs, and `i - 1`
+     * underflows into the allocation prefix. Upstream PR 289 / issue 38. */
+    if (i > 0) {
+        vst1q_u8(rowMax + (i - 1) * SIMD_WIDTH8, pimax_vec);
+    }
 
     /* Extract results */
     uint8_t score[SIMD_WIDTH8] __attribute((aligned(128)));
@@ -1059,8 +1063,11 @@ int kswv::kswv_neon_16(int16_t seq1SoA[],
         int16_t *S = H1; H1 = H0; H0 = S;
     }
 
-    /* Store final row's pimax. */
-    vst1q_s16(rowMax + (i - 1) * SIMD_WIDTH16, pimax_vec);
+    /* Store final row's pimax. Guard on i > 0 for all-padding batches
+     * (nrow == 0 → i stays at 0 → underflow). See issue 38 / PR 289. */
+    if (i > 0) {
+        vst1q_s16(rowMax + (i - 1) * SIMD_WIDTH16, pimax_vec);
+    }
 
     /* Extract primary results. */
     int16_t score[SIMD_WIDTH16] __attribute((aligned(128)));
@@ -1445,7 +1452,12 @@ int kswv::kswv256_u8(uint8_t seq1SoA[],
         uint8_t *S = H1; H1 = H0; H0 = S;
     }
 
-    _mm256_storeu_si256((__m256i*)(rowMax + (i - 1) * SIMD_WIDTH8), pimax_vec);
+    /* Guard on i > 0: when every pair in the batch has len1 == 0, nrow
+     * is 0, the DP loop never runs, and `i - 1` underflows into the
+     * rowMax allocation prefix. See issue 38 / upstream PR 289. */
+    if (i > 0) {
+        _mm256_storeu_si256((__m256i*)(rowMax + (i - 1) * SIMD_WIDTH8), pimax_vec);
+    }
 
     /* Extract results. */
     uint8_t score[SIMD_WIDTH8] __attribute__((aligned(64)));
@@ -2079,7 +2091,11 @@ int kswv::kswv512_u8(uint8_t seq1SoA[],
     pimax512 = _mm512_mask_blend_epi8(mask512, pimax512, zero512);
     pimax512 = _mm512_mask_blend_epi8(minsc_msk, zero512, pimax512);
     pimax512 = _mm512_mask_blend_epi8(exit0, zero512, pimax512);
-    _mm512_store_si512((__m512i *) (rowMax + (i-1) * SIMD_WIDTH8), pimax512);
+    /* Guard on i > 0: all-len1==0 batches give nrow == 0 and would
+     * otherwise underflow into the rowMax allocation. issue 38 / PR 289. */
+    if (i > 0) {
+        _mm512_store_si512((__m512i *) (rowMax + (i-1) * SIMD_WIDTH8), pimax512);
+    }
 
     /******************* DP loop over *****************************/
     /**************** Partial output setting **********************/
@@ -2623,7 +2639,11 @@ int kswv::kswv512_16(int16_t seq1SoA[],
     pimax512 = _mm512_mask_blend_epi16(mask512, pimax512, minus1);
     pimax512 = _mm512_mask_blend_epi16(minsc_msk, minus1, pimax512);
     pimax512 = _mm512_mask_blend_epi16(exit0, minus1, pimax512);
-    _mm512_store_si512((__m512i *) (rowMax + (i-1) * SIMD_WIDTH16), pimax512);
+    /* Guard on i > 0: all-len1==0 batches give nrow == 0 and would
+     * otherwise underflow into the rowMax allocation. issue 38 / PR 289. */
+    if (i > 0) {
+        _mm512_store_si512((__m512i *) (rowMax + (i-1) * SIMD_WIDTH16), pimax512);
+    }
     // __m512i max512_ = max512;
 
     /******************* DP loop over *****************************/
