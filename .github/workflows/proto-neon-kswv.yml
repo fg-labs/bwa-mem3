@@ -4,8 +4,9 @@ name: proto-neon-kswv
 # on ARM. Runs on the proto/neon-kswv-* branches only. Not gated on main.
 #
 # Jobs:
-#   selftest-perf-arm  — build port + control, run kswv_selftest, run mem
-#                         on dwgsim/chr17 with both builds, report speedup.
+#   selftest-perf-arm  — build port + control, run bwa_mem2_tests_unit
+#                         --test-suite="unit/kswv", run mem on dwgsim/chr17 with
+#                         both builds, report speedup.
 #   reference-x86      — build AVX-512 reference, run mem, produce reference SAM.
 #   sam-identity       — diff md5 of sorted SAM from arm (port build) vs x86.
 
@@ -21,10 +22,12 @@ on:
       - 'proto/neon-kswv-**'
     paths:
       - 'src/**'
-      - 'test/kswv_selftest.cpp'
       - 'test/kswv_nrow_zero_test.cpp'
+      - 'test/framework/**'
+      - 'test/unit/**'
       - '.github/workflows/proto-neon-kswv.yml'
       - 'Makefile'
+      - 'test/Makefile'
   workflow_dispatch:
 
 env:
@@ -86,17 +89,23 @@ jobs:
           make -j"$(nproc)" DISABLE_BATCHED_MATESW=1 CXX=g++
           mv bwa-mem2.arm64 bwa-mem2.control
 
-      - name: Build kswv_selftest
+      - name: Build kswv unit test
         run: |
-          # Use the 'port' libbwa; the selftest only exercises kswv regardless.
+          # Use the 'port' libbwa; the kswv unit test only exercises kswv regardless.
           cp libbwa.port.a libbwa.a
-          make arch=arm64 kswv_selftest CXX=g++
+          make -C test framework unit CXX=g++
 
-      - name: Run kswv_selftest
+      - name: Run kswv unit test
         id: selftest
         run: |
           mkdir -p /tmp/ci-out
-          ./kswv_selftest 2>&1 | tee /tmp/ci-out/selftest.log
+          # selftest-perf-arm has no matrix, so ${{ strategy.job-index }}
+          # would expand to empty and emit kswv-selftest-.xml. Use a stable
+          # name and upload it alongside selftest.log below.
+          ./test/bwa_mem2_tests_unit --test-suite="unit/kswv" \
+            --reporters=junit \
+            --out=/tmp/ci-out/kswv-selftest-arm.xml \
+            2>&1 | tee /tmp/ci-out/selftest.log
           status=${PIPESTATUS[0]}
           echo "selftest_exit=$status" >> "$GITHUB_OUTPUT"
           tail -25 /tmp/ci-out/selftest.log >> "$GITHUB_STEP_SUMMARY"
@@ -210,6 +219,7 @@ jobs:
             /tmp/ci-out/port.sam.md5
             /tmp/ci-out/port.rep1.sam
             /tmp/ci-out/selftest.log
+            /tmp/ci-out/kswv-selftest-arm.xml
 
   reference-x86:
     name: x86 reference SAM (AVX-512)
@@ -277,18 +287,21 @@ jobs:
           make -j"$(nproc)" arch="$USE_AVX" DISABLE_BATCHED_MATESW=1 CXX=g++
           mv bwa-mem2 bwa-mem2.control 2>/dev/null || true
 
-      - name: Build kswv_selftest (x86)
-        # Rebuild against the port libbwa so the selftest exercises the
+      - name: Build kswv unit test (x86)
+        # Rebuild against the port libbwa so the unit test exercises the
         # new kswv kernel, not the control build's scalar fallback.
+        # Go through the parent test-binaries target so ARCH_FLAGS_FROM_PARENT
+        # propagates and the test TU sees the same __AVX2__ / __AVX512BW__
+        # surface libbwa.port.a was built with.
         run: |
           cp libbwa.port.a libbwa.a
-          make arch="$USE_AVX" kswv_selftest CXX=g++
+          make test-binaries arch="$USE_AVX" CXX=g++
 
-      - name: Run kswv_selftest (x86)
+      - name: Run kswv unit test (x86)
         # Strict gate for both AVX2 and AVX-512BW: all four NEON fixes
         # (te split, freeze, per-lane score2, minsc filter) are applied
         # on both paths — AVX2 from PR 20, AVX-512BW by this PR.
-        run: ./kswv_selftest
+        run: ./test/bwa_mem2_tests_unit --test-suite="unit/kswv"
 
       - name: Build kswv_nrow_zero_test (x86, ASan)
         # issue 38 / upstream PR 289 regression. Covers the AVX2 u8 kernel
