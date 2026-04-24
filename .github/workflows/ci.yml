@@ -14,11 +14,13 @@ jobs:
           - os: ubuntu-latest
             arch_flag: "sse41"
             use_mimalloc: "1"
+            run_integration: true
             name: "Linux x86_64 SSE4.1 (mimalloc)"
           - os: ubuntu-latest
             arch_flag: "avx2"
             use_mimalloc: "1"
             canonical: true
+            run_integration: true
             name: "Linux x86_64 AVX2 (mimalloc)"
           - os: ubuntu-latest
             arch_flag: "avx2"
@@ -27,10 +29,12 @@ jobs:
           - os: ubuntu-24.04-arm
             arch_flag: ""
             use_mimalloc: "1"
+            run_integration: true
             name: "Linux ARM64 (mimalloc)"
           - os: macos-latest
             arch_flag: ""
             use_mimalloc: "1"
+            run_integration: true
             name: "macOS ARM64 (mimalloc)"
           - os: ubuntu-latest
             arch_flag: "multi"
@@ -102,6 +106,28 @@ jobs:
         with:
           name: unit-results-${{ matrix.name }}
           path: unit-results-*.xml
+
+      - name: Build doctest integration binary
+        if: matrix.run_integration == true
+        run: make -C test integration
+
+      - name: Run integration tests
+        if: matrix.run_integration == true
+        env:
+          BWA_MEM2_TEST_MATRIX_ROW: ${{ matrix.name }}
+        # See unit-test step above for the cat-on-failure rationale.
+        run: |
+          ./test/bwa_mem2_tests_integration \
+            --reporters=junit \
+            --out=integration-results-${{ strategy.job-index }}.xml \
+          || { cat integration-results-${{ strategy.job-index }}.xml; exit 1; }
+
+      - name: Upload integration-test results
+        if: always() && matrix.run_integration == true
+        uses: actions/upload-artifact@0b7f8abb1508181956e8e162db84b466c27e18ce # v4.3.3
+        with:
+          name: integration-results-${{ matrix.name }}
+          path: integration-results-*.xml
 
       - name: Verify mimalloc is linked (when enabled)
         if: matrix.use_mimalloc == '1'
