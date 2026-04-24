@@ -321,6 +321,10 @@ int mem_aln_to_bam(struct bam1_t *b,
     if (p.XA != NULL) {
         bam_aux_append(b, "XA", 'Z', (int)strlen(p.XA) + 1, (const uint8_t *)p.XA);
     }
+    if (p.HN >= 0) {
+        int32_t hn = (int32_t)p.HN;
+        bam_aux_append(b, "HN", 'i', sizeof(hn), (const uint8_t *)&hn);
+    }
 
     bam_writer_append_generic_aux(b, s, opt, bns, p.rid);
 

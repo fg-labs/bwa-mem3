@@ -527,7 +527,7 @@ int mem_sam_pe(const mem_opt_t *opt, const bntseq_t *bns,
                uint64_t id, bseq1_t s[2], mem_alnreg_v a[2])
 {
     extern void mem_reg2sam(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, bseq1_t *s, mem_alnreg_v *a, int extra_flag, const mem_aln_t *m);
-    extern char **mem_gen_alt(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, const mem_alnreg_v *a, int l_query, const char *query);
+    extern char **mem_gen_alt(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, const mem_alnreg_v *a, int l_query, const char *query, int **out_hn);
 
     int i, j, z[2], extra_flag, n_pri[2], q_se[2], n_aa[2], paired;
     kstring_t str;
@@ -543,9 +543,10 @@ int mem_sam_pe(const mem_opt_t *opt, const bntseq_t *bns,
 
     if (paired) {
         char **XA[2];
+        int *HN[2] = { 0, 0 };
         if (!(opt->flag & MEM_F_ALL)) {
             for (i = 0; i < 2; ++i)
-                XA[i] = mem_gen_alt(opt, bns, pac, &a[i], s[i].l_seq, s[i].seq);
+                XA[i] = mem_gen_alt(opt, bns, pac, &a[i], s[i].l_seq, s[i].seq, &HN[i]);
         } else XA[0] = XA[1] = 0;
         // write SAM
         for (i = 0; i < 2; ++i) {
@@ -554,6 +555,7 @@ int mem_sam_pe(const mem_opt_t *opt, const bntseq_t *bns,
 
             h[i].flag |= 0x40<<i | extra_flag;
             h[i].XA = XA[i]? XA[i][z[i]] : 0;
+            h[i].HN = HN[i]? HN[i][z[i]] : -1;
             aa[i][n_aa[i]++] = h[i];
             if (n_pri[i] < a[i].n) { // the read has ALT hits
                 mem_alnreg_t *p = &a[i].a[n_pri[i]];
@@ -561,6 +563,7 @@ int mem_sam_pe(const mem_opt_t *opt, const bntseq_t *bns,
                 g[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, p);
                 g[i].flag |= 0x800 | 0x40<<i | extra_flag;
                 g[i].XA = XA[i]? XA[i][n_pri[i]] : 0;
+                g[i].HN = HN[i]? HN[i][n_pri[i]] : -1;
                 aa[i][n_aa[i]++] = g[i];
             }
         }
@@ -587,6 +590,7 @@ int mem_sam_pe(const mem_opt_t *opt, const bntseq_t *bns,
         // free
         for (i = 0; i < 2; ++i) {
             free(h[i].cigar); free(g[i].cigar);
+            free(HN[i]);
             if (XA[i] == 0) continue;
             for (j = 0; j < a[i].n; ++j) free(XA[i][j]);
             free(XA[i]);
@@ -796,7 +800,8 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
     extern void mem_reg2sam(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
                             bseq1_t *s, mem_alnreg_v *a, int extra_flag, const mem_aln_t *m);
     extern char **mem_gen_alt(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
-                              const mem_alnreg_v *a, int l_query, const char *query);
+                              const mem_alnreg_v *a, int l_query, const char *query,
+                              int **out_hn);
     #if MATE_SORT
     extern void sort_alnreg_re(int n, mem_alnreg_t* a);
     extern void sort_alnreg_score(int n, mem_alnreg_t* a);
@@ -935,9 +940,10 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                 a[i].a[z[i]].secondary_all = -1;
             }
         }
+        int *HN[2] = { 0, 0 };
         if (!(opt->flag & MEM_F_ALL)) {
             for (i = 0; i < 2; ++i)
-                XA[i] = mem_gen_alt(opt, bns, pac, &a[i], s[i].l_seq, s[i].seq);
+                XA[i] = mem_gen_alt(opt, bns, pac, &a[i], s[i].l_seq, s[i].seq, &HN[i]);
         } else XA[0] = XA[1] = 0;
         // write SAM
         for (i = 0; i < 2; ++i) {
@@ -946,6 +952,7 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
 
             h[i].flag |= 0x40<<i | extra_flag;
             h[i].XA = XA[i]? XA[i][z[i]] : 0;
+            h[i].HN = HN[i]? HN[i][z[i]] : -1;
             aa[i][n_aa[i]++] = h[i];
             if (n_pri[i] < a[i].n) { // the read has ALT hits
                 mem_alnreg_t *p = &a[i].a[n_pri[i]];
@@ -953,6 +960,7 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                 g[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, p);
                 g[i].flag |= 0x800 | 0x40<<i | extra_flag;
                 g[i].XA = XA[i]? XA[i][n_pri[i]] : 0;
+                g[i].HN = HN[i]? HN[i][n_pri[i]] : -1;
                 aa[i][n_aa[i]++] = g[i];
             }
         }
@@ -979,6 +987,7 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
         // free
         for (i = 0; i < 2; ++i) {
             free(h[i].cigar); free(g[i].cigar);
+            free(HN[i]);
             if (XA[i] == 0) continue;
             for (j = 0; j < a[i].n; ++j) free(XA[i][j]);
             free(XA[i]);
