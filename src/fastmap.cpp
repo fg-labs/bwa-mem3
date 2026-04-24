@@ -193,7 +193,6 @@ void worker_alloc(const mem_opt_t *opt, worker_t &w, int32_t nreads, int32_t nth
     w.nthreads = nthreads;
 
     int32_t memSize = nreads;
-    int32_t readLen = READ_LEN;
 
     /* Mem allocation section for core kernels */
     w.regs = NULL; w.chain_ar = NULL; w.seedBuf = NULL;
@@ -255,26 +254,31 @@ void worker_alloc(const mem_opt_t *opt, worker_t &w, int32_t nreads, int32_t nth
         wsize * sizeof(SeqPair) * opt->n_threads * 3;
     fprintf(stderr, "2. Memory pre-allocation for BSW: %0.4lf MB\n", allocMem/1e6);
 
+    // SMEM buffers (matchArray / min_intv_ar / query_pos_ar / enc_qdb / rid)
+    // and the lockstep-batch slot buffers are sized from the observed max
+    // read length on each batch in mem_collect_smem; they're NULL here and
+    // grow on first use. `lim` is still a fixed BATCH_SIZE+32 allocation
+    // because its size does not depend on read length.
     for (int l=0; l<nthreads; l++)
     {
-        // BATCH_MUL accounts for smems per reads in smem kernel
-        w.mmc.wsize_mem[l]     = BATCH_MUL * BATCH_SIZE *               readLen;
-        w.mmc.wsize_mem_s[l]     = BATCH_MUL * BATCH_SIZE *               readLen;
-        w.mmc.wsize_mem_r[l]     = BATCH_MUL * BATCH_SIZE *               readLen;
-        w.mmc.matchArray[l]    = (SMEM *) _mm_malloc(w.mmc.wsize_mem[l] * sizeof(SMEM), 64);
-        w.mmc.min_intv_ar[l]   = (int32_t *) malloc(w.mmc.wsize_mem[l] * sizeof(int32_t));
-        w.mmc.query_pos_ar[l]  = (int16_t *) malloc(w.mmc.wsize_mem[l] * sizeof(int16_t));
-        w.mmc.enc_qdb[l]       = (uint8_t *) malloc(w.mmc.wsize_mem[l] * sizeof(uint8_t));
-        w.mmc.rid[l]           = (int32_t *) malloc(w.mmc.wsize_mem[l] * sizeof(int32_t));
-        w.mmc.lim[l]           = (int32_t *) _mm_malloc((BATCH_SIZE + 32) * sizeof(int32_t), 64); // candidate not for reallocation, deferred for next round of changes.
+        w.mmc.wsize_mem[l]     = 0;
+        w.mmc.wsize_mem_s[l]   = 0;
+        w.mmc.wsize_mem_r[l]   = 0;
+        w.mmc.matchArray[l]    = NULL;
+        w.mmc.min_intv_ar[l]   = NULL;
+        w.mmc.query_pos_ar[l]  = NULL;
+        w.mmc.enc_qdb[l]       = NULL;
+        w.mmc.rid[l]           = NULL;
+        w.mmc.lim[l]           = (int32_t *) _mm_malloc((BATCH_SIZE + 32) * sizeof(int32_t), 64);
+
+        w.mmc.lockstep_prev[l]      = NULL;
+        w.mmc.lockstep_match_buf[l] = NULL;
+        w.mmc.lockstep_buf_cap[l]   = 0;
     }
 
-    allocMem = nthreads * BATCH_MUL * BATCH_SIZE * readLen * sizeof(SMEM) +
-        nthreads * BATCH_MUL * BATCH_SIZE * readLen *sizeof(int32_t) +
-        nthreads * BATCH_MUL * BATCH_SIZE * readLen *sizeof(int16_t) +
-        nthreads * BATCH_MUL * BATCH_SIZE * readLen *sizeof(int32_t) +
-        nthreads * (BATCH_SIZE + 32) * sizeof(int32_t);
-    fprintf(stderr, "3. Memory pre-allocation for BWT: %0.4lf MB\n", allocMem/1e6);
+    allocMem = nthreads * (BATCH_SIZE + 32) * sizeof(int32_t);
+    fprintf(stderr, "3. Memory pre-allocation for BWT (lazy SMEM buffers, %ld B fixed): %0.4lf MB\n",
+            (long)(nthreads * (BATCH_SIZE + 32) * sizeof(int32_t)), allocMem/1e6);
     fprintf(stderr, "------------------------------------------\n");
 }
 
@@ -305,6 +309,9 @@ void worker_free(worker_t &w, int32_t nthreads)
         free(w.mmc.seqPairArrayRight128[l]);
     }
 
+    // NULL-safe: SMEM buffers are now allocated lazily on first batch;
+    // workers that never ran a batch leave them as NULL. _mm_free / free
+    // are both well-defined on NULL.
     for(int l=0; l<nthreads; l++) {
         _mm_free(w.mmc.matchArray[l]);
         free(w.mmc.min_intv_ar[l]);
@@ -312,6 +319,9 @@ void worker_free(worker_t &w, int32_t nthreads)
         free(w.mmc.enc_qdb[l]);
         free(w.mmc.rid[l]);
         _mm_free(w.mmc.lim[l]);
+
+        _mm_free(w.mmc.lockstep_prev[l]);
+        _mm_free(w.mmc.lockstep_match_buf[l]);
     }
 }
 
@@ -719,7 +729,7 @@ static int process(void *shared, gzFile gfp, gzFile gfp2, int pipe_threads)
     }
 #endif
 
-    int32_t nreads = aux->actual_chunk_size/ READ_LEN + 10;
+    int32_t nreads = aux->actual_chunk_size / NREADS_ESTIMATE_AVG_BASES + 10;
 
     /* All memory allocation */
     memoryAlloc(aux, w, nreads, nthreads);

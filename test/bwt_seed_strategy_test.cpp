@@ -145,7 +145,8 @@ int main(int argc, char **argv) {
             seqs,
             query_cum_len_ar,
             minSeedLen,
-            matchArray);
+            matchArray,
+            (int64_t)numReads * readlength);
 
     endTick = __rdtsc();
 #ifdef VTUNE_ANALYSIS

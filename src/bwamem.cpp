@@ -647,55 +647,107 @@ SMEM *mem_collect_smem(FMI_search *fmi, const mem_opt_t *opt,
 
     int32_t *query_cum_len_ar = (int32_t *)_mm_malloc(nseq * sizeof(int32_t), 64);
 
-    // New addition: checks
-    // int64_t tot_seq_len = 0;
-    // for (int l=0; l<nseq; l++)
-    //     tot_seq_len += seq_[l].l_seq;
-    // 
-    // if (tot_seq_len > mmc->wsize_mem_s[tid]) {
-    //     fprintf(stderr, "[%0.4d] REA Re-allocating enc_qdb only\n", tid);
-    //     mmc->wsize_mem_s[tid] = tot_seq_len + 1024;
-    //     mmc->enc_qdb[tid]     = (uint8_t *) realloc(mmc->enc_qdb[tid],
-    //                                                 mmc->wsize_mem_s[tid] * sizeof(uint8_t));
-    //     enc_qdb = mmc->enc_qdb[tid];
-    // }
+    // Measure the batch before writing into any per-read buffer. enc_qdb /
+    // min_intv_ar / rid may have been sized by a prior batch whose
+    // wsize_mem_s / wsize_mem_r is smaller than this batch needs; the grow
+    // blocks below use tot_seq_len and max_readlength to resize before any
+    // write, so we need both values up front.
+    int64_t tot_seq_len = 0;
+    max_readlength = seq_[0].l_seq;
+    for (int l = 0; l < nseq; l++) {
+        tot_seq_len += seq_[l].l_seq;
+        if (max_readlength < seq_[l].l_seq)
+            max_readlength = seq_[l].l_seq;
+    }
 
-    int offset = 0, max_read_len = 0;
-    for (int l=0; l<nseq; l++)
-    {
+    // Empty-batch fast path: no bases to walk, no SMEMs to emit. Skipping
+    // here also avoids dereferencing the per-thread buffers below before
+    // they grow — they remain NULL on the first call when needed_match is
+    // 0 (e.g. a malformed/zero-length input slips through bseq).
+    if (tot_seq_len == 0 || max_readlength <= 0) {
+        _mm_free(query_cum_len_ar);
+        tot_smem = 0;
+        return mmc->matchArray[tid];
+    }
+
+    // Pre-walk sizing. All SMEM-family buffers grow monotonically in
+    // max_readlength (matchArray) or tot_seq_len (enc_qdb and wsize_mem_r
+    // helpers). The walk functions also receive wsize_mem[tid] as
+    // max_smem and bounds-check every write — defense in depth against a
+    // sizing miscalculation. Use nseq, not BATCH_SIZE, so a small tail
+    // batch with a single long read doesn't allocate as if every call were
+    // a full BATCH_SIZE block.
+    int64_t needed_match = (int64_t)BATCH_MUL * nseq * max_readlength;
+    if (mmc->wsize_mem[tid] < needed_match) {
+        _mm_free(mmc->matchArray[tid]);
+        mmc->wsize_mem[tid] = needed_match;
+        mmc->matchArray[tid] = (SMEM *) _mm_malloc(needed_match * sizeof(SMEM), 64);
+        assert(mmc->matchArray[tid] != NULL);
+        matchArray = mmc->matchArray[tid];
+    }
+    if (mmc->wsize_mem_s[tid] < tot_seq_len) {
+        // enc_qdb must hold every base in the batch. Use a nonzero floor so
+        // repeated allocs on small batches don't churn; nseq*max_readlength
+        // is a monotonic upper bound that matches the historical sizing.
+        int64_t needed_s = (int64_t)nseq * max_readlength;
+        mmc->wsize_mem_s[tid] = needed_s;
+        mmc->enc_qdb[tid] = (uint8_t *) realloc(mmc->enc_qdb[tid], needed_s * sizeof(uint8_t));
+        assert(mmc->enc_qdb[tid] != NULL);
+        enc_qdb = mmc->enc_qdb[tid];
+    }
+    // min_intv_ar / query_pos_ar / rid all index by "read" or by SMEM index
+    // in the split-SMEM pass. Size them to hold up to num_smem1 candidates —
+    // upper-bounded by matchArray capacity.
+    if (mmc->wsize_mem_r[tid] < needed_match) {
+        mmc->wsize_mem_r[tid] = needed_match;
+        mmc->min_intv_ar[tid]  = (int32_t *) realloc(mmc->min_intv_ar[tid],
+                                                     needed_match * sizeof(int32_t));
+        mmc->query_pos_ar[tid] = (int16_t *) realloc(mmc->query_pos_ar[tid],
+                                                     needed_match * sizeof(int16_t));
+        mmc->rid[tid]          = (int32_t *) realloc(mmc->rid[tid],
+                                                     needed_match * sizeof(int32_t));
+        assert(mmc->min_intv_ar[tid]  != NULL);
+        assert(mmc->query_pos_ar[tid] != NULL);
+        assert(mmc->rid[tid]          != NULL);
+        min_intv_ar  = mmc->min_intv_ar[tid];
+        query_pos_ar = mmc->query_pos_ar[tid];
+        rid          = mmc->rid[tid];
+    }
+    // Lockstep per-slot buffers (heap-owned; one pair per thread).
+    if (mmc->lockstep_buf_cap[tid] < max_readlength) {
+        int64_t n_elems = (int64_t)SMEM_LOCKSTEP_N * max_readlength;
+        _mm_free(mmc->lockstep_prev[tid]);
+        _mm_free(mmc->lockstep_match_buf[tid]);
+        mmc->lockstep_prev[tid]      = (SMEM *) _mm_malloc(n_elems * sizeof(SMEM), 64);
+        mmc->lockstep_match_buf[tid] = (SMEM *) _mm_malloc(n_elems * sizeof(SMEM), 64);
+        assert(mmc->lockstep_prev[tid]      != NULL);
+        assert(mmc->lockstep_match_buf[tid] != NULL);
+        mmc->lockstep_buf_cap[tid] = max_readlength;
+    }
+
+    // Populate per-read buffers now that the grow blocks above have sized
+    // them for this batch. enc_qdb is indexed linearly across all reads;
+    // min_intv_ar / rid are indexed by read.
+    int offset = 0;
+    query_cum_len_ar[0] = 0;
+    for (int l = 0; l < nseq; l++) {
+        if (l > 0)
+            query_cum_len_ar[l] = query_cum_len_ar[l - 1] + seq_[l - 1].l_seq;
         min_intv_ar[l] = 1;
-        for (int j=0; j<seq_[l].l_seq; j++) {
+        for (int j = 0; j < seq_[l].l_seq; j++) {
             enc_qdb[offset + j] = seq_[l].seq[j];
-            // max_read_len = std::max(max_read_len, seq_[l].seq[j]);
         }
         offset += seq_[l].l_seq;
         rid[l] = l;
     }
 
-    max_readlength = seq_[0].l_seq;
-    query_cum_len_ar[0] = 0;
-    for(int i = 1; i < nseq; i++) {
-        query_cum_len_ar[i] = query_cum_len_ar[i - 1] + seq_[i-1].l_seq;
-        if (max_readlength < seq_[i].l_seq)
-            max_readlength = seq_[i].l_seq;
-    }
-
     fmi->getSMEMsAllPosOneThread(enc_qdb, min_intv_ar, rid, nseq, nseq,
                                  seq_, query_cum_len_ar, max_readlength, opt->min_seed_len,
-                                 matchArray, &num_smem1);
-    // New addition: checks
-    // if (num_smem1 > mmc->wsize_mem_r[tid]) {
-    //     fprintf(stderr, "[%0.4d] REA Re-allocating min_intv, query_pos, & rid\n", tid);
-    //     mmc->wsize_mem_r[tid] = num_smem1 + 1024;
-    //     mmc->min_intv_ar[tid]  = (int32_t *) realloc(mmc->min_intv_ar[tid],
-    //                                                  mmc->wsize_mem_r[tid] *  sizeof(int32_t));
-    //     mmc->query_pos_ar[tid] = (int16_t *) realloc(mmc->query_pos_ar[tid],
-    //                                                  mmc->wsize_mem_r[tid] *  sizeof(int16_t));
-    //     mmc->rid[tid]          = (int32_t *) realloc(mmc->rid[tid],
-    //                                                   mmc->wsize_mem_r[tid] * sizeof(int32_t));
-    // }
+                                 matchArray, mmc->wsize_mem[tid],
+                                 mmc->lockstep_prev[tid],
+                                 mmc->lockstep_match_buf[tid],
+                                 &num_smem1);
 
-    // fprintf(stderr, "num_smem1: %d\n", num_smem1);
     int64_t mem_lim = 0;
     for (int64_t i=0; i<num_smem1; i++)
     {
@@ -714,36 +766,10 @@ SMEM *mem_collect_smem(FMI_search *fmi, const mem_opt_t *opt,
 
         min_intv_ar[pos] = p->s + 1;
         pos ++;
-        // mem_lim += seq_[p->rid].l_seq;
         mem_lim += end - start;
     }
+    (void)mem_lim;
 
-    #if 1
-    // fprintf(stderr, "num_smem2: %d, lim: %d\n", num_smem2, mem_lim + num_smem1 + offset);
-    if (mmc->wsize_mem[tid] < mem_lim + num_smem1) {
-        fprintf(stderr, "[%0.4d] REA Re-allocating SMEM data structures after num_smem1\n", tid);
-        int64_t tmp = mmc->wsize_mem[tid];
-        mmc->wsize_mem[tid] = mem_lim + num_smem1;
-        
-        SMEM* ptr1 = mmc->matchArray[tid];
-        // ptr2 = w.mmc.min_intv_ar;
-        // ptr3 =
-        fprintf(stderr, "Realloc size from: %d to :%d\n", tmp, mmc->wsize_mem[tid]);
-        mmc->matchArray[tid]    = (SMEM *) _mm_malloc(mmc->wsize_mem[tid] * sizeof(SMEM), 64);
-        assert(mmc->matchArray[tid] != NULL);
-        matchArray = mmc->matchArray[tid];
-        // w.mmc.min_intv_ar[l]   = (int32_t *) malloc(w.mmc.wsize_mem[l] * sizeof(int32_t));
-        // w.mmc.query_pos_ar[tid]  = (int16_t *) malloc(w.mmc.wsize_mem[l] * sizeof(int16_t));
-        // w.mmc.enc_qdb[l]       = (uint8_t *) malloc(w.mmc.wsize_mem[l] * sizeof(uint8_t));
-        // w.mmc.rid[l]           = (int32_t *) malloc(w.mmc.wsize_mem[l] * sizeof(int32_t));
-        //w.mmc.lim[l]         = (int32_t *) _mm_malloc((BATCH_SIZE + 32) * sizeof(int32_t), 64);
-        for (int i=0; i<num_smem1; i++) {
-            mmc->matchArray[tid][i] = ptr1[i];
-        }
-        _mm_free(ptr1);
-    }
-    #endif
-    
 #if SMEM_LOCKSTEP_N > 1
     fmi->getSMEMsOnePosOneThread_lockstep(enc_qdb,
                                           query_pos_ar,
@@ -756,6 +782,9 @@ SMEM *mem_collect_smem(FMI_search *fmi, const mem_opt_t *opt,
                                           max_readlength,
                                           opt->min_seed_len,
                                           matchArray + num_smem1,
+                                          mmc->wsize_mem[tid] - num_smem1,
+                                          mmc->lockstep_prev[tid],
+                                          mmc->lockstep_match_buf[tid],
                                           &num_smem2);
 #else
     fmi->getSMEMsOnePosOneThread(enc_qdb,
@@ -769,35 +798,19 @@ SMEM *mem_collect_smem(FMI_search *fmi, const mem_opt_t *opt,
                                  max_readlength,
                                  opt->min_seed_len,
                                  matchArray + num_smem1,
+                                 mmc->wsize_mem[tid] - num_smem1,
                                  &num_smem2);
 #endif
-    // assert(mmc->wsize_mem[tid] > (num_smem1 + num_smem2));
-    // fprintwsize_mem_rf(stderr, "num_smem2: %d\n", num_smem2);
     if (opt->max_mem_intv > 0)
     {
-        #if 1
-		if (mmc->wsize_mem[tid] < num_smem2 + offset*1.0/(opt->min_seed_len + 1) + num_smem1) {
-            int64_t tmp = mmc->wsize_mem[tid];
-		    mmc->wsize_mem[tid] = num_smem2 + offset*1.0/(opt->min_seed_len + 1) + num_smem1;
-		    SMEM* ptr1 = mmc->matchArray[tid];
-            fprintf(stderr, "[%0.4d] REA Re-allocating SMEM data structures after num_smem2\n", tid);
-            fprintf(stderr, "Realloc2 size from: %d to :%d\n", tmp, mmc->wsize_mem[tid]);
-		    mmc->matchArray[tid]    = (SMEM *) _mm_malloc(mmc->wsize_mem[tid] * sizeof(SMEM), 64);
-		    assert(mmc->matchArray[tid] != NULL);
-		    matchArray = mmc->matchArray[tid];
-		    for (int i=0; i<num_smem1; i++) {
-		        mmc->matchArray[tid][i] = ptr1[i];
-		    }
-		    _mm_free(ptr1);
-		}
-        #endif
         for (int l=0; l<nseq; l++)
             min_intv_ar[l] = opt->max_mem_intv;
 
         num_smem3 = fmi->bwtSeedStrategyAllPosOneThread(enc_qdb, min_intv_ar,
                                                         nseq, seq_, query_cum_len_ar,
                                                         opt->min_seed_len + 1,
-                                                        matchArray + num_smem1 + num_smem2);
+                                                        matchArray + num_smem1 + num_smem2,
+                                                        mmc->wsize_mem[tid] - num_smem1 - num_smem2);
     }
     tot_smem = num_smem1 + num_smem2 + num_smem3;
     // assert(mmc->wsize_mem[tid] > (tot_smem));
@@ -1004,7 +1017,7 @@ int mem_kernel1_core(FMI_search *fmi,
                      int tid)
 {
     int i;
-    int64_t num_smem = 0, tot_len = 0;
+    int64_t num_smem = 0;
     mem_chain_v *chn;
 
     uint64_t tim;
@@ -1013,34 +1026,16 @@ int mem_kernel1_core(FMI_search *fmi,
     {
         char *seq = seq_[l].seq;
         int len = seq_[l].l_seq;
-        tot_len += len;
 
         for (i = 0; i < len; ++i)
             seq[i] = seq[i] < 4? seq[i] : nst_nt4_table[(int)seq[i]]; //nst_nt4??
     }
-    // tot_len *= N_SMEM_KERNEL;
-    // fprintf(stderr, "wsize: %d, tot_len: %d\n", mmc->wsize_mem[tid], tot_len);
-    // This covers enc_qdb/SMEM reallocs
-    if (tot_len >= mmc->wsize_mem[tid])
-    {
-        fprintf(stderr, "[%0.4d] Re-allocating SMEM data structures due to enc_qdb\n", tid);
-        int64_t tmp = mmc->wsize_mem[tid];
-        mmc->wsize_mem[tid] = tot_len;
-        mmc->wsize_mem_s[tid] = tot_len;
-        mmc->wsize_mem_r[tid] = tot_len;
-        mmc->matchArray[tid]   = (SMEM *) _mm_realloc(mmc->matchArray[tid],
-                                                      tmp, mmc->wsize_mem[tid], sizeof(SMEM));
-            //realloc(mmc->matchArray[tid], mmc->wsize_mem[tid] *   sizeof(SMEM));
-        mmc->min_intv_ar[tid]  = (int32_t *) realloc(mmc->min_intv_ar[tid],
-                                                     mmc->wsize_mem[tid] *  sizeof(int32_t));
-        mmc->query_pos_ar[tid] = (int16_t *) realloc(mmc->query_pos_ar[tid],
-                                                     mmc->wsize_mem[tid] *  sizeof(int16_t));
-        mmc->enc_qdb[tid]      = (uint8_t *) realloc(mmc->enc_qdb[tid],
-                                                      mmc->wsize_mem[tid] * sizeof(uint8_t));
-        mmc->rid[tid]          = (int32_t *) realloc(mmc->rid[tid],
-                                                      mmc->wsize_mem[tid] * sizeof(int32_t));
-        // w.mmc.lim[l]        = (int32_t *) _mm_malloc((BATCH_SIZE + 32) * sizeof(int32_t), 64);
-    }
+    // SMEM-family per-thread buffer sizing happens inside mem_collect_smem,
+    // pre-walk and keyed on max_readlength / tot_seq_len of this batch. The
+    // historical tot_len-based grow that used to live here is redundant with
+    // that pre-walk grow and was incorrect for the lazy-init case
+    // (wsize_mem == 0 with a 0-base degenerate batch tripped _mm_realloc's
+    // "shrinking not supported" path on a NULL pointer).
 
     SMEM    *matchArray   = mmc->matchArray[tid];
     int32_t *min_intv_ar  = mmc->min_intv_ar[tid];
@@ -1064,7 +1059,11 @@ int mem_kernel1_core(FMI_search *fmi,
                                   num_smem,
                                   tid);
 
-    if (num_smem >= *wsize_mem){
+    // mem_collect_smem bounds-checks every matchArray write via
+    // smem_overflow_die, so num_smem can equal *wsize_mem (last slot used)
+    // without an actual overflow. Only `>` indicates a sizing miscalculation.
+    // An empty batch is a valid case: num_smem == *wsize_mem == 0.
+    if (num_smem > *wsize_mem){
         fprintf(stderr, "Error [bug]: num_smem: %ld are more than allocated space %ld.\n",
                 num_smem, *wsize_mem);
         exit(EXIT_FAILURE);
