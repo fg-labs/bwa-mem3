@@ -519,59 +519,165 @@ int bwa_idx2mem(bwaidx_t *idx)
  * SAM header routines *
  ***********************/
 
-void bwa_print_sam_hdr(const bntseq_t *bns, const char *hdr_line, FILE *fp)
+// Write the first line from `lines` to `fp` if print is nonzero, and return
+// a pointer to the remainder (or NULL when consumed). `lines` is newline-
+// separated but not required to be newline-terminated.
+static const char *remove_line(const char *lines, int print, FILE *fp)
 {
-    int i, n_SQ = 0, n_HD = 0;
-    extern char *bwa_pg;
-    if (hdr_line) {
-        const char *p = hdr_line;
+    const char *nl = strchr(lines, '\n');
+    if (nl) {
+        if (print) {
+            err_fwrite(lines, 1, (size_t)(nl - lines), fp);
+            err_fputc('\n', fp);
+        }
+        return nl + 1;
+    } else {
+        if (print) {
+            err_fputs(lines, fp);
+            err_fputc('\n', fp);
+        }
+        return NULL;
+    }
+}
+
+// Return 1 iff `lines` contains any @SQ header records.
+static int has_SQ(const char *lines)
+{
+    if (lines == NULL) return 0;
+    if (strncmp(lines, "@SQ\t", 4) == 0) return 1;
+    return strstr(lines, "\n@SQ\t") != NULL;
+}
+
+// Count the number of @SQ header records in `lines`.
+static int count_SQ(const char *lines)
+{
+    int n_SQ = 0;
+    if (lines) {
+        const char *p = lines;
         while ((p = strstr(p, "@SQ\t")) != 0) {
-            if (p == hdr_line || *(p-1) == '\n') ++n_SQ;
+            if (p == lines || *(p - 1) == '\n') ++n_SQ;
             p += 4;
-        }
-        p = hdr_line;
-        while ((p = strstr(p, "@HD\t")) != 0) {
-            if (p == hdr_line || *(p-1) == '\n') ++n_HD;
-            p += 4;
-        }
-        // emit the user-supplied @HD first if present
-        if (n_HD > 0) {
-            err_fputs(hdr_line, fp);
-            err_fputs("\n", fp);
         }
     }
-    // emit a default @HD when the user did not supply one
+    return n_SQ;
+}
+
+// Emit the full SAM header, merging (in precedence order) user `hdr_line`
+// (from -H), `bns_hdr` (loaded from <prefix>.hdr or <baseprefix>.dict), and
+// the index's @SQ records. Precedence mirrors lh3/bwa#348:
+//   @HD : user's > index's > default "@HD\tVN:1.5\tSO:unsorted\tGO:query".
+//   @SQ : if user supplies any, use user's alone (index .hdr was already
+//         skipped by the caller); else index's @SQ; else generated from bns.
+//   Other: all remaining lines from bns_hdr, then hdr_line, then bwa_pg.
+static void print_sam_hdr(const bntseq_t *bns, const char *bns_hdr,
+                          const char *hdr_line, FILE *fp)
+{
+    int i, n_HD = 0, n_SQ = count_SQ(hdr_line);
+    extern char *bwa_pg;
+
+    // Emit an @HD record — prefer user's, else index's, else default — and
+    // consume any leading @HD from both streams so they are not re-emitted.
+    if (hdr_line && strncmp(hdr_line, "@HD\t", 4) == 0) {
+        hdr_line = remove_line(hdr_line, n_HD == 0, fp);
+        ++n_HD;
+    }
+    if (bns_hdr && strncmp(bns_hdr, "@HD\t", 4) == 0) {
+        bns_hdr = remove_line(bns_hdr, n_HD == 0, fp);
+        ++n_HD;
+    }
     if (n_HD == 0)
         err_fputs("@HD\tVN:1.5\tSO:unsorted\tGO:query\n", fp);
-    // @SQ lines follow @HD
-    if (n_SQ == 0) {
-        for (i = 0; i < bns->n_seqs; ++i) {
-#if ORIG
-            err_printf("@SQ\tSN:%s\tLN:%d", bns->anns[i].name, bns->anns[i].len);
-            if (bns->anns[i].is_alt) err_printf("\tAH:*\n");
-            else err_fputc('\n', stdout);
-#else
-            char buf[500];
-            sprintf(buf, "@SQ\tSN:%s\tLN:%d", bns->anns[i].name, bns->anns[i].len);
-            err_fputs(buf, fp);
-            if (bns->anns[i].is_alt) {
-                sprintf(buf, "\tAH:*\n");
-                err_fputs(buf, fp);
-            } else
-                err_fputc('\n', fp);
-#endif
-        }
-    } else if (n_SQ != bns->n_seqs && bwa_verbose >= 2)
-        fprintf(stderr, "[W::%s] %d @SQ lines provided with -H; %d sequences in the index. "
-               "Continue anyway.\n", __func__, n_SQ, bns->n_seqs);
 
-    // emit the rest of hdr_line (e.g. @CO, @RG, @PG) after @SQ, but only
-    // when it did not already carry an @HD that we printed up front.
-    if (hdr_line && n_HD == 0) {
-        err_fputs(hdr_line, fp);
-        err_fputs("\n", fp);
+    // Generate @SQ from bns only when neither hdr_line nor bns_hdr supply any.
+    if (n_SQ == 0 && !has_SQ(bns_hdr)) {
+        for (i = 0; i < bns->n_seqs; ++i) {
+            char buf[512];
+            snprintf(buf, sizeof(buf), "@SQ\tSN:%s\tLN:%d",
+                     bns->anns[i].name, bns->anns[i].len);
+            err_fputs(buf, fp);
+            if (bns->anns[i].is_alt) err_fputs("\tAH:*\n", fp);
+            else                     err_fputc('\n', fp);
+        }
     }
+
+    if (n_SQ != 0 && n_SQ != bns->n_seqs && bwa_verbose >= 2)
+        fprintf(stderr, "[W::%s] %d @SQ lines provided with -H; %d sequences in the index. "
+                "Continue anyway.\n", __func__, n_SQ, bns->n_seqs);
+
+    if (bns_hdr) { err_fputs(bns_hdr, fp); err_fputc('\n', fp); }
+    if (hdr_line) { err_fputs(hdr_line, fp); err_fputc('\n', fp); }
     if (bwa_pg) err_fputs(bwa_pg, fp);
+}
+
+void bwa_print_sam_hdr(const bntseq_t *bns, const char *hdr_line, FILE *fp)
+{
+    print_sam_hdr(bns, NULL, hdr_line, fp);
+}
+
+// Load the contents of `<prefix>.hdr` if present, else `<baseprefix>.dict`
+// (where baseprefix strips a trailing .fa/.fna/.fasta, optionally .gz), into
+// a newly-allocated, newline-separated but not newline-terminated string.
+// Returns NULL if neither file exists (or is empty). Caller owns the result
+// and must free() it.
+char *bwa_load_hdr_from_index(const char *prefix)
+{
+    if (prefix == NULL) return NULL;
+
+    kstring_t path = { 0, 0, NULL };
+    ksprintf(&path, "%s.hdr", prefix);
+    FILE *fp = fopen(path.s, "r");
+    if (!fp) {
+        // Try <baseprefix>.dict: drop the ".hdr" we just appended, then drop
+        // a trailing ".gz" (if any) and the final dotted suffix inside the
+        // basename — e.g. foo.fa -> foo, foo.fasta.gz -> foo — before
+        // appending ".dict".
+        size_t l;
+        path.l -= 4; // drop ".hdr"
+        if (path.l >= 3 && strncmp(&path.s[path.l - 3], ".gz", 3) == 0)
+            path.l -= 3;
+        for (l = path.l; l > 0 && path.s[l - 1] != '/'; --l) {
+            if (path.s[l - 1] == '.') { path.l = l - 1; break; }
+        }
+        ksprintf(&path, ".dict");
+        fp = fopen(path.s, "r");
+    }
+
+    char *out = NULL;
+    if (fp) {
+        kstring_t buf = { 0, 0, NULL };
+        int c;
+        while ((c = getc(fp)) != EOF)
+            if (c != '\r') kputc(c, &buf);
+        fclose(fp);
+
+        while (buf.l > 0 && buf.s[buf.l - 1] == '\n') --buf.l;
+        if (buf.l > 0) {
+            buf.s[buf.l] = '\0';
+            out = buf.s; // transfer ownership
+        } else {
+            free(buf.s);
+        }
+    }
+
+    free(path.s);
+    return out;
+}
+
+void bwa_print_sam_hdr2(const bntseq_t *bns, const char *idx_hdr_lines,
+                        const char *hdr_line, FILE *fp)
+{
+    // If the user's -H supplies any @SQ, ignore the index .hdr/.dict content
+    // entirely — the user has taken responsibility for the @SQ block.
+    const char *bns_hdr = has_SQ(hdr_line) ? NULL : idx_hdr_lines;
+
+    if (bns_hdr) {
+        int n_SQ = count_SQ(bns_hdr);
+        if (n_SQ != 0 && n_SQ != bns->n_seqs && bwa_verbose >= 2)
+            fprintf(stderr,
+                    "[W::%s] %d @SQ lines loaded from index; %d sequences in the index. "
+                    "Continue anyway.\n", __func__, n_SQ, bns->n_seqs);
+    }
+    print_sam_hdr(bns, bns_hdr, hdr_line, fp);
 }
 
 static char *bwa_escape(char *s)

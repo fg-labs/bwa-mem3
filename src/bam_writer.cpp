@@ -26,19 +26,83 @@ void           bam_writer_free(struct bam1_t *b)  { if (b) bam_destroy1(b); }
 }
 
 bam_writer_t *bam_writer_open(const char *path, const bntseq_t *bns,
+                              const char *idx_hdr_lines,
                               const char *hdr_line, const char *bwa_pg,
                               int compression_level)
 {
     if (path == NULL || bns == NULL) return NULL;
 
+    // Detect whether the index .hdr/.dict content already supplies @SQ or
+    // @HD records. If @SQ: skip auto-generating @SQ from `bns` — adding
+    // both would hit htslib's "duplicate SN" de-dup and fail. If @HD:
+    // skip the default @HD — htslib's sam_hdr_add_lines does not de-dup
+    // @HD records, so emitting both would produce two @HD lines. The
+    // caller (fastmap.cpp) has already nulled `idx_hdr_lines` when the
+    // user's -H supplies @SQ, so if we see @SQ here, they're authoritative.
+    int idx_has_sq = 0, idx_has_hd = 0;
+    if (idx_hdr_lines != NULL && idx_hdr_lines[0] != '\0') {
+        if (strncmp(idx_hdr_lines, "@SQ\t", 4) == 0 ||
+            strstr(idx_hdr_lines, "\n@SQ\t") != NULL)
+            idx_has_sq = 1;
+        if (strncmp(idx_hdr_lines, "@HD\t", 4) == 0 ||
+            strstr(idx_hdr_lines, "\n@HD\t") != NULL)
+            idx_has_hd = 1;
+    }
+    int user_has_hd = 0;
+    if (hdr_line != NULL && hdr_line[0] != '\0') {
+        if (strncmp(hdr_line, "@HD\t", 4) == 0 ||
+            strstr(hdr_line, "\n@HD\t") != NULL)
+            user_has_hd = 1;
+    }
+
     sam_hdr_t *hdr = sam_hdr_init();
     if (hdr == NULL) return NULL;
-    if (sam_hdr_add_line(hdr, "HD", "VN", "1.6", "SO", "unsorted", NULL) < 0) goto fail;
-    for (int i = 0; i < bns->n_seqs; ++i) {
-        char len_buf[32];
-        snprintf(len_buf, sizeof(len_buf), "%lld", (long long)bns->anns[i].len);
-        if (sam_hdr_add_line(hdr, "SQ", "SN", bns->anns[i].name, "LN", len_buf, NULL) < 0)
-            goto fail;
+    // Emit a default @HD only when neither the user's -H nor the index's
+    // .hdr/.dict supplies one. Precedence (user > index > default) is
+    // enforced by ordering: we add idx_hdr_lines before hdr_line, and the
+    // SAM text path uses the same precedence via bwa_print_sam_hdr2.
+    if (!idx_has_hd && !user_has_hd &&
+        sam_hdr_add_line(hdr, "HD", "VN", "1.6", "SO", "unsorted", NULL) < 0) goto fail;
+    if (!idx_has_sq) {
+        for (int i = 0; i < bns->n_seqs; ++i) {
+            char len_buf[32];
+            snprintf(len_buf, sizeof(len_buf), "%lld", (long long)bns->anns[i].len);
+            if (sam_hdr_add_line(hdr, "SQ", "SN", bns->anns[i].name, "LN", len_buf, NULL) < 0)
+                goto fail;
+        }
+    }
+    // Merge the index's .hdr/.dict records after the default @HD (and
+    // auto-generated @SQ, when the index didn't supply its own) but before
+    // the user's -H lines. If the user has an @HD in -H, strip the @HD
+    // records from idx_hdr_lines first — htslib's sam_hdr_add_lines does
+    // not de-dup @HD, so without filtering we'd emit two @HD records. This
+    // matches the SAM text path's precedence: user > index > default.
+    if (idx_hdr_lines != NULL && idx_hdr_lines[0] != '\0') {
+        const char *to_add = idx_hdr_lines;
+        char *filtered = NULL;
+        if (user_has_hd && idx_has_hd) {
+            // Copy idx_hdr_lines, dropping any @HD records.
+            size_t n = strlen(idx_hdr_lines);
+            filtered = (char *)malloc(n + 1);
+            if (filtered == NULL) goto fail;
+            size_t w = 0;
+            const char *p = idx_hdr_lines;
+            while (*p) {
+                const char *eol = strchr(p, '\n');
+                size_t len = eol ? (size_t)(eol - p) : strlen(p);
+                int is_hd = (len >= 4 && strncmp(p, "@HD\t", 4) == 0);
+                if (!is_hd && len > 0) {
+                    memcpy(filtered + w, p, len); w += len;
+                    filtered[w++] = '\n';
+                }
+                p = eol ? eol + 1 : p + len;
+            }
+            filtered[w] = '\0';
+            to_add = filtered;
+        }
+        int rc = (to_add[0] != '\0') ? sam_hdr_add_lines(hdr, to_add, 0) : 0;
+        free(filtered);
+        if (rc < 0) goto fail;
     }
     if (hdr_line != NULL && hdr_line[0] != '\0' && sam_hdr_add_lines(hdr, hdr_line, 0) < 0)
         goto fail;

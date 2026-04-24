@@ -1280,12 +1280,19 @@ int main_mem(int argc, char *argv[])
         }
     }
 
+    /* Look up optional per-index header records (<prefix>.hdr or
+     * <baseprefix>.dict) once and route them into both output paths. The
+     * SAM text path merges these with user -H per lh3/bwa#348 precedence;
+     * the --bam path forwards them to htslib's sam_hdr_add_lines so the
+     * rich @SQ (AS/M5/SP/AH/…) also makes it into the BAM header. */
+    char *idx_hdr_lines = bwa_load_hdr_from_index(ref_prefix);
+
     /* Output path:
      *  - --meth: open meth_bam_writer with strand-consolidated SQ headers.
      *    Honors -o/-f (target path) or stdout ("-").
      *  - --bam (no --meth): open generic bam_writer; htslib writes its own
      *    @HD + @SQ + @PG header. Honors -o/-f or stdout.
-     *  - SAM text: open -o/-f path (if any) as a FILE*; bwa_print_sam_hdr. */
+     *  - SAM text: open -o/-f path (if any) as a FILE*; bwa_print_sam_hdr2. */
     bam_writer_t *bam_writer = NULL;
     if (opt->meth_mode) {
         g_meth_cmap = meth_chrom_map_build_from_bns(aux.fmi->idx->bns);
@@ -1309,7 +1316,16 @@ int main_mem(int argc, char *argv[])
     } else if (opt->bam_mode) {
         const char *bam_path = is_o ? out_path : "-";
         extern char *bwa_pg;
-        bam_writer = bam_writer_open(bam_path, aux.fmi->idx->bns, hdr_line,
+        /* Suppress idx .hdr/.dict records entirely when the user's -H
+         * supplies any @SQ, matching bwa_print_sam_hdr2's SAM precedence. */
+        const char *bam_idx_hdr = idx_hdr_lines;
+        if (hdr_line != NULL) {
+            if (strncmp(hdr_line, "@SQ\t", 4) == 0 ||
+                strstr(hdr_line, "\n@SQ\t") != NULL)
+                bam_idx_hdr = NULL;
+        }
+        bam_writer = bam_writer_open(bam_path, aux.fmi->idx->bns,
+                                     bam_idx_hdr, hdr_line,
                                      bwa_pg, opt->bam_level);
         if (bam_writer == NULL) {
             fprintf(stderr, "ERROR: failed to open BAM writer at '%s'\n", bam_path);
@@ -1330,7 +1346,7 @@ int main_mem(int argc, char *argv[])
             }
             out_opened = true;
         }
-        bwa_print_sam_hdr(aux.fmi->idx->bns, hdr_line, aux.fp);
+        bwa_print_sam_hdr2(aux.fmi->idx->bns, idx_hdr_lines, hdr_line, aux.fp);
     }
 
     if (fixed_chunk_size > 0)
@@ -1355,6 +1371,7 @@ int main_mem(int argc, char *argv[])
     int32_t nt = aux.opt->n_threads;
     _mm_free(ref_string);
     free(hdr_line);
+    free(idx_hdr_lines);
     free(opt);
     kseq_destroy(aux.ks);
     err_gzclose(fp); kclose(ko);
