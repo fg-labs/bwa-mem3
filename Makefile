@@ -221,7 +221,7 @@ else
 	$(MAKE) arch=avx2   EXE=bwa-mem2.avx2     CXX=$(CXX) all
 	rm -f src/*.o $(BWA_LIB); cd ext/safestringlib/ && $(MAKE) clean;
 	$(MAKE) arch=avx512bw EXE=bwa-mem2.avx512bw CXX=$(CXX) all
-	$(CXX) -Wall -O3 src/runsimd.cpp -Iext/safestringlib/include -Lext/safestringlib/ -lsafestring $(STATIC_GCC) -o bwa-mem2
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) -Wall -O3 src/runsimd.cpp -Iext/safestringlib/include -Lext/safestringlib/ -lsafestring $(STATIC_GCC) -o bwa-mem2
 endif
 
 # ARM64/Apple Silicon build target - single binary, no multi-binary launcher needed
@@ -232,12 +232,12 @@ arm64:
 
 
 $(EXE):$(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) $(if $(filter 1,$(USE_MIMALLOC)),$(MIMALLOC_LIB)) src/main.o
-	$(CXX) $(CXXFLAGS) $(LDFLAGS) src/main.o $(BWA_LIB) $(LIBS) $(MIMALLOC_LDFLAGS) -o $@
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) src/main.o $(BWA_LIB) $(LIBS) $(MIMALLOC_LDFLAGS) -o $@
 
 # kswv self-consistency test: batched SIMD kswv vs scalar ksw_align2 reference.
 # Built by the proto-neon-kswv CI workflow; runnable standalone.
 kswv_selftest: $(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) test/kswv_selftest.o
-	$(CXX) $(CXXFLAGS) $(LDFLAGS) test/kswv_selftest.o $(BWA_LIB) $(LIBS) -o $@
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/kswv_selftest.o $(BWA_LIB) $(LIBS) -o $@
 
 # Run the in-tree tests. Currently just kswv_selftest; extend as more land.
 test: kswv_selftest
@@ -299,13 +299,13 @@ PGO_PROFILE_DIR=pgo_profiles
 
 pgo-generate:
 	rm -f src/*.o $(BWA_LIB); cd ext/safestringlib/ && $(MAKE) clean;
-	$(MAKE) arch=arm64 EXE=bwa-mem2.pgo-instr CXXFLAGS="-g -O3 -fpermissive $(ARCH_FLAGS) -fprofile-generate=$(PGO_PROFILE_DIR)" CXX=$(CXX) all
+	$(MAKE) arch=arm64 EXE=bwa-mem2.pgo-instr CXXFLAGS="$(CXXFLAGS) -g -O3 -fpermissive $(ARCH_FLAGS) -fprofile-generate=$(PGO_PROFILE_DIR)" CXX=$(CXX) all
 	@echo "PGO instrumented binary built. Run training workload with bwa-mem2.pgo-instr"
 	@echo "Then run: make pgo-use"
 
 pgo-use:
 	rm -f src/*.o $(BWA_LIB); cd ext/safestringlib/ && $(MAKE) clean;
-	$(MAKE) arch=arm64 EXE=bwa-mem2.pgo CXXFLAGS="-g -O3 -fpermissive $(ARCH_FLAGS) -fprofile-use=$(PGO_PROFILE_DIR) -fprofile-correction" CXX=$(CXX) all
+	$(MAKE) arch=arm64 EXE=bwa-mem2.pgo CXXFLAGS="$(CXXFLAGS) -g -O3 -fpermissive $(ARCH_FLAGS) -fprofile-use=$(PGO_PROFILE_DIR) -fprofile-correction" CXX=$(CXX) all
 	@echo "PGO optimized binary built: bwa-mem2.pgo"
 
 pgo-clean:
