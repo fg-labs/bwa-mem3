@@ -57,6 +57,15 @@ FRAMEWORK_DIR   := framework
 INTEGRATION_DIR := integration
 UNIT_DIR        := unit
 
+# ARCH_FLAGS_FROM_PARENT: propagated from the parent Makefile's
+# `test-binaries` target so the test build sees the same __AVX2__ /
+# __AVX512BW__ / APPLE_SILICON macros as libbwa.a. Required for the
+# BWA_TESTS_HAVE_KSWV macro in kswv_runner.h to evaluate consistently
+# between libbwa.a and the test binary.
+ifneq ($(ARCH_FLAGS_FROM_PARENT),)
+    CXXFLAGS += $(ARCH_FLAGS_FROM_PARENT)
+endif
+
 # COVERAGE=1 augments CXXFLAGS/LDFLAGS with --coverage and overrides -O2 with
 # -O0 so gcov line numbers correspond 1:1 with source. Consumed by the CI
 # `coverage` job. Matches the parent Makefile's coverage plumbing.
@@ -164,26 +173,32 @@ libsais-objs:
 
 $(EXE): | libsais-objs
 
+# NB: $(LDFLAGS) is threaded through every link rule below so COVERAGE=1
+# (which appends --coverage to LDFLAGS at the top of the file) propagates
+# uniformly. Without it, `make -C test all COVERAGE=1` would leave the
+# legacy binaries with unresolved __gcov_* symbols even though the .o
+# files were compiled with --coverage. CI doesn't rebuild these targets
+# under coverage, but local-dev `make all` did.
 fmi_test: $(INTEGRATION_DIR)/fmi_test.o
-	$(CXX) -o $@ $^ $(LIBS)
+	$(CXX) $(LDFLAGS) -o $@ $^ $(LIBS)
 
 smem2_test: $(INTEGRATION_DIR)/smem2_test.o
-	$(CXX) -o $@ $^ $(LIBS)
+	$(CXX) $(LDFLAGS) -o $@ $^ $(LIBS)
 
 sa2ref_test: $(INTEGRATION_DIR)/sa2ref_test.o
-	$(CXX) -o $@ $^ $(LIBS)
+	$(CXX) $(LDFLAGS) -o $@ $^ $(LIBS)
 
 bwt_seed_strategy_test: $(INTEGRATION_DIR)/bwt_seed_strategy_test.o
-	$(CXX) -o $@ $^ $(LIBS)
+	$(CXX) $(LDFLAGS) -o $@ $^ $(LIBS)
 
 xeonbsw: $(INTEGRATION_DIR)/main_banded.o
-	$(CXX) -o $@ $^ $(LIBS)
+	$(CXX) $(LDFLAGS) -o $@ $^ $(LIBS)
 
 smem_lockstep_parity_test: smem_lockstep_parity_test.o
-	$(CXX) -o $@ $^ $(LIBS)
+	$(CXX) $(LDFLAGS) -o $@ $^ $(LIBS)
 
 header_insert_test: header_insert_test.o
-	$(CXX) -o $@ $^ $(LIBS)
+	$(CXX) $(LDFLAGS) -o $@ $^ $(LIBS)
 
 # Build test-local copies of packed_text.cpp / system.cpp into test/
 # rather than ../src/. The parent build's CXXFLAGS (`-O3 -fpermissive`,

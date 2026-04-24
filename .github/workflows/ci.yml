@@ -84,9 +84,35 @@ jobs:
         run: ./bwa-mem2 version
 
       - name: Build doctest framework and unit binary
-        run: make -C test framework unit
+        # Invoke via the parent `test-binaries` target so ARCH_FLAGS
+        # propagate from libbwa.a's build into the test CXXFLAGS. Ensures
+        # BWA_TESTS_HAVE_KSWV in kswv_runner.h evaluates consistently
+        # between libbwa.a and the test binary (notably: sse41 row has
+        # no kswv::getScores8 symbol, so tests must be compiled out).
+        # For arch_flag="" (ARM/Apple Silicon), the parent build
+        # auto-selects ARM ARCH_FLAGS via IS_ARM.
+        # NOTE: arch_flag="multi" is intentionally excluded here. The
+        # `multi` target leaves libbwa.a in its final avx512bw state, so
+        # the only ARCH_FLAGS_FROM_PARENT value that keeps libbwa.a and
+        # the test TU consistent is `-mavx512f -mavx512bw`. But GitHub's
+        # ubuntu-latest runners do not all expose AVX-512 at runtime, so
+        # a test binary built with `-mavx512bw` SIGILLs on first
+        # AVX-512 instruction (compilers freely emit AVX-512 in any TU
+        # once the flag is set). The `multi` row's purpose is to
+        # validate that `make multi`'s per-arch sub-builds + dispatcher
+        # link cleanly; doctest coverage is already provided by the
+        # sse41/avx2 rows. So we skip framework + unit/integration
+        # build and execution on this row.
+        if: matrix.arch_flag != 'multi'
+        run: |
+          if [ "${{ matrix.arch_flag }}" = "" ]; then
+            make test-binaries CXX=${{ matrix.cxx || 'g++' }}
+          else
+            make test-binaries arch=${{ matrix.arch_flag }} CXX=${{ matrix.cxx || 'g++' }}
+          fi
 
       - name: Run unit tests (all rows)
+        if: matrix.arch_flag != 'multi'
         env:
           BWA_MEM2_TEST_MATRIX_ROW: ${{ matrix.name }}
         # `--reporters=junit --out=…` writes JUnit XML to the file and
@@ -101,18 +127,14 @@ jobs:
           || { cat unit-results-${{ strategy.job-index }}.xml; exit 1; }
 
       - name: Upload unit-test results
-        if: always()
+        if: always() && matrix.arch_flag != 'multi'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: unit-results-${{ matrix.name }}
           path: unit-results-*.xml
 
-      - name: Build doctest integration binary
-        if: matrix.run_integration == true
-        run: make -C test integration
-
       - name: Run integration tests
-        if: matrix.run_integration == true
+        if: matrix.run_integration == true && matrix.arch_flag != 'multi'
         env:
           BWA_MEM2_TEST_MATRIX_ROW: ${{ matrix.name }}
         # See unit-test step above for the cat-on-failure rationale.
@@ -123,7 +145,7 @@ jobs:
           || { cat integration-results-${{ strategy.job-index }}.xml; exit 1; }
 
       - name: Upload integration-test results
-        if: always() && matrix.run_integration == true
+        if: always() && matrix.run_integration == true && matrix.arch_flag != 'multi'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: integration-results-${{ matrix.name }}
@@ -332,10 +354,15 @@ jobs:
         # gcovr walks the tree, runs gcov on each .gcda, and emits a
         # single Cobertura XML that Codecov can consume directly. Limit
         # to src/ and test/ (skip vendored htslib / mimalloc / etc.).
+        # `--filter` patterns are regular expressions matched against
+        # paths relative to `--root` and are NOT implicitly anchored, so
+        # prefix each with `^` to scope them to the project root and
+        # cleanly exclude anything under ext/ that happens to share a
+        # subpath (e.g. ext/htslib/test/).
         run: |
           gcovr --root . \
-                --filter 'src/' --filter 'test/framework/' \
-                --filter 'test/unit/' --filter 'test/integration/' \
+                --filter '^src/' --filter '^test/framework/' \
+                --filter '^test/unit/' --filter '^test/integration/' \
                 --print-summary \
                 --xml coverage.xml
 

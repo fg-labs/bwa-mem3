@@ -1,6 +1,8 @@
 // test/framework/kswv_runner.cpp
 #include "kswv_runner.h"
 
+#if BWA_TESTS_HAVE_KSWV
+
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
@@ -20,6 +22,14 @@ std::vector<kswr_t> run_kswv_batch(const std::vector<TestPair> &pairs,
         // match score so the batched runner agrees with run_scalar_ksw
         // when tests use non-unit match matrices.
         xtra_flags = default_xtra_flags(static_cast<int>(mat[0]));
+    }
+
+    // Short-circuit for an empty pair set so we never construct kswv with
+    // maxRefLen=maxQerLen=0 (the SIMD inner kernel's allocation/loop
+    // bounds are not validated for n==0). Current callers don't hit this,
+    // but defensive: future tests that build pair sets dynamically might.
+    if (pairs.empty()) {
+        return {};
     }
 
     BatchBuffers bb(pairs, xtra_flags);
@@ -48,8 +58,7 @@ std::vector<kswr_t> run_kswv_batch(const std::vector<TestPair> &pairs,
     pwsw->getScores8(bb.pairs(), bb.ref_buf(), bb.qer_buf(),
                      bb.aln(), bb.n(), 1, 0);
 
-    if (const char *dbg = std::getenv("BWA_TESTS_DEBUG_PHASE0")) {
-        (void)dbg;
+    if (std::getenv("BWA_TESTS_DEBUG_PHASE0")) {
         int nprint = (bb.n() < 5) ? bb.n() : 5;
         for (int i = 0; i < nprint; i++) {
             kswr_t r = bb.aln()[i];
@@ -95,3 +104,5 @@ std::vector<kswr_t> run_kswv_batch(const std::vector<TestPair> &pairs,
 }
 
 } // namespace bwa_tests
+
+#endif // BWA_TESTS_HAVE_KSWV

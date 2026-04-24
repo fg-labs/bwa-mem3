@@ -18,6 +18,8 @@
 #include "scoring.h"
 #include "seqpair_gen.h"
 
+#if BWA_TESTS_HAVE_KSWV
+
 namespace {
 
 // Edge-case pair builder. Deterministic given seed.
@@ -127,3 +129,5 @@ TEST_CASE("kswv handles every curated edge case identically to scalar"
     SUBCASE("sub cluster len 10")   { check_pair_parity(bwa_tests::gen_sub_cluster_pair(rng, 100, 150, 40, 10)); }
     SUBCASE("20% N bases")          { check_pair_parity(bwa_tests::gen_with_n_bases_pair(rng, 100, 150, 20)); }
 }
+
+#endif // BWA_TESTS_HAVE_KSWV

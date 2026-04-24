@@ -323,11 +323,24 @@ $(EXE):$(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) $(if $(filter 1,$(U
 kswv_nrow_zero_test: $(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) test/kswv_nrow_zero_test.o
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) test/kswv_nrow_zero_test.o $(BWA_LIB) $(LIBS) -o $@
 
+# Build the test binaries with the same ARCH_FLAGS as libbwa.a so the
+# test binary's kswv.h preprocessor state (SIMD_WIDTH8, BWA_TESTS_HAVE_KSWV)
+# matches what libbwa.a was compiled with. Consumed by ci.yml so that e.g.
+# the sse41 matrix row builds test/framework with -msse4.1 only (matching
+# libbwa.a, which then lacks kswv::getScores8 — the BWA_TESTS_HAVE_KSWV
+# macro guards the test away).
+.PHONY: test-binaries
+test-binaries: $(BWA_LIB)
+	$(MAKE) -C test framework unit integration \
+	    CXX=$(CXX) \
+	    COVERAGE=$(COVERAGE) \
+	    ARCH_FLAGS_FROM_PARENT='$(ARCH_FLAGS)'
+
 # Run the in-tree tests via the unit-test harness in test/, plus the
 # standalone kswv_nrow_zero_test regression.
-test: kswv_nrow_zero_test
-	$(MAKE) -C test framework unit
+test: test-binaries kswv_nrow_zero_test
 	./test/bwa_mem2_tests_unit
+	./test/bwa_mem2_tests_integration
 	./kswv_nrow_zero_test
 
 test/kswv_nrow_zero_test.o: test/kswv_nrow_zero_test.cpp
