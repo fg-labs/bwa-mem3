@@ -126,6 +126,13 @@ endif
 
 MEM_FLAGS=	-DSAIS=1
 CPPFLAGS+=	-DENABLE_PREFETCH -DV17=1 -DMATE_SORT=0 $(MEM_FLAGS)
+
+# Version string for `bwa-mem2 version` and the @PG VN: field. Prefer
+# `git describe` (e.g. v2.3-30-g61813ef, with -dirty suffix for modified
+# trees) so the stamped version always reflects the actual build. Fall
+# back to a static tag for source-tarball / shallow-clone builds.
+FG_LABS_VERSION_FALLBACK := 2.3-fg-labs
+VERSION_STRING := $(shell git describe --tags --dirty 2>/dev/null || echo $(FG_LABS_VERSION_FALLBACK))
 INCLUDES+=   -Isrc -Iext/safestringlib/include -Iext/htslib
 ifeq ($(USE_MIMALLOC),1)
     INCLUDES += -Iext/mimalloc/include
@@ -211,13 +218,25 @@ ifneq ($(strip $(DISABLE_BATCHED_MATESW)),)
     CPPFLAGS += -DDISABLE_BATCHED_MATESW=$(DISABLE_BATCHED_MATESW)
 endif
 
-.PHONY:all clean depend multi print-mimalloc-config kswv_selftest kswv_nrow_zero_test test
+.PHONY:all clean depend multi print-mimalloc-config kswv_selftest kswv_nrow_zero_test test FORCE
 .SUFFIXES:.cpp .o
 
 .cpp.o:
 	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $< -o $@
 
 all:$(EXE)
+
+# Regenerate src/version.h on every invocation, but only touch the file
+# (and thus trigger a main.o rebuild) when the string actually changed.
+# Must be declared after `all:$(EXE)` so FORCE is never picked as the
+# default goal when the caller supplies `arch=...` (which skips the
+# `myall:` dispatch branch).
+FORCE:
+src/version.h: FORCE
+	@printf '#ifndef BWA_MEM2_VERSION_H\n#define BWA_MEM2_VERSION_H\n#define PACKAGE_VERSION "%s"\n#endif\n' '$(VERSION_STRING)' > $@.tmp
+	@if ! cmp -s $@.tmp $@ 2>/dev/null; then mv $@.tmp $@; else rm -f $@.tmp; fi
+
+src/main.o: src/version.h
 
 multi: $(if $(filter 1,$(USE_MIMALLOC)),$(MIMALLOC_LIB))
 ifneq ($(IS_ARM),)
@@ -314,7 +333,7 @@ $(MIMALLOC_LIB):
 	cd $(MIMALLOC_BUILD) && cmake $(MIMALLOC_CMAKE_FLAGS) .. && $(MAKE)
 
 clean:
-	rm -fr src/*.o test/*.o $(BWA_LIB) $(EXE) kswv_selftest kswv_nrow_zero_test bwa-mem2.sse41 bwa-mem2.sse42 bwa-mem2.avx bwa-mem2.avx2 bwa-mem2.avx512bw bwa-mem2.arm64
+	rm -fr src/*.o src/version.h test/*.o $(BWA_LIB) $(EXE) kswv_selftest kswv_nrow_zero_test bwa-mem2.sse41 bwa-mem2.sse42 bwa-mem2.avx bwa-mem2.avx2 bwa-mem2.avx512bw bwa-mem2.arm64
 	cd ext/safestringlib/ && $(MAKE) clean
 	-[ -f ext/htslib/config.mk ] && cd ext/htslib && $(MAKE) distclean
 	rm -rf $(MIMALLOC_BUILD)
