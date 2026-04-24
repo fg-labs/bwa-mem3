@@ -44,9 +44,20 @@ jobs:
           submodules: recursive
 
       - name: Install apt dependencies
-        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev samtools
+        uses: awalsh128/cache-apt-pkgs-action@acb598e5ddbc6f68a970c5da0688d2f3a9f04d05 # v1.6.0
+        with:
+          packages: zlib1g-dev samtools
+          version: 1.0
+
+      - name: Cache dwgsim binary
+        id: cache-dwgsim
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: /tmp/dwgsim-src/dwgsim
+          key: dwgsim-${{ runner.os }}-${{ runner.arch }}-${{ env.DWGSIM_REF }}
 
       - name: Build dwgsim
+        if: steps.cache-dwgsim.outputs.cache-hit != 'true'
         run: |
           git clone https://github.com/nh13/DWGSIM.git /tmp/dwgsim-src
           git -C /tmp/dwgsim-src checkout --detach "$DWGSIM_REF"
@@ -72,14 +83,36 @@ jobs:
           fi
           gunzip /tmp/ci-ref/chr17.fa.gz
 
+      # Cache key ties built binaries to any source or build-config change
+      # under src/, ext/, or the parent Makefile. Submodule updates bump
+      # the hash because the checked-out submodule trees are hashed.
+      - name: Cache port build artifacts
+        id: cache-port
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            bwa-mem2.port
+            libbwa.port.a
+          key: arm-port-${{ hashFiles('src/**', 'ext/**', 'Makefile') }}
+
       - name: Build port (gates widened; no-op on this branch until the port lands)
+        if: steps.cache-port.outputs.cache-hit != 'true'
         run: |
           make clean
           make -j"$(nproc)" CXX=g++
           mv bwa-mem2.arm64 bwa-mem2.port
           cp libbwa.a libbwa.port.a
 
+      - name: Cache control build artifacts
+        id: cache-control
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            bwa-mem2.control
+          key: arm-control-${{ hashFiles('src/**', 'ext/**', 'Makefile') }}
+
       - name: Build control (DISABLE_BATCHED_MATESW=1)
+        if: steps.cache-control.outputs.cache-hit != 'true'
         run: |
           make clean
           make -j"$(nproc)" DISABLE_BATCHED_MATESW=1 CXX=g++
@@ -117,7 +150,20 @@ jobs:
         if: steps.cache-chr17-index.outputs.cache-hit != 'true'
         run: ./bwa-mem2.port index /tmp/ci-ref/chr17.fa
 
+      # Simulated reads are deterministic given seed + dwgsim version +
+      # reference + params. Cache by those so CI reruns skip the ~55s
+      # dwgsim invocation.
+      - name: Cache simulated reads
+        id: cache-reads
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            /tmp/ci-reads/reads.bwa.read1.fastq.gz
+            /tmp/ci-reads/reads.bwa.read2.fastq.gz
+          key: reads-chr17-${{ env.CHR17_SHA256 }}-dwgsim-${{ env.DWGSIM_REF }}-N${{ env.N_PAIRS }}-z42-100bp-e0.01-r0.001
+
       - name: Simulate dwgsim reads
+        if: steps.cache-reads.outputs.cache-hit != 'true'
         run: |
           mkdir -p /tmp/ci-reads
           /tmp/dwgsim-src/dwgsim \
@@ -206,7 +252,10 @@ jobs:
           submodules: recursive
 
       - name: Install apt dependencies
-        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev samtools
+        uses: awalsh128/cache-apt-pkgs-action@acb598e5ddbc6f68a970c5da0688d2f3a9f04d05 # v1.6.0
+        with:
+          packages: zlib1g-dev samtools
+          version: 1.0
 
       - name: Check AVX-512 availability
         run: |
@@ -224,7 +273,15 @@ jobs:
             echo "USE_AVX=avx512" >> "$GITHUB_ENV"
           fi
 
+      - name: Cache dwgsim binary
+        id: cache-dwgsim
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: /tmp/dwgsim-src/dwgsim
+          key: dwgsim-${{ runner.os }}-${{ runner.arch }}-${{ env.DWGSIM_REF }}
+
       - name: Build dwgsim
+        if: steps.cache-dwgsim.outputs.cache-hit != 'true'
         run: |
           git clone https://github.com/nh13/DWGSIM.git /tmp/dwgsim-src
           git -C /tmp/dwgsim-src checkout --detach "$DWGSIM_REF"
@@ -250,13 +307,35 @@ jobs:
           fi
           gunzip /tmp/ci-ref/chr17.fa.gz
 
+      # Cache key ties built binaries to source / build-config changes.
+      # USE_AVX is part of the key because port/control are built with
+      # either avx2 or avx512 flags depending on runner CPU detection.
+      - name: Cache x86 port build artifacts
+        id: cache-x86-port
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            bwa-mem2.port
+            libbwa.port.a
+          key: x86-port-${{ env.USE_AVX }}-${{ hashFiles('src/**', 'ext/**', 'Makefile') }}
+
       - name: Build x86 port (batched mate-rescue enabled)
+        if: steps.cache-x86-port.outputs.cache-hit != 'true'
         run: |
           make -j"$(nproc)" arch="$USE_AVX" CXX=g++
           mv bwa-mem2 bwa-mem2.port 2>/dev/null || true
           cp libbwa.a libbwa.port.a
 
+      - name: Cache x86 control build artifacts
+        id: cache-x86-control
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            bwa-mem2.control
+          key: x86-control-${{ env.USE_AVX }}-${{ hashFiles('src/**', 'ext/**', 'Makefile') }}
+
       - name: Build x86 control (DISABLE_BATCHED_MATESW=1)
+        if: steps.cache-x86-control.outputs.cache-hit != 'true'
         run: |
           make clean
           make -j"$(nproc)" arch="$USE_AVX" DISABLE_BATCHED_MATESW=1 CXX=g++
@@ -275,11 +354,36 @@ jobs:
         # on both paths — AVX2 from PR 20, AVX-512BW by this PR.
         run: ./kswv_selftest
 
+      - name: Cache chr17 bwa-mem2 index (x86)
+        id: cache-x86-chr17-index
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            /tmp/ci-ref/chr17.fa.0123
+            /tmp/ci-ref/chr17.fa.amb
+            /tmp/ci-ref/chr17.fa.ann
+            /tmp/ci-ref/chr17.fa.bwt.2bit.64
+            /tmp/ci-ref/chr17.fa.pac
+          key: chr17-bwamem2-index-${{ env.CHR17_SHA256 }}
+
       - name: Index chr17
         # Use the port binary for indexing (indexing code is arch-agnostic).
+        if: steps.cache-x86-chr17-index.outputs.cache-hit != 'true'
         run: ./bwa-mem2.port index /tmp/ci-ref/chr17.fa
 
+      # Simulated reads cached across both ARM and x86 jobs — same seed,
+      # dwgsim version, reference, and params.
+      - name: Cache simulated reads (x86)
+        id: cache-x86-reads
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            /tmp/ci-reads/reads.bwa.read1.fastq.gz
+            /tmp/ci-reads/reads.bwa.read2.fastq.gz
+          key: reads-chr17-${{ env.CHR17_SHA256 }}-dwgsim-${{ env.DWGSIM_REF }}-N${{ env.N_PAIRS }}-z42-100bp-e0.01-r0.001
+
       - name: Simulate dwgsim reads (same params as ARM job)
+        if: steps.cache-x86-reads.outputs.cache-hit != 'true'
         run: |
           mkdir -p /tmp/ci-reads
           /tmp/dwgsim-src/dwgsim \
