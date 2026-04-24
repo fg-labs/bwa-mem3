@@ -29,7 +29,7 @@
 ##*****************************************************************************************/
 
 
-EXE=		fmi_test smem2_test bwt_seed_strategy_test sa2ref_test xeonbsw smem_lockstep_parity_test
+EXE=		fmi_test smem2_test bwt_seed_strategy_test sa2ref_test xeonbsw smem_lockstep_parity_test header_insert_test
 
 # Match the parent Makefile's compiler + flag selection. Detect ARM
 # (Apple Silicon arm64 and Linux aarch64) and wire in OpenMP, sse2neon
@@ -101,6 +101,9 @@ xeonbsw:main_banded.o
 smem_lockstep_parity_test: smem_lockstep_parity_test.o
 	$(CXX) -o $@ $^ $(LIBS)
 
+header_insert_test:header_insert_test.o
+	$(CXX) -o $@ $^ $(LIBS)
+
 clean:
 	rm -fr *.o $(EXE)
 
@@ -118,3 +121,4 @@ smem2_test.o: ../src/FMI_search.h ../src/bntseq.h ../src/read_index_ele.h
 smem2_test.o: ../src/bwa.h ../src/bwt.h ../src/utils.h ../src/macro.h
 smem_lockstep_parity_test.o: ../src/FMI_search.h ../src/bntseq.h ../src/read_index_ele.h
 smem_lockstep_parity_test.o: ../src/bwa.h ../src/bwt.h ../src/utils.h ../src/macro.h
+header_insert_test.o: ../src/bwa.h
