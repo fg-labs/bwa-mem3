@@ -861,6 +861,12 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "                 flag alignments to the matching strand ('f' or 'r') as QC-fail (0x200)\n");
     fprintf(stderr, "   --do-not-penalize-chimeras\n");
     fprintf(stderr, "                 disable the longest-match <44%% chimera heuristic (no 0x200 / MAPQ cap)\n");
+    fprintf(stderr, "Supplementary MAPQ rescoring (fg-labs extension):\n");
+    fprintf(stderr, "   --supp-rep-hard-cap INT\n");
+    fprintf(stderr, "                 force MAPQ=0 for supplementary alignments whose chain contains any seed\n");
+    fprintf(stderr, "                 with >=INT genome occurrences (i.e. the supp region is repetitive on its\n");
+    fprintf(stderr, "                 own). 0 disables (default). Typical values 5-20; lower = more aggressive.\n");
+    fprintf(stderr, "                 Primary MAPQ is unaffected.\n");
     fprintf(stderr, "Note: Please read the man page for detailed description of the command line and options.\n");
 }
 
@@ -904,12 +910,14 @@ int main_mem(int argc, char *argv[])
         OPT_METH,
         OPT_METH_SET_AS_FAILED,
         OPT_METH_NO_CHIMERA,
+        OPT_SUPP_REP_HARD_CAP,
     };
     static struct option long_opts[] = {
         {"bam",                      optional_argument, 0, OPT_BAM},
         {"meth",                     no_argument,       0, OPT_METH},
         {"set-as-failed",            required_argument, 0, OPT_METH_SET_AS_FAILED},
         {"do-not-penalize-chimeras", no_argument,       0, OPT_METH_NO_CHIMERA},
+        {"supp-rep-hard-cap",        required_argument, 0, OPT_SUPP_REP_HARD_CAP},
         {0, 0, 0, 0}
     };
     while ((c = getopt_long(argc, argv, "51qpaMCSPVYjuk:c:v:s:r:t:R:A:B:O:E:U:w:L:d:T:Q:D:m:I:N:W:x:G:h:y:K:X:H:o:f:z:",
@@ -1049,6 +1057,19 @@ int main_mem(int argc, char *argv[])
         }
         else if (c == OPT_METH_NO_CHIMERA) {
             opt->meth_no_chim = 1;
+        }
+        else if (c == OPT_SUPP_REP_HARD_CAP) {
+            char *end = NULL;
+            errno = 0;
+            long v = strtol(optarg, &end, 10);
+            if (end == optarg || end == NULL || *end != '\0' ||
+                errno == ERANGE || v < 0 || v > INT_MAX) {
+                fprintf(stderr, "ERROR: --supp-rep-hard-cap requires a non-negative integer\n");
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+            opt->supp_rep_hard_cap = (int)v;
         }
         else if (c == 'I')
         {

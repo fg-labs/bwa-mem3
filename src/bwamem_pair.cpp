@@ -217,17 +217,18 @@ int mem_matesw(const mem_opt_t *opt, const bntseq_t *bns,
             if (aln.score >= opt->min_seed_len && aln.qb >= 0) { // something goes wrong if aln.qb < 0
                 b.rid = a->rid;
                 b.is_alt = a->is_alt;
-                b.qb = is_rev? l_ms - (aln.qe + 1) : aln.qb;                                                                                                                                                                              
-                b.qe = is_rev? l_ms - aln.qb : aln.qe + 1; 
+                b.qb = is_rev? l_ms - (aln.qe + 1) : aln.qb;
+                b.qe = is_rev? l_ms - aln.qb : aln.qe + 1;
                 b.rb = is_rev? (l_pac<<1) - (rb + aln.te + 1) : rb + aln.tb;
                 b.re = is_rev? (l_pac<<1) - (rb + aln.tb) : rb + aln.te + 1;
                 b.score = aln.score;
                 b.csub = aln.score2;
                 b.secondary = -1;
                 b.seedcov = (b.re - b.rb < b.qe - b.qb? b.re - b.rb : b.qe - b.qb) >> 1;
+                b.chain_n_hits = 1; // mate-rescue has no SMEM evidence; treat as unique anchor
 
                 kv_push(mem_alnreg_t, *ma, b); // make room for a new element
-                
+
                 #if !MATE_SORT
                 // move b s.t. ma is sorted
                 for (i = 0; i < ma->n - 1; ++i) // find the insertion point
@@ -564,6 +565,8 @@ int mem_sam_pe(const mem_opt_t *opt, const bntseq_t *bns,
                 g[i].flag |= 0x800 | 0x40<<i | extra_flag;
                 g[i].XA = XA[i]? XA[i][n_pri[i]] : 0;
                 g[i].HN = HN[i]? HN[i][n_pri[i]] : -1;
+                if (opt->supp_rep_hard_cap > 0 && p->chain_n_hits >= opt->supp_rep_hard_cap)
+                    g[i].mapq = 0; // fg-labs: force repetitive-supp MAPQ to 0
                 aa[i][n_aa[i]++] = g[i];
             }
         }
@@ -961,6 +964,8 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                 g[i].flag |= 0x800 | 0x40<<i | extra_flag;
                 g[i].XA = XA[i]? XA[i][n_pri[i]] : 0;
                 g[i].HN = HN[i]? HN[i][n_pri[i]] : -1;
+                if (opt->supp_rep_hard_cap > 0 && p->chain_n_hits >= opt->supp_rep_hard_cap)
+                    g[i].mapq = 0; // fg-labs: force repetitive-supp MAPQ to 0
                 aa[i][n_aa[i]++] = g[i];
             }
         }
@@ -1280,13 +1285,14 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                 b.rid = a->rid;
                 b.is_alt = a->is_alt;
                 b.qb = is_rev? l_ms - (aln.qe + 1) : aln.qb;
-                b.qe = is_rev? l_ms - aln.qb : aln.qe + 1; 
+                b.qe = is_rev? l_ms - aln.qb : aln.qe + 1;
                 b.rb = is_rev? (l_pac<<1) - (rb + aln.te + 1) : rb + aln.tb;
                 b.re = is_rev? (l_pac<<1) - (rb + aln.tb) : rb + aln.te + 1;
                 b.score = aln.score;
                 b.csub = aln.score2;
                 b.secondary = -1;
                 b.seedcov = (b.re - b.rb < b.qe - b.qb? b.re - b.rb : b.qe - b.qb) >> 1;
+                b.chain_n_hits = 1; // mate-rescue has no SMEM evidence; treat as unique anchor
 
                 kv_push(mem_alnreg_t, *ma, b); // make room for a new element
 

@@ -25,6 +25,18 @@ land upstream.
   CI-gated on Linux x86 only. See `README.md` → "Memory allocator" for
   details.
 
+- **`--supp-rep-hard-cap INT`** (opt-in, default disabled): forces MAPQ=0 on
+  supplementary alignments whose chain contains a seed with `>=INT` genome
+  occurrences. Addresses the long-standing bwa/bwa-mem2 issue where a supp
+  fragment that maps to many places standalone (e.g. a short read in a CCATCC
+  repeat) inherits a high MAPQ from its primary because the supp's competing
+  repetitive chains get filtered out during the full-read pipeline and
+  therefore never contribute to its `sub`/`sub_n`. See
+  [upstream #260](https://github.com/bwa-mem2/bwa-mem2/issues/260) for the
+  reporter case. Primary MAPQ is unaffected; default output is byte-identical
+  to stock bwa-mem2. Typical values are 5–20 (lower = more aggressive); the
+  upstream #260 repro drops from MAPQ=60 to MAPQ=0 at `--supp-rep-hard-cap 18`.
+
 [pr288]: https://github.com/bwa-mem2/bwa-mem2/pull/288
 
 ## Branching and update policy
