@@ -843,6 +843,7 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "   -h INT[,INT]  if there are <INT hits with score >%.2f%% of the max score, output all in XA [%d,%d]\n",
             opt->XA_drop_ratio * 100.0, opt->max_XA_hits, opt->max_XA_hits_alt);
     fprintf(stderr, "   -z FLOAT      the fraction of the max score to use with -h [%.2f]\n", opt->XA_drop_ratio);
+    fprintf(stderr, "   -u            output XB instead of XA; XB is XA with the alignment score and mapping quality added\n");
     fprintf(stderr, "   -a            output all alignments for SE or unpaired PE\n");
     fprintf(stderr, "   -C            append FASTA/FASTQ comment to SAM output\n");
     fprintf(stderr, "   -V            output the reference FASTA header in the XR tag\n");
@@ -911,7 +912,7 @@ int main_mem(int argc, char *argv[])
         {"do-not-penalize-chimeras", no_argument,       0, OPT_METH_NO_CHIMERA},
         {0, 0, 0, 0}
     };
-    while ((c = getopt_long(argc, argv, "51qpaMCSPVYjk:c:v:s:r:t:R:A:B:O:E:U:w:L:d:T:Q:D:m:I:N:W:x:G:h:y:K:X:H:o:f:z:",
+    while ((c = getopt_long(argc, argv, "51qpaMCSPVYjuk:c:v:s:r:t:R:A:B:O:E:U:w:L:d:T:Q:D:m:I:N:W:x:G:h:y:K:X:H:o:f:z:",
                             long_opts, NULL)) >= 0)
     {
         if (c == 'k') opt->min_seed_len = atoi(optarg), opt0.min_seed_len = 1;
@@ -942,6 +943,7 @@ int main_mem(int argc, char *argv[])
         else if (c == 'V') opt->flag |= MEM_F_REF_HDR;
         else if (c == '5') opt->flag |= MEM_F_PRIMARY5 | MEM_F_KEEP_SUPP_MAPQ; // always apply MEM_F_KEEP_SUPP_MAPQ with -5
         else if (c == 'q') opt->flag |= MEM_F_KEEP_SUPP_MAPQ;
+        else if (c == 'u') opt->flag |= MEM_F_XB;
         else if (c == 'c') opt->max_occ = atoi(optarg), opt0.max_occ = 1;
         else if (c == 'd') opt->zdrop = atoi(optarg), opt0.zdrop = 1;
         else if (c == 'v') bwa_verbose = atoi(optarg);

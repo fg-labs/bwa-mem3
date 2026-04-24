@@ -71,6 +71,7 @@ typedef struct __smem_i smem_i;
 // V17
 #define MEM_F_PRIMARY5  0x800
 #define MEM_F_KEEP_SUPP_MAPQ 0x1000
+#define MEM_F_XB        0x2000
 
 
 typedef struct mem_opt_t {
