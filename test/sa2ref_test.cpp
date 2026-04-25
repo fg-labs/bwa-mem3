@@ -49,7 +49,7 @@ int64_t loadData(FILE *infp, SMEM *smemArray) {
 	int64_t numSmems = 0;
     while(numSmems < MAX_NUM_SMEM) {
 		int32_t val = 0;
-        SMEM smem;
+        SMEM smem = {};
         smem.rid = 0;
         smem.m = 0;
         smem.n = 0;
@@ -80,12 +80,12 @@ int main(int argc, char **argv) {
 	FILE *infp = NULL;
 	infp = fopen(argv[2], "r");
 	if (infp == NULL) {
-		printf("Unable to open sa2ref input file!!"); exit(0);
+		printf("Unable to open sa2ref input file!!"); exit(1);
 	}
 	FILE *outfp = NULL;
 	outfp = fopen(argv[3], "w");
 	if (outfp == NULL) {
-		printf("Unable to open sa2ref output file!!"); exit(0);
+		printf("Unable to open sa2ref output file!!"); exit(1);
 	}
 	
     FMI_search *fmiSearch = new FMI_search(argv[1]);
@@ -110,7 +110,15 @@ int main(int argc, char **argv) {
     for(i = 0; i < numSmems; i++)
     {
         int32_t count = 0;
+        if (numOffs >= MAX_NUM_OFFSET) {
+            fprintf(stderr, "refCoordArray capacity exceeded before processing all SMEMs\n");
+            break;
+        }
         fmiSearch->get_sa_entries(smemArray + i, refCoordArray + numOffs, &count, 1, max_occ);
+        if (count < 0 || numOffs + count > MAX_NUM_OFFSET) {
+            fprintf(stderr, "refCoordArray capacity exceeded while collecting SA entries\n");
+            break;
+        }
         numOffs += count;
     }
     endTick = __rdtsc();

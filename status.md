@@ -45,7 +45,7 @@
 
 ### Task 3: Native NEON for bandedSWA.cpp
 - Optimized _mm_blendv_epi16 to use native NEON vbsl (bitwise select)
-- Added _mm_movemask_epi16 and _mm_blendv_epi16_fast to simd_compat.h
+- Added `_mm_movemask_epi16` and `_mm_blendv_epi16_fast` to `simd_compat.h`
 - Modified bandedSWA.cpp to use vbsl directly on ARM instead of OR/AND/ANDNOT
 - Benchmark: 14.4s → 13.8s average (~4% improvement)
 - Correctness verified: identical AS:i scores

@@ -1,0 +1,4 @@
+# Enforce LF line endings for all text files.
+# Prevents CRLF from sneaking back in on Windows checkouts and keeps diffs
+# noise-free across platforms.
+* text=auto eol=lf
