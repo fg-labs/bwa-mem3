@@ -111,6 +111,7 @@ typedef struct mem_opt_t {
     int    meth_mode;       // 1 = bisulfite mode (--meth); implies bam_mode
     char   meth_set_as_failed;// 'f', 'r', or 0 — flag reads on that strand 0x200
     int    meth_no_chim;    // 1 to skip the longest-M <44% chimera heuristic
+    int    supp_rep_hard_cap; // supp alnregs whose chain's seeds share >=this many genome hits are forced to MAPQ=0; 0 disables
 } mem_opt_t;
 
 
@@ -120,6 +121,7 @@ typedef struct abc {
     abc() {
         done = 0;
         rbeg = qbeg = len = score = aln = 0;
+        n_hits = 1;
     }
     int64_t rbeg;
     int32_t qbeg;
@@ -127,6 +129,7 @@ typedef struct abc {
     int32_t score;
     int8_t done;
     int aln;
+    int32_t n_hits;  // SMEM SA occurrence count this seed came from; 1 = unique
 } mem_seed_t; // unaligned memory
 
 typedef struct {
@@ -157,6 +160,7 @@ typedef struct mem_alnreg_t {
     int secondary;  // index of the parent hit shadowing the current hit; <0 if primary
     int secondary_all;
     int seedlen0;   // length of the starting seed
+    int chain_n_hits; // max SMEM SA-occurrence count across this chain's seeds (1 = no repetitive seed)
     int n_comp:30, is_alt:2; // number of sub-alignments chained together
     float frac_rep;
     uint64_t hash;
