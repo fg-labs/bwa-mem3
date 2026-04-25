@@ -30,10 +30,7 @@ Contacts: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@
 
 // ----------------------------------
 #include "main.h"
-
-#ifndef PACKAGE_VERSION
-#define PACKAGE_VERSION "2.2.1"
-#endif
+#include "version.h"
 
 #ifdef USE_MIMALLOC
 #include <mimalloc.h>

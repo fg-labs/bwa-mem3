@@ -3,3 +3,4 @@
 *.dSYM
 .*.swp
 a.out
+src/version.h

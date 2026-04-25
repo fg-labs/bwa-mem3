@@ -39,6 +39,22 @@ land upstream.
 
 [pr288]: https://github.com/bwa-mem2/bwa-mem2/pull/288
 
+## Version stamping
+
+`PACKAGE_VERSION` (the value reported by `bwa-mem2 version` and written to
+the `@PG VN:` SAM header field) is generated at build time by the Makefile
+from `git describe --tags --dirty`, e.g. `v2.3-30-g61813ef` for a tree 30
+commits past upstream tag `v2.3` at commit `61813ef`.
+
+- No manual bumping required: cut a fresh release by tagging the commit
+  (`git tag -a vX.Y-fg-labs.N -m …`) and the next build picks it up.
+- Builds where `git describe --tags` fails (source-tarball extractions, or
+  shallow clones / checkouts with no tag reachable from `HEAD` — including
+  CI's default `actions/checkout` fetch-depth of 1) fall back to the static
+  `FG_LABS_VERSION_FALLBACK` in `Makefile`. Bump that when cutting a
+  release that will be consumed as a tarball, or in CI artifacts.
+- `src/version.h` is generated and `.gitignore`d; `make clean` removes it.
+
 ## Branching and update policy
 
 - `master` tracks upstream unchanged.
