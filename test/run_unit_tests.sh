@@ -63,4 +63,11 @@ LINES="$(wc -l < "$FKSW" | tr -d ' ')"
 [[ "$LINES" -eq 3 ]] || fail "xeonbsw: expected 3 lines in fksw.txt, got $LINES"
 ok "xeonbsw ($LINES pair scores emitted)"
 
+# --- pg_cl_escape_test ----------------------------------------------------
+# Regression for issue #45 / upstream #293: tabs inside `-R` must not
+# bleed into the @PG CL: value. Uses the same phiX fixture as the rest
+# of the harness (indexed above if needed).
+"$HERE/pg_cl_escape_test.sh" "$BWAMEM2" "$FIXTURES" || fail "pg_cl_escape_test failed"
+ok "pg_cl_escape_test"
+
 echo "ALL UNIT TESTS PASSED"
