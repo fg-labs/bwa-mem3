@@ -22,6 +22,7 @@ on:
     paths:
       - 'src/**'
       - 'test/kswv_selftest.cpp'
+      - 'test/kswv_nrow_zero_test.cpp'
       - '.github/workflows/proto-neon-kswv.yml'
       - 'Makefile'
   workflow_dispatch:
@@ -100,6 +101,20 @@ jobs:
           echo "selftest_exit=$status" >> "$GITHUB_OUTPUT"
           tail -25 /tmp/ci-out/selftest.log >> "$GITHUB_STEP_SUMMARY"
           exit $status
+
+      - name: Build kswv_nrow_zero_test (ASan)
+        # issue 38 / upstream PR 289: all-len1==0 batches used to walk past
+        # the rowMax allocation prefix. Build with asan so the pre-fix write
+        # trips heap-buffer-overflow and fails the job rather than silently
+        # corrupting memory. `make clean` forces libbwa to recompile under
+        # asan instrumentation — the pre-asan objects left by earlier steps
+        # would otherwise satisfy the make graph and run uninstrumented.
+        run: |
+          make clean
+          make ASAN=1 arch=arm64 kswv_nrow_zero_test CXX=g++
+
+      - name: Run kswv_nrow_zero_test
+        run: ./kswv_nrow_zero_test
 
       - name: Cache chr17 bwa-mem2 index
         id: cache-chr17-index
@@ -274,6 +289,17 @@ jobs:
         # (te split, freeze, per-lane score2, minsc filter) are applied
         # on both paths — AVX2 from PR 20, AVX-512BW by this PR.
         run: ./kswv_selftest
+
+      - name: Build kswv_nrow_zero_test (x86, ASan)
+        # issue 38 / upstream PR 289 regression. Covers the AVX2 u8 kernel
+        # and the AVX-512BW u8+16 kernels on whichever $USE_AVX is selected.
+        # `make clean` forces libbwa to recompile under asan instrumentation.
+        run: |
+          make clean
+          make ASAN=1 arch="$USE_AVX" kswv_nrow_zero_test CXX=g++
+
+      - name: Run kswv_nrow_zero_test (x86)
+        run: ./kswv_nrow_zero_test
 
       - name: Index chr17
         # Use the port binary for indexing (indexing code is arch-agnostic).
