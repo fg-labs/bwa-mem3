@@ -174,6 +174,14 @@ int main(int argc, char **argv) {
         int64_t myTotalSmems = 0;
         int64_t startTick = __rdtsc();
 
+        // Per-thread lockstep slot buffers. Each OpenMP thread owns its own
+        // pair; production code (mmc) grows them on demand, but here
+        // max_readlength is fixed for the run so one allocation suffices for
+        // every batch this thread will process.
+        const int64_t ls_pair_elems = (int64_t)SMEM_LOCKSTEP_N * max_readlength;
+        SMEM *ls_prev      = (SMEM *)_mm_malloc(ls_pair_elems * sizeof(SMEM), 64);
+        SMEM *ls_match_buf = (SMEM *)_mm_malloc(ls_pair_elems * sizeof(SMEM), 64);
+
 #pragma omp for schedule(dynamic)
         for(i = 0; i < numReads; i += batch_size)
         {
@@ -191,7 +199,7 @@ int main(int argc, char **argv) {
             if((matchArrayAlloc - myTotalSmems) < (batch_size * max_readlength))
             {
                 matchArrayAlloc *= 2;
-                matchArray[tid] = (SMEM *)realloc(matchArray[tid], matchArrayAlloc * sizeof(SMEM)); 
+                matchArray[tid] = (SMEM *)realloc(matchArray[tid], matchArrayAlloc * sizeof(SMEM));
             }
             fmiSearch->getSMEMsAllPosOneThread(enc_qdb + i * max_readlength,
                     min_intv_array + i,
@@ -203,6 +211,9 @@ int main(int argc, char **argv) {
                     max_readlength,
                     minSeedLen,
                     matchArray[tid] + myTotalSmems,
+                    matchArrayAlloc - myTotalSmems,
+                    ls_prev,
+                    ls_match_buf,
                     numTotalSmem + batch_id);
             batchStart[batch_id] = matchArray[tid] + myTotalSmems;
             fmiSearch->sortSMEMs(matchArray[tid] + myTotalSmems,
@@ -222,6 +233,8 @@ int main(int argc, char **argv) {
         int64_t endTick = __rdtsc();
         printf("%d] %ld ticks, workTicks = %ld\n", tid, endTick - startTick, workTicks[tid]);
         _mm_free(rid_array);
+        _mm_free(ls_prev);
+        _mm_free(ls_match_buf);
     }
 
     endTick = __rdtsc();

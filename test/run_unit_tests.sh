@@ -77,4 +77,87 @@ ok "xeonbsw ($LINES pair scores emitted)"
 "$HERE/pg_cl_escape_test.sh" "$BWAMEM2" "$FIXTURES" || fail "pg_cl_escape_test failed"
 ok "pg_cl_escape_test"
 
+# --- smem_lockstep_parity_test --------------------------------------------
+OUT="$(cd "$HERE" && ./smem_lockstep_parity_test "$FIXTURES/phix.fa" 2>&1)"
+CASES_PASSED="$(echo "$OUT" | sed -nE 's/^([0-9]+) \/ ([0-9]+) cases passed$/\1/p')"
+CASES_TOTAL="$(echo "$OUT"  | sed -nE 's/^([0-9]+) \/ ([0-9]+) cases passed$/\2/p')"
+[[ -n "$CASES_TOTAL" ]]              || fail "smem_lockstep_parity_test: no summary line"
+[[ "$CASES_PASSED" == "$CASES_TOTAL" ]] || fail "smem_lockstep_parity_test: $CASES_PASSED / $CASES_TOTAL cases passed"
+ok "smem_lockstep_parity_test ($CASES_PASSED / $CASES_TOTAL)"
+
+# --- long-read end-to-end (issue 44) --------------------------------------
+# Pre-fix, reads > 151 bp overran the per-thread SMEM buffer (segfault) and
+# reads > 512 bp tripped the MAX_READ_LEN_FOR_LOCKSTEP assert. Post-fix the
+# SMEM and lockstep-slot buffers are sized per-batch, so these must align
+# cleanly and produce SAM lines.
+for LEN_FQ in long_read_300bp long_read_1kbp long_read_3kbp; do
+    RAW="$("$BWAMEM2" mem "$FIXTURES/phix.fa" "$FIXTURES/${LEN_FQ}.fq" 2>/dev/null)" \
+        || fail "bwa-mem2 mem ${LEN_FQ}.fq: non-zero exit (crash regression)"
+    OUT="$(printf '%s\n' "$RAW" | grep -v '^@' || true)"
+    [[ -n "$OUT" ]] || fail "bwa-mem2 mem ${LEN_FQ}.fq: no SAM records emitted"
+    # Every record should be a successful alignment (not flag 4 = unmapped).
+    UNMAPPED="$(echo "$OUT" | awk '$2 == 4 || $2 == 2052' | wc -l | tr -d ' ')"
+    [[ "$UNMAPPED" == "0" ]] || fail "bwa-mem2 mem ${LEN_FQ}.fq: $UNMAPPED unmapped record(s)"
+    ok "bwa-mem2 mem ${LEN_FQ}.fq (all records mapped)"
+done
+
+
+# --- interleaved -p mode regression --------------------------------------
+# Bugs covered:
+#  - Empty/zero-length-read batches (which a malformed FASTQ that bseq parses
+#    as a single 0-bp record would trigger) used to fall through the lazy-init
+#    grow checks in mem_collect_smem with NULL per-thread buffers and SEGV in
+#    the populate loop. mem_collect_smem now early-returns on zero-base batches.
+#  - The OLD `tot_len >= mmc->wsize_mem[tid]` grow block in mem_kernel1_core
+#    used to fire when both sides were 0, calling _mm_realloc(NULL, 0, 0, ...)
+#    which returns NULL and then exit(1) on the post-collect check. That block
+#    is gone; mem_collect_smem owns all SMEM-family sizing.
+PE_TMP="$(mktemp -d)"
+# Append to (don't replace) the EXIT trap installed earlier for OUT_FILE /
+# FKSW / HEADER_OUT — overwriting it would leak those paths once this block
+# runs.
+trap 'rm -f "$OUT_FILE" "$FKSW" "$HEADER_OUT"; rm -rf "$PE_TMP"' EXIT
+
+# Build a small properly-interleaved FASTQ from phix. Use python so the
+# fixture is generated programmatically (per repo convention) and so the
+# interleaving is correct at FASTQ-record granularity.
+python3 - "$FIXTURES/phix.fa" "$PE_TMP/interleaved.fq" <<'PY'
+import random, sys
+ref_path, out_path = sys.argv[1], sys.argv[2]
+ref = ''
+with open(ref_path) as f:
+    next(f)
+    for line in f:
+        ref += line.strip()
+random.seed(42)
+N, RL, INS = 50, 120, 280
+comp = str.maketrans('ACGTN', 'TGCAN')
+with open(out_path, 'w') as out:
+    for i in range(N):
+        pos = random.randint(0, len(ref) - INS)
+        r1 = ref[pos:pos+RL]
+        r2 = ref[pos+INS-RL:pos+INS][::-1].translate(comp)
+        q  = 'I' * RL
+        out.write(f'@pe{i}/1\n{r1}\n+\n{q}\n')
+        out.write(f'@pe{i}/2\n{r2}\n+\n{q}\n')
+PY
+
+OUT="$("$BWAMEM2" mem -p "$FIXTURES/phix.fa" "$PE_TMP/interleaved.fq" 2>/dev/null)" \
+    || fail "bwa-mem2 mem -p interleaved.fq: non-zero exit (crash regression)"
+RECORDS="$(printf '%s\n' "$OUT" | grep -cv '^@' || true)"
+[[ "$RECORDS" -ge 100 ]] || fail "bwa-mem2 mem -p: expected >=100 records (50 pairs × 2), got $RECORDS"
+ok "bwa-mem2 mem -p interleaved.fq ($RECORDS records)"
+
+# Empty FASTQ + zero-length-read FASTQ regressions for the empty-batch
+# defensive path in mem_collect_smem / mem_kernel1_core.
+: > "$PE_TMP/empty.fq"
+"$BWAMEM2" mem "$FIXTURES/phix.fa" "$PE_TMP/empty.fq" >/dev/null 2>&1 \
+    || fail "bwa-mem2 mem on empty FASTQ: non-zero exit"
+ok "bwa-mem2 mem on empty FASTQ (no crash)"
+
+printf '@zero\n\n+\n\n' > "$PE_TMP/zero.fq"
+"$BWAMEM2" mem "$FIXTURES/phix.fa" "$PE_TMP/zero.fq" >/dev/null 2>&1 \
+    || fail "bwa-mem2 mem on zero-length read: non-zero exit"
+ok "bwa-mem2 mem on zero-length read (no crash)"
+
 echo "ALL UNIT TESTS PASSED"

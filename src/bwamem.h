@@ -219,6 +219,15 @@ typedef struct
     int64_t wsize_mem[MAX_THREADS];
     int64_t wsize_mem_s[MAX_THREADS];
     int64_t wsize_mem_r[MAX_THREADS];
+
+    // Lockstep SMEM batching per-slot state. One pair of contiguous SMEM
+    // buffers per thread, each of size SMEM_LOCKSTEP_N * lockstep_buf_cap[tid].
+    // Per-slot views are stride-offset into these at lockstep driver entry.
+    // Grown on demand when the batch's max_readlength exceeds the per-slot
+    // capacity.
+    SMEM    *lockstep_prev[MAX_THREADS];
+    SMEM    *lockstep_match_buf[MAX_THREADS];
+    int64_t  lockstep_buf_cap[MAX_THREADS];
 } mem_cache;
 
 // chain moved to .h

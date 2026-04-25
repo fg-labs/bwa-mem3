@@ -124,6 +124,7 @@ class FMI_search: public indexEle
                                  int32_t  max_readlength,
                                  int32_t minSeedLen,
                                  SMEM *matchArray,
+                                 int64_t max_smem,
                                  int64_t *__numTotalSmem);
 
     /* Lockstep-batched variant of getSMEMsOnePosOneThread: advances
@@ -144,6 +145,9 @@ class FMI_search: public indexEle
                                           int32_t  max_readlength,
                                           int32_t minSeedLen,
                                           SMEM *matchArray,
+                                          int64_t max_smem,
+                                          SMEM *lockstep_prev_base,
+                                          SMEM *lockstep_match_buf_base,
                                           int64_t *__numTotalSmem);
 
     void getSMEMsAllPosOneThread(uint8_t *enc_qdb,
@@ -156,16 +160,20 @@ class FMI_search: public indexEle
                                  int32_t max_readlength,
                                  int32_t minSeedLen,
                                  SMEM *matchArray,
+                                 int64_t max_smem,
+                                 SMEM *lockstep_prev_base,
+                                 SMEM *lockstep_match_buf_base,
                                  int64_t *__numTotalSmem);
-        
-    
+
+
     int64_t bwtSeedStrategyAllPosOneThread(uint8_t *enc_qdb,
                                            int32_t *max_intv_array,
                                            int32_t numReads,
                                            const bseq1_t *seq_,
                                            int32_t *query_cum_len_ar,
                                            int32_t minSeedLen,
-                                           SMEM *matchArray);
+                                           SMEM *matchArray,
+                                           int64_t max_smem);
         
     void sortSMEMs(SMEM *matchArray,
                    int64_t numTotalSmem[],
@@ -227,7 +235,10 @@ private:
                       const int32_t *rid_array,
                       const bseq1_t *seq_,
                       const int32_t *query_cum_len_ar,
-                      const uint8_t *enc_qdb);
+                      const uint8_t *enc_qdb,
+                      SMEM *prev_buf,
+                      SMEM *match_buf_buf,
+                      int32_t buf_cap);
     void ls_prefetch_cp_occ(const BatchSlot *s);
     void ls_advance_forward_step(BatchSlot *s, const uint8_t *enc_qdb);
     void ls_prepare_backward(BatchSlot *s);

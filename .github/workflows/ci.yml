@@ -278,14 +278,26 @@ jobs:
       - name: Interleaved alignment smoke (chr22)
         if: matrix.canonical == true
         run: |
-          # Interleave R1 and R2 into a single FASTQ
-          paste <(zcat /tmp/chr22-sim/reads.bwa.read1.fastq.gz) \
-                <(zcat /tmp/chr22-sim/reads.bwa.read2.fastq.gz) \
+          # Interleave R1 and R2 into a single FASTQ at FASTQ-record (4-line)
+          # granularity. The naive `paste R1 R2 | tr '\t' '\n'` interleaves at
+          # line granularity, which produces a malformed FASTQ. Collapse each
+          # input to one tab-separated row per record first (`paste - - - -`),
+          # then interleave whole records, then re-expand tabs to newlines.
+          paste -d '\n' \
+            <(zcat /tmp/chr22-sim/reads.bwa.read1.fastq.gz | paste - - - -) \
+            <(zcat /tmp/chr22-sim/reads.bwa.read2.fastq.gz | paste - - - -) \
             | tr '\t' '\n' > /tmp/chr22-sim/interleaved.fq
           $GITHUB_WORKSPACE/bwa-mem2 mem -p -t 4 /tmp/chr22/chr22.fa \
             /tmp/chr22-sim/interleaved.fq > /tmp/chr22-sim/p.sam 2>/dev/null
           records=$(grep -cv '^@' /tmp/chr22-sim/p.sam)
           [ "$records" -gt 0 ] || { echo "FAIL: interleaved alignment produced zero records"; exit 1; }
+          # 50,000 simulated PE pairs × 2 reads = 100,000 input reads, so a
+          # properly interleaved input must produce at least one SAM line per
+          # read (primary alignment, mapped or unmapped). Tolerate >= because
+          # secondary/supplementary alignments add extra lines. Without this
+          # floor the previous `paste | tr` (line-interleaved, malformed FASTQ)
+          # silently passed at ~50k records — half the reads, parser-tolerated.
+          [ "$records" -ge 100000 ] || { echo "FAIL: expected >=100000 records, got $records"; exit 1; }
           echo "PASS: interleaved smoke ($records records)"
 
       - name: Install pixi (for --meth oracle)

@@ -81,7 +81,11 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 
 #define SEEDS_PER_CHAIN 1
 #define N_SMEM_KERNEL 3
-#define READ_LEN 151
+// Average read length used only to pre-estimate `nreads` (number of reads
+// per chunk) for per-run regs/chain_ar/seedBuf allocation. Not a
+// correctness bound — the SMEM and related per-thread buffers are sized
+// at batch time from the observed maximum read length and grown on demand.
+#define NREADS_ESTIMATE_AVG_BASES 100
 
 #define SEQ_LEN8 128   // redundant??
 
