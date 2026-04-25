@@ -51,10 +51,17 @@ ok "bwt_seed_strategy_test"
 # --- sa2ref_test -----------------------------------------------------------
 OUT_FILE="$(mktemp)"
 FKSW="$HERE/fksw.txt"
-trap 'rm -f "$OUT_FILE" "$FKSW"' EXIT
+HEADER_OUT="$(mktemp)"
+trap 'rm -f "$OUT_FILE" "$FKSW" "$HEADER_OUT"' EXIT
 (cd "$HERE" && ./sa2ref_test "$FIXTURES/phix.fa" "$FIXTURES/sa2ref_input.txt" "$OUT_FILE" 20 >/dev/null 2>&1) || fail "sa2ref_test crashed"
 [[ -s "$OUT_FILE" ]] || fail "sa2ref_test: output file empty"
 ok "sa2ref_test (wrote $(wc -l < "$OUT_FILE" | tr -d ' ') coords)"
+
+# --- header_insert_test ----------------------------------------------------
+(cd "$HERE" && ./header_insert_test 2>&1) | tee "$HEADER_OUT" >/dev/null || fail "header_insert_test crashed"
+grep -q 'ALL HEADER INSERT TESTS PASSED' "$HEADER_OUT" \
+    || fail "header_insert_test: final banner missing ($(tail -n1 "$HEADER_OUT"))"
+ok "header_insert_test"
 
 # --- xeonbsw (main_banded) -------------------------------------------------
 (cd "$HERE" && ./xeonbsw -pairs "$FIXTURES/pairs.txt" >/dev/null 2>&1) || fail "xeonbsw crashed"
