@@ -840,7 +840,10 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "   -K INT        process INT input bases in each batch regardless of nThreads (for reproducibility) []\n");
     fprintf(stderr, "   -v INT        verbose level: 1=error, 2=warning, 3=message, 4+=debugging [%d]\n", bwa_verbose);
     fprintf(stderr, "   -T INT        minimum score to output [%d]\n", opt->T);
-    fprintf(stderr, "   -h INT[,INT]  if there are <INT hits with score >80%% of the max score, output all in XA [%d,%d]\n", opt->max_XA_hits, opt->max_XA_hits_alt);
+    fprintf(stderr, "   -h INT[,INT]  if there are <INT hits with score >%.2f%% of the max score, output all in XA [%d,%d]\n",
+            opt->XA_drop_ratio * 100.0, opt->max_XA_hits, opt->max_XA_hits_alt);
+    fprintf(stderr, "   -z FLOAT      the fraction of the max score to use with -h [%.2f]\n", opt->XA_drop_ratio);
+    fprintf(stderr, "   -u            output XB instead of XA; XB is XA with the alignment score and mapping quality added\n");
     fprintf(stderr, "   -a            output all alignments for SE or unpaired PE\n");
     fprintf(stderr, "   -C            append FASTA/FASTQ comment to SAM output\n");
     fprintf(stderr, "   -V            output the reference FASTA header in the XR tag\n");
@@ -909,7 +912,7 @@ int main_mem(int argc, char *argv[])
         {"do-not-penalize-chimeras", no_argument,       0, OPT_METH_NO_CHIMERA},
         {0, 0, 0, 0}
     };
-    while ((c = getopt_long(argc, argv, "51qpaMCSPVYjk:c:v:s:r:t:R:A:B:O:E:U:w:L:d:T:Q:D:m:I:N:W:x:G:h:y:K:X:H:o:f:",
+    while ((c = getopt_long(argc, argv, "51qpaMCSPVYjuk:c:v:s:r:t:R:A:B:O:E:U:w:L:d:T:Q:D:m:I:N:W:x:G:h:y:K:X:H:o:f:z:",
                             long_opts, NULL)) >= 0)
     {
         if (c == 'k') opt->min_seed_len = atoi(optarg), opt0.min_seed_len = 1;
@@ -940,6 +943,7 @@ int main_mem(int argc, char *argv[])
         else if (c == 'V') opt->flag |= MEM_F_REF_HDR;
         else if (c == '5') opt->flag |= MEM_F_PRIMARY5 | MEM_F_KEEP_SUPP_MAPQ; // always apply MEM_F_KEEP_SUPP_MAPQ with -5
         else if (c == 'q') opt->flag |= MEM_F_KEEP_SUPP_MAPQ;
+        else if (c == 'u') opt->flag |= MEM_F_XB;
         else if (c == 'c') opt->max_occ = atoi(optarg), opt0.max_occ = 1;
         else if (c == 'd') opt->zdrop = atoi(optarg), opt0.zdrop = 1;
         else if (c == 'v') bwa_verbose = atoi(optarg);
@@ -967,6 +971,7 @@ int main_mem(int argc, char *argv[])
             if (*p != 0 && ispunct(*p) && isdigit(p[1]))
                 opt->max_XA_hits_alt = strtol(p+1, &p, 10);
         }
+        else if (c == 'z') opt->XA_drop_ratio = atof(optarg);
         else if (c == 'Q')
         {
             opt0.mapQ_coef_len = 1;
@@ -1275,12 +1280,19 @@ int main_mem(int argc, char *argv[])
         }
     }
 
+    /* Look up optional per-index header records (<prefix>.hdr or
+     * <baseprefix>.dict) once and route them into both output paths. The
+     * SAM text path merges these with user -H per lh3/bwa#348 precedence;
+     * the --bam path forwards them to htslib's sam_hdr_add_lines so the
+     * rich @SQ (AS/M5/SP/AH/…) also makes it into the BAM header. */
+    char *idx_hdr_lines = bwa_load_hdr_from_index(ref_prefix);
+
     /* Output path:
      *  - --meth: open meth_bam_writer with strand-consolidated SQ headers.
      *    Honors -o/-f (target path) or stdout ("-").
      *  - --bam (no --meth): open generic bam_writer; htslib writes its own
      *    @HD + @SQ + @PG header. Honors -o/-f or stdout.
-     *  - SAM text: open -o/-f path (if any) as a FILE*; bwa_print_sam_hdr. */
+     *  - SAM text: open -o/-f path (if any) as a FILE*; bwa_print_sam_hdr2. */
     bam_writer_t *bam_writer = NULL;
     if (opt->meth_mode) {
         g_meth_cmap = meth_chrom_map_build_from_bns(aux.fmi->idx->bns);
@@ -1304,7 +1316,16 @@ int main_mem(int argc, char *argv[])
     } else if (opt->bam_mode) {
         const char *bam_path = is_o ? out_path : "-";
         extern char *bwa_pg;
-        bam_writer = bam_writer_open(bam_path, aux.fmi->idx->bns, hdr_line,
+        /* Suppress idx .hdr/.dict records entirely when the user's -H
+         * supplies any @SQ, matching bwa_print_sam_hdr2's SAM precedence. */
+        const char *bam_idx_hdr = idx_hdr_lines;
+        if (hdr_line != NULL) {
+            if (strncmp(hdr_line, "@SQ\t", 4) == 0 ||
+                strstr(hdr_line, "\n@SQ\t") != NULL)
+                bam_idx_hdr = NULL;
+        }
+        bam_writer = bam_writer_open(bam_path, aux.fmi->idx->bns,
+                                     bam_idx_hdr, hdr_line,
                                      bwa_pg, opt->bam_level);
         if (bam_writer == NULL) {
             fprintf(stderr, "ERROR: failed to open BAM writer at '%s'\n", bam_path);
@@ -1325,7 +1346,7 @@ int main_mem(int argc, char *argv[])
             }
             out_opened = true;
         }
-        bwa_print_sam_hdr(aux.fmi->idx->bns, hdr_line, aux.fp);
+        bwa_print_sam_hdr2(aux.fmi->idx->bns, idx_hdr_lines, hdr_line, aux.fp);
     }
 
     if (fixed_chunk_size > 0)
@@ -1350,6 +1371,7 @@ int main_mem(int argc, char *argv[])
     int32_t nt = aux.opt->n_threads;
     _mm_free(ref_string);
     free(hdr_line);
+    free(idx_hdr_lines);
     free(opt);
     kseq_destroy(aux.ks);
     err_gzclose(fp); kclose(ko);

@@ -108,6 +108,9 @@ extern "C" {
 	
 	void bwa_idx_destroy(bwaidx_t *idx);
 	void bwa_print_sam_hdr(const bntseq_t *bns, const char *hdr_line, FILE *fp);
+	void bwa_print_sam_hdr2(const bntseq_t *bns, const char *idx_hdr_lines,
+	                        const char *hdr_line, FILE *fp);
+	char *bwa_load_hdr_from_index(const char *prefix);
 	char *bwa_set_rg(const char *s);
 	char *bwa_insert_header(const char *s, char *hdr);
 #ifdef __cplusplus

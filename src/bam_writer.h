@@ -20,11 +20,18 @@ typedef struct bam_writer_s bam_writer_t;
 
 /* Open a BAM writer at `path` ("-" for stdout). compression_level 0 = no
  * deflate (fast, same size as SAM), 1..9 = BGZF deflate levels. @SQ is
- * built directly from `bns->anns`. `hdr_line` carries user-supplied header
- * lines (e.g., `@RG` from `-R` and `-H` insertions, as accumulated by
- * bwa_insert_header); it is inserted before `@PG`. `bwa_pg` is inserted
- * as-is. Both may be NULL. Returns NULL on failure. */
+ * built directly from `bns->anns`. `idx_hdr_lines` carries header records
+ * loaded from <prefix>.hdr or <baseprefix>.dict (or NULL if neither exists,
+ * or if the user's `hdr_line` supplies @SQ records — in which case the index
+ * file is ignored entirely, matching the SAM text path). These are inserted
+ * after the default @HD/@SQ but before user `hdr_line`, so user -H entries
+ * win on any @HD/@SQ collision via htslib's header de-dup rules. `hdr_line`
+ * carries user-supplied header lines (e.g., `@RG` from `-R` and `-H`
+ * insertions, as accumulated by bwa_insert_header); it is inserted before
+ * `@PG`. `bwa_pg` is inserted as-is. All three may be NULL. Returns NULL on
+ * failure. */
 bam_writer_t *bam_writer_open(const char *path, const bntseq_t *bns,
+                              const char *idx_hdr_lines,
                               const char *hdr_line, const char *bwa_pg,
                               int compression_level);
 
