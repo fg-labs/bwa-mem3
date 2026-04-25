@@ -173,7 +173,7 @@ int display_stats(int nthreads)
                 agg1, agg2, agg1*1.0/agg2);
     }
 
-    double res, max_ = 0, min_=1e10;
+    double res = 0.0, max_ = 0, min_=1e10;
     for (int i=0; i<nthreads; i++) {
         double val = (tprof[ALIGN1][i]*1.0) / tprof[MEM_CHAIN][i];
         res += val;
