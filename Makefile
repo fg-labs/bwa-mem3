@@ -206,7 +206,7 @@ myall:arm64
 endif
 endif
 
-CXXFLAGS+=	-g -O3 -std=gnu++14 -fpermissive $(ARCH_FLAGS) $(ASAN_FLAGS) #-Wall ##-xSSE2
+CXXFLAGS+=	-g -O3 -std=gnu++14 -fpermissive $(ARCH_FLAGS) $(ASAN_FLAGS) $(EXTRA_CXXFLAGS) #-Wall ##-xSSE2
 
 # Control build flag for the batched mate-rescue SW port on ARM.
 # When set (e.g. `make arm64 DISABLE_BATCHED_MATESW=1`), the source gate for
@@ -333,28 +333,59 @@ $(MIMALLOC_LIB):
 	cd $(MIMALLOC_BUILD) && cmake $(MIMALLOC_CMAKE_FLAGS) .. && $(MAKE)
 
 clean:
-	rm -fr src/*.o src/version.h test/*.o $(BWA_LIB) $(EXE) kswv_selftest kswv_nrow_zero_test bwa-mem2.sse41 bwa-mem2.sse42 bwa-mem2.avx bwa-mem2.avx2 bwa-mem2.avx512bw bwa-mem2.arm64
+	rm -fr src/*.o src/version.h test/*.o $(BWA_LIB) $(EXE) kswv_selftest kswv_nrow_zero_test bwa-mem2.sse41 bwa-mem2.sse42 bwa-mem2.avx bwa-mem2.avx2 bwa-mem2.avx512bw bwa-mem2.arm64 bwa-mem2.pgo bwa-mem2.pgo-instr bwa-mem2.pgo.* bwa-mem2.pgo-instr.*
 	cd ext/safestringlib/ && $(MAKE) clean
 	-[ -f ext/htslib/config.mk ] && cd ext/htslib && $(MAKE) distclean
 	rm -rf $(MIMALLOC_BUILD)
 
-# Profile-Guided Optimization (PGO) targets for Apple Silicon
-# Usage: make pgo-generate && <run training workload> && make pgo-use
-PGO_PROFILE_DIR=pgo_profiles
+# Profile-Guided Optimization (PGO) targets.
+#
+# Usage (host-default arch, single shared profile dir — preserves prior
+# arm64 behavior on Apple Silicon / aarch64 hosts):
+#   make pgo-generate && <run training workload> && make pgo-use
+#
+# Multi-arch / multi-regime usage (override at command line):
+#   make pgo-generate PGO_ARCH=avx2 PGO_PROFILE_DIR=/path/to/regimeA
+#   <run training>
+#   make pgo-use PGO_ARCH=avx2 PGO_PROFILE_DIR=/path/to/regimeA
+#
+# PGO_ARCH accepts the same values as the top-level `arch=` knob: arm64,
+# sse41, sse42, avx, avx2, avx512, avx512bw, native, or any custom flag
+# string. Defaults match the host: arm64 on Apple Silicon / aarch64,
+# native otherwise. Output binaries are arch-suffixed when PGO_ARCH is
+# non-default, so multiple per-arch builds coexist:
+#   PGO_ARCH=arm64  -> bwa-mem2.pgo-instr,    bwa-mem2.pgo
+#   PGO_ARCH=avx2   -> bwa-mem2.pgo-instr.avx2, bwa-mem2.pgo.avx2
+ifneq ($(IS_ARM),)
+    PGO_ARCH ?= arm64
+else
+    PGO_ARCH ?= native
+endif
+PGO_PROFILE_DIR ?= pgo_profiles
+
+# Output names: keep the bare names when PGO_ARCH is the default arm64
+# (backward-compat); arch-suffix otherwise so per-arch outputs don't collide.
+ifeq ($(PGO_ARCH),arm64)
+    PGO_INSTR_EXE = bwa-mem2.pgo-instr
+    PGO_FINAL_EXE = bwa-mem2.pgo
+else
+    PGO_INSTR_EXE = bwa-mem2.pgo-instr.$(PGO_ARCH)
+    PGO_FINAL_EXE = bwa-mem2.pgo.$(PGO_ARCH)
+endif
 
 pgo-generate:
 	rm -f src/*.o $(BWA_LIB); cd ext/safestringlib/ && $(MAKE) clean;
-	$(MAKE) arch=arm64 EXE=bwa-mem2.pgo-instr CXXFLAGS="$(CXXFLAGS) -g -O3 -fpermissive $(ARCH_FLAGS) -fprofile-generate=$(PGO_PROFILE_DIR)" CXX=$(CXX) all
-	@echo "PGO instrumented binary built. Run training workload with bwa-mem2.pgo-instr"
-	@echo "Then run: make pgo-use"
+	$(MAKE) arch=$(PGO_ARCH) EXE=$(PGO_INSTR_EXE) EXTRA_CXXFLAGS="-fprofile-generate=$(PGO_PROFILE_DIR)" CXX=$(CXX) all
+	@echo "PGO instrumented binary built: $(PGO_INSTR_EXE) (arch=$(PGO_ARCH), profile dir=$(PGO_PROFILE_DIR))"
+	@echo "Run training workload with $(PGO_INSTR_EXE), then: make pgo-use PGO_ARCH=$(PGO_ARCH) PGO_PROFILE_DIR=$(PGO_PROFILE_DIR)"
 
 pgo-use:
 	rm -f src/*.o $(BWA_LIB); cd ext/safestringlib/ && $(MAKE) clean;
-	$(MAKE) arch=arm64 EXE=bwa-mem2.pgo CXXFLAGS="$(CXXFLAGS) -g -O3 -fpermissive $(ARCH_FLAGS) -fprofile-use=$(PGO_PROFILE_DIR) -fprofile-correction" CXX=$(CXX) all
-	@echo "PGO optimized binary built: bwa-mem2.pgo"
+	$(MAKE) arch=$(PGO_ARCH) EXE=$(PGO_FINAL_EXE) EXTRA_CXXFLAGS="-fprofile-use=$(PGO_PROFILE_DIR) -fprofile-correction" CXX=$(CXX) all
+	@echo "PGO optimized binary built: $(PGO_FINAL_EXE) (arch=$(PGO_ARCH))"
 
 pgo-clean:
-	rm -rf $(PGO_PROFILE_DIR) bwa-mem2.pgo-instr bwa-mem2.pgo
+	rm -rf $(PGO_PROFILE_DIR) bwa-mem2.pgo-instr bwa-mem2.pgo bwa-mem2.pgo-instr.* bwa-mem2.pgo.*
 
 # Print the effective mimalloc setting. Used by CI and humans.
 print-mimalloc-config:
