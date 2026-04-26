@@ -16,6 +16,9 @@ jobs:
   build-and-test:
     strategy:
       fail-fast: false
+      # Each row carries `artifact_slug` (a-z0-9-) alongside the human-
+      # friendly `name`. Artifact uploads use the slug to keep names URL-
+      # safe and free of spaces / parens; job titles still use `name`.
       matrix:
         include:
           - os: ubuntu-latest
@@ -23,35 +26,42 @@ jobs:
             use_mimalloc: "1"
             run_integration: true
             name: "Linux x86_64 SSE4.1 (mimalloc)"
+            artifact_slug: "linux-x86_64-sse41-mimalloc"
           - os: ubuntu-latest
             arch_flag: "avx2"
             use_mimalloc: "1"
             canonical: true
             run_integration: true
             name: "Linux x86_64 AVX2 (mimalloc)"
+            artifact_slug: "linux-x86_64-avx2-mimalloc"
           - os: ubuntu-latest
             arch_flag: "avx2"
             use_mimalloc: "0"
             name: "Linux x86_64 AVX2 (no-mimalloc)"
+            artifact_slug: "linux-x86_64-avx2-no-mimalloc"
           - os: ubuntu-24.04-arm
             arch_flag: ""
             use_mimalloc: "1"
             run_integration: true
             name: "Linux ARM64 (mimalloc)"
+            artifact_slug: "linux-arm64-mimalloc"
           - os: macos-latest
             arch_flag: ""
             use_mimalloc: "1"
             run_integration: true
             name: "macOS ARM64 (mimalloc)"
+            artifact_slug: "macos-arm64-mimalloc"
           - os: ubuntu-latest
             arch_flag: "multi"
             use_mimalloc: "1"
             name: "Linux x86_64 multi (mimalloc)"
+            artifact_slug: "linux-x86_64-multi-mimalloc"
           - os: ubuntu-latest
             arch_flag: "avx2"
             use_mimalloc: "1"
             cxx: "clang++"
             name: "Linux x86_64 AVX2 clang (mimalloc)"
+            artifact_slug: "linux-x86_64-avx2-clang-mimalloc"
 
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
@@ -129,39 +139,40 @@ jobs:
         env:
           BWA_MEM2_TEST_MATRIX_ROW: ${{ matrix.name }}
         # `--reporters=junit --out=…` writes JUnit XML to the file and
-        # nothing to stdout, so on failure dump the XML to the job log to
-        # surface failing assertions inline. (`--reporters=console,junit`
-        # would interleave console output into the same `--out` file and
-        # corrupt the JUnit XML, so the reporters must run separately.)
+        # nothing to stdout. doctest itself prints the failing-assertion
+        # summary to stderr before exiting non-zero, so the per-step log
+        # already surfaces the diagnosis; the JUnit XML is only consumed
+        # via the upload-artifact step below.
         run: |
           ./test/bwa_mem2_tests_unit \
             --reporters=junit \
-            --out=unit-results-${{ strategy.job-index }}.xml \
-          || { cat unit-results-${{ strategy.job-index }}.xml; exit 1; }
+            --out=unit-results-${{ strategy.job-index }}.xml
 
       - name: Upload unit-test results
         if: always() && matrix.arch_flag != 'multi'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: unit-results-${{ matrix.name }}
+          # Sanitize matrix.name (contains spaces and parens like
+          # "Linux x86_64 SSE4.1 (mimalloc)") into a hyphenated artifact
+          # name. upload-artifact@v7 technically allows spaces and parens
+          # but a sanitized name keeps URLs and downloads clean.
+          name: unit-results-${{ matrix.artifact_slug }}
           path: unit-results-*.xml
 
       - name: Run integration tests
         if: matrix.run_integration == true && matrix.arch_flag != 'multi'
         env:
           BWA_MEM2_TEST_MATRIX_ROW: ${{ matrix.name }}
-        # See unit-test step above for the cat-on-failure rationale.
         run: |
           ./test/bwa_mem2_tests_integration \
             --reporters=junit \
-            --out=integration-results-${{ strategy.job-index }}.xml \
-          || { cat integration-results-${{ strategy.job-index }}.xml; exit 1; }
+            --out=integration-results-${{ strategy.job-index }}.xml
 
       - name: Upload integration-test results
         if: always() && matrix.run_integration == true && matrix.arch_flag != 'multi'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: integration-results-${{ matrix.name }}
+          name: integration-results-${{ matrix.artifact_slug }}
           path: integration-results-*.xml
 
       - name: Verify mimalloc is linked (when enabled)

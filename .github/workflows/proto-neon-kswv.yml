@@ -87,7 +87,9 @@ jobs:
           fi
           gunzip /tmp/ci-ref/chr17.fa.gz
 
-      # Cache key ties built binaries to any src, ext, or Makefile change.
+      # Cache key ties built binaries to any src, ext, Makefile, or
+      # workflow-file change so flag tweaks here (CXX, arch, etc.) bust
+      # the cache even when src/ext/Makefile are untouched.
       - name: Cache port build artifacts
         id: cache-port
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
@@ -95,7 +97,7 @@ jobs:
           path: |
             bwa-mem2.port
             libbwa.port.a
-          key: arm-port-${{ hashFiles('src/**', 'ext/**', 'Makefile') }}
+          key: arm-port-${{ hashFiles('src/**', 'ext/**', 'Makefile', '.github/workflows/proto-neon-kswv.yml') }}
 
       - name: Build port (gates widened; no-op on this branch until the port lands)
         if: steps.cache-port.outputs.cache-hit != 'true'
@@ -110,7 +112,7 @@ jobs:
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: bwa-mem2.control
-          key: arm-control-${{ hashFiles('src/**', 'ext/**', 'Makefile') }}
+          key: arm-control-${{ hashFiles('src/**', 'ext/**', 'Makefile', '.github/workflows/proto-neon-kswv.yml') }}
 
       - name: Build control (DISABLE_BATCHED_MATESW=1)
         if: steps.cache-control.outputs.cache-hit != 'true'
@@ -120,6 +122,9 @@ jobs:
           mv bwa-mem2.arm64 bwa-mem2.control
 
       - name: Build kswv unit test
+        # Route through the parent `test-binaries` target — same as the
+        # x86 job — so any future changes to ARCH_FLAGS_FROM_PARENT plumbing
+        # apply uniformly to both arches.
         run: |
           # Use the 'port' libbwa; the kswv unit test only exercises kswv regardless.
           cp libbwa.port.a libbwa.a
@@ -129,7 +134,7 @@ jobs:
           # — which references it directly — fails to find it. Rebuild it
           # explicitly so this step works on cache hit and cache miss alike.
           make ext/safestringlib/libsafestring.a CXX=g++
-          make -C test framework unit CXX=g++
+          make test-binaries CXX=g++
 
       - name: Run kswv unit test
         id: selftest
@@ -345,7 +350,7 @@ jobs:
           path: |
             bwa-mem2.port
             libbwa.port.a
-          key: x86-port-${{ env.USE_AVX }}-${{ hashFiles('src/**', 'ext/**', 'Makefile') }}
+          key: x86-port-${{ env.USE_AVX }}-${{ hashFiles('src/**', 'ext/**', 'Makefile', '.github/workflows/proto-neon-kswv.yml') }}
 
       - name: Build x86 port (batched mate-rescue enabled)
         if: steps.cache-x86-port.outputs.cache-hit != 'true'
@@ -359,7 +364,7 @@ jobs:
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: bwa-mem2.control
-          key: x86-control-${{ env.USE_AVX }}-${{ hashFiles('src/**', 'ext/**', 'Makefile') }}
+          key: x86-control-${{ env.USE_AVX }}-${{ hashFiles('src/**', 'ext/**', 'Makefile', '.github/workflows/proto-neon-kswv.yml') }}
 
       - name: Build x86 control (DISABLE_BATCHED_MATESW=1)
         if: steps.cache-x86-control.outputs.cache-hit != 'true'

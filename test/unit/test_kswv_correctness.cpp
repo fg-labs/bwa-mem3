@@ -90,19 +90,24 @@ TEST_CASE("kswv::getScores8 matches scalar ksw_align2 on 10k random + curated ed
         const bool score_ok  = bwa_tests::kswr_score_eq(scalar_aln[i], batched[i]);
         const bool coord_ok  = bwa_tests::kswr_coords_eq(scalar_aln[i], batched[i]);
         const bool score2_ok = bwa_tests::kswr_score2_eq(scalar_aln[i], batched[i]);
-        if (!score_ok)  ++score_mism;
-        if (!coord_ok)  ++coord_mism;
-        if (!score2_ok) ++score2_mism;
-
-        CHECK(score_ok);
-        CHECK(coord_ok);
-        CHECK(score2_ok);
+        // Only emit per-pair CHECKs on mismatch — at 10k pairs the doctest
+        // log would otherwise carry ~30k passing assertions per run, which
+        // dwarfs the actual signal on a regression.
+        if (!score_ok)  { ++score_mism;  CHECK(score_ok); }
+        if (!coord_ok)  { ++coord_mism;  CHECK(coord_ok); }
+        if (!score2_ok) { ++score2_mism; CHECK(score2_ok); }
     }
 
     MESSAGE("kswv vs scalar: score_mism=" << score_mism
             << " coord_mism=" << coord_mism
             << " score2_mism=" << score2_mism
             << " over " << pairs.size() << " pairs");
+    // Aggregate gates so a regression with no per-pair CHECK still fails
+    // the test (e.g. if all 10k pairs happen to mismatch in coords only,
+    // those per-pair CHECKs cover it; this catches counting drift too).
+    CHECK(score_mism == 0);
+    CHECK(coord_mism == 0);
+    CHECK(score2_mism == 0);
 }
 
 TEST_CASE("kswv handles every curated edge case identically to scalar"
