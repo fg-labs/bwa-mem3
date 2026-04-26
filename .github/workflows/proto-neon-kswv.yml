@@ -123,6 +123,12 @@ jobs:
         run: |
           # Use the 'port' libbwa; the kswv unit test only exercises kswv regardless.
           cp libbwa.port.a libbwa.a
+          # Port/control build caches restore only the bwa-mem2 binaries +
+          # libbwa.port.a; ext/safestringlib/libsafestring.a is not in either
+          # cache, so when both caches hit (no `make` runs) the test link line
+          # — which references it directly — fails to find it. Rebuild it
+          # explicitly so this step works on cache hit and cache miss alike.
+          make ext/safestringlib/libsafestring.a CXX=g++
           make -C test framework unit CXX=g++
 
       - name: Run kswv unit test
@@ -370,6 +376,12 @@ jobs:
         # surface libbwa.port.a was built with.
         run: |
           cp libbwa.port.a libbwa.a
+          # Port/control build caches restore only the bwa-mem2 binaries +
+          # libbwa.port.a; ext/safestringlib/libsafestring.a is not in either
+          # cache, so when both caches hit (no `make` runs) the test link line
+          # — which references it directly — fails to find it. Rebuild it
+          # explicitly so this step works on cache hit and cache miss alike.
+          make ext/safestringlib/libsafestring.a arch="$USE_AVX" CXX=g++
           make test-binaries arch="$USE_AVX" CXX=g++
 
       - name: Run kswv unit test (x86)
