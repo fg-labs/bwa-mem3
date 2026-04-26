@@ -460,12 +460,10 @@ void FMI_search::getSMEMsOnePosOneThread(uint8_t *enc_qdb,
 // composing the existing primitives (backwardExt, count[], cp_occ) in the
 // same sequence the scalar would.
 //
-// MAX_READ_LEN_FOR_LOCKSTEP caps per-slot buffer sizes so the whole slot
-// lives on the caller's stack. Override via -DMAX_READ_LEN_FOR_LOCKSTEP=N
-// at build time if running with reads longer than the default.
-#ifndef MAX_READ_LEN_FOR_LOCKSTEP
-#define MAX_READ_LEN_FOR_LOCKSTEP 512
-#endif
+// The prev[] and match_buf[] buffers are heap-allocated by the driver
+// (getSMEMsOnePosOneThread_lockstep), sized from the batch's
+// max_readlength. No compile-time cap — long reads (PacBio HiFi, ONT)
+// fit cleanly.
 
 enum LockstepPhase : uint8_t {
     PH_FWD      = 0,  // forward extension inner loop active
@@ -504,9 +502,10 @@ struct FMI_search::BatchSlot {
     int32_t match_count;
     bool    ready;
 
-    // Pointers into per-slot bulk arrays (allocated by the caller).
-    SMEM    *prev;        // capacity = MAX_READ_LEN_FOR_LOCKSTEP
-    SMEM    *match_buf;   // capacity = MAX_READ_LEN_FOR_LOCKSTEP
+    // Pointers into per-slot bulk arrays (allocated by the driver, sized
+    // by max_readlength).
+    SMEM    *prev;
+    SMEM    *match_buf;
 };
 
 void FMI_search::ls_prefetch_cp_occ(const BatchSlot *s)
@@ -557,17 +556,6 @@ void FMI_search::ls_init_slot(BatchSlot *s,
     s->start_pos   = query_pos_array[input_idx];
     s->min_intv    = min_intv_array[input_idx];
     s->readlength  = seq_[s->rid].l_seq;
-    /* Runtime guard rather than assert(): the lockstep prev/match buffers are
-     * fixed-size on the stack (sized by MAX_READ_LEN_FOR_LOCKSTEP), and a read
-     * exceeding that bound would corrupt them silently in NDEBUG builds. */
-    if (s->readlength > MAX_READ_LEN_FOR_LOCKSTEP) {
-        fprintf(stderr,
-                "[FMI_search::ls_init_slot] read rid=%d length=%d exceeds "
-                "MAX_READ_LEN_FOR_LOCKSTEP=%d; recompile with "
-                "-DMAX_READ_LEN_FOR_LOCKSTEP=<n>\n",
-                s->rid, s->readlength, MAX_READ_LEN_FOR_LOCKSTEP);
-        exit(EXIT_FAILURE);
-    }
     s->offset      = query_cum_len_ar[s->rid];
     s->next_x      = s->start_pos + 1;
     s->numPrev     = 0;
@@ -832,20 +820,51 @@ void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
                                                    int64_t *__numTotalSmem)
 {
     (void)batch_size;
-    (void)max_readlength;
 
     if (numReads == 0) return;
 
     const int32_t N = SMEM_LOCKSTEP_N;
     // LISA trick #4: hybrid SoA layout. `slots[]` holds only the small hot
     // state (~80 B per slot, full array fits in 1-2 cache lines for N=8).
-    // Bulk per-slot buffers (prev/match_buf, ~32 KB each) live separately.
-    BatchSlot slots[SMEM_LOCKSTEP_N];
-    SMEM prev_bufs [SMEM_LOCKSTEP_N][MAX_READ_LEN_FOR_LOCKSTEP];
-    SMEM match_bufs[SMEM_LOCKSTEP_N][MAX_READ_LEN_FOR_LOCKSTEP];
+    // Bulk per-slot buffers (prev/match_buf) live separately and are reused
+    // across calls via thread_local caches sized from the batch's
+    // max_readlength so reads of any length fit (see issue #44 / PR #55).
+    //
+    // The outer driver getSMEMsAllPosOneThread runs this in a do/while
+    // loop, so allocating per-call (~2*N*max_readlength*sizeof(SMEM) ≈
+    // 384 KB at N=8, max_readlength=1500) imposed measurable allocator
+    // pressure. Cache per-thread (so OMP workers don't share) and grow
+    // monotonically — max_readlength is bounded by the driver batch and
+    // increases rarely in practice.
+    //
+    // TODO(memory): the cache only grows. For mixed-length workloads (e.g.
+    // a single ONT-class read with max_readlength≈1e6 mid-stream — sized
+    // to ~640 MB per thread, ~10 GB across 16 OMP workers — followed by
+    // short reads), the high-water mark is held until thread/process exit.
+    // Acceptable for the smoke1M Illumina PE150 benchmark (max_readlength≈
+    // 150 → ~38 KB/thread). Revisit if a streaming aligner or long-running
+    // service pipeline appears: gate the realloc on a configured upper
+    // bound (e.g. MAX_SMEM_PER_SLOT) or shrink when cached_per_slot greatly
+    // exceeds the current batch. Also flagged by leak-sanitizer/Valgrind
+    // because the buffers are released only at process exit.
+    BatchSlot slots[SMEM_LOCKSTEP_N] = {};
+    static thread_local SMEM   *cached_prev  = NULL;
+    static thread_local SMEM   *cached_match = NULL;
+    static thread_local size_t  cached_per_slot = 0;
+    const size_t per_slot_smems = (size_t)max_readlength;
+    if (per_slot_smems > cached_per_slot) {
+        if (cached_prev  != NULL) _mm_free(cached_prev);
+        if (cached_match != NULL) _mm_free(cached_match);
+        const size_t total_slot_bytes = (size_t)N * per_slot_smems * sizeof(SMEM);
+        cached_prev  = (SMEM *)_mm_malloc(total_slot_bytes, 64);
+        assert_not_null(cached_prev, total_slot_bytes, total_slot_bytes);
+        cached_match = (SMEM *)_mm_malloc(total_slot_bytes, 64);
+        assert_not_null(cached_match, total_slot_bytes, (size_t)2 * total_slot_bytes);
+        cached_per_slot = per_slot_smems;
+    }
     for (int32_t s = 0; s < N; s++) {
-        slots[s].prev      = prev_bufs[s];
-        slots[s].match_buf = match_bufs[s];
+        slots[s].prev      = cached_prev  + (size_t)s * cached_per_slot;
+        slots[s].match_buf = cached_match + (size_t)s * cached_per_slot;
     }
 
     // Seed the first min(N, numReads) slots.
@@ -931,6 +950,9 @@ void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
     }
 
     *__numTotalSmem = numTotalSmem;
+    /* prev/match buffers are owned by thread_local caches above; intentionally
+     * not freed here so the next call (same thread) reuses them without a
+     * round-trip through the allocator. The caches leak at thread/process exit. */
 }
 
 int64_t FMI_search::bwtSeedStrategyAllPosOneThread(uint8_t *enc_qdb,

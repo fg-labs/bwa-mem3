@@ -519,10 +519,10 @@ int main(int argc, char *argv[]) {
     }
 
     /* Case 11: long reads (>151bp and >512bp) — regression for issue 44.
-     * Pre-fix, readlength > MAX_READ_LEN_FOR_LOCKSTEP (512) would trip a
-     * hard assert in ls_init_slot. Post-fix, the lockstep slot buffers
-     * are heap-backed and sized from the caller's max_readlength, so any
-     * length works. Exercises a 1000bp and a 1500bp synthetic read. */
+     * Pre-fix, readlength > 512 would trip the lockstep cap and exit.
+     * Post-fix, the lockstep slot buffers are heap-allocated by the
+     * driver and sized from max_readlength, so any length works.
+     * Exercises a 1000bp and a 1500bp synthetic read. */
     {
         char r_1000bp[1001];
         char r_1500bp[1501];
@@ -542,6 +542,36 @@ int main(int argc, char *argv[]) {
         int32_t mia[] = {1, 1};
         int32_t rid[] = {0, 1};
         run_case(fmi, "Case 11: long reads (1000bp, 1500bp)",
+                 numReads, max_readlength, 19,
+                 enc_qdb, qpa, mia, rid, seq_, cum_len);
+        free(enc_qdb); free(seq_); free(cum_len);
+    }
+
+    /* Case 12: long reads with mid-read N — exercises the non-ACGT
+     * termination path on the long-read code path that Case 11's clean
+     * 4-base rotation didn't cover. The forward SMEM walk must split at
+     * the N position and re-seed past it, on the heap-allocated lockstep
+     * slot buffers. Two reads: 1000bp with N at pos 700, 1500bp with N
+     * at pos 1100. */
+    {
+        char r_1000bp[1001];
+        char r_1500bp[1501];
+        const char *bases = "ACGT";
+        for (int i = 0; i < 1000; i++) r_1000bp[i] = bases[(i * 7 + 3) & 3];
+        r_1000bp[700] = 'N';
+        r_1000bp[1000] = '\0';
+        for (int i = 0; i < 1500; i++) r_1500bp[i] = bases[(i * 11 + 5) & 3];
+        r_1500bp[1100] = 'N';
+        r_1500bp[1500] = '\0';
+        const char *reads[] = { r_1000bp, r_1500bp };
+        int32_t numReads = 2;
+        int32_t max_readlength = 1500;
+        uint8_t *enc_qdb; bseq1_t *seq_; int32_t *cum_len;
+        encode_reads(reads, numReads, &enc_qdb, &seq_, &cum_len);
+        int16_t qpa[] = {0, 0};
+        int32_t mia[] = {1, 1};
+        int32_t rid[] = {0, 1};
+        run_case(fmi, "Case 12: long reads with mid-read N",
                  numReads, max_readlength, 19,
                  enc_qdb, qpa, mia, rid, seq_, cum_len);
         free(enc_qdb); free(seq_); free(cum_len);

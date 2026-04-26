@@ -1158,6 +1158,18 @@ int mem_kernel1_core(FMI_search *fmi,
         for (i = 0; i < len; ++i)
             seq[i] = seq[i] < 4? seq[i] : nst_nt4_table[(int)seq[i]]; //nst_nt4??
     }
+    // Empty-batch fast path: a 0-base batch (e.g. malformed FASTQ parsed as a
+    // single zero-length record) tripped the lazy-init grow block below with
+    // tot_len(0) >= wsize_mem(0), routing through _mm_realloc(NULL, 0, 0, …)
+    // and exiting via the post-collect overflow check. With no bases, there
+    // are no SMEMs to collect — initialize chain_ar to empty so mem_kernel2_core
+    // (which walks chain_ar unconditionally and free()s chain_ar[l].a) sees
+    // a valid empty state, then let downstream stages emit unmapped records.
+    if (tot_len == 0) {
+        for (int l = 0; l < nseq; ++l)
+            kv_init(chain_ar[l]);
+        return 1;
+    }
     // tot_len *= N_SMEM_KERNEL;
     // fprintf(stderr, "wsize: %d, tot_len: %d\n", mmc->wsize_mem[tid], tot_len);
     // This covers enc_qdb/SMEM reallocs
