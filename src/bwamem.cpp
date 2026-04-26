@@ -3227,9 +3227,18 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
     SeqPair *pair_ar_aux = seqPairArrayAux;
     int nump = numPairsLeft1;
 
-    // PR 26c.1: tighten initial band using max(tight_band) across batch.
+    // per-pair tight_band proofs are still piped in via
+    // sp->tight_band (and short-circuit the retry loop below once w >=
+    // tight_band), but we no longer narrow init_w from opt->w. A batched
+    // SW pass shares one band across all pairs in the batch, so narrowing
+    // would force FALLBACK pairs (no tight_band proof) to start with a
+    // band insufficient for indels their alignment really needs. The
+    // heuristic exits (a->score == prev / max_off < 3w/4) can then fire
+    // on a suboptimal alignment found within the narrow band, breaking
+    // chr22 parity.
     int max_tb = sp_max_tight_band(pair_ar, nump);
-    int init_w = (max_tb > 0 && max_tb < opt->w) ? max_tb : opt->w; if (init_w > BUCKET_MAX_INIT_W) init_w = BUCKET_MAX_INIT_W;
+    int init_w = opt->w;
+    (void)max_tb;
     tprof[UGP_L_DISP_NARROW][tid] += (init_w < opt->w);
 
     // scalar
@@ -3257,7 +3266,8 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
             a->score = sp->score;
 
             if (a->score == prev || sp->max_off < (w >> 1) + (w >> 2) ||
-                i+1 == MAX_BAND_TRY || sp->tight_band > 0)
+                i+1 == MAX_BAND_TRY ||
+                (sp->tight_band > 0 && w >= sp->tight_band))
             {
                 ugp_record_left_outcome(sp, opt->a, tid);
                 if (sp->gscore <= 0 || sp->gscore <= a->score - opt->pen_clip5) {
@@ -3299,7 +3309,8 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
 
     nump = numPairsLeft16;
     max_tb = sp_max_tight_band(pair_ar, nump);
-    init_w = (max_tb > 0 && max_tb < opt->w) ? max_tb : opt->w; if (init_w > BUCKET_MAX_INIT_W) init_w = BUCKET_MAX_INIT_W;
+    init_w = opt->w;
+    (void)max_tb;
     tprof[UGP_L_DISP_NARROW][tid] += (init_w < opt->w);
     for ( i=0; i<MAX_BAND_TRY; i++)
     {
@@ -3333,7 +3344,8 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
 
 
             if (a->score == prev || sp->max_off < (w >> 1) + (w >> 2) ||
-                i+1 == MAX_BAND_TRY || sp->tight_band > 0)
+                i+1 == MAX_BAND_TRY ||
+                (sp->tight_band > 0 && w >= sp->tight_band))
             {
                 ugp_record_left_outcome(sp, opt->a, tid);
                 if (sp->gscore <= 0 || sp->gscore <= a->score - opt->pen_clip5) {
@@ -3371,7 +3383,8 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
 
     nump = numPairsLeft128;
     max_tb = sp_max_tight_band(pair_ar, nump);
-    init_w = (max_tb > 0 && max_tb < opt->w) ? max_tb : opt->w; if (init_w > BUCKET_MAX_INIT_W) init_w = BUCKET_MAX_INIT_W;
+    init_w = opt->w;
+    (void)max_tb;
     tprof[UGP_L_DISP_NARROW][tid] += (init_w < opt->w);
     for ( i=0; i<MAX_BAND_TRY; i++)
     {
@@ -3405,7 +3418,8 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
             a->score = sp->score;
 
             if (a->score == prev || sp->max_off < (w >> 1) + (w >> 2) ||
-                i+1 == MAX_BAND_TRY || sp->tight_band > 0)
+                i+1 == MAX_BAND_TRY ||
+                (sp->tight_band > 0 && w >= sp->tight_band))
             {
                 ugp_record_left_outcome(sp, opt->a, tid);
                 if (sp->gscore <= 0 || sp->gscore <= a->score - opt->pen_clip5) {
@@ -3583,7 +3597,8 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
     pair_ar_aux = seqPairArrayAux;
     nump = numPairsRight1;
     max_tb = sp_max_tight_band(pair_ar, nump);
-    init_w = (max_tb > 0 && max_tb < opt->w) ? max_tb : opt->w; if (init_w > BUCKET_MAX_INIT_W) init_w = BUCKET_MAX_INIT_W;
+    init_w = opt->w;
+    (void)max_tb;
     tprof[UGP_R_DISP_NARROW][tid] += (init_w < opt->w);
 
     for ( i=0; i<MAX_BAND_TRY; i++)
@@ -3611,7 +3626,8 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
 
             // no further banding
             if (a->score == prev || sp->max_off < (w >> 1) + (w >> 2) ||
-                i+1 == MAX_BAND_TRY || sp->tight_band > 0)
+                i+1 == MAX_BAND_TRY ||
+                (sp->tight_band > 0 && w >= sp->tight_band))
             {
                 ugp_record_right_outcome(sp, tid);
                 if (sp->gscore <= 0 || sp->gscore <= a->score - opt->pen_clip3) {
@@ -3648,7 +3664,8 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
     pair_ar_aux = seqPairArrayAux;
     nump = numPairsRight16;
     max_tb = sp_max_tight_band(pair_ar, nump);
-    init_w = (max_tb > 0 && max_tb < opt->w) ? max_tb : opt->w; if (init_w > BUCKET_MAX_INIT_W) init_w = BUCKET_MAX_INIT_W;
+    init_w = opt->w;
+    (void)max_tb;
     tprof[UGP_R_DISP_NARROW][tid] += (init_w < opt->w);
 
     for ( i=0; i<MAX_BAND_TRY; i++)
@@ -3684,7 +3701,8 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
 
             // no further banding
             if (a->score == prev || sp->max_off < (w >> 1) + (w >> 2) ||
-                i+1 == MAX_BAND_TRY || sp->tight_band > 0)
+                i+1 == MAX_BAND_TRY ||
+                (sp->tight_band > 0 && w >= sp->tight_band))
             {
                 ugp_record_right_outcome(sp, tid);
                 if (sp->gscore <= 0 || sp->gscore <= a->score - opt->pen_clip3) {
@@ -3722,7 +3740,8 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
     pair_ar_aux = seqPairArrayAux;
     nump = numPairsRight128;
     max_tb = sp_max_tight_band(pair_ar, nump);
-    init_w = (max_tb > 0 && max_tb < opt->w) ? max_tb : opt->w; if (init_w > BUCKET_MAX_INIT_W) init_w = BUCKET_MAX_INIT_W;
+    init_w = opt->w;
+    (void)max_tb;
     tprof[UGP_R_DISP_NARROW][tid] += (init_w < opt->w);
 
     for ( i=0; i<MAX_BAND_TRY; i++)
@@ -3757,7 +3776,8 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
             a->score = sp->score;
             // no further banding
             if (a->score == prev || sp->max_off < (w >> 1) + (w >> 2) ||
-                i+1 == MAX_BAND_TRY || sp->tight_band > 0)
+                i+1 == MAX_BAND_TRY ||
+                (sp->tight_band > 0 && w >= sp->tight_band))
             {
                 ugp_record_right_outcome(sp, tid);
                 if (sp->gscore <= 0 || sp->gscore <= a->score - opt->pen_clip3) {
