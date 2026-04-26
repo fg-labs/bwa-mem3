@@ -80,6 +80,23 @@ int main(int argc, char **argv) {
     assert(readlength < 10000);
     assert(numReads > 0);
     assert(numReads * readlength < QUERY_DB_SIZE);
+    // bwtSeedStrategyAllPosOneThread now requires the caller to pre-size
+    // matchArray to at least numReads * max(seqs[i].l_seq) SMEMs (the
+    // internal max_smem cap was removed). This test allocates by the CLI
+    // `readlength` and the encoder loop below reads seqs[st].seq[r] for
+    // every r < readlength, so reject any record whose length doesn't
+    // match: longer reads would overflow matchArray, shorter reads would
+    // walk past seqs[st].seq. Unconditional check so the safety holds
+    // under -DNDEBUG.
+    for (int32_t _i = 0; _i < numReads; _i++) {
+        if (seqs[_i].l_seq != readlength) {
+            fprintf(stderr,
+                    "[E::%s] read %d has l_seq=%d != readlength=%d; "
+                    "fixed-width buffers would be indexed out of bounds.\n",
+                    __func__, _i, seqs[_i].l_seq, readlength);
+            exit(EXIT_FAILURE);
+        }
+    }
 
     uint8_t *enc_qdb=(uint8_t *)malloc(numReads*readlength*sizeof(uint8_t));
 
@@ -145,8 +162,7 @@ int main(int argc, char **argv) {
             seqs,
             query_cum_len_ar,
             minSeedLen,
-            matchArray,
-            (int64_t)numReads * readlength);
+            matchArray);
 
     endTick = __rdtsc();
 #ifdef VTUNE_ANALYSIS

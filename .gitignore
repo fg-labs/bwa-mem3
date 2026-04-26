@@ -3,4 +3,6 @@
 *.dSYM
 .*.swp
 a.out
+bwa-mem2
+bwa-mem2.*
 src/version.h

@@ -32,6 +32,9 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
 #if NUMA_ENABLED
 #include <numa.h>
 #endif
@@ -550,8 +553,10 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
                     }
                     meth_bam_group_propagate_qcfail(group, total);
                     for (int j = 0; j < total; ++j) {
+#ifndef DISABLE_OUTPUT
                         if (meth_bam_writer_write(g_meth_bam_writer, group[j]) < 0)
                             err_fatal(__func__, "failed to write meth BAM record");
+#endif
                         bam_writer_free(group[j]);
                     }
                     free(group);
@@ -559,15 +564,28 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
             } else if (aux->bam_writer != NULL) {
                 for (int k = 0; k < group_size; ++k) {
                     for (int j = 0; j < ret->seqs[i+k].n_bams; ++j) {
+#ifndef DISABLE_OUTPUT
                         if (bam_writer_write(aux->bam_writer, (struct bam1_t *)ret->seqs[i+k].bams[j]) < 0)
                             err_fatal(__func__, "failed to write BAM record");
+#endif
                         bam_writer_free((struct bam1_t *)ret->seqs[i+k].bams[j]);
                     }
                 }
             } else {
                 for (int k = 0; k < group_size; ++k) {
                     if (ret->seqs[i+k].sam) {
+#ifndef DISABLE_OUTPUT
                         fputs(ret->seqs[i+k].sam, aux->fp);
+#endif
+                    }
+                    /* meth_mode populates bams[] regardless of writer state;
+                     * under DISABLE_OUTPUT both writers are forced NULL and
+                     * we land here, so the per-record bam1_t allocations
+                     * would otherwise leak (only the pointer array below is
+                     * freed). Profile-build only, but it skews the very
+                     * Maximum RSS that bench/run.sh records. */
+                    for (int j = 0; j < ret->seqs[i+k].n_bams; ++j) {
+                        bam_writer_free((struct bam1_t *)ret->seqs[i+k].bams[j]);
                     }
                 }
             }
@@ -1237,7 +1255,19 @@ int main_mem(int argc, char *argv[])
     fseek(fr, 0, SEEK_END);
     rlen = ftell(fr);
     ref_string = (uint8_t*) _mm_malloc(rlen, 64);
+    assert_not_null(ref_string, rlen, rlen);
     aux.ref_string = ref_string;
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+    /* Pack table is ~800 MB for hg38 — accessed at every candidate alignment
+     * for reference fetch. Request transparent hugepages to reduce dTLB
+     * pressure and tame 4-KB-page demotion spikes that cause bimodal wall-
+     * clock variance on large indices. (The duplicate hint in
+     * bwa_idx_load_from_disk targets the legacy disk-load path that
+     * bwa-mem2 mem doesn't use — `ref_string` here is the live runtime
+     * buffer.) */
+    if (ref_string != NULL && rlen > 0)
+        (void)madvise(ref_string, rlen, MADV_HUGEPAGE);
+#endif
     rewind(fr);
 
     /* Reading ref. sequence */
@@ -1315,6 +1345,30 @@ int main_mem(int argc, char *argv[])
      *    @HD + @SQ + @PG header. Honors -o/-f or stdout.
      *  - SAM text: open -o/-f path (if any) as a FILE*; bwa_print_sam_hdr2. */
     bam_writer_t *bam_writer = NULL;
+#ifdef DISABLE_OUTPUT
+    /* profile-build (-DDISABLE_OUTPUT) skips ALL filesystem-touching output
+     * code so wall-clock measurements aren't gated on disk speed. The
+     * per-record write sites below are also #ifndef-guarded; this block
+     * additionally skips writer open + header emit so a non-writable -o
+     * (or read-only fs) doesn't fail before compute begins. */
+    aux.bam_writer = NULL;
+    g_meth_bam_writer = NULL;
+    if (opt->meth_mode) {
+        g_meth_cmap = meth_chrom_map_build_from_bns(aux.fmi->idx->bns);
+        /* g_meth_cmap is consulted by per-record paths even with output
+         * disabled; build it so meth_mode tagging stays consistent. */
+        if (g_meth_cmap == NULL) {
+            fprintf(stderr, "ERROR: meth: failed to build chrom map\n");
+            free(opt);
+            delete aux.fmi;
+            return 1;
+        }
+    }
+    (void)is_o;
+    (void)hdr_line;
+    (void)idx_hdr_lines;
+    (void)out_path;
+#else
     if (opt->meth_mode) {
         g_meth_cmap = meth_chrom_map_build_from_bns(aux.fmi->idx->bns);
         if (g_meth_cmap == NULL) {
@@ -1369,6 +1423,7 @@ int main_mem(int argc, char *argv[])
         }
         bwa_print_sam_hdr2(aux.fmi->idx->bns, idx_hdr_lines, hdr_line, aux.fp);
     }
+#endif
 
     if (fixed_chunk_size > 0)
         aux.task_size = fixed_chunk_size;
@@ -1413,6 +1468,13 @@ int main_mem(int argc, char *argv[])
             exit_code = 1;
         }
         g_meth_bam_writer = NULL;
+    }
+    /* Free g_meth_cmap independently of g_meth_bam_writer: under
+     * -DDISABLE_OUTPUT the writer is never opened, but the chrom map is
+     * still built so per-record paths see consistent tagging. The
+     * branch above only fires when the writer exists, so freeing the
+     * map there would leak on the DISABLE_OUTPUT path. */
+    if (meth_mode_local && g_meth_cmap != NULL) {
         meth_chrom_map_free(g_meth_cmap);
         g_meth_cmap = NULL;
     }

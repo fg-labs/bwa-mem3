@@ -33,6 +33,142 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "memcpy_bwamem.h"
 #include "bam_writer.h"
 #include "meth_bam.h"
+#include <inttypes.h>      /* PRId64 for int64_t fprintf format strings */
+
+/* ─── SIMD-accelerated SEQ/QUAL encoders for SAM record building ──────────
+ * Replaces the per-byte `dst[i] = "ACGTN"[src[i]]` loop in mem_aln2sam.
+ * Works on 16 bytes at a time via a byte-LUT shuffle. Three implementations
+ * compiled in: NEON (vqtbl1q_u8) on aarch64, SSSE3 (_mm_shuffle_epi8) on
+ * x86 — covers SSSE3, SSE4, AVX2, AVX-512BW — and a scalar fallback for
+ * everything else. AVX2/AVX-512BW could process 32/64 bytes per iter but
+ * the inner loop is already short for typical 150-bp reads, so the SSSE3
+ * 16-byte width is the right compromise of code volume vs. perf. */
+#if defined(__ARM_NEON) || defined(__aarch64__)
+#  include <arm_neon.h>
+#  define SAM_FAST_IMPL 1   /* NEON */
+#elif defined(__SSSE3__) || defined(__SSE4_1__) || defined(__AVX__) \
+   || defined(__AVX2__) || defined(__AVX512BW__)
+#  include <tmmintrin.h>    /* SSSE3 _mm_shuffle_epi8 */
+#  define SAM_FAST_IMPL 2   /* SSSE3+ */
+#endif
+
+#ifdef SAM_FAST_IMPL
+static const uint8_t enc_fwd_lut[16] = {
+    'A','C','G','T','N','N','N','N',
+    'N','N','N','N','N','N','N','N',
+};
+static const uint8_t enc_rev_lut[16] = {
+    'T','G','C','A','N','N','N','N',
+    'N','N','N','N','N','N','N','N',
+};
+#endif
+
+/* Scalar tail clamp — mirrors the SIMD path's vminq_u8/_mm_min_epu8 against 4
+ * so any code >= 5 in src[] decodes to 'N' instead of indexing OOB into the
+ * 5-byte "ACGTN"/"TGCAN" literals. Today s->seq is always 2-bit ACGTN before
+ * mem_aln2sam, so this is latent — but it keeps SIMD and scalar paths in
+ * lockstep if that invariant ever drifts. */
+#define SAM_NT_CLAMP4(c) ((unsigned)(c) <= 4u ? (unsigned)(c) : 4u)
+
+#if SAM_FAST_IMPL == 1
+/* NEON 16-byte: vqtbl1q_u8 LUT + vminq_u8 clamp + vextq+vrev64q reverse. */
+static inline void encode_seq_fwd(char *dst, const uint8_t *src, int n) {
+    const uint8x16_t lut = vld1q_u8(enc_fwd_lut);
+    const uint8x16_t four = vdupq_n_u8(4);
+    int i = 0;
+    while (i + 16 <= n) {
+        uint8x16_t v   = vld1q_u8(src + i);
+        uint8x16_t cl  = vminq_u8(v, four);
+        uint8x16_t out = vqtbl1q_u8(lut, cl);
+        vst1q_u8((uint8_t*)dst + i, out);
+        i += 16;
+    }
+    while (i < n) { dst[i] = "ACGTN"[SAM_NT_CLAMP4(src[i])]; ++i; }
+}
+static inline void encode_seq_rev(char *dst, const uint8_t *src, int n) {
+    const uint8x16_t lut = vld1q_u8(enc_rev_lut);
+    const uint8x16_t four = vdupq_n_u8(4);
+    int i = 0;
+    while (i + 16 <= n) {
+        uint8x16_t v = vld1q_u8(src + n - 16 - i);
+        v = vextq_u8(v, v, 8);
+        v = vrev64q_u8(v);
+        uint8x16_t cl  = vminq_u8(v, four);
+        uint8x16_t out = vqtbl1q_u8(lut, cl);
+        vst1q_u8((uint8_t*)dst + i, out);
+        i += 16;
+    }
+    while (i < n) { dst[i] = "TGCAN"[SAM_NT_CLAMP4(src[n - 1 - i])]; ++i; }
+}
+static inline void copy_qual_rev(char *dst, const char *src, int n) {
+    int i = 0;
+    while (i + 16 <= n) {
+        uint8x16_t v = vld1q_u8((const uint8_t*)(src + n - 16 - i));
+        v = vextq_u8(v, v, 8);
+        v = vrev64q_u8(v);
+        vst1q_u8((uint8_t*)dst + i, v);
+        i += 16;
+    }
+    while (i < n) { dst[i] = src[n - 1 - i]; ++i; }
+}
+#elif SAM_FAST_IMPL == 2
+/* SSSE3 16-byte: _mm_shuffle_epi8 LUT + _mm_min_epu8 clamp + reverse-mask
+ * shuffle for the reverse direction. Works on every x86 since 2006 (SSSE3
+ * is in Core 2 and later); AVX2/AVX-512 hosts pick this path too. */
+static const uint8_t rev16_mask[16] = {
+    15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0,
+};
+static inline void encode_seq_fwd(char *dst, const uint8_t *src, int n) {
+    const __m128i lut  = _mm_loadu_si128((const __m128i*)enc_fwd_lut);
+    const __m128i four = _mm_set1_epi8(4);
+    int i = 0;
+    while (i + 16 <= n) {
+        __m128i v   = _mm_loadu_si128((const __m128i*)(src + i));
+        __m128i cl  = _mm_min_epu8(v, four);
+        __m128i out = _mm_shuffle_epi8(lut, cl);
+        _mm_storeu_si128((__m128i*)(dst + i), out);
+        i += 16;
+    }
+    while (i < n) { dst[i] = "ACGTN"[SAM_NT_CLAMP4(src[i])]; ++i; }
+}
+static inline void encode_seq_rev(char *dst, const uint8_t *src, int n) {
+    const __m128i lut  = _mm_loadu_si128((const __m128i*)enc_rev_lut);
+    const __m128i four = _mm_set1_epi8(4);
+    const __m128i rev  = _mm_loadu_si128((const __m128i*)rev16_mask);
+    int i = 0;
+    while (i + 16 <= n) {
+        __m128i v   = _mm_loadu_si128((const __m128i*)(src + n - 16 - i));
+        v           = _mm_shuffle_epi8(v, rev);   /* reverse all 16 bytes */
+        __m128i cl  = _mm_min_epu8(v, four);
+        __m128i out = _mm_shuffle_epi8(lut, cl);
+        _mm_storeu_si128((__m128i*)(dst + i), out);
+        i += 16;
+    }
+    while (i < n) { dst[i] = "TGCAN"[SAM_NT_CLAMP4(src[n - 1 - i])]; ++i; }
+}
+static inline void copy_qual_rev(char *dst, const char *src, int n) {
+    const __m128i rev = _mm_loadu_si128((const __m128i*)rev16_mask);
+    int i = 0;
+    while (i + 16 <= n) {
+        __m128i v = _mm_loadu_si128((const __m128i*)(src + n - 16 - i));
+        v = _mm_shuffle_epi8(v, rev);
+        _mm_storeu_si128((__m128i*)(dst + i), v);
+        i += 16;
+    }
+    while (i < n) { dst[i] = src[n - 1 - i]; ++i; }
+}
+#else
+/* Scalar fallback (no SIMD available). */
+static inline void encode_seq_fwd(char *dst, const uint8_t *src, int n) {
+    for (int i = 0; i < n; ++i) dst[i] = "ACGTN"[SAM_NT_CLAMP4(src[i])];
+}
+static inline void encode_seq_rev(char *dst, const uint8_t *src, int n) {
+    for (int i = 0; i < n; ++i) dst[i] = "TGCAN"[SAM_NT_CLAMP4(src[n - 1 - i])];
+}
+static inline void copy_qual_rev(char *dst, const char *src, int n) {
+    for (int i = 0; i < n; ++i) dst[i] = src[n - 1 - i];
+}
+#endif
 /* Not including <htslib/sam.h>: its kstring.h shares the KSTRING_H guard
  * with bwa-mem2's. Opaque bam1_t wrappers live in bam_writer.h. */
 
@@ -54,7 +190,17 @@ KSORT_INIT(mem_intv1, SMEM, intv_lt1)  // debug
 #define max_(x, y) ((x)>(y)?(x):(y))
 #define min_(x, y) ((x)>(y)?(y):(x))
 
-#define MAX_BAND_TRY  2
+#define MAX_BAND_TRY  4
+
+/* cap initial band-width at this value. The retry loop
+ * doubles w each iteration (up to MAX_BAND_TRY-1 iters), so pairs whose
+ * alignment needs a wider band are caught by the retry. Setting this below
+ * opt->w forces the kernel to start tight, accept tight-fit pairs early
+ * (via sp->max_off heuristic + sp->tight_band), and only expand on demand.
+ * BUCKET_MAX_INIT_W=8 with MAX_BAND_TRY=4 gives w-sequence 8, 16, 32, 64. */
+#ifndef BUCKET_MAX_INIT_W
+#define BUCKET_MAX_INIT_W 8
+#endif
 
             int tcnt = 0;
 /********************
@@ -144,7 +290,6 @@ mem_opt_t *mem_opt_init()
     o->min_chain_weight = 0;
     o->max_chain_extend = 1<<30;
     o->mapQ_coef_len = 50; o->mapQ_coef_fac = log(o->mapQ_coef_len);
-    o->supp_rep_hard_cap = 0; // disabled by default; preserves stock MAPQ output
     bwa_fill_scmat(o->a, o->b, o->mat);
     return o;
 }
@@ -427,7 +572,9 @@ int mem_seed_sw(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
     if (qe - qb >= MEM_SHORT_LEN || re - rb >= MEM_SHORT_LEN) return -1; // the seed seems good enough; no need to do SW
 
     rseq = bns_fetch_seq(bns, pac, &rb, mid, &re, &rid);
-    x = ksw_align2(qe - qb, (uint8_t*)query + qb, re - rb, rseq, 5, opt->mat, opt->o_del, opt->e_del, opt->o_ins, opt->e_ins, KSW_XSTART, 0);
+    // No qry-profile cache: each seed slices a different sub-query
+    // (query+qb, qe-qb), so ksw_align2 always builds a fresh profile.
+    x = ksw_align2(qe - qb, (uint8_t*)query + qb, re - rb, rseq, 5, opt->mat, opt->o_del, opt->e_del, opt->o_ins, opt->e_ins, KSW_XSTART, NULL);
     free(rseq);
     return x.score;
 }
@@ -648,108 +795,27 @@ SMEM *mem_collect_smem(FMI_search *fmi, const mem_opt_t *opt,
 
     int32_t *query_cum_len_ar = (int32_t *)_mm_malloc(nseq * sizeof(int32_t), 64);
 
-    // Measure the batch before writing into any per-read buffer. enc_qdb /
-    // min_intv_ar / rid may have been sized by a prior batch whose
-    // wsize_mem_s / wsize_mem_r is smaller than this batch needs; the grow
-    // blocks below use tot_seq_len and max_readlength to resize before any
-    // write, so we need both values up front.
-    int64_t tot_seq_len = 0;
-    max_readlength = seq_[0].l_seq;
-    for (int l = 0; l < nseq; l++) {
-        tot_seq_len += seq_[l].l_seq;
-        if (max_readlength < seq_[l].l_seq)
-            max_readlength = seq_[l].l_seq;
-    }
-
-    // Empty-batch fast path: no bases to walk, no SMEMs to emit. Skipping
-    // here also avoids dereferencing the per-thread buffers below before
-    // they grow — they remain NULL on the first call when needed_match is
-    // 0 (e.g. a malformed/zero-length input slips through bseq).
-    if (tot_seq_len == 0 || max_readlength <= 0) {
-        _mm_free(query_cum_len_ar);
-        tot_smem = 0;
-        return mmc->matchArray[tid];
-    }
-
-    // Pre-walk sizing. All SMEM-family buffers grow monotonically in
-    // max_readlength (matchArray) or tot_seq_len (enc_qdb and wsize_mem_r
-    // helpers). The walk functions also receive wsize_mem[tid] as
-    // max_smem and bounds-check every write — defense in depth against a
-    // sizing miscalculation. Use nseq, not BATCH_SIZE, so a small tail
-    // batch with a single long read doesn't allocate as if every call were
-    // a full BATCH_SIZE block.
-    int64_t needed_match = (int64_t)BATCH_MUL * nseq * max_readlength;
-    if (mmc->wsize_mem[tid] < needed_match) {
-        _mm_free(mmc->matchArray[tid]);
-        mmc->wsize_mem[tid] = needed_match;
-        mmc->matchArray[tid] = (SMEM *) _mm_malloc(needed_match * sizeof(SMEM), 64);
-        assert(mmc->matchArray[tid] != NULL);
-        matchArray = mmc->matchArray[tid];
-    }
-    if (mmc->wsize_mem_s[tid] < tot_seq_len) {
-        // enc_qdb must hold every base in the batch. Use a nonzero floor so
-        // repeated allocs on small batches don't churn; nseq*max_readlength
-        // is a monotonic upper bound that matches the historical sizing.
-        int64_t needed_s = (int64_t)nseq * max_readlength;
-        mmc->wsize_mem_s[tid] = needed_s;
-        mmc->enc_qdb[tid] = (uint8_t *) realloc(mmc->enc_qdb[tid], needed_s * sizeof(uint8_t));
-        assert(mmc->enc_qdb[tid] != NULL);
-        enc_qdb = mmc->enc_qdb[tid];
-    }
-    // min_intv_ar / query_pos_ar / rid all index by "read" or by SMEM index
-    // in the split-SMEM pass. Size them to hold up to num_smem1 candidates —
-    // upper-bounded by matchArray capacity.
-    if (mmc->wsize_mem_r[tid] < needed_match) {
-        mmc->wsize_mem_r[tid] = needed_match;
-        mmc->min_intv_ar[tid]  = (int32_t *) realloc(mmc->min_intv_ar[tid],
-                                                     needed_match * sizeof(int32_t));
-        mmc->query_pos_ar[tid] = (int16_t *) realloc(mmc->query_pos_ar[tid],
-                                                     needed_match * sizeof(int16_t));
-        mmc->rid[tid]          = (int32_t *) realloc(mmc->rid[tid],
-                                                     needed_match * sizeof(int32_t));
-        assert(mmc->min_intv_ar[tid]  != NULL);
-        assert(mmc->query_pos_ar[tid] != NULL);
-        assert(mmc->rid[tid]          != NULL);
-        min_intv_ar  = mmc->min_intv_ar[tid];
-        query_pos_ar = mmc->query_pos_ar[tid];
-        rid          = mmc->rid[tid];
-    }
-    // Lockstep per-slot buffers (heap-owned; one pair per thread).
-    if (mmc->lockstep_buf_cap[tid] < max_readlength) {
-        int64_t n_elems = (int64_t)SMEM_LOCKSTEP_N * max_readlength;
-        _mm_free(mmc->lockstep_prev[tid]);
-        _mm_free(mmc->lockstep_match_buf[tid]);
-        mmc->lockstep_prev[tid]      = (SMEM *) _mm_malloc(n_elems * sizeof(SMEM), 64);
-        mmc->lockstep_match_buf[tid] = (SMEM *) _mm_malloc(n_elems * sizeof(SMEM), 64);
-        assert(mmc->lockstep_prev[tid]      != NULL);
-        assert(mmc->lockstep_match_buf[tid] != NULL);
-        mmc->lockstep_buf_cap[tid] = max_readlength;
-    }
-
-    // Populate per-read buffers now that the grow blocks above have sized
-    // them for this batch. enc_qdb is indexed linearly across all reads;
-    // min_intv_ar / rid are indexed by read.
     int offset = 0;
-    query_cum_len_ar[0] = 0;
-    for (int l = 0; l < nseq; l++) {
-        if (l > 0)
-            query_cum_len_ar[l] = query_cum_len_ar[l - 1] + seq_[l - 1].l_seq;
+    for (int l=0; l<nseq; l++)
+    {
         min_intv_ar[l] = 1;
-        for (int j = 0; j < seq_[l].l_seq; j++) {
-            enc_qdb[offset + j] = seq_[l].seq[j];
-        }
+        memcpy(enc_qdb + offset, seq_[l].seq, (size_t)seq_[l].l_seq);
         offset += seq_[l].l_seq;
         rid[l] = l;
     }
 
+    max_readlength = seq_[0].l_seq;
+    query_cum_len_ar[0] = 0;
+    for(int i = 1; i < nseq; i++) {
+        query_cum_len_ar[i] = query_cum_len_ar[i - 1] + seq_[i-1].l_seq;
+        if (max_readlength < seq_[i].l_seq)
+            max_readlength = seq_[i].l_seq;
+    }
+
     fmi->getSMEMsAllPosOneThread(enc_qdb, min_intv_ar, rid, nseq, nseq,
                                  seq_, query_cum_len_ar, max_readlength, opt->min_seed_len,
-                                 matchArray, mmc->wsize_mem[tid],
-                                 mmc->lockstep_prev[tid],
-                                 mmc->lockstep_match_buf[tid],
-                                 &num_smem1);
+                                 matchArray, &num_smem1);
 
-    int64_t mem_lim = 0;
     for (int64_t i=0; i<num_smem1; i++)
     {
         SMEM *p = &matchArray[i];
@@ -767,10 +833,41 @@ SMEM *mem_collect_smem(FMI_search *fmi, const mem_opt_t *opt,
 
         min_intv_ar[pos] = p->s + 1;
         pos ++;
-        mem_lim += end - start;
     }
-    (void)mem_lim;
 
+    #if 1
+    // Pre-walk grow: getSMEMsOnePosOneThread emits at most readlength SMEMs
+    // per re-walk position (the scalar walker's worst case is one SMEM per
+    // backward step plus the final prev[0]), so the safe upper bound on
+    // num_smem2 is pos * max_readlength.
+    const int64_t safe_smem2_cap = (int64_t)pos * max_readlength;
+    if (mmc->wsize_mem[tid] < num_smem1 + safe_smem2_cap) {
+        int64_t tmp = mmc->wsize_mem[tid];
+        mmc->wsize_mem[tid] = num_smem1 + safe_smem2_cap;
+
+        SMEM* ptr1 = mmc->matchArray[tid];
+        // ptr2 = w.mmc.min_intv_ar;
+        // ptr3 =
+        if (bwa_verbose >= 4) {
+            fprintf(stderr, "[%0.4d] REA Re-allocating SMEM after num_smem1: "
+                    "%" PRId64 " -> %" PRId64 "\n",
+                    tid, tmp, mmc->wsize_mem[tid]);
+        }
+        mmc->matchArray[tid]    = (SMEM *) _mm_malloc(mmc->wsize_mem[tid] * sizeof(SMEM), 64);
+        assert(mmc->matchArray[tid] != NULL);
+        matchArray = mmc->matchArray[tid];
+        // w.mmc.min_intv_ar[l]   = (int32_t *) malloc(w.mmc.wsize_mem[l] * sizeof(int32_t));
+        // w.mmc.query_pos_ar[tid]  = (int16_t *) malloc(w.mmc.wsize_mem[l] * sizeof(int16_t));
+        // w.mmc.enc_qdb[l]       = (uint8_t *) malloc(w.mmc.wsize_mem[l] * sizeof(uint8_t));
+        // w.mmc.rid[l]           = (int32_t *) malloc(w.mmc.wsize_mem[l] * sizeof(int32_t));
+        //w.mmc.lim[l]         = (int32_t *) _mm_malloc((BATCH_SIZE + 32) * sizeof(int32_t), 64);
+        for (int i=0; i<num_smem1; i++) {
+            mmc->matchArray[tid][i] = ptr1[i];
+        }
+        _mm_free(ptr1);
+    }
+    #endif
+    
 #if SMEM_LOCKSTEP_N > 1
     fmi->getSMEMsOnePosOneThread_lockstep(enc_qdb,
                                           query_pos_ar,
@@ -783,9 +880,6 @@ SMEM *mem_collect_smem(FMI_search *fmi, const mem_opt_t *opt,
                                           max_readlength,
                                           opt->min_seed_len,
                                           matchArray + num_smem1,
-                                          mmc->wsize_mem[tid] - num_smem1,
-                                          mmc->lockstep_prev[tid],
-                                          mmc->lockstep_match_buf[tid],
                                           &num_smem2);
 #else
     fmi->getSMEMsOnePosOneThread(enc_qdb,
@@ -799,19 +893,51 @@ SMEM *mem_collect_smem(FMI_search *fmi, const mem_opt_t *opt,
                                  max_readlength,
                                  opt->min_seed_len,
                                  matchArray + num_smem1,
-                                 mmc->wsize_mem[tid] - num_smem1,
                                  &num_smem2);
 #endif
+    // assert(mmc->wsize_mem[tid] > (num_smem1 + num_smem2));
+    // fprintwsize_mem_rf(stderr, "num_smem2: %d\n", num_smem2);
     if (opt->max_mem_intv > 0)
     {
+        #if 1
+		// Pre-walk grow for the third pass. bwtSeedStrategyAllPosOneThread's
+		// documented worst case (FMI_search.h) is nseq * max_seq_length SMEMs
+		// — one per query position per read — which dwarfs the prior
+		// offset/(min_seed_len+1) heuristic. Use the safe bound so the
+		// caller cannot overflow matchArray when this pass writes at
+		// (num_smem1 + num_smem2).
+		const int64_t safe_smem3_cap = (int64_t)nseq * max_readlength;
+		const int64_t mem_intv_cap = num_smem1 + num_smem2 + safe_smem3_cap;
+		if (mmc->wsize_mem[tid] < mem_intv_cap) {
+            int64_t tmp = mmc->wsize_mem[tid];
+		    mmc->wsize_mem[tid] = mem_intv_cap;
+		    SMEM* ptr1 = mmc->matchArray[tid];
+            if (bwa_verbose >= 4) {
+                fprintf(stderr, "[%0.4d] REA Re-allocating SMEM after num_smem2: "
+                        "%" PRId64 " -> %" PRId64 "\n",
+                        tid, tmp, mmc->wsize_mem[tid]);
+            }
+		    mmc->matchArray[tid]    = (SMEM *) _mm_malloc(mmc->wsize_mem[tid] * sizeof(SMEM), 64);
+		    assert(mmc->matchArray[tid] != NULL);
+		    matchArray = mmc->matchArray[tid];
+		    // First pass wrote num_smem1 records at offset 0; the second pass
+		    // (getSMEMsOnePosOneThread*) just wrote num_smem2 records at offset
+		    // num_smem1. Preserve both — bwtSeedStrategyAllPosOneThread() below
+		    // appends at offset num_smem1 + num_smem2.
+		    int64_t already_written = (int64_t)num_smem1 + num_smem2;
+		    for (int64_t i = 0; i < already_written; ++i) {
+		        mmc->matchArray[tid][i] = ptr1[i];
+		    }
+		    _mm_free(ptr1);
+		}
+        #endif
         for (int l=0; l<nseq; l++)
             min_intv_ar[l] = opt->max_mem_intv;
 
         num_smem3 = fmi->bwtSeedStrategyAllPosOneThread(enc_qdb, min_intv_ar,
                                                         nseq, seq_, query_cum_len_ar,
                                                         opt->min_seed_len + 1,
-                                                        matchArray + num_smem1 + num_smem2,
-                                                        mmc->wsize_mem[tid] - num_smem1 - num_smem2);
+                                                        matchArray + num_smem1 + num_smem2);
     }
     tot_smem = num_smem1 + num_smem2 + num_smem3;
     // assert(mmc->wsize_mem[tid] > (tot_smem));
@@ -942,7 +1068,6 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
 
                 s.qbeg = p->m;
                 s.score= s.len = slen;
-                s.n_hits = (int32_t)(p->s < INT32_MIN ? INT32_MIN : (p->s > INT32_MAX ? INT32_MAX : p->s));
                 if (s.rbeg < 0 || s.len < 0)
                     fprintf(stderr, "rbeg: %ld, slen: %d, cnt: %d, n: %d, m: %d, num_smem: %ld\n",
                             s.rbeg, s.len, cnt-1, p->n, p->m, num_smem);
@@ -1019,7 +1144,7 @@ int mem_kernel1_core(FMI_search *fmi,
                      int tid)
 {
     int i;
-    int64_t num_smem = 0;
+    int64_t num_smem = 0, tot_len = 0;
     mem_chain_v *chn;
 
     uint64_t tim;
@@ -1028,16 +1153,38 @@ int mem_kernel1_core(FMI_search *fmi,
     {
         char *seq = seq_[l].seq;
         int len = seq_[l].l_seq;
+        tot_len += len;
 
         for (i = 0; i < len; ++i)
             seq[i] = seq[i] < 4? seq[i] : nst_nt4_table[(int)seq[i]]; //nst_nt4??
     }
-    // SMEM-family per-thread buffer sizing happens inside mem_collect_smem,
-    // pre-walk and keyed on max_readlength / tot_seq_len of this batch. The
-    // historical tot_len-based grow that used to live here is redundant with
-    // that pre-walk grow and was incorrect for the lazy-init case
-    // (wsize_mem == 0 with a 0-base degenerate batch tripped _mm_realloc's
-    // "shrinking not supported" path on a NULL pointer).
+    // tot_len *= N_SMEM_KERNEL;
+    // fprintf(stderr, "wsize: %d, tot_len: %d\n", mmc->wsize_mem[tid], tot_len);
+    // This covers enc_qdb/SMEM reallocs
+    if (tot_len >= mmc->wsize_mem[tid])
+    {
+        int64_t tmp = mmc->wsize_mem[tid];
+        mmc->wsize_mem[tid] = tot_len;
+        if (bwa_verbose >= 4) {
+            fprintf(stderr, "[%0.4d] Re-allocating SMEM scratch (enc_qdb): "
+                    "%" PRId64 " -> %" PRId64 "\n",
+                    tid, tmp, mmc->wsize_mem[tid]);
+        }
+        mmc->wsize_mem_s[tid] = tot_len;
+        mmc->wsize_mem_r[tid] = tot_len;
+        mmc->matchArray[tid]   = (SMEM *) _mm_realloc(mmc->matchArray[tid],
+                                                      tmp, mmc->wsize_mem[tid], sizeof(SMEM));
+            //realloc(mmc->matchArray[tid], mmc->wsize_mem[tid] *   sizeof(SMEM));
+        mmc->min_intv_ar[tid]  = (int32_t *) realloc(mmc->min_intv_ar[tid],
+                                                     mmc->wsize_mem[tid] *  sizeof(int32_t));
+        mmc->query_pos_ar[tid] = (int16_t *) realloc(mmc->query_pos_ar[tid],
+                                                     mmc->wsize_mem[tid] *  sizeof(int16_t));
+        mmc->enc_qdb[tid]      = (uint8_t *) realloc(mmc->enc_qdb[tid],
+                                                      mmc->wsize_mem[tid] * sizeof(uint8_t));
+        mmc->rid[tid]          = (int32_t *) realloc(mmc->rid[tid],
+                                                      mmc->wsize_mem[tid] * sizeof(int32_t));
+        // w.mmc.lim[l]        = (int32_t *) _mm_malloc((BATCH_SIZE + 32) * sizeof(int32_t), 64);
+    }
 
     SMEM    *matchArray   = mmc->matchArray[tid];
     int32_t *min_intv_ar  = mmc->min_intv_ar[tid];
@@ -1061,10 +1208,8 @@ int mem_kernel1_core(FMI_search *fmi,
                                   num_smem,
                                   tid);
 
-    // mem_collect_smem bounds-checks every matchArray write via
-    // smem_overflow_die, so num_smem can equal *wsize_mem (last slot used)
-    // without an actual overflow. Only `>` indicates a sizing miscalculation.
-    // An empty batch is a valid case: num_smem == *wsize_mem == 0.
+    // Exact-fit (num_smem == *wsize_mem) is valid: the last write lands at
+    // matchArray[*wsize_mem - 1]. Trip only on a true overrun.
     if (num_smem > *wsize_mem){
         fprintf(stderr, "Error [bug]: num_smem: %ld are more than allocated space %ld.\n",
                 num_smem, *wsize_mem);
@@ -1075,6 +1220,7 @@ int mem_kernel1_core(FMI_search *fmi,
 
 
     /********************* Kernel 1.1: SA2REF **********************/
+    tim = __rdtsc();
     printf_(VER, "6.1. Calling mem_chain..\n");
     mem_chain_seeds(fmi, opt, fmi->idx->bns,
                     seq_, nseq, tid,
@@ -1085,7 +1231,7 @@ int mem_kernel1_core(FMI_search *fmi,
                     num_smem);
 
     printf_(VER, "5. Done mem_chain..\n");
-    // tprof[MEM_CHAIN][tid] += __rdtsc() - tim;
+    tprof[MEM_CHAIN][tid] += __rdtsc() - tim;
 
     /************** Post-processing of collected smems/chains ************/
     // tim = __rdtsc();
@@ -1582,13 +1728,6 @@ void mem_reg2sam(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
 #else
         if (l && !p->is_alt && q->mapq > aa.a[0].mapq) q->mapq = aa.a[0].mapq;
 #endif
-        // fg-labs: supp alnregs whose chain contains a repetitive seed (many
-        // genome occurrences) inherit primary MAPQ despite being ambiguous on
-        // their own — upstream issue bwa-mem2/bwa-mem2#260. Opt-in override:
-        // force MAPQ=0 when the chain's most-repetitive seed exceeds the cap.
-        if (opt->supp_rep_hard_cap > 0 && l && p->secondary < 0 &&
-            p->chain_n_hits >= opt->supp_rep_hard_cap)
-            q->mapq = 0;
         ++l;
     }
     if (aa.n == 0) { // no alignments good enough; then write an unaligned record
@@ -1610,6 +1749,8 @@ void mem_reg2sam(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
     free(HN);
 }
 
+/* Caller must have called ks_resize beforehand to leave room for
+ * n_cigar*16 bytes (worst-case: each op is 11 digits + 1 letter). */
 static inline void add_cigar(const mem_opt_t *opt, mem_aln_t *p, kstring_t *str, int which)
 {
     int i;
@@ -1618,9 +1759,9 @@ static inline void add_cigar(const mem_opt_t *opt, mem_aln_t *p, kstring_t *str,
             int c = p->cigar[i]&0xf;
             if (!(opt->flag&MEM_F_SOFTCLIP) && !p->is_alt && (c == 3 || c == 4))
                 c = which? 4 : 3; // use hard clipping for supplementary alignments
-            kputw(p->cigar[i]>>4, str); kputc("MIDSH"[c], str);
+            kputw_u(p->cigar[i]>>4, str); kputc_u("MIDSH"[c], str);
         }
-    } else kputc('*', str); // having a coordinate but unaligned (e.g. when copy_mate is true)
+    } else kputc_u('*', str); // having a coordinate but unaligned (e.g. when copy_mate is true)
 }
 
 void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str,
@@ -1661,128 +1802,170 @@ void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str,
     p->flag |= p->is_rev? 0x10 : 0; // is on the reverse strand
     p->flag |= m && m->is_rev? 0x20 : 0; // is mate on the reverse strand
 
+    /* ─── Pre-size kstring once for the worst-case record length, then use
+     * unsafe (no-realloc, no-bound-check) writes throughout. The estimate
+     * covers: QNAME + FLAG + RNAME + POS + MAPQ + CIGAR + mate fields +
+     * SEQ + QUAL + tags + headers; rare overflow falls back to ks_resize.
+     */
+    l_name = (int)strlen(s->name);
+    {
+        size_t md_len = 0;
+        if (p->n_cigar)
+            md_len = strlen((const char*)(p->cigar + p->n_cigar));
+        size_t comm_len = s->comment ? strlen(s->comment) : 0;
+        size_t anno_len = ((opt->flag & MEM_F_REF_HDR) && p->rid >= 0
+                           && bns->anns[p->rid].anno && bns->anns[p->rid].anno[0])
+                          ? strlen(bns->anns[p->rid].anno) : 0;
+        size_t xa_len   = p->XA ? strlen(p->XA) : 0;
+        size_t rg_len   = bwa_rg_id[0] ? strlen(bwa_rg_id) : 0;
+        /* RNAME/RNEXT contig names can be very long (T2T-style assemblies).
+         * Mate CIGAR (MC:Z) under V17 is also written via add_cigar(). */
+        size_t rname_len = (p->rid >= 0) ? strlen(bns->anns[p->rid].name) : 1;
+        size_t rnext_len = (m && m->rid >= 0 && m->rid != p->rid)
+                           ? strlen(bns->anns[m->rid].name) : 1;
+        size_t mate_cigar_len = (m && m->n_cigar) ? (size_t)m->n_cigar * 16 : 0;
+        /* SA:Z worst case (only emitted when n>1 and there are other primary
+         * hits, but priced unconditionally so the local ks_resize at the
+         * SA:Z site can be dropped — single resize keeps the unsafe-fast
+         * write invariant for the post-SA:Z tags (XA, HN, comment, XR:Z). */
+        size_t sa_need = 16;
+        for (int j = 0; j < n; ++j) {
+            if (j == which || (list[j].flag&0x100)) continue;
+            sa_need += strlen(bns->anns[list[j].rid].name) + 32 + list[j].n_cigar * 16;
+        }
+        size_t need = (size_t)l_name
+                    + (size_t)s->l_seq * 2     /* SEQ + QUAL */
+                    + (size_t)p->n_cigar * 16  /* primary CIGAR */
+                    + mate_cigar_len           /* MC:Z mate CIGAR */
+                    + rname_len + rnext_len    /* RNAME + RNEXT */
+                    + md_len + xa_len + rg_len + comm_len + anno_len
+                    + sa_need                  /* SA:Z (multi-supp) */
+                    + 256;                      /* slack for ints + tags */
+        ks_resize(str, str->l + need);
+    }
+
     // print up to CIGAR
-    l_name = strlen(s->name);
-    ks_resize(str, str->l + s->l_seq + l_name + (s->qual? s->l_seq : 0) + 20);
-    kputsn(s->name, l_name, str); kputc('\t', str); // QNAME
-    kputw((p->flag&0xffff) | (p->flag&0x10000? 0x100 : 0), str); kputc('\t', str); // FLAG
+    kputsn_u(s->name, l_name, str); kputc_u('\t', str); // QNAME
+    kputw_u((p->flag&0xffff) | (p->flag&0x10000? 0x100 : 0), str); kputc_u('\t', str); // FLAG
     if (p->rid >= 0) { // with coordinate
-        kputs(bns->anns[p->rid].name, str); kputc('\t', str); // RNAME
-        kputl(p->pos + 1, str); kputc('\t', str); // POS
-        kputw(p->mapq, str); kputc('\t', str); // MAPQ
+        kputs_u(bns->anns[p->rid].name, str); kputc_u('\t', str); // RNAME
+        kputl_u(p->pos + 1, str); kputc_u('\t', str); // POS
+        kputw_u(p->mapq, str); kputc_u('\t', str); // MAPQ
 #if OLD // from v15
         if (p->n_cigar) { // aligned
             for (i = 0; i < p->n_cigar; ++i) {
                 int c = p->cigar[i]&0xf;
                 if (!(opt->flag&MEM_F_SOFTCLIP) && !p->is_alt && (c == 3 || c == 4))
                     c = which? 4 : 3; // use hard clipping for supplementary alignments
-                kputw(p->cigar[i]>>4, str); kputc("MIDSH"[c], str);
+                kputw_u(p->cigar[i]>>4, str); kputc_u("MIDSH"[c], str);
             }
-        } else kputc('*', str); // having a coordinate but unaligned (e.g. when copy_mate is true)
+        } else kputc_u('*', str);
 #else
         // modification from v17
         add_cigar(opt, p, str, which);
 #endif
-    } else kputsn("*\t0\t0\t*", 7, str); // without coordinte
-    kputc('\t', str);
+    } else kputsn_u("*\t0\t0\t*", 7, str); // without coordinte
+    kputc_u('\t', str);
 
     // print the mate position if applicable
     if (m && m->rid >= 0) {
-        if (p->rid == m->rid) kputc('=', str);
-        else kputs(bns->anns[m->rid].name, str);
-        kputc('\t', str);
-        kputl(m->pos + 1, str); kputc('\t', str);
+        if (p->rid == m->rid) kputc_u('=', str);
+        else kputs_u(bns->anns[m->rid].name, str);
+        kputc_u('\t', str);
+        kputl_u(m->pos + 1, str); kputc_u('\t', str);
         if (p->rid == m->rid) {
             int64_t p0 = p->pos + (p->is_rev? get_rlen(p->n_cigar, p->cigar) - 1 : 0);
             int64_t p1 = m->pos + (m->is_rev? get_rlen(m->n_cigar, m->cigar) - 1 : 0);
-            if (m->n_cigar == 0 || p->n_cigar == 0) kputc('0', str);
-            else kputl(-(p0 - p1 + (p0 > p1? 1 : p0 < p1? -1 : 0)), str);
-        } else kputc('0', str);
-    } else kputsn("*\t0\t0", 5, str);
-    kputc('\t', str);
+            if (m->n_cigar == 0 || p->n_cigar == 0) kputc_u('0', str);
+            else kputl_u(-(p0 - p1 + (p0 > p1? 1 : p0 < p1? -1 : 0)), str);
+        } else kputc_u('0', str);
+    } else kputsn_u("*\t0\t0", 5, str);
+    kputc_u('\t', str);
 
-    // print SEQ and QUAL
+    // print SEQ and QUAL — SIMD via NEON tbl1q_u8 byte LUT.
     if (p->flag & 0x100) { // for secondary alignments, don't write SEQ and QUAL
-        kputsn("*\t*", 3, str);
-    } else if (!p->is_rev) { // the forward strand
-        int i, qb = 0, qe = s->l_seq;
-        if (p->n_cigar && which && !(opt->flag&MEM_F_SOFTCLIP) && !p->is_alt) { // have cigar && not the primary alignment && not softclip all
+        kputsn_u("*\t*", 3, str);
+    } else if (!p->is_rev) { // forward strand
+        int qb = 0, qe = s->l_seq;
+        if (p->n_cigar && which && !(opt->flag&MEM_F_SOFTCLIP) && !p->is_alt) {
             if ((p->cigar[0]&0xf) == 4 || (p->cigar[0]&0xf) == 3) qb += p->cigar[0]>>4;
             if ((p->cigar[p->n_cigar-1]&0xf) == 4 || (p->cigar[p->n_cigar-1]&0xf) == 3) qe -= p->cigar[p->n_cigar-1]>>4;
         }
-        ks_resize(str, str->l + (qe - qb) + 1);
-        for (i = qb; i < qe; ++i) str->s[str->l++] = "ACGTN"[(int)s->seq[i]];
-        kputc('\t', str);
-        if (s->qual) { // printf qual
-            ks_resize(str, str->l + (qe - qb) + 1);
-            for (i = qb; i < qe; ++i) str->s[str->l++] = s->qual[i];
-            str->s[str->l] = 0;
-        } else kputc('*', str);
-    } else { // the reverse strand
-        int i, qb = 0, qe = s->l_seq;
+        const int n_seq = qe - qb;
+        encode_seq_fwd(str->s + str->l, (const uint8_t*)(s->seq + qb), n_seq);
+        str->l += n_seq;
+        kputc_u('\t', str);
+        if (s->qual) {
+            memcpy(str->s + str->l, s->qual + qb, (size_t)n_seq);
+            str->l += n_seq;
+        } else kputc_u('*', str);
+    } else { // reverse strand
+        int qb = 0, qe = s->l_seq;
         if (p->n_cigar && which && !(opt->flag&MEM_F_SOFTCLIP) && !p->is_alt) {
             if ((p->cigar[0]&0xf) == 4 || (p->cigar[0]&0xf) == 3) qe -= p->cigar[0]>>4;
             if ((p->cigar[p->n_cigar-1]&0xf) == 4 || (p->cigar[p->n_cigar-1]&0xf) == 3) qb += p->cigar[p->n_cigar-1]>>4;
         }
-        ks_resize(str, str->l + (qe - qb) + 1);
-        for (i = qe-1; i >= qb; --i) str->s[str->l++] = "TGCAN"[(int)s->seq[i]];
-        kputc('\t', str);
-        if (s->qual) { // printf qual
-            ks_resize(str, str->l + (qe - qb) + 1);
-            for (i = qe-1; i >= qb; --i) str->s[str->l++] = s->qual[i];
-            str->s[str->l] = 0;
-        } else kputc('*', str);
+        const int n_seq = qe - qb;
+        encode_seq_rev(str->s + str->l, (const uint8_t*)(s->seq + qb), n_seq);
+        str->l += n_seq;
+        kputc_u('\t', str);
+        if (s->qual) {
+            copy_qual_rev(str->s + str->l, (const char*)(s->qual + qb), n_seq);
+            str->l += n_seq;
+        } else kputc_u('*', str);
     }
 
     // print optional tags
     if (p->n_cigar) {
-        kputsn("\tNM:i:", 6, str); kputw(p->NM, str);
-        kputsn("\tMD:Z:", 6, str); kputs((char*)(p->cigar + p->n_cigar), str);
+        kputsn_u("\tNM:i:", 6, str); kputw_u(p->NM, str);
+        kputsn_u("\tMD:Z:", 6, str); kputs_u((char*)(p->cigar + p->n_cigar), str);
     }
 #if V17
-    if (m && m->n_cigar) { kputsn("\tMC:Z:", 6, str); add_cigar(opt, m, str, which); }
+    if (m && m->n_cigar) { kputsn_u("\tMC:Z:", 6, str); add_cigar(opt, m, str, which); }
 #endif
-    if (m) { kputsn("\tMQ:i:", 6, str); kputw(m->mapq, str); }
-    if (p->score >= 0) { kputsn("\tAS:i:", 6, str); kputw(p->score, str); }
-    if (p->sub >= 0) { kputsn("\tXS:i:", 6, str); kputw(p->sub, str); }
-    if (bwa_rg_id[0]) { kputsn("\tRG:Z:", 6, str); kputs(bwa_rg_id, str); }
+    if (m) { kputsn_u("\tMQ:i:", 6, str); kputw_u(m->mapq, str); }
+    if (p->score >= 0) { kputsn_u("\tAS:i:", 6, str); kputw_u(p->score, str); }
+    if (p->sub >= 0) { kputsn_u("\tXS:i:", 6, str); kputw_u(p->sub, str); }
+    if (bwa_rg_id[0]) { kputsn_u("\tRG:Z:", 6, str); kputs_u(bwa_rg_id, str); }
     if (!(p->flag & 0x100)) { // not multi-hit
         for (i = 0; i < n; ++i)
             if (i != which && !(list[i].flag&0x100)) break;
         if (i < n) { // there are other primary hits; output them
-            kputsn("\tSA:Z:", 6, str);
+            /* SA:Z capacity is reserved in the outer pre-size above. */
+            kputsn_u("\tSA:Z:", 6, str);
             for (i = 0; i < n; ++i) {
                 const mem_aln_t *r = &list[i];
                 int k;
-                if (i == which || (r->flag&0x100)) continue; // proceed if: 1) different from the current; 2) not shadowed multi hit
-                kputs(bns->anns[r->rid].name, str); kputc(',', str);
-                kputl(r->pos+1, str); kputc(',', str);
-                kputc("+-"[r->is_rev], str); kputc(',', str);
+                if (i == which || (r->flag&0x100)) continue;
+                kputs_u(bns->anns[r->rid].name, str); kputc_u(',', str);
+                kputl_u(r->pos+1, str); kputc_u(',', str);
+                kputc_u("+-"[r->is_rev], str); kputc_u(',', str);
                 for (k = 0; k < r->n_cigar; ++k) {
-                    kputw(r->cigar[k]>>4, str); kputc("MIDSH"[r->cigar[k]&0xf], str);
+                    kputw_u(r->cigar[k]>>4, str); kputc_u("MIDSH"[r->cigar[k]&0xf], str);
                 }
-                kputc(',', str); kputw(r->mapq, str);
-                kputc(',', str); kputw(r->NM, str);
-                kputc(';', str);
+                kputc_u(',', str); kputw_u(r->mapq, str);
+                kputc_u(',', str); kputw_u(r->NM, str);
+                kputc_u(';', str);
             }
         }
         if (p->alt_sc > 0)
             ksprintf(str, "\tpa:f:%.3f", (double)p->score / p->alt_sc);
     }
 
-    if (p->XA) { kputsn("\tXA:Z:", 6, str); kputs(p->XA, str); }
-    if (p->HN >= 0) { kputsn("\tHN:i:", 6, str); kputw(p->HN, str); }
+    if (p->XA) { kputsn_u("\tXA:Z:", 6, str); kputs_u(p->XA, str); }
+    if (p->HN >= 0) { kputsn_u("\tHN:i:", 6, str); kputw_u(p->HN, str); }
 
-    if (s->comment) { kputc('\t', str); kputs(s->comment, str); }
+    if (s->comment) { kputc_u('\t', str); kputs_u(s->comment, str); }
     if ((opt->flag&MEM_F_REF_HDR) && p->rid >= 0 && bns->anns[p->rid].anno != 0 && bns->anns[p->rid].anno[0] != 0) {
         int tmp;
-        kputsn("\tXR:Z:", 6, str);
-        tmp = str->l;
-        kputs(bns->anns[p->rid].anno, str);
-        for (i = tmp; i < str->l; ++i) // replace TAB in the comment to SPACE
+        kputsn_u("\tXR:Z:", 6, str);
+        tmp = (int)str->l;
+        kputs_u(bns->anns[p->rid].anno, str);
+        for (i = tmp; i < (int)str->l; ++i) // replace TAB in the comment to SPACE
             if (str->s[i] == '\t') str->s[i] = ' ';
     }
-    kputc('\n', str);
+    kputc_u('\n', str);
+    str->s[str->l] = 0;  /* single trailing NUL — unsafe writers skipped this */
 }
 
 mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, int l_query, const char *query_, const mem_alnreg_t *ar)
@@ -2123,6 +2306,307 @@ inline void sortPairsLen(SeqPair *pairArray, int32_t count, SeqPair *tempArray, 
 /* Restructured BSW parent function */
 #define FAC 8
 #define PFD 2
+
+// ungapped diagonal-extension analyzer.
+//
+// Walks the N-step diagonal once (SIMD scan + bitmap + scalar trajectory).
+// Emits three possible status codes:
+//
+//   FP_STATUS_HIT      — ungapped is provably optimal (≤ x_threshold
+//                        mismatches, no ambig). Caller skips banded SW
+//                        and uses sp.score/qle/gscore/gtle directly.
+//
+//   FP_STATUS_TIGHT    — fast-path fails (too many mismatches) but the
+//                        ungapped score bounds the useful SW band:
+//                          tight_band = ceil((min(len1,len2)·a - ungapped_score)
+//                                            / (o_min + e_min))
+//                        Caller runs SW with this tight band instead of
+//                        opt->w, and skips MAX_BAND_TRY retries (the
+//                        bound is an upper bound on any gapped score).
+//
+//   FP_STATUS_FALLBACK — ambig base or out-of-range length. Caller uses
+//                        opt->w with the full retry loop.
+//
+// Derivation of tight_band: for any alignment with band offset B from
+// diagonal, min B gaps are required; cost ≥ B · (o_min + e_min). Max
+// alignment score (all matches) ≤ min(len1, len2) · a. For any gapped
+// alignment to beat the observed ungapped max score S:
+//   min_len·a - B·(o_min+e_min) > S
+//   B < (min_len·a - S) / (o_min + e_min)
+// So any band ≥ tight_band is sufficient; narrower bands suffice too
+// when the gapped alternative score is < min_len·a. Starting SW at
+// tight_band is strictly correct and avoids over-banded DP work.
+#define FP_N_MAX 128
+#define FP_STATUS_FALLBACK  0
+#define FP_STATUS_HIT       1
+#define FP_STATUS_TIGHT     2
+
+/* Q2 helper: bin an extension's final alignment score into one of 8 buckets.
+ * Bins: {0-10, 11-25, 26-50, 51-75, 76-100, 101-125, 126-150, 151+}. */
+static inline int ugp_score_bin(int s)
+{
+    if      (s <=  10) return 0;
+    else if (s <=  25) return 1;
+    else if (s <=  50) return 2;
+    else if (s <=  75) return 3;
+    else if (s <= 100) return 4;
+    else if (s <= 125) return 5;
+    else if (s <= 150) return 6;
+    else               return 7;
+}
+
+/* Q3 helper: bin a "delta from perfect extension" into one of 8 buckets.
+ * delta = h0 + a * len2 - aln_score, where (h0 + a * len2) is the score of a
+ * hypothetical all-match ungapped extension. delta == 0 ⇒ extension was
+ * perfect (HIT path with all matches); delta grows with mismatches and gaps.
+ * Bins: {0, 1-5, 6-10, 11-25, 26-50, 51-75, 76-100, 101+}. */
+static inline int ugp_delta_bin(int d)
+{
+    if      (d ==   0) return 0;
+    else if (d <=   5) return 1;
+    else if (d <=  10) return 2;
+    else if (d <=  25) return 3;
+    else if (d <=  50) return 4;
+    else if (d <=  75) return 5;
+    else if (d <= 100) return 6;
+    else               return 7;
+}
+
+/* Q1+Q2+Q3 outcome helpers. Each post-SW dispatch (LEFT scalar / 16-bit /
+ * 8-bit; RIGHT scalar / 16-bit / 8-bit) commits a final outcome and bumps
+ * the same set of profiling counters. Hoisted so categorization changes
+ * (extra category, adjusted bin edges, fourth tier, ...) live in one place
+ * instead of drifting across six near-identical inlined blocks. */
+static inline void ugp_record_left_outcome(const SeqPair *sp, int a_match, int tid)
+{
+    int _u = (sp->qle == sp->tle);
+    tprof[UGP_OUTCOME_BASE + 0 * 2 + (_u ? 0 : 1)][tid]++;
+    tprof[UGP_SCORE_HIST_BASE + 0 * UGP_SCORE_HIST_NBINS
+          + ugp_score_bin(sp->score)][tid]++;
+    /* Q3: per-category delta-from-perfect histograms. Non-HIT by
+     * construction at the post-SW commit. cat0=ALL; cat1 (ungapped final)
+     * or cat2 (gapped final) by sp->qle == sp->tle proxy; cat4
+     * (ungap_final ∩ ~HIT) when ungapped. */
+    int _perfect = sp->h0 + a_match * sp->len2;
+    int _bin_ung = ugp_delta_bin(_perfect - sp->ugp_walk_score);
+    int _bin_fin = ugp_delta_bin(_perfect - sp->score);
+    tprof[UGP_L_CAT_UNG_BASE + 0 * UGP_CAT_NBINS + _bin_ung][tid]++;
+    tprof[UGP_L_CAT_FIN_BASE + 0 * UGP_CAT_NBINS + _bin_fin][tid]++;
+    if (_u) {
+        tprof[UGP_L_CAT_UNG_BASE + 1 * UGP_CAT_NBINS + _bin_ung][tid]++;
+        tprof[UGP_L_CAT_FIN_BASE + 1 * UGP_CAT_NBINS + _bin_fin][tid]++;
+        tprof[UGP_L_CAT_UNG_BASE + 4 * UGP_CAT_NBINS + _bin_ung][tid]++;
+        tprof[UGP_L_CAT_FIN_BASE + 4 * UGP_CAT_NBINS + _bin_fin][tid]++;
+    } else {
+        tprof[UGP_L_CAT_UNG_BASE + 2 * UGP_CAT_NBINS + _bin_ung][tid]++;
+        tprof[UGP_L_CAT_FIN_BASE + 2 * UGP_CAT_NBINS + _bin_fin][tid]++;
+    }
+}
+
+static inline void ugp_record_right_outcome(const SeqPair *sp, int tid)
+{
+    int _u = (sp->qle == sp->tle);
+    tprof[UGP_OUTCOME_BASE + 1 * 2 + (_u ? 0 : 1)][tid]++;
+    tprof[UGP_SCORE_HIST_BASE + 1 * UGP_SCORE_HIST_NBINS
+          + ugp_score_bin(sp->score)][tid]++;
+}
+
+/* Q3 helper: would-be ungapped extension score for arbitrary N. Mirrors the
+ * HIT-path scalar walk in ungapped_analyze (cur with floor at 0; max_sc
+ * tracker; ambig terminates the walk to match analyze's FALLBACK semantics).
+ * Returned score is what an ungapped extension would produce on this pair
+ * regardless of whether the fast-path actually triggered HIT. */
+static inline int ungapped_walk_score(const uint8_t *qs, const uint8_t *rs,
+                                       int N, int h0, int a, int b)
+{
+    int cur = h0, max_sc = h0;
+    for (int j = 0; j < N; j++) {
+        uint8_t qj = qs[j], rj = rs[j];
+        if (qj >= 4 || rj >= 4) break;       /* ambig: terminate the walk */
+        if (cur == 0) continue;
+        if (qj == rj) cur += a;
+        else {
+            cur -= b;
+            if (cur < 0) cur = 0;
+        }
+        if (cur >= max_sc) max_sc = cur;
+    }
+    return max_sc;
+}
+
+/* optimal ungapped score (no floor) from a per-base mismatch bitmap.
+ *
+ *     score(i) = h0 + (i − mismatches_i)·a − mismatches_i·b
+ *              = h0 + i·a − mismatches_i·(a+b)        for i ∈ [0, N]
+ *
+ * f(i) is monotone non-decreasing within match runs and drops by b at each
+ * mismatch. Local maxima therefore live at one of:
+ *   (a) i = 0                                    f(0)  = h0
+ *   (b) i = p,  bitmap[p] == 1                   f(p)  = h0 + p·a − k·(a+b)
+ *                                                where k = mismatches in [0,p)
+ *   (c) i = N                                    f(N)  = h0 + N·a − total·(a+b)
+ *
+ * Iterating set bits of the bitmap via ctz + clear-low is O(total_mis), not
+ * O(N) — typically a handful of operations for HIT/TIGHT candidates.
+ *
+ * Unlike ungapped_walk_score, there is NO floor: score is allowed to dip
+ * below 0 and recover. This yields max_sc ≥ walk's max_sc, giving a strictly
+ * tighter (still safe) bound on the SW band in the tight_band proof. The
+ * walk's floor exists to mirror SW kernel local-SW semantics for SAM
+ * byte-identity on qle/gscore — irrelevant for the band proof. */
+static inline int ungapped_max_sc_from_bitmap(uint64_t mis_lo, uint64_t mis_hi,
+                                               int N, int h0, int a, int b)
+{
+    int max_sc = h0;            /* candidate (a): empty extension */
+    int gap    = a + b;         /* score drop per mismatch (relative to match) */
+    int k      = 0;             /* mismatches counted so far */
+    uint64_t lo = mis_lo, hi = mis_hi;
+    while (lo) {
+        int p = __builtin_ctzll(lo);
+        int s = h0 + p * a - k * gap;
+        if (s > max_sc) max_sc = s;
+        lo &= lo - 1;
+        k++;
+    }
+    while (hi) {
+        int p = 64 + __builtin_ctzll(hi);
+        int s = h0 + p * a - k * gap;
+        if (s > max_sc) max_sc = s;
+        hi &= hi - 1;
+        k++;
+    }
+    int s_end = h0 + N * a - k * gap;       /* candidate (c) */
+    if (s_end > max_sc) max_sc = s_end;
+    return max_sc;
+}
+
+static inline int ungapped_analyze(const uint8_t *qs, const uint8_t *rs, int N,
+                                    int h0, int a, int b,
+                                    int o_min, int e_min,
+                                    int x_threshold, int default_w,
+                                    int *out_score, int *out_qle,
+                                    int *out_gscore, int *out_gtle,
+                                    int *out_tight_band)
+{
+    if (N <= 0 || N > FP_N_MAX || x_threshold < 0) return FP_STATUS_FALLBACK;
+
+    const __m128i v3 = _mm_set1_epi8(3);
+    uint64_t mis_lo = 0, mis_hi = 0;
+    int total_mis = 0;
+    int i = 0;
+    for (; i + 16 <= N; i += 16) {
+        __m128i qv = _mm_loadu_si128((const __m128i *)(qs + i));
+        __m128i rv = _mm_loadu_si128((const __m128i *)(rs + i));
+        // AMBIG (code >= 4) detected via max > 3. ACGT = 0..3.
+        __m128i mxv = _mm_max_epu8(qv, rv);
+        if ((unsigned)_mm_movemask_epi8(_mm_cmpgt_epi8(mxv, v3)))
+            return FP_STATUS_FALLBACK;  // ambig: give up on both paths
+        __m128i eqv = _mm_cmpeq_epi8(qv, rv);
+        unsigned mism_mask = (~(unsigned)_mm_movemask_epi8(eqv)) & 0xFFFFu;
+        total_mis += __builtin_popcount(mism_mask);
+        if (i < 64) {
+            mis_lo |= ((uint64_t)mism_mask) << i;
+            if (i + 16 > 64) mis_hi |= ((uint64_t)mism_mask) >> (64 - i);
+        } else {
+            mis_hi |= ((uint64_t)mism_mask) << (i - 64);
+        }
+    }
+    for (; i < N; i++) {
+        uint8_t qi = qs[i], ri = rs[i];
+        if (qi >= 4 || ri >= 4) return FP_STATUS_FALLBACK;
+        if (qi != ri) {
+            total_mis++;
+            if (i < 64) mis_lo |= (1ULL << i);
+            else        mis_hi |= (1ULL << (i - 64));
+        }
+    }
+
+    // precise max_sc (no floor) from the mismatch bitmap.
+    //
+    // An earlier formulation used `S = h0 + first_mis_pos·a` — a loose lower bound on the
+    // walk's max_sc — to skip the scalar walk on TIGHT pairs. That preserved
+    // walk-time but left the band proof loose: any matching run after the
+    // first mismatch could not contribute to S, so the proven band stayed
+    // wider than necessary.
+    //
+    // The bitmap-derived max_sc is the optimal ungapped score over all
+    // prefix lengths in [0, N], with no floor (score is allowed to dip and
+    // recover). It is ≥ the walk's max_sc, so substituting it into the band
+    // proof yields a strictly tighter (still safe) bound. Computing it from
+    // the bitmap is O(total_mis), independent of N.
+    //
+    // Band derivation (see comment above):
+    //     B < (min_len·a − S − o_min) / e_min        with S = max_sc − h0
+    // For LEFT extensions where the caller gates on len1 ≥ len2,
+    // min_len = N. Substituting:
+    //     numerator = N·a − (max_sc_proof − h0) − o_min
+    //               = N·a + h0 − max_sc_proof − o_min
+    int max_sc_proof = ungapped_max_sc_from_bitmap(mis_lo, mis_hi, N, h0, a, b);
+
+    if (total_mis > x_threshold) {
+        int64_t numerator = (int64_t)N * a + h0 - max_sc_proof - o_min;
+        int band;
+        if (numerator <= 0) {
+            // Ungapped-optimal (same "tight_band = 0 sentinel" semantic as
+            // walk-derived numerator ≤ 0: let SW run with fallback width).
+            band = 0;
+        } else if (e_min <= 0) {
+            band = default_w;
+        } else {
+            band = (int)((numerator + e_min - 1) / e_min);
+            if (band > default_w) band = default_w;
+        }
+        *out_tight_band = band;
+        // Outputs unused on TIGHT; set sane values for any future caller.
+        *out_score  = max_sc_proof;
+        *out_qle    = 0;
+        *out_gscore = 0;
+        *out_gtle   = N;
+        return FP_STATUS_TIGHT;
+    }
+
+    // HIT candidate: run the scalar walk for precise qle / gscore / max_sc.
+    //
+    // MAIN_CODE* local-SW semantics: once cur==0 in the ungapped path it
+    // stays 0 (no e/f restart).
+    //
+    // Tie-break: SW's maxRS tracker (bandedSWA.cpp MAIN_CODE) updates the
+    // position on BOTH strictly-greater and tied equal-to-current
+    // comparisons — equivalent to "pick the rightmost position where the
+    // max was achieved". We must mirror that (use >=) or qle/tle diverge
+    // from SW on tied-score walks, breaking byte-identical SAM.
+    int cur = h0, max_sc = h0, max_i = 0;
+    for (int j = 0; j < N; j++) {
+        int is_mis = (j < 64) ? (int)((mis_lo >> j) & 1ULL)
+                              : (int)((mis_hi >> (j - 64)) & 1ULL);
+        if (cur == 0) continue;
+        if (!is_mis) cur += a;
+        else {
+            cur -= b;
+            if (cur < 0) cur = 0;
+        }
+        if (cur >= max_sc) { max_sc = cur; max_i = j + 1; }
+    }
+
+    *out_score      = max_sc;
+    *out_qle        = max_i;
+    *out_gscore     = cur;
+    *out_gtle       = N;
+    *out_tight_band = 0;   // unused on HIT (SW skipped)
+    return FP_STATUS_HIT;
+}
+
+// max tight_band across a pair_ar batch. 0 means "no pair had a
+// useful bound"; caller falls back to opt->w.
+static inline int sp_max_tight_band(const SeqPair *pair_ar, int nump)
+{
+    int m = 0;
+    for (int l = 0; l < nump; l++) {
+        if (pair_ar[l].tight_band > m) m = pair_ar[l].tight_band;
+    }
+    return m;
+}
+
 void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                                    const uint8_t *pac, bseq1_t *seq_, int nseq,
                                    mem_chain_v* chain_ar, mem_alnreg_v *av_v,
@@ -2154,6 +2638,14 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
 
     int64_t leftRefOffset = 0, rightRefOffset = 0;
     int64_t leftQerOffset = 0, rightQerOffset = 0;
+
+    // ungapped fast-path threshold, computed once per call from
+    // the scoring model. See ungapped_fastpath_walk docstring.
+    const int fp_o_min = opt->o_del < opt->o_ins ? opt->o_del : opt->o_ins;
+    const int fp_e_min = opt->e_del < opt->e_ins ? opt->e_del : opt->e_ins;
+    const int fp_denom = opt->a + opt->b - fp_e_min;
+    const int fp_x_threshold = (fp_denom > 0) ? (fp_o_min / fp_denom) : -1;
+    // (fp_o_min, fp_e_min above are reused directly by ungapped_analyze.)
 
     int srt_size = MAX_SEEDS_PER_READ, fac = FAC;
     uint64_t *srt = (uint64_t *) malloc(srt_size * 8);
@@ -2201,7 +2693,6 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
             // get the max possible span
             rmax[0] = l_pac<<1; rmax[1] = 0;
 
-            int chain_max_n_hits = 1;
             for (int i = 0; i < c->n; ++i) {
                 int64_t b, e;
                 const mem_seed_t *t = &c->seeds[i];
@@ -2213,7 +2704,6 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                 rmax[0] = tmp < b? rmax[0] : b;
                 rmax[1] = (rmax[1] > e)? rmax[1] : e;
                 if (t->len > max) max = t->len;
-                if (t->n_hits > chain_max_n_hits) chain_max_n_hits = t->n_hits;
             }
 
             rmax[0] = rmax[0] > 0? rmax[0] : 0;
@@ -2279,7 +2769,6 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                 a->frac_rep = c->frac_rep;
                 a->seedlen0 = s->len;
                 a->c = c; //ptr
-                a->chain_n_hits = chain_max_n_hits;
                 a->rb = a->qb = a->re = a->qe = H0_;
 
                 tprof[PE19][tid] ++;
@@ -2359,21 +2848,133 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
 
                     sp.len2 = s->qbeg;
                     sp.len1 = tmp;
-                    int minval = sp.h0 + min_(sp.len1, sp.len2) * opt->a;
+                    sp.tight_band = 0;  // 0 sentinel: "no tight bound known"
+                    int minval;  // declared ahead of goto target for C++
 
-                    if (sp.len1 < MAX_SEQ_LEN8 && sp.len2 < MAX_SEQ_LEN8 && minval < MAX_SEQ_LEN8) {
-                        numPairsLeft128++;
+                    // ungapped analysis.
+                    //   HIT      → skip SW; fill a->* from ungapped.
+                    //   TIGHT    → save sp.tight_band; SW will use it.
+                    //   FALLBACK → use opt->w.
+                    if (sp.len1 >= sp.len2 && sp.len2 <= FP_N_MAX) {
+                        tprof[UGP_L_ATTEMPT][tid]++;
+                        int fp_score, fp_qle, fp_gscore, fp_gtle, fp_band;
+                        int fp_st = ungapped_analyze(qs, rs, sp.len2,
+                                                     sp.h0, opt->a, opt->b,
+                                                     fp_o_min, fp_e_min,
+                                                     fp_x_threshold, opt->w,
+                                                     &fp_score, &fp_qle,
+                                                     &fp_gscore, &fp_gtle,
+                                                     &fp_band);
+                        if (fp_st == FP_STATUS_HIT) {
+                            tprof[UGP_L_HIT][tid]++;
+                            tprof[UGP_L_UNGAPPED][tid]++;
+                            tprof[UGP_SCORE_HIST_BASE + 0 * UGP_SCORE_HIST_NBINS
+                                  + ugp_score_bin(fp_score)][tid]++;
+                            /* Q3: cat0=ALL, cat1=UNGAP_FINAL, cat3=HIT.
+                             * For HIT, fp_score is both the would-be ungapped
+                             * score and the committed score, so the delta
+                             * (perfect_score - aln_score) is the same for
+                             * both histograms. */
+                            {
+                                int _perfect = sp.h0 + opt->a * sp.len2;
+                                int _delta = _perfect - fp_score;
+                                int _bin = ugp_delta_bin(_delta);
+                                tprof[UGP_L_CAT_UNG_BASE + 0 * UGP_CAT_NBINS + _bin][tid]++;
+                                tprof[UGP_L_CAT_UNG_BASE + 1 * UGP_CAT_NBINS + _bin][tid]++;
+                                tprof[UGP_L_CAT_UNG_BASE + 3 * UGP_CAT_NBINS + _bin][tid]++;
+                                tprof[UGP_L_CAT_FIN_BASE + 0 * UGP_CAT_NBINS + _bin][tid]++;
+                                tprof[UGP_L_CAT_FIN_BASE + 1 * UGP_CAT_NBINS + _bin][tid]++;
+                                tprof[UGP_L_CAT_FIN_BASE + 3 * UGP_CAT_NBINS + _bin][tid]++;
+                            }
+                            // Roll back the qs/rs buffer offsets we just
+                            // consumed; the batch won't reference them.
+                            leftQerOffset -= s->qbeg;
+                            leftRefOffset -= tmp;
+                            // Mirror post-SW extraction (~line 2560).
+                            a->score = fp_score;
+                            if (fp_gscore <= 0 || fp_gscore <= a->score - opt->pen_clip5) {
+                                a->qb = s->qbeg - fp_qle;
+                                a->rb = s->rbeg - fp_qle; // tle == qle on diagonal
+                                a->truesc = a->score;
+                            } else {
+                                a->qb = 0;
+                                a->rb = s->rbeg - fp_gtle;
+                                a->truesc = fp_gscore;
+                            }
+                            a->w = max_(a->w, opt->w);
+                            if (a->rb != H0_ && a->qb != H0_ && a->qe != H0_ && a->re != H0_) {
+                                int ii;
+                                for (ii = 0, a->seedcov = 0; ii < a->c->n; ++ii) {
+                                    const mem_seed_t *t = &(a->c->seeds[ii]);
+                                    if (t->qbeg >= a->qb && t->qbeg + t->len <= a->qe &&
+                                        t->rbeg >= a->rb && t->rbeg + t->len <= a->re)
+                                        a->seedcov += t->len;
+                                }
+                            }
+                            goto LEFT_DONE;
+                        }
+                        if (fp_st == FP_STATUS_TIGHT) {
+                            // Fast-path failed but tight_band valid. Pipe
+                            // to SW via sp.tight_band.
+                            sp.tight_band = fp_band;
+                            tprof[UGP_L_TIGHT][tid]++;
+                            if (fp_band <= 8)        tprof[UGP_L_TB_1_8][tid]++;
+                            else if (fp_band <= 32)  tprof[UGP_L_TB_9_32][tid]++;
+                            else                     tprof[UGP_L_TB_33_MAX][tid]++;
+
+                        }
+                        // FALLBACK: sp.tight_band stays 0.
                     }
-                    else if (sp.len1 < MAX_SEQ_LEN16 && sp.len2 < MAX_SEQ_LEN16 && minval < MAX_SEQ_LEN16){
-                        numPairsLeft16++;
+
+                    minval = sp.h0 + min_(sp.len1, sp.len2) * opt->a;
+
+                    {
+                        int t_tier;
+                        if (sp.len1 < MAX_SEQ_LEN8 && sp.len2 < MAX_SEQ_LEN8 && minval < MAX_SEQ_LEN8) {
+                            numPairsLeft128++; t_tier = 0;
+                        }
+                        else if (sp.len1 < MAX_SEQ_LEN16 && sp.len2 < MAX_SEQ_LEN16 && minval < MAX_SEQ_LEN16){
+                            numPairsLeft16++;  t_tier = 1;
+                        }
+                        else {
+                            numPairsLeft1++;   t_tier = 2;  /* scalar; not bucketed */
+                        }
+                        /* tight_band histogram bin. */
+                        int tb_ = sp.tight_band;
+                        int fine_bin;
+                        if      (tb_ ==  0) fine_bin = 0;
+                        else if (tb_ <=  2) fine_bin = 1;
+                        else if (tb_ <=  4) fine_bin = 2;
+                        else if (tb_ <=  8) fine_bin = 3;
+                        else if (tb_ <= 16) fine_bin = 4;
+                        else if (tb_ <= 32) fine_bin = 5;
+                        else if (tb_ <= 48) fine_bin = 6;
+                        else if (tb_ <= 64) fine_bin = 7;
+                        else if (tb_ <= 80) fine_bin = 8;
+                        else                fine_bin = 9;
+                        tprof[UGP_FINE_BASE + 0 * UGP_FINE_NBINS + fine_bin][tid]++;
+                        if (t_tier <= 1) {
+                            int band_bin;
+                            if      (tb_ ==  0) band_bin = 0;
+                            else if (tb_ <=  8) band_bin = 1;
+                            else if (tb_ <= 32) band_bin = 2;
+                            else                band_bin = 3;
+                            tprof[UGP_TIER_TB_BASE + 0 * 8 + t_tier * 4 + band_bin][tid]++;
+                        }
                     }
-                    else {
-                        numPairsLeft1++;
-                    }
+
+                    /* Q3: compute would-be ungapped extension score for this
+                     * non-HIT LEFT pair. The walk handles arbitrary N
+                     * (including the bypass case len2 > FP_N_MAX where
+                     * analyze did not run). Cost: O(len2) scalar; called
+                     * for instrumentation only — discard if reverting. */
+                    sp.ugp_walk_score = ungapped_walk_score(qs, rs, sp.len2,
+                                                            sp.h0, opt->a, opt->b);
 
                     seqPairArrayLeft128[numPairsLeft] = sp;
                     numPairsLeft ++;
                     a->qb = s->qbeg; a->rb = s->rbeg;
+                    LEFT_DONE: ;
                 }
                 else
                 {
@@ -2461,7 +3062,69 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
 
                     for (int i = 0; i < sp.len1; ++i) rs[i] = rseq[re + i]; //seq1
 
-                    int minval = sp.h0 + min_(sp.len1, sp.len2) * opt->a;
+                    sp.tight_band = 0;
+                    sp.ugp_r_attempted = 0;
+                    int minval;  // declared ahead of goto target for C++
+
+                    // ungapped analysis on right ext.
+                    // Precondition a->score != -1 means left either didn't
+                    // need extension or was fast-pathed — in both cases
+                    // h0 is known. If left was batched, we skip (can't
+                    // know h0 yet); SW will run with default band.
+                    if (a->score != -1 && sp.len1 >= sp.len2 && sp.len2 <= FP_N_MAX) {
+                        sp.ugp_r_attempted = 1;
+                        tprof[UGP_R_ATTEMPT][tid]++;
+                        int fp_h0 = a->score;  // the real h0 for right ext
+                        int fp_score, fp_qle, fp_gscore, fp_gtle, fp_band;
+                        int fp_st = ungapped_analyze(qs, rs, sp.len2,
+                                                     fp_h0, opt->a, opt->b,
+                                                     fp_o_min, fp_e_min,
+                                                     fp_x_threshold, opt->w,
+                                                     &fp_score, &fp_qle,
+                                                     &fp_gscore, &fp_gtle,
+                                                     &fp_band);
+                        if (fp_st == FP_STATUS_HIT) {
+                            tprof[UGP_R_HIT][tid]++;
+                            tprof[UGP_R_UNGAPPED][tid]++;
+                            tprof[UGP_SCORE_HIST_BASE + 1 * UGP_SCORE_HIST_NBINS
+                                  + ugp_score_bin(fp_score)][tid]++;
+                            // Roll back the qs/rs buffer offsets.
+                            rightQerOffset -= sp.len2;
+                            rightRefOffset -= sp.len1;
+                            // Mirror post-SW extraction (~line 2777).
+                            a->score = fp_score;
+                            if (fp_gscore <= 0 || fp_gscore <= a->score - opt->pen_clip3) {
+                                a->qe = qe + fp_qle;
+                                a->re = rmax[0] + re + fp_qle; // tle == qle on diagonal
+                                a->truesc += a->score - fp_h0;
+                            } else {
+                                a->qe = l_query;
+                                a->re = rmax[0] + re + fp_gtle;
+                                a->truesc += fp_gscore - fp_h0;
+                            }
+                            a->w = max_(a->w, opt->w);
+                            if (a->rb != H0_ && a->qb != H0_ && a->qe != H0_ && a->re != H0_) {
+                                int ii;
+                                for (ii = 0, a->seedcov = 0; ii < a->c->n; ++ii) {
+                                    const mem_seed_t *t = &a->c->seeds[ii];
+                                    if (t->qbeg >= a->qb && t->qbeg + t->len <= a->qe &&
+                                        t->rbeg >= a->rb && t->rbeg + t->len <= a->re)
+                                        a->seedcov += t->len;
+                                }
+                            }
+                            goto RIGHT_DONE;
+                        }
+                        if (fp_st == FP_STATUS_TIGHT) {
+                            sp.tight_band = fp_band;
+                            tprof[UGP_R_TIGHT][tid]++;
+                            if (fp_band <= 8)        tprof[UGP_R_TB_1_8][tid]++;
+                            else if (fp_band <= 32)  tprof[UGP_R_TB_9_32][tid]++;
+                            else                     tprof[UGP_R_TB_33_MAX][tid]++;
+
+                        }
+                    }
+
+                    minval = sp.h0 + min_(sp.len1, sp.len2) * opt->a;
 
                     if (sp.len1 < MAX_SEQ_LEN8 && sp.len2 < MAX_SEQ_LEN8 && minval < MAX_SEQ_LEN8) {
                         numPairsRight128++;
@@ -2472,9 +3135,12 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                     else {
                         numPairsRight1++;
                     }
+                    /* RIGHT histograms (Groups A & B) are populated post-left-SW
+                     * once 26e/26f's right pass has finalised sp->tight_band. */
                     seqPairArrayRight128[numPairsRight] = sp;
                     numPairsRight ++;
                     a->qe = qe; a->re = rmax[0] + re;
+                    RIGHT_DONE: ;
                 }
                 else
                 {
@@ -2507,6 +3173,27 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                     numPairsLeft128, numPairsLeft16, numPairsLeft1, opt->a);
     assert(numPairsLeft == (numPairsLeft128 + numPairsLeft16 + numPairsLeft1));
 
+    /* instrumentation: per-batch narrow bucket size (Group C, LEFT).
+     * Counts pairs in the 8-bit tier with tight_band ∈ [1,8] for THIS worker
+     * batch — the size a future narrow bucket would have. */
+    {
+        int narrow_sz = 0;
+        for (int l = 0; l < numPairsLeft128; l++) {
+            int tb = seqPairArrayLeft128[l].tight_band;
+            if (tb > 0 && tb <= 8) narrow_sz++;
+        }
+        int bin;
+        if      (narrow_sz ==   0) bin = 0;
+        else if (narrow_sz <   16) bin = 1;
+        else if (narrow_sz <   32) bin = 2;
+        else if (narrow_sz <   64) bin = 3;
+        else if (narrow_sz <  128) bin = 4;
+        else if (narrow_sz <  256) bin = 5;
+        else if (narrow_sz <  512) bin = 6;
+        else                       bin = 7;
+        tprof[UGP_NARROW_SZ_BASE + 0 * UGP_NARROW_SZ_NBINS + bin][tid]++;
+    }
+
 
     // SWA
     // uint64_t timL = __rdtsc();
@@ -2528,10 +3215,15 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
     SeqPair *pair_ar_aux = seqPairArrayAux;
     int nump = numPairsLeft1;
 
+    // PR 26c.1: tighten initial band using max(tight_band) across batch.
+    int max_tb = sp_max_tight_band(pair_ar, nump);
+    int init_w = (max_tb > 0 && max_tb < opt->w) ? max_tb : opt->w; if (init_w > BUCKET_MAX_INIT_W) init_w = BUCKET_MAX_INIT_W;
+    tprof[UGP_L_DISP_NARROW][tid] += (init_w < opt->w);
+
     // scalar
     for ( i=0; i<MAX_BAND_TRY; i++)
     {
-        int32_t w = opt->w << i;
+        int32_t w = init_w << i;
         // uint64_t tim = __rdtsc();
         bswLeft.scalarBandedSWAWrapper(pair_ar,
                                        seqBufLeftRef,
@@ -2553,8 +3245,9 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
             a->score = sp->score;
 
             if (a->score == prev || sp->max_off < (w >> 1) + (w >> 2) ||
-                i+1 == MAX_BAND_TRY)
+                i+1 == MAX_BAND_TRY || sp->tight_band > 0)
             {
+                ugp_record_left_outcome(sp, opt->a, tid);
                 if (sp->gscore <= 0 || sp->gscore <= a->score - opt->pen_clip5) {
                     a->qb -= sp->qle; a->rb -= sp->tle;
                     a->truesc = a->score;
@@ -2593,11 +3286,14 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
     pair_ar_aux = seqPairArrayAux;
 
     nump = numPairsLeft16;
+    max_tb = sp_max_tight_band(pair_ar, nump);
+    init_w = (max_tb > 0 && max_tb < opt->w) ? max_tb : opt->w; if (init_w > BUCKET_MAX_INIT_W) init_w = BUCKET_MAX_INIT_W;
+    tprof[UGP_L_DISP_NARROW][tid] += (init_w < opt->w);
     for ( i=0; i<MAX_BAND_TRY; i++)
     {
-        int32_t w = opt->w << i;
+        int32_t w = init_w << i;
         // int64_t tim = __rdtsc();
-#if ((!__AVX512BW__) && (!__AVX2__) && (!__SSE2__))
+#if !HAVE_BSW_VECTOR_8_16
         bswLeft.scalarBandedSWAWrapper(pair_ar, seqBufLeftRef, seqBufLeftQer, nump, nthreads, w);
 #else
         sortPairsLen(pair_ar, nump, seqPairArrayAux, hist);
@@ -2625,8 +3321,9 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
 
 
             if (a->score == prev || sp->max_off < (w >> 1) + (w >> 2) ||
-                i+1 == MAX_BAND_TRY)
+                i+1 == MAX_BAND_TRY || sp->tight_band > 0)
             {
+                ugp_record_left_outcome(sp, opt->a, tid);
                 if (sp->gscore <= 0 || sp->gscore <= a->score - opt->pen_clip5) {
                     a->qb -= sp->qle; a->rb -= sp->tle;
                     a->truesc = a->score;
@@ -2661,12 +3358,15 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
     pair_ar_aux = seqPairArrayAux;
 
     nump = numPairsLeft128;
+    max_tb = sp_max_tight_band(pair_ar, nump);
+    init_w = (max_tb > 0 && max_tb < opt->w) ? max_tb : opt->w; if (init_w > BUCKET_MAX_INIT_W) init_w = BUCKET_MAX_INIT_W;
+    tprof[UGP_L_DISP_NARROW][tid] += (init_w < opt->w);
     for ( i=0; i<MAX_BAND_TRY; i++)
     {
-        int32_t w = opt->w << i;
+        int32_t w = init_w << i;
         // int64_t tim = __rdtsc();
 
-#if ((!__AVX512BW__) && (!__AVX2__) && (!__SSE2__))
+#if !HAVE_BSW_VECTOR_8_16
         bswLeft.scalarBandedSWAWrapper(pair_ar, seqBufLeftRef, seqBufLeftQer, nump, nthreads, w);
 #else
         sortPairsLen(pair_ar, nump, seqPairArrayAux, hist);
@@ -2693,8 +3393,9 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
             a->score = sp->score;
 
             if (a->score == prev || sp->max_off < (w >> 1) + (w >> 2) ||
-                i+1 == MAX_BAND_TRY)
+                i+1 == MAX_BAND_TRY || sp->tight_band > 0)
             {
+                ugp_record_left_outcome(sp, opt->a, tid);
                 if (sp->gscore <= 0 || sp->gscore <= a->score - opt->pen_clip5) {
                     a->qb -= sp->qle; a->rb -= sp->tle;
                     a->truesc = a->score;
@@ -2728,7 +3429,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
 
     // uint64_t timR = __rdtsc();
     // **********************************************************
-    // Right, scalar
+    // h0 fixup: right-extension h0 is the left-extension alnreg score.
     for (int l=0; l<numPairsRight; l++) {
         mem_alnreg_t *a;
         SeqPair *sp = &seqPairArrayRight128[l];
@@ -2736,18 +3437,146 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
         sp->h0 = a->score;
     }
 
+    // post-left-SW right-side ungapped pass. The per-seed fast-
+    // path skipped right ext for 93% of pairs because a->score was still
+    // -1 at construction time (left SW hadn't run yet). Now that left
+    // SW is done, a->score is final and h0 is set above. Run ungapped
+    // analysis on every right pair:
+    //   HIT    → fill a->* directly, compact the pair out of the array.
+    //   TIGHT  → set sp->tight_band for the SW dispatch.
+    //   FALL   → leave tight_band at construction default (typically 0).
+    {
+        int compacted = 0;
+        for (int l = 0; l < numPairsRight; l++) {
+            SeqPair *sp = &seqPairArrayRight128[l];
+            mem_alnreg_t *a = &(av_v[sp->seqid].a[sp->regid]);
+            int keep = 1;
+            // Skip pairs already analyzed at construction time (a->score
+            // was non-(-1) then; UGP_R_ATTEMPT and outcome counters fired
+            // there). Without this guard, those pairs would double-count.
+            if (!sp->ugp_r_attempted &&
+                sp->len1 >= sp->len2 && sp->len2 > 0 && sp->len2 <= FP_N_MAX) {
+                tprof[UGP_R_ATTEMPT][tid]++;
+                const uint8_t *qs = seqBufRightQer + sp->idq;
+                const uint8_t *rs = seqBufRightRef + sp->idr;
+                int fp_score, fp_qle, fp_gscore, fp_gtle, fp_band;
+                int fp_st = ungapped_analyze(qs, rs, sp->len2, sp->h0,
+                                              opt->a, opt->b,
+                                              fp_o_min, fp_e_min,
+                                              fp_x_threshold, opt->w,
+                                              &fp_score, &fp_qle,
+                                              &fp_gscore, &fp_gtle,
+                                              &fp_band);
+                if (fp_st == FP_STATUS_HIT) {
+                    tprof[UGP_R_HIT][tid]++;
+                    tprof[UGP_R_UNGAPPED][tid]++;
+                    tprof[UGP_SCORE_HIST_BASE + 1 * UGP_SCORE_HIST_NBINS
+                          + ugp_score_bin(fp_score)][tid]++;
+                    // Mirror post-right-SW extraction. a->qe / a->re were
+                    // set in the per-seed construction loop to the pre-
+                    // extension anchor positions (s->qbeg+s->len / s->rbeg+s->len).
+                    int l_query = seq_[sp->seqid].l_seq;
+                    a->score = fp_score;
+                    if (fp_gscore <= 0 || fp_gscore <= a->score - opt->pen_clip3) {
+                        a->qe += fp_qle;
+                        a->re += fp_qle; // tle == qle on diagonal
+                        a->truesc += a->score - sp->h0;
+                    } else {
+                        a->qe = l_query;
+                        a->re += fp_gtle;
+                        a->truesc += fp_gscore - sp->h0;
+                    }
+                    a->w = max_(a->w, opt->w);
+                    if (a->rb != H0_ && a->qb != H0_ && a->qe != H0_ && a->re != H0_) {
+                        int ii;
+                        for (ii = 0, a->seedcov = 0; ii < a->c->n; ++ii) {
+                            const mem_seed_t *t = &a->c->seeds[ii];
+                            if (t->qbeg >= a->qb && t->qbeg + t->len <= a->qe &&
+                                t->rbeg >= a->rb && t->rbeg + t->len <= a->re)
+                                a->seedcov += t->len;
+                        }
+                    }
+                    keep = 0;
+                } else if (fp_st == FP_STATUS_TIGHT) {
+                    sp->tight_band = fp_band;
+                    tprof[UGP_R_TIGHT][tid]++;
+                    if (fp_band <= 8)        tprof[UGP_R_TB_1_8][tid]++;
+                    else if (fp_band <= 32)  tprof[UGP_R_TB_9_32][tid]++;
+                    else                     tprof[UGP_R_TB_33_MAX][tid]++;
+
+                }
+            }
+            if (keep) {
+                if (compacted != l)
+                    seqPairArrayRight128[compacted] = *sp;
+                compacted++;
+            }
+        }
+        numPairsRight = compacted;
+    }
+
     sortPairsLenExt(seqPairArrayRight128, numPairsRight, seqPairArrayAux,
                     hist, numPairsRight128, numPairsRight16, numPairsRight1, opt->a);
 
     assert(numPairsRight == (numPairsRight128 + numPairsRight16 + numPairsRight1));
 
+    /* instrumentation (Groups A, B, C — RIGHT). Run after the post-
+     * left-SW analyze pass + tier sort: sp->tight_band is now final and the
+     * 128 region is contiguous at the head of seqPairArrayRight128. */
+    {
+        int narrow_sz = 0;
+        for (int l = 0; l < numPairsRight; l++) {
+            SeqPair *sp_ = &seqPairArrayRight128[l];
+            int tb_ = sp_->tight_band;
+            int t_tier;
+            int minval_ = sp_->h0 + min_(sp_->len1, sp_->len2) * opt->a;
+            if (sp_->len1 < MAX_SEQ_LEN8 && sp_->len2 < MAX_SEQ_LEN8 && minval_ < MAX_SEQ_LEN8)        t_tier = 0;
+            else if (sp_->len1 < MAX_SEQ_LEN16 && sp_->len2 < MAX_SEQ_LEN16 && minval_ < MAX_SEQ_LEN16) t_tier = 1;
+            else                                                                                       t_tier = 2;
+            int fine_bin;
+            if      (tb_ ==  0) fine_bin = 0;
+            else if (tb_ <=  2) fine_bin = 1;
+            else if (tb_ <=  4) fine_bin = 2;
+            else if (tb_ <=  8) fine_bin = 3;
+            else if (tb_ <= 16) fine_bin = 4;
+            else if (tb_ <= 32) fine_bin = 5;
+            else if (tb_ <= 48) fine_bin = 6;
+            else if (tb_ <= 64) fine_bin = 7;
+            else if (tb_ <= 80) fine_bin = 8;
+            else                fine_bin = 9;
+            tprof[UGP_FINE_BASE + 1 * UGP_FINE_NBINS + fine_bin][tid]++;
+            if (t_tier <= 1) {
+                int band_bin;
+                if      (tb_ ==  0) band_bin = 0;
+                else if (tb_ <=  8) band_bin = 1;
+                else if (tb_ <= 32) band_bin = 2;
+                else                band_bin = 3;
+                tprof[UGP_TIER_TB_BASE + 1 * 8 + t_tier * 4 + band_bin][tid]++;
+            }
+            if (t_tier == 0 && tb_ > 0 && tb_ <= 8) narrow_sz++;
+        }
+        int bin;
+        if      (narrow_sz ==   0) bin = 0;
+        else if (narrow_sz <   16) bin = 1;
+        else if (narrow_sz <   32) bin = 2;
+        else if (narrow_sz <   64) bin = 3;
+        else if (narrow_sz <  128) bin = 4;
+        else if (narrow_sz <  256) bin = 5;
+        else if (narrow_sz <  512) bin = 6;
+        else                       bin = 7;
+        tprof[UGP_NARROW_SZ_BASE + 1 * UGP_NARROW_SZ_NBINS + bin][tid]++;
+    }
+
     pair_ar = seqPairArrayRight128 + numPairsRight128 + numPairsRight16;
     pair_ar_aux = seqPairArrayAux;
     nump = numPairsRight1;
+    max_tb = sp_max_tight_band(pair_ar, nump);
+    init_w = (max_tb > 0 && max_tb < opt->w) ? max_tb : opt->w; if (init_w > BUCKET_MAX_INIT_W) init_w = BUCKET_MAX_INIT_W;
+    tprof[UGP_R_DISP_NARROW][tid] += (init_w < opt->w);
 
     for ( i=0; i<MAX_BAND_TRY; i++)
     {
-        int32_t w = opt->w << i;
+        int32_t w = init_w << i;
         // tim = __rdtsc();
         bswRight.scalarBandedSWAWrapper(pair_ar,
                         seqBufRightRef,
@@ -2770,8 +3599,9 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
 
             // no further banding
             if (a->score == prev || sp->max_off < (w >> 1) + (w >> 2) ||
-                i+1 == MAX_BAND_TRY)
+                i+1 == MAX_BAND_TRY || sp->tight_band > 0)
             {
+                ugp_record_right_outcome(sp, tid);
                 if (sp->gscore <= 0 || sp->gscore <= a->score - opt->pen_clip3) {
                     a->qe += sp->qle, a->re += sp->tle;
                     a->truesc += a->score - sp->h0;
@@ -2805,12 +3635,15 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
     pair_ar = seqPairArrayRight128 + numPairsRight128;
     pair_ar_aux = seqPairArrayAux;
     nump = numPairsRight16;
+    max_tb = sp_max_tight_band(pair_ar, nump);
+    init_w = (max_tb > 0 && max_tb < opt->w) ? max_tb : opt->w; if (init_w > BUCKET_MAX_INIT_W) init_w = BUCKET_MAX_INIT_W;
+    tprof[UGP_R_DISP_NARROW][tid] += (init_w < opt->w);
 
     for ( i=0; i<MAX_BAND_TRY; i++)
     {
-        int32_t w = opt->w << i;
+        int32_t w = init_w << i;
         // uint64_t tim = __rdtsc();
-#if ((!__AVX512BW__) && (!__AVX2__) && (!__SSE2__))
+#if !HAVE_BSW_VECTOR_8_16
         bswRight.scalarBandedSWAWrapper(pair_ar, seqBufRightRef, seqBufRightQer, nump, nthreads, w);
 #else
         sortPairsLen(pair_ar, nump, seqPairArrayAux, hist);
@@ -2839,8 +3672,9 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
 
             // no further banding
             if (a->score == prev || sp->max_off < (w >> 1) + (w >> 2) ||
-                i+1 == MAX_BAND_TRY)
+                i+1 == MAX_BAND_TRY || sp->tight_band > 0)
             {
+                ugp_record_right_outcome(sp, tid);
                 if (sp->gscore <= 0 || sp->gscore <= a->score - opt->pen_clip3) {
                     a->qe += sp->qle, a->re += sp->tle;
                     a->truesc += a->score - sp->h0;
@@ -2875,13 +3709,16 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
     pair_ar = seqPairArrayRight128;
     pair_ar_aux = seqPairArrayAux;
     nump = numPairsRight128;
+    max_tb = sp_max_tight_band(pair_ar, nump);
+    init_w = (max_tb > 0 && max_tb < opt->w) ? max_tb : opt->w; if (init_w > BUCKET_MAX_INIT_W) init_w = BUCKET_MAX_INIT_W;
+    tprof[UGP_R_DISP_NARROW][tid] += (init_w < opt->w);
 
     for ( i=0; i<MAX_BAND_TRY; i++)
     {
-        int32_t w = opt->w << i;
+        int32_t w = init_w << i;
         // uint64_t tim = __rdtsc();
 
-#if ((!__AVX512BW__) && (!__AVX2__) && (!__SSE2__))
+#if !HAVE_BSW_VECTOR_8_16
         bswRight.scalarBandedSWAWrapper(pair_ar, seqBufRightRef, seqBufRightQer, nump, nthreads, w);
 #else
         sortPairsLen(pair_ar, nump, seqPairArrayAux, hist);
@@ -2908,8 +3745,9 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
             a->score = sp->score;
             // no further banding
             if (a->score == prev || sp->max_off < (w >> 1) + (w >> 2) ||
-                i+1 == MAX_BAND_TRY)
+                i+1 == MAX_BAND_TRY || sp->tight_band > 0)
             {
+                ugp_record_right_outcome(sp, tid);
                 if (sp->gscore <= 0 || sp->gscore <= a->score - opt->pen_clip3) {
                     a->qe += sp->qle, a->re += sp->tle;
                     a->truesc += a->score - sp->h0;
@@ -2957,8 +3795,13 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
         lim_g[l] += lim_g[l-1];
 
     // uint64_t tim = __rdtsc();
-    int *lim = (int *) calloc(BATCH_SIZE, sizeof(int));
-    assert(lim != NULL);
+    // BATCH_SIZE is a compile-time constant (1024 on arm64, 512 elsewhere);
+    // sizeof(int)*BATCH_SIZE = 4096/2048 bytes — safe on stack, skips an
+    // allocator round-trip per call to this function. nseq is bounded by
+    // kt_for's BATCH_SIZE-chunked work distribution (worker_bwt at the
+    // call site) — assert it for future-proofing.
+    assert(nseq <= BATCH_SIZE);
+    int lim[BATCH_SIZE] = {0};
 
     for (int l=0; l<nseq; l++)
     {
@@ -3049,6 +3892,5 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
     }
     free(srtgg);
     free(srt);
-    free(lim);
     // tprof[MEM_ALN2_DOWN][tid] += __rdtsc() - tim;
 }

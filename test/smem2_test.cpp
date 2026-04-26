@@ -176,7 +176,6 @@ int main(int argc, char **argv) {
             readlength,
             minSeedLen,
             matchArray,
-            (int64_t)numReads * readlength,
             numTotalSmem);
     endTick = __rdtsc();
 #ifdef VTUNE_ANALYSIS

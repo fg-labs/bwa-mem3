@@ -138,7 +138,12 @@ int main(int argc, char **argv) {
 
     int64_t num_batches = (numReads + batch_size - 1 ) / batch_size;
     int64_t *numTotalSmem = (int64_t *)_mm_malloc(num_batches * sizeof(int64_t), 64);;
-    SMEM **batchStart = (SMEM **)_mm_malloc(num_batches * sizeof(SMEM *), 64);;
+    // Per-batch (tid, offset) lookup. matchArray[tid] is grown on demand
+    // with realloc() below, which can relocate the buffer — so we publish
+    // a stable index pair instead of a raw SMEM* into the (mutable) buffer
+    // and resolve to a pointer at print time once all growth is done.
+    int32_t *batchTid    = (int32_t *)_mm_malloc(num_batches * sizeof(int32_t), 64);
+    int64_t *batchOffset = (int64_t *)_mm_malloc(num_batches * sizeof(int64_t), 64);
 #pragma omp parallel num_threads(numthreads)
     {
         int tid = omp_get_thread_num();
@@ -160,7 +165,8 @@ int main(int argc, char **argv) {
 #endif
     startTick = __rdtsc();
     memset(numTotalSmem, 0, num_batches * sizeof(int64_t));
-    memset(batchStart, 0, num_batches * sizeof(int64_t));
+    memset(batchTid, 0, num_batches * sizeof(int32_t));
+    memset(batchOffset, 0, num_batches * sizeof(int64_t));
     int64_t workTicks[numthreads];
     memset(workTicks, 0, numthreads * sizeof(int64_t));
     int64_t perThreadQuota = numReads / numthreads;
@@ -169,18 +175,22 @@ int main(int argc, char **argv) {
     {
         int32_t *rid_array = (int32_t *)_mm_malloc(batch_size * sizeof(int32_t), 64);
         int32_t tid = omp_get_thread_num();
+        // Initial capacity must hold at least one batch's worst case so the
+        // first grow check below has a real budget to compare against. When
+        // numthreads > numReads, perThreadQuota is 0 and the legacy
+        // `perThreadQuota * 20` would malloc(0).
         int64_t matchArrayAlloc = perThreadQuota * 20;
+        const int64_t min_alloc = (int64_t)batch_size * max_readlength;
+        if (matchArrayAlloc < min_alloc) matchArrayAlloc = min_alloc;
         matchArray[tid] = (SMEM *)malloc(matchArrayAlloc * sizeof(SMEM));
         int64_t myTotalSmems = 0;
         int64_t startTick = __rdtsc();
 
-        // Per-thread lockstep slot buffers. Each OpenMP thread owns its own
-        // pair; production code (mmc) grows them on demand, but here
-        // max_readlength is fixed for the run so one allocation suffices for
-        // every batch this thread will process.
-        const int64_t ls_pair_elems = (int64_t)SMEM_LOCKSTEP_N * max_readlength;
-        SMEM *ls_prev      = (SMEM *)_mm_malloc(ls_pair_elems * sizeof(SMEM), 64);
-        SMEM *ls_match_buf = (SMEM *)_mm_malloc(ls_pair_elems * sizeof(SMEM), 64);
+        // The lockstep variant of getSMEMsOnePosOneThread now owns its
+        // per-slot prev/match buffers internally (sized by
+        // MAX_READ_LEN_FOR_LOCKSTEP), so the harness no longer pre-allocates
+        // them. matchArrayAlloc is grown on demand to keep the per-thread
+        // output buffer ahead of the per-batch SMEM count.
 
 #pragma omp for schedule(dynamic)
         for(i = 0; i < numReads; i += batch_size)
@@ -211,11 +221,9 @@ int main(int argc, char **argv) {
                     max_readlength,
                     minSeedLen,
                     matchArray[tid] + myTotalSmems,
-                    matchArrayAlloc - myTotalSmems,
-                    ls_prev,
-                    ls_match_buf,
                     numTotalSmem + batch_id);
-            batchStart[batch_id] = matchArray[tid] + myTotalSmems;
+            batchTid[batch_id]    = tid;
+            batchOffset[batch_id] = myTotalSmems;
             fmiSearch->sortSMEMs(matchArray[tid] + myTotalSmems,
                     numTotalSmem + batch_id,
                     batch_count,
@@ -233,8 +241,6 @@ int main(int argc, char **argv) {
         int64_t endTick = __rdtsc();
         printf("%d] %ld ticks, workTicks = %ld\n", tid, endTick - startTick, workTicks[tid]);
         _mm_free(rid_array);
-        _mm_free(ls_prev);
-        _mm_free(ls_match_buf);
     }
 
     endTick = __rdtsc();
@@ -267,7 +273,9 @@ int main(int argc, char **argv) {
     int32_t prevRid = -1;
     for(batch_id = 0; batch_id < num_batches; batch_id++)
     {
-        SMEM *myMatchArray = batchStart[batch_id];
+        // Resolve (tid, offset) to a stable pointer now — every batch's
+        // owning thread has finished growing matchArray[tid].
+        SMEM *myMatchArray = matchArray[batchTid[batch_id]] + batchOffset[batch_id];
         int64_t i;
         for(i = 0; i < numTotalSmem[batch_id]; i++)
         {
@@ -303,7 +311,8 @@ int main(int argc, char **argv) {
     }
     _mm_free(min_intv_array);
     _mm_free(numTotalSmem);
-    _mm_free(batchStart);
+    _mm_free(batchTid);
+    _mm_free(batchOffset);
     delete fmiSearch;
     return 0;
 }

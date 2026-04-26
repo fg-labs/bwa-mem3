@@ -32,28 +32,33 @@ Authors: Sanchit Misra <sanchit.misra@intel.com>; Vasimuddin Md <vasimuddin.md@i
 #include <stdlib.h>
 #include <inttypes.h>
 #include <climits>
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
 #include "FMI_search.h"
 #include "memcpy_bwamem.h"
 #include "profiling.h"
 #include "libsais_build.h"
 
-// Structured-exit on SMEM-buffer overflow. Called from every matchArray
-// and match_buf write site when a bounds check fails. Prints a clear
-// message and exits so memory corruption never propagates.
-static void smem_overflow_die(const char *where, int64_t cap,
-                              int64_t needed, int32_t read_len)
-{
-    fprintf(stderr,
-        "FATAL: SMEM buffer overflow in %s: capacity=%" PRId64
-        ", attempted write at index=%" PRId64 ", read_len=%d. This is a "
-        "bwa-mem2 bug — please file an issue at "
-        "https://github.com/fg-labs/bwa-mem2/issues with the input that "
-        "triggered it.\n",
-        where, cap, needed, read_len);
-    exit(1);
-}
-
 #include "safestringlib.h"
+
+// Request transparent huge pages for large index buffers. The bwa-mem2
+// hg38 index is ~17 GB split across cp_occ (~6 GB), sa_ms_byte (~2 GB),
+// sa_ls_word (~8 GB). With 4 KB pages the dTLB can cover ~256 KB — a
+// rounding error against 17 GB. Linux THP promotes adjacent 4 KB pages
+// to 2 MB pages (coverage ~128 MB per 64-entry TLB), dramatically
+// reducing TLB pressure in the SMEM Occ-lookup and SA expansion loops.
+// Without this advice, THP promotion is opportunistic and can be demoted
+// under memory pressure → bimodal per-run wall-clock as THP compaction
+// toggles.
+static inline void bwamem_madv_hugepage(void *p, size_t sz)
+{
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+    if (p != NULL && sz > 0) (void)madvise(p, sz, MADV_HUGEPAGE);
+#else
+    (void)p; (void)sz;
+#endif
+}
 
 FMI_search::FMI_search(const char *fname)
 {
@@ -135,6 +140,11 @@ int FMI_search::build_index() {
 
 void FMI_search::load_index()
 {
+    // Running total of index bytes allocated so far in this function.
+    // Passed to assert_not_null so a failed allocation reports both the
+    // attempted size and how much we'd already committed before failing.
+    int64_t index_alloc = 0;
+
     one_hot_mask_array = (uint64_t *)_mm_malloc(64 * sizeof(uint64_t), 64);
     one_hot_mask_array[0] = 0;
     uint64_t base = 0x8000000000000000L;
@@ -175,10 +185,11 @@ void FMI_search::load_index()
     cp_occ = NULL;
 
     err_fread_noeof(&count[0], sizeof(int64_t), 5, cpstream);
-    if ((cp_occ = (CP_OCC *)_mm_malloc(cp_occ_size * sizeof(CP_OCC), 64)) == NULL) {
-        fprintf(stderr, "ERROR! unable to allocated cp_occ memory\n");
-        exit(EXIT_FAILURE);
-    }
+    int64_t cp_occ_bytes = cp_occ_size * sizeof(CP_OCC);
+    cp_occ = (CP_OCC *)_mm_malloc(cp_occ_bytes, 64);
+    index_alloc += cp_occ_bytes;
+    assert_not_null(cp_occ, cp_occ_bytes, index_alloc);
+    bwamem_madv_hugepage(cp_occ, cp_occ_bytes);
 
     err_fread_noeof(cp_occ, sizeof(CP_OCC), cp_occ_size, cpstream);
     int64_t ii = 0;
@@ -190,15 +201,31 @@ void FMI_search::load_index()
     #if SA_COMPRESSION
 
     int64_t reference_seq_len_ = (reference_seq_len >> SA_COMPX) + 1;
-    sa_ms_byte = (int8_t *)_mm_malloc(reference_seq_len_ * sizeof(int8_t), 64);
-    sa_ls_word = (uint32_t *)_mm_malloc(reference_seq_len_ * sizeof(uint32_t), 64);
+    int64_t sa_ms_bytes = reference_seq_len_ * sizeof(int8_t);
+    int64_t sa_ls_bytes = reference_seq_len_ * sizeof(uint32_t);
+    sa_ms_byte = (int8_t *)_mm_malloc(sa_ms_bytes, 64);
+    index_alloc += sa_ms_bytes;
+    assert_not_null(sa_ms_byte, sa_ms_bytes, index_alloc);
+    sa_ls_word = (uint32_t *)_mm_malloc(sa_ls_bytes, 64);
+    index_alloc += sa_ls_bytes;
+    assert_not_null(sa_ls_word, sa_ls_bytes, index_alloc);
+    bwamem_madv_hugepage(sa_ms_byte, sa_ms_bytes);
+    bwamem_madv_hugepage(sa_ls_word, sa_ls_bytes);
     err_fread_noeof(sa_ms_byte, sizeof(int8_t), reference_seq_len_, cpstream);
     err_fread_noeof(sa_ls_word, sizeof(uint32_t), reference_seq_len_, cpstream);
-    
+
     #else
-    
-    sa_ms_byte = (int8_t *)_mm_malloc(reference_seq_len * sizeof(int8_t), 64);
-    sa_ls_word = (uint32_t *)_mm_malloc(reference_seq_len * sizeof(uint32_t), 64);
+
+    int64_t sa_ms_bytes = reference_seq_len * sizeof(int8_t);
+    int64_t sa_ls_bytes = reference_seq_len * sizeof(uint32_t);
+    sa_ms_byte = (int8_t *)_mm_malloc(sa_ms_bytes, 64);
+    index_alloc += sa_ms_bytes;
+    assert_not_null(sa_ms_byte, sa_ms_bytes, index_alloc);
+    sa_ls_word = (uint32_t *)_mm_malloc(sa_ls_bytes, 64);
+    index_alloc += sa_ls_bytes;
+    assert_not_null(sa_ls_word, sa_ls_bytes, index_alloc);
+    bwamem_madv_hugepage(sa_ms_byte, sa_ms_bytes);
+    bwamem_madv_hugepage(sa_ls_word, sa_ls_bytes);
     err_fread_noeof(sa_ms_byte, sizeof(int8_t), reference_seq_len, cpstream);
     err_fread_noeof(sa_ls_word, sizeof(uint32_t), reference_seq_len, cpstream);
 
@@ -256,16 +283,14 @@ void FMI_search::getSMEMsOnePosOneThread(uint8_t *enc_qdb,
                                          int32_t max_readlength,
                                          int32_t minSeedLen,
                                          SMEM *matchArray,
-                                         int64_t max_smem,
                                          int64_t *__numTotalSmem)
 {
     int64_t numTotalSmem = *__numTotalSmem;
-    // Heap-allocate prevArray instead of using a stack VLA. max_readlength
-    // is now driven by batch content (no compile-time cap), so on long-read
-    // workloads a stack array would risk exhaustion. Sized identically to
-    // the lockstep path's per-slot buffer (max_readlength SMEMs).
-    SMEM *prevArray = (SMEM *)_mm_malloc((size_t)max_readlength * sizeof(SMEM), 64);
-    assert(prevArray != NULL);
+    // Heap-allocate to avoid stack overflow on long reads (PacBio HiFi /
+    // ONT 1 Mbp+); mirrors the lockstep path's max_readlength sizing.
+    int64_t prevArray_bytes = (int64_t)max_readlength * sizeof(SMEM);
+    SMEM *prevArray = (SMEM *)_mm_malloc((size_t)prevArray_bytes, 64);
+    assert_not_null(prevArray, prevArray_bytes, prevArray_bytes);
 
     uint32_t i;
     // Perform SMEM for original reads
@@ -372,10 +397,6 @@ void FMI_search::getSMEMsOnePosOneThread(uint8_t *enc_qdb,
                     {
                         cur_j = j;
 
-                        if (numTotalSmem >= max_smem)
-                            smem_overflow_die("getSMEMsOnePosOneThread",
-                                              max_smem, numTotalSmem,
-                                              readlength);
                         matchArray[numTotalSmem++] = smem;
                         break;
                     }
@@ -421,9 +442,6 @@ void FMI_search::getSMEMsOnePosOneThread(uint8_t *enc_qdb,
                 if(((smem.n - smem.m + 1) >= minSeedLen))
                 {
 
-                    if (numTotalSmem >= max_smem)
-                        smem_overflow_die("getSMEMsOnePosOneThread",
-                                          max_smem, numTotalSmem, readlength);
                     matchArray[numTotalSmem++] = smem;
                 }
                 numPrev = 0;
@@ -442,9 +460,12 @@ void FMI_search::getSMEMsOnePosOneThread(uint8_t *enc_qdb,
 // composing the existing primitives (backwardExt, count[], cp_occ) in the
 // same sequence the scalar would.
 //
-// The prev[] and match_buf[] buffers are heap-owned by the caller (mmc in
-// mem_collect_smem), sized from the batch's max_readlength, and handed to
-// each slot as stride-offset pointers at driver entry. No compile-time cap.
+// MAX_READ_LEN_FOR_LOCKSTEP caps per-slot buffer sizes so the whole slot
+// lives on the caller's stack. Override via -DMAX_READ_LEN_FOR_LOCKSTEP=N
+// at build time if running with reads longer than the default.
+#ifndef MAX_READ_LEN_FOR_LOCKSTEP
+#define MAX_READ_LEN_FOR_LOCKSTEP 512
+#endif
 
 enum LockstepPhase : uint8_t {
     PH_FWD      = 0,  // forward extension inner loop active
@@ -453,6 +474,13 @@ enum LockstepPhase : uint8_t {
     PH_DONE     = 3   // slot finished; match_buf ready for flush
 };
 
+// LISA trick #4: hybrid SoA. The per-slot "hot" state stays compact
+// (~80 bytes) so cross-slot access (e.g. T1 prefetch lookahead against
+// slots[(s+N/2)%N]) hits a tight L1-resident array instead of jumping
+// 32KB strides across embedded buffers. The bulk arrays (prev[],
+// match_buf[]; ~32 KB each) live in separate per-slot allocations,
+// referenced by pointer. Accessor syntax (s->prev[i], s->match_buf[i])
+// is unchanged from the embedded-array version.
 struct FMI_search::BatchSlot {
     // Input identity — copied at init, never mutated thereafter.
     int32_t input_idx;           // index into the caller's input arrays
@@ -471,17 +499,14 @@ struct FMI_search::BatchSlot {
     int32_t cur_j;               // backward phase bookkeeping (scalar's cur_j)
     LockstepPhase phase;
 
-    // Backward-search state. numCurr/curr_s are loop-local in
-    // ls_advance_backward_step — they don't live across outer-j steps,
-    // so they don't appear here.
+    // Per-slot bulk-buffer state.
     int32_t numPrev;
-    SMEM   *prev;                // borrowed; caller-owned heap buffer, buf_cap SMEMs
-    int32_t buf_cap;
-
-    // Per-slot match buffer + reorder-buffer ready flag for in-order flush.
-    SMEM   *match_buf;           // borrowed; caller-owned, buf_cap SMEMs
     int32_t match_count;
     bool    ready;
+
+    // Pointers into per-slot bulk arrays (allocated by the caller).
+    SMEM    *prev;        // capacity = MAX_READ_LEN_FOR_LOCKSTEP
+    SMEM    *match_buf;   // capacity = MAX_READ_LEN_FOR_LOCKSTEP
 };
 
 void FMI_search::ls_prefetch_cp_occ(const BatchSlot *s)
@@ -496,13 +521,28 @@ void FMI_search::ls_prefetch_cp_occ(const BatchSlot *s)
 #endif
 }
 
+/* T1 (L2) variant — used for cross-slot N/2-step lookahead. The T0 prefetch
+ * above lands at "this slot's next step" granularity; T1 here lands at
+ * "this slot's step ~N/2 from now". For N=8 that's 4 stepping-passes ahead,
+ * giving DRAM-latency-class lookahead when the cp_occ working set spills
+ * out of L2/L3. */
+void FMI_search::ls_prefetch_cp_occ_t1(const BatchSlot *s)
+{
+#ifdef ENABLE_PREFETCH
+    _mm_prefetch((const char *)(&cp_occ[(s->smem.k) >> CP_SHIFT]), _MM_HINT_T1);
+    _mm_prefetch((const char *)(&cp_occ[(s->smem.l) >> CP_SHIFT]), _MM_HINT_T1);
+    _mm_prefetch((const char *)(&cp_occ[(s->smem.k + s->smem.s) >> CP_SHIFT]), _MM_HINT_T1);
+    _mm_prefetch((const char *)(&cp_occ[(s->smem.l + s->smem.s) >> CP_SHIFT]), _MM_HINT_T1);
+#else
+    (void)s;
+#endif
+}
+
 // Populate a slot from the caller's input arrays at the given input_idx.
 // After this call either:
 //   phase == PH_FWD  — slot is ready to step the forward-extension inner loop
 //   phase == PH_DONE — the first base is non-ACGT; scalar skips this read, so
 //                      we match that (zero matches emitted, ready to flush).
-// prev_buf/match_buf_buf are borrowed stride views into a caller-owned
-// per-thread heap allocation (buf_cap SMEMs each).
 void FMI_search::ls_init_slot(BatchSlot *s,
                               int32_t input_idx,
                               const int16_t *query_pos_array,
@@ -510,22 +550,27 @@ void FMI_search::ls_init_slot(BatchSlot *s,
                               const int32_t *rid_array,
                               const bseq1_t *seq_,
                               const int32_t *query_cum_len_ar,
-                              const uint8_t *enc_qdb,
-                              SMEM *prev_buf,
-                              SMEM *match_buf_buf,
-                              int32_t buf_cap)
+                              const uint8_t *enc_qdb)
 {
     s->input_idx   = input_idx;
     s->rid         = rid_array[input_idx];
     s->start_pos   = query_pos_array[input_idx];
     s->min_intv    = min_intv_array[input_idx];
     s->readlength  = seq_[s->rid].l_seq;
+    /* Runtime guard rather than assert(): the lockstep prev/match buffers are
+     * fixed-size on the stack (sized by MAX_READ_LEN_FOR_LOCKSTEP), and a read
+     * exceeding that bound would corrupt them silently in NDEBUG builds. */
+    if (s->readlength > MAX_READ_LEN_FOR_LOCKSTEP) {
+        fprintf(stderr,
+                "[FMI_search::ls_init_slot] read rid=%d length=%d exceeds "
+                "MAX_READ_LEN_FOR_LOCKSTEP=%d; recompile with "
+                "-DMAX_READ_LEN_FOR_LOCKSTEP=<n>\n",
+                s->rid, s->readlength, MAX_READ_LEN_FOR_LOCKSTEP);
+        exit(EXIT_FAILURE);
+    }
     s->offset      = query_cum_len_ar[s->rid];
     s->next_x      = s->start_pos + 1;
     s->numPrev     = 0;
-    s->prev        = prev_buf;
-    s->match_buf   = match_buf_buf;
-    s->buf_cap     = buf_cap;
     s->match_count = 0;
     s->ready       = false;
 
@@ -657,10 +702,6 @@ void FMI_search::ls_advance_backward_step(BatchSlot *s,
             newSmem.m = s->j;
             if ((newSmem.s < s->min_intv) && ((smem.n - smem.m + 1) >= minSeedLen)) {
                 s->cur_j = s->j;
-                if (s->match_count >= s->buf_cap)
-                    smem_overflow_die("ls_advance_backward_step/match_buf",
-                                      s->buf_cap, s->match_count,
-                                      s->readlength);
                 s->match_buf[s->match_count++] = smem;
                 break;
             }
@@ -699,9 +740,6 @@ DONE:
     if (s->numPrev != 0) {
         SMEM smem = s->prev[0];
         if ((smem.n - smem.m + 1) >= minSeedLen) {
-            if (s->match_count >= s->buf_cap)
-                smem_overflow_die("ls_advance_backward_step/match_buf(final)",
-                                  s->buf_cap, s->match_count, s->readlength);
             s->match_buf[s->match_count++] = smem;
         }
         s->numPrev = 0;
@@ -709,7 +747,7 @@ DONE:
     s->phase = PH_DONE;
     s->ready = true;
 }
-// ===== End lockstep scaffolding =====
+// ===== End lockstep SMEM batching =====
 
 void FMI_search::getSMEMsAllPosOneThread(uint8_t *enc_qdb,
                                          int32_t *min_intv_array,
@@ -721,9 +759,6 @@ void FMI_search::getSMEMsAllPosOneThread(uint8_t *enc_qdb,
                                          int32_t max_readlength,
                                          int32_t minSeedLen,
                                          SMEM *matchArray,
-                                         int64_t max_smem,
-                                         SMEM *lockstep_prev_base,
-                                         SMEM *lockstep_match_buf_base,
                                          int64_t *__numTotalSmem)
 {
     int16_t *query_pos_array = (int16_t *)_mm_malloc(numReads * sizeof(int16_t), 64);
@@ -762,13 +797,8 @@ void FMI_search::getSMEMsAllPosOneThread(uint8_t *enc_qdb,
                                          max_readlength,
                                          minSeedLen,
                                          matchArray,
-                                         max_smem,
-                                         lockstep_prev_base,
-                                         lockstep_match_buf_base,
                                          __numTotalSmem);
 #else
-        (void)lockstep_prev_base;
-        (void)lockstep_match_buf_base;
         getSMEMsOnePosOneThread(enc_qdb,
                                 query_pos_array,
                                 min_intv_array,
@@ -780,7 +810,6 @@ void FMI_search::getSMEMsAllPosOneThread(uint8_t *enc_qdb,
                                 max_readlength,
                                 minSeedLen,
                                 matchArray,
-                                max_smem,
                                 __numTotalSmem);
 #endif
         numActive = tail;
@@ -800,36 +829,30 @@ void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
                                                    int32_t max_readlength,
                                                    int32_t minSeedLen,
                                                    SMEM *matchArray,
-                                                   int64_t max_smem,
-                                                   SMEM *lockstep_prev_base,
-                                                   SMEM *lockstep_match_buf_base,
                                                    int64_t *__numTotalSmem)
 {
     (void)batch_size;
+    (void)max_readlength;
 
     if (numReads == 0) return;
 
     const int32_t N = SMEM_LOCKSTEP_N;
-    // Per-slot prev[] and match_buf[] are borrowed stride views into a
-    // caller-owned per-thread heap allocation, sized `max_readlength` SMEMs
-    // each. BatchSlot itself (a handful of ints + pointers) lives on the
-    // stack — small and bounded, no compile-time read-length cap.
+    // LISA trick #4: hybrid SoA layout. `slots[]` holds only the small hot
+    // state (~80 B per slot, full array fits in 1-2 cache lines for N=8).
+    // Bulk per-slot buffers (prev/match_buf, ~32 KB each) live separately.
     BatchSlot slots[SMEM_LOCKSTEP_N];
-    const int32_t slot_cap = max_readlength;
-
-    auto slot_prev      = [&](int32_t s) -> SMEM * {
-        return lockstep_prev_base      + (int64_t)s * slot_cap;
-    };
-    auto slot_match_buf = [&](int32_t s) -> SMEM * {
-        return lockstep_match_buf_base + (int64_t)s * slot_cap;
-    };
+    SMEM prev_bufs [SMEM_LOCKSTEP_N][MAX_READ_LEN_FOR_LOCKSTEP];
+    SMEM match_bufs[SMEM_LOCKSTEP_N][MAX_READ_LEN_FOR_LOCKSTEP];
+    for (int32_t s = 0; s < N; s++) {
+        slots[s].prev      = prev_bufs[s];
+        slots[s].match_buf = match_bufs[s];
+    }
 
     // Seed the first min(N, numReads) slots.
     int32_t initial = (numReads < N) ? numReads : N;
     for (int32_t s = 0; s < initial; s++) {
         ls_init_slot(&slots[s], s, query_pos_array, min_intv_array,
-                     rid_array, seq_, query_cum_len_ar, enc_qdb,
-                     slot_prev(s), slot_match_buf(s), slot_cap);
+                     rid_array, seq_, query_cum_len_ar, enc_qdb);
         if (slots[s].phase == PH_FWD) ls_prefetch_cp_occ(&slots[s]);
     }
     // Any unused slots (numReads < N) are marked DONE with invalid input_idx
@@ -866,6 +889,15 @@ void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
                 case PH_DONE:
                     break;
             }
+            // LISA trick #5: cross-slot T1 (L2) prefetch with N/2-step lookahead.
+            // The same-slot T0 prefetch issued inside ls_advance_*_step covers
+            // the next single-step access; this T1 prefetch on slot[s+N/2] keeps
+            // a copy in L2 for that slot's access ~N/2 stepping-passes from now,
+            // hiding DRAM-class latency when cp_occ entries spill out of L3.
+            const int32_t s_la = (s + (N / 2)) % N;
+            if (slots[s_la].phase == PH_FWD || slots[s_la].phase == PH_BWD) {
+                ls_prefetch_cp_occ_t1(&slots[s_la]);
+            }
         }
 
         // --- Flush pass: in-order emit + slot recycle. ---
@@ -877,10 +909,6 @@ void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
                     slots[s].ready &&
                     slots[s].input_idx == flush_cursor) {
                     for (int32_t m = 0; m < slots[s].match_count; m++) {
-                        if (numTotalSmem >= max_smem)
-                            smem_overflow_die("getSMEMsOnePosOneThread_lockstep",
-                                              max_smem, numTotalSmem,
-                                              slots[s].readlength);
                         matchArray[numTotalSmem++] = slots[s].match_buf[m];
                     }
                     query_pos_array[slots[s].input_idx] = slots[s].next_x;
@@ -889,8 +917,7 @@ void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
                     if (next_input < numReads) {
                         ls_init_slot(&slots[s], next_input,
                                      query_pos_array, min_intv_array,
-                                     rid_array, seq_, query_cum_len_ar, enc_qdb,
-                                     slot_prev(s), slot_match_buf(s), slot_cap);
+                                     rid_array, seq_, query_cum_len_ar, enc_qdb);
                         if (slots[s].phase == PH_FWD) ls_prefetch_cp_occ(&slots[s]);
                         next_input++;
                     } else {
@@ -912,8 +939,7 @@ int64_t FMI_search::bwtSeedStrategyAllPosOneThread(uint8_t *enc_qdb,
                                                    const bseq1_t *seq_,
                                                    int32_t *query_cum_len_ar,
                                                    int32_t minSeedLen,
-                                                   SMEM *matchArray,
-                                                   int64_t max_smem)
+                                                   SMEM *matchArray)
 {
     int32_t i;
 
@@ -976,10 +1002,6 @@ int64_t FMI_search::bwtSeedStrategyAllPosOneThread(uint8_t *enc_qdb,
 
                             if(smem.s > 0)
                             {
-                                if (numTotalSeed >= max_smem)
-                                    smem_overflow_die("bwtSeedStrategyAllPosOneThread",
-                                                      max_smem, numTotalSeed,
-                                                      readlength);
                                 matchArray[numTotalSeed++] = smem;
                             }
                             break;
@@ -1009,8 +1031,11 @@ void FMI_search::getSMEMs(uint8_t *enc_qdb,
         SMEM *matchArray,
         int64_t *numTotalSmem)
 {
-    SMEM *prevArray = (SMEM *)_mm_malloc(nthreads * readlength * sizeof(SMEM), 64);
-    SMEM *currArray = (SMEM *)_mm_malloc(nthreads * readlength * sizeof(SMEM), 64);
+    const size_t smem_arr_bytes = (size_t)nthreads * (size_t)readlength * sizeof(SMEM);
+    SMEM *prevArray = (SMEM *)_mm_malloc(smem_arr_bytes, 64);
+    assert_not_null(prevArray, smem_arr_bytes, smem_arr_bytes);
+    SMEM *currArray = (SMEM *)_mm_malloc(smem_arr_bytes, 64);
+    assert_not_null(currArray, smem_arr_bytes, (size_t)2 * smem_arr_bytes);
 
 
 // #pragma omp parallel num_threads(nthreads)
@@ -1253,11 +1278,18 @@ void FMI_search::get_sa_entries(int64_t *posArray, int64_t *coordArray, uint32_t
 // #pragma omp parallel for num_threads(nthreads)
     for(i = 0; i < count; i++)
     {
+        /* Prefetch the SAL slot SAL_PFD iterations ahead. Both
+         * sa_ms_byte and sa_ls_word are large random-access arrays
+         * (separate cache lines), so issue two prefetches per slot. */
+        if (i + SAL_PFD < count) {
+            int64_t pf_pos = posArray[i + SAL_PFD];
+            _mm_prefetch((const char *)(sa_ms_byte + pf_pos), _MM_HINT_T0);
+            _mm_prefetch((const char *)(sa_ls_word + pf_pos), _MM_HINT_T0);
+        }
         int64_t pos = posArray[i];
         int64_t sa_entry = sa_ms_byte[pos];
         sa_entry = sa_entry << 32;
         sa_entry = sa_entry + sa_ls_word[pos];
-        //_mm_prefetch((const char *)(sa_ms_byte + pos + SAL_PFD), _MM_HINT_T0);
         coordArray[i] = sa_entry;
     }
 }
@@ -1276,10 +1308,16 @@ void FMI_search::get_sa_entries(SMEM *smemArray, int64_t *coordArray, int32_t *c
         for(j = smem.k; (j < hi) && (c < max_occ); j+=step, c++)
         {
             int64_t pos = j;
+            /* Prefetch SAL_PFD iterations ahead. Both arrays sit on
+             * separate cache lines, so issue both prefetches per slot. */
+            int64_t pf_pos = pos + SAL_PFD * step;
+            if (pf_pos < hi) {
+                _mm_prefetch((const char *)(sa_ms_byte + pf_pos), _MM_HINT_T0);
+                _mm_prefetch((const char *)(sa_ls_word + pf_pos), _MM_HINT_T0);
+            }
             int64_t sa_entry = sa_ms_byte[pos];
             sa_entry = sa_entry << 32;
             sa_entry = sa_entry + sa_ls_word[pos];
-            //_mm_prefetch((const char *)(sa_ms_byte + pos + SAL_PFD * step), _MM_HINT_T0);
             coordArray[totalCoordCount + c] = sa_entry;
         }
         coordCountArray[i] = c;
