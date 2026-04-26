@@ -3,7 +3,7 @@
  * numTotalSmem, query_pos_array write-back) must be byte-identical.
  *
  * Usage: smem_lockstep_parity_test <bwa-mem2 index prefix>
- *   e.g. smem_lockstep_parity_test /Volumes/scratch-00001/bench/pr-15/ref/hg38.fa
+ *   e.g. smem_lockstep_parity_test /path/to/hg38.fa
  */
 
 #include <assert.h>

@@ -53,11 +53,11 @@ jobs:
 
       - name: Install dependencies (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev bwa autoconf automake samtools
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev bwa autoconf automake samtools libomp-dev
 
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
-        run: brew install bwa autoconf automake
+        run: brew install bwa autoconf automake libomp
 
       - name: Verify CMake is available
         run: cmake --version

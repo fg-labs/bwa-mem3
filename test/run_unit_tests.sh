@@ -17,6 +17,14 @@ ok()   { echo "OK:   $*"; }
 # Build the five unit binaries.
 (cd "$HERE" && make) || fail "test/ make failed"
 
+# synthetic_1mb.fa is checked in alongside its committed baselines so the
+# byte-diff test stays reproducible across Python versions and platforms.
+# A previous version of this script regenerated the FASTA via random.choice;
+# random.choice's bytes are deterministic per Python version, but the
+# baselines were built from a different generator, so CI ran the diff
+# against a mismatched source and flaked.
+[[ -s "$FIXTURES/synthetic_1mb.fa" ]] || fail "synthetic_1mb.fa fixture missing at $FIXTURES/synthetic_1mb.fa"
+
 # Build the phiX FMI index if not already present. Check all five artifacts
 # that `bwa-mem2 index` produces so a corrupt/partial prior run is re-indexed.
 if [[ ! -s "$FIXTURES/phix.fa.bwt.2bit.64" || \
@@ -159,5 +167,33 @@ printf '@zero\n\n+\n\n' > "$PE_TMP/zero.fq"
 "$BWAMEM2" mem "$FIXTURES/phix.fa" "$PE_TMP/zero.fq" >/dev/null 2>&1 \
     || fail "bwa-mem2 mem on zero-length read: non-zero exit"
 ok "bwa-mem2 mem on zero-length read (no crash)"
+
+# --- packed_text_test ------------------------------------------------------
+(cd "$HERE" && ./packed_text_test) || fail "packed_text_test"
+ok "packed_text_test"
+
+# --- system_test -----------------------------------------------------------
+(cd "$HERE" && ./system_test) || fail "system_test"
+ok "system_test"
+
+# --- libsais byte-diff against committed baselines -------------------------
+(cd "$HERE" && ./libsais_index_diff_test.sh) || fail "libsais_index_diff_test"
+ok "libsais_index_diff_test"
+
+# --- libsais determinism across thread counts ------------------------------
+(cd "$HERE" && ./libsais_determinism_test.sh) || fail "libsais_determinism_test"
+ok "libsais_determinism_test"
+
+# --- libsais chr22 byte-diff (skips if scratch fixture absent) -------------
+(cd "$HERE" && ./libsais_chr22_diff_test.sh) || fail "libsais_chr22_diff_test"
+ok "libsais_chr22_diff_test"
+
+# --- libsais 10 Mbp hg38 slice byte-diff (skips if scratch fixture absent) -
+(cd "$HERE" && ./libsais_hg38_slice_diff_test.sh) || fail "libsais_hg38_slice_diff_test"
+ok "libsais_hg38_slice_diff_test"
+
+# --- libsais --max-memory peak-RSS budget test -----------------------------
+(cd "$HERE" && ./libsais_memory_budget_test.sh) || fail "libsais_memory_budget_test"
+ok "libsais_memory_budget_test"
 
 echo "ALL UNIT TESTS PASSED"
