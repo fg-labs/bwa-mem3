@@ -30,6 +30,8 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "read_index_ele.h"
 #include "safestringlib.h"
 
+#include "bwa_madvise.h"
+
 indexEle::indexEle()
 {
     idx = (bwaidx_fm_t*) calloc(1, sizeof(bwaidx_fm_t));
@@ -75,9 +77,11 @@ void indexEle::bwa_idx_load_ele(const char *hint, int which)
         
         if (which & BWA_IDX_PAC)
         {
-            idx->pac = (uint8_t*) calloc(idx->bns->l_pac/4+1, 1);
+            int64_t pac_bytes = idx->bns->l_pac/4+1;
+            idx->pac = (uint8_t*) calloc(pac_bytes, 1);
             assert(idx->pac != NULL);
-            err_fread_noeof(idx->pac, 1, idx->bns->l_pac/4+1, idx->bns->fp_pac); // concatenated 2-bit encoded sequence
+            bwamem_madv_hugepage(idx->pac, pac_bytes);
+            err_fread_noeof(idx->pac, 1, pac_bytes, idx->bns->fp_pac); // concatenated 2-bit encoded sequence
             err_fclose(idx->bns->fp_pac);
             idx->bns->fp_pac = 0;
         }

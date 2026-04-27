@@ -47,13 +47,7 @@ extern uint64_t tprof[LIM_R][LIM_C];
 #  include "malloc_wrap.h"
 #endif
 
-#ifdef __GNUC__
-#define LIKELY(x) __builtin_expect((x),1)
-#define UNLIKELY(x) __builtin_expect((x),0)
-#else
-#define LIKELY(x) (x)
-#define UNLIKELY(x) (x)
-#endif
+/* LIKELY/UNLIKELY come from macro.h (included above). */
 
 /**
  * Initialize the query data structure

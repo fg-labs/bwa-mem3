@@ -77,20 +77,17 @@ static bool run_case(FMI_search *fmi,
 
     int64_t n_scalar = 0, n_lockstep = 0;
 
-    // Per-slot lockstep buffers: one pair per test call, sized to fit any
-    // single SMEM walk for this max_readlength.
-    const int64_t ls_pair_elems = (int64_t)SMEM_LOCKSTEP_N * max_readlength;
-    SMEM *ls_prev      = (SMEM *)_mm_malloc(ls_pair_elems * sizeof(SMEM), 64);
-    SMEM *ls_match_buf = (SMEM *)_mm_malloc(ls_pair_elems * sizeof(SMEM), 64);
+    // The lockstep variant of getSMEMsOnePosOneThread heap-allocates its
+    // per-slot prev/match scratch internally (sized from max_readlength),
+    // so the harness no longer pre-allocates them.
 
     fmi->getSMEMsOnePosOneThread(enc_qdb, qpa_s, mia_s, rid_s,
                                  numReads, numReads, seq_, query_cum_len_ar,
                                  max_readlength, minSeedLen, scalar_out,
-                                 max_out, &n_scalar);
+                                 &n_scalar);
     fmi->getSMEMsOnePosOneThread_lockstep(enc_qdb, qpa_l, mia_l, rid_l,
                                           numReads, numReads, seq_, query_cum_len_ar,
                                           max_readlength, minSeedLen, lockstep_out,
-                                          max_out, ls_prev, ls_match_buf,
                                           &n_lockstep);
 
     total_cases++;
@@ -122,8 +119,6 @@ static bool run_case(FMI_search *fmi,
 
     _mm_free(scalar_out);
     _mm_free(lockstep_out);
-    _mm_free(ls_prev);
-    _mm_free(ls_match_buf);
     free(qpa_s); free(qpa_l); free(mia_s); free(mia_l); free(rid_s); free(rid_l);
     return ok;
 }
@@ -403,9 +398,9 @@ int main(int argc, char *argv[]) {
         const int32_t max_out = numReads * max_readlength;
         SMEM *scalar_out   = (SMEM *)_mm_malloc(max_out * sizeof(SMEM), 64);
         SMEM *lockstep_out = (SMEM *)_mm_malloc(max_out * sizeof(SMEM), 64);
-        const int64_t ls_pair_elems = (int64_t)SMEM_LOCKSTEP_N * max_readlength;
-        SMEM *ls_prev      = (SMEM *)_mm_malloc(ls_pair_elems * sizeof(SMEM), 64);
-        SMEM *ls_match_buf = (SMEM *)_mm_malloc(ls_pair_elems * sizeof(SMEM), 64);
+        /* The lockstep variant now owns its per-slot prev/match scratch
+         * internally (sized by MAX_READ_LEN_FOR_LOCKSTEP); no external
+         * lockstep buffers are needed here. */
 
         /* The two do/while blocks below intentionally mirror the compaction
          * logic in FMI_search::getSMEMsAllPosOneThread (see src/FMI_search.cpp),
@@ -433,7 +428,7 @@ int main(int argc, char *argv[]) {
                 fmi->getSMEMsOnePosOneThread(enc_qdb, qpa_s, mia_work, rid_work,
                                              tail, tail, seq_, cum_len,
                                              max_readlength, minSeedLen, scalar_out,
-                                             max_out, &n_s);
+                                             &n_s);
                 numActive = tail;
             } while (numActive > 0);
         }
@@ -459,7 +454,7 @@ int main(int argc, char *argv[]) {
                 fmi->getSMEMsOnePosOneThread_lockstep(enc_qdb, qpa_l, mia_work, rid_work,
                                                      tail, tail, seq_, cum_len,
                                                      max_readlength, minSeedLen, lockstep_out,
-                                                     max_out, ls_prev, ls_match_buf, &n_l);
+                                                     &n_l);
                 numActive = tail;
             } while (numActive > 0);
         }
@@ -485,7 +480,6 @@ int main(int argc, char *argv[]) {
             }
         }
         _mm_free(scalar_out); _mm_free(lockstep_out);
-        _mm_free(ls_prev); _mm_free(ls_match_buf);
         free(enc_qdb); free(seq_); free(cum_len);
     }
 
@@ -525,10 +519,10 @@ int main(int argc, char *argv[]) {
     }
 
     /* Case 11: long reads (>151bp and >512bp) — regression for issue 44.
-     * Pre-fix, readlength > MAX_READ_LEN_FOR_LOCKSTEP (512) would trip a
-     * hard assert in ls_init_slot. Post-fix, the lockstep slot buffers
-     * are heap-backed and sized from the caller's max_readlength, so any
-     * length works. Exercises a 1000bp and a 1500bp synthetic read. */
+     * Pre-fix, readlength > 512 would trip the lockstep cap and exit.
+     * Post-fix, the lockstep slot buffers are heap-allocated by the
+     * driver and sized from max_readlength, so any length works.
+     * Exercises a 1000bp and a 1500bp synthetic read. */
     {
         char r_1000bp[1001];
         char r_1500bp[1501];
@@ -548,6 +542,36 @@ int main(int argc, char *argv[]) {
         int32_t mia[] = {1, 1};
         int32_t rid[] = {0, 1};
         run_case(fmi, "Case 11: long reads (1000bp, 1500bp)",
+                 numReads, max_readlength, 19,
+                 enc_qdb, qpa, mia, rid, seq_, cum_len);
+        free(enc_qdb); free(seq_); free(cum_len);
+    }
+
+    /* Case 12: long reads with mid-read N — exercises the non-ACGT
+     * termination path on the long-read code path that Case 11's clean
+     * 4-base rotation didn't cover. The forward SMEM walk must split at
+     * the N position and re-seed past it, on the heap-allocated lockstep
+     * slot buffers. Two reads: 1000bp with N at pos 700, 1500bp with N
+     * at pos 1100. */
+    {
+        char r_1000bp[1001];
+        char r_1500bp[1501];
+        const char *bases = "ACGT";
+        for (int i = 0; i < 1000; i++) r_1000bp[i] = bases[(i * 7 + 3) & 3];
+        r_1000bp[700] = 'N';
+        r_1000bp[1000] = '\0';
+        for (int i = 0; i < 1500; i++) r_1500bp[i] = bases[(i * 11 + 5) & 3];
+        r_1500bp[1100] = 'N';
+        r_1500bp[1500] = '\0';
+        const char *reads[] = { r_1000bp, r_1500bp };
+        int32_t numReads = 2;
+        int32_t max_readlength = 1500;
+        uint8_t *enc_qdb; bseq1_t *seq_; int32_t *cum_len;
+        encode_reads(reads, numReads, &enc_qdb, &seq_, &cum_len);
+        int16_t qpa[] = {0, 0};
+        int32_t mia[] = {1, 1};
+        int32_t rid[] = {0, 1};
+        run_case(fmi, "Case 12: long reads with mid-read N",
                  numReads, max_readlength, 19,
                  enc_qdb, qpa, mia, rid, seq_, cum_len);
         free(enc_qdb); free(seq_); free(cum_len);

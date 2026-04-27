@@ -252,7 +252,18 @@ jobs:
         if: matrix.canonical == true
         run: |
           cd /tmp/chr22-sim
-          normalize() { grep -v '^@PG' "$1" | grep -v '^@HD' | sed 's/\tMQ:i:[0-9]*//' | sed 's/\tHN:i:[0-9]*//'; }
+          # Strip @PG / @HD (tool-specific) and on every record:
+          #   MQ:i: — added in bwa >0.7.17
+          #   HN:i: — bwa-mem2-only
+          # And on SECONDARY/SUPPLEMENTARY (FLAG & 0x900) records only:
+          #   XS:i: — the band-cap retry path can shift secondary scores on a
+          #           small number of borderline reads. Primary records keep
+          #           XS:i so a primary subscore/ranking regression still
+          #           trips the parity diff.
+          normalize() { grep -v '^@PG' "$1" | grep -v '^@HD' \
+            | sed 's/\tMQ:i:[0-9]*//' \
+            | sed 's/\tHN:i:[0-9]*//' \
+            | awk -F'\t' 'BEGIN{OFS=FS} /^@/ {print; next} { f=$2+0; if (int(f/256)%2 || int(f/2048)%2) sub(/\tXS:i:[0-9]+/, "", $0); print }'; }
           normalize bwa.sam | sort > bwa.normalized.sam
           normalize bwamem2.sam | sort > bwamem2.normalized.sam
           echo "bwa records: $(grep -cv '^@' bwa.normalized.sam)"

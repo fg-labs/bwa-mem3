@@ -91,7 +91,7 @@ typedef struct smem_struct
 #define SAL_PFD 16
 
 #ifndef SMEM_LOCKSTEP_N
-#define SMEM_LOCKSTEP_N 4
+#define SMEM_LOCKSTEP_N 8
 #endif
 
 class FMI_search: public indexEle
@@ -104,6 +104,21 @@ class FMI_search: public indexEle
     int build_index();
     void load_index();
 
+    /* matchArray sizing contract (applies to all four SMEM-emitting methods
+     * below). The previous internal `max_smem` capacity guard was removed;
+     * the caller MUST pre-size matchArray to hold at least:
+     *
+     *   - getSMEMsOnePosOneThread, getSMEMsOnePosOneThread_lockstep,
+     *     getSMEMsAllPosOneThread:   numReads * max_readlength SMEMs,
+     *     where max_readlength is the function parameter passed in.
+     *
+     *   - bwtSeedStrategyAllPosOneThread:   numReads * max_seq_length SMEMs,
+     *     where max_seq_length = max_i(seq_[i].l_seq), computed by the
+     *     caller (this method takes no max_readlength parameter).
+     *
+     * Writing past the pre-sized capacity is undefined behavior. The actual
+     * number of SMEMs written is reported via *__numTotalSmem (or the
+     * int64_t return value on bwtSeedStrategyAllPosOneThread). */
     void getSMEMs(uint8_t *enc_qdb,
                   int32_t numReads,
                   int32_t batch_size,
@@ -112,7 +127,8 @@ class FMI_search: public indexEle
                   int32_t numthreads,
                   SMEM *matchArray,
                   int64_t *numTotalSmem);
-    
+
+    /* matchArray must hold at least numReads * max_readlength SMEMs (caller-sized). */
     void getSMEMsOnePosOneThread(uint8_t *enc_qdb,
                                  int16_t *query_pos_array,
                                  int32_t *min_intv_array,
@@ -124,7 +140,6 @@ class FMI_search: public indexEle
                                  int32_t  max_readlength,
                                  int32_t minSeedLen,
                                  SMEM *matchArray,
-                                 int64_t max_smem,
                                  int64_t *__numTotalSmem);
 
     /* Lockstep-batched variant of getSMEMsOnePosOneThread: advances
@@ -133,7 +148,8 @@ class FMI_search: public indexEle
      * engine. Per-read algorithm is byte-identical to the scalar path; only
      * the cross-read interleaving is new. Output in matchArray is written
      * in the same (read, smem) order as the scalar path via per-slot match
-     * buffers flushed by input-index cursor. */
+     * buffers flushed by input-index cursor.
+     * matchArray must hold at least numReads * max_readlength SMEMs (caller-sized). */
     void getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
                                           int16_t *query_pos_array,
                                           int32_t *min_intv_array,
@@ -145,11 +161,9 @@ class FMI_search: public indexEle
                                           int32_t  max_readlength,
                                           int32_t minSeedLen,
                                           SMEM *matchArray,
-                                          int64_t max_smem,
-                                          SMEM *lockstep_prev_base,
-                                          SMEM *lockstep_match_buf_base,
                                           int64_t *__numTotalSmem);
 
+    /* matchArray must hold at least numReads * max_readlength SMEMs (caller-sized). */
     void getSMEMsAllPosOneThread(uint8_t *enc_qdb,
                                  int32_t *min_intv_array,
                                  int32_t *rid_array,
@@ -160,20 +174,18 @@ class FMI_search: public indexEle
                                  int32_t max_readlength,
                                  int32_t minSeedLen,
                                  SMEM *matchArray,
-                                 int64_t max_smem,
-                                 SMEM *lockstep_prev_base,
-                                 SMEM *lockstep_match_buf_base,
                                  int64_t *__numTotalSmem);
 
 
+    /* matchArray must hold at least numReads * (longest l_seq in seq_) SMEMs;
+     * returns the actual count written. */
     int64_t bwtSeedStrategyAllPosOneThread(uint8_t *enc_qdb,
                                            int32_t *max_intv_array,
                                            int32_t numReads,
                                            const bseq1_t *seq_,
                                            int32_t *query_cum_len_ar,
                                            int32_t minSeedLen,
-                                           SMEM *matchArray,
-                                           int64_t max_smem);
+                                           SMEM *matchArray);
         
     void sortSMEMs(SMEM *matchArray,
                    int64_t numTotalSmem[],
@@ -226,11 +238,9 @@ private:
                       const int32_t *rid_array,
                       const bseq1_t *seq_,
                       const int32_t *query_cum_len_ar,
-                      const uint8_t *enc_qdb,
-                      SMEM *prev_buf,
-                      SMEM *match_buf_buf,
-                      int32_t buf_cap);
+                      const uint8_t *enc_qdb);
     void ls_prefetch_cp_occ(const BatchSlot *s);
+    void ls_prefetch_cp_occ_t1(const BatchSlot *s);
     void ls_advance_forward_step(BatchSlot *s, const uint8_t *enc_qdb);
     void ls_prepare_backward(BatchSlot *s);
     void ls_advance_backward_step(BatchSlot *s,

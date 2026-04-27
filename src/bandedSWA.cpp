@@ -45,6 +45,31 @@ extern uint64_t prof[10][112];
 #define DUMMY1 99
 #define DUMMY2 100
 
+// Build the 16-byte LUT used by SBT_PREPASS8_LUT across all 8-bit kernel
+// variants (AVX2, AVX-512BW, SSE2/NEON). Layout:
+//   [0]      = w_match    (s1 == s2, both ACGT)
+//   [1..3]   = w_mismatch (ACGT vs ACGT, XOR ∈ {1,2,3})
+//   [4..15]  = w_ambig    (any cell with target=N or query=N; indices
+//                           4..7 = target N=4, 8..11 = query N=8, 12 =
+//                           both N, 13..15 unreachable but filled for
+//                           safety so out-of-band XORs never read junk)
+static inline void build_pmat16(int8_t out[16],
+                                int8_t w_match, int8_t w_mismatch, int8_t w_ambig)
+{
+    out[0] = w_match;
+    out[1] = w_mismatch;
+    out[2] = w_mismatch;
+    out[3] = w_mismatch;
+    for (int i = 4; i < 16; i++) out[i] = w_ambig;
+}
+
+// Defensive: numThreads must be ≥ 1 — _mm_malloc(0, 64) is implementation-
+// defined and a 0-byte slab would silently OOM downstream writes. Wrappers
+// fan out to constructors and per-batch SoA setup; clamping centrally keeps
+// every entry point in agreement.
+template <typename T>
+static inline T effective_threads(T n) { return n < 1 ? T(1) : n; }
+
 //-----------------------------------------------------------------------------------
 // constructor
 BandedPairWiseSW::BandedPairWiseSW(const int o_del, const int e_del, const int o_ins,
@@ -74,29 +99,54 @@ BandedPairWiseSW::BandedPairWiseSW(const int o_del, const int e_del, const int o
     sort2Ticks = 0;
     this->F8_ = this->H8_  = this->H8__ = NULL;
     this->F16_ = this->H16_  = this->H16__ = NULL;
-    
-    F8_ = H8_ = H8__ = NULL;
-    F8_ = (int8_t *)_mm_malloc(MAX_SEQ_LEN8 * SIMD_WIDTH8 * numThreads * sizeof(int8_t), 64);
-    H8_ = (int8_t *)_mm_malloc(MAX_SEQ_LEN8 * SIMD_WIDTH8 * numThreads * sizeof(int8_t), 64);
-    H8__ = (int8_t *)_mm_malloc(MAX_SEQ_LEN8 * SIMD_WIDTH8 * numThreads * sizeof(int8_t), 64);
+    this->sbt8_ = NULL;
+    this->sbt16_ = NULL;
+    this->dp_slab_ = NULL;
 
-    F16_ = H16_ = H16__ = NULL;
-    F16_ = (int16_t *)_mm_malloc(MAX_SEQ_LEN16 * SIMD_WIDTH16 * numThreads * sizeof(int16_t), 64);
-    H16_ = (int16_t *)_mm_malloc(MAX_SEQ_LEN16 * SIMD_WIDTH16 * numThreads * sizeof(int16_t), 64);
-    H16__ = (int16_t *)_mm_malloc(MAX_SEQ_LEN16 * SIMD_WIDTH16 * numThreads * sizeof(int16_t), 64);
+    // Fold all per-thread scratch into one 64B-aligned slab:
+    //   3 × sz8  : F8_, H8_, H8__       (8-bit DP rails)
+    //   3 × sz16 : F16_, H16_, H16__    (16-bit DP rails)
+    //   1 × sz8  : sbt8_                (8-bit SBT pre-pass scratch)
+    //   1 × sz16 : sbt16_               (16-bit SBT pre-pass scratch;
+    //                                    multi-MB — moved off the stack)
+    // Each partition is a multiple of 64B (MAX_SEQ_LEN8=128, SIMD_WIDTH8
+    // ≥ 16 → 8-bit partition multiple of 2048; 16-bit similarly), so
+    // neighbouring views stay 64B-aligned without explicit padding. The
+    // static_asserts below trip at compile time if a future MAX_SEQ_LEN*
+    // / SIMD_WIDTH* tweak breaks the 64B partition invariant.
+    static_assert((MAX_SEQ_LEN8  * SIMD_WIDTH8  * sizeof(int8_t))  % 64 == 0,
+                  "8-bit DP partition not a multiple of 64B; tune MAX_SEQ_LEN8 / SIMD_WIDTH8");
+    static_assert((MAX_SEQ_LEN16 * SIMD_WIDTH16 * sizeof(int16_t)) % 64 == 0,
+                  "16-bit DP partition not a multiple of 64B; tune MAX_SEQ_LEN16 / SIMD_WIDTH16");
+    numThreads = effective_threads(numThreads);
+    size_t sz8  = (size_t)MAX_SEQ_LEN8  * SIMD_WIDTH8  * numThreads * sizeof(int8_t);
+    size_t sz16 = (size_t)MAX_SEQ_LEN16 * SIMD_WIDTH16 * numThreads * sizeof(int16_t);
+    size_t total = 4 * sz8 + 4 * sz16;
+    dp_slab_ = _mm_malloc(total, 64);
+    if (UNLIKELY(dp_slab_ == NULL)) {
+        fprintf(stderr, "BSW DP-scratch slab allocation failed (%zu bytes)\n", total);
+        exit(EXIT_FAILURE);
+    }
 
-    if (F8_ == NULL || H8_ == NULL || H8__ == NULL) {
-        printf("BSW8 Memory not alloacted!!!\n"); exit(EXIT_FAILURE);
-    }       
-    if (F16_ == NULL || H16_ == NULL || H16__ == NULL) {
-        printf("BSW16 Memory not alloacted!!!\n"); exit(EXIT_FAILURE);
-    }       
+    char *base = (char *)dp_slab_;
+    F8_   = (int8_t  *)(base + 0       );
+    H8_   = (int8_t  *)(base + sz8     );
+    H8__  = (int8_t  *)(base + 2 * sz8 );
+    sbt8_ = (int8_t  *)(base + 3 * sz8 );
+    F16_  = (int16_t *)(base + 4 * sz8);
+    H16_  = (int16_t *)(base + 4 * sz8 + sz16);
+    H16__ = (int16_t *)(base + 4 * sz8 + 2 * sz16);
+    sbt16_ = (int16_t *)(base + 4 * sz8 + 3 * sz16);
 }
 
-// destructor 
+// destructor
 BandedPairWiseSW::~BandedPairWiseSW() {
-    _mm_free(F8_); _mm_free(H8_); _mm_free(H8__);
-    _mm_free(F16_);_mm_free(H16_); _mm_free(H16__);
+    _mm_free(dp_slab_);
+    F8_ = H8_ = H8__ = NULL;
+    F16_ = H16_ = H16__ = NULL;
+    sbt8_ = NULL;
+    sbt16_ = NULL;
+    dp_slab_ = NULL;
 }
 
 int64_t BandedPairWiseSW::getTicks()
@@ -345,6 +395,61 @@ void BandedPairWiseSW::scalarBandedSWAWrapper(SeqPair *seqPairArray,
         f21 = _mm256_max_epi16(val256, f21);                            \
     }
 
+// --- PR 17/16: AVX2 LUT primitive ---
+// pmat256 must have the 16-byte LUT broadcast into both 128-bit halves
+// (use _mm256_broadcastsi128_si256). 1 xor + 1 shuffle replaces the
+// legacy 4-op cmpeq+blendv+max+blendv path. The non-LUT variant was
+// removed: it relied on max_epu8 setting bit 7 to detect AMBIG, which
+// no longer holds under the asymmetric AMBIG encoding (target N=4,
+// query N=8) introduced alongside the LUT path.
+#define SBT_PREPASS8_LUT(s1, s2, sbt11_out, pmat256)                    \
+    {                                                                   \
+        __m256i xor_ = _mm256_xor_si256(s1, s2);                        \
+        sbt11_out = _mm256_shuffle_epi8(pmat256, xor_);                 \
+    }
+
+#define MAIN_CODE8_CORE(sbt11, h00, h11, e11, f11, f21, zero256, e_ins256, oe_ins256, e_del256, oe_del256) \
+    {                                                                   \
+        __m256i m11 = _mm256_add_epi8(h00, sbt11);                      \
+        __m256i cmp11 = _mm256_cmpeq_epi8(h00, zero256);                \
+        m11 = _mm256_blendv_epi8(m11, zero256, cmp11);                  \
+        h11 = _mm256_max_epi8(m11, e11);                                \
+        h11 = _mm256_max_epi8(h11, f11);                                \
+        __m256i temp256 = _mm256_sub_epi8(m11, oe_ins256);              \
+        __m256i val256  = _mm256_max_epi8(temp256, zero256);            \
+        e11 = _mm256_sub_epi8(e11, e_ins256);                           \
+        e11 = _mm256_max_epi8(val256, e11);                             \
+        temp256 = _mm256_sub_epi8(m11, oe_del256);                      \
+        val256  = _mm256_max_epi8(temp256, zero256);                    \
+        f21 = _mm256_sub_epi8(f11, e_del256);                           \
+        f21 = _mm256_max_epi8(val256, f21);                             \
+    }
+
+#define SBT_PREPASS16(s1, s2, sbt11_out, mismatch256, match256, w_ambig_256) \
+    {                                                                   \
+        __m256i cmp_ = _mm256_cmpeq_epi16(s1, s2);                      \
+        __m256i sbt_ = _mm256_blendv_epi16(mismatch256, match256, cmp_); \
+        __m256i tmp_ = _mm256_max_epu16(s1, s2);                        \
+        sbt11_out = _mm256_blendv_epi16(sbt_, w_ambig_256, tmp_);       \
+    }
+
+#define MAIN_CODE16_CORE(sbt11, h00, h11, e11, f11, f21, zero256, e_ins256, oe_ins256, e_del256, oe_del256) \
+    {                                                                   \
+        __m256i m11 = _mm256_add_epi16(h00, sbt11);                     \
+        __m256i cmp11 = _mm256_cmpeq_epi16(h00, zero256);               \
+        m11 = _mm256_blendv_epi16(m11, zero256, cmp11);                 \
+        h11 = _mm256_max_epi16(m11, e11);                               \
+        h11 = _mm256_max_epi16(h11, f11);                               \
+        __m256i temp256 = _mm256_sub_epi16(m11, oe_ins256);             \
+        __m256i val256  = _mm256_max_epi16(temp256, zero256);           \
+        e11 = _mm256_sub_epi16(e11, e_ins256);                          \
+        e11 = _mm256_max_epi16(val256, e11);                            \
+        temp256 = _mm256_sub_epi16(m11, oe_del256);                     \
+        val256  = _mm256_max_epi16(temp256, zero256);                   \
+        f21 = _mm256_sub_epi16(f11, e_del256);                          \
+        f21 = _mm256_max_epi16(val256, f21);                            \
+    }
+
 // MACROs section ends
 // ------------------------------------------------------------------------------------
 
@@ -440,18 +545,19 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                                                   uint16_t numThreads,
                                                   int32_t w)
 {
+    numThreads = effective_threads(numThreads);
     int64_t st1, st2, st3, st4, st5;
 #if RDT
     st1 = ___rdtsc();
 #endif
-    
+
     uint8_t *seq1SoA = NULL;
-    seq1SoA = (uint8_t *)_mm_malloc(MAX_SEQ_LEN8 * SIMD_WIDTH8 * numThreads * sizeof(uint8_t), 64);
-    
+    seq1SoA = (uint8_t *)_mm_malloc((size_t)MAX_SEQ_LEN8 * SIMD_WIDTH8 * numThreads * sizeof(uint8_t), 64);
+
     uint8_t *seq2SoA = NULL;
-    seq2SoA = (uint8_t *)_mm_malloc(MAX_SEQ_LEN8 * SIMD_WIDTH8 * numThreads * sizeof(uint8_t), 64);
+    seq2SoA = (uint8_t *)_mm_malloc((size_t)MAX_SEQ_LEN8 * SIMD_WIDTH8 * numThreads * sizeof(uint8_t), 64);
     
-    if (seq1SoA == NULL || seq2SoA == NULL) {
+    if (UNLIKELY(seq1SoA == NULL || seq2SoA == NULL)) {
         fprintf(stderr, "Error! Mem not allocated!!!\n");
         exit(EXIT_FAILURE);
     }
@@ -473,9 +579,9 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
 #if SORT_PAIRS     // disbaled in bwa-mem2 (only used in separate benchmark bsw code)
 
     // Sort the sequences according to decreasing order of lengths
-    SeqPair *tempArray = (SeqPair *)_mm_malloc(SORT_BLOCK_SIZE * numThreads *
+    SeqPair *tempArray = (SeqPair *)_mm_malloc((size_t)SORT_BLOCK_SIZE * numThreads *
                                                sizeof(SeqPair), 64);
-    int16_t *hist = (int16_t *)_mm_malloc((MAX_SEQ_LEN8 + 32) * numThreads *
+    int16_t *hist = (int16_t *)_mm_malloc((size_t)(MAX_SEQ_LEN8 + 32) * numThreads *
                                           sizeof(int16_t), 64);
 
 #pragma omp parallel num_threads(numThreads)
@@ -495,6 +601,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
         }
     }
     _mm_free(hist);
+    _mm_free(tempArray);
 #endif
 
 #if RDT
@@ -557,7 +664,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
 
                 for(k = 0; k < sp.len1; k++)
                 {
-                    mySeq1SoA[k * SIMD_WIDTH8 + j] = (seq1[k] == AMBIG?0xFF:seq1[k]);
+                    mySeq1SoA[k * SIMD_WIDTH8 + j] = seq1[k] /* PR16: N stays 4 */;
                     H2[k * SIMD_WIDTH8 + j] = 0;
                 }
                 qlen[j] = sp.len2 * max;
@@ -595,7 +702,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                 
                 for(k = 0; k < sp.len2; k++)
                 {
-                    mySeq2SoA[k * SIMD_WIDTH8 + j] = (seq2[k]==AMBIG?0xFF:seq2[k]);
+                    mySeq2SoA[k * SIMD_WIDTH8 + j] = (seq2[k]==AMBIG ? 8 : seq2[k]) /* PR16: query N→8 */;
                     H1[k * SIMD_WIDTH8 + j] = 0;                    
                 }
                 if(maxLen2 < sp.len2) maxLen2 = sp.len2;
@@ -731,6 +838,13 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
     __m256i w_ambig_256  = _mm256_set1_epi8(this->w_ambig); // ambig penalty
     __m256i five256      = _mm256_set1_epi8(5);
 
+    // PR 16: pmat LUT, broadcast into both 128-bit halves (shuffle_epi8 is
+    // lane-wise on AVX2 — each half shuffles against its own half of pmat256).
+    int8_t pmat_bytes[16] __attribute__((aligned(16)));
+    build_pmat16(pmat_bytes, this->w_match, this->w_mismatch, this->w_ambig);
+    __m128i pmat128 = _mm_load_si128((__m128i *)pmat_bytes);
+    __m256i pmat256 = _mm256_broadcastsi128_si256(pmat128);
+
     __m256i e_del256    = _mm256_set1_epi8(this->e_del);
     __m256i oe_del256   = _mm256_set1_epi8(this->o_del + this->e_del);
     __m256i e_ins256    = _mm256_set1_epi8(this->e_ins);
@@ -741,12 +855,16 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
     int8_t  *H_v = H8__ + tid * SIMD_WIDTH8 * MAX_SEQ_LEN8;
 
     int lane;
-    
+
     int8_t i, j;
 
     uint8_t tlen[SIMD_WIDTH8];
     uint8_t tail[SIMD_WIDTH8] __attribute((aligned(64)));
     uint8_t head[SIMD_WIDTH8] __attribute((aligned(64)));
+
+    // PR 17: per-row score-vector scratch for fission. Thread-local view
+    // into sbt8_ (slab-backed; see constructor) — too large for the stack.
+    int8_t *sbt_buf = sbt8_ + tid * SIMD_WIDTH8 * MAX_SEQ_LEN8;
     
     int32_t minq = 10000000;
     for (int l=0; l<SIMD_WIDTH8; l++) {
@@ -887,23 +1005,29 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
         tim1 = __rdtsc();
 #endif
         
+        // PR 17+16: score pre-pass via LUT.
+        for (int jp = beg; jp < end; jp++) {
+            __m256i s2 = _mm256_load_si256((__m256i *)(seq2SoA + jp * SIMD_WIDTH8));
+            __m256i sbt11;
+            SBT_PREPASS8_LUT(s10, s2, sbt11, pmat256);
+            _mm256_store_si256((__m256i *)(sbt_buf + jp * SIMD_WIDTH8), sbt11);
+        }
+
         j256 = _mm256_set1_epi8(beg);
 #pragma unroll(4)
         for(j = beg; j < end; j++)
         {
-            __m256i f11, f21, s2;
+            __m256i f11, f21, sbt11;
             h00 = _mm256_load_si256((__m256i *)(H_h + j * SIMD_WIDTH8));
             f11 = _mm256_load_si256((__m256i *)(F + j * SIMD_WIDTH8));
-            
-            s2 = _mm256_load_si256((__m256i *)(seq2SoA + (j) * SIMD_WIDTH8));
-            
+            sbt11 = _mm256_load_si256((__m256i *)(sbt_buf + j * SIMD_WIDTH8));
+
             __m256i pj256 = j256;
             j256 = _mm256_add_epi8(j256, one256);
-            
-            MAIN_CODE8(s10, s2, h00, h11, e11, f11, f21, zero256,
-                       maxScore256, e_ins256, oe_ins256,
-                       e_del256, oe_del256,
-                       y1_256, maxRS1); //i+1
+
+            MAIN_CODE8_CORE(sbt11, h00, h11, e11, f11, f21, zero256,
+                            e_ins256, oe_ins256,
+                            e_del256, oe_del256);
 
             
             // Masked writing
@@ -1147,15 +1271,16 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
                                                    uint16_t numThreads,
                                                    int32_t w)
 {
+    numThreads = effective_threads(numThreads);
     int64_t st1, st2, st3, st4, st5;
-#if RDT     
+#if RDT
     st1 = ___rdtsc();
 #endif
-    
-    uint16_t *seq1SoA = (uint16_t *)_mm_malloc(MAX_SEQ_LEN16 * SIMD_WIDTH16 * numThreads * sizeof(uint16_t), 64);
-    uint16_t *seq2SoA = (uint16_t *)_mm_malloc(MAX_SEQ_LEN16 * SIMD_WIDTH16 * numThreads * sizeof(uint16_t), 64);
 
-    if (seq1SoA == NULL || seq2SoA == NULL) {
+    uint16_t *seq1SoA = (uint16_t *)_mm_malloc((size_t)MAX_SEQ_LEN16 * SIMD_WIDTH16 * numThreads * sizeof(uint16_t), 64);
+    uint16_t *seq2SoA = (uint16_t *)_mm_malloc((size_t)MAX_SEQ_LEN16 * SIMD_WIDTH16 * numThreads * sizeof(uint16_t), 64);
+
+    if (UNLIKELY(seq1SoA == NULL || seq2SoA == NULL)) {
         fprintf(stderr, "Error! Mem not allocated!!!\n");
         exit(EXIT_FAILURE);
     }
@@ -1175,11 +1300,11 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
     
 #if SORT_PAIRS      // disbaled in bwa-mem2 (only used in separate benchmark bsw code)
     // Sort the sequences according to decreasing order of lengths
-    SeqPair *tempArray = (SeqPair *)_mm_malloc(SORT_BLOCK_SIZE * numThreads *
+    SeqPair *tempArray = (SeqPair *)_mm_malloc((size_t)SORT_BLOCK_SIZE * numThreads *
                                                sizeof(SeqPair), 64);
-    int16_t *hist = (int16_t *)_mm_malloc((MAX_SEQ_LEN16 + 16) * numThreads *
+    int16_t *hist = (int16_t *)_mm_malloc((size_t)(MAX_SEQ_LEN16 + 16) * numThreads *
                                           sizeof(int16_t), 64);
-    int16_t *histb = (int16_t *)_mm_malloc((MAX_SEQ_LEN16 + 16) * numThreads *
+    int16_t *histb = (int16_t *)_mm_malloc((size_t)(MAX_SEQ_LEN16 + 16) * numThreads *
                                            sizeof(int16_t), 64);
 #pragma omp parallel num_threads(numThreads)
     {
@@ -1198,7 +1323,9 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
             sortPairsLen(pairArray + first, last - first, myTempArray, myHist, myHistb);
         }
     }
+    _mm_free(histb);
     _mm_free(hist);
+    _mm_free(tempArray);
 #endif
 
 #if RDT 
@@ -1434,18 +1561,21 @@ void BandedPairWiseSW::smithWaterman256_16(uint16_t seq1SoA[],
     __m256i oe_del256   = _mm256_set1_epi16(this->o_del + this->e_del);
     __m256i e_ins256    = _mm256_set1_epi16(this->e_ins);
     __m256i oe_ins256   = _mm256_set1_epi16(this->o_ins + this->e_ins);
-    
+
     int16_t *F  = F16_ + tid * SIMD_WIDTH16 * MAX_SEQ_LEN16;
     int16_t *H_h    = H16_ + tid * SIMD_WIDTH16 * MAX_SEQ_LEN16;
     int16_t *H_v = H16__ + tid * SIMD_WIDTH16 * MAX_SEQ_LEN16;
 
     int lane = 0;
-    
+
     int16_t i, j;
 
     uint16_t tlen[SIMD_WIDTH16];
     uint16_t tail[SIMD_WIDTH16] __attribute((aligned(64)));
     uint16_t head[SIMD_WIDTH16] __attribute((aligned(64)));
+
+    // PR 17: per-row score-vector scratch for fission (AVX2 16-bit).
+    int16_t *sbt_buf = sbt16_ + tid * SIMD_WIDTH16 * MAX_SEQ_LEN16;
     
     int32_t minq = 10000000;
     for (int l=0; l<SIMD_WIDTH16; l++) {
@@ -1585,22 +1715,28 @@ void BandedPairWiseSW::smithWaterman256_16(uint16_t seq1SoA[],
         tim1 = __rdtsc();
 #endif
         
+        // PR 17: AVX2 16-bit score pre-pass (fission only, no LUT).
+        for (int jp = beg; jp < end; jp++) {
+            __m256i s2 = _mm256_load_si256((__m256i *)(seq2SoA + jp * SIMD_WIDTH16));
+            __m256i sbt11;
+            SBT_PREPASS16(s10, s2, sbt11, mismatch256, match256, w_ambig_256);
+            _mm256_store_si256((__m256i *)(sbt_buf + jp * SIMD_WIDTH16), sbt11);
+        }
+
         j256 = _mm256_set1_epi16(beg);
         for(j = beg; j < end; j++)
         {
-            __m256i f11, f21, s2;
+            __m256i f11, f21, sbt11;
+            sbt11 = _mm256_load_si256((__m256i *)(sbt_buf + j * SIMD_WIDTH16));
             h00 = _mm256_load_si256((__m256i *)(H_h + j * SIMD_WIDTH16));
             f11 = _mm256_load_si256((__m256i *)(F + j * SIMD_WIDTH16));
 
-            s2 = _mm256_load_si256((__m256i *)(seq2SoA + (j) * SIMD_WIDTH16));
-            
             __m256i pj256 = j256;
             j256 = _mm256_add_epi16(j256, one256);
 
-            MAIN_CODE16(s10, s2, h00, h11, e11, f11, f21, zero256,
-                        maxScore256, e_ins256, oe_ins256,
-                        e_del256, oe_del256,
-                        y1_256, maxRS1); //i+1
+            MAIN_CODE16_CORE(sbt11, h00, h11, e11, f11, f21, zero256,
+                             e_ins256, oe_ins256,
+                             e_del256, oe_del256);
             
             // Masked writing
             __m256i cmp2 = _mm256_cmpgt_epi16(head256, pj256);
@@ -1905,6 +2041,61 @@ void BandedPairWiseSW::smithWaterman256_16(uint16_t seq1SoA[],
         f21 = _mm512_max_epi16(val512, f21);                            \
     }
 
+// --- PR 17/16: AVX-512BW LUT primitive ---
+// Broadcast the 16-byte pmat into all four 128-bit lanes.
+// _mm512_shuffle_epi8 is per-128-bit-lane; each lane shuffles against
+// its own quarter of the 512-bit pmat. The non-LUT variant was removed
+// (its movepi8_mask AMBIG detection no longer fires under the asymmetric
+// AMBIG encoding shipped alongside the LUT path).
+#define SBT_PREPASS8_LUT(s1, s2, sbt11_out, pmat512)                    \
+    {                                                                   \
+        __m512i xor_ = _mm512_xor_si512(s1, s2);                        \
+        sbt11_out = _mm512_shuffle_epi8(pmat512, xor_);                 \
+    }
+
+#define MAIN_CODE8_CORE(sbt11, h00, h11, e11, f11, f21, zero512, e_ins512, oe_ins512, e_del512, oe_del512) \
+    {                                                                   \
+        __m512i m11 = _mm512_add_epi8(h00, sbt11);                      \
+        __mmask64 cmp11 = _mm512_cmpeq_epi8_mask(h00, zero512);         \
+        m11 = _mm512_mask_blend_epi8(cmp11, m11, zero512);              \
+        h11 = _mm512_max_epi8(m11, e11);                                \
+        h11 = _mm512_max_epi8(h11, f11);                                \
+        __m512i temp512 = _mm512_sub_epi8(m11, oe_ins512);              \
+        __m512i val512  = _mm512_max_epi8(temp512, zero512);            \
+        e11 = _mm512_sub_epi8(e11, e_ins512);                           \
+        e11 = _mm512_max_epi8(val512, e11);                             \
+        temp512 = _mm512_sub_epi8(m11, oe_del512);                      \
+        val512  = _mm512_max_epi8(temp512, zero512);                    \
+        f21 = _mm512_sub_epi8(f11, e_del512);                           \
+        f21 = _mm512_max_epi8(val512, f21);                             \
+    }
+
+#define SBT_PREPASS16(s1, s2, sbt11_out, mismatch512, match512, w_ambig_512) \
+    {                                                                   \
+        __mmask32 cmp_ = _mm512_cmpeq_epi16_mask(s1, s2);               \
+        __m512i sbt_ = _mm512_mask_blend_epi16(cmp_, mismatch512, match512); \
+        __m512i tmp_ = _mm512_max_epu16(s1, s2);                        \
+        __mmask32 amb_ = _mm512_movepi16_mask(tmp_);                    \
+        sbt11_out = _mm512_mask_blend_epi16(amb_, sbt_, w_ambig_512);   \
+    }
+
+#define MAIN_CODE16_CORE(sbt11, h00, h11, e11, f11, f21, zero512, e_ins512, oe_ins512, e_del512, oe_del512) \
+    {                                                                   \
+        __m512i m11 = _mm512_add_epi16(h00, sbt11);                     \
+        __mmask32 cmp11 = _mm512_cmpeq_epi16_mask(h00, zero512);        \
+        m11 = _mm512_mask_blend_epi16(cmp11, m11, zero512);             \
+        h11 = _mm512_max_epi16(m11, e11);                               \
+        h11 = _mm512_max_epi16(h11, f11);                               \
+        __m512i temp512 = _mm512_sub_epi16(m11, oe_ins512);             \
+        __m512i val512  = _mm512_max_epi16(temp512, zero512);           \
+        e11 = _mm512_sub_epi16(e11, e_ins512);                          \
+        e11 = _mm512_max_epi16(val512, e11);                            \
+        temp512 = _mm512_sub_epi16(m11, oe_del512);                     \
+        val512  = _mm512_max_epi16(temp512, zero512);                   \
+        f21 = _mm512_sub_epi16(f11, e_del512);                          \
+        f21 = _mm512_max_epi16(val512, f21);                            \
+    }
+
 
 inline void sortPairsLen(SeqPair *pairArray, int32_t count,
                          SeqPair *tempArray, int16_t *hist,
@@ -2001,13 +2192,18 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                                                   uint16_t numThreads,
                                                   int32_t w)
 {
+    numThreads = effective_threads(numThreads);
     int64_t st1, st2, st3, st4, st5;
 #if RDT
     st1 = ___rdtsc();
 #endif
-    uint8_t *seq1SoA = (uint8_t *)_mm_malloc(MAX_SEQ_LEN8 * SIMD_WIDTH8 * numThreads * sizeof(uint8_t), 64);
-    uint8_t *seq2SoA = (uint8_t *)_mm_malloc(MAX_SEQ_LEN8 * SIMD_WIDTH8 * numThreads * sizeof(uint8_t), 64);
-    
+    uint8_t *seq1SoA = (uint8_t *)_mm_malloc((size_t)MAX_SEQ_LEN8 * SIMD_WIDTH8 * numThreads * sizeof(uint8_t), 64);
+    uint8_t *seq2SoA = (uint8_t *)_mm_malloc((size_t)MAX_SEQ_LEN8 * SIMD_WIDTH8 * numThreads * sizeof(uint8_t), 64);
+    if (UNLIKELY(seq1SoA == NULL || seq2SoA == NULL)) {
+        fprintf(stderr, "Error! Mem not allocated!!!\n");
+        exit(EXIT_FAILURE);
+    }
+
     int32_t ii;
     int32_t roundNumPairs = ((numPairs + SIMD_WIDTH8 - 1)/SIMD_WIDTH8 ) * SIMD_WIDTH8;
     for(ii = numPairs; ii < roundNumPairs; ii++)
@@ -2023,11 +2219,11 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
     
 #if SORT_PAIRS       // disbaled in bwa-mem2 (only used in separate benchmark bsw code)
     // Sort the sequences according to decreasing order of lengths
-    SeqPair *tempArray = (SeqPair *)_mm_malloc(SORT_BLOCK_SIZE * numThreads *
+    SeqPair *tempArray = (SeqPair *)_mm_malloc((size_t)SORT_BLOCK_SIZE * numThreads *
                                                sizeof(SeqPair), 64);
-    int16_t *hist = (int16_t *)_mm_malloc((MAX_SEQ_LEN8 + 32) * numThreads *
+    int16_t *hist = (int16_t *)_mm_malloc((size_t)(MAX_SEQ_LEN8 + 32) * numThreads *
                                           sizeof(int16_t), 64);
-    int16_t *histb = (int16_t *)_mm_malloc((MAX_SEQ_LEN8 + 32) * numThreads *
+    int16_t *histb = (int16_t *)_mm_malloc((size_t)(MAX_SEQ_LEN8 + 32) * numThreads *
                                            sizeof(int16_t), 64);
 #pragma omp parallel num_threads(numThreads)
     {
@@ -2046,7 +2242,9 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
             sortPairsLen(pairArray + first, last - first, myTempArray, myHist, myHistb);
         }
     }
+    _mm_free(histb);
     _mm_free(hist);
+    _mm_free(tempArray);
 #endif
     
 #if RDT
@@ -2111,7 +2309,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
 
                 for(k = 0; k < sp.len1; k++)
                 {
-                    mySeq1SoA[k * SIMD_WIDTH8 + j] = (seq1[k] == AMBIG?0xFF:seq1[k]);
+                    mySeq1SoA[k * SIMD_WIDTH8 + j] = seq1[k] /* PR16: N stays 4 */;
                     H2[k * SIMD_WIDTH8 + j] = 0;
                 }
                 qlen[j] = sp.len2 * max;
@@ -2150,7 +2348,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                 seq2 = seqBufQer + (int64_t)sp.idq;
                 for(k = 0; k < sp.len2; k++)
                 {
-                    mySeq2SoA[k * SIMD_WIDTH8 + j] = (seq2[k]==AMBIG?0xFF:seq2[k]);
+                    mySeq2SoA[k * SIMD_WIDTH8 + j] = (seq2[k]==AMBIG ? 8 : seq2[k]) /* PR16: query N→8 */;
                     H1[k * SIMD_WIDTH8 + j] = 0;                    
                 }
                 if(maxLen2 < sp.len2) maxLen2 = sp.len2;
@@ -2281,23 +2479,33 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
     __m512i w_ambig_512  = _mm512_set1_epi8(this->w_ambig); // ambig penalty
     __m512i five512      = _mm512_set1_epi8(5);
 
+    // PR 16: pmat LUT broadcast into all 4 128-bit lanes of 512-bit register.
+    int8_t pmat_bytes[16] __attribute__((aligned(16)));
+    build_pmat16(pmat_bytes, this->w_match, this->w_mismatch, this->w_ambig);
+    __m128i pmat128 = _mm_load_si128((__m128i *)pmat_bytes);
+    __m512i pmat512 = _mm512_broadcast_i32x4(pmat128);
+
     __m512i e_del512    = _mm512_set1_epi8(this->e_del);
     __m512i oe_del512   = _mm512_set1_epi8(this->o_del + this->e_del);
     __m512i e_ins512    = _mm512_set1_epi8(this->e_ins);
-    __m512i oe_ins512   = _mm512_set1_epi8(this->o_ins + this->e_ins);  
-    
+    __m512i oe_ins512   = _mm512_set1_epi8(this->o_ins + this->e_ins);
+
     int8_t  *F   = F8_ + tid * SIMD_WIDTH8 * MAX_SEQ_LEN8;
     int8_t  *H_h = H8_ + tid * SIMD_WIDTH8 * MAX_SEQ_LEN8;
     int8_t  *H_v = H8__ + tid * SIMD_WIDTH8 * MAX_SEQ_LEN8;
-    
+
     int lane = 0;
-    
+
     int8_t lowInitValue = LOW_INIT_VALUE;
     int16_t i, j;
 
     uint8_t tlen[SIMD_WIDTH8];
     uint8_t tail[SIMD_WIDTH8] __attribute((aligned(64)));
     uint8_t head[SIMD_WIDTH8] __attribute((aligned(64)));
+
+    // PR 17: per-row score-vector scratch for fission. Thread-local view
+    // into sbt8_ (slab-backed; see constructor) — too large for the stack.
+    int8_t *sbt_buf = sbt8_ + tid * SIMD_WIDTH8 * MAX_SEQ_LEN8;
     
     int32_t minq = 10000000;
     for (int l=0; l<SIMD_WIDTH8; l++) {
@@ -2436,22 +2644,28 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
         tim1 = __rdtsc();
 #endif
         
+        // PR 17+16: AVX-512 8-bit score pre-pass via LUT.
+        for (int jp = beg; jp < end; jp++) {
+            __m512i s2 = _mm512_load_si512((__m512i *)(seq2SoA + jp * SIMD_WIDTH8));
+            __m512i sbt11;
+            SBT_PREPASS8_LUT(s10, s2, sbt11, pmat512);
+            _mm512_store_si512((__m512i *)(sbt_buf + jp * SIMD_WIDTH8), sbt11);
+        }
+
         j512 = _mm512_set1_epi8(beg);
         for(j = beg; j < end; j++)
         {
-            __m512i f11, f21, f31, f41, f51, jj512, s2;
+            __m512i f11, f21, f31, f41, f51, jj512, sbt11;
             h00 = _mm512_load_si512((__m512i *)(H_h + j * SIMD_WIDTH8));
             f11 = _mm512_load_si512((__m512i *)(F + j * SIMD_WIDTH8));
+            sbt11 = _mm512_load_si512((__m512i *)(sbt_buf + j * SIMD_WIDTH8));
 
-            s2 = _mm512_load_si512((__m512i *)(seq2SoA + (j) * SIMD_WIDTH8));
-            
             __m512i pj512 = j512;
             j512 = _mm512_add_epi8(j512, one512);
             
-            MAIN_CODE8(s10, s2, h00, h11, e11, f11, f21, zero512,
-                       maxScore512, e_ins512, oe_ins512,
-                       e_del512, oe_del512,
-                       y1_512, maxRS1); //i+1
+            MAIN_CODE8_CORE(sbt11, h00, h11, e11, f11, f21, zero512,
+                            e_ins512, oe_ins512,
+                            e_del512, oe_del512);
 
             // Masked writing
             __mmask64 cmp2 = _mm512_cmpgt_epi8_mask(head512, pj512);
@@ -2694,15 +2908,16 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
                                                    uint16_t numThreads,
                                                    int32_t w)
 {
+    numThreads = effective_threads(numThreads);
     int64_t st1, st2, st3, st4, st5;
 #if RDT
     st1 = ___rdtsc();
 #endif
-    
-    uint16_t *seq1SoA = (uint16_t *)_mm_malloc(MAX_SEQ_LEN16 * SIMD_WIDTH16 * numThreads * sizeof(uint16_t), 64);
-    uint16_t *seq2SoA = (uint16_t *)_mm_malloc(MAX_SEQ_LEN16 * SIMD_WIDTH16 * numThreads * sizeof(uint16_t), 64);
 
-    if (seq1SoA == NULL || seq2SoA == NULL) {
+    uint16_t *seq1SoA = (uint16_t *)_mm_malloc((size_t)MAX_SEQ_LEN16 * SIMD_WIDTH16 * numThreads * sizeof(uint16_t), 64);
+    uint16_t *seq2SoA = (uint16_t *)_mm_malloc((size_t)MAX_SEQ_LEN16 * SIMD_WIDTH16 * numThreads * sizeof(uint16_t), 64);
+
+    if (UNLIKELY(seq1SoA == NULL || seq2SoA == NULL)) {
         fprintf(stderr, "Error! Mem not allocated!!!\n");
         exit(EXIT_FAILURE);
     }
@@ -2722,9 +2937,9 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
     
 #if SORT_PAIRS       // disbaled in bwa-mem2 (only used in separate benchmark bsw code)
     // Sort the sequences according to decreasing order of lengths
-    SeqPair *tempArray = (SeqPair *)_mm_malloc(SORT_BLOCK_SIZE * numThreads *
+    SeqPair *tempArray = (SeqPair *)_mm_malloc((size_t)SORT_BLOCK_SIZE * numThreads *
                                                sizeof(SeqPair), 64);
-    int16_t *hist = (int16_t *)_mm_malloc((MAX_SEQ_LEN16 + 32) * numThreads *
+    int16_t *hist = (int16_t *)_mm_malloc((size_t)(MAX_SEQ_LEN16 + 32) * numThreads *
                                           sizeof(int16_t), 64);
 #pragma omp parallel num_threads(numThreads)
     {
@@ -2743,6 +2958,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
         }
     }
     _mm_free(hist);
+    _mm_free(tempArray);
 #endif
     
 #if RDT
@@ -2988,14 +3204,17 @@ void BandedPairWiseSW::smithWaterman512_16(uint16_t seq1SoA[],
     int16_t *F   = F16_ + tid * SIMD_WIDTH16 * MAX_SEQ_LEN16;
     int16_t *H_h = H16_ + tid * SIMD_WIDTH16 * MAX_SEQ_LEN16;
     int16_t *H_v = H16__ + tid * SIMD_WIDTH16 * MAX_SEQ_LEN16;
-    
+
     int lane = 0;
-    
+
     int16_t i, j;
 
     uint16_t tlen[SIMD_WIDTH16];
     uint16_t tail[SIMD_WIDTH16] __attribute((aligned(64)));
     uint16_t head[SIMD_WIDTH16] __attribute((aligned(64)));
+
+    // PR 17: per-row score-vector scratch for fission (AVX-512 16-bit).
+    int16_t *sbt_buf = sbt16_ + tid * SIMD_WIDTH16 * MAX_SEQ_LEN16;
     
     int32_t minq = 10000000;
     for (int l=0; l<SIMD_WIDTH16; l++) {
@@ -3132,22 +3351,28 @@ void BandedPairWiseSW::smithWaterman512_16(uint16_t seq1SoA[],
         tim1 = __rdtsc();
 #endif
         
+        // PR 17: AVX-512 16-bit score pre-pass (fission only, no LUT).
+        for (int jp = beg; jp < end; jp++) {
+            __m512i s2 = _mm512_load_si512((__m512i *)(seq2SoA + jp * SIMD_WIDTH16));
+            __m512i sbt11;
+            SBT_PREPASS16(s10, s2, sbt11, mismatch512, match512, w_ambig_512);
+            _mm512_store_si512((__m512i *)(sbt_buf + jp * SIMD_WIDTH16), sbt11);
+        }
+
         j512 = _mm512_set1_epi16(beg);
         for(j = beg; j < end; j++)
         {
-            __m512i f11, f21, f31, f41, f51, jj512, s2;
+            __m512i f11, f21, f31, f41, f51, jj512, sbt11;
             h00 = _mm512_load_si512((__m512i *)(H_h + j * SIMD_WIDTH16));
             f11 = _mm512_load_si512((__m512i *)(F + j * SIMD_WIDTH16));
+            sbt11 = _mm512_load_si512((__m512i *)(sbt_buf + j * SIMD_WIDTH16));
 
-            s2 = _mm512_load_si512((__m512i *)(seq2SoA + (j) * SIMD_WIDTH16));
-            
             __m512i pj512 = j512;
             j512 = _mm512_add_epi16(j512, one512);
 
-            MAIN_CODE16(s10, s2, h00, h11, e11, f11, f21, zero512,
-                       maxScore512, e_ins512, oe_ins512,
-                       e_del512, oe_del512,
-                       y1_512, maxRS1); //i+1
+            MAIN_CODE16_CORE(sbt11, h00, h11, e11, f11, f21, zero512,
+                             e_ins512, oe_ins512,
+                             e_del512, oe_del512);
 
             // Masked writing
             __mmask32 cmp2 = _mm512_cmpgt_epi16_mask(head512, pj512);
@@ -3358,7 +3583,11 @@ void BandedPairWiseSW::smithWaterman512_16(uint16_t seq1SoA[],
 
 
 /**************** SSE2 code ******************/
-#if ((!__AVX512BW__) && (!__AVX2__) && (__SSE2__))
+/* SBT_PREPASS8_LUT below uses _mm_shuffle_epi8 (PSHUFB, an SSSE3 intrinsic),
+ * so this block requires SSSE3. The Makefile passes -mssse3 on all x86 arch
+ * targets and sse2neon predefines __SSSE3__=1, so this matches every build
+ * that compiles the SSE2/NEON path. */
+#if ((!__AVX512BW__) && (!__AVX2__) && (__SSE2__) && (__SSSE3__))
 
 // SSE2/NEON - 16 bit blendv
 static inline __m128i
@@ -3401,6 +3630,33 @@ _mm_blendv_epi16(__m128i x, __m128i y, __m128i mask)
         sbt11 = _mm_blendv_epi16(sbt11, w_ambig_128, tmp128);           \
         __m128i m11 = _mm_add_epi16(h00, sbt11);                        \
         cmp11 = _mm_cmpeq_epi16(h00, zero128);                          \
+        m11 = _mm_blendv_epi16(m11, zero128, cmp11);                    \
+        h11 = _mm_max_epi16(m11, e11);                                  \
+        h11 = _mm_max_epi16(h11, f11);                                  \
+        __m128i temp128 = _mm_sub_epi16(m11, oe_ins128);                \
+        __m128i val128  = _mm_max_epi16(temp128, zero128);              \
+        e11 = _mm_sub_epi16(e11, e_ins128);                             \
+        e11 = _mm_max_epi16(val128, e11);                               \
+        temp128 = _mm_sub_epi16(m11, oe_del128);                        \
+        val128  = _mm_max_epi16(temp128, zero128);                      \
+        f21 = _mm_sub_epi16(f11, e_del128);                             \
+        f21 = _mm_max_epi16(val128, f21);                               \
+    }
+
+// PR 17: 16-bit fission primitives, mirror of the 8-bit pair above.
+#define SBT_PREPASS16(s1, s2, sbt11_out, mismatch128, match128, w_ambig_128, ff128) \
+    {                                                                   \
+        __m128i cmp11_ = _mm_cmpeq_epi16(s1, s2);                       \
+        __m128i sbt_ = _mm_blendv_epi16(mismatch128, match128, cmp11_); \
+        __m128i tmp_ = _mm_max_epu16(s1, s2);                           \
+        tmp_ = _mm_cmpeq_epi16(tmp_, ff128);                            \
+        sbt11_out = _mm_blendv_epi16(sbt_, w_ambig_128, tmp_);          \
+    }
+
+#define MAIN_CODE16_CORE(sbt11, h00, h11, e11, f11, f21, zero128, e_ins128, oe_ins128, e_del128, oe_del128) \
+    {                                                                   \
+        __m128i m11 = _mm_add_epi16(h00, sbt11);                        \
+        __m128i cmp11 = _mm_cmpeq_epi16(h00, zero128);                  \
         m11 = _mm_blendv_epi16(m11, zero128, cmp11);                    \
         h11 = _mm_max_epi16(m11, e11);                                  \
         h11 = _mm_max_epi16(h11, f11);                                  \
@@ -3504,15 +3760,18 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
                                                    uint16_t numThreads,
                                                    int32_t w)
 {
+    numThreads = effective_threads(numThreads);
 #if RDT
     int64_t st1, st2, st3, st4, st5;
     st1 = ___rdtsc();
 #endif
-    
-    uint16_t *seq1SoA = (uint16_t *)_mm_malloc(MAX_SEQ_LEN16 * SIMD_WIDTH16 * numThreads * sizeof(uint16_t), 64);
-    uint16_t *seq2SoA = (uint16_t *)_mm_malloc(MAX_SEQ_LEN16 * SIMD_WIDTH16 * numThreads * sizeof(uint16_t), 64);
 
-    assert (seq1SoA != NULL || seq2SoA != NULL);
+    uint16_t *seq1SoA = (uint16_t *)_mm_malloc((size_t)MAX_SEQ_LEN16 * SIMD_WIDTH16 * numThreads * sizeof(uint16_t), 64);
+    uint16_t *seq2SoA = (uint16_t *)_mm_malloc((size_t)MAX_SEQ_LEN16 * SIMD_WIDTH16 * numThreads * sizeof(uint16_t), 64);
+    if (UNLIKELY(seq1SoA == NULL || seq2SoA == NULL)) {
+        fprintf(stderr, "Error! Mem not allocated!!!\n");
+        exit(EXIT_FAILURE);
+    }
 
     int32_t ii;
     int32_t roundNumPairs = ((numPairs + SIMD_WIDTH16 - 1)/SIMD_WIDTH16 ) * SIMD_WIDTH16;
@@ -3530,11 +3789,11 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
     
 #if SORT_PAIRS       // disbaled in bwa-mem2 (only used in separate benchmark bsw code)
     // Sort the sequences according to decreasing order of lengths
-    SeqPair *tempArray = (SeqPair *)_mm_malloc(SORT_BLOCK_SIZE * numThreads *
+    SeqPair *tempArray = (SeqPair *)_mm_malloc((size_t)SORT_BLOCK_SIZE * numThreads *
                                                sizeof(SeqPair), 64);
-    int16_t *hist = (int16_t *)_mm_malloc((MAX_SEQ_LEN16 + 16) * numThreads *
+    int16_t *hist = (int16_t *)_mm_malloc((size_t)(MAX_SEQ_LEN16 + 16) * numThreads *
                                           sizeof(int16_t), 64);
-    int16_t *histb = (int16_t *)_mm_malloc((MAX_SEQ_LEN16 + 16) * numThreads *
+    int16_t *histb = (int16_t *)_mm_malloc((size_t)(MAX_SEQ_LEN16 + 16) * numThreads *
                                            sizeof(int16_t), 64);
 #pragma omp parallel num_threads(numThreads)
     {
@@ -3553,7 +3812,9 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
             sortPairsLen(pairArray + first, last - first, myTempArray, myHist, myHistb);
         }
     }
+    _mm_free(histb);
     _mm_free(hist);
+    _mm_free(tempArray);
 #endif
 
 #if RDT
@@ -3794,6 +4055,9 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
     uint16_t tlen[SIMD_WIDTH16];
     uint16_t tail[SIMD_WIDTH16] __attribute((aligned(64)));
     uint16_t head[SIMD_WIDTH16] __attribute((aligned(64)));
+
+    // PR 17: per-row score-vector scratch (16-bit variant).
+    int16_t *sbt_buf = sbt16_ + tid * SIMD_WIDTH16 * MAX_SEQ_LEN16;
     
     int32_t minq = 10000000;
     for (int l=0; l<SIMD_WIDTH16; l++) {
@@ -3923,22 +4187,28 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
         tim1 = __rdtsc();
 #endif
         
+        // PR 17: 16-bit pre-pass. Same shape as the 8-bit path.
+        for (int jp = beg; jp < end; jp++) {
+            __m128i s2 = _mm_load_si128((__m128i *)(seq2SoA + jp * SIMD_WIDTH16));
+            __m128i sbt11;
+            SBT_PREPASS16(s10, s2, sbt11, mismatch128, match128, w_ambig_128, ff128);
+            _mm_store_si128((__m128i *)(sbt_buf + jp * SIMD_WIDTH16), sbt11);
+        }
+
         j128 = _mm_set1_epi16(beg);
         for(j = beg; j < end; j++)
         {
-            __m128i f11, f21, s2;
+            __m128i f11, f21, sbt11;
             h00 = _mm_load_si128((__m128i *)(H_h + j * SIMD_WIDTH16));
             f11 = _mm_load_si128((__m128i *)(F + j * SIMD_WIDTH16));
+            sbt11 = _mm_load_si128((__m128i *)(sbt_buf + j * SIMD_WIDTH16));
 
-            s2 = _mm_load_si128((__m128i *)(seq2SoA + (j) * SIMD_WIDTH16));
-            
             __m128i pj128 = j128;
             j128 = _mm_add_epi16(j128, one128);
 
-            MAIN_CODE16(s10, s2, h00, h11, e11, f11, f21, zero128,
-                        maxScore128, e_ins128, oe_ins128,
-                        e_del128, oe_del128,
-                        y1_128, maxRS1); //i+1
+            MAIN_CODE16_CORE(sbt11, h00, h11, e11, f11, f21, zero128,
+                             e_ins128, oe_ins128,
+                             e_del128, oe_del128);
 
             // Masked writing
             __m128i cmp1 = _mm_cmpgt_epi16(head128, pj128);
@@ -4201,6 +4471,44 @@ static inline __m128i _mm_blendv_epi8 (__m128i x, __m128i y, __m128i mask)
         f21 = _mm_max_epu8(temp128, f21);                               \
     }
 
+// --- PR 17/16: SSE2/NEON LUT primitive ---
+// With the asymmetric AMBIG encoding (target N=4, query N=8), the low 4 bits
+// of (s1 ^ s2) index a 16-byte pmat LUT where:
+//   [0]     = w_match   (s1==s2, both ACGT)
+//   [1..3]  = w_mismatch (ACGT vs ACGT, XOR ∈ {1,2,3})
+//   [4..7]  = w_ambig   (target=N=4, query=ACGT)
+//   [8..11] = w_ambig   (target=ACGT, query=N=8)
+//   [12]    = w_ambig   (both N)
+//   [13..15] = w_ambig   (unreachable; filled for safety)
+// Replaces 4-op cmpeq+blendv+max+blendv critical path with 1 XOR + 1
+// shuffle_epi8 (TBL on NEON). The non-LUT SBT_PREPASS8 variant was removed
+// — its max_epu8 + cmpeq AMBIG detection relied on the legacy symmetric
+// (target=N=15, query=N=15) encoding and would mis-classify under the
+// current asymmetric encoding.
+#define SBT_PREPASS8_LUT(s1, s2, sbt11_out, pmat128)                    \
+    {                                                                   \
+        __m128i xor_ = _mm_xor_si128(s1, s2);                           \
+        sbt11_out = _mm_shuffle_epi8(pmat128, xor_);                    \
+    }
+
+// MAIN_CODE8_CORE runs only the cell-update half of MAIN_CODE8 using a
+// pre-computed score vector `sbt11` from SBT_PREPASS8.
+#define MAIN_CODE8_CORE(sbt11, h00, h11, e11, f11, f21, zero128, e_ins128, oe_ins128, e_del128, oe_del128) \
+    {                                                                   \
+        __m128i m11 = _mm_add_epi8(h00, sbt11);                         \
+        __m128i cmp11 = _mm_cmpeq_epi8(h00, zero128);                   \
+        m11 = _mm_blendv_epi8(m11, zero128, cmp11);                     \
+        m11 = _mm_and_si128(m11, _mm_cmpgt_epi8(m11, zero128));         \
+        h11 = _mm_max_epu8(m11, e11);                                   \
+        h11 = _mm_max_epu8(h11, f11);                                   \
+        __m128i temp128 = _mm_subs_epu8(m11, oe_ins128);                \
+        e11 = _mm_subs_epu8(e11, e_ins128);                             \
+        e11 = _mm_max_epu8(temp128, e11);                               \
+        temp128 = _mm_subs_epu8(m11, oe_del128);                        \
+        f21 = _mm_subs_epu8(f11, e_del128);                             \
+        f21 = _mm_max_epu8(temp128, f21);                               \
+    }
+
 
 // #define PFD 2 // SSE2
 void BandedPairWiseSW::getScores8(SeqPair *pairArray,
@@ -4235,14 +4543,15 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                                                   uint16_t numThreads,
                                                   int32_t w)
 {
+    numThreads = effective_threads(numThreads);
 #if RDT
     int64_t st1, st2, st3, st4, st5;
     st1 = ___rdtsc();
 #endif
-    uint8_t *seq1SoA = (uint8_t *)_mm_malloc(MAX_SEQ_LEN8 * SIMD_WIDTH8 * numThreads * sizeof(uint8_t), 64);
-    uint8_t *seq2SoA = (uint8_t *)_mm_malloc(MAX_SEQ_LEN8 * SIMD_WIDTH8 * numThreads * sizeof(uint8_t), 64);
+    uint8_t *seq1SoA = (uint8_t *)_mm_malloc((size_t)MAX_SEQ_LEN8 * SIMD_WIDTH8 * numThreads * sizeof(uint8_t), 64);
+    uint8_t *seq2SoA = (uint8_t *)_mm_malloc((size_t)MAX_SEQ_LEN8 * SIMD_WIDTH8 * numThreads * sizeof(uint8_t), 64);
 
-    if (seq1SoA == NULL || seq2SoA == NULL) {
+    if (UNLIKELY(seq1SoA == NULL || seq2SoA == NULL)) {
         fprintf(stderr, "Error! Mem not allocated!!!\n");
         exit(EXIT_FAILURE);
     }
@@ -4263,11 +4572,11 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
     
 #if SORT_PAIRS       // disbaled in bwa-mem2 (only used in separate benchmark bsw code)
     // Sort the sequences according to decreasing order of lengths
-    SeqPair *tempArray = (SeqPair *)_mm_malloc(SORT_BLOCK_SIZE * numThreads *
+    SeqPair *tempArray = (SeqPair *)_mm_malloc((size_t)SORT_BLOCK_SIZE * numThreads *
                                                sizeof(SeqPair), 64);
-    int16_t *hist = (int16_t *)_mm_malloc((MAX_SEQ_LEN8 + 32) * numThreads *
+    int16_t *hist = (int16_t *)_mm_malloc((size_t)(MAX_SEQ_LEN8 + 32) * numThreads *
                                           sizeof(int16_t), 64);
-    int16_t *histb = (int16_t *)_mm_malloc((MAX_SEQ_LEN8 + 32) * numThreads *
+    int16_t *histb = (int16_t *)_mm_malloc((size_t)(MAX_SEQ_LEN8 + 32) * numThreads *
                                            sizeof(int16_t), 64);
 #pragma omp parallel num_threads(numThreads)
     {
@@ -4286,7 +4595,9 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
             sortPairsLen(pairArray + first, last - first, myTempArray, myHist, myHistb);
         }
     }
+    _mm_free(histb);
     _mm_free(hist);
+    _mm_free(tempArray);
 #endif
 
 #if RDT
@@ -4342,7 +4653,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                 
                 for(k = 0; k < sp.len1; k++)
                 {
-                    mySeq1SoA[k * SIMD_WIDTH8 + j] = (seq1[k] == AMBIG?0xFF:seq1[k]);
+                    mySeq1SoA[k * SIMD_WIDTH8 + j] = seq1[k] /* PR16: N stays 4 */;
                     H2[k * SIMD_WIDTH8 + j] = 0;
                 }
                 qlen[j] = sp.len2 * max;
@@ -4379,7 +4690,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                 
                 for(k = 0; k < sp.len2; k++)
                 {
-                    mySeq2SoA[k * SIMD_WIDTH8 + j] = (seq2[k]==AMBIG?0xFF:seq2[k]);
+                    mySeq2SoA[k * SIMD_WIDTH8 + j] = (seq2[k]==AMBIG ? 8 : seq2[k]) /* PR16: query N→8 */;
                     H1[k * SIMD_WIDTH8 + j] = 0;                    
                 }
                 if(maxLen2 < sp.len2) maxLen2 = sp.len2;
@@ -4508,6 +4819,12 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
     __m128i mismatch128  = _mm_set1_epi8(this->w_mismatch);
     __m128i w_ambig_128  = _mm_set1_epi8(this->w_ambig);    // ambig penalty
 
+    // PR 16: score-lookup LUT indexed by low 4 bits of (target XOR query).
+    // See SBT_PREPASS8_LUT for the layout. Built once per kernel call.
+    int8_t pmat_bytes[16] __attribute__((aligned(16)));
+    build_pmat16(pmat_bytes, this->w_match, this->w_mismatch, this->w_ambig);
+    __m128i pmat128 = _mm_load_si128((__m128i *)pmat_bytes);
+
     __m128i e_del128    = _mm_set1_epi8(this->e_del);
     __m128i oe_del128   = _mm_set1_epi8(this->o_del + this->e_del);
     __m128i e_ins128    = _mm_set1_epi8(this->e_ins);
@@ -4522,6 +4839,12 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
     uint8_t tlen[SIMD_WIDTH8];
     uint8_t tail[SIMD_WIDTH8] __attribute((aligned(64)));
     uint8_t head[SIMD_WIDTH8] __attribute((aligned(64)));
+
+    // PR 17: per-row score-vector scratch for loop fission. Holds sbt[j]
+    // (score for each band column) pre-computed outside the DP core so
+    // the core's critical path doesn't carry the cmpeq+blendv+maxu+blendv
+    // chain that builds the score. Slab-backed (see constructor sbt8_).
+    int8_t *sbt_buf = sbt8_ + tid * SIMD_WIDTH8 * MAX_SEQ_LEN8;
     
     int32_t minq = 10000000;
     for (int l=0; l<SIMD_WIDTH8; l++) {
@@ -4647,22 +4970,32 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
         tim1 = __rdtsc();
 #endif
         
+        // PR 17: pre-pass — build score vector sbt[j] for all band columns
+        // once. Independent per-j, so vectorized loads/stores run at peak
+        // throughput without carrying the DP core's dep chain.
+        for (int jp = beg; jp < end; jp++) {
+            __m128i s2 = _mm_load_si128((__m128i *)(seq2SoA + jp * SIMD_WIDTH8));
+            __m128i sbt11;
+            // PR 16: LUT score build (1 xor + 1 shuffle) in place of
+            // the 4-op cmpeq+blendv+max+blendv SBT_PREPASS8.
+            SBT_PREPASS8_LUT(s10, s2, sbt11, pmat128);
+            _mm_store_si128((__m128i *)(sbt_buf + jp * SIMD_WIDTH8), sbt11);
+        }
+
         j128 = _mm_set1_epi8(beg);
         for(j = beg; j < end; j++)
         {
-            __m128i f11, f21, s2;
+            __m128i f11, f21, sbt11;
             h00 = _mm_load_si128((__m128i *)(H_h + j * SIMD_WIDTH8));
             f11 = _mm_load_si128((__m128i *)(F + j * SIMD_WIDTH8));
+            sbt11 = _mm_load_si128((__m128i *)(sbt_buf + j * SIMD_WIDTH8));
 
-            s2 = _mm_load_si128((__m128i *)(seq2SoA + (j) * SIMD_WIDTH8));
-            
             __m128i pj128 = j128;
             j128 = _mm_add_epi8(j128, one128);
 
-            MAIN_CODE8(s10, s2, h00, h11, e11, f11, f21, zero128,
-                       maxScore128, e_ins128, oe_ins128,
-                       e_del128, oe_del128,
-                       y1_128, maxRS1); //i+1
+            MAIN_CODE8_CORE(sbt11, h00, h11, e11, f11, f21, zero128,
+                            e_ins128, oe_ins128,
+                            e_del128, oe_del128);
 
             // Masked writing
             __m128i cmp1 = _mm_cmpgt_epi8(head128, pj128);

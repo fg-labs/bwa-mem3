@@ -259,7 +259,7 @@ ifneq ($(strip $(DISABLE_BATCHED_MATESW)),)
     CPPFLAGS += -DDISABLE_BATCHED_MATESW=$(DISABLE_BATCHED_MATESW)
 endif
 
-.PHONY:all clean depend multi print-mimalloc-config kswv_selftest kswv_nrow_zero_test test FORCE
+.PHONY:all clean depend multi print-mimalloc-config kswv_selftest kswv_nrow_zero_test test FORCE pgo-generate pgo-use pgo-clean profile-build profile-clean lto-build lto-clean
 .SUFFIXES:.cpp .o
 
 .cpp.o:
@@ -395,8 +395,8 @@ $(MIMALLOC_LIB):
 	mkdir -p $(MIMALLOC_BUILD)
 	cd $(MIMALLOC_BUILD) && cmake $(MIMALLOC_CMAKE_FLAGS) .. && $(MAKE)
 
-clean:
-	rm -fr src/*.o src/version.h test/*.o $(BWA_LIB) $(EXE) kswv_selftest kswv_nrow_zero_test bwa-mem2.sse41 bwa-mem2.sse42 bwa-mem2.avx bwa-mem2.avx2 bwa-mem2.avx512bw bwa-mem2.arm64 bwa-mem2.pgo bwa-mem2.pgo-instr bwa-mem2.pgo.* bwa-mem2.pgo-instr.*
+clean: pgo-clean profile-clean lto-clean
+	rm -fr src/*.o src/version.h test/*.o $(BWA_LIB) $(EXE) kswv_selftest kswv_nrow_zero_test bwa-mem2.sse41 bwa-mem2.sse42 bwa-mem2.avx bwa-mem2.avx2 bwa-mem2.avx512bw bwa-mem2.arm64
 	rm -f $(LIBSAIS_OBJS)
 	cd ext/safestringlib/ && $(MAKE) clean
 	-[ -f ext/htslib/config.mk ] && cd ext/htslib && $(MAKE) distclean
@@ -450,6 +450,66 @@ pgo-use:
 
 pgo-clean:
 	rm -rf $(PGO_PROFILE_DIR) bwa-mem2.pgo-instr bwa-mem2.pgo bwa-mem2.pgo-instr.* bwa-mem2.pgo.*
+
+# profile-build / lto-build target arch. Mirrors PGO_ARCH: defaults to
+# arm64 on Apple Silicon / aarch64 hosts (preserves prior behavior), and
+# native otherwise. Override at the command line for cross-builds, e.g.
+#   make profile-build PROFILE_ARCH=avx2
+#   make lto-build LTO_ARCH=avx512bw
+ifneq ($(IS_ARM),)
+    PROFILE_ARCH ?= arm64
+    LTO_ARCH     ?= arm64
+else
+    PROFILE_ARCH ?= native
+    LTO_ARCH     ?= native
+endif
+
+# Compute-only profile build. -DDISABLE_OUTPUT short-circuits BAM/SAM
+# per-record writes AND writer open + header emit, so wall-clock measurements
+# exclude all output I/O (no -o file open, no @HD/@SQ/@PG emission). All
+# upstream alignment work runs unchanged; the per-stage tprof[] counters
+# (printed at end of run) are unaffected.
+# Usage: make profile-build
+#        make profile-build PROFILE_ARCH=avx2     # cross-build
+#        ./bwa-mem2.profile mem -t N idx r1.fq.gz r2.fq.gz
+profile-build:
+	rm -f src/*.o $(BWA_LIB); cd ext/safestringlib/ && $(MAKE) clean;
+	$(MAKE) arch=$(PROFILE_ARCH) EXE=bwa-mem2.profile EXTRA_CXXFLAGS="$(EXTRA_CXXFLAGS) -DDISABLE_OUTPUT" CXX=$(CXX) all
+	@echo "Compute-only profile binary: bwa-mem2.profile (arch=$(PROFILE_ARCH), output I/O skipped)"
+	# Drop variant-flagged objects from the shared cache so a subsequent
+	# `make all` doesn't relink stale -DDISABLE_OUTPUT objects.
+	rm -f src/*.o $(BWA_LIB)
+
+profile-clean:
+	rm -f bwa-mem2.profile
+
+# Link-Time Optimization build.
+# Usage: make lto-build
+#        make lto-build LTO_ARCH=avx2             # cross-build
+#        ./bwa-mem2.lto mem -t N idx r1.fq.gz r2.fq.gz
+# Compiles all bwa-mem2 sources with LTO and links with LTO. Non-bwa-mem2
+# deps (htslib, mimalloc, safestringlib) keep their non-LTO objects; the
+# linker still does LTO across bwa-mem2's own .o. On GCC,
+# -fno-semantic-interposition additionally allows more aggressive inlining
+# across translation units (no effect on clang, silently ignored).
+
+# LTO_FLAG is detected at recipe-time (not Makefile-parse time) so a stale
+# or missing $(CXX) doesn't print a "command not found" warning on every
+# `make` invocation that doesn't even target lto-build.
+lto-build:
+	rm -f src/*.o $(BWA_LIB); cd ext/safestringlib/ && $(MAKE) clean;
+	@CXX_VERSION="$$($(CXX) --version 2>&1 | head -1)"; \
+	  case "$$CXX_VERSION" in *clang*) LTO_FLAG=-flto=thin ;; *) LTO_FLAG=-flto ;; esac; \
+	  echo "LTO_FLAG=$$LTO_FLAG (cxx: $$CXX_VERSION, arch: $(LTO_ARCH))"; \
+	  $(MAKE) arch=$(LTO_ARCH) EXE=bwa-mem2.lto EXTRA_CXXFLAGS="$(EXTRA_CXXFLAGS) $$LTO_FLAG -fno-semantic-interposition" CXX=$(CXX) all
+	@echo "LTO binary: bwa-mem2.lto (arch=$(LTO_ARCH))"
+	# Drop variant-flagged objects from the shared cache so a subsequent
+	# `make all` doesn't relink stale -flto / -fno-semantic-interposition
+	# objects.
+	rm -f src/*.o $(BWA_LIB)
+
+lto-clean:
+	rm -f bwa-mem2.lto
 
 # Print the effective mimalloc setting. Used by CI and humans.
 print-mimalloc-config:
