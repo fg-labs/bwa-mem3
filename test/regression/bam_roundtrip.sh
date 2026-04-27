@@ -22,7 +22,7 @@ samtools quickcheck bwamem2.bam
 # grep -c exits 1 on zero matches, which would abort the script under set -e
 # before we can report a real "0 vs 0" result. Use wc -l on the filtered
 # stream instead.
-sam_records=$(grep -v '^@' bwamem2.sam | wc -l)
+sam_records=$(grep -v '^@' bwamem2.sam | wc -l | tr -d ' ')
 bam_records=$(samtools view -c bwamem2.bam)
 if [ "$sam_records" != "$bam_records" ]; then
     echo "FAIL: SAM ($sam_records) vs --bam=6 BAM ($bam_records) record count mismatch"
