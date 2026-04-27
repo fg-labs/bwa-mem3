@@ -49,6 +49,7 @@ int usage()
     fprintf(stderr, "  index         create index (add --meth to build a bwameth-style doubled c2t reference)\n");
     fprintf(stderr, "  mem           alignment (add --meth for bisulfite-seq: inline c2t + BAM output)\n");
     fprintf(stderr, "  version       print version number\n");
+    fprintf(stderr, "Run `bwa-mem2 <command> --help` for command-specific options.\n");
     return 1;
 }
 
@@ -78,6 +79,11 @@ int main(int argc, char* argv[])
     int ret = -1;
     if (argc < 2) return usage();
 
+    if (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
+        usage();
+        return 0;
+    }
+
     if (strcmp(argv[1], "index") == 0)
     {
          uint64_t tim = __rdtsc();
@@ -87,6 +93,43 @@ int main(int argc, char* argv[])
     }
     else if (strcmp(argv[1], "mem") == 0)
     {
+        // Short-circuit `mem --help` so we skip the AVX/SA banner and the
+        // post-run profiling trailer (printed below when ret==0). Skip
+        // tokens that are the value of an option that takes an argument
+        // -- otherwise `mem -R --help ...`, `mem -o --help ...`, or
+        // `mem --set-as-failed --help ...` would treat the option's
+        // value as a help request and suppress the banner. Keep the
+        // short-option string and long-option list in sync with the
+        // optstring and long_opts table in fastmap.cpp::main_mem.
+        static const char *const MEM_SHORT_OPTS_WITH_ARG =
+            "kcvsrtRABOEUwLdTQDmINWxGhyKXHofz";
+        static const char *const MEM_LONG_OPTS_WITH_ARG[] = {
+            "--set-as-failed", "--supp-rep-hard-cap", NULL,
+        };
+        for (int i = 2; i < argc; ++i) {
+            const char *t = argv[i];
+            if (strcmp(t, "--") == 0) break;
+            if (strcmp(t, "--help") == 0) return main_mem(argc-1, argv+1);
+            // Long option (no `=`): next argv token is its value.
+            int matched_long = 0;
+            for (int j = 0; MEM_LONG_OPTS_WITH_ARG[j]; ++j) {
+                if (strcmp(t, MEM_LONG_OPTS_WITH_ARG[j]) == 0) {
+                    matched_long = 1; break;
+                }
+            }
+            if (matched_long) { ++i; continue; }
+            // Short-option bundle `-abc[value]`: walk chars; the first
+            // arg-taking option consumes the rest of the bundle (if any)
+            // or the next argv token (if the bundle ends at it).
+            if (t[0] != '-' || t[1] == '\0' || t[1] == '-') continue;
+            for (const char *p = t + 1; *p; ++p) {
+                if (strchr(MEM_SHORT_OPTS_WITH_ARG, *p)) {
+                    if (*(p + 1) == '\0') ++i;
+                    break;
+                }
+            }
+        }
+
         tprof[MEM][0] = __rdtsc();
         kstring_t pg = {0,0,0};
         extern char *bwa_pg;

@@ -877,6 +877,8 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "                 with >=INT genome occurrences (i.e. the supp region is repetitive on its\n");
     fprintf(stderr, "                 own). 0 disables (default). Typical values 5-20; lower = more aggressive.\n");
     fprintf(stderr, "                 Primary MAPQ is unaffected.\n");
+    fprintf(stderr, "Help:\n");
+    fprintf(stderr, "   --help        print this help message and exit\n");
     fprintf(stderr, "Note: Please read the man page for detailed description of the command line and options.\n");
 }
 
@@ -921,6 +923,7 @@ int main_mem(int argc, char *argv[])
         OPT_METH_SET_AS_FAILED,
         OPT_METH_NO_CHIMERA,
         OPT_SUPP_REP_HARD_CAP,
+        OPT_HELP,
     };
     static struct option long_opts[] = {
         {"bam",                      optional_argument, 0, OPT_BAM},
@@ -928,6 +931,7 @@ int main_mem(int argc, char *argv[])
         {"set-as-failed",            required_argument, 0, OPT_METH_SET_AS_FAILED},
         {"do-not-penalize-chimeras", no_argument,       0, OPT_METH_NO_CHIMERA},
         {"supp-rep-hard-cap",        required_argument, 0, OPT_SUPP_REP_HARD_CAP},
+        {"help",                     no_argument,       0, OPT_HELP},
         {0, 0, 0, 0}
     };
     while ((c = getopt_long(argc, argv, "51qpaMCSPVYjuk:c:v:s:r:t:R:A:B:O:E:U:w:L:d:T:Q:D:m:I:N:W:x:G:h:y:K:X:H:o:f:z:",
@@ -1080,6 +1084,14 @@ int main_mem(int argc, char *argv[])
                 return 1;
             }
             opt->supp_rep_hard_cap = (int)v;
+        }
+        else if (c == OPT_HELP) {
+            usage(opt);
+            free(opt);
+            free(hdr_line);
+            free(rg_line);
+            if (out_opened) fclose(aux.fp);
+            return 0;
         }
         else if (c == 'I')
         {

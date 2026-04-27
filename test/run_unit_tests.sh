@@ -85,6 +85,12 @@ ok "xeonbsw ($LINES pair scores emitted)"
 "$HERE/pg_cl_escape_test.sh" "$BWAMEM2" "$FIXTURES" || fail "pg_cl_escape_test failed"
 ok "pg_cl_escape_test"
 
+# --- help_prescan_test ----------------------------------------------------
+# `mem --help` pre-scan must not match `--help` when it is the value of
+# an option that takes an argument (-R, -o, --set-as-failed, ...).
+"$HERE/help_prescan_test.sh" "$BWAMEM2" "$FIXTURES" || fail "help_prescan_test failed"
+ok "help_prescan_test"
+
 # --- smem_lockstep_parity_test --------------------------------------------
 OUT="$(cd "$HERE" && ./smem_lockstep_parity_test "$FIXTURES/phix.fa" 2>&1)"
 CASES_PASSED="$(echo "$OUT" | sed -nE 's/^([0-9]+) \/ ([0-9]+) cases passed$/\1/p')"

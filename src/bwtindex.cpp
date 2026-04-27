@@ -172,6 +172,22 @@ static int64_t parse_memory_spec(const char *s)
     return v;
 }
 
+static void index_usage(void)
+{
+	fprintf(stderr, "Usage: bwa-mem2 index [-p prefix] [-t N] [--max-memory SIZE] [--tmp-dir PATH] [--meth] <in.fasta>\n");
+	fprintf(stderr, "\n"
+	        "  -p STR             output prefix (default: <in.fasta>)\n"
+	        "  -t INT             worker threads [auto: detected cores, cgroup-aware]\n"
+	        "  --max-memory SIZE  peak memory budget; SIZE accepts a G/M/K suffix\n"
+	        "                     (case-insensitive) or bare bytes\n"
+	        "                     [auto: min(50%% of RAM, 32G), cgroup-aware]\n"
+	        "  --tmp-dir PATH     scratch directory [$TMPDIR]\n"
+	        "  --meth             build a bwameth-style doubled c2t reference + FMI.\n"
+	        "                     Writes <in.fasta>.bwameth.c2t and the FMI alongside it.\n"
+	        "                     Use with `bwa-mem2 mem --meth <in.fasta> R1.fq [R2.fq]`.\n"
+	        "  -h, --help         print this help message and exit\n");
+}
+
 int bwa_index(int argc, char *argv[]) // the "index" command
 {
 	int c;
@@ -184,9 +200,10 @@ int bwa_index(int argc, char *argv[]) // the "index" command
 		{"max-memory", required_argument, 0, 1001},
 		{"tmp-dir",    required_argument, 0, 1002},
 		{"threads",    required_argument, 0, 't'},
+		{"help",       no_argument,       0, 'h'},
 		{0, 0, 0, 0}
 	};
-	while ((c = getopt_long(argc, argv, "p:t:", long_opts, NULL)) >= 0) {
+	while ((c = getopt_long(argc, argv, "p:t:h", long_opts, NULL)) >= 0) {
 		if (c == 'p') prefix = optarg;
 		else if (c == 't') {
 			// Mirror parse_memory_spec's strict strtol parsing: atoi
@@ -211,21 +228,16 @@ int bwa_index(int argc, char *argv[]) // the "index" command
 			user_max_memory = mem;
 		} else if (c == 1002) {
 			setenv("BWA_INDEX_TMPDIR", optarg, 1);
+		} else if (c == 'h') {
+			index_usage();
+			return 0;
 		} else {
 			return 1;
 		}
 	}
 
 	if (optind + 1 > argc) {
-		fprintf(stderr, "Usage: bwa-mem2 index [-p prefix] [-t N] [--max-memory G] [--tmp-dir PATH] [--meth] <in.fasta>\n");
-		fprintf(stderr, "\n"
-		        "  -p STR          output prefix (default: <in.fasta>)\n"
-		        "  -t INT          worker threads [auto: detected cores, cgroup-aware]\n"
-		        "  --max-memory G  peak memory budget [auto: min(50%% of RAM, 32G), cgroup-aware]\n"
-		        "  --tmp-dir PATH  scratch directory [$TMPDIR]\n"
-		        "  --meth          build a bwameth-style doubled c2t reference + FMI.\n"
-		        "                  Writes <in.fasta>.bwameth.c2t and the FMI alongside it.\n"
-		        "                  Use with `bwa-mem2 mem --meth <in.fasta> R1.fq [R2.fq]`.\n");
+		index_usage();
 		return 1;
 	}
 
