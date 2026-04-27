@@ -63,6 +63,13 @@ static inline void build_pmat16(int8_t out[16],
     for (int i = 4; i < 16; i++) out[i] = w_ambig;
 }
 
+// Defensive: numThreads must be ≥ 1 — _mm_malloc(0, 64) is implementation-
+// defined and a 0-byte slab would silently OOM downstream writes. Wrappers
+// fan out to constructors and per-batch SoA setup; clamping centrally keeps
+// every entry point in agreement.
+template <typename T>
+static inline T effective_threads(T n) { return n < 1 ? T(1) : n; }
+
 //-----------------------------------------------------------------------------------
 // constructor
 BandedPairWiseSW::BandedPairWiseSW(const int o_del, const int e_del, const int o_ins,
@@ -111,11 +118,7 @@ BandedPairWiseSW::BandedPairWiseSW(const int o_del, const int e_del, const int o
                   "8-bit DP partition not a multiple of 64B; tune MAX_SEQ_LEN8 / SIMD_WIDTH8");
     static_assert((MAX_SEQ_LEN16 * SIMD_WIDTH16 * sizeof(int16_t)) % 64 == 0,
                   "16-bit DP partition not a multiple of 64B; tune MAX_SEQ_LEN16 / SIMD_WIDTH16");
-    // Defensive: numThreads must be ≥ 1 — _mm_malloc(0, 64) is
-    // implementation-defined, and a 0-byte slab would silently OOM downstream
-    // writes. Clamp instead of asserting so a misconfigured caller still
-    // gets a usable (single-thread) instance.
-    if (numThreads < 1) numThreads = 1;
+    numThreads = effective_threads(numThreads);
     size_t sz8  = (size_t)MAX_SEQ_LEN8  * SIMD_WIDTH8  * numThreads * sizeof(int8_t);
     size_t sz16 = (size_t)MAX_SEQ_LEN16 * SIMD_WIDTH16 * numThreads * sizeof(int16_t);
     size_t total = 4 * sz8 + 4 * sz16;
@@ -542,9 +545,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                                                   uint16_t numThreads,
                                                   int32_t w)
 {
-    // Mirror the constructor's numThreads<1 clamp so a misconfigured caller
-    // gets sized SoA buffers instead of zero-byte allocations.
-    if (numThreads < 1) numThreads = 1;
+    numThreads = effective_threads(numThreads);
     int64_t st1, st2, st3, st4, st5;
 #if RDT
     st1 = ___rdtsc();
@@ -600,6 +601,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
         }
     }
     _mm_free(hist);
+    _mm_free(tempArray);
 #endif
 
 #if RDT
@@ -1269,8 +1271,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
                                                    uint16_t numThreads,
                                                    int32_t w)
 {
-    // Mirror the constructor's numThreads<1 clamp.
-    if (numThreads < 1) numThreads = 1;
+    numThreads = effective_threads(numThreads);
     int64_t st1, st2, st3, st4, st5;
 #if RDT
     st1 = ___rdtsc();
@@ -1322,7 +1323,9 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
             sortPairsLen(pairArray + first, last - first, myTempArray, myHist, myHistb);
         }
     }
+    _mm_free(histb);
     _mm_free(hist);
+    _mm_free(tempArray);
 #endif
 
 #if RDT 
@@ -2189,8 +2192,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                                                   uint16_t numThreads,
                                                   int32_t w)
 {
-    // Mirror the constructor's numThreads<1 clamp.
-    if (numThreads < 1) numThreads = 1;
+    numThreads = effective_threads(numThreads);
     int64_t st1, st2, st3, st4, st5;
 #if RDT
     st1 = ___rdtsc();
@@ -2240,7 +2242,9 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
             sortPairsLen(pairArray + first, last - first, myTempArray, myHist, myHistb);
         }
     }
+    _mm_free(histb);
     _mm_free(hist);
+    _mm_free(tempArray);
 #endif
     
 #if RDT
@@ -2904,8 +2908,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
                                                    uint16_t numThreads,
                                                    int32_t w)
 {
-    // Mirror the constructor's numThreads<1 clamp.
-    if (numThreads < 1) numThreads = 1;
+    numThreads = effective_threads(numThreads);
     int64_t st1, st2, st3, st4, st5;
 #if RDT
     st1 = ___rdtsc();
@@ -2955,6 +2958,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
         }
     }
     _mm_free(hist);
+    _mm_free(tempArray);
 #endif
     
 #if RDT
@@ -3756,8 +3760,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
                                                    uint16_t numThreads,
                                                    int32_t w)
 {
-    // Mirror the constructor's numThreads<1 clamp.
-    if (numThreads < 1) numThreads = 1;
+    numThreads = effective_threads(numThreads);
 #if RDT
     int64_t st1, st2, st3, st4, st5;
     st1 = ___rdtsc();
@@ -3809,7 +3812,9 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
             sortPairsLen(pairArray + first, last - first, myTempArray, myHist, myHistb);
         }
     }
+    _mm_free(histb);
     _mm_free(hist);
+    _mm_free(tempArray);
 #endif
 
 #if RDT
@@ -4538,8 +4543,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                                                   uint16_t numThreads,
                                                   int32_t w)
 {
-    // Mirror the constructor's numThreads<1 clamp.
-    if (numThreads < 1) numThreads = 1;
+    numThreads = effective_threads(numThreads);
 #if RDT
     int64_t st1, st2, st3, st4, st5;
     st1 = ___rdtsc();
@@ -4591,7 +4595,9 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
             sortPairsLen(pairArray + first, last - first, myTempArray, myHist, myHistb);
         }
     }
+    _mm_free(histb);
     _mm_free(hist);
+    _mm_free(tempArray);
 #endif
 
 #if RDT

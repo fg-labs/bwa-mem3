@@ -32,9 +32,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#if defined(__linux__)
-#include <sys/mman.h>
-#endif
+#include "bwa_madvise.h"
 #if NUMA_ENABLED
 #include <numa.h>
 #endif
@@ -1257,17 +1255,11 @@ int main_mem(int argc, char *argv[])
     ref_string = (uint8_t*) _mm_malloc(rlen, 64);
     assert_not_null(ref_string, rlen, rlen);
     aux.ref_string = ref_string;
-#if defined(__linux__) && defined(MADV_HUGEPAGE)
     /* Pack table is ~800 MB for hg38 — accessed at every candidate alignment
-     * for reference fetch. Request transparent hugepages to reduce dTLB
-     * pressure and tame 4-KB-page demotion spikes that cause bimodal wall-
-     * clock variance on large indices. (The duplicate hint in
-     * bwa_idx_load_from_disk targets the legacy disk-load path that
-     * bwa-mem2 mem doesn't use — `ref_string` here is the live runtime
-     * buffer.) */
-    if (ref_string != NULL && rlen > 0)
-        (void)madvise(ref_string, rlen, MADV_HUGEPAGE);
-#endif
+     * for reference fetch. THP hint reduces dTLB pressure and tames the
+     * 4-KB-page demotion spikes that produce bimodal wall-clock variance
+     * on large indices. */
+    bwamem_madv_hugepage(ref_string, rlen);
     rewind(fr);
 
     /* Reading ref. sequence */

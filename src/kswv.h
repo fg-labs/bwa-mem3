@@ -46,14 +46,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
     #endif
 #endif
 
-#ifdef __GNUC__
-#define LIKELY(x) __builtin_expect((x),1)
-#define UNLIKELY(x) __builtin_expect((x),0)
-#else
-#define LIKELY(x) (x)
-#define UNLIKELY(x) (x)
-#endif
-
+/* LIKELY/UNLIKELY come from macro.h (included above). */
 
 #define MAX_SEQ_LEN_REF_SAM 2048
 #define MAX_SEQ_LEN_QER_SAM 512

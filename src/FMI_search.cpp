@@ -32,33 +32,13 @@ Authors: Sanchit Misra <sanchit.misra@intel.com>; Vasimuddin Md <vasimuddin.md@i
 #include <stdlib.h>
 #include <inttypes.h>
 #include <climits>
-#if defined(__linux__)
-#include <sys/mman.h>
-#endif
+#include "bwa_madvise.h"
 #include "FMI_search.h"
 #include "memcpy_bwamem.h"
 #include "profiling.h"
 #include "libsais_build.h"
 
 #include "safestringlib.h"
-
-// Request transparent huge pages for large index buffers. The bwa-mem2
-// hg38 index is ~17 GB split across cp_occ (~6 GB), sa_ms_byte (~2 GB),
-// sa_ls_word (~8 GB). With 4 KB pages the dTLB can cover ~256 KB — a
-// rounding error against 17 GB. Linux THP promotes adjacent 4 KB pages
-// to 2 MB pages (coverage ~128 MB per 64-entry TLB), dramatically
-// reducing TLB pressure in the SMEM Occ-lookup and SA expansion loops.
-// Without this advice, THP promotion is opportunistic and can be demoted
-// under memory pressure → bimodal per-run wall-clock as THP compaction
-// toggles.
-static inline void bwamem_madv_hugepage(void *p, size_t sz)
-{
-#if defined(__linux__) && defined(MADV_HUGEPAGE)
-    if (p != NULL && sz > 0) (void)madvise(p, sz, MADV_HUGEPAGE);
-#else
-    (void)p; (void)sz;
-#endif
-}
 
 FMI_search::FMI_search(const char *fname)
 {
@@ -1065,7 +1045,7 @@ void FMI_search::getSMEMs(uint8_t *enc_qdb,
         int tid = 0; //omp_get_thread_num();   // removed omp
         numTotalSmem[tid] = 0;
         SMEM *myPrevArray = prevArray + tid * readlength;
-        SMEM *myCurrArray = prevArray + tid * readlength;
+        SMEM *myCurrArray = currArray + tid * readlength;
 
         int32_t perThreadQuota = (numReads + (nthreads - 1)) / nthreads;
         int32_t first = tid * perThreadQuota;

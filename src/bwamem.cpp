@@ -2615,16 +2615,6 @@ static inline int ungapped_analyze(const uint8_t *qs, const uint8_t *rs, int N,
     return FP_STATUS_HIT;
 }
 
-// max tight_band across a pair_ar batch. 0 means "no pair had a
-// useful bound"; caller falls back to opt->w.
-static inline int sp_max_tight_band(const SeqPair *pair_ar, int nump)
-{
-    int m = 0;
-    for (int l = 0; l < nump; l++) {
-        if (pair_ar[l].tight_band > m) m = pair_ar[l].tight_band;
-    }
-    return m;
-}
 
 void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                                    const uint8_t *pac, bseq1_t *seq_, int nseq,
@@ -3246,10 +3236,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
     // heuristic exits (a->score == prev / max_off < 3w/4) can then fire
     // on a suboptimal alignment found within the narrow band, breaking
     // chr22 parity.
-    int max_tb = sp_max_tight_band(pair_ar, nump);
     int init_w = opt->w;
-    (void)max_tb;
-    tprof[UGP_L_DISP_NARROW][tid] += (init_w < opt->w);
 
     // scalar
     for ( i=0; i<MAX_BAND_TRY; i++)
@@ -3318,10 +3305,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
     pair_ar_aux = seqPairArrayAux;
 
     nump = numPairsLeft16;
-    max_tb = sp_max_tight_band(pair_ar, nump);
     init_w = opt->w;
-    (void)max_tb;
-    tprof[UGP_L_DISP_NARROW][tid] += (init_w < opt->w);
     for ( i=0; i<MAX_BAND_TRY; i++)
     {
         int32_t w = init_w << i;
@@ -3392,10 +3376,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
     pair_ar_aux = seqPairArrayAux;
 
     nump = numPairsLeft128;
-    max_tb = sp_max_tight_band(pair_ar, nump);
     init_w = opt->w;
-    (void)max_tb;
-    tprof[UGP_L_DISP_NARROW][tid] += (init_w < opt->w);
     for ( i=0; i<MAX_BAND_TRY; i++)
     {
         int32_t w = init_w << i;
@@ -3606,10 +3587,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
     pair_ar = seqPairArrayRight128 + numPairsRight128 + numPairsRight16;
     pair_ar_aux = seqPairArrayAux;
     nump = numPairsRight1;
-    max_tb = sp_max_tight_band(pair_ar, nump);
     init_w = opt->w;
-    (void)max_tb;
-    tprof[UGP_R_DISP_NARROW][tid] += (init_w < opt->w);
 
     for ( i=0; i<MAX_BAND_TRY; i++)
     {
@@ -3673,10 +3651,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
     pair_ar = seqPairArrayRight128 + numPairsRight128;
     pair_ar_aux = seqPairArrayAux;
     nump = numPairsRight16;
-    max_tb = sp_max_tight_band(pair_ar, nump);
     init_w = opt->w;
-    (void)max_tb;
-    tprof[UGP_R_DISP_NARROW][tid] += (init_w < opt->w);
 
     for ( i=0; i<MAX_BAND_TRY; i++)
     {
@@ -3749,10 +3724,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
     pair_ar = seqPairArrayRight128;
     pair_ar_aux = seqPairArrayAux;
     nump = numPairsRight128;
-    max_tb = sp_max_tight_band(pair_ar, nump);
     init_w = opt->w;
-    (void)max_tb;
-    tprof[UGP_R_DISP_NARROW][tid] += (init_w < opt->w);
 
     for ( i=0; i<MAX_BAND_TRY; i++)
     {
