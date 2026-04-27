@@ -1,14 +1,39 @@
 name: proto-neon-kswv
 
-# Correctness + perf harness for wiring NEON kswv into the mate-rescue path
-# on ARM. Runs on the proto/neon-kswv-* branches only. Not gated on main.
+# Correctness + perf harness for the kswv batched mate-rescue port. Runs on
+# proto/* branches and PRs to fg-main.
 #
-# Jobs:
-#   selftest-perf-arm  — build port + control, run bwa_mem2_tests_unit
-#                         --test-suite="unit/kswv", run mem on dwgsim/chr17 with
-#                         both builds, report speedup.
-#   reference-x86      — build AVX-512 reference, run mem, produce reference SAM.
-#   sam-identity       — diff md5 of sorted SAM from arm (port build) vs x86.
+# Job graph (fan-out / fan-in):
+#
+#   prepare ──┬─→ run-mem-arm-port ─┐
+#             ├─→ run-mem-arm-ctrl ─┤
+#             ├─→ run-mem-x86-port ─┼── report
+#             └─→ run-mem-x86-ctrl ─┘
+#
+#   kswv-arm     (unit kswv test + ASan zero-rows test, off the critical path)
+#   kswv-x86     (unit kswv test + ASan zero-rows test, off the critical path)
+#
+# Stages:
+#   prepare        — install holodeck, fetch chr17, simulate reads. The ref
+#                    and reads are cached across runs; reads are also
+#                    uploaded as a small artifact so downstream jobs do not
+#                    need the holodeck binary themselves.
+#   run-mem-*      — build bwa-mem2 (ccache + full-binary cache), restore
+#                    the chr17 FM-index (or build it on miss), run mem
+#                    N_REPS times with BAM-1 output, upload timings + (port
+#                    only) BAM.
+#   report         — fan-in: render port-vs-control perf tables per arch
+#                    and md5 the port BAM body across arches for SAM
+#                    identity.
+#   kswv-*         — independent unit tests (doctest framework, suite
+#                    "unit/kswv") + ASan zero-rows regression; share the
+#                    per-arch ccache so libbwa rebuilds (incl. the ASan
+#                    rebuild) are cheap.
+#
+# Port-vs-control timings come from different runners under this design,
+# so the speedup signal carries some inter-runner variance on top of the
+# usual rep-to-rep noise. Median of N_REPS=3 holds this within a few
+# percent in practice; bump N_REPS if a particular comparison looks flaky.
 
 on:
   push:
@@ -25,22 +50,146 @@ on:
       - 'test/kswv_nrow_zero_test.cpp'
       - 'test/framework/**'
       - 'test/unit/**'
+      - 'test/Makefile'
       - '.github/workflows/proto-neon-kswv.yml'
       - 'Makefile'
-      - 'test/Makefile'
   workflow_dispatch:
 
 env:
   CHR17_URL: "https://hgdownload.soe.ucsc.edu/goldenpath/hg38/chromosomes/chr17.fa.gz"
   CHR17_SHA256: "9acaede8d9b0a190489b49ebf38063bc69897c0d5f125c7549a6f7ee91a0b3c0"  # UCSC hg38 chr17.fa.gz
-  DWGSIM_REF: "dwgsim.0.1.16"  # pin for reproducible simulated reads
-  N_PAIRS: "500000"  # matches the 500k PE workload used for local A/B
+  HOLODECK_VERSION: "0.2.0"
+  SIM_COVERAGE: "1"           # ~415K PE pairs on chr17 at read-length 100
+  SIM_READ_LENGTH: "100"
+  SIM_SEED: "42"
   N_REPS: "3"
 
 jobs:
-  selftest-perf-arm:
-    name: ARM selftest + port/control perf
-    runs-on: ubuntu-24.04-arm
+  prepare:
+    name: prepare (holodeck + chr17 + reads)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install apt dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends curl ca-certificates samtools
+
+      - name: Cache holodeck binary
+        id: cache-holodeck
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cargo/bin/holodeck
+          key: holodeck-${{ runner.arch }}-${{ env.HOLODECK_VERSION }}
+
+      - name: Install holodeck via cargo
+        if: steps.cache-holodeck.outputs.cache-hit != 'true'
+        run: |
+          # ubuntu-24.04 ships rustup; ensure stable >= 1.94 (holodeck MSRV).
+          # `-q` is no longer accepted on `toolchain install` by recent rustup
+          # parsers; pass it as a top-level flag instead.
+          rustup -q toolchain install stable --profile minimal
+          rustup default stable
+          cargo install --locked --version "$HOLODECK_VERSION" holodeck
+
+      - name: Add cargo bin to PATH
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Cache chr17 reference
+        id: cache-chr17
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: /tmp/ci-data/chr17.fa
+          key: chr17-${{ env.CHR17_SHA256 }}
+
+      - name: Download chr17 if cache miss
+        if: steps.cache-chr17.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p /tmp/ci-data
+          curl -sL "$CHR17_URL" -o /tmp/ci-data/chr17.fa.gz
+          got_sha256="$(sha256sum /tmp/ci-data/chr17.fa.gz | awk '{print $1}')"
+          if [ "$got_sha256" != "$CHR17_SHA256" ]; then
+            echo "chr17.fa.gz sha256 mismatch: expected $CHR17_SHA256, got $got_sha256"
+            exit 1
+          fi
+          gunzip /tmp/ci-data/chr17.fa.gz
+
+      - name: Cache simulated reads (r1)
+        id: cache-reads-r1
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: /tmp/ci-data/reads.r1.fastq.gz
+          key: reads-holodeck-${{ env.HOLODECK_VERSION }}-${{ env.CHR17_SHA256 }}-cov${{ env.SIM_COVERAGE }}-l${{ env.SIM_READ_LENGTH }}-seed${{ env.SIM_SEED }}-r1
+
+      - name: Cache simulated reads (r2)
+        id: cache-reads-r2
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: /tmp/ci-data/reads.r2.fastq.gz
+          key: reads-holodeck-${{ env.HOLODECK_VERSION }}-${{ env.CHR17_SHA256 }}-cov${{ env.SIM_COVERAGE }}-l${{ env.SIM_READ_LENGTH }}-seed${{ env.SIM_SEED }}-r2
+
+      - name: Index chr17 for holodeck (.fai)
+        if: steps.cache-reads-r1.outputs.cache-hit != 'true' || steps.cache-reads-r2.outputs.cache-hit != 'true'
+        run: samtools faidx /tmp/ci-data/chr17.fa
+
+      - name: Simulate reads with holodeck
+        if: steps.cache-reads-r1.outputs.cache-hit != 'true' || steps.cache-reads-r2.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p /tmp/ci-data
+          holodeck simulate \
+            -r /tmp/ci-data/chr17.fa \
+            -o /tmp/ci-data/reads \
+            --coverage "$SIM_COVERAGE" \
+            --read-length "$SIM_READ_LENGTH" \
+            --seed "$SIM_SEED" \
+            -t 2
+
+      - name: Upload data artifact (reads + ref)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          # Bundles ref + reads so run-mem jobs depend on a single artifact
+          # instead of also restoring the chr17 cache. The cache still helps
+          # this prepare job skip the curl+gunzip on subsequent runs.
+          name: data
+          path: |
+            /tmp/ci-data/chr17.fa
+            /tmp/ci-data/reads.r1.fastq.gz
+            /tmp/ci-data/reads.r2.fastq.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  run-mem:
+    name: ${{ matrix.label }}
+    needs: prepare
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: "run-mem-arm-port"
+            runs-on: ubuntu-24.04-arm
+            arch: arm
+            build_flags: ""
+            binary_name: bwa-mem2.arm64
+            flags_slug: port
+          - label: "run-mem-arm-ctrl"
+            runs-on: ubuntu-24.04-arm
+            arch: arm
+            build_flags: "DISABLE_BATCHED_MATESW=1"
+            binary_name: bwa-mem2.arm64
+            flags_slug: control
+          - label: "run-mem-x86-port"
+            runs-on: ubuntu-24.04
+            arch: x86
+            build_flags: ""
+            binary_name: bwa-mem2  # x86 multi-arch dispatcher binary
+            flags_slug: port
+          - label: "run-mem-x86-ctrl"
+            runs-on: ubuntu-24.04
+            arch: x86
+            build_flags: "DISABLE_BATCHED_MATESW=1"
+            binary_name: bwa-mem2
+            flags_slug: control
+    env:
+      CCACHE_DIR: /home/runner/.ccache
+      CCACHE_MAXSIZE: "500M"
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -48,206 +197,179 @@ jobs:
           submodules: recursive
 
       - name: Install apt dependencies
-        uses: awalsh128/cache-apt-pkgs-action@acb598e5ddbc6f68a970c5da0688d2f3a9f04d05 # v1.6.0
-        with:
-          packages: zlib1g-dev samtools
-          version: 1.0
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev samtools libomp-dev ccache
 
-      - name: Cache dwgsim binary
-        id: cache-dwgsim
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: /tmp/dwgsim-src/dwgsim
-          key: dwgsim-${{ runner.os }}-${{ runner.arch }}-${{ env.DWGSIM_REF }}
-
-      - name: Build dwgsim
-        if: steps.cache-dwgsim.outputs.cache-hit != 'true'
+      - name: Detect x86 ISA (avx2 / avx512bw)
+        if: matrix.arch == 'x86'
         run: |
-          git clone https://github.com/nh13/DWGSIM.git /tmp/dwgsim-src
-          git -C /tmp/dwgsim-src checkout --detach "$DWGSIM_REF"
-          git -C /tmp/dwgsim-src submodule update --init --recursive
-          make -C /tmp/dwgsim-src -j"$(nproc)"
-
-      - name: Cache chr17 reference
-        id: cache-chr17
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: /tmp/ci-ref/chr17.fa
-          key: chr17-${{ env.CHR17_SHA256 }}
-
-      - name: Download chr17 if cache miss
-        if: steps.cache-chr17.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p /tmp/ci-ref
-          curl -sL "$CHR17_URL" -o /tmp/ci-ref/chr17.fa.gz
-          got_sha256="$(sha256sum /tmp/ci-ref/chr17.fa.gz | awk '{print $1}')"
-          if [ "$got_sha256" != "$CHR17_SHA256" ]; then
-            echo "chr17.fa.gz sha256 mismatch: expected $CHR17_SHA256, got $got_sha256"
-            exit 1
+          # AVX-512BW is required for the x86 batched mate-rescue path (gated
+          # by __AVX512BW__ in bwamem.cpp:1255 and bwamem_pair.cpp:657). Free
+          # GH runners typically do not expose it. When it is missing we fall
+          # back to AVX2, which takes the same scalar mem_sam_pe path as ARM
+          # — so the cross-arch SAM identity check is then testing
+          # scalar-vs-scalar, not batched-vs-scalar.
+          if grep -q avx512bw /proc/cpuinfo; then
+            echo "MAKE_ARCH=avx512bw" >> "$GITHUB_ENV"
+          else
+            echo "::warning::AVX-512BW not available on this runner; falling back to AVX2"
+            echo "MAKE_ARCH=avx2" >> "$GITHUB_ENV"
           fi
-          gunzip /tmp/ci-ref/chr17.fa.gz
 
-      # Cache key ties built binaries to any src, ext, Makefile, or
-      # workflow-file change so flag tweaks here (CXX, arch, etc.) bust
-      # the cache even when src/ext/Makefile are untouched.
-      - name: Cache port build artifacts
-        id: cache-port
+      - name: Set arm make arch
+        if: matrix.arch == 'arm'
+        run: echo "MAKE_ARCH=arm64" >> "$GITHUB_ENV"
+
+      - name: Cache ccache
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
-          path: |
-            bwa-mem2.port
-            libbwa.port.a
-          key: arm-port-${{ hashFiles('src/**', 'ext/**', 'Makefile', '.github/workflows/proto-neon-kswv.yml') }}
+          path: ${{ env.CCACHE_DIR }}
+          # Per-arch ccache. Build flags don't need to participate because
+          # ccache hashes preprocessor defines (e.g. -DDISABLE_BATCHED_MATESW)
+          # via CXXFLAGS. Restore from any prior arch ccache entry.
+          key: ccache-${{ runner.arch }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ runner.arch }}-
 
-      - name: Build port (gates widened; no-op on this branch until the port lands)
-        if: steps.cache-port.outputs.cache-hit != 'true'
-        run: |
-          make clean
-          make -j"$(nproc)" CXX=g++
-          mv bwa-mem2.arm64 bwa-mem2.port
-          cp libbwa.a libbwa.port.a
-
-      - name: Cache control build artifacts
-        id: cache-control
+      - name: Cache prebuilt bwa-mem2 binary
+        id: cache-binary
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
-          path: bwa-mem2.control
-          key: arm-control-${{ hashFiles('src/**', 'ext/**', 'Makefile', '.github/workflows/proto-neon-kswv.yml') }}
+          path: ${{ matrix.binary_name }}
+          # Exact-hit only (no restore-keys): a binary from a different SHA
+          # would not match the source we just checked out. ccache covers
+          # the cold-build case when this misses.
+          key: bwa-mem2-${{ runner.arch }}-${{ matrix.flags_slug }}-${{ env.MAKE_ARCH }}-${{ github.sha }}
 
-      - name: Build control (DISABLE_BATCHED_MATESW=1)
-        if: steps.cache-control.outputs.cache-hit != 'true'
+      - name: Build bwa-mem2 (ccache wrapping g++)
+        if: steps.cache-binary.outputs.cache-hit != 'true'
         run: |
-          make clean
-          make -j"$(nproc)" DISABLE_BATCHED_MATESW=1 CXX=g++
-          mv bwa-mem2.arm64 bwa-mem2.control
+          # Pair CC with CXX explicitly: the Makefile only auto-pairs bare
+          # compiler names (g++, clang++), not wrapped invocations like
+          # `ccache g++` — see Makefile lines 36–58.
+          # Pass the `arm64` target explicitly on ARM rather than relying on
+          # the implicit `myall:arm64` default-goal dispatch (set up
+          # conditionally in the Makefile based on $(IS_ARM) + empty $(arch)).
+          # Makes the produced artifact name (bwa-mem2.arm64) unambiguous.
+          ccache --zero-stats >/dev/null
+          if [ "${{ matrix.arch }}" = "arm" ]; then
+            make -j"$(nproc)" CXX="ccache g++" CC="ccache gcc" ${{ matrix.build_flags }} arm64
+          else
+            make -j"$(nproc)" arch="$MAKE_ARCH" CXX="ccache g++" CC="ccache gcc" ${{ matrix.build_flags }}
+          fi
+          ccache --show-stats | tee -a "$GITHUB_STEP_SUMMARY"
 
-      - name: Build kswv unit test
-        # Route through the parent `test-binaries` target — same as the
-        # x86 job — so any future changes to ARCH_FLAGS_FROM_PARENT plumbing
-        # apply uniformly to both arches.
-        run: |
-          # Use the 'port' libbwa; the kswv unit test only exercises kswv regardless.
-          cp libbwa.port.a libbwa.a
-          # Port/control build caches restore only the bwa-mem2 binaries +
-          # libbwa.port.a; ext/safestringlib/libsafestring.a is not in either
-          # cache, so when both caches hit (no `make` runs) the test link line
-          # — which references it directly — fails to find it. Rebuild it
-          # explicitly so this step works on cache hit and cache miss alike.
-          make ext/safestringlib/libsafestring.a CXX=g++
-          make test-binaries CXX=g++
+      - name: Verify binary
+        run: ls -l ./${{ matrix.binary_name }}
 
-      - name: Run kswv unit test
-        id: selftest
-        run: |
-          mkdir -p /tmp/ci-out
-          # selftest-perf-arm has no matrix, so ${{ strategy.job-index }}
-          # would expand to empty and emit kswv-selftest-.xml. Use a stable
-          # name and upload it alongside selftest.log below.
-          ./test/bwa_mem2_tests_unit --test-suite="unit/kswv" \
-            --reporters=junit \
-            --out=/tmp/ci-out/kswv-selftest-arm.xml \
-            2>&1 | tee /tmp/ci-out/selftest.log
-          status=${PIPESTATUS[0]}
-          echo "selftest_exit=$status" >> "$GITHUB_OUTPUT"
-          tail -25 /tmp/ci-out/selftest.log >> "$GITHUB_STEP_SUMMARY"
-          exit $status
-
-      - name: Build kswv_nrow_zero_test (ASan)
-        # issue 38 / upstream PR 289: all-len1==0 batches used to walk past
-        # the rowMax allocation prefix. Build with asan so the pre-fix write
-        # trips heap-buffer-overflow and fails the job rather than silently
-        # corrupting memory. `make clean` forces libbwa to recompile under
-        # asan instrumentation — the pre-asan objects left by earlier steps
-        # would otherwise satisfy the make graph and run uninstrumented.
-        run: |
-          make clean
-          make ASAN=1 arch=arm64 kswv_nrow_zero_test CXX=g++
-
-      - name: Run kswv_nrow_zero_test
-        run: ./kswv_nrow_zero_test
+      - name: Download data artifact (ref + reads)
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: data
+          path: /tmp/ci-data
 
       - name: Cache chr17 bwa-mem2 index
         id: cache-chr17-index
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
-            /tmp/ci-ref/chr17.fa.0123
-            /tmp/ci-ref/chr17.fa.amb
-            /tmp/ci-ref/chr17.fa.ann
-            /tmp/ci-ref/chr17.fa.bwt.2bit.64
-            /tmp/ci-ref/chr17.fa.pac
+            /tmp/ci-data/chr17.fa.0123
+            /tmp/ci-data/chr17.fa.amb
+            /tmp/ci-data/chr17.fa.ann
+            /tmp/ci-data/chr17.fa.bwt.2bit.64
+            /tmp/ci-data/chr17.fa.pac
+          # Index format is arch-portable; share one cache across arm and x86.
           key: chr17-bwamem2-index-${{ env.CHR17_SHA256 }}
 
       - name: Build chr17 index if cache miss
         if: steps.cache-chr17-index.outputs.cache-hit != 'true'
-        run: ./bwa-mem2.port index /tmp/ci-ref/chr17.fa
+        run: ./${{ matrix.binary_name }} index /tmp/ci-data/chr17.fa
 
-      # Simulated reads are deterministic given seed + dwgsim version +
-      # reference + params. Cache by those so reruns skip the ~55s
-      # dwgsim invocation.
-      - name: Cache simulated reads
-        id: cache-reads
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: |
-            /tmp/ci-reads/reads.bwa.read1.fastq.gz
-            /tmp/ci-reads/reads.bwa.read2.fastq.gz
-          key: reads-chr17-${{ env.CHR17_SHA256 }}-dwgsim-${{ env.DWGSIM_REF }}-N${{ env.N_PAIRS }}-z42-100bp-e0.01-r0.001
-
-      - name: Simulate dwgsim reads
-        if: steps.cache-reads.outputs.cache-hit != 'true'
+      - name: Run mem (BAM-1 output)
         run: |
-          mkdir -p /tmp/ci-reads
-          /tmp/dwgsim-src/dwgsim \
-            -z 42 \
-            -N "$N_PAIRS" -1 100 -2 100 \
-            -e 0.01 -E 0.01 -r 0.001 -R 0 \
-            /tmp/ci-ref/chr17.fa \
-            /tmp/ci-reads/reads
-
-      - name: Run mem (port build)
-        run: |
+          set -o pipefail
           mkdir -p /tmp/ci-out
           for rep in $(seq 1 "$N_REPS"); do
-            /usr/bin/time -v ./bwa-mem2.port mem -t "$(nproc)" \
-              /tmp/ci-ref/chr17.fa \
-              /tmp/ci-reads/reads.bwa.read1.fastq.gz /tmp/ci-reads/reads.bwa.read2.fastq.gz \
-              > /tmp/ci-out/port.rep${rep}.sam \
-              2> /tmp/ci-out/port.rep${rep}.time
+            base="/tmp/ci-out/${{ matrix.flags_slug }}.rep${rep}"
+            /usr/bin/time -v ./${{ matrix.binary_name }} mem -t "$(nproc)" \
+              /tmp/ci-data/chr17.fa \
+              /tmp/ci-data/reads.r1.fastq.gz /tmp/ci-data/reads.r2.fastq.gz \
+              2> "${base}.time" \
+              | samtools view -@ 2 -b -1 -o "${base}.bam" -
           done
 
-      - name: Run mem (control build)
-        run: |
-          for rep in $(seq 1 "$N_REPS"); do
-            /usr/bin/time -v ./bwa-mem2.control mem -t "$(nproc)" \
-              /tmp/ci-ref/chr17.fa \
-              /tmp/ci-reads/reads.bwa.read1.fastq.gz /tmp/ci-reads/reads.bwa.read2.fastq.gz \
-              > /tmp/ci-out/control.rep${rep}.sam \
-              2> /tmp/ci-out/control.rep${rep}.time
-          done
+      - name: Upload timings
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: results-${{ matrix.arch }}-${{ matrix.flags_slug }}-time
+          path: /tmp/ci-out/${{ matrix.flags_slug }}.rep*.time
+          if-no-files-found: error
+          retention-days: 1
 
-      - name: Report speedup
+      - name: Upload port BAM (rep1) for cross-arch identity check
+        if: matrix.flags_slug == 'port'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: results-${{ matrix.arch }}-port-bam
+          path: /tmp/ci-out/port.rep1.bam
+          if-no-files-found: error
+          retention-days: 1
+
+  report:
+    name: report (perf table + cross-arch SAM identity)
+    needs: run-mem
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install apt dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends samtools
+
+      - name: Download all run-mem results
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          path: /tmp/results
+          pattern: results-*
+
+      - name: Render perf tables
         run: |
           extract_elapsed() {
             awk '/Elapsed \(wall clock\) time/ { split($NF, t, ":"); if (length(t)==3) print t[1]*3600+t[2]*60+t[3]; else print t[1]*60+t[2] }' "$1"
           }
-          median3() {
-            awk '{print $1}' "$1" | sort -n | head -2 | tail -1
+          # Generalized median: works for any N_REPS (odd or even). The
+          # header comment encourages bumping N_REPS for noisy comparisons,
+          # so this helper must not assume N=3. Picks the middle element
+          # (index = (N+1)/2, integer-truncated) of the sorted samples,
+          # i.e. the lower middle for even N — same convention as N=3.
+          median() {
+            sort -n "$1" | awk '
+              { a[NR] = $1 }
+              END {
+                if (NR == 0) exit 1
+                print a[int((NR + 1) / 2)]
+              }
+            '
           }
-          {
-            echo "## ARM perf A/B (port vs control, DISABLE_BATCHED_MATESW)"
+
+          report_arch() {
+            arch="$1"
+            port_dir="/tmp/results/results-${arch}-port-time"
+            ctrl_dir="/tmp/results/results-${arch}-control-time"
+            port_elapsed="/tmp/${arch}.port.elapsed"
+            ctrl_elapsed="/tmp/${arch}.ctrl.elapsed"
+            [ -d "$port_dir" ] && [ -d "$ctrl_dir" ] || { echo "missing $arch results"; return 1; }
+            echo "## ${arch} perf A/B (port vs control, DISABLE_BATCHED_MATESW)"
             echo ""
             echo "| rep | port (s) | control (s) |"
             echo "| --- | --------:| -----------:|"
+            : > "$port_elapsed"
+            : > "$ctrl_elapsed"
             for rep in $(seq 1 "$N_REPS"); do
-              p=$(extract_elapsed /tmp/ci-out/port.rep${rep}.time)
-              c=$(extract_elapsed /tmp/ci-out/control.rep${rep}.time)
+              p=$(extract_elapsed "${port_dir}/port.rep${rep}.time")
+              c=$(extract_elapsed "${ctrl_dir}/control.rep${rep}.time")
               echo "| $rep | $p | $c |"
-              echo "$p" >> /tmp/ci-out/port.elapsed
-              echo "$c" >> /tmp/ci-out/control.elapsed
+              echo "$p" >> "$port_elapsed"
+              echo "$c" >> "$ctrl_elapsed"
             done
-            pm=$(median3 /tmp/ci-out/port.elapsed)
-            cm=$(median3 /tmp/ci-out/control.elapsed)
+            pm=$(median "$port_elapsed")
+            cm=$(median "$ctrl_elapsed")
             echo ""
             echo "median port: ${pm}s, median control: ${cm}s"
             if [ -n "$pm" ] && [ -n "$cm" ] && [ "$pm" != "0" ]; then
@@ -255,29 +377,55 @@ jobs:
               pct=$(awk -v p="$pm" -v c="$cm" 'BEGIN { printf "%+.1f%%", 100*(c-p)/c }')
               echo "speedup (control / port): ${speedup}x  (${pct})"
             fi
-          } | tee -a "$GITHUB_STEP_SUMMARY"
+            echo ""
+          }
 
-      - name: Sort + md5 port SAM for identity check
+          { report_arch arm; report_arch x86; } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Cross-arch SAM identity (port-arm vs port-x86)
         run: |
-          samtools sort -@ "$(nproc)" -n /tmp/ci-out/port.rep1.sam -o /tmp/ci-out/port.sorted.bam
-          samtools view /tmp/ci-out/port.sorted.bam | md5sum | awk '{print $1}' > /tmp/ci-out/port.sam.md5
-          echo "ARM port SAM md5: $(cat /tmp/ci-out/port.sam.md5)" >> "$GITHUB_STEP_SUMMARY"
+          arm_bam=/tmp/results/results-arm-port-bam/port.rep1.bam
+          x86_bam=/tmp/results/results-x86-port-bam/port.rep1.bam
+          for f in "$arm_bam" "$x86_bam"; do
+            [ -s "$f" ] || { echo "missing $f"; exit 1; }
+          done
+          # Sort by name to canonicalize multi-thread output order, then md5
+          # the records body (samtools view drops headers by default, which
+          # avoids @PG/@HD differences across builds).
+          samtools sort -n -@ "$(nproc)" -o /tmp/arm.sorted.bam "$arm_bam"
+          samtools sort -n -@ "$(nproc)" -o /tmp/x86.sorted.bam "$x86_bam"
+          arm_md5=$(samtools view /tmp/arm.sorted.bam | md5sum | awk '{print $1}')
+          x86_md5=$(samtools view /tmp/x86.sorted.bam | md5sum | awk '{print $1}')
+          {
+            echo "## Cross-arch SAM identity"
+            echo ""
+            echo "- ARM (port, NEON batched mate-rescue): \`$arm_md5\`"
+            echo "- x86 (port, batched on AVX-512BW / scalar on AVX2): \`$x86_md5\`"
+            echo ""
+            if [ "$arm_md5" = "$x86_md5" ]; then
+              echo "PASS: byte-identical sorted SAM body across arches."
+            else
+              echo "FAIL: SAM md5 differs."
+            fi
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          [ "$arm_md5" = "$x86_md5" ] || exit 1
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: arm-outputs
-          # All under /tmp/ci-out so the archive flattens to bare filenames
-          # rather than preserving a /tmp/... prefix.
-          path: |
-            /tmp/ci-out/port.sam.md5
-            /tmp/ci-out/port.rep1.sam
-            /tmp/ci-out/selftest.log
-            /tmp/ci-out/kswv-selftest-arm.xml
-
-  reference-x86:
-    name: x86 reference SAM (AVX-512)
-    runs-on: ubuntu-24.04
+  kswv:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: "kswv-arm"
+            runs-on: ubuntu-24.04-arm
+            arch: arm
+          - label: "kswv-x86"
+            runs-on: ubuntu-24.04
+            arch: x86
+    env:
+      CCACHE_DIR: /home/runner/.ccache
+      CCACHE_MAXSIZE: "500M"
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -285,261 +433,63 @@ jobs:
           submodules: recursive
 
       - name: Install apt dependencies
-        uses: awalsh128/cache-apt-pkgs-action@acb598e5ddbc6f68a970c5da0688d2f3a9f04d05 # v1.6.0
-        with:
-          packages: zlib1g-dev samtools
-          version: 1.0
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev libomp-dev ccache
 
-      - name: Check AVX-512 availability
+      - name: Detect x86 ISA
+        if: matrix.arch == 'x86'
         run: |
-          # AVX-512BW is required for the x86 batched mate-rescue path (gated
-          # by __AVX512BW__ in bwamem.cpp:1255 and bwamem_pair.cpp:657). Free
-          # GH runners typically do not expose it. When it's missing we fall
-          # back to AVX2, which takes the same scalar mem_sam_pe path as ARM
-          # today — so the cross-arch "SAM identity" step is then testing
-          # scalar-vs-scalar, not batched-vs-scalar. That's still useful once
-          # the port lands (ARM batched vs x86 scalar cross-check) but noted.
-          if ! grep -q avx512bw /proc/cpuinfo; then
-            echo "::warning::AVX-512BW not available on this runner; falling back to AVX2 reference"
-            echo "USE_AVX=avx2" >> "$GITHUB_ENV"
+          if grep -q avx512bw /proc/cpuinfo; then
+            echo "MAKE_ARCH=avx512bw" >> "$GITHUB_ENV"
           else
-            echo "USE_AVX=avx512" >> "$GITHUB_ENV"
+            echo "MAKE_ARCH=avx2" >> "$GITHUB_ENV"
           fi
 
-      - name: Cache dwgsim binary
-        id: cache-dwgsim
+      - name: Set arm make arch
+        if: matrix.arch == 'arm'
+        run: echo "MAKE_ARCH=arm64" >> "$GITHUB_ENV"
+
+      - name: Cache ccache
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
-          path: /tmp/dwgsim-src/dwgsim
-          key: dwgsim-${{ runner.os }}-${{ runner.arch }}-${{ env.DWGSIM_REF }}
+          path: ${{ env.CCACHE_DIR }}
+          # Share with run-mem-${arch}: same restore-keys prefix.
+          key: ccache-${{ runner.arch }}-kswv-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ runner.arch }}-
 
-      - name: Build dwgsim
-        if: steps.cache-dwgsim.outputs.cache-hit != 'true'
-        run: |
-          git clone https://github.com/nh13/DWGSIM.git /tmp/dwgsim-src
-          git -C /tmp/dwgsim-src checkout --detach "$DWGSIM_REF"
-          git -C /tmp/dwgsim-src submodule update --init --recursive
-          make -C /tmp/dwgsim-src -j"$(nproc)"
-
-      - name: Cache chr17 reference
-        id: cache-chr17
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: /tmp/ci-ref/chr17.fa
-          key: chr17-${{ env.CHR17_SHA256 }}
-
-      - name: Download chr17 if cache miss
-        if: steps.cache-chr17.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p /tmp/ci-ref
-          curl -sL "$CHR17_URL" -o /tmp/ci-ref/chr17.fa.gz
-          got_sha256="$(sha256sum /tmp/ci-ref/chr17.fa.gz | awk '{print $1}')"
-          if [ "$got_sha256" != "$CHR17_SHA256" ]; then
-            echo "chr17.fa.gz sha256 mismatch: expected $CHR17_SHA256, got $got_sha256"
-            exit 1
-          fi
-          gunzip /tmp/ci-ref/chr17.fa.gz
-
-      # USE_AVX is part of the cache key because the x86 port/control
-      # binaries are built with either avx2 or avx512 flags depending
-      # on runner CPU detection.
-      - name: Cache x86 port build artifacts
-        id: cache-x86-port
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: |
-            bwa-mem2.port
-            libbwa.port.a
-          key: x86-port-${{ env.USE_AVX }}-${{ hashFiles('src/**', 'ext/**', 'Makefile', '.github/workflows/proto-neon-kswv.yml') }}
-
-      - name: Build x86 port (batched mate-rescue enabled)
-        if: steps.cache-x86-port.outputs.cache-hit != 'true'
-        run: |
-          make -j"$(nproc)" arch="$USE_AVX" CXX=g++
-          mv bwa-mem2 bwa-mem2.port 2>/dev/null || true
-          cp libbwa.a libbwa.port.a
-
-      - name: Cache x86 control build artifacts
-        id: cache-x86-control
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: bwa-mem2.control
-          key: x86-control-${{ env.USE_AVX }}-${{ hashFiles('src/**', 'ext/**', 'Makefile', '.github/workflows/proto-neon-kswv.yml') }}
-
-      - name: Build x86 control (DISABLE_BATCHED_MATESW=1)
-        if: steps.cache-x86-control.outputs.cache-hit != 'true'
-        run: |
-          make clean
-          make -j"$(nproc)" arch="$USE_AVX" DISABLE_BATCHED_MATESW=1 CXX=g++
-          mv bwa-mem2 bwa-mem2.control 2>/dev/null || true
-
-      - name: Build kswv unit test (x86)
-        # Rebuild against the port libbwa so the unit test exercises the
-        # new kswv kernel, not the control build's scalar fallback.
-        # Go through the parent test-binaries target so ARCH_FLAGS_FROM_PARENT
+      - name: Build + run kswv unit test
+        # Builds the doctest-based test/bwa_mem2_tests_unit binary via the
+        # parent `test-binaries` target so ARCH_FLAGS_FROM_PARENT plumbing
         # propagates and the test TU sees the same __AVX2__ / __AVX512BW__
-        # surface libbwa.port.a was built with.
-        run: |
-          cp libbwa.port.a libbwa.a
-          # Port/control build caches restore only the bwa-mem2 binaries +
-          # libbwa.port.a; ext/safestringlib/libsafestring.a is not in either
-          # cache, so when both caches hit (no `make` runs) the test link line
-          # — which references it directly — fails to find it. Rebuild it
-          # explicitly so this step works on cache hit and cache miss alike.
-          make ext/safestringlib/libsafestring.a arch="$USE_AVX" CXX=g++
-          make test-binaries arch="$USE_AVX" CXX=g++
-
-      - name: Run kswv unit test (x86)
-        # Strict gate for both AVX2 and AVX-512BW: all four NEON fixes
-        # (te split, freeze, per-lane score2, minsc filter) are applied
-        # on both paths — AVX2 from PR 20, AVX-512BW by this PR.
-        run: ./test/bwa_mem2_tests_unit --test-suite="unit/kswv"
-
-      - name: Build kswv_nrow_zero_test (x86, ASan)
-        # issue 38 / upstream PR 289 regression. Covers the AVX2 u8 kernel
-        # and the AVX-512BW u8+16 kernels on whichever $USE_AVX is selected.
-        # `make clean` forces libbwa to recompile under asan instrumentation.
-        run: |
-          make clean
-          make ASAN=1 arch="$USE_AVX" kswv_nrow_zero_test CXX=g++
-
-      - name: Run kswv_nrow_zero_test (x86)
-        run: ./kswv_nrow_zero_test
-
-      - name: Cache chr17 bwa-mem2 index (x86)
-        id: cache-x86-chr17-index
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: |
-            /tmp/ci-ref/chr17.fa.0123
-            /tmp/ci-ref/chr17.fa.amb
-            /tmp/ci-ref/chr17.fa.ann
-            /tmp/ci-ref/chr17.fa.bwt.2bit.64
-            /tmp/ci-ref/chr17.fa.pac
-          key: chr17-bwamem2-index-${{ env.CHR17_SHA256 }}
-
-      - name: Index chr17
-        # Use the port binary for indexing (indexing code is arch-agnostic).
-        if: steps.cache-x86-chr17-index.outputs.cache-hit != 'true'
-        run: ./bwa-mem2.port index /tmp/ci-ref/chr17.fa
-
-      # Simulated reads shared with the ARM job — same seed + dwgsim
-      # version + reference + params.
-      - name: Cache simulated reads (x86)
-        id: cache-x86-reads
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: |
-            /tmp/ci-reads/reads.bwa.read1.fastq.gz
-            /tmp/ci-reads/reads.bwa.read2.fastq.gz
-          key: reads-chr17-${{ env.CHR17_SHA256 }}-dwgsim-${{ env.DWGSIM_REF }}-N${{ env.N_PAIRS }}-z42-100bp-e0.01-r0.001
-
-      - name: Simulate dwgsim reads (same params as ARM job)
-        if: steps.cache-x86-reads.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p /tmp/ci-reads
-          /tmp/dwgsim-src/dwgsim \
-            -z 42 \
-            -N "$N_PAIRS" -1 100 -2 100 \
-            -e 0.01 -E 0.01 -r 0.001 -R 0 \
-            /tmp/ci-ref/chr17.fa \
-            /tmp/ci-reads/reads
-
-      - name: Run mem (x86 port build)
+        # / NEON surface libbwa was built with.
         run: |
           mkdir -p /tmp/ci-out
-          for rep in $(seq 1 "$N_REPS"); do
-            /usr/bin/time -v ./bwa-mem2.port mem -t "$(nproc)" \
-              /tmp/ci-ref/chr17.fa \
-              /tmp/ci-reads/reads.bwa.read1.fastq.gz /tmp/ci-reads/reads.bwa.read2.fastq.gz \
-              > /tmp/ci-out/x86_port.rep${rep}.sam \
-              2> /tmp/ci-out/x86_port.rep${rep}.time
-          done
+          ccache --zero-stats >/dev/null
+          make arch="$MAKE_ARCH" CXX="ccache g++" CC="ccache gcc" test-binaries
+          ./test/bwa_mem2_tests_unit --test-suite="unit/kswv" \
+            --reporters=junit \
+            --out=/tmp/ci-out/kswv-unit-${{ matrix.arch }}.xml \
+            2>&1 | tee /tmp/selftest.log
+          status=${PIPESTATUS[0]}
+          tail -25 /tmp/selftest.log >> "$GITHUB_STEP_SUMMARY"
+          exit $status
 
-      - name: Run mem (x86 control build)
-        run: |
-          for rep in $(seq 1 "$N_REPS"); do
-            /usr/bin/time -v ./bwa-mem2.control mem -t "$(nproc)" \
-              /tmp/ci-ref/chr17.fa \
-              /tmp/ci-reads/reads.bwa.read1.fastq.gz /tmp/ci-reads/reads.bwa.read2.fastq.gz \
-              > /tmp/ci-out/x86_control.rep${rep}.sam \
-              2> /tmp/ci-out/x86_control.rep${rep}.time
-          done
-
-      - name: Report x86 speedup
-        run: |
-          extract_elapsed() {
-            awk '/Elapsed \(wall clock\) time/ { split($NF, t, ":"); if (length(t)==3) print t[1]*3600+t[2]*60+t[3]; else print t[1]*60+t[2] }' "$1"
-          }
-          median3() { awk '{print $1}' "$1" | sort -n | head -2 | tail -1; }
-          {
-            echo "## x86 ($USE_AVX) perf A/B (port vs control)"
-            echo ""
-            echo "| rep | port (s) | control (s) |"
-            echo "| --- | --------:| -----------:|"
-            for rep in $(seq 1 "$N_REPS"); do
-              p=$(extract_elapsed /tmp/ci-out/x86_port.rep${rep}.time)
-              c=$(extract_elapsed /tmp/ci-out/x86_control.rep${rep}.time)
-              echo "| $rep | $p | $c |"
-              echo "$p" >> /tmp/ci-out/x86_port.elapsed
-              echo "$c" >> /tmp/ci-out/x86_control.elapsed
-            done
-            pm=$(median3 /tmp/ci-out/x86_port.elapsed)
-            cm=$(median3 /tmp/ci-out/x86_control.elapsed)
-            echo ""
-            echo "median port: ${pm}s, median control: ${cm}s"
-            if [ -n "$pm" ] && [ -n "$cm" ] && [ "$pm" != "0" ]; then
-              speedup=$(awk -v p="$pm" -v c="$cm" 'BEGIN { printf "%.2f", c/p }')
-              pct=$(awk -v p="$pm" -v c="$cm" 'BEGIN { printf "%+.1f%%", 100*(c-p)/c }')
-              echo "speedup (control / port): ${speedup}x  (${pct})"
-            fi
-          } | tee -a "$GITHUB_STEP_SUMMARY"
-
-      - name: Sort + md5 x86 port SAM for identity check
-        run: |
-          samtools sort -@ "$(nproc)" -n /tmp/ci-out/x86_port.rep1.sam -o /tmp/ci-out/x86.sorted.bam
-          samtools view /tmp/ci-out/x86.sorted.bam | md5sum | awk '{print $1}' > /tmp/ci-out/x86.sam.md5
-          echo "x86 port ($USE_AVX) SAM md5: $(cat /tmp/ci-out/x86.sam.md5)" >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Upload artifact
+      - name: Upload kswv unit test JUnit report
+        if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: x86-outputs
-          path: |
-            /tmp/ci-out/x86.sam.md5
-            /tmp/ci-out/x86_port.rep1.sam
+          name: kswv-unit-${{ matrix.arch }}
+          path: /tmp/ci-out/kswv-unit-${{ matrix.arch }}.xml
+          if-no-files-found: warn
+          retention-days: 1
 
-  sam-identity:
-    name: cross-arch SAM identity
-    needs: [selftest-perf-arm, reference-x86]
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Download ARM outputs
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
-        with:
-          name: arm-outputs
-          path: /tmp/arm-outputs
-
-      - name: Download x86 outputs
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
-        with:
-          name: x86-outputs
-          path: /tmp/x86-outputs
-
-      - name: Diff md5s
+      - name: Build + run kswv_nrow_zero_test (ASan)
+        # issue 38 / upstream PR 289: all-len1==0 batches used to walk past
+        # the rowMax allocation prefix. Rebuild libbwa under asan so the
+        # pre-fix write trips heap-buffer-overflow rather than corrupting
+        # silently. `make clean` forces full recompile under instrumentation.
         run: |
-          arm_md5="$(cat /tmp/arm-outputs/port.sam.md5)"
-          x86_md5="$(cat /tmp/x86-outputs/x86.sam.md5)"
-          {
-            echo "## Cross-arch SAM identity"
-            echo ""
-            echo "- ARM (port, NEON batched mate-rescue): \`$arm_md5\`"
-            echo "- x86 (port build; batched on AVX-512, scalar on AVX2 runners): \`$x86_md5\`"
-            echo ""
-            if [ "$arm_md5" = "$x86_md5" ]; then
-              echo "PASS: byte-identical sorted SAM across arches."
-            else
-              echo "FAIL: SAM md5 differs."
-            fi
-          } | tee -a "$GITHUB_STEP_SUMMARY"
-          [ "$arm_md5" = "$x86_md5" ] || exit 1
+          make clean
+          make ASAN=1 arch="$MAKE_ARCH" CXX="ccache g++" CC="ccache gcc" kswv_nrow_zero_test
+          ./kswv_nrow_zero_test
+          ccache --show-stats | tee -a "$GITHUB_STEP_SUMMARY"

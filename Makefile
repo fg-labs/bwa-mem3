@@ -293,22 +293,22 @@ ifneq ($(IS_ARM),)
 	$(MAKE) arm64
 else
 	rm -f src/*.o $(BWA_LIB); cd ext/safestringlib/ && $(MAKE) clean;
-	$(MAKE) arch=sse41    EXE=bwa-mem2.sse41    CXX=$(CXX) all
+	$(MAKE) arch=sse41    EXE=bwa-mem2.sse41    CXX="$(CXX)" all
 	rm -f src/*.o $(BWA_LIB); cd ext/safestringlib/ && $(MAKE) clean;
-	$(MAKE) arch=sse42    EXE=bwa-mem2.sse42    CXX=$(CXX) all
+	$(MAKE) arch=sse42    EXE=bwa-mem2.sse42    CXX="$(CXX)" all
 	rm -f src/*.o $(BWA_LIB); cd ext/safestringlib/ && $(MAKE) clean;
-	$(MAKE) arch=avx    EXE=bwa-mem2.avx    CXX=$(CXX) all
+	$(MAKE) arch=avx    EXE=bwa-mem2.avx    CXX="$(CXX)" all
 	rm -f src/*.o $(BWA_LIB); cd ext/safestringlib/ && $(MAKE) clean;
-	$(MAKE) arch=avx2   EXE=bwa-mem2.avx2     CXX=$(CXX) all
+	$(MAKE) arch=avx2   EXE=bwa-mem2.avx2     CXX="$(CXX)" all
 	rm -f src/*.o $(BWA_LIB); cd ext/safestringlib/ && $(MAKE) clean;
-	$(MAKE) arch=avx512bw EXE=bwa-mem2.avx512bw CXX=$(CXX) all
+	$(MAKE) arch=avx512bw EXE=bwa-mem2.avx512bw CXX="$(CXX)" all
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) -Wall -O3 src/runsimd.cpp -Iext/safestringlib/include -Lext/safestringlib/ -lsafestring $(STATIC_GCC) -o bwa-mem2
 endif
 
 # ARM64/Apple Silicon build target - single binary, no multi-binary launcher needed
 arm64:
 	rm -f src/*.o $(BWA_LIB); cd ext/safestringlib/ && $(MAKE) clean;
-	$(MAKE) arch=arm64 EXE=bwa-mem2.arm64 CXX=$(CXX) all
+	$(MAKE) arch=arm64 EXE=bwa-mem2.arm64 CXX="$(CXX)" all
 	ln -sf bwa-mem2.arm64 bwa-mem2
 
 
@@ -330,9 +330,13 @@ kswv_nrow_zero_test: $(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) test/kswv_nrow_zero_t
 # libbwa.a, which then lacks kswv::getScores8 — the BWA_TESTS_HAVE_KSWV
 # macro guards the test away).
 .PHONY: test-binaries
-test-binaries: $(BWA_LIB)
+# $(SAFE_STR_LIB) is a real link-time dep: test/Makefile's
+# bwa_mem2_tests_unit recipe references ../ext/safestringlib/libsafestring.a
+# directly. Without this prereq, callers that skip the bwa-mem2 binary
+# build (which builds it as a side-effect of $(EXE) deps) link-fail.
+test-binaries: $(BWA_LIB) $(SAFE_STR_LIB)
 	$(MAKE) -C test framework unit integration \
-	    CXX=$(CXX) \
+	    CXX="$(CXX)" \
 	    COVERAGE=$(COVERAGE) \
 	    ARCH_FLAGS_FROM_PARENT='$(ARCH_FLAGS)'
 
@@ -367,7 +371,7 @@ else ifneq (,$(findstring clang,$(SAFE_CC_BASENAME)))
 endif
 
 $(SAFE_STR_LIB):
-	cd ext/safestringlib/ && $(MAKE) clean && $(MAKE) CC=$(CC) CFLAGS="-Iinclude -Isafeclib $(SAFE_EXTRA_CFLAGS) -fstack-protector-strong -fPIE -fPIC -O2" directories libsafestring.a
+	cd ext/safestringlib/ && $(MAKE) clean && $(MAKE) CC="$(CC)" CFLAGS="-Iinclude -Isafeclib $(SAFE_EXTRA_CFLAGS) -fstack-protector-strong -fPIE -fPIC -O2" directories libsafestring.a
 
 # htslib: minimal configure (no lzma/bz2/curl/S3/GCS/plugins), zlib only.
 # Guard on config.mk (only created by ./configure) rather than Makefile, which
@@ -455,13 +459,13 @@ endif
 
 pgo-generate:
 	rm -f src/*.o $(BWA_LIB); cd ext/safestringlib/ && $(MAKE) clean;
-	$(MAKE) arch=$(PGO_ARCH) EXE=$(PGO_INSTR_EXE) EXTRA_CXXFLAGS="-fprofile-generate=$(PGO_PROFILE_DIR)" CXX=$(CXX) all
+	$(MAKE) arch=$(PGO_ARCH) EXE=$(PGO_INSTR_EXE) EXTRA_CXXFLAGS="-fprofile-generate=$(PGO_PROFILE_DIR)" CXX="$(CXX)" all
 	@echo "PGO instrumented binary built: $(PGO_INSTR_EXE) (arch=$(PGO_ARCH), profile dir=$(PGO_PROFILE_DIR))"
 	@echo "Run training workload with $(PGO_INSTR_EXE), then: make pgo-use PGO_ARCH=$(PGO_ARCH) PGO_PROFILE_DIR=$(PGO_PROFILE_DIR)"
 
 pgo-use:
 	rm -f src/*.o $(BWA_LIB); cd ext/safestringlib/ && $(MAKE) clean;
-	$(MAKE) arch=$(PGO_ARCH) EXE=$(PGO_FINAL_EXE) EXTRA_CXXFLAGS="-fprofile-use=$(PGO_PROFILE_DIR) -fprofile-correction" CXX=$(CXX) all
+	$(MAKE) arch=$(PGO_ARCH) EXE=$(PGO_FINAL_EXE) EXTRA_CXXFLAGS="-fprofile-use=$(PGO_PROFILE_DIR) -fprofile-correction" CXX="$(CXX)" all
 	@echo "PGO optimized binary built: $(PGO_FINAL_EXE) (arch=$(PGO_ARCH))"
 
 pgo-clean:
@@ -490,7 +494,7 @@ endif
 #        ./bwa-mem2.profile mem -t N idx r1.fq.gz r2.fq.gz
 profile-build:
 	rm -f src/*.o $(BWA_LIB); cd ext/safestringlib/ && $(MAKE) clean;
-	$(MAKE) arch=$(PROFILE_ARCH) EXE=bwa-mem2.profile EXTRA_CXXFLAGS="$(EXTRA_CXXFLAGS) -DDISABLE_OUTPUT" CXX=$(CXX) all
+	$(MAKE) arch=$(PROFILE_ARCH) EXE=bwa-mem2.profile EXTRA_CXXFLAGS="$(EXTRA_CXXFLAGS) -DDISABLE_OUTPUT" CXX="$(CXX)" all
 	@echo "Compute-only profile binary: bwa-mem2.profile (arch=$(PROFILE_ARCH), output I/O skipped)"
 	# Drop variant-flagged objects from the shared cache so a subsequent
 	# `make all` doesn't relink stale -DDISABLE_OUTPUT objects.
@@ -517,7 +521,7 @@ lto-build:
 	@CXX_VERSION="$$($(CXX) --version 2>&1 | head -1)"; \
 	  case "$$CXX_VERSION" in *clang*) LTO_FLAG=-flto=thin ;; *) LTO_FLAG=-flto ;; esac; \
 	  echo "LTO_FLAG=$$LTO_FLAG (cxx: $$CXX_VERSION, arch: $(LTO_ARCH))"; \
-	  $(MAKE) arch=$(LTO_ARCH) EXE=bwa-mem2.lto EXTRA_CXXFLAGS="$(EXTRA_CXXFLAGS) $$LTO_FLAG -fno-semantic-interposition" CXX=$(CXX) all
+	  $(MAKE) arch=$(LTO_ARCH) EXE=bwa-mem2.lto EXTRA_CXXFLAGS="$(EXTRA_CXXFLAGS) $$LTO_FLAG -fno-semantic-interposition" CXX="$(CXX)" all
 	@echo "LTO binary: bwa-mem2.lto (arch=$(LTO_ARCH))"
 	# Drop variant-flagged objects from the shared cache so a subsequent
 	# `make all` doesn't relink stale -flto / -fno-semantic-interposition
