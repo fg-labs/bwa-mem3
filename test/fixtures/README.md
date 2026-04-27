@@ -12,6 +12,8 @@ Committed inputs for the five C++ unit tests under `test/`:
 
 All four SMEM/seed tests share `phix.fa` (phiX174, NC_001422.1, 5386 bp) as the reference. The FMI index is built on demand by the harness — not committed.
 
+`synthetic_1mb.fa` is a 1 Mbp ACGT-only FASTA used by the libsais byte-diff, determinism, and memory-budget tests; the matching `.0123` and `.bwt.2bit.64` baselines under `baselines/` are derived from it and only stay reproducible when both source and baselines are committed together.
+
 ## Regenerating the fixtures
 
 Fixtures are derived from `phix.fa` (committed). To regenerate after a format change:

@@ -206,7 +206,6 @@ class FMI_search: public indexEle
     int64_t sentinel_index;
 private:
         char file_name[PATH_MAX];
-        int64_t index_alloc;
         int64_t count[5];
         uint32_t *sa_ls_word;
         int8_t *sa_ms_byte;
@@ -214,14 +213,6 @@ private:
 
         uint64_t *one_hot_mask_array;
 
-        int64_t pac_seq_len(const char *fn_pac);
-        void pac2nt(const char *fn_pac,
-                    std::string &reference_seq);
-        int build_fm_index(const char *ref_file_name,
-                               char *binary_seq,
-                               int64_t ref_seq_len,
-                               int64_t *sa_bwt,
-                               int64_t *count);
         SMEM backwardExt(SMEM smem, uint8_t a);
 
     // ----- Lockstep SMEM batching internals -----

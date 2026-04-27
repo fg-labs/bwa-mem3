@@ -35,14 +35,20 @@
 #include <time.h>
 #include <getopt.h>
 #include <limits.h>
+#include <stdint.h>
+#include <errno.h>
 #include <sys/stat.h>
 #include <zlib.h>
+
+#include <algorithm>
+
 #include "bntseq.h"
 #include "bwa.h"
 #include "bwt.h"
 #include "utils.h"
 #include "FMI_search.h"
 #include "kseq.h"
+#include "system.h"
 
 KSEQ_DECLARE(gzFile)
 
@@ -148,30 +154,123 @@ static int meth_index_c2t_build(const char *fa)
     return 0;
 }
 
+// Parse a memory spec such as "64G", "512M", "1024K", or a bare integer
+// (bytes).  Returns the number of bytes, or -1 on parse error / overflow.
+static int64_t parse_memory_spec(const char *s)
+{
+    char *end;
+    errno = 0;
+    int64_t v = strtoll(s, &end, 10);
+    if (errno != 0 || end == s || v < 0) return -1;
+    int shift = 0;
+    if      (*end == 'G' || *end == 'g') { shift = 30; ++end; }
+    else if (*end == 'M' || *end == 'm') { shift = 20; ++end; }
+    else if (*end == 'K' || *end == 'k') { shift = 10; ++end; }
+    if (*end != '\0') return -1;
+    if (shift && v > (INT64_MAX >> shift)) return -1;
+    v <<= shift;
+    return v;
+}
+
 int bwa_index(int argc, char *argv[]) // the "index" command
 {
 	int c;
 	char *prefix = 0;
 	int meth = 0;
+	int64_t user_max_memory = 0;   // 0 => auto default
+	int     user_threads    = 0;   // 0 => auto default
 	static struct option long_opts[] = {
-		{"meth", no_argument, 0, 1000},
+		{"meth",       no_argument,       0, 1000},
+		{"max-memory", required_argument, 0, 1001},
+		{"tmp-dir",    required_argument, 0, 1002},
+		{"threads",    required_argument, 0, 't'},
 		{0, 0, 0, 0}
 	};
-	while ((c = getopt_long(argc, argv, "p:", long_opts, NULL)) >= 0) {
+	while ((c = getopt_long(argc, argv, "p:t:", long_opts, NULL)) >= 0) {
 		if (c == 'p') prefix = optarg;
-		else if (c == 1000) meth = 1;
-		else return 1;
+		else if (c == 't') {
+			// Mirror parse_memory_spec's strict strtol parsing: atoi
+			// silently accepts numeric-prefix garbage like "4abc" and
+			// has implementation-defined behaviour on overflow.
+			char *end = NULL;
+			errno = 0;
+			long t = strtol(optarg, &end, 10);
+			if (errno || end == optarg || *end != '\0' || t <= 0 || t > INT_MAX) {
+				fprintf(stderr, "ERROR: invalid -t spec '%s'\n", optarg);
+				return 1;
+			}
+			user_threads = (int)t;
+		} else if (c == 1000) {
+			meth = 1;
+		} else if (c == 1001) {
+			int64_t mem = parse_memory_spec(optarg);
+			if (mem <= 0) {
+				fprintf(stderr, "ERROR: invalid --max-memory spec '%s'\n", optarg);
+				return 1;
+			}
+			user_max_memory = mem;
+		} else if (c == 1002) {
+			setenv("BWA_INDEX_TMPDIR", optarg, 1);
+		} else {
+			return 1;
+		}
 	}
 
 	if (optind + 1 > argc) {
-		fprintf(stderr, "Usage: bwa-mem2 index [-p prefix] [--meth] <in.fasta>\n");
+		fprintf(stderr, "Usage: bwa-mem2 index [-p prefix] [-t N] [--max-memory G] [--tmp-dir PATH] [--meth] <in.fasta>\n");
 		fprintf(stderr, "\n"
-		        "  -p STR    output prefix (default: <in.fasta>)\n"
-		        "  --meth    build a bwameth-style doubled c2t reference + FMI.\n"
-		        "            Writes <in.fasta>.bwameth.c2t and the FMI alongside it.\n"
-		        "            Use with `bwa-mem2 mem --meth <in.fasta> R1.fq [R2.fq]`.\n");
+		        "  -p STR          output prefix (default: <in.fasta>)\n"
+		        "  -t INT          worker threads [auto: detected cores, cgroup-aware]\n"
+		        "  --max-memory G  peak memory budget [auto: min(50%% of RAM, 32G), cgroup-aware]\n"
+		        "  --tmp-dir PATH  scratch directory [$TMPDIR]\n"
+		        "  --meth          build a bwameth-style doubled c2t reference + FMI.\n"
+		        "                  Writes <in.fasta>.bwameth.c2t and the FMI alongside it.\n"
+		        "                  Use with `bwa-mem2 mem --meth <in.fasta> R1.fq [R2.fq]`.\n");
 		return 1;
 	}
+
+	// Resolve --max-memory and -t: user value wins; otherwise auto from
+	// cgroup-aware host detection. Emit a one-line audit per flag.
+	{
+		int64_t detected_mem = bwa::detect_total_memory_bytes();
+		int     detected_cpu = bwa::detect_cpu_count();
+
+		int64_t resolved_mem;
+		if (user_max_memory > 0) {
+			resolved_mem = user_max_memory;
+			fprintf(stderr, "[bwa_index] --max-memory = %.1f GiB (user-specified)\n",
+			        (double)resolved_mem / (double)(1LL << 30));
+		} else if (detected_mem > 0) {
+			resolved_mem = std::min<int64_t>(detected_mem / 2, 32LL << 30);
+			fprintf(stderr, "[bwa_index] --max-memory = %.1f GiB (auto: 50%% of %.1f GiB detected, capped at 32 GiB)\n",
+			        (double)resolved_mem  / (double)(1LL << 30),
+			        (double)detected_mem  / (double)(1LL << 30));
+		} else {
+			resolved_mem = 4LL << 30;
+			fprintf(stderr, "[bwa_index] --max-memory = 4.0 GiB (fallback: host detection failed; "
+			                "pass --max-memory explicitly to override)\n");
+		}
+
+		int resolved_cpu;
+		if (user_threads > 0) {
+			resolved_cpu = user_threads;
+			fprintf(stderr, "[bwa_index] -t = %d (user-specified)\n", resolved_cpu);
+		} else if (detected_cpu > 0) {
+			resolved_cpu = detected_cpu;
+			fprintf(stderr, "[bwa_index] -t = %d (auto: detected cores, cgroup-aware)\n", resolved_cpu);
+		} else {
+			resolved_cpu = 1;
+			fprintf(stderr, "[bwa_index] -t = 1 (fallback: CPU detection failed; "
+			                "pass -t explicitly to override)\n");
+		}
+
+		char buf[32];
+		snprintf(buf, sizeof(buf), "%lld", (long long)resolved_mem);
+		setenv("BWA_INDEX_MAX_MEMORY", buf, 1);
+		snprintf(buf, sizeof(buf), "%d", resolved_cpu);
+		setenv("BWA_INDEX_THREADS", buf, 1);
+	}
+
 	if (meth) {
 		if (prefix != 0) {
 			fprintf(stderr, "ERROR: --meth does not accept -p (prefix is <in.fasta>.bwameth.c2t)\n");
@@ -180,8 +279,7 @@ int bwa_index(int argc, char *argv[]) // the "index" command
 		return meth_index_c2t_build(argv[optind]);
 	}
 	if (prefix == 0) prefix = argv[optind];
-	bwa_idx_build(argv[optind], prefix);
-	return 0;
+	return bwa_idx_build(argv[optind], prefix);
 }
 
 int bwa_idx_build(const char *fa, const char *prefix)
@@ -189,18 +287,18 @@ int bwa_idx_build(const char *fa, const char *prefix)
 	extern void bwa_pac_rev_core(const char *fn, const char *fn_rev);
 
 	clock_t t;
-	int64_t l_pac;
+	int rc = 0;
 
 	{ // nucleotide indexing
 		gzFile fp = xzopen(fa, "r");
 		t = clock();
 		fprintf(stderr, "[bwa_index] Pack FASTA... ");
-		l_pac = bns_fasta2bntseq(fp, prefix, 1);
+		bns_fasta2bntseq(fp, prefix, 1);
 		fprintf(stderr, "%.2f sec\n", (float)(clock() - t) / CLOCKS_PER_SEC);
 		err_gzclose(fp);
         FMI_search *fmi = new FMI_search(prefix);
-        fmi->build_index();
+        rc = fmi->build_index();
         delete fmi;
 	}
-	return 0;
+	return rc;
 }

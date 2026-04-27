@@ -29,7 +29,7 @@
 ##*****************************************************************************************/
 
 
-EXE=		fmi_test smem2_test bwt_seed_strategy_test sa2ref_test xeonbsw smem_lockstep_parity_test header_insert_test
+EXE=		fmi_test smem2_test bwt_seed_strategy_test sa2ref_test xeonbsw smem_lockstep_parity_test header_insert_test packed_text_test system_test
 
 # Match the parent Makefile's compiler + flag selection. Detect ARM
 # (Apple Silicon arm64 and Linux aarch64) and wire in OpenMP, sse2neon
@@ -52,15 +52,15 @@ ifneq ($(IS_ARM),)
             $(error libomp not found: install with `brew install libomp`, or set LIBOMP_PREFIX to its install prefix)
         endif
         CXXFLAGS ?= -std=c++11 -O2 -Xpreprocessor -fopenmp -I$(LIBOMP_PREFIX)/include
-        LIBS ?= -L.. -L$(LIBOMP_PREFIX)/lib -lomp -lbwa -lz -framework Accelerate ../ext/safestringlib/libsafestring.a
+        LIBS ?= -L.. -L$(LIBOMP_PREFIX)/lib -lomp -lbwa ../ext/libsais/src/libsais.o ../ext/libsais/src/libsais64.o -lz -framework Accelerate ../ext/safestringlib/libsafestring.a
     else
         CXXFLAGS ?= -std=c++11 -O2 -fopenmp
-        LIBS ?= -L.. -fopenmp -lbwa -lz ../ext/safestringlib/libsafestring.a
+        LIBS ?= -L.. -fopenmp -lbwa ../ext/libsais/src/libsais.o ../ext/libsais/src/libsais64.o -lz ../ext/safestringlib/libsafestring.a
     endif
 else
     CXX ?=      g++
     CXXFLAGS ?= -std=c++11 -fopenmp -mtune=native -march=native
-    LIBS ?=     -L.. -fopenmp -lbwa -lz ../ext/safestringlib/libsafestring.a
+    LIBS ?=     -L.. -fopenmp -lbwa ../ext/libsais/src/libsais.o ../ext/libsais/src/libsais64.o -lz ../ext/safestringlib/libsafestring.a
 endif
 
 # CPPFLAGS / INCLUDES: add sse2neon SSE-emulation macros + include path
@@ -75,13 +75,27 @@ else
     INCLUDES = -I../src -I../ext/safestringlib/include
 endif
 
-.PHONY:all clean depend
+.PHONY:all clean depend libsais-objs
 .SUFFIXES:.cpp .o
 
 .cpp.o:
 	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $< -o $@
 
 all:$(EXE)
+
+# libsais object files live in the parent build tree and link into every
+# test binary via $(LIBS) — they appear as bare paths inside the link
+# command, NOT as make prerequisites, so make doesn't know to build them
+# on demand. Delegate to the parent Makefile's LIBSAIS_OBJS rule
+# (-DLIBSAIS_OPENMP / -O3 flag set stays in one place) and gate $(EXE)
+# behind it via an order-only prerequisite — fires once per invocation
+# without forcing the test binaries to relink. The parent's target paths
+# are relative to its own dir, so we drop the leading `../` when
+# invoking it.
+libsais-objs:
+	$(MAKE) -C .. ext/libsais/src/libsais.o ext/libsais/src/libsais64.o
+
+$(EXE): | libsais-objs
 
 fmi_test:fmi_test.o
 	$(CXX) -o $@ $^ $(LIBS)
@@ -103,6 +117,28 @@ smem_lockstep_parity_test: smem_lockstep_parity_test.o
 
 header_insert_test:header_insert_test.o
 	$(CXX) -o $@ $^ $(LIBS)
+
+# Build test-local copies of packed_text.cpp / system.cpp into test/
+# rather than ../src/. The parent build's CXXFLAGS (`-O3 -fpermissive`,
+# `-DSAIS=1`, `-DLIBSAIS_OPENMP`) differ from this Makefile's
+# (`-O2 -fopenmp -mtune=native -march=native`, `-DENABLE_PREFETCH`),
+# and writing back into ../src/*.o would silently overwrite parent build
+# artifacts with a different ABI/flag set — `ar rcs libbwa.a ...` would
+# then archive the test-flagged objects on the next parent rebuild.
+packed_text_test: packed_text_test.o packed_text_lib.o
+	$(CXX) -o $@ $^ $(LIBS)
+
+packed_text_test.o: ../src/packed_text.h
+packed_text_lib.o: ../src/packed_text.cpp ../src/packed_text.h
+	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $< -o $@
+
+system_test: system_test.o system_lib.o
+	$(CXX) -o $@ $^ $(LIBS)
+
+system_test.o: ../src/system.h
+system_lib.o: ../src/system.cpp ../src/system.h
+	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $< -o $@
+
 
 clean:
 	rm -fr *.o $(EXE)

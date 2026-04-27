@@ -34,10 +34,29 @@ endif
 
 EXE=		bwa-mem2
 #CXX=		icpc
+# Pair CC with CXX for the toolchains we know about so libsais.c (the only
+# C TU in this build) doesn't silently fall back to make's default `cc`,
+# which can drift from CXX (e.g. CXX=icpx + CC=gcc would mix toolchains).
 ifeq ($(CXX), icpc)
 	CC= icc
+else ifeq ($(CXX), icpx)
+	CC= icx
 else ifeq ($(CXX), g++)
-	CC=gcc
+	CC= gcc
+else ifeq ($(CXX), clang++)
+	CC= clang
+else ifeq ($(CXX), c++)
+	# `c++` is GNU make's default and on every system we ship to it is
+	# symlinked to the same toolchain as `cc`, so the pairing is safe.
+	CC= cc
+else
+    # Wrappers (`ccache g++`), versioned binaries (`g++-13`), and
+    # cross-compilers don't match any case above. Only warn if CC truly
+    # is the make-default — operators who pin both CXX and CC explicitly
+    # already know what they're doing and shouldn't see a spurious hint.
+    ifeq ($(origin CC),default)
+        $(warning Unrecognized CXX='$(CXX)'; CC will fall back to default '$(CC)' which may not match CXX. Set CC explicitly to avoid mixing toolchains for libsais.c.)
+    endif
 endif
 
 # AddressSanitizer support for catching kswv rowMax / SIMD store overruns
@@ -124,8 +143,7 @@ else
     ARCH_FLAGS = -msse -msse2 -msse3 -mssse3 -msse4.1
 endif
 
-MEM_FLAGS=	-DSAIS=1
-CPPFLAGS+=	-DENABLE_PREFETCH -DV17=1 -DMATE_SORT=0 $(MEM_FLAGS)
+CPPFLAGS+=	-DENABLE_PREFETCH -DV17=1 -DMATE_SORT=0 -DLIBSAIS_OPENMP
 
 # Version string for `bwa-mem2 version` and the @PG VN: field. Prefer
 # `git describe` (e.g. v2.3-30-g61813ef, with -dirty suffix for modified
@@ -133,15 +151,38 @@ CPPFLAGS+=	-DENABLE_PREFETCH -DV17=1 -DMATE_SORT=0 $(MEM_FLAGS)
 # back to a static tag for source-tarball / shallow-clone builds.
 FG_LABS_VERSION_FALLBACK := 2.3-fg-labs
 VERSION_STRING := $(shell git describe --tags --dirty 2>/dev/null || echo $(FG_LABS_VERSION_FALLBACK))
-INCLUDES+=   -Isrc -Iext/safestringlib/include -Iext/htslib
+INCLUDES+=   -Isrc -Iext/safestringlib/include -Iext/htslib -Iext/libsais/include
 ifeq ($(USE_MIMALLOC),1)
     INCLUDES += -Iext/mimalloc/include
 endif
-LIBS=		-lpthread -lm -lz -L. -lbwa -Lext/safestringlib -lsafestring -Lext/htslib -lhts $(STATIC_GCC) $(LIBS_EXTRA)
+
+# libsais (pinned in ext/libsais; see submodule SHA): linear-time suffix
+# array / BWT construction via SA-IS. Compiled with OpenMP so
+# libsais_gsa_omp can run parallel induced-sorting. libomp is already a
+# link dep of bwa-mem2's alignment paths; no new dep.
+LIBSAIS_DIR    = ext/libsais
+LIBSAIS_OBJS   = $(LIBSAIS_DIR)/src/libsais.o $(LIBSAIS_DIR)/src/libsais64.o
+LIBSAIS_CFLAGS = -O3 -std=c99 -DLIBSAIS_OPENMP -I$(LIBSAIS_DIR)/include
+ifeq ($(UNAME_S),Darwin)
+    # Resolve at parse time but defer the missing-libomp error until the
+    # libsais recipe actually runs, so `make clean`, `make print-mimalloc-config`,
+    # etc. still work on hosts without libomp installed. The check below in
+    # the libsais pattern rule produces the actionable hint when needed.
+    LIBOMP_PREFIX ?= $(shell brew --prefix libomp 2>/dev/null)
+    LIBSAIS_OPENMP_CFLAGS = -Xpreprocessor -fopenmp -I$(LIBOMP_PREFIX)/include
+    LIBSAIS_OPENMP_LIBS   = -L$(LIBOMP_PREFIX)/lib -lomp
+else
+    LIBSAIS_OPENMP_CFLAGS = -fopenmp
+    LIBSAIS_OPENMP_LIBS   = -fopenmp
+endif
+
+LIBS=		-lpthread -lm -lz -L. -lbwa -Lext/safestringlib -lsafestring -Lext/htslib -lhts $(LIBSAIS_OPENMP_LIBS) $(STATIC_GCC) $(LIBS_EXTRA)
 OBJS=		src/fastmap.o src/bwtindex.o src/utils.o src/memcpy_bwamem.o src/kthread.o \
 			src/kstring.o src/ksw.o src/bntseq.o src/bwamem.o src/profiling.o src/bandedSWA.o \
 			src/FMI_search.o src/read_index_ele.o src/bwamem_pair.o src/kswv.o src/bwa.o \
-			src/bwamem_extra.o src/kopen.o src/bam_writer.o src/meth_bam.o
+			src/bwamem_extra.o src/kopen.o src/bam_writer.o src/meth_bam.o \
+			src/packed_text.o src/fm_index_writer.o src/index_prelude.o \
+			src/system.o src/libsais_build.o
 BWA_LIB=    libbwa.a
 SAFE_STR_LIB=    ext/safestringlib/libsafestring.a
 HTS_LIB=    ext/htslib/libhts.a
@@ -206,7 +247,7 @@ myall:arm64
 endif
 endif
 
-CXXFLAGS+=	-g -O3 -std=gnu++14 -fpermissive $(ARCH_FLAGS) $(ASAN_FLAGS) $(EXTRA_CXXFLAGS) #-Wall ##-xSSE2
+CXXFLAGS+=	-g -O3 -std=gnu++14 -fpermissive $(ARCH_FLAGS) $(ASAN_FLAGS) $(LIBSAIS_OPENMP_CFLAGS) $(EXTRA_CXXFLAGS) #-Wall ##-xSSE2
 
 # Control build flag for the batched mate-rescue SW port on ARM.
 # When set (e.g. `make arm64 DISABLE_BATCHED_MATESW=1`), the source gate for
@@ -263,8 +304,8 @@ arm64:
 	ln -sf bwa-mem2.arm64 bwa-mem2
 
 
-$(EXE):$(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) $(if $(filter 1,$(USE_MIMALLOC)),$(MIMALLOC_LIB)) src/main.o
-	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) src/main.o $(BWA_LIB) $(LIBS) $(MIMALLOC_LDFLAGS) -o $@
+$(EXE):$(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) $(if $(filter 1,$(USE_MIMALLOC)),$(MIMALLOC_LIB)) src/main.o
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) src/main.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) $(MIMALLOC_LDFLAGS) -o $@
 
 # kswv self-consistency test: batched SIMD kswv vs scalar ksw_align2 reference.
 # Built by the proto-neon-kswv CI workflow; runnable standalone.
@@ -294,18 +335,21 @@ test/kswv_nrow_zero_test.o: test/kswv_nrow_zero_test.cpp
 $(BWA_LIB):$(OBJS)
 	ar rcs $(BWA_LIB) $(OBJS)
 
-$(HTS_LIB):
-	cd ext/htslib && \
-	    ([ -f Makefile ] || (autoreconf -i && \
-	        ./configure --disable-lzma --disable-libcurl --disable-gcs \
-	                    --disable-s3 --disable-plugins --disable-bz2)) && \
-	    $(MAKE) libhts.a
-
-# On macOS, safestringlib needs stdlib.h for abort() and the memset_s
-# declaration conflicts with macOS C11 Annex K (different signature).
+# safestringlib's safeclib_private.h calls abort() / memcpy() via macros
+# without including <stdlib.h> / <string.h> in the TU, which fails the
+# implicit-function-declaration check in clang >= 15. Some safeclib TUs
+# (strcasecmp_s.c, strcasestr_s.c) likewise call toupper() without
+# including <ctype.h>. Force-include stdlib.h + ctype.h whenever the
+# build CC is clang (Linux clang job) or whenever we're on Darwin (where
+# the system `cc` is always clang). On Darwin we also redefine memset_s:
+# macOS libc declares C11 Annex K memset_s with a different signature,
+# which conflicts with the safestringlib definition.
 SAFE_EXTRA_CFLAGS =
+SAFE_CC_BASENAME := $(notdir $(CC))
 ifeq ($(UNAME_S),Darwin)
-    SAFE_EXTRA_CFLAGS = -include stdlib.h -Dmemset_s=_safestringlib_memset_s
+    SAFE_EXTRA_CFLAGS += -include stdlib.h -include ctype.h -Dmemset_s=_safestringlib_memset_s
+else ifneq (,$(findstring clang,$(SAFE_CC_BASENAME)))
+    SAFE_EXTRA_CFLAGS += -include stdlib.h -include ctype.h
 endif
 
 $(SAFE_STR_LIB):
@@ -321,6 +365,25 @@ $(HTS_LIB):
 	                    --disable-s3 --disable-plugins --disable-bz2)) && \
 	    $(MAKE) libhts.a
 
+# libsais: compile the two C sources we use (libsais.c + libsais64.c) as
+# plain .o files. OpenMP enabled via LIBSAIS_OPENMP so libsais64_gsa_omp
+# can run parallel induced-sorting.
+#
+# CFLAGS / CPPFLAGS / ASAN_FLAGS are forwarded so that ASAN builds
+# instrument libsais and so that package-manager-supplied flags
+# (Conda/Homebrew/distro) reach the libsais TU. LIBSAIS_CFLAGS is appended
+# last so its -O3/-std=c99 take precedence over any user override.
+$(LIBSAIS_DIR)/src/%.o: $(LIBSAIS_DIR)/src/%.c
+	@if [ ! -f $(LIBSAIS_DIR)/include/libsais64.h ]; then \
+	    echo "ERROR: $(LIBSAIS_DIR) is empty. Run: git submodule update --init --recursive"; \
+	    exit 1; \
+	fi
+	@if [ "$(UNAME_S)" = "Darwin" ] && [ -z "$(strip $(LIBOMP_PREFIX))" ]; then \
+	    echo "ERROR: libomp not found. Install with 'brew install libomp', or set LIBOMP_PREFIX to its install prefix."; \
+	    exit 1; \
+	fi
+	$(CC) -c $(CPPFLAGS) $(CFLAGS) $(ASAN_FLAGS) $(LIBSAIS_CFLAGS) $(LIBSAIS_OPENMP_CFLAGS) $< -o $@
+
 # Build mimalloc via its own CMake system. Shells out to cmake once and
 # caches the build tree under ext/mimalloc/build. This rule always builds
 # when invoked; USE_MIMALLOC=0 consumers simply don't depend on it.
@@ -334,6 +397,7 @@ $(MIMALLOC_LIB):
 
 clean:
 	rm -fr src/*.o src/version.h test/*.o $(BWA_LIB) $(EXE) kswv_selftest kswv_nrow_zero_test bwa-mem2.sse41 bwa-mem2.sse42 bwa-mem2.avx bwa-mem2.avx2 bwa-mem2.avx512bw bwa-mem2.arm64 bwa-mem2.pgo bwa-mem2.pgo-instr bwa-mem2.pgo.* bwa-mem2.pgo-instr.*
+	rm -f $(LIBSAIS_OBJS)
 	cd ext/safestringlib/ && $(MAKE) clean
 	-[ -f ext/htslib/config.mk ] && cd ext/htslib && $(MAKE) distclean
 	rm -rf $(MIMALLOC_BUILD)
@@ -392,12 +456,16 @@ print-mimalloc-config:
 	@echo "USE_MIMALLOC=$(USE_MIMALLOC)"
 
 depend:
-	(LC_ALL=C; export LC_ALL; makedepend -Y -- $(CXXFLAGS) $(CPPFLAGS) -I. -- src/*.cpp)
+	(LC_ALL=C; export LC_ALL; makedepend -Y -- $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) -- src/*.cpp)
 
 # DO NOT DELETE
 
 src/FMI_search.o: src/FMI_search.h src/bntseq.h src/read_index_ele.h
-src/FMI_search.o: src/utils.h src/macro.h src/bwa.h src/bwt.h src/sais.h
+src/FMI_search.o: src/utils.h src/macro.h src/bwa.h src/bwt.h
+src/FMI_search.o: src/libsais_build.h
+src/libsais_build.o: src/libsais_build.h src/fm_index_writer.h src/index_prelude.h
+src/libsais_build.o: src/packed_text.h src/utils.h src/macro.h
+src/libsais_build.o: ext/libsais/include/libsais.h ext/libsais/include/libsais64.h
 src/bandedSWA.o: src/bandedSWA.h src/macro.h
 src/bntseq.o: src/bntseq.h src/utils.h src/macro.h src/kseq.h src/khash.h
 src/bwa.o: src/bntseq.h src/bwa.h src/bwt.h src/macro.h src/ksw.h src/utils.h
