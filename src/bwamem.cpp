@@ -1740,6 +1740,13 @@ void mem_reg2sam(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
 #else
         if (l && !p->is_alt && q->mapq > aa.a[0].mapq) q->mapq = aa.a[0].mapq;
 #endif
+        // fg-labs: supp alnregs whose chain contains a repetitive seed (many
+        // genome occurrences) inherit primary MAPQ despite being ambiguous on
+        // their own — upstream issue bwa-mem2/bwa-mem2#260. Opt-in override:
+        // force MAPQ=0 when the chain's most-repetitive seed exceeds the cap.
+        if (opt->supp_rep_hard_cap > 0 && l && p->secondary < 0 &&
+            p->chain_n_hits >= opt->supp_rep_hard_cap)
+            q->mapq = 0;
         ++l;
     }
     if (aa.n == 0) { // no alignments good enough; then write an unaligned record
@@ -2705,6 +2712,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
             // get the max possible span
             rmax[0] = l_pac<<1; rmax[1] = 0;
 
+            int chain_max_n_hits = 1;
             for (int i = 0; i < c->n; ++i) {
                 int64_t b, e;
                 const mem_seed_t *t = &c->seeds[i];
@@ -2716,6 +2724,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                 rmax[0] = tmp < b? rmax[0] : b;
                 rmax[1] = (rmax[1] > e)? rmax[1] : e;
                 if (t->len > max) max = t->len;
+                if (t->n_hits > chain_max_n_hits) chain_max_n_hits = t->n_hits;
             }
 
             rmax[0] = rmax[0] > 0? rmax[0] : 0;
@@ -2781,6 +2790,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                 a->frac_rep = c->frac_rep;
                 a->seedlen0 = s->len;
                 a->c = c; //ptr
+                a->chain_n_hits = chain_max_n_hits;
                 a->rb = a->qb = a->re = a->qe = H0_;
 
                 tprof[PE19][tid] ++;
