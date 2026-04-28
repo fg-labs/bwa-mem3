@@ -17,6 +17,9 @@ ok()   { echo "OK:   $*"; }
 # Build the five unit binaries.
 (cd "$HERE" && make) || fail "test/ make failed"
 
+# Build any test binaries that live outside test/Makefile.
+( cd "$ROOT" && make -j4 shm_section_find_test shm_pack_round_trip_test ) >/dev/null
+
 # synthetic_1mb.fa is checked in alongside its committed baselines so the
 # byte-diff test stays reproducible across Python versions and platforms.
 # A previous version of this script regenerated the FASTA via random.choice;
@@ -201,5 +204,18 @@ ok "libsais_hg38_slice_diff_test"
 # --- libsais --max-memory peak-RSS budget test -----------------------------
 (cd "$HERE" && ./libsais_memory_budget_test.sh) || fail "libsais_memory_budget_test"
 ok "libsais_memory_budget_test"
+
+# --- shm_section_find_test (unit: section-find helper) -----------------------
+echo "==> shm_section_find_test"
+( cd "$ROOT" && ./shm_section_find_test )
+echo "OK:   shm_section_find_test"
+
+# --- shm pack round-trip (unit: pack/unpack a phiX segment) ------------------
+(cd "$HERE" && ./shm_pack_round_trip_test.sh) || fail "shm_pack_round_trip_test"
+ok "shm_pack_round_trip_test"
+
+# --- shm end-to-end round-trip (byte-identical SAM with and without shm) -----
+(cd "$HERE" && ./shm_round_trip_test.sh) || fail "shm_round_trip_test"
+ok "shm_round_trip_test"
 
 echo "ALL UNIT TESTS PASSED"

@@ -112,6 +112,55 @@ Where
 Where <prefix> is the prefix specified when creating the index or the path to the reference fasta file in case no prefix was provided.
 ```
 
+## Shared-memory index (`shm`)
+
+The bwa-mem2 FM-index is large (~28 GB for hg38), and `bwa-mem2 mem`
+re-reads it from disk on every invocation. For workloads that align
+many small samples back-to-back on the same machine, or for benchmark
+runs that want to measure mapping in isolation from index-load cost,
+the index can be staged once into POSIX shared memory:
+
+```sh
+# Stage the index. After this, subsequent `mem` runs auto-attach.
+./bwa-mem2 shm <prefix>
+
+# List staged indices.
+./bwa-mem2 shm -l
+
+# Drop everything (does not unstage selectively — matches bwa v1).
+./bwa-mem2 shm -d
+```
+
+`bwa-mem2 mem <prefix> ...` automatically attaches when a matching
+segment is staged; no extra flag is needed. Subsequent `mem`
+invocations on the same host see the FMI, BNS, PAC, and the `.0123`
+reference string aliased into the shared mapping rather than re-read
+from disk.
+
+**Footgun: there is no staleness check.** If you re-run `bwa-mem2
+index <prefix>`, the on-disk files will not match the staged segment,
+but `mem` will still attach to the stale segment and silently
+mis-align. Always `bwa-mem2 shm -d` before re-indexing.
+
+**Basename collisions.** Per-index segment names are derived from the
+filename component of the prefix, so `/data/a/hg38` and `/data/b/hg38`
+both map to `/bwaidx-hg38` and collide. Stage one at a time, or use
+distinct prefix basenames.
+
+**macOS.** Apple's POSIX shared-memory implementation imposes its own
+per-segment size cap that is not directly the same as the SysV
+`kern.sysv.shmmax` knob. Small reference indices (a few hundred MB)
+work out of the box; larger indices may simply fail to stage with no
+straightforward operator-facing tunable. For production references
+(e.g. hg38), prefer Linux, where `/dev/shm` is a tmpfs that defaults
+to ~50% of RAM on bare metal and rarely needs tuning.
+
+**Containers.** In Docker and Kubernetes, `/dev/shm` is often much
+smaller than the host default (commonly 64 MiB) and will fail to fit
+a real reference index. Raise it explicitly: `docker run --shm-size=32g
+...`, or in Kubernetes mount an `emptyDir` with `medium: Memory` and
+a generous `sizeLimit` at `/dev/shm`.
+
 ## Performance
 
 Datasets:  

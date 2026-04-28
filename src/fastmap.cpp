@@ -42,6 +42,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "FMI_search.h"
 #include "bam_writer.h"
 #include "meth_bam.h"
+#include "bwa_shm.h"
 
 #if AFF && (__linux__)
 #include <sys/sysinfo.h>
@@ -898,6 +899,68 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "Note: Please read the man page for detailed description of the command line and options.\n");
 }
 
+/* Resolve `<prefix>.0123` to a `uint8_t *` view of the ref string. If
+ * `shm_base` is non-NULL, the FMI loader already attached this segment;
+ * resolve REF_STRING via that single mapping. Otherwise fall back to the
+ * disk slurp. The two paths must agree: if FMI came from disk, ref string
+ * must come from disk too, so we never call `bwa_shm_attach` here. */
+static uint8_t *load_ref_string(const char *prefix, uint8_t *shm_base,
+                                int64_t *rlen_out, int *is_shm_out)
+{
+    *is_shm_out = 0;
+    *rlen_out   = 0;
+
+    if (shm_base != NULL) {
+        uint64_t off = 0, sz = 0;
+        if (bwa_shm_section_find(shm_base, BWA_SHM_SEC_REF_STRING, &off, &sz) != 0) {
+            fprintf(stderr,
+                "ERROR: shm segment for '%s' is missing REF_STRING; aborting.\n"
+                "       The segment was staged by an older bwa-mem2; drop and re-stage.\n",
+                prefix);
+            exit(EXIT_FAILURE);
+        }
+        *is_shm_out = 1;
+        *rlen_out   = (int64_t)sz;
+        fprintf(stderr, "* Reference genome attached from shm: %lld bytes\n",
+                (long long)sz);
+        return shm_base + off;
+    }
+
+    /* Disk path. */
+    char binary_seq_file[PATH_MAX];
+    strcpy_s(binary_seq_file, PATH_MAX, prefix);
+    strcat_s(binary_seq_file, PATH_MAX, ".0123");
+
+    fprintf(stderr, "* Binary seq file = %s\n", binary_seq_file);
+    FILE *fr = fopen(binary_seq_file, "r");
+    if (fr == NULL) {
+        fprintf(stderr, "Error: can't open %s input file\n", binary_seq_file);
+        return NULL;
+    }
+    int64_t rlen = 0;
+    if (fseek(fr, 0, SEEK_END) != 0) {
+        fprintf(stderr, "Error: fseek failed on %s\n", binary_seq_file);
+        fclose(fr);
+        return NULL;
+    }
+    rlen = ftell(fr);
+    if (rlen <= 0) {
+        fprintf(stderr, "Error: %s is empty or unseekable (ftell=%lld)\n",
+                binary_seq_file, (long long)rlen);
+        fclose(fr);
+        return NULL;
+    }
+    uint8_t *buf = (uint8_t*) _mm_malloc(rlen, 64);
+    assert_not_null(buf, rlen, rlen);
+    bwamem_madv_hugepage(buf, rlen);
+    rewind(fr);
+    err_fread_noeof(buf, 1, rlen, fr);
+    fclose(fr);
+
+    *rlen_out = rlen;
+    return buf;
+}
+
 int main_mem(int argc, char *argv[])
 {
     int          i, c, ignore_alt = 0, no_mt_io = 0;
@@ -1242,46 +1305,23 @@ int main_mem(int argc, char *argv[])
     fprintf(stderr, "* Ref file: %s\n", ref_prefix);
     aux.fmi = new FMI_search(ref_prefix);
     aux.fmi->load_index();
+    aux.shm_base = aux.fmi->shm_attached_base();
     tprof[FMI][0] += __rdtsc() - tim;
 
-    // reading ref string from the file
+    // reading ref string (from shm if FMI attached, else from .0123 file)
     tim = __rdtsc();
     fprintf(stderr, "* Reading reference genome..\n");
-
-    char binary_seq_file[PATH_MAX];
-    strcpy_s(binary_seq_file, PATH_MAX, ref_prefix);
-    strcat_s(binary_seq_file, PATH_MAX, ".0123");
-    //sprintf(binary_seq_file, "%s.0123", argv[optind]);
-
-    fprintf(stderr, "* Binary seq file = %s\n", binary_seq_file);
-    FILE *fr = fopen(binary_seq_file, "r");
-
-    if (fr == NULL) {
-        fprintf(stderr, "Error: can't open %s input file\n", binary_seq_file);
+    int64_t rlen = 0;
+    int     ref_is_shm = 0;
+    ref_string = load_ref_string(ref_prefix, aux.shm_base, &rlen, &ref_is_shm);
+    if (ref_string == NULL) {
         exit(EXIT_FAILURE);
     }
-
-    int64_t rlen = 0;
-    fseek(fr, 0, SEEK_END);
-    rlen = ftell(fr);
-    ref_string = (uint8_t*) _mm_malloc(rlen, 64);
-    assert_not_null(ref_string, rlen, rlen);
-    aux.ref_string = ref_string;
-    /* Pack table is ~800 MB for hg38 — accessed at every candidate alignment
-     * for reference fetch. THP hint reduces dTLB pressure and tames the
-     * 4-KB-page demotion spikes that produce bimodal wall-clock variance
-     * on large indices. */
-    bwamem_madv_hugepage(ref_string, rlen);
-    rewind(fr);
-
-    /* Reading ref. sequence */
-    err_fread_noeof(ref_string, 1, rlen, fr);
-
-    uint64_t timer  = __rdtsc();
+    aux.ref_string         = ref_string;
+    aux.ref_string_is_shm  = ref_is_shm;
+    uint64_t timer = __rdtsc();
     tprof[REF_IO][0] += timer - tim;
-
-    fclose(fr);
-    fprintf(stderr, "* Reference genome size: %ld bp\n", rlen);
+    fprintf(stderr, "* Reference genome size: %ld bp\n", (long)rlen);
     fprintf(stderr, "* Done reading reference genome !!\n\n");
 
     if (ignore_alt)
@@ -1449,7 +1489,11 @@ int main_mem(int argc, char *argv[])
 
     // free memory
     int32_t nt = aux.opt->n_threads;
-    _mm_free(ref_string);
+    if (!aux.ref_string_is_shm) {
+        _mm_free(ref_string);
+    }
+    /* When ref_string aliases shm, the segment is owned by the loader
+     * process; the kernel reclaims the mapping at process exit. */
     free(hdr_line);
     free(idx_hdr_lines);
     free(opt);

@@ -32,7 +32,9 @@ Authors: Sanchit Misra <sanchit.misra@intel.com>; Vasimuddin Md <vasimuddin.md@i
 #include <stdlib.h>
 #include <inttypes.h>
 #include <climits>
+#include <sys/mman.h>     /* munmap */
 #include "bwa_madvise.h"
+#include "bwa_shm.h"
 #include "FMI_search.h"
 #include "memcpy_bwamem.h"
 #include "profiling.h"
@@ -43,26 +45,123 @@ Authors: Sanchit Misra <sanchit.misra@intel.com>; Vasimuddin Md <vasimuddin.md@i
 FMI_search::FMI_search(const char *fname)
 {
     fprintf(stderr, "* Entering FMI_search\n");
-    //strcpy(file_name, fname);
     strcpy_s(file_name, PATH_MAX, fname);
     reference_seq_len = 0;
     sentinel_index = 0;
     sa_ls_word = NULL;
     sa_ms_byte = NULL;
     cp_occ = NULL;
-    one_hot_mask_array = NULL;
+    shm_base = NULL;
+    shm_len = 0;
+
+    /* one_hot_mask_array is constant across the FMI's lifetime and is
+     * identical on disk and shm paths; initialize it once at construction. */
+    int64_t one_hot_bytes = 64 * (int64_t)sizeof(uint64_t);
+    one_hot_mask_array = (uint64_t *)_mm_malloc(one_hot_bytes, 64);
+    assert_not_null(one_hot_mask_array, one_hot_bytes, one_hot_bytes);
+    one_hot_mask_array[0] = 0;
+    uint64_t base = 0x8000000000000000L;
+    one_hot_mask_array[1] = base;
+    for (int64_t i = 2; i < 64; ++i) {
+        one_hot_mask_array[i] = (one_hot_mask_array[i - 1] >> 1) | base;
+    }
 }
 
 FMI_search::~FMI_search()
 {
-    if(sa_ms_byte)
-        _mm_free(sa_ms_byte);
-    if(sa_ls_word)
-        _mm_free(sa_ls_word);
-    if(cp_occ)
-        _mm_free(cp_occ);
-    if(one_hot_mask_array)
-        _mm_free(one_hot_mask_array);
+    /* When attached from shm, cp_occ/sa_*_byte/sa_*_word alias mmap'd pages
+     * owned by the shm segment, so we don't _mm_free them. We do munmap the
+     * mapping itself — leaving it would leak VA in long-lived processes that
+     * construct and destroy FMI_search repeatedly. */
+    if (shm_base != NULL) {
+        munmap(shm_base, shm_len);
+        shm_base = NULL;
+        shm_len  = 0;
+    } else {
+        if (sa_ms_byte) _mm_free(sa_ms_byte);
+        if (sa_ls_word) _mm_free(sa_ls_word);
+        if (cp_occ)     _mm_free(cp_occ);
+    }
+    if (one_hot_mask_array) _mm_free(one_hot_mask_array);
+}
+
+int64_t FMI_search::cp_occ_size_bytes() const {
+    return ((reference_seq_len >> CP_SHIFT) + 1) * (int64_t)sizeof(CP_OCC);
+}
+
+int64_t FMI_search::sa_sample_count() const {
+    return (reference_seq_len >> SA_COMPX) + 1;
+}
+
+void FMI_search::load_index_from_shm(uint8_t *base, size_t len)
+{
+    if (base == NULL) {
+        fprintf(stderr, "ERROR! load_index_from_shm called with NULL base\n");
+        exit(EXIT_FAILURE);
+    }
+    uint64_t off = 0, sz = 0;
+
+    if (bwa_shm_section_find(base, BWA_SHM_SEC_FMI_SCALARS, &off, &sz) != 0
+        || sz != BWA_SHM_FMI_SCALARS_BYTES) {
+        fprintf(stderr, "ERROR! shm segment missing or malformed FMI_SCALARS\n");
+        exit(EXIT_FAILURE);
+    }
+    memcpy(&reference_seq_len, base + off,                                    sizeof(int64_t));
+    memcpy(count,              base + off + sizeof(int64_t),                  sizeof(int64_t) * 5);
+    memcpy(&sentinel_index,    base + off + sizeof(int64_t) * 6,              sizeof(int64_t));
+
+    /* Validate scalars before we use reference_seq_len in cp_occ_size_bytes()
+     * and the SA size accessors. Bounds match the disk path's asserts in
+     * load_index() and the writer-side checks in bwa_shm_compute(). A corrupt
+     * segment would otherwise drive negative or overflowing section sizes. */
+    if (reference_seq_len <= 0 || reference_seq_len > 0x7fffffffffLL) {
+        fprintf(stderr,
+            "ERROR! shm FMI_SCALARS: reference_seq_len=%lld out of bounds\n",
+            (long long)reference_seq_len);
+        exit(EXIT_FAILURE);
+    }
+    /* count[] is +1-adjusted by bwa_shm_compute; range [1, ref_seq_len+1]. */
+    for (int i = 0; i < 5; ++i) {
+        if (count[i] < 0 || count[i] > reference_seq_len + 1) {
+            fprintf(stderr,
+                "ERROR! shm FMI_SCALARS: count[%d]=%lld out of bounds (ref_seq_len=%lld)\n",
+                i, (long long)count[i], (long long)reference_seq_len);
+            exit(EXIT_FAILURE);
+        }
+    }
+    if (sentinel_index < 0 || sentinel_index >= reference_seq_len) {
+        fprintf(stderr,
+            "ERROR! shm FMI_SCALARS: sentinel_index=%lld out of bounds (ref_seq_len=%lld)\n",
+            (long long)sentinel_index, (long long)reference_seq_len);
+        exit(EXIT_FAILURE);
+    }
+
+    if (bwa_shm_section_find(base, BWA_SHM_SEC_FMI_CP_OCC, &off, &sz) != 0
+        || (int64_t)sz != cp_occ_size_bytes()) {
+        fprintf(stderr, "ERROR! shm segment missing or sized FMI_CP_OCC\n");
+        exit(EXIT_FAILURE);
+    }
+    cp_occ = (CP_OCC *)(base + off);
+
+    if (bwa_shm_section_find(base, BWA_SHM_SEC_FMI_SA_MS, &off, &sz) != 0
+        || (int64_t)sz != sa_ms_byte_size_bytes()) {
+        fprintf(stderr, "ERROR! shm segment missing or sized FMI_SA_MS\n");
+        exit(EXIT_FAILURE);
+    }
+    sa_ms_byte = (int8_t *)(base + off);
+
+    if (bwa_shm_section_find(base, BWA_SHM_SEC_FMI_SA_LS, &off, &sz) != 0
+        || (int64_t)sz != sa_ls_word_size_bytes()) {
+        fprintf(stderr, "ERROR! shm segment missing or sized FMI_SA_LS\n");
+        exit(EXIT_FAILURE);
+    }
+    sa_ls_word = (uint32_t *)(base + off);
+
+    shm_base = base;
+    shm_len  = len;
+
+    fprintf(stderr, "* FMI attached from shm: ref_seq_len=%ld sentinel_index=%ld\n",
+            (long)reference_seq_len, (long)sentinel_index);
 }
 
 int FMI_search::build_index() {
@@ -120,20 +219,25 @@ int FMI_search::build_index() {
 
 void FMI_search::load_index()
 {
+    /* Try the staged shm segment first. On hit, both the FMI internals
+     * (cp_occ / sa_*) and the BNS+PAC are attached as views into the
+     * mapping; the segment lifetime belongs to the shm-loading process. */
+    {
+        size_t   shm_attach_len = 0;
+        uint8_t *shm_base_local = bwa_shm_attach(file_name, &shm_attach_len);
+        if (shm_base_local != NULL) {
+            load_index_from_shm(shm_base_local, shm_attach_len);
+            bwa_idx_load_ele_from_shm(shm_base_local, shm_attach_len);
+            fprintf(stderr, "* FMI+BNS+PAC attached from shm; "
+                    "skipping disk load.\n");
+            return;
+        }
+    }
+
     // Running total of index bytes allocated so far in this function.
     // Passed to assert_not_null so a failed allocation reports both the
     // attempted size and how much we'd already committed before failing.
     int64_t index_alloc = 0;
-
-    one_hot_mask_array = (uint64_t *)_mm_malloc(64 * sizeof(uint64_t), 64);
-    one_hot_mask_array[0] = 0;
-    uint64_t base = 0x8000000000000000L;
-    one_hot_mask_array[1] = base;
-    int64_t i = 0;
-    for(i = 2; i < 64; i++)
-    {
-        one_hot_mask_array[i] = (one_hot_mask_array[i - 1] >> 1) | base;
-    }
 
     char *ref_file_name = file_name;
     //beCalls = 0;

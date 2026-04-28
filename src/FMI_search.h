@@ -100,9 +100,32 @@ class FMI_search: public indexEle
     FMI_search(const char *fname);
     ~FMI_search();
     //int64_t beCalls;
-    
+
+    /* Read-only size accessors. Used by load_index_from_shm for section
+     * validation, and by the round-trip test for byte-equality checks. */
+    int64_t cp_occ_size_bytes()      const;
+    int64_t sa_sample_count()        const;
+    int64_t sa_ms_byte_size_bytes()  const { return sa_sample_count() * (int64_t)sizeof(int8_t); }
+    int64_t sa_ls_word_size_bytes() const { return sa_sample_count() * (int64_t)sizeof(uint32_t); }
+
+    /* Read-only data accessors. Used by the round-trip test to byte-compare
+     * the packed segment payload against the in-memory loader's buffers. */
+    const void     *cp_occ_data()     const { return cp_occ; }
+    const int8_t   *sa_ms_byte_data() const { return sa_ms_byte; }
+    const uint32_t *sa_ls_word_data() const { return sa_ls_word; }
+    const int64_t  *count_data()      const { return count; }
+
+    /* Return the shm segment base if load_index attached from shm, else NULL.
+     * fastmap reuses this so it doesn't have to re-attach for the ref string. */
+    uint8_t *shm_attached_base()     const { return shm_base; }
+
     int build_index();
     void load_index();
+
+    /* Attach to a packed bwa-mem2 index segment from bwa_shm_attach. Sets
+     * scalars and the cp_occ / sa_ms_byte / sa_ls_word pointers; the
+     * destructor munmaps `base` and leaves the aliased buffers untouched. */
+    void load_index_from_shm(uint8_t *base, size_t len);
 
     /* matchArray sizing contract (applies to all four SMEM-emitting methods
      * below). The previous internal `max_smem` capacity guard was removed;
@@ -224,6 +247,14 @@ private:
         CP_OCC *cp_occ;
 
         uint64_t *one_hot_mask_array;
+
+        /* If non-NULL, cp_occ / sa_ms_byte / sa_ls_word point into a shared
+         * memory mapping owned by the shm segment rather than being
+         * _mm_malloc'd. shm_len is the byte length of the mapping so the
+         * destructor can munmap it; the destructor also skips _mm_free on
+         * shm-backed buffers. */
+        uint8_t *shm_base;
+        size_t   shm_len;
 
         SMEM backwardExt(SMEM smem, uint8_t a);
 
