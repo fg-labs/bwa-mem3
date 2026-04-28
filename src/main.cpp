@@ -31,6 +31,7 @@ Contacts: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@
 // ----------------------------------
 #include "main.h"
 #include "version.h"
+#include "bwa_shm.h"
 
 #ifdef USE_MIMALLOC
 #include <mimalloc.h>
@@ -48,6 +49,7 @@ int usage()
     fprintf(stderr, "Commands:\n");
     fprintf(stderr, "  index         create index (add --meth to build a bwameth-style doubled c2t reference)\n");
     fprintf(stderr, "  mem           alignment (add --meth for bisulfite-seq: inline c2t + BAM output)\n");
+    fprintf(stderr, "  shm           load/list/drop the index in POSIX shared memory\n");
     fprintf(stderr, "  version       print version number\n");
     fprintf(stderr, "Run `bwa-mem2 <command> --help` for command-specific options.\n");
     return 1;
@@ -173,6 +175,10 @@ int main(int argc, char* argv[])
         }
 #endif
         return 0;
+    }
+    else if (strcmp(argv[1], "shm") == 0)
+    {
+        return main_shm(argc - 1, argv + 1);
     }
     else {
         fprintf(stderr, "ERROR: unknown command '%s'\n", argv[1]);

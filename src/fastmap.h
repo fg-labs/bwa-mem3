@@ -67,7 +67,9 @@ typedef struct {
 	int64_t actual_chunk_size;
 	FILE *fp;
 	uint8_t *ref_string;
+	int      ref_string_is_shm;   /* 1 if ref_string aliases shm pages; do not _mm_free. */
 	FMI_search *fmi;
+	uint8_t *shm_base;            /* if non-NULL, the active /bwaidx-<base> mapping */
 	struct bam_writer_s *bam_writer;  /* non-NULL when opt->bam_mode is set */
 } ktp_aux_t;
 

@@ -60,6 +60,17 @@ public:
 	indexEle();
 	~indexEle();
 	void bwa_idx_load_ele(const char *hint, int which);
-	char *bwa_idx_infer_prefix(const char *hint);	
+	char *bwa_idx_infer_prefix(const char *hint);
+
+	/* Attach BNS + PAC from a packed bwa-mem2 index segment produced by
+	 * bwa_shm_pack_from_disk. `base`/`len` describe the segment (typically
+	 * from bwa_shm_attach). The bntseq_t struct and anns[] array are
+	 * heap-copied (mapper mutates them); ambs[], name/anno strings, and
+	 * pac are aliased into the segment. Sets idx->is_shm=1 and idx->mem,
+	 * idx->l_mem so the existing destructor gate skips the wrong frees.
+	 * The segment's lifetime belongs to the loader process; shm pages are
+	 * never freed by this object.
+	 */
+	void bwa_idx_load_ele_from_shm(uint8_t *base, size_t len);
 };
 #endif
