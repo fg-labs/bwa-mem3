@@ -172,15 +172,20 @@ $(INTEGRATION_DIR)/placeholder.o: $(INTEGRATION_DIR)/placeholder.cpp
 # test binary via $(LIBS) — they appear as bare paths inside the link
 # command, NOT as make prerequisites, so make doesn't know to build them
 # on demand. Delegate to the parent Makefile's LIBSAIS_OBJS rule
-# (-DLIBSAIS_OPENMP / -O3 flag set stays in one place) and gate $(EXE)
-# behind it via an order-only prerequisite — fires once per invocation
-# without forcing the test binaries to relink. The parent's target paths
-# are relative to its own dir, so we drop the leading `../` when
-# invoking it.
+# (-DLIBSAIS_OPENMP / -O3 flag set stays in one place) and gate every test
+# binary behind it via an order-only prerequisite — fires once per
+# invocation without forcing the test binaries to relink. The parent's
+# target paths are relative to its own dir, so we drop the leading `../`
+# when invoking it.
+#
+# Cover both the legacy $(EXE) binaries AND the doctest unit/integration
+# binaries: when libbwa.a is restored from a CI cache without a fresh
+# parent `make` (e.g. proto-neon-kswv.yml's both-caches-hit path), $(BWA_LIB)
+# is already up-to-date so the parent never triggers libsais.o on its own.
 libsais-objs:
 	$(MAKE) -C .. ext/libsais/src/libsais.o ext/libsais/src/libsais64.o
 
-$(EXE): | libsais-objs
+$(EXE) $(UNIT_BIN) $(INTEGRATION_BIN): | libsais-objs
 
 # NB: $(LDFLAGS) is threaded through every link rule below so COVERAGE=1
 # (which appends --coverage to LDFLAGS at the top of the file) propagates
