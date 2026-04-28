@@ -1,50 +1,32 @@
-##/*************************************************************************************
-##                           The MIT License
+##*****************************************************************************
+##  bwa-mem2 test build
 ##
-##   BWA-MEM2  (Sequence alignment using Burrows-Wheeler Transform),
-##   Copyright (C) 2019  Intel Corporation, Heng Li.
+##  This Makefile produces:
+##    - test/framework/libbwa_test_framework.a    (shared test-helper lib)
+##    - test/bwa_mem2_tests_unit                  (doctest unit binary)
+##    - test/bwa_mem2_tests_integration           (doctest integration binary)
+##    - test/fmi_test, smem2_test, ...            (legacy per-binary tests,
+##                                                  migrated one-by-one in
+##                                                  follow-up PRs)
 ##
-##   Permission is hereby granted, free of charge, to any person obtaining
-##   a copy of this software and associated documentation files (the
-##   "Software"), to deal in the Software without restriction, including
-##   without limitation the rights to use, copy, modify, merge, publish,
-##   distribute, sublicense, and/or sell copies of the Software, and to
-##   permit persons to whom the Software is furnished to do so, subject to
-##   the following conditions:
-##
-##   The above copyright notice and this permission notice shall be
-##   included in all copies or substantial portions of the Software.
-##
-##   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
-##   EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-##   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
-##   NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
-##   BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
-##   ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
-##   CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-##   SOFTWARE.
-##
-##Contacts: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@intel.com>;
-##                                Heng Li <hli@jimmy.harvard.edu> 
-##*****************************************************************************************/
+##  Arch flags (CXX, CXXFLAGS, CPPFLAGS, INCLUDES, LIBS) inherit from the
+##  parent Makefile when invoked via `make -C test`. Override on the command
+##  line for local builds that don't go through the parent (e.g. macOS ARM
+##  direct builds — see the ARM branch below).
+##*****************************************************************************
 
+EXE = fmi_test smem2_test bwt_seed_strategy_test sa2ref_test xeonbsw smem_lockstep_parity_test header_insert_test packed_text_test system_test
 
-EXE=		fmi_test smem2_test bwt_seed_strategy_test sa2ref_test xeonbsw smem_lockstep_parity_test header_insert_test packed_text_test system_test
+# Doctest binaries — rules populated in Task 14 (unit) and Task 15
+# (integration). Listed separately from $(EXE) so `all` and
+# `run_unit_tests.sh` keep working during the framework-scaffolding PR.
+DOCTEST_BINS = bwa_mem2_tests_unit bwa_mem2_tests_integration
 
-# Match the parent Makefile's compiler + flag selection. Detect ARM
-# (Apple Silicon arm64 and Linux aarch64) and wire in OpenMP, sse2neon
-# SSE-to-NEON translation, and (on macOS) Accelerate. On Linux x86 the
-# original Intel toolchain used icpc; this now defaults to g++ so CI
-# (which has no icpc) can build. Override with e.g. `make CXX=icpc` or
-# `make CXX=clang++` to restore or change.
 UNAME_M := $(shell uname -m)
 UNAME_S := $(shell uname -s)
 IS_ARM  := $(filter $(UNAME_M),arm64 aarch64)
 
 ifneq ($(IS_ARM),)
-    # ARM build: requires libomp for OpenMP (brew install libomp on macOS;
-    # libgomp via system compiler on Linux aarch64) and sse2neon to
-    # translate the SSE intrinsics used through ../src/simd_compat.h.
     CXX ?= clang++
     ifeq ($(UNAME_S),Darwin)
         LIBOMP_PREFIX ?= $(shell brew --prefix libomp 2>/dev/null)
@@ -52,71 +34,185 @@ ifneq ($(IS_ARM),)
             $(error libomp not found: install with `brew install libomp`, or set LIBOMP_PREFIX to its install prefix)
         endif
         CXXFLAGS ?= -std=c++11 -O2 -Xpreprocessor -fopenmp -I$(LIBOMP_PREFIX)/include
-        LIBS ?= -L.. -L$(LIBOMP_PREFIX)/lib -lomp -lbwa ../ext/libsais/src/libsais.o ../ext/libsais/src/libsais64.o -lz -framework Accelerate ../ext/safestringlib/libsafestring.a
+        LIBS     ?= -L.. -L$(LIBOMP_PREFIX)/lib -lomp -lbwa ../ext/libsais/src/libsais.o ../ext/libsais/src/libsais64.o -lz -framework Accelerate ../ext/safestringlib/libsafestring.a
     else
         CXXFLAGS ?= -std=c++11 -O2 -fopenmp
-        LIBS ?= -L.. -fopenmp -lbwa ../ext/libsais/src/libsais.o ../ext/libsais/src/libsais64.o -lz ../ext/safestringlib/libsafestring.a
+        LIBS     ?= -L.. -fopenmp -lbwa ../ext/libsais/src/libsais.o ../ext/libsais/src/libsais64.o -lz ../ext/safestringlib/libsafestring.a
     endif
 else
-    CXX ?=      g++
+    CXX      ?= g++
     CXXFLAGS ?= -std=c++11 -fopenmp -mtune=native -march=native
-    LIBS ?=     -L.. -fopenmp -lbwa ../ext/libsais/src/libsais.o ../ext/libsais/src/libsais64.o -lz ../ext/safestringlib/libsafestring.a
+    LIBS     ?= -L.. -fopenmp -lbwa ../ext/libsais/src/libsais.o ../ext/libsais/src/libsais64.o -lz ../ext/safestringlib/libsafestring.a
 endif
 
-# CPPFLAGS / INCLUDES: add sse2neon SSE-emulation macros + include path
-# on ARM so ../src/simd_compat.h can translate the SSE intrinsics used
-# by fmi_test.cpp et al. Add APPLE_SILICON + CACHE_LINE_BYTES=128 to
-# match the parent Makefile's ARM flags.
 ifneq ($(IS_ARM),)
     CPPFLAGS = -DENABLE_PREFETCH -D__SSE__=1 -D__SSE2__=1 -D__SSE3__=1 -D__SSSE3__=1 -D__SSE4_1__=1 -D__SSE4_2__=1 -DAPPLE_SILICON=1 -DCACHE_LINE_BYTES=128
-    INCLUDES = -I../src -I../ext/safestringlib/include -I../ext/sse2neon
+    INCLUDES = -I../src -I../ext/safestringlib/include -I../ext/sse2neon -I../ext
 else
     CPPFLAGS = -DENABLE_PREFETCH
-    INCLUDES = -I../src -I../ext/safestringlib/include
+    INCLUDES = -I../src -I../ext/safestringlib/include -I../ext
 endif
 
-.PHONY:all clean depend libsais-objs
-.SUFFIXES:.cpp .o
+FRAMEWORK_DIR   := framework
+INTEGRATION_DIR := integration
+UNIT_DIR        := unit
+
+# ARCH_FLAGS_FROM_PARENT: propagated from the parent Makefile's
+# `test-binaries` target so the test build sees the same __AVX2__ /
+# __AVX512BW__ / APPLE_SILICON macros as libbwa.a. Required for the
+# BWA_TESTS_HAVE_KSWV macro in kswv_runner.h to evaluate consistently
+# between libbwa.a and the test binary.
+#
+# IMPORTANT: we also strip -march=native / -mtune=native from the
+# default CXXFLAGS. Those flags enable every feature the runner CPU
+# supports (so e.g. an AVX2-capable runner silently defines __AVX2__
+# even on the `sse41` matrix row) and GCC only has -mno-<feat> to
+# disable, not -m<arch-only>. Stripping + re-adding the parent's
+# arch flags gives the test build the same ISA surface libbwa.a saw.
+ifneq ($(ARCH_FLAGS_FROM_PARENT),)
+    CXXFLAGS := $(filter-out -march=native -mtune=native,$(CXXFLAGS)) $(ARCH_FLAGS_FROM_PARENT)
+endif
+
+# COVERAGE=1 augments CXXFLAGS/LDFLAGS with --coverage and overrides -O2 with
+# -O0 so gcov line numbers correspond 1:1 with source. Consumed by the CI
+# `coverage` job. Matches the parent Makefile's coverage plumbing.
+ifneq ($(COVERAGE),)
+    CXXFLAGS += -O0 --coverage
+    LDFLAGS  += --coverage
+endif
+FRAMEWORK_SRCS := $(FRAMEWORK_DIR)/scoring.cpp \
+                  $(FRAMEWORK_DIR)/seqpair_gen.cpp \
+                  $(FRAMEWORK_DIR)/seqpair_batch.cpp \
+                  $(FRAMEWORK_DIR)/ksw_runner.cpp \
+                  $(FRAMEWORK_DIR)/kswv_runner.cpp \
+                  $(FRAMEWORK_DIR)/kswr_cmp.cpp \
+                  $(FRAMEWORK_DIR)/junit_reporter.cpp \
+                  $(FRAMEWORK_DIR)/test_main.cpp
+FRAMEWORK_OBJS := $(FRAMEWORK_SRCS:.cpp=.o)
+FRAMEWORK_LIB  := $(FRAMEWORK_DIR)/libbwa_test_framework.a
+
+FRAMEWORK_INCLUDES := $(INCLUDES) -I$(FRAMEWORK_DIR)
+
+# Legacy integration-binary sources live under integration/ after the
+# Task 11 migration. We still emit their binaries at test/<name> so that
+# run_unit_tests.sh and the proto-neon-kswv.yml workflow keep working.
+# No `vpath` is needed: every legacy target spells out its source as
+# $(INTEGRATION_DIR)/<name>.o, satisfied by the explicit pattern rule
+# further down.
+
+.PHONY: all framework unit integration clean libsais-objs
+.SUFFIXES: .cpp .o
+
+# Default: build everything.
+all: framework unit integration $(EXE)
+
+# -- Framework static lib ----------------------------------------------------
+
+framework: $(FRAMEWORK_LIB)
+
+$(FRAMEWORK_LIB): $(FRAMEWORK_OBJS)
+	ar rcs $@ $^
+
+$(FRAMEWORK_DIR)/%.o: $(FRAMEWORK_DIR)/%.cpp
+	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(FRAMEWORK_INCLUDES) -MMD -MP $< -o $@
+
+# -- Doctest unit/integration binaries (populated in Task 12 + 13) ---------
+
+UNIT_SRCS := $(wildcard $(UNIT_DIR)/test_*.cpp)
+UNIT_OBJS := $(UNIT_SRCS:.cpp=.o)
+UNIT_BIN  := bwa_mem2_tests_unit
+
+# Fail fast if no test_*.cpp files are present in unit/. The link line
+# would otherwise pull only test_main.o out of the framework lib and
+# silently produce a binary with zero TEST_CASEs that reports "no
+# assertions" as a green CI run.
+#
+# Gate the check on the active goals so `make clean` (and other
+# non-build targets) still works on a checkout with no unit tests yet.
+# `$(error ...)` is evaluated at parse time, regardless of the requested
+# goal, so without the MAKECMDGOALS filter every invocation would abort.
+ifeq ($(strip $(UNIT_SRCS)),)
+  ifneq ($(filter unit all,$(or $(MAKECMDGOALS),all)),)
+    $(error No test_*.cpp sources found in $(UNIT_DIR)/. Add a unit test or pick a different target (e.g. `make -C test clean`).)
+  endif
+endif
+
+unit: $(UNIT_BIN)
+
+$(UNIT_BIN): $(UNIT_OBJS) $(FRAMEWORK_LIB)
+	$(CXX) $(LDFLAGS) -o $@ $(UNIT_OBJS) $(FRAMEWORK_LIB) $(LIBS)
+
+$(UNIT_DIR)/%.o: $(UNIT_DIR)/%.cpp
+	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(FRAMEWORK_INCLUDES) -MMD -MP $< -o $@
+
+INTEGRATION_TEST_SRCS := $(wildcard $(INTEGRATION_DIR)/test_*.cpp) \
+                         $(wildcard $(INTEGRATION_DIR)/placeholder.cpp)
+INTEGRATION_TEST_OBJS := $(INTEGRATION_TEST_SRCS:.cpp=.o)
+INTEGRATION_BIN       := bwa_mem2_tests_integration
+
+integration: $(INTEGRATION_BIN)
+
+$(INTEGRATION_BIN): $(INTEGRATION_TEST_OBJS) $(FRAMEWORK_LIB)
+	$(CXX) $(LDFLAGS) -o $@ $(INTEGRATION_TEST_OBJS) $(FRAMEWORK_LIB) $(LIBS)
+
+# Integration tests use the framework headers; override the generic
+# integration/%.o rule added in Task 12 for test_* / placeholder files.
+$(INTEGRATION_DIR)/test_%.o: $(INTEGRATION_DIR)/test_%.cpp
+	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(FRAMEWORK_INCLUDES) -MMD -MP $< -o $@
+
+$(INTEGRATION_DIR)/placeholder.o: $(INTEGRATION_DIR)/placeholder.cpp
+	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(FRAMEWORK_INCLUDES) -MMD -MP $< -o $@
+
+# -- Legacy per-binary tests (sources under integration/; binaries emit in test/) -
 
 .cpp.o:
 	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $< -o $@
-
-all:$(EXE)
 
 # libsais object files live in the parent build tree and link into every
 # test binary via $(LIBS) — they appear as bare paths inside the link
 # command, NOT as make prerequisites, so make doesn't know to build them
 # on demand. Delegate to the parent Makefile's LIBSAIS_OBJS rule
-# (-DLIBSAIS_OPENMP / -O3 flag set stays in one place) and gate $(EXE)
-# behind it via an order-only prerequisite — fires once per invocation
-# without forcing the test binaries to relink. The parent's target paths
-# are relative to its own dir, so we drop the leading `../` when
-# invoking it.
+# (-DLIBSAIS_OPENMP / -O3 flag set stays in one place) and gate every test
+# binary behind it via an order-only prerequisite — fires once per
+# invocation without forcing the test binaries to relink. The parent's
+# target paths are relative to its own dir, so we drop the leading `../`
+# when invoking it.
+#
+# Cover both the legacy $(EXE) binaries AND the doctest unit/integration
+# binaries: when libbwa.a is restored from a CI cache without a fresh
+# parent `make` (e.g. proto-neon-kswv.yml's both-caches-hit path), $(BWA_LIB)
+# is already up-to-date so the parent never triggers libsais.o on its own.
 libsais-objs:
 	$(MAKE) -C .. ext/libsais/src/libsais.o ext/libsais/src/libsais64.o
 
-$(EXE): | libsais-objs
+$(EXE) $(UNIT_BIN) $(INTEGRATION_BIN): | libsais-objs
 
-fmi_test:fmi_test.o
-	$(CXX) -o $@ $^ $(LIBS)
+# NB: $(LDFLAGS) is threaded through every link rule below so COVERAGE=1
+# (which appends --coverage to LDFLAGS at the top of the file) propagates
+# uniformly. Without it, `make -C test all COVERAGE=1` would leave the
+# legacy binaries with unresolved __gcov_* symbols even though the .o
+# files were compiled with --coverage. CI doesn't rebuild these targets
+# under coverage, but local-dev `make all` did.
+fmi_test: $(INTEGRATION_DIR)/fmi_test.o
+	$(CXX) $(LDFLAGS) -o $@ $^ $(LIBS)
 
-smem2_test: smem2_test.o
-	$(CXX) -o $@ $^ $(LIBS)
+smem2_test: $(INTEGRATION_DIR)/smem2_test.o
+	$(CXX) $(LDFLAGS) -o $@ $^ $(LIBS)
 
-sa2ref_test: sa2ref_test.o
-	$(CXX) -o $@ $^ $(LIBS)
+sa2ref_test: $(INTEGRATION_DIR)/sa2ref_test.o
+	$(CXX) $(LDFLAGS) -o $@ $^ $(LIBS)
 
-bwt_seed_strategy_test:bwt_seed_strategy_test.o
-	$(CXX) -o $@ $^ $(LIBS)
+bwt_seed_strategy_test: $(INTEGRATION_DIR)/bwt_seed_strategy_test.o
+	$(CXX) $(LDFLAGS) -o $@ $^ $(LIBS)
 
-xeonbsw:main_banded.o
-	$(CXX) -o $@ $^ $(LIBS)
+xeonbsw: $(INTEGRATION_DIR)/main_banded.o
+	$(CXX) $(LDFLAGS) -o $@ $^ $(LIBS)
 
 smem_lockstep_parity_test: smem_lockstep_parity_test.o
-	$(CXX) -o $@ $^ $(LIBS)
+	$(CXX) $(LDFLAGS) -o $@ $^ $(LIBS)
 
-header_insert_test:header_insert_test.o
-	$(CXX) -o $@ $^ $(LIBS)
+header_insert_test: header_insert_test.o
+	$(CXX) $(LDFLAGS) -o $@ $^ $(LIBS)
 
 # Build test-local copies of packed_text.cpp / system.cpp into test/
 # rather than ../src/. The parent build's CXXFLAGS (`-O3 -fpermissive`,
@@ -139,22 +235,32 @@ system_test.o: ../src/system.h
 system_lib.o: ../src/system.cpp ../src/system.h
 	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $< -o $@
 
+$(INTEGRATION_DIR)/%.o: $(INTEGRATION_DIR)/%.cpp
+	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $< -o $@
+
 
 clean:
-	rm -fr *.o $(EXE)
+	rm -f *.o *.d $(INTEGRATION_DIR)/*.o $(INTEGRATION_DIR)/*.d \
+	      $(UNIT_DIR)/*.o $(UNIT_DIR)/*.d \
+	      $(FRAMEWORK_OBJS) $(FRAMEWORK_DIR)/*.d $(FRAMEWORK_LIB) $(EXE) $(DOCTEST_BINS)
+	rm -f *.gcno *.gcda $(INTEGRATION_DIR)/*.gcno $(INTEGRATION_DIR)/*.gcda \
+	      $(UNIT_DIR)/*.gcno $(UNIT_DIR)/*.gcda \
+	      $(FRAMEWORK_DIR)/*.gcno $(FRAMEWORK_DIR)/*.gcda
 
+# Pull in auto-generated header deps so editing a header triggers a
+# rebuild of dependent .o files. Generated by -MMD -MP on each compile.
+-include $(FRAMEWORK_OBJS:.o=.d) $(UNIT_OBJS:.o=.d) $(INTEGRATION_TEST_OBJS:.o=.d)
 
 # DO NOT DELETE
-
-bwt_seed_strategy_test.o: ../src/FMI_search.h ../src/bntseq.h ../src/read_index_ele.h
-bwt_seed_strategy_test.o: ../src/bwa.h ../src/bwt.h ../src/utils.h ../src/macro.h
-fmi_test.o: ../src/FMI_search.h ../src/bntseq.h ../src/read_index_ele.h
-fmi_test.o: ../src/bwa.h ../src/bwt.h ../src/utils.h ../src/macro.h
-main_banded.o: ../src/bandedSWA.h ../src/macro.h
-sa2ref_test.o: ../src/FMI_search.h ../src/bntseq.h ../src/read_index_ele.h
-sa2ref_test.o: ../src/bwa.h ../src/bwt.h ../src/utils.h ../src/macro.h
-smem2_test.o: ../src/FMI_search.h ../src/bntseq.h ../src/read_index_ele.h
-smem2_test.o: ../src/bwa.h ../src/bwt.h ../src/utils.h ../src/macro.h
+integration/bwt_seed_strategy_test.o: ../src/FMI_search.h ../src/bntseq.h ../src/read_index_ele.h
+integration/bwt_seed_strategy_test.o: ../src/bwa.h ../src/bwt.h ../src/utils.h ../src/macro.h
+integration/fmi_test.o: ../src/FMI_search.h ../src/bntseq.h ../src/read_index_ele.h
+integration/fmi_test.o: ../src/bwa.h ../src/bwt.h ../src/utils.h ../src/macro.h
+integration/main_banded.o: ../src/bandedSWA.h ../src/macro.h
+integration/sa2ref_test.o: ../src/FMI_search.h ../src/bntseq.h ../src/read_index_ele.h
+integration/sa2ref_test.o: ../src/bwa.h ../src/bwt.h ../src/utils.h ../src/macro.h
+integration/smem2_test.o: ../src/FMI_search.h ../src/bntseq.h ../src/read_index_ele.h
+integration/smem2_test.o: ../src/bwa.h ../src/bwt.h ../src/utils.h ../src/macro.h
 smem_lockstep_parity_test.o: ../src/FMI_search.h ../src/bntseq.h ../src/read_index_ele.h
 smem_lockstep_parity_test.o: ../src/bwa.h ../src/bwt.h ../src/utils.h ../src/macro.h
 header_insert_test.o: ../src/bwa.h

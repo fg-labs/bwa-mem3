@@ -5,42 +5,63 @@ on:
     branches: [master, fg-main]
   pull_request:
 
+env:
+  # Pin dwgsim so simulated reads are reproducible and the CI cache key
+  # (keyed on this ref) is valid.
+  DWGSIM_REF: "dwgsim.0.1.16"
+  # phiX174 genome URL (NCBI, immutable content).
+  PHIX_URL: "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/819/615/GCF_000819615.1_ViralProj14015/GCF_000819615.1_ViralProj14015_genomic.fna.gz"
+
 jobs:
   build-and-test:
     strategy:
       fail-fast: false
+      # Each row carries `artifact_slug` (a-z0-9-) alongside the human-
+      # friendly `name`. Artifact uploads use the slug to keep names URL-
+      # safe and free of spaces / parens; job titles still use `name`.
       matrix:
         include:
           - os: ubuntu-latest
             arch_flag: "sse41"
             use_mimalloc: "1"
+            run_integration: true
             name: "Linux x86_64 SSE4.1 (mimalloc)"
+            artifact_slug: "linux-x86_64-sse41-mimalloc"
           - os: ubuntu-latest
             arch_flag: "avx2"
             use_mimalloc: "1"
             canonical: true
+            run_integration: true
             name: "Linux x86_64 AVX2 (mimalloc)"
+            artifact_slug: "linux-x86_64-avx2-mimalloc"
           - os: ubuntu-latest
             arch_flag: "avx2"
             use_mimalloc: "0"
             name: "Linux x86_64 AVX2 (no-mimalloc)"
+            artifact_slug: "linux-x86_64-avx2-no-mimalloc"
           - os: ubuntu-24.04-arm
             arch_flag: ""
             use_mimalloc: "1"
+            run_integration: true
             name: "Linux ARM64 (mimalloc)"
+            artifact_slug: "linux-arm64-mimalloc"
           - os: macos-latest
             arch_flag: ""
             use_mimalloc: "1"
+            run_integration: true
             name: "macOS ARM64 (mimalloc)"
+            artifact_slug: "macos-arm64-mimalloc"
           - os: ubuntu-latest
             arch_flag: "multi"
             use_mimalloc: "1"
             name: "Linux x86_64 multi (mimalloc)"
+            artifact_slug: "linux-x86_64-multi-mimalloc"
           - os: ubuntu-latest
             arch_flag: "avx2"
             use_mimalloc: "1"
             cxx: "clang++"
             name: "Linux x86_64 AVX2 clang (mimalloc)"
+            artifact_slug: "linux-x86_64-avx2-clang-mimalloc"
 
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
@@ -53,7 +74,13 @@ jobs:
 
       - name: Install dependencies (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev bwa autoconf automake samtools libomp-dev
+        # libomp-dev is required so `clang++ -fopenmp` can find -lomp when
+        # building the test framework on the AVX2 clang matrix row. On g++
+        # rows it's unused — libgomp ships with g++.
+        uses: awalsh128/cache-apt-pkgs-action@acb598e5ddbc6f68a970c5da0688d2f3a9f04d05 # v1.6.0
+        with:
+          packages: zlib1g-dev bwa autoconf automake samtools libomp-dev
+          version: 1.0
 
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
@@ -79,6 +106,75 @@ jobs:
       - name: Verify binary
         run: ./bwa-mem2 version
 
+      - name: Build doctest framework and unit binary
+        # Invoke via the parent `test-binaries` target so ARCH_FLAGS
+        # propagate from libbwa.a's build into the test CXXFLAGS. Ensures
+        # BWA_TESTS_HAVE_KSWV in kswv_runner.h evaluates consistently
+        # between libbwa.a and the test binary (notably: sse41 row has
+        # no kswv::getScores8 symbol, so tests must be compiled out).
+        # For arch_flag="" (ARM/Apple Silicon), the parent build
+        # auto-selects ARM ARCH_FLAGS via IS_ARM.
+        # NOTE: arch_flag="multi" is intentionally excluded here. The
+        # `multi` target leaves libbwa.a in its final avx512bw state, so
+        # the only ARCH_FLAGS_FROM_PARENT value that keeps libbwa.a and
+        # the test TU consistent is `-mavx512f -mavx512bw`. But GitHub's
+        # ubuntu-latest runners do not all expose AVX-512 at runtime, so
+        # a test binary built with `-mavx512bw` SIGILLs on first
+        # AVX-512 instruction (compilers freely emit AVX-512 in any TU
+        # once the flag is set). The `multi` row's purpose is to
+        # validate that `make multi`'s per-arch sub-builds + dispatcher
+        # link cleanly; doctest coverage is already provided by the
+        # sse41/avx2 rows. So we skip framework + unit/integration
+        # build and execution on this row.
+        if: matrix.arch_flag != 'multi'
+        run: |
+          if [ "${{ matrix.arch_flag }}" = "" ]; then
+            make test-binaries CXX=${{ matrix.cxx || 'g++' }}
+          else
+            make test-binaries arch=${{ matrix.arch_flag }} CXX=${{ matrix.cxx || 'g++' }}
+          fi
+
+      - name: Run unit tests (all rows)
+        if: matrix.arch_flag != 'multi'
+        env:
+          BWA_MEM2_TEST_MATRIX_ROW: ${{ matrix.name }}
+        # `--reporters=junit --out=…` writes JUnit XML to the file and
+        # nothing to stdout. doctest itself prints the failing-assertion
+        # summary to stderr before exiting non-zero, so the per-step log
+        # already surfaces the diagnosis; the JUnit XML is only consumed
+        # via the upload-artifact step below.
+        run: |
+          ./test/bwa_mem2_tests_unit \
+            --reporters=junit \
+            --out=unit-results-${{ strategy.job-index }}.xml
+
+      - name: Upload unit-test results
+        if: always() && matrix.arch_flag != 'multi'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          # Sanitize matrix.name (contains spaces and parens like
+          # "Linux x86_64 SSE4.1 (mimalloc)") into a hyphenated artifact
+          # name. upload-artifact@v7 technically allows spaces and parens
+          # but a sanitized name keeps URLs and downloads clean.
+          name: unit-results-${{ matrix.artifact_slug }}
+          path: unit-results-*.xml
+
+      - name: Run integration tests
+        if: matrix.run_integration == true && matrix.arch_flag != 'multi'
+        env:
+          BWA_MEM2_TEST_MATRIX_ROW: ${{ matrix.name }}
+        run: |
+          ./test/bwa_mem2_tests_integration \
+            --reporters=junit \
+            --out=integration-results-${{ strategy.job-index }}.xml
+
+      - name: Upload integration-test results
+        if: always() && matrix.run_integration == true && matrix.arch_flag != 'multi'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: integration-results-${{ matrix.artifact_slug }}
+          path: integration-results-*.xml
+
       - name: Verify mimalloc is linked (when enabled)
         if: matrix.use_mimalloc == '1'
         run: test/mimalloc_loaded_test.sh ./bwa-mem2
@@ -92,17 +188,35 @@ jobs:
           fi
           echo "PASS: no-mimalloc build correctly omits mimalloc"
 
+      - name: Cache dwgsim binary
+        id: cache-dwgsim
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: /tmp/dwgsim-src/dwgsim
+          key: dwgsim-${{ runner.os }}-${{ runner.arch }}-${{ env.DWGSIM_REF }}
+
       - name: Build dwgsim
+        if: steps.cache-dwgsim.outputs.cache-hit != 'true'
         run: |
-          git clone --recursive https://github.com/nh13/DWGSIM.git /tmp/dwgsim-src
-          cd /tmp/dwgsim-src
-          make -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
+          git clone https://github.com/nh13/DWGSIM.git /tmp/dwgsim-src
+          git -C /tmp/dwgsim-src checkout --detach "$DWGSIM_REF"
+          git -C /tmp/dwgsim-src submodule update --init --recursive
+          make -C /tmp/dwgsim-src -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
+
+      - name: Cache phiX174 reference
+        id: cache-phix
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: /tmp/ci-test/phix174.fa
+          # NCBI phiX174 reference is immutable. Bump the suffix if
+          # PHIX_URL ever changes.
+          key: phix174-ncbi-v1
 
       - name: Download phiX174 reference
+        if: steps.cache-phix.outputs.cache-hit != 'true'
         run: |
           mkdir -p /tmp/ci-test
-          curl -sL "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/819/615/GCF_000819615.1_ViralProj14015/GCF_000819615.1_ViralProj14015_genomic.fna.gz" \
-            | gunzip > /tmp/ci-test/phix174.fa
+          curl -sL "$PHIX_URL" | gunzip > /tmp/ci-test/phix174.fa
 
       - name: Simulate reads with dwgsim
         run: |
@@ -119,46 +233,11 @@ jobs:
             /tmp/ci-test/phix174.fa \
             /tmp/ci-test/reads
 
-      - name: Index and align with bwa
+      - name: Compare bwa and bwa-mem2 output (phiX parity)
         run: |
-          cd /tmp/ci-test
-          cp phix174.fa bwa_phix174.fa
-          bwa index bwa_phix174.fa
-          bwa mem bwa_phix174.fa reads.bwa.read1.fastq.gz reads.bwa.read2.fastq.gz > bwa.sam 2>bwa.log
-
-      - name: Index and align with bwa-mem2
-        run: |
-          cd /tmp/ci-test
-          cp phix174.fa bwamem2_phix174.fa
-          $GITHUB_WORKSPACE/bwa-mem2 index bwamem2_phix174.fa
-          $GITHUB_WORKSPACE/bwa-mem2 mem bwamem2_phix174.fa reads.bwa.read1.fastq.gz reads.bwa.read2.fastq.gz > bwamem2.sam 2>bwamem2.log
-
-      - name: Compare bwa and bwa-mem2 output
-        run: |
-          cd /tmp/ci-test
-
-          # Strip @PG and @HD headers (tool-specific), and MQ / HN tags
-          # (MQ was added in bwa >0.7.17; HN is a bwa-mem2-only aggregate of
-          # hits-under-XA-drop-ratio and has no analog in lh3/bwa mem).
-          normalize() {
-            grep -v '^@PG' "$1" | grep -v '^@HD' \
-              | sed 's/\tMQ:i:[0-9]*//' \
-              | sed 's/\tHN:i:[0-9]*//'
-          }
-
-          normalize bwa.sam | sort > bwa.normalized.sam
-          normalize bwamem2.sam | sort > bwamem2.normalized.sam
-
-          echo "bwa aligned records: $(grep -cv '^@' bwa.normalized.sam)"
-          echo "bwa-mem2 aligned records: $(grep -cv '^@' bwamem2.normalized.sam)"
-
-          if diff bwa.normalized.sam bwamem2.normalized.sam > /dev/null 2>&1; then
-            echo "PASS: bwa and bwa-mem2 output is identical (after normalizing headers and MQ tag)"
-          else
-            echo "FAIL: bwa and bwa-mem2 output differs"
-            diff bwa.normalized.sam bwamem2.normalized.sam | head -40
-            exit 1
-          fi
+          BWA_MEM2="$GITHUB_WORKSPACE/bwa-mem2" \
+          CI_TEST_DIR=/tmp/ci-test \
+          bash test/regression/phix_parity.sh
 
       - name: Run unit-test harness
         if: matrix.canonical == true || matrix.arch_flag == 'sse41'
@@ -168,35 +247,16 @@ jobs:
       - name: --bam=6 roundtrip smoke (phiX)
         if: matrix.canonical == true
         run: |
-          cd /tmp/ci-test
-          $GITHUB_WORKSPACE/bwa-mem2 mem --bam=6 bwamem2_phix174.fa \
-            reads.bwa.read1.fastq.gz reads.bwa.read2.fastq.gz > bwamem2.bam 2>/dev/null
-          # BAM must decode cleanly and match record count of SAM path
-          samtools quickcheck bwamem2.bam
-          sam_records=$(grep -cv '^@' bwamem2.sam)
-          bam_records=$(samtools view -c bwamem2.bam)
-          if [ "$sam_records" != "$bam_records" ]; then
-            echo "FAIL: SAM ($sam_records) vs --bam=6 BAM ($bam_records) record count mismatch"
-            exit 1
-          fi
-          echo "PASS: --bam=6 roundtrip ($bam_records records)"
+          BWA_MEM2="$GITHUB_WORKSPACE/bwa-mem2" \
+          CI_TEST_DIR=/tmp/ci-test \
+          bash test/regression/bam_roundtrip.sh
 
       - name: Thread-determinism smoke (phiX, -t 1 vs -t 4)
         if: matrix.canonical == true
         run: |
-          cd /tmp/ci-test
-          $GITHUB_WORKSPACE/bwa-mem2 mem -t 1 bwamem2_phix174.fa \
-            reads.bwa.read1.fastq.gz reads.bwa.read2.fastq.gz 2>/dev/null \
-            | grep -v '^@PG' | sort > t1.sam
-          $GITHUB_WORKSPACE/bwa-mem2 mem -t 4 bwamem2_phix174.fa \
-            reads.bwa.read1.fastq.gz reads.bwa.read2.fastq.gz 2>/dev/null \
-            | grep -v '^@PG' | sort > t4.sam
-          if ! diff t1.sam t4.sam > /dev/null 2>&1; then
-            echo "FAIL: -t 1 and -t 4 outputs differ after sort"
-            diff t1.sam t4.sam | head -20
-            exit 1
-          fi
-          echo "PASS: thread-determinism ($(wc -l < t1.sam) records)"
+          BWA_MEM2="$GITHUB_WORKSPACE/bwa-mem2" \
+          CI_TEST_DIR=/tmp/ci-test \
+          bash test/regression/thread_determinism.sh
 
       - name: Cache chr22 reference
         if: matrix.canonical == true
@@ -232,49 +292,13 @@ jobs:
             -r 0.001 -S 2 \
             /tmp/chr22/chr22.fa /tmp/chr22-sim/reads
 
-      - name: Index chr22 with bwa and align
-        if: matrix.canonical == true
-        run: |
-          cp /tmp/chr22/chr22.fa /tmp/chr22-sim/bwa_chr22.fa
-          bwa index /tmp/chr22-sim/bwa_chr22.fa
-          bwa mem -t 4 /tmp/chr22-sim/bwa_chr22.fa \
-            /tmp/chr22-sim/reads.bwa.read1.fastq.gz /tmp/chr22-sim/reads.bwa.read2.fastq.gz \
-            > /tmp/chr22-sim/bwa.sam 2>/tmp/chr22-sim/bwa.log
-
-      - name: Align chr22 with bwa-mem2
-        if: matrix.canonical == true
-        run: |
-          $GITHUB_WORKSPACE/bwa-mem2 mem -t 4 /tmp/chr22/chr22.fa \
-            /tmp/chr22-sim/reads.bwa.read1.fastq.gz /tmp/chr22-sim/reads.bwa.read2.fastq.gz \
-            > /tmp/chr22-sim/bwamem2.sam 2>/tmp/chr22-sim/bwamem2.log
-
       - name: Compare chr22 bwa vs bwa-mem2 (parity)
         if: matrix.canonical == true
         run: |
-          cd /tmp/chr22-sim
-          # Strip @PG / @HD (tool-specific) and on every record:
-          #   MQ:i: — added in bwa >0.7.17
-          #   HN:i: — bwa-mem2-only
-          # And on SECONDARY/SUPPLEMENTARY (FLAG & 0x900) records only:
-          #   XS:i: — the band-cap retry path can shift secondary scores on a
-          #           small number of borderline reads. Primary records keep
-          #           XS:i so a primary subscore/ranking regression still
-          #           trips the parity diff.
-          normalize() { grep -v '^@PG' "$1" | grep -v '^@HD' \
-            | sed 's/\tMQ:i:[0-9]*//' \
-            | sed 's/\tHN:i:[0-9]*//' \
-            | awk -F'\t' 'BEGIN{OFS=FS} /^@/ {print; next} { f=$2+0; if (int(f/256)%2 || int(f/2048)%2) sub(/\tXS:i:[0-9]+/, "", $0); print }'; }
-          normalize bwa.sam | sort > bwa.normalized.sam
-          normalize bwamem2.sam | sort > bwamem2.normalized.sam
-          echo "bwa records: $(grep -cv '^@' bwa.normalized.sam)"
-          echo "bwa-mem2 records: $(grep -cv '^@' bwamem2.normalized.sam)"
-          if diff bwa.normalized.sam bwamem2.normalized.sam > /dev/null 2>&1; then
-            echo "PASS: bwa == bwa-mem2 on chr22 (50k PE reads)"
-          else
-            echo "FAIL: chr22 parity diff; first 40 lines:"
-            diff bwa.normalized.sam bwamem2.normalized.sam | head -40
-            exit 1
-          fi
+          BWA_MEM2="$GITHUB_WORKSPACE/bwa-mem2" \
+          CHR22_FA=/tmp/chr22/chr22.fa \
+          CHR22_SIM_DIR=/tmp/chr22-sim \
+          bash test/regression/chr22_parity.sh
 
       - name: SE alignment smoke (chr22)
         if: matrix.canonical == true
@@ -338,5 +362,58 @@ jobs:
         if: matrix.canonical == true
         env:
           BWAMETH_DIR: ${{ github.workspace }}/bwa-meth-oracle
+        run: bash test/regression/meth_oracle.sh
+
+  coverage:
+    name: Coverage (Linux AVX2, gcov → Codecov)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        uses: awalsh128/cache-apt-pkgs-action@acb598e5ddbc6f68a970c5da0688d2f3a9f04d05 # v1.6.0
+        with:
+          packages: zlib1g-dev autoconf automake gcovr
+          version: 1.0
+
+      - name: Build libbwa.a with coverage
+        run: make -j"$(nproc)" arch=avx2 CXX=g++ USE_MIMALLOC=0 COVERAGE=1
+
+      - name: Build test binaries with coverage
+        # Go through the parent test-binaries target so ARCH_FLAGS_FROM_PARENT
+        # propagates and the test TU sees the same __AVX2__ / __AVX512BW__
+        # surface libbwa.a was compiled with. COVERAGE=1 still flows in via
+        # MAKEFLAGS.
+        run: make test-binaries arch=avx2 CXX=g++ COVERAGE=1
+
+      - name: Run unit tests
+        run: ./test/bwa_mem2_tests_unit
+
+      - name: Run integration tests
+        run: ./test/bwa_mem2_tests_integration
+
+      - name: Collect coverage into Cobertura XML
+        # gcovr walks the tree, runs gcov on each .gcda, and emits a
+        # single Cobertura XML that Codecov can consume directly. Limit
+        # to src/ and test/ (skip vendored htslib / mimalloc / etc.).
+        # `--filter` patterns are regular expressions matched against
+        # paths relative to `--root` and are NOT implicitly anchored, so
+        # prefix each with `^` to scope them to the project root and
+        # cleanly exclude anything under ext/ that happens to share a
+        # subpath (e.g. ext/htslib/test/).
         run: |
-          bash test/meth/test.sh
+          gcovr --root . \
+                --filter '^src/' --filter '^test/framework/' \
+                --filter '^test/unit/' --filter '^test/integration/' \
+                --print-summary \
+                --xml coverage.xml
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@57e3a136b779b570ffcdbf80b3bdc90e7fab3de2 # v6.0.0
+        with:
+          files: coverage.xml
+          fail_ci_if_error: false
+          verbose: true

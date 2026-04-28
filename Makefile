@@ -249,6 +249,14 @@ endif
 
 CXXFLAGS+=	-g -O3 -std=gnu++14 -fpermissive $(ARCH_FLAGS) $(ASAN_FLAGS) $(LIBSAIS_OPENMP_CFLAGS) $(EXTRA_CXXFLAGS) #-Wall ##-xSSE2
 
+# COVERAGE=1 augments CXXFLAGS/LDFLAGS with --coverage and overrides -O3 with
+# -O0 so gcov line numbers correspond 1:1 with source. Consumed by the CI
+# `coverage` job; not part of any shipped binary.
+ifneq ($(COVERAGE),)
+    CXXFLAGS += -O0 --coverage
+    LDFLAGS  += --coverage
+endif
+
 # Control build flag for the batched mate-rescue SW port on ARM.
 # When set (e.g. `make arm64 DISABLE_BATCHED_MATESW=1`), the source gate for
 # the new batched path falls through to the legacy scalar mem_sam_pe. Used by
@@ -259,7 +267,7 @@ ifneq ($(strip $(DISABLE_BATCHED_MATESW)),)
     CPPFLAGS += -DDISABLE_BATCHED_MATESW=$(DISABLE_BATCHED_MATESW)
 endif
 
-.PHONY:all clean depend multi print-mimalloc-config kswv_selftest kswv_nrow_zero_test test FORCE pgo-generate pgo-use pgo-clean profile-build profile-clean lto-build lto-clean
+.PHONY:all clean depend multi print-mimalloc-config kswv_nrow_zero_test test FORCE pgo-generate pgo-use pgo-clean profile-build profile-clean lto-build lto-clean
 .SUFFIXES:.cpp .o
 
 .cpp.o:
@@ -307,11 +315,6 @@ arm64:
 $(EXE):$(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) $(if $(filter 1,$(USE_MIMALLOC)),$(MIMALLOC_LIB)) src/main.o
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) src/main.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) $(MIMALLOC_LDFLAGS) -o $@
 
-# kswv self-consistency test: batched SIMD kswv vs scalar ksw_align2 reference.
-# Built by the proto-neon-kswv CI workflow; runnable standalone.
-kswv_selftest: $(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) test/kswv_selftest.o
-	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/kswv_selftest.o $(BWA_LIB) $(LIBS) -o $@
-
 # Regression test for issue 38 / upstream PR 289: exercises an all-len1==0
 # batch that drives each SIMD kswv kernel through the nrow==0 path. Without
 # the post-loop `if (i > 0)` guard, the rowMax store writes SIMD_WIDTH* bytes
@@ -320,14 +323,25 @@ kswv_selftest: $(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) test/kswv_selftest.o
 kswv_nrow_zero_test: $(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) test/kswv_nrow_zero_test.o
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) test/kswv_nrow_zero_test.o $(BWA_LIB) $(LIBS) -o $@
 
-# Run the in-tree tests. Currently kswv_selftest + kswv_nrow_zero_test;
-# extend as more land.
-test: kswv_selftest kswv_nrow_zero_test
-	./kswv_selftest
-	./kswv_nrow_zero_test
+# Build the test binaries with the same ARCH_FLAGS as libbwa.a so the
+# test binary's kswv.h preprocessor state (SIMD_WIDTH8, BWA_TESTS_HAVE_KSWV)
+# matches what libbwa.a was compiled with. Consumed by ci.yml so that e.g.
+# the sse41 matrix row builds test/framework with -msse4.1 only (matching
+# libbwa.a, which then lacks kswv::getScores8 — the BWA_TESTS_HAVE_KSWV
+# macro guards the test away).
+.PHONY: test-binaries
+test-binaries: $(BWA_LIB)
+	$(MAKE) -C test framework unit integration \
+	    CXX=$(CXX) \
+	    COVERAGE=$(COVERAGE) \
+	    ARCH_FLAGS_FROM_PARENT='$(ARCH_FLAGS)'
 
-test/kswv_selftest.o: test/kswv_selftest.cpp
-	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $< -o $@
+# Run the in-tree tests via the unit-test harness in test/, plus the
+# standalone kswv_nrow_zero_test regression.
+test: test-binaries kswv_nrow_zero_test
+	./test/bwa_mem2_tests_unit
+	./test/bwa_mem2_tests_integration
+	./kswv_nrow_zero_test
 
 test/kswv_nrow_zero_test.o: test/kswv_nrow_zero_test.cpp
 	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $< -o $@
@@ -396,8 +410,10 @@ $(MIMALLOC_LIB):
 	cd $(MIMALLOC_BUILD) && cmake $(MIMALLOC_CMAKE_FLAGS) .. && $(MAKE)
 
 clean: pgo-clean profile-clean lto-clean
-	rm -fr src/*.o src/version.h test/*.o $(BWA_LIB) $(EXE) kswv_selftest kswv_nrow_zero_test bwa-mem2.sse41 bwa-mem2.sse42 bwa-mem2.avx bwa-mem2.avx2 bwa-mem2.avx512bw bwa-mem2.arm64
+	rm -fr src/*.o src/version.h test/*.o $(BWA_LIB) $(EXE) kswv_nrow_zero_test bwa-mem2.sse41 bwa-mem2.sse42 bwa-mem2.avx bwa-mem2.avx2 bwa-mem2.avx512bw bwa-mem2.arm64
 	rm -f $(LIBSAIS_OBJS)
+	rm -f src/*.gcno src/*.gcda
+	$(MAKE) -C test clean
 	cd ext/safestringlib/ && $(MAKE) clean
 	-[ -f ext/htslib/config.mk ] && cd ext/htslib && $(MAKE) distclean
 	rm -rf $(MIMALLOC_BUILD)
