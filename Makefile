@@ -32,7 +32,7 @@ ifneq ($(portable),)
 	STATIC_GCC=-static-libgcc -static-libstdc++
 endif
 
-EXE=		bwa-mem2
+EXE=		bwa-mem3
 #CXX=		icpc
 # Pair CC with CXX for the toolchains we know about so libsais.c (the only
 # C TU in this build) doesn't silently fall back to make's default `cc`,
@@ -73,7 +73,7 @@ ifneq ($(strip $(ASAN)),)
 endif
 
 # mimalloc integration. Default on — see FG-MAIN.md.
-# Override with USE_MIMALLOC=0 to build a stock bwa-mem2 without mimalloc.
+# Override with USE_MIMALLOC=0 to build a stock bwa-mem3 without mimalloc.
 USE_MIMALLOC ?= 1
 
 # Detect architecture
@@ -145,11 +145,11 @@ endif
 
 CPPFLAGS+=	-DENABLE_PREFETCH -DV17=1 -DMATE_SORT=0 -DLIBSAIS_OPENMP
 
-# Version string for `bwa-mem2 version` and the @PG VN: field. Prefer
+# Version string for `bwa-mem3 version` and the @PG VN: field. Prefer
 # `git describe` (e.g. v2.3-30-g61813ef, with -dirty suffix for modified
 # trees) so the stamped version always reflects the actual build. Fall
 # back to a static tag for source-tarball / shallow-clone builds.
-FG_LABS_VERSION_FALLBACK := 2.3-fg-labs
+FG_LABS_VERSION_FALLBACK := 0.1.0-pre
 VERSION_STRING := $(shell git describe --tags --dirty 2>/dev/null || echo $(FG_LABS_VERSION_FALLBACK))
 INCLUDES+=   -Isrc -Iext/safestringlib/include -Iext/htslib -Iext/libsais/include
 ifeq ($(USE_MIMALLOC),1)
@@ -159,7 +159,7 @@ endif
 # libsais (pinned in ext/libsais; see submodule SHA): linear-time suffix
 # array / BWT construction via SA-IS. Compiled with OpenMP so
 # libsais_gsa_omp can run parallel induced-sorting. libomp is already a
-# link dep of bwa-mem2's alignment paths; no new dep.
+# link dep of bwa-mem3's alignment paths; no new dep.
 LIBSAIS_DIR    = ext/libsais
 LIBSAIS_OBJS   = $(LIBSAIS_DIR)/src/libsais.o $(LIBSAIS_DIR)/src/libsais64.o
 LIBSAIS_CFLAGS = -O3 -std=c99 -DLIBSAIS_OPENMP -I$(LIBSAIS_DIR)/include
@@ -283,7 +283,7 @@ all:$(EXE)
 # `myall:` dispatch branch).
 FORCE:
 src/version.h: FORCE
-	@printf '#ifndef BWA_MEM2_VERSION_H\n#define BWA_MEM2_VERSION_H\n#define PACKAGE_VERSION "%s"\n#endif\n' '$(VERSION_STRING)' > $@.tmp
+	@printf '#ifndef BWA_MEM3_VERSION_H\n#define BWA_MEM3_VERSION_H\n#define PACKAGE_VERSION "%s"\n#endif\n' '$(VERSION_STRING)' > $@.tmp
 	@if ! cmp -s $@.tmp $@ 2>/dev/null; then mv $@.tmp $@; else rm -f $@.tmp; fi
 
 src/main.o: src/version.h
@@ -294,23 +294,23 @@ ifneq ($(IS_ARM),)
 	$(MAKE) arm64
 else
 	rm -f src/*.o $(BWA_LIB); cd ext/safestringlib/ && $(MAKE) clean;
-	$(MAKE) arch=sse41    EXE=bwa-mem2.sse41    CXX="$(CXX)" all
+	$(MAKE) arch=sse41    EXE=bwa-mem3.sse41    CXX="$(CXX)" all
 	rm -f src/*.o $(BWA_LIB); cd ext/safestringlib/ && $(MAKE) clean;
-	$(MAKE) arch=sse42    EXE=bwa-mem2.sse42    CXX="$(CXX)" all
+	$(MAKE) arch=sse42    EXE=bwa-mem3.sse42    CXX="$(CXX)" all
 	rm -f src/*.o $(BWA_LIB); cd ext/safestringlib/ && $(MAKE) clean;
-	$(MAKE) arch=avx    EXE=bwa-mem2.avx    CXX="$(CXX)" all
+	$(MAKE) arch=avx    EXE=bwa-mem3.avx    CXX="$(CXX)" all
 	rm -f src/*.o $(BWA_LIB); cd ext/safestringlib/ && $(MAKE) clean;
-	$(MAKE) arch=avx2   EXE=bwa-mem2.avx2     CXX="$(CXX)" all
+	$(MAKE) arch=avx2   EXE=bwa-mem3.avx2     CXX="$(CXX)" all
 	rm -f src/*.o $(BWA_LIB); cd ext/safestringlib/ && $(MAKE) clean;
-	$(MAKE) arch=avx512bw EXE=bwa-mem2.avx512bw CXX="$(CXX)" all
-	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) -Wall -O3 src/runsimd.cpp -Iext/safestringlib/include -Lext/safestringlib/ -lsafestring $(STATIC_GCC) -o bwa-mem2
+	$(MAKE) arch=avx512bw EXE=bwa-mem3.avx512bw CXX="$(CXX)" all
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) -Wall -O3 src/runsimd.cpp -Iext/safestringlib/include -Lext/safestringlib/ -lsafestring $(STATIC_GCC) -o bwa-mem3
 endif
 
 # ARM64/Apple Silicon build target - single binary, no multi-binary launcher needed
 arm64:
 	rm -f src/*.o $(BWA_LIB); cd ext/safestringlib/ && $(MAKE) clean;
-	$(MAKE) arch=arm64 EXE=bwa-mem2.arm64 CXX="$(CXX)" all
-	ln -sf bwa-mem2.arm64 bwa-mem2
+	$(MAKE) arch=arm64 EXE=bwa-mem3.arm64 CXX="$(CXX)" all
+	ln -sf bwa-mem3.arm64 bwa-mem3
 
 
 $(EXE):$(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) $(if $(filter 1,$(USE_MIMALLOC)),$(MIMALLOC_LIB)) src/main.o
@@ -333,7 +333,7 @@ kswv_nrow_zero_test: $(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) test/kswv_nrow_zero_t
 .PHONY: test-binaries
 # $(SAFE_STR_LIB) is a real link-time dep: test/Makefile's
 # bwa_mem2_tests_unit recipe references ../ext/safestringlib/libsafestring.a
-# directly. Without this prereq, callers that skip the bwa-mem2 binary
+# directly. Without this prereq, callers that skip the bwa-mem3 binary
 # build (which builds it as a side-effect of $(EXE) deps) link-fail.
 test-binaries: $(BWA_LIB) $(SAFE_STR_LIB)
 	$(MAKE) -C test framework unit integration \
@@ -429,7 +429,7 @@ $(MIMALLOC_LIB):
 	cd $(MIMALLOC_BUILD) && cmake $(MIMALLOC_CMAKE_FLAGS) .. && $(MAKE)
 
 clean: pgo-clean profile-clean lto-clean
-	rm -fr src/*.o src/version.h test/*.o $(BWA_LIB) $(EXE) kswv_nrow_zero_test shm_section_find_test shm_pack_round_trip_test bwa-mem2.sse41 bwa-mem2.sse42 bwa-mem2.avx bwa-mem2.avx2 bwa-mem2.avx512bw bwa-mem2.arm64
+	rm -fr src/*.o src/version.h test/*.o $(BWA_LIB) $(EXE) kswv_nrow_zero_test shm_section_find_test shm_pack_round_trip_test bwa-mem3.sse41 bwa-mem3.sse42 bwa-mem3.avx bwa-mem3.avx2 bwa-mem3.avx512bw bwa-mem3.arm64
 	rm -f $(LIBSAIS_OBJS)
 	rm -f src/*.gcno src/*.gcda
 	$(MAKE) -C test clean
@@ -453,8 +453,8 @@ clean: pgo-clean profile-clean lto-clean
 # string. Defaults match the host: arm64 on Apple Silicon / aarch64,
 # native otherwise. Output binaries are arch-suffixed when PGO_ARCH is
 # non-default, so multiple per-arch builds coexist:
-#   PGO_ARCH=arm64  -> bwa-mem2.pgo-instr,    bwa-mem2.pgo
-#   PGO_ARCH=avx2   -> bwa-mem2.pgo-instr.avx2, bwa-mem2.pgo.avx2
+#   PGO_ARCH=arm64  -> bwa-mem3.pgo-instr,    bwa-mem3.pgo
+#   PGO_ARCH=avx2   -> bwa-mem3.pgo-instr.avx2, bwa-mem3.pgo.avx2
 ifneq ($(IS_ARM),)
     PGO_ARCH ?= arm64
 else
@@ -465,11 +465,11 @@ PGO_PROFILE_DIR ?= pgo_profiles
 # Output names: keep the bare names when PGO_ARCH is the default arm64
 # (backward-compat); arch-suffix otherwise so per-arch outputs don't collide.
 ifeq ($(PGO_ARCH),arm64)
-    PGO_INSTR_EXE = bwa-mem2.pgo-instr
-    PGO_FINAL_EXE = bwa-mem2.pgo
+    PGO_INSTR_EXE = bwa-mem3.pgo-instr
+    PGO_FINAL_EXE = bwa-mem3.pgo
 else
-    PGO_INSTR_EXE = bwa-mem2.pgo-instr.$(PGO_ARCH)
-    PGO_FINAL_EXE = bwa-mem2.pgo.$(PGO_ARCH)
+    PGO_INSTR_EXE = bwa-mem3.pgo-instr.$(PGO_ARCH)
+    PGO_FINAL_EXE = bwa-mem3.pgo.$(PGO_ARCH)
 endif
 
 pgo-generate:
@@ -484,7 +484,7 @@ pgo-use:
 	@echo "PGO optimized binary built: $(PGO_FINAL_EXE) (arch=$(PGO_ARCH))"
 
 pgo-clean:
-	rm -rf $(PGO_PROFILE_DIR) bwa-mem2.pgo-instr bwa-mem2.pgo bwa-mem2.pgo-instr.* bwa-mem2.pgo.*
+	rm -rf $(PGO_PROFILE_DIR) bwa-mem3.pgo-instr bwa-mem3.pgo bwa-mem3.pgo-instr.* bwa-mem3.pgo.*
 
 # profile-build / lto-build target arch. Mirrors PGO_ARCH: defaults to
 # arm64 on Apple Silicon / aarch64 hosts (preserves prior behavior), and
@@ -506,25 +506,25 @@ endif
 # (printed at end of run) are unaffected.
 # Usage: make profile-build
 #        make profile-build PROFILE_ARCH=avx2     # cross-build
-#        ./bwa-mem2.profile mem -t N idx r1.fq.gz r2.fq.gz
+#        ./bwa-mem3.profile mem -t N idx r1.fq.gz r2.fq.gz
 profile-build:
 	rm -f src/*.o $(BWA_LIB); cd ext/safestringlib/ && $(MAKE) clean;
-	$(MAKE) arch=$(PROFILE_ARCH) EXE=bwa-mem2.profile EXTRA_CXXFLAGS="$(EXTRA_CXXFLAGS) -DDISABLE_OUTPUT" CXX="$(CXX)" all
-	@echo "Compute-only profile binary: bwa-mem2.profile (arch=$(PROFILE_ARCH), output I/O skipped)"
+	$(MAKE) arch=$(PROFILE_ARCH) EXE=bwa-mem3.profile EXTRA_CXXFLAGS="$(EXTRA_CXXFLAGS) -DDISABLE_OUTPUT" CXX="$(CXX)" all
+	@echo "Compute-only profile binary: bwa-mem3.profile (arch=$(PROFILE_ARCH), output I/O skipped)"
 	# Drop variant-flagged objects from the shared cache so a subsequent
 	# `make all` doesn't relink stale -DDISABLE_OUTPUT objects.
 	rm -f src/*.o $(BWA_LIB)
 
 profile-clean:
-	rm -f bwa-mem2.profile
+	rm -f bwa-mem3.profile
 
 # Link-Time Optimization build.
 # Usage: make lto-build
 #        make lto-build LTO_ARCH=avx2             # cross-build
-#        ./bwa-mem2.lto mem -t N idx r1.fq.gz r2.fq.gz
-# Compiles all bwa-mem2 sources with LTO and links with LTO. Non-bwa-mem2
+#        ./bwa-mem3.lto mem -t N idx r1.fq.gz r2.fq.gz
+# Compiles all bwa-mem3 sources with LTO and links with LTO. Non-bwa-mem3
 # deps (htslib, mimalloc, safestringlib) keep their non-LTO objects; the
-# linker still does LTO across bwa-mem2's own .o. On GCC,
+# linker still does LTO across bwa-mem3's own .o. On GCC,
 # -fno-semantic-interposition additionally allows more aggressive inlining
 # across translation units (no effect on clang, silently ignored).
 
@@ -536,15 +536,15 @@ lto-build:
 	@CXX_VERSION="$$($(CXX) --version 2>&1 | head -1)"; \
 	  case "$$CXX_VERSION" in *clang*) LTO_FLAG=-flto=thin ;; *) LTO_FLAG=-flto ;; esac; \
 	  echo "LTO_FLAG=$$LTO_FLAG (cxx: $$CXX_VERSION, arch: $(LTO_ARCH))"; \
-	  $(MAKE) arch=$(LTO_ARCH) EXE=bwa-mem2.lto EXTRA_CXXFLAGS="$(EXTRA_CXXFLAGS) $$LTO_FLAG -fno-semantic-interposition" CXX="$(CXX)" all
-	@echo "LTO binary: bwa-mem2.lto (arch=$(LTO_ARCH))"
+	  $(MAKE) arch=$(LTO_ARCH) EXE=bwa-mem3.lto EXTRA_CXXFLAGS="$(EXTRA_CXXFLAGS) $$LTO_FLAG -fno-semantic-interposition" CXX="$(CXX)" all
+	@echo "LTO binary: bwa-mem3.lto (arch=$(LTO_ARCH))"
 	# Drop variant-flagged objects from the shared cache so a subsequent
 	# `make all` doesn't relink stale -flto / -fno-semantic-interposition
 	# objects.
 	rm -f src/*.o $(BWA_LIB)
 
 lto-clean:
-	rm -f bwa-mem2.lto
+	rm -f bwa-mem3.lto
 
 # Print the effective mimalloc setting. Used by CI and humans.
 print-mimalloc-config:
@@ -599,4 +599,4 @@ src/read_index_ele.o: src/macro.h
 src/utils.o: src/utils.h src/ksort.h src/kseq.h
 src/memcpy_bwamem.o: src/memcpy_bwamem.h
 src/bam_writer.o: src/bam_writer.h src/bwamem.h src/bwa.h src/bntseq.h
-src/meth_bam.o: src/meth_bam.h src/bwamem.h src/bwa.h src/bntseq.h
+src/meth_bam.o: src/meth_bam.h src/bwamem.h src/bwa.h src/bntseq.h src/version.h
