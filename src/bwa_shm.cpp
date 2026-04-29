@@ -2,7 +2,7 @@
                            The MIT License
 
    BWA-MEM2  (Sequence alignment using Burrows-Wheeler Transform),
-   Copyright (C) 2026  Fulcrum Genomics, contributors of bwa-mem2.
+   Copyright (C) 2026  Fulcrum Genomics, contributors of bwa-mem3.
 
    Permission is hereby granted, free of charge, to any person obtaining
    a copy of this software and associated documentation files (the
@@ -40,7 +40,7 @@
 #include <sys/stat.h>      /* mode constants, stat */
 #include <fcntl.h>         /* O_* */
 #include <unistd.h>        /* close, ftruncate */
-#include <getopt.h>        /* getopt_long for `bwa-mem2 shm --meth ...` */
+#include <getopt.h>        /* getopt_long for `bwa-mem3 shm --meth ...` */
 #include <errno.h>
 #include <limits.h>        /* PATH_MAX */
 
@@ -99,7 +99,7 @@ static void path_concat2(char out[PATH_MAX], const char *a, const char *b)
  * NOTE: there is no advisory lock around the registry. POSIX shm fds on
  * macOS reject flock(2) with EOPNOTSUPP, so a portable lock would require
  * a side-channel lockfile. We accept the v1 race window here: two
- * concurrent `bwa-mem2 shm <prefix>` invocations may both pass the
+ * concurrent `bwa-mem3 shm <prefix>` invocations may both pass the
  * pre-stage `bwa_shm_test` and append duplicate entries (or have one
  * `O_EXCL`-create the segment and the other discover it via EEXIST). The
  * EEXIST branch in `bwa_shm_stage` treats that as already-staged. */
@@ -768,8 +768,8 @@ int bwa_shm_section_find(const uint8_t *base, uint32_t kind,
     return -1;
 }
 
-/* Resolve the on-disk prefix for `bwa-mem2 shm --meth <idxbase>` so that
- * the registry basename matches what `bwa-mem2 mem --meth <idxbase>` will
+/* Resolve the on-disk prefix for `bwa-mem3 shm --meth <idxbase>` so that
+ * the registry basename matches what `bwa-mem3 mem --meth <idxbase>` will
  * later look up. Mirrors fastmap.cpp's c2t-suffix resolution: append
  * `.bwameth.c2t` unless `prefix` already ends with it. */
 static int resolve_meth_prefix(const char *prefix, char out[PATH_MAX])
@@ -813,7 +813,7 @@ static int hint_missing_meth_flag(const char *prefix)
     std::fprintf(stderr,
         "[E::main_shm] no FMI at '%s.0123' but a meth index is present at "
         "'%s.bwameth.c2t.*'\n"
-        "             did you mean `bwa-mem2 shm --meth %s`?\n",
+        "             did you mean `bwa-mem3 shm --meth %s`?\n",
         prefix, prefix, prefix);
     return 1;
 }
@@ -821,19 +821,19 @@ static int hint_missing_meth_flag(const char *prefix)
 static void print_shm_usage(void)
 {
     std::fprintf(stderr,
-        "\nUsage: bwa-mem2 shm [-d|-l|--help] [--meth] [idxbase]\n\n"
+        "\nUsage: bwa-mem3 shm [-d|-l|--help] [--meth] [idxbase]\n\n"
         "Options:\n"
         "  -d        destroy all indices in shared memory (matches bwa v1 behavior)\n"
         "  -l        list names of indices in shared memory\n"
-        "  --meth    stage a `bwa-mem2 index --meth` index — auto-appends\n"
+        "  --meth    stage a `bwa-mem3 index --meth` index — auto-appends\n"
         "            `.bwameth.c2t` to <idxbase>, mirroring `mem --meth`\n"
         "  -h --help print this help and exit\n\n"
-        "Stage with no flags: `bwa-mem2 shm <idxbase>` loads the index into\n"
-        "POSIX shared memory; subsequent `bwa-mem2 mem <idxbase> ...` runs\n"
+        "Stage with no flags: `bwa-mem3 shm <idxbase>` loads the index into\n"
+        "POSIX shared memory; subsequent `bwa-mem3 mem <idxbase> ...` runs\n"
         "auto-attach instead of re-reading from disk. For meth indices, pass\n"
         "the same plain `<idxbase>` to all three commands plus `--meth` on\n"
         "`index`, `shm`, and `mem` (the c2t suffix is auto-appended).\n\n"
-        "Footgun: if you re-build the index, run `bwa-mem2 shm -d` first.\n"
+        "Footgun: if you re-build the index, run `bwa-mem3 shm -d` first.\n"
         "There is no staleness check -- a stale segment will silently mis-align.\n\n"
         "macOS: POSIX shm has implementation-defined per-segment caps; large\n"
         "       indices may simply fail to stage. Prefer Linux for production.\n"
@@ -848,7 +848,7 @@ int main_shm(int argc, char *argv[])
 
     /* Pre-scan for --help / -h. getopt_long would treat -h as unknown
      * (no short opt declared) and print a generic error, but the top-level
-     * usage advertises `bwa-mem2 <command> --help`, so we honor both. */
+     * usage advertises `bwa-mem3 <command> --help`, so we honor both. */
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
             print_shm_usage();

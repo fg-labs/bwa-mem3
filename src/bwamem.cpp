@@ -170,7 +170,7 @@ static inline void copy_qual_rev(char *dst, const char *src, int n) {
 }
 #endif
 /* Not including <htslib/sam.h>: its kstring.h shares the KSTRING_H guard
- * with bwa-mem2's. Opaque bam1_t wrappers live in bam_writer.h. */
+ * with bwa-mem3's. Opaque bam1_t wrappers live in bam_writer.h. */
 
 meth_chrom_map_t *g_meth_cmap = NULL;
 

@@ -327,7 +327,7 @@ void worker_free(worker_t &w, int32_t nthreads)
     }
 }
 
-// Back-compat wrapper used by the bwa-mem2 pipeline.
+// Back-compat wrapper used by the bwa-mem3 pipeline.
 void memoryAlloc(ktp_aux_t *aux, worker_t &w, int32_t nreads, int32_t nthreads)
 {
     worker_alloc(aux->opt, w, nreads, nthreads);
@@ -828,7 +828,7 @@ static void update_a(mem_opt_t *opt, const mem_opt_t *opt0)
 
 static void usage(const mem_opt_t *opt)
 {
-    fprintf(stderr, "Usage: bwa-mem2 mem [options] <idxbase> <in1.fq> [in2.fq]\n");
+    fprintf(stderr, "Usage: bwa-mem3 mem [options] <idxbase> <in1.fq> [in2.fq]\n");
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  Algorithm options:\n");
     fprintf(stderr, "    -o STR        Output SAM file name\n");
@@ -883,7 +883,7 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "Bisulfite (--meth) options:\n");
     fprintf(stderr, "   --meth        enable inline bwameth-style C→T/G→A read conversion + meth-aware BAM\n");
     fprintf(stderr, "                 emission. Implies --bam. Requires the reference to have been built\n");
-    fprintf(stderr, "                 with `bwa-mem2 index --meth` (emits ref.fa.bwameth.c2t).\n");
+    fprintf(stderr, "                 with `bwa-mem3 index --meth` (emits ref.fa.bwameth.c2t).\n");
     fprintf(stderr, "   --set-as-failed f|r\n");
     fprintf(stderr, "                 flag alignments to the matching strand ('f' or 'r') as QC-fail (0x200)\n");
     fprintf(stderr, "   --do-not-penalize-chimeras\n");
@@ -915,7 +915,7 @@ static uint8_t *load_ref_string(const char *prefix, uint8_t *shm_base,
         if (bwa_shm_section_find(shm_base, BWA_SHM_SEC_REF_STRING, &off, &sz) != 0) {
             fprintf(stderr,
                 "ERROR: shm segment for '%s' is missing REF_STRING; aborting.\n"
-                "       The segment was staged by an older bwa-mem2; drop and re-stage.\n",
+                "       The segment was staged by an older bwa-mem3; drop and re-stage.\n",
                 prefix);
             exit(EXIT_FAILURE);
         }
@@ -991,9 +991,9 @@ int main_mem(int argc, char *argv[])
     /* Parse input arguments */
     // comment: added option '5' in the list
     //
-    // Long-only options for bisulfite mode (bwa-mem2 meth fork):
+    // Long-only options for bisulfite mode (bwa-mem3 meth fork):
     //   --meth                      Enable inline bwameth-style c2t + post-processing + BAM output.
-    //                               Expects a reference built with `bwa-mem2 index --meth`.
+    //                               Expects a reference built with `bwa-mem3 index --meth`.
     //   --set-as-failed f|r         Flag alignments to this strand as QC-fail (0x200)
     //   --do-not-penalize-chimeras  Skip the longest-match <44% chimera heuristic
     enum {
@@ -1215,7 +1215,7 @@ int main_mem(int argc, char *argv[])
     /* Further input parsing */
     if (mode)
     {
-        fprintf(stderr, "WARNING: bwa-mem2 doesn't work well with long reads or contigs; please use minimap2 instead.\n");
+        fprintf(stderr, "WARNING: bwa-mem3 doesn't work well with long reads or contigs; please use minimap2 instead.\n");
         if (strcmp(mode, "intractg") == 0)
         {
             if (!opt0.o_del) opt->o_del = 16;
@@ -1257,7 +1257,7 @@ int main_mem(int argc, char *argv[])
         }
     } else update_a(opt, &opt0);
 
-    /* Meth-mode default tuning. bwameth.py runs bwa-mem2 with
+    /* Meth-mode default tuning. bwameth.py runs bwa-mem3 with
      * -B 2 -L 10 -U 100 -T 40 -CM — these reduce mismatch and soft-clip
      * penalties so BS reads get long un-clipped alignments, raise the
      * output score threshold, mark shorter hits as secondary, and
@@ -1276,9 +1276,9 @@ int main_mem(int argc, char *argv[])
     /* Matrix for SWA */
     bwa_fill_scmat(opt->a, opt->b, opt->mat);
 
-    /* In --meth the canonical UX is "bwa-mem2 mem --meth ref.fa" and
+    /* In --meth the canonical UX is "bwa-mem3 mem --meth ref.fa" and
      * we auto-append ".bwameth.c2t" to find the index built by
-     * "bwa-mem2 index --meth". If the user (or bwameth.py's internal
+     * "bwa-mem3 index --meth". If the user (or bwameth.py's internal
      * invocation) already passed the ".bwameth.c2t" path directly, use
      * it as-is rather than double-appending. */
     char c2t_ref[PATH_MAX];

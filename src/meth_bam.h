@@ -7,13 +7,13 @@
 #include "bwamem.h"
 #include "bntseq.h"
 
-/* htslib's <htslib/kstring.h> and bwa-mem2's src/kstring.h share the
+/* htslib's <htslib/kstring.h> and bwa-mem3's src/kstring.h share the
  * `KSTRING_H` guard, so including htslib/sam.h here would make one of them
  * a no-op. htslib is therefore only included inside src/meth_bam.cpp; this
  * header forward-declares bam1_t and exposes htslib-free wrappers. */
 struct bam1_t;
 
-/* Native BAM emission for `bwa-mem2 mem --meth`: consolidates the
+/* Native BAM emission for `bwa-mem3 mem --meth`: consolidates the
  * bwa-meth c2t doubled reference's fchr/rchr contigs into one @SQ per
  * real chromosome and converts mem_aln_t records to bam1_t with the
  * meth-specific tags (YD:Z) and chimera QC. */

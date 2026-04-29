@@ -122,7 +122,7 @@ class FMI_search: public indexEle
     int build_index();
     void load_index();
 
-    /* Attach to a packed bwa-mem2 index segment from bwa_shm_attach. Sets
+    /* Attach to a packed bwa-mem3 index segment from bwa_shm_attach. Sets
      * scalars and the cp_occ / sa_ms_byte / sa_ls_word pointers; the
      * destructor munmaps `base` and leaves the aliased buffers untouched. */
     void load_index_from_shm(uint8_t *base, size_t len);

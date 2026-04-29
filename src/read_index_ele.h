@@ -62,7 +62,7 @@ public:
 	void bwa_idx_load_ele(const char *hint, int which);
 	char *bwa_idx_infer_prefix(const char *hint);
 
-	/* Attach BNS + PAC from a packed bwa-mem2 index segment produced by
+	/* Attach BNS + PAC from a packed bwa-mem3 index segment produced by
 	 * bwa_shm_pack_from_disk. `base`/`len` describe the segment (typically
 	 * from bwa_shm_attach). The bntseq_t struct and anns[] array are
 	 * heap-copied (mapper mutates them); ambs[], name/anno strings, and

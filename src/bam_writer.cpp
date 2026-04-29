@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 
-/* htslib headers before any bwa-mem2 header that pulls in kstring.h
+/* htslib headers before any bwa-mem3 header that pulls in kstring.h
  * (they share the KSTRING_H include guard). */
 #include "htslib/sam.h"
 #include "htslib/kstring.h"
@@ -243,7 +243,7 @@ int mem_aln_to_bam(struct bam1_t *b,
 
     uint16_t flag16 = (uint16_t)((p.flag & 0xffff) | (p.flag & 0x10000 ? 0x100 : 0));
 
-    /* Remap primary CIGAR: bwa-mem2 ops -> BAM ops, + soft->hard for supp */
+    /* Remap primary CIGAR: bwa-mem3 ops -> BAM ops, + soft->hard for supp */
     uint32_t *bam_cigar = NULL;
     size_t    bam_n_cigar = 0;
     if (p.n_cigar > 0) {
@@ -262,7 +262,7 @@ int mem_aln_to_bam(struct bam1_t *b,
 
     hts_pos_t tlen = 0;
     if (mp && mp->rid >= 0 && p.rid == mp->rid && p.n_cigar > 0 && m.n_cigar > 0) {
-        /* TLEN uses ref-consumed lengths. bwa-mem2 and BAM both encode
+        /* TLEN uses ref-consumed lengths. bwa-mem3 and BAM both encode
          * M=0, D=2, so we can count directly on the pre-remap CIGARs. */
         int64_t p_rlen = cigar_ref_len_mem(p.cigar, p.n_cigar);
         int64_t m_rlen = cigar_ref_len_mem(m.cigar, m.n_cigar);

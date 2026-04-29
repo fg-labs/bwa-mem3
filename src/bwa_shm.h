@@ -93,7 +93,7 @@ extern "C" {
 	int       bwa_shm_section_find(const uint8_t *base, uint32_t kind,
 	                               uint64_t *offset_out, uint64_t *size_out);
 
-	/* Layout of a packed bwa-mem2 index segment. Computed by bwa_shm_compute
+	/* Layout of a packed bwa-mem3 index segment. Computed by bwa_shm_compute
 	 * from a prefix on disk; consumed by bwa_shm_pack_into and bwa_shm_stage.
 	 * Owns a heap-loaded bntseq_t held across compute->pack_into so we don't
 	 * read .ann/.amb twice. Free with bwa_shm_layout_free. */

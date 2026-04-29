@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 
-/* htslib headers must come before any bwa-mem2 header that pulls in
- * bwa-mem2's kstring.h (they share the KSTRING_H include guard). */
+/* htslib headers must come before any bwa-mem3 header that pulls in
+ * bwa-mem3's kstring.h (they share the KSTRING_H include guard). */
 #include "htslib/sam.h"
 #include "htslib/kstring.h"
 
@@ -135,7 +135,7 @@ meth_bam_writer_t *meth_bam_writer_open(const char *path_or_dash,
                              NULL) < 0) goto fail;
     }
 
-    /* Original bwa-mem2 @PG */
+    /* Original bwa-mem3 @PG */
     if (bwa_pg != NULL && bwa_pg[0] != '\0') {
         if (sam_hdr_add_lines(w->hdr, bwa_pg, 0) < 0) goto fail;
     }
@@ -220,11 +220,11 @@ int meth_mem_aln_to_bam(bam1_t *b,
     p.flag |= p.is_rev ? 0x10 : 0;
     p.flag |= mp && mp->is_rev ? 0x20 : 0;
 
-    /* Fold bwa-mem2's high-bit supp flag (0x10000) down into BAM's 0x100. */
+    /* Fold bwa-mem3's high-bit supp flag (0x10000) down into BAM's 0x100. */
     uint16_t flag16 = (uint16_t)((p.flag & 0xffff) | (p.flag & 0x10000 ? 0x100 : 0));
 
     /* Direction (YD:Z source) comes from the chrom name prefix ('f'/'r')
-     * written by `bwa-mem2 index --meth`. */
+     * written by `bwa-mem3 index --meth`. */
     int32_t tid = -1, mtid = -1;
     char direction = 0;
     if (p.rid >= 0 && p.rid < cmap->n_internal) {
@@ -235,7 +235,7 @@ int meth_mem_aln_to_bam(bam1_t *b,
         mtid = cmap->out_tid[mp->rid];
     }
 
-    /* Remap primary CIGAR: bwa-mem2 ops -> BAM ops, + soft->hard for supp */
+    /* Remap primary CIGAR: bwa-mem3 ops -> BAM ops, + soft->hard for supp */
     uint32_t *bam_cigar = NULL;
     size_t    bam_n_cigar = 0;
     if (p.n_cigar > 0) {
@@ -484,7 +484,7 @@ int meth_mem_aln_to_bam(bam1_t *b,
 
     /* Generic aux shared with the --bam path so --meth -C emits FASTQ tags
      * plus the YS:Z/YC:Z meth tags that `fastmap.cpp` built into s->comment,
-     * and --meth -V emits XR:Z. p.rid here is the bwa-mem2 internal contig
+     * and --meth -V emits XR:Z. p.rid here is the bwa-mem3 internal contig
      * index (pre-remap), which is what bns uses. */
     bam_writer_append_generic_aux(b, s, opt, bns, p.rid);
 

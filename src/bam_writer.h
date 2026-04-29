@@ -7,7 +7,7 @@
 #include "bwamem.h"
 #include "bntseq.h"
 
-/* htslib/sam.h and bwa-mem2's kstring.h share the KSTRING_H guard, so htslib
+/* htslib/sam.h and bwa-mem3's kstring.h share the KSTRING_H guard, so htslib
  * headers are only included inside src/bam_writer.cpp. Callers get a
  * forward-declared bam1_t and opaque writer handle. */
 struct bam1_t;
@@ -70,7 +70,7 @@ int bam_writer_push_aln(bseq1_t *s,
  *   2. XR:Z from `bns->anns[rid].anno` when MEM_F_REF_HDR is set (-V).
  *
  * Factored out so both the generic bam_writer path and the meth_bam path
- * produce identical output for --bam vs --meth. `rid` is the bwa-mem2
+ * produce identical output for --bam vs --meth. `rid` is the bwa-mem3
  * internal contig index (bns-relative), not a post-remap output tid. */
 void bam_writer_append_generic_aux(struct bam1_t *b,
                                    const bseq1_t *s,

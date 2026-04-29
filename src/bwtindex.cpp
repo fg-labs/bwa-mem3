@@ -174,7 +174,7 @@ static int64_t parse_memory_spec(const char *s)
 
 static void index_usage(void)
 {
-	fprintf(stderr, "Usage: bwa-mem2 index [-p prefix] [-t N] [--max-memory SIZE] [--tmp-dir PATH] [--meth] <in.fasta>\n");
+	fprintf(stderr, "Usage: bwa-mem3 index [-p prefix] [-t N] [--max-memory SIZE] [--tmp-dir PATH] [--meth] <in.fasta>\n");
 	fprintf(stderr, "\n"
 	        "  -p STR             output prefix (default: <in.fasta>)\n"
 	        "  -t INT             worker threads [auto: detected cores, cgroup-aware]\n"
@@ -184,7 +184,7 @@ static void index_usage(void)
 	        "  --tmp-dir PATH     scratch directory [$TMPDIR]\n"
 	        "  --meth             build a bwameth-style doubled c2t reference + FMI.\n"
 	        "                     Writes <in.fasta>.bwameth.c2t and the FMI alongside it.\n"
-	        "                     Use with `bwa-mem2 mem --meth <in.fasta> R1.fq [R2.fq]`.\n"
+	        "                     Use with `bwa-mem3 mem --meth <in.fasta> R1.fq [R2.fq]`.\n"
 	        "  -h, --help         print this help message and exit\n");
 }
 

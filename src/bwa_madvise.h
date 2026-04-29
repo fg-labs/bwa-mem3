@@ -13,7 +13,7 @@
 #include <sys/mman.h>
 #endif
 
-// Request transparent huge pages on a large allocation. The bwa-mem2 hg38
+// Request transparent huge pages on a large allocation. The bwa-mem3 hg38
 // index runtime working set is ~17 GB (cp_occ ~6 GB, sa_ms_byte ~2 GB,
 // sa_ls_word ~8 GB) plus an ~800 MB pack table. With 4 KB pages the dTLB
 // covers ~256 KB — a rounding error. Promoting to 2 MB THP pages (coverage

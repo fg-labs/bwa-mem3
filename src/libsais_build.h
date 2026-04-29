@@ -10,7 +10,7 @@ struct LibsaisBuildOpts {
     std::string tmpdir;
 };
 
-// Build the bwa-mem2 FM index via libsais's generalized-suffix-array
+// Build the bwa-mem3 FM index via libsais's generalized-suffix-array
 // construction. Precondition: `<prefix>.pac` and `<prefix>.ann` already
 // exist, with the .pac encoding the forward-only bases emitted by
 // bns_fasta2bntseq (l_pac bases, 2-bit, alphabet A=0 C=1 G=2 T=3; N was

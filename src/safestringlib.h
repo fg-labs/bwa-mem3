@@ -6,7 +6,7 @@
  *
  * On macOS, memset_s is declared in <string.h> with a 4-argument signature
  * (C11 Annex K), which conflicts with safestringlib's 3-argument version.
- * bwa-mem2 doesn't call memset_s, so we hide safestringlib's declaration
+ * bwa-mem3 doesn't call memset_s, so we hide safestringlib's declaration
  * by renaming it during inclusion.
  */
 

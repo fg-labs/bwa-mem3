@@ -87,11 +87,11 @@ int main_mem(int argc, char *argv[]);
 // Allocate all per-worker scratch buffers (chaining arrays, BSW buffers, BWT
 // scratch) on `w`, sized for `nreads` and `nthreads`. Exposed so that
 // consumers of libbwa.a that build their own worker_t (e.g. language
-// bindings) can reuse the exact same allocation layout as the bwa-mem2
+// bindings) can reuse the exact same allocation layout as the bwa-mem3
 // pipeline and stay in sync across future changes. Records `nthreads` on
 // `w.nthreads` so the matching worker_free can validate the pairing. Prints
 // a small summary to stderr. Asserts on allocation failure (matching the
-// rest of bwa-mem2).
+// rest of bwa-mem3).
 void worker_alloc(const mem_opt_t *opt, worker_t &w, int32_t nreads, int32_t nthreads);
 
 // Release all per-worker scratch buffers previously allocated by
