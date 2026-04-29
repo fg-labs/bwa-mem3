@@ -1,9 +1,7 @@
-# fg-main
+# What's different from bwa-mem2
 
-`fg-main` is the Fulcrum Genomics integration branch for bwa-mem2: upstream
-[`bwa-mem2/bwa-mem2`](https://github.com/bwa-mem2/bwa-mem2) `master` + the
-platform-support and bug-fix commits listed below that we carry until they
-land upstream.
+This document tracks the changes carried by `bwa-mem3` on top of upstream
+[`bwa-mem2/bwa-mem2`](https://github.com/bwa-mem2/bwa-mem2)'s `master` branch.
 
 ## Carried on top of upstream
 
@@ -41,7 +39,7 @@ land upstream.
 
 ## Version stamping
 
-`PACKAGE_VERSION` (the value reported by `bwa-mem2 version` and written to
+`PACKAGE_VERSION` (the value reported by `bwa-mem3 version` and written to
 the `@PG VN:` SAM header field) is generated at build time by the Makefile
 from `git describe --tags --dirty`, e.g. `v2.3-30-g61813ef` for a tree 30
 commits past upstream tag `v2.3` at commit `61813ef`.
@@ -58,18 +56,18 @@ commits past upstream tag `v2.3` at commit `61813ef`.
 ## Branching and update policy
 
 - `master` tracks upstream unchanged.
-- `fg-main` is `upstream/master` plus the commits above. Rebased onto upstream roughly quarterly, or sooner when an upstream release we care about lands.
-- Contributions go via PR targeting `fg-main`. CI and CodeRabbit gate merges.
+- `main` is `upstream/master` plus the commits above. Rebased onto upstream roughly quarterly, or sooner when an upstream release we care about lands.
+- Contributions go via PR targeting `main`. CI and CodeRabbit gate merges.
 - Any PR that adds or removes a fork-carried commit must update the table above in the same PR.
 
 ## Consuming
 
-Clone this repo and check out `fg-main`:
+Clone this repo and check out `main`:
 
 ```bash
-git clone https://github.com/fg-labs/bwa-mem2.git
-cd bwa-mem2
-git checkout fg-main
+git clone https://github.com/fg-labs/bwa-mem3.git
+cd bwa-mem3
+git checkout main
 ```
 
 Or vendor the branch into a downstream repo by pinning to a specific
@@ -77,4 +75,4 @@ commit (not the branch tip) so your build is reproducible.
 
 ## Relationship to upstream
 
-We submit the generally-useful fixes and features carried here as PRs against [`bwa-mem2/bwa-mem2`](https://github.com/bwa-mem2/bwa-mem2) when the upstream maintainers are actively merging; while they are not, fixes land here first and we drop them from `fg-main` once they appear upstream.
+We submit the generally-useful fixes and features carried here as PRs against [`bwa-mem2/bwa-mem2`](https://github.com/bwa-mem2/bwa-mem2) when the upstream maintainers are actively merging; while they are not, fixes land here first and we drop them from `main` once they appear upstream.
