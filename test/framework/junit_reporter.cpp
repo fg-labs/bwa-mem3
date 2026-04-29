@@ -18,7 +18,7 @@ void install_matrix_row_reporter_hook() {
     // banner before the test run so the CI log itself disambiguates.
     // A richer reporter override is scheduled for a follow-up PR once
     // we see what GitHub's test-results action actually consumes.
-    const char *row = std::getenv("BWA_MEM2_TEST_MATRIX_ROW");
+    const char *row = std::getenv("BWA_MEM3_TEST_MATRIX_ROW");
     if (row && row[0] != '\0') {
         std::fprintf(stderr, "\n=== bwa-mem3 tests — matrix row: %s ===\n\n", row);
     }

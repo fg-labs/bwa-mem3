@@ -2,7 +2,7 @@
 //
 // Install a doctest reporter hook that decorates the built-in junit
 // reporter output with the CI matrix row name (read from the
-// BWA_MEM2_TEST_MATRIX_ROW env var; empty if unset). This keeps the
+// BWA_MEM3_TEST_MATRIX_ROW env var; empty if unset). This keeps the
 // per-row result artifacts disambiguable after actions/upload-artifact
 // collects them.
 

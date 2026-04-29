@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [master, fg-main]
+    branches: [master, main]
   pull_request:
 
 env:
@@ -89,7 +89,7 @@ jobs:
       - name: Verify CMake is available
         run: cmake --version
 
-      - name: Build bwa-mem2
+      - name: Build bwa-mem3
         run: |
           if [ "${{ matrix.arch_flag }}" = "" ]; then
             make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)" \
@@ -104,7 +104,7 @@ jobs:
           fi
 
       - name: Verify binary
-        run: ./bwa-mem2 version
+        run: ./bwa-mem3 version
 
       - name: Build doctest framework and unit binary
         # Invoke via the parent `test-binaries` target so ARCH_FLAGS
@@ -137,14 +137,14 @@ jobs:
       - name: Run unit tests (all rows)
         if: matrix.arch_flag != 'multi'
         env:
-          BWA_MEM2_TEST_MATRIX_ROW: ${{ matrix.name }}
+          BWA_MEM3_TEST_MATRIX_ROW: ${{ matrix.name }}
         # `--reporters=junit --out=…` writes JUnit XML to the file and
         # nothing to stdout. doctest itself prints the failing-assertion
         # summary to stderr before exiting non-zero, so the per-step log
         # already surfaces the diagnosis; the JUnit XML is only consumed
         # via the upload-artifact step below.
         run: |
-          ./test/bwa_mem2_tests_unit \
+          ./test/bwa_mem3_tests_unit \
             --reporters=junit \
             --out=unit-results-${{ strategy.job-index }}.xml
 
@@ -162,9 +162,9 @@ jobs:
       - name: Run integration tests
         if: matrix.run_integration == true && matrix.arch_flag != 'multi'
         env:
-          BWA_MEM2_TEST_MATRIX_ROW: ${{ matrix.name }}
+          BWA_MEM3_TEST_MATRIX_ROW: ${{ matrix.name }}
         run: |
-          ./test/bwa_mem2_tests_integration \
+          ./test/bwa_mem3_tests_integration \
             --reporters=junit \
             --out=integration-results-${{ strategy.job-index }}.xml
 
@@ -177,12 +177,12 @@ jobs:
 
       - name: Verify mimalloc is linked (when enabled)
         if: matrix.use_mimalloc == '1'
-        run: test/mimalloc_loaded_test.sh ./bwa-mem2
+        run: test/mimalloc_loaded_test.sh ./bwa-mem3
 
       - name: Verify mimalloc is NOT linked (when disabled)
         if: matrix.use_mimalloc == '0'
         run: |
-          if test/mimalloc_loaded_test.sh ./bwa-mem2; then
+          if test/mimalloc_loaded_test.sh ./bwa-mem3; then
             echo "FAIL: USE_MIMALLOC=0 build should NOT report mimalloc" >&2
             exit 1
           fi
@@ -233,9 +233,9 @@ jobs:
             /tmp/ci-test/phix174.fa \
             /tmp/ci-test/reads
 
-      - name: Compare bwa and bwa-mem2 output (phiX parity)
+      - name: Compare bwa and bwa-mem3 output (phiX parity)
         run: |
-          BWA_MEM2="$GITHUB_WORKSPACE/bwa-mem2" \
+          BWA_MEM2="$GITHUB_WORKSPACE/bwa-mem3" \
           CI_TEST_DIR=/tmp/ci-test \
           bash test/regression/phix_parity.sh
 
@@ -247,14 +247,14 @@ jobs:
       - name: --bam=6 roundtrip smoke (phiX)
         if: matrix.canonical == true
         run: |
-          BWA_MEM2="$GITHUB_WORKSPACE/bwa-mem2" \
+          BWA_MEM2="$GITHUB_WORKSPACE/bwa-mem3" \
           CI_TEST_DIR=/tmp/ci-test \
           bash test/regression/bam_roundtrip.sh
 
       - name: Thread-determinism smoke (phiX, -t 1 vs -t 4)
         if: matrix.canonical == true
         run: |
-          BWA_MEM2="$GITHUB_WORKSPACE/bwa-mem2" \
+          BWA_MEM2="$GITHUB_WORKSPACE/bwa-mem3" \
           CI_TEST_DIR=/tmp/ci-test \
           bash test/regression/thread_determinism.sh
 
@@ -279,7 +279,7 @@ jobs:
         if: matrix.canonical == true
         run: |
           cd /tmp/chr22
-          $GITHUB_WORKSPACE/bwa-mem2 index chr22.fa
+          $GITHUB_WORKSPACE/bwa-mem3 index chr22.fa
           ls chr22.fa.*
 
       - name: Simulate chr22 reads with dwgsim
@@ -292,10 +292,10 @@ jobs:
             -r 0.001 -S 2 \
             /tmp/chr22/chr22.fa /tmp/chr22-sim/reads
 
-      - name: Compare chr22 bwa vs bwa-mem2 (parity)
+      - name: Compare chr22 bwa vs bwa-mem3 (parity)
         if: matrix.canonical == true
         run: |
-          BWA_MEM2="$GITHUB_WORKSPACE/bwa-mem2" \
+          BWA_MEM2="$GITHUB_WORKSPACE/bwa-mem3" \
           CHR22_FA=/tmp/chr22/chr22.fa \
           CHR22_SIM_DIR=/tmp/chr22-sim \
           bash test/regression/chr22_parity.sh
@@ -303,11 +303,11 @@ jobs:
       - name: SE alignment smoke (chr22)
         if: matrix.canonical == true
         run: |
-          $GITHUB_WORKSPACE/bwa-mem2 mem -t 4 /tmp/chr22/chr22.fa \
+          $GITHUB_WORKSPACE/bwa-mem3 mem -t 4 /tmp/chr22/chr22.fa \
             /tmp/chr22-sim/reads.bwa.read1.fastq.gz > /tmp/chr22-sim/se.sam 2>/dev/null
           records=$(grep -cv '^@' /tmp/chr22-sim/se.sam)
           [ "$records" -gt 0 ] || { echo "FAIL: SE alignment produced zero records"; exit 1; }
-          grep -q '^@PG.*bwa-mem2' /tmp/chr22-sim/se.sam || { echo "FAIL: SE missing @PG"; exit 1; }
+          grep -q '^@PG.*bwa-mem3' /tmp/chr22-sim/se.sam || { echo "FAIL: SE missing @PG"; exit 1; }
           echo "PASS: SE smoke ($records records)"
 
       - name: Interleaved alignment smoke (chr22)
@@ -322,7 +322,7 @@ jobs:
             <(zcat /tmp/chr22-sim/reads.bwa.read1.fastq.gz | paste - - - -) \
             <(zcat /tmp/chr22-sim/reads.bwa.read2.fastq.gz | paste - - - -) \
             | tr '\t' '\n' > /tmp/chr22-sim/interleaved.fq
-          $GITHUB_WORKSPACE/bwa-mem2 mem -p -t 4 /tmp/chr22/chr22.fa \
+          $GITHUB_WORKSPACE/bwa-mem3 mem -p -t 4 /tmp/chr22/chr22.fa \
             /tmp/chr22-sim/interleaved.fq > /tmp/chr22-sim/p.sam 2>/dev/null
           records=$(grep -cv '^@' /tmp/chr22-sim/p.sam)
           [ "$records" -gt 0 ] || { echo "FAIL: interleaved alignment produced zero records"; exit 1; }
@@ -390,10 +390,10 @@ jobs:
         run: make test-binaries arch=avx2 CXX=g++ COVERAGE=1
 
       - name: Run unit tests
-        run: ./test/bwa_mem2_tests_unit
+        run: ./test/bwa_mem3_tests_unit
 
       - name: Run integration tests
-        run: ./test/bwa_mem2_tests_integration
+        run: ./test/bwa_mem3_tests_integration
 
       - name: Collect coverage into Cobertura XML
         # gcovr walks the tree, runs gcov on each .gcda, and emits a

@@ -1,7 +1,7 @@
 name: proto-neon-kswv
 
 # Correctness + perf harness for the kswv batched mate-rescue port. Runs on
-# proto/* branches and PRs to fg-main.
+# proto/* branches and PRs to main.
 #
 # Job graph (fan-out / fan-in):
 #
@@ -18,7 +18,7 @@ name: proto-neon-kswv
 #                    and reads are cached across runs; reads are also
 #                    uploaded as a small artifact so downstream jobs do not
 #                    need the holodeck binary themselves.
-#   run-mem-*      — build bwa-mem2 (ccache + full-binary cache), restore
+#   run-mem-*      — build bwa-mem3 (ccache + full-binary cache), restore
 #                    the chr17 FM-index (or build it on miss), run mem
 #                    N_REPS times with BAM-1 output, upload timings + (port
 #                    only) BAM.
@@ -43,7 +43,7 @@ on:
       - 'proto/avx512-kswv-**'
   pull_request:
     branches:
-      - 'fg-main'
+      - 'main'
       - 'proto/neon-kswv-**'
     paths:
       - 'src/**'
@@ -167,25 +167,25 @@ jobs:
             runs-on: ubuntu-24.04-arm
             arch: arm
             build_flags: ""
-            binary_name: bwa-mem2.arm64
+            binary_name: bwa-mem3.arm64
             flags_slug: port
           - label: "run-mem-arm-ctrl"
             runs-on: ubuntu-24.04-arm
             arch: arm
             build_flags: "DISABLE_BATCHED_MATESW=1"
-            binary_name: bwa-mem2.arm64
+            binary_name: bwa-mem3.arm64
             flags_slug: control
           - label: "run-mem-x86-port"
             runs-on: ubuntu-24.04
             arch: x86
             build_flags: ""
-            binary_name: bwa-mem2  # x86 multi-arch dispatcher binary
+            binary_name: bwa-mem3  # x86 multi-arch dispatcher binary
             flags_slug: port
           - label: "run-mem-x86-ctrl"
             runs-on: ubuntu-24.04
             arch: x86
             build_flags: "DISABLE_BATCHED_MATESW=1"
-            binary_name: bwa-mem2
+            binary_name: bwa-mem3
             flags_slug: control
     env:
       CCACHE_DIR: /home/runner/.ccache
@@ -230,7 +230,7 @@ jobs:
           restore-keys: |
             ccache-${{ runner.arch }}-
 
-      - name: Cache prebuilt bwa-mem2 binary
+      - name: Cache prebuilt bwa-mem3 binary
         id: cache-binary
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
@@ -238,9 +238,9 @@ jobs:
           # Exact-hit only (no restore-keys): a binary from a different SHA
           # would not match the source we just checked out. ccache covers
           # the cold-build case when this misses.
-          key: bwa-mem2-${{ runner.arch }}-${{ matrix.flags_slug }}-${{ env.MAKE_ARCH }}-${{ github.sha }}
+          key: bwa-mem3-${{ runner.arch }}-${{ matrix.flags_slug }}-${{ env.MAKE_ARCH }}-${{ github.sha }}
 
-      - name: Build bwa-mem2 (ccache wrapping g++)
+      - name: Build bwa-mem3 (ccache wrapping g++)
         if: steps.cache-binary.outputs.cache-hit != 'true'
         run: |
           # Pair CC with CXX explicitly: the Makefile only auto-pairs bare
@@ -249,7 +249,7 @@ jobs:
           # Pass the `arm64` target explicitly on ARM rather than relying on
           # the implicit `myall:arm64` default-goal dispatch (set up
           # conditionally in the Makefile based on $(IS_ARM) + empty $(arch)).
-          # Makes the produced artifact name (bwa-mem2.arm64) unambiguous.
+          # Makes the produced artifact name (bwa-mem3.arm64) unambiguous.
           ccache --zero-stats >/dev/null
           if [ "${{ matrix.arch }}" = "arm" ]; then
             make -j"$(nproc)" CXX="ccache g++" CC="ccache gcc" ${{ matrix.build_flags }} arm64
@@ -267,7 +267,7 @@ jobs:
           name: data
           path: /tmp/ci-data
 
-      - name: Cache chr17 bwa-mem2 index
+      - name: Cache chr17 bwa-mem3 index
         id: cache-chr17-index
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
@@ -458,7 +458,7 @@ jobs:
             ccache-${{ runner.arch }}-
 
       - name: Build + run kswv unit test
-        # Builds the doctest-based test/bwa_mem2_tests_unit binary via the
+        # Builds the doctest-based test/bwa_mem3_tests_unit binary via the
         # parent `test-binaries` target so ARCH_FLAGS_FROM_PARENT plumbing
         # propagates and the test TU sees the same __AVX2__ / __AVX512BW__
         # / NEON surface libbwa was built with.
@@ -466,7 +466,7 @@ jobs:
           mkdir -p /tmp/ci-out
           ccache --zero-stats >/dev/null
           make arch="$MAKE_ARCH" CXX="ccache g++" CC="ccache gcc" test-binaries
-          ./test/bwa_mem2_tests_unit --test-suite="unit/kswv" \
+          ./test/bwa_mem3_tests_unit --test-suite="unit/kswv" \
             --reporters=junit \
             --out=/tmp/ci-out/kswv-unit-${{ matrix.arch }}.xml \
             2>&1 | tee /tmp/selftest.log
