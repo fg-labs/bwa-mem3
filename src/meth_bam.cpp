@@ -8,6 +8,7 @@
 #include "meth_bam.h"
 #include "bam_writer.h"
 #include "cigar_util.h"
+#include "version.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -139,16 +140,16 @@ meth_bam_writer_t *meth_bam_writer_open(const char *path_or_dash,
         if (sam_hdr_add_lines(w->hdr, bwa_pg, 0) < 0) goto fail;
     }
 
-    /* bwa-mem2-meth @PG — grow as needed so very long CLs aren't truncated. */
+    /* bwa-mem3-meth @PG — grow as needed so very long CLs aren't truncated. */
     {
         const char *cl_in = (meth_pg_cl && meth_pg_cl[0]) ? meth_pg_cl
-                                                          : "bwa-mem2 mem --meth";
+                                                          : "bwa-mem3 mem --meth";
         char *cl_copy = strdup(cl_in);
         if (cl_copy == NULL) goto fail;
         sanitize_cl(cl_copy);
         kstring_t pg = {0, 0, NULL};
-        ksprintf(&pg, "@PG\tID:bwa-mem2-meth\tPN:bwa-mem2-meth\tVN:2.2.1-meth\tCL:%s\n",
-                 cl_copy);
+        ksprintf(&pg, "@PG\tID:bwa-mem3-meth\tPN:bwa-mem3-meth\tVN:%s-meth\tCL:%s\n",
+                 PACKAGE_VERSION, cl_copy);
         free(cl_copy);
         int rc = (pg.s != NULL) ? sam_hdr_add_lines(w->hdr, pg.s, 0) : -1;
         free(pg.s);

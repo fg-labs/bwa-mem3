@@ -1,30 +1,30 @@
 #!/usr/bin/env bash
-# Regression test: bwa-mem2 mem --meth end-to-end.
+# Regression test: bwa-mem3 mem --meth end-to-end.
 #
 # Two layers of assertions:
 #
 # Layer 1 (always runs):  valid BAM emission.
 #   - binary builds and runs with --meth
 #   - produces uncompressed BAM readable by samtools
-#   - @PG ID:bwa-mem2-meth present
+#   - @PG ID:bwa-mem3-meth present
 #   - BGZF EOF marker at tail
 #   - --set-as-failed / --do-not-penalize-chimeras parse cleanly
 #
 # Layer 2 (runs if pixi + bwameth.py available):  equivalence to bwameth.py.
 #   Builds a bwameth c2t reference, c2t-converts reads, runs BOTH the
-#   bwameth.py Python pipeline and `bwa-mem2 mem --meth` on the same
+#   bwameth.py Python pipeline and `bwa-mem3 mem --meth` on the same
 #   converted reads, and diffs structural fields + YD:Z tags + flag
 #   distribution. Currently zero diff on the bwa-meth/example fixture.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-BWAMEM2="$HERE/../../bwa-mem2"
+BWAMEM2="$HERE/../../bwa-mem3"
 SAMTOOLS="${SAMTOOLS:-samtools}"
 BWAMETH_DIR="${BWAMETH_DIR:-$HOME/work/git/bwa-meth}"
 BWAMETH_PY="$BWAMETH_DIR/bwameth.py"
 
 if [[ ! -x "$BWAMEM2" ]]; then
-    echo "ERROR: bwa-mem2 binary not found at $BWAMEM2. Run 'make arm64' first."
+    echo "ERROR: bwa-mem3 binary not found at $BWAMEM2. Run 'make arm64' first."
     exit 2
 fi
 if ! command -v "$SAMTOOLS" >/dev/null 2>&1; then
@@ -54,8 +54,8 @@ HDR="$("$SAMTOOLS" view -H /tmp/meth_test.bam 2>&1)"
 if echo "$HDR" | grep -qi 'truncated\|EOF marker is absent'; then
     echo "FAIL: samtools reports truncated BAM"; echo "$HDR"; exit 1
 fi
-if ! echo "$HDR" | grep -q 'ID:bwa-mem2-meth'; then
-    echo "FAIL: @PG ID:bwa-mem2-meth missing"; exit 1
+if ! echo "$HDR" | grep -q 'ID:bwa-mem3-meth'; then
+    echo "FAIL: @PG ID:bwa-mem3-meth missing"; exit 1
 fi
 
 TOTAL="$("$SAMTOOLS" view -c /tmp/meth_test.bam 2>/dev/null)"
@@ -68,7 +68,7 @@ if [[ ! -s /tmp/meth_test2.bam ]]; then
     exit 1
 fi
 
-echo "OK layer 1: bwa-mem2 mem --meth (records=$TOTAL, BGZF-EOF ok, @PG bwa-mem2-meth ok)"
+echo "OK layer 1: bwa-mem3 mem --meth (records=$TOTAL, BGZF-EOF ok, @PG bwa-mem3-meth ok)"
 
 # ---------------------------------------------------------------------------
 # Layer 2: bwa-meth equivalence (requires pixi + bwameth.py + toolshed)
@@ -112,7 +112,7 @@ norm() {
 # TLEN (col 9) intentionally diverges from bwameth.py on the edge case of
 # mates landing on opposite projected strands (f* vs r* in the doubled c2t
 # reference). bwameth.py is a post-processor that strips the f/r prefix to
-# make RNAME==RNEXT but inherits bwa-mem2's internal TLEN=0 (which bwa-mem2
+# make RNAME==RNEXT but inherits bwa-mem3's internal TLEN=0 (which bwa-mem3
 # sets because the internal rids differ). Per the SAM spec, TLEN=0 is
 # reserved for "information unavailable (e.g., mates on different refs)";
 # once we consolidate f*/r* to one output contig the information IS
@@ -148,15 +148,15 @@ fi
 
 MINE_F="$(grep -c YD:Z:f /tmp/meth_mine.sam || true)"
 MINE_R="$(grep -c YD:Z:r /tmp/meth_mine.sam || true)"
-echo "OK layer 2: bwa-mem2 mem --meth matches bwameth.py (records=$MINE_N, YD:Z:f=$MINE_F YD:Z:r=$MINE_R)"
+echo "OK layer 2: bwa-mem3 mem --meth matches bwameth.py (records=$MINE_N, YD:Z:f=$MINE_F YD:Z:r=$MINE_R)"
 
 # ---------------------------------------------------------------------------
-# Layer 3: full-pipeline end-to-end — `bwa-mem2 index --meth` + `mem --meth`
+# Layer 3: full-pipeline end-to-end — `bwa-mem3 index --meth` + `mem --meth`
 # ---------------------------------------------------------------------------
 # Tests the single-command drop-in replacement for the bwameth.py pipeline:
 #
-#   bwa-mem2 index --meth ref.fa                           # once
-#   bwa-mem2 mem   --meth ref.fa R1.fq R2.fq | samtools sort ...
+#   bwa-mem3 index --meth ref.fa                           # once
+#   bwa-mem3 mem   --meth ref.fa R1.fq R2.fq | samtools sort ...
 #
 # No Python, no bwameth.py invocation, no piping. Asserts byte-for-byte
 # equivalence with bwameth.py end-to-end on the example fixture:
@@ -235,6 +235,6 @@ if only_n or only_o or gap or nonly or same_pos != len(both) or same_cigar != le
         f'  same chrom+pos: {same_pos}/{len(both)}\n'
         f'  same CIGAR:     {same_cigar}/{len(both)}\n')
     sys.exit(1)
-print(f'OK layer 3: bwa-mem2 mem --meth == bwameth.py end-to-end '
+print(f'OK layer 3: bwa-mem3 mem --meth == bwameth.py end-to-end '
       f'(records={len(both)}, chrom+pos match, CIGAR match)')
 PY
