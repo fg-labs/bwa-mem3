@@ -40,6 +40,7 @@
 #include <sys/stat.h>      /* mode constants, stat */
 #include <fcntl.h>         /* O_* */
 #include <unistd.h>        /* close, ftruncate */
+#include <getopt.h>        /* getopt_long for `bwa-mem2 shm --meth ...` */
 #include <errno.h>
 #include <limits.h>        /* PATH_MAX */
 
@@ -767,17 +768,71 @@ int bwa_shm_section_find(const uint8_t *base, uint32_t kind,
     return -1;
 }
 
+/* Resolve the on-disk prefix for `bwa-mem2 shm --meth <idxbase>` so that
+ * the registry basename matches what `bwa-mem2 mem --meth <idxbase>` will
+ * later look up. Mirrors fastmap.cpp's c2t-suffix resolution: append
+ * `.bwameth.c2t` unless `prefix` already ends with it. */
+static int resolve_meth_prefix(const char *prefix, char out[PATH_MAX])
+{
+    static const char SUFFIX[] = ".bwameth.c2t";
+    static const size_t SUFLEN = sizeof(SUFFIX) - 1;
+    size_t plen = std::strlen(prefix);
+    int already = (plen >= SUFLEN) &&
+                  (std::strcmp(prefix + plen - SUFLEN, SUFFIX) == 0);
+    if (already) {
+        if (plen + 1 > (size_t)PATH_MAX) {
+            std::fprintf(stderr, "[E::%s] prefix too long\n", __func__);
+            return -1;
+        }
+        strcpy_s(out, PATH_MAX, prefix);
+    } else {
+        if (plen + SUFLEN + 1 > (size_t)PATH_MAX) {
+            std::fprintf(stderr, "[E::%s] prefix too long for --meth\n", __func__);
+            return -1;
+        }
+        path_concat2(out, prefix, SUFFIX);
+    }
+    return 0;
+}
+
+/* If `<prefix>.0123` is absent but `<prefix>.bwameth.c2t.0123` is present,
+ * the user likely meant `--meth`. Print a hint and return 1. Returns 0
+ * when no hint applies (let the regular stage path produce its own error). */
+static int hint_missing_meth_flag(const char *prefix)
+{
+    char zer_path[PATH_MAX];
+    path_concat2(zer_path, prefix, ".0123");
+    struct stat st;
+    if (stat(zer_path, &st) == 0) return 0;        /* literal index present */
+    if (errno != ENOENT) return 0;                 /* I/O error: defer */
+
+    char c2t_zer[PATH_MAX];
+    path_concat2(c2t_zer, prefix, ".bwameth.c2t.0123");
+    if (stat(c2t_zer, &st) != 0) return 0;         /* no meth index either */
+
+    std::fprintf(stderr,
+        "[E::main_shm] no FMI at '%s.0123' but a meth index is present at "
+        "'%s.bwameth.c2t.*'\n"
+        "             did you mean `bwa-mem2 shm --meth %s`?\n",
+        prefix, prefix, prefix);
+    return 1;
+}
+
 static void print_shm_usage(void)
 {
     std::fprintf(stderr,
-        "\nUsage: bwa-mem2 shm [-d|-l|--help] [idxbase]\n\n"
+        "\nUsage: bwa-mem2 shm [-d|-l|--help] [--meth] [idxbase]\n\n"
         "Options:\n"
         "  -d        destroy all indices in shared memory (matches bwa v1 behavior)\n"
         "  -l        list names of indices in shared memory\n"
+        "  --meth    stage a `bwa-mem2 index --meth` index — auto-appends\n"
+        "            `.bwameth.c2t` to <idxbase>, mirroring `mem --meth`\n"
         "  -h --help print this help and exit\n\n"
         "Stage with no flags: `bwa-mem2 shm <idxbase>` loads the index into\n"
         "POSIX shared memory; subsequent `bwa-mem2 mem <idxbase> ...` runs\n"
-        "auto-attach instead of re-reading from disk.\n\n"
+        "auto-attach instead of re-reading from disk. For meth indices, pass\n"
+        "the same plain `<idxbase>` to all three commands plus `--meth` on\n"
+        "`index`, `shm`, and `mem` (the c2t suffix is auto-appended).\n\n"
         "Footgun: if you re-build the index, run `bwa-mem2 shm -d` first.\n"
         "There is no staleness check -- a stale segment will silently mis-align.\n\n"
         "macOS: POSIX shm has implementation-defined per-segment caps; large\n"
@@ -789,11 +844,11 @@ static void print_shm_usage(void)
 
 int main_shm(int argc, char *argv[])
 {
-    int c, to_list = 0, to_drop = 0, ret = 0;
+    int c, to_list = 0, to_drop = 0, meth = 0, ret = 0;
 
-    /* Pre-scan for --help / -h. getopt's "ld" optstring would treat them as
-     * unknown options and print a generic error, but the top-level usage
-     * (src/main.cpp) advertises `bwa-mem2 <command> --help`, so we honor it. */
+    /* Pre-scan for --help / -h. getopt_long would treat -h as unknown
+     * (no short opt declared) and print a generic error, but the top-level
+     * usage advertises `bwa-mem2 <command> --help`, so we honor both. */
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
             print_shm_usage();
@@ -810,10 +865,15 @@ int main_shm(int argc, char *argv[])
     extern int optreset;
     optreset = 1;
 #endif
-    while ((c = getopt(argc, argv, "ld")) >= 0) {
-        if      (c == 'l') to_list = 1;
-        else if (c == 'd') to_drop = 1;
-        else               return 1;   /* getopt printed the error */
+    static struct option long_opts[] = {
+        {"meth", no_argument, 0, 1000},
+        {0,      0,           0, 0   }
+    };
+    while ((c = getopt_long(argc, argv, "ld", long_opts, NULL)) >= 0) {
+        if      (c == 'l')   to_list = 1;
+        else if (c == 'd')   to_drop = 1;
+        else if (c == 1000)  meth    = 1;
+        else                 return 1;   /* getopt printed the error */
     }
     if (optind == argc && !to_list && !to_drop) {
         print_shm_usage();
@@ -824,13 +884,32 @@ int main_shm(int argc, char *argv[])
             "[E::%s] -l or -d cannot be combined with idxbase\n", __func__);
         return 1;
     }
+    if (meth && (to_list || to_drop)) {
+        std::fprintf(stderr,
+            "[E::%s] --meth cannot be combined with -l or -d\n", __func__);
+        return 1;
+    }
+    if (optind + 1 < argc) {
+        std::fprintf(stderr,
+            "[E::%s] too many positional arguments; expected at most one idxbase\n",
+            __func__);
+        return 1;
+    }
 
     /* Stage. */
     if (optind < argc) {
-        if (bwa_shm_stage(argv[optind]) < 0) {
+        const char *user_prefix = argv[optind];
+        char       resolved[PATH_MAX];
+        if (meth) {
+            if (resolve_meth_prefix(user_prefix, resolved) != 0) return 1;
+            user_prefix = resolved;
+        } else if (hint_missing_meth_flag(user_prefix)) {
+            return 1;
+        }
+        if (bwa_shm_stage(user_prefix) < 0) {
             std::fprintf(stderr,
                 "[E::%s] failed to stage '%s' in shared memory\n",
-                __func__, argv[optind]);
+                __func__, user_prefix);
             ret = 1;
         }
     }
