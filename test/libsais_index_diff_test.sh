@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Byte-diff bwa-mem2 index output against the baselines committed under
+# Byte-diff bwa-mem3 index output against the baselines committed under
 # test/fixtures/baselines/. The baselines were produced at the legacy/sais-lite
 # tag and capture the byte-exact reference artifacts we expect.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
-BWAMEM2="$ROOT/bwa-mem2"
+BWAMEM2="$ROOT/bwa-mem3"
 BASELINES="$HERE/fixtures/baselines"
 
 FAIL=0

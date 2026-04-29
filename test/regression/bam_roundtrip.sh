@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # test/regression/bam_roundtrip.sh
 #
-# Regression: bwa-mem2 mem --bam=6 produces a BAM that decodes cleanly
+# Regression: bwa-mem3 mem --bam=6 produces a BAM that decodes cleanly
 # and has the same record count as the SAM path.
 #
 # Was: the "--bam=6 roundtrip smoke (phiX)" step inline in ci.yml.
 #
 # Inputs:
-#   BWA_MEM2    — path to bwa-mem2 binary
+#   BWA_MEM2    — path to bwa-mem3 binary
 #   CI_TEST_DIR — directory containing bwamem2_phix174.fa (pre-indexed),
 #                 bwamem2.sam (from the phix_parity step), and FASTQs
 set -euo pipefail

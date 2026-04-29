@@ -4,7 +4,7 @@
  * which builds the phix index first.
  *
  * Usage: shm_pack_round_trip_test <prefix>
- *   <prefix> is the path passed to `bwa-mem2 index`, e.g. test/fixtures/phix.fa
+ *   <prefix> is the path passed to `bwa-mem3 index`, e.g. test/fixtures/phix.fa
  */
 
 #include "bwa_shm.h"

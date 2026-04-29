@@ -1,5 +1,5 @@
 ##*****************************************************************************
-##  bwa-mem2 test build
+##  bwa-mem3 test build
 ##
 ##  This Makefile produces:
 ##    - test/framework/libbwa_test_framework.a    (shared test-helper lib)

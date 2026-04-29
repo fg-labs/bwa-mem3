@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
 # test/help_prescan_test.sh
 #
-# `bwa-mem2 mem` pre-scans argv for `--help` so the AVX/SA banner and the
+# `bwa-mem3 mem` pre-scans argv for `--help` so the AVX/SA banner and the
 # post-run profiling trailer are skipped on a real help request. The scan
 # must NOT match `--help` when it appears as the value of an option that
 # takes an argument (e.g. `-R --help`, `-o --help`,
 # `--set-as-failed --help`). Without the fix, those legitimate runs
 # wrongly short-circuit to `main_mem` and suppress the banner.
 #
-# Usage: test/help_prescan_test.sh <bwa-mem2-binary> <fixtures-dir>
+# Usage: test/help_prescan_test.sh <bwa-mem3-binary> <fixtures-dir>
 
 set -euo pipefail
 
 if [[ $# -ne 2 ]]; then
-    echo "usage: $0 <bwa-mem2-binary> <fixtures-dir>" >&2
+    echo "usage: $0 <bwa-mem3-binary> <fixtures-dir>" >&2
     exit 2
 fi
 
@@ -26,7 +26,7 @@ fixtures="$(abspath "$2")"
 ref="$fixtures/phix.fa"
 reads="$fixtures/reads.fa"
 
-[[ -x "$bin" ]]   || { echo "FAIL: bwa-mem2 binary not executable at $bin" >&2; exit 1; }
+[[ -x "$bin" ]]   || { echo "FAIL: bwa-mem3 binary not executable at $bin" >&2; exit 1; }
 [[ -s "$ref" ]]   || { echo "FAIL: phix.fa missing at $ref" >&2; exit 1; }
 [[ -s "$reads" ]] || { echo "FAIL: reads.fa missing at $reads" >&2; exit 1; }
 
@@ -34,7 +34,7 @@ reads="$fixtures/reads.fa"
 if [[ ! -s "$ref.bwt.2bit.64" || ! -s "$ref.0123" || ! -s "$ref.amb" \
       || ! -s "$ref.ann"       || ! -s "$ref.pac" ]]; then
     "$bin" index "$ref" >/dev/null 2>&1 \
-        || { echo "FAIL: bwa-mem2 index on phix.fa failed" >&2; exit 1; }
+        || { echo "FAIL: bwa-mem3 index on phix.fa failed" >&2; exit 1; }
 fi
 
 tmpdir="$(mktemp -d)"

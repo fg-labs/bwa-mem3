@@ -13,10 +13,10 @@
 namespace bwa_tests {
 
 // Default minimum-seed-length used by the kswv-family tests. Matches
-// bwa-mem2's default mem_opt_t::min_seed_len.
+// bwa-mem3's default mem_opt_t::min_seed_len.
 constexpr int DEFAULT_MIN_SEED_LEN = 19;
 
-// Default gap penalties for bwa-mem2: open=6, extend=1 (both strands).
+// Default gap penalties for bwa-mem3: open=6, extend=1 (both strands).
 constexpr int DEFAULT_GAP_OPEN   = 6;
 constexpr int DEFAULT_GAP_EXTEND = 1;
 

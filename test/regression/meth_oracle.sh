@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # test/regression/meth_oracle.sh
 #
-# Regression: bwa-mem2 --meth Layers 1-3 match the bwa-meth oracle.
+# Regression: bwa-mem3 --meth Layers 1-3 match the bwa-meth oracle.
 #
 # Was: the "Run --meth Layers 1-3" step inline in ci.yml. This is a thin
 # wrapper that re-invokes the existing test/meth/test.sh harness.

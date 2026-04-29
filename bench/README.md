@@ -1,4 +1,4 @@
-# bwa-mem2 performance porting harness
+# bwa-mem3 performance porting harness
 
 Minimal reproducible benchmark for the performance porting effort tracked in `PERF_PORTING_PLAN.md`. Each PR in that plan uses this harness to (a) gate byte-identical SAM output via a golden md5 and (b) measure wall-clock + max-RSS deltas.
 

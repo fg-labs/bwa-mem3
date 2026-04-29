@@ -5,7 +5,7 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
-BWAMEM2="$ROOT/bwa-mem2"
+BWAMEM2="$ROOT/bwa-mem3"
 FA_SRC="$HERE/fixtures/synthetic_1mb.fa"
 [[ -s "$FA_SRC" ]] || { echo "FAIL: $FA_SRC missing"; exit 1; }
 

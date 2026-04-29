@@ -2,7 +2,7 @@
  * Both functions are given identical inputs; outputs (matchArray bytes,
  * numTotalSmem, query_pos_array write-back) must be byte-identical.
  *
- * Usage: smem_lockstep_parity_test <bwa-mem2 index prefix>
+ * Usage: smem_lockstep_parity_test <bwa-mem3 index prefix>
  *   e.g. smem_lockstep_parity_test /path/to/hg38.fa
  */
 
@@ -159,7 +159,7 @@ static void encode_reads(const char * const *reads, int32_t numReads,
 
 int main(int argc, char *argv[]) {
     if (argc != 2) {
-        fprintf(stderr, "Usage: %s <bwa-mem2 index prefix>\n", argv[0]);
+        fprintf(stderr, "Usage: %s <bwa-mem3 index prefix>\n", argv[0]);
         return 2;
     }
 

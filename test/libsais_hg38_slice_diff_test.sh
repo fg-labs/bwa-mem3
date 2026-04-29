@@ -16,7 +16,7 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
-BWAMEM2="$ROOT/bwa-mem2"
+BWAMEM2="$ROOT/bwa-mem3"
 
 HG38="${BWA_TEST_HG38_FASTA:-}"
 SLICE_DIR="${BWA_TEST_HG38_SLICE_DIR:-${TMPDIR:-/tmp}/hg38-slice}"
@@ -53,7 +53,7 @@ if [[ ! -s "$SLICE_DIR/baseline/slice.fa.bwt.2bit.64" ]]; then
     if [[ "${BWA_TEST_HG38_SLICE_BASELINE_BOOTSTRAP:-0}" != "1" ]]; then
         echo "FAIL: baseline at $SLICE_DIR/baseline is missing or incomplete." >&2
         echo "      Seed it from a known-good commit (e.g. checkout legacy/sais-lite," >&2
-        echo "      build, run \`bwa-mem2 index\` on the slice FASTA, copy the" >&2
+        echo "      build, run \`bwa-mem3 index\` on the slice FASTA, copy the" >&2
         echo "      .pac/.ann/.amb/.0123/.bwt.2bit.64 outputs into \$SLICE_DIR/baseline)," >&2
         echo "      or one-shot bootstrap with BWA_TEST_HG38_SLICE_BASELINE_BOOTSTRAP=1." >&2
         exit 1

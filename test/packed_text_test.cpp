@@ -1,5 +1,5 @@
 // Exercises PackedText::get_base / get_kmer on a deterministic pac buffer
-// built with the same _set_pac convention used by bwa-mem2 index.
+// built with the same _set_pac convention used by bwa-mem3 index.
 #include "packed_text.h"
 #include <cstdio>
 #include <cstdlib>

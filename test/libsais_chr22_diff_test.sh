@@ -15,7 +15,7 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
-BWAMEM2="$ROOT/bwa-mem2"
+BWAMEM2="$ROOT/bwa-mem3"
 
 FIXTURE="${BWA_TEST_CHR22_FASTA:-}"
 BASELINE_DIR="${BWA_TEST_CHR22_BASELINE:-}"
@@ -50,7 +50,7 @@ if [[ $baseline_complete -eq 0 ]]; then
     if [[ "${BWA_TEST_CHR22_BASELINE_BOOTSTRAP:-0}" != "1" ]]; then
         echo "FAIL: baseline at $BASELINE_DIR is missing or incomplete." >&2
         echo "      Seed it from a known-good commit (e.g. checkout legacy/sais-lite," >&2
-        echo "      build, run \`bwa-mem2 index\` on the chr22 FASTA, copy the" >&2
+        echo "      build, run \`bwa-mem3 index\` on the chr22 FASTA, copy the" >&2
         echo "      .pac/.ann/.amb/.0123/.bwt.2bit.64 outputs into \$BASELINE_DIR)," >&2
         echo "      or one-shot bootstrap with BWA_TEST_CHR22_BASELINE_BOOTSTRAP=1." >&2
         exit 1

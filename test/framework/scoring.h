@@ -1,8 +1,8 @@
 // test/framework/scoring.h
 //
-// Scoring-matrix helpers for bwa-mem2 test fixtures.
+// Scoring-matrix helpers for bwa-mem3 test fixtures.
 //
-// The bwa-mem2 production code fills a 5x5 substitution matrix (ACGTN) using
+// The bwa-mem3 production code fills a 5x5 substitution matrix (ACGTN) using
 // `bwa_fill_scmat(a, b, ambig, mat[25])` (see test/integration/main_banded.cpp
 // pre-migration, or the inlined callers throughout). Tests need the same
 // layout so that `ksw_align2` and `kswv::getScores8` see identical scoring.
@@ -29,7 +29,7 @@ using ScoringMatrix = std::array<int8_t, 25>;
 // appropriate signs.
 ScoringMatrix build_scoring_matrix(int match, int mismatch, int ambig);
 
-// bwa-mem2's default scoring (match=1, mismatch=4, ambig=1). Provided for
+// bwa-mem3's default scoring (match=1, mismatch=4, ambig=1). Provided for
 // tests that don't want to repeat the magic numbers.
 ScoringMatrix default_scoring_matrix();
 

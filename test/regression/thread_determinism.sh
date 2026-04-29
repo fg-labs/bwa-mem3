@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # test/regression/thread_determinism.sh
 #
-# Regression: bwa-mem2 -t 1 and -t 4 produce identical (sorted) output.
+# Regression: bwa-mem3 -t 1 and -t 4 produce identical (sorted) output.
 #
 # Was: the "Thread-determinism smoke (phiX, -t 1 vs -t 4)" step inline in ci.yml.
 #
 # Inputs:
-#   BWA_MEM2    — path to bwa-mem2 binary
+#   BWA_MEM2    — path to bwa-mem3 binary
 #   CI_TEST_DIR — directory containing bwamem2_phix174.fa (pre-indexed)
 #                 and reads.bwa.read[12].fastq.gz
 set -euo pipefail

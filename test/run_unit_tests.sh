@@ -6,13 +6,13 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
-BWAMEM2="$ROOT/bwa-mem2"
+BWAMEM2="$ROOT/bwa-mem3"
 FIXTURES="$HERE/fixtures"
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 ok()   { echo "OK:   $*"; }
 
-[[ -x "$BWAMEM2" ]] || fail "bwa-mem2 not built at $BWAMEM2 (run 'make' or 'make arm64' first)"
+[[ -x "$BWAMEM2" ]] || fail "bwa-mem3 not built at $BWAMEM2 (run 'make' or 'make arm64' first)"
 
 # Build the five unit binaries.
 (cd "$HERE" && make) || fail "test/ make failed"
@@ -29,13 +29,13 @@ ok()   { echo "OK:   $*"; }
 [[ -s "$FIXTURES/synthetic_1mb.fa" ]] || fail "synthetic_1mb.fa fixture missing at $FIXTURES/synthetic_1mb.fa"
 
 # Build the phiX FMI index if not already present. Check all five artifacts
-# that `bwa-mem2 index` produces so a corrupt/partial prior run is re-indexed.
+# that `bwa-mem3 index` produces so a corrupt/partial prior run is re-indexed.
 if [[ ! -s "$FIXTURES/phix.fa.bwt.2bit.64" || \
       ! -s "$FIXTURES/phix.fa.0123"        || \
       ! -s "$FIXTURES/phix.fa.amb"         || \
       ! -s "$FIXTURES/phix.fa.ann"         || \
       ! -s "$FIXTURES/phix.fa.pac" ]]; then
-    "$BWAMEM2" index "$FIXTURES/phix.fa" >/dev/null 2>&1 || fail "bwa-mem2 index on phix.fa failed"
+    "$BWAMEM2" index "$FIXTURES/phix.fa" >/dev/null 2>&1 || fail "bwa-mem3 index on phix.fa failed"
 fi
 
 # --- fmi_test --------------------------------------------------------------
@@ -109,13 +109,13 @@ ok "smem_lockstep_parity_test ($CASES_PASSED / $CASES_TOTAL)"
 # cleanly and produce SAM lines.
 for LEN_FQ in long_read_300bp long_read_1kbp long_read_3kbp; do
     RAW="$("$BWAMEM2" mem "$FIXTURES/phix.fa" "$FIXTURES/${LEN_FQ}.fq" 2>/dev/null)" \
-        || fail "bwa-mem2 mem ${LEN_FQ}.fq: non-zero exit (crash regression)"
+        || fail "bwa-mem3 mem ${LEN_FQ}.fq: non-zero exit (crash regression)"
     OUT="$(printf '%s\n' "$RAW" | grep -v '^@' || true)"
-    [[ -n "$OUT" ]] || fail "bwa-mem2 mem ${LEN_FQ}.fq: no SAM records emitted"
+    [[ -n "$OUT" ]] || fail "bwa-mem3 mem ${LEN_FQ}.fq: no SAM records emitted"
     # Every record should be a successful alignment (not flag 4 = unmapped).
     UNMAPPED="$(echo "$OUT" | awk '$2 == 4 || $2 == 2052' | wc -l | tr -d ' ')"
-    [[ "$UNMAPPED" == "0" ]] || fail "bwa-mem2 mem ${LEN_FQ}.fq: $UNMAPPED unmapped record(s)"
-    ok "bwa-mem2 mem ${LEN_FQ}.fq (all records mapped)"
+    [[ "$UNMAPPED" == "0" ]] || fail "bwa-mem3 mem ${LEN_FQ}.fq: $UNMAPPED unmapped record(s)"
+    ok "bwa-mem3 mem ${LEN_FQ}.fq (all records mapped)"
 done
 
 
@@ -160,22 +160,22 @@ with open(out_path, 'w') as out:
 PY
 
 OUT="$("$BWAMEM2" mem -p "$FIXTURES/phix.fa" "$PE_TMP/interleaved.fq" 2>/dev/null)" \
-    || fail "bwa-mem2 mem -p interleaved.fq: non-zero exit (crash regression)"
+    || fail "bwa-mem3 mem -p interleaved.fq: non-zero exit (crash regression)"
 RECORDS="$(printf '%s\n' "$OUT" | grep -cv '^@' || true)"
-[[ "$RECORDS" -ge 100 ]] || fail "bwa-mem2 mem -p: expected >=100 records (50 pairs × 2), got $RECORDS"
-ok "bwa-mem2 mem -p interleaved.fq ($RECORDS records)"
+[[ "$RECORDS" -ge 100 ]] || fail "bwa-mem3 mem -p: expected >=100 records (50 pairs × 2), got $RECORDS"
+ok "bwa-mem3 mem -p interleaved.fq ($RECORDS records)"
 
 # Empty FASTQ + zero-length-read FASTQ regressions for the empty-batch
 # defensive path in mem_collect_smem / mem_kernel1_core.
 : > "$PE_TMP/empty.fq"
 "$BWAMEM2" mem "$FIXTURES/phix.fa" "$PE_TMP/empty.fq" >/dev/null 2>&1 \
-    || fail "bwa-mem2 mem on empty FASTQ: non-zero exit"
-ok "bwa-mem2 mem on empty FASTQ (no crash)"
+    || fail "bwa-mem3 mem on empty FASTQ: non-zero exit"
+ok "bwa-mem3 mem on empty FASTQ (no crash)"
 
 printf '@zero\n\n+\n\n' > "$PE_TMP/zero.fq"
 "$BWAMEM2" mem "$FIXTURES/phix.fa" "$PE_TMP/zero.fq" >/dev/null 2>&1 \
-    || fail "bwa-mem2 mem on zero-length read: non-zero exit"
-ok "bwa-mem2 mem on zero-length read (no crash)"
+    || fail "bwa-mem3 mem on zero-length read: non-zero exit"
+ok "bwa-mem3 mem on zero-length read (no crash)"
 
 # --- packed_text_test ------------------------------------------------------
 (cd "$HERE" && ./packed_text_test) || fail "packed_text_test"

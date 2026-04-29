@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run bwa-mem2 mem on a fixed harness input and append measurements to results.csv.
+# Run bwa-mem3 mem on a fixed harness input and append measurements to results.csv.
 # Usage: bench/run.sh <tag>
 #   <tag>  a label for this run (e.g. "baseline", "pr-15", "main-after-lto").
 #
@@ -39,10 +39,10 @@ case "$TAG" in
 esac
 echo "TAG=$TAG -> BIN=$BIN" >&2
 
-# BENCH_INDEX is a bwa-mem2 index *prefix* (the loader probes for
+# BENCH_INDEX is a bwa-mem3 index *prefix* (the loader probes for
 # <prefix>.0123, <prefix>.bwt.2bit.64, etc.), so the bare prefix may not
 # itself exist as a file. Probe the .0123 sidecar — it's the only one
-# bwa-mem2 mem unconditionally requires — but report the prefix name so
+# bwa-mem3 mem unconditionally requires — but report the prefix name so
 # the user sees the variable they configured.
 [[ -e "$BIN"               ]] || { echo "error: missing path: $BIN"          >&2; exit 2; }
 [[ -e "${BENCH_INDEX}.0123" ]] || { echo "error: missing path: $BENCH_INDEX (.0123 sidecar not found)" >&2; exit 2; }
@@ -128,7 +128,7 @@ run_trial() {
     trap "rm -f -- $time_file_q" RETURN
   fi
 
-  # Run. stdout → SAM (or /dev/null); stderr → time_file (includes bwa-mem2 log + /usr/bin/time output).
+  # Run. stdout → SAM (or /dev/null); stderr → time_file (includes bwa-mem3 log + /usr/bin/time output).
   # shellcheck disable=SC2086
   "${TIME_CMD[@]}" "$BIN" mem -t "$threads" "$BENCH_INDEX" "$BENCH_R1" "$BENCH_R2" \
       > "$sam_file" 2> "$time_file"

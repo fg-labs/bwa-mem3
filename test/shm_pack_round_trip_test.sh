@@ -2,7 +2,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-BIN=${BIN:-./bwa-mem2}
+BIN=${BIN:-./bwa-mem3}
 INNER=${INNER:-./shm_pack_round_trip_test}
 PREFIX=test/fixtures/phix.fa
 

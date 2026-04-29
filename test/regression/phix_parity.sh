@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # test/regression/phix_parity.sh
 #
-# Regression: bwa and bwa-mem2 produce identical SAM output on phiX174
+# Regression: bwa and bwa-mem3 produce identical SAM output on phiX174
 # (500 PE reads, simulated with dwgsim -z 42 for reproducibility).
 #
-# Was: the "Compare bwa and bwa-mem2 output" step inline in ci.yml.
+# Was: the "Compare bwa and bwa-mem3 output" step inline in ci.yml.
 #
 # Inputs (read from environment):
-#   BWA_MEM2    — path to the bwa-mem2 binary under test
+#   BWA_MEM2    — path to the bwa-mem3 binary under test
 #   CI_TEST_DIR — working directory containing phix174.fa and dwgsim-simulated
 #                 reads.bwa.read[12].fastq.gz (produced by upstream CI steps)
 #
@@ -39,12 +39,12 @@ normalize bwa.sam     | sort > bwa.normalized.sam
 normalize bwamem2.sam | sort > bwamem2.normalized.sam
 
 echo "bwa aligned records:      $(grep -cv '^@' bwa.normalized.sam)"
-echo "bwa-mem2 aligned records: $(grep -cv '^@' bwamem2.normalized.sam)"
+echo "bwa-mem3 aligned records: $(grep -cv '^@' bwamem2.normalized.sam)"
 
 if diff bwa.normalized.sam bwamem2.normalized.sam > /dev/null 2>&1; then
-    echo "PASS: bwa and bwa-mem2 output is identical (after normalizing headers and MQ tag)"
+    echo "PASS: bwa and bwa-mem3 output is identical (after normalizing headers and MQ tag)"
 else
-    echo "FAIL: bwa and bwa-mem2 output differs"
+    echo "FAIL: bwa and bwa-mem3 output differs"
     diff bwa.normalized.sam bwamem2.normalized.sam | head -40
     exit 1
 fi

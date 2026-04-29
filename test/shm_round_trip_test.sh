@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end byte-identical regression: bwa-mem2 mem with a staged shm
+# End-to-end byte-identical regression: bwa-mem3 mem with a staged shm
 # segment vs. a disk-load run on the same phix index. Pass criterion is
 # (a) staged run shows the attach log line, (b) disk run does not, and
 # (c) `diff` between the two SAM outputs produces no output.
@@ -7,7 +7,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-BIN=${BIN:-./bwa-mem2}
+BIN=${BIN:-./bwa-mem3}
 PREFIX=test/fixtures/phix.fa
 READS=test/fixtures/reads.fa
 

@@ -20,7 +20,7 @@ void install_matrix_row_reporter_hook() {
     // we see what GitHub's test-results action actually consumes.
     const char *row = std::getenv("BWA_MEM2_TEST_MATRIX_ROW");
     if (row && row[0] != '\0') {
-        std::fprintf(stderr, "\n=== bwa-mem2 tests — matrix row: %s ===\n\n", row);
+        std::fprintf(stderr, "\n=== bwa-mem3 tests — matrix row: %s ===\n\n", row);
     }
 }
 

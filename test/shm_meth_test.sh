@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# Regression: `bwa-mem2 shm --meth` resolves the c2t-suffixed prefix the
-# same way `bwa-mem2 mem --meth` does, so an end user passes the same plain
+# Regression: `bwa-mem3 shm --meth` resolves the c2t-suffixed prefix the
+# same way `bwa-mem3 mem --meth` does, so an end user passes the same plain
 # FASTA path to all three commands (`index --meth`, `shm --meth`,
 # `mem --meth`) without juggling the `.bwameth.c2t` suffix by hand.
 #
-# Pre-fix, `bwa-mem2 shm <plain>` opens `bns_restore(<plain>)` and fails on
+# Pre-fix, `bwa-mem3 shm <plain>` opens `bns_restore(<plain>)` and fails on
 # `<plain>.ann` when only the meth artifacts are on disk; staging instead
-# required typing `bwa-mem2 shm <plain>.bwameth.c2t`. This test pins the
+# required typing `bwa-mem3 shm <plain>.bwameth.c2t`. This test pins the
 # new flag-driven behavior in place.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-BIN=${BIN:-./bwa-mem2}
+BIN=${BIN:-./bwa-mem3}
 
 if [[ ! -x "$BIN" ]]; then
     echo "FAIL: $BIN not built. Run 'make -j4' first." >&2
@@ -36,9 +36,9 @@ ERR="$(mktemp)"
 trap '"$BIN" shm -d >/dev/null 2>&1 || true; rm -rf "$WORKDIR" "$ERR"' EXIT
 
 # Build only the meth index. The plain ref.fa.{0123,ann,...} are NOT built,
-# so this is the exact scenario where the pre-fix `bwa-mem2 shm ref.fa` UX
+# so this is the exact scenario where the pre-fix `bwa-mem3 shm ref.fa` UX
 # would have failed with `fail to open '...ref.fa.ann'`.
-echo "[setup] bwa-mem2 index --meth $PLAIN_PREFIX"
+echo "[setup] bwa-mem3 index --meth $PLAIN_PREFIX"
 "$BIN" index --meth "$PLAIN_PREFIX" >/dev/null 2>&1
 
 # Sanity: the plain index files must be absent (so test cases C and D below
@@ -51,7 +51,7 @@ for ext in .0123 .ann .amb .pac .bwt.2bit.64; do
 done
 
 # --- A: `shm --meth <plain>` stages under the c2t basename --------------
-echo "[A] bwa-mem2 shm --meth $PLAIN_PREFIX"
+echo "[A] bwa-mem3 shm --meth $PLAIN_PREFIX"
 "$BIN" shm --meth "$PLAIN_PREFIX" >/dev/null 2>&1 \
     || { echo "FAIL A: shm --meth <plain> exited non-zero" >&2; exit 1; }
 
@@ -80,7 +80,7 @@ fi
 "$BIN" shm -d >/dev/null 2>&1
 
 # --- C: `shm --meth <c2t-suffixed-prefix>` is idempotent ----------------
-echo "[C] bwa-mem2 shm --meth <prefix>.bwameth.c2t (no double-append)"
+echo "[C] bwa-mem3 shm --meth <prefix>.bwameth.c2t (no double-append)"
 "$BIN" shm --meth "$C2T_PREFIX" >/dev/null 2>&1 \
     || { echo "FAIL C: shm --meth on already-c2t prefix exited non-zero" >&2; exit 1; }
 LIST="$("$BIN" shm -l 2>&1)"
@@ -98,7 +98,7 @@ fi
 "$BIN" shm -d >/dev/null 2>&1
 
 # --- D: `shm <plain>` (no --meth) errors with a helpful hint ------------
-echo "[D] bwa-mem2 shm <plain>  (only meth artifacts on disk → hint about --meth)"
+echo "[D] bwa-mem3 shm <plain>  (only meth artifacts on disk → hint about --meth)"
 : > "$ERR"
 if "$BIN" shm "$PLAIN_PREFIX" >/dev/null 2>"$ERR"; then
     echo "FAIL D: shm <plain> on a meth-only directory unexpectedly succeeded" >&2
@@ -113,7 +113,7 @@ if ! grep -q -- "--meth" "$ERR"; then
 fi
 
 # --- E: extra positional arguments after idxbase are rejected -----------
-echo "[E] bwa-mem2 shm --meth <prefix> <typo>  (extra positional rejected)"
+echo "[E] bwa-mem3 shm --meth <prefix> <typo>  (extra positional rejected)"
 : > "$ERR"
 if "$BIN" shm --meth "$PLAIN_PREFIX" stray-arg >/dev/null 2>"$ERR"; then
     echo "FAIL E: shm --meth <prefix> <stray-arg> unexpectedly succeeded" >&2

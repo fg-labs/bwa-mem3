@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run the bwa-mem2 index build across a few reference sizes, capture wall
+# Run the bwa-mem3 index build across a few reference sizes, capture wall
 # time and peak RSS via /usr/bin/time, emit a TSV and a human-readable
 # summary. Outputs go under BENCH_DIR (default: $TMPDIR/bwa-index-bench;
 # override with BENCH_DIR=... for a larger scratch volume).
@@ -17,19 +17,19 @@
 #
 # Environment overrides:
 #   BENCH_DIR        - where to stage work and write results
-#   BWAMEM2          - path to bwa-mem2 binary (default: $ROOT/bwa-mem2)
+#   BWAMEM2          - path to bwa-mem3 binary (default: $ROOT/bwa-mem3)
 #   BWA_TEST_HG38_FASTA / BWA_TEST_HG38_MET_C2T - source FASTA paths
-#   BWA_INDEX_THREADS    - passed to `bwa-mem2 index -t`. Unset = auto-detect.
-#   BWA_INDEX_MAX_MEMORY - passed to `bwa-mem2 index --max-memory`. Unset =
+#   BWA_INDEX_THREADS    - passed to `bwa-mem3 index -t`. Unset = auto-detect.
+#   BWA_INDEX_MAX_MEMORY - passed to `bwa-mem3 index --max-memory`. Unset =
 #       auto-detect (min(50% RAM, 32G)). The 32G cap rejects hg38 (~58 GiB
 #       peak) and hg38_meth, so override here to reproduce the PR's numbers
 #       (e.g. BWA_INDEX_MAX_MEMORY=128G on a 256 GiB host).
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
-BWAMEM2="${BWAMEM2:-$ROOT/bwa-mem2}"
+BWAMEM2="${BWAMEM2:-$ROOT/bwa-mem3}"
 
-# Build the index-builder argv once. Empty defaults mean "let bwa-mem2 pick",
+# Build the index-builder argv once. Empty defaults mean "let bwa-mem3 pick",
 # which is the documented auto-detect path. Setting an explicit budget makes
 # wall-time / peak-RSS comparable across hosts.
 INDEX_ARGS=()
@@ -76,7 +76,7 @@ run_one() {
     local wd="$BENCH_DIR/$label"
     rm -rf "$wd"
     mkdir -p "$wd"
-    # Symlink the source FASTA: bwa-mem2 index reads it once, and copying
+    # Symlink the source FASTA: bwa-mem3 index reads it once, and copying
     # multi-GiB references (hg38 ≈ 3 GiB, hg38_meth doubled) wastes disk
     # and adds wall-clock noise before the timed step we actually care about.
     ln -sf "$fasta" "$wd/ref.fa"

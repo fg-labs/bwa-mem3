@@ -1,6 +1,6 @@
-# Testing bwa-mem2
+# Testing bwa-mem3
 
-bwa-mem2 tests are organized into three categories — **unit**, **integration**, and **regression** — each with its own build target, CI scope, and runtime cost.
+bwa-mem3 tests are organized into three categories — **unit**, **integration**, and **regression** — each with its own build target, CI scope, and runtime cost.
 
 | Category       | Binary / runner                    | Fixtures                                     | CI scope                             |
 |----------------|------------------------------------|----------------------------------------------|--------------------------------------|
@@ -17,7 +17,7 @@ All commands run from the repo root unless noted.
 ### Build everything
 
 ```bash
-make                                      # builds bwa-mem2 binary
+make                                      # builds bwa-mem3 binary
 make -C test -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)   # builds framework + both doctest binaries + legacy integration binaries
 ```
 
@@ -57,7 +57,7 @@ curl -sL "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/819/615/GCF_000819615
   | gunzip > phix174.fa
 dwgsim -z 42 -N 500 -1 150 -2 150 -r 0.001 -S 2 phix174.fa reads
 cd -
-BWA_MEM2="$(pwd)/bwa-mem2" CI_TEST_DIR=/tmp/ci-test bash test/regression/phix_parity.sh
+BWA_MEM2="$(pwd)/bwa-mem3" CI_TEST_DIR=/tmp/ci-test bash test/regression/phix_parity.sh
 ```
 
 ## Running tests in CI
@@ -132,7 +132,7 @@ Write a standalone bash script in `test/regression/<name>.sh`:
 - Wire it into `.github/workflows/ci.yml` with the appropriate `if: matrix.canonical == true` gate.
 
 Choose regression over integration when:
-- The test shells out to bwa-mem2 (or any other binary) as a process.
+- The test shells out to bwa-mem3 (or any other binary) as a process.
 - The test diffs against a third-party tool's output (bwa, bwa-meth, samtools).
 - The test needs fixtures >100 KB or downloaded at CI time.
 
