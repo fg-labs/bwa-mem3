@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: MIT */
-#ifndef BWAMEM2_METH_BAM_H
-#define BWAMEM2_METH_BAM_H
+#ifndef BWAMEM3_METH_BAM_H
+#define BWAMEM3_METH_BAM_H
 
 #include <stdint.h>
 #include "bwa.h"

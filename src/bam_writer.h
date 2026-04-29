@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: MIT */
-#ifndef BWAMEM2_BAM_WRITER_H
-#define BWAMEM2_BAM_WRITER_H
+#ifndef BWAMEM3_BAM_WRITER_H
+#define BWAMEM3_BAM_WRITER_H
 
 #include <stdint.h>
 #include "bwa.h"

@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: MIT */
-#ifndef BWAMEM2_CIGAR_UTIL_H
-#define BWAMEM2_CIGAR_UTIL_H
+#ifndef BWAMEM3_CIGAR_UTIL_H
+#define BWAMEM3_CIGAR_UTIL_H
 
 #include <stdint.h>
 
