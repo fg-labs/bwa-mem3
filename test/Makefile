@@ -3,8 +3,8 @@
 ##
 ##  This Makefile produces:
 ##    - test/framework/libbwa_test_framework.a    (shared test-helper lib)
-##    - test/bwa_mem2_tests_unit                  (doctest unit binary)
-##    - test/bwa_mem2_tests_integration           (doctest integration binary)
+##    - test/bwa_mem3_tests_unit                  (doctest unit binary)
+##    - test/bwa_mem3_tests_integration           (doctest integration binary)
 ##    - test/fmi_test, smem2_test, ...            (legacy per-binary tests,
 ##                                                  migrated one-by-one in
 ##                                                  follow-up PRs)
@@ -20,7 +20,7 @@ EXE = fmi_test smem2_test bwt_seed_strategy_test sa2ref_test xeonbsw smem_lockst
 # Doctest binaries — rules populated in Task 14 (unit) and Task 15
 # (integration). Listed separately from $(EXE) so `all` and
 # `run_unit_tests.sh` keep working during the framework-scaffolding PR.
-DOCTEST_BINS = bwa_mem2_tests_unit bwa_mem2_tests_integration
+DOCTEST_BINS = bwa_mem3_tests_unit bwa_mem3_tests_integration
 
 UNAME_M := $(shell uname -m)
 UNAME_S := $(shell uname -s)
@@ -120,7 +120,7 @@ $(FRAMEWORK_DIR)/%.o: $(FRAMEWORK_DIR)/%.cpp
 
 UNIT_SRCS := $(wildcard $(UNIT_DIR)/test_*.cpp)
 UNIT_OBJS := $(UNIT_SRCS:.cpp=.o)
-UNIT_BIN  := bwa_mem2_tests_unit
+UNIT_BIN  := bwa_mem3_tests_unit
 
 # Fail fast if no test_*.cpp files are present in unit/. The link line
 # would otherwise pull only test_main.o out of the framework lib and
@@ -148,7 +148,7 @@ $(UNIT_DIR)/%.o: $(UNIT_DIR)/%.cpp
 INTEGRATION_TEST_SRCS := $(wildcard $(INTEGRATION_DIR)/test_*.cpp) \
                          $(wildcard $(INTEGRATION_DIR)/placeholder.cpp)
 INTEGRATION_TEST_OBJS := $(INTEGRATION_TEST_SRCS:.cpp=.o)
-INTEGRATION_BIN       := bwa_mem2_tests_integration
+INTEGRATION_BIN       := bwa_mem3_tests_integration
 
 integration: $(INTEGRATION_BIN)
 

@@ -4,8 +4,8 @@ bwa-mem2 tests are organized into three categories — **unit**, **integration**
 
 | Category       | Binary / runner                    | Fixtures                                     | CI scope                             |
 |----------------|------------------------------------|----------------------------------------------|--------------------------------------|
-| **unit**       | `test/bwa_mem2_tests_unit`         | None. All inputs synthetic.                  | Every matrix row                     |
-| **integration**| `test/bwa_mem2_tests_integration`  | Small committed FASTAs / FMI under `test/fixtures/` | SSE4.1, AVX2, ARM64 Linux, macOS ARM |
+| **unit**       | `test/bwa_mem3_tests_unit`         | None. All inputs synthetic.                  | Every matrix row                     |
+| **integration**| `test/bwa_mem3_tests_integration`  | Small committed FASTAs / FMI under `test/fixtures/` | SSE4.1, AVX2, ARM64 Linux, macOS ARM |
 | **regression** | `test/regression/*.sh`             | Downloaded references (phiX, chr22) + bwa + dwgsim | Canonical AVX2 row only      |
 
 Design rationale: see the internal test framework design spec (not committed).
@@ -24,20 +24,20 @@ make -C test -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)   # builds framework + 
 ### Run unit tests
 
 ```bash
-./test/bwa_mem2_tests_unit                # run all unit tests
-./test/bwa_mem2_tests_unit --list-test-cases
-./test/bwa_mem2_tests_unit --test-case="*kswv*"
-./test/bwa_mem2_tests_unit --test-suite="unit/kswv"
-./test/bwa_mem2_tests_unit --test-suite-exclude=slow
-./test/bwa_mem2_tests_unit --success      # also print passing assertions
-./test/bwa_mem2_tests_unit --reporters=junit --out=unit-results.xml
-./test/bwa_mem2_tests_unit --help         # full doctest flag list
+./test/bwa_mem3_tests_unit                # run all unit tests
+./test/bwa_mem3_tests_unit --list-test-cases
+./test/bwa_mem3_tests_unit --test-case="*kswv*"
+./test/bwa_mem3_tests_unit --test-suite="unit/kswv"
+./test/bwa_mem3_tests_unit --test-suite-exclude=slow
+./test/bwa_mem3_tests_unit --success      # also print passing assertions
+./test/bwa_mem3_tests_unit --reporters=junit --out=unit-results.xml
+./test/bwa_mem3_tests_unit --help         # full doctest flag list
 ```
 
 ### Run integration tests
 
 ```bash
-./test/bwa_mem2_tests_integration         # same doctest CLI as unit binary
+./test/bwa_mem3_tests_integration         # same doctest CLI as unit binary
 ```
 
 Plus the legacy integration binaries (being migrated to the doctest integration binary one-by-one):
@@ -64,7 +64,7 @@ BWA_MEM2="$(pwd)/bwa-mem2" CI_TEST_DIR=/tmp/ci-test bash test/regression/phix_pa
 
 - **ci.yml** runs unit tests on every matrix row, integration tests on the four widened canonical rows, and regression tests on the canonical AVX2 row only.
 - JUnit artifacts are uploaded per row (`unit-results-<name>.xml`, `integration-results-<name>.xml`). Download them from a failed run's Actions page to see fine-grained assertion output.
-- **proto-neon-kswv.yml** runs `./test/bwa_mem2_tests_unit --test-suite="unit/kswv"` on proto branches.
+- **proto-neon-kswv.yml** runs `./test/bwa_mem3_tests_unit --test-suite="unit/kswv"` on proto branches.
 
 ## Adding a unit test
 
@@ -139,13 +139,13 @@ Choose regression over integration when:
 ## Debugging a failing test
 
 ```bash
-./test/bwa_mem2_tests_unit --test-case="*kswv*" --success  # verbose
-./test/bwa_mem2_tests_unit --test-case="*kswv*" --break    # break into debugger on failure
-./test/bwa_mem2_tests_unit --test-case="*foo*" --subcase="bar"  # run single SUBCASE
+./test/bwa_mem3_tests_unit --test-case="*kswv*" --success  # verbose
+./test/bwa_mem3_tests_unit --test-case="*kswv*" --break    # break into debugger on failure
+./test/bwa_mem3_tests_unit --test-case="*foo*" --subcase="bar"  # run single SUBCASE
 
 # Re-run kswv tests with the original phase-0/phase-1 diagnostics:
 BWA_TESTS_DEBUG_PHASE0=1 BWA_TESTS_DEBUG_PHASE1=1 \
-  ./test/bwa_mem2_tests_unit --test-suite="unit/kswv"
+  ./test/bwa_mem3_tests_unit --test-suite="unit/kswv"
 ```
 
 For a test using `std::mt19937(seed)`, reproduce locally by editing the seed and running the full binary — there is no persistent "last-failing-seed" record.

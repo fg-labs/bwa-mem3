@@ -332,7 +332,7 @@ kswv_nrow_zero_test: $(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) test/kswv_nrow_zero_t
 # macro guards the test away).
 .PHONY: test-binaries
 # $(SAFE_STR_LIB) is a real link-time dep: test/Makefile's
-# bwa_mem2_tests_unit recipe references ../ext/safestringlib/libsafestring.a
+# bwa_mem3_tests_unit recipe references ../ext/safestringlib/libsafestring.a
 # directly. Without this prereq, callers that skip the bwa-mem3 binary
 # build (which builds it as a side-effect of $(EXE) deps) link-fail.
 test-binaries: $(BWA_LIB) $(SAFE_STR_LIB)
@@ -354,8 +354,8 @@ test/shm_pack_round_trip_test.o: test/shm_pack_round_trip_test.cpp
 # shm_pack_round_trip_test runs via test/shm_pack_round_trip_test.sh which
 # builds the phiX index first; invoked from test/run_unit_tests.sh.
 test: test-binaries kswv_nrow_zero_test shm_section_find_test
-	./test/bwa_mem2_tests_unit
-	./test/bwa_mem2_tests_integration
+	./test/bwa_mem3_tests_unit
+	./test/bwa_mem3_tests_integration
 	./kswv_nrow_zero_test
 	./shm_section_find_test
 
