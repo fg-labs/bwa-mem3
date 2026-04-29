@@ -758,6 +758,10 @@ static int process(void *shared, gzFile gfp, gzFile gfp2, int pipe_threads)
     int n_steps = 3;
 
     w.ref_string = aux->ref_string;
+    // Mirror into mem_cache so helpers that take only `mmc` (e.g.
+    // mem_matesw_batch_pre/post) can call bns_fetch_seq_v2 without
+    // threading ref_string through every signature on the way down.
+    w.mmc.ref_string = aux->ref_string;
     w.fmi = aux->fmi;
     w.nreads  = nreads;
     // w.memSize = nreads;
