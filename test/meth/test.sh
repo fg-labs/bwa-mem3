@@ -89,6 +89,15 @@ fi
 
 export PATH="$(cd "$HERE/../.." && pwd):$PATH"
 
+# Upstream bwameth.py shells out to `bwa-mem2` by name. After the
+# bwa-mem2 -> bwa-mem3 binary rename, that PATH lookup fails and the
+# (2>/dev/null-silenced) pipeline below exits with no diagnostic. Provide
+# a bwa-mem2 alias on PATH so the oracle resolves to our renamed binary.
+ALIAS_DIR="$(mktemp -d)"
+trap 'rm -rf "$ALIAS_DIR"' EXIT
+ln -sf "$BWAMEM2" "$ALIAS_DIR/bwa-mem2"
+export PATH="$ALIAS_DIR:$PATH"
+
 if [[ ! -f "$HERE/ref.fa.bwameth.c2t.0123" ]]; then
     (cd "$HERE" && pixi run python3 "$BWAMETH_PY" index-mem2 ref.fa >/dev/null 2>&1)
 fi
