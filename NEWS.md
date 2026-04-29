@@ -1,3 +1,21 @@
+Release 0.1.0-pre (2026-04-28)
+---------------------------------
+
+* Project renamed from `bwa-mem2` to `bwa-mem3`. The new project tracks
+  Fulcrum Genomics' performance and feature work on top of the upstream
+  bwa-mem2 codebase.
+* Default branch renamed from `fg-main` to `main`.
+* Binary renamed from `bwa-mem2` to `bwa-mem3`. Arch-suffixed variants
+  (`bwa-mem3.sse41`, `.sse42`, `.avx`, `.avx2`, `.avx512bw`, `.arm64`,
+  `.pgo`, `.profile`, `.lto`) renamed to match.
+* `@PG` SAM header tags now read `ID:bwa-mem3 PN:bwa-mem3` (and
+  `bwa-mem3-meth` for `--meth` mode).
+* Test binaries renamed: `bwa_mem2_tests_unit` →
+  `bwa_mem3_tests_unit`, `bwa_mem2_tests_integration` →
+  `bwa_mem3_tests_integration`.
+* `.bwt.2bit.64` index file format unchanged — bwa-mem3 reads indexes
+  built by `bwa-mem2 index` without re-indexing.
+
 Release 2.2.1 (17 March 2021)
 ---------------------------------
 Hotfix for v2.2: Fixed the bug mentioned in #135.

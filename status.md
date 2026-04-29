@@ -1,4 +1,4 @@
-# BWA-MEM2 Apple Silicon Optimization Status
+# BWA-MEM3 Apple Silicon Optimization Status
 
 ## Current State
 - Branch: `apple-silicon`
@@ -65,12 +65,12 @@
 ### Task 4: Multi-binary Launcher
 - On ARM/Apple Silicon, there's only one NEON instruction set level
 - Unlike x86 (SSE41/SSE42/AVX/AVX2/AVX512), no need for multiple binaries
-- arm64 Makefile target already creates symlink bwa-mem2 -> bwa-mem2.arm64
+- arm64 Makefile target already creates symlink bwa-mem3 -> bwa-mem3.arm64
 - N/A: No benefit from multi-binary approach on ARM
 
 ### Task 5: Accelerate.framework
 - Framework already linked in build for macOS
-- Analyzed compute patterns in bwa-mem2:
+- Analyzed compute patterns in bwa-mem3:
   - Smith-Waterman: Already SIMD-optimized (sse2neon)
   - FM-index: Memory-bound, pointer chasing (not vectorizable)
   - Sorting: Small arrays, not suitable for vDSP
