@@ -124,6 +124,11 @@ the index can be staged once into POSIX shared memory:
 # Stage the index. After this, subsequent `mem` runs auto-attach.
 ./bwa-mem2 shm <prefix>
 
+# Stage a `bwa-mem2 index --meth` index. Auto-appends `.bwameth.c2t`
+# so the same plain `<prefix>` works for `index --meth`, `shm --meth`,
+# and `mem --meth`.
+./bwa-mem2 shm --meth <prefix>
+
 # List staged indices.
 ./bwa-mem2 shm -l
 
@@ -279,6 +284,13 @@ same record count, same chrom+pos, same CIGAR for every mapped primary.
 
 - `--set-as-failed {f,r}` — flag alignments aligned to the given strand as QC-fail (`0x200`).
 - `--do-not-penalize-chimeras` — skip the longest-match < 44% chimera heuristic.
+
+### Shared memory
+
+`bwa-mem2 shm --meth ref.fa` stages a meth index the same way
+`bwa-mem2 shm` stages a plain one — see the [shared-memory index](#shared-memory-index-shm)
+section. Pass the same plain `ref.fa` to `index --meth`, `shm --meth`,
+and `mem --meth`; the `.bwameth.c2t` suffix is auto-appended on all three.
 
 ### Legacy bwameth.py-compatible invocation
 

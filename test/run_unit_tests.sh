@@ -218,4 +218,8 @@ ok "shm_pack_round_trip_test"
 (cd "$HERE" && ./shm_round_trip_test.sh) || fail "shm_round_trip_test"
 ok "shm_round_trip_test"
 
+# --- shm --meth flag (parity with mem --meth's c2t-suffix resolution) --------
+(cd "$HERE" && ./shm_meth_test.sh) || fail "shm_meth_test"
+ok "shm_meth_test"
+
 echo "ALL UNIT TESTS PASSED"
