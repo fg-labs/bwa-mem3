@@ -1101,7 +1101,15 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
 
         if (rb < 0) rb = 0;
         if (re > l_pac<<1) re = l_pac<<1;
-        if (rb < re) ref = bns_fetch_seq(bns, pac, &rb, (rb+re)>>1, &re, &rid);
+        // bns_fetch_seq_v2 is zero-copy: it returns a pointer into ref_string
+        // (the unpacked .0123 reference). The legacy bns_fetch_seq malloc'd a
+        // fresh buffer, which the trailing free(ref) below released; v2 has
+        // no allocation, so we drop that free. The seqPairArrayAux scratch
+        // is unused by v2 but kept for signature parity with the existing v2
+        // caller in bwamem.cpp::mem_chain2aln_across_reads_V2.
+        if (rb < re) ref = bns_fetch_seq_v2(bns, pac, &rb, (rb+re)>>1, &re, &rid,
+                                            mmc->ref_string,
+                                            (uint8_t*) mmc->seqPairArrayAux[tid]);
 
         if (a->rid == rid && re - rb >= opt->min_seed_len) { // no funny things happening
             //kswr_t aln;
@@ -1192,7 +1200,7 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
             seqPairArray[pcnt++] = sp;
         }
         if (rev) free(rev);
-        free(ref);
+        // ref aliases ref_string (see bns_fetch_seq_v2 above); no free.
     }
     return pcnt;
 }
@@ -1258,7 +1266,11 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
         }
         if (rb < 0) rb = 0;
         if (re > l_pac<<1) re = l_pac<<1;
-        if (rb < re) ref = bns_fetch_seq(bns, pac, &rb, (rb+re)>>1, &re, &rid);
+        // Zero-copy ref slice via bns_fetch_seq_v2 (see mem_matesw_batch_pre
+        // for rationale). The scratch arg is unused by v2; pass NULL since
+        // mem_matesw_batch_post has no tid in scope to index seqPairArrayAux.
+        if (rb < re) ref = bns_fetch_seq_v2(bns, pac, &rb, (rb+re)>>1, &re, &rid,
+                                            mmc->ref_string, NULL);
 
         if (a->rid == rid && re - rb >= opt->min_seed_len) { // no funny things happening
             kswr_t aln;
@@ -1267,7 +1279,7 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
 
             //aln = **myaln;
             //(*myaln)++;
-            int index = gar[gcnt + r];          
+            int index = gar[gcnt + r];
             if (index == -1) {
                 // fprintf(stderr, "Re-routing: Encountered -ve index for "
                 // "gcnt: %d, look into pre.\n", gcnt + r);
@@ -1346,9 +1358,9 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
         #else
         if (n) ma->n = mem_dedup_patch(opt, 0, 0, 0, ma->n, ma->a);
         #endif
-        
+
         if (rev) free(rev);
-        free(ref);
+        // ref aliases ref_string (see bns_fetch_seq_v2 above); no free.
     }
     return n;
 }

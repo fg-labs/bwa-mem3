@@ -78,6 +78,18 @@ extern "C" {
 	int bns_cnt_ambi(const bntseq_t *bns, int64_t pos_f, int len, int *ref_id);
 	uint8_t *bns_get_seq(int64_t l_pac, const uint8_t *pac, int64_t beg, int64_t end, int64_t *len);
 	uint8_t *bns_fetch_seq(const bntseq_t *bns, const uint8_t *pac, int64_t *beg, int64_t mid, int64_t *end, int *rid);
+	// Zero-copy v2 variants used by mem_chain2aln_across_reads_V2 and the
+	// mem_matesw_batch_* path. Return a pointer into the pre-unpacked
+	// `ref_string` (the .0123 reference materialized at startup); no
+	// allocation, callers must NOT free the returned pointer. The seqb
+	// scratch arg is currently unused by both v2 variants (kept for
+	// signature parity with their original definition); pass any buffer
+	// or NULL.
+	uint8_t *bns_get_seq_v2(int64_t l_pac, const uint8_t *pac, int64_t beg, int64_t end,
+	                        int64_t *len, uint8_t *ref_string, uint8_t *seqb);
+	uint8_t *bns_fetch_seq_v2(const bntseq_t *bns, const uint8_t *pac,
+	                          int64_t *beg, int64_t mid, int64_t *end, int *rid,
+	                          uint8_t *ref_string, uint8_t *seqb);
 	int bns_intv2rid(const bntseq_t *bns, int64_t rb, int64_t re);
 
 #ifdef __cplusplus

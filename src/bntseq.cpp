@@ -472,11 +472,67 @@ uint8_t *bns_fetch_seq(const bntseq_t *bns, const uint8_t *pac, int64_t *beg, in
 	*end = *end < far_end? *end : far_end;
 
 	seq = bns_get_seq(bns->l_pac, pac, *beg, *end, &len);
-	
+
 	if (seq == 0 || *end - *beg != len) {
 		fprintf(stderr, "[E::%s] begin=%ld, mid=%ld, end=%ld, len=%ld, seq=%p, rid=%d, far_beg=%ld, far_end=%ld\n",
 				__func__, (long)*beg, (long)mid, (long)*end, (long)len, seq, *rid, (long)far_beg, (long)far_end);
 	}
 	assert(seq && *end - *beg == len); // assertion failure should never happen
+	return seq;
+}
+
+// Zero-copy v2 variants. Identical semantics to bns_get_seq / bns_fetch_seq
+// except they return a pointer into the caller-supplied `ref_string` (the
+// .0123 reference materialized at startup) rather than a malloc'd copy. The
+// `seqb` parameter is retained for signature parity with an earlier draft and
+// is currently unused.
+uint8_t *bns_get_seq_v2(int64_t l_pac, const uint8_t *pac, int64_t beg, int64_t end,
+                        int64_t *len, uint8_t *ref_string, uint8_t *seqb)
+{
+	uint8_t *seq = 0;
+	if (ref_string == NULL) { // guard against UB pointer arithmetic on NULL
+		*len = 0;
+		return 0;
+	}
+	if (end < beg) end ^= beg, beg ^= end, end ^= beg; // if end is smaller, swap
+	if (end > l_pac<<1) end = l_pac<<1;
+	if (beg < 0) beg = 0;
+	if (beg >= l_pac || end <= l_pac) {
+		*len = end - beg;
+		seq = ref_string + beg; // forward and reverse halves both live in ref_string
+	} else *len = 0; // if bridging the forward-reverse boundary, return nothing
+	return seq;
+}
+
+uint8_t *bns_fetch_seq_v2(const bntseq_t *bns, const uint8_t *pac,
+                          int64_t *beg, int64_t mid, int64_t *end, int *rid,
+                          uint8_t *ref_string, uint8_t *seqb)
+{
+	int64_t far_beg, far_end, len;
+	int is_rev;
+	uint8_t *seq;
+
+	if (*end < *beg) *end ^= *beg, *beg ^= *end, *end ^= *beg; // if end is smaller, swap
+	assert(*beg <= mid && mid < *end);
+
+	*rid = bns_pos2rid(bns, bns_depos(bns, mid, &is_rev));
+	far_beg = bns->anns[*rid].offset;
+	far_end = far_beg + bns->anns[*rid].len;
+	if (is_rev) { // flip to the reverse strand
+		int64_t tmp = far_beg;
+		far_beg = (bns->l_pac<<1) - far_end;
+		far_end = (bns->l_pac<<1) - tmp;
+	}
+	*beg = *beg > far_beg? *beg : far_beg;
+	*end = *end < far_end? *end : far_end;
+
+	seq = bns_get_seq_v2(bns->l_pac, pac, *beg, *end, &len, ref_string, seqb);
+
+	if (seq == 0 || *end - *beg != len) {
+		fprintf(stderr, "[E::%s] begin=%ld, mid=%ld, end=%ld, len=%ld, seq=%p, rid=%d, far_beg=%ld, far_end=%ld\n",
+				__func__, (long)*beg, (long)mid, (long)*end, (long)len, seq, *rid, (long)far_beg, (long)far_end);
+	}
+	assert(seq && *end - *beg == len); // assertion failure should never happen
+
 	return seq;
 }
