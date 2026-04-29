@@ -448,7 +448,7 @@ void bwa_idx_destroy(bwaidx_t *idx)
     free(idx);
 }
 
-int bwa_mem2idx(int64_t l_mem, uint8_t *mem, bwaidx_t *idx)
+int bwa_mem3idx(int64_t l_mem, uint8_t *mem, bwaidx_t *idx)
 {
     int64_t k = 0, x;
     int i;
@@ -511,7 +511,7 @@ int bwa_idx2mem(bwaidx_t *idx)
     free(idx->bns); idx->bns = 0;
     free(idx->pac); idx->pac = 0;
 
-    return bwa_mem2idx(k, mem, idx);
+    return bwa_mem3idx(k, mem, idx);
 }
 #endif
 
