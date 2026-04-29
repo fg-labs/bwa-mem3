@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # test/pg_cl_escape_test.sh
 #
-# Asserts that `bwa-mem2 mem -R $'@RG\tID:x\tSM:y\tLB:z' ...` produces a
+# Asserts that `bwa-mem3 mem -R $'@RG\tID:x\tSM:y\tLB:z' ...` produces a
 # SAM header whose `@PG` line contains no literal tabs, newlines, or
 # carriage returns inside the `CL:` value. Regression for issue #45 /
 # upstream #293: without escaping, whitespace from the user-supplied `-R`
@@ -10,18 +10,18 @@
 #
 # The assertion is structural, not textual:
 #   * The @PG line must have exactly 5 tab-separated fields
-#     (@PG, ID:bwa-mem2, PN:bwa-mem2, VN:..., CL:...).
+#     (@PG, ID:bwa-mem3, PN:bwa-mem3, VN:..., CL:...).
 #   * There must be exactly one @PG line.
 #   * The CL: value must be free of raw \t, \n, and \r.
 #   * The @RG line must still contain the user's tab-separated fields
 #     (tab-only case), because argv itself is not mutated.
 #
-# Usage: test/pg_cl_escape_test.sh <bwa-mem2-binary> <fixtures-dir>
+# Usage: test/pg_cl_escape_test.sh <bwa-mem3-binary> <fixtures-dir>
 
 set -euo pipefail
 
 if [[ $# -ne 2 ]]; then
-    echo "usage: $0 <bwa-mem2-binary> <fixtures-dir>" >&2
+    echo "usage: $0 <bwa-mem3-binary> <fixtures-dir>" >&2
     exit 2
 fi
 
@@ -30,21 +30,21 @@ fixtures="$2"
 ref="$fixtures/phix.fa"
 reads="$fixtures/reads.fa"
 
-[[ -x "$bin" ]]   || { echo "FAIL: bwa-mem2 binary not executable at $bin" >&2; exit 1; }
+[[ -x "$bin" ]]   || { echo "FAIL: bwa-mem3 binary not executable at $bin" >&2; exit 1; }
 [[ -s "$ref" ]]   || { echo "FAIL: phix.fa missing at $ref" >&2; exit 1; }
 [[ -s "$reads" ]] || { echo "FAIL: reads.fa missing at $reads" >&2; exit 1; }
 
 # Build the phiX FMI index if not already present.
 if [[ ! -s "$ref.bwt.2bit.64" || ! -s "$ref.0123" || ! -s "$ref.amb" \
       || ! -s "$ref.ann"       || ! -s "$ref.pac" ]]; then
-    "$bin" index "$ref" >/dev/null 2>&1 || { echo "FAIL: bwa-mem2 index on phix.fa failed" >&2; exit 1; }
+    "$bin" index "$ref" >/dev/null 2>&1 || { echo "FAIL: bwa-mem3 index on phix.fa failed" >&2; exit 1; }
 fi
 
 sam="$(mktemp)"
 err="$(mktemp)"
 trap 'rm -f "$sam" "$err"' EXIT
 
-# Run `bwa-mem2 mem` with the given -R value and assert that the emitted
+# Run `bwa-mem3 mem` with the given -R value and assert that the emitted
 # @PG line is structurally well-formed. $1 is a short label used in
 # failure messages; $2 is the -R string.
 assert_pg_well_formed() {
@@ -52,7 +52,7 @@ assert_pg_well_formed() {
     local rg="$2"
 
     "$bin" mem -R "$rg" "$ref" "$reads" >"$sam" 2>"$err" || {
-        echo "FAIL [$label]: bwa-mem2 mem exited non-zero" >&2
+        echo "FAIL [$label]: bwa-mem3 mem exited non-zero" >&2
         echo "---- stderr ----" >&2
         cat "$err" >&2
         echo "----------------" >&2
@@ -115,7 +115,7 @@ assert_pg_well_formed() {
 
 # --- @PG checks: embed each whitespace variant in -R and verify CL: clean -
 # All three values parse as a valid @RG (they start with "@RG\tID:" before
-# the injected character); bwa-mem2 will emit a @RG line but we only
+# the injected character); bwa-mem3 will emit a @RG line but we only
 # assert @PG structure here — that is the fix under test.
 assert_pg_well_formed "tab"             $'@RG\tID:x\tSM:y\tLB:z'
 assert_pg_well_formed "newline"         $'@RG\tID:x\tSM:y\tLB:z\nTRAIL'
@@ -129,7 +129,7 @@ assert_pg_well_formed "carriage-return" $'@RG\tID:x\tSM:y\tLB:z\rTRAIL'
 # call order above ever changes.
 rg=$'@RG\tID:x\tSM:y\tLB:z'
 "$bin" mem -R "$rg" "$ref" "$reads" >"$sam" 2>"$err" || {
-    echo "FAIL: bwa-mem2 mem exited non-zero (@RG assertion)" >&2
+    echo "FAIL: bwa-mem3 mem exited non-zero (@RG assertion)" >&2
     echo "---- stderr ----" >&2
     cat "$err" >&2
     echo "----------------" >&2

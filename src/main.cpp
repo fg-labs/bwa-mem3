@@ -45,13 +45,13 @@ Contacts: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@
 
 int usage()
 {
-    fprintf(stderr, "Usage: bwa-mem2 <command> <arguments>\n");
+    fprintf(stderr, "Usage: bwa-mem3 <command> <arguments>\n");
     fprintf(stderr, "Commands:\n");
     fprintf(stderr, "  index         create index (add --meth to build a bwameth-style doubled c2t reference)\n");
     fprintf(stderr, "  mem           alignment (add --meth for bisulfite-seq: inline c2t + BAM output)\n");
     fprintf(stderr, "  shm           load/list/drop the index in POSIX shared memory\n");
     fprintf(stderr, "  version       print version number\n");
-    fprintf(stderr, "Run `bwa-mem2 <command> --help` for command-specific options.\n");
+    fprintf(stderr, "Run `bwa-mem3 <command> --help` for command-specific options.\n");
     return 1;
 }
 
@@ -154,7 +154,7 @@ int main(int argc, char* argv[])
         fprintf(stderr, "* SA compression enabled with xfactor: %d\n", 0x1 << SA_COMPX);
         #endif
         
-        ksprintf(&pg, "@PG\tID:bwa-mem2\tPN:bwa-mem2\tVN:%s\tCL:%s", PACKAGE_VERSION, argv[0]);
+        ksprintf(&pg, "@PG\tID:bwa-mem3\tPN:bwa-mem3\tVN:%s\tCL:%s", PACKAGE_VERSION, argv[0]);
 
         for (int i = 1; i < argc; ++i) append_pg_cl_arg(&pg, argv[i]);
         ksprintf(&pg, "\n");
