@@ -409,6 +409,13 @@ int kswv::kswv_neon_u8(uint8_t seq1SoA[],
     uint8_t *F = F8 + tid * SIMD_WIDTH8 * this->maxQerLen;
     uint8_t *rowMax = rowMax8 + tid * SIMD_WIDTH8 * this->maxRefLen;
 
+    /* Per-strip L1 prefetches, mirroring the AVX-512 8-bit + 16-bit kernels.
+     * Args: (addr, rw=0 read, locality=0 lowest — equivalent to x86 NTA). */
+    __builtin_prefetch(F + SIMD_WIDTH8, 0, 0);
+    __builtin_prefetch(seq2SoA, 0, 0);
+    __builtin_prefetch(seq1SoA, 0, 0);
+    __builtin_prefetch(H1 + SIMD_WIDTH8, 0, 0);
+
     /* Initialize arrays */
     for (int i = 0; i <= ncol; i++)
     {
@@ -956,6 +963,13 @@ int kswv::kswv_neon_16(int16_t seq1SoA[],
     int16_t *F      = F16      + tid * SIMD_WIDTH16 * this->maxQerLen;
     int16_t *rowMax = rowMax16 + tid * SIMD_WIDTH16 * this->maxRefLen;
 
+    /* Per-strip L1 prefetches, mirroring the AVX-512 16-bit kernel. Args:
+     * (addr, rw=0 read, locality=0 lowest — equivalent to x86 NTA). */
+    __builtin_prefetch(F + SIMD_WIDTH16, 0, 0);
+    __builtin_prefetch(seq2SoA, 0, 0);
+    __builtin_prefetch(seq1SoA, 0, 0);
+    __builtin_prefetch(H1 + SIMD_WIDTH16, 0, 0);
+
     for (int i = 0; i <= ncol; i++) {
         vst1q_s16(H0   + i * SIMD_WIDTH16, zero_vec);
         vst1q_s16(Hmax + i * SIMD_WIDTH16, zero_vec);
@@ -1329,6 +1343,14 @@ int kswv::kswv256_u8(uint8_t seq1SoA[],
     uint8_t *Hmax   = H8_max  + tid * SIMD_WIDTH8 * this->maxQerLen;
     uint8_t *F      = F8      + tid * SIMD_WIDTH8 * this->maxQerLen;
     uint8_t *rowMax = rowMax8 + tid * SIMD_WIDTH8 * this->maxRefLen;
+
+    // Per-strip L1 prefetches mirroring the AVX-512 8-bit and 16-bit kernels.
+    // The 8-bit AVX2 path was missing them; without these the inner loop
+    // stalls on L1 misses for F/H1/seq for the first several rows.
+    _mm_prefetch((const char*) (F + SIMD_WIDTH8), _MM_HINT_NTA);
+    _mm_prefetch((const char*) seq2SoA, _MM_HINT_NTA);
+    _mm_prefetch((const char*) seq1SoA, _MM_HINT_NTA);
+    _mm_prefetch((const char*) (H1 + SIMD_WIDTH8), _MM_HINT_NTA);
 
     for (int i = 0; i <= ncol; i++) {
         _mm256_storeu_si256((__m256i*)(H0   + i * SIMD_WIDTH8), zero_vec);
@@ -2002,8 +2024,17 @@ int kswv::kswv512_u8(uint8_t seq1SoA[],
     uint8_t *Hmax   = H8_max + tid * SIMD_WIDTH8 * this->maxQerLen;
     uint8_t *F      = F8 + tid * SIMD_WIDTH8 * this->maxQerLen;
     uint8_t *rowMax = rowMax8 + tid * SIMD_WIDTH8 * this->maxRefLen;
-    
-    
+
+    // Mirror kswv512_16's per-strip prefetches (see kswv.cpp ~line 2547).
+    // The 8-bit kernel was overlooked when those prefetches were added in
+    // PR #58; without them the inner loop stalls on L1 misses for F/H1/seq
+    // for the first several rows. Identical hint shape; load addresses
+    // scaled to SIMD_WIDTH8 (64 bytes per row).
+    _mm_prefetch((const char*) (F + SIMD_WIDTH8), _MM_HINT_NTA);
+    _mm_prefetch((const char*) seq2SoA, _MM_HINT_NTA);
+    _mm_prefetch((const char*) seq1SoA, _MM_HINT_NTA);
+    _mm_prefetch((const char*) (H1 + SIMD_WIDTH8), _MM_HINT_NTA);
+
     for (int i=0; i <=ncol; i++)
     {
         _mm512_store_si512((__m512*) (H0 + i * SIMD_WIDTH8), zero512);
