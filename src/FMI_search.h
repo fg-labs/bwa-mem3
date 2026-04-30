@@ -91,7 +91,7 @@ typedef struct smem_struct
 #define SAL_PFD 16
 
 #ifndef SMEM_LOCKSTEP_N
-#define SMEM_LOCKSTEP_N 8
+#define SMEM_LOCKSTEP_N 16
 #endif
 
 class FMI_search: public indexEle
