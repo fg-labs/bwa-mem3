@@ -209,17 +209,27 @@ bntseq_t *bns_restore(const char *prefix)
 			kh_val(h, k) = i;
 		}
 		i = 0;
+		int truncated = 0;
 		while ((c = fgetc(fp)) != EOF) {
 			if (c == '\t' || c == '\n' || c == '\r') {
 				str[i] = 0;
-				if (str[0] != '@') {
+				if (!truncated && str[0] != '@') {
 					k = kh_get(str, h, str);
 					if (k != kh_end(h))
 						bns->anns[kh_val(h, k)].is_alt = 1;
 				}
 				while (c != '\n' && c != EOF) c = fgetc(fp);
 				i = 0;
-			} else str[i++] = c; // FIXME: potential segfault here
+				truncated = 0;
+			} else if (i + 1 < (int)sizeof(str)) {
+				str[i++] = c;
+			} else {
+				// Name exceeds sizeof(str)-1; drop remaining chars to avoid
+				// overflowing the stack buffer, and skip the hash lookup so
+				// a truncated prefix can't accidentally match a different
+				// contig that shares those leading bytes.
+				truncated = 1;
+			}
 		}
 		kh_destroy(str, h);
 		fclose(fp);
