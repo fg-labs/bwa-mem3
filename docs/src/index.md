@@ -20,7 +20,7 @@ support for things you used to need a wrapper script for.
 - **Stage the index once, align many.** A `bwa-mem3 shm` subcommand
   pins the FM-index in shared memory so back-to-back runs on the same host
   skip the 28 GB read every time.
-- **Correctness fixes upstream hasn't merged yet.** Tabs in `-R`,
+- **Correctness fixes upstream haven't merged yet.** Tabs in `-R`,
   151+ bp reads, AVX-512 mate-rescue, kswv `score2` plateau across
   NEON/AVX2/AVX-512BW, mem_sam_pe proper-pair flag — every fix tracked
   back to the upstream PR or issue that found it.
