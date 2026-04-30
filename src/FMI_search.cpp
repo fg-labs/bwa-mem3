@@ -1639,7 +1639,7 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
         map_pos[j] = map_ar[i];
         offset[j] = 0;
         
-        if (pos & SA_COMPX_MASK == 0) {
+        if ((pos & SA_COMPX_MASK) == 0) {
             _mm_prefetch(&sa_ms_byte[pos >> SA_COMPX], _MM_HINT_T0);
             _mm_prefetch(&sa_ls_word[pos >> SA_COMPX], _MM_HINT_T0);
         }
@@ -1676,7 +1676,7 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
                     map_pos[k] = map_ar[i++];
                     offset[k] = 0;
                     
-                    if (pos & SA_COMPX_MASK == 0) {
+                    if ((pos & SA_COMPX_MASK) == 0) {
                         _mm_prefetch(&sa_ms_byte[pos >> SA_COMPX], _MM_HINT_T0);
                         _mm_prefetch(&sa_ls_word[pos >> SA_COMPX], _MM_HINT_T0);
                     }
@@ -1690,7 +1690,7 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
             }
             else {
                 working_set[k] = sp;
-                if (sp & SA_COMPX_MASK == 0) {
+                if ((sp & SA_COMPX_MASK) == 0) {
                     _mm_prefetch(&sa_ms_byte[sp >> SA_COMPX], _MM_HINT_T0);
                     _mm_prefetch(&sa_ls_word[sp >> SA_COMPX], _MM_HINT_T0);
                 }
