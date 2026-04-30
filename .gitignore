@@ -5,8 +5,10 @@
 a.out
 bwa-mem2
 bwa-mem2.*
+!docs/src/related-projects/bwa-mem2.md
 src/version.h
 *.gcno
 *.gcda
 coverage.info
 coverage/
+docs/book/

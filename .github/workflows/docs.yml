@@ -1,0 +1,66 @@
+name: docs
+
+on:
+  pull_request:
+    paths:
+      - 'docs/**'
+      - 'src/**'
+      - 'Makefile'
+      - '.github/workflows/docs.yml'
+      - '.readthedocs.yaml'
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    name: build mdbook + drift check CLI snippets
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          submodules: recursive
+
+      - name: Install build deps for bwa-mem3
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake zlib1g-dev libbz2-dev liblzma-dev libcurl4-openssl-dev libssl-dev
+
+      - name: Cache cargo bin (mdbook + plugins)
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/bin/mdbook
+            ~/.cargo/bin/mdbook-mermaid
+          key: cargo-mdbook-0.5.2-mermaid-0.17.0-${{ runner.os }}-v1
+
+      - name: Install mdbook + plugins
+        run: |
+          want_mdbook=0.5.2
+          want_mermaid=0.17.0
+          have_mdbook="$(mdbook --version 2>/dev/null | awk '{print $2}' || true)"
+          have_mermaid="$(mdbook-mermaid --version 2>/dev/null | awk '{print $2}' || true)"
+          if [ "$have_mdbook" != "$want_mdbook" ]; then
+            cargo install mdbook --version "$want_mdbook" --locked --force
+          fi
+          if [ "$have_mermaid" != "$want_mermaid" ]; then
+            cargo install mdbook-mermaid --version "$want_mermaid" --locked --force
+          fi
+          mdbook --version
+          mdbook-mermaid --version
+
+      - name: Build bwa-mem3
+        run: make
+
+      - name: Regenerate CLI snippets
+        run: make docs-cli
+
+      - name: Drift check (CLI snippets)
+        run: |
+          if ! git diff --exit-code docs/_generated/; then
+            echo "::error::docs/_generated/cli/*.txt is out of sync. Run 'make docs-cli' locally and commit."
+            exit 1
+          fi
+
+      - name: Build mdbook
+        run: make docs

@@ -1,0 +1,12 @@
+version: 2
+
+build:
+  os: ubuntu-24.04
+  tools:
+    rust: "1.91"
+  commands:
+    - cargo install mdbook --version 0.5.2 --locked
+    - cargo install mdbook-mermaid --locked
+    - cd docs && mdbook build
+    - mkdir -p _readthedocs/html
+    - cp -r docs/book/. _readthedocs/html/

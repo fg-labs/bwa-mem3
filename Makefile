@@ -268,7 +268,7 @@ ifneq ($(strip $(DISABLE_BATCHED_MATESW)),)
     CPPFLAGS += -DDISABLE_BATCHED_MATESW=$(DISABLE_BATCHED_MATESW)
 endif
 
-.PHONY:all clean depend multi print-mimalloc-config kswv_nrow_zero_test shm_section_find_test shm_pack_round_trip_test test FORCE pgo-generate pgo-use pgo-clean profile-build profile-clean lto-build lto-clean
+.PHONY:all clean depend multi print-mimalloc-config kswv_nrow_zero_test shm_section_find_test shm_pack_round_trip_test test FORCE pgo-generate pgo-use pgo-clean profile-build profile-clean lto-build lto-clean docs docs-serve docs-cli docs-clean docs-install-tools
 .SUFFIXES:.cpp .o
 
 .cpp.o:
@@ -436,6 +436,39 @@ clean: pgo-clean profile-clean lto-clean
 	cd ext/safestringlib/ && $(MAKE) clean
 	-[ -f ext/htslib/config.mk ] && cd ext/htslib && $(MAKE) distclean
 	rm -rf $(MIMALLOC_BUILD)
+
+# ----------------------------------------------------------------------------
+# Documentation (mdbook). See docs/superpowers/specs/ for design.
+# ----------------------------------------------------------------------------
+
+# Sub-commands whose --help is captured into docs/_generated/cli/.
+DOCS_CLI_SUBCMDS := index mem shm version
+
+docs:
+	cd docs && mdbook build
+
+docs-serve:
+	cd docs && mdbook serve --open
+
+docs-cli: $(EXE)
+	@mkdir -p docs/_generated/cli
+	@for sub in $(DOCS_CLI_SUBCMDS); do \
+		echo "  CAPTURE  docs/_generated/cli/$$sub.txt"; \
+		./$(EXE) $$sub --help 2>&1 \
+			| sed -e 's/[[:space:]]*$$//' \
+			| grep -v '^Total time taken:' \
+			| grep -v '^Looking to launch ' \
+			| grep -v '^Launching executable ' \
+			| awk '/^v?[0-9]+\.[0-9]+/ {print "v<MAJOR.MINOR>-<N>-g<COMMIT>"; next} {print}' \
+			> docs/_generated/cli/$$sub.txt; \
+	done
+
+docs-clean:
+	rm -rf docs/book
+
+docs-install-tools:
+	cargo install mdbook --version 0.5.2 --locked
+	cargo install mdbook-mermaid --version 0.17.0 --locked
 
 # Profile-Guided Optimization (PGO) targets.
 #

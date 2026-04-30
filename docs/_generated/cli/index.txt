@@ -1,0 +1,12 @@
+Usage: bwa-mem3 index [-p prefix] [-t N] [--max-memory SIZE] [--tmp-dir PATH] [--meth] <in.fasta>
+
+  -p STR             output prefix (default: <in.fasta>)
+  -t INT             worker threads [auto: detected cores, cgroup-aware]
+  --max-memory SIZE  peak memory budget; SIZE accepts a G/M/K suffix
+                     (case-insensitive) or bare bytes
+                     [auto: min(50% of RAM, 32G), cgroup-aware]
+  --tmp-dir PATH     scratch directory [$TMPDIR]
+  --meth             build a bwameth-style doubled c2t reference + FMI.
+                     Writes <in.fasta>.bwameth.c2t and the FMI alongside it.
+                     Use with `bwa-mem3 mem --meth <in.fasta> R1.fq [R2.fq]`.
+  -h, --help         print this help message and exit

@@ -2,3 +2,6 @@
 # Prevents CRLF from sneaking back in on Windows checkouts and keeps diffs
 # noise-free across platforms.
 * text=auto eol=lf
+
+# Mark mdbook --help auto-captured snippets as generated so PR diffs collapse them.
+docs/_generated/** linguist-generated=true

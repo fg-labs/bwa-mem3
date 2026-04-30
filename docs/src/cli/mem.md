@@ -1,0 +1,323 @@
+# mem
+
+`bwa-mem3 mem` aligns short DNA reads against an indexed reference genome
+using the BWA-MEM algorithm. It accepts one or two FASTQ files (single-end or
+paired-end) and writes alignments to stdout in SAM or BAM format. It is the
+primary alignment subcommand; nearly all bwa-mem3 usage flows through it.
+
+## Synopsis
+
+```text
+{{#include ../../_generated/cli/mem.txt}}
+```
+
+## Common usage
+
+Paired-end alignment, 16 threads, SAM to stdout:
+
+```sh
+bwa-mem3 mem -t 16 ref.fa R1.fq.gz R2.fq.gz > out.sam
+```
+
+Paired-end alignment, emit uncompressed BAM, pipe directly to `samtools sort`:
+
+```sh
+bwa-mem3 mem --bam -t 16 ref.fa R1.fq.gz R2.fq.gz \
+  | samtools sort -@ 8 -o out.bam -
+samtools index out.bam
+```
+
+Paired-end methylation alignment with a read group header:
+
+```sh
+bwa-mem3 mem --meth -t 16 \
+  -R '@RG\tID:lib1\tSM:sample1\tPL:ILLUMINA' \
+  ref.fa R1.fq.gz R2.fq.gz \
+  | samtools sort -o out.bam -
+```
+
+## Flag reference
+
+### Input / output
+
+#### `-o STR` — output file
+
+Write output to `STR` instead of stdout. Honored for both SAM and `--bam`
+output; the path is opened lazily so BAM mode can hand it to htslib instead of
+truncating it as a SAM-text file. Stdout redirection (`>`) remains an
+alternative.
+
+#### `--bam[=N]` — emit BAM
+
+Emit BAM instead of SAM. `N` controls BGZF compression: `0` (default when
+`--bam` is used without `=`) writes uncompressed BAM, which costs almost no
+CPU and is the recommended mode for piping to `samtools sort`. Values `1`–`9`
+select increasing BGZF deflate levels; use `--bam=6` or `--bam=9` only when
+writing directly to final storage without a downstream sort step.
+
+> **Tip — Prefer --bam for production pipelines**
+>
+> Uncompressed BAM (`--bam` or `--bam=0`) eliminates the text-formatting cost on
+> the aligner side and the text-parse cost on the `samtools sort` side. For any
+> pipeline that immediately sorts or processes the output, this is faster than
+> SAM at no quality cost.
+
+#### `-R STR` — read group header
+
+Injects a `@RG` header line and tags every alignment with `RG:Z:<ID>`. The
+value is a tab-separated `@RG` line with literal `\t` escapes, for example:
+
+```sh
+-R '@RG\tID:run1\tSM:HG001\tPL:ILLUMINA\tLB:lib1'
+```
+
+bwa-mem3 escapes any literal tab characters inside `-R` values before writing
+them to the `@PG CL:` field, preventing header corruption (fix for issue #45).
+
+#### `-H STR/FILE` — extra header lines
+
+If `STR` begins with `@`, it is injected verbatim as a header line. Otherwise
+`STR` is treated as a path and every line in the file is injected. Useful for
+adding `@CO` comments or custom `@RG` / `@PG` entries.
+
+#### `-p` — smart pairing
+
+Reads interleaved paired-end data from a single FASTQ file (`in1.fq`) rather
+than two separate files. The second positional argument (`in2.fq`) is ignored.
+
+#### `-5` — leftmost-coordinate primary
+
+For split alignments, designates the alignment with the smallest genomic
+coordinate as primary, rather than the longest alignment. Useful for some
+downstream tools that expect the leftmost alignment to be primary.
+
+#### `-q` — preserve supplementary MAPQ
+
+By default, bwa-mem3 may downgrade the MAPQ of supplementary alignments.
+`-q` suppresses that adjustment.
+
+#### `-K INT` — fixed batch size
+
+Forces each thread batch to process exactly `INT` input bases regardless of
+the number of threads. Useful when you need bit-for-bit reproducible output
+across runs with different `-t` values: fix `-K` to the same value and the
+output is deterministic.
+
+#### `-v INT` — verbosity
+
+Controls stderr diagnostic output: `1` = errors only, `2` = warnings,
+`3` = informational messages (default), `4+` = debugging.
+
+#### `-a` — all alignments
+
+Output all alignments for single-end or unpaired paired-end reads, including
+secondary alignments. Equivalent to enabling secondary-alignment reporting.
+
+#### `-C` — append FASTA/FASTQ comment
+
+Appends the comment field from the FASTA/FASTQ header to the SAM output as
+an additional column. Useful when the comment carries barcodes or UMIs.
+
+#### `-V` — reference header in XR tag
+
+Emits the reference FASTA header line for each alignment position as an `XR`
+SAM tag.
+
+#### `-Y` — soft-clip supplementary alignments
+
+Uses soft clipping instead of hard clipping for supplementary alignments.
+Some downstream tools require this.
+
+#### `-M` — mark shorter split hits as secondary
+
+Marks the shorter alignment in a split read as secondary (sets `0x100` flag)
+rather than supplementary. Required for compatibility with tools that do not
+handle supplementary alignments (e.g. Picard's duplicate-marking before
+certain versions).
+
+#### `-j` — treat ALT contigs as primary
+
+Treats ALT contigs as part of the primary assembly by ignoring the
+`<idxbase>.alt` file. Use when your workflow does not include ALT-aware
+postprocessing.
+
+### Scoring
+
+All scoring flags accept integer values. Changing `-A` (match score) scales
+the penalty flags that default to multiples of `-A`; explicit overrides of
+individual flags are unaffected.
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `-A INT` | 1 | Score for a sequence match. Scales `-T`, `-d`, `-B`, `-O`, `-E`, `-L`, `-U` unless overridden. |
+| `-B INT` | 4 | Mismatch penalty. |
+| `-O INT[,INT]` | 6,6 | Gap open penalty for deletions and insertions respectively. |
+| `-E INT[,INT]` | 1,1 | Gap extension penalty per base. A gap of length k costs `-O + -E * k`. |
+| `-L INT[,INT]` | 5,5 | Clipping penalty for 5' and 3' ends. |
+| `-U INT` | 17 | Penalty for an unpaired read pair (affects mate-rescue scoring). |
+| `-T INT` | 30 | Minimum alignment score to output. Alignments below this threshold are not reported. |
+
+> **Note — --meth overrides scoring defaults**
+>
+> When `--meth` is active, bwa-mem3 applies bwameth.py-compatible defaults:
+> `-B 2 -L 10 -U 100 -T 40 -CM`. Any of these can still be overridden by
+> passing the flag explicitly after `--meth`.
+
+### Paired-end
+
+#### `-I FLOAT[,FLOAT[,INT[,INT]]]` — insert size distribution
+
+Specifies the mean, standard deviation (default: 10% of mean), maximum
+(default: 4 sigma above mean), and minimum of the insert size distribution for
+FR-orientation paired-end reads. By default bwa-mem3 infers these parameters
+from the first batch of reads. Provide them explicitly for speed or when the
+reference is short and inference may be inaccurate.
+
+#### `-m INT` — mate rescue rounds
+
+Maximum number of mate-rescue attempts per read. Reduce to speed up alignment
+on data where the default (50) wastes time on unrescuable pairs.
+
+#### `-S` — skip mate rescue
+
+Disables mate rescue entirely. Faster but may reduce sensitivity for
+discordant pairs.
+
+#### `-P` — skip pairing
+
+Skips the pairing step; mate rescue still runs unless `-S` is also given.
+
+### Filtering
+
+#### `-c INT` — skip repetitive seeds
+
+Seeds with more than `INT` occurrences in the reference are skipped. Lowering
+this (e.g. to 50) speeds up alignment of highly repetitive reads but may
+reduce sensitivity. Raising it increases sensitivity in repeat-heavy regions
+at a cost in runtime.
+
+#### `-D FLOAT` — chain length fraction
+
+Drops chains shorter than `FLOAT` times the longest overlapping chain. The
+default (0.50) discards chains that are less than half the length of the best
+chain.
+
+#### `-W INT` — minimum seeded bases
+
+Discards chains with fewer than `INT` seeded bases. Raising this filters out
+very short, low-confidence chains.
+
+#### `-h INT[,INT]` — secondary alignment reporting
+
+If there are fewer than `INT` hits with score exceeding `FLOAT` (see `-z`)
+times the maximum score, all of them are output in the `XA` auxiliary tag.
+The second integer is a hard cap on the number of XA entries. Defaults: 5, 200.
+
+#### `-z FLOAT` — secondary score fraction
+
+Fraction of the maximum alignment score used as the threshold for secondary
+hit reporting with `-h`. Default: 0.80.
+
+#### `-u` — emit XB instead of XA
+
+Outputs `XB` in place of `XA`. `XB` is an extension of `XA` that also carries
+the alignment score and mapping quality for each secondary hit.
+
+### Methylation (`--meth`)
+
+#### `--meth` — enable bisulfite alignment mode
+
+Activates inline C→T (R1) and G→A (R2) read conversion, bwameth-compatible
+scoring defaults, inline BAM post-processing, and forces `--bam` output.
+The reference must have been indexed with `bwa-mem3 index --meth`.
+
+Pass the original FASTA prefix as `<idxbase>` — the `.bwameth.c2t` suffix is
+appended automatically. If `<idxbase>` already ends in `.bwameth.c2t`
+(interop with an external c2t converter), the auto-append is skipped.
+
+See [Methylation Reference](../methylation/overview.md) for the full treatment.
+
+#### `--set-as-failed {f|r}` — strand QC-fail flag
+
+Forces the QC-fail bit (`0x200`) on all alignments to the forward (`f`) or
+reverse (`r`) bisulfite strand. Used when one strand is known to be
+unreliable for a given library preparation.
+
+#### `--do-not-penalize-chimeras` — disable chimera heuristic
+
+Disables the longest-match < 44% chimera heuristic that would otherwise set
+`0x200`, clear `0x2`, and cap MAPQ at 1 for likely chimeric alignments.
+Use when the default chimera filter is too aggressive for your library type.
+
+### Threading
+
+#### `-t INT` — number of threads
+
+Number of worker threads. Defaults to 1. Set to the number of physical cores
+available to this job. Scaling is workload- and hardware-dependent: on typical
+machines the curve flattens around 16–32 threads (FM-index bandwidth and I/O
+contention dominate); on high-memory / fast-I/O servers the aligner can keep
+scaling toward ~64 threads on hg38 before saturating. See the threading guide
+for measured guidance and per-machine recommendations.
+
+See [User Guide — Threading and resource use](../user-guide/threading.md) for
+guidance on thread counts at various machine sizes.
+
+### Supplementary MAPQ rescoring
+
+#### `--supp-rep-hard-cap INT` — cap MAPQ for repetitive supplementary alignments
+
+Forces MAPQ=0 for supplementary alignments whose chain contains any seed with
+at least `INT` occurrences in the genome. This targets supplementary
+alignments anchored in repetitive regions that upstream MAPQ scoring may
+overestimate. `0` disables the cap (default). Typical values are 5–20; lower
+values are more aggressive. Primary alignment MAPQ is unaffected.
+
+### Debug
+
+#### `-k INT` — minimum seed length
+
+Minimum exact-match seed length. Shorter seeds increase sensitivity but raise
+runtime. The default (19) is calibrated for 100–150 bp Illumina reads.
+
+#### `-w INT` — band width
+
+Band width for the banded Smith-Waterman extension. Wider bands can recover
+alignments with long indels at greater CPU cost.
+
+#### `-d INT` — X-dropoff
+
+Off-diagonal X-dropoff for the Z-drop heuristic. Controls how far an alignment
+extension continues after a score drop.
+
+#### `-r FLOAT` — re-seeding factor
+
+Seeds longer than `-k * FLOAT` are re-seeded internally to find sub-seeds.
+Lowering this produces more seeds and higher sensitivity at greater cost.
+
+#### `-y INT` — third-round seed occurrence threshold
+
+Seed occurrence threshold for the third round of seeding. Rarely needs
+adjustment outside highly repetitive genomes.
+
+## Notes / Gotchas
+
+> **Warning — --meth requires a --meth index**
+>
+> Running `bwa-mem3 mem --meth` against a standard (non-c2t) index produces
+> incorrect alignments without an error. Confirm that the index was built with
+> `bwa-mem3 index --meth` before aligning bisulfite data.
+>
+> **Note — SIMD variant printed to stderr at startup**
+>
+> When mem starts it prints a banner (`Executing in AVX512 mode!!` etc.) to
+> stderr. This is informational and does not affect stdout output.
+
+---
+
+**See also:**
+[User Guide — Aligning short reads](../user-guide/aligning.md) ·
+[User Guide — Output: SAM/BAM, headers, tags](../user-guide/output.md) ·
+[CLI Reference — index](index-cmd.md) ·
+[Methylation Reference — Overview](../methylation/overview.md) ·
+[Best Practices — Output format](../best-practices/output-format.md)

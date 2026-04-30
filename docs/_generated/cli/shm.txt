@@ -1,0 +1,25 @@
+
+Usage: bwa-mem3 shm [-d|-l|--help] [--meth] [idxbase]
+
+Options:
+  -d        destroy all indices in shared memory (matches bwa v1 behavior)
+  -l        list names of indices in shared memory
+  --meth    stage a `bwa-mem3 index --meth` index — auto-appends
+            `.bwameth.c2t` to <idxbase>, mirroring `mem --meth`
+  -h --help print this help and exit
+
+Stage with no flags: `bwa-mem3 shm <idxbase>` loads the index into
+POSIX shared memory; subsequent `bwa-mem3 mem <idxbase> ...` runs
+auto-attach instead of re-reading from disk. For meth indices, pass
+the same plain `<idxbase>` to all three commands plus `--meth` on
+`index`, `shm`, and `mem` (the c2t suffix is auto-appended).
+
+Footgun: if you re-build the index, run `bwa-mem3 shm -d` first.
+There is no staleness check -- a stale segment will silently mis-align.
+
+macOS: POSIX shm has implementation-defined per-segment caps; large
+       indices may simply fail to stage. Prefer Linux for production.
+Linux: /dev/shm defaults to ~50% of RAM on bare metal; in containers
+       it is often much smaller and may need raising via --shm-size
+       (Docker) or an emptyDir tmpfs (Kubernetes).
+
