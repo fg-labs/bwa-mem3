@@ -228,6 +228,13 @@ typedef struct
     SMEM    *lockstep_prev[MAX_THREADS];
     SMEM    *lockstep_match_buf[MAX_THREADS];
     int64_t  lockstep_buf_cap[MAX_THREADS];
+
+    // Pointer into worker_t::ref_string (the unpacked .0123 reference).
+    // Set once in the worker_aln/worker_sam entry points; lets helpers like
+    // mem_seed_sw and the mem_matesw_* family invoke bns_fetch_seq_v2 without
+    // threading ref_string through 8 function signatures. Read-only and
+    // shared across threads — every thread sees the same pointer.
+    uint8_t *ref_string;
 } mem_cache;
 
 // chain moved to .h
