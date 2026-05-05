@@ -191,8 +191,21 @@ typedef struct {
 	}																	\
 	void ks_introsort_##name(size_t n, type_t a[])						\
 	{																	\
+		/* Threshold for the on-stack partition-stack buffer:           \
+		 * d ≤ KS_INTROSORT_STACK_DLIMIT covers n ≤ 2^16 = 65,536, which \
+		 * captures every realistic call in practice. The buffer is     \
+		 * sized to klib's `(sizeof(size_t)*d)+2` formula at d=16:      \
+		 * 8*16+2 = 130 entries × 24 B = ~3,120 B on-stack — well       \
+		 * within OpenMP worker stacks (default 4 MB). For pathologic   \
+		 * n > 2^16, fall through to the legacy malloc path so behavior \
+		 * is unchanged at the boundary. Eliminates the per-call malloc \
+		 * for the common small-n case (~50-100 ns each on glibc;       \
+		 * disproportionately costly at the per-read sort frequency). */ \
+		enum { KS_INTROSORT_STACK_DLIMIT = 16 };                        \
+		ks_isort_stack_t stack_buf[(sizeof(size_t)*KS_INTROSORT_STACK_DLIMIT)+2]; \
 		int d;															\
 		ks_isort_stack_t *top, *stack;									\
+		int stack_heap_alloc = 0;										\
 		type_t rp, swap_tmp;											\
 		type_t *s, *t, *i, *j, *k;										\
 																		\
@@ -202,8 +215,13 @@ typedef struct {
 			return;														\
 		}																\
 		for (d = 2; 1ul<<d < n; ++d);									\
-		stack = (ks_isort_stack_t*)malloc(sizeof(ks_isort_stack_t) * ((sizeof(size_t)*d)+2)); \
-        assert(stack != NULL);                                          \
+		if (d <= KS_INTROSORT_STACK_DLIMIT) {							\
+			stack = stack_buf;											\
+		} else {														\
+			stack = (ks_isort_stack_t*)malloc(sizeof(ks_isort_stack_t) * ((sizeof(size_t)*d)+2)); \
+			assert(stack != NULL);                                      \
+			stack_heap_alloc = 1;										\
+		}																\
 		top = stack; s = a; t = a + (n-1); d <<= 1;						\
 		while (1) {														\
 			if (s < t) {												\
@@ -234,7 +252,7 @@ typedef struct {
 				}														\
 			} else {													\
 				if (top == stack) {										\
-					free(stack);										\
+					if (stack_heap_alloc) free(stack);					\
 					__ks_insertsort_##name(a, a+n);						\
 					return;												\
 				} else { --top; s = (type_t*)top->left; t = (type_t*)top->right; d = top->depth; } \
