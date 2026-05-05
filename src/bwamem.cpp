@@ -2506,6 +2506,30 @@ static inline int ungapped_analyze(const uint8_t *qs, const uint8_t *rs, int N,
         return FP_STATUS_TIGHT;
     }
 
+    // Closed-form fast path: total_mis == 0 (perfect-match HIT).
+    //
+    // With no mismatches the scalar walk below is deterministic:
+    //   cur starts at h0 and only increases (+a per iter), so it never
+    //   touches the `cur == 0` early-skip after the first iteration.
+    //   max_sc rises to h0 + N*a; max_i ends at N (the >= tie-break
+    //   updates max_i on every step).
+    //
+    // The h0 > 0 guard preserves bit-identicality with the loop: when
+    // h0 == 0 the loop's `if (cur == 0) continue` inhibits all updates,
+    // leaving max_sc = 0 / max_i = 0; the closed form would instead
+    // compute max_sc = N*a, breaking parity. h0 == 0 is pathological in
+    // practice (caller passes a seed score) but the guard is a single
+    // compare and free.
+    if (total_mis == 0 && h0 > 0) {
+        int score = h0 + N * a;
+        *out_score      = score;
+        *out_qle        = N;
+        *out_gscore     = score;
+        *out_gtle       = N;
+        *out_tight_band = 0;   // unused on HIT (SW skipped)
+        return FP_STATUS_HIT;
+    }
+
     // HIT candidate: run the scalar walk for precise qle / gscore / max_sc.
     //
     // MAIN_CODE* local-SW semantics: once cur==0 in the ungapped path it
