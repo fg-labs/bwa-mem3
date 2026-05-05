@@ -67,6 +67,19 @@ int display_stats(int nthreads)
     fprintf(stderr, "Processor is running @%lf MHz\n", proc_freq*1.0/1e6);
     fprintf(stderr, "Runtime profile:\n");
 
+    /* tprof[][] has a fixed column dimension of LIM_C (= MAX_THREADS = 256).
+     * Every per-thread aggregation below — both the explicit `for (t=0; t<nthreads;...)`
+     * loops and the find_opt(tprof[X], nthreads, ...) calls — would index past
+     * the column dimension when the user runs with -t > LIM_C, walking into
+     * adjacent globals. Clamp the per-thread profile span to LIM_C; the actual
+     * thread count is already logged above. */
+    if (nthreads > LIM_C) {
+        fprintf(stderr,
+                "WARNING: per-thread profile truncated to %d threads (-t %d > LIM_C=%d)\n",
+                LIM_C, nthreads, LIM_C);
+        nthreads = LIM_C;
+    }
+
     fprintf(stderr, "\n\tTime taken for main_mem function: %0.2lf sec\n\n",
             tprof[MEM][0]*1.0/proc_freq);
 
