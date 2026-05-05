@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
+#include <memory>
 #include <string>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -68,7 +69,10 @@ void write_doubled_pac(const char* fwd_pac_path, int64_t l_pac,
     PackedText fwd(fwd_pac_path, l_pac);
     int64_t doubled = 2 * l_pac;
     int64_t nbytes  = (doubled + 3) / 4;
-    std::vector<uint8_t> buf((size_t)nbytes, 0);
+    // Default-init via new[]: every byte is unconditionally overwritten in
+    // the parallel loop below, so the value-init zero-fill that
+    // std::vector<uint8_t>(n, 0) performed was wasted bandwidth.
+    std::unique_ptr<uint8_t[]> buf(new uint8_t[(size_t)nbytes]);
 
     auto base_at = [&](int64_t idx) -> uint8_t {
         // Forward half: fwd[idx]. RC half: complement of fwd[l_pac-1-(idx-l_pac)].
@@ -98,7 +102,7 @@ void write_doubled_pac(const char* fwd_pac_path, int64_t l_pac,
     // grows past that (large custom genomes / methylation doubled wheat) the
     // raw write() returned a short count and aborted with a half-written file
     // in $TMPDIR. pwrite_all loops on EINTR + short writes.
-    pwrite_all(fd, buf.data(), (size_t)nbytes, 0, "doubled.pac data");
+    pwrite_all(fd, buf.get(), (size_t)nbytes, 0, "doubled.pac data");
     off_t cur = (off_t)nbytes;
     uint8_t ct = 0;
     if (doubled % 4 == 0) {
@@ -204,13 +208,18 @@ int libsais_build_fm_index(const char* prefix, int64_t pac_len,
     // Phase 1: unpack .pac into a libsais-ready byte buffer. Alphabet is
     // {0=$, 1..4=ACGT}; the trailing 0 at index N is the GSA terminator.
     auto t1 = clock_t_::now();
-    std::vector<uint8_t> buf((size_t)(N + 1));
+    // Default-init: positions [0, N) are written by the parallel loop and
+    // buf[N] is set explicitly to the GSA terminator below, so the
+    // value-init zero-fill std::vector<uint8_t>(N+1) performed was a wasted
+    // ~6.2 GiB write on a doubled-human input.
+    std::unique_ptr<uint8_t[]> buf(new uint8_t[(size_t)(N + 1)]);
     // Capture out-of-range bases without crashing inside the OpenMP region:
     // err_fatal terminates via exit(), which interacts poorly with libomp's
     // teardown when other threads are mid-loop. Record the first offending
     // index atomically and report after the parallel region.
     std::atomic<int64_t> bad_pos{-1};
     std::atomic<unsigned> bad_val{0};
+    uint8_t* buf_ptr = buf.get();
 #ifdef _OPENMP
     #pragma omp parallel for num_threads(T) schedule(static)
 #endif
@@ -220,9 +229,9 @@ int libsais_build_fm_index(const char* prefix, int64_t pac_len,
             int64_t expect = -1;
             if (bad_pos.compare_exchange_strong(expect, i)) bad_val.store(b);
         }
-        buf[(size_t)i] = (uint8_t)(b + 1);
+        buf_ptr[(size_t)i] = (uint8_t)(b + 1);
     }
-    buf[(size_t)N] = 0;
+    buf_ptr[(size_t)N] = 0;
     if (bad_pos.load() >= 0)
         err_fatal(__func__,
                   "unexpected non-2bit base %u at doubled-pac[%lld]",
@@ -232,19 +241,23 @@ int libsais_build_fm_index(const char* prefix, int64_t pac_len,
 
     // Phase 2: libsais GSA. Extra-space `fs` lets libsais avoid a realloc
     // inside the induced-sorting passes; 10000 matches upstream's example.
+    // SA buffer is allocated default-init (uninitialized): libsais writes
+    // every output suffix and uses the trailing `fs` slots as scratch, so
+    // the implicit zero-fill from std::vector<T>(n) was wasted bandwidth
+    // (~50 GiB on a doubled-human input with int64_t SA).
     auto t2 = clock_t_::now();
     const int64_t fs = 10000;
-    std::vector<int64_t> sa64;
-    std::vector<int32_t> sa32;
+    std::unique_ptr<int64_t[]> sa64;
+    std::unique_ptr<int32_t[]> sa32;
     if (!use_int64_sa) {
-        sa32.resize((size_t)(N + 1 + fs));
-        int32_t rc = libsais_gsa_omp(buf.data(), sa32.data(),
+        sa32.reset(new int32_t[(size_t)(N + 1 + fs)]);
+        int32_t rc = libsais_gsa_omp(buf_ptr, sa32.get(),
                                      (int32_t)(N + 1), (int32_t)fs,
                                      /*freq=*/nullptr, T);
         if (rc != 0) err_fatal(__func__, "libsais_gsa_omp failed (rc=%d)", rc);
     } else {
-        sa64.resize((size_t)(N + 1 + fs));
-        int64_t rc = libsais64_gsa_omp(buf.data(), sa64.data(),
+        sa64.reset(new int64_t[(size_t)(N + 1 + fs)]);
+        int64_t rc = libsais64_gsa_omp(buf_ptr, sa64.get(),
                                        N + 1, fs,
                                        /*freq=*/nullptr, T);
         if (rc != 0) err_fatal(__func__, "libsais64_gsa_omp failed (rc=%lld)", (long long)rc);
@@ -257,14 +270,14 @@ int libsais_build_fm_index(const char* prefix, int64_t pac_len,
     std::string bwt_path = std::string(prefix) + ".bwt.2bit.64";
     int64_t sentinel_index = -1;
     // Drive the dispatch off the explicit width flag rather than
-    // sa32.empty(); the latter is correct today but is load-bearing on
-    // a side effect of the resize above and would silently flip if a
-    // future refactor reserves both vectors for RAII reasons.
+    // checking which unique_ptr is non-null; the latter is correct today
+    // but would silently flip if a future refactor allocated both buffers
+    // for RAII reasons.
     const void* sa_ptr = use_int64_sa
-        ? (const void*)sa64.data()
-        : (const void*)sa32.data();
+        ? (const void*)sa64.get()
+        : (const void*)sa32.get();
     write_fm_index_streaming(
-        bwt_path.c_str(), buf.data(),
+        bwt_path.c_str(), buf_ptr,
         sa_ptr,
         /*sa_is_64bit=*/use_int64_sa,
         N, count, &sentinel_index, T);
