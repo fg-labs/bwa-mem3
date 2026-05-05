@@ -41,6 +41,7 @@
 #include <fcntl.h>         /* O_* */
 #include <unistd.h>        /* close, ftruncate */
 #include <getopt.h>        /* getopt_long for `bwa-mem3 shm --meth ...` */
+#include <semaphore.h>     /* sem_open, sem_wait, sem_post, sem_close, sem_unlink */
 #include <errno.h>
 #include <limits.h>        /* PATH_MAX */
 
@@ -48,6 +49,12 @@
  * (int64_t l_mem, char[] basename) entries. The header is 4 bytes total
  * (two uint16_t fields). next_write_offset starts at 4 on a fresh segment. */
 #define BWA_SHM_CTL_HEADER_BYTES 4
+
+/* Named POSIX semaphore guarding read-modify-write sequences against
+ * /bwactl. Created on first use and unlinked by bwa_shm_destroy alongside
+ * the registry, so `bwa-mem3 shm -d` is the recovery path if a stager
+ * crashes while holding the lock (POSIX semaphores have no SEM_UNDO). */
+#define BWA_SHM_LOCK_NAME "/bwactl_lock"
 
 /* .bwt.2bit.64 prefix: int64_t reference_seq_len, int64_t count[5]. */
 #define BWA_BWT_2BIT_HEADER_BYTES (sizeof(int64_t) * 6)
@@ -88,6 +95,36 @@ static void path_concat2(char out[PATH_MAX], const char *a, const char *b)
     strcat_s(out, PATH_MAX, b);
 }
 
+/* Acquire the cross-process lock that serializes read-modify-write
+ * sequences on /bwactl. POSIX named semaphores work on both Linux and
+ * macOS (unlike flock(2) on POSIX shm fds, which macOS rejects with
+ * EOPNOTSUPP). Returns the open semaphore on success — held by us until
+ * ctl_lock_release — or NULL on failure. */
+static sem_t *ctl_lock_acquire(void)
+{
+    sem_t *s = sem_open(BWA_SHM_LOCK_NAME, O_CREAT, 0644, 1);
+    if (s == SEM_FAILED) {
+        std::fprintf(stderr, "[E::%s] sem_open(%s) failed: %s\n",
+                     __func__, BWA_SHM_LOCK_NAME, std::strerror(errno));
+        return NULL;
+    }
+    while (sem_wait(s) < 0) {
+        if (errno == EINTR) continue;
+        std::fprintf(stderr, "[E::%s] sem_wait(%s) failed: %s\n",
+                     __func__, BWA_SHM_LOCK_NAME, std::strerror(errno));
+        sem_close(s);
+        return NULL;
+    }
+    return s;
+}
+
+static void ctl_lock_release(sem_t *s)
+{
+    if (s == NULL) return;
+    sem_post(s);
+    sem_close(s);
+}
+
 /* Open `/bwactl` read-write, creating it if necessary and zero-initializing
  * a fresh segment with next-write offset = BWA_SHM_CTL_HEADER_BYTES.
  *
@@ -96,13 +133,9 @@ static void path_concat2(char out[PATH_MAX], const char *a, const char *b)
  * closes it after the mapping is no longer needed (typical pattern: close
  * immediately, since the mapping survives close).
  *
- * NOTE: there is no advisory lock around the registry. POSIX shm fds on
- * macOS reject flock(2) with EOPNOTSUPP, so a portable lock would require
- * a side-channel lockfile. We accept the v1 race window here: two
- * concurrent `bwa-mem3 shm <prefix>` invocations may both pass the
- * pre-stage `bwa_shm_test` and append duplicate entries (or have one
- * `O_EXCL`-create the segment and the other discover it via EEXIST). The
- * EEXIST branch in `bwa_shm_stage` treats that as already-staged. */
+ * Concurrent RMW callers must hold ctl_lock_acquire across the open / read
+ * / write / close cycle so the n_entries / next_write fields stay coherent
+ * across processes. */
 static void *ctl_open_rw(int *fd_out)
 {
     int created = 0;
@@ -503,6 +536,12 @@ int bwa_shm_destroy(void)
     int rc = ctl_walk(destroy_cb, NULL);
     if (rc < 0) return rc;
     shm_unlink(BWA_SHM_CTL_NAME);
+    /* Recover from a stuck lock: a stager that segfaulted or was kill -9'd
+     * mid-stage holds the named semaphore until it is unlinked, blocking
+     * every subsequent stager forever. POSIX has no SEM_UNDO, so unlinking
+     * alongside the registry is the operator-visible recovery path. Errors
+     * are ignored (ENOENT is the common case on a clean drop). */
+    sem_unlink(BWA_SHM_LOCK_NAME);
     return 0;
 }
 
@@ -537,15 +576,26 @@ int bwa_shm_stage(const char *prefix)
         return -1;
     }
 
-    /* 2. Open the control segment R/W. There is no advisory lock — see the
-     *    note on ctl_open_rw for why. We re-check the registry below to
-     *    catch the case where another stager appended this prefix between
-     *    our pre-stage bwa_shm_test and now. */
+    /* 2. Acquire the cross-process lock, then open the control segment R/W.
+     *    Holding the lock across the read-modify-write window prevents two
+     *    concurrent stagers from racing each other to append the same
+     *    basename or stomping each other's next_write cursor. The pre-stage
+     *    bwa_shm_test() above is unlocked (a cheap fast path); we re-scan
+     *    the live registry below now that the lock is held to catch the
+     *    case where another stager appended this prefix between our test
+     *    and our acquire. */
+    sem_t *ctl_lock = ctl_lock_acquire();
+    if (ctl_lock == NULL) {
+        bwa_shm_layout_free(&layout);
+        return -1;
+    }
+
     int   ctl_fd  = -1;
     void *ctl_map = ctl_open_rw(&ctl_fd);
     if (ctl_map == NULL) {
         std::fprintf(stderr, "[E::%s] failed to open control segment %s: %s\n",
                      __func__, BWA_SHM_CTL_NAME, std::strerror(errno));
+        ctl_lock_release(ctl_lock);
         bwa_shm_layout_free(&layout);
         return -1;
     }
@@ -568,6 +618,7 @@ int bwa_shm_stage(const char *prefix)
                     "[M::%s] index '%s' was staged by another process\n",
                     __func__, prefix);
                 ctl_close(ctl_map, ctl_fd);
+                ctl_lock_release(ctl_lock);
                 bwa_shm_layout_free(&layout);
                 return 0;
             }
@@ -586,6 +637,7 @@ int bwa_shm_stage(const char *prefix)
                      "[E::%s] control segment full (cannot stage '%s')\n",
                      __func__, name);
         ctl_close(ctl_map, ctl_fd);
+        ctl_lock_release(ctl_lock);
         bwa_shm_layout_free(&layout);
         return -1;
     }
@@ -602,6 +654,7 @@ int bwa_shm_stage(const char *prefix)
             "[M::%s] segment %s already exists; treating as already staged\n",
             __func__, idx_path);
         ctl_close(ctl_map, ctl_fd);
+        ctl_lock_release(ctl_lock);
         bwa_shm_layout_free(&layout);
         return 0;
     }
@@ -609,6 +662,7 @@ int bwa_shm_stage(const char *prefix)
         std::fprintf(stderr, "[E::%s] shm_open(%s) failed: %s\n",
                      __func__, idx_path, std::strerror(errno));
         ctl_close(ctl_map, ctl_fd);
+        ctl_lock_release(ctl_lock);
         bwa_shm_layout_free(&layout);
         return -1;
     }
@@ -619,6 +673,7 @@ int bwa_shm_stage(const char *prefix)
         close(idx_fd);
         shm_unlink(idx_path);
         ctl_close(ctl_map, ctl_fd);
+        ctl_lock_release(ctl_lock);
         bwa_shm_layout_free(&layout);
         return -1;
     }
@@ -630,6 +685,7 @@ int bwa_shm_stage(const char *prefix)
         close(idx_fd);
         shm_unlink(idx_path);
         ctl_close(ctl_map, ctl_fd);
+        ctl_lock_release(ctl_lock);
         bwa_shm_layout_free(&layout);
         return -1;
     }
@@ -641,6 +697,7 @@ int bwa_shm_stage(const char *prefix)
         close(idx_fd);
         shm_unlink(idx_path);
         ctl_close(ctl_map, ctl_fd);
+        ctl_lock_release(ctl_lock);
         bwa_shm_layout_free(&layout);
         return -1;
     }
@@ -658,6 +715,7 @@ int bwa_shm_stage(const char *prefix)
     std::memcpy((uint8_t *)ctl_map + 2, &next_write, sizeof(uint16_t));
 
     ctl_close(ctl_map, ctl_fd);
+    ctl_lock_release(ctl_lock);
 
     std::fprintf(stderr, "[M::%s] staged '%s' (%llu bytes) as %s\n",
                  __func__, name,
@@ -835,6 +893,10 @@ static void print_shm_usage(void)
         "`index`, `shm`, and `mem` (the c2t suffix is auto-appended).\n\n"
         "Footgun: if you re-build the index, run `bwa-mem3 shm -d` first.\n"
         "There is no staleness check -- a stale segment will silently mis-align.\n\n"
+        "Stuck-lock recovery: concurrent stagers are serialized by a named\n"
+        "       POSIX semaphore. If a stager is kill -9'd mid-stage, the lock\n"
+        "       persists and subsequent stages block forever. `bwa-mem3 shm -d`\n"
+        "       unlinks the semaphore alongside the registry; rerun afterwards.\n\n"
         "macOS: POSIX shm has implementation-defined per-segment caps; large\n"
         "       indices may simply fail to stage. Prefer Linux for production.\n"
         "Linux: /dev/shm defaults to ~50%% of RAM on bare metal; in containers\n"

@@ -268,7 +268,7 @@ ifneq ($(strip $(DISABLE_BATCHED_MATESW)),)
     CPPFLAGS += -DDISABLE_BATCHED_MATESW=$(DISABLE_BATCHED_MATESW)
 endif
 
-.PHONY:all clean depend multi print-mimalloc-config kswv_nrow_zero_test shm_section_find_test shm_pack_round_trip_test test FORCE pgo-generate pgo-use pgo-clean profile-build profile-clean lto-build lto-clean docs docs-serve docs-cli docs-clean docs-install-tools
+.PHONY:all clean depend multi print-mimalloc-config kswv_nrow_zero_test shm_section_find_test shm_pack_round_trip_test shm_lock_destroy_test test FORCE pgo-generate pgo-use pgo-clean profile-build profile-clean lto-build lto-clean docs docs-serve docs-cli docs-clean docs-install-tools
 .SUFFIXES:.cpp .o
 
 .cpp.o:
@@ -347,22 +347,30 @@ shm_section_find_test: $(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) tes
 shm_pack_round_trip_test: $(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/shm_pack_round_trip_test.o
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/shm_pack_round_trip_test.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
 
+shm_lock_destroy_test: $(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/shm_lock_destroy_test.o
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/shm_lock_destroy_test.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
+
 test/shm_pack_round_trip_test.o: test/shm_pack_round_trip_test.cpp
 
 # Run the in-tree tests via the unit-test harness in test/, plus the
-# standalone regressions (kswv_nrow_zero_test + shm_section_find_test).
-# shm_pack_round_trip_test runs via test/shm_pack_round_trip_test.sh which
-# builds the phiX index first; invoked from test/run_unit_tests.sh.
-test: test-binaries kswv_nrow_zero_test shm_section_find_test
+# standalone regressions (kswv_nrow_zero_test + shm_section_find_test +
+# shm_lock_destroy_test). shm_pack_round_trip_test runs via
+# test/shm_pack_round_trip_test.sh which builds the phiX index first;
+# invoked from test/run_unit_tests.sh.
+test: test-binaries kswv_nrow_zero_test shm_section_find_test shm_lock_destroy_test
 	./test/bwa_mem3_tests_unit
 	./test/bwa_mem3_tests_integration
 	./kswv_nrow_zero_test
 	./shm_section_find_test
+	./shm_lock_destroy_test
 
 test/kswv_nrow_zero_test.o: test/kswv_nrow_zero_test.cpp
 	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $< -o $@
 
 test/shm_section_find_test.o: test/shm_section_find_test.cpp
+	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $< -o $@
+
+test/shm_lock_destroy_test.o: test/shm_lock_destroy_test.cpp
 	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $< -o $@
 
 $(BWA_LIB):$(OBJS)
@@ -429,7 +437,7 @@ $(MIMALLOC_LIB):
 	cd $(MIMALLOC_BUILD) && cmake $(MIMALLOC_CMAKE_FLAGS) .. && $(MAKE)
 
 clean: pgo-clean profile-clean lto-clean
-	rm -fr src/*.o src/version.h test/*.o $(BWA_LIB) $(EXE) kswv_nrow_zero_test shm_section_find_test shm_pack_round_trip_test bwa-mem3.sse41 bwa-mem3.sse42 bwa-mem3.avx bwa-mem3.avx2 bwa-mem3.avx512bw bwa-mem3.arm64
+	rm -fr src/*.o src/version.h test/*.o $(BWA_LIB) $(EXE) kswv_nrow_zero_test shm_section_find_test shm_pack_round_trip_test shm_lock_destroy_test bwa-mem3.sse41 bwa-mem3.sse42 bwa-mem3.avx bwa-mem3.avx2 bwa-mem3.avx512bw bwa-mem3.arm64
 	rm -f $(LIBSAIS_OBJS)
 	rm -f src/*.gcno src/*.gcda
 	$(MAKE) -C test clean

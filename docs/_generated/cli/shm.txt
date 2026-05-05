@@ -17,6 +17,11 @@ the same plain `<idxbase>` to all three commands plus `--meth` on
 Footgun: if you re-build the index, run `bwa-mem3 shm -d` first.
 There is no staleness check -- a stale segment will silently mis-align.
 
+Stuck-lock recovery: concurrent stagers are serialized by a named
+       POSIX semaphore. If a stager is kill -9'd mid-stage, the lock
+       persists and subsequent stages block forever. `bwa-mem3 shm -d`
+       unlinks the semaphore alongside the registry; rerun afterwards.
+
 macOS: POSIX shm has implementation-defined per-segment caps; large
        indices may simply fail to stage. Prefer Linux for production.
 Linux: /dev/shm defaults to ~50% of RAM on bare metal; in containers
