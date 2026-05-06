@@ -84,6 +84,15 @@ transparently.
 > Kubernetes pods. Raise the limit with `--shm-size` (Docker) or an
 > `emptyDir` tmpfs volume with an explicit size (Kubernetes) before attempting
 > to stage a large index.
+>
+> **Note — Stuck-lock recovery**
+>
+> Concurrent `bwa-mem3 shm <prefix>` invocations are serialized by a named
+> POSIX semaphore (`/bwactl_lock`) so the registry stays consistent. POSIX
+> semaphores have no `SEM_UNDO` equivalent: if a stager segfaults or is
+> `kill -9`'d while holding the lock, every subsequent stage will block in
+> `sem_wait` forever. Run `bwa-mem3 shm -d` to recover — it unlinks the
+> semaphore alongside the registry, freeing the next stager.
 
 ---
 

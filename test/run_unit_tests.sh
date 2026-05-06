@@ -18,7 +18,7 @@ ok()   { echo "OK:   $*"; }
 (cd "$HERE" && make) || fail "test/ make failed"
 
 # Build any test binaries that live outside test/Makefile.
-( cd "$ROOT" && make -j4 shm_section_find_test shm_pack_round_trip_test ) >/dev/null
+( cd "$ROOT" && make -j4 shm_section_find_test shm_pack_round_trip_test shm_lock_destroy_test ) >/dev/null
 
 # synthetic_1mb.fa is checked in alongside its committed baselines so the
 # byte-diff test stays reproducible across Python versions and platforms.
@@ -209,6 +209,11 @@ ok "libsais_memory_budget_test"
 echo "==> shm_section_find_test"
 ( cd "$ROOT" && ./shm_section_find_test )
 echo "OK:   shm_section_find_test"
+
+# --- shm_lock_destroy_test (unit: bwa_shm_destroy unlinks /bwactl_lock) ------
+echo "==> shm_lock_destroy_test"
+( cd "$ROOT" && ./shm_lock_destroy_test )
+echo "OK:   shm_lock_destroy_test"
 
 # --- shm pack round-trip (unit: pack/unpack a phiX segment) ------------------
 (cd "$HERE" && ./shm_pack_round_trip_test.sh) || fail "shm_pack_round_trip_test"
