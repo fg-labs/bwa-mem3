@@ -52,10 +52,11 @@ jobs:
             name: "macOS ARM64 (mimalloc)"
             artifact_slug: "macos-arm64-mimalloc"
           - os: ubuntu-latest
-            arch_flag: "multi"
+            arch_flag: ""
             use_mimalloc: "1"
-            name: "Linux x86_64 multi (mimalloc)"
-            artifact_slug: "linux-x86_64-multi-mimalloc"
+            run_integration: true
+            name: "Linux x86_64 single-binary (mimalloc)"
+            artifact_slug: "linux-x86_64-single-mimalloc"
           - os: ubuntu-latest
             arch_flag: "avx2"
             use_mimalloc: "1"
@@ -94,9 +95,6 @@ jobs:
           if [ "${{ matrix.arch_flag }}" = "" ]; then
             make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)" \
               CXX=${{ matrix.cxx || 'g++' }} USE_MIMALLOC=${{ matrix.use_mimalloc }}
-          elif [ "${{ matrix.arch_flag }}" = "multi" ]; then
-            make -j"$(nproc)" multi \
-              CXX=${{ matrix.cxx || 'g++' }} USE_MIMALLOC=${{ matrix.use_mimalloc }}
           else
             make -j"$(nproc)" \
               arch=${{ matrix.arch_flag }} \
@@ -112,21 +110,10 @@ jobs:
         # BWA_TESTS_HAVE_KSWV in kswv_runner.h evaluates consistently
         # between libbwa.a and the test binary (notably: sse41 row has
         # no kswv::getScores8 symbol, so tests must be compiled out).
-        # For arch_flag="" (ARM/Apple Silicon), the parent build
-        # auto-selects ARM ARCH_FLAGS via IS_ARM.
-        # NOTE: arch_flag="multi" is intentionally excluded here. The
-        # `multi` target leaves libbwa.a in its final avx512bw state, so
-        # the only ARCH_FLAGS_FROM_PARENT value that keeps libbwa.a and
-        # the test TU consistent is `-mavx512f -mavx512bw`. But GitHub's
-        # ubuntu-latest runners do not all expose AVX-512 at runtime, so
-        # a test binary built with `-mavx512bw` SIGILLs on first
-        # AVX-512 instruction (compilers freely emit AVX-512 in any TU
-        # once the flag is set). The `multi` row's purpose is to
-        # validate that `make multi`'s per-arch sub-builds + dispatcher
-        # link cleanly; doctest coverage is already provided by the
-        # sse41/avx2 rows. So we skip framework + unit/integration
-        # build and execution on this row.
-        if: matrix.arch_flag != 'multi'
+        # For arch_flag="" rows (ARM, macOS, single-binary x86), the parent
+        # build auto-selects ARCH_FLAGS via IS_ARM (ARM) or leaves them empty
+        # (x86 single-binary, which compiled all tier kernels separately and
+        # uses the sse41 baseline for non-kernel TUs).
         run: |
           if [ "${{ matrix.arch_flag }}" = "" ]; then
             make test-binaries CXX=${{ matrix.cxx || 'g++' }}
@@ -135,7 +122,6 @@ jobs:
           fi
 
       - name: Run unit tests (all rows)
-        if: matrix.arch_flag != 'multi'
         env:
           BWA_MEM3_TEST_MATRIX_ROW: ${{ matrix.name }}
         # `--reporters=junit --out=…` writes JUnit XML to the file and
@@ -149,7 +135,7 @@ jobs:
             --out=unit-results-${{ strategy.job-index }}.xml
 
       - name: Upload unit-test results
-        if: always() && matrix.arch_flag != 'multi'
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           # Sanitize matrix.name (contains spaces and parens like
@@ -160,7 +146,7 @@ jobs:
           path: unit-results-*.xml
 
       - name: Run integration tests
-        if: matrix.run_integration == true && matrix.arch_flag != 'multi'
+        if: matrix.run_integration == true
         env:
           BWA_MEM3_TEST_MATRIX_ROW: ${{ matrix.name }}
         run: |
@@ -169,7 +155,7 @@ jobs:
             --out=integration-results-${{ strategy.job-index }}.xml
 
       - name: Upload integration-test results
-        if: always() && matrix.run_integration == true && matrix.arch_flag != 'multi'
+        if: always() && matrix.run_integration == true
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: integration-results-${{ matrix.artifact_slug }}

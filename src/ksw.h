@@ -27,6 +27,11 @@
 
 #include <stdint.h>
 
+/* Per-tier symbol mangling: must be included before any function declarations
+ * so that kernel TU compiles (with KERNEL_VARIANT=_avx2 etc.) see the rename
+ * macros and emit per-tier mangled names instead of the unmangled originals. */
+#include "kernel_dispatch.h"
+
 /* SIMD compatibility for ARM/x86 */
 #if defined(__ARM_NEON) || defined(__aarch64__) || defined(APPLE_SILICON)
     #include "simd_compat.h"

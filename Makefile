@@ -177,13 +177,25 @@ else
 endif
 
 LIBS=		-lpthread -lm -lz -L. -lbwa -Lext/safestringlib -lsafestring -Lext/htslib -lhts $(LIBSAIS_OPENMP_LIBS) $(STATIC_GCC) $(LIBS_EXTRA)
+# Non-kernel objects: always compiled once at the baseline ISA and linked into
+# libbwa.a on every build (arm64 and x86 alike).
 OBJS=		src/fastmap.o src/bwtindex.o src/utils.o src/memcpy_bwamem.o src/kthread.o \
-			src/kstring.o src/ksw.o src/bntseq.o src/bwamem.o src/profiling.o src/bandedSWA.o \
-			src/FMI_search.o src/read_index_ele.o src/bwamem_pair.o src/kswv.o src/bwa.o \
+			src/kstring.o src/bntseq.o src/bwamem.o src/profiling.o \
+			src/FMI_search.o src/read_index_ele.o src/bwamem_pair.o src/bwa.o \
 			src/bwamem_extra.o src/kopen.o src/bam_writer.o src/meth_bam.o \
 			src/packed_text.o src/fm_index_writer.o src/index_prelude.o \
 			src/system.o src/libsais_build.o \
-			src/bwa_shm.o
+			src/bwa_shm.o src/simd_dispatch.o
+
+# Kernel TUs (bandedSWA, kswv, ksw, sam_encode) are compiled per-tier on x86
+# and linked directly via KERNEL_TIER_OBJS_LINK. The dispatch wrappers in
+# simd_dispatch.cpp provide the unmangled entry points. On arm64 there is only
+# one tier (NEON, unmangled), so the baseline objects ARE the only copies.
+# On x86, the baseline (unsuffixed) objects provide the concrete kswv/ksw/etc.
+# class bodies needed by test binaries (e.g. kswv_nrow_zero_test) that
+# instantiate these classes directly rather than going through the dispatcher.
+KERNEL_BASELINE_OBJS = src/bandedSWA.o src/kswv.o src/ksw.o src/sam_encode.o
+OBJS += $(KERNEL_BASELINE_OBJS)
 BWA_LIB=    libbwa.a
 SAFE_STR_LIB=    ext/safestringlib/libsafestring.a
 HTS_LIB=    ext/htslib/libhts.a
@@ -235,7 +247,7 @@ else ifneq ($(arch),)
 # To provide a different architecture flag like -march=core-avx2.
 	ARCH_FLAGS=$(arch)
 else
-myall:multi
+myall:single
 endif
 endif
 
@@ -249,6 +261,33 @@ endif
 endif
 
 CXXFLAGS+=	-g -O3 -std=gnu++14 -fpermissive $(ARCH_FLAGS) $(ASAN_FLAGS) $(LIBSAIS_OPENMP_CFLAGS) $(EXTRA_CXXFLAGS) #-Wall ##-xSSE2
+
+# CXXFLAGS used for per-tier kernel TU compilation. Must NOT contain any
+# -m... ISA flag — each per-tier rule appends the right one.
+BASE_CXXFLAGS = -g -O3 -std=gnu++14 -fpermissive $(ASAN_FLAGS) $(LIBSAIS_OPENMP_CFLAGS) $(EXTRA_CXXFLAGS)
+
+# Per-tier ISA flag groups for kernel multi-tier compilation (x86_64 only).
+KERNEL_FLAGS_sse41    = -msse4.1
+KERNEL_FLAGS_sse42    = -msse4.2 -mpopcnt
+KERNEL_FLAGS_avx      = -mavx -mpopcnt
+KERNEL_FLAGS_avx2     = -mavx -mavx2 -mpopcnt
+KERNEL_FLAGS_avx512bw = -mavx -mavx2 -mavx512f -mavx512bw -mpopcnt
+
+# Source files compiled at every tier on x86_64.
+KERNEL_SRCS = src/bandedSWA.cpp src/kswv.cpp src/ksw.cpp src/sam_encode.cpp
+
+# All per-tier kernel objects. On x86_64 these are 5 tiers × 4 kernel TUs = 20 .o files.
+ifneq ($(IS_ARM),)
+    # arm64: single unsuffixed build (KERNEL_VARIANT unset). Already in $(OBJS).
+    KERNEL_TIER_OBJS =
+else
+    KERNEL_TIER_OBJS = \
+        $(patsubst src/%.cpp,src/%.sse41.o,$(KERNEL_SRCS)) \
+        $(patsubst src/%.cpp,src/%.sse42.o,$(KERNEL_SRCS)) \
+        $(patsubst src/%.cpp,src/%.avx.o,$(KERNEL_SRCS)) \
+        $(patsubst src/%.cpp,src/%.avx2.o,$(KERNEL_SRCS)) \
+        $(patsubst src/%.cpp,src/%.avx512bw.o,$(KERNEL_SRCS))
+endif
 
 # COVERAGE=1 augments CXXFLAGS/LDFLAGS with --coverage and overrides -O3 with
 # -O0 so gcov line numbers correspond 1:1 with source. Consumed by the CI
@@ -268,11 +307,27 @@ ifneq ($(strip $(DISABLE_BATCHED_MATESW)),)
     CPPFLAGS += -DDISABLE_BATCHED_MATESW=$(DISABLE_BATCHED_MATESW)
 endif
 
-.PHONY:all clean depend multi print-mimalloc-config kswv_nrow_zero_test shm_section_find_test shm_pack_round_trip_test shm_lock_destroy_test test FORCE pgo-generate pgo-use pgo-clean profile-build profile-clean lto-build lto-clean docs docs-serve docs-cli docs-clean docs-install-tools
+.PHONY:all myall arm64 clean depend single all-single print-mimalloc-config kswv_nrow_zero_test shm_section_find_test shm_pack_round_trip_test shm_lock_destroy_test test FORCE pgo-generate pgo-use pgo-clean profile-build profile-clean lto-build lto-clean docs docs-serve docs-cli docs-clean docs-install-tools
 .SUFFIXES:.cpp .o
 
 .cpp.o:
 	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $< -o $@
+
+# Per-tier kernel compile rules. Active only on x86_64 multi-tier builds.
+src/%.sse41.o: src/%.cpp
+	$(CXX) -c $(BASE_CXXFLAGS) $(KERNEL_FLAGS_sse41) $(CPPFLAGS) -DKERNEL_VARIANT=_sse41 $(INCLUDES) $< -o $@
+
+src/%.sse42.o: src/%.cpp
+	$(CXX) -c $(BASE_CXXFLAGS) $(KERNEL_FLAGS_sse42) $(CPPFLAGS) -DKERNEL_VARIANT=_sse42 $(INCLUDES) $< -o $@
+
+src/%.avx.o: src/%.cpp
+	$(CXX) -c $(BASE_CXXFLAGS) $(KERNEL_FLAGS_avx) $(CPPFLAGS) -DKERNEL_VARIANT=_avx $(INCLUDES) $< -o $@
+
+src/%.avx2.o: src/%.cpp
+	$(CXX) -c $(BASE_CXXFLAGS) $(KERNEL_FLAGS_avx2) $(CPPFLAGS) -DKERNEL_VARIANT=_avx2 $(INCLUDES) $< -o $@
+
+src/%.avx512bw.o: src/%.cpp
+	$(CXX) -c $(BASE_CXXFLAGS) $(KERNEL_FLAGS_avx512bw) $(CPPFLAGS) -DKERNEL_VARIANT=_avx512bw $(INCLUDES) $< -o $@
 
 all:$(EXE)
 
@@ -288,23 +343,23 @@ src/version.h: FORCE
 
 src/main.o: src/version.h
 
-multi: $(if $(filter 1,$(USE_MIMALLOC)),$(MIMALLOC_LIB))
+# Single-binary multi-tier build. All kernel TUs are compiled at every
+# tier; the dispatcher picks the right per-tier subclass at runtime.
+# Replaces the `multi` target's 5 sequential clean rebuilds + execv launcher.
+.PHONY: single
+single: $(if $(filter 1,$(USE_MIMALLOC)),$(MIMALLOC_LIB))
 ifneq ($(IS_ARM),)
-	@echo "ARM64 detected - building single arm64 binary instead of multi"
+	@echo "ARM64 detected - building single arm64 binary instead of multi-tier"
 	$(MAKE) arm64
 else
-	rm -f src/*.o $(BWA_LIB); cd ext/safestringlib/ && $(MAKE) clean;
-	$(MAKE) arch=sse41    EXE=bwa-mem3.sse41    CXX="$(CXX)" all
-	rm -f src/*.o $(BWA_LIB); cd ext/safestringlib/ && $(MAKE) clean;
-	$(MAKE) arch=sse42    EXE=bwa-mem3.sse42    CXX="$(CXX)" all
-	rm -f src/*.o $(BWA_LIB); cd ext/safestringlib/ && $(MAKE) clean;
-	$(MAKE) arch=avx    EXE=bwa-mem3.avx    CXX="$(CXX)" all
-	rm -f src/*.o $(BWA_LIB); cd ext/safestringlib/ && $(MAKE) clean;
-	$(MAKE) arch=avx2   EXE=bwa-mem3.avx2     CXX="$(CXX)" all
-	rm -f src/*.o $(BWA_LIB); cd ext/safestringlib/ && $(MAKE) clean;
-	$(MAKE) arch=avx512bw EXE=bwa-mem3.avx512bw CXX="$(CXX)" all
-	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) -Wall -O3 src/runsimd.cpp -Iext/safestringlib/include -Lext/safestringlib/ -lsafestring $(STATIC_GCC) -o bwa-mem3
+	$(MAKE) arch=sse41 EXE=bwa-mem3 CXX="$(CXX)" KERNEL_TIER_OBJS_LINK="$(KERNEL_TIER_OBJS)" all-single
 endif
+
+# Internal: builds the single binary with arch=sse41 baseline for non-kernel
+# TUs and links all KERNEL_TIER_OBJS_LINK on top.
+.PHONY: all-single
+all-single: $(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) $(KERNEL_TIER_OBJS_LINK) src/main.o
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) src/main.o $(KERNEL_TIER_OBJS_LINK) $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) $(MIMALLOC_LDFLAGS) -o $(EXE)
 
 # ARM64/Apple Silicon build target - single binary, no multi-binary launcher needed
 arm64:
@@ -321,8 +376,18 @@ $(EXE):$(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) $(if $(filter 1,$(U
 # the post-loop `if (i > 0)` guard, the rowMax store writes SIMD_WIDTH* bytes
 # before the allocation and aborts at a later allocator operation; under
 # asan the write is reported directly.
-kswv_nrow_zero_test: $(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) test/kswv_nrow_zero_test.o
-	$(CXX) $(CXXFLAGS) $(LDFLAGS) test/kswv_nrow_zero_test.o $(BWA_LIB) $(LIBS) -o $@
+#
+# On x86 multi-tier builds, libbwa.a's baseline kswv.o is compiled at
+# -msse4.1 (the single-binary SSE floor), which hits the SSE-only stub that
+# calls exit(). To exercise the real SIMD kernel, compile a native-tier copy
+# of kswv.cpp (src/kswv.native.o) and link it ahead of libbwa.a so the linker
+# picks the native-ISA concrete kswv class.  On arm64 -march=native resolves
+# to the NEON path already covered by the baseline objects.
+src/kswv.native.o: src/kswv.cpp
+	$(CXX) -c $(BASE_CXXFLAGS) -march=native $(CPPFLAGS) $(INCLUDES) $< -o $@
+
+kswv_nrow_zero_test: $(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) src/kswv.native.o test/kswv_nrow_zero_test.o
+	$(CXX) $(BASE_CXXFLAGS) -march=native $(LDFLAGS) test/kswv_nrow_zero_test.o src/kswv.native.o $(BWA_LIB) $(LIBS) -o $@
 
 # Build the test binaries with the same ARCH_FLAGS as libbwa.a so the
 # test binary's kswv.h preprocessor state (SIMD_WIDTH8, BWA_TESTS_HAVE_KSWV)
@@ -365,7 +430,7 @@ test: test-binaries kswv_nrow_zero_test shm_section_find_test shm_lock_destroy_t
 	./shm_lock_destroy_test
 
 test/kswv_nrow_zero_test.o: test/kswv_nrow_zero_test.cpp
-	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $< -o $@
+	$(CXX) -c $(BASE_CXXFLAGS) -march=native $(CPPFLAGS) $(INCLUDES) $< -o $@
 
 test/shm_section_find_test.o: test/shm_section_find_test.cpp
 	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $< -o $@
@@ -373,8 +438,16 @@ test/shm_section_find_test.o: test/shm_section_find_test.cpp
 test/shm_lock_destroy_test.o: test/shm_lock_destroy_test.cpp
 	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $< -o $@
 
-$(BWA_LIB):$(OBJS)
-	ar rcs $(BWA_LIB) $(OBJS)
+# Archive both the baseline (unmangled) kernel objects from $(OBJS) and the
+# per-tier (mangled) objects from $(KERNEL_TIER_OBJS) into libbwa.a. The
+# duplication with $(KERNEL_TIER_OBJS_LINK) on the all-single recipe is
+# intentional: legacy single-arch builds (`make arch=avx2`, `make arch=sse41`,
+# etc.) link only libbwa.a on the binary line and rely on libbwa.a to satisfy
+# simd_dispatch.o's references to make_kswv_kernel_<tier>, ksw_*_<tier>, and
+# sam_encode_*_<tier>. Dropping per-tier objects from libbwa.a breaks those
+# matrix rows. On arm64 $(KERNEL_TIER_OBJS) is empty.
+$(BWA_LIB):$(OBJS) $(KERNEL_TIER_OBJS)
+	ar rcs $(BWA_LIB) $(OBJS) $(KERNEL_TIER_OBJS)
 
 # safestringlib's safeclib_private.h calls abort() / memcpy() via macros
 # without including <stdlib.h> / <string.h> in the TU, which fails the
@@ -437,7 +510,7 @@ $(MIMALLOC_LIB):
 	cd $(MIMALLOC_BUILD) && cmake $(MIMALLOC_CMAKE_FLAGS) .. && $(MAKE)
 
 clean: pgo-clean profile-clean lto-clean
-	rm -fr src/*.o src/version.h test/*.o $(BWA_LIB) $(EXE) kswv_nrow_zero_test shm_section_find_test shm_pack_round_trip_test shm_lock_destroy_test bwa-mem3.sse41 bwa-mem3.sse42 bwa-mem3.avx bwa-mem3.avx2 bwa-mem3.avx512bw bwa-mem3.arm64
+	rm -fr src/*.o src/version.h test/*.o $(BWA_LIB) $(EXE) kswv_nrow_zero_test shm_section_find_test shm_pack_round_trip_test shm_lock_destroy_test bwa-mem3.arm64
 	rm -f $(LIBSAIS_OBJS)
 	rm -f src/*.gcno src/*.gcda
 	$(MAKE) -C test clean

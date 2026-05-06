@@ -1,0 +1,367 @@
+// src/simd_dispatch.cpp
+#include "simd_dispatch.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <mutex>
+
+static int g_tier = BWAMEM3_TIER_NONE;
+static std::once_flag g_init_flag;
+
+#if defined(__x86_64__) || defined(__i386__)
+static int detect_x86_tier(void)
+{
+    __builtin_cpu_init();
+    if (__builtin_cpu_supports("avx512bw")) return BWAMEM3_TIER_AVX512BW;
+    if (__builtin_cpu_supports("avx2"))     return BWAMEM3_TIER_AVX2;
+    if (__builtin_cpu_supports("avx"))      return BWAMEM3_TIER_AVX;
+    if (__builtin_cpu_supports("sse4.2"))   return BWAMEM3_TIER_SSE42;
+    if (__builtin_cpu_supports("sse4.1"))   return BWAMEM3_TIER_SSE41;
+    return BWAMEM3_TIER_NONE;
+}
+#endif
+
+const char *bwamem3_simd_tier_name(int tier)
+{
+    switch (tier) {
+        case BWAMEM3_TIER_AVX512BW: return "avx512bw";
+        case BWAMEM3_TIER_AVX2:     return "avx2";
+        case BWAMEM3_TIER_AVX:      return "avx";
+        case BWAMEM3_TIER_SSE42:    return "sse42";
+        case BWAMEM3_TIER_SSE41:    return "sse41";
+        case BWAMEM3_TIER_NEON:     return "neon";
+        case BWAMEM3_TIER_NONE:     return "scalar";
+        default:                    return "unknown";
+    }
+}
+
+int bwamem3_simd_tier(void) { return g_tier; }
+
+/* Internal: parse the same strings bwamem3_simd_tier_name returns. */
+static int parse_tier_name(const char *name)
+{
+    if (name == NULL || name[0] == '\0') return -1;
+    if (!strcmp(name, "avx512bw")) return BWAMEM3_TIER_AVX512BW;
+    if (!strcmp(name, "avx2"))     return BWAMEM3_TIER_AVX2;
+    if (!strcmp(name, "avx"))      return BWAMEM3_TIER_AVX;
+    if (!strcmp(name, "sse42"))    return BWAMEM3_TIER_SSE42;
+    if (!strcmp(name, "sse4.2"))   return BWAMEM3_TIER_SSE42;
+    if (!strcmp(name, "sse41"))    return BWAMEM3_TIER_SSE41;
+    if (!strcmp(name, "sse4.1"))   return BWAMEM3_TIER_SSE41;
+    if (!strcmp(name, "neon"))     return BWAMEM3_TIER_NEON;
+    if (!strcmp(name, "scalar"))   return BWAMEM3_TIER_NONE;
+    return -1;
+}
+
+/* The body of bwamem3_simd_init. Called at most once via std::call_once. */
+static void bwamem3_simd_init_body(void)
+{
+#if defined(__x86_64__) || defined(__i386__)
+    g_tier = detect_x86_tier();
+#elif defined(__aarch64__) || defined(__ARM_NEON)
+    /* aarch64 baseline ABI guarantees NEON. */
+    g_tier = BWAMEM3_TIER_NEON;
+#else
+    g_tier = BWAMEM3_TIER_NONE;
+#endif
+
+    /* Optional override: BWAMEM3_FORCE_TIER=<name> downgrades only.
+     * Up-tier requests would SIGILL on the first wider instruction. */
+    const char *force = getenv("BWAMEM3_FORCE_TIER");
+    if (force != NULL && force[0] != '\0') {
+        int forced = parse_tier_name(force);
+        if (forced < 0) {
+            fprintf(stderr, "[W::%s] ignoring BWAMEM3_FORCE_TIER=%s (unknown tier)\n",
+                    __func__, force);
+        } else {
+#if defined(__x86_64__) || defined(__i386__)
+            /* Only x86 tiers are ordered; reject NEON forcing on x86. */
+            if (forced == BWAMEM3_TIER_NEON) {
+                fprintf(stderr, "[W::%s] ignoring BWAMEM3_FORCE_TIER=neon on x86\n", __func__);
+            } else if (forced > g_tier) {
+                fprintf(stderr, "[W::%s] ignoring BWAMEM3_FORCE_TIER=%s (host is %s; cannot up-tier)\n",
+                        __func__, force, bwamem3_simd_tier_name(g_tier));
+            } else {
+                g_tier = forced;
+            }
+#else
+            /* arm64 and scalar: allow only the matching tier or scalar. */
+            if (forced != g_tier && forced != BWAMEM3_TIER_NONE) {
+                fprintf(stderr, "[W::%s] ignoring BWAMEM3_FORCE_TIER=%s on this arch\n",
+                        __func__, force);
+            } else {
+                g_tier = forced;
+            }
+#endif
+        }
+    }
+
+    if (getenv("BWAMEM3_DEBUG_SIMD")) {
+        fprintf(stderr, "[M::%s] SIMD tier: %s\n", __func__, bwamem3_simd_tier_name(g_tier));
+    }
+}
+
+void bwamem3_simd_init(void)
+{
+    /* std::call_once: thread-safe, exactly-once execution of the init body.
+     * Any number of concurrent callers will block until the running one
+     * finishes, then return; subsequent calls are a single relaxed load. */
+    std::call_once(g_init_flag, bwamem3_simd_init_body);
+}
+
+/* ── Per-tier kernel factory dispatch ──────────────────────────────────
+ *
+ * Each per-tier kernel TU compile produces a distinct concrete class
+ * (BandedPairWiseSW_avx2 etc.). The factories below construct the right
+ * one based on g_tier and return ownership via unique_ptr<IBandedPairWiseSW>
+ * / unique_ptr<Ikswv>. On arm64 there's only one tier (NEON, unsuffixed)
+ * so the factories construct the unmangled class directly.
+ */
+
+#include "bandedSWA.h"
+#include "kswv.h"
+#include "ksw.h"
+#include "sam_encode.h"
+
+#if defined(__x86_64__) || defined(__i386__)
+
+std::unique_ptr<IBandedPairWiseSW> make_banded_pair_wise_sw(
+    int o_del, int e_del, int o_ins, int e_ins, int zdrop,
+    int end_bonus, const int8_t *mat,
+    int8_t w_match, int8_t w_mismatch, int numThreads)
+{
+    bwamem3_simd_init();
+    IBandedPairWiseSW *raw;
+    switch (g_tier) {
+      case BWAMEM3_TIER_AVX512BW:
+        raw = make_bsw_kernel_avx512bw(o_del, e_del, o_ins, e_ins, zdrop, end_bonus,
+                                       mat, w_match, w_mismatch, numThreads); break;
+      case BWAMEM3_TIER_AVX2:
+        raw = make_bsw_kernel_avx2(o_del, e_del, o_ins, e_ins, zdrop, end_bonus,
+                                   mat, w_match, w_mismatch, numThreads); break;
+      case BWAMEM3_TIER_AVX:
+        raw = make_bsw_kernel_avx(o_del, e_del, o_ins, e_ins, zdrop, end_bonus,
+                                  mat, w_match, w_mismatch, numThreads); break;
+      case BWAMEM3_TIER_SSE42:
+        raw = make_bsw_kernel_sse42(o_del, e_del, o_ins, e_ins, zdrop, end_bonus,
+                                    mat, w_match, w_mismatch, numThreads); break;
+      case BWAMEM3_TIER_SSE41:
+      default:
+        raw = make_bsw_kernel_sse41(o_del, e_del, o_ins, e_ins, zdrop, end_bonus,
+                                    mat, w_match, w_mismatch, numThreads); break;
+    }
+    return std::unique_ptr<IBandedPairWiseSW>(raw);
+}
+
+std::unique_ptr<Ikswv> make_kswv(
+    int o_del, int e_del, int o_ins, int e_ins,
+    int8_t w_match, int8_t w_mismatch,
+    int numThreads, int32_t maxRefLen, int32_t maxQerLen)
+{
+    bwamem3_simd_init();
+    Ikswv *raw;
+    switch (g_tier) {
+      case BWAMEM3_TIER_AVX512BW:
+        raw = make_kswv_kernel_avx512bw(o_del, e_del, o_ins, e_ins, w_match, w_mismatch,
+                                        numThreads, maxRefLen, maxQerLen); break;
+      case BWAMEM3_TIER_AVX2:
+        raw = make_kswv_kernel_avx2(o_del, e_del, o_ins, e_ins, w_match, w_mismatch,
+                                    numThreads, maxRefLen, maxQerLen); break;
+      case BWAMEM3_TIER_AVX:
+        raw = make_kswv_kernel_avx(o_del, e_del, o_ins, e_ins, w_match, w_mismatch,
+                                   numThreads, maxRefLen, maxQerLen); break;
+      case BWAMEM3_TIER_SSE42:
+        raw = make_kswv_kernel_sse42(o_del, e_del, o_ins, e_ins, w_match, w_mismatch,
+                                     numThreads, maxRefLen, maxQerLen); break;
+      case BWAMEM3_TIER_SSE41:
+      default:
+        raw = make_kswv_kernel_sse41(o_del, e_del, o_ins, e_ins, w_match, w_mismatch,
+                                     numThreads, maxRefLen, maxQerLen); break;
+    }
+    return std::unique_ptr<Ikswv>(raw);
+}
+
+#else  /* arm64 / scalar fallback */
+
+std::unique_ptr<IBandedPairWiseSW> make_banded_pair_wise_sw(
+    int o_del, int e_del, int o_ins, int e_ins, int zdrop,
+    int end_bonus, const int8_t *mat,
+    int8_t w_match, int8_t w_mismatch, int numThreads)
+{
+    return std::unique_ptr<IBandedPairWiseSW>(
+        new BandedPairWiseSW(o_del, e_del, o_ins, e_ins, zdrop, end_bonus,
+                             mat, w_match, w_mismatch, numThreads));
+}
+
+std::unique_ptr<Ikswv> make_kswv(
+    int o_del, int e_del, int o_ins, int e_ins,
+    int8_t w_match, int8_t w_mismatch,
+    int numThreads, int32_t maxRefLen, int32_t maxQerLen)
+{
+    return std::unique_ptr<Ikswv>(
+        new kswv(o_del, e_del, o_ins, e_ins, w_match, w_mismatch,
+                 numThreads, maxRefLen, maxQerLen));
+}
+
+#endif  /* x86 vs arm64 factory dispatch */
+
+/* ── ksw C-linkage dispatch wrappers ────────────────────────────────────
+ *
+ * ksw.cpp's free functions are SIMD-bearing and get per-tier mangled by
+ * kernel_dispatch.h. Non-kernel TUs (bwa.cpp, bwamem.cpp, bwamem_pair.cpp)
+ * call the unmangled names, so we provide thin wrappers here that pick
+ * the right mangled symbol at runtime via a switch on g_tier.
+ *
+ * On arm64 the unmangled symbol IS the only build, so the wrappers just
+ * call through directly.
+ */
+
+#if defined(__x86_64__) || defined(__i386__)
+
+/* Forward-declare the per-tier mangled symbols. Each kernel TU compile
+ * with KERNEL_VARIANT=_avx2 etc. will define exactly one of each set. */
+
+#define BWAMEM3_DECLARE_KSW_TIER(suffix)                                              \
+extern "C" int ksw_extend2##suffix(int qlen, const uint8_t *query, int tlen,          \
+    const uint8_t *target, int m, const int8_t *mat, int o_del, int e_del,            \
+    int o_ins, int e_ins, int w, int end_bonus, int zdrop, int h0,                    \
+    int *qle, int *tle, int *gtle, int *gscore, int *max_off);                        \
+extern "C" int ksw_extend##suffix(int qlen, const uint8_t *query, int tlen,           \
+    const uint8_t *target, int m, const int8_t *mat, int gapo, int gape,              \
+    int w, int end_bonus, int zdrop, int h0, int *qle, int *tle,                      \
+    int *gtle, int *gscore, int *max_off);                                            \
+extern "C" int ksw_global2##suffix(int qlen, const uint8_t *query, int tlen,          \
+    const uint8_t *target, int m, const int8_t *mat, int o_del, int e_del,            \
+    int o_ins, int e_ins, int w, int *n_cigar, uint32_t **cigar);                     \
+extern "C" int ksw_global##suffix(int qlen, const uint8_t *query, int tlen,           \
+    const uint8_t *target, int m, const int8_t *mat, int gapo, int gape,              \
+    int w, int *n_cigar, uint32_t **cigar);                                           \
+extern "C" kswr_t ksw_align2##suffix(int qlen, uint8_t *query, int tlen,              \
+    uint8_t *target, int m, const int8_t *mat, int o_del, int e_del,                  \
+    int o_ins, int e_ins, int xtra, kswq_t **qry);                                    \
+extern "C" kswr_t ksw_align##suffix(int qlen, uint8_t *query, int tlen,               \
+    uint8_t *target, int m, const int8_t *mat, int gapo, int gape, int xtra,          \
+    kswq_t **qry);
+
+BWAMEM3_DECLARE_KSW_TIER(_sse41)
+BWAMEM3_DECLARE_KSW_TIER(_sse42)
+BWAMEM3_DECLARE_KSW_TIER(_avx)
+BWAMEM3_DECLARE_KSW_TIER(_avx2)
+BWAMEM3_DECLARE_KSW_TIER(_avx512bw)
+#undef BWAMEM3_DECLARE_KSW_TIER
+
+/* Helper macro to pick a tier-specific symbol based on g_tier. */
+#define KSW_DISPATCH_CALL(name, ...) \
+    do { \
+        switch (g_tier) { \
+          case BWAMEM3_TIER_AVX512BW: return name##_avx512bw(__VA_ARGS__); \
+          case BWAMEM3_TIER_AVX2:     return name##_avx2(__VA_ARGS__); \
+          case BWAMEM3_TIER_AVX:      return name##_avx(__VA_ARGS__); \
+          case BWAMEM3_TIER_SSE42:    return name##_sse42(__VA_ARGS__); \
+          default:                    return name##_sse41(__VA_ARGS__); \
+        } \
+    } while(0)
+
+extern "C" int ksw_extend2(int qlen, const uint8_t *query, int tlen,
+    const uint8_t *target, int m, const int8_t *mat, int o_del, int e_del,
+    int o_ins, int e_ins, int w, int end_bonus, int zdrop, int h0,
+    int *qle, int *tle, int *gtle, int *gscore, int *max_off) {
+    bwamem3_simd_init();
+    KSW_DISPATCH_CALL(ksw_extend2, qlen, query, tlen, target, m, mat, o_del, e_del,
+                      o_ins, e_ins, w, end_bonus, zdrop, h0, qle, tle, gtle, gscore, max_off);
+}
+
+extern "C" int ksw_extend(int qlen, const uint8_t *query, int tlen,
+    const uint8_t *target, int m, const int8_t *mat, int gapo, int gape,
+    int w, int end_bonus, int zdrop, int h0, int *qle, int *tle,
+    int *gtle, int *gscore, int *max_off) {
+    bwamem3_simd_init();
+    KSW_DISPATCH_CALL(ksw_extend, qlen, query, tlen, target, m, mat, gapo, gape, w,
+                      end_bonus, zdrop, h0, qle, tle, gtle, gscore, max_off);
+}
+
+extern "C" int ksw_global2(int qlen, const uint8_t *query, int tlen,
+    const uint8_t *target, int m, const int8_t *mat, int o_del, int e_del,
+    int o_ins, int e_ins, int w, int *n_cigar, uint32_t **cigar) {
+    bwamem3_simd_init();
+    KSW_DISPATCH_CALL(ksw_global2, qlen, query, tlen, target, m, mat, o_del, e_del,
+                      o_ins, e_ins, w, n_cigar, cigar);
+}
+
+extern "C" int ksw_global(int qlen, const uint8_t *query, int tlen,
+    const uint8_t *target, int m, const int8_t *mat, int gapo, int gape,
+    int w, int *n_cigar, uint32_t **cigar) {
+    bwamem3_simd_init();
+    KSW_DISPATCH_CALL(ksw_global, qlen, query, tlen, target, m, mat, gapo, gape, w,
+                      n_cigar, cigar);
+}
+
+extern "C" kswr_t ksw_align2(int qlen, uint8_t *query, int tlen,
+    uint8_t *target, int m, const int8_t *mat, int o_del, int e_del,
+    int o_ins, int e_ins, int xtra, kswq_t **qry) {
+    bwamem3_simd_init();
+    KSW_DISPATCH_CALL(ksw_align2, qlen, query, tlen, target, m, mat, o_del, e_del,
+                      o_ins, e_ins, xtra, qry);
+}
+
+extern "C" kswr_t ksw_align(int qlen, uint8_t *query, int tlen,
+    uint8_t *target, int m, const int8_t *mat, int gapo, int gape, int xtra,
+    kswq_t **qry) {
+    bwamem3_simd_init();
+    KSW_DISPATCH_CALL(ksw_align, qlen, query, tlen, target, m, mat, gapo, gape, xtra, qry);
+}
+
+#endif  /* x86 ksw dispatch wrappers */
+
+/* ── sam_encode C-linkage dispatch wrappers ─────────────────────────────────
+ *
+ * sam_encode.cpp's three functions are compiled per-tier on x86 so the
+ * compiler can emit VEX/EVEX-encoded SIMD where available. Non-kernel TUs
+ * (bwamem.cpp) call the unmangled names; these wrappers resolve those calls
+ * to the right tier-mangled body at runtime.
+ *
+ * On arm64 there is only one build (unmangled NEON/scalar), so the wrappers
+ * are not needed — bwamem.cpp resolves directly to the body in sam_encode.o.
+ */
+
+#if defined(__x86_64__) || defined(__i386__)
+
+#define BWAMEM3_DECLARE_SAM_ENCODE_TIER(suffix)                                        \
+extern "C" void sam_encode_seq_fwd##suffix(char *dst, const uint8_t *src, int n);      \
+extern "C" void sam_encode_seq_rev##suffix(char *dst, const uint8_t *src, int n);      \
+extern "C" void sam_encode_qual_rev##suffix(char *dst, const char *src, int n);
+
+BWAMEM3_DECLARE_SAM_ENCODE_TIER(_sse41)
+BWAMEM3_DECLARE_SAM_ENCODE_TIER(_sse42)
+BWAMEM3_DECLARE_SAM_ENCODE_TIER(_avx)
+BWAMEM3_DECLARE_SAM_ENCODE_TIER(_avx2)
+BWAMEM3_DECLARE_SAM_ENCODE_TIER(_avx512bw)
+#undef BWAMEM3_DECLARE_SAM_ENCODE_TIER
+
+#define SAM_ENCODE_DISPATCH_VOID(name, ...) \
+    do { \
+        switch (g_tier) { \
+          case BWAMEM3_TIER_AVX512BW: name##_avx512bw(__VA_ARGS__); return; \
+          case BWAMEM3_TIER_AVX2:     name##_avx2(__VA_ARGS__);     return; \
+          case BWAMEM3_TIER_AVX:      name##_avx(__VA_ARGS__);      return; \
+          case BWAMEM3_TIER_SSE42:    name##_sse42(__VA_ARGS__);    return; \
+          default:                    name##_sse41(__VA_ARGS__);    return; \
+        } \
+    } while(0)
+
+extern "C" void sam_encode_seq_fwd(char *dst, const uint8_t *src, int n) {
+    bwamem3_simd_init();
+    SAM_ENCODE_DISPATCH_VOID(sam_encode_seq_fwd, dst, src, n);
+}
+
+extern "C" void sam_encode_seq_rev(char *dst, const uint8_t *src, int n) {
+    bwamem3_simd_init();
+    SAM_ENCODE_DISPATCH_VOID(sam_encode_seq_rev, dst, src, n);
+}
+
+extern "C" void sam_encode_qual_rev(char *dst, const char *src, int n) {
+    bwamem3_simd_init();
+    SAM_ENCODE_DISPATCH_VOID(sam_encode_qual_rev, dst, src, n);
+}
+
+#endif  /* x86 sam_encode dispatch wrappers */

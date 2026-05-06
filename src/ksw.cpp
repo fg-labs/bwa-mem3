@@ -31,6 +31,12 @@
 #include <stdint.h>
 #include <assert.h>
 
+/* Per-tier symbol mangling: must come before ksw.h (which re-includes it,
+ * but the include guard makes the second inclusion a no-op) and before any
+ * function definitions so that kernel TU compiles (KERNEL_VARIANT=_avx2 etc.)
+ * rename every ksw_* definition to its tier-mangled equivalent. */
+#include "kernel_dispatch.h"
+
 /* SIMD compatibility for ARM/x86 */
 #if defined(__ARM_NEON) || defined(__aarch64__) || defined(APPLE_SILICON)
     #include "simd_compat.h"
@@ -60,7 +66,7 @@ extern uint64_t tprof[LIM_R][LIM_C];
  *
  * @return       Query data structure
  */
-kswq_t *ksw_qinit(int size, int qlen, const uint8_t *query, int m, const int8_t *mat)
+static kswq_t *ksw_qinit(int size, int qlen, const uint8_t *query, int m, const int8_t *mat)
 {
 	kswq_t *q;
 	int slen, a, tmp, p;
@@ -109,7 +115,7 @@ kswq_t *ksw_qinit(int size, int qlen, const uint8_t *query, int m, const int8_t 
 	return q;
 }
 
-kswr_t ksw_u8(kswq_t *q, int tlen, const uint8_t *target,
+static kswr_t ksw_u8(kswq_t *q, int tlen, const uint8_t *target,
 			  int _o_del, int _e_del, int _o_ins, int _e_ins,
 			  int xtra) // the first gap costs -(_o+_e)
 {
@@ -232,7 +238,7 @@ end_loop16:
 	return r;
 }
 
-kswr_t ksw_i16(kswq_t *q, int tlen, const uint8_t *target, int _o_del, int _e_del, int _o_ins, int _e_ins, int xtra) // the first gap costs -(_o+_e)
+static kswr_t ksw_i16(kswq_t *q, int tlen, const uint8_t *target, int _o_del, int _e_del, int _o_ins, int _e_ins, int xtra) // the first gap costs -(_o+_e)
 {
 	int slen, i, m_b, n_b, te = -1, gmax = 0, minsc, endsc;
 	uint64_t *b;
@@ -378,42 +384,6 @@ kswr_t ksw_align2(int qlen, uint8_t *query, int tlen, uint8_t *target,
 	if (r.score == rr.score) {
 		r.tb = r.te - rr.te, r.qb = r.qe - rr.qe;
 	}
-	return r;
-}
-
-kswr_t ksw_align2_orig_bak(int qlen, uint8_t *query, int tlen, uint8_t *target,
-						   int m, const int8_t *mat, int o_del, int e_del,
-						   int o_ins, int e_ins, int xtra, kswq_t **qry)
-{
-	// int tid = omp_get_thread_num();
-	int size;
-	kswq_t *q;
-	kswr_t r, rr;
-	kswr_t (*func)(kswq_t*, int, const uint8_t*, int, int, int, int, int);
-
-	q = (qry && *qry)? *qry : ksw_qinit((xtra & KSW_XBYTE)? 1 : 2, qlen, query, m, mat);
-	
-	if (qry && *qry == 0) *qry = q;
-	func = q->size == 2? ksw_i16 : ksw_u8;
-	size = q->size;
-	// uint64_t tim = __rdtsc();
-	r = func(q, tlen, target, o_del, e_del, o_ins, e_ins, xtra);
-	// tprof[ALIGN1][tid] += __rdtsc() - tim;
-
-	if (qry == 0) free(q);
-	if ((xtra & KSW_XSTART) == 0 || ((xtra & KSW_XSUBO) && r.score < (xtra & 0xffff))) return r;
-	revseq(r.qe + 1, query); revseq(r.te + 1, target); // +1 because qe/te points to the exact end, not the position after the end
-	
-	q = ksw_qinit(size, r.qe + 1, query, m, mat);
-	// tim = __rdtsc();
-	rr = func(q, tlen, target, o_del, e_del, o_ins, e_ins, KSW_XSTOP | r.score);
-	// tprof[ALIGN1][tid] += __rdtsc() - tim;
-	
-	revseq(r.qe + 1, query); revseq(r.te + 1, target);
-	free(q);
-
-	if (r.score == rr.score)
-		r.tb = r.te - rr.te, r.qb = r.qe - rr.qe;
 	return r;
 }
 

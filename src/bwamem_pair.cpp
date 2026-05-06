@@ -722,7 +722,8 @@ int mem_sam_pe_batch(const mem_opt_t *opt, mem_cache *mmc,
     }
 
     int nthreads = 1; // no multi-threading here
-    kswv *pwsw = new kswv(opt->o_del, opt->e_del, opt->o_ins, opt->e_ins, opt->a, -1*opt->b, nthreads,
+    auto pwsw = make_kswv(opt->o_del, opt->e_del, opt->o_ins, opt->e_ins,
+                          opt->a, -1*opt->b, nthreads,
                           maxRefLen, maxQerLen);
 
     // Shift 16-bit 
@@ -786,8 +787,7 @@ int mem_sam_pe_batch(const mem_opt_t *opt, mem_cache *mmc,
     exit(EXIT_FAILURE);
 #endif
     
-    delete(pwsw);
-#endif  
+#endif
 
     return 1;
 }
