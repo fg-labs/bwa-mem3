@@ -30,6 +30,7 @@ Contacts: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@
 
 // ----------------------------------
 #include "main.h"
+#include "simd_dispatch.h"
 #include "version.h"
 #include "bwa_shm.h"
 
@@ -72,8 +73,9 @@ static void append_pg_cl_arg(kstring_t *pg, const char *arg)
 
 int main(int argc, char* argv[])
 {
-        
-    // ---------------------------------    
+    bwamem3_simd_init();
+
+    // ---------------------------------
     uint64_t tim = __rdtsc();
     sleep(1);
     proc_freq = __rdtsc() - tim;
@@ -137,17 +139,13 @@ int main(int argc, char* argv[])
         extern char *bwa_pg;
 
         fprintf(stderr, "-----------------------------\n");
-#if __AVX512BW__
-        fprintf(stderr, "Executing in AVX512 mode!!\n");
-#elif __AVX2__
-        fprintf(stderr, "Executing in AVX2 mode!!\n");
-#elif __AVX__
-        fprintf(stderr, "Executing in AVX mode!!\n");        
-#elif __SSE4_2__
-        fprintf(stderr, "Executing in SSE4.2 mode!!\n");
-#elif __SSE4_1__
-        fprintf(stderr, "Executing in SSE4.1 mode!!\n");        
-#endif
+        // Print the runtime-dispatched kernel tier rather than the compile-time
+        // baseline. Non-kernel TUs (including this one) build at sse41 baseline
+        // in the single-binary build, so a __AVX2__/__AVX512BW__ banner here
+        // would mislead AVX2/AVX-512 hosts into thinking they're running the
+        // SSE4.1 kernels.
+        fprintf(stderr, "Executing in %s mode!!\n",
+                bwamem3_simd_tier_name(bwamem3_simd_tier()));
         fprintf(stderr, "-----------------------------\n");
 
         #if SA_COMPRESSION

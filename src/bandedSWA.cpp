@@ -27,6 +27,7 @@
 Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@intel.com>;
 *****************************************************************************************/
 
+#include "kernel_dispatch.h"
 #include "bandedSWA.h"
 #ifdef VTUNE_ANALYSIS
 #include <ittnotify.h> 
@@ -5211,3 +5212,20 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
 }
 
 #endif
+
+/* Per-tier factory function. Compiled into each KERNEL_VARIANT build of
+ * this TU; the symbol is mangled by kernel_dispatch.h to
+ * make_bsw_kernel_<tier>. On arm64 (no KERNEL_VARIANT) this is the
+ * unmangled make_bsw_kernel.
+ *
+ * Returns IBandedPairWiseSW* (not unique_ptr) because extern "C" disallows
+ * non-POD return types. The dispatcher in simd_dispatch.cpp wraps it into
+ * unique_ptr at the call site. */
+extern "C" IBandedPairWiseSW *make_bsw_kernel(
+    int o_del, int e_del, int o_ins, int e_ins, int zdrop,
+    int end_bonus, const int8_t *mat,
+    int8_t w_match, int8_t w_mismatch, int numThreads)
+{
+    return new BandedPairWiseSW(o_del, e_del, o_ins, e_ins, zdrop, end_bonus,
+                                mat, w_match, w_mismatch, numThreads);
+}

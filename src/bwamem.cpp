@@ -35,140 +35,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "meth_bam.h"
 #include <inttypes.h>      /* PRId64 for int64_t fprintf format strings */
 
-/* ─── SIMD-accelerated SEQ/QUAL encoders for SAM record building ──────────
- * Replaces the per-byte `dst[i] = "ACGTN"[src[i]]` loop in mem_aln2sam.
- * Works on 16 bytes at a time via a byte-LUT shuffle. Three implementations
- * compiled in: NEON (vqtbl1q_u8) on aarch64, SSSE3 (_mm_shuffle_epi8) on
- * x86 — covers SSSE3, SSE4, AVX2, AVX-512BW — and a scalar fallback for
- * everything else. AVX2/AVX-512BW could process 32/64 bytes per iter but
- * the inner loop is already short for typical 150-bp reads, so the SSSE3
- * 16-byte width is the right compromise of code volume vs. perf. */
-#if defined(__ARM_NEON) || defined(__aarch64__)
-#  include <arm_neon.h>
-#  define SAM_FAST_IMPL 1   /* NEON */
-#elif defined(__SSSE3__) || defined(__SSE4_1__) || defined(__AVX__) \
-   || defined(__AVX2__) || defined(__AVX512BW__)
-#  include <tmmintrin.h>    /* SSSE3 _mm_shuffle_epi8 */
-#  define SAM_FAST_IMPL 2   /* SSSE3+ */
-#endif
-
-#ifdef SAM_FAST_IMPL
-static const uint8_t enc_fwd_lut[16] = {
-    'A','C','G','T','N','N','N','N',
-    'N','N','N','N','N','N','N','N',
-};
-static const uint8_t enc_rev_lut[16] = {
-    'T','G','C','A','N','N','N','N',
-    'N','N','N','N','N','N','N','N',
-};
-#endif
-
-/* Scalar tail clamp — mirrors the SIMD path's vminq_u8/_mm_min_epu8 against 4
- * so any code >= 5 in src[] decodes to 'N' instead of indexing OOB into the
- * 5-byte "ACGTN"/"TGCAN" literals. Today s->seq is always 2-bit ACGTN before
- * mem_aln2sam, so this is latent — but it keeps SIMD and scalar paths in
- * lockstep if that invariant ever drifts. */
-#define SAM_NT_CLAMP4(c) ((unsigned)(c) <= 4u ? (unsigned)(c) : 4u)
-
-#if SAM_FAST_IMPL == 1
-/* NEON 16-byte: vqtbl1q_u8 LUT + vminq_u8 clamp + vextq+vrev64q reverse. */
-static inline void encode_seq_fwd(char *dst, const uint8_t *src, int n) {
-    const uint8x16_t lut = vld1q_u8(enc_fwd_lut);
-    const uint8x16_t four = vdupq_n_u8(4);
-    int i = 0;
-    while (i + 16 <= n) {
-        uint8x16_t v   = vld1q_u8(src + i);
-        uint8x16_t cl  = vminq_u8(v, four);
-        uint8x16_t out = vqtbl1q_u8(lut, cl);
-        vst1q_u8((uint8_t*)dst + i, out);
-        i += 16;
-    }
-    while (i < n) { dst[i] = "ACGTN"[SAM_NT_CLAMP4(src[i])]; ++i; }
-}
-static inline void encode_seq_rev(char *dst, const uint8_t *src, int n) {
-    const uint8x16_t lut = vld1q_u8(enc_rev_lut);
-    const uint8x16_t four = vdupq_n_u8(4);
-    int i = 0;
-    while (i + 16 <= n) {
-        uint8x16_t v = vld1q_u8(src + n - 16 - i);
-        v = vextq_u8(v, v, 8);
-        v = vrev64q_u8(v);
-        uint8x16_t cl  = vminq_u8(v, four);
-        uint8x16_t out = vqtbl1q_u8(lut, cl);
-        vst1q_u8((uint8_t*)dst + i, out);
-        i += 16;
-    }
-    while (i < n) { dst[i] = "TGCAN"[SAM_NT_CLAMP4(src[n - 1 - i])]; ++i; }
-}
-static inline void copy_qual_rev(char *dst, const char *src, int n) {
-    int i = 0;
-    while (i + 16 <= n) {
-        uint8x16_t v = vld1q_u8((const uint8_t*)(src + n - 16 - i));
-        v = vextq_u8(v, v, 8);
-        v = vrev64q_u8(v);
-        vst1q_u8((uint8_t*)dst + i, v);
-        i += 16;
-    }
-    while (i < n) { dst[i] = src[n - 1 - i]; ++i; }
-}
-#elif SAM_FAST_IMPL == 2
-/* SSSE3 16-byte: _mm_shuffle_epi8 LUT + _mm_min_epu8 clamp + reverse-mask
- * shuffle for the reverse direction. Works on every x86 since 2006 (SSSE3
- * is in Core 2 and later); AVX2/AVX-512 hosts pick this path too. */
-static const uint8_t rev16_mask[16] = {
-    15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0,
-};
-static inline void encode_seq_fwd(char *dst, const uint8_t *src, int n) {
-    const __m128i lut  = _mm_loadu_si128((const __m128i*)enc_fwd_lut);
-    const __m128i four = _mm_set1_epi8(4);
-    int i = 0;
-    while (i + 16 <= n) {
-        __m128i v   = _mm_loadu_si128((const __m128i*)(src + i));
-        __m128i cl  = _mm_min_epu8(v, four);
-        __m128i out = _mm_shuffle_epi8(lut, cl);
-        _mm_storeu_si128((__m128i*)(dst + i), out);
-        i += 16;
-    }
-    while (i < n) { dst[i] = "ACGTN"[SAM_NT_CLAMP4(src[i])]; ++i; }
-}
-static inline void encode_seq_rev(char *dst, const uint8_t *src, int n) {
-    const __m128i lut  = _mm_loadu_si128((const __m128i*)enc_rev_lut);
-    const __m128i four = _mm_set1_epi8(4);
-    const __m128i rev  = _mm_loadu_si128((const __m128i*)rev16_mask);
-    int i = 0;
-    while (i + 16 <= n) {
-        __m128i v   = _mm_loadu_si128((const __m128i*)(src + n - 16 - i));
-        v           = _mm_shuffle_epi8(v, rev);   /* reverse all 16 bytes */
-        __m128i cl  = _mm_min_epu8(v, four);
-        __m128i out = _mm_shuffle_epi8(lut, cl);
-        _mm_storeu_si128((__m128i*)(dst + i), out);
-        i += 16;
-    }
-    while (i < n) { dst[i] = "TGCAN"[SAM_NT_CLAMP4(src[n - 1 - i])]; ++i; }
-}
-static inline void copy_qual_rev(char *dst, const char *src, int n) {
-    const __m128i rev = _mm_loadu_si128((const __m128i*)rev16_mask);
-    int i = 0;
-    while (i + 16 <= n) {
-        __m128i v = _mm_loadu_si128((const __m128i*)(src + n - 16 - i));
-        v = _mm_shuffle_epi8(v, rev);
-        _mm_storeu_si128((__m128i*)(dst + i), v);
-        i += 16;
-    }
-    while (i < n) { dst[i] = src[n - 1 - i]; ++i; }
-}
-#else
-/* Scalar fallback (no SIMD available). */
-static inline void encode_seq_fwd(char *dst, const uint8_t *src, int n) {
-    for (int i = 0; i < n; ++i) dst[i] = "ACGTN"[SAM_NT_CLAMP4(src[i])];
-}
-static inline void encode_seq_rev(char *dst, const uint8_t *src, int n) {
-    for (int i = 0; i < n; ++i) dst[i] = "TGCAN"[SAM_NT_CLAMP4(src[n - 1 - i])];
-}
-static inline void copy_qual_rev(char *dst, const char *src, int n) {
-    for (int i = 0; i < n; ++i) dst[i] = src[n - 1 - i];
-}
-#endif
+#include "sam_encode.h"
 /* Not including <htslib/sam.h>: its kstring.h shares the KSTRING_H guard
  * with bwa-mem3's. Opaque bam1_t wrappers live in bam_writer.h. */
 
@@ -1911,7 +1778,7 @@ void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str,
             if ((p->cigar[p->n_cigar-1]&0xf) == 4 || (p->cigar[p->n_cigar-1]&0xf) == 3) qe -= p->cigar[p->n_cigar-1]>>4;
         }
         const int n_seq = qe - qb;
-        encode_seq_fwd(str->s + str->l, (const uint8_t*)(s->seq + qb), n_seq);
+        sam_encode_seq_fwd(str->s + str->l, (const uint8_t*)(s->seq + qb), n_seq);
         str->l += n_seq;
         kputc_u('\t', str);
         if (s->qual) {
@@ -1925,11 +1792,11 @@ void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str,
             if ((p->cigar[p->n_cigar-1]&0xf) == 4 || (p->cigar[p->n_cigar-1]&0xf) == 3) qb += p->cigar[p->n_cigar-1]>>4;
         }
         const int n_seq = qe - qb;
-        encode_seq_rev(str->s + str->l, (const uint8_t*)(s->seq + qb), n_seq);
+        sam_encode_seq_rev(str->s + str->l, (const uint8_t*)(s->seq + qb), n_seq);
         str->l += n_seq;
         kputc_u('\t', str);
         if (s->qual) {
-            copy_qual_rev(str->s + str->l, (const char*)(s->qual + qb), n_seq);
+            sam_encode_qual_rev(str->s + str->l, (const char*)(s->qual + qb), n_seq);
             str->l += n_seq;
         } else kputc_u('*', str);
     }
@@ -3159,13 +3026,15 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
 
     // Now, process all the collected seq-pairs
     // First, left alignment, move out these calls
-    BandedPairWiseSW bswLeft(opt->o_del, opt->e_del, opt->o_ins,
-                             opt->e_ins, opt->zdrop, opt->pen_clip5,
-                             opt->mat, opt->a, opt->b, nthreads);
+    auto bswLeft = make_banded_pair_wise_sw(
+        opt->o_del, opt->e_del, opt->o_ins, opt->e_ins,
+        opt->zdrop, opt->pen_clip5,
+        opt->mat, opt->a, opt->b, nthreads);
 
-    BandedPairWiseSW bswRight(opt->o_del, opt->e_del, opt->o_ins,
-                              opt->e_ins, opt->zdrop, opt->pen_clip3,
-                              opt->mat, opt->a, opt->b, nthreads);
+    auto bswRight = make_banded_pair_wise_sw(
+        opt->o_del, opt->e_del, opt->o_ins, opt->e_ins,
+        opt->zdrop, opt->pen_clip3,
+        opt->mat, opt->a, opt->b, nthreads);
 
     int i;
     // Left
@@ -3189,7 +3058,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
     {
         int32_t w = init_w << i;
         // uint64_t tim = __rdtsc();
-        bswLeft.scalarBandedSWAWrapper(pair_ar,
+        bswLeft->scalarBandedSWAWrapper(pair_ar,
                                        seqBufLeftRef,
                                        seqBufLeftQer,
                                        nump,
@@ -3257,10 +3126,10 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
         int32_t w = init_w << i;
         // int64_t tim = __rdtsc();
 #if !HAVE_BSW_VECTOR_8_16
-        bswLeft.scalarBandedSWAWrapper(pair_ar, seqBufLeftRef, seqBufLeftQer, nump, nthreads, w);
+        bswLeft->scalarBandedSWAWrapper(pair_ar, seqBufLeftRef, seqBufLeftQer, nump, nthreads, w);
 #else
         sortPairsLen(pair_ar, nump, seqPairArrayAux, hist);
-        bswLeft.getScores16(pair_ar,
+        bswLeft->getScores16(pair_ar,
                             seqBufLeftRef,
                             seqBufLeftQer,
                             nump,
@@ -3329,10 +3198,10 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
         // int64_t tim = __rdtsc();
 
 #if !HAVE_BSW_VECTOR_8_16
-        bswLeft.scalarBandedSWAWrapper(pair_ar, seqBufLeftRef, seqBufLeftQer, nump, nthreads, w);
+        bswLeft->scalarBandedSWAWrapper(pair_ar, seqBufLeftRef, seqBufLeftQer, nump, nthreads, w);
 #else
         sortPairsLen(pair_ar, nump, seqPairArrayAux, hist);
-        bswLeft.getScores8(pair_ar,
+        bswLeft->getScores8(pair_ar,
                            seqBufLeftRef,
                            seqBufLeftQer,
                            nump,
@@ -3539,7 +3408,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
     {
         int32_t w = init_w << i;
         // tim = __rdtsc();
-        bswRight.scalarBandedSWAWrapper(pair_ar,
+        bswRight->scalarBandedSWAWrapper(pair_ar,
                         seqBufRightRef,
                         seqBufRightQer,
                         nump,
@@ -3604,10 +3473,10 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
         int32_t w = init_w << i;
         // uint64_t tim = __rdtsc();
 #if !HAVE_BSW_VECTOR_8_16
-        bswRight.scalarBandedSWAWrapper(pair_ar, seqBufRightRef, seqBufRightQer, nump, nthreads, w);
+        bswRight->scalarBandedSWAWrapper(pair_ar, seqBufRightRef, seqBufRightQer, nump, nthreads, w);
 #else
         sortPairsLen(pair_ar, nump, seqPairArrayAux, hist);
-        bswRight.getScores16(pair_ar,
+        bswRight->getScores16(pair_ar,
                              seqBufRightRef,
                              seqBufRightQer,
                              nump,
@@ -3678,10 +3547,10 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
         // uint64_t tim = __rdtsc();
 
 #if !HAVE_BSW_VECTOR_8_16
-        bswRight.scalarBandedSWAWrapper(pair_ar, seqBufRightRef, seqBufRightQer, nump, nthreads, w);
+        bswRight->scalarBandedSWAWrapper(pair_ar, seqBufRightRef, seqBufRightQer, nump, nthreads, w);
 #else
         sortPairsLen(pair_ar, nump, seqPairArrayAux, hist);
-        bswRight.getScores8(pair_ar,
+        bswRight->getScores8(pair_ar,
                             seqBufRightRef,
                             seqBufRightQer,
                             nump,

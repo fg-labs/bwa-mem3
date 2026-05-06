@@ -157,7 +157,86 @@ typedef struct {
 } eh_t;
 
 
-class BandedPairWiseSW {
+#include "kernel_dispatch.h"  /* must come before BandedPairWiseSW class so per-tier compiles see the renamed symbol */
+
+#include <memory>
+
+/* Abstract interface for the banded Smith-Waterman batch kernel.
+ * Concrete implementations are per-tier mangled subclasses (BandedPairWiseSW
+ * compiled with KERNEL_VARIANT=_sse41/_sse42/_avx/_avx2/_avx512bw on x86,
+ * unsuffixed on arm64). Construct via make_banded_pair_wise_sw().
+ *
+ * getScores8/getScores16 are declared unconditionally here even though the
+ * concrete class only defines them when HAVE_BSW_VECTOR_8_16 holds (which
+ * currently means at least SSSE3 on x86 or NEON on arm64 — every tier we
+ * ship). A future build that disables vector kernels (HAVE_BSW_VECTOR_8_16=0)
+ * would fail to compile because the `final` concrete class would lack
+ * overrides for these pure-virtual methods. If that build is ever needed,
+ * either tighten the guards on these decls to match the cpp side, or
+ * provide scalar wrappers. */
+class IBandedPairWiseSW {
+public:
+    virtual ~IBandedPairWiseSW() = default;
+
+    virtual int scalarBandedSWA(int qlen, const uint8_t *query, int tlen,
+                                const uint8_t *target, int32_t w,
+                                int h0, int *_qle, int *_tle,
+                                int *_gtle, int *_gscore,
+                                int *_max_off) = 0;
+
+    virtual void scalarBandedSWAWrapper(SeqPair *seqPairArray,
+                                        uint8_t *seqBufRef,
+                                        uint8_t *seqBufQer,
+                                        int numPairs,
+                                        int nthreads,
+                                        int32_t w) = 0;
+
+    virtual void getScores8(SeqPair *pairArray,
+                            uint8_t *seqBufRef,
+                            uint8_t *seqBufQer,
+                            int32_t numPairs,
+                            uint16_t numThreads,
+                            int32_t w) = 0;
+
+    virtual void getScores16(SeqPair *pairArray,
+                             uint8_t *seqBufRef,
+                             uint8_t *seqBufQer,
+                             int32_t numPairs,
+                             uint16_t numThreads,
+                             int32_t w) = 0;
+
+    /* SW_cells is a public field on BandedPairWiseSW today; expose as a getter
+     * on the interface so non-virtual access through the unique_ptr works. */
+    virtual uint64_t sw_cells() const = 0;
+};
+
+/* Factory: returns a per-tier concrete BandedPairWiseSW. Construction
+ * arguments mirror the BandedPairWiseSW ctor exactly. */
+std::unique_ptr<IBandedPairWiseSW> make_banded_pair_wise_sw(
+    int o_del, int e_del, int o_ins, int e_ins, int zdrop,
+    int end_bonus, const int8_t *mat,
+    int8_t w_match, int8_t w_mismatch, int numThreads);
+
+/* Per-tier factory function forward declarations.
+ * Defined in bandedSWA.<tier>.o (each kernel TU compile).
+ * Called from simd_dispatch.cpp to construct the right per-tier concrete
+ * class without exposing the class layout to the dispatcher TU (which
+ * previously caused an ODR size mismatch / heap corruption). */
+#if defined(__x86_64__) || defined(__i386__)
+extern "C" IBandedPairWiseSW *make_bsw_kernel_sse41(int, int, int, int, int, int,
+                                                    const int8_t*, int8_t, int8_t, int);
+extern "C" IBandedPairWiseSW *make_bsw_kernel_sse42(int, int, int, int, int, int,
+                                                    const int8_t*, int8_t, int8_t, int);
+extern "C" IBandedPairWiseSW *make_bsw_kernel_avx(int, int, int, int, int, int,
+                                                  const int8_t*, int8_t, int8_t, int);
+extern "C" IBandedPairWiseSW *make_bsw_kernel_avx2(int, int, int, int, int, int,
+                                                   const int8_t*, int8_t, int8_t, int);
+extern "C" IBandedPairWiseSW *make_bsw_kernel_avx512bw(int, int, int, int, int, int,
+                                                       const int8_t*, int8_t, int8_t, int);
+#endif
+
+
+class BandedPairWiseSW final : public IBandedPairWiseSW {
     
 public:
     uint64_t SW_cells;
@@ -175,19 +254,21 @@ public:
     BandedPairWiseSW(BandedPairWiseSW&&)                 = delete;
     BandedPairWiseSW& operator=(BandedPairWiseSW&&)      = delete;
 
+    uint64_t sw_cells() const override { return SW_cells; }
+
     // Scalar code section
     int scalarBandedSWA(int qlen, const uint8_t *query, int tlen,
                         const uint8_t *target, int32_t w,
                         int h0, int *_qle, int *_tle,
                         int *_gtle, int *_gscore,
-                        int *_max_off);
+                        int *_max_off) override;
 
     void scalarBandedSWAWrapper(SeqPair *seqPairArray,
                                 uint8_t *seqBufRef,
                                 uint8_t *seqBufQer,
                                 int numPairs,
                                 int nthreads,
-                                int32_t w);
+                                int32_t w) override;
 
 #if (defined(__ARM_NEON) || defined(__aarch64__) || defined(APPLE_SILICON)) || ((!__AVX512BW__) && (!__AVX2__) && (__SSE2__) && (__SSSE3__))
     // On ARM: use SSE2 path via sse2neon translation
@@ -203,7 +284,7 @@ public:
                     uint8_t *seqBufQer,
                     int32_t numPairs,
                     uint16_t numThreads,
-                    int32_t w);
+                    int32_t w) override;
 
     void smithWatermanBatchWrapper8(SeqPair *pairArray,
                                    uint8_t *seqBufRef,
@@ -230,7 +311,7 @@ public:
                      uint8_t *seqBufQer,
                      int32_t numPairs,
                      uint16_t numThreads,
-                     int32_t w);
+                     int32_t w) override;
 
     void smithWatermanBatchWrapper16(SeqPair *pairArray,
                                      uint8_t *seqBufRef,
@@ -238,7 +319,7 @@ public:
                                      int32_t numPairs,
                                      uint16_t numThreads,
                                      int32_t w);
-    
+
     void smithWaterman128_16(uint16_t seq1SoA[],
                              uint16_t seq2SoA[],
                              uint16_t nrow,
@@ -257,13 +338,13 @@ public:
 #if !defined(__ARM_NEON) && !defined(__aarch64__) && !defined(APPLE_SILICON)
 #if ((!__AVX512BW__) & (__AVX2__))
     // AVX256 is not updated for banding and separate ins/del in the inner loop.
-    // 8 bit vector code section    
+    // 8 bit vector code section
     void getScores8(SeqPair *pairArray,
                     uint8_t *seqBufRef,
                     uint8_t *seqBufQer,
                     int32_t numPairs,
                     uint16_t numThreads,
-                    int32_t w);
+                    int32_t w) override;
 
     void smithWatermanBatchWrapper8(SeqPair *pairArray,
                                    uint8_t *seqBufRef,
@@ -290,7 +371,7 @@ public:
                      uint8_t *seqBufQer,
                      int32_t numPairs,
                      uint16_t numThreads,
-                     int32_t w);
+                     int32_t w) override;
 
     void smithWatermanBatchWrapper16(SeqPair *pairArray,
                                      uint8_t *seqBufRef,
@@ -298,7 +379,7 @@ public:
                                      int32_t numPairs,
                                      uint16_t numThreads,
                                      int32_t w);
-    
+
     void smithWaterman256_16(uint16_t seq1SoA[],
                              uint16_t seq2SoA[],
                              uint16_t nrow,
@@ -317,13 +398,13 @@ public:
 
 #if !defined(__ARM_NEON) && !defined(__aarch64__) && !defined(APPLE_SILICON)
 #if __AVX512BW__
-    // 8 bit vector code section    
+    // 8 bit vector code section
     void getScores8(SeqPair *pairArray,
                     uint8_t *seqBufRef,
                     uint8_t *seqBufQer,
                     int32_t numPairs,
                     uint16_t numThreads,
-                    int32_t w);
+                    int32_t w) override;
 
     void smithWatermanBatchWrapper8(SeqPair *pairArray,
                                    uint8_t *seqBufRef,
@@ -351,7 +432,7 @@ public:
                      uint8_t *seqBufQer,
                      int32_t numPairs,
                      uint16_t numThreads,
-                     int32_t w);
+                     int32_t w) override;
 
     void smithWatermanBatchWrapper16(SeqPair *pairArray,
                                      uint8_t *seqBufRef,

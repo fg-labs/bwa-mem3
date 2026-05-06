@@ -30,6 +30,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include <stddef.h>
 #include <string.h>
 #include <unistd.h>
+#include "kernel_dispatch.h"
 #include "kswv.h"
 #include "limits.h"
 
@@ -2813,7 +2814,56 @@ int kswv::kswv512_16(int16_t seq1SoA[],
     return 1;
 }
 
-#endif // AVX512BW
+#elif ((!__AVX512BW__) && (!__AVX2__) && (defined(__SSE2__) || defined(__SSSE3__) || defined(__SSE4_1__)))
+/* SSE-only fallback stubs (sse41/sse42/avx tiers).
+ *
+ * The batched kswv kernel requires AVX2 or AVX-512BW. These methods are
+ * unreachable in the single-binary build because the only call site,
+ * mem_sam_pe_batch() in src/bwamem_pair.cpp, is itself reached only from
+ * src/bwamem.cpp inside `#if BWAMEM_BATCHED_MATESW` (see bwamem.cpp:1302
+ * and macro.h:79-86). bwamem.cpp is a non-kernel TU compiled at the sse41
+ * baseline, so __AVX2__ is undefined there and BWAMEM_BATCHED_MATESW=0 —
+ * the entire batched path is excluded at compile time, and the dispatcher
+ * has nothing to route here at runtime.
+ *
+ * The stubs exist only so the Ikswv vtable resolves at link time on every
+ * x86 tier (sse41/sse42/avx all need getScores8/getScores16 bodies even
+ * though the dispatcher never calls them). If a future change opens a
+ * runtime call site for the batched path on SSE tiers, replace these with
+ * a scalar fallback or add a runtime gate in make_kswv() rather than
+ * relying on this exit().
+ */
+void kswv::getScores8(SeqPair * /*pairArray*/,
+                      uint8_t * /*seqBufRef*/,
+                      uint8_t * /*seqBufQer*/,
+                      kswr_t*   /*aln*/,
+                      int32_t   /*numPairs*/,
+                      uint16_t  /*numThreads*/,
+                      int       /*phase*/)
+{
+    fprintf(stderr,
+            "[E::%s] batched kswv kernel not available at this SIMD tier (SSE only). "
+            "Recompile with AVX2+ or use the scalar mate-SW path.\n",
+            __func__);
+    exit(EXIT_FAILURE);
+}
+
+void kswv::getScores16(SeqPair * /*pairArray*/,
+                       uint8_t * /*seqBufRef*/,
+                       uint8_t * /*seqBufQer*/,
+                       kswr_t*   /*aln*/,
+                       int32_t   /*numPairs*/,
+                       uint16_t  /*numThreads*/,
+                       int       /*phase*/)
+{
+    fprintf(stderr,
+            "[E::%s] batched kswv kernel not available at this SIMD tier (SSE only). "
+            "Recompile with AVX2+ or use the scalar mate-SW path.\n",
+            __func__);
+    exit(EXIT_FAILURE);
+}
+
+#endif // AVX512BW / SSE-only fallback
 
 
 
@@ -3563,4 +3613,22 @@ int main(int argc, char *argv[])
     fclose(fsam);
     return 1;
 }
+
 #endif  // MAINY
+
+/* Per-tier factory function. Compiled into each KERNEL_VARIANT build of
+ * this TU; the symbol is mangled by kernel_dispatch.h to
+ * make_kswv_kernel_<tier>. On arm64 (no KERNEL_VARIANT) this is the
+ * unmangled make_kswv_kernel.
+ *
+ * Returns Ikswv* (not unique_ptr) because extern "C" disallows non-POD
+ * return types. The dispatcher in simd_dispatch.cpp wraps it into
+ * unique_ptr at the call site. */
+extern "C" Ikswv *make_kswv_kernel(
+    int o_del, int e_del, int o_ins, int e_ins,
+    int8_t w_match, int8_t w_mismatch,
+    int numThreads, int32_t maxRefLen, int32_t maxQerLen)
+{
+    return new kswv(o_del, e_del, o_ins, e_ins, w_match, w_mismatch,
+                    numThreads, maxRefLen, maxQerLen);
+}

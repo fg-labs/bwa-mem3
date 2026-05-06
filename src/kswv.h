@@ -134,14 +134,84 @@ const kswr_t g_defr = { 0, -1, -1, -1, -1, -1, -1 };
 
 #endif
 
-class kswv {
+#include "kernel_dispatch.h"  /* must come before kswv class so per-tier compiles see the renamed symbol */
+
+#include <memory>
+
+/* Abstract interface for the vectorized KSW batch kernel.
+ * Concrete implementations are per-tier mangled subclasses (kswv compiled
+ * with KERNEL_VARIANT=_sse41/_sse42/_avx/_avx2/_avx512bw on x86, unsuffixed
+ * on arm64). Construct via make_kswv().
+ *
+ * getScores8/getScores16 are declared unconditionally here even though the
+ * concrete class only defines them on builds with vector support. Every
+ * tier we ship satisfies this; if a future build disables vector kernels,
+ * these decls would need conditional guards to match the cpp side. */
+class Ikswv {
+public:
+    virtual ~Ikswv() = default;
+
+    virtual void getScores8(SeqPair *pairArray,
+                            uint8_t *seqBufRef,
+                            uint8_t *seqBufQer,
+                            kswr_t* aln,
+                            int32_t numPairs,
+                            uint16_t numThreads,
+                            int phase) = 0;
+
+    virtual void getScores16(SeqPair *pairArray,
+                             uint8_t *seqBufRef,
+                             uint8_t *seqBufQer,
+                             kswr_t* aln,
+                             int32_t numPairs,
+                             uint16_t numThreads,
+                             int phase) = 0;
+
+};
+
+/* Factory: returns a per-tier concrete kswv. Construction args mirror the
+ * kswv ctor exactly. */
+std::unique_ptr<Ikswv> make_kswv(
+    int o_del, int e_del, int o_ins, int e_ins,
+    int8_t w_match, int8_t w_mismatch,
+    int numThreads, int32_t maxRefLen, int32_t maxQerLen);
+
+/* Per-tier factory function forward declarations.
+ * Defined in kswv.<tier>.o (each kernel TU compile).
+ * Called from simd_dispatch.cpp to construct the right per-tier concrete
+ * class without exposing the class layout to the dispatcher TU (which
+ * previously caused an ODR size mismatch / heap corruption). */
+#if defined(__x86_64__) || defined(__i386__)
+extern "C" Ikswv *make_kswv_kernel_sse41(int, int, int, int, int8_t, int8_t,
+                                         int, int32_t, int32_t);
+extern "C" Ikswv *make_kswv_kernel_sse42(int, int, int, int, int8_t, int8_t,
+                                         int, int32_t, int32_t);
+extern "C" Ikswv *make_kswv_kernel_avx(int, int, int, int, int8_t, int8_t,
+                                       int, int32_t, int32_t);
+extern "C" Ikswv *make_kswv_kernel_avx2(int, int, int, int, int8_t, int8_t,
+                                        int, int32_t, int32_t);
+extern "C" Ikswv *make_kswv_kernel_avx512bw(int, int, int, int, int8_t, int8_t,
+                                            int, int32_t, int32_t);
+#endif
+
+
+class kswv final : public Ikswv {
 public:
 
 	kswv(const int o_del, const int e_del, const int o_ins,
 		 const int e_ins, const int8_t w_match, const int8_t w_mismatch,
 		 int numThreads, int32_t maxRefLen, int32_t maxQerLen);
-	
-	~kswv();
+
+	~kswv() override;
+
+	// kswv owns heap buffers (rowMax8/16, F/H/E vectors, etc.) freed in the
+	// destructor. Allowing copy/move would alias those allocations and make
+	// double-free / use-after-free trivial to introduce. Mirrors the same
+	// guard on BandedPairWiseSW.
+	kswv(const kswv&)            = delete;
+	kswv& operator=(const kswv&) = delete;
+	kswv(kswv&&)                 = delete;
+	kswv& operator=(kswv&&)      = delete;
 
 	void getScores8(SeqPair *pairArray,
 					uint8_t *seqBufRef,
@@ -149,7 +219,7 @@ public:
 					kswr_t* aln,
 					int32_t numPairs,
 					uint16_t numThreads,
-					int phase);
+					int phase) override;
 
 	void getScores16(SeqPair *pairArray,
 					 uint8_t *seqBufRef,
@@ -157,8 +227,8 @@ public:
 					 kswr_t* aln,
 					 int32_t numPairs,
 					 uint16_t numThreads,
-					 int phase);
-    
+					 int phase) override;
+
 	void kswvScalarWrapper(SeqPair *seqPairArray,
                            uint8_t *seqBufRef,
                            uint8_t *seqBufQer,
