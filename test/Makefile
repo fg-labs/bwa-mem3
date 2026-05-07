@@ -34,15 +34,15 @@ ifneq ($(IS_ARM),)
             $(error libomp not found: install with `brew install libomp`, or set LIBOMP_PREFIX to its install prefix)
         endif
         CXXFLAGS ?= -std=c++11 -O2 -Xpreprocessor -fopenmp -I$(LIBOMP_PREFIX)/include
-        LIBS     ?= -L.. -L$(LIBOMP_PREFIX)/lib -lomp -lbwa ../ext/libsais/src/libsais.o ../ext/libsais/src/libsais64.o -lz -framework Accelerate ../ext/safestringlib/libsafestring.a
+        LIBS     ?= -L.. -L$(LIBOMP_PREFIX)/lib -lomp -lbwa ../ext/libsais/src/libsais.o ../ext/libsais/src/libsais64.o -lz -framework Accelerate ../ext/safestringlib/libsafestring.a ../ext/htslib/libhts.a -lpthread
     else
         CXXFLAGS ?= -std=c++11 -O2 -fopenmp
-        LIBS     ?= -L.. -fopenmp -lbwa ../ext/libsais/src/libsais.o ../ext/libsais/src/libsais64.o -lz ../ext/safestringlib/libsafestring.a
+        LIBS     ?= -L.. -fopenmp -lbwa ../ext/libsais/src/libsais.o ../ext/libsais/src/libsais64.o -lz ../ext/safestringlib/libsafestring.a ../ext/htslib/libhts.a -lpthread
     endif
 else
     CXX      ?= g++
     CXXFLAGS ?= -std=c++11 -fopenmp -mtune=native -march=native
-    LIBS     ?= -L.. -fopenmp -lbwa ../ext/libsais/src/libsais.o ../ext/libsais/src/libsais64.o -lz ../ext/safestringlib/libsafestring.a
+    LIBS     ?= -L.. -fopenmp -lbwa ../ext/libsais/src/libsais.o ../ext/libsais/src/libsais64.o -lz ../ext/safestringlib/libsafestring.a ../ext/htslib/libhts.a -lpthread
 endif
 
 ifneq ($(IS_ARM),)
