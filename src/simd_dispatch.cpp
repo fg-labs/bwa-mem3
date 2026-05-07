@@ -8,6 +8,32 @@
 static int g_tier = BWAMEM3_TIER_NONE;
 static std::once_flag g_init_flag;
 
+/* Build-time tier — what the compiler emitted for this TU and (because the
+ * BASELINE_ARCH knob in the Makefile propagates ARCH_FLAGS into CXXFLAGS for
+ * every non-kernel compile) what every non-kernel TU was compiled at. Used
+ * at init time to flag a gap between the binary's build baseline and the
+ * host's capability — when the host is more capable than the build, hot
+ * non-kernel paths (chain extension, FMI walks, mate scoring) won't be
+ * auto-vectorized at the higher width and the binary leaves measurable
+ * performance on the table. The arm64 branch comes first because the
+ * sse2neon shim sets the SSE feature macros, which would otherwise cause
+ * the SSE branches to fire on aarch64. */
+#if defined(__aarch64__) || defined(__ARM_NEON)
+static constexpr int g_build_tier = BWAMEM3_TIER_NEON;
+#elif defined(__AVX512BW__)
+static constexpr int g_build_tier = BWAMEM3_TIER_AVX512BW;
+#elif defined(__AVX2__)
+static constexpr int g_build_tier = BWAMEM3_TIER_AVX2;
+#elif defined(__AVX__)
+static constexpr int g_build_tier = BWAMEM3_TIER_AVX;
+#elif defined(__SSE4_2__)
+static constexpr int g_build_tier = BWAMEM3_TIER_SSE42;
+#elif defined(__SSE4_1__)
+static constexpr int g_build_tier = BWAMEM3_TIER_SSE41;
+#else
+static constexpr int g_build_tier = BWAMEM3_TIER_NONE;
+#endif
+
 #if defined(__x86_64__) || defined(__i386__)
 static int detect_x86_tier(void)
 {
@@ -65,6 +91,31 @@ static void bwamem3_simd_init_body(void)
     g_tier = BWAMEM3_TIER_NONE;
 #endif
 
+    /* Build-vs-host gap warning. The per-tier kernel TUs are still compiled
+     * at every supported tier and dispatched correctly via this file, so
+     * kernel calls (BSW, kswv, ksw_extend, sam_encode_*) will pick the
+     * host's tier regardless. But every non-kernel TU (bwamem.cpp,
+     * bwamem_pair.cpp, FMI_search.cpp, fastmap.cpp, ...) is compiled once
+     * at the BASELINE_ARCH tier, so when the host is more capable the
+     * compiler can't auto-vectorize those hot paths at the wider width.
+     * Compare on the x86 ordering only; arm64 builds have a single tier.
+     * Use the detected tier (pre-FORCE_TIER) so the warning reflects the
+     * binary's potential vs the host's capability, not the deliberate
+     * runtime override. */
+#if defined(__x86_64__) || defined(__i386__)
+    if (g_build_tier > BWAMEM3_TIER_NONE && g_build_tier < g_tier) {
+        fprintf(stderr,
+                "[W::%s] build baseline %s < host tier %s; non-kernel TUs "
+                "are not auto-vectorized at the higher width (expect "
+                "10-15%% slower hot paths). Rebuild with BASELINE_ARCH=%s "
+                "to recover.\n",
+                __func__,
+                bwamem3_simd_tier_name(g_build_tier),
+                bwamem3_simd_tier_name(g_tier),
+                bwamem3_simd_tier_name(g_tier));
+    }
+#endif
+
     /* Optional override: BWAMEM3_FORCE_TIER=<name> downgrades only.
      * Up-tier requests would SIGILL on the first wider instruction. */
     const char *force = getenv("BWAMEM3_FORCE_TIER");
@@ -97,7 +148,10 @@ static void bwamem3_simd_init_body(void)
     }
 
     if (getenv("BWAMEM3_DEBUG_SIMD")) {
-        fprintf(stderr, "[M::%s] SIMD tier: %s\n", __func__, bwamem3_simd_tier_name(g_tier));
+        fprintf(stderr, "[M::%s] SIMD tier: %s (build baseline: %s)\n",
+                __func__,
+                bwamem3_simd_tier_name(g_tier),
+                bwamem3_simd_tier_name(g_build_tier));
     }
 }
 
