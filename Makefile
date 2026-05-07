@@ -408,11 +408,12 @@ kswv_nrow_zero_test: $(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) src/kswv.native.o tes
 # libbwa.a, which then lacks kswv::getScores8 — the BWA_TESTS_HAVE_KSWV
 # macro guards the test away).
 .PHONY: test-binaries
-# $(SAFE_STR_LIB) is a real link-time dep: test/Makefile's
+# $(SAFE_STR_LIB) and $(HTS_LIB) are real link-time deps: test/Makefile's
 # bwa_mem3_tests_unit recipe references ../ext/safestringlib/libsafestring.a
-# directly. Without this prereq, callers that skip the bwa-mem3 binary
-# build (which builds it as a side-effect of $(EXE) deps) link-fail.
-test-binaries: $(BWA_LIB) $(SAFE_STR_LIB)
+# and ../ext/htslib/libhts.a directly. Without these prereqs, callers that
+# skip the bwa-mem3 binary build (which builds them as a side-effect of
+# $(EXE) deps) link-fail.
+test-binaries: $(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB)
 	$(MAKE) -C test framework unit integration \
 	    CXX="$(CXX)" \
 	    COVERAGE=$(COVERAGE) \

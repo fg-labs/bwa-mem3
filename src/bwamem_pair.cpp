@@ -1284,10 +1284,19 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                 // fprintf(stderr, "Re-routing: Encountered -ve index for "
                 // "gcnt: %d, look into pre.\n", gcnt + r);
                 assert(ref != 0);
-                aln = ksw_align2(l_ms, seq, re - rb, ref, 5,
+                // ksw_align2 reverses its target argument in place via
+                // revseq (see ksw.cpp:375,381). When mmc->ref_string is
+                // shm-backed (PROT_READ mmap of /dev/shm/bwaidx-*), that
+                // write SIGSEGVs. Copy the slice into a writable scratch
+                // buffer before handing it to ksw_align2.
+                int64_t ref_len = re - rb;
+                uint8_t *ref_rw = (uint8_t*) malloc((size_t)ref_len);
+                assert(ref_rw != NULL);
+                memcpy(ref_rw, ref, (size_t)ref_len);
+                aln = ksw_align2(l_ms, seq, ref_len, ref_rw, 5,
                                  opt->mat, opt->o_del, opt->e_del,
                                  opt->o_ins, opt->e_ins, xtra, 0);
-
+                free(ref_rw);
             }
             else
                 aln = *(*myaln + index);
