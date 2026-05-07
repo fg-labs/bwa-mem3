@@ -343,6 +343,17 @@ src/version.h: FORCE
 
 src/main.o: src/version.h
 
+# Baseline ISA tier for non-kernel TUs in the x86 single-binary build.
+# Defaults to avx2: every host that runs bwa-mem3 in practice has AVX2
+# (Haswell, 2013+; any host with AVX-512 also has AVX2), and dropping the
+# baseline below avx2 measurably slows hot non-kernel paths (chain
+# extension, FMI BWT walks, mate scoring) because the compiler can no
+# longer auto-vectorize them at 256-bit width. Override to sse41 (or
+# sse42, avx) for vintage hardware; the per-tier kernel objects are still
+# compiled at every tier regardless, so kernel dispatch on lower-tier
+# hosts continues to work.
+BASELINE_ARCH ?= avx2
+
 # Single-binary multi-tier build. All kernel TUs are compiled at every
 # tier; the dispatcher picks the right per-tier subclass at runtime.
 # Replaces the `multi` target's 5 sequential clean rebuilds + execv launcher.
@@ -352,11 +363,11 @@ ifneq ($(IS_ARM),)
 	@echo "ARM64 detected - building single arm64 binary instead of multi-tier"
 	$(MAKE) arm64
 else
-	$(MAKE) arch=sse41 EXE=bwa-mem3 CXX="$(CXX)" KERNEL_TIER_OBJS_LINK="$(KERNEL_TIER_OBJS)" all-single
+	$(MAKE) arch=$(BASELINE_ARCH) EXE=bwa-mem3 CXX="$(CXX)" KERNEL_TIER_OBJS_LINK="$(KERNEL_TIER_OBJS)" all-single
 endif
 
-# Internal: builds the single binary with arch=sse41 baseline for non-kernel
-# TUs and links all KERNEL_TIER_OBJS_LINK on top.
+# Internal: builds the single binary with the BASELINE_ARCH tier for
+# non-kernel TUs and links all KERNEL_TIER_OBJS_LINK on top.
 .PHONY: all-single
 all-single: $(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) $(KERNEL_TIER_OBJS_LINK) src/main.o
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) src/main.o $(KERNEL_TIER_OBJS_LINK) $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) $(MIMALLOC_LDFLAGS) -o $(EXE)
@@ -377,12 +388,13 @@ $(EXE):$(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) $(if $(filter 1,$(U
 # before the allocation and aborts at a later allocator operation; under
 # asan the write is reported directly.
 #
-# On x86 multi-tier builds, libbwa.a's baseline kswv.o is compiled at
-# -msse4.1 (the single-binary SSE floor), which hits the SSE-only stub that
-# calls exit(). To exercise the real SIMD kernel, compile a native-tier copy
-# of kswv.cpp (src/kswv.native.o) and link it ahead of libbwa.a so the linker
-# picks the native-ISA concrete kswv class.  On arm64 -march=native resolves
-# to the NEON path already covered by the baseline objects.
+# On x86 multi-tier builds, libbwa.a's baseline kswv.o is compiled at the
+# BASELINE_ARCH tier (avx2 by default; sse41 if overridden, in which case
+# the SSE-only stub that calls exit() would fire). Compile a separate
+# native-tier copy of kswv.cpp (src/kswv.native.o) and link it ahead of
+# libbwa.a so the linker picks the host's native-ISA concrete kswv class
+# regardless of BASELINE_ARCH. On arm64 -march=native resolves to the NEON
+# path already covered by the baseline objects.
 src/kswv.native.o: src/kswv.cpp
 	$(CXX) -c $(BASE_CXXFLAGS) -march=native $(CPPFLAGS) $(INCLUDES) $< -o $@
 
