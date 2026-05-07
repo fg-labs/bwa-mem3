@@ -59,6 +59,7 @@
 - [Features](whats-different/features.md)
 - [Architecture support](whats-different/arch-support.md)
 - [Build & infrastructure](whats-different/build-infra.md)
+- [`BASELINE_ARCH=avx512bw` build flag](whats-different/avx512-baseline.md)
 - [Upstream PR status](whats-different/upstream-prs.md)
 
 # Developer Guide

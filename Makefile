@@ -227,19 +227,44 @@ else ifeq ($(arch),avx2)
 		ARCH_FLAGS=-mavx2
 	endif
 else ifeq ($(arch),avx512)
+	# Legacy alias for arch=avx512bw (preserved for backward compat with
+	# pre-PR #16 invocations). Keep flags identical to the avx512bw branch
+	# below — including the -mprefer-vector-width=256 / -qopt-zmm-usage=low
+	# autovec cap. See the avx512bw branch for the rationale.
 	ifeq ($(CXX), icpc)
-		ARCH_FLAGS=-xCORE-AVX512
+		ARCH_FLAGS=-xCORE-AVX512 -qopt-zmm-usage=low
 	else
-		ARCH_FLAGS=-mavx512f -mavx512bw
+		ARCH_FLAGS=-mavx512f -mavx512bw -mprefer-vector-width=256
 	endif
 else ifeq ($(arch),avx512bw)
 	# Explicit BW target: double the lane width vs AVX2 (64x8-bit / 32x16-bit).
 	# AVX-512BW implies AVX-512F; -mavx512bw alone enables BW+F on gcc/clang
 	# but we list both flags for clarity.
+	#
+	# -mprefer-vector-width=256 (gcc/clang) / -qopt-zmm-usage=low (icpc):
+	# keep AVX-512BW *capabilities* available (32 zmm registers, mask
+	# registers, byte/word lane permutes, gather/scatter) but cap the
+	# auto-vectorizer's preferred SIMD width at 256-bit. Two effects:
+	#   1. AMD Zen 4 (c7a / Genoa) splits 512-bit AVX-512 ops into
+	#      2x 256-bit µops per op. For short-trip-count auto-vec loops
+	#      that's a regression — 2x latency without amortizing the
+	#      reduced iteration count, plus more I-cache pressure. Capping
+	#      at 256-bit keeps the compiler from widening those loops.
+	#   2. Intel Sapphire Rapids (c7i / m7i) has native 512-bit
+	#      execution but pays a ~3-5% AVX-512 frequency downclock under
+	#      sustained heavy use, plus AVX-512↔AVX2 transition penalties
+	#      when non-kernel TUs running 512-bit code call into
+	#      explicitly-256-bit kernel TUs. Capping at 256-bit avoids
+	#      both.
+	# Empirical: c7a wgs-5M shm-warmed -4.4% wall vs avx2 baseline
+	# (vanilla avx512bw was -2.2%, the cap adds another 2% on top).
+	# c7i wgs-5M is a wash either way (-0.7%). The hand-tuned 512-bit
+	# kernel TUs are unaffected — they use intrinsics, not auto-vec.
+	# Canonical mitigation per FFmpeg, libvpx, ISPC docs.
 	ifeq ($(CXX), icpc)
-		ARCH_FLAGS=-xCORE-AVX512
+		ARCH_FLAGS=-xCORE-AVX512 -qopt-zmm-usage=low
 	else
-		ARCH_FLAGS=-mavx512f -mavx512bw
+		ARCH_FLAGS=-mavx512f -mavx512bw -mprefer-vector-width=256
 	endif
 else ifeq ($(arch),native)
 	ARCH_FLAGS=-march=native

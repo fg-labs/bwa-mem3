@@ -91,27 +91,46 @@ static void bwamem3_simd_init_body(void)
     g_tier = BWAMEM3_TIER_NONE;
 #endif
 
-    /* Build-vs-host gap warning. The per-tier kernel TUs are still compiled
+    /* Build-vs-host gap (debug-only).
+     *
+     * The per-tier kernel TUs (KERNEL_SRCS in the Makefile) are compiled
      * at every supported tier and dispatched correctly via this file, so
      * kernel calls (BSW, kswv, ksw_extend, sam_encode_*) will pick the
-     * host's tier regardless. But every non-kernel TU (bwamem.cpp,
-     * bwamem_pair.cpp, FMI_search.cpp, fastmap.cpp, ...) is compiled once
-     * at the BASELINE_ARCH tier, so when the host is more capable the
-     * compiler can't auto-vectorize those hot paths at the wider width.
-     * Compare on the x86 ordering only; arm64 builds have a single tier.
-     * Use the detected tier (pre-FORCE_TIER) so the warning reflects the
-     * binary's potential vs the host's capability, not the deliberate
-     * runtime override. */
+     * host's tier regardless of BASELINE_ARCH. Every non-kernel TU
+     * (bwamem.cpp, bwamem_pair.cpp, FMI_search.cpp, fastmap.cpp, ...) is
+     * compiled once at BASELINE_ARCH, so a build_tier < host_tier mismatch
+     * means the compiler couldn't auto-vectorize those hot paths at the
+     * higher width.
+     *
+     * Earlier versions of bwa-mem3 emitted a [W::] warning here promising
+     * "10-15%% slower hot paths, rebuild with BASELINE_ARCH=<host_tier>
+     * to recover". Empirically (c7a / c7i wgs-5M shm-warmed bare-metal,
+     * tricord) the gap is much smaller than that and the recommendation
+     * is not always applicable:
+     *   - avx2 -> avx512bw: c7a -2.2%%, c7i -0.7%% (wash, both cases)
+     *   - avx2 -> avx512bw + -mprefer-vector-width=256 (the default for
+     *     arch=avx512bw): c7a -4.4%%, c7i -0.7%%
+     *   - sse41 -> avx2: ~+10-15%% on AVX2 hosts (the original PR #84
+     *     measurement that motivated raising the default to avx2)
+     * The "10-15%%" figure was the sse41->avx2 transition on AVX2-only
+     * hosts; it does not generalize to avx2->avx512bw.
+     *
+     * The warning is now BWAMEM3_DEBUG_SIMD-gated to avoid spamming a
+     * misleading recommendation in production logs. The per-stage tier
+     * report below already covers the diagnostic case. */
 #if defined(__x86_64__) || defined(__i386__)
-    if (g_build_tier > BWAMEM3_TIER_NONE && g_build_tier < g_tier) {
+    if (g_build_tier > BWAMEM3_TIER_NONE && g_build_tier < g_tier
+        && getenv("BWAMEM3_DEBUG_SIMD")) {
         fprintf(stderr,
-                "[W::%s] build baseline %s < host tier %s; non-kernel TUs "
-                "are not auto-vectorized at the higher width (expect "
-                "10-15%% slower hot paths). Rebuild with BASELINE_ARCH=%s "
-                "to recover.\n",
+                "[M::%s] build baseline %s < host tier %s; non-kernel TUs "
+                "compiled for %s. Hot kernel paths self-dispatch at host tier "
+                "regardless. Rebuilding with BASELINE_ARCH=%s typically "
+                "yields <2%% wall-time gain on AVX-512 hosts (PR #84's "
+                "10-15%% figure was the sse41->avx2 transition).\n",
                 __func__,
                 bwamem3_simd_tier_name(g_build_tier),
                 bwamem3_simd_tier_name(g_tier),
+                bwamem3_simd_tier_name(g_build_tier),
                 bwamem3_simd_tier_name(g_tier));
     }
 #endif
