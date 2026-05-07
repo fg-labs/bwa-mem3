@@ -57,6 +57,20 @@ jobs:
             run_integration: true
             name: "Linux x86_64 single-binary (mimalloc)"
             artifact_slug: "linux-x86_64-single-mimalloc"
+          # Same single-binary build as the row above, but with the
+          # BASELINE_ARCH override flipped to sse41 (the vintage-host
+          # portability path). PR #83 originally hardcoded the sse41
+          # baseline; the perf-regression fix flipped the default to avx2
+          # and made it tunable. Keep this row so the override path stays
+          # exercised — without it, a future refactor could silently drop
+          # sub-avx2 portability.
+          - os: ubuntu-latest
+            arch_flag: ""
+            baseline_arch: "sse41"
+            use_mimalloc: "1"
+            run_integration: true
+            name: "Linux x86_64 single-binary BASELINE_ARCH=sse41 (mimalloc)"
+            artifact_slug: "linux-x86_64-single-sse41-baseline-mimalloc"
           - os: ubuntu-latest
             arch_flag: "avx2"
             use_mimalloc: "1"
@@ -91,9 +105,16 @@ jobs:
         run: cmake --version
 
       - name: Build bwa-mem3
+        # For arch_flag="" rows the build goes through the single: target,
+        # which honors BASELINE_ARCH (defaults to avx2; override per-row via
+        # matrix.baseline_arch). On ARM rows BASELINE_ARCH is harmless — the
+        # single: recipe short-circuits to the arm64 build before consulting
+        # it. On rows that pin arch=… we hit a single-arch build that bypasses
+        # single: entirely, so BASELINE_ARCH is not used and is omitted.
         run: |
           if [ "${{ matrix.arch_flag }}" = "" ]; then
             make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)" \
+              BASELINE_ARCH=${{ matrix.baseline_arch || 'avx2' }} \
               CXX=${{ matrix.cxx || 'g++' }} USE_MIMALLOC=${{ matrix.use_mimalloc }}
           else
             make -j"$(nproc)" \
@@ -111,9 +132,11 @@ jobs:
         # between libbwa.a and the test binary (notably: sse41 row has
         # no kswv::getScores8 symbol, so tests must be compiled out).
         # For arch_flag="" rows (ARM, macOS, single-binary x86), the parent
-        # build auto-selects ARCH_FLAGS via IS_ARM (ARM) or leaves them empty
-        # (x86 single-binary, which compiled all tier kernels separately and
-        # uses the sse41 baseline for non-kernel TUs).
+        # build auto-selects ARCH_FLAGS via IS_ARM (ARM) or falls back to
+        # the file-default -msse4.1 floor (x86 single-binary, which compiled
+        # all tier kernels separately; the test TU compiles at sse41 here
+        # regardless of BASELINE_ARCH, so kswv tests gate on BWA_TESTS_HAVE_KSWV
+        # and skip when the test TU lacks __AVX2__/__AVX512BW__).
         run: |
           if [ "${{ matrix.arch_flag }}" = "" ]; then
             make test-binaries CXX=${{ matrix.cxx || 'g++' }}
