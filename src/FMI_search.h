@@ -256,7 +256,43 @@ private:
         uint8_t *shm_base;
         size_t   shm_len;
 
-        SMEM backwardExt(SMEM smem, uint8_t a);
+        /* Defined inline so all hot callers (getSMEMs* and ls_advance_*)
+         * fully absorb the body and pay no struct-by-value pass / return
+         * cost. backwardExt is called ~10^9 times per 5M-pair WGS run, so
+         * the SysV-ABI hidden-pointer dance for the 24-byte SMEM struct
+         * dominates self-time on gcc 12+ (issue #87): a single output store
+         * `vmovdqu %ymm0, (%r8)` writing the return SMEM hits 42% of the
+         * function's CPU samples on c7a (Zen 4) with gcc-14, with the
+         * matching argument load close behind. always_inline removes the
+         * call boundary and recovers the full gcc-11 baseline (and beats
+         * it by ~4% wall-clock on c7a wgs-5M shm-warmed). */
+        __attribute__((always_inline)) inline
+        SMEM backwardExt(SMEM smem, uint8_t a) const
+        {
+            uint8_t b;
+            int64_t k[4], l[4], s[4];
+            for (b = 0; b < 4; b++) {
+                int64_t sp = (int64_t)(smem.k);
+                int64_t ep = (int64_t)(smem.k) + (int64_t)(smem.s);
+                GET_OCC(sp, b, occ_id_sp, y_sp, occ_sp, one_hot_bwt_str_c_sp, match_mask_sp);
+                GET_OCC(ep, b, occ_id_ep, y_ep, occ_ep, one_hot_bwt_str_c_ep, match_mask_ep);
+                k[b] = count[b] + occ_sp;
+                s[b] = occ_ep - occ_sp;
+            }
+
+            int64_t sentinel_offset = 0;
+            if ((smem.k <= sentinel_index) && ((smem.k + smem.s) > sentinel_index))
+                sentinel_offset = 1;
+            l[3] = smem.l + sentinel_offset;
+            l[2] = l[3] + s[3];
+            l[1] = l[2] + s[2];
+            l[0] = l[1] + s[1];
+
+            smem.k = k[a];
+            smem.l = l[a];
+            smem.s = s[a];
+            return smem;
+        }
 
     // ----- Lockstep SMEM batching internals -----
     // Defined in FMI_search.cpp. Phases and per-slot state are scoped to
