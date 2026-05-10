@@ -285,12 +285,26 @@ jobs:
 
       - name: Setup holodeck (pixi)
         # Install holodeck via bioconda; pinned to v0.2.1 in
-        # test/holodeck/pixi.toml. Runs on every matrix row.
+        # test/holodeck/pixi.toml. Runs on every matrix row. samtools is
+        # bundled with holodeck in this pixi env so we have a uniform
+        # source of `samtools faidx` across linux-64, linux-aarch64, and
+        # osx-arm64 (the macOS brew step otherwise wouldn't carry it).
         uses: prefix-dev/setup-pixi@1b2de7f3351f171c8b4dfeb558c639cb58ed4ec0 # v0.9.5
         with:
           pixi-version: v0.49.0
           manifest-path: test/holodeck/pixi.toml
           cache: true
+
+      - name: Index chr22 with samtools faidx
+        # holodeck requires an indexed FASTA (.fai sidecar). The
+        # bwa-mem3 indexer doesn't produce .fai, so build it here.
+        # --frozen makes pixi error if pixi.lock is out of sync with
+        # pixi.toml rather than silently regenerating the lockfile;
+        # that pins samtools (manifest unbounded at >=1.20) and every
+        # transitive dep to the committed lockfile for deterministic CI.
+        run: |
+          pixi run --frozen --manifest-path test/holodeck/pixi.toml -- \
+            samtools faidx /tmp/chr22/chr22.fa
 
       - name: Simulate chr22 reads with holodeck
         # Deterministic ~50k PE pairs by construction: chr22 is ~50 Mbp
