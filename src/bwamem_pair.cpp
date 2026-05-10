@@ -37,6 +37,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "bwamem.h"
 #include "bam_writer.h"
 #include "kvec.h"
+#include "u8vec_scratch.h"
 #include "utils.h"
 #include "ksw.h"
 #include "bandedSWA.h"
@@ -202,7 +203,14 @@ int mem_matesw(const mem_opt_t *opt, const bntseq_t *bns,
         }
         if (rb < 0) rb = 0;
         if (re > l_pac<<1) re = l_pac<<1;
-        if (rb < re) ref = bns_fetch_seq(bns, pac, &rb, (rb+re)>>1, &re, &rid);
+        static thread_local u8vec_scratch_t t_ref;
+        if (rb < re) {
+            size_t want = (size_t)((re - rb) + 64);
+            if (t_ref.v.m < want) kv_resize(uint8_t, t_ref.v, want);
+            int64_t rlen;
+            bns_fetch_seq_into(bns, pac, &rb, (rb+re)>>1, &re, &rid, t_ref.v.a, &rlen);
+            ref = t_ref.v.a;
+        }
         if (a->rid == rid && re - rb >= opt->min_seed_len) { // no funny things happening
             kswr_t aln;
             mem_alnreg_t b;
@@ -279,7 +287,7 @@ int mem_matesw(const mem_opt_t *opt, const bntseq_t *bns,
         if (n) ma->n = mem_dedup_patch(opt, 0, 0, 0, ma->n, ma->a); // sam_improvements
         #endif
         if (rev) free(rev);
-        free(ref);
+        /* ref aliases t_ref thread-local scratch; do not free. */
     }
     return n;
 }

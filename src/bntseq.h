@@ -65,6 +65,22 @@ typedef struct {
 
 extern unsigned char nst_nt4_table[256];
 
+/* 2-bit pac primitives — published so callers in other TUs (e.g. the
+ * meth XM:Z slice path) can decode bases inline without going through
+ * the malloc'ing bns_get_seq path. `pac` is the standard 2-bit packed
+ * buffer (4 bases/byte, top-first); `l` is the global bp offset.
+ *
+ * Arguments must be side-effect-free: `l` is evaluated 3x in _get_pac
+ * and 3x in _set_pac. The macro bodies are fully parenthesized so that
+ * arithmetic on the result (e.g. `_get_pac(pac, i) + 1`) sees the
+ * intended `& 3` masking instead of `& (3 + 1)`. */
+#ifndef _get_pac
+#define _get_pac(pac, l) ((((pac)[(l) >> 2]) >> ((~(l) & 3) << 1)) & 3)
+#endif
+#ifndef _set_pac
+#define _set_pac(pac, l, c) ((pac)[(l) >> 2] |= (uint8_t)((c) << ((~(l) & 3) << 1)))
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -76,8 +92,28 @@ extern "C" {
 	int64_t bns_fasta2bntseq(gzFile fp_fa, const char *prefix, int for_only);
 	int bns_pos2rid(const bntseq_t *bns, int64_t pos_f);
 	int bns_cnt_ambi(const bntseq_t *bns, int64_t pos_f, int len, int *ref_id);
-	uint8_t *bns_get_seq(int64_t l_pac, const uint8_t *pac, int64_t beg, int64_t end, int64_t *len);
-	uint8_t *bns_fetch_seq(const bntseq_t *bns, const uint8_t *pac, int64_t *beg, int64_t mid, int64_t *end, int *rid);
+	/* Iterate over the bns->ambs intervals overlapping [pos_f, pos_f + len),
+	 * in sorted (offset) order. `fn` receives the half-open interval
+	 * [amb_st, amb_en) clipped to [pos_f, pos_f + len) plus the caller
+	 * context. Iteration stops when fn returns nonzero. Returns the last
+	 * fn return value (0 if no intervals visited). */
+	typedef int (*bns_amb_visit_fn)(int64_t amb_st, int64_t amb_en, void *ctx);
+	int bns_iter_ambi(const bntseq_t *bns, int64_t pos_f, int len,
+	                  bns_amb_visit_fn fn, void *ctx);
+	/* Decode forward/reverse-complement bases [beg, end) of `pac` into
+	 * caller-provided `dst` (capacity must be >= max(end - beg, 0)).
+	 * `dst` is filled with 2-bit-decoded bases (0..3 = A/C/G/T); ambiguous
+	 * (N) positions are NOT marked here — callers that care consult
+	 * bns->ambs separately (see bns_iter_ambi). On bridging the
+	 * forward/reverse boundary `*len_out` is set to 0 and dst is
+	 * untouched. Otherwise `*len_out == end - beg` (after end-clamp to
+	 * `2 * l_pac` and beg-clamp to 0). */
+	void bns_get_seq_into(int64_t l_pac, const uint8_t *pac,
+	                      int64_t beg, int64_t end,
+	                      uint8_t *dst, int64_t *len_out);
+	void bns_fetch_seq_into(const bntseq_t *bns, const uint8_t *pac,
+	                        int64_t *beg, int64_t mid, int64_t *end, int *rid,
+	                        uint8_t *dst, int64_t *len_out);
 	// Zero-copy v2 variants used by mem_chain2aln_across_reads_V2 and the
 	// mem_matesw_batch_* path. Return a pointer into the pre-unpacked
 	// `ref_string` (the .0123 reference materialized at startup); no

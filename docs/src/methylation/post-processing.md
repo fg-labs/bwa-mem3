@@ -39,13 +39,17 @@ output contig index is `cmap->out_tid[p.rid]`.
 > distance rather than zero (which would happen if the mismatched internal TIDs
 > were used).
 
-## Chimera QC heuristic
+## Chimera QC heuristic (opt-in)
 
-bwameth.py applies a heuristic to flag reads that look like chimeric fragments:
-if the longest contiguous alignment run (sum of M/=/X CIGAR operations) covers
-less than 44% of the read length, the read is considered a potential chimera.
+bwameth.py applies a heuristic to flag reads that look like chimeric
+fragments: if the longest contiguous alignment run (sum of M/=/X CIGAR
+operations) covers less than 44 % of the read length, the read is
+considered a potential chimera. **Bismark does not apply this kind of
+heuristic.**
 
-`bwa-mem3 --meth` applies the same heuristic inside `meth_mem_aln_to_bam`:
+`bwa-mem3 --meth` makes this opt-in via `--chimera-qc` (default off, so
+the runtime posture matches Bismark). When enabled, the check inside
+`meth_mem_aln_to_bam` does:
 
 ```text
 if (100 * longest_M_run < 44 * l_seq):
@@ -54,15 +58,16 @@ if (100 * longest_M_run < 44 * l_seq):
     mapq   =  min(mapq, 1)
 ```
 
-The threshold constant is `MIN_LONGEST_M_PCT = 44` (defined at the top of
-`src/meth_bam.cpp`). The longest run is computed by `cigar_longest_m_mem`
-from `src/cigar_util.cpp`, which counts M, `=`, and X operations.
+The threshold constant is `MIN_LONGEST_M_PCT = 44` (defined at the top
+of `src/meth_bam.cpp`). The longest run is computed by
+`cigar_longest_m_mem` from `src/cigar_util.cpp`, which counts M, `=`,
+and X operations.
 
-The chimera heuristic is only applied to mapped records (`!(flag & 0x4) &&
-direction != 0`). Unmapped records are not touched.
+The chimera heuristic is only applied to mapped records (`!(flag & 0x4)
+&& direction != 0`). Unmapped records are not touched.
 
-To disable this heuristic, pass `--do-not-penalize-chimeras`. See
-[Flags](flags.md) for details.
+See [Flags](flags.md) for when to use `--chimera-qc` (PBAT / scBS-Seq;
+bwameth.py-equivalence runs).
 
 ## `--set-as-failed` strand filtering
 
@@ -122,7 +127,7 @@ and reproducibility.
 
 **See also:**
 [Overview](overview.md) ·
-[SAM tags: YS, YC, YD](tags.md) ·
-[Flags: --set-as-failed, --do-not-penalize-chimeras](flags.md) ·
+[SAM tags: XR, XG, XM](tags.md) ·
+[Flags: --set-as-failed, --chimera-qc](flags.md) ·
 [Conversion details](conversion.md) ·
 [User Guide → Output: SAM/BAM, headers, tags](../user-guide/output.md)

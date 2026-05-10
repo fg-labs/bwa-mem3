@@ -33,6 +33,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "memcpy_bwamem.h"
 #include "bam_writer.h"
 #include "meth_bam.h"
+#include "u8vec_scratch.h"
 #include <inttypes.h>      /* PRId64 for int64_t fprintf format strings */
 
 #include "sam_encode.h"
@@ -438,11 +439,18 @@ int mem_seed_sw(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
     }
     if (qe - qb >= MEM_SHORT_LEN || re - rb >= MEM_SHORT_LEN) return -1; // the seed seems good enough; no need to do SW
 
-    rseq = bns_fetch_seq(bns, pac, &rb, mid, &re, &rid);
-    // No qry-profile cache: each seed slices a different sub-query
-    // (query+qb, qe-qb), so ksw_align2 always builds a fresh profile.
-    x = ksw_align2(qe - qb, (uint8_t*)query + qb, re - rb, rseq, 5, opt->mat, opt->o_del, opt->e_del, opt->o_ins, opt->e_ins, KSW_XSTART, NULL);
-    free(rseq);
+    {
+        static thread_local u8vec_scratch_t t_rseq;
+        size_t want = (size_t)((re - rb) + 64);
+        if (t_rseq.v.m < want) kv_resize(uint8_t, t_rseq.v, want);
+        int64_t rlen;
+        bns_fetch_seq_into(bns, pac, &rb, mid, &re, &rid, t_rseq.v.a, &rlen);
+        rseq = t_rseq.v.a;
+        // No qry-profile cache: each seed slices a different sub-query
+        // (query+qb, qe-qb), so ksw_align2 always builds a fresh profile.
+        x = ksw_align2(qe - qb, (uint8_t*)query + qb, re - rb, rseq, 5, opt->mat, opt->o_del, opt->e_del, opt->o_ins, opt->e_ins, KSW_XSTART, NULL);
+        /* rseq aliases thread-local scratch; do not free. */
+    }
     return x.score;
 }
 
@@ -1842,7 +1850,9 @@ void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str,
     if (p->HN >= 0) { kputsn_u("\tHN:i:", 6, str); kputw_u(p->HN, str); }
 
     if (s->comment) { kputc_u('\t', str); kputs_u(s->comment, str); }
-    if ((opt->flag&MEM_F_REF_HDR) && p->rid >= 0 && bns->anns[p->rid].anno != 0 && bns->anns[p->rid].anno[0] != 0) {
+    if ((opt->flag&MEM_F_REF_HDR) && !opt->meth_mode && p->rid >= 0 && bns->anns[p->rid].anno != 0 && bns->anns[p->rid].anno[0] != 0) {
+        /* Suppressed under --meth: that mode repurposes XR:Z for the Bismark
+         * read-conversion direction (see docs/src/methylation/tags.md). */
         int tmp;
         kputsn_u("\tXR:Z:", 6, str);
         tmp = (int)str->l;

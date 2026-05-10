@@ -253,8 +253,9 @@ void bns_destroy(bntseq_t *bns)
 	}
 }
 
-#define _set_pac(pac, l, c) ((pac)[(l)>>2] |= (c)<<((~(l)&3)<<1))
-#define _get_pac(pac, l) ((pac)[(l)>>2]>>((~(l)&3)<<1)&3)
+/* _get_pac and _set_pac now published in bntseq.h so meth_orig_ref.cpp
+ * (and any other in-tree caller that needs inline 2-bit decode) can use
+ * them without re-defining. */
 
 static uint8_t *add1(const kseq_t *seq, bntseq_t *bns, uint8_t *pac, int64_t *m_pac, int *m_seqs, int *m_holes, bntamb1_t **q)
 {
@@ -411,65 +412,94 @@ int bns_intv2rid(const bntseq_t *bns, int64_t rb, int64_t re)
 	return rid_b == rid_e? rid_b : -1;
 }
 
-int bns_cnt_ambi(const bntseq_t *bns, int64_t pos_f, int len, int *ref_id)
+/* Iterate ambs intervals overlapping [pos_f, pos_f + len). Sorted by
+ * offset. The pre-existing bns_cnt_ambi did binary-search-then-break-on-
+ * first-overlap, which under-counts when a window legitimately overlaps
+ * two intervals; folding the count through this iterator fixes that as
+ * a side effect. */
+int bns_iter_ambi(const bntseq_t *bns, int64_t pos_f, int len,
+                  bns_amb_visit_fn fn, void *ctx)
 {
-	int left, mid, right, nn;
-	if (ref_id) *ref_id = bns_pos2rid(bns, pos_f);
-	left = 0; right = bns->n_holes; nn = 0;
+	int left, mid, right;
+	int64_t window_end = pos_f + len;
+	int rc = 0;
+	if (bns == NULL || bns->n_holes == 0 || len <= 0 || fn == NULL) return 0;
+
+	/* Lower-bound on offset+len: find the first amb whose end-position
+	 * is greater than pos_f (i.e. whose interval can possibly overlap). */
+	left = 0; right = bns->n_holes;
 	while (left < right) {
 		mid = (left + right) >> 1;
-		if (pos_f >= bns->ambs[mid].offset + bns->ambs[mid].len) left = mid + 1;
-		else if (pos_f + len <= bns->ambs[mid].offset) right = mid;
-		else { // overlap
-			if (pos_f >= bns->ambs[mid].offset) {
-				nn += bns->ambs[mid].offset + bns->ambs[mid].len < pos_f + len?
-					bns->ambs[mid].offset + bns->ambs[mid].len - pos_f : len;
-			} else {
-				nn += bns->ambs[mid].offset + bns->ambs[mid].len < pos_f + len?
-					bns->ambs[mid].len : len - (bns->ambs[mid].offset - pos_f);
-			}
-			break;
-		}
+		if ((int64_t)(bns->ambs[mid].offset + bns->ambs[mid].len) <= pos_f) left = mid + 1;
+		else right = mid;
 	}
-	return nn;
+
+	/* Walk forward through overlapping ambs until we run off the end. */
+	for (int i = left; i < bns->n_holes; ++i) {
+		const bntamb1_t *a = &bns->ambs[i];
+		if ((int64_t)a->offset >= window_end) break;
+		int64_t st = (int64_t)a->offset > pos_f ? (int64_t)a->offset : pos_f;
+		int64_t en = (int64_t)(a->offset + a->len) < window_end
+		             ? (int64_t)(a->offset + a->len) : window_end;
+		if (st >= en) continue;
+		rc = fn(st, en, ctx);
+		if (rc != 0) return rc;
+	}
+	return rc;
 }
 
-uint8_t *bns_get_seq(int64_t l_pac, const uint8_t *pac, int64_t beg, int64_t end, int64_t *len)
+namespace {
+struct cnt_ambi_ctx { int nn; };
+int cnt_ambi_visit(int64_t st, int64_t en, void *ctx) {
+	((cnt_ambi_ctx *)ctx)->nn += (int)(en - st);
+	return 0; /* keep iterating */
+}
+}
+
+int bns_cnt_ambi(const bntseq_t *bns, int64_t pos_f, int len, int *ref_id)
 {
-	uint8_t *seq = 0;
+	if (ref_id) *ref_id = bns_pos2rid(bns, pos_f);
+	cnt_ambi_ctx ctx = { 0 };
+	bns_iter_ambi(bns, pos_f, len, cnt_ambi_visit, &ctx);
+	return ctx.nn;
+}
+
+void bns_get_seq_into(int64_t l_pac, const uint8_t *pac,
+                      int64_t beg, int64_t end,
+                      uint8_t *dst, int64_t *len_out)
+{
 	if (end < beg) end ^= beg, beg ^= end, end ^= beg; // if end is smaller, swap
 	if (end > l_pac<<1) end = l_pac<<1;
 	if (beg < 0) beg = 0;
 	if (beg >= l_pac || end <= l_pac) {
 		int64_t k, l = 0;
-		*len = end - beg;
-		seq = (uint8_t*) malloc(end - beg + 64);		
-        assert(seq != NULL);
+		*len_out = end - beg;
 		if (beg >= l_pac) { // reverse strand
 			int64_t beg_f = (l_pac<<1) - 1 - end;
 			int64_t end_f = (l_pac<<1) - 1 - beg;
 			for (k = end_f; k > beg_f; --k) {
-				seq[l++] = 3 - _get_pac(pac, k);
+				dst[l++] = 3 - _get_pac(pac, k);
 			}
 		} else { // forward strand
 			for (k = beg; k < end; ++k) {
-				seq[l++] = _get_pac(pac, k);
+				dst[l++] = _get_pac(pac, k);
 			}
 		}
-	} else *len = 0; // if bridging the forward-reverse boundary, return nothing
-	return seq;
+	} else {
+		*len_out = 0; // if bridging the forward-reverse boundary, return nothing
+	}
 }
 
-uint8_t *bns_fetch_seq(const bntseq_t *bns, const uint8_t *pac, int64_t *beg, int64_t mid, int64_t *end, int *rid)
+void bns_fetch_seq_into(const bntseq_t *bns, const uint8_t *pac,
+                        int64_t *beg, int64_t mid, int64_t *end, int *rid,
+                        uint8_t *dst, int64_t *len_out)
 {
-	int64_t far_beg, far_end, len;
+	int64_t far_beg, far_end;
 	int is_rev;
-	uint8_t *seq;
 
 	if (*end < *beg) *end ^= *beg, *beg ^= *end, *end ^= *beg; // if end is smaller, swap
-	// printf("%ld %ld %ld\n", *beg, mid, *end);
 	assert(*beg <= mid && mid < *end);
-	
+
 	*rid = bns_pos2rid(bns, bns_depos(bns, mid, &is_rev));
 	far_beg = bns->anns[*rid].offset;
 	far_end = far_beg + bns->anns[*rid].len;
@@ -481,14 +511,13 @@ uint8_t *bns_fetch_seq(const bntseq_t *bns, const uint8_t *pac, int64_t *beg, in
 	*beg = *beg > far_beg? *beg : far_beg;
 	*end = *end < far_end? *end : far_end;
 
-	seq = bns_get_seq(bns->l_pac, pac, *beg, *end, &len);
+	bns_get_seq_into(bns->l_pac, pac, *beg, *end, dst, len_out);
 
-	if (seq == 0 || *end - *beg != len) {
-		fprintf(stderr, "[E::%s] begin=%ld, mid=%ld, end=%ld, len=%ld, seq=%p, rid=%d, far_beg=%ld, far_end=%ld\n",
-				__func__, (long)*beg, (long)mid, (long)*end, (long)len, seq, *rid, (long)far_beg, (long)far_end);
+	if (*end - *beg != *len_out) {
+		fprintf(stderr, "[E::%s] begin=%ld, mid=%ld, end=%ld, len=%ld, rid=%d, far_beg=%ld, far_end=%ld\n",
+				__func__, (long)*beg, (long)mid, (long)*end, (long)(*len_out), *rid, (long)far_beg, (long)far_end);
 	}
-	assert(seq && *end - *beg == len); // assertion failure should never happen
-	return seq;
+	assert(*end - *beg == *len_out); // assertion failure should never happen
 }
 
 // Zero-copy v2 variants. Identical semantics to bns_get_seq / bns_fetch_seq

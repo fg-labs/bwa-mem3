@@ -83,6 +83,10 @@ static int meth_c2t_is_fresh(const char *in_fa, const char *out_fa)
     return b.st_mtime >= a.st_mtime;
 }
 
+/* (No separate un-converted-pac emission. `bwa-mem3 mem --meth` recovers
+ * original ref bases at runtime via per-record dual-slice from idx->pac
+ * — see src/meth_orig_ref.cpp.) */
+
 static int meth_index_c2t_build(const char *fa)
 {
     char out_fa[PATH_MAX];

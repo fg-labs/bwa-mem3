@@ -1,3 +1,14 @@
+Release 0.2.0-pre (2026-05-09)
+---------------------------------
+
+* `mem --meth` emits Bismark-compatible auxiliary tags `XR:Z`
+  (read conversion `CT`/`GA`), `XG:Z` (genome strand `CT`/`GA`),
+  and `XM:Z` (per-base methylation call string). These replace the
+  prior bwameth-style `YS:Z`/`YC:Z`/`YD:Z` on output (still used
+  internally for SEQ restoration). The reference-annotation `XR:Z`
+  from `-V` is suppressed under `--meth` to avoid colliding with the
+  Bismark semantics. See `docs/src/methylation/tags.md`.
+
 Release 0.1.0-pre (2026-04-28)
 ---------------------------------
 

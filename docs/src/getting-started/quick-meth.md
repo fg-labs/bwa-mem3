@@ -45,9 +45,9 @@ auto-appends `.bwameth.c2t` to the reference path when `--meth` is active.
 external tools:
 
 1. **Inline c2t read conversion.** R1 reads have every `C` converted to `T` before alignment;
-   R2 reads have every `G` converted to `A`. The original unconverted sequence is preserved in
-   the `YS:Z:` SAM tag. The conversion direction for each read is recorded in `YC:Z:` (value
-   `CT` or `GA`), matching the bwameth.py convention.
+   R2 reads have every `G` converted to `A`. The original unconverted sequence is restored
+   into the BAM `SEQ` field on emit. The conversion direction is reported per record in the
+   Bismark `XR:Z` tag (value `CT` for R1/SE, `GA` for R2).
 
 2. **bwameth.py-equivalent scoring defaults.** `--meth` sets `-B 2 -L 10 -U 100 -T 40 -CM`
    automatically. These match the defaults used by bwameth.py and are optimized for
@@ -57,8 +57,8 @@ external tools:
 3. **Inline BAM post-processing.** After alignment, bwa-mem3 rewrites the SAM stream in-process:
    - `@SQ` headers with `f`/`r` prefixes (e.g. `fchr1`, `rchr1`) are collapsed back to one
      entry per real chromosome (`chr1`). Read-level `RNAME` fields are rewritten to match.
-   - Each mapped record gains a `YD:Z:` tag (`f` for forward-strand, `r` for reverse-strand)
-     indicating which converted strand the read aligned to.
+   - Each mapped record gains Bismark `XG:Z` (genome strand: `CT` for top-strand
+     alignment, `GA` for bottom-strand) and `XM:Z` (per-base methylation call string).
    - Chimera QC: reads whose longest `M`/`=`/`X` run is less than 44% of the read length are
      flagged `0x200` (QC-fail), have flag `0x2` (proper pair) cleared, and have MAPQ capped at 1.
    - Pair-level QC-fail propagation: if one mate is QC-failed, the other mate is also flagged.
@@ -69,8 +69,9 @@ external tools:
    downstream `samtools sort` to read BAM natively. The stream is still fully readable by any
    htslib-based tool.
 
-For full details on each tag, the chimera QC heuristic, and the `--set-as-failed` and
-`--do-not-penalize-chimeras` flags, see the [Methylation Reference](../methylation/overview.md).
+For full details on each tag, the optional chimera QC heuristic, and the
+`--set-as-failed` / `--chimera-qc` flags, see the
+[Methylation Reference](../methylation/overview.md).
 
 ---
 

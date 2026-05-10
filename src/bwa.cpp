@@ -38,6 +38,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "utils.h"
 #include "kstring.h"
 #include "kvec.h"
+#include "u8vec_scratch.h"
 #include <string>
 
 #include "safestringlib.h"
@@ -268,7 +269,13 @@ uint32_t *bwa_gen_cigar2(const int8_t mat[25], int o_del, int e_del, int o_ins, 
     if (n_cigar) *n_cigar = 0;
     if (NM) *NM = -1;
     if (l_query <= 0 || rb >= re || (rb < l_pac && re > l_pac)) return 0; // reject if negative length or bridging the forward and reverse strand
-    rseq = bns_get_seq(l_pac, pac, rb, re, &rlen);
+    {
+        static thread_local u8vec_scratch_t t_rseq;
+        size_t want = (size_t)((re - rb) + 64);  // +64 keeps the "+64" headroom the old malloc had
+        if (t_rseq.v.m < want) kv_resize(uint8_t, t_rseq.v, want);
+        bns_get_seq_into(l_pac, pac, rb, re, t_rseq.v.a, &rlen);
+        rseq = t_rseq.v.a;
+    }
     if (re - rb != rlen) goto ret_gen_cigar; // possible if out of range
     if (rb >= l_pac) { // then reverse both query and rseq; this is to ensure indels to be placed at the leftmost position
         for (i = 0; i < l_query>>1; ++i)
@@ -341,7 +348,7 @@ uint32_t *bwa_gen_cigar2(const int8_t mat[25], int o_del, int e_del, int o_ins, 
             tmp = query[i], query[i] = query[l_query - 1 - i], query[l_query - 1 - i] = tmp;
 
 ret_gen_cigar:
-    free(rseq);
+    /* rseq aliases thread-local kvec scratch in this function; do not free. */
     return cigar;
 }
 

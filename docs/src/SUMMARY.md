@@ -46,9 +46,9 @@
 - [Overview](methylation/overview.md)
 - [bwameth.py drop-in mapping](methylation/bwameth-mapping.md)
 - [Conversion details (C->T, G->A)](methylation/conversion.md)
-- [SAM tags: YS, YC, YD](methylation/tags.md)
+- [SAM tags: XR, XG, XM](methylation/tags.md)
 - [Chimera QC and header rewriting](methylation/post-processing.md)
-- [Flags: --set-as-failed, --do-not-penalize-chimeras](methylation/flags.md)
+- [Flags: --set-as-failed, --chimera-qc](methylation/flags.md)
 - [Interop with external bwameth.py c2t](methylation/external-c2t.md)
 
 # What's Different from bwa-mem2

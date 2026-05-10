@@ -8,13 +8,15 @@
 #   - produces uncompressed BAM readable by samtools
 #   - @PG ID:bwa-mem3-meth present
 #   - BGZF EOF marker at tail
-#   - --set-as-failed / --do-not-penalize-chimeras parse cleanly
+#   - --set-as-failed / --chimera-qc parse cleanly
 #
 # Layer 2 (runs if pixi + bwameth.py available):  equivalence to bwameth.py.
 #   Builds a bwameth c2t reference, c2t-converts reads, runs BOTH the
 #   bwameth.py Python pipeline and `bwa-mem3 mem --meth` on the same
-#   converted reads, and diffs structural fields + YD:Z tags + flag
-#   distribution. Currently zero diff on the bwa-meth/example fixture.
+#   converted reads, and diffs structural fields (QNAME, FLAG, RNAME,
+#   POS, MAPQ, CIGAR, RNEXT, PNEXT) only. Tag-value parity moved to
+#   test_bismark_tags.sh (holodeck golden) since the two pipelines now
+#   emit different tag schemas (Bismark XR/XG/XM vs bwameth YS/YC/YD).
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -61,14 +63,76 @@ fi
 TOTAL="$("$SAMTOOLS" view -c /tmp/meth_test.bam 2>/dev/null)"
 if [[ "$TOTAL" -lt 1 ]]; then echo "FAIL: zero records in output BAM"; exit 1; fi
 
-"$BWAMEM3" mem --meth --set-as-failed f --do-not-penalize-chimeras \
+"$BWAMEM3" mem --meth --set-as-failed f --chimera-qc \
     ref.fa t_R1.fastq.gz 2>/dev/null > /tmp/meth_test2.bam
 if [[ ! -s /tmp/meth_test2.bam ]]; then
-    echo "FAIL: --set-as-failed + --do-not-penalize-chimeras produced empty output"
+    echo "FAIL: --set-as-failed + --chimera-qc produced empty output"
     exit 1
 fi
 
 echo "OK layer 1: bwa-mem3 mem --meth (records=$TOTAL, BGZF-EOF ok, @PG bwa-mem3-meth ok)"
+
+# --- Bismark XR:Z / XG:Z / XM:Z emission assertions ----------------------
+# Every primary mapped record (FLAG & 0x904 == 0) must carry XR:Z:(CT|GA),
+# XG:Z:(CT|GA), and XM:Z whose payload length equals SEQ length. Unmapped
+# records (FLAG & 0x4) carry XR:Z only. No record emits the legacy Y* tags.
+
+PRIMARY_MAPPED_NO_XR=$("$SAMTOOLS" view -F 0x904 /tmp/meth_test.bam \
+    | mawk '!/\tXR:Z:(CT|GA)/{n++} END{print n+0}')
+if [[ "$PRIMARY_MAPPED_NO_XR" -ne 0 ]]; then
+    echo "FAIL: $PRIMARY_MAPPED_NO_XR primary mapped record(s) missing XR:Z:(CT|GA)"
+    exit 1
+fi
+
+PRIMARY_MAPPED_NO_XG=$("$SAMTOOLS" view -F 0x904 /tmp/meth_test.bam \
+    | mawk '!/\tXG:Z:(CT|GA)/{n++} END{print n+0}')
+if [[ "$PRIMARY_MAPPED_NO_XG" -ne 0 ]]; then
+    echo "FAIL: $PRIMARY_MAPPED_NO_XG primary mapped record(s) missing XG:Z:(CT|GA)"
+    exit 1
+fi
+
+XM_LEN_BAD=$("$SAMTOOLS" view -F 0x904 /tmp/meth_test.bam \
+    | mawk '
+        {
+            seq_len = length($10)
+            xm_len = -1
+            for (i = 12; i <= NF; i++) {
+                if (substr($i, 1, 5) == "XM:Z:") { xm_len = length($i) - 5; break }
+            }
+            if (xm_len < 0) { n++; next }
+            if (xm_len != seq_len) n++
+        }
+        END { print n+0 }')
+if [[ "$XM_LEN_BAD" -ne 0 ]]; then
+    echo "FAIL: $XM_LEN_BAD record(s) with missing or wrong-length XM:Z"
+    exit 1
+fi
+
+UNMAPPED_BAD=$("$SAMTOOLS" view -f 0x4 /tmp/meth_test.bam \
+    | mawk '
+        {
+            has_xr = 0; has_xg = 0; has_xm = 0
+            for (i = 12; i <= NF; i++) {
+                if (substr($i, 1, 5) == "XR:Z:") has_xr = 1
+                if (substr($i, 1, 5) == "XG:Z:") has_xg = 1
+                if (substr($i, 1, 5) == "XM:Z:") has_xm = 1
+            }
+            if (!has_xr || has_xg || has_xm) n++
+        }
+        END { print n+0 }')
+if [[ "$UNMAPPED_BAD" -ne 0 ]]; then
+    echo "FAIL: $UNMAPPED_BAD unmapped record(s) with wrong tag set (XR required, XG/XM forbidden)"
+    exit 1
+fi
+
+Y_LEAKS=$("$SAMTOOLS" view /tmp/meth_test.bam \
+    | grep -cE '\b(YS|YC|YD):[ZA]:' || true)
+if [[ "$Y_LEAKS" -ne 0 ]]; then
+    echo "FAIL: $Y_LEAKS record(s) still emit YS/YC/YD legacy tags"
+    exit 1
+fi
+
+echo "OK layer 1 Bismark tags: XR/XG/XM well-formed, no Y* leak"
 
 # ---------------------------------------------------------------------------
 # Layer 2: bwa-meth equivalence (requires pixi + bwameth.py + toolshed)
@@ -107,7 +171,10 @@ pixi run python3 "$BWAMETH_PY" --reference ref.fa t_R1.fastq.gz t_R2.fastq.gz \
 
 pixi run python3 "$BWAMETH_PY" c2t t_R1.fastq.gz t_R2.fastq.gz 2>/dev/null \
     > /tmp/meth_c2t.fq
-"$BWAMEM3" mem --meth -CM -p -T 40 -B 2 -L 10 -U 100 -t 4 \
+# --chimera-qc: bwa-mem3's chimera heuristic is off by default (Bismark
+# behavior); enable it here so the structural diff against bwameth.py
+# (which always applies the heuristic) sees matching FLAG/MAPQ values.
+"$BWAMEM3" mem --meth --chimera-qc -CM -p -T 40 -B 2 -L 10 -U 100 -t 4 \
     ref.fa.bwameth.c2t /tmp/meth_c2t.fq 2>/dev/null > /tmp/meth_mine.bam
 "$SAMTOOLS" view /tmp/meth_mine.bam 2>/dev/null > /tmp/meth_mine.sam
 
@@ -139,15 +206,6 @@ TWO="$(diff <(norm /tmp/meth_mine.sam | cut -f6) \
              <(norm /tmp/meth_oracle_records.sam | cut -f6) | wc -l | tr -d ' ')"
 if [[ "$TWO" != "0" ]]; then echo "FAIL layer 2: CIGAR diff ($TWO lines)"; exit 1; fi
 
-for d in f r; do
-    MINE_YD="$(grep -c "YD:Z:$d" /tmp/meth_mine.sam || true)"
-    ORACLE_YD="$(grep -c "YD:Z:$d" /tmp/meth_oracle_records.sam || true)"
-    if [[ "$MINE_YD" != "$ORACLE_YD" ]]; then
-        echo "FAIL layer 2: YD:Z:$d count mismatch (mine=$MINE_YD oracle=$ORACLE_YD)"
-        exit 1
-    fi
-done
-
 MINE_N="$(wc -l < /tmp/meth_mine.sam | tr -d ' ')"
 ORACLE_N="$(wc -l < /tmp/meth_oracle_records.sam | tr -d ' ')"
 if [[ "$MINE_N" != "$ORACLE_N" ]]; then
@@ -155,9 +213,13 @@ if [[ "$MINE_N" != "$ORACLE_N" ]]; then
     exit 1
 fi
 
-MINE_F="$(grep -c YD:Z:f /tmp/meth_mine.sam || true)"
-MINE_R="$(grep -c YD:Z:r /tmp/meth_mine.sam || true)"
-echo "OK layer 2: bwa-mem3 mem --meth matches bwameth.py (records=$MINE_N, YD:Z:f=$MINE_F YD:Z:r=$MINE_R)"
+# bwameth.py emits YD/YC/YS; bwa-mem3 emits Bismark XR/XG/XM. We don't
+# diff tag values across the two pipelines (different tag schemas).
+# Tag-value golden truth lives in Layer 3 (test_bismark_tags.sh) which
+# compares against holodeck's Bismark-compatible golden BAM.
+MINE_XG_F="$(grep -c 'XG:Z:CT' /tmp/meth_mine.sam || true)"
+MINE_XG_R="$(grep -c 'XG:Z:GA' /tmp/meth_mine.sam || true)"
+echo "OK layer 2: bwa-mem3 mem --meth matches bwameth.py structurally (records=$MINE_N, XG:Z:CT=$MINE_XG_F XG:Z:GA=$MINE_XG_R)"
 
 # ---------------------------------------------------------------------------
 # Layer 3: full-pipeline end-to-end — `bwa-mem3 index --meth` + `mem --meth`
@@ -187,8 +249,10 @@ fi
 rm -f "$HERE/ref.fa.bwameth.c2t"*
 "$BWAMEM3" index --meth ref.fa >/dev/null 2>&1
 
-# Single-command end-to-end alignment.
-"$BWAMEM3" mem --meth -t 4 ref.fa t_R1.fastq.gz t_R2.fastq.gz 2>/dev/null > /tmp/meth_e2e.bam
+# Single-command end-to-end alignment.  --chimera-qc enabled here for
+# parity with bwameth.py's always-on heuristic; default bwa-mem3 --meth
+# behavior is no chimera QC (Bismark default).
+"$BWAMEM3" mem --meth --chimera-qc -t 4 ref.fa t_R1.fastq.gz t_R2.fastq.gz 2>/dev/null > /tmp/meth_e2e.bam
 "$SAMTOOLS" view /tmp/meth_e2e.bam 2>/dev/null > /tmp/meth_e2e.sam
 
 # Oracle: bwameth.py end-to-end on the same raw FASTQs (reuses Layer 2's

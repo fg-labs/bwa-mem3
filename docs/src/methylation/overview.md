@@ -8,12 +8,15 @@ reference, and one `bwa-mem3 mem --meth` aligns and post-processes reads from
 raw FASTQ to sorted-ready BAM.
 
 The output BAM is structurally equivalent to what the bwameth.py pipeline
-produces: consolidated `@SQ` headers (one entry per real chromosome rather than
-one per doubled-reference contig), `YS:Z:` / `YC:Z:` tags carrying the
-original pre-conversion read sequence and the conversion direction, `YD:Z:`
-indicating the strand hypothesis, chimera QC flags, and a `@PG ID:bwa-mem3-meth`
-provenance entry. Downstream tools that consume bwameth.py output — including
-MethylDackel and Bismark — work without change.
+produces: consolidated `@SQ` headers (one entry per real chromosome rather
+than one per doubled-reference contig), Bismark-compatible `XR:Z` (read
+conversion `CT`/`GA`), `XG:Z` (genome strand `CT`/`GA`), and `XM:Z`
+(per-base methylation call string) auxiliary tags, optional chimera QC flags
+(`--chimera-qc`, off by default to match Bismark), and a
+`@PG ID:bwa-mem3-meth` provenance entry. Every Bismark-native tool
+(`bismark_methylation_extractor`, methylKit, methtuple, DMRfinder,
+epialleleR), MethylDackel, and biscuit's per-read methylation tools read
+the BAM directly without conversion.
 
 ## Pipeline at a glance
 
@@ -23,19 +26,21 @@ files are required.
 
 ```mermaid
 flowchart LR
-    A[Raw FASTQ\nR1 / R2] -->|inline C→T / G→A| B[c2t-converted reads\n+ YS:Z + YC:Z in comment]
+    A[Raw FASTQ\nR1 / R2] -->|inline C→T / G→A| B[c2t-converted reads\n+ internal YS/YC carrier]
     B -->|bwa mem core| C[mem_aln_t\nalignments vs doubled ref]
     C -->|chrom map\nf/r → real chr| D[header rewrite\n@SQ consolidated]
-    D -->|YD:Z tagging\nchimera QC\nQC-fail propagation| E[BAM output\nwb0 uncompressed]
+    D -->|XR/XG/XM Bismark tags\noptional --chimera-qc\nQC-fail propagation| E[BAM output\nwb0 uncompressed]
 ```
 
 Steps:
 
-1. **FASTQ ingest with inline c2t conversion.** R1 bases have every `C` replaced
-   with `T`; R2 bases have every `G` replaced with `A`. The original bases are
-   preserved in a `YS:Z:` comment field and the conversion direction is stored in
-   `YC:Z:`. This conversion happens in-memory — the FASTQ is never written to
-   disk in converted form.
+1. **FASTQ ingest with inline c2t conversion.** R1 bases have every `C`
+   replaced with `T`; R2 bases have every `G` replaced with `A`. The
+   original bases and conversion direction are kept on an internal carrier
+   on each read (in `bseq1_t.comment`); they are never emitted to BAM as
+   tags themselves but feed the BAM-write step (SEQ restoration, `XR:Z`
+   derivation). This conversion happens in-memory — the FASTQ is never
+   written to disk in converted form.
 
 2. **Alignment against the doubled reference.** The converted reads are aligned
    against the `ref.fa.bwameth.c2t` reference, which contains both a forward
@@ -47,13 +52,15 @@ Steps:
    single `@SQ SN:chr1` entry in the output BAM header. RNAME and RNEXT fields
    in each record are rewritten to the consolidated name.
 
-4. **Tag emission and QC.** Each aligned record receives a `YD:Z:{f,r}` tag
-   indicating which strand it mapped to. The chimera QC heuristic flags records
-   whose longest M/=/X CIGAR run covers less than 44% of the read length.
-   QC-fail flags propagate across all records in a read group. The original
-   pre-c2t sequence from `YS:Z:` is copied back into the BAM SEQ field so that
-   methylation callers (e.g. MethylDackel) see real cytosines rather than the
-   converted sequence.
+4. **Tag emission and QC.** Each aligned record receives Bismark-compatible
+   `XR:Z` (read conversion direction), `XG:Z` (genome strand), and `XM:Z`
+   (per-base methylation call string) auxiliary tags. With opt-in
+   `--chimera-qc` (off by default — matches Bismark), records whose longest
+   M/=/X CIGAR run covers less than 44 % of the read length are flagged
+   `0x200`; QC-fail flags then propagate across all records in a read group.
+   The original pre-c2t sequence is copied back into the BAM SEQ field so
+   methylation callers see real cytosines rather than the converted
+   sequence.
 
 5. **BAM output.** Records are written as uncompressed BAM (`wb0` mode via
    htslib). The `@PG ID:bwa-mem3-meth` line records the exact command line.
@@ -82,6 +89,6 @@ samtools index out.bam
 **See also:**
 [bwameth.py drop-in mapping](bwameth-mapping.md) ·
 [Conversion details](conversion.md) ·
-[SAM tags: YS, YC, YD](tags.md) ·
+[SAM tags: XR, XG, XM](tags.md) ·
 [Chimera QC and header rewriting](post-processing.md) ·
 [Quick start: methylation alignment](../getting-started/quick-meth.md)

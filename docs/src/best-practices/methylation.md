@@ -54,15 +54,18 @@ bwa-mem3 mem --meth --set-as-failed r --bam=0 -t 16 ref.fa R1.fq.gz R2.fq.gz \
   | samtools sort -@ 4 -o out.bam -
 ```
 
-**Chimeric reads from long-read-length protocols.** By default, `--meth`
-applies a chimera QC heuristic: if the longest matching run (CIGAR `M`/`=`/`X`
-operations) is less than 44% of the read length, the alignment is flagged
-`0x200` (QC fail), the paired flag `0x2` is cleared, and MAPQ is capped at 1.
-If your protocol produces legitimate long reads where this heuristic
-over-aggressively flags alignments, pass `--do-not-penalize-chimeras`:
+**Chimera QC is opt-in** (matches Bismark default). bwameth.py applies a
+chimera heuristic that flags reads whose longest matching run
+(CIGAR `M`/`=`/`X`) is less than 44 % of the read length: `0x200` set,
+`0x2` cleared, MAPQ capped at 1. `bwa-mem3 --meth` does **not** apply
+this by default — the runtime posture matches Bismark, where no such
+heuristic exists.
+
+If your library is PBAT / scBS-Seq (where intra-fragment chimerism is
+common) or you want bwameth.py-equivalent flagging, pass `--chimera-qc`:
 
 ```bash
-bwa-mem3 mem --meth --do-not-penalize-chimeras --bam=0 -t 16 ref.fa R1.fq.gz R2.fq.gz \
+bwa-mem3 mem --meth --chimera-qc --bam=0 -t 16 ref.fa R1.fq.gz R2.fq.gz \
   | samtools sort -@ 4 -o out.bam -
 ```
 
@@ -79,19 +82,18 @@ The `--meth` output BAM is designed to be a drop-in replacement for the output
 of the `bwameth.py` pipeline. The following downstream tools have been used
 successfully with `bwa-mem3 --meth` output:
 
-- **MethylDackel** — extracts methylation calls from the `YD:Z:` strand tag.
-- **Bismark** — accepts the bwameth-convention `YD:Z:` strand annotation.
-- **PileOMeth** — reads the standard bisulfite BAM format.
-
-If a tool requires the `XB:Z:` tag convention used by Bismark's own aligner
-rather than the `YD:Z:` convention, a conversion step is needed before
-methylation calling.
+- **`bismark_methylation_extractor`**, **methylKit `processBismarkAln`**,
+  **methtuple**, **DMRfinder**, **epialleleR** — read the Bismark `XR:Z`,
+  `XG:Z`, `XM:Z` tags directly from `--meth` output.
+- **MethylDackel** — reads `XG:Z` (and ignores the bwameth-convention `YD:Z:`
+  if present, which `--meth` no longer emits).
+- **biscuit per-read tools** — read `XG:Z`.
 
 ---
 
 **See also:**
 [Methylation Reference: Overview](../methylation/overview.md) ·
-[SAM tags: YS, YC, YD](../methylation/tags.md) ·
-[Flags: --set-as-failed, --do-not-penalize-chimeras](../methylation/flags.md) ·
+[SAM tags: XR, XG, XM](../methylation/tags.md) ·
+[Flags: --set-as-failed, --chimera-qc](../methylation/flags.md) ·
 [Quick start: methylation alignment](../getting-started/quick-meth.md) ·
 [Output format](output-format.md)
