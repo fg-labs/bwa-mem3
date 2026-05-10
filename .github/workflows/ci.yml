@@ -390,13 +390,16 @@ jobs:
           [ "$records" -ge 100000 ] || { echo "FAIL: expected >=100000 records, got $records"; exit 1; }
           echo "PASS: interleaved smoke ($records records)"
 
-      - name: Setup bwa-meth oracle (pixi)
+      - name: Install bwa-meth pixi env
         if: matrix.canonical == true
-        uses: prefix-dev/setup-pixi@1b2de7f3351f171c8b4dfeb558c639cb58ed4ec0 # v0.9.5
-        with:
-          pixi-version: v0.49.0
-          manifest-path: test/meth/pyproject.toml
-          cache: true
+        # The holodeck setup-pixi step already installed the pixi binary
+        # to /home/runner/.pixi/bin and added it to PATH. Calling
+        # setup-pixi a second time would collide on the binary download
+        # ("Destination file path /home/runner/.pixi/bin/pixi already
+        # exists"). Resolve the bwa-meth project's deps directly using
+        # the already-installed pixi instead.
+        run: |
+          pixi install --manifest-path test/meth/pyproject.toml
 
       - name: Checkout bwa-meth oracle
         if: matrix.canonical == true
