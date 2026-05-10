@@ -5,13 +5,6 @@ on:
     branches: [main]
   pull_request:
 
-env:
-  # Pin dwgsim so simulated reads are reproducible and the CI cache key
-  # (keyed on this ref) is valid.
-  DWGSIM_REF: "dwgsim.0.1.16"
-  # phiX174 genome URL (NCBI, immutable content).
-  PHIX_URL: "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/819/615/GCF_000819615.1_ViralProj14015/GCF_000819615.1_ViralProj14015_genomic.fna.gz"
-
 jobs:
   build-and-test:
     strategy:
@@ -197,123 +190,162 @@ jobs:
           fi
           echo "PASS: no-mimalloc build correctly omits mimalloc"
 
-      - name: Cache dwgsim binary
-        id: cache-dwgsim
+      - name: Cache chr22 reference
+        id: cache-chr22
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
-          path: /tmp/dwgsim-src/dwgsim
-          key: dwgsim-${{ runner.os }}-${{ runner.arch }}-${{ env.DWGSIM_REF }}
+          path: /tmp/chr22/chr22.fa
+          key: chr22-hg38-ucsc-v1
 
-      - name: Build dwgsim
-        if: steps.cache-dwgsim.outputs.cache-hit != 'true'
+      - name: Download chr22 reference (hg38)
+        if: steps.cache-chr22.outputs.cache-hit != 'true'
+        # --fail makes curl exit non-zero on HTTP 4xx/5xx instead of writing
+        # the error body into the gunzip pipe; --retry/--retry-delay/
+        # --retry-all-errors absorb transient UCSC hiccups so a flaky 5xx
+        # doesn't fail the whole matrix on a cold cache. The SHA-256 pin
+        # is enforced unconditionally by the next step so it catches both
+        # a fresh download and a restored cache entry.
         run: |
-          git clone https://github.com/nh13/DWGSIM.git /tmp/dwgsim-src
-          git -C /tmp/dwgsim-src checkout --detach "$DWGSIM_REF"
-          git -C /tmp/dwgsim-src submodule update --init --recursive
-          make -C /tmp/dwgsim-src -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
+          mkdir -p /tmp/chr22
+          curl --fail --retry 3 --retry-delay 2 --retry-all-errors -sSL \
+            "https://hgdownload.soe.ucsc.edu/goldenPath/hg38/chromosomes/chr22.fa.gz" \
+            | gunzip > /tmp/chr22/chr22.fa
+          test -s /tmp/chr22/chr22.fa
+          echo "chr22.fa bytes: $(wc -c < /tmp/chr22/chr22.fa)"
 
-      - name: Cache phiX174 reference
-        id: cache-phix
+      - name: Verify chr22 reference SHA-256
+        # Runs unconditionally — after a cache restore (hit) and after a
+        # fresh download (miss) — so the parity input is always
+        # cryptographically validated against the pin. Without this, a
+        # stale chr22-hg38-ucsc-v1 cache entry (e.g., one populated
+        # before the pin existed, or one carried over from a future pin
+        # bump that forgot to rev the cache key) would silently swap
+        # every regression job to a different chr22 payload.
+        env:
+          CHR22_FASTA_SHA256_PIN: ce3ee1ca39356238f7aee438a40a88b4f1b9d80b316b263e16fb12402212d10f
+        run: |
+          actual_sha=$(shasum -a 256 /tmp/chr22/chr22.fa | awk '{print $1}')
+          if [ "$actual_sha" != "$CHR22_FASTA_SHA256_PIN" ]; then
+            echo "FAIL: chr22.fa sha256 mismatch (expected $CHR22_FASTA_SHA256_PIN, got $actual_sha)" >&2
+            exit 1
+          fi
+
+      - name: Build chr22 FMI index
+        # bwa-mem3 index is rebuilt every run because its sidecar layout is
+        # coupled to the bwa-mem3 binary, which changes per commit.
+        run: |
+          cd /tmp/chr22
+          "$GITHUB_WORKSPACE/bwa-mem3" index chr22.fa
+          ls chr22.fa.*
+
+      - name: Compute chr22 bwa-index cache inputs
+        # Salt the bwa-index cache key with the inputs that actually
+        # produce it: the bwa version (apt on Linux, brew on macOS) and a
+        # digest of chr22.fa. Without this, an apt/brew bwa bump or a
+        # UCSC reference refresh would silently restore stale sidecars
+        # built from different inputs, breaking parity. shasum -a 256 is
+        # available on both ubuntu-latest and macos-latest.
+        run: |
+          bwa_version=$(bwa 2>&1 | sed -n 's/^Version: //p' | head -1)
+          chr22_fasta_sha=$(shasum -a 256 /tmp/chr22/chr22.fa | awk '{print $1}' | cut -c1-16)
+          {
+            echo "BWA_VERSION=${bwa_version}"
+            echo "CHR22_FASTA_SHA=${chr22_fasta_sha}"
+          } >> "$GITHUB_ENV"
+          echo "BWA_VERSION=${bwa_version}"
+          echo "CHR22_FASTA_SHA=${chr22_fasta_sha}"
+
+      - name: Cache chr22 bwa indexes
+        # Sidecars are cached separately from the chr22 FASTA so an
+        # apt/brew bwa bump invalidates this key without re-downloading
+        # the reference. The key is salted by ${BWA_VERSION} and a
+        # ${CHR22_FASTA_SHA} digest of chr22.fa (exported above) plus
+        # ${runner.os} to differentiate apt vs. brew bwa builds.
+        id: cache-chr22-bwa
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
-          path: /tmp/ci-test/phix174.fa
-          # NCBI phiX174 reference is immutable. Bump the suffix if
-          # PHIX_URL ever changes.
-          key: phix174-ncbi-v1
+          path: |
+            /tmp/chr22/bwa_chr22.fa
+            /tmp/chr22/bwa_chr22.fa.amb
+            /tmp/chr22/bwa_chr22.fa.ann
+            /tmp/chr22/bwa_chr22.fa.bwt
+            /tmp/chr22/bwa_chr22.fa.pac
+            /tmp/chr22/bwa_chr22.fa.sa
+          key: chr22-hg38-ucsc-bwa-v2-${{ runner.os }}-${{ env.BWA_VERSION }}-${{ env.CHR22_FASTA_SHA }}
 
-      - name: Download phiX174 reference
-        if: steps.cache-phix.outputs.cache-hit != 'true'
+      - name: Build chr22 bwa indexes
+        if: steps.cache-chr22-bwa.outputs.cache-hit != 'true'
+        # bwa index writes sidecars next to the FASTA filename, so we use
+        # a dedicated bwa_chr22.fa copy to keep its sidecars from
+        # colliding with the bwa-mem3 index files at /tmp/chr22/chr22.fa.*.
         run: |
-          mkdir -p /tmp/ci-test
-          curl -sL "$PHIX_URL" | gunzip > /tmp/ci-test/phix174.fa
+          cp /tmp/chr22/chr22.fa /tmp/chr22/bwa_chr22.fa
+          bwa index /tmp/chr22/bwa_chr22.fa
+          ls /tmp/chr22/bwa_chr22.fa.*
 
-      - name: Simulate reads with dwgsim
+      - name: Setup holodeck (pixi)
+        # Install holodeck via bioconda; pinned to v0.2.1 in
+        # test/holodeck/pixi.toml. Runs on every matrix row.
+        uses: prefix-dev/setup-pixi@1b2de7f3351f171c8b4dfeb558c639cb58ed4ec0 # v0.9.5
+        with:
+          pixi-version: v0.49.0
+          manifest-path: test/holodeck/pixi.toml
+          cache: true
+
+      - name: Simulate chr22 reads with holodeck
+        # Deterministic ~50k PE pairs by construction: chr22 is ~50 Mbp
+        # and --coverage 0.3 with --read-length 150 (~300 bp inserts)
+        # yields ~50k pairs. --simple-names emits @holodeck::N headers
+        # (aligners ignore name content). Flat 0.001 error rate mimics
+        # dwgsim's -r 0.001 -S 2 to keep the byte-identical parity bar
+        # realistic.
         run: |
-          # Pin -z so the simulated reads are reproducible across CI runs.
-          # Without this, each job gets a different time-seeded batch and a
-          # stray read spanning the phiX174 circular origin can produce a
-          # byte-level diff vs bwa, flaking the comparison step. See issue
-          # #11 for plans to replace this test with a curated dataset
-          # (via holodeck) and drop dwgsim entirely.
-          /tmp/dwgsim-src/dwgsim \
-            -z 42 \
-            -N 500 -1 150 -2 150 \
-            -r 0.001 -S 2 \
-            /tmp/ci-test/phix174.fa \
-            /tmp/ci-test/reads
+          mkdir -p /tmp/chr22-sim
+          pixi run --frozen --manifest-path test/holodeck/pixi.toml -- \
+            holodeck simulate \
+              -r /tmp/chr22/chr22.fa \
+              -o /tmp/chr22-sim/reads \
+              --coverage 0.3 \
+              --read-length 150 \
+              --seed 42 \
+              --simple-names \
+              --min-error-rate 0.001 --max-error-rate 0.001
+          ls /tmp/chr22-sim/
 
-      - name: Compare bwa and bwa-mem3 output (phiX parity)
+      - name: Compare chr22 bwa vs bwa-mem3 (parity)
         run: |
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
-          CI_TEST_DIR=/tmp/ci-test \
-          bash test/regression/phix_parity.sh
+          CHR22_FA=/tmp/chr22/chr22.fa \
+          BWA_CHR22_FA=/tmp/chr22/bwa_chr22.fa \
+          CHR22_SIM_DIR=/tmp/chr22-sim \
+          bash test/regression/chr22_parity.sh
 
       - name: Run unit-test harness
         if: matrix.canonical == true || matrix.arch_flag == 'sse41'
         run: |
           bash test/run_unit_tests.sh
 
-      - name: --bam=6 roundtrip smoke (phiX)
-        if: matrix.canonical == true
-        run: |
-          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
-          CI_TEST_DIR=/tmp/ci-test \
-          bash test/regression/bam_roundtrip.sh
-
-      - name: Thread-determinism smoke (phiX, -t 1 vs -t 4)
-        if: matrix.canonical == true
-        run: |
-          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
-          CI_TEST_DIR=/tmp/ci-test \
-          bash test/regression/thread_determinism.sh
-
-      - name: Cache chr22 reference
-        if: matrix.canonical == true
-        id: cache-chr22
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: /tmp/chr22
-          key: chr22-hg38-ucsc-v1
-
-      - name: Download chr22 reference (hg38)
-        if: matrix.canonical == true && steps.cache-chr22.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p /tmp/chr22
-          curl -sL "https://hgdownload.soe.ucsc.edu/goldenPath/hg38/chromosomes/chr22.fa.gz" \
-            | gunzip > /tmp/chr22/chr22.fa
-          test -s /tmp/chr22/chr22.fa
-          echo "chr22.fa bytes: $(wc -c < /tmp/chr22/chr22.fa)"
-
-      - name: Build chr22 FMI index
-        if: matrix.canonical == true
-        run: |
-          cd /tmp/chr22
-          $GITHUB_WORKSPACE/bwa-mem3 index chr22.fa
-          ls chr22.fa.*
-
-      - name: Simulate chr22 reads with dwgsim
-        if: matrix.canonical == true
-        run: |
-          mkdir -p /tmp/chr22-sim
-          /tmp/dwgsim-src/dwgsim \
-            -z 42 \
-            -N 50000 -1 150 -2 150 \
-            -r 0.001 -S 2 \
-            /tmp/chr22/chr22.fa /tmp/chr22-sim/reads
-
-      - name: Compare chr22 bwa vs bwa-mem3 (parity)
+      - name: --bam=6 roundtrip smoke (chr22)
         if: matrix.canonical == true
         run: |
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           CHR22_FA=/tmp/chr22/chr22.fa \
           CHR22_SIM_DIR=/tmp/chr22-sim \
-          bash test/regression/chr22_parity.sh
+          bash test/regression/bam_roundtrip.sh
+
+      - name: Thread-determinism smoke (chr22, -t 1 vs -t 4)
+        if: matrix.canonical == true
+        run: |
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          CHR22_FA=/tmp/chr22/chr22.fa \
+          CHR22_SIM_DIR=/tmp/chr22-sim \
+          bash test/regression/thread_determinism.sh
 
       - name: SE alignment smoke (chr22)
         if: matrix.canonical == true
         run: |
-          $GITHUB_WORKSPACE/bwa-mem3 mem -t 4 /tmp/chr22/chr22.fa \
-            /tmp/chr22-sim/reads.bwa.read1.fastq.gz > /tmp/chr22-sim/se.sam 2>/dev/null
+          "$GITHUB_WORKSPACE/bwa-mem3" mem -t 4 /tmp/chr22/chr22.fa \
+            /tmp/chr22-sim/reads.r1.fastq.gz > /tmp/chr22-sim/se.sam 2>/dev/null
           records=$(grep -cv '^@' /tmp/chr22-sim/se.sam)
           [ "$records" -gt 0 ] || { echo "FAIL: SE alignment produced zero records"; exit 1; }
           grep -q '^@PG.*bwa-mem3' /tmp/chr22-sim/se.sam || { echo "FAIL: SE missing @PG"; exit 1; }
@@ -328,14 +360,14 @@ jobs:
           # input to one tab-separated row per record first (`paste - - - -`),
           # then interleave whole records, then re-expand tabs to newlines.
           paste -d '\n' \
-            <(zcat /tmp/chr22-sim/reads.bwa.read1.fastq.gz | paste - - - -) \
-            <(zcat /tmp/chr22-sim/reads.bwa.read2.fastq.gz | paste - - - -) \
+            <(zcat /tmp/chr22-sim/reads.r1.fastq.gz | paste - - - -) \
+            <(zcat /tmp/chr22-sim/reads.r2.fastq.gz | paste - - - -) \
             | tr '\t' '\n' > /tmp/chr22-sim/interleaved.fq
-          $GITHUB_WORKSPACE/bwa-mem3 mem -p -t 4 /tmp/chr22/chr22.fa \
+          "$GITHUB_WORKSPACE/bwa-mem3" mem -p -t 4 /tmp/chr22/chr22.fa \
             /tmp/chr22-sim/interleaved.fq > /tmp/chr22-sim/p.sam 2>/dev/null
           records=$(grep -cv '^@' /tmp/chr22-sim/p.sam)
           [ "$records" -gt 0 ] || { echo "FAIL: interleaved alignment produced zero records"; exit 1; }
-          # 50,000 simulated PE pairs × 2 reads = 100,000 input reads, so a
+          # ~50,000 simulated PE pairs × 2 reads = ~100,000 input reads, so a
           # properly interleaved input must produce at least one SAM line per
           # read (primary alignment, mapped or unmapped). Tolerate >= because
           # secondary/supplementary alignments add extra lines. Without this
@@ -344,7 +376,7 @@ jobs:
           [ "$records" -ge 100000 ] || { echo "FAIL: expected >=100000 records, got $records"; exit 1; }
           echo "PASS: interleaved smoke ($records records)"
 
-      - name: Install pixi (for --meth oracle)
+      - name: Setup bwa-meth oracle (pixi)
         if: matrix.canonical == true
         uses: prefix-dev/setup-pixi@1b2de7f3351f171c8b4dfeb558c639cb58ed4ec0 # v0.9.5
         with:
