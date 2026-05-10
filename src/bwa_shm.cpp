@@ -38,6 +38,7 @@
 #include <cstring>
 #include <sys/mman.h>      /* shm_open, mmap, munmap */
 #include <sys/stat.h>      /* mode constants, stat */
+#include <sys/statvfs.h>   /* statvfs — /dev/shm capacity preflight */
 #include <fcntl.h>         /* O_* */
 #include <unistd.h>        /* close, ftruncate */
 #include <getopt.h>        /* getopt_long for `bwa-mem3 shm --meth ...` */
@@ -640,6 +641,54 @@ int bwa_shm_stage(const char *prefix)
         ctl_lock_release(ctl_lock);
         bwa_shm_layout_free(&layout);
         return -1;
+    }
+
+    /* 4b. /dev/shm capacity preflight.
+     *
+     * ftruncate on a tmpfs file lazily reserves space — it succeeds even
+     * when the requested size exceeds the tmpfs limit. The actual ENOSPC
+     * surfaces during pack_into's freads as SIGBUS / EFAULT when a page
+     * fault on a write to the mmap'd region cannot allocate a backing
+     * page. The user-visible failure is then a confusing
+     * `[fread] Bad address` from err_fread_noeof, with no indication
+     * that /dev/shm was the cause.
+     *
+     * statvfs("/dev/shm") tells us the tmpfs's available bytes up-front,
+     * so we can refuse cleanly with a message that points at the actual
+     * fix. Default tmpfs size on Linux is RAM/2 (e.g. 16 GB on a 32 GB
+     * c7a.4xlarge / c7i.4xlarge), so the hg38 FMI index (~17 GB
+     * total_size) doesn't fit out of the box on common AWS instance
+     * sizes. The remediation is a one-liner — `mount -o remount,size=…`
+     * — but only useful if the user knows that's the problem. */
+    {
+        struct statvfs svfs;
+        if (statvfs("/dev/shm", &svfs) == 0) {
+            /* f_bavail is in units of f_frsize (fundamental block size),
+             * not f_bsize (preferred I/O block size); on Linux tmpfs the
+             * two are equal but POSIX permits them to differ (e.g. ZFS
+             * reports f_frsize=1MiB), so use f_frsize for portability. */
+            uint64_t avail = (uint64_t)svfs.f_frsize * (uint64_t)svfs.f_bavail;
+            if ((uint64_t)layout.total_size > avail) {
+                std::fprintf(stderr,
+                    "[E::%s] /dev/shm has %llu bytes free but staging '%s' "
+                    "needs %llu bytes. Remount with larger size, e.g. "
+                    "`sudo mount -o remount,size=%lluG /dev/shm`.\n",
+                    __func__,
+                    (unsigned long long)avail,
+                    name,
+                    (unsigned long long)layout.total_size,
+                    (unsigned long long)((layout.total_size + (1ULL<<30) - 1) / (1ULL<<30) + 2));
+                ctl_close(ctl_map, ctl_fd);
+                ctl_lock_release(ctl_lock);
+                bwa_shm_layout_free(&layout);
+                return -1;
+            }
+        }
+        /* statvfs failure (e.g. /dev/shm not present, ENOSYS on exotic
+         * kernels) is non-fatal — fall through and let the existing
+         * shm_open / ftruncate / pack_into path run. The pre-existing
+         * (less helpful) error message in pack_into is still better
+         * than refusing to stage based on a missing diagnostic. */
     }
 
     /* 5. Create the per-index segment. EEXIST means another stager raced us
