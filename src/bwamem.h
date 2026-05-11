@@ -110,7 +110,7 @@ typedef struct mem_opt_t {
     int    bam_level;       // 0..9, BGZF deflate level (0 = uncompressed)
     int    meth_mode;       // 1 = bisulfite mode (--meth); implies bam_mode
     char   meth_set_as_failed;// 'f', 'r', or 0 — flag reads on that strand 0x200
-    int    meth_no_chim;    // 1 to skip the longest-M <44% chimera heuristic
+    int    meth_chimera_qc; // 1 to enable bwameth.py-style longest-M <44% chimera heuristic (default off; not in Bismark)
     int    supp_rep_hard_cap; // supp alnregs whose chain's seeds share >=this many genome hits are forced to MAPQ=0; 0 disables
 } mem_opt_t;
 

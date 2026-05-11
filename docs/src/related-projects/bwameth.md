@@ -26,11 +26,12 @@ bundled with the original script.
 alignment pipeline. It inlines the C-to-T and G-to-A conversion, runs the bwa-mem3
 alignment engine (with all of its correctness fixes and SIMD speedups), rewrites the
 `@SQ` headers to collapse the per-strand contig pairs back to canonical chromosome names,
-applies chimera QC, and emits a `@PG ID:bwa-mem3-meth` header. The output BAM is
-compatible with the same downstream tabulation tools that consume bwameth.py output.
+emits Bismark-compatible `XR:Z` / `XG:Z` / `XM:Z` auxiliary tags, and writes a
+`@PG ID:bwa-mem3-meth` header. The bwameth.py-style chimera QC heuristic is
+available via `--chimera-qc` (off by default — Bismark behavior).
 The [Methylation Reference](../methylation/overview.md) section documents the full
-implementation in detail, including the `YS:Z:`, `YC:Z:`, and `YD:Z:` tags and the
-`--set-as-failed` and `--do-not-penalize-chimeras` flags.
+implementation in detail, including the Bismark `XR:Z` / `XG:Z` / `XM:Z` tags and
+the `--set-as-failed` / `--chimera-qc` flags.
 
 > **Tip — Interop with the bwameth.py c2t step**
 >

@@ -68,7 +68,7 @@ int meth_bam_writer_close(meth_bam_writer_t *w);
 /* Convert one alignment to a bam1_t with meth transforms applied:
  *   - chrom rewrite: p->rid → cmap->out_tid[p->rid]
  *   - YD:Z:{f,r} tag from cmap->direction[p->rid]
- *   - chimera QC (unless opt->meth_no_chim): if longest M/=/X run < 44%
+ *   - chimera QC (only when opt->meth_chimera_qc is set): if longest M/=/X run < 44%
  *     of l_seq, set 0x200, clear 0x2, cap mapq at 1
  *   - opt->meth_set_as_failed forces 0x200 on the matching strand
  * Caller owns `b`. Returns 0 on success, -1 on error. */

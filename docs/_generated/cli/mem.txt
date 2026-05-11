@@ -51,8 +51,9 @@ Bisulfite (--meth) options:
                  with `bwa-mem3 index --meth` (emits ref.fa.bwameth.c2t).
    --set-as-failed f|r
                  flag alignments to the matching strand ('f' or 'r') as QC-fail (0x200)
-   --do-not-penalize-chimeras
-                 disable the longest-match <44% chimera heuristic (no 0x200 / MAPQ cap)
+   --chimera-qc
+                 enable the bwameth.py-style longest-match <44% chimera heuristic
+                 (sets 0x200, clears 0x2, caps MAPQ at 1). Off by default; not in Bismark.
 Supplementary MAPQ rescoring (fg-labs extension):
    --supp-rep-hard-cap INT
                  force MAPQ=0 for supplementary alignments whose chain contains any seed

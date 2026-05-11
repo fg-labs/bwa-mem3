@@ -42,6 +42,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "FMI_search.h"
 #include "bam_writer.h"
 #include "meth_bam.h"
+#include "meth_orig_ref.h"
 #include "bwa_shm.h"
 
 #if AFF && (__linux__)
@@ -890,8 +891,9 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "                 with `bwa-mem3 index --meth` (emits ref.fa.bwameth.c2t).\n");
     fprintf(stderr, "   --set-as-failed f|r\n");
     fprintf(stderr, "                 flag alignments to the matching strand ('f' or 'r') as QC-fail (0x200)\n");
-    fprintf(stderr, "   --do-not-penalize-chimeras\n");
-    fprintf(stderr, "                 disable the longest-match <44%% chimera heuristic (no 0x200 / MAPQ cap)\n");
+    fprintf(stderr, "   --chimera-qc\n");
+    fprintf(stderr, "                 enable the bwameth.py-style longest-match <44%% chimera heuristic\n");
+    fprintf(stderr, "                 (sets 0x200, clears 0x2, caps MAPQ at 1). Off by default; not in Bismark.\n");
     fprintf(stderr, "Supplementary MAPQ rescoring (fg-labs extension):\n");
     fprintf(stderr, "   --supp-rep-hard-cap INT\n");
     fprintf(stderr, "                 force MAPQ=0 for supplementary alignments whose chain contains any seed\n");
@@ -996,15 +998,16 @@ int main_mem(int argc, char *argv[])
     // comment: added option '5' in the list
     //
     // Long-only options for bisulfite mode (bwa-mem3 meth fork):
-    //   --meth                      Enable inline bwameth-style c2t + post-processing + BAM output.
-    //                               Expects a reference built with `bwa-mem3 index --meth`.
-    //   --set-as-failed f|r         Flag alignments to this strand as QC-fail (0x200)
-    //   --do-not-penalize-chimeras  Skip the longest-match <44% chimera heuristic
+    //   --meth              Enable inline bwameth-style c2t + post-processing + BAM output.
+    //                       Expects a reference built with `bwa-mem3 index --meth`.
+    //   --set-as-failed f|r Flag alignments to this strand as QC-fail (0x200)
+    //   --chimera-qc        Enable the bwameth.py-style longest-M <44% chimera heuristic
+    //                       (off by default; not part of Bismark)
     enum {
         OPT_BAM = 1000,
         OPT_METH,
         OPT_METH_SET_AS_FAILED,
-        OPT_METH_NO_CHIMERA,
+        OPT_METH_CHIMERA_QC,
         OPT_SUPP_REP_HARD_CAP,
         OPT_HELP,
     };
@@ -1012,7 +1015,7 @@ int main_mem(int argc, char *argv[])
         {"bam",                      optional_argument, 0, OPT_BAM},
         {"meth",                     no_argument,       0, OPT_METH},
         {"set-as-failed",            required_argument, 0, OPT_METH_SET_AS_FAILED},
-        {"do-not-penalize-chimeras", no_argument,       0, OPT_METH_NO_CHIMERA},
+        {"chimera-qc",               no_argument,       0, OPT_METH_CHIMERA_QC},
         {"supp-rep-hard-cap",        required_argument, 0, OPT_SUPP_REP_HARD_CAP},
         {"help",                     no_argument,       0, OPT_HELP},
         {0, 0, 0, 0}
@@ -1152,8 +1155,8 @@ int main_mem(int argc, char *argv[])
             }
             opt->meth_set_as_failed = optarg[0];
         }
-        else if (c == OPT_METH_NO_CHIMERA) {
-            opt->meth_no_chim = 1;
+        else if (c == OPT_METH_CHIMERA_QC) {
+            opt->meth_chimera_qc = 1;
         }
         else if (c == OPT_SUPP_REP_HARD_CAP) {
             char *end = NULL;
@@ -1411,6 +1414,15 @@ int main_mem(int argc, char *argv[])
             delete aux.fmi;
             return 1;
         }
+        g_meth_orig_ref = meth_orig_ref_load(aux.fmi->idx->bns,
+                                             aux.fmi->idx->pac, g_meth_cmap);
+        if (g_meth_orig_ref == NULL) {
+            fprintf(stderr, "ERROR: meth: failed to build un-converted ref view\n");
+            meth_chrom_map_free(g_meth_cmap); g_meth_cmap = NULL;
+            free(opt);
+            delete aux.fmi;
+            return 1;
+        }
     }
     (void)is_o;
     (void)hdr_line;
@@ -1425,12 +1437,25 @@ int main_mem(int argc, char *argv[])
             delete aux.fmi;
             return 1;
         }
+        g_meth_orig_ref = meth_orig_ref_load(aux.fmi->idx->bns,
+                                             aux.fmi->idx->pac, g_meth_cmap);
+        if (g_meth_orig_ref == NULL) {
+            fprintf(stderr, "ERROR: meth: failed to build un-converted ref view\n");
+            meth_chrom_map_free(g_meth_cmap); g_meth_cmap = NULL;
+            free(opt);
+            delete aux.fmi;
+            return 1;
+        }
+        fprintf(stderr,
+                "[bwa-mem3:--meth] un-converted reference loaded "
+                "(%d chrom(s)).\n", g_meth_cmap->n_output);
         const char *meth_out_path = is_o ? out_path : "-";
         extern char *bwa_pg;
         g_meth_bam_writer = meth_bam_writer_open(meth_out_path, g_meth_cmap, bwa_pg, NULL,
                                                  opt->bam_level);
         if (g_meth_bam_writer == NULL) {
             fprintf(stderr, "ERROR: meth: failed to open BAM writer for '%s'\n", meth_out_path);
+            meth_orig_ref_free(g_meth_orig_ref); g_meth_orig_ref = NULL;
             meth_chrom_map_free(g_meth_cmap); g_meth_cmap = NULL;
             free(opt);
             delete aux.fmi;
@@ -1521,11 +1546,15 @@ int main_mem(int argc, char *argv[])
         }
         g_meth_bam_writer = NULL;
     }
-    /* Free g_meth_cmap independently of g_meth_bam_writer: under
-     * -DDISABLE_OUTPUT the writer is never opened, but the chrom map is
-     * still built so per-record paths see consistent tagging. The
-     * branch above only fires when the writer exists, so freeing the
-     * map there would leak on the DISABLE_OUTPUT path. */
+    /* Free g_meth_cmap and g_meth_orig_ref independently of g_meth_bam_writer:
+     * under -DDISABLE_OUTPUT the writer is never opened, but the chrom map
+     * and orig-ref recovery are still built so per-record paths see
+     * consistent tagging. The branch above only fires when the writer
+     * exists, so freeing here covers the DISABLE_OUTPUT path. */
+    if (meth_mode_local && g_meth_orig_ref != NULL) {
+        meth_orig_ref_free(g_meth_orig_ref);
+        g_meth_orig_ref = NULL;
+    }
     if (meth_mode_local && g_meth_cmap != NULL) {
         meth_chrom_map_free(g_meth_cmap);
         g_meth_cmap = NULL;

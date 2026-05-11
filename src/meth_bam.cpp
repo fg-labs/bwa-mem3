@@ -8,6 +8,8 @@
 #include "meth_bam.h"
 #include "bam_writer.h"
 #include "cigar_util.h"
+#include "meth_orig_ref.h"
+#include "meth_xm.h"
 #include "version.h"
 
 #include <cstdio>
@@ -43,7 +45,8 @@ meth_chrom_map_t *meth_chrom_map_build_from_bns(const bntseq_t *bns)
         m->direction    = (char *)   calloc((size_t)m->n_internal, sizeof(char));
         m->output_names = (char **)  calloc((size_t)m->n_internal, sizeof(char *));
         m->output_lens  = (int64_t *)calloc((size_t)m->n_internal, sizeof(int64_t));
-        if (!m->out_tid || !m->direction || !m->output_names || !m->output_lens) {
+        if (!m->out_tid || !m->direction
+                || !m->output_names || !m->output_lens) {
             meth_chrom_map_free(m);
             return NULL;
         }
@@ -74,6 +77,7 @@ meth_chrom_map_t *meth_chrom_map_build_from_bns(const bntseq_t *bns)
             m->out_tid[i] = idx;
         }
     }
+
     return m;
 }
 
@@ -346,7 +350,7 @@ int meth_mem_aln_to_bam(bam1_t *b,
         if (opt->meth_set_as_failed != 0 && opt->meth_set_as_failed == direction) {
             flag16 |= 0x200;
         }
-        if (!opt->meth_no_chim && p.n_cigar > 0 && s->l_seq > 0) {
+        if (opt->meth_chimera_qc && p.n_cigar > 0 && s->l_seq > 0) {
             int lm = cigar_longest_m_mem(p.cigar, p.n_cigar);
             if (100 * lm < MIN_LONGEST_M_PCT * s->l_seq) {
                 flag16 |= 0x200;
@@ -354,6 +358,23 @@ int meth_mem_aln_to_bam(bam1_t *b,
                 if (mapq > 1) mapq = 1;
             }
         }
+    }
+
+    /* Build XM:Z BEFORE bam_set1 frees seq_text and bam_cigar. Stashed for
+     * appending after the bam_set1 call below — bam_aux_append needs the
+     * record to be initialized first.
+     *
+     * is_top_strand keys off `direction` (the cmap f/r tag = XG:Z), NOT
+     * the SAM 0x10 RC flag: methylation is on the top strand when the
+     * fragment was OT (any read mapped to f-contig, including CTOT
+     * is_rev=1 R2s) and on the bottom strand when the fragment was OB. */
+    char *xm = NULL;
+    if (mapped && seq_text != NULL && bam_cigar != NULL && l_emit > 0) {
+        int is_top_strand = (direction == 'f') ? 1 : 0;
+        xm = meth_build_xm(g_meth_orig_ref, tid, (int64_t)p.pos,
+                           is_top_strand,
+                           bam_cigar, (int)bam_n_cigar,
+                           seq_text, (int)l_emit);
     }
 
     /* Build the bam1_t. bam_set1 handles 4-bit packing, name storage, etc. */
@@ -373,7 +394,7 @@ int meth_mem_aln_to_bam(bam1_t *b,
     free(bam_cigar);
     free(seq_text);
     free(qual_bin);
-    if (ret < 0) return -1;
+    if (ret < 0) return -1;  /* xm aliases thread-local scratch; no free */
 
     /* Aux tags — roughly match mem_aln2sam emission order */
     if (p.n_cigar > 0) {
@@ -476,15 +497,42 @@ int meth_mem_aln_to_bam(bam1_t *b,
             bam_aux_append(b, "XA", 'Z', (int)xa.l + 1, (const uint8_t *)xa.s);
         free(xa.s);
     }
-    /* YD:Z — meth strand hypothesis */
+    /* Bismark-compatible XR:Z (read conversion) emitted on every record;
+     * XG:Z (genome strand) and XM:Z (methylation call string) only on
+     * mapped records. The YC:Z payload in s->comment carries the (CT|GA)
+     * value (the comment buffer is "YS:Z:<seq>\tYC:Z:<dir>", see
+     * src/fastmap.cpp:415-425). Locate it with a marker search rather
+     * than l_seq arithmetic so any future YS framing change (alternate
+     * prefix length, prior FASTQ comments folded in) stays detectable. */
+    {
+        const char *xr = NULL;
+        if (s->comment != NULL) {
+            const char *yc = strstr(s->comment, "\tYC:Z:");
+            if (yc != NULL) {
+                const char *p2 = yc + 6;  /* skip "\tYC:Z:" */
+                if      (p2[0] == 'C' && p2[1] == 'T') xr = "CT";
+                else if (p2[0] == 'G' && p2[1] == 'A') xr = "GA";
+            }
+        }
+        if (xr != NULL) {
+            bam_aux_append(b, "XR", 'Z', 3, (const uint8_t *)xr);
+        }
+    }
     if (mapped) {
-        char yd[2] = { direction, '\0' };
-        bam_aux_append(b, "YD", 'Z', 2, (const uint8_t *)yd);
+        const char *xg = (direction == 'f') ? "CT" : "GA";
+        bam_aux_append(b, "XG", 'Z', 3, (const uint8_t *)xg);
+        if (xm != NULL) {
+            /* xm aliases thread-local scratch in meth_xm.cpp; do not free. */
+            bam_aux_append(b, "XM", 'Z', (int)l_emit + 1,
+                           (const uint8_t *)xm);
+        }
     }
 
-    /* Generic aux shared with the --bam path so --meth -C emits FASTQ tags
-     * plus the YS:Z/YC:Z meth tags that `fastmap.cpp` built into s->comment,
-     * and --meth -V emits XR:Z. p.rid here is the bwa-mem3 internal contig
+    /* Generic aux shared with the --bam path so --meth -C emits FASTQ tags.
+     * The YS:Z/YC:Z meth carriers in s->comment are filtered inside
+     * append_sam_aux_tokens under opt->meth_mode so they don't leak into
+     * the BAM output (they're internal carriers only — XR:Z replaces YC,
+     * SEQ restoration replaces YS). p.rid is the bwa-mem3 internal contig
      * index (pre-remap), which is what bns uses. */
     bam_writer_append_generic_aux(b, s, opt, bns, p.rid);
 

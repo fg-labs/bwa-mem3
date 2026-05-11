@@ -156,7 +156,7 @@ int bam_writer_close(bam_writer_t *w)
  * (A/i/f/Z/H) are handled; B (typed array) is skipped because parsing it
  * is non-trivial and FASTQ comments effectively never use it. Malformed
  * tokens are skipped silently. */
-static void append_sam_aux_tokens(struct bam1_t *b, const char *s)
+static void append_sam_aux_tokens(struct bam1_t *b, const char *s, int meth_mode)
 {
     if (s == NULL) return;
     while (*s) {
@@ -167,6 +167,15 @@ static void append_sam_aux_tokens(struct bam1_t *b, const char *s)
         size_t tok_len = (size_t)(s - tok);
         /* Need at least "XX:T:" (5 chars) and a non-empty value. */
         if (tok_len < 6 || tok[2] != ':' || tok[4] != ':') continue;
+        /* Under --meth, the YS:Z and YC:Z tokens in s->comment are internal
+         * carriers only (used by meth_mem_aln_to_bam for SEQ restoration and
+         * XR:Z derivation). Suppress them here so the BAM output carries
+         * only the Bismark XR:Z/XG:Z/XM:Z tag set. */
+        if (meth_mode
+                && ((tok[0] == 'Y' && tok[1] == 'S')
+                 || (tok[0] == 'Y' && tok[1] == 'C'))) {
+            continue;
+        }
         char tag[2] = { tok[0], tok[1] };
         char type   = tok[3];
         const char *val  = tok + 5;
@@ -412,12 +421,14 @@ extern "C" void bam_writer_append_generic_aux(struct bam1_t *b,
      * SAM-text aux tokens and emit each as a packed BAM aux so the BAM and
      * SAM paths carry the same tags. */
     if (s->comment != NULL && s->comment[0] != '\0') {
-        append_sam_aux_tokens(b, s->comment);
+        append_sam_aux_tokens(b, s->comment, opt->meth_mode);
     }
 
     /* Reference annotation (-V / MEM_F_REF_HDR). Mirrors mem_aln2sam: emit
-     * bns->anns[rid].anno as XR:Z, replacing TAB with SPACE. */
-    if ((opt->flag & MEM_F_REF_HDR) && rid >= 0 &&
+     * bns->anns[rid].anno as XR:Z, replacing TAB with SPACE. Suppressed
+     * under --meth because that mode repurposes XR:Z for the Bismark
+     * read-conversion direction (see docs/src/methylation/tags.md). */
+    if ((opt->flag & MEM_F_REF_HDR) && !opt->meth_mode && rid >= 0 &&
         bns != NULL && bns->anns[rid].anno != NULL &&
         bns->anns[rid].anno[0] != '\0') {
         const char *anno = bns->anns[rid].anno;

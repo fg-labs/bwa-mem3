@@ -243,11 +243,13 @@ Forces the QC-fail bit (`0x200`) on all alignments to the forward (`f`) or
 reverse (`r`) bisulfite strand. Used when one strand is known to be
 unreliable for a given library preparation.
 
-#### `--do-not-penalize-chimeras` — disable chimera heuristic
+#### `--chimera-qc` — opt in to bwameth.py-style chimera heuristic
 
-Disables the longest-match < 44% chimera heuristic that would otherwise set
-`0x200`, clear `0x2`, and cap MAPQ at 1 for likely chimeric alignments.
-Use when the default chimera filter is too aggressive for your library type.
+Off by default (matches Bismark, which has no equivalent heuristic).
+When set, mapped records whose longest M/=/X CIGAR run is less than 44 % of
+the read length get `0x200` set, `0x2` cleared, and MAPQ capped at 1. Useful
+for PBAT / scBS-Seq libraries where intra-fragment chimerism is common, or
+when reproducing bwameth.py output bit-for-bit.
 
 ### Threading
 

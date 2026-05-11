@@ -47,20 +47,25 @@ Key points for this pattern:
   paired-end reads (bwameth.py c2t emits interleaved output to stdout).
 - Use `/dev/stdin` as the reads argument to read from the pipe.
 - The `bwa-mem3 --meth` inline c2t conversion is **not** applied when the
-  reads arrive pre-converted; however, `YS:Z:` and `YC:Z:` tags are only
-  written by the inline conversion path. If you need those tags in the output,
-  you must either use the integrated mode (no external c2t step) or ensure
-  your external preprocessor emits compatible comments in the FASTQ.
+  reads arrive pre-converted. `XR:Z` (read conversion) and `XG:Z` (genome
+  strand) are still emitted on every record; `XM:Z` (per-base methylation
+  call string) is emitted on every mapped record. `XR:Z` is derived from
+  the inline carrier the c2t step normally writes — when reads are
+  pre-converted, the carrier is absent unless the external preprocessor
+  emits it as a FASTQ comment (see warning below).
 
-> **Warning — YS:Z: and YC:Z: require integrated mode**
+> **Warning — `XR:Z:` requires the inline carrier**
 >
-> When reads are pre-converted by an external tool and piped in, the inline
-> c2t step in `src/fastmap.cpp` is bypassed. `YS:Z:` and `YC:Z:` tags will
-> not be present in the output BAM unless the external converter writes them
-> as FASTQ comment fields in the format `YS:Z:<seq>\tYC:Z:<dir>` and those
-> comments are passed through. MethylDackel and similar callers use `YS:Z:`
-> to restore original bases for methylation calling; if the tag is absent,
-> they fall back to reading SEQ directly, which may affect accuracy.
+> `XR:Z:` records the read's bisulfite-conversion direction (`CT` for top-
+> strand, `GA` for bottom-strand R2). bwa-mem3's inline c2t step records
+> that direction into the FASTQ comment as `YS:Z:<seq>\tYC:Z:<dir>`, which
+> the BAM emitter then reads to set `XR:Z:` (the `YS`/`YC` carrier itself
+> is dropped from BAM output). When reads are pre-converted externally and
+> piped in, the inline c2t step in `src/fastmap.cpp` is bypassed. If your
+> external preprocessor does not emit a compatible `YC:Z:` comment field,
+> `XR:Z:` will be absent from the output BAM. `XG:Z:` and `XM:Z:` are
+> unaffected — they're derived from the reference contig direction and
+> CIGAR walk, not from the carrier.
 
 ## Header rewriting and BAM post-processing with external c2t
 
@@ -68,28 +73,28 @@ Whether reads are converted inline or externally, all BAM post-processing steps
 apply identically when `--meth` is active:
 
 - `@SQ` header consolidation (f/r contigs → one entry per chromosome).
-- `YD:Z:` tag emission from the contig name prefix.
-- Chimera QC heuristic (unless `--do-not-penalize-chimeras` is set).
+- Bismark `XR:Z` / `XG:Z` / `XM:Z` auxiliary tag emission.
+- Chimera QC heuristic (only when `--chimera-qc` is set; off by default).
 - Pair-level QC-fail propagation.
 - `@PG ID:bwa-mem3-meth` insertion.
 
 The post-processing pipeline depends only on the reference contig names (to
-determine `YD:Z:`) and the alignment flags — not on whether reads were
+determine `XG:Z`) and the alignment flags — not on whether reads were
 converted inline or externally.
 
 ## Summary of path variants
 
-| Reference arg | Read source | Auto-append? | Inline c2t? | `YS:Z:` emitted? |
-|---------------|-------------|-------------|------------|-----------------|
-| `ref.fa` | Raw FASTQ | Yes (→ `ref.fa.bwameth.c2t`) | Yes | Yes |
-| `ref.fa.bwameth.c2t` | Raw FASTQ | No | Yes | Yes |
-| `ref.fa.bwameth.c2t` | Pre-converted (pipe) | No | No | No (unless pre-emitted) |
+| Reference arg | Read source | Auto-append? | Inline c2t? | `XR/XG/XM` emitted? |
+|---------------|-------------|-------------|------------|---------------------|
+| `ref.fa` | Raw FASTQ | Yes (→ `ref.fa.bwameth.c2t`) | Yes | All three |
+| `ref.fa.bwameth.c2t` | Raw FASTQ | No | Yes | All three |
+| `ref.fa.bwameth.c2t` | Pre-converted (pipe) | No | No | `XG`/`XM` always; `XR` only if external preprocessor emits the `YC:Z` carrier |
 
 ---
 
 **See also:**
 [Overview](overview.md) ·
 [Conversion details](conversion.md) ·
-[SAM tags: YS, YC, YD](tags.md) ·
+[SAM tags: XR, XG, XM](tags.md) ·
 [bwameth.py drop-in mapping](bwameth-mapping.md) ·
 [Related Projects: bwameth.py](../related-projects/bwameth.md)

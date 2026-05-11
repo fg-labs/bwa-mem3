@@ -1,12 +1,12 @@
-// Parity test: bns_get_seq (legacy on-the-fly unpack) vs bns_get_seq_v2
+// Parity test: bns_get_seq_into (caller-buffer write) vs bns_get_seq_v2
 // (zero-copy pointer into pre-unpacked ref_string).
 //
-// Why this matters: upstream v2.2.1 left bns_get_seq_v2 half-applied — it's
-// only called from one site in the mainline alignment loop; four other
-// callers still use the legacy bns_get_seq path (3.7% of compute on c7i SPR
-// per `perf record`). Before converting those callers, we want a hard
-// byte-identity guarantee that the two functions return the same bases for
-// the same input range.
+// Why this matters: bns_get_seq_into and bns_get_seq_v2 are the two ways
+// in-tree callers fetch ref bases — the former does inline 2-bit decode
+// into a caller buffer; the latter returns a pointer into a pre-decoded
+// .0123 ref_string. Both must return byte-identical bases for the same
+// input range, since callers pick one path based on whether ref_string
+// is materialized in their context.
 //
 // Test strategy: build a small synthetic packed reference (.pac-style 2-bit
 // packed), independently build the equivalent ref_string (forward + reverse
@@ -28,13 +28,13 @@
 
 #include "bntseq.h"
 
-// _set_pac is private to bntseq.cpp. Mirror it here for fixture generation.
-// Format: byte (k>>2) holds 4 bases at positions 4k..4k+3 (top-first).
+// _set_pac is published by bntseq.h.
+//
+// Pac layout: byte (k>>2) holds 4 bases at positions 4k..4k+3 (top-first).
 //   pac[i] bit 7:6 = base at position 4i+0
 //   pac[i] bit 5:4 = base at position 4i+1
 //   pac[i] bit 3:2 = base at position 4i+2
 //   pac[i] bit 1:0 = base at position 4i+3
-#define _set_pac(pac, l, c) ((pac)[(l) >> 2] |= (c) << ((~(l) & 3) << 1))
 
 namespace {
 
@@ -60,42 +60,40 @@ void build_synthetic_ref(std::mt19937 &rng, int64_t l_pac, std::vector<uint8_t> 
 }
 
 // Run both functions for one (beg, end) and assert byte-identical output.
-// Skip cases where the legacy fn returns nullptr (boundary-bridging) — both
-// should return *len = 0 there but neither produces bytes to compare.
+// Skip cases where bns_get_seq_into reports *len_out = 0 (boundary-bridging).
 void check_range(int64_t l_pac, const uint8_t *pac, const uint8_t *ref_string,
                  int64_t beg, int64_t end) {
-    int64_t len_legacy = 0;
-    uint8_t *legacy = bns_get_seq(l_pac, pac, beg, end, &len_legacy);
+    // bns_get_seq_into needs caller buffer >= |end - beg|. Allocate worst-case
+    // (2 * l_pac) and zero so any unwritten bytes show up as a CHECK miss.
+    std::vector<uint8_t> into_buf(2 * l_pac, 0xff);
+    int64_t len_into = 0;
+    bns_get_seq_into(l_pac, pac, beg, end, into_buf.data(), &len_into);
 
-    // bns_get_seq_v2 expects a scratch buffer (`seqb`); legacy v2 paths
-    // ignore it (the function returns a ref_string pointer directly), but we
-    // pass a real one to match the production call shape.
+    // bns_get_seq_v2 expects a scratch buffer (`seqb`); the function ignores
+    // it (returns a ref_string pointer directly), but we pass a real one to
+    // match the production call shape.
     std::vector<uint8_t> scratch(2 * l_pac, 0xff);
     int64_t len_v2 = 0;
     uint8_t *v2 = bns_get_seq_v2(l_pac, pac, beg, end, &len_v2,
                                  const_cast<uint8_t *>(ref_string), scratch.data());
 
-    CHECK(len_legacy == len_v2);
-    if (len_legacy == 0) {
-        // Boundary-bridging: both should report empty; legacy returns NULL,
-        // v2 still returns a pointer (not used). Nothing to compare.
-        free(legacy);
+    CHECK(len_into == len_v2);
+    if (len_into == 0) {
+        // Boundary-bridging: both should report empty.
         return;
     }
-    REQUIRE(legacy != nullptr);
     REQUIRE(v2 != nullptr);
-    for (int64_t i = 0; i < len_legacy; ++i) {
+    for (int64_t i = 0; i < len_into; ++i) {
         CAPTURE(beg);
         CAPTURE(end);
         CAPTURE(i);
-        CHECK(static_cast<int>(legacy[i]) == static_cast<int>(v2[i]));
+        CHECK(static_cast<int>(into_buf[i]) == static_cast<int>(v2[i]));
     }
-    free(legacy);
 }
 
 }  // namespace
 
-TEST_CASE("bns_get_seq vs v2: forward strand exhaustive small ref") {
+TEST_CASE("bns_get_seq_into vs v2: forward strand exhaustive small ref") {
     std::mt19937 rng(0x5EEDu);
     constexpr int64_t L = 64;
     std::vector<uint8_t> pac, ref_string;
@@ -109,7 +107,7 @@ TEST_CASE("bns_get_seq vs v2: forward strand exhaustive small ref") {
     }
 }
 
-TEST_CASE("bns_get_seq vs v2: reverse strand exhaustive small ref") {
+TEST_CASE("bns_get_seq_into vs v2: reverse strand exhaustive small ref") {
     std::mt19937 rng(0xC0FFEEu);
     constexpr int64_t L = 64;
     std::vector<uint8_t> pac, ref_string;
@@ -123,7 +121,7 @@ TEST_CASE("bns_get_seq vs v2: reverse strand exhaustive small ref") {
     }
 }
 
-TEST_CASE("bns_get_seq vs v2: bridging forward/reverse boundary returns empty") {
+TEST_CASE("bns_get_seq_into vs v2: bridging forward/reverse boundary returns empty") {
     std::mt19937 rng(0xBEEFu);
     constexpr int64_t L = 64;
     std::vector<uint8_t> pac, ref_string;
@@ -132,25 +130,25 @@ TEST_CASE("bns_get_seq vs v2: bridging forward/reverse boundary returns empty") 
     // beg < l_pac, end > l_pac → should return *len = 0 in both.
     for (int64_t beg : {int64_t{0}, int64_t{1}, int64_t{L / 2}, int64_t{L - 1}}) {
         for (int64_t end : {int64_t{L + 1}, int64_t{L + L / 2}, int64_t{2 * L}}) {
-            int64_t len_legacy = 0, len_v2 = 0;
-            uint8_t *legacy = bns_get_seq(L, pac.data(), beg, end, &len_legacy);
+            int64_t len_into = 0, len_v2 = 0;
+            std::vector<uint8_t> into_buf(2 * L, 0xff);
+            bns_get_seq_into(L, pac.data(), beg, end, into_buf.data(), &len_into);
             std::vector<uint8_t> scratch(2 * L, 0xff);
             (void)bns_get_seq_v2(L, pac.data(), beg, end, &len_v2,
                                  ref_string.data(), scratch.data());
-            CHECK(len_legacy == 0);
+            CHECK(len_into == 0);
             CHECK(len_v2 == 0);
-            free(legacy);
         }
     }
 }
 
-TEST_CASE("bns_get_seq vs v2: swapped beg/end (XOR-swap path)") {
+TEST_CASE("bns_get_seq_into vs v2: swapped beg/end (XOR-swap path)") {
     std::mt19937 rng(0xDEADu);
     constexpr int64_t L = 64;
     std::vector<uint8_t> pac, ref_string;
     build_synthetic_ref(rng, L, pac, ref_string);
 
-    // Swap path: legacy does `if (end < beg) end ^= beg, beg ^= end, end ^= beg`.
+    // Swap path: bns_get_seq_into does `if (end < beg) end ^= beg, beg ^= end, end ^= beg`.
     // v2 does the same. Both should produce the same canonicalized [beg, end).
     check_range(L, pac.data(), ref_string.data(), /*beg=*/40, /*end=*/10);
     check_range(L, pac.data(), ref_string.data(), /*beg=*/L + 30, /*end=*/L + 5);
@@ -172,7 +170,7 @@ TEST_CASE("bns_get_seq_v2: NULL ref_string returns NULL with *len = 0") {
     CHECK(len == 0);
 }
 
-TEST_CASE("bns_get_seq vs v2: large random ref, randomized ranges") {
+TEST_CASE("bns_get_seq_into vs v2: large random ref, randomized ranges") {
     std::mt19937 rng(0x900DCAFEu);
     constexpr int64_t L = 16384;  // larger to exercise unaligned reads
     std::vector<uint8_t> pac, ref_string;
