@@ -1,0 +1,22 @@
+[workspace]
+authors = ["Nils Homer <nilshomer@gmail.com>"]
+name = "holodeck"
+version = "0.1.0"
+# Disable strict channel priority: samtools (bioconda) pulls htslib
+# (bioconda) which depends on libdeflate, which lives in conda-forge.
+# Strict priority would block libdeflate from satisfying that
+# transitive dep. Bioconda's own guidance is `flexible` priority for
+# bioconda + conda-forge stacks.
+channel-priority = "disabled"
+channels = ["bioconda", "conda-forge"]
+platforms = ["linux-64", "linux-aarch64", "osx-arm64"]
+
+[dependencies]
+holodeck = "==0.2.1"
+# samtools is needed to faidx the reference before holodeck simulates
+# (holodeck requires an indexed FASTA). Bundled here so the dependency
+# is uniform across linux-64, linux-aarch64, and osx-arm64 — the macOS
+# CI deps step otherwise wouldn't carry samtools.
+samtools = ">=1.20"
+
+[tasks]
