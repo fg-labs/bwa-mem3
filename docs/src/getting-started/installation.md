@@ -17,10 +17,54 @@ Until the Bioconda package is available, build from source using the steps below
 
 ### Prerequisites
 
-- A C++17 compiler (GCC 8+ or Clang 7+)
-- GNU make
-- Rust toolchain (for `cargo install` of mdbook tools, not required for the aligner itself)
-- Git (for submodule checkout)
+bwa-mem3 vendors several libraries as git submodules. Building from source requires the toolchain to compile bwa-mem3 itself plus the bootstrap tools each vendored library needs.
+
+| Tool | Why it's needed | Minimum version |
+|------|-----------------|-----------------|
+| C++14 compiler (GCC or Clang) | bwa-mem3 itself | GCC 8+ / Clang 7+ |
+| GNU make | top-level build | 3.81+ |
+| Git | submodule checkout (with `--recursive`) | any recent |
+| autoconf, automake, autoconf-archive, libtool | `ext/htslib` runs `autoreconf -i && ./configure` during build | any recent |
+| pkg-config | htslib's `configure` uses it to locate zlib | any recent |
+| zlib development headers | htslib links against zlib | any recent |
+| OpenMP runtime | `ext/libsais` uses OpenMP for parallel suffix-array construction | see notes below |
+| CMake 3.12+ | building bundled mimalloc (default; skip if you pass `USE_MIMALLOC=0`) | 3.12+ |
+
+> **OpenMP notes.**
+> - On **Linux with GCC**, libgomp ships with the compiler — no extra package needed.
+> - On **Linux with Clang**, install `libomp-dev` (Debian/Ubuntu) or `libomp-devel` (RHEL/Fedora).
+> - On **macOS**, install Homebrew's `libomp` (`brew install libomp`). The Makefile auto-detects the Homebrew prefix; set `LIBOMP_PREFIX=/path/to/libomp` if you installed it elsewhere.
+
+#### Install prerequisites by platform
+
+**Debian / Ubuntu:**
+```bash
+sudo apt-get install \
+    build-essential git cmake pkg-config \
+    autoconf automake autoconf-archive libtool \
+    zlib1g-dev \
+    libomp-dev          # only needed if building with Clang
+```
+
+**RHEL / Fedora / Amazon Linux:**
+```bash
+sudo dnf install \
+    gcc gcc-c++ make git cmake pkgconfig \
+    autoconf automake autoconf-archive libtool \
+    zlib-devel \
+    libomp-devel        # only needed if building with Clang
+```
+
+**macOS (Homebrew):**
+```bash
+xcode-select --install   # Apple Clang + git + make
+brew install \
+    cmake pkg-config \
+    autoconf automake autoconf-archive libtool \
+    libomp
+```
+
+> **What happens if a prereq is missing.** The Makefile fails fast with an actionable error: a missing `libomp` on macOS, a missing `autoreconf`, or a missing `cmake` each produce a one-line hint pointing at the install command above. There is no need to install everything optimistically — install only what the error message asks for if you prefer.
 
 ### Clone and build
 
