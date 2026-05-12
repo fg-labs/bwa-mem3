@@ -88,6 +88,26 @@ int main(int argc, char* argv[])
         return 0;
     }
 
+    /* SIMD host-floor precheck — refuse with exit(2) if the host CPU
+     * cannot execute the build's compiled-in instructions, before any
+     * subcommand body (and the AVX2-compiled banner / @PG ksprintf in
+     * the `mem` branch below) gets a chance to SIGILL on a too-old
+     * host. Diagnostic invocations opt out so operators can still
+     * introspect the binary on a host below floor:
+     *   - `version`               always prints + warns (never refuses)
+     *   - `<subcommand> --help`   prints help (never refuses)
+     *   - `<subcommand> -h`       same
+     * Only argv[2] is checked: matching --help / -h anywhere in argv
+     * would false-positive on pathological invocations like
+     * `mem -R --help ref r1 r2` (where --help is the VALUE of -R) and
+     * skip the precheck for an actual alignment run. Realistic help
+     * invocations put --help right after the subcommand. */
+    bool wants_help = (argc >= 3) &&
+                      (strcmp(argv[2], "--help") == 0 || strcmp(argv[2], "-h") == 0);
+    if (strcmp(argv[1], "version") != 0 && !wants_help) {
+        bwamem3_enforce_host_floor();
+    }
+
     if (strcmp(argv[1], "index") == 0)
     {
          uint64_t tim = __rdtsc();
@@ -166,6 +186,7 @@ int main(int argc, char* argv[])
     else if (strcmp(argv[1], "version") == 0)
     {
         puts(PACKAGE_VERSION);
+        bwamem3_print_version_simd(stdout);
 #ifdef USE_MIMALLOC
         {
             int mv = mi_version();
