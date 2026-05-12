@@ -7,8 +7,12 @@ This page documents every build target available in the Makefile and what each p
 - A C++14-capable compiler: GCC 7+ or Clang 6+ on Linux; Clang 15+ (Xcode) on macOS.
 - GNU make 3.81+.
 - CMake 3.12+ (required only when `USE_MIMALLOC=1`, which is the default).
-- libomp (macOS only): `brew install libomp`. libsais uses OpenMP for parallel suffix-array construction.
+- autoconf, automake, autoconf-archive, libtool, pkg-config — `ext/htslib`'s build runs `autoreconf -i && ./configure` and locates zlib via `pkg-config`.
+- zlib development headers — htslib links against zlib.
+- OpenMP runtime — libsais uses OpenMP for parallel suffix-array construction. Linux + GCC: libgomp ships with the compiler, nothing extra to install. Linux + Clang: `libomp-dev` (Debian) / `libomp-devel` (RHEL). macOS: `brew install libomp`; the Makefile auto-detects the Homebrew prefix or honours `LIBOMP_PREFIX`.
 - Git submodules initialised: `git submodule update --init --recursive`.
+
+See [Getting Started → Installation](../getting-started/installation.md) for the full per-platform install commands.
 
 > **Warning — Submodules must be present**
 >
