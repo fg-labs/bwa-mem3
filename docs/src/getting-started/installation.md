@@ -49,7 +49,7 @@ sudo apt-get install \
 **RHEL / Fedora / Amazon Linux:**
 ```bash
 sudo dnf install \
-    gcc gcc-c++ make git cmake pkgconfig \
+    gcc gcc-c++ make git cmake pkgconf-pkg-config \
     autoconf automake autoconf-archive libtool \
     zlib-devel \
     libomp-devel        # only needed if building with Clang
