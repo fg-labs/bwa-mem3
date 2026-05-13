@@ -1,87 +1,131 @@
 # SIMD Dispatch Matrix
 
-bwa-mem3 uses a multi-binary dispatch strategy on x86: the `bwa-mem3` launcher reads the CPU's CPUID bits at startup, then `execv`s the highest-capability variant binary found on disk. On ARM there is only one NEON level, so the launcher execs `bwa-mem3.arm64` directly without any cpuid check.
+bwa-mem3 ships **one binary per platform**. The x86 binary contains
+compiled kernels for every supported SIMD tier
+(`sse41` / `sse42` / `avx` / `avx2` / `avx512bw`) and dispatches in
+process at startup. The arm64 binary contains a single NEON kernel
+path. There are no `bwa-mem3.<tier>` companion files on disk and no
+launcher binary.
 
 ## Dispatch flowchart
 
 ```mermaid
 flowchart TD
-    A[bwa-mem3 launcher starts] --> B{Platform?}
-    B -- ARM / aarch64 --> C[exec bwa-mem3.arm64]
-    B -- x86 --> D[read CPUID via __cpuidex]
-    D --> E{AVX-512BW supported?}
-    E -- yes --> F[exec bwa-mem3.avx512bw]
-    E -- no --> G{AVX2 supported?}
-    G -- yes --> H[exec bwa-mem3.avx2]
-    G -- no --> I{AVX supported?}
-    I -- yes --> J[exec bwa-mem3.avx]
-    I -- no --> K{SSE4.2 supported?}
-    K -- yes --> L[exec bwa-mem3.sse42]
-    K -- no --> M{SSE4.1 supported?}
-    M -- yes --> N[exec bwa-mem3.sse41]
-    M -- no --> O[error: no supported variant found]
+    A[bwa-mem3 mem starts] --> B{Platform?}
+    B -- ARM / aarch64 --> C[NEON kernel TU, no dispatch]
+    B -- x86 --> D[bwamem3_simd_init in src/simd_dispatch.cpp]
+    D --> E[__builtin_cpu_supports]
+    E --> F{Host capability?}
+    F -- AVX-512BW --> G1[g_tier = avx512bw]
+    F -- AVX2 --> G2[g_tier = avx2]
+    F -- AVX --> G3[g_tier = avx]
+    F -- SSE4.2 --> G4[g_tier = sse42]
+    F -- SSE4.1 --> G5[g_tier = sse41]
+    F -- below build floor --> H[exit(2): host below SIMD floor]
+    G1 & G2 & G3 & G4 & G5 --> I[Per-kernel factory selects matching tier]
 ```
 
-The launcher reads CPUID leaf 1 (for SSE flags) and leaf 7 (for AVX2 and AVX-512 flags). It checks in descending capability order and stops at the first variant binary it finds on disk. If no variant binary is executable, it exits with an error.
+Tier detection runs once during `main()`. Subsequent kernel calls pay
+a single indirect-call hop through a factory vtable (or an
+`extern "C"` wrapper for free-function `ksw_*` kernels) — about
+0.3 ns per call after BTB warm-up, well below run-to-run noise on the
+[bwa-mem3-bench](https://github.com/fg-labs/bwa-mem3-bench) corpus.
 
-The ARM path always tries `bwa-mem3.arm64` first, then falls back to the bare `bwa-mem3` name (which on ARM is a symlink to `bwa-mem3.arm64` created by `make arm64`).
+If the host CPU does not meet the build's compile-time SIMD floor
+(`BASELINE_ARCH`, default `avx2` since PR #84), the binary exits with
+code 2 and an `[E::bwamem3]` message naming the gap before any
+alignment work runs. `bwa-mem3 version`, `--help`, and `-h` are
+exempt and always succeed so operators can introspect a binary on a
+host that cannot run alignment. See
+[Host requirements](../getting-started/host-requirements.md).
 
-## Building the variant binaries
-
-`make multi` builds all five x86 variants and the launcher in sequence:
+## Building
 
 ```bash
-make multi
+make                              # single multi-tier x86 binary, BASELINE_ARCH=avx2
+make BASELINE_ARCH=sse41          # lower host SIMD floor / maximize portability (~10–15% slower on AVX2 hosts)
+make BASELINE_ARCH=avx512bw       # AVX-512BW-only fleet (locks the host floor)
+make arm64                        # single NEON binary, no dispatch table
 ```
 
-This produces:
+`BASELINE_ARCH` controls the tier at which non-kernel translation
+units compile. The hand-tuned kernel TUs in `KERNEL_SRCS`
+(`bandedSWA`, `kswv`, `ksw`, `sam_encode`) are always compiled at
+every supported tier and dispatched at runtime, so a build at
+`BASELINE_ARCH=avx2` still uses the AVX-512BW kernels on AVX-512BW
+hosts. The non-kernel TUs are not auto-vectorized above
+`BASELINE_ARCH`, which is the trade-off — see
+[`BASELINE_ARCH=avx512bw` build flag](../whats-different/avx512-baseline.md)
+for the empirical perf characterization.
 
-| Filename | Arch flags | Minimum CPU |
+Supported x86 tiers (minimum CPU for each tier's kernel path):
+
+| Tier | Arch flags | Minimum CPU |
 |---|---|---|
-| `bwa-mem3.sse41` | `-msse4.1` | Penryn (2007) / K10 (2011) |
-| `bwa-mem3.sse42` | `-msse4.2` | Nehalem (2008) / Bulldozer (2011) |
-| `bwa-mem3.avx` | `-mavx` | Sandy Bridge (2011) / Bulldozer (2011) |
-| `bwa-mem3.avx2` | `-mavx2` | Haswell (2013) / Excavator (2015) |
-| `bwa-mem3.avx512bw` | `-mavx512f -mavx512bw` | Skylake-X (2017) / Zen 4 (2022) |
+| `sse41` | `-msse4.1` | Penryn (2007) / K10 (2011) |
+| `sse42` | `-msse4.2` | Nehalem (2008) / Bulldozer (2011) |
+| `avx` | `-mavx` | Sandy Bridge (2011) / Bulldozer (2011) |
+| `avx2` | `-mavx2` | Haswell (2013) / Excavator (2015) |
+| `avx512bw` | `-mavx512f -mavx512bw -mprefer-vector-width=256` | Skylake-X (2017) / Zen 4 (2022) |
 
-For ARM builds, `make arm64` produces a single binary and creates the symlink:
+For arm64 builds:
 
-| Filename | Arch flags | Platform |
+| Binary | Arch flags | Platform |
 |---|---|---|
-| `bwa-mem3.arm64` | `-DAPPLE_SILICON=1` + sse2neon shim | Any aarch64 / Apple Silicon |
-
-To build a single-arch binary for a known target (e.g. for a cluster with uniform hardware):
-
-```bash
-make arch=avx2
-```
-
-The resulting binary is named `bwa-mem3` and contains only AVX2 code. The launcher is not built; it is not needed when the target ISA is fixed.
+| `bwa-mem3` (arm64) | `-DAPPLE_SILICON=1` + native NEON / sse2neon shim | Any aarch64 / Apple Silicon |
 
 ## Kernel vectorization coverage
 
-The table below lists the kernels that have SIMD implementations and which ISA levels they cover.
-
 | Kernel | SSE4.1 | SSE4.2 | AVX | AVX2 | AVX-512BW | NEON (arm64) |
 |---|---|---|---|---|---|---|
-| kswv (vectorized Smith-Waterman) | 8-wide int16 | 8-wide int16 | 8-wide int16 | 16-wide int16 | 32-wide int16 | 8-wide int16 (native) |
-| bandedSWA (banded alignment) | SSE2 baseline | SSE2 baseline | SSE2 baseline | SSE2 baseline | SSE2 baseline | native NEON blendv |
-| FM-index lookup (FMI_search) | SSE popcount | SSE popcount | SSE popcount | SSE popcount | SSE popcount | __builtin_popcountl |
+| `kswv` (vectorized Smith-Waterman) | 8-wide int16 | 8-wide int16 | 8-wide int16 | 16-wide int16 | 32-wide int16 | 8-wide int16 (native) |
+| `bandedSWA` (banded alignment / mate-rescue) | vectorized | vectorized | vectorized | vectorized | vectorized | native NEON blendv |
+| `ksw_*` (SW extension free functions) | per-tier | per-tier | per-tier | per-tier | per-tier | per-tier (NEON) |
+| `sam_encode` (SAM seq/qual encoder) | per-tier | per-tier | per-tier | per-tier | per-tier | per-tier (NEON) |
+| FM-index lookup (`FMI_search`) | scalar popcount | scalar popcount | scalar popcount | scalar popcount | scalar popcount | `__builtin_popcountl` |
 | libsais BWT construction | scalar | scalar | scalar | OpenMP parallel | OpenMP parallel | OpenMP parallel |
 
 > **Note — FM-index is memory-bound**
 >
-> The FM-index backward-extension loop is limited by pointer-chasing through the `cp_occ` arrays, not by computation. Additional SIMD width does not increase throughput here. See the Apple Silicon optimization log in [Developer Guide — Apple Silicon / NEON port](../developer-guide/neon-port.md) for the profiling evidence.
+> The FM-index backward-extension loop is limited by pointer-chasing through the `cp_occ` arrays, not by computation. Additional SIMD width does not increase throughput here. See [Developer Guide — Apple Silicon / NEON port](../developer-guide/neon-port.md) for the profiling evidence.
 
-## Why the launcher uses execv, not a function pointer
+## Runtime overrides
 
-The multi-binary design was inherited from bwa-mem2. Separate compilation units mean the compiler can use the target ISA's full instruction set throughout — not just in hand-vectorized loops but also in auto-vectorized loops, register allocation, and branch heuristics. A single-binary dispatcher that calls ISA-specific function pointers achieves the same for hand-written kernels but leaves the compiler's auto-vectorization gated at the baseline ISA. For a workload with this many scalar loops, the execv approach yields a measurable difference. For the ARM path, all CPUs have the same NEON level so the single-binary approach is fine.
+Two environment variables tune dispatch:
+
+| Variable | Effect |
+|---|---|
+| `BWAMEM3_FORCE_TIER=<tier>` | Forces a specific tier (`sse41` / `sse42` / `avx` / `avx2` / `avx512bw`). Downgrade-only: requests above the host's detected tier (which would SIGILL) and unknown names are rejected with a stderr warning. Used by `test/regression/all_tiers_parity.sh` to confirm byte-identical SAM across all tiers on AVX-512 hosts. |
+| `BWAMEM3_DEBUG_SIMD=1` | Prints a one-line `[I::bwamem3_simd_init_body]` startup banner with the build baseline, the detected host capability, and the resolved tier. Also enables the build-baseline-vs-host gap warning. |
+
+Use `bwa-mem3 version` to read the resolved tier without alignment:
+
+```text
+bwa-mem3 0.1.0-pre
+SIMD floor:   avx2 (x86-64-v3, Haswell 2013+); kernels: sse41 sse42 avx avx2 avx512bw
+SIMD runtime: avx512bw (BWAMEM3_FORCE_TIER unset)
+```
+
+## Why in-process dispatch, not separate binaries
+
+The pre-PR-#83 design shipped six binaries (one launcher plus one
+per ISA tier) and `execv`d the matching tier at startup. That worked
+but cost ~120 MB on disk, required all six binaries to be present in
+the same directory, and made `BWAMEM3_FORCE_TIER` impossible without
+re-exec'ing a different file. The current single-binary design keeps
+the per-tier compile granularity for the hand-tuned kernel TUs while
+collapsing distribution to one file (~25 MB), and adds runtime tier
+override and a clean host-floor precheck. Indirect-call overhead is
+the only trade-off, and it is below the measurement noise floor on
+every architecture in the bench matrix.
 
 ---
 
 **See also:**
 [Performance overview](overview.md) ·
 [PGO build](pgo.md) ·
+[Host requirements](../getting-started/host-requirements.md) ·
 [Developer Guide — SIMD dispatch architecture](../developer-guide/simd-dispatch.md) ·
-[Developer Guide — Multi-binary launcher (x86)](../developer-guide/launcher.md) ·
-[Developer Guide — Apple Silicon / NEON port](../developer-guide/neon-port.md)
+[Developer Guide — Single-binary SIMD dispatch (x86)](../developer-guide/launcher.md) ·
+[Developer Guide — Apple Silicon / NEON port](../developer-guide/neon-port.md) ·
+[`BASELINE_ARCH=avx512bw` build flag](../whats-different/avx512-baseline.md)

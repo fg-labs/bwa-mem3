@@ -28,13 +28,34 @@ See [Getting Started → Installation](../getting-started/installation.md) for t
 make
 ```
 
-On x86 hosts this is equivalent to `make multi` (see below). On Apple Silicon and other aarch64 hosts the Makefile detects the architecture and builds a single ARM64 binary instead.
+On x86 hosts this is equivalent to `make single` (see below): one binary
+containing all five SIMD tiers, dispatched in process at startup. On
+Apple Silicon and other aarch64 hosts the Makefile detects the
+architecture and builds a single ARM64 binary with one NEON kernel TU.
 
 The resulting binary is `bwa-mem3` in the repo root.
 
-### Single-arch x86 builds
+### Single multi-tier x86 build (default on x86)
 
-Pass `arch=<target>` to compile a single binary with a specific ISA level:
+```bash
+make single                       # alias of the default `make`
+make BASELINE_ARCH=avx512bw       # raise non-kernel TU compile baseline
+make BASELINE_ARCH=sse41          # lower it for pre-Haswell hosts
+```
+
+Builds one `bwa-mem3` binary. The four hand-tuned kernel TUs in
+`KERNEL_SRCS` (`bandedSWA.cpp`, `kswv.cpp`, `ksw.cpp`,
+`sam_encode.cpp`) are compiled five times each — once per supported
+tier (`sse41` / `sse42` / `avx` / `avx2` / `avx512bw`) — and dispatched
+at runtime via `__builtin_cpu_supports`. Non-kernel TUs compile once at
+`BASELINE_ARCH` (default `avx2` since PR #84). See
+[Single-binary SIMD dispatch (x86)](launcher.md) for the full design.
+
+### Single-tier x86 builds
+
+Pass `arch=<target>` to compile a single binary with kernels for **one
+tier only** (no runtime dispatch table — useful on clusters with uniform
+hardware):
 
 | Command | SIMD level | `ARCH_FLAGS` |
 |---|---|---|
@@ -42,18 +63,14 @@ Pass `arch=<target>` to compile a single binary with a specific ISA level:
 | `make arch=sse42` | SSE4.2 | `-msse … -msse4.2` |
 | `make arch=avx` | AVX | `-mavx` |
 | `make arch=avx2` | AVX2 | `-mavx2` |
-| `make arch=avx512bw` | AVX-512BW | `-mavx512f -mavx512bw` |
+| `make arch=avx512bw` | AVX-512BW | `-mavx512f -mavx512bw -mprefer-vector-width=256` |
 | `make arch=native` | host CPU features | `-march=native` |
 
-For Intel compiler (`icpc` / `icpx`) the flags differ slightly; see the Makefile for the `ifeq ($(CXX), icpc)` branches.
-
-### Multi-binary x86 build (default on x86)
-
-```bash
-make multi
-```
-
-Builds five ISA-specific binaries (`bwa-mem3.sse41`, `bwa-mem3.sse42`, `bwa-mem3.avx`, `bwa-mem3.avx2`, `bwa-mem3.avx512bw`) plus the thin launcher `bwa-mem3` that execs the best-matching binary at runtime. See [Multi-binary launcher](launcher.md) for details.
+For Intel compiler (`icpc` / `icpx`) the flags differ slightly; see the
+Makefile for the `ifeq ($(CXX), icpc)` branches. The `avx512bw` target
+keeps the `-mprefer-vector-width=256` cap from PR #86 — see
+[`BASELINE_ARCH=avx512bw` build flag](../whats-different/avx512-baseline.md)
+for the empirical perf characterization.
 
 ### ARM64 / Apple Silicon build
 
@@ -61,7 +78,8 @@ Builds five ISA-specific binaries (`bwa-mem3.sse41`, `bwa-mem3.sse42`, `bwa-mem3
 make arch=arm64
 ```
 
-Compiles a single binary `bwa-mem3.arm64` and creates a symlink `bwa-mem3 -> bwa-mem3.arm64`. See [Apple Silicon / NEON port](neon-port.md) for background.
+Compiles a single binary `bwa-mem3` with one NEON kernel TU. See
+[Apple Silicon / NEON port](neon-port.md) for background.
 
 ## Tuned builds
 
@@ -154,7 +172,7 @@ Removes only the mdbook build output (`docs/book/`). Covered in [Developer Guide
 
 **See also:**
 [SIMD dispatch architecture](simd-dispatch.md) ·
-[Multi-binary launcher](launcher.md) ·
+[Single-binary SIMD dispatch (x86)](launcher.md) ·
 [Best Practices → Build](../best-practices/build.md) ·
 [Performance → PGO build](../performance/pgo.md) ·
 [Apple Silicon / NEON port](neon-port.md)

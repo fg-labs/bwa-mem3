@@ -4,7 +4,7 @@ bwa-mem3 supports ARM64 (Apple Silicon and Linux aarch64) as a first-class build
 
 ## Architecture overview
 
-The ARM build compiles a single binary (`bwa-mem3.arm64`) rather than a family of ISA-specific binaries. There is only one NEON instruction-set level on all current ARM64 CPUs, so the multi-binary launcher used on x86 is not needed. `make arm64` builds the binary and creates a symlink `bwa-mem3 -> bwa-mem3.arm64`.
+The ARM build compiles a single binary with a single NEON kernel TU. There is only one NEON instruction-set level on all current ARM64 CPUs, so the per-tier dispatch table used by the x86 single-binary build (see [Single-binary SIMD dispatch (x86)](launcher.md)) collapses to a one-entry switch on aarch64 — there is effectively no dispatch overhead. `make arm64` builds and installs the binary at the bare `bwa-mem3` name.
 
 ### sse2neon shim
 
@@ -47,7 +47,7 @@ The FM-index (`FMI_search.cpp`) is memory-bound with sequential pointer-chasing 
 | Correctness verification | done | — | 200,006 alignments, 0 differences vs. reference |
 | Dynamic L2 cache detection | done | ~0% | 4 MB detected; compile-time `BATCH_SIZE=1024` already optimal |
 | Native NEON `bandedSWA.cpp` | done | ~4% | `vbsl`-based blendv in `simd_compat.h` |
-| Multi-binary launcher | N/A | 0% | Not applicable on ARM (single NEON level) |
+| Per-tier dispatch table | N/A | 0% | Collapses to one entry on ARM (single NEON level) |
 | Accelerate.framework | done | ~0% | Linked; no suitable compute patterns |
 | M1/M2/M3/M4 detection | done | ~0% | P/E-core counts and L2 cache via sysctl |
 | Native NEON `FMI_search.cpp` | N/A | 0% | Memory-bound; SIMD cannot help |

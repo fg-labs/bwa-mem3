@@ -84,9 +84,9 @@ make pgo-use PGO_ARCH=avx512bw PGO_PROFILE_DIR=pgo_profiles_avx512bw
 >
 > Profile data collected on one microarchitecture is not portable to a different one. An AVX2 profile collected on a Haswell CPU will not improve — and may pessimize — an AVX-512BW build run on a Sapphire Rapids CPU. Always collect profiles on the same hardware class where the optimized binary will run.
 
-## PGO and the multi-binary layout
+## PGO and the single-binary multi-tier build
 
-The PGO targets produce a single optimized binary for a single arch target. They do not rebuild the full `make multi` set. If you want PGO-optimized multi-binary dispatch, build and profile each arch variant separately, place them alongside the launcher, and verify with `./bwa-mem3 version`.
+The PGO targets produce one optimized binary for a single `arch=` target. They do not yet rebuild the default `make single` multi-tier binary's per-tier kernel TUs. If you need PGO across more than one host class, build and profile each `arch=` variant separately and deploy whichever matches the target fleet — `bwa-mem3 version` will report the resolved tier so you can confirm. PGO for the in-process multi-tier dispatch path is tracked as a future enhancement.
 
 ## Relationship to LTO
 

@@ -4,13 +4,14 @@ This page describes the recommended build configuration for production use of bw
 
 ## Choose the right arch target
 
-The default `make` invocation builds the multi-binary launcher on x86 (or a
-single ARM64 binary on Apple Silicon). For production servers where the CPU
-family is known, specify the target explicitly so the compiler can generate
-tighter code and the binary does not need the launcher overhead:
+The default `make` invocation builds a single multi-tier binary on x86
+(or a single NEON binary on arm64). For production clusters where the
+CPU family is uniform, you can trim further by building one tier only —
+the binary drops the per-tier dispatch table and ships a single kernel
+path:
 
 ```bash
-# Most modern x86-64 servers (Skylake or later):
+# Most modern x86-64 servers (Haswell or later):
 make arch=avx2
 
 # Intel Cascade Lake / Sapphire Rapids, AWS c7i/m7i:
@@ -20,9 +21,12 @@ make arch=avx512bw
 make arch=arm64
 ```
 
-Omit `arch=` if the deployment target is heterogeneous or unknown; `make`
-(with no arguments) builds the full multi-binary suite on x86 and selects the
-fastest variant at runtime via `cpuid`.
+Omit `arch=` if the deployment target is heterogeneous or unknown; the
+default `make` produces a single binary that includes every supported
+x86 tier and dispatches at runtime via `__builtin_cpu_supports`. Tune
+the non-kernel TU compile baseline with `BASELINE_ARCH=` (default
+`avx2`) — see
+[Single-binary SIMD dispatch (x86)](../developer-guide/launcher.md).
 
 See [SIMD dispatch matrix](../performance/simd-dispatch.md) for the full list
 of targets and which kernels each vectorizes.

@@ -47,49 +47,57 @@ missing symbols, or at runtime with missing index files.
 > If `make` reports missing headers (e.g. `htslib/hts.h: No such file or
 > directory`), the submodules were not initialized.
 
-## Building without an arch target on a known CPU
+## Leaving `BASELINE_ARCH` at the default on a known higher-tier CPU
 
-The default `make` (no `arch=`) builds the multi-binary launcher suite on x86.
-On a production server with a known CPU family, this is unnecessary: the
-launcher adds a small cpuid dispatch overhead on every invocation, and the
-extra binaries consume disk space. More importantly, building without an
-explicit `arch=` means the compiler cannot assume any ISA beyond SSE4.1, so
-AVX2- and AVX-512-specific optimizations are not applied to the base binary.
+The default `make` (no `arch=`) builds the multi-tier single binary
+with non-kernel TUs compiled at `BASELINE_ARCH=avx2`. On a production
+server with a known higher-tier CPU family, this leaves auto-vectorized
+non-kernel hot paths at 256-bit width when the host could go wider, or
+keeps the host-floor precheck at `avx2` when the deployment surface is
+strictly AVX-512. Pass `BASELINE_ARCH=` (or build a single-tier binary
+with `arch=`) to align the build with the deployment:
 
 > **Warning — Suboptimal build on known hardware**
 >
-> On a server with a known CPU family, always pass an explicit `arch=`:
->
 > ```bash
-> make arch=avx2        # for Broadwell/Skylake and later x86
-> make arch=avx512bw    # for Cascade Lake, Ice Lake, Sapphire Rapids
-> make arch=arm64       # for Apple Silicon, AWS Graviton
+> # Single multi-tier binary with non-kernel TUs at the host's tier:
+> make BASELINE_ARCH=avx512bw      # Cascade Lake / Ice Lake / Sapphire Rapids / Zen 4
+>
+> # Single-tier binary (no dispatch table; smallest install) when the cluster
+> # is uniform and you don't need cross-tier portability:
+> make arch=avx2                   # Broadwell/Skylake and later x86
+> make arch=avx512bw               # Cascade Lake / Sapphire Rapids
+> make arch=arm64                  # Apple Silicon / AWS Graviton
 > ```
 >
-> The `make multi` target (or bare `make` on x86) is appropriate when you are
-> building a binary that will be distributed and run on multiple CPU families,
-> or when the target CPU is genuinely unknown.
+> The default (`make` with no overrides) is appropriate when the binary
+> will be distributed across multiple CPU families or when the target
+> CPU is genuinely unknown. Note that `BASELINE_ARCH=avx512bw` does not
+> always win over `avx2` even on AVX-512 hosts — see
+> [`BASELINE_ARCH=avx512bw` build flag](../whats-different/avx512-baseline.md)
+> for the empirical perf characterization.
 
 See [SIMD dispatch matrix](../performance/simd-dispatch.md) for the full set
-of targets.
+of targets and the in-process dispatch architecture.
 
 ## Mixing bwa-mem3 and bwa-mem2 outputs in the same pipeline
 
 bwa-mem3 adds several custom SAM tags that bwa-mem2 does not emit: `HN:i`
 (total number of primary alignments — both reported and suppressed — that the
 aligner found for this read, before the `-h` supplementary cap is applied),
-and — in `--meth` mode —
-`YS:Z:`, `YC:Z:`, and `YD:Z:`. It also rewrites `@SQ` header lines in
-`--meth` mode (collapsing `f`/`r` strand prefixes back to one entry per
-chromosome).
+and — in `--meth` mode — the Bismark-compatible `XR:Z` (read conversion
+direction), `XG:Z` (genome strand), and `XM:Z` (per-base methylation call
+string) tags. It also rewrites `@SQ` header lines in `--meth` mode
+(collapsing `f`/`r` strand prefixes back to one entry per chromosome).
 
 > **Warning — Header and tag mismatch**
 >
 > Do not merge BAM files produced by bwa-mem3 and bwa-mem2 without verifying
 > that the `@PG` headers and custom tags are handled correctly by the downstream
 > tool. In methylation workflows, a bwa-mem2 BAM mixed into a bwa-mem3 `--meth`
-> pipeline will be missing `YD:Z:` strand annotations, which will cause
-> methylation callers to silently drop or misclassify those records.
+> pipeline will be missing the `XR:Z` / `XG:Z` / `XM:Z` Bismark annotations,
+> which will cause methylation callers to silently drop or misclassify those
+> records.
 
 If you must merge outputs from both tools, run `samtools view -H` on both
 files and confirm that `@SQ` lines are consistent and that the downstream tool

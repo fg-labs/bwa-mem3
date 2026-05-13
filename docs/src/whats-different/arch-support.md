@@ -24,26 +24,38 @@ that matches both names. All four architecture-conditional blocks in the
 Makefile are rewritten to use `IS_ARM`: the NEON/sse2neon flag block, the x86
 arch-specific block, the ARM64 single-binary build block, and the `multi`
 target ARM64 short-circuit. The CI workflow is extended to trigger on pushes
-to `fg-main` (the integration branch) and adds an `ubuntu-24.04-arm` matrix
-row so the aarch64 path is exercised on every PR.
+to `fg-main` (the integration branch at the time of PR #1, renamed to `main`
+in the 0.1.0-pre release) and adds an `ubuntu-24.04-arm` matrix row so the
+aarch64 path is exercised on every PR.
 
 ## `arch=avx512bw` explicit build target (PR #16)
 
 The AVX-512 Smith-Waterman kernels in bwa-mem2 are guarded by the
-`__AVX512BW__` preprocessor macro — not `__AVX512F__`. The only way to build
-them before this PR was `arch=avx512`, but `make multi` emitted the dispatch
-binary as `bwa-mem2.avx512bw`. The build selector (`avx512`), the preprocessor
-guard (`__AVX512BW__`), and the dispatcher suffix (`.avx512bw`) disagreed.
+`__AVX512BW__` preprocessor macro — not `__AVX512F__`. The only way to
+build them before this PR was `arch=avx512`, but the (then) `make multi`
+rule emitted the dispatch binary as `bwa-mem2.avx512bw`. The build
+selector (`avx512`), the preprocessor guard (`__AVX512BW__`), and the
+dispatcher suffix (`.avx512bw`) disagreed.
 
-PR #16 adds `arch=avx512bw` as an explicit Makefile target with flags
-`-mavx512f -mavx512bw` and switches `make multi` to invoke `arch=avx512bw`
-when emitting `bwa-mem3.avx512bw`. The legacy `arch=avx512` is preserved as
-an alias with identical flags. No C++ is changed; the fix is 11 insertions and
-2 deletions in the Makefile.
+PR #16 added `arch=avx512bw` as an explicit Makefile target with flags
+`-mavx512f -mavx512bw` and switched the multi-binary `make` path to use
+it. The legacy `arch=avx512` was preserved as an alias with identical
+flags. No C++ was changed; the fix was 11 insertions and 2 deletions in
+the Makefile.
 
-This is a pure build-correctness fix: before PR #16, `arch=avx512bw` and
-`arch=multi` builds on AVX-512BW hardware silently compiled the wrong kernel
-(see [Correctness → AVX-512BW dispatch guard](correctness.md) for the
+PR #83 has since replaced the multi-binary scheme with a single binary
+that compiles each kernel TU at every supported tier and dispatches
+in process; the `avx512bw` tier name and flag set survived the
+transition unchanged, and the `arch=avx512bw` build target remains the
+single-arch fallback for clusters with uniform AVX-512BW hardware. The
+pre-#16 mismatch between selector, guard, and suffix is therefore
+resolved in both the historical multi-binary layout and the current
+single-binary layout.
+
+This is a pure build-correctness fix: before PR #16, `arch=avx512bw`
+and the legacy multi-binary build on AVX-512BW hardware silently
+compiled the wrong kernel (see
+[Correctness → AVX-512BW dispatch guard](correctness.md) for the
 downstream effect).
 
 ## NEON kswv mate-rescue (PR #18)

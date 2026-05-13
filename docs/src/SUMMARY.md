@@ -68,7 +68,7 @@
 
 - [Building from source](developer-guide/building.md)
 - [SIMD dispatch architecture](developer-guide/simd-dispatch.md)
-- [Multi-binary launcher (x86)](developer-guide/launcher.md)
+- [Single-binary SIMD dispatch (x86)](developer-guide/launcher.md)
 - [Apple Silicon / NEON port](developer-guide/neon-port.md)
 - [Regression test framework](developer-guide/regression-tests.md)
 - [Release process](developer-guide/release.md)
