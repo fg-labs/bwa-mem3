@@ -2,6 +2,9 @@
 #ifndef BWAMEM3_SIMD_DISPATCH_H
 #define BWAMEM3_SIMD_DISPATCH_H
 
+#include <stdio.h>          /* for FILE * in bwamem3_print_version_simd */
+#include <stddef.h>         /* for size_t in bwamem3_format_host_floor_error */
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -40,6 +43,40 @@ int bwamem3_simd_tier(void);
 /* Returns a stable string for a tier value: "sse41", "sse42", "avx",
  * "avx2", "avx512bw", "neon", "scalar", or "unknown". */
 const char *bwamem3_simd_tier_name(int tier);
+
+/* Pure comparison helper: returns 1 if host_tier can run a binary built
+ * at build_tier, 0 otherwise. Handles NEON/x86 family orthogonality
+ * defensively. Declared in the header so unit tests don't need to
+ * forward-declare it (which would let signature drift go undetected). */
+int bwamem3_check_host_floor(int host_tier, int build_tier);
+
+/* Pure formatter: writes the host-floor refusal message into a caller-
+ * provided buffer. Returns the byte count written (excluding terminator),
+ * or -1 on truncation/null-buffer. Buffer is NUL-terminated within its
+ * bounds when buf != NULL && bufsz > 0. */
+int bwamem3_format_host_floor_error(char *buf, size_t bufsz,
+                                    int host_tier, int build_tier);
+
+/* Returns 1 if the running host can execute this binary's compiled-in
+ * instructions, 0 otherwise. Reads the raw host capability (independent
+ * of BWAMEM3_FORCE_TIER) so the query reflects the SIGILL risk for the
+ * compiler-emitted non-kernel TU instructions, not the kernel dispatch
+ * tier. Calls bwamem3_simd_init() to populate the cache. Pure query —
+ * never exits. Used by the version subcommand to print a warning. */
+int bwamem3_host_meets_floor(void);
+
+/* Refuses to run if the host doesn't meet the build's floor: writes a clear
+ * error to stderr and calls exit(2). On success, returns. Called from
+ * main() after the early -h/--help/version short-circuits so diagnostic
+ * commands (`bwa-mem3 version`, `bwa-mem3 <cmd> --help`) remain usable
+ * on too-old hosts. */
+void bwamem3_enforce_host_floor(void);
+
+/* Prints the SIMD floor / runtime / optional warning banner to the given
+ * stream. Calls bwamem3_simd_init() to ensure tiers are populated. Two
+ * lines unconditionally (floor + runtime); a third warning line iff
+ * bwamem3_host_meets_floor() returns 0. Never exits. */
+void bwamem3_print_version_simd(FILE *f);
 
 #ifdef __cplusplus
 }

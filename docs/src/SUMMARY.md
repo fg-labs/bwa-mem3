@@ -5,6 +5,7 @@
 # Getting Started
 
 - [Installation](getting-started/installation.md)
+- [Host requirements](getting-started/host-requirements.md)
 - [Quick start: align paired-end FASTQs](getting-started/quick-align.md)
 - [Quick start: methylation alignment](getting-started/quick-meth.md)
 - [Quick start: shared-memory index](getting-started/quick-shm.md)
@@ -31,6 +32,7 @@
 - [Output format](best-practices/output-format.md)
 - [Multi-sample workflows](best-practices/multi-sample.md)
 - [Methylation defaults](best-practices/methylation.md)
+- [Multi-architecture deployment](best-practices/multi-arch-deployment.md)
 - [Anti-patterns](best-practices/anti-patterns.md)
 
 # CLI Reference

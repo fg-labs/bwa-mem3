@@ -6,6 +6,9 @@
 #include <mutex>
 
 static int g_tier = BWAMEM3_TIER_NONE;
+static int g_host_capability = BWAMEM3_TIER_NONE;  /* raw detect_x86_tier(),
+                                                      preserved before
+                                                      BWAMEM3_FORCE_TIER */
 static std::once_flag g_init_flag;
 
 /* Build-time tier — what the compiler emitted for this TU and (because the
@@ -79,17 +82,153 @@ static int parse_tier_name(const char *name)
     return -1;
 }
 
+/* Pure helper: returns 1 if host_tier can run a binary built at build_tier.
+ * x86 tiers and NEON are orthogonal — a binary built for NEON cannot run on
+ * x86 and vice versa, so cross-family always returns 0. NEON is its own
+ * floor: NEON-on-NEON returns 1; anything else paired with NEON returns 0. */
+extern "C" int bwamem3_check_host_floor(int host_tier, int build_tier)
+{
+    if (build_tier == BWAMEM3_TIER_NEON) {
+        return host_tier == BWAMEM3_TIER_NEON ? 1 : 0;
+    }
+    if (host_tier == BWAMEM3_TIER_NEON) {
+        return 0;  /* x86 build on NEON host: impossible by ELF, defensive */
+    }
+    return host_tier >= build_tier ? 1 : 0;
+}
+
+/* Pure helper: format the host-floor error message into a caller-provided
+ * buffer. Returns the number of bytes written (excluding terminator), or
+ * -1 if the buffer was too small or buf is NULL. When buf != NULL &&
+ * bufsz > 0, the buffer is left NUL-terminated within its bounds on
+ * any return path. Pure function — no I/O, no exit. */
+extern "C" int bwamem3_format_host_floor_error(char *buf, size_t bufsz,
+                                               int host_tier, int build_tier)
+{
+    if (buf == NULL || bufsz == 0) return -1;
+    const char *host_name  = bwamem3_simd_tier_name(host_tier);
+    const char *build_name = bwamem3_simd_tier_name(build_tier);
+    int n = snprintf(buf, bufsz,
+        "[E::bwamem3] this binary was compiled for SIMD floor %s and emits %s "
+        "instructions in non-kernel translation units. The host CPU does not "
+        "support %s (detected: %s). Running would SIGILL on the first %s "
+        "instruction.\n"
+        "\n"
+        "To run on this host, rebuild bwa-mem3 with BASELINE_ARCH=%s (or "
+        "lower), or use a binary built for a lower SIMD floor.\n",
+        build_name, build_name, build_name, host_name, build_name, host_name);
+    if (n < 0 || (size_t)n >= bufsz) {
+        buf[bufsz - 1] = '\0';
+        return -1;
+    }
+    return n;
+}
+
+extern "C" int bwamem3_host_meets_floor(void)
+{
+    bwamem3_simd_init();
+    return bwamem3_check_host_floor(g_host_capability, g_build_tier);
+}
+
+extern "C" void bwamem3_enforce_host_floor(void)
+{
+    bwamem3_simd_init();
+    if (bwamem3_check_host_floor(g_host_capability, g_build_tier)) {
+        return;
+    }
+    char buf[1024];
+    bwamem3_format_host_floor_error(buf, sizeof(buf),
+                                    g_host_capability, g_build_tier);
+    fputs(buf, stderr);
+    /* exit (not _exit) so stdio flushes before the process tears down. */
+    exit(2);
+}
+
+extern "C" void bwamem3_print_version_simd(FILE *f)
+{
+    bwamem3_simd_init();
+
+#if defined(__x86_64__) || defined(__i386__)
+    const char *floor_paren = "x86 floor";
+    switch (g_build_tier) {
+      case BWAMEM3_TIER_AVX512BW: floor_paren = "x86-64-v4, Skylake-X 2017+"; break;
+      case BWAMEM3_TIER_AVX2:     floor_paren = "x86-64-v3, Haswell 2013+";   break;
+      case BWAMEM3_TIER_AVX:      floor_paren = "Sandy Bridge 2011+";          break;
+      case BWAMEM3_TIER_SSE42:    floor_paren = "x86-64-v2, Nehalem 2008+";    break;
+      case BWAMEM3_TIER_SSE41:    floor_paren = "Penryn 2007+";                break;
+      default:                    floor_paren = "scalar";                       break;
+    }
+    fprintf(f, "SIMD floor: %s (%s); kernels: sse41 sse42 avx avx2 avx512bw\n",
+            bwamem3_simd_tier_name(g_build_tier), floor_paren);
+#elif defined(__aarch64__) || defined(__ARM_NEON)
+    fprintf(f, "SIMD floor: neon (aarch64 baseline); kernels: neon\n");
+#else
+    fprintf(f, "SIMD floor: scalar; kernels: scalar\n");
+#endif
+
+    /* Runtime line: reflects FORCE_TIER if set. When FORCE_TIER asks for
+     * an unknown / up-tier / cross-family value, init_body() emits a
+     * [W::*] warning and leaves g_tier unchanged — annotate the runtime
+     * line as ", ignored" so the banner doesn't look like the request
+     * was accepted. Comparison is on the parsed tier value, not the raw
+     * string, so aliases like "sse4.2" / "sse42" both report correctly. */
+    const char *force = getenv("BWAMEM3_FORCE_TIER");
+    if (force != NULL && force[0] != '\0') {
+        int requested_tier = parse_tier_name(force);
+        const char *suffix = (requested_tier >= 0 && requested_tier == g_tier)
+                             ? "" : ", ignored";
+        fprintf(f, "SIMD runtime: %s (BWAMEM3_FORCE_TIER=%s%s)\n",
+                bwamem3_simd_tier_name(g_tier), force, suffix);
+    } else {
+        fprintf(f, "SIMD runtime: %s (BWAMEM3_FORCE_TIER unset)\n",
+                bwamem3_simd_tier_name(g_tier));
+    }
+
+    /* Optional warning when raw host capability is below build floor.
+     * Goes to stderr (not f) to match the convention of every other
+     * [W::*] warning in the codebase, and so 'bwa-mem3 version | grep ^SIMD'
+     * in CI scripts isn't contaminated by the warning line. */
+    if (!bwamem3_check_host_floor(g_host_capability, g_build_tier)) {
+        fprintf(stderr, "[W::bwa-mem3] this host (%s) is below the binary's floor "
+                   "(%s); 'bwa-mem3 mem' will refuse to run. Rebuild with "
+                   "BASELINE_ARCH=%s (or lower) to run on this host.\n",
+                bwamem3_simd_tier_name(g_host_capability),
+                bwamem3_simd_tier_name(g_build_tier),
+                bwamem3_simd_tier_name(g_host_capability));
+    }
+}
+
 /* The body of bwamem3_simd_init. Called at most once via std::call_once. */
 static void bwamem3_simd_init_body(void)
 {
 #if defined(__x86_64__) || defined(__i386__)
-    g_tier = detect_x86_tier();
+    g_host_capability = detect_x86_tier();
 #elif defined(__aarch64__) || defined(__ARM_NEON)
-    /* aarch64 baseline ABI guarantees NEON. */
-    g_tier = BWAMEM3_TIER_NEON;
+    g_host_capability = BWAMEM3_TIER_NEON;
 #else
-    g_tier = BWAMEM3_TIER_NONE;
+    g_host_capability = BWAMEM3_TIER_NONE;
 #endif
+
+#ifdef BWAMEM3_TESTING
+    /* Test-only: BWAMEM3_TESTING_HOST_TIER overrides the detected host
+     * capability, so regression tests can simulate too-old hosts without
+     * actually being on one. Production builds (without -DBWAMEM3_TESTING)
+     * never compile this path. */
+    {
+        const char *injected = getenv("BWAMEM3_TESTING_HOST_TIER");
+        if (injected != NULL && injected[0] != '\0') {
+            int tier = parse_tier_name(injected);
+            if (tier >= 0) {
+                g_host_capability = tier;
+            } else {
+                fprintf(stderr, "[W::%s] ignoring BWAMEM3_TESTING_HOST_TIER=%s "
+                                "(unknown tier)\n", __func__, injected);
+            }
+        }
+    }
+#endif
+
+    g_tier = g_host_capability;
 
     /* Build-vs-host gap (debug-only).
      *

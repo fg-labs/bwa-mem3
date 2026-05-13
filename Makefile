@@ -72,6 +72,14 @@ ifneq ($(strip $(ASAN)),)
     CFLAGS      += $(ASAN_FLAGS)
 endif
 
+# TESTING_BUILD=1 defines BWAMEM3_TESTING which enables test-only injection
+# hooks (BWAMEM3_TESTING_HOST_TIER env var read by simd_dispatch.cpp). Used
+# by test/regression/host_floor_enforce.sh. Production builds leave this
+# unset; integration tests build with `make TESTING_BUILD=1`.
+ifneq ($(TESTING_BUILD),)
+    CXXFLAGS += -DBWAMEM3_TESTING
+endif
+
 # mimalloc integration. Default on — see FG-MAIN.md.
 # Override with USE_MIMALLOC=0 to build a stock bwa-mem3 without mimalloc.
 USE_MIMALLOC ?= 1
@@ -333,7 +341,7 @@ ifneq ($(strip $(DISABLE_BATCHED_MATESW)),)
     CPPFLAGS += -DDISABLE_BATCHED_MATESW=$(DISABLE_BATCHED_MATESW)
 endif
 
-.PHONY:all myall arm64 clean depend single all-single print-mimalloc-config kswv_nrow_zero_test shm_section_find_test shm_pack_round_trip_test shm_lock_destroy_test test FORCE pgo-generate pgo-use pgo-clean profile-build profile-clean lto-build lto-clean docs docs-serve docs-cli docs-clean docs-install-tools
+.PHONY:all myall arm64 clean depend single all-single print-mimalloc-config kswv_nrow_zero_test shm_section_find_test shm_pack_round_trip_test shm_lock_destroy_test test test-injection FORCE pgo-generate pgo-use pgo-clean profile-build profile-clean lto-build lto-clean docs docs-serve docs-cli docs-clean docs-install-tools
 .SUFFIXES:.cpp .o
 
 .cpp.o:
@@ -356,6 +364,24 @@ src/%.avx512bw.o: src/%.cpp
 	$(CXX) -c $(BASE_CXXFLAGS) $(KERNEL_FLAGS_avx512bw) $(CPPFLAGS) -DKERNEL_VARIANT=_avx512bw $(INCLUDES) $< -o $@
 
 all:$(EXE)
+
+# Note: simd_dispatch.cpp is compiled at the regular BASELINE_ARCH like
+# every other non-kernel TU. An earlier draft of this PR compiled it at
+# -march=x86-64 to keep the precheck path SIGILL-safe on too-old hosts,
+# but that broke `g_build_tier` (a `static constexpr` in this TU derived
+# from __AVX2__/__SSE4_1__/etc., which only get defined when the matching
+# -m flag is in scope). With the override, every binary reported its
+# floor as "scalar" and the precheck silently became a no-op.
+#
+# In practice the precheck path is scalar-only — std::call_once,
+# integer comparisons, getenv, snprintf, fputs, exit — with no array
+# loops the compiler could autovectorize. main.cpp's preamble before
+# the precheck (argc check, rdtsc, sleep, argv strcmp scan) is the
+# same shape: scalar branching + libc calls. Even at -mavx2 the
+# compiler doesn't emit AVX2 for any of this, so the precheck actually
+# fires on EVERY host below the build floor — sse42, sse41, scalar,
+# cross-family — not just one tier below. Verified empirically with
+# the BWAMEM3_TESTING_HOST_TIER injection test.
 
 # Regenerate src/version.h on every invocation, but only touch the file
 # (and thus trigger a main.o rebuild) when the string actually changed.
@@ -461,12 +487,26 @@ test/shm_pack_round_trip_test.o: test/shm_pack_round_trip_test.cpp
 # shm_lock_destroy_test). shm_pack_round_trip_test runs via
 # test/shm_pack_round_trip_test.sh which builds the phiX index first;
 # invoked from test/run_unit_tests.sh.
-test: test-binaries kswv_nrow_zero_test shm_section_find_test shm_lock_destroy_test
+#
+# Note: depends on `bwa-mem3` so version_banner.sh has a binary to grep —
+# previously `test:` only built the test harness binaries, not the main
+# executable.
+test: test-binaries kswv_nrow_zero_test shm_section_find_test shm_lock_destroy_test bwa-mem3
 	./test/bwa_mem3_tests_unit
 	./test/bwa_mem3_tests_integration
 	./kswv_nrow_zero_test
 	./shm_section_find_test
 	./shm_lock_destroy_test
+	BWA_MEM3=./bwa-mem3 ./test/regression/version_banner.sh
+
+# Regression test that requires a binary built with TESTING_BUILD=1
+# (enables BWAMEM3_TESTING_HOST_TIER env-var injection). Not invoked by
+# the default `test` target because it requires a non-production build.
+# CI runs `make clean && make TESTING_BUILD=1 && make test-injection`
+# as a separate matrix row.
+test-injection: bwa-mem3
+	BWA_MEM3_TESTING=./bwa-mem3 INJECTED_TIER=sse41 PARITY_FA=/dev/null \
+		./test/regression/host_floor_enforce.sh
 
 test/kswv_nrow_zero_test.o: test/kswv_nrow_zero_test.cpp
 	$(CXX) -c $(BASE_CXXFLAGS) -march=native $(CPPFLAGS) $(INCLUDES) $< -o $@
@@ -579,6 +619,9 @@ docs-cli: $(EXE)
 			| grep -v '^Total time taken:' \
 			| grep -v '^Looking to launch ' \
 			| grep -v '^Launching executable ' \
+			| grep -v '^SIMD floor: ' \
+			| grep -v '^SIMD runtime: ' \
+			| grep -v '^\[W::' \
 			| awk '/^v?[0-9]+\.[0-9]+/ {print "v<MAJOR.MINOR>-<N>-g<COMMIT>"; next} {print}' \
 			> docs/_generated/cli/$$sub.txt; \
 	done

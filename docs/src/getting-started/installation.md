@@ -136,6 +136,10 @@ mimalloc 3.x.x
 If the `mimalloc` line is absent, the build linked the system allocator (expected when
 `USE_MIMALLOC=0` was passed or when the vendor submodule was not initialized).
 
+## Next: host requirements
+
+If you're planning to deploy bwa-mem3 across a heterogeneous fleet (AWS Batch, mixed compute clusters), read [Host requirements](host-requirements.md) for the supported CPU floor and [Best Practices → Multi-architecture deployment](../best-practices/multi-arch-deployment.md) for the deployment recipe.
+
 ---
 
 **See also:**
