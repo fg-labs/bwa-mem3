@@ -18,6 +18,18 @@ bwa-mem3 inherits the SIMD-vectorized alignment kernels of bwa-mem2 and adds sev
 
 PR [#58](https://github.com/fg-labs/bwa-mem3/pull/58) and the related lockstep SMEM-batching work ([#33](https://github.com/fg-labs/bwa-mem3/pull/33)) reduced per-read overhead in the main mapping loop beyond what upstream bwa-mem2 carries. The batch `-H` ingestion improvement ([#49](https://github.com/fg-labs/bwa-mem3/pull/49)) further reduces header-processing latency for large sample sets.
 
+## Reference numbers across architectures
+
+Wall-time medians from [bwa-mem3-bench](https://github.com/fg-labs/bwa-mem3-bench) at SHA `dc7fcfe` (2026-05-13), 5 reps per cell, t≈16, hg38, paired-end 150 bp:
+
+| sample | c6a (AVX2, Zen3) | c7a (AVX-512, Zen4) | c7i (AVX-512, SPR) | c7g (NEON, Graviton3) | c8g (NEON, Graviton4) |
+|---|---:|---:|---:|---:|---:|
+| wgs-5M | 147.70 s | **101.17 s** | 138.33 s | 178.54 s | 151.23 s |
+| wes-5M | 84.37 s | **61.96 s** | 75.08 s | 84.50 s | 70.90 s |
+| panel-twist-5M | 158.49 s | **106.94 s** | 151.78 s | 194.04 s | 163.38 s |
+
+Concordance vs upstream `bwa-mem2 v2.2.1` on these cells: **100.0000%** across 8.1M–10M reads/cell. NEON-vs-x86 cross-architecture concordance on the same builds is also 100.0000%. Spot-pool noise envelope (rep-to-rep CV): ~1% on c6a / c7a / c7g / c8g, ~8–9% on c7i. See the bench repo for the methodology, the full per-rep table, and noisier instance classes excluded from this summary.
+
 ## Benchmarking responsibly
 
 Alignment throughput is sensitive to read length, error rate, reference size, thread count, CPU architecture, NUMA topology, and whether the index is cold (in-kernel page cache) or warm. The [bwa-mem3-bench](https://github.com/fg-labs/bwa-mem3-bench) harness controls for these variables by running standardized workloads on defined instance types. If you need numbers for a procurement or publication decision, run the harness against your target hardware.

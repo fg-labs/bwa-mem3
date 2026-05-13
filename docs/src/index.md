@@ -25,8 +25,8 @@ support for things you used to need a wrapper script for.
   NEON/AVX2/AVX-512BW, mem_sam_pe proper-pair flag — every fix tracked
   back to the upstream PR or issue that found it.
 - **Architecture-aware out of the box.** SSE4.1, SSE4.2, AVX, AVX2,
-  AVX-512BW, and ARM64/NEON. A multi-binary launcher picks the right
-  one for your CPU.
+  AVX-512BW, and ARM64/NEON. One binary per platform; the dispatcher
+  picks the right tier for your CPU in process at startup.
 
 ## Get started in 30 seconds
 

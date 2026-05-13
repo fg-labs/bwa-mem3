@@ -71,12 +71,16 @@ per-arch × per-regime profile capture. See also
 
 ## `CXXFLAGS`/`CPPFLAGS`/`LDFLAGS` forwarding (PR #50)
 
-The Makefile's `multi:` rule compiled `runsimd.cpp` (the x86 multi-binary
-launcher) without honoring `CXXFLAGS`, `CPPFLAGS`, or `LDFLAGS`. The `$(EXE)`
-link honored `CXXFLAGS` and `LDFLAGS` but not `CPPFLAGS`.
+At the time of PR #50, the Makefile's `multi:` rule compiled
+`runsimd.cpp` (the x86 multi-binary launcher) without honoring
+`CXXFLAGS`, `CPPFLAGS`, or `LDFLAGS`. The `$(EXE)` link honored
+`CXXFLAGS` and `LDFLAGS` but not `CPPFLAGS`. PR #83 has since replaced
+the multi-binary scheme with a single binary that builds via the
+`single:` target (the default), and that target inherits the same
+flag-forwarding behavior.
 
-PR #50 mirrors upstream [bwa-mem2#290](https://github.com/bwa-mem2/bwa-mem2/pull/290):
-the `multi:` compile now honors all three variables, and `$(EXE)` link adds
+PR #50 mirrored upstream [bwa-mem2#290](https://github.com/bwa-mem2/bwa-mem2/pull/290):
+the compile rules now honor all three variables, and `$(EXE)` link adds
 `$(CPPFLAGS)`. This allows downstream packagers (Debian, Bioconda) and
 reproducible-build systems to inject hardening flags (`-D_FORTIFY_SOURCE=2`,
 `-fstack-protector-strong`, `-Wl,-z,relro`) through the environment without

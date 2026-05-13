@@ -85,6 +85,21 @@ transparently.
 > `emptyDir` tmpfs volume with an explicit size (Kubernetes) before attempting
 > to stage a large index.
 >
+> **Note — `/dev/shm` capacity preflight (PR #86)**
+>
+> Before opening the segment, `bwa-mem3 shm` calls `statvfs("/dev/shm")` and
+> compares the available bytes against the index's `total_size`. If `/dev/shm`
+> is too small the stage aborts cleanly with an `[E::bwa_shm_stage]` message
+> that names `/dev/shm`, the required size, and a `mount -o remount,size=...`
+> hint. This replaces the previous failure mode where `ftruncate` succeeded
+> lazily and `pack_into` later surfaced ENOSPC as `[fread] Bad address` with
+> no indication that `/dev/shm` was the cause. The preflight is best-effort:
+> a `statvfs` failure (no `/dev/shm`, restricted sandbox, ENOSYS) is
+> non-fatal and the stage proceeds. As a rough sizing guide, hg38 stages
+> ~17 GB; AWS instances default to RAM/2 (so c7a.4xlarge / c7i.4xlarge at
+> 32 GB get ~16 GB of `/dev/shm`, which is just under the index size — a
+> `remount,size=28g` is the documented fix).
+>
 > **Note — Stuck-lock recovery**
 >
 > Concurrent `bwa-mem3 shm <prefix>` invocations are serialized by a named

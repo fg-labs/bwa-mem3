@@ -90,9 +90,10 @@ numbers.
 
 ## Arch flags and the index format
 
-The FM-index format is architecture-independent. A single index can be used
-with any bwa-mem3 binary — `bwa-mem3.avx2`, `bwa-mem3.avx512bw`, and the ARM
-single-binary all read the same on-disk layout.
+The FM-index format is architecture-independent. A single index works
+across every SIMD tier and every supported platform: the x86 binary's
+AVX2 / AVX-512BW dispatch paths and the arm64 NEON binary all read the
+same on-disk layout.
 
 ---
 

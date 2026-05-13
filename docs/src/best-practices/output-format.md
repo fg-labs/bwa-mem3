@@ -48,9 +48,10 @@ contend. A 16:8 split (bwa-mem3:samtools) works well on 24-core machines.
 ## Methylation output
 
 The `--meth` path always writes uncompressed BAM internally, regardless of
-the `--bam` flag.  The post-processing step (header rewrite, chimera QC,
-`YD:Z:` tag) is performed inline before the record is handed to htslib, so the
-same pipeline shape applies:
+the `--bam` flag.  The post-processing step (header rewrite, Bismark
+`XR:Z` / `XG:Z` / `XM:Z` tag emission, opt-in chimera QC) is performed
+inline before the record is handed to htslib, so the same pipeline shape
+applies:
 
 ```bash
 bwa-mem3 mem --meth --bam=0 -t 16 ref.fa R1.fq.gz R2.fq.gz \

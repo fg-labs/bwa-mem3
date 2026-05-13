@@ -2,36 +2,35 @@
 
 The items below are ordered by expected impact for most workloads. Work through them in sequence; there is little point optimizing output format before confirming you are running the right binary for your CPU.
 
-## 1. Run the right binary for your CPU
+## 1. Confirm the resolved SIMD tier matches your CPU
 
-If you built with `make multi` (recommended for production x86 deployments), the `bwa-mem3` launcher reads CPUID at startup and execs the highest-capability variant automatically. Verify which variant is running by checking the banner printed to stderr at the start of a `mem` run:
-
-```text
------------------------------
-Executing in AVX512 mode!!
------------------------------
-```
-
-If the banner says SSE4.1 on a machine you believe supports AVX2, the variant binary may be missing from the directory. Confirm with:
+The default `make` produces a single binary that contains every supported
+x86 SIMD tier and selects one in process at startup. Verify which tier
+is running:
 
 ```bash
-ls -1 bwa-mem3.sse41 bwa-mem3.sse42 bwa-mem3.avx bwa-mem3.avx2 bwa-mem3.avx512bw 2>&1
+bwa-mem3 version
+# expect: SIMD floor: <build_floor>; SIMD runtime: <resolved_tier>
 ```
 
-If files are missing, rebuild with `make multi`.
+If the runtime tier is below what your CPU supports, double-check
+whether you accidentally built with a lower `BASELINE_ARCH=` or set
+`BWAMEM3_FORCE_TIER` in the environment. Set `BWAMEM3_DEBUG_SIMD=1` to
+get a startup banner on stderr at the start of a `mem` run.
 
-For ARM / Apple Silicon, there is only one binary level. Confirm it is in use:
+On ARM / Apple Silicon, the binary has one NEON tier; `bwa-mem3 version`
+reports `SIMD runtime: neon`.
 
-```bash
-ls -la bwa-mem3
-# expect: bwa-mem3 -> bwa-mem3.arm64
-```
-
-See [SIMD dispatch matrix](simd-dispatch.md) for the full dispatch logic and the minimum CPU requirements for each variant.
+See [SIMD dispatch matrix](simd-dispatch.md) for the full dispatch
+logic and the minimum CPU requirements for each tier.
 
 > **Tip — Single-arch deployments**
 >
-> On a cluster where all nodes have the same CPU, build with `make arch=avx2` (or the appropriate ISA). The launcher overhead is negligible but removing it simplifies the deployment: only one binary to distribute and no variant-lookup failures.
+> On a cluster where every node has the same CPU, build with
+> `make arch=avx2` (or the appropriate ISA). The runtime dispatch
+> overhead is negligible, but a single-arch build trims the binary
+> and removes any chance of `BWAMEM3_FORCE_TIER` accidentally
+> downgrading throughput in production.
 
 ## 2. Build with PGO if you will run repeatedly
 
@@ -99,7 +98,7 @@ On a 16-core machine, allocating 12 threads to `mem` and 8 to `samtools sort` (w
 
 | Item | Action | Reference |
 |---|---|---|
-| Right binary for CPU | `make multi`; verify banner | [SIMD dispatch matrix](simd-dispatch.md) |
+| Right SIMD tier for CPU | `bwa-mem3 version`; verify `SIMD runtime:` | [SIMD dispatch matrix](simd-dispatch.md) |
 | PGO for production | `pgo-generate` → train → `pgo-use` | [PGO build](pgo.md) |
 | Shared-memory index | `bwa-mem3 shm ref.fa` before batch runs | [Quick start: shm](../getting-started/quick-shm.md) |
 | Emit uncompressed BAM | `--bam=0` | [Best Practices — Output format](../best-practices/output-format.md) |

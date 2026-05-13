@@ -13,7 +13,7 @@ bwa-mem3 runs on the hosts in the table below. Verify your host with `bwa-mem3 v
 
 ```text
 $ bwa-mem3 version
-bwa-mem3-0.1.0-pre-12-gabcdef1
+v0.1.0-pre-12-gabcdef1
 SIMD floor: avx2 (x86-64-v3, Haswell 2013+); kernels: sse41 sse42 avx avx2 avx512bw
 SIMD runtime: avx512bw (BWAMEM3_FORCE_TIER unset)
 mimalloc 3.x.x

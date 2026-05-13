@@ -23,11 +23,16 @@ bwa-mem3 mem --meth ref.fa R1.fq R2.fq | samtools sort -o out.bam
 index that `bwameth.py index-mem2` produces.
 
 `mem --meth` performs inline C→T conversion of R1 and G→A conversion of R2
-before seeding, stashes the original bases in `YS:Z:`, records the conversion
-direction in `YC:Z:`, consolidates the `f`/`r` contig pairs back to one `@SQ`
-per real chromosome, applies a chimera QC heuristic (longest M/=/X run < 44%
-of read length → set `0x200`, clear proper-pair `0x2`, cap MAPQ at 1), copies
-`YS:Z:` back into the SEQ field for CpG-calling tools, and writes a `@PG
+before seeding (stashing the pre-conversion bases on an internal
+`YS:Z` / `YC:Z` carrier in `bseq1_t.comment`; both are suppressed at
+BAM emit), consolidates the `f`/`r` contig pairs back to one `@SQ`
+per real chromosome, emits Bismark-compatible `XR:Z` (read conversion
+direction), `XG:Z` (genome strand), and `XM:Z` (per-base methylation
+call string) auxiliary tags on every record, optionally applies a
+chimera QC heuristic (longest M/=/X run < 44% of read length → set
+`0x200`, clear proper-pair `0x2`, cap MAPQ at 1) when `--chimera-qc`
+is passed, copies the internal pre-conversion sequence back into the
+BAM SEQ field for CpG-calling tools, and writes a `@PG
 ID:bwa-mem3-meth` entry.
 
 On the bwameth.py example fixture (92,684 reads), end-to-end output is

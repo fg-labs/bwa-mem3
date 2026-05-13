@@ -28,7 +28,8 @@ two projections of each chromosome:
 
 Converted R1 reads are therefore alignable to `f`-prefixed contigs and
 converted R2 reads to `r`-prefixed contigs. The contig prefix records which
-strand hypothesis was used and feeds the `YD:Z:` tag directly.
+strand hypothesis was used and feeds the Bismark `XG:Z` tag directly
+(`CT` for `f`-prefixed / OT, `GA` for `r`-prefixed / OB).
 
 ## Where conversion happens
 
@@ -44,9 +45,13 @@ comment buffer as:
 YS:Z:<l_seq bases>\tYC:Z:<direction>
 ```
 
-where `<direction>` is `CT` for R1 (C→T) and `GA` for R2 (G→A). These fields
-pass through the alignment kernel untouched and are emitted as SAM aux tags in
-the output BAM. See [SAM tags: YS, YC, YD](tags.md) for the per-tag reference.
+where `<direction>` is `CT` for R1 (C→T) and `GA` for R2 (G→A). These
+fields pass through the alignment kernel untouched and serve two
+internal purposes at BAM-write time: `YS:Z` is the source for SEQ
+restoration (see next section), and `YC:Z` is the source for the
+emitted `XR:Z:` Bismark tag. They are **not** emitted to the output
+BAM — `bam_writer.cpp` suppresses them under `--meth`. See
+[SAM tags: XR, XG, XM](tags.md) for the per-tag output reference.
 
 ## Sequence restoration in the BAM SEQ field
 
@@ -54,8 +59,11 @@ Methylation callers such as MethylDackel identify methylated cytosines by
 examining the BAM SEQ field at each CpG site. They need to see real `C`/`T`
 bases — not the uniformly-converted `T`/`A` bases that were used for alignment.
 
-`meth_mem_aln_to_bam` (in `src/meth_bam.cpp`) restores the original sequence
-from `YS:Z:` before writing the BAM record:
+`meth_mem_aln_to_bam` (in `src/meth_bam.cpp`) restores the original
+sequence from the internal `YS:Z` carrier on `bseq1_t.comment` before
+writing the BAM record (the carrier itself is suppressed at BAM emit
+by `bam_writer.cpp` under `--meth`, so it never reaches the output
+file):
 
 1. The `YS:Z:` payload is located at the start of the `bseq1_t.comment` field
    (offset `+5` past the `YS:Z:` header bytes).
@@ -91,7 +99,7 @@ FASTA can be used interchangeably with either tool across tested versions.
 
 **See also:**
 [Overview](overview.md) ·
-[SAM tags: YS, YC, YD](tags.md) ·
+[SAM tags: XR, XG, XM](tags.md) ·
 [Interop with external bwameth.py c2t](external-c2t.md) ·
 [User Guide → Indexing the reference](../user-guide/indexing.md) ·
 [Best Practices → Methylation defaults](../best-practices/methylation.md)

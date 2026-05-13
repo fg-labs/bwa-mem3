@@ -52,8 +52,8 @@ A step in paired-end alignment where, if one mate lacks a confident seed, bwa-me
 **mimalloc**
 A high-performance memory allocator from Microsoft. bwa-mem3 vendors mimalloc and links it into every binary by default. To disable, build with `USE_MIMALLOC=0`. See [Memory allocator (mimalloc)](../user-guide/allocator.md).
 
-**Multi-binary launcher**
-On x86, bwa-mem3 ships a thin launcher binary that detects CPUID features at runtime and execs the appropriate arch-specialized binary (`bwa-mem3.sse41`, `.avx2`, `.avx512bw`, etc.). On ARM64 a single `bwa-mem3.arm64` binary is built. See [Multi-binary launcher (x86)](../developer-guide/launcher.md).
+**Single-binary SIMD dispatch**
+On x86, bwa-mem3 ships one binary that contains compiled kernels for every supported SIMD tier (`sse41` / `sse42` / `avx` / `avx2` / `avx512bw`) and selects one in process at startup via `__builtin_cpu_supports`. There are no per-tier companion binaries. On ARM64 the binary contains a single NEON kernel TU. Replaces the prior multi-binary `execv` launcher (PR #83). See [Single-binary SIMD dispatch (x86)](../developer-guide/launcher.md).
 
 **PGO**
 Profile-Guided Optimization — a two-pass build where the first pass instruments the binary, a representative workload is run to collect profiles, and the second pass uses those profiles to guide inlining and branch layout. Activated via `make pgo-generate` then `make pgo-use`. See [PGO build](../performance/pgo.md).
@@ -68,7 +68,7 @@ SAM flag bit indicating that both mates of a pair are mapped in the expected ori
 Sequence Alignment Map — a tab-delimited text format for read alignments. Each record contains mandatory fields (QNAME, FLAG, RNAME, POS, MAPQ, CIGAR, RNEXT, PNEXT, TLEN, SEQ, QUAL) plus optional tags. See [Output: SAM/BAM, headers, tags](../user-guide/output.md).
 
 **SIMD dispatch**
-Runtime selection of the fastest available SIMD instruction set (SSE4.1, AVX2, AVX-512BW, NEON) for hot alignment kernels. On x86 this is implemented by the multi-binary launcher; on ARM64 a single binary covers NEON. See [SIMD dispatch matrix](../performance/simd-dispatch.md).
+Runtime selection of the fastest available SIMD instruction set (SSE4.1, SSE4.2, AVX, AVX2, AVX-512BW, NEON) for hot alignment kernels. On x86 this is implemented in process by `src/simd_dispatch.cpp` via `__builtin_cpu_supports`; on ARM64 a single NEON tier covers every supported CPU. See [SIMD dispatch matrix](../performance/simd-dispatch.md).
 
 **SMEM**
 Super-Maximal Exact Match — a seed found by extending a read's position in the FM-index as far as possible in both directions. SMEMs form the initial seeds for chaining and extension in the BWA-MEM algorithm. See [Performance improvements](../whats-different/performance.md).

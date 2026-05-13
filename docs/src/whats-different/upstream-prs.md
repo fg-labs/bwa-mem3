@@ -5,7 +5,7 @@ corresponding upstream bwa-mem2 PR or issue. "Fork-only" means no upstream PR
 exists; the change may be submitted upstream in the future or may be
 fork-specific by design. "Open" means the upstream PR or issue existed at the
 time of bwa-mem3's implementation but had not been merged. Upstream status is
-current as of the bwa-mem3 0.1.0-pre release.
+current as of the bwa-mem3 0.2.0-pre release.
 
 For prose descriptions of each change, follow the links in the "bwa-mem3 PR"
 column to the relevant deep-dive page section.
@@ -25,6 +25,8 @@ column to the relevant deep-dive page section.
 | NEON 16-bit kernel rewrite | [#31](https://github.com/fg-labs/bwa-mem3/pull/31) | — | fork-only |
 | kseq2bseq1 zero-initialization | [#22](https://github.com/fg-labs/bwa-mem3/pull/22) | — | fork-only |
 | Proper-pair flag from emitted alignment | [#17](https://github.com/fg-labs/bwa-mem3/pull/17) | — | fork-only |
+| `@HD` emitted before `@SQ` per SAM spec | [#35](https://github.com/fg-labs/bwa-mem3/pull/35) | [lh3/bwa#345](https://github.com/lh3/bwa/pull/345) | closed (lh3 only) |
+| `mem_matesw` SIGSEGV on shm-backed `ref_string` | [#85](https://github.com/fg-labs/bwa-mem3/pull/85) | — | fork-only |
 | **Performance** | | | |
 | Lockstep SMEM batching | [#33](https://github.com/fg-labs/bwa-mem3/pull/33) | — | fork-only |
 | Batched `-H` header ingestion (O(n) fix) | [#49](https://github.com/fg-labs/bwa-mem3/pull/49) | [bwa-mem2#204](https://github.com/bwa-mem2/bwa-mem2/pull/204) | open PR |
@@ -38,6 +40,10 @@ column to the relevant deep-dive page section.
 | `--supp-rep-hard-cap` MAPQ rescoring | [#56](https://github.com/fg-labs/bwa-mem3/pull/56) | [bwa-mem2#260](https://github.com/bwa-mem2/bwa-mem2/issues/260) | open issue |
 | `bwa-mem3 shm` shared-memory index | [#65](https://github.com/fg-labs/bwa-mem3/pull/65) | — | fork-only (v1 feature port) |
 | `shm --meth` symmetry | [#67](https://github.com/fg-labs/bwa-mem3/pull/67) | — | fork-only |
+| `-z FLOAT` (XA_drop_ratio CLI knob) | [#35](https://github.com/fg-labs/bwa-mem3/pull/35) | [lh3/bwa#294](https://github.com/lh3/bwa/pull/294) | merged (lh3 only) |
+| `-u` flag — widen `XA:Z` records with `,score,mapq` | [#35](https://github.com/fg-labs/bwa-mem3/pull/35) | [lh3/bwa#293](https://github.com/lh3/bwa/pull/293) | merged (lh3 only) |
+| `MQ:i` mate mapping quality tag | [#35](https://github.com/fg-labs/bwa-mem3/pull/35) | [lh3/bwa#330](https://github.com/lh3/bwa/pull/330) | merged (lh3 only) |
+| Bismark-compatible `XR:Z` / `XG:Z` / `XM:Z` tags | [#90](https://github.com/fg-labs/bwa-mem3/pull/90) | — | fork-only |
 | **Architecture support** | | | |
 | Linux ARM64 / aarch64 build + CI | [#1](https://github.com/fg-labs/bwa-mem3/pull/1) | [bwa-mem2#288](https://github.com/bwa-mem2/bwa-mem2/pull/288) | open PR |
 | `arch=avx512bw` explicit Makefile target | [#16](https://github.com/fg-labs/bwa-mem3/pull/16) | — | fork-only |

@@ -1,13 +1,77 @@
-Release 0.2.0-pre (2026-05-09)
+Release 0.2.0-pre (2026-05-13)
 ---------------------------------
+
+Operational / packaging
+
+* Single-binary SIMD dispatch on x86 (#83). The previous multi-binary
+  build (`make multi` producing five `bwa-mem3.<tier>` ISA variants plus
+  a `runsimd.cpp` launcher that `execv`'d the matching tier) is replaced
+  by a single binary that contains compiled kernels for every supported
+  tier (`sse41` / `sse42` / `avx` / `avx2` / `avx512bw`) and selects one
+  in process at startup via `__builtin_cpu_supports`. Install size drops
+  from ~120 MB to ~25 MB; per-call overhead is one indirect branch
+  (~0.3 ns after BTB warm-up). No `.<tier>` companion files are produced
+  or needed. See `docs/src/developer-guide/launcher.md`.
+* `BWAMEM3_FORCE_TIER=<tier>` and `BWAMEM3_DEBUG_SIMD=1` env vars (#83).
+  `BWAMEM3_FORCE_TIER` is downgrade-only and replaces the prior
+  "exec the `bwa-mem3.sse41` binary" A/B-testing pattern; up-tier or
+  unrecognized requests are rejected with a stderr warning.
+* `BASELINE_ARCH=avx2` is the new default for non-kernel translation
+  units on x86 (#84, supersedes the SSE4.1 floor that PR #83 originally
+  shipped with). Override via `make BASELINE_ARCH=<tier>`. AVX-512BW
+  hosts using `BASELINE_ARCH=avx512bw` see a small additional speedup
+  on Zen 4 with `-mprefer-vector-width=256` (#86) and roughly flat
+  results on Sapphire Rapids — see
+  `docs/src/whats-different/avx512-baseline.md` for the characterization.
+* Host-floor precheck (#95). `bwa-mem3 mem`, `bwa-mem3 index`, and
+  `bwa-mem3 shm` refuse to run with exit code 2 and an `[E::bwamem3]`
+  stderr message when the host CPU does not meet the build's compile-time
+  SIMD floor, instead of SIGILL-ing deep in alignment. `bwa-mem3 version`,
+  `--help`, and `-h` are exempt and always succeed.
+* `bwa-mem3 version` now prints `SIMD floor:` (build's required minimum)
+  and `SIMD runtime:` (resolved tier) lines on stdout, plus a
+  `[W::bwa-mem3]` warning on stderr (exit 0) if the host is below the
+  floor. See `docs/src/getting-started/host-requirements.md`.
+* `bwa-mem3 shm` performs a `statvfs("/dev/shm")` capacity preflight
+  (#86). When `/dev/shm` is too small for the index, the stage aborts
+  with an `[E::bwa_shm_stage]` message naming `/dev/shm`, the required
+  size, and a `mount -o remount,size=...` hint — replacing the prior
+  `[fread] Bad address` failure mode. `statvfs` failures (no `/dev/shm`,
+  restricted sandbox) are non-fatal and the stage proceeds.
+
+Methylation
 
 * `mem --meth` emits Bismark-compatible auxiliary tags `XR:Z`
   (read conversion `CT`/`GA`), `XG:Z` (genome strand `CT`/`GA`),
-  and `XM:Z` (per-base methylation call string). These replace the
-  prior bwameth-style `YS:Z`/`YC:Z`/`YD:Z` on output (still used
-  internally for SEQ restoration). The reference-annotation `XR:Z`
-  from `-V` is suppressed under `--meth` to avoid colliding with the
-  Bismark semantics. See `docs/src/methylation/tags.md`.
+  and `XM:Z` (per-base methylation call string) (#90). These replace
+  the prior bwameth-style `YS:Z` / `YC:Z` / `YD:Z` on output (still
+  used internally for SEQ restoration). The reference-annotation
+  `XR:Z` from `-V` is suppressed under `--meth` to avoid colliding
+  with the Bismark semantics. Downstream tools that previously read
+  `YS:Z` / `YC:Z` / `YD:Z` must be pointed at the corresponding
+  `XR:Z` / `XG:Z` and the per-base `XM:Z`. See
+  `docs/src/methylation/tags.md`.
+
+Correctness
+
+* Fixed SIGSEGV in `mem_matesw` on shm-backed `ref_string` (#85).
+  `ksw_align2` mutates its reference slice in place; when the slice
+  pointed into a read-only shm segment, this faulted. Now copies the
+  slice before passing it in.
+
+Performance
+
+* x86 wall-time improvements on the bench (vs the 0.1.0-pre baseline):
+  AVX2 (c6a) −17 to −22%, AVX-512 AMD Zen4 (c7a) −16 to −24%, AVX-512
+  Intel SPR (c7i) −28 to −30% across wgs / wes / panel-twist 5M-read
+  samples. Concordance vs upstream `bwa-mem2 v2.2.1` remains
+  100.0000% on all non-methylation cells. arm64 (c7g / c8g) is flat
+  (within ±2%). The wins are attributable primarily to (a) capping
+  AVX-512BW auto-vectorization at 256-bit on the `avx512bw` target
+  (#86) and (b) inlining `FMI_search::backwardExt` to recover a
+  gcc 12+ wall-clock regression (#88). See
+  `docs/src/performance/overview.md` for the reference numbers across
+  architectures.
 
 Release 0.1.0-pre (2026-04-28)
 ---------------------------------

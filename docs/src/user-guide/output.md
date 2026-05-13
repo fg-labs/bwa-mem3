@@ -66,8 +66,20 @@ convention of separate-tool pipelines.
 ### Standard tags
 
 bwa-mem3 emits the same standard tags as bwa-mem2 (`NM:i`, `MD:Z`, `AS:i`,
-`XS:i`, `SA:Z`, `RG:Z`, `XA:Z`, etc.). These are documented in the SAM
-specification and are not described further here.
+`XS:i`, `SA:Z`, `RG:Z`, `XA:Z`, `MC:Z`, etc.). These are documented in the
+SAM specification and are not described further here.
+
+bwa-mem3 additionally emits `MQ:i` on paired-end records — the mate's
+mapping quality, set alongside `MC:Z` (the mate's CIGAR) so callers that
+key off the mate's MAPQ don't need to look at the mate record. Both SAM
+and `--bam` output paths emit it. Backported from `lh3/bwa` PR #330 in
+fg-labs PR #35.
+
+The `XA:Z` field set widens from `chr,pos,CIGAR,NM` to
+`chr,pos,CIGAR,NM,score,mapq` when `-u` (a.k.a. the upstream "XB" toggle)
+is passed; the tag name itself remains `XA:Z` for downstream
+compatibility. Tools that parse `XA:Z` need to be aware of the two
+possible field widths.
 
 ### `HN:i` — total alignment hit count
 
@@ -84,14 +96,22 @@ relying solely on MAPQ.
 
 ### Methylation-only tags
 
-The following tags are emitted only when `--meth` is active. See
-[SAM tags: YS, YC, YD](../methylation/tags.md) for the full per-tag reference.
+The following Bismark-compatible tags are emitted only when `--meth` is
+active. See [SAM tags: XR, XG, XM](../methylation/tags.md) for the full
+per-tag reference, including the `XM:Z` character alphabet and the
+`XG:Z` strand-pick semantics.
 
 | Tag | Type | Description |
 |-----|------|-------------|
-| `YS:Z` | string | Original (pre-c2t) read sequence |
-| `YC:Z` | string | Conversion direction: `CT` (R1, C→T) or `GA` (R2, G→A) |
-| `YD:Z` | string | Methylation strand: `f` (forward) or `r` (reverse) |
+| `XR:Z` | string | Read conversion direction: `CT` (R1 / SE) or `GA` (R2) |
+| `XG:Z` | string | Genome strand of the alignment: `CT` (OT) or `GA` (OB) |
+| `XM:Z` | string | Per-base methylation call string (length = `SEQ`) |
+
+The bwameth-style `YS:Z` / `YC:Z` tags exist only as an internal carrier
+on `bseq1_t.comment` for SEQ restoration and `XR:Z` derivation; they
+are suppressed at BAM emit and never appear in output. The bwameth
+`YD:Z` strand tag has been replaced by Bismark `XG:Z` and is not
+emitted.
 
 ## MAPQ semantics
 

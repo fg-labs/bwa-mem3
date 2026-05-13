@@ -47,9 +47,10 @@ before handing off to the aligner. `bwa-mem3 --meth` performs the C→T / G→A
 conversion in-memory on each read batch before passing it to the alignment
 kernel. No temporary FASTQ is written and no extra pipe stage is needed.
 
-**Inline BAM post-processing.** Header rewriting, `YD:Z:` tagging, chimera QC,
-and QC-fail propagation all happen inside the same process and the same pass
-over the alignments. There is no separate post-processing step. Output is
+**Inline BAM post-processing.** Header rewriting, Bismark `XR:Z` / `XG:Z` /
+`XM:Z` tag emission, opt-in chimera QC (`--chimera-qc`), and QC-fail
+propagation all happen inside the same process and the same pass over the
+alignments. There is no separate post-processing step. Output is
 written as uncompressed BAM (`wb0`) — a near-zero-cost format that downstream
 `samtools sort` reads natively.
 
@@ -66,17 +67,21 @@ intentionally differs — see below):
 | Field | bwameth.py | bwa-mem3 --meth |
 |-------|-----------|-----------------|
 | `@SQ` headers | One per real chromosome | One per real chromosome |
-| `YS:Z:` | Pre-c2t original sequence | Same |
-| `YC:Z:` | Conversion direction (`CT` or `GA`) | Same |
-| `YD:Z:` | Strand (`f` or `r`) | Same |
+| Methylation aux tags | `YS:Z`, `YC:Z`, `YD:Z` (bwameth) | `XR:Z`, `XG:Z`, `XM:Z` (Bismark-compatible) |
 | `@PG` | `ID:bwameth` | `ID:bwa-mem3-meth` |
-| Chimera QC threshold | Longest M < 44% of read | Same (44%) |
+| Chimera QC threshold | Longest M < 44% of read | Same (44%), opt-in via `--chimera-qc` |
 | Chimera QC flags | `0x200`, clear `0x2`, MAPQ ≤ 1 | Same |
 | SEQ field | Pre-c2t bases (RC-flipped when `is_rev`) | Same |
 
-The `@PG ID:` is intentionally different so provenance is unambiguous. All
-downstream tools that rely on `YS:Z:`, `YC:Z:`, `YD:Z:`, and the QC flags
-behave identically.
+The `@PG ID:` is intentionally different so provenance is unambiguous.
+bwa-mem3 `--meth` emits the **Bismark-compatible** `XR:Z` / `XG:Z` /
+`XM:Z` tag set rather than the bwameth-style `YS:Z` / `YC:Z` / `YD:Z`
+set, which means the output is directly consumable by
+`bismark_methylation_extractor`, methylKit, methtuple, DMRfinder, and
+epialleleR in addition to MethylDackel and biscuit. Downstream tools
+that read `YS:Z` / `YC:Z` / `YD:Z` will not find those tags and must be
+pointed at the corresponding `XR:Z` / `XG:Z` (and the per-base `XM:Z`
+methylation call string) instead.
 
 > **Info — End-to-end regression coverage**
 >
@@ -96,6 +101,6 @@ post-processing path only.
 **See also:**
 [Overview](overview.md) ·
 [Conversion details](conversion.md) ·
-[SAM tags: YS, YC, YD](tags.md) ·
+[SAM tags: XR, XG, XM](tags.md) ·
 [Chimera QC and header rewriting](post-processing.md) ·
 [Related Projects: bwameth.py](../related-projects/bwameth.md)

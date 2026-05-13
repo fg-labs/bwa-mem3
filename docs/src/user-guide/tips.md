@@ -7,9 +7,10 @@ full rationale.
 ## Index once, align many times
 
 Build the FM-index once per reference version. The on-disk index format is
-stable across bwa-mem3 releases and architecture variants — `bwa-mem3.avx2`
-and `bwa-mem3.avx512bw` read the same files. You do not need to re-index when
-upgrading bwa-mem3 unless the release notes say otherwise.
+stable across bwa-mem3 releases and across every SIMD tier inside the
+single binary — the AVX2 and AVX-512BW kernel paths read the same files.
+You do not need to re-index when upgrading bwa-mem3 unless the release
+notes say otherwise.
 
 ```sh
 # Build once
@@ -78,20 +79,24 @@ wait
 See [Threading and resource use](threading.md) for per-machine thread count
 recommendations.
 
-## Use the right binary for your CPU
+## Confirm the binary's SIMD tier matches your CPU
 
-bwa-mem3 ships separate binaries per SIMD level. Using the highest level
-supported by your CPU gives the best performance:
+bwa-mem3 ships **one binary per platform** that contains every supported
+x86 SIMD tier (or the single NEON path on arm64) and picks the right
+tier in process at startup. There are no per-tier companion binaries to
+copy or call directly.
 
-| CPU generation | Recommended binary |
-|---------------|-------------------|
-| Modern Intel/AMD (2018+) | `bwa-mem3.avx512bw` or `bwa-mem3.avx2` |
-| Older x86 | `bwa-mem3.sse42` or `bwa-mem3.sse41` |
-| Apple Silicon / AWS Graviton | `bwa-mem3` (single ARM binary) |
+| CPU generation | Resolved tier |
+|---------------|---------------|
+| Modern Intel/AMD (2018+) | `avx512bw` or `avx2` |
+| Older x86 | `sse42` or `sse41` |
+| Apple Silicon / AWS Graviton | `neon` |
 
-When you run `bwa-mem3` (the launcher), it detects your CPU and execs the
-appropriate variant automatically. If you copy only a single SIMD binary,
-call it directly.
+Verify the resolved tier with `bwa-mem3 version` (prints `SIMD floor:` and
+`SIMD runtime:` lines on stdout) or set `BWAMEM3_DEBUG_SIMD=1` to get a
+startup banner from `bwa-mem3 mem`. If you need to force a lower tier
+for A/B regression testing, set `BWAMEM3_FORCE_TIER=<tier>` — upgrade
+requests above the host's capability are rejected.
 
 See [Performance: SIMD dispatch matrix](../performance/simd-dispatch.md).
 
