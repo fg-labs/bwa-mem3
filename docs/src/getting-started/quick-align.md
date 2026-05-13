@@ -74,9 +74,11 @@ bwa-mem3 emits standard SAM tags plus the `HN:i:` tag introduced by the fork:
 | `AS:i` | int | Alignment score |
 | `XS:i` | int | Suboptimal alignment score |
 | `SA:Z` | string | Supplementary alignment chain |
+| `MC:Z` | string | Mate CIGAR (paired-end) |
+| `MQ:i` | int | Mate mapping quality (paired-end) |
 | `HN:i` | int | Total number of primary alignments (reported and suppressed) found for the read, before the `-h` supplementary cap is applied |
 
-For the methylation-specific tags (`YS:Z`, `YC:Z`, `YD:Z`), see
+For the methylation-specific tags (`XR:Z`, `XG:Z`, `XM:Z`), see
 [Methylation Reference — SAM tags](../methylation/tags.md).
 
 ---
