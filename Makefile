@@ -157,7 +157,7 @@ CPPFLAGS+=	-DENABLE_PREFETCH -DV17=1 -DMATE_SORT=0 -DLIBSAIS_OPENMP
 # `git describe` (e.g. v2.3-30-g61813ef, with -dirty suffix for modified
 # trees) so the stamped version always reflects the actual build. Fall
 # back to a static tag for source-tarball / shallow-clone builds.
-FG_LABS_VERSION_FALLBACK := 0.1.0-pre
+FG_LABS_VERSION_FALLBACK := 0.2.0
 VERSION_STRING := $(shell git describe --tags --dirty 2>/dev/null || echo $(FG_LABS_VERSION_FALLBACK))
 INCLUDES+=   -Isrc -Iext/safestringlib/include -Iext/htslib -Iext/libsais/include
 ifeq ($(USE_MIMALLOC),1)

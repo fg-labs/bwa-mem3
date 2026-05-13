@@ -1,4 +1,4 @@
-Release 0.2.0-pre (2026-05-13)
+Release 0.2.0 (2026-05-13)
 ---------------------------------
 
 Operational / packaging
@@ -38,6 +38,11 @@ Operational / packaging
   size, and a `mount -o remount,size=...` hint — replacing the prior
   `[fread] Bad address` failure mode. `statvfs` failures (no `/dev/shm`,
   restricted sandbox) are non-fatal and the stage proceeds.
+* `bwa-mem3 shm` `/bwactl` registry RMW is now serialized via a POSIX
+  named semaphore (#82, closes #66). Concurrent `shm stage` / `shm drop`
+  invocations across processes no longer race when updating the
+  registry; the prior best-effort flock was per-`open` and did not
+  cover the read-modify-write window.
 
 Methylation
 
@@ -58,6 +63,16 @@ Correctness
   `ksw_align2` mutates its reference slice in place; when the slice
   pointed into a read-only shm segment, this faulted. Now copies the
   slice before passing it in.
+* `FMI_search` sampled-SA prefetch: parenthesized `SA_COMPX_MASK`
+  precedence so the masked offset is computed against the correct
+  operand (#73). The unparenthesized form was silently producing
+  wrong-but-harmless prefetch addresses; no alignment output was
+  affected.
+* `bntseq` `.alt` parser bounds the line buffer to prevent a
+  stack-overflow on malicious or malformed `.alt` files (#74).
+* `display_stats` clamps the per-thread bucket count to `LIM_C` so
+  `--profile` with `-t` greater than the compiled-in limit no longer
+  writes past the end of the stats array (#81).
 
 Performance
 
@@ -72,6 +87,12 @@ Performance
   gcc 12+ wall-clock regression (#88). See
   `docs/src/performance/overview.md` for the reference numbers across
   architectures.
+* Smaller contributions in the release window: per-strip L1 prefetches
+  across all `kswv` u8/u16 kernels (#70); `SMEM_LOCKSTEP_N` bumped from
+  8 to 16 (#75); closed-form ungapped HIT path when `total_mis == 0`
+  (#77); `ksort` switched to an on-stack buffer for small `n` to drop
+  a per-call `malloc` (#78); `libsais_build` skips a wasted zero-init
+  pass on its unpack and SA buffers, trimming index-build time (#80).
 
 Release 0.1.0-pre (2026-04-28)
 ---------------------------------

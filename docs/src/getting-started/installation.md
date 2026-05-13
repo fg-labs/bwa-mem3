@@ -129,7 +129,7 @@ active:
 Expected output (with mimalloc):
 
 ```text
-bwa-mem3-0.1.0-pre-12-gabcdef1
+v0.2.0-12-gabcdef1
 mimalloc 3.x.x
 ```
 
