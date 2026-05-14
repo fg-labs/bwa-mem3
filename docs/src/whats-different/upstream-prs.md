@@ -72,6 +72,9 @@ column to the relevant deep-dive page section.
 | `CXXFLAGS`/`CPPFLAGS`/`LDFLAGS` forwarding | [#50](https://github.com/fg-labs/bwa-mem3/pull/50) | [bwa-mem2#290](https://github.com/bwa-mem2/bwa-mem2/pull/290) | open upstream PR |
 | Unit-test harness + ARM CI | [#23](https://github.com/fg-labs/bwa-mem3/pull/23) | — | fork-only |
 | CI matrix expansion (7 rows) | [#24](https://github.com/fg-labs/bwa-mem3/pull/24) | — | fork-only |
+| Shell-var rename `BWAMEM2`/`BWA_MEM2[_*]` → `BWAMEM3`/`BWA_MEM3[_*]` (CI/bench/test scripts) | [#68](https://github.com/fg-labs/bwa-mem3/pull/68) | — | fork-only |
+| Methylation oracle: alias `bwa-mem2` → `bwa-mem3` on `PATH` for `bwameth.py` | [#72](https://github.com/fg-labs/bwa-mem3/pull/72) | — | fork-only |
+| Migrate parity tests from dwgsim/phiX174 to holodeck/chr22 | [#89](https://github.com/fg-labs/bwa-mem3/pull/89) | — | fork-only |
 
 ## Upstream issues tracked but not yet fixed in bwa-mem3
 
