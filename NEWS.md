@@ -1,3 +1,15 @@
+Release 0.3.0-pre (TBD)
+---------------------------------
+
+Operational / packaging
+
+Methylation
+
+Correctness
+
+Performance
+
+
 Release 0.2.0 (2026-05-13)
 ---------------------------------
 

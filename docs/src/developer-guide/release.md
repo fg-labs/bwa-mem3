@@ -7,7 +7,7 @@ bwa-mem3 follows [semantic versioning](https://semver.org). Releases are driven 
 The Makefile computes the version string at parse time:
 
 ```makefile
-FG_LABS_VERSION_FALLBACK := 0.2.0
+FG_LABS_VERSION_FALLBACK := 0.3.0-pre
 VERSION_STRING := $(shell git describe --tags --dirty 2>/dev/null || echo $(FG_LABS_VERSION_FALLBACK))
 ```
 
