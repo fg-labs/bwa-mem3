@@ -124,6 +124,8 @@ Auto-generated from `git log --reverse --no-merges master..main` and the convent
 | `652ce0f` | docs(install): list autoconf/automake/libomp/zlib system prereqs | [#93](https://github.com/fg-labs/bwa-mem3/pull/93) |
 | `296b1b9` | docs(install): fix RHEL/Fedora package name pkgconfig → pkgconf-pkg-config | [#94](https://github.com/fg-labs/bwa-mem3/pull/94) |
 | `dc7fcfe` | feat(simd): add SIMD host-floor precheck for multi-arch deployment | [#95](https://github.com/fg-labs/bwa-mem3/pull/95) |
+| `3bc64b0` | docs: pre-release documentation pass for v0.2.0-pre | [#96](https://github.com/fg-labs/bwa-mem3/pull/96) |
+| `27a60c9` | chore(release): prep v0.2.0 release notes and metadata | [#97](https://github.com/fg-labs/bwa-mem3/pull/97) |
 
 <!-- FG-MAIN-TABLE:end -->
 
