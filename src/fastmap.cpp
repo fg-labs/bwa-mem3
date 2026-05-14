@@ -267,6 +267,7 @@ void worker_alloc(const mem_opt_t *opt, worker_t &w, int32_t nreads, int32_t nth
         w.mmc.wsize_mem[l]     = 0;
         w.mmc.wsize_mem_s[l]   = 0;
         w.mmc.wsize_mem_r[l]   = 0;
+        w.mmc.wsize_qdb[l]     = 0;
         w.mmc.matchArray[l]    = NULL;
         w.mmc.min_intv_ar[l]   = NULL;
         w.mmc.query_pos_ar[l]  = NULL;

@@ -219,6 +219,12 @@ typedef struct
     int64_t wsize_mem[MAX_THREADS];
     int64_t wsize_mem_s[MAX_THREADS];
     int64_t wsize_mem_r[MAX_THREADS];
+    // enc_qdb byte-size tracker. Separate from wsize_mem because
+    // mem_collect_smem repurposes wsize_mem as an SMEM-entry count, which
+    // breaks the byte-count invariant for enc_qdb on short-read workloads
+    // (≤50 bp aDNA), where SMEM count >> tot_len bytes can leave enc_qdb
+    // silently undersized between batches.
+    int64_t wsize_qdb[MAX_THREADS];
 
     // Lockstep SMEM batching per-slot state. One pair of contiguous SMEM
     // buffers per thread, each of size SMEM_LOCKSTEP_N * lockstep_buf_cap[tid].
