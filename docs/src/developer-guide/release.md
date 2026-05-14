@@ -7,7 +7,7 @@ bwa-mem3 follows [semantic versioning](https://semver.org). Releases are driven 
 The Makefile computes the version string at parse time:
 
 ```makefile
-FG_LABS_VERSION_FALLBACK := 0.1.0-pre
+FG_LABS_VERSION_FALLBACK := 0.2.0
 VERSION_STRING := $(shell git describe --tags --dirty 2>/dev/null || echo $(FG_LABS_VERSION_FALLBACK))
 ```
 
@@ -180,10 +180,10 @@ Run these in order; each command depends on the previous one.
    ```
 
    Substitute `0.X.Y` with the exact version literal you are tagging,
-   including any pre-release suffix — e.g. for `v0.2.0-pre` use
-   `/^Release 0\.2\.0-pre /`. The trailing space in the inner pattern
-   anchors the match to a complete version token so that `0.2.0` does
-   not also match `Release 0.2.0-pre (...)`. The awk script prints
+   including any pre-release suffix — e.g. for `v0.3.0-pre` use
+   `/^Release 0\.3\.0-pre /`. The trailing space in the inner pattern
+   anchors the match to a complete version token so that `0.3.0` does
+   not also match `Release 0.3.0-pre (...)`. The awk script prints
    lines while `p` is true: it flips on at the matching `Release` line
    and back off at the next `Release` line, which gives a clean
    section without needing a trailing `sed '$d'`.

@@ -5,7 +5,7 @@ corresponding upstream bwa-mem2 PR or issue. "Fork-only" means no upstream PR
 exists; the change may be submitted upstream in the future or may be
 fork-specific by design. "Open" means the upstream PR or issue existed at the
 time of bwa-mem3's implementation but had not been merged. Upstream status is
-current as of the bwa-mem3 0.2.0-pre release.
+current as of the bwa-mem3 0.2.0 release.
 
 For prose descriptions of each change, follow the links in the "bwa-mem3 PR"
 column to the relevant deep-dive page section.
@@ -27,11 +27,21 @@ column to the relevant deep-dive page section.
 | Proper-pair flag from emitted alignment | [#17](https://github.com/fg-labs/bwa-mem3/pull/17) | — | fork-only |
 | `@HD` emitted before `@SQ` per SAM spec | [#35](https://github.com/fg-labs/bwa-mem3/pull/35) | [lh3/bwa#345](https://github.com/lh3/bwa/pull/345) | closed (lh3 only) |
 | `mem_matesw` SIGSEGV on shm-backed `ref_string` | [#85](https://github.com/fg-labs/bwa-mem3/pull/85) | — | fork-only |
+| `SA_COMPX_MASK` precedence in sampled-SA prefetch | [#73](https://github.com/fg-labs/bwa-mem3/pull/73) | — | fork-only |
+| `.alt` parse buffer bounded (stack overflow) | [#74](https://github.com/fg-labs/bwa-mem3/pull/74) | — | fork-only |
+| `display_stats` nthreads clamp to `LIM_C` | [#81](https://github.com/fg-labs/bwa-mem3/pull/81) | — | fork-only |
 | **Performance** | | | |
 | Lockstep SMEM batching | [#33](https://github.com/fg-labs/bwa-mem3/pull/33) | — | fork-only |
 | Batched `-H` header ingestion (O(n) fix) | [#49](https://github.com/fg-labs/bwa-mem3/pull/49) | [bwa-mem2#204](https://github.com/bwa-mem2/bwa-mem2/pull/204) | open PR |
 | libsais FM-index construction | [#57](https://github.com/fg-labs/bwa-mem3/pull/57) | — | fork-only |
 | Consolidated mapping speedups | [#58](https://github.com/fg-labs/bwa-mem3/pull/58) | — | fork-only |
+| kswv per-strip L1 prefetches (all u8/16 kernels) | [#70](https://github.com/fg-labs/bwa-mem3/pull/70) | — | fork-only |
+| `SMEM_LOCKSTEP_N` bumped from 8 to 16 | [#75](https://github.com/fg-labs/bwa-mem3/pull/75) | — | fork-only |
+| Closed-form ungapped HIT when `total_mis == 0` | [#77](https://github.com/fg-labs/bwa-mem3/pull/77) | — | fork-only |
+| `ksort` on-stack buffer for small `n` | [#78](https://github.com/fg-labs/bwa-mem3/pull/78) | — | fork-only |
+| `libsais_build` skip wasted zero-init | [#80](https://github.com/fg-labs/bwa-mem3/pull/80) | — | fork-only |
+| Cap `avx512bw` autovec at 256-bit | [#86](https://github.com/fg-labs/bwa-mem3/pull/86) | — | fork-only |
+| Inline `FMI_search::backwardExt` (recover gcc 12+ regression) | [#88](https://github.com/fg-labs/bwa-mem3/pull/88) | — | fork-only |
 | **Features** | | | |
 | `--bam=LEVEL` direct BAM output | [#12](https://github.com/fg-labs/bwa-mem3/pull/12) | — | fork-only |
 | `--meth` bisulfite alignment mode | [#13](https://github.com/fg-labs/bwa-mem3/pull/13) | — | fork-only |
@@ -44,11 +54,17 @@ column to the relevant deep-dive page section.
 | `-u` flag — widen `XA:Z` records with `,score,mapq` | [#35](https://github.com/fg-labs/bwa-mem3/pull/35) | [lh3/bwa#293](https://github.com/lh3/bwa/pull/293) | merged (lh3 only) |
 | `MQ:i` mate mapping quality tag | [#35](https://github.com/fg-labs/bwa-mem3/pull/35) | [lh3/bwa#330](https://github.com/lh3/bwa/pull/330) | merged (lh3 only) |
 | Bismark-compatible `XR:Z` / `XG:Z` / `XM:Z` tags | [#90](https://github.com/fg-labs/bwa-mem3/pull/90) | — | fork-only |
+| `/bwactl` registry interprocess lock (POSIX named semaphore) | [#82](https://github.com/fg-labs/bwa-mem3/pull/82) | — | fork-only |
+| `bwa-mem3 shm` `/dev/shm` capacity preflight | [#86](https://github.com/fg-labs/bwa-mem3/pull/86) | — | fork-only |
+| Host-floor precheck (`SIMD floor:` / `SIMD runtime:`, exit 2 on under-floor host) | [#95](https://github.com/fg-labs/bwa-mem3/pull/95) | — | fork-only |
 | **Architecture support** | | | |
 | Linux ARM64 / aarch64 build + CI | [#1](https://github.com/fg-labs/bwa-mem3/pull/1) | [bwa-mem2#288](https://github.com/bwa-mem2/bwa-mem2/pull/288) | open PR |
 | `arch=avx512bw` explicit Makefile target | [#16](https://github.com/fg-labs/bwa-mem3/pull/16) | — | fork-only |
 | NEON kswv mate-rescue kernel | [#18](https://github.com/fg-labs/bwa-mem3/pull/18) | — | fork-only |
 | AVX2 kswv mate-rescue kernel | [#20](https://github.com/fg-labs/bwa-mem3/pull/20) | — | fork-only |
+| `bns_fetch_seq_v2` migration of `mem_matesw_batch_{pre,post}` | [#76](https://github.com/fg-labs/bwa-mem3/pull/76) | — | fork-only |
+| Single-binary in-process SIMD dispatch (replaces multi-binary `execv` launcher) | [#83](https://github.com/fg-labs/bwa-mem3/pull/83) | — | fork-only |
+| Default x86 `BASELINE_ARCH=avx2` (was `sse41`) | [#84](https://github.com/fg-labs/bwa-mem3/pull/84) | — | fork-only |
 | **Build & infrastructure** | | | |
 | doctest framework + Codecov | [#34](https://github.com/fg-labs/bwa-mem3/pull/34) | — | fork-only |
 | `PACKAGE_VERSION` from `git describe` | [#52](https://github.com/fg-labs/bwa-mem3/pull/52) | [bwa-mem2#283](https://github.com/bwa-mem2/bwa-mem2/issues/283), [bwa-mem2#284](https://github.com/bwa-mem2/bwa-mem2/pull/284) | open issue + open PR |

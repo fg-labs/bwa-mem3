@@ -46,7 +46,7 @@ AWS Batch, GCP Batch, Kubernetes, and containerd all read the manifest list and 
 
 ```text
 $ bwa-mem3 version
-bwa-mem3-0.1.0-pre-12-gabcdef1
+v0.2.0-12-gabcdef1
 SIMD floor: avx2 (x86-64-v3, Haswell 2013+); kernels: sse41 sse42 avx avx2 avx512bw
 SIMD runtime: avx512bw (BWAMEM3_FORCE_TIER unset)
 ```
