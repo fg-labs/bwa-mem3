@@ -943,6 +943,8 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
 
                 s.qbeg = p->m;
                 s.score= s.len = slen;
+                // Propagate SMEM SA-count so chain_n_hits gates --supp-rep-hard-cap.
+                s.n_hits = static_cast<int32_t>(p->s);
                 if (s.rbeg < 0 || s.len < 0)
                     fprintf(stderr, "rbeg: %ld, slen: %d, cnt: %d, n: %d, m: %d, num_smem: %ld\n",
                             s.rbeg, s.len, cnt-1, p->n, p->m, num_smem);
