@@ -162,7 +162,7 @@ CPPFLAGS+=	-DENABLE_PREFETCH -DV17=1 -DMATE_SORT=0 -DLIBSAIS_OPENMP
 # base version; checkouts past or dirty at the tag get an informational
 # dev suffix appended.
 VERSION_STRING := $(shell scripts/version.sh)
-INCLUDES+=   -Isrc -Iext/safestringlib/include -Iext/htslib -Iext/libsais/include
+INCLUDES+=   -Isrc -Iext/htslib -Iext/libsais/include
 ifeq ($(USE_MIMALLOC),1)
     INCLUDES += -Iext/mimalloc/include
 endif
@@ -187,7 +187,7 @@ else
     LIBSAIS_OPENMP_LIBS   = -fopenmp
 endif
 
-LIBS=		-lpthread -lm -lz -L. -lbwa -Lext/safestringlib -lsafestring -Lext/htslib -lhts $(LIBSAIS_OPENMP_LIBS) $(STATIC_GCC) $(LIBS_EXTRA)
+LIBS=		-lpthread -lm -lz -L. -lbwa -Lext/htslib -lhts $(LIBSAIS_OPENMP_LIBS) $(STATIC_GCC) $(LIBS_EXTRA)
 # Non-kernel objects: always compiled once at the baseline ISA and linked into
 # libbwa.a on every build (arm64 and x86 alike).
 OBJS=		src/fastmap.o src/bwtindex.o src/utils.o src/kthread.o \
@@ -209,7 +209,6 @@ OBJS=		src/fastmap.o src/bwtindex.o src/utils.o src/kthread.o \
 KERNEL_BASELINE_OBJS = src/bandedSWA.o src/kswv.o src/ksw.o src/sam_encode.o
 OBJS += $(KERNEL_BASELINE_OBJS)
 BWA_LIB=    libbwa.a
-SAFE_STR_LIB=    ext/safestringlib/libsafestring.a
 HTS_LIB=    ext/htslib/libhts.a
 
 # Architecture-specific builds (x86 only, ARM uses default from above)
@@ -424,17 +423,17 @@ endif
 # Internal: builds the single binary with the BASELINE_ARCH tier for
 # non-kernel TUs and links all KERNEL_TIER_OBJS_LINK on top.
 .PHONY: all-single
-all-single: $(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) $(KERNEL_TIER_OBJS_LINK) src/main.o
+all-single: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) $(KERNEL_TIER_OBJS_LINK) src/main.o
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) src/main.o $(KERNEL_TIER_OBJS_LINK) $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) $(MIMALLOC_LDFLAGS) -o $(EXE)
 
 # ARM64/Apple Silicon build target - single binary, no multi-binary launcher needed
 arm64:
-	rm -f src/*.o $(BWA_LIB); cd ext/safestringlib/ && $(MAKE) clean;
+	rm -f src/*.o $(BWA_LIB)
 	$(MAKE) arch=arm64 EXE=bwa-mem3.arm64 CXX="$(CXX)" all
 	ln -sf bwa-mem3.arm64 bwa-mem3
 
 
-$(EXE):$(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) $(if $(filter 1,$(USE_MIMALLOC)),$(MIMALLOC_LIB)) src/main.o
+$(EXE):$(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) $(if $(filter 1,$(USE_MIMALLOC)),$(MIMALLOC_LIB)) src/main.o
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) src/main.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) $(MIMALLOC_LDFLAGS) -o $@
 
 # Regression test for issue 38 / upstream PR 289: exercises an all-len1==0
@@ -453,7 +452,7 @@ $(EXE):$(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) $(if $(filter 1,$(U
 src/kswv.native.o: src/kswv.cpp
 	$(CXX) -c $(BASE_CXXFLAGS) -march=native $(CPPFLAGS) $(INCLUDES) $< -o $@
 
-kswv_nrow_zero_test: $(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) src/kswv.native.o test/kswv_nrow_zero_test.o
+kswv_nrow_zero_test: $(BWA_LIB) $(HTS_LIB) src/kswv.native.o test/kswv_nrow_zero_test.o
 	$(CXX) $(BASE_CXXFLAGS) -march=native $(LDFLAGS) test/kswv_nrow_zero_test.o src/kswv.native.o $(BWA_LIB) $(LIBS) -o $@
 
 # Build the test binaries with the same ARCH_FLAGS as libbwa.a so the
@@ -463,24 +462,23 @@ kswv_nrow_zero_test: $(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) src/kswv.native.o tes
 # libbwa.a, which then lacks kswv::getScores8 — the BWA_TESTS_HAVE_KSWV
 # macro guards the test away).
 .PHONY: test-binaries
-# $(SAFE_STR_LIB) and $(HTS_LIB) are real link-time deps: test/Makefile's
-# bwa_mem3_tests_unit recipe references ../ext/safestringlib/libsafestring.a
-# and ../ext/htslib/libhts.a directly. Without these prereqs, callers that
-# skip the bwa-mem3 binary build (which builds them as a side-effect of
-# $(EXE) deps) link-fail.
-test-binaries: $(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB)
+# $(HTS_LIB) is a real link-time dep: test/Makefile's bwa_mem3_tests_unit
+# recipe references ../ext/htslib/libhts.a directly. Without this prereq,
+# callers that skip the bwa-mem3 binary build (which builds it as a
+# side-effect of $(EXE) deps) link-fail.
+test-binaries: $(BWA_LIB) $(HTS_LIB)
 	$(MAKE) -C test framework unit integration \
 	    CXX="$(CXX)" \
 	    COVERAGE=$(COVERAGE) \
 	    ARCH_FLAGS_FROM_PARENT='$(ARCH_FLAGS)'
 
-shm_section_find_test: $(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/shm_section_find_test.o
+shm_section_find_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/shm_section_find_test.o
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/shm_section_find_test.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
 
-shm_pack_round_trip_test: $(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/shm_pack_round_trip_test.o
+shm_pack_round_trip_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/shm_pack_round_trip_test.o
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/shm_pack_round_trip_test.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
 
-shm_lock_destroy_test: $(BWA_LIB) $(SAFE_STR_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/shm_lock_destroy_test.o
+shm_lock_destroy_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/shm_lock_destroy_test.o
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/shm_lock_destroy_test.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
 
 test/shm_pack_round_trip_test.o: test/shm_pack_round_trip_test.cpp
@@ -531,26 +529,6 @@ test/shm_lock_destroy_test.o: test/shm_lock_destroy_test.cpp
 $(BWA_LIB):$(OBJS) $(KERNEL_TIER_OBJS)
 	ar rcs $(BWA_LIB) $(OBJS) $(KERNEL_TIER_OBJS)
 
-# safestringlib's safeclib_private.h calls abort() / memcpy() via macros
-# without including <stdlib.h> / <string.h> in the TU, which fails the
-# implicit-function-declaration check in clang >= 15. Some safeclib TUs
-# (strcasecmp_s.c, strcasestr_s.c) likewise call toupper() without
-# including <ctype.h>. Force-include stdlib.h + ctype.h whenever the
-# build CC is clang (Linux clang job) or whenever we're on Darwin (where
-# the system `cc` is always clang). On Darwin we also redefine memset_s:
-# macOS libc declares C11 Annex K memset_s with a different signature,
-# which conflicts with the safestringlib definition.
-SAFE_EXTRA_CFLAGS =
-SAFE_CC_BASENAME := $(notdir $(CC))
-ifeq ($(UNAME_S),Darwin)
-    SAFE_EXTRA_CFLAGS += -include stdlib.h -include ctype.h -Dmemset_s=_safestringlib_memset_s
-else ifneq (,$(findstring clang,$(SAFE_CC_BASENAME)))
-    SAFE_EXTRA_CFLAGS += -include stdlib.h -include ctype.h
-endif
-
-$(SAFE_STR_LIB):
-	cd ext/safestringlib/ && $(MAKE) clean && $(MAKE) CC="$(CC)" CFLAGS="-Iinclude -Isafeclib $(SAFE_EXTRA_CFLAGS) -fstack-protector-strong -fPIE -fPIC -O2" directories libsafestring.a
-
 # htslib: minimal configure (no lzma/bz2/curl/S3/GCS/plugins), zlib only.
 # Guard on config.mk (only created by ./configure) rather than Makefile, which
 # is checked into the htslib tree and would make the guard a no-op.
@@ -596,7 +574,6 @@ clean: pgo-clean profile-clean lto-clean
 	rm -f $(LIBSAIS_OBJS)
 	rm -f src/*.gcno src/*.gcda
 	$(MAKE) -C test clean
-	cd ext/safestringlib/ && $(MAKE) clean
 	-[ -f ext/htslib/config.mk ] && cd ext/htslib && $(MAKE) distclean
 	rm -rf $(MIMALLOC_BUILD)
 
@@ -672,13 +649,13 @@ else
 endif
 
 pgo-generate:
-	rm -f src/*.o $(BWA_LIB); cd ext/safestringlib/ && $(MAKE) clean;
+	rm -f src/*.o $(BWA_LIB)
 	$(MAKE) arch=$(PGO_ARCH) EXE=$(PGO_INSTR_EXE) EXTRA_CXXFLAGS="-fprofile-generate=$(PGO_PROFILE_DIR)" CXX="$(CXX)" all
 	@echo "PGO instrumented binary built: $(PGO_INSTR_EXE) (arch=$(PGO_ARCH), profile dir=$(PGO_PROFILE_DIR))"
 	@echo "Run training workload with $(PGO_INSTR_EXE), then: make pgo-use PGO_ARCH=$(PGO_ARCH) PGO_PROFILE_DIR=$(PGO_PROFILE_DIR)"
 
 pgo-use:
-	rm -f src/*.o $(BWA_LIB); cd ext/safestringlib/ && $(MAKE) clean;
+	rm -f src/*.o $(BWA_LIB)
 	$(MAKE) arch=$(PGO_ARCH) EXE=$(PGO_FINAL_EXE) EXTRA_CXXFLAGS="-fprofile-use=$(PGO_PROFILE_DIR) -fprofile-correction" CXX="$(CXX)" all
 	@echo "PGO optimized binary built: $(PGO_FINAL_EXE) (arch=$(PGO_ARCH))"
 
@@ -707,7 +684,7 @@ endif
 #        make profile-build PROFILE_ARCH=avx2     # cross-build
 #        ./bwa-mem3.profile mem -t N idx r1.fq.gz r2.fq.gz
 profile-build:
-	rm -f src/*.o $(BWA_LIB); cd ext/safestringlib/ && $(MAKE) clean;
+	rm -f src/*.o $(BWA_LIB)
 	$(MAKE) arch=$(PROFILE_ARCH) EXE=bwa-mem3.profile EXTRA_CXXFLAGS="$(EXTRA_CXXFLAGS) -DDISABLE_OUTPUT" CXX="$(CXX)" all
 	@echo "Compute-only profile binary: bwa-mem3.profile (arch=$(PROFILE_ARCH), output I/O skipped)"
 	# Drop variant-flagged objects from the shared cache so a subsequent
@@ -722,7 +699,7 @@ profile-clean:
 #        make lto-build LTO_ARCH=avx2             # cross-build
 #        ./bwa-mem3.lto mem -t N idx r1.fq.gz r2.fq.gz
 # Compiles all bwa-mem3 sources with LTO and links with LTO. Non-bwa-mem3
-# deps (htslib, mimalloc, safestringlib) keep their non-LTO objects; the
+# deps (htslib, mimalloc) keep their non-LTO objects; the
 # linker still does LTO across bwa-mem3's own .o. On GCC,
 # -fno-semantic-interposition additionally allows more aggressive inlining
 # across translation units (no effect on clang, silently ignored).
@@ -731,7 +708,7 @@ profile-clean:
 # or missing $(CXX) doesn't print a "command not found" warning on every
 # `make` invocation that doesn't even target lto-build.
 lto-build:
-	rm -f src/*.o $(BWA_LIB); cd ext/safestringlib/ && $(MAKE) clean;
+	rm -f src/*.o $(BWA_LIB)
 	@CXX_VERSION="$$($(CXX) --version 2>&1 | head -1)"; \
 	  case "$$CXX_VERSION" in *clang*) LTO_FLAG=-flto=thin ;; *) LTO_FLAG=-flto ;; esac; \
 	  echo "LTO_FLAG=$$LTO_FLAG (cxx: $$CXX_VERSION, arch: $(LTO_ARCH))"; \

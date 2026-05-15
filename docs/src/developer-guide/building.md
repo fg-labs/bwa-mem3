@@ -17,7 +17,7 @@ See [Getting Started → Installation](../getting-started/installation.md) for t
 > **Warning — Submodules must be present**
 >
 > The build will fail with a clear error message if any of the required submodules
-> (`ext/libsais`, `ext/htslib`, `ext/safestringlib`, `ext/mimalloc`, `ext/sse2neon`) are missing.
+> (`ext/libsais`, `ext/htslib`, `ext/mimalloc`, `ext/sse2neon`) are missing.
 > Always clone with `--recursive` or run `git submodule update --init --recursive` before `make`.
 
 ## Standard builds
@@ -115,7 +115,7 @@ make lto-build                                 # builds bwa-mem3.lto (native arc
 make lto-build LTO_ARCH=avx2                   # explicit arch
 ```
 
-LTO compiles bwa-mem3's own translation units with `-flto` (thin LTO on Clang, full LTO on GCC) plus `-fno-semantic-interposition` on GCC. Third-party libraries (`htslib`, `mimalloc`, `safestringlib`) are linked without LTO. Clean:
+LTO compiles bwa-mem3's own translation units with `-flto` (thin LTO on Clang, full LTO on GCC) plus `-fno-semantic-interposition` on GCC. Third-party libraries (`htslib`, `mimalloc`) are linked without LTO. Clean:
 
 ```bash
 make lto-clean
@@ -150,7 +150,7 @@ make profile-clean
 make clean
 ```
 
-Removes object files, `libbwa.a`, all binaries, test binaries, libsais objects, safestringlib, htslib, and the mimalloc build tree.
+Removes object files, `libbwa.a`, all binaries, test binaries, libsais objects, htslib, and the mimalloc build tree.
 
 ```bash
 make docs-clean
