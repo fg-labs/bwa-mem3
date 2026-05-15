@@ -153,12 +153,15 @@ endif
 
 CPPFLAGS+=	-DENABLE_PREFETCH -DV17=1 -DMATE_SORT=0 -DLIBSAIS_OPENMP
 
-# Version string for `bwa-mem3 version` and the @PG VN: field. Prefer
-# `git describe` (e.g. v2.3-30-g61813ef, with -dirty suffix for modified
-# trees) so the stamped version always reflects the actual build. Fall
-# back to a static tag for source-tarball / shallow-clone builds.
-FG_LABS_VERSION_FALLBACK := 0.2.0
-VERSION_STRING := $(shell git describe --tags --dirty 2>/dev/null || echo $(FG_LABS_VERSION_FALLBACK))
+# Version string for `bwa-mem3 version` and the @PG VN: field. The single
+# source of truth is `version.txt` (rewritten by release-please on each
+# release). The logic of "base version + optional git-describe dev suffix"
+# lives in `scripts/version.sh` rather than an inline `$(shell ...)` so
+# the multi-line case statement can stay readable and is independently
+# testable. Tarball / shallow-clone builds with no .git/ get the bare
+# base version; checkouts past or dirty at the tag get an informational
+# dev suffix appended.
+VERSION_STRING := $(shell scripts/version.sh)
 INCLUDES+=   -Isrc -Iext/safestringlib/include -Iext/htslib -Iext/libsais/include
 ifeq ($(USE_MIMALLOC),1)
     INCLUDES += -Iext/mimalloc/include

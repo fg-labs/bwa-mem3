@@ -1,0 +1,287 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build the source tarball for, e.g. v0.3.0. Do NOT use v0.2.0 — its tarball is pinned by sha256 in an open bioconda PR and must not change."
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  release-please:
+    name: release-please
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - name: Run release-please
+        id: release
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  tarball:
+    name: Build vendored source tarball
+    needs: [release-please]
+    if: |
+      always() && (
+        github.event_name == 'workflow_dispatch' ||
+        (github.event_name == 'push' && needs.release-please.outputs.release_created == 'true')
+      )
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Resolve target tag and version
+        id: target
+        # On workflow_dispatch the operator supplies the tag (e.g. v0.3.0).
+        # On the auto-release path release-please supplies tag_name (with
+        # leading 'v') and a separate version output (no 'v'). The
+        # workflow_dispatch input is routed through env (INPUT_TAG) to
+        # avoid GitHub-expression interpolation inside the shell, which
+        # would otherwise allow command injection via a crafted tag value.
+        # Validate format and reject v0.2.0 (its tarball asset is pinned
+        # by sha256 in open bioconda PR #65419 and must not change).
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          AUTO_TAG: ${{ needs.release-please.outputs.tag_name }}
+          AUTO_VERSION: ${{ needs.release-please.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${INPUT_TAG:-}"
+            version="${tag#v}"
+          else
+            tag="${AUTO_TAG:-}"
+            version="${AUTO_VERSION:-}"
+          fi
+          if [ -z "$tag" ] || [ -z "$version" ]; then
+            echo "::error::Resolved empty tag or version (tag='$tag', version='$version')"
+            exit 1
+          fi
+          # Tag format: vX.Y.Z with an optional pre-release suffix like
+          # v1.2.3-rc.1. release-please always emits semver-conformant
+          # tags; workflow_dispatch operators must too.
+          if ! printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$'; then
+            echo "::error::Invalid tag format: '$tag' (expected vX.Y.Z or vX.Y.Z-<suffix>)"
+            exit 1
+          fi
+          if [ "$tag" = "v0.2.0" ]; then
+            echo "::error::v0.2.0 is pinned by sha256 in open bioconda PR #65419 and must not be overwritten."
+            exit 1
+          fi
+          echo "tag=${tag}"         >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "Resolved tag=${tag} version=${version}"
+
+      - name: Checkout tag with submodules
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ steps.target.outputs.tag }}
+          submodules: recursive
+          # depth 1 is enough — git-archive-all walks working-tree
+          # submodule HEADs, not commit history. The tagged commit is
+          # at HEAD so subsequent steps don't need history either.
+          fetch-depth: 1
+
+      - name: Verify version.txt matches resolved tag
+        # version.txt is the single source of truth for the package
+        # version. The resolved tag comes from either release-please's
+        # outputs (auto-release path, where release-please wrote
+        # version.txt in the just-merged release PR) or from the
+        # workflow_dispatch input (rebuild path, where the asset is
+        # being regenerated for an existing release whose version.txt
+        # was set when that release shipped). The two MUST agree;
+        # disagreement means the .release-please-manifest.json and
+        # version.txt have drifted, which would let a release ship with
+        # a misleading binary version. Fail loud here rather than
+        # silently producing a wrong asset.
+        id: ver
+        env:
+          EXPECTED: ${{ steps.target.outputs.version }}
+        run: |
+          set -euo pipefail
+          file_version=$(tr -d '[:space:]' < version.txt)
+          if [ -z "$file_version" ]; then
+            echo "::error::version.txt is empty"
+            exit 1
+          fi
+          if [ "$file_version" != "$EXPECTED" ]; then
+            echo "::error::version.txt says '$file_version' but resolved tag implies '$EXPECTED' (manifest drift between version.txt and .release-please-manifest.json)"
+            exit 1
+          fi
+          echo "version=${file_version}" >> "$GITHUB_OUTPUT"
+
+      - name: Install build dependencies for smoke test
+        # zlib1g-dev for htslib link, autoconf/automake for htslib's configure
+        # step. Mirrors what bioconda's recipe declares under requirements.build
+        # / requirements.host.
+        uses: awalsh128/cache-apt-pkgs-action@acb598e5ddbc6f68a970c5da0688d2f3a9f04d05 # v1.6.0
+        with:
+          packages: zlib1g-dev autoconf automake
+          version: 1.0
+
+      - name: Install git-archive-all
+        # Pinned to a known-good release so a future breaking version
+        # bump can't silently change the tarball layout or sha256.
+        run: pipx install 'git-archive-all==1.23.1'
+
+      - name: Build vendored source tarball
+        # git-archive-all walks every submodule in .gitmodules and runs
+        # `git archive` on each, stitching into a single tar with the
+        # bwa-mem3-<version>/ prefix and no .git/ dirs. File mtimes inside
+        # the tar come from commit timestamps (not filesystem walk time),
+        # so the inner tar is deterministic. We gzip separately with
+        # `-n` so the gzip header carries no wall-clock mtime or original
+        # filename — without this, the .gz wrapper would differ across
+        # runs even though the tar inside is identical. The same tag
+        # from the same repo state therefore produces a byte-identical
+        # .tar.gz on any runner.
+        run: |
+          set -euo pipefail
+          VERSION='${{ steps.ver.outputs.version }}'
+          git-archive-all \
+            --prefix "bwa-mem3-${VERSION}/" \
+            "Source_code_including_submodules.tar"
+          gzip -n -f Source_code_including_submodules.tar
+          ls -lh Source_code_including_submodules.tar.gz
+
+      - name: Smoke test the tarball
+        # Extract the asset and run the same make invocation bioconda's
+        # build.sh uses (`make -j${CPU_COUNT} CC=${CC} CXX=${CXX}` with
+        # the default `myall` target). Note this exercises the build
+        # against the runner's *system* gcc, not conda-forge's
+        # toolchain — so it validates "the source tree builds" but not
+        # "the source tree builds under conda-forge's gcc / libstdc++ /
+        # glibc". A conda-only ABI breakage will pass here and fail
+        # only on bioconda CI. If the smoke step fails the upload step
+        # doesn't run; the tag and (asset-less) GH release still exist
+        # and can be repaired via workflow_dispatch once the underlying
+        # issue is fixed.
+        #
+        # The trailing assertion is the second half of the single-source
+        # contract: the binary's reported version must start with
+        # version.txt's content (allowing an optional dev suffix). If
+        # Makefile / scripts/version.sh ever drifts from version.txt
+        # this catches it before the asset uploads.
+        run: |
+          set -euo pipefail
+          VERSION='${{ steps.ver.outputs.version }}'
+          tar -xzf Source_code_including_submodules.tar.gz -C /tmp
+          cd "/tmp/bwa-mem3-${VERSION}"
+          make -j"$(nproc)" CC=cc CXX=c++
+          got=$(./bwa-mem3 version 2>&1 | head -1)
+          case "$got" in
+            "$VERSION"|"$VERSION"-*)
+              echo "bwa-mem3 version OK: $got"
+              ;;
+            *)
+              echo "::error::bwa-mem3 reports '$got', expected '$VERSION' or '$VERSION-<suffix>' (Makefile / scripts/version.sh drifted from version.txt)"
+              exit 1
+              ;;
+          esac
+
+      - name: Compute sha256
+        # sha256sum is the Linux coreutils idiom and matches the tool
+        # conda-build uses to verify recipe `source.sha256`.
+        run: |
+          set -euo pipefail
+          sha256sum Source_code_including_submodules.tar.gz \
+            > Source_code_including_submodules.tar.gz.sha256
+          cat Source_code_including_submodules.tar.gz.sha256
+
+      - name: Upload release assets
+        # --clobber lets workflow_dispatch rebuild path overwrite. On the
+        # auto-release path the assets don't exist yet so the flag is a
+        # no-op. The v0.2.0 guard in the "Resolve target tag" step
+        # prevents an accidental dispatch from overwriting the bioconda-
+        # pinned asset.
+        run: |
+          set -euo pipefail
+          TAG='${{ steps.target.outputs.tag }}'
+          gh release upload "$TAG" \
+            Source_code_including_submodules.tar.gz \
+            Source_code_including_submodules.tar.gz.sha256 \
+            --clobber
+
+      - name: Append "For packagers" note to release body
+        # Read the current body, strip any previously-appended packagers
+        # block (idempotent across workflow_dispatch rebuilds), append a
+        # fresh block, write back. The HTML-comment delimiters survive
+        # GitHub's markdown renderer invisibly. We build the new body in
+        # a tempfile via printf rather than a shell heredoc to keep the
+        # YAML literal-block scalar happy (a shell heredoc body has to
+        # be flush-left, which would terminate the YAML block prematurely).
+        # The `gh release view` call is wrapped in a small retry loop
+        # because release-please-action creates the release via the REST
+        # API in the prior job; a freshly-created release isn't always
+        # immediately visible on the next API call.
+        run: |
+          set -euo pipefail
+          TAG='${{ steps.target.outputs.tag }}'
+          REPO='${{ github.repository }}'
+          SHA256=$(cut -d ' ' -f 1 < Source_code_including_submodules.tar.gz.sha256)
+
+          fetched=false
+          for attempt in 1 2 3 4 5; do
+            if gh release view "$TAG" --json body --jq .body > current_body.md 2>/tmp/gh_view_err; then
+              fetched=true
+              break
+            fi
+            echo "Attempt ${attempt}: gh release view failed; retrying in 3s..." >&2
+            cat /tmp/gh_view_err >&2 || true
+            sleep 3
+          done
+          if [ "$fetched" != "true" ]; then
+            echo "::error::Could not fetch release body for $TAG after 5 attempts"
+            exit 1
+          fi
+
+          # Strip any prior packagers block. If a previous run left the
+          # opening marker without a closing one (e.g. a crashed runner),
+          # bail rather than silently dropping every line after it.
+          awk '
+            /<!-- packagers-block -->/   { skip=1; next }
+            /<!-- \/packagers-block -->/ { skip=0; next }
+            skip != 1 { print }
+            END {
+              if (skip == 1) {
+                print "ERROR: unclosed packagers-block in release body; refusing to rewrite" > "/dev/stderr"
+                exit 1
+              }
+            }
+          ' current_body.md > stripped_body.md
+
+          # Trim trailing blank lines.
+          sed -e :a -e '/^[[:space:]]*$/{$d;N;ba' -e '}' stripped_body.md > trimmed_body.md
+
+          # shellcheck disable=SC2016
+          # Single-quoted format strings below intentionally contain literal
+          # backticks (markdown code spans) and not command substitutions.
+          {
+            cat trimmed_body.md
+            printf '\n\n<!-- packagers-block -->\n'
+            printf '### For packagers\n\n'
+            printf 'A vendored source tarball (all submodules bundled, no `.git/` directories) is available as a release asset:\n\n'
+            printf -- '- **File**: `Source_code_including_submodules.tar.gz`\n'
+            printf -- '- **sha256**: `%s`\n' "$SHA256"
+            printf -- '- **URL**: `https://github.com/%s/releases/download/%s/Source_code_including_submodules.tar.gz`\n\n' "$REPO" "$TAG"
+            printf "Downstream package recipes (e.g. bioconda) should pin against this asset rather than GitHub's auto-generated source tarball, which omits submodule contents.\n"
+            printf '<!-- /packagers-block -->\n'
+          } > new_body.md
+
+          gh release edit "$TAG" --notes-file new_body.md
