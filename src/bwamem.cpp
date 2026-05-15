@@ -30,7 +30,6 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 
 #include "bwamem.h"
 #include "FMI_search.h"
-#include "memcpy_bwamem.h"
 #include "bam_writer.h"
 #include "meth_bam.h"
 #include "u8vec_scratch.h"
@@ -401,7 +400,7 @@ static int test_and_merge(const mem_opt_t *opt, int64_t l_pac, mem_chain_t *c,
             c->m <<= 1;
             if (pm == SEEDS_PER_CHAIN) {  // re-new memory
                 if ((auxSeedBuf = (mem_seed_t *) calloc(c->m, sizeof(mem_seed_t))) == NULL) { fprintf(stderr, "ERROR: out of memory auxSeedBuf\n"); exit(1); }
-                memcpy_bwamem((char*) (auxSeedBuf), c->m * sizeof(mem_seed_t), c->seeds, c->n * sizeof(mem_seed_t), __FILE__, __LINE__);
+                memcpy((char*) (auxSeedBuf), c->seeds, c->n * sizeof(mem_seed_t));
                 c->seeds = auxSeedBuf;
                 tprof[PE13][tid]++;
             } else {  // new memory
@@ -1444,7 +1443,7 @@ void mem_process_seqs(mem_opt_t *opt,
     // PAIRED_END
     if (opt->flag & MEM_F_PE) { // infer insert sizes if not provided
         if (pes0)
-            memcpy_bwamem(pes, 4 * sizeof(mem_pestat_t), pes0, 4 * sizeof(mem_pestat_t), __FILE__, __LINE__); // if pes0 != NULL, set the insert-size
+            memcpy(pes, pes0, 4 * sizeof(mem_pestat_t)); // if pes0 != NULL, set the insert-size
                                                          // distribution as pes0
         else {
             fprintf(stderr, "[0000] Inferring insert size distribution of PE reads from data, "
@@ -1995,7 +1994,14 @@ void* _mm_realloc(void *ptr, int64_t csize, int64_t nsize, int16_t dsize) {
     }
     void *nptr = _mm_malloc(nsize * dsize, 64);
     assert(nptr != NULL);
-    memcpy_bwamem(nptr, nsize * dsize, ptr, csize, __FILE__, __LINE__);
+    /* csize is in elements (matching nsize), not bytes — multiply by dsize so
+     * callers passing dsize > 1 (sa_coord with sizeof(int64_t), matchArray
+     * with sizeof(SMEM)) get the full pre-grow contents copied across, not
+     * just the first csize bytes. Guard the NULL/empty lazy-init path
+     * (matchArray[tid] starts NULL with wsize_mem[tid]=0). */
+    if (ptr != NULL && csize > 0) {
+        memcpy(nptr, ptr, (size_t)csize * (size_t)dsize);
+    }
     _mm_free(ptr);
 
     return nptr;

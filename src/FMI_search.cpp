@@ -37,7 +37,6 @@ Authors: Sanchit Misra <sanchit.misra@intel.com>; Vasimuddin Md <vasimuddin.md@i
 #include "bwa_madvise.h"
 #include "bwa_shm.h"
 #include "FMI_search.h"
-#include "memcpy_bwamem.h"
 #include "profiling.h"
 #include "libsais_build.h"
 

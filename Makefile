@@ -190,7 +190,7 @@ endif
 LIBS=		-lpthread -lm -lz -L. -lbwa -Lext/safestringlib -lsafestring -Lext/htslib -lhts $(LIBSAIS_OPENMP_LIBS) $(STATIC_GCC) $(LIBS_EXTRA)
 # Non-kernel objects: always compiled once at the baseline ISA and linked into
 # libbwa.a on every build (arm64 and x86 alike).
-OBJS=		src/fastmap.o src/bwtindex.o src/utils.o src/memcpy_bwamem.o src/kthread.o \
+OBJS=		src/fastmap.o src/bwtindex.o src/utils.o src/kthread.o \
 			src/kstring.o src/bntseq.o src/bwamem.o src/profiling.o \
 			src/FMI_search.o src/read_index_ele.o src/bwamem_pair.o src/bwa.o \
 			src/bwamem_extra.o src/kopen.o src/bam_writer.o src/meth_bam.o \
@@ -757,12 +757,7 @@ depend:
 src/FMI_search.o: src/bwa_madvise.h src/bwa_shm.h src/FMI_search.h
 src/FMI_search.o: src/simd_compat.h src/read_index_ele.h src/utils.h
 src/FMI_search.o: src/bntseq.h src/macro.h src/bwa.h src/bwt.h
-src/FMI_search.o: src/memcpy_bwamem.h src/safestringlib.h
-src/FMI_search.o: ext/safestringlib/include/safe_mem_lib.h
-src/FMI_search.o: ext/safestringlib/include/safe_lib.h
-src/FMI_search.o: ext/safestringlib/include/safe_types.h
-src/FMI_search.o: ext/safestringlib/include/safe_lib_errno.h
-src/FMI_search.o: ext/safestringlib/include/safe_str_lib.h src/profiling.h
+src/FMI_search.o: src/profiling.h
 src/FMI_search.o: src/libsais_build.h
 src/bam_writer.o: ext/htslib/htslib/sam.h ext/htslib/htslib/hts.h
 src/bam_writer.o: ext/htslib/htslib/hts_defs.h ext/htslib/htslib/hts_log.h
@@ -777,39 +772,20 @@ src/bam_writer.o: src/cigar_util.h
 src/bandedSWA.o: src/kernel_dispatch.h src/bandedSWA.h src/macro.h
 src/bandedSWA.o: src/simd_compat.h
 src/bntseq.o: src/bntseq.h src/utils.h src/macro.h src/kseq.h
-src/bntseq.o: src/memcpy_bwamem.h src/safestringlib.h
-src/bntseq.o: ext/safestringlib/include/safe_mem_lib.h
-src/bntseq.o: ext/safestringlib/include/safe_lib.h
-src/bntseq.o: ext/safestringlib/include/safe_types.h
-src/bntseq.o: ext/safestringlib/include/safe_lib_errno.h
-src/bntseq.o: ext/safestringlib/include/safe_str_lib.h src/khash.h
+src/bntseq.o: src/khash.h
 src/bwa.o: src/bntseq.h src/bwa.h src/bwt.h src/macro.h src/ksw.h
 src/bwa.o: src/kernel_dispatch.h src/simd_compat.h src/utils.h src/kstring.h
-src/bwa.o: src/kvec.h src/u8vec_scratch.h src/safestringlib.h
-src/bwa.o: ext/safestringlib/include/safe_mem_lib.h
-src/bwa.o: ext/safestringlib/include/safe_lib.h
-src/bwa.o: ext/safestringlib/include/safe_types.h
-src/bwa.o: ext/safestringlib/include/safe_lib_errno.h
-src/bwa.o: ext/safestringlib/include/safe_str_lib.h src/kseq.h
-src/bwa.o: src/memcpy_bwamem.h
+src/bwa.o: src/kvec.h src/u8vec_scratch.h
+src/bwa.o: src/kseq.h
 src/bwa_shm.o: src/bwa_shm.h src/bwa.h src/bntseq.h src/bwt.h src/macro.h
 src/bwa_shm.o: src/FMI_search.h src/simd_compat.h src/read_index_ele.h
-src/bwa_shm.o: src/utils.h src/safestringlib.h
-src/bwa_shm.o: ext/safestringlib/include/safe_mem_lib.h
-src/bwa_shm.o: ext/safestringlib/include/safe_lib.h
-src/bwa_shm.o: ext/safestringlib/include/safe_types.h
-src/bwa_shm.o: ext/safestringlib/include/safe_lib_errno.h
-src/bwa_shm.o: ext/safestringlib/include/safe_str_lib.h
+src/bwa_shm.o: src/utils.h
 src/bwamem.o: src/bwamem.h src/bwt.h src/bntseq.h src/bwa.h src/macro.h
 src/bwamem.o: src/kthread.h src/bandedSWA.h src/simd_compat.h
 src/bwamem.o: src/kernel_dispatch.h src/kstring.h src/ksw.h src/kvec.h
 src/bwamem.o: src/ksort.h src/utils.h src/profiling.h src/FMI_search.h
-src/bwamem.o: src/read_index_ele.h src/memcpy_bwamem.h src/safestringlib.h
-src/bwamem.o: ext/safestringlib/include/safe_mem_lib.h
-src/bwamem.o: ext/safestringlib/include/safe_lib.h
-src/bwamem.o: ext/safestringlib/include/safe_types.h
-src/bwamem.o: ext/safestringlib/include/safe_lib_errno.h
-src/bwamem.o: ext/safestringlib/include/safe_str_lib.h src/bam_writer.h
+src/bwamem.o: src/read_index_ele.h
+src/bwamem.o: src/bam_writer.h
 src/bwamem.o: src/meth_bam.h src/u8vec_scratch.h src/sam_encode.h
 src/bwamem.o: src/kbtree.h
 src/bwamem_extra.o: src/bwa.h src/bntseq.h src/bwt.h src/macro.h src/bwamem.h
@@ -825,23 +801,15 @@ src/bwamem_pair.o: src/FMI_search.h src/read_index_ele.h src/bam_writer.h
 src/bwamem_pair.o: src/u8vec_scratch.h src/kswv.h
 src/bwtindex.o: src/bntseq.h src/bwa.h src/bwt.h src/macro.h src/utils.h
 src/bwtindex.o: src/FMI_search.h src/simd_compat.h src/read_index_ele.h
-src/bwtindex.o: src/kseq.h src/memcpy_bwamem.h src/safestringlib.h
-src/bwtindex.o: ext/safestringlib/include/safe_mem_lib.h
-src/bwtindex.o: ext/safestringlib/include/safe_lib.h
-src/bwtindex.o: ext/safestringlib/include/safe_types.h
-src/bwtindex.o: ext/safestringlib/include/safe_lib_errno.h
-src/bwtindex.o: ext/safestringlib/include/safe_str_lib.h src/system.h
+src/bwtindex.o: src/kseq.h
+src/bwtindex.o: src/system.h
 src/fastmap.o: src/bwa_madvise.h src/fastmap.h src/bwa.h src/bntseq.h
 src/fastmap.o: src/bwt.h src/macro.h src/bwamem.h src/kthread.h
 src/fastmap.o: src/bandedSWA.h src/simd_compat.h src/kernel_dispatch.h
 src/fastmap.o: src/kstring.h src/ksw.h src/kvec.h src/ksort.h src/utils.h
 src/fastmap.o: src/profiling.h src/FMI_search.h src/read_index_ele.h
-src/fastmap.o: src/kseq.h src/memcpy_bwamem.h src/safestringlib.h
-src/fastmap.o: ext/safestringlib/include/safe_mem_lib.h
-src/fastmap.o: ext/safestringlib/include/safe_lib.h
-src/fastmap.o: ext/safestringlib/include/safe_types.h
-src/fastmap.o: ext/safestringlib/include/safe_lib_errno.h
-src/fastmap.o: ext/safestringlib/include/safe_str_lib.h src/bam_writer.h
+src/fastmap.o: src/kseq.h
+src/fastmap.o: src/bam_writer.h
 src/fastmap.o: src/meth_bam.h src/meth_orig_ref.h src/bwa_shm.h
 src/fm_index_writer.o: src/fm_index_writer.h src/FMI_search.h
 src/fm_index_writer.o: src/simd_compat.h src/read_index_ele.h src/utils.h
@@ -849,12 +817,6 @@ src/fm_index_writer.o: src/bntseq.h src/macro.h src/bwa.h src/bwt.h
 src/fm_index_writer.o: src/io_utils.h
 src/index_prelude.o: src/index_prelude.h src/io_utils.h src/utils.h
 src/index_prelude.o: src/packed_text.h
-src/kopen.o: src/memcpy_bwamem.h src/safestringlib.h
-src/kopen.o: ext/safestringlib/include/safe_mem_lib.h
-src/kopen.o: ext/safestringlib/include/safe_lib.h
-src/kopen.o: ext/safestringlib/include/safe_types.h
-src/kopen.o: ext/safestringlib/include/safe_lib_errno.h
-src/kopen.o: ext/safestringlib/include/safe_str_lib.h
 src/kstring.o: src/kstring.h
 src/ksw.o: src/kernel_dispatch.h src/simd_compat.h src/ksw.h src/macro.h
 src/kswv.o: src/kernel_dispatch.h src/kswv.h src/macro.h src/ksw.h
@@ -873,19 +835,9 @@ src/main.o: src/main.h src/kstring.h src/utils.h src/macro.h src/bandedSWA.h
 src/main.o: src/simd_compat.h src/kernel_dispatch.h src/profiling.h
 src/main.o: src/fastmap.h src/bwa.h src/bntseq.h src/bwt.h src/bwamem.h
 src/main.o: src/kthread.h src/ksw.h src/kvec.h src/ksort.h src/FMI_search.h
-src/main.o: src/read_index_ele.h src/kseq.h src/memcpy_bwamem.h
-src/main.o: src/safestringlib.h ext/safestringlib/include/safe_mem_lib.h
-src/main.o: ext/safestringlib/include/safe_lib.h
-src/main.o: ext/safestringlib/include/safe_types.h
-src/main.o: ext/safestringlib/include/safe_lib_errno.h
-src/main.o: ext/safestringlib/include/safe_str_lib.h src/simd_dispatch.h
+src/main.o: src/read_index_ele.h src/kseq.h
+src/main.o: src/simd_dispatch.h
 src/main.o: src/version.h src/bwa_shm.h ext/mimalloc/include/mimalloc.h
-src/memcpy_bwamem.o: src/memcpy_bwamem.h src/safestringlib.h
-src/memcpy_bwamem.o: ext/safestringlib/include/safe_mem_lib.h
-src/memcpy_bwamem.o: ext/safestringlib/include/safe_lib.h
-src/memcpy_bwamem.o: ext/safestringlib/include/safe_types.h
-src/memcpy_bwamem.o: ext/safestringlib/include/safe_lib_errno.h
-src/memcpy_bwamem.o: ext/safestringlib/include/safe_str_lib.h
 src/meth_bam.o: ext/htslib/htslib/sam.h ext/htslib/htslib/hts.h
 src/meth_bam.o: ext/htslib/htslib/hts_defs.h ext/htslib/htslib/hts_log.h
 src/meth_bam.o: ext/htslib/htslib/kstring.h ext/htslib/htslib/kroundup.h
@@ -910,21 +862,11 @@ src/meth_xm.o: src/profiling.h src/FMI_search.h src/read_index_ele.h
 src/packed_text.o: src/packed_text.h src/utils.h
 src/profiling.o: src/macro.h src/bwa.h src/bntseq.h src/bwt.h src/profiling.h
 src/read_index_ele.o: src/read_index_ele.h src/utils.h src/bntseq.h
-src/read_index_ele.o: src/macro.h src/safestringlib.h
-src/read_index_ele.o: ext/safestringlib/include/safe_mem_lib.h
-src/read_index_ele.o: ext/safestringlib/include/safe_lib.h
-src/read_index_ele.o: ext/safestringlib/include/safe_types.h
-src/read_index_ele.o: ext/safestringlib/include/safe_lib_errno.h
-src/read_index_ele.o: ext/safestringlib/include/safe_str_lib.h
+src/read_index_ele.o: src/macro.h
 src/read_index_ele.o: src/bwa_madvise.h src/bwa_shm.h
 src/sam_encode.o: src/sam_encode.h src/kernel_dispatch.h
 src/simd_dispatch.o: src/simd_dispatch.h src/bandedSWA.h src/macro.h
 src/simd_dispatch.o: src/simd_compat.h src/kernel_dispatch.h src/kswv.h
 src/simd_dispatch.o: src/ksw.h src/sam_encode.h
 src/system.o: src/system.h
-src/utils.o: src/utils.h src/ksort.h src/kseq.h src/memcpy_bwamem.h
-src/utils.o: src/safestringlib.h ext/safestringlib/include/safe_mem_lib.h
-src/utils.o: ext/safestringlib/include/safe_lib.h
-src/utils.o: ext/safestringlib/include/safe_types.h
-src/utils.o: ext/safestringlib/include/safe_lib_errno.h
-src/utils.o: ext/safestringlib/include/safe_str_lib.h
+src/utils.o: src/utils.h src/ksort.h src/kseq.h
