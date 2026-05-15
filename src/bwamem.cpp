@@ -1047,15 +1047,35 @@ int mem_kernel1_core(FMI_search *fmi,
             kv_init(chain_ar[l]);
         return 1;
     }
+    // enc_qdb is sized in *bytes* (= tot_len). Track its capacity via the
+    // dedicated wsize_qdb so it stays correct independent of wsize_mem,
+    // which mem_collect_smem grows in *SMEM-entry* units. On short-read
+    // workloads (≤50 bp aDNA), the post-mem_collect_smem wsize_mem in SMEM
+    // units can exceed tot_len in bytes, which would make the legacy
+    // `if (tot_len >= wsize_mem)` gate skip the enc_qdb realloc on
+    // subsequent batches even when enc_qdb is undersized.
+    if (tot_len > mmc->wsize_qdb[tid]) {
+        int64_t tmp = mmc->wsize_qdb[tid];
+        mmc->enc_qdb[tid] = (uint8_t *) realloc(mmc->enc_qdb[tid],
+                                                tot_len * sizeof(uint8_t));
+        assert(mmc->enc_qdb[tid] != NULL);
+        mmc->wsize_qdb[tid] = tot_len;
+        if (bwa_verbose >= 4) {
+            fprintf(stderr, "[%0.4d] Re-allocating enc_qdb: "
+                    "%" PRId64 " -> %" PRId64 "\n",
+                    tid, tmp, mmc->wsize_qdb[tid]);
+        }
+    }
     // tot_len *= N_SMEM_KERNEL;
     // fprintf(stderr, "wsize: %d, tot_len: %d\n", mmc->wsize_mem[tid], tot_len);
-    // This covers enc_qdb/SMEM reallocs
+    // This covers matchArray and the per-read int arrays. enc_qdb is grown
+    // separately above (wsize_qdb).
     if (tot_len >= mmc->wsize_mem[tid])
     {
         int64_t tmp = mmc->wsize_mem[tid];
         mmc->wsize_mem[tid] = tot_len;
         if (bwa_verbose >= 4) {
-            fprintf(stderr, "[%0.4d] Re-allocating SMEM scratch (enc_qdb): "
+            fprintf(stderr, "[%0.4d] Re-allocating SMEM scratch: "
                     "%" PRId64 " -> %" PRId64 "\n",
                     tid, tmp, mmc->wsize_mem[tid]);
         }
@@ -1068,8 +1088,6 @@ int mem_kernel1_core(FMI_search *fmi,
                                                      mmc->wsize_mem[tid] *  sizeof(int32_t));
         mmc->query_pos_ar[tid] = (int16_t *) realloc(mmc->query_pos_ar[tid],
                                                      mmc->wsize_mem[tid] *  sizeof(int16_t));
-        mmc->enc_qdb[tid]      = (uint8_t *) realloc(mmc->enc_qdb[tid],
-                                                      mmc->wsize_mem[tid] * sizeof(uint8_t));
         mmc->rid[tid]          = (int32_t *) realloc(mmc->rid[tid],
                                                       mmc->wsize_mem[tid] * sizeof(int32_t));
         // w.mmc.lim[l]        = (int32_t *) _mm_malloc((BATCH_SIZE + 32) * sizeof(int32_t), 64);
