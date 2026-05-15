@@ -1053,10 +1053,16 @@ int mem_kernel1_core(FMI_search *fmi,
     // `if (tot_len >= wsize_mem)` gate skip the enc_qdb realloc on
     // subsequent batches even when enc_qdb is undersized.
     if (tot_len > mmc->wsize_qdb[tid]) {
+        int64_t tmp = mmc->wsize_qdb[tid];
         mmc->enc_qdb[tid] = (uint8_t *) realloc(mmc->enc_qdb[tid],
                                                 tot_len * sizeof(uint8_t));
         assert(mmc->enc_qdb[tid] != NULL);
         mmc->wsize_qdb[tid] = tot_len;
+        if (bwa_verbose >= 4) {
+            fprintf(stderr, "[%0.4d] Re-allocating enc_qdb: "
+                    "%" PRId64 " -> %" PRId64 "\n",
+                    tid, tmp, mmc->wsize_qdb[tid]);
+        }
     }
     // tot_len *= N_SMEM_KERNEL;
     // fprintf(stderr, "wsize: %d, tot_len: %d\n", mmc->wsize_mem[tid], tot_len);
