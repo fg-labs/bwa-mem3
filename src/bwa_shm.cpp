@@ -31,7 +31,6 @@
 #include "macro.h"         /* SA_COMPX */
 #include "bntseq.h"        /* bntseq_t, bns_restore, bns_destroy */
 #include "utils.h"         /* err_fread_noeof, err_fclose, xopen */
-#include "safestringlib.h" /* strcpy_s, strcat_s */
 
 #include <stdio.h>
 #include <cstdlib>
@@ -87,13 +86,15 @@ static const char *prefix_basename(const char *hint)
     return p + 1;
 }
 
-/* Build "<a><b>" into `out` (PATH_MAX-bounded) using safestringlib helpers,
- * matching the path-building convention used elsewhere in the codebase
- * (see bntseq.cpp, FMI_search.cpp, fastmap.cpp). */
+/* Build "<a><b>" into `out` (PATH_MAX-bounded), matching the path-building
+ * convention used elsewhere in the codebase (see bntseq.cpp, FMI_search.cpp,
+ * fastmap.cpp). Aborts via err_fatal if the result would overflow PATH_MAX —
+ * every caller passes a PATH_MAX buffer and treats truncation as a hard error. */
 static void path_concat2(char out[PATH_MAX], const char *a, const char *b)
 {
-    strcpy_s(out, PATH_MAX, a);
-    strcat_s(out, PATH_MAX, b);
+    int n = std::snprintf(out, PATH_MAX, "%s%s", a, b);
+    if (n < 0 || n >= PATH_MAX)
+        err_fatal(__func__, "path too long: '%s%s'", a, b);
 }
 
 /* Acquire the cross-process lock that serializes read-modify-write
@@ -891,7 +892,7 @@ static int resolve_meth_prefix(const char *prefix, char out[PATH_MAX])
             std::fprintf(stderr, "[E::%s] prefix too long\n", __func__);
             return -1;
         }
-        strcpy_s(out, PATH_MAX, prefix);
+        strcpy(out, prefix);
     } else {
         if (plen + SUFLEN + 1 > (size_t)PATH_MAX) {
             std::fprintf(stderr, "[E::%s] prefix too long for --meth\n", __func__);

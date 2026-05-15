@@ -51,6 +51,16 @@ KHASH_MAP_INIT_STR(str, int)
 
 extern uint64_t tprof[LIM_R][LIM_C];
 
+/* Build "<prefix><suffix>" into `out` (sized `outsz`), aborting via err_fatal
+ * if the result would exceed `outsz`. Used by the bns_* file-path helpers
+ * below; replaces the prior strcpy_s/strcat_s calls. */
+static void bns_build_path(char *out, size_t outsz, const char *prefix, const char *suffix)
+{
+	int n = snprintf(out, outsz, "%s%s", prefix, suffix);
+	if (n < 0 || (size_t)n >= outsz)
+		err_fatal(__func__, "path too long for prefix '%s' (suffix '%s')", prefix, suffix);
+}
+
 unsigned char nst_nt4_table[256] = {
 	4, 4, 4, 4,  4, 4, 4, 4,  4, 4, 4, 4,  4, 4, 4, 4, 
 	4, 4, 4, 4,  4, 4, 4, 4,  4, 4, 4, 4,  4, 4, 4, 4, 
@@ -75,9 +85,8 @@ void bns_dump(const bntseq_t *bns, const char *prefix)
 	char str[PATH_MAX];
 	FILE *fp;
 	int i;
-    //assert(strlen(prefix) + 4 < 1024);
 	{ // dump .ann
-		strcpy_s(str, PATH_MAX, prefix); strcat_s(str, PATH_MAX, ".ann");
+		bns_build_path(str, sizeof(str), prefix, ".ann");
 		fp = xopen(str, "w");
 		err_fprintf(fp, "%lld %d %u\n", (long long)bns->l_pac, bns->n_seqs, bns->seed);
 		for (i = 0; i != bns->n_seqs; ++i) {
@@ -91,7 +100,7 @@ void bns_dump(const bntseq_t *bns, const char *prefix)
 		err_fclose(fp);
 	}
 	{ // dump .amb
-		strcpy_s(str, PATH_MAX, prefix); strcat_s(str, PATH_MAX, ".amb");
+		bns_build_path(str, sizeof(str), prefix, ".amb");
 		fp = xopen(str, "w");
 		err_fprintf(fp, "%lld %d %u\n", (long long)bns->l_pac, bns->n_seqs, bns->n_holes);
 		for (i = 0; i != bns->n_holes; ++i) {
@@ -190,13 +199,12 @@ bntseq_t *bns_restore(const char *prefix)
 	char ann_filename[PATH_MAX], amb_filename[PATH_MAX], pac_filename[PATH_MAX], alt_filename[PATH_MAX];
 	FILE *fp;
 	bntseq_t *bns;
-	//assert(strlen(prefix) + 4 < 1024);
-	strcpy_s(ann_filename, PATH_MAX, prefix); strcat_s(ann_filename, PATH_MAX, ".ann");
-	strcpy_s(amb_filename, PATH_MAX, prefix); strcat_s(amb_filename, PATH_MAX, ".amb");
-	strcpy_s(pac_filename, PATH_MAX, prefix); strcat_s(pac_filename, PATH_MAX, ".pac");
+	bns_build_path(ann_filename, sizeof(ann_filename), prefix, ".ann");
+	bns_build_path(amb_filename, sizeof(amb_filename), prefix, ".amb");
+	bns_build_path(pac_filename, sizeof(pac_filename), prefix, ".pac");
 	bns = bns_restore_core(ann_filename, amb_filename, pac_filename);
 	if (bns == 0) return 0;
-    strcpy_s(alt_filename, PATH_MAX, prefix); strcat_s(alt_filename, PATH_MAX, ".alt");
+	bns_build_path(alt_filename, sizeof(alt_filename), prefix, ".alt");
 	if ((fp = fopen(alt_filename, "r")) != 0) { // read .alt file if present
 		char str[1024];
 		khash_t(str) *h;
@@ -332,8 +340,7 @@ int64_t bns_fasta2bntseq(gzFile fp_fa, const char *prefix, int for_only)
 	pac = (uint8_t*) calloc(m_pac/4, 1);
 	if (pac == NULL) { perror("Allocation of pac failed"); exit(EXIT_FAILURE); }
 	q = bns->ambs;
-	//assert(strlen(prefix) + 4 < 1024);
-	strcpy_s(name, PATH_MAX, prefix); strcat_s(name, PATH_MAX, ".pac");
+	bns_build_path(name, sizeof(name), prefix, ".pac");
 	fp = xopen(name, "wb");
 	// read sequences
 	while (kseq_read(seq) >= 0) pac = add1(seq, bns, pac, &m_pac, &m_seqs, &m_holes, &q);

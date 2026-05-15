@@ -41,8 +41,6 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "u8vec_scratch.h"
 #include <string>
 
-#include "safestringlib.h"
-
 int bwa_verbose = 3;
 char bwa_rg_id[256];
 char *bwa_pg;
@@ -741,7 +739,7 @@ char *bwa_insert_header(const char *s, char *hdr)
         int len_s = strlen(s);
         hdr = (char*) realloc(hdr, len + len_s + 2);
         hdr[len++] = '\n';
-        strcpy_s(hdr + len, len_s + 1, s);
+        strcpy(hdr + len, s);
     } else hdr = strdup(s);
     bwa_escape(hdr + len);
     return hdr;
