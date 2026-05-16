@@ -48,9 +48,6 @@
 #  include "malloc_wrap.h"
 #endif
 
-#include "memcpy_bwamem.h"
-#include "safestringlib.h"
-
 #ifdef _WIN32
 #define _KO_NO_NET
 #endif
@@ -121,7 +118,7 @@ static int http_open(const char *fn)
 	l = p - fn - 7;
 	http_host = (char*) calloc(l + 1, 1);
     assert(http_host != NULL);
-	strncpy_s(http_host, l + 1, fn + 7, l);
+	strncpy(http_host, fn + 7, l);
 	http_host[l] = 0;
 	for (q = http_host; *q && *q != ':'; ++q);
 	if (*q == ':') *q++ = 0;
@@ -228,7 +225,7 @@ static int ftp_open(const char *fn)
 	port = strdup("21");
 	host = (char*) calloc(l + 1, 1);
     assert(host != NULL);
-	strncpy_s(host, l + 1, fn + 6, l);
+	strncpy(host, fn + 6, l);
 	retr = (char*) calloc(strlen(p) + 8, 1);
     assert(retr != NULL);
 	sprintf(retr, "RETR %s\r\n", p);
@@ -248,7 +245,7 @@ static int ftp_open(const char *fn)
 	if (*p != '(') goto ftp_open_end;
 	++p;
 	sscanf(p, "%d,%d,%d,%d,%d,%d", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]);
-	memcpy_bwamem(pasv_ip, 4 * sizeof(int), v, 4 * sizeof(int), __FILE__, __LINE__);
+	memcpy(pasv_ip, v, 4 * sizeof(int));
 	pasv_port = (v[4]<<8&0xff00) + v[5];
 	kftp_send_cmd(&aux, retr, 0);
 	sprintf(host2, "%d.%d.%d.%d", pasv_ip[0], pasv_ip[1], pasv_ip[2], pasv_ip[3]);
@@ -285,7 +282,7 @@ static char **cmd2argv(const char *cmd)
 			++argc;
 	argv = (char**)calloc(argc + 2, sizeof(void*));
 	argv[0] = str = (char*)calloc(end - beg + 1, 1);
-	strncpy_s(argv[0], end - beg + 1, cmd + beg, end - beg);
+	strncpy(argv[0], cmd + beg, end - beg);
 	for (i = argc = 1; i < end - beg; ++i)
 		if (isspace(str[i])) str[i] = 0;
 		else if (str[i] && str[i-1] == 0) argv[argc++] = &str[i];

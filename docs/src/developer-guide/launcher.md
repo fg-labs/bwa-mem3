@@ -137,10 +137,17 @@ prints `SIMD floor:` (the build's required minimum) and
 `SIMD runtime:` (the resolved tier) on stdout; on a too-old host it
 also emits a `[W::bwa-mem3]` warning on stderr.
 
-The `simd_dispatch.cpp` translation unit itself is compiled at
-`-march=x86-64` via an explicit Makefile rule, so the precheck path
-stays SIGILL-safe even when `BASELINE_ARCH=avx2` (or higher) for the
-rest of the binary.
+The `simd_dispatch.cpp` translation unit is compiled at `BASELINE_ARCH`
+like every other non-kernel TU; an earlier draft forced it to
+`-march=x86-64` to keep the precheck SIGILL-safe, but that broke
+`g_build_tier` (a `static constexpr` derived from `__AVX2__` /
+`__SSE4_1__` / etc., which are only defined when the matching `-m`
+flag is in scope) — every binary reported its floor as `scalar` and
+the precheck became a no-op. In practice the precheck path is
+scalar-only (`std::call_once`, integer comparisons, `getenv`,
+`snprintf`, `fputs`, `exit`) with no array loops the compiler could
+autovectorize, so it stays SIGILL-safe even when `BASELINE_ARCH=avx2`
+(or higher) for the rest of the binary.
 
 ## Per-tier parity validation
 
@@ -162,7 +169,7 @@ row.
 | Per-call overhead | Direct call (tier fixed at launch via separate binary) | Indirect call through factory vtable or `extern "C"` wrapper (~0.3 ns / call) |
 | Non-kernel auto-vectorization | At each binary's compile tier | At `BASELINE_ARCH` (default `avx2`); raise via `BASELINE_ARCH=` |
 | Tier override | Run the `.<tier>` binary directly | `BWAMEM3_FORCE_TIER=<tier>` (downgrade-only) |
-| `runsimd.cpp` (220-line launcher + safestringlib) | Required | Removed |
+| `runsimd.cpp` (220-line launcher) | Required | Removed |
 
 The ~0.3 ns indirect-call cost is amortized across alignment work and
 has not been measurable in any bench cell. The non-kernel

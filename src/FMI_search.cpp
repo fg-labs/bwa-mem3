@@ -32,20 +32,31 @@ Authors: Sanchit Misra <sanchit.misra@intel.com>; Vasimuddin Md <vasimuddin.md@i
 #include <stdlib.h>
 #include <inttypes.h>
 #include <climits>
+#include <cstring>
 #include <sys/mman.h>     /* munmap */
 #include "bwa_madvise.h"
 #include "bwa_shm.h"
 #include "FMI_search.h"
-#include "memcpy_bwamem.h"
 #include "profiling.h"
 #include "libsais_build.h"
 
-#include "safestringlib.h"
+/* Build "<prefix><suffix>" into `out` (sized `outsz`); aborts on overflow.
+ * Replaces the prior strcpy_s/strcat_s pattern for assembling FMI sidecar
+ * paths from a user-supplied prefix. */
+static void fmi_build_path(char *out, size_t outsz, const char *prefix, const char *suffix)
+{
+    int n = snprintf(out, outsz, "%s%s", prefix, suffix);
+    if (n < 0 || (size_t)n >= outsz) {
+        fprintf(stderr, "ERROR: FMI path too long for prefix '%s' (suffix '%s')\n",
+                prefix, suffix);
+        exit(EXIT_FAILURE);
+    }
+}
 
 FMI_search::FMI_search(const char *fname)
 {
     fprintf(stderr, "* Entering FMI_search\n");
-    strcpy_s(file_name, PATH_MAX, fname);
+    fmi_build_path(file_name, sizeof(file_name), fname, "");
     reference_seq_len = 0;
     sentinel_index = 0;
     sa_ls_word = NULL;
@@ -170,8 +181,7 @@ int FMI_search::build_index() {
 
     // Read single-strand length from .ann to compute doubled pac_len.
     char ann_path[PATH_MAX];
-    strcpy_s(ann_path, PATH_MAX, prefix);
-    strcat_s(ann_path, PATH_MAX, ".ann");
+    fmi_build_path(ann_path, sizeof(ann_path), prefix, ".ann");
     FILE* fann = fopen(ann_path, "r");
     if (fann == NULL) {
         fprintf(stderr, "ERROR: cannot open '%s'\n", ann_path);
@@ -242,8 +252,7 @@ void FMI_search::load_index()
     char *ref_file_name = file_name;
     //beCalls = 0;
     char cp_file_name[PATH_MAX];
-    strcpy_s(cp_file_name, PATH_MAX, ref_file_name);
-    strcat_s(cp_file_name, PATH_MAX, CP_FILENAME_SUFFIX);
+    fmi_build_path(cp_file_name, sizeof(cp_file_name), ref_file_name, CP_FILENAME_SUFFIX);
 
     // Read the BWT and FM index of the reference sequence
     FILE *cpstream = NULL;

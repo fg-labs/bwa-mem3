@@ -28,12 +28,11 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 *****************************************************************************************/
 
 #include "read_index_ele.h"
-#include "safestringlib.h"
 
 #include "bwa_madvise.h"
 #include "bwa_shm.h"
 
-#include <cstring>     /* memcpy */
+#include <cstring>     /* memcpy, strcpy */
 
 indexEle::indexEle()
 {
@@ -61,7 +60,7 @@ void indexEle::bwa_idx_load_ele(const char *hint, int which)
     int l_hint = strlen(hint);
     prefix = (char *) malloc(l_hint + 3 + 4 + 1);
     assert(prefix != NULL);
-    strcpy_s(prefix, l_hint + 3 + 4 + 1, hint);
+    strcpy(prefix, hint);
 
     fprintf(stderr, "* Index prefix: %s\n", prefix);
     
@@ -244,15 +243,15 @@ char* indexEle::bwa_idx_infer_prefix(const char *hint)
     l_hint = strlen(hint);
     prefix = (char *) malloc(l_hint + 3 + 4 + 1);
     assert(prefix != NULL);
-    strcpy_s(prefix, l_hint + 3 + 4 + 1, hint);
-    strcpy_s(prefix + l_hint, 8, ".64.bwt");
+    strcpy(prefix, hint);
+    strcpy(prefix + l_hint, ".64.bwt");
     if ((fp = fopen(prefix, "rb")) != 0)
     {
         fclose(fp);
         prefix[l_hint + 3] = 0;
         return prefix;
     } else {
-        strcpy_s(prefix + l_hint, 8, ".bwt");
+        strcpy(prefix + l_hint, ".bwt");
         if ((fp = fopen(prefix, "rb")) == 0)
         {
             free(prefix);

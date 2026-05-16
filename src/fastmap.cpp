@@ -935,8 +935,11 @@ static uint8_t *load_ref_string(const char *prefix, uint8_t *shm_base,
 
     /* Disk path. */
     char binary_seq_file[PATH_MAX];
-    strcpy_s(binary_seq_file, PATH_MAX, prefix);
-    strcat_s(binary_seq_file, PATH_MAX, ".0123");
+    int n = snprintf(binary_seq_file, sizeof(binary_seq_file), "%s.0123", prefix);
+    if (n < 0 || (size_t)n >= sizeof(binary_seq_file)) {
+        fprintf(stderr, "Error: reference prefix too long for path: %s\n", prefix);
+        return NULL;
+    }
 
     fprintf(stderr, "* Binary seq file = %s\n", binary_seq_file);
     FILE *fr = fopen(binary_seq_file, "r");

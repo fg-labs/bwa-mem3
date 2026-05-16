@@ -29,8 +29,8 @@ running any indexing step.
 
 ## Forgetting to initialize submodules
 
-bwa-mem3 depends on several submodules (`ext/htslib`, `ext/safestringlib`,
-`ext/libsais`, `ext/mimalloc`, `ext/sse2neon`). A shallow clone or a clone
+bwa-mem3 depends on several submodules (`ext/htslib`, `ext/libsais`,
+`ext/mimalloc`, `ext/sse2neon`). A shallow clone or a clone
 without `--recursive` will produce a build that fails at the linking step with
 missing symbols, or at runtime with missing index files.
 
