@@ -162,7 +162,12 @@ CPPFLAGS+=	-DENABLE_PREFETCH -DV17=1 -DMATE_SORT=0 -DLIBSAIS_OPENMP
 # base version; checkouts past or dirty at the tag get an informational
 # dev suffix appended.
 VERSION_STRING := $(shell scripts/version.sh)
-INCLUDES+=   -Isrc -Iext/htslib -Iext/libsais/include
+# One path per line so adding or removing a single -I against this list
+# is a one-line diff that never overlaps with edits to adjacent lines
+# (e.g. the VERSION_STRING block above).
+INCLUDES += -Isrc
+INCLUDES += -Iext/htslib
+INCLUDES += -Iext/libsais/include
 ifeq ($(USE_MIMALLOC),1)
     INCLUDES += -Iext/mimalloc/include
 endif
@@ -187,7 +192,17 @@ else
     LIBSAIS_OPENMP_LIBS   = -fopenmp
 endif
 
-LIBS=		-lpthread -lm -lz -L. -lbwa -Lext/htslib -lhts $(LIBSAIS_OPENMP_LIBS) $(STATIC_GCC) $(LIBS_EXTRA)
+# Same one-per-line shape as INCLUDES above. -L/-l pairs that name a
+# specific library stay grouped (search path + lib are a unit), so
+# adding or removing a dep is still a one-line diff.
+LIBS  = -lpthread
+LIBS += -lm
+LIBS += -lz
+LIBS += -L. -lbwa
+LIBS += -Lext/htslib -lhts
+LIBS += $(LIBSAIS_OPENMP_LIBS)
+LIBS += $(STATIC_GCC)
+LIBS += $(LIBS_EXTRA)
 # Non-kernel objects: always compiled once at the baseline ISA and linked into
 # libbwa.a on every build (arm64 and x86 alike).
 OBJS=		src/fastmap.o src/bwtindex.o src/utils.o src/kthread.o \
