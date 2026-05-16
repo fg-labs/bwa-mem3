@@ -203,6 +203,16 @@ LIBS += -Lext/htslib -lhts
 LIBS += $(LIBSAIS_OPENMP_LIBS)
 LIBS += $(STATIC_GCC)
 LIBS += $(LIBS_EXTRA)
+# Pull in htslib's transitive deps (-ldeflate when libdeflate is detected,
+# bzlib, lzma, curl when those features are enabled, etc.) from the
+# generated htslib_static.mk -- same mechanism samtools uses. Without this,
+# any htslib feature whose configure auto-detects (notably libdeflate on
+# Debian/Ubuntu, where libdeflate-dev is the default install) results in
+# unresolved-symbol link errors at the bwa-mem3 link step. The `-include`
+# is tolerant of the file being absent on first Make pass; the $(HTS_LIB)
+# rule below produces it as a side effect of building libhts.a.
+-include ext/htslib/htslib_static.mk
+LIBS += $(HTSLIB_static_LIBS)
 # Non-kernel objects: always compiled once at the baseline ISA and linked into
 # libbwa.a on every build (arm64 and x86 alike).
 OBJS=		src/fastmap.o src/bwtindex.o src/utils.o src/kthread.o \
@@ -552,7 +562,7 @@ $(HTS_LIB):
 	    ([ -f config.mk ] || (autoreconf -i && \
 	        ./configure --disable-lzma --disable-libcurl --disable-gcs \
 	                    --disable-s3 --disable-plugins --disable-bz2)) && \
-	    $(MAKE) libhts.a
+	    $(MAKE) libhts.a htslib_static.mk
 
 # libsais: compile the two C sources we use (libsais.c + libsais64.c) as
 # plain .o files. OpenMP enabled via LIBSAIS_OPENMP so libsais64_gsa_omp
