@@ -203,6 +203,28 @@ LIBS += -Lext/htslib -lhts
 LIBS += $(LIBSAIS_OPENMP_LIBS)
 LIBS += $(STATIC_GCC)
 LIBS += $(LIBS_EXTRA)
+# Pull in htslib's transitive deps (-ldeflate when libdeflate is detected,
+# bzlib / lzma / curl when those features are enabled) from the generated
+# htslib_static.mk -- the same mechanism samtools uses (samtools'
+# config.mk.in pulls in both static_LIBS and static_LDFLAGS).
+#
+# Without this, any htslib configure feature that auto-detects on the
+# host -- notably libdeflate on Debian/Ubuntu where libdeflate-dev is
+# the default install -- gives libhts.a unresolved symbols that fail
+# the bwa-mem3 link step.
+#
+# Mechanism (subtle): on a clean tree, htslib_static.mk doesn't exist
+# at parse time, so `-include` silently skips it. To populate
+# HTSLIB_static_LIBS / HTSLIB_static_LDFLAGS in time for the link
+# recipe we rely on GNU Make's "remade-makefiles" restart loop, which
+# only fires when the include file is itself a target with a non-empty
+# recipe in this Makefile. The rule is declared next to the `$(HTS_LIB)`
+# recipe further down (where HTS_LIB is in scope and the build-time
+# concerns sit together); the `@:` recipe there is required -- a
+# prereq-only rule does NOT trigger restart.
+-include ext/htslib/htslib_static.mk
+LIBS    += $(HTSLIB_static_LIBS)
+LDFLAGS += $(HTSLIB_static_LDFLAGS)
 # Non-kernel objects: always compiled once at the baseline ISA and linked into
 # libbwa.a on every build (arm64 and x86 alike).
 OBJS=		src/fastmap.o src/bwtindex.o src/utils.o src/kthread.o \
@@ -485,7 +507,9 @@ test-binaries: $(BWA_LIB) $(HTS_LIB)
 	$(MAKE) -C test framework unit integration \
 	    CXX="$(CXX)" \
 	    COVERAGE=$(COVERAGE) \
-	    ARCH_FLAGS_FROM_PARENT='$(ARCH_FLAGS)'
+	    ARCH_FLAGS_FROM_PARENT='$(ARCH_FLAGS)' \
+	    HTSLIB_static_LIBS='$(HTSLIB_static_LIBS)' \
+	    HTSLIB_static_LDFLAGS='$(HTSLIB_static_LDFLAGS)'
 
 shm_section_find_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/shm_section_find_test.o
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/shm_section_find_test.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
@@ -552,7 +576,21 @@ $(HTS_LIB):
 	    ([ -f config.mk ] || (autoreconf -i && \
 	        ./configure --disable-lzma --disable-libcurl --disable-gcs \
 	                    --disable-s3 --disable-plugins --disable-bz2)) && \
-	    $(MAKE) libhts.a
+	    $(MAKE) libhts.a htslib_static.mk
+
+# Companion to the `-include ext/htslib/htslib_static.mk` near LIBS:
+# declare the include file as a target with a non-empty recipe so GNU
+# Make's "remade-makefiles" restart loop fires on the first parse,
+# builds $(HTS_LIB) (which generates htslib_static.mk as a side effect
+# of the `make libhts.a htslib_static.mk` invocation above), then
+# re-parses this Makefile so HTSLIB_static_LIBS / HTSLIB_static_LDFLAGS
+# resolve in time for the link recipe. `@:` is required -- without a
+# recipe, Make doesn't consider the include file "remade" and skips
+# the restart, leaving the include variables empty at link time.
+# Must be placed after the default goal (myall / all) so it doesn't
+# accidentally become the default goal of `make` with no arguments.
+ext/htslib/htslib_static.mk: $(HTS_LIB)
+	@:
 
 # libsais: compile the two C sources we use (libsais.c + libsais64.c) as
 # plain .o files. OpenMP enabled via LIBSAIS_OPENMP so libsais64_gsa_omp

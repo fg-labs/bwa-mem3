@@ -85,10 +85,16 @@ jobs:
         # libomp-dev is required so `clang++ -fopenmp` can find -lomp when
         # building the test framework on the AVX2 clang matrix row. On g++
         # rows it's unused — libgomp ships with g++.
+        #
+        # libdeflate-dev exercises the htslib_static.mk transitive-deps
+        # path: htslib's configure auto-detects libdeflate and libhts.a
+        # then references libdeflate_* symbols that resolve via -ldeflate
+        # from $(HTSLIB_static_LIBS). Without this on the runner, the
+        # libdeflate-enabled link path is invisible to CI.
         uses: awalsh128/cache-apt-pkgs-action@acb598e5ddbc6f68a970c5da0688d2f3a9f04d05 # v1.6.0
         with:
-          packages: zlib1g-dev bwa autoconf automake samtools libomp-dev
-          version: 1.0
+          packages: zlib1g-dev libdeflate-dev bwa autoconf automake samtools libomp-dev
+          version: 1.1
 
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
