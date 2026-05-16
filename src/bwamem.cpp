@@ -3127,7 +3127,20 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
             int prev = a->score;
             a->score = sp->score;
 
-            if (a->score == prev || sp->max_off < (w >> 1) + (w >> 2) ||
+            /* 2-bandwidth bit-equiv guard: at w < opt->w, only commit when
+             * the gscore-conditional below picks the local branch. The
+             * global branch uses sp->gscore / sp->gtle which are band-
+             * dependent (SW kernel computes them over the band only); a
+             * narrow-w commit there would diverge from main. Local-branch
+             * values (sp->score, sp->qle, sp->tle) are band-unconstrained
+             * when max_off < 0.75*w, so the narrow commit is identical to
+             * the wider one for those. Global-path pairs retry until w >=
+             * opt->w, at which point the gscore/gtle match main exactly. */
+            int gscore_local_branch = (sp->gscore <= 0 ||
+                                       sp->gscore <= a->score - opt->pen_clip5);
+            int safe_at_narrow = (w >= opt->w) || gscore_local_branch;
+
+            if (((a->score == prev || sp->max_off < (w >> 1) + (w >> 2)) && safe_at_narrow) ||
                 i+1 == MAX_BAND_TRY ||
                 (sp->tight_band > 0 && w >= sp->tight_band))
             {
@@ -3202,7 +3215,20 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
             a->score = sp->score;
 
 
-            if (a->score == prev || sp->max_off < (w >> 1) + (w >> 2) ||
+            /* 2-bandwidth bit-equiv guard: at w < opt->w, only commit when
+             * the gscore-conditional below picks the local branch. The
+             * global branch uses sp->gscore / sp->gtle which are band-
+             * dependent (SW kernel computes them over the band only); a
+             * narrow-w commit there would diverge from main. Local-branch
+             * values (sp->score, sp->qle, sp->tle) are band-unconstrained
+             * when max_off < 0.75*w, so the narrow commit is identical to
+             * the wider one for those. Global-path pairs retry until w >=
+             * opt->w, at which point the gscore/gtle match main exactly. */
+            int gscore_local_branch = (sp->gscore <= 0 ||
+                                       sp->gscore <= a->score - opt->pen_clip5);
+            int safe_at_narrow = (w >= opt->w) || gscore_local_branch;
+
+            if (((a->score == prev || sp->max_off < (w >> 1) + (w >> 2)) && safe_at_narrow) ||
                 i+1 == MAX_BAND_TRY ||
                 (sp->tight_band > 0 && w >= sp->tight_band))
             {
@@ -3273,7 +3299,20 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
             int prev = a->score;
             a->score = sp->score;
 
-            if (a->score == prev || sp->max_off < (w >> 1) + (w >> 2) ||
+            /* 2-bandwidth bit-equiv guard: at w < opt->w, only commit when
+             * the gscore-conditional below picks the local branch. The
+             * global branch uses sp->gscore / sp->gtle which are band-
+             * dependent (SW kernel computes them over the band only); a
+             * narrow-w commit there would diverge from main. Local-branch
+             * values (sp->score, sp->qle, sp->tle) are band-unconstrained
+             * when max_off < 0.75*w, so the narrow commit is identical to
+             * the wider one for those. Global-path pairs retry until w >=
+             * opt->w, at which point the gscore/gtle match main exactly. */
+            int gscore_local_branch = (sp->gscore <= 0 ||
+                                       sp->gscore <= a->score - opt->pen_clip5);
+            int safe_at_narrow = (w >= opt->w) || gscore_local_branch;
+
+            if (((a->score == prev || sp->max_off < (w >> 1) + (w >> 2)) && safe_at_narrow) ||
                 i+1 == MAX_BAND_TRY ||
                 (sp->tight_band > 0 && w >= sp->tight_band))
             {
@@ -3478,7 +3517,20 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
             a->score = sp->score;
 
             // no further banding
-            if (a->score == prev || sp->max_off < (w >> 1) + (w >> 2) ||
+            /* 2-bandwidth bit-equiv guard: at w < opt->w, only commit when
+             * the gscore-conditional below picks the local branch. The
+             * global branch uses sp->gscore / sp->gtle which are band-
+             * dependent (SW kernel computes them over the band only); a
+             * narrow-w commit there would diverge from main. Local-branch
+             * values (sp->score, sp->qle, sp->tle) are band-unconstrained
+             * when max_off < 0.75*w, so the narrow commit is identical to
+             * the wider one for those. Global-path pairs retry until w >=
+             * opt->w, at which point the gscore/gtle match main exactly. */
+            int gscore_local_branch = (sp->gscore <= 0 ||
+                                       sp->gscore <= a->score - opt->pen_clip5);
+            int safe_at_narrow = (w >= opt->w) || gscore_local_branch;
+
+            if (((a->score == prev || sp->max_off < (w >> 1) + (w >> 2)) && safe_at_narrow) ||
                 i+1 == MAX_BAND_TRY ||
                 (sp->tight_band > 0 && w >= sp->tight_band))
             {
@@ -3550,7 +3602,20 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
             a->score = sp->score;
 
             // no further banding
-            if (a->score == prev || sp->max_off < (w >> 1) + (w >> 2) ||
+            /* 2-bandwidth bit-equiv guard: at w < opt->w, only commit when
+             * the gscore-conditional below picks the local branch. The
+             * global branch uses sp->gscore / sp->gtle which are band-
+             * dependent (SW kernel computes them over the band only); a
+             * narrow-w commit there would diverge from main. Local-branch
+             * values (sp->score, sp->qle, sp->tle) are band-unconstrained
+             * when max_off < 0.75*w, so the narrow commit is identical to
+             * the wider one for those. Global-path pairs retry until w >=
+             * opt->w, at which point the gscore/gtle match main exactly. */
+            int gscore_local_branch = (sp->gscore <= 0 ||
+                                       sp->gscore <= a->score - opt->pen_clip5);
+            int safe_at_narrow = (w >= opt->w) || gscore_local_branch;
+
+            if (((a->score == prev || sp->max_off < (w >> 1) + (w >> 2)) && safe_at_narrow) ||
                 i+1 == MAX_BAND_TRY ||
                 (sp->tight_band > 0 && w >= sp->tight_band))
             {
@@ -3622,7 +3687,20 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
             int prev = a->score;
             a->score = sp->score;
             // no further banding
-            if (a->score == prev || sp->max_off < (w >> 1) + (w >> 2) ||
+            /* 2-bandwidth bit-equiv guard: at w < opt->w, only commit when
+             * the gscore-conditional below picks the local branch. The
+             * global branch uses sp->gscore / sp->gtle which are band-
+             * dependent (SW kernel computes them over the band only); a
+             * narrow-w commit there would diverge from main. Local-branch
+             * values (sp->score, sp->qle, sp->tle) are band-unconstrained
+             * when max_off < 0.75*w, so the narrow commit is identical to
+             * the wider one for those. Global-path pairs retry until w >=
+             * opt->w, at which point the gscore/gtle match main exactly. */
+            int gscore_local_branch = (sp->gscore <= 0 ||
+                                       sp->gscore <= a->score - opt->pen_clip5);
+            int safe_at_narrow = (w >= opt->w) || gscore_local_branch;
+
+            if (((a->score == prev || sp->max_off < (w >> 1) + (w >> 2)) && safe_at_narrow) ||
                 i+1 == MAX_BAND_TRY ||
                 (sp->tight_band > 0 && w >= sp->tight_band))
             {
