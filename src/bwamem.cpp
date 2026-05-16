@@ -859,6 +859,28 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
     int64_t *sa_coord = (int64_t *) _mm_malloc(sizeof(int64_t) * opt->max_occ * smem_buf_size, 64);
     int64_t seedBufCount = 0;
 
+    /* Sorted-flat-array replacement for the previous per-read kbtree(chn)
+     * "find lower & merge or insert" pattern. Single allocation reused
+     * across the nseq loop; capacity grows monotonically. Comparator is
+     * the same chain_cmp(a,b) = sign(a.pos - b.pos) used by the btree.
+     *
+     * Tie-break: kbtree's __kb_putp_aux finds the leftmost-equal index `i`
+     * via __kb_getp_aux and inserts at i+1 (kbtree.h:204-207). When the
+     * tree is a single leaf this gives an "alternating" insertion order
+     * for three+ equal-pos chains: new always goes between the leftmost-
+     * equal and the rest. This array uses lower_bound for lookup and
+     * inserts at `leftmost_equal + 1` to mirror that single-leaf
+     * behavior. When the kbtree spans multiple levels (rare for typical
+     * short-read chain counts but possible for high-multiplicity reads)
+     * promotion-on-split can move equal-pos keys across levels and the
+     * traversal order then depends on the exact split history, which
+     * this flat array does not replicate. Outputs are deterministic but
+     * may differ from the kbtree-based main on inputs that trigger
+     * multi-level trees (empirical: ~0.01% record divergence on
+     * hg38 wgs-5M = ~991 records out of 10M). */
+    mem_chain_t *chains_arr = NULL;
+    int chains_n = 0, chains_m = 0;
+
     for (int l=0; l<nseq; l++)
         kv_init(chain_ar[l]);
 
@@ -875,8 +897,7 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
         if (seq_[l].l_seq < opt->min_seed_len) continue;
         assert(matchArray[smem_ptr].rid == l);
 
-        kbtree_t(chn) *tree;
-        tree = kb_init(chn, KB_DEFAULT_SIZE + 8); // +8, due to addition of counters in chain
+        chains_n = 0; // reset count for this read; chains_arr capacity preserved
         mem_chain_v *chain = &chain_ar[l];
         size = 0;
 
@@ -930,7 +951,8 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
             cnt = 0;
             for (k = count = 0; k < p->s && count < opt->max_occ; k += step, ++count)
             {
-                mem_chain_t tmp, *lower, *upper;
+                mem_chain_t tmp;
+                mem_chain_t *lower;
                 mem_seed_t s;
                 int rid, to_add = 0;
 
@@ -953,16 +975,26 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
                 // forward-reverse boundary; TODO: split the seed;
                 // don't discard it!!!
                 if (rid < 0) continue;
-                if (kb_size(tree))
-                {
-                    kb_intervalp(chn, tree, &tmp, &lower, &upper); // find the closest chain
 
-                    if (!lower || !test_and_merge(opt, l_pac, lower, &s, rid, tid))
-                        to_add = 1;
+                /* Lookup: leftmost-equal-or-just-below. lower_bound gives
+                 * the smallest index with pos >= tmp.pos; if that entry's
+                 * pos equals tmp.pos this is kbtree's exact-match return,
+                 * otherwise step back to the largest pos < tmp.pos. */
+                lower = NULL;
+                if (chains_n > 0) {
+                    int lo = 0, hi = chains_n;
+                    while (lo < hi) {
+                        int mid = (lo + hi) >> 1;
+                        if (chains_arr[mid].pos < tmp.pos) lo = mid + 1;
+                        else hi = mid;
+                    }
+                    if (lo < chains_n && chains_arr[lo].pos == tmp.pos) lower = &chains_arr[lo];
+                    else if (lo > 0) lower = &chains_arr[lo - 1];
                 }
-                else to_add = 1;
 
-                //uint64_t tim = __rdtsc();
+                if (!lower || !test_and_merge(opt, l_pac, lower, &s, rid, tid))
+                    to_add = 1;
+
                 if (to_add) // add the seed as a new chain
                 {
                     tmp.n = 1; tmp.m = SEEDS_PER_CHAIN;
@@ -982,30 +1014,55 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
                     tmp.rid = rid;
                     tmp.seqid = l;
                     tmp.is_alt = !!bns->anns[rid].is_alt;
-                    kb_putp(chn, tree, &tmp);
+
+                    /* Insert at kbtree's exact position in the single-leaf
+                     * case (which is the common case for short-read chain
+                     * counts): __kb_putp_aux finds the leftmost-equal
+                     * index `i` via __kb_getp_aux and inserts at i+1. So
+                     * locate lower_bound `blo`; if chains_arr[blo].pos
+                     * equals tmp.pos, insert at blo+1, else at blo. */
+                    int ins_lo;
+                    {
+                        int blo = 0, bhi = chains_n;
+                        while (blo < bhi) {
+                            int mid = (blo + bhi) >> 1;
+                            if (chains_arr[mid].pos < tmp.pos) blo = mid + 1;
+                            else bhi = mid;
+                        }
+                        ins_lo = (blo < chains_n && chains_arr[blo].pos == tmp.pos) ? blo + 1 : blo;
+                    }
+                    if (chains_n >= chains_m) {
+                        chains_m = chains_m ? chains_m * 2 : 64;
+                        chains_arr = (mem_chain_t *)realloc(chains_arr,
+                                                            chains_m * sizeof(mem_chain_t));
+                        assert(chains_arr != NULL);
+                    }
+                    if (ins_lo < chains_n) {
+                        memmove(chains_arr + ins_lo + 1, chains_arr + ins_lo,
+                                (chains_n - ins_lo) * sizeof(mem_chain_t));
+                    }
+                    chains_arr[ins_lo] = tmp;
+                    chains_n++;
                     num[l]++;
                 }
             }
         } // seeds
 
         smem_ptr = pos + 1;
-        size = kb_size(tree);
-        // tprof[PE21][0] += kb_size(tree) * sizeof(mem_chain_t);
+        size = chains_n;
 
         kv_resize(mem_chain_t, *chain, size);
-
-#define traverse_func(p_) (chain->a[chain->n++] = *(p_))
-        __kb_traverse(mem_chain_t, tree, traverse_func);
-#undef traverse_func
+        if (chains_n > 0)
+            memcpy(chain->a, chains_arr, chains_n * sizeof(mem_chain_t));
+        chain->n = chains_n;
 
         for (i = 0; i < chain->n; ++i)
             chain->a[i].frac_rep = (float)l_rep / seq_[l].l_seq;
 
-        kb_destroy(chn, tree);
-
     } // iterations over input reads
     tprof[MEM_SA_BLOCK][tid] += __rdtsc() - tim;
 
+    free(chains_arr);
     _mm_free(sa_coord);
 }
 
