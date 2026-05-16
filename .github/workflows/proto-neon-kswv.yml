@@ -452,10 +452,23 @@ jobs:
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ${{ env.CCACHE_DIR }}
-          # Share with run-mem-${arch}: same restore-keys prefix.
-          key: ccache-${{ runner.arch }}-kswv-${{ github.sha }}
+          # Include MAKE_ARCH in the key/restore-keys so cache entries
+          # don't leak across x86 microarch boundaries. The
+          # `kswv_nrow_zero_test` target compiles src/kswv.cpp at
+          # -march=native to exercise the host's native-ISA kswv class
+          # (see parent Makefile's src/kswv.native.o rule). ccache hashes
+          # the literal command line, NOT host CPUID -- so an
+          # AVX-512-built kswv.native.o was previously served to runners
+          # that lacked AVX-512 (via the `ccache-${{ runner.arch }}-`
+          # prefix matching across microarchs) and the test would SIGILL
+          # on its first kswv operation. Partitioning by MAKE_ARCH
+          # (avx2 / avx512bw / arm64) keeps the cache microarch-aware.
+          # This drops the historical sharing with run-mem-${arch} jobs,
+          # which is fine -- run-mem-x86 builds with explicit -m flags
+          # tied to MAKE_ARCH anyway, not -march=native.
+          key: ccache-${{ runner.arch }}-${{ env.MAKE_ARCH }}-kswv-${{ github.sha }}
           restore-keys: |
-            ccache-${{ runner.arch }}-
+            ccache-${{ runner.arch }}-${{ env.MAKE_ARCH }}-
 
       - name: Build + run kswv unit test
         # Builds the doctest-based test/bwa_mem3_tests_unit binary via the
@@ -491,26 +504,5 @@ jobs:
         run: |
           make clean
           make ASAN=1 arch="$MAKE_ARCH" CXX="ccache g++" CC="ccache gcc" kswv_nrow_zero_test
-          # DIAGNOSTIC (temporary, to be removed once root cause is fixed):
-          # Verify the hypothesis that ccache + -march=native + heterogeneous
-          # GHA runners cause SIGILL when an AVX-512-built kswv.native.o is
-          # restored to a runner that lacks AVX-512. If `runner avx-512 flags`
-          # is empty AND `kswv.native.o avx-512 insn count` > 0, the cached
-          # .o has instructions the runner can't execute.
-          if [ "${{ matrix.arch }}" = "x86" ]; then
-            echo "::group::diagnostic: runner avx-512 features + cached kswv.native.o ISA"
-            echo "--- /proc/cpuinfo avx-512 flags ---"
-            grep -m1 -oE '\bavx512[a-z_]*\b' /proc/cpuinfo | sort -u || echo "(none)"
-            echo "--- src/kswv.native.o AVX-512 instruction count ---"
-            objdump -d src/kswv.native.o 2>/dev/null \
-              | grep -coE '%(zmm[0-9]+|k[0-7])\b|\bvmovdqu64\b|\bvp[a-z]+512[bwdq]?\b' \
-              || echo "0"
-            echo "--- src/kswv.native.o first 10 AVX-512 instructions (if any) ---"
-            objdump -d src/kswv.native.o 2>/dev/null \
-              | grep -E '%(zmm[0-9]+|k[0-7])\b|\bvmovdqu64\b|\bvp[a-z]+512[bwdq]?\b' \
-              | head -10 \
-              || echo "(none)"
-            echo "::endgroup::"
-          fi
           ./kswv_nrow_zero_test
           ccache --show-stats | tee -a "$GITHUB_STEP_SUMMARY"
