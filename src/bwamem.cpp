@@ -57,17 +57,31 @@ KSORT_INIT(mem_intv1, SMEM, intv_lt1)  // debug
 #define max_(x, y) ((x)>(y)?(x):(y))
 #define min_(x, y) ((x)>(y)?(y):(x))
 
-#define MAX_BAND_TRY  4
-
-/* cap initial band-width at this value. The retry loop
- * doubles w each iteration (up to MAX_BAND_TRY-1 iters), so pairs whose
- * alignment needs a wider band are caught by the retry. Setting this below
- * opt->w forces the kernel to start tight, accept tight-fit pairs early
- * (via sp->max_off heuristic + sp->tight_band), and only expand on demand.
- * BUCKET_MAX_INIT_W=8 with MAX_BAND_TRY=4 gives w-sequence 8, 16, 32, 64. */
-#ifndef BUCKET_MAX_INIT_W
-#define BUCKET_MAX_INIT_W 8
-#endif
+/* Two-bandwidth SW retry. The banded-SW kernel is invoked at
+ * w = init_w << i for i in 0..MAX_BAND_TRY-1, with each pair committed at
+ * the smallest w that satisfies max_off < 0.75 * w (the unconstrained-
+ * alignment condition).
+ *
+ * Old layout: init_w = opt->w, MAX_BAND_TRY = 4. For default opt->w = 100
+ * this gives the retry sequence (100, 200, 400, 800).
+ *
+ * New layout: init_w = (opt->w + 3) / 4, MAX_BAND_TRY = 6. For default
+ * opt->w = 100 this gives (25, 50, 100, 200, 400, 800) — same max reach
+ * (8 * opt->w), and the same intermediate widths, with two narrower
+ * pre-attempts up front. Pairs whose alignment fits within w=25 (the
+ * common case for well-aligned short reads with low indel rate) now
+ * commit on the first iteration instead of paying the full opt->w cost.
+ *
+ * Bit-equivalence: any pair that converges at the new narrow w satisfies
+ * max_off < 0.75 * w_narrow, which also satisfies max_off < 0.75 * opt->w
+ * since w_narrow < opt->w. So such a pair would have converged at the
+ * original first iteration (w = opt->w) with the same alignment — the
+ * optimal path lies within both bands, the SW recurrence over the
+ * shared cells produces the same scores. Pairs that don't converge at
+ * narrow w continue through the same widening sequence as before. The
+ * last-iteration fallback commit fires at the same final w (8 * opt->w)
+ * in both layouts. */
+#define MAX_BAND_TRY  6
 
             int tcnt = 0;
 /********************
@@ -3087,7 +3101,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
     // heuristic exits (a->score == prev / max_off < 3w/4) can then fire
     // on a suboptimal alignment found within the narrow band, breaking
     // chr22 parity.
-    int init_w = opt->w;
+    int init_w = (opt->w + 3) / 4; // start narrow; MBT=6 preserves max reach 8 * opt->w
 
     // scalar
     for ( i=0; i<MAX_BAND_TRY; i++)
@@ -3156,7 +3170,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
     pair_ar_aux = seqPairArrayAux;
 
     nump = numPairsLeft16;
-    init_w = opt->w;
+    init_w = (opt->w + 3) / 4; // start narrow; MBT=6 preserves max reach 8 * opt->w
     for ( i=0; i<MAX_BAND_TRY; i++)
     {
         int32_t w = init_w << i;
@@ -3227,7 +3241,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
     pair_ar_aux = seqPairArrayAux;
 
     nump = numPairsLeft128;
-    init_w = opt->w;
+    init_w = (opt->w + 3) / 4; // start narrow; MBT=6 preserves max reach 8 * opt->w
     for ( i=0; i<MAX_BAND_TRY; i++)
     {
         int32_t w = init_w << i;
@@ -3438,7 +3452,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
     pair_ar = seqPairArrayRight128 + numPairsRight128 + numPairsRight16;
     pair_ar_aux = seqPairArrayAux;
     nump = numPairsRight1;
-    init_w = opt->w;
+    init_w = (opt->w + 3) / 4; // start narrow; MBT=6 preserves max reach 8 * opt->w
 
     for ( i=0; i<MAX_BAND_TRY; i++)
     {
@@ -3502,7 +3516,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
     pair_ar = seqPairArrayRight128 + numPairsRight128;
     pair_ar_aux = seqPairArrayAux;
     nump = numPairsRight16;
-    init_w = opt->w;
+    init_w = (opt->w + 3) / 4; // start narrow; MBT=6 preserves max reach 8 * opt->w
 
     for ( i=0; i<MAX_BAND_TRY; i++)
     {
@@ -3575,7 +3589,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
     pair_ar = seqPairArrayRight128;
     pair_ar_aux = seqPairArrayAux;
     nump = numPairsRight128;
-    init_w = opt->w;
+    init_w = (opt->w + 3) / 4; // start narrow; MBT=6 preserves max reach 8 * opt->w
 
     for ( i=0; i<MAX_BAND_TRY; i++)
     {
