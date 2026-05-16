@@ -3140,7 +3140,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                     a->truesc = sp->gscore;
                 }
 
-                a->w = max_(a->w, w);
+                a->w = max_(a->w, max_(w, opt->w)); // 2-bandwidth: floor at opt->w so a->w matches the original behavior for downstream uses (mem_patch_reg threshold, global-alignment bandwidth cap)
                 if (a->rb != H0_ && a->qb != H0_ && a->qe != H0_ && a->re != H0_)
                 {
                     int i = 0;
@@ -3215,7 +3215,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                     a->truesc = sp->gscore;
                 }
 
-                a->w = max_(a->w, w);
+                a->w = max_(a->w, max_(w, opt->w)); // 2-bandwidth: floor at opt->w so a->w matches the original behavior for downstream uses (mem_patch_reg threshold, global-alignment bandwidth cap)
                 if (a->rb != H0_ && a->qb != H0_ && a->qe != H0_ && a->re != H0_)
                 {
                     int i = 0;
@@ -3286,7 +3286,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                     a->truesc = sp->gscore;
                 }
 
-                a->w = max_(a->w, w);
+                a->w = max_(a->w, max_(w, opt->w)); // 2-bandwidth: floor at opt->w so a->w matches the original behavior for downstream uses (mem_patch_reg threshold, global-alignment bandwidth cap)
                 if (a->rb != H0_ && a->qb != H0_ && a->qe != H0_ && a->re != H0_)
                 {
                     int i = 0;
@@ -3491,7 +3491,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                     a->qe = l_query, a->re += sp->gtle;
                     a->truesc += sp->gscore - sp->h0;
                 }
-                a->w = max_(a->w, w);
+                a->w = max_(a->w, max_(w, opt->w)); // 2-bandwidth: floor at opt->w so a->w matches the original behavior for downstream uses (mem_patch_reg threshold, global-alignment bandwidth cap)
                 if (a->rb != H0_ && a->qb != H0_ && a->qe != H0_ && a->re != H0_)
                 {
                     int i = 0;
@@ -3563,7 +3563,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                     a->qe = l_query, a->re += sp->gtle;
                     a->truesc += sp->gscore - sp->h0;
                 }
-                a->w = max_(a->w, w);
+                a->w = max_(a->w, max_(w, opt->w)); // 2-bandwidth: floor at opt->w so a->w matches the original behavior for downstream uses (mem_patch_reg threshold, global-alignment bandwidth cap)
                 if (a->rb != H0_ && a->qb != H0_ && a->qe != H0_ && a->re != H0_)
                 {
                     int i = 0;
@@ -3635,7 +3635,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                     a->qe = l_query, a->re += sp->gtle;
                     a->truesc += sp->gscore - sp->h0;
                 }
-                a->w = max_(a->w, w);
+                a->w = max_(a->w, max_(w, opt->w)); // 2-bandwidth: floor at opt->w so a->w matches the original behavior for downstream uses (mem_patch_reg threshold, global-alignment bandwidth cap)
                 if (a->rb != H0_ && a->qb != H0_ && a->qe != H0_ && a->re != H0_)
                 {
                     int i = 0;
