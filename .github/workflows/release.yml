@@ -246,7 +246,11 @@ jobs:
           tar -xzf Source_code_including_submodules.tar.gz -C /tmp
           cd "/tmp/bwa-mem3-${VERSION}"
           make -j"$(nproc)" CC=cc CXX=c++
-          got=$(./bwa-mem3 version 2>&1 | head -1)
+          # Read stdout only -- bwa-mem3 prints its version string to
+          # stdout, while mimalloc emits a startup banner ("mimalloc
+          # 3.3.x") to stderr. With `2>&1` the banner can flush first
+          # and `head -1` then captures the wrong line.
+          got=$(./bwa-mem3 version 2>/dev/null | head -1)
           case "$got" in
             "$VERSION"|"$VERSION"-*)
               echo "bwa-mem3 version OK: $got"
