@@ -118,15 +118,13 @@ if [ "$short_records" -lt 1000 ]; then
     exit 1
 fi
 
-# Fail fast on the first ASAN report so the trap's tail of $short_log
-# captures the actual overflow rather than downstream cascade noise.
-# detect_leaks=0 because LSan (bundled with ASan on Linux, off on
-# macOS) finds pre-existing leaks in FMI_search's lockstep SMEM path
-# that are orthogonal to the wsize_mem class of bug this fixture
-# guards. Conflating the two would block every PR on an unrelated
-# bug; the leaks should be addressed in their own change.
+# Fail fast on the first ASAN/LSan report so the trap's tail of
+# $short_log captures the actual overflow rather than downstream
+# cascade noise. LSan (bundled with ASan on Linux) is left on its
+# default so the fixture also catches per-thread leak regressions
+# (e.g. the FMI_search lockstep SMEM caches fixed in #116).
 short_sam="$CHR22_SIM_DIR/short_dense_var.sam"
-ASAN_OPTIONS=abort_on_error=1:halt_on_error=1:detect_leaks=0 \
+ASAN_OPTIONS=abort_on_error=1:halt_on_error=1 \
 "$BWA_MEM3" mem -t 4 "$CHR22_FA" "$short_fq" \
     > "$short_sam" 2>"$short_log"
 
