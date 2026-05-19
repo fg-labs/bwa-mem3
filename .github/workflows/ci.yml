@@ -428,6 +428,32 @@ jobs:
           BWAMETH_DIR: ${{ github.workspace }}/bwa-meth-oracle
         run: bash test/regression/meth_oracle.sh
 
+      - name: Short-read SE smoke (chr22, ASAN, dense+variable-length)
+        if: matrix.canonical == true
+        # Guards the wsize_mem byte-vs-entry capacity-tracker class of bug
+        # fixed in PR #100. The fixture simulates 25-50 bp variable-length
+        # reads from chr22:14M-20M (pericentromeric, repeat-rich) at 5-10%
+        # error so SMEM density per base exceeds tot_len bytes across
+        # successive batches with mismatched byte totals — exactly the
+        # regime that inverts the `if (tot_len >= wsize_mem)` gate.
+        # Builds with ASAN=1 (forces USE_MIMALLOC=0; mimalloc and asan
+        # can't coexist) so the heap-buffer-overflow in mem_collect_smem
+        # surfaces as a non-zero exit independent of allocator behavior.
+        # Placed last in the canonical row because `make clean && make
+        # ASAN=1` replaces $GITHUB_WORKSPACE/bwa-mem3; nothing after this
+        # step uses the binary. Canonical-only because PR #100 confirmed
+        # the bug is input-regime-specific, not codegen-/SIMD-specific
+        # (reproduces on AVX2, AVX-512BW, SMEM_LOCKSTEP_N=1).
+        run: |
+          make clean
+          make -j"$(nproc)" arch=${{ matrix.arch_flag }} \
+            CXX=${{ matrix.cxx || 'g++' }} ASAN=1
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          CHR22_FA=/tmp/chr22/chr22.fa \
+          CHR22_SIM_DIR=/tmp/chr22-sim-dense \
+          PIXI_MANIFEST="$GITHUB_WORKSPACE/test/holodeck/pixi.toml" \
+          bash test/regression/short_read_smoke.sh
+
   coverage:
     name: Coverage (Linux AVX2, gcov → Codecov)
     runs-on: ubuntu-latest
