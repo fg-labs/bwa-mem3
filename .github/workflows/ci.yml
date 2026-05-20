@@ -361,6 +361,14 @@ jobs:
           CHR22_SIM_DIR=/tmp/chr22-sim \
           bash test/regression/thread_determinism.sh
 
+      - name: --supp-rep-hard-cap repetitive-seed regression
+        if: matrix.canonical == true
+        run: |
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          SUPP_REP_FIXTURE_AWK="$GITHUB_WORKSPACE/test/fixtures/supp_rep/build_fixture.awk" \
+          SUPP_REP_PHIX_FA="$GITHUB_WORKSPACE/test/fixtures/phix.fa" \
+          bash test/regression/supp_rep_hard_cap.sh
+
       - name: SE alignment smoke (chr22)
         if: matrix.canonical == true
         run: |
