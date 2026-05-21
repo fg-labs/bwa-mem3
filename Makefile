@@ -762,10 +762,58 @@ profile-clean:
 # `make` invocation that doesn't even target lto-build.
 lto-build:
 	rm -f src/*.o $(BWA_LIB)
+	# GCC + Docker BuildKit jobserver workaround (fg-labs/bwa-mem3#121).
+	#
+	# Symptom: under BuildKit `make lto-build` dies with
+	#   make[2]: *** write jobserver: Bad file descriptor.  Stop.
+	#   lto-wrapper: fatal error: make returned 2 exit status
+	# linux/arm64 happens to dodge it; linux/amd64 reproduces every time.
+	#
+	# Root cause: GNU make 4.3's jobserver uses a pair of pipe FDs the parent
+	# make advertises in MAKEFLAGS. The chain that breaks under BuildKit is
+	# `make[1]` → `gcc -flto` → `lto-wrapper` → `make[2]`. GCC's hygienic
+	# subprocess infrastructure sets FD_CLOEXEC on inherited file descriptors
+	# it doesn't recognize as compiler-relevant, which closes the jobserver
+	# FDs before lto-wrapper's `make[2]` can see them. `make[2]` reads
+	# MAKEFLAGS, finds the FD numbers, tries to write to them, and dies on
+	# EBADF. This is a known GNU make 4.3 limitation;
+	# `--jobserver-style=fifo` (GNU make 4.4+) would survive the chain by
+	# using a named FIFO instead of FDs, but Debian Bookworm — and therefore
+	# the bwa-mem3-bench Dockerfile's base image — ships make 4.3.
+	#
+	# Tried and rejected:
+	#   - `-flto=auto`: still attempts jobserver negotiation on GCC 12.
+	#   - `-flto=N` alone: lto-wrapper still spawns a sub-make that inherits
+	#     MAKEFLAGS via the GCC env.
+	#   - Clearing MAKEFLAGS for the recursive make `+` `-j$N`: the recursive
+	#     make freshly opens its own jobserver FDs in its process, but those
+	#     FDs still get CLOEXEC'd by GCC during the LTO link step, so
+	#     lto-wrapper's make[2] still hits EBADF.
+	#
+	# Fix that works: drive the recursive make with `-j1` so it does NOT
+	# advertise a jobserver in MAKEFLAGS at all. With nothing advertised,
+	# lto-wrapper's make[2] doesn't try to inherit one — it uses the
+	# parallelism level requested by `-flto=$$LTO_JOBS` directly, via its
+	# own freshly-opened FDs scoped to the lto-wrapper process tree. The
+	# inner compile phase goes serial (~5 min cost on a bench-fleet build);
+	# the LTO link phase, which dominates LTO build time, stays parallel.
+	# Acceptable trade-off for a per-SHA one-shot build.
+	#
+	# When BuildKit is not in the picture (local dev, traditional CI) the
+	# -j1 inner compile is the same single-fork-per-recipe-line behavior
+	# `make all -j1` would have produced — no behavioral regression vs.
+	# running `make lto-build` without -j on the outer level. The fix only
+	# changes the parallelism breakdown, not the build product.
+	#
+	# Clang's `-flto=thin` branch is unaffected — ThinLTO uses its own
+	# parallelism, not the GNU make jobserver, and never participated in
+	# the FD inheritance dance.
 	@CXX_VERSION="$$($(CXX) --version 2>&1 | head -1)"; \
-	  case "$$CXX_VERSION" in *clang*) LTO_FLAG=-flto=thin ;; *) LTO_FLAG=-flto ;; esac; \
-	  echo "LTO_FLAG=$$LTO_FLAG (cxx: $$CXX_VERSION, arch: $(LTO_ARCH))"; \
-	  $(MAKE) arch=$(LTO_ARCH) EXE=bwa-mem3.lto EXTRA_CXXFLAGS="$(EXTRA_CXXFLAGS) $$LTO_FLAG -fno-semantic-interposition" CXX="$(CXX)" all
+	  LTO_JOBS=$$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 1); \
+	  case "$$CXX_VERSION" in *clang*) LTO_FLAG=-flto=thin ;; *) LTO_FLAG=-flto=$$LTO_JOBS ;; esac; \
+	  echo "LTO_FLAG=$$LTO_FLAG (cxx: $$CXX_VERSION, arch: $(LTO_ARCH), lto-jobs: $$LTO_JOBS)"; \
+	  MAKEFLAGS= MAKEOVERRIDES= \
+	    $(MAKE) -j1 arch=$(LTO_ARCH) EXE=bwa-mem3.lto EXTRA_CXXFLAGS="$(EXTRA_CXXFLAGS) $$LTO_FLAG -fno-semantic-interposition" CXX="$(CXX)" all
 	@echo "LTO binary: bwa-mem3.lto (arch=$(LTO_ARCH))"
 	# Drop variant-flagged objects from the shared cache so a subsequent
 	# `make all` doesn't relink stale -flto / -fno-semantic-interposition
