@@ -56,6 +56,7 @@
 # What's Different from bwa-mem2
 
 - [Overview](whats-different/overview.md)
+- [Equivalence with bwa-mem2](whats-different/equivalence.md)
 - [Correctness fixes](whats-different/correctness.md)
 - [Performance improvements](whats-different/performance.md)
 - [Features](whats-different/features.md)

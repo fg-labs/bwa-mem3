@@ -10,6 +10,8 @@ bwa-mem3 is a short-read aligner derived from [bwa-mem2](https://github.com/bwa-
 carrying correctness fixes, performance improvements, and new features (methylation alignment,
 shared-memory index, mimalloc allocator) maintained by [Fulcrum Genomics](https://fulcrumgenomics.com).
 
+bwa-mem3 is **not** byte-identical to bwa-mem2 — it adds SAM tags, fixes crashes, and changes tie resolution. The core alignment is preserved on the data we have tested, but the SAM byte stream is not. See [Equivalence with bwa-mem2](https://bwa-mem3.readthedocs.io/en/latest/whats-different/equivalence.html) for a field-by-field comparison and a full per-PR audit.
+
 **Full documentation:** <https://bwa-mem3.readthedocs.io>
 
 ## Install
