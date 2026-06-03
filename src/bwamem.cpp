@@ -33,6 +33,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "bam_writer.h"
 #include "meth_bam.h"
 #include "u8vec_scratch.h"
+#include "pdqsort_wrap.h"
 #include <inttypes.h>      /* PRId64 for int64_t fprintf format strings */
 
 #include "sam_encode.h"
@@ -49,8 +50,20 @@ extern uint64_t tprof[LIM_R][LIM_C];
 #define chain_cmp(a, b) (((b).pos < (a).pos) - ((a).pos < (b).pos))
 KBTREE_INIT(chn, mem_chain_t, chain_cmp)
 
-#define intv_lt(a, b) ((a).info < (b).info)
+/* mem_intv: primary sort by `info` (composite (m,n) key). Tie-break on
+ * x[0] then x[1] extends to a strict total order so the dedup loop in
+ * mem_collect_intv walking adjacent equal-info intervals sees a
+ * deterministic order regardless of sort algorithm. Without these tie-
+ * breaks, klib introsort vs pdqsort produce different equal-info
+ * neighbor orderings in repetitive regions, which propagates to SAM
+ * via different chain compositions. Matches the mem_ars2 stabilization
+ * rationale. */
+#define intv_lt(a, b) \
+    ((a).info < (b).info || ((a).info == (b).info && \
+     ((a).x[0] < (b).x[0] || ((a).x[0] == (b).x[0] && \
+      (a).x[1] < (b).x[1]))))
 KSORT_INIT(mem_intv, bwtintv_t, intv_lt)
+PDQSORT_INIT(mem_intv, bwtintv_t, intv_lt)
 #define intv_lt1(a, b) ((((uint64_t)(a).m) <<32 | ((uint64_t)(a).n)) < (((uint64_t)(b).m) <<32 | ((uint64_t)(b).n)))  // trial
 KSORT_INIT(mem_intv1, SMEM, intv_lt1)  // debug
 
@@ -79,6 +92,7 @@ KSORT_INIT(mem_intv1, SMEM, intv_lt1)  // debug
 
 #define flt_lt(a, b) ((a).w > (b).w)
 KSORT_INIT(mem_flt, mem_chain_t, flt_lt)
+PDQSORT_INIT(mem_flt, mem_chain_t, flt_lt)
 //------------------------------------------------------------------
 // Alignment: Construct the alignment from a chain *
 
@@ -165,11 +179,27 @@ mem_opt_t *mem_opt_init()
  * De-overlap single-end hits *
  ******************************/
 
-#define alnreg_slt2(a, b) ((a).re < (b).re)
+/* mem_ars2: primary sort by reference END position (`re`). Used by
+ * mem_sort_dedup_patch as the first ordering before its order-sensitive
+ * dedup/patch loop. The tie-break keys (rb, score-desc, qb) make the
+ * order deterministic at equal `re`; without them, the dedup outcome
+ * depended on whichever ordering the underlying sort algorithm happened
+ * to produce (klib introsort is unstable, pdqsort is unstable
+ * differently, radix is stable) — different orderings produced
+ * different surviving alnreg sets, propagating to `sub_n` and MAPQ.
+ * With the full key, every sort algorithm produces the same surviving
+ * set and the SAM is bit-equal regardless of which sort runs. */
+#define alnreg_slt2(a, b) \
+    ((a).re < (b).re || ((a).re == (b).re && \
+     ((a).rb < (b).rb || ((a).rb == (b).rb && \
+      ((a).score > (b).score || ((a).score == (b).score && \
+       (a).qb < (b).qb))))))
 KSORT_INIT(mem_ars2, mem_alnreg_t, alnreg_slt2)
+PDQSORT_INIT(mem_ars2, mem_alnreg_t, alnreg_slt2)
 
 #define alnreg_slt(a, b) ((a).score > (b).score || ((a).score == (b).score && ((a).rb < (b).rb || ((a).rb == (b).rb && (a).qb < (b).qb))))
 KSORT_INIT(mem_ars, mem_alnreg_t, alnreg_slt)
+PDQSORT_INIT(mem_ars, mem_alnreg_t, alnreg_slt)
 
 #define alnreg_hlt(a, b)  ((a).score > (b).score || ((a).score == (b).score && ((a).is_alt < (b).is_alt || ((a).is_alt == (b).is_alt && (a).hash < (b).hash))))
 KSORT_INIT(mem_ars_hash, mem_alnreg_t, alnreg_hlt)
@@ -179,11 +209,11 @@ KSORT_INIT(mem_ars_hash2, mem_alnreg_t, alnreg_hlt2)
 
 #if MATE_SORT
 void sort_alnreg_re(int n, mem_alnreg_t* a) {
-    ks_introsort(mem_ars2, n, a);
+    pdqsort_mem_ars2(n, a);
 }
 
 void sort_alnreg_score(int n, mem_alnreg_t* a) {
-    ks_introsort(mem_ars, n, a);
+    pdqsort_mem_ars(n, a);
 }
 
 #endif
@@ -313,7 +343,7 @@ int mem_sort_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns,
 {
     int m, i, j;
     if (n <= 1) return n;
-    ks_introsort(mem_ars2, n, a); // sort by the END position, not START!
+    pdqsort_mem_ars2(n, a); // sort by the END position, not START!
 
     for (i = 0; i < n; ++i) a[i].n_comp = 1;
     for (i = 1; i < n; ++i)
@@ -357,7 +387,7 @@ int mem_sort_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns,
             else ++m;
         }
     n = m;
-    ks_introsort(mem_ars, n, a);
+    pdqsort_mem_ars(n, a);
     for (i = 1; i < n; ++i) { // mark identical hits
         if (a[i].score == a[i-1].score && a[i].rb == a[i-1].rb && a[i].qb == a[i-1].qb)
             a[i].qe = a[i].qb;
