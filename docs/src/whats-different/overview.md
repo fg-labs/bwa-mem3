@@ -4,10 +4,15 @@ This section tracks every change that bwa-mem3 carries on top of upstream
 [bwa-mem2/bwa-mem2](https://github.com/bwa-mem2/bwa-mem2)'s `master` branch,
 explains why each change was made, and records its upstream disposition.
 
+bwa-mem3 is **not byte-identical** to bwa-mem2. Upstream guarantees its output exactly reproduces the original `bwa`; bwa-mem3 has consciously stepped below that bar by emitting extra SAM tags, fixing crashes and SIMD scoring bugs, and changing tie resolution. On the data we have tested the core alignment (position, CIGAR, MAPQ, FLAG) is preserved, but the SAM byte stream is not. See [Equivalence with bwa-mem2](equivalence.md) for the verified field-by-field comparison and an auditable, per-PR trail of every divergence.
+
 ## How this section is organized
 
 Each deep-dive page covers one category of change:
 
+- [Equivalence with bwa-mem2](equivalence.md) — what is and isn't preserved
+  relative to upstream, with a verified concordance check and an auditable
+  list linking every merged PR by output impact.
 - [Correctness fixes](correctness.md) — bugs in upstream bwa-mem2 that are
   fixed in bwa-mem3, including the kswv SIMD score2 plateau series, the
   proper-pair flag regression, the zero-init crash, the SMEM buffer overflow,
@@ -197,6 +202,7 @@ and we drop them from `main` once they appear upstream.
 ---
 
 **See also:**
+[Equivalence with bwa-mem2](equivalence.md) ·
 [Correctness fixes](correctness.md) ·
 [Performance improvements](performance.md) ·
 [Features](features.md) ·
