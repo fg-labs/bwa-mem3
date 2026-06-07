@@ -2,26 +2,25 @@
 
 bwa-mem3 is **not** byte-identical to bwa-mem2, and that is intentional. Upstream bwa-mem2 advertises exact equivalence with the original `bwa` — "produces alignment identical to bwa" and "exact same output as bwa-mem(2)" — and that guarantee was the right bar for a project whose sole charter was to reproduce `bwa mem` faster. bwa-mem3 has a broader charter: it adds informative SAM tags, fixes crashes and undefined behavior, corrects SIMD scoring kernels, and makes tie resolution deterministic. Several of those changes necessarily move output away from a byte-for-byte match. We have consciously stepped below the bit-identity bar, and this page records exactly where, and gives an auditable trail back to every merged pull request so a reader can decide for themselves whether each divergence matters for their workflow.
 
-The short version: on the data we have tested, the **core alignment** — where each read maps and how — is preserved. The **SAM byte stream** is not, because bwa-mem3 emits additional auxiliary tags that upstream never wrote. Beyond the additive tags, other divergences exist in the code but are latent, opt-in, or per-architecture; they are described under "What differs" below and in more depth on the [Correctness fixes](correctness.md), [Performance improvements](performance.md), and [Features](features.md) pages.
+The short version: on the data we have tested, the **core alignment** — where each read maps and how — is preserved on essentially every read. The **SAM byte stream** is not, primarily because bwa-mem3 emits additional auxiliary tags that upstream never wrote, and secondarily because it adds a handful of supplementary alignments and shifts MAPQ/CIGAR on a small per-architecture fraction of reads. Beyond the additive tags, the remaining divergences are latent, opt-in, or per-architecture; they are described under "What differs" below and in more depth on the [Correctness fixes](correctness.md), [Performance improvements](performance.md), and [Features](features.md) pages.
 
 ## What is preserved
 
-We ran an empirical concordance check on sample `smoke-1M` (1M paired-end 150 bp reads), aligned on an AVX2 host (AWS `c6a`), comparing current `main` (commit `c6240a74`) against upstream `bwa-mem2` v2.2.1 over all 64,763 SAM records. The following fields were **identical on every record — zero differences**:
+We ran an empirical concordance check with [bwa-mem3-bench](https://github.com/fg-labs/bwa-mem3-bench) at commit `bffae5a` (current `main`), comparing bwa-mem3 against upstream `bwa-mem2` v2.2.1 on x86 hosts across whole-genome, whole-exome, and panel workloads. **Primary-alignment concordance** — reference name, position, CIGAR, MAPQ, and placement flags compared per read end — is:
 
-- Reference name and mapping position (`RNAME`, `POS`)
-- `CIGAR`
-- Mapping quality (column 5, `MAPQ`)
-- The full bitwise `FLAG`, including the `0x2` proper-pair bit
-- The `AS:i` alignment score
-- The `NM:i` edit distance, `MD:Z` mismatch string, `MC:Z` mate CIGAR, and `XS:i` suboptimal score
+| sample | primary concordance | primary records |
+|---|---:|---:|
+| wes-5M | 99.9996% | 10,051,170 |
+| wgs-5M | 99.9893% | 9,980,872 |
+| panel-twist-5M | 99.9414% | 7,913,324 |
 
-In other words, on this workload, where each read maps, how it is aligned, how confidently, and how its mate relates to it are all unchanged from upstream.
+Where each read maps is preserved on essentially every read. The well-under-0.1% of primary records that differ do so in `MAPQ`, `CIGAR`, or position, and are accounted for by the per-architecture SIMD `score2`/`MAPQ` convergence and the deterministic tie-break change described under "What differs" below and on the [Correctness fixes](correctness.md) page. (On the 1M-read `smoke-1M` cell the figure is 99.946%; the larger exome and genome cells above are more representative.) Cross-architecture, the NEON (ARM) and x86 builds are byte-identical to each other — 100.0000% concordance over all records, supplementary alignments included.
 
 ## What differs
 
-### Additive SAM tags (observed on the tested data)
+### Additive SAM tags
 
-The only differences observed on `smoke-1M` are two **additive** auxiliary tags that bwa-mem3 emits and upstream does not:
+The most pervasive difference is two **additive** auxiliary tags that bwa-mem3 emits and upstream does not:
 
 - `MQ:i` — mate mapping quality, present on ~100% of bwa-mem3 records and absent from upstream output.
 - `HN:i` — total hit count per primary, present on 54,188 of the 64,763 bwa-mem3 records and on 0 upstream records.
@@ -42,9 +41,13 @@ Same alignment, same scores — two extra tags. Because these tags are inserted 
 
 Separately, the `@PG` header line reports `ID:bwa-mem3` / `PN:bwa-mem3` rather than `bwa-mem2`, which is also a byte-level header difference by design.
 
+### Additional supplementary alignments
+
+On the default build, with no special flags, bwa-mem3 emits a small number of **additional supplementary (chimeric/split) alignments** that upstream `bwa-mem2` v2.2.1 does not. On `wes-5M` (5,025,585 read pairs) bwa-mem3 emits 5,123 supplementary records versus upstream's 5,118 — five extra split alignments, on five templates (0.0001%). The **primary** alignment of every affected pair is unchanged; only an extra supplementary record is added. This is measured by bwa-mem3-bench's `compare-bams`, which reports per-template supplementary count-mismatch and position-unmatched rates alongside primary concordance. These additions are default-on behavior — they occur with no special flags — and are *not* a product of the opt-in `--supp-rep-hard-cap` rescoring, which only lowers MAPQ and never adds records. Pinning them to a specific upstream-divergence PR is tracked as follow-up.
+
 ### Divergences that are latent, opt-in, or per-architecture
 
-The following changes can move alignments, scores, or MAPQ relative to upstream, but did **not** surface on the tested `smoke-1M` / AVX2 cell because they are gated, latent, or only active on other inputs or architectures:
+The following changes can move alignments, scores, or MAPQ relative to upstream, but did **not** surface as primary-alignment differences on the measured cells because they are gated, latent, or only active on other inputs or architectures:
 
 - **Proper-pair `FLAG` recompute ([#17](https://github.com/fg-labs/bwa-mem3/pull/17), default-on).** bwa-mem3 computes the `0x2` bit from the alignment actually emitted rather than from the below-threshold primary. This only changes the flag in the rare case where the primary's score is under `opt->T` but an ALT hit clears it; on `smoke-1M` no record hit that path, so the full `FLAG` matched upstream exactly. See [Correctness fixes → Proper-pair flag](correctness.md).
 - **SIMD scoring-kernel fixes ([#21](https://github.com/fg-labs/bwa-mem3/pull/21), [#26](https://github.com/fg-labs/bwa-mem3/pull/26), [#28](https://github.com/fg-labs/bwa-mem3/pull/28), [#29](https://github.com/fg-labs/bwa-mem3/pull/29), [#30](https://github.com/fg-labs/bwa-mem3/pull/30), [#31](https://github.com/fg-labs/bwa-mem3/pull/31)).** These correct the batched mate-rescue `kswv` kernels so the suboptimal score (`score2` → `XS:i`/`MAPQ`) converges toward the scalar `ksw_align2` reference. They move `XS`/`MAPQ` on the minority of reads where the SIMD kernel previously diverged, and the affected reads differ by architecture (AVX2 vs NEON vs AVX-512BW). See [Correctness fixes → kswv score2 plateau series](correctness.md).

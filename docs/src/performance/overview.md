@@ -20,15 +20,15 @@ PR [#58](https://github.com/fg-labs/bwa-mem3/pull/58) and the related lockstep S
 
 ## Reference numbers across architectures
 
-Wall-time medians from [bwa-mem3-bench](https://github.com/fg-labs/bwa-mem3-bench) at SHA `dc7fcfe` (2026-05-13), 5 reps per cell, t≈16, hg38, paired-end 150 bp:
+Wall-time medians from [bwa-mem3-bench](https://github.com/fg-labs/bwa-mem3-bench) at SHA `bffae5a` (2026-06-07), 5 reps per cell, t≈16, hg38, paired-end 150 bp:
 
 | sample | c6a (AVX2, Zen3) | c7a (AVX-512, Zen4) | c7i (AVX-512, SPR) | c7g (NEON, Graviton3) | c8g (NEON, Graviton4) |
 |---|---:|---:|---:|---:|---:|
-| wgs-5M | 147.70 s | **101.17 s** | 138.33 s | 178.54 s | 151.23 s |
-| wes-5M | 84.37 s | **61.96 s** | 75.08 s | 84.50 s | 70.90 s |
-| panel-twist-5M | 158.49 s | **106.94 s** | 151.78 s | 194.04 s | 163.38 s |
+| wgs-5M | 142.88 s | **97.94 s** | 147.83 s | 176.49 s | 150.76 s |
+| wes-5M | 78.87 s | **59.81 s** | 79.25 s | 81.81 s | 67.47 s |
+| panel-twist-5M | 157.12 s | **105.99 s** | 166.15 s | 192.53 s | 164.16 s |
 
-Concordance vs upstream `bwa-mem2 v2.2.1` on these cells: **100.0000%** across 8.1M–10M reads/cell. NEON-vs-x86 cross-architecture concordance on the same builds is also 100.0000%. Spot-pool noise envelope (rep-to-rep CV): ~1% on c6a / c7a / c7g / c8g, ~8–9% on c7i. See the bench repo for the methodology, the full per-rep table, and noisier instance classes excluded from this summary.
+Concordance vs upstream `bwa-mem2 v2.2.1` on these cells, measured over primary-alignment records: **wgs-5M 99.9893%, wes-5M 99.9996%, panel-twist-5M 99.9414%**. bwa-mem3 is intentionally **not** byte-identical to bwa-mem2 — the residual differences are additive SAM tags, per-architecture SIMD `score2`/`MAPQ` convergence, deterministic tie-breaks, and a small number of additional supplementary alignments; see [Equivalence with bwa-mem2](../whats-different/equivalence.md) for the full audited breakdown. NEON-vs-x86 cross-architecture concordance on the same builds remains **100.0000%** (the ARM and x86 fg-labs builds produce identical records). Spot-pool noise envelope (rep-to-rep CV): ~1% on c6a / c7a / c7g / c8g, ~8–9% on c7i. See the bench repo for the methodology, the full per-rep table, and noisier instance classes excluded from this summary.
 
 ## Benchmarking responsibly
 
