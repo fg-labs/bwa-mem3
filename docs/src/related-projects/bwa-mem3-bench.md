@@ -29,6 +29,35 @@ bwa-mem3-bench runs collected after the relevant PR was merged. The suite also
 validates that bwa-mem3 does not regress relative to bwa-mem2 on any supported
 architecture before a new release is tagged.
 
+## Per-release concordance history
+
+Per-(release, sample) primary-alignment concordance against upstream bwa-mem2 v2.2.1, with supplementary-alignment counts, across released bwa-mem3 versions. Concordance is the minimum vs-baseline value over reps and x86 architectures (deterministic per sample); `supp_query`/`supp_baseline` are total supplementary records emitted by bwa-mem3 and bwa-mem2, and `count_mismatch` is the number of templates whose supplementary count differs. The [divergence catalog](../whats-different/equivalence.md#declared-divergence-catalog) explains what each kind of drift is and its budget.
+
+This table and the divergence catalog are both generated from the benchmark database — do not edit them by hand. Regenerate after a new release is collected with `pixi run python -m bwa_mem3_bench.cli bench docs --releases v0.2.0=<sha>,v0.2.1=<sha>,...` (in the bwa-mem3-bench repo), then replace the content between the `FG-DIVERGENCE-CATALOG` / `FG-RELEASE-TABLE` markers with the emitted `runs/docs/{divergence-catalog.md,release-table.md}` (the `inject_between_markers` helper in `bwa_mem3_bench.report.docs` does exactly this splice).
+
+<!-- FG-RELEASE-TABLE:start -->
+| release | sample | concordance_% | supp_query | supp_baseline | count_mismatch |
+| --- | --- | --- | --- | --- | --- |
+| v0.2.0 | meth-twist-emseq-5M | 98.8852 | 0 | 0 | 0 |
+| v0.2.0 | panel-twist-5M | 100.0000 | 186946 | 186946 | 0 |
+| v0.2.0 | smoke-1M | 100.0000 | 1455 | 1455 | 0 |
+| v0.2.0 | smoke-meth | 98.8573 | 0 | 0 | 0 |
+| v0.2.0 | wes-5M | 100.0000 | 5118 | 5118 | 0 |
+| v0.2.0 | wgs-5M | 100.0000 | 49686 | 49686 | 0 |
+| v0.2.1 | meth-twist-emseq-5M | 98.8852 | 0 | 0 | 0 |
+| v0.2.1 | panel-twist-5M | 100.0000 | 186946 | 186946 | 0 |
+| v0.2.1 | smoke-1M | 100.0000 | 1455 | 1455 | 0 |
+| v0.2.1 | smoke-meth | 98.8573 | 0 | 0 | 0 |
+| v0.2.1 | wes-5M | 100.0000 | 5118 | 5118 | 0 |
+| v0.2.1 | wgs-5M | 100.0000 | 49686 | 49686 | 0 |
+| v0.2.2 | meth-twist-emseq-5M | 98.8773 | 0 | 0 | 0 |
+| v0.2.2 | panel-twist-5M | 99.9414 | 187039 | 186946 | 199 |
+| v0.2.2 | smoke-1M | 99.9460 | 0 | 0 | 0 |
+| v0.2.2 | smoke-meth | 98.8429 | 0 | 0 | 0 |
+| v0.2.2 | wes-5M | 99.9996 | 5123 | 5118 | 5 |
+| v0.2.2 | wgs-5M | 99.9893 | 49926 | 49686 | 256 |
+<!-- FG-RELEASE-TABLE:end -->
+
 ## Links
 
 - GitHub: <https://github.com/fg-labs/bwa-mem3-bench>

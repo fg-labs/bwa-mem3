@@ -43,7 +43,7 @@ Separately, the `@PG` header line reports `ID:bwa-mem3` / `PN:bwa-mem3` rather t
 
 ### Additional supplementary alignments
 
-On the default build, with no special flags, bwa-mem3 emits a small number of **additional supplementary (chimeric/split) alignments** that upstream `bwa-mem2` v2.2.1 does not. On `wes-5M` (5,025,585 read pairs) bwa-mem3 emits 5,123 supplementary records versus upstream's 5,118 — five extra split alignments, on five templates (0.0001%). The **primary** alignment of every affected pair is unchanged; only an extra supplementary record is added. This is measured by bwa-mem3-bench's `compare-bams`, which reports per-template supplementary count-mismatch and position-unmatched rates alongside primary concordance. These additions are default-on behavior — they occur with no special flags — and are *not* a product of the opt-in `--supp-rep-hard-cap` rescoring, which only lowers MAPQ and never adds records. Pinning them to a specific upstream-divergence PR is tracked as follow-up.
+On the default build, with no special flags, bwa-mem3 emits a small number of **additional supplementary (chimeric/split) alignments** that upstream `bwa-mem2` v2.2.1 does not. On `wes-5M` (5,025,585 read pairs) bwa-mem3 emits 5,123 supplementary records versus upstream's 5,118 — five extra split alignments, on five templates (0.0001%). The **primary** alignment of every affected pair is unchanged; only an extra supplementary record is added. This is measured by bwa-mem3-bench's `compare-bams`, which reports per-template supplementary count-mismatch and position-unmatched rates alongside primary concordance. These additions are default-on behavior — they occur with no special flags — and are *not* a product of the opt-in `--supp-rep-hard-cap` rescoring, which only lowers MAPQ and never adds records. Pinning them to a specific upstream-divergence PR is tracked as follow-up ([#127](https://github.com/fg-labs/bwa-mem3/issues/127)).
 
 ### Divergences that are latent, opt-in, or per-architecture
 
@@ -54,6 +54,18 @@ The following changes can move alignments, scores, or MAPQ relative to upstream,
 - **Seeding correctness fixes ([#55](https://github.com/fg-labs/bwa-mem3/pull/55), [#73](https://github.com/fg-labs/bwa-mem3/pull/73), [#100](https://github.com/fg-labs/bwa-mem3/pull/100)).** These fix buffer sizing and a prefetch-mask precedence bug. They change alignments only where the old bug actually triggered (e.g. reads longer than 151 bp for [#55](https://github.com/fg-labs/bwa-mem3/pull/55); [#73](https://github.com/fg-labs/bwa-mem3/pull/73) is a prefetch hint with no semantic change).
 - **Opt-in MAPQ rescoring ([#56](https://github.com/fg-labs/bwa-mem3/pull/56), [#101](https://github.com/fg-labs/bwa-mem3/pull/101), [#118](https://github.com/fg-labs/bwa-mem3/pull/118), default-off).** `--supp-rep-hard-cap INT` forces MAPQ=0 on supplementary alignments anchored in repetitive seeds. With no flag the output is unchanged; [#101](https://github.com/fg-labs/bwa-mem3/pull/101) makes the flag actually take effect (it shipped as a silent no-op before), and [#118](https://github.com/fg-labs/bwa-mem3/pull/118) is its regression test. See [Features → `--supp-rep-hard-cap`](features.md).
 - **Tie-break determinism ([#123](https://github.com/fg-labs/bwa-mem3/pull/123)).** Makes secondary-alignment ordering deterministic across runs; can reorder equal-scoring ties relative to upstream's order.
+
+## Declared divergence catalog
+
+The divergences described above are tracked as a structured registry in [bwa-mem3-bench](https://github.com/fg-labs/bwa-mem3-bench) (`docs/expected-divergences.yaml`). Each carries a per-sample concordance-drift budget that the benchmark gates against on every run — a new bwa-mem3 build that drifts beyond its budget fails CI rather than silently shipping a regression. The table below is generated from that registry; do not edit it by hand (see [bwa-mem3-bench → Per-release concordance history](../related-projects/bwa-mem3-bench.md) for how it is regenerated).
+
+<!-- FG-DIVERGENCE-CATALOG:start -->
+| id | pr | affected | samples | budget_% | summary |
+| --- | --- | --- | --- | --- | --- |
+| FG-PRIMARY-DRIFT | fg-labs/bwa-mem3#123 | primary_alignment | wgs-5M, wes-5M, panel-twist-5M, smoke-1M | 0.1000 | Per-architecture SIMD score2/MAPQ convergence (#21, #26, #28-#31) and deterministic tie-break ordering (#123) shift MAPQ, CIGAR, or position on a small fraction of primary alignments relative to bwa-mem2 v2.2.1. Where each read maps is preserved; the affected reads differ in placement detail, and the set varies by SIMD architecture. |
+| FG-METH-DIVERGENCE | fg-labs/bwa-mem3#90 | meth_alignment | meth-twist-emseq-5M, smoke-meth | 1.5000 | Bisulfite (--meth) mode against the bwameth.py baseline diverges beyond the ignored YD/XM/XG tag set (Bismark-compatible XR/XG/XM tags and C->T/G->A conversion handling), giving a larger but still-bounded concordance drift on methylation workloads. |
+| FG-SUPP-ADDITIONS | TBD | supplementary_alignment | all | 0.0000 | bwa-mem3 emits a small number of additional supplementary (split/chimeric) alignments vs bwa-mem2 v2.2.1 on the default build (e.g. wes-5M: 5123 vs 5118). Primary alignments are unchanged. Tracked as a supplementary-count metric (compare-bams supp_count_mismatch / supp_unmatched); it does not affect the primary-concordance drift budget, hence 0.0 here. |
+<!-- FG-DIVERGENCE-CATALOG:end -->
 
 ## Auditable PR list
 
