@@ -132,7 +132,7 @@ jobs:
         # / requirements.host.
         uses: awalsh128/cache-apt-pkgs-action@acb598e5ddbc6f68a970c5da0688d2f3a9f04d05 # v1.6.0
         with:
-          packages: zlib1g-dev autoconf automake
+          packages: zlib1g-dev libdeflate-dev autoconf automake
           version: 1.0
 
       - name: Install git-archive-all
