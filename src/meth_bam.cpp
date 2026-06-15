@@ -105,10 +105,27 @@ static void sanitize_cl(char *s)
     for (; *s; ++s) if (*s == '\t') *s = ' ';
 }
 
+/* True if the SAM header text `s` contains a line whose type is `tag4`
+ * (e.g. "@HD\t"): either as the first line or following a newline. Used to
+ * avoid emitting a default @HD when the user's -H already supplies one —
+ * htslib's sam_hdr_add_lines does not de-dup @HD records, so two would be
+ * written. Mirrors the same guard in bam_writer.cpp's default path. */
+static int hdr_text_has_type(const char *s, const char *tag4)
+{
+    if (s == NULL || s[0] == '\0') return 0;
+    size_t n = strlen(tag4);
+    if (strncmp(s, tag4, n) == 0) return 1;
+    char needle[8] = "\n";
+    /* tag4 is always 4 chars ("@XX\t"); "\n" + tag4 fits in 8. */
+    strncpy(needle + 1, tag4, sizeof(needle) - 2);
+    return strstr(s, needle) != NULL;
+}
+
 meth_bam_writer_t *meth_bam_writer_open(const char *path_or_dash,
                                         meth_chrom_map_t *cmap,
                                         const char *bwa_pg,
                                         const char *meth_pg_cl,
+                                        const char *hdr_line,
                                         int compression_level)
 {
     if (path_or_dash == NULL || cmap == NULL) return NULL;
@@ -126,8 +143,10 @@ meth_bam_writer_t *meth_bam_writer_open(const char *path_or_dash,
     w->hdr = sam_hdr_init();
     if (w->hdr == NULL) { hts_close(w->fp); free(w); return NULL; }
 
-    /* @HD */
-    if (sam_hdr_add_line(w->hdr, "HD", "VN", "1.6", "SO", "unsorted", NULL) < 0) goto fail;
+    /* @HD — skip the default when the user's -H already supplies one, else
+     * htslib would write two @HD lines (it does not de-dup @HD). */
+    if (!hdr_text_has_type(hdr_line, "@HD\t") &&
+        sam_hdr_add_line(w->hdr, "HD", "VN", "1.6", "SO", "unsorted", NULL) < 0) goto fail;
 
     /* @SQ from consolidated chrom map */
     for (int i = 0; i < cmap->n_output; ++i) {
@@ -138,6 +157,16 @@ meth_bam_writer_t *meth_bam_writer_open(const char *path_or_dash,
                              "LN", len_buf,
                              NULL) < 0) goto fail;
     }
+
+    /* User header text (-R read group, -H lines). Emitted after @SQ and
+     * before the @PG lines, matching the default writer's precedence so a
+     * -R read group becomes an @RG header that the per-record RG:Z tags
+     * (stamped from bwa_rg_id below) actually reference. The consolidated
+     * @SQ above is authoritative for --meth, so a user -H that re-supplies
+     * @SQ for an already-emitted contig will make htslib reject the add and
+     * the open fails loudly rather than emitting duplicate references. */
+    if (hdr_line != NULL && hdr_line[0] != '\0' &&
+        sam_hdr_add_lines(w->hdr, hdr_line, 0) < 0) goto fail;
 
     /* Original bwa-mem3 @PG */
     if (bwa_pg != NULL && bwa_pg[0] != '\0') {

@@ -48,12 +48,16 @@ extern meth_chrom_map_t *g_meth_cmap;
 extern meth_bam_writer_t *g_meth_bam_writer;
 
 /* Open a BAM writer at path ("-" for stdout). `compression_level` is the
- * BGZF deflate level: 0 = uncompressed, 1..9 = deflate. Returns NULL on
- * failure. */
+ * BGZF deflate level: 0 = uncompressed, 1..9 = deflate. `hdr_line` is the
+ * assembled user header text (-R read group and/or -H lines, '\n'-joined,
+ * no trailing newline), or NULL — emitted verbatim after the @SQ block so a
+ * -R read group lands as an @RG header, matching the default (non-meth)
+ * writer. Returns NULL on failure. */
 meth_bam_writer_t *meth_bam_writer_open(const char *path_or_dash,
                                         meth_chrom_map_t *cmap,
                                         const char *bwa_pg,
                                         const char *meth_pg_cl,
+                                        const char *hdr_line,
                                         int compression_level);
 
 /* Write one bam1_t. Returns 0 on success, -1 on error. */

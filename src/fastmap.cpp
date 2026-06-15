@@ -1490,7 +1490,7 @@ int main_mem(int argc, char *argv[])
         const char *meth_out_path = is_o ? out_path : "-";
         extern char *bwa_pg;
         g_meth_bam_writer = meth_bam_writer_open(meth_out_path, g_meth_cmap, bwa_pg, NULL,
-                                                 opt->bam_level);
+                                                 hdr_line, opt->bam_level);
         if (g_meth_bam_writer == NULL) {
             fprintf(stderr, "ERROR: meth: failed to open BAM writer for '%s'\n", meth_out_path);
             meth_orig_ref_free(g_meth_orig_ref); g_meth_orig_ref = NULL;
