@@ -110,7 +110,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #endif
 
 #define MAX_LINE_LEN 256
-#define MAX_SEQ_LEN8 128
+#define MAX_SEQ_LEN8 1088
 #define MAX_SEQ_LEN16 32768
 #define MATRIX_MIN_CUTOFF 0
 #define LOW_INIT_VALUE -128

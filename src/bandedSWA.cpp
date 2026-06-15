@@ -110,8 +110,8 @@ BandedPairWiseSW::BandedPairWiseSW(const int o_del, const int e_del, const int o
     //   1 × sz8  : sbt8_                (8-bit SBT pre-pass scratch)
     //   1 × sz16 : sbt16_               (16-bit SBT pre-pass scratch;
     //                                    multi-MB — moved off the stack)
-    // Each partition is a multiple of 64B (MAX_SEQ_LEN8=128, SIMD_WIDTH8
-    // ≥ 16 → 8-bit partition multiple of 2048; 16-bit similarly), so
+    // Each partition is a multiple of 64B (MAX_SEQ_LEN8=1088, SIMD_WIDTH8
+    // ≥ 16 → 8-bit partition multiple of 17408; 16-bit similarly), so
     // neighbouring views stay 64B-aligned without explicit padding. The
     // static_asserts below trip at compile time if a future MAX_SEQ_LEN*
     // / SIMD_WIDTH* tweak breaks the 64B partition invariant.
