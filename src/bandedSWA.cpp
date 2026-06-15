@@ -4641,8 +4641,8 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
         for(i = nstart; i < nend; i+=SIMD_WIDTH8)
         {
             int32_t j, k;
-            uint8_t maxLen1 = 0;
-            uint8_t maxLen2 = 0;
+            int maxLen1 = 0;
+            int maxLen2 = 0;
             //bsize = 100;
             bsize = w;
             
@@ -4804,8 +4804,8 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
 
 void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
                                           uint8_t seq2SoA[],
-                                          uint8_t nrow,
-                                          uint8_t ncol,
+                                          int nrow,
+                                          int ncol,
                                           SeqPair *p,
                                           uint8_t h0[],
                                           uint16_t tid,
@@ -4835,7 +4835,7 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
     int8_t  *H_h = H8_ + tid * SIMD_WIDTH8 * MAX_SEQ_LEN8;
     int8_t  *H_v = H8__ + tid * SIMD_WIDTH8 * MAX_SEQ_LEN8;
 
-    int8_t i, j;
+    int i, j;
 
     uint8_t tlen[SIMD_WIDTH8];
     uint8_t tail[SIMD_WIDTH8] __attribute((aligned(64)));

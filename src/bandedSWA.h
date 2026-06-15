@@ -295,8 +295,8 @@ public:
 
     void smithWaterman128_8(uint8_t seq1SoA[],
                             uint8_t seq2SoA[],
-                            uint8_t nrow,
-                            uint8_t ncol,
+                            int nrow,
+                            int ncol,
                             SeqPair *p,
                             uint8_t h0[],
                             uint16_t tid,
