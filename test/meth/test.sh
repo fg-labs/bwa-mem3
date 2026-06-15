@@ -194,16 +194,19 @@ norm() {
 # once we consolidate f*/r* to one output contig the information IS
 # available, so we compute a real TLEN. Diff QNAME..MPOS (cols 1-8) to
 # assert structural parity without re-enforcing bwameth.py's TLEN=0 quirk.
+# `|| true`: under `set -euo pipefail` a non-zero `diff` exit (files differ) inside
+# a command substitution aborts the script *before* the FAIL branch below runs,
+# turning a real structural mismatch into a silent `exit 1` with no diagnostic.
 ONE="$(diff <(norm /tmp/meth_mine.sam | cut -f1-8) \
-             <(norm /tmp/meth_oracle_records.sam | cut -f1-8) | wc -l | tr -d ' ')"
+             <(norm /tmp/meth_oracle_records.sam | cut -f1-8) | wc -l | tr -d ' ' || true)"
 if [[ "$ONE" != "0" ]]; then
     echo "FAIL layer 2: structural diff in cols 1-8 ($ONE lines)"
-    diff <(norm /tmp/meth_mine.sam | cut -f1-8) <(norm /tmp/meth_oracle_records.sam | cut -f1-8) | head -20
+    diff <(norm /tmp/meth_mine.sam | cut -f1-8) <(norm /tmp/meth_oracle_records.sam | cut -f1-8) | head -20 || true
     exit 1
 fi
 
 TWO="$(diff <(norm /tmp/meth_mine.sam | cut -f6) \
-             <(norm /tmp/meth_oracle_records.sam | cut -f6) | wc -l | tr -d ' ')"
+             <(norm /tmp/meth_oracle_records.sam | cut -f6) | wc -l | tr -d ' ' || true)"
 if [[ "$TWO" != "0" ]]; then echo "FAIL layer 2: CIGAR diff ($TWO lines)"; exit 1; fi
 
 MINE_N="$(wc -l < /tmp/meth_mine.sam | tr -d ' ')"
