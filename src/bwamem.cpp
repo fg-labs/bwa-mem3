@@ -121,6 +121,17 @@ static inline int bsw8_envelope_ok(int len1, int len2, int w,
 {
     int max_step = score_a > 1 ? score_a : 1;   /* max(w_match, w_ambig, 1) */
     return len1 < MAX_SEQ_LEN8 && len2 < MAX_SEQ_LEN8 &&
+           /* target (rows, len1) >= query (cols, len2). The re-baseline 8-bit
+            * kernel's gscore (query-end score) is byte-identical to scalar ONLY
+            * when the query-end column (len2-1) lies on or left of the main
+            * diagonal, i.e. len1 >= len2. When len2 > len1 the query end is
+            * off-diagonal to the right, where the re-baseline saturating-subtract
+            * zeroes those low-scoring cells (they sit >zdrop below the row max),
+            * the band trims them, and gscore is lost. Such pairs (rare: only when
+            * the reference window is shorter than the read segment, e.g. at contig
+            * edges) route to the 16-bit tier, which has no re-baseline and is
+            * byte-identical for them. See smithWaterman128_8 gscore capture. */
+           len1 >= len2 &&
            w <= BSW8_MAX_W &&
            zdrop + max_step <= BSW8_MAX_ZDROP_STEP;
 }

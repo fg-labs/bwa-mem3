@@ -1014,9 +1014,9 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
     __m256i two256  = _mm256_set1_epi8(2);
     __m256i ff256 = _mm256_set1_epi8(0xFF);
 
-    // gscore best-row marker lane: 1 == "this row updated gscore", 0 == earlier
-    // (the actual earlier row is carried in the wide ierow[] side channel).
-    __m256i max_ie256 = zero256;
+    // gscore query-end capture (see smithWaterman128_8). Reset per row.
+    __m256i hqe256   = zero256;   // query-end cell H (rebaselined byte) this row
+    __m256i qfire256 = zero256;   // 0xFF where this lane reached its query end this row
 
     // Offset-frame band edges. head_off starts at 0 (col 0 - row 0); tail_off
     // starts saturated-high (+127) and is immediately clamped by the band-grow
@@ -1034,7 +1034,6 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
         _mm256_store_si256((__m256i *)(F + j * SIMD_WIDTH8), zero256);
 
     __m256i y256 = zero256;   // best col as diagonal offset: col - i_at_capture (i_at_capture = xrow[l]-1)
-    __m256i gscore = _mm256_set1_epi8(-1);
     __m256i max_off256 = zero256;
     __m256i exit0 = _mm256_set1_epi8(0xFF);
     __m256i zdrop256 = _mm256_set1_epi8(zdrop);
@@ -1067,9 +1066,9 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
 
         __m256i y1_256 = zero256;   // row-max column as diagonal offset (col - i)
 
-        // gscore best-row marker resets each row (the carried best row lives in
-        // the wide ierow[] side channel; this lane only flags "updated this row").
-        max_ie256 = zero256;
+        // gscore query-end capture resets each row.
+        hqe256   = zero256;
+        qfire256 = zero256;
 
         // Per-row diagonal-offset of the query end: qlen_off = qlen - i. Built
         // wide then saturated to int8, with a validity mask so an out-of-band
@@ -1205,32 +1204,21 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
 
             h10 = h11;
 
-            // gscore calculations
+            // gscore query-end capture (see smithWaterman128_8 for the full
+            // rationale: the re-baseline saturating-subtract zeroes off-diagonal
+            // query-end cells, so gscore cannot be reconstructed from the trimmed
+            // tail; capture (byte+B) per row and finalize wide). Fire exactly like
+            // the byte-identical 16-bit tier: col == qlen-1 (j256 == qlen_off) AND
+            // the band-grown tail reached the query end (tail256 == qlen_off ==
+            // scalar's end == qlen) AND in-band (qlen_valid) AND lane alive (exit0).
             if (j >= minq)
             {
-                // SAFE query-end test: (col - i) == (qlen - i) iff col == qlen,
-                // but only when qlen-i is in-band (else the wrapped/saturated
-                // qlen_off could alias an in-band col offset). Gate with the
-                // validity mask so an out-of-band query end can never match.
                 __m256i cmp = _mm256_cmpeq_epi8(j256, qlen_off256);
+                cmp = _mm256_and_si256(cmp, _mm256_cmpeq_epi8(tail256, qlen_off256));
                 cmp = _mm256_and_si256(cmp, qlen_valid256);
-                __m256i cmp_gh = _mm256_cmpgt_epi8(gscore, h11);
-                // Row marker: when h11 beats old gscore, flag "this row" (one256);
-                // otherwise keep the existing marker. The actual best row is
-                // captured into the wide ierow[] side channel in the epilogue.
-                __m256i tmp256_1 = _mm256_blendv_epi8(one256, max_ie256, cmp_gh);
-                __m256i max_gh = _mm256_blendv_epi8(h11, gscore, cmp_gh);
-
-                tmp256_1 = _mm256_blendv_epi8(max_ie256, tmp256_1, cmp);
-                tmp256_1 = _mm256_blendv_epi8(max_ie256, tmp256_1, exit0);
-
-                max_gh = _mm256_blendv_epi8(gscore, max_gh, exit0);
-                max_gh = _mm256_blendv_epi8(gscore, max_gh, cmp);
-
-                cmp = _mm256_cmpgt_epi8(j256, tail256);
-                max_gh = _mm256_blendv_epi8(max_gh, gscore, cmp);
-                max_ie256 = _mm256_blendv_epi8(tmp256_1, max_ie256, cmp);
-                gscore = max_gh;
+                cmp = _mm256_and_si256(cmp, exit0);
+                hqe256   = _mm256_blendv_epi8(hqe256, h11, cmp);
+                qfire256 = _mm256_blendv_epi8(qfire256, ff256, cmp);
             }
         }
         __m256i cmp1 = _mm256_cmpgt_epi8(head256, j256);
@@ -1280,35 +1268,32 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
             int8_t  ms_a[SIMD_WIDTH8]       __attribute((aligned(32)));
             int8_t  rs_a[SIMD_WIDTH8]       __attribute((aligned(32)));
             int8_t  exit_a[SIMD_WIDTH8]     __attribute((aligned(32)));
-            int8_t  ie_mark_a[SIMD_WIDTH8]  __attribute((aligned(32)));
-            int8_t  gs_a[SIMD_WIDTH8]       __attribute((aligned(32)));
+            int8_t  qfire_a[SIMD_WIDTH8]    __attribute((aligned(32)));
+            int8_t  hqe_a[SIMD_WIDTH8]      __attribute((aligned(32)));
             _mm256_store_si256((__m256i *) cmp_a, cmp);
             _mm256_store_si256((__m256i *) y1_a, y1_256);
             _mm256_store_si256((__m256i *) y_a, y256);
             _mm256_store_si256((__m256i *) ms_a, maxScore256);
             _mm256_store_si256((__m256i *) rs_a, maxRS1);
             _mm256_store_si256((__m256i *) exit_a, exit0);
-            _mm256_store_si256((__m256i *) ie_mark_a, max_ie256);
-            _mm256_store_si256((__m256i *) gs_a, gscore);
+            _mm256_store_si256((__m256i *) qfire_a, qfire256);
+            _mm256_store_si256((__m256i *) hqe_a, hqe256);
             for (int l = 0; l < SIMD_WIDTH8; l++) {
                 // best-score row
                 if (cmp_a[l]) xrow[l] = i + 1;
-                // best-gscore row: marker==1 means gscore was set this row
-                if (ie_mark_a[l] == 1) ierow[l] = i + 1;
-                // ABSOLUTE-FRAME score tracking: the 8-bit maxScore256/gscore are
-                // in the lane's CURRENT B[l] frame, so the absolute value is the
-                // rebaselined byte + B[l]. Re-derive both every row (cheap, O(rows))
-                // rather than trying to add B back once at the end (the recorded
-                // max may pre-date later B bumps). max() guards against the byte
-                // being re-baselined away in a later row.
+                // ABSOLUTE-FRAME score tracking: the 8-bit maxScore256 is in the
+                // lane's CURRENT B[l] frame; absolute = rebaselined byte + B[l].
                 {
                     int ms_abs = (int)(uint8_t)ms_a[l] + B[l];
                     if (ms_abs > best_abs[l]) best_abs[l] = ms_abs;
-                    // gscore init is -1 (0xFF as a byte); treat that as "unset".
-                    if ((uint8_t)gs_a[l] != 0xFF) {
-                        int gs_abs = (int)(uint8_t)gs_a[l] + B[l];
-                        if (gs_abs > gbest_abs[l]) gbest_abs[l] = gs_abs;
-                    }
+                }
+                // gscore (query-end score): qfire flags this lane reached its query
+                // end this row; hqe is the captured query-end cell H (byte, B[l]
+                // frame); absolute = byte + B[l]. Scalar's `>=` tie-break (last
+                // max-achieving row wins gtle). See smithWaterman128_8.
+                if (qfire_a[l]) {
+                    int gs_abs = (int)(uint8_t)hqe_a[l] + B[l];
+                    if (gs_abs >= gbest_abs[l]) { gbest_abs[l] = gs_abs; ierow[l] = i + 1; }
                 }
                 // z-drop (only relevant where the lane is still alive). The drop
                 // is ms-rs of two bytes in the SAME B[l] frame, so the B cancels
@@ -1473,13 +1458,10 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
                 // maxRS1 for the triggering row, and maxRS1 >= REBASE_HI >
                 // REBASE_KEEP > delta, so it stays positive).
                 maxScore256 = _mm256_subs_epu8(maxScore256, delta256);
-                // gscore: keep the -1 (0xFF) "unset" sentinel intact, but lower
-                // set lanes (it is compared SIGNED against the rebaselined h11 in
-                // the gscore block, so it must track the same frame). Zero the
-                // delta for lanes whose gscore is still 0xFF.
-                __m256i gset = _mm256_cmpeq_epi8(gscore, ff256);   // 0xFF where unset
-                __m256i gdelta = _mm256_andnot_si256(gset, delta256);
-                gscore = _mm256_subs_epu8(gscore, gdelta);
+                // gscore no longer carries a rebaselined byte register: the
+                // query-end cell H is captured per row and accumulated wide
+                // (gbest_abs, absolute units) in the epilogue, immune to this
+                // re-baseline subtract.
             }
         }
 
@@ -2920,9 +2902,9 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
     __m512i two512    = _mm512_set1_epi8(2);
     __m512i ff512     = _mm512_set1_epi8(0xFF);
 
-    // gscore best-row marker lane: 1 == "this row updated gscore", 0 == earlier
-    // (the actual earlier row is carried in the wide ierow[] side channel).
-    __m512i max_ie512 = zero512;
+    // gscore query-end capture (see smithWaterman128_8). Reset per row.
+    __m512i hqe512   = zero512;   // query-end cell H (rebaselined byte) this row
+    __m512i qfire512 = zero512;   // 0xFF where this lane reached its query end this row
 
     // Offset-frame band edges. head_off starts at 0 (col 0 - row 0); tail_off
     // starts saturated-high (+127) and is immediately clamped by the band-grow
@@ -2940,7 +2922,6 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
         _mm512_store_si512((__m512i *)(F + j * SIMD_WIDTH8), zero512);
 
     __m512i y512       = zero512;   // best col as diagonal offset: col - i_at_capture (i_at_capture = xrow[l]-1)
-    __m512i gscore     = _mm512_set1_epi8(-1);
     __m512i max_off512 = zero512;
     __m512i exit0      = _mm512_set1_epi8(0xFF);
     __m512i zdrop512   = _mm512_set1_epi8(zdrop);
@@ -2973,9 +2954,9 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
 
         __m512i y1_512 = zero512;   // row-max column as diagonal offset (col - i)
 
-        // gscore best-row marker resets each row (the carried best row lives in
-        // the wide ierow[] side channel; this lane only flags "updated this row").
-        max_ie512 = zero512;
+        // gscore query-end capture resets each row.
+        hqe512   = zero512;
+        qfire512 = zero512;
 
         // Per-row diagonal-offset of the query end: qlen_off = qlen - i. Built
         // wide then saturated to int8, with a validity mask so an out-of-band
@@ -3106,35 +3087,19 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
 
             h10 = h11;
                         
-            // gscore calculations
+            // gscore query-end capture (see smithWaterman128_8). Fire exactly like
+            // the byte-identical 16-bit tier: col == qlen-1 (j512 == qlen_off) AND
+            // band-grown tail reached the query end (tail512 == qlen_off == scalar's
+            // end == qlen) AND in-band (qlen_valid) AND lane alive (exit0 high bit).
+            // mask_blend(k, a, b) selects b where k, a where ~k.
             if (j >= minq)
             {
-                // SAFE query-end test: (col - i) == (qlen - i) iff col == qlen,
-                // but only when qlen-i is in-band (else the wrapped/saturated
-                // qlen_off could alias an in-band col offset). Gate with the
-                // validity mask so an out-of-band query end can never match.
                 __mmask64 cmp = _mm512_cmpeq_epi8_mask(j512, qlen_off512);
+                cmp = cmp & _mm512_cmpeq_epi8_mask(tail512, qlen_off512);
                 cmp = cmp & qlen_valid_k;
-                __mmask64 cmp_gh = _mm512_cmpgt_epi8_mask(gscore, h11);
-                // Row marker: when h11 beats old gscore, flag "this row" (one512);
-                // otherwise keep the existing marker. The actual best row is
-                // captured into the wide ierow[] side channel in the epilogue.
-                __m512i tmp512_1 = _mm512_mask_blend_epi8(cmp_gh, one512, max_ie512);
-                __m512i max_gh   = _mm512_mask_blend_epi8(cmp_gh, h11, gscore);
-
-                tmp512_1 = _mm512_mask_blend_epi8(cmp, max_ie512, tmp512_1);
-                // exit0: 0xFF=alive; movepi8_mask takes the high bit => mask bit=1 where alive,
-                // so the following mask_blend selects the new value on alive lanes.
-                __mmask64 mex0 = _mm512_movepi8_mask(exit0);
-                tmp512_1 = _mm512_mask_blend_epi8(mex0, max_ie512, tmp512_1);
-
-                max_gh = _mm512_mask_blend_epi8(mex0, gscore, max_gh);
-                max_gh = _mm512_mask_blend_epi8(cmp, gscore, max_gh);
-
-                cmp = _mm512_cmpgt_epi8_mask(j512, tail512);
-                max_gh = _mm512_mask_blend_epi8(cmp, max_gh, gscore);
-                max_ie512 = _mm512_mask_blend_epi8(cmp, tmp512_1, max_ie512);
-                gscore = max_gh;
+                cmp = cmp & _mm512_movepi8_mask(exit0);
+                hqe512   = _mm512_mask_blend_epi8(cmp, hqe512, h11);
+                qfire512 = _mm512_mask_blend_epi8(cmp, qfire512, ff512);
             }
         }
         __mmask64 cmp1 = _mm512_cmpgt_epi8_mask(head512, j512);
@@ -3183,8 +3148,8 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
             int8_t  ms_a[SIMD_WIDTH8]       __attribute((aligned(64)));
             int8_t  rs_a[SIMD_WIDTH8]       __attribute((aligned(64)));
             int8_t  exit_a[SIMD_WIDTH8]     __attribute((aligned(64)));
-            int8_t  ie_mark_a[SIMD_WIDTH8]  __attribute((aligned(64)));
-            int8_t  gs_a[SIMD_WIDTH8]       __attribute((aligned(64)));
+            int8_t  qfire_a[SIMD_WIDTH8]    __attribute((aligned(64)));
+            int8_t  hqe_a[SIMD_WIDTH8]      __attribute((aligned(64)));
             // cmp/exit0 are mask registers here; materialize them as 0xFF/0x00
             // byte vectors so the wide scalar loop can branch on them.
             _mm512_store_si512((__m512i *) cmp_a,
@@ -3194,27 +3159,24 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
             _mm512_store_si512((__m512i *) ms_a, maxScore512);
             _mm512_store_si512((__m512i *) rs_a, maxRS1);
             _mm512_store_si512((__m512i *) exit_a, exit0);
-            _mm512_store_si512((__m512i *) ie_mark_a, max_ie512);
-            _mm512_store_si512((__m512i *) gs_a, gscore);
+            _mm512_store_si512((__m512i *) qfire_a, qfire512);
+            _mm512_store_si512((__m512i *) hqe_a, hqe512);
             for (int l = 0; l < SIMD_WIDTH8; l++) {
                 // best-score row
                 if (cmp_a[l]) xrow[l] = i + 1;
-                // best-gscore row: marker==1 means gscore was set this row
-                if (ie_mark_a[l] == 1) ierow[l] = i + 1;
-                // ABSOLUTE-FRAME score tracking: the 8-bit maxScore512/gscore are
-                // in the lane's CURRENT B[l] frame, so the absolute value is the
-                // rebaselined byte + B[l]. Re-derive both every row (cheap, O(rows))
-                // rather than trying to add B back once at the end (the recorded
-                // max may pre-date later B bumps). max() guards against the byte
-                // being re-baselined away in a later row.
+                // ABSOLUTE-FRAME score tracking: the 8-bit maxScore512 is in the
+                // lane's CURRENT B[l] frame; absolute = rebaselined byte + B[l].
                 {
                     int ms_abs = (int)(uint8_t)ms_a[l] + B[l];
                     if (ms_abs > best_abs[l]) best_abs[l] = ms_abs;
-                    // gscore init is -1 (0xFF as a byte); treat that as "unset".
-                    if ((uint8_t)gs_a[l] != 0xFF) {
-                        int gs_abs = (int)(uint8_t)gs_a[l] + B[l];
-                        if (gs_abs > gbest_abs[l]) gbest_abs[l] = gs_abs;
-                    }
+                }
+                // gscore (query-end score): qfire flags this lane reached its query
+                // end this row; hqe is the captured query-end cell H (byte, B[l]
+                // frame); absolute = byte + B[l]. Scalar's `>=` tie-break. See
+                // smithWaterman128_8.
+                if (qfire_a[l]) {
+                    int gs_abs = (int)(uint8_t)hqe_a[l] + B[l];
+                    if (gs_abs >= gbest_abs[l]) { gbest_abs[l] = gs_abs; ierow[l] = i + 1; }
                 }
                 // z-drop (only relevant where the lane is still alive). The drop
                 // is ms-rs of two bytes in the SAME B[l] frame, so the B cancels
@@ -3376,14 +3338,10 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
                 // maxRS1 for the triggering row, and maxRS1 >= REBASE_HI >
                 // REBASE_KEEP > delta, so it stays positive).
                 maxScore512 = _mm512_subs_epu8(maxScore512, delta512);
-                // gscore: keep the -1 (0xFF) "unset" sentinel intact, but lower
-                // set lanes (it is compared SIGNED against the rebaselined h11 in
-                // the gscore block, so it must track the same frame). Zero the
-                // delta for lanes whose gscore is still 0xFF.
-                __mmask64 gset = _mm512_cmpeq_epi8_mask(gscore, ff512); // 1 where gscore unset (0xFF)
-                // gdelta = delta only where gscore is set (mask off unset lanes).
-                __m512i gdelta = _mm512_maskz_mov_epi8(~gset, delta512);
-                gscore = _mm512_subs_epu8(gscore, gdelta);
+                // gscore no longer carries a rebaselined byte register: the
+                // query-end cell H is captured per row and accumulated wide
+                // (gbest_abs, absolute units) in the epilogue, immune to this
+                // re-baseline subtract.
             }
         }
 
@@ -5527,9 +5485,16 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
     __m128i two128    = _mm_set1_epi8(2);
     __m128i ff128     = _mm_set1_epi8(0xFF);
 
-    // gscore best-row marker lane: 1 == "this row updated gscore", 0 == earlier
-    // (the actual earlier row is carried in the wide ierow[] side channel).
-    __m128i max_ie128 = zero128;
+    // gscore (query-end score) capture, per row. The diagonal-offset 8-bit kernel
+    // CANNOT reconstruct gscore from the rebaselined byte state via the trimmed
+    // tail128: re-baselining saturates the off-diagonal query-end cells to 0 (they
+    // sit far below the row max), the band masking then trims them, and the gscore
+    // is lost. Instead, when a lane's band-grown band reaches the query end we
+    // capture that lane's query-end cell H (hqe128) and flag it (qfire128) here in
+    // the inner loop -- BEFORE this row's re-baseline -- and finalize a per-lane
+    // WIDE running gbest_abs / ierow in the epilogue (value = byte + B). Reset per row.
+    __m128i hqe128   = zero128;   // query-end cell H (rebaselined byte) this row
+    __m128i qfire128 = zero128;   // 0xFF where this lane reached its query end this row
 
     // Offset-frame band edges. head_off starts at 0 (col 0 - row 0); tail_off
     // starts saturated-high (+127) and is immediately clamped by the band-grow
@@ -5547,7 +5512,6 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
         _mm_store_si128((__m128i *)(F + j * SIMD_WIDTH8), zero128);
 
     __m128i y128 = zero128;   // best col as diagonal offset: col - i_at_capture (i_at_capture = xrow[l]-1)
-    __m128i gscore = _mm_set1_epi8(-1);
     __m128i max_off128 = zero128;
     __m128i exit0 = _mm_set1_epi8(0xFF);
     __m128i zdrop128 = _mm_set1_epi8(zdrop);
@@ -5580,9 +5544,9 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
 
         __m128i y1_128 = zero128;   // row-max column as diagonal offset (col - i)
 
-        // gscore best-row marker resets each row (the carried best row lives in
-        // the wide ierow[] side channel; this lane only flags "updated this row").
-        max_ie128 = zero128;
+        // gscore query-end capture resets each row.
+        hqe128   = zero128;
+        qfire128 = zero128;
 
         // Per-row diagonal-offset of the query end: qlen_off = qlen - i. Built
         // wide then saturated to int8, with a validity mask so an out-of-band
@@ -5720,33 +5684,32 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
 
             h10 = h11;
                         
-            // gscore calculations
+            // gscore query-end capture. Fire when (a) this column is the lane's
+            // query-end column -- (col - i) == (qlen - i) iff col == qlen-1 -- and
+            // qlen-i is in the representable in-band window (qlen_valid: qoff in
+            // [-w, w+1]), so the lane's band-grown band has reached the query end
+            // (== scalar's `end == qlen`), and (b) the lane is still alive at row
+            // start (exit0). We capture the raw h11 (rebaselined byte) here; the
+            // wide epilogue turns it into an absolute byte+B gscore that survives
+            // re-baselining. No dependence on the trimmed tail128 (which the
+            // off-diagonal query-end column is, by construction, often beyond).
             if (j >= minq)
             {
-                // SAFE query-end test: (col - i) == (qlen - i) iff col == qlen,
-                // but only when qlen-i is in-band (else the wrapped/saturated
-                // qlen_off could alias an in-band col offset). Gate with the
-                // validity mask so an out-of-band query end can never match.
+                // Fire exactly like the 16-bit tier (which is byte-identical to
+                // scalar): the query-end column is reached (j128 == qlen_off, i.e.
+                // col == qlen-1) AND the band-grown tail reaches the query end
+                // (tail128 == qlen_off -- scalar's `end == qlen`; tail128 is
+                // clamped to qlen_off at band-grow, so >= reduces to ==), AND the
+                // lane is alive (exit0). qlen_valid guards the wrapped/out-of-band
+                // qlen_off alias. Fires regardless of h11 (matches scalar's h1==0
+                // firing); the captured value is finalized wide (byte+B) in the
+                // epilogue so it survives re-baselining.
                 __m128i cmp = _mm_cmpeq_epi8(j128, qlen_off128);
+                cmp = _mm_and_si128(cmp, _mm_cmpeq_epi8(tail128, qlen_off128));
                 cmp = _mm_and_si128(cmp, qlen_valid128);
-                //__m128i max_gh = _mm_max_epi8(gscore, h11);      //epi8 not present, modif
-                __m128i cmp_gh = _mm_cmpgt_epi8(gscore, h11);
-                // Row marker: when h11 beats old gscore, flag "this row" (one128);
-                // otherwise keep the existing marker. The actual best row is
-                // captured into the wide ierow[] side channel in the epilogue.
-                __m128i tmp128_1 = _mm_blendv_epi8(one128, max_ie128, cmp_gh);
-                __m128i max_gh = _mm_blendv_epi8(h11, gscore, cmp_gh);
-
-                tmp128_1 = _mm_blendv_epi8(max_ie128, tmp128_1, cmp);
-                tmp128_1 = _mm_blendv_epi8(max_ie128, tmp128_1, exit0);
-
-                max_gh = _mm_blendv_epi8(gscore, max_gh, exit0);
-                max_gh = _mm_blendv_epi8(gscore, max_gh, cmp);
-
-                cmp = _mm_cmpgt_epi8(j128, tail128);
-                max_gh = _mm_blendv_epi8(max_gh, gscore, cmp);
-                max_ie128 = _mm_blendv_epi8(tmp128_1, max_ie128, cmp);
-                gscore = max_gh;
+                cmp = _mm_and_si128(cmp, exit0);
+                hqe128   = _mm_blendv_epi8(hqe128, h11, cmp);
+                qfire128 = _mm_blendv_epi8(qfire128, ff128, cmp);
             }
         }
         __m128i cmp1 = _mm_cmpgt_epi8(head128, j128);
@@ -5796,35 +5759,36 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
             int8_t  ms_a[SIMD_WIDTH8]       __attribute((aligned(16)));
             int8_t  rs_a[SIMD_WIDTH8]       __attribute((aligned(16)));
             int8_t  exit_a[SIMD_WIDTH8]     __attribute((aligned(16)));
-            int8_t  ie_mark_a[SIMD_WIDTH8]  __attribute((aligned(16)));
-            int8_t  gs_a[SIMD_WIDTH8]       __attribute((aligned(16)));
+            int8_t  qfire_a[SIMD_WIDTH8]    __attribute((aligned(16)));
+            int8_t  hqe_a[SIMD_WIDTH8]      __attribute((aligned(16)));
             _mm_store_si128((__m128i *) cmp_a, cmp);
             _mm_store_si128((__m128i *) y1_a, y1_128);
             _mm_store_si128((__m128i *) y_a, y128);
             _mm_store_si128((__m128i *) ms_a, maxScore128);
             _mm_store_si128((__m128i *) rs_a, maxRS1);
             _mm_store_si128((__m128i *) exit_a, exit0);
-            _mm_store_si128((__m128i *) ie_mark_a, max_ie128);
-            _mm_store_si128((__m128i *) gs_a, gscore);
+            _mm_store_si128((__m128i *) qfire_a, qfire128);
+            _mm_store_si128((__m128i *) hqe_a, hqe128);
             for (int l = 0; l < SIMD_WIDTH8; l++) {
                 // best-score row
                 if (cmp_a[l]) xrow[l] = i + 1;
-                // best-gscore row: marker==1 means gscore was set this row
-                if (ie_mark_a[l] == 1) ierow[l] = i + 1;
-                // ABSOLUTE-FRAME score tracking: the 8-bit maxScore128/gscore are
-                // in the lane's CURRENT B[l] frame, so the absolute value is the
-                // rebaselined byte + B[l]. Re-derive both every row (cheap, O(rows))
-                // rather than trying to add B back once at the end (the recorded
-                // max may pre-date later B bumps). max() guards against the byte
-                // being re-baselined away in a later row.
+                // ABSOLUTE-FRAME score tracking: the 8-bit maxScore128 is in the
+                // lane's CURRENT B[l] frame, so the absolute value is the
+                // rebaselined byte + B[l]. Re-derive every row (cheap, O(rows))
+                // rather than adding B back once at the end (the recorded max may
+                // pre-date later B bumps). max() guards against the byte being
+                // re-baselined away in a later row.
                 {
                     int ms_abs = (int)(uint8_t)ms_a[l] + B[l];
                     if (ms_abs > best_abs[l]) best_abs[l] = ms_abs;
-                    // gscore init is -1 (0xFF as a byte); treat that as "unset".
-                    if ((uint8_t)gs_a[l] != 0xFF) {
-                        int gs_abs = (int)(uint8_t)gs_a[l] + B[l];
-                        if (gs_abs > gbest_abs[l]) gbest_abs[l] = gs_abs;
-                    }
+                }
+                // gscore (query-end score): qfire flags that this lane reached its
+                // query end this row; hqe is the captured query-end cell H (byte,
+                // current B[l] frame). The absolute value is byte + B[l]. Scalar's
+                // tie-break updates on `>=` so the LAST max-achieving row wins gtle.
+                if (qfire_a[l]) {
+                    int gs_abs = (int)(uint8_t)hqe_a[l] + B[l];
+                    if (gs_abs >= gbest_abs[l]) { gbest_abs[l] = gs_abs; ierow[l] = i + 1; }
                 }
                 // z-drop (only relevant where the lane is still alive). The drop
                 // is ms-rs of two bytes in the SAME B[l] frame, so the B cancels
@@ -5992,13 +5956,10 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
                 // maxRS1 for the triggering row, and maxRS1 >= REBASE_HI >
                 // REBASE_KEEP > delta, so it stays positive).
                 maxScore128 = _mm_subs_epu8(maxScore128, delta128);
-                // gscore: keep the -1 (0xFF) "unset" sentinel intact, but lower
-                // set lanes (it is compared SIGNED against the rebaselined h11 in
-                // the gscore block, so it must track the same frame). Zero the
-                // delta for lanes whose gscore is still 0xFF.
-                __m128i gset = _mm_cmpeq_epi8(gscore, ff128);   // 0xFF where unset
-                __m128i gdelta = _mm_andnot_si128(gset, delta128);
-                gscore = _mm_subs_epu8(gscore, gdelta);
+                // gscore no longer carries a rebaselined byte register: the
+                // query-end cell H is captured per row and accumulated wide
+                // (gbest_abs, in absolute units) in the epilogue, so it is immune
+                // to this re-baseline subtract.
             }
         }
 
