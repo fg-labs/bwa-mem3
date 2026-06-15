@@ -52,12 +52,18 @@ extern meth_bam_writer_t *g_meth_bam_writer;
  * assembled user header text (-R read group and/or -H lines, '\n'-joined,
  * no trailing newline), or NULL — emitted verbatim after the @SQ block so a
  * -R read group lands as an @RG header, matching the default (non-meth)
- * writer. Returns NULL on failure. */
+ * writer. `orig_idx_hdr_lines` is the *original* (pre-c2t) reference's
+ * .hdr/.dict sidecar text, or NULL: its @SQ identity tags (M5/UR/AS/SP) are
+ * merged into the consolidated @SQ for each contig whose SN and LN both match
+ * (an LN mismatch means a stale/foreign sidecar and is skipped), and its
+ * @CO/@PG/@RG records are forwarded after @SQ; its @HD and @SQ lines are
+ * dropped. Returns NULL on failure. */
 meth_bam_writer_t *meth_bam_writer_open(const char *path_or_dash,
                                         meth_chrom_map_t *cmap,
                                         const char *bwa_pg,
                                         const char *meth_pg_cl,
                                         const char *hdr_line,
+                                        const char *orig_idx_hdr_lines,
                                         int compression_level);
 
 /* Write one bam1_t. Returns 0 on success, -1 on error. */

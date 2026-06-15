@@ -121,11 +121,109 @@ static int hdr_text_has_type(const char *s, const char *tag4)
     return strstr(s, needle) != NULL;
 }
 
+/* True if the tab-delimited @SQ `line` (length `line_len`) carries a token
+ * exactly equal to `key``val` (whole token, not a prefix) — e.g. key="SN:"
+ * val="<name>", or key="LN:" val="<decimal>". */
+static int sq_line_has_kv(const char *line, size_t line_len,
+                          const char *key, size_t key_len,
+                          const char *val, size_t val_len)
+{
+    const char *end = line + line_len;
+    const char *p = line + 3;                 /* "@SQ" -> first '\t' */
+    while (p < end) {
+        const char *tok = p + 1;              /* skip the '\t' */
+        const char *tok_end = (const char *)memchr(tok, '\t', (size_t)(end - tok));
+        if (tok_end == NULL) tok_end = end;
+        if ((size_t)(tok_end - tok) == key_len + val_len &&
+            strncmp(tok, key, key_len) == 0 &&
+            strncmp(tok + key_len, val, val_len) == 0)
+            return 1;
+        p = tok_end;
+    }
+    return 0;
+}
+
+/* Append to `out` the reference-identity tags (M5/UR/AS/SP) found on the @SQ
+ * line of `hdr_text` whose SN equals `sn`, each as "\t<TAG>:<value>". Used to
+ * enrich the consolidated --meth @SQ with identity tags from the *original*
+ * (pre-c2t) reference's .hdr/.dict sidecar, matched by SN. Enrichment is gated
+ * on the sidecar line's LN also equalling `expected_len` (the chrom-map
+ * length): a SN match with a differing LN means a stale or foreign sidecar
+ * whose M5/UR would misidentify the sequence, so nothing is appended in that
+ * case. Appends nothing if `hdr_text` is NULL/empty or has no matching @SQ.
+ * SN is unique in a valid header, so the first match wins. */
+static void meth_append_sq_extra_tags(const char *hdr_text, const char *sn,
+                                      int64_t expected_len, kstring_t *out)
+{
+    if (hdr_text == NULL || hdr_text[0] == '\0' || sn == NULL) return;
+    static const char *const WANT[] = { "M5:", "UR:", "AS:", "SP:" };
+    const int n_want = (int)(sizeof(WANT) / sizeof(WANT[0]));
+    const size_t sn_len = strlen(sn);
+    char ln_buf[32];
+    int ln_len = snprintf(ln_buf, sizeof(ln_buf), "%lld", (long long)expected_len);
+    if (ln_len <= 0 || (size_t)ln_len >= sizeof(ln_buf)) return;
+
+    const char *line = hdr_text;
+    while (*line != '\0') {
+        const char *eol = strchr(line, '\n');
+        size_t line_len = eol ? (size_t)(eol - line) : strlen(line);
+        if (line_len >= 4 && strncmp(line, "@SQ\t", 4) == 0 &&
+            sq_line_has_kv(line, line_len, "SN:", 3, sn, sn_len)) {
+            /* SN matched: only enrich when LN agrees, else the sidecar is
+             * stale/foreign and its identity tags can't be trusted. */
+            if (!sq_line_has_kv(line, line_len, "LN:", 3, ln_buf, (size_t)ln_len))
+                return;
+            const char *end = line + line_len;
+            const char *p = line + 3;
+            while (p < end) {
+                const char *tok = p + 1;
+                const char *tok_end = (const char *)memchr(tok, '\t', (size_t)(end - tok));
+                if (tok_end == NULL) tok_end = end;
+                for (int i = 0; i < n_want; ++i) {
+                    if ((size_t)(tok_end - tok) > 3 && strncmp(tok, WANT[i], 3) == 0) {
+                        kputc('\t', out);
+                        kputsn(tok, (int)(tok_end - tok), out);
+                        break;
+                    }
+                }
+                p = tok_end;
+            }
+            return;                           /* SN is unique; first match wins */
+        }
+        if (eol == NULL) break;
+        line = eol + 1;
+    }
+}
+
+/* Append to `out` every record line of `hdr_text` that is NOT @HD or @SQ
+ * (i.e. @CO/@PG/@RG and any others), each terminated by '\n'. @SQ is skipped
+ * because the consolidated @SQ block is authoritative (its identity tags are
+ * merged separately by meth_append_sq_extra_tags); @HD is skipped because the
+ * writer emits its own. */
+static void meth_append_passthrough_records(const char *hdr_text, kstring_t *out)
+{
+    if (hdr_text == NULL) return;
+    const char *line = hdr_text;
+    while (*line != '\0') {
+        const char *eol = strchr(line, '\n');
+        size_t line_len = eol ? (size_t)(eol - line) : strlen(line);
+        int skip = (line_len >= 4 && (strncmp(line, "@HD\t", 4) == 0 ||
+                                      strncmp(line, "@SQ\t", 4) == 0));
+        if (!skip && line_len > 0) {
+            kputsn(line, (int)line_len, out);
+            kputc('\n', out);
+        }
+        if (eol == NULL) break;
+        line = eol + 1;
+    }
+}
+
 meth_bam_writer_t *meth_bam_writer_open(const char *path_or_dash,
                                         meth_chrom_map_t *cmap,
                                         const char *bwa_pg,
                                         const char *meth_pg_cl,
                                         const char *hdr_line,
+                                        const char *orig_idx_hdr_lines,
                                         int compression_level)
 {
     if (path_or_dash == NULL || cmap == NULL) return NULL;
@@ -148,35 +246,48 @@ meth_bam_writer_t *meth_bam_writer_open(const char *path_or_dash,
     if (!hdr_text_has_type(hdr_line, "@HD\t") &&
         sam_hdr_add_line(w->hdr, "HD", "VN", "1.6", "SO", "unsorted", NULL) < 0) goto fail;
 
-    /* @SQ from consolidated chrom map */
+    /* @SQ from the consolidated chrom map, enriched by SN with the original
+     * reference's identity tags (M5/UR/AS/SP) from its .hdr/.dict sidecar when
+     * available. SN/LN come from the cmap (authoritative for --meth); the
+     * extra tags are appended verbatim. The consolidated output SN/LN equal
+     * the original reference's contig SN/LN (the c2t build only doubles into
+     * f/r-prefixed contigs and C->T conversion is length-preserving), so the
+     * original sidecar's @SQ matches by SN. */
     for (int i = 0; i < cmap->n_output; ++i) {
-        char len_buf[32];
-        snprintf(len_buf, sizeof(len_buf), "%lld", (long long)cmap->output_lens[i]);
-        if (sam_hdr_add_line(w->hdr, "SQ",
-                             "SN", cmap->output_names[i],
-                             "LN", len_buf,
-                             NULL) < 0) goto fail;
+        kstring_t sq = {0, 0, NULL};
+        ksprintf(&sq, "@SQ\tSN:%s\tLN:%lld",
+                 cmap->output_names[i], (long long)cmap->output_lens[i]);
+        meth_append_sq_extra_tags(orig_idx_hdr_lines, cmap->output_names[i],
+                                  cmap->output_lens[i], &sq);
+        int rc = (sq.s != NULL) ? sam_hdr_add_lines(w->hdr, sq.s, sq.l) : -1;
+        free(sq.s);
+        if (rc < 0) goto fail;
     }
 
-    /* User header text (-R read group, -H lines). Emitted after @SQ and
-     * before the @PG lines, matching the default writer's precedence so a
-     * -R read group becomes an @RG header that the per-record RG:Z tags
-     * (stamped from bwa_rg_id below) actually reference. The consolidated
-     * @SQ above is authoritative for --meth, so a user -H that re-supplies
-     * @SQ for an already-emitted contig will make htslib reject the add and
-     * the open fails loudly rather than emitting duplicate references.
-     *
-     * Note: unlike bam_writer_open (the default path), the index's .hdr/.dict
-     * sidecar records (idx_hdr_lines) are deliberately NOT forwarded here. In
-     * --meth mode the index prefix is the c2t-converted reference (fastmap.cpp
-     * rewrites ref_prefix to ".bwameth.c2t" before loading the sidecar), so
-     * that sidecar describes the doubled f/r converted contigs: its @SQ is
-     * unusable and its @CO/@PG describe the internal conversion artifact, not
-     * the user's reference. The correct way to carry real reference metadata
-     * (@SQ M5/UR tags, @CO/@PG) into --meth output is to load the *original*
-     * (pre-c2t) reference's sidecar and merge it by SN into the consolidated
-     * @SQ -- left as a follow-up; see the matching note at the call site in
-     * main_mem (fastmap.cpp). */
+    /* Original reference's non-@HD/@SQ sidecar records (@CO/@PG/@RG),
+     * forwarded after @SQ and before the user header — mirroring the index
+     * tier of bam_writer_open's precedence (index > default, below user). Its
+     * @SQ is consumed into the enriched consolidated block above and its @HD
+     * is the writer's own, so both are dropped here. `orig_idx_hdr_lines` is
+     * loaded from the *original* (pre-c2t) reference prefix by main_mem; the
+     * c2t index's own sidecar (which describes the doubled f/r converted
+     * contigs) is never consulted. */
+    if (orig_idx_hdr_lines != NULL && orig_idx_hdr_lines[0] != '\0') {
+        kstring_t pt = {0, 0, NULL};
+        meth_append_passthrough_records(orig_idx_hdr_lines, &pt);
+        int rc = (pt.l > 0) ? sam_hdr_add_lines(w->hdr, pt.s, pt.l) : 0;
+        free(pt.s);
+        if (rc < 0) goto fail;
+    }
+
+    /* User header text (-R read group, -H lines). Emitted after @SQ and the
+     * forwarded sidecar records, before the @PG lines, matching the default
+     * writer's precedence (user > index > default) so a -R read group becomes
+     * an @RG header that the per-record RG:Z tags (stamped from bwa_rg_id
+     * below) actually reference. The consolidated @SQ above is authoritative
+     * for --meth, so a user -H that re-supplies @SQ for an already-emitted
+     * contig will make htslib reject the add and the open fails loudly rather
+     * than emitting duplicate references. */
     if (hdr_line != NULL && hdr_line[0] != '\0' &&
         sam_hdr_add_lines(w->hdr, hdr_line, 0) < 0) goto fail;
 
