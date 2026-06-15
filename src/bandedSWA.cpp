@@ -937,7 +937,7 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
     //
     // NB: scores must stay in the SIGNED-positive byte range [0,127]. The DP
     // recurrence floors cells with `m11 & (m11 > 0)` (signed _mm256_cmpgt_epi8) and
-    // the row/global-max trackers (maxRS1, maxScore256, gscore) compare scores
+    // the row/global-max trackers (maxRS1, maxScore256) compare scores
     // with SIGNED _mm256_cmpgt_epi8 — all of which mis-read a byte >= 128 as
     // negative. So we re-baseline within [0,127], not [0,255].
     //
@@ -1003,7 +1003,7 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
         B[l]        = B0[l];   // start the floor at B0 so byte state = abs - B0
         best_abs[l] = p[l].h0; // maxScore256 inits to the h0 seed; record the
                                // ABSOLUTE seed score (wide), not the rebaselined byte
-        gbest_abs[l]= -1;      // matches the int8 gscore init (-1) in absolute units
+        gbest_abs[l]= -1;      // unset sentinel (-1): gscore=-1 / gtle=0 when no query end is reached, matching scalar
         if (p[l].len2 < minq) minq = p[l].len2;
     }
     minq -= 1; // for gscore
@@ -2825,7 +2825,7 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
     //
     // NB: scores must stay in the SIGNED-positive byte range [0,127]. The DP
     // recurrence floors cells with cmpeq(h00,0) and the row/global-max trackers
-    // (maxRS1, maxScore512, gscore) compare scores with SIGNED
+    // (maxRS1, maxScore512) compare scores with SIGNED
     // _mm512_cmpgt_epi8_mask — all of which mis-read a byte >= 128 as negative.
     // So we re-baseline within [0,127], not [0,255].
     //
@@ -2891,7 +2891,7 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
         B[l]        = B0[l];   // start the floor at B0 so byte state = abs - B0
         best_abs[l] = p[l].h0; // maxScore512 inits to the h0 seed; record the
                                // ABSOLUTE seed score (wide), not the rebaselined byte
-        gbest_abs[l]= -1;      // matches the int8 gscore init (-1) in absolute units
+        gbest_abs[l]= -1;      // unset sentinel (-1): gscore=-1 / gtle=0 when no query end is reached, matching scalar
         if (p[l].len2 < minq) minq = p[l].len2;
     }
     minq -= 1; // for gscore
@@ -5408,7 +5408,7 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
     //
     // NB: scores must stay in the SIGNED-positive byte range [0,127]. The DP
     // recurrence floors cells with `m11 & (m11 > 0)` (signed _mm_cmpgt_epi8) and
-    // the row/global-max trackers (maxRS1, maxScore128, gscore) compare scores
+    // the row/global-max trackers (maxRS1, maxScore128) compare scores
     // with SIGNED _mm_cmpgt_epi8 — all of which mis-read a byte >= 128 as
     // negative. So we re-baseline within [0,127], not [0,255].
     //
@@ -5474,7 +5474,7 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
         B[l]        = B0[l];   // start the floor at B0 so byte state = abs - B0
         best_abs[l] = p[l].h0; // maxScore128 inits to the h0 seed; record the
                                // ABSOLUTE seed score (wide), not the rebaselined byte
-        gbest_abs[l]= -1;      // matches the int8 gscore init (-1) in absolute units
+        gbest_abs[l]= -1;      // unset sentinel (-1): gscore=-1 / gtle=0 when no query end is reached, matching scalar
         if (p[l].len2 < minq) minq = p[l].len2;
     }
     minq -= 1; // for gscore

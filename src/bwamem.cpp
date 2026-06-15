@@ -119,6 +119,18 @@ KSORT_INIT(mem_intv1, SMEM, intv_lt1)  // debug
 static inline int bsw8_envelope_ok(int len1, int len2, int w,
                                    int score_a, int zdrop)
 {
+    /* Dev A/B hook: BWAMEM3_DISABLE_BSW8=1 forces every pair off the 8-bit path
+     * onto the 16-bit (then scalar) buckets. Used to validate that the 8-bit
+     * kernel is byte-identical to the 16-bit reference in the full pipeline
+     * (diff the SAM with vs without). Off by default. The function-local static
+     * with a non-trivial initializer gets C++11 thread-safe one-time init, so the
+     * getenv runs exactly once even under the OpenMP/pthread worker fan-out (a
+     * plain `static int x = -1; if (x<0) x = ...;` would be a data race). */
+    static const int disable = []() {
+        const char *e = getenv("BWAMEM3_DISABLE_BSW8");
+        return (e && atoi(e)) ? 1 : 0;
+    }();
+    if (disable) return 0;
     int max_step = score_a > 1 ? score_a : 1;   /* max(w_match, w_ambig, 1) */
     return len1 < MAX_SEQ_LEN8 && len2 < MAX_SEQ_LEN8 &&
            /* target (rows, len1) >= query (cols, len2). The re-baseline 8-bit
