@@ -13,7 +13,7 @@ Options:
     -c INT        skip seeds with more than INT occurrences [500]
     -D FLOAT      drop chains shorter than FLOAT fraction of the longest overlapping chain [0.50]
     -W INT        discard a chain if seeded bases shorter than INT [0]
-    -m INT        perform at most INT rounds of mate rescues for each read [50]
+    -m INT        perform at most INT rounds of mate rescues for each read [10]
     -S            skip mate rescue
     -P            skip pairing; mate rescue performed unless -S also in use
 Scoring options:

@@ -27,7 +27,8 @@ bwa mem -t 4 "$BWA_CHR22_FA" \
     "$CHR22_SIM_DIR/reads.r2.fastq.gz" \
     > "$CHR22_SIM_DIR/bwa.sam" 2>"$CHR22_SIM_DIR/bwa.log"
 
-"$BWA_MEM3" mem -t 4 "$CHR22_FA" \
+# pin to bwa's default max_matesw so parity is independent of bwa-mem3's lowered default
+"$BWA_MEM3" mem -t 4 -m 50 "$CHR22_FA" \
     "$CHR22_SIM_DIR/reads.r1.fastq.gz" \
     "$CHR22_SIM_DIR/reads.r2.fastq.gz" \
     > "$CHR22_SIM_DIR/bwamem3.sam" 2>"$CHR22_SIM_DIR/bwamem3.log"
