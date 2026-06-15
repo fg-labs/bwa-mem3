@@ -42,9 +42,16 @@ speed/accuracy trade-off. Current recommended deviations:
 | flag | default (drop-in) | recommended | effect |
 |---|---|---|---|
 | `-m` (mate-rescue depth) | 50 | **10** | ~11–22% less alignment CPU; near-neutral accuracy (see below) |
+| `-s` (Pass-2 re-seed width), **`--meth` only** | 10 | **0** | ~20% less alignment CPU; near-neutral accuracy (see below) |
 
 This table will grow as we benchmark additional tunings; each entry is gated on the same
 "measurably faster, near-neutral accuracy" bar.
+
+For a bisulfite (`--meth`) pipeline the recommended invocation is therefore:
+
+```bash
+bwa-mem3 mem -t <N> --meth -m 10 -s 0 ref.fa R1.fq R2.fq > out.sam
+```
 
 ## Why we recommend `-m 10`
 
@@ -80,6 +87,46 @@ against golden truth.
 Numbers are from [bwa-mem3-bench](../related-projects/bwa-mem3-bench.md) on 5 M-read real datasets
 plus a multi-contig holodeck golden-truth ablation; consult the bench for methodology and current
 figures.
+
+## Why we recommend `-s 0` under `--meth`
+
+`-s` controls bwa-mem's Pass-2 "re-seeding" — after the first seeding pass, long super-maximal exact
+matches whose occurrence count is `≤ -s` are re-seeded from their midpoint to recover shorter, more
+frequent matches that a long seed would otherwise swallow. Under `--meth`, reads are projected into a
+3-letter alphabet (C→T and G→A), which collapses sequence complexity: in that space Pass-2 mostly
+mines low-complexity sub-seeds that inflate the candidate set without changing placement. Setting
+`-s 0` disables Pass-2 entirely (an exact seed's interval size is always ≥ 1, so the re-seed gate
+never fires). This is **methylation-specific** — in the full 4-letter alphabet Pass-2 still earns its
+keep, so the recommendation is scoped to `--meth`.
+
+**Placement is a measured wash, even where re-seeding should matter most.** We aligned ~33 M
+holodeck em-seq golden-truth reads with `-s 0` vs the `-s 10` default across two references —
+single-contig chr22 and a deliberately hard multi-contig build (chr19–22 + their ALT scaffolds +
+decoys + HLA, 2,977 contigs) that stresses cross-contig multi-mapping. In both regimes the net
+true-recall difference is **within noise**:
+
+| reference (10 seeds) | records | net recall Δ (`-s 0` − `-s 10`) | significance |
+|---|---:|---:|---|
+| single-contig chr22 | 16.9 M | −22 (−0.0001%) | McNemar p = 0.87 |
+| multi-contig (ALT/decoy/HLA) | 16.4 M | −453 (−0.0028%) | McNemar p = 0.23 |
+
+The direction (a sub-0.003% loss concentrated in the low-MAPQ cross-contig tail) mirrors `-m 10`'s,
+and `-s 0` is *not* the same as disabling all seeding — it only removes the redundant second pass.
+
+**The one caveat is mapping-quality calibration.** Removing Pass-2 shrinks the candidate set, so MAPQ
+trends upward (≈95% of changed reads). On easy references this is benign re-distribution; in the hard
+multi-contig regime the dominant high-confidence bin (MAPQ 50–60, ~84% of reads) stays *identically*
+calibrated (0.020% mis-placement either way), but the small mid-MAPQ bins (~3% of reads) are modestly
+to ~2× more error-prone at a given reported MAPQ under `-s 0`. This is negligible for methylation
+quantification but worth knowing for callers that hard-filter on MAPQ in repetitive regions.
+
+**In exchange, seeding is ~20% cheaper.** On chr22 (single thread, best-of-5): alignment user-CPU
+**−19.7%** (12.96 s vs 16.14 s) and peak RSS **−6.5%**, with the gain largest on high-depth and
+repetitive inputs where the redundant Pass-2 candidate set is largest.
+
+A selective fallback — skip Pass-2 globally but re-seed only low-confidence reads — was evaluated and
+**does not help**: in the multi-contig regime it would re-seed ~13% of reads yet recovers about as
+many placements as it sacrifices (net within noise), so there is no cheap middle ground.
 
 ## Speed: drop-in and recommended
 
