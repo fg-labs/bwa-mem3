@@ -28,6 +28,7 @@
 
 # Best Practices
 
+- [Settings profiles: bwa drop-in vs recommended](best-practices/settings-profiles.md)
 - [Build](best-practices/build.md)
 - [Output format](best-practices/output-format.md)
 - [Multi-sample workflows](best-practices/multi-sample.md)
