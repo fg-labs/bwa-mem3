@@ -366,7 +366,7 @@ void FMI_search::load_index()
 }
 
 void FMI_search::getSMEMsOnePosOneThread(uint8_t *enc_qdb,
-                                         int16_t *query_pos_array,
+                                         int32_t *query_pos_array,
                                          int32_t *min_intv_array,
                                          int32_t *rid_array,
                                          int32_t numReads,
@@ -592,13 +592,13 @@ struct FMI_search::BatchSlot {
     // Input identity — copied at init, never mutated thereafter.
     int32_t input_idx;           // index into the caller's input arrays
     int32_t rid;                 // rid_array[input_idx]
-    int16_t start_pos;           // query_pos_array[input_idx] (saved for bwd init)
+    int32_t start_pos;           // query_pos_array[input_idx] (saved for bwd init)
     int32_t min_intv;            // min_intv_array[input_idx]
     int32_t readlength;          // seq_[rid].l_seq
     int32_t offset;              // query_cum_len_ar[rid]
 
     // Output for query_pos_array[input_idx] write-back at flush time.
-    int16_t next_x;
+    int32_t next_x;
 
     // Walk state (mirrors scalar locals).
     SMEM smem;                   // current SA interval
@@ -653,7 +653,7 @@ void FMI_search::ls_prefetch_cp_occ_t1(const BatchSlot *s)
 //                      we match that (zero matches emitted, ready to flush).
 void FMI_search::ls_init_slot(BatchSlot *s,
                               int32_t input_idx,
-                              const int16_t *query_pos_array,
+                              const int32_t *query_pos_array,
                               const int32_t *min_intv_array,
                               const int32_t *rid_array,
                               const bseq1_t *seq_,
@@ -858,7 +858,7 @@ void FMI_search::getSMEMsAllPosOneThread(uint8_t *enc_qdb,
                                          SMEM *matchArray,
                                          int64_t *__numTotalSmem)
 {
-    int16_t *query_pos_array = (int16_t *)_mm_malloc(numReads * sizeof(int16_t), 64);
+    int32_t *query_pos_array = (int32_t *)_mm_malloc(numReads * sizeof(int32_t), 64);
 
     int32_t i;
     for(i = 0; i < numReads; i++)
@@ -916,7 +916,7 @@ void FMI_search::getSMEMsAllPosOneThread(uint8_t *enc_qdb,
 }
 
 void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
-                                                   int16_t *query_pos_array,
+                                                   int32_t *query_pos_array,
                                                    int32_t *min_intv_array,
                                                    int32_t *rid_array,
                                                    int32_t numReads,
@@ -1077,7 +1077,7 @@ int64_t FMI_search::bwtSeedStrategyAllPosOneThread(uint8_t *enc_qdb,
     for(i = 0; i < numReads; i++)
     {
         int readlength = seq_[i].l_seq;
-        int16_t x = 0;
+        int32_t x = 0;
         while(x < readlength)
         {
             int next_x = x + 1;

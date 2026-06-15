@@ -119,6 +119,45 @@ for LEN_FQ in long_read_300bp long_read_1kbp long_read_3kbp; do
 done
 
 
+# --- ultra-long-read crash regression (read length > INT16_MAX) -----------
+# Pre-fix, read positions in the SMEM seeding path were int16_t:
+# query_pos_array (FMI_search getSMEMsAllPos/OnePos/lockstep + caller's
+# mmc->query_pos_ar), BatchSlot.start_pos/next_x, and the walk index `x`
+# in bwtSeedStrategyAllPosOneThread. For a read longer than INT16_MAX
+# (32767) bp the position incremented past 32767 and wrapped negative, so
+# the re-seed loops (`while (x < readlength)` and the getSMEMsAllPos
+# do/while) never advanced past the wrap point. They emitted SMEMs without
+# bound until matchArray overran -> heap corruption / SIGSEGV. The
+# 300bp-3kbp cases above all stay under 32767 and never exposed it; phiX
+# (~5 kb) is too small to host the alignment, so use the checked-in 1 Mb
+# synthetic reference and a 40 kb read sliced from it.
+SYN="$FIXTURES/synthetic_1mb.fa"
+if [[ ! -s "$SYN.bwt.2bit.64" || ! -s "$SYN.0123" || ! -s "$SYN.amb" || \
+      ! -s "$SYN.ann"         || ! -s "$SYN.pac" ]]; then
+    "$BWAMEM3" index "$SYN" >/dev/null 2>&1 || fail "bwa-mem3 index on synthetic_1mb.fa failed"
+fi
+# Slice a 40 kb read (> 32767) from the middle of the reference so it maps
+# back cleanly. Derived at run time rather than committed as a fixture.
+ULTRALONG_FA="$(mktemp "$HERE/.ultralong_40kbp.XXXXXX.fa")"
+# Append to (don't replace) the EXIT trap installed earlier so the temp FASTA
+# is removed on early failure or in parallel runs, not just on success.
+trap 'rm -f "$OUT_FILE" "$FKSW" "$HEADER_OUT" "$ULTRALONG_FA"' EXIT
+awk 'NR==1 && /^>/ {next} {seq = seq $0}
+     END { print ">ultralong_40kbp"; print substr(seq, 100001, 40000) }' \
+    "$SYN" > "$ULTRALONG_FA"
+LR_LEN="$(awk 'NR==2 {print length($0)}' "$ULTRALONG_FA")"
+[[ "$LR_LEN" -gt 32767 ]] || fail "ultralong fixture is ${LR_LEN}bp, need > 32767 (INT16_MAX)"
+RAW="$("$BWAMEM3" mem "$SYN" "$ULTRALONG_FA" 2>/dev/null)" \
+    || fail "bwa-mem3 mem ultralong ${LR_LEN}bp: non-zero exit (int16 position-overflow regression)"
+OUT="$(printf '%s\n' "$RAW" | grep -v '^@' || true)"
+[[ -n "$OUT" ]] || fail "bwa-mem3 mem ultralong: no SAM records emitted"
+# The primary record (flag < 256, not 4=unmapped) must align.
+PRIMARY_MAPPED="$(echo "$OUT" | awk '$2 < 256 && $2 != 4 {c++} END {print c+0}')"
+[[ "$PRIMARY_MAPPED" -ge 1 ]] || fail "bwa-mem3 mem ultralong ${LR_LEN}bp: primary read unmapped"
+rm -f "$ULTRALONG_FA"   # cleaned here on success; EXIT trap covers early-failure paths
+ok "bwa-mem3 mem ultralong ${LR_LEN}bp (> 32767, mapped)"
+
+
 # --- interleaved -p mode regression --------------------------------------
 # Bugs covered:
 #  - Empty/zero-length-read batches (which a malformed FASTQ that bseq parses

@@ -153,7 +153,7 @@ class FMI_search: public indexEle
 
     /* matchArray must hold at least numReads * max_readlength SMEMs (caller-sized). */
     void getSMEMsOnePosOneThread(uint8_t *enc_qdb,
-                                 int16_t *query_pos_array,
+                                 int32_t *query_pos_array,
                                  int32_t *min_intv_array,
                                  int32_t *rid_array,
                                  int32_t numReads,
@@ -174,7 +174,7 @@ class FMI_search: public indexEle
      * buffers flushed by input-index cursor.
      * matchArray must hold at least numReads * max_readlength SMEMs (caller-sized). */
     void getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
-                                          int16_t *query_pos_array,
+                                          int32_t *query_pos_array,
                                           int32_t *min_intv_array,
                                           int32_t *rid_array,
                                           int32_t numReads,
@@ -300,7 +300,7 @@ private:
     struct BatchSlot;
 
     void ls_init_slot(BatchSlot *s, int32_t input_idx,
-                      const int16_t *query_pos_array,
+                      const int32_t *query_pos_array,
                       const int32_t *min_intv_array,
                       const int32_t *rid_array,
                       const bseq1_t *seq_,

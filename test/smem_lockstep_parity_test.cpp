@@ -49,7 +49,7 @@ static bool run_case(FMI_search *fmi,
                      int32_t max_readlength,
                      int32_t minSeedLen,
                      uint8_t *enc_qdb,
-                     int16_t *query_pos_array_in,
+                     int32_t *query_pos_array_in,
                      int32_t *min_intv_array_in,
                      int32_t *rid_array_in,
                      const bseq1_t *seq_,
@@ -62,14 +62,22 @@ static bool run_case(FMI_search *fmi,
     SMEM *scalar_out   = (SMEM *)_mm_malloc(max_out * sizeof(SMEM), 64);
     SMEM *lockstep_out = (SMEM *)_mm_malloc(max_out * sizeof(SMEM), 64);
 
-    int16_t *qpa_s = (int16_t *)malloc(numReads * sizeof(int16_t));
-    int16_t *qpa_l = (int16_t *)malloc(numReads * sizeof(int16_t));
+    int32_t *qpa_s = (int32_t *)malloc(numReads * sizeof(int32_t));
+    int32_t *qpa_l = (int32_t *)malloc(numReads * sizeof(int32_t));
     int32_t *mia_s = (int32_t *)malloc(numReads * sizeof(int32_t));
     int32_t *mia_l = (int32_t *)malloc(numReads * sizeof(int32_t));
     int32_t *rid_s = (int32_t *)malloc(numReads * sizeof(int32_t));
     int32_t *rid_l = (int32_t *)malloc(numReads * sizeof(int32_t));
-    memcpy(qpa_s, query_pos_array_in, numReads * sizeof(int16_t));
-    memcpy(qpa_l, query_pos_array_in, numReads * sizeof(int16_t));
+    if (!qpa_s || !qpa_l || !mia_s || !mia_l || !rid_s || !rid_l) {
+        fprintf(stderr, "[FAIL] %s: allocation failed\n", case_name);
+        _mm_free(scalar_out);
+        _mm_free(lockstep_out);
+        free(qpa_s); free(qpa_l); free(mia_s); free(mia_l); free(rid_s); free(rid_l);
+        total_cases++;
+        return false;
+    }
+    memcpy(qpa_s, query_pos_array_in, numReads * sizeof(int32_t));
+    memcpy(qpa_l, query_pos_array_in, numReads * sizeof(int32_t));
     memcpy(mia_s, min_intv_array_in, numReads * sizeof(int32_t));
     memcpy(mia_l, min_intv_array_in, numReads * sizeof(int32_t));
     memcpy(rid_s, rid_array_in, numReads * sizeof(int32_t));
@@ -108,7 +116,7 @@ static bool run_case(FMI_search *fmi,
                     a.rid, a.m, a.n, (long long)a.k, (long long)a.l, (long long)a.s,
                     b.rid, b.m, b.n, (long long)b.k, (long long)b.l, (long long)b.s);
             ok = false;
-        } else if (memcmp(qpa_s, qpa_l, numReads * sizeof(int16_t)) != 0) {
+        } else if (memcmp(qpa_s, qpa_l, numReads * sizeof(int32_t)) != 0) {
             fprintf(stderr, "[FAIL] %s: query_pos_array write-back differs\n", case_name);
             ok = false;
         } else {
@@ -179,7 +187,7 @@ int main(int argc, char *argv[]) {
         int32_t max_readlength = 32;
         uint8_t *enc_qdb; bseq1_t *seq_; int32_t *cum_len;
         encode_reads(reads, numReads, &enc_qdb, &seq_, &cum_len);
-        int16_t qpa[] = {0, 0};
+        int32_t qpa[] = {0, 0};
         int32_t mia[] = {1, 1};
         int32_t rid[] = {0, 1};
         run_case(fmi, "Case 1: two simple reads",
@@ -200,7 +208,7 @@ int main(int argc, char *argv[]) {
         int32_t max_readlength = 40;
         uint8_t *enc_qdb; bseq1_t *seq_; int32_t *cum_len;
         encode_reads(reads, numReads, &enc_qdb, &seq_, &cum_len);
-        int16_t qpa[] = {0, 0};
+        int32_t qpa[] = {0, 0};
         int32_t mia[] = {1, 1};
         int32_t rid[] = {0, 1};
         run_case(fmi, "Case 2: numReads < N",
@@ -223,7 +231,7 @@ int main(int argc, char *argv[]) {
         int32_t max_readlength = 32;
         uint8_t *enc_qdb; bseq1_t *seq_; int32_t *cum_len;
         encode_reads(reads, numReads, &enc_qdb, &seq_, &cum_len);
-        int16_t qpa[] = {0, 0, 0, 0};
+        int32_t qpa[] = {0, 0, 0, 0};
         int32_t mia[] = {1, 1, 1, 1};
         int32_t rid[] = {0, 1, 2, 3};
         run_case(fmi, "Case 3: numReads == N",
@@ -246,7 +254,7 @@ int main(int argc, char *argv[]) {
         int32_t max_readlength = 32;
         uint8_t *enc_qdb; bseq1_t *seq_; int32_t *cum_len;
         encode_reads(reads, numReads, &enc_qdb, &seq_, &cum_len);
-        int16_t qpa[] = {0, 0, 0, 0, 0};
+        int32_t qpa[] = {0, 0, 0, 0, 0};
         int32_t mia[] = {1, 1, 1, 1, 1};
         int32_t rid[] = {0, 1, 2, 3, 4};
         run_case(fmi, "Case 4: numReads == N+1",
@@ -271,7 +279,7 @@ int main(int argc, char *argv[]) {
         int32_t max_readlength = 32;
         uint8_t *enc_qdb; bseq1_t *seq_; int32_t *cum_len;
         encode_reads(reads, numReads, &enc_qdb, &seq_, &cum_len);
-        int16_t qpa[] = {0, 0, 0, 0};
+        int32_t qpa[] = {0, 0, 0, 0};
         int32_t mia[] = {1, 1, 1, 1};
         int32_t rid[] = {0, 1, 2, 3};
         run_case(fmi, "Case 5: first base non-ACGT",
@@ -299,7 +307,7 @@ int main(int argc, char *argv[]) {
         int32_t max_readlength = 32;
         uint8_t *enc_qdb; bseq1_t *seq_; int32_t *cum_len;
         encode_reads(reads, numReads, &enc_qdb, &seq_, &cum_len);
-        int16_t qpa[] = {0, 0, 0, 0, 0, 0, 0};
+        int32_t qpa[] = {0, 0, 0, 0, 0, 0, 0};
         int32_t mia[] = {1, 1, 1, 1, 1, 1, 1};
         int32_t rid[] = {0, 1, 2, 3, 4, 5, 6};
         run_case(fmi, "Case 6: numReads not divisible by N",
@@ -324,7 +332,7 @@ int main(int argc, char *argv[]) {
         int32_t max_readlength = 32;
         uint8_t *enc_qdb; bseq1_t *seq_; int32_t *cum_len;
         encode_reads(reads, numReads, &enc_qdb, &seq_, &cum_len);
-        int16_t qpa[] = {5, 10, 0, 15};   /* mixed start positions */
+        int32_t qpa[] = {5, 10, 0, 15};   /* mixed start positions */
         int32_t mia[] = {1, 1, 1, 1};
         int32_t rid[] = {0, 1, 2, 3};
         run_case(fmi, "Case 7: mixed start_pos",
@@ -358,7 +366,7 @@ int main(int argc, char *argv[]) {
         int32_t max_readlength = 300;
         uint8_t *enc_qdb; bseq1_t *seq_; int32_t *cum_len;
         encode_reads(reads, numReads, &enc_qdb, &seq_, &cum_len);
-        int16_t qpa[] = {0, 0};
+        int32_t qpa[] = {0, 0};
         int32_t mia[] = {1, 1};
         int32_t rid[] = {0, 1};
         run_case(fmi, "Case 8: real 300bp SRR6109255.100035",
@@ -409,7 +417,7 @@ int main(int argc, char *argv[]) {
          * structure changes in production, update both drivers here to match. */
         /* Scalar outer driver. */
         int64_t n_s = 0;
-        int16_t qpa_s[2] = {0, 0};
+        int32_t qpa_s[2] = {0, 0};
         {
             int32_t rid_work[2] = {0, 1};
             int32_t mia_work[2] = {1, 1};
@@ -435,7 +443,7 @@ int main(int argc, char *argv[]) {
 
         /* Lockstep outer driver. */
         int64_t n_l = 0;
-        int16_t qpa_l[2] = {0, 0};
+        int32_t qpa_l[2] = {0, 0};
         {
             int32_t rid_work[2] = {0, 1};
             int32_t mia_work[2] = {1, 1};
@@ -509,7 +517,7 @@ int main(int argc, char *argv[]) {
         encode_reads(reads, numReads, &enc_qdb, &seq_, &cum_len);
         /* Start mid-read (past adapter) and use a large min_intv so the
          * forward walk will terminate via the newSmem.s < min_intv branch. */
-        int16_t qpa[] = {100, 100};
+        int32_t qpa[] = {100, 100};
         int32_t mia[] = {1000, 1000};
         int32_t rid[] = {0, 1};
         run_case(fmi, "Case 10: forward-ext min_intv break",
@@ -538,7 +546,7 @@ int main(int argc, char *argv[]) {
         int32_t max_readlength = 1500;
         uint8_t *enc_qdb; bseq1_t *seq_; int32_t *cum_len;
         encode_reads(reads, numReads, &enc_qdb, &seq_, &cum_len);
-        int16_t qpa[] = {0, 0};
+        int32_t qpa[] = {0, 0};
         int32_t mia[] = {1, 1};
         int32_t rid[] = {0, 1};
         run_case(fmi, "Case 11: long reads (1000bp, 1500bp)",
@@ -568,7 +576,7 @@ int main(int argc, char *argv[]) {
         int32_t max_readlength = 1500;
         uint8_t *enc_qdb; bseq1_t *seq_; int32_t *cum_len;
         encode_reads(reads, numReads, &enc_qdb, &seq_, &cum_len);
-        int16_t qpa[] = {0, 0};
+        int32_t qpa[] = {0, 0};
         int32_t mia[] = {1, 1};
         int32_t rid[] = {0, 1};
         run_case(fmi, "Case 12: long reads with mid-read N",

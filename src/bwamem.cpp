@@ -685,7 +685,7 @@ SMEM *mem_collect_smem(FMI_search *fmi, const mem_opt_t *opt,
                        int nseq,
                        SMEM *matchArray,
                        int32_t *min_intv_ar,
-                       int16_t *query_pos_ar,
+                       int32_t *query_pos_ar,
                        uint8_t *enc_qdb,
                        int32_t *rid,
                        mem_cache *mmc,
@@ -1085,9 +1085,10 @@ int mem_kernel1_core(FMI_search *fmi,
     // subsequent batches even when enc_qdb is undersized.
     if (tot_len > mmc->wsize_qdb[tid]) {
         int64_t tmp = mmc->wsize_qdb[tid];
-        mmc->enc_qdb[tid] = (uint8_t *) realloc(mmc->enc_qdb[tid],
-                                                tot_len * sizeof(uint8_t));
-        assert(mmc->enc_qdb[tid] != NULL);
+        uint8_t *new_enc_qdb = (uint8_t *) realloc(mmc->enc_qdb[tid],
+                                                   tot_len * sizeof(uint8_t));
+        if (new_enc_qdb == NULL) err_fatal(__func__, "out of memory growing enc_qdb");
+        mmc->enc_qdb[tid] = new_enc_qdb;
         mmc->wsize_qdb[tid] = tot_len;
         if (bwa_verbose >= 4) {
             fprintf(stderr, "[%0.4d] Re-allocating enc_qdb: "
@@ -1113,18 +1114,26 @@ int mem_kernel1_core(FMI_search *fmi,
         mmc->matchArray[tid]   = (SMEM *) _mm_realloc(mmc->matchArray[tid],
                                                       tmp, mmc->wsize_mem[tid], sizeof(SMEM));
             //realloc(mmc->matchArray[tid], mmc->wsize_mem[tid] *   sizeof(SMEM));
-        mmc->min_intv_ar[tid]  = (int32_t *) realloc(mmc->min_intv_ar[tid],
-                                                     mmc->wsize_mem[tid] *  sizeof(int32_t));
-        mmc->query_pos_ar[tid] = (int16_t *) realloc(mmc->query_pos_ar[tid],
-                                                     mmc->wsize_mem[tid] *  sizeof(int16_t));
-        mmc->rid[tid]          = (int32_t *) realloc(mmc->rid[tid],
-                                                      mmc->wsize_mem[tid] * sizeof(int32_t));
+        int32_t *new_min_intv_ar = (int32_t *) realloc(mmc->min_intv_ar[tid],
+                                                       mmc->wsize_mem[tid] * sizeof(int32_t));
+        if (new_min_intv_ar == NULL) err_fatal(__func__, "out of memory growing min_intv_ar");
+        mmc->min_intv_ar[tid] = new_min_intv_ar;
+
+        int32_t *new_query_pos_ar = (int32_t *) realloc(mmc->query_pos_ar[tid],
+                                                        mmc->wsize_mem[tid] * sizeof(int32_t));
+        if (new_query_pos_ar == NULL) err_fatal(__func__, "out of memory growing query_pos_ar");
+        mmc->query_pos_ar[tid] = new_query_pos_ar;
+
+        int32_t *new_rid = (int32_t *) realloc(mmc->rid[tid],
+                                               mmc->wsize_mem[tid] * sizeof(int32_t));
+        if (new_rid == NULL) err_fatal(__func__, "out of memory growing rid");
+        mmc->rid[tid] = new_rid;
         // w.mmc.lim[l]        = (int32_t *) _mm_malloc((BATCH_SIZE + 32) * sizeof(int32_t), 64);
     }
 
     SMEM    *matchArray   = mmc->matchArray[tid];
     int32_t *min_intv_ar  = mmc->min_intv_ar[tid];
-    int16_t *query_pos_ar = mmc->query_pos_ar[tid];
+    int32_t *query_pos_ar = mmc->query_pos_ar[tid];
     uint8_t *enc_qdb      = mmc->enc_qdb[tid];
     int32_t *rid          = mmc->rid[tid];
     int64_t  *wsize_mem   = &mmc->wsize_mem[tid];
