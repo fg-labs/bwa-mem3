@@ -88,6 +88,14 @@ ok "xeonbsw ($LINES pair scores emitted)"
 "$HERE/pg_cl_escape_test.sh" "$BWAMEM3" "$FIXTURES" || fail "pg_cl_escape_test failed"
 ok "pg_cl_escape_test"
 
+# --- meth_rg_header_test --------------------------------------------------
+# A `-R` read group must be emitted as an @RG header line in --meth mode,
+# not just stamped as RG:Z on records (the default path always was). Guards
+# the malformed-BAM regression where --meth records referenced an undeclared
+# read group ID.
+"$HERE/meth_rg_header_test.sh" "$BWAMEM3" "$FIXTURES" || fail "meth_rg_header_test failed"
+ok "meth_rg_header_test"
+
 # --- help_prescan_test ----------------------------------------------------
 # `mem --help` pre-scan must not match `--help` when it is the value of
 # an option that takes an argument (-R, -o, --set-as-failed, ...).
