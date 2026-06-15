@@ -4513,6 +4513,20 @@ static inline __m128i _mm_blendv_epi8 (__m128i x, __m128i y, __m128i mask)
     }
 
 
+// ---------------------------------------------------------------------------
+// 8-bit re-baseline floor helpers (shared by wrapper + every SIMD kernel tier)
+//
+// Initial 8-bit score floor: keep the seed score h0 inside the re-baseline
+// keep-window so the stored byte (= H_abs - B) never overflows signed int8.
+// Clamping prefixes >REBASE_KEEP below h0 is lossless (REBASE_KEEP=zdrop+1 >
+// zdrop => already past the z-drop horizon). MUST be used by every SIMD tier.
+static inline int bsw8_rebase_keep(int zdrop)            { return zdrop + 1; }
+static inline int bsw8_initial_floor(int h0, int zdrop) {
+    int b0 = h0 - bsw8_rebase_keep(zdrop);
+    return b0 > 0 ? b0 : 0;
+}
+// ---------------------------------------------------------------------------
+
 // #define PFD 2 // SSE2
 void BandedPairWiseSW::getScores8(SeqPair *pairArray,
                                   uint8_t *seqBufRef,
@@ -4631,12 +4645,21 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
         __m128i e_del128  = _mm_set1_epi8(e_del);
         __m128i eb_ins128 = _mm_set1_epi8(eb - o_ins);
         __m128i eb_del128 = _mm_set1_epi8(eb - o_del);
-        
+
         int8_t max = 0;
         if (max < w_match) max = w_match;
         if (max < w_mismatch) max = w_mismatch;
         if (max < w_ambig) max = w_ambig;
-        
+
+        // Initial per-lane score floor B0 = max(0, h0 - REBASE_KEEP_W) (long-read
+        // 8-bit, seed score h0 >= 128). Seeding the H bytes from raw h0 overflows
+        // the signed-int8 score state on row 0, so we seed from the rebaselined
+        // h0' = min(h0, REBASE_KEEP_W) instead (see the per-lane h0 init below).
+        // REBASE_KEEP_W MUST equal the kernel's REBASE_KEEP (bsw8_rebase_keep)
+        // so the two agree on B0; smithWaterman128_8 recomputes B0 via
+        // bsw8_initial_floor(p[].h0, zdrop).
+        const int REBASE_KEEP_W = bsw8_rebase_keep(zdrop);
+
         int nstart = 0, nend = numPairs;
         
 // #pragma omp for schedule(dynamic, 128)
@@ -4651,9 +4674,20 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
             for(j = 0; j < SIMD_WIDTH8; j++)
             {
                 SeqPair sp = pairArray[i + j];
-                h0[j] = sp.h0;
+                // Re-baseline the seed score into the int8 byte frame: seed the H
+                // arrays from h0' = h0 - B0 = min(h0, REBASE_KEEP_W) (clamped >= 0)
+                // so the initial bytes fit signed-int8 even when the true seed h0
+                // is several hundred (long-read). smithWaterman128_8 recomputes the
+                // matching B0 = max(0, h0 - REBASE_KEEP) from p[].h0 + zdrop and
+                // starts that lane's floor B there, so byte == H_absolute - B.
+                {
+                    int h0p = sp.h0;
+                    if (h0p > REBASE_KEEP_W) h0p = REBASE_KEEP_W;
+                    if (h0p < 0) h0p = 0;
+                    h0[j] = (uint8_t) h0p;
+                }
                 seq1 = seqBufRef + (int64_t)sp.idr;
-                
+
                 for(k = 0; k < sp.len1; k++)
                 {
                     mySeq1SoA[k * SIMD_WIDTH8 + j] = seq1[k] /* PR16: N stays 4 */;
@@ -4864,6 +4898,78 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
     int32_t xrow[SIMD_WIDTH8];    // best row for score (== i+1 at capture)
     int32_t ierow[SIMD_WIDTH8];   // best row for gscore (== i+1 at capture)
 
+    // --- PER-LANE SCORE RE-BASELINING (long-read 8-bit, scores > 127) ---
+    // H/F/E and the score maxima are unsigned 8-bit [0,255], but a 1 kb
+    // alignment scores ~900. To keep the kernel 16-lane (8-bit) we carry a
+    // wide per-lane running FLOOR B[l]: every stored 8-bit score represents
+    // (H_absolute - B[l]). When a lane's row-max climbs toward 255 we raise
+    // B[l] by `delta` and subtract `delta` (saturating, _mm_subs_epu8) from
+    // every carried score buffer/register for that lane, then add B back when
+    // reconstructing the absolute result.
+    //
+    // SAFETY: subtracting delta saturates cells whose rebaselined value < delta
+    // to 0, i.e. cells that were >= (REBASE_HI - delta) = REBASE_KEEP below the
+    // row max. With REBASE_KEEP > zdrop, any such cell is already beyond the
+    // z-drop horizon (the alignment through it has already z-dropped) and cannot
+    // lead to the optimum, so clamping it to 0 is sound. The per-row max can
+    // climb by at most w_match between two row-end checks (H(i,j) <= H(i-1,j-1)
+    // + w_match), so REBASE_HI must leave >= w_match headroom below 255.
+    //
+    // NB: scores must stay in the SIGNED-positive byte range [0,127]. The DP
+    // recurrence floors cells with `m11 & (m11 > 0)` (signed _mm_cmpgt_epi8) and
+    // the row/global-max trackers (maxRS1, maxScore128, gscore) compare scores
+    // with SIGNED _mm_cmpgt_epi8 — all of which mis-read a byte >= 128 as
+    // negative. So we re-baseline within [0,127], not [0,255].
+    //
+    // Re-baseline window derived from this kernel's scoring + z-drop, so the
+    // 8-bit score path is correct for ANY valid scoring (not just bench defaults):
+    //   REBASE_KEEP > zdrop      => any cell clamped on re-baseline (>= REBASE_KEEP
+    //                               below the row max) is already past the z-drop
+    //                               horizon, so clamping it to 0 is lossless.
+    //   REBASE_HI + maxStep<=127 => a not-yet-triggered row carries max < REBASE_HI
+    //                               and grows by <= maxStep, so the score byte never
+    //                               exceeds signed-int8 +127 (the floor/max-trackers
+    //                               use signed _mm_cmpgt_epi8; a byte >=128 would be
+    //                               misread as negative and killed).
+    // Precondition REBASE_HI > REBASE_KEEP (a non-empty window exists) is equivalent
+    // to zdrop + maxStep <= 125; the 8-bit routing gate (bwamem.cpp, separate task)
+    // MUST ensure this, else the pair belongs on the 16-bit path.
+    int maxStep = (int)this->w_match;
+    if ((int)this->w_ambig > maxStep) maxStep = (int)this->w_ambig;
+    if (maxStep < 1) maxStep = 1;
+    const int REBASE_KEEP = zdrop + 1;
+    const int REBASE_HI   = 127 - maxStep;
+    assert(REBASE_HI > REBASE_KEEP &&
+           "8-bit SW re-baseline: zdrop+maxStep>125, scoring outside safe envelope (route to 16-bit)");
+    int32_t B[SIMD_WIDTH8];        // per-lane wide score floor (stored = abs - B)
+    int32_t best_abs[SIMD_WIDTH8]; // running best score in ABSOLUTE units
+    int32_t gbest_abs[SIMD_WIDTH8];// running gscore (query-end) in ABSOLUTE units
+
+    // --- INITIAL SCORE FLOOR B0 (long-read 8-bit, seed score h0 >= 128) ---
+    // The H arrays are seeded from the seed score h0 (H_v[0]=h0, then gap-
+    // decremented down column 0 and across row 0). For a long-read seed h0 can
+    // be several hundred, which immediately overflows the signed-int8 byte
+    // state before any re-baseline event can fire. So we start each lane's
+    // running floor at B0[l] = max(0, h0 - REBASE_KEEP) instead of 0: the
+    // wrapper seeds the H bytes from h0' = h0 - B0 = min(h0, REBASE_KEEP)
+    // (clamped >= 0, so the initial bytes land in [0, REBASE_KEEP] <= 127), and
+    // here we set B[l] = B0[l] so the stored bytes still mean (H_absolute - B).
+    //
+    // SAFETY (identical argument to the mid-DP re-baseline): the gap-prefix
+    // cells in column 0 / row 0 that fall more than REBASE_KEEP below h0 are
+    // saturated to byte 0 by the wrapper's unsigned-saturating seed. Because
+    // REBASE_KEEP = zdrop+1 > zdrop, any such prefix cell is already beyond the
+    // z-drop horizon below the seed, so an alignment routed through it has
+    // already z-dropped and cannot be optimal -- clamping it to the floor is
+    // lossless. This is the SAME situation that arises mid-DP whenever B>0 after
+    // a re-baseline (byte 0 then means H_absolute == B, not 0), which the
+    // h00==0 local-restart test in MAIN_CODE8_CORE already handles correctly; B0
+    // simply makes B>0 from row 0 instead of from the first re-baseline event.
+    int32_t B0[SIMD_WIDTH8];
+    for (int l=0; l<SIMD_WIDTH8; l++) {
+        B0[l] = bsw8_initial_floor((int)p[l].h0, zdrop);
+    }
+
     int32_t minq = 10000000;
     for (int l=0; l<SIMD_WIDTH8; l++) {
         tlenw[l]  = p[l].len1;
@@ -4874,6 +4980,10 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
         mlenw[l]  = ml;
         xrow[l]   = 0;
         ierow[l]  = 0;
+        B[l]        = B0[l];   // start the floor at B0 so byte state = abs - B0
+        best_abs[l] = p[l].h0; // maxScore128 inits to the h0 seed; record the
+                               // ABSOLUTE seed score (wide), not the rebaselined byte
+        gbest_abs[l]= -1;      // matches the int8 gscore init (-1) in absolute units
         if (p[l].len2 < minq) minq = p[l].len2;
     }
     minq -= 1; // for gscore
@@ -5154,6 +5264,7 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
             int8_t  rs_a[SIMD_WIDTH8]       __attribute((aligned(16)));
             int8_t  exit_a[SIMD_WIDTH8]     __attribute((aligned(16)));
             int8_t  ie_mark_a[SIMD_WIDTH8]  __attribute((aligned(16)));
+            int8_t  gs_a[SIMD_WIDTH8]       __attribute((aligned(16)));
             _mm_store_si128((__m128i *) cmp_a, cmp);
             _mm_store_si128((__m128i *) y1_a, y1_128);
             _mm_store_si128((__m128i *) y_a, y128);
@@ -5161,12 +5272,30 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
             _mm_store_si128((__m128i *) rs_a, maxRS1);
             _mm_store_si128((__m128i *) exit_a, exit0);
             _mm_store_si128((__m128i *) ie_mark_a, max_ie128);
+            _mm_store_si128((__m128i *) gs_a, gscore);
             for (int l = 0; l < SIMD_WIDTH8; l++) {
                 // best-score row
                 if (cmp_a[l]) xrow[l] = i + 1;
                 // best-gscore row: marker==1 means gscore was set this row
                 if (ie_mark_a[l] == 1) ierow[l] = i + 1;
-                // z-drop (only relevant where the lane is still alive)
+                // ABSOLUTE-FRAME score tracking: the 8-bit maxScore128/gscore are
+                // in the lane's CURRENT B[l] frame, so the absolute value is the
+                // rebaselined byte + B[l]. Re-derive both every row (cheap, O(rows))
+                // rather than trying to add B back once at the end (the recorded
+                // max may pre-date later B bumps). max() guards against the byte
+                // being re-baselined away in a later row.
+                {
+                    int ms_abs = (int)(uint8_t)ms_a[l] + B[l];
+                    if (ms_abs > best_abs[l]) best_abs[l] = ms_abs;
+                    // gscore init is -1 (0xFF as a byte); treat that as "unset".
+                    if ((uint8_t)gs_a[l] != 0xFF) {
+                        int gs_abs = (int)(uint8_t)gs_a[l] + B[l];
+                        if (gs_abs > gbest_abs[l]) gbest_abs[l] = gs_abs;
+                    }
+                }
+                // z-drop (only relevant where the lane is still alive). The drop
+                // is ms-rs of two bytes in the SAME B[l] frame, so the B cancels
+                // and the comparison is already in ABSOLUTE score units.
                 if (exit_a[l]) {
                     int xr  = xrow[l];                       // best row
                     int y1c = (int) y1_a[l] + i;             // row-max col (abs)
@@ -5274,6 +5403,72 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
         head128 = _mm_sub_epi8(head128, one128);
         tail128 = _mm_sub_epi8(tail128, one128);
 
+        // --- RE-BASELINE EVENT (per-lane score floor) ---
+        // After this row's score state is final, lower any lane whose row-max
+        // (maxRS1, rebaselined) has climbed to REBASE_HI back into range. We
+        // raise B[l] by delta = maxRS1[l] - REBASE_KEEP and subtract that delta
+        // (saturating to 0) from every carried score buffer/register for that
+        // lane. Done AFTER band narrowing so this row's trim matches the 16-bit
+        // reference; the next row reads the lowered values consistently.
+        {
+            uint8_t rs_b[SIMD_WIDTH8] __attribute((aligned(16)));
+            _mm_store_si128((__m128i *) rs_b, maxRS1);
+            int8_t  delta_a[SIMD_WIDTH8] __attribute((aligned(16)));
+            int any = 0;
+            for (int l = 0; l < SIMD_WIDTH8; l++) {
+                int d = 0;
+                if ((int)rs_b[l] >= REBASE_HI) {
+                    d = (int)rs_b[l] - REBASE_KEEP;   // keep low REBASE_KEEP, in range
+                    B[l] += d;
+                    any = 1;
+                }
+                delta_a[l] = (int8_t) d;              // 0..(REBASE_HI-REBASE_KEEP) small
+            }
+            if (any) {
+                __m128i delta128 = _mm_load_si128((__m128i *) delta_a);
+                // Subtract delta from every carried score buffer over the active
+                // band columns. The range [lo,hi] is the union of the current and
+                // next band windows; clamping to [0, ncol-1] keeps the loop within
+                // the valid column range (a safe superset covering every column the
+                // next row will read).
+                int lo = nbeg < beg ? nbeg : beg;
+                int hi = nend > end ? nend : end;
+                if (lo < 0) lo = 0;
+                if (hi + 1 > ncol) hi = ncol - 1;
+                for (int l = lo; l <= hi; l++) {
+                    __m128i h128 = _mm_load_si128((__m128i *)(H_h + l * SIMD_WIDTH8));
+                    __m128i f128 = _mm_load_si128((__m128i *)(F   + l * SIMD_WIDTH8));
+                    h128 = _mm_subs_epu8(h128, delta128);
+                    f128 = _mm_subs_epu8(f128, delta128);
+                    _mm_store_si128((__m128i *)(H_h + l * SIMD_WIDTH8), h128);
+                    _mm_store_si128((__m128i *)(F   + l * SIMD_WIDTH8), f128);
+                }
+                // The vertical seed H_v is read only while the band still touches
+                // column 0 (beg==0). Lower the rows that may still be consumed.
+                if (beg == 0) {
+                    for (int r = i + 1; r < nrow; r++) {
+                        __m128i v128 = _mm_load_si128((__m128i *)(H_v + r * SIMD_WIDTH8));
+                        v128 = _mm_subs_epu8(v128, delta128);
+                        _mm_store_si128((__m128i *)(H_v + r * SIMD_WIDTH8), v128);
+                    }
+                }
+                // Carried score maxima (registers) live in the same rebaselined
+                // frame and must be lowered too so the next row's z-drop (ms-rs)
+                // and the absolute-frame add-back stay consistent. maxScore128 is
+                // the running max, so it never saturates to 0 (maxScore128 >=
+                // maxRS1 for the triggering row, and maxRS1 >= REBASE_HI >
+                // REBASE_KEEP > delta, so it stays positive).
+                maxScore128 = _mm_subs_epu8(maxScore128, delta128);
+                // gscore: keep the -1 (0xFF) "unset" sentinel intact, but lower
+                // set lanes (it is compared SIGNED against the rebaselined h11 in
+                // the gscore block, so it must track the same frame). Zero the
+                // delta for lanes whose gscore is still 0xFF.
+                __m128i gset = _mm_cmpeq_epi8(gscore, ff128);   // 0xFF where unset
+                __m128i gdelta = _mm_andnot_si128(gset, delta128);
+                gscore = _mm_subs_epu8(gscore, gdelta);
+            }
+        }
+
 #if RDT
         prof[DP2][0] += __rdtsc() - tim1;
 #endif
@@ -5283,31 +5478,26 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
     prof[DP][0] += __rdtsc() - tim;
 #endif
     
-    // Score / gscore stay int8 here (exact while score < 128).
-    // TODO: scores >= 128 need re-baselining (not yet implemented).
-    // Positions are reconstructed wide from the diagonal-offset lanes plus the
-    // per-lane best-row side channels.
-    int8_t score[SIMD_WIDTH8]  __attribute((aligned(64)));
-    _mm_store_si128((__m128i *) score, maxScore128);
-
+    // Scores are reconstructed in ABSOLUTE units from the per-lane wide
+    // best_abs/gbest_abs side channels (= rebaselined byte + B[l], captured each
+    // row before any later re-baseline could saturate the byte away). Positions
+    // are reconstructed wide from the diagonal-offset lanes plus the per-lane
+    // best-row side channels.
     int8_t maxj[SIMD_WIDTH8]  __attribute((aligned(64)));
     _mm_store_si128((__m128i *) maxj, y128);   // best col as diagonal offset
 
     int8_t max_off_ar[SIMD_WIDTH8]  __attribute((aligned(64)));
     _mm_store_si128((__m128i *) max_off_ar, max_off128);
 
-    int8_t gscore_ar[SIMD_WIDTH8]  __attribute((aligned(64)));
-    _mm_store_si128((__m128i *) gscore_ar, gscore);
-
     for(i = 0; i < SIMD_WIDTH8; i++)
     {
-        p[i].score   = (uint8_t) score[i];
+        p[i].score   = best_abs[i];                               // absolute score
         p[i].tle     = xrow[i];                                   // best row (target end)
         // qle reconstruction: maxj[l] = col - (xrow-1), so col = maxj[l] + (xrow-1).
         // Guard the unset case (xrow==0 means no update occurred).
         p[i].qle     = (xrow[i] == 0) ? 0 : ((int) maxj[i] + xrow[i] - 1);
         p[i].max_off = (uint8_t) max_off_ar[i];
-        p[i].gscore  = (uint8_t) gscore_ar[i];
+        p[i].gscore  = gbest_abs[i];                              // absolute gscore (-1 if unset)
         p[i].gtle    = ierow[i];                                  // best gscore row
     }
 
