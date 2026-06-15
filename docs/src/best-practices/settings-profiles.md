@@ -143,6 +143,25 @@ A benchmark that quotes only default-vs-default settings understates the through
 caller who has adopted the recommended profile; quote both so readers can pick the comparison that
 matches their deployment.
 
+## Situational: `--supp-rep-hard-cap` for SV-aware pipelines
+
+This is **not** part of the recommended profile — it is a situational knob, not a free speed-up, and
+the default (`0`, off) is correct for plain alignment.
+
+If you run structural-variant or breakpoint detection downstream (e.g. `fgsv SvPileup`),
+`--supp-rep-hard-cap 20` suppresses repeat-induced *spurious* supplementary breakpoints — split
+alignments anchored in repeats whose mapping quality is overestimated — at no measured cost to real
+SV breakpoints. On GIAB HG002 CMRG (GRCh38, 2×250) it stripped repeat artifacts while preserving
+every credible real-SV breakpoint, including ones in moderately-repetitive regions.
+
+Do **not** use more aggressive values: `--supp-rep-hard-cap` ≤ 10 began suppressing *real* GIAB SV
+breakpoints (a verified insertion at chr3:45890256 and deletion at chr18:79739776) whose supporting
+split reads happen to land in repetitive regions.
+
+Caveats: this was measured on a single repeat-enriched truth set at the breakpoint level (not
+end-to-end SV calls), so treat `20` as a sensible starting point for SV workflows rather than a
+universal recommendation. It has no effect on primary-alignment MAPQ or on non-SV pipelines.
+
 ---
 
 **See also:**
