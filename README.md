@@ -12,6 +12,8 @@ shared-memory index, mimalloc allocator) maintained by [Fulcrum Genomics](https:
 
 bwa-mem3 is **not** byte-identical to bwa-mem2 — it adds SAM tags, fixes crashes, and changes tie resolution. The core alignment is preserved on the data we have tested, but the SAM byte stream is not. See [Equivalence with bwa-mem2](https://bwa-mem3.readthedocs.io/en/latest/whats-different/equivalence.html) for a field-by-field comparison and a full per-PR audit.
 
+By default bwa-mem3 keeps bwa-mem2's command-line defaults, so it drops into an existing pipeline unchanged. For the fastest configuration — and what each recommended deviation from the bwa defaults trades for speed — see [Settings profiles: bwa drop-in vs recommended](https://bwa-mem3.readthedocs.io/en/latest/best-practices/settings-profiles.html).
+
 **Full documentation:** <https://bwa-mem3.readthedocs.io>
 
 ## Install

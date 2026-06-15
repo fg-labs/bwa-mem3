@@ -176,7 +176,9 @@ reference is short and inference may be inaccurate.
 #### `-m INT` — mate rescue rounds
 
 Maximum number of mate-rescue attempts per read. Reduce to speed up alignment
-on data where the default (50) wastes time on unrescuable pairs.
+on data where the default (50) wastes time on unrescuable pairs. See
+[Settings profiles](../best-practices/settings-profiles.md) for the benchmarked
+`-m 10` recommendation.
 
 #### `-S` — skip mate rescue
 
