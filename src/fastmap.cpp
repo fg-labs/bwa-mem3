@@ -44,6 +44,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "meth_bam.h"
 #include "meth_orig_ref.h"
 #include "bwa_shm.h"
+#include "fast_reader_bseq.h"
 
 #if AFF && (__linux__)
 #include <sys/sysinfo.h>
@@ -348,10 +349,9 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
 
         /* Read "reads" from input file (fread) */
         int64_t sz = 0;
-        ret->seqs = bseq_read_orig(aux->task_size,
-                                   &ret->n_seqs,
-                                   aux->ks, aux->ks2,
-                                   &sz);
+        ret->seqs = aux->legacy_reader
+            ? bseq_read_orig(aux->task_size, &ret->n_seqs, aux->ks, aux->ks2, &sz)
+            : bseq_read_fast(aux->task_size, &ret->n_seqs, aux->frks, aux->frks2, &sz);
 
         tprof[READ_IO][0] += __rdtsc() - tim;
 
@@ -901,6 +901,10 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "                 with >=INT genome occurrences (i.e. the supp region is repetitive on its\n");
     fprintf(stderr, "                 own). 0 disables (default). Typical values 5-20; lower = more aggressive.\n");
     fprintf(stderr, "                 Primary MAPQ is unaffected.\n");
+    fprintf(stderr, "Input reader:\n");
+    fprintf(stderr, "   --legacy-reader\n");
+    fprintf(stderr, "                 use the legacy gzFile/kseq input reader instead of the default\n");
+    fprintf(stderr, "                 content-detecting fast reader (escape hatch / A-B baseline).\n");
     fprintf(stderr, "Help:\n");
     fprintf(stderr, "   --help        print this help message and exit\n");
     fprintf(stderr, "Note: Please read the man page for detailed description of the command line and options.\n");
@@ -979,7 +983,7 @@ int main_mem(int argc, char *argv[])
     const char  *mode                      = 0;
 
     mem_opt_t    *opt, opt0;
-    gzFile        fp, fp2 = 0;
+    gzFile        fp = 0, fp2 = 0;
     void         *ko = 0, *ko2 = 0;
     int           fd, fd2;
     mem_pestat_t  pes[4];
@@ -1013,6 +1017,7 @@ int main_mem(int argc, char *argv[])
         OPT_METH_SET_AS_FAILED,
         OPT_METH_CHIMERA_QC,
         OPT_SUPP_REP_HARD_CAP,
+        OPT_LEGACY_READER,
         OPT_HELP,
     };
     static struct option long_opts[] = {
@@ -1021,6 +1026,7 @@ int main_mem(int argc, char *argv[])
         {"set-as-failed",            required_argument, 0, OPT_METH_SET_AS_FAILED},
         {"chimera-qc",               no_argument,       0, OPT_METH_CHIMERA_QC},
         {"supp-rep-hard-cap",        required_argument, 0, OPT_SUPP_REP_HARD_CAP},
+        {"legacy-reader",            no_argument,       0, OPT_LEGACY_READER},
         {"help",                     no_argument,       0, OPT_HELP},
         {0, 0, 0, 0}
     };
@@ -1175,6 +1181,7 @@ int main_mem(int argc, char *argv[])
             }
             opt->supp_rep_hard_cap = (int)v;
         }
+        else if (c == OPT_LEGACY_READER) aux.legacy_reader = 1;
         else if (c == OPT_HELP) {
             usage(opt);
             free(opt);
@@ -1351,8 +1358,22 @@ int main_mem(int argc, char *argv[])
         return 1;
     }
     // fp = gzopen(argv[optind + 1], "r");
-    fp = gzdopen(fd, "r");
-    aux.ks = kseq_init(fp);
+    if (aux.legacy_reader) {
+        fp = gzdopen(fd, "r");
+        aux.ks = kseq_init(fp);
+    } else {
+        const char *fr_err = NULL;
+        aux.fr1 = fast_reader_dopen(fd, &fr_err);
+        if (aux.fr1 == NULL) {
+            fprintf(stderr, "[E::%s] %s\n", __func__, fr_err ? fr_err : "failed to open input");
+            free(opt);
+            if (out_opened) fclose(aux.fp);
+            delete aux.fmi;
+            kclose(ko);
+            return 1;
+        }
+        aux.frks = fast_kseq_init(aux.fr1);
+    }
 
     // PAIRED_END
     /* Handling Paired-end reads */
@@ -1369,8 +1390,8 @@ int main_mem(int argc, char *argv[])
                 fprintf(stderr, "[E::%s] failed to open file `%s'.\n", __func__, argv[optind + 2]);
                 free(opt);
                 free(ko);
-                err_gzclose(fp);
-                kseq_destroy(aux.ks);
+                if (aux.legacy_reader) { err_gzclose(fp); kseq_destroy(aux.ks); }
+                else { fast_kseq_destroy(aux.frks); fast_reader_close(aux.fr1); }
                 if (out_opened)
                     fclose(aux.fp);
                 delete aux.fmi;
@@ -1378,11 +1399,24 @@ int main_mem(int argc, char *argv[])
                 // kclose(ko2);
                 return 1;
             }
-            // fp2 = gzopen(argv[optind + 2], "r");
-            fp2 = gzdopen(fd2, "r");
-            aux.ks2 = kseq_init(fp2);
+            if (aux.legacy_reader) {
+                fp2 = gzdopen(fd2, "r");
+                aux.ks2 = kseq_init(fp2);
+                assert(aux.ks2 != 0);
+            } else {
+                const char *fr_err2 = NULL;
+                aux.fr2 = fast_reader_dopen(fd2, &fr_err2);
+                if (aux.fr2 == NULL) {
+                    fprintf(stderr, "[E::%s] %s\n", __func__, fr_err2 ? fr_err2 : "failed to open input");
+                    free(opt);
+                    fast_kseq_destroy(aux.frks); fast_reader_close(aux.fr1);
+                    if (out_opened) fclose(aux.fp);
+                    delete aux.fmi; kclose(ko); kclose(ko2);
+                    return 1;
+                }
+                aux.frks2 = fast_kseq_init(aux.fr2);
+            }
             opt->flag |= MEM_F_PE;
-            assert(aux.ks2 != 0);
         }
     }
 
@@ -1530,13 +1564,15 @@ int main_mem(int argc, char *argv[])
     free(hdr_line);
     free(idx_hdr_lines);
     free(opt);
-    kseq_destroy(aux.ks);
-    err_gzclose(fp); kclose(ko);
+    if (aux.legacy_reader) { kseq_destroy(aux.ks); err_gzclose(fp); }
+    else { fast_kseq_destroy(aux.frks); fast_reader_close(aux.fr1); }
+    kclose(ko);
 
     // PAIRED_END
-    if (aux.ks2) {
-        kseq_destroy(aux.ks2);
-        err_gzclose(fp2); kclose(ko2);
+    if (aux.ks2 || aux.fr2) {
+        if (aux.legacy_reader) { kseq_destroy(aux.ks2); err_gzclose(fp2); }
+        else { fast_kseq_destroy(aux.frks2); fast_reader_close(aux.fr2); }
+        kclose(ko2);
     }
 
     /* BGZF flush + EOF marker errors surface only on close. Propagate to the

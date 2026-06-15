@@ -197,7 +197,7 @@ jobs:
           submodules: recursive
 
       - name: Install apt dependencies
-        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev samtools libomp-dev ccache
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev libdeflate-dev samtools libomp-dev ccache
 
       - name: Detect x86 ISA (avx2 / avx512bw)
         if: matrix.arch == 'x86'
@@ -433,7 +433,7 @@ jobs:
           submodules: recursive
 
       - name: Install apt dependencies
-        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev libomp-dev ccache
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev libdeflate-dev libomp-dev ccache
 
       - name: Detect x86 ISA
         if: matrix.arch == 'x86'

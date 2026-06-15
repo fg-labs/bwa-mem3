@@ -55,8 +55,15 @@ KSEQ_DECLARE(gzFile)
 /* Forward-declared — keeps htslib out of this header. */
 struct bam_writer_s;
 
+#include "fast_reader.h"
+
 typedef struct {
 	kseq_t *ks, *ks2;
+	/* Fast-path reader (default). When legacy_reader is set, the gzFile/kseq
+	 * path (ks, ks2, fp) is used; otherwise the fast_reader path below. */
+	int legacy_reader;
+	fast_reader_t *fr1, *fr2;
+	void *frks, *frks2;   /* kseq_t* over fast_reader; opaque in this header */
 	mem_opt_t *opt;
 	mem_pestat_t *pes0;
 	int64_t n_processed;

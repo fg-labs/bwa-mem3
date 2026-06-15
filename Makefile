@@ -172,6 +172,17 @@ ifeq ($(USE_MIMALLOC),1)
     INCLUDES += -Iext/mimalloc/include
 endif
 
+# libdeflate: used directly by src/fast_reader.c for BGZF block decode (the
+# vanilla-gzip path stays on zlib). htslib already links -ldeflate
+# transitively; we add the <libdeflate.h> include path here. On macOS it
+# lives under the Homebrew prefix, resolved dynamically (mirrors the libomp
+# prefix detection below) so the build works on both Apple Silicon
+# (/opt/homebrew) and Intel (/usr/local) hosts rather than hardcoding one.
+ifeq ($(UNAME_S),Darwin)
+    LIBDEFLATE_PREFIX ?= $(shell brew --prefix libdeflate 2>/dev/null)
+    INCLUDES += -I$(LIBDEFLATE_PREFIX)/include
+endif
+
 # libsais (pinned in ext/libsais; see submodule SHA): linear-time suffix
 # array / BWT construction via SA-IS. Compiled with OpenMP so
 # libsais_gsa_omp can run parallel induced-sorting. libomp is already a
@@ -203,6 +214,12 @@ LIBS += -Lext/htslib -lhts
 LIBS += $(LIBSAIS_OPENMP_LIBS)
 LIBS += $(STATIC_GCC)
 LIBS += $(LIBS_EXTRA)
+# libdeflate is a direct dependency of src/fast_reader.c (BGZF block decode).
+ifeq ($(UNAME_S),Darwin)
+    LIBS += -L$(LIBDEFLATE_PREFIX)/lib -ldeflate
+else
+    LIBS += -ldeflate
+endif
 # Pull in htslib's transitive deps (-ldeflate when libdeflate is detected,
 # bzlib / lzma / curl when those features are enabled) from the generated
 # htslib_static.mk -- the same mechanism samtools uses (samtools'
@@ -234,7 +251,8 @@ OBJS=		src/fastmap.o src/bwtindex.o src/utils.o src/kthread.o \
 			src/meth_orig_ref.o src/meth_xm.o \
 			src/packed_text.o src/fm_index_writer.o src/index_prelude.o \
 			src/system.o src/libsais_build.o \
-			src/bwa_shm.o src/simd_dispatch.o
+			src/bwa_shm.o src/simd_dispatch.o \
+			src/fast_reader.o src/fast_reader_bseq.o
 
 # Kernel TUs (bandedSWA, kswv, ksw, sam_encode) are compiled per-tier on x86
 # and linked directly via KERNEL_TIER_OBJS_LINK. The dispatch wrappers in
@@ -519,6 +537,25 @@ shm_pack_round_trip_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/shm_pack_ro
 
 shm_lock_destroy_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/shm_lock_destroy_test.o
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/shm_lock_destroy_test.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
+
+# fast_reader is C (not C++); the implicit .c rule omits $(INCLUDES), so give
+# these objects explicit rules carrying the project include paths (incl.
+# libdeflate) and preprocessor defines.
+src/fast_reader.o: src/fast_reader.c src/fast_reader.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDES) -c -o $@ $<
+
+src/fast_reader_bseq.o: src/fast_reader_bseq.c src/fast_reader_bseq.h src/fast_reader.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDES) -c -o $@ $<
+
+# Standalone fast_reader correctness self-test (plain/gzip/multi-member/BGZF
+# round-trips). Links only zlib + libdeflate, so it needs no bwa-mem3 build.
+FAST_READER_TEST_INC = -Isrc
+ifeq ($(UNAME_S),Darwin)
+    FAST_READER_TEST_INC += -I$(LIBDEFLATE_PREFIX)/include
+    FAST_READER_TEST_LIB = -L$(LIBDEFLATE_PREFIX)/lib
+endif
+fast_reader_selftest: src/fast_reader.c test/fast_reader_selftest.c
+	$(CC) -O2 -Wall -Wextra $(FAST_READER_TEST_INC) test/fast_reader_selftest.c src/fast_reader.c $(FAST_READER_TEST_LIB) -lz -ldeflate -o $@
 
 test/shm_pack_round_trip_test.o: test/shm_pack_round_trip_test.cpp
 

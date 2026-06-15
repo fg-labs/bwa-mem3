@@ -60,6 +60,10 @@ Supplementary MAPQ rescoring (fg-labs extension):
                  with >=INT genome occurrences (i.e. the supp region is repetitive on its
                  own). 0 disables (default). Typical values 5-20; lower = more aggressive.
                  Primary MAPQ is unaffected.
+Input reader:
+   --legacy-reader
+                 use the legacy gzFile/kseq input reader instead of the default
+                 content-detecting fast reader (escape hatch / A-B baseline).
 Help:
    --help        print this help message and exit
 Note: Please read the man page for detailed description of the command line and options.
