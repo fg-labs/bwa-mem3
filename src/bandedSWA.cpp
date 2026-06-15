@@ -4435,6 +4435,8 @@ static inline __m128i _mm_blendv_epi8 (__m128i x, __m128i y, __m128i mask)
 }
 #endif
 
+// ZSCORE8 is unused in smithWaterman128_8 (z-drop replaced by wide scalar);
+// retained here in case a future 128-bit tier reinstates it.
 #define ZSCORE8(i4_128, y4_128)                                         \
     {                                                                   \
         __m128i tmpi = _mm_sub_epi8(i4_128, x128);                      \
@@ -4812,7 +4814,7 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
                                           int32_t numPairs,
                                           int zdrop,
                                           int32_t w,
-                                          uint8_t qlen[],
+                                          uint8_t qlen[],   // dead parameter (overwritten immediately); remove with call site in a later task
                                           uint8_t myband[])
 {
     
@@ -4837,7 +4839,6 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
 
     int i, j;
 
-    uint8_t tlen[SIMD_WIDTH8];
     uint8_t tail[SIMD_WIDTH8] __attribute((aligned(64)));
     uint8_t head[SIMD_WIDTH8] __attribute((aligned(64)));
 
@@ -4846,45 +4847,68 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
     // the core's critical path doesn't carry the cmpeq+blendv+maxu+blendv
     // chain that builds the score. Slab-backed (see constructor sbt8_).
     int8_t *sbt_buf = sbt8_ + tid * SIMD_WIDTH8 * MAX_SEQ_LEN8;
-    
+
+    // --- DIAGONAL-OFFSET POSITION ENCODING (long-read 8-bit, w<=127) ---
+    // Every per-cell COLUMN position is tracked as the diagonal offset
+    //   d = col - i  in [-w, +w+1]  (fits signed int8 for w <= ~126).
+    // ROW quantities (best row, best-gscore row, qlen, tlen, mlen) exceed
+    // int8 for long reads, so they live in WIDE per-lane int32 side channels
+    // updated O(rows) in the per-row epilogue, not O(cells). Absolute end
+    // coordinates are reconstructed at the result store from the wide row.
+    // Persistent column-offset state (head128/tail128) is shifted by -1 each
+    // row (frame follows i) so the same absolute edge keeps its offset.
+    int32_t tlenw[SIMD_WIDTH8];   // raw target length (rows), wide
+    int32_t qlenw[SIMD_WIDTH8];   // raw query length (cols), wide
+    int32_t mbandw[SIMD_WIDTH8];  // per-lane band width, wide
+    int32_t mlenw[SIMD_WIDTH8];   // min(qlen+myband, tlen), wide row bound
+    int32_t xrow[SIMD_WIDTH8];    // best row for score (== i+1 at capture)
+    int32_t ierow[SIMD_WIDTH8];   // best row for gscore (== i+1 at capture)
+
     int32_t minq = 10000000;
     for (int l=0; l<SIMD_WIDTH8; l++) {
-        tlen[l] = p[l].len1;
-        qlen[l] = p[l].len2;
+        tlenw[l]  = p[l].len1;
+        qlenw[l]  = p[l].len2;
+        mbandw[l] = myband[l];
+        int ml = qlenw[l] + mbandw[l];
+        if (ml > tlenw[l]) ml = tlenw[l];
+        mlenw[l]  = ml;
+        xrow[l]   = 0;
+        ierow[l]  = 0;
         if (p[l].len2 < minq) minq = p[l].len2;
     }
     minq -= 1; // for gscore
 
-    __m128i tlen128   = _mm_load_si128((__m128i *) tlen);
-    __m128i qlen128   = _mm_load_si128((__m128i *) qlen);
     __m128i myband128 = _mm_load_si128((__m128i *) myband);
     __m128i zero128   = _mm_setzero_si128();
     __m128i one128    = _mm_set1_epi8(1);
     __m128i two128    = _mm_set1_epi8(2);
-    __m128i max_ie128 = zero128;
     __m128i ff128     = _mm_set1_epi8(0xFF);
-        
-    __m128i tail128 = qlen128, head128 = zero128;
+
+    // gscore best-row marker lane: 1 == "this row updated gscore", 0 == earlier
+    // (the actual earlier row is carried in the wide ierow[] side channel).
+    __m128i max_ie128 = zero128;
+
+    // Offset-frame band edges. head_off starts at 0 (col 0 - row 0); tail_off
+    // starts saturated-high (+127) and is immediately clamped by the band-grow
+    // min() against (1+myband) and (qlen-i) on the first row.
+    __m128i head128 = zero128;
+    __m128i tail128 = _mm_set1_epi8(127);
     _mm_store_si128((__m128i *) head, head128);
     _mm_store_si128((__m128i *) tail, tail128);
 
-    __m128i mlen128 = _mm_add_epi8(qlen128, myband128);
-    mlen128 = _mm_min_epu8(mlen128, tlen128);
-    
     __m128i hval = _mm_load_si128((__m128i *)(H_v));
     __mmask16 dmask = 0xFFFF;
-    
+
     __m128i maxScore128 = hval;
     for(j = 0; j < ncol; j++)
         _mm_store_si128((__m128i *)(F + j * SIMD_WIDTH8), zero128);
-    
-    __m128i x128 = zero128;
-    __m128i y128 = zero128;
+
+    __m128i y128 = zero128;   // best col as diagonal offset: col - i_at_capture (i_at_capture = xrow[l]-1)
     __m128i gscore = _mm_set1_epi8(-1);
     __m128i max_off128 = zero128;
     __m128i exit0 = _mm_set1_epi8(0xFF);
     __m128i zdrop128 = _mm_set1_epi8(zdrop);
-    
+
     int beg = 0, end = ncol;
     int nbeg = beg, nend = end;
 
@@ -4910,23 +4934,51 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
 
         __m128i j128 = zero128;
         __m128i maxRS1 = zero128;
-        
-        __m128i i1_128 = _mm_set1_epi8(i+1);
-        __m128i y1_128 = zero128;
-        
-#if RDT 
+
+        __m128i y1_128 = zero128;   // row-max column as diagonal offset (col - i)
+
+        // gscore best-row marker resets each row (the carried best row lives in
+        // the wide ierow[] side channel; this lane only flags "updated this row").
+        max_ie128 = zero128;
+
+        // Per-row diagonal-offset of the query end: qlen_off = qlen - i. Built
+        // wide then saturated to int8, with a validity mask so an out-of-band
+        // qlen-i (which would wrap and spuriously alias an in-band col offset)
+        // never triggers a false gscore/clamp. qlen_off_valid is true only when
+        // qlen-i lies within the representable band window [-w, w+1].
+        int8_t qlen_off_a[SIMD_WIDTH8]   __attribute((aligned(16)));
+        int8_t qlen_valid_a[SIMD_WIDTH8] __attribute((aligned(16)));
+        int8_t cmpim_a[SIMD_WIDTH8]      __attribute((aligned(16)));
+        for (int l=0; l<SIMD_WIDTH8; l++) {
+            int qoff = qlenw[l] - i;                 // wide
+            int qoff_sat = qoff;                     // saturate to int8 range
+            if (qoff_sat >  127) qoff_sat =  127;
+            if (qoff_sat < -128) qoff_sat = -128;
+            qlen_off_a[l]   = (int8_t) qoff_sat;
+            qlen_valid_a[l] = (qoff >= -w && qoff <= w + 1) ? (int8_t)0xFF : 0;
+            // exit when row i+1 has passed the per-lane effective length bound.
+            cmpim_a[l]      = ((i + 1) > mlenw[l]) ? (int8_t)0xFF : 0;
+        }
+        __m128i qlen_off128   = _mm_load_si128((__m128i *) qlen_off_a);
+        __m128i qlen_valid128 = _mm_load_si128((__m128i *) qlen_valid_a);
+
+#if RDT
         uint64_t tim1 = __rdtsc();
 #endif
-        
-        // Banding
-        __m128i i128, cache128;
+
+        // Banding (diagonal-offset frame). head128/tail128 arrive here in row-i's
+        // offset frame: the -1 shift at the end of the previous iteration converts
+        // (col - (i-1)) -> (col - i), so no additional adjustment is needed here.
+        //   abs head-grow: head = max(head, i - myband)  ->  head_off = max(head_off, -myband)
+        //   abs tail-clamp: tail = min(tail, (i+1)+myband, qlen)
+        //                                          -> tail_off = min(tail_off, 1+myband, qlen-i)
+        __m128i cache128;
         __m128i phead128 = head128, ptail128 = tail128;
-        i128 = _mm_set1_epi8(i);
-        cache128 = _mm_subs_epu8(i128, myband128);  // modif
-        head128 = _mm_max_epu8(head128, cache128);   // epi8 not present
-        cache128 = _mm_add_epi8(i1_128, myband128);
-        tail128 = _mm_min_epu8(tail128, cache128);
-        tail128 = _mm_min_epu8(tail128, qlen128);
+        __m128i negband128 = _mm_sub_epi8(zero128, myband128);            // -myband
+        head128 = _mm_max_epi8(head128, negband128);
+        cache128 = _mm_add_epi8(myband128, one128);                       // 1 + myband
+        tail128 = _mm_min_epi8(tail128, cache128);
+        tail128 = _mm_min_epi8(tail128, qlen_off128);
 
         // NEW, trimming.
         __m128i cmph = _mm_cmpeq_epi8(head128, phead128);
@@ -4941,7 +4993,7 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
             __m128i h128 = _mm_load_si128((__m128i *)(H_h + l * SIMD_WIDTH8));
             __m128i f128 = _mm_load_si128((__m128i *)(F + l * SIMD_WIDTH8));
 
-            __m128i pj128 = _mm_set1_epi8(l);
+            __m128i pj128 = _mm_set1_epi8(l - i);   // diagonal offset of column l
             __m128i cmp1 = _mm_cmpgt_epi8(head128, pj128);
             uint32_t cval = _mm_movemask_epi8(cmp1);
             if (cval == 0x00) break;
@@ -4958,7 +5010,9 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
         prof[DP3][0] += __rdtsc() - tim1;
 #endif
 
-        __m128i cmpim = _mm_cmpgt_epi8(i1_128, mlen128);
+        // cmpim: lane exits if row i+1 passed its effective length (precomputed
+        // wide into cmpim_a) OR the band collapsed (tail<=head, offset frame).
+        __m128i cmpim = _mm_load_si128((__m128i *) cmpim_a);
         __m128i cmpht = _mm_cmpeq_epi8(tail128, head128);
         cmpim = _mm_or_si128(cmpim, cmpht);
         // NEW
@@ -4983,7 +5037,7 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
             _mm_store_si128((__m128i *)(sbt_buf + jp * SIMD_WIDTH8), sbt11);
         }
 
-        j128 = _mm_set1_epi8(beg);
+        j128 = _mm_set1_epi8(beg - i);   // diagonal offset of first band column
         for(j = beg; j < end; j++)
         {
             __m128i f11, f21, sbt11;
@@ -5026,19 +5080,27 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
             // gscore calculations
             if (j >= minq)
             {
-                __m128i cmp = _mm_cmpeq_epi8(j128, qlen128);
+                // SAFE query-end test: (col - i) == (qlen - i) iff col == qlen,
+                // but only when qlen-i is in-band (else the wrapped/saturated
+                // qlen_off could alias an in-band col offset). Gate with the
+                // validity mask so an out-of-band query end can never match.
+                __m128i cmp = _mm_cmpeq_epi8(j128, qlen_off128);
+                cmp = _mm_and_si128(cmp, qlen_valid128);
                 //__m128i max_gh = _mm_max_epi8(gscore, h11);      //epi8 not present, modif
                 __m128i cmp_gh = _mm_cmpgt_epi8(gscore, h11);
-                __m128i tmp128_1 = _mm_blendv_epi8(i1_128, max_ie128, cmp_gh);
+                // Row marker: when h11 beats old gscore, flag "this row" (one128);
+                // otherwise keep the existing marker. The actual best row is
+                // captured into the wide ierow[] side channel in the epilogue.
+                __m128i tmp128_1 = _mm_blendv_epi8(one128, max_ie128, cmp_gh);
                 __m128i max_gh = _mm_blendv_epi8(h11, gscore, cmp_gh);
-                
+
                 tmp128_1 = _mm_blendv_epi8(max_ie128, tmp128_1, cmp);
                 tmp128_1 = _mm_blendv_epi8(max_ie128, tmp128_1, exit0);
-                
+
                 max_gh = _mm_blendv_epi8(gscore, max_gh, exit0);
-                max_gh = _mm_blendv_epi8(gscore, max_gh, cmp);              
-            
-                cmp = _mm_cmpgt_epi8(j128, tail128); 
+                max_gh = _mm_blendv_epi8(gscore, max_gh, cmp);
+
+                cmp = _mm_cmpgt_epi8(j128, tail128);
                 max_gh = _mm_blendv_epi8(max_gh, gscore, cmp);
                 max_ie128 = _mm_blendv_epi8(tmp128_1, max_ie128, cmp);
                 gscore = max_gh;
@@ -5067,23 +5129,57 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
         maxScore128 = _mm_blendv_epi8(maxScore128, score128, exit0);
 
         __m128i cmp = _mm_cmpgt_epi8(maxScore128, bmaxScore128);
+        // y128 (best col) stays a diagonal offset captured in the best row's
+        // frame; the best row itself moves to the wide xrow[] side channel.
         y128 = _mm_blendv_epi8(y128, y1_128, cmp);
-        x128 = _mm_blendv_epi8(x128, i1_128, cmp);
-        
-        // max_off calculations
-#if 0
-        tmp = _mm_sub_epi8(y1_128, i1_128);
-        tmp = _mm_abs_epi8(tmp);               // not present
-#else
-        __m128i ab = _mm_subs_epu8(y1_128, i1_128);
-        __m128i ba = _mm_subs_epu8(i1_128, y1_128);
-        tmp = _mm_or_si128(ab, ba);
-#endif
+
+        // max_off = max running diagonal-distance of the row-max from the main
+        // diagonal: |y1col - (i+1)| = |y1_off - 1| in the offset frame.
+        // y1_off - 1 is a SIGNED int8 (negative when row-max is left of the
+        // sub-diagonal), so use _mm_abs_epi8 (SSSE3 / sse2neon on arm64).
+        __m128i y1_minus1 = _mm_sub_epi8(y1_128, one128);
+        tmp = _mm_abs_epi8(y1_minus1);                    // |y1_off - 1|
         __m128i bmax_off128 = max_off128;
         tmp = _mm_max_epu8(max_off128, tmp);  // modif
         max_off128 = _mm_blendv_epi8(bmax_off128, tmp, cmp);
-        // Z-score
-        ZSCORE8(i1_128, y1_128);        
+
+        // Per-lane wide updates (O(rows)): best-score row (xrow), best-gscore
+        // row (ierow), and the z-drop test — all done in wide scalars so row
+        // distances that exceed int8 for long reads are handled exactly.
+        {
+            int8_t  cmp_a[SIMD_WIDTH8]      __attribute((aligned(16)));
+            int8_t  y1_a[SIMD_WIDTH8]       __attribute((aligned(16)));
+            int8_t  y_a[SIMD_WIDTH8]        __attribute((aligned(16)));
+            int8_t  ms_a[SIMD_WIDTH8]       __attribute((aligned(16)));
+            int8_t  rs_a[SIMD_WIDTH8]       __attribute((aligned(16)));
+            int8_t  exit_a[SIMD_WIDTH8]     __attribute((aligned(16)));
+            int8_t  ie_mark_a[SIMD_WIDTH8]  __attribute((aligned(16)));
+            _mm_store_si128((__m128i *) cmp_a, cmp);
+            _mm_store_si128((__m128i *) y1_a, y1_128);
+            _mm_store_si128((__m128i *) y_a, y128);
+            _mm_store_si128((__m128i *) ms_a, maxScore128);
+            _mm_store_si128((__m128i *) rs_a, maxRS1);
+            _mm_store_si128((__m128i *) exit_a, exit0);
+            _mm_store_si128((__m128i *) ie_mark_a, max_ie128);
+            for (int l = 0; l < SIMD_WIDTH8; l++) {
+                // best-score row
+                if (cmp_a[l]) xrow[l] = i + 1;
+                // best-gscore row: marker==1 means gscore was set this row
+                if (ie_mark_a[l] == 1) ierow[l] = i + 1;
+                // z-drop (only relevant where the lane is still alive)
+                if (exit_a[l]) {
+                    int xr  = xrow[l];                       // best row
+                    int y1c = (int) y1_a[l] + i;             // row-max col (abs)
+                    int yc  = (int) y_a[l] + (xr - 1);       // best col (abs)
+                    int tmpi = (i + 1) - xr;
+                    int tmpj = y1c - yc;
+                    int dif  = tmpi > tmpj ? (tmpi - tmpj) : (tmpj - tmpi);
+                    int drop = (int)(uint8_t)ms_a[l] - (int)(uint8_t)rs_a[l];
+                    if (drop - dif > zdrop) exit_a[l] = 0;
+                }
+            }
+            exit0 = _mm_load_si128((__m128i *) exit_a);
+        }
 
 #if RDT
         prof[DP1][0] += __rdtsc() - tim1;
@@ -5121,8 +5217,8 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
         __m128i tmpb = ff128;
 
         __m128i exit1 = _mm_xor_si128(exit0, ff128);
-        __m128i l128 = _mm_set1_epi8(beg);
-        
+        __m128i l128 = _mm_set1_epi8(beg - i);   // diagonal offset of column beg
+
         for (l = beg; l < end; l++)
         {
             __m128i f128 = _mm_load_si128((__m128i *)(F + l * SIMD_WIDTH8));
@@ -5147,7 +5243,7 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
         __m128i  index128 = tail128;
         tmpb = ff128;
 
-        l128 = _mm_set1_epi8(end);
+        l128 = _mm_set1_epi8(end - i);   // diagonal offset of column end
         for (l = end; l >= beg; l--)
         {
             __m128i f128 = _mm_load_si128((__m128i *)(F + l * SIMD_WIDTH8));
@@ -5169,8 +5265,15 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
             tmpb = tmp;
         }
         index128 = _mm_add_epi8(index128, two128);
-        tail128 = _mm_min_epu8(index128, qlen128);   // epi8 not present, modif
-        
+        // signed min in the offset frame against qlen-i
+        tail128 = _mm_min_epi8(index128, qlen_off128);
+
+        // Frame shift for the next row: i advances by 1, so the same absolute
+        // band edge has its diagonal offset (col - i) decremented by 1. Keep
+        // head/tail tracking the same columns as the frame moves.
+        head128 = _mm_sub_epi8(head128, one128);
+        tail128 = _mm_sub_epi8(tail128, one128);
+
 #if RDT
         prof[DP2][0] += __rdtsc() - tim1;
 #endif
@@ -5180,14 +5283,15 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
     prof[DP][0] += __rdtsc() - tim;
 #endif
     
+    // Score / gscore stay int8 here (exact while score < 128).
+    // TODO: scores >= 128 need re-baselining (not yet implemented).
+    // Positions are reconstructed wide from the diagonal-offset lanes plus the
+    // per-lane best-row side channels.
     int8_t score[SIMD_WIDTH8]  __attribute((aligned(64)));
     _mm_store_si128((__m128i *) score, maxScore128);
 
-    int8_t maxi[SIMD_WIDTH8]  __attribute((aligned(64)));
-    _mm_store_si128((__m128i *) maxi, x128);
-
     int8_t maxj[SIMD_WIDTH8]  __attribute((aligned(64)));
-    _mm_store_si128((__m128i *) maxj, y128);
+    _mm_store_si128((__m128i *) maxj, y128);   // best col as diagonal offset
 
     int8_t max_off_ar[SIMD_WIDTH8]  __attribute((aligned(64)));
     _mm_store_si128((__m128i *) max_off_ar, max_off128);
@@ -5195,19 +5299,18 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
     int8_t gscore_ar[SIMD_WIDTH8]  __attribute((aligned(64)));
     _mm_store_si128((__m128i *) gscore_ar, gscore);
 
-    int8_t maxie_ar[SIMD_WIDTH8]  __attribute((aligned(64)));
-    _mm_store_si128((__m128i *) maxie_ar, max_ie128);
-    
     for(i = 0; i < SIMD_WIDTH8; i++)
     {
-        p[i].score = score[i];
-        p[i].tle = maxi[i];
-        p[i].qle = maxj[i];
-        p[i].max_off = max_off_ar[i];
-        p[i].gscore = gscore_ar[i];
-        p[i].gtle = maxie_ar[i];
+        p[i].score   = (uint8_t) score[i];
+        p[i].tle     = xrow[i];                                   // best row (target end)
+        // qle reconstruction: maxj[l] = col - (xrow-1), so col = maxj[l] + (xrow-1).
+        // Guard the unset case (xrow==0 means no update occurred).
+        p[i].qle     = (xrow[i] == 0) ? 0 : ((int) maxj[i] + xrow[i] - 1);
+        p[i].max_off = (uint8_t) max_off_ar[i];
+        p[i].gscore  = (uint8_t) gscore_ar[i];
+        p[i].gtle    = ierow[i];                                  // best gscore row
     }
-    
+
     return;
 }
 
