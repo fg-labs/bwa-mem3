@@ -164,7 +164,19 @@ meth_bam_writer_t *meth_bam_writer_open(const char *path_or_dash,
      * (stamped from bwa_rg_id below) actually reference. The consolidated
      * @SQ above is authoritative for --meth, so a user -H that re-supplies
      * @SQ for an already-emitted contig will make htslib reject the add and
-     * the open fails loudly rather than emitting duplicate references. */
+     * the open fails loudly rather than emitting duplicate references.
+     *
+     * Note: unlike bam_writer_open (the default path), the index's .hdr/.dict
+     * sidecar records (idx_hdr_lines) are deliberately NOT forwarded here. In
+     * --meth mode the index prefix is the c2t-converted reference (fastmap.cpp
+     * rewrites ref_prefix to ".bwameth.c2t" before loading the sidecar), so
+     * that sidecar describes the doubled f/r converted contigs: its @SQ is
+     * unusable and its @CO/@PG describe the internal conversion artifact, not
+     * the user's reference. The correct way to carry real reference metadata
+     * (@SQ M5/UR tags, @CO/@PG) into --meth output is to load the *original*
+     * (pre-c2t) reference's sidecar and merge it by SN into the consolidated
+     * @SQ -- left as a follow-up; see the matching note at the call site in
+     * main_mem (fastmap.cpp). */
     if (hdr_line != NULL && hdr_line[0] != '\0' &&
         sam_hdr_add_lines(w->hdr, hdr_line, 0) < 0) goto fail;
 

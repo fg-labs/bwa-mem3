@@ -1489,6 +1489,14 @@ int main_mem(int argc, char *argv[])
                 "(%d chrom(s)).\n", g_meth_cmap->n_output);
         const char *meth_out_path = is_o ? out_path : "-";
         extern char *bwa_pg;
+        /* idx_hdr_lines is intentionally NOT passed to the meth writer: in
+         * --meth mode ref_prefix points at the ".bwameth.c2t" index, so its
+         * .hdr/.dict sidecar describes the doubled f/r converted contigs, not
+         * the user's reference. The consolidated @SQ from g_meth_cmap is
+         * authoritative. Carrying real reference metadata (@SQ M5/UR, @CO/@PG)
+         * into --meth output would require loading the *original* reference's
+         * sidecar and merging by SN -- a follow-up, not this fix. See the
+         * matching note in meth_bam_writer_open (meth_bam.cpp). */
         g_meth_bam_writer = meth_bam_writer_open(meth_out_path, g_meth_cmap, bwa_pg, NULL,
                                                  hdr_line, opt->bam_level);
         if (g_meth_bam_writer == NULL) {

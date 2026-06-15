@@ -122,4 +122,35 @@ samtools view    "$tmp/meth.bam" >"$tmp/meth.recs" 2>/dev/null \
     || { echo "FAIL: samtools could not read --meth BAM records" >&2; exit 1; }
 assert_rg_consistent "--meth" "$tmp/meth.hdr" "$tmp/meth.recs"
 
+# --- --meth @HD de-dup: a user -H @HD must suppress the default @HD ---------
+# meth_bam_writer_open emits a default "@HD VN:1.6 SO:unsorted" UNLESS the
+# user's -H already supplies an @HD (the hdr_text_has_type() guard). Without
+# that guard htslib would write two @HD lines (it does not de-dup @HD). Pass a
+# DISTINCT @HD (SO:coordinate) alongside -R and assert the output carries
+# exactly one @HD line and it is the user's — proving the default was
+# suppressed and the user's line survived. This pins the guard that the -R
+# assertions above never exercise (an @RG line carries no @HD).
+USER_HD=$'@HD\tVN:1.6\tSO:coordinate'
+"$bin" mem --meth -R "$RG" -H "$USER_HD" "$ref" "$reads" \
+    >"$tmp/meth_hd.bam" 2>"$tmp/meth_hd.err" || {
+    echo "FAIL: bwa-mem3 mem --meth -H @HD exited non-zero" >&2; cat "$tmp/meth_hd.err" >&2; exit 1
+}
+samtools view -H "$tmp/meth_hd.bam" >"$tmp/meth_hd.hdr" 2>/dev/null \
+    || { echo "FAIL: samtools could not read --meth -H @HD BAM header" >&2; exit 1; }
+
+n_hd="$(grep -c $'^@HD\t' "$tmp/meth_hd.hdr" || true)"
+if [[ "$n_hd" -ne 1 ]]; then
+    echo "FAIL [--meth @HD dedup]: expected exactly 1 @HD line, got $n_hd" >&2
+    echo "---- header @HD lines (tabs as <TAB>) ----" >&2
+    grep '^@HD' "$tmp/meth_hd.hdr" | sed $'s/\t/<TAB>/g' >&2 || echo "(none)" >&2
+    echo "------------------------------------------" >&2
+    exit 1
+fi
+if ! grep -qE $'^@HD\t.*\tSO:coordinate(\t|$)' "$tmp/meth_hd.hdr"; then
+    echo "FAIL [--meth @HD dedup]: the surviving @HD is not the user's (SO:coordinate)" >&2
+    grep '^@HD' "$tmp/meth_hd.hdr" | sed $'s/\t/<TAB>/g' >&2
+    exit 1
+fi
+echo "OK:   [--meth @HD dedup] exactly one @HD line, user's SO:coordinate preserved"
+
 echo "PASS: -R read group emitted as @RG header in both default and --meth modes"
