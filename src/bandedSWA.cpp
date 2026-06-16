@@ -429,19 +429,25 @@ void BandedPairWiseSW::scalarBandedSWAWrapper(SeqPair *seqPairArray,
 
 #define MAIN_CODE8_CORE(sbt11, h00, h11, e11, f11, f21, zero256, e_ins256, oe_ins256, e_del256, oe_del256) \
     {                                                                   \
-        __m256i m11 = _mm256_add_epi8(h00, sbt11);                      \
+        /* M = max(0, h00 + sbt) computed in UNSIGNED-saturating form so a    \
+         * legitimate score in [128,255] is kept (the old signed add_epi8 +   \
+         * signed max_epi8 floor wrapped/mis-read >127 as negative). Split    \
+         * the signed substitution score into its +bonus and -penalty parts:  \
+         * adds_epu8 (no wrap past 255) then subs_epu8 (floors at 0). Mirrors  \
+         * the validated NEON smithWaterman128_8 recurrence. */                \
+        __m256i sbt_pos = _mm256_max_epi8(sbt11, zero256);              \
+        __m256i sbt_neg = _mm256_max_epi8(_mm256_sub_epi8(zero256, sbt11), zero256); \
+        __m256i m11 = _mm256_subs_epu8(_mm256_adds_epu8(h00, sbt_pos), sbt_neg); \
         __m256i cmp11 = _mm256_cmpeq_epi8(h00, zero256);                \
-        m11 = _mm256_blendv_epi8(m11, zero256, cmp11);                  \
-        h11 = _mm256_max_epi8(m11, e11);                                \
-        h11 = _mm256_max_epi8(h11, f11);                                \
-        __m256i temp256 = _mm256_sub_epi8(m11, oe_ins256);              \
-        __m256i val256  = _mm256_max_epi8(temp256, zero256);            \
-        e11 = _mm256_sub_epi8(e11, e_ins256);                           \
-        e11 = _mm256_max_epi8(val256, e11);                             \
-        temp256 = _mm256_sub_epi8(m11, oe_del256);                      \
-        val256  = _mm256_max_epi8(temp256, zero256);                    \
-        f21 = _mm256_sub_epi8(f11, e_del256);                           \
-        f21 = _mm256_max_epi8(val256, f21);                             \
+        m11 = _mm256_blendv_epi8(m11, zero256, cmp11);  /* h00==0 -> local restart */ \
+        h11 = _mm256_max_epu8(m11, e11);                                \
+        h11 = _mm256_max_epu8(h11, f11);                                \
+        __m256i temp256 = _mm256_subs_epu8(m11, oe_ins256);            \
+        e11 = _mm256_subs_epu8(e11, e_ins256);                          \
+        e11 = _mm256_max_epu8(temp256, e11);                            \
+        temp256 = _mm256_subs_epu8(m11, oe_del256);                    \
+        f21 = _mm256_subs_epu8(f11, e_del256);                          \
+        f21 = _mm256_max_epu8(temp256, f21);                            \
     }
 
 #define SBT_PREPASS16(s1, s2, sbt11_out, mismatch256, match256, w_ambig_256) \
@@ -671,6 +677,12 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
         // so the two agree on B0; smithWaterman256_8 recomputes B0 via
         // bsw8_initial_floor(p[].h0, zdrop).
         const int REBASE_KEEP_W = bsw8_rebase_keep(zdrop);
+        // The h0-prefix column/row seed below uses SIGNED int8 ops, so the seeded
+        // byte min(h0, REBASE_KEEP_W) must stay <= 127 (signed-positive). The
+        // routing gate (bsw8_envelope_ok) enforces zdrop <= 126; assert for any
+        // direct caller that bypasses the gate.
+        assert(REBASE_KEEP_W <= 127 &&
+               "8-bit h0-prefix seed is signed int8; REBASE_KEEP>127 (zdrop>126) -> route to 16-bit");
 
         int nstart = 0, nend = numPairs;
 
@@ -927,40 +939,39 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
     // every carried score buffer/register for that lane, then add B back when
     // reconstructing the absolute result.
     //
-    // SAFETY: subtracting delta saturates cells whose rebaselined value < delta
-    // to 0, i.e. cells that were >= (REBASE_HI - delta) = REBASE_KEEP below the
-    // row max. With REBASE_KEEP > zdrop, any such cell is already beyond the
-    // z-drop horizon (the alignment through it has already z-dropped) and cannot
-    // lead to the optimum, so clamping it to 0 is sound. The per-row max can
-    // climb by at most w_match between two row-end checks (H(i,j) <= H(i-1,j-1)
-    // + w_match), so REBASE_HI must leave >= w_match headroom below 255.
+    // Scores live in the UNSIGNED byte range [0,255]. The DP recurrence computes
+    // M = max(0, h00 + sbt) with unsigned-saturating arithmetic (adds_epu8 then
+    // subs_epu8) and the row/global-max trackers (maxRS1, maxScore256) compare
+    // with UNSIGNED order (== after _mm256_max_epu8), so the full [0,255] is usable.
     //
-    // NB: scores must stay in the SIGNED-positive byte range [0,127]. The DP
-    // recurrence floors cells with `m11 & (m11 > 0)` (signed _mm256_cmpgt_epi8) and
-    // the row/global-max trackers (maxRS1, maxScore256) compare scores
-    // with SIGNED _mm256_cmpgt_epi8 — all of which mis-read a byte >= 128 as
-    // negative. So we re-baseline within [0,127], not [0,255].
-    //
-    // Re-baseline window derived from this kernel's scoring + z-drop, so the
-    // 8-bit score path is correct for ANY valid scoring (not just bench defaults):
-    //   REBASE_KEEP > zdrop      => any cell clamped on re-baseline (>= REBASE_KEEP
-    //                               below the row max) is already past the z-drop
-    //                               horizon, so clamping it to 0 is lossless.
-    //   REBASE_HI + maxStep<=127 => a not-yet-triggered row carries max < REBASE_HI
-    //                               and grows by <= maxStep, so the score byte never
-    //                               exceeds signed-int8 +127 (the floor/max-trackers
-    //                               use signed _mm256_cmpgt_epi8; a byte >=128 would be
-    //                               misread as negative and killed).
-    // Precondition REBASE_HI > REBASE_KEEP (a non-empty window exists) is equivalent
-    // to zdrop + maxStep <= 125; the 8-bit routing gate (bwamem.cpp, separate task)
-    // MUST ensure this, else the pair belongs on the 16-bit path.
+    // CORRECTNESS depends on re-baselining NEVER firing for a pair admitted to
+    // this kernel. The saturating-subtract is NOT generally lossless: it can zero
+    // a still-positive off-diagonal cell (a cell may sit > zdrop below the ROW max
+    // yet still lie on the eventual optimum — z-drop is a row-level early-exit, not
+    // a per-cell guarantee), and a zeroed cell is then misread as the h00==0
+    // local-restart sentinel, spuriously truncating a valid alignment. So we do
+    // NOT rely on re-baseline being lossless; instead it is held inert:
+    //   REBASE_HI = 255 - maxStep: a row whose max has not reached REBASE_HI grows
+    //     by <= maxStep per row (H(i,j) <= H(i-1,j-1) + maxStep), so its bytes stay
+    //     <= 255 with no rebase needed.
+    //   The bwamem.cpp routing gate admits a pair only when its MAX ATTAINABLE
+    //     score stays < REBASE_HI and h0 <= REBASE_KEEP (so B0 == 0). Under that
+    //     gate the row max never reaches REBASE_HI: B stays 0, stored bytes equal
+    //     absolute scores, and the kernel is a plain exact unsigned [0,255] SW.
+    // The re-baseline machinery below is retained only as a safety net; pairs that
+    // could exceed the envelope take the 16-bit path.
+    // Precondition REBASE_HI > REBASE_KEEP (a non-empty window) holds for
+    // zdrop + maxStep <= 253; the routing gate enforces the tighter
+    // zdrop + maxStep <= 127 because the h0-prefix column/row seed (wrapper setup
+    // below) uses SIGNED int8 ops, so the seeded byte min(h0, REBASE_KEEP) must
+    // stay <= 127 (signed-positive).
     int maxStep = (int)this->w_match;
     if ((int)this->w_ambig > maxStep) maxStep = (int)this->w_ambig;
     if (maxStep < 1) maxStep = 1;
     const int REBASE_KEEP = zdrop + 1;
-    const int REBASE_HI   = 127 - maxStep;
+    const int REBASE_HI   = 255 - maxStep;
     assert(REBASE_HI > REBASE_KEEP &&
-           "8-bit SW re-baseline: zdrop+maxStep>125, scoring outside safe envelope (route to 16-bit)");
+           "8-bit SW re-baseline: zdrop+maxStep>253, scoring outside safe envelope (route to 16-bit)");
     int32_t B[SIMD_WIDTH8];        // per-lane wide score floor (stored = abs - B)
     int32_t best_abs[SIMD_WIDTH8]; // running best score in ABSOLUTE units
     int32_t gbest_abs[SIMD_WIDTH8];// running gscore (query-end) in ABSOLUTE units
@@ -1189,8 +1200,11 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
             f21 = _mm256_blendv_epi8(f21, zero256, cmp1);
 
             __m256i bmaxRS = maxRS1;
-            maxRS1 =_mm256_max_epi8(maxRS1, h11);
-            __m256i cmpA = _mm256_cmpgt_epi8(maxRS1, bmaxRS);
+            maxRS1 =_mm256_max_epu8(maxRS1, h11);
+            // UNSIGNED >: maxRS1 = max_epu8(.,h11) >= bmaxRS always, so
+            // (maxRS1 >u bmaxRS) == (maxRS1 != bmaxRS). Signed cmpgt_epi8 here
+            // mis-read scores >127 (long reads) as negative.
+            __m256i cmpA = _mm256_xor_si256(_mm256_cmpeq_epi8(maxRS1, bmaxRS), ff256);
             __m256i cmpB =_mm256_cmpeq_epi8(maxRS1, h11);
             cmpA = _mm256_or_si256(cmpA, cmpB);
             cmp1 = _mm256_cmpgt_epi8(j256, tail256);
@@ -1239,10 +1253,12 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
 
         exit0 = _mm256_blendv_epi8(exit0, zero256,  tmp);
 
-        __m256i score256 = _mm256_max_epi8(maxScore256, maxRS1);
+        __m256i score256 = _mm256_max_epu8(maxScore256, maxRS1);
         maxScore256 = _mm256_blendv_epi8(maxScore256, score256, exit0);
 
-        __m256i cmp = _mm256_cmpgt_epi8(maxScore256, bmaxScore256);
+        // UNSIGNED >: maxScore256 (post-update) >= bmaxScore256, so (>u) == (!=).
+        // Signed cmpgt_epi8 mis-read scores >127.
+        __m256i cmp = _mm256_xor_si256(_mm256_cmpeq_epi8(maxScore256, bmaxScore256), ff256);
         // y256 (best col) stays a diagonal offset captured in the best row's
         // frame; the best row itself moves to the wide xrow[] side channel.
         y256 = _mm256_blendv_epi8(y256, y1_256, cmp);
@@ -1254,7 +1270,7 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
         __m256i y1_minus1 = _mm256_sub_epi8(y1_256, one256);
         tmp = _mm256_abs_epi8(y1_minus1);                    // |y1_off - 1|
         __m256i bmax_off256 = max_off256;
-        tmp = _mm256_max_epi8(max_off256, tmp);
+        tmp = _mm256_max_epu8(max_off256, tmp);
         max_off256 = _mm256_blendv_epi8(bmax_off256, tmp, cmp);
 
         // Per-lane wide updates (O(rows)): best-score row (xrow), best-gscore
@@ -2322,19 +2338,25 @@ void BandedPairWiseSW::smithWaterman256_16(uint16_t seq1SoA[],
 
 #define MAIN_CODE8_CORE(sbt11, h00, h11, e11, f11, f21, zero512, e_ins512, oe_ins512, e_del512, oe_del512) \
     {                                                                   \
-        __m512i m11 = _mm512_add_epi8(h00, sbt11);                      \
+        /* M = max(0, h00 + sbt) in UNSIGNED-saturating form so a legitimate  \
+         * score in [128,255] is kept (the old signed add_epi8 + signed       \
+         * max_epi8 floor wrapped/mis-read >127 as negative). Split the signed \
+         * substitution score into +bonus and -penalty parts: adds_epu8 (no   \
+         * wrap past 255) then subs_epu8 (floors at 0). Mirrors the validated  \
+         * NEON smithWaterman128_8 recurrence. */                              \
+        __m512i sbt_pos = _mm512_max_epi8(sbt11, zero512);              \
+        __m512i sbt_neg = _mm512_max_epi8(_mm512_sub_epi8(zero512, sbt11), zero512); \
+        __m512i m11 = _mm512_subs_epu8(_mm512_adds_epu8(h00, sbt_pos), sbt_neg); \
         __mmask64 cmp11 = _mm512_cmpeq_epi8_mask(h00, zero512);         \
-        m11 = _mm512_mask_blend_epi8(cmp11, m11, zero512);              \
-        h11 = _mm512_max_epi8(m11, e11);                                \
-        h11 = _mm512_max_epi8(h11, f11);                                \
-        __m512i temp512 = _mm512_sub_epi8(m11, oe_ins512);              \
-        __m512i val512  = _mm512_max_epi8(temp512, zero512);            \
-        e11 = _mm512_sub_epi8(e11, e_ins512);                           \
-        e11 = _mm512_max_epi8(val512, e11);                             \
-        temp512 = _mm512_sub_epi8(m11, oe_del512);                      \
-        val512  = _mm512_max_epi8(temp512, zero512);                    \
-        f21 = _mm512_sub_epi8(f11, e_del512);                           \
-        f21 = _mm512_max_epi8(val512, f21);                             \
+        m11 = _mm512_mask_blend_epi8(cmp11, m11, zero512);  /* h00==0 -> local restart */ \
+        h11 = _mm512_max_epu8(m11, e11);                                \
+        h11 = _mm512_max_epu8(h11, f11);                                \
+        __m512i temp512 = _mm512_subs_epu8(m11, oe_ins512);            \
+        e11 = _mm512_subs_epu8(e11, e_ins512);                          \
+        e11 = _mm512_max_epu8(temp512, e11);                            \
+        temp512 = _mm512_subs_epu8(m11, oe_del512);                    \
+        f21 = _mm512_subs_epu8(f11, e_del512);                          \
+        f21 = _mm512_max_epu8(temp512, f21);                            \
     }
 
 #define SBT_PREPASS16(s1, s2, sbt11_out, mismatch512, match512, w_ambig_512) \
@@ -2557,6 +2579,12 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
         // so the two agree on B0; smithWaterman512_8 recomputes B0 via
         // bsw8_initial_floor(p[].h0, zdrop).
         const int REBASE_KEEP_W = bsw8_rebase_keep(zdrop);
+        // The h0-prefix column/row seed below uses SIGNED int8 ops, so the seeded
+        // byte min(h0, REBASE_KEEP_W) must stay <= 127 (signed-positive). The
+        // routing gate (bsw8_envelope_ok) enforces zdrop <= 126; assert for any
+        // direct caller that bypasses the gate.
+        assert(REBASE_KEEP_W <= 127 &&
+               "8-bit h0-prefix seed is signed int8; REBASE_KEEP>127 (zdrop>126) -> route to 16-bit");
 
         int nstart = 0, nend = numPairs;
 
@@ -2815,40 +2843,39 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
     // every carried score buffer/register for that lane, then add B back when
     // reconstructing the absolute result.
     //
-    // SAFETY: subtracting delta saturates cells whose rebaselined value < delta
-    // to 0, i.e. cells that were >= (REBASE_HI - delta) = REBASE_KEEP below the
-    // row max. With REBASE_KEEP > zdrop, any such cell is already beyond the
-    // z-drop horizon (the alignment through it has already z-dropped) and cannot
-    // lead to the optimum, so clamping it to 0 is sound. The per-row max can
-    // climb by at most w_match between two row-end checks (H(i,j) <= H(i-1,j-1)
-    // + w_match), so REBASE_HI must leave >= w_match headroom below 255.
+    // Scores live in the UNSIGNED byte range [0,255]. The DP recurrence computes
+    // M = max(0, h00 + sbt) with unsigned-saturating arithmetic (adds_epu8 then
+    // subs_epu8) and the row/global-max trackers (maxRS1, maxScore512) compare
+    // with UNSIGNED order (_mm512_cmpgt_epu8_mask), so the full [0,255] is usable.
     //
-    // NB: scores must stay in the SIGNED-positive byte range [0,127]. The DP
-    // recurrence floors cells with cmpeq(h00,0) and the row/global-max trackers
-    // (maxRS1, maxScore512) compare scores with SIGNED
-    // _mm512_cmpgt_epi8_mask — all of which mis-read a byte >= 128 as negative.
-    // So we re-baseline within [0,127], not [0,255].
-    //
-    // Re-baseline window derived from this kernel's scoring + z-drop, so the
-    // 8-bit score path is correct for ANY valid scoring (not just bench defaults):
-    //   REBASE_KEEP > zdrop      => any cell clamped on re-baseline (>= REBASE_KEEP
-    //                               below the row max) is already past the z-drop
-    //                               horizon, so clamping it to 0 is lossless.
-    //   REBASE_HI + maxStep<=127 => a not-yet-triggered row carries max < REBASE_HI
-    //                               and grows by <= maxStep, so the score byte never
-    //                               exceeds signed-int8 +127 (the floor/max-trackers
-    //                               use signed _mm512_cmpgt_epi8_mask; a byte >=128
-    //                               would be misread as negative and killed).
-    // Precondition REBASE_HI > REBASE_KEEP (a non-empty window exists) is equivalent
-    // to zdrop + maxStep <= 125; the 8-bit routing gate (bwamem.cpp, separate task)
-    // MUST ensure this, else the pair belongs on the 16-bit path.
+    // CORRECTNESS depends on re-baselining NEVER firing for a pair admitted to
+    // this kernel. The saturating-subtract is NOT generally lossless: it can zero
+    // a still-positive off-diagonal cell (a cell may sit > zdrop below the ROW max
+    // yet still lie on the eventual optimum — z-drop is a row-level early-exit, not
+    // a per-cell guarantee), and a zeroed cell is then misread as the h00==0
+    // local-restart sentinel, spuriously truncating a valid alignment. So we do
+    // NOT rely on re-baseline being lossless; instead it is held inert:
+    //   REBASE_HI = 255 - maxStep: a row whose max has not reached REBASE_HI grows
+    //     by <= maxStep per row (H(i,j) <= H(i-1,j-1) + maxStep), so its bytes stay
+    //     <= 255 with no rebase needed.
+    //   The bwamem.cpp routing gate admits a pair only when its MAX ATTAINABLE
+    //     score stays < REBASE_HI and h0 <= REBASE_KEEP (so B0 == 0). Under that
+    //     gate the row max never reaches REBASE_HI: B stays 0, stored bytes equal
+    //     absolute scores, and the kernel is a plain exact unsigned [0,255] SW.
+    // The re-baseline machinery below is retained only as a safety net; pairs that
+    // could exceed the envelope take the 16-bit path.
+    // Precondition REBASE_HI > REBASE_KEEP (a non-empty window) holds for
+    // zdrop + maxStep <= 253; the routing gate enforces the tighter
+    // zdrop + maxStep <= 127 because the h0-prefix column/row seed (wrapper setup
+    // below) uses SIGNED int8 ops, so the seeded byte min(h0, REBASE_KEEP) must
+    // stay <= 127 (signed-positive).
     int maxStep = (int)this->w_match;
     if ((int)this->w_ambig > maxStep) maxStep = (int)this->w_ambig;
     if (maxStep < 1) maxStep = 1;
     const int REBASE_KEEP = zdrop + 1;
-    const int REBASE_HI   = 127 - maxStep;
+    const int REBASE_HI   = 255 - maxStep;
     assert(REBASE_HI > REBASE_KEEP &&
-           "8-bit SW re-baseline: zdrop+maxStep>125, scoring outside safe envelope (route to 16-bit)");
+           "8-bit SW re-baseline: zdrop+maxStep>253, scoring outside safe envelope (route to 16-bit)");
     int32_t B[SIMD_WIDTH8];        // per-lane wide score floor (stored = abs - B)
     int32_t best_abs[SIMD_WIDTH8]; // running best score in ABSOLUTE units
     int32_t gbest_abs[SIMD_WIDTH8];// running gscore (query-end) in ABSOLUTE units
@@ -3071,9 +3098,10 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
             f21 = _mm512_mask_blend_epi8(cmp1, f21, zero512);
             
             /* Part of main code MAIN_CODE */
-            __m512i bmaxRS = maxRS1, blend512;                                      
-            maxRS1 =_mm512_max_epi8(maxRS1, h11);                           
-            __mmask64 cmpA = _mm512_cmpgt_epi8_mask(maxRS1, bmaxRS);                    
+            __m512i bmaxRS = maxRS1, blend512;
+            maxRS1 =_mm512_max_epu8(maxRS1, h11);
+            // UNSIGNED >: signed cmpgt_epi8 mis-read scores >127 (long reads).
+            __mmask64 cmpA = _mm512_cmpgt_epu8_mask(maxRS1, bmaxRS);
             __mmask64 cmpB =_mm512_cmpeq_epi8_mask(maxRS1, h11);                    
             cmpA = cmpA | cmpB;
             cmp1 = _mm512_cmpgt_epi8_mask(j512, tail512);
@@ -3117,12 +3145,13 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
 
         exit0 = _mm512_mask_blend_epi8(tmp, exit0, zero512);
 
-        __m512i score512 = _mm512_max_epi8(maxScore512, maxRS1);
+        __m512i score512 = _mm512_max_epu8(maxScore512, maxRS1);
         // exit0: 0xFF=alive; movepi8_mask high-bit => mask bit=1 where alive.
         __mmask64 mex0 = _mm512_movepi8_mask(exit0);
         maxScore512 = _mm512_mask_blend_epi8(mex0, maxScore512, score512);
 
-        __mmask64 cmp = _mm512_cmpgt_epi8_mask(maxScore512, bmaxScore512);
+        // UNSIGNED >: signed cmpgt_epi8 mis-read scores >127 (long reads).
+        __mmask64 cmp = _mm512_cmpgt_epu8_mask(maxScore512, bmaxScore512);
         // y512 (best col) stays a diagonal offset captured in the best row's
         // frame; the best row itself moves to the wide xrow[] side channel.
         y512 = _mm512_mask_blend_epi8(cmp, y512, y1_512);
@@ -3134,7 +3163,7 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
         __m512i y1_minus1 = _mm512_sub_epi8(y1_512, one512);
         __m512i ind512 = _mm512_abs_epi8(y1_minus1);          // |y1_off - 1|
         __m512i bmax_off512 = max_off512;
-        ind512 = _mm512_max_epi8(max_off512, ind512);
+        ind512 = _mm512_max_epu8(max_off512, ind512);
         max_off512 = _mm512_mask_blend_epi8(cmp, bmax_off512, ind512);
 
         // Per-lane wide updates (O(rows)): best-score row (xrow), best-gscore
@@ -5003,10 +5032,16 @@ static inline __m128i _mm_blendv_epi8 (__m128i x, __m128i y, __m128i mask)
 // pre-computed score vector `sbt11` from SBT_PREPASS8.
 #define MAIN_CODE8_CORE(sbt11, h00, h11, e11, f11, f21, zero128, e_ins128, oe_ins128, e_del128, oe_del128) \
     {                                                                   \
-        __m128i m11 = _mm_add_epi8(h00, sbt11);                         \
+        /* M = max(0, h00 + sbt) computed in UNSIGNED-saturating form so a    \
+         * legitimate score in [128,255] is kept (the old signed `m11 &       \
+         * (m11 > 0)` floor mis-read >127 as negative and zeroed it). Split   \
+         * the signed substitution score into its +bonus and -penalty parts:  \
+         * adds_epu8 (no wrap past 255) then subs_epu8 (floors at 0). */       \
+        __m128i sbt_pos = _mm_max_epi8(sbt11, zero128);                 \
+        __m128i sbt_neg = _mm_max_epi8(_mm_sub_epi8(zero128, sbt11), zero128); \
+        __m128i m11 = _mm_subs_epu8(_mm_adds_epu8(h00, sbt_pos), sbt_neg); \
         __m128i cmp11 = _mm_cmpeq_epi8(h00, zero128);                   \
-        m11 = _mm_blendv_epi8(m11, zero128, cmp11);                     \
-        m11 = _mm_and_si128(m11, _mm_cmpgt_epi8(m11, zero128));         \
+        m11 = _mm_blendv_epi8(m11, zero128, cmp11);  /* h00==0 -> local restart */ \
         h11 = _mm_max_epu8(m11, e11);                                   \
         h11 = _mm_max_epu8(h11, f11);                                   \
         __m128i temp128 = _mm_subs_epu8(m11, oe_ins128);                \
@@ -5150,6 +5185,12 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
         // so the two agree on B0; smithWaterman128_8 recomputes B0 via
         // bsw8_initial_floor(p[].h0, zdrop).
         const int REBASE_KEEP_W = bsw8_rebase_keep(zdrop);
+        // The h0-prefix column/row seed below uses SIGNED int8 ops, so the seeded
+        // byte min(h0, REBASE_KEEP_W) must stay <= 127 (signed-positive). The
+        // routing gate (bsw8_envelope_ok) enforces zdrop <= 126; assert for any
+        // direct caller that bypasses the gate.
+        assert(REBASE_KEEP_W <= 127 &&
+               "8-bit h0-prefix seed is signed int8; REBASE_KEEP>127 (zdrop>126) -> route to 16-bit");
 
         int nstart = 0, nend = numPairs;
         
@@ -5398,40 +5439,39 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
     // every carried score buffer/register for that lane, then add B back when
     // reconstructing the absolute result.
     //
-    // SAFETY: subtracting delta saturates cells whose rebaselined value < delta
-    // to 0, i.e. cells that were >= (REBASE_HI - delta) = REBASE_KEEP below the
-    // row max. With REBASE_KEEP > zdrop, any such cell is already beyond the
-    // z-drop horizon (the alignment through it has already z-dropped) and cannot
-    // lead to the optimum, so clamping it to 0 is sound. The per-row max can
-    // climb by at most w_match between two row-end checks (H(i,j) <= H(i-1,j-1)
-    // + w_match), so REBASE_HI must leave >= w_match headroom below 255.
+    // Scores live in the UNSIGNED byte range [0,255]. The DP recurrence computes
+    // M = max(0, h00 + sbt) with unsigned-saturating arithmetic (adds_epu8 then
+    // subs_epu8) and the row/global-max trackers (maxRS1, maxScore128) compare
+    // with UNSIGNED order (== after _mm_max_epu8), so the full [0,255] is usable.
     //
-    // NB: scores must stay in the SIGNED-positive byte range [0,127]. The DP
-    // recurrence floors cells with `m11 & (m11 > 0)` (signed _mm_cmpgt_epi8) and
-    // the row/global-max trackers (maxRS1, maxScore128) compare scores
-    // with SIGNED _mm_cmpgt_epi8 — all of which mis-read a byte >= 128 as
-    // negative. So we re-baseline within [0,127], not [0,255].
-    //
-    // Re-baseline window derived from this kernel's scoring + z-drop, so the
-    // 8-bit score path is correct for ANY valid scoring (not just bench defaults):
-    //   REBASE_KEEP > zdrop      => any cell clamped on re-baseline (>= REBASE_KEEP
-    //                               below the row max) is already past the z-drop
-    //                               horizon, so clamping it to 0 is lossless.
-    //   REBASE_HI + maxStep<=127 => a not-yet-triggered row carries max < REBASE_HI
-    //                               and grows by <= maxStep, so the score byte never
-    //                               exceeds signed-int8 +127 (the floor/max-trackers
-    //                               use signed _mm_cmpgt_epi8; a byte >=128 would be
-    //                               misread as negative and killed).
-    // Precondition REBASE_HI > REBASE_KEEP (a non-empty window exists) is equivalent
-    // to zdrop + maxStep <= 125; the 8-bit routing gate (bwamem.cpp, separate task)
-    // MUST ensure this, else the pair belongs on the 16-bit path.
+    // CORRECTNESS depends on re-baselining NEVER firing for a pair admitted to
+    // this kernel. The saturating-subtract is NOT generally lossless: it can zero
+    // a still-positive off-diagonal cell (a cell may sit > zdrop below the ROW max
+    // yet still lie on the eventual optimum — z-drop is a row-level early-exit, not
+    // a per-cell guarantee), and a zeroed cell is then misread as the h00==0
+    // local-restart sentinel, spuriously truncating a valid alignment. So we do
+    // NOT rely on re-baseline being lossless; instead it is held inert:
+    //   REBASE_HI = 255 - maxStep: a row whose max has not reached REBASE_HI grows
+    //     by <= maxStep per row (H(i,j) <= H(i-1,j-1) + maxStep), so its bytes stay
+    //     <= 255 with no rebase needed.
+    //   The bwamem.cpp routing gate admits a pair only when its MAX ATTAINABLE
+    //     score stays < REBASE_HI and h0 <= REBASE_KEEP (so B0 == 0). Under that
+    //     gate the row max never reaches REBASE_HI: B stays 0, stored bytes equal
+    //     absolute scores, and the kernel is a plain exact unsigned [0,255] SW.
+    // The re-baseline machinery below is retained only as a safety net; pairs that
+    // could exceed the envelope take the 16-bit path.
+    // Precondition REBASE_HI > REBASE_KEEP (a non-empty window) holds for
+    // zdrop + maxStep <= 253; the routing gate enforces the tighter
+    // zdrop + maxStep <= 127 because the h0-prefix column/row seed (wrapper setup
+    // below) uses SIGNED int8 ops, so the seeded byte min(h0, REBASE_KEEP) must
+    // stay <= 127 (signed-positive).
     int maxStep = (int)this->w_match;
     if ((int)this->w_ambig > maxStep) maxStep = (int)this->w_ambig;
     if (maxStep < 1) maxStep = 1;
     const int REBASE_KEEP = zdrop + 1;
-    const int REBASE_HI   = 127 - maxStep;
+    const int REBASE_HI   = 255 - maxStep;
     assert(REBASE_HI > REBASE_KEEP &&
-           "8-bit SW re-baseline: zdrop+maxStep>125, scoring outside safe envelope (route to 16-bit)");
+           "8-bit SW re-baseline: zdrop+maxStep>253, scoring outside safe envelope (route to 16-bit)");
     int32_t B[SIMD_WIDTH8];        // per-lane wide score floor (stored = abs - B)
     int32_t best_abs[SIMD_WIDTH8]; // running best score in ABSOLUTE units
     int32_t gbest_abs[SIMD_WIDTH8];// running gscore (query-end) in ABSOLUTE units
@@ -5668,9 +5708,12 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
             f21 = _mm_blendv_epi8(f21, zero128, cmp1);
             
             // got this block out of MAIN_CODE
-            __m128i bmaxRS = maxRS1;                                        
+            __m128i bmaxRS = maxRS1;
             maxRS1 =_mm_max_epu8(maxRS1, h11);   // modif
-            __m128i cmpA = _mm_cmpgt_epi8(maxRS1, bmaxRS);                  
+            // UNSIGNED >: maxRS1 = max_epu8(.,h11) >= bmaxRS always, so
+            // (maxRS1 >u bmaxRS) == (maxRS1 != bmaxRS). Signed cmpgt_epi8 here
+            // mis-read scores >127 (long reads) as negative.
+            __m128i cmpA = _mm_xor_si128(_mm_cmpeq_epi8(maxRS1, bmaxRS), ff128);
             __m128i cmpB =_mm_cmpeq_epi8(maxRS1, h11);                  
             cmpA = _mm_or_si128(cmpA, cmpB);
             cmp1 = _mm_cmpgt_epi8(j128, tail128);
@@ -5734,7 +5777,10 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
         __m128i score128 = _mm_max_epu8(maxScore128, maxRS1);   // epi8 not present, modif
         maxScore128 = _mm_blendv_epi8(maxScore128, score128, exit0);
 
-        __m128i cmp = _mm_cmpgt_epi8(maxScore128, bmaxScore128);
+        // UNSIGNED >: maxScore128 (post-update, = max_epu8 of old & maxRS1 on
+        // alive lanes, else unchanged) is >= bmaxScore128, so (>u) == (!=).
+        // Signed cmpgt_epi8 mis-read scores >127.
+        __m128i cmp = _mm_xor_si128(_mm_cmpeq_epi8(maxScore128, bmaxScore128), ff128);
         // y128 (best col) stays a diagonal offset captured in the best row's
         // frame; the best row itself moves to the wide xrow[] side channel.
         y128 = _mm_blendv_epi8(y128, y1_128, cmp);
