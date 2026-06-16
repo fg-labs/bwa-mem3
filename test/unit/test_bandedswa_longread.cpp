@@ -23,6 +23,22 @@ namespace {
 
 struct Out { int score, tle, gtle, qle, gscore, max_off; };
 
+// The batched kernels (getScores8/16) round numPairs up to a multiple of the
+// SIMD width (roundNumPairs in smithWatermanBatchWrapper{8,16}) and initialize
+// + prefetch-read padding lanes PAST numPairs (the production pipeline
+// over-allocates seqPairArray by MAX_LINE_LEN to cover this). A direct caller
+// that allocates exactly numPairs SeqPairs therefore gets an out-of-bounds
+// write/read on any tier whose SIMD width does not divide numPairs (e.g.
+// AVX2=32, AVX-512=64). Pad the SeqPair array: round up to SIMD_WIDTH8 -- the
+// 8-bit lane count of the tier this TU compiles for, which equals the width the
+// linked kernel rounds to because the test build is given the same arch macros
+// as libbwa.a (see test/Makefile ARCH_FLAGS_FROM_PARENT) -- plus MAX_LINE_LEN
+// slack for the prefetch look-ahead, mirroring the production over-allocation.
+// Padding pairs are value-initialized (len1=len2=0), inert dummy lanes.
+inline int padPairs(int n) {
+    return ((n + SIMD_WIDTH8 - 1) / SIMD_WIDTH8) * SIMD_WIDTH8 + MAX_LINE_LEN;
+}
+
 // Build the bench-default 5x5 nucleotide scoring matrix (match=a, mismatch=-b,
 // ambiguous=-1).
 void build_mat(int8_t mat[25], int a, int b, int ambig) {
@@ -48,7 +64,7 @@ int run_parity(int width, int n, int maxlen, unsigned long seed,
 
     std::vector<uint8_t> seqBufRef((size_t)STRIDE * n, 0);
     std::vector<uint8_t> seqBufQer((size_t)STRIDE * n, 0);
-    std::vector<SeqPair> pairs(n);
+    std::vector<SeqPair> pairs(padPairs(n));   // padded for SIMD-width round-up + prefetch
     std::vector<Out> oracle(n);
 
     std::mt19937_64 rng(seed);
