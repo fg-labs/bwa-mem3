@@ -96,6 +96,14 @@ ok "pg_cl_escape_test"
 "$HERE/meth_rg_header_test.sh" "$BWAMEM3" "$FIXTURES" || fail "meth_rg_header_test failed"
 ok "meth_rg_header_test"
 
+# --- meth_sidecar_enrich_test ---------------------------------------------
+# --meth must enrich its consolidated @SQ with the original reference's
+# identity tags (M5/UR/AS/SP) from that reference's .hdr/.dict sidecar
+# (matched by SN) and forward its @CO/@PG/@RG provenance, while never
+# consulting the c2t index's own sidecar.
+"$HERE/meth_sidecar_enrich_test.sh" "$BWAMEM3" "$FIXTURES" || fail "meth_sidecar_enrich_test failed"
+ok "meth_sidecar_enrich_test"
+
 # --- help_prescan_test ----------------------------------------------------
 # `mem --help` pre-scan must not match `--help` when it is the value of
 # an option that takes an argument (-R, -o, --set-as-failed, ...).

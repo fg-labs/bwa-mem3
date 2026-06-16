@@ -1300,6 +1300,11 @@ int main_mem(int argc, char *argv[])
      * invocation) already passed the ".bwameth.c2t" path directly, use
      * it as-is rather than double-appending. */
     char c2t_ref[PATH_MAX];
+    char orig_ref_buf[PATH_MAX];
+    /* In --meth, the original (pre-c2t) reference prefix, used to load that
+     * reference's .hdr/.dict sidecar for @SQ M5/UR enrichment and @CO/@PG/@RG
+     * pass-through. NULL outside --meth. */
+    const char *meth_orig_ref_prefix = NULL;
     const char *ref_prefix = argv[optind];
     if (opt->meth_mode) {
         const char *suffix = ".bwameth.c2t";
@@ -1314,6 +1319,25 @@ int main_mem(int argc, char *argv[])
                 exit(EXIT_FAILURE);
             }
             ref_prefix = c2t_ref;
+            meth_orig_ref_prefix = argv[optind];
+        } else {
+            /* User passed the ".bwameth.c2t" path directly; recover the
+             * original reference prefix by stripping the suffix so its
+             * sidecar (not the c2t index's) supplies @SQ identity tags. */
+            size_t base = alen - slen;
+            if (base < sizeof(orig_ref_buf)) {
+                memcpy(orig_ref_buf, argv[optind], base);
+                orig_ref_buf[base] = '\0';
+                meth_orig_ref_prefix = orig_ref_buf;
+            } else {
+                /* Degenerate: the prefix doesn't fit. The original sidecar is
+                 * optional (the c2t index alone aligns), so warn and continue
+                 * without @SQ M5/UR enrichment rather than aborting. */
+                fprintf(stderr,
+                        "[bwa-mem3:--meth] WARNING: reference path too long to "
+                        "derive the original prefix; @SQ M5/UR enrichment "
+                        "skipped.\n");
+            }
         }
     }
 
@@ -1426,6 +1450,12 @@ int main_mem(int argc, char *argv[])
      * the --bam path forwards them to htslib's sam_hdr_add_lines so the
      * rich @SQ (AS/M5/SP/AH/…) also makes it into the BAM header. */
     char *idx_hdr_lines = bwa_load_hdr_from_index(ref_prefix);
+    /* --meth only: the original (pre-c2t) reference's .hdr/.dict sidecar, for
+     * @SQ M5/UR enrichment and @CO/@PG/@RG pass-through in meth_bam_writer_open.
+     * NULL outside --meth or when the original has no sidecar. */
+    char *meth_orig_hdr_lines = (meth_orig_ref_prefix != NULL)
+                                ? bwa_load_hdr_from_index(meth_orig_ref_prefix)
+                                : NULL;
 
     /* Output path:
      *  - --meth: open meth_bam_writer with strand-consolidated SQ headers.
@@ -1465,6 +1495,7 @@ int main_mem(int argc, char *argv[])
     (void)is_o;
     (void)hdr_line;
     (void)idx_hdr_lines;
+    (void)meth_orig_hdr_lines;
     (void)out_path;
 #else
     if (opt->meth_mode) {
@@ -1489,16 +1520,15 @@ int main_mem(int argc, char *argv[])
                 "(%d chrom(s)).\n", g_meth_cmap->n_output);
         const char *meth_out_path = is_o ? out_path : "-";
         extern char *bwa_pg;
-        /* idx_hdr_lines is intentionally NOT passed to the meth writer: in
-         * --meth mode ref_prefix points at the ".bwameth.c2t" index, so its
-         * .hdr/.dict sidecar describes the doubled f/r converted contigs, not
-         * the user's reference. The consolidated @SQ from g_meth_cmap is
-         * authoritative. Carrying real reference metadata (@SQ M5/UR, @CO/@PG)
-         * into --meth output would require loading the *original* reference's
-         * sidecar and merging by SN -- a follow-up, not this fix. See the
-         * matching note in meth_bam_writer_open (meth_bam.cpp). */
+        /* The c2t index's own sidecar (idx_hdr_lines) is NOT passed: in --meth
+         * mode ref_prefix points at the ".bwameth.c2t" index, whose sidecar
+         * describes the doubled f/r converted contigs. Instead pass
+         * meth_orig_hdr_lines — the *original* reference's sidecar — so the
+         * writer can enrich the consolidated @SQ with real M5/UR tags and
+         * forward @CO/@PG/@RG provenance. */
         g_meth_bam_writer = meth_bam_writer_open(meth_out_path, g_meth_cmap, bwa_pg, NULL,
-                                                 hdr_line, opt->bam_level);
+                                                 hdr_line, meth_orig_hdr_lines,
+                                                 opt->bam_level);
         if (g_meth_bam_writer == NULL) {
             fprintf(stderr, "ERROR: meth: failed to open BAM writer for '%s'\n", meth_out_path);
             meth_orig_ref_free(g_meth_orig_ref); g_meth_orig_ref = NULL;
@@ -1571,6 +1601,7 @@ int main_mem(int argc, char *argv[])
      * process; the kernel reclaims the mapping at process exit. */
     free(hdr_line);
     free(idx_hdr_lines);
+    free(meth_orig_hdr_lines);
     free(opt);
     if (aux.legacy_reader) { kseq_destroy(aux.ks); err_gzclose(fp); }
     else { fast_kseq_destroy(aux.frks); fast_reader_close(aux.fr1); }
