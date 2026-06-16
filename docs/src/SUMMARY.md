@@ -17,6 +17,7 @@
 - [Output: SAM/BAM, headers, tags](user-guide/output.md)
 - [Threading and resource use](user-guide/threading.md)
 - [Memory allocator (mimalloc)](user-guide/allocator.md)
+- [Memory budgeting and data-type tuning](user-guide/memory-and-data-types.md)
 - [Tips and best practices](user-guide/tips.md)
 
 # Performance
