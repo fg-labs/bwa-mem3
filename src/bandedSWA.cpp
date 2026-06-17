@@ -1572,6 +1572,8 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
         pairArray[ii].id = ii;
         pairArray[ii].len1 = 0;
         pairArray[ii].len2 = 0;
+        pairArray[ii].idr = 0;
+        pairArray[ii].idq = 0;
     }
 
 #if RDT 
@@ -1655,7 +1657,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
             uint64_t tim;
             for(j = 0; j < SIMD_WIDTH16; j++)
             {
-                { // prefetch block
+                if ((i + j + PFD) < roundNumPairs) { // prefetch block (bounded; see getScores8/16 contract)
                     SeqPair spf = pairArray[i + j + PFD];
                     _mm_prefetch((const char*) seqBufRef + (int64_t)spf.idr, _MM_HINT_NTA);
                     _mm_prefetch((const char*) seqBufRef + (int64_t)spf.idr + 64, _MM_HINT_NTA);
@@ -1696,7 +1698,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
 //-------------------
             for(j = 0; j < SIMD_WIDTH16; j++)
             {
-                { // prefetch block
+                if ((i + j + PFD) < roundNumPairs) { // prefetch block (bounded; see getScores8/16 contract)
                     SeqPair spf = pairArray[i + j + PFD];
                     _mm_prefetch((const char*) seqBufQer + (int64_t)spf.idq, _MM_HINT_NTA);
                     _mm_prefetch((const char*) seqBufQer + (int64_t)spf.idq + 64, _MM_HINT_NTA);
@@ -2500,6 +2502,8 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
         pairArray[ii].id = ii;
         pairArray[ii].len1 = 0;
         pairArray[ii].len2 = pairArray[numPairs - 1].len2;
+        pairArray[ii].idr = 0;
+        pairArray[ii].idq = 0;
     }
 
 #if RDT
@@ -2602,7 +2606,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
             uint64_t tim;
             for(j = 0; j < SIMD_WIDTH8; j++)
             {
-                { // prefetch block
+                if ((i + j + PFD8) < roundNumPairs) { // prefetch block (bounded; see getScores8/16 contract)
                     SeqPair spf = pairArray[i + j + PFD8];
                     _mm_prefetch((const char*) seqBufRef + (int64_t)spf.idr, _MM_HINT_NTA);
                     _mm_prefetch((const char*) seqBufRef + (int64_t)spf.idr + 64, _MM_HINT_NTA);
@@ -2653,7 +2657,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
 //-------------------
             for(j = 0; j < SIMD_WIDTH8; j++)
             {
-                { // prefetch block
+                if ((i + j + PFD8) < roundNumPairs) { // prefetch block (bounded; see getScores8/16 contract)
                     SeqPair spf = pairArray[i + j + PFD8];
                     _mm_prefetch((const char*) seqBufQer + (int64_t)spf.idq, _MM_HINT_NTA);
                     _mm_prefetch((const char*) seqBufQer + (int64_t)spf.idq + 64, _MM_HINT_NTA);
@@ -3464,6 +3468,8 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
         pairArray[ii].id = ii;
         pairArray[ii].len1 = 0;
         pairArray[ii].len2 = 0;
+        pairArray[ii].idr = 0;
+        pairArray[ii].idq = 0;
     }
 
 #if RDT
@@ -3546,7 +3552,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
 
             for(j = 0; j < SIMD_WIDTH16; j++)
             {
-                { // prefetch block
+                if ((i + j + PFD16) < roundNumPairs) { // prefetch block (bounded; see getScores8/16 contract)
                     SeqPair spf = pairArray[i + j + PFD16];
                     _mm_prefetch((const char*) seqBufRef + (int64_t)spf.idr, _MM_HINT_NTA);
                     _mm_prefetch((const char*) seqBufRef + (int64_t)spf.idr + 64, _MM_HINT_NTA);
@@ -3589,7 +3595,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
 //-------------------
             for(j = 0; j < SIMD_WIDTH16; j++)
             {
-                { // prefetch block
+                if ((i + j + PFD16) < roundNumPairs) { // prefetch block (bounded; see getScores8/16 contract)
                     SeqPair spf = pairArray[i + j + PFD16];
                     _mm_prefetch((const char*) seqBufQer + (int64_t)spf.idq, _MM_HINT_NTA);
                     _mm_prefetch((const char*) seqBufQer + (int64_t)spf.idq + 64, _MM_HINT_NTA);
@@ -4316,6 +4322,8 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
         pairArray[ii].id = ii;
         pairArray[ii].len1 = 0;
         pairArray[ii].len2 = 0;
+        pairArray[ii].idr = 0;
+        pairArray[ii].idq = 0;
     }
 
 #if RDT
@@ -4399,7 +4407,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
 
             for(j = 0; j < SIMD_WIDTH16; j++)
             {
-                { // prefetch block
+                if ((i + j + PFD) < roundNumPairs) { // prefetch block (bounded; see getScores8/16 contract)
                     SeqPair spf = pairArray[i + j + PFD];
                     _mm_prefetch((const char*) seqBufRef + (int64_t)spf.idr, _MM_HINT_NTA);
                     _mm_prefetch((const char*) seqBufRef + (int64_t)spf.idr + 64, _MM_HINT_NTA);
@@ -4440,7 +4448,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
 //-------------------
             for(j = 0; j < SIMD_WIDTH16; j++)
             {
-                { // prefetch block
+                if ((i + j + PFD) < roundNumPairs) { // prefetch block (bounded; see getScores8/16 contract)
                     SeqPair spf = pairArray[i + j + PFD];
                     _mm_prefetch((const char*) seqBufQer + (int64_t)spf.idq, _MM_HINT_NTA);
                     _mm_prefetch((const char*) seqBufQer + (int64_t)spf.idq + 64, _MM_HINT_NTA);
