@@ -181,15 +181,25 @@ ifeq ($(USE_MIMALLOC),1)
     INCLUDES += -Iext/mimalloc/include
 endif
 
-# libdeflate: used directly by src/fast_reader.c for BGZF block decode (the
-# vanilla-gzip path stays on zlib). htslib already links -ldeflate
-# transitively; we add the <libdeflate.h> include path here. On macOS it
-# lives under the Homebrew prefix, resolved dynamically (mirrors the libomp
-# prefix detection below) so the build works on both Apple Silicon
-# (/opt/homebrew) and Intel (/usr/local) hosts rather than hardcoding one.
+# libdeflate: used directly by src/fast_reader.c for BGZF block decode. htslib
+# already links -ldeflate transitively; we add the <libdeflate.h> include path
+# here. On macOS it lives under the Homebrew prefix, resolved dynamically
+# (mirrors the libomp prefix detection below) so the build works on both Apple
+# Silicon (/opt/homebrew) and Intel (/usr/local) hosts rather than hardcoding one.
 ifeq ($(UNAME_S),Darwin)
     LIBDEFLATE_PREFIX ?= $(shell brew --prefix libdeflate 2>/dev/null)
     INCLUDES += -I$(LIBDEFLATE_PREFIX)/include
+endif
+
+# zlib-ng: src/fast_reader.c uses its native (zng_*) streaming inflate for the
+# plain-gzip path (SIMD, ~2x zlib). Native API => no symbol clash with the
+# system zlib that htslib / the legacy gzFile reader still use. On macOS resolve
+# the Homebrew prefix; on Linux <zlib-ng.h>/-lz-ng come from the system package.
+# TODO(prod): vendor zlib-ng under ext/ (cmake static build, like mimalloc) so
+# the Batch fleet doesn't depend on a host package.
+ifeq ($(UNAME_S),Darwin)
+    ZLIBNG_PREFIX ?= $(shell brew --prefix zlib-ng 2>/dev/null)
+    INCLUDES += -I$(ZLIBNG_PREFIX)/include
 endif
 
 # libsais (pinned in ext/libsais; see submodule SHA): linear-time suffix
@@ -228,6 +238,12 @@ ifeq ($(UNAME_S),Darwin)
     LIBS += -L$(LIBDEFLATE_PREFIX)/lib -ldeflate
 else
     LIBS += -ldeflate
+endif
+# zlib-ng: direct dependency of src/fast_reader.c (streaming plain-gzip inflate).
+ifeq ($(UNAME_S),Darwin)
+    LIBS += -L$(ZLIBNG_PREFIX)/lib -lz-ng
+else
+    LIBS += -lz-ng
 endif
 # Pull in htslib's transitive deps (-ldeflate when libdeflate is detected,
 # bzlib / lzma / curl when those features are enabled) from the generated
@@ -590,21 +606,21 @@ stage_prof_test: src/stage_prof.cpp src/stage_prof.h test/stage_prof_test.cpp
 # round-trips). Links only zlib + libdeflate, so it needs no bwa-mem3 build.
 FAST_READER_TEST_INC = -Isrc
 ifeq ($(UNAME_S),Darwin)
-    FAST_READER_TEST_INC += -I$(LIBDEFLATE_PREFIX)/include
-    FAST_READER_TEST_LIB = -L$(LIBDEFLATE_PREFIX)/lib
+    FAST_READER_TEST_INC += -I$(LIBDEFLATE_PREFIX)/include -I$(ZLIBNG_PREFIX)/include
+    FAST_READER_TEST_LIB = -L$(LIBDEFLATE_PREFIX)/lib -L$(ZLIBNG_PREFIX)/lib
 endif
 fast_reader_selftest: src/fast_reader.c test/fast_reader_selftest.c
-	$(CC) -O2 -Wall -Wextra $(FAST_READER_TEST_INC) test/fast_reader_selftest.c src/fast_reader.c $(FAST_READER_TEST_LIB) -lz -ldeflate -o $@
+	$(CC) -O2 -Wall -Wextra $(FAST_READER_TEST_INC) test/fast_reader_selftest.c src/fast_reader.c $(FAST_READER_TEST_LIB) -lz -lz-ng -ldeflate -o $@
 
 # Differential test: fr_fastq vs kseq, byte-identical record parsing. Links only
 # zlib + libdeflate (kseq.h is header-only), so it needs no bwa-mem3 build.
 fr_fastq_diff_test: src/fr_fastq.c src/fast_reader.c test/fr_fastq_diff_test.c
-	$(CC) -O2 -Wall -Wextra $(FAST_READER_TEST_INC) test/fr_fastq_diff_test.c src/fr_fastq.c src/fast_reader.c $(FAST_READER_TEST_LIB) -lz -ldeflate -o $@
+	$(CC) -O2 -Wall -Wextra $(FAST_READER_TEST_INC) test/fr_fastq_diff_test.c src/fr_fastq.c src/fast_reader.c $(FAST_READER_TEST_LIB) -lz -lz-ng -ldeflate -o $@
 
 # Read+parse microbenchmark: kseq vs fr_fastq on a real FASTQ (no index/align).
 # Usage: ./fr_fastq_bench {kseq|frfastq} reads.fq[.gz] [reps]
 fr_fastq_bench: src/fr_fastq.c src/fast_reader.c test/fr_fastq_bench.c
-	$(CC) -O2 -Wall -Wextra $(FAST_READER_TEST_INC) test/fr_fastq_bench.c src/fr_fastq.c src/fast_reader.c $(FAST_READER_TEST_LIB) -lz -ldeflate -o $@
+	$(CC) -O2 -Wall -Wextra $(FAST_READER_TEST_INC) test/fr_fastq_bench.c src/fr_fastq.c src/fast_reader.c $(FAST_READER_TEST_LIB) -lz -lz-ng -ldeflate -o $@
 
 test/shm_pack_round_trip_test.o: test/shm_pack_round_trip_test.cpp
 
