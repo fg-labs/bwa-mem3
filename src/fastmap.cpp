@@ -1653,11 +1653,28 @@ int main_mem(int argc, char *argv[])
     }
 #endif
 
-    if (fixed_chunk_size > 0)
+    if (fixed_chunk_size > 0) {
+        /* -K: the user pinned the batch size (for reproducibility) — honor it
+         * exactly, never cap. */
         aux.task_size = fixed_chunk_size;
-    else {
-        //aux.task_size = 10000000 * opt->n_threads; //aux.actual_chunk_size;
-        aux.task_size = opt->chunk_size * opt->n_threads; //aux.actual_chunk_size;
+    } else {
+        /* Default batch size is chunk_size (~10M bases) per thread. That keeps
+         * each thread well-fed, but at very high -t it makes a single chunk
+         * enormous (10M * 192 ~= 1.9G bases), so the input is only ~3-4 chunks
+         * and the pipeline starves: the first chunk's read and the last chunk's
+         * write don't overlap anything, leaving cores idle (fill/drain). Cap the
+         * default so high -t still produces enough chunks to keep read/compute/
+         * write overlapped, while keeping each chunk far above the ~33k-pairs
+         * floor below which per-chunk overhead (pestat/barriers) starts to bite.
+         * Output stays identical for -t small enough that the cap doesn't engage
+         * (scaled <= cap); above that, batch composition changes exactly as -K
+         * would (validated to leave proper-pair rate unchanged). The cap is
+         * overridable via BWA_MEM3_CHUNK_CAP (bases; <=0 disables, for sweeps). */
+        int64_t cap = 256000000;
+        const char *cap_env = getenv("BWA_MEM3_CHUNK_CAP");
+        if (cap_env && *cap_env) cap = (int64_t)atoll(cap_env);
+        int64_t scaled = (int64_t)opt->chunk_size * (int64_t)opt->n_threads;
+        aux.task_size = (cap > 0 && scaled > cap) ? cap : scaled;
     }
     tprof[MISC][1] = opt->chunk_size = aux.actual_chunk_size = aux.task_size;
 
