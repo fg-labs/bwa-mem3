@@ -224,7 +224,7 @@ static size_t make_fuzz_payload(char *out, size_t cap)
         out[n++] = fasta ? '>' : '@';
         int namelen = 1 + (int)rnd(20);
         for (int j = 0; j < namelen; j++) out[n++] = (char)('a' + rnd(26));
-        if (rnd(2)) { out[n++] = (char)('/' + rnd(2) * ('1' - '/')); } /* sometimes /x style */
+        if (rnd(2)) { out[n++] = '/'; out[n++] = (char)('1' + rnd(2)); } /* sometimes /1 or /2 */
         if (rnd(3) == 0) { out[n++] = ' '; int cl = (int)rnd(15); for (int j = 0; j < cl; j++) out[n++] = (char)('A' + rnd(40)); }
         out[n++] = '\n';
         int seqlen = (int)rnd(40);

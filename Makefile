@@ -261,7 +261,7 @@ OBJS=		src/fastmap.o src/bwtindex.o src/utils.o src/kthread.o \
 			src/packed_text.o src/fm_index_writer.o src/index_prelude.o \
 			src/system.o src/libsais_build.o \
 			src/bwa_shm.o src/simd_dispatch.o \
-			src/fast_reader.o src/fast_reader_bseq.o src/stage_prof.o
+			src/fast_reader.o src/fast_reader_bseq.o src/fr_fastq.o src/stage_prof.o
 
 # Kernel TUs (bandedSWA, kswv, ksw, sam_encode) are compiled per-tier on x86
 # and linked directly via KERNEL_TIER_OBJS_LINK. The dispatch wrappers in
@@ -574,7 +574,10 @@ shm_lock_destroy_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/shm_lock_destr
 src/fast_reader.o: src/fast_reader.c src/fast_reader.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDES) -c -o $@ $<
 
-src/fast_reader_bseq.o: src/fast_reader_bseq.c src/fast_reader_bseq.h src/fast_reader.h
+src/fast_reader_bseq.o: src/fast_reader_bseq.c src/fast_reader_bseq.h src/fast_reader.h src/fr_fastq.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDES) -c -o $@ $<
+
+src/fr_fastq.o: src/fr_fastq.c src/fr_fastq.h src/fast_reader.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDES) -c -o $@ $<
 
 # Standalone stage_prof helper unit test (stats + clocks + NaN init). Links only
@@ -597,6 +600,11 @@ fast_reader_selftest: src/fast_reader.c test/fast_reader_selftest.c
 # zlib + libdeflate (kseq.h is header-only), so it needs no bwa-mem3 build.
 fr_fastq_diff_test: src/fr_fastq.c src/fast_reader.c test/fr_fastq_diff_test.c
 	$(CC) -O2 -Wall -Wextra $(FAST_READER_TEST_INC) test/fr_fastq_diff_test.c src/fr_fastq.c src/fast_reader.c $(FAST_READER_TEST_LIB) -lz -ldeflate -o $@
+
+# Read+parse microbenchmark: kseq vs fr_fastq on a real FASTQ (no index/align).
+# Usage: ./fr_fastq_bench {kseq|frfastq} reads.fq[.gz] [reps]
+fr_fastq_bench: src/fr_fastq.c src/fast_reader.c test/fr_fastq_bench.c
+	$(CC) -O2 -Wall -Wextra $(FAST_READER_TEST_INC) test/fr_fastq_bench.c src/fr_fastq.c src/fast_reader.c $(FAST_READER_TEST_LIB) -lz -ldeflate -o $@
 
 test/shm_pack_round_trip_test.o: test/shm_pack_round_trip_test.cpp
 
