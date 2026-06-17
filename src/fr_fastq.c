@@ -111,6 +111,15 @@ static size_t line_content_len(const unsigned char *s, size_t raw_len)
     return raw_len;
 }
 
+/* Index of the next '\n' in b[from..end), or `end` if none. memchr is the
+ * libc-vectorised newline scan (NEON/SSE/AVX) — the sequence and quality lines
+ * are the dominant scan cost, so this is where the speedup lives. */
+static inline size_t find_nl(const unsigned char *b, size_t from, size_t end)
+{
+    const unsigned char *nl = (const unsigned char *)memchr(b + from, '\n', end - from);
+    return nl ? (size_t)(nl - b) : end;
+}
+
 /* Attempt to parse one record entirely out of the resident buffer.
  *   1           -> *rec filled, *new_beg = byte after the record
  *   0           -> clean EOF
@@ -139,8 +148,7 @@ static int scan_record(fr_fastq_t *p, fr_fastq_rec_t *rec, size_t *new_beg)
     size_t com_s = name_e, com_e = name_e;
     size_t after_header;          /* first byte of the line below the header */
     if (i < end && b[i] != '\n') {
-        size_t cs = i + 1, j = cs;
-        while (j < end && b[j] != '\n') j++;
+        size_t cs = i + 1, j = find_nl(b, cs, end);
         if (j >= end && !p->eof) return FR_UNDERRUN;
         com_s = cs;
         com_e = cs + line_content_len(b + cs, j - cs);
@@ -160,7 +168,7 @@ static int scan_record(fr_fastq_t *p, fr_fastq_rec_t *rec, size_t *new_beg)
         if (c == '>' || c == '@' || c == '+') { term = c; break; }
         if (c == '\n') { k++; continue; }        /* skip empty lines */
         size_t ls = k;
-        while (k < end && b[k] != '\n') k++;
+        k = find_nl(b, k, end);
         if (k >= end && !p->eof) return FR_UNDERRUN;
         size_t clen = line_content_len(b + ls, k - ls);
         if (seq_lines == 0) { seq_s = ls; seq_e = ls + clen; }
@@ -193,8 +201,7 @@ static int scan_record(fr_fastq_t *p, fr_fastq_rec_t *rec, size_t *new_beg)
     }
 
     /* skip the '+' separator line. */
-    size_t pl = k;
-    while (pl < end && b[pl] != '\n') pl++;
+    size_t pl = find_nl(b, k, end);
     if (pl >= end && !p->eof) return FR_UNDERRUN;
     if (pl >= end) return -2;     /* '+' line with no newline and no quality */
     size_t m = pl + 1;
@@ -205,7 +212,7 @@ static int scan_record(fr_fastq_t *p, fr_fastq_rec_t *rec, size_t *new_beg)
     for (;;) {
         if (m >= end) { if (p->eof) break; else return FR_UNDERRUN; }
         size_t ls = m;
-        while (m < end && b[m] != '\n') m++;
+        m = find_nl(b, m, end);
         if (m >= end && !p->eof) return FR_UNDERRUN;
         size_t clen = line_content_len(b + ls, m - ls);
         if (qual_lines == 0) { qual_s = ls; qual_e = ls + clen; }
