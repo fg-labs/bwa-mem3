@@ -593,6 +593,11 @@ endif
 fast_reader_selftest: src/fast_reader.c test/fast_reader_selftest.c
 	$(CC) -O2 -Wall -Wextra $(FAST_READER_TEST_INC) test/fast_reader_selftest.c src/fast_reader.c $(FAST_READER_TEST_LIB) -lz -ldeflate -o $@
 
+# Differential test: fr_fastq vs kseq, byte-identical record parsing. Links only
+# zlib + libdeflate (kseq.h is header-only), so it needs no bwa-mem3 build.
+fr_fastq_diff_test: src/fr_fastq.c src/fast_reader.c test/fr_fastq_diff_test.c
+	$(CC) -O2 -Wall -Wextra $(FAST_READER_TEST_INC) test/fr_fastq_diff_test.c src/fr_fastq.c src/fast_reader.c $(FAST_READER_TEST_LIB) -lz -ldeflate -o $@
+
 test/shm_pack_round_trip_test.o: test/shm_pack_round_trip_test.cpp
 
 # Run the in-tree tests via the unit-test harness in test/, plus the
