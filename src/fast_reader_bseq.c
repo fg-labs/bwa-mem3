@@ -15,23 +15,49 @@
  * instantiation used elsewhere. */
 KSEQ_INIT(fast_reader_t *, fast_reader_read)
 
-/* trim_readno / kseq2bseq1 mirror the static helpers in bwa.cpp exactly:
- * strip a trailing /<digit> for any digit; per-field strdup; qual==NULL when
- * empty; zero the struct first (the output loop free()s every field). */
+/* fr_trim_readno mirrors the static helper in bwa.cpp exactly: strip a trailing
+ * /<digit> for any digit. It runs BEFORE the copy and shortens ks->name.l, so
+ * fr_kseq2bseq1 must read the live kseq length rather than re-scanning. */
 static inline void fr_trim_readno(kstring_t *s)
 {
     if (s->l > 2 && s->s[s->l - 2] == '/' && isdigit((unsigned char)s->s[s->l - 1]))
         s->l -= 2, s->s[s->l] = 0;
 }
 
+/* Length-aware field copy: malloc(len+1)+memcpy using the kseq-known length,
+ * avoiding strdup's internal strlen scan on the hot path. The kseq source is
+ * already NUL-terminated at .l; we set dst[len] explicitly so the copy is
+ * NUL-terminated regardless. Aborts on OOM to match the house style of failing
+ * loudly on allocation failure (see the realloc in bseq_read_fast below). */
+static inline char *fr_dup_field(const char *src, size_t len)
+{
+    char *dst = (char *)malloc(len + 1);
+    if (dst == NULL)
+        err_fatal(__func__, "failed to allocate %zu bytes for a read field", len + 1);
+    memcpy(dst, src, len);
+    dst[len] = '\0';
+    return dst;
+}
+
+/* fr_kseq2bseq1 produces output identical to bwa.cpp's kseq2bseq1, but copies
+ * each field with its kseq-known length (ks->*.l) so the copy never scans for a
+ * terminator, and takes l_seq from ks->seq.l directly. qual==NULL when empty.
+ *
+ * The leading memset is retained on purpose and is NOT the cost the strlen
+ * removal targets: bseq_read_fast grows `seqs` with realloc, which leaves new
+ * entries uninitialized, and the output loop in fastmap.cpp free()s sam/bams
+ * unconditionally — so every field must start well-defined. Zeroing the whole
+ * struct (rather than hand-listing sam/bams/n_bams/cap_bams) stays correct if a
+ * field is ever added to bseq1_t, matching the documented rationale on the
+ * bwa.cpp sibling. id is overwritten by the caller. */
 static inline void fr_kseq2bseq1(const kseq_t *ks, bseq1_t *s)
 {
     memset(s, 0, sizeof(*s));
-    s->name    = strdup(ks->name.s);
-    s->comment = ks->comment.l ? strdup(ks->comment.s) : 0;
-    s->seq     = strdup(ks->seq.s);
-    s->qual    = ks->qual.l ? strdup(ks->qual.s) : 0;
-    s->l_seq   = strlen(s->seq);
+    s->name    = fr_dup_field(ks->name.s, ks->name.l);
+    s->comment = ks->comment.l ? fr_dup_field(ks->comment.s, ks->comment.l) : 0;
+    s->seq     = fr_dup_field(ks->seq.s, ks->seq.l);
+    s->qual    = ks->qual.l ? fr_dup_field(ks->qual.s, ks->qual.l) : 0;
+    s->l_seq   = (int)ks->seq.l;
 }
 
 void *fast_kseq_init(fast_reader_t *fr) { return kseq_init(fr); }
