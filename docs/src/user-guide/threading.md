@@ -25,7 +25,7 @@ Thread count and wall-clock alignment time scale well to approximately 16–32
 threads on a modern CPU. Beyond that, several effects conspire to flatten the
 curve:
 
-1. **FM-index bandwidth.** The index for hg38 is ~28 GB and does not fit in
+1. **FM-index bandwidth.** The index for hg38 is ~21 GB and does not fit in
    the L3 cache of any current server. At high thread counts, threads contend
    for memory bandwidth accessing the BWT.
 2. **IO contention.** On spinning disk or a shared network filesystem,
@@ -68,9 +68,15 @@ and [Best Practices: multi-sample workflows](../best-practices/multi-sample.md).
 
 ## Memory use
 
-Peak RAM during alignment is dominated by the in-memory FM-index. For hg38,
-expect roughly 28 GB of resident memory per `bwa-mem3 mem` process. Additional
-memory is used per batch (`-K` reads × read length × a small constant).
+Peak RAM during alignment is the resident index plus a per-batch working set.
+The index dominates: for hg38 the resident baseline is roughly 21 GB per
+`bwa-mem3 mem` process, fixed regardless of `-t` or `-K`. The per-batch working
+set is added on top and scales with the *effective* batch size, which by default
+is `chunk_size × n_threads` (so `-t 16` at the default `chunk_size` buffers
+160 M bases per batch, not 10 M). On memory-constrained hosts, or for data with
+wide mate-rescue windows such as Hi-C, this per-batch term is what tips a run
+into OOM — see
+[Memory budgeting and data-type tuning](memory-and-data-types.md).
 
 With `bwa-mem3 shm`, the index is mapped from a shared-memory segment, so
 multiple concurrent `mem` processes share the same physical pages. The OS
@@ -85,7 +91,7 @@ process.
 
 ## IO recommendations
 
-- **Use local NVMe storage** for the index files when possible. The ~28 GB BWT
+- **Use local NVMe storage** for the index files when possible. The ~16 GB BWT
   read is the dominant IO event at the start of each `mem` run.
 - **Write BAM (`--bam`) to a fast local disk** or pipe directly to
   `samtools sort`. Avoid writing uncompressed SAM to a network filesystem.
@@ -96,6 +102,7 @@ process.
 
 **See also:**
 [Aligning short reads (mem)](aligning.md) ·
+[Memory budgeting and data-type tuning](memory-and-data-types.md) ·
 [Memory allocator (mimalloc)](allocator.md) ·
 [Quick start: shared-memory index](../getting-started/quick-shm.md) ·
 [Best Practices: multi-sample workflows](../best-practices/multi-sample.md) ·
