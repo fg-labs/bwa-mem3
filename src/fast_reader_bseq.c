@@ -70,8 +70,25 @@ bseq1_t *bseq_read_fast(int64_t chunk_size, int *n_, void *ks1_, void *ks2_, int
     int64_t size = 0, m, n;
     bseq1_t *seqs;
     m = n = 0; seqs = 0;
-    while (kseq_read(ks) >= 0) {
-        if (ks2 && kseq_read(ks2) < 0) {                 /* 2nd file has fewer */
+    for (;;) {
+        /* Tokenize the next record(s). kseq_read does the FASTQ tokenization
+         * (newline scan + copy of each field into its kstring_t) and pulls
+         * bytes through the codec layer, which charges its own read()/inflate
+         * time to the diskwait/decompress timers from inside this call. To make
+         * read_parse account for the tokenization itself (the dominant, formerly
+         * uninstrumented cost), time the whole kseq_read region and subtract the
+         * IO delta the codec already counted. The IO interval is strictly nested
+         * inside this wall bracket, so the remainder is non-negative. */
+        double _tk0 = sp_enabled() ? sp_wall() : 0.0, _io0 = 0.0;
+        if (sp_enabled()) { double d, c; sp_read_get(&d, &c, NULL); _io0 = d + c; }
+        int r1 = kseq_read(ks);
+        int r2 = (r1 >= 0 && ks2) ? kseq_read(ks2) : 0;
+        if (sp_enabled()) {
+            double d, c; sp_read_get(&d, &c, NULL);
+            sp_read_add(2, (sp_wall() - _tk0) - ((d + c) - _io0));
+        }
+        if (r1 < 0) break;                               /* clean EOF on 1st file */
+        if (ks2 && r2 < 0) {                             /* 2nd file has fewer */
             fprintf(stderr, "[W::%s] the 2nd file has fewer sequences.\n", __func__);
             break;
         }
