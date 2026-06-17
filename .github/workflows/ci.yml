@@ -340,6 +340,20 @@ jobs:
           CHR22_SIM_DIR=/tmp/chr22-sim \
           bash test/regression/chr22_parity.sh
 
+      - name: Long-read PE 8-bit/16-bit parity (chr22, 400bp)
+        if: matrix.canonical == true
+        # Exercises the recovered >=128bp 8-bit banded-SW path end-to-end: the
+        # script self-simulates 400bp PE reads and diffs `bwa-mem3 mem` with the
+        # 8-bit path enabled (default) vs BWAMEM3_DISABLE_BSW8=1 (forced 16-bit).
+        # The two must be byte-identical -- guards the unsigned [0,255] recurrence
+        # + routing gate against regression. Self-contained A/B (one binary).
+        run: |
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          CHR22_FA=/tmp/chr22/chr22.fa \
+          CHR22_SIM_DIR=/tmp/chr22-sim-longread \
+          PIXI_MANIFEST="$GITHUB_WORKSPACE/test/holodeck/pixi.toml" \
+          bash test/regression/longread_pe_parity.sh
+
       - name: Run unit-test harness
         if: matrix.canonical == true || matrix.arch_flag == 'sse41'
         run: |

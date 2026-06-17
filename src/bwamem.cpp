@@ -82,6 +82,97 @@ KSORT_INIT(mem_intv1, SMEM, intv_lt1)  // debug
 #define BUCKET_MAX_INIT_W 8
 #endif
 
+/* ------------------------------------------------------------------------
+ * 8-bit (16-lane) SW safe-envelope gate.
+ *
+ * The recovered 8-bit kernel `smithWaterman128_8` (and the AVX2/AVX-512 ports)
+ * runs an UNSIGNED [0,255] score recurrence and is byte-exact for long reads
+ * ONLY inside the envelope below. The decisive constraint is that the per-lane
+ * score re-baselining must NEVER fire for an admitted pair: its saturating
+ * subtract is not generally lossless (it can zero a still-positive off-diagonal
+ * cell, which the recurrence then misreads as the h00==0 local-restart sentinel
+ * and truncates a valid alignment — z-drop is a row-level early-exit, not a
+ * per-cell guarantee). Held inert, the kernel is a plain exact unsigned SW.
+ *
+ *   - len1, len2 < MAX_SEQ_LEN8  : slab width + the wide per-row position
+ *     side channel are sized MAX_SEQ_LEN8; rows/cols at or beyond it would
+ *     run off the slab.
+ *   - len1 >= len2 (target >= query) : the gscore (query-end) capture is
+ *     byte-identical to scalar only when the query-end column lies on/left of
+ *     the main diagonal. See smithWaterman128_8 gscore capture.
+ *   - w <= BSW8_MAX_W (= 127)     : every band/position quantity is encoded
+ *     as a diagonal offset d = j - i in [-w, +w], which fits signed int8
+ *     only for w <= 127. The default opt->w = 100 qualifies; wide-band
+ *     retries (w doubling to 200/400/800) do NOT and fall back to 16-bit.
+ *   - zdrop + maxStep <= 127      : keeps REBASE_KEEP = zdrop + 1 <= 127. The DP
+ *     body is unsigned [0,255], but the h0-prefix column/row seed in the kernel
+ *     wrappers (smithWaterman*_8 setup) still uses SIGNED int8 ops, so the seeded
+ *     byte h0' = min(h0, REBASE_KEEP) must stay <= 127 (signed-positive). maxStep
+ *     is the largest per-step score increment, max(w_match, w_ambig, 1) =
+ *     max(opt->a, 1). (This also keeps the re-baseline window non-empty:
+ *     REBASE_HI = 255 - maxStep > REBASE_KEEP.)
+ *   - h0 <= zdrop + 1             : keeps the initial floor B0 = max(0, h0 -
+ *     REBASE_KEEP) == 0, so the seed score does not itself force a re-baseline.
+ *   - h0 + min(len1,len2)*a < 255 - maxStep : the MAX ATTAINABLE score (seed
+ *     plus an all-match diagonal over the shorter sequence) stays below REBASE_HI,
+ *     so the running row max never reaches it and re-baseline never fires.
+ *
+ * NOTE: minval (= h0 + min(len)*a) is still used by sortPairsLenExt as the
+ * counting-sort bin index (hist[minval]) and must stay < MAX_SEQ_LEN8 there for
+ * the bin to be in range; that is a histogram-sizing constraint, NOT the tier
+ * decision. Pairs failing this envelope fall through to the existing 16-bit
+ * (then scalar) buckets exactly as before. */
+#define BSW8_MAX_W 127                 /* max band: diagonal offset d=j-i must fit signed int8 */
+#define BSW8_MAX_ZDROP_STEP 127        /* keep REBASE_KEEP=zdrop+1 <= 127: the h0-prefix
+                                          column/row seed in the 8-bit wrappers uses SIGNED
+                                          int8 ops, so the seeded byte min(h0,REBASE_KEEP) must
+                                          stay signed-positive (<=127). Also keeps the re-baseline
+                                          window non-empty (REBASE_HI=255-max_step > REBASE_KEEP).
+                                          See smithWaterman128_8 re-baseline + h0-prefix seed. */
+
+static inline int bsw8_envelope_ok(int len1, int len2, int w,
+                                   int score_a, int zdrop, int h0)
+{
+    /* Dev A/B hook: BWAMEM3_DISABLE_BSW8=1 forces every pair off the 8-bit path
+     * onto the 16-bit (then scalar) buckets. Used to validate that the 8-bit
+     * kernel is byte-identical to the 16-bit reference in the full pipeline
+     * (diff the SAM with vs without). Off by default. The function-local static
+     * with a non-trivial initializer gets C++11 thread-safe one-time init, so the
+     * getenv runs exactly once even under the OpenMP/pthread worker fan-out (a
+     * plain `static int x = -1; if (x<0) x = ...;` would be a data race). */
+    static const int disable = []() {
+        const char *e = getenv("BWAMEM3_DISABLE_BSW8");
+        return (e && atoi(e)) ? 1 : 0;
+    }();
+    if (disable) return 0;
+    /* 64-bit math: len < MAX_SEQ_LEN8 and a small score_a keep these tiny in
+     * practice, but compute the bounds in int64_t so a pathological scoring
+     * parameter cannot wrap an int and admit a pair the guards would reject. */
+    int64_t max_step = score_a > 1 ? (int64_t)score_a : 1;   /* max(w_match, w_ambig, 1) */
+    int64_t shorter  = len1 < len2 ? (int64_t)len1 : (int64_t)len2;
+    /* Max attainable SW score: seed h0 plus an all-match diagonal over the
+     * shorter sequence. Must stay strictly below REBASE_HI = 255 - max_step so
+     * the running row max never triggers a (lossy) re-baseline; combined with
+     * h0 <= zdrop+1 (B0 == 0) the kernel runs as an exact unsigned [0,255] SW. */
+    int64_t max_score = (int64_t)h0 + shorter * (int64_t)score_a;
+    return len1 < MAX_SEQ_LEN8 && len2 < MAX_SEQ_LEN8 &&
+           /* target (rows, len1) >= query (cols, len2). The re-baseline 8-bit
+            * kernel's gscore (query-end score) is byte-identical to scalar ONLY
+            * when the query-end column (len2-1) lies on or left of the main
+            * diagonal, i.e. len1 >= len2. When len2 > len1 the query end is
+            * off-diagonal to the right, where the re-baseline saturating-subtract
+            * zeroes those low-scoring cells (they sit >zdrop below the row max),
+            * the band trims them, and gscore is lost. Such pairs (rare: only when
+            * the reference window is shorter than the read segment, e.g. at contig
+            * edges) route to the 16-bit tier, which has no re-baseline and is
+            * byte-identical for them. See smithWaterman128_8 gscore capture. */
+           len1 >= len2 &&
+           w <= BSW8_MAX_W &&
+           zdrop + max_step <= BSW8_MAX_ZDROP_STEP &&
+           h0 <= zdrop + 1 &&
+           max_score < 255 - max_step;
+}
+
             int tcnt = 0;
 /********************
  * Filtering chains *
@@ -2048,7 +2139,7 @@ void* _mm_realloc(void *ptr, int64_t csize, int64_t nsize, int16_t dsize) {
 
 inline void sortPairsLenExt(SeqPair *pairArray, int32_t count, SeqPair *tempArray,
                             int32_t *hist, int &numPairs128, int &numPairs16,
-                            int &numPairs1, int score_a)
+                            int &numPairs1, int score_a, int w, int zdrop)
 {
     int32_t i;
     numPairs128 = numPairs16 = numPairs1 = 0;
@@ -2060,18 +2151,32 @@ inline void sortPairsLenExt(SeqPair *pairArray, int32_t count, SeqPair *tempArra
         //_mm256_store_si256((__m256i *)(hist + i), zero256);
         hist[i] = 0;
 
-    int *arr = (int*) calloc (count, sizeof(int));
-    assert(arr != NULL);
+    /* count can be 0 for an empty extension side; calloc(0, ...) is allowed to
+     * return NULL, so guard on count rather than assert non-null (asserts are
+     * compiled in here — no -DNDEBUG). Matches the out-of-memory convention used
+     * by the other calloc sites in this file. */
+    int *arr = NULL;
+    if (count > 0) {
+        arr = (int*) calloc((size_t)count, sizeof(int));
+        if (arr == NULL) { fprintf(stderr, "ERROR: out of memory in %s\n", __func__); exit(EXIT_FAILURE); }
+    }
 
+    /* minval is the counting-sort bin (sorts the 8-bit bucket by score for
+     * lane packing). The tier decision is the safe envelope, not minval:
+     * re-baselining handles arbitrary score, so a pair can be 8-bit even with
+     * minval >= MAX_SEQ_LEN8. Clamp the bin to keep it in range — only the
+     * ordering, not correctness, depends on the exact key. */
     for(i = 0; i < count; i++)
     {
         SeqPair sp = pairArray[i];
         // int minval = sp.h0 + max_(sp.len1, sp.len2);
-        int minval = sp.h0 + min_(sp.len1, sp.len2) * score_a;
-        if (sp.len1 < MAX_SEQ_LEN8 && sp.len2 < MAX_SEQ_LEN8 && minval < MAX_SEQ_LEN8)
-            hist[minval]++;
-        else if(sp.len1 < MAX_SEQ_LEN16 && sp.len2 < MAX_SEQ_LEN16 && minval < MAX_SEQ_LEN16)
-            hist2[minval] ++;
+        int64_t minval = (int64_t)sp.h0 + (int64_t)min_(sp.len1, sp.len2) * (int64_t)score_a;
+        if (bsw8_envelope_ok(sp.len1, sp.len2, w, score_a, zdrop, sp.h0)) {
+            int bin = minval < 0 ? 0 : (minval < MAX_SEQ_LEN8 ? (int)minval : MAX_SEQ_LEN8 - 1);
+            hist[bin]++;
+        }
+        else if(sp.len1 < MAX_SEQ_LEN16 && sp.len2 < MAX_SEQ_LEN16 && minval >= 0 && minval < MAX_SEQ_LEN16)
+            hist2[(int)minval] ++;
         else
             hist3[0] ++;
 
@@ -2097,33 +2202,34 @@ inline void sortPairsLenExt(SeqPair *pairArray, int32_t count, SeqPair *tempArra
     {
         SeqPair sp = pairArray[i];
         // int minval = sp.h0 + max_(sp.len1, sp.len2);
-        int minval = sp.h0 + min_(sp.len1, sp.len2) * score_a;
+        int64_t minval = (int64_t)sp.h0 + (int64_t)min_(sp.len1, sp.len2) * (int64_t)score_a;
 
-        if (sp.len1 < MAX_SEQ_LEN8 && sp.len2 < MAX_SEQ_LEN8 && minval < MAX_SEQ_LEN8)
+        if (bsw8_envelope_ok(sp.len1, sp.len2, w, score_a, zdrop, sp.h0))
         {
-            int32_t pos = hist[minval];
+            int bin = minval < 0 ? 0 : (minval < MAX_SEQ_LEN8 ? (int)minval : MAX_SEQ_LEN8 - 1);
+            int32_t pos = hist[bin];
             tempArray[pos] = sp;
-            hist[minval]++;
+            hist[bin]++;
             numPairs128 ++;
             if (arr[pos] != 0)
             {
                 fprintf(stderr, "[%s] Error log: repeat, pos: %d, arr: %d, minval: %d, (%d %d)\n",
-                        __func__, pos, arr[pos], minval, sp.len1, sp.len2);
+                        __func__, pos, arr[pos], (int)minval, sp.len1, sp.len2);
                 exit(EXIT_FAILURE);
             }
             arr[pos] = 1;
         }
-        else if (sp.len1 < MAX_SEQ_LEN16 && sp.len2 < MAX_SEQ_LEN16 && minval < MAX_SEQ_LEN16) {
-            int32_t pos = hist2[minval];
+        else if (sp.len1 < MAX_SEQ_LEN16 && sp.len2 < MAX_SEQ_LEN16 && minval >= 0 && minval < MAX_SEQ_LEN16) {
+            int32_t pos = hist2[(int)minval];
             tempArray[pos] = sp;
-            hist2[minval]++;
+            hist2[(int)minval]++;
             numPairs16 ++;
             if (arr[pos] != 0)
             {
                 SeqPair spt = pairArray[arr[pos]-1];
                 fprintf(stderr, "[%s] Error log: repeat, "
                         "i: %d, pos: %d, arr: %d, hist2: %d, minval: %d, (%d %d %d) (%d %d %d)\n",
-                        __func__, i, pos, arr[pos], hist2[minval],  minval, sp.h0, sp.len1, sp.len2,
+                        __func__, i, pos, arr[pos], hist2[(int)minval],  (int)minval, sp.h0, sp.len1, sp.len2,
                         spt.h0, spt.len1, spt.len2);
                 exit(EXIT_FAILURE);
             }
@@ -2749,7 +2855,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                     sp.len2 = s->qbeg;
                     sp.len1 = tmp;
                     sp.tight_band = 0;  // 0 sentinel: "no tight bound known"
-                    int minval;  // declared ahead of goto target for C++
+                    int64_t minval;  // declared ahead of goto target for C++
 
                     // ungapped analysis.
                     //   HIT      → skip SW; fill a->* from ungapped.
@@ -2826,14 +2932,16 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                         // FALLBACK: sp.tight_band stays 0.
                     }
 
-                    minval = sp.h0 + min_(sp.len1, sp.len2) * opt->a;
+                    minval = (int64_t)sp.h0 + (int64_t)min_(sp.len1, sp.len2) * (int64_t)opt->a;
 
                     {
                         int t_tier;
-                        if (sp.len1 < MAX_SEQ_LEN8 && sp.len2 < MAX_SEQ_LEN8 && minval < MAX_SEQ_LEN8) {
+                        /* Mirror the routing decision in sortPairsLenExt: 8-bit
+                         * iff the safe envelope holds (initial band opt->w). */
+                        if (bsw8_envelope_ok(sp.len1, sp.len2, opt->w, opt->a, opt->zdrop, sp.h0)) {
                             numPairsLeft128++; t_tier = 0;
                         }
-                        else if (sp.len1 < MAX_SEQ_LEN16 && sp.len2 < MAX_SEQ_LEN16 && minval < MAX_SEQ_LEN16){
+                        else if (sp.len1 < MAX_SEQ_LEN16 && sp.len2 < MAX_SEQ_LEN16 && minval >= 0 && minval < MAX_SEQ_LEN16){
                             numPairsLeft16++;  t_tier = 1;
                         }
                         else {
@@ -2964,7 +3072,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
 
                     sp.tight_band = 0;
                     sp.ugp_r_attempted = 0;
-                    int minval;  // declared ahead of goto target for C++
+                    int64_t minval;  // declared ahead of goto target for C++
 
                     // ungapped analysis on right ext.
                     // Precondition a->score != -1 means left either didn't
@@ -3024,12 +3132,14 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                         }
                     }
 
-                    minval = sp.h0 + min_(sp.len1, sp.len2) * opt->a;
+                    minval = (int64_t)sp.h0 + (int64_t)min_(sp.len1, sp.len2) * (int64_t)opt->a;
 
-                    if (sp.len1 < MAX_SEQ_LEN8 && sp.len2 < MAX_SEQ_LEN8 && minval < MAX_SEQ_LEN8) {
+                    /* Mirror the routing decision in sortPairsLenExt: 8-bit iff
+                     * the safe envelope holds (initial band opt->w). */
+                    if (bsw8_envelope_ok(sp.len1, sp.len2, opt->w, opt->a, opt->zdrop, sp.h0)) {
                         numPairsRight128++;
                     }
-                    else if(sp.len1 < MAX_SEQ_LEN16 && sp.len2 < MAX_SEQ_LEN16 && minval < MAX_SEQ_LEN16) {
+                    else if(sp.len1 < MAX_SEQ_LEN16 && sp.len2 < MAX_SEQ_LEN16 && minval >= 0 && minval < MAX_SEQ_LEN16) {
                         numPairsRight16++;
                     }
                     else {
@@ -3070,7 +3180,8 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
 
     /* Sorting based score is required as that affects the use of SIMD lanes */
     sortPairsLenExt(seqPairArrayLeft128, numPairsLeft, seqPairArrayAux, hist,
-                    numPairsLeft128, numPairsLeft16, numPairsLeft1, opt->a);
+                    numPairsLeft128, numPairsLeft16, numPairsLeft1, opt->a,
+                    opt->w, opt->zdrop);
     assert(numPairsLeft == (numPairsLeft128 + numPairsLeft16 + numPairsLeft1));
 
     /* instrumentation: per-batch narrow bucket size (Group C, LEFT).
@@ -3276,12 +3387,27 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
         bswLeft->scalarBandedSWAWrapper(pair_ar, seqBufLeftRef, seqBufLeftQer, nump, nthreads, w);
 #else
         sortPairsLen(pair_ar, nump, seqPairArrayAux, hist);
-        bswLeft->getScores8(pair_ar,
-                           seqBufLeftRef,
-                           seqBufLeftQer,
-                           nump,
-                           nthreads,
-                           w);
+        /* These pairs were bucketed for the 8-bit path at the initial band
+         * opt->w (which the envelope proved <= BSW8_MAX_W). Once the doubling
+         * retry pushes w >= 128 the diagonal-offset int8 encoding can no
+         * longer represent the band, so divert that iteration to the 16-bit
+         * kernel rather than feeding getScores8 an unrepresentable band. The
+         * tight_band early-exit below is unaffected (it short-circuits the
+         * retry regardless of which width ran). */
+        if (w <= BSW8_MAX_W)
+            bswLeft->getScores8(pair_ar,
+                               seqBufLeftRef,
+                               seqBufLeftQer,
+                               nump,
+                               nthreads,
+                               w);
+        else
+            bswLeft->getScores16(pair_ar,
+                                seqBufLeftRef,
+                                seqBufLeftQer,
+                                nump,
+                                nthreads,
+                                w);
 #endif
 
         tprof[PE1][0] += nump;
@@ -3423,7 +3549,8 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
     }
 
     sortPairsLenExt(seqPairArrayRight128, numPairsRight, seqPairArrayAux,
-                    hist, numPairsRight128, numPairsRight16, numPairsRight1, opt->a);
+                    hist, numPairsRight128, numPairsRight16, numPairsRight1, opt->a,
+                    opt->w, opt->zdrop);
 
     assert(numPairsRight == (numPairsRight128 + numPairsRight16 + numPairsRight1));
 
@@ -3436,9 +3563,9 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
             SeqPair *sp_ = &seqPairArrayRight128[l];
             int tb_ = sp_->tight_band;
             int t_tier;
-            int minval_ = sp_->h0 + min_(sp_->len1, sp_->len2) * opt->a;
-            if (sp_->len1 < MAX_SEQ_LEN8 && sp_->len2 < MAX_SEQ_LEN8 && minval_ < MAX_SEQ_LEN8)        t_tier = 0;
-            else if (sp_->len1 < MAX_SEQ_LEN16 && sp_->len2 < MAX_SEQ_LEN16 && minval_ < MAX_SEQ_LEN16) t_tier = 1;
+            int64_t minval_ = (int64_t)sp_->h0 + (int64_t)min_(sp_->len1, sp_->len2) * (int64_t)opt->a;
+            if (bsw8_envelope_ok(sp_->len1, sp_->len2, opt->w, opt->a, opt->zdrop, sp_->h0))             t_tier = 0;
+            else if (sp_->len1 < MAX_SEQ_LEN16 && sp_->len2 < MAX_SEQ_LEN16 && minval_ >= 0 && minval_ < MAX_SEQ_LEN16) t_tier = 1;
             else                                                                                       t_tier = 2;
             int fine_bin;
             if      (tb_ ==  0) fine_bin = 0;
@@ -3625,12 +3752,23 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
         bswRight->scalarBandedSWAWrapper(pair_ar, seqBufRightRef, seqBufRightQer, nump, nthreads, w);
 #else
         sortPairsLen(pair_ar, nump, seqPairArrayAux, hist);
-        bswRight->getScores8(pair_ar,
-                            seqBufRightRef,
-                            seqBufRightQer,
-                            nump,
-                            nthreads,
-                            w);
+        /* See the LEFT int8 loop: divert w >= 128 retry iterations to the
+         * 16-bit kernel (the diagonal-offset int8 band can't represent it).
+         * tight_band early-exit is preserved. */
+        if (w <= BSW8_MAX_W)
+            bswRight->getScores8(pair_ar,
+                                seqBufRightRef,
+                                seqBufRightQer,
+                                nump,
+                                nthreads,
+                                w);
+        else
+            bswRight->getScores16(pair_ar,
+                                 seqBufRightRef,
+                                 seqBufRightQer,
+                                 nump,
+                                 nthreads,
+                                 w);
 #endif
 
         tprof[PE3][0] += nump;
