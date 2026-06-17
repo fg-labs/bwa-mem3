@@ -356,27 +356,6 @@ void BandedPairWiseSW::scalarBandedSWAWrapper(SeqPair *seqPairArray,
     }
 
 
-#define MAIN_CODE8(s1, s2, h00, h11, e11, f11, f21, zero256,  maxScore256, e_ins256, oe_ins256, e_del256, oe_del256, y256, maxRS) \
-    {                                                                   \
-        __m256i cmp11 = _mm256_cmpeq_epi8(s1, s2);                      \
-        __m256i sbt11 = _mm256_blendv_epi8(mismatch256, match256, cmp11); \
-        __m256i tmp256 = _mm256_max_epu8(s1, s2);                       \
-        /*tmp256 = _mm256_cmpeq_epi8(tmp256, val102);*/                 \
-        sbt11 = _mm256_blendv_epi8(sbt11, w_ambig_256, tmp256);         \
-        __m256i m11 = _mm256_add_epi8(h00, sbt11);                      \
-        cmp11 = _mm256_cmpeq_epi8(h00, zero256);                        \
-        m11 = _mm256_blendv_epi8(m11, zero256, cmp11);                  \
-        h11 = _mm256_max_epi8(m11, e11);                                \
-        h11 = _mm256_max_epi8(h11, f11);                                \
-        __m256i temp256 = _mm256_sub_epi8(h11, oe_ins256);              \
-        __m256i val256  = _mm256_max_epi8(temp256, zero256);            \
-        e11 = _mm256_sub_epi8(e11, e_ins256);                           \
-        e11 = _mm256_max_epi8(val256, e11);                             \
-        temp256 = _mm256_sub_epi8(h11, oe_del256);                      \
-        val256  = _mm256_max_epi8(temp256, zero256);                    \
-        f21 = _mm256_sub_epi8(f11, e_del256);                           \
-        f21 = _mm256_max_epi8(val256, f21);                             \
-    }
 
 // ------------------------ vec 16 --------------------------------------------------
 #define _mm256_blendv_epi16(a,b,c)              \
@@ -399,26 +378,6 @@ void BandedPairWiseSW::scalarBandedSWAWrapper(SeqPair *seqPairArray,
     }
 
 
-#define MAIN_CODE16(s1, s2, h00, h11, e11, f11, f21, zero256,  maxScore256, e_ins256, oe_ins256, e_del256, oe_del256, y256, maxRS) \
-    {                                                                   \
-        __m256i cmp11 = _mm256_cmpeq_epi16(s1, s2);                     \
-        __m256i sbt11 = _mm256_blendv_epi16(mismatch256, match256, cmp11); \
-        __m256i tmp256 = _mm256_max_epu16(s1, s2);                      \
-        sbt11 = _mm256_blendv_epi16(sbt11, w_ambig_256, tmp256);        \
-        __m256i m11 = _mm256_add_epi16(h00, sbt11);                     \
-        cmp11 = _mm256_cmpeq_epi16(h00, zero256);                       \
-        m11 = _mm256_blendv_epi16(m11, zero256, cmp11);                 \
-        h11 = _mm256_max_epi16(m11, e11);                               \
-        h11 = _mm256_max_epi16(h11, f11);                               \
-        __m256i temp256 = _mm256_sub_epi16(h11, oe_ins256);             \
-        __m256i val256  = _mm256_max_epi16(temp256, zero256);           \
-        e11 = _mm256_sub_epi16(e11, e_ins256);                          \
-        e11 = _mm256_max_epi16(val256, e11);                            \
-        temp256 = _mm256_sub_epi16(h11, oe_del256);                     \
-        val256  = _mm256_max_epi16(temp256, zero256);                   \
-        f21 = _mm256_sub_epi16(f11, e_del256);                          \
-        f21 = _mm256_max_epi16(val256, f21);                            \
-    }
 
 // --- PR 17/16: AVX2 LUT primitive ---
 // pmat256 must have the 16-byte LUT broadcast into both 128-bit halves
@@ -2129,30 +2088,6 @@ void BandedPairWiseSW::smithWaterman256_16(uint16_t seq1SoA[],
     }
 
 
-#define MAIN_CODE8(s1, s2, h00, h11, e11, f11, f21, zero512,  maxScore512, e_ins512, oe_ins512, e_del512, oe_del512, y512, maxRS) \
-    {                                                                   \
-        __mmask64 cmp11;                                                \
-        __m512i sbt11, tmp512, m11, temp512, val512;                    \
-        cmp11 = _mm512_cmpeq_epi8_mask(s1, s2);                         \
-        sbt11 = _mm512_mask_blend_epi8(cmp11, mismatch512, match512);   \
-        tmp512 = _mm512_max_epu8(s1, s2);                               \
-        cmp11 = _mm512_movepi8_mask(tmp512);                            \
-        /*tmp512 = _mm512_cmpeq_epi8(tmp512, val102);*/                 \
-        sbt11 = _mm512_mask_blend_epi8(cmp11, sbt11, w_ambig_512);      \
-        m11 = _mm512_add_epi8(h00, sbt11);                              \
-        cmp11 = _mm512_cmpeq_epi8_mask(h00, zero512);                   \
-        m11 = _mm512_mask_blend_epi8(cmp11, m11, zero512);              \
-        h11 = _mm512_max_epi8(m11, e11);                                \
-        h11 = _mm512_max_epi8(h11, f11);                                \
-        temp512 = _mm512_sub_epi8(h11, oe_ins512);                      \
-        val512  = _mm512_max_epi8(temp512, zero512);                    \
-        e11 = _mm512_sub_epi8(e11, e_ins512);                           \
-        e11 = _mm512_max_epi8(val512, e11);                             \
-        temp512 = _mm512_sub_epi8(h11, oe_del512);                      \
-        val512  = _mm512_max_epi8(temp512, zero512);                    \
-        f21 = _mm512_sub_epi8(f11, e_del512);                           \
-        f21 = _mm512_max_epi8(val512, f21);                             \
-    }
 
 // ------------------------ vec 16 --------------------------------------------------
 #define ZSCORE16(i4_512, y4_512)                                            \
@@ -2170,30 +2105,6 @@ void BandedPairWiseSW::smithWaterman256_16(uint16_t seq1SoA[],
         exit0 = _mm512_mask_blend_epi16(cmp, exit0, zero512);           \
     }
 
-#define MAIN_CODE16(s1, s2, h00, h11, e11, f11, f21, zero512,  maxScore512, e_ins512, oe_ins512, e_del512, oe_del512, y512, maxRS) \
-    {                                                                   \
-        __mmask32 cmp11;                                                \
-        __m512i sbt11, tmp512, m11, temp512, val512;                    \
-        cmp11 = _mm512_cmpeq_epi16_mask(s1, s2);                        \
-        sbt11 = _mm512_mask_blend_epi16(cmp11, mismatch512, match512);  \
-        tmp512 = _mm512_max_epu16(s1, s2);                              \
-        cmp11 = _mm512_movepi16_mask(tmp512);                           \
-        /*tmp512 = _mm512_cmpeq_epi16(tmp512, val102);*/                \
-        sbt11 = _mm512_mask_blend_epi16(cmp11, sbt11, w_ambig_512);     \
-        m11 = _mm512_add_epi16(h00, sbt11);                             \
-        cmp11 = _mm512_cmpeq_epi16_mask(h00, zero512);                  \
-        m11 = _mm512_mask_blend_epi16(cmp11, m11, zero512);             \
-        h11 = _mm512_max_epi16(m11, e11);                               \
-        h11 = _mm512_max_epi16(h11, f11);                               \
-        temp512 = _mm512_sub_epi16(h11, oe_ins512);                     \
-        val512  = _mm512_max_epi16(temp512, zero512);                   \
-        e11 = _mm512_sub_epi16(e11, e_ins512);                          \
-        e11 = _mm512_max_epi16(val512, e11);                            \
-        temp512 = _mm512_sub_epi16(h11, oe_del512);                     \
-        val512  = _mm512_max_epi16(temp512, zero512);                   \
-        f21 = _mm512_sub_epi16(f11, e_del512);                          \
-        f21 = _mm512_max_epi16(val512, f21);                            \
-    }
 
 // --- PR 17/16: AVX-512BW LUT primitive ---
 // Broadcast the 16-byte pmat into all four 128-bit lanes.
@@ -3888,27 +3799,6 @@ _mm_blendv_epi16(__m128i x, __m128i y, __m128i mask)
     }
 
 
-#define MAIN_CODE16(s1, s2, h00, h11, e11, f11, f21, zero256,  maxScore128, e_ins128, oe_ins128, e_del128, oe_del128, y128, maxRS) \
-    {                                                                   \
-        __m128i cmp11 = _mm_cmpeq_epi16(s1, s2);                        \
-        __m128i sbt11 = _mm_blendv_epi16(mismatch128, match128, cmp11); \
-        __m128i tmp128 = _mm_max_epu16(s1, s2);                         \
-        tmp128 = _mm_cmpeq_epi16(tmp128, ff128);                        \
-        sbt11 = _mm_blendv_epi16(sbt11, w_ambig_128, tmp128);           \
-        __m128i m11 = _mm_add_epi16(h00, sbt11);                        \
-        cmp11 = _mm_cmpeq_epi16(h00, zero128);                          \
-        m11 = _mm_blendv_epi16(m11, zero128, cmp11);                    \
-        h11 = _mm_max_epi16(m11, e11);                                  \
-        h11 = _mm_max_epi16(h11, f11);                                  \
-        __m128i temp128 = _mm_sub_epi16(h11, oe_ins128);                \
-        __m128i val128  = _mm_max_epi16(temp128, zero128);              \
-        e11 = _mm_sub_epi16(e11, e_ins128);                             \
-        e11 = _mm_max_epi16(val128, e11);                               \
-        temp128 = _mm_sub_epi16(h11, oe_del128);                        \
-        val128  = _mm_max_epi16(temp128, zero128);                      \
-        f21 = _mm_sub_epi16(f11, e_del128);                             \
-        f21 = _mm_max_epi16(val128, f21);                               \
-    }
 
 // PR 17: 16-bit fission primitives, mirror of the 8-bit pair above.
 #define SBT_PREPASS16(s1, s2, sbt11_out, mismatch128, match128, w_ambig_128, ff128) \
@@ -4632,26 +4522,6 @@ static inline __m128i _mm_blendv_epi8 (__m128i x, __m128i y, __m128i mask)
     }
 
 
-#define MAIN_CODE8(s1, s2, h00, h11, e11, f11, f21, zero128,  maxScore128, e_ins128, oe_ins128, e_del128, oe_del128, y128, maxRS) \
-    {                                                                   \
-        __m128i cmp11 = _mm_cmpeq_epi8(s1, s2);                         \
-        __m128i sbt11 = _mm_blendv_epi8(mismatch128, match128, cmp11);  \
-        __m128i tmp128 = _mm_max_epu8(s1, s2);                          \
-        tmp128 = _mm_cmpeq_epi8(tmp128, ff128);                         \
-        sbt11 = _mm_blendv_epi8(sbt11, w_ambig_128, tmp128);            \
-        __m128i m11 = _mm_add_epi8(h00, sbt11);                         \
-        cmp11 = _mm_cmpeq_epi8(h00, zero128);                           \
-        m11 = _mm_blendv_epi8(m11, zero128, cmp11);                     \
-        m11 = _mm_and_si128(m11, _mm_cmpgt_epi8(m11, zero128));         \
-        h11 = _mm_max_epu8(m11, e11);                                   \
-        h11 = _mm_max_epu8(h11, f11);                                   \
-        __m128i temp128 = _mm_subs_epu8(h11, oe_ins128);                \
-        e11 = _mm_subs_epu8(e11, e_ins128);                             \
-        e11 = _mm_max_epu8(temp128, e11);                               \
-        temp128 = _mm_subs_epu8(h11, oe_del128);                        \
-        f21 = _mm_subs_epu8(f11, e_del128);                             \
-        f21 = _mm_max_epu8(temp128, f21);                               \
-    }
 
 // --- PR 17/16: SSE2/NEON LUT primitive ---
 // With the asymmetric AMBIG encoding (target N=4, query N=8), the low 4 bits
