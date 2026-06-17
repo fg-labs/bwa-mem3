@@ -303,7 +303,6 @@ public:
                             int32_t numPairs,
                             int zdrop,
                             int32_t w,
-                            uint8_t qlen[],
                             uint8_t myband[]);
     // 16 bit vector code section
     void getScores16(SeqPair *pairArray,
@@ -363,7 +362,6 @@ public:
                             int32_t numPairs,
                             int zdrop,
                             int32_t w,
-                            uint8_t qlen[],
                             uint8_t myband[]);
     // 16 bit vector code section
     void getScores16(SeqPair *pairArray,
@@ -423,7 +421,6 @@ public:
                             int32_t numPairs,
                             int zdrop,
                             int32_t w,
-                            uint8_t qlen[],
                             uint8_t myband[]);
 
     // 16 bit vector code section

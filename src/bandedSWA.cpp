@@ -828,7 +828,6 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                                numPairs,
                                zdrop,
                                bsize,
-                               qlen,
                                myband);
         }
     }
@@ -885,7 +884,6 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
                                           int32_t numPairs,
                                           int zdrop,
                                           int32_t w,
-                                          uint8_t qlen[],   // dead parameter (overwritten immediately); remove with call site in a later task
                                           uint8_t myband[])
 {
     __m256i match256     = _mm256_set1_epi8(this->w_match);
@@ -2735,7 +2733,6 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                                numPairs,
                                zdrop,
                                bsize,
-                               qlen,
                                myband);
         }
     }
@@ -2791,7 +2788,6 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
                                           int32_t numPairs,
                                           int zdrop,
                                           int32_t w,
-                                          uint8_t qlen[],   // dead parameter (overwritten immediately); remove with call site in a later task
                                           uint8_t myband[])
 {
     __m512i match512     = _mm512_set1_epi8(this->w_match);
@@ -5333,7 +5329,6 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                                numPairs,
                                zdrop,
                                bsize,
-                               qlen,
                                myband);         
         }
     }
@@ -5388,7 +5383,6 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
                                           int32_t numPairs,
                                           int zdrop,
                                           int32_t w,
-                                          uint8_t qlen[],   // dead parameter (overwritten immediately); remove with call site in a later task
                                           uint8_t myband[])
 {
     
