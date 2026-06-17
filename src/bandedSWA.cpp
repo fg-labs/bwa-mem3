@@ -4495,14 +4495,10 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
 }
 
 /********************************************************************************/
-/* SSE2 - 8 bit version */
-#ifndef __SSE4_1__
-static inline __m128i _mm_blendv_epi8 (__m128i x, __m128i y, __m128i mask)
-{
-    // Replace bit in x with bit in y when matching bit in mask is set:
-    return _mm_or_si128(_mm_andnot_si128(mask, x), _mm_and_si128(mask, y));
-}
-#endif
+/* 128-bit - 8 bit version */
+// NB: the 128-bit kernel requires SSE4.1 (max_epi8 / min_epi8 / blendv_epi8); the
+// lowest x86 build tier is sse41 and arm64 routes through sse2neon, so no
+// sub-SSE4.1 polyfill is needed.
 
 // ZSCORE8 is unused in smithWaterman128_8 (z-drop replaced by wide scalar);
 // retained here in case a future 128-bit tier reinstates it.
