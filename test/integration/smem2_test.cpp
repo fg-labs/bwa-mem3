@@ -43,7 +43,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 
 int myrank, num_ranks;
 
-int32_t read_smem2_input(char *fname, char *query_seq, int16_t *query_pos_array, int32_t *min_intv_array, int32_t readlen)
+int32_t read_smem2_input(char *fname, char *query_seq, int32_t *query_pos_array, int32_t *min_intv_array, int32_t readlen)
 {
     FILE *smem2_fp = fopen(fname, "r");
     assert(smem2_fp != NULL);
@@ -62,7 +62,7 @@ int32_t read_smem2_input(char *fname, char *query_seq, int16_t *query_pos_array,
         //printf("2.0\n");
         memcpy(query_seq + numReads * readlen, line, readlen);
         //printf("3.0\n");
-        fscanf(smem2_fp, "%hd", query_pos_array + numReads);
+        fscanf(smem2_fp, "%d", query_pos_array + numReads);
         //printf("4.0\n");
         fscanf(smem2_fp, "%d", min_intv_array + numReads);
         //printf("4.1\n");
@@ -92,7 +92,7 @@ int main(int argc, char **argv) {
     }
 
     char *query_seq=(char *)malloc(QUERY_DB_SIZE*sizeof(char));
-    int16_t *query_pos_array = (int16_t *)_mm_malloc(MAX_NUM_QUERIES * sizeof(int16_t), 64);
+    int32_t *query_pos_array = (int32_t *)_mm_malloc(MAX_NUM_QUERIES * sizeof(int32_t), 64);
     int32_t *min_intv_array = (int32_t *)_mm_malloc(MAX_NUM_QUERIES * sizeof(int32_t), 64);
     int32_t *rid_array = (int32_t *)_mm_malloc(MAX_NUM_QUERIES * sizeof(int32_t), 64);
     int readlength=atoi(argv[4]);

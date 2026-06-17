@@ -213,7 +213,7 @@ typedef struct
     int32_t *min_intv_ar[MAX_THREADS];
     int32_t *rid[MAX_THREADS];
     int32_t *lim[MAX_THREADS];
-    int16_t *query_pos_ar[MAX_THREADS];
+    int32_t *query_pos_ar[MAX_THREADS];
     uint8_t *enc_qdb[MAX_THREADS];
     
     int64_t wsize_mem[MAX_THREADS];
