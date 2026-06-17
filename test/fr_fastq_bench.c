@@ -77,7 +77,19 @@ static long run_kseq(const char *path, long *bases)
     *bases = bp; return n;
 }
 
-static long run_frfastq(const char *path, long *bases)
+/* malloc(l+1) + free, no memcpy: isolates allocation cost. A single touch
+ * keeps the optimizer from eliding the allocation. */
+static volatile char g_sink;
+static void alloc_field(size_t l)
+{
+    char *d = (char *)malloc(l + 1);
+    if (!d) abort();
+    d[0] = (char)l; g_sink = d[0];
+    free(d);
+}
+
+/* level: 0 = scan only, 1 = scan + alloc (no copy), 2 = scan + alloc + copy. */
+static long run_frfastq(const char *path, long *bases, int level)
 {
     int fd = open(path, O_RDONLY);
     if (fd < 0) { perror("open"); exit(2); }
@@ -89,12 +101,21 @@ static long run_frfastq(const char *path, long *bases)
     fr_fastq_rec_t r;
     while (fr_fastq_next(p, &r) == 1) {
         size_t nl = trim_readno_len(r.name, r.name_l);
-        char *name = dup_field(r.name, nl);
-        char *comment = r.comment_l ? dup_field(r.comment, r.comment_l) : NULL;
-        char *seq = dup_field(r.seq, r.seq_l);
-        char *qual = r.qual_l ? dup_field(r.qual, r.qual_l) : NULL;
+        if (level == 2) {
+            char *name = dup_field(r.name, nl);
+            char *comment = r.comment_l ? dup_field(r.comment, r.comment_l) : NULL;
+            char *seq = dup_field(r.seq, r.seq_l);
+            char *qual = r.qual_l ? dup_field(r.qual, r.qual_l) : NULL;
+            free(name); free(comment); free(seq); free(qual);
+        } else if (level == 1) {
+            alloc_field(nl);
+            if (r.comment_l) alloc_field(r.comment_l);
+            alloc_field(r.seq_l);
+            if (r.qual_l) alloc_field(r.qual_l);
+        } else {
+            g_sink = (char)(nl ^ r.seq_l ^ r.qual_l); /* force the slices to be read */
+        }
         bp += (long)r.seq_l; n++;
-        free(name); free(comment); free(seq); free(qual);
     }
     fr_fastq_destroy(p); fast_reader_close(fr);
     *bases = bp; return n;
@@ -114,13 +135,18 @@ int main(int argc, char **argv)
         }
         reps = (int)v;
     }
+    /* modes: kseq | frfastq(=copy) | fr_scan | fr_alloc | fr_copy */
     int use_kseq = strcmp(mode, "kseq") == 0;
-    if (!use_kseq && strcmp(mode, "frfastq") != 0) { fprintf(stderr, "bad mode\n"); return 2; }
+    int level = 2;
+    if (strcmp(mode, "fr_scan") == 0)  level = 0;
+    else if (strcmp(mode, "fr_alloc") == 0) level = 1;
+    else if (strcmp(mode, "fr_copy") == 0 || strcmp(mode, "frfastq") == 0) level = 2;
+    else if (!use_kseq) { fprintf(stderr, "bad mode\n"); return 2; }
 
     double best = 1e30; long n = 0, bp = 0;
     for (int i = 0; i < reps; i++) {
         double t0 = now();
-        n = use_kseq ? run_kseq(path, &bp) : run_frfastq(path, &bp);
+        n = use_kseq ? run_kseq(path, &bp) : run_frfastq(path, &bp, level);
         double dt = now() - t0;
         if (dt < best) best = dt;
         fprintf(stderr, "  rep %d: %.4fs  (%.1f Mreads/s)\n", i, dt, n / dt / 1e6);
