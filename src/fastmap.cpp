@@ -1661,6 +1661,17 @@ int main_mem(int argc, char *argv[])
     }
     tprof[MISC][1] = opt->chunk_size = aux.actual_chunk_size = aux.task_size;
 
+    /* Pipeline depth. The 3-step pipeline (read / process / write) is gated by
+     * how many of those steps can run at once. With 2 workers only 2 of the 3
+     * run concurrently, so the single I/O-side worker serialises read(N+1) and
+     * write(N-1) around the compute worker; at high thread counts that
+     * read+write chain, not compute, binds the wall. A 3rd worker lets
+     * read || process || write triple-overlap. It is not oversubscription: the
+     * step mutex still admits only one worker into the compute step at a time,
+     * so the extra worker only ever does single-threaded I/O. Cost is one more
+     * chunk in flight. -1 (no_mt_io) forces single-threaded I/O as before. */
+    const int pipe_workers = no_mt_io ? 1 : (opt->n_threads > 2 ? 3 : opt->n_threads);
+
     double sp_t0 = 0.0;
 #ifdef STAGE_PROF
     /* stage_prof: arm per-chunk read/process/write profiling if --profile given */
@@ -1677,7 +1688,7 @@ int main_mem(int argc, char *argv[])
         sp_init(profile_path, "bwa-mem3", PACKAGE_VERSION, sp_arch, opt->n_threads,
                 opt->bam_mode ? "bam" : "sam",
                 opt->bam_mode ? opt->bam_level : -1, sp_in);
-        sp_set_workers(no_mt_io ? 1 : 2);   /* pipeline depth (process() arg) */
+        sp_set_workers(pipe_workers);   /* pipeline depth (process() arg) */
         sp_t0 = sp_wall();
     }
 #endif
@@ -1685,7 +1696,7 @@ int main_mem(int argc, char *argv[])
     tim = __rdtsc();
 
     /* Relay process function */
-    process(&aux, fp, fp2, no_mt_io? 1:2);
+    process(&aux, fp, fp2, pipe_workers);
 
     tprof[PROCESS][0] += __rdtsc() - tim;
 
