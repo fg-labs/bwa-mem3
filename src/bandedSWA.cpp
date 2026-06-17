@@ -1294,36 +1294,66 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
             _mm256_store_si256((__m256i *) exit_a, exit0);
             _mm256_store_si256((__m256i *) qfire_a, qfire256);
             _mm256_store_si256((__m256i *) hqe_a, hqe256);
-            for (int l = 0; l < SIMD_WIDTH8; l++) {
-                // best-score row
-                if (cmp_a[l]) xrow[l] = i + 1;
-                // ABSOLUTE-FRAME score tracking: the 8-bit maxScore256 is in the
-                // lane's CURRENT B[l] frame; absolute = rebaselined byte + B[l].
-                {
-                    int ms_abs = (int)(uint8_t)ms_a[l] + B[l];
-                    if (ms_abs > best_abs[l]) best_abs[l] = ms_abs;
-                }
-                // gscore (query-end score): qfire flags this lane reached its query
-                // end this row; hqe is the captured query-end cell H (byte, B[l]
-                // frame); absolute = byte + B[l]. Scalar's `>=` tie-break (last
-                // max-achieving row wins gtle). See smithWaterman128_8.
-                if (qfire_a[l]) {
-                    int gs_abs = (int)(uint8_t)hqe_a[l] + B[l];
-                    if (gs_abs >= gbest_abs[l]) { gbest_abs[l] = gs_abs; ierow[l] = i + 1; }
-                }
-                // z-drop (only relevant where the lane is still alive). The drop
-                // is ms-rs of two bytes in the SAME B[l] frame, so the B cancels
-                // and the comparison is already in ABSOLUTE score units.
-                if (exit_a[l]) {
-                    int xr  = xrow[l];                       // best row
-                    int y1c = (int) y1_a[l] + i;             // row-max col (abs)
-                    int yc  = (int) y_a[l] + (xr - 1);       // best col (abs)
-                    int tmpi = (i + 1) - xr;
-                    int tmpj = y1c - yc;
-                    int dif  = tmpi > tmpj ? (tmpi - tmpj) : (tmpj - tmpi);
-                    int drop = (int)(uint8_t)ms_a[l] - (int)(uint8_t)rs_a[l];
-                    if (drop - dif > zdrop) exit_a[l] = 0;
-                }
+            // VECTORIZED per-lane wide updates (see smithWaterman128_8). 8 int32
+            // per __m256i, so SIMD_WIDTH8 lanes -> SIMD_WIDTH8/8 groups of 8. Each
+            // group's z-drop die mask is narrowed (lane-crossing-free) to 8 bytes
+            // via a 128-bit pack and cleared in exit_a; exit0 reloaded at the end.
+            const __m256i vi   = _mm256_set1_epi32(i);
+            const __m256i vip1 = _mm256_set1_epi32(i + 1);
+            const __m256i vone = _mm256_set1_epi32(1);
+            const __m256i vzd  = _mm256_set1_epi32(zdrop);
+            const __m256i vedel = _mm256_set1_epi32(this->e_del);
+            const __m256i veins = _mm256_set1_epi32(this->e_ins);
+            for (int g = 0; g < SIMD_WIDTH8 / 8; g++) {
+                const int base = g * 8;
+                __m256i Bg   = _mm256_loadu_si256((const __m256i *)(B + base));
+                __m256i msg  = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)(ms_a    + base)));
+                __m256i rsg  = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)(rs_a    + base)));
+                __m256i hqeg = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)(hqe_a   + base)));
+                __m256i cmpg = _mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i *)(cmp_a   + base)));
+                __m256i exitg= _mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i *)(exit_a  + base)));
+                __m256i qfg  = _mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i *)(qfire_a + base)));
+                __m256i y1g  = _mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i *)(y1_a    + base)));
+                __m256i yg   = _mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i *)(y_a     + base)));
+
+                __m256i xrg = _mm256_loadu_si256((const __m256i *)(xrow + base));
+                xrg = _mm256_blendv_epi8(xrg, vip1, cmpg);
+                _mm256_storeu_si256((__m256i *)(xrow + base), xrg);
+
+                __m256i ms_abs = _mm256_add_epi32(msg, Bg);
+                __m256i bag = _mm256_loadu_si256((const __m256i *)(best_abs + base));
+                bag = _mm256_max_epi32(bag, ms_abs);
+                _mm256_storeu_si256((__m256i *)(best_abs + base), bag);
+
+                __m256i gs_abs = _mm256_add_epi32(hqeg, Bg);
+                __m256i gba = _mm256_loadu_si256((const __m256i *)(gbest_abs + base));
+                __m256i ge  = _mm256_xor_si256(_mm256_cmpgt_epi32(gba, gs_abs), ff256); // gs_abs >= gba
+                __m256i gmask = _mm256_and_si256(qfg, ge);
+                gba = _mm256_blendv_epi8(gba, gs_abs, gmask);
+                _mm256_storeu_si256((__m256i *)(gbest_abs + base), gba);
+                __m256i ierg = _mm256_loadu_si256((const __m256i *)(ierow + base));
+                ierg = _mm256_blendv_epi8(ierg, vip1, gmask);
+                _mm256_storeu_si256((__m256i *)(ierow + base), ierg);
+
+                __m256i y1c  = _mm256_add_epi32(y1g, vi);
+                __m256i yc   = _mm256_add_epi32(yg, _mm256_sub_epi32(xrg, vone));
+                __m256i tmpi = _mm256_sub_epi32(vip1, xrg);
+                __m256i tmpj = _mm256_sub_epi32(y1c, yc);
+                // z-drop gap term weighted by gap-extend penalty, matching the
+                // scalar reference (drift>0 -> deletion side *e_del, else *e_ins).
+                __m256i zdelta = _mm256_sub_epi32(tmpi, tmpj);
+                __m256i zesel  = _mm256_blendv_epi8(veins, vedel,
+                                     _mm256_cmpgt_epi32(zdelta, _mm256_setzero_si256()));
+                __m256i dif  = _mm256_mullo_epi32(_mm256_abs_epi32(zdelta), zesel);
+                __m256i drop = _mm256_sub_epi32(msg, rsg);
+                __m256i die  = _mm256_cmpgt_epi32(_mm256_sub_epi32(drop, dif), vzd);
+                die = _mm256_and_si256(die, exitg);
+                // narrow 8 int32 die masks -> 8 bytes (128-bit packs, no lane cross)
+                __m128i d16 = _mm_packs_epi32(_mm256_castsi256_si128(die),
+                                              _mm256_extracti128_si256(die, 1));
+                __m128i d8  = _mm_packs_epi16(d16, d16);
+                __m128i ex  = _mm_loadl_epi64((const __m128i *)(exit_a + base));
+                _mm_storel_epi64((__m128i *)(exit_a + base), _mm_andnot_si128(d8, ex));
             }
             exit0 = _mm256_load_si256((__m256i *) exit_a);
         }
@@ -3177,57 +3207,77 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
         // done in wide scalars so row distances that exceed int8 for long reads
         // are handled exactly.
         {
-            int8_t  cmp_a[SIMD_WIDTH8]      __attribute((aligned(64)));
+            // Only the int32 DATA channels need materializing as byte arrays; the
+            // cmp/qfire/exit per-lane predicates are read straight from the cmp
+            // __mmask64 and movepi8_mask(qfire512)/movepi8_mask(exit0) below.
             int8_t  y1_a[SIMD_WIDTH8]       __attribute((aligned(64)));
             int8_t  y_a[SIMD_WIDTH8]        __attribute((aligned(64)));
             int8_t  ms_a[SIMD_WIDTH8]       __attribute((aligned(64)));
             int8_t  rs_a[SIMD_WIDTH8]       __attribute((aligned(64)));
-            int8_t  exit_a[SIMD_WIDTH8]     __attribute((aligned(64)));
-            int8_t  qfire_a[SIMD_WIDTH8]    __attribute((aligned(64)));
             int8_t  hqe_a[SIMD_WIDTH8]      __attribute((aligned(64)));
-            // cmp/exit0 are mask registers here; materialize them as 0xFF/0x00
-            // byte vectors so the wide scalar loop can branch on them.
-            _mm512_store_si512((__m512i *) cmp_a,
-                               _mm512_maskz_set1_epi8(cmp, (char)0xFF));
             _mm512_store_si512((__m512i *) y1_a, y1_512);
             _mm512_store_si512((__m512i *) y_a, y512);
             _mm512_store_si512((__m512i *) ms_a, maxScore512);
             _mm512_store_si512((__m512i *) rs_a, maxRS1);
-            _mm512_store_si512((__m512i *) exit_a, exit0);
-            _mm512_store_si512((__m512i *) qfire_a, qfire512);
             _mm512_store_si512((__m512i *) hqe_a, hqe512);
-            for (int l = 0; l < SIMD_WIDTH8; l++) {
-                // best-score row
-                if (cmp_a[l]) xrow[l] = i + 1;
-                // ABSOLUTE-FRAME score tracking: the 8-bit maxScore512 is in the
-                // lane's CURRENT B[l] frame; absolute = rebaselined byte + B[l].
-                {
-                    int ms_abs = (int)(uint8_t)ms_a[l] + B[l];
-                    if (ms_abs > best_abs[l]) best_abs[l] = ms_abs;
-                }
-                // gscore (query-end score): qfire flags this lane reached its query
-                // end this row; hqe is the captured query-end cell H (byte, B[l]
-                // frame); absolute = byte + B[l]. Scalar's `>=` tie-break. See
-                // smithWaterman128_8.
-                if (qfire_a[l]) {
-                    int gs_abs = (int)(uint8_t)hqe_a[l] + B[l];
-                    if (gs_abs >= gbest_abs[l]) { gbest_abs[l] = gs_abs; ierow[l] = i + 1; }
-                }
-                // z-drop (only relevant where the lane is still alive). The drop
-                // is ms-rs of two bytes in the SAME B[l] frame, so the B cancels
-                // and the comparison is already in ABSOLUTE score units.
-                if (exit_a[l]) {
-                    int xr  = xrow[l];                       // best row
-                    int y1c = (int) y1_a[l] + i;             // row-max col (abs)
-                    int yc  = (int) y_a[l] + (xr - 1);       // best col (abs)
-                    int tmpi = (i + 1) - xr;
-                    int tmpj = y1c - yc;
-                    int dif  = tmpi > tmpj ? (tmpi - tmpj) : (tmpj - tmpi);
-                    int drop = (int)(uint8_t)ms_a[l] - (int)(uint8_t)rs_a[l];
-                    if (drop - dif > zdrop) exit_a[l] = 0;
-                }
+            // VECTORIZED per-lane wide updates (see smithWaterman128_8) using
+            // AVX-512 mask registers: 16 int32 per __m512i -> SIMD_WIDTH8/16 groups
+            // of 16. Per-lane predicates (cmp/qfire/exit) are __mmask16 slices; the
+            // z-dropped lanes are accumulated into a combined mask and cleared in
+            // exit0. Byte-identical (same >, >= tie-breaks; same abs/z-drop math).
+            const __m512i vi   = _mm512_set1_epi32(i);
+            const __m512i vip1 = _mm512_set1_epi32(i + 1);
+            const __m512i vone = _mm512_set1_epi32(1);
+            const __m512i vzd  = _mm512_set1_epi32(zdrop);
+            const __m512i vedel = _mm512_set1_epi32(this->e_del);
+            const __m512i veins = _mm512_set1_epi32(this->e_ins);
+            const __mmask64 qf64 = _mm512_movepi8_mask(qfire512);
+            const __mmask64 ex64 = _mm512_movepi8_mask(exit0);
+            __mmask64 die64 = 0;
+            for (int g = 0; g < SIMD_WIDTH8 / 16; g++) {
+                const int base = g * 16;
+                const __mmask16 cmpm = (__mmask16)(cmp  >> (16 * g));
+                const __mmask16 qfm  = (__mmask16)(qf64 >> (16 * g));
+                const __mmask16 exm  = (__mmask16)(ex64 >> (16 * g));
+                __m512i Bg   = _mm512_loadu_si512((const void *)(B + base));
+                __m512i msg  = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)(ms_a  + base)));
+                __m512i rsg  = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)(rs_a  + base)));
+                __m512i hqeg = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)(hqe_a + base)));
+                __m512i y1g  = _mm512_cvtepi8_epi32(_mm_loadu_si128((const __m128i *)(y1_a  + base)));
+                __m512i yg   = _mm512_cvtepi8_epi32(_mm_loadu_si128((const __m128i *)(y_a   + base)));
+
+                __m512i xrg = _mm512_loadu_si512((const void *)(xrow + base));
+                xrg = _mm512_mask_mov_epi32(xrg, cmpm, vip1);
+                _mm512_storeu_si512((void *)(xrow + base), xrg);
+
+                __m512i bag = _mm512_loadu_si512((const void *)(best_abs + base));
+                bag = _mm512_max_epi32(bag, _mm512_add_epi32(msg, Bg));
+                _mm512_storeu_si512((void *)(best_abs + base), bag);
+
+                __m512i gs_abs = _mm512_add_epi32(hqeg, Bg);
+                __m512i gba = _mm512_loadu_si512((const void *)(gbest_abs + base));
+                __mmask16 gmask = qfm & _mm512_cmpge_epi32_mask(gs_abs, gba); // qfire & gs>=gbest
+                gba = _mm512_mask_mov_epi32(gba, gmask, gs_abs);
+                _mm512_storeu_si512((void *)(gbest_abs + base), gba);
+                __m512i ierg = _mm512_loadu_si512((const void *)(ierow + base));
+                ierg = _mm512_mask_mov_epi32(ierg, gmask, vip1);
+                _mm512_storeu_si512((void *)(ierow + base), ierg);
+
+                __m512i y1c  = _mm512_add_epi32(y1g, vi);
+                __m512i yc   = _mm512_add_epi32(yg, _mm512_sub_epi32(xrg, vone));
+                __m512i tmpi = _mm512_sub_epi32(vip1, xrg);
+                __m512i tmpj = _mm512_sub_epi32(y1c, yc);
+                // z-drop gap term weighted by gap-extend penalty, matching the
+                // scalar reference (drift>0 -> deletion side *e_del, else *e_ins).
+                __m512i zdelta = _mm512_sub_epi32(tmpi, tmpj);
+                __mmask16 zdsel = _mm512_cmpgt_epi32_mask(zdelta, _mm512_setzero_si512());
+                __m512i zesel  = _mm512_mask_blend_epi32(zdsel, veins, vedel);
+                __m512i dif  = _mm512_mullo_epi32(_mm512_abs_epi32(zdelta), zesel);
+                __m512i drop = _mm512_sub_epi32(msg, rsg);
+                __mmask16 diem = exm & _mm512_cmpgt_epi32_mask(_mm512_sub_epi32(drop, dif), vzd);
+                die64 |= ((__mmask64)diem) << (16 * g);
             }
-            exit0 = _mm512_load_si512((__m512i *) exit_a);
+            exit0 = _mm512_mask_mov_epi8(exit0, die64, _mm512_setzero_si512());
         }
 
 #if RDT
@@ -5826,42 +5876,74 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
             _mm_store_si128((__m128i *) exit_a, exit0);
             _mm_store_si128((__m128i *) qfire_a, qfire128);
             _mm_store_si128((__m128i *) hqe_a, hqe128);
-            for (int l = 0; l < SIMD_WIDTH8; l++) {
-                // best-score row
-                if (cmp_a[l]) xrow[l] = i + 1;
-                // ABSOLUTE-FRAME score tracking: the 8-bit maxScore128 is in the
-                // lane's CURRENT B[l] frame, so the absolute value is the
-                // rebaselined byte + B[l]. Re-derive every row (cheap, O(rows))
-                // rather than adding B back once at the end (the recorded max may
-                // pre-date later B bumps). max() guards against the byte being
-                // re-baselined away in a later row.
-                {
-                    int ms_abs = (int)(uint8_t)ms_a[l] + B[l];
-                    if (ms_abs > best_abs[l]) best_abs[l] = ms_abs;
-                }
-                // gscore (query-end score): qfire flags that this lane reached its
-                // query end this row; hqe is the captured query-end cell H (byte,
-                // current B[l] frame). The absolute value is byte + B[l]. Scalar's
-                // tie-break updates on `>=` so the LAST max-achieving row wins gtle.
-                if (qfire_a[l]) {
-                    int gs_abs = (int)(uint8_t)hqe_a[l] + B[l];
-                    if (gs_abs >= gbest_abs[l]) { gbest_abs[l] = gs_abs; ierow[l] = i + 1; }
-                }
-                // z-drop (only relevant where the lane is still alive). The drop
-                // is ms-rs of two bytes in the SAME B[l] frame, so the B cancels
-                // and the comparison is already in ABSOLUTE score units.
-                if (exit_a[l]) {
-                    int xr  = xrow[l];                       // best row
-                    int y1c = (int) y1_a[l] + i;             // row-max col (abs)
-                    int yc  = (int) y_a[l] + (xr - 1);       // best col (abs)
-                    int tmpi = (i + 1) - xr;
-                    int tmpj = y1c - yc;
-                    int dif  = tmpi > tmpj ? (tmpi - tmpj) : (tmpj - tmpi);
-                    int drop = (int)(uint8_t)ms_a[l] - (int)(uint8_t)rs_a[l];
-                    if (drop - dif > zdrop) exit_a[l] = 0;
-                }
+            // VECTORIZED per-lane wide updates (replaces the scalar lane loop;
+            // it was the dominant SW-kernel cost on AVX-512 per profiling). int32
+            // is 4x int8, so SIMD_WIDTH8 lanes split into SIMD_WIDTH8/4 groups of
+            // 4 int32. Each group does the same xrow / best_abs / gbest_abs+ierow /
+            // z-drop work as the scalar loop in wide int32 SIMD; byte-identical
+            // (same >, >= tie-breaks; same abs/z-drop arithmetic; B[] added per row).
+            const __m128i vi   = _mm_set1_epi32(i);
+            const __m128i vip1 = _mm_set1_epi32(i + 1);
+            const __m128i vone = _mm_set1_epi32(1);
+            const __m128i vzd  = _mm_set1_epi32(zdrop);
+            const __m128i vedel = _mm_set1_epi32(this->e_del);
+            const __m128i veins = _mm_set1_epi32(this->e_ins);
+            __m128i die_g[SIMD_WIDTH8 / 4];
+            for (int g = 0; g < SIMD_WIDTH8 / 4; g++) {
+                const int base = g * 4;
+                __m128i Bg   = _mm_loadu_si128((const __m128i *)(B + base));
+                __m128i msg  = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(*(const int32_t *)(ms_a    + base)));
+                __m128i rsg  = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(*(const int32_t *)(rs_a    + base)));
+                __m128i hqeg = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(*(const int32_t *)(hqe_a   + base)));
+                __m128i cmpg = _mm_cvtepi8_epi32(_mm_cvtsi32_si128(*(const int32_t *)(cmp_a   + base)));
+                __m128i exitg= _mm_cvtepi8_epi32(_mm_cvtsi32_si128(*(const int32_t *)(exit_a  + base)));
+                __m128i qfg  = _mm_cvtepi8_epi32(_mm_cvtsi32_si128(*(const int32_t *)(qfire_a + base)));
+                __m128i y1g  = _mm_cvtepi8_epi32(_mm_cvtsi32_si128(*(const int32_t *)(y1_a    + base)));
+                __m128i yg   = _mm_cvtepi8_epi32(_mm_cvtsi32_si128(*(const int32_t *)(y_a     + base)));
+
+                // (1) best-score row: xrow = cmp ? i+1 : xrow
+                __m128i xrg = _mm_loadu_si128((const __m128i *)(xrow + base));
+                xrg = _mm_blendv_epi8(xrg, vip1, cmpg);
+                _mm_storeu_si128((__m128i *)(xrow + base), xrg);
+
+                // (2) best_abs = max(best_abs, (uint8)ms + B)
+                __m128i ms_abs = _mm_add_epi32(msg, Bg);
+                __m128i bag = _mm_loadu_si128((const __m128i *)(best_abs + base));
+                bag = _mm_max_epi32(bag, ms_abs);
+                _mm_storeu_si128((__m128i *)(best_abs + base), bag);
+
+                // (3) gscore: where qfire AND gs_abs >= gbest_abs, take gs_abs / i+1
+                __m128i gs_abs = _mm_add_epi32(hqeg, Bg);
+                __m128i gba = _mm_loadu_si128((const __m128i *)(gbest_abs + base));
+                __m128i ge  = _mm_xor_si128(_mm_cmpgt_epi32(gba, gs_abs), ff128); // gs_abs >= gba
+                __m128i gmask = _mm_and_si128(qfg, ge);
+                gba = _mm_blendv_epi8(gba, gs_abs, gmask);
+                _mm_storeu_si128((__m128i *)(gbest_abs + base), gba);
+                __m128i ierg = _mm_loadu_si128((const __m128i *)(ierow + base));
+                ierg = _mm_blendv_epi8(ierg, vip1, gmask);
+                _mm_storeu_si128((__m128i *)(ierow + base), ierg);
+
+                // (4) z-drop (alive lanes): dif = |((i+1)-xr) - (y1c-yc)|,
+                //     drop = (uint8)ms - (uint8)rs; die where drop-dif > zdrop.
+                __m128i y1c  = _mm_add_epi32(y1g, vi);
+                __m128i yc   = _mm_add_epi32(yg, _mm_sub_epi32(xrg, vone));
+                __m128i tmpi = _mm_sub_epi32(vip1, xrg);
+                __m128i tmpj = _mm_sub_epi32(y1c, yc);
+                // z-drop gap term weighted by gap-extend penalty, matching the
+                // scalar reference (drift>0 -> deletion side *e_del, else *e_ins).
+                __m128i zdelta = _mm_sub_epi32(tmpi, tmpj);
+                __m128i zesel  = _mm_blendv_epi8(veins, vedel,
+                                     _mm_cmpgt_epi32(zdelta, _mm_setzero_si128()));
+                __m128i dif  = _mm_mullo_epi32(_mm_abs_epi32(zdelta), zesel);
+                __m128i drop = _mm_sub_epi32(msg, rsg);
+                __m128i die  = _mm_cmpgt_epi32(_mm_sub_epi32(drop, dif), vzd);
+                die_g[g] = _mm_and_si128(die, exitg);
             }
-            exit0 = _mm_load_si128((__m128i *) exit_a);
+            // pack the four int32 die masks back to a byte mask; clear dying lanes.
+            __m128i die01 = _mm_packs_epi32(die_g[0], die_g[1]);
+            __m128i die23 = _mm_packs_epi32(die_g[2], die_g[3]);
+            __m128i die_bytes = _mm_packs_epi16(die01, die23);
+            exit0 = _mm_andnot_si128(die_bytes, exit0);
         }
 
 #if RDT

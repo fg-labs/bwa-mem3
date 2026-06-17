@@ -15,7 +15,7 @@
 ##  direct builds — see the ARM branch below).
 ##*****************************************************************************
 
-EXE = fmi_test smem2_test bwt_seed_strategy_test sa2ref_test xeonbsw smem_lockstep_parity_test header_insert_test packed_text_test system_test
+EXE = fmi_test smem2_test bwt_seed_strategy_test sa2ref_test xeonbsw bandedswa_zdrop_eweight_test smem_lockstep_parity_test header_insert_test packed_text_test system_test
 
 # Doctest binaries — rules populated in Task 14 (unit) and Task 15
 # (integration). Listed separately from $(EXE) so `all` and
@@ -219,6 +219,9 @@ bwt_seed_strategy_test: $(INTEGRATION_DIR)/bwt_seed_strategy_test.o
 xeonbsw: $(INTEGRATION_DIR)/main_banded.o
 	$(CXX) $(LDFLAGS) -o $@ $^ $(LIBS)
 
+bandedswa_zdrop_eweight_test: $(INTEGRATION_DIR)/bandedswa_zdrop_eweight_test.o
+	$(CXX) $(LDFLAGS) -o $@ $^ $(LIBS)
+
 smem_lockstep_parity_test: smem_lockstep_parity_test.o
 	$(CXX) $(LDFLAGS) -o $@ $^ $(LIBS)
 
@@ -268,6 +271,7 @@ integration/bwt_seed_strategy_test.o: ../src/bwa.h ../src/bwt.h ../src/utils.h .
 integration/fmi_test.o: ../src/FMI_search.h ../src/bntseq.h ../src/read_index_ele.h
 integration/fmi_test.o: ../src/bwa.h ../src/bwt.h ../src/utils.h ../src/macro.h
 integration/main_banded.o: ../src/bandedSWA.h ../src/macro.h
+integration/bandedswa_zdrop_eweight_test.o: ../src/bandedSWA.h ../src/macro.h
 integration/sa2ref_test.o: ../src/FMI_search.h ../src/bntseq.h ../src/read_index_ele.h
 integration/sa2ref_test.o: ../src/bwa.h ../src/bwt.h ../src/utils.h ../src/macro.h
 integration/smem2_test.o: ../src/FMI_search.h ../src/bntseq.h ../src/read_index_ele.h
