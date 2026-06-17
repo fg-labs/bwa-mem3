@@ -53,10 +53,12 @@ void build_mat(int8_t mat[25], int a, int b, int ambig) {
 // Drive width-bit batched kernel (8 or 16) vs the scalar oracle over n random
 // target>=query pairs up to maxlen, and tally per-field mismatches. Returns the
 // total number of pairs with any mismatch.
-int run_parity(int width, int n, int maxlen, unsigned long seed,
+int run_parity(int width, int n, int maxlen, unsigned long seed, int zdrop,
                int &bs, int &bt, int &bg, int &bq, int &bgs, int &bm) {
-    const int a = 1, b = 4, ambig = -1, o = 6, e = 1, zdrop = 100, end_bonus = 5, w = 100;
-    const int STRIDE = 1280;   // > MAX_SEQ_LEN8 (1088); generous per-pair slot
+    const int a = 1, b = 4, ambig = -1, o = 6, e = 1, end_bonus = 5, w = 100;
+    const int STRIDE = maxlen + MAX_LINE_LEN;   // per-pair seq slot; scales with read
+                                                // length, + slack for prefetch look-ahead
+                                                // (16-bit handles up to MAX_SEQ_LEN16=32768)
     int8_t mat[25];
     build_mat(mat, a, b, ambig);
 
@@ -110,10 +112,11 @@ int run_parity(int width, int n, int maxlen, unsigned long seed,
     return bad;
 }
 
-void check_width(int width, int n, int maxlen, unsigned long seed) {
+void check_width(int width, int n, int maxlen, unsigned long seed, int zdrop = 100) {
     int bs, bt, bg, bq, bgs, bm;
-    int bad = run_parity(width, n, maxlen, seed, bs, bt, bg, bq, bgs, bm);
+    int bad = run_parity(width, n, maxlen, seed, zdrop, bs, bt, bg, bq, bgs, bm);
     MESSAGE("bandedSWA getScores" << width << " vs scalar: maxlen=" << maxlen
+            << " zdrop=" << zdrop
             << " n=" << n << " ANY=" << bad
             << " (score=" << bs << " tle=" << bt << " gtle=" << bg
             << " qle=" << bq << " gscore=" << bgs << " max_off=" << bm << ")");
@@ -244,6 +247,18 @@ TEST_CASE("bandedSWA getScores16 byte-identical to scalar (short + long reads)"
           * doctest::test_suite("unit/bandedswa")) {
     SUBCASE("short reads (maxlen 120)") { check_width(16, 3000, 120, 999); }
     SUBCASE("long reads (maxlen 1000)") { check_width(16, 1500, 1000, 999); }
+}
+
+TEST_CASE("bandedSWA getScores16 byte-identical to scalar past MAX_SEQ_LEN8 + high zdrop"
+          * doctest::test_suite("unit/bandedswa")) {
+    // The 8-bit path caps at MAX_SEQ_LEN8 (1088); reads beyond that use the 16-bit
+    // kernel exclusively, a regime that previously had no byte-identity coverage.
+    SUBCASE("16-bit long reads (maxlen 2000)") { check_width(16, 600, 2000, 4242); }
+    SUBCASE("16-bit long reads (maxlen 4000)") { check_width(16, 300, 4000, 4243); }
+    // zdrop beyond the 8-bit gate's <=126 cap: exercises the 16-bit path's
+    // handling of a large z-drop horizon (getScores16 has no re-baseline, so it
+    // takes zdrop directly; this also covers what the 8-bit gate routes here).
+    SUBCASE("16-bit high zdrop (maxlen 1000, zdrop 150)") { check_width(16, 1500, 1000, 4244, 150); }
 }
 
 TEST_CASE("bandedSWA 8-bit byte-identical to scalar on repeat-rich, large-h0 reads"
