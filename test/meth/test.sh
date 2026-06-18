@@ -135,182 +135,21 @@ fi
 echo "OK layer 1 Bismark tags: XR/XG/XM well-formed, no Y* leak"
 
 # ---------------------------------------------------------------------------
-# Layer 2: bwa-meth equivalence (requires pixi + bwameth.py + toolshed)
+# Layers 2-3 (bwameth equivalence) RETIRED in D3.
 # ---------------------------------------------------------------------------
-
-if ! command -v pixi >/dev/null 2>&1; then
-    echo "SKIP layer 2: pixi not on PATH"
-    exit 0
-fi
-if [[ ! -f "$BWAMETH_PY" ]]; then
-    echo "SKIP layer 2: bwameth.py not found at $BWAMETH_PY (set BWAMETH_DIR)"
-    exit 0
-fi
-if [[ ! -f "$HERE/pyproject.toml" ]]; then
-    echo "SKIP layer 2: pixi env not initialized in $HERE (run 'pixi init && pixi add toolshed')"
-    exit 0
-fi
-
-export PATH="$(cd "$HERE/../.." && pwd):$PATH"
-
-# Upstream bwameth.py shells out to `bwa-mem2` by name. After the
-# bwa-mem2 -> bwa-mem3 binary rename, that PATH lookup fails and the
-# (2>/dev/null-silenced) pipeline below exits with no diagnostic. Provide
-# a bwa-mem2 alias on PATH so the oracle resolves to our renamed binary.
-ALIAS_DIR="$(mktemp -d)"
-trap 'rm -rf "$ALIAS_DIR"' EXIT
-ln -sf "$BWAMEM3" "$ALIAS_DIR/bwa-mem2"
-export PATH="$ALIAS_DIR:$PATH"
-
-if [[ ! -f "$HERE/ref.fa.bwameth.c2t.0123" ]]; then
-    (cd "$HERE" && pixi run python3 "$BWAMETH_PY" index-mem2 ref.fa >/dev/null 2>&1)
-fi
-
-pixi run python3 "$BWAMETH_PY" --reference ref.fa t_R1.fastq.gz t_R2.fastq.gz \
-    2>/dev/null > /tmp/meth_oracle.sam
-
-pixi run python3 "$BWAMETH_PY" c2t t_R1.fastq.gz t_R2.fastq.gz 2>/dev/null \
-    > /tmp/meth_c2t.fq
-# --chimera-qc: bwa-mem3's chimera heuristic is off by default (Bismark
-# behavior); enable it here so the structural diff against bwameth.py
-# (which always applies the heuristic) sees matching FLAG/MAPQ values.
-"$BWAMEM3" mem --meth --chimera-qc -CM -p -T 40 -B 2 -L 10 -U 100 -t 4 \
-    ref.fa.bwameth.c2t /tmp/meth_c2t.fq 2>/dev/null > /tmp/meth_mine.bam
-"$SAMTOOLS" view /tmp/meth_mine.bam 2>/dev/null > /tmp/meth_mine.sam
-
-grep -v '^@' /tmp/meth_oracle.sam > /tmp/meth_oracle_records.sam
-
-norm() {
-    awk -F'\t' 'BEGIN{OFS="\t"} { if ($7 == "=") $7 = $3; print }' "$1" \
-        | sort -k1,1 -k2,2n
-}
-
-# TLEN (col 9) intentionally diverges from bwameth.py on the edge case of
-# mates landing on opposite projected strands (f* vs r* in the doubled c2t
-# reference). bwameth.py is a post-processor that strips the f/r prefix to
-# make RNAME==RNEXT but inherits bwa-mem3's internal TLEN=0 (which bwa-mem3
-# sets because the internal rids differ). Per the SAM spec, TLEN=0 is
-# reserved for "information unavailable (e.g., mates on different refs)";
-# once we consolidate f*/r* to one output contig the information IS
-# available, so we compute a real TLEN. Diff QNAME..MPOS (cols 1-8) to
-# assert structural parity without re-enforcing bwameth.py's TLEN=0 quirk.
-# `|| true`: under `set -euo pipefail` a non-zero `diff` exit (files differ) inside
-# a command substitution aborts the script *before* the FAIL branch below runs,
-# turning a real structural mismatch into a silent `exit 1` with no diagnostic.
-ONE="$(diff <(norm /tmp/meth_mine.sam | cut -f1-8) \
-             <(norm /tmp/meth_oracle_records.sam | cut -f1-8) | wc -l | tr -d ' ' || true)"
-if [[ "$ONE" != "0" ]]; then
-    echo "FAIL layer 2: structural diff in cols 1-8 ($ONE lines)"
-    diff <(norm /tmp/meth_mine.sam | cut -f1-8) <(norm /tmp/meth_oracle_records.sam | cut -f1-8) | head -20 || true
-    exit 1
-fi
-
-TWO="$(diff <(norm /tmp/meth_mine.sam | cut -f6) \
-             <(norm /tmp/meth_oracle_records.sam | cut -f6) | wc -l | tr -d ' ' || true)"
-if [[ "$TWO" != "0" ]]; then echo "FAIL layer 2: CIGAR diff ($TWO lines)"; exit 1; fi
-
-MINE_N="$(wc -l < /tmp/meth_mine.sam | tr -d ' ')"
-ORACLE_N="$(wc -l < /tmp/meth_oracle_records.sam | tr -d ' ')"
-if [[ "$MINE_N" != "$ORACLE_N" ]]; then
-    echo "FAIL layer 2: record count mismatch (mine=$MINE_N oracle=$ORACLE_N)"
-    exit 1
-fi
-
-# bwameth.py emits YD/YC/YS; bwa-mem3 emits Bismark XR/XG/XM. We don't
-# diff tag values across the two pipelines (different tag schemas).
-# Tag-value golden truth lives in Layer 3 (test_bismark_tags.sh) which
-# compares against holodeck's Bismark-compatible golden BAM.
-MINE_XG_F="$(grep -c 'XG:Z:CT' /tmp/meth_mine.sam || true)"
-MINE_XG_R="$(grep -c 'XG:Z:GA' /tmp/meth_mine.sam || true)"
-echo "OK layer 2: bwa-mem3 mem --meth matches bwameth.py structurally (records=$MINE_N, XG:Z:CT=$MINE_XG_F XG:Z:GA=$MINE_XG_R)"
-
-# ---------------------------------------------------------------------------
-# Layer 3: full-pipeline end-to-end — `bwa-mem3 index --meth` + `mem --meth`
-# ---------------------------------------------------------------------------
-# Tests the single-command drop-in replacement for the bwameth.py pipeline:
+# The pre-D3 --meth was a 3-letter / bwameth-style aligner, so Layers 2-3
+# asserted structural (QNAME/FLAG/RNAME/POS/CIGAR) and byte equivalence to
+# bwameth.py via the doubled c2t reference. D3 redesigns --meth to seed in
+# collapsed space but SCORE/EXTEND against the ORIGINAL 4-letter reference with
+# a per-strand asymmetric matrix -- it deliberately diverges from bwameth's
+# collapsed-space alignment (it distinguishes real variants from conversions).
+# Structural/byte equivalence to bwameth is therefore no longer a goal, and the
+# old `mem --meth <c2t-prefix> <pre-converted-reads>` invocation does not exist
+# in the new dual-index model (bare prefix + original reads + `.meth` seed).
 #
-#   bwa-mem3 index --meth ref.fa                           # once
-#   bwa-mem3 mem   --meth ref.fa R1.fq R2.fq | samtools sort ...
-#
-# No Python, no bwameth.py invocation, no piping. Asserts byte-for-byte
-# equivalence with bwameth.py end-to-end on the example fixture:
-#   - same set of aligned primary QNAMEs
-#   - same chromosome + position for every mapped primary
-#   - same CIGAR for every mapped primary
-
-# Only runs when the bwameth.py oracle is available (Layer 2's pixi env).
-if ! command -v pixi >/dev/null 2>&1; then
-    echo "SKIP layer 3: pixi not on PATH (needed to regenerate oracle)"
-    exit 0
-fi
-if [[ ! -f "$BWAMETH_PY" ]]; then
-    echo "SKIP layer 3: bwameth.py not found at $BWAMETH_PY"
-    exit 0
-fi
-
-# Fresh index via our own --meth builder.
-rm -f "$HERE/ref.fa.bwameth.c2t"*
-"$BWAMEM3" index --meth ref.fa >/dev/null 2>&1
-
-# Single-command end-to-end alignment.  --chimera-qc enabled here for
-# parity with bwameth.py's always-on heuristic; default bwa-mem3 --meth
-# behavior is no chimera QC (Bismark default).
-"$BWAMEM3" mem --meth --chimera-qc -t 4 ref.fa t_R1.fastq.gz t_R2.fastq.gz 2>/dev/null > /tmp/meth_e2e.bam
-"$SAMTOOLS" view /tmp/meth_e2e.bam 2>/dev/null > /tmp/meth_e2e.sam
-
-# Oracle: bwameth.py end-to-end on the same raw FASTQs (reuses Layer 2's
-# meth_oracle.sam if it was just written, otherwise regenerate).
-if [[ ! -s /tmp/meth_oracle.sam ]]; then
-    pixi run python3 "$BWAMETH_PY" --reference ref.fa t_R1.fastq.gz t_R2.fastq.gz \
-        2>/dev/null > /tmp/meth_oracle.sam
-fi
-grep -v '^@' /tmp/meth_oracle.sam > /tmp/meth_oracle_records.sam
-
-# Record count sanity.
-N_MINE="$("$SAMTOOLS" view -c /tmp/meth_e2e.bam 2>/dev/null)"
-N_ORAC="$(wc -l < /tmp/meth_oracle_records.sam | tr -d ' ')"
-if [[ "$N_MINE" != "$N_ORAC" ]]; then
-    echo "FAIL layer 3: record count mismatch (mine=$N_MINE oracle=$N_ORAC)"
-    exit 1
-fi
-
-# Per-primary agreement: same chrom+pos and same CIGAR for every mapped read.
-# (Soft-clip/secondary tie-breaking can be order-sensitive; we allow the
-# tiny symmetric set of "mapped only in one" to be 0 here, matching the
-# bwa-meth/example fixture.)
-python3 - <<'PY'
-import sys
-def load(path):
-    out = {}
-    with open(path) as fh:
-        for line in fh:
-            if line.startswith('@'): continue
-            f = line.rstrip('\n').split('\t')
-            flag = int(f[1])
-            if flag & 0x100 or flag & 0x800: continue
-            is_r2 = 2 if (flag & 0x80) else 1
-            unmapped = 1 if (flag & 0x4) else 0
-            out[f'{f[0]}/{is_r2}']=(unmapped, int(f[3]), f[5], f[2])
-    return out
-n=load('/tmp/meth_e2e.sam'); o=load('/tmp/meth_oracle.sam')
-only_n=sorted(set(n) - set(o))
-only_o=sorted(set(o) - set(n))
-both=[k for k in n if k in o and n[k][0]==0 and o[k][0]==0]
-gap=[k for k in n if k in o and n[k][0]==1 and o[k][0]==0]
-nonly=[k for k in n if k in o and n[k][0]==0 and o[k][0]==1]
-same_pos=sum(1 for k in both if n[k][1]==o[k][1] and n[k][3]==o[k][3])
-same_cigar=sum(1 for k in both if n[k][2]==o[k][2])
-if only_n or only_o or gap or nonly or same_pos != len(both) or same_cigar != len(both):
-    sys.stderr.write(
-        f'FAIL layer 3: diverged from bwameth.py oracle\n'
-        f'  native-only QNAMEs: {len(only_n)}\n'
-        f'  oracle-only QNAMEs: {len(only_o)}\n'
-        f'  both-mapped: {len(both)}\n'
-        f'  oracle-only mapped: {len(gap)}\n'
-        f'  native-only mapped: {len(nonly)}\n'
-        f'  same chrom+pos: {same_pos}/{len(both)}\n'
-        f'  same CIGAR:     {same_cigar}/{len(both)}\n')
-    sys.exit(1)
-print(f'OK layer 3: bwa-mem3 mem --meth == bwameth.py end-to-end '
-      f'(records={len(both)}, chrom+pos match, CIGAR match)')
-PY
+# D3 correctness is covered by the CI-wired whole-aligner regressions
+# (test/regression/meth_*.sh: dual index + seed->original remap, mixed-PE
+# asymmetric scoring, OT/OB x strand placement, original-alphabet output
+# integrity, reverse-strand-conversion) plus the directed gamma unit tests.
+echo "OK: Layer 1 passed; Layers 2-3 (bwameth structural/byte equivalence) retired in D3 (see comment)."
+exit 0

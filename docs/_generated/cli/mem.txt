@@ -48,7 +48,8 @@ Input/output options:
 Bisulfite (--meth) options:
    --meth        enable inline bwameth-style C→T/G→A read conversion + meth-aware BAM
                  emission. Implies --bam. Requires the reference to have been built
-                 with `bwa-mem3 index --meth` (emits ref.fa.bwameth.c2t).
+                 with `bwa-mem3 index --meth` (emits the original index plus a
+                 ref.fa.meth.* converted seed index).
    --set-as-failed f|r
                  flag alignments to the matching strand ('f' or 'r') as QC-fail (0x200)
    --chimera-qc

@@ -953,7 +953,8 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "Bisulfite (--meth) options:\n");
     fprintf(stderr, "   --meth        enable inline bwameth-style C→T/G→A read conversion + meth-aware BAM\n");
     fprintf(stderr, "                 emission. Implies --bam. Requires the reference to have been built\n");
-    fprintf(stderr, "                 with `bwa-mem3 index --meth` (emits ref.fa.bwameth.c2t).\n");
+    fprintf(stderr, "                 with `bwa-mem3 index --meth` (emits the original index plus a\n");
+    fprintf(stderr, "                 ref.fa.meth.* converted seed index).\n");
     fprintf(stderr, "   --set-as-failed f|r\n");
     fprintf(stderr, "                 flag alignments to the matching strand ('f' or 'r') as QC-fail (0x200)\n");
     fprintf(stderr, "   --chimera-qc\n");
@@ -1380,20 +1381,20 @@ int main_mem(int argc, char *argv[])
     /* Matrix for SWA */
     bwa_fill_scmat(opt->a, opt->b, opt->mat);
 
-    /* In --meth the canonical UX is "bwa-mem3 mem --meth ref.fa" and
-     * we auto-append ".bwameth.c2t" to find the index built by
-     * "bwa-mem3 index --meth". If the user (or bwameth.py's internal
-     * invocation) already passed the ".bwameth.c2t" path directly, use
-     * it as-is rather than double-appending. */
+    /* In --meth (D3) the canonical UX is "bwa-mem3 mem --meth ref.fa": we
+     * auto-append ".meth" to find the converted SEED FM-index built by
+     * "bwa-mem3 index --meth" (the original-alphabet index lives at the bare
+     * prefix and supplies BNS+PAC via FMI_search::set_meth_ref_prefix below).
+     * If the user already passed the ".meth" path directly, use it as-is. */
     char c2t_ref[PATH_MAX];
     char orig_ref_buf[PATH_MAX];
-    /* In --meth, the original (pre-c2t) reference prefix, used to load that
-     * reference's .hdr/.dict sidecar for @SQ M5/UR enrichment and @CO/@PG/@RG
-     * pass-through. NULL outside --meth. */
+    /* In --meth, the ORIGINAL (un-projected) reference prefix: supplies BNS+PAC
+     * for extension/coords (dual-index, set_meth_ref_prefix) and the
+     * .hdr/.dict sidecar for @SQ M5/UR enrichment. NULL outside --meth. */
     const char *meth_orig_ref_prefix = NULL;
     const char *ref_prefix = argv[optind];
     if (opt->meth_mode) {
-        const char *suffix = ".bwameth.c2t";
+        const char *suffix = ".meth";
         size_t slen = strlen(suffix);
         size_t alen = strlen(argv[optind]);
         int already_c2t = (alen >= slen) &&
@@ -1407,9 +1408,9 @@ int main_mem(int argc, char *argv[])
             ref_prefix = c2t_ref;
             meth_orig_ref_prefix = argv[optind];
         } else {
-            /* User passed the ".bwameth.c2t" path directly; recover the
+            /* User passed the ".meth" seed-index path directly; recover the
              * original reference prefix by stripping the suffix so its
-             * sidecar (not the c2t index's) supplies @SQ identity tags. */
+             * sidecar (not the seed index's) supplies @SQ identity tags. */
             size_t base = alen - slen;
             if (base < sizeof(orig_ref_buf)) {
                 memcpy(orig_ref_buf, argv[optind], base);
@@ -1427,14 +1428,66 @@ int main_mem(int argc, char *argv[])
         }
     }
 
+    /* D3: fail fast with an actionable message if the `.meth` seed index is
+     * absent — distinguishing a never-built index from a stale D1 `.bwameth.c2t`
+     * index (the format changed; the user must re-run `index --meth`). */
+    if (opt->meth_mode) {
+        char probe[PATH_MAX];
+        snprintf(probe, sizeof(probe), "%s%s", ref_prefix, ".bwt.2bit.64");
+        if (access(probe, F_OK) != 0) {
+            const char *orig = (meth_orig_ref_prefix != NULL) ? meth_orig_ref_prefix
+                                                              : argv[optind];
+            char old_probe[PATH_MAX];
+            snprintf(old_probe, sizeof(old_probe), "%s.bwameth.c2t.bwt.2bit.64", orig);
+            if (access(old_probe, F_OK) == 0)
+                fprintf(stderr,
+                        "ERROR: --meth found a legacy '.bwameth.c2t' index, but the "
+                        "format changed. Re-run: bwa-mem3 index --meth %s\n", orig);
+            else
+                fprintf(stderr,
+                        "ERROR: --meth seed index '%s.*' not found. Run: "
+                        "bwa-mem3 index --meth %s\n", ref_prefix, orig);
+            free(opt);
+            if (out_opened) fclose(aux.fp);
+            return 1;
+        }
+    }
+
     /* Load bwt2/FMI index */
     uint64_t tim = __rdtsc();
 
     fprintf(stderr, "* Ref file: %s\n", ref_prefix);
     aux.fmi = new FMI_search(ref_prefix);
+    /* D3 dual-index: the FM-index AND its BNS/PAC come from the `.meth` SEED prefix.
+     * The seed BNS is required to decode seed positions into (seed contig, local pos,
+     * strand): the seed reference has the f/r-doubled contig layout (r0,f0,r1,f1,...).
+     * Seed contigs are remapped to ORIGINAL coordinates arithmetically
+     * (orig_tid = seed_rid/2; hypothesis = seed_rid & 1; pos preserved). The ORIGINAL
+     * reference's BNS/PAC are loaded separately as the remap/extension target in the
+     * extension phase (NOT a replacement of the seed BNS). */
     aux.fmi->load_index();
     aux.shm_base = aux.fmi->shm_attached_base();
     tprof[FMI][0] += __rdtsc() - tim;
+
+    /* D3 SEEDING PHASE (WIP). The dual index is loaded: FM-index from the `.meth`
+     * seed prefix, BNS+PAC from the ORIGINAL reference. Chaining/extension/output
+     * are NOT yet wired for the original-alphabet architecture — seed hits are in
+     * seed-index (f/r doubled) coordinates and must be remapped to original
+     * coordinates first (the seed→original remap, B4), and SW scoring/output are
+     * the deferred γ phase. Until those land, stop cleanly here rather than running
+     * the c2t-architecture pipeline against the original BNS (mismatched coords).
+     * >>> SEED-DUMP / remap goes here (B4/B5). <<< */
+    if (opt->meth_mode) {
+        fprintf(stderr,
+                "[bwa-mem3:--meth] D3 seed index loaded: FM-index + seed BNS (%d "
+                "contigs, f/r-doubled). Seed→original remap, original-ref load, and "
+                "extension/output are the next (deferred) phases; stopping. See D3 "
+                "spec §5/§6.\n", aux.fmi->idx->bns ? aux.fmi->idx->bns->n_seqs : -1);
+        delete aux.fmi;
+        free(opt);
+        if (out_opened) fclose(aux.fp);
+        return 0;
+    }
 
     // reading ref string (from shm if FMI attached, else from .0123 file)
     tim = __rdtsc();

@@ -878,11 +878,11 @@ int bwa_shm_section_find(const uint8_t *base, uint32_t kind,
 
 /* Resolve the on-disk prefix for `bwa-mem3 shm --meth <idxbase>` so that
  * the registry basename matches what `bwa-mem3 mem --meth <idxbase>` will
- * later look up. Mirrors fastmap.cpp's c2t-suffix resolution: append
- * `.bwameth.c2t` unless `prefix` already ends with it. */
+ * later look up. Mirrors fastmap.cpp's D3 seed-suffix resolution: append
+ * `.meth` (the converted seed FM-index) unless `prefix` already ends with it. */
 static int resolve_meth_prefix(const char *prefix, char out[PATH_MAX])
 {
-    static const char SUFFIX[] = ".bwameth.c2t";
+    static const char SUFFIX[] = ".meth";
     static const size_t SUFLEN = sizeof(SUFFIX) - 1;
     size_t plen = std::strlen(prefix);
     int already = (plen >= SUFLEN) &&
@@ -903,9 +903,9 @@ static int resolve_meth_prefix(const char *prefix, char out[PATH_MAX])
     return 0;
 }
 
-/* If `<prefix>.0123` is absent but `<prefix>.bwameth.c2t.0123` is present,
- * the user likely meant `--meth`. Print a hint and return 1. Returns 0
- * when no hint applies (let the regular stage path produce its own error). */
+/* If `<prefix>.0123` is absent but `<prefix>.meth.0123` is present, the user
+ * likely meant `--meth`. Print a hint and return 1. Returns 0 when no hint
+ * applies (let the regular stage path produce its own error). */
 static int hint_missing_meth_flag(const char *prefix)
 {
     char zer_path[PATH_MAX];
@@ -914,13 +914,13 @@ static int hint_missing_meth_flag(const char *prefix)
     if (stat(zer_path, &st) == 0) return 0;        /* literal index present */
     if (errno != ENOENT) return 0;                 /* I/O error: defer */
 
-    char c2t_zer[PATH_MAX];
-    path_concat2(c2t_zer, prefix, ".bwameth.c2t.0123");
-    if (stat(c2t_zer, &st) != 0) return 0;         /* no meth index either */
+    char meth_zer[PATH_MAX];
+    path_concat2(meth_zer, prefix, ".meth.0123");
+    if (stat(meth_zer, &st) != 0) return 0;        /* no meth seed index either */
 
     std::fprintf(stderr,
-        "[E::main_shm] no FMI at '%s.0123' but a meth index is present at "
-        "'%s.bwameth.c2t.*'\n"
+        "[E::main_shm] no FMI at '%s.0123' but a meth seed index is present at "
+        "'%s.meth.*'\n"
         "             did you mean `bwa-mem3 shm --meth %s`?\n",
         prefix, prefix, prefix);
     return 1;
