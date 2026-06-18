@@ -1105,6 +1105,8 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
             // the byte-identical 16-bit tier: col == qlen-1 (j256 == qlen_off) AND
             // the band-grown tail reached the query end (tail256 == qlen_off ==
             // scalar's end == qlen) AND in-band (qlen_valid) AND lane alive (exit0).
+            // gtle CONTRACT (see smithWaterman128_8): exact vs scalar for
+            // gscore > 0; may differ only in the unused gscore == 0 tail.
             if (j >= minq)
             {
                 __m256i cmp = _mm256_cmpeq_epi8(j256, qlen_off256);
@@ -2845,6 +2847,8 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
             // band-grown tail reached the query end (tail512 == qlen_off == scalar's
             // end == qlen) AND in-band (qlen_valid) AND lane alive (exit0 high bit).
             // mask_blend(k, a, b) selects b where k, a where ~k.
+            // gtle CONTRACT (see smithWaterman128_8): exact vs scalar for
+            // gscore > 0; may differ only in the unused gscore == 0 tail.
             if (j >= minq)
             {
                 __mmask64 cmp = _mm512_cmpeq_epi8_mask(j512, qlen_off512);
@@ -5297,6 +5301,20 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
                 // qlen_off alias. Fires regardless of h11 (matches scalar's h1==0
                 // firing); the captured value is finalized wide (byte+B) in the
                 // epilogue so it survives re-baselining.
+                //
+                // gtle (= max_ie+1, the captured row) CONTRACT vs scalar: exact
+                // when gscore > 0; may differ only in the gscore == 0 query-end
+                // tail. The vector row loop ends at nrow = mlenw =
+                // min(qlen+myband, tlen) (myband is e-dependent), whereas scalar
+                // runs to its dynamic m==0 break and keeps updating max_ie on the
+                // trailing end==qlen rows (all h1==0, gscore stays 0) that the
+                // vector never reaches. This is harmless: bwa-mem consumes gtle
+                // only under `gscore > 0` (see the `if (gscore <= 0 || ...) {...}
+                // else {...gtle...}` guards in bwamem.cpp), so the gscore==0
+                // divergence never reaches a SAM record. At default -E 1,
+                // mlenw == tlen, so there is no divergence at all. Enforced by
+                // test/integration/bandedswa_zdrop_eweight_test.cpp (gtle compared
+                // iff gscore > 0).
                 __m128i cmp = _mm_cmpeq_epi8(j128, qlen_off128);
                 cmp = _mm_and_si128(cmp, _mm_cmpeq_epi8(tail128, qlen_off128));
                 cmp = _mm_and_si128(cmp, qlen_valid128);
