@@ -42,6 +42,9 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "FMI_search.h"
 #include "bam_writer.h"
 #include "meth_bam.h"
+#include "stage_prof.h"
+#include "version.h"
+#include <sys/resource.h>
 #include "meth_orig_ref.h"
 #include "bwa_shm.h"
 #include "fast_reader_bseq.h"
@@ -346,6 +349,12 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
         ktp_data_t *ret = (ktp_data_t *) calloc(1, sizeof(ktp_data_t));
         assert(ret != NULL);
         uint64_t tim = __rdtsc();
+        double sp_r0 = 0.0;
+        if (sp_enabled()) {
+            sp_chunk_init(&ret->prof); sp_read_reset();
+            ret->prof.chunk_start = sp_run_elapsed();   /* timeline anchor */
+            sp_r0 = sp_wall();
+        }
 
         /* Read "reads" from input file (fread) */
         int64_t sz = 0;
@@ -354,6 +363,18 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
             : bseq_read_fast(aux->task_size, &ret->n_seqs, aux->frks, aux->frks2, &sz);
 
         tprof[READ_IO][0] += __rdtsc() - tim;
+
+        if (sp_enabled()) {
+            ret->prof.read_wall = sp_wall() - sp_r0;
+            /* Only the fast reader is instrumented; the legacy reader leaves the
+             * sub-splits at their NaN init (blank) rather than reporting a fake 0. */
+            if (!aux->legacy_reader) {
+                sp_read_get(&ret->prof.read_diskwait, &ret->prof.read_decompress, &ret->prof.read_parse);
+                sp_read_get_bytes(&ret->prof.read_bytes_in, &ret->prof.bgzf_blocks);
+            }
+            ret->prof.n_reads = ret->n_seqs;
+            ret->prof.n_bp = sz;
+        }
 
         fprintf(stderr, "[0000] read_chunk: %ld, work_chunk_size: %ld, nseq: %d\n",
                 aux->task_size, sz, ret->n_seqs);
@@ -458,6 +479,13 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
 
         fprintf(stderr, "[0000] Calling mem_process_seqs.., task: %d\n", task++);
 
+        double sp_p0 = 0.0;
+        if (sp_enabled()) {
+            sp_chunk_init(&g_ktfor);          /* reset balance + encode accumulator */
+            g_ktfor.encode = 0.0;             /* accumulate (sp_chunk_init left it NaN) */
+            sp_p0 = sp_wall();
+        }
+
         uint64_t tim = __rdtsc();
         if (opt->flag & MEM_F_SMARTPE)
         {
@@ -520,7 +548,21 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
                              w);
         }
         tprof[MEM_PROCESS2][0] += __rdtsc() - tim;
-                
+
+        if (sp_enabled()) {
+            ret->prof.proc_wall      = sp_wall() - sp_p0;
+            ret->prof.proc_cpu       = g_ktfor.proc_cpu;
+            ret->prof.thr_busy_min   = g_ktfor.thr_busy_min;
+            ret->prof.thr_busy_max   = g_ktfor.thr_busy_max;
+            ret->prof.thr_busy_mean  = g_ktfor.thr_busy_mean;
+            ret->prof.thr_busy_stdev = g_ktfor.thr_busy_stdev;
+            /* encode = SAM/BAM-build CPU (accurate, summed over compute threads);
+             * compute = the rest of the alignment CPU. Same clock, so subtractable. */
+            ret->prof.encode  = g_ktfor.encode;
+            ret->prof.compute = (g_ktfor.proc_cpu > g_ktfor.encode)
+                                ? g_ktfor.proc_cpu - g_ktfor.encode : NAN;
+        }
+
         aux->n_processed += ret->n_seqs;
         return ret;
     }
@@ -528,6 +570,8 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
     else if (step == 2)
     {
         uint64_t tim = __rdtsc();
+        double sp_w0 = sp_enabled() ? sp_wall() : 0.0;
+        long sp_wbytes = 0;
 
         for (int i = 0; i < ret->n_seqs; )
         {
@@ -592,6 +636,7 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
             }
 
             for (int k = 0; k < group_size; ++k) {
+                if (sp_enabled() && ret->seqs[i+k].sam) sp_wbytes += (long)strlen(ret->seqs[i+k].sam);
                 free(ret->seqs[i+k].name);
                 free(ret->seqs[i+k].comment);
                 free(ret->seqs[i+k].seq);
@@ -600,6 +645,19 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
                 free(ret->seqs[i+k].bams);
             }
             i += group_size;
+        }
+        if (sp_enabled()) {
+            ret->prof.write_wall = sp_wall() - sp_w0;
+            ret->prof.write_bytes = sp_wbytes;
+            if (aux->opt->bam_mode) {            /* htslib fuses compress+diskwrite */
+                ret->prof.write_compress = ret->prof.write_wall;   /* diskwrite stays NaN */
+            } else {
+                ret->prof.write_diskwrite = ret->prof.write_wall;
+                ret->prof.write_compress = 0.0;
+            }
+            static long g_sp_chunk = 0;
+            ret->prof.chunk = __sync_fetch_and_add(&g_sp_chunk, 1);
+            sp_add_chunk(&ret->prof);
         }
         free(ret->seqs);
         free(ret);
@@ -618,6 +676,7 @@ static void *ktp_worker(void *data)
 
     while (w->step < p->n_steps) {
         // test whether we can kick off the job with this worker
+        double sp_i0 = sp_enabled() ? sp_wall() : 0.0;   // idle = time waiting for our turn
         int pthread_ret = pthread_mutex_lock(&p->mutex);
         assert(pthread_ret == 0);
         for (;;) {
@@ -634,6 +693,7 @@ static void *ktp_worker(void *data)
         }
         pthread_ret = pthread_mutex_unlock(&p->mutex);
         assert(pthread_ret == 0);
+        if (sp_enabled()) sp_add_idle(w->step, sp_wall() - sp_i0);   /* idle attributed to next step */
 
         // working on w->step
         w->data = kt_pipeline(p->shared, w->step, w->step? w->data : 0, w->opt, *(w->w)); // for the first step, input is NULL
@@ -905,6 +965,11 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "   --legacy-reader\n");
     fprintf(stderr, "                 use the legacy gzFile/kseq input reader instead of the default\n");
     fprintf(stderr, "                 content-detecting fast reader (escape hatch / A-B baseline).\n");
+#ifdef STAGE_PROF
+    fprintf(stderr, "Profiling:\n");
+    fprintf(stderr, "   --profile FILE\n");
+    fprintf(stderr, "                 write per-chunk stage profiling TSV to FILE (off by default).\n");
+#endif
     fprintf(stderr, "Help:\n");
     fprintf(stderr, "   --help        print this help message and exit\n");
     fprintf(stderr, "Note: Please read the man page for detailed description of the command line and options.\n");
@@ -1018,6 +1083,9 @@ int main_mem(int argc, char *argv[])
         OPT_METH_CHIMERA_QC,
         OPT_SUPP_REP_HARD_CAP,
         OPT_LEGACY_READER,
+#ifdef STAGE_PROF
+        OPT_PROFILE,
+#endif
         OPT_HELP,
     };
     static struct option long_opts[] = {
@@ -1027,9 +1095,15 @@ int main_mem(int argc, char *argv[])
         {"chimera-qc",               no_argument,       0, OPT_METH_CHIMERA_QC},
         {"supp-rep-hard-cap",        required_argument, 0, OPT_SUPP_REP_HARD_CAP},
         {"legacy-reader",            no_argument,       0, OPT_LEGACY_READER},
+#ifdef STAGE_PROF
+        {"profile",                  required_argument, 0, OPT_PROFILE},
+#endif
         {"help",                     no_argument,       0, OPT_HELP},
         {0, 0, 0, 0}
     };
+#ifdef STAGE_PROF
+    const char *profile_path = NULL;   /* --profile <path>: stage_prof TSV output */
+#endif
     while ((c = getopt_long(argc, argv, "51qpaMCSPVYjuk:c:v:s:r:t:R:A:B:O:E:U:w:L:d:T:Q:D:m:I:N:W:x:G:h:y:K:X:H:o:f:z:",
                             long_opts, NULL)) >= 0)
     {
@@ -1152,6 +1226,11 @@ int main_mem(int argc, char *argv[])
                 opt->bam_level = lvl;
             }
         }
+#ifdef STAGE_PROF
+        else if (c == OPT_PROFILE) {
+            profile_path = optarg;
+        }
+#endif
         else if (c == OPT_METH) {
             opt->meth_mode = 1;
             opt->bam_mode = 1;  /* meth implies BAM output */
@@ -1582,12 +1661,44 @@ int main_mem(int argc, char *argv[])
     }
     tprof[MISC][1] = opt->chunk_size = aux.actual_chunk_size = aux.task_size;
 
+    double sp_t0 = 0.0;
+#ifdef STAGE_PROF
+    /* stage_prof: arm per-chunk read/process/write profiling if --profile given */
+    if (profile_path && profile_path[0]) {
+#if defined(__x86_64__) || defined(_M_X64)
+        const char *sp_arch = "x86_64";
+#elif defined(__aarch64__) || defined(__arm64__)
+        const char *sp_arch = "arm64";
+#else
+        const char *sp_arch = "unknown";
+#endif
+        const char *sp_in = (optind + 1 < argc) ? argv[optind + 1]
+                          : (optind < argc ? argv[optind] : "");
+        sp_init(profile_path, "bwa-mem3", PACKAGE_VERSION, sp_arch, opt->n_threads,
+                opt->bam_mode ? "bam" : "sam",
+                opt->bam_mode ? opt->bam_level : -1, sp_in);
+        sp_set_workers(no_mt_io ? 1 : 2);   /* pipeline depth (process() arg) */
+        sp_t0 = sp_wall();
+    }
+#endif
+
     tim = __rdtsc();
 
     /* Relay process function */
     process(&aux, fp, fp2, no_mt_io? 1:2);
 
     tprof[PROCESS][0] += __rdtsc() - tim;
+
+    if (sp_enabled()) {
+        struct rusage ru; getrusage(RUSAGE_SELF, &ru);
+#ifdef __linux__
+        double rss_mb = (double)ru.ru_maxrss / 1024.0;          /* Linux: ru_maxrss is KiB */
+#else
+        double rss_mb = (double)ru.ru_maxrss / (1024.0*1024.0); /* macOS/BSD: ru_maxrss is bytes */
+#endif
+        /* mean_cores_busy is computed inside sp_finish from per-chunk proc_cpu */
+        sp_finish(sp_wall() - sp_t0, 0.0, rss_mb);
+    }
 
     /* Close meth BAM writer BEFORE free(opt) — opt->meth_mode is checked here. */
     int meth_mode_local = opt->meth_mode;

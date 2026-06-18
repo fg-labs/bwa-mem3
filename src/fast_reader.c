@@ -1,4 +1,5 @@
 #include "fast_reader.h"
+#include "stage_prof.h"
 
 #include <zlib.h>
 #include <libdeflate.h>
@@ -64,12 +65,15 @@ static int fr_fill(fast_reader_t *fr)
         fr->cin_len = keep;
         fr->cin_pos = 0;
     }
+    double _t0 = sp_enabled() ? sp_wall() : 0.0;
     while (fr->cin_len < fr->cin_cap && !fr->eof_in) {
         ssize_t r = read(fr->fd, fr->cin + fr->cin_len, fr->cin_cap - fr->cin_len);
-        if (r < 0) { if (errno == EINTR) continue; return -1; }
+        if (r < 0) { if (errno == EINTR) continue; if (sp_enabled()) sp_read_add(0, sp_wall()-_t0); return -1; }
         if (r == 0) { fr->eof_in = 1; break; }
         fr->cin_len += (size_t)r;
+        if (sp_enabled()) sp_read_bytes((long)r, 0);   /* fd (on-disk) bytes */
     }
+    if (sp_enabled()) sp_read_add(0, sp_wall() - _t0);
     return 0;
 }
 
@@ -141,12 +145,15 @@ static int fr_read_plain(fast_reader_t *fr, unsigned char *buf, int len)
         fr->cin_pos += (size_t)take;
         out += take;
     }
+    double _t0 = sp_enabled() ? sp_wall() : 0.0;
     while (out < len && !fr->eof_in) {
         ssize_t r = read(fr->fd, buf + out, len - out);
-        if (r < 0) { if (errno == EINTR) continue; return -1; }
+        if (r < 0) { if (errno == EINTR) continue; if (sp_enabled()) sp_read_add(0, sp_wall()-_t0); return -1; }
         if (r == 0) { fr->eof_in = 1; break; }
         out += (int)r;
+        if (sp_enabled()) sp_read_bytes((long)r, 0);   /* fd (on-disk) bytes */
     }
+    if (sp_enabled()) sp_read_add(0, sp_wall() - _t0);
     return out;
 }
 
@@ -161,7 +168,9 @@ static int fr_read_gzip(fast_reader_t *fr, unsigned char *buf, int len)
             fr->zs.next_in = fr->cin + fr->cin_pos;
             fr->zs.avail_in = (uInt)(fr->cin_len - fr->cin_pos);
         }
+        double _td = sp_enabled() ? sp_wall() : 0.0;
         int ret = inflate(&fr->zs, Z_NO_FLUSH);
+        if (sp_enabled()) sp_read_add(1, sp_wall() - _td);
         fr->cin_pos = fr->cin_len - fr->zs.avail_in;       /* track consumed */
         if (ret == Z_STREAM_END) {                          /* member done */
             if (inflateReset(&fr->zs) != Z_OK) return -1;
@@ -229,14 +238,17 @@ static int fr_next_bgzf_block(fast_reader_t *fr)
         if (isize > fr->bout_cap) return -1;                 /* >64 KiB: not BGZF */
 
         size_t actual = 0;
+        double _td = sp_enabled() ? sp_wall() : 0.0;
         enum libdeflate_result r =
             libdeflate_deflate_decompress(fr->ld, p + cdata_off, cdata_len,
                                           fr->bout, isize, &actual);
+        if (sp_enabled()) sp_read_add(1, sp_wall() - _td);
         if (r != LIBDEFLATE_SUCCESS || actual != isize) return -1;
         if (libdeflate_crc32(0, fr->bout, isize) != crc) return -1;
 
         fr->bout_len = isize;
         fr->bout_pos = 0;
+        if (sp_enabled()) sp_read_bytes(0, 1);   /* one decoded BGZF block */
         return 0;
     }
 }

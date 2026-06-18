@@ -30,6 +30,7 @@
 *****************************************************************************************/
 
 #include "kthread.h"
+#include "stage_prof.h"
 #include <stdio.h>
 
 #if AFF && (__linux__)
@@ -90,6 +91,8 @@ static void *ktf_worker(void *data)
 	ktf_worker_t *w = (ktf_worker_t*)data;
 	long i;
 	int tid = w->i;
+	double _c0 = sp_enabled() ? sp_thread_cpu() : 0.0;
+	if (sp_enabled()) sp_encode_reset();
 
 #if AFF && (__linux__)
 	fprintf(stderr, "i: %d, CPU: %d\n", tid , sched_getcpu());
@@ -109,6 +112,7 @@ static void *ktf_worker(void *data)
 		int ed = (i + 1) * BATCH_SIZE < w->t->n? (i + 1) * BATCH_SIZE : w->t->n;
 		w->t->func(w->t->data, st, ed-st, w - w->t->w);
 	}
+	if (sp_enabled()) { w->cpu_busy = sp_thread_cpu() - _c0; w->encode = sp_encode_get(); }
 	pthread_exit(0);
 }
 
@@ -161,6 +165,17 @@ void kt_for(void (*func)(void*, int, int, int), void *data, int n)
 #endif
 	}
 	for (i = 0; i < t.n_threads; ++i) pthread_join(tid[i], 0);
+
+	if (sp_enabled()) {
+		double *busy = (double*) malloc(t.n_threads * sizeof(double));
+		assert(busy != NULL);
+		double sum = 0, esum = 0;
+		for (i = 0; i < t.n_threads; ++i) { busy[i] = t.w[i].cpu_busy; sum += busy[i]; esum += t.w[i].encode; }
+		g_ktfor.proc_cpu += sum;                        /* accumulate across kt_for calls in a step */
+		g_ktfor.encode   += esum;                       /* SAM/BAM-build CPU (only worker_sam adds) */
+		sp_thread_stats(&g_ktfor, busy, t.n_threads);   /* balance stats from the most recent call */
+		free(busy);
+	}
 
     pthread_attr_destroy(&attr);
     free(t.w);

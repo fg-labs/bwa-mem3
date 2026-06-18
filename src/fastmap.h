@@ -44,6 +44,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "bwa.h"
 #include "bwamem.h"
 #include "kthread.h"
+#include "stage_prof.h"
 #include "kvec.h"
 #include "utils.h"
 #include "bntseq.h"
@@ -84,6 +85,7 @@ typedef struct {
 	ktp_aux_t *aux;
 	int n_seqs;
 	bseq1_t *seqs;
+	prof_chunk_t prof;   /* stage_prof: per-chunk read/process/write timing (--profile) */
 } ktp_data_t;
 
     

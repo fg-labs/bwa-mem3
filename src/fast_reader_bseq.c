@@ -8,6 +8,7 @@
 #include "kstring.h"
 #include "kseq.h"
 #include "utils.h"   /* err_fatal */
+#include "stage_prof.h"
 
 /* kseq instantiated over the fast_reader byte source. This is the only TU that
  * uses this handle type, so there is no kseq_t name collision with the gzFile
@@ -60,6 +61,7 @@ bseq1_t *bseq_read_fast(int64_t chunk_size, int *n_, void *ks1_, void *ks2_, int
                 err_fatal(__func__, "failed to grow read buffer to %ld records", (long)m);
             seqs = tmp;
         }
+        double _tp = sp_enabled() ? sp_wall() : 0.0;
         fr_trim_readno(&ks->name);
         fr_kseq2bseq1(ks, &seqs[n]);
         seqs[n].id = n;
@@ -70,6 +72,7 @@ bseq1_t *bseq_read_fast(int64_t chunk_size, int *n_, void *ks1_, void *ks2_, int
             seqs[n].id = n;
             size += seqs[n++].l_seq;
         }
+        if (sp_enabled()) sp_read_add(2, sp_wall() - _tp);
         if (size >= chunk_size && (n & 1) == 0) break;   /* even-parity cut, all modes */
     }
     if (size == 0) {                                      /* 1st file has fewer */

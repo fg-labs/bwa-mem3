@@ -37,8 +37,18 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include <inttypes.h>      /* PRId64 for int64_t fprintf format strings */
 
 #include "sam_encode.h"
+#include "stage_prof.h"
 /* Not including <htslib/sam.h>: its kstring.h shares the KSTRING_H guard
  * with bwa-mem3's. Opaque bam1_t wrappers live in bam_writer.h. */
+
+/* RAII bracket for the SAM/BAM build (stage_prof --profile). Accumulates the
+ * calling (compute) thread's CPU time across all of mem_aln2sam's return paths
+ * into the per-thread encode accumulator; harvested by kt_for. Zero cost when off. */
+namespace { struct SpEncodeScope {
+    double t0; bool on;
+    SpEncodeScope() : t0(0.0), on(sp_enabled()) { if (on) t0 = sp_thread_cpu(); }
+    ~SpEncodeScope() { if (on) sp_encode_add(sp_thread_cpu() - t0); }
+}; }
 
 meth_chrom_map_t *g_meth_cmap = NULL;
 
@@ -1810,6 +1820,7 @@ static inline void add_cigar(const mem_opt_t *opt, mem_aln_t *p, kstring_t *str,
 void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str,
                  bseq1_t *s, int n, const mem_aln_t *list, int which, const mem_aln_t *m_)
 {
+    SpEncodeScope _enc;   /* stage_prof: time the SAM/BAM build (all return paths) */
     /* BAM short-circuit: meth_mode applies the bisulfite overlay (chrom
      * consolidation, YD:Z, chimera QC), plain bam_mode uses the generic
      * writer. Either path leaves `str` untouched. */

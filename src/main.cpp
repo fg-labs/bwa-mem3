@@ -128,7 +128,11 @@ int main(int argc, char* argv[])
         static const char *const MEM_SHORT_OPTS_WITH_ARG =
             "kcvsrtRABOEUwLdTQDmINWxGhyKXHofz";
         static const char *const MEM_LONG_OPTS_WITH_ARG[] = {
-            "--set-as-failed", "--supp-rep-hard-cap", NULL,
+            "--set-as-failed", "--supp-rep-hard-cap",
+#ifdef STAGE_PROF
+            "--profile",
+#endif
+            NULL,
         };
         for (int i = 2; i < argc; ++i) {
             const char *t = argv[i];

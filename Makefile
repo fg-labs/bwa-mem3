@@ -153,6 +153,15 @@ endif
 
 CPPFLAGS+=	-DENABLE_PREFETCH -DV17=1 -DMATE_SORT=0 -DLIBSAIS_OPENMP
 
+# Profiling (--profile stage instrumentation) is a COMPILE-TIME opt-in. The
+# default build omits it entirely (no --profile option, zero runtime overhead;
+# sp_enabled() folds to a compile-time 0 and the hooks vanish). Build with
+# `make STAGE_PROF=1` to compile in the real stage_prof implementation and
+# expose --profile. (Distinct from the PGO `profile-build` target below.)
+ifeq ($(strip $(STAGE_PROF)),1)
+    CPPFLAGS += -DSTAGE_PROF=1
+endif
+
 # Version string for `bwa-mem3 version` and the @PG VN: field. The single
 # source of truth is `version.txt` (rewritten by release-please on each
 # release). The logic of "base version + optional git-describe dev suffix"
@@ -252,7 +261,7 @@ OBJS=		src/fastmap.o src/bwtindex.o src/utils.o src/kthread.o \
 			src/packed_text.o src/fm_index_writer.o src/index_prelude.o \
 			src/system.o src/libsais_build.o \
 			src/bwa_shm.o src/simd_dispatch.o \
-			src/fast_reader.o src/fast_reader_bseq.o
+			src/fast_reader.o src/fast_reader_bseq.o src/stage_prof.o
 
 # Kernel TUs (bandedSWA, kswv, ksw, sam_encode) are compiled per-tier on x86
 # and linked directly via KERNEL_TIER_OBJS_LINK. The dispatch wrappers in
@@ -451,6 +460,7 @@ src/version.h: FORCE
 	@if ! cmp -s $@.tmp $@ 2>/dev/null; then mv $@.tmp $@; else rm -f $@.tmp; fi
 
 src/main.o: src/version.h
+src/fastmap.o: src/version.h
 
 # Baseline ISA tier for non-kernel TUs in the x86 single-binary build.
 # Defaults to avx2: every host that runs bwa-mem3 in practice has AVX2
@@ -546,6 +556,12 @@ src/fast_reader.o: src/fast_reader.c src/fast_reader.h
 
 src/fast_reader_bseq.o: src/fast_reader_bseq.c src/fast_reader_bseq.h src/fast_reader.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDES) -c -o $@ $<
+
+# Standalone stage_prof helper unit test (stats + clocks + NaN init). Links only
+# pthread + libm, so it needs no bwa-mem3/htslib build. Built with -DSTAGE_PROF
+# so the real implementation (not the no-op inlines) is exercised.
+stage_prof_test: src/stage_prof.cpp src/stage_prof.h test/stage_prof_test.cpp
+	$(CXX) -O2 -std=gnu++14 -DSTAGE_PROF=1 -Isrc src/stage_prof.cpp test/stage_prof_test.cpp -lpthread -lm -o $@
 
 # Standalone fast_reader correctness self-test (plain/gzip/multi-member/BGZF
 # round-trips). Links only zlib + libdeflate, so it needs no bwa-mem3 build.

@@ -74,6 +74,8 @@ struct kt_for_t;
 typedef struct {
 	struct kt_for_t *t;
 	long i;
+	double cpu_busy;   /* stage_prof: per-thread CLOCK_THREAD_CPUTIME seconds (--profile) */
+	double encode;     /* stage_prof: per-thread SAM/BAM-build CPU seconds */
 } ktf_worker_t;
 
 typedef struct kt_for_t {
