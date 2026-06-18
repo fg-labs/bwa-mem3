@@ -2,11 +2,33 @@ version: 2
 
 build:
   os: ubuntu-24.04
+  # A tool entry is required by the Read the Docs schema even when the build is
+  # driven entirely by `commands`. We do not actually use Python — it is the
+  # lightest always-available toolchain to satisfy the requirement. mdbook and
+  # mdbook-mermaid are installed from prebuilt release binaries below.
   tools:
-    rust: "1.91"
+    python: "3.12"
   commands:
-    - cargo install mdbook --version 0.5.2 --locked
-    - cargo install mdbook-mermaid --locked
-    - cd docs && mdbook build
+    # Install pinned mdbook + mdbook-mermaid from prebuilt release binaries.
+    #
+    # These pins MUST stay in lockstep with .github/workflows/docs.yml. That CI
+    # job pins BOTH mdbook (0.5.2) and mdbook-mermaid (0.17.0); the previous
+    # version of this file pinned only mdbook and ran `cargo install
+    # mdbook-mermaid` with no version, so Read the Docs floated to whatever
+    # mdbook-mermaid was newest on crates.io. When a newer mdbook-mermaid that
+    # is incompatible with mdbook 0.5.2 ships, the RTD build breaks while CI
+    # stays green — leaving the published site stale (e.g. missing the
+    # whats-different/equivalence page added later). Prebuilt binaries also avoid
+    # a multi-minute source compile on every build and drop the brittle rust
+    # toolchain pin entirely.
+    #
+    # Each binary is downloaded to a file, verified against its pinned SHA-256,
+    # and only then extracted — so a corrupted or tampered download fails the
+    # build with a checksum error instead of being run. The `&&` chain makes any
+    # step's failure (curl, checksum, or tar) abort the command.
+    - mkdir -p bin
+    - curl -fsSL https://github.com/rust-lang/mdBook/releases/download/v0.5.2/mdbook-v0.5.2-x86_64-unknown-linux-gnu.tar.gz -o bin/mdbook.tar.gz && echo "084e4342ba564db270108763e404a7d1f309d932651a22484e93c0dc1a071f6d  bin/mdbook.tar.gz" | sha256sum -c - && tar -xzf bin/mdbook.tar.gz -C bin
+    - curl -fsSL https://github.com/badboy/mdbook-mermaid/releases/download/v0.17.0/mdbook-mermaid-v0.17.0-x86_64-unknown-linux-gnu.tar.gz -o bin/mdbook-mermaid.tar.gz && echo "8aced70d781830fb0e81988f081c4abdd49e056a001ae2f1e4d484e1f6385c57  bin/mdbook-mermaid.tar.gz" | sha256sum -c - && tar -xzf bin/mdbook-mermaid.tar.gz -C bin
+    - cd docs && PATH="$PWD/../bin:$PATH" mdbook build
     - mkdir -p _readthedocs/html
     - cp -r docs/book/. _readthedocs/html/
