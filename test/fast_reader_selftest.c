@@ -22,6 +22,10 @@
 #include <string.h>
 #include <unistd.h>
 
+/* fast_reader.c is instrumented with stage_prof hooks, but they are compiled
+ * out by default (no -DSTAGE_PROF): stage_prof.h then provides no-op inlines, so
+ * fast_reader.c is self-contained and this standalone test needs no sp_* stubs. */
+
 static int g_fail = 0;
 #define CHECK(cond, msg) do { \
     if (!(cond)) { fprintf(stderr, "FAIL: %s\n", (msg)); g_fail = 1; } \
