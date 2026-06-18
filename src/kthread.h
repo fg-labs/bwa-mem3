@@ -89,4 +89,8 @@ typedef struct kt_for_t {
 
 void kt_pipeline(int n_threads, int (*func)(void*), void *shared_data, int n_steps);
 void kt_for(void (*func)(void*,int,int,int), void *data, int n);
+/* Tear down the persistent kt_for() worker pool (joins the worker threads).
+ * Call once after the last kt_for()/kt_pipeline() of a run; a no-op if the pool
+ * was never created. */
+void kt_pool_destroy(void);
 #endif

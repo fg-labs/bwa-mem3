@@ -32,6 +32,9 @@
 #include "kthread.h"
 #include "stage_prof.h"
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
 
 #if AFF && (__linux__)
 extern int affy[256];
@@ -85,10 +88,13 @@ static inline long steal_work(kt_for_t *t)
 	return k*BATCH_SIZE >= t->n? -1 : k;
 }
 
-/******** Current working code *********/
-static void *ktf_worker(void *data)
+/* The per-thread work loop: strided dispatch followed by work-stealing.
+ * Extracted from the old per-call thread body so it can be driven by a
+ * persistent pool worker (see below). Distribution is byte-for-byte the
+ * legacy behaviour; tid passed to func() is the worker's slot index
+ * (w - w->t->w). */
+static void ktf_run(ktf_worker_t *w)
 {
-	ktf_worker_t *w = (ktf_worker_t*)data;
 	long i;
 	int tid = w->i;
 	double _c0 = sp_enabled() ? sp_thread_cpu() : 0.0;
@@ -97,14 +103,13 @@ static void *ktf_worker(void *data)
 #if AFF && (__linux__)
 	fprintf(stderr, "i: %d, CPU: %d\n", tid , sched_getcpu());
 #endif
-	
+
 	for (;;) {
 		i = __sync_fetch_and_add(&w->i, w->t->n_threads);
 		int st = i * BATCH_SIZE;
 		if (st >= w->t->n) break;
 		int ed = (i + 1) * BATCH_SIZE < w->t->n? (i + 1) * BATCH_SIZE : w->t->n;
-		// w->t->func(w->t->data, st, ed-st, tid);
-        w->t->func(w->t->data, st, ed-st, w - w->t->w);
+		w->t->func(w->t->data, st, ed-st, w - w->t->w);
 	}
 
 	while ((i = steal_work(w->t)) >= 0) {
@@ -113,71 +118,171 @@ static void *ktf_worker(void *data)
 		w->t->func(w->t->data, st, ed-st, w - w->t->w);
 	}
 	if (sp_enabled()) { w->cpu_busy = sp_thread_cpu() - _c0; w->encode = sp_encode_get(); }
-	pthread_exit(0);
+}
+
+/* ---------------------------------------------------------------------------
+ * Persistent worker pool for kt_for().
+ *
+ * The original kt_for() spawned n worker pthreads on every call and joined
+ * them at the end. bwa-mem3 calls kt_for() three times per chunk (worker_bwt /
+ * worker_aln / worker_sam) across many chunks, so a per-thread scratch buffer
+ * (e.g. mmc->enc_qdb[tid]) is malloc()'d by one chunk's worker thread and then
+ * realloc()'d by a *different* OS thread on a later chunk — the first thread
+ * has already exited. That cross-thread realloc of an abandoned-heap block is
+ * mishandled by mimalloc v3.x and silently corrupts the heap, crashing with
+ * SIGSEGV several chunks later (it is benign under glibc / mimalloc v2.x, which
+ * is why no sanitizer flags it).
+ *
+ * A persistent pool keeps the same n worker threads alive for the whole run, so
+ * worker slot `tid` is always the same OS thread: every realloc of that slot's
+ * buffers happens on the thread that allocated them — no cross-thread realloc.
+ * It also removes the per-chunk thread create/join overhead.
+ * ------------------------------------------------------------------------- */
+typedef struct {
+	int started;
+	int n_threads;
+	pthread_t *threads;
+	ktf_worker_t *w;          /* per-worker steal state (n_threads entries) */
+	kt_for_t job;             /* current job: func / data / n / w           */
+	pthread_mutex_t mtx;
+	pthread_cond_t cv_go;     /* signalled when a new generation is posted  */
+	pthread_cond_t cv_done;   /* signalled when the last worker finishes    */
+	long generation;          /* bumped once per kt_for() call              */
+	int n_left;               /* workers not yet done with `generation`     */
+	int shutdown;
+} kt_pool_t;
+
+static kt_pool_t g_kt_pool = {0};
+
+static void *kt_pool_worker(void *arg)
+{
+	long k = (long)(intptr_t)arg;
+	long seen = 0;
+	for (;;) {
+		pthread_mutex_lock(&g_kt_pool.mtx);
+		while (g_kt_pool.generation == seen && !g_kt_pool.shutdown)
+			pthread_cond_wait(&g_kt_pool.cv_go, &g_kt_pool.mtx);
+		if (g_kt_pool.shutdown) { pthread_mutex_unlock(&g_kt_pool.mtx); break; }
+		seen = g_kt_pool.generation;
+		pthread_mutex_unlock(&g_kt_pool.mtx);
+
+		ktf_run(&g_kt_pool.w[k]);
+
+		pthread_mutex_lock(&g_kt_pool.mtx);
+		if (--g_kt_pool.n_left == 0) pthread_cond_signal(&g_kt_pool.cv_done);
+		pthread_mutex_unlock(&g_kt_pool.mtx);
+	}
+	return NULL;
+}
+
+static void kt_pool_init(int n_threads)
+{
+	g_kt_pool.n_threads = n_threads;
+	g_kt_pool.threads = (pthread_t*) malloc(n_threads * sizeof(pthread_t));
+	g_kt_pool.w       = (ktf_worker_t*) malloc(n_threads * sizeof(ktf_worker_t));
+	if (g_kt_pool.threads == NULL || g_kt_pool.w == NULL) {
+		perror("Allocation of kt_for worker pool failed");
+		exit(EXIT_FAILURE);
+	}
+	pthread_mutex_init(&g_kt_pool.mtx, NULL);
+	pthread_cond_init(&g_kt_pool.cv_go, NULL);
+	pthread_cond_init(&g_kt_pool.cv_done, NULL);
+	g_kt_pool.generation = 0;
+	g_kt_pool.n_left = 0;
+	g_kt_pool.shutdown = 0;
+
+	pthread_attr_t attr;
+	pthread_attr_init(&attr);
+#ifdef __APPLE__
+	/* Prefer P-cores on Apple Silicon for compute-intensive alignment work. */
+	int pcore_count = get_pcore_count();
+	if (pcore_count > 0)
+		pthread_attr_set_qos_class_np(&attr, QOS_CLASS_USER_INITIATED, 0);
+#endif
+	for (int i = 0; i < n_threads; ++i) {
+#if AFF && (__linux__)
+		cpu_set_t cpus;
+		CPU_ZERO(&cpus);
+		CPU_SET(affy[i], &cpus);
+		pthread_attr_setaffinity_np(&attr, sizeof(cpu_set_t), &cpus);
+#endif
+		/* A failed worker would leave kt_for() waiting on cv_done for a
+		 * completion that never arrives (deadlock), so fail loudly instead.
+		 * pthread_create() returns the error code directly rather than via
+		 * errno, so report it with strerror(rc), not perror(). */
+		int rc = pthread_create(&g_kt_pool.threads[i], &attr, kt_pool_worker, (void*)(intptr_t)i);
+		if (rc != 0) {
+			fprintf(stderr, "ERROR: kt_for worker pool: pthread_create failed (worker %d): %s\n", i, strerror(rc));
+			exit(EXIT_FAILURE);
+		}
+	}
+	pthread_attr_destroy(&attr);
+	g_kt_pool.started = 1;
+}
+
+/* Tear the pool down (joins the workers). Safe to call when no pool exists. */
+void kt_pool_destroy(void)
+{
+	if (!g_kt_pool.started) return;
+	pthread_mutex_lock(&g_kt_pool.mtx);
+	g_kt_pool.shutdown = 1;
+	pthread_cond_broadcast(&g_kt_pool.cv_go);
+	pthread_mutex_unlock(&g_kt_pool.mtx);
+	for (int i = 0; i < g_kt_pool.n_threads; ++i)
+		pthread_join(g_kt_pool.threads[i], NULL);
+	free(g_kt_pool.threads);
+	free(g_kt_pool.w);
+	pthread_mutex_destroy(&g_kt_pool.mtx);
+	pthread_cond_destroy(&g_kt_pool.cv_go);
+	pthread_cond_destroy(&g_kt_pool.cv_done);
+	memset(&g_kt_pool, 0, sizeof(g_kt_pool));
 }
 
 void kt_for(void (*func)(void*, int, int, int), void *data, int n)
 {
-	int i;
-	kt_for_t t;
-	pthread_t *tid;
 	worker_t *w = (worker_t*) data;
-	t.func = func, t.data = data, t.n_threads = w->nthreads, t.n = n;
-	t.w = (ktf_worker_t*) malloc (t.n_threads * sizeof(ktf_worker_t));
-    assert(t.w != NULL);
-	tid = (pthread_t*) malloc (t.n_threads * sizeof(pthread_t));
-    assert(tid != NULL);
-	for (i = 0; i < t.n_threads; ++i)
-		t.w[i].t = &t, t.w[i].i = i;
+	int n_threads = w->nthreads;
+	if (n_threads < 1) n_threads = 1;  /* nthreads is int16_t; never spin up a 0/negative pool */
 
-	pthread_attr_t attr;
-    pthread_attr_init(&attr);
-
-#ifdef __APPLE__
-    /* Set QoS to USER_INITIATED for compute-intensive alignment work
-     * This hints to the scheduler to prefer P-cores (performance cores)
-     * over E-cores (efficiency cores) on Apple Silicon */
-    static int pcore_count = -2;  /* -2 = not yet queried */
-    if (pcore_count == -2) {
-        pcore_count = get_pcore_count();
-    }
-
-    /* Only set QoS on Apple Silicon (pcore_count > 0) */
-    if (pcore_count > 0) {
-        pthread_attr_set_qos_class_np(&attr, QOS_CLASS_USER_INITIATED, 0);
-    }
-#endif
-
-	// printf("getcpu: %d\n", sched_getcpu());
-	for (i = 0; i < t.n_threads; ++i) {
-#if AFF && (__linux__)
-		cpu_set_t cpus;
-		CPU_ZERO(&cpus);
-		// CPU_SET(i, &cpus);
-		CPU_SET(affy[i], &cpus);
-		pthread_attr_setaffinity_np(&attr, sizeof(cpu_set_t), &cpus);
-		pthread_create(&tid[i], &attr, ktf_worker, &t.w[i]);
-#elif defined(__APPLE__)
-        /* Use attr with QoS settings on Apple */
-        pthread_create(&tid[i], &attr, ktf_worker, &t.w[i]);
-#else
-		pthread_create(&tid[i], NULL, ktf_worker, &t.w[i]);
-#endif
+	/* kt_for() is only ever called from the serialized step-1 of kt_pipeline
+	 * (one chunk in flight at a time), so lazy init here is race-free, and
+	 * n_threads (= opt->n_threads) is constant for the whole run. Rebuild the
+	 * pool defensively if that invariant ever changes. */
+	if (!g_kt_pool.started)
+		kt_pool_init(n_threads);
+	else if (g_kt_pool.n_threads != n_threads) {
+		kt_pool_destroy();
+		kt_pool_init(n_threads);
 	}
-	for (i = 0; i < t.n_threads; ++i) pthread_join(tid[i], 0);
 
+	pthread_mutex_lock(&g_kt_pool.mtx);
+	g_kt_pool.job.func = func;
+	g_kt_pool.job.data = data;
+	g_kt_pool.job.n = n;
+	g_kt_pool.job.n_threads = n_threads;
+	g_kt_pool.job.w = g_kt_pool.w;
+	for (int i = 0; i < n_threads; ++i) {
+		g_kt_pool.w[i].t = &g_kt_pool.job;
+		g_kt_pool.w[i].i = i;
+	}
+	g_kt_pool.n_left = n_threads;
+	++g_kt_pool.generation;
+	pthread_cond_broadcast(&g_kt_pool.cv_go);
+	while (g_kt_pool.n_left > 0)
+		pthread_cond_wait(&g_kt_pool.cv_done, &g_kt_pool.mtx);
+	pthread_mutex_unlock(&g_kt_pool.mtx);
+
+	/* All workers are done with this generation (n_left == 0) and will not
+	 * touch their per-slot stats again until the next kt_for() call, so the
+	 * pool's worker slots can be read without the lock here. */
 	if (sp_enabled()) {
-		double *busy = (double*) malloc(t.n_threads * sizeof(double));
+		double *busy = (double*) malloc(n_threads * sizeof(double));
 		assert(busy != NULL);
 		double sum = 0, esum = 0;
-		for (i = 0; i < t.n_threads; ++i) { busy[i] = t.w[i].cpu_busy; sum += busy[i]; esum += t.w[i].encode; }
+		for (int i = 0; i < n_threads; ++i) { busy[i] = g_kt_pool.w[i].cpu_busy; sum += busy[i]; esum += g_kt_pool.w[i].encode; }
 		g_ktfor.proc_cpu += sum;                        /* accumulate across kt_for calls in a step */
 		g_ktfor.encode   += esum;                       /* SAM/BAM-build CPU (only worker_sam adds) */
-		sp_thread_stats(&g_ktfor, busy, t.n_threads);   /* balance stats from the most recent call */
+		sp_thread_stats(&g_ktfor, busy, n_threads);     /* balance stats from the most recent call */
 		free(busy);
 	}
-
-    pthread_attr_destroy(&attr);
-    free(t.w);
-	free(tid);
 }

@@ -868,6 +868,10 @@ static int process(void *shared, gzFile gfp, gzFile gfp2, int pipe_threads)
     free(aux_.workers);
     /***** pipeline ends ******/
 
+    /* Retire the kt_for() worker pool (created lazily on the first chunk).
+     * No kt_for() calls remain past this point. */
+    kt_pool_destroy();
+
     fprintf(stderr, "[0000] Computation ends..\n");
 
     /* Dealloc per-worker scratch buffers allocated in the header section */

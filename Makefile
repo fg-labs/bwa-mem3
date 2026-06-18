@@ -407,7 +407,7 @@ ifneq ($(strip $(DISABLE_BATCHED_MATESW)),)
     CPPFLAGS += -DDISABLE_BATCHED_MATESW=$(DISABLE_BATCHED_MATESW)
 endif
 
-.PHONY:all myall arm64 clean depend single all-single print-mimalloc-config kswv_nrow_zero_test bandedswa_padding_test bandedswa_highzdrop_seed_test shm_section_find_test shm_pack_round_trip_test shm_lock_destroy_test test test-injection FORCE pgo-generate pgo-use pgo-clean profile-build profile-clean lto-build lto-clean docs docs-serve docs-cli docs-clean docs-install-tools
+.PHONY:all myall arm64 clean depend single all-single print-mimalloc-config kswv_nrow_zero_test bandedswa_padding_test bandedswa_highzdrop_seed_test shm_section_find_test shm_pack_round_trip_test shm_lock_destroy_test kt_for_pool_test test test-injection FORCE pgo-generate pgo-use pgo-clean profile-build profile-clean lto-build lto-clean docs docs-serve docs-cli docs-clean docs-install-tools
 .SUFFIXES:.cpp .o
 
 .cpp.o:
@@ -568,6 +568,9 @@ shm_pack_round_trip_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/shm_pack_ro
 shm_lock_destroy_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/shm_lock_destroy_test.o
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/shm_lock_destroy_test.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
 
+kt_for_pool_test: $(BWA_LIB) $(HTS_LIB) test/kt_for_pool_test.o
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/kt_for_pool_test.o $(BWA_LIB) $(LIBS) -o $@
+
 # fast_reader is C (not C++); the implicit .c rule omits $(INCLUDES), so give
 # these objects explicit rules carrying the project include paths (incl.
 # libdeflate) and preprocessor defines.
@@ -604,13 +607,14 @@ test/shm_pack_round_trip_test.o: test/shm_pack_round_trip_test.cpp
 # Note: depends on `bwa-mem3` so version_banner.sh has a binary to grep —
 # previously `test:` only built the test harness binaries, not the main
 # executable.
-test: test-binaries kswv_nrow_zero_test bandedswa_padding_test bandedswa_highzdrop_seed_test shm_section_find_test shm_lock_destroy_test bwa-mem3
+test: test-binaries kswv_nrow_zero_test bandedswa_padding_test bandedswa_highzdrop_seed_test shm_section_find_test shm_lock_destroy_test kt_for_pool_test bwa-mem3
 	./test/bwa_mem3_tests_unit
 	./test/bwa_mem3_tests_integration
 	./kswv_nrow_zero_test
 	./bandedswa_padding_test
 	./bandedswa_highzdrop_seed_test
 	./shm_section_find_test
+	./kt_for_pool_test
 	./shm_lock_destroy_test
 	BWA_MEM3=./bwa-mem3 ./test/regression/version_banner.sh
 
@@ -636,6 +640,9 @@ test/shm_section_find_test.o: test/shm_section_find_test.cpp
 	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $< -o $@
 
 test/shm_lock_destroy_test.o: test/shm_lock_destroy_test.cpp
+	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $< -o $@
+
+test/kt_for_pool_test.o: test/kt_for_pool_test.cpp
 	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $< -o $@
 
 # Archive both the baseline (unmangled) kernel objects from $(OBJS) and the
@@ -704,7 +711,7 @@ $(MIMALLOC_LIB):
 	cd $(MIMALLOC_BUILD) && cmake $(MIMALLOC_CMAKE_FLAGS) .. && $(MAKE)
 
 clean: pgo-clean profile-clean lto-clean
-	rm -fr src/*.o src/version.h test/*.o $(BWA_LIB) $(EXE) kswv_nrow_zero_test bandedswa_padding_test bandedswa_highzdrop_seed_test shm_section_find_test shm_pack_round_trip_test shm_lock_destroy_test bwa-mem3.arm64
+	rm -fr src/*.o src/version.h test/*.o $(BWA_LIB) $(EXE) kswv_nrow_zero_test bandedswa_padding_test bandedswa_highzdrop_seed_test shm_section_find_test shm_pack_round_trip_test shm_lock_destroy_test kt_for_pool_test bwa-mem3.arm64
 	rm -f $(LIBSAIS_OBJS)
 	rm -f src/*.gcno src/*.gcda
 	$(MAKE) -C test clean
