@@ -529,3 +529,33 @@ jobs:
           files: coverage.xml
           fail_ci_if_error: false
           verbose: true
+
+  # Profiling (--profile) is compiled out of the default build, so the matrix
+  # rows above never exercise the STAGE_PROF=1 code path. Build it here (and run
+  # the stage_prof unit test) so the opt-in path cannot silently bit-rot.
+  profiling-build:
+    name: Profiling build (STAGE_PROF=1)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Install dependencies (Linux)
+        uses: awalsh128/cache-apt-pkgs-action@acb598e5ddbc6f68a970c5da0688d2f3a9f04d05 # v1.6.0
+        with:
+          packages: zlib1g-dev libdeflate-dev autoconf automake libomp-dev
+          version: 1.1
+
+      - name: Build with profiling compiled in
+        run: make -j"$(nproc)" STAGE_PROF=1 BASELINE_ARCH=avx2 CXX=g++ USE_MIMALLOC=1
+
+      - name: --profile is exposed in this build
+        run: |
+          ./bwa-mem3 mem 2>&1 | grep -q -- '--profile' \
+            || { echo "::error::--profile missing from a STAGE_PROF=1 build"; exit 1; }
+
+      - name: stage_prof unit test
+        run: make stage_prof_test && ./stage_prof_test
