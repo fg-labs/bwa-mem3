@@ -4,19 +4,114 @@ Performance claims in this section are benchmarked, not asserted. The canonical 
 
 ## What drives bwa-mem3's performance
 
-bwa-mem3 inherits the SIMD-vectorized alignment kernels of bwa-mem2 and adds several improvements of its own. The headline gains relative to a stock bwa-mem2 build fall into four categories.
+There is no single "the speedup." bwa-mem3 inherits bwa-mem2's SIMD-vectorized
+core and layers on a series of independent improvements, each targeting a
+different bottleneck in the align pipeline. How much any one of them helps —
+and therefore the total — depends heavily on the workload: read length, error
+rate, reference size, thread count, CPU architecture (AVX2 vs AVX-512 vs NEON),
+and whether the index is cold or warm in the page cache. A short-read whole-genome
+run is dominated by seeding and FM-index walks; a long-read or high-error run
+spends most of its cycles in the Smith–Waterman kernels; a many-sample run can be
+bottlenecked on header ingestion or decompression. The drivers below group by
+*what part of the machine or algorithm they fix*. For real, reproducible numbers
+on specific hardware, always defer to [bwa-mem3-bench](https://github.com/fg-labs/bwa-mem3-bench)
+rather than any single anecdote here.
 
-**Vectorized alignment kernels.** The Smith-Waterman and banded-SWA kernels (kswv, bandedSWA) are compiled against the widest SIMD ISA the current CPU supports — SSE4.1 through AVX-512BW on x86, or native NEON on ARM. On Apple Silicon, native NEON intrinsics replaced the sse2neon shim in the two hottest kernels, delivering roughly 10% additional throughput over the pure-translation baseline. See [SIMD dispatch matrix](simd-dispatch.md) for the full picture.
+For the full per-change list with PR links and status, see
+[What's Different — Performance improvements](../whats-different/performance.md).
 
-**libsais FM-index construction.** The indexing step uses the linear-time suffix-array/BWT construction library libsais in place of the original quadratic-time approach. This cuts `bwa-mem3 index` wall time substantially on large references. See [What's Different — Performance improvements](../whats-different/performance.md) for the corresponding PR details.
+### 1. Getting more out of the machine (SIMD / microarchitecture)
 
-**mimalloc allocator.** bwa-mem3 vendors and statically links [mimalloc](https://github.com/microsoft/mimalloc), replacing the system `malloc`/`free` for all allocations. On Linux the library is injected via `--whole-archive`; on macOS it uses dyld interposition. The allocator shows consistent throughput gains on multi-threaded workloads because mimalloc avoids the lock contention in glibc's `ptmalloc` at high thread counts. See [User Guide — Memory allocator](../user-guide/allocator.md) for details.
+The alignment kernels (`kswv` mate-rescue, `bandedSWA`) are compiled for the
+widest SIMD ISA the host supports — SSE4.1 through AVX-512BW on x86, native NEON
+on ARM — and selected at runtime by an in-process dispatcher (a single binary
+that picks the right kernel per host, [#83](https://github.com/fg-labs/bwa-mem3/pull/83))
+rather than the older multi-binary `execv` launcher.
 
-**Profile-Guided Optimization (PGO).** The build system provides `make pgo-generate` and `make pgo-use` targets that compile an instrumented binary, gather branch-probability and call-frequency profiles from a representative workload, and then recompile with those profiles applied. On Apple Silicon the measured gain is approximately 3%; on x86 the gain depends on the workload mix. PGO is opt-in and is not applied to the default `make` output. See [PGO build](pgo.md) for the full workflow.
+- **Native NEON kernels** replaced the `sse2neon` translation shim in the two
+  hottest kernels on ARM, worth roughly **10% additional throughput** on Apple
+  Silicon over the pure-translation baseline.
+- **AVX2 as the x86 baseline** ([#84](https://github.com/fg-labs/bwa-mem3/pull/84)):
+  restoring the non-kernel translation units to `-mavx2` recovered ~**+15%** user
+  time on `wgs-5M` / ~**+11%** on `wes-5M` that had been lost when the baseline
+  briefly dropped to SSE4.1 — hot non-kernel paths (chain extension, FM-index BWT
+  walks, mate scoring) auto-vectorize at 256-bit width again.
+- **Capping AVX-512BW auto-vectorization at 256-bit** ([#86](https://github.com/fg-labs/bwa-mem3/pull/86))
+  avoids the frequency downclock that wide 512-bit auto-vec code triggers on some
+  x86 parts, where the wider vectors cost more in clock than they return.
+- **Per-strip L1 prefetches** added to the 8-/16-bit `kswv` kernels that lacked
+  them ([#70](https://github.com/fg-labs/bwa-mem3/pull/70), bringing them in line
+  with `kswv512_16`) stop the inner SW loop from stalling on first-touch L1
+  misses.
+- **A recovered 8-bit banded SW path** for reads ≥128 bp
+  ([#140](https://github.com/fg-labs/bwa-mem3/pull/140) and follow-ups) keeps
+  long-read alignment in the cheaper 8-bit lane width where it is valid.
 
-## Consolidated mapping speedups
+See the [SIMD dispatch matrix](simd-dispatch.md) for the full ISA picture.
 
-PR [#58](https://github.com/fg-labs/bwa-mem3/pull/58) and the related lockstep SMEM-batching work ([#33](https://github.com/fg-labs/bwa-mem3/pull/33)) reduced per-read overhead in the main mapping loop beyond what upstream bwa-mem2 carries. The batch `-H` ingestion improvement ([#49](https://github.com/fg-labs/bwa-mem3/pull/49)) further reduces header-processing latency for large sample sets.
+### 2. Fixing bad patterns in the hot path (algorithmic rewrites)
+
+Several gains come simply from rewriting code that did more work than it needed
+to — the "rewrites wind up fixing bad patterns" effect — without changing where
+reads map.
+
+- **Lockstep SMEM batching** ([#33](https://github.com/fg-labs/bwa-mem3/pull/33),
+  widened from 8 to 16 reads in [#75](https://github.com/fg-labs/bwa-mem3/pull/75)):
+  advances several reads' seed walks in interleaved order so the out-of-order
+  engine overlaps the random `cp_occ` checkpoint-array cache misses of one read
+  with the compute of another. Measured ~**−6% wall time** on 150 bp WGS, with the
+  hot `cp_occ` load share dropping from 65.5% to 53.3% of seeding time.
+- **O(n²) → O(n) header ingestion** ([#49](https://github.com/fg-labs/bwa-mem3/pull/49)):
+  the `-H` path re-ran `strlen` + `realloc` per line; batching the read took a
+  ~70 MB / 1.5 M-line header from **>10 minutes to under a second** before
+  alignment even starts.
+- **Closed-form ungapped scoring** when there are no mismatches
+  ([#77](https://github.com/fg-labs/bwa-mem3/pull/77)) replaces a per-base
+  Kadane-style walk with a direct store.
+- **On-stack sort buffers for small arrays** ([#78](https://github.com/fg-labs/bwa-mem3/pull/78))
+  removes a per-read `malloc`/`free` that was dominating the sort of the typical
+  5–30-element alignment-region arrays.
+- **Inlining `backwardExt`** ([#88](https://github.com/fg-labs/bwa-mem3/pull/88))
+  eliminates a struct-by-value ABI pass that gcc 12+ could not optimize away,
+  recovering (and beating) the older compiler's baseline.
+- **`pdqsort` with stable tie-breaks** at the dedup-patch sort sites
+  ([#123](https://github.com/fg-labs/bwa-mem3/pull/123)).
+- The **consolidated mapping-speedup audit** ([#58](https://github.com/fg-labs/bwa-mem3/pull/58))
+  bundles tuning across the ksw2 band loop, SMEM batching, suffix-array lookup
+  prefetch, and SAM record building — historically the single largest wall-time
+  step in `main`.
+
+### 3. Indexing
+
+`bwa-mem3 index` builds the FM-index with the linear-time
+[libsais](https://github.com/IlyaGrebnov/libsais) library
+([#57](https://github.com/fg-labs/bwa-mem3/pull/57)) instead of the older
+sais-lite, cutting both wall time and peak memory while producing a
+byte-identical index (existing indexes need no rebuild). Construction also skips
+the wasted zero-initialization of unpack and suffix-array buffers
+([#80](https://github.com/fg-labs/bwa-mem3/pull/80)), which on a doubled-human
+input avoided tens of GiB of write-then-overwrite zero-fill.
+
+### 4. Memory allocation and I/O
+
+- **mimalloc**, vendored and statically linked by default
+  ([#19](https://github.com/fg-labs/bwa-mem3/pull/19)), replaces the system
+  allocator and avoids glibc `ptmalloc`'s lock contention at high thread counts —
+  a consistent multi-threaded throughput win. See
+  [User Guide — Memory allocator](../user-guide/allocator.md).
+- **Faster read ingestion**: a content-detecting FASTQ fast path over libdeflate
+  BGZF ([#128](https://github.com/fg-labs/bwa-mem3/pull/128), merged) cuts the
+  cost of decompressing and parsing input, which matters most when the aligner
+  would otherwise be I/O- or parse-bound. A vendored zlib-ng inflate path with an
+  added pipeline worker ([#153](https://github.com/fg-labs/bwa-mem3/pull/153)) is
+  **proposed but not yet merged** and extends the same idea.
+
+### 5. Build-time optimization (PGO)
+
+The build provides opt-in `make pgo-generate` / `make pgo-use` targets that
+recompile with branch-probability and call-frequency profiles gathered from a
+representative workload — ~**3%** on Apple Silicon, workload-dependent on x86.
+PGO is not applied to the default `make` output. See [PGO build](pgo.md).
 
 ## Reference numbers across architectures
 
