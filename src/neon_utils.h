@@ -139,31 +139,23 @@
  * NEON doesn't have a direct movemask, so we need to implement it
  */
 static inline uint16_t neon_movemask_u8(uint8x16_t v) {
-    /* Extract the high bit from each byte */
-    static const uint8_t shift_vals[16] = {0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7};
-    uint8x16_t shift = vld1q_u8(shift_vals);
+    /* Per-byte positional weights (1<<lane), repeated across both 8-byte
+     * halves. A compile-time vector literal, so it materializes via MOVI
+     * immediates rather than a data-section load. */
+    const uint8x16_t bit_mask = {1, 2, 4, 8, 16, 32, 64, 128,
+                                 1, 2, 4, 8, 16, 32, 64, 128};
 
-    /* Shift each byte so the high bit becomes bit 0, then shift back to position */
-    uint8x16_t high_bits = vshrq_n_u8(v, 7);  /* Get high bit of each byte */
+    /* Broadcast each byte's high bit across the whole lane (0xFF/0x00) via an
+     * arithmetic right shift, then keep that lane's positional weight with vand.
+     * NOTE: a *logical* shift (vshrq_n_u8) yields 0x01, and 0x01 & (1<<lane) is
+     * 0 for every lane except 0 and 8 -- that silently collapses the mask. The
+     * signed shift is required for vand to be equivalent to the vshl packing. */
+    uint8x16_t hi = vreinterpretq_u8_s8(vshrq_n_s8(vreinterpretq_s8_u8(v), 7));
+    uint8x16_t bits = vandq_u8(hi, bit_mask);
 
-    /* Accumulate bits: low half -> low byte of result, high half -> high byte */
-    uint8x8_t low = vget_low_u8(high_bits);
-    uint8x8_t high = vget_high_u8(high_bits);
-
-    /* Shift and combine */
-    static const uint8_t pos_low[8]  = {0, 1, 2, 3, 4, 5, 6, 7};
-    static const uint8_t pos_high[8] = {0, 1, 2, 3, 4, 5, 6, 7};
-    uint8x8_t shift_low = vld1_u8(pos_low);
-    uint8x8_t shift_high = vld1_u8(pos_high);
-
-    uint8x8_t shifted_low = vshl_u8(low, vreinterpret_s8_u8(shift_low));
-    uint8x8_t shifted_high = vshl_u8(high, vreinterpret_s8_u8(shift_high));
-
-    /* Horizontal add to combine bits */
-    uint8_t result_low = vaddv_u8(shifted_low);
-    uint8_t result_high = vaddv_u8(shifted_high);
-
-    return (uint16_t)result_low | ((uint16_t)result_high << 8);
+    /* Sum each 8-byte half: low half -> low byte of result, high -> high. */
+    return (uint16_t)vaddv_u8(vget_low_u8(bits)) |
+           ((uint16_t)vaddv_u8(vget_high_u8(bits)) << 8);
 }
 
 /*
