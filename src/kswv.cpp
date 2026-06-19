@@ -465,10 +465,11 @@ int kswv::kswv_neon_u8(uint8_t seq1SoA[],
             uint8x16_t cmpq = vceqq_u8(s2, five_vec);
             sbt = vbslq_u8(cmpq, sft_vec, sbt);
 
-            /* Check for boundary (high bit set) */
+            /* Check for boundary (high bit set in s1 or s2). vtstq_u8 against
+             * 0x80 sets 0xFF where bit 7 is set, 0x00 otherwise — one op vs the
+             * prior vshr+vceq pair, and this runs per cell in the inner loop. */
             uint8x16_t or_val = vorrq_u8(s1, s2);
-            uint8x16_t high_bit = vshrq_n_u8(or_val, 7);
-            uint8x16_t is_boundary = vceqq_u8(high_bit, one_vec);
+            uint8x16_t is_boundary = vtstq_u8(or_val, vdupq_n_u8(0x80));
 
             uint8x16_t m11 = vqaddq_u8(h00, sbt);
             m11 = vbslq_u8(is_boundary, zero_vec, m11);
