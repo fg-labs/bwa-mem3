@@ -395,7 +395,7 @@ void BandedPairWiseSW::scalarBandedSWAWrapper(SeqPair *seqPairArray,
         tmp = _mm256_blendv_epi16(sub_b256, sub_a256, cmp);             \
         tmp = _mm256_sub_epi16(score256, tmp);                          \
         cmp = _mm256_cmpgt_epi16(tmp, zdrop256);                            \
-        exit0 = _mm256_blendv_epi16(exit0, zero256, cmp);               \
+        exit0 = _mm256_andnot_si256(cmp, exit0);               \
     }
 
 
@@ -445,7 +445,7 @@ void BandedPairWiseSW::scalarBandedSWAWrapper(SeqPair *seqPairArray,
         __m256i sbt_neg = _mm256_max_epi8(_mm256_sub_epi8(zero256, sbt11), zero256); \
         __m256i m11 = _mm256_subs_epu8(_mm256_adds_epu8(h00, sbt_pos), sbt_neg); \
         __m256i cmp11 = _mm256_cmpeq_epi8(h00, zero256);                \
-        m11 = _mm256_blendv_epi8(m11, zero256, cmp11);  /* h00==0 -> local restart */ \
+        m11 = _mm256_andnot_si256(cmp11, m11);  /* h00==0 -> local restart */ \
         h11 = _mm256_max_epu8(m11, e11);                                \
         h11 = _mm256_max_epu8(h11, f11);                                \
         /* gap-open from H (standard Gotoh), unsigned-saturating */      \
@@ -469,7 +469,7 @@ void BandedPairWiseSW::scalarBandedSWAWrapper(SeqPair *seqPairArray,
     {                                                                   \
         __m256i m11 = _mm256_add_epi16(h00, sbt11);                     \
         __m256i cmp11 = _mm256_cmpeq_epi16(h00, zero256);               \
-        m11 = _mm256_blendv_epi16(m11, zero256, cmp11);                 \
+        m11 = _mm256_andnot_si256(cmp11, m11);                 \
         h11 = _mm256_max_epi16(m11, e11);                               \
         h11 = _mm256_max_epi16(h11, f11);                               \
         __m256i temp256 = _mm256_sub_epi16(h11, oe_ins256);             \
@@ -1143,8 +1143,8 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
             if (cval == 0x00) break;
             __m256i cmp2 = _mm256_cmpgt_epi8(pj256, tail256);
             cmp1 = _mm256_or_si256(cmp1, cmp2);
-            h256 = _mm256_blendv_epi8(h256, zero256, cmp1);
-            f256 = _mm256_blendv_epi8(f256, zero256, cmp1);
+            h256 = _mm256_andnot_si256(cmp1, h256);
+            f256 = _mm256_andnot_si256(cmp1, f256);
 
             _mm256_store_si256((__m256i *)(F + l * SIMD_WIDTH8), f256);
             _mm256_store_si256((__m256i *)(H_h + l * SIMD_WIDTH8), h256);
@@ -1163,7 +1163,7 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
         cmpht = _mm256_cmpgt_epi8(head256, tail256);
         cmpim = _mm256_or_si256(cmpim, cmpht);
 
-        exit0 = _mm256_blendv_epi8(exit0, zero256, cmpim);
+        exit0 = _mm256_andnot_si256(cmpim, exit0);
 
 #if RDT
         tim1 = __rdtsc();
@@ -1201,8 +1201,8 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
             __m256i cmp1 = _mm256_cmpgt_epi8(head256, pj256);
             __m256i cmp2 = _mm256_cmpgt_epi8(pj256, tail256);
             cmp1 = _mm256_or_si256(cmp1, cmp2);
-            h10 = _mm256_blendv_epi8(h10, zero256, cmp1);
-            f21 = _mm256_blendv_epi8(f21, zero256, cmp1);
+            h10 = _mm256_andnot_si256(cmp1, h10);
+            f21 = _mm256_andnot_si256(cmp1, f21);
 
             __m256i bmaxRS = maxRS1;
             maxRS1 =_mm256_max_epu8(maxRS1, h11);
@@ -1243,7 +1243,7 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
         __m256i cmp1 = _mm256_cmpgt_epi8(head256, j256);
         __m256i cmp2 = _mm256_cmpgt_epi8(j256, tail256);
         cmp1 = _mm256_or_si256(cmp1, cmp2);
-        h10 = _mm256_blendv_epi8(h10, zero256, cmp1);
+        h10 = _mm256_andnot_si256(cmp1, h10);
 
         _mm256_store_si256((__m256i *)(H_h + j * SIMD_WIDTH8), h10);
         _mm256_store_si256((__m256i *)(F + j * SIMD_WIDTH8), zero256);
@@ -1256,7 +1256,7 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
         cval = _mm256_movemask_epi8(tmp);
         if (cval == 0xFFFFFFFF) break;
 
-        exit0 = _mm256_blendv_epi8(exit0, zero256,  tmp);
+        exit0 = _mm256_andnot_si256(tmp, exit0);
 
         __m256i score256 = _mm256_max_epu8(maxScore256, maxRS1);
         maxScore256 = _mm256_blendv_epi8(maxScore256, score256, exit0);
@@ -1971,8 +1971,8 @@ void BandedPairWiseSW::smithWaterman256_16(uint16_t seq1SoA[],
             //__m256i cmp2 = _mm256_cmpgt_epi16(pj256, tail256);
             __m256i cmp2 = _mm256_cmpgt_epi16(j256, tail256);
             cmp1 = _mm256_or_si256(cmp1, cmp2);
-            h256 = _mm256_blendv_epi16(h256, zero256, cmp1);
-            f256 = _mm256_blendv_epi16(f256, zero256, cmp1);
+            h256 = _mm256_andnot_si256(cmp1, h256);
+            f256 = _mm256_andnot_si256(cmp1, f256);
             
             _mm256_store_si256((__m256i *)(F + l * SIMD_WIDTH16), f256);
             _mm256_store_si256((__m256i *)(H_h + l * SIMD_WIDTH16), h256);
@@ -1993,7 +1993,7 @@ void BandedPairWiseSW::smithWaterman256_16(uint16_t seq1SoA[],
         cmpht = _mm256_cmpgt_epi16(head256, tail256);
         cmpim = _mm256_or_si256(cmpim, cmpht);
 
-        exit0 = _mm256_blendv_epi16(exit0, zero256, cmpim);
+        exit0 = _mm256_andnot_si256(cmpim, exit0);
 
         
 #if RDT
@@ -2027,8 +2027,8 @@ void BandedPairWiseSW::smithWaterman256_16(uint16_t seq1SoA[],
             __m256i cmp2 = _mm256_cmpgt_epi16(head256, pj256);
             __m256i cmp1 = _mm256_cmpgt_epi16(pj256, tail256);
             cmp1 = _mm256_or_si256(cmp1, cmp2);
-            h10 = _mm256_blendv_epi16(h10, zero256, cmp1);
-            f21 = _mm256_blendv_epi16(f21, zero256, cmp1);
+            h10 = _mm256_andnot_si256(cmp1, h10);
+            f21 = _mm256_andnot_si256(cmp1, f21);
             
             __m256i bmaxRS = maxRS1;                                        
             maxRS1 =_mm256_max_epi16(maxRS1, h11);                          
@@ -2071,7 +2071,7 @@ void BandedPairWiseSW::smithWaterman256_16(uint16_t seq1SoA[],
         __m256i cmp2 = _mm256_cmpgt_epi16(head256, j256);
         __m256i cmp1 = _mm256_cmpgt_epi16(j256, tail256);
         cmp1 = _mm256_or_si256(cmp1, cmp2);
-        h10 = _mm256_blendv_epi16(h10, zero256, cmp1);
+        h10 = _mm256_andnot_si256(cmp1, h10);
         
         _mm256_store_si256((__m256i *)(H_h + j * SIMD_WIDTH16), h10);
         _mm256_store_si256((__m256i *)(F + j * SIMD_WIDTH16), zero256);
@@ -2082,7 +2082,7 @@ void BandedPairWiseSW::smithWaterman256_16(uint16_t seq1SoA[],
         uint32_t cval = _mm256_movemask_epi8(tmp) & dmask32;
         if (cval == dmask32) break;
 
-        exit0 = _mm256_blendv_epi16(exit0, zero256,  tmp);
+        exit0 = _mm256_andnot_si256(tmp, exit0);
 
         __m256i score256 = _mm256_max_epi16(maxScore256, maxRS1);
         maxScore256 = _mm256_blendv_epi16(maxScore256, score256, exit0);
