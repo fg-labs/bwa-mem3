@@ -410,12 +410,15 @@ int kswv::kswv_neon_u8(uint8_t seq1SoA[],
     uint8_t *F = F8 + tid * SIMD_WIDTH8 * this->maxQerLen;
     uint8_t *rowMax = rowMax8 + tid * SIMD_WIDTH8 * this->maxRefLen;
 
-    /* Per-strip L1 prefetches, mirroring the AVX-512 8-bit + 16-bit kernels.
-     * Args: (addr, rw=0 read, locality=0 lowest — equivalent to x86 NTA). */
-    __builtin_prefetch(F + SIMD_WIDTH8, 0, 0);
-    __builtin_prefetch(seq2SoA, 0, 0);
+    /* Per-strip warm-up prefetches. F and H1 are read+written every row across
+     * all columns (loop-resident, fit in L1), and seq2SoA is swept every row,
+     * so they want a keep hint (locality 1-2), not NTA. seq1SoA is read once
+     * per row (one vector at seq1SoA[i]) — genuinely streaming, so locality 0.
+     * Args: (addr, rw=0 read, locality 0 lowest .. 3 highest). */
+    __builtin_prefetch(F + SIMD_WIDTH8, 0, 1);
+    __builtin_prefetch(seq2SoA, 0, 2);
     __builtin_prefetch(seq1SoA, 0, 0);
-    __builtin_prefetch(H1 + SIMD_WIDTH8, 0, 0);
+    __builtin_prefetch(H1 + SIMD_WIDTH8, 0, 1);
 
     /* Initialize arrays */
     for (int i = 0; i <= ncol; i++)
@@ -964,12 +967,14 @@ int kswv::kswv_neon_16(int16_t seq1SoA[],
     int16_t *F      = F16      + tid * SIMD_WIDTH16 * this->maxQerLen;
     int16_t *rowMax = rowMax16 + tid * SIMD_WIDTH16 * this->maxRefLen;
 
-    /* Per-strip L1 prefetches, mirroring the AVX-512 16-bit kernel. Args:
-     * (addr, rw=0 read, locality=0 lowest — equivalent to x86 NTA). */
-    __builtin_prefetch(F + SIMD_WIDTH16, 0, 0);
-    __builtin_prefetch(seq2SoA, 0, 0);
+    /* Per-strip warm-up prefetches. F and H1 are loop-resident (read+written
+     * every row, fit in L1) and seq2SoA is swept every row, so they want a keep
+     * hint (locality 1-2), not NTA. seq1SoA is read once per row — streaming, so
+     * locality 0. Args: (addr, rw=0 read, locality 0 lowest .. 3 highest). */
+    __builtin_prefetch(F + SIMD_WIDTH16, 0, 1);
+    __builtin_prefetch(seq2SoA, 0, 2);
     __builtin_prefetch(seq1SoA, 0, 0);
-    __builtin_prefetch(H1 + SIMD_WIDTH16, 0, 0);
+    __builtin_prefetch(H1 + SIMD_WIDTH16, 0, 1);
 
     for (int i = 0; i <= ncol; i++) {
         vst1q_s16(H0   + i * SIMD_WIDTH16, zero_vec);
