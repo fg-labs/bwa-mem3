@@ -104,14 +104,19 @@
      * This extracts the MSB of each 16-bit element into an 8-bit result.
      */
     static inline int _mm_movemask_epi16(__m128i v) {
-        /* Shift right to get MSB in LSB position for each 16-bit element */
-        uint16x8_t shifted = vshrq_n_u16(vreinterpretq_u16_m128i(v), 15);
-        /* Narrow to 8-bit (taking low byte of each 16-bit element) */
-        uint8x8_t narrow = vmovn_u16(shifted);
-        /* Horizontal add with position weights: bit 0 has weight 1, bit 1 has weight 2, etc. */
-        static const uint8_t weights[8] = {1, 2, 4, 8, 16, 32, 64, 128};
-        uint8x8_t weighted = vmul_u8(narrow, vld1_u8(weights));
-        return vaddv_u8(weighted);
+        /* Broadcast each 16-bit lane's MSB across the lane (0xFFFF/0x0000) via an
+         * arithmetic right shift, then narrow to 0xFF/0x00 per byte.
+         * NOTE: a *logical* shift (vshrq_n_u16) yields 0x0001, and after narrowing
+         * 0x01 & (1<<lane) is 0 for every lane except 0 -- that silently collapses
+         * the mask. The signed shift is required for vand to match the old vmul. */
+        uint16x8_t msb = vreinterpretq_u16_s16(vshrq_n_s16(vreinterpretq_s16_m128i(v), 15));
+        /* Narrow to 8-bit (low byte of each 16-bit element is now 0xFF/0x00) */
+        uint8x8_t narrow = vmovn_u16(msb);
+        /* Weight each lane's mask by its bit position, then horizontal add.
+         * vand against a compile-time {1<<lane} literal (materialized via MOVI,
+         * 1-cycle) replaces vmul_u8 + a data-section weights load (3-cycle). */
+        const uint8x8_t bit_mask = {1, 2, 4, 8, 16, 32, 64, 128};
+        return (int)vaddv_u8(vand_u8(narrow, bit_mask));
     }
 
     /*
