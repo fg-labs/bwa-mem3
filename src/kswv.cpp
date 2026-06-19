@@ -523,21 +523,18 @@ int kswv::kswv_neon_u8(uint8_t seq1SoA[],
         uint16_t cmp0_msk = neon_movemask_u8(cmp0);
         cmp0_msk &= exit0;
 
-        /* 16-bit-wide comparison mirrors cmp0 but with 0xFFFF/0x0000 per
-         * 16-bit lane, suitable for updating the two halves of te. Must be
-         * computed BEFORE the vmaxq_u8 update of gmax_vec (same as cmp0). */
-        uint16x8_t cmp_lo_16 = vcgtq_u16(vmovl_u8(vget_low_u8(imax_vec)),
-                                         vmovl_u8(vget_low_u8(gmax_vec)));
-        uint16x8_t cmp_hi_16 = vcgtq_u16(vmovl_u8(vget_high_u8(imax_vec)),
-                                         vmovl_u8(vget_high_u8(gmax_vec)));
+        /* 16-bit-wide form of cmp0 (0xFFFF/0x0000 per 16-bit lane) for updating
+         * the two halves of te. cmp0 is already the byte-level "imax > gmax"
+         * mask (0xFF/0x00); since imax/gmax are u8, the byte compare equals the
+         * widened u16 compare, so interleaving each byte with itself widens the
+         * mask directly — no second compare needed. */
+        uint16x8_t cmp_lo_16 = vreinterpretq_u16_u8(vzip1q_u8(cmp0, cmp0));
+        uint16x8_t cmp_hi_16 = vreinterpretq_u16_u8(vzip2q_u8(cmp0, cmp0));
 
-        /* 16-bit frozen masks (0xFFFF per lane where frozen, else 0x0000).
-         * Widen 0xFF/0x00 bytes: vtstq_u8-style check, but we can use
-         * vmovl_u8 + vcgtq to turn non-zero into 0xFFFF. */
-        uint16x8_t frozen_lo_16 = vcgtq_u16(
-            vmovl_u8(vget_low_u8(frozen_vec)), vdupq_n_u16(0));
-        uint16x8_t frozen_hi_16 = vcgtq_u16(
-            vmovl_u8(vget_high_u8(frozen_vec)), vdupq_n_u16(0));
+        /* 16-bit frozen masks. frozen_vec bytes are strictly 0xFF/0x00, so the
+         * same byte-interleave widens them to 0xFFFF/0x0000 per 16-bit lane. */
+        uint16x8_t frozen_lo_16 = vreinterpretq_u16_u8(vzip1q_u8(frozen_vec, frozen_vec));
+        uint16x8_t frozen_hi_16 = vreinterpretq_u16_u8(vzip2q_u8(frozen_vec, frozen_vec));
 
         /* Combine "imax > gmax" with "not frozen" for the final update masks */
         cmp_lo_16 = vbicq_u16(cmp_lo_16, frozen_lo_16);
