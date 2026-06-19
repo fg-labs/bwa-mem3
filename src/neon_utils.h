@@ -139,31 +139,23 @@
  * NEON doesn't have a direct movemask, so we need to implement it
  */
 static inline uint16_t neon_movemask_u8(uint8x16_t v) {
-    /* Extract the high bit from each byte */
-    static const uint8_t shift_vals[16] = {0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7};
-    uint8x16_t shift = vld1q_u8(shift_vals);
+    /* Per-byte positional weights (1<<lane), repeated across both 8-byte
+     * halves. A compile-time vector literal, so it materializes via MOVI
+     * immediates rather than a data-section load. */
+    const uint8x16_t bit_mask = {1, 2, 4, 8, 16, 32, 64, 128,
+                                 1, 2, 4, 8, 16, 32, 64, 128};
 
-    /* Shift each byte so the high bit becomes bit 0, then shift back to position */
-    uint8x16_t high_bits = vshrq_n_u8(v, 7);  /* Get high bit of each byte */
+    /* Broadcast each byte's high bit across the whole lane (0xFF/0x00) via an
+     * arithmetic right shift, then keep that lane's positional weight with vand.
+     * NOTE: a *logical* shift (vshrq_n_u8) yields 0x01, and 0x01 & (1<<lane) is
+     * 0 for every lane except 0 and 8 -- that silently collapses the mask. The
+     * signed shift is required for vand to be equivalent to the vshl packing. */
+    uint8x16_t hi = vreinterpretq_u8_s8(vshrq_n_s8(vreinterpretq_s8_u8(v), 7));
+    uint8x16_t bits = vandq_u8(hi, bit_mask);
 
-    /* Accumulate bits: low half -> low byte of result, high half -> high byte */
-    uint8x8_t low = vget_low_u8(high_bits);
-    uint8x8_t high = vget_high_u8(high_bits);
-
-    /* Shift and combine */
-    static const uint8_t pos_low[8]  = {0, 1, 2, 3, 4, 5, 6, 7};
-    static const uint8_t pos_high[8] = {0, 1, 2, 3, 4, 5, 6, 7};
-    uint8x8_t shift_low = vld1_u8(pos_low);
-    uint8x8_t shift_high = vld1_u8(pos_high);
-
-    uint8x8_t shifted_low = vshl_u8(low, vreinterpret_s8_u8(shift_low));
-    uint8x8_t shifted_high = vshl_u8(high, vreinterpret_s8_u8(shift_high));
-
-    /* Horizontal add to combine bits */
-    uint8_t result_low = vaddv_u8(shifted_low);
-    uint8_t result_high = vaddv_u8(shifted_high);
-
-    return (uint16_t)result_low | ((uint16_t)result_high << 8);
+    /* Sum each 8-byte half: low half -> low byte of result, high -> high. */
+    return (uint16_t)vaddv_u8(vget_low_u8(bits)) |
+           ((uint16_t)vaddv_u8(vget_high_u8(bits)) << 8);
 }
 
 /*
@@ -218,74 +210,6 @@ static inline void* neon_aligned_alloc(size_t size) {
 static inline void neon_aligned_free(void* ptr) {
     free(ptr);
 }
-
-/*
- * Main Smith-Waterman code macro for 8-bit values (NEON version)
- * This is the core computation macro equivalent to MAIN_SAM_CODE8_OPT
- */
-#define MAIN_SAM_CODE8_NEON(s1, s2, h00, h11, e11, f11, f21,                    \
-                            match_vec, mismatch_vec, oe_ins_vec, e_ins_vec,     \
-                            oe_del_vec, e_del_vec, imax_vec, iqe_vec, l_vec)    \
-    {                                                                           \
-        uint8x16_t cmp_eq = vceqq_u8(s1, s2);                                   \
-        uint8x16_t sbt = vbslq_u8(cmp_eq, match_vec, mismatch_vec);             \
-        uint8x16_t m11 = vqaddq_u8(h00, sbt);                                   \
-        /* Check for boundary/ambiguous bases */                                 \
-        uint8x16_t or_val = vorrq_u8(s1, s2);                                   \
-        uint8x16_t high_bit = vshrq_n_u8(or_val, 7);                            \
-        uint8x16_t is_boundary = vceqq_u8(high_bit, vdupq_n_u8(1));             \
-        m11 = vbslq_u8(is_boundary, vdupq_n_u8(0), m11);                        \
-        /* Max with E and F */                                                   \
-        h11 = vmaxq_u8(m11, e11);                                               \
-        h11 = vmaxq_u8(h11, f11);                                               \
-        /* Update max tracking */                                                \
-        uint8x16_t cmp_gt = vcgtq_u8(h11, imax_vec);                            \
-        imax_vec = vmaxq_u8(imax_vec, h11);                                     \
-        iqe_vec = vbslq_u8(cmp_gt, l_vec, iqe_vec);                             \
-        /* Gap extension: E = max(H - gap_open_ins, E - gap_ext_ins) */         \
-        uint8x16_t gap_e = vqsubq_u8(h11, oe_ins_vec);                          \
-        e11 = vqsubq_u8(e11, e_ins_vec);                                        \
-        e11 = vmaxq_u8(gap_e, e11);                                             \
-        /* Gap extension: F = max(H - gap_open_del, F - gap_ext_del) */         \
-        uint8x16_t gap_d = vqsubq_u8(h11, oe_del_vec);                          \
-        f21 = vqsubq_u8(f11, e_del_vec);                                        \
-        f21 = vmaxq_u8(gap_d, f21);                                             \
-    }
-
-/*
- * Main Smith-Waterman code macro for 16-bit values (NEON version)
- */
-#define MAIN_SAM_CODE16_NEON(s1, s2, h00, h11, e11, f11, f21,                   \
-                             match_vec, mismatch_vec, oe_ins_vec, e_ins_vec,    \
-                             oe_del_vec, e_del_vec, imax_vec, iqe_vec, l_vec,   \
-                             zero_vec)                                           \
-    {                                                                           \
-        uint16x8_t cmp_eq = vceqq_u16(s1, s2);                                  \
-        int16x8_t sbt = vbslq_s16(cmp_eq, match_vec, mismatch_vec);             \
-        int16x8_t m11 = vaddq_s16(h00, sbt);                                    \
-        /* Check for boundary */                                                 \
-        uint16x8_t or_val = vorrq_u16(vreinterpretq_u16_s16(s1),                \
-                                       vreinterpretq_u16_s16(s2));              \
-        uint16x8_t high_bit = vshrq_n_u16(or_val, 15);                          \
-        uint16x8_t is_boundary = vceqq_u16(high_bit, vdupq_n_u16(1));           \
-        m11 = vbslq_s16(is_boundary, zero_vec, m11);                            \
-        /* Max with E, F, and 0 */                                               \
-        h11 = vmaxq_s16(m11, e11);                                              \
-        h11 = vmaxq_s16(h11, f11);                                              \
-        h11 = vmaxq_s16(h11, zero_vec);                                         \
-        /* Update max tracking */                                                \
-        uint16x8_t cmp_gt = vcgtq_s16(h11, imax_vec);                           \
-        imax_vec = vmaxq_s16(imax_vec, h11);                                    \
-        iqe_vec = vbslq_s16(cmp_gt, l_vec, iqe_vec);                            \
-        /* Gap extension: E = max(H - gap_open_ins, E - gap_ext_ins) */         \
-        int16x8_t gap_e = vsubq_s16(h11, oe_ins_vec);                           \
-        e11 = vsubq_s16(e11, e_ins_vec);                                        \
-        e11 = vmaxq_s16(gap_e, e11);                                            \
-        /* Gap extension: F = max(H - gap_open_del, F - gap_ext_del) */         \
-        int16x8_t gap_d = vsubq_s16(h11, oe_del_vec);                           \
-        f21 = vsubq_s16(f11, e_del_vec);                                        \
-        f21 = vmaxq_s16(gap_d, f21);                                            \
-    }
 
 #endif /* __ARM_NEON || __aarch64__ || APPLE_SILICON */
 

@@ -410,12 +410,15 @@ int kswv::kswv_neon_u8(uint8_t seq1SoA[],
     uint8_t *F = F8 + tid * SIMD_WIDTH8 * this->maxQerLen;
     uint8_t *rowMax = rowMax8 + tid * SIMD_WIDTH8 * this->maxRefLen;
 
-    /* Per-strip L1 prefetches, mirroring the AVX-512 8-bit + 16-bit kernels.
-     * Args: (addr, rw=0 read, locality=0 lowest — equivalent to x86 NTA). */
-    __builtin_prefetch(F + SIMD_WIDTH8, 0, 0);
-    __builtin_prefetch(seq2SoA, 0, 0);
+    /* Per-strip warm-up prefetches. F and H1 are read+written every row across
+     * all columns (loop-resident, fit in L1), and seq2SoA is swept every row,
+     * so they want a keep hint (locality 1-2), not NTA. seq1SoA is read once
+     * per row (one vector at seq1SoA[i]) — genuinely streaming, so locality 0.
+     * Args: (addr, rw=0 read, locality 0 lowest .. 3 highest). */
+    __builtin_prefetch(F + SIMD_WIDTH8, 0, 1);
+    __builtin_prefetch(seq2SoA, 0, 2);
     __builtin_prefetch(seq1SoA, 0, 0);
-    __builtin_prefetch(H1 + SIMD_WIDTH8, 0, 0);
+    __builtin_prefetch(H1 + SIMD_WIDTH8, 0, 1);
 
     /* Initialize arrays */
     for (int i = 0; i <= ncol; i++)
@@ -462,10 +465,11 @@ int kswv::kswv_neon_u8(uint8_t seq1SoA[],
             uint8x16_t cmpq = vceqq_u8(s2, five_vec);
             sbt = vbslq_u8(cmpq, sft_vec, sbt);
 
-            /* Check for boundary (high bit set) */
+            /* Check for boundary (high bit set in s1 or s2). vtstq_u8 against
+             * 0x80 sets 0xFF where bit 7 is set, 0x00 otherwise — one op vs the
+             * prior vshr+vceq pair, and this runs per cell in the inner loop. */
             uint8x16_t or_val = vorrq_u8(s1, s2);
-            uint8x16_t high_bit = vshrq_n_u8(or_val, 7);
-            uint8x16_t is_boundary = vceqq_u8(high_bit, one_vec);
+            uint8x16_t is_boundary = vtstq_u8(or_val, vdupq_n_u8(0x80));
 
             uint8x16_t m11 = vqaddq_u8(h00, sbt);
             m11 = vbslq_u8(is_boundary, zero_vec, m11);
@@ -501,8 +505,8 @@ int kswv::kswv_neon_u8(uint8_t seq1SoA[],
             uint16_t msk16 = neon_movemask_u8(cmp_gt);
             msk16 |= mask16;
 
-            /* Apply masks */
-            uint8x16_t msk_vec = vld1q_u8((uint8_t*)&msk16); // simplified
+            /* Zero out lanes that set a new row max (cmp_gt) in the stored
+             * pimax before writing it back. */
             pimax_vec = vbslq_u8(cmp_gt, zero_vec, pimax_vec);
 
             vst1q_u8(rowMax + (i - 1) * SIMD_WIDTH8, pimax_vec);
@@ -520,21 +524,18 @@ int kswv::kswv_neon_u8(uint8_t seq1SoA[],
         uint16_t cmp0_msk = neon_movemask_u8(cmp0);
         cmp0_msk &= exit0;
 
-        /* 16-bit-wide comparison mirrors cmp0 but with 0xFFFF/0x0000 per
-         * 16-bit lane, suitable for updating the two halves of te. Must be
-         * computed BEFORE the vmaxq_u8 update of gmax_vec (same as cmp0). */
-        uint16x8_t cmp_lo_16 = vcgtq_u16(vmovl_u8(vget_low_u8(imax_vec)),
-                                         vmovl_u8(vget_low_u8(gmax_vec)));
-        uint16x8_t cmp_hi_16 = vcgtq_u16(vmovl_u8(vget_high_u8(imax_vec)),
-                                         vmovl_u8(vget_high_u8(gmax_vec)));
+        /* 16-bit-wide form of cmp0 (0xFFFF/0x0000 per 16-bit lane) for updating
+         * the two halves of te. cmp0 is already the byte-level "imax > gmax"
+         * mask (0xFF/0x00); since imax/gmax are u8, the byte compare equals the
+         * widened u16 compare, so interleaving each byte with itself widens the
+         * mask directly — no second compare needed. */
+        uint16x8_t cmp_lo_16 = vreinterpretq_u16_u8(vzip1q_u8(cmp0, cmp0));
+        uint16x8_t cmp_hi_16 = vreinterpretq_u16_u8(vzip2q_u8(cmp0, cmp0));
 
-        /* 16-bit frozen masks (0xFFFF per lane where frozen, else 0x0000).
-         * Widen 0xFF/0x00 bytes: vtstq_u8-style check, but we can use
-         * vmovl_u8 + vcgtq to turn non-zero into 0xFFFF. */
-        uint16x8_t frozen_lo_16 = vcgtq_u16(
-            vmovl_u8(vget_low_u8(frozen_vec)), vdupq_n_u16(0));
-        uint16x8_t frozen_hi_16 = vcgtq_u16(
-            vmovl_u8(vget_high_u8(frozen_vec)), vdupq_n_u16(0));
+        /* 16-bit frozen masks. frozen_vec bytes are strictly 0xFF/0x00, so the
+         * same byte-interleave widens them to 0xFFFF/0x0000 per 16-bit lane. */
+        uint16x8_t frozen_lo_16 = vreinterpretq_u16_u8(vzip1q_u8(frozen_vec, frozen_vec));
+        uint16x8_t frozen_hi_16 = vreinterpretq_u16_u8(vzip2q_u8(frozen_vec, frozen_vec));
 
         /* Combine "imax > gmax" with "not frozen" for the final update masks */
         cmp_lo_16 = vbicq_u16(cmp_lo_16, frozen_lo_16);
@@ -964,12 +965,14 @@ int kswv::kswv_neon_16(int16_t seq1SoA[],
     int16_t *F      = F16      + tid * SIMD_WIDTH16 * this->maxQerLen;
     int16_t *rowMax = rowMax16 + tid * SIMD_WIDTH16 * this->maxRefLen;
 
-    /* Per-strip L1 prefetches, mirroring the AVX-512 16-bit kernel. Args:
-     * (addr, rw=0 read, locality=0 lowest — equivalent to x86 NTA). */
-    __builtin_prefetch(F + SIMD_WIDTH16, 0, 0);
-    __builtin_prefetch(seq2SoA, 0, 0);
+    /* Per-strip warm-up prefetches. F and H1 are loop-resident (read+written
+     * every row, fit in L1) and seq2SoA is swept every row, so they want a keep
+     * hint (locality 1-2), not NTA. seq1SoA is read once per row — streaming, so
+     * locality 0. Args: (addr, rw=0 read, locality 0 lowest .. 3 highest). */
+    __builtin_prefetch(F + SIMD_WIDTH16, 0, 1);
+    __builtin_prefetch(seq2SoA, 0, 2);
     __builtin_prefetch(seq1SoA, 0, 0);
-    __builtin_prefetch(H1 + SIMD_WIDTH16, 0, 0);
+    __builtin_prefetch(H1 + SIMD_WIDTH16, 0, 1);
 
     for (int i = 0; i <= ncol; i++) {
         vst1q_s16(H0   + i * SIMD_WIDTH16, zero_vec);
