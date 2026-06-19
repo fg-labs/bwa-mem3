@@ -2052,17 +2052,20 @@ void BandedPairWiseSW::smithWaterman256_16(uint16_t seq1SoA[],
             if (j >= minq)
             {
                 __m256i cmp = _mm256_cmpeq_epi16(j256, qlen256);
+                // Both blendv pairs below fall back to the same operand under
+                // exit0 then cmp, so each collapses to one select against the
+                // fused mask (cmp & exit0): saves 2 port-5 blendv per qualifying
+                // cell. Bit-identical — lane masks are uniform 0xFFFF/0x0000.
+                __m256i sel = _mm256_and_si256(cmp, exit0);
                 __m256i max_gh = _mm256_max_epi16(gscore, h11);
                 __m256i cmp_gh = _mm256_cmpgt_epi16(gscore, h11);
-                __m256i tmp256_1 = _mm256_blendv_epi16(i1_256, max_ie256, cmp_gh);
+                __m256i cand_ie = _mm256_blendv_epi16(i1_256, max_ie256, cmp_gh);
 
-                __m256i tmp256_t = _mm256_blendv_epi16(max_ie256, tmp256_1, cmp);
-                tmp256_1 = _mm256_blendv_epi16(max_ie256, tmp256_t, exit0);             
+                __m256i tmp256_1 = _mm256_blendv_epi16(max_ie256, cand_ie, sel);
 
-                max_gh = _mm256_blendv_epi16(gscore, max_gh, exit0);
-                max_gh = _mm256_blendv_epi16(gscore, max_gh, cmp);              
+                max_gh = _mm256_blendv_epi16(gscore, max_gh, sel);
 
-                cmp = _mm256_cmpgt_epi16(j256, tail256); 
+                cmp = _mm256_cmpgt_epi16(j256, tail256);
                 max_gh = _mm256_blendv_epi16(max_gh, gscore, cmp);
                 max_ie256 = _mm256_blendv_epi16(tmp256_1, max_ie256, cmp);
                 gscore = max_gh;            
