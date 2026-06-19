@@ -16,7 +16,8 @@ std::vector<kswr_t> run_kswv_batch(const std::vector<TestPair> &pairs,
                                    const ScoringMatrix &mat,
                                    int gap_open,
                                    int gap_extend,
-                                   int xtra_flags) {
+                                   int xtra_flags,
+                                   bool use16) {
     if (xtra_flags == 0) {
         // Derive the KSW_XSUBO threshold (low 16 bits) from the matrix's
         // match score so the batched runner agrees with run_scalar_ksw
@@ -55,8 +56,13 @@ std::vector<kswr_t> run_kswv_batch(const std::vector<TestPair> &pairs,
         1, maxRefLen, maxQerLen));
 
     // Phase 0: forward pass.
-    pwsw->getScores8(bb.pairs(), bb.ref_buf(), bb.qer_buf(),
-                     bb.aln(), bb.n(), 1, 0);
+    if (use16) {
+        pwsw->getScores16(bb.pairs(), bb.ref_buf(), bb.qer_buf(),
+                          bb.aln(), bb.n(), 1, 0);
+    } else {
+        pwsw->getScores8(bb.pairs(), bb.ref_buf(), bb.qer_buf(),
+                         bb.aln(), bb.n(), 1, 0);
+    }
 
     if (std::getenv("BWA_TESTS_DEBUG_PHASE0")) {
         int nprint = (bb.n() < 5) ? bb.n() : 5;
@@ -81,8 +87,13 @@ std::vector<kswr_t> run_kswv_batch(const std::vector<TestPair> &pairs,
     }
 
     // Phase 1: reverse pass fills tb/qb.
-    pwsw->getScores8(bb.pairs(), bb.ref_buf(), bb.qer_buf(),
-                     bb.aln(), pos, 1, 1);
+    if (use16) {
+        pwsw->getScores16(bb.pairs(), bb.ref_buf(), bb.qer_buf(),
+                          bb.aln(), pos, 1, 1);
+    } else {
+        pwsw->getScores8(bb.pairs(), bb.ref_buf(), bb.qer_buf(),
+                         bb.aln(), pos, 1, 1);
+    }
 
     if (dbg1) {
         int dumped = 0;

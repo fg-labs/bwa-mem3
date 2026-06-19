@@ -110,6 +110,112 @@ TEST_CASE("kswv::getScores8 matches scalar ksw_align2 on 10k random + curated ed
     CHECK(score2_mism == 0);
 }
 
+TEST_CASE("kswv::getScores16 matches scalar ksw_align2 on 10k random + curated edge pairs"
+          * doctest::test_suite("unit/kswv")) {
+
+    auto mat = bwa_tests::build_scoring_matrix(1, 4, 1);
+
+    std::mt19937 rng(42);
+    auto pairs = build_edge_cases(rng);
+    auto bulk  = build_bulk_random(rng, 10000);
+    pairs.insert(pairs.end(), bulk.begin(), bulk.end());
+
+    std::vector<kswr_t> scalar_aln;
+    scalar_aln.reserve(pairs.size());
+    for (const auto &p : pairs) {
+        scalar_aln.push_back(bwa_tests::run_scalar_ksw(p, mat));
+    }
+
+    // use16 = true drives the 16-bit kernel (kswv256_16 / kswv512_16 /
+    // kswv_neon_16) regardless of the production l_ms*a routing.
+    auto batched = bwa_tests::run_kswv_batch(pairs, mat,
+                                             bwa_tests::DEFAULT_GAP_OPEN,
+                                             bwa_tests::DEFAULT_GAP_EXTEND,
+                                             0, /*use16=*/true);
+    REQUIRE(batched.size() == pairs.size());
+
+    int score_mism = 0, coord_mism = 0, score2_mism = 0;
+    for (size_t i = 0; i < pairs.size(); i++) {
+        CAPTURE(i);
+        CAPTURE(pairs[i].tag);
+        CAPTURE(scalar_aln[i].score);
+        CAPTURE(batched[i].score);
+        const bool score_ok  = bwa_tests::kswr_score_eq(scalar_aln[i], batched[i]);
+        const bool coord_ok  = bwa_tests::kswr_coords_eq(scalar_aln[i], batched[i]);
+        const bool score2_ok = bwa_tests::kswr_score2_eq(scalar_aln[i], batched[i]);
+        if (!score_ok)  { ++score_mism;  CHECK(score_ok); }
+        if (!coord_ok)  { ++coord_mism;  CHECK(coord_ok); }
+        if (!score2_ok) { ++score2_mism; CHECK(score2_ok); }
+    }
+
+    MESSAGE("kswv16 vs scalar: score_mism=" << score_mism
+            << " coord_mism=" << coord_mism
+            << " score2_mism=" << score2_mism
+            << " over " << pairs.size() << " pairs");
+    CHECK(score_mism == 0);
+    CHECK(coord_mism == 0);
+    CHECK(score2_mism == 0);
+}
+
+TEST_CASE("kswv::getScores16 matches scalar on high scores that overflow the 8-bit kernel"
+          * doctest::test_suite("unit/kswv")) {
+    // match=14 with long, near-exact pairs pushes alignment scores well
+    // past 255, where the 8-bit kernel saturates. The 16-bit kernel must
+    // still reproduce scalar ksw_align2 exactly. match=14 also makes
+    // min_seed_len*match = 19*14 = 266 >= 250, so default_xtra_flags drops
+    // KSW_XBYTE for BOTH the scalar reference and the batch — i.e. both run
+    // the word path, exactly the case production routes to getScores16.
+    auto mat = bwa_tests::build_scoring_matrix(14, 8, 1);
+
+    std::mt19937 rng(1234);
+    std::vector<bwa_tests::TestPair> pairs;
+    std::uniform_int_distribution<int> qlen_d(80, 128);
+    std::uniform_int_distribution<int> rlen_d(150, 250);
+    for (int i = 0; i < 5000; i++) {
+        pairs.push_back(bwa_tests::gen_sub_cluster_pair(
+            rng, qlen_d(rng), rlen_d(rng), 40, 2));
+    }
+
+    std::vector<kswr_t> scalar_aln;
+    scalar_aln.reserve(pairs.size());
+    for (const auto &p : pairs) {
+        scalar_aln.push_back(bwa_tests::run_scalar_ksw(p, mat));
+    }
+
+    auto batched = bwa_tests::run_kswv_batch(pairs, mat,
+                                             bwa_tests::DEFAULT_GAP_OPEN,
+                                             bwa_tests::DEFAULT_GAP_EXTEND,
+                                             0, /*use16=*/true);
+    REQUIRE(batched.size() == pairs.size());
+
+    int score_mism = 0, coord_mism = 0, score2_mism = 0, over255 = 0;
+    for (size_t i = 0; i < pairs.size(); i++) {
+        CAPTURE(i);
+        CAPTURE(pairs[i].tag);
+        CAPTURE(scalar_aln[i].score);
+        CAPTURE(batched[i].score);
+        if (scalar_aln[i].score > 255) ++over255;
+        const bool score_ok  = bwa_tests::kswr_score_eq(scalar_aln[i], batched[i]);
+        const bool coord_ok  = bwa_tests::kswr_coords_eq(scalar_aln[i], batched[i]);
+        const bool score2_ok = bwa_tests::kswr_score2_eq(scalar_aln[i], batched[i]);
+        if (!score_ok)  { ++score_mism;  CHECK(score_ok); }
+        if (!coord_ok)  { ++coord_mism;  CHECK(coord_ok); }
+        if (!score2_ok) { ++score2_mism; CHECK(score2_ok); }
+    }
+
+    MESSAGE("kswv16 high-score: over255=" << over255
+            << " score_mism=" << score_mism
+            << " coord_mism=" << coord_mism
+            << " score2_mism=" << score2_mism
+            << " over " << pairs.size() << " pairs");
+    // Guard the test's own premise: at least some pairs must exceed the
+    // 8-bit ceiling, else this wouldn't be testing the 16-bit range.
+    CHECK(over255 > 0);
+    CHECK(score_mism == 0);
+    CHECK(coord_mism == 0);
+    CHECK(score2_mism == 0);
+}
+
 TEST_CASE("kswv handles every curated edge case identically to scalar"
           * doctest::test_suite("unit/kswv")) {
 
