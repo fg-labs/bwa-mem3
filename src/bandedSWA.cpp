@@ -75,7 +75,7 @@ static inline T effective_threads(T n) { return n < 1 ? T(1) : n; }
 // 8-bit re-baseline floor helpers (shared by wrapper + every SIMD kernel tier)
 //
 // Initial 8-bit score floor: keep the seed score h0 inside the re-baseline
-// keep-window so the stored byte (= H_abs - B) never overflows signed int8.
+// keep-window so the stored byte (= H_abs - B) stays within the unsigned [0,255] range.
 // Clamping prefixes >REBASE_KEEP below h0 is lossless (REBASE_KEEP=zdrop+1 >
 // zdrop => already past the z-drop horizon). MUST be used by every SIMD tier.
 // Defined at file scope (before any tier #if block) so every kernel variant
@@ -580,12 +580,13 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
         // so the two agree on B0; smithWaterman256_8 recomputes B0 via
         // bsw8_initial_floor(p[].h0, zdrop).
         const int REBASE_KEEP_W = bsw8_rebase_keep(zdrop);
-        // The h0-prefix column/row seed below uses SIGNED int8 ops, so the seeded
-        // byte min(h0, REBASE_KEEP_W) must stay <= 127 (signed-positive). The
-        // routing gate (bsw8_envelope_ok) enforces zdrop <= 126; assert for any
-        // direct caller that bypasses the gate.
-        assert(REBASE_KEEP_W <= 127 &&
-               "8-bit h0-prefix seed is signed int8; REBASE_KEEP>127 (zdrop>126) -> route to 16-bit");
+        // The h0-prefix column/row seed below is unsigned-saturating [0,255], so
+        // the seeded byte min(h0, REBASE_KEEP_W) only needs to fit a uint8. The
+        // routing gate (bsw8_envelope_ok) enforces zdrop + maxStep <= 253 (so the
+        // re-baseline window REBASE_HI = 255 - maxStep > REBASE_KEEP holds);
+        // assert the byte bound for any direct caller that bypasses the gate.
+        assert(REBASE_KEEP_W <= 255 &&
+               "8-bit h0-prefix seed byte min(h0,REBASE_KEEP) must fit uint8 (zdrop<=254)");
 
         int nstart = 0, nend = numPairs;
 
@@ -612,6 +613,11 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                     int h0p = sp.h0;
                     if (h0p > REBASE_KEEP_W) h0p = REBASE_KEEP_W;
                     if (h0p < 0) h0p = 0;
+                    // Always-on uint8 guard (asserts are compiled out in release):
+                    // a direct caller that bypasses the gate with zdrop > 254 would
+                    // otherwise truncate the seed byte. In-envelope REBASE_KEEP_W <= 253,
+                    // so this never fires on the production path.
+                    if (h0p > 255) h0p = 255;
                     h0[j] = (uint8_t) h0p;
                 }
                 seq1 = seqBufRef + (int64_t)sp.idr;
@@ -638,12 +644,17 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
 //--------------------
             __m256i h0_256 = _mm256_load_si256((__m256i*) h0);
             _mm256_store_si256((__m256i *) H2, h0_256);
-            __m256i tmp256 = _mm256_sub_epi8(h0_256, o_del256);
+            // h0-prefix deletion seed, unsigned-saturating [0,255]. Was signed
+            // sub_epi8 + max_epi8(.,0) floor, which required the seed byte
+            // min(h0,REBASE_KEEP) <= 127 and so capped zdrop at 126. subs_epu8
+            // floors at 0 inherently and feeds the floored value forward;
+            // byte-identical for the monotone-decreasing affine prefix. Mirrors
+            // smithWaterman128_8 (the NEON reference, already unsigned here).
+            __m256i tmp256 = _mm256_subs_epu8(h0_256, o_del256);
 
             for(k = 1; k < maxLen1; k++) {
-                tmp256 = _mm256_sub_epi8(tmp256, e_del256);
-                __m256i tmp256_ = _mm256_max_epi8(tmp256, zero256);
-                _mm256_store_si256((__m256i *)(H2 + k* SIMD_WIDTH8), tmp256_);
+                tmp256 = _mm256_subs_epu8(tmp256, e_del256);
+                _mm256_store_si256((__m256i *)(H2 + k* SIMD_WIDTH8), tmp256);
             }
 //-------------------
             for(j = 0; j < SIMD_WIDTH8; j++)
@@ -674,20 +685,17 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
 
 //------------------------
             _mm256_store_si256((__m256i *) H1, h0_256);
-            __m256i cmp256 = _mm256_cmpgt_epi8(h0_256, oe_ins256);
-            tmp256 = _mm256_sub_epi8(h0_256, oe_ins256);
-            // _mm256_store_si256((__m256i *) (H1 + SIMD_WIDTH8), tmp256);
-
-            tmp256 = _mm256_blendv_epi8(zero256, tmp256, cmp256);
+            // h0-prefix insertion seed, unsigned-saturating [0,255]:
+            // H1[1] = max(0, h0' - oe_ins), then -e_ins per step. subs_epu8
+            // replaces the signed cmpgt+sub+blendv (first gap) and sub+max_epi8
+            // (extensions); byte-identical for h0' in [0,255].
+            tmp256 = _mm256_subs_epu8(h0_256, oe_ins256);
             _mm256_store_si256((__m256i *) (H1 + SIMD_WIDTH8), tmp256);
             for(k = 2; k < maxLen2; k++)
             {
-                // __m256i h1_256 = _mm256_load_si256((__m256i *) (H1 + (k-1) * SIMD_WIDTH8));
-                __m256i h1_256 = tmp256;
-                tmp256 = _mm256_sub_epi8(h1_256, e_ins256);
-                tmp256 = _mm256_max_epi8(tmp256, zero256);
+                tmp256 = _mm256_subs_epu8(tmp256, e_ins256);
                 _mm256_store_si256((__m256i *)(H1 + k*SIMD_WIDTH8), tmp256);
-            }           
+            }
 //------------------------
             /* Banding calculation in pre-processing */
             uint8_t myband[SIMD_WIDTH8] __attribute__((aligned(64)));
@@ -841,10 +849,10 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
     // The re-baseline machinery below is retained only as a safety net; pairs that
     // could exceed the envelope take the 16-bit path.
     // Precondition REBASE_HI > REBASE_KEEP (a non-empty window) holds for
-    // zdrop + maxStep <= 253; the routing gate enforces the tighter
-    // zdrop + maxStep <= 127 because the h0-prefix column/row seed (wrapper setup
-    // below) uses SIGNED int8 ops, so the seeded byte min(h0, REBASE_KEEP) must
-    // stay <= 127 (signed-positive).
+    // zdrop + maxStep <= 253, which is exactly what the routing gate enforces.
+    // The h0-prefix column/row seed (wrapper setup below) is unsigned-saturating
+    // [0,255] and imposes no tighter ceiling; it previously used signed int8 ops
+    // that required the seed byte <= 127 and capped zdrop at 126.
     int maxStep = (int)this->w_match;
     if ((int)this->w_ambig > maxStep) maxStep = (int)this->w_ambig;
     if (maxStep < 1) maxStep = 1;
@@ -859,11 +867,11 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
     // --- INITIAL SCORE FLOOR B0 (long-read 8-bit, seed score h0 >= 128) ---
     // The H arrays are seeded from the seed score h0 (H_v[0]=h0, then gap-
     // decremented down column 0 and across row 0). For a long-read seed h0 can
-    // be several hundred, which immediately overflows the signed-int8 byte
-    // state before any re-baseline event can fire. So we start each lane's
+    // be several hundred, which would overflow the unsigned [0,255] byte state
+    // before any re-baseline event can fire. So we start each lane's
     // running floor at B0[l] = max(0, h0 - REBASE_KEEP) instead of 0: the
     // wrapper seeds the H bytes from h0' = h0 - B0 = min(h0, REBASE_KEEP)
-    // (clamped >= 0, so the initial bytes land in [0, REBASE_KEEP] <= 127), and
+    // (clamped >= 0, so the initial bytes land in [0, REBASE_KEEP] <= 254), and
     // here we set B[l] = B0[l] so the stored bytes still mean (H_absolute - B).
     //
     // SAFETY (identical argument to the mid-DP re-baseline): the gap-prefix
@@ -2331,12 +2339,13 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
         // so the two agree on B0; smithWaterman512_8 recomputes B0 via
         // bsw8_initial_floor(p[].h0, zdrop).
         const int REBASE_KEEP_W = bsw8_rebase_keep(zdrop);
-        // The h0-prefix column/row seed below uses SIGNED int8 ops, so the seeded
-        // byte min(h0, REBASE_KEEP_W) must stay <= 127 (signed-positive). The
-        // routing gate (bsw8_envelope_ok) enforces zdrop <= 126; assert for any
-        // direct caller that bypasses the gate.
-        assert(REBASE_KEEP_W <= 127 &&
-               "8-bit h0-prefix seed is signed int8; REBASE_KEEP>127 (zdrop>126) -> route to 16-bit");
+        // The h0-prefix column/row seed below is unsigned-saturating [0,255], so
+        // the seeded byte min(h0, REBASE_KEEP_W) only needs to fit a uint8. The
+        // routing gate (bsw8_envelope_ok) enforces zdrop + maxStep <= 253 (so the
+        // re-baseline window REBASE_HI = 255 - maxStep > REBASE_KEEP holds);
+        // assert the byte bound for any direct caller that bypasses the gate.
+        assert(REBASE_KEEP_W <= 255 &&
+               "8-bit h0-prefix seed byte min(h0,REBASE_KEEP) must fit uint8 (zdrop<=254)");
 
         int nstart = 0, nend = numPairs;
 
@@ -2370,6 +2379,11 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                     int h0p = sp.h0;
                     if (h0p > REBASE_KEEP_W) h0p = REBASE_KEEP_W;
                     if (h0p < 0) h0p = 0;
+                    // Always-on uint8 guard (asserts are compiled out in release):
+                    // a direct caller that bypasses the gate with zdrop > 254 would
+                    // otherwise truncate the seed byte. In-envelope REBASE_KEEP_W <= 253,
+                    // so this never fires on the production path.
+                    if (h0p > 255) h0p = 255;
                     h0[j] = (uint8_t) h0p;
                 }
                 seq1 = seqBufRef + (int64_t)sp.idr;
@@ -2395,12 +2409,13 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
 //--------------------
             __m512i h0_512 = _mm512_load_si512((__m512i*) h0);
             _mm512_store_si512((__m512i *) H2, h0_512);
-            __m512i tmp512 = _mm512_sub_epi8(h0_512, o_del512);
-            
+            // h0-prefix deletion seed, unsigned-saturating [0,255] (was signed
+            // sub_epi8 + max_epi8 floor; see smithWaterman128_8 / smithWaterman256_8).
+            __m512i tmp512 = _mm512_subs_epu8(h0_512, o_del512);
+
             for(k = 1; k < maxLen1; k++) {
-                tmp512 = _mm512_sub_epi8(tmp512, e_del512);
-                __m512i tmp512_ = _mm512_max_epi8(tmp512, zero512);
-                _mm512_store_si512((__m512i *)(H2 + k* SIMD_WIDTH8), tmp512_);
+                tmp512 = _mm512_subs_epu8(tmp512, e_del512);
+                _mm512_store_si512((__m512i *)(H2 + k* SIMD_WIDTH8), tmp512);
             }
 //-------------------
             for(j = 0; j < SIMD_WIDTH8; j++)
@@ -2432,18 +2447,17 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
             }
 //------------------------
             _mm512_store_si512((__m512i *) H1, h0_512);
-            __mmask64 mask512 = _mm512_cmpgt_epi8_mask(h0_512, oe_ins512);
-            tmp512 = _mm512_sub_epi8(h0_512, oe_ins512);
-            tmp512 = _mm512_mask_blend_epi8(mask512, zero512, tmp512);
+            // h0-prefix insertion seed, unsigned-saturating [0,255]:
+            // H1[1] = max(0, h0' - oe_ins), then -e_ins per step (was signed
+            // cmpgt_mask+sub+mask_blend, then sub+max_epi8).
+            tmp512 = _mm512_subs_epu8(h0_512, oe_ins512);
             _mm512_store_si512((__m512i *) (H1 + SIMD_WIDTH8), tmp512);
 
             for(k = 2; k < maxLen2; k++)
             {
-                __m512i h1_512 = tmp512;
-                tmp512 = _mm512_sub_epi8(h1_512, e_ins512);
-                tmp512 = _mm512_max_epi8(tmp512, zero512);
+                tmp512 = _mm512_subs_epu8(tmp512, e_ins512);
                 _mm512_store_si512((__m512i *)(H1 + k*SIMD_WIDTH8), tmp512);
-            }           
+            }
 //------------------------
             /* Banding calculation in pre-processing */
             uint8_t myband[SIMD_WIDTH8] __attribute__((aligned(64)));
@@ -2594,10 +2608,10 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
     // The re-baseline machinery below is retained only as a safety net; pairs that
     // could exceed the envelope take the 16-bit path.
     // Precondition REBASE_HI > REBASE_KEEP (a non-empty window) holds for
-    // zdrop + maxStep <= 253; the routing gate enforces the tighter
-    // zdrop + maxStep <= 127 because the h0-prefix column/row seed (wrapper setup
-    // below) uses SIGNED int8 ops, so the seeded byte min(h0, REBASE_KEEP) must
-    // stay <= 127 (signed-positive).
+    // zdrop + maxStep <= 253, which is exactly what the routing gate enforces.
+    // The h0-prefix column/row seed (wrapper setup below) is unsigned-saturating
+    // [0,255] and imposes no tighter ceiling; it previously used signed int8 ops
+    // that required the seed byte <= 127 and capped zdrop at 126.
     int maxStep = (int)this->w_match;
     if ((int)this->w_ambig > maxStep) maxStep = (int)this->w_ambig;
     if (maxStep < 1) maxStep = 1;
@@ -2612,11 +2626,11 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
     // --- INITIAL SCORE FLOOR B0 (long-read 8-bit, seed score h0 >= 128) ---
     // The H arrays are seeded from the seed score h0 (H_v[0]=h0, then gap-
     // decremented down column 0 and across row 0). For a long-read seed h0 can
-    // be several hundred, which immediately overflows the signed-int8 byte
-    // state before any re-baseline event can fire. So we start each lane's
+    // be several hundred, which would overflow the unsigned [0,255] byte state
+    // before any re-baseline event can fire. So we start each lane's
     // running floor at B0[l] = max(0, h0 - REBASE_KEEP) instead of 0: the
     // wrapper seeds the H bytes from h0' = h0 - B0 = min(h0, REBASE_KEEP)
-    // (clamped >= 0, so the initial bytes land in [0, REBASE_KEEP] <= 127), and
+    // (clamped >= 0, so the initial bytes land in [0, REBASE_KEEP] <= 254), and
     // here we set B[l] = B0[l] so the stored bytes still mean (H_absolute - B).
     //
     // SAFETY (identical argument to the mid-DP re-baseline): the gap-prefix
@@ -4766,12 +4780,13 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
         // so the two agree on B0; smithWaterman128_8 recomputes B0 via
         // bsw8_initial_floor(p[].h0, zdrop).
         const int REBASE_KEEP_W = bsw8_rebase_keep(zdrop);
-        // The h0-prefix column/row seed below uses SIGNED int8 ops, so the seeded
-        // byte min(h0, REBASE_KEEP_W) must stay <= 127 (signed-positive). The
-        // routing gate (bsw8_envelope_ok) enforces zdrop <= 126; assert for any
-        // direct caller that bypasses the gate.
-        assert(REBASE_KEEP_W <= 127 &&
-               "8-bit h0-prefix seed is signed int8; REBASE_KEEP>127 (zdrop>126) -> route to 16-bit");
+        // The h0-prefix column/row seed below is unsigned-saturating [0,255], so
+        // the seeded byte min(h0, REBASE_KEEP_W) only needs to fit a uint8. The
+        // routing gate (bsw8_envelope_ok) enforces zdrop + maxStep <= 253 (so the
+        // re-baseline window REBASE_HI = 255 - maxStep > REBASE_KEEP holds);
+        // assert the byte bound for any direct caller that bypasses the gate.
+        assert(REBASE_KEEP_W <= 255 &&
+               "8-bit h0-prefix seed byte min(h0,REBASE_KEEP) must fit uint8 (zdrop<=254)");
 
         int nstart = 0, nend = numPairs;
         
@@ -4797,6 +4812,11 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                     int h0p = sp.h0;
                     if (h0p > REBASE_KEEP_W) h0p = REBASE_KEEP_W;
                     if (h0p < 0) h0p = 0;
+                    // Always-on uint8 guard (asserts are compiled out in release):
+                    // a direct caller that bypasses the gate with zdrop > 254 would
+                    // otherwise truncate the seed byte. In-envelope REBASE_KEEP_W <= 253,
+                    // so this never fires on the production path.
+                    if (h0p > 255) h0p = 255;
                     h0[j] = (uint8_t) h0p;
                 }
                 seq1 = seqBufRef + (int64_t)sp.idr;
@@ -4859,19 +4879,17 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
             }
 //------------------------
             _mm_store_si128((__m128i *) H1, h0_128);
-            __m128i cmp128 = _mm_cmpgt_epi8(h0_128, oe_ins128);
-            tmp128 = _mm_sub_epi8(h0_128, oe_ins128);
-
-            tmp128 = _mm_blendv_epi8(zero128, tmp128, cmp128);
+            // h0-prefix insertion seed, unsigned-saturating [0,255]:
+            // H1[1] = max(0, h0' - oe_ins), then -e_ins per step. The first gap
+            // was the last signed island here (cmpgt_epi8 + sub_epi8 + blendv);
+            // the extension loop already used subs_epu8.
+            tmp128 = _mm_subs_epu8(h0_128, oe_ins128);
             _mm_store_si128((__m128i *) (H1 + SIMD_WIDTH8), tmp128);
             for(k = 2; k < maxLen2; k++)
             {
-                // __m128i h1_128 = _mm_load_si128((__m128i *) (H1 + (k-1) * SIMD_WIDTH8));
-                __m128i h1_128 = tmp128;
-                tmp128 = _mm_subs_epu8(h1_128, e_ins128);   // modif
-                // tmp128 = _mm_max_epi8(tmp128, zero128);
+                tmp128 = _mm_subs_epu8(tmp128, e_ins128);
                 _mm_store_si128((__m128i *)(H1 + k*SIMD_WIDTH8), tmp128);
-            }           
+            }
 //------------------------
             uint8_t myband[SIMD_WIDTH8] __attribute__((aligned(64)));
             uint8_t temp[SIMD_WIDTH8] __attribute__((aligned(64)));
@@ -5019,10 +5037,10 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
     // The re-baseline machinery below is retained only as a safety net; pairs that
     // could exceed the envelope take the 16-bit path.
     // Precondition REBASE_HI > REBASE_KEEP (a non-empty window) holds for
-    // zdrop + maxStep <= 253; the routing gate enforces the tighter
-    // zdrop + maxStep <= 127 because the h0-prefix column/row seed (wrapper setup
-    // below) uses SIGNED int8 ops, so the seeded byte min(h0, REBASE_KEEP) must
-    // stay <= 127 (signed-positive).
+    // zdrop + maxStep <= 253, which is exactly what the routing gate enforces.
+    // The h0-prefix column/row seed (wrapper setup below) is unsigned-saturating
+    // [0,255] and imposes no tighter ceiling; it previously used signed int8 ops
+    // that required the seed byte <= 127 and capped zdrop at 126.
     int maxStep = (int)this->w_match;
     if ((int)this->w_ambig > maxStep) maxStep = (int)this->w_ambig;
     if (maxStep < 1) maxStep = 1;
@@ -5037,11 +5055,11 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
     // --- INITIAL SCORE FLOOR B0 (long-read 8-bit, seed score h0 >= 128) ---
     // The H arrays are seeded from the seed score h0 (H_v[0]=h0, then gap-
     // decremented down column 0 and across row 0). For a long-read seed h0 can
-    // be several hundred, which immediately overflows the signed-int8 byte
-    // state before any re-baseline event can fire. So we start each lane's
+    // be several hundred, which would overflow the unsigned [0,255] byte state
+    // before any re-baseline event can fire. So we start each lane's
     // running floor at B0[l] = max(0, h0 - REBASE_KEEP) instead of 0: the
     // wrapper seeds the H bytes from h0' = h0 - B0 = min(h0, REBASE_KEEP)
-    // (clamped >= 0, so the initial bytes land in [0, REBASE_KEEP] <= 127), and
+    // (clamped >= 0, so the initial bytes land in [0, REBASE_KEEP] <= 254), and
     // here we set B[l] = B0[l] so the stored bytes still mean (H_absolute - B).
     //
     // SAFETY (identical argument to the mid-DP re-baseline): the gap-prefix

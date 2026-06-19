@@ -114,13 +114,12 @@ KSORT_INIT(mem_intv1, SMEM, intv_lt1)  // debug
  *     as a diagonal offset d = j - i in [-w, +w], which fits signed int8
  *     only for w <= 127. The default opt->w = 100 qualifies; wide-band
  *     retries (w doubling to 200/400/800) do NOT and fall back to 16-bit.
- *   - zdrop + maxStep <= 127      : keeps REBASE_KEEP = zdrop + 1 <= 127. The DP
- *     body is unsigned [0,255], but the h0-prefix column/row seed in the kernel
- *     wrappers (smithWaterman*_8 setup) still uses SIGNED int8 ops, so the seeded
- *     byte h0' = min(h0, REBASE_KEEP) must stay <= 127 (signed-positive). maxStep
- *     is the largest per-step score increment, max(w_match, w_ambig, 1) =
- *     max(opt->a, 1). (This also keeps the re-baseline window non-empty:
- *     REBASE_HI = 255 - maxStep > REBASE_KEEP.)
+ *   - zdrop + maxStep <= 253      : keeps the re-baseline window non-empty,
+ *     REBASE_HI = 255 - maxStep > REBASE_KEEP = zdrop + 1. The DP body AND the
+ *     h0-prefix column/row seed (smithWaterman*_8 setup) are both unsigned-
+ *     saturating [0,255], so the seeded byte h0' = min(h0, REBASE_KEEP) only
+ *     needs to fit a uint8. maxStep is the largest per-step score increment,
+ *     max(w_match, w_ambig, 1) = max(opt->a, 1).
  *   - h0 <= zdrop + 1             : keeps the initial floor B0 = max(0, h0 -
  *     REBASE_KEEP) == 0, so the seed score does not itself force a re-baseline.
  *   - h0 + min(len1,len2)*a < 255 - maxStep : the MAX ATTAINABLE score (seed
@@ -133,11 +132,12 @@ KSORT_INIT(mem_intv1, SMEM, intv_lt1)  // debug
  * decision. Pairs failing this envelope fall through to the existing 16-bit
  * (then scalar) buckets exactly as before. */
 #define BSW8_MAX_W 127                 /* max band: diagonal offset d=j-i must fit signed int8 */
-#define BSW8_MAX_ZDROP_STEP 127        /* keep REBASE_KEEP=zdrop+1 <= 127: the h0-prefix
-                                          column/row seed in the 8-bit wrappers uses SIGNED
-                                          int8 ops, so the seeded byte min(h0,REBASE_KEEP) must
-                                          stay signed-positive (<=127). Also keeps the re-baseline
-                                          window non-empty (REBASE_HI=255-max_step > REBASE_KEEP).
+#define BSW8_MAX_ZDROP_STEP 253        /* keep the re-baseline window non-empty:
+                                          REBASE_HI=255-max_step > REBASE_KEEP=zdrop+1, i.e.
+                                          zdrop+max_step <= 253. The DP body AND the h0-prefix
+                                          column/row seed in the 8-bit wrappers are both
+                                          unsigned-saturating [0,255], so the seed byte
+                                          min(h0,REBASE_KEEP) just needs to fit a uint8.
                                           See smithWaterman128_8 re-baseline + h0-prefix seed. */
 
 static inline int bsw8_envelope_ok(int len1, int len2, int w,
