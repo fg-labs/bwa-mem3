@@ -1206,12 +1206,11 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
 
             __m256i bmaxRS = maxRS1;
             maxRS1 =_mm256_max_epu8(maxRS1, h11);
-            // UNSIGNED >: maxRS1 = max_epu8(.,h11) >= bmaxRS always, so
-            // (maxRS1 >u bmaxRS) == (maxRS1 != bmaxRS). Signed cmpgt_epi8 here
-            // mis-read scores >127 (long reads) as negative.
-            __m256i cmpA = _mm256_xor_si256(_mm256_cmpeq_epi8(maxRS1, bmaxRS), ff256);
-            __m256i cmpB =_mm256_cmpeq_epi8(maxRS1, h11);
-            cmpA = _mm256_or_si256(cmpA, cmpB);
+            // "new row-max" argmax mask. maxRS1 = max(bmaxRS,h11), so
+            // (maxRS1 != bmaxRS) is a strict subset of (maxRS1 == h11) (both
+            // mean h11 >= bmaxRS); the OR was redundant. cmpeq(maxRS1,h11) is
+            // the exact combined mask — bit-identical, drops a cmpeq+xor+or.
+            __m256i cmpA = _mm256_cmpeq_epi8(maxRS1, h11);
             cmp1 = _mm256_cmpgt_epi8(j256, tail256);
             cmp1 = _mm256_or_si256(cmp1, cmp2);
             cmpA = _mm256_blendv_epi8(y1_256, j256, cmpA);
@@ -2030,11 +2029,13 @@ void BandedPairWiseSW::smithWaterman256_16(uint16_t seq1SoA[],
             h10 = _mm256_andnot_si256(cmp1, h10);
             f21 = _mm256_andnot_si256(cmp1, f21);
             
-            __m256i bmaxRS = maxRS1;                                        
-            maxRS1 =_mm256_max_epi16(maxRS1, h11);                          
-            __m256i cmpA = _mm256_cmpgt_epi16(maxRS1, bmaxRS);                  
-            __m256i cmpB =_mm256_cmpeq_epi16(maxRS1, h11);                  
-            cmpA = _mm256_or_si256(cmpA, cmpB);
+            __m256i bmaxRS = maxRS1;
+            maxRS1 =_mm256_max_epi16(maxRS1, h11);
+            // "new row-max" argmax mask. maxRS1 = max(bmaxRS,h11), so
+            // cmpgt(maxRS1,bmaxRS) is a strict subset of cmpeq(maxRS1,h11)
+            // (both mean h11 >= bmaxRS); the OR was redundant. cmpeq(maxRS1,h11)
+            // is the exact combined mask — bit-identical, drops a cmpgt+or.
+            __m256i cmpA = _mm256_cmpeq_epi16(maxRS1, h11);
             cmp1 = _mm256_cmpgt_epi16(j256, tail256); // change
             cmp1 = _mm256_or_si256(cmp1, cmp2);         // change
             cmpA = _mm256_blendv_epi16(y1_256, j256, cmpA);
