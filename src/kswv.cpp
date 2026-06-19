@@ -1255,10 +1255,6 @@ static inline __m256i avx2_widen_u8_hi(__m256i v)
 
 /* Signed 16-bit compares are provided directly by AVX2 (_mm256_cmpgt_epi16,
  * _mm256_cmpeq_epi16). No cmplt / cmpge; synthesize. */
-static inline __m256i avx2_cmplt_s16(__m256i a, __m256i b)
-{
-    return _mm256_cmpgt_epi16(b, a);
-}
 static inline __m256i avx2_cmpgt_s16(__m256i a, __m256i b)
 {
     return _mm256_cmpgt_epi16(a, b);

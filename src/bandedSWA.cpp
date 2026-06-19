@@ -338,45 +338,8 @@ void BandedPairWiseSW::scalarBandedSWAWrapper(SeqPair *seqPairArray,
 //------------------------------------------------------------------------------
 // MACROs
 // ------------------------ vec-8 ---------------------------------------------
-// ZSCORE8 is unused in smithWaterman256_8 (z-drop replaced by wide scalar);
-// retained here in case a future 256-bit tier reinstates it.
-#define ZSCORE8(i4_256, y4_256)                                         \
-    {                                                                   \
-        __m256i tmpi = _mm256_sub_epi8(i4_256, x256);                   \
-        __m256i tmpj = _mm256_sub_epi8(y4_256, y256);                   \
-        cmp = _mm256_cmpgt_epi8(tmpi, tmpj);                            \
-        score256 = _mm256_sub_epi8(maxScore256, maxRS1);                \
-        __m256i insdel = _mm256_blendv_epi8(e_ins256, e_del256, cmp);   \
-        __m256i sub_a256 = _mm256_sub_epi8(tmpi, tmpj);                 \
-        __m256i sub_b256 = _mm256_sub_epi8(tmpj, tmpi);                 \
-        tmp = _mm256_blendv_epi8(sub_b256, sub_a256, cmp);              \
-        tmp = _mm256_sub_epi8(score256, tmp);                           \
-        cmp = _mm256_cmpgt_epi8(tmp, zdrop256);                         \
-        exit0 = _mm256_blendv_epi8(exit0, zero256, cmp);                \
-    }
 
 
-#define MAIN_CODE8(s1, s2, h00, h11, e11, f11, f21, zero256,  maxScore256, e_ins256, oe_ins256, e_del256, oe_del256, y256, maxRS) \
-    {                                                                   \
-        __m256i cmp11 = _mm256_cmpeq_epi8(s1, s2);                      \
-        __m256i sbt11 = _mm256_blendv_epi8(mismatch256, match256, cmp11); \
-        __m256i tmp256 = _mm256_max_epu8(s1, s2);                       \
-        /*tmp256 = _mm256_cmpeq_epi8(tmp256, val102);*/                 \
-        sbt11 = _mm256_blendv_epi8(sbt11, w_ambig_256, tmp256);         \
-        __m256i m11 = _mm256_add_epi8(h00, sbt11);                      \
-        cmp11 = _mm256_cmpeq_epi8(h00, zero256);                        \
-        m11 = _mm256_blendv_epi8(m11, zero256, cmp11);                  \
-        h11 = _mm256_max_epi8(m11, e11);                                \
-        h11 = _mm256_max_epi8(h11, f11);                                \
-        __m256i temp256 = _mm256_sub_epi8(h11, oe_ins256);              \
-        __m256i val256  = _mm256_max_epi8(temp256, zero256);            \
-        e11 = _mm256_sub_epi8(e11, e_ins256);                           \
-        e11 = _mm256_max_epi8(val256, e11);                             \
-        temp256 = _mm256_sub_epi8(h11, oe_del256);                      \
-        val256  = _mm256_max_epi8(temp256, zero256);                    \
-        f21 = _mm256_sub_epi8(f11, e_del256);                           \
-        f21 = _mm256_max_epi8(val256, f21);                             \
-    }
 
 // ------------------------ vec 16 --------------------------------------------------
 #define _mm256_blendv_epi16(a,b,c)              \
@@ -399,26 +362,6 @@ void BandedPairWiseSW::scalarBandedSWAWrapper(SeqPair *seqPairArray,
     }
 
 
-#define MAIN_CODE16(s1, s2, h00, h11, e11, f11, f21, zero256,  maxScore256, e_ins256, oe_ins256, e_del256, oe_del256, y256, maxRS) \
-    {                                                                   \
-        __m256i cmp11 = _mm256_cmpeq_epi16(s1, s2);                     \
-        __m256i sbt11 = _mm256_blendv_epi16(mismatch256, match256, cmp11); \
-        __m256i tmp256 = _mm256_max_epu16(s1, s2);                      \
-        sbt11 = _mm256_blendv_epi16(sbt11, w_ambig_256, tmp256);        \
-        __m256i m11 = _mm256_add_epi16(h00, sbt11);                     \
-        cmp11 = _mm256_cmpeq_epi16(h00, zero256);                       \
-        m11 = _mm256_blendv_epi16(m11, zero256, cmp11);                 \
-        h11 = _mm256_max_epi16(m11, e11);                               \
-        h11 = _mm256_max_epi16(h11, f11);                               \
-        __m256i temp256 = _mm256_sub_epi16(h11, oe_ins256);             \
-        __m256i val256  = _mm256_max_epi16(temp256, zero256);           \
-        e11 = _mm256_sub_epi16(e11, e_ins256);                          \
-        e11 = _mm256_max_epi16(val256, e11);                            \
-        temp256 = _mm256_sub_epi16(h11, oe_del256);                     \
-        val256  = _mm256_max_epi16(temp256, zero256);                   \
-        f21 = _mm256_sub_epi16(f11, e_del256);                          \
-        f21 = _mm256_max_epi16(val256, f21);                            \
-    }
 
 // --- PR 17/16: AVX2 LUT primitive ---
 // pmat256 must have the 16-byte LUT broadcast into both 128-bit halves
@@ -888,11 +831,7 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
 {
     __m256i match256     = _mm256_set1_epi8(this->w_match);
     __m256i mismatch256  = _mm256_set1_epi8(this->w_mismatch);
-    __m256i gapOpen256   = _mm256_set1_epi8(this->w_open);
-    __m256i gapExtend256 = _mm256_set1_epi8(this->w_extend);
-    __m256i gapOE256     = _mm256_set1_epi8(this->w_open + this->w_extend);
     __m256i w_ambig_256  = _mm256_set1_epi8(this->w_ambig); // ambig penalty
-    __m256i five256      = _mm256_set1_epi8(5);
 
     // PR 16: pmat LUT, broadcast into both 128-bit halves (shuffle_epi8 is
     // lane-wise on AVX2 — each half shuffles against its own half of pmat256).
@@ -1835,11 +1774,7 @@ void BandedPairWiseSW::smithWaterman256_16(uint16_t seq1SoA[],
 {
     __m256i match256     = _mm256_set1_epi16(this->w_match);
     __m256i mismatch256  = _mm256_set1_epi16(this->w_mismatch);
-    __m256i gapOpen256   = _mm256_set1_epi16(this->w_open);
-    __m256i gapExtend256 = _mm256_set1_epi16(this->w_extend);
-    __m256i gapOE256     = _mm256_set1_epi16(this->w_open + this->w_extend);
     __m256i w_ambig_256  = _mm256_set1_epi16(this->w_ambig);    // ambig penalty
-    __m256i five256      = _mm256_set1_epi16(5);
 
     __m256i e_del256    = _mm256_set1_epi16(this->e_del);
     __m256i oe_del256   = _mm256_set1_epi16(this->o_del + this->e_del);
