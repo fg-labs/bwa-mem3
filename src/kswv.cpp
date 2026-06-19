@@ -501,8 +501,8 @@ int kswv::kswv_neon_u8(uint8_t seq1SoA[],
             uint16_t msk16 = neon_movemask_u8(cmp_gt);
             msk16 |= mask16;
 
-            /* Apply masks */
-            uint8x16_t msk_vec = vld1q_u8((uint8_t*)&msk16); // simplified
+            /* Zero out lanes that set a new row max (cmp_gt) in the stored
+             * pimax before writing it back. */
             pimax_vec = vbslq_u8(cmp_gt, zero_vec, pimax_vec);
 
             vst1q_u8(rowMax + (i - 1) * SIMD_WIDTH8, pimax_vec);
