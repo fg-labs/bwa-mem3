@@ -1431,6 +1431,11 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
         // lane. Done AFTER band narrowing so this row's trim matches the 16-bit
         // reference; the next row reads the lowered values consistently.
         {
+            /* Fast path: one vector test for "any lane >= REBASE_HI?" — see the
+             * 128-bit kernel. Under the routing envelope this is ~always false, so
+             * the per-lane scalar scan + maxRS1 store below are skipped each row. */
+            __m256i hi256 = _mm256_set1_epi8((int8_t) REBASE_HI);
+            if (_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_subs_epu8(hi256, maxRS1), zero256))) {
             uint8_t rs_b[SIMD_WIDTH8] __attribute((aligned(32)));
             _mm256_store_si256((__m256i *) rs_b, maxRS1);
             int8_t  delta_a[SIMD_WIDTH8] __attribute((aligned(32)));
@@ -1484,6 +1489,7 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
                 // (gbest_abs, absolute units) in the epilogue, immune to this
                 // re-baseline subtract.
             }
+            }   /* end "any lane >= REBASE_HI" fast-path guard */
         }
 
 #if RDT
@@ -3323,6 +3329,10 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
         // lane. Done AFTER band narrowing so this row's trim matches the 16-bit
         // reference; the next row reads the lowered values consistently.
         {
+            /* Fast path: one vector test for "any lane >= REBASE_HI?" — see the
+             * 128-bit kernel. Under the routing envelope this is ~always false, so
+             * the per-lane scalar scan + maxRS1 store below are skipped each row. */
+            if (_mm512_cmpge_epu8_mask(maxRS1, _mm512_set1_epi8((int8_t) REBASE_HI))) {
             uint8_t rs_b[SIMD_WIDTH8] __attribute((aligned(64)));
             _mm512_store_si512((__m512i *) rs_b, maxRS1);
             int8_t  delta_a[SIMD_WIDTH8] __attribute((aligned(64)));
@@ -3376,6 +3386,7 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
                 // (gbest_abs, absolute units) in the epilogue, immune to this
                 // re-baseline subtract.
             }
+            }   /* end "any lane >= REBASE_HI" fast-path guard */
         }
 
 #if RDT
@@ -5956,6 +5967,13 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
         // lane. Done AFTER band narrowing so this row's trim matches the 16-bit
         // reference; the next row reads the lowered values consistently.
         {
+            /* Fast path: one vector test for "any lane >= REBASE_HI?". Under the
+             * routing envelope no admitted pair ever reaches REBASE_HI (the gate
+             * keeps the max attainable score below it), so this is ~always false and
+             * the per-lane scalar scan + maxRS1 store below are skipped each row.
+             * Unsigned >=: subs_epu8(REBASE_HI, maxRS1)==0 iff maxRS1 >= REBASE_HI. */
+            __m128i hi128 = _mm_set1_epi8((int8_t) REBASE_HI);
+            if (_mm_movemask_epi8(_mm_cmpeq_epi8(_mm_subs_epu8(hi128, maxRS1), zero128))) {
             uint8_t rs_b[SIMD_WIDTH8] __attribute((aligned(16)));
             _mm_store_si128((__m128i *) rs_b, maxRS1);
             int8_t  delta_a[SIMD_WIDTH8] __attribute((aligned(16)));
@@ -6009,6 +6027,7 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
                 // (gbest_abs, in absolute units) in the epilogue, so it is immune
                 // to this re-baseline subtract.
             }
+            }   /* end "any lane >= REBASE_HI" fast-path guard */
         }
 
 #if RDT
