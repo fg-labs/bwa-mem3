@@ -407,7 +407,7 @@ ifneq ($(strip $(DISABLE_BATCHED_MATESW)),)
     CPPFLAGS += -DDISABLE_BATCHED_MATESW=$(DISABLE_BATCHED_MATESW)
 endif
 
-.PHONY:all myall arm64 clean depend single all-single print-mimalloc-config kswv_nrow_zero_test shm_section_find_test shm_pack_round_trip_test shm_lock_destroy_test test test-injection FORCE pgo-generate pgo-use pgo-clean profile-build profile-clean lto-build lto-clean docs docs-serve docs-cli docs-clean docs-install-tools
+.PHONY:all myall arm64 clean depend single all-single print-mimalloc-config kswv_nrow_zero_test bandedswa_padding_test shm_section_find_test shm_pack_round_trip_test shm_lock_destroy_test test test-injection FORCE pgo-generate pgo-use pgo-clean profile-build profile-clean lto-build lto-clean docs docs-serve docs-cli docs-clean docs-install-tools
 .SUFFIXES:.cpp .o
 
 .cpp.o:
@@ -520,6 +520,21 @@ src/kswv.native.o: src/kswv.cpp
 kswv_nrow_zero_test: $(BWA_LIB) $(HTS_LIB) src/kswv.native.o test/kswv_nrow_zero_test.o
 	$(CXX) $(BASE_CXXFLAGS) -march=native $(LDFLAGS) test/kswv_nrow_zero_test.o src/kswv.native.o $(BWA_LIB) $(LIBS) -o $@
 
+# Native-tier copy of bandedSWA.cpp, linked ahead of libbwa.a for the same
+# reason as src/kswv.native.o: on x86 multi-tier builds libbwa.a's baseline
+# bandedSWA.o is compiled at BASELINE_ARCH (avx2), which lacks the 512-wide
+# wrappers; the native copy guarantees the host's widest getScores8/16 (and
+# their PFD8/PFD16 prefetch sites) are the ones the padding test exercises.
+# On arm64 -march=native resolves to the NEON baseline already.
+src/bandedSWA.native.o: src/bandedSWA.cpp
+	$(CXX) -c $(BASE_CXXFLAGS) -march=native $(CPPFLAGS) $(INCLUDES) $< -o $@
+
+# getScores8/16 padding-lane / prefetch contract regression. Meaningful under
+# ASan (`make ASAN=1 bandedswa_padding_test`): a tight-allocation caller that
+# over-reads the SeqPair array aborts; the bounded prefetch runs clean.
+bandedswa_padding_test: $(BWA_LIB) $(HTS_LIB) src/bandedSWA.native.o test/bandedswa_padding_test.o
+	$(CXX) $(BASE_CXXFLAGS) -march=native $(LDFLAGS) test/bandedswa_padding_test.o src/bandedSWA.native.o $(BWA_LIB) $(LIBS) -o $@
+
 # Build the test binaries with the same ARCH_FLAGS as libbwa.a so the
 # test binary's kswv.h preprocessor state (SIMD_WIDTH8, BWA_TESTS_HAVE_KSWV)
 # matches what libbwa.a was compiled with. Consumed by ci.yml so that e.g.
@@ -584,10 +599,11 @@ test/shm_pack_round_trip_test.o: test/shm_pack_round_trip_test.cpp
 # Note: depends on `bwa-mem3` so version_banner.sh has a binary to grep —
 # previously `test:` only built the test harness binaries, not the main
 # executable.
-test: test-binaries kswv_nrow_zero_test shm_section_find_test shm_lock_destroy_test bwa-mem3
+test: test-binaries kswv_nrow_zero_test bandedswa_padding_test shm_section_find_test shm_lock_destroy_test bwa-mem3
 	./test/bwa_mem3_tests_unit
 	./test/bwa_mem3_tests_integration
 	./kswv_nrow_zero_test
+	./bandedswa_padding_test
 	./shm_section_find_test
 	./shm_lock_destroy_test
 	BWA_MEM3=./bwa-mem3 ./test/regression/version_banner.sh
@@ -602,6 +618,9 @@ test-injection: bwa-mem3
 		./test/regression/host_floor_enforce.sh
 
 test/kswv_nrow_zero_test.o: test/kswv_nrow_zero_test.cpp
+	$(CXX) -c $(BASE_CXXFLAGS) -march=native $(CPPFLAGS) $(INCLUDES) $< -o $@
+
+test/bandedswa_padding_test.o: test/bandedswa_padding_test.cpp
 	$(CXX) -c $(BASE_CXXFLAGS) -march=native $(CPPFLAGS) $(INCLUDES) $< -o $@
 
 test/shm_section_find_test.o: test/shm_section_find_test.cpp
@@ -676,7 +695,7 @@ $(MIMALLOC_LIB):
 	cd $(MIMALLOC_BUILD) && cmake $(MIMALLOC_CMAKE_FLAGS) .. && $(MAKE)
 
 clean: pgo-clean profile-clean lto-clean
-	rm -fr src/*.o src/version.h test/*.o $(BWA_LIB) $(EXE) kswv_nrow_zero_test shm_section_find_test shm_pack_round_trip_test shm_lock_destroy_test bwa-mem3.arm64
+	rm -fr src/*.o src/version.h test/*.o $(BWA_LIB) $(EXE) kswv_nrow_zero_test bandedswa_padding_test shm_section_find_test shm_pack_round_trip_test shm_lock_destroy_test bwa-mem3.arm64
 	rm -f $(LIBSAIS_OBJS)
 	rm -f src/*.gcno src/*.gcda
 	$(MAKE) -C test clean

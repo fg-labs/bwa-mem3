@@ -506,3 +506,14 @@ jobs:
           make ASAN=1 arch="$MAKE_ARCH" CXX="ccache g++" CC="ccache gcc" kswv_nrow_zero_test
           ./kswv_nrow_zero_test
           ccache --show-stats | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Build + run bandedswa_padding_test (ASan)
+        # issue 146: getScores8/16 prefetch-read pairArray[i+j+PFD] past a
+        # caller's minimal roundup(numPairs, SIMD_WIDTH) allocation. Under ASan
+        # a tight-allocation caller trips heap-buffer-overflow; the bounded
+        # prefetch runs clean. `make clean` forces full recompile under asan.
+        run: |
+          make clean
+          make ASAN=1 arch="$MAKE_ARCH" CXX="ccache g++" CC="ccache gcc" bandedswa_padding_test
+          ./bandedswa_padding_test
+          ccache --show-stats | tee -a "$GITHUB_STEP_SUMMARY"

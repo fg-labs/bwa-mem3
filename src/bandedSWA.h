@@ -191,6 +191,30 @@ public:
                                         int nthreads,
                                         int32_t w) = 0;
 
+    /* Batched banded Smith-Waterman over `numPairs` SeqPairs.
+     *
+     * PADDING-LANE CONTRACT (must be honored by every caller):
+     * the kernel rounds the batch up to a whole number of SIMD lanes
+     * (SIMD_WIDTH8 for getScores8, SIMD_WIDTH16 for getScores16 — tier
+     * dependent, up to 64) and *writes* the trailing padding lanes
+     * pairArray[numPairs .. roundup(numPairs, SIMD_WIDTH)) itself, setting
+     * their id and zeroing len1/len2/idr/idq. The caller MUST therefore allocate at
+     * least roundup(numPairs, SIMD_WIDTH) SeqPair slots, NOT just numPairs, or those
+     * writes (and the SoA gather that reads len1/len2 back) run off the end of
+     * the array. A caller that does not know the active tier should round up to
+     * the max lane count (64). The pipeline over-allocates and is safe; a
+     * direct caller that sized the array to exactly numPairs crashed on
+     * AVX2/AVX-512 — see the test helper BatchBuffers
+     * (test/framework/seqpair_batch.h), which allocates numPairs + SIMD_WIDTH8
+     * SeqPair slots and so satisfies this rule.
+     *
+     * Prefetch reads of pairArray[i+j+PFD] are bounded to < roundNumPairs, so
+     * the kernel never reads past the rounded-up region (no extra +PFD slack is
+     * required of the caller). Those bounded prefetches still touch the kernel's
+     * own padding lanes, reading back their idr/idq to form a prefetch address;
+     * the kernel zeroes idr/idq above so that read is well-defined and the
+     * resulting hint lands at seqBufRef/seqBufQer offset 0 (in-bounds) even when
+     * the caller left the padding slots uninitialized. */
     virtual void getScores8(SeqPair *pairArray,
                             uint8_t *seqBufRef,
                             uint8_t *seqBufQer,
@@ -198,6 +222,8 @@ public:
                             uint16_t numThreads,
                             int32_t w) = 0;
 
+    /* See getScores8 for the padding-lane / prefetch contract (identical, with
+     * SIMD_WIDTH16 lanes). */
     virtual void getScores16(SeqPair *pairArray,
                              uint8_t *seqBufRef,
                              uint8_t *seqBufQer,
