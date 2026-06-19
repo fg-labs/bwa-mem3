@@ -38,6 +38,13 @@ docker buildx build --platform linux/amd64,linux/arm64 \
   -t <registry>/<image>:<tag> --push .
 ```
 
+> **Building the arm64 layer with clang?** A recent `clang` produces faster
+> NEON code than `gcc` on aarch64 (see
+> [Best Practices → Build](build.md#use-a-recent-compiler-especially-on-arm)).
+> If you switch the arm64 build to clang, swap the OpenMP runtime: clang links
+> `libomp` (LLVM) rather than `libgomp`, so the runtime stage needs `libomp5`
+> (or `llvm-openmp`) in place of `libgomp1`.
+
 AWS Batch, GCP Batch, Kubernetes, and containerd all read the manifest list and pull the correct layer based on the host's architecture. The submitter references one tag; the runtime picks the right binary automatically.
 
 ## Verifying at runtime

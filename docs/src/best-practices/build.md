@@ -31,6 +31,36 @@ the non-kernel TU compile baseline with `BASELINE_ARCH=` (default
 See [SIMD dispatch matrix](../performance/simd-dispatch.md) for the full list
 of targets and which kernels each vectorizes.
 
+## Use a recent compiler (especially on ARM)
+
+Use the newest C++ compiler available, and on ARM/aarch64 prefer a recent
+`clang`. The compiler matters more on ARM than on x86: the aarch64 build runs
+its SIMD through the [sse2neon](../developer-guide/neon-port.md) translation
+layer rather than hand-written intrinsics, so codegen quality — and therefore
+throughput — depends heavily on the compiler **and its version**.
+
+Measured on AWS Graviton4 (`c8g.4xlarge`, 16 cores), hg38, 5M read pairs,
+`make arm64`, best-of-3 CPU-seconds:
+
+| Compiler | CPU-seconds | vs gcc 15.2 |
+|---|---:|---:|
+| gcc 15.2 | 1779 | — |
+| clang 22.1 | 1679 | ~6% faster |
+
+Two takeaways:
+
+- **clang generally emits better NEON than gcc** for sse2neon-translated code —
+  about 6% fewer CPU-seconds here.
+- **Compiler *version* matters as much as the vendor.** A larger ~18%
+  clang-over-gcc gap has been reported against an older gcc (~13); against a
+  modern gcc (15.2) it narrows to ~6%, because recent gcc closed most of the
+  NEON-codegen gap. Bumping the gcc version is often most of the win even
+  without switching to clang.
+
+If you build the arm64 binary with clang, note the OpenMP runtime changes from
+`libgomp` to `libomp` (`llvm-openmp`) — see
+[Multi-architecture deployment](multi-arch-deployment.md).
+
 ## Profile-Guided Optimization (PGO)
 
 PGO typically yields 3–5% throughput improvement on real workloads.  It is opt-in — the standard
@@ -99,6 +129,16 @@ make pgo-generate PGO_ARCH=avx2
 ./bwa-mem3.pgo-instr.avx2 mem -t 16 ref.fa R1.fq.gz R2.fq.gz > /dev/null
 make pgo-use PGO_ARCH=avx2
 # Deploy: bwa-mem3.pgo.avx2
+```
+
+On ARM/aarch64 (Apple Silicon, AWS Graviton), build with a recent `clang` and
+apply PGO on top:
+
+```bash
+make pgo-generate PGO_ARCH=arm64 CXX=clang++
+./bwa-mem3.pgo-instr mem -t 16 ref.fa R1.fq.gz R2.fq.gz > /dev/null
+make pgo-use PGO_ARCH=arm64 CXX=clang++
+# Deploy: bwa-mem3.pgo
 ```
 
 ---
