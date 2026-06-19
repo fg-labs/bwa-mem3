@@ -81,6 +81,13 @@ LINES="$(wc -l < "$FKSW" | tr -d ' ')"
 [[ "$LINES" -eq 3 ]] || fail "xeonbsw: expected 3 lines in fksw.txt, got $LINES"
 ok "xeonbsw ($LINES pair scores emitted)"
 
+# --- bandedswa_zdrop_eweight_test (z-drop gap-extend weighting parity) ------
+# Self-contained: generates tandem-repeat fixtures and compares getScores8 to
+# the scalar oracle at non-default gap-extend (e_del/e_ins != 1). Exits non-zero
+# on any score-field mismatch.
+(cd "$HERE" && ./bandedswa_zdrop_eweight_test >/dev/null 2>&1) || fail "bandedswa_zdrop_eweight_test (z-drop e_del/e_ins weighting)"
+ok "bandedswa_zdrop_eweight_test (z-drop gap-extend weighting parity)"
+
 # --- pg_cl_escape_test ----------------------------------------------------
 # Regression for issue #45 / upstream #293: tabs inside `-R` must not
 # bleed into the @PG CL: value. Uses the same phiX fixture as the rest
