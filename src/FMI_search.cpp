@@ -858,7 +858,9 @@ void FMI_search::getSMEMsAllPosOneThread(uint8_t *enc_qdb,
                                          SMEM *matchArray,
                                          int64_t *__numTotalSmem)
 {
-    int32_t *query_pos_array = (int32_t *)_mm_malloc(numReads * sizeof(int32_t), 64);
+    size_t query_pos_bytes = (size_t)numReads * sizeof(int32_t);
+    int32_t *query_pos_array = (int32_t *)_mm_malloc(query_pos_bytes, 64);
+    assert_not_null(query_pos_array, query_pos_bytes, query_pos_bytes);
 
     int32_t i;
     for(i = 0; i < numReads; i++)
@@ -1591,8 +1593,16 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
 {
     
     // uint32_t i;
-    int32_t totalCoordCount = 0;
-    int32_t mem_lim = 0, id = 0;
+    // totalCoordCount and id (below) both count entries staged into the int64
+    // coordArray/pos_ar/map_ar buffers and are paired with the int64 mem_lim,
+    // so keep them int64 to avoid truncating the running offset.
+    int64_t totalCoordCount = 0;
+    // mem_lim sums the (uncapped) SA-interval sizes smem.s, which for a highly
+    // repetitive seed can approach the genome length and overflow int32 on its
+    // own. A wrapped value undersizes the pos_ar/map_ar allocation below and
+    // corrupts the heap, so accumulate in int64. id indexes those buffers and
+    // is paired with mem_lim, so widen it too.
+    int64_t mem_lim = 0, id = 0;
     
     for(int i = 0; i < count; i++)
     {
@@ -1601,8 +1611,11 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
         mem_lim += smem.s;
     }
 
-    int64_t *pos_ar = (int64_t *) _mm_malloc( mem_lim * sizeof(int64_t), 64);
-    int64_t *map_ar = (int64_t *) _mm_malloc( mem_lim * sizeof(int64_t), 64);
+    size_t sa_ar_bytes = (size_t)mem_lim * sizeof(int64_t);
+    int64_t *pos_ar = (int64_t *) _mm_malloc( sa_ar_bytes, 64);
+    assert_not_null(pos_ar, sa_ar_bytes, sa_ar_bytes);
+    int64_t *map_ar = (int64_t *) _mm_malloc( sa_ar_bytes, 64);
+    assert_not_null(map_ar, sa_ar_bytes, (size_t)2 * sa_ar_bytes);
 
     for(int i = 0; i < count; i++)
     {
@@ -1650,7 +1663,9 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
         j++;
     }
         
-    int lim = j, all_quit = 0;
+    // all_quit counts up to id (int64); lim stays int (bounded by sa_batch_size).
+    int lim = j;
+    int64_t all_quit = 0;
     while (all_quit < id)
     {
         
