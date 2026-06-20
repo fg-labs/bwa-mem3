@@ -1,7 +1,7 @@
-/* Adapter: kseq parser over a fast_reader, producing bseq1_t chunks with the
- * exact contract of bseq_read_orig (same chunking, parity, trim, per-field
- * allocation). Kept in its own translation unit because kseq.h can only be
- * instantiated for one handle type per TU. */
+/* Adapter: fr_fastq parser over a fast_reader, producing bseq1_t chunks with
+ * the exact contract of bseq_read_orig (same chunking, parity, trim, per-field
+ * allocation) — byte-identical to the former kseq path. The handle names below
+ * are kept for the pipeline call sites; the opaque handle is an fr_fastq_t*. */
 #ifndef FAST_READER_BSEQ_H
 #define FAST_READER_BSEQ_H
 
@@ -12,18 +12,17 @@
 extern "C" {
 #endif
 
-/* Create a kseq bound to an already-open fast_reader, returned as an opaque
- * kseq_t*. `fr` must be non-NULL and outlive the returned handle (the kseq
+/* Create a parser bound to an already-open fast_reader, returned as an opaque
+ * handle. `fr` must be non-NULL and outlive the returned handle (the parser
  * borrows it; it does not take ownership and fast_kseq_destroy does NOT close
- * the underlying fast_reader). Returns the handle; never returns NULL on the
- * caller-visible path (the underlying kseq_init allocates with calloc and the
- * fast_reader is assumed valid). */
+ * the underlying fast_reader). Never returns NULL on the caller-visible path
+ * (it aborts on allocation failure). */
 void *fast_kseq_init(fast_reader_t *fr);
 
-/* Destroy a handle from fast_kseq_init. `ks` may be NULL (no-op). Frees only
- * the kseq buffers; the caller still owns and must close the fast_reader the
+/* Destroy a handle from fast_kseq_init. `p` may be NULL (no-op). Frees only the
+ * parser buffers; the caller still owns and must close the fast_reader the
  * handle was bound to. */
-void  fast_kseq_destroy(void *ks);
+void  fast_kseq_destroy(void *p);
 
 /* Mirror of bseq_read_orig, reading from fast_reader-backed kseq handles.
  * Reads up to ~chunk_size bytes of sequence (cut on an even record boundary)

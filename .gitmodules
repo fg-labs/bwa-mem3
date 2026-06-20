@@ -10,3 +10,6 @@
 [submodule "ext/libsais"]
 	path = ext/libsais
 	url = https://github.com/IlyaGrebnov/libsais.git
+[submodule "ext/zlib-ng"]
+	path = ext/zlib-ng
+	url = https://github.com/zlib-ng/zlib-ng.git

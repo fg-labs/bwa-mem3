@@ -181,15 +181,54 @@ ifeq ($(USE_MIMALLOC),1)
     INCLUDES += -Iext/mimalloc/include
 endif
 
-# libdeflate: used directly by src/fast_reader.c for BGZF block decode (the
-# vanilla-gzip path stays on zlib). htslib already links -ldeflate
-# transitively; we add the <libdeflate.h> include path here. On macOS it
-# lives under the Homebrew prefix, resolved dynamically (mirrors the libomp
-# prefix detection below) so the build works on both Apple Silicon
-# (/opt/homebrew) and Intel (/usr/local) hosts rather than hardcoding one.
+# libdeflate: used directly by src/fast_reader.c for BGZF block decode. htslib
+# already links -ldeflate transitively; we add the <libdeflate.h> include path
+# here. On macOS it lives under the Homebrew prefix, resolved dynamically
+# (mirrors the libomp prefix detection below) so the build works on both Apple
+# Silicon (/opt/homebrew) and Intel (/usr/local) hosts rather than hardcoding one.
 ifeq ($(UNAME_S),Darwin)
     LIBDEFLATE_PREFIX ?= $(shell brew --prefix libdeflate 2>/dev/null)
     INCLUDES += -I$(LIBDEFLATE_PREFIX)/include
+endif
+
+# zlib-ng: src/fast_reader.c uses its native (zng_*) streaming inflate for the
+# plain-gzip path (SIMD, ~2.3x stock zlib on both x86 and arm64). The native API
+# (zng_* symbols, <zlib-ng.h>) => no symbol clash with the system zlib that
+# htslib / the legacy gzFile reader still use.
+#
+# Vendored under ext/zlib-ng (git submodule, pinned to a zlib-ng release) and
+# built as a static archive (libz-ng.a with zng_* symbols) via its own CMake
+# system -- the same integration pattern as ext/mimalloc -- so the Batch/CI
+# fleet does NOT depend on a host zlib-ng package. ZLIB_COMPAT=OFF keeps the
+# zng_* names; BUILD_SHARED_LIBS=OFF yields the static archive.
+#
+# ZLIBNG_USE_VENDORED=1 (default) builds and links the vendored copy. Set it to
+# 0 to fall back to a host-installed zlib-ng (Homebrew on macOS, system package
+# on Linux) -- handy for dev hosts that already have it, mirroring how libdeflate
+# is resolved on macOS.
+ZLIBNG_USE_VENDORED ?= 1
+
+ZLIBNG_SRC   = ext/zlib-ng
+ZLIBNG_BUILD = $(ZLIBNG_SRC)/build
+ZLIBNG_LIB   = $(ZLIBNG_BUILD)/libz-ng.a
+# Static, native (non-zlib-compat) build with tests off. Matches mimalloc's
+# CMAKE_BUILD_TYPE=Release static integration.
+# ZLIB_ENABLE_TESTS=OFF skips the example/infcover/etc. test executables;
+# ZLIBNG_ENABLE_TESTS / WITH_GTEST turn off the API + gtest suites. We only
+# need libz-ng.a and the generated headers.
+ZLIBNG_CMAKE_FLAGS = -DZLIB_COMPAT=OFF -DBUILD_SHARED_LIBS=OFF \
+                     -DZLIB_ENABLE_TESTS=OFF -DZLIBNG_ENABLE_TESTS=OFF \
+                     -DWITH_GTEST=OFF \
+                     -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+
+ifeq ($(ZLIBNG_USE_VENDORED),1)
+    # zlib-ng.h ships in the source root and #includes zconf-ng.h /
+    # zlib_name_mangling-ng.h, which CMake GENERATES into the build dir -- so
+    # both paths are needed on the include line.
+    INCLUDES += -I$(ZLIBNG_SRC) -I$(ZLIBNG_BUILD)
+else ifeq ($(UNAME_S),Darwin)
+    ZLIBNG_PREFIX ?= $(shell brew --prefix zlib-ng 2>/dev/null)
+    INCLUDES += -I$(ZLIBNG_PREFIX)/include
 endif
 
 # libsais (pinned in ext/libsais; see submodule SHA): linear-time suffix
@@ -229,6 +268,15 @@ ifeq ($(UNAME_S),Darwin)
 else
     LIBS += -ldeflate
 endif
+# zlib-ng: direct dependency of src/fast_reader.c (streaming plain-gzip inflate).
+# Vendored static archive by default; host package as an opt-out fallback.
+ifeq ($(ZLIBNG_USE_VENDORED),1)
+    LIBS += $(ZLIBNG_LIB)
+else ifeq ($(UNAME_S),Darwin)
+    LIBS += -L$(ZLIBNG_PREFIX)/lib -lz-ng
+else
+    LIBS += -lz-ng
+endif
 # Pull in htslib's transitive deps (-ldeflate when libdeflate is detected,
 # bzlib / lzma / curl when those features are enabled) from the generated
 # htslib_static.mk -- the same mechanism samtools uses (samtools'
@@ -261,7 +309,7 @@ OBJS=		src/fastmap.o src/bwtindex.o src/utils.o src/kthread.o \
 			src/packed_text.o src/fm_index_writer.o src/index_prelude.o \
 			src/system.o src/libsais_build.o \
 			src/bwa_shm.o src/simd_dispatch.o \
-			src/fast_reader.o src/fast_reader_bseq.o src/stage_prof.o
+			src/fast_reader.o src/fast_reader_bseq.o src/fr_fastq.o src/stage_prof.o
 
 # Kernel TUs (bandedSWA, kswv, ksw, sam_encode) are compiled per-tier on x86
 # and linked directly via KERNEL_TIER_OBJS_LINK. The dispatch wrappers in
@@ -477,7 +525,7 @@ BASELINE_ARCH ?= avx2
 # tier; the dispatcher picks the right per-tier subclass at runtime.
 # Replaces the `multi` target's 5 sequential clean rebuilds + execv launcher.
 .PHONY: single
-single: $(if $(filter 1,$(USE_MIMALLOC)),$(MIMALLOC_LIB))
+single: $(if $(filter 1,$(USE_MIMALLOC)),$(MIMALLOC_LIB)) $(if $(filter 1,$(ZLIBNG_USE_VENDORED)),$(ZLIBNG_LIB))
 ifneq ($(IS_ARM),)
 	@echo "ARM64 detected - building single arm64 binary instead of multi-tier"
 	$(MAKE) arm64
@@ -488,7 +536,7 @@ endif
 # Internal: builds the single binary with the BASELINE_ARCH tier for
 # non-kernel TUs and links all KERNEL_TIER_OBJS_LINK on top.
 .PHONY: all-single
-all-single: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) $(KERNEL_TIER_OBJS_LINK) src/main.o
+all-single: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) $(if $(filter 1,$(ZLIBNG_USE_VENDORED)),$(ZLIBNG_LIB)) $(KERNEL_TIER_OBJS_LINK) src/main.o
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) src/main.o $(KERNEL_TIER_OBJS_LINK) $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) $(MIMALLOC_LDFLAGS) -o $(EXE)
 
 # ARM64/Apple Silicon build target - single binary, no multi-binary launcher needed
@@ -498,7 +546,7 @@ arm64:
 	ln -sf bwa-mem3.arm64 bwa-mem3
 
 
-$(EXE):$(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) $(if $(filter 1,$(USE_MIMALLOC)),$(MIMALLOC_LIB)) src/main.o
+$(EXE):$(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) $(if $(filter 1,$(USE_MIMALLOC)),$(MIMALLOC_LIB)) $(if $(filter 1,$(ZLIBNG_USE_VENDORED)),$(ZLIBNG_LIB)) src/main.o
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) src/main.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) $(MIMALLOC_LDFLAGS) -o $@
 
 # Regression test for issue 38 / upstream PR 289: exercises an all-len1==0
@@ -571,10 +619,18 @@ shm_lock_destroy_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/shm_lock_destr
 # fast_reader is C (not C++); the implicit .c rule omits $(INCLUDES), so give
 # these objects explicit rules carrying the project include paths (incl.
 # libdeflate) and preprocessor defines.
-src/fast_reader.o: src/fast_reader.c src/fast_reader.h
+# fast_reader.c #includes <zlib-ng.h>, which pulls the CMake-generated
+# zconf-ng.h / zlib_name_mangling-ng.h from the vendored build dir, so the
+# vendored archive (which generates those headers as a side effect) must be
+# built first. Gated on ZLIBNG_USE_VENDORED so the host-package fallback build
+# doesn't try to build the submodule.
+src/fast_reader.o: src/fast_reader.c src/fast_reader.h $(if $(filter 1,$(ZLIBNG_USE_VENDORED)),$(ZLIBNG_LIB))
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDES) -c -o $@ $<
 
-src/fast_reader_bseq.o: src/fast_reader_bseq.c src/fast_reader_bseq.h src/fast_reader.h
+src/fast_reader_bseq.o: src/fast_reader_bseq.c src/fast_reader_bseq.h src/fast_reader.h src/fr_fastq.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDES) -c -o $@ $<
+
+src/fr_fastq.o: src/fr_fastq.c src/fr_fastq.h src/fast_reader.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDES) -c -o $@ $<
 
 # Standalone stage_prof helper unit test (stats + clocks + NaN init). Links only
@@ -585,13 +641,39 @@ stage_prof_test: src/stage_prof.cpp src/stage_prof.h test/stage_prof_test.cpp
 
 # Standalone fast_reader correctness self-test (plain/gzip/multi-member/BGZF
 # round-trips). Links only zlib + libdeflate, so it needs no bwa-mem3 build.
+# Include / link flags shared by the standalone fast_reader test binaries.
+# zlib-ng resolution matches the main build: vendored static archive by default
+# (ext/zlib-ng build dir for the generated headers, libz-ng.a for the symbols),
+# host package as the opt-out fallback.
 FAST_READER_TEST_INC = -Isrc
+FAST_READER_TEST_LIB =
+ifeq ($(ZLIBNG_USE_VENDORED),1)
+    FAST_READER_TEST_INC += -I$(ZLIBNG_SRC) -I$(ZLIBNG_BUILD)
+    FAST_READER_TEST_ZLIBNG = $(ZLIBNG_LIB)
+    FAST_READER_TEST_DEP    = $(ZLIBNG_LIB)
+else
+    FAST_READER_TEST_ZLIBNG = -lz-ng
+endif
 ifeq ($(UNAME_S),Darwin)
     FAST_READER_TEST_INC += -I$(LIBDEFLATE_PREFIX)/include
-    FAST_READER_TEST_LIB = -L$(LIBDEFLATE_PREFIX)/lib
+    FAST_READER_TEST_LIB += -L$(LIBDEFLATE_PREFIX)/lib
+    ifneq ($(ZLIBNG_USE_VENDORED),1)
+        FAST_READER_TEST_INC += -I$(ZLIBNG_PREFIX)/include
+        FAST_READER_TEST_LIB += -L$(ZLIBNG_PREFIX)/lib
+    endif
 endif
-fast_reader_selftest: src/fast_reader.c test/fast_reader_selftest.c
-	$(CC) -O2 -Wall -Wextra $(FAST_READER_TEST_INC) test/fast_reader_selftest.c src/fast_reader.c $(FAST_READER_TEST_LIB) -lz -ldeflate -o $@
+fast_reader_selftest: src/fast_reader.c test/fast_reader_selftest.c $(FAST_READER_TEST_DEP)
+	$(CC) -O2 -Wall -Wextra $(FAST_READER_TEST_INC) test/fast_reader_selftest.c src/fast_reader.c $(FAST_READER_TEST_LIB) -lz $(FAST_READER_TEST_ZLIBNG) -ldeflate -o $@
+
+# Differential test: fr_fastq vs kseq, byte-identical record parsing. Links only
+# zlib + zlib-ng + libdeflate (kseq.h is header-only), so it needs no bwa-mem3 build.
+fr_fastq_diff_test: src/fr_fastq.c src/fast_reader.c test/fr_fastq_diff_test.c $(FAST_READER_TEST_DEP)
+	$(CC) -O2 -Wall -Wextra $(FAST_READER_TEST_INC) test/fr_fastq_diff_test.c src/fr_fastq.c src/fast_reader.c $(FAST_READER_TEST_LIB) -lz $(FAST_READER_TEST_ZLIBNG) -ldeflate -o $@
+
+# Read+parse microbenchmark: kseq vs fr_fastq on a real FASTQ (no index/align).
+# Usage: ./fr_fastq_bench {kseq|frfastq} reads.fq[.gz] [reps]
+fr_fastq_bench: src/fr_fastq.c src/fast_reader.c test/fr_fastq_bench.c $(FAST_READER_TEST_DEP)
+	$(CC) -O2 -Wall -Wextra $(FAST_READER_TEST_INC) test/fr_fastq_bench.c src/fr_fastq.c src/fast_reader.c $(FAST_READER_TEST_LIB) -lz $(FAST_READER_TEST_ZLIBNG) -ldeflate -o $@
 
 test/shm_pack_round_trip_test.o: test/shm_pack_round_trip_test.cpp
 
@@ -703,6 +785,19 @@ $(MIMALLOC_LIB):
 	mkdir -p $(MIMALLOC_BUILD)
 	cd $(MIMALLOC_BUILD) && cmake $(MIMALLOC_CMAKE_FLAGS) .. && $(MAKE)
 
+# Build zlib-ng via its own CMake system, mirroring the mimalloc rule above.
+# Shells out to cmake once and caches the build tree under ext/zlib-ng/build;
+# produces libz-ng.a (zng_* symbols) plus the generated zconf-ng.h /
+# zlib_name_mangling-ng.h headers in the build dir. Only depended on when
+# ZLIBNG_USE_VENDORED=1 (the default).
+$(ZLIBNG_LIB):
+	@if [ ! -f $(ZLIBNG_SRC)/CMakeLists.txt ]; then \
+		echo "ERROR: $(ZLIBNG_SRC) is empty. Run: git submodule update --init --recursive"; \
+		exit 1; \
+	fi
+	mkdir -p $(ZLIBNG_BUILD)
+	cd $(ZLIBNG_BUILD) && cmake $(ZLIBNG_CMAKE_FLAGS) .. && $(MAKE)
+
 clean: pgo-clean profile-clean lto-clean
 	rm -fr src/*.o src/version.h test/*.o $(BWA_LIB) $(EXE) kswv_nrow_zero_test bandedswa_padding_test bandedswa_highzdrop_seed_test shm_section_find_test shm_pack_round_trip_test shm_lock_destroy_test bwa-mem3.arm64
 	rm -f $(LIBSAIS_OBJS)
@@ -710,6 +805,7 @@ clean: pgo-clean profile-clean lto-clean
 	$(MAKE) -C test clean
 	-[ -f ext/htslib/config.mk ] && cd ext/htslib && $(MAKE) distclean
 	rm -rf $(MIMALLOC_BUILD)
+	rm -rf $(ZLIBNG_BUILD)
 
 # ----------------------------------------------------------------------------
 # Documentation (mdbook). See docs/superpowers/specs/ for design.

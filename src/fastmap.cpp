@@ -1653,13 +1653,41 @@ int main_mem(int argc, char *argv[])
     }
 #endif
 
-    if (fixed_chunk_size > 0)
+    if (fixed_chunk_size > 0) {
+        /* -K: the user pinned the batch size (for reproducibility) — honor it
+         * exactly, never cap. */
         aux.task_size = fixed_chunk_size;
-    else {
-        //aux.task_size = 10000000 * opt->n_threads; //aux.actual_chunk_size;
-        aux.task_size = opt->chunk_size * opt->n_threads; //aux.actual_chunk_size;
+    } else {
+        /* Default batch size is chunk_size (~10M bases) per thread. That keeps
+         * each thread well-fed, but at very high -t it makes a single chunk
+         * enormous (10M * 192 ~= 1.9G bases), so the input is only ~3-4 chunks
+         * and the pipeline starves: the first chunk's read and the last chunk's
+         * write don't overlap anything, leaving cores idle (fill/drain). Cap the
+         * default so high -t still produces enough chunks to keep read/compute/
+         * write overlapped, while keeping each chunk far above the ~33k-pairs
+         * floor below which per-chunk overhead (pestat/barriers) starts to bite.
+         * Output stays identical for -t small enough that the cap doesn't engage
+         * (scaled <= cap); above that, batch composition changes exactly as -K
+         * would (validated to leave proper-pair rate unchanged). The cap is
+         * overridable via BWA_MEM3_CHUNK_CAP (bases; <=0 disables, for sweeps). */
+        int64_t cap = 256000000;
+        const char *cap_env = getenv("BWA_MEM3_CHUNK_CAP");
+        if (cap_env && *cap_env) cap = (int64_t)atoll(cap_env);
+        int64_t scaled = (int64_t)opt->chunk_size * (int64_t)opt->n_threads;
+        aux.task_size = (cap > 0 && scaled > cap) ? cap : scaled;
     }
     tprof[MISC][1] = opt->chunk_size = aux.actual_chunk_size = aux.task_size;
+
+    /* Pipeline depth. The 3-step pipeline (read / process / write) is gated by
+     * how many of those steps can run at once. With 2 workers only 2 of the 3
+     * run concurrently, so the single I/O-side worker serialises read(N+1) and
+     * write(N-1) around the compute worker; at high thread counts that
+     * read+write chain, not compute, binds the wall. A 3rd worker lets
+     * read || process || write triple-overlap. It is not oversubscription: the
+     * step mutex still admits only one worker into the compute step at a time,
+     * so the extra worker only ever does single-threaded I/O. Cost is one more
+     * chunk in flight. -1 (no_mt_io) forces single-threaded I/O as before. */
+    const int pipe_workers = no_mt_io ? 1 : (opt->n_threads > 2 ? 3 : opt->n_threads);
 
     double sp_t0 = 0.0;
 #ifdef STAGE_PROF
@@ -1677,7 +1705,7 @@ int main_mem(int argc, char *argv[])
         sp_init(profile_path, "bwa-mem3", PACKAGE_VERSION, sp_arch, opt->n_threads,
                 opt->bam_mode ? "bam" : "sam",
                 opt->bam_mode ? opt->bam_level : -1, sp_in);
-        sp_set_workers(no_mt_io ? 1 : 2);   /* pipeline depth (process() arg) */
+        sp_set_workers(pipe_workers);   /* pipeline depth (process() arg) */
         sp_t0 = sp_wall();
     }
 #endif
@@ -1685,7 +1713,7 @@ int main_mem(int argc, char *argv[])
     tim = __rdtsc();
 
     /* Relay process function */
-    process(&aux, fp, fp2, no_mt_io? 1:2);
+    process(&aux, fp, fp2, pipe_workers);
 
     tprof[PROCESS][0] += __rdtsc() - tim;
 

@@ -1,7 +1,14 @@
 #include "fast_reader.h"
 #include "stage_prof.h"
 
-#include <zlib.h>
+/* zlib-ng (native zng_* API) for the streaming plain-gzip inflate path: its
+ * SIMD inflate is ~2x zlib's, and it keeps the streaming inflate() model that a
+ * FASTQ-scale reader needs (the decompressed stream is far larger than RAM, so a
+ * one-shot decompressor like libdeflate cannot be used here). The native API is
+ * used (not --zlib-compat) so these symbols never collide with the system zlib
+ * that htslib and the legacy gzFile reader still use. libdeflate stays on the
+ * bounded, independent BGZF blocks below. */
+#include <zlib-ng.h>
 #include <libdeflate.h>
 
 #include <errno.h>
@@ -24,7 +31,7 @@ struct fast_reader {
     int            eof_in;
 
     /* gzip */
-    z_stream zs;
+    zng_stream zs;
     int      zs_active;
 
     /* bgzf */
@@ -115,7 +122,7 @@ fast_reader_t *fast_reader_dopen(int fd, const char **err)
     if (fmt == FR_GZIP) {
         fr->zs.zalloc = Z_NULL; fr->zs.zfree = Z_NULL; fr->zs.opaque = Z_NULL;
         fr->zs.next_in = Z_NULL; fr->zs.avail_in = 0;
-        if (inflateInit2(&fr->zs, 15 + 16) != Z_OK) {   /* 15+16 = gzip wrapper */
+        if (zng_inflateInit2(&fr->zs, 15 + 16) != Z_OK) {   /* 15+16 = gzip wrapper */
             free(fr->cin); free(fr); FR_DOPEN_FAIL("inflateInit2 failed");
         }
         fr->zs_active = 1;
@@ -169,11 +176,11 @@ static int fr_read_gzip(fast_reader_t *fr, unsigned char *buf, int len)
             fr->zs.avail_in = (uInt)(fr->cin_len - fr->cin_pos);
         }
         double _td = sp_enabled() ? sp_wall() : 0.0;
-        int ret = inflate(&fr->zs, Z_NO_FLUSH);
+        int ret = zng_inflate(&fr->zs, Z_NO_FLUSH);
         if (sp_enabled()) sp_read_add(1, sp_wall() - _td);
         fr->cin_pos = fr->cin_len - fr->zs.avail_in;       /* track consumed */
         if (ret == Z_STREAM_END) {                          /* member done */
-            if (inflateReset(&fr->zs) != Z_OK) return -1;
+            if (zng_inflateReset(&fr->zs) != Z_OK) return -1;
             if (fr->zs.avail_in == 0 && fr->eof_in) break;  /* nothing follows */
             continue;                                       /* next member */
         }
@@ -288,7 +295,7 @@ fr_format_t fast_reader_format(const fast_reader_t *fr) { return fr->fmt; }
 void fast_reader_close(fast_reader_t *fr)
 {
     if (!fr) return;
-    if (fr->zs_active) inflateEnd(&fr->zs);
+    if (fr->zs_active) zng_inflateEnd(&fr->zs);
     if (fr->ld) libdeflate_free_decompressor(fr->ld);
     free(fr->bout);
     free(fr->cin);
