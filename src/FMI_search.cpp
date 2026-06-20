@@ -1597,18 +1597,19 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
     // coordArray/pos_ar/map_ar buffers and are paired with the int64 mem_lim,
     // so keep them int64 to avoid truncating the running offset.
     int64_t totalCoordCount = 0;
-    // mem_lim sums the (uncapped) SA-interval sizes smem.s, which for a highly
-    // repetitive seed can approach the genome length and overflow int32 on its
-    // own. A wrapped value undersizes the pos_ar/map_ar allocation below and
-    // corrupts the heap, so accumulate in int64. id indexes those buffers and
-    // is paired with mem_lim, so widen it too.
+    // mem_lim is the exact number of entries the staging loop below writes:
+    // each SMEM contributes min(smem.s, max_occ) (the inner loop stops at
+    // c < max_occ). Summing min(s, max_occ) instead of the uncapped interval
+    // size s both right-sizes the pos_ar/map_ar allocation -- repetitive seeds
+    // have s up to the reference length but still write only max_occ entries --
+    // and keeps every term bounded by max_occ so the int64 sum cannot run away.
+    // id indexes those buffers and is paired with mem_lim, so it is int64 too.
     int64_t mem_lim = 0, id = 0;
-    
+
     for(int i = 0; i < count; i++)
     {
-        int32_t c = 0;
         SMEM smem = smemArray[i];
-        mem_lim += smem.s;
+        mem_lim += (smem.s > max_occ) ? max_occ : smem.s;
     }
 
     size_t sa_ar_bytes = (size_t)mem_lim * sizeof(int64_t);
