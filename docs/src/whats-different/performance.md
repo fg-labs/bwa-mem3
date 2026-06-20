@@ -128,29 +128,37 @@ walks), **sw** (Smith–Waterman / banded kernels), **index** (`bwa-mem3 index`)
 | Recover 8-bit banded SW (≥128 bp) | sw | Keeps long reads in the cheaper 8-bit lane width where valid | [#140](https://github.com/fg-labs/bwa-mem3/pull/140) | — |
 | Gotoh gaps from H | sw | Derives extension gaps from H (standard Gotoh) rather than M in the recovered 8-bit path | [#141](https://github.com/fg-labs/bwa-mem3/pull/141) | — |
 | Drop dead `qlen[]` param | sw | Removes an unread parameter from the three 8-bit kernels (cleanup; compile-output-identical) | [#143](https://github.com/fg-labs/bwa-mem3/pull/143) | — |
+| Long-read kernel parity test | sw/test | Promotes the 8-bit/16-bit byte-identity harness into a CI doctest | [#144](https://github.com/fg-labs/bwa-mem3/pull/144) | — |
+| Short-circuit re-baseline scan | sw | Skips the inert per-row re-baseline scan in the banded kernel | [#147](https://github.com/fg-labs/bwa-mem3/pull/147) | — |
+| Remove dead SW code paths | sw | Deletes unreachable `SORT_PAIRS` / non-CORE / SSE2-polyfill code (no behavior change) | [#148](https://github.com/fg-labs/bwa-mem3/pull/148) | — |
+| Vectorize epilogue side-channel | sw | Vectorizes the per-row epilogue side-channel loop | [#149](https://github.com/fg-labs/bwa-mem3/pull/149) | — |
+| Bound getScores prefetch reads | sw | Bounds `getScores8/16` prefetch reads to the padding contract (hardening) | [#150](https://github.com/fg-labs/bwa-mem3/pull/150) | — |
+| Unsigned 8-bit h0-prefix seed | sw | Widens the 8-bit h0-prefix seed to unsigned `[0,255]` | [#151](https://github.com/fg-labs/bwa-mem3/pull/151) | — |
+| `--profile` stage timing | prof | Off-by-default read/proc/write + disk/decompress/parse breakdown for diagnosing pipeline scaling (no overhead when off) | [#152](https://github.com/fg-labs/bwa-mem3/pull/152) | — |
+| zlib-ng inflate + 3rd worker | i/o | Vendored zlib-ng inflate path with chunk cap and an added pipeline worker (~2.2× faster read stage; up to −7.8% wall at 96 cores) | [#153](https://github.com/fg-labs/bwa-mem3/pull/153) | — |
+| Right-size SA staging buffers | index | Sizes the `pos_ar`/`map_ar` staging buffers to the actual `min(s, max_occ)` write count instead of the uncapped SA-interval sum | [#157](https://github.com/fg-labs/bwa-mem3/pull/157) | — |
+| `gtle` contract test | sw/test | Enforces `gtle` byte-identity when `gscore > 0`; documents the `gscore == 0` query-end tail divergence | [#158](https://github.com/fg-labs/bwa-mem3/pull/158) | — |
+| NEON SW tuning | sw | Replaces `sse2neon` all-zero `movemask` tests with single-instruction `vmaxvq` horizontal reductions in the hot SW scans | [#160](https://github.com/fg-labs/bwa-mem3/pull/160) | — |
+| AVX2 SW tuning | sw | Relieves the port-5 `vpblendvb`/`vpshufb` bottleneck in the two SW kernels (byte-identical, Zen3-verified) | [#161](https://github.com/fg-labs/bwa-mem3/pull/161) | — |
+| AVX2 16-bit `kswv256_16` | sw | Adds the AVX2 16-bit mate-rescue kernel so AVX2 hosts no longer fall back to scalar `ksw_align2` for 16-bit rescue | [#162](https://github.com/fg-labs/bwa-mem3/pull/162) | — |
+| NEON `movemask` parity test | sw/test | Scalar-vs-NEON unit test for the `movemask` helpers; guards the #160 rewrite against silent mask collapse | [#164](https://github.com/fg-labs/bwa-mem3/pull/164) | — |
 
 ### Open / in progress
 
-These are not yet merged to `main`; tracked together under the long-read
-banded-SW effort ([#146](https://github.com/fg-labs/bwa-mem3/issues/146)) and the
-read-I/O pipeline work.
+Not yet merged to `main`:
 
 | Item | Stage | Mechanism | bwa-mem3 PR |
 |------|-------|-----------|-------------|
-| Short-circuit re-baseline scan | sw | Skips the inert per-row re-baseline scan in the banded kernel | [#147](https://github.com/fg-labs/bwa-mem3/pull/147) |
-| Vectorize epilogue side-channel | sw | Vectorizes the per-row epilogue side-channel loop | [#149](https://github.com/fg-labs/bwa-mem3/pull/149) |
-| Unsigned 8-bit h0-prefix seed | sw | Widens the 8-bit h0-prefix seed to unsigned `[0,255]` | [#151](https://github.com/fg-labs/bwa-mem3/pull/151) |
-| zlib-ng inflate + 3rd worker | i/o | Vendored zlib-ng inflate path with chunk cap and an added pipeline worker | [#153](https://github.com/fg-labs/bwa-mem3/pull/153) |
-| Bound getScores prefetch reads | sw | Bounds `getScores8/16` prefetch reads to the padding contract (hardening) | [#150](https://github.com/fg-labs/bwa-mem3/pull/150) |
-| Remove dead SW code paths | sw | Deletes unreachable `SORT_PAIRS` / non-CORE / SSE2-polyfill code (no behavior change) | [#148](https://github.com/fg-labs/bwa-mem3/pull/148) |
-| Long-read kernel parity test | sw | Promotes the 8-bit/16-bit byte-identity harness into a CI doctest | [#144](https://github.com/fg-labs/bwa-mem3/pull/144) |
+| AVX2 8-bit wrapper prefetch | sw | Adds the missing next-batch ref/query software-prefetch to `smithWatermanBatchWrapper8` — the lone SW wrapper that lacked it (follow-up to #161) | [#163](https://github.com/fg-labs/bwa-mem3/pull/163) |
 
-Two correctness fixes underpin the long-read SW and high-throughput work rather
-than adding speed themselves: SMEM read positions widened `int16_t` → `int32_t`
-to stop a long-read `SIGSEGV` ([#142](https://github.com/fg-labs/bwa-mem3/pull/142),
-merged), and a persistent `kt_for` worker pool that fixes a multi-chunk
-`SIGSEGV` under mimalloc v3 ([#154](https://github.com/fg-labs/bwa-mem3/pull/154),
-open).
+Several correctness and crash fixes underpin the long-read SW, indexing, and
+high-throughput work rather than adding speed themselves: SMEM read positions
+widened `int16_t` → `int32_t` to stop a long-read `SIGSEGV`
+([#142](https://github.com/fg-labs/bwa-mem3/pull/142), merged); a persistent
+`kt_for` worker pool that fixes a multi-chunk `SIGSEGV` under mimalloc v3
+([#154](https://github.com/fg-labs/bwa-mem3/pull/154), merged); and `mem_lim`
+widened to `int64` to stop an SA-staging buffer overflow on highly repetitive
+seeds ([#156](https://github.com/fg-labs/bwa-mem3/pull/156), merged).
 
 ---
 

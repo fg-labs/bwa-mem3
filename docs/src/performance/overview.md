@@ -46,6 +46,17 @@ rather than the older multi-binary `execv` launcher.
 - **A recovered 8-bit banded SW path** for reads ≥128 bp
   ([#140](https://github.com/fg-labs/bwa-mem3/pull/140) and follow-ups) keeps
   long-read alignment in the cheaper 8-bit lane width where it is valid.
+- **Per-ISA SW kernel hand-tuning.** A NEON pass
+  ([#160](https://github.com/fg-labs/bwa-mem3/pull/160)) replaced the multi-instruction
+  `sse2neon` "all lanes zero" tests in the hot band-narrowing scans with a single
+  `vmaxvq` horizontal reduction; an AVX2 pass
+  ([#161](https://github.com/fg-labs/bwa-mem3/pull/161)) relieved the port-5
+  `vpblendvb`/`vpshufb` bottleneck that ceilings the inner loop on Zen3. Both are
+  byte-identical to the prior output.
+- **AVX2 16-bit mate rescue** ([#162](https://github.com/fg-labs/bwa-mem3/pull/162)):
+  AVX2-only hosts (e.g. Zen3, which run the AVX2 default) previously fell back to
+  scalar `ksw_align2` for 16-bit mate rescue because only NEON and AVX-512 had a
+  batched 16-bit `kswv`; `kswv256_16` closes that gap.
 
 See the [SIMD dispatch matrix](simd-dispatch.md) for the full ISA picture.
 
@@ -90,7 +101,9 @@ sais-lite, cutting both wall time and peak memory while producing a
 byte-identical index (existing indexes need no rebuild). Construction also skips
 the wasted zero-initialization of unpack and suffix-array buffers
 ([#80](https://github.com/fg-labs/bwa-mem3/pull/80)), which on a doubled-human
-input avoided tens of GiB of write-then-overwrite zero-fill.
+input avoided tens of GiB of write-then-overwrite zero-fill, and right-sizes the
+SA-entry staging buffers to the actual write count rather than the uncapped
+SA-interval sum ([#157](https://github.com/fg-labs/bwa-mem3/pull/157)).
 
 ### 4. Memory allocation and I/O
 
@@ -102,9 +115,14 @@ input avoided tens of GiB of write-then-overwrite zero-fill.
 - **Faster read ingestion**: a content-detecting FASTQ fast path over libdeflate
   BGZF ([#128](https://github.com/fg-labs/bwa-mem3/pull/128), merged) cuts the
   cost of decompressing and parsing input, which matters most when the aligner
-  would otherwise be I/O- or parse-bound. A vendored zlib-ng inflate path with an
-  added pipeline worker ([#153](https://github.com/fg-labs/bwa-mem3/pull/153)) is
-  **proposed but not yet merged** and extends the same idea.
+  would otherwise be I/O- or parse-bound. A vendored zlib-ng inflate path with a
+  third pipeline worker ([#153](https://github.com/fg-labs/bwa-mem3/pull/153),
+  merged) extends the same idea: it cuts the read stage ~**2.2×** on gzip input
+  and, because the serial read stage becomes a larger share of the wall as the
+  compute stage parallelizes, improves end-to-end wall by up to **−7.8%** at 96
+  cores. The accompanying `--profile` stage-timing mode
+  ([#152](https://github.com/fg-labs/bwa-mem3/pull/152)) is what attributes wall
+  time across the read‖proc‖write stages to surface exactly this effect.
 
 ### 5. Build-time optimization (PGO)
 
