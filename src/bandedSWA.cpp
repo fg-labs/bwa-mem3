@@ -586,6 +586,12 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
             uint64_t tim;
             for(j = 0; j < SIMD_WIDTH8; j++)
             {
+                if ((i + j + PFD) < roundNumPairs) { // prefetch block (bounded; see getScores8/16 contract)
+                    SeqPair spf = pairArray[i + j + PFD];
+                    _mm_prefetch((const char*) seqBufRef + (int64_t)spf.idr, _MM_HINT_NTA);
+                    _mm_prefetch((const char*) seqBufRef + (int64_t)spf.idr + 64, _MM_HINT_NTA);
+                }
+
                 SeqPair sp = pairArray[i + j];
                 // Re-baseline the seed score into the int8 byte frame: seed the H
                 // arrays from h0' = h0 - B0 = min(h0, REBASE_KEEP_W) (clamped >= 0)
@@ -642,7 +648,13 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
             }
 //-------------------
             for(j = 0; j < SIMD_WIDTH8; j++)
-            {               
+            {
+                if ((i + j + PFD) < roundNumPairs) { // prefetch block (bounded; see getScores8/16 contract)
+                    SeqPair spf = pairArray[i + j + PFD];
+                    _mm_prefetch((const char*) seqBufQer + (int64_t)spf.idq, _MM_HINT_NTA);
+                    _mm_prefetch((const char*) seqBufQer + (int64_t)spf.idq + 64, _MM_HINT_NTA);
+                }
+
                 SeqPair sp = pairArray[i + j];
                 seq2 = seqBufQer + (int64_t)sp.idq;
                 
