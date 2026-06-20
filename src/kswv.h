@@ -309,6 +309,25 @@ private:
 				   int32_t numPairs,
 				   int phase);
 
+	void kswvBatchWrapper16_avx2(SeqPair *pairArray,
+								 uint8_t *seqBufRef,
+								 uint8_t *seqBufQer,
+								 kswr_t* aln,
+								 int32_t numPairs,
+								 uint16_t numThreads,
+								 int phase);
+
+	int kswv256_16(int16_t seq1SoA[],
+				   int16_t seq2SoA[],
+				   int16_t nrow,
+				   int16_t ncol,
+				   SeqPair *p,
+				   kswr_t *aln,
+				   int po_ind,
+				   uint16_t tid,
+				   int32_t numPairs,
+				   int phase);
+
 #elif __AVX512BW__
 	void kswvBatchWrapper8(SeqPair *pairArray,
 						   uint8_t *seqBufRef,

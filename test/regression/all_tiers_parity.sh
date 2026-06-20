@@ -73,28 +73,50 @@ echo "Testing tiers: ${TIERS[*]}"
 # Pick a reference SAM (the highest tier — usually the host's actual tier).
 # Use ${#TIERS[@]}-1 instead of negative indexing so we work on macOS bash 3.2.
 REF_TIER="${TIERS[$((${#TIERS[@]}-1))]}"
-REF_SAM="$OUT_DIR/$REF_TIER.sam"
 
-for t in "${TIERS[@]}"; do
-    echo ">>> Generating SAM for tier=$t"
-    BWAMEM3_FORCE_TIER="$t" "$BWA_MEM3" mem -t 1 \
-        "$PARITY_FA" "$PARITY_R1" "$PARITY_R2" \
-        > "$OUT_DIR/$t.sam" 2>"$OUT_DIR/$t.log"
-    echo "    Produced $(wc -c < "$OUT_DIR/$t.sam") bytes"
-done
+# Scoring variants to diff under. Each entry is a label plus extra `mem`
+# args. The default run drives the 8-bit kswv mate-rescue kernel; the
+# "match4" run raises the match score so mate-rescue pairs clear the
+# byte-mode gate at src/bwamem_pair.cpp:217 (KSW_XBYTE set iff
+# l_ms*opt->a < 250) and route to getScores16 — without this no end-to-end
+# test exercises the 16-bit kswv kernels across tiers.
+#
+# The gate scales with l_ms (the rescued read length), so the match score
+# needed to reach 16-bit depends on the fixture: -A 4 clears it for any
+# read >= 63bp, covering all realistic short-read fixtures. If a future
+# fixture uses reads shorter than that, raise -A here or the match4 variant
+# silently degenerates into a second 8-bit run.
+VARIANT_LABELS=(default match4)
+VARIANT_ARGS=("" "-A 4")
 
 EXIT=0
-for t in "${TIERS[@]}"; do
-    if [[ "$t" == "$REF_TIER" ]]; then
-        continue
-    fi
-    if ! diff -q "$REF_SAM" "$OUT_DIR/$t.sam" >/dev/null; then
-        echo "FAIL: tier $t differs from $REF_TIER"
-        diff "$REF_SAM" "$OUT_DIR/$t.sam" | head -20
-        EXIT=1
-    else
-        echo "OK: tier $t matches $REF_TIER"
-    fi
+for vi in "${!VARIANT_LABELS[@]}"; do
+    vlabel="${VARIANT_LABELS[$vi]}"
+    # shellcheck disable=SC2206  # intentional word-splitting of the arg string
+    vargs=(${VARIANT_ARGS[$vi]})
+    echo "=== Scoring variant: $vlabel (mem args: ${VARIANT_ARGS[$vi]:-none}) ==="
+    REF_SAM="$OUT_DIR/$vlabel.$REF_TIER.sam"
+
+    for t in "${TIERS[@]}"; do
+        echo ">>> Generating SAM for tier=$t"
+        BWAMEM3_FORCE_TIER="$t" "$BWA_MEM3" mem -t 1 ${vargs[@]+"${vargs[@]}"} \
+            "$PARITY_FA" "$PARITY_R1" "$PARITY_R2" \
+            > "$OUT_DIR/$vlabel.$t.sam" 2>"$OUT_DIR/$vlabel.$t.log"
+        echo "    Produced $(wc -c < "$OUT_DIR/$vlabel.$t.sam") bytes"
+    done
+
+    for t in "${TIERS[@]}"; do
+        if [[ "$t" == "$REF_TIER" ]]; then
+            continue
+        fi
+        if ! diff -q "$REF_SAM" "$OUT_DIR/$vlabel.$t.sam" >/dev/null; then
+            echo "FAIL: [$vlabel] tier $t differs from $REF_TIER"
+            diff "$REF_SAM" "$OUT_DIR/$vlabel.$t.sam" | head -20
+            EXIT=1
+        else
+            echo "OK: [$vlabel] tier $t matches $REF_TIER"
+        fi
+    done
 done
 
 if [[ "$EXIT" -eq 0 ]]; then
