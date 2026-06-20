@@ -483,22 +483,18 @@ int kswv::kswv_neon_u8(uint8_t seq1SoA[],
             imax_vec = vmaxq_u8(imax_vec, h11);
             iqe_vec = vbslq_u8(cmp0, l_vec, iqe_vec);
 
-            /* ESCAN1: shorten the loop-carried E (insertion-gap) recurrence.
-             * Baseline:  e11[j] = max(h11[j]-(O+E), e11[j-1]-E),
-             *            where h11[j] = max(m11[j], f11[j], e11[j-1]).
-             * Because (e11[j-1]-(O+E)) <= (e11[j-1]-E) in saturating u8 arithmetic,
-             * the e11[j-1] term inside h11 is redundant in the first max argument:
-             *   e11[j] = max( max(m11[j],f11[j])-(O+E), e11[j-1]-E ).
-             * This breaks the h11 -> e11 chain so the carried recurrence depends only
-             * on the precomputed mf = max(m11,f11) (no dependence on e11 through h11).
-             * Exact: same DP, Daily-scan-style reassociation of the gap recurrence. */
+            /* Reassociate BOTH gap recurrences off h11 (Daily-scan algebra).
+             * e uses max(m11,f11), f uses max(m11,e11) — each drops the term
+             * dominated by its own extension arg (O>=0, saturating u8). me must
+             * read the OLD e11, so compute it before the e-update overwrites e11. */
             uint8x16_t mf = vmaxq_u8(m11, f11);
+            uint8x16_t me = vmaxq_u8(m11, e11);
             uint8x16_t gapE = vqsubq_u8(mf, oe_ins_vec);
             e11 = vqsubq_u8(e11, e_ins_vec);
             e11 = vmaxq_u8(gapE, e11);
 
-            /* Gap extension for F */
-            uint8x16_t gapD = vqsubq_u8(h11, oe_del_vec);
+            /* Gap extension for F (reassociated) */
+            uint8x16_t gapD = vqsubq_u8(me, oe_del_vec);
             f21 = vqsubq_u8(f11, e_del_vec);
             f21 = vmaxq_u8(gapD, f21);
 
