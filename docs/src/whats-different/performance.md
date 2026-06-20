@@ -1,8 +1,9 @@
 # Performance Improvements
 
 This page covers the performance work carried in bwa-mem3 on top of upstream
-bwa-mem2. Almost every change listed here is a pure throughput or memory win
-that preserves the aligner's output; the one exception is the deterministic
+bwa-mem2. Almost every change listed here is a throughput, memory, or
+supporting (test/hardening/cleanup) change that preserves the aligner's output;
+the one exception is the deterministic
 tie-break ordering in [#123](https://github.com/fg-labs/bwa-mem3/pull/123),
 which can reorder equal-scoring alignments relative to upstream (see
 [Equivalence with bwa-mem2](equivalence.md) for the full, audited list of where
@@ -102,7 +103,10 @@ The mechanism column says, in one line, *why it is faster*. The stage column
 groups changes by where in the pipeline they act: **seed** (SMEM/FM-index
 walks), **sw** (Smith–Waterman / banded kernels), **index** (`bwa-mem3 index`),
 **i/o** (read decompression + header ingestion), **mem** (allocation),
-**dispatch** (SIMD/runtime selection), or **sort**.
+**dispatch** (SIMD/runtime selection), **sort**, or **prof** (off-by-default
+profiling). A `/test` suffix (e.g. `sw/test`) marks a test or contract-locking
+change for that stage; a slash between two stages (e.g. `dispatch/sw`) means the
+change spans both.
 
 ### Merged
 
