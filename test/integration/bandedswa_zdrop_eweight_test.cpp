@@ -32,18 +32,17 @@ bool envelope_ok(int len1, int len2, int w, int zdrop, int h0, int maxStep) {
     int shorter = len1 < len2 ? len1 : len2;
     return len1 < MAX_SEQ_LEN8 && len2 < MAX_SEQ_LEN8 && len1 >= len2 &&
            w <= 127 && zdrop + maxStep <= 127 && h0 <= zdrop + 1 &&
-           (h0 + shorter * 1) < 255 - maxStep;
+           (h0 + shorter * maxStep) < 255 - maxStep;   // mirrors bwamem.cpp: h0 + shorter*score_a
 }
 
 // Run one (o_del, e_del, o_ins, e_ins, zdrop) configuration: build the fixture,
-// score with the scalar oracle and getScores8, diff the five z-drop-affected
-// output fields (score, tle, qle, gscore, max_off; gtle is excluded — see the
-// NOTE below) over admitted pairs. Returns the number of mismatches; sets
-// *admitted_out to the number of pairs the routing gate admits (main fails the
-// run if any config admits none, guarding against a fixture that exercises no
-// admitted pair).
+// score with the scalar oracle and getScores8, diff the output fields over
+// admitted pairs (gtle only when scalar gscore > 0). Returns the number of
+// mismatches; sets *admitted_out to the count of envelope-admitted pairs and
+// *gpos_out to how many of those had gscore > 0 (the regime where gtle is
+// compared — used by main() to fail if that coverage is ever vacuous).
 long run_config(const char *name, int o_del, int e_del, int o_ins, int e_ins,
-                int zdrop, long *admitted_out) {
+                int zdrop, long *admitted_out, long *gpos_out) {
     // Multiple of 64 = max SIMD_WIDTH8 (avx512bw). getScores8 processes pairs in
     // SIMD_WIDTH8-wide batches; a non-multiple leaves a partial final batch whose
     // padding lanes read/write past the array (heap corruption on avx2/avx512).
@@ -97,56 +96,77 @@ long run_config(const char *name, int o_del, int e_del, int o_ins, int e_ins,
 
     bsw.getScores8(pairs.data(), ref.data(), qer.data(), (int32_t)n, 1, w);
 
-    long admitted = 0, diffs = 0;
+    long admitted = 0, diffs = 0, gpos = 0;
     for (long c = 0; c < n; ++c) {
         const SeqPair &q = pairs[c];
         if (!envelope_ok(q.len1, q.len2, w, zdrop, q.h0, maxStep)) continue;
         admitted++;
         const Out &O = oracle[c];
-        // NOTE: gtle (gscore row = max_ie+1) is intentionally excluded here. A
-        // SEPARATE, pre-existing divergence affects gtle at non-unit gap-extend
-        // in gscore==0 query-end tie cases (independent of the z-drop weighting
-        // fixed in this change); it is tracked and fixed in its own PR. This
-        // probe validates only the z-drop-affected fields.
+        if (O.gscore > 0) gpos++;   // pairs in the regime where gtle IS compared
+        // gtle (gscore row = max_ie+1) CONTRACT: it is byte-identical to scalar
+        // whenever gscore > 0, and may differ only in the gscore == 0 query-end
+        // tail. Root cause: the 8-bit vector row loop ends at the e-dependent band
+        // bound mlenw = min(qlen+myband, tlen), while scalar runs to its dynamic
+        // m==0 break and keeps updating max_ie on the trailing end==qlen rows
+        // (all h1==0, so gscore stays 0). bwa-mem only consumes gtle under
+        // `gscore > 0` (every gtle read in bwamem.cpp is in the else-branch of an
+        // `if (gscore <= 0 || ...) {...} else { ...gtle...}` guard), so the
+        // gscore==0 divergence never reaches a SAM record. We ENFORCE the safe
+        // half of that contract here: gtle must match for gscore > 0. If a future
+        // change widens the divergence into the gscore > 0 regime (the consumed
+        // one), this fails. The gscore == 0 tail is intentionally not compared.
+        const bool gtle_must_match = (O.gscore > 0);
         if (O.score != q.score || O.tle != q.tle ||
-            O.qle != q.qle || O.gscore != q.gscore || O.max_off != q.max_off) {
+            O.qle != q.qle || O.gscore != q.gscore || O.max_off != q.max_off ||
+            (gtle_must_match && O.gtle != q.gtle)) {
             if (diffs < 10)
                 fprintf(stderr,
-                    "[zdrop-eweight:%s] DIFF c=%ld len1=%d len2=%d h0=%d | scalar %d/%d/%d/%d/%d | 8 %d/%d/%d/%d/%d\n",
+                    "[zdrop-eweight:%s] DIFF c=%ld len1=%d len2=%d h0=%d | scalar %d/%d/%d/%d/%d/%d | 8 %d/%d/%d/%d/%d/%d\n",
                     name, c, q.len1, q.len2, q.h0,
-                    O.score, O.tle, O.qle, O.gscore, O.max_off,
-                    q.score, q.tle, q.qle, q.gscore, q.max_off);
+                    O.score, O.tle, O.gtle, O.qle, O.gscore, O.max_off,
+                    q.score, q.tle, q.gtle, q.qle, q.gscore, q.max_off);
             diffs++;
         }
     }
-    fprintf(stderr, "[zdrop-eweight:%s] o_del=%d e_del=%d o_ins=%d e_ins=%d zdrop=%d: admitted=%ld diffs=%ld\n",
-            name, o_del, e_del, o_ins, e_ins, zdrop, admitted, diffs);
+    fprintf(stderr, "[zdrop-eweight:%s] o_del=%d e_del=%d o_ins=%d e_ins=%d zdrop=%d: admitted=%ld (gscore>0: %ld) diffs=%ld\n",
+            name, o_del, e_del, o_ins, e_ins, zdrop, admitted, gpos, diffs);
     *admitted_out = admitted;
+    *gpos_out = gpos;
     return diffs;
 }
 
 } // namespace
 
 int main() {
-    long adm = 0, total_diffs = 0, min_admitted = -1;
+    long adm = 0, gpos = 0, total_diffs = 0, min_admitted = -1, total_gpos = 0;
 
     // Config A: asymmetric, non-unit gap-extend, small zdrop (z-drop fires
     // often, deletion/insertion weighting both exercised). This is the config
     // that diverges pre-fix.
-    total_diffs += run_config("asym", /*o_del*/6, /*e_del*/3, /*o_ins*/6, /*e_ins*/1, /*zdrop*/25, &adm);
+    total_diffs += run_config("asym", /*o_del*/6, /*e_del*/3, /*o_ins*/6, /*e_ins*/1, /*zdrop*/25, &adm, &gpos);
     if (min_admitted < 0 || adm < min_admitted) min_admitted = adm;
+    total_gpos += gpos;
 
     // Config B: symmetric non-unit gap-extend.
-    total_diffs += run_config("sym2", 6, 2, 6, 2, 30, &adm);
+    total_diffs += run_config("sym2", 6, 2, 6, 2, 30, &adm, &gpos);
     if (adm < min_admitted) min_admitted = adm;
+    total_gpos += gpos;
 
     // Config C: default gap-extend (e = 1). Must match both before and after
     // the fix — a guard that the weighting change is a no-op at default params.
-    total_diffs += run_config("e1", 6, 1, 6, 1, 25, &adm);
+    total_diffs += run_config("e1", 6, 1, 6, 1, 25, &adm, &gpos);
     if (adm < min_admitted) min_admitted = adm;
+    total_gpos += gpos;
 
     if (min_admitted <= 0) {
         fprintf(stderr, "bandedswa_zdrop_eweight_test: FAIL — a config admitted no pairs\n");
+        return 2;
+    }
+    // The gtle invariant (compared iff gscore > 0) is the point of this probe;
+    // fail loudly if the fixture never exercises a gscore > 0 pair, else the
+    // gtle check is silently vacuous (cf. seed_hi guard in the high-zdrop test).
+    if (total_gpos <= 0) {
+        fprintf(stderr, "bandedswa_zdrop_eweight_test: FAIL — no gscore>0 pairs; gtle invariant untested\n");
         return 2;
     }
     if (total_diffs != 0) {
