@@ -315,13 +315,22 @@ extension continues after a score drop.
 
 #### `-r FLOAT` — re-seeding factor
 
-Seeds longer than `-k * FLOAT` are re-seeded internally to find sub-seeds.
-Lowering this produces more seeds and higher sensitivity at greater cost.
+Seeds longer than `-k * FLOAT` are re-seeded internally to find sub-seeds (bwa-mem's
+second seeding round). Lowering this produces more seeds and higher sensitivity at
+greater cost; **raising it** (e.g. `-r 10`) suppresses the round, which — combined with
+`-y 0` — roughly halves alignment CPU on clean, low-divergence data. Round 2 is genuine
+split-read/divergence sensitivity, so it costs accuracy on divergent libraries; see
+[Settings profiles](../best-practices/settings-profiles.md#why-we-recommend--y-0).
 
 #### `-y INT` — third-round seed occurrence threshold
 
-Seed occurrence threshold for the third round of seeding. Rarely needs
-adjustment outside highly repetitive genomes.
+bwa-mem's third seeding round: for each read position, grow an exact match until it
+occurs fewer than `INT` times in the genome (default 20), then emit it as a seed — a
+repeat-region safety net. **`-y 0` disables the round entirely**, which benchmarks
+F1-near-neutral across all tested regimes (within ±0.02; better on repeat-enriched and
+divergent data) while cutting ~11–30 % of alignment CPU. Recommended for the speed/accuracy
+profile — see
+[Settings profiles → `-y 0`](../best-practices/settings-profiles.md#why-we-recommend--y-0).
 
 ## Notes / Gotchas
 

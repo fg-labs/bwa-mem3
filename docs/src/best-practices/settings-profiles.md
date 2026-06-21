@@ -33,7 +33,7 @@ No extra flags. Use this when you are:
 ## Recommended profile
 
 ```bash
-bwa-mem3 mem -t <N> -m 10 ref.fa R1.fq R2.fq > out.sam
+bwa-mem3 mem -t <N> -m 10 -y 0 ref.fa R1.fq R2.fq > out.sam
 ```
 
 Use this for new pipelines, or once a drop-in migration is validated and you want bwa-mem3's best
@@ -42,6 +42,7 @@ speed/accuracy trade-off. Current recommended deviations:
 | flag | default (drop-in) | recommended | effect |
 |---|---|---|---|
 | `-m` (mate-rescue depth) | 50 | **10** | ~11–22% less alignment CPU; near-neutral accuracy (see below) |
+| `-y` (3rd-round seeding occurrence) | 20 | **0** | ~11–30% less alignment CPU; F1 near-neutral across regimes (within ±0.02; better on divergent/repeat — see below) |
 | `-s` (Pass-2 re-seed width), **`--meth` only** | 10 | **0** | ~20% less alignment CPU; near-neutral accuracy (see below) |
 | `--min-ext-len` (skip short-seed extension), **standard-error reads** | 0 | **30** | ~10–20% less alignment CPU; accuracy change confined to the already-low-confidence tail (see below) |
 
@@ -51,7 +52,7 @@ This table will grow as we benchmark additional tunings; each entry is gated on 
 For a bisulfite (`--meth`) pipeline the recommended invocation is therefore:
 
 ```bash
-bwa-mem3 mem -t <N> --meth -m 10 -s 0 ref.fa R1.fq R2.fq > out.sam
+bwa-mem3 mem -t <N> --meth -m 10 -s 0 -y 0 ref.fa R1.fq R2.fq > out.sam
 ```
 
 ## Why we recommend `-m 10`
@@ -90,6 +91,48 @@ One caveat: this golden-truth metric scores a single best placement per read, so
 Numbers are from [bwa-mem3-bench](../related-projects/bwa-mem3-bench.md) on 5 M-read real datasets
 plus a multi-contig holodeck golden-truth ablation; consult the bench for methodology and current
 figures.
+
+## Why we recommend `-y 0`
+
+bwa-mem seeds in up to three rounds: (1) SMEMs, (2) reseeding long SMEMs (`-r`), and (3) an
+occurrence-bounded "seed strategy" round (`-y`) that, for every read position, grows an exact match
+until it occurs fewer than `-y` (default 20) times in the genome and emits it. Round 3 is a
+repeat-region safety net. `-y 0` disables it entirely.
+
+**It is net-useless-to-harmful, even in the repeats it was built for.** We swept `-y 0` (and the
+more-aggressive `-y 0 -r 10`, see below) against the stock default across four golden-truth regimes
+(holodeck, read-name truth) and on real WES + WGS:
+
+| regime | ΔF1 (`-y 0` − default) | ΔF1 (`-y 0 -r 10` − default) | ΔF1 in the MAPQ-0 (repeat) bin (`-y 0` / `-y 0 -r 10`) |
+|---|---|---|---|
+| easy (150 bp, default error) | −0.010 | −0.001 | −0.14 / −0.04 |
+| substitution-divergent (2–15%) | **+0.008** | −0.074 | **+0.13** / −0.07 |
+| indel-rich (37 % indels) | −0.016 | −0.017 | −0.02 / −0.03 |
+| **repeat-enriched** (reads simulated from RepeatMasker, 49 % of hg38) | **+0.007** | +0.004 | **+0.16** / −0.02 |
+
+The tiny easy/indel deltas are ≤0.016 in absolute F1; on the divergent and *repeat-enriched* regimes —
+where round 3 is supposed to earn its keep — removing it makes F1 **better**. Mechanism: its
+low-occurrence (<20-hit) seeds add spurious near-tied repeat candidates that slightly degrade
+placement; dropping them lets the correct unique anchor win. (The regime sweep was on standard,
+non-`--meth` reads; `-y 0` is a generic seeding change and is recommended for `--meth` on the same
+basis, but was not separately F1-measured there.)
+
+**On real data the confident core is untouched.** On 20 M real WES+WGS reads, **zero** confidently and
+uniquely mapped reads (MAPQ ≥ 60, NM ≤ 1, no soft-clip) became unmapped under `-y 0`, and 3–4 per 10 M
+lost any alignment score. Every regression lands on the already-low-confidence tail (base MAPQ ≈ 0,
+heavily soft-clipped or high-NM), and round 3 was so often producing *worse* primaries that removing it
+*improves* a large share of as many reads as it perturbs (on WES, 3,194 reads improve vs 3,784 that
+worsen).
+
+**In exchange, alignment CPU drops ~11–30 % single-thread**, larger on data with more repeat content
+(WGS > WES). The win is confirmed cross-architecture (Graviton4/Linux: realistic +29.9 %, HG002 WGS
++19.8 %, matching macOS) — it cuts cold-memory seeding work, not arithmetic, so it ports.
+
+**More aggressive (clean-data only): also drop round 2 with `-y 0 -r 10`.** That roughly halves
+alignment CPU (~50–63 %), but round 2 *is* genuine split-read/divergence sensitivity — it costs
+−0.074 F1 on divergent data (the `-y 0 -r 10` column above, concentrated in the repeat/multimapper
+bin). Use `-y 0 -r 10` only on known-clean, low-divergence libraries; `-y 0` alone is the
+broadly-safe recommendation.
 
 ## Why we recommend `-s 0` under `--meth`
 
