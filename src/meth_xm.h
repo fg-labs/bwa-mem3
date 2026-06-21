@@ -4,7 +4,7 @@
 
 #include <stdint.h>
 
-#include "meth_orig_ref.h"
+#include "bntseq.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -20,13 +20,15 @@ extern "C" {
  * record) or copy elsewhere before the next call.
  *
 
- *   o            : un-converted reference (forward-strand bases per real chrom)
- *   real_tid     : index into o's per-chrom array (== cmap->out_tid[p->rid])
- *   pos          : 0-based forward-genome alignment start
+ *   bns, pac     : the ORIGINAL (un-converted) reference bns + 2-bit pac
+ *                  (D3 PR-5: replaces the retired meth_orig_ref f/r fold).
+ *                  Forward-strand bases are decoded inline per record.
+ *   real_tid     : contig index into bns->anns (== the alignment's original rid)
+ *   pos          : 0-based forward-genome alignment start (contig-local)
  *   is_top_strand: 1 if methylation events are on the top (forward) strand,
- *                  0 if on the bottom strand. This is determined by the
- *                  XG:Z value, NOT by the SAM 0x10 flag: XG:Z:CT (= cmap
- *                  direction 'f') => top strand; XG:Z:GA (= 'r') => bottom.
+ *                  0 if on the bottom strand. Sourced from the winning
+ *                  hypothesis (= XG:Z), NOT the SAM 0x10 flag: OT (XG:Z:CT)
+ *                  => top strand; OB (XG:Z:GA) => bottom.
  *   bam_cigar    : CIGAR in BAM op encoding (0=M, 1=I, 2=D, 3=N, 4=S, 5=H, 6=P, 7==, 8=X)
  *   n_cigar      : number of cigar ops
  *   seq_text     : SEQ-orientation read bases (ASCII A/C/G/T), length l_emit
@@ -35,7 +37,7 @@ extern "C" {
  * Output XM matches Bismark's methylation_call: per-base char in SEQ
  * orientation, with z/Z (CpG), x/X (CHG), h/H (CHH), u/U (unknown), '.' for
  * everything else. */
-char *meth_build_xm(const meth_orig_ref_t *o, int real_tid,
+char *meth_build_xm(const bntseq_t *bns, const uint8_t *pac, int real_tid,
                     int64_t pos, int is_top_strand,
                     const uint32_t *bam_cigar, int n_cigar,
                     const char *seq_text, int l_emit);

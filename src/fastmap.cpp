@@ -45,7 +45,6 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "stage_prof.h"
 #include "version.h"
 #include <sys/resource.h>
-#include "meth_orig_ref.h"
 #include "bwa_shm.h"
 #include "fast_reader_bseq.h"
 
@@ -1728,32 +1727,14 @@ int main_mem(int argc, char *argv[])
     aux.bam_writer = NULL;
     g_meth_bam_writer = NULL;
     if (opt->meth_mode) {
-        /* D3-TODO(PR-3 gating / PR-5): the chrom map + un-converted ref view are
-         * still built from the SEED (f/r-doubled) BNS/PAC. With PR-3's coordinate
-         * cutover, alignments now carry ORIGINAL rids/coords, so the output layer
-         * (meth_mem_aln_to_bam: cmap->out_tid[rid], meth_orig_ref f/r fold, XG)
-         * is INTERNALLY INCONSISTENT — RNAME/POS/XM/XG emission is WRONG until the
-         * output is re-pointed to the original bns/pac in PR-5 (spec §6.1). Built
-         * as-is tonight only so the pipeline links and runs end to end; do NOT
-         * trust any --meth BAM record's coordinates/tags before PR-5. */
-        g_meth_cmap = meth_chrom_map_build_from_bns(aux.fmi->idx->bns);
-        /* g_meth_cmap is consulted by per-record paths even with output
-         * disabled; build it so meth_mode tagging stays consistent. */
-        if (g_meth_cmap == NULL) {
-            fprintf(stderr, "ERROR: meth: failed to build chrom map\n");
-            free(opt);
-            delete aux.fmi;
-            return 1;
-        }
-        g_meth_orig_ref = meth_orig_ref_load(aux.fmi->idx->bns,
-                                             aux.fmi->idx->pac, g_meth_cmap);
-        if (g_meth_orig_ref == NULL) {
-            fprintf(stderr, "ERROR: meth: failed to build un-converted ref view\n");
-            meth_chrom_map_free(g_meth_cmap); g_meth_cmap = NULL;
-            free(opt);
-            delete aux.fmi;
-            return 1;
-        }
+        /* D3 (PR-5): output is native original-alphabet. RNAME/POS/XM/XG all
+         * derive from the ORIGINAL bns/pac (loaded into aux.meth_orig_bns/pac
+         * by PR-1) and the per-alignment hypothesis — no f/r chrom map, no
+         * un-converted ref view. The per-record path needs only the original
+         * pac global (the original bns reaches it via mem_aln_bns()). With
+         * output disabled there is no writer to open, but the global must still
+         * be set so meth_mem_aln_to_bam builds correct XM/coords. */
+        g_meth_orig_pac = aux.meth_orig_pac;
     }
     (void)is_o;
     (void)hdr_line;
@@ -1762,48 +1743,31 @@ int main_mem(int argc, char *argv[])
     (void)out_path;
 #else
     if (opt->meth_mode) {
-        /* D3-TODO(PR-3 gating / PR-5): the chrom map + un-converted ref view are
-         * still built from the SEED (f/r-doubled) BNS/PAC. With PR-3's coordinate
-         * cutover, alignments now carry ORIGINAL rids/coords, so the output layer
-         * (meth_mem_aln_to_bam: cmap->out_tid[rid], meth_orig_ref f/r fold, XG)
-         * is INTERNALLY INCONSISTENT — RNAME/POS/XM/XG emission is WRONG until the
-         * output is re-pointed to the original bns/pac in PR-5 (spec §6.1). Built
-         * as-is tonight only so the pipeline links and runs end to end; do NOT
-         * trust any --meth BAM record's coordinates/tags before PR-5. */
-        g_meth_cmap = meth_chrom_map_build_from_bns(aux.fmi->idx->bns);
-        if (g_meth_cmap == NULL) {
-            fprintf(stderr, "ERROR: meth: failed to build chrom map\n");
+        /* D3 (PR-5): native original-alphabet output. The @SQ header is built
+         * straight from the ORIGINAL (un-converted) bns (aux.meth_orig_bns),
+         * and the per-record path consults the original pac (g_meth_orig_pac)
+         * for XM:Z; alignments already carry original rids/coords (PR-3) and the
+         * hypothesis (XG strand), so there is no f/r chrom map and no
+         * un-converted ref fold. */
+        if (aux.meth_orig_bns == NULL || aux.meth_orig_pac == NULL) {
+            fprintf(stderr, "ERROR: meth: original reference (bns/pac) not loaded\n");
             free(opt);
             delete aux.fmi;
             return 1;
         }
-        g_meth_orig_ref = meth_orig_ref_load(aux.fmi->idx->bns,
-                                             aux.fmi->idx->pac, g_meth_cmap);
-        if (g_meth_orig_ref == NULL) {
-            fprintf(stderr, "ERROR: meth: failed to build un-converted ref view\n");
-            meth_chrom_map_free(g_meth_cmap); g_meth_cmap = NULL;
-            free(opt);
-            delete aux.fmi;
-            return 1;
-        }
-        fprintf(stderr,
-                "[bwa-mem3:--meth] un-converted reference loaded "
-                "(%d chrom(s)).\n", g_meth_cmap->n_output);
+        g_meth_orig_pac = aux.meth_orig_pac;
         const char *meth_out_path = is_o ? out_path : "-";
         extern char *bwa_pg;
-        /* The c2t index's own sidecar (idx_hdr_lines) is NOT passed: in --meth
-         * mode ref_prefix points at the ".bwameth.c2t" index, whose sidecar
-         * describes the doubled f/r converted contigs. Instead pass
-         * meth_orig_hdr_lines — the *original* reference's sidecar — so the
-         * writer can enrich the consolidated @SQ with real M5/UR tags and
-         * forward @CO/@PG/@RG provenance. */
-        g_meth_bam_writer = meth_bam_writer_open(meth_out_path, g_meth_cmap, bwa_pg, NULL,
+        /* meth_orig_hdr_lines is the *original* reference's .hdr/.dict sidecar;
+         * the writer enriches each @SQ with its M5/UR tags and forwards
+         * @CO/@PG/@RG provenance. */
+        g_meth_bam_writer = meth_bam_writer_open(meth_out_path, aux.meth_orig_bns,
+                                                 bwa_pg, NULL,
                                                  hdr_line, meth_orig_hdr_lines,
                                                  opt->bam_level);
         if (g_meth_bam_writer == NULL) {
             fprintf(stderr, "ERROR: meth: failed to open BAM writer for '%s'\n", meth_out_path);
-            meth_orig_ref_free(g_meth_orig_ref); g_meth_orig_ref = NULL;
-            meth_chrom_map_free(g_meth_cmap); g_meth_cmap = NULL;
+            g_meth_orig_pac = NULL;
             free(opt);
             delete aux.fmi;
             return 1;
@@ -1956,19 +1920,11 @@ int main_mem(int argc, char *argv[])
         }
         g_meth_bam_writer = NULL;
     }
-    /* Free g_meth_cmap and g_meth_orig_ref independently of g_meth_bam_writer:
-     * under -DDISABLE_OUTPUT the writer is never opened, but the chrom map
-     * and orig-ref recovery are still built so per-record paths see
-     * consistent tagging. The branch above only fires when the writer
-     * exists, so freeing here covers the DISABLE_OUTPUT path. */
-    if (meth_mode_local && g_meth_orig_ref != NULL) {
-        meth_orig_ref_free(g_meth_orig_ref);
-        g_meth_orig_ref = NULL;
-    }
-    if (meth_mode_local && g_meth_cmap != NULL) {
-        meth_chrom_map_free(g_meth_cmap);
-        g_meth_cmap = NULL;
-    }
+    /* D3 (PR-5): the original pac global is a borrowed pointer into
+     * aux.meth_orig_pac (freed by meth_orig_ref_free_handles below); just
+     * clear it. The retired f/r chrom map and un-converted ref fold no longer
+     * exist. */
+    g_meth_orig_pac = NULL;
     if (out_opened) {
         fclose(aux.fp);
     }

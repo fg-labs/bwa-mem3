@@ -50,7 +50,10 @@ namespace { struct SpEncodeScope {
     ~SpEncodeScope() { if (on) sp_encode_add(sp_thread_cpu() - t0); }
 }; }
 
-meth_chrom_map_t *g_meth_cmap = NULL;
+/* D3 (--meth, PR-5): original-reference pac for XM:Z, set in fastmap.cpp.
+ * The meth output path is gated on opt->meth_mode (the chrom map that used to
+ * gate it was retired with the f/r output layer). */
+const uint8_t *g_meth_orig_pac = NULL;
 
 //----------------
 extern uint64_t tprof[LIM_R][LIM_C];
@@ -2040,7 +2043,7 @@ void mem_reg2sam(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
         if (p->secondary >= 0 && p->secondary < INT_MAX && p->score < a->a[p->secondary].score * opt->drop_ratio) continue;
         q = kv_pushp(mem_aln_t, aa);
 
-        *q = mem_reg2aln(opt, bns, pac, s->l_seq, s->seq, p);
+        *q = mem_reg2aln(opt, bns, pac, s->l_seq, s->seq, p, s->meth_orig_seq);
         assert(q->rid >= 0); // this should not happen with the new code
         q->XA = XA? XA[k] : 0;
         q->HN = HN? HN[k] : -1;
@@ -2104,11 +2107,13 @@ void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str,
     /* BAM short-circuit: meth_mode applies the bisulfite overlay (chrom
      * consolidation, YD:Z, chimera QC), plain bam_mode uses the generic
      * writer. Either path leaves `str` untouched. */
-    if (opt->meth_mode && g_meth_cmap != NULL) {
+    if (opt->meth_mode) {
         struct bam1_t *b = bam_writer_alloc();
         if (b == NULL)
             err_fatal(__func__, "out of memory allocating bam1_t for meth record");
-        if (meth_mem_aln_to_bam(b, opt, bns, s, n, list, which, m_, g_meth_cmap) != 0) {
+        /* `bns` here is the ORIGINAL bns under --meth (mem_aln_bns()); pair
+         * it with the original pac global for the XM:Z reference window. */
+        if (meth_mem_aln_to_bam(b, opt, bns, g_meth_orig_pac, s, n, list, which, m_) != 0) {
             bam_writer_free(b);
             err_fatal(__func__, "meth BAM conversion failed for read \"%s\"", s->name);
         }
@@ -2304,7 +2309,7 @@ void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str,
     str->s[str->l] = 0;  /* single trailing NUL — unsafe writers skipped this */
 }
 
-mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, int l_query, const char *query_, const mem_alnreg_t *ar)
+mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, int l_query, const char *query_, const mem_alnreg_t *ar, const char *meth_orig_query)
 {
     mem_aln_t a;
     int i, w2, tmp, qb, qe, NM, score, is_rev, last_sc = -(1<<30), l_MD;
@@ -2313,16 +2318,28 @@ mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *
 
     memset(&a, 0, sizeof(mem_aln_t));
     a.HN = -1; // sentinel: HN not computed unless caller fills from mem_gen_alt out_hn
+    a.meth_hypothesis = -1; // non-meth default; overwritten below from ar
     if (ar == 0 || ar->rb < 0 || ar->re < 0) { // generate an unmapped record
         a.rid = -1; a.pos = -1; a.flag |= 0x4;
         return a;
     }
+    a.meth_hypothesis = ar->meth_hypothesis; // carry hypothesis to the output layer
     qb = ar->qb, qe = ar->qe;
     rb = ar->rb, re = ar->re;
+    /* D3 (--meth, PR-5): output CIGAR/NM/MD must reflect the ORIGINAL read vs the
+     * ORIGINAL reference in the original alphabet, so a real (non-converting) SNP
+     * shows as a mismatch and the bisulfite C→T/G→A conversion shows as read-T at
+     * ref-C (the substrate a downstream double-masking step like Revelio expects;
+     * plan §4 / spec §6.1). When `meth_orig_query` is supplied, regen from the
+     * original bases; else fall back to the projected `query_` (non-meth path,
+     * byte-for-byte identical to legacy). */
+    const int use_meth_orig = (opt->meth_mode && meth_orig_query != NULL
+                               && ar->meth_hypothesis >= 0);
+    const char *regen_query = use_meth_orig ? meth_orig_query : query_;
     query = (uint8_t*) malloc(l_query);
     assert(query != NULL);
     for (i = 0; i < l_query; ++i) // convert to the nt4 encoding
-        query[i] = query_[i] < 5? query_[i] : nst_nt4_table[(int)query_[i]];
+        query[i] = regen_query[i] < 5? regen_query[i] : nst_nt4_table[(int)regen_query[i]];
     a.mapq = ar->secondary < 0? mem_approx_mapq_se(opt, ar) : 0;
     if (ar->secondary >= 0) a.flag |= 0x100; // secondary alignment
     tmp = infer_bw(qe - qb, re - rb, ar->truesc, opt->a, opt->o_del, opt->e_del);
@@ -2331,21 +2348,35 @@ mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *
     if (bwa_verbose >= 4) fprintf(stderr, "* Band width: inferred=%d, cmd_opt=%d, alnreg=%d\n", w2, opt->w, ar->w);
     if (w2 > opt->w) w2 = w2 < ar->w? w2 : ar->w;
     i = 0; a.cigar = 0;
-    /* D3-TODO(PR-4): the final CIGAR/NM/MD regen below still uses the PROJECTED
-     * read (query_ = s->seq, encoded above) and the symmetric opt->mat. This
-     * shapes OUTPUT only (CIGAR/NM/MD) — selection and MAPQ already derive from
-     * the batched γ scores (a->score/a->truesc), so leaving this symmetric does
-     * not affect placement tonight. The correct fix is the original read
-     * (meth_orig_seq) + per-hypothesis matrix (mem_opt_meth_mat(opt,
-     * ar->meth_hypothesis)); it is bundled with the PR-5 output-layer change
-     * because it needs the caller (mem_reg2sam / bwamem_pair.cpp) to pass the
-     * original bases — explicitly out of PR-4 scope per the plan. Using the
-     * asymmetric matrix here with the already-projected read would be WRONG
-     * (double-counting the conversion), so it is deliberately NOT changed. */
+    /* D3 (--meth, PR-5): native-alphabet output regen.
+     *   - `regen_query` is the ORIGINAL read (meth_orig_query) under --meth, else
+     *     the projected read for non-meth (legacy, unchanged).
+     *   - `regen_mat` is the per-hypothesis ASYMMETRIC matrix under --meth so the
+     *     CIGAR/gap shape matches the asymmetric extension that selected this
+     *     region (using the symmetric matrix with the ORIGINAL read would
+     *     re-penalize every conversion as a mismatch and can shift gaps); for
+     *     non-meth it is the symmetric opt->mat (legacy, unchanged).
+     *
+     * D3-TODO(PR-5 gating): NM/MD-vs-conversion policy DECISION (do NOT silently
+     * resolve further without sign-off). bwa_gen_cigar2 computes NM/MD by LITERAL
+     * base comparison (query[x+i] != rseq[y+i]), independent of `regen_mat`. So a
+     * bisulfite C→T (OT) / G→A (OB) at a ref-C/ref-G is COUNTED as one mismatch in
+     * NM and emitted in MD, exactly like a real SNP — it is NOT hidden. This is
+     * deliberate: it is the substrate a downstream Revelio-style double-mask +
+     * conventional caller expects (the conversion is visible as read-T at ref-C,
+     * then BQ-masked downstream; the aligner does no masking — plan §4 RESOLVED).
+     * The conversion is NOT double-counted against the alignment SCORE: the
+     * asymmetric `regen_mat` frees the conversion cell to a match (+a) for the DP,
+     * while NM/MD count it once as a literal mismatch — two separate concerns.
+     * If the gating team instead wants conversions HIDDEN from NM/MD (e.g. a
+     * Bismark-style XM-only consumer), that is a different, explicit choice and
+     * must be made here, not assumed. */
+    const int8_t *regen_mat = use_meth_orig
+        ? mem_opt_meth_mat(opt, ar->meth_hypothesis) : opt->mat;
     do {
         free(a.cigar);
         w2 = w2 < opt->w<<2? w2 : opt->w<<2;
-        a.cigar = bwa_gen_cigar2(opt->mat, opt->o_del, opt->e_del, opt->o_ins, opt->e_ins, w2, bns->l_pac, pac, qe - qb, (uint8_t*)&query[qb], rb, re, &score, &a.n_cigar, &NM);
+        a.cigar = bwa_gen_cigar2(regen_mat, opt->o_del, opt->e_del, opt->o_ins, opt->e_ins, w2, bns->l_pac, pac, qe - qb, (uint8_t*)&query[qb], rb, re, &score, &a.n_cigar, &NM);
         if (bwa_verbose >= 4) fprintf(stderr, "* Final alignment: w2=%d, global_sc=%d, local_sc=%d\n", w2, score, ar->truesc);
         if (score == last_sc || w2 == opt->w<<2) break; // it is possible that global alignment and local alignment give different scores
         last_sc = score;

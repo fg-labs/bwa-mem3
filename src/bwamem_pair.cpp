@@ -577,7 +577,7 @@ int mem_sam_pe(const mem_opt_t *opt, const bntseq_t *bns,
         } else XA[0] = XA[1] = 0;
         // write SAM
         for (i = 0; i < 2; ++i) {
-            h[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, &a[i].a[z[i]]);
+            h[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, &a[i].a[z[i]], s[i].meth_orig_seq);
             h[i].mapq = q_se[i];
 
             h[i].flag |= 0x40<<i | extra_flag;
@@ -587,7 +587,7 @@ int mem_sam_pe(const mem_opt_t *opt, const bntseq_t *bns,
             if (n_pri[i] < a[i].n) { // the read has ALT hits
                 mem_alnreg_t *p = &a[i].a[n_pri[i]];
                 if (p->score < opt->T || p->secondary >= 0 || !p->is_alt) continue;
-                g[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, p);
+                g[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, p, s[i].meth_orig_seq);
                 g[i].flag |= 0x800 | 0x40<<i | extra_flag;
                 g[i].XA = XA[i]? XA[i][n_pri[i]] : 0;
                 g[i].HN = HN[i]? HN[i][n_pri[i]] : -1;
@@ -635,7 +635,7 @@ int mem_sam_pe(const mem_opt_t *opt, const bntseq_t *bns,
             else if (n_pri[i] < a[i].n && a[i].a[n_pri[i]].score >= opt->T)
                 which[i] = n_pri[i];
         }
-        if (which[i] >= 0) h[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, &a[i].a[which[i]]);
+        if (which[i] >= 0) h[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, &a[i].a[which[i]], s[i].meth_orig_seq);
         else h[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, 0);
     }
     // Proper-pair flag must be computed from the same alignments that were just
@@ -981,7 +981,7 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
         } else XA[0] = XA[1] = 0;
         // write SAM
         for (i = 0; i < 2; ++i) {
-            h[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, &a[i].a[z[i]]);
+            h[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, &a[i].a[z[i]], s[i].meth_orig_seq);
             h[i].mapq = q_se[i];
 
             h[i].flag |= 0x40<<i | extra_flag;
@@ -991,7 +991,7 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
             if (n_pri[i] < a[i].n) { // the read has ALT hits
                 mem_alnreg_t *p = &a[i].a[n_pri[i]];
                 if (p->score < opt->T || p->secondary >= 0 || !p->is_alt) continue;
-                g[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, p);
+                g[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, p, s[i].meth_orig_seq);
                 g[i].flag |= 0x800 | 0x40<<i | extra_flag;
                 g[i].XA = XA[i]? XA[i][n_pri[i]] : 0;
                 g[i].HN = HN[i]? HN[i][n_pri[i]] : -1;
@@ -1039,7 +1039,7 @@ no_pairing:
             else if (n_pri[i] < a[i].n && a[i].a[n_pri[i]].score >= opt->T)
                 which[i] = n_pri[i];
         }
-        if (which[i] >= 0) h[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, &a[i].a[which[i]]);
+        if (which[i] >= 0) h[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, &a[i].a[which[i]], s[i].meth_orig_seq);
         else h[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, 0);
     }
     // Proper-pair flag must be computed from the same alignments that were just

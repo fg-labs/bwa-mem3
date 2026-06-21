@@ -215,6 +215,11 @@ typedef struct { // This struct is only used for the convenience of API.
     int HN;          // total # of hits clustered with this primary under XA_drop_ratio; -1 when not computed (e.g., MEM_F_ALL)
 
     int score, sub, alt_sc;
+    /* D3 (--meth, PR-5): bisulfite hypothesis (1=OT, 0=OB, -1=non-meth),
+     * copied from the source mem_alnreg_t in mem_reg2aln. The output layer
+     * (meth_mem_aln_to_bam) sources the XG strand tag and the XM source
+     * strand from THIS, not from the (now retired) f/r contig direction. */
+    int8_t meth_hypothesis;
 } mem_aln_t;
 
 // struct
@@ -502,8 +507,16 @@ void mem_process_seqs(mem_opt_t *opt, int64_t n_processed,
  *
  * @return       CIGAR, strand, mapping quality and forward-strand position
  */
+/* D3 (--meth, PR-5): `meth_orig_query` is the read's ORIGINAL (un-projected)
+ * bases (bseq1_t.meth_orig_seq), same orientation/order as `seq`. When non-NULL
+ * under --meth, the final CIGAR/NM/MD regen runs the ORIGINAL read against the
+ * ORIGINAL reference with the per-hypothesis asymmetric matrix
+ * (mem_opt_meth_mat(opt, ar->meth_hypothesis)) so output is native-alphabet.
+ * NULL (the default) preserves the legacy symmetric `seq`-vs-ref regen exactly
+ * for the non-meth path. */
 mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
-                      int l_seq, const char *seq, const mem_alnreg_t *ar);
+                      int l_seq, const char *seq, const mem_alnreg_t *ar,
+                      const char *meth_orig_query = NULL);
 
 
 /**
