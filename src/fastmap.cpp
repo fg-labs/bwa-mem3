@@ -1087,6 +1087,7 @@ int main_mem(int argc, char *argv[])
         OPT_METH_CHIMERA_QC,
         OPT_SUPP_REP_HARD_CAP,
         OPT_LEGACY_READER,
+        OPT_MIN_EXT_LEN,
 #ifdef STAGE_PROF
         OPT_PROFILE,
 #endif
@@ -1094,6 +1095,7 @@ int main_mem(int argc, char *argv[])
     };
     static struct option long_opts[] = {
         {"bam",                      optional_argument, 0, OPT_BAM},
+        {"min-ext-len",              required_argument, 0, OPT_MIN_EXT_LEN},
         {"meth",                     no_argument,       0, OPT_METH},
         {"set-as-failed",            required_argument, 0, OPT_METH_SET_AS_FAILED},
         {"chimera-qc",               no_argument,       0, OPT_METH_CHIMERA_QC},
@@ -1112,6 +1114,7 @@ int main_mem(int argc, char *argv[])
                             long_opts, NULL)) >= 0)
     {
         if (c == 'k') opt->min_seed_len = atoi(optarg), opt0.min_seed_len = 1;
+        else if (c == OPT_MIN_EXT_LEN) opt->min_ext_len = atoi(optarg), opt0.min_ext_len = 1;
         else if (c == '1') no_mt_io = 1;
         else if (c == 'x') mode = optarg;
         else if (c == 'w') opt->w = atoi(optarg), opt0.w = 1;
