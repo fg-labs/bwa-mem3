@@ -1570,11 +1570,11 @@ int main_mem(int argc, char *argv[])
      * on worker_t::meth_orig_*. Load the ORIGINAL unpacked reference here (the
      * seed `.0123` is still loaded below as `ref_string`, but is unused after the
      * remap; kept for the non-meth code path's invariants).
-     * D3-TODO(PR-3 gating): extension/mate-rescue scoring is still SYMMETRIC and
-     * uses the PROJECTED read tonight (PR-4 swaps in the asymmetric matrix +
-     * original read). Per plan §6 (B1) NO placement/MAPQ/concordance assertion
-     * may gate PR-3 — tomorrow's gating covers remap round-trip, original-handle
-     * load, and PE/strand placement only. */
+     * Extension and mate-rescue score the ORIGINAL read against the original
+     * reference with the per-hypothesis asymmetric OT/OB matrix (PR-4 + A1: the
+     * batched extension partitions a mixed PE batch by hypothesis; mate rescue
+     * routes meth pairs through the scalar ksw_align2 path). The projected read is
+     * used only for seeding against the `.meth` FM-index. */
     if (opt->meth_mode && meth_orig_ref_prefix != NULL) {
         int64_t orig_rlen = 0;
         int     orig_is_shm = 0;   /* original .0123 is never in shm; force disk */
@@ -1733,7 +1733,17 @@ int main_mem(int argc, char *argv[])
          * un-converted ref view. The per-record path needs only the original
          * pac global (the original bns reaches it via mem_aln_bns()). With
          * output disabled there is no writer to open, but the global must still
-         * be set so meth_mem_aln_to_bam builds correct XM/coords. */
+         * be set so meth_mem_aln_to_bam builds correct XM/coords. Mirror the
+         * non-DISABLE_OUTPUT guard below: a NULL original bns/pac (e.g. the
+         * degenerate "prefix too long" path never loaded the handles) would
+         * otherwise let chaining run against a NULL original reference and
+         * silently corrupt coordinates. */
+        if (aux.meth_orig_bns == NULL || aux.meth_orig_pac == NULL) {
+            fprintf(stderr, "ERROR: meth: original reference (bns/pac) not loaded\n");
+            free(opt);
+            delete aux.fmi;
+            return 1;
+        }
         g_meth_orig_pac = aux.meth_orig_pac;
     }
     (void)is_o;

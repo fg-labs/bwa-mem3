@@ -161,8 +161,9 @@ typedef struct {
      * contract) each read is projected under a SINGLE hypothesis (R1→OT, R2→OB),
      * so all of a read's seeds carry the same label and no cross-hypothesis merge
      * can occur; test_and_merge is therefore NOT hypothesis-guarded.
-     * D3-TODO(PR-3 gating): if non-directional / dual-hypothesis-per-read support
-     * is ever added, test_and_merge MUST gain a hypothesis guard. */
+     * NOTE (--meth directional invariant): if non-directional / dual-hypothesis-
+     * per-read support is ever added, test_and_merge MUST gain a hypothesis guard
+     * (it is currently safe only because each read is single-hypothesis). */
     int8_t meth_hypothesis;
 } mem_chain_t;
 
@@ -437,7 +438,8 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                           const uint8_t *pac, const mem_pestat_t pes[4],
                           const mem_alnreg_t *a, int l_ms, const uint8_t *ms,
                           mem_alnreg_v *ma, kswr_t **myaln, int32_t gcnt,
-                          int32_t *gar, mem_cache *mmc);
+                          int32_t *gar, mem_cache *mmc, const char *ms_orig = NULL,
+                          const int8_t *mat = NULL);
 
 int mem_sam_pe(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
                const mem_pestat_t pes[4], uint64_t id, bseq1_t s[2],
