@@ -483,13 +483,18 @@ int kswv::kswv_neon_u8(uint8_t seq1SoA[],
             imax_vec = vmaxq_u8(imax_vec, h11);
             iqe_vec = vbslq_u8(cmp0, l_vec, iqe_vec);
 
-            /* Gap extension for E */
-            uint8x16_t gapE = vqsubq_u8(h11, oe_ins_vec);
+            /* Reassociate BOTH gap recurrences off h11 (Daily-scan algebra).
+             * e uses max(m11,f11), f uses max(m11,e11) — each drops the term
+             * dominated by its own extension arg (O>=0, saturating u8). me must
+             * read the OLD e11, so compute it before the e-update overwrites e11. */
+            uint8x16_t mf = vmaxq_u8(m11, f11);
+            uint8x16_t me = vmaxq_u8(m11, e11);
+            uint8x16_t gapE = vqsubq_u8(mf, oe_ins_vec);
             e11 = vqsubq_u8(e11, e_ins_vec);
             e11 = vmaxq_u8(gapE, e11);
 
-            /* Gap extension for F */
-            uint8x16_t gapD = vqsubq_u8(h11, oe_del_vec);
+            /* Gap extension for F (reassociated) */
+            uint8x16_t gapD = vqsubq_u8(me, oe_del_vec);
             f21 = vqsubq_u8(f11, e_del_vec);
             f21 = vmaxq_u8(gapD, f21);
 
@@ -1024,11 +1029,16 @@ int kswv::kswv_neon_16(int16_t seq1SoA[],
             imax_vec = vmaxq_s16(imax_vec, h11);
             iqe_vec  = vbslq_s16(cmp0, l_vec, iqe_vec);
 
-            int16x8_t gapE = vsubq_s16(h11, oe_ins_vec);
+            /* Reassociate both gap recurrences off h11 (variant C: h11 is
+             * clamped to 0 above, so fold that 0 into mf/me to preserve the
+             * floor). me reads OLD e11 — compute before the e-update. */
+            int16x8_t mf = vmaxq_s16(vmaxq_s16(m11, f11), zero_vec);
+            int16x8_t me = vmaxq_s16(vmaxq_s16(m11, e11), zero_vec);
+            int16x8_t gapE = vsubq_s16(mf, oe_ins_vec);
             e11 = vsubq_s16(e11, e_ins_vec);
             e11 = vmaxq_s16(gapE, e11);
 
-            int16x8_t gapD = vsubq_s16(h11, oe_del_vec);
+            int16x8_t gapD = vsubq_s16(me, oe_del_vec);
             int16x8_t f21  = vsubq_s16(f11, e_del_vec);
             f21 = vmaxq_s16(gapD, f21);
 

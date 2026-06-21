@@ -3894,11 +3894,15 @@ _mm_blendv_epi16(__m128i x, __m128i y, __m128i mask)
         m11 = _mm_blendv_epi16(m11, zero128, cmp11);                    \
         h11 = _mm_max_epi16(m11, e11);                                  \
         h11 = _mm_max_epi16(h11, f11);                                  \
-        __m128i temp128 = _mm_sub_epi16(h11, oe_ins128);                \
+        /* Reassociate gap recurrences off h11 (variant B, signed; keep   \
+         * the existing max(.,0) floor). me reads OLD e11. */              \
+        __m128i mf128 = _mm_max_epi16(m11, f11);                        \
+        __m128i me128 = _mm_max_epi16(m11, e11);                        \
+        __m128i temp128 = _mm_sub_epi16(mf128, oe_ins128);             \
         __m128i val128  = _mm_max_epi16(temp128, zero128);              \
         e11 = _mm_sub_epi16(e11, e_ins128);                             \
         e11 = _mm_max_epi16(val128, e11);                               \
-        temp128 = _mm_sub_epi16(h11, oe_del128);                        \
+        temp128 = _mm_sub_epi16(me128, oe_del128);                     \
         val128  = _mm_max_epi16(temp128, zero128);                      \
         f21 = _mm_sub_epi16(f11, e_del128);                             \
         f21 = _mm_max_epi16(val128, f21);                               \
@@ -4664,11 +4668,15 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
         m11 = _mm_blendv_epi8(m11, zero128, cmp11);  /* h00==0 -> local restart */ \
         h11 = _mm_max_epu8(m11, e11);                                   \
         h11 = _mm_max_epu8(h11, f11);                                   \
-        __m128i temp128 = _mm_subs_epu8(h11, oe_ins128);                \
-        e11 = _mm_subs_epu8(e11, e_ins128);                             \
+        /* Reassociate gap recurrences off h11 (variant A, saturating u8). \
+         * me reads OLD e11 — compute before the e-update. */               \
+        __m128i mf128 = _mm_max_epu8(m11, f11);                         \
+        __m128i me128 = _mm_max_epu8(m11, e11);                         \
+        __m128i temp128 = _mm_subs_epu8(mf128, oe_ins128);             \
+        e11 = _mm_subs_epu8(e11, e_ins128);                            \
         e11 = _mm_max_epu8(temp128, e11);                               \
-        temp128 = _mm_subs_epu8(h11, oe_del128);                        \
-        f21 = _mm_subs_epu8(f11, e_del128);                             \
+        temp128 = _mm_subs_epu8(me128, oe_del128);                     \
+        f21 = _mm_subs_epu8(f11, e_del128);                            \
         f21 = _mm_max_epu8(temp128, f21);                               \
     }
 
