@@ -1,5 +1,57 @@
 # Changelog
 
+## [0.3.0](https://github.com/fg-labs/bwa-mem3/compare/v0.2.2...v0.3.0) (2026-06-21)
+
+
+### Features
+
+* **bsw:** make the 8-bit h0-prefix seed unsigned [0,255] ([#151](https://github.com/fg-labs/bwa-mem3/issues/151)) ([9f51c5f](https://github.com/fg-labs/bwa-mem3/commit/9f51c5f521612a7c3e1c0dae9d71db38be0121b8))
+* **bsw:** recover the 8-bit banded Smith–Waterman path for reads ≥128 bp ([#140](https://github.com/fg-labs/bwa-mem3/issues/140)) ([155a916](https://github.com/fg-labs/bwa-mem3/commit/155a91632de602663377197ff1168d200a24f344))
+* **kswv:** AVX2 16-bit mate-rescue kernel (kswv256_16) ([#162](https://github.com/fg-labs/bwa-mem3/issues/162)) ([9107b82](https://github.com/fg-labs/bwa-mem3/commit/9107b825189da87822bccac152e4a98daf00aac1))
+* **meth:** carry original-reference @SQ M5/UR and @CO/@PG into --meth headers ([#139](https://github.com/fg-labs/bwa-mem3/issues/139)) ([e94ad8b](https://github.com/fg-labs/bwa-mem3/commit/e94ad8b847b6637b95aea6dff3e07f560e22a532))
+* **prof:** off-by-default --profile stage-timing instrumentation ([#152](https://github.com/fg-labs/bwa-mem3/issues/152)) ([83cf7ab](https://github.com/fg-labs/bwa-mem3/commit/83cf7ab9d8e4589354e16654726fbdfaa1b4b63c))
+* **reader:** content-detecting FASTQ reader fast path (libdeflate BGZF) ([#128](https://github.com/fg-labs/bwa-mem3/issues/128)) ([cdd71bf](https://github.com/fg-labs/bwa-mem3/commit/cdd71bf4590cf2e1a5d908d6e852f780c93c3a8a))
+
+
+### Bug Fixes
+
+* **bsw:** bound getScores8/16 prefetch reads to the padding contract ([#150](https://github.com/fg-labs/bwa-mem3/issues/150)) ([87ed5d4](https://github.com/fg-labs/bwa-mem3/commit/87ed5d4a78b6b78789bca45be5649373576ee668))
+* **fmi:** widen mem_lim to int64 and guard SA-entry allocations ([#156](https://github.com/fg-labs/bwa-mem3/issues/156)) ([2d18c1e](https://github.com/fg-labs/bwa-mem3/commit/2d18c1ed00de5e4a60fa31d15fec04c7b74877a0))
+* **kthread:** drive kt_for with a persistent worker pool ([#154](https://github.com/fg-labs/bwa-mem3/issues/154)) ([26b24e7](https://github.com/fg-labs/bwa-mem3/commit/26b24e7bac9fd7f73921b902ba98a628776087b6))
+* **meth:** emit -R read group as @RG header in --meth mode ([#137](https://github.com/fg-labs/bwa-mem3/issues/137)) ([ccd1fc5](https://github.com/fg-labs/bwa-mem3/commit/ccd1fc56d26bfd54ab1f9604845332353afd75a6))
+* **seeding:** widen SMEM read positions from int16_t to int32_t ([#142](https://github.com/fg-labs/bwa-mem3/issues/142)) ([037c418](https://github.com/fg-labs/bwa-mem3/commit/037c418b3b3c49deeb41bd57e37eacc7895e6fca))
+* **test:** make meth layer-2 FAIL diagnostics reachable under set -e ([#133](https://github.com/fg-labs/bwa-mem3/issues/133)) ([d2d6688](https://github.com/fg-labs/bwa-mem3/commit/d2d66880bce736900b81e7610cbae1d1556ba7ea))
+
+
+### Performance
+
+* **bsw:** AVX2 SIMD tuning for the Smith-Waterman kernels ([#161](https://github.com/fg-labs/bwa-mem3/issues/161)) ([458b216](https://github.com/fg-labs/bwa-mem3/commit/458b21653cb6f84808032360a85a78f291064a4e))
+* **bsw:** NEON SIMD tuning for the Smith-Waterman kernels ([#160](https://github.com/fg-labs/bwa-mem3/issues/160)) ([d971ff0](https://github.com/fg-labs/bwa-mem3/commit/d971ff0694d8a90cf836dfff873534c9d3a160a4))
+* **bsw:** prefetch next batch's ref/query in the AVX2 8-bit wrapper ([#163](https://github.com/fg-labs/bwa-mem3/issues/163)) ([e6082a0](https://github.com/fg-labs/bwa-mem3/commit/e6082a05fc6af07da26dae90210ea651b601dd91))
+* **bsw:** short-circuit the inert per-row re-baseline scan ([#147](https://github.com/fg-labs/bwa-mem3/issues/147)) ([8e284e0](https://github.com/fg-labs/bwa-mem3/commit/8e284e0cf274e8c77c78457e372c1ab92de69f3f))
+* **bsw:** vectorize the per-row epilogue side-channel loop ([#149](https://github.com/fg-labs/bwa-mem3/issues/149)) ([403aeb7](https://github.com/fg-labs/bwa-mem3/commit/403aeb76ad8ec2664736998c018a7e033af0c070))
+* **fmi:** size SA-entry staging buffers to the exact write count ([#157](https://github.com/fg-labs/bwa-mem3/issues/157)) ([aa0fe33](https://github.com/fg-labs/bwa-mem3/commit/aa0fe3335c58badf97893fae32f67ff02f69217a))
+* **read:** vendored zlib-ng inflate + chunk cap + 3rd pipeline worker ([#153](https://github.com/fg-labs/bwa-mem3/issues/153)) ([5cf89e3](https://github.com/fg-labs/bwa-mem3/commit/5cf89e3c60e01bec089183e511efa27327414035))
+* **sw:** reassociate affine-gap recurrences on NEON (kswv + bandedSWA) ([#166](https://github.com/fg-labs/bwa-mem3/issues/166)) ([a02fcb4](https://github.com/fg-labs/bwa-mem3/commit/a02fcb446574d5b5d03abdbf73c9b129deead2d4))
+
+
+### Refactoring
+
+* **bsw:** derive extension gaps from H (standard Gotoh), not M ([#141](https://github.com/fg-labs/bwa-mem3/issues/141)) ([f715fbd](https://github.com/fg-labs/bwa-mem3/commit/f715fbd92b4c4acabe7b7ab8dde35d5ad7fe211c))
+* **bsw:** drop the dead qlen[] parameter from the 8-bit kernels ([#143](https://github.com/fg-labs/bwa-mem3/issues/143)) ([42321df](https://github.com/fg-labs/bwa-mem3/commit/42321df6100f04451b8a4d5ed7f214ea28522ec8))
+* **bsw:** remove dead SW code paths (SORT_PAIRS, non-CORE macros, SSE2 polyfill) ([#148](https://github.com/fg-labs/bwa-mem3/issues/148)) ([ad8937e](https://github.com/fg-labs/bwa-mem3/commit/ad8937ef05fb48992ca61be70c21d4b6e245a7b3))
+
+
+### Documentation
+
+* add memory budgeting and data-type tuning guide ([#145](https://github.com/fg-labs/bwa-mem3/issues/145)) ([7127d80](https://github.com/fg-labs/bwa-mem3/commit/7127d80f7204c7951bf74d8191a883c4e0f00a82))
+* add situational --supp-rep-hard-cap 20 note for SV-aware pipelines ([#134](https://github.com/fg-labs/bwa-mem3/issues/134)) ([e20bc0e](https://github.com/fg-labs/bwa-mem3/commit/e20bc0e28d3501a732e9b1eba88a9920ec877bae))
+* **perf:** refresh reference-architecture table to v0.3.0 (a02fcb4) ([#167](https://github.com/fg-labs/bwa-mem3/issues/167)) ([2cd7bfa](https://github.com/fg-labs/bwa-mem3/commit/2cd7bfa1cfb5392856905df3b88cebeda2a1d659))
+* **perf:** what drives the speedup, full perf-PR catalog, and fix the stale RTD build ([#155](https://github.com/fg-labs/bwa-mem3/issues/155)) ([0b01fb7](https://github.com/fg-labs/bwa-mem3/commit/0b01fb73a2e9a8b9e8899f30b2afd94c9e6a1418))
+* recommend -s 0 for --meth Pass-2 re-seeding in settings profiles ([#132](https://github.com/fg-labs/bwa-mem3/issues/132)) ([45e02e0](https://github.com/fg-labs/bwa-mem3/commit/45e02e0095f862c99eaf99273b2912ff2229ec9b))
+* recommend a recent compiler on aarch64, with measured NEON numbers ([#165](https://github.com/fg-labs/bwa-mem3/issues/165)) ([b591684](https://github.com/fg-labs/bwa-mem3/commit/b59168479ddb0fddba86cd0eb0e61ee0a1c8fcb0))
+* settings profiles (bwa drop-in vs recommended) ([#131](https://github.com/fg-labs/bwa-mem3/issues/131)) ([4d845c9](https://github.com/fg-labs/bwa-mem3/commit/4d845c92154d29f944191ec080009d916ce4b72b))
+
 ## [0.2.2](https://github.com/fg-labs/bwa-mem3/compare/v0.2.1...v0.2.2) (2026-06-08)
 
 
