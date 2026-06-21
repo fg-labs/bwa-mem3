@@ -84,6 +84,8 @@ low-MAPQ deep-rescue tail: the mapped count only ever *decreases* (it never newl
 previously-unmapped read), and the handful of reads whose placement does change net to ≈0 recall
 against golden truth.
 
+One caveat: this golden-truth metric scores a single best placement per read, so it does not capture downstream tools that *aggregate over repeats* — depth-based CNV, SV/mobile-element calling in repetitive regions, or repeat-region methylation. If your pipeline relies on which repeat copy is reported (rather than just the confident, MAPQ-high tier), validate `-m 10` against your own analysis rather than assuming neutrality.
+
 Numbers are from [bwa-mem3-bench](../related-projects/bwa-mem3-bench.md) on 5 M-read real datasets
 plus a multi-contig holodeck golden-truth ablation; consult the bench for methodology and current
 figures.
