@@ -209,6 +209,25 @@ chain.
 Discards chains with fewer than `INT` seeded bases. Raising this filters out
 very short, low-confidence chains.
 
+#### `--min-ext-len INT` — skip Smith-Waterman extension of short seeds
+
+Off by default (`0`) → output byte-identical to baseline. When `INT > 0`, seeds
+shorter than `INT` bp are dropped before banded Smith-Waterman, so their
+extension never runs. Short seeds carry the large majority of extension work but
+rarely change the final alignment (long seeds resolve via the ungapped
+fast-path), so skipping them trims alignment CPU — roughly 10–20 % single-thread
+on Illumina WGS, more on data with many short seeds.
+
+`30` is the recommended value: on real HG002 WGS it gives ~20 % lower alignment
+CPU while any accuracy change is confined to reads that were already
+low-confidence (heavily soft-clipped, high edit distance, or multi-mapping) —
+confidently, uniquely mapped reads are unaffected. Larger values (40–50) are
+also accuracy-safe on known-clean data but trade accuracy on divergent data.
+Keep it low or off for libraries with very high per-base error (degraded
+chemistry, cross-species); indels and structural variants are *not* a
+contraindication. See
+[Features — short-seed extension filter](../whats-different/features.md#--min-ext-len-short-seed-extension-filter).
+
 #### `-h INT[,INT]` — secondary alignment reporting
 
 If there are fewer than `INT` hits with score exceeding `FLOAT` (see `-z`)

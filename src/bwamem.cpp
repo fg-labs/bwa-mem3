@@ -255,6 +255,7 @@ mem_opt_t *mem_opt_init()
     o->max_mem_intv = 20;
 
     o->min_seed_len = 19;
+    o->min_ext_len = 0;   // off by default -> byte-identical to baseline
     o->split_width = 10;
     o->max_occ = 500;
     o->max_chain_gap = 10000;
@@ -627,6 +628,22 @@ void mem_print_chain(const bntseq_t *bns, mem_chain_v *chn)
     }
 }
 
+// Skip-short-seed extension filter: drop seeds shorter than min_ext_len from a
+// chain in place, so they are never extended (their banded Smith-Waterman is
+// skipped downstream). Stable compaction -- surviving seeds keep their order.
+// Returns the new seed count. min_ext_len <= 0 is a no-op, which keeps default
+// output byte-identical to baseline.
+int mem_chain_drop_short_seeds(mem_chain_t *c, int min_ext_len)
+{
+    if (min_ext_len <= 0) return c->n;
+    int j, k;
+    for (j = k = 0; j < c->n; ++j)
+        if (c->seeds[j].len >= min_ext_len)
+            c->seeds[k++] = c->seeds[j];
+    c->n = k;
+    return c->n;
+}
+
 void mem_flt_chained_seeds(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
                            bseq1_t *seq_, int n_chn, mem_chain_t *a)
 {
@@ -641,6 +658,12 @@ void mem_flt_chained_seeds(const mem_opt_t *opt, const bntseq_t *bns, const uint
         mem_chain_t *c = &a[i];
         const uint8_t *query = (uint8_t*) seq_[c->seqid].seq;
         int l_query = seq_[c->seqid].l_seq;
+
+        // Skip-short-seed extension filter (opt->min_ext_len). Placed BEFORE the
+        // MEM_SEEDSW_COEF screen `continue` below, which is skipped for typical
+        // read lengths -- dropping seeds inside that loop would no-op on the main
+        // workload. Off (min_ext_len==0): no-op, output byte-identical.
+        mem_chain_drop_short_seeds(c, opt->min_ext_len);
 
         double min_l = opt->min_chain_weight?
         MEM_HSP_COEF * opt->min_chain_weight : MEM_MINSC_COEF * log(l_query);

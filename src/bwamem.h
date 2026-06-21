@@ -88,6 +88,7 @@ typedef struct mem_opt_t {
     int T;                  // output score threshold; only affecting output
     int flag;               // see MEM_F_* macros
     int min_seed_len;       // minimum seed length
+    int min_ext_len;        // seeds shorter than this are not extended (0 = off)
     int min_chain_weight;
     int max_chain_extend;
     float split_factor;     // split into a seed if MEM is longer than min_seed_len*split_factor
@@ -276,6 +277,11 @@ const bwtintv_v *smem_next(smem_i *itr);
 
 mem_opt_t *mem_opt_init(void);
 void mem_fill_scmat(int a, int b, int8_t mat[25]);
+
+// Skip-short-seed extension filter: drop seeds shorter than min_ext_len from a
+// chain in place (stable; surviving seeds keep their order). Returns the new
+// seed count. min_ext_len <= 0 is a no-op. See mem_opt_t::min_ext_len.
+int mem_chain_drop_short_seeds(mem_chain_t *c, int min_ext_len);
 
 void mem_reg2sam(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
                  bseq1_t *s, mem_alnreg_v *a, int extra_flag, const mem_aln_t *m);
