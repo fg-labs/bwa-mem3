@@ -446,6 +446,15 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
                     snprintf(comment + off, yslen - off, "\t%s", prior);
                 free(s->comment);
                 s->comment = comment;
+                /* Retain the ORIGINAL (unconverted) read bases as a first-class
+                 * field BEFORE the in-place projection below overwrites s->seq.
+                 * Same orientation/order as s->seq (original read order, ASCII);
+                 * downstream consumers must RC it wherever they RC s->seq — see
+                 * the bseq1_t.meth_orig_seq orientation contract in bwa.h.
+                 * strdup is fine for the draft; freed in the per-batch free
+                 * loop below alongside s->seq. */
+                s->meth_orig_seq = strdup(s->seq);
+                assert(s->meth_orig_seq != NULL);
                 /* Project in place. */
                 for (int j = 0; j < l; ++j) {
                     char c = s->seq[j];
@@ -643,6 +652,7 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
                 free(ret->seqs[i+k].qual);
                 free(ret->seqs[i+k].sam);
                 free(ret->seqs[i+k].bams);
+                free(ret->seqs[i+k].meth_orig_seq); /* NULL outside --meth; free() is NULL-safe */
             }
             i += group_size;
         }
@@ -825,6 +835,17 @@ static int process(void *shared, gzFile gfp, gzFile gfp2, int pipe_threads)
     // threading ref_string through every signature on the way down.
     w.mmc.ref_string = aux->ref_string;
     w.fmi = aux->fmi;
+    /* D3 (--meth, PR-3): hand the ORIGINAL bns/pac/.0123 to the worker so the
+     * (remapped, original-coord) seeds chain/extend/pair/output against the
+     * original reference. NULL outside --meth → mem_aln_* fall back to the seed
+     * index and the non-meth path is unchanged. The batched mate-rescue helpers
+     * read the ref via w.mmc.ref_string, so point THAT at the original .0123 too
+     * in --meth (else mate rescue would fetch SEED bases at original coords). */
+    w.meth_orig_bns        = aux->meth_orig_bns;
+    w.meth_orig_pac        = aux->meth_orig_pac;
+    w.meth_orig_ref_string = aux->meth_orig_ref_string;
+    if (aux->opt->meth_mode && aux->meth_orig_ref_string != NULL)
+        w.mmc.ref_string = aux->meth_orig_ref_string;
     w.nreads  = nreads;
     // w.memSize = nreads;
 
@@ -1043,6 +1064,59 @@ static uint8_t *load_ref_string(const char *prefix, uint8_t *shm_base,
 
     *rlen_out = rlen;
     return buf;
+}
+
+/* D3 (--meth) only: load the ORIGINAL reference's bns + pac (un-converted, real
+ * chrom names) from `prefix` as resident handles for the future extension/scoring
+ * phase, distinct from the seed FM-index. Mirrors indexEle::bwa_idx_load_ele's
+ * disk path (bns_restore then slurp the full .pac into memory and close fp_pac).
+ * On success writes *bns_out / *pac_out and returns 0; on failure frees any
+ * partial allocation, leaves the out-params NULL, and returns -1. */
+static int meth_orig_ref_load_handles(const char *prefix,
+                                      bntseq_t **bns_out, uint8_t **pac_out)
+{
+    *bns_out = NULL;
+    *pac_out = NULL;
+    bntseq_t *bns = bns_restore(prefix);
+    if (bns == NULL) {
+        fprintf(stderr,
+                "ERROR: --meth could not load the original reference bns from "
+                "'%s.{amb,ann,pac}'\n", prefix);
+        return -1;
+    }
+    int64_t pac_bytes = bns->l_pac / 4 + 1;
+    uint8_t *pac = (uint8_t*) calloc(pac_bytes, 1);
+    if (pac == NULL) {
+        fprintf(stderr, "ERROR: --meth failed to allocate %lld bytes for the "
+                "original reference pac\n", (long long)pac_bytes);
+        bns_destroy(bns);
+        return -1;
+    }
+    bwamem_madv_hugepage(pac, pac_bytes);
+    /* bns_restore left .pac open in bns->fp_pac; slurp it whole, then close. */
+    err_fread_noeof(pac, 1, pac_bytes, bns->fp_pac);
+    err_fclose(bns->fp_pac);
+    bns->fp_pac = NULL;
+
+    *bns_out = bns;
+    *pac_out = pac;
+    return 0;
+}
+
+/* Free the original-reference handles loaded by meth_orig_ref_load_handles and
+ * NULL them. Idempotent (NULL-safe) so it can sit on every exit path the seed
+ * index is freed on without double-free risk. */
+static void meth_orig_ref_free_handles(ktp_aux_t *aux)
+{
+    if (aux->meth_orig_pac != NULL) { free(aux->meth_orig_pac); aux->meth_orig_pac = NULL; }
+    if (aux->meth_orig_bns != NULL) { bns_destroy(aux->meth_orig_bns); aux->meth_orig_bns = NULL; }
+    /* D3 (--meth, PR-3): the original .0123 ref_string is always _mm_malloc'd by
+     * load_ref_string's disk path (we pass shm_base=NULL), so it is never a shm
+     * alias — free it with _mm_free unconditionally. */
+    if (aux->meth_orig_ref_string != NULL) {
+        _mm_free(aux->meth_orig_ref_string);
+        aux->meth_orig_ref_string = NULL;
+    }
 }
 
 int main_mem(int argc, char *argv[])
@@ -1469,24 +1543,58 @@ int main_mem(int argc, char *argv[])
     aux.shm_base = aux.fmi->shm_attached_base();
     tprof[FMI][0] += __rdtsc() - tim;
 
-    /* D3 SEEDING PHASE (WIP). The dual index is loaded: FM-index from the `.meth`
-     * seed prefix, BNS+PAC from the ORIGINAL reference. Chaining/extension/output
-     * are NOT yet wired for the original-alphabet architecture — seed hits are in
-     * seed-index (f/r doubled) coordinates and must be remapped to original
-     * coordinates first (the seed→original remap, B4), and SW scoring/output are
-     * the deferred γ phase. Until those land, stop cleanly here rather than running
-     * the c2t-architecture pipeline against the original BNS (mismatched coords).
-     * >>> SEED-DUMP / remap goes here (B4/B5). <<< */
-    if (opt->meth_mode) {
+    /* D3: load the ORIGINAL reference's bns/pac as resident handles for the
+     * (future) extension/scoring phase — distinct from the seed FM-index above.
+     * The seed BNS (aux.fmi->idx->bns) is the f/r-doubled converted reference
+     * used to decode seed positions; these handles are the un-converted original
+     * (real chrom names, N contigs) that extension will score against. No
+     * consumer yet (extension is behind the meth-mode checkpoint below); this is
+     * a load-only building block. Freed on every exit path the seed index is. */
+    if (opt->meth_mode && meth_orig_ref_prefix != NULL) {
+        if (meth_orig_ref_load_handles(meth_orig_ref_prefix,
+                                       &aux.meth_orig_bns, &aux.meth_orig_pac) != 0) {
+            delete aux.fmi;
+            free(opt);
+            if (out_opened) fclose(aux.fp);
+            return 1;
+        }
         fprintf(stderr,
-                "[bwa-mem3:--meth] D3 seed index loaded: FM-index + seed BNS (%d "
-                "contigs, f/r-doubled). Seed→original remap, original-ref load, and "
-                "extension/output are the next (deferred) phases; stopping. See D3 "
-                "spec §5/§6.\n", aux.fmi->idx->bns ? aux.fmi->idx->bns->n_seqs : -1);
-        delete aux.fmi;
-        free(opt);
-        if (out_opened) fclose(aux.fp);
-        return 0;
+                "[bwa-mem3:--meth] original reference bns/pac loaded for "
+                "extension (%d contig(s)).\n", aux.meth_orig_bns->n_seqs);
+    }
+
+    /* D3 (--meth, PR-3): the early-return seeding checkpoint is REMOVED — the
+     * pipeline now runs end to end. Seeds generated against the `.meth` seed
+     * FM-index are remapped to ORIGINAL coordinates + an OT/OB hypothesis inside
+     * mem_chain_seeds (see meth_seed_to_orig), and chaining/extension/pairing/
+     * mate-rescue/output all operate against the ORIGINAL bns/pac/.0123 carried
+     * on worker_t::meth_orig_*. Load the ORIGINAL unpacked reference here (the
+     * seed `.0123` is still loaded below as `ref_string`, but is unused after the
+     * remap; kept for the non-meth code path's invariants).
+     * D3-TODO(PR-3 gating): extension/mate-rescue scoring is still SYMMETRIC and
+     * uses the PROJECTED read tonight (PR-4 swaps in the asymmetric matrix +
+     * original read). Per plan §6 (B1) NO placement/MAPQ/concordance assertion
+     * may gate PR-3 — tomorrow's gating covers remap round-trip, original-handle
+     * load, and PE/strand placement only. */
+    if (opt->meth_mode && meth_orig_ref_prefix != NULL) {
+        int64_t orig_rlen = 0;
+        int     orig_is_shm = 0;   /* original .0123 is never in shm; force disk */
+        aux.meth_orig_ref_string =
+            load_ref_string(meth_orig_ref_prefix, /*shm_base=*/NULL,
+                            &orig_rlen, &orig_is_shm);
+        if (aux.meth_orig_ref_string == NULL) {
+            fprintf(stderr,
+                    "ERROR: --meth could not load the original reference '%s.0123' "
+                    "(needed for extension).\n", meth_orig_ref_prefix);
+            meth_orig_ref_free_handles(&aux);
+            delete aux.fmi;
+            free(opt);
+            if (out_opened) fclose(aux.fp);
+            return 1;
+        }
+        fprintf(stderr,
+                "[bwa-mem3:--meth] original reference .0123 loaded for extension "
+                "(%ld bp).\n", (long)orig_rlen);
     }
 
     // reading ref string (from shm if FMI attached, else from .0123 file)
@@ -1508,6 +1616,14 @@ int main_mem(int argc, char *argv[])
     if (ignore_alt)
         for (i = 0; i < aux.fmi->idx->bns->n_seqs; ++i)
             aux.fmi->idx->bns->anns[i].is_alt = 0;
+    /* D3 (--meth, PR-3): --ignore-alt clears is_alt on the SEED bns above, but
+     * --meth chaining/extension/output read is_alt from the ORIGINAL bns
+     * (aux.meth_orig_bns) — mirror the clear there so --ignore-alt takes effect
+     * in --meth. (Original genome indexes rarely carry ALT contigs, but keep the
+     * two views consistent.) */
+    if (ignore_alt && opt->meth_mode && aux.meth_orig_bns != NULL)
+        for (i = 0; i < aux.meth_orig_bns->n_seqs; ++i)
+            aux.meth_orig_bns->anns[i].is_alt = 0;
 
     /* READS file operations */
     ko = kopen(argv[optind + 1], &fd);
@@ -1612,6 +1728,14 @@ int main_mem(int argc, char *argv[])
     aux.bam_writer = NULL;
     g_meth_bam_writer = NULL;
     if (opt->meth_mode) {
+        /* D3-TODO(PR-3 gating / PR-5): the chrom map + un-converted ref view are
+         * still built from the SEED (f/r-doubled) BNS/PAC. With PR-3's coordinate
+         * cutover, alignments now carry ORIGINAL rids/coords, so the output layer
+         * (meth_mem_aln_to_bam: cmap->out_tid[rid], meth_orig_ref f/r fold, XG)
+         * is INTERNALLY INCONSISTENT — RNAME/POS/XM/XG emission is WRONG until the
+         * output is re-pointed to the original bns/pac in PR-5 (spec §6.1). Built
+         * as-is tonight only so the pipeline links and runs end to end; do NOT
+         * trust any --meth BAM record's coordinates/tags before PR-5. */
         g_meth_cmap = meth_chrom_map_build_from_bns(aux.fmi->idx->bns);
         /* g_meth_cmap is consulted by per-record paths even with output
          * disabled; build it so meth_mode tagging stays consistent. */
@@ -1638,6 +1762,14 @@ int main_mem(int argc, char *argv[])
     (void)out_path;
 #else
     if (opt->meth_mode) {
+        /* D3-TODO(PR-3 gating / PR-5): the chrom map + un-converted ref view are
+         * still built from the SEED (f/r-doubled) BNS/PAC. With PR-3's coordinate
+         * cutover, alignments now carry ORIGINAL rids/coords, so the output layer
+         * (meth_mem_aln_to_bam: cmap->out_tid[rid], meth_orig_ref f/r fold, XG)
+         * is INTERNALLY INCONSISTENT — RNAME/POS/XM/XG emission is WRONG until the
+         * output is re-pointed to the original bns/pac in PR-5 (spec §6.1). Built
+         * as-is tonight only so the pipeline links and runs end to end; do NOT
+         * trust any --meth BAM record's coordinates/tags before PR-5. */
         g_meth_cmap = meth_chrom_map_build_from_bns(aux.fmi->idx->bns);
         if (g_meth_cmap == NULL) {
             fprintf(stderr, "ERROR: meth: failed to build chrom map\n");
@@ -1850,6 +1982,10 @@ int main_mem(int argc, char *argv[])
     }
 
     // new bwt/FMI
+    /* D3 (--meth, PR-3): free the original-reference handles (bns/pac/.0123)
+     * alongside the seed FM-index. NULL/no-op outside --meth; idempotent and
+     * NULL-safe. Now reached on every run since the seeding checkpoint is gone. */
+    meth_orig_ref_free_handles(&aux);
     delete(aux.fmi);
 
     /* Display runtime profiling stats */

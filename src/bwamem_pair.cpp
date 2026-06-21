@@ -154,8 +154,13 @@ int mem_matesw(const mem_opt_t *opt, const bntseq_t *bns,
                const mem_alnreg_t *a, int l_ms, const uint8_t *ms,
                mem_alnreg_v *ma)
 {
+    /* D3-TODO(PR-6): mate-rescue dedup passes mat=NULL (default) so this resolves
+     * to opt->mat; the proper original-read + per-hypothesis matrix swap for mate
+     * rescue is PR-6. These callers pass bns/pac/query = 0 (dedup-only, no patch
+     * SW), so the matrix is unused here regardless. */
     extern int mem_sort_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns,
-                                    const uint8_t *pac, uint8_t *query, int n, mem_alnreg_t *a);
+                                    const uint8_t *pac, uint8_t *query, int n,
+                                    mem_alnreg_t *a, const int8_t *mat = NULL);
     #if MATE_SORT
     extern int mem_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns,
                                const uint8_t *pac, uint8_t *query, int n, mem_alnreg_t *a);
@@ -225,6 +230,14 @@ int mem_matesw(const mem_opt_t *opt, const bntseq_t *bns,
             if (aln.score >= opt->min_seed_len && aln.qb >= 0) { // something goes wrong if aln.qb < 0
                 b.rid = a->rid;
                 b.is_alt = a->is_alt;
+                /* D3-TODO(PR-3 gating / PR-4/Step-6, B3): the rescued mate's
+                 * meth_hypothesis is left 0 by the memset above, NOT the
+                 * opposite-strand hypothesis of the anchor (directional: rescuing
+                 * an OT anchor's mate uses OB, and vice versa). Harmless in PR-3
+                 * (no scoring/output reads it yet); MUST be set to !a->meth_hyp
+                 * when PR-4/Step-6 wires the asymmetric mate-rescue scorer.
+                 * Coordinates here are already ORIGINAL (l_pac is the original
+                 * l_pac via the original bns), so the 6a coordinate fix holds. */
                 b.qb = is_rev? l_ms - (aln.qe + 1) : aln.qb;
                 b.qe = is_rev? l_ms - aln.qb : aln.qe + 1;
                 b.rb = is_rev? (l_pac<<1) - (rb + aln.te + 1) : rb + aln.tb;
@@ -403,8 +416,13 @@ int mem_pair_resolve(const mem_opt_t *opt, const bntseq_t *bns,
     #if MATE_SORT
     extern void sort_alnreg_re(int n, mem_alnreg_t* a);
     extern void sort_alnreg_score(int n, mem_alnreg_t* a);
+    /* D3-TODO(PR-6): mate-rescue dedup passes mat=NULL (default) so this resolves
+     * to opt->mat; the proper original-read + per-hypothesis matrix swap for mate
+     * rescue is PR-6. These callers pass bns/pac/query = 0 (dedup-only, no patch
+     * SW), so the matrix is unused here regardless. */
     extern int mem_sort_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns,
-                                    const uint8_t *pac, uint8_t *query, int n, mem_alnreg_t *a);
+                                    const uint8_t *pac, uint8_t *query, int n,
+                                    mem_alnreg_t *a, const int8_t *mat = NULL);
     #endif
 
     int n = 0, i, j, o, subo, n_sub, extra_flag = 1;
@@ -816,8 +834,13 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
     #if MATE_SORT
     extern void sort_alnreg_re(int n, mem_alnreg_t* a);
     extern void sort_alnreg_score(int n, mem_alnreg_t* a);
+    /* D3-TODO(PR-6): mate-rescue dedup passes mat=NULL (default) so this resolves
+     * to opt->mat; the proper original-read + per-hypothesis matrix swap for mate
+     * rescue is PR-6. These callers pass bns/pac/query = 0 (dedup-only, no patch
+     * SW), so the matrix is unused here regardless. */
     extern int mem_sort_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns,
-                                    const uint8_t *pac, uint8_t *query, int n, mem_alnreg_t *a);
+                                    const uint8_t *pac, uint8_t *query, int n,
+                                    mem_alnreg_t *a, const int8_t *mat = NULL);
     #endif
     
     int32_t *gar = (int32_t*) mmc->seqPairArrayAux[tid];
@@ -1046,9 +1069,11 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                          mem_alnreg_v *ma, mem_cache *mmc, int pcnt, int32_t gcnt,
                          int32_t &maxRefLen, int32_t &maxQerLen, int32_t tid)
 {
+    /* D3-TODO(PR-6): see the mate-rescue note above — mat defaults to opt->mat;
+     * proper per-hypothesis mate-rescue scoring is PR-6. */
     extern int mem_sort_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns,
                                     const uint8_t *pac, uint8_t *query, int n,
-                                    mem_alnreg_t *a);
+                                    mem_alnreg_t *a, const int8_t *mat = NULL);
 
     uint8_t *seqBufRef = mmc->seqBufLeftRef[tid*CACHE_LINE];
     uint8_t *seqBufQer = mmc->seqBufLeftQer[tid*CACHE_LINE];
@@ -1222,8 +1247,13 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
     extern int mem_sort_dedup_patch_rev(const mem_opt_t *opt, const bntseq_t *bns,
                                         const uint8_t *pac, uint8_t *query, int n,
                                         mem_alnreg_t *a);    
+    /* D3-TODO(PR-6): mate-rescue dedup passes mat=NULL (default) so this resolves
+     * to opt->mat; the proper original-read + per-hypothesis matrix swap for mate
+     * rescue is PR-6. These callers pass bns/pac/query = 0 (dedup-only, no patch
+     * SW), so the matrix is unused here regardless. */
     extern int mem_sort_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns,
-                                    const uint8_t *pac, uint8_t *query, int n, mem_alnreg_t *a);
+                                    const uint8_t *pac, uint8_t *query, int n,
+                                    mem_alnreg_t *a, const int8_t *mat = NULL);
     #if MATE_SORT    
     extern int mem_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns,
                                const uint8_t *pac, uint8_t *query, int n, mem_alnreg_t *a);
@@ -1313,6 +1343,14 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
             if (aln.score >= opt->min_seed_len && aln.qb >= 0) { // something goes wrong if aln.qb < 0
                 b.rid = a->rid;
                 b.is_alt = a->is_alt;
+                /* D3-TODO(PR-3 gating / PR-4/Step-6, B3): the rescued mate's
+                 * meth_hypothesis is left 0 by the memset above, NOT the
+                 * opposite-strand hypothesis of the anchor (directional: rescuing
+                 * an OT anchor's mate uses OB, and vice versa). Harmless in PR-3
+                 * (no scoring/output reads it yet); MUST be set to !a->meth_hyp
+                 * when PR-4/Step-6 wires the asymmetric mate-rescue scorer.
+                 * Coordinates here are already ORIGINAL (l_pac is the original
+                 * l_pac via the original bns), so the 6a coordinate fix holds. */
                 b.qb = is_rev? l_ms - (aln.qe + 1) : aln.qb;
                 b.qe = is_rev? l_ms - aln.qb : aln.qe + 1;
                 b.rb = is_rev? (l_pac<<1) - (rb + aln.te + 1) : rb + aln.tb;
