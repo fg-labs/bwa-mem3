@@ -6,7 +6,7 @@ The short version: on the data we have tested, the **core alignment** — where 
 
 ## What is preserved
 
-We ran an empirical concordance check with [bwa-mem3-bench](https://github.com/fg-labs/bwa-mem3-bench) at commit `bffae5a` (current `main`), comparing bwa-mem3 against upstream `bwa-mem2` v2.2.1 on x86 hosts across whole-genome, whole-exome, and panel workloads. **Primary-alignment concordance** — reference name, position, CIGAR, MAPQ, and placement flags compared per read end — is:
+We ran an empirical concordance check with [bwa-mem3-bench](https://github.com/fg-labs/bwa-mem3-bench) at commit `a02fcb4` (current `main`), comparing bwa-mem3 against upstream `bwa-mem2` v2.2.1 on x86 hosts across whole-genome, whole-exome, and panel workloads. **Primary-alignment concordance** — reference name, position, CIGAR, MAPQ, and placement flags compared per read end — is:
 
 | sample | primary concordance | primary records |
 |---|---:|---:|
