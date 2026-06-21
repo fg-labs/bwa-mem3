@@ -19,14 +19,14 @@ FROM ubuntu:24.04 AS build
 RUN apt-get update && apt-get install -y \
     build-essential git cmake pkg-config \
     autoconf automake autoconf-archive libtool \
-    zlib1g-dev
+    zlib1g-dev libdeflate-dev
 WORKDIR /src
 RUN git clone --recursive https://github.com/fg-labs/bwa-mem3 .
 RUN make -j
 
 FROM ubuntu:24.04
 COPY --from=build /src/bwa-mem3 /usr/local/bin/bwa-mem3
-RUN apt-get update && apt-get install -y libgomp1 zlib1g \
+RUN apt-get update && apt-get install -y libgomp1 zlib1g libdeflate0 \
  && rm -rf /var/lib/apt/lists/*
 ENTRYPOINT ["bwa-mem3"]
 ```

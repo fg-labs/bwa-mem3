@@ -9,6 +9,7 @@ This page documents every build target available in the Makefile and what each p
 - CMake 3.12+ (required only when `USE_MIMALLOC=1`, which is the default).
 - autoconf, automake, autoconf-archive, libtool, pkg-config — `ext/htslib`'s build runs `autoreconf -i && ./configure` and locates zlib via `pkg-config`.
 - zlib development headers — htslib links against zlib.
+- libdeflate development headers — `src/fast_reader.c` uses libdeflate for BGZF block decode (htslib also links it transitively). Debian/Ubuntu: `libdeflate-dev`; RHEL/Fedora: `libdeflate-devel`; macOS: `brew install libdeflate` (the Makefile auto-detects the Homebrew prefix or honours `LIBDEFLATE_PREFIX`). **Amazon Linux 2023 ships no `libdeflate-devel`** — build *and install* it from source (e.g. libdeflate v1.22): `cmake -B build -DCMAKE_INSTALL_PREFIX=/usr/local -DLIBDEFLATE_BUILD_SHARED_LIB=OFF`, then `cmake --build build && sudo cmake --install build`, and set `LIBRARY_PATH=/usr/local/lib64:/usr/local/lib` (CMake installs to `lib` or `lib64` depending on the distro) before `make`.
 - OpenMP runtime — libsais uses OpenMP for parallel suffix-array construction. Linux + GCC: libgomp ships with the compiler, nothing extra to install. Linux + Clang: `libomp-dev` (Debian) / `libomp-devel` (RHEL). macOS: `brew install libomp`; the Makefile auto-detects the Homebrew prefix or honours `LIBOMP_PREFIX`.
 - Git submodules initialised: `git submodule update --init --recursive`.
 

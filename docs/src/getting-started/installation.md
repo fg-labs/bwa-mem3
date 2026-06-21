@@ -27,6 +27,7 @@ bwa-mem3 vendors several libraries as git submodules. Building from source requi
 | autoconf, automake, autoconf-archive, libtool | `ext/htslib` runs `autoreconf -i && ./configure` during build | any recent |
 | pkg-config | htslib's `configure` uses it to locate zlib | any recent |
 | zlib development headers | htslib links against zlib | any recent |
+| libdeflate development headers | `src/fast_reader.c` uses libdeflate for BGZF block decode | any recent |
 | OpenMP runtime | `ext/libsais` uses OpenMP for parallel suffix-array construction | see notes below |
 | CMake 3.12+ | building bundled mimalloc (default; skip if you pass `USE_MIMALLOC=0`) | 3.12+ |
 
@@ -42,7 +43,7 @@ bwa-mem3 vendors several libraries as git submodules. Building from source requi
 sudo apt-get install \
     build-essential git cmake pkg-config \
     autoconf automake autoconf-archive libtool \
-    zlib1g-dev \
+    zlib1g-dev libdeflate-dev \
     libomp-dev          # only needed if building with Clang
 ```
 
@@ -51,9 +52,17 @@ sudo apt-get install \
 sudo dnf install \
     gcc gcc-c++ make git cmake pkgconf-pkg-config \
     autoconf automake autoconf-archive libtool \
-    zlib-devel \
+    zlib-devel libdeflate-devel \
     libomp-devel        # only needed if building with Clang
 ```
+
+> **Amazon Linux 2023 has no `libdeflate-devel`.** The `dnf install` above will fail on that one
+> package. Build *and install* libdeflate from source instead (e.g. v1.22): configure with
+> `cmake -B build -DCMAKE_INSTALL_PREFIX=/usr/local -DLIBDEFLATE_BUILD_SHARED_LIB=OFF`, then
+> `cmake --build build && sudo cmake --install build` to put the headers and static library under
+> `/usr/local`. CMake installs the library to `lib` or `lib64` depending on the distro, so set
+> `LIBRARY_PATH=/usr/local/lib64:/usr/local/lib` (covering both) before running bwa-mem3's `make`.
+> Other RHEL/Fedora releases have the package.
 
 **macOS (Homebrew):**
 ```bash
@@ -61,7 +70,7 @@ xcode-select --install   # Apple Clang + git + make
 brew install \
     cmake pkg-config \
     autoconf automake autoconf-archive libtool \
-    libomp
+    libdeflate libomp
 ```
 
 > **What happens if a prereq is missing.** The Makefile fails fast with an actionable error: a missing `libomp` on macOS, a missing `autoreconf`, or a missing `cmake` each produce a one-line hint pointing at the install command above. There is no need to install everything optimistically — install only what the error message asks for if you prefer.
