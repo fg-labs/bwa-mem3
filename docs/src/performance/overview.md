@@ -133,15 +133,17 @@ PGO is not applied to the default `make` output. See [PGO build](pgo.md).
 
 ## Reference numbers across architectures
 
-Wall-time medians from [bwa-mem3-bench](https://github.com/fg-labs/bwa-mem3-bench) at SHA `bffae5a` (2026-06-07), 5 reps per cell, t≈16, hg38, paired-end 150 bp:
+Wall-time medians from [bwa-mem3-bench](https://github.com/fg-labs/bwa-mem3-bench) at SHA `a02fcb4` (2026-06-20), 5 reps per cell, t≈16, hg38, paired-end 150 bp:
 
-| sample | c6a (AVX2, Zen3) | c7a (AVX-512, Zen4) | c7i (AVX-512, SPR) | c7g (NEON, Graviton3) | c8g (NEON, Graviton4) |
+| sample | c6a (x86-64, AVX2, Zen3) | c7a (x86-64, AVX-512, Zen4) | c7i (x86-64, AVX-512, SPR) | c7g (arm64, NEON, Graviton3) | c8g (arm64, NEON, Graviton4) |
 |---|---:|---:|---:|---:|---:|
-| wgs-5M | 142.88 s | **97.94 s** | 147.83 s | 176.49 s | 150.76 s |
-| wes-5M | 78.87 s | **59.81 s** | 79.25 s | 81.81 s | 67.47 s |
-| panel-twist-5M | 157.12 s | **105.99 s** | 166.15 s | 192.53 s | 164.16 s |
+| wgs-5M | 131.63 s | **92.66 s** | 112.98 s | 154.27 s | 127.93 s |
+| wes-5M | 76.57 s | **56.53 s** | 67.66 s | 79.67 s | 65.26 s |
+| panel-twist-5M | 150.84 s | **102.72 s** | 156.42 s | 181.37 s | 148.50 s |
 
-Concordance vs upstream `bwa-mem2 v2.2.1` on these cells, measured over primary-alignment records: **wgs-5M 99.9893%, wes-5M 99.9996%, panel-twist-5M 99.9414%**. bwa-mem3 is intentionally **not** byte-identical to bwa-mem2 — the residual differences are additive SAM tags, per-architecture SIMD `score2`/`MAPQ` convergence, deterministic tie-breaks, and a small number of additional supplementary alignments; see [Equivalence with bwa-mem2](../whats-different/equivalence.md) for the full audited breakdown. NEON-vs-x86 cross-architecture concordance on the same builds remains **100.0000%** (the ARM and x86 fg-labs builds produce identical records). Spot-pool noise envelope (rep-to-rep CV): ~1% on c6a / c7a / c7g / c8g, ~8–9% on c7i. See the bench repo for the methodology, the full per-rep table, and noisier instance classes excluded from this summary.
+Concordance vs upstream `bwa-mem2 v2.2.1` on these cells, measured over primary-alignment records: **wgs-5M 99.9893%, wes-5M 99.9996%, panel-twist-5M 99.9414%**. bwa-mem3 is intentionally **not** byte-identical to bwa-mem2 — the residual differences are additive SAM tags, per-architecture SIMD `score2`/`MAPQ` convergence, deterministic tie-breaks, and a small number of additional supplementary alignments; see [Equivalence with bwa-mem2](../whats-different/equivalence.md) for the full audited breakdown. NEON-vs-x86 cross-architecture concordance on the same builds remains **100.0000%** (the ARM and x86 fg-labs builds produce identical records). Spot-pool noise envelope (rep-to-rep CV) for this run: ~1–2% on c7a / c7g / c8g, ~1–5% on c6a, ~10–16% on c7i — the c7i medians in particular carry wide error bars and should be read as directional. See the bench repo for the methodology, the full per-rep table, and noisier instance classes (e.g. m7i) excluded from this summary.
+
+Release-to-release speedups are deliberately uneven across this grid. A workload's gain scales with the share of its wall time spent in the Smith–Waterman kernels — highest on `wgs-5M` (~85% of cycles), lowest on the seed/IO-bound `wes-5M`, and intermediate on `panel-twist-5M`, whose deep target coverage produces many split alignments that each re-enter SW. That per-workload factor is multiplied by how heavily a given release retuned the host's per-ISA SW kernel: v0.3.0 concentrated on the NEON ([#160](https://github.com/fg-labs/bwa-mem3/pull/160), [#166](https://github.com/fg-labs/bwa-mem3/pull/166)) and AVX2 ([#161](https://github.com/fg-labs/bwa-mem3/pull/161), [#162](https://github.com/fg-labs/bwa-mem3/pull/162)) kernels, so Graviton and AVX2 hosts moved more than the already-tuned AVX-512BW path. See [SIMD dispatch](simd-dispatch.md) for how the per-host kernel is selected.
 
 ## Benchmarking responsibly
 
