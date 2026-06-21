@@ -160,6 +160,48 @@ all 11 SAM columns and all aux tags. See
 [Best Practices → Output format](../best-practices/output-format.md) for the
 recommended pipeline.
 
+## `--min-ext-len` short-seed extension filter
+
+`--min-ext-len INT` opts into skipping banded Smith-Waterman extension of seeds
+shorter than `INT` bp. Off by default (`0`) → output byte-identical to baseline.
+
+Smith-Waterman extension is ~60 % of `bwa-mem3 mem` CPU, and almost all of it is
+spent on short seeds: seeds ≤40 bp hold roughly **90 % of all banded-SW cells**
+yet are ~99 % wasted, because long seeds already resolve via the ungapped
+fast-path at near-zero cost. `--min-ext-len` drops the short seeds before
+extension (`mem_chain_drop_short_seeds`, a stable in-place compaction of each
+chain's seeds, called from `mem_flt_chained_seeds` in `src/bwamem.cpp`), so their
+extension never runs while seeding and chaining are untouched.
+
+Measured single-thread on hg38:
+
+- **Real HG002 1M PE WGS: ~20 % lower alignment CPU at `--min-ext-len 30`.** The
+  accuracy effect is confined to reads that were already low-confidence — 0.40 %
+  of reads change (mostly partial, heavily soft-clipped, or repeat/multi-mapping
+  reads); **zero** confidently and uniquely mapped reads (MAPQ ≥ 60, NM ≤ 1,
+  no soft-clip) regress.
+- Simulated clean Illumina and indel-rich data: free (F1 unchanged or slightly
+  better, even at larger thresholds).
+- The only workload with a real accuracy cost is very high per-base error
+  (degraded chemistry, cross-species) — there, every seed is short, so some
+  correct alignments depend solely on short seeds. Indels and structural variants
+  are *not* a contraindication: an indel leaves two still-long exact segments
+  that the fast-path handles.
+- Confirmed cross-architecture: Graviton4/Linux reproduces the win (realistic
+  +15.8 %, HG002 +20.5 %), matching macOS — the speedup is algorithmic, not
+  microarch tuning.
+
+`30` is the recommended opt-in value (accuracy-safe across clean, indel-rich, and
+moderately-divergent data); `40`–`50` are also safe on known-clean data but cost
+accuracy as divergence rises. Because the speedup is thinning the extension stage
+— not faster seeding — the wall-clock gain is smaller than the cell-count
+reduction would suggest (seeding, which the filter does not touch, dominates
+runtime). See
+[CLI → mem `--min-ext-len`](../cli/mem.md#--min-ext-len-int--skip-smith-waterman-extension-of-short-seeds)
+and
+[Settings profiles](../best-practices/settings-profiles.md#why-we-recommend---min-ext-len-30-standard-error-reads)
+for the recommended operating point.
+
 ---
 
 ## Changes catalog
@@ -173,6 +215,7 @@ recommended pipeline.
 | `shm --meth` symmetry | [#67](https://github.com/fg-labs/bwa-mem3/pull/67) | — | fork-only |
 | `HN:i` hit count tag | [#42](https://github.com/fg-labs/bwa-mem3/pull/42) | [lh3/bwa#438](https://github.com/lh3/bwa/pull/438) | fork-only (analogous to bwa aln) |
 | `--bam=LEVEL` direct BAM output | [#12](https://github.com/fg-labs/bwa-mem3/pull/12) | — | fork-only |
+| `--min-ext-len` short-seed extension filter | _pending_ | — | fork-only (opt-in, off by default) |
 
 ---
 

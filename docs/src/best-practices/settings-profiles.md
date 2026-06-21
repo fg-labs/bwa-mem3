@@ -43,6 +43,7 @@ speed/accuracy trade-off. Current recommended deviations:
 |---|---|---|---|
 | `-m` (mate-rescue depth) | 50 | **10** | ~11–22% less alignment CPU; near-neutral accuracy (see below) |
 | `-s` (Pass-2 re-seed width), **`--meth` only** | 10 | **0** | ~20% less alignment CPU; near-neutral accuracy (see below) |
+| `--min-ext-len` (skip short-seed extension), **standard-error reads** | 0 | **30** | ~10–20% less alignment CPU; accuracy change confined to the already-low-confidence tail (see below) |
 
 This table will grow as we benchmark additional tunings; each entry is gated on the same
 "measurably faster, near-neutral accuracy" bar.
@@ -127,6 +128,43 @@ repetitive inputs where the redundant Pass-2 candidate set is largest.
 A selective fallback — skip Pass-2 globally but re-seed only low-confidence reads — was evaluated and
 **does not help**: in the multi-contig regime it would re-seed ~13% of reads yet recovers about as
 many placements as it sacrifices (net within noise), so there is no cheap middle ground.
+
+## Why we recommend `--min-ext-len 30` (standard-error reads)
+
+`--min-ext-len INT` drops seeds shorter than `INT` bp before banded Smith–Waterman, so their
+extension never runs (off by default, `0` → byte-identical to baseline). Extension is ~60% of `mem`
+CPU and almost all of it is spent on short seeds — seeds ≤40 bp hold ~90% of all banded-SW *cells*
+yet are ~99% wasted, because long seeds already resolve via the ungapped fast-path. Skipping them
+thins the extension stage without touching seeding or chaining.
+
+**The accuracy change is confined to reads that were already low-confidence.** On real HG002 1M PE
+WGS at `--min-ext-len 30`, 0.40% of reads change, and profiling every one of them against the
+population shows the cost lands entirely on reads that were *already* marginal — heavily soft-clipped
+partial alignments (median 95 of 150 bp clipped), high edit distance, or multi-mappers. **Zero**
+confidently, uniquely mapped reads (MAPQ ≥ 60, NM ≤ 1, no soft-clip) regress. Like `-m 10`, the
+mapped count only ever *decreases* (≈0.11% newly unmapped; it essentially never newly maps a
+previously-unmapped read), and the reads whose locus changes are repeat/paralog churn with
+sub-2-mismatch score deltas — about 1 in 4 of which the filter actually *improves*. On simulated
+clean Illumina and indel-rich data the change is nil-to-positive even at larger thresholds.
+
+**In exchange, alignment CPU drops ~10–20% single-thread**, largest on data carrying many short
+seeds (real WGS sees more than idealized simulated reads). Because the speedup thins extension rather
+than speeding seeding — and seeding dominates the wall — the wall-clock gain is smaller than the
+~90% banded-SW *cell* reduction would suggest.
+
+**Contraindication — very high per-base error.** On degraded-chemistry or cross-species libraries
+(per-base error well above modern Illumina), every seed is short, so some correct alignments depend
+*solely* on short seeds and the cost rises sharply (e.g. at 2–15% simulated substitution error, F1
+−0.2% at `30`, growing to −1.4% at `40` and a cliff at `50`). Keep `--min-ext-len` low or off for
+such data. **Indels and structural variants are *not* a contraindication** — an indel splits a read
+into two still-long exact segments that the fast-path handles, so indel-rich data is free.
+
+`30` is the accuracy-safe knee; `40`–`50` give a little more speed on known-clean data but trade
+accuracy as divergence rises. The CPU win is confirmed cross-architecture: on Graviton4/Linux
+(c8g) the same single-thread sweep gives realistic **+15.8%** and HG002 **+20.5%** (T=0→T=30),
+matching macOS — the filter is algorithmic, so it ports. Remaining before this graduates from
+"recommended for standard-error reads" to an unqualified default: a multi-thread + broader
+[bwa-mem3-bench](../related-projects/bwa-mem3-bench.md) run (all current figures are single-thread).
 
 ## Speed: drop-in and recommended
 
