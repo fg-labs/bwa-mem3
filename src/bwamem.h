@@ -195,6 +195,16 @@ typedef struct mem_alnreg_t {
      * propagated from the originating chain so PR-4's asymmetric extension and
      * the output (XG strand) layers can select the right matrix/strand. */
     int8_t meth_hypothesis;
+    /* D3 (--meth, fix): STRAND-ADJUSTED extension hypothesis = meth_hypothesis
+     * XOR is_rev. bwa-mem extends reverse-strand seeds against the reverse-
+     * complemented reference window, so a conversion that the OT matrix frees
+     * (ref-C x read-T) presents as the OB-freed cell (ref-G x read-A) there, and
+     * vice-versa. Extension/regen MUST select the matrix from THIS field, not the
+     * raw hypothesis, or reverse-strand reads (the bulk of PE) get the wrong
+     * matrix, their real conversions are scored as mismatches, and the 5' end
+     * soft-clips. Set at alnreg creation from the seed strand; -1 = non-meth.
+     * (Output XG/XM still use the raw meth_hypothesis — the genome strand.) */
+    int8_t meth_strand_hyp;
 } mem_alnreg_t;
 
 typedef struct { size_t n, m; mem_alnreg_t *a; } mem_alnreg_v;

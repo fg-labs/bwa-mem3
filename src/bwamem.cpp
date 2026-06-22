@@ -718,7 +718,12 @@ void mem_flt_chained_seeds(const mem_opt_t *opt, const bntseq_t *bns, const uint
                 meth_qbuf[q] = (ch < 4) ? ch : nst_nt4_table[ch];
             }
             query = meth_qbuf;
-            mat = mem_opt_meth_mat(opt, c->meth_hypothesis);
+            /* D3 (--meth, fix): strand-adjusted hypothesis — this chain's seeds
+             * are single-strand; a reverse chain (seeds[0].rbeg >= l_pac) extends
+             * against the RC reference, flipping the conversion's freed cell. */
+            int hyp = c->meth_hypothesis;
+            if (hyp >= 0 && c->seeds[0].rbeg >= bns->l_pac) hyp ^= 1;
+            mat = mem_opt_meth_mat(opt, hyp);
         }
 
         double min_l = opt->min_chain_weight?
@@ -1623,8 +1628,9 @@ int mem_kernel2_core(FMI_search *fmi,
                 dd_qbuf[q] = (ch < 4) ? ch : nst_nt4_table[ch];
             }
             dd_query = dd_qbuf;
-            /* per-read hypothesis: all alnregs share it; take the first. */
-            int hyp = (regs[l].n > 0) ? regs[l].a[0].meth_hypothesis : -1;
+            /* per-read STRAND-ADJUSTED hypothesis (see meth_strand_hyp); take the
+             * first alnreg's (dedup-patch shares one matrix across the read). */
+            int hyp = (regs[l].n > 0) ? regs[l].a[0].meth_strand_hyp : -1;
             dd_mat = mem_opt_meth_mat(opt, hyp);
         }
         regs[l].n = mem_sort_dedup_patch(opt, aln_bns,
@@ -2371,8 +2377,15 @@ mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *
      * separate concerns. Hiding conversions from NM/MD (e.g. a Bismark-style
      * XM-only consumer) would be a different, explicit choice and must be made
      * here, not assumed. */
+    /* D3 (--meth, fix): the CIGAR regen must use the SAME strand-adjusted matrix
+     * as the extension (see mem_alnreg_t.meth_strand_hyp). ar->rb is final here,
+     * so derive is_rev directly (rb in doubled-pac; >= l_pac = reverse) and flip
+     * the hypothesis; otherwise reverse-strand reads regen with the wrong matrix
+     * and their conversions become CIGAR mismatches / soft-clips. */
+    int regen_hyp = ar->meth_hypothesis;
+    if (regen_hyp >= 0 && ar->rb >= bns->l_pac) regen_hyp ^= 1;
     const int8_t *regen_mat = use_meth_orig
-        ? mem_opt_meth_mat(opt, ar->meth_hypothesis) : opt->mat;
+        ? mem_opt_meth_mat(opt, regen_hyp) : opt->mat;
     do {
         free(a.cigar);
         w2 = w2 < opt->w<<2? w2 : opt->w<<2;
@@ -2702,7 +2715,10 @@ static inline void bsw_run_tier(BswMethTier tier, const mem_opt_t *opt,
     int lo = 0, mid = 0, hi = nump - 1;
     while (mid <= hi) {
         const SeqPair *sp = &pair_ar[mid];
-        int h = av_v[sp->seqid].a[sp->regid].meth_hypothesis;
+        /* strand-adjusted hypothesis (see mem_alnreg_t.meth_strand_hyp): the
+         * extension matrix must match the conversion direction AS SEEN against
+         * the (possibly RC) reference window, not the raw genome-strand hypothesis. */
+        int h = av_v[sp->seqid].a[sp->regid].meth_strand_hyp;
         int key = (h < 0) ? 2 : ((h & 1) ? 0 : 1);
         if (key == 0)      { SeqPair t = pair_ar[lo]; pair_ar[lo]  = pair_ar[mid]; pair_ar[mid] = t; lo++; mid++; }
         else if (key == 1) { mid++; }
@@ -3233,6 +3249,12 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                  * alnreg (-1 outside --meth) so PR-4's asymmetric extension and
                  * the output (XG) layer can select the matrix/strand. */
                 a->meth_hypothesis = c->meth_hypothesis;
+                /* D3 (--meth, fix): strand-adjusted hypothesis for the extension
+                 * matrix. Reverse-strand seeds (s->rbeg >= l_pac, original
+                 * doubled-pac) extend against the RC reference window, which
+                 * flips the conversion's freed cell — so flip the hypothesis. */
+                a->meth_strand_hyp = (c->meth_hypothesis < 0) ? -1
+                    : (int8_t)((c->meth_hypothesis ^ (s->rbeg >= l_pac ? 1 : 0)) & 1);
                 a->chain_n_hits = chain_max_n_hits;
                 a->rb = a->qb = a->re = a->qe = H0_;
 
