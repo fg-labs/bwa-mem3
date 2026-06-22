@@ -450,6 +450,22 @@ jobs:
           BWAMETH_DIR: ${{ github.workspace }}/bwa-meth-oracle
         run: bash test/regression/meth_oracle.sh
 
+      - name: --meth whole-aligner regressions (D3)
+        if: matrix.canonical == true
+        # Self-contained --meth regressions (each generates its fixtures inline):
+        # dual index + seed->original remap; mixed OT/OB PE per-hypothesis scoring;
+        # OT/OB x strand placement; original-alphabet output integrity (Bismark
+        # four-strand XR/XG); and the reverse-strand-conversion matrix flip
+        # (meth_strand_hyp) — a reverse read that is unmapped under the unflipped
+        # matrix and full-length under the fix.
+        env:
+          BWA_MEM3: ${{ github.workspace }}/bwa-mem3
+        run: |
+          for t in meth_seed_index meth_mixed_pe_asym meth_pe_placement \
+                   meth_output_integrity meth_reverse_strand_conversion; do
+            echo "::group::$t"; bash "test/regression/$t.sh"; echo "::endgroup::"
+          done
+
       - name: Short-read SE smoke (chr22, ASAN, dense+variable-length)
         if: matrix.canonical == true
         # Guards the wsize_mem byte-vs-entry capacity-tracker class of bug
