@@ -277,20 +277,26 @@ mem_opt_t *mem_opt_init()
     o->max_chain_extend = 1<<30;
     o->mapQ_coef_len = 50; o->mapQ_coef_fac = log(o->mapQ_coef_len);
     bwa_fill_scmat(o->a, o->b, o->mat);
-    /* D3 (--meth, PR-4): build the per-hypothesis ASYMMETRIC matrices once, from
-     * the symmetric `mat`. Target-major mat[ref*5+read], ACGT order A,C,G,T,N.
-     * Free exactly ONE off-diagonal cell to a MATCH (+a); leave everything else
-     * (incl. the mirror cell, a real variant) at the symmetric value:
-     *   OT: free mat[C][T] = mat[1*5+3]  (ref C, read T = unmethylated C→T)
-     *   OB: free mat[G][A] = mat[2*5+0]  (ref G, read A = bottom-strand G→A)
-     * One freed cell ⇒ the SIMD kernel's rank-1 fast path. These are valid only
-     * under --meth and are selected per chain via mem_opt_meth_mat(). They are
-     * harmless to build unconditionally (cost is one memcpy + one store each). */
+    mem_opt_fill_meth_mat(o);
+    return o;
+}
+
+/* D3 (--meth, PR-4): (re)derive the per-hypothesis ASYMMETRIC matrices from the
+ * symmetric `mat` + match score `a`. Target-major mat[ref*5+read], ACGT order
+ * A,C,G,T,N. Free exactly ONE off-diagonal cell to a MATCH (+a); leave everything
+ * else (incl. the mirror cell, a real variant) at the symmetric value:
+ *   OT: free mat[C][T] = mat[1*5+3]  (ref C, read T = unmethylated C→T)
+ *   OB: free mat[G][A] = mat[2*5+0]  (ref G, read A = bottom-strand G→A)
+ * One freed cell ⇒ the SIMD kernel's rank-1 fast path. Selected per chain via
+ * mem_opt_meth_mat(); valid only under --meth. MUST be called after EVERY rebuild
+ * of opt->mat (mem_opt_init AND after main_mem parses -A/-B/-x and re-runs
+ * bwa_fill_scmat) — otherwise the meth matrices keep the default match/mismatch
+ * and silently ignore the user's scoring options. */
+void mem_opt_fill_meth_mat(mem_opt_t *o) {
     memcpy(o->mat_ot, o->mat, sizeof(o->mat));
     o->mat_ot[1 * 5 + 3] = o->a;   /* ref C / read T → match (C→T conversion)   */
     memcpy(o->mat_ob, o->mat, sizeof(o->mat));
     o->mat_ob[2 * 5 + 0] = o->a;   /* ref G / read A → match (G→A conversion)   */
-    return o;
 }
 
 /******************************

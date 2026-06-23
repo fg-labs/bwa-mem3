@@ -48,7 +48,9 @@ emit snp "$SNP_READ" snp.fq
 samtools quickcheck snp.bam || fail "snp invalid BAM"
 line=$(samtools view snp.bam | mawk 'NR==1')
 as=$(tag "$line" AS); nm=$(tag "$line" NM); md=$(tag "$line" MD)
-[ "$as" = "55" ] || fail "SNP/conv: AS $as, want 55 (only the real SNP penalized; conversions free)"
+# --meth keeps the bwa default mismatch penalty b=4 (not bwameth's b=2), so the single real SNP costs -4
+# (conversions free): 59 match/freed columns (+59) - 1 SNP (-4) = 55.
+[ "$as" = "55" ] || fail "SNP/conv: AS $as, want 55 (only the real SNP penalized at b=4; conversions free)"
 [ "$nm" = "11" ] || fail "SNP/conv: NM $nm, want 11 (10 conversions + 1 SNP)"
 # MD reference-base mismatch letters: ten ref-C (conversions) + exactly one ref-A (SNP).
 nC=$(printf '%s' "$md" | tr -cd 'C' | wc -c | tr -d ' ')

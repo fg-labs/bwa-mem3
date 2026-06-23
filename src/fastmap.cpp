@@ -1435,14 +1435,18 @@ int main_mem(int argc, char *argv[])
         }
     } else update_a(opt, &opt0);
 
-    /* Meth-mode default tuning. bwameth.py runs bwa-mem3 with
-     * -B 2 -L 10 -U 100 -T 40 -CM — these reduce mismatch and soft-clip
-     * penalties so BS reads get long un-clipped alignments, raise the
-     * output score threshold, mark shorter hits as secondary, and
-     * pass the YS/YC comment tags through to SAM. We apply the same
-     * defaults when --meth is set, modulo explicit CLI overrides. */
+    /* Meth-mode default tuning. bwameth runs (collapsed) bwa with
+     * -B 2 -L 10 -U 100 -T 40 -CM. We adopt the soft-clip / unpaired /
+     * output-threshold and -M/-C defaults so BS reads get long un-clipped
+     * alignments, but deliberately NOT bwameth's lenient -B 2: bwa-mem3 scores
+     * against the ORIGINAL 4-letter reference with the per-strand asymmetric
+     * matrix, which already frees the expected conversion, so it neither needs
+     * nor benefits from bwameth's collapsed-space leniency. The full-hg38
+     * variant A/B showed the bwa default b=4 places better and is better
+     * MAPQ-calibrated than b=2 (placement 92.6 vs 92.5, discordant MAPQ 1.8 vs
+     * 2.1), so we keep b=4. -A/-B remain user-overridable and now reach the
+     * asymmetric matrices (mem_opt_fill_meth_mat below). */
     if (opt->meth_mode) {
-        if (!opt0.b)            opt->b           = 2;
         if (!opt0.pen_clip5)    opt->pen_clip5   = 10;
         if (!opt0.pen_clip3)    opt->pen_clip3   = 10;
         if (!opt0.pen_unpaired) opt->pen_unpaired= 100;
@@ -1453,6 +1457,10 @@ int main_mem(int argc, char *argv[])
 
     /* Matrix for SWA */
     bwa_fill_scmat(opt->a, opt->b, opt->mat);
+    /* D3 (--meth): re-derive the per-hypothesis asymmetric matrices from the matrix
+     * we just rebuilt, so -A/-B and the -x presets reach meth scoring (they set
+     * opt->a/opt->b above; without this the meth matrices keep init-time defaults). */
+    mem_opt_fill_meth_mat(opt);
 
     /* In --meth (D3) the canonical UX is "bwa-mem3 mem --meth ref.fa": we
      * auto-append ".meth" to find the converted SEED FM-index built by

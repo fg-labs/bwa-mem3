@@ -361,6 +361,10 @@ const bwtintv_v *smem_next(smem_i *itr);
 
 mem_opt_t *mem_opt_init(void);
 void mem_fill_scmat(int a, int b, int8_t mat[25]);
+/* (Re)derive the --meth per-hypothesis matrices (mat_ot/mat_ob) from opt->mat +
+ * opt->a. Call after any rebuild of opt->mat (e.g. CLI -A/-B/-x parsing) so meth
+ * scoring tracks the user's options instead of the init-time defaults. */
+void mem_opt_fill_meth_mat(mem_opt_t *opt);
 
 // Skip-short-seed extension filter: drop seeds shorter than min_ext_len from a
 // chain in place (stable; surviving seeds keep their order). Returns the new
