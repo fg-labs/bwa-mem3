@@ -379,7 +379,24 @@ private:
 								uint16_t numThreads,
 								int phase);
 
+	/* Thin dispatcher: selects the HasFreed template instantiation based on
+	 * the rank-1 freed-cell flag. The <false> instantiation dead-code-
+	 * eliminates every freed-cell override block, giving codegen identical to
+	 * the pre-issue-173 kernel for the non-meth path. Mirrors kswv_neon_u8. */
 	int kswv256_u8(uint8_t seq1SoA[],
+				   uint8_t seq2SoA[],
+				   int16_t nrow,
+				   int16_t ncol,
+				   SeqPair *p,
+				   kswr_t *aln,
+				   int po_ind,
+				   uint16_t tid,
+				   int32_t numPairs,
+				   int phase);
+
+	/* Templated u8 kernel body; see kswv_neon_u8_impl. */
+	template<bool HasFreed>
+	int kswv256_u8_impl(uint8_t seq1SoA[],
 				   uint8_t seq2SoA[],
 				   int16_t nrow,
 				   int16_t ncol,
@@ -398,7 +415,21 @@ private:
 								 uint16_t numThreads,
 								 int phase);
 
+	/* Thin dispatcher: see kswv256_u8 above. */
 	int kswv256_16(int16_t seq1SoA[],
+				   int16_t seq2SoA[],
+				   int16_t nrow,
+				   int16_t ncol,
+				   SeqPair *p,
+				   kswr_t *aln,
+				   int po_ind,
+				   uint16_t tid,
+				   int32_t numPairs,
+				   int phase);
+
+	/* Templated i16 kernel body; see kswv_neon_u8_impl. */
+	template<bool HasFreed>
+	int kswv256_16_impl(int16_t seq1SoA[],
 				   int16_t seq2SoA[],
 				   int16_t nrow,
 				   int16_t ncol,
@@ -418,7 +449,22 @@ private:
 						   uint16_t numThreads,
 						   int phase);
 
+	/* Thin dispatcher: selects the HasFreed template instantiation based on
+	 * the rank-1 freed-cell flag. See kswv256_u8 / kswv_neon_u8. */
 	int kswv512_u8(uint8_t seq1SoA[],
+				   uint8_t seq2SoA[],
+				   int16_t nrow,
+				   int16_t ncol,
+				   SeqPair *p,
+				   kswr_t *aln,
+				   int po_ind,
+				   uint16_t tid,
+				   int32_t numPairs,
+				   int phase);
+
+	/* Templated u8 kernel body; see kswv_neon_u8_impl. */
+	template<bool HasFreed>
+	int kswv512_u8_impl(uint8_t seq1SoA[],
 				   uint8_t seq2SoA[],
 				   int16_t nrow,
 				   int16_t ncol,
@@ -437,7 +483,21 @@ private:
 							uint16_t numThreads,
 							int phase);
 
+	/* Thin dispatcher: see kswv512_u8 above. */
 	int kswv512_16(int16_t seq1SoA[],
+                   int16_t seq2SoA[],
+                   int16_t nrow,
+                   int16_t ncol,
+                   SeqPair *p,
+                   kswr_t* aln,
+                   int po_ind,
+                   uint16_t tid,
+                   int32_t numPairs,
+                   int phase);
+
+	/* Templated i16 kernel body; see kswv_neon_u8_impl. */
+	template<bool HasFreed>
+	int kswv512_16_impl(int16_t seq1SoA[],
                    int16_t seq2SoA[],
                    int16_t nrow,
                    int16_t ncol,
