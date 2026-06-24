@@ -455,7 +455,7 @@ ifneq ($(strip $(DISABLE_BATCHED_MATESW)),)
     CPPFLAGS += -DDISABLE_BATCHED_MATESW=$(DISABLE_BATCHED_MATESW)
 endif
 
-.PHONY:all myall arm64 clean depend single all-single print-mimalloc-config kswv_nrow_zero_test bandedswa_padding_test bandedswa_highzdrop_seed_test shm_section_find_test shm_pack_round_trip_test shm_lock_destroy_test kt_for_pool_test test test-injection FORCE pgo-generate pgo-use pgo-clean profile-build profile-clean lto-build lto-clean docs docs-serve docs-cli docs-clean docs-install-tools
+.PHONY:all myall arm64 clean depend single all-single print-mimalloc-config kswv_nrow_zero_test kswv_freed_cell_test bandedswa_padding_test bandedswa_highzdrop_seed_test shm_section_find_test shm_pack_round_trip_test shm_lock_destroy_test kt_for_pool_test test test-injection FORCE pgo-generate pgo-use pgo-clean profile-build profile-clean lto-build lto-clean docs docs-serve docs-cli docs-clean docs-install-tools
 .SUFFIXES:.cpp .o
 
 .cpp.o:
@@ -567,6 +567,12 @@ src/kswv.native.o: src/kswv.cpp
 
 kswv_nrow_zero_test: $(BWA_LIB) $(HTS_LIB) src/kswv.native.o test/kswv_nrow_zero_test.o
 	$(CXX) $(BASE_CXXFLAGS) -march=native $(LDFLAGS) test/kswv_nrow_zero_test.o src/kswv.native.o $(BWA_LIB) $(LIBS) -o $@
+
+# Issue 173 / Task 2: mat-aware make_kswv freed-cell detection. Mirrors the
+# kswv_nrow_zero_test link line (native-tier kswv ahead of libbwa.a so the
+# host's concrete kswv class is linked) plus the doctest include path.
+kswv_freed_cell_test: $(BWA_LIB) $(HTS_LIB) src/kswv.native.o test/kswv_freed_cell_test.o
+	$(CXX) $(BASE_CXXFLAGS) -march=native $(LDFLAGS) test/kswv_freed_cell_test.o src/kswv.native.o $(BWA_LIB) $(LIBS) -o $@
 
 # Native-tier copy of bandedSWA.cpp, linked ahead of libbwa.a for the same
 # reason as src/kswv.native.o: on x86 multi-tier builds libbwa.a's baseline
@@ -689,10 +695,11 @@ test/shm_pack_round_trip_test.o: test/shm_pack_round_trip_test.cpp
 # Note: depends on `bwa-mem3` so version_banner.sh has a binary to grep —
 # previously `test:` only built the test harness binaries, not the main
 # executable.
-test: test-binaries kswv_nrow_zero_test bandedswa_padding_test bandedswa_highzdrop_seed_test shm_section_find_test shm_lock_destroy_test kt_for_pool_test bwa-mem3
+test: test-binaries kswv_nrow_zero_test kswv_freed_cell_test bandedswa_padding_test bandedswa_highzdrop_seed_test shm_section_find_test shm_lock_destroy_test kt_for_pool_test bwa-mem3
 	./test/bwa_mem3_tests_unit
 	./test/bwa_mem3_tests_integration
 	./kswv_nrow_zero_test
+	./kswv_freed_cell_test
 	./bandedswa_padding_test
 	./bandedswa_highzdrop_seed_test
 	./shm_section_find_test
@@ -711,6 +718,12 @@ test-injection: bwa-mem3
 
 test/kswv_nrow_zero_test.o: test/kswv_nrow_zero_test.cpp
 	$(CXX) -c $(BASE_CXXFLAGS) -march=native $(CPPFLAGS) $(INCLUDES) $< -o $@
+
+# Carries -Iext so the doctest-based test resolves `#include "doctest/doctest.h"`
+# (matching test/unit/*; -Iext/doctest would shadow the C++ <version> header).
+# kswv_nrow_zero_test does not use doctest, hence its rule above omits this.
+test/kswv_freed_cell_test.o: test/kswv_freed_cell_test.cpp
+	$(CXX) -c $(BASE_CXXFLAGS) -march=native $(CPPFLAGS) $(INCLUDES) -Iext $< -o $@
 
 test/bandedswa_padding_test.o: test/bandedswa_padding_test.cpp
 	$(CXX) -c $(BASE_CXXFLAGS) -march=native $(CPPFLAGS) $(INCLUDES) $< -o $@
@@ -806,7 +819,7 @@ $(ZLIBNG_LIB):
 	cd $(ZLIBNG_BUILD) && cmake $(ZLIBNG_CMAKE_FLAGS) .. && $(MAKE)
 
 clean: pgo-clean profile-clean lto-clean
-	rm -fr src/*.o src/version.h test/*.o $(BWA_LIB) $(EXE) kswv_nrow_zero_test bandedswa_padding_test bandedswa_highzdrop_seed_test shm_section_find_test shm_pack_round_trip_test shm_lock_destroy_test kt_for_pool_test bwa-mem3.arm64
+	rm -fr src/*.o src/version.h test/*.o $(BWA_LIB) $(EXE) kswv_nrow_zero_test kswv_freed_cell_test bandedswa_padding_test bandedswa_highzdrop_seed_test shm_section_find_test shm_pack_round_trip_test shm_lock_destroy_test kt_for_pool_test bwa-mem3.arm64
 	rm -f $(LIBSAIS_OBJS)
 	rm -f src/*.gcno src/*.gcda
 	$(MAKE) -C test clean

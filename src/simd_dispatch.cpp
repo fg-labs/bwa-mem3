@@ -365,32 +365,46 @@ std::unique_ptr<IBandedPairWiseSW> make_banded_pair_wise_sw(
     return std::unique_ptr<IBandedPairWiseSW>(raw);
 }
 
+/* Mat-aware factory (issue 173): routes through the per-tier _mat overloads so
+ * the chosen tier's concrete kswv runs freed-cell detection in its ctor. */
 std::unique_ptr<Ikswv> make_kswv(
     int o_del, int e_del, int o_ins, int e_ins,
     int8_t w_match, int8_t w_mismatch,
-    int numThreads, int32_t maxRefLen, int32_t maxQerLen)
+    int numThreads, int32_t maxRefLen, int32_t maxQerLen,
+    const int8_t *mat25)
 {
     bwamem3_simd_init();
     Ikswv *raw;
     switch (g_tier) {
       case BWAMEM3_TIER_AVX512BW:
-        raw = make_kswv_kernel_avx512bw(o_del, e_del, o_ins, e_ins, w_match, w_mismatch,
-                                        numThreads, maxRefLen, maxQerLen); break;
+        raw = make_kswv_kernel_avx512bw_mat(o_del, e_del, o_ins, e_ins, w_match, w_mismatch,
+                                            numThreads, maxRefLen, maxQerLen, mat25); break;
       case BWAMEM3_TIER_AVX2:
-        raw = make_kswv_kernel_avx2(o_del, e_del, o_ins, e_ins, w_match, w_mismatch,
-                                    numThreads, maxRefLen, maxQerLen); break;
+        raw = make_kswv_kernel_avx2_mat(o_del, e_del, o_ins, e_ins, w_match, w_mismatch,
+                                        numThreads, maxRefLen, maxQerLen, mat25); break;
       case BWAMEM3_TIER_AVX:
-        raw = make_kswv_kernel_avx(o_del, e_del, o_ins, e_ins, w_match, w_mismatch,
-                                   numThreads, maxRefLen, maxQerLen); break;
+        raw = make_kswv_kernel_avx_mat(o_del, e_del, o_ins, e_ins, w_match, w_mismatch,
+                                       numThreads, maxRefLen, maxQerLen, mat25); break;
       case BWAMEM3_TIER_SSE42:
-        raw = make_kswv_kernel_sse42(o_del, e_del, o_ins, e_ins, w_match, w_mismatch,
-                                     numThreads, maxRefLen, maxQerLen); break;
+        raw = make_kswv_kernel_sse42_mat(o_del, e_del, o_ins, e_ins, w_match, w_mismatch,
+                                         numThreads, maxRefLen, maxQerLen, mat25); break;
       case BWAMEM3_TIER_SSE41:
       default:
-        raw = make_kswv_kernel_sse41(o_del, e_del, o_ins, e_ins, w_match, w_mismatch,
-                                     numThreads, maxRefLen, maxQerLen); break;
+        raw = make_kswv_kernel_sse41_mat(o_del, e_del, o_ins, e_ins, w_match, w_mismatch,
+                                         numThreads, maxRefLen, maxQerLen, mat25); break;
     }
     return std::unique_ptr<Ikswv>(raw);
+}
+
+/* 9-arg factory: delegates to the mat-aware path with mat25 == nullptr, which
+ * reproduces the original symmetric-kernel behavior exactly. */
+std::unique_ptr<Ikswv> make_kswv(
+    int o_del, int e_del, int o_ins, int e_ins,
+    int8_t w_match, int8_t w_mismatch,
+    int numThreads, int32_t maxRefLen, int32_t maxQerLen)
+{
+    return make_kswv(o_del, e_del, o_ins, e_ins, w_match, w_mismatch,
+                     numThreads, maxRefLen, maxQerLen, nullptr);
 }
 
 #else  /* arm64 / scalar fallback */
@@ -405,14 +419,27 @@ std::unique_ptr<IBandedPairWiseSW> make_banded_pair_wise_sw(
                              mat, w_match, w_mismatch, numThreads));
 }
 
+/* Mat-aware factory (issue 173): single unsuffixed arm64 kswv, constructed via
+ * the mat-aware ctor so freed-cell detection runs. */
+std::unique_ptr<Ikswv> make_kswv(
+    int o_del, int e_del, int o_ins, int e_ins,
+    int8_t w_match, int8_t w_mismatch,
+    int numThreads, int32_t maxRefLen, int32_t maxQerLen,
+    const int8_t *mat25)
+{
+    return std::unique_ptr<Ikswv>(
+        new kswv(o_del, e_del, o_ins, e_ins, w_match, w_mismatch,
+                 numThreads, maxRefLen, maxQerLen, mat25));
+}
+
+/* 9-arg factory: delegates with mat25 == nullptr (original behavior). */
 std::unique_ptr<Ikswv> make_kswv(
     int o_del, int e_del, int o_ins, int e_ins,
     int8_t w_match, int8_t w_mismatch,
     int numThreads, int32_t maxRefLen, int32_t maxQerLen)
 {
-    return std::unique_ptr<Ikswv>(
-        new kswv(o_del, e_del, o_ins, e_ins, w_match, w_mismatch,
-                 numThreads, maxRefLen, maxQerLen));
+    return make_kswv(o_del, e_del, o_ins, e_ins, w_match, w_mismatch,
+                     numThreads, maxRefLen, maxQerLen, nullptr);
 }
 
 #endif  /* x86 vs arm64 factory dispatch */

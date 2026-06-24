@@ -57,6 +57,12 @@
     * visible at the dispatcher's translation unit. */
 #  define make_bsw_kernel    BWAMEM3_PASTE(make_bsw_kernel,    KERNEL_VARIANT)
 #  define make_kswv_kernel   BWAMEM3_PASTE(make_kswv_kernel,   KERNEL_VARIANT)
+   /* Mat-aware 10-arg factory (issue 173): mangles to
+    * make_kswv_kernel<VARIANT>_mat (e.g. make_kswv_kernel_avx2_mat) so the
+    * tier suffix stays adjacent to the base name, matching the decls in
+    * kswv.h and the make_kswv_kernel_<tier>_mat dispatch calls. */
+#  define make_kswv_kernel_mat \
+       BWAMEM3_PASTE(BWAMEM3_PASTE(make_kswv_kernel, KERNEL_VARIANT), _mat)
 #endif
 
 #endif /* BWAMEM3_KERNEL_DISPATCH_H */

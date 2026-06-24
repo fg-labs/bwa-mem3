@@ -160,6 +160,39 @@ kswv::kswv(const int o_del, const int e_del, const int o_ins,
     rowMax8 = (uint8_t*) rowMax16;
 }
 
+// Mat-aware constructor (issue 173). Delegates to the 9-arg ctor (identical
+// buffer allocation / field init), then inspects the supplied 5x5 scoring
+// matrix for the rank-1 asymmetric (bisulfite OT/OB) freed cell.
+//
+//   nullptr / symmetric matrix ⇒ the existing symmetric XOR-LUT kernel runs
+//     unchanged (has_freed = needs_scalar = false).
+//   exactly one off-diagonal cell freed to a match ⇒ has_freed, fr_ref/fr_read
+//     name it; the kernel will apply the rank-1 override (a later task).
+//   any other asymmetric matrix (>=2 freed cells, changed diagonal, freed
+//     value != w_match) ⇒ needs_scalar; the caller routes those pairs to
+//     ksw_align2.
+//
+// Sign convention: w_match is +a, w_mismatch is -b (negative), and mat25's
+// off-diagonals are likewise the negated penalty. All three are sign-consistent
+// with each other, so they are passed straight through to the Task-1 detectors
+// without re-negation.
+kswv::kswv(const int o_del, const int e_del, const int o_ins,
+           const int e_ins, const int8_t w_match, const int8_t w_mismatch,
+           int numThreads, int32_t maxRefLen, int32_t maxQerLen,
+           const int8_t *mat25)
+    : kswv(o_del, e_del, o_ins, e_ins, w_match, w_mismatch,
+           numThreads, maxRefLen, maxQerLen)
+{
+    if (mat25 != nullptr) {
+        if (bsw_generic_matrix(mat25, w_match, w_mismatch)) {
+            BswFreedCell fc = bsw_freed_cell(mat25, w_match, w_mismatch,
+                                             bsw_force_generic_matrix());
+            if (fc.rank1) { has_freed = true; fr_ref = fc.ref; fr_read = fc.read; }
+            else          { needs_scalar = true; }
+        }
+    }
+}
+
 // destructor 
 kswv::~kswv() {
     _mm_free(F16); _mm_free(H16_0); _mm_free(H16_max); _mm_free(H16_1);
@@ -3983,4 +4016,18 @@ extern "C" Ikswv *make_kswv_kernel(
 {
     return new kswv(o_del, e_del, o_ins, e_ins, w_match, w_mismatch,
                     numThreads, maxRefLen, maxQerLen);
+}
+
+/* Mat-aware 10-arg per-tier factory (issue 173). Mangled by
+ * kernel_dispatch.h to make_kswv_kernel_<tier>_mat (unmangled
+ * make_kswv_kernel_mat on arm64). Constructs via the mat-aware ctor so the
+ * freed cell is detected; mat25 == nullptr reproduces the 9-arg behavior. */
+extern "C" Ikswv *make_kswv_kernel_mat(
+    int o_del, int e_del, int o_ins, int e_ins,
+    int8_t w_match, int8_t w_mismatch,
+    int numThreads, int32_t maxRefLen, int32_t maxQerLen,
+    const int8_t *mat25)
+{
+    return new kswv(o_del, e_del, o_ins, e_ins, w_match, w_mismatch,
+                    numThreads, maxRefLen, maxQerLen, mat25);
 }
