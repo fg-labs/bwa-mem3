@@ -32,22 +32,34 @@ jobs:
           path: |
             ~/.cargo/bin/mdbook
             ~/.cargo/bin/mdbook-mermaid
-          key: cargo-mdbook-0.5.2-mermaid-0.17.0-${{ runner.os }}-v1
+            ~/.cargo/bin/mdbook-linkcheck2
+          key: cargo-mdbook-0.5.2-mermaid-0.17.0-linkcheck2-0.12.2-${{ runner.os }}-v1
 
       - name: Install mdbook + plugins
         run: |
           want_mdbook=0.5.2
           want_mermaid=0.17.0
-          have_mdbook="$(mdbook --version 2>/dev/null | awk '{print $2}' || true)"
+          want_linkcheck2=0.12.2
+          # mdbook prints "mdbook v0.5.2" (note the leading 'v'); strip it so the
+          # comparison against want_mdbook matches and the install does not rerun
+          # every time. mdbook-mermaid and mdbook-linkcheck2 emit plain versions.
+          have_mdbook="$(mdbook --version 2>/dev/null | awk '{print $2}' | sed 's/^v//' || true)"
           have_mermaid="$(mdbook-mermaid --version 2>/dev/null | awk '{print $2}' || true)"
+          have_linkcheck2="$(mdbook-linkcheck2 --version 2>/dev/null | awk '{print $2}' || true)"
           if [ "$have_mdbook" != "$want_mdbook" ]; then
             cargo install mdbook --version "$want_mdbook" --locked --force
           fi
           if [ "$have_mermaid" != "$want_mermaid" ]; then
             cargo install mdbook-mermaid --version "$want_mermaid" --locked --force
           fi
+          # Broken-link checker backend (see docs/book.toml). The fork supports
+          # mdBook 0.5; the original mdbook-linkcheck does not.
+          if [ "$have_linkcheck2" != "$want_linkcheck2" ]; then
+            cargo install mdbook-linkcheck2 --version "$want_linkcheck2" --locked --force
+          fi
           mdbook --version
           mdbook-mermaid --version
+          mdbook-linkcheck2 --version
 
       - name: Build bwa-mem3
         run: make

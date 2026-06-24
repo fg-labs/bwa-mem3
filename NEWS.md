@@ -1,4 +1,4 @@
-Release notes for 0.3.0 and later live in [`CHANGELOG.md`](./CHANGELOG.md) and the [GitHub Releases](https://github.com/fg-labs/bwa-mem3/releases) page. The 0.2.0 entry below is preserved as historical context.
+Release notes for 0.3.0 and later live in [`CHANGELOG.md`](https://github.com/fg-labs/bwa-mem3/blob/main/CHANGELOG.md) and the [GitHub Releases](https://github.com/fg-labs/bwa-mem3/releases) page. The 0.2.0 entry below is preserved as historical context.
 
 Release 0.2.0 (2026-05-13)
 ---------------------------------

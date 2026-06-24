@@ -163,11 +163,13 @@ Removes only the mdbook build output (`docs/book/`). Covered in [Developer Guide
 
 | Target | Action |
 |---|---|
-| `make docs` | Build the mdbook into `docs/book/` |
+| `make docs` | Build the mdbook into `docs/book/html/` |
 | `make docs-serve` | Live-preview at `http://localhost:3000` |
 | `make docs-cli` | Capture `--help` output for each subcommand into `docs/_generated/cli/` |
 | `make docs-clean` | Remove `docs/book/` |
-| `make docs-install-tools` | `cargo install` mdbook + three plugins |
+| `make docs-install-tools` | `cargo install` mdbook, mdbook-mermaid, and mdbook-linkcheck2 |
+
+The build runs the [mdbook-linkcheck2](https://github.com/marxin/mdbook-linkcheck2) backend, which **fails the build on a dead internal link** (a link to a page that does not exist). This guards against broken cross-references reaching the published site — mdBook on its own only warns. External (web) links are not checked, and bracketed literal text in the captured CLI snippets (e.g. `[P]`) is reported only as a non-fatal warning. Because a second output backend is configured, the HTML site is written to `docs/book/html/` rather than `docs/book/`.
 
 ---
 

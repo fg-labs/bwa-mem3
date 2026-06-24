@@ -31,3 +31,25 @@ runnable = false
 
 [preprocessor.mermaid]
 command = "mdbook-mermaid"
+
+# Broken-link checker. Configuring this as an output backend makes `mdbook build`
+# (which both CI and Read the Docs run) fail when an internal link points at a page
+# that does not exist. mdBook on its own only *warns* on dead internal links, so a
+# broken cross-reference can ship to the published site unnoticed.
+#
+# We use the mdbook-linkcheck2 fork rather than the original mdbook-linkcheck: the
+# original is pinned to the mdBook 0.4 backend API and cannot parse mdBook 0.5's
+# RenderContext (this book builds with mdBook 0.5.2). See .readthedocs.yaml and
+# .github/workflows/docs.yml for the pinned install.
+#
+# `follow-web-links = false`: do not hit the network -- external links are out of
+# scope here and following them makes the build slow, flaky, and offline-broken.
+#
+# The default warning-policy is intentional: bracketed literal text in the captured
+# CLI `--help` snippets (e.g. `[P]`, `[=LEVEL]`, `[proto]`) is reported as a non-fatal
+# "incomplete link" warning, while genuine dead links remain hard errors.
+#
+# NOTE: configuring a second output backend makes mdBook write the HTML site to
+# book/html/ rather than book/ -- the Read the Docs copy step accounts for this.
+[output.linkcheck2]
+follow-web-links = false
