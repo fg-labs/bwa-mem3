@@ -721,14 +721,19 @@ void mem_flt_chained_seeds(const mem_opt_t *opt, const bntseq_t *bns, const uint
         // read lengths -- dropping seeds inside that loop would no-op on the main
         // workload. Off (min_ext_len==0): no-op, output byte-identical.
         mem_chain_drop_short_seeds(c, opt->min_ext_len);
+        if (c->n == 0) continue;  /* CodeRabbit: drop_short_seeds can empty the
+                                   * chain; the meth block below reads seeds[0]. */
 
         /* D3 (--meth, PR-4): swap to the original read + per-hypothesis matrix. */
         const int8_t *mat = opt->mat;
         if (opt->meth_mode && seq_[c->seqid].meth_orig_seq != NULL) {
             if (l_query > meth_qbuf_cap) {
                 meth_qbuf_cap = l_query;
-                meth_qbuf = (uint8_t *) realloc(meth_qbuf, (size_t) meth_qbuf_cap);
-                assert(meth_qbuf != NULL);
+                /* CodeRabbit: don't assign realloc() result back to meth_qbuf
+                 * directly — a NULL return would leak the old buffer. */
+                uint8_t *meth_qbuf_new = (uint8_t *) realloc(meth_qbuf, (size_t) meth_qbuf_cap);
+                assert(meth_qbuf_new != NULL);
+                meth_qbuf = meth_qbuf_new;
             }
             const char *os = seq_[c->seqid].meth_orig_seq;
             for (int q = 0; q < l_query; ++q) {
@@ -3146,8 +3151,10 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
         if (opt->meth_mode && seq_[l].meth_orig_seq != NULL) {
             if (l_query > meth_qbuf_cap) {
                 meth_qbuf_cap = l_query;
-                meth_qbuf = (uint8_t *) realloc(meth_qbuf, (size_t) meth_qbuf_cap);
-                assert(meth_qbuf != NULL);
+                /* CodeRabbit: temp pointer so a NULL realloc doesn't leak. */
+                uint8_t *meth_qbuf_new = (uint8_t *) realloc(meth_qbuf, (size_t) meth_qbuf_cap);
+                assert(meth_qbuf_new != NULL);
+                meth_qbuf = meth_qbuf_new;
             }
             const char *os = seq_[l].meth_orig_seq;
             for (int i = 0; i < l_query; ++i) {
@@ -3809,7 +3816,9 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
         bsw_run_tier(BSW_TIER_SCALAR, opt, av_v,
                      bswLeft.get(), bswLeftOt.get(), bswLeftOb.get(),
                      pair_ar, seqBufLeftRef, seqBufLeftQer, nump, nthreads, w,
-                     seqPairArrayAux, pair_ar_aux, hist);
+                     pair_ar_aux, pair_ar_aux, hist);  /* CodeRabbit: base_scratch must
+                     * track pair_ar_aux (distinct from pair_ar after the retry swap),
+                     * not the static seqPairArrayAux which pair_ar can alias. */
         // tprof[PE5][0] += nump;
         // tprof[PE6][0] ++;
         // tprof[MEM_ALN2_B][tid] += __rdtsc() - tim;
@@ -3874,7 +3883,9 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
         bsw_run_tier(BSW_TIER_16, opt, av_v,
                      bswLeft.get(), bswLeftOt.get(), bswLeftOb.get(),
                      pair_ar, seqBufLeftRef, seqBufLeftQer, nump, nthreads, w,
-                     seqPairArrayAux, pair_ar_aux, hist);
+                     pair_ar_aux, pair_ar_aux, hist);  /* CodeRabbit: base_scratch must
+                     * track pair_ar_aux (distinct from pair_ar after the retry swap),
+                     * not the static seqPairArrayAux which pair_ar can alias. */
 
         tprof[PE5][0] += nump;
         tprof[PE6][0] ++;
@@ -3946,7 +3957,9 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
         bsw_run_tier(BSW_TIER_8, opt, av_v,
                      bswLeft.get(), bswLeftOt.get(), bswLeftOb.get(),
                      pair_ar, seqBufLeftRef, seqBufLeftQer, nump, nthreads, w,
-                     seqPairArrayAux, pair_ar_aux, hist);
+                     pair_ar_aux, pair_ar_aux, hist);  /* CodeRabbit: base_scratch must
+                     * track pair_ar_aux (distinct from pair_ar after the retry swap),
+                     * not the static seqPairArrayAux which pair_ar can alias. */
 
         tprof[PE1][0] += nump;
         tprof[PE2][0] ++;
@@ -4025,7 +4038,12 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
             // Skip pairs already analyzed at construction time (a->score
             // was non-(-1) then; UGP_R_ATTEMPT and outcome counters fired
             // there). Without this guard, those pairs would double-count.
-            if (!sp->ugp_r_attempted &&
+            // !opt->meth_mode: ungapped_analyze hardcodes symmetric opt->a/opt->b
+            // and cannot honor the per-strand asymmetric matrix, so a HIT here
+            // would fill a->score / qe / re from symmetric scoring and compact
+            // the pair out, bypassing the asymmetric banded SW. The two
+            // construction-time passes are gated the same way (see ~3397/3618).
+            if (!opt->meth_mode && !sp->ugp_r_attempted &&
                 sp->len1 >= sp->len2 && sp->len2 > 0 && sp->len2 <= FP_N_MAX) {
                 tprof[UGP_R_ATTEMPT][tid]++;
                 const uint8_t *qs = seqBufRightQer + sp->idq;
@@ -4151,7 +4169,9 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
         bsw_run_tier(BSW_TIER_SCALAR, opt, av_v,
                      bswRight.get(), bswRightOt.get(), bswRightOb.get(),
                      pair_ar, seqBufRightRef, seqBufRightQer, nump, nthreads, w,
-                     seqPairArrayAux, pair_ar_aux, hist);
+                     pair_ar_aux, pair_ar_aux, hist);  /* CodeRabbit: base_scratch must
+                     * track pair_ar_aux (distinct from pair_ar after the retry swap),
+                     * not the static seqPairArrayAux which pair_ar can alias. */
         // tprof[PE7][0] += nump;
         // tprof[PE8][0] ++;
         // tprof[MEM_ALN2_C][tid] += __rdtsc() - tim;
@@ -4213,7 +4233,9 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
         bsw_run_tier(BSW_TIER_16, opt, av_v,
                      bswRight.get(), bswRightOt.get(), bswRightOb.get(),
                      pair_ar, seqBufRightRef, seqBufRightQer, nump, nthreads, w,
-                     seqPairArrayAux, pair_ar_aux, hist);
+                     pair_ar_aux, pair_ar_aux, hist);  /* CodeRabbit: base_scratch must
+                     * track pair_ar_aux (distinct from pair_ar after the retry swap),
+                     * not the static seqPairArrayAux which pair_ar can alias. */
 
         tprof[PE7][0] += nump;
         tprof[PE8][0] ++;
@@ -4283,7 +4305,9 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
         bsw_run_tier(BSW_TIER_8, opt, av_v,
                      bswRight.get(), bswRightOt.get(), bswRightOb.get(),
                      pair_ar, seqBufRightRef, seqBufRightQer, nump, nthreads, w,
-                     seqPairArrayAux, pair_ar_aux, hist);
+                     pair_ar_aux, pair_ar_aux, hist);  /* CodeRabbit: base_scratch must
+                     * track pair_ar_aux (distinct from pair_ar after the retry swap),
+                     * not the static seqPairArrayAux which pair_ar can alias. */
 
         tprof[PE3][0] += nump;
         tprof[PE4][0] ++;

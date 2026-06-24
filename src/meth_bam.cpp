@@ -370,11 +370,13 @@ int meth_mem_aln_to_bam(bam1_t *b,
         }
     }
 
-    /* Restore pre-c2t bases from YS:Z so MethylDackel sees real C/Ts.
-     * FASTQ ingest (fastmap.cpp meth_mode block) builds comments as
+    /* Restore pre-c2t bases so MethylDackel sees real C/Ts. CodeRabbit: prefer
+     * the first-class meth_orig_seq field (native-alphabet output no longer
+     * depends on comment preservation); fall back to the YS:Z comment only when
+     * meth_orig_seq is unavailable. FASTQ ingest builds comments as
      * "YS:Z:<l_seq bytes>\tYC:Z:XX" starting at offset 0 — rely on that. */
-    const char *orig_seq = NULL;
-    if (s->comment && s->l_seq > 0
+    const char *orig_seq = s->meth_orig_seq;
+    if (orig_seq == NULL && s->comment && s->l_seq > 0
         && s->comment[0] == 'Y' && s->comment[1] == 'S' && s->comment[2] == ':') {
         orig_seq = s->comment + 5;
     }
