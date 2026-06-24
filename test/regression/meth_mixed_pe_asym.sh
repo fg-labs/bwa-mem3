@@ -42,7 +42,7 @@ printf '@p\n%s\n+\n%s\n' "$R1" "$Q" > r1.fq
 printf '@p\n%s\n+\n%s\n' "$R2" "$Q" > r2.fq
 
 "$BWA_MEM3" index --meth ref.fa >/dev/null 2>&1 || fail "index --meth nonzero exit"
-"$BWA_MEM3" mem --meth -t 1 ref.fa r1.fq r2.fq > pe.bam 2>/dev/null || fail "mem --meth nonzero exit"
+"$BWA_MEM3" mem --meth --meth-scoring genomic -t 1 ref.fa r1.fq r2.fq > pe.bam 2>/dev/null || fail "mem --meth nonzero exit"
 samtools quickcheck pe.bam || fail "mem --meth produced an invalid BAM"
 
 # Extract one decoded line per mate (READ1 = flag&64, READ2 = flag&128).

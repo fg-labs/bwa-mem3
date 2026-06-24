@@ -44,7 +44,7 @@ tag() { mawk -v k="$2" '{for(i=12;i<=NF;i++) if(substr($i,1,5)==k":Z:"||substr($
 # OT fwd @101: 10 C->T conversions (free) + 1 real A->G SNP at read pos 22 (penalized).
 SNP_READ=ATTCTGGCGATTTAGGTGACTCGCAGAATCGTTCTTTCTAACGTAGTTTGTATAGTTCTC
 emit snp "$SNP_READ" snp.fq
-"$BWA_MEM3" mem --meth -t 1 ref.fa snp.fq > snp.bam 2>/dev/null || fail "snp mem --meth nonzero exit"
+"$BWA_MEM3" mem --meth --meth-scoring genomic -t 1 ref.fa snp.fq > snp.bam 2>/dev/null || fail "snp mem --meth nonzero exit"
 samtools quickcheck snp.bam || fail "snp invalid BAM"
 line=$(samtools view snp.bam | mawk 'NR==1')
 as=$(tag "$line" AS); nm=$(tag "$line" NM); md=$(tag "$line" MD)
@@ -77,11 +77,11 @@ check_strand() { # $1 bam $2 mateflag $3 label $4 wantXR $5 wantXG
     [ "$xg" = "$5" ] || fail "$3: XG $xg, want $5 (Bismark genome strand)"
 }
 emit f "$FWD_R1" f1.fq; emit f "$FWD_R2" f2.fq
-"$BWA_MEM3" mem --meth -t 1 ref.fa f1.fq f2.fq > fwd.bam 2>/dev/null || fail "fwd nonzero exit"
+"$BWA_MEM3" mem --meth --meth-scoring genomic -t 1 ref.fa f1.fq f2.fq > fwd.bam 2>/dev/null || fail "fwd nonzero exit"
 check_strand fwd.bam 64  "OT   R1" CT CT
 check_strand fwd.bam 128 "CTOT R2" GA CT
 emit r "$REV_R1" r1.fq; emit r "$REV_R2" r2.fq
-"$BWA_MEM3" mem --meth -t 1 ref.fa r1.fq r2.fq > rev.bam 2>/dev/null || fail "rev nonzero exit"
+"$BWA_MEM3" mem --meth --meth-scoring genomic -t 1 ref.fa r1.fq r2.fq > rev.bam 2>/dev/null || fail "rev nonzero exit"
 check_strand rev.bam 64  "OB   R1" CT GA
 check_strand rev.bam 128 "CTOB R2" GA GA
 
@@ -90,7 +90,7 @@ SEQ_R1=ATCCCGGCGACTTAGGCGACCCACAGAATCGTCCCTTCTAACGTAGTTCGCATAGTTCCC
 SEQ_R2=TAGGCGATTTATTAGACCCAACTCTTAACAGACGTCTCAAGTCTAACAAACGTAGACCCG
 SEQ_R2_RC=CGGGTCTACGTTTGTTAGACTTGAGACGTCTGTTAAGAGTTGGGTCTAATAAATCGCCTA
 emit pp "$SEQ_R1" s1.fq; emit pp "$SEQ_R2" s2.fq
-"$BWA_MEM3" mem --meth -t 1 ref.fa s1.fq s2.fq > seq.bam 2>/dev/null || fail "seq nonzero exit"
+"$BWA_MEM3" mem --meth --meth-scoring genomic -t 1 ref.fa s1.fq s2.fq > seq.bam 2>/dev/null || fail "seq nonzero exit"
 samtools quickcheck seq.bam || fail "seq invalid BAM (S1 inconsistent-BAM trap)"
 read -r rev seq cig < <(samtools view seq.bam | mawk '(int($2/128)%2)==1{print (int($2/16)%2),$10,$6;exit}')
 [ "$rev" = "1" ]            || fail "SEQ orient: R2 expected reverse-mapped (rev=$rev)"

@@ -50,7 +50,7 @@ printf '@p\n%s\n+\n%s\n' "$R1" "$Q" > r1.fq
 printf '@p\n%s\n+\n%s\n' "$R2" "$Q" > r2.fq
 
 "$BWA_MEM3" index --meth ref.fa >/dev/null 2>&1 || fail "index --meth nonzero exit"
-"$BWA_MEM3" mem --meth -t 1 ref.fa r1.fq r2.fq > pe.bam 2>/dev/null || fail "mem --meth nonzero exit"
+"$BWA_MEM3" mem --meth --meth-scoring genomic -t 1 ref.fa r1.fq r2.fq > pe.bam 2>/dev/null || fail "mem --meth nonzero exit"
 samtools quickcheck pe.bam || fail "produced an invalid BAM"
 
 # Decode one mate (mate-flag bit 64=READ1, 128=READ2) into: rname pos mapq rev cigar as nm xr.

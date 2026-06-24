@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 # Regression test: bwa-mem3 mem --meth end-to-end.
 #
-# Two layers of assertions:
-#
 # Layer 1 (always runs):  valid BAM emission.
 #   - binary builds and runs with --meth
 #   - produces uncompressed BAM readable by samtools
@@ -10,13 +8,12 @@
 #   - BGZF EOF marker at tail
 #   - --set-as-failed / --chimera-qc parse cleanly
 #
-# Layer 2 (runs if pixi + bwameth.py available):  equivalence to bwameth.py.
-#   Builds a bwameth c2t reference, c2t-converts reads, runs BOTH the
-#   bwameth.py Python pipeline and `bwa-mem3 mem --meth` on the same
-#   converted reads, and diffs structural fields (QNAME, FLAG, RNAME,
-#   POS, MAPQ, CIGAR, RNEXT, PNEXT) only. Tag-value parity moved to
-#   test_bismark_tags.sh (holodeck golden) since the two pipelines now
-#   emit different tag schemas (Bismark XR/XG/XM vs bwameth YS/YC/YD).
+# Layers 2-3 (bwameth structural / byte equivalence) are RETIRED in D3 — see the
+# note near the exit at the bottom of this file. D3 intentionally diverges from
+# bwameth (the genomic --meth-scoring mode is variant-aware, not collapsed), so
+# byte/structural equivalence to bwameth.py is no longer an invariant. D3
+# correctness is covered by the CI-wired whole-aligner regressions
+# (test/regression/meth_*.sh) plus the directed unit tests.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"

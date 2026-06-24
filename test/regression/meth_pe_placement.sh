@@ -62,14 +62,14 @@ check() { # $1 bam  $2 mateflag  $3 label  $4 pos  $5 rev  $6 xr  $7 as  $8 nm
 
 # --- forward fragment ---
 emit f "$FWD_R1" f1.fq; emit f "$FWD_R2" f2.fq
-"$BWA_MEM3" mem --meth -t 1 ref.fa f1.fq f2.fq > fwd.bam 2>/dev/null || fail "fwd mem --meth nonzero exit"
+"$BWA_MEM3" mem --meth --meth-scoring genomic -t 1 ref.fa f1.fq f2.fq > fwd.bam 2>/dev/null || fail "fwd mem --meth nonzero exit"
 samtools quickcheck fwd.bam || fail "fwd produced an invalid BAM"
 check fwd.bam 64  "FWD R1 OT-fwd" 101 0 CT 60 10
 check fwd.bam 128 "FWD R2 OB-rev" 301 1 GA 60 5
 
 # --- reverse fragment ---
 emit r "$REV_R1" r1.fq; emit r "$REV_R2" r2.fq
-"$BWA_MEM3" mem --meth -t 1 ref.fa r1.fq r2.fq > rev.bam 2>/dev/null || fail "rev mem --meth nonzero exit"
+"$BWA_MEM3" mem --meth --meth-scoring genomic -t 1 ref.fa r1.fq r2.fq > rev.bam 2>/dev/null || fail "rev mem --meth nonzero exit"
 samtools quickcheck rev.bam || fail "rev produced an invalid BAM"
 check rev.bam 64  "REV R1 OT-rev" 701 1 CT 60 6
 check rev.bam 128 "REV R2 OB-fwd" 501 0 GA 60 9
