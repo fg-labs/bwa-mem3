@@ -706,6 +706,7 @@ test: test-binaries kswv_nrow_zero_test kswv_freed_cell_test bandedswa_padding_t
 	./kt_for_pool_test
 	./shm_lock_destroy_test
 	BWA_MEM3=./bwa-mem3 ./test/regression/version_banner.sh
+	BWA_MEM3=./bwa-mem3 ./test/regression/meth_rescue_batched_identical.sh
 
 # Regression test that requires a binary built with TESTING_BUILD=1
 # (enables BWAMEM3_TESTING_HOST_TIER env-var injection). Not invoked by

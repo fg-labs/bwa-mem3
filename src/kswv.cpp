@@ -538,9 +538,9 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
 
             /* Apply the rank-1 freed-cell override: where the row is fr_ref and
              * this column is fr_read, force the biased match score. Real bases
-             * are 0-3 and fr_read ∈ {0,3}; padding/ambig (DUMMY5/0xFF/AMBQ)
-             * never equal fr_read, so vceqq is naturally false for them — no
-             * extra masking needed. */
+             * are 0-3 and fr_read ∈ {0,3}; s1 boundary (0xFF) and s2
+             * ambig/padding (AMBQ=8, DUMMY5=5) never equal fr_read, so vceqq
+             * is naturally false for them — no extra masking needed. */
             if (HasFreed) {
                 uint8x16_t freed = vandq_u8(rowfreed, vceqq_u8(s2, frread_vec));
                 sbt = vbslq_u8(freed, match_vec, sbt);

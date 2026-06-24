@@ -211,6 +211,12 @@ typedef struct dnaSeqPair
     // a->score != -1 made fp_h0 known) so the post-left-SW pass doesn't
     // double-count UGP_R_ATTEMPT / UGP_R_TIGHT / UGP_R_HIT.
     uint8_t ugp_r_attempted = 0;
+    // issue 173 / Task 5 (--meth batched mate rescue): per-pair bisulfite
+    // hypothesis tag for the batched kswv mate-rescue partition. 1 = OT
+    // (mat_ot, frees C->T), 0 = OB (mat_ob, frees G->A); -1 = non-meth
+    // (default; the kernels never read this field, so it does not perturb
+    // the non-meth getScores8/16 results — proven by the unchanged goldens).
+    int8_t meth_hyp = -1;
 }SeqPair;
 
 
