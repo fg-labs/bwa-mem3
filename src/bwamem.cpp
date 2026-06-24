@@ -276,6 +276,7 @@ mem_opt_t *mem_opt_init()
     o->min_chain_weight = 0;
     o->max_chain_extend = 1<<30;
     o->mapQ_coef_len = 50; o->mapQ_coef_fac = log(o->mapQ_coef_len);
+    o->meth_scoring = MEM_METH_SCORING_COLLAPSED;  /* --meth default: bwameth-compatible */
     bwa_fill_scmat(o->a, o->b, o->mat);
     mem_opt_fill_meth_mat(o);
     return o;
@@ -287,16 +288,27 @@ mem_opt_t *mem_opt_init()
  * else (incl. the mirror cell, a real variant) at the symmetric value:
  *   OT: free mat[C][T] = mat[1*5+3]  (ref C, read T = unmethylated C→T)
  *   OB: free mat[G][A] = mat[2*5+0]  (ref G, read A = bottom-strand G→A)
- * One freed cell ⇒ the SIMD kernel's rank-1 fast path. Selected per chain via
- * mem_opt_meth_mat(); valid only under --meth. MUST be called after EVERY rebuild
- * of opt->mat (mem_opt_init AND after main_mem parses -A/-B/-x and re-runs
- * bwa_fill_scmat) — otherwise the meth matrices keep the default match/mismatch
- * and silently ignore the user's scoring options. */
+ * GENOMIC (opt->meth_scoring): only that one cell is freed ⇒ the mirror stays a
+ * real mismatch and the SIMD kernel takes its rank-1 fast path. COLLAPSED: the
+ * mirror cell is ALSO freed (two cells) so C/T and G/A are interchangeable
+ * (bwameth-compatible), via bandedSWA's general-matrix path. Selected per chain
+ * via mem_opt_meth_mat(); valid only under --meth. MUST be called after EVERY
+ * rebuild of opt->mat (mem_opt_init AND after main_mem parses -A/-B/-x and
+ * re-runs bwa_fill_scmat) — otherwise the meth matrices keep the default
+ * match/mismatch and silently ignore the user's scoring options. */
 void mem_opt_fill_meth_mat(mem_opt_t *o) {
     memcpy(o->mat_ot, o->mat, sizeof(o->mat));
-    o->mat_ot[1 * 5 + 3] = o->a;   /* ref C / read T → match (C→T conversion)   */
     memcpy(o->mat_ob, o->mat, sizeof(o->mat));
-    o->mat_ob[2 * 5 + 0] = o->a;   /* ref G / read A → match (G→A conversion)   */
+    o->mat_ot[1 * 5 + 3] = o->a;   /* OT: ref C / read T → match (C→T conversion)   */
+    o->mat_ob[2 * 5 + 0] = o->a;   /* OB: ref G / read A → match (G→A conversion)   */
+    if (o->meth_scoring == MEM_METH_SCORING_COLLAPSED) {
+        /* bwameth-compatible: free the MIRROR cell too so C/T (and G/A) are
+         * mutually interchangeable (collapsed 3-letter space). Two freed cells ⇒
+         * bandedSWA general path, not the rank-1 fast path. Loses variant vs.
+         * conversion discrimination; reproduces bwameth placement. */
+        o->mat_ot[3 * 5 + 1] = o->a;   /* OT: ref T / read C → match */
+        o->mat_ob[0 * 5 + 2] = o->a;   /* OB: ref A / read G → match */
+    }
 }
 
 /******************************
@@ -3261,6 +3273,26 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                  * flips the conversion's freed cell — so flip the hypothesis. */
                 a->meth_strand_hyp = (c->meth_hypothesis < 0) ? -1
                     : (int8_t)((c->meth_hypothesis ^ (s->rbeg >= l_pac ? 1 : 0)) & 1);
+                /* D3 (--meth): the seed matched in projected 3-letter space, but
+                 * its 4-letter score against the ORIGINAL read + ref is not
+                 * necessarily len*a — a seed-internal variant (e.g. a C/T mirror
+                 * that collapsed in seed space) scores as a mismatch under the
+                 * per-strand matrix. Recompute the true ungapped seed score so the
+                 * alnreg score (the h0 the extension starts from, hence AS, MAPQ,
+                 * and mate rescue) is honest rather than optimistically len*a.
+                 * --meth-scoring collapsed frees C/T (and G/A) both ways, so this
+                 * reproduces len*a (bwameth-like); genomic penalizes the variant.
+                 * query is the ORIGINAL read (meth_orig_seq, set above); rseq is
+                 * the original 4-letter ref window. mat[ref*5+read] is target-major
+                 * (matches mem_opt_fill_meth_mat). */
+                int meth_seed_sc = s->len * opt->a;
+                if (opt->meth_mode && a->meth_strand_hyp >= 0) {
+                    const int8_t *seed_mat = mem_opt_meth_mat(opt, a->meth_strand_hyp);
+                    const int64_t roff = s->rbeg - rmax[0];
+                    meth_seed_sc = 0;
+                    for (int _i = 0; _i < s->len; ++_i)
+                        meth_seed_sc += seed_mat[ rseq[roff + _i] * 5 + query[s->qbeg + _i] ];
+                }
                 a->chain_n_hits = chain_max_n_hits;
                 a->rb = a->qb = a->re = a->qe = H0_;
 
@@ -3271,7 +3303,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                 if (s->qbeg)  // left extension
                 {
                     SeqPair sp;
-                    sp.h0 = s->len * opt->a;
+                    sp.h0 = meth_seed_sc;   /* D3: true seed score (== len*a outside --meth) */
                     sp.seqid = c->seqid;
                     sp.regid = av->n - 1;
 
@@ -3481,7 +3513,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                 else
                 {
                     flag = 1;
-                    a->score = a->truesc = s->len * opt->a, a->qb = 0, a->rb = s->rbeg;
+                    a->score = a->truesc = meth_seed_sc, a->qb = 0, a->rb = s->rbeg;  /* D3: true seed score */
                 }
 
                 if (s->qbeg + s->len != l_query)  // right extension

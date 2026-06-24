@@ -74,6 +74,13 @@ typedef struct __smem_i smem_i;
 #define MEM_F_XB        0x2000
 
 
+/* D3 (--meth): bisulfite substitution-matrix mode, selected by --meth-scoring.
+ * COLLAPSED (default) frees BOTH conversion directions so C/T (and G/A) are
+ * interchangeable — reproduces bwameth's collapsed 3-letter placement (a
+ * drop-in). GENOMIC frees only the bisulfite conversion direction, keeping the
+ * mirror cell a real mismatch — variant-aware, truthful NM/MD. */
+enum mem_meth_scoring { MEM_METH_SCORING_COLLAPSED = 0, MEM_METH_SCORING_GENOMIC = 1 };
+
 typedef struct mem_opt_t {
     int a, b;               // match score and mismatch penalty
     int o_del, e_del;
@@ -107,22 +114,24 @@ typedef struct mem_opt_t {
     int max_matesw;         // perform maximally max_matesw rounds of mate-SW for each end
     int max_XA_hits, max_XA_hits_alt; // if there are max_hits or fewer, output them all
     int8_t mat[25];         // scoring matrix; mat[0] == 0 if unset
-    /* D3 (--meth, PR-4): per-hypothesis ASYMMETRIC substitution matrices, built
-     * once from `mat` in mem_opt_init (target-major mat[ref*5+read], ACGT order
-     * A,C,G,T,N). They are identical to the symmetric `mat` except each frees
-     * exactly ONE off-diagonal cell to a MATCH (+a):
-     *   mat_ot: free mat[C][T] = mat[1*5+3] = +a  (top strand, unmethylated C→T)
-     *   mat_ob: free mat[G][A] = mat[2*5+0] = +a  (bottom strand, G→A)
-     * The mirror cells (mat[T][C], mat[A][G]) STAY at the −b mismatch (genuine
-     * variants bisulfite cannot produce). Exactly one freed cell ⇒ the SIMD
-     * kernel takes its rank-1 fast path (bandedSWA bsw_freed_cell). Outside
-     * --meth these are unused; selection is by mem_chain_t.meth_hypothesis
+    /* D3 (--meth): per-hypothesis substitution matrices, built from `mat` by
+     * mem_opt_fill_meth_mat() per opt->meth_scoring (target-major mat[ref*5+read],
+     * ACGT order A,C,G,T,N). Each frees the bisulfite conversion cell to a MATCH
+     * (+a): mat_ot frees mat[C][T]=mat[1*5+3] (top strand C→T), mat_ob frees
+     * mat[G][A]=mat[2*5+0] (bottom strand G→A).
+     *   GENOMIC: ONLY that cell is freed; the mirror (mat[T][C], mat[A][G]) STAYS
+     *     at −b so genuine variants score as mismatches → one freed cell ⇒ the
+     *     SIMD rank-1 fast path. Variant-aware, truthful NM/MD.
+     *   COLLAPSED: the mirror cell is ALSO freed (two cells) so C/T and G/A are
+     *     interchangeable → reproduces bwameth; uses bandedSWA's general path.
+     * Outside --meth these are unused; selection is by mem_chain_t.meth_hypothesis
      * (1 = OT, 0 = OB) via mem_opt_meth_mat(). */
-    int8_t mat_ot[25];      // OT (C→T) asymmetric matrix; valid only under --meth
-    int8_t mat_ob[25];      // OB (G→A) asymmetric matrix; valid only under --meth
+    int8_t mat_ot[25];      // OT (C→T) meth matrix; valid only under --meth
+    int8_t mat_ob[25];      // OB (G→A) meth matrix; valid only under --meth
     int    bam_mode;        // 1 = emit BAM instead of SAM text (--bam); meth_mode implies this
     int    bam_level;       // 0..9, BGZF deflate level (0 = uncompressed)
     int    meth_mode;       // 1 = bisulfite mode (--meth); implies bam_mode
+    int    meth_scoring;    // bisulfite matrix mode (--meth-scoring): MEM_METH_SCORING_{COLLAPSED,GENOMIC}
     char   meth_set_as_failed;// 'f', 'r', or 0 — flag reads on that strand 0x200
     int    meth_chimera_qc; // 1 to enable bwameth.py-style longest-M <44% chimera heuristic (default off; not in Bismark)
     int    supp_rep_hard_cap; // supp alnregs whose chain's seeds share >=this many genome hits are forced to MAPQ=0; 0 disables

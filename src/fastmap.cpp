@@ -975,6 +975,11 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "                 emission. Implies --bam. Requires the reference to have been built\n");
     fprintf(stderr, "                 with `bwa-mem3 index --meth` (emits the original index plus a\n");
     fprintf(stderr, "                 ref.fa.meth.* converted seed index).\n");
+    fprintf(stderr, "   --meth-scoring collapsed|genomic\n");
+    fprintf(stderr, "                 bisulfite scoring mode [collapsed]. collapsed: C/T (and G/A)\n");
+    fprintf(stderr, "                 interchangeable, bwameth-compatible placement (sets -B 2).\n");
+    fprintf(stderr, "                 genomic: free only the conversion direction, keep variants as\n");
+    fprintf(stderr, "                 mismatches (variant-aware, truthful NM/MD; -B 4).\n");
     fprintf(stderr, "   --set-as-failed f|r\n");
     fprintf(stderr, "                 flag alignments to the matching strand ('f' or 'r') as QC-fail (0x200)\n");
     fprintf(stderr, "   --chimera-qc\n");
@@ -1157,6 +1162,7 @@ int main_mem(int argc, char *argv[])
     enum {
         OPT_BAM = 1000,
         OPT_METH,
+        OPT_METH_SCORING,
         OPT_METH_SET_AS_FAILED,
         OPT_METH_CHIMERA_QC,
         OPT_SUPP_REP_HARD_CAP,
@@ -1171,6 +1177,7 @@ int main_mem(int argc, char *argv[])
         {"bam",                      optional_argument, 0, OPT_BAM},
         {"min-ext-len",              required_argument, 0, OPT_MIN_EXT_LEN},
         {"meth",                     no_argument,       0, OPT_METH},
+        {"meth-scoring",             required_argument, 0, OPT_METH_SCORING},
         {"set-as-failed",            required_argument, 0, OPT_METH_SET_AS_FAILED},
         {"chimera-qc",               no_argument,       0, OPT_METH_CHIMERA_QC},
         {"supp-rep-hard-cap",        required_argument, 0, OPT_SUPP_REP_HARD_CAP},
@@ -1316,6 +1323,18 @@ int main_mem(int argc, char *argv[])
             opt->meth_mode = 1;
             opt->bam_mode = 1;  /* meth implies BAM output */
         }
+        else if (c == OPT_METH_SCORING) {
+            if (optarg != NULL && strcmp(optarg, "collapsed") == 0) {
+                opt->meth_scoring = MEM_METH_SCORING_COLLAPSED;
+            } else if (optarg != NULL && strcmp(optarg, "genomic") == 0) {
+                opt->meth_scoring = MEM_METH_SCORING_GENOMIC;
+            } else {
+                fprintf(stderr, "ERROR: --meth-scoring requires 'collapsed' or 'genomic'\n");
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+        }
         else if (c == OPT_METH_SET_AS_FAILED) {
             if (optarg == NULL || !(optarg[0] == 'f' || optarg[0] == 'r') || optarg[1] != '\0') {
                 fprintf(stderr, "ERROR: --set-as-failed requires 'f' or 'r'\n");
@@ -1436,23 +1455,27 @@ int main_mem(int argc, char *argv[])
     } else update_a(opt, &opt0);
 
     /* Meth-mode default tuning. bwameth runs (collapsed) bwa with
-     * -B 2 -L 10 -U 100 -T 40 -CM. We adopt the soft-clip / unpaired /
-     * output-threshold and -M/-C defaults so BS reads get long un-clipped
-     * alignments, but deliberately NOT bwameth's lenient -B 2: bwa-mem3 scores
-     * against the ORIGINAL 4-letter reference with the per-strand asymmetric
-     * matrix, which already frees the expected conversion, so it neither needs
-     * nor benefits from bwameth's collapsed-space leniency. The full-hg38
-     * variant A/B showed the bwa default b=4 places better and is better
-     * MAPQ-calibrated than b=2 (placement 92.6 vs 92.5, discordant MAPQ 1.8 vs
-     * 2.1), so we keep b=4. -A/-B remain user-overridable and now reach the
-     * asymmetric matrices (mem_opt_fill_meth_mat below). */
+     * -B 2 -L 10 -T 40 -CM. The soft-clip / output-threshold / -M / -C defaults
+     * are shared by both --meth-scoring modes (sensible for BS reads either way),
+     * but the mismatch penalty and pen_unpaired follow the scoring mode:
+     *   COLLAPSED (bwameth drop-in): -B 2 (bwameth's lenient mismatch) and leave
+     *     pen_unpaired at the bwa default (bwameth does not set -U).
+     *   GENOMIC (variant-aware): keep bwa's -B 4 — the full-hg38 variant A/B with
+     *     the asymmetric matrix showed b=4 places better and is better MAPQ-
+     *     calibrated than b=2 (placement 92.6 vs 92.5, discordant MAPQ 1.8 vs
+     *     2.1) — plus the tuned pen_unpaired 100.
+     * -A/-B always override and reach the matrices (mem_opt_fill_meth_mat below). */
     if (opt->meth_mode) {
         if (!opt0.pen_clip5)    opt->pen_clip5   = 10;
         if (!opt0.pen_clip3)    opt->pen_clip3   = 10;
-        if (!opt0.pen_unpaired) opt->pen_unpaired= 100;
         if (!opt0.T)            opt->T           = 40;
         opt->flag |= MEM_F_NO_MULTI;   /* -M */
         aux.copy_comment = 1;          /* -C, needed for YS:Z/YC:Z passthrough */
+        if (opt->meth_scoring == MEM_METH_SCORING_COLLAPSED) {
+            if (!opt0.b) opt->b = 2;   /* match bwameth's lenient mismatch */
+        } else {                       /* GENOMIC */
+            if (!opt0.pen_unpaired) opt->pen_unpaired = 100;
+        }
     }
 
     /* Matrix for SWA */
