@@ -336,6 +336,9 @@ void kswv::kswvBatchWrapper8(SeqPair *pairArray,
     return;
 }
 
+/* Thin dispatcher: route to the HasFreed template instantiation. The <false>
+ * path dead-code-eliminates every freed-cell override → byte-identical to the
+ * pre-issue-173 kernel for symmetric (non-meth) matrices. */
 int kswv::kswv_neon_u8(uint8_t seq1SoA[],
                        uint8_t seq2SoA[],
                        int16_t nrow,
@@ -346,6 +349,25 @@ int kswv::kswv_neon_u8(uint8_t seq1SoA[],
                        uint16_t tid,
                        int32_t numPairs,
                        int phase)
+{
+    return has_freed
+        ? kswv_neon_u8_impl<true>(seq1SoA, seq2SoA, nrow, ncol, p, aln,
+                                  po_ind, tid, numPairs, phase)
+        : kswv_neon_u8_impl<false>(seq1SoA, seq2SoA, nrow, ncol, p, aln,
+                                   po_ind, tid, numPairs, phase);
+}
+
+template<bool HasFreed>
+int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
+                            uint8_t seq2SoA[],
+                            int16_t nrow,
+                            int16_t ncol,
+                            SeqPair *p,
+                            kswr_t *aln,
+                            int po_ind,
+                            uint16_t tid,
+                            int32_t numPairs,
+                            int phase)
 {
     int m_b, n_b;
     uint8_t minsc[SIMD_WIDTH8] __attribute__((aligned(128))) = {0};
@@ -482,6 +504,22 @@ int kswv::kswv_neon_u8(uint8_t seq1SoA[],
         imax_vec = zero_vec;
         uint8x16_t iqe_vec = vdupq_n_u8(0xFF);
 
+        /* Rank-1 freed-cell override (issue 173, bisulfite OT/OB). The freed
+         * cell scores (s1==fr_ref, s2==fr_read) as a true match. s1 is
+         * loop-invariant across the inner j loop, so hoist the per-row
+         * comparison here; per-cell only the s2 compare + blend remains.
+         * match_vec is the kernel's OWN biased match entry (temp[0] already
+         * includes +shift) so the freed cell scores byte-identically to a real
+         * match in the biased u8 domain. When !HasFreed, all of this and the
+         * per-cell block below compile out (identical codegen to today). */
+        uint8x16_t frref_vec, frread_vec, match_vec, rowfreed;
+        if (HasFreed) {
+            frref_vec  = vdupq_n_u8((uint8_t)fr_ref);
+            frread_vec = vdupq_n_u8((uint8_t)fr_read);
+            match_vec  = vdupq_n_u8((uint8_t)temp[0]);
+            rowfreed   = vceqq_u8(s1, frref_vec);
+        }
+
         uint8x16_t l_vec = zero_vec;
         for (j = 0; j < ncol; j++)
         {
@@ -497,6 +535,16 @@ int kswv::kswv_neon_u8(uint8_t seq1SoA[],
             /* Check for ambiguous query base (DUMMY5) */
             uint8x16_t cmpq = vceqq_u8(s2, five_vec);
             sbt = vbslq_u8(cmpq, sft_vec, sbt);
+
+            /* Apply the rank-1 freed-cell override: where the row is fr_ref and
+             * this column is fr_read, force the biased match score. Real bases
+             * are 0-3 and fr_read ∈ {0,3}; padding/ambig (DUMMY5/0xFF/AMBQ)
+             * never equal fr_read, so vceqq is naturally false for them — no
+             * extra masking needed. */
+            if (HasFreed) {
+                uint8x16_t freed = vandq_u8(rowfreed, vceqq_u8(s2, frread_vec));
+                sbt = vbslq_u8(freed, match_vec, sbt);
+            }
 
             /* Check for boundary (high bit set in s1 or s2). vtstq_u8 against
              * 0x80 sets 0xFF where bit 7 is set, 0x00 otherwise — one op vs the
@@ -891,6 +939,7 @@ void kswv::kswvBatchWrapper16(SeqPair *pairArray,
     return;
 }
 
+/* Thin dispatcher: see kswv_neon_u8. */
 int kswv::kswv_neon_16(int16_t seq1SoA[],
                        int16_t seq2SoA[],
                        int16_t nrow,
@@ -901,6 +950,25 @@ int kswv::kswv_neon_16(int16_t seq1SoA[],
                        uint16_t tid,
                        int32_t numPairs,
                        int phase)
+{
+    return has_freed
+        ? kswv_neon_16_impl<true>(seq1SoA, seq2SoA, nrow, ncol, p, aln,
+                                  po_ind, tid, numPairs, phase)
+        : kswv_neon_16_impl<false>(seq1SoA, seq2SoA, nrow, ncol, p, aln,
+                                   po_ind, tid, numPairs, phase);
+}
+
+template<bool HasFreed>
+int kswv::kswv_neon_16_impl(int16_t seq1SoA[],
+                            int16_t seq2SoA[],
+                            int16_t nrow,
+                            int16_t ncol,
+                            SeqPair *p,
+                            kswr_t *aln,
+                            int po_ind,
+                            uint16_t tid,
+                            int32_t numPairs,
+                            int phase)
 {
     /* NEON 16-bit mate-rescue kernel.
      *
@@ -1031,6 +1099,19 @@ int kswv::kswv_neon_16(int16_t seq1SoA[],
         int16x8_t l_vec   = zero_vec;
         int16x8_t i_vec   = vdupq_n_s16((int16_t)i);
 
+        /* Rank-1 freed-cell override (issue 173). s1 is loop-invariant, so
+         * hoist the per-row fr_ref comparison. The 16-bit kernel has NO shift
+         * bias (m11 = h00 + sbt directly), so the biased match constant is
+         * just temp8[0] (== w_match), sign-extended to int16. !HasFreed → both
+         * this and the per-cell block compile out. */
+        int16x8_t frref_vec16, frread_vec16, match_vec16, rowfreed16;
+        if (HasFreed) {
+            frref_vec16  = vdupq_n_s16((int16_t)fr_ref);
+            frread_vec16 = vdupq_n_s16((int16_t)fr_read);
+            match_vec16  = vdupq_n_s16((int16_t)temp8[0]);
+            rowfreed16   = vreinterpretq_s16_u16(vceqq_s16(s1, frref_vec16));
+        }
+
         for (int j = 0; j < ncol; j++) {
             int16x8_t h00 = vld1q_s16(H0 + j * SIMD_WIDTH16);
             int16x8_t s2  = vld1q_s16(seq2SoA + j * SIMD_WIDTH16);
@@ -1045,6 +1126,16 @@ int kswv::kswv_neon_16(int16_t seq1SoA[],
             uint8x8_t  idx8 = vmovn_u16(vreinterpretq_u16_s16(xor_val));
             int8x8_t   sbt8 = vqtbl2_s8(perm_vec, idx8);
             int16x8_t  sbt  = vmovl_s8(sbt8);
+
+            /* Rank-1 freed-cell override (issue 173): where row==fr_ref and
+             * col==fr_read, force the match score. Real bases 0-3; fr_read ∈
+             * {0,3}; padding/ambig (DUMMY3/0xFFFF/AMBQ16) never equal fr_read,
+             * so vceqq is naturally false for them. */
+            if (HasFreed) {
+                int16x8_t freed = vandq_s16(
+                    rowfreed16, vreinterpretq_s16_u16(vceqq_s16(s2, frread_vec16)));
+                sbt = vbslq_s16(vreinterpretq_u16_s16(freed), match_vec16, sbt);
+            }
 
             /* Boundary: high bit set in (s1 | s2) indicates padding. */
             int16x8_t or_val = vorrq_s16(s1, s2);

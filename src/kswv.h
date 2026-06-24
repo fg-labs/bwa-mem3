@@ -298,6 +298,10 @@ private:
 						   uint16_t numThreads,
 						   int phase);
 
+	/* Thin dispatcher: selects the HasFreed template instantiation based on
+	 * the rank-1 freed-cell flag. The <false> instantiation dead-code-
+	 * eliminates every freed-cell override block, giving codegen identical to
+	 * the pre-issue-173 kernel for the non-meth path. */
 	int kswv_neon_u8(uint8_t seq1SoA[],
 				     uint8_t seq2SoA[],
 				     int16_t nrow,
@@ -309,6 +313,21 @@ private:
 				     int32_t numPairs,
 				     int phase);
 
+	/* Templated u8 kernel body. When HasFreed, applies the rank-1 freed-cell
+	 * (fr_ref x fr_read -> match) override per cell; otherwise the override
+	 * blocks compile out entirely. */
+	template<bool HasFreed>
+	int kswv_neon_u8_impl(uint8_t seq1SoA[],
+					      uint8_t seq2SoA[],
+					      int16_t nrow,
+					      int16_t ncol,
+					      SeqPair *p,
+					      kswr_t *aln,
+					      int po_ind,
+					      uint16_t tid,
+					      int32_t numPairs,
+					      int phase);
+
 	void kswvBatchWrapper16(SeqPair *pairArray,
 							uint8_t *seqBufRef,
 							uint8_t *seqBufQer,
@@ -317,6 +336,7 @@ private:
 							uint16_t numThreads,
 							int phase);
 
+	/* Thin dispatcher: see kswv_neon_u8 above. */
 	int kswv_neon_16(int16_t seq1SoA[],
                      int16_t seq2SoA[],
                      int16_t nrow,
@@ -327,6 +347,19 @@ private:
                      uint16_t tid,
                      int32_t numPairs,
                      int phase);
+
+	/* Templated i16 kernel body; see kswv_neon_u8_impl. */
+	template<bool HasFreed>
+	int kswv_neon_16_impl(int16_t seq1SoA[],
+                          int16_t seq2SoA[],
+                          int16_t nrow,
+                          int16_t ncol,
+                          SeqPair *p,
+                          kswr_t* aln,
+                          int po_ind,
+                          uint16_t tid,
+                          int32_t numPairs,
+                          int phase);
 
 #elif ((!__AVX512BW__) & (__AVX2__))
 	/* AVX2 (256-bit, 32-lane u8) batched mate-rescue SW kernel.
