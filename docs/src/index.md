@@ -12,11 +12,13 @@ support for things you used to need a wrapper script for.
   bwa-mem2 — but consolidated mapping speedups, a memory-bounded index
   builder, batched header ingestion, and a tuned allocator add up to
   measurable wall-clock wins on real workloads.
-- **Methylation in one binary.** A `--meth` flag turns bwa-mem3 into a
-  drop-in replacement for the entire `bwameth.py` pipeline. No Python, no
-  inline conversion script, no separate post-processing step. One
-  `bwa-mem3 index --meth ref.fa`, one `bwa-mem3 mem --meth ref.fa
-  R1.fq R2.fq`, done — header collapsed, tags emitted, chimeras flagged.
+- **Methylation in one binary.** A `--meth` flag adds native bisulfite/EM-seq
+  alignment: bwameth-compatible read *placement* by default
+  (`--meth-scoring collapsed`), or variant-aware scoring on request
+  (`--meth-scoring genomic`). No Python, no inline conversion script, no separate
+  post-processing step. One `bwa-mem3 index --meth ref.fa`, one
+  `bwa-mem3 mem --meth ref.fa R1.fq R2.fq`, done — headers consolidated and
+  Bismark tags emitted.
 - **Stage the index once, align many.** A `bwa-mem3 shm` subcommand
   pins the FM-index in shared memory so back-to-back runs on the same host
   skip the 28 GB read every time.

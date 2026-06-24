@@ -123,6 +123,10 @@ an additional column. Useful when the comment carries barcodes or UMIs.
 Emits the reference FASTA header line for each alignment position as an `XR`
 SAM tag.
 
+Under `--meth`, `XR:Z` instead carries the Bismark read-conversion direction
+(`CT`/`GA`) and this reference-annotation use of `XR` is suppressed — see
+[Methylation Reference → Flags](../methylation/flags.md).
+
 #### `-Y` — soft-clip supplementary alignments
 
 Uses soft clipping instead of hard clipping for supplementary alignments.
@@ -159,9 +163,11 @@ individual flags are unaffected.
 
 > **Note — --meth overrides scoring defaults**
 >
-> When `--meth` is active, bwa-mem3 applies bwameth.py-compatible defaults:
-> `-B 2 -L 10 -U 100 -T 40 -CM`. Any of these can still be overridden by
-> passing the flag explicitly after `--meth`.
+> When `--meth` is active, bwa-mem3 applies `-L 10 -U 100 -T 40 -M -C` plus a
+> mode-dependent mismatch penalty: `-B 2` for `--meth-scoring collapsed` (default,
+> bwameth-compatible) and `-B 4` for `--meth-scoring genomic`. This mirrors
+> bwameth's `bwa mem -T 40 -B 2 -L 10 -CM` (with `-U 100` for paired-end). Any of
+> these can still be overridden by passing the flag explicitly after `--meth`.
 
 ### Paired-end
 
@@ -248,15 +254,25 @@ the alignment score and mapping quality for each secondary hit.
 
 #### `--meth` — enable bisulfite alignment mode
 
-Activates inline C→T (R1) and G→A (R2) read conversion, bwameth-compatible
-scoring defaults, inline BAM post-processing, and forces `--bam` output.
-The reference must have been indexed with `bwa-mem3 index --meth`.
+Activates bisulfite alignment: each read is projected (R1 `C→T`, R2 `G→A`) to find
+seeds in the converted `.meth` seed index, then extended and scored against the
+**original** 4-letter reference, with inline BAM post-processing and forced
+`--bam` output. The reference must have been indexed with `bwa-mem3 index --meth`.
 
-Pass the original FASTA prefix as `<idxbase>` — the `.bwameth.c2t` suffix is
-appended automatically. If `<idxbase>` already ends in `.bwameth.c2t`
-(interop with an external c2t converter), the auto-append is skipped.
+Pass the original FASTA prefix as `<idxbase>` (e.g. `ref.fa`); the `ref.fa.meth.*`
+seed index alongside it is found automatically. A legacy bwameth `.bwameth.c2t`
+index is not used directly — rebuild with `index --meth` (see
+[Migrating from bwameth.py c2t](../methylation/external-c2t.md)).
 
 See [Methylation Reference](../methylation/overview.md) for the full treatment.
+
+#### `--meth-scoring {collapsed|genomic}` — bisulfite scoring model
+
+Selects how the 4-letter matrix treats converted bases. `collapsed` (default)
+frees C↔T and G↔A both ways (bwameth-compatible placement, sets `-B 2`); `genomic`
+frees only the conversion direction, keeping real variants as mismatches
+(variant-aware, truthful `NM`/`MD`, keeps `-B 4`). Only meaningful with `--meth`.
+See [Flags → --meth-scoring](../methylation/flags.md#--meth-scoring-collapsedgenomic).
 
 #### `--set-as-failed {f|r}` — strand QC-fail flag
 

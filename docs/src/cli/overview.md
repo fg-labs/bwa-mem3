@@ -22,8 +22,8 @@ Each subcommand page follows the same layout:
 ## Subcommands
 
 **[index](index-cmd.md)** builds the FM-index from a reference FASTA.
-Pass `--meth` to produce a bwameth-style doubled c2t reference for
-methylation alignment.
+Pass `--meth` to build a dual index (the normal index plus a converted `.meth`
+seed index) for methylation alignment.
 
 **[mem](mem.md)** aligns short reads against an indexed reference, producing
 SAM or BAM output. It is the primary alignment subcommand. The flag surface is

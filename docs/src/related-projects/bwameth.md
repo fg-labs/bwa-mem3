@@ -22,22 +22,30 @@ bundled with the original script.
 
 ## How it relates to bwa-mem3
 
-`bwa-mem3 mem --meth` is a single-binary drop-in replacement for the bwameth.py
-alignment pipeline. It inlines the C-to-T and G-to-A conversion, runs the bwa-mem3
-alignment engine (with all of its correctness fixes and SIMD speedups), rewrites the
-`@SQ` headers to collapse the per-strand contig pairs back to canonical chromosome names,
-emits Bismark-compatible `XR:Z` / `XG:Z` / `XM:Z` auxiliary tags, and writes a
-`@PG ID:bwa-mem3-meth` header. The bwameth.py-style chimera QC heuristic is
-available via `--chimera-qc` (off by default — Bismark behavior).
-The [Methylation Reference](../methylation/overview.md) section documents the full
-implementation in detail, including the Bismark `XR:Z` / `XG:Z` / `XM:Z` tags and
-the `--set-as-failed` / `--chimera-qc` flags.
+`bwa-mem3 mem --meth` is a single-binary alignment pipeline that, in its default
+`collapsed` mode, reproduces bwameth.py's read *placement* (it is a placement
+drop-in, not a byte-for-byte clone). The key difference is *where it scores*:
+where bwameth.py converts both reads and reference to 3-letter space and aligns
+there, bwa-mem3 uses the 3-letter projection only to **find seeds**, then extends
+and scores against the **original 4-letter reference**. That enables a second,
+opt-in mode — `--meth-scoring genomic` — which keeps real C/T and G/A variants as
+mismatches (truthful `NM`/`MD`), something a collapsed-space aligner cannot do.
 
-> **Tip — Interop with the bwameth.py c2t step**
+It rewrites the `@SQ` headers to consolidate the per-strand contig pairs back to
+canonical chromosome names, emits Bismark-compatible `XR:Z` / `XG:Z` / `XM:Z`
+auxiliary tags, and writes a `@PG ID:bwa-mem3-meth` header. The bwameth.py-style
+chimera QC heuristic is available via `--chimera-qc` (off by default — Bismark
+behavior). The [Methylation Reference](../methylation/overview.md) documents the
+full implementation, including the two
+[`--meth-scoring` modes](../methylation/overview.md#two-scoring-modes---meth-scoring),
+the Bismark tags, and the `--set-as-failed` / `--chimera-qc` flags.
+
+> **Note — external c2t interop was removed**
 >
-> If your pipeline already performs its own C-to-T conversion before alignment, see
-> [Interop with external bwameth.py c2t](../methylation/external-c2t.md) for how to pass
-> pre-converted reads to `bwa-mem3 mem --meth` without double-conversion.
+> Because scoring runs on the original bases, `bwa-mem3 mem --meth` can no longer
+> consume pre-converted reads or a `.bwameth.c2t` reference. Pass raw FASTQ and the
+> original `ref.fa` prefix; see
+> [Migrating from bwameth.py c2t](../methylation/external-c2t.md).
 
 ## Links
 
@@ -51,4 +59,4 @@ the `--set-as-failed` / `--chimera-qc` flags.
 [Methylation Reference: Overview](../methylation/overview.md) ·
 [Quick start: methylation alignment](../getting-started/quick-meth.md) ·
 [Best Practices — Methylation defaults](../best-practices/methylation.md) ·
-[Interop with external bwameth.py c2t](../methylation/external-c2t.md)
+[Migrating from bwameth.py c2t](../methylation/external-c2t.md)

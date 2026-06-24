@@ -1,94 +1,58 @@
-# Interop with External bwameth.py c2t
+# Migrating from external bwameth.py c2t
 
-Some workflows use bwameth.py's `c2t` subcommand to convert reads before
-passing them to an aligner. `bwa-mem3 --meth` supports this pattern by
-detecting whether the caller has already provided a pre-converted FASTQ and
-whether the reference path already points to the doubled-reference FASTA.
+Earlier (D1) `bwa-mem3 --meth` releases mirrored bwameth.py: they aligned
+pre-converted reads against a single `ref.fa.bwameth.c2t` doubled reference, so a
+bwameth-style external c2t workflow could be wired up directly. **The current
+(D3) design does not support that pattern**, because it seeds in 3-letter space
+but scores against the *original* 4-letter reference. This page explains what
+changed and how to migrate.
 
-## Auto-detect logic for the reference path
-
-When `--meth` is active, `bwa-mem3 mem` ordinarily appends `.bwameth.c2t` to
-the reference path so the user can pass the original FASTA prefix:
-
-```sh
-bwa-mem3 mem --meth -t 16 ref.fa R1.fq.gz R2.fq.gz
-# internally uses ref.fa.bwameth.c2t as the reference
-```
-
-If the reference path already ends with `.bwameth.c2t`, the auto-append is
-skipped:
-
-```sh
-bwa-mem3 mem --meth -t 16 ref.fa.bwameth.c2t R1.fq.gz R2.fq.gz
-# no suffix appended; ref.fa.bwameth.c2t is used as-is
-```
-
-This detection is a simple suffix check on the path string. It allows callers
-that manage the doubled-reference path explicitly to pass it without triggering
-double-append.
-
-## Using bwameth.py c2t as the read preprocessor
-
-If your pipeline already runs `bwameth.py c2t` to convert reads (for example,
-because it needs to reuse converted reads across multiple aligners), you can
-pipe the output directly to `bwa-mem3 mem --meth`:
-
-```sh
-bwameth.py c2t R1.fq.gz R2.fq.gz \
-  | bwa-mem3 mem --meth -p -t 16 ref.fa.bwameth.c2t /dev/stdin \
-  | samtools sort -o out.bam
-```
-
-Key points for this pattern:
-
-- Pass the `.bwameth.c2t` reference path explicitly so the auto-append is
-  suppressed.
-- Use `-p` to tell `bwa-mem3 mem` that the input contains interleaved
-  paired-end reads (bwameth.py c2t emits interleaved output to stdout).
-- Use `/dev/stdin` as the reads argument to read from the pipe.
-- The `bwa-mem3 --meth` inline c2t conversion is **not** applied when the
-  reads arrive pre-converted. `XR:Z` (read conversion) and `XG:Z` (genome
-  strand) are still emitted on every record; `XM:Z` (per-base methylation
-  call string) is emitted on every mapped record. `XR:Z` is derived from
-  the inline carrier the c2t step normally writes — when reads are
-  pre-converted, the carrier is absent unless the external preprocessor
-  emits it as a FASTQ comment (see warning below).
-
-> **Warning — `XR:Z:` requires the inline carrier**
+> **Important — external c2t interop is no longer supported**
 >
-> `XR:Z:` records the read's bisulfite-conversion direction (`CT` for top-
-> strand, `GA` for bottom-strand R2). bwa-mem3's inline c2t step records
-> that direction into the FASTQ comment as `YS:Z:<seq>\tYC:Z:<dir>`, which
-> the BAM emitter then reads to set `XR:Z:` (the `YS`/`YC` carrier itself
-> is dropped from BAM output). When reads are pre-converted externally and
-> piped in, the inline c2t step in `src/fastmap.cpp` is bypassed. If your
-> external preprocessor does not emit a compatible `YC:Z:` comment field,
-> `XR:Z:` will be absent from the output BAM. `XG:Z:` and `XM:Z:` are
-> unaffected — they're derived from the reference contig direction and
-> CIGAR walk, not from the carrier.
+> `bwa-mem3 mem --meth` no longer aligns against a `.bwameth.c2t` reference, and
+> it cannot consume pre-converted reads. It must do the C→T / G→A projection
+> itself (for seeding) so it can keep the original bases for scoring against the
+> original reference. Pass **raw FASTQ** and the **original** `ref.fa` prefix.
 
-## Header rewriting and BAM post-processing with external c2t
+## What changed
 
-Whether reads are converted inline or externally, all BAM post-processing steps
-apply identically when `--meth` is active:
+| | D1 (old) | D3 (current) |
+|---|----------|--------------|
+| Reference used for alignment | `ref.fa.bwameth.c2t` (converted, doubled) | `ref.fa` original 4-letter index + `ref.fa.meth.*` seed index |
+| Reads | pre-converted, or inline-converted | raw FASTQ; projected internally for seeding only |
+| External `bwameth.py c2t` reads piped in | supported | **not supported** |
+| Passing a `.bwameth.c2t` reference path | used as-is | **errors**: "found a legacy '.bwameth.c2t' index … Re-run: bwa-mem3 index --meth" |
 
-- `@SQ` header consolidation (f/r contigs → one entry per chromosome).
-- Bismark `XR:Z` / `XG:Z` / `XM:Z` auxiliary tag emission.
-- Chimera QC heuristic (only when `--chimera-qc` is set; off by default).
-- Pair-level QC-fail propagation.
-- `@PG ID:bwa-mem3-meth` insertion.
+Because scoring now runs on the original bases, feeding pre-converted reads would
+make the converted bases *look* like the truth and corrupt scoring, `NM`/`MD`,
+and the `XM` methylation string. That is why the external-c2t path was removed
+rather than adapted.
 
-The post-processing pipeline depends only on the reference contig names (to
-determine `XG:Z`) and the alignment flags — not on whether reads were
-converted inline or externally.
+## How to migrate
 
-## Summary of path variants
+1. **Rebuild the index.** A legacy `ref.fa.bwameth.c2t` index is not usable.
+   Build the dual index from the original FASTA:
 
-| Reference arg | Read source | Auto-append? | Inline c2t? | `XR/XG/XM` emitted? |
-|---------------|-------------|-------------|------------|---------------------|
-| `ref.fa` | Raw FASTQ | Yes (→ `ref.fa.bwameth.c2t`) | Yes | All three |
-| `ref.fa.bwameth.c2t` | Raw FASTQ | No | Yes | All three |
-| `ref.fa.bwameth.c2t` | Pre-converted (pipe) | No | No | `XG`/`XM` always; `XR` only if external preprocessor emits the `YC:Z` carrier |
+   ```sh
+   bwa-mem3 index --meth ref.fa     # writes ref.fa.* and ref.fa.meth.*
+   ```
+
+2. **Pass raw FASTQ and the original prefix.** Drop any `bwameth.py c2t`
+   preprocessing step and the `-p /dev/stdin` plumbing:
+
+   ```sh
+   bwa-mem3 mem --meth -t 16 ref.fa R1.fq.gz R2.fq.gz \
+     | samtools sort -o out.bam
+   ```
+
+   bwa-mem3 finds `ref.fa.meth.*` automatically and does the seed-time projection
+   internally. (You can pass the `ref.fa.meth` seed-index path directly if you
+   prefer, but the original-reference handles must sit alongside it.)
+
+If you specifically need bwameth.py's collapsed-space alignment or its own c2t
+tooling, continue to use bwameth.py itself — see
+[bwameth.py drop-in mapping](bwameth-mapping.md) for how `--meth-scoring collapsed`
+reproduces its placement instead.
 
 ---
 

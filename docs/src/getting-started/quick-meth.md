@@ -4,79 +4,89 @@ bwa-mem3 supports bisulfite-converted (WGBS/RRBS/EM-seq) read alignment through 
 flag on both `index` and `mem`. No Python interpreter, no piped preprocessor, and no separate
 postprocessing step are required.
 
-> **Note — Drop-in replacement for bwameth.py**
+> **Note — bwameth-compatible by default, variant-aware on request**
 >
-> bwa-mem3 with `--meth` is a single-binary drop-in replacement for the `bwameth.py` pipeline.
-> The output BAM is byte-compatible for the standard tags used by methylation callers (Bismark,
-> MethylDackel, PileOMeth, etc.).
+> By default (`--meth-scoring collapsed`) bwa-mem3 reproduces bwameth.py's read **placement** and
+> emits the standard Bismark tags methylation callers expect (MethylDackel, Bismark, PileOMeth,
+> etc.). It is a placement drop-in — not a byte-for-byte reproduction of bwameth. Add
+> `--meth-scoring genomic` to opt into variant-aware scoring (truthful `NM`/`MD`; one BAM for both
+> methylation and variant calling).
 
 ## Index the reference for methylation
 
-Build the c2t doubled reference once:
+Build the methylation index once:
 
 ```bash
 bwa-mem3 index --meth ref.fa
 ```
 
-This writes two additional files next to the standard index:
+This builds the normal 4-letter index at the bare prefix **plus** a converted seed index:
 
-| File | Description |
-|------|-------------|
-| `ref.fa.bwameth.c2t` | C→T converted reference (forward strand) with G→A reverse complement interleaved |
-| `ref.fa.bwameth.c2t.*` | FM-index files for the c2t reference |
+| File(s) | Description |
+|---------|-------------|
+| `ref.fa.0123`, `ref.fa.amb`, `ref.fa.ann`, `ref.fa.bwt.2bit.64`, `ref.fa.pac` | Normal index over the original reference (used for scoring/extension). |
+| `ref.fa.meth.fa` | Per-strand C→T / G→A converted FASTA (`f`/`r` doubled contigs). |
+| `ref.fa.meth.*` | FM-index over the converted FASTA (used only for **seeding**). |
 
-The c2t index is separate from the standard index produced by `bwa-mem3 index ref.fa`. You need
-both if you intend to run standard and methylation alignments against the same reference.
+Both indexes live next to `ref.fa`; `bwa-mem3 index ref.fa` (no `--meth`) builds only the first set.
 
 ## Align bisulfite-converted reads
 
 ```bash
+# Default: collapsed (bwameth-compatible placement)
 bwa-mem3 mem --meth -t 16 ref.fa R1.fq.gz R2.fq.gz \
   | samtools sort -o out.bam
 samtools index out.bam
+
+# Opt into variant-aware scoring
+bwa-mem3 mem --meth --meth-scoring genomic -t 16 ref.fa R1.fq.gz R2.fq.gz \
+  | samtools sort -o out.bam
+
+# Single-end (RRBS etc.): pass one FASTQ. The C→T (R1) projection is used for all reads.
+bwa-mem3 mem --meth -t 16 ref.fa R1.fq.gz \
+  | samtools sort -o out.bam
 ```
 
-Pass the original (unconverted) reference path, not the `.bwameth.c2t` file. bwa-mem3
-auto-appends `.bwameth.c2t` to the reference path when `--meth` is active.
+Pass the original (unconverted) reference path. bwa-mem3 finds the `ref.fa.meth.*` seed index
+automatically when `--meth` is active. The paired-end-only flags (`-U 100`, `-p`) do not apply
+to single-end input.
 
 ## What `--meth` does
 
-`--meth` activates a pipeline of in-process transformations that would otherwise require
-external tools:
+`--meth` activates a pipeline of in-process steps that would otherwise require external tools:
 
-1. **Inline c2t read conversion.** R1 reads have every `C` converted to `T` before alignment;
-   R2 reads have every `G` converted to `A`. The original unconverted sequence is restored
-   into the BAM `SEQ` field on emit. The conversion direction is reported per record in the
-   Bismark `XR:Z` tag (value `CT` for R1/SE, `GA` for R2).
+1. **Seed in 3-letter space, score in 4-letter space.** Each read is projected (R1 `C→T`, R2 `G→A`)
+   to find seeds in the `ref.fa.meth.*` index, then extended and **scored against the original
+   4-letter reference** with a per-strand asymmetric matrix. The original bases are restored into
+   the BAM `SEQ` field on emit, and the conversion direction is reported per record in the Bismark
+   `XR:Z` tag (`CT` for R1/SE, `GA` for R2).
 
-2. **bwameth.py-equivalent scoring defaults.** `--meth` sets `-B 2 -L 10 -U 100 -T 40 -CM`
-   automatically. These match the defaults used by bwameth.py and are optimized for
-   bisulfite-converted reads where C→T mismatches carry no penalty. Any of these values can be
-   overridden on the command line.
+2. **Scoring defaults.** `--meth` sets `-L 10 -U 100 -T 40 -M -C` in both modes, plus the
+   mode-dependent mismatch penalty: `-B 2` for `collapsed`, `-B 4` for `genomic`. These mirror
+   bwameth's `bwa mem -T 40 -B 2 -L 10 -CM` (with `-U 100` for paired-end). Any value can be
+   overridden on the command line after `--meth`.
 
-3. **Inline BAM post-processing.** After alignment, bwa-mem3 rewrites the SAM stream in-process:
-   - `@SQ` headers with `f`/`r` prefixes (e.g. `fchr1`, `rchr1`) are collapsed back to one
-     entry per real chromosome (`chr1`). Read-level `RNAME` fields are rewritten to match.
-   - Each mapped record gains Bismark `XG:Z` (genome strand: `CT` for top-strand
-     alignment, `GA` for bottom-strand) and `XM:Z` (per-base methylation call string).
-   - Chimera QC: reads whose longest `M`/`=`/`X` run is less than 44% of the read length are
-     flagged `0x200` (QC-fail), have flag `0x2` (proper pair) cleared, and have MAPQ capped at 1.
-   - Pair-level QC-fail propagation: if one mate is QC-failed, the other mate is also flagged.
+3. **Inline BAM post-processing.** After alignment, bwa-mem3 rewrites the stream in-process:
+   - `@SQ` headers with `f`/`r` prefixes (e.g. `fchr1`, `rchr1`) are consolidated back to one entry
+     per real chromosome (`chr1`); record `RNAME`/`RNEXT` fields are rewritten to match.
+   - Each mapped record gains Bismark `XG:Z` (genome strand) and `XM:Z` (per-base methylation call
+     string).
+   - Optional chimera QC (`--chimera-qc`, **off by default** to match Bismark): reads whose longest
+     `M`/`=`/`X` run is under 44% of the read are flagged `0x200`, have `0x2` cleared, and MAPQ
+     capped at 1. QC-fail flags then propagate across the read group.
    - A `@PG ID:bwa-mem3-meth` program record is appended to the header.
 
-4. **Uncompressed BAM output.** The post-processed stream is written as uncompressed BAM
-   (`wb0`) rather than SAM text. This eliminates text serialization overhead and allows
-   downstream `samtools sort` to read BAM natively. The stream is still fully readable by any
-   htslib-based tool.
+4. **Uncompressed BAM output.** The stream is written as uncompressed BAM (`wb0`) rather than SAM
+   text, so downstream `samtools sort` reads it natively. It is still readable by any htslib tool.
 
-For full details on each tag, the optional chimera QC heuristic, and the
-`--set-as-failed` / `--chimera-qc` flags, see the
-[Methylation Reference](../methylation/overview.md).
+For the scoring modes, each tag, the optional chimera QC heuristic, and the `--set-as-failed` /
+`--chimera-qc` flags, see the [Methylation Reference](../methylation/overview.md).
 
 ---
 
 **See also:**
 [Methylation Reference — Overview](../methylation/overview.md) ·
+[Methylation Reference — Flags](../methylation/flags.md) ·
 [Methylation Reference — SAM tags](../methylation/tags.md) ·
 [Best Practices — Methylation defaults](../best-practices/methylation.md) ·
 [CLI Reference — mem](../cli/mem.md)

@@ -59,9 +59,9 @@ staging succeeded before launching alignment jobs.
 
 ### `--meth` — stage a methylation index
 
-Auto-appends `.bwameth.c2t` to `<idxbase>` before staging, mirroring the
-behavior of `bwa-mem3 index --meth` and `bwa-mem3 mem --meth`. Pass the
-same plain `<idxbase>` to all three commands; the c2t suffix is handled
+Stages the `.meth` seed index (`<idxbase>.meth.*`) into shared memory, mirroring
+the behavior of `bwa-mem3 index --meth` and `bwa-mem3 mem --meth`. Pass the same
+plain `<idxbase>` to all three commands; the `.meth` suffix is handled
 transparently.
 
 ## Notes / Gotchas

@@ -8,36 +8,40 @@ which now read `bwa-mem3`).
 
 ## `--meth` bisulfite alignment mode (PR #13)
 
-`--meth` turns `bwa-mem3 index` and `bwa-mem3 mem` into a single-binary
-drop-in replacement for the entire
-[bwameth.py](https://github.com/brentp/bwa-meth) pipeline. No Python, no
-separate post-processing step, no bwameth.py dependency.
+`--meth` adds native bisulfite/EM-seq alignment to `bwa-mem3 index` and
+`bwa-mem3 mem` in a single binary — no Python, no separate post-processing step,
+no [bwameth.py](https://github.com/brentp/bwa-meth) dependency. In the default
+`--meth-scoring collapsed` mode it reproduces bwameth.py's read *placement* (a
+placement drop-in, not a byte-for-byte clone); `--meth-scoring genomic` opts into
+variant-aware scoring bwameth cannot produce.
 
 ```bash
 bwa-mem3 index --meth ref.fa          # once per reference
 bwa-mem3 mem --meth ref.fa R1.fq R2.fq | samtools sort -o out.bam
 ```
 
-`index --meth` writes `<ref>.bwameth.c2t` — a doubled reference with
-`f`/`r`-prefixed contigs and C→T / G→A projection, byte-identical to the
-index that `bwameth.py index-mem2` produces.
+`index --meth` builds a dual index: the normal index over the original reference
+plus a converted **seed** index `<ref>.meth.*` (over `<ref>.meth.fa`, a doubled
+reference with `f`-prefixed C→T and `r`-prefixed G→A contigs). Reads seed in that
+3-letter space but are scored against the original 4-letter reference, so the
+index layout is **not** the same as bwameth.py's single `.bwameth.c2t` reference.
 
-`mem --meth` performs inline C→T conversion of R1 and G→A conversion of R2
-before seeding (stashing the pre-conversion bases on an internal
-`YS:Z` / `YC:Z` carrier in `bseq1_t.comment`; both are suppressed at
-BAM emit), consolidates the `f`/`r` contig pairs back to one `@SQ`
-per real chromosome, emits Bismark-compatible `XR:Z` (read conversion
-direction), `XG:Z` (genome strand), and `XM:Z` (per-base methylation
-call string) auxiliary tags on every record, optionally applies a
-chimera QC heuristic (longest M/=/X run < 44% of read length → set
-`0x200`, clear proper-pair `0x2`, cap MAPQ at 1) when `--chimera-qc`
-is passed, copies the internal pre-conversion sequence back into the
-BAM SEQ field for CpG-calling tools, and writes a `@PG
-ID:bwa-mem3-meth` entry.
+`mem --meth` projects each read (R1 C→T, R2 G→A) to find seeds in the `.meth`
+index, preserving the original bases on the first-class `bseq1_t.meth_orig_seq`
+field (a `YS:Z`/`YC:Z` comment carrier is a fallback only; neither reaches the
+BAM). It then extends and **scores against the original 4-letter reference** with
+a per-strand asymmetric matrix, consolidates the `f`/`r` contig pairs back to one
+`@SQ` per real chromosome, emits Bismark-compatible `XR:Z` (read conversion
+direction), `XG:Z` (genome strand), and `XM:Z` (per-base methylation call string)
+auxiliary tags, restores the original bases into the BAM SEQ field for CpG-calling
+tools, optionally applies a chimera QC heuristic (longest M/=/X run < 44% of read
+length → set `0x200`, clear proper-pair `0x2`, cap MAPQ at 1) when `--chimera-qc`
+is passed (off by default), and writes a `@PG ID:bwa-mem3-meth` entry.
 
-On the bwameth.py example fixture (92,684 reads), end-to-end output is
-byte-identical on chrom, pos, CIGAR, and SEQ vs the bwameth.py oracle. Stacks
-on PR #12 (`--bam`). See the
+In the default `collapsed` mode this reproduces bwameth.py's read *placement*
+(chrom, pos) for the standard case, while scoring against the original reference
+rather than in collapsed space — so it is not byte-for-byte identical to bwameth
+output. Stacks on PR #12 (`--bam`). See the
 [Methylation Reference](../methylation/overview.md) for full details.
 
 ## Vendored mimalloc allocator (PR #19)
@@ -106,18 +110,18 @@ processes on the same host share the same in-memory copy. Closes
 
 ## `bwa-mem3 shm --meth` (PR #67)
 
-`bwa-mem3 mem --meth <prefix>` auto-appends `.bwameth.c2t` to locate the
-methylation index built by `bwa-mem3 index --meth <prefix>`. Before PR #67,
-staging a methylation index in shared memory required passing the full
-`.bwameth.c2t`-suffixed path to `shm` while continuing to pass the plain
-prefix to `mem`. The mismatch was easy to forget, and the failure mode — a
-run that silently attached the wrong segment — was difficult to diagnose.
+`bwa-mem3 mem --meth <prefix>` locates the `.meth` seed index built by
+`bwa-mem3 index --meth <prefix>` automatically. Before PR #67, staging a
+methylation index in shared memory required passing the full suffixed seed-index
+path to `shm` while continuing to pass the plain prefix to `mem`. The mismatch was
+easy to forget, and the failure mode — a run that silently attached the wrong
+segment — was difficult to diagnose.
 
 PR #67 adds `--meth` support to `bwa-mem3 shm` so the same plain-prefix
 convention works end-to-end:
 
 ```bash
-bwa-mem3 shm --meth ref.fa       # stages ref.fa.bwameth.c2t
+bwa-mem3 shm --meth ref.fa       # stages ref.fa.meth.*
 bwa-mem3 mem --meth ref.fa ...   # attaches automatically
 bwa-mem3 shm -d --meth ref.fa   # detaches
 ```
