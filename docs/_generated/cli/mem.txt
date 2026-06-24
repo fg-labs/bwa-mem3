@@ -50,6 +50,11 @@ Bisulfite (--meth) options:
                  emission. Implies --bam. Requires the reference to have been built
                  with `bwa-mem3 index --meth` (emits the original index plus a
                  ref.fa.meth.* converted seed index).
+   --meth-scoring collapsed|genomic
+                 bisulfite scoring mode [collapsed]. collapsed: C/T (and G/A)
+                 interchangeable, bwameth-compatible placement (sets -B 2).
+                 genomic: free only the conversion direction, keep variants as
+                 mismatches (variant-aware, truthful NM/MD; -B 4).
    --set-as-failed f|r
                  flag alignments to the matching strand ('f' or 'r') as QC-fail (0x200)
    --chimera-qc
