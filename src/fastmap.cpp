@@ -1454,28 +1454,32 @@ int main_mem(int argc, char *argv[])
         }
     } else update_a(opt, &opt0);
 
-    /* Meth-mode default tuning. bwameth runs (collapsed) bwa with
-     * -B 2 -L 10 -T 40 -CM. The soft-clip / output-threshold / -M / -C defaults
-     * are shared by both --meth-scoring modes (sensible for BS reads either way),
-     * but the mismatch penalty and pen_unpaired follow the scoring mode:
-     *   COLLAPSED (bwameth drop-in): -B 2 (bwameth's lenient mismatch) and leave
-     *     pen_unpaired at the bwa default (bwameth does not set -U).
-     *   GENOMIC (variant-aware): keep bwa's -B 4 — the full-hg38 variant A/B with
-     *     the asymmetric matrix showed b=4 places better and is better MAPQ-
-     *     calibrated than b=2 (placement 92.6 vs 92.5, discordant MAPQ 1.8 vs
-     *     2.1) — plus the tuned pen_unpaired 100.
-     * -A/-B always override and reach the matrices (mem_opt_fill_meth_mat below). */
+    /* Meth-mode default tuning. bwameth.py runs bwa as
+     * `bwa mem -T 40 -B 2 -L 10 -CM`, adding `-U 100 -p` for paired-end. We adopt
+     * the soft-clip (-L 10), unpaired (-U 100), output-threshold (-T 40), -M and
+     * -C defaults for BOTH --meth-scoring modes; the ONLY mode-dependent knob is
+     * the mismatch penalty (the leniency gate):
+     *   COLLAPSED (bwameth drop-in): -B 2 — bwameth's lenient mismatch. Combined
+     *     with the two-cell matrix (C/T and G/A free both ways) this reproduces
+     *     bwameth's collapsed-space placement.
+     *   GENOMIC (variant-aware): keep bwa's default -B 4 — the full-hg38 variant
+     *     A/B with the asymmetric matrix showed b=4 places better and is better
+     *     MAPQ-calibrated than b=2 (placement 92.6 vs 92.5, discordant MAPQ
+     *     1.8 vs 2.1).
+     * pen_unpaired is only consulted for paired-end rescue, so setting it
+     * unconditionally is a no-op for single-end. -A/-B always override and reach
+     * the matrices (mem_opt_fill_meth_mat below). */
     if (opt->meth_mode) {
         if (!opt0.pen_clip5)    opt->pen_clip5   = 10;
         if (!opt0.pen_clip3)    opt->pen_clip3   = 10;
+        if (!opt0.pen_unpaired) opt->pen_unpaired = 100;  /* bwameth -U 100 (paired) */
         if (!opt0.T)            opt->T           = 40;
         opt->flag |= MEM_F_NO_MULTI;   /* -M */
         aux.copy_comment = 1;          /* -C, needed for YS:Z/YC:Z passthrough */
         if (opt->meth_scoring == MEM_METH_SCORING_COLLAPSED) {
-            if (!opt0.b) opt->b = 2;   /* match bwameth's lenient mismatch */
-        } else {                       /* GENOMIC */
-            if (!opt0.pen_unpaired) opt->pen_unpaired = 100;
+            if (!opt0.b) opt->b = 2;   /* bwameth's lenient mismatch */
         }
+        /* GENOMIC keeps bwa's default b=4 (variant-aware). */
     }
 
     /* Matrix for SWA */
