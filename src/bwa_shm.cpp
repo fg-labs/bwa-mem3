@@ -315,27 +315,15 @@ int bwa_shm_compute(const char *prefix, bwa_shm_layout_t *layout, bool bns_only)
         return -1;
     }
 
-    /* 3. Stat <prefix>.0123 for its size. Skipped for a bns_only (D3 --meth
-     * seed) segment: the seed `.0123` is not staged and need not exist. */
-    if (bns_only) {
-        layout->ref_string_len = 0;
-    } else {
-        char zer_path[PATH_MAX];
-        path_concat2(zer_path, prefix, ".0123");
-        struct stat zst;
-        if (stat(zer_path, &zst) != 0) {
-            fprintf(stderr, "[E::%s] stat(%s) failed: %s\n",
-                    __func__, zer_path, strerror(errno));
-            bwa_shm_layout_free(layout);
-            return -1;
-        }
-        if (zst.st_size <= 0) {
-            fprintf(stderr, "[E::%s] %s is empty\n", __func__, zer_path);
-            bwa_shm_layout_free(layout);
-            return -1;
-        }
-        layout->ref_string_len = (int64_t)zst.st_size;
-    }
+    /* 3. REF_STRING (.0123) is NEVER staged. `mem` pac-fetches the original
+     * reference from `.pac` on demand (bns_get_seq_v2), so the unpacked `.0123`
+     * is never read from shm — for meth OR plain. Zero-length REF_STRING section
+     * for every index → −6.4 GB per staged segment on hg38, and the `.0123` need
+     * not exist on disk (commit "stop building .0123"). This is DECOUPLED from
+     * `bns_only`: that flag still gates PAC below — the seed --meth segment drops
+     * PAC too, but plain/original segments KEEP PAC (pac-fetch reads it). The
+     * `.0123` is not stat'd, so staging works on an index that doesn't have it. */
+    layout->ref_string_len = 0;
 
     /* 4. BNS_NAMES section size: walk anns[]. */
     int64_t bns_names_bytes = 0;
