@@ -10,18 +10,33 @@ built once and reused indefinitely.
 bwa-mem3 index ref.fa
 ```
 
-The command writes five files alongside the input FASTA:
+The command writes four files alongside the input FASTA:
 
 | File | Contents |
 |------|----------|
 | `ref.fa.bwt.2bit.64` | Burrows-Wheeler Transform, 2-bit packed, 64-bit offsets |
-| `ref.fa.0123` | Forward sequence, 2-bit packed |
 | `ref.fa.amb` | Coordinates and counts of ambiguous (N) bases |
 | `ref.fa.ann` | Sequence names and lengths |
-| `ref.fa.pac` | Forward sequence, 4-bit packed |
+| `ref.fa.pac` | Forward sequence, 2-bit packed (one base per 2 bits) |
 
 The `.bwt.2bit.64` file dominates disk usage. For the human reference (hg38),
-expect roughly 28 GB total across all five files.
+expect roughly 11 GB total across all four files.
+
+> **Note — no `.0123` by default**
+>
+> Earlier releases (and bwa-mem2) also wrote `ref.fa.0123`, an *unpacked*
+> forward+reverse reference (~8× the `.pac`; ~6.4 GB on hg38). bwa-mem3 no longer
+> builds it: `mem` reconstructs the bases it needs directly from the packed
+> `.pac` on demand (*pac-fetch*), so `.0123` is never read. Output is byte-for-byte
+> identical. Pass `--emit-unpacked-ref` to `index` if you need the file for an
+> external tool that still requires it (e.g. bwa-mem2):
+>
+> ```sh
+> bwa-mem3 index --emit-unpacked-ref ref.fa   # also writes ref.fa.0123
+> ```
+>
+> At run time, `BWAMEM3_REF_PAC_FETCH=0` reloads `.0123` instead of pac-fetching
+> (only on an index that still has the file); it exists for A/B verification.
 
 ## Methylation index (`--meth`)
 
@@ -36,7 +51,6 @@ prefix. The seed index is built over a per-strand-converted FASTA
 
 ```text
 # normal index over the original reference (used for scoring/extension)
-ref.fa.0123
 ref.fa.amb
 ref.fa.ann
 ref.fa.bwt.2bit.64
@@ -49,17 +63,23 @@ ref.fa.meth.bwt.2bit.64
 ref.fa.meth.pac
 ```
 
-> **Note — the seed index has no `.0123`**
+> **Note — neither index ships a `.0123`**
 >
-> The seed index deliberately omits the unpacked `.meth.0123` reference. `mem
-> --meth` seeds against the seed FM-index but scores/extends against the
-> **original** reference, so it never reads the seed's unpacked bases. Skipping
-> it saves ~13 GB of disk — and ~13 GB of resident memory at run time — on hg38.
+> By default, neither the original index nor the `.meth` seed index writes an
+> unpacked `.0123`. `mem --meth` seeds against the seed FM-index but scores/extends
+> against the **original** reference, whose bases it pac-fetches from
+> `ref.fa.pac` — so the original `.0123` (~6.4 GB) is unnecessary, and the seed's
+> unpacked bases are never read at all (~13 GB). Skipping both saves ~19 GB of
+> disk on hg38, while the runtime RSS reduction comes from avoiding the original
+> `.0123` load. (`--emit-unpacked-ref`
+> applies to the original index only, for bwa-mem2 compatibility; the seed never
+> needs one.)
 
 The `.meth` seed FM-index is roughly twice the size of the normal FM-index (its
-contigs are doubled), so a `--meth` build is larger than a plain build but less
-than 3× (the seed `.0123` is skipped). For hg38, budget on the order of 50 GB of
-disk for the combined dual index plus the intermediate `ref.fa.meth.fa`.
+contigs are doubled), so a `--meth` build is larger than a plain build but well
+under 3× (by default no `.0123` is written; `--emit-unpacked-ref` adds it for the
+original index only). For hg38, budget on the order of 35 GB
+of disk for the combined dual index plus the intermediate `ref.fa.meth.fa`.
 
 > **Tip — Pass the original FASTA to mem, not the seed index**
 >

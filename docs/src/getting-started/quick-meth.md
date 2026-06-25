@@ -24,7 +24,7 @@ This builds the normal 4-letter index at the bare prefix **plus** a converted se
 
 | File(s) | Description |
 |---------|-------------|
-| `ref.fa.0123`, `ref.fa.amb`, `ref.fa.ann`, `ref.fa.bwt.2bit.64`, `ref.fa.pac` | Normal index over the original reference (used for scoring/extension). |
+| `ref.fa.amb`, `ref.fa.ann`, `ref.fa.bwt.2bit.64`, `ref.fa.pac` | Normal index over the original reference (used for scoring/extension; bases are pac-fetched from `.pac`, so no `.0123` is built). |
 | `ref.fa.meth.fa` | Per-strand C→T / G→A converted FASTA (`f`/`r` doubled contigs). |
 | `ref.fa.meth.*` | FM-index over the converted FASTA (used only for **seeding**). |
 

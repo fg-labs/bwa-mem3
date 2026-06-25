@@ -65,9 +65,12 @@ plain `<idxbase>` to all three commands; the `.meth` suffix is handled
 transparently.
 
 The staged seed segment is **seed-only**: it holds the seed FM-index and contig
-metadata (BNS) but omits the packed reference (PAC) and the unpacked reference
-(`.0123`), because `mem --meth` extends against the original reference and never
-reads the seed's bases. This trims ~14.5 GB from the staged segment on hg38.
+metadata (BNS) but omits the packed reference (PAC), because `mem --meth` extends
+against the original reference and never reads the seed's bases. This trims
+~1.6 GB from the staged segment on hg38. (The unpacked `.0123` reference is never
+staged for **any** index — plain or seed — because `mem` pac-fetches reference
+bases from `.pac` on demand; that saves the seed's ~13 GB and the original's
+~6.4 GB versus staging `.0123`.)
 
 ## Notes / Gotchas
 

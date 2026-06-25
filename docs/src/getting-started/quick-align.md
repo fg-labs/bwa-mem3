@@ -8,19 +8,21 @@ This page walks through the two-command workflow: index the reference once, then
 bwa-mem3 index ref.fa
 ```
 
-This produces five index files alongside `ref.fa`:
+This produces four index files alongside `ref.fa`:
 
 | File | Description |
 |------|-------------|
 | `ref.fa.bwt.2bit.64` | FM-index in 2-bit packed format |
-| `ref.fa.0123` | 2-bit packed reference sequence |
 | `ref.fa.amb` | Ambiguous base positions |
 | `ref.fa.ann` | Sequence name and length annotations |
-| `ref.fa.pac` | Packed 4-bit reference sequence |
+| `ref.fa.pac` | 2-bit packed reference sequence |
+
+(No `ref.fa.0123` is written: `mem` reconstructs reference bases from `.pac` on
+demand. Pass `index --emit-unpacked-ref` if a tool such as bwa-mem2 needs it.)
 
 Indexing hg38 takes roughly 2-3 minutes and requires approximately 60 GB of peak disk space
-during creation (including temporary/intermediate files); the final FM-index stored on disk
-is roughly 28 GB. The index is read once per `mem` invocation; for workloads that align many
+during creation (including temporary/intermediate files); the final index stored on disk
+is roughly 11 GB. The index is read once per `mem` invocation; for workloads that align many
 samples, load it into shared memory first (see [Quick start: shared-memory index](quick-shm.md)).
 
 ## Align paired-end reads

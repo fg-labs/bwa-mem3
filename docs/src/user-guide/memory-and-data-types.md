@@ -15,10 +15,21 @@ Peak resident memory during `bwa-mem3 mem` is the sum of two parts:
 peak RSS  ≈  resident index  +  per-batch working set
 ```
 
-**Resident index.** The FM-index, packed reference, and related structures are
-loaded once and shared across all threads (there is no per-thread copy). For
-hg38 the resident index baseline is roughly **21 GB**. This is fixed for a given
-reference and does not change with `-t` or `-K`.
+**Resident index.** The FM-index, packed reference (`.pac`), and related
+structures are loaded once and shared across all threads (there is no per-thread
+copy). For hg38 the resident index baseline is roughly **15 GB**. This is fixed
+for a given reference and does not change with `-t` or `-K`.
+
+`mem` reconstructs the reference bases it needs for scoring and extension
+directly from the packed `.pac` on demand (*pac-fetch*), so the unpacked
+`.0123` reference (~6.4 GB on hg38) is **neither loaded nor required on disk** —
+the `.pac` already holds the same bases at one-quarter the size. This is the
+default and is byte-for-byte identical to loading `.0123`. The escape hatch
+`BWAMEM3_REF_PAC_FETCH=0` restores the old behavior of loading `.0123` (only on
+an index that still has the file; see [indexing](indexing.md)), and is intended
+only for A/B verification. On hg38 (5M read pairs, `-t 16`) pac-fetch lowered
+peak RSS by **~6.2 GB** for a plain alignment and **~6.3 GB** for `--meth`, at
+neutral-to-slightly-faster wall time.
 
 **Per-batch working set.** On top of the index, each in-flight batch holds the
 reads, their seeds, candidate alignment regions, and the reference windows used
@@ -29,18 +40,20 @@ larger.
 ### Methylation (`--meth`) mode
 
 `--meth` loads a **dual index**: the doubled seed FM-index for seeding plus the
-**original** reference's packed (`.pac`) and unpacked (`.0123`) bases for
-scoring/extension. The seed FM-index is roughly twice the size of a plain
-FM-index (its contigs are doubled), so the resident index for hg38 is on the
-order of **28 GB** (seed FM-index ~21 GB + original `.0123` ~6 GB + original
-`.pac` ~1 GB), versus ~21 GB for a plain alignment.
+**original** reference's packed `.pac` for scoring/extension. The seed FM-index
+is roughly twice the size of a plain FM-index (its contigs are doubled), so the
+resident index for hg38 is on the order of **22 GB** (seed FM-index ~21 GB +
+original `.pac` ~1 GB), versus ~17 GB for a plain alignment.
 
+As with plain alignment, the original reference's bases are pac-fetched from its
+`.pac` — the original unpacked `.0123` (~6.4 GB) is **neither built nor loaded**.
 The seed index's own unpacked `.0123` (~13 GB) and packed `.pac` (~1.6 GB) are
-**neither built nor loaded** — `mem --meth` extends against the original
+likewise **neither built nor loaded** — `mem --meth` extends against the original
 reference, never the seed, so the seed's bases are never read. (Earlier `--meth`
-builds loaded both, costing ~14.5 GB of extra RSS.) Under `bwa-mem3 shm --meth`
-the staged seed segment is likewise seed-only, omitting the seed PAC and
-`.0123`. The per-batch levers below (`-K`, `-t`) apply unchanged.
+builds loaded the original `.0123` plus both seed files, costing ~20 GB of extra
+RSS in total.) Under `bwa-mem3 shm --meth` the staged seed segment is likewise
+seed-only, omitting the seed PAC and `.0123`. The per-batch levers below (`-K`,
+`-t`) apply unchanged.
 
 ## Effective batch size: `-K` and the `-t` multiplier
 
@@ -75,7 +88,7 @@ budget like this:
 per-batch budget  ≈  memory cap  −  resident index  −  headroom
 ```
 
-For hg38 under a 28 GB cap, that is roughly `28 − 21 − a couple GB ≈ a few GB`
+For hg38 under a 22 GB cap, that is roughly `22 − 15 − a couple GB ≈ a few GB`
 for the per-batch working set — not much. The levers, in order of preference:
 
 1. **Lower `-K`.** `-K 1000000` keeps the per-batch working set well under 1 GB
@@ -86,7 +99,7 @@ for the per-batch working set — not much. The levers, in order of preference:
    adjusting `-K` first so you keep your cores busy.
 3. **Use `bwa-mem3 shm`** if you run several samples on one host: the index is
    mapped from a shared segment and its pages are shared across processes, so the
-   ~21 GB index is paid once rather than per process. See
+   ~15 GB index is paid once rather than per process. See
    [Quick start: shared-memory index](../getting-started/quick-shm.md).
 
 > **Tip — a silent OOM looks like a truncated BAM**
