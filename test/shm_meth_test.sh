@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
-# Regression: `bwa-mem3 shm --meth` resolves the c2t-suffixed prefix the
+# Regression: `bwa-mem3 shm --meth` resolves the `.meth` seed-index prefix the
 # same way `bwa-mem3 mem --meth` does, so an end user passes the same plain
-# FASTA path to all three commands (`index --meth`, `shm --meth`,
-# `mem --meth`) without juggling the `.bwameth.c2t` suffix by hand.
+# FASTA path to all three commands (`index --meth`, `shm --meth`, `mem --meth`)
+# without juggling the `.meth` suffix by hand.
 #
-# Pre-fix, `bwa-mem3 shm <plain>` opens `bns_restore(<plain>)` and fails on
-# `<plain>.ann` when only the meth artifacts are on disk; staging instead
-# required typing `bwa-mem3 shm <plain>.bwameth.c2t`. This test pins the
-# new flag-driven behavior in place.
+# D3 (dual index): `index --meth` builds BOTH the original-alphabet index at the
+# bare prefix (`ref.fa.{0123,ann,...}`) AND the converted seed FM-index at
+# `ref.fa.meth.*`. `shm --meth <plain>` stages the seed segment under the
+# `ref.fa.meth` basename; `mem --meth <plain>` attaches it from shm. Because the
+# bare index now exists too, plain `shm <plain>` also succeeds (stages the
+# original index) — the dual index removes the old meth-only failure mode.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -19,48 +21,51 @@ if [[ ! -x "$BIN" ]]; then
     exit 2
 fi
 
-# Isolated dir so the meth-only artifacts are the *only* index in scope.
-# test/fixtures/phix.fa already has a plain index from other tests, which
-# would mask the negative case below.
+# Isolated dir so the staged segments are unambiguous.
 WORKDIR="$(mktemp -d -t shm_meth.XXXXXX)"
 cp test/fixtures/phix.fa "$WORKDIR/ref.fa"
 PLAIN_PREFIX="$WORKDIR/ref.fa"
-C2T_PREFIX="$WORKDIR/ref.fa.bwameth.c2t"
+METH_PREFIX="$WORKDIR/ref.fa.meth"
 
-# Drop any stale registry from prior runs and on every exit. Allocate the
-# stderr-capture file once and truncate between cases — avoids mktemp churn
-# and ensures the EXIT trap (which expands $ERR at fire time) cleans up the
-# single live path rather than leaking earlier ones.
+# Drop any stale registry from prior runs and on every exit.
 "$BIN" shm -d >/dev/null 2>&1 || true
 ERR="$(mktemp)"
 trap '"$BIN" shm -d >/dev/null 2>&1 || true; rm -rf "$WORKDIR" "$ERR"' EXIT
 
-# Build only the meth index. The plain ref.fa.{0123,ann,...} are NOT built,
-# so this is the exact scenario where the pre-fix `bwa-mem3 shm ref.fa` UX
-# would have failed with `fail to open '...ref.fa.ann'`.
 echo "[setup] bwa-mem3 index --meth $PLAIN_PREFIX"
 "$BIN" index --meth "$PLAIN_PREFIX" >/dev/null 2>&1
 
-# Sanity: the plain index files must be absent (so test cases C and D below
-# actually exercise the wrong-flag path).
+# D3 dual-index invariant: `index --meth` writes the bare original index AND the
+# .meth seed index. The bare original carries the unpacked `.0123` (the --meth
+# extension target); the seed index does NOT — `mem --meth` never extends against
+# the seed, so its `.0123` is not built (saves ~13 GB on hg38).
 for ext in .0123 .ann .amb .pac .bwt.2bit.64; do
-    if [[ -e "${PLAIN_PREFIX}${ext}" ]]; then
-        echo "FAIL: precondition violated — ${PLAIN_PREFIX}${ext} exists" >&2
+    if [[ ! -e "${PLAIN_PREFIX}${ext}" ]]; then
+        echo "FAIL: dual index missing bare original index ${PLAIN_PREFIX}${ext}" >&2
         exit 1
     fi
 done
+for ext in .ann .amb .pac .bwt.2bit.64; do
+    if [[ ! -e "${METH_PREFIX}${ext}" ]]; then
+        echo "FAIL: dual index missing seed index ${METH_PREFIX}${ext}" >&2
+        exit 1
+    fi
+done
+if [[ -e "${METH_PREFIX}.0123" ]]; then
+    echo "FAIL: seed index ${METH_PREFIX}.0123 was built; it must not be (never read in --meth)" >&2
+    exit 1
+fi
 
-# --- A: `shm --meth <plain>` stages under the c2t basename --------------
+# --- A: `shm --meth <plain>` stages the seed under the .meth basename ----
 echo "[A] bwa-mem3 shm --meth $PLAIN_PREFIX"
 "$BIN" shm --meth "$PLAIN_PREFIX" >/dev/null 2>&1 \
     || { echo "FAIL A: shm --meth <plain> exited non-zero" >&2; exit 1; }
 
 LIST="$("$BIN" shm -l 2>&1)"
-COUNT_A="$(echo "$LIST" | awk '{print $1}' | grep -xc 'ref.fa.bwameth.c2t' || true)"
+COUNT_A="$(echo "$LIST" | awk '{print $1}' | grep -xc 'ref.fa.meth' || true)"
 if [[ "$COUNT_A" -ne 1 ]]; then
-    echo "FAIL A: expected exactly one 'ref.fa.bwameth.c2t' entry, got $COUNT_A" >&2
-    echo "----- shm -l -----" >&2
-    echo "$LIST" >&2
+    echo "FAIL A: expected exactly one 'ref.fa.meth' entry, got $COUNT_A" >&2
+    echo "----- shm -l -----" >&2; echo "$LIST" >&2
     exit 1
 fi
 "$BIN" shm -d >/dev/null 2>&1
@@ -69,7 +74,6 @@ fi
 echo "[B] shm --meth + mem --meth ⇒ 'attached from shm'"
 "$BIN" shm --meth "$PLAIN_PREFIX" >/dev/null 2>&1
 : > "$ERR"
-
 "$BIN" mem --meth "$PLAIN_PREFIX" test/fixtures/reads.fa >/dev/null 2>"$ERR" \
     || { echo "FAIL B: mem --meth exited non-zero" >&2; cat "$ERR" >&2; exit 1; }
 if ! grep -q "attached from shm" "$ERR"; then
@@ -79,38 +83,37 @@ if ! grep -q "attached from shm" "$ERR"; then
 fi
 "$BIN" shm -d >/dev/null 2>&1
 
-# --- C: `shm --meth <c2t-suffixed-prefix>` is idempotent ----------------
-echo "[C] bwa-mem3 shm --meth <prefix>.bwameth.c2t (no double-append)"
-"$BIN" shm --meth "$C2T_PREFIX" >/dev/null 2>&1 \
-    || { echo "FAIL C: shm --meth on already-c2t prefix exited non-zero" >&2; exit 1; }
+# --- C: `shm --meth <.meth-suffixed-prefix>` is idempotent (no double-append) ---
+echo "[C] bwa-mem3 shm --meth <prefix>.meth (no double-append)"
+"$BIN" shm --meth "$METH_PREFIX" >/dev/null 2>&1 \
+    || { echo "FAIL C: shm --meth on already-.meth prefix exited non-zero" >&2; exit 1; }
 LIST="$("$BIN" shm -l 2>&1)"
-COUNT_C="$(echo "$LIST" | awk '{print $1}' | grep -xc 'ref.fa.bwameth.c2t' || true)"
+COUNT_C="$(echo "$LIST" | awk '{print $1}' | grep -xc 'ref.fa.meth' || true)"
 if [[ "$COUNT_C" -ne 1 ]]; then
-    echo "FAIL C: expected exactly one 'ref.fa.bwameth.c2t' entry, got $COUNT_C" >&2
-    echo "----- shm -l -----" >&2
-    echo "$LIST" >&2
+    echo "FAIL C: expected exactly one 'ref.fa.meth' entry, got $COUNT_C" >&2
+    echo "----- shm -l -----" >&2; echo "$LIST" >&2
     exit 1
 fi
-if echo "$LIST" | awk '{print $1}' | grep -qx 'ref.fa.bwameth.c2t.bwameth.c2t'; then
-    echo "FAIL C: double-appended 'ref.fa.bwameth.c2t.bwameth.c2t' entry present" >&2
+if echo "$LIST" | awk '{print $1}' | grep -qx 'ref.fa.meth.meth'; then
+    echo "FAIL C: double-appended 'ref.fa.meth.meth' entry present" >&2
     exit 1
 fi
 "$BIN" shm -d >/dev/null 2>&1
 
-# --- D: `shm <plain>` (no --meth) errors with a helpful hint ------------
-echo "[D] bwa-mem3 shm <plain>  (only meth artifacts on disk → hint about --meth)"
-: > "$ERR"
-if "$BIN" shm "$PLAIN_PREFIX" >/dev/null 2>"$ERR"; then
-    echo "FAIL D: shm <plain> on a meth-only directory unexpectedly succeeded" >&2
-    cat "$ERR" >&2
+# --- D: plain `shm <plain>` (no --meth) now SUCCEEDS on the dual index ----
+# The dual index writes the bare original index, so the old "meth-only directory"
+# failure mode is gone: `shm <plain>` stages the original index.
+echo "[D] bwa-mem3 shm <plain>  (dual index ⇒ plain staging works)"
+"$BIN" shm "$PLAIN_PREFIX" >/dev/null 2>&1 \
+    || { echo "FAIL D: shm <plain> on a dual index unexpectedly failed" >&2; exit 1; }
+LIST="$("$BIN" shm -l 2>&1)"
+COUNT_D="$(echo "$LIST" | awk '{print $1}' | grep -xc 'ref.fa' || true)"
+if [[ "$COUNT_D" -ne 1 ]]; then
+    echo "FAIL D: expected exactly one 'ref.fa' entry, got $COUNT_D" >&2
+    echo "----- shm -l -----" >&2; echo "$LIST" >&2
     exit 1
 fi
-if ! grep -q -- "--meth" "$ERR"; then
-    echo "FAIL D: error message did not mention '--meth' as a hint" >&2
-    echo "----- stderr -----" >&2
-    cat "$ERR" >&2
-    exit 1
-fi
+"$BIN" shm -d >/dev/null 2>&1
 
 # --- E: extra positional arguments after idxbase are rejected -----------
 echo "[E] bwa-mem3 shm --meth <prefix> <typo>  (extra positional rejected)"
@@ -122,8 +125,7 @@ if "$BIN" shm --meth "$PLAIN_PREFIX" stray-arg >/dev/null 2>"$ERR"; then
 fi
 if ! grep -qiE "positional|too many|unexpected" "$ERR"; then
     echo "FAIL E: error message did not flag the extra positional arg" >&2
-    echo "----- stderr -----" >&2
-    cat "$ERR" >&2
+    echo "----- stderr -----" >&2; cat "$ERR" >&2
     exit 1
 fi
 

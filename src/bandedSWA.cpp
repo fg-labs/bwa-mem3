@@ -64,6 +64,89 @@ static inline void build_pmat16(int8_t out[16],
     for (int i = 4; i < 16; i++) out[i] = w_ambig;
 }
 
+// Build the 16-byte ASYMMETRIC substitution LUT for the generic-matrix scoring
+// seam (D3 bisulfite OT/OB matrices). Indexed by (ref<<2)|read over the ACGT
+// (0..3) submatrix: out[(i<<2)|j] = mat[i*5 + j] (target-major mat[ref*5+read]).
+// N cells (target/query == 4) are NOT in this LUT — callers mask them to ambig.
+// For a symmetric matrix this reproduces build_pmat16's scores exactly (the
+// diagonal is w_match, every off-diagonal is w_mismatch), so the default path
+// stays bit-identical; an asymmetric off-diagonal (e.g. ref-C x read-T freed)
+// is now honored where the XOR-LUT could not represent it.
+static inline void build_amat16(int8_t out[16], const int8_t *mat)
+{
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++)
+            out[(i << 2) | j] = mat[i * 5 + j];
+}
+
+// True when `mat`'s ACGT 4x4 submatrix is NOT the plain symmetric
+// match/mismatch matrix implied by (w_match, w_mismatch) — i.e. the cheap
+// symmetric XOR LUT cannot represent it and the generic (target-major) LUT
+// path is required. The default aligner matrix is symmetric, so this returns
+// false on the hot path and the kernels keep their original fast prepass;
+// it returns true only for an asymmetric matrix (bisulfite OT/OB), which pays
+// the heavier generic prepass. N cells are handled separately, so only the
+// ACGT submatrix is inspected. w_mismatch is the kernel's stored (negated)
+// penalty, matching how mat off-diagonals are encoded.
+static inline bool bsw_generic_matrix(const int8_t *mat, int8_t w_match, int8_t w_mismatch)
+{
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++) {
+            int8_t expect = (i == j) ? w_match : w_mismatch;
+            if (mat[i * 5 + j] != expect) return true;
+        }
+    return false;
+}
+
+// Dev/validation hook: when BWAMEM3_FORCE_GENMAT is set in the environment, the
+// SW kernels take the generic-matrix prepass even for a symmetric matrix. This
+// lets the standalone kernel bench (which uses the default symmetric matrix)
+// (a) measure the generic path's throughput and (b) prove it is byte-identical
+// to the symmetric path on symmetric inputs (amat == pmat there). Read once;
+// zero cost on the production path when unset (magic-static init, no syscall in
+// the hot loop). NEVER affects output for a symmetric matrix — only which
+// prepass macro runs.
+static inline bool bsw_force_generic_matrix()
+{
+    static const bool forced = (getenv("BWAMEM3_FORCE_GENMAT") != NULL);
+    return forced;
+}
+
+// Rank-1 fast-path descriptor for the generic-matrix seam. Bisulfite frees
+// exactly ONE ordered off-diagonal cell per strand to a match (OT: ref-C/read-T;
+// OB: ref-G/read-A). When the matrix is the plain symmetric matrix plus a single
+// such freed-to-match cell, the kernel can skip the byte-shuffle LUT entirely
+// and just extend the match condition (SBT_PREPASS16_RANK1) — no TBL, no
+// sign-extend, near parity with symmetric. Any other deviation (>=2 freed cells,
+// a changed diagonal, or a freed value != w_match) falls back to the general LUT
+// path. `rank1` is the only field the kernel branches on; (ref,read) name the
+// freed cell. When `forced` is set on an otherwise-symmetric matrix we synthesize
+// the no-op cell (0,0) so the bench exercises and times the rank-1 path while
+// staying byte-identical to symmetric.
+struct BswFreedCell { bool rank1; int8_t ref; int8_t read; };
+static inline BswFreedCell bsw_freed_cell(const int8_t *mat, int8_t w_match,
+                                          int8_t w_mismatch, bool forced)
+{
+    int n_freed = 0;
+    int8_t fr_ref = 0, fr_read = 0;
+    bool ok = true;
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++) {
+            int8_t expect = (i == j) ? w_match : w_mismatch;
+            if (mat[i * 5 + j] == expect) continue;
+            if (i != j && mat[i * 5 + j] == w_match) {   // off-diagonal freed to match
+                n_freed++; fr_ref = (int8_t)i; fr_read = (int8_t)j;
+            } else {
+                ok = false;                              // diagonal change / non-match freed
+            }
+        }
+    BswFreedCell c;
+    c.rank1 = ok && (n_freed == 1 || (forced && n_freed == 0));
+    c.ref = fr_ref;
+    c.read = fr_read;
+    return c;
+}
+
 // Defensive: numThreads must be ≥ 1 — _mm_malloc(0, 64) is implementation-
 // defined and a 0-byte slab would silently OOM downstream writes. Wrappers
 // fan out to constructors and per-batch SoA setup; clamping centrally keeps
@@ -366,14 +449,42 @@ void BandedPairWiseSW::scalarBandedSWAWrapper(SeqPair *seqPairArray,
 // --- PR 17/16: AVX2 LUT primitive ---
 // pmat256 must have the 16-byte LUT broadcast into both 128-bit halves
 // (use _mm256_broadcastsi128_si256). 1 xor + 1 shuffle replaces the
-// legacy 4-op cmpeq+blendv+max+blendv path. The non-LUT variant was
-// removed: it relied on max_epu8 setting bit 7 to detect AMBIG, which
-// no longer holds under the asymmetric AMBIG encoding (target N=4,
-// query N=8) introduced alongside the LUT path.
-#define SBT_PREPASS8_LUT(s1, s2, sbt11_out, pmat256)                    \
+// legacy 4-op cmpeq+blendv+max+blendv path. The XOR index is order-insensitive,
+// so it cannot represent an asymmetric matrix — that case uses SBT_PREPASS8_AMAT.
+#define SBT_PREPASS8_XOR(s1, s2, sbt11_out, pmat256)                    \
     {                                                                   \
         __m256i xor_ = _mm256_xor_si256(s1, s2);                        \
         sbt11_out = _mm256_shuffle_epi8(pmat256, xor_);                 \
+    }
+
+// D3 generic-matrix seam (gated on an asymmetric matrix; the default symmetric
+// path uses SBT_PREPASS8_XOR above). Index the target-major LUT
+// amat[(ref<<2)|read] (broadcast into both 128-bit halves), then mask N cells to
+// ambig. s1=target/ref, s2=query/read; ACGT=0..3, N=4(target)/8(query). For a
+// symmetric matrix amat == the XOR pmat scores; an asymmetric off-diagonal
+// (ref-C x read-T freed) is scored correctly. (s1<<2 via two add_epi8; N detected
+// by max_epu8(s1,s2) > 3.) Mirrors the validated NEON SBT_PREPASS8_AMAT.
+#define SBT_PREPASS8_AMAT(s1, s2, sbt11_out, amat256, ambig256, three256) \
+    {                                                                   \
+        __m256i sh_  = _mm256_add_epi8(s1, s1);                         \
+        sh_          = _mm256_add_epi8(sh_, sh_);          /* s1 << 2 */ \
+        __m256i idx_ = _mm256_or_si256(sh_, s2);           /* (ref<<2)|read */ \
+        __m256i acgt_  = _mm256_shuffle_epi8(amat256, idx_);           \
+        __m256i nmax_  = _mm256_max_epu8(s1, s2);                       \
+        __m256i nmask_ = _mm256_cmpgt_epi8(nmax_, three256); /* N: base > 3 */ \
+        sbt11_out = _mm256_or_si256(_mm256_andnot_si256(nmask_, acgt_), \
+                                    _mm256_and_si256(nmask_, ambig256)); \
+    }
+
+// D3 8-bit rank-1 fast path: symmetric XOR LUT + single freed-to-match override.
+// Cheaper than AMAT on the fast 8-bit tier (no index build, no N-mask). Mirrors NEON.
+// rowfreed = (ref==fr_ref) hoisted per row (s1 is constant across the band loop).
+#define SBT_PREPASS8_RANK1(s1, s2, rowfreed, sbt11_out, pmat256, match256, frread256) \
+    {                                                                   \
+        __m256i xor_  = _mm256_xor_si256(s1, s2);                       \
+        __m256i sbt_  = _mm256_shuffle_epi8(pmat256, xor_);            \
+        __m256i freed_ = _mm256_and_si256(rowfreed, _mm256_cmpeq_epi8(s2, frread256)); \
+        sbt11_out = _mm256_blendv_epi8(sbt_, match256, freed_);        \
     }
 
 #define MAIN_CODE8_CORE(sbt11, h00, h11, e11, f11, f21, zero256, e_ins256, oe_ins256, e_del256, oe_del256) \
@@ -400,12 +511,42 @@ void BandedPairWiseSW::scalarBandedSWAWrapper(SeqPair *seqPairArray,
         f21 = _mm256_max_epu8(temp256, f21);                            \
     }
 
-#define SBT_PREPASS16(s1, s2, sbt11_out, mismatch256, match256, w_ambig_256) \
+// Symmetric (default) fast path. N detected by the high bit of max_epu16 (N=0xFFFF).
+#define SBT_PREPASS16_SYM(s1, s2, sbt11_out, mismatch256, match256, w_ambig_256) \
     {                                                                   \
         __m256i cmp_ = _mm256_cmpeq_epi16(s1, s2);                      \
         __m256i sbt_ = _mm256_blendv_epi16(mismatch256, match256, cmp_); \
         __m256i tmp_ = _mm256_max_epu16(s1, s2);                        \
         sbt11_out = _mm256_blendv_epi16(sbt_, w_ambig_256, tmp_);       \
+    }
+
+// D3 rank-1 fast path: symmetric + a single off-diagonal freed to a match
+// (bisulfite OT/OB). Match when (ref==read) OR (ref==fr_ref AND read==fr_read);
+// no LUT, no sign-extend. N(high bit of max_epu16)->ambig. Mirrors NEON.
+// alt1 = (ref==fr_ref) ? fr_read : ref, hoisted per row (see NEON variant).
+#define SBT_PREPASS16_RANK1(s1, s2, alt1, sbt11_out, mismatch256, match256, w_ambig_256) \
+    {                                                                   \
+        __m256i eq_  = _mm256_cmpeq_epi16(s2, s1);                      \
+        __m256i fr_  = _mm256_cmpeq_epi16(s2, alt1);                    \
+        __m256i ism_ = _mm256_or_si256(eq_, fr_);                       \
+        __m256i sbt_ = _mm256_blendv_epi16(mismatch256, match256, ism_); \
+        __m256i nmax_ = _mm256_max_epu16(s1, s2);                       \
+        sbt11_out = _mm256_blendv_epi16(sbt_, w_ambig_256, nmax_);      \
+    }
+
+// D3 generic-matrix seam (gated; >=2 freed cells / non-match freed values). LUT
+// amat[(ref<<2)|read] for both-ACGT lanes; non-ACGT is mismatch-or-ambig (padding
+// pairs are never equal; N->ambig). Byte LUT score in the low byte -> sign-extend.
+// acgt mask via cmpeq(max_epu16(maxb,3),3) (unsigned <=3 test). Mirrors NEON.
+#define SBT_PREPASS16_AMAT(s1, s2, sbt11_out, amat256, mismatch256, w_ambig_256, three256) \
+    {                                                                   \
+        __m256i maxb_ = _mm256_max_epu16(s1, s2);                       \
+        __m256i base_ = _mm256_blendv_epi16(mismatch256, w_ambig_256, maxb_); /* N high bit */ \
+        __m256i acgt_ = _mm256_cmpeq_epi16(_mm256_max_epu16(maxb_, three256), three256); \
+        __m256i idx_  = _mm256_or_si256(_mm256_slli_epi16(s1, 2), s2);  \
+        __m256i lut_  = _mm256_shuffle_epi8(amat256, idx_);            \
+        lut_ = _mm256_srai_epi16(_mm256_slli_epi16(lut_, 8), 8);       \
+        sbt11_out = _mm256_blendv_epi16(base_, lut_, acgt_);          \
     }
 
 #define MAIN_CODE16_CORE(sbt11, h00, h11, e11, f11, f21, zero256, e_ins256, oe_ins256, e_del256, oe_del256) \
@@ -775,6 +916,18 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
     build_pmat16(pmat_bytes, this->w_match, this->w_mismatch, this->w_ambig);
     __m128i pmat128 = _mm_load_si128((__m128i *)pmat_bytes);
     __m256i pmat256 = _mm256_broadcastsi128_si256(pmat128);
+    // D3 generic-matrix seam: symmetric default uses the XOR pmat (fast); an
+    // asymmetric matrix (bisulfite OT/OB) uses the target-major amat LUT.
+    const bool forced  = bsw_force_generic_matrix();
+    const bool gen_mat = bsw_generic_matrix(this->mat, this->w_match, this->w_mismatch)
+                         || forced;
+    const BswFreedCell fc = bsw_freed_cell(this->mat, this->w_match, this->w_mismatch, forced);
+    __m256i frref256  = _mm256_set1_epi8(fc.ref);
+    __m256i frread256 = _mm256_set1_epi8(fc.read);
+    int8_t amat_bytes[16] __attribute__((aligned(16)));
+    build_amat16(amat_bytes, this->mat);
+    __m256i amat256 = _mm256_broadcastsi128_si256(_mm_load_si128((__m128i *)amat_bytes));
+    __m256i three256_8 = _mm256_set1_epi8(3);
 
     __m256i e_del256    = _mm256_set1_epi8(this->e_del);
     __m256i oe_del256   = _mm256_set1_epi8(this->o_del + this->e_del);
@@ -1046,14 +1199,30 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
 
         // PR 17: pre-pass — build score vector sbt[j] for all band columns
         // once. Independent per-j, so vectorized loads/stores run at peak
-        // throughput without carrying the DP core's dep chain.
-        for (int jp = beg; jp < end; jp++) {
-            __m256i s2 = _mm256_load_si256((__m256i *)(seq2SoA + jp * SIMD_WIDTH8));
-            __m256i sbt11;
-            // PR 16: LUT score build (1 xor + 1 shuffle) in place of
-            // the 4-op cmpeq+blendv+max+blendv SBT_PREPASS8.
-            SBT_PREPASS8_LUT(s10, s2, sbt11, pmat256);
-            _mm256_store_si256((__m256i *)(sbt_buf + jp * SIMD_WIDTH8), sbt11);
+        // throughput without carrying the DP core's dep chain. gen_mat branch is
+        // loop-invariant (once per row): symmetric keeps the XOR LUT.
+        if (!gen_mat) {
+            for (int jp = beg; jp < end; jp++) {
+                __m256i s2 = _mm256_load_si256((__m256i *)(seq2SoA + jp * SIMD_WIDTH8));
+                __m256i sbt11;
+                SBT_PREPASS8_XOR(s10, s2, sbt11, pmat256);
+                _mm256_store_si256((__m256i *)(sbt_buf + jp * SIMD_WIDTH8), sbt11);
+            }
+        } else if (fc.rank1) {
+            __m256i rowfreed = _mm256_cmpeq_epi8(s10, frref256);
+            for (int jp = beg; jp < end; jp++) {
+                __m256i s2 = _mm256_load_si256((__m256i *)(seq2SoA + jp * SIMD_WIDTH8));
+                __m256i sbt11;
+                SBT_PREPASS8_RANK1(s10, s2, rowfreed, sbt11, pmat256, match256, frread256);
+                _mm256_store_si256((__m256i *)(sbt_buf + jp * SIMD_WIDTH8), sbt11);
+            }
+        } else {
+            for (int jp = beg; jp < end; jp++) {
+                __m256i s2 = _mm256_load_si256((__m256i *)(seq2SoA + jp * SIMD_WIDTH8));
+                __m256i sbt11;
+                SBT_PREPASS8_AMAT(s10, s2, sbt11, amat256, w_ambig_256, three256_8);
+                _mm256_store_si256((__m256i *)(sbt_buf + jp * SIMD_WIDTH8), sbt11);
+            }
         }
 
         j256 = _mm256_set1_epi8(beg - i);   // diagonal offset of first band column
@@ -1702,6 +1871,20 @@ void BandedPairWiseSW::smithWaterman256_16(uint16_t seq1SoA[],
     __m256i mismatch256  = _mm256_set1_epi16(this->w_mismatch);
     __m256i w_ambig_256  = _mm256_set1_epi16(this->w_ambig);    // ambig penalty
 
+    // D3 generic-matrix seam: symmetric default uses SBT_PREPASS16_SYM; a single
+    // freed-to-match cell (bisulfite) uses the rank-1 path; any other asymmetric
+    // matrix uses the amat LUT. gen_mat is false on the hot path.
+    const bool forced  = bsw_force_generic_matrix();
+    const bool gen_mat = bsw_generic_matrix(this->mat, this->w_match, this->w_mismatch)
+                         || forced;
+    const BswFreedCell fc = bsw_freed_cell(this->mat, this->w_match, this->w_mismatch, forced);
+    __m256i frref256  = _mm256_set1_epi16(fc.ref);
+    __m256i frread256 = _mm256_set1_epi16(fc.read);
+    int8_t amat_bytes[16] __attribute__((aligned(16)));
+    build_amat16(amat_bytes, this->mat);
+    __m256i amat256   = _mm256_broadcastsi128_si256(_mm_load_si128((__m128i *)amat_bytes));
+    __m256i three256  = _mm256_set1_epi16(3);
+
     __m256i e_del256    = _mm256_set1_epi16(this->e_del);
     __m256i oe_del256   = _mm256_set1_epi16(this->o_del + this->e_del);
     __m256i e_ins256    = _mm256_set1_epi16(this->e_ins);
@@ -1860,12 +2043,30 @@ void BandedPairWiseSW::smithWaterman256_16(uint16_t seq1SoA[],
         tim1 = __rdtsc();
 #endif
         
-        // PR 17: AVX2 16-bit score pre-pass (fission only, no LUT).
-        for (int jp = beg; jp < end; jp++) {
-            __m256i s2 = _mm256_load_si256((__m256i *)(seq2SoA + jp * SIMD_WIDTH16));
-            __m256i sbt11;
-            SBT_PREPASS16(s10, s2, sbt11, mismatch256, match256, w_ambig_256);
-            _mm256_store_si256((__m256i *)(sbt_buf + jp * SIMD_WIDTH16), sbt11);
+        // PR 17: AVX2 16-bit score pre-pass (fission). gen_mat branch is
+        // loop-invariant: symmetric keeps the cheap SYM prepass.
+        if (!gen_mat) {
+            for (int jp = beg; jp < end; jp++) {
+                __m256i s2 = _mm256_load_si256((__m256i *)(seq2SoA + jp * SIMD_WIDTH16));
+                __m256i sbt11;
+                SBT_PREPASS16_SYM(s10, s2, sbt11, mismatch256, match256, w_ambig_256);
+                _mm256_store_si256((__m256i *)(sbt_buf + jp * SIMD_WIDTH16), sbt11);
+            }
+        } else if (fc.rank1) {
+            __m256i alt10 = _mm256_blendv_epi16(s10, frread256, _mm256_cmpeq_epi16(s10, frref256));
+            for (int jp = beg; jp < end; jp++) {
+                __m256i s2 = _mm256_load_si256((__m256i *)(seq2SoA + jp * SIMD_WIDTH16));
+                __m256i sbt11;
+                SBT_PREPASS16_RANK1(s10, s2, alt10, sbt11, mismatch256, match256, w_ambig_256);
+                _mm256_store_si256((__m256i *)(sbt_buf + jp * SIMD_WIDTH16), sbt11);
+            }
+        } else {
+            for (int jp = beg; jp < end; jp++) {
+                __m256i s2 = _mm256_load_si256((__m256i *)(seq2SoA + jp * SIMD_WIDTH16));
+                __m256i sbt11;
+                SBT_PREPASS16_AMAT(s10, s2, sbt11, amat256, mismatch256, w_ambig_256, three256);
+                _mm256_store_si256((__m256i *)(sbt_buf + jp * SIMD_WIDTH16), sbt11);
+            }
         }
 
         j256 = _mm256_set1_epi16(beg);
@@ -2149,13 +2350,38 @@ void BandedPairWiseSW::smithWaterman256_16(uint16_t seq1SoA[],
 // --- PR 17/16: AVX-512BW LUT primitive ---
 // Broadcast the 16-byte pmat into all four 128-bit lanes.
 // _mm512_shuffle_epi8 is per-128-bit-lane; each lane shuffles against
-// its own quarter of the 512-bit pmat. The non-LUT variant was removed
-// (its movepi8_mask AMBIG detection no longer fires under the asymmetric
-// AMBIG encoding shipped alongside the LUT path).
-#define SBT_PREPASS8_LUT(s1, s2, sbt11_out, pmat512)                    \
+// its own quarter of the 512-bit pmat. The XOR index is order-insensitive,
+// so it cannot represent an asymmetric matrix — that case uses SBT_PREPASS8_AMAT.
+#define SBT_PREPASS8_XOR(s1, s2, sbt11_out, pmat512)                    \
     {                                                                   \
         __m512i xor_ = _mm512_xor_si512(s1, s2);                        \
         sbt11_out = _mm512_shuffle_epi8(pmat512, xor_);                 \
+    }
+
+// D3 generic-matrix seam (gated; symmetric default uses SBT_PREPASS8_XOR). Index
+// the target-major LUT amat[(ref<<2)|read] (broadcast to all 4 lanes), then mask
+// N to ambig. ACGT=0..3, N=4(target)/8(query). N detected by max_epu8(s1,s2) > 3.
+// Mirrors the validated NEON/AVX2 SBT_PREPASS8_AMAT.
+#define SBT_PREPASS8_AMAT(s1, s2, sbt11_out, amat512, ambig512, three512) \
+    {                                                                   \
+        __m512i sh_  = _mm512_add_epi8(s1, s1);                         \
+        sh_          = _mm512_add_epi8(sh_, sh_);          /* s1 << 2 */ \
+        __m512i idx_ = _mm512_or_si512(sh_, s2);           /* (ref<<2)|read */ \
+        __m512i acgt_  = _mm512_shuffle_epi8(amat512, idx_);           \
+        __m512i nmax_  = _mm512_max_epu8(s1, s2);                       \
+        __mmask64 nmask_ = _mm512_cmpgt_epi8_mask(nmax_, three512); /* N: base > 3 */ \
+        sbt11_out = _mm512_mask_blend_epi8(nmask_, acgt_, ambig512);    \
+    }
+
+// D3 8-bit rank-1 fast path: symmetric XOR LUT + single freed-to-match override.
+// Cheaper than AMAT on the fast 8-bit tier (no index build, no N-mask). Mirrors NEON.
+// rowfreed = cmpeq_epi8_mask(ref, fr_ref) hoisted per row (s1 constant per band).
+#define SBT_PREPASS8_RANK1(s1, s2, rowfreed, sbt11_out, pmat512, match512, frread512) \
+    {                                                                   \
+        __m512i xor_  = _mm512_xor_si512(s1, s2);                       \
+        __m512i sbt_  = _mm512_shuffle_epi8(pmat512, xor_);           \
+        __mmask64 freed_ = rowfreed & _mm512_cmpeq_epi8_mask(s2, frread512); \
+        sbt11_out = _mm512_mask_blend_epi8(freed_, sbt_, match512);    \
     }
 
 #define MAIN_CODE8_CORE(sbt11, h00, h11, e11, f11, f21, zero512, e_ins512, oe_ins512, e_del512, oe_del512) \
@@ -2182,13 +2408,43 @@ void BandedPairWiseSW::smithWaterman256_16(uint16_t seq1SoA[],
         f21 = _mm512_max_epu8(temp512, f21);                            \
     }
 
-#define SBT_PREPASS16(s1, s2, sbt11_out, mismatch512, match512, w_ambig_512) \
+// Symmetric (default) fast path. N detected by movepi16_mask (N=0xFFFF, high bit).
+#define SBT_PREPASS16_SYM(s1, s2, sbt11_out, mismatch512, match512, w_ambig_512) \
     {                                                                   \
         __mmask32 cmp_ = _mm512_cmpeq_epi16_mask(s1, s2);               \
         __m512i sbt_ = _mm512_mask_blend_epi16(cmp_, mismatch512, match512); \
         __m512i tmp_ = _mm512_max_epu16(s1, s2);                        \
         __mmask32 amb_ = _mm512_movepi16_mask(tmp_);                    \
         sbt11_out = _mm512_mask_blend_epi16(amb_, sbt_, w_ambig_512);   \
+    }
+
+// D3 rank-1 fast path: symmetric + a single off-diagonal freed to a match
+// (bisulfite OT/OB). Match when (ref==read) OR (ref==fr_ref AND read==fr_read);
+// no LUT, no sign-extend. Mirrors NEON/AVX2.
+// alt1 = (ref==fr_ref) ? fr_read : ref, hoisted per row (see NEON variant).
+#define SBT_PREPASS16_RANK1(s1, s2, alt1, sbt11_out, mismatch512, match512, w_ambig_512) \
+    {                                                                   \
+        __mmask32 eq_  = _mm512_cmpeq_epi16_mask(s2, s1);             \
+        __mmask32 fr_  = _mm512_cmpeq_epi16_mask(s2, alt1);          \
+        __mmask32 ism_ = eq_ | fr_;                                    \
+        __m512i sbt_ = _mm512_mask_blend_epi16(ism_, mismatch512, match512); \
+        __mmask32 amb_ = _mm512_movepi16_mask(_mm512_max_epu16(s1, s2)); \
+        sbt11_out = _mm512_mask_blend_epi16(amb_, sbt_, w_ambig_512);   \
+    }
+
+// D3 generic-matrix seam (gated; >=2 freed cells / non-match freed values). LUT
+// amat[(ref<<2)|read] for both-ACGT lanes; non-ACGT is mismatch-or-ambig. Byte LUT
+// score in low byte -> sign-extend. acgt mask via cmpeq(max_epu16(maxb,3),3).
+#define SBT_PREPASS16_AMAT(s1, s2, sbt11_out, amat512, mismatch512, w_ambig_512, three512) \
+    {                                                                   \
+        __m512i maxb_ = _mm512_max_epu16(s1, s2);                      \
+        __mmask32 nN_ = _mm512_movepi16_mask(maxb_);  /* N high bit */ \
+        __m512i base_ = _mm512_mask_blend_epi16(nN_, mismatch512, w_ambig_512); \
+        __mmask32 acgt_ = _mm512_cmpeq_epi16_mask(_mm512_max_epu16(maxb_, three512), three512); \
+        __m512i idx_  = _mm512_or_si512(_mm512_slli_epi16(s1, 2), s2);  \
+        __m512i lut_  = _mm512_shuffle_epi8(amat512, idx_);           \
+        lut_ = _mm512_srai_epi16(_mm512_slli_epi16(lut_, 8), 8);      \
+        sbt11_out = _mm512_mask_blend_epi16(acgt_, base_, lut_);      \
     }
 
 #define MAIN_CODE16_CORE(sbt11, h00, h11, e11, f11, f21, zero512, e_ins512, oe_ins512, e_del512, oe_del512) \
@@ -2536,6 +2792,18 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
     build_pmat16(pmat_bytes, this->w_match, this->w_mismatch, this->w_ambig);
     __m128i pmat128 = _mm_load_si128((__m128i *)pmat_bytes);
     __m512i pmat512 = _mm512_broadcast_i32x4(pmat128);
+    // D3 generic-matrix seam: symmetric default uses the XOR pmat; an asymmetric
+    // matrix (bisulfite OT/OB) uses the target-major amat LUT.
+    const bool forced  = bsw_force_generic_matrix();
+    const bool gen_mat = bsw_generic_matrix(this->mat, this->w_match, this->w_mismatch)
+                         || forced;
+    const BswFreedCell fc = bsw_freed_cell(this->mat, this->w_match, this->w_mismatch, forced);
+    __m512i frref512  = _mm512_set1_epi8(fc.ref);
+    __m512i frread512 = _mm512_set1_epi8(fc.read);
+    int8_t amat_bytes[16] __attribute__((aligned(16)));
+    build_amat16(amat_bytes, this->mat);
+    __m512i amat512 = _mm512_broadcast_i32x4(_mm_load_si128((__m128i *)amat_bytes));
+    __m512i three512_8 = _mm512_set1_epi8(3);
 
     __m512i e_del512    = _mm512_set1_epi8(this->e_del);
     __m512i oe_del512   = _mm512_set1_epi8(this->o_del + this->e_del);
@@ -2804,12 +3072,30 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
         tim1 = __rdtsc();
 #endif
 
-        // PR 17+16: AVX-512 8-bit score pre-pass via LUT.
-        for (int jp = beg; jp < end; jp++) {
-            __m512i s2 = _mm512_load_si512((__m512i *)(seq2SoA + jp * SIMD_WIDTH8));
-            __m512i sbt11;
-            SBT_PREPASS8_LUT(s10, s2, sbt11, pmat512);
-            _mm512_store_si512((__m512i *)(sbt_buf + jp * SIMD_WIDTH8), sbt11);
+        // PR 17+16: AVX-512 8-bit score pre-pass via LUT. gen_mat branch is
+        // loop-invariant: symmetric keeps the cheap XOR LUT.
+        if (!gen_mat) {
+            for (int jp = beg; jp < end; jp++) {
+                __m512i s2 = _mm512_load_si512((__m512i *)(seq2SoA + jp * SIMD_WIDTH8));
+                __m512i sbt11;
+                SBT_PREPASS8_XOR(s10, s2, sbt11, pmat512);
+                _mm512_store_si512((__m512i *)(sbt_buf + jp * SIMD_WIDTH8), sbt11);
+            }
+        } else if (fc.rank1) {
+            __mmask64 rowfreed = _mm512_cmpeq_epi8_mask(s10, frref512);
+            for (int jp = beg; jp < end; jp++) {
+                __m512i s2 = _mm512_load_si512((__m512i *)(seq2SoA + jp * SIMD_WIDTH8));
+                __m512i sbt11;
+                SBT_PREPASS8_RANK1(s10, s2, rowfreed, sbt11, pmat512, match512, frread512);
+                _mm512_store_si512((__m512i *)(sbt_buf + jp * SIMD_WIDTH8), sbt11);
+            }
+        } else {
+            for (int jp = beg; jp < end; jp++) {
+                __m512i s2 = _mm512_load_si512((__m512i *)(seq2SoA + jp * SIMD_WIDTH8));
+                __m512i sbt11;
+                SBT_PREPASS8_AMAT(s10, s2, sbt11, amat512, w_ambig_512, three512_8);
+                _mm512_store_si512((__m512i *)(sbt_buf + jp * SIMD_WIDTH8), sbt11);
+            }
         }
 
         j512 = _mm512_set1_epi8(beg - i);   // diagonal offset of first band column
@@ -3450,7 +3736,20 @@ void BandedPairWiseSW::smithWaterman512_16(uint16_t seq1SoA[],
     __m512i gapOE512     = _mm512_set1_epi16(this->w_open + this->w_extend);
     __m512i w_ambig_512  = _mm512_set1_epi16(this->w_ambig);    // ambig penalty
     __m512i five512      = _mm512_set1_epi16(5);
-    
+
+    // D3 generic-matrix seam: symmetric default uses SYM; a single freed-to-match
+    // cell (bisulfite) uses rank-1; any other asymmetric matrix uses the amat LUT.
+    const bool forced  = bsw_force_generic_matrix();
+    const bool gen_mat = bsw_generic_matrix(this->mat, this->w_match, this->w_mismatch)
+                         || forced;
+    const BswFreedCell fc = bsw_freed_cell(this->mat, this->w_match, this->w_mismatch, forced);
+    __m512i frref512  = _mm512_set1_epi16(fc.ref);
+    __m512i frread512 = _mm512_set1_epi16(fc.read);
+    int8_t amat_bytes[16] __attribute__((aligned(16)));
+    build_amat16(amat_bytes, this->mat);
+    __m512i amat512   = _mm512_broadcast_i32x4(_mm_load_si128((__m128i *)amat_bytes));
+    __m512i three512  = _mm512_set1_epi16(3);
+
     __m512i e_del512    = _mm512_set1_epi16(this->e_del);
     __m512i oe_del512   = _mm512_set1_epi16(this->o_del + this->e_del);
     __m512i e_ins512    = _mm512_set1_epi16(this->e_ins);
@@ -3606,12 +3905,30 @@ void BandedPairWiseSW::smithWaterman512_16(uint16_t seq1SoA[],
         tim1 = __rdtsc();
 #endif
         
-        // PR 17: AVX-512 16-bit score pre-pass (fission only, no LUT).
-        for (int jp = beg; jp < end; jp++) {
-            __m512i s2 = _mm512_load_si512((__m512i *)(seq2SoA + jp * SIMD_WIDTH16));
-            __m512i sbt11;
-            SBT_PREPASS16(s10, s2, sbt11, mismatch512, match512, w_ambig_512);
-            _mm512_store_si512((__m512i *)(sbt_buf + jp * SIMD_WIDTH16), sbt11);
+        // PR 17: AVX-512 16-bit score pre-pass (fission). gen_mat branch is
+        // loop-invariant: symmetric keeps the cheap SYM prepass.
+        if (!gen_mat) {
+            for (int jp = beg; jp < end; jp++) {
+                __m512i s2 = _mm512_load_si512((__m512i *)(seq2SoA + jp * SIMD_WIDTH16));
+                __m512i sbt11;
+                SBT_PREPASS16_SYM(s10, s2, sbt11, mismatch512, match512, w_ambig_512);
+                _mm512_store_si512((__m512i *)(sbt_buf + jp * SIMD_WIDTH16), sbt11);
+            }
+        } else if (fc.rank1) {
+            __m512i alt10 = _mm512_mask_blend_epi16(_mm512_cmpeq_epi16_mask(s10, frref512), s10, frread512);
+            for (int jp = beg; jp < end; jp++) {
+                __m512i s2 = _mm512_load_si512((__m512i *)(seq2SoA + jp * SIMD_WIDTH16));
+                __m512i sbt11;
+                SBT_PREPASS16_RANK1(s10, s2, alt10, sbt11, mismatch512, match512, w_ambig_512);
+                _mm512_store_si512((__m512i *)(sbt_buf + jp * SIMD_WIDTH16), sbt11);
+            }
+        } else {
+            for (int jp = beg; jp < end; jp++) {
+                __m512i s2 = _mm512_load_si512((__m512i *)(seq2SoA + jp * SIMD_WIDTH16));
+                __m512i sbt11;
+                SBT_PREPASS16_AMAT(s10, s2, sbt11, amat512, mismatch512, w_ambig_512, three512);
+                _mm512_store_si512((__m512i *)(sbt_buf + jp * SIMD_WIDTH16), sbt11);
+            }
         }
 
         j512 = _mm512_set1_epi16(beg);
@@ -3878,13 +4195,61 @@ _mm_blendv_epi16(__m128i x, __m128i y, __m128i mask)
 
 
 // PR 17: 16-bit fission primitives, mirror of the 8-bit pair above.
-#define SBT_PREPASS16(s1, s2, sbt11_out, mismatch128, match128, w_ambig_128, ff128) \
+// Symmetric (default) fast path: cmpeq match/mismatch + N(0xFFFF)->ambig.
+#define SBT_PREPASS16_SYM(s1, s2, sbt11_out, mismatch128, match128, w_ambig_128, ff128) \
     {                                                                   \
         __m128i cmp11_ = _mm_cmpeq_epi16(s1, s2);                       \
         __m128i sbt_ = _mm_blendv_epi16(mismatch128, match128, cmp11_); \
         __m128i tmp_ = _mm_max_epu16(s1, s2);                           \
         tmp_ = _mm_cmpeq_epi16(tmp_, ff128);                            \
         sbt11_out = _mm_blendv_epi16(sbt_, w_ambig_128, tmp_);          \
+    }
+
+// D3 rank-1 fast path: symmetric matrix plus a single off-diagonal cell freed
+// to a match (bisulfite OT/OB). The freed transition just extends the match
+// condition — match when (ref==read) OR (ref==fr_ref AND read==fr_read) — so no
+// byte-shuffle LUT and no sign-extend are needed. N(0xFFFF)->ambig exactly as
+// the symmetric path; padding (DUMMY) lanes are never equal and never hit the
+// freed cell, so they stay mismatch. For the no-op cell (0,0) this is identical
+// to SBT_PREPASS16_SYM. The freed-cell test factors into a per-ROW invariant:
+// the row base s1 is constant across the band loop, so we hoist
+//   alt1 = (s1 == fr_ref) ? fr_read : s1     (computed once per row)
+// and the per-cell match condition is just (read==ref) OR (read==alt1) — i.e.
+// on a ref-C row, read-T also matches (the freed conversion); on any other row
+// alt1==s1 so it degenerates to plain equality. Saves 2 ops/cell vs comparing
+// fr_ref/fr_read per cell. ~7 ALU ops/cell, near parity with SYM.
+#define SBT_PREPASS16_RANK1(s1, s2, alt1, sbt11_out, mismatch128, match128, w_ambig_128, ff128) \
+    {                                                                   \
+        __m128i eq_  = _mm_cmpeq_epi16(s2, s1);                         \
+        __m128i fr_  = _mm_cmpeq_epi16(s2, alt1);                       \
+        __m128i ism_ = _mm_or_si128(eq_, fr_);                          \
+        __m128i sbt_ = _mm_blendv_epi16(mismatch128, match128, ism_);   \
+        __m128i nN_  = _mm_cmpeq_epi16(_mm_max_epu16(s1, s2), ff128);   \
+        sbt11_out = _mm_blendv_epi16(sbt_, w_ambig_128, nN_);          \
+    }
+
+// D3 generic-matrix seam (gated on an asymmetric matrix; the default symmetric
+// path uses SBT_PREPASS16_SYM above and is untouched). For both-ACGT lanes the
+// score comes from a target-major LUT amat[(ref<<2)|read], so an asymmetric
+// off-diagonal (e.g. ref-C x read-T freed on bisulfite OT) is scored correctly.
+// Every NON-ACGT lane is provably mismatch-or-ambig — padding pairs (DUMMY1=99
+// target / DUMMY2=100 query) are never equal and real-vs-padding never matches,
+// so the only non-ACGT values are w_ambig (when either base is N=0xFFFF) and
+// w_mismatch (otherwise). That lets us drop the symmetric cmpeq match/mismatch
+// blend entirely and select acgt ? lut : (N ? ambig : mismatch). For a symmetric
+// matrix the LUT diagonal is w_match and off-diagonals are w_mismatch, so this
+// is byte-identical to SBT_PREPASS16_SYM. The byte LUT lands the score in each
+// 16-bit lane's low byte, so we sign-extend (slli 8, srai 8) before use.
+#define SBT_PREPASS16_AMAT(s1, s2, sbt11_out, amat128, mismatch128, w_ambig_128, ff128, three128) \
+    {                                                                   \
+        __m128i maxb_ = _mm_max_epu16(s1, s2);                          \
+        __m128i nN_   = _mm_cmpeq_epi16(maxb_, ff128);  /* either base N */ \
+        __m128i base_ = _mm_blendv_epi16(mismatch128, w_ambig_128, nN_); \
+        __m128i acgt_ = _mm_cmpeq_epi16(_mm_max_epu16(maxb_, three128), three128); /* both <= 3 */ \
+        __m128i idx_  = _mm_or_si128(_mm_slli_epi16(s1, 2), s2);  /* (ref<<2)|read */ \
+        __m128i lut_  = _mm_shuffle_epi8(amat128, idx_);  /* score in low byte */ \
+        lut_ = _mm_srai_epi16(_mm_slli_epi16(lut_, 8), 8);  /* sign-extend low byte */ \
+        sbt11_out = _mm_blendv_epi16(base_, lut_, acgt_);            \
     }
 
 #define MAIN_CODE16_CORE(sbt11, h00, h11, e11, f11, f21, zero128, e_ins128, oe_ins128, e_del128, oe_del128) \
@@ -4194,6 +4559,22 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
     __m128i mismatch128  = _mm_set1_epi16(this->w_mismatch);
     __m128i w_ambig_128  = _mm_set1_epi16(this->w_ambig);   // ambig penalty
 
+    // D3 generic-matrix seam: when the matrix is asymmetric (bisulfite OT/OB),
+    // score the ACGT submatrix from a target-major LUT amat[(ref<<2)|read]
+    // overlaid on the symmetric base (SBT_PREPASS16_AMAT). The default aligner
+    // matrix is symmetric, so gen_mat is false on the hot path and the kernel
+    // uses the original cheap SBT_PREPASS16_SYM — no perf cost when not needed.
+    const bool forced  = bsw_force_generic_matrix();
+    const bool gen_mat = bsw_generic_matrix(this->mat, this->w_match, this->w_mismatch)
+                         || forced;
+    const BswFreedCell fc = bsw_freed_cell(this->mat, this->w_match, this->w_mismatch, forced);
+    __m128i frref128  = _mm_set1_epi16(fc.ref);
+    __m128i frread128 = _mm_set1_epi16(fc.read);
+    int8_t amat_bytes[16] __attribute__((aligned(16)));
+    build_amat16(amat_bytes, this->mat);
+    __m128i amat128 = _mm_load_si128((__m128i *)amat_bytes);
+    __m128i three128 = _mm_set1_epi16(3);                    // ACGT mask (base <= 3)
+
     __m128i e_del128    = _mm_set1_epi16(this->e_del);
     __m128i oe_del128   = _mm_set1_epi16(this->o_del + this->e_del);
     __m128i e_ins128    = _mm_set1_epi16(this->e_ins);
@@ -4340,12 +4721,33 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
         tim1 = __rdtsc();
 #endif
         
-        // PR 17: 16-bit pre-pass. Same shape as the 8-bit path.
-        for (int jp = beg; jp < end; jp++) {
-            __m128i s2 = _mm_load_si128((__m128i *)(seq2SoA + jp * SIMD_WIDTH16));
-            __m128i sbt11;
-            SBT_PREPASS16(s10, s2, sbt11, mismatch128, match128, w_ambig_128, ff128);
-            _mm_store_si128((__m128i *)(sbt_buf + jp * SIMD_WIDTH16), sbt11);
+        // PR 17: 16-bit pre-pass. Same shape as the 8-bit path. The gen_mat
+        // branch is loop-invariant across the whole kernel call (once per row,
+        // perfectly predicted), so the symmetric default keeps its fast prepass.
+        if (!gen_mat) {
+            for (int jp = beg; jp < end; jp++) {
+                __m128i s2 = _mm_load_si128((__m128i *)(seq2SoA + jp * SIMD_WIDTH16));
+                __m128i sbt11;
+                SBT_PREPASS16_SYM(s10, s2, sbt11, mismatch128, match128, w_ambig_128, ff128);
+                _mm_store_si128((__m128i *)(sbt_buf + jp * SIMD_WIDTH16), sbt11);
+            }
+        } else if (fc.rank1) {
+            // Hoist the loop-invariant freed-cell row test: alt10 = (ref==fr_ref)
+            // ? fr_read : ref, computed once per row (s10 is constant across band).
+            __m128i alt10 = _mm_blendv_epi16(s10, frread128, _mm_cmpeq_epi16(s10, frref128));
+            for (int jp = beg; jp < end; jp++) {
+                __m128i s2 = _mm_load_si128((__m128i *)(seq2SoA + jp * SIMD_WIDTH16));
+                __m128i sbt11;
+                SBT_PREPASS16_RANK1(s10, s2, alt10, sbt11, mismatch128, match128, w_ambig_128, ff128);
+                _mm_store_si128((__m128i *)(sbt_buf + jp * SIMD_WIDTH16), sbt11);
+            }
+        } else {
+            for (int jp = beg; jp < end; jp++) {
+                __m128i s2 = _mm_load_si128((__m128i *)(seq2SoA + jp * SIMD_WIDTH16));
+                __m128i sbt11;
+                SBT_PREPASS16_AMAT(s10, s2, sbt11, amat128, mismatch128, w_ambig_128, ff128, three128);
+                _mm_store_si128((__m128i *)(sbt_buf + jp * SIMD_WIDTH16), sbt11);
+            }
         }
 
         j128 = _mm_set1_epi16(beg);
@@ -4633,8 +5035,8 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
 
 
 // --- PR 17/16: SSE2/NEON LUT primitive ---
-// With the asymmetric AMBIG encoding (target N=4, query N=8), the low 4 bits
-// of (s1 ^ s2) index a 16-byte pmat LUT where:
+// Symmetric (default) fast path. With the asymmetric AMBIG encoding (target
+// N=4, query N=8), the low 4 bits of (s1 ^ s2) index a 16-byte pmat LUT where:
 //   [0]     = w_match   (s1==s2, both ACGT)
 //   [1..3]  = w_mismatch (ACGT vs ACGT, XOR ∈ {1,2,3})
 //   [4..7]  = w_ambig   (target=N=4, query=ACGT)
@@ -4642,14 +5044,46 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
 //   [12]    = w_ambig   (both N)
 //   [13..15] = w_ambig   (unreachable; filled for safety)
 // Replaces 4-op cmpeq+blendv+max+blendv critical path with 1 XOR + 1
-// shuffle_epi8 (TBL on NEON). The non-LUT SBT_PREPASS8 variant was removed
-// — its max_epu8 + cmpeq AMBIG detection relied on the legacy symmetric
-// (target=N=15, query=N=15) encoding and would mis-classify under the
-// current asymmetric encoding.
-#define SBT_PREPASS8_LUT(s1, s2, sbt11_out, pmat128)                    \
+// shuffle_epi8 (TBL on NEON). The XOR index is order-insensitive, so it cannot
+// represent an asymmetric matrix — that case uses SBT_PREPASS8_AMAT below.
+#define SBT_PREPASS8_XOR(s1, s2, sbt11_out, pmat128)                    \
     {                                                                   \
         __m128i xor_ = _mm_xor_si128(s1, s2);                           \
         sbt11_out = _mm_shuffle_epi8(pmat128, xor_);                    \
+    }
+
+// D3 generic-matrix seam (gated on an asymmetric matrix; the default symmetric
+// path uses SBT_PREPASS8_XOR above and is untouched). Index the 16-byte
+// target-major LUT amat[(ref<<2)|read] (order-sensitive, unlike the symmetric
+// XOR), then mask N cells to ambig. s1 = target/ref, s2 = query/read;
+// ACGT = 0..3, N = 4 (target) / 8 (query). For a symmetric matrix amat yields
+// the same scores as the XOR pmat path; an asymmetric off-diagonal (ref-C x
+// read-T freed) is scored correctly. (s1<<2 via two add_epi8 — no byte shift in
+// SSE2/NEON; N detected by max_epu8(s1,s2) > 3.)
+#define SBT_PREPASS8_AMAT(s1, s2, sbt11_out, amat128, ambig128, three128) \
+    {                                                                   \
+        __m128i sh_  = _mm_add_epi8(s1, s1);                            \
+        sh_          = _mm_add_epi8(sh_, sh_);          /* s1 << 2 */   \
+        __m128i idx_ = _mm_or_si128(sh_, s2);           /* (ref<<2)|read */ \
+        __m128i acgt_  = _mm_shuffle_epi8(amat128, idx_);              \
+        __m128i nmax_  = _mm_max_epu8(s1, s2);                          \
+        __m128i nmask_ = _mm_cmpgt_epi8(nmax_, three128); /* N: base > 3 */ \
+        sbt11_out = _mm_or_si128(_mm_andnot_si128(nmask_, acgt_),       \
+                                 _mm_and_si128(nmask_, ambig128));      \
+    }
+
+// D3 8-bit rank-1 fast path: symmetric XOR LUT (folds match/mismatch + N) plus a
+// single freed-to-match cell override (bisulfite OT/OB). Cheaper than AMAT on the
+// fast 8-bit tier (no index build, no max/cmpgt N-mask): the XOR LUT already
+// handles N/ambig, so we only override the one freed ACGT cell to match. frref/
+// frread are the 8-bit-broadcast freed (ref,read); padding/N never equal frref.
+// rowfreed = (ref==fr_ref) hoisted per row (s1 is constant across the band loop).
+#define SBT_PREPASS8_RANK1(s1, s2, rowfreed, sbt11_out, pmat128, match128, frread128) \
+    {                                                                   \
+        __m128i xor_  = _mm_xor_si128(s1, s2);                          \
+        __m128i sbt_  = _mm_shuffle_epi8(pmat128, xor_);                \
+        __m128i freed_ = _mm_and_si128(rowfreed, _mm_cmpeq_epi8(s2, frread128)); \
+        sbt11_out = _mm_blendv_epi8(sbt_, match128, freed_);            \
     }
 
 // MAIN_CODE8_CORE runs only the cell-update half of MAIN_CODE8 using a
@@ -4968,11 +5402,23 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
     __m128i mismatch128  = _mm_set1_epi8(this->w_mismatch);
     __m128i w_ambig_128  = _mm_set1_epi8(this->w_ambig);    // ambig penalty
 
-    // PR 16: score-lookup LUT indexed by low 4 bits of (target XOR query).
-    // See SBT_PREPASS8_LUT for the layout. Built once per kernel call.
+    // D3 generic-matrix seam: the default symmetric matrix uses the cheap XOR
+    // LUT (SBT_PREPASS8_XOR, pmat128); an asymmetric matrix (bisulfite OT/OB)
+    // uses the target-major LUT amat[(ref<<2)|read] (SBT_PREPASS8_AMAT). gen_mat
+    // is false on the hot path, so symmetric scoring keeps its original speed.
+    const bool forced  = bsw_force_generic_matrix();
+    const bool gen_mat = bsw_generic_matrix(this->mat, this->w_match, this->w_mismatch)
+                         || forced;
+    const BswFreedCell fc = bsw_freed_cell(this->mat, this->w_match, this->w_mismatch, forced);
+    __m128i frref128  = _mm_set1_epi8(fc.ref);
+    __m128i frread128 = _mm_set1_epi8(fc.read);
     int8_t pmat_bytes[16] __attribute__((aligned(16)));
     build_pmat16(pmat_bytes, this->w_match, this->w_mismatch, this->w_ambig);
     __m128i pmat128 = _mm_load_si128((__m128i *)pmat_bytes);
+    int8_t amat_bytes[16] __attribute__((aligned(16)));
+    build_amat16(amat_bytes, this->mat);
+    __m128i amat128 = _mm_load_si128((__m128i *)amat_bytes);
+    __m128i three128 = _mm_set1_epi8(3);                     // N threshold (base > 3)
 
     __m128i e_del128    = _mm_set1_epi8(this->e_del);
     __m128i oe_del128   = _mm_set1_epi8(this->o_del + this->e_del);
@@ -5254,14 +5700,32 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
         
         // PR 17: pre-pass — build score vector sbt[j] for all band columns
         // once. Independent per-j, so vectorized loads/stores run at peak
-        // throughput without carrying the DP core's dep chain.
-        for (int jp = beg; jp < end; jp++) {
-            __m128i s2 = _mm_load_si128((__m128i *)(seq2SoA + jp * SIMD_WIDTH8));
-            __m128i sbt11;
-            // PR 16: LUT score build (1 xor + 1 shuffle) in place of
-            // the 4-op cmpeq+blendv+max+blendv SBT_PREPASS8.
-            SBT_PREPASS8_LUT(s10, s2, sbt11, pmat128);
-            _mm_store_si128((__m128i *)(sbt_buf + jp * SIMD_WIDTH8), sbt11);
+        // throughput without carrying the DP core's dep chain. The gen_mat
+        // branch is loop-invariant (once per row, perfectly predicted): the
+        // symmetric default keeps the PR16 XOR LUT (1 xor + 1 shuffle); an
+        // asymmetric matrix pays the heavier generic LUT only when needed.
+        if (!gen_mat) {
+            for (int jp = beg; jp < end; jp++) {
+                __m128i s2 = _mm_load_si128((__m128i *)(seq2SoA + jp * SIMD_WIDTH8));
+                __m128i sbt11;
+                SBT_PREPASS8_XOR(s10, s2, sbt11, pmat128);
+                _mm_store_si128((__m128i *)(sbt_buf + jp * SIMD_WIDTH8), sbt11);
+            }
+        } else if (fc.rank1) {
+            __m128i rowfreed = _mm_cmpeq_epi8(s10, frref128);
+            for (int jp = beg; jp < end; jp++) {
+                __m128i s2 = _mm_load_si128((__m128i *)(seq2SoA + jp * SIMD_WIDTH8));
+                __m128i sbt11;
+                SBT_PREPASS8_RANK1(s10, s2, rowfreed, sbt11, pmat128, match128, frread128);
+                _mm_store_si128((__m128i *)(sbt_buf + jp * SIMD_WIDTH8), sbt11);
+            }
+        } else {
+            for (int jp = beg; jp < end; jp++) {
+                __m128i s2 = _mm_load_si128((__m128i *)(seq2SoA + jp * SIMD_WIDTH8));
+                __m128i sbt11;
+                SBT_PREPASS8_AMAT(s10, s2, sbt11, amat128, w_ambig_128, three128);
+                _mm_store_si128((__m128i *)(sbt_buf + jp * SIMD_WIDTH8), sbt11);
+            }
         }
 
         j128 = _mm_set1_epi8(beg - i);   // diagonal offset of first band column

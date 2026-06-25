@@ -79,6 +79,22 @@ typedef struct {
 	FMI_search *fmi;
 	uint8_t *shm_base;            /* if non-NULL, the active /bwaidx-<base> mapping */
 	struct bam_writer_s *bam_writer;  /* non-NULL when opt->bam_mode is set */
+	/* D3 (--meth) ORIGINAL-reference handles, resident alongside (and distinct
+	 * from) the seed FM-index in `fmi`. The seed index (`fmi->idx->bns/pac`) is
+	 * the f/r-doubled converted reference used for candidate generation; these
+	 * are the un-converted original `.bns`/`.pac` (real chrom names, N contigs)
+	 * loaded for the future extension/scoring phase (D3 spec §5.2/§6). Both must
+	 * stay resident. NULL outside --meth (and when no original prefix resolved).
+	 * Load-only in this step — no consumer yet (extension is behind the
+	 * meth-mode checkpoint). */
+	bntseq_t *meth_orig_bns;
+	uint8_t  *meth_orig_pac;
+	/* D3 (--meth, PR-3) ORIGINAL unpacked reference (`<orig>.0123`), the
+	 * extension/dedup ref bases for the (original-coord) remapped seeds. Distinct
+	 * from `ref_string` above, which is the SEED `.0123`. Always heap-allocated
+	 * via _mm_malloc here (never shm) and _mm_free'd on teardown. NULL outside
+	 * --meth (or when no original prefix resolved). */
+	uint8_t  *meth_orig_ref_string;
 } ktp_aux_t;
 
 typedef struct {

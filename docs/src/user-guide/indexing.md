@@ -29,28 +29,45 @@ expect roughly 28 GB total across all five files.
 bwa-mem3 index --meth ref.fa
 ```
 
-Methylation mode builds a C-to-T doubled reference in addition to the standard
-FM-index files. The command writes a `ref.fa.bwameth.c2t` file (the doubled
-FASTA) and its own set of five index files with the `.bwameth.c2t` suffix:
+Methylation mode builds a **dual index**: the normal FM-index over the original
+reference (at the bare prefix), plus a converted **seed** index under the `.meth`
+prefix. The seed index is built over a per-strand-converted FASTA
+(`ref.fa.meth.fa`) whose contigs are doubled (`f`-prefixed C→T, `r`-prefixed G→A):
 
 ```text
-ref.fa.bwameth.c2t
-ref.fa.bwameth.c2t.bwt.2bit.64
-ref.fa.bwameth.c2t.0123
-ref.fa.bwameth.c2t.amb
-ref.fa.bwameth.c2t.ann
-ref.fa.bwameth.c2t.pac
+# normal index over the original reference (used for scoring/extension)
+ref.fa.0123
+ref.fa.amb
+ref.fa.ann
+ref.fa.bwt.2bit.64
+ref.fa.pac
+# converted seed index (used only for seeding)
+ref.fa.meth.fa
+ref.fa.meth.amb
+ref.fa.meth.ann
+ref.fa.meth.bwt.2bit.64
+ref.fa.meth.pac
 ```
 
-The doubled reference is roughly twice the size of the standard one. For hg38,
-allow approximately 56 GB of disk space.
-
-> **Tip — Pass the original FASTA to mem, not the c2t file**
+> **Note — the seed index has no `.0123`**
 >
-> When running `bwa-mem3 mem --meth`, pass the original FASTA path (`ref.fa`),
-> not `ref.fa.bwameth.c2t`. bwa-mem3 appends `.bwameth.c2t` automatically.
-> The auto-append is skipped only when the path already ends in `.bwameth.c2t`,
-> which is useful for external-c2t interop pipelines.
+> The seed index deliberately omits the unpacked `.meth.0123` reference. `mem
+> --meth` seeds against the seed FM-index but scores/extends against the
+> **original** reference, so it never reads the seed's unpacked bases. Skipping
+> it saves ~13 GB of disk — and ~13 GB of resident memory at run time — on hg38.
+
+The `.meth` seed FM-index is roughly twice the size of the normal FM-index (its
+contigs are doubled), so a `--meth` build is larger than a plain build but less
+than 3× (the seed `.0123` is skipped). For hg38, budget on the order of 50 GB of
+disk for the combined dual index plus the intermediate `ref.fa.meth.fa`.
+
+> **Tip — Pass the original FASTA to mem, not the seed index**
+>
+> When running `bwa-mem3 mem --meth`, pass the original FASTA path (`ref.fa`);
+> bwa-mem3 finds `ref.fa.meth.*` automatically. A legacy `ref.fa.bwameth.c2t`
+> index from an older release is **not** usable — rebuild with
+> `bwa-mem3 index --meth` (see
+> [Migrating from bwameth.py c2t](../methylation/external-c2t.md)).
 
 ## Output file locations
 

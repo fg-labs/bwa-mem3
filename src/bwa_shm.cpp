@@ -218,7 +218,7 @@ static int ctl_walk(bwa_shm_ctl_cb_t cb, void *ctx)
 
 extern "C" {
 
-int bwa_shm_compute(const char *prefix, bwa_shm_layout_t *layout)
+int bwa_shm_compute(const char *prefix, bwa_shm_layout_t *layout, bool bns_only)
 {
     if (prefix == NULL || layout == NULL) return -1;
 
@@ -315,22 +315,27 @@ int bwa_shm_compute(const char *prefix, bwa_shm_layout_t *layout)
         return -1;
     }
 
-    /* 3. Stat <prefix>.0123 for its size. */
-    char zer_path[PATH_MAX];
-    path_concat2(zer_path, prefix, ".0123");
-    struct stat zst;
-    if (stat(zer_path, &zst) != 0) {
-        fprintf(stderr, "[E::%s] stat(%s) failed: %s\n",
-                __func__, zer_path, strerror(errno));
-        bwa_shm_layout_free(layout);
-        return -1;
+    /* 3. Stat <prefix>.0123 for its size. Skipped for a bns_only (D3 --meth
+     * seed) segment: the seed `.0123` is not staged and need not exist. */
+    if (bns_only) {
+        layout->ref_string_len = 0;
+    } else {
+        char zer_path[PATH_MAX];
+        path_concat2(zer_path, prefix, ".0123");
+        struct stat zst;
+        if (stat(zer_path, &zst) != 0) {
+            fprintf(stderr, "[E::%s] stat(%s) failed: %s\n",
+                    __func__, zer_path, strerror(errno));
+            bwa_shm_layout_free(layout);
+            return -1;
+        }
+        if (zst.st_size <= 0) {
+            fprintf(stderr, "[E::%s] %s is empty\n", __func__, zer_path);
+            bwa_shm_layout_free(layout);
+            return -1;
+        }
+        layout->ref_string_len = (int64_t)zst.st_size;
     }
-    if (zst.st_size <= 0) {
-        fprintf(stderr, "[E::%s] %s is empty\n", __func__, zer_path);
-        bwa_shm_layout_free(layout);
-        return -1;
-    }
-    layout->ref_string_len = (int64_t)zst.st_size;
 
     /* 4. BNS_NAMES section size: walk anns[]. */
     int64_t bns_names_bytes = 0;
@@ -344,7 +349,9 @@ int bwa_shm_compute(const char *prefix, bwa_shm_layout_t *layout)
     int64_t bns_struct_bytes  = (int64_t)sizeof(bntseq_t);
     int64_t bns_ambs_bytes    = (int64_t)bns->n_holes * (int64_t)sizeof(bntamb1_t);
     int64_t bns_anns_bytes    = (int64_t)bns->n_seqs  * (int64_t)sizeof(bntann1_t);
-    int64_t pac_bytes         = bns->l_pac / 4 + 1;
+    /* PAC is omitted from a bns_only (D3 --meth seed) segment: `mem --meth`
+     * extends against the ORIGINAL pac, never the seed's. Zero-size section. */
+    int64_t pac_bytes         = bns_only ? 0 : (bns->l_pac / 4 + 1);
 
     /* 6. Lay out sections at 64-byte aligned offsets. */
     static const uint32_t N_SECTIONS = 10;
@@ -447,8 +454,9 @@ int bwa_shm_pack_into(const bwa_shm_layout_t *layout, uint8_t *dest)
         }
     }
 
-    /* 7. PAC: stream <prefix>.pac. */
-    {
+    /* 7. PAC: stream <prefix>.pac. Skipped for a bns_only (D3 --meth seed)
+     * segment, where the PAC section is zero-length. */
+    if (sec[8].size > 0) {
         char pac_path[PATH_MAX];
         path_concat2(pac_path, layout->prefix, ".pac");
         FILE *fp = xopen(pac_path, "rb");
@@ -456,8 +464,10 @@ int bwa_shm_pack_into(const bwa_shm_layout_t *layout, uint8_t *dest)
         err_fclose(fp);
     }
 
-    /* 8. REF_STRING: stream <prefix>.0123. */
-    {
+    /* 8. REF_STRING: stream <prefix>.0123. Skipped for a bns_only (D3 --meth
+     * seed) segment — the REF_STRING section is zero-length and the seed
+     * `.0123` need not exist on disk. */
+    if (sec[9].size > 0) {
         char zer_path[PATH_MAX];
         path_concat2(zer_path, layout->prefix, ".0123");
         FILE *fp = xopen(zer_path, "rb");
@@ -547,7 +557,7 @@ int bwa_shm_destroy(void)
     return 0;
 }
 
-int bwa_shm_stage(const char *prefix)
+int bwa_shm_stage(const char *prefix, bool bns_only)
 {
     if (prefix == NULL || prefix[0] == '\0') {
         std::fprintf(stderr, "[E::%s] empty prefix\n", __func__);
@@ -572,7 +582,7 @@ int bwa_shm_stage(const char *prefix)
 
     /* 1. Compute the layout (loads BNS; peeks scalars from the FMI file). */
     bwa_shm_layout_t layout;
-    if (bwa_shm_compute(prefix, &layout) != 0) {
+    if (bwa_shm_compute(prefix, &layout, bns_only) != 0) {
         std::fprintf(stderr, "[E::%s] failed to compute layout for '%s'\n",
                      __func__, prefix);
         return -1;
@@ -878,11 +888,11 @@ int bwa_shm_section_find(const uint8_t *base, uint32_t kind,
 
 /* Resolve the on-disk prefix for `bwa-mem3 shm --meth <idxbase>` so that
  * the registry basename matches what `bwa-mem3 mem --meth <idxbase>` will
- * later look up. Mirrors fastmap.cpp's c2t-suffix resolution: append
- * `.bwameth.c2t` unless `prefix` already ends with it. */
+ * later look up. Mirrors fastmap.cpp's D3 seed-suffix resolution: append
+ * `.meth` (the converted seed FM-index) unless `prefix` already ends with it. */
 static int resolve_meth_prefix(const char *prefix, char out[PATH_MAX])
 {
-    static const char SUFFIX[] = ".bwameth.c2t";
+    static const char SUFFIX[] = ".meth";
     static const size_t SUFLEN = sizeof(SUFFIX) - 1;
     size_t plen = std::strlen(prefix);
     int already = (plen >= SUFLEN) &&
@@ -903,9 +913,9 @@ static int resolve_meth_prefix(const char *prefix, char out[PATH_MAX])
     return 0;
 }
 
-/* If `<prefix>.0123` is absent but `<prefix>.bwameth.c2t.0123` is present,
- * the user likely meant `--meth`. Print a hint and return 1. Returns 0
- * when no hint applies (let the regular stage path produce its own error). */
+/* If `<prefix>.0123` is absent but `<prefix>.meth.0123` is present, the user
+ * likely meant `--meth`. Print a hint and return 1. Returns 0 when no hint
+ * applies (let the regular stage path produce its own error). */
 static int hint_missing_meth_flag(const char *prefix)
 {
     char zer_path[PATH_MAX];
@@ -914,13 +924,15 @@ static int hint_missing_meth_flag(const char *prefix)
     if (stat(zer_path, &st) == 0) return 0;        /* literal index present */
     if (errno != ENOENT) return 0;                 /* I/O error: defer */
 
-    char c2t_zer[PATH_MAX];
-    path_concat2(c2t_zer, prefix, ".bwameth.c2t.0123");
-    if (stat(c2t_zer, &st) != 0) return 0;         /* no meth index either */
+    /* Detect the seed index by its FM-index file: the seed `.meth.0123` is no
+     * longer built (it is never read by `mem --meth`), so probe `.meth.bwt.2bit.64`. */
+    char meth_fmi[PATH_MAX];
+    path_concat2(meth_fmi, prefix, ".meth.bwt.2bit.64");
+    if (stat(meth_fmi, &st) != 0) return 0;        /* no meth seed index either */
 
     std::fprintf(stderr,
-        "[E::main_shm] no FMI at '%s.0123' but a meth index is present at "
-        "'%s.bwameth.c2t.*'\n"
+        "[E::main_shm] no FMI at '%s.0123' but a meth seed index is present at "
+        "'%s.meth.*'\n"
         "             did you mean `bwa-mem3 shm --meth %s`?\n",
         prefix, prefix, prefix);
     return 1;
@@ -934,7 +946,7 @@ static void print_shm_usage(void)
         "  -d        destroy all indices in shared memory (matches bwa v1 behavior)\n"
         "  -l        list names of indices in shared memory\n"
         "  --meth    stage a `bwa-mem3 index --meth` index — auto-appends\n"
-        "            `.bwameth.c2t` to <idxbase>, mirroring `mem --meth`\n"
+        "            `.meth` to <idxbase>, mirroring `mem --meth`\n"
         "  -h --help print this help and exit\n\n"
         "Stage with no flags: `bwa-mem3 shm <idxbase>` loads the index into\n"
         "POSIX shared memory; subsequent `bwa-mem3 mem <idxbase> ...` runs\n"
@@ -1018,7 +1030,9 @@ int main_shm(int argc, char *argv[])
         } else if (hint_missing_meth_flag(user_prefix)) {
             return 1;
         }
-        if (bwa_shm_stage(user_prefix) < 0) {
+        /* --meth stages a SEED-only segment: omit PAC + REF_STRING (.0123),
+         * which `mem --meth` never reads. Saves ~14.5 GB of shm on hg38. */
+        if (bwa_shm_stage(user_prefix, /*bns_only=*/meth != 0) < 0) {
             std::fprintf(stderr,
                 "[E::%s] failed to stage '%s' in shared memory\n",
                 __func__, user_prefix);

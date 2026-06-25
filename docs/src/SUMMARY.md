@@ -53,7 +53,7 @@
 - [SAM tags: XR, XG, XM](methylation/tags.md)
 - [Chimera QC and header rewriting](methylation/post-processing.md)
 - [Flags: --set-as-failed, --chimera-qc](methylation/flags.md)
-- [Interop with external bwameth.py c2t](methylation/external-c2t.md)
+- [Migrating from bwameth.py c2t](methylation/external-c2t.md)
 
 # What's Different from bwa-mem2
 

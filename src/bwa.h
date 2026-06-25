@@ -66,6 +66,25 @@ typedef struct {
 	void **bams;
 	int    n_bams;
 	int    cap_bams;
+	/* --meth (D3) only: the ORIGINAL, unconverted read bases captured at
+	 * ingest *before* the in-place C->T (R1) / G->A (R2) projection
+	 * overwrites `seq`. NUL-terminated ASCII, length `l_seq`. NULL for
+	 * non-meth reads (no behavior change).
+	 *
+	 * This is a first-class copy of what is otherwise only preserved as the
+	 * `YS:Z:` comment string, so the D3 extension/scoring (PR-4) and the
+	 * SAM/XM writers (PR-5) can read the original bases without parsing a
+	 * comment in the hot path.
+	 *
+	 * ORIENTATION CONTRACT (spec S1): stored in the SAME orientation/order as
+	 * `seq` at ingest — i.e. original read order, exactly as it came off the
+	 * sequencer. It is NOT pre-reverse-complemented. Every downstream consumer
+	 * MUST apply the SAME reverse-complement to `meth_orig_seq` that it applies
+	 * to `seq`/the projected read — notably the extension/scoring path and
+	 * `mem_matesw` (which reverse-complements the mate before rescue), and the
+	 * SAM/XM emitters. Storing `seq` projected-forward while CIGAR/MD describe
+	 * the original (or vice versa) yields an internally inconsistent BAM. */
+	char  *meth_orig_seq;
 } bseq1_t;
 
 extern int bwa_verbose;
@@ -97,7 +116,15 @@ extern "C" {
 							 int64_t rb, int64_t re, int *score,
 							 int *n_cigar, int *NM);
 
-	int bwa_idx_build(const char *fa, const char *prefix);
+	/* emit_unpacked_ref=0 skips writing `<prefix>.0123` (D3 --meth seed index —
+	 * never extended against, so the unpacked seed ref is dead weight). `int`
+	 * (not bool) and a C++-only default keep this declaration valid C: bwa.h is
+	 * inside extern "C" and is transitively included by fast_reader_bseq.c. */
+#ifdef __cplusplus
+	int bwa_idx_build(const char *fa, const char *prefix, int emit_unpacked_ref = 1);
+#else
+	int bwa_idx_build(const char *fa, const char *prefix, int emit_unpacked_ref);
+#endif
 
 	char *bwa_idx_infer_prefix(const char *hint);
 	bwt_t *bwa_idx_load_bwt(const char *hint);

@@ -1,21 +1,19 @@
-// Shared test fixture for tests that need a loaded meth_orig_ref_t. Builds
-// an in-memory doubled-c2t bns + pac (matching what bwa-mem3 index --meth
-// produces) from a forward-strand sequence, then constructs a cmap and
-// calls meth_orig_ref_load. Same code path the production runtime uses.
+// Shared test fixture for tests that need an ORIGINAL (un-converted) bns + pac
+// — the same handles the D3 (PR-5) runtime loads via
+// meth_orig_ref_load_handles (bns_restore + slurped 2-bit pac). Builds them
+// in memory from a forward-strand sequence (one contig), storing the bases
+// un-converted (no c2t fold) so meth_build_xm can decode forward-genome
+// bases inline. Same code path the production runtime exercises.
 
 #ifndef BWAMEM3_TEST_METH_ORIG_REF_FIXTURE_H
 #define BWAMEM3_TEST_METH_ORIG_REF_FIXTURE_H
 
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <string>
 #include <vector>
 
 #include "bntseq.h"
-#include "meth_bam.h"
-#include "meth_orig_ref.h"
 
 namespace meth_test {
 
@@ -33,82 +31,62 @@ inline void pac_pack_set(uint8_t *pac, int64_t i, uint8_t v) {
     pac[i >> 2] |= (uint8_t)(v << ((~i & 3) << 1));
 }
 
-/* RAII fixture that owns:
- *   - a doubled-c2t bns (one chrom, contigs r-X then f-X)
- *   - a packed c2t pac (G->A on r-X, C->T on f-X)
- *   - the cmap built from the doubled bns
- *   - a meth_orig_ref_t loaded against bns + pac + cmap
+/* RAII fixture that owns an original (un-converted) single-contig bns + pac:
+ *   - bns: one contig "X" of length len at offset 0
+ *   - pac: the forward sequence packed 2-bit, un-converted
+ *   - ambs: one 1-bp 'N' interval per 'N' in the input
  *
- * Construct from a forward-strand sequence (one chrom). Test code uses
- * .orig (the loaded handle) and .real_tid (always 0) for slice calls. */
+ * Construct from a forward-strand sequence (one contig). Test code uses
+ * .orig_bns / .orig_pac (the loaded handles) and .real_tid (always 0). */
 struct OrigRefFixture {
     bntseq_t                  bns{};
-    std::vector<bntann1_t>    anns;
+    bntann1_t                 ann{};
     std::vector<bntamb1_t>    ambs;
-    std::vector<std::string>  name_storage;
+    std::string               name_storage = "X";
     std::vector<uint8_t>      pac;
-    meth_chrom_map_t         *cmap = nullptr;
-    meth_orig_ref_t          *orig = nullptr;
+    bntseq_t                 *orig_bns = nullptr;
+    uint8_t                  *orig_pac = nullptr;
     int                       real_tid = 0;
 
     explicit OrigRefFixture(const std::string &forward_seq) {
         const int len = (int)forward_seq.size();
-        bns.l_pac = (int64_t)len * 2;
-        bns.n_seqs = 2;
-        anns.resize(2);
-        name_storage = {"rX", "fX"};
-        for (int i = 0; i < 2; ++i) {
-            anns[i] = bntann1_t{};
-            anns[i].offset = (int64_t)i * len;
-            anns[i].len    = len;
-            anns[i].name   = const_cast<char *>(name_storage[i].c_str());
-            anns[i].anno   = const_cast<char *>("");
-        }
-        bns.anns = anns.data();
+        bns.l_pac  = (int64_t)len;
+        bns.n_seqs = 1;
 
-        /* ambs: any 'N' in the input marks a 1-bp interval on BOTH halves
-         * of the doubled pac (matching what bwa-mem3 index --meth produces).
-         * bns_iter_ambi binary-searches bns->ambs assuming non-decreasing
-         * offset+len, so emit all r-X intervals (offsets 0..len-1) before
-         * any f-X interval (offsets len..2*len-1) to preserve that order. */
-        for (int half = 0; half < 2; ++half) {
-            for (int i = 0; i < len; ++i) {
-                if (forward_seq[i] != 'N') continue;
-                bntamb1_t a;
-                a.offset = anns[half].offset + i;
-                a.len = 1;
-                a.amb = 'N';
-                ambs.push_back(a);
-            }
+        ann.offset = 0;
+        ann.len    = len;
+        ann.n_ambs = 0;
+        ann.name   = const_cast<char *>(name_storage.c_str());
+        ann.anno   = const_cast<char *>("");
+        bns.anns   = &ann;
+
+        /* ambs: any 'N' in the input marks a 1-bp interval. bns_iter_ambi
+         * binary-searches bns->ambs assuming non-decreasing offset+len, which
+         * is satisfied by emitting them in input order. */
+        for (int i = 0; i < len; ++i) {
+            if (forward_seq[i] != 'N') continue;
+            bntamb1_t a{};
+            a.offset = i;
+            a.len    = 1;
+            a.amb    = 'N';
+            ambs.push_back(a);
+            ++ann.n_ambs;
         }
-        bns.ambs = ambs.data();
+        bns.ambs    = ambs.data();
         bns.n_holes = (int)ambs.size();
 
-        const int pac_bytes = ((int)bns.l_pac + 3) / 4;
+        const int pac_bytes = (len + 3) / 4;
         pac.assign(pac_bytes, 0);
-        /* r-X: G->A applied to the forward strand. */
+        /* Un-converted: store the forward sequence as-is (no c2t / g2a fold). */
         for (int i = 0; i < len; ++i) {
-            char b = forward_seq[i];
-            char projected = (b == 'G') ? 'A' : b;
-            pac_pack_set(pac.data(), anns[0].offset + i, base_to_2bit(projected));
-        }
-        /* f-X: C->T applied to the forward strand. */
-        for (int i = 0; i < len; ++i) {
-            char b = forward_seq[i];
-            char projected = (b == 'C') ? 'T' : b;
-            pac_pack_set(pac.data(), anns[1].offset + i, base_to_2bit(projected));
+            pac_pack_set(pac.data(), i, base_to_2bit(forward_seq[i]));
         }
 
-        cmap = meth_chrom_map_build_from_bns(&bns);
-        if (cmap == nullptr) std::abort();
-        orig = meth_orig_ref_load(&bns, pac.data(), cmap);
-        if (orig == nullptr) std::abort();
+        orig_bns = &bns;
+        orig_pac = pac.data();
     }
 
-    ~OrigRefFixture() {
-        if (orig) meth_orig_ref_free(orig);
-        if (cmap) meth_chrom_map_free(cmap);
-    }
+    ~OrigRefFixture() = default;
 
     OrigRefFixture(const OrigRefFixture &) = delete;
     OrigRefFixture &operator=(const OrigRefFixture &) = delete;

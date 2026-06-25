@@ -197,13 +197,18 @@ int libsais_build_fm_index(const char* prefix, int64_t pac_len,
 
     PackedText pac(doubled_pac.c_str(), N);
 
-    if (emit_0123(pac, prefix, T) != 0)
-        err_fatal(__func__, "emit_0123 failed");
+    /* D3 --meth seed index passes emit_unpacked_ref=false: the seed `.0123` is
+     * never read at runtime (extension uses the original reference), so skip
+     * the ~13 GB write. The FM build below uses `pac`, not the `.0123` file. */
+    if (opts.emit_unpacked_ref) {
+        if (emit_0123(pac, prefix, T) != 0)
+            err_fatal(__func__, "emit_0123 failed");
+    }
 
     int64_t count[5] = {0};
     compute_counts(pac, count, T);
-    std::fprintf(stderr, "[libsais_build] phase 0 (doubled-pac + .0123 + count) %.2fs\n",
-            elapsed_since(t0));
+    std::fprintf(stderr, "[libsais_build] phase 0 (doubled-pac%s + count) %.2fs\n",
+            opts.emit_unpacked_ref ? " + .0123" : "", elapsed_since(t0));
 
     // Phase 1: unpack .pac into a libsais-ready byte buffer. Alphabet is
     // {0=$, 1..4=ACGT}; the trailing 0 at index N is the GSA terminator.

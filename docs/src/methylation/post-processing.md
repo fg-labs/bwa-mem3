@@ -7,7 +7,7 @@ pass over the aligned records.
 
 ## `@SQ` header consolidation
 
-The doubled reference (`ref.fa.bwameth.c2t`) contains two contigs for each
+The `.meth` seed reference (`ref.fa.meth.fa`) contains two contigs for each
 chromosome:
 
 - `fchr1`, `fchr2`, … — C→T projections of each chromosome.

@@ -74,6 +74,13 @@ typedef struct __smem_i smem_i;
 #define MEM_F_XB        0x2000
 
 
+/* D3 (--meth): bisulfite substitution-matrix mode, selected by --meth-scoring.
+ * COLLAPSED (default) frees BOTH conversion directions so C/T (and G/A) are
+ * interchangeable — reproduces bwameth's collapsed 3-letter placement (a
+ * drop-in). GENOMIC frees only the bisulfite conversion direction, keeping the
+ * mirror cell a real mismatch — variant-aware, truthful NM/MD. */
+enum mem_meth_scoring { MEM_METH_SCORING_COLLAPSED = 0, MEM_METH_SCORING_GENOMIC = 1 };
+
 typedef struct mem_opt_t {
     int a, b;               // match score and mismatch penalty
     int o_del, e_del;
@@ -107,9 +114,24 @@ typedef struct mem_opt_t {
     int max_matesw;         // perform maximally max_matesw rounds of mate-SW for each end
     int max_XA_hits, max_XA_hits_alt; // if there are max_hits or fewer, output them all
     int8_t mat[25];         // scoring matrix; mat[0] == 0 if unset
+    /* D3 (--meth): per-hypothesis substitution matrices, built from `mat` by
+     * mem_opt_fill_meth_mat() per opt->meth_scoring (target-major mat[ref*5+read],
+     * ACGT order A,C,G,T,N). Each frees the bisulfite conversion cell to a MATCH
+     * (+a): mat_ot frees mat[C][T]=mat[1*5+3] (top strand C→T), mat_ob frees
+     * mat[G][A]=mat[2*5+0] (bottom strand G→A).
+     *   GENOMIC: ONLY that cell is freed; the mirror (mat[T][C], mat[A][G]) STAYS
+     *     at −b so genuine variants score as mismatches → one freed cell ⇒ the
+     *     SIMD rank-1 fast path. Variant-aware, truthful NM/MD.
+     *   COLLAPSED: the mirror cell is ALSO freed (two cells) so C/T and G/A are
+     *     interchangeable → reproduces bwameth; uses bandedSWA's general path.
+     * Outside --meth these are unused; selection is by mem_chain_t.meth_hypothesis
+     * (1 = OT, 0 = OB) via mem_opt_meth_mat(). */
+    int8_t mat_ot[25];      // OT (C→T) meth matrix; valid only under --meth
+    int8_t mat_ob[25];      // OB (G→A) meth matrix; valid only under --meth
     int    bam_mode;        // 1 = emit BAM instead of SAM text (--bam); meth_mode implies this
     int    bam_level;       // 0..9, BGZF deflate level (0 = uncompressed)
     int    meth_mode;       // 1 = bisulfite mode (--meth); implies bam_mode
+    int    meth_scoring;    // bisulfite matrix mode (--meth-scoring): MEM_METH_SCORING_{COLLAPSED,GENOMIC}
     char   meth_set_as_failed;// 'f', 'r', or 0 — flag reads on that strand 0x200
     int    meth_chimera_qc; // 1 to enable bwameth.py-style longest-M <44% chimera heuristic (default off; not in Bismark)
     int    supp_rep_hard_cap; // supp alnregs whose chain's seeds share >=this many genome hits are forced to MAPQ=0; 0 disables
@@ -140,6 +162,18 @@ typedef struct {
     float frac_rep;
     int64_t pos;
     mem_seed_t *seeds;
+    /* D3 (--meth, PR-3): per-chain bisulfite hypothesis label, carried from the
+     * seed→original remap so PR-4 can pick the asymmetric OT/OB matrix. Encoding
+     * matches the seed contig parity (seed_rid & 1): 1 = OT (C→T, odd "f" seed
+     * contig), 0 = OB (G→A, even "r" seed contig). -1 = not a meth chain
+     * (non-meth runs leave this at -1). For directional libraries (the --meth
+     * contract) each read is projected under a SINGLE hypothesis (R1→OT, R2→OB),
+     * so all of a read's seeds carry the same label and no cross-hypothesis merge
+     * can occur; test_and_merge is therefore NOT hypothesis-guarded.
+     * NOTE (--meth directional invariant): if non-directional / dual-hypothesis-
+     * per-read support is ever added, test_and_merge MUST gain a hypothesis guard
+     * (it is currently safe only because each read is single-hypothesis). */
+    int8_t meth_hypothesis;
 } mem_chain_t;
 
 typedef struct { size_t n, m, cc; mem_chain_t *a;  } mem_chain_v;
@@ -166,6 +200,20 @@ typedef struct mem_alnreg_t {
     float frac_rep;
     uint64_t hash;
     int flg;
+    /* D3 (--meth, PR-3): bisulfite hypothesis (1=OT, 0=OB, -1=non-meth),
+     * propagated from the originating chain so PR-4's asymmetric extension and
+     * the output (XG strand) layers can select the right matrix/strand. */
+    int8_t meth_hypothesis;
+    /* D3 (--meth, fix): STRAND-ADJUSTED extension hypothesis = meth_hypothesis
+     * XOR is_rev. bwa-mem extends reverse-strand seeds against the reverse-
+     * complemented reference window, so a conversion that the OT matrix frees
+     * (ref-C x read-T) presents as the OB-freed cell (ref-G x read-A) there, and
+     * vice-versa. Extension/regen MUST select the matrix from THIS field, not the
+     * raw hypothesis, or reverse-strand reads (the bulk of PE) get the wrong
+     * matrix, their real conversions are scored as mismatches, and the 5' end
+     * soft-clips. Set at alnreg creation from the seed strand; -1 = non-meth.
+     * (Output XG/XM still use the raw meth_hypothesis — the genome strand.) */
+    int8_t meth_strand_hyp;
 } mem_alnreg_t;
 
 typedef struct { size_t n, m; mem_alnreg_t *a; } mem_alnreg_v;
@@ -187,6 +235,11 @@ typedef struct { // This struct is only used for the convenience of API.
     int HN;          // total # of hits clustered with this primary under XA_drop_ratio; -1 when not computed (e.g., MEM_F_ALL)
 
     int score, sub, alt_sc;
+    /* D3 (--meth, PR-5): bisulfite hypothesis (1=OT, 0=OB, -1=non-meth),
+     * copied from the source mem_alnreg_t in mem_reg2aln. The output layer
+     * (meth_mem_aln_to_bam) sources the XG strand tag and the XM source
+     * strand from THIS, not from the (now retired) f/r contig direction. */
+    int8_t meth_hypothesis;
 } mem_aln_t;
 
 // struct
@@ -264,7 +317,47 @@ typedef struct worker_t {
     int16_t           nthreads;
     int32_t           nreads;
     FMI_search       *fmi;
+    /* D3 (--meth, PR-3) coordinate cutover. The seed FM-index in `fmi` lives in
+     * f/r-doubled SEED coordinates and is used ONLY for candidate generation;
+     * every downstream consumer (chaining merge tests, extension ref fetch,
+     * pairing/insert-size, mate rescue, output) must run in ORIGINAL-reference
+     * coordinates. These handles are the original (un-converted) bns/pac and the
+     * original unpacked `.0123` ref_string; seed hits are remapped into the
+     * original-doubled-pac space in mem_chain_seeds before chaining, after which
+     * these (NOT fmi->idx->bns/pac) are the bns/pac/ref_string the rest of the
+     * pipeline uses. NULL outside --meth. */
+    const bntseq_t   *meth_orig_bns;
+    const uint8_t    *meth_orig_pac;
+    uint8_t          *meth_orig_ref_string;
 } worker_t;
+
+/* D3 (--meth, PR-3) helpers. In --meth, this returns the ORIGINAL bns/pac/
+ * ref_string the chaining/extension/pairing/output layers must use; outside
+ * --meth it returns the single seed/normal index handles. Centralizes the
+ * "which coordinate space" decision so every consumer is converted in one place
+ * (the coordinate-cutover audit, B4). */
+static inline const bntseq_t *mem_aln_bns(const worker_t *w) {
+    return (w->opt->meth_mode && w->meth_orig_bns != NULL)
+           ? w->meth_orig_bns : w->fmi->idx->bns;
+}
+static inline const uint8_t *mem_aln_pac(const worker_t *w) {
+    return (w->opt->meth_mode && w->meth_orig_pac != NULL)
+           ? w->meth_orig_pac : w->fmi->idx->pac;
+}
+static inline uint8_t *mem_aln_ref_string(const worker_t *w) {
+    return (w->opt->meth_mode && w->meth_orig_ref_string != NULL)
+           ? w->meth_orig_ref_string : w->ref_string;
+}
+
+/* D3 (--meth, PR-4): select the substitution matrix for an extension by the
+ * per-chain/per-alnreg OT/OB hypothesis. Outside --meth (or hypothesis < 0,
+ * i.e. a non-meth chain) this returns the symmetric `opt->mat` unchanged so the
+ * non-meth path is byte-for-byte identical. hypothesis: 1 = OT (mat_ot, frees
+ * C→T), 0 = OB (mat_ob, frees G→A). See mem_opt_t::mat_ot/mat_ob. */
+static inline const int8_t *mem_opt_meth_mat(const mem_opt_t *opt, int meth_hypothesis) {
+    if (!opt->meth_mode || meth_hypothesis < 0) return opt->mat;
+    return (meth_hypothesis & 1) ? opt->mat_ot : opt->mat_ob;
+}
 
 
 typedef kvec_t(int) int_v;
@@ -277,6 +370,10 @@ const bwtintv_v *smem_next(smem_i *itr);
 
 mem_opt_t *mem_opt_init(void);
 void mem_fill_scmat(int a, int b, int8_t mat[25]);
+/* (Re)derive the --meth per-hypothesis matrices (mat_ot/mat_ob) from opt->mat +
+ * opt->a. Call after any rebuild of opt->mat (e.g. CLI -A/-B/-x parsing) so meth
+ * scoring tracks the user's options instead of the init-time defaults. */
+void mem_opt_fill_meth_mat(mem_opt_t *opt);
 
 // Skip-short-seed extension filter: drop seeds shorter than min_ext_len from a
 // chain in place (stable; surviving seeds keep their order). Returns the new
@@ -308,12 +405,21 @@ int mem_kernel1_core(FMI_search *fmi, const mem_opt_t *opt,
                      mem_seed_t *seedBuf,
                      int64_t seedBufSize,
                      mem_cache *mmc,
-                     int tid);
+                     int tid,
+                     /* D3 (--meth, PR-3): ORIGINAL bns/pac remap target +
+                      * filtering ref. NULL outside --meth → legacy behavior. */
+                     const bntseq_t *meth_orig_bns = NULL,
+                     const uint8_t  *meth_orig_pac = NULL);
 
 int mem_kernel2_core(FMI_search *fmi, const mem_opt_t *opt,
                      bseq1_t *seq_, mem_alnreg_v *regs, int nseq,
                      mem_chain_v *chain_ar, mem_cache *mmc,
-                     uint8_t *ref_string, int tid);
+                     uint8_t *ref_string, int tid,
+                     /* D3 (--meth, PR-3): ORIGINAL bns/pac for extension/dedup.
+                      * NULL outside --meth → legacy behavior. ref_string above
+                      * is already the original .0123 in --meth (see worker_aln). */
+                     const bntseq_t *meth_orig_bns = NULL,
+                     const uint8_t  *meth_orig_pac = NULL);
 
 void* _mm_realloc(void *ptr, int64_t csize, int64_t nsize, int16_t dsize);
 
@@ -355,7 +461,8 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                           const uint8_t *pac, const mem_pestat_t pes[4],
                           const mem_alnreg_t *a, int l_ms, const uint8_t *ms,
                           mem_alnreg_v *ma, kswr_t **myaln, int32_t gcnt,
-                          int32_t *gar, mem_cache *mmc);
+                          int32_t *gar, mem_cache *mmc, const char *ms_orig = NULL,
+                          const int8_t *mat = NULL);
 
 int mem_sam_pe(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
                const mem_pestat_t pes[4], uint64_t id, bseq1_t s[2],
@@ -425,8 +532,16 @@ void mem_process_seqs(mem_opt_t *opt, int64_t n_processed,
  *
  * @return       CIGAR, strand, mapping quality and forward-strand position
  */
+/* D3 (--meth, PR-5): `meth_orig_query` is the read's ORIGINAL (un-projected)
+ * bases (bseq1_t.meth_orig_seq), same orientation/order as `seq`. When non-NULL
+ * under --meth, the final CIGAR/NM/MD regen runs the ORIGINAL read against the
+ * ORIGINAL reference with the per-hypothesis asymmetric matrix
+ * (mem_opt_meth_mat(opt, ar->meth_hypothesis)) so output is native-alphabet.
+ * NULL (the default) preserves the legacy symmetric `seq`-vs-ref regen exactly
+ * for the non-meth path. */
 mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
-                      int l_seq, const char *seq, const mem_alnreg_t *ar);
+                      int l_seq, const char *seq, const mem_alnreg_t *ar,
+                      const char *meth_orig_query = NULL);
 
 
 /**

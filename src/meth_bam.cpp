@@ -8,7 +8,6 @@
 #include "meth_bam.h"
 #include "bam_writer.h"
 #include "cigar_util.h"
-#include "meth_orig_ref.h"
 #include "meth_xm.h"
 #include "version.h"
 
@@ -18,81 +17,14 @@
 
 /* Private writer struct — opaque to callers via meth_bam.h. */
 struct meth_bam_writer_s {
-    htsFile          *fp;
-    sam_hdr_t        *hdr;
-    meth_chrom_map_t *cmap; /* non-owning */
+    htsFile   *fp;
+    sam_hdr_t *hdr;
 };
 
 /* Declared in src/bwa.h (without extern "C"); match that linkage here. */
 extern char bwa_rg_id[256];
 
 meth_bam_writer_t *g_meth_bam_writer = NULL;
-/* g_meth_cmap lives in bwamem.cpp (so the worker hook can reach it without
- * a link dependency on meth_bam.cpp; both files see the header). */
-
-/* ------------------------------------------------------------------- */
-/* Chrom map                                                            */
-/* ------------------------------------------------------------------- */
-
-meth_chrom_map_t *meth_chrom_map_build_from_bns(const bntseq_t *bns)
-{
-    if (bns == NULL) return NULL;
-    meth_chrom_map_t *m = (meth_chrom_map_t *)calloc(1, sizeof(*m));
-    if (m == NULL) return NULL;
-    m->n_internal = bns->n_seqs;
-    if (m->n_internal > 0) {
-        m->out_tid      = (int *)    calloc((size_t)m->n_internal, sizeof(int));
-        m->direction    = (char *)   calloc((size_t)m->n_internal, sizeof(char));
-        m->output_names = (char **)  calloc((size_t)m->n_internal, sizeof(char *));
-        m->output_lens  = (int64_t *)calloc((size_t)m->n_internal, sizeof(int64_t));
-        if (!m->out_tid || !m->direction
-                || !m->output_names || !m->output_lens) {
-            meth_chrom_map_free(m);
-            return NULL;
-        }
-    }
-
-    for (int i = 0; i < m->n_internal; ++i) {
-        const char *name = bns->anns[i].name;
-        char prefix = name[0];
-        const char *stripped = name;
-        char dir = 0;
-        if (prefix == 'f' || prefix == 'r') {
-            stripped = name + 1;
-            dir = prefix;
-        }
-        m->direction[i] = dir;
-
-        int existing = -1;
-        for (int j = 0; j < m->n_output; ++j) {
-            if (strcmp(m->output_names[j], stripped) == 0) { existing = j; break; }
-        }
-        if (existing >= 0) {
-            m->out_tid[i] = existing;
-        } else {
-            int idx = m->n_output++;
-            m->output_names[idx] = strdup(stripped);
-            if (m->output_names[idx] == NULL) { meth_chrom_map_free(m); return NULL; }
-            m->output_lens[idx] = bns->anns[i].len;
-            m->out_tid[i] = idx;
-        }
-    }
-
-    return m;
-}
-
-void meth_chrom_map_free(meth_chrom_map_t *m)
-{
-    if (m == NULL) return;
-    free(m->out_tid);
-    free(m->direction);
-    if (m->output_names != NULL) {
-        for (int i = 0; i < m->n_output; ++i) free(m->output_names[i]);
-        free(m->output_names);
-    }
-    free(m->output_lens);
-    free(m);
-}
 
 /* ------------------------------------------------------------------- */
 /* BAM writer                                                           */
@@ -219,17 +151,16 @@ static void meth_append_passthrough_records(const char *hdr_text, kstring_t *out
 }
 
 meth_bam_writer_t *meth_bam_writer_open(const char *path_or_dash,
-                                        meth_chrom_map_t *cmap,
+                                        const bntseq_t *bns,
                                         const char *bwa_pg,
                                         const char *meth_pg_cl,
                                         const char *hdr_line,
                                         const char *orig_idx_hdr_lines,
                                         int compression_level)
 {
-    if (path_or_dash == NULL || cmap == NULL) return NULL;
+    if (path_or_dash == NULL || bns == NULL) return NULL;
     meth_bam_writer_t *w = (meth_bam_writer_t *)calloc(1, sizeof(*w));
     if (w == NULL) return NULL;
-    w->cmap = cmap;
 
     if (compression_level < 0) compression_level = 0;
     if (compression_level > 9) compression_level = 9;
@@ -246,19 +177,17 @@ meth_bam_writer_t *meth_bam_writer_open(const char *path_or_dash,
     if (!hdr_text_has_type(hdr_line, "@HD\t") &&
         sam_hdr_add_line(w->hdr, "HD", "VN", "1.6", "SO", "unsorted", NULL) < 0) goto fail;
 
-    /* @SQ from the consolidated chrom map, enriched by SN with the original
-     * reference's identity tags (M5/UR/AS/SP) from its .hdr/.dict sidecar when
-     * available. SN/LN come from the cmap (authoritative for --meth); the
-     * extra tags are appended verbatim. The consolidated output SN/LN equal
-     * the original reference's contig SN/LN (the c2t build only doubles into
-     * f/r-prefixed contigs and C->T conversion is length-preserving), so the
-     * original sidecar's @SQ matches by SN. */
-    for (int i = 0; i < cmap->n_output; ++i) {
+    /* @SQ directly from the ORIGINAL (un-converted) bns contigs (D3 PR-5: no
+     * f/r consolidation — alignments already carry original rids). Each @SQ is
+     * enriched by SN with the original reference's identity tags (M5/UR/AS/SP)
+     * from its .hdr/.dict sidecar when available; the extra tags are appended
+     * verbatim, gated on a matching SN+LN. */
+    for (int i = 0; i < bns->n_seqs; ++i) {
         kstring_t sq = {0, 0, NULL};
         ksprintf(&sq, "@SQ\tSN:%s\tLN:%lld",
-                 cmap->output_names[i], (long long)cmap->output_lens[i]);
-        meth_append_sq_extra_tags(orig_idx_hdr_lines, cmap->output_names[i],
-                                  cmap->output_lens[i], &sq);
+                 bns->anns[i].name, (long long)bns->anns[i].len);
+        meth_append_sq_extra_tags(orig_idx_hdr_lines, bns->anns[i].name,
+                                  bns->anns[i].len, &sq);
         int rc = (sq.s != NULL) ? sam_hdr_add_lines(w->hdr, sq.s, sq.l) : -1;
         free(sq.s);
         if (rc < 0) goto fail;
@@ -351,12 +280,13 @@ static constexpr int MIN_LONGEST_M_PCT = 44;
 
 int meth_mem_aln_to_bam(bam1_t *b,
                         const mem_opt_t *opt, const bntseq_t *bns,
+                        const uint8_t *pac,
                         const bseq1_t *s, int n_alns,
                         const mem_aln_t *list, int which,
-                        const mem_aln_t *m_,
-                        const meth_chrom_map_t *cmap)
+                        const mem_aln_t *m_)
 {
-    if (b == NULL || opt == NULL || s == NULL || list == NULL || cmap == NULL) return -1;
+    if (b == NULL || opt == NULL || s == NULL || list == NULL
+            || bns == NULL || pac == NULL) return -1;
 
     /* Local copies so flag/rid can be mutated without touching the caller's. */
     mem_aln_t p = list[which];
@@ -379,17 +309,18 @@ int meth_mem_aln_to_bam(bam1_t *b,
     /* Fold bwa-mem3's high-bit supp flag (0x10000) down into BAM's 0x100. */
     uint16_t flag16 = (uint16_t)((p.flag & 0xffff) | (p.flag & 0x10000 ? 0x100 : 0));
 
-    /* Direction (YD:Z source) comes from the chrom name prefix ('f'/'r')
-     * written by `bwa-mem3 index --meth`. */
-    int32_t tid = -1, mtid = -1;
+    /* D3 (PR-5): RNAME/POS are already in ORIGINAL-reference coordinates after
+     * the PR-3 seed→original remap, so RNAME = p.rid directly (no f/r→chrom
+     * map). The genome-strand call ('f'=OT/top, 'r'=OB/bottom) is sourced from
+     * the winning hypothesis (p.meth_hypothesis: 1=OT, 0=OB), NOT from a contig
+     * name prefix. `direction` is retained as the legacy 'f'/'r' char only so
+     * the XG:Z text and the opt->meth_set_as_failed strand filter keep their
+     * existing encoding. */
+    int32_t tid = (p.rid >= 0 && p.rid < bns->n_seqs) ? p.rid : -1;
+    int32_t mtid = (mp && mp->rid >= 0 && mp->rid < bns->n_seqs) ? mp->rid : -1;
     char direction = 0;
-    if (p.rid >= 0 && p.rid < cmap->n_internal) {
-        tid       = cmap->out_tid[p.rid];
-        direction = cmap->direction[p.rid];
-    }
-    if (mp && mp->rid >= 0 && mp->rid < cmap->n_internal) {
-        mtid = cmap->out_tid[mp->rid];
-    }
+    if (tid >= 0 && p.meth_hypothesis >= 0)
+        direction = (p.meth_hypothesis & 1) ? 'f' : 'r';
 
     /* Remap primary CIGAR: bwa-mem3 ops -> BAM ops, + soft->hard for supp */
     uint32_t *bam_cigar = NULL;
@@ -439,11 +370,13 @@ int meth_mem_aln_to_bam(bam1_t *b,
         }
     }
 
-    /* Restore pre-c2t bases from YS:Z so MethylDackel sees real C/Ts.
-     * FASTQ ingest (fastmap.cpp meth_mode block) builds comments as
+    /* Restore pre-c2t bases so MethylDackel sees real C/Ts. CodeRabbit: prefer
+     * the first-class meth_orig_seq field (native-alphabet output no longer
+     * depends on comment preservation); fall back to the YS:Z comment only when
+     * meth_orig_seq is unavailable. FASTQ ingest builds comments as
      * "YS:Z:<l_seq bytes>\tYC:Z:XX" starting at offset 0 — rely on that. */
-    const char *orig_seq = NULL;
-    if (s->comment && s->l_seq > 0
+    const char *orig_seq = s->meth_orig_seq;
+    if (orig_seq == NULL && s->comment && s->l_seq > 0
         && s->comment[0] == 'Y' && s->comment[1] == 'S' && s->comment[2] == ':') {
         orig_seq = s->comment + 5;
     }
@@ -516,14 +449,20 @@ int meth_mem_aln_to_bam(bam1_t *b,
      * appending after the bam_set1 call below — bam_aux_append needs the
      * record to be initialized first.
      *
-     * is_top_strand keys off `direction` (the cmap f/r tag = XG:Z), NOT
-     * the SAM 0x10 RC flag: methylation is on the top strand when the
-     * fragment was OT (any read mapped to f-contig, including CTOT
-     * is_rev=1 R2s) and on the bottom strand when the fragment was OB. */
+     * D3 (PR-5): is_top_strand keys off the winning hypothesis (= XG:Z), NOT
+     * the SAM 0x10 RC flag: methylation is on the top strand for OT
+     * (p.meth_hypothesis==1, any read including CTOT is_rev=1 R2s) and on the
+     * bottom strand for OB. The XM ref source is the ORIGINAL bns/pac (tid is
+     * the original rid); meth_build_xm reads the original read-C-vs-T at ref-C
+     * from `seq_text`, which is restored from meth_orig_seq above. */
     char *xm = NULL;
     if (mapped && seq_text != NULL && bam_cigar != NULL && l_emit > 0) {
-        int is_top_strand = (direction == 'f') ? 1 : 0;
-        xm = meth_build_xm(g_meth_orig_ref, tid, (int64_t)p.pos,
+        /* Match the XG `direction` guard at line ~322: a -1 hypothesis maps to
+         * XG:Z:GA (bottom strand), so treat it as bottom here too. ((-1)&1)==1
+         * would otherwise mislabel a -1-hypothesis record (e.g. mate rescued off
+         * a -1 anchor) as top strand, emitting XG:GA with a top-strand XM. */
+        int is_top_strand = (p.meth_hypothesis >= 0 && (p.meth_hypothesis & 1)) ? 1 : 0;
+        xm = meth_build_xm(bns, pac, tid, (int64_t)p.pos,
                            is_top_strand,
                            bam_cigar, (int)bam_n_cigar,
                            seq_text, (int)l_emit);
@@ -584,9 +523,9 @@ int meth_mem_aln_to_bam(bam1_t *b,
         float pa_f = (float)((double)p.score / (double)p.alt_sc);
         bam_aux_append(b, "pa", 'f', sizeof(pa_f), (const uint8_t *)&pa_f);
     }
-    /* SA:Z (other primary hits) — mirrors mem_aln2sam, but chrom names are
-     * rewritten through cmap so split-alignment linkage references the
-     * consolidated output contig rather than the doubled c2t f/r contig. */
+    /* SA:Z (other primary hits) — mirrors mem_aln2sam. D3 (PR-5): rids are
+     * already ORIGINAL, so the contig name comes straight from bns->anns (no
+     * f/r→chrom rewrite). */
     if (!(p.flag & 0x100)) {
         int has_other = 0;
         for (int i = 0; i < n_alns; ++i)
@@ -597,11 +536,8 @@ int meth_mem_aln_to_bam(bam1_t *b,
                 const mem_aln_t *r = &list[i];
                 if (i == which || (r->flag & 0x100)) continue;
                 const char *r_name = NULL;
-                if (r->rid >= 0 && r->rid < cmap->n_internal) {
-                    int r_out = cmap->out_tid[r->rid];
-                    if (r_out >= 0 && r_out < cmap->n_output)
-                        r_name = cmap->output_names[r_out];
-                }
+                if (r->rid >= 0 && r->rid < bns->n_seqs)
+                    r_name = bns->anns[r->rid].name;
                 if (r_name == NULL) r_name = "*";
                 kputs(r_name, &sa); kputc(',', &sa);
                 kputl(r->pos + 1, &sa); kputc(',', &sa);
@@ -619,35 +555,11 @@ int meth_mem_aln_to_bam(bam1_t *b,
             free(sa.s);
         }
     }
-    /* XA:Z — like SA, rewrite each entry's contig name through cmap. Entries
-     * look like `name,+/-pos,cigar,NM;`; the name up to the first comma is
-     * the doubled-ref 'f'/'r'-prefixed contig. Strip the leading f/r so the
-     * tag matches the consolidated @SQ names published by meth_bam_writer_open. */
+    /* XA:Z — D3 (PR-5): p.XA is produced by mem_gen_alt against the ORIGINAL
+     * bns, so its `name,+/-pos,cigar,NM;` entries already carry original contig
+     * names. No f/r prefix stripping or chrom rewrite is needed; emit verbatim. */
     if (p.XA != NULL) {
-        kstring_t xa = {0, 0, NULL};
-        for (const char *entry = p.XA; *entry; ) {
-            const char *entry_end = strchr(entry, ';');
-            size_t entry_len = entry_end ? (size_t)(entry_end - entry) : strlen(entry);
-            if (entry_len > 0) {
-                const char *name_end = (const char *)memchr(entry, ',', entry_len);
-                size_t name_len = name_end ? (size_t)(name_end - entry) : entry_len;
-                const char *name = entry;
-                if (name_len > 1 && (name[0] == 'f' || name[0] == 'r')) {
-                    ++name;
-                    --name_len;
-                }
-                kputsn(name, (int)name_len, &xa);
-                if (name_end) {
-                    kputsn(name_end, (int)(entry_len - (name_end - entry)), &xa);
-                }
-                kputc(';', &xa);
-            }
-            if (!entry_end) break;
-            entry = entry_end + 1;
-        }
-        if (xa.l > 0)
-            bam_aux_append(b, "XA", 'Z', (int)xa.l + 1, (const uint8_t *)xa.s);
-        free(xa.s);
+        bam_aux_append(b, "XA", 'Z', (int)strlen(p.XA) + 1, (const uint8_t *)p.XA);
     }
     /* Bismark-compatible XR:Z (read conversion) emitted on every record;
      * XG:Z (genome strand) and XM:Z (methylation call string) only on
@@ -671,6 +583,8 @@ int meth_mem_aln_to_bam(bam1_t *b,
         }
     }
     if (mapped) {
+        /* XG:Z genome strand from the winning hypothesis: OT→CT, OB→GA
+         * (direction is the 'f'/'r' encoding of p.meth_hypothesis above). */
         const char *xg = (direction == 'f') ? "CT" : "GA";
         bam_aux_append(b, "XG", 'Z', 3, (const uint8_t *)xg);
         if (xm != NULL) {
@@ -684,8 +598,8 @@ int meth_mem_aln_to_bam(bam1_t *b,
      * The YS:Z/YC:Z meth carriers in s->comment are filtered inside
      * append_sam_aux_tokens under opt->meth_mode so they don't leak into
      * the BAM output (they're internal carriers only — XR:Z replaces YC,
-     * SEQ restoration replaces YS). p.rid is the bwa-mem3 internal contig
-     * index (pre-remap), which is what bns uses. */
+     * SEQ restoration replaces YS). D3 (PR-5): p.rid is the ORIGINAL contig
+     * index, which is what the original `bns` passed here uses. */
     bam_writer_append_generic_aux(b, s, opt, bns, p.rid);
 
     return 0;

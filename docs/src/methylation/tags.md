@@ -14,7 +14,7 @@ biscuit's per-read methylation tools.
 |----------|-------|
 | Type | `Z` (NUL-terminated string) |
 | Values | `CT` (R1 / SE) or `GA` (R2) |
-| Set by | `meth_mem_aln_to_bam` from FASTQ-ingest carrier (`s->comment`'s YC payload) |
+| Set by | `meth_mem_aln_to_bam` from the read's conversion direction (R1 → `CT`, R2 → `GA`) |
 | Emitted on | All records (mapped and unmapped) |
 
 `XR:Z` records which conversion was applied to the read at FASTQ ingest:
@@ -33,12 +33,12 @@ biscuit's per-read methylation tools.
 
 `XG:Z` indicates which doubled-reference strand the read aligned to:
 
-- `CT` — read aligned to the C→T-projected forward strand (OT).
-- `GA` — read aligned to the G→A-projected forward strand (OB).
+- `CT` — read aligned under the OT (top-strand) hypothesis (`f`-prefixed seed contig).
+- `GA` — read aligned under the OB (bottom-strand) hypothesis (`r`-prefixed seed contig).
 
 For properly paired directional reads, R1 and R2 of a fragment naturally
-share `XG:Z`. Discordant pairs (already flagged with `0x200` by the
-chimera-QC heuristic) may see `XG:Z` diverge between mates.
+share `XG:Z`. Discordant pairs (flagged with `0x200` only when `--chimera-qc`
+is enabled) may see `XG:Z` diverge between mates.
 
 ### `XM:Z` — methylation call string
 
@@ -65,23 +65,16 @@ relative to FASTQ-original orientation.
 
 ## Computation
 
-Under `--meth`, the doubled c2t reference (`<prefix>.bwameth.c2t.*`) is
-folded once at startup into an in-memory un-converted pac (the
-`meth_orig_ref` module — `src/meth_orig_ref.cpp`). The fold uses
-`(f, r) → original` recovery on every position via a 5-row table:
+Under `--meth`, the **original** 4-letter reference is loaded directly alongside
+the `.meth` seed index — its `bns`/`pac` handles, via `meth_orig_ref_load_handles`
+in `src/fastmap.cpp`. (No conversion or fold is needed: unlike the retired D1
+design, the reference used for scoring and `XM` is the unmodified reference, not a
+recovered projection of the doubled c2t index.)
 
-| f[P] | r[P] | original[P] |
-|------|------|-------------|
-| T    | T    | T           |
-| T    | C    | C           |
-| G    | A    | G           |
-| A    | A    | A           |
-| N    | N    | N (via `bns->ambs`) |
-
-Per mapped record, `meth_build_xm` slices the un-converted forward-strand
-window at the read's footprint plus 2 bp of context on either side, then
-walks the BAM CIGAR jointly over the restored SEQ and the ref window.
-The classifier matches Bismark's `methylation_call`:
+Per mapped record, `meth_build_xm` (`src/meth_bam.cpp`) slices the original
+forward-strand reference window at the read's footprint plus 2 bp of context on
+either side, then walks the BAM CIGAR jointly over the restored SEQ and the ref
+window. The classifier matches Bismark's `methylation_call`:
 
 ```
 match position with ref[t] == 'C' (top strand) or 'G' (bottom strand):
@@ -99,8 +92,8 @@ deletion / N op                         -> no XM emit
 hard clip / pad                         -> no XM emit
 ```
 
-The `top vs bottom strand` choice is driven by `XG:Z` (= cmap
-direction), **not** by the SAM 0x10 (RC) flag. CTOT reads (R2 mapped
+The `top vs bottom strand` choice is driven by `XG:Z` (= the winning OT/OB
+hypothesis, `p.meth_hypothesis`), **not** by the SAM 0x10 (RC) flag. CTOT reads (R2 mapped
 forward to a top-strand contig with 0x10 set) and OB reads (R1 mapped
 RC to a bottom-strand contig) are both handled by reading the rule
 table from the strand encoded in `XG`. The walk runs in SEQ orientation

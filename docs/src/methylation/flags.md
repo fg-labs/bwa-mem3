@@ -1,8 +1,49 @@
-# Flags: --set-as-failed, --chimera-qc
+# Flags: --meth-scoring, --set-as-failed, --chimera-qc
 
-`bwa-mem3 --meth` adds two flags that control QC behavior during BAM
-post-processing. Both flags affect the chimera QC and strand-filtering logic
-inside `meth_mem_aln_to_bam` (`src/meth_bam.cpp`).
+`bwa-mem3 --meth` adds three flags. `--meth-scoring` selects the bisulfite
+scoring model; `--set-as-failed` and `--chimera-qc` control QC behavior during
+BAM post-processing (both affect the chimera QC and strand-filtering logic inside
+`meth_mem_aln_to_bam`, `src/meth_bam.cpp`).
+
+## `--meth-scoring {collapsed|genomic}`
+
+Selects how the 4-letter scoring matrix treats bisulfite-converted bases.
+`bwa-mem3 --meth` scores against the original reference, so it can either collapse
+the conversion (bwameth-style) or keep it variant-aware.
+
+**Accepted values:**
+
+- `collapsed` (**default**) — free **both** conversion directions: C↔T *and* G↔A
+  are interchangeable (a two-cell matrix). Reproduces bwameth's collapsed-space
+  **placement** and sets the mismatch penalty to `-B 2`. Use this when you need
+  bwameth-compatible read placement (the drop-in default).
+- `genomic` — free **only** the conversion direction (a one-cell matrix), so the
+  mirror cell stays a real mismatch. A genuine C/T or G/A variant is penalized,
+  making `NM`/`MD` truthful and the BAM usable for variant calling. Keeps bwa's
+  default `-B 4`.
+
+**Effect on output:**
+
+The mode changes alignment score, `MAPQ`, `NM`, `MD`, and occasionally placement
+and CIGAR. On a real C/T (or G/A) variant under a seed, `genomic` lowers the
+score by `-A + -B` (the match score plus the mismatch penalty) relative to
+`collapsed` — the freed match becomes a mismatch —
+which can break paralog ties in `genomic`'s favor and avoid spurious indels. The
+Bismark `XR`/`XG`/`XM` tags and the `SEQ` field are identical in both modes.
+
+**When to use it:**
+
+Keep `collapsed` for methylation-only workflows that must match bwameth placement
+(e.g. clinical pipelines validated against a bwameth release). Choose `genomic`
+when you want one BAM that serves both methylation *and* variant calling, or want
+the aligner to distinguish real variants from conversions.
+
+> **Note — `-B` follows the mode, but you can override it**
+>
+> `collapsed` sets `-B 2` and `genomic` keeps `-B 4` by default. An explicit
+> `-B` after `--meth` overrides the mode default and still reaches the per-strand
+> matrices. The other `--meth` defaults (`-L 10 -U 100 -T 40 -M -C`) are the same
+> in both modes.
 
 ## `--set-as-failed {f|r}`
 

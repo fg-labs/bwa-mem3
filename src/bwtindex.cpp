@@ -52,10 +52,11 @@
 
 KSEQ_DECLARE(gzFile)
 
-/* Emits `<fa>.bwameth.c2t` with two contigs per input chromosome — the
+/* Writes two converted contigs per input chromosome to the seed FASTA — the
  * G→A-projected reverse-strand target (`>r<name>`) and the C→T-projected
- * forward-strand target (`>f<name>`), wrapped at 100 bp — then runs
- * bwa_idx_build on it. Byte-identical to bwameth.py's `index-mem2`. */
+ * forward-strand target (`>f<name>`), wrapped at 100 bp. The caller
+ * (meth_index_build) then builds the seed FM-index over it. The per-strand
+ * projection matches bwameth.py's `index-mem2` contig layout. */
 static void meth_project_and_write(FILE *out, const char *prefix, const char *name,
                                    const char *seq, size_t len, char from, char to)
 {
@@ -83,42 +84,57 @@ static int meth_c2t_is_fresh(const char *in_fa, const char *out_fa)
     return b.st_mtime >= a.st_mtime;
 }
 
-/* (No separate un-converted-pac emission. `bwa-mem3 mem --meth` recovers
- * original ref bases at runtime via per-record dual-slice from idx->pac
- * — see src/meth_orig_ref.cpp.) */
-
-static int meth_index_c2t_build(const char *fa)
+/* D3 BS-seq index layout. `index --meth` builds TWO indexes from `fa`:
+ *   1. The ORIGINAL-alphabet index `<fa>.{pac,ann,amb,0123,bwt.2bit.64}` — real chrom
+ *      names + original bases. This is the extension/scoring reference and the basis
+ *      for variant-callable `mem --meth` output. (Identical to a normal `index`.)
+ *   2. A converted SEED index `<fa>.meth.{pac,ann,amb,0123,bwt.2bit.64}`, built over a
+ *      per-strand-converted FASTA `<fa>.meth.fa` (two contigs per chromosome:
+ *      `>r<name>` = G->A reverse-strand target, `>f<name>` = C->T forward-strand
+ *      target). 3-letter seeding requires per-strand conversion because C->T and
+ *      reverse-complement do not commute. This index is used ONLY to find seed
+ *      SA-intervals, which are then remapped to original coordinates for chaining and
+ *      extension. The `.meth` separation is by file PREFIX (not by changing the global
+ *      CP_FILENAME_SUFFIX, which serves every index). */
+static int meth_index_build(const char *fa)
 {
-    char out_fa[PATH_MAX];
-    int n = snprintf(out_fa, sizeof(out_fa), "%s.bwameth.c2t", fa);
-    if (n <= 0 || (size_t)n >= sizeof(out_fa)) {
+    /* 1. Original-alphabet index (extension reference). */
+    fprintf(stderr, "[bwa_index:--meth] building original index for %s ...\n", fa);
+    if (bwa_idx_build(fa, fa) != 0) {
+        fprintf(stderr, "ERROR: bwa_idx_build failed on original %s\n", fa);
+        return 5;
+    }
+
+    /* 2a. Emit the per-strand-converted seed FASTA <fa>.meth.fa. */
+    char conv_fa[PATH_MAX];
+    int n = snprintf(conv_fa, sizeof(conv_fa), "%s.meth.fa", fa);
+    if (n <= 0 || (size_t)n >= sizeof(conv_fa)) {
         fprintf(stderr, "ERROR: reference path too long\n");
         return 1;
     }
 
-    if (meth_c2t_is_fresh(fa, out_fa)) {
-        fprintf(stderr, "[bwa_index:--meth] %s is newer than %s; skipping c2t FASTA emission\n",
-                out_fa, fa);
+    if (meth_c2t_is_fresh(fa, conv_fa)) {
+        fprintf(stderr, "[bwa_index:--meth] %s is newer than %s; skipping seed FASTA emission\n",
+                conv_fa, fa);
     } else {
         gzFile in = gzopen(fa, "r");
         if (in == NULL) {
             fprintf(stderr, "ERROR: cannot open %s\n", fa);
             return 2;
         }
-        FILE *out = fopen(out_fa, "w");
+        FILE *out = fopen(conv_fa, "w");
         if (out == NULL) {
-            fprintf(stderr, "ERROR: cannot open %s for writing\n", out_fa);
+            fprintf(stderr, "ERROR: cannot open %s for writing\n", conv_fa);
             gzclose(in);
             return 3;
         }
-        fprintf(stderr, "[bwa_index:--meth] writing %s ...\n", out_fa);
+        fprintf(stderr, "[bwa_index:--meth] writing seed FASTA %s ...\n", conv_fa);
 
         kseq_t *seq = kseq_init(in);
         int64_t total_bases = 0, n_seqs = 0;
         int kr = 0;
         while ((kr = kseq_read(seq)) >= 0) {
-            /* bwameth.py's fasta_iter upper-cases before projection — match it
-             * so soft-masked ref regions round-trip to the same FASTA bytes. */
+            /* upper-case before projection so soft-masked ref regions round-trip. */
             for (size_t i = 0; i < seq->seq.l; ++i) {
                 char c = seq->seq.s[i];
                 if (c >= 'a' && c <= 'z') seq->seq.s[i] = (char)(c - 'a' + 'A');
@@ -130,29 +146,36 @@ static int meth_index_c2t_build(const char *fa)
         }
         kseq_destroy(seq);
         gzclose(in);
-        /* kseq_read returns -1 on clean EOF; anything < -1 is parse/IO error
-         * (truncated gzip, malformed FASTA, short read). Don't leave a
-         * partial .bwameth.c2t on disk and don't feed it to bwa_idx_build. */
+        /* kseq_read returns -1 on clean EOF; < -1 is a parse/IO error. Don't leave a
+         * partial seed FASTA on disk and don't feed it to bwa_idx_build. */
         if (kr < -1) {
             fclose(out);
-            unlink(out_fa);
+            unlink(conv_fa);
             fprintf(stderr, "ERROR: failed while reading %s (kseq_read=%d)\n", fa, kr);
             return 4;
         }
         if (fclose(out) != 0) {
-            /* Short writes / flush errors can surface only here. Drop the
-             * half-written file so meth_c2t_is_fresh() won't later treat it
-             * as current and feed garbage to bwa_idx_build. */
-            unlink(out_fa);
-            fprintf(stderr, "ERROR: failed to close %s\n", out_fa);
+            unlink(conv_fa);
+            fprintf(stderr, "ERROR: failed to close %s\n", conv_fa);
             return 4;
         }
-        fprintf(stderr, "[bwa_index:--meth] emitted %lld seqs, %lld bp (doubled to %lld bp of c2t text)\n",
+        fprintf(stderr, "[bwa_index:--meth] emitted %lld seqs, %lld bp (doubled to %lld bp of seed text)\n",
                 (long long)n_seqs, (long long)total_bases, (long long)(2 * total_bases));
     }
 
-    if (bwa_idx_build(out_fa, out_fa) != 0) {
-        fprintf(stderr, "ERROR: bwa_idx_build failed on %s\n", out_fa);
+    /* 2b. Build the converted seed index under the `.meth` prefix. */
+    char meth_prefix[PATH_MAX];
+    n = snprintf(meth_prefix, sizeof(meth_prefix), "%s.meth", fa);
+    if (n <= 0 || (size_t)n >= sizeof(meth_prefix)) {
+        fprintf(stderr, "ERROR: reference path too long\n");
+        return 1;
+    }
+    fprintf(stderr, "[bwa_index:--meth] building seed index %s.* ...\n", meth_prefix);
+    /* emit_unpacked_ref=false: the seed `.0123` is never read by `mem --meth`
+     * (extension uses the original reference), so don't write it (~13 GB on
+     * hg38). The seed `.pac` + `.bwt.2bit.64` + `.ann`/`.amb` are still built. */
+    if (bwa_idx_build(conv_fa, meth_prefix, /*emit_unpacked_ref=*/false) != 0) {
+        fprintf(stderr, "ERROR: bwa_idx_build failed on seed index %s\n", conv_fa);
         return 5;
     }
     return 0;
@@ -186,9 +209,9 @@ static void index_usage(void)
 	        "                     (case-insensitive) or bare bytes\n"
 	        "                     [auto: min(50%% of RAM, 32G), cgroup-aware]\n"
 	        "  --tmp-dir PATH     scratch directory [$TMPDIR]\n"
-	        "  --meth             build a bwameth-style doubled c2t reference + FMI.\n"
-	        "                     Writes <in.fasta>.bwameth.c2t and the FMI alongside it.\n"
-	        "                     Use with `bwa-mem3 mem --meth <in.fasta> R1.fq [R2.fq]`.\n"
+	        "  --meth             build a BS-aware dual index. Writes the original-alphabet\n"
+	        "                     index at <in.fasta>.* plus a converted seed FM-index at\n"
+	        "                     <in.fasta>.meth.* (used by `bwa-mem3 mem --meth`).\n"
 	        "  -h, --help         print this help message and exit\n");
 }
 
@@ -289,16 +312,16 @@ int bwa_index(int argc, char *argv[]) // the "index" command
 
 	if (meth) {
 		if (prefix != 0) {
-			fprintf(stderr, "ERROR: --meth does not accept -p (prefix is <in.fasta>.bwameth.c2t)\n");
+			fprintf(stderr, "ERROR: --meth does not accept -p (outputs <in.fasta>.* and <in.fasta>.meth.*)\n");
 			return 1;
 		}
-		return meth_index_c2t_build(argv[optind]);
+		return meth_index_build(argv[optind]);
 	}
 	if (prefix == 0) prefix = argv[optind];
 	return bwa_idx_build(argv[optind], prefix);
 }
 
-int bwa_idx_build(const char *fa, const char *prefix)
+int bwa_idx_build(const char *fa, const char *prefix, int emit_unpacked_ref)
 {
 	extern void bwa_pac_rev_core(const char *fn, const char *fn_rev);
 
@@ -313,7 +336,7 @@ int bwa_idx_build(const char *fa, const char *prefix)
 		fprintf(stderr, "%.2f sec\n", (float)(clock() - t) / CLOCKS_PER_SEC);
 		err_gzclose(fp);
         FMI_search *fmi = new FMI_search(prefix);
-        rc = fmi->build_index();
+        rc = fmi->build_index(emit_unpacked_ref);
         delete fmi;
 	}
 	return rc;

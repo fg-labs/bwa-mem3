@@ -305,7 +305,7 @@ OBJS=		src/fastmap.o src/bwtindex.o src/utils.o src/kthread.o \
 			src/kstring.o src/bntseq.o src/bwamem.o src/profiling.o \
 			src/FMI_search.o src/read_index_ele.o src/bwamem_pair.o src/bwa.o \
 			src/bwamem_extra.o src/kopen.o src/bam_writer.o src/meth_bam.o \
-			src/meth_orig_ref.o src/meth_xm.o \
+			src/meth_xm.o \
 			src/packed_text.o src/fm_index_writer.o src/index_prelude.o \
 			src/system.o src/libsais_build.o \
 			src/bwa_shm.o src/simd_dispatch.o \
@@ -1072,7 +1072,7 @@ src/fastmap.o: src/kstring.h src/ksw.h src/kvec.h src/ksort.h src/utils.h
 src/fastmap.o: src/profiling.h src/FMI_search.h src/read_index_ele.h
 src/fastmap.o: src/kseq.h
 src/fastmap.o: src/bam_writer.h
-src/fastmap.o: src/meth_bam.h src/meth_orig_ref.h src/bwa_shm.h
+src/fastmap.o: src/meth_bam.h src/bwa_shm.h
 src/fm_index_writer.o: src/fm_index_writer.h src/FMI_search.h
 src/fm_index_writer.o: src/simd_compat.h src/read_index_ele.h src/utils.h
 src/fm_index_writer.o: src/bntseq.h src/macro.h src/bwa.h src/bwt.h
@@ -1109,18 +1109,9 @@ src/meth_bam.o: src/bwamem.h src/kthread.h src/bandedSWA.h src/simd_compat.h
 src/meth_bam.o: src/kernel_dispatch.h src/kstring.h src/ksw.h src/kvec.h
 src/meth_bam.o: src/ksort.h src/utils.h src/profiling.h src/FMI_search.h
 src/meth_bam.o: src/read_index_ele.h src/bam_writer.h src/cigar_util.h
-src/meth_bam.o: src/meth_orig_ref.h src/meth_xm.h src/version.h
-src/meth_orig_ref.o: src/meth_orig_ref.h src/bntseq.h src/meth_bam.h
-src/meth_orig_ref.o: src/bwa.h src/bwt.h src/macro.h src/bwamem.h
-src/meth_orig_ref.o: src/kthread.h src/bandedSWA.h src/simd_compat.h
-src/meth_orig_ref.o: src/kernel_dispatch.h src/kstring.h src/ksw.h src/kvec.h
-src/meth_orig_ref.o: src/ksort.h src/utils.h src/profiling.h src/FMI_search.h
-src/meth_orig_ref.o: src/read_index_ele.h
-src/meth_xm.o: src/meth_xm.h src/meth_orig_ref.h src/bntseq.h src/meth_bam.h
-src/meth_xm.o: src/bwa.h src/bwt.h src/macro.h src/bwamem.h src/kthread.h
-src/meth_xm.o: src/bandedSWA.h src/simd_compat.h src/kernel_dispatch.h
-src/meth_xm.o: src/kstring.h src/ksw.h src/kvec.h src/ksort.h src/utils.h
-src/meth_xm.o: src/profiling.h src/FMI_search.h src/read_index_ele.h
+src/meth_bam.o: src/meth_xm.h src/version.h
+src/meth_xm.o: src/meth_xm.h src/bntseq.h
+src/meth_xm.o: src/kstring.h
 src/packed_text.o: src/packed_text.h src/utils.h
 src/profiling.o: src/macro.h src/bwa.h src/bntseq.h src/bwt.h src/profiling.h
 src/read_index_ele.o: src/read_index_ele.h src/utils.h src/bntseq.h

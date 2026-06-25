@@ -47,6 +47,15 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #  include "malloc_wrap.h"
 #endif
 
+/* File-scope forward declaration of the dedup/patch entry point defined in
+ * src/bwamem.cpp (kept default-free there). The `mat = NULL` default lives
+ * here only, so [dcl.fct.default]/4 (no redefining a default in one TU) is
+ * satisfied — the historical per-block-scope re-declarations each repeated the
+ * default and only compiled under -fpermissive. */
+extern int mem_sort_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns,
+                                const uint8_t *pac, uint8_t *query, int n,
+                                mem_alnreg_t *a, const int8_t *mat = NULL);
+
 
 #define MIN_RATIO     0.8
 #define MIN_DIR_CNT   10
@@ -152,10 +161,33 @@ void mem_pestat(const mem_opt_t *opt, int64_t l_pac, int n,
 int mem_matesw(const mem_opt_t *opt, const bntseq_t *bns,
                const uint8_t *pac, const mem_pestat_t pes[4],
                const mem_alnreg_t *a, int l_ms, const uint8_t *ms,
-               mem_alnreg_v *ma)
+               mem_alnreg_v *ma, const char *ms_orig = NULL,
+               const int8_t *mat = NULL)
 {
-    extern int mem_sort_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns,
-                                    const uint8_t *pac, uint8_t *query, int n, mem_alnreg_t *a);
+    /* D3 (--meth, PR-6): the mate-rescue dedup at the bottom of this function
+     * still passes mat=NULL (resolving to opt->mat) — but those calls pass
+     * bns/pac/query = 0 (dedup-only, no patch SW), so the matrix is unused
+     * there regardless; leaving them on opt->mat is correct. The per-hypothesis
+     * asymmetric scorer below uses the `mat` parameter (the caller selects the
+     * OPPOSITE-strand matrix of the anchor via mem_opt_meth_mat). */
+    /* Outside --meth, mat is NULL and ms_orig is NULL: behavior is byte-for-byte
+     * identical to the historical symmetric/projected mate rescue. */
+    const int8_t *sw_mat = mat ? mat : opt->mat;
+    /* D3 (--meth, PR-6): when ms_orig is set, score the ORIGINAL (unconverted)
+     * mate bases against the original ref window instead of the projected mate.
+     * meth_orig_seq is ASCII in the SAME orientation as `ms`/`seq` (bwa.h
+     * contract), so 2-bit-encode it here and let the existing per-orientation
+     * RC below reverse-complement it EXACTLY as it does the projected mate. */
+    uint8_t *ms2 = NULL;
+    if (ms_orig != NULL) {
+        ms2 = (uint8_t*) malloc(l_ms);
+        assert(ms2 != NULL);
+        for (int k = 0; k < l_ms; ++k) {
+            unsigned char c = (unsigned char) ms_orig[k];
+            ms2[k] = (c < 4) ? c : nst_nt4_table[c];
+        }
+        ms = ms2; // alias the projected-mate pointer to the original bases
+    }
     #if MATE_SORT
     extern int mem_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns,
                                const uint8_t *pac, uint8_t *query, int n, mem_alnreg_t *a);
@@ -218,13 +250,24 @@ int mem_matesw(const mem_opt_t *opt, const bntseq_t *bns,
 
             assert(ref !=0 && re - rb >= 0);
             aln = ksw_align2(l_ms, seq, re - rb, ref, 5,
-                             opt->mat, opt->o_del, opt->e_del,
+                             sw_mat, opt->o_del, opt->e_del,
                              opt->o_ins, opt->e_ins, xtra, 0);
-            
+
             memset(&b, 0, sizeof(mem_alnreg_t));
             if (aln.score >= opt->min_seed_len && aln.qb >= 0) { // something goes wrong if aln.qb < 0
                 b.rid = a->rid;
                 b.is_alt = a->is_alt;
+                /* D3 (--meth, PR-6, B3): the rescued mate's hypothesis is the
+                 * OPPOSITE strand of the anchor for directional libraries
+                 * (R1→OT, R2→OB): rescuing an OT anchor's mate uses OB and vice
+                 * versa. The caller selects sw_mat = mem_opt_meth_mat(opt,
+                 * !anchor_hyp) accordingly; record !a->meth_hypothesis here so
+                 * the output layer (XG/XM) sources the right strand. -1 anchor
+                 * (non-meth) stays -1. Single hypothesis per rescue ⇒ rank-1.
+                 * Coordinates are already ORIGINAL (l_pac is the original l_pac
+                 * via the original bns), so the 6a coordinate fix holds. */
+                b.meth_hypothesis = (a->meth_hypothesis < 0) ? -1
+                                                             : !a->meth_hypothesis;
                 b.qb = is_rev? l_ms - (aln.qe + 1) : aln.qb;
                 b.qe = is_rev? l_ms - aln.qb : aln.qe + 1;
                 b.rb = is_rev? (l_pac<<1) - (rb + aln.te + 1) : rb + aln.tb;
@@ -289,6 +332,7 @@ int mem_matesw(const mem_opt_t *opt, const bntseq_t *bns,
         if (rev) free(rev);
         /* ref aliases t_ref thread-local scratch; do not free. */
     }
+    if (ms2) free(ms2); // D3 (--meth): original-mate 2-bit scratch
     return n;
 }
 
@@ -403,8 +447,9 @@ int mem_pair_resolve(const mem_opt_t *opt, const bntseq_t *bns,
     #if MATE_SORT
     extern void sort_alnreg_re(int n, mem_alnreg_t* a);
     extern void sort_alnreg_score(int n, mem_alnreg_t* a);
-    extern int mem_sort_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns,
-                                    const uint8_t *pac, uint8_t *query, int n, mem_alnreg_t *a);
+    /* D3 (--meth, PR-6): this dedup call passes bns/pac/query = 0 (dedup-only,
+     * no patch SW), so its matrix is never consulted — opt->mat default is
+     * correct; the per-hypothesis asymmetric scoring lives in mem_matesw. */
     #endif
 
     int n = 0, i, j, o, subo, n_sub, extra_flag = 1;
@@ -426,7 +471,14 @@ int mem_pair_resolve(const mem_opt_t *opt, const bntseq_t *bns,
             sort_alnreg_re(a[!i].n, a[!i].a);
             int val = 0, swcount = 0;
             for (j = 0; j < b[i].n && j < opt->max_matesw; ++j) {
-                int val = mem_matesw(opt, bns, pac, pes, &b[i].a[j], s[!i].l_seq, (uint8_t*)s[!i].seq, &a[!i]);
+                /* D3 (--meth, PR-6, B3): rescue read !i against original ref using
+                 * its ORIGINAL bases and the OPPOSITE-strand matrix of anchor
+                 * b[i].a[j] (R1→OT / R2→OB ⇒ mate uses the other). Outside --meth
+                 * these stay NULL and mem_matesw is identical to before. */
+                const char  *ms_orig = opt->meth_mode ? s[!i].meth_orig_seq : NULL;
+                const int8_t *rmat    = opt->meth_mode
+                    ? mem_opt_meth_mat(opt, !b[i].a[j].meth_hypothesis) : NULL;
+                int val = mem_matesw(opt, bns, pac, pes, &b[i].a[j], s[!i].l_seq, (uint8_t*)s[!i].seq, &a[!i], ms_orig, rmat);
                 n += val;
                 swcount += val;
             }
@@ -443,7 +495,12 @@ int mem_pair_resolve(const mem_opt_t *opt, const bntseq_t *bns,
 
         for (i = 0; i < 2; ++i)
             for (j = 0; j < b[i].n && j < opt->max_matesw; ++j) {
-                int val = mem_matesw(opt, bns, pac, pes, &b[i].a[j], s[!i].l_seq, (uint8_t*)s[!i].seq, &a[!i]);
+                /* D3 (--meth, PR-6, B3): see MATE_SORT branch above — original
+                 * mate bases + opposite-strand matrix of the anchor. */
+                const char  *ms_orig = opt->meth_mode ? s[!i].meth_orig_seq : NULL;
+                const int8_t *rmat    = opt->meth_mode
+                    ? mem_opt_meth_mat(opt, !b[i].a[j].meth_hypothesis) : NULL;
+                int val = mem_matesw(opt, bns, pac, pes, &b[i].a[j], s[!i].l_seq, (uint8_t*)s[!i].seq, &a[!i], ms_orig, rmat);
                 n += val;
             }
         #endif
@@ -559,7 +616,7 @@ int mem_sam_pe(const mem_opt_t *opt, const bntseq_t *bns,
         } else XA[0] = XA[1] = 0;
         // write SAM
         for (i = 0; i < 2; ++i) {
-            h[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, &a[i].a[z[i]]);
+            h[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, &a[i].a[z[i]], s[i].meth_orig_seq);
             h[i].mapq = q_se[i];
 
             h[i].flag |= 0x40<<i | extra_flag;
@@ -569,7 +626,7 @@ int mem_sam_pe(const mem_opt_t *opt, const bntseq_t *bns,
             if (n_pri[i] < a[i].n) { // the read has ALT hits
                 mem_alnreg_t *p = &a[i].a[n_pri[i]];
                 if (p->score < opt->T || p->secondary >= 0 || !p->is_alt) continue;
-                g[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, p);
+                g[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, p, s[i].meth_orig_seq);
                 g[i].flag |= 0x800 | 0x40<<i | extra_flag;
                 g[i].XA = XA[i]? XA[i][n_pri[i]] : 0;
                 g[i].HN = HN[i]? HN[i][n_pri[i]] : -1;
@@ -617,7 +674,7 @@ int mem_sam_pe(const mem_opt_t *opt, const bntseq_t *bns,
             else if (n_pri[i] < a[i].n && a[i].a[n_pri[i]].score >= opt->T)
                 which[i] = n_pri[i];
         }
-        if (which[i] >= 0) h[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, &a[i].a[which[i]]);
+        if (which[i] >= 0) h[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, &a[i].a[which[i]], s[i].meth_orig_seq);
         else h[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, 0);
     }
     // Proper-pair flag must be computed from the same alignments that were just
@@ -816,10 +873,11 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
     #if MATE_SORT
     extern void sort_alnreg_re(int n, mem_alnreg_t* a);
     extern void sort_alnreg_score(int n, mem_alnreg_t* a);
-    extern int mem_sort_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns,
-                                    const uint8_t *pac, uint8_t *query, int n, mem_alnreg_t *a);
+    /* D3 (--meth, PR-6): dedup-only call (query = 0, no patch SW) — matrix
+     * unused, opt->mat default correct; asymmetric scoring is in
+     * mem_matesw_batch_post's scalar fallback. */
     #endif
-    
+
     int32_t *gar = (int32_t*) mmc->seqPairArrayAux[tid];
     
     int n = 0, i, j, z[2], o, subo, n_sub, extra_flag = 1, n_pri[2], n_aa[2];
@@ -850,9 +908,17 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
             sort_alnreg_re(a[!i].n, a[!i].a);
             int val = 0, swcount = 0;
             for (j = 0; j < b[i].n && j < opt->max_matesw; ++j) {
+                /* D3 (--meth, PR-6/A1, B3): original mate bases + opposite-strand
+                 * matrix of anchor b[i].a[j], honored on the scalar ksw_align2
+                 * path through which mem_matesw_batch_post scores every meth
+                 * rescue (the batched kswv enqueue is skipped under --meth). */
+                const char  *ms_orig = opt->meth_mode ? s[!i].meth_orig_seq : NULL;
+                const int8_t *rmat    = opt->meth_mode
+                    ? mem_opt_meth_mat(opt, !b[i].a[j].meth_hypothesis) : NULL;
                 val = mem_matesw_batch_post(opt, bns, pac, pes, &b[i].a[j],
                                                 s[!i].l_seq, (uint8_t*)s[!i].seq,
-                                                &a[!i], myaln, gcnt, gar, mmc);
+                                                &a[!i], myaln, gcnt, gar, mmc,
+                                                ms_orig, rmat);
                 n += val;
                 swcount += val;
                 // ncnt++;
@@ -869,9 +935,14 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
         #else
         for (i = 0; i < 2; ++i) {
             for (j = 0; j < b[i].n && j < opt->max_matesw; ++j) {
+                /* D3 (--meth, PR-6, B3): see MATE_SORT branch above. */
+                const char  *ms_orig = opt->meth_mode ? s[!i].meth_orig_seq : NULL;
+                const int8_t *rmat    = opt->meth_mode
+                    ? mem_opt_meth_mat(opt, !b[i].a[j].meth_hypothesis) : NULL;
                 int val = mem_matesw_batch_post(opt, bns, pac, pes, &b[i].a[j],
                                                 s[!i].l_seq, (uint8_t*)s[!i].seq,
-                                                &a[!i], myaln, gcnt, gar, mmc);
+                                                &a[!i], myaln, gcnt, gar, mmc,
+                                                ms_orig, rmat);
                 n += val;
                 // ncnt++;
                 gcnt += 4;
@@ -883,7 +954,7 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
 
     n_pri[0] = mem_mark_primary_se(opt, a[0].n, a[0].a, id<<1|0);
     n_pri[1] = mem_mark_primary_se(opt, a[1].n, a[1].a, id<<1|1);
-    
+
     #if V17
     if (opt->flag & MEM_F_PRIMARY5) {
         mem_reorder_primary5(opt->T, &a[0]);
@@ -958,7 +1029,7 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
         } else XA[0] = XA[1] = 0;
         // write SAM
         for (i = 0; i < 2; ++i) {
-            h[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, &a[i].a[z[i]]);
+            h[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, &a[i].a[z[i]], s[i].meth_orig_seq);
             h[i].mapq = q_se[i];
 
             h[i].flag |= 0x40<<i | extra_flag;
@@ -968,7 +1039,7 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
             if (n_pri[i] < a[i].n) { // the read has ALT hits
                 mem_alnreg_t *p = &a[i].a[n_pri[i]];
                 if (p->score < opt->T || p->secondary >= 0 || !p->is_alt) continue;
-                g[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, p);
+                g[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, p, s[i].meth_orig_seq);
                 g[i].flag |= 0x800 | 0x40<<i | extra_flag;
                 g[i].XA = XA[i]? XA[i][n_pri[i]] : 0;
                 g[i].HN = HN[i]? HN[i][n_pri[i]] : -1;
@@ -1016,7 +1087,7 @@ no_pairing:
             else if (n_pri[i] < a[i].n && a[i].a[n_pri[i]].score >= opt->T)
                 which[i] = n_pri[i];
         }
-        if (which[i] >= 0) h[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, &a[i].a[which[i]]);
+        if (which[i] >= 0) h[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, &a[i].a[which[i]], s[i].meth_orig_seq);
         else h[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, 0);
     }
     // Proper-pair flag must be computed from the same alignments that were just
@@ -1046,9 +1117,16 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                          mem_alnreg_v *ma, mem_cache *mmc, int pcnt, int32_t gcnt,
                          int32_t &maxRefLen, int32_t &maxQerLen, int32_t tid)
 {
-    extern int mem_sort_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns,
-                                    const uint8_t *pac, uint8_t *query, int n,
-                                    mem_alnreg_t *a);
+    /* D3 (--meth, A1/PR-6): _pre stages the batched-SIMD mate-rescue query for
+     * the kswv getScores8/16 kernel — a SYMMETRIC kernel (built from scalar
+     * match/mismatch via make_kswv) that cannot express the asymmetric freed-cell
+     * matrix. Under --meth we therefore do NOT stage meth pairs here (the enqueue
+     * branch below leaves gar[gcnt+r] = -1), so mem_matesw_batch_post re-runs
+     * every meth rescue through the scalar ksw_align2 path, which honors the
+     * per-hypothesis asymmetric matrix. The cost is bounded to the (minority)
+     * rescued mates; teaching kswv a full mat[ref*5+read] is a future PERF
+     * optimization, not a correctness gap. The dedup below passes query = 0 (no
+     * patch SW), so its mat default (opt->mat) is unused. */
 
     uint8_t *seqBufRef = mmc->seqBufLeftRef[tid*CACHE_LINE];
     uint8_t *seqBufQer = mmc->seqBufLeftQer[tid*CACHE_LINE];
@@ -1120,6 +1198,20 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                                             (uint8_t*) mmc->seqPairArrayAux[tid]);
 
         if (a->rid == rid && re - rb >= opt->min_seed_len) { // no funny things happening
+            /* D3 (--meth, A1/PR-6): route meth mate-rescue through the scalar
+             * ksw_align2 fallback in mem_matesw_batch_post, which honors the
+             * per-hypothesis asymmetric matrix. The batched kswv kernel is
+             * SYMMETRIC (built from scalar match/mismatch via make_kswv) and
+             * cannot express the freed-cell asymmetry, so we skip the batched
+             * enqueue here — leaving gar[gcnt+r] = -1, which _post reads as
+             * "no precomputed score" and re-runs the orientation through
+             * ksw_align2 with the asymmetric `mat`. kswv.cpp stays untouched;
+             * the cost is bounded to the (minority) rescued mates. */
+            if (opt->meth_mode) {
+                gar[gcnt + r] = -1;
+                if (rev) free(rev);
+                continue;
+            }
             //kswr_t aln;
             //mem_alnreg_t b;
             int xtra = KSW_XSUBO | KSW_XSTART | (l_ms * opt->a < 250? KSW_XBYTE : 0) | (opt->min_seed_len * opt->a);
@@ -1217,13 +1309,24 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                           const uint8_t *pac, const mem_pestat_t pes[4],
                           const mem_alnreg_t *a, int l_ms, const uint8_t *ms,
                           mem_alnreg_v *ma, kswr_t **myaln, int32_t gcnt,
-                          int32_t *gar, mem_cache *mmc)
+                          int32_t *gar, mem_cache *mmc, const char *ms_orig,
+                          const int8_t *mat)
 {
     extern int mem_sort_dedup_patch_rev(const mem_opt_t *opt, const bntseq_t *bns,
                                         const uint8_t *pac, uint8_t *query, int n,
-                                        mem_alnreg_t *a);    
-    extern int mem_sort_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns,
-                                    const uint8_t *pac, uint8_t *query, int n, mem_alnreg_t *a);
+                                        mem_alnreg_t *a);
+    /* The mate-rescue dedup at the bottom passes bns/pac/query = 0 (dedup-only,
+     * no patch SW), so its matrix is unused; opt->mat default is correct there. */
+    /* D3 (--meth, A1/PR-6, B3): the rescued mate uses the OPPOSITE-strand matrix
+     * of the anchor `a`. The asymmetric `mat` is honored on the scalar ksw_align2
+     * fallback below (index == -1), which under --meth is the path EVERY meth
+     * rescue takes: _pre deliberately skips the batched enqueue for meth pairs
+     * (leaving gar = -1) because the batched kswv kernel (make_kswv /
+     * getScores8/16) is SYMMETRIC and cannot express the freed-cell asymmetry.
+     * So meth mate-rescue is fully γ-correct here. Teaching kswv a full
+     * mat[ref*5+read] so batched mate rescue could score the asymmetric matrix
+     * directly is a future PERF optimization, not a correctness gap. */
+    const int8_t *sw_mat = mat ? mat : opt->mat;
     #if MATE_SORT    
     extern int mem_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns,
                                const uint8_t *pac, uint8_t *query, int n, mem_alnreg_t *a);
@@ -1234,6 +1337,22 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
     int64_t l_pac = bns->l_pac;
     int i, r, skip[4], n = 0, rid = -1;
 
+    /* D3 (--meth, PR-6): for the scalar ksw_align2 fallback (index == -1) point
+     * the mate query at the ORIGINAL bases (ASCII meth_orig_seq, same orientation
+     * as `ms`/seq). The per-orientation RC below then reverse-complements them
+     * exactly as the projected mate. The batched SIMD scores are unaffected (they
+     * were computed in mem_sam_pe_batch from _pre's projected query). */
+    uint8_t *ms2 = NULL;
+    if (ms_orig != NULL) {
+        ms2 = (uint8_t*) malloc(l_ms);
+        assert(ms2 != NULL);
+        for (int k = 0; k < l_ms; ++k) {
+            unsigned char c = (unsigned char) ms_orig[k];
+            ms2[k] = (c < 4) ? c : nst_nt4_table[c];
+        }
+        ms = ms2;
+    }
+
     for (r = 0; r < 4; ++r) {
         skip[r] = pes[r].failed? 1 : 0;
     }
@@ -1241,8 +1360,8 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
     for (i = 0; i < ma->n; ++i) { // check which orinentation has been found
         int64_t dist;
         r = mem_infer_dir(l_pac, a->rb, ma->a[i].rb, &dist);
-        if (dist >= pes[r].low && dist <= pes[r].high) 
-            skip[r] = 1;        
+        if (dist >= pes[r].low && dist <= pes[r].high)
+            skip[r] = 1;
     }
 
     
@@ -1302,7 +1421,7 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                 assert(ref_rw != NULL);
                 memcpy(ref_rw, ref, (size_t)ref_len);
                 aln = ksw_align2(l_ms, seq, ref_len, ref_rw, 5,
-                                 opt->mat, opt->o_del, opt->e_del,
+                                 sw_mat, opt->o_del, opt->e_del,
                                  opt->o_ins, opt->e_ins, xtra, 0);
                 free(ref_rw);
             }
@@ -1313,6 +1432,17 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
             if (aln.score >= opt->min_seed_len && aln.qb >= 0) { // something goes wrong if aln.qb < 0
                 b.rid = a->rid;
                 b.is_alt = a->is_alt;
+                /* D3 (--meth, PR-6, B3): rescued mate hypothesis = OPPOSITE strand
+                 * of the anchor (directional: rescuing an OT anchor's mate uses OB
+                 * and vice versa); set from !a->meth_hypothesis so the output
+                 * layer (XG/XM) sources the right strand. -1 anchor stays -1.
+                 * (Under --meth this score came from the scalar ksw_align2 path
+                 * with the asymmetric matrix — see the top of this function — so
+                 * it is fully γ-correct, not symmetric/projected.)
+                 * Coordinates are already ORIGINAL (l_pac is the original l_pac via
+                 * the original bns), so the 6a coordinate fix holds. */
+                b.meth_hypothesis = (a->meth_hypothesis < 0) ? -1
+                                                             : !a->meth_hypothesis;
                 b.qb = is_rev? l_ms - (aln.qe + 1) : aln.qb;
                 b.qe = is_rev? l_ms - aln.qb : aln.qe + 1;
                 b.rb = is_rev? (l_pac<<1) - (rb + aln.te + 1) : rb + aln.tb;
@@ -1379,6 +1509,7 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
         if (rev) free(rev);
         // ref aliases ref_string (see bns_fetch_seq_v2 above); no free.
     }
+    if (ms2) free(ms2); // D3 (--meth): original-mate 2-bit scratch
     return n;
 }
 

@@ -1,25 +1,42 @@
 # Methylation Defaults
 
-`bwa-mem3 mem --meth` ships with a set of scoring and filtering defaults that
-match the bwameth.py reference implementation. This page describes what those
-defaults are, when to keep them, and when to override them.
+`bwa-mem3 mem --meth` ships with scoring and filtering defaults aligned with the
+bwameth.py reference implementation (in the default `collapsed` scoring mode).
+This page describes what those defaults are, how the scoring mode changes them,
+when to keep them, and when to override them.
+
+## Choosing a scoring mode (`--meth-scoring`)
+
+`--meth` scores against the original 4-letter reference, so it offers two models:
+
+- **`collapsed` (default)** — C/T and G/A interchangeable; bwameth-compatible
+  **placement**; mismatch penalty `-B 2`. Use for methylation-only workflows that
+  must match a bwameth release.
+- **`genomic` (opt-in)** — only the conversion direction is freed, so real
+  variants are penalized; truthful `NM`/`MD`; mismatch penalty `-B 4`. Use when
+  one BAM must serve both methylation and variant calling.
+
+See [Methylation Reference → Flags](../methylation/flags.md#--meth-scoring-collapsedgenomic).
 
 ## What `--meth` sets
 
-When `--meth` is passed, the following flags are applied automatically in
-addition to enabling inline c2t conversion and BAM post-processing:
+When `--meth` is passed, the following flags are applied automatically in addition
+to enabling seed projection and BAM post-processing. All are shared by both
+scoring modes **except the mismatch penalty `-B`, which is the mode's leniency
+gate**:
 
 | Flag | Value | Purpose |
 |------|-------|---------|
-| `-B` | `2` | Mismatch penalty. Reduced from the bwa-mem2 default of 4. Bisulfite-treated reads carry C→T and G→A mismatches at converted positions; a lower penalty prevents these from causing spurious soft-clipping or unmapped reads. |
-| `-L` | `10` | Clipping penalty. Increased from the bwa-mem2 default of 5 to discourage clipping of read ends that carry converted bases at positions that look like mismatches. |
-| `-U` | `100` | Unpaired read penalty. Higher than default; methylation libraries typically have well-defined insert sizes and anomalous pairing usually reflects a mapping artifact. |
-| `-T` | `40` | Minimum alignment score threshold. Higher than default; raises the bar to report an alignment, reducing spurious low-quality hits against the doubled reference. |
-| `-CM` | — | Treats soft-clipped bases as matches in CIGAR output. Required for correct behavior of downstream methylation callers (e.g. Bismark, MethylDackel) that count clipped bases. |
+| `-B` | `2` (`collapsed`) / `4` (`genomic`) | Mismatch penalty. `collapsed` lowers it to `2` (bwameth's value) so collapsed C/T-and-G/A matching is cheap; `genomic` keeps bwa's default `4` so real variants are penalized. This is the only `--meth`-default that depends on `--meth-scoring`. |
+| `-L` | `10` | Clipping penalty. Increased from the bwa default of 5 to discourage clipping of read ends that carry converted bases that look like mismatches. |
+| `-U` | `100` | Unpaired read penalty (paired-end). Higher than default; methylation libraries have well-defined insert sizes and anomalous pairing usually reflects a mapping artifact. Matches bwameth's `-U 100`. |
+| `-T` | `40` | Minimum alignment score threshold. Higher than default; raises the bar to report an alignment. |
+| `-M` | — | Mark shorter split hits as secondary (`-M`). |
+| `-C` | — | Append FASTA/FASTQ comment to output (carries the internal conversion metadata through the kernel). |
 
-These defaults can all be overridden on the command line. The `--meth` flag
-sets them first; any explicit flag that follows overrides the `--meth`-set
-value.
+`-CM` above is bwameth's shorthand; in bwa-mem3 these are the separate `-M` and
+`-C` flags. These defaults can all be overridden on the command line: `--meth`
+sets them first; any explicit flag that follows overrides the `--meth`-set value.
 
 ## When to keep the defaults
 
@@ -29,7 +46,7 @@ expected by most downstream methylation calling tools. Unless you have a
 specific reason to deviate, use:
 
 ```bash
-bwa-mem3 mem --meth --bam=0 -t 16 ref.fa R1.fq.gz R2.fq.gz \
+bwa-mem3 mem --meth -t 16 ref.fa R1.fq.gz R2.fq.gz \
   | samtools sort -@ 4 -o out.bam -
 samtools index out.bam
 ```
@@ -50,7 +67,7 @@ suppresses alignments to the reverse-complement strand, which reduces noise
 from strand-ambiguous alignments:
 
 ```bash
-bwa-mem3 mem --meth --set-as-failed r --bam=0 -t 16 ref.fa R1.fq.gz R2.fq.gz \
+bwa-mem3 mem --meth --set-as-failed r -t 16 ref.fa R1.fq.gz R2.fq.gz \
   | samtools sort -@ 4 -o out.bam -
 ```
 
@@ -65,7 +82,7 @@ If your library is PBAT / scBS-Seq (where intra-fragment chimerism is
 common) or you want bwameth.py-equivalent flagging, pass `--chimera-qc`:
 
 ```bash
-bwa-mem3 mem --meth --chimera-qc --bam=0 -t 16 ref.fa R1.fq.gz R2.fq.gz \
+bwa-mem3 mem --meth --chimera-qc -t 16 ref.fa R1.fq.gz R2.fq.gz \
   | samtools sort -@ 4 -o out.bam -
 ```
 
@@ -78,8 +95,11 @@ bwa-mem3 mem --meth --chimera-qc --bam=0 -t 16 ref.fa R1.fq.gz R2.fq.gz \
 
 ## Downstream tool compatibility
 
-The `--meth` output BAM is designed to be a drop-in replacement for the output
-of the `bwameth.py` pipeline. The following downstream tools have been used
+The `--meth` output BAM carries the Bismark tag set that downstream methylation
+tools expect, so it serves as a placement drop-in for the `bwameth.py` pipeline
+(in `collapsed` mode) — though scoring is computed against the original reference
+rather than in collapsed space, so it is not byte-for-byte identical to bwameth
+output. The following downstream tools have been used
 successfully with `bwa-mem3 --meth` output:
 
 - **`bismark_methylation_extractor`**, **methylKit `processBismarkAln`**,

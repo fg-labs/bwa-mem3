@@ -50,7 +50,10 @@ namespace { struct SpEncodeScope {
     ~SpEncodeScope() { if (on) sp_encode_add(sp_thread_cpu() - t0); }
 }; }
 
-meth_chrom_map_t *g_meth_cmap = NULL;
+/* D3 (--meth, PR-5): original-reference pac for XM:Z, set in fastmap.cpp.
+ * The meth output path is gated on opt->meth_mode (the chrom map that used to
+ * gate it was retired with the f/r output layer). */
+const uint8_t *g_meth_orig_pac = NULL;
 
 //----------------
 extern uint64_t tprof[LIM_R][LIM_C];
@@ -273,8 +276,39 @@ mem_opt_t *mem_opt_init()
     o->min_chain_weight = 0;
     o->max_chain_extend = 1<<30;
     o->mapQ_coef_len = 50; o->mapQ_coef_fac = log(o->mapQ_coef_len);
+    o->meth_scoring = MEM_METH_SCORING_COLLAPSED;  /* --meth default: bwameth-compatible */
     bwa_fill_scmat(o->a, o->b, o->mat);
+    mem_opt_fill_meth_mat(o);
     return o;
+}
+
+/* D3 (--meth, PR-4): (re)derive the per-hypothesis ASYMMETRIC matrices from the
+ * symmetric `mat` + match score `a`. Target-major mat[ref*5+read], ACGT order
+ * A,C,G,T,N. Free exactly ONE off-diagonal cell to a MATCH (+a); leave everything
+ * else (incl. the mirror cell, a real variant) at the symmetric value:
+ *   OT: free mat[C][T] = mat[1*5+3]  (ref C, read T = unmethylated C→T)
+ *   OB: free mat[G][A] = mat[2*5+0]  (ref G, read A = bottom-strand G→A)
+ * GENOMIC (opt->meth_scoring): only that one cell is freed ⇒ the mirror stays a
+ * real mismatch and the SIMD kernel takes its rank-1 fast path. COLLAPSED: the
+ * mirror cell is ALSO freed (two cells) so C/T and G/A are interchangeable
+ * (bwameth-compatible), via bandedSWA's general-matrix path. Selected per chain
+ * via mem_opt_meth_mat(); valid only under --meth. MUST be called after EVERY
+ * rebuild of opt->mat (mem_opt_init AND after main_mem parses -A/-B/-x and
+ * re-runs bwa_fill_scmat) — otherwise the meth matrices keep the default
+ * match/mismatch and silently ignore the user's scoring options. */
+void mem_opt_fill_meth_mat(mem_opt_t *o) {
+    memcpy(o->mat_ot, o->mat, sizeof(o->mat));
+    memcpy(o->mat_ob, o->mat, sizeof(o->mat));
+    o->mat_ot[1 * 5 + 3] = o->a;   /* OT: ref C / read T → match (C→T conversion)   */
+    o->mat_ob[2 * 5 + 0] = o->a;   /* OB: ref G / read A → match (G→A conversion)   */
+    if (o->meth_scoring == MEM_METH_SCORING_COLLAPSED) {
+        /* bwameth-compatible: free the MIRROR cell too so C/T (and G/A) are
+         * mutually interchangeable (collapsed 3-letter space). Two freed cells ⇒
+         * bandedSWA general path, not the rank-1 fast path. Loses variant vs.
+         * conversion discrimination; reproduces bwameth placement. */
+        o->mat_ot[3 * 5 + 1] = o->a;   /* OT: ref T / read C → match */
+        o->mat_ob[0 * 5 + 2] = o->a;   /* OB: ref A / read G → match */
+    }
 }
 
 /******************************
@@ -325,8 +359,11 @@ void sort_alnreg_score(int n, mem_alnreg_t* a) {
 
 int mem_patch_reg(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
                   uint8_t *query, const mem_alnreg_t *a, const mem_alnreg_t *b,
-                  int *_w)
+                  int *_w, const int8_t *mat)
 {
+    /* D3 (--meth, PR-4): `mat` is the per-hypothesis substitution matrix and
+     * `query` the original read bases; the caller passes opt->mat + projected
+     * read outside --meth so behavior is unchanged there. */
     int w, score, q_s, r_s;
     double r;
     if (bns == 0 || pac == 0 || query == 0) return 0;
@@ -357,7 +394,7 @@ int mem_patch_reg(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
     if (bwa_verbose >= 4)
         fprintf(stderr, "* test potential hit merge with global alignment; w=%d\n", w);
 
-    bwa_gen_cigar2(opt->mat, opt->o_del, opt->e_del, opt->o_ins, opt->e_ins, w,
+    bwa_gen_cigar2(mat, opt->o_del, opt->e_del, opt->o_ins, opt->e_ins, w,
                    bns->l_pac, pac, b->qe - a->qb, query + a->qb, a->rb, b->re,
                    &score, 0, 0);
 
@@ -417,7 +454,7 @@ int mem_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns,
                 }
                 else q->qe = q->qb;
             }
-            else if (q->rb < p->rb && (score = mem_patch_reg(opt, bns, pac, query, q, p, &w)) > 0) { // then merge q into p
+            else if (q->rb < p->rb && (score = mem_patch_reg(opt, bns, pac, query, q, p, &w, opt->mat)) > 0) { // then merge q into p
                 p->n_comp += q->n_comp + 1;
                 p->seedcov = p->seedcov > q->seedcov? p->seedcov : q->seedcov;
                 p->sub = p->sub > q->sub? p->sub : q->sub;
@@ -441,8 +478,16 @@ int mem_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns,
 
 int mem_sort_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns,
                          const uint8_t *pac, uint8_t *query, int n,
-                         mem_alnreg_t *a)
+                         mem_alnreg_t *a, const int8_t *mat)
 {
+    /* D3 (--meth, PR-4): `mat` is the per-read OT/OB matrix and `query` the
+     * original read bases (the caller threads both under --meth); outside --meth
+     * `mat` is opt->mat and `query` the normal read, so behavior is unchanged.
+     * All of a read's alnregs share one hypothesis under directional --meth, so a
+     * single per-read matrix is correct for the colinear merge below. mat == NULL
+     * (the default used by dedup-only callers, e.g. mate rescue passing 0,0,0)
+     * resolves to opt->mat — those callers also pass bns==0 so no patch SW runs. */
+    if (mat == NULL) mat = opt->mat;
     int m, i, j;
     if (n <= 1) return n;
     pdqsort_mem_ars2(n, a); // sort by the END position, not START!
@@ -471,7 +516,7 @@ int mem_sort_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns,
                 }
                 else q->qe = q->qb;
             }
-            else if (q->rb < p->rb && (score = mem_patch_reg(opt, bns, pac, query, q, p, &w)) > 0) { // then merge q into p
+            else if (q->rb < p->rb && (score = mem_patch_reg(opt, bns, pac, query, q, p, &w, mat)) > 0) { // then merge q into p
                 p->n_comp += q->n_comp + 1;
                 p->seedcov = p->seedcov > q->seedcov? p->seedcov : q->seedcov;
                 p->sub = p->sub > q->sub? p->sub : q->sub;
@@ -549,8 +594,12 @@ static int test_and_merge(const mem_opt_t *opt, int64_t l_pac, mem_chain_t *c,
 }
 
 int mem_seed_sw(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
-                int l_query, const uint8_t *query, const mem_seed_t *s)
+                int l_query, const uint8_t *query, const mem_seed_t *s,
+                const int8_t *mat)
 {
+    /* D3 (--meth, PR-4): `mat` is the (possibly asymmetric, per-hypothesis)
+     * substitution matrix for this chain; the caller passes opt->mat outside
+     * --meth so behavior is unchanged there. */
     int qb, qe, rid;
     int64_t rb, re, mid, l_pac = bns->l_pac;
     uint8_t *rseq = 0;
@@ -579,7 +628,7 @@ int mem_seed_sw(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
         rseq = t_rseq.v.a;
         // No qry-profile cache: each seed slices a different sub-query
         // (query+qb, qe-qb), so ksw_align2 always builds a fresh profile.
-        x = ksw_align2(qe - qb, (uint8_t*)query + qb, re - rb, rseq, 5, opt->mat, opt->o_del, opt->e_del, opt->o_ins, opt->e_ins, KSW_XSTART, NULL);
+        x = ksw_align2(qe - qb, (uint8_t*)query + qb, re - rb, rseq, 5, mat, opt->o_del, opt->e_del, opt->o_ins, opt->e_ins, KSW_XSTART, NULL);
         /* rseq aliases thread-local scratch; do not free. */
     }
     return x.score;
@@ -653,6 +702,14 @@ void mem_flt_chained_seeds(const mem_opt_t *opt, const bntseq_t *bns, const uint
     int i, j, k;// min_HSP_score = (int)(opt->a * min_l + .499);
     //if (min_l > MEM_SEEDSW_COEF * l_query) return; // don't run the following for short reads
 
+    /* D3 (--meth, PR-4): the chained-seed SW filter must score the ORIGINAL read
+     * against the original ref with the per-chain asymmetric matrix, same as
+     * extension — otherwise it over-penalizes bisulfite conversions and drops
+     * borderline seeds (the PR-3 placeholder concern). meth_qbuf is the reusable
+     * 2-bit encode of meth_orig_seq (same orientation as seq, per bwa.h). */
+    uint8_t *meth_qbuf = NULL;
+    int      meth_qbuf_cap = 0;
+
     for (i = 0; i < n_chn; ++i)
     {
         mem_chain_t *c = &a[i];
@@ -664,6 +721,33 @@ void mem_flt_chained_seeds(const mem_opt_t *opt, const bntseq_t *bns, const uint
         // read lengths -- dropping seeds inside that loop would no-op on the main
         // workload. Off (min_ext_len==0): no-op, output byte-identical.
         mem_chain_drop_short_seeds(c, opt->min_ext_len);
+        if (c->n == 0) continue;  /* CodeRabbit: drop_short_seeds can empty the
+                                   * chain; the meth block below reads seeds[0]. */
+
+        /* D3 (--meth, PR-4): swap to the original read + per-hypothesis matrix. */
+        const int8_t *mat = opt->mat;
+        if (opt->meth_mode && seq_[c->seqid].meth_orig_seq != NULL) {
+            if (l_query > meth_qbuf_cap) {
+                meth_qbuf_cap = l_query;
+                /* CodeRabbit: don't assign realloc() result back to meth_qbuf
+                 * directly — a NULL return would leak the old buffer. */
+                uint8_t *meth_qbuf_new = (uint8_t *) realloc(meth_qbuf, (size_t) meth_qbuf_cap);
+                assert(meth_qbuf_new != NULL);
+                meth_qbuf = meth_qbuf_new;
+            }
+            const char *os = seq_[c->seqid].meth_orig_seq;
+            for (int q = 0; q < l_query; ++q) {
+                unsigned char ch = (unsigned char) os[q];
+                meth_qbuf[q] = (ch < 4) ? ch : nst_nt4_table[ch];
+            }
+            query = meth_qbuf;
+            /* D3 (--meth, fix): strand-adjusted hypothesis — this chain's seeds
+             * are single-strand; a reverse chain (seeds[0].rbeg >= l_pac) extends
+             * against the RC reference, flipping the conversion's freed cell. */
+            int hyp = c->meth_hypothesis;
+            if (hyp >= 0 && c->seeds[0].rbeg >= bns->l_pac) hyp ^= 1;
+            mat = mem_opt_meth_mat(opt, hyp);
+        }
 
         double min_l = opt->min_chain_weight?
         MEM_HSP_COEF * opt->min_chain_weight : MEM_MINSC_COEF * log(l_query);
@@ -673,7 +757,7 @@ void mem_flt_chained_seeds(const mem_opt_t *opt, const bntseq_t *bns, const uint
         for (j = k = 0; j < c->n; ++j)
         {
             mem_seed_t *s = &c->seeds[j];
-            s->score = mem_seed_sw(opt, bns, pac, l_query, query, s);
+            s->score = mem_seed_sw(opt, bns, pac, l_query, query, s, mat);
             if (s->score < 0 || s->score >= min_HSP_score)
             {
                 s->score = s->score < 0? s->len * opt->a : s->score;
@@ -682,6 +766,7 @@ void mem_flt_chained_seeds(const mem_opt_t *opt, const bntseq_t *bns, const uint
         }
         c->n = k;
     }
+    free(meth_qbuf);  /* NULL outside --meth; free() is NULL-safe */
 }
 
 int mem_chain_flt(const mem_opt_t *opt, int n_chn_, mem_chain_t *a_, int tid)
@@ -990,9 +1075,99 @@ SMEM *mem_collect_smem(FMI_search *fmi, const mem_opt_t *opt,
     return matchArray;
 }
 
+/* D3 (--meth, PR-3): remap one seed hit from SEED-index (f/r-doubled) coordinates
+ * to ORIGINAL-reference coordinates + a bisulfite hypothesis label.
+ *
+ * The seed reference has 2N contigs in r0,f0,r1,f1,... order (rchrK = G→A / OB,
+ * fchrK = C→T / OT); both are FORWARD projections of the original contig K, so
+ * the seed-local position equals the original-local position. The seed FM-index
+ * additionally doubles its own pac (forward + reverse-complement), so a seed hit
+ * `seed_rbeg` lives in [0, 2*L_seed) where >= L_seed means the hit is on the RC
+ * of the seed reference. That RC strand is the genomic alignment strand and is
+ * INDEPENDENT of the OT/OB hypothesis (which is the f/r contig parity).
+ *
+ * Inputs:
+ *   seed_bns   — the seed (f/r-doubled) BNS, used to decode seed_rbeg.
+ *   orig_bns   — the original BNS (N contigs), the remap target.
+ *   seed_rbeg  — seed-index doubled-pac coordinate of the seed start.
+ *   seed_len   — seed length (>0); used to project the start across strands.
+ * Outputs (only written on success):
+ *   *orig_rbeg   — start coordinate in ORIGINAL doubled-pac space [0, 2*L_orig).
+ *   *orig_rid    — original contig id.
+ *   *hypothesis  — 1 = OT (odd "f" seed contig), 0 = OB (even "r" seed contig).
+ * Returns 0 on success, -1 if the hit cannot be remapped (bridging / out of
+ * range), in which case the caller should drop the seed.
+ *
+ * NOTE: the reverse-strand re-encoding below is the single most placement-
+ * critical step in --meth (spec §5.2 / plan §5: "strand bookkeeping can silently
+ * corrupt placement"). It is exercised end-to-end and covered by the seed→
+ * original remap + OT/OB PE/strand placement regression tests
+ * (test/regression/meth_seed_index.sh and the live mem --meth placement tests).
+ */
+static inline int meth_seed_to_orig(const bntseq_t *seed_bns,
+                                    const bntseq_t *orig_bns,
+                                    int64_t seed_rbeg, int32_t seed_len,
+                                    int64_t *orig_rbeg, int *orig_rid,
+                                    int8_t *hypothesis)
+{
+    if (seed_bns == NULL || orig_bns == NULL) return -1;
+    if (seed_rbeg < 0 || seed_rbeg >= (seed_bns->l_pac << 1)) return -1;
+
+    /* Decode the seed start to a forward seed coordinate + RC flag. */
+    int seed_is_rev = 0;
+    int64_t seed_fwd = bns_depos(seed_bns, seed_rbeg, &seed_is_rev); /* [0,L_seed) */
+    int seed_rid = bns_pos2rid(seed_bns, seed_fwd);
+    if (seed_rid < 0) return -1;
+
+    /* Seed contig order is r0,f0,r1,f1,...: orig contig = rid/2, OT iff odd. */
+    int o_rid = seed_rid >> 1;
+    if (o_rid < 0 || o_rid >= orig_bns->n_seqs) return -1;
+    *hypothesis = (int8_t)(seed_rid & 1); /* 1=f=OT(C→T), 0=r=OB(G→A) */
+
+    /* f/r seed contigs are forward projections of the original, so the seed-local
+     * offset is the original-local offset. Reject seeds that bridge the contig
+     * end (parity with bns_intv2rid, which returns -1 on a multi-contig / f-r
+     * boundary span). seed_fwd is the FORWARD coordinate of the seed start: for a
+     * forward seed the forward span is [seed_local, seed_local+span); for a
+     * reverse seed bns_depos returns the rightmost forward base, so the forward
+     * span is (seed_local-span, seed_local]. Require that whole span to fit the
+     * seed contig (and, since the original shares the layout, the original too). */
+    int64_t seed_local = seed_fwd - seed_bns->anns[seed_rid].offset;
+    int64_t span = (seed_len > 0) ? (int64_t)seed_len : 1;
+    int64_t span_lo = seed_is_rev ? (seed_local - span + 1) : seed_local;
+    int64_t span_hi = seed_is_rev ? (seed_local + 1) : (seed_local + span); /* exclusive */
+    int64_t seed_contig_len = seed_bns->anns[seed_rid].len;
+    int64_t orig_contig_len = orig_bns->anns[o_rid].len;
+    if (span_lo < 0 || span_hi > seed_contig_len) return -1;
+    if (span_hi > orig_contig_len)                return -1;
+    int64_t orig_fwd = orig_bns->anns[o_rid].offset + seed_local; /* [0,L_orig) */
+
+    /* Re-encode the genomic strand into the ORIGINAL doubled-pac space.
+     * NOTE: this mirrors the doubled-pac arithmetic used throughout pairing /
+     * mate rescue (e.g. b.rb = (l_pac<<1) - (rb + te + 1)).
+     * The seed and original references share identical per-contig length and
+     * forward layout, so the transform is a pure per-contig forward-coordinate
+     * offset shift (seed_offset → orig_offset, already applied to get orig_fwd),
+     * re-encoded to the SAME strand. bns_depos is its own inverse on a single
+     * position, so the START coordinate is preserved exactly across the shift;
+     * extension re-derives the span. */
+    if (!seed_is_rev) {
+        *orig_rbeg = orig_fwd;                                   /* forward */
+    } else {
+        *orig_rbeg = (orig_bns->l_pac << 1) - 1 - orig_fwd;      /* reverse */
+    }
+    /* NOTE: the reverse-strand re-encode above is THE placement-critical line; it
+     * is covered by the seed→original remap round-trip and the OT/OB paired-end
+     * strand placement regression tests. */
+    if (*orig_rbeg < 0 || *orig_rbeg >= (orig_bns->l_pac << 1)) return -1;
+    *orig_rid = o_rid;
+    return 0;
+}
+
 /** NEW ONE **/
 void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
                      const bntseq_t *bns,
+                     const bntseq_t *meth_orig_bns,
                      const bseq1_t *seq_,
                      int nseq,
                      int tid,
@@ -1005,7 +1180,13 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
     int b, e, l_rep, size = 0;
     int64_t i, pos = 0;
     int64_t smem_ptr = 0;
-    int64_t l_pac = bns->l_pac;
+    /* `bns` is the SEED (f/r-doubled) BNS used to decode SA coordinates. In
+     * --meth we remap each seed hit into ORIGINAL coordinates before chaining, so
+     * the chain-side bns / l_pac (rid lookup, strand-boundary merge test) must be
+     * the ORIGINAL ones. Outside --meth chain_bns == bns. */
+    const int meth_remap = (opt->meth_mode && meth_orig_bns != NULL);
+    const bntseq_t *chain_bns = meth_remap ? meth_orig_bns : bns;
+    int64_t l_pac = chain_bns->l_pac;
 
     int num[nseq];
     memset(num, 0, nseq*sizeof(int));
@@ -1102,7 +1283,22 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
                     fprintf(stderr, "rbeg: %ld, slen: %d, cnt: %d, n: %d, m: %d, num_smem: %ld\n",
                             s.rbeg, s.len, cnt-1, p->n, p->m, num_smem);
 
-                rid = bns_intv2rid(bns, s.rbeg, s.rbeg + s.len);
+                /* D3 (--meth, PR-3) seed→original remap (spec §5.2). The SA coord
+                 * just decoded (s.rbeg) is in SEED (f/r-doubled) coordinates. Map
+                 * it to ORIGINAL doubled-pac coords + an OT/OB hypothesis so all
+                 * downstream chaining/extension/output sees original space only.
+                 * Non-meth: chain_bns == bns and rid is the seed rid as before. */
+                int8_t meth_hyp = -1;
+                if (meth_remap) {
+                    int64_t o_rbeg = 0; int o_rid = -1;
+                    if (meth_seed_to_orig(bns, meth_orig_bns, s.rbeg, s.len,
+                                          &o_rbeg, &o_rid, &meth_hyp) != 0)
+                        continue; /* un-remappable (bridge/range): drop the seed */
+                    s.rbeg = tmp.pos = o_rbeg;
+                    rid = o_rid;
+                } else {
+                    rid = bns_intv2rid(bns, s.rbeg, s.rbeg + s.len);
+                }
                 // bridging multiple reference sequences or the
                 // forward-reverse boundary; TODO: split the seed;
                 // don't discard it!!!
@@ -1135,7 +1331,13 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
                     tmp.seeds[0] = s;
                     tmp.rid = rid;
                     tmp.seqid = l;
-                    tmp.is_alt = !!bns->anns[rid].is_alt;
+                    /* is_alt indexes the chain-side bns (original in --meth). */
+                    tmp.is_alt = !!chain_bns->anns[rid].is_alt;
+                    /* D3: carry the OT/OB hypothesis on the chain (-1 non-meth).
+                     * All seeds of one read share a hypothesis (directional
+                     * R1→OT / R2→OB), so test_and_merge needs no hypothesis
+                     * guard; new chains for the same read get the same label. */
+                    tmp.meth_hypothesis = meth_hyp;
                     kb_putp(chn, tree, &tmp);
                     num[l]++;
                 }
@@ -1171,8 +1373,17 @@ int mem_kernel1_core(FMI_search *fmi,
                      mem_seed_t *seedBuf,
                      int64_t seedBufSize,
                      mem_cache *mmc,
-                     int tid)
+                     int tid,
+                     const bntseq_t *meth_orig_bns,
+                     const uint8_t  *meth_orig_pac)
 {
+    /* D3 (--meth, PR-3): in --meth chaining/filtering run in ORIGINAL coords;
+     * outside --meth (or if a handle is missing) fall back to the seed index so
+     * the non-meth path is byte-for-byte unchanged. */
+    const bntseq_t *chain_bns = (opt->meth_mode && meth_orig_bns != NULL)
+                                ? meth_orig_bns : fmi->idx->bns;
+    const uint8_t  *chain_pac = (opt->meth_mode && meth_orig_pac != NULL)
+                                ? meth_orig_pac : fmi->idx->pac;
     int i;
     int64_t num_smem = 0, tot_len = 0;
     mem_chain_v *chn;
@@ -1292,6 +1503,7 @@ int mem_kernel1_core(FMI_search *fmi,
     tim = __rdtsc();
     printf_(VER, "6.1. Calling mem_chain..\n");
     mem_chain_seeds(fmi, opt, fmi->idx->bns,
+                    /* remap target (NULL outside --meth) */ meth_orig_bns,
                     seq_, nseq, tid,
                     chain_ar,
                     seedBuf,
@@ -1317,7 +1529,13 @@ int mem_kernel1_core(FMI_search *fmi,
     printf_(VER, "8. Calling mem_flt_chained_seeds..\n");
     for (int l=0; l<nseq; l++) {
         chn = &chain_ar[l];
-        mem_flt_chained_seeds(opt, fmi->idx->bns, fmi->idx->pac, seq_, chn->n, chn->a);
+        /* D3: seeds are now in ORIGINAL coords (remapped in mem_chain_seeds), so
+         * the seed-SW filter fetches the ORIGINAL ref window.
+         * D3 (--meth, PR-4): mem_flt_chained_seeds now scores the ORIGINAL read
+         * (meth_orig_seq) against the original ref with the per-chain asymmetric
+         * OT/OB matrix (mem_opt_meth_mat), so bisulfite conversions are no longer
+         * mis-penalized at the seed-filter stage. */
+        mem_flt_chained_seeds(opt, chain_bns, chain_pac, seq_, chn->n, chn->a);
     }
     printf_(VER, "8. Done mem_flt_chained_seeds..\n");
     // tprof[MEM_ALN_M2][tid] += __rdtsc() - tim;
@@ -1334,9 +1552,18 @@ int mem_kernel2_core(FMI_search *fmi,
                      mem_chain_v *chain_ar,
                      mem_cache *mmc,
                      uint8_t *ref_string,
-                     int tid)
+                     int tid,
+                     const bntseq_t *meth_orig_bns,
+                     const uint8_t  *meth_orig_pac)
 {
     int i;
+    /* D3 (--meth, PR-3): extension/dedup must run in ORIGINAL coords. ref_string
+     * is already the original .0123 (worker_aln passes mem_aln_ref_string).
+     * Outside --meth these fall back to the seed/normal index unchanged. */
+    const bntseq_t *aln_bns = (opt->meth_mode && meth_orig_bns != NULL)
+                              ? meth_orig_bns : fmi->idx->bns;
+    const uint8_t  *aln_pac = (opt->meth_mode && meth_orig_pac != NULL)
+                              ? meth_orig_pac : fmi->idx->pac;
     for (int l=0; l<nseq; l++)
     {
         kv_init(regs[l]);
@@ -1344,9 +1571,21 @@ int mem_kernel2_core(FMI_search *fmi,
     /****************** Kernel 2: B-SWA *********************/
     uint64_t tim = __rdtsc();
     printf_(VER, "9. Calling mem_chain2aln...\n");
+    /* D3 (--meth, PR-4): mem_chain2aln_across_reads_V2 now extends the ORIGINAL
+     * read bases (seq_[].meth_orig_seq, 2-bit-encoded internally) against the
+     * ORIGINAL ref window with the per-hypothesis asymmetric matrix selected from
+     * chain->meth_hypothesis. The ungapped fast path is disabled under --meth
+     * (it cannot express the matrix). a->score / a->truesc — and therefore
+     * selection (mem_mark_primary_se) and MAPQ (mem_approx_mapq_se) downstream —
+     * are now original-space γ scores. A MIXED-hypothesis batch (interleaved
+     * R1/OT + R2/OB — the common paired-end case) is handled by bsw_run_tier's
+     * per-hypothesis partition pass inside the function: each tier's pairs are
+     * split by meth_hypothesis and scored against a matching OT/OB SW object, so
+     * every pair gets its asymmetric matrix. Homogeneous (single-hypothesis)
+     * batches collapse to a single partition with no extra cost. */
     mem_chain2aln_across_reads_V2(opt,
-                                  fmi->idx->bns,
-                                  fmi->idx->pac,
+                                  aln_bns,
+                                  aln_pac,
                                   seq_,
                                   nseq,
                                   chain_ar,
@@ -1387,19 +1626,49 @@ int mem_kernel2_core(FMI_search *fmi,
         regs[l].n = m;
     }
 
+    /* D3 (--meth, PR-4): the colinear alnreg merge in mem_sort_dedup_patch
+     * recomputes p->score/p->truesc (feeds selection + MAPQ), so it must use the
+     * ORIGINAL read + per-read OT/OB matrix like extension. Under directional
+     * --meth every alnreg of a read shares one hypothesis, so one matrix per read
+     * is correct. Outside --meth (or with no orig seq) it stays the projected
+     * read + opt->mat — unchanged. The original read is 2-bit-encoded into a
+     * reusable scratch buffer (same orientation as seq, per bwa.h). */
+    uint8_t *dd_qbuf = NULL;
+    int      dd_qbuf_cap = 0;
     for (int l=0; l<nseq; l++) {
-        regs[l].n = mem_sort_dedup_patch(opt, fmi->idx->bns,
-                                         fmi->idx->pac,
-                                         (uint8_t*) seq_[l].seq,
-                                         regs[l].n, regs[l].a);
+        uint8_t      *dd_query = (uint8_t*) seq_[l].seq;
+        const int8_t *dd_mat   = opt->mat;
+        if (opt->meth_mode && seq_[l].meth_orig_seq != NULL) {
+            int l_query = seq_[l].l_seq;
+            if (l_query > dd_qbuf_cap) {
+                dd_qbuf_cap = l_query;
+                dd_qbuf = (uint8_t *) realloc(dd_qbuf, (size_t) dd_qbuf_cap);
+                assert(dd_qbuf != NULL);
+            }
+            const char *os = seq_[l].meth_orig_seq;
+            for (int q = 0; q < l_query; ++q) {
+                unsigned char ch = (unsigned char) os[q];
+                dd_qbuf[q] = (ch < 4) ? ch : nst_nt4_table[ch];
+            }
+            dd_query = dd_qbuf;
+            /* per-read STRAND-ADJUSTED hypothesis (see meth_strand_hyp); take the
+             * first alnreg's (dedup-patch shares one matrix across the read). */
+            int hyp = (regs[l].n > 0) ? regs[l].a[0].meth_strand_hyp : -1;
+            dd_mat = mem_opt_meth_mat(opt, hyp);
+        }
+        regs[l].n = mem_sort_dedup_patch(opt, aln_bns,
+                                         aln_pac,
+                                         dd_query,
+                                         regs[l].n, regs[l].a, dd_mat);
     }
+    free(dd_qbuf);  /* NULL outside --meth; free() is NULL-safe */
 
     for (int l=0; l<nseq; l++)
     {
         for (i = 0; i < regs[l].n; ++i)
         {
             mem_alnreg_t *p = &regs[l].a[i];
-            if (p->rid >= 0 && fmi->idx->bns->anns[p->rid].is_alt)
+            if (p->rid >= 0 && aln_bns->anns[p->rid].is_alt)
                 p->is_alt = 1;
         }
     }
@@ -1413,14 +1682,18 @@ static void worker_aln(void *data, int seq_id, int batch_size, int tid)
     worker_t *w = (worker_t*) data;
 
     printf_(VER, "11. Calling mem_kernel2_core..\n");
+    /* D3 (--meth): pass the ORIGINAL .0123 ref_string and original bns/pac so
+     * extension/dedup fetch original bases for the (now original-coord) seeds.
+     * mem_aln_* return the seed/normal handles outside --meth (no-op there). */
     mem_kernel2_core(w->fmi, w->opt,
                      w->seqs + seq_id,
                      w->regs + seq_id,
                      batch_size,
                      w->chain_ar + seq_id,
                      &w->mmc,
-                     w->ref_string,
-                     tid);
+                     mem_aln_ref_string(w),
+                     tid,
+                     w->meth_orig_bns, w->meth_orig_pac);
     printf_(VER, "11. Done mem_kernel2_core....\n");
 
 }
@@ -1445,7 +1718,9 @@ static void worker_bwt(void *data, int seq_id, int batch_size, int tid)
                      w->seedBuf + seq_id * AVG_SEEDS_PER_READ,
                      seedBufSz,
                      &(w->mmc),
-                     tid);
+                     tid,
+                     /* D3 (--meth) remap target; NULL outside --meth */
+                     w->meth_orig_bns, w->meth_orig_pac);
     printf_(VER, "4. Done mem_kernel1_core....\n");
 }
 
@@ -1496,8 +1771,19 @@ static void worker_sam(void *data, int seqid, int batch_size, int tid)
         for (int i=start; i< end; i+=2)
         {
             // orig mem_sam_pe() function
-            mem_sam_pe(w->opt, w->fmi->idx->bns,
-                       w->fmi->idx->pac, w->pes,
+            /* D3 (--meth, PR-3): pairing + mate rescue run in ORIGINAL coords
+             * (anchors already remapped). mem_aln_bns/pac return the original
+             * bns/pac in --meth; the seed/normal index otherwise. This is where
+             * the mate-rescue coordinate reconciliation (6a) lands: mem_matesw's
+             * window math derives l_pac from bns->l_pac, so passing original
+             * bns/pac fixes the doubled-pac↔real-chrom mismatch.
+             * D3 (--meth, PR-6): mem_pair_resolve now drives mem_matesw with the
+             * ORIGINAL mate bases (s[!i].meth_orig_seq) + the OPPOSITE-strand
+             * asymmetric matrix of the anchor; the rescued mate's meth_hypothesis
+             * is set to !anchor. (This scalar mem_sam_pe path is selected only
+             * when no batched kswv kernel is available.) */
+            mem_sam_pe(w->opt, mem_aln_bns(w),
+                       mem_aln_pac(w), w->pes,
                        (w->n_processed >> 1) + pos++,   // check!
                        &w->seqs[i],
                        &w->regs[i]);
@@ -1512,8 +1798,8 @@ static void worker_sam(void *data, int seqid, int batch_size, int tid)
         int32_t gcnt = 0;
         for (int i=start; i< end; i+=2)
         {
-            mem_sam_pe_batch_pre(w->opt, w->fmi->idx->bns,
-                                 w->fmi->idx->pac, w->pes,
+            mem_sam_pe_batch_pre(w->opt, mem_aln_bns(w),
+                                 mem_aln_pac(w), w->pes,
                                  (w->n_processed >> 1) + pos++,   // check!
                                  &w->seqs[i],
                                  &w->regs[i],
@@ -1540,8 +1826,8 @@ static void worker_sam(void *data, int seqid, int batch_size, int tid)
         kswr_t *myaln = aln;
         for (int i=start; i< end; i+=2)
         {
-            mem_sam_pe_batch_post(w->opt, w->fmi->idx->bns,
-                                  w->fmi->idx->pac, w->pes,
+            mem_sam_pe_batch_post(w->opt, mem_aln_bns(w),
+                                  mem_aln_pac(w), w->pes,
                                   (w->n_processed >> 1) + pos++,   // check!
                                   &w->seqs[i],
                                   &w->regs[i],
@@ -1567,7 +1853,8 @@ static void worker_sam(void *data, int seqid, int batch_size, int tid)
 #if V17  // Feature from v0.7.17 of orig. bwa-mem
             if (w->opt->flag & MEM_F_PRIMARY5) mem_reorder_primary5(w->opt->T, &w->regs[i]);
 #endif
-            mem_reg2sam(w->opt, w->fmi->idx->bns, w->fmi->idx->pac, &w->seqs[i],
+            /* D3 (--meth): emit in ORIGINAL coords/alphabet via mem_aln_bns/pac. */
+            mem_reg2sam(w->opt, mem_aln_bns(w), mem_aln_pac(w), &w->seqs[i],
                         &w->regs[i], 0, 0);
             free(w->regs[i].a);
         }
@@ -1609,9 +1896,12 @@ void mem_process_seqs(mem_opt_t *opt,
             memcpy(pes, pes0, 4 * sizeof(mem_pestat_t)); // if pes0 != NULL, set the insert-size
                                                          // distribution as pes0
         else {
+            /* D3 (--meth): insert-size inference operates on alnreg.rb which are
+             * now in ORIGINAL doubled-pac space, so use the ORIGINAL l_pac. */
+            const bntseq_t *pestat_bns = mem_aln_bns(&w);
             fprintf(stderr, "[0000] Inferring insert size distribution of PE reads from data, "
-                    "l_pac: %ld, n: %d\n", w.fmi->idx->bns->l_pac, n);
-            mem_pestat(opt, w.fmi->idx->bns->l_pac, n, w.regs, pes); // otherwise, infer the insert size
+                    "l_pac: %ld, n: %d\n", pestat_bns->l_pac, n);
+            mem_pestat(opt, pestat_bns->l_pac, n, w.regs, pes); // otherwise, infer the insert size
                                                          // distribution from data
         }
     }
@@ -1783,7 +2073,7 @@ void mem_reg2sam(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
         if (p->secondary >= 0 && p->secondary < INT_MAX && p->score < a->a[p->secondary].score * opt->drop_ratio) continue;
         q = kv_pushp(mem_aln_t, aa);
 
-        *q = mem_reg2aln(opt, bns, pac, s->l_seq, s->seq, p);
+        *q = mem_reg2aln(opt, bns, pac, s->l_seq, s->seq, p, s->meth_orig_seq);
         assert(q->rid >= 0); // this should not happen with the new code
         q->XA = XA? XA[k] : 0;
         q->HN = HN? HN[k] : -1;
@@ -1847,11 +2137,13 @@ void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str,
     /* BAM short-circuit: meth_mode applies the bisulfite overlay (chrom
      * consolidation, YD:Z, chimera QC), plain bam_mode uses the generic
      * writer. Either path leaves `str` untouched. */
-    if (opt->meth_mode && g_meth_cmap != NULL) {
+    if (opt->meth_mode) {
         struct bam1_t *b = bam_writer_alloc();
         if (b == NULL)
             err_fatal(__func__, "out of memory allocating bam1_t for meth record");
-        if (meth_mem_aln_to_bam(b, opt, bns, s, n, list, which, m_, g_meth_cmap) != 0) {
+        /* `bns` here is the ORIGINAL bns under --meth (mem_aln_bns()); pair
+         * it with the original pac global for the XM:Z reference window. */
+        if (meth_mem_aln_to_bam(b, opt, bns, g_meth_orig_pac, s, n, list, which, m_) != 0) {
             bam_writer_free(b);
             err_fatal(__func__, "meth BAM conversion failed for read \"%s\"", s->name);
         }
@@ -2047,7 +2339,7 @@ void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str,
     str->s[str->l] = 0;  /* single trailing NUL — unsafe writers skipped this */
 }
 
-mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, int l_query, const char *query_, const mem_alnreg_t *ar)
+mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, int l_query, const char *query_, const mem_alnreg_t *ar, const char *meth_orig_query)
 {
     mem_aln_t a;
     int i, w2, tmp, qb, qe, NM, score, is_rev, last_sc = -(1<<30), l_MD;
@@ -2056,16 +2348,28 @@ mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *
 
     memset(&a, 0, sizeof(mem_aln_t));
     a.HN = -1; // sentinel: HN not computed unless caller fills from mem_gen_alt out_hn
+    a.meth_hypothesis = -1; // non-meth default; overwritten below from ar
     if (ar == 0 || ar->rb < 0 || ar->re < 0) { // generate an unmapped record
         a.rid = -1; a.pos = -1; a.flag |= 0x4;
         return a;
     }
+    a.meth_hypothesis = ar->meth_hypothesis; // carry hypothesis to the output layer
     qb = ar->qb, qe = ar->qe;
     rb = ar->rb, re = ar->re;
+    /* D3 (--meth, PR-5): output CIGAR/NM/MD must reflect the ORIGINAL read vs the
+     * ORIGINAL reference in the original alphabet, so a real (non-converting) SNP
+     * shows as a mismatch and the bisulfite C→T/G→A conversion shows as read-T at
+     * ref-C (the substrate a downstream double-masking step like Revelio expects;
+     * plan §4 / spec §6.1). When `meth_orig_query` is supplied, regen from the
+     * original bases; else fall back to the projected `query_` (non-meth path,
+     * byte-for-byte identical to legacy). */
+    const int use_meth_orig = (opt->meth_mode && meth_orig_query != NULL
+                               && ar->meth_hypothesis >= 0);
+    const char *regen_query = use_meth_orig ? meth_orig_query : query_;
     query = (uint8_t*) malloc(l_query);
     assert(query != NULL);
     for (i = 0; i < l_query; ++i) // convert to the nt4 encoding
-        query[i] = query_[i] < 5? query_[i] : nst_nt4_table[(int)query_[i]];
+        query[i] = regen_query[i] < 5? regen_query[i] : nst_nt4_table[(int)regen_query[i]];
     a.mapq = ar->secondary < 0? mem_approx_mapq_se(opt, ar) : 0;
     if (ar->secondary >= 0) a.flag |= 0x100; // secondary alignment
     tmp = infer_bw(qe - qb, re - rb, ar->truesc, opt->a, opt->o_del, opt->e_del);
@@ -2074,10 +2378,41 @@ mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *
     if (bwa_verbose >= 4) fprintf(stderr, "* Band width: inferred=%d, cmd_opt=%d, alnreg=%d\n", w2, opt->w, ar->w);
     if (w2 > opt->w) w2 = w2 < ar->w? w2 : ar->w;
     i = 0; a.cigar = 0;
+    /* D3 (--meth, PR-5): native-alphabet output regen.
+     *   - `regen_query` is the ORIGINAL read (meth_orig_query) under --meth, else
+     *     the projected read for non-meth (legacy, unchanged).
+     *   - `regen_mat` is the per-hypothesis ASYMMETRIC matrix under --meth so the
+     *     CIGAR/gap shape matches the asymmetric extension that selected this
+     *     region (using the symmetric matrix with the ORIGINAL read would
+     *     re-penalize every conversion as a mismatch and can shift gaps); for
+     *     non-meth it is the symmetric opt->mat (legacy, unchanged).
+     *
+     * NOTE (--meth NM/MD-vs-conversion policy, RESOLVED — plan §4): bwa_gen_cigar2
+     * computes NM/MD by LITERAL base comparison (query[x+i] != rseq[y+i]),
+     * independent of `regen_mat`. So a bisulfite C→T (OT) / G→A (OB) at a
+     * ref-C/ref-G is COUNTED as one mismatch in NM and emitted in MD, exactly like
+     * a real SNP — it is NOT hidden. This is deliberate: it is the substrate a
+     * downstream Revelio-style double-mask + conventional caller expects (the
+     * conversion is visible as read-T at ref-C, then BQ-masked downstream; the
+     * aligner does no masking). The conversion is NOT double-counted against the
+     * alignment SCORE: the asymmetric `regen_mat` frees the conversion cell to a
+     * match (+a) for the DP, while NM/MD count it once as a literal mismatch — two
+     * separate concerns. Hiding conversions from NM/MD (e.g. a Bismark-style
+     * XM-only consumer) would be a different, explicit choice and must be made
+     * here, not assumed. */
+    /* D3 (--meth, fix): the CIGAR regen must use the SAME strand-adjusted matrix
+     * as the extension (see mem_alnreg_t.meth_strand_hyp). ar->rb is final here,
+     * so derive is_rev directly (rb in doubled-pac; >= l_pac = reverse) and flip
+     * the hypothesis; otherwise reverse-strand reads regen with the wrong matrix
+     * and their conversions become CIGAR mismatches / soft-clips. */
+    int regen_hyp = ar->meth_hypothesis;
+    if (regen_hyp >= 0 && ar->rb >= bns->l_pac) regen_hyp ^= 1;
+    const int8_t *regen_mat = use_meth_orig
+        ? mem_opt_meth_mat(opt, regen_hyp) : opt->mat;
     do {
         free(a.cigar);
         w2 = w2 < opt->w<<2? w2 : opt->w<<2;
-        a.cigar = bwa_gen_cigar2(opt->mat, opt->o_del, opt->e_del, opt->o_ins, opt->e_ins, w2, bns->l_pac, pac, qe - qb, (uint8_t*)&query[qb], rb, re, &score, &a.n_cigar, &NM);
+        a.cigar = bwa_gen_cigar2(regen_mat, opt->o_del, opt->e_del, opt->o_ins, opt->e_ins, w2, bns->l_pac, pac, qe - qb, (uint8_t*)&query[qb], rb, re, &score, &a.n_cigar, &NM);
         if (bwa_verbose >= 4) fprintf(stderr, "* Final alignment: w2=%d, global_sc=%d, local_sc=%d\n", w2, score, ar->truesc);
         if (score == last_sc || w2 == opt->w<<2) break; // it is possible that global alignment and local alignment give different scores
         last_sc = score;
@@ -2324,6 +2659,98 @@ inline void sortPairsLen(SeqPair *pairArray, int32_t count, SeqPair *tempArray, 
     for(i = 0; i < count; i++) {
         pairArray[i] = tempArray[i];
     }
+}
+
+/* ------------------------------------------------------------------------- *
+ * D3 (--meth, A1/PR-4): per-hypothesis banded-SW tier dispatch.
+ *
+ * A worker batch interleaves R1 (OT, C->T) and R2 (OB, G->A) reads, so a single
+ * per-object substitution matrix cannot score every pair in the batch correctly
+ * (the PR-3 placeholder fell back to the SYMMETRIC matrix for mixed batches).
+ * bsw_run_tier() partitions a tier's pair array in place by the owning alnreg's
+ * meth_hypothesis (OT = odd, OB = even, none = <0) and runs the matching SW
+ * object on each contiguous run, so each pair is scored in original space with
+ * its asymmetric OT/OB matrix. Each run is single-hypothesis, so the kernel's
+ * rank-1 fast path still applies. The kernel re-sorts pairs by length internally
+ * and the retry loop reads results back via seqid/regid, so the in-place reorder
+ * is safe.
+ *
+ * Outside --meth the partition is skipped and the call is byte-for-byte the
+ * original single kernel invocation on the symmetric object.
+ * ------------------------------------------------------------------------- */
+enum BswMethTier { BSW_TIER_SCALAR, BSW_TIER_16, BSW_TIER_8 };
+
+/* One tier kernel call over pa[0..n). `sort_scratch` must be a SeqPair buffer
+ * DISTINCT from `pa` (sortPairsLen is a counting sort that scatters through it;
+ * aliasing pa would corrupt the sort). Scalar tier ignores sort_scratch. */
+static inline void bsw_tier_kernel(BswMethTier tier, IBandedPairWiseSW *bsw,
+        SeqPair *pa, uint8_t *ref, uint8_t *qer, int n, int nthreads, int32_t w,
+        SeqPair *sort_scratch, int32_t *hist)
+{
+    if (n <= 0) return;
+    switch (tier) {
+    case BSW_TIER_SCALAR:
+        bsw->scalarBandedSWAWrapper(pa, ref, qer, n, nthreads, w);
+        break;
+    case BSW_TIER_16:
+#if !HAVE_BSW_VECTOR_8_16
+        bsw->scalarBandedSWAWrapper(pa, ref, qer, n, nthreads, w);
+#else
+        sortPairsLen(pa, n, sort_scratch, hist);
+        bsw->getScores16(pa, ref, qer, n, nthreads, w);
+#endif
+        break;
+    case BSW_TIER_8:
+#if !HAVE_BSW_VECTOR_8_16
+        bsw->scalarBandedSWAWrapper(pa, ref, qer, n, nthreads, w);
+#else
+        sortPairsLen(pa, n, sort_scratch, hist);
+        /* int8 diagonal encoding can't represent a band >= 128; divert to the
+         * 16-bit kernel once the doubling retry pushes w past the envelope. */
+        if (w <= BSW8_MAX_W) bsw->getScores8(pa, ref, qer, n, nthreads, w);
+        else                 bsw->getScores16(pa, ref, qer, n, nthreads, w);
+#endif
+        break;
+    }
+}
+
+/* Dispatch one tier of `nump` pairs. Non-meth: a single call on `sym` with the
+ * original `base_scratch` (= seqPairArrayAux). Meth: 3-way in-place partition by
+ * hypothesis, then one call per non-empty run on the matching object, using
+ * `meth_scratch` (= the retry loop's pair_ar_aux, always distinct from pair_ar)
+ * as the sort scratch. */
+static inline void bsw_run_tier(BswMethTier tier, const mem_opt_t *opt,
+        const mem_alnreg_v *av_v,
+        IBandedPairWiseSW *sym, IBandedPairWiseSW *ot, IBandedPairWiseSW *ob,
+        SeqPair *pair_ar, uint8_t *ref, uint8_t *qer, int nump,
+        int nthreads, int32_t w,
+        SeqPair *base_scratch, SeqPair *meth_scratch, int32_t *hist)
+{
+    if (nump <= 0) return;
+    if (!opt->meth_mode) {
+        bsw_tier_kernel(tier, sym, pair_ar, ref, qer, nump, nthreads, w,
+                        base_scratch, hist);
+        return;
+    }
+    /* Dutch-flag partition into [OT (key 0) | OB (key 1) | SYM (key 2)]. Order
+     * within/among runs is irrelevant: the kernel re-sorts by length and the
+     * caller maps each result back to its alnreg by seqid/regid. */
+    int lo = 0, mid = 0, hi = nump - 1;
+    while (mid <= hi) {
+        const SeqPair *sp = &pair_ar[mid];
+        /* strand-adjusted hypothesis (see mem_alnreg_t.meth_strand_hyp): the
+         * extension matrix must match the conversion direction AS SEEN against
+         * the (possibly RC) reference window, not the raw genome-strand hypothesis. */
+        int h = av_v[sp->seqid].a[sp->regid].meth_strand_hyp;
+        int key = (h < 0) ? 2 : ((h & 1) ? 0 : 1);
+        if (key == 0)      { SeqPair t = pair_ar[lo]; pair_ar[lo]  = pair_ar[mid]; pair_ar[mid] = t; lo++; mid++; }
+        else if (key == 1) { mid++; }
+        else               { SeqPair t = pair_ar[mid]; pair_ar[mid] = pair_ar[hi]; pair_ar[hi]  = t; hi--; }
+    }
+    int n_ot = lo, n_ob = mid - lo, n_sym = nump - mid;
+    bsw_tier_kernel(tier, ot,  pair_ar,       ref, qer, n_ot,  nthreads, w, meth_scratch, hist);
+    bsw_tier_kernel(tier, ob,  pair_ar + lo,  ref, qer, n_ob,  nthreads, w, meth_scratch, hist);
+    bsw_tier_kernel(tier, sym, pair_ar + mid, ref, qer, n_sym, nthreads, w, meth_scratch, hist);
 }
 
 /* Restructured BSW parent function */
@@ -2690,6 +3117,17 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
 
     int spos = 0;
 
+    /* D3 (--meth, PR-4): extension scores the ORIGINAL (unconverted) read bases
+     * against the original reference, not the projected (C→T / G→A) read used for
+     * seeding. seq_[l].meth_orig_seq holds the original bases as NUL-terminated
+     * ASCII in the SAME orientation/order as seq_[l].seq (see the bseq1_t
+     * orientation contract in bwa.h), so a 2-bit encode of it indexes identically
+     * to the projected query the extension index math already assumes — every
+     * qs[i] = query[...] below stays correct with no index change. We 2-bit-encode
+     * into this reusable scratch buffer per read. NULL/unused outside --meth. */
+    uint8_t *meth_qbuf = NULL;
+    int      meth_qbuf_cap = 0;
+
     // uint64_t timUP = __rdtsc();
     for (int l=0; l<nseq; l++)
     {
@@ -2701,6 +3139,30 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
 
         const uint8_t *query = (uint8_t *) seq_[l].seq;
         int l_query = seq_[l].l_seq;
+
+        /* D3 (--meth, PR-4): swap the extension query to the ORIGINAL read bases.
+         * seq_[l].seq is the projected (already C→T/G→A) read, used only for
+         * seeding; extension must score the original read against the original
+         * ref with the per-hypothesis asymmetric matrix. We 2-bit-encode
+         * meth_orig_seq (ASCII, same orientation as seq) into meth_qbuf and point
+         * `query` at it. If meth_orig_seq is missing (should not happen under
+         * --meth once ingest populates it) we fall back to the projected read so
+         * the path still runs. */
+        if (opt->meth_mode && seq_[l].meth_orig_seq != NULL) {
+            if (l_query > meth_qbuf_cap) {
+                meth_qbuf_cap = l_query;
+                /* CodeRabbit: temp pointer so a NULL realloc doesn't leak. */
+                uint8_t *meth_qbuf_new = (uint8_t *) realloc(meth_qbuf, (size_t) meth_qbuf_cap);
+                assert(meth_qbuf_new != NULL);
+                meth_qbuf = meth_qbuf_new;
+            }
+            const char *os = seq_[l].meth_orig_seq;
+            for (int i = 0; i < l_query; ++i) {
+                unsigned char c = (unsigned char) os[i];
+                meth_qbuf[i] = (c < 4) ? c : nst_nt4_table[c];
+            }
+            query = meth_qbuf;
+        }
 
         mem_chain_v *chn = &chain_ar[l];
         mem_alnreg_v *av = &av_v[l];  // alignment
@@ -2808,6 +3270,36 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                 a->frac_rep = c->frac_rep;
                 a->seedlen0 = s->len;
                 a->c = c; //ptr
+                /* D3 (--meth, PR-3): carry the OT/OB hypothesis from chain to
+                 * alnreg (-1 outside --meth) so PR-4's asymmetric extension and
+                 * the output (XG) layer can select the matrix/strand. */
+                a->meth_hypothesis = c->meth_hypothesis;
+                /* D3 (--meth, fix): strand-adjusted hypothesis for the extension
+                 * matrix. Reverse-strand seeds (s->rbeg >= l_pac, original
+                 * doubled-pac) extend against the RC reference window, which
+                 * flips the conversion's freed cell — so flip the hypothesis. */
+                a->meth_strand_hyp = (c->meth_hypothesis < 0) ? -1
+                    : (int8_t)((c->meth_hypothesis ^ (s->rbeg >= l_pac ? 1 : 0)) & 1);
+                /* D3 (--meth): the seed matched in projected 3-letter space, but
+                 * its 4-letter score against the ORIGINAL read + ref is not
+                 * necessarily len*a — a seed-internal variant (e.g. a C/T mirror
+                 * that collapsed in seed space) scores as a mismatch under the
+                 * per-strand matrix. Recompute the true ungapped seed score so the
+                 * alnreg score (the h0 the extension starts from, hence AS, MAPQ,
+                 * and mate rescue) is honest rather than optimistically len*a.
+                 * --meth-scoring collapsed frees C/T (and G/A) both ways, so this
+                 * reproduces len*a (bwameth-like); genomic penalizes the variant.
+                 * query is the ORIGINAL read (meth_orig_seq, set above); rseq is
+                 * the original 4-letter ref window. mat[ref*5+read] is target-major
+                 * (matches mem_opt_fill_meth_mat). */
+                int meth_seed_sc = s->len * opt->a;
+                if (opt->meth_mode && a->meth_strand_hyp >= 0) {
+                    const int8_t *seed_mat = mem_opt_meth_mat(opt, a->meth_strand_hyp);
+                    const int64_t roff = s->rbeg - rmax[0];
+                    meth_seed_sc = 0;
+                    for (int _i = 0; _i < s->len; ++_i)
+                        meth_seed_sc += seed_mat[ rseq[roff + _i] * 5 + query[s->qbeg + _i] ];
+                }
                 a->chain_n_hits = chain_max_n_hits;
                 a->rb = a->qb = a->re = a->qe = H0_;
 
@@ -2818,7 +3310,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                 if (s->qbeg)  // left extension
                 {
                     SeqPair sp;
-                    sp.h0 = s->len * opt->a;
+                    sp.h0 = meth_seed_sc;   /* D3: true seed score (== len*a outside --meth) */
                     sp.seqid = c->seqid;
                     sp.regid = av->n - 1;
 
@@ -2895,7 +3387,14 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                     //   HIT      → skip SW; fill a->* from ungapped.
                     //   TIGHT    → save sp.tight_band; SW will use it.
                     //   FALLBACK → use opt->w.
-                    if (sp.len1 >= sp.len2 && sp.len2 <= FP_N_MAX) {
+                    /* D3 (--meth, PR-4): the ungapped fast path scores with
+                     * opt->a/opt->b hardcoded (ungapped_analyze) — it CANNOT
+                     * express the asymmetric OT/OB matrix, so a HIT would
+                     * mis-penalize every bisulfite conversion (read T at ref C)
+                     * as a mismatch and commit a wrong a->score. Disable it under
+                     * --meth so all extension flows through the matrix-aware SW
+                     * kernel. (Perf-only fast path; correctness-neutral to skip.) */
+                    if (!opt->meth_mode && sp.len1 >= sp.len2 && sp.len2 <= FP_N_MAX) {
                         tprof[UGP_L_ATTEMPT][tid]++;
                         int fp_score, fp_qle, fp_gscore, fp_gtle, fp_band;
                         int fp_st = ungapped_analyze(qs, rs, sp.len2,
@@ -3021,7 +3520,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                 else
                 {
                     flag = 1;
-                    a->score = a->truesc = s->len * opt->a, a->qb = 0, a->rb = s->rbeg;
+                    a->score = a->truesc = meth_seed_sc, a->qb = 0, a->rb = s->rbeg;  /* D3: true seed score */
                 }
 
                 if (s->qbeg + s->len != l_query)  // right extension
@@ -3113,7 +3612,10 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                     // need extension or was fast-pathed — in both cases
                     // h0 is known. If left was batched, we skip (can't
                     // know h0 yet); SW will run with default band.
-                    if (a->score != -1 && sp.len1 >= sp.len2 && sp.len2 <= FP_N_MAX) {
+                    /* D3 (--meth, PR-4): disable the ungapped fast path under
+                     * --meth — see the LEFT-side rationale above (it can't score
+                     * the asymmetric OT/OB matrix). */
+                    if (!opt->meth_mode && a->score != -1 && sp.len1 >= sp.len2 && sp.len2 <= FP_N_MAX) {
                         sp.ugp_r_attempted = 1;
                         tprof[UGP_R_ATTEMPT][tid]++;
                         int fp_h0 = a->score;  // the real h0 for right ext
@@ -3244,6 +3746,22 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
     // uint64_t timL = __rdtsc();
     int nthreads = 1;
 
+    /* D3 (--meth, A1/PR-4): per-batch substitution-matrix objects. The banded-SW
+     * kernel reads this->mat once per getScores16/getScores8/scalar call for ALL
+     * pairs it processes (the matrix is per-SW-object, not per-pair).
+     *
+     * The symmetric objects (bswLeft/bswRight, built from opt->mat) drive the
+     * entire non-meth pipeline and, under --meth, the non-meth (hypothesis < 0)
+     * pairs. Under --meth we additionally build per-hypothesis OT/OB objects;
+     * bsw_run_tier() partitions each tier's pairs by hypothesis and scores each
+     * partition against its matching object, so a MIXED-hypothesis batch (the
+     * common paired-end case: R1 OT + R2 OB interleaved) is scored correctly in
+     * original space — the remaining PR-4 work, replacing the PR-3 symmetric
+     * fallback. A homogeneous batch (e.g. single-end directional input) yields a
+     * single non-empty partition, so there is no extra cost there.
+     *
+     * Outside --meth only the symmetric objects are built and used, and the path
+     * is byte-for-byte identical to baseline. */
     // Now, process all the collected seq-pairs
     // First, left alignment, move out these calls
     auto bswLeft = make_banded_pair_wise_sw(
@@ -3255,6 +3773,23 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
         opt->o_del, opt->e_del, opt->o_ins, opt->e_ins,
         opt->zdrop, opt->pen_clip3,
         opt->mat, opt->a, opt->b, nthreads);
+
+    /* Per-hypothesis OT/OB objects (only under --meth). Left/right differ solely
+     * in the clip-extension end bonus (pen_clip5 vs pen_clip3), matching the
+     * symmetric objects above. */
+    std::unique_ptr<IBandedPairWiseSW> bswLeftOt, bswLeftOb, bswRightOt, bswRightOb;
+    if (opt->meth_mode) {
+        const int8_t *m_ot = mem_opt_meth_mat(opt, 1);   /* OT: frees C->T */
+        const int8_t *m_ob = mem_opt_meth_mat(opt, 0);   /* OB: frees G->A */
+        bswLeftOt  = make_banded_pair_wise_sw(opt->o_del, opt->e_del, opt->o_ins, opt->e_ins,
+                                              opt->zdrop, opt->pen_clip5, m_ot, opt->a, opt->b, nthreads);
+        bswLeftOb  = make_banded_pair_wise_sw(opt->o_del, opt->e_del, opt->o_ins, opt->e_ins,
+                                              opt->zdrop, opt->pen_clip5, m_ob, opt->a, opt->b, nthreads);
+        bswRightOt = make_banded_pair_wise_sw(opt->o_del, opt->e_del, opt->o_ins, opt->e_ins,
+                                              opt->zdrop, opt->pen_clip3, m_ot, opt->a, opt->b, nthreads);
+        bswRightOb = make_banded_pair_wise_sw(opt->o_del, opt->e_del, opt->o_ins, opt->e_ins,
+                                              opt->zdrop, opt->pen_clip3, m_ob, opt->a, opt->b, nthreads);
+    }
 
     int i;
     // Left
@@ -3278,12 +3813,12 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
     {
         int32_t w = init_w << i;
         // uint64_t tim = __rdtsc();
-        bswLeft->scalarBandedSWAWrapper(pair_ar,
-                                       seqBufLeftRef,
-                                       seqBufLeftQer,
-                                       nump,
-                                       nthreads,
-                                       w);
+        bsw_run_tier(BSW_TIER_SCALAR, opt, av_v,
+                     bswLeft.get(), bswLeftOt.get(), bswLeftOb.get(),
+                     pair_ar, seqBufLeftRef, seqBufLeftQer, nump, nthreads, w,
+                     pair_ar_aux, pair_ar_aux, hist);  /* CodeRabbit: base_scratch must
+                     * track pair_ar_aux (distinct from pair_ar after the retry swap),
+                     * not the static seqPairArrayAux which pair_ar can alias. */
         // tprof[PE5][0] += nump;
         // tprof[PE6][0] ++;
         // tprof[MEM_ALN2_B][tid] += __rdtsc() - tim;
@@ -3345,17 +3880,12 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
     {
         int32_t w = init_w << i;
         // int64_t tim = __rdtsc();
-#if !HAVE_BSW_VECTOR_8_16
-        bswLeft->scalarBandedSWAWrapper(pair_ar, seqBufLeftRef, seqBufLeftQer, nump, nthreads, w);
-#else
-        sortPairsLen(pair_ar, nump, seqPairArrayAux, hist);
-        bswLeft->getScores16(pair_ar,
-                            seqBufLeftRef,
-                            seqBufLeftQer,
-                            nump,
-                            nthreads,
-                            w);
-#endif
+        bsw_run_tier(BSW_TIER_16, opt, av_v,
+                     bswLeft.get(), bswLeftOt.get(), bswLeftOb.get(),
+                     pair_ar, seqBufLeftRef, seqBufLeftQer, nump, nthreads, w,
+                     pair_ar_aux, pair_ar_aux, hist);  /* CodeRabbit: base_scratch must
+                     * track pair_ar_aux (distinct from pair_ar after the retry swap),
+                     * not the static seqPairArrayAux which pair_ar can alias. */
 
         tprof[PE5][0] += nump;
         tprof[PE6][0] ++;
@@ -3417,32 +3947,19 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
         int32_t w = init_w << i;
         // int64_t tim = __rdtsc();
 
-#if !HAVE_BSW_VECTOR_8_16
-        bswLeft->scalarBandedSWAWrapper(pair_ar, seqBufLeftRef, seqBufLeftQer, nump, nthreads, w);
-#else
-        sortPairsLen(pair_ar, nump, seqPairArrayAux, hist);
         /* These pairs were bucketed for the 8-bit path at the initial band
          * opt->w (which the envelope proved <= BSW8_MAX_W). Once the doubling
-         * retry pushes w >= 128 the diagonal-offset int8 encoding can no
-         * longer represent the band, so divert that iteration to the 16-bit
-         * kernel rather than feeding getScores8 an unrepresentable band. The
-         * tight_band early-exit below is unaffected (it short-circuits the
-         * retry regardless of which width ran). */
-        if (w <= BSW8_MAX_W)
-            bswLeft->getScores8(pair_ar,
-                               seqBufLeftRef,
-                               seqBufLeftQer,
-                               nump,
-                               nthreads,
-                               w);
-        else
-            bswLeft->getScores16(pair_ar,
-                                seqBufLeftRef,
-                                seqBufLeftQer,
-                                nump,
-                                nthreads,
-                                w);
-#endif
+         * retry pushes w >= 128 the diagonal-offset int8 encoding can no longer
+         * represent the band, so bsw_run_tier (BSW_TIER_8) diverts that
+         * iteration to the 16-bit kernel rather than feeding getScores8 an
+         * unrepresentable band. The tight_band early-exit below is unaffected
+         * (it short-circuits the retry regardless of which width ran). */
+        bsw_run_tier(BSW_TIER_8, opt, av_v,
+                     bswLeft.get(), bswLeftOt.get(), bswLeftOb.get(),
+                     pair_ar, seqBufLeftRef, seqBufLeftQer, nump, nthreads, w,
+                     pair_ar_aux, pair_ar_aux, hist);  /* CodeRabbit: base_scratch must
+                     * track pair_ar_aux (distinct from pair_ar after the retry swap),
+                     * not the static seqPairArrayAux which pair_ar can alias. */
 
         tprof[PE1][0] += nump;
         tprof[PE2][0] ++;
@@ -3521,7 +4038,12 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
             // Skip pairs already analyzed at construction time (a->score
             // was non-(-1) then; UGP_R_ATTEMPT and outcome counters fired
             // there). Without this guard, those pairs would double-count.
-            if (!sp->ugp_r_attempted &&
+            // !opt->meth_mode: ungapped_analyze hardcodes symmetric opt->a/opt->b
+            // and cannot honor the per-strand asymmetric matrix, so a HIT here
+            // would fill a->score / qe / re from symmetric scoring and compact
+            // the pair out, bypassing the asymmetric banded SW. The two
+            // construction-time passes are gated the same way (see ~3397/3618).
+            if (!opt->meth_mode && !sp->ugp_r_attempted &&
                 sp->len1 >= sp->len2 && sp->len2 > 0 && sp->len2 <= FP_N_MAX) {
                 tprof[UGP_R_ATTEMPT][tid]++;
                 const uint8_t *qs = seqBufRightQer + sp->idq;
@@ -3644,12 +4166,12 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
     {
         int32_t w = init_w << i;
         // tim = __rdtsc();
-        bswRight->scalarBandedSWAWrapper(pair_ar,
-                        seqBufRightRef,
-                        seqBufRightQer,
-                        nump,
-                        nthreads,
-                        w);
+        bsw_run_tier(BSW_TIER_SCALAR, opt, av_v,
+                     bswRight.get(), bswRightOt.get(), bswRightOb.get(),
+                     pair_ar, seqBufRightRef, seqBufRightQer, nump, nthreads, w,
+                     pair_ar_aux, pair_ar_aux, hist);  /* CodeRabbit: base_scratch must
+                     * track pair_ar_aux (distinct from pair_ar after the retry swap),
+                     * not the static seqPairArrayAux which pair_ar can alias. */
         // tprof[PE7][0] += nump;
         // tprof[PE8][0] ++;
         // tprof[MEM_ALN2_C][tid] += __rdtsc() - tim;
@@ -3708,17 +4230,12 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
     {
         int32_t w = init_w << i;
         // uint64_t tim = __rdtsc();
-#if !HAVE_BSW_VECTOR_8_16
-        bswRight->scalarBandedSWAWrapper(pair_ar, seqBufRightRef, seqBufRightQer, nump, nthreads, w);
-#else
-        sortPairsLen(pair_ar, nump, seqPairArrayAux, hist);
-        bswRight->getScores16(pair_ar,
-                             seqBufRightRef,
-                             seqBufRightQer,
-                             nump,
-                             nthreads,
-                             w);
-#endif
+        bsw_run_tier(BSW_TIER_16, opt, av_v,
+                     bswRight.get(), bswRightOt.get(), bswRightOb.get(),
+                     pair_ar, seqBufRightRef, seqBufRightQer, nump, nthreads, w,
+                     pair_ar_aux, pair_ar_aux, hist);  /* CodeRabbit: base_scratch must
+                     * track pair_ar_aux (distinct from pair_ar after the retry swap),
+                     * not the static seqPairArrayAux which pair_ar can alias. */
 
         tprof[PE7][0] += nump;
         tprof[PE8][0] ++;
@@ -3782,28 +4299,15 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
         int32_t w = init_w << i;
         // uint64_t tim = __rdtsc();
 
-#if !HAVE_BSW_VECTOR_8_16
-        bswRight->scalarBandedSWAWrapper(pair_ar, seqBufRightRef, seqBufRightQer, nump, nthreads, w);
-#else
-        sortPairsLen(pair_ar, nump, seqPairArrayAux, hist);
-        /* See the LEFT int8 loop: divert w >= 128 retry iterations to the
-         * 16-bit kernel (the diagonal-offset int8 band can't represent it).
-         * tight_band early-exit is preserved. */
-        if (w <= BSW8_MAX_W)
-            bswRight->getScores8(pair_ar,
-                                seqBufRightRef,
-                                seqBufRightQer,
-                                nump,
-                                nthreads,
-                                w);
-        else
-            bswRight->getScores16(pair_ar,
-                                 seqBufRightRef,
-                                 seqBufRightQer,
-                                 nump,
-                                 nthreads,
-                                 w);
-#endif
+        /* See the LEFT int8 loop: bsw_run_tier (BSW_TIER_8) diverts w >= 128
+         * retry iterations to the 16-bit kernel (the diagonal-offset int8 band
+         * can't represent it). tight_band early-exit is preserved. */
+        bsw_run_tier(BSW_TIER_8, opt, av_v,
+                     bswRight.get(), bswRightOt.get(), bswRightOb.get(),
+                     pair_ar, seqBufRightRef, seqBufRightQer, nump, nthreads, w,
+                     pair_ar_aux, pair_ar_aux, hist);  /* CodeRabbit: base_scratch must
+                     * track pair_ar_aux (distinct from pair_ar after the retry swap),
+                     * not the static seqPairArrayAux which pair_ar can alias. */
 
         tprof[PE3][0] += nump;
         tprof[PE4][0] ++;
@@ -3968,5 +4472,6 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
     }
     free(srtgg);
     free(srt);
+    free(meth_qbuf);  /* D3 (--meth, PR-4): original-read 2-bit scratch; NULL outside --meth */
     // tprof[MEM_ALN2_DOWN][tid] += __rdtsc() - tim;
 }
