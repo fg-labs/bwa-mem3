@@ -167,6 +167,20 @@ public:
                              uint16_t numThreads,
                              int phase) = 0;
 
+    /* True when the construction matrix is asymmetric in a way THIS concrete
+     * tier cannot express, so the caller must route those pairs to the scalar
+     * fallback (ksw_align2). Two reasons it can be true:
+     *   - the matrix shape is unsupported: a non-mirror multi-cell free, a
+     *     changed diagonal, or a freed value != w_match; or
+     *   - the running tier lacks the freed-cell kernel override. Only the NEON,
+     *     AVX2, and AVX-512BW kernels implement it; an SSE41/SSE42/AVX kswv
+     *     reports true for any freed-cell matrix.
+     * A symmetric matrix, a rank-1 freed cell (bisulfite genomic OT/OB), or an
+     * exact mirrored freed pair (collapsed --meth) returns false on a tier that
+     * implements the override. Declared on the abstract interface so the
+     * dispatcher never depends on the concrete kswv layout. */
+    virtual bool needsScalar() const = 0;
+
 };
 
 /* Factory: returns a per-tier concrete kswv. Construction args mirror the
@@ -175,6 +189,20 @@ std::unique_ptr<Ikswv> make_kswv(
     int o_del, int e_del, int o_ins, int e_ins,
     int8_t w_match, int8_t w_mismatch,
     int numThreads, int32_t maxRefLen, int32_t maxQerLen);
+
+/* Mat-aware factory overload (issue 173). `mat25` is the 5x5 scoring matrix
+ * the caller will use for SW; when non-null and asymmetric, the ctor detects
+ * the rank-1 freed cell (bisulfite OT/OB) or flags needsScalar() for any
+ * richer asymmetry. `mat25 == nullptr` (or a symmetric matrix) reproduces the
+ * 9-arg behavior exactly. The sign convention matches make_kswv's existing
+ * callers: w_match is +a, w_mismatch is -b (negative), and mat25's
+ * off-diagonals are likewise the negated penalty — passed straight through to
+ * the Task-1 detectors without re-negation. */
+std::unique_ptr<Ikswv> make_kswv(
+    int o_del, int e_del, int o_ins, int e_ins,
+    int8_t w_match, int8_t w_mismatch,
+    int numThreads, int32_t maxRefLen, int32_t maxQerLen,
+    const int8_t *mat25);
 
 /* Per-tier factory function forward declarations.
  * Defined in kswv.<tier>.o (each kernel TU compile).
@@ -192,6 +220,20 @@ extern "C" Ikswv *make_kswv_kernel_avx2(int, int, int, int, int8_t, int8_t,
                                         int, int32_t, int32_t);
 extern "C" Ikswv *make_kswv_kernel_avx512bw(int, int, int, int, int8_t, int8_t,
                                             int, int32_t, int32_t);
+
+/* Mat-aware 10-arg per-tier overloads (issue 173). Distinct C symbols (the
+ * `_mat` suffix) since C linkage has no overloading; the trailing arg is the
+ * 5x5 scoring matrix forwarded to the ctor for freed-cell detection. */
+extern "C" Ikswv *make_kswv_kernel_sse41_mat(int, int, int, int, int8_t, int8_t,
+                                             int, int32_t, int32_t, const int8_t *);
+extern "C" Ikswv *make_kswv_kernel_sse42_mat(int, int, int, int, int8_t, int8_t,
+                                             int, int32_t, int32_t, const int8_t *);
+extern "C" Ikswv *make_kswv_kernel_avx_mat(int, int, int, int, int8_t, int8_t,
+                                           int, int32_t, int32_t, const int8_t *);
+extern "C" Ikswv *make_kswv_kernel_avx2_mat(int, int, int, int, int8_t, int8_t,
+                                            int, int32_t, int32_t, const int8_t *);
+extern "C" Ikswv *make_kswv_kernel_avx512bw_mat(int, int, int, int, int8_t, int8_t,
+                                                int, int32_t, int32_t, const int8_t *);
 #endif
 
 
@@ -202,7 +244,19 @@ public:
 		 const int e_ins, const int8_t w_match, const int8_t w_mismatch,
 		 int numThreads, int32_t maxRefLen, int32_t maxQerLen);
 
+	/* Mat-aware ctor (issue 173): same as above, plus a 5x5 scoring matrix
+	 * used to detect the rank-1 freed cell. `mat25 == nullptr` reproduces the
+	 * 9-arg ctor exactly. Delegates to the 9-arg ctor, then runs detection. */
+	kswv(const int o_del, const int e_del, const int o_ins,
+		 const int e_ins, const int8_t w_match, const int8_t w_mismatch,
+		 int numThreads, int32_t maxRefLen, int32_t maxQerLen,
+		 const int8_t *mat25);
+
 	~kswv() override;
+
+	/* See Ikswv::needsScalar. Set in the mat-aware ctor; false for the 9-arg
+	 * ctor (symmetric / nullptr matrix). */
+	bool needsScalar() const override { return needs_scalar; }
 
 	// kswv owns heap buffers (rowMax8/16, F/H/E vectors, etc.) freed in the
 	// destructor. Allowing copy/move would alias those allocations and make
@@ -250,6 +304,10 @@ private:
 						   uint16_t numThreads,
 						   int phase);
 
+	/* Thin dispatcher: selects the HasFreed template instantiation based on
+	 * the rank-1 freed-cell flag. The <false> instantiation dead-code-
+	 * eliminates every freed-cell override block, giving codegen identical to
+	 * the pre-issue-173 kernel for the non-meth path. */
 	int kswv_neon_u8(uint8_t seq1SoA[],
 				     uint8_t seq2SoA[],
 				     int16_t nrow,
@@ -261,6 +319,21 @@ private:
 				     int32_t numPairs,
 				     int phase);
 
+	/* Templated u8 kernel body. When HasFreed, applies the rank-1 freed-cell
+	 * (fr_ref x fr_read -> match) override per cell; otherwise the override
+	 * blocks compile out entirely. */
+	template<bool HasFreed>
+	int kswv_neon_u8_impl(uint8_t seq1SoA[],
+					      uint8_t seq2SoA[],
+					      int16_t nrow,
+					      int16_t ncol,
+					      SeqPair *p,
+					      kswr_t *aln,
+					      int po_ind,
+					      uint16_t tid,
+					      int32_t numPairs,
+					      int phase);
+
 	void kswvBatchWrapper16(SeqPair *pairArray,
 							uint8_t *seqBufRef,
 							uint8_t *seqBufQer,
@@ -269,6 +342,7 @@ private:
 							uint16_t numThreads,
 							int phase);
 
+	/* Thin dispatcher: see kswv_neon_u8 above. */
 	int kswv_neon_16(int16_t seq1SoA[],
                      int16_t seq2SoA[],
                      int16_t nrow,
@@ -279,6 +353,19 @@ private:
                      uint16_t tid,
                      int32_t numPairs,
                      int phase);
+
+	/* Templated i16 kernel body; see kswv_neon_u8_impl. */
+	template<bool HasFreed>
+	int kswv_neon_16_impl(int16_t seq1SoA[],
+                          int16_t seq2SoA[],
+                          int16_t nrow,
+                          int16_t ncol,
+                          SeqPair *p,
+                          kswr_t* aln,
+                          int po_ind,
+                          uint16_t tid,
+                          int32_t numPairs,
+                          int phase);
 
 #elif ((!__AVX512BW__) & (__AVX2__))
 	/* AVX2 (256-bit, 32-lane u8) batched mate-rescue SW kernel.
@@ -298,7 +385,24 @@ private:
 								uint16_t numThreads,
 								int phase);
 
+	/* Thin dispatcher: selects the HasFreed template instantiation based on
+	 * the rank-1 freed-cell flag. The <false> instantiation dead-code-
+	 * eliminates every freed-cell override block, giving codegen identical to
+	 * the pre-issue-173 kernel for the non-meth path. Mirrors kswv_neon_u8. */
 	int kswv256_u8(uint8_t seq1SoA[],
+				   uint8_t seq2SoA[],
+				   int16_t nrow,
+				   int16_t ncol,
+				   SeqPair *p,
+				   kswr_t *aln,
+				   int po_ind,
+				   uint16_t tid,
+				   int32_t numPairs,
+				   int phase);
+
+	/* Templated u8 kernel body; see kswv_neon_u8_impl. */
+	template<bool HasFreed>
+	int kswv256_u8_impl(uint8_t seq1SoA[],
 				   uint8_t seq2SoA[],
 				   int16_t nrow,
 				   int16_t ncol,
@@ -317,7 +421,21 @@ private:
 								 uint16_t numThreads,
 								 int phase);
 
+	/* Thin dispatcher: see kswv256_u8 above. */
 	int kswv256_16(int16_t seq1SoA[],
+				   int16_t seq2SoA[],
+				   int16_t nrow,
+				   int16_t ncol,
+				   SeqPair *p,
+				   kswr_t *aln,
+				   int po_ind,
+				   uint16_t tid,
+				   int32_t numPairs,
+				   int phase);
+
+	/* Templated i16 kernel body; see kswv_neon_u8_impl. */
+	template<bool HasFreed>
+	int kswv256_16_impl(int16_t seq1SoA[],
 				   int16_t seq2SoA[],
 				   int16_t nrow,
 				   int16_t ncol,
@@ -337,7 +455,22 @@ private:
 						   uint16_t numThreads,
 						   int phase);
 
+	/* Thin dispatcher: selects the HasFreed template instantiation based on
+	 * the rank-1 freed-cell flag. See kswv256_u8 / kswv_neon_u8. */
 	int kswv512_u8(uint8_t seq1SoA[],
+				   uint8_t seq2SoA[],
+				   int16_t nrow,
+				   int16_t ncol,
+				   SeqPair *p,
+				   kswr_t *aln,
+				   int po_ind,
+				   uint16_t tid,
+				   int32_t numPairs,
+				   int phase);
+
+	/* Templated u8 kernel body; see kswv_neon_u8_impl. */
+	template<bool HasFreed>
+	int kswv512_u8_impl(uint8_t seq1SoA[],
 				   uint8_t seq2SoA[],
 				   int16_t nrow,
 				   int16_t ncol,
@@ -356,7 +489,21 @@ private:
 							uint16_t numThreads,
 							int phase);
 
+	/* Thin dispatcher: see kswv512_u8 above. */
 	int kswv512_16(int16_t seq1SoA[],
+                   int16_t seq2SoA[],
+                   int16_t nrow,
+                   int16_t ncol,
+                   SeqPair *p,
+                   kswr_t* aln,
+                   int po_ind,
+                   uint16_t tid,
+                   int32_t numPairs,
+                   int phase);
+
+	/* Templated i16 kernel body; see kswv_neon_u8_impl. */
+	template<bool HasFreed>
+	int kswv512_16_impl(int16_t seq1SoA[],
                    int16_t seq2SoA[],
                    int16_t nrow,
                    int16_t ncol,
@@ -381,6 +528,23 @@ private:
 	int m;
 	int o_del, o_ins, e_del, e_ins;
 	// const int8_t *mat;
+
+	/* Freed-cell descriptor (issue 173), populated by the mat-aware ctor.
+	 * `has_freed` ⇒ off-diagonal cells were freed to a match (bisulfite). The
+	 * kernel frees a SYMMETRIC PAIR of cells: (fr_ref x fr_read) and
+	 * (fr_ref2 x fr_read2). GENOMIC (rank-1) frees ONE cell, so the mirror
+	 * equals the primary (fr_ref2==fr_ref, fr_read2==fr_read) and the second
+	 * blend is idempotent. COLLAPSED (the --meth default) frees the conversion
+	 * cell AND its mirror, so (fr_ref2,fr_read2) = (fr_read,fr_ref).
+	 * `needs_scalar` ⇒ the matrix is asymmetric in a way the kernel cannot
+	 * express (non-mirror multi-cell, changed diagonal, …) and the caller must
+	 * fall back to scalar. The 9-arg ctor leaves all false. ABI note: these live
+	 * here (not in the dispatcher TU) and are safe to add because every TU
+	 * includes this same kswv.h. */
+	int8_t fr_ref = 0, fr_read = 0;
+	int8_t fr_ref2 = 0, fr_read2 = 0;
+	bool has_freed = false;
+	bool needs_scalar = false;
 
 	int8_t w_match;
 	int8_t w_mismatch;

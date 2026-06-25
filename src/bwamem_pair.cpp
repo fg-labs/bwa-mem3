@@ -755,18 +755,107 @@ static inline void revseq(int l, uint8_t *s)
         t = s[i], s[i] = s[l - 1 - i], s[l - 1 - i] = t;
 }
 
+/* Task 5: Read the BWAMEM3_METH_BATCHED_RESCUE escape hatch once. Default ON
+ * (batched meth mate rescue). Set to "0" to force the legacy scalar ksw_align2
+ * rescue path (used by the regression to A/B the same binary). Only consulted
+ * under opt->meth_mode; the non-meth path is unaffected. */
+static bool meth_batched_rescue_enabled()
+{
+    static const bool enabled = []() {
+        const char *e = getenv("BWAMEM3_METH_BATCHED_RESCUE");
+        return !(e != NULL && strcmp(e, "0") == 0);
+    }();
+    return enabled;
+}
+
+/* Task 5: run the two-phase batched kswv over a contiguous SeqPair slice
+ * pairs[0..slice_pcnt) whose 8-bit pairs occupy [0, slice_pcnt8) and 16-bit
+ * pairs [slice_pcnt8, slice_pcnt). The slice must have MAX_LINE_LEN trailing
+ * headroom (the 16-bit shift writes into pairs[slice_pcnt + MAX_LINE_LEN)).
+ * aln is the shared per-batch result array indexed by SeqPair.regid; seqBufRef
+ * /seqBufQer are the shared (idr/idq-keyed) sequence buffers. This is the exact
+ * body of the pre-Task-5 mem_sam_pe_batch, hoisted verbatim so the non-meth
+ * call (one slice = the whole batch) stays byte-identical. */
+static void mem_sam_pe_batch_run(Ikswv *pwsw, SeqPair *pairs,
+                                 uint8_t *seqBufRef, uint8_t *seqBufQer,
+                                 kswr_t *aln, int64_t slice_pcnt,
+                                 int64_t slice_pcnt8, int nthreads)
+{
+    // Shift 16-bit
+    for (int i=0; i<slice_pcnt-slice_pcnt8; i++)
+        pairs[slice_pcnt + MAX_LINE_LEN - 1 - i] = pairs[slice_pcnt-i-1];
+
+#if BWAMEM_BATCHED_MATESW
+    pwsw->getScores8(pairs, seqBufRef, seqBufQer, aln, slice_pcnt8, nthreads, 0);
+    pwsw->getScores16(pairs + slice_pcnt8 + MAX_LINE_LEN, seqBufRef, seqBufQer,
+                      aln, slice_pcnt-slice_pcnt8, nthreads, 0);
+#else
+    fprintf(stderr, "Error: mem_sam_pe_batch reached without a batched kswv kernel\n");
+    exit(EXIT_FAILURE);
+#endif
+
+    // Post-processing
+    int pos = 0, pos8 = 0, pos16 = 0;
+    for (int i=0; i<slice_pcnt8; i++)
+    {
+        SeqPair sp = pairs[i];
+        int ind = sp.regid;
+        kswr_t r = aln[ind];
+        int xtra = sp.h0;
+        if ((xtra & KSW_XSTART) == 0 || ((xtra & KSW_XSUBO) && r.score < (xtra & 0xffff))) continue;
+
+        sp.h0 = KSW_XSTOP | r.score;
+        sp.len2 = r.qe + 1;
+        uint8_t *qs = seqBufQer + sp.idq;
+        uint8_t *rs = seqBufRef + sp.idr;
+        revseq(r.qe + 1, qs); revseq(r.te + 1, rs);
+        pairs[pos++] = sp;
+        pos8 ++;
+    }
+
+    int id = slice_pcnt8 + MAX_LINE_LEN;
+    for (int i=0; i<slice_pcnt-slice_pcnt8; i++)
+    {
+        SeqPair sp = pairs[i + id];
+        int ind = sp.regid;
+        kswr_t r = aln[ind];
+        int xtra = sp.h0;
+        if ((xtra & KSW_XSTART) == 0 || ((xtra & KSW_XSUBO) && r.score < (xtra & 0xffff))) continue;
+
+        sp.h0 = KSW_XSTOP | r.score;
+        sp.len2 = r.qe + 1;
+        uint8_t *qs = seqBufQer + sp.idq;
+        uint8_t *rs = seqBufRef + sp.idr;
+        revseq(r.qe + 1, qs); revseq(r.te + 1, rs);
+        pairs[pos++] = sp;
+        pos16 ++;
+    }
+
+    int pcnt2 = pos;
+    assert(pos8 + pos16 == pcnt2);
+    (void) pcnt2;
+
+#if BWAMEM_BATCHED_MATESW
+    pwsw->getScores16(pairs + pos8, seqBufRef, seqBufQer, aln, pos16, nthreads, 1);
+    pwsw->getScores8(pairs, seqBufRef, seqBufQer, aln, pos8, nthreads, 1);
+#else
+    fprintf(stderr, "Error: mem_sam_pe_batch reached without a batched kswv kernel\n");
+    exit(EXIT_FAILURE);
+#endif
+}
+
 // This function is equivalent to align2() for axv512
 int mem_sam_pe_batch(const mem_opt_t *opt, mem_cache *mmc,
                      int64_t &pcnt, int64_t &pcnt8, kswr_t *aln,
                      int32_t maxRefLen, int32_t maxQerLen, int tid)
 {
     uint8_t *seqBufRef = mmc->seqBufLeftRef[tid*CACHE_LINE];
-    uint8_t *seqBufQer = mmc->seqBufLeftQer[tid*CACHE_LINE];    
+    uint8_t *seqBufQer = mmc->seqBufLeftQer[tid*CACHE_LINE];
 
     SeqPair *seqPairArray = mmc->seqPairArrayLeft128[tid];
 
 #if DEBUG    // orig function from bwa-mem -- for debugging purpose. Disabled by default.
-    // uint64_t tim = __rdtsc();   
+    // uint64_t tim = __rdtsc();
     SeqPair sp;
     for (int i=0; i<pcnt; i++) {
         sp = seqPairArray[i];
@@ -775,10 +864,10 @@ int mem_sam_pe_batch(const mem_opt_t *opt, mem_cache *mmc,
         uint8_t *rs = seqBufRef + sp.idr;
         aln[i] = ksw_align2(sp.len2, qs, sp.len1, rs, 5,
                             opt->mat, opt->o_del, opt->e_del,
-                            opt->o_ins, opt->e_ins, xtra, 0);       
+                            opt->o_ins, opt->e_ins, xtra, 0);
     }
     // tprof[SAM2][0] += __rdtsc() - tim;
-    
+
 #else   // avx512, vectorized function
 
     for (int i=0; i<pcnt; i++) {
@@ -787,71 +876,92 @@ int mem_sam_pe_batch(const mem_opt_t *opt, mem_cache *mmc,
     }
 
     int nthreads = 1; // no multi-threading here
+
+    /* Task 5: under --meth (batched rescue enabled), partition the enqueued
+     * mate-rescue pairs by bisulfite hypothesis (OT/OB) and run the kernel once
+     * per group with the matching mat-aware kswv object. mat_ot frees C->T (top
+     * strand), mat_ob frees G->A (bottom strand); make_kswv installs the rank-1
+     * freed-cell override for each, so the batched score equals the scalar
+     * ksw_align2 score with the asymmetric matrix. Non-meth and the env-OFF
+     * escape hatch fall through to the single-object path below, byte-identical
+     * to the pre-Task-5 code. */
+    if (opt->meth_mode && meth_batched_rescue_enabled()) {
+        // Scratch slice (Right128 is free here; sort_classify only used it as
+        // a transient and the final layout lives in Left128). Sized
+        // wsize_pair + MAX_LINE_LEN, which comfortably holds one group plus
+        // the 16-bit shift headroom (a group is <= pcnt <= wsize_pair pairs).
+        SeqPair *scratch = mmc->seqPairArrayRight128[tid];
+
+        auto pwsw_ot = make_kswv(opt->o_del, opt->e_del, opt->o_ins, opt->e_ins,
+                                 opt->a, -1*opt->b, nthreads,
+                                 maxRefLen, maxQerLen, opt->mat_ot);
+        auto pwsw_ob = make_kswv(opt->o_del, opt->e_del, opt->o_ins, opt->e_ins,
+                                 opt->a, -1*opt->b, nthreads,
+                                 maxRefLen, maxQerLen, opt->mat_ob);
+        // The batched kernel expresses exactly the matrices mem_opt_fill_meth_mat
+        // produces: GENOMIC (one freed cell) and COLLAPSED (the conversion cell
+        // PLUS its mirror — a symmetric (i,j)/(j,i) pair). needsScalar() is
+        // therefore always false here. Guard it at RUNTIME rather than with a
+        // bare assert(): under NDEBUG assert is a no-op, which would let a future
+        // unsupported matrix run the batched kernel and silently mis-score. Fail
+        // loudly instead — this can only fire on a programming error in
+        // mem_opt_fill_meth_mat (a matrix that is neither rank-1 nor a mirror pair).
+        if (pwsw_ot->needsScalar() || pwsw_ob->needsScalar())
+            err_fatal(__func__,
+                      "meth mate-rescue matrix not expressible by the batched kernel "
+                      "(neither rank-1 genomic nor a collapsed mirror pair)");
+
+        // hyp == 1 -> OT (mat_ot / pwsw_ot); hyp == 0 -> OB (mat_ob / pwsw_ob).
+        // -1 (non-meth) cannot occur here: every enqueued pair under meth_mode
+        // was tagged with a real hypothesis in mem_matesw_batch_pre. Process
+        // each group in the shared scratch buffer one at a time; aln[] is keyed
+        // by regid and seqBuf* by idr/idq, so each pair is scored exactly once
+        // regardless of grouping.
+        int64_t scored = 0;
+        for (int hyp = 1; hyp >= 0; --hyp) {
+            int64_t n8 = 0, n16 = 0;
+            // 8-bit pairs of this hyp first, then 16-bit, mirroring
+            // sort_classify's layout so mem_sam_pe_batch_run's split is valid.
+            for (int64_t i = 0; i < pcnt; ++i) {
+                SeqPair *s = &seqPairArray[i];
+                if (s->meth_hyp != hyp) continue;
+                if (s->h0 & KSW_XBYTE) scratch[n8++] = *s;
+            }
+            int64_t group_pcnt8 = n8;
+            for (int64_t i = 0; i < pcnt; ++i) {
+                SeqPair *s = &seqPairArray[i];
+                if (s->meth_hyp != hyp) continue;
+                if (!(s->h0 & KSW_XBYTE)) scratch[group_pcnt8 + (n16++)] = *s;
+            }
+            int64_t group_pcnt = n8 + n16;
+            scored += group_pcnt;
+            if (group_pcnt == 0) continue;
+
+            Ikswv *pwsw = (hyp == 1) ? pwsw_ot.get() : pwsw_ob.get();
+            mem_sam_pe_batch_run(pwsw, scratch, seqBufRef, seqBufQer,
+                                 aln, group_pcnt, group_pcnt8, nthreads);
+        }
+        // Release-safe invariant guard: the OT/OB partition must cover every
+        // enqueued pair. A pair tagged with a hypothesis outside {0,1} would be
+        // skipped by both groups, leaving its aln[] entry uninitialized for
+        // mem_matesw_batch_post to read. The assert in mem_matesw_batch_pre
+        // catches this in debug; fail loud under NDEBUG too rather than emit a
+        // silently mis-scored rescue.
+        if (scored != pcnt)
+            err_fatal(__func__,
+                      "batched meth rescue partition missed %ld of %ld pairs "
+                      "(a pair carried a hypothesis outside {OT,OB})",
+                      (long)(pcnt - scored), (long)pcnt);
+        return 1;
+    }
+
     auto pwsw = make_kswv(opt->o_del, opt->e_del, opt->o_ins, opt->e_ins,
                           opt->a, -1*opt->b, nthreads,
                           maxRefLen, maxQerLen);
 
-    // Shift 16-bit 
-    for (int i=0; i<pcnt-pcnt8; i++)
-        seqPairArray[pcnt + MAX_LINE_LEN - 1 - i] = seqPairArray[pcnt-i-1];
-    
-#if BWAMEM_BATCHED_MATESW
-    pwsw->getScores8(seqPairArray, seqBufRef, seqBufQer, aln, pcnt8, nthreads, 0);
-    pwsw->getScores16(seqPairArray + pcnt8 + MAX_LINE_LEN, seqBufRef, seqBufQer,
-                      aln, pcnt-pcnt8, nthreads, 0);
-#else
-    fprintf(stderr, "Error: mem_sam_pe_batch reached without a batched kswv kernel\n");
-    exit(EXIT_FAILURE);
-#endif
+    mem_sam_pe_batch_run(pwsw.get(), seqPairArray, seqBufRef, seqBufQer,
+                         aln, pcnt, pcnt8, nthreads);
 
-    // Post-processing
-    int pos = 0, pos8 = 0, pos16 = 0;
-    for (int i=0; i<pcnt8; i++)
-    {
-        SeqPair sp = seqPairArray[i];
-        int ind = sp.regid;
-        kswr_t r = aln[ind];
-        int xtra = sp.h0;
-        if ((xtra & KSW_XSTART) == 0 || ((xtra & KSW_XSUBO) && r.score < (xtra & 0xffff))) continue; 
-        
-        sp.h0 = KSW_XSTOP | r.score;
-        sp.len2 = r.qe + 1;
-        uint8_t *qs = seqBufQer + sp.idq;
-        uint8_t *rs = seqBufRef + sp.idr;
-        revseq(r.qe + 1, qs); revseq(r.te + 1, rs);
-        seqPairArray[pos++] = sp;        
-        pos8 ++;
-    }
-    
-    int id = pcnt8 + MAX_LINE_LEN;
-    for (int i=0; i<pcnt-pcnt8; i++)
-    {
-        SeqPair sp = seqPairArray[i + id];
-        int ind = sp.regid;
-        kswr_t r = aln[ind];
-        int xtra = sp.h0;
-        if ((xtra & KSW_XSTART) == 0 || ((xtra & KSW_XSUBO) && r.score < (xtra & 0xffff))) continue; 
-        
-        sp.h0 = KSW_XSTOP | r.score;
-        sp.len2 = r.qe + 1;
-        uint8_t *qs = seqBufQer + sp.idq;
-        uint8_t *rs = seqBufRef + sp.idr;
-        revseq(r.qe + 1, qs); revseq(r.te + 1, rs);
-        seqPairArray[pos++] = sp;        
-        pos16 ++;
-    }
-
-    int pcnt2 = pos;
-    assert(pos8 + pos16 == pcnt2);
-
-#if BWAMEM_BATCHED_MATESW
-    pwsw->getScores16(seqPairArray + pos8, seqBufRef, seqBufQer, aln, pos16, nthreads, 1);
-    pwsw->getScores8(seqPairArray, seqBufRef, seqBufQer, aln, pos8, nthreads, 1);
-#else
-    fprintf(stderr, "Error: mem_sam_pe_batch reached without a batched kswv kernel\n");
-    exit(EXIT_FAILURE);
-#endif
-    
 #endif
 
     return 1;
@@ -1117,16 +1227,23 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                          mem_alnreg_v *ma, mem_cache *mmc, int pcnt, int32_t gcnt,
                          int32_t &maxRefLen, int32_t &maxQerLen, int32_t tid)
 {
-    /* D3 (--meth, A1/PR-6): _pre stages the batched-SIMD mate-rescue query for
-     * the kswv getScores8/16 kernel — a SYMMETRIC kernel (built from scalar
-     * match/mismatch via make_kswv) that cannot express the asymmetric freed-cell
-     * matrix. Under --meth we therefore do NOT stage meth pairs here (the enqueue
-     * branch below leaves gar[gcnt+r] = -1), so mem_matesw_batch_post re-runs
-     * every meth rescue through the scalar ksw_align2 path, which honors the
-     * per-hypothesis asymmetric matrix. The cost is bounded to the (minority)
-     * rescued mates; teaching kswv a full mat[ref*5+read] is a future PERF
-     * optimization, not a correctness gap. The dedup below passes query = 0 (no
-     * patch SW), so its mat default (opt->mat) is unused. */
+    /* D3 (--meth, A1/PR-6 → issue 173 Task 5): _pre stages the batched-SIMD
+     * mate-rescue query for the kswv getScores8/16 kernel. As of the mat-aware
+     * kernels (Tasks 1-4) the batched kernel CAN express the bisulfite OT/OB
+     * freed-cell matrices, so under --meth we now stage meth pairs here just
+     * like non-meth pairs and tag each with its bisulfite hypothesis
+     * (sp.meth_hyp, set near the enqueue below). mem_sam_pe_batch then
+     * partitions the enqueued pairs by OT/OB and scores each group with the
+     * matching mat-aware kswv object, byte-identical to the per-hypothesis
+     * scalar ksw_align2. The legacy scalar path (gar[gcnt+r] = -1 →
+     * mem_matesw_batch_post re-runs ksw_align2) is retained as the escape hatch
+     * (BWAMEM3_METH_BATCHED_RESCUE=0). The OT/OB matrices mem_opt_fill_meth_mat
+     * produces are always expressible (rank-1 genomic or a collapsed mirror
+     * pair), so the kswv objects never report needsScalar() here; if a future
+     * matrix or tier ever did, mem_sam_pe_batch fails loud via err_fatal rather
+     * than silently mis-scoring (see the needsScalar() guard there). The dedup
+     * below passes query = 0 (no patch SW), so its mat default (opt->mat) is
+     * unused. */
 
     uint8_t *seqBufRef = mmc->seqBufLeftRef[tid*CACHE_LINE];
     uint8_t *seqBufQer = mmc->seqBufLeftQer[tid*CACHE_LINE];
@@ -1198,16 +1315,24 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                                             (uint8_t*) mmc->seqPairArrayAux[tid]);
 
         if (a->rid == rid && re - rb >= opt->min_seed_len) { // no funny things happening
-            /* D3 (--meth, A1/PR-6): route meth mate-rescue through the scalar
-             * ksw_align2 fallback in mem_matesw_batch_post, which honors the
-             * per-hypothesis asymmetric matrix. The batched kswv kernel is
-             * SYMMETRIC (built from scalar match/mismatch via make_kswv) and
-             * cannot express the freed-cell asymmetry, so we skip the batched
-             * enqueue here — leaving gar[gcnt+r] = -1, which _post reads as
-             * "no precomputed score" and re-runs the orientation through
-             * ksw_align2 with the asymmetric `mat`. kswv.cpp stays untouched;
-             * the cost is bounded to the (minority) rescued mates. */
-            if (opt->meth_mode) {
+            /* D3 (--meth, Task 5): meth mate-rescue is now enqueued for the
+             * batched kswv kernel just like a non-meth pair. The kernels are
+             * mat-aware (Task 2/4): make_kswv(..., mat_ot/mat_ob) installs the
+             * rank-1 freed-cell override for the bisulfite OT/OB matrices, so
+             * the batched score matches the scalar ksw_align2 score with the
+             * asymmetric matrix. The per-pair hypothesis tag (sp.meth_hyp,
+             * below) drives the OT/OB partition in mem_sam_pe_batch, which runs
+             * getScores8/16 once per hypothesis group with the matching object.
+             * The rescued mate uses the OPPOSITE-strand matrix of the anchor
+             * `a` (mem_opt_meth_mat(opt, !a->meth_hypothesis)), exactly as
+             * mem_matesw_batch_post's scalar fallback does. The legacy scalar
+             * path remains as a safety fallback for any pair whose object
+             * reports needsScalar() (rank-1 meth never does) and is reachable
+             * via BWAMEM3_METH_BATCHED_RESCUE=0 (escape hatch). */
+            if (opt->meth_mode && !meth_batched_rescue_enabled()) {
+                // Escape hatch (env=0): keep the legacy scalar rescue. Leave
+                // gar = -1 so mem_matesw_batch_post re-runs this orientation
+                // through ksw_align2 with the asymmetric matrix.
                 gar[gcnt + r] = -1;
                 if (rev) free(rev);
                 continue;
@@ -1295,6 +1420,25 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
             for (int l=0; l<sp.len1; l++) rs[l] = ref[l];
             for (int l=0; l<sp.len2; l++) qs[l] = seq[l];
 
+            /* Task 5: tag the enqueued meth pair with the rescued mate's
+             * bisulfite hypothesis = OPPOSITE strand of the anchor `a`
+             * (mem_opt_meth_mat(opt, !a->meth_hypothesis) — the exact value
+             * mem_matesw_batch_post's scalar fallback already uses to pick
+             * rmat). is_rev was already baked into a->meth_hypothesis upstream,
+             * so we reuse it verbatim and do NOT re-derive strand logic here.
+             *
+             * Under --meth every chain that survives to mate rescue carries a
+             * real hypothesis (a->meth_hypothesis ∈ {0,1}): meth_seed_to_orig
+             * either remaps a seed with a concrete hypothesis or drops it, so a
+             * negative hypothesis never reaches an enqueued anchor. The tag is
+             * therefore always in {0,1} under --meth, which the OT/OB partition
+             * in mem_sam_pe_batch requires. Non-meth pairs keep the SeqPair
+             * default (-1), which the kernels ignore. The assert documents the
+             * invariant; mem_sam_pe_batch additionally guards it at runtime so a
+             * future violation fails loud instead of silently dropping a pair. */
+            sp.meth_hyp = opt->meth_mode ? (int8_t)!a->meth_hypothesis : (int8_t)-1;
+            assert(!opt->meth_mode || sp.meth_hyp == 0 || sp.meth_hyp == 1);
+
             gar[gcnt + r] = pcnt;
             sp.regid = pcnt;
             seqPairArray[pcnt++] = sp;
@@ -1317,15 +1461,15 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                                         mem_alnreg_t *a);
     /* The mate-rescue dedup at the bottom passes bns/pac/query = 0 (dedup-only,
      * no patch SW), so its matrix is unused; opt->mat default is correct there. */
-    /* D3 (--meth, A1/PR-6, B3): the rescued mate uses the OPPOSITE-strand matrix
-     * of the anchor `a`. The asymmetric `mat` is honored on the scalar ksw_align2
-     * fallback below (index == -1), which under --meth is the path EVERY meth
-     * rescue takes: _pre deliberately skips the batched enqueue for meth pairs
-     * (leaving gar = -1) because the batched kswv kernel (make_kswv /
-     * getScores8/16) is SYMMETRIC and cannot express the freed-cell asymmetry.
-     * So meth mate-rescue is fully γ-correct here. Teaching kswv a full
-     * mat[ref*5+read] so batched mate rescue could score the asymmetric matrix
-     * directly is a future PERF optimization, not a correctness gap. */
+    /* D3 (--meth, A1/PR-6, B3): meth mate rescue is now scored by the BATCHED
+     * kswv kernel (via the OT/OB hypothesis partition in mem_sam_pe_batch) by
+     * default — _pre enqueues each pair and tags it with sp.meth_hyp ∈ {0,1}.
+     * The scalar ksw_align2 path below (index == -1) is the ESCAPE HATCH: it
+     * is reached only when BWAMEM3_METH_BATCHED_RESCUE=0 forces the legacy
+     * scalar path (gar[gcnt+r] == -1 from _pre), or for any matrix where the
+     * kswv object reports needsScalar() (a non-rank-1 asymmetric matrix; the
+     * current OT/OB matrices are rank-1 and never trigger this). The path is
+     * retained as a safety net, not the primary route. */
     const int8_t *sw_mat = mat ? mat : opt->mat;
     #if MATE_SORT    
     extern int mem_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns,

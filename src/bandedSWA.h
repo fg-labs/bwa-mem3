@@ -118,6 +118,112 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #define min_(x, y) ((x)>(y)?(y):(x))
 #define max_(x, y) ((x)>(y)?(x):(y))
 
+// True when `mat`'s ACGT 4x4 submatrix is NOT the plain symmetric
+// match/mismatch matrix implied by (w_match, w_mismatch) — i.e. the cheap
+// symmetric XOR LUT cannot represent it and the generic (target-major) LUT
+// path is required. The default aligner matrix is symmetric, so this returns
+// false on the hot path and the kernels keep their original fast prepass;
+// it returns true only for an asymmetric matrix (bisulfite OT/OB), which pays
+// the heavier generic prepass. N cells are handled separately, so only the
+// ACGT submatrix is inspected. w_mismatch is the kernel's stored (negated)
+// penalty, matching how mat off-diagonals are encoded.
+static inline bool bsw_generic_matrix(const int8_t *mat, int8_t w_match, int8_t w_mismatch)
+{
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++) {
+            int8_t expect = (i == j) ? w_match : w_mismatch;
+            if (mat[i * 5 + j] != expect) return true;
+        }
+    return false;
+}
+
+// Dev/validation hook: when BWAMEM3_FORCE_GENMAT is set in the environment, the
+// SW kernels take the generic-matrix prepass even for a symmetric matrix. This
+// lets the standalone kernel bench (which uses the default symmetric matrix)
+// (a) measure the generic path's throughput and (b) prove it is byte-identical
+// to the symmetric path on symmetric inputs (amat == pmat there). Read once;
+// zero cost on the production path when unset (magic-static init, no syscall in
+// the hot loop). NEVER affects output for a symmetric matrix — only which
+// prepass macro runs.
+static inline bool bsw_force_generic_matrix()
+{
+    static const bool forced = (getenv("BWAMEM3_FORCE_GENMAT") != NULL);
+    return forced;
+}
+
+// Rank-1 fast-path descriptor for the generic-matrix seam. Bisulfite frees
+// exactly ONE ordered off-diagonal cell per strand to a match (OT: ref-C/read-T;
+// OB: ref-G/read-A). When the matrix is the plain symmetric matrix plus a single
+// such freed-to-match cell, the kernel can skip the byte-shuffle LUT entirely
+// and just extend the match condition (SBT_PREPASS16_RANK1) — no TBL, no
+// sign-extend, near parity with symmetric. Any other deviation (>=2 freed cells,
+// a changed diagonal, or a freed value != w_match) falls back to the general LUT
+// path. `rank1` is the only field the kernel branches on; (ref,read) name the
+// freed cell. When `forced` is set on an otherwise-symmetric matrix we synthesize
+// the no-op cell (0,0) so the bench exercises and times the rank-1 path while
+// staying byte-identical to symmetric.
+struct BswFreedCell { bool rank1; int8_t ref; int8_t read; };
+static inline BswFreedCell bsw_freed_cell(const int8_t *mat, int8_t w_match,
+                                          int8_t w_mismatch, bool forced)
+{
+    int n_freed = 0;
+    int8_t fr_ref = 0, fr_read = 0;
+    bool ok = true;
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++) {
+            int8_t expect = (i == j) ? w_match : w_mismatch;
+            if (mat[i * 5 + j] == expect) continue;
+            if (i != j && mat[i * 5 + j] == w_match) {   // off-diagonal freed to match
+                n_freed++; fr_ref = (int8_t)i; fr_read = (int8_t)j;
+            } else {
+                ok = false;                              // diagonal change / non-match freed
+            }
+        }
+    BswFreedCell c;
+    c.rank1 = ok && (n_freed == 1 || (forced && n_freed == 0));
+    c.ref = fr_ref;
+    c.read = fr_read;
+    return c;
+}
+
+// COLLAPSED bisulfite (the `--meth` default) frees the conversion cell AND its
+// mirror, so C/T (and G/A) are mutually interchangeable: two off-diagonal cells
+// (i,j) and (j,i), both to a match, with everything else canonical. This is the
+// rank-1 case plus its transpose; the kernel handles it by freeing BOTH ordered
+// cells (the rank-1 case is the degenerate (i,j)==(j,i) where the mirror equals
+// the primary). `supported` is true ONLY for an exact symmetric mirror pair; a
+// non-mirror two-cell matrix (e.g. OT+OB combined), >2 freed cells, a changed
+// diagonal, or a non-match freed value all leave it false → scalar fallback.
+// (refA,readA) is the primary cell, (refB,readB) its mirror.
+struct BswFreedPair { bool supported; int8_t refA, readA, refB, readB; };
+static inline BswFreedPair bsw_freed_pair(const int8_t *mat, int8_t w_match,
+                                          int8_t w_mismatch)
+{
+    int n_freed = 0;
+    int8_t r[2] = {0, 0}, c[2] = {0, 0};
+    bool ok = true;
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++) {
+            int8_t expect = (i == j) ? w_match : w_mismatch;
+            if (mat[i * 5 + j] == expect) continue;
+            if (i != j && mat[i * 5 + j] == w_match) {   // off-diagonal freed to match
+                if (n_freed < 2) { r[n_freed] = (int8_t)i; c[n_freed] = (int8_t)j; }
+                n_freed++;
+            } else {
+                ok = false;                              // diagonal change / non-match freed
+            }
+        }
+    BswFreedPair p;
+    p.supported = false;
+    p.refA = p.readA = p.refB = p.readB = 0;
+    if (ok && n_freed == 2 && r[0] == c[1] && c[0] == r[1]) {  // exact (i,j)/(j,i) mirror
+        p.supported = true;
+        p.refA = r[0]; p.readA = c[0];
+        p.refB = r[1]; p.readB = c[1];
+    }
+    return p;
+}
+
 typedef struct dnaSeqPair
 {
     int32_t idr, idq, id;
@@ -143,6 +249,12 @@ typedef struct dnaSeqPair
     // a->score != -1 made fp_h0 known) so the post-left-SW pass doesn't
     // double-count UGP_R_ATTEMPT / UGP_R_TIGHT / UGP_R_HIT.
     uint8_t ugp_r_attempted = 0;
+    // issue 173 / Task 5 (--meth batched mate rescue): per-pair bisulfite
+    // hypothesis tag for the batched kswv mate-rescue partition. 1 = OT
+    // (mat_ot, frees C->T), 0 = OB (mat_ob, frees G->A); -1 = non-meth
+    // (default; the kernels never read this field, so it does not perturb
+    // the non-meth getScores8/16 results — proven by the unchanged goldens).
+    int8_t meth_hyp = -1;
 }SeqPair;
 
 

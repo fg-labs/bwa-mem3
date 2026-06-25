@@ -57,6 +57,23 @@
     * visible at the dispatcher's translation unit. */
 #  define make_bsw_kernel    BWAMEM3_PASTE(make_bsw_kernel,    KERNEL_VARIANT)
 #  define make_kswv_kernel   BWAMEM3_PASTE(make_kswv_kernel,   KERNEL_VARIANT)
+   /* Mat-aware 10-arg factory (issue 173): mangles to
+    * make_kswv_kernel<VARIANT>_mat (e.g. make_kswv_kernel_avx2_mat) so the
+    * tier suffix stays adjacent to the base name, matching the decls in
+    * kswv.h and the make_kswv_kernel_<tier>_mat dispatch calls.
+    *
+    * Glue all three tokens in ONE paste via a dedicated helper. Routing the
+    * bare `make_kswv_kernel` token through BWAMEM3_PASTE would argument-
+    * prescan it — and `make_kswv_kernel` is itself an object-macro (above),
+    * so it expands to make_kswv_kernel<VARIANT> first, doubling the suffix
+    * into make_kswv_kernel<VARIANT><VARIANT>_mat (an undefined symbol vs. the
+    * dispatcher's make_kswv_kernel<VARIANT>_mat call — an x86-only link error
+    * arm64 cannot surface). The `##` operands here are NOT macro-expanded, so
+    * the base name stays literal. (The 9-arg make_*_kernel macros escape this
+    * only by being self-referential, hence blue-painted.) */
+#  define BWAMEM3_KSWV_MAT_GLUE(v) make_kswv_kernel ## v ## _mat
+#  define BWAMEM3_KSWV_MAT(v)      BWAMEM3_KSWV_MAT_GLUE(v)
+#  define make_kswv_kernel_mat     BWAMEM3_KSWV_MAT(KERNEL_VARIANT)
 #endif
 
 #endif /* BWAMEM3_KERNEL_DISPATCH_H */
