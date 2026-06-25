@@ -1613,7 +1613,15 @@ int main_mem(int argc, char *argv[])
      * batched extension partitions a mixed PE batch by hypothesis; mate rescue
      * routes meth pairs through the scalar ksw_align2 path). The projected read is
      * used only for seeding against the `.meth` FM-index. */
-    if (opt->meth_mode && meth_orig_ref_prefix != NULL) {
+    /* pac-fetch (default ON): reconstruct the ORIGINAL reference from its `.pac`
+     * on demand (bns_get_seq_v2's ref_string==NULL path) instead of loading the
+     * unpacked `.0123` (~6.4 GB on hg38). Byte-identical, perf-neutral. The
+     * escape hatch BWAMEM3_REF_PAC_FETCH=0 reloads the legacy `.0123` (only
+     * succeeds on an index that still carries the file). */
+    int ref_pac_fetch;
+    { const char *e = getenv("BWAMEM3_REF_PAC_FETCH");
+      ref_pac_fetch = !(e != NULL && e[0] == '0'); }
+    if (opt->meth_mode && meth_orig_ref_prefix != NULL && !ref_pac_fetch) {
         int64_t orig_rlen = 0;
         int     orig_is_shm = 0;   /* original .0123 is never in shm; force disk */
         aux.meth_orig_ref_string =
@@ -1622,7 +1630,7 @@ int main_mem(int argc, char *argv[])
         if (aux.meth_orig_ref_string == NULL) {
             fprintf(stderr,
                     "ERROR: --meth could not load the original reference '%s.0123' "
-                    "(needed for extension).\n", meth_orig_ref_prefix);
+                    "(BWAMEM3_REF_PAC_FETCH=0 requires it).\n", meth_orig_ref_prefix);
             meth_orig_ref_free_handles(&aux);
             delete aux.fmi;
             free(opt);
@@ -1632,6 +1640,10 @@ int main_mem(int argc, char *argv[])
         fprintf(stderr,
                 "[bwa-mem3:--meth] original reference .0123 loaded for extension "
                 "(%ld bp).\n", (long)orig_rlen);
+    } else if (opt->meth_mode && meth_orig_ref_prefix != NULL) {
+        fprintf(stderr,
+                "[bwa-mem3:--meth] pac-fetch: original .0123 NOT loaded; unpacking "
+                "original bases from .pac on demand.\n");
     }
 
     // reading ref string (from shm if FMI attached, else from .0123 file)
