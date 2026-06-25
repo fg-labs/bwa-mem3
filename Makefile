@@ -863,6 +863,9 @@ docs-clean:
 docs-install-tools:
 	cargo install mdbook --version 0.5.2 --locked
 	cargo install mdbook-mermaid --version 0.17.0 --locked
+	# Broken-link checker backend (see docs/book.toml). The mdbook-linkcheck2
+	# fork supports mdBook 0.5; the original mdbook-linkcheck does not.
+	cargo install mdbook-linkcheck2 --version 0.12.2 --locked
 
 # Profile-Guided Optimization (PGO) targets.
 #
