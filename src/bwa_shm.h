@@ -83,7 +83,11 @@ extern "C" {
 #endif
 
 	int       bwa_shm_test(const char *prefix);                      /* 1 if staged, 0 if not, -1 on error */
-	int       bwa_shm_stage(const char *prefix);                     /* loads from disk, packs, stages */
+	/* bns_only=true stages a SEED-only segment (D3 --meth): the FM-index + BNS
+	 * are packed, but PAC and REF_STRING (.0123) are omitted (zero-length
+	 * sections) because `mem --meth` never reads the seed pac/.0123. The seed
+	 * `.0123` need not even exist on disk. Saves ~14.5 GB of shm on hg38. */
+	int       bwa_shm_stage(const char *prefix, bool bns_only = false); /* loads from disk, packs, stages */
 	int       bwa_shm_destroy(void);                                 /* drops all (matches v1 -d) */
 	int       bwa_shm_list(void);                                    /* prints staged indices to stdout */
 	int       main_shm(int argc, char *argv[]);                      /* CLI entry — see src/main.cpp dispatch */
@@ -109,8 +113,10 @@ extern "C" {
 		bwa_shm_section_t sections[16];  /* 10 used today; spare for forward-compat */
 	} bwa_shm_layout_t;
 
-	/* Compute layout and load BNS. Returns 0 on success, -1 on error. */
-	int  bwa_shm_compute(const char *prefix, bwa_shm_layout_t *layout);
+	/* Compute layout and load BNS. Returns 0 on success, -1 on error. When
+	 * bns_only=true, the PAC and REF_STRING sections are sized to zero and the
+	 * `.0123` is not stat'd (the seed `.0123` need not exist) — see bwa_shm_stage. */
+	int  bwa_shm_compute(const char *prefix, bwa_shm_layout_t *layout, bool bns_only = false);
 
 	/* Pack the index described by `layout` into `dest`, which must be at least
 	 * layout->total_size bytes. Streams cp_occ / sa_* / pac / ref_string from

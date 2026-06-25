@@ -43,16 +43,23 @@ ref.fa.bwt.2bit.64
 ref.fa.pac
 # converted seed index (used only for seeding)
 ref.fa.meth.fa
-ref.fa.meth.0123
 ref.fa.meth.amb
 ref.fa.meth.ann
 ref.fa.meth.bwt.2bit.64
 ref.fa.meth.pac
 ```
 
-The `.meth` seed index is roughly twice the size of the normal index (its contigs
-are doubled), so a `--meth` build roughly triples the on-disk index footprint
-versus a plain build. For hg38, budget on the order of 80 GB of disk.
+> **Note — the seed index has no `.0123`**
+>
+> The seed index deliberately omits the unpacked `.meth.0123` reference. `mem
+> --meth` seeds against the seed FM-index but scores/extends against the
+> **original** reference, so it never reads the seed's unpacked bases. Skipping
+> it saves ~13 GB of disk — and ~13 GB of resident memory at run time — on hg38.
+
+The `.meth` seed FM-index is roughly twice the size of the normal FM-index (its
+contigs are doubled), so a `--meth` build is larger than a plain build but less
+than 3× (the seed `.0123` is skipped). For hg38, budget on the order of 50 GB of
+disk for the combined dual index plus the intermediate `ref.fa.meth.fa`.
 
 > **Tip — Pass the original FASTA to mem, not the seed index**
 >

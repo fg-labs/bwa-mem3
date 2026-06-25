@@ -108,7 +108,9 @@ original base calls.
   reference, and
 - the converted **seed** index `ref.fa.meth.*` (built over a per-strand-converted
   FASTA `ref.fa.meth.fa` with the `f`/`r` doubled contigs) — used only for
-  seeding.
+  seeding. The seed index omits the unpacked `.meth.0123` reference: seeding uses
+  the seed FM-index and scoring/extension uses the original reference, so the
+  seed's unpacked bases are never read (saving ~13 GB of disk and RSS on hg38).
 
 This dual-index layout differs from bwameth.py, which builds a single
 `ref.fa.bwameth.c2t` doubled reference and aligns entirely against it. A legacy

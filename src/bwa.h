@@ -116,7 +116,15 @@ extern "C" {
 							 int64_t rb, int64_t re, int *score,
 							 int *n_cigar, int *NM);
 
-	int bwa_idx_build(const char *fa, const char *prefix);
+	/* emit_unpacked_ref=0 skips writing `<prefix>.0123` (D3 --meth seed index —
+	 * never extended against, so the unpacked seed ref is dead weight). `int`
+	 * (not bool) and a C++-only default keep this declaration valid C: bwa.h is
+	 * inside extern "C" and is transitively included by fast_reader_bseq.c. */
+#ifdef __cplusplus
+	int bwa_idx_build(const char *fa, const char *prefix, int emit_unpacked_ref = 1);
+#else
+	int bwa_idx_build(const char *fa, const char *prefix, int emit_unpacked_ref);
+#endif
 
 	char *bwa_idx_infer_prefix(const char *hint);
 	bwt_t *bwa_idx_load_bwt(const char *hint);

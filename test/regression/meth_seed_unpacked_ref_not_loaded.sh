@@ -1,16 +1,20 @@
 #!/usr/bin/env bash
 # test/regression/meth_seed_unpacked_ref_not_loaded.sh
 #
-# Regression (D3 memory): the SEED index's unpacked reference (`<ref>.meth.0123`)
-# is NOT consumed by `mem --meth`. D3 seeds in the doubled `.meth` FM-index but
+# Regression (D3 memory): the SEED index's unpacked reference `<ref>.meth.0123`
+# is neither BUILT nor LOADED. D3 seeds in the doubled `.meth` FM-index but
 # extends/scores against the ORIGINAL reference (meth_orig_*), so the seed
-# `.0123` is dead weight (~13 GB on hg38). This test pins the contract that it is
-# never loaded, by deleting it after indexing and asserting `mem --meth` still
-# runs and produces a BYTE-IDENTICAL BAM.
+# `.0123` is dead weight (~13 GB on hg38, never read). `index --meth` therefore
+# does not emit it, and `mem --meth` does not load it.
 #
-# RED on a binary that still loads the seed `.0123`: the second `mem --meth`
-# exits non-zero (load_ref_string fails on the missing file).
-# GREEN once the seed `.0123` load is gated off in --meth: identical output.
+# Asserts:
+#   1. `index --meth` builds the seed FM-index/bns/pac but NOT `<ref>.meth.0123`.
+#   2. The ORIGINAL `<ref>.0123` (the real extension target) IS built.
+#   3. `mem --meth` runs to a valid, non-empty BAM without the seed `.0123`, and
+#      the output is deterministic.
+#
+# RED on a binary that builds + loads the seed `.0123`: assertion 1 fails (the
+# file is present). GREEN once the seed `.0123` is dropped from build + load.
 #
 # Inputs:
 #   BWA_MEM3 — path to the bwa-mem3 binary under test
@@ -28,41 +32,33 @@ REF=TCATTGGCTATCCTAACCCGACCCTAGGAGCGGTTGGCGTGTATGCCGTGAATTTTCTCATTTCCGCTAGACATAA
 printf '>chrA\n%s\n' "$REF" > ref.fa
 Q=$(printf 'I%.0s' $(seq 1 60))
 "$BWA_MEM3" index --meth ref.fa >/dev/null 2>&1 || fail "index --meth nonzero exit"
-[ -f ref.fa.meth.0123 ] || fail "expected seed index ref.fa.meth.0123 to exist after indexing"
 
-# Proper FR pairs derived from the reference (exact windows so they place
-# cleanly and deterministically; exercises seeding + original-ref extension).
-mk_pair() {  # $1=name $2=fwd-start(0-based) $3=rev-start
-  local r1 r2
-  r1=${REF:$2:60}
-  r2=$(rc "${REF:$3:60}")
-  printf '@%s\n%s\n+\n%s\n' "$1" "$r1" "$Q" >> r1.fq
-  printf '@%s\n%s\n+\n%s\n' "$1" "$r2" "$Q" >> r2.fq
-}
+# 1. The seed unpacked reference must NOT be built; the seed FM-index/bns/pac must.
+[ ! -e ref.fa.meth.0123 ] || fail "seed ref.fa.meth.0123 was built; it must not be (never read in --meth)"
+for f in ref.fa.meth.bwt.2bit.64 ref.fa.meth.ann ref.fa.meth.amb ref.fa.meth.pac; do
+  [ -s "$f" ] || fail "expected seed index file $f to be built"
+done
+# 2. The ORIGINAL unpacked reference (the real extension target) must be built.
+[ -s ref.fa.0123 ] || fail "expected original ref.fa.0123 (the --meth extension target) to be built"
+
+# Proper FR pairs derived from the reference (exact windows so they place cleanly).
 : > r1.fq; : > r2.fq
-mk_pair p1 100 300
-mk_pair p2 500 720
-mk_pair p3 900 1140
+mk_pair() { local r1 r2; r1=${REF:$2:60}; r2=$(rc "${REF:$3:60}")
+  printf '@%s\n%s\n+\n%s\n' "$1" "$r1" "$Q" >> r1.fq
+  printf '@%s\n%s\n+\n%s\n' "$1" "$r2" "$Q" >> r2.fq; }
+mk_pair p1 100 300; mk_pair p2 500 720; mk_pair p3 900 1140
 
-run_meth() { # $1=out.bam
-  "$BWA_MEM3" mem --meth --meth-scoring genomic -t 1 ref.fa r1.fq r2.fq > "$1" 2>/dev/null
-}
+run_meth() { "$BWA_MEM3" mem --meth --meth-scoring genomic -t 1 ref.fa r1.fq r2.fq > "$1" 2>/dev/null; }
 
-# 1. Baseline run with the full index present (the golden output).
-run_meth with.bam || fail "mem --meth nonzero exit with full index"
-samtools quickcheck with.bam || fail "with.bam invalid"
-samtools view with.bam > with.records || fail "samtools view with.bam failed"
-[ -s with.records ] || fail "with.bam produced no alignment records"
+# 3. mem --meth runs without the seed `.0123`, emits a valid non-empty BAM,
+#    and is deterministic.
+run_meth a.bam || fail "mem --meth nonzero exit (must not need the seed .0123)"
+samtools quickcheck a.bam || fail "a.bam invalid"
+samtools view a.bam > a.records || fail "samtools view a.bam failed"
+[ -s a.records ] || fail "mem --meth produced no alignment records"
+run_meth b.bam || fail "mem --meth nonzero exit on second run"
+samtools quickcheck b.bam || fail "b.bam invalid"
+samtools view b.bam > b.records || fail "samtools view b.bam failed"
+diff -q a.records b.records >/dev/null 2>&1 || fail "mem --meth output is non-deterministic"
 
-# 2. Delete the SEED unpacked reference and re-run. A binary that does not
-#    consume it must succeed; one that loads it will exit non-zero here.
-rm -f ref.fa.meth.0123
-run_meth without.bam || fail "mem --meth exited non-zero after removing ref.fa.meth.0123 (the seed .0123 must not be loaded in --meth)"
-samtools quickcheck without.bam || fail "without.bam invalid"
-samtools view without.bam > without.records || fail "samtools view without.bam failed"
-
-# 3. Output must be byte-identical: removing a never-read buffer cannot change a thing.
-diff -q with.records without.records >/dev/null 2>&1 \
-  || fail "BAM records changed after removing the seed .0123 (output must be identical)"
-
-echo "PASS: meth_seed_unpacked_ref_not_loaded (seed .meth.0123 is not consumed by mem --meth; output byte-identical without it)"
+echo "PASS: meth_seed_unpacked_ref_not_loaded (seed .meth.0123 is neither built nor loaded; mem --meth works without it)"

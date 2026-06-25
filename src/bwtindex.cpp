@@ -171,7 +171,10 @@ static int meth_index_build(const char *fa)
         return 1;
     }
     fprintf(stderr, "[bwa_index:--meth] building seed index %s.* ...\n", meth_prefix);
-    if (bwa_idx_build(conv_fa, meth_prefix) != 0) {
+    /* emit_unpacked_ref=false: the seed `.0123` is never read by `mem --meth`
+     * (extension uses the original reference), so don't write it (~13 GB on
+     * hg38). The seed `.pac` + `.bwt.2bit.64` + `.ann`/`.amb` are still built. */
+    if (bwa_idx_build(conv_fa, meth_prefix, /*emit_unpacked_ref=*/false) != 0) {
         fprintf(stderr, "ERROR: bwa_idx_build failed on seed index %s\n", conv_fa);
         return 5;
     }
@@ -318,7 +321,7 @@ int bwa_index(int argc, char *argv[]) // the "index" command
 	return bwa_idx_build(argv[optind], prefix);
 }
 
-int bwa_idx_build(const char *fa, const char *prefix)
+int bwa_idx_build(const char *fa, const char *prefix, int emit_unpacked_ref)
 {
 	extern void bwa_pac_rev_core(const char *fn, const char *fn_rev);
 
@@ -333,7 +336,7 @@ int bwa_idx_build(const char *fa, const char *prefix)
 		fprintf(stderr, "%.2f sec\n", (float)(clock() - t) / CLOCKS_PER_SEC);
 		err_gzclose(fp);
         FMI_search *fmi = new FMI_search(prefix);
-        rc = fmi->build_index();
+        rc = fmi->build_index(emit_unpacked_ref);
         delete fmi;
 	}
 	return rc;

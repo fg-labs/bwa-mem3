@@ -64,6 +64,11 @@ the behavior of `bwa-mem3 index --meth` and `bwa-mem3 mem --meth`. Pass the same
 plain `<idxbase>` to all three commands; the `.meth` suffix is handled
 transparently.
 
+The staged seed segment is **seed-only**: it holds the seed FM-index and contig
+metadata (BNS) but omits the packed reference (PAC) and the unpacked reference
+(`.0123`), because `mem --meth` extends against the original reference and never
+reads the seed's bases. This trims ~14.5 GB from the staged segment on hg38.
+
 ## Notes / Gotchas
 
 > **Warning — No staleness check — always destroy before re-indexing**
@@ -76,7 +81,8 @@ transparently.
 > **Note — Platform limits**
 >
 > **macOS:** POSIX shared memory has implementation-defined per-segment size
-> caps. Staging a full hg38 index (~28 GB) may fail silently or with a
+> caps. Staging a full hg38 index (~18 GB; ~21 GB for a `--meth` seed segment)
+> may fail silently or with a
 > cryptic error. Prefer Linux for production use with large references.
 >
 > **Linux containers:** `/dev/shm` typically defaults to ~50% of physical RAM

@@ -53,10 +53,16 @@ for ext in pac ann amb 0123 bwt.2bit.64; do
 done
 
 # --- remap validation: projected read -> correct f/r contig + pos ----------
-# helper: align one read (seq) against the .meth seed index, assert RNAME/POS.
+# The `.meth` seed index no longer ships a `.0123` (dropped to save ~13 GB; it is
+# never read by `mem --meth`), so plain `mem` cannot extend against it. Probe the
+# seed FM content via a plain index of the converted seed FASTA `ref.fa.meth.fa`
+# (byte-identical doubled f/r text, plus the `.0123` plain `mem` extension needs),
+# which `index --meth` left on disk. Same contigs/positions as `ref.fa.meth.*`.
+"$BWA_MEM3" index ref.fa.meth.fa >/dev/null 2>&1 || fail "probe index of ref.fa.meth.fa nonzero exit"
+# helper: align one read (seq) against the seed FM content, assert RNAME/POS.
 check() {  # $1=label  $2=seq  $3=want_rname  $4=want_pos
     printf '@r\n%s\n+\n%s\n' "$2" "$(printf 'I%.0s' $(seq 1 ${#2}))" > q.fq
-    line=$("$BWA_MEM3" mem ref.fa.meth q.fq 2>/dev/null | mawk '$1!~/^@/{print; exit}')
+    line=$("$BWA_MEM3" mem ref.fa.meth.fa q.fq 2>/dev/null | mawk '$1!~/^@/{print; exit}')
     rn=$(echo "$line" | cut -f3); pos=$(echo "$line" | cut -f4)
     [ "$rn" = "$3" ] && [ "$pos" = "$4" ] \
         || fail "$1: mapped $rn:$pos, want $3:$4"

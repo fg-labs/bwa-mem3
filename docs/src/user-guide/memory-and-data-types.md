@@ -26,6 +26,22 @@ by mate rescue. This scales with the *effective batch size* (below) and with the
 data: longer reference windows — for example wide mate-rescue windows — make it
 larger.
 
+### Methylation (`--meth`) mode
+
+`--meth` loads a **dual index**: the doubled seed FM-index for seeding plus the
+**original** reference's packed (`.pac`) and unpacked (`.0123`) bases for
+scoring/extension. The seed FM-index is roughly twice the size of a plain
+FM-index (its contigs are doubled), so the resident index for hg38 is on the
+order of **28 GB** (seed FM-index ~21 GB + original `.0123` ~6 GB + original
+`.pac` ~1 GB), versus ~21 GB for a plain alignment.
+
+The seed index's own unpacked `.0123` (~13 GB) and packed `.pac` (~1.6 GB) are
+**neither built nor loaded** — `mem --meth` extends against the original
+reference, never the seed, so the seed's bases are never read. (Earlier `--meth`
+builds loaded both, costing ~14.5 GB of extra RSS.) Under `bwa-mem3 shm --meth`
+the staged seed segment is likewise seed-only, omitting the seed PAC and
+`.0123`. The per-batch levers below (`-K`, `-t`) apply unchanged.
+
 ## Effective batch size: `-K` and the `-t` multiplier
 
 The single most important knob for per-batch memory is the effective batch size,

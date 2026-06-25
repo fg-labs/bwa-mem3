@@ -70,7 +70,11 @@ public:
 	 * idx->l_mem so the existing destructor gate skips the wrong frees.
 	 * The segment's lifetime belongs to the loader process; shm pages are
 	 * never freed by this object.
+	 *
+	 * load_pac=false skips the PAC section entirely (idx->pac=NULL): the D3
+	 * --meth seed segment is staged bns_only (no PAC section), and `mem --meth`
+	 * extends against the ORIGINAL pac, so the seed pac is never needed.
 	 */
-	void bwa_idx_load_ele_from_shm(uint8_t *base, size_t len);
+	void bwa_idx_load_ele_from_shm(uint8_t *base, size_t len, bool load_pac = true);
 };
 #endif

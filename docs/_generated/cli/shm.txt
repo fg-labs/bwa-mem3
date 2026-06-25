@@ -5,7 +5,7 @@ Options:
   -d        destroy all indices in shared memory (matches bwa v1 behavior)
   -l        list names of indices in shared memory
   --meth    stage a `bwa-mem3 index --meth` index — auto-appends
-            `.bwameth.c2t` to <idxbase>, mirroring `mem --meth`
+            `.meth` to <idxbase>, mirroring `mem --meth`
   -h --help print this help and exit
 
 Stage with no flags: `bwa-mem3 shm <idxbase>` loads the index into

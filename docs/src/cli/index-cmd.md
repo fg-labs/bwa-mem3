@@ -76,6 +76,10 @@ prefix), plus a converted **seed** FM-index under the `.meth` prefix, built over
 per-strand-converted FASTA `<in.fasta>.meth.fa` (`f`-prefixed C→T and `r`-prefixed
 G→A doubled contigs). All files are placed alongside the original FASTA.
 
+The seed index omits the unpacked `.meth.0123` reference: `mem --meth` extends
+against the original reference, never the seed, so the seed's unpacked bases are
+never read. Not building it saves ~13 GB of disk (and RSS) on hg38.
+
 Pass the **original** FASTA prefix to all three `index`, `shm`, and `mem` commands;
 the `.meth` seed index is located automatically when `--meth` is present.
 
@@ -83,9 +87,12 @@ the `.meth` seed index is located automatically when `--meth` is present.
 
 > **Tip — Index once, align many times**
 >
-> A standard hg38 index takes several minutes and ~28 GB of disk. A `--meth`
-> build adds the `.meth` seed index on top (roughly triples the footprint — on
-> the order of 80 GB for hg38). Build once and store on shared storage; all
+> A standard hg38 index is ~18 GB of index files on disk and takes several
+> minutes to build. A `--meth` build adds the seed index on top — the doubled
+> seed FM-index (~21 GB) plus its packed `.pac` (~1.6 GB) — for roughly **40 GB**
+> of index files (~47 GB including the converted `.meth.fa`). That is a little
+> over double the plain footprint, not triple: the seed's unpacked `.0123`
+> (~13 GB) is no longer built. Build once and store on shared storage; all
 > alignment jobs on the same reference share the files.
 >
 > **Note — a `--meth` index is a superset, not a separate index**

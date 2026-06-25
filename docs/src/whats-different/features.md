@@ -84,7 +84,7 @@ Closes [issue #46](https://github.com/fg-labs/bwa-mem3/issues/46).
 ## Shared-memory index: `bwa-mem3 shm` (PR #65)
 
 `bwa-mem3 mem` reloads the FM-index from disk on every invocation. For hg38
-the index is ~28 GB; for short alignment jobs (targeted panels, small sample
+the index is ~18 GB; for short alignment jobs (targeted panels, small sample
 batches) this load cost dominates runtime and makes per-invocation IOPS the
 bottleneck.
 

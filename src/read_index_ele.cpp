@@ -91,7 +91,7 @@ void indexEle::bwa_idx_load_ele(const char *hint, int which)
     free(prefix);
 }
 
-void indexEle::bwa_idx_load_ele_from_shm(uint8_t *base, size_t len)
+void indexEle::bwa_idx_load_ele_from_shm(uint8_t *base, size_t len, bool load_pac)
 {
     if (base == NULL) {
         fprintf(stderr, "ERROR! bwa_idx_load_ele_from_shm called with NULL base\n");
@@ -107,10 +107,18 @@ void indexEle::bwa_idx_load_ele_from_shm(uint8_t *base, size_t len)
     if (bwa_shm_section_find(base, BWA_SHM_SEC_BNS_STRUCT, &off_bns,  &sz_bns)  != 0
         || bwa_shm_section_find(base, BWA_SHM_SEC_BNS_AMBS,  &off_ambs, &sz_ambs) != 0
         || bwa_shm_section_find(base, BWA_SHM_SEC_BNS_ANNS,  &off_anns, &sz_anns) != 0
-        || bwa_shm_section_find(base, BWA_SHM_SEC_BNS_NAMES, &off_names, &sz_names) != 0
-        || bwa_shm_section_find(base, BWA_SHM_SEC_PAC,       &off_pac,  &sz_pac)  != 0)
+        || bwa_shm_section_find(base, BWA_SHM_SEC_BNS_NAMES, &off_names, &sz_names) != 0)
     {
-        fprintf(stderr, "ERROR! shm segment missing one or more BNS/PAC sections\n");
+        fprintf(stderr, "ERROR! shm segment missing one or more BNS sections\n");
+        exit(EXIT_FAILURE);
+    }
+    /* PAC is only required when load_pac. A D3 --meth seed segment is staged
+     * bns_only (zero-length PAC section); `mem --meth` extends against the
+     * ORIGINAL pac, so the seed pac is never read. */
+    if (load_pac
+        && bwa_shm_section_find(base, BWA_SHM_SEC_PAC, &off_pac, &sz_pac) != 0)
+    {
+        fprintf(stderr, "ERROR! shm segment missing PAC section\n");
         exit(EXIT_FAILURE);
     }
 
@@ -211,14 +219,20 @@ void indexEle::bwa_idx_load_ele_from_shm(uint8_t *base, size_t len)
 
     /* pac aliased into shm. The on-disk loader allocates a dedicated buffer;
      * here we just point at the segment. The size sanity check ensures the
-     * segment matches what bns->l_pac demands. */
-    int64_t expected_pac = idx->bns->l_pac / 4 + 1;
-    if ((int64_t)sz_pac != expected_pac) {
-        fprintf(stderr, "ERROR! BNS_PAC size %llu != l_pac/4+1 %lld\n",
-                (unsigned long long)sz_pac, (long long)expected_pac);
-        exit(EXIT_FAILURE);
+     * segment matches what bns->l_pac demands. Skipped under !load_pac (D3
+     * --meth seed segment): idx->pac stays NULL so any consumer that bypasses
+     * the mem_aln_pac() helper crashes rather than reading seed bases. */
+    if (load_pac) {
+        int64_t expected_pac = idx->bns->l_pac / 4 + 1;
+        if ((int64_t)sz_pac != expected_pac) {
+            fprintf(stderr, "ERROR! BNS_PAC size %llu != l_pac/4+1 %lld\n",
+                    (unsigned long long)sz_pac, (long long)expected_pac);
+            exit(EXIT_FAILURE);
+        }
+        idx->pac = (uint8_t *)(base + off_pac);
+    } else {
+        idx->pac = NULL;
     }
-    idx->pac = (uint8_t *)(base + off_pac);
 
     /* The destructor's existing is_shm gate skips free(idx->mem). We set
      * idx->mem = base / idx->l_mem = len so the gate works as designed.

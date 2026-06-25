@@ -175,7 +175,7 @@ void FMI_search::load_index_from_shm(uint8_t *base, size_t len)
             (long)reference_seq_len, (long)sentinel_index);
 }
 
-int FMI_search::build_index() {
+int FMI_search::build_index(bool emit_unpacked_ref) {
 
     char *prefix = file_name;
 
@@ -224,6 +224,7 @@ int FMI_search::build_index() {
         opts.max_memory_bytes = parse_ll(mm, "BWA_INDEX_MAX_MEMORY");
     if (const char* td = getenv("BWA_INDEX_TMPDIR"))
         opts.tmpdir           = td;
+    opts.emit_unpacked_ref = emit_unpacked_ref;
     return libsais_build_fm_index(prefix, pac_len, opts);
 }
 
@@ -237,11 +238,9 @@ void FMI_search::load_index(bool load_pac)
         uint8_t *shm_base_local = bwa_shm_attach(file_name, &shm_attach_len);
         if (shm_base_local != NULL) {
             load_index_from_shm(shm_base_local, shm_attach_len);
-            bwa_idx_load_ele_from_shm(shm_base_local, shm_attach_len);
-            /* D3 --meth seed index: drop the pac view so nothing reads seed
-             * bases at original coords (extension uses meth_orig_pac). The shm
-             * mapping owns the bytes; NULLing the alias frees nothing. */
-            if (!load_pac) idx->pac = NULL;
+            /* D3 --meth seed segment is staged bns_only: no PAC section, and
+             * idx->pac stays NULL (extension uses meth_orig_pac). */
+            bwa_idx_load_ele_from_shm(shm_base_local, shm_attach_len, load_pac);
             fprintf(stderr, "* FMI+BNS%s attached from shm; "
                     "skipping disk load.\n", load_pac ? "+PAC" : "");
             return;

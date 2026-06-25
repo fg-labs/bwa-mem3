@@ -35,18 +35,26 @@ trap '"$BIN" shm -d >/dev/null 2>&1 || true; rm -rf "$WORKDIR" "$ERR"' EXIT
 echo "[setup] bwa-mem3 index --meth $PLAIN_PREFIX"
 "$BIN" index --meth "$PLAIN_PREFIX" >/dev/null 2>&1
 
-# D3 dual-index invariant: BOTH the bare original index and the .meth seed index
-# are written by `index --meth`.
+# D3 dual-index invariant: `index --meth` writes the bare original index AND the
+# .meth seed index. The bare original carries the unpacked `.0123` (the --meth
+# extension target); the seed index does NOT — `mem --meth` never extends against
+# the seed, so its `.0123` is not built (saves ~13 GB on hg38).
 for ext in .0123 .ann .amb .pac .bwt.2bit.64; do
     if [[ ! -e "${PLAIN_PREFIX}${ext}" ]]; then
         echo "FAIL: dual index missing bare original index ${PLAIN_PREFIX}${ext}" >&2
         exit 1
     fi
+done
+for ext in .ann .amb .pac .bwt.2bit.64; do
     if [[ ! -e "${METH_PREFIX}${ext}" ]]; then
         echo "FAIL: dual index missing seed index ${METH_PREFIX}${ext}" >&2
         exit 1
     fi
 done
+if [[ -e "${METH_PREFIX}.0123" ]]; then
+    echo "FAIL: seed index ${METH_PREFIX}.0123 was built; it must not be (never read in --meth)" >&2
+    exit 1
+fi
 
 # --- A: `shm --meth <plain>` stages the seed under the .meth basename ----
 echo "[A] bwa-mem3 shm --meth $PLAIN_PREFIX"
