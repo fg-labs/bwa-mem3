@@ -28,10 +28,10 @@ ok()   { echo "OK:   $*"; }
 # against a mismatched source and flaked.
 [[ -s "$FIXTURES/synthetic_1mb.fa" ]] || fail "synthetic_1mb.fa fixture missing at $FIXTURES/synthetic_1mb.fa"
 
-# Build the phiX FMI index if not already present. Check all five artifacts
-# that `bwa-mem3 index` produces so a corrupt/partial prior run is re-indexed.
+# Build the phiX FMI index if not already present. Check all four artifacts
+# that `bwa-mem3 index` produces by default (no `.0123`: mem pac-fetches from
+# `.pac`) so a corrupt/partial prior run is re-indexed.
 if [[ ! -s "$FIXTURES/phix.fa.bwt.2bit.64" || \
-      ! -s "$FIXTURES/phix.fa.0123"        || \
       ! -s "$FIXTURES/phix.fa.amb"         || \
       ! -s "$FIXTURES/phix.fa.ann"         || \
       ! -s "$FIXTURES/phix.fa.pac" ]]; then
@@ -155,7 +155,7 @@ done
 # (~5 kb) is too small to host the alignment, so use the checked-in 1 Mb
 # synthetic reference and a 40 kb read sliced from it.
 SYN="$FIXTURES/synthetic_1mb.fa"
-if [[ ! -s "$SYN.bwt.2bit.64" || ! -s "$SYN.0123" || ! -s "$SYN.amb" || \
+if [[ ! -s "$SYN.bwt.2bit.64" || ! -s "$SYN.amb" || \
       ! -s "$SYN.ann"         || ! -s "$SYN.pac" ]]; then
     "$BWAMEM3" index "$SYN" >/dev/null 2>&1 || fail "bwa-mem3 index on synthetic_1mb.fa failed"
 fi

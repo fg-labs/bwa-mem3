@@ -5,7 +5,7 @@
 # without juggling the `.meth` suffix by hand.
 #
 # D3 (dual index): `index --meth` builds BOTH the original-alphabet index at the
-# bare prefix (`ref.fa.{0123,ann,...}`) AND the converted seed FM-index at
+# bare prefix (`ref.fa.{ann,amb,pac,bwt.2bit.64}`) AND the converted seed FM-index at
 # `ref.fa.meth.*`. `shm --meth <plain>` stages the seed segment under the
 # `ref.fa.meth` basename; `mem --meth <plain>` attaches it from shm. Because the
 # bare index now exists too, plain `shm <plain>` also succeeds (stages the
@@ -36,10 +36,10 @@ echo "[setup] bwa-mem3 index --meth $PLAIN_PREFIX"
 "$BIN" index --meth "$PLAIN_PREFIX" >/dev/null 2>&1
 
 # D3 dual-index invariant: `index --meth` writes the bare original index AND the
-# .meth seed index. The bare original carries the unpacked `.0123` (the --meth
-# extension target); the seed index does NOT — `mem --meth` never extends against
-# the seed, so its `.0123` is not built (saves ~13 GB on hg38).
-for ext in .0123 .ann .amb .pac .bwt.2bit.64; do
+# .meth seed index. Neither carries the unpacked `.0123` by default — `mem`
+# pac-fetches the original reference from `.pac`, and `mem --meth` never extends
+# against the seed at all (saves ~6.4 GB original + ~13 GB seed on hg38).
+for ext in .ann .amb .pac .bwt.2bit.64; do
     if [[ ! -e "${PLAIN_PREFIX}${ext}" ]]; then
         echo "FAIL: dual index missing bare original index ${PLAIN_PREFIX}${ext}" >&2
         exit 1
@@ -51,6 +51,10 @@ for ext in .ann .amb .pac .bwt.2bit.64; do
         exit 1
     fi
 done
+if [[ -e "${PLAIN_PREFIX}.0123" ]]; then
+    echo "FAIL: original index ${PLAIN_PREFIX}.0123 was built; it must not be by default (mem pac-fetches from .pac)" >&2
+    exit 1
+fi
 if [[ -e "${METH_PREFIX}.0123" ]]; then
     echo "FAIL: seed index ${METH_PREFIX}.0123 was built; it must not be (never read in --meth)" >&2
     exit 1

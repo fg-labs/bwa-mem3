@@ -16,7 +16,9 @@ for t in 1 4 8; do
     d="$RUN_DIR/t$t"
     mkdir -p "$d"
     cp "$FA_SRC" "$d/t.fa"
-    "$BWAMEM3" index -t "$t" "$d/t.fa" >/dev/null
+    # --emit-unpacked-ref: this test validates .0123 determinism too; .0123 is no
+    # longer built by default (mem pac-fetches from .pac).
+    "$BWAMEM3" index --emit-unpacked-ref -t "$t" "$d/t.fa" >/dev/null
 done
 
 for ext in bwt.2bit.64 0123; do

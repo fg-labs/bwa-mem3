@@ -21,7 +21,9 @@ trap 'rm -rf "$TD"' EXIT
 for fa in phix.fa synthetic_1mb.fa; do
     [[ -s "$HERE/fixtures/$fa" ]] || { echo "FAIL: source fixture $HERE/fixtures/$fa missing"; exit 1; }
     cp "$HERE/fixtures/$fa" "$TD/$fa"
-    "$BWAMEM3" index "$TD/$fa" >/dev/null 2>&1
+    # --emit-unpacked-ref: byte-diff the .0123 baseline too; .0123 is no longer
+    # built by default (mem pac-fetches from .pac).
+    "$BWAMEM3" index --emit-unpacked-ref "$TD/$fa" >/dev/null 2>&1
     for ext in 0123 bwt.2bit.64; do
         if ! cmp -s "$BASELINES/$fa.$ext" "$TD/$fa.$ext"; then
             echo "FAIL: $fa.$ext diverges from baseline"

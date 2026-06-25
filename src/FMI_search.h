@@ -119,9 +119,10 @@ class FMI_search: public indexEle
      * fastmap reuses this so it doesn't have to re-attach for the ref string. */
     uint8_t *shm_attached_base()     const { return shm_base; }
 
-    /* emit_unpacked_ref=false skips writing the unpacked `<prefix>.0123`
-     * (used by the D3 --meth seed index, which is never extended against). */
-    int build_index(bool emit_unpacked_ref = true);
+    /* emit_unpacked_ref defaults false: skip writing the unpacked `<prefix>.0123`.
+     * `mem` pac-fetches the original reference from `.pac`, so `.0123` is never
+     * read; pass true only to emit it for an external consumer (e.g. bwa-mem2). */
+    int build_index(bool emit_unpacked_ref = false);
     /* load_pac=false skips loading the 2-bit packed reference (BNS only). D3
      * --meth uses this for the SEED index: seeding needs the FM-index + bns
      * (for the seed->original remap) but never the seed pac — extension/scoring

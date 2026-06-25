@@ -116,12 +116,15 @@ extern "C" {
 							 int64_t rb, int64_t re, int *score,
 							 int *n_cigar, int *NM);
 
-	/* emit_unpacked_ref=0 skips writing `<prefix>.0123` (D3 --meth seed index —
-	 * never extended against, so the unpacked seed ref is dead weight). `int`
-	 * (not bool) and a C++-only default keep this declaration valid C: bwa.h is
-	 * inside extern "C" and is transitively included by fast_reader_bseq.c. */
+	/* emit_unpacked_ref=0 (the default) skips writing `<prefix>.0123`. `mem`
+	 * pac-fetches the original reference from `<prefix>.pac` on demand
+	 * (bns_get_seq_v2), so the unpacked `.0123` (~8x the `.pac`) is never read
+	 * and not worth building. Pass 1 only to emit it for an external consumer
+	 * that still requires the unpacked file (e.g. bwa-mem2). `int` (not bool)
+	 * and a C++-only default keep this declaration valid C: bwa.h is inside
+	 * extern "C" and is transitively included by fast_reader_bseq.c. */
 #ifdef __cplusplus
-	int bwa_idx_build(const char *fa, const char *prefix, int emit_unpacked_ref = 1);
+	int bwa_idx_build(const char *fa, const char *prefix, int emit_unpacked_ref = 0);
 #else
 	int bwa_idx_build(const char *fa, const char *prefix, int emit_unpacked_ref);
 #endif

@@ -68,7 +68,9 @@ int emit_0123(const PackedText& pac, const char* prefix, int num_threads)
         }
     }
     // Surface deferred I/O errors (delayed-writeback EIO, full filesystem,
-    // etc.). The .0123 file is a non-negotiable index artefact.
+    // etc.) so a truncated .0123 never masquerades as complete. This runs only
+    // when the caller opted into emitting .0123 (off by default; `mem`
+    // pac-fetches from .pac instead).
     if (close(fd) != 0) {
         err_fatal(__func__, "close('%s') failed: %s", out.c_str(), strerror(errno));
     }

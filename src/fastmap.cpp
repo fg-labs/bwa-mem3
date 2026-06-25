@@ -1621,6 +1621,25 @@ int main_mem(int argc, char *argv[])
     int ref_pac_fetch;
     { const char *e = getenv("BWAMEM3_REF_PAC_FETCH");
       ref_pac_fetch = !(e != NULL && e[0] == '0'); }
+    /* The legacy reload (BWAMEM3_REF_PAC_FETCH=0) reads `<prefix>.0123`, which is
+     * no longer built by default (bwa_idx_build's emit_unpacked_ref). If the user
+     * asks for it but the file is absent, fall back to pac-fetch rather than
+     * aborting — the two paths are byte-identical, so an old script or muscle-
+     * memory env setting still runs. The escape hatch only does anything on an
+     * index that was built (or rebuilt) with the unpacked `.0123` present. */
+    if (!ref_pac_fetch) {
+        const char *probe_prefix = (opt->meth_mode && meth_orig_ref_prefix != NULL)
+                                       ? meth_orig_ref_prefix : ref_prefix;
+        char probe_0123[PATH_MAX];
+        int pn = snprintf(probe_0123, sizeof(probe_0123), "%s.0123", probe_prefix);
+        if (pn > 0 && (size_t)pn < sizeof(probe_0123) && access(probe_0123, R_OK) != 0) {
+            fprintf(stderr,
+                    "* BWAMEM3_REF_PAC_FETCH=0 requested but '%s' is absent "
+                    "(index built without it); falling back to pac-fetch.\n",
+                    probe_0123);
+            ref_pac_fetch = 1;
+        }
+    }
     if (opt->meth_mode && meth_orig_ref_prefix != NULL && !ref_pac_fetch) {
         int64_t orig_rlen = 0;
         int     orig_is_shm = 0;   /* original .0123 is never in shm; force disk */

@@ -83,7 +83,7 @@ assert_rg_consistent() {
 # --- default (non-meth) path: SAM output -----------------------------------
 # This path was always correct; it is the control that proves --meth must
 # match it.
-if [[ ! -s "$ref.bwt.2bit.64" || ! -s "$ref.0123" || ! -s "$ref.amb" \
+if [[ ! -s "$ref.bwt.2bit.64" || ! -s "$ref.amb" \
       || ! -s "$ref.ann"       || ! -s "$ref.pac" ]]; then
     "$bin" index "$ref" >/dev/null 2>&1 || { echo "FAIL: bwa-mem3 index on phix.fa failed" >&2; exit 1; }
 fi
@@ -102,13 +102,14 @@ if ! command -v samtools >/dev/null 2>&1; then
     exit 0
 fi
 
-# --meth requires a c2t-converted index built with `index --meth`. Check the
-# full artifact set (converted FASTA + the five FMI files), not just one, so a
-# partial index left by an interrupted run is rebuilt rather than skipped —
-# matching the non-meth block above.
-if [[ ! -s "$ref.bwameth.c2t"            || ! -s "$ref.bwameth.c2t.bwt.2bit.64" \
-      || ! -s "$ref.bwameth.c2t.0123"    || ! -s "$ref.bwameth.c2t.amb"        \
-      || ! -s "$ref.bwameth.c2t.ann"     || ! -s "$ref.bwameth.c2t.pac" ]]; then
+# --meth requires the D3 seed index built with `index --meth`. Check the full
+# artifact set (converted seed FASTA + the four seed FMI files), not just one,
+# so a partial index left by an interrupted run is rebuilt rather than skipped —
+# matching the non-meth block above. The seed has no `.0123` (never read in
+# --meth; extension uses the original reference, which itself pac-fetches).
+if [[ ! -s "$ref.meth.fa"            || ! -s "$ref.meth.bwt.2bit.64" \
+      || ! -s "$ref.meth.amb"        || ! -s "$ref.meth.ann"         \
+      || ! -s "$ref.meth.pac" ]]; then
     "$bin" index --meth "$ref" >/dev/null 2>&1 \
         || { echo "FAIL: bwa-mem3 index --meth on phix.fa failed" >&2; exit 1; }
 fi

@@ -85,10 +85,12 @@ static int meth_c2t_is_fresh(const char *in_fa, const char *out_fa)
 }
 
 /* D3 BS-seq index layout. `index --meth` builds TWO indexes from `fa`:
- *   1. The ORIGINAL-alphabet index `<fa>.{pac,ann,amb,0123,bwt.2bit.64}` — real chrom
+ *   1. The ORIGINAL-alphabet index `<fa>.{pac,ann,amb,bwt.2bit.64}` — real chrom
  *      names + original bases. This is the extension/scoring reference and the basis
  *      for variant-callable `mem --meth` output. (Identical to a normal `index`.)
- *   2. A converted SEED index `<fa>.meth.{pac,ann,amb,0123,bwt.2bit.64}`, built over a
+ *      `mem` pac-fetches its bases from `.pac`, so no `.0123` is written (see
+ *      bwa_idx_build's emit_unpacked_ref default).
+ *   2. A converted SEED index `<fa>.meth.{pac,ann,amb,bwt.2bit.64}`, built over a
  *      per-strand-converted FASTA `<fa>.meth.fa` (two contigs per chromosome:
  *      `>r<name>` = G->A reverse-strand target, `>f<name>` = C->T forward-strand
  *      target). 3-letter seeding requires per-strand conversion because C->T and
@@ -96,11 +98,13 @@ static int meth_c2t_is_fresh(const char *in_fa, const char *out_fa)
  *      SA-intervals, which are then remapped to original coordinates for chaining and
  *      extension. The `.meth` separation is by file PREFIX (not by changing the global
  *      CP_FILENAME_SUFFIX, which serves every index). */
-static int meth_index_build(const char *fa)
+static int meth_index_build(const char *fa, int emit_unpacked_ref)
 {
-    /* 1. Original-alphabet index (extension reference). */
+    /* 1. Original-alphabet index (extension reference). emit_unpacked_ref applies
+     * to the original only (its `.0123` is the legacy bwa-mem2 extension target);
+     * the seed index never needs an unpacked ref (step 2b passes false). */
     fprintf(stderr, "[bwa_index:--meth] building original index for %s ...\n", fa);
-    if (bwa_idx_build(fa, fa) != 0) {
+    if (bwa_idx_build(fa, fa, emit_unpacked_ref) != 0) {
         fprintf(stderr, "ERROR: bwa_idx_build failed on original %s\n", fa);
         return 5;
     }
@@ -171,9 +175,10 @@ static int meth_index_build(const char *fa)
         return 1;
     }
     fprintf(stderr, "[bwa_index:--meth] building seed index %s.* ...\n", meth_prefix);
-    /* emit_unpacked_ref=false: the seed `.0123` is never read by `mem --meth`
-     * (extension uses the original reference), so don't write it (~13 GB on
-     * hg38). The seed `.pac` + `.bwt.2bit.64` + `.ann`/`.amb` are still built. */
+    /* emit_unpacked_ref=false (also the default now): the seed `.0123` is never
+     * read by `mem --meth` (extension uses the original reference), so don't
+     * write it (~13 GB on hg38). Kept explicit for documentation; the seed
+     * `.pac` + `.bwt.2bit.64` + `.ann`/`.amb` are still built. */
     if (bwa_idx_build(conv_fa, meth_prefix, /*emit_unpacked_ref=*/false) != 0) {
         fprintf(stderr, "ERROR: bwa_idx_build failed on seed index %s\n", conv_fa);
         return 5;
@@ -212,6 +217,10 @@ static void index_usage(void)
 	        "  --meth             build a BS-aware dual index. Writes the original-alphabet\n"
 	        "                     index at <in.fasta>.* plus a converted seed FM-index at\n"
 	        "                     <in.fasta>.meth.* (used by `bwa-mem3 mem --meth`).\n"
+	        "  --emit-unpacked-ref also write the unpacked `<prefix>.0123` reference. Off by\n"
+	        "                     default: `mem` pac-fetches bases from `.pac`, so `.0123`\n"
+	        "                     is never read. Enable only for an external consumer that\n"
+	        "                     still requires it (e.g. bwa-mem2); ~8x the size of `.pac`.\n"
 	        "  -h, --help         print this help message and exit\n");
 }
 
@@ -220,14 +229,16 @@ int bwa_index(int argc, char *argv[]) // the "index" command
 	int c;
 	char *prefix = 0;
 	int meth = 0;
+	int emit_unpacked_ref = 0;     // 0 => don't write <prefix>.0123 (mem pac-fetches)
 	int64_t user_max_memory = 0;   // 0 => auto default
 	int     user_threads    = 0;   // 0 => auto default
 	static struct option long_opts[] = {
-		{"meth",       no_argument,       0, 1000},
-		{"max-memory", required_argument, 0, 1001},
-		{"tmp-dir",    required_argument, 0, 1002},
-		{"threads",    required_argument, 0, 't'},
-		{"help",       no_argument,       0, 'h'},
+		{"meth",              no_argument,       0, 1000},
+		{"max-memory",        required_argument, 0, 1001},
+		{"tmp-dir",           required_argument, 0, 1002},
+		{"emit-unpacked-ref", no_argument,       0, 1003},
+		{"threads",           required_argument, 0, 't'},
+		{"help",              no_argument,       0, 'h'},
 		{0, 0, 0, 0}
 	};
 	while ((c = getopt_long(argc, argv, "p:t:h", long_opts, NULL)) >= 0) {
@@ -255,6 +266,8 @@ int bwa_index(int argc, char *argv[]) // the "index" command
 			user_max_memory = mem;
 		} else if (c == 1002) {
 			setenv("BWA_INDEX_TMPDIR", optarg, 1);
+		} else if (c == 1003) {
+			emit_unpacked_ref = 1;
 		} else if (c == 'h') {
 			index_usage();
 			return 0;
@@ -315,10 +328,10 @@ int bwa_index(int argc, char *argv[]) // the "index" command
 			fprintf(stderr, "ERROR: --meth does not accept -p (outputs <in.fasta>.* and <in.fasta>.meth.*)\n");
 			return 1;
 		}
-		return meth_index_build(argv[optind]);
+		return meth_index_build(argv[optind], emit_unpacked_ref);
 	}
 	if (prefix == 0) prefix = argv[optind];
-	return bwa_idx_build(argv[optind], prefix);
+	return bwa_idx_build(argv[optind], prefix, emit_unpacked_ref);
 }
 
 int bwa_idx_build(const char *fa, const char *prefix, int emit_unpacked_ref)

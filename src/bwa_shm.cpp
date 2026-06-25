@@ -901,25 +901,27 @@ static int resolve_meth_prefix(const char *prefix, char out[PATH_MAX])
     return 0;
 }
 
-/* If `<prefix>.0123` is absent but `<prefix>.meth.0123` is present, the user
- * likely meant `--meth`. Print a hint and return 1. Returns 0 when no hint
- * applies (let the regular stage path produce its own error). */
+/* If the plain FM-index `<prefix>.bwt.2bit.64` is absent but the seed index
+ * `<prefix>.meth.bwt.2bit.64` is present, the user likely meant `--meth`. Print
+ * a hint and return 1. Returns 0 when no hint applies (let the regular stage
+ * path produce its own error). Probes `.bwt.2bit.64`, not `.0123`: the unpacked
+ * `.0123` is no longer built by default (mem pac-fetches from `.pac`), so a
+ * complete plain index has no `.0123` — only `.bwt.2bit.64` is a reliable
+ * "index present" sentinel. */
 static int hint_missing_meth_flag(const char *prefix)
 {
-    char zer_path[PATH_MAX];
-    path_concat2(zer_path, prefix, ".0123");
+    char fmi_path[PATH_MAX];
+    path_concat2(fmi_path, prefix, ".bwt.2bit.64");
     struct stat st;
-    if (stat(zer_path, &st) == 0) return 0;        /* literal index present */
+    if (stat(fmi_path, &st) == 0) return 0;        /* plain index present */
     if (errno != ENOENT) return 0;                 /* I/O error: defer */
 
-    /* Detect the seed index by its FM-index file: the seed `.meth.0123` is no
-     * longer built (it is never read by `mem --meth`), so probe `.meth.bwt.2bit.64`. */
     char meth_fmi[PATH_MAX];
     path_concat2(meth_fmi, prefix, ".meth.bwt.2bit.64");
     if (stat(meth_fmi, &st) != 0) return 0;        /* no meth seed index either */
 
     std::fprintf(stderr,
-        "[E::main_shm] no FMI at '%s.0123' but a meth seed index is present at "
+        "[E::main_shm] no FMI at '%s.bwt.2bit.64' but a meth seed index is present at "
         "'%s.meth.*'\n"
         "             did you mean `bwa-mem3 shm --meth %s`?\n",
         prefix, prefix, prefix);
