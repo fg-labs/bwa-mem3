@@ -898,10 +898,18 @@ int mem_sam_pe_batch(const mem_opt_t *opt, mem_cache *mmc,
         auto pwsw_ob = make_kswv(opt->o_del, opt->e_del, opt->o_ins, opt->e_ins,
                                  opt->a, -1*opt->b, nthreads,
                                  maxRefLen, maxQerLen, opt->mat_ob);
-        // Rank-1 meth matrices must be expressible by the batched kernel; if a
-        // future matrix is richer, needsScalar() flags it and we keep the
-        // scalar path (env=0 / index==-1 in _post) as the safety net.
-        assert(!pwsw_ot->needsScalar() && !pwsw_ob->needsScalar());
+        // The batched kernel expresses exactly the matrices mem_opt_fill_meth_mat
+        // produces: GENOMIC (one freed cell) and COLLAPSED (the conversion cell
+        // PLUS its mirror — a symmetric (i,j)/(j,i) pair). needsScalar() is
+        // therefore always false here. Guard it at RUNTIME rather than with a
+        // bare assert(): under NDEBUG assert is a no-op, which would let a future
+        // unsupported matrix run the batched kernel and silently mis-score. Fail
+        // loudly instead — this can only fire on a programming error in
+        // mem_opt_fill_meth_mat (a matrix that is neither rank-1 nor a mirror pair).
+        if (pwsw_ot->needsScalar() || pwsw_ob->needsScalar())
+            err_fatal(__func__,
+                      "meth mate-rescue matrix not expressible by the batched kernel "
+                      "(neither rank-1 genomic nor a collapsed mirror pair)");
 
         // hyp == 1 -> OT (mat_ot / pwsw_ot); hyp == 0 -> OB (mat_ob / pwsw_ob).
         // -1 (non-meth) cannot occur here: every enqueued pair under meth_mode

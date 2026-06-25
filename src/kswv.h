@@ -167,12 +167,18 @@ public:
                              uint16_t numThreads,
                              int phase) = 0;
 
-    /* True when the construction matrix is asymmetric in a way the batched
-     * kernel cannot express (>=2 freed cells, a changed diagonal, or a freed
-     * value != w_match). The caller must then route those pairs to the scalar
-     * fallback (ksw_align2). A symmetric matrix or a rank-1 freed cell (the
-     * bisulfite OT/OB case) returns false. Declared on the abstract interface
-     * so the dispatcher never depends on the concrete kswv layout. */
+    /* True when the construction matrix is asymmetric in a way THIS concrete
+     * tier cannot express, so the caller must route those pairs to the scalar
+     * fallback (ksw_align2). Two reasons it can be true:
+     *   - the matrix shape is unsupported: a non-mirror multi-cell free, a
+     *     changed diagonal, or a freed value != w_match; or
+     *   - the running tier lacks the freed-cell kernel override. Only the NEON,
+     *     AVX2, and AVX-512BW kernels implement it; an SSE41/SSE42/AVX kswv
+     *     reports true for any freed-cell matrix.
+     * A symmetric matrix, a rank-1 freed cell (bisulfite genomic OT/OB), or an
+     * exact mirrored freed pair (collapsed --meth) returns false on a tier that
+     * implements the override. Declared on the abstract interface so the
+     * dispatcher never depends on the concrete kswv layout. */
     virtual bool needsScalar() const = 0;
 
 };
@@ -523,15 +529,20 @@ private:
 	int o_del, o_ins, e_del, e_ins;
 	// const int8_t *mat;
 
-	/* Rank-1 freed-cell descriptor (issue 173), populated by the mat-aware
-	 * ctor. `has_freed` ⇒ a single off-diagonal cell (fr_ref x fr_read) was
-	 * freed to a match (bisulfite OT/OB); the kernel will apply the override
-	 * (a later task — currently unused, so output is unchanged).
+	/* Freed-cell descriptor (issue 173), populated by the mat-aware ctor.
+	 * `has_freed` ⇒ off-diagonal cells were freed to a match (bisulfite). The
+	 * kernel frees a SYMMETRIC PAIR of cells: (fr_ref x fr_read) and
+	 * (fr_ref2 x fr_read2). GENOMIC (rank-1) frees ONE cell, so the mirror
+	 * equals the primary (fr_ref2==fr_ref, fr_read2==fr_read) and the second
+	 * blend is idempotent. COLLAPSED (the --meth default) frees the conversion
+	 * cell AND its mirror, so (fr_ref2,fr_read2) = (fr_read,fr_ref).
 	 * `needs_scalar` ⇒ the matrix is asymmetric in a way the kernel cannot
-	 * express and the caller must fall back to scalar. The 9-arg ctor leaves
-	 * both false. ABI note: these live here (not in the dispatcher TU) and are
-	 * safe to add because every TU includes this same kswv.h. */
+	 * express (non-mirror multi-cell, changed diagonal, …) and the caller must
+	 * fall back to scalar. The 9-arg ctor leaves all false. ABI note: these live
+	 * here (not in the dispatcher TU) and are safe to add because every TU
+	 * includes this same kswv.h. */
 	int8_t fr_ref = 0, fr_read = 0;
+	int8_t fr_ref2 = 0, fr_read2 = 0;
 	bool has_freed = false;
 	bool needs_scalar = false;
 

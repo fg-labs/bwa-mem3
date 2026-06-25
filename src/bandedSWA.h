@@ -186,6 +186,44 @@ static inline BswFreedCell bsw_freed_cell(const int8_t *mat, int8_t w_match,
     return c;
 }
 
+// COLLAPSED bisulfite (the `--meth` default) frees the conversion cell AND its
+// mirror, so C/T (and G/A) are mutually interchangeable: two off-diagonal cells
+// (i,j) and (j,i), both to a match, with everything else canonical. This is the
+// rank-1 case plus its transpose; the kernel handles it by freeing BOTH ordered
+// cells (the rank-1 case is the degenerate (i,j)==(j,i) where the mirror equals
+// the primary). `supported` is true ONLY for an exact symmetric mirror pair; a
+// non-mirror two-cell matrix (e.g. OT+OB combined), >2 freed cells, a changed
+// diagonal, or a non-match freed value all leave it false → scalar fallback.
+// (refA,readA) is the primary cell, (refB,readB) its mirror.
+struct BswFreedPair { bool supported; int8_t refA, readA, refB, readB; };
+static inline BswFreedPair bsw_freed_pair(const int8_t *mat, int8_t w_match,
+                                          int8_t w_mismatch)
+{
+    int n_freed = 0;
+    int8_t r[2] = {0, 0}, c[2] = {0, 0};
+    bool ok = true;
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++) {
+            int8_t expect = (i == j) ? w_match : w_mismatch;
+            if (mat[i * 5 + j] == expect) continue;
+            if (i != j && mat[i * 5 + j] == w_match) {   // off-diagonal freed to match
+                if (n_freed < 2) { r[n_freed] = (int8_t)i; c[n_freed] = (int8_t)j; }
+                n_freed++;
+            } else {
+                ok = false;                              // diagonal change / non-match freed
+            }
+        }
+    BswFreedPair p;
+    p.supported = false;
+    p.refA = p.readA = p.refB = p.readB = 0;
+    if (ok && n_freed == 2 && r[0] == c[1] && c[0] == r[1]) {  // exact (i,j)/(j,i) mirror
+        p.supported = true;
+        p.refA = r[0]; p.readA = c[0];
+        p.refB = r[1]; p.readB = c[1];
+    }
+    return p;
+}
+
 typedef struct dnaSeqPair
 {
     int32_t idr, idq, id;
