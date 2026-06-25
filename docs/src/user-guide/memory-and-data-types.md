@@ -24,12 +24,10 @@ for a given reference and does not change with `-t` or `-K`.
 directly from the packed `.pac` on demand (*pac-fetch*), so the unpacked
 `.0123` reference (~6.4 GB on hg38) is **neither loaded nor required on disk** —
 the `.pac` already holds the same bases at one-quarter the size. This is the
-default and is byte-for-byte identical to loading `.0123`. The escape hatch
-`BWAMEM3_REF_PAC_FETCH=0` restores the old behavior of loading `.0123` (only on
-an index that still has the file; see [indexing](indexing.md)), and is intended
-only for A/B verification. On hg38 (5M read pairs, `-t 16`) pac-fetch lowered
-peak RSS by **~6.2 GB** for a plain alignment and **~6.3 GB** for `--meth`, at
-neutral-to-slightly-faster wall time.
+only reference path and is byte-for-byte identical to the historical `.0123`
+load. On hg38 (5M read pairs, `-t 16`) pac-fetch lowered peak RSS by **~6.2 GB**
+for a plain alignment and **~6.3 GB** for `--meth`, at neutral-to-slightly-faster
+wall time.
 
 **Per-batch working set.** On top of the index, each in-flight batch holds the
 reads, their seeds, candidate alignment regions, and the reference windows used

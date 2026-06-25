@@ -35,8 +35,7 @@ expect roughly 11 GB total across all four files.
 > bwa-mem3 index --emit-unpacked-ref ref.fa   # also writes ref.fa.0123
 > ```
 >
-> At run time, `BWAMEM3_REF_PAC_FETCH=0` reloads `.0123` instead of pac-fetching
-> (only on an index that still has the file); it exists for A/B verification.
+> `mem` ignores any `.0123` present and always pac-fetches from `.pac`.
 
 ## Methylation index (`--meth`)
 
