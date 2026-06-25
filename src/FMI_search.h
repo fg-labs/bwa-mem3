@@ -120,7 +120,11 @@ class FMI_search: public indexEle
     uint8_t *shm_attached_base()     const { return shm_base; }
 
     int build_index();
-    void load_index();
+    /* load_pac=false skips loading the 2-bit packed reference (BNS only). D3
+     * --meth uses this for the SEED index: seeding needs the FM-index + bns
+     * (for the seed->original remap) but never the seed pac — extension/scoring
+     * runs against the ORIGINAL pac (meth_orig_pac). Saves ~1.6 GB on hg38. */
+    void load_index(bool load_pac = true);
 
     /* Attach to a packed bwa-mem3 index segment from bwa_shm_attach. Sets
      * scalars and the cp_occ / sa_ms_byte / sa_ls_word pointers; the

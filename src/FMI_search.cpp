@@ -227,7 +227,7 @@ int FMI_search::build_index() {
     return libsais_build_fm_index(prefix, pac_len, opts);
 }
 
-void FMI_search::load_index()
+void FMI_search::load_index(bool load_pac)
 {
     /* Try the staged shm segment first. On hit, both the FMI internals
      * (cp_occ / sa_*) and the BNS+PAC are attached as views into the
@@ -238,8 +238,12 @@ void FMI_search::load_index()
         if (shm_base_local != NULL) {
             load_index_from_shm(shm_base_local, shm_attach_len);
             bwa_idx_load_ele_from_shm(shm_base_local, shm_attach_len);
-            fprintf(stderr, "* FMI+BNS+PAC attached from shm; "
-                    "skipping disk load.\n");
+            /* D3 --meth seed index: drop the pac view so nothing reads seed
+             * bases at original coords (extension uses meth_orig_pac). The shm
+             * mapping owns the bytes; NULLing the alias frees nothing. */
+            if (!load_pac) idx->pac = NULL;
+            fprintf(stderr, "* FMI+BNS%s attached from shm; "
+                    "skipping disk load.\n", load_pac ? "+PAC" : "");
             return;
         }
     }
@@ -360,7 +364,9 @@ void FMI_search::load_index()
 
     fprintf(stderr, "* Reading other elements of the index from files %s\n",
             ref_file_name);
-    bwa_idx_load_ele(ref_file_name, BWA_IDX_ALL);
+    /* D3 --meth: BNS only for the seed index (skip the ~1.6 GB seed pac). The
+     * seed bns drives the seed->original remap; extension uses meth_orig_pac. */
+    bwa_idx_load_ele(ref_file_name, load_pac ? BWA_IDX_ALL : BWA_IDX_BNS);
 
     fprintf(stderr, "* Done reading Index!!\n");
 }

@@ -462,7 +462,8 @@ jobs:
           BWA_MEM3: ${{ github.workspace }}/bwa-mem3
         run: |
           for t in meth_seed_index meth_mixed_pe_asym meth_pe_placement \
-                   meth_output_integrity meth_reverse_strand_conversion; do
+                   meth_output_integrity meth_reverse_strand_conversion \
+                   meth_seed_unpacked_ref_not_loaded; do
             echo "::group::$t"; bash "test/regression/$t.sh"; echo "::endgroup::"
           done
 

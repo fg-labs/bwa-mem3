@@ -1573,7 +1573,10 @@ int main_mem(int argc, char *argv[])
      * (orig_tid = seed_rid/2; hypothesis = seed_rid & 1; pos preserved). The ORIGINAL
      * reference's BNS/PAC are loaded separately as the remap/extension target in the
      * extension phase (NOT a replacement of the seed BNS). */
-    aux.fmi->load_index();
+    /* D3 --meth: load the SEED index's FM + bns but NOT its pac. The seed pac is
+     * never read in --meth (extension/scoring/mate-rescue use meth_orig_pac);
+     * skipping it saves ~1.6 GB on hg38. Outside --meth, load the pac as before. */
+    aux.fmi->load_index(/*load_pac=*/!opt->meth_mode);
     aux.shm_base = aux.fmi->shm_attached_base();
     tprof[FMI][0] += __rdtsc() - tim;
 
@@ -1633,19 +1636,36 @@ int main_mem(int argc, char *argv[])
 
     // reading ref string (from shm if FMI attached, else from .0123 file)
     tim = __rdtsc();
-    fprintf(stderr, "* Reading reference genome..\n");
-    int64_t rlen = 0;
-    int     ref_is_shm = 0;
-    ref_string = load_ref_string(ref_prefix, aux.shm_base, &rlen, &ref_is_shm);
-    if (ref_string == NULL) {
-        exit(EXIT_FAILURE);
+    uint64_t timer;
+    if (opt->meth_mode) {
+        /* D3 --meth: the SEED `.0123` is dead weight (~13 GB on hg38). Every
+         * downstream consumer reads the ORIGINAL unpacked reference via
+         * mem_aln_ref_string()/mmc.ref_string (= meth_orig_ref_string, loaded
+         * above); seeding uses the FM-index, not the unpacked seed `.0123`. So
+         * skip loading it entirely and poison aux.ref_string to NULL — any
+         * consumer that bypasses the mem_aln_* helpers will then crash loudly
+         * rather than silently read seed bases at original coordinates. */
+        ref_string             = NULL;
+        aux.ref_string         = NULL;
+        aux.ref_string_is_shm  = 0;
+        timer = __rdtsc();
+        fprintf(stderr, "* [--meth] seed reference `.0123` not loaded "
+                "(extension uses the original reference)\n");
+    } else {
+        fprintf(stderr, "* Reading reference genome..\n");
+        int64_t rlen = 0;
+        int     ref_is_shm = 0;
+        ref_string = load_ref_string(ref_prefix, aux.shm_base, &rlen, &ref_is_shm);
+        if (ref_string == NULL) {
+            exit(EXIT_FAILURE);
+        }
+        aux.ref_string         = ref_string;
+        aux.ref_string_is_shm  = ref_is_shm;
+        timer = __rdtsc();
+        fprintf(stderr, "* Reference genome size: %ld bp\n", (long)rlen);
+        fprintf(stderr, "* Done reading reference genome !!\n\n");
     }
-    aux.ref_string         = ref_string;
-    aux.ref_string_is_shm  = ref_is_shm;
-    uint64_t timer = __rdtsc();
     tprof[REF_IO][0] += timer - tim;
-    fprintf(stderr, "* Reference genome size: %ld bp\n", (long)rlen);
-    fprintf(stderr, "* Done reading reference genome !!\n\n");
 
     if (ignore_alt)
         for (i = 0; i < aux.fmi->idx->bns->n_seqs; ++i)
