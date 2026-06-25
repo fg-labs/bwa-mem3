@@ -1663,6 +1663,20 @@ int main_mem(int argc, char *argv[])
         timer = __rdtsc();
         fprintf(stderr, "* [--meth] seed reference `.0123` not loaded "
                 "(extension uses the original reference)\n");
+    } else if (ref_pac_fetch) {
+        /* plain pac-fetch (default): unpack the original reference from `.pac` on
+         * demand (bns_get_seq_v2's ref_string==NULL path). idx->pac is resident
+         * on both the disk path (load_pac=true) and the shm-attach path (aliases
+         * the staged PAC section). aux.ref_string==NULL routes every consumer —
+         * extension + batched mate rescue — to pac-fetch (the rescue copies each
+         * window into seqBufRef in-iteration, so the single-live-window contract
+         * holds). −6.4 GB on hg38, byte-identical. */
+        ref_string             = NULL;
+        aux.ref_string         = NULL;
+        aux.ref_string_is_shm  = 0;
+        timer = __rdtsc();
+        fprintf(stderr, "* pac-fetch: reference `.0123` not loaded; "
+                "unpacking original bases from .pac on demand\n");
     } else {
         fprintf(stderr, "* Reading reference genome..\n");
         int64_t rlen = 0;
