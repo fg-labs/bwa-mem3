@@ -336,7 +336,7 @@ second seeding round). Lowering this produces more seeds and higher sensitivity 
 greater cost; **raising it** (e.g. `-r 10`) suppresses the round, which — combined with
 `-y 0` — roughly halves alignment CPU on clean, low-divergence data. Round 2 is genuine
 split-read/divergence sensitivity, so it costs accuracy on divergent libraries; see
-[Settings profiles](../best-practices/settings-profiles.md#why-we-recommend--y-0).
+[Settings profiles](../best-practices/settings-profiles.md#third-round-seeding--y-0).
 
 #### `-y INT` — third-round seed occurrence threshold
 
@@ -346,7 +346,7 @@ repeat-region safety net. **`-y 0` disables the round entirely**, which benchmar
 F1-near-neutral across all tested regimes (within ±0.02; better on repeat-enriched and
 divergent data) while cutting ~11–30 % of alignment CPU. Recommended for the speed/accuracy
 profile — see
-[Settings profiles → `-y 0`](../best-practices/settings-profiles.md#why-we-recommend--y-0).
+[Settings profiles → `-y 0`](../best-practices/settings-profiles.md#third-round-seeding--y-0).
 
 #### `--legacy-reader` — use the legacy input reader
 

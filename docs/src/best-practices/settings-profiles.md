@@ -1,8 +1,8 @@
 # Settings profiles: bwa drop-in vs recommended
 
-bwa-mem3's **defaults are chosen to track bwa-mem / bwa-mem2 behavior** — it is meant to be a
-faster drop-in for an existing bwa-mem2 pipeline. Some defaults that the bwa lineage inherited are,
-however, more conservative than necessary. This page defines two profiles:
+bwa-mem3's **defaults track bwa-mem / bwa-mem2 behavior** — it is a faster drop-in for an existing
+bwa-mem2 pipeline. Some defaults the bwa lineage inherited are, however, more conservative than
+necessary. This page defines two profiles:
 
 - a **drop-in profile** that keeps the bwa-mem/bwa-mem2 defaults, for migrations and parity checks;
 - a **recommended profile** that deviates from those defaults where we have benchmarked the change
@@ -55,7 +55,7 @@ For a bisulfite (`--meth`) pipeline the recommended invocation is therefore:
 bwa-mem3 mem -t <N> --meth -m 10 -s 0 -y 0 ref.fa R1.fq R2.fq > out.sam
 ```
 
-## Why we recommend `-m 10`
+## Mate-rescue depth: `-m 10`
 
 `-m` caps how many near-best candidate loci per read get a mate-rescue Smith–Waterman pass. bwa-mem
 and bwa-mem2 both default to **50**; we measured the marginal value of that depth directly —
@@ -92,7 +92,7 @@ Numbers are from [bwa-mem3-bench](../related-projects/bwa-mem3-bench.md) on 5 M-
 plus a multi-contig holodeck golden-truth ablation; consult the bench for methodology and current
 figures.
 
-## Why we recommend `-y 0`
+## Third-round seeding: `-y 0`
 
 bwa-mem seeds in up to three rounds: (1) SMEMs, (2) reseeding long SMEMs (`-r`), and (3) an
 occurrence-bounded "seed strategy" round (`-y`) that, for every read position, grows an exact match
@@ -134,7 +134,7 @@ alignment CPU (~50–63 %), but round 2 *is* genuine split-read/divergence sensi
 bin). Use `-y 0 -r 10` only on known-clean, low-divergence libraries; `-y 0` alone is the
 broadly-safe recommendation.
 
-## Why we recommend `-s 0` under `--meth`
+## Pass-2 re-seeding under `--meth`: `-s 0`
 
 `-s` controls bwa-mem's Pass-2 "re-seeding" — after the first seeding pass, long super-maximal exact
 matches whose occurrence count is `≤ -s` are re-seeded from their midpoint to recover shorter, more
@@ -174,7 +174,7 @@ A selective fallback — skip Pass-2 globally but re-seed only low-confidence re
 **does not help**: in the multi-contig regime it would re-seed ~13% of reads yet recovers about as
 many placements as it sacrifices (net within noise), so there is no cheap middle ground.
 
-## Why we recommend `--min-ext-len 30` (standard-error reads)
+## Short-seed extension: `--min-ext-len 30`
 
 `--min-ext-len INT` drops seeds shorter than `INT` bp before banded Smith–Waterman, so their
 extension never runs (off by default, `0` → byte-identical to baseline). Extension is ~60% of `mem`
