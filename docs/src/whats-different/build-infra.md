@@ -87,58 +87,13 @@ reproducible-build systems to inject hardening flags (`-D_FORTIFY_SOURCE=2`,
 patching the Makefile. No functional change unless the env vars are set.
 Closes [issue #39](https://github.com/fg-labs/bwa-mem3/issues/39).
 
-## Unit-test harness and ARM CI (PR #23)
+## Testing and CI (PR #23, #24)
 
-Historically, PR #23 added a local bash harness (`test/run_unit_tests.sh`) that
-built and ran the five C++ unit binaries under `test/` against committed fixtures
-in `test/fixtures/`, asserting exit 0 and non-empty diff-able output (those
-binaries have since been consolidated into the doctest harness — see the section
-above). It also
-fixes several pre-existing issues blocking the harness:
-
-- `test/Makefile` defaulted to `icpc` (Intel compiler, not available on GitHub
-  runners); changed to `g++` on Linux x86.
-- ARM flags are mirrored from the parent Makefile so `cd test && make` builds
-  on macOS arm64 and Linux aarch64.
-- Three test sources (`smem2_test`, `bwt_seed_strategy_test`, `sa2ref_test`)
-  were missing the `fmiSearch->load_index()` call that `fmi_test.cpp` has,
-  causing immediate segfaults on run.
-- `test/main_banded.cpp` opened `fksw.txt` but never wrote to it; output is
-  now written and `main()` returns 0 on success.
-- Fixtures are added under `test/fixtures/` covering phiX174, 50 bp test
-  reads, BWT seed strategy inputs, SA pairs, and SW pairs.
-
-## CI matrix expansion (PR #24)
-
-PR #24 stacks on PR #23 and expands the GitHub workflow `.github/workflows/ci.yml` from 5 matrix
-rows to 7:
-
-| Row | Runner | Arch | Role |
-|-----|--------|------|------|
-| 1 | ubuntu-latest | sse41 | smoke + unit tests |
-| 2 | ubuntu-latest | avx2 | canonical deep tests |
-| 3 | ubuntu-latest | avx2 (no mimalloc) | unchanged |
-| 4 | ubuntu-24.04-arm | arm64 | unchanged |
-| 5 | macos-latest | arm64 | unchanged |
-| 6 (new) | ubuntu-latest | multi | runsimd dispatcher smoke |
-| 7 (new) | ubuntu-latest | avx2 clang++ | Linux Clang smoke |
-
-The canonical row (row 2) adds: `--bam=6` roundtrip record-count parity,
-thread-determinism (`-t1` vs `-t4` sorted diff), unit-test harness, chr22
-pipeline parity vs bwa, SE smoke, interleaved smoke, and `--meth` Layers 1–3.
-
----
-
-## Changes catalog
-
-| Item | bwa-mem3 PR | Upstream PR/issue | Status |
-|------|-------------|-------------------|--------|
-| doctest framework + Codecov | [#34](https://github.com/fg-labs/bwa-mem3/pull/34) | — | fork-only |
-| `PACKAGE_VERSION` from `git describe` | [#52](https://github.com/fg-labs/bwa-mem3/pull/52) | [bwa-mem2#283](https://github.com/bwa-mem2/bwa-mem2/issues/283), [bwa-mem2#284](https://github.com/bwa-mem2/bwa-mem2/pull/284) | fork-only (upstream issue + PR open) |
-| PGO target parameterization | [#59](https://github.com/fg-labs/bwa-mem3/pull/59) | — | fork-only |
-| `CXXFLAGS`/`CPPFLAGS`/`LDFLAGS` forwarding | [#50](https://github.com/fg-labs/bwa-mem3/pull/50) | [bwa-mem2#290](https://github.com/bwa-mem2/bwa-mem2/pull/290) | fork-only (mirrors open upstream PR) |
-| Unit-test harness + ARM CI | [#23](https://github.com/fg-labs/bwa-mem3/pull/23) | — | fork-only |
-| CI matrix expansion | [#24](https://github.com/fg-labs/bwa-mem3/pull/24) | — | fork-only |
+The test harness and the GitHub Actions CI matrix (multi-arch builds, the
+canonical deep-test row, `--bam` roundtrip and thread-determinism checks, chr22
+parity vs bwa, and the `--meth` regressions) are contributor-facing. See the
+[Developer Guide → Regression test framework](../developer-guide/regression-tests.md)
+for what runs and how to run it locally.
 
 ---
 
