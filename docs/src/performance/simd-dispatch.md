@@ -39,14 +39,11 @@ exempt and always succeed so operators can introspect a binary on a
 host that cannot run alignment. See
 [Host requirements](../getting-started/host-requirements.md).
 
-## Building
+## `BASELINE_ARCH` and the kernel tiers
 
-```bash
-make                              # single multi-tier x86 binary, BASELINE_ARCH=avx2
-make BASELINE_ARCH=sse41          # lower host SIMD floor / maximize portability (~10–15% slower on AVX2 hosts)
-make BASELINE_ARCH=avx512bw       # AVX-512BW-only fleet (locks the host floor)
-make arm64                        # single NEON binary, no dispatch table
-```
+The build targets (`make`, `make arch=…`, `make BASELINE_ARCH=…`, `make arm64`)
+are documented in [Best Practices → Build](../best-practices/build.md). What
+matters for dispatch is `BASELINE_ARCH`:
 
 `BASELINE_ARCH` controls the tier at which non-kernel translation
 units compile. The hand-tuned kernel TUs in `KERNEL_SRCS`
