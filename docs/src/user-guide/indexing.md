@@ -22,6 +22,17 @@ The command writes four files alongside the input FASTA:
 The `.bwt.2bit.64` file dominates disk usage. For the human reference (hg38),
 expect roughly 11 GB total across all four files.
 
+> **Note — reusing an existing index**
+>
+> - **From `bwa-mem2`:** an index built by `bwa-mem2 index` works as-is — no
+>   rebuild. bwa-mem3 reads its `.bwt.2bit.64` and `.pac` and ignores the
+>   `.0123`.
+> - **From `bwa` (v1):** a `bwa index` uses a different FM-index format
+>   (`.bwt` / `.sa`) and **cannot** be reused — run `bwa-mem3 index ref.fa` to
+>   rebuild (a few minutes; the FASTA is unchanged).
+>
+> See [Coming from bwa or bwa-mem2](../getting-started/migrating.md).
+
 > **Note — no `.0123` by default**
 >
 > Earlier releases (and bwa-mem2) also wrote `ref.fa.0123`, an *unpacked*

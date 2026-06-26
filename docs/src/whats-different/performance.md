@@ -67,9 +67,10 @@ per-line baseline across eight edge cases.
 [libsais v2.9.1](https://github.com/IlyaGrebnov/libsais) (Ilya Grebnov)
 instead of the sais-lite (Yuta Mori saisxx) library that bwa-mem2 inherited.
 libsais is actively maintained, supports OpenMP-parallel induced sorting, and
-produces a byte-identical FM-index. No changes are required to existing
-indexes — bwa-mem3 reads index files built by `bwa-mem2 index` without
-re-indexing.
+produces a byte-identical FM-index. An index built by `bwa-mem2 index` is read
+without re-indexing; a `bwa` (v1) index uses a different format and must be
+rebuilt with `bwa-mem3 index` (see
+[Coming from bwa or bwa-mem2](../getting-started/migrating.md)).
 
 For a human reference (GRCh38 + decoys), libsais reduces indexing wall time
 and peak memory vs sais-lite. Exact numbers depend on thread count and

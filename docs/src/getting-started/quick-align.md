@@ -2,6 +2,11 @@
 
 This page walks through the two-command workflow: index the reference once, then align reads.
 
+> **Switching from `bwa` or `bwa-mem2`?** The command line is unchanged, but
+> rebuild the index if you're coming from `bwa` v1 (a `bwa-mem2` index is reused
+> as-is), and expect output that is functionally equivalent but **not**
+> byte-identical. See [Coming from bwa or bwa-mem2](migrating.md).
+
 ## Index the reference
 
 ```bash

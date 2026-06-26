@@ -5,6 +5,7 @@
 # Getting Started
 
 - [Installation](getting-started/installation.md)
+- [Coming from bwa or bwa-mem2](getting-started/migrating.md)
 - [Host requirements](getting-started/host-requirements.md)
 - [Quick start: align paired-end FASTQs](getting-started/quick-align.md)
 - [Quick start: methylation alignment](getting-started/quick-meth.md)
