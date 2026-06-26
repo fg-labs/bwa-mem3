@@ -115,12 +115,20 @@ extern "C" {
 	                        int64_t *beg, int64_t mid, int64_t *end, int *rid,
 	                        uint8_t *dst, int64_t *len_out);
 	// Zero-copy v2 variants used by mem_chain2aln_across_reads_V2 and the
-	// mem_matesw_batch_* path. Return a pointer into the pre-unpacked
-	// `ref_string` (the .0123 reference materialized at startup); no
-	// allocation, callers must NOT free the returned pointer. The seqb
-	// scratch arg is currently unused by both v2 variants (kept for
-	// signature parity with their original definition); pass any buffer
-	// or NULL.
+	// mem_matesw_batch_* path. Callers must NOT free the returned pointer.
+	//
+	// Two lifetime regimes, selected by `ref_string`:
+	//   - ref_string != NULL: returns a pointer into the pre-unpacked `.0123`
+	//     reference materialized at startup. Stable for the run; any number of
+	//     windows may be held live at once.
+	//   - ref_string == NULL (pac-fetch): the `.0123` was not loaded, so the
+	//     window is reconstructed on demand from `pac` into a PER-THREAD scratch
+	//     buffer. SINGLE LIVE WINDOW — the returned pointer aliases scratch that
+	//     this thread's NEXT v2 call overwrites, so each caller must consume (or
+	//     copy) the window before fetching again on the same thread. Do NOT cache
+	//     multiple pac-fetch windows across calls.
+	// The seqb scratch arg is currently unused by both v2 variants (kept for
+	// signature parity with their original definition); pass any buffer or NULL.
 	uint8_t *bns_get_seq_v2(int64_t l_pac, const uint8_t *pac, int64_t beg, int64_t end,
 	                        int64_t *len, uint8_t *ref_string, uint8_t *seqb);
 	uint8_t *bns_fetch_seq_v2(const bntseq_t *bns, const uint8_t *pac,

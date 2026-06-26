@@ -35,20 +35,6 @@
     } \
 } while (0)
 
-static uint8_t *slurp(const char *path, int64_t *len_out) {
-    FILE *fp = std::fopen(path, "rb");
-    CHECK(fp != NULL);
-    std::fseek(fp, 0, SEEK_END);
-    int64_t n = std::ftell(fp);
-    std::rewind(fp);
-    uint8_t *buf = (uint8_t *)std::malloc((size_t)n);
-    CHECK(buf != NULL);
-    err_fread_noeof(buf, 1, (size_t)n, fp);
-    std::fclose(fp);
-    *len_out = n;
-    return buf;
-}
-
 int main(int argc, char *argv[]) {
     if (argc < 2) {
         std::fprintf(stderr, "Usage: %s <prefix>\n", argv[0]);
@@ -74,11 +60,6 @@ int main(int argc, char *argv[]) {
     /* 3. Independently load the same index from disk for comparison. */
     FMI_search ref(prefix);
     ref.load_index();
-
-    char zer_path[4096];
-    std::snprintf(zer_path, sizeof(zer_path), "%s.0123", prefix);
-    int64_t ref_string_len = 0;
-    uint8_t *ref_string = slurp(zer_path, &ref_string_len);
 
     /* 4. Walk sections and compare. */
     auto section = [&](uint32_t kind, uint64_t *off, uint64_t *sz) {
@@ -170,13 +151,14 @@ int main(int argc, char *argv[]) {
     CHECK_EQ((int64_t)sz, (int64_t)(ref.idx->bns->l_pac / 4 + 1));
     CHECK_EQ(std::memcmp(buf + off, ref.idx->pac, (size_t)sz), 0);
 
-    /* REF_STRING (.0123). */
+    /* REF_STRING (.0123) is NEVER staged: the section slot is present (so
+     * n_sections stays 10) but always zero length. `mem` pac-fetches the
+     * original reference from `.pac` on demand, so the unpacked `.0123` is
+     * neither staged nor required on disk. */
     section(BWA_SHM_SEC_REF_STRING, &off, &sz);
-    CHECK_EQ((int64_t)sz, ref_string_len);
-    CHECK_EQ(std::memcmp(buf + off, ref_string, (size_t)sz), 0);
+    CHECK_EQ(sz, 0ull);
 
     /* Cleanup. */
-    std::free(ref_string);
     std::free(buf);
 
     std::printf("shm_pack_round_trip_test: OK\n");

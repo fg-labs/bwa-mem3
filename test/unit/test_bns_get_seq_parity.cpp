@@ -155,19 +155,72 @@ TEST_CASE("bns_get_seq_into vs v2: swapped beg/end (XOR-swap path)") {
     check_range(L, pac.data(), ref_string.data(), /*beg=*/L, /*end=*/0);  // bridging
 }
 
-TEST_CASE("bns_get_seq_v2: NULL ref_string returns NULL with *len = 0") {
-    // Defensive guard: bns_get_seq_v2 must not perform pointer arithmetic on a
-    // NULL ref_string. Without the guard, `ref_string + beg` for beg > 0 yields
-    // a non-null but invalid pointer that evades downstream `seq == 0` checks.
+TEST_CASE("bns_get_seq_v2: NULL ref_string pac-fetches bases identical to .0123") {
+    // pac-fetch contract: a NULL ref_string is no longer a "return NULL" guard —
+    // it means "reconstruct this window from `pac` on demand" (the .0123 view was
+    // not loaded). The bases returned MUST be byte-identical to what a non-NULL
+    // ref_string (the unpacked .0123) view would yield for the same [beg, end),
+    // including the reverse-complement half [l_pac, 2*l_pac). This is the
+    // identity gate for dropping .0123 in favor of unpacking from .pac.
+    std::mt19937 rng(0x5EEDu);
     constexpr int64_t L = 64;
-    std::vector<uint8_t> pac((L + 3) / 4, 0);
-    std::vector<uint8_t> scratch(2 * L, 0xff);
+    std::vector<uint8_t> pac, ref_string;
+    build_synthetic_ref(rng, L, pac, ref_string);
 
-    int64_t len = -1;
-    uint8_t *seq = bns_get_seq_v2(L, pac.data(), /*beg=*/10, /*end=*/20, &len,
-                                  /*ref_string=*/nullptr, scratch.data());
-    CHECK(seq == nullptr);
-    CHECK(len == 0);
+    // Forward windows (beg,end < L) and reverse-complement windows (beg >= L);
+    // bridging windows return len 0 and are covered by the boundary test above.
+    for (int64_t beg : {int64_t{0}, int64_t{10}, int64_t{L - 20}, int64_t{L}, int64_t{L + 5}}) {
+        for (int64_t span : {int64_t{1}, int64_t{17}, int64_t{40}}) {
+            int64_t end = beg + span;
+            if (end > 2 * L || (beg < L && end > L)) continue;  // skip bridging
+            int64_t len_ref = 0, len_pf = 0;
+            std::vector<uint8_t> scratch_ref(2 * L, 0xff);
+            uint8_t *seq_ref = bns_get_seq_v2(L, pac.data(), beg, end, &len_ref,
+                                              ref_string.data(), scratch_ref.data());
+            // ref_string == NULL → pac-fetch path. Result points into a thread-local
+            // buffer valid until the next pac-fetch call; compare immediately.
+            std::vector<uint8_t> scratch_pf(2 * L, 0xff);
+            uint8_t *seq_pf = bns_get_seq_v2(L, pac.data(), beg, end, &len_pf,
+                                             /*ref_string=*/nullptr, scratch_pf.data());
+            REQUIRE(len_pf == len_ref);
+            REQUIRE(len_pf == end - beg);
+            REQUIRE(seq_ref != nullptr);
+            REQUIRE(seq_pf != nullptr);
+            CHECK(std::memcmp(seq_pf, seq_ref, (size_t)len_pf) == 0);
+        }
+    }
+}
+
+TEST_CASE("bns_get_seq_v2: NULL ref_string bridging window returns empty without bases") {
+    // pac-fetch bridging contract: a window crossing the forward/reverse boundary
+    // (beg < l_pac < end) yields nothing, exactly like the .0123 path. The
+    // implementation short-circuits this BEFORE growing its scratch buffer so a
+    // bad bridge query can't balloon RSS toward the doubled reference. Observable
+    // surface here is the empty result; the no-alloc guarantee is internal.
+    std::mt19937 rng(0xB1D6Eu);
+    constexpr int64_t L = 64;
+    std::vector<uint8_t> pac, ref_string;
+    build_synthetic_ref(rng, L, pac, ref_string);
+
+    for (int64_t beg : {int64_t{0}, int64_t{1}, int64_t{L / 2}, int64_t{L - 1}}) {
+        for (int64_t end : {int64_t{L + 1}, int64_t{L + L / 2}, int64_t{2 * L}}) {
+            CAPTURE(beg);
+            CAPTURE(end);
+            int64_t len_pf = -1;
+            std::vector<uint8_t> scratch(2 * L, 0xff);
+            uint8_t *seq_pf = bns_get_seq_v2(L, pac.data(), beg, end, &len_pf,
+                                             /*ref_string=*/nullptr, scratch.data());
+            CHECK(len_pf == 0);
+            CHECK(seq_pf == nullptr);
+        }
+    }
+    // Swapped bridging (end < beg) canonicalizes to the same empty result.
+    int64_t len_pf = -1;
+    std::vector<uint8_t> scratch(2 * L, 0xff);
+    uint8_t *seq_pf = bns_get_seq_v2(L, pac.data(), /*beg=*/L + 10, /*end=*/L - 10,
+                                     &len_pf, /*ref_string=*/nullptr, scratch.data());
+    CHECK(len_pf == 0);
+    CHECK(seq_pf == nullptr);
 }
 
 TEST_CASE("bns_get_seq_into vs v2: large random ref, randomized ranges") {

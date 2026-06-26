@@ -15,9 +15,10 @@ if [[ ! -x "$INNER" ]]; then
     exit 2
 fi
 
-# Build the phix index if any of the index files are missing.
+# Build the phix index if any of the index files are missing. No `.0123`: it is
+# not built by default (mem pac-fetches from `.pac`) and never staged in shm.
 need_index=0
-for ext in .0123 .amb .ann .bwt.2bit.64 .pac; do
+for ext in .amb .ann .bwt.2bit.64 .pac; do
     if [[ ! -s "${PREFIX}${ext}" ]]; then
         need_index=1; break
     fi

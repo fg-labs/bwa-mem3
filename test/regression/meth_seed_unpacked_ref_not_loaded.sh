@@ -1,20 +1,21 @@
 #!/usr/bin/env bash
 # test/regression/meth_seed_unpacked_ref_not_loaded.sh
 #
-# Regression (D3 memory): the SEED index's unpacked reference `<ref>.meth.0123`
-# is neither BUILT nor LOADED. D3 seeds in the doubled `.meth` FM-index but
-# extends/scores against the ORIGINAL reference (meth_orig_*), so the seed
-# `.0123` is dead weight (~13 GB on hg38, never read). `index --meth` therefore
-# does not emit it, and `mem --meth` does not load it.
+# Regression (D3 memory): NEITHER unpacked reference `.0123` is built or loaded.
+# D3 seeds in the doubled `.meth` FM-index but extends/scores against the
+# ORIGINAL reference (meth_orig_*), which it now pac-fetches from `<ref>.pac` on
+# demand. The seed `.meth.0123` (~13 GB on hg38) is never read, and the original
+# `<ref>.0123` (~6.4 GB) is redundant with `.pac`. `index --meth` therefore emits
+# neither, and `mem --meth` loads neither.
 #
 # Asserts:
 #   1. `index --meth` builds the seed FM-index/bns/pac but NOT `<ref>.meth.0123`.
-#   2. The ORIGINAL `<ref>.0123` (the real extension target) IS built.
-#   3. `mem --meth` runs to a valid, non-empty BAM without the seed `.0123`, and
-#      the output is deterministic.
+#   2. The ORIGINAL `<ref>.0123` is also NOT built (mem pac-fetches from `.pac`).
+#   3. `mem --meth` runs to a valid, non-empty BAM without any `.0123`, and the
+#      output is deterministic.
 #
-# RED on a binary that builds + loads the seed `.0123`: assertion 1 fails (the
-# file is present). GREEN once the seed `.0123` is dropped from build + load.
+# RED on a binary that builds the seed `.0123`: assertion 1 fails. RED on one
+# that still builds the original `.0123` by default: assertion 2 fails.
 #
 # Inputs:
 #   BWA_MEM3 — path to the bwa-mem3 binary under test
@@ -38,8 +39,9 @@ Q=$(printf 'I%.0s' $(seq 1 60))
 for f in ref.fa.meth.bwt.2bit.64 ref.fa.meth.ann ref.fa.meth.amb ref.fa.meth.pac; do
   [ -s "$f" ] || fail "expected seed index file $f to be built"
 done
-# 2. The ORIGINAL unpacked reference (the real extension target) must be built.
-[ -s ref.fa.0123 ] || fail "expected original ref.fa.0123 (the --meth extension target) to be built"
+# 2. The ORIGINAL unpacked reference must NOT be built either (mem pac-fetches
+#    the extension target from ref.fa.pac on demand).
+[ ! -e ref.fa.0123 ] || fail "original ref.fa.0123 was built; it must not be by default (mem pac-fetches from .pac)"
 
 # Proper FR pairs derived from the reference (exact windows so they place cleanly).
 : > r1.fq; : > r2.fq
@@ -50,9 +52,9 @@ mk_pair p1 100 300; mk_pair p2 500 720; mk_pair p3 900 1140
 
 run_meth() { "$BWA_MEM3" mem --meth --meth-scoring genomic -t 1 ref.fa r1.fq r2.fq > "$1" 2>/dev/null; }
 
-# 3. mem --meth runs without the seed `.0123`, emits a valid non-empty BAM,
+# 3. mem --meth runs without any `.0123`, emits a valid non-empty BAM,
 #    and is deterministic.
-run_meth a.bam || fail "mem --meth nonzero exit (must not need the seed .0123)"
+run_meth a.bam || fail "mem --meth nonzero exit (must not need any .0123)"
 samtools quickcheck a.bam || fail "a.bam invalid"
 samtools view a.bam > a.records || fail "samtools view a.bam failed"
 [ -s a.records ] || fail "mem --meth produced no alignment records"
@@ -61,4 +63,4 @@ samtools quickcheck b.bam || fail "b.bam invalid"
 samtools view b.bam > b.records || fail "samtools view b.bam failed"
 diff -q a.records b.records >/dev/null 2>&1 || fail "mem --meth output is non-deterministic"
 
-echo "PASS: meth_seed_unpacked_ref_not_loaded (seed .meth.0123 is neither built nor loaded; mem --meth works without it)"
+echo "PASS: meth_seed_unpacked_ref_not_loaded (neither .meth.0123 nor original .0123 is built or loaded; mem --meth works without them)"

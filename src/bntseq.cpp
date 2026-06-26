@@ -527,6 +527,19 @@ void bns_fetch_seq_into(const bntseq_t *bns, const uint8_t *pac,
 	assert(*end - *beg == *len_out); // assertion failure should never happen
 }
 
+// pac-fetch scratch buffer (used by bns_get_seq_v2's ref_string==NULL path).
+// Thread-local so each worker reconstructs windows into its own buffer; the
+// destructor frees it at thread exit (via __cxa_thread_atexit), so a worker
+// thread's buffer is not leaked when the thread terminates — without it,
+// LeakSanitizer flags one live allocation per worker thread.
+namespace {
+struct PacFetchScratch {
+    uint8_t *buf = nullptr;
+    int64_t  cap = 0;
+    ~PacFetchScratch() { free(buf); }
+};
+}  // namespace
+
 // Zero-copy v2 variants. Identical semantics to bns_get_seq / bns_fetch_seq
 // except they return a pointer into the caller-supplied `ref_string` (the
 // .0123 reference materialized at startup) rather than a malloc'd copy. The
@@ -536,9 +549,53 @@ uint8_t *bns_get_seq_v2(int64_t l_pac, const uint8_t *pac, int64_t beg, int64_t 
                         int64_t *len, uint8_t *ref_string, uint8_t *seqb)
 {
 	uint8_t *seq = 0;
-	if (ref_string == NULL) { // guard against UB pointer arithmetic on NULL
-		*len = 0;
-		return 0;
+	if (ref_string == NULL) {
+		/* pac-fetch: the unpacked `.0123` was not loaded. Reconstruct the window
+		 * by unpacking the ORIGINAL `.pac` on demand (bns_get_seq_into: forward
+		 * 2-bit unpack; reverse-strand window = reverse + complement) — byte-
+		 * identical to the `.0123` it replaces.
+		 *
+		 * CONTRACT (single live window): the returned pointer aliases a per-thread
+		 * scratch that this thread's NEXT call overwrites. Every caller must
+		 * consume (or copy) the window before fetching again on the same thread —
+		 * exactly the zero-copy `.0123` contract. All current consumers honor it
+		 * (extension consumes rseq within the chain iteration; both mate-rescue
+		 * sites copy the window into seqBufRef immediately). This is a convention,
+		 * NOT enforceable as an in-function assert (the function cannot observe a
+		 * caller's later deref). The NDEBUG poison-fill below is a best-effort
+		 * detector: it 0xFF's the prior window so a stale read trips the byte-
+		 * identity / BAM-cmp golden gate rather than silently mis-scoring.
+		 * seqb (the caller's scratch) is intentionally left untouched. */
+		static thread_local PacFetchScratch t_pf;
+		int64_t b = beg, e = end;
+		if (e < b) { int64_t t = b; b = e; e = t; }
+		if (e > l_pac<<1) e = l_pac<<1;
+		if (b < 0) b = 0;
+		int64_t need = e - b;
+		if (need <= 0) { *len = 0; return 0; }
+		/* A window bridging the forward/reverse boundary yields nothing (the
+		 * legacy `.0123` path returns empty without allocating; bns_get_seq_into
+		 * likewise sets len=0 and writes no bytes). Short-circuit BEFORE the
+		 * realloc so a bad bridge query can't grow t_pf.buf toward the doubled
+		 * reference (~6.4 GB on hg38) just to return an empty window. */
+		if (b < l_pac && e > l_pac) { *len = 0; return 0; }
+		if (need > t_pf.cap) {
+			/* Grow via a temp so a failed realloc neither leaks the old buffer nor
+			 * leaves the buffer NULL with cap > 0 (which would deref NULL below).
+			 * Matches the perror+exit idiom used for the .pac realloc in this file. */
+			uint8_t *nb = (uint8_t*)realloc(t_pf.buf, (size_t)need);
+			if (nb == NULL) { perror("Reallocation of pac-fetch buffer failed"); exit(EXIT_FAILURE); }
+			t_pf.buf = nb; t_pf.cap = need;
+		}
+		(void)seqb;
+#ifndef NDEBUG
+		if (t_pf.buf && t_pf.cap > 0) memset(t_pf.buf, 0xFF, (size_t)t_pf.cap); /* poison prior window */
+#endif
+		/* Fetch with the already-clamped [b, e) so the bytes written stay in
+		 * lock-step with `need` (the buffer size). bns_get_seq_into re-derives
+		 * the same clamp, so this is byte-identical to passing [beg, end). */
+		bns_get_seq_into(l_pac, pac, b, e, t_pf.buf, len);
+		return (*len > 0) ? t_pf.buf : 0;
 	}
 	if (end < beg) end ^= beg, beg ^= end, end ^= beg; // if end is smaller, swap
 	if (end > l_pac<<1) end = l_pac<<1;

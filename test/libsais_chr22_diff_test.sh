@@ -58,14 +58,15 @@ if [[ $baseline_complete -eq 0 ]]; then
     echo "INFO: BWA_TEST_CHR22_BASELINE_BOOTSTRAP=1 -- bootstrapping baseline at $BASELINE_DIR"
     mkdir -p "$BASELINE_DIR"
     cp "$FIXTURE" "$BASELINE_DIR/chr22.fa"
-    "$BWAMEM3" index "$BASELINE_DIR/chr22.fa" >/dev/null
+    "$BWAMEM3" index --emit-unpacked-ref "$BASELINE_DIR/chr22.fa" >/dev/null
 fi
 
 TD="$(mktemp -d)"
 trap 'rm -rf "$TD"' EXIT
 
 cp "$FIXTURE" "$TD/chr22.fa"
-"$BWAMEM3" index "$TD/chr22.fa" >/dev/null
+# --emit-unpacked-ref: EXTS byte-diffs .0123, which is no longer built by default.
+"$BWAMEM3" index --emit-unpacked-ref "$TD/chr22.fa" >/dev/null
 
 FAIL=0
 for ext in "${EXTS[@]}"; do

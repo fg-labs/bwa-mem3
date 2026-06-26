@@ -18,7 +18,11 @@ the last:
    format conventions, and the `.bwt` / `.pac` / `.ann` / `.amb` index layout.
 2. **bwa-mem2** (Vasimuddin et al., Intel) — Replaced scalar inner loops with SIMD
    kernels; introduced the compact `.bwt.2bit.64` and `.0123` index formats;
-   retained full output compatibility with bwa-mem.
+   retained full output compatibility with bwa-mem. (bwa-mem3 reads the same
+   formats but no longer **builds** the unpacked `.0123` by default — it
+   pac-fetches reference bases from `.pac`. If you want to share a bwa-mem3 index
+   with bwa-mem2, which loads `.0123` directly, build it with
+   `bwa-mem3 index --emit-unpacked-ref`.)
 3. **bwa-mem3** (Fulcrum Genomics fork) — Carries correctness fixes, performance
    improvements, new features (bisulfite alignment, mimalloc, ARM Neon), and
    expanded architecture support on top of the bwa-mem2 codebase. See

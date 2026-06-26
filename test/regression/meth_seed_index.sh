@@ -48,16 +48,17 @@ ann_names=$(mawk 'NR>1 && (NR%2)==0 {print $2}' ref.fa.meth.ann | tr '\n' ' ')
 # --- A2: original index is byte-identical to a plain index ------------------
 cp ref.fa refp.fa
 "$BWA_MEM3" index refp.fa >/dev/null 2>&1 || fail "plain index nonzero exit"
-for ext in pac ann amb 0123 bwt.2bit.64; do
+for ext in pac ann amb bwt.2bit.64; do
     cmp -s "ref.fa.$ext" "refp.fa.$ext" || fail "original --meth index differs from plain index (.$ext)"
 done
 
 # --- remap validation: projected read -> correct f/r contig + pos ----------
-# The `.meth` seed index no longer ships a `.0123` (dropped to save ~13 GB; it is
-# never read by `mem --meth`), so plain `mem` cannot extend against it. Probe the
-# seed FM content via a plain index of the converted seed FASTA `ref.fa.meth.fa`
-# (byte-identical doubled f/r text, plus the `.0123` plain `mem` extension needs),
-# which `index --meth` left on disk. Same contigs/positions as `ref.fa.meth.*`.
+# The `.meth` seed index has no `.0123` (never read by `mem --meth`), so plain
+# `mem` cannot be pointed straight at the seed prefix. Probe the seed FM content
+# via a plain index of the converted seed FASTA `ref.fa.meth.fa` (byte-identical
+# doubled f/r text), which `index --meth` left on disk. Plain `mem` pac-fetches
+# its bases from `.pac`, so no `.0123` is needed. Same contigs/positions as the
+# seed `ref.fa.meth.*`.
 "$BWA_MEM3" index ref.fa.meth.fa >/dev/null 2>&1 || fail "probe index of ref.fa.meth.fa nonzero exit"
 # helper: align one read (seq) against the seed FM content, assert RNAME/POS.
 check() {  # $1=label  $2=seq  $3=want_rname  $4=want_pos

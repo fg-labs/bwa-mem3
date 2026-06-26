@@ -1005,71 +1005,6 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "Note: Please read the man page for detailed description of the command line and options.\n");
 }
 
-/* Resolve `<prefix>.0123` to a `uint8_t *` view of the ref string. If
- * `shm_base` is non-NULL, the FMI loader already attached this segment;
- * resolve REF_STRING via that single mapping. Otherwise fall back to the
- * disk slurp. The two paths must agree: if FMI came from disk, ref string
- * must come from disk too, so we never call `bwa_shm_attach` here. */
-static uint8_t *load_ref_string(const char *prefix, uint8_t *shm_base,
-                                int64_t *rlen_out, int *is_shm_out)
-{
-    *is_shm_out = 0;
-    *rlen_out   = 0;
-
-    if (shm_base != NULL) {
-        uint64_t off = 0, sz = 0;
-        if (bwa_shm_section_find(shm_base, BWA_SHM_SEC_REF_STRING, &off, &sz) != 0) {
-            fprintf(stderr,
-                "ERROR: shm segment for '%s' is missing REF_STRING; aborting.\n"
-                "       The segment was staged by an older bwa-mem3; drop and re-stage.\n",
-                prefix);
-            exit(EXIT_FAILURE);
-        }
-        *is_shm_out = 1;
-        *rlen_out   = (int64_t)sz;
-        fprintf(stderr, "* Reference genome attached from shm: %lld bytes\n",
-                (long long)sz);
-        return shm_base + off;
-    }
-
-    /* Disk path. */
-    char binary_seq_file[PATH_MAX];
-    int n = snprintf(binary_seq_file, sizeof(binary_seq_file), "%s.0123", prefix);
-    if (n < 0 || (size_t)n >= sizeof(binary_seq_file)) {
-        fprintf(stderr, "Error: reference prefix too long for path: %s\n", prefix);
-        return NULL;
-    }
-
-    fprintf(stderr, "* Binary seq file = %s\n", binary_seq_file);
-    FILE *fr = fopen(binary_seq_file, "r");
-    if (fr == NULL) {
-        fprintf(stderr, "Error: can't open %s input file\n", binary_seq_file);
-        return NULL;
-    }
-    int64_t rlen = 0;
-    if (fseek(fr, 0, SEEK_END) != 0) {
-        fprintf(stderr, "Error: fseek failed on %s\n", binary_seq_file);
-        fclose(fr);
-        return NULL;
-    }
-    rlen = ftell(fr);
-    if (rlen <= 0) {
-        fprintf(stderr, "Error: %s is empty or unseekable (ftell=%lld)\n",
-                binary_seq_file, (long long)rlen);
-        fclose(fr);
-        return NULL;
-    }
-    uint8_t *buf = (uint8_t*) _mm_malloc(rlen, 64);
-    assert_not_null(buf, rlen, rlen);
-    bwamem_madv_hugepage(buf, rlen);
-    rewind(fr);
-    err_fread_noeof(buf, 1, rlen, fr);
-    fclose(fr);
-
-    *rlen_out = rlen;
-    return buf;
-}
-
 /* D3 (--meth) only: load the ORIGINAL reference's bns + pac (un-converted, real
  * chrom names) from `prefix` as resident handles for the future extension/scoring
  * phase, distinct from the seed FM-index. Mirrors indexEle::bwa_idx_load_ele's
@@ -1114,9 +1049,10 @@ static void meth_orig_ref_free_handles(ktp_aux_t *aux)
 {
     if (aux->meth_orig_pac != NULL) { free(aux->meth_orig_pac); aux->meth_orig_pac = NULL; }
     if (aux->meth_orig_bns != NULL) { bns_destroy(aux->meth_orig_bns); aux->meth_orig_bns = NULL; }
-    /* D3 (--meth, PR-3): the original .0123 ref_string is always _mm_malloc'd by
-     * load_ref_string's disk path (we pass shm_base=NULL), so it is never a shm
-     * alias — free it with _mm_free unconditionally. */
+    /* D3 (--meth): meth_orig_ref_string is NULL under pac-fetch (the only path
+     * now — the original reference is unpacked from `.pac` on demand, never
+     * materialized). This NULL-safe free is retained defensively; if it is ever
+     * non-NULL it would be an _mm_malloc'd buffer, freed with _mm_free. */
     if (aux->meth_orig_ref_string != NULL) {
         _mm_free(aux->meth_orig_ref_string);
         aux->meth_orig_ref_string = NULL;
@@ -1604,37 +1540,27 @@ int main_mem(int argc, char *argv[])
      * pipeline now runs end to end. Seeds generated against the `.meth` seed
      * FM-index are remapped to ORIGINAL coordinates + an OT/OB hypothesis inside
      * mem_chain_seeds (see meth_seed_to_orig), and chaining/extension/pairing/
-     * mate-rescue/output all operate against the ORIGINAL bns/pac/.0123 carried
-     * on worker_t::meth_orig_*. Load the ORIGINAL unpacked reference here (the
-     * seed `.0123` is still loaded below as `ref_string`, but is unused after the
-     * remap; kept for the non-meth code path's invariants).
+     * mate-rescue/output all operate against the ORIGINAL bns/pac carried on
+     * worker_t::meth_orig_* (the original reference bases are pac-fetched from
+     * `.pac` on demand; no unpacked `.0123` is loaded for either the seed or the
+     * original — see below).
      * Extension and mate-rescue score the ORIGINAL read against the original
      * reference with the per-hypothesis asymmetric OT/OB matrix (PR-4 + A1: the
      * batched extension partitions a mixed PE batch by hypothesis; mate rescue
      * routes meth pairs through the scalar ksw_align2 path). The projected read is
      * used only for seeding against the `.meth` FM-index. */
+    /* pac-fetch: reconstruct the ORIGINAL reference from its `.pac` on demand
+     * (bns_get_seq_v2's ref_string==NULL path) instead of loading the unpacked
+     * `.0123` (~6.4 GB on hg38). This is the only reference path: `index` no
+     * longer builds `.0123` and `mem` never reads it (byte-identical to the
+     * historical `.0123` load, verified on plain + --meth incl. batched rescue). */
     if (opt->meth_mode && meth_orig_ref_prefix != NULL) {
-        int64_t orig_rlen = 0;
-        int     orig_is_shm = 0;   /* original .0123 is never in shm; force disk */
-        aux.meth_orig_ref_string =
-            load_ref_string(meth_orig_ref_prefix, /*shm_base=*/NULL,
-                            &orig_rlen, &orig_is_shm);
-        if (aux.meth_orig_ref_string == NULL) {
-            fprintf(stderr,
-                    "ERROR: --meth could not load the original reference '%s.0123' "
-                    "(needed for extension).\n", meth_orig_ref_prefix);
-            meth_orig_ref_free_handles(&aux);
-            delete aux.fmi;
-            free(opt);
-            if (out_opened) fclose(aux.fp);
-            return 1;
-        }
         fprintf(stderr,
-                "[bwa-mem3:--meth] original reference .0123 loaded for extension "
-                "(%ld bp).\n", (long)orig_rlen);
+                "[bwa-mem3:--meth] pac-fetch: original reference unpacked from "
+                ".pac on demand (.0123 not loaded).\n");
     }
 
-    // reading ref string (from shm if FMI attached, else from .0123 file)
+    // reference bases are pac-fetched from .pac on demand; no .0123 is loaded
     tim = __rdtsc();
     uint64_t timer;
     if (opt->meth_mode) {
@@ -1652,18 +1578,19 @@ int main_mem(int argc, char *argv[])
         fprintf(stderr, "* [--meth] seed reference `.0123` not loaded "
                 "(extension uses the original reference)\n");
     } else {
-        fprintf(stderr, "* Reading reference genome..\n");
-        int64_t rlen = 0;
-        int     ref_is_shm = 0;
-        ref_string = load_ref_string(ref_prefix, aux.shm_base, &rlen, &ref_is_shm);
-        if (ref_string == NULL) {
-            exit(EXIT_FAILURE);
-        }
-        aux.ref_string         = ref_string;
-        aux.ref_string_is_shm  = ref_is_shm;
+        /* plain pac-fetch: unpack the original reference from `.pac` on demand
+         * (bns_get_seq_v2's ref_string==NULL path). idx->pac is resident on both
+         * the disk path (load_pac=true) and the shm-attach path (aliases the
+         * staged PAC section). aux.ref_string==NULL routes every consumer —
+         * extension + batched mate rescue — to pac-fetch (the rescue copies each
+         * window into seqBufRef in-iteration, so the single-live-window contract
+         * holds). −6.4 GB on hg38, byte-identical. */
+        ref_string             = NULL;
+        aux.ref_string         = NULL;
+        aux.ref_string_is_shm  = 0;
         timer = __rdtsc();
-        fprintf(stderr, "* Reference genome size: %ld bp\n", (long)rlen);
-        fprintf(stderr, "* Done reading reference genome !!\n\n");
+        fprintf(stderr, "* pac-fetch: reference `.0123` not loaded; "
+                "unpacking original bases from .pac on demand\n");
     }
     tprof[REF_IO][0] += timer - tim;
 

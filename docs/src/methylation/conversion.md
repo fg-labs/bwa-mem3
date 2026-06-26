@@ -103,14 +103,18 @@ original base calls.
 
 `bwa-mem3 index --meth ref.fa` writes **two** indexes:
 
-- the normal 4-letter index at the bare prefix (`ref.fa.0123`, `.amb`, `.ann`,
+- the normal 4-letter index at the bare prefix (`ref.fa.amb`, `.ann`,
   `.bwt.2bit.64`, `.pac`) — used for scoring/extension against the original
   reference, and
 - the converted **seed** index `ref.fa.meth.*` (built over a per-strand-converted
   FASTA `ref.fa.meth.fa` with the `f`/`r` doubled contigs) — used only for
-  seeding. The seed index omits the unpacked `.meth.0123` reference: seeding uses
-  the seed FM-index and scoring/extension uses the original reference, so the
-  seed's unpacked bases are never read (saving ~13 GB of disk and RSS on hg38).
+  seeding.
+
+Neither index writes an unpacked `.0123`: seeding uses the seed FM-index, and
+scoring/extension pac-fetches the original reference's bases from `ref.fa.pac` on
+demand. So the original `.0123` (~6.4 GB) is unnecessary and the seed's unpacked
+bases are never read (~13 GB) — saving ~19 GB of disk on hg38, while the runtime
+RSS reduction comes from avoiding the original `.0123` load (~6.4 GB).
 
 This dual-index layout differs from bwameth.py, which builds a single
 `ref.fa.bwameth.c2t` doubled reference and aligns entirely against it. A legacy

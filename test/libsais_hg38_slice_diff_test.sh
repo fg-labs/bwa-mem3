@@ -61,14 +61,15 @@ if [[ ! -s "$SLICE_DIR/baseline/slice.fa.bwt.2bit.64" ]]; then
     echo "INFO: BWA_TEST_HG38_SLICE_BASELINE_BOOTSTRAP=1 -- bootstrapping baseline at $SLICE_DIR/baseline"
     mkdir -p "$SLICE_DIR/baseline"
     cp "$SLICE_DIR/slice.fa" "$SLICE_DIR/baseline/slice.fa"
-    "$BWAMEM3" index "$SLICE_DIR/baseline/slice.fa" >/dev/null
+    "$BWAMEM3" index --emit-unpacked-ref "$SLICE_DIR/baseline/slice.fa" >/dev/null
 fi
 
 TD="$(mktemp -d)"
 trap 'rm -rf "$TD"' EXIT
 
 cp "$SLICE_DIR/slice.fa" "$TD/slice.fa"
-"$BWAMEM3" index "$TD/slice.fa" >/dev/null
+# --emit-unpacked-ref: this test byte-diffs .0123, which is no longer built by default.
+"$BWAMEM3" index --emit-unpacked-ref "$TD/slice.fa" >/dev/null
 
 FAIL=0
 for ext in pac ann amb 0123 bwt.2bit.64; do

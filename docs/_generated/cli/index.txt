@@ -9,4 +9,8 @@ Usage: bwa-mem3 index [-p prefix] [-t N] [--max-memory SIZE] [--tmp-dir PATH] [-
   --meth             build a BS-aware dual index. Writes the original-alphabet
                      index at <in.fasta>.* plus a converted seed FM-index at
                      <in.fasta>.meth.* (used by `bwa-mem3 mem --meth`).
+  --emit-unpacked-ref also write the unpacked `<prefix>.0123` reference. Off by
+                     default: `mem` pac-fetches bases from `.pac`, so `.0123`
+                     is never read. Enable only for an external consumer that
+                     still requires it (e.g. bwa-mem2); ~8x the size of `.pac`.
   -h, --help         print this help message and exit

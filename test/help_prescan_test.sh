@@ -31,7 +31,7 @@ reads="$fixtures/reads.fa"
 [[ -s "$reads" ]] || { echo "FAIL: reads.fa missing at $reads" >&2; exit 1; }
 
 # Build the phiX FMI index if not already present.
-if [[ ! -s "$ref.bwt.2bit.64" || ! -s "$ref.0123" || ! -s "$ref.amb" \
+if [[ ! -s "$ref.bwt.2bit.64" || ! -s "$ref.amb" \
       || ! -s "$ref.ann"       || ! -s "$ref.pac" ]]; then
     "$bin" index "$ref" >/dev/null 2>&1 \
         || { echo "FAIL: bwa-mem3 index on phix.fa failed" >&2; exit 1; }
