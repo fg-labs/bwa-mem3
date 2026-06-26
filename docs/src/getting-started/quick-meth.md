@@ -6,9 +6,12 @@ postprocessing step are required.
 
 > **Note — bwameth-compatible by default, variant-aware on request**
 >
-> By default (`--meth-scoring collapsed`) bwa-mem3 reproduces bwameth.py's read **placement** and
+> By default (`--meth-scoring collapsed`) bwa-mem3 closely tracks bwameth.py's read **placement** and
 > emits the standard Bismark tags methylation callers expect (MethylDackel, Bismark, PileOMeth,
-> etc.). It is a placement drop-in — not a byte-for-byte reproduction of bwameth. Add
+> etc.). It is a placement drop-in — *not* a byte-for-byte reproduction of bwameth: a small fraction
+> of records (~1% on typical WGBS/EM-seq) still differ in `POS`/`CIGAR`/`MAPQ`, so re-validate if you
+> are pinned to a specific bwameth release (see
+> [bwameth.py drop-in mapping](../methylation/bwameth-mapping.md)). Add
 > `--meth-scoring genomic` to opt into variant-aware scoring (truthful `NM`/`MD`; one BAM for both
 > methylation and variant calling).
 

@@ -25,14 +25,21 @@ about bisulfite-converted bases. This is controlled by `--meth-scoring`:
 
 | Mode | Default? | Matrix | `-B` | Behavior |
 |------|----------|--------|------|----------|
-| **`collapsed`** | **yes** | frees C↔T *and* G↔A both ways (two cells) | `2` | bwameth-compatible **placement** — C/T and G/A are interchangeable, so it matches bwameth's collapsed-space mapping. The drop-in default for pipelines pinned to bwameth. |
+| **`collapsed`** | **yes** | frees C↔T *and* G↔A both ways (two cells) | `2` | bwameth-compatible **placement** — C/T and G/A are interchangeable, so it closely tracks bwameth's collapsed-space mapping. A close approximation, **not** exact: ~1% of records differ in `POS`/`CIGAR`/`MAPQ`, so re-validate if pinned to a bwameth release. |
 | **`genomic`** | no (opt-in) | frees only the conversion direction (one cell) | `4` | **variant-aware** — a real C/T or G/A variant scores as a mismatch, so `NM`/`MD` are truthful and the BAM is usable for variant calling. |
 
 The default is `collapsed` so existing methylation pipelines see
 bwameth-compatible read placement unless they explicitly opt into `genomic`.
-`collapsed` reproduces bwameth's *placement* and emits the same Bismark tag set;
-it is a placement drop-in, not a byte-for-byte reproduction of bwameth or of any
-prior 3-letter `--meth` release.
+`collapsed` **closely tracks** bwameth's *placement* and emits the same Bismark
+tag set, but it is a placement drop-in — **not** a byte-for-byte reproduction of
+bwameth, and not drift-free. Because scoring runs against the original 4-letter
+reference rather than in collapsed 3-letter space, a small but nonzero fraction
+of records (on the order of ~1% on typical WGBS/EM-seq) differ from bwameth.py in
+`POS`, `CIGAR`, or `MAPQ`; this 4-letter scoring path is also why `collapsed`
+diverges *more* than the older 3-letter `--meth` releases did. If you are pinned
+to a specific bwameth release, re-validate against your own bwameth output rather
+than assume equivalence — see the
+[bwameth.py drop-in mapping](bwameth-mapping.md) page.
 
 ## Pipeline at a glance
 
