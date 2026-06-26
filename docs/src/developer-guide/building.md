@@ -157,7 +157,7 @@ Removes object files, `libbwa.a`, all binaries, test binaries, libsais objects, 
 make docs-clean
 ```
 
-Removes only the mdbook build output (`docs/book/`). Covered in [Developer Guide → Building](building.md) context; see the Makefile docs targets for the full list.
+Removes only the mdbook build output (`docs/book/`). See the [Documentation targets](#documentation-targets) below for the full list.
 
 ## Documentation targets
 

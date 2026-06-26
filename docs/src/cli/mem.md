@@ -348,6 +348,12 @@ divergent data) while cutting ~11–30 % of alignment CPU. Recommended for the s
 profile — see
 [Settings profiles → `-y 0`](../best-practices/settings-profiles.md#why-we-recommend--y-0).
 
+#### `--legacy-reader` — use the legacy input reader
+
+Read input with the legacy `gzFile`/`kseq` reader instead of the default
+content-detecting fast reader. An escape hatch for A/B baselining or working
+around an input the fast reader mishandles; not needed in normal use.
+
 ## Notes / Gotchas
 
 > **Warning — --meth requires a --meth index**
