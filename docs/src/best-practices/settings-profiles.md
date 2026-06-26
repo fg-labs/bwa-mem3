@@ -11,6 +11,13 @@ necessary. This page defines two profiles:
 The defaults ship as the drop-in profile. The recommended profile is **opt-in** — you turn it on
 with explicit flags — so upgrading bwa-mem3 never silently changes your alignments.
 
+**Which profile?**
+
+| Your situation | Profile | Invocation |
+|---|---|---|
+| Migrating a bwa-mem2 pipeline, or validating against bwa/bwa-mem2 | **Drop-in** | `bwa-mem3 mem` (no extra flags) |
+| New pipeline, or migration already validated | **Recommended** | `bwa-mem3 mem -m 10 -y 0` (add `-s 0` under `--meth`) |
+
 > bwa-mem3 is already, by design, *not* byte-identical to bwa-mem2 even at default settings
 > (additive SAM tags, per-architecture SIMD `score2`/MAPQ convergence, deterministic tie-breaks, a
 > few extra supplementary alignments) — it is 99.94%–99.9996% concordant on primary records
