@@ -11,7 +11,7 @@ for a specific compression level) to write BAM. Level 0 (uncompressed) is the
 default when `--bam` is given without an argument, which is optimal when piping
 to a downstream `samtools sort`.
 
-```sh
+```bash
 # SAM (default)
 bwa-mem3 mem -t 16 ref.fa R1.fq.gz R2.fq.gz > out.sam
 

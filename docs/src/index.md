@@ -21,7 +21,7 @@ support for things you used to need a wrapper script for.
   Bismark tags emitted.
 - **Stage the index once, align many.** A `bwa-mem3 shm` subcommand
   pins the FM-index in shared memory so back-to-back runs on the same host
-  skip the 28 GB read every time.
+  skip the ~11 GB index read every time.
 - **Correctness fixes upstream haven't merged yet.** Tabs in `-R`,
   151+ bp reads, AVX-512 mate-rescue, kswv `score2` plateau across
   NEON/AVX2/AVX-512BW, mem_sam_pe proper-pair flag — every fix tracked
@@ -78,8 +78,8 @@ cd bwa-mem3 && make
   dispatch, regression tests, contributing.
 - **[Related Projects](related-projects/bwa-mem3-bench.md)** —
   bwa-mem3-bench, bwa-mem3-rs, fgumi, bwa-mem2 upstream.
-- **[Reference](reference/glossary.md)** — Glossary, citation, license,
-  changelog.
+- **[Reference](reference/pr-catalog.md)** — PR catalog, glossary, citation,
+  license, changelog.
 
 ---
 

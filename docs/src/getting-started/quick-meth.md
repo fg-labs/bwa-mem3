@@ -56,34 +56,20 @@ to single-end input.
 
 ## What `--meth` does
 
-`--meth` activates a pipeline of in-process steps that would otherwise require external tools:
+In one process, `--meth` replaces what bwameth.py does with external tools:
 
-1. **Seed in 3-letter space, score in 4-letter space.** Each read is projected (R1 `C→T`, R2 `G→A`)
-   to find seeds in the `ref.fa.meth.*` index, then extended and **scored against the original
-   4-letter reference** with a per-strand asymmetric matrix. The original bases are restored into
-   the BAM `SEQ` field on emit, and the conversion direction is reported per record in the Bismark
-   `XR:Z` tag (`CT` for R1/SE, `GA` for R2).
+- **Seeds in 3-letter space, scores in 4-letter space** — projects each read
+  (R1 `C→T`, R2 `G→A`) to seed against `ref.fa.meth.*`, then extends and scores
+  against the *original* reference, restoring the original bases in `SEQ`.
+- **Applies bwameth-aligned defaults** — `-L 10 -U 100 -T 40 -M -C` plus
+  mode-dependent `-B` (`2` for `collapsed`, `4` for `genomic`).
+- **Post-processes the BAM inline** — consolidates `f`/`r` `@SQ` headers back to
+  real chromosomes, emits Bismark `XR`/`XG`/`XM` tags, runs optional
+  `--chimera-qc`, and writes uncompressed BAM ready for `samtools sort`.
 
-2. **Scoring defaults.** `--meth` sets `-L 10 -U 100 -T 40 -M -C` in both modes, plus the
-   mode-dependent mismatch penalty: `-B 2` for `collapsed`, `-B 4` for `genomic`. These mirror
-   bwameth's `bwa mem -T 40 -B 2 -L 10 -CM` (with `-U 100` for paired-end). Any value can be
-   overridden on the command line after `--meth`.
-
-3. **Inline BAM post-processing.** After alignment, bwa-mem3 rewrites the stream in-process:
-   - `@SQ` headers with `f`/`r` prefixes (e.g. `fchr1`, `rchr1`) are consolidated back to one entry
-     per real chromosome (`chr1`); record `RNAME`/`RNEXT` fields are rewritten to match.
-   - Each mapped record gains Bismark `XG:Z` (genome strand) and `XM:Z` (per-base methylation call
-     string).
-   - Optional chimera QC (`--chimera-qc`, **off by default** to match Bismark): reads whose longest
-     `M`/`=`/`X` run is under 44% of the read are flagged `0x200`, have `0x2` cleared, and MAPQ
-     capped at 1. QC-fail flags then propagate across the read group.
-   - A `@PG ID:bwa-mem3-meth` program record is appended to the header.
-
-4. **Uncompressed BAM output.** The stream is written as uncompressed BAM (`wb0`) rather than SAM
-   text, so downstream `samtools sort` reads it natively. It is still readable by any htslib tool.
-
-For the scoring modes, each tag, the optional chimera QC heuristic, and the `--set-as-failed` /
-`--chimera-qc` flags, see the [Methylation Reference](../methylation/overview.md).
+See the [Methylation Reference — Overview](../methylation/overview.md) for the
+mechanism in detail, [Flags](../methylation/flags.md) for the scoring modes and
+QC flags, and [SAM tags](../methylation/tags.md) for the tag definitions.
 
 ---
 

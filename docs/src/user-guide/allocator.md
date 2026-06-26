@@ -36,7 +36,7 @@ The linkage strategy differs by OS:
 
 Run:
 
-```sh
+```bash
 ./bwa-mem3 version
 ```
 
@@ -53,7 +53,7 @@ If that line is absent, mimalloc is not active.
 Pass `USE_MIMALLOC=0` at build time to produce a binary linked against the
 system allocator:
 
-```sh
+```bash
 make USE_MIMALLOC=0
 ```
 
@@ -89,4 +89,4 @@ work. See [Features](../whats-different/features.md) and
 [Features: mimalloc](../whats-different/features.md) ·
 [Getting Started: installation](../getting-started/installation.md) ·
 [Developer Guide: building from source](../developer-guide/building.md) ·
-[Performance: tuning checklist](../performance/tuning.md)
+[Best Practices: optimization checklist](../best-practices/optimization-checklist.md)

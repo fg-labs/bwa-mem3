@@ -41,7 +41,7 @@ larger.
 **original** reference's packed `.pac` for scoring/extension. The seed FM-index
 is roughly twice the size of a plain FM-index (its contigs are doubled), so the
 resident index for hg38 is on the order of **22 GB** (seed FM-index ~21 GB +
-original `.pac` ~1 GB), versus ~17 GB for a plain alignment.
+original `.pac` ~1 GB), versus ~15 GB for a plain alignment.
 
 As with plain alignment, the original reference's bases are pac-fetched from its
 `.pac` — the original unpacked `.0123` (~6.4 GB) is **neither built nor loaded**.
@@ -123,7 +123,7 @@ common cause of OOM on Hi-C.
 
 The fix is to align Hi-C the way Hi-C pipelines expect, with `-5SP`:
 
-```sh
+```bash
 bwa-mem3 mem -5SP -t 16 --bam ref.fa hic_R1.fq.gz hic_R2.fq.gz \
   | samtools sort -n -@ 2 -o hic.namesorted.bam -
 ```

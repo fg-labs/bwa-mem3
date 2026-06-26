@@ -6,7 +6,7 @@ built once and reused indefinitely.
 
 ## Basic indexing
 
-```sh
+```bash
 bwa-mem3 index ref.fa
 ```
 
@@ -22,6 +22,17 @@ The command writes four files alongside the input FASTA:
 The `.bwt.2bit.64` file dominates disk usage. For the human reference (hg38),
 expect roughly 11 GB total across all four files.
 
+> **Note — reusing an existing index**
+>
+> - **From `bwa-mem2`:** an index built by `bwa-mem2 index` works as-is — no
+>   rebuild. bwa-mem3 reads its `.bwt.2bit.64` and `.pac` and ignores the
+>   `.0123`.
+> - **From `bwa` (v1):** a `bwa index` uses a different FM-index format
+>   (`.bwt` / `.sa`) and **cannot** be reused — run `bwa-mem3 index ref.fa` to
+>   rebuild (a few minutes; the FASTA is unchanged).
+>
+> See [Coming from bwa or bwa-mem2](../getting-started/migrating.md).
+
 > **Note — no `.0123` by default**
 >
 > Earlier releases (and bwa-mem2) also wrote `ref.fa.0123`, an *unpacked*
@@ -31,7 +42,7 @@ expect roughly 11 GB total across all four files.
 > identical. Pass `--emit-unpacked-ref` to `index` if you need the file for an
 > external tool that still requires it (e.g. bwa-mem2):
 >
-> ```sh
+> ```bash
 > bwa-mem3 index --emit-unpacked-ref ref.fa   # also writes ref.fa.0123
 > ```
 >
@@ -39,7 +50,7 @@ expect roughly 11 GB total across all four files.
 
 ## Methylation index (`--meth`)
 
-```sh
+```bash
 bwa-mem3 index --meth ref.fa
 ```
 
@@ -94,28 +105,31 @@ Index files are written to the same directory as the input FASTA by default.
 The input path is taken verbatim as a prefix — you can pass an absolute path to
 write into a different directory:
 
-```sh
+```bash
 bwa-mem3 index /data/indexes/hg38/hg38.fa
 # writes hg38.fa.bwt.2bit.64, etc. into /data/indexes/hg38/
 ```
 
 ## Time and memory
 
-Indexing hg38 takes roughly 60–90 minutes on a single core and requires about
-80 GB of RAM during construction. The process is single-threaded; additional
-cores do not reduce wall time.
+Index construction is **multi-threaded and memory-bounded**. `index -t` defaults
+to the detected core count (cgroup-aware), and `--max-memory` caps peak RAM at
+`min(50% of RAM, 32 GB)` by default — raise or lower it to trade memory against
+spill I/O. On a typical multi-core host, indexing hg38 takes a few minutes
+(longer if pinned to a single core).
 
-bwa-mem3 uses [libsais](https://github.com/IlyaGrebnov/libsais) to construct
-the suffix array, which is faster than the original bwa-mem2 approach. See
-[Performance improvements](../whats-different/performance.md) for benchmark
-numbers.
+bwa-mem3 builds the suffix array with
+[libsais](https://github.com/IlyaGrebnov/libsais), whose OpenMP-parallel,
+memory-bounded construction is faster and leaner than the original bwa-mem2
+approach. See [Performance improvements](../whats-different/performance.md) for
+benchmark numbers.
 
 > **Warning — Do not index over a live shared-memory segment**
 >
 > If you have previously staged the index into shared memory with `bwa-mem3 shm`,
 > drop the segment first before re-indexing:
 >
-> ```sh
+> ```bash
 > bwa-mem3 shm -d
 > bwa-mem3 index ref.fa
 > ```

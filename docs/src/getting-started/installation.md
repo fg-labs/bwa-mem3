@@ -1,5 +1,9 @@
 # Installation
 
+Already using `bwa` or `bwa-mem2`? After installing, see
+[Coming from bwa or bwa-mem2](migrating.md) — the command line is unchanged, but
+the index and output have a couple of migration notes.
+
 ## Bioconda (coming soon)
 
 A Bioconda package for bwa-mem3 is in preparation. Once published, installation will be:

@@ -5,6 +5,7 @@
 # Getting Started
 
 - [Installation](getting-started/installation.md)
+- [Coming from bwa or bwa-mem2](getting-started/migrating.md)
 - [Host requirements](getting-started/host-requirements.md)
 - [Quick start: align paired-end FASTQs](getting-started/quick-align.md)
 - [Quick start: methylation alignment](getting-started/quick-meth.md)
@@ -25,10 +26,10 @@
 - [Overview](performance/overview.md)
 - [SIMD dispatch matrix](performance/simd-dispatch.md)
 - [PGO build](performance/pgo.md)
-- [Tuning checklist](performance/tuning.md)
 
 # Best Practices
 
+- [Optimization checklist](best-practices/optimization-checklist.md)
 - [Settings profiles: bwa drop-in vs recommended](best-practices/settings-profiles.md)
 - [Build](best-practices/build.md)
 - [Output format](best-practices/output-format.md)
@@ -65,7 +66,6 @@
 - [Architecture support](whats-different/arch-support.md)
 - [Build & infrastructure](whats-different/build-infra.md)
 - [`BASELINE_ARCH=avx512bw` build flag](whats-different/avx512-baseline.md)
-- [Upstream PR status](whats-different/upstream-prs.md)
 
 # Developer Guide
 
@@ -88,6 +88,7 @@
 
 # Reference
 
+- [PR catalog](reference/pr-catalog.md)
 - [Glossary](reference/glossary.md)
 - [Citation](reference/citation.md)
 - [License](reference/license.md)

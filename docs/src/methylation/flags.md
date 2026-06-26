@@ -22,6 +22,14 @@ the conversion (bwameth-style) or keep it variant-aware.
   making `NM`/`MD` truthful and the BAM usable for variant calling. Keeps bwa's
   default `-B 4`.
 
+> **Important — `collapsed` is a placement drop-in, not byte-identical to bwameth**
+>
+> `collapsed` *closely tracks* bwameth's placement but scores against the original
+> 4-letter reference, so ~1% of records differ from bwameth.py in `POS`/`CIGAR`/`MAPQ`.
+> **If you are pinned to a specific bwameth release, re-validate against your own
+> bwameth output** — see [bwameth.py drop-in mapping](bwameth-mapping.md) for the
+> full caveat.
+
 **Effect on output:**
 
 The mode changes alignment score, `MAPQ`, `NM`, `MD`, and occasionally placement

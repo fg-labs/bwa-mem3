@@ -97,6 +97,6 @@ The PGO targets produce one optimized binary for a single `arch=` target. They d
 **See also:**
 [Performance overview](overview.md) ·
 [SIMD dispatch matrix](simd-dispatch.md) ·
-[Tuning checklist](tuning.md) ·
+[Optimization checklist](../best-practices/optimization-checklist.md) ·
 [Best Practices — Build](../best-practices/build.md) ·
 [Developer Guide — Building from source](../developer-guide/building.md)

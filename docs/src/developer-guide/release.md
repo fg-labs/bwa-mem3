@@ -128,11 +128,9 @@ git-tag command. **Every item must pass.**
       Operational / packaging, Correctness, Performance, and
       Methylation subheadings as applicable; every user-visible PR in
       the release window is listed with its number.
-- [ ] `docs/src/whats-different/overview.md` `FG-MAIN-TABLE` is
-      regenerated to cover the new PRs (see
-      [Contributing](contributing.md) for the regeneration command).
-- [ ] `docs/src/whats-different/upstream-prs.md` has rows for every
-      user-visible PR landed since the previous tag.
+- [ ] `docs/src/reference/pr-catalog.md` `FG-MAIN-TABLE` block has a row for
+      every fork-carried PR landed since the previous tag, with its upstream
+      disposition (see [Contributing](contributing.md#the-fg-main-table-rule)).
 - [ ] `docs/src/reference/changelog.md` and `docs/src/cli/version.md`
       examples reference the new release string.
 - [ ] Spot-check the bwa-mem3-bench reference numbers in
@@ -229,7 +227,7 @@ After the tag is pushed and the GitHub release is published:
 
 ## What's Different table update
 
-When a release bundles new fork-carried commits that were not previously documented, update the `FG-MAIN-TABLE` in `docs/src/whats-different/overview.md` in the same PR before tagging. See [Contributing](contributing.md) for the rule.
+When a release bundles new fork-carried commits that were not previously documented, update the `FG-MAIN-TABLE` in `docs/src/reference/pr-catalog.md` in the same PR before tagging. See [Contributing](contributing.md#the-fg-main-table-rule) for the rule.
 
 ---
 

@@ -116,7 +116,7 @@ and reproducibility.
 >
 > After alignment, confirm consolidation and provenance with:
 >
-> ```sh
+> ```bash
 > samtools view -H out.bam | grep -E '^@SQ|^@PG'
 > ```
 >
@@ -127,6 +127,7 @@ and reproducibility.
 
 **See also:**
 [Overview](overview.md) ·
+[bwameth.py drop-in mapping](bwameth-mapping.md) ·
 [SAM tags: XR, XG, XM](tags.md) ·
 [Flags: --set-as-failed, --chimera-qc](flags.md) ·
 [Conversion details](conversion.md) ·

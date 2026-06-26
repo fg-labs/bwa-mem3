@@ -89,8 +89,10 @@ This is a clean failure: the job exits before any billable alignment work starts
 
 **Defence-in-depth recommendation:** configure your AWS Batch compute environment (or equivalent) to exclude instance families older than your binary's floor. The precheck protects against accidental scheduling; an allowlist at the orchestrator level prevents the scheduling decision in the first place.
 
-## See also
+---
 
-- [Getting Started → Host requirements](../getting-started/host-requirements.md)
-- [Getting Started → Installation](../getting-started/installation.md)
-- `src/simd_dispatch.cpp` — the runtime dispatcher (`bwamem3_simd_init`, `bwamem3_enforce_host_floor`, `bwamem3_print_version_simd`)
+**See also:**
+[Getting Started → Host requirements](../getting-started/host-requirements.md) ·
+[Getting Started → Installation](../getting-started/installation.md) ·
+[Build](build.md) ·
+[Performance → SIMD dispatch matrix](../performance/simd-dispatch.md)

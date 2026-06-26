@@ -164,6 +164,6 @@ upstream PR at time of merge.
 **See also:**
 [Performance improvements](performance.md) ·
 [Architecture support](arch-support.md) ·
-[Upstream PR status](upstream-prs.md) ·
+[PR catalog](../reference/pr-catalog.md) ·
 [Developer Guide → Regression test framework](../developer-guide/regression-tests.md) ·
 [Performance → SIMD dispatch matrix](../performance/simd-dispatch.md)

@@ -125,6 +125,7 @@ bwameth `.bwameth.c2t` index cannot be reused directly — rebuild with
 
 **See also:**
 [Overview](overview.md) ·
+[bwameth.py drop-in mapping](bwameth-mapping.md) ·
 [SAM tags: XR, XG, XM](tags.md) ·
 [Migrating from bwameth.py c2t](external-c2t.md) ·
 [User Guide → Indexing the reference](../user-guide/indexing.md) ·

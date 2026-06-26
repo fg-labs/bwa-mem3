@@ -63,43 +63,12 @@ If you build the arm64 binary with clang, note the OpenMP runtime changes from
 
 ## Profile-Guided Optimization (PGO)
 
-PGO typically yields 3–5% throughput improvement on real workloads.  It is opt-in — the standard
-`make` target does not use it — but is recommended for any installation that
-will run many alignment jobs against the same reference.
-
-The workflow is three steps:
-
-```bash
-# Step 1: Build an instrumented binary (produces bwa-mem3.pgo-instr).
-make pgo-generate
-
-# Step 2: Run a representative training workload.
-#   Use reads and a reference that reflect actual production input.
-#   About 10–30 million read pairs is sufficient.
-./bwa-mem3.pgo-instr mem -t 16 ref.fa R1.fq.gz R2.fq.gz > /dev/null
-
-# Step 3: Build the PGO-optimized binary (produces bwa-mem3.pgo).
-make pgo-use
-```
-
-To target a specific SIMD level, pass `PGO_ARCH=`:
-
-```bash
-make pgo-generate PGO_ARCH=avx2
-./bwa-mem3.pgo-instr.avx2 mem -t 16 ref.fa R1.fq.gz R2.fq.gz > /dev/null
-make pgo-use PGO_ARCH=avx2
-# Produces: bwa-mem3.pgo.avx2
-```
-
-Profile data is written to `pgo_profiles/` by default. Pass
-`PGO_PROFILE_DIR=<path>` to change the location.
-
-> **Tip — Training data matters**
->
-> The training workload should resemble production input in read length, base
-> quality distribution, and reference composition. A read set that is too short,
-> too long, or too easy (low mismatch rate) will bias the branch predictions and
-> may produce a build that is slower than the non-PGO baseline on real data.
+PGO adds 3–5% throughput on real workloads and is recommended for any
+installation that runs many alignment jobs against the same reference. It is
+opt-in — the default `make` does not use it. The generate → train → use
+workflow, the `PGO_ARCH=` selector, `PGO_PROFILE_DIR=`, and the training-data
+caveats are all in [Performance → PGO build](../performance/pgo.md); the Summary
+below shows the production recipe.
 
 ## mimalloc
 

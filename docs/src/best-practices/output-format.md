@@ -88,5 +88,5 @@ For production alignment jobs that feed `samtools sort`, always use
 [Aligning short reads (mem)](../user-guide/aligning.md) ·
 [Output: SAM/BAM, headers, tags](../user-guide/output.md) ·
 [Threading and resource use](../user-guide/threading.md) ·
-[Tuning checklist](../performance/tuning.md) ·
+[Optimization checklist](optimization-checklist.md) ·
 [CLI Reference: mem](../cli/mem.md)

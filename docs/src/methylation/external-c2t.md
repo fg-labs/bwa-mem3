@@ -33,14 +33,14 @@ rather than adapted.
 1. **Rebuild the index.** A legacy `ref.fa.bwameth.c2t` index is not usable.
    Build the dual index from the original FASTA:
 
-   ```sh
+   ```bash
    bwa-mem3 index --meth ref.fa     # writes ref.fa.* and ref.fa.meth.*
    ```
 
 2. **Pass raw FASTQ and the original prefix.** Drop any `bwameth.py c2t`
    preprocessing step and the `-p /dev/stdin` plumbing:
 
-   ```sh
+   ```bash
    bwa-mem3 mem --meth -t 16 ref.fa R1.fq.gz R2.fq.gz \
      | samtools sort -o out.bam
    ```

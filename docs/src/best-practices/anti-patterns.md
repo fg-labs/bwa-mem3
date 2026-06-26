@@ -57,28 +57,13 @@ keeps the host-floor precheck at `avx2` when the deployment surface is
 strictly AVX-512. Pass `BASELINE_ARCH=` (or build a single-tier binary
 with `arch=`) to align the build with the deployment:
 
-> **Warning — Suboptimal build on known hardware**
->
-> ```bash
-> # Single multi-tier binary with non-kernel TUs at the host's tier:
-> make BASELINE_ARCH=avx512bw      # Cascade Lake / Ice Lake / Sapphire Rapids / Zen 4
->
-> # Single-tier binary (no dispatch table; smallest install) when the cluster
-> # is uniform and you don't need cross-tier portability:
-> make arch=avx2                   # Broadwell/Skylake and later x86
-> make arch=avx512bw               # Cascade Lake / Sapphire Rapids
-> make arch=arm64                  # Apple Silicon / AWS Graviton
-> ```
->
-> The default (`make` with no overrides) is appropriate when the binary
-> will be distributed across multiple CPU families or when the target
-> CPU is genuinely unknown. Note that `BASELINE_ARCH=avx512bw` does not
-> always win over `avx2` even on AVX-512 hosts — see
-> [`BASELINE_ARCH=avx512bw` build flag](../whats-different/avx512-baseline.md)
-> for the empirical perf characterization.
-
-See [SIMD dispatch matrix](../performance/simd-dispatch.md) for the full set
-of targets and the in-process dispatch architecture.
+Pick a `BASELINE_ARCH=` (or a single-tier `arch=`) build target that matches the
+deployment — see [Build → arch targets](build.md#choose-the-right-arch-target).
+The default is correct only when the binary is distributed across multiple CPU
+families or the target is genuinely unknown. Note that `BASELINE_ARCH=avx512bw`
+does not always beat `avx2` even on AVX-512 hosts — see
+[`BASELINE_ARCH=avx512bw` build flag](../whats-different/avx512-baseline.md) for
+the empirical characterization.
 
 ## Mixing bwa-mem3 and bwa-mem2 outputs in the same pipeline
 

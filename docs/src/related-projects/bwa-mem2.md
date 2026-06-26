@@ -42,7 +42,7 @@ has not yet been validated against your specific reference or sequencing library
 bwa-mem3 tracks bwa-mem2's `master` branch and periodically rebases fork-carried
 commits on top of upstream changes. The [What's Different](../whats-different/overview.md)
 section documents every divergence between the two projects, and the
-[Upstream PR status](../whats-different/upstream-prs.md) page tracks which bwa-mem3
+[PR catalog](../reference/pr-catalog.md) page tracks which bwa-mem3
 changes have been proposed back to bwa-mem2. The goal is to keep the fork divergence
 minimal and to upstream as many fixes as practical.
 
@@ -57,6 +57,6 @@ minimal and to upstream as many fixes as practical.
 
 **See also:**
 [What's Different from bwa-mem2](../whats-different/overview.md) ·
-[Upstream PR status](../whats-different/upstream-prs.md) ·
+[PR catalog](../reference/pr-catalog.md) ·
 [bwa-mem3-bench](bwa-mem3-bench.md) ·
 [Citation](../reference/citation.md)
