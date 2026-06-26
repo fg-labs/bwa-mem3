@@ -1,6 +1,6 @@
 # Quick start: shared-memory index
 
-The bwa-mem3 FM-index for a genome like hg38 is approximately 15 GB. By default, every
+The bwa-mem3 hg38 index is roughly 11 GB on disk (~15 GB once loaded into RAM). By default, every
 `bwa-mem3 mem` invocation reads the index from disk, which can take 30–60 seconds on a spinning
 disk and several seconds even on fast NVMe storage. For workloads that align many small samples
 in sequence on the same machine, this per-invocation overhead accumulates.
