@@ -227,7 +227,7 @@ After the tag is pushed and the GitHub release is published:
 
 ## What's Different table update
 
-When a release bundles new fork-carried commits that were not previously documented, update the `FG-MAIN-TABLE` in `docs/src/whats-different/overview.md` in the same PR before tagging. See [Contributing](contributing.md) for the rule.
+When a release bundles new fork-carried commits that were not previously documented, update the `FG-MAIN-TABLE` in `docs/src/reference/pr-catalog.md` in the same PR before tagging. See [Contributing](contributing.md#the-fg-main-table-rule) for the rule.
 
 ---
 

@@ -112,14 +112,17 @@ bwa-mem3 index /data/indexes/hg38/hg38.fa
 
 ## Time and memory
 
-Indexing hg38 takes roughly 60–90 minutes on a single core and requires about
-80 GB of RAM during construction. The process is single-threaded; additional
-cores do not reduce wall time.
+Index construction is **multi-threaded and memory-bounded**. `index -t` defaults
+to the detected core count (cgroup-aware), and `--max-memory` caps peak RAM at
+`min(50% of RAM, 32 GB)` by default — raise or lower it to trade memory against
+spill I/O. On a typical multi-core host, indexing hg38 takes a few minutes
+(longer if pinned to a single core).
 
-bwa-mem3 uses [libsais](https://github.com/IlyaGrebnov/libsais) to construct
-the suffix array, which is faster than the original bwa-mem2 approach. See
-[Performance improvements](../whats-different/performance.md) for benchmark
-numbers.
+bwa-mem3 builds the suffix array with
+[libsais](https://github.com/IlyaGrebnov/libsais), whose OpenMP-parallel,
+memory-bounded construction is faster and leaner than the original bwa-mem2
+approach. See [Performance improvements](../whats-different/performance.md) for
+benchmark numbers.
 
 > **Warning — Do not index over a live shared-memory segment**
 >

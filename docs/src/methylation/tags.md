@@ -120,10 +120,12 @@ XG:Z:CT
 XM:Z:..z..h..Z..x..h.....Z..
 ```
 
-## See also
+---
 
-- [Overview](overview.md)
-- [Conversion details](conversion.md)
-- [Chimera QC and header rewriting](post-processing.md)
-- [Flags: --set-as-failed, --chimera-qc](flags.md)
-- [User Guide → Output: SAM/BAM, headers, tags](../user-guide/output.md)
+**See also:**
+[Overview](overview.md) ·
+[bwameth.py drop-in mapping](bwameth-mapping.md) ·
+[Conversion details](conversion.md) ·
+[Chimera QC and header rewriting](post-processing.md) ·
+[Flags: --set-as-failed, --chimera-qc](flags.md) ·
+[User Guide → Output: SAM/BAM, headers, tags](../user-guide/output.md)

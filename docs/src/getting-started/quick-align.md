@@ -25,9 +25,9 @@ This produces four index files alongside `ref.fa`:
 (No `ref.fa.0123` is written: `mem` reconstructs reference bases from `.pac` on
 demand. Pass `index --emit-unpacked-ref` if a tool such as bwa-mem2 needs it.)
 
-Indexing hg38 takes roughly 2-3 minutes and requires approximately 60 GB of peak disk space
-during creation (including temporary/intermediate files); the final index stored on disk
-is roughly 11 GB. The index is read once per `mem` invocation; for workloads that align many
+Indexing hg38 takes a few minutes on a multi-core host (construction is
+multi-threaded and memory-bounded — see [Indexing the reference](../user-guide/indexing.md));
+the final index is roughly 11 GB on disk. The index is read once per `mem` invocation; for workloads that align many
 samples, load it into shared memory first (see [Quick start: shared-memory index](quick-shm.md)).
 
 ## Align paired-end reads
@@ -41,8 +41,9 @@ cores; hyperthreading provides diminishing returns above that point. See
 [User Guide — Threading and resource use](../user-guide/threading.md) for recommendations at
 different core counts.
 
-The default output is uncompressed SAM on stdout. To write compressed BAM directly, use the
-`--bam` flag:
+The default output is SAM on stdout. To write BAM directly, add `--bam`
+(uncompressed by default — best for piping to `samtools sort`; use `--bam=6` for
+BGZF-compressed BAM):
 
 ```bash
 bwa-mem3 mem --bam -t 16 ref.fa r1.fq.gz r2.fq.gz \
