@@ -97,57 +97,13 @@ are maintained at [bwa-mem3-bench](https://github.com/fg-labs/bwa-mem3-bench).
 
 ---
 
-## Changes catalog
+## Full change list
 
-The mechanism column says, in one line, *why it is faster*. The stage column
-groups changes by where in the pipeline they act: **seed** (SMEM/FM-index
-walks), **sw** (Smith–Waterman / banded kernels), **index** (`bwa-mem3 index`),
-**i/o** (read decompression + header ingestion), **mem** (allocation),
-**dispatch** (SIMD/runtime selection), **sort**, or **prof** (off-by-default
-profiling). A `/test` suffix (e.g. `sw/test`) marks a test or contract-locking
-change for that stage; a slash between two stages (e.g. `dispatch/sw`) means the
-change spans both.
+Every performance PR — with its upstream disposition — is in the
+[PR catalog](../reference/pr-catalog.md) (filter on the *Performance* class).
+The sections above narrate the load-bearing ones.
 
-### Merged
-
-| Item | Stage | Mechanism | bwa-mem3 PR | Upstream |
-|------|-------|-----------|-------------|----------|
-| mimalloc by default | mem | Vendored + statically linked allocator; avoids glibc `ptmalloc` lock contention at high thread counts | [#19](https://github.com/fg-labs/bwa-mem3/pull/19) | — |
-| Lockstep SMEM batching | seed | Interleaves several reads' seed walks so the OoO engine overlaps `cp_occ` cache misses across reads | [#33](https://github.com/fg-labs/bwa-mem3/pull/33) | — |
-| Batched `-H` header ingestion | i/o | One-pass buffered read; fixes O(n²) `strlen`+`realloc` per line (>10 min → <1 s on large headers) | [#49](https://github.com/fg-labs/bwa-mem3/pull/49) | [bwa-mem2#204](https://github.com/bwa-mem2/bwa-mem2/pull/204) (open); closes [#37](https://github.com/fg-labs/bwa-mem3/issues/37) |
-| libsais FM-index construction | index | Linear-time suffix-array/BWT build; less wall time + memory; byte-identical index | [#57](https://github.com/fg-labs/bwa-mem3/pull/57) | — |
-| Consolidated mapping speedups | seed/sw | Multi-phase hot-path audit across ksw2 band loop, SMEM batching, SAL prefetch, SAM building | [#58](https://github.com/fg-labs/bwa-mem3/pull/58) | — |
-| kswv per-strip L1 prefetches | sw | Adds the per-strip L1 prefetches that `kswv512_16` already had to the four `kswv` kernels that lacked them; stops first-touch L1 stalls | [#70](https://github.com/fg-labs/bwa-mem3/pull/70) | — |
-| `SMEM_LOCKSTEP_N` 8 → 16 | seed | Wider lockstep batch exposes more memory-level parallelism on modern cores | [#75](https://github.com/fg-labs/bwa-mem3/pull/75) | — |
-| Closed-form ungapped HIT | sw | Replaces the per-base Kadane walk with a direct store when `total_mis == 0` | [#77](https://github.com/fg-labs/bwa-mem3/pull/77) | — |
-| On-stack ksort buffer | sort | Removes a per-call `malloc` for small arrays (typical n = 5–30 alignment regions) | [#78](https://github.com/fg-labs/bwa-mem3/pull/78) | — |
-| Skip zero-init in libsais build | index | Drops value-initialization of unpack + SA buffers later fully overwritten (tens of GiB of zero-fill avoided) | [#80](https://github.com/fg-labs/bwa-mem3/pull/80) | — |
-| Single-binary SIMD dispatch | dispatch | Replaces the multi-binary `execv` launcher with in-process per-host kernel selection | [#83](https://github.com/fg-labs/bwa-mem3/pull/83) | — |
-| x86 baseline → avx2 | dispatch/sw | Restores 256-bit auto-vec on non-kernel TUs (~+15% wgs / +11% wes vs the sse41 baseline) | [#84](https://github.com/fg-labs/bwa-mem3/pull/84) | — |
-| Cap avx512bw autovec at 256-bit | dispatch/sw | Avoids the 512-bit auto-vec frequency downclock on some x86 parts (the PR also adds an unrelated `bwa_shm` `/dev/shm` preflight) | [#86](https://github.com/fg-labs/bwa-mem3/pull/86) | — |
-| Inline `backwardExt` | seed | Forces inlining at the hot SMEM call sites; kills a struct-by-value ABI pass gcc 12+ couldn't elide | [#88](https://github.com/fg-labs/bwa-mem3/pull/88) | — |
-| SIMD host-floor precheck | dispatch | Fails fast with a clear message when a host lacks the build's required ISA (safe multi-arch deployment) | [#95](https://github.com/fg-labs/bwa-mem3/pull/95) | — |
-| Stable tie-breaks + pdqsort | sort | Deterministic alnreg ordering and `pdqsort` at the dedup-patch sort sites (see equivalence note above) | [#123](https://github.com/fg-labs/bwa-mem3/pull/123) | — |
-| FASTQ reader fast path | i/o | Content-detecting reader over libdeflate BGZF for faster input decompression/parse | [#128](https://github.com/fg-labs/bwa-mem3/pull/128) | — |
-| Recover 8-bit banded SW (≥128 bp) | sw | Keeps long reads in the cheaper 8-bit lane width where valid | [#140](https://github.com/fg-labs/bwa-mem3/pull/140) | — |
-| Gotoh gaps from H | sw | Derives extension gaps from H (standard Gotoh) rather than M in the recovered 8-bit path | [#141](https://github.com/fg-labs/bwa-mem3/pull/141) | — |
-| Drop dead `qlen[]` param | sw | Removes an unread parameter from the three 8-bit kernels (cleanup; compile-output-identical) | [#143](https://github.com/fg-labs/bwa-mem3/pull/143) | — |
-| Long-read kernel parity test | sw/test | Promotes the 8-bit/16-bit byte-identity harness into a CI doctest | [#144](https://github.com/fg-labs/bwa-mem3/pull/144) | — |
-| Short-circuit re-baseline scan | sw | Skips the inert per-row re-baseline scan in the banded kernel | [#147](https://github.com/fg-labs/bwa-mem3/pull/147) | — |
-| Remove dead SW code paths | sw | Deletes unreachable `SORT_PAIRS` / non-CORE / SSE2-polyfill code (no behavior change) | [#148](https://github.com/fg-labs/bwa-mem3/pull/148) | — |
-| Vectorize epilogue side-channel | sw | Vectorizes the per-row epilogue side-channel loop | [#149](https://github.com/fg-labs/bwa-mem3/pull/149) | — |
-| Bound getScores prefetch reads | sw | Bounds `getScores8/16` prefetch reads to the padding contract (hardening) | [#150](https://github.com/fg-labs/bwa-mem3/pull/150) | — |
-| Unsigned 8-bit h0-prefix seed | sw | Widens the 8-bit h0-prefix seed to unsigned `[0,255]` | [#151](https://github.com/fg-labs/bwa-mem3/pull/151) | — |
-| `--profile` stage timing | prof | Off-by-default read/proc/write + disk/decompress/parse breakdown for diagnosing pipeline scaling (no overhead when off) | [#152](https://github.com/fg-labs/bwa-mem3/pull/152) | — |
-| zlib-ng inflate + 3rd worker | i/o | Vendored zlib-ng inflate path with chunk cap and an added pipeline worker (~2.2× faster read stage; up to −7.8% wall at 96 cores) | [#153](https://github.com/fg-labs/bwa-mem3/pull/153) | — |
-| Right-size SA staging buffers | index | Sizes the `pos_ar`/`map_ar` staging buffers to the actual `min(s, max_occ)` write count instead of the uncapped SA-interval sum | [#157](https://github.com/fg-labs/bwa-mem3/pull/157) | — |
-| `gtle` contract test | sw/test | Enforces `gtle` byte-identity when `gscore > 0`; documents the `gscore == 0` query-end tail divergence | [#158](https://github.com/fg-labs/bwa-mem3/pull/158) | — |
-| NEON SW tuning | sw | Replaces `sse2neon` all-zero `movemask` tests with single-instruction `vmaxvq` horizontal reductions in the hot SW scans | [#160](https://github.com/fg-labs/bwa-mem3/pull/160) | — |
-| AVX2 SW tuning | sw | Relieves the port-5 `vpblendvb`/`vpshufb` bottleneck in the two SW kernels (byte-identical, Zen3-verified) | [#161](https://github.com/fg-labs/bwa-mem3/pull/161) | — |
-| AVX2 16-bit `kswv256_16` | sw | Adds the AVX2 16-bit mate-rescue kernel so AVX2 hosts no longer fall back to scalar `ksw_align2` for 16-bit rescue | [#162](https://github.com/fg-labs/bwa-mem3/pull/162) | — |
-| NEON `movemask` parity test | sw/test | Scalar-vs-NEON unit test for the `movemask` helpers; guards the #160 rewrite against silent mask collapse | [#164](https://github.com/fg-labs/bwa-mem3/pull/164) | — |
-
-### Open / in progress
+## Open / in progress
 
 Not yet merged to `main`:
 

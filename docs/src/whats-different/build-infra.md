@@ -147,4 +147,4 @@ pipeline parity vs bwa, SE smoke, interleaved smoke, and `--meth` Layers 1–3.
 [Developer Guide → Release process](../developer-guide/release.md) ·
 [Performance → PGO build](../performance/pgo.md) ·
 [Performance improvements](performance.md) ·
-[Upstream PR status](upstream-prs.md)
+[PR catalog](../reference/pr-catalog.md)

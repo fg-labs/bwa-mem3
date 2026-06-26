@@ -61,7 +61,7 @@ WIP
 
 ## The FG-MAIN-TABLE rule
 
-Every PR that introduces a new fork-carried commit — a commit that is on `main` but not on `master` (the upstream bwa-mem2 mirror) — **must** update the `FG-MAIN-TABLE` block in `docs/src/whats-different/overview.md` in the same PR.
+Every PR that introduces a new fork-carried commit — a commit that is on `main` but not on `master` (the upstream bwa-mem2 mirror) — **must** update the `FG-MAIN-TABLE` block in `docs/src/reference/pr-catalog.md` in the same PR.
 
 The table records each fork-carried change, its bwa-mem3 PR number, the corresponding upstream bwa-mem2 PR or issue (if any), and its upstream status. Keeping this table current is the primary mechanism by which the project maintains transparency about its relationship to upstream.
 

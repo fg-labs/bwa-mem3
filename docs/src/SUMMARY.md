@@ -65,7 +65,6 @@
 - [Architecture support](whats-different/arch-support.md)
 - [Build & infrastructure](whats-different/build-infra.md)
 - [`BASELINE_ARCH=avx512bw` build flag](whats-different/avx512-baseline.md)
-- [Upstream PR status](whats-different/upstream-prs.md)
 
 # Developer Guide
 
@@ -88,6 +87,7 @@
 
 # Reference
 
+- [PR catalog](reference/pr-catalog.md)
 - [Glossary](reference/glossary.md)
 - [Citation](reference/citation.md)
 - [License](reference/license.md)

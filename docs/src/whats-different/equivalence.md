@@ -67,90 +67,11 @@ The divergences described above are tracked as a structured registry in [bwa-mem
 | FG-SUPP-ADDITIONS | TBD | supplementary_alignment | all | 0.0000 | bwa-mem3 emits a small number of additional supplementary (split/chimeric) alignments vs bwa-mem2 v2.2.1 on the default build (e.g. wes-5M: 5123 vs 5118). Primary alignments are unchanged. Tracked as a supplementary-count metric (compare-bams supp_count_mismatch / supp_unmatched); it does not affect the primary-concordance drift budget, hence 0.0 here. |
 <!-- FG-DIVERGENCE-CATALOG:end -->
 
-## Auditable PR list
+## Per-PR audit trail
 
-Every merged pull request on `main` is linked below, grouped by whether and how it can affect output, output-affecting groups first. The build / CI / docs / chore group at the end has no output impact and is collapsed but still links each PR. PR link format is `https://github.com/fg-labs/bwa-mem3/pull/<N>`. For the commit-level table and upstream disposition see the [Overview](overview.md) and [Upstream PR status](upstream-prs.md) pages.
-
-### Additive SAM tags (not present in bwa-mem2)
-
-These add optional fields and therefore break byte-identity by construction, without changing the alignment.
-
-- [#42](https://github.com/fg-labs/bwa-mem3/pull/42) — `HN:i` total-hit-count tag per primary.
-- [#35](https://github.com/fg-labs/bwa-mem3/pull/35) — ports four lh3/bwa PRs, including the `MQ` mate-MAPQ tag, the `-u`/`XB` tag, and `@HD` ordering.
-- [#90](https://github.com/fg-labs/bwa-mem3/pull/90) — Bismark-compatible `XR`/`XG`/`XM` methylation tags (meth mode only).
-
-### Proper-pair FLAG semantics (default-on, latent on smoke-1M)
-
-- [#17](https://github.com/fg-labs/bwa-mem3/pull/17) — compute the `0x2` proper-pair flag from the emitted alignment.
-
-### SIMD scoring-kernel fixes (per-arch `score2` → `XS`/MAPQ; converge toward scalar)
-
-- [#21](https://github.com/fg-labs/bwa-mem3/pull/21) — apply NEON score2-scan fixes to the AVX-512BW kernel.
-- [#26](https://github.com/fg-labs/bwa-mem3/pull/26) — gate AVX2 arch dispatch on `!__AVX512BW__`.
-- [#28](https://github.com/fg-labs/bwa-mem3/pull/28) — consolidate AVX2 score2 plateaus to match scalar `ksw_align2`.
-- [#29](https://github.com/fg-labs/bwa-mem3/pull/29) — port score2 plateau consolidation to NEON + AVX-512BW.
-- [#30](https://github.com/fg-labs/bwa-mem3/pull/30) — port the score2 plateau fix to `kswv_512_16` (AVX-512BW 16-bit).
-- [#31](https://github.com/fg-labs/bwa-mem3/pull/31) — rewrite `kswv_neon_16` as a real SIMD kernel with correct table + score2.
-
-### Seeding correctness fixes (can change alignments where the old bug triggered)
-
-- [#55](https://github.com/fg-labs/bwa-mem3/pull/55) — size SMEM buffers from observed max read length (fixes >151 bp corruption).
-- [#100](https://github.com/fg-labs/bwa-mem3/pull/100) — track `enc_qdb` byte capacity separately from `wsize_mem`.
-- [#73](https://github.com/fg-labs/bwa-mem3/pull/73) — parenthesize `SA_COMPX_MASK` precedence in the sampled-SA prefetch (prefetch hint; no semantic change).
-
-### Opt-in MAPQ rescoring (default OFF)
-
-- [#56](https://github.com/fg-labs/bwa-mem3/pull/56) — `--supp-rep-hard-cap` opt-in supplementary MAPQ rescoring.
-- [#101](https://github.com/fg-labs/bwa-mem3/pull/101) — propagate SMEM SA-count to seed `n_hits` so `--supp-rep-hard-cap` actually fires.
-- [#118](https://github.com/fg-labs/bwa-mem3/pull/118) — regression test for `--supp-rep-hard-cap` on a repetitive workload.
-
-### Tie-break determinism
-
-- [#123](https://github.com/fg-labs/bwa-mem3/pull/123) — deterministic tie resolution (open at the time this page shipped; this docs page stacks on it).
-
-### New modes / output formats (separate features)
-
-- [#13](https://github.com/fg-labs/bwa-mem3/pull/13) — `--meth` bisulfite alignment mode.
-- [#90](https://github.com/fg-labs/bwa-mem3/pull/90) — Bismark-compatible `XR`/`XG`/`XM` meth tags (also listed under additive tags).
-- [#12](https://github.com/fg-labs/bwa-mem3/pull/12) — `--bam[=LEVEL]` direct BAM output.
-- [#65](https://github.com/fg-labs/bwa-mem3/pull/65) — `bwa-mem3 shm` shared-memory index.
-- [#67](https://github.com/fg-labs/bwa-mem3/pull/67) — `shm --meth` symmetry.
-- [#82](https://github.com/fg-labs/bwa-mem3/pull/82) — serialize `/bwactl` RMW with a POSIX named semaphore.
-- [#83](https://github.com/fg-labs/bwa-mem3/pull/83) — single-binary in-process SIMD dispatch (replaces the multi-binary `execv` launcher).
-- [#57](https://github.com/fg-labs/bwa-mem3/pull/57) — libsais-based memory-bounded FM-index construction.
-
-### Core-kernel performance (intended output-neutral; smoke evidence consistent)
-
-- [#33](https://github.com/fg-labs/bwa-mem3/pull/33) — lockstep SMEM batching across N reads.
-- [#49](https://github.com/fg-labs/bwa-mem3/pull/49) — batch `-H` header ingestion (fixes O(n²) header read).
-- [#58](https://github.com/fg-labs/bwa-mem3/pull/58) — consolidated mapping speedups (ksw2, SMEM, SAL, SAM).
-- [#70](https://github.com/fg-labs/bwa-mem3/pull/70) — per-strip L1 prefetches across all u8/16 kswv kernels.
-- [#75](https://github.com/fg-labs/bwa-mem3/pull/75) — bump `SMEM_LOCKSTEP_N` from 8 to 16.
-- [#76](https://github.com/fg-labs/bwa-mem3/pull/76) — convert `mem_matesw_batch_{pre,post}` to `bns_fetch_seq_v2`.
-- [#77](https://github.com/fg-labs/bwa-mem3/pull/77) — closed-form HIT for `total_mis == 0` in the ungapped path.
-- [#78](https://github.com/fg-labs/bwa-mem3/pull/78) — replace per-call malloc with an on-stack buffer for small `n` in ksort.
-- [#80](https://github.com/fg-labs/bwa-mem3/pull/80) — skip wasted zero-init on libsais unpack + SA buffers.
-- [#86](https://github.com/fg-labs/bwa-mem3/pull/86) — cap AVX-512BW autovec at 256-bit; `bwa_shm` `/dev/shm` preflight.
-- [#88](https://github.com/fg-labs/bwa-mem3/pull/88) — inline `backwardExt` to recover a gcc 12+ wall-clock regression.
-
-### Crash / UB / safety fixes (output-neutral except where UB previously corrupted results)
-
-- [#22](https://github.com/fg-labs/bwa-mem3/pull/22) — zero `bseq1_t` in `kseq2bseq1` (crash on realloc growth).
-- [#51](https://github.com/fg-labs/bwa-mem3/pull/51) — guard the post-loop `rowMax` store on `nrow==0` batches.
-- [#74](https://github.com/fg-labs/bwa-mem3/pull/74) — bound the `.alt` parse buffer to prevent stack overflow.
-- [#85](https://github.com/fg-labs/bwa-mem3/pull/85) — copy the ref slice before `ksw_align2` to avoid SIGSEGV on a shm-backed `ref_string`.
-- [#117](https://github.com/fg-labs/bwa-mem3/pull/117) — free lockstep SMEM caches at thread exit.
-
-### Build / CI / docs / chore (no output impact)
-
-These do not change alignment output. Each is linked for completeness.
-
-- Build / Make / link: [#16](https://github.com/fg-labs/bwa-mem3/pull/16), [#50](https://github.com/fg-labs/bwa-mem3/pull/50), [#52](https://github.com/fg-labs/bwa-mem3/pull/52), [#53](https://github.com/fg-labs/bwa-mem3/pull/53), [#59](https://github.com/fg-labs/bwa-mem3/pull/59), [#84](https://github.com/fg-labs/bwa-mem3/pull/84), [#105](https://github.com/fg-labs/bwa-mem3/pull/105), [#108](https://github.com/fg-labs/bwa-mem3/pull/108), [#122](https://github.com/fg-labs/bwa-mem3/pull/122).
-- CLI / API plumbing (no default-output change): [#5](https://github.com/fg-labs/bwa-mem3/pull/5), [#6](https://github.com/fg-labs/bwa-mem3/pull/6), [#7](https://github.com/fg-labs/bwa-mem3/pull/7), [#8](https://github.com/fg-labs/bwa-mem3/pull/8), [#9](https://github.com/fg-labs/bwa-mem3/pull/9), [#54](https://github.com/fg-labs/bwa-mem3/pull/54), [#60](https://github.com/fg-labs/bwa-mem3/pull/60), [#81](https://github.com/fg-labs/bwa-mem3/pull/81).
-- Allocator: [#19](https://github.com/fg-labs/bwa-mem3/pull/19) — vendored mimalloc (output-neutral; can change crash/no-crash behavior on the buggy paths above).
-- CI / test harness / fixtures: [#1](https://github.com/fg-labs/bwa-mem3/pull/1), [#2](https://github.com/fg-labs/bwa-mem3/pull/2), [#4](https://github.com/fg-labs/bwa-mem3/pull/4), [#10](https://github.com/fg-labs/bwa-mem3/pull/10), [#18](https://github.com/fg-labs/bwa-mem3/pull/18), [#20](https://github.com/fg-labs/bwa-mem3/pull/20), [#23](https://github.com/fg-labs/bwa-mem3/pull/23), [#24](https://github.com/fg-labs/bwa-mem3/pull/24), [#34](https://github.com/fg-labs/bwa-mem3/pull/34), [#63](https://github.com/fg-labs/bwa-mem3/pull/63), [#68](https://github.com/fg-labs/bwa-mem3/pull/68), [#72](https://github.com/fg-labs/bwa-mem3/pull/72), [#89](https://github.com/fg-labs/bwa-mem3/pull/89), [#102](https://github.com/fg-labs/bwa-mem3/pull/102), [#111](https://github.com/fg-labs/bwa-mem3/pull/111), [#112](https://github.com/fg-labs/bwa-mem3/pull/112), [#113](https://github.com/fg-labs/bwa-mem3/pull/113), [#114](https://github.com/fg-labs/bwa-mem3/pull/114), [#115](https://github.com/fg-labs/bwa-mem3/pull/115).
-- Arch support / SIMD floor precheck: [#1](https://github.com/fg-labs/bwa-mem3/pull/1) (arm64 build, also above), [#95](https://github.com/fg-labs/bwa-mem3/pull/95).
-- Docs / release / metadata: [#3](https://github.com/fg-labs/bwa-mem3/pull/3), [#71](https://github.com/fg-labs/bwa-mem3/pull/71), [#79](https://github.com/fg-labs/bwa-mem3/pull/79), [#93](https://github.com/fg-labs/bwa-mem3/pull/93), [#94](https://github.com/fg-labs/bwa-mem3/pull/94), [#96](https://github.com/fg-labs/bwa-mem3/pull/96), [#97](https://github.com/fg-labs/bwa-mem3/pull/97), [#98](https://github.com/fg-labs/bwa-mem3/pull/98), [#106](https://github.com/fg-labs/bwa-mem3/pull/106), [#107](https://github.com/fg-labs/bwa-mem3/pull/107).
+Every fork-carried change is listed — with its class and upstream bwa-mem2
+disposition — in the [PR catalog](../reference/pr-catalog.md). The declared
+divergence catalog above calls out the entries that actually affect output.
 
 ---
 
@@ -159,4 +80,4 @@ These do not change alignment output. Each is linked for completeness.
 [Correctness fixes](correctness.md) ·
 [Performance improvements](performance.md) ·
 [Features](features.md) ·
-[Upstream PR status](upstream-prs.md)
+[PR catalog](../reference/pr-catalog.md)
