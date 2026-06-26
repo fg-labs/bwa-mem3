@@ -68,26 +68,13 @@ and [Best Practices: multi-sample workflows](../best-practices/multi-sample.md).
 
 ## Memory use
 
-Peak RAM during alignment is the resident index plus a per-batch working set.
-The index dominates: for hg38 the resident baseline is roughly 15 GB per
-`bwa-mem3 mem` process (~22 GB under `--meth`), fixed regardless of `-t` or `-K`. The per-batch working
-set is added on top and scales with the *effective* batch size, which by default
-is `chunk_size × n_threads` (so `-t 16` at the default `chunk_size` buffers
-160 M bases per batch, not 10 M). On memory-constrained hosts, or for data with
-wide mate-rescue windows such as Hi-C, this per-batch term is what tips a run
-into OOM — see
+Peak RAM is the resident index (~15 GB for hg38, ~22 GB under `--meth`) plus a
+per-batch working set that scales with the *effective* batch size
+(`chunk_size × n_threads`), and is fixed with respect to `-t`. The per-batch term
+is what tips memory-constrained or wide-window (e.g. Hi-C) runs into OOM, and
+`bwa-mem3 shm` lets concurrent processes share one physical copy of the index.
+For the full budgeting model and the `-K`/`-t` interaction, see
 [Memory budgeting and data-type tuning](memory-and-data-types.md).
-
-With `bwa-mem3 shm`, the index is mapped from a shared-memory segment, so
-multiple concurrent `mem` processes share the same physical pages. The OS
-deduplicates the pages; total RAM use is approximately one index, not one per
-process.
-
-> **Tip — Use shm for repeated runs on the same machine**
->
-> If you run more than a few samples on the same machine without rebooting,
-> `bwa-mem3 shm` pays off immediately. The index is read from disk once and
-> stays in RAM for all subsequent `mem` invocations.
 
 ## IO recommendations
 
