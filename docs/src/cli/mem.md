@@ -219,20 +219,11 @@ very short, low-confidence chains.
 
 Off by default (`0`) → output byte-identical to baseline. When `INT > 0`, seeds
 shorter than `INT` bp are dropped before banded Smith-Waterman, so their
-extension never runs. Short seeds carry the large majority of extension work but
-rarely change the final alignment (long seeds resolve via the ungapped
-fast-path), so skipping them trims alignment CPU — roughly 10–20 % single-thread
-on Illumina WGS, more on data with many short seeds.
-
-`30` is the recommended value: on real HG002 WGS it gives ~20 % lower alignment
-CPU while any accuracy change is confined to reads that were already
-low-confidence (heavily soft-clipped, high edit distance, or multi-mapping) —
-confidently, uniquely mapped reads are unaffected. Larger values (40–50) are
-also accuracy-safe on known-clean data but trade accuracy on divergent data.
-Keep it low or off for libraries with very high per-base error (degraded
-chemistry, cross-species); indels and structural variants are *not* a
-contraindication. See
-[Features — short-seed extension filter](../whats-different/features.md#--min-ext-len-short-seed-extension-filter).
+extension never runs (~10–20 % less alignment CPU). `30` is the recommended,
+accuracy-safe value for standard-error reads; keep it low or off for very
+high-error libraries. For the benchmarks, recommended value, and the high-error
+contraindication, see
+[Settings profiles → `--min-ext-len 30`](../best-practices/settings-profiles.md#short-seed-extension---min-ext-len-30).
 
 #### `-h INT[,INT]` — secondary alignment reporting
 
@@ -332,20 +323,18 @@ extension continues after a score drop.
 #### `-r FLOAT` — re-seeding factor
 
 Seeds longer than `-k * FLOAT` are re-seeded internally to find sub-seeds (bwa-mem's
-second seeding round). Lowering this produces more seeds and higher sensitivity at
-greater cost; **raising it** (e.g. `-r 10`) suppresses the round, which — combined with
-`-y 0` — roughly halves alignment CPU on clean, low-divergence data. Round 2 is genuine
-split-read/divergence sensitivity, so it costs accuracy on divergent libraries; see
-[Settings profiles](../best-practices/settings-profiles.md#third-round-seeding--y-0).
+second seeding round). Lowering produces more seeds / higher sensitivity at greater
+cost; raising (e.g. `-r 10`) suppresses the round. Round 2 is genuine
+split-read/divergence sensitivity, so only suppress it on known-clean data — see
+[Settings profiles → `-y 0`](../best-practices/settings-profiles.md#third-round-seeding--y-0).
 
 #### `-y INT` — third-round seed occurrence threshold
 
 bwa-mem's third seeding round: for each read position, grow an exact match until it
 occurs fewer than `INT` times in the genome (default 20), then emit it as a seed — a
-repeat-region safety net. **`-y 0` disables the round entirely**, which benchmarks
-F1-near-neutral across all tested regimes (within ±0.02; better on repeat-enriched and
-divergent data) while cutting ~11–30 % of alignment CPU. Recommended for the speed/accuracy
-profile — see
+repeat-region safety net. **`-y 0` disables the round**, cutting ~11–30 % of alignment
+CPU with F1-near-neutral accuracy; it is part of the recommended profile. For the
+regime sweep and rationale, see
 [Settings profiles → `-y 0`](../best-practices/settings-profiles.md#third-round-seeding--y-0).
 
 #### `--legacy-reader` — use the legacy input reader
