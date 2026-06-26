@@ -65,23 +65,9 @@ bwa-mem3 mem -t 16 \
 The value is a tab-delimited string following BWA conventions. Every aligned record receives an
 `RG:Z:` tag matching the `ID` field of the read-group header.
 
-## Output tags
-
-bwa-mem3 emits standard SAM tags plus the `HN:i:` tag introduced by the fork:
-
-| Tag | Type | Description |
-|-----|------|-------------|
-| `NM:i` | int | Edit distance to the reference |
-| `MD:Z` | string | Mismatch and deletion string |
-| `AS:i` | int | Alignment score |
-| `XS:i` | int | Suboptimal alignment score |
-| `SA:Z` | string | Supplementary alignment chain |
-| `MC:Z` | string | Mate CIGAR (paired-end) |
-| `MQ:i` | int | Mate mapping quality (paired-end) |
-| `HN:i` | int | Total number of primary alignments (reported and suppressed) found for the read, before the `-h` supplementary cap is applied |
-
-For the methylation-specific tags (`XR:Z`, `XG:Z`, `XM:Z`), see
-[Methylation Reference — SAM tags](../methylation/tags.md).
+bwa-mem3 emits the standard SAM tags plus the fork's `HN:i` tag; for the full
+list see [Output: SAM/BAM, headers, tags](../user-guide/output.md) (and
+[Methylation SAM tags](../methylation/tags.md) under `--meth`).
 
 ---
 

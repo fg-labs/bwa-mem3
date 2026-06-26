@@ -84,27 +84,12 @@ tested host.
 
 ## Symbol mangling per tier
 
-`src/kernel_dispatch.h` is a preprocessor-only header that renames
-kernel-exported symbols according to a `KERNEL_VARIANT=_<tier>` macro.
-Each kernel TU is compiled `N` times with a different
-`-DKERNEL_VARIANT=_<tier>` plus the matching `-m...` flags, producing
-per-tier mangled symbols that link cleanly into one binary without ODR
-collision.
-
-`bandedSWA.h` adds an abstract `IBandedPairWiseSW` interface;
-`BandedPairWiseSW` is `final` and inherits from it. `kswv.h` mirrors
-this with `Ikswv`. The dispatcher TU sees only the interface; the
-factory implementations in each per-tier kernel TU see the full
-concrete class layout via the rename. This separation sidesteps the
-ODR risk that would arise if the dispatcher TU and the factory TUs
-both included the full class definition.
-
-Internal aux helpers in `ksw.cpp` (`ksw_qinit`, `ksw_u8`, `ksw_i16`)
-are forced `static` so the per-tier compiles don't multi-define them.
-The SAM seq/qual encoder previously inlined in `bwamem.cpp` was lifted
-into a free-standing `src/sam_encode.{h,cpp}` translation unit so it
-participates in per-tier compilation and benefits from the
-auto-vectorizer's tier-specific `vmovdqu` / VEX / EVEX encoding wins.
+The compile-time machinery — the `KERNEL_VARIANT` symbol-rename scheme, the
+`IBandedPairWiseSW` / `Ikswv` interface split that keeps the dispatcher TU free
+of class-layout knowledge, and the ODR-collision avoidance — is documented once
+in [SIMD dispatch architecture → Per-tier compilation and symbol mangling](simd-dispatch.md#per-tier-compilation-and-symbol-mangling).
+This page covers the *runtime* side: tier selection, host-floor enforcement, and
+distribution.
 
 ## Environment overrides
 
