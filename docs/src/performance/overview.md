@@ -154,6 +154,6 @@ Alignment throughput is sensitive to read length, error rate, reference size, th
 **See also:**
 [SIMD dispatch matrix](simd-dispatch.md) ·
 [PGO build](pgo.md) ·
-[Tuning checklist](tuning.md) ·
+[Optimization checklist](../best-practices/optimization-checklist.md) ·
 [What's Different — Performance improvements](../whats-different/performance.md) ·
 [bwa-mem3-bench](../related-projects/bwa-mem3-bench.md)

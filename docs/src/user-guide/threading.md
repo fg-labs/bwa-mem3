@@ -106,4 +106,4 @@ process.
 [Memory allocator (mimalloc)](allocator.md) ·
 [Quick start: shared-memory index](../getting-started/quick-shm.md) ·
 [Best Practices: multi-sample workflows](../best-practices/multi-sample.md) ·
-[Performance: tuning checklist](../performance/tuning.md)
+[Best Practices: optimization checklist](../best-practices/optimization-checklist.md)

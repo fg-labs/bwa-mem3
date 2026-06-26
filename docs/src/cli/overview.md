@@ -44,4 +44,4 @@ mimalloc is compiled in, the mimalloc version.
 [User Guide — Indexing the reference](../user-guide/indexing.md) ·
 [Getting Started — Quick start: align paired-end FASTQs](../getting-started/quick-align.md) ·
 [Getting Started — Quick start: shared-memory index](../getting-started/quick-shm.md) ·
-[Performance — Tuning checklist](../performance/tuning.md)
+[Best Practices — Optimization checklist](../best-practices/optimization-checklist.md)

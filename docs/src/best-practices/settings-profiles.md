@@ -248,7 +248,7 @@ universal recommendation. It has no effect on primary-alignment MAPQ or on non-S
 ---
 
 **See also:**
-[Tuning checklist](../performance/tuning.md) ·
+[Optimization checklist](optimization-checklist.md) ·
 [Performance Overview](../performance/overview.md) ·
 [Equivalence with bwa-mem2](../whats-different/equivalence.md) ·
 [CLI Reference — `mem`](../cli/mem.md)

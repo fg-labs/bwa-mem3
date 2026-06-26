@@ -89,4 +89,4 @@ work. See [Features](../whats-different/features.md) and
 [Features: mimalloc](../whats-different/features.md) ·
 [Getting Started: installation](../getting-started/installation.md) ·
 [Developer Guide: building from source](../developer-guide/building.md) ·
-[Performance: tuning checklist](../performance/tuning.md)
+[Best Practices: optimization checklist](../best-practices/optimization-checklist.md)

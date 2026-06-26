@@ -25,10 +25,10 @@
 - [Overview](performance/overview.md)
 - [SIMD dispatch matrix](performance/simd-dispatch.md)
 - [PGO build](performance/pgo.md)
-- [Tuning checklist](performance/tuning.md)
 
 # Best Practices
 
+- [Optimization checklist](best-practices/optimization-checklist.md)
 - [Settings profiles: bwa drop-in vs recommended](best-practices/settings-profiles.md)
 - [Build](best-practices/build.md)
 - [Output format](best-practices/output-format.md)

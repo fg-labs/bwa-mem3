@@ -126,5 +126,5 @@ The Best Practices section covers these topics in depth:
 [Aligning short reads (mem)](aligning.md) ·
 [Threading and resource use](threading.md) ·
 [Memory allocator (mimalloc)](allocator.md) ·
-[Performance: tuning checklist](../performance/tuning.md) ·
+[Best Practices: optimization checklist](../best-practices/optimization-checklist.md) ·
 [Best Practices: anti-patterns](../best-practices/anti-patterns.md)

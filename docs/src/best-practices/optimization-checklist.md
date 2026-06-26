@@ -1,4 +1,4 @@
-# Tuning Checklist
+# Optimization checklist
 
 The items below are ordered by expected impact for most workloads. Work through them in sequence; there is little point optimizing output format before confirming you are running the right binary for your CPU.
 
@@ -21,7 +21,7 @@ get a startup banner on stderr at the start of a `mem` run.
 On ARM / Apple Silicon, the binary has one NEON tier; `bwa-mem3 version`
 reports `SIMD runtime: neon`.
 
-See [SIMD dispatch matrix](simd-dispatch.md) for the full dispatch
+See [SIMD dispatch matrix](../performance/simd-dispatch.md) for the full dispatch
 logic and the minimum CPU requirements for each tier.
 
 > **Tip — Single-arch deployments**
@@ -42,7 +42,7 @@ make pgo-generate PGO_ARCH=avx2
 make pgo-use PGO_ARCH=avx2
 ```
 
-See [PGO build](pgo.md) for the full workflow, including multi-arch and profile portability notes.
+See [PGO build](../performance/pgo.md) for the full workflow, including multi-arch and profile portability notes.
 
 ## 3. Use shared memory for many small samples
 
@@ -63,7 +63,7 @@ bwa-mem3 shm -d
 >
 > `bwa-mem3 shm` does not detect whether the on-disk index has changed after the segment was loaded. Always run `bwa-mem3 shm -d` before re-indexing a reference and re-loading with `bwa-mem3 shm`. Failing to do so results in alignments against a stale index.
 
-See [Getting Started — Shared-memory index](../getting-started/quick-shm.md) and [Best Practices — Multi-sample workflows](../best-practices/multi-sample.md) for complete workflows.
+See [Getting Started — Shared-memory index](../getting-started/quick-shm.md) and [Best Practices — Multi-sample workflows](multi-sample.md) for complete workflows.
 
 ## 4. Emit BAM directly
 
@@ -75,9 +75,9 @@ bwa-mem3 mem --bam=0 -t 16 ref.fa R1.fq.gz R2.fq.gz \
 samtools index out.bam
 ```
 
-The `--bam` flag (without `=0`) produces BGZF-compressed BAM. This is useful when writing directly to disk without a downstream piped tool.
+A compression level — `--bam=6`, say — produces BGZF-compressed BAM, useful when writing directly to disk without a downstream piped tool.
 
-See [Best Practices — Output format](../best-practices/output-format.md) for guidance on when SAM is still appropriate.
+See [Best Practices — Output format](output-format.md) for guidance on when SAM is still appropriate.
 
 ## 5. Pipe to a multi-threaded sorter
 
@@ -98,17 +98,17 @@ On a 16-core machine, allocating 12 threads to `mem` and 8 to `samtools sort` (w
 
 | Item | Action | Reference |
 |---|---|---|
-| Right SIMD tier for CPU | `bwa-mem3 version`; verify `SIMD runtime:` | [SIMD dispatch matrix](simd-dispatch.md) |
-| PGO for production | `pgo-generate` → train → `pgo-use` | [PGO build](pgo.md) |
+| Right SIMD tier for CPU | `bwa-mem3 version`; verify `SIMD runtime:` | [SIMD dispatch matrix](../performance/simd-dispatch.md) |
+| PGO for production | `pgo-generate` → train → `pgo-use` | [PGO build](../performance/pgo.md) |
 | Shared-memory index | `bwa-mem3 shm ref.fa` before batch runs | [Quick start: shm](../getting-started/quick-shm.md) |
-| Emit uncompressed BAM | `--bam=0` | [Best Practices — Output format](../best-practices/output-format.md) |
+| Emit uncompressed BAM | `--bam=0` | [Best Practices — Output format](output-format.md) |
 | Multi-threaded sort | `samtools sort -@` with appropriate thread split | [User Guide — Threading](../user-guide/threading.md) |
 
 ---
 
 **See also:**
-[Performance overview](overview.md) ·
-[SIMD dispatch matrix](simd-dispatch.md) ·
-[PGO build](pgo.md) ·
-[Best Practices — Build](../best-practices/build.md) ·
+[Performance overview](../performance/overview.md) ·
+[SIMD dispatch matrix](../performance/simd-dispatch.md) ·
+[PGO build](../performance/pgo.md) ·
+[Best Practices — Build](build.md) ·
 [User Guide — Threading and resource use](../user-guide/threading.md)
