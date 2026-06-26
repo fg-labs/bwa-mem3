@@ -15,13 +15,13 @@ primary alignment subcommand; nearly all bwa-mem3 usage flows through it.
 
 Paired-end alignment, 16 threads, SAM to stdout:
 
-```sh
+```bash
 bwa-mem3 mem -t 16 ref.fa R1.fq.gz R2.fq.gz > out.sam
 ```
 
 Paired-end alignment, emit uncompressed BAM, pipe directly to `samtools sort`:
 
-```sh
+```bash
 bwa-mem3 mem --bam -t 16 ref.fa R1.fq.gz R2.fq.gz \
   | samtools sort -@ 8 -o out.bam -
 samtools index out.bam
@@ -29,7 +29,7 @@ samtools index out.bam
 
 Paired-end methylation alignment with a read group header:
 
-```sh
+```bash
 bwa-mem3 mem --meth -t 16 \
   -R '@RG\tID:lib1\tSM:sample1\tPL:ILLUMINA' \
   ref.fa R1.fq.gz R2.fq.gz \
@@ -67,7 +67,7 @@ writing directly to final storage without a downstream sort step.
 Injects a `@RG` header line and tags every alignment with `RG:Z:<ID>`. The
 value is a tab-separated `@RG` line with literal `\t` escapes, for example:
 
-```sh
+```bash
 -R '@RG\tID:run1\tSM:HG001\tPL:ILLUMINA\tLB:lib1'
 ```
 

@@ -41,3 +41,12 @@ The `version` subcommand stays exit-0 so introspection still works on the same h
 ## Mixed-architecture fleets
 
 For AWS Batch and other heterogeneous compute environments where the same job may schedule onto x86_64 *or* arm64 hosts, see [Best Practices → Multi-architecture deployment](../best-practices/multi-arch-deployment.md).
+
+---
+
+**See also:**
+[Installation](installation.md) ·
+[Coming from bwa or bwa-mem2](migrating.md) ·
+[Quick start: align paired-end FASTQs](quick-align.md) ·
+[Performance → SIMD dispatch matrix](../performance/simd-dispatch.md) ·
+[Best Practices → Multi-architecture deployment](../best-practices/multi-arch-deployment.md)

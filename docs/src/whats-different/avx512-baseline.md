@@ -117,9 +117,10 @@ within-host only, so compare on the hardware you will deploy on. (An
 earlier bench-infrastructure regression here was traced to a toolchain
 difference, not avx512bw itself, and is resolved.)
 
-## See also
+---
 
-- [SIMD dispatch architecture](../developer-guide/simd-dispatch.md)
-  — how the runtime kernel dispatcher picks a tier
-- [Build & infrastructure](build-infra.md) — the broader build layout
-- [Architecture support](arch-support.md) — per-host SIMD coverage
+**See also:**
+[SIMD dispatch architecture](../developer-guide/simd-dispatch.md) ·
+[Build & infrastructure](build-infra.md) ·
+[Architecture support](arch-support.md) ·
+[Best Practices → Build](../best-practices/build.md)

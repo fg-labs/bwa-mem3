@@ -8,19 +8,19 @@ for `bwa-mem2 mem` and supports all standard bwa-mem flags.
 
 **Paired-end:**
 
-```sh
+```bash
 bwa-mem3 mem -t 16 ref.fa R1.fq.gz R2.fq.gz > out.sam
 ```
 
 **Single-end:**
 
-```sh
+```bash
 bwa-mem3 mem -t 16 ref.fa reads.fq.gz > out.sam
 ```
 
 **Pipe directly to samtools:**
 
-```sh
+```bash
 bwa-mem3 mem --bam=0 -t 16 ref.fa R1.fq.gz R2.fq.gz \
   | samtools sort -@ 8 -o out.bam -
 samtools index out.bam
@@ -58,7 +58,7 @@ string is embedded as an `RG:Z:` tag on every output record.
 > Pass `-R` with a literal `\t` between fields. Most shells require single quotes
 > or `$'...'` quoting to prevent interpretation of the backslash:
 >
-> ```sh
+> ```bash
 > bwa-mem3 mem -R $'@RG\tID:s1\tSM:sample1' -t 16 ref.fa R1.fq.gz R2.fq.gz
 > ```
 
@@ -85,7 +85,7 @@ Normal paired-end alignments should leave both at their defaults.
 
 ### SAM (default)
 
-```sh
+```bash
 bwa-mem3 mem -t 16 ref.fa R1.fq.gz R2.fq.gz > out.sam
 ```
 
@@ -94,7 +94,7 @@ tools that consume SAM.
 
 ### BAM (`--bam=0`)
 
-```sh
+```bash
 bwa-mem3 mem --bam=0 -t 16 ref.fa R1.fq.gz R2.fq.gz > out.bam
 ```
 

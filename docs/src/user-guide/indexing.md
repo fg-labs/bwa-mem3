@@ -6,7 +6,7 @@ built once and reused indefinitely.
 
 ## Basic indexing
 
-```sh
+```bash
 bwa-mem3 index ref.fa
 ```
 
@@ -42,7 +42,7 @@ expect roughly 11 GB total across all four files.
 > identical. Pass `--emit-unpacked-ref` to `index` if you need the file for an
 > external tool that still requires it (e.g. bwa-mem2):
 >
-> ```sh
+> ```bash
 > bwa-mem3 index --emit-unpacked-ref ref.fa   # also writes ref.fa.0123
 > ```
 >
@@ -50,7 +50,7 @@ expect roughly 11 GB total across all four files.
 
 ## Methylation index (`--meth`)
 
-```sh
+```bash
 bwa-mem3 index --meth ref.fa
 ```
 
@@ -105,7 +105,7 @@ Index files are written to the same directory as the input FASTA by default.
 The input path is taken verbatim as a prefix — you can pass an absolute path to
 write into a different directory:
 
-```sh
+```bash
 bwa-mem3 index /data/indexes/hg38/hg38.fa
 # writes hg38.fa.bwt.2bit.64, etc. into /data/indexes/hg38/
 ```
@@ -129,7 +129,7 @@ benchmark numbers.
 > If you have previously staged the index into shared memory with `bwa-mem3 shm`,
 > drop the segment first before re-indexing:
 >
-> ```sh
+> ```bash
 > bwa-mem3 shm -d
 > bwa-mem3 index ref.fa
 > ```

@@ -34,7 +34,7 @@ No extra flag is needed. When `bwa-mem3 mem` starts, it checks whether a matchin
 segment exists. If one does, it attaches automatically:
 
 ```bash
-bwa-mem3 mem -t 16 ref.fa r1.fq.gz r2.fq.gz > out.sam
+bwa-mem3 mem -t 16 ref.fa R1.fq.gz R2.fq.gz > out.sam
 ```
 
 ## Inspect and drop staged segments

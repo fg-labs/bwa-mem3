@@ -16,19 +16,19 @@ seed index — for bisulfite-seq alignment.
 
 Build a standard index using all available cores:
 
-```sh
+```bash
 bwa-mem3 index ref.fa
 ```
 
 Build a methylation-aware index (required before `bwa-mem3 mem --meth`):
 
-```sh
+```bash
 bwa-mem3 index --meth ref.fa
 ```
 
 Limit peak RAM to 16 GB and write scratch data to `/scratch`:
 
-```sh
+```bash
 bwa-mem3 index --max-memory 16G --tmp-dir /scratch ref.fa
 ```
 
@@ -40,7 +40,7 @@ By default, index files are written alongside `<in.fasta>` using the FASTA
 path as a prefix (e.g. `ref.fa.bwt.2bit.64`, `ref.fa.pac`, etc.). Use `-p`
 to write them to a different base path, such as a dedicated index directory:
 
-```sh
+```bash
 bwa-mem3 index -p /idx/hg38 ref.fa
 # writes /idx/hg38.bwt.2bit.64, /idx/hg38.pac, …
 # align with: bwa-mem3 mem /idx/hg38 R1.fq R2.fq
@@ -77,7 +77,7 @@ on hg38) is never read and is not built. Enable this flag only when an external
 consumer still requires the file — for example, sharing an index with
 [bwa-mem2](../related-projects/bwa-mem2.md), which loads `.0123` directly:
 
-```sh
+```bash
 bwa-mem3 index --emit-unpacked-ref ref.fa   # additionally writes ref.fa.0123
 ```
 

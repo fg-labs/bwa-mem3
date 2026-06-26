@@ -33,7 +33,7 @@ samples, load it into shared memory first (see [Quick start: shared-memory index
 ## Align paired-end reads
 
 ```bash
-bwa-mem3 mem -t 16 ref.fa r1.fq.gz r2.fq.gz > out.sam
+bwa-mem3 mem -t 16 ref.fa R1.fq.gz R2.fq.gz > out.sam
 ```
 
 `-t 16` sets the thread count to 16. bwa-mem3 scales well up to the number of physical CPU
@@ -46,7 +46,7 @@ The default output is SAM on stdout. To write BAM directly, add `--bam`
 BGZF-compressed BAM):
 
 ```bash
-bwa-mem3 mem --bam -t 16 ref.fa r1.fq.gz r2.fq.gz \
+bwa-mem3 mem --bam -t 16 ref.fa R1.fq.gz R2.fq.gz \
   | samtools sort -@ 8 -o out.bam -
 samtools index out.bam
 ```
@@ -65,7 +65,7 @@ For downstream tools that require a `@RG` header (most variant callers), pass `-
 ```bash
 bwa-mem3 mem -t 16 \
   -R '@RG\tID:sample1\tSM:sample1\tPL:ILLUMINA\tLB:lib1' \
-  ref.fa r1.fq.gz r2.fq.gz > out.sam
+  ref.fa R1.fq.gz R2.fq.gz > out.sam
 ```
 
 The value is a tab-delimited string following BWA conventions. Every aligned record receives an

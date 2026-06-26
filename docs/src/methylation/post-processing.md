@@ -116,7 +116,7 @@ and reproducibility.
 >
 > After alignment, confirm consolidation and provenance with:
 >
-> ```sh
+> ```bash
 > samtools view -H out.bam | grep -E '^@SQ|^@PG'
 > ```
 >

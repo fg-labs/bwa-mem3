@@ -94,7 +94,7 @@ make pgo-generate                              # builds bwa-mem3.pgo-instr (arm6
 make pgo-generate PGO_ARCH=avx2               # or a specific x86 target
 
 # Run your training workload with the instrumented binary
-./bwa-mem3.pgo-instr mem -t 16 ref.fa r1.fq.gz r2.fq.gz > /dev/null
+./bwa-mem3.pgo-instr mem -t 16 ref.fa R1.fq.gz R2.fq.gz > /dev/null
 
 # Phase 2: optimised binary
 make pgo-use                                   # builds bwa-mem3.pgo
@@ -129,7 +129,7 @@ Used when profiling CPU hotspots without I/O noise. The `-DDISABLE_OUTPUT` flag 
 ```bash
 make profile-build                             # builds bwa-mem3.profile (native)
 make profile-build PROFILE_ARCH=avx2          # explicit arch
-./bwa-mem3.profile mem -t 16 ref.fa r1.fq.gz r2.fq.gz
+./bwa-mem3.profile mem -t 16 ref.fa R1.fq.gz R2.fq.gz
 
 make profile-clean
 ```

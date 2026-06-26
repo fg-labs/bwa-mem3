@@ -31,7 +31,7 @@ differs, and where the two approaches diverge by design.
 
 ### bwameth.py pipeline (multi-step)
 
-```sh
+```bash
 # Step 1: build a single doubled (c2t) reference
 bwameth.py index ref.fa                # writes ref.fa.bwameth.c2t + FMI
 
@@ -43,7 +43,7 @@ samtools index out.bam
 
 ### bwa-mem3 --meth (single binary)
 
-```sh
+```bash
 # Step 1: build a dual index (original index + .meth seed index)
 bwa-mem3 index --meth ref.fa           # writes ref.fa.* AND ref.fa.meth.*
 

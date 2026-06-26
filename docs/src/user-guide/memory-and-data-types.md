@@ -123,7 +123,7 @@ common cause of OOM on Hi-C.
 
 The fix is to align Hi-C the way Hi-C pipelines expect, with `-5SP`:
 
-```sh
+```bash
 bwa-mem3 mem -5SP -t 16 --bam ref.fa hic_R1.fq.gz hic_R2.fq.gz \
   | samtools sort -n -@ 2 -o hic.namesorted.bam -
 ```

@@ -17,7 +17,7 @@ panels or amplicon sequencing — this removes the dominant I/O bottleneck.
 
 Stage a standard index, align two samples, then release the segment:
 
-```sh
+```bash
 bwa-mem3 shm ref.fa
 bwa-mem3 mem -t 16 ref.fa sample1_R1.fq sample1_R2.fq > sample1.sam
 bwa-mem3 mem -t 16 ref.fa sample2_R1.fq sample2_R2.fq > sample2.sam
@@ -26,7 +26,7 @@ bwa-mem3 shm -d
 
 Stage a methylation index and align:
 
-```sh
+```bash
 bwa-mem3 shm --meth ref.fa
 bwa-mem3 mem --meth -t 16 ref.fa R1.fq R2.fq | samtools sort -o out.bam -
 bwa-mem3 shm -d
@@ -34,7 +34,7 @@ bwa-mem3 shm -d
 
 List all currently staged segments:
 
-```sh
+```bash
 bwa-mem3 shm -l
 ```
 

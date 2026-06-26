@@ -86,7 +86,7 @@ Steps:
 
 ## Quick-start commands
 
-```sh
+```bash
 # Index once: builds the normal index at the bare prefix PLUS a .meth seed index.
 bwa-mem3 index --meth ref.fa
 

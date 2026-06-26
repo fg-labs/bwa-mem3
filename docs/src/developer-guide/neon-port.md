@@ -63,7 +63,7 @@ make arch=arm64
 
 # PGO build (recommended for production on Apple Silicon)
 make pgo-generate PGO_ARCH=arm64
-./bwa-mem3.pgo-instr mem -t 8 ref.fa r1.fq.gz r2.fq.gz > /dev/null
+./bwa-mem3.pgo-instr mem -t 8 ref.fa R1.fq.gz R2.fq.gz > /dev/null
 make pgo-use PGO_ARCH=arm64
 ```
 

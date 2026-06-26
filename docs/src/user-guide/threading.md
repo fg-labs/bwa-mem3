@@ -53,7 +53,7 @@ When running multiple `bwa-mem3 mem` processes on the same machine, divide
 threads so that the total does not exceed the physical core count. For example,
 on a 32-core machine running four concurrent samples:
 
-```sh
+```bash
 # Four parallel runs, 8 threads each
 for sample in a b c d; do
   bwa-mem3 mem --bam -t 8 ref.fa ${sample}_R1.fq.gz ${sample}_R2.fq.gz \

@@ -21,7 +21,7 @@ the same property.
 
 Confirm the installed version, SIMD floor, and resolved tier:
 
-```sh
+```bash
 ./bwa-mem3 version
 ```
 
