@@ -7,7 +7,7 @@ sample after the first.
 
 ## The problem: repeated index loads
 
-The bwa-mem3 FM-index for hg38 is approximately 28 GB on disk. Without shared
+The bwa-mem3 FM-index for hg38 is approximately 15 GB on disk. Without shared
 memory, `bwa-mem3 mem` reads the entire index from disk on every invocation.
 On a fast NVMe drive this takes 30–60 seconds; on a network-attached or
 spinning-disk filesystem it can take several minutes. For a batch of 100
@@ -16,7 +16,7 @@ samples, that adds hours of pure I/O overhead.
 ## Staging the index once with `bwa-mem3 shm`
 
 ```bash
-# Stage the index into shared memory (one-time cost, ~28 GB for hg38).
+# Stage the index into shared memory (one-time cost, ~15 GB for hg38).
 bwa-mem3 shm ref.fa
 
 # Align each sample. bwa-mem3 mem attaches automatically — no extra flag.

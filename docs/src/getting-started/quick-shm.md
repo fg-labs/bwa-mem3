@@ -1,6 +1,6 @@
 # Quick start: shared-memory index
 
-The bwa-mem3 FM-index for a genome like hg38 is approximately 28 GB. By default, every
+The bwa-mem3 FM-index for a genome like hg38 is approximately 15 GB. By default, every
 `bwa-mem3 mem` invocation reads the index from disk, which can take 30–60 seconds on a spinning
 disk and several seconds even on fast NVMe storage. For workloads that align many small samples
 in sequence on the same machine, this per-invocation overhead accumulates.
@@ -58,7 +58,7 @@ Shared-memory indexing is most beneficial when:
 - Aligning tens to hundreds of small samples (e.g. amplicon panels, targeted sequencing) where
   per-sample read time dominates the per-sample alignment time.
 - Running a batch pipeline on a single large machine where the index fits comfortably in RAM
-  (approximately 28 GB for hg38 with the standard index).
+  (approximately 15 GB for hg38 with the standard index).
 - The same reference is used for all samples in the batch; a new `shm` invocation is required
   for each distinct reference.
 
