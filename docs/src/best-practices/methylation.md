@@ -2,65 +2,22 @@
 
 `bwa-mem3 mem --meth` ships with scoring and filtering defaults aligned with the
 bwameth.py reference implementation (in the default `collapsed` scoring mode).
-This page describes what those defaults are, how the scoring mode changes them,
-when to keep them, and when to override them.
+This page is prescriptive: when to keep those defaults and when to override them.
+For *what* the flags are and *how* the scoring modes work, see the reference:
 
-## Choosing a scoring mode (`--meth-scoring`)
-
-`--meth` scores against the original 4-letter reference, so it offers two models:
-
-- **`collapsed` (default)** — C/T and G/A interchangeable; bwameth-compatible
-  **placement**; mismatch penalty `-B 2`. Use for methylation-only workflows.
-  It closely tracks bwameth placement but is **not** identical — re-validate if
-  you are pinned to a specific bwameth release (see the caveat below).
-- **`genomic` (opt-in)** — only the conversion direction is freed, so real
-  variants are penalized; truthful `NM`/`MD`; mismatch penalty `-B 4`. Use when
-  one BAM must serve both methylation and variant calling.
-
-> **Important — `collapsed` is a placement drop-in, not a drift-free clone**
->
-> Because `--meth` scores against the original 4-letter reference (not in
-> collapsed 3-letter space like bwameth.py), `collapsed` **approximates**
-> bwameth's placement rather than reproducing it exactly. Expect a small but
-> nonzero fraction of records to differ in `POS`, `CIGAR`, or `MAPQ` — on the
-> order of ~1% on typical WGBS/EM-seq, with true mapped-position changes on a
-> smaller subset. The 4-letter scoring path makes this **larger** than the older
-> 3-letter `--meth` releases. **If your pipeline is validated against a specific
-> bwameth release, treat `collapsed` as a new aligner version and re-validate
-> against your own bwameth output — do not assume placement equivalence.** For
-> strict byte-for-byte reproduction of a bwameth release, keep using bwameth.py
-> (see [bwameth.py drop-in mapping](../methylation/bwameth-mapping.md)).
-
-See [Methylation Reference → Flags](../methylation/flags.md#--meth-scoring-collapsedgenomic).
-
-## What `--meth` sets
-
-When `--meth` is passed, the following flags are applied automatically in addition
-to enabling seed projection and BAM post-processing. All are shared by both
-scoring modes **except the mismatch penalty `-B`, which is the mode's leniency
-gate**:
-
-| Flag | Value | Purpose |
-|------|-------|---------|
-| `-B` | `2` (`collapsed`) / `4` (`genomic`) | Mismatch penalty. `collapsed` lowers it to `2` (bwameth's value) so collapsed C/T-and-G/A matching is cheap; `genomic` keeps bwa's default `4` so real variants are penalized. This is the only `--meth`-default that depends on `--meth-scoring`. |
-| `-L` | `10` | Clipping penalty. Increased from the bwa default of 5 to discourage clipping of read ends that carry converted bases that look like mismatches. |
-| `-U` | `100` | Unpaired read penalty (paired-end). Higher than default; methylation libraries have well-defined insert sizes and anomalous pairing usually reflects a mapping artifact. Matches bwameth's `-U 100`. |
-| `-T` | `40` | Minimum alignment score threshold. Higher than default; raises the bar to report an alignment. |
-| `-M` | — | Mark shorter split hits as secondary (`-M`). |
-| `-C` | — | Append FASTA/FASTQ comment to output (carries the internal conversion metadata through the kernel). |
-
-`-CM` above is bwameth's shorthand; in bwa-mem3 these are the separate `-M` and
-`-C` flags. These defaults can all be overridden on the command line: `--meth`
-sets them first; any explicit flag that follows overrides the `--meth`-set value.
+- **Scoring modes (`collapsed` vs `genomic`) and the full `--meth` flag set** —
+  [Methylation Reference → Flags](../methylation/flags.md#--meth-scoring-collapsedgenomic).
+- **Placement compatibility with bwameth.py** (the default `collapsed` mode is a
+  placement drop-in, *not* byte-identical — ~1% of records differ in
+  `POS`/`CIGAR`/`MAPQ`, so **re-validate if you are pinned to a specific bwameth
+  release**) — [bwameth.py drop-in mapping](../methylation/bwameth-mapping.md).
 
 ## When to keep the defaults
 
 For standard whole-genome bisulfite sequencing (WGBS) workflows, the defaults
-are appropriate as-is. They were derived from the bwameth.py codebase and are
-expected by most downstream methylation calling tools. Keeping the defaults
-gives bwameth-compatible *placement* — close, but not identical (re-validate
-against your own bwameth output if you are pinned to a release; see the caveat
-above). Unless you have a specific reason to deviate, use:
+(`collapsed` scoring plus `-B 2 -L 10 -U 100 -T 40 -M -C`) are appropriate as-is.
+They were derived from the bwameth.py codebase and are expected by most
+downstream methylation callers. Unless you have a specific reason to deviate, use:
 
 ```bash
 bwa-mem3 mem --meth -t 16 ref.fa R1.fq.gz R2.fq.gz \
@@ -88,15 +45,11 @@ bwa-mem3 mem --meth --set-as-failed r -t 16 ref.fa R1.fq.gz R2.fq.gz \
   | samtools sort -@ 4 -o out.bam -
 ```
 
-**Chimera QC is opt-in** (matches Bismark default). bwameth.py applies a
-chimera heuristic that flags reads whose longest matching run
-(CIGAR `M`/`=`/`X`) is less than 44 % of the read length: `0x200` set,
-`0x2` cleared, MAPQ capped at 1. `bwa-mem3 --meth` does **not** apply
-this by default — the runtime posture matches Bismark, where no such
-heuristic exists.
-
-If your library is PBAT / scBS-Seq (where intra-fragment chimerism is
-common) or you want bwameth.py-equivalent flagging, pass `--chimera-qc`:
+**Chimera QC is opt-in** (off by default, matching Bismark). Leave it off for
+standard directional EM-seq / WGBS. Turn it on for PBAT / scBS-Seq libraries
+(where intra-fragment chimerism is common) or when you want bwameth.py-equivalent
+flagging — pass `--chimera-qc` (see [Flags](../methylation/flags.md#--chimera-qc)
+for the exact heuristic):
 
 ```bash
 bwa-mem3 mem --meth --chimera-qc -t 16 ref.fa R1.fq.gz R2.fq.gz \
@@ -112,21 +65,11 @@ bwa-mem3 mem --meth --chimera-qc -t 16 ref.fa R1.fq.gz R2.fq.gz \
 
 ## Downstream tool compatibility
 
-The `--meth` output BAM carries the Bismark tag set that downstream methylation
-tools expect, so it serves as a placement drop-in for the `bwameth.py` pipeline
-(in `collapsed` mode). Because scoring is computed against the original reference
-rather than in collapsed space, the placement is a close approximation, **not**
-byte-for-byte identical to bwameth output, and ~1% of records differ in
-`POS`/`CIGAR`/`MAPQ` (see the [scoring-mode caveat](#choosing-a-scoring-mode---meth-scoring)
-above). The following downstream tools have been used successfully with
-`bwa-mem3 --meth` output:
-
-- **`bismark_methylation_extractor`**, **methylKit `processBismarkAln`**,
-  **methtuple**, **DMRfinder**, **epialleleR** — read the Bismark `XR:Z`,
-  `XG:Z`, `XM:Z` tags directly from `--meth` output.
-- **MethylDackel** — reads `XG:Z` (and ignores the bwameth-convention `YD:Z:`
-  if present, which `--meth` no longer emits).
-- **biscuit per-read tools** — read `XG:Z`.
+The `--meth` output BAM carries the Bismark `XR:Z` / `XG:Z` / `XM:Z` tag set, so
+it feeds Bismark-aware callers directly — `bismark_methylation_extractor`,
+methylKit, methtuple, DMRfinder, epialleleR, MethylDackel, and biscuit per-read
+tools have all been used successfully. See [SAM tags](../methylation/tags.md) for
+the tag definitions and which tools read which tag.
 
 ---
 
