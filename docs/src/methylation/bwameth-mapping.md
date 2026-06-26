@@ -1,19 +1,31 @@
 # bwameth.py Drop-In Mapping
 
 `bwa-mem3 --meth` is designed so that, in its **default `collapsed` mode**, read
-*placement* matches the bwameth.py pipeline for the standard case, while emitting
-the Bismark tag set methylation callers expect. This page explains what is the
-same, what differs, and where the two approaches diverge by design.
+*placement* closely tracks the bwameth.py pipeline for the standard case (with a
+small, bounded divergence — see the callout below), while emitting the Bismark
+tag set methylation callers expect. This page explains what is the same, what
+differs, and where the two approaches diverge by design.
 
-> **Important — placement drop-in, not byte-identical**
+> **Important — placement drop-in, *not* byte-identical, and *not* drift-free**
 >
-> `collapsed` reproduces bwameth's **placement** (where reads map and their
-> primary/MAPQ behavior) because both treat C/T and G/A as interchangeable. It is
-> **not** a byte-for-byte reproduction: bwa-mem3 scores against the original
-> 4-letter reference rather than in collapsed space, so scores and some CIGARs can
-> differ at the margins, and the tag schema is Bismark (`XR`/`XG`/`XM`), not
-> bwameth (`YS`/`YC`/`YD`). The opt-in `genomic` mode diverges from bwameth on
-> purpose (it penalizes real variants).
+> `collapsed` **approximates** bwameth's placement (where reads map and their
+> primary/MAPQ behavior) because both treat C/T and G/A as interchangeable — but
+> it is **neither** a byte-for-byte reproduction **nor** drift-free. bwa-mem3
+> scores against the original 4-letter reference rather than in collapsed space,
+> so a small but nonzero fraction of records differ from bwameth.py in **`POS`**,
+> **`CIGAR`**, or **`MAPQ`** — on the order of ~1% of records on typical
+> WGBS/EM-seq, with true mapped-position (`POS`) changes affecting a smaller
+> subset (a few tenths of a percent). The 4-letter scoring path **widens** this
+> versus a pure collapsed-space aligner — and versus the older 3-letter `--meth`
+> releases — and the opt-in `genomic` mode diverges further on purpose (it
+> penalizes real variants). The tag schema is also Bismark (`XR`/`XG`/`XM`), not
+> bwameth (`YS`/`YC`/`YD`).
+>
+> **If you are pinned to a specific bwameth release** (e.g. a clinical pipeline
+> validated against a bwameth version), treat `collapsed` as a *new aligner* and
+> **re-validate against your own bwameth output** — do not assume placement
+> equivalence. The divergence is small and bounded, but it is real and it is
+> larger than the older 3-letter `--meth` path.
 
 ## Command comparison
 
@@ -73,12 +85,16 @@ pass. Output is uncompressed BAM (`wb0`) that `samtools sort` reads natively.
 ## What stays the same (collapsed mode)
 
 The output BAM carries the standard methylation tag set, flags, and SEQ
-representation. The `@PG` provenance line and the tag schema intentionally differ:
+representation, and read placement **closely tracks** bwameth at the standard
+case — but "stays the same" here means *functionally equivalent*, not
+*identical*: as the callout above notes, ~1% of records still differ in
+`POS`/`CIGAR`/`MAPQ`. The `@PG` provenance line and the tag schema intentionally
+differ:
 
 | Field | bwameth.py | bwa-mem3 --meth |
 |-------|-----------|-----------------|
 | `@SQ` headers | One per real chromosome | One per real chromosome |
-| Read placement (collapsed) | reference | Matches at the standard case |
+| Read placement (collapsed) | reference | Closely tracks at the standard case; ~1% of records differ in `POS`/`CIGAR`/`MAPQ` (re-validate if pinned to a bwameth release) |
 | Methylation aux tags | `YS:Z`, `YC:Z`, `YD:Z` | `XR:Z`, `XG:Z`, `XM:Z` (Bismark) |
 | `@PG` | `ID:bwameth` | `ID:bwa-mem3-meth` |
 | Chimera QC threshold | Longest M < 44% of read | Same (44%), opt-in via `--chimera-qc` |
