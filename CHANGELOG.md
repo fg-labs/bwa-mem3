@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.4.0](https://github.com/fg-labs/bwa-mem3/compare/v0.3.0...v0.4.0) (2026-06-27)
+
+
+### Features
+
+* **mem:** --min-ext-len opt-in filter to skip extension of short seeds ([#169](https://github.com/fg-labs/bwa-mem3/issues/169)) ([13db252](https://github.com/fg-labs/bwa-mem3/commit/13db252ad4c7c39eff18bd3674430aac51570346))
+* **meth:** native bisulfite (BS-seq) alignment via --meth (D3) ([#174](https://github.com/fg-labs/bwa-mem3/issues/174)) ([a0296b1](https://github.com/fg-labs/bwa-mem3/commit/a0296b1766f17aab85b720fef1cf7f3984735105))
+
+
+### Performance
+
+* **mem:** pac-fetch the reference from .pac instead of loading/building .0123 ([#177](https://github.com/fg-labs/bwa-mem3/issues/177)) ([9c4bbf2](https://github.com/fg-labs/bwa-mem3/commit/9c4bbf217d3cbf02143a2fbd9fb75329126d9010))
+* **meth:** batched (SIMD) asymmetric mate rescue (closes [#173](https://github.com/fg-labs/bwa-mem3/issues/173)) ([#175](https://github.com/fg-labs/bwa-mem3/issues/175)) ([f146a18](https://github.com/fg-labs/bwa-mem3/commit/f146a18a32232a6ea05b040b10917a464a2d264c))
+
+
+### Documentation
+
+* **book:** document the libdeflate build prerequisite (incl. AL2023) ([#172](https://github.com/fg-labs/bwa-mem3/issues/172)) ([c2b6ec7](https://github.com/fg-labs/bwa-mem3/commit/c2b6ec78bc8fadb1aa63f99aee4f90671f840e7d))
+* **book:** recommend -y 0 (drop 3rd-round seeding) as an opt-in speed knob ([#171](https://github.com/fg-labs/bwa-mem3/issues/171)) ([ca9ac1f](https://github.com/fg-labs/bwa-mem3/commit/ca9ac1f2289c200708193c3f6ebbe094f230d79d))
+* collapse the mdbook sidebar into nested, foldable sections ([#180](https://github.com/fg-labs/bwa-mem3/issues/180)) ([c6ac47b](https://github.com/fg-labs/bwa-mem3/commit/c6ac47b9ebc3146144377f4a56e689b3fdf11946))
+* deep mdbook cleanup — dedup, consolidate, and tighten ([#179](https://github.com/fg-labs/bwa-mem3/issues/179)) ([54d6d11](https://github.com/fg-labs/bwa-mem3/commit/54d6d1161c374d7eb7fcef0eaac7c1156fe0bfb4))
+* **meth:** disclose collapsed-mode placement drift vs bwameth.py ([#178](https://github.com/fg-labs/bwa-mem3/issues/178)) ([96f29e2](https://github.com/fg-labs/bwa-mem3/commit/96f29e257e9acd9072caa246b1589c8943babc26))
+* **settings-profiles:** note repeat-aggregating downstream caveat for -m 10 ([#168](https://github.com/fg-labs/bwa-mem3/issues/168)) ([38fd1ec](https://github.com/fg-labs/bwa-mem3/commit/38fd1ec9717e29cace9eac33bd643a7da001da4e))
+
 ## [0.3.0](https://github.com/fg-labs/bwa-mem3/compare/v0.2.2...v0.3.0) (2026-06-21)
 
 
