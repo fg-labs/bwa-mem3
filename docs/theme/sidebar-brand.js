@@ -199,12 +199,34 @@
         }
     }
 
+    // ── Whole-row fold for draft-chapter section headers ──────────────────────
+    // Section headers (Getting Started, User Guide, ...) are mdBook "draft
+    // chapters": non-link <span>s that fold their children. mdBook only wires
+    // its fold handler to the small ❱ arrow (a.chapter-fold-toggle), so by
+    // default clicking the header *text* does nothing. Delegate clicks at the
+    // document level (the TOC is injected asynchronously by mdBook's toc.js, so
+    // a stable ancestor is the reliable place to listen) and forward a click on
+    // anywhere in a draft header row to that existing toggle -- reusing mdBook's
+    // own fold logic and persistence rather than reimplementing it.
+    function enableDraftHeaderFold() {
+        document.addEventListener('click', function (e) {
+            // Real anchors (child page links, the ❱ arrow itself, brand links)
+            // handle their own clicks -- don't hijack or double-toggle them.
+            if (e.target.closest('a')) return;
+            var wrapper = e.target.closest('.chapter-link-wrapper');
+            if (!wrapper) return;
+            var toggle = wrapper.querySelector('a.chapter-fold-toggle');
+            if (toggle) toggle.click();
+        });
+    }
+
     // ── Init ──────────────────────────────────────────────────────────────────
     function init() {
         injectBrand();
         injectFooter();
         injectBreadcrumb();
         colorMenuTitle();
+        enableDraftHeaderFold();
     }
 
     if (document.readyState === 'loading') {
