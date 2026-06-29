@@ -1,17 +1,30 @@
 # Release process
 
-bwa-mem3 follows [semantic versioning](https://semver.org). Releases are driven by git tags. The version string is derived automatically from `git describe` and embedded in every binary at compile time.
+bwa-mem3 follows [semantic versioning](https://semver.org). Releases are automated with [release-please](https://github.com/googleapis/release-please): every push to `main` updates a standing "release PR" that bumps the version and regenerates the changelog from the [Conventional Commits](contributing.md#commit-message-conventions) history; merging that PR tags the release and publishes a GitHub Release. The version string is derived from `version.txt` and embedded in every binary at compile time.
 
 ## Version stamping
 
-The Makefile computes the version string at parse time:
+`version.txt` at the repo root is the **single source of truth** for the version. release-please rewrites it (and `.release-please-manifest.json`) in the release PR; nothing else should edit it by hand.
+
+The Makefile computes the build's version string from it at parse time:
 
 ```makefile
-FG_LABS_VERSION_FALLBACK := 0.2.0
-VERSION_STRING := $(shell git describe --tags --dirty 2>/dev/null || echo $(FG_LABS_VERSION_FALLBACK))
+# version.txt is the single source of truth; scripts/version.sh reads it
+# and appends an informational git-describe-style dev suffix.
+VERSION_STRING := $(shell scripts/version.sh)
 ```
 
-`git describe` produces a string such as `v0.1.0` (on a tag), `v0.1.0-3-gabcdef1` (three commits past the tag), or `v0.1.0-dirty` (uncommitted changes). If `git describe` fails — for example in a source tarball or a shallow clone without tag history — the build falls back to `FG_LABS_VERSION_FALLBACK`.
+[`scripts/version.sh`](https://github.com/fg-labs/bwa-mem3/blob/main/scripts/version.sh) reads the base version from `version.txt` and, when git is available, appends a dev suffix that surfaces how far the working tree is from the matching tag:
+
+| Working-tree state | Example string |
+|---|---|
+| Source tarball / shallow clone (no git) | `0.4.0` |
+| Clean and exactly at tag `v0.4.0` | `0.4.0` |
+| Clean, not at the tag | `0.4.0-3f7ab2e` |
+| Uncommitted changes at the tag | `0.4.0-dirty` |
+| Uncommitted changes, not at the tag | `0.4.0-3f7ab2e-dirty` |
+
+"At the tag" means HEAD is precisely the commit pointed to by tag `v<base>` (or `<base>`). Manifest drift — HEAD at a tag that disagrees with `version.txt` — is treated as "not at tag", so the `-<sha>` suffix surfaces the drift visibly rather than silently printing a wrong bare version.
 
 The string is written into `src/version.h` by the `src/version.h: FORCE` rule, which runs on every `make` invocation but only touches the file when the string changes. This minimises unnecessary recompilation of `src/main.o`.
 
@@ -20,19 +33,21 @@ The string is written into `src/version.h` by the `src/version.h: FORCE` rule, w
 - `bwa-mem3 version` output (stdout).
 - The `@PG VN:` field in every SAM/BAM file produced by `bwa-mem3 mem`.
 
+Note the version string has **no leading `v`** (it mirrors `version.txt`, e.g. `0.4.0`), even though the git tags do (`v0.4.0`).
+
 ### Verifying the version
 
 ```bash
 ./bwa-mem3 version
-# Example output on a tagged commit:
-# v0.1.0
+# Example output on a release tag:
+# 0.4.0
 # mimalloc 3.3.0        ← if USE_MIMALLOC=1
 ```
 
-On an untagged commit the string includes the commit distance and short SHA:
+On a commit past the tag the string carries the short SHA suffix:
 
 ```text
-v0.1.0-12-g3f7ab2e
+0.4.0-3f7ab2e
 ```
 
 ## Semver policy
@@ -85,8 +100,9 @@ breaking changes.
 
 ## Release-readiness checklist
 
-Run through this list on the commit you intend to tag, before any
-git-tag command. **Every item must pass.**
+Run through this list on the candidate `main` commit **before merging the
+release PR** (merging it is what tags and publishes the release — see
+[Cutting a release](#cutting-a-release)). **Every item must pass.**
 
 ### Build and test
 
@@ -124,10 +140,15 @@ git-tag command. **Every item must pass.**
 ### Docs
 
 - [ ] `make docs` builds cleanly with no mdbook warnings.
-- [ ] `NEWS.md` has a top-section entry for the new version with
-      Operational / packaging, Correctness, Performance, and
-      Methylation subheadings as applicable; every user-visible PR in
-      the release window is listed with its number.
+- [ ] The release notes are generated automatically by release-please
+      from the conventional-commit history, so the real check is
+      upstream: every user-visible PR in the release window has a
+      correct conventional-commit type, and any breaking change carries
+      a `!` / `BREAKING CHANGE:` marker so it lands in the `⚠ BREAKING
+      CHANGES` section (see
+      [Flagging breaking changes](contributing.md#flagging-breaking-changes)).
+      `NEWS.md` is **not** updated — it is frozen at 0.2.0; 0.3.0 and
+      later live only in `CHANGELOG.md` and the GitHub Releases page.
 - [ ] `docs/src/reference/pr-catalog.md` `FG-MAIN-TABLE` block has a row for
       every fork-carried PR landed since the previous tag, with its upstream
       disposition (see [Contributing](contributing.md#the-fg-main-table-rule)).
@@ -137,65 +158,63 @@ git-tag command. **Every item must pass.**
       `docs/src/performance/overview.md` against the bench's
       `regression.md` for the tagging SHA.
 
-## Tagging the release
+## Cutting a release
 
-Run these in order; each command depends on the previous one.
+Releases are not tagged by hand. The [`.github/workflows/release.yml`](https://github.com/fg-labs/bwa-mem3/blob/main/.github/workflows/release.yml) workflow runs release-please on every push to `main` and a tarball job on each published release.
 
-1. Pre-flight (confirms the readiness checklist):
+1. **release-please maintains a standing release PR.** After PRs land on
+   `main`, release-please opens (or updates) a PR titled
+   `chore(main): release X.Y.Z`. It computes the next version from the
+   conventional-commit history since the last tag, bumps `version.txt`
+   and `.release-please-manifest.json`, and prepends the generated
+   section to `CHANGELOG.md`. The bump level is driven entirely by the
+   commit types: `feat:` → minor, `fix:`/`perf:`/etc. → patch, and a
+   `!` / `BREAKING CHANGE:` marker forces the breaking bump (a minor
+   pre-1.0, since `bump-minor-pre-major` is set). If the proposed version
+   is wrong, the fix is upstream — correct the offending commit's type or
+   add a breaking marker (see
+   [Flagging breaking changes](contributing.md#flagging-breaking-changes)),
+   not the release PR.
 
-   ```bash
-   make clean && make
-   make test
-   make docs
-   ```
+2. **Review the release PR.** Confirm the proposed version matches the
+   change set per the [semver policy](#semver-policy), and that the
+   generated `CHANGELOG.md` reads correctly — in particular that any
+   breaking change appears under `⚠ BREAKING CHANGES`. Run the
+   [release-readiness checklist](#release-readiness-checklist) against the
+   PR's base commit.
 
-2. Confirm `NEWS.md` is current. The top entry header line must match
-   the tag you are about to create (e.g. `Release 0.2.0 (YYYY-MM-DD)`).
+3. **Merge the release PR.** This is the action that ships the release.
+   release-please creates the `vX.Y.Z` tag and a GitHub Release whose body
+   is the generated changelog section. Read the Docs activates a versioned
+   build at `/vX.Y.Z/` automatically once the tag appears.
 
-3. Tag the release commit. Prefer a signed tag (`-s`); fall back to an
-   annotated tag (`-a`) only when signing is unavailable:
+4. **The tarball job runs automatically** once the release is created. It
+   checks out the tag with submodules, verifies `version.txt` matches the
+   tag, builds the vendored `Source_code_including_submodules.tar.gz`
+   (all submodules bundled, no `.git/`), smoke-tests that it compiles and
+   reports the right version, uploads the asset plus its `.sha256`, and
+   appends a "For packagers" block (with the asset URL and sha256) to the
+   release body. Bioconda recipes pin against this asset.
 
-   ```bash
-   git tag -s v0.X.Y -m "Release v0.X.Y"
-   ```
-
-4. Push the tag to the `fg-labs` remote:
-
-   ```bash
-   git push fg-labs v0.X.Y
-   ```
-
-   Read the Docs activates a versioned build at `/v0.X.Y/` automatically
-   when the tag appears on the remote.
-
-5. Create a GitHub release from the tag via `gh`. The body should be
-   the matching `NEWS.md` section, no preamble:
-
-   ```bash
-   gh release create v0.X.Y --repo fg-labs/bwa-mem3 \
-     --title "bwa-mem3 v0.X.Y" \
-     --notes-file <(awk '/^Release / {p = ($0 ~ /^Release 0\.X\.Y /)} p' NEWS.md)
-   ```
-
-   Substitute `0.X.Y` with the exact version literal you are tagging,
-   including any pre-release suffix — e.g. for `v0.3.0-pre` use
-   `/^Release 0\.3\.0-pre /`. The trailing space in the inner pattern
-   anchors the match to a complete version token so that `0.3.0` does
-   not also match `Release 0.3.0-pre (...)`. The awk script prints
-   lines while `p` is true: it flips on at the matching `Release` line
-   and back off at the next `Release` line, which gives a clean
-   section without needing a trailing `sed '$d'`.
-
-> **Note — Tarball builds**
+> **Note — Manual rebuild of a tarball asset**
 >
-> Source tarballs created by GitHub (or `git archive`) do not include git history,
-> so `git describe` fails and the version falls back to `FG_LABS_VERSION_FALLBACK`.
-> For reproducible tarball builds, set `VERSION_STRING` explicitly on the command line:
-> `make VERSION_STRING=v0.X.Y`.
+> The tarball job can be re-run for an existing tag via the workflow's
+> `workflow_dispatch` input (e.g. to repair a missing asset), but `v0.2.0`
+> is rejected — its asset is pinned by sha256 in an open bioconda PR and
+> must not change.
+>
+> <hr>
+>
+> **Note — Tarball builds and the version string**
+>
+> A source tarball has no git history, so `scripts/version.sh` cannot append a
+> dev suffix — but it still reads the git-tracked `version.txt`, so a `make`
+> from the tarball prints the bare base version (e.g. `0.4.0`) with no further
+> action needed.
 
 ## Post-release verification
 
-After the tag is pushed and the GitHub release is published:
+After the release PR is merged and the GitHub release is published:
 
 - Wait ~5 minutes for Read the Docs to build the new version, then
   open `https://bwa-mem3.readthedocs.io/en/v0.X.Y/` and confirm:
@@ -205,18 +224,19 @@ After the tag is pushed and the GitHub release is published:
     `methylation/tags.md` all render with their mermaid diagrams and
     tables intact (these are the most diagram-heavy pages).
 - Pull the tag in a clean clone and verify `bwa-mem3 version`
-  reports the bare tag string (no `-N-gSHA` distance suffix):
+  reports the bare version string (no `-<sha>` dev suffix):
 
   ```bash
   git clone -b v0.X.Y --depth 1 https://github.com/fg-labs/bwa-mem3.git
   cd bwa-mem3 && make
   ./bwa-mem3 version | head -1
-  # expect: v0.X.Y
+  # expect: 0.X.Y   (no leading 'v'; mirrors version.txt)
   ```
 
 - If the docs build failed on RTD or the version string is wrong, do
-  not delete or move the tag. Tags are immutable in practice — open a
-  follow-up `v0.X.(Y+1)` patch release with the fix instead.
+  not delete or move the tag. Tags are immutable in practice — let
+  release-please open the next release PR with the fix (a follow-up
+  `0.X.(Y+1)` patch) instead.
 
 ## Branch and tag conventions
 
