@@ -45,6 +45,37 @@ Updated kswv
 WIP
 ```
 
+### Flagging breaking changes
+
+Releases are generated automatically by [release-please](https://github.com/googleapis/release-please) from the conventional-commit history (see [Release process](release.md)). A change that breaks a downstream consumer — see the [semver policy](release.md#semver-policy) for what qualifies — **must** be marked so the breaking-change notice lands in `CHANGELOG.md` and the GitHub release body. Describing the break only in the commit body is not enough: release-please does not read prose, so an unmarked break is silently filed under its plain type (e.g. a `perf:` commit lands under "Performance" with no warning) and downstream users never see it.
+
+Mark a break either way:
+
+- Append a `!` after the type/scope: `perf(index)!: stop building .0123 by default`, **and/or**
+- Add a `BREAKING CHANGE:` footer (the colon is required) describing the break and the migration path.
+
+```text
+perf(index)!: stop building the unpacked .0123 reference by default
+
+BREAKING CHANGE: `bwa-mem3 index` no longer writes `.0123`; `mem` reconstructs
+reference bases from `.pac` on demand. External tools that read `.0123` directly
+(e.g. sharing an index with bwa-mem2) must re-run with `index --emit-unpacked-ref`.
+```
+
+release-please then emits a `⚠ BREAKING CHANGES` section automatically. While the project is pre-1.0 this still bumps only the minor version (`bump-minor-pre-major` is set), matching the [semver policy](release.md#semver-policy)'s rule that a pre-1.0 break is allowed when it is called out clearly — the footer is how it gets called out.
+
+> **Note — Squash merges**
+>
+> The project [squash-merges single-commit PRs and rebase-merges multi-commit
+> PRs with a clean history](branches.md). For a **squash-merged** PR,
+> release-please reads only the squash-merge commit subject (which defaults to
+> the PR title), **not** the individual commit bodies — so put the `!` /
+> `BREAKING CHANGE:` marker on the PR title or the squash commit message itself,
+> because a marker buried in a sub-commit body is discarded at squash time. A
+> **rebase-merged** PR keeps its individual commits, so a marker in any sub-commit
+> message is preserved and detected; even so, prefer putting it on the PR title
+> as well so the convention is uniform regardless of how the PR is merged.
+
 ## Pull request workflow
 
 1. Push your branch to `fg-labs/bwa-mem3` (or your fork) and open a PR targeting `fg-labs/bwa-mem3 main`.
