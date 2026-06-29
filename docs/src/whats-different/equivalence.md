@@ -55,6 +55,16 @@ The following changes can move alignments, scores, or MAPQ relative to upstream,
 - **Opt-in MAPQ rescoring ([#56](https://github.com/fg-labs/bwa-mem3/pull/56), [#101](https://github.com/fg-labs/bwa-mem3/pull/101), [#118](https://github.com/fg-labs/bwa-mem3/pull/118), default-off).** `--supp-rep-hard-cap INT` forces MAPQ=0 on supplementary alignments anchored in repetitive seeds. With no flag the output is unchanged; [#101](https://github.com/fg-labs/bwa-mem3/pull/101) makes the flag actually take effect (it shipped as a silent no-op before), and [#118](https://github.com/fg-labs/bwa-mem3/pull/118) is its regression test. See [Features → `--supp-rep-hard-cap`](features.md).
 - **Tie-break determinism ([#123](https://github.com/fg-labs/bwa-mem3/pull/123)).** Makes secondary-alignment ordering deterministic across runs; can reorder equal-scoring ties relative to upstream's order.
 
+(The resolve→order→chain seeding refactor that backs `--seed-order` is byte-identical in its default `off` mode; it is described in the dedicated section below rather than listed here, since only its non-`off` modes are divergent.)
+
+### Seed ordering (`--seed-order`, opt-in)
+
+`--seed-order off` (the default) preserves byte-identical output. The internal resolve→order→chain refactor that enables it was verified to be bit-for-bit identical to the previous code path across single-end, paired-end, and threaded runs.
+
+`--seed-order local-longest` (and the unadvertised advanced modes `global-longest`, `absorb-count`, `most-absorb`) are **opt-in** and are **not byte-identical**. They reorder each read's SA-resolved seeds before chaining so that the longest seeds anchor chains first; contained shorter seeds are then absorbed rather than extended. The output shift is non-trivial: secondary alignments, `XA:Z:`, `XS:i`, and `HN:i` can all change, and a small number of primary alignments may shift as well.
+
+Accuracy on an easy simulated profile (holodeck, ~94.4 % F1) is flat relative to `off`. Hard-data F1 validation on divergent/indel-rich reads and GIAB benchmarks is **not yet complete**. Because the accuracy gate is not fully passed, all non-`off` modes remain opt-in only; the default stays `off`. See [Optimization checklist → Reorder seeds longest-first](../best-practices/optimization-checklist.md#6-reorder-seeds-longest-first---seed-order-local-longest) for usage guidance.
+
 ## Declared divergence catalog
 
 The divergences described above are tracked as a structured registry in [bwa-mem3-bench](https://github.com/fg-labs/bwa-mem3-bench) (`docs/expected-divergences.yaml`). Each carries a per-sample concordance-drift budget that the benchmark gates against on every run — a new bwa-mem3 build that drifts beyond its budget fails CI rather than silently shipping a regression. The table below is generated from that registry; do not edit it by hand (see [bwa-mem3-bench → Per-release concordance history](../related-projects/bwa-mem3-bench.md) for how it is regenerated).

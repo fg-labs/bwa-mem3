@@ -208,6 +208,30 @@ for the recommended operating point.
 
 ---
 
+## `--seed-order` seed reordering before chaining
+
+`--seed-order <mode>` reorders each read's SA-resolved seeds before chaining. The default
+`off` preserves byte-identical output. The recommended opt-in mode is `local-longest`,
+which sorts seeds by decreasing length so the longest seed anchors its chain first and
+absorbs contained shorter seeds — those sub-seeds then never reach banded Smith-Waterman.
+
+```bash
+bwa-mem3 mem --seed-order local-longest -t 16 ref.fa R1.fq.gz R2.fq.gz | samtools sort -@ 4 -o out.bam -
+```
+
+Measured on 50,000 real WGS reads (1000 Genomes HG00096, hg38), `local-longest` reduces
+extended seeds by ~8.9 % (absorbed fraction increases from 38.2 % to 43.7 %). Since
+Smith-Waterman extension is typically the dominant per-read cost in `bwa-mem3 mem`, this
+translates to a meaningful throughput gain on extension-heavy workloads.
+
+`--seed-order local-longest` is **not byte-identical** to the default — it can shift
+secondary alignments, `XA:Z:`, `XS:i`, `HN:i`, and a small number of primaries. Accuracy
+is flat on easy simulated data (holodeck, F1 ~94.4 %; no regression vs `off`), but
+hard-data F1 validation on divergent/indel-rich reads and GIAB benchmarks is not yet
+complete. For that reason, all non-`off` modes are opt-in only and the default stays `off`.
+
+See [Optimization checklist → Reorder seeds longest-first](../best-practices/optimization-checklist.md#6-reorder-seeds-longest-first---seed-order-local-longest) and [Equivalence → Seed ordering](equivalence.md#seed-ordering---seed-order-opt-in) for full details.
+
 ## Changes catalog
 
 | Item | bwa-mem3 PR | Upstream PR/issue | Status |
@@ -220,6 +244,7 @@ for the recommended operating point.
 | `HN:i` hit count tag | [#42](https://github.com/fg-labs/bwa-mem3/pull/42) | [lh3/bwa#438](https://github.com/lh3/bwa/pull/438) | fork-only (analogous to bwa aln) |
 | `--bam=LEVEL` direct BAM output | [#12](https://github.com/fg-labs/bwa-mem3/pull/12) | — | fork-only |
 | `--min-ext-len` short-seed extension filter | _pending_ | — | fork-only (opt-in, off by default) |
+| `--seed-order` seed reordering | [#186](https://github.com/fg-labs/bwa-mem3/pull/186) | — | fork-only (opt-in, off by default) |
 
 ---
 

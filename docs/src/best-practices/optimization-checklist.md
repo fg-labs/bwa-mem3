@@ -94,6 +94,36 @@ On a 16-core machine, allocating 12 threads to `mem` and 8 to `samtools sort` (w
 >
 > `bwa-mem3 mem` scales well to 16–32 threads on most workloads. Beyond 32 threads the per-thread work unit becomes small enough that synchronization overhead starts to erode gains. See [User Guide — Threading and resource use](../user-guide/threading.md) for thread-scaling data.
 
+## 6. Reorder seeds longest-first (`--seed-order local-longest`)
+
+After SA-interval resolution bwa-mem3 builds chains by scanning seeds in the order they
+were emitted. `--seed-order local-longest` re-sorts each read's resolved seeds by
+decreasing length before chaining. The longest seed anchors its chain first and absorbs
+shorter seeds that are fully contained within it, so contained sub-seeds are never
+extended — they contribute nothing a long seed does not already cover.
+
+```bash
+bwa-mem3 mem --seed-order local-longest -t 16 ref.fa R1.fq.gz R2.fq.gz | samtools sort -@ 4 -o out.bam -
+```
+
+Measured on 50,000 real WGS reads (1000 Genomes HG00096, hg38), `local-longest` cuts
+the fraction of seeds that reach banded Smith-Waterman extension from 38.2 % to 43.7 %
+absorbed (an ~8.9 % reduction in extended seeds). Since Smith-Waterman extension is
+typically the dominant per-read cost in `bwa-mem3 mem`, the gain scales accordingly with
+the seed absorption rate for a given dataset.
+
+**Accuracy and byte-identity.** F1 is flat on an easy simulated profile (holodeck, ~94.4 %;
+no regression vs `--seed-order off`). Hard-data F1 validation on divergent/indel-rich
+reads and GIAB benchmarks is not yet complete, so `--seed-order local-longest` is
+**opt-in only** and the default remains `off`. Non-`off` modes are **not byte-identical**
+to `off`: they can shift secondary alignments, `XA:Z:`, `XS:i`, and `HN:i` tags, and a
+small number of primaries. See
+[Equivalence → Seed ordering](../whats-different/equivalence.md#seed-ordering---seed-order-opt-in)
+for the full taxonomy.
+
+Additional advanced modes are accepted by the option (`global-longest`, `absorb-count`,
+`most-absorb`) but are unadvertised pending further validation.
+
 ## Summary table
 
 | Item | Action | Reference |
@@ -103,6 +133,7 @@ On a 16-core machine, allocating 12 threads to `mem` and 8 to `samtools sort` (w
 | Shared-memory index | `bwa-mem3 shm ref.fa` before batch runs | [Quick start: shm](../getting-started/quick-shm.md) |
 | Emit uncompressed BAM | `--bam=0` | [Best Practices — Output format](output-format.md) |
 | Multi-threaded sort | `samtools sort -@` with appropriate thread split | [User Guide — Threading](../user-guide/threading.md) |
+| Reorder seeds longest-first | `--seed-order local-longest` | [Equivalence](../whats-different/equivalence.md) |
 
 ---
 

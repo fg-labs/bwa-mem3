@@ -66,6 +66,10 @@ Supplementary MAPQ rescoring (fg-labs extension):
                  with >=INT genome occurrences (i.e. the supp region is repetitive on its
                  own). 0 disables (default). Typical values 5-20; lower = more aggressive.
                  Primary MAPQ is unaffected.
+Seed ordering (fg-labs extension):
+   --seed-order STR
+                 seed emission order before chaining: off|local-longest [off]
+                 (advanced modes: global-longest, absorb-count, most-absorb; see docs)
 Input reader:
    --legacy-reader
                  use the legacy gzFile/kseq input reader instead of the default
