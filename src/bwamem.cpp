@@ -38,6 +38,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 
 #include "sam_encode.h"
 #include "stage_prof.h"
+#include "seed_order.h"
 /* Not including <htslib/sam.h>: its kstring.h shares the KSTRING_H guard
  * with bwa-mem3's. Opaque bam1_t wrappers live in bam_writer.h. */
 
@@ -259,6 +260,7 @@ mem_opt_t *mem_opt_init()
 
     o->min_seed_len = 19;
     o->min_ext_len = 0;   // off by default -> byte-identical to baseline
+    o->seed_emit_order = SEED_ORDER_OFF;  // byte-identical default
     o->split_width = 10;
     o->max_occ = 500;
     o->max_chain_gap = 10000;
@@ -1194,6 +1196,12 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
     int64_t *sa_coord = (int64_t *) _mm_malloc(sizeof(int64_t) * opt->max_occ * smem_buf_size, 64);
     int64_t seedBufCount = 0;
 
+    /* Seed-order refactor (Phase A buffer, Spec S4): one fully-resolved seed per
+     * SA hit, sized by RESOLVED-seed count (the prefetch ceiling), NOT SMEM count.
+     * Persisted across reads in this call and freed at function end with sa_coord. */
+    seed_rec_t *recs = NULL;
+    int64_t recs_cap = 0;
+
     for (int l=0; l<nseq; l++)
         kv_init(chain_ar[l]);
 
@@ -1239,6 +1247,21 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
                                                sizeof(int64_t));
             assert(sa_coord != NULL);
         }
+
+        /* Phase A buffer (Spec S4): ceiling = (#SMEMs this read) * max_occ, the
+         * same prefetch ceiling sa_coord is sized to. Grow with realloc, persist
+         * across reads. Reset nrec per read. */
+        int64_t nrec = 0;
+        int64_t recs_need = (pos - smem_ptr + 1) * (int64_t)opt->max_occ;
+        if (recs_need > recs_cap)
+        {
+            recs_cap = recs_need;
+            /* CodeRabbit: temp pointer so a NULL realloc doesn't leak recs. */
+            seed_rec_t *recs_new = (seed_rec_t *) realloc(recs, recs_cap * sizeof(seed_rec_t));
+            assert(recs_new != NULL);
+            recs = recs_new;
+        }
+
         int64_t id = 0, cnt_ = 0, mypos = 0;
         #if SA_COMPRESSION
         uint64_t tim = __rdtsc();
@@ -1265,14 +1288,17 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
             cnt = 0;
             for (k = count = 0; k < p->s && count < opt->max_occ; k += step, ++count)
             {
-                mem_chain_t tmp, *lower, *upper;
                 mem_seed_t s;
-                int rid, to_add = 0;
+                int rid;
 
+                /* Phase A (resolve). B2/B3: the SA cursor advances BEFORE any drop
+                 * (rid<0 / un-remappable meth) — a dropped hit still consumes a
+                 * slot. The #if SA_COMPRESSION / #else regimes index different
+                 * cursors (global mypos vs per-SMEM cnt); keep both. */
                 #if SA_COMPRESSION
-                s.rbeg = tmp.pos = sa_coord[mypos++];
+                s.rbeg = sa_coord[mypos++];
                 #else
-                s.rbeg = tmp.pos = sa_coord[cnt++];
+                s.rbeg = sa_coord[cnt++];
                 #endif
 
                 s.qbeg = p->m;
@@ -1294,7 +1320,7 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
                     if (meth_seed_to_orig(bns, meth_orig_bns, s.rbeg, s.len,
                                           &o_rbeg, &o_rid, &meth_hyp) != 0)
                         continue; /* un-remappable (bridge/range): drop the seed */
-                    s.rbeg = tmp.pos = o_rbeg;
+                    s.rbeg = o_rbeg;
                     rid = o_rid;
                 } else {
                     rid = bns_intv2rid(bns, s.rbeg, s.rbeg + s.len);
@@ -1303,46 +1329,71 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
                 // forward-reverse boundary; TODO: split the seed;
                 // don't discard it!!!
                 if (rid < 0) continue;
-                if (kb_size(tree))
-                {
-                    kb_intervalp(chn, tree, &tmp, &lower, &upper); // find the closest chain
 
-                    if (!lower || !test_and_merge(opt, l_pac, lower, &s, rid, tid))
-                        to_add = 1;
-                }
-                else to_add = 1;
-
-                //uint64_t tim = __rdtsc();
-                if (to_add) // add the seed as a new chain
-                {
-                    tmp.n = 1; tmp.m = SEEDS_PER_CHAIN;
-                    if((seedBufCount + tmp.m) > seedBufSize)
-                    {
-                        tmp.m += 1;
-                        tmp.seeds = (mem_seed_t *)calloc (tmp.m, sizeof(mem_seed_t));
-                        assert(tmp.seeds != NULL);
-                        tprof[PE13][tid]++;
-                    }
-                    else {
-                        tmp.seeds = seedBuf + seedBufCount;
-                        seedBufCount += tmp.m;
-                    }
-                    memset((char*) (tmp.seeds), 0, tmp.m * sizeof(mem_seed_t));
-                    tmp.seeds[0] = s;
-                    tmp.rid = rid;
-                    tmp.seqid = l;
-                    /* is_alt indexes the chain-side bns (original in --meth). */
-                    tmp.is_alt = !!chain_bns->anns[rid].is_alt;
-                    /* D3: carry the OT/OB hypothesis on the chain (-1 non-meth).
-                     * All seeds of one read share a hypothesis (directional
-                     * R1→OT / R2→OB), so test_and_merge needs no hypothesis
-                     * guard; new chains for the same read get the same label. */
-                    tmp.meth_hypothesis = meth_hyp;
-                    kb_putp(chn, tree, &tmp);
-                    num[l]++;
-                }
+                // Phase A: append the fully-resolved seed (drops above already
+                // consumed the SA slot). B1: copy the FULL mem_seed_t.
+                seed_rec_t *r = &recs[nrec++];
+                r->seed = s;
+                r->rid = rid;
+                r->meth_hyp = meth_hyp; // -1 when !meth_remap
+                r->orig_ix = (uint32_t)(nrec - 1);
             }
         } // seeds
+
+        // Phase B (order). Identity for SEED_ORDER_OFF; stable on orig_ix.
+        order_seeds(recs, nrec, opt->seed_emit_order);
+
+        // Phase C (chain). MOVED verbatim from the old per-seed body; sources
+        // s/rid/meth_hyp from the ordered buffer. S5: equal-pos insertion order
+        // into the kbtree is preserved (no dedup/compact beyond order_seeds).
+        for (int64_t ri = 0; ri < nrec; ++ri)
+        {
+            mem_seed_t s = recs[ri].seed;
+            int rid = recs[ri].rid;
+            int8_t meth_hyp = recs[ri].meth_hyp;
+            mem_chain_t tmp, *lower, *upper;
+            int to_add = 0;
+            tmp.pos = s.rbeg;
+
+            if (kb_size(tree))
+            {
+                kb_intervalp(chn, tree, &tmp, &lower, &upper); // find the closest chain
+
+                if (!lower || !test_and_merge(opt, l_pac, lower, &s, rid, tid))
+                    to_add = 1;
+            }
+            else to_add = 1;
+
+            //uint64_t tim = __rdtsc();
+            if (to_add) // add the seed as a new chain
+            {
+                tmp.n = 1; tmp.m = SEEDS_PER_CHAIN;
+                if((seedBufCount + tmp.m) > seedBufSize)
+                {
+                    tmp.m += 1;
+                    tmp.seeds = (mem_seed_t *)calloc (tmp.m, sizeof(mem_seed_t));
+                    assert(tmp.seeds != NULL);
+                    tprof[PE13][tid]++;
+                }
+                else {
+                    tmp.seeds = seedBuf + seedBufCount;
+                    seedBufCount += tmp.m;
+                }
+                memset((char*) (tmp.seeds), 0, tmp.m * sizeof(mem_seed_t));
+                tmp.seeds[0] = s;
+                tmp.rid = rid;
+                tmp.seqid = l;
+                /* is_alt indexes the chain-side bns (original in --meth). */
+                tmp.is_alt = !!chain_bns->anns[rid].is_alt;
+                /* D3: carry the OT/OB hypothesis on the chain (-1 non-meth).
+                 * All seeds of one read share a hypothesis (directional
+                 * R1→OT / R2→OB), so test_and_merge needs no hypothesis
+                 * guard; new chains for the same read get the same label. */
+                tmp.meth_hypothesis = meth_hyp;
+                kb_putp(chn, tree, &tmp);
+                num[l]++;
+            }
+        } // Phase C
 
         smem_ptr = pos + 1;
         size = kb_size(tree);
@@ -1363,6 +1414,7 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
     tprof[MEM_SA_BLOCK][tid] += __rdtsc() - tim;
 
     _mm_free(sa_coord);
+    free(recs);
 }
 
 int mem_kernel1_core(FMI_search *fmi,

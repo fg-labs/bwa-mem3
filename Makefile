@@ -302,7 +302,7 @@ LDFLAGS += $(HTSLIB_static_LDFLAGS)
 # Non-kernel objects: always compiled once at the baseline ISA and linked into
 # libbwa.a on every build (arm64 and x86 alike).
 OBJS=		src/fastmap.o src/bwtindex.o src/utils.o src/kthread.o \
-			src/kstring.o src/bntseq.o src/bwamem.o src/profiling.o \
+			src/kstring.o src/bntseq.o src/bwamem.o src/seed_order.o src/profiling.o \
 			src/FMI_search.o src/read_index_ele.o src/bwamem_pair.o src/bwa.o \
 			src/bwamem_extra.o src/kopen.o src/bam_writer.o src/meth_bam.o \
 			src/meth_xm.o \

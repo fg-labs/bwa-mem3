@@ -81,6 +81,14 @@ typedef struct __smem_i smem_i;
  * mirror cell a real mismatch — variant-aware, truthful NM/MD. */
 enum mem_meth_scoring { MEM_METH_SCORING_COLLAPSED = 0, MEM_METH_SCORING_GENOMIC = 1 };
 
+typedef enum {
+    SEED_ORDER_OFF = 0,
+    SEED_ORDER_GLOBAL_LONGEST,
+    SEED_ORDER_LOCAL_LONGEST,
+    SEED_ORDER_ABSORB_COUNT,
+    SEED_ORDER_MOST_ABSORB
+} seed_order_t;
+
 typedef struct mem_opt_t {
     int a, b;               // match score and mismatch penalty
     int o_del, e_del;
@@ -96,6 +104,7 @@ typedef struct mem_opt_t {
     int flag;               // see MEM_F_* macros
     int min_seed_len;       // minimum seed length
     int min_ext_len;        // seeds shorter than this are not extended (0 = off)
+    seed_order_t seed_emit_order;  // --seed-order; SEED_ORDER_OFF = byte-identical
     int min_chain_weight;
     int max_chain_extend;
     float split_factor;     // split into a seed if MEM is longer than min_seed_len*split_factor
