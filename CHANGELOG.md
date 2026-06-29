@@ -3,6 +3,11 @@
 ## [0.4.0](https://github.com/fg-labs/bwa-mem3/compare/v0.3.0...v0.4.0) (2026-06-27)
 
 
+### ⚠ BREAKING CHANGES
+
+* **index:** `bwa-mem3 index` no longer writes the unpacked `.0123` reference file by default ([#177](https://github.com/fg-labs/bwa-mem3/pull/177)). `bwa-mem3 mem` now reconstructs reference bases from the packed `.pac` on demand ("pac-fetch") and ignores any `.0123` present, so the file is redundant for bwa-mem3 itself. External tools that read `.0123` directly — most notably sharing a single index with **bwa-mem2** — will break, since the expected file is now absent. To restore the old on-disk layout, re-run indexing with the new opt-in flag `index --emit-unpacked-ref`. Alignment output is byte-for-byte identical; the change is purely to the index artifact set.
+
+
 ### Features
 
 * **mem:** --min-ext-len opt-in filter to skip extension of short seeds ([#169](https://github.com/fg-labs/bwa-mem3/issues/169)) ([13db252](https://github.com/fg-labs/bwa-mem3/commit/13db252ad4c7c39eff18bd3674430aac51570346))
