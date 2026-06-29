@@ -43,6 +43,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "bam_writer.h"
 #include "meth_bam.h"
 #include "stage_prof.h"
+#include "seed_order.h"
 #include "version.h"
 #include <sys/resource.h>
 #include "bwa_shm.h"
@@ -991,6 +992,10 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "                 with >=INT genome occurrences (i.e. the supp region is repetitive on its\n");
     fprintf(stderr, "                 own). 0 disables (default). Typical values 5-20; lower = more aggressive.\n");
     fprintf(stderr, "                 Primary MAPQ is unaffected.\n");
+    fprintf(stderr, "Seed ordering (fg-labs extension):\n");
+    fprintf(stderr, "   --seed-order STR\n");
+    fprintf(stderr, "                 seed emission order before chaining: off|local-longest [off]\n");
+    fprintf(stderr, "                 (advanced modes: global-longest, absorb-count, most-absorb; see docs)\n");
     fprintf(stderr, "Input reader:\n");
     fprintf(stderr, "   --legacy-reader\n");
     fprintf(stderr, "                 use the legacy gzFile/kseq input reader instead of the default\n");
@@ -1104,6 +1109,7 @@ int main_mem(int argc, char *argv[])
         OPT_SUPP_REP_HARD_CAP,
         OPT_LEGACY_READER,
         OPT_MIN_EXT_LEN,
+        OPT_SEED_ORDER,
 #ifdef STAGE_PROF
         OPT_PROFILE,
 #endif
@@ -1117,6 +1123,7 @@ int main_mem(int argc, char *argv[])
         {"set-as-failed",            required_argument, 0, OPT_METH_SET_AS_FAILED},
         {"chimera-qc",               no_argument,       0, OPT_METH_CHIMERA_QC},
         {"supp-rep-hard-cap",        required_argument, 0, OPT_SUPP_REP_HARD_CAP},
+        {"seed-order",               required_argument, 0, OPT_SEED_ORDER},
         {"legacy-reader",            no_argument,       0, OPT_LEGACY_READER},
 #ifdef STAGE_PROF
         {"profile",                  required_argument, 0, OPT_PROFILE},
@@ -1297,6 +1304,16 @@ int main_mem(int argc, char *argv[])
             opt->supp_rep_hard_cap = (int)v;
         }
         else if (c == OPT_LEGACY_READER) aux.legacy_reader = 1;
+        else if (c == OPT_SEED_ORDER) {
+            opt->seed_emit_order = seed_order_from_str(optarg);
+            if ((int)opt->seed_emit_order < 0) {
+                fprintf(stderr, "[E::%s] unknown --seed-order '%s' (off|local-longest; "
+                        "see docs for advanced modes)\n", __func__, optarg);
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+        }
         else if (c == OPT_HELP) {
             usage(opt);
             free(opt);
@@ -1496,6 +1513,9 @@ int main_mem(int argc, char *argv[])
             return 1;
         }
     }
+
+    if (opt->seed_emit_order != SEED_ORDER_OFF)
+        fprintf(stderr, "[M::%s] seed order: %s\n", __func__, seed_order_to_str(opt->seed_emit_order));
 
     /* Load bwt2/FMI index */
     uint64_t tim = __rdtsc();
