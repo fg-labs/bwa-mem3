@@ -30,6 +30,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 
 #include "bwamem.h"
 #include "FMI_search.h"
+#include "smem_dedup.h"
 #include "bam_writer.h"
 #include "meth_bam.h"
 #include "u8vec_scratch.h"
@@ -261,6 +262,7 @@ mem_opt_t *mem_opt_init()
     o->min_seed_len = 19;
     o->min_ext_len = 0;   // off by default -> byte-identical to baseline
     o->seed_emit_order = SEED_ORDER_OFF;  // byte-identical default
+    o->smem_dedup  = 0;   // off by default -> byte-identical to baseline; opt-in via --smem-dedup
     o->split_width = 10;
     o->max_occ = 500;
     o->max_chain_gap = 10000;
@@ -1073,7 +1075,11 @@ SMEM *mem_collect_smem(FMI_search *fmi, const mem_opt_t *opt,
         smem_ptr = pos + 1;
     }
 
+    if (opt->smem_dedup)
+        tot_smem = smem_dedup_inplace(matchArray, tot_smem);
+
     _mm_free(query_cum_len_ar);
+
     return matchArray;
 }
 

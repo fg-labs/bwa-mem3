@@ -932,6 +932,7 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "    -r FLOAT      look for internal seeds inside a seed longer than {-k} * FLOAT [%g]\n", opt->split_factor);
     fprintf(stderr, "    -y INT        seed occurrence for the 3rd round seeding [%ld]\n", (long)opt->max_mem_intv);
     fprintf(stderr, "    -c INT        skip seeds with more than INT occurrences [%d]\n", opt->max_occ);
+    fprintf(stderr, "    --smem-dedup  dedup identical SMEMs before chaining: fewer SA lookups, ~10%% fewer; opt-in, NOT byte-identical (changes XS/secondary on a small fraction of reads) [off]\n");
     fprintf(stderr, "    -D FLOAT      drop chains shorter than FLOAT fraction of the longest overlapping chain [%.2f]\n", opt->drop_ratio);
     fprintf(stderr, "    -W INT        discard a chain if seeded bases shorter than INT [0]\n");
     fprintf(stderr, "    -m INT        perform at most INT rounds of mate rescues for each read [%d]\n", opt->max_matesw);
@@ -1110,6 +1111,7 @@ int main_mem(int argc, char *argv[])
         OPT_LEGACY_READER,
         OPT_MIN_EXT_LEN,
         OPT_SEED_ORDER,
+        OPT_SMEM_DEDUP,
 #ifdef STAGE_PROF
         OPT_PROFILE,
 #endif
@@ -1118,6 +1120,7 @@ int main_mem(int argc, char *argv[])
     static struct option long_opts[] = {
         {"bam",                      optional_argument, 0, OPT_BAM},
         {"min-ext-len",              required_argument, 0, OPT_MIN_EXT_LEN},
+        {"smem-dedup",               no_argument,       0, OPT_SMEM_DEDUP},
         {"meth",                     no_argument,       0, OPT_METH},
         {"meth-scoring",             required_argument, 0, OPT_METH_SCORING},
         {"set-as-failed",            required_argument, 0, OPT_METH_SET_AS_FAILED},
@@ -1314,6 +1317,7 @@ int main_mem(int argc, char *argv[])
                 return 1;
             }
         }
+        else if (c == OPT_SMEM_DEDUP) opt->smem_dedup = 1;
         else if (c == OPT_HELP) {
             usage(opt);
             free(opt);
