@@ -117,6 +117,12 @@ ok "meth_sidecar_enrich_test"
 "$HERE/help_prescan_test.sh" "$BWAMEM3" "$FIXTURES" || fail "help_prescan_test failed"
 ok "help_prescan_test"
 
+# --- fast_preset_test -----------------------------------------------------
+# --fast bundles the four characterized speed levers; explicit flags override;
+# default path stays clean. Asserts on the resolved-opts audit line.
+"$HERE/fast_preset_test.sh" "$BWAMEM3" "$FIXTURES" || fail "fast_preset_test failed"
+ok "fast_preset_test"
+
 # --- smem_lockstep_parity_test --------------------------------------------
 OUT="$(cd "$HERE" && ./smem_lockstep_parity_test "$FIXTURES/phix.fa" 2>&1)"
 CASES_PASSED="$(echo "$OUT" | sed -nE 's/^([0-9]+) \/ ([0-9]+) cases passed$/\1/p')"
