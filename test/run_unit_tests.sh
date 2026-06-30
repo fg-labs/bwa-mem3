@@ -123,6 +123,13 @@ ok "help_prescan_test"
 "$HERE/fast_preset_test.sh" "$BWAMEM3" "$FIXTURES" || fail "fast_preset_test failed"
 ok "fast_preset_test"
 
+# --- min_ext_len_safety_test ----------------------------------------------
+# The --min-ext-len short-seed filter must never empty a chain: an all-short
+# chain is left intact, so a huge --min-ext-len is a no-op (== default), not a
+# read-dropping cliff. Regression for the smoke-1M low-mappability collapse.
+"$HERE/min_ext_len_safety_test.sh" "$BWAMEM3" "$FIXTURES" || fail "min_ext_len_safety_test failed"
+ok "min_ext_len_safety_test"
+
 # --- smem_lockstep_parity_test --------------------------------------------
 OUT="$(cd "$HERE" && ./smem_lockstep_parity_test "$FIXTURES/phix.fa" 2>&1)"
 CASES_PASSED="$(echo "$OUT" | sed -nE 's/^([0-9]+) \/ ([0-9]+) cases passed$/\1/p')"

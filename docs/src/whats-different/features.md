@@ -193,44 +193,48 @@ analysis](https://github.com/fg-labs/bwa-mem3/pull/187) for the full characteriz
 
 ## `--min-ext-len` short-seed extension filter
 
-`--min-ext-len INT` opts into skipping banded Smith-Waterman extension of seeds
-shorter than `INT` bp. Off by default (`0`) → output byte-identical to baseline.
+`--min-ext-len INT` opts into skipping banded Smith-Waterman extension of short
+seeds (< `INT` bp) **that sit in a chain with a longer anchor seed** — the
+anchor's extension already covers them, so their own extension is redundant. Off
+by default (`0`) → output byte-identical to baseline.
 
 Smith-Waterman extension is ~60 % of `bwa-mem3 mem` CPU, and almost all of it is
 spent on short seeds: seeds ≤40 bp hold roughly **90 % of all banded-SW cells**
 yet are ~99 % wasted, because long seeds already resolve via the ungapped
-fast-path at near-zero cost. `--min-ext-len` drops the short seeds before
+fast-path at near-zero cost. The filter drops those redundant short seeds before
 extension (`mem_chain_drop_short_seeds`, a stable in-place compaction of each
 chain's seeds, called from `mem_flt_chained_seeds` in `src/bwamem.cpp`), so their
 extension never runs while seeding and chaining are untouched.
 
-Measured single-thread on hg38:
+**Recall-safe by construction.** A chain whose seeds are *all* short is left
+intact — dropping its only evidence would unmap the read — so the filter never
+empties a chain. (An earlier version dropped every short seed unconditionally,
+which silently unmapped low-mappability reads: a 151 bp low-mappability sample
+lost 63 % of its mappings. The anchor guard fixes this; it is a strict recall
+improvement that can reduce work but never lose a read.)
 
-- **Real HG002 1M PE WGS: ~20 % lower alignment CPU at `--min-ext-len 30`.** The
-  accuracy effect is confined to reads that were already low-confidence — 0.40 %
-  of reads change (mostly partial, heavily soft-clipped, or repeat/multi-mapping
-  reads); **zero** confidently and uniquely mapped reads (MAPQ ≥ 60, NM ≤ 1,
-  no soft-clip) regress.
-- Simulated clean Illumina and indel-rich data: free (F1 unchanged or slightly
-  better, even at larger thresholds).
-- The only workload with a real accuracy cost is very high per-base error
-  (degraded chemistry, cross-species) — there, every seed is short, so some
-  correct alignments depend solely on short seeds. Indels and structural variants
-  are *not* a contraindication: an indel leaves two still-long exact segments
-  that the fast-path handles.
-- Confirmed cross-architecture: Graviton4/Linux reproduces the win (realistic
-  +15.8 %, HG002 +20.5 %), matching macOS — the speedup is algorithmic, not
-  microarch tuning.
+Measured single-thread on hg38 (HG002 1M PE WGS, non-emptying filter):
 
-`30` is the recommended opt-in value (accuracy-safe across clean, indel-rich, and
-moderately-divergent data); `40`–`50` are also safe on known-clean data but cost
-accuracy as divergence rises. Because the speedup is thinning the extension stage
-— not faster seeding — the wall-clock gain is smaller than the cell-count
-reduction would suggest (seeding, which the filter does not touch, dominates
-runtime). See
+- **~10 % lower `main_mem` CPU at `--min-ext-len 30` (−9.5 % measured), with no
+  recall loss** — mapped count is identical to default (99.75 %). ~0.10 % of
+  reads change locus (down from ~0.40 % under the old emptying filter), confined
+  to the low-confidence tail; ~0.005 % of reads change at MAPQ ≥ 60.
+- **Higher thresholds no longer cliff:** mapped count and ~0.10 % divergence hold
+  flat across `30`–`50`, because all-short chains are now protected.
+- The previously-documented high-error F1 cliff and the cross-architecture speed
+  figures were measured under the *emptying* behavior; both need a fresh
+  [bwa-mem3-bench](../related-projects/bwa-mem3-bench.md) run under the
+  non-emptying filter. Indels and structural variants were never a
+  contraindication (an indel leaves two still-long exact segments the fast-path
+  handles).
+
+`30` is the recommended opt-in value. Because the speedup thins the extension
+stage — not seeding — the wall-clock gain is smaller than the cell-count
+reduction suggests (seeding, which the filter does not touch, dominates runtime).
+See
 [CLI → mem `--min-ext-len`](../cli/mem.md#--min-ext-len-int--skip-smith-waterman-extension-of-short-seeds)
 and
-[Settings profiles](../best-practices/settings-profiles.md#why-we-recommend---min-ext-len-30-standard-error-reads)
+[Settings profiles](../best-practices/settings-profiles.md#short-seed-extension---min-ext-len-30)
 for the recommended operating point.
 
 ---

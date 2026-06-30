@@ -188,40 +188,50 @@ many placements as it sacrifices (net within noise), so there is no cheap middle
 
 ## Short-seed extension: `--min-ext-len 30`
 
-`--min-ext-len INT` drops seeds shorter than `INT` bp before banded Smith–Waterman, so their
-extension never runs (off by default, `0` → byte-identical to baseline). Extension is ~60% of `mem`
-CPU and almost all of it is spent on short seeds — seeds ≤40 bp hold ~90% of all banded-SW *cells*
-yet are ~99% wasted, because long seeds already resolve via the ungapped fast-path. Skipping them
+`--min-ext-len INT` skips banded Smith–Waterman extension of seeds shorter than `INT` bp **in chains
+that still hold a longer anchor seed** — those short seeds are collinear with the anchor, whose
+extension already covers them, so dropping them is near output-neutral and pure speed. A chain whose
+seeds are *all* short is left untouched, so the filter never empties a chain and never drops a read;
+such all-short chains (common on low-mappability / repetitive loci) extend exactly as the default
+does. Off by default (`0` → byte-identical to baseline). Extension is ~60% of `mem` CPU and almost
+all of it is spent on short seeds — seeds ≤40 bp hold ~90% of all banded-SW *cells* yet are ~99%
+wasted, because long seeds already resolve via the ungapped fast-path. Skipping the *redundant* ones
 thins the extension stage without touching seeding or chaining.
 
-**The accuracy change is confined to reads that were already low-confidence.** On real HG002 1M PE
-WGS at `--min-ext-len 30`, 0.40% of reads change, and profiling every one of them against the
-population shows the cost lands entirely on reads that were *already* marginal — heavily soft-clipped
-partial alignments (median 95 of 150 bp clipped), high edit distance, or multi-mappers. **Zero**
-confidently, uniquely mapped reads (MAPQ ≥ 60, NM ≤ 1, no soft-clip) regress. Like `-m 10`, the
-mapped count only ever *decreases* (≈0.11% newly unmapped; it essentially never newly maps a
-previously-unmapped read), and the reads whose locus changes are repeat/paralog churn with
-sub-2-mismatch score deltas — about 1 in 4 of which the filter actually *improves*. On simulated
-clean Illumina and indel-rich data the change is nil-to-positive even at larger thresholds.
+> **Recall-safe (non-emptying filter).** Earlier releases dropped *every* short seed unconditionally,
+> which emptied all-short chains and silently unmapped reads whose only evidence was short —
+> negligible on clean WGS but catastrophic on low-mappability short-read data (a 151 bp
+> low-mappability sample lost 63% of its mappings). The current filter only drops a short seed when a
+> longer anchor survives in the same chain, making it a *strict recall improvement*: it can reduce
+> extension work but can never lose a read.
 
-**In exchange, alignment CPU drops ~10–20% single-thread**, largest on data carrying many short
-seeds (real WGS sees more than idealized simulated reads). Because the speedup thins extension rather
-than speeding seeding — and seeding dominates the wall — the wall-clock gain is smaller than the
-~90% banded-SW *cell* reduction would suggest.
+**The accuracy change is small, confined to low-confidence reads, and costs no recall.** On real
+HG002 1M PE WGS at `--min-ext-len 30` (non-emptying filter), the mapped count is unchanged from
+default (99.75% both), and only ~0.10% of reads change locus — down from ~0.40% under the old
+emptying filter, because the reads that used to vanish now map identically to default. The locus
+changes concentrate in the low-confidence tail (repeat/paralog churn); ~0.005% of reads (≈100 of
+2 M) change at MAPQ ≥ 60.
 
-**Contraindication — very high per-base error.** On degraded-chemistry or cross-species libraries
-(per-base error well above modern Illumina), every seed is short, so some correct alignments depend
-*solely* on short seeds and the cost rises sharply (e.g. at 2–15% simulated substitution error, F1
-−0.2% at `30`, growing to −1.4% at `40` and a cliff at `50`). Keep `--min-ext-len` low or off for
-such data. **Indels and structural variants are *not* a contraindication** — an indel splits a read
-into two still-long exact segments that the fast-path handles, so indel-rich data is free.
+**In exchange, alignment CPU drops ~10% single-thread at `--min-ext-len 30`** (measured −9.5%
+`main_mem` on HG002 WGS-1M), largest on data carrying many short seeds. Because the speedup thins
+extension rather than speeding seeding — and seeding dominates the wall — the wall-clock gain is
+smaller than the ~90% banded-SW *cell* reduction would suggest.
 
-`30` is the accuracy-safe knee; `40`–`50` give a little more speed on known-clean data but trade
-accuracy as divergence rises. The CPU win is confirmed cross-architecture: on Graviton4/Linux
-(c8g) the same single-thread sweep gives realistic **+15.8%** and HG002 **+20.5%** (T=0→T=30),
-matching macOS — the filter is algorithmic, so it ports. Remaining before this graduates from
-"recommended for standard-error reads" to an unqualified default: a multi-thread + broader
-[bwa-mem3-bench](../related-projects/bwa-mem3-bench.md) run (all current figures are single-thread).
+**Higher thresholds no longer cliff.** Because all-short chains are now protected, raising
+`--min-ext-len` to `40`–`50` no longer drops reads: on HG002 WGS-1M the mapped count holds at 99.75%
+and divergence stays ~0.10% across `30`–`50`. The previously-documented high-error F1 cliff (F1
+−1.4% at `40`, a cliff at `50` on 2–15% simulated substitution error) was a property of the
+*emptying* behavior — its mechanism, correct alignments carried *solely* on short seeds being
+dropped, is exactly what the non-emptying filter now protects — so it is expected to be largely
+removed, **pending re-validation** of the simulated-error sweep under the new filter. **Indels and
+structural variants were never a contraindication** — an indel splits a read into two still-long
+exact segments the fast-path handles, so indel-rich data is free.
+
+`30` remains the recommended value. **Validation status:** the non-emptying filter changes the
+observable output of `--min-ext-len` (and therefore `--fast`), so the cross-architecture speed
+figures and the golden-truth F1 sweep need a fresh
+[bwa-mem3-bench](../related-projects/bwa-mem3-bench.md) run (multi-thread, all regimes) before
+`--min-ext-len` / `--fast` graduate from "recommended" to an unqualified default.
 
 ## Speed: drop-in and recommended
 

@@ -217,12 +217,14 @@ very short, low-confidence chains.
 
 #### `--min-ext-len INT` — skip Smith-Waterman extension of short seeds
 
-Off by default (`0`) → output byte-identical to baseline. When `INT > 0`, seeds
-shorter than `INT` bp are dropped before banded Smith-Waterman, so their
-extension never runs (~10–20 % less alignment CPU). `30` is the recommended,
-accuracy-safe value for standard-error reads; keep it low or off for very
-high-error libraries. For the benchmarks, recommended value, and the high-error
-contraindication, see
+Off by default (`0`) → output byte-identical to baseline. When `INT > 0`, a short
+seed (< `INT` bp) is dropped before banded Smith-Waterman **only if its chain
+still has a longer anchor seed** — its extension is then redundant (the anchor
+already covers it), so skipping it is near output-neutral (~10 % less alignment
+CPU at `30`). A chain whose seeds are *all* short is left untouched, so the filter
+never empties a chain or drops a read: it is recall-safe by construction. `30` is
+the recommended value. For the benchmarks, behavior details, and validation
+status, see
 [Settings profiles → `--min-ext-len 30`](../best-practices/settings-profiles.md#short-seed-extension---min-ext-len-30).
 
 #### `-h INT[,INT]` — secondary alignment reporting
