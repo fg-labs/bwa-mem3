@@ -43,6 +43,11 @@ No extra flags. Use this when you are:
 bwa-mem3 mem -t <N> -m 10 -y 0 ref.fa R1.fq R2.fq > out.sam
 ```
 
+> **Shorthand:** `bwa-mem3 mem --fast` applies `-m 10 -y 0 --min-ext-len 30
+> --smem-dedup` (and `-s 0` under `--meth`) in one flag. Explicit flags still
+> override individual levers where applicable; `--smem-dedup` is always enabled.
+> See [`mem` → `--fast`](../cli/mem.md#--fast--speed-preset-opt-in-not-byte-identical).
+
 Use this for new pipelines, or once a drop-in migration is validated and you want bwa-mem3's best
 speed/accuracy trade-off. Current recommended deviations:
 

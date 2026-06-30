@@ -241,6 +241,26 @@ hit reporting with `-h`. Default: 0.80.
 Outputs `XB` in place of `XA`. `XB` is an extension of `XA` that also carries
 the alignment score and mapping quality for each secondary hit.
 
+### Speed preset
+
+#### `--fast` — speed preset (opt-in, not byte-identical)
+
+`--fast` is a one-flag shorthand for the characterized speed levers:
+
+```text
+bwa-mem3 mem --fast  ≡  -m 10 -y 0 --min-ext-len 30 --smem-dedup
+```
+
+Under `--meth` it additionally sets `-s 0` (drop Pass-2 re-seeding).
+
+Each lever is applied only if you did not set it explicitly, so explicit flags
+win where applicable (`--fast -m 30` keeps `-m 30`); `--smem-dedup` is always
+enabled and cannot be opted back out of once `--fast` is set. Output is **not**
+byte-identical to the default; the accuracy cost of each lever is characterized in
+[Settings profiles](../best-practices/settings-profiles.md) and is confined to
+the already-low-confidence tail. `bwa-mem3 mem` prints the resolved preset to
+stderr (`[M::main_mem] --fast: ...`) so runs are self-documenting.
+
 ### Methylation (`--meth`)
 
 #### `--meth` — enable bisulfite alignment mode
