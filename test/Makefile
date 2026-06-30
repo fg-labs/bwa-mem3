@@ -150,7 +150,7 @@ endif
 
 unit: $(UNIT_BIN)
 
-$(UNIT_BIN): $(UNIT_OBJS) $(FRAMEWORK_LIB)
+$(UNIT_BIN): $(UNIT_OBJS) $(FRAMEWORK_LIB) ../libbwa.a
 	$(CXX) $(LDFLAGS) -o $@ $(UNIT_OBJS) $(FRAMEWORK_LIB) $(LIBS)
 
 $(UNIT_DIR)/%.o: $(UNIT_DIR)/%.cpp
@@ -163,7 +163,7 @@ INTEGRATION_BIN       := bwa_mem3_tests_integration
 
 integration: $(INTEGRATION_BIN)
 
-$(INTEGRATION_BIN): $(INTEGRATION_TEST_OBJS) $(FRAMEWORK_LIB)
+$(INTEGRATION_BIN): $(INTEGRATION_TEST_OBJS) $(FRAMEWORK_LIB) ../libbwa.a
 	$(CXX) $(LDFLAGS) -o $@ $(INTEGRATION_TEST_OBJS) $(FRAMEWORK_LIB) $(LIBS)
 
 # Integration tests use the framework headers; override the generic
