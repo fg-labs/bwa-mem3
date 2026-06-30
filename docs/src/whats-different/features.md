@@ -164,6 +164,33 @@ all 11 SAM columns and all aux tags. See
 [Best Practices → Output format](../best-practices/output-format.md) for the
 recommended pipeline.
 
+## `--smem-dedup` SMEM deduplication
+
+`--smem-dedup` opts into removing fully-identical duplicate SMEM seeds before SA
+expansion. Off by default → output byte-identical to baseline. When enabled,
+duplicate SMEMs (same `rid`, query span `[m,n)`, SA interval `[k,l)` of size `s`) that
+appear adjacent in the sorted SMEM array are compacted in O(n) with no
+allocation.
+
+Duplicate SMEMs arise because the FM-index is a B-tree and can contain duplicate
+keys, particularly in repeat-dense regions. On 50 k WGS reads vs hg38, roughly
+10 % fewer SA lookups are performed with `--smem-dedup` active. The wall-clock
+impact on an arm64 host is ~1–2 % (seeding is a fraction of total runtime);
+on x86 workloads where SA expansion is a larger share the gain is correspondingly
+larger.
+
+The accuracy impact is small and bounded: only reads that carried duplicate SMEMs
+can be affected, and only if the deduplication changes which chain wins. On the
+50 k validation set, 2 reads (0.004 %) differed — one XS tag update on a MAPQ-60
+read (primary coordinates unchanged) and one equal-score MAPQ-0 tie-break shift.
+Zero uniquely-mapped reads changed. See the [root cause
+analysis](https://github.com/fg-labs/bwa-mem3/pull/187) for the full characterization.
+
+> **Not byte-identical**
+>
+> Do not enable in pipelines that compare output to a bwa-mem2 or bwa-mem3
+> baseline. The changes are benign and bounded, but they are real SAM changes.
+
 ## `--min-ext-len` short-seed extension filter
 
 `--min-ext-len INT` opts into skipping banded Smith-Waterman extension of seeds
@@ -243,6 +270,7 @@ See [Optimization checklist → Reorder seeds longest-first](../best-practices/o
 | `shm --meth` symmetry | [#67](https://github.com/fg-labs/bwa-mem3/pull/67) | — | fork-only |
 | `HN:i` hit count tag | [#42](https://github.com/fg-labs/bwa-mem3/pull/42) | [lh3/bwa#438](https://github.com/lh3/bwa/pull/438) | fork-only (analogous to bwa aln) |
 | `--bam=LEVEL` direct BAM output | [#12](https://github.com/fg-labs/bwa-mem3/pull/12) | — | fork-only |
+| `--smem-dedup` SMEM deduplication | [#187](https://github.com/fg-labs/bwa-mem3/pull/187) | — | fork-only (opt-in, not byte-identical) |
 | `--min-ext-len` short-seed extension filter | _pending_ | — | fork-only (opt-in, off by default) |
 | `--seed-order` seed reordering | [#186](https://github.com/fg-labs/bwa-mem3/pull/186) | — | fork-only (opt-in, off by default) |
 

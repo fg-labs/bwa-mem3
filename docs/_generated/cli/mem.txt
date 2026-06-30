@@ -11,6 +11,7 @@ Options:
     -r FLOAT      look for internal seeds inside a seed longer than {-k} * FLOAT [1.5]
     -y INT        seed occurrence for the 3rd round seeding [20]
     -c INT        skip seeds with more than INT occurrences [500]
+    --smem-dedup  dedup identical SMEMs before chaining: fewer SA lookups, ~10% fewer; opt-in, NOT byte-identical (changes XS/secondary on a small fraction of reads) [off]
     -D FLOAT      drop chains shorter than FLOAT fraction of the longest overlapping chain [0.50]
     -W INT        discard a chain if seeded bases shorter than INT [0]
     -m INT        perform at most INT rounds of mate rescues for each read [50]

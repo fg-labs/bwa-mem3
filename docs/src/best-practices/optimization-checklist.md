@@ -123,6 +123,29 @@ for the full taxonomy.
 
 Additional advanced modes are accepted by the option (`global-longest`, `absorb-count`,
 `most-absorb`) but are unadvertised pending further validation.
+## 7. Enable SMEM deduplication (opt-in, not byte-identical)
+
+`--smem-dedup` removes duplicate SMEM seeds before SA expansion, cutting SA
+lookups by roughly 10 % on typical short-read WGS data. Off by default to preserve
+byte-identical output. Enable only when output identity with upstream bwa-mem2 is
+not required:
+
+```bash
+bwa-mem3 mem --smem-dedup -t 16 ref.fa R1.fq.gz R2.fq.gz | ...
+```
+
+The accuracy impact is confined to a small fraction of reads: on 50 k WGS reads vs
+hg38 only 2 reads (0.004 %) changed — one XS tag update on a MAPQ-60 read
+(primary placement unchanged) and one tie-break shift on a MAPQ-0 equal-score
+locus. All uniquely-mapped reads are unaffected.
+
+> **Not byte-identical**
+>
+> `--smem-dedup` changes the SMEM set seen by chaining for reads that had
+> duplicate SMEMs (arising from B-tree duplicate keys in the SA). This can alter
+> XS tags and equal-score placements on 0.004 % of reads (2 of 50 k on the WGS
+> validation set). Do not enable in pipelines that compare output to a bwa-mem2
+> baseline.
 
 ## Summary table
 
@@ -134,6 +157,7 @@ Additional advanced modes are accepted by the option (`global-longest`, `absorb-
 | Emit uncompressed BAM | `--bam=0` | [Best Practices — Output format](output-format.md) |
 | Multi-threaded sort | `samtools sort -@` with appropriate thread split | [User Guide — Threading](../user-guide/threading.md) |
 | Reorder seeds longest-first | `--seed-order local-longest` | [Equivalence](../whats-different/equivalence.md) |
+| SMEM deduplication | `--smem-dedup`; ~10 % fewer SA lookups; opt-in, not byte-identical | [Features → --smem-dedup](../whats-different/features.md#--smem-dedup-smem-deduplication) |
 
 ---
 
