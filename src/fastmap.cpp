@@ -938,6 +938,10 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "    -m INT        perform at most INT rounds of mate rescues for each read [%d]\n", opt->max_matesw);
     fprintf(stderr, "    -S            skip mate rescue\n");
     fprintf(stderr, "    -P            skip pairing; mate rescue performed unless -S also in use\n");
+    fprintf(stderr, "    --fast        speed preset: -m 10 -y 0 --min-ext-len 30 --smem-dedup (and -s 2\n");
+    fprintf(stderr, "                  under --meth). Opt-in; explicit flags override where applicable;\n");
+    fprintf(stderr, "                  --smem-dedup is always enabled. NOT byte-identical to the default\n");
+    fprintf(stderr, "                  (divergence confined to the low-confidence tail).\n");
     fprintf(stderr, "Scoring options:\n");
     fprintf(stderr, "   -A INT        score for a sequence match, which scales options -TdBOELU unless overridden [%d]\n", opt->a);
     fprintf(stderr, "   -B INT        penalty for a mismatch [%d]\n", opt->b);
@@ -1071,6 +1075,7 @@ int main_mem(int argc, char *argv[])
     int          fixed_chunk_size          = -1;
     char        *p, *rg_line               = 0, *hdr_line = 0;
     const char  *mode                      = 0;
+    int          fast                      = 0;
 
     mem_opt_t    *opt, opt0;
     gzFile        fp = 0, fp2 = 0;
@@ -1112,6 +1117,7 @@ int main_mem(int argc, char *argv[])
         OPT_MIN_EXT_LEN,
         OPT_SEED_ORDER,
         OPT_SMEM_DEDUP,
+        OPT_FAST,
 #ifdef STAGE_PROF
         OPT_PROFILE,
 #endif
@@ -1121,6 +1127,7 @@ int main_mem(int argc, char *argv[])
         {"bam",                      optional_argument, 0, OPT_BAM},
         {"min-ext-len",              required_argument, 0, OPT_MIN_EXT_LEN},
         {"smem-dedup",               no_argument,       0, OPT_SMEM_DEDUP},
+        {"fast",                     no_argument,       0, OPT_FAST},
         {"meth",                     no_argument,       0, OPT_METH},
         {"meth-scoring",             required_argument, 0, OPT_METH_SCORING},
         {"set-as-failed",            required_argument, 0, OPT_METH_SET_AS_FAILED},
@@ -1318,6 +1325,7 @@ int main_mem(int argc, char *argv[])
             }
         }
         else if (c == OPT_SMEM_DEDUP) opt->smem_dedup = 1;
+        else if (c == OPT_FAST) fast = 1;
         else if (c == OPT_HELP) {
             usage(opt);
             free(opt);
@@ -1410,6 +1418,27 @@ int main_mem(int argc, char *argv[])
             return 1;
         }
     } else update_a(opt, &opt0);
+
+    /* --fast: one-flag shorthand for the characterized speed levers
+     *   -m 10  -y 0  --min-ext-len 30  --smem-dedup   (+ -s 0 under --meth).
+     * Mirrors the -x preset: each lever is applied only when the user did not
+     * set it explicitly (opt0), so explicit flags win where applicable. The one
+     * exception is --smem-dedup, which is forced on unconditionally (no opt-out).
+     * Output is NOT byte-identical to the default; divergence is confined to the
+     * low-confidence tail (see docs/best-practices/settings-profiles.md).
+     * meth_mode is already resolved here (parsed in the getopt loop above). */
+    if (fast) {
+        if (!opt0.max_matesw)   opt->max_matesw   = 10;  /* -m 10 */
+        if (!opt0.max_mem_intv) opt->max_mem_intv = 0;   /* -y 0  */
+        if (!opt0.min_ext_len)  opt->min_ext_len  = 30;  /* --min-ext-len 30 */
+        opt->smem_dedup = 1;                             /* --smem-dedup (plain on/off) */
+        if (opt->meth_mode && !opt0.split_width)
+            opt->split_width = 2;                        /* -s 2 (meth only): light Pass-2 reseed.
+                                                          * -s 0 (no reseed) inflates MAPQ on bisulfite
+                                                          * reads (interior-repeat competitors go unfound);
+                                                          * -s 2 reseeds the occurrence-1 SMEMs that inflate,
+                                                          * recovering MAPQ+placement at ~the same speed. */
+    }
 
     /* Meth-mode default tuning. bwameth.py runs bwa as
      * `bwa mem -T 40 -B 2 -L 10 -CM`, adding `-U 100 -p` for paired-end. We adopt
@@ -1520,6 +1549,14 @@ int main_mem(int argc, char *argv[])
 
     if (opt->seed_emit_order != SEED_ORDER_OFF)
         fprintf(stderr, "[M::%s] seed order: %s\n", __func__, seed_order_to_str(opt->seed_emit_order));
+    if (fast) {
+        if (opt->meth_mode)
+            fprintf(stderr, "[M::%s] --fast: -m %d -y %ld --min-ext-len %d --smem-dedup -s %d\n",
+                    __func__, opt->max_matesw, (long)opt->max_mem_intv, opt->min_ext_len, opt->split_width);
+        else
+            fprintf(stderr, "[M::%s] --fast: -m %d -y %ld --min-ext-len %d --smem-dedup\n",
+                    __func__, opt->max_matesw, (long)opt->max_mem_intv, opt->min_ext_len);
+    }
 
     /* Load bwt2/FMI index */
     uint64_t tim = __rdtsc();

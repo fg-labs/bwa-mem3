@@ -217,12 +217,14 @@ very short, low-confidence chains.
 
 #### `--min-ext-len INT` — skip Smith-Waterman extension of short seeds
 
-Off by default (`0`) → output byte-identical to baseline. When `INT > 0`, seeds
-shorter than `INT` bp are dropped before banded Smith-Waterman, so their
-extension never runs (~10–20 % less alignment CPU). `30` is the recommended,
-accuracy-safe value for standard-error reads; keep it low or off for very
-high-error libraries. For the benchmarks, recommended value, and the high-error
-contraindication, see
+Off by default (`0`) → output byte-identical to baseline. When `INT > 0`, a short
+seed (< `INT` bp) is dropped before banded Smith-Waterman **only if its chain
+still has a longer anchor seed** — its extension is then redundant (the anchor
+already covers it), so skipping it is near output-neutral (~10 % less alignment
+CPU at `30`). A chain whose seeds are *all* short is left untouched, so the filter
+never empties a chain or drops a read: it is recall-safe by construction. `30` is
+the recommended value. For the benchmarks, behavior details, and validation
+status, see
 [Settings profiles → `--min-ext-len 30`](../best-practices/settings-profiles.md#short-seed-extension---min-ext-len-30).
 
 #### `-h INT[,INT]` — secondary alignment reporting
@@ -240,6 +242,29 @@ hit reporting with `-h`. Default: 0.80.
 
 Outputs `XB` in place of `XA`. `XB` is an extension of `XA` that also carries
 the alignment score and mapping quality for each secondary hit.
+
+### Speed preset
+
+#### `--fast` — speed preset (opt-in, not byte-identical)
+
+`--fast` is a one-flag shorthand for the characterized speed levers:
+
+```text
+bwa-mem3 mem --fast  ≡  -m 10 -y 0 --min-ext-len 30 --smem-dedup
+```
+
+Under `--meth` it additionally sets `-s 2` (light Pass-2 re-seeding). Earlier releases
+used `-s 0` (no re-seed), which inflated MAPQ on bisulfite reads; `-s 2` recovers the
+MAPQ/placement at nearly the same speed. See
+[Settings profiles → Pass-2 re-seeding](../best-practices/settings-profiles.md#pass-2-re-seeding-under---meth--s-2).
+
+Each lever is applied only if you did not set it explicitly, so explicit flags
+win where applicable (`--fast -m 30` keeps `-m 30`); `--smem-dedup` is always
+enabled and cannot be opted back out of once `--fast` is set. Output is **not**
+byte-identical to the default; the accuracy cost of each lever is characterized in
+[Settings profiles](../best-practices/settings-profiles.md) and is confined to
+the already-low-confidence tail. `bwa-mem3 mem` prints the resolved preset to
+stderr (`[M::main_mem] --fast: ...`) so runs are self-documenting.
 
 ### Methylation (`--meth`)
 

@@ -1,7 +1,10 @@
 // Unit tests for the --min-ext-len short-seed extension filter
-// (mem_chain_drop_short_seeds). The filter drops seeds shorter than the
-// threshold from a chain so they are never extended; min_ext_len <= 0 is a
-// no-op (default), which keeps output byte-identical to baseline.
+// (mem_chain_drop_short_seeds). In a chain that still holds a seed >=
+// min_ext_len (an anchor), seeds shorter than the threshold are dropped so they
+// are never extended. A chain with NO such anchor -- every seed shorter than the
+// threshold -- is left untouched, so the filter never empties a chain and never
+// loses a read (recall-safety invariant). min_ext_len <= 0 is a no-op (default),
+// which keeps output byte-identical to baseline.
 
 #include "doctest/doctest.h"
 #include "bwamem.h"
@@ -85,11 +88,14 @@ TEST_CASE("boundary: seed length == threshold is kept (>=)"
     CHECK(drop_short(seeds, 30) == std::vector<int>{30, 31});
 }
 
-TEST_CASE("all seeds shorter than threshold -> empty chain"
+TEST_CASE("all seeds shorter than threshold -> chain left intact (non-emptying)"
           * doctest::test_suite("unit/min_ext_len"))
 {
+    // No seed >= 30 means there is no anchor whose extension covers the short
+    // seeds, so the filter must leave the chain untouched rather than empty it
+    // (recall-safety: an all-short chain is a read's only evidence).
     auto seeds = make_seeds({10, 19, 25});
-    CHECK(drop_short(seeds, 30).empty());
+    CHECK(drop_short(seeds, 30) == std::vector<int>{10, 19, 25});
 }
 
 TEST_CASE("all seeds at least threshold -> all kept"

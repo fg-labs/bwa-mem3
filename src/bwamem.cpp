@@ -681,15 +681,27 @@ void mem_print_chain(const bntseq_t *bns, mem_chain_v *chn)
     }
 }
 
-// Skip-short-seed extension filter: drop seeds shorter than min_ext_len from a
-// chain in place, so they are never extended (their banded Smith-Waterman is
-// skipped downstream). Stable compaction -- surviving seeds keep their order.
-// Returns the new seed count. min_ext_len <= 0 is a no-op, which keeps default
-// output byte-identical to baseline.
+// Skip-short-seed extension filter: in a chain that still has a long-enough
+// anchor, drop seeds shorter than min_ext_len so they are never extended (their
+// banded Smith-Waterman is skipped downstream) -- those short seeds are collinear
+// with the anchor and its extension already covers them, so dropping them is
+// near output-neutral and pure speed.
+//
+// A chain with NO seed >= min_ext_len is left untouched: its only evidence is
+// short, so dropping it would empty the chain and the read would go unmapped.
+// Such all-short chains (common on low-mappability / repetitive reads) therefore
+// extend exactly as the default does. This guarantees the filter never empties a
+// non-empty chain, so it can only reduce extension work, never lose a read.
+//
+// Stable compaction -- surviving seeds keep their order. Returns the new seed
+// count. min_ext_len <= 0 is a no-op (default), byte-identical to baseline.
 int mem_chain_drop_short_seeds(mem_chain_t *c, int min_ext_len)
 {
     if (min_ext_len <= 0) return c->n;
     int j, k;
+    for (j = 0; j < c->n; ++j)
+        if (c->seeds[j].len >= min_ext_len) break;
+    if (j == c->n) return c->n;            /* no anchor: all-short chain, leave intact */
     for (j = k = 0; j < c->n; ++j)
         if (c->seeds[j].len >= min_ext_len)
             c->seeds[k++] = c->seeds[j];
@@ -725,8 +737,10 @@ void mem_flt_chained_seeds(const mem_opt_t *opt, const bntseq_t *bns, const uint
         // read lengths -- dropping seeds inside that loop would no-op on the main
         // workload. Off (min_ext_len==0): no-op, output byte-identical.
         mem_chain_drop_short_seeds(c, opt->min_ext_len);
-        if (c->n == 0) continue;  /* CodeRabbit: drop_short_seeds can empty the
-                                   * chain; the meth block below reads seeds[0]. */
+        if (c->n == 0) continue;  /* Defensive: drop_short_seeds never empties a
+                                   * non-empty chain (it leaves all-short chains
+                                   * intact), but the meth block below reads
+                                   * seeds[0], so guard regardless. */
 
         /* D3 (--meth, PR-4): swap to the original read + per-hypothesis matrix. */
         const int8_t *mat = opt->mat;

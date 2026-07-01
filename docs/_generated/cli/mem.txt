@@ -17,6 +17,10 @@ Options:
     -m INT        perform at most INT rounds of mate rescues for each read [50]
     -S            skip mate rescue
     -P            skip pairing; mate rescue performed unless -S also in use
+    --fast        speed preset: -m 10 -y 0 --min-ext-len 30 --smem-dedup (and -s 2
+                  under --meth). Opt-in; explicit flags override where applicable;
+                  --smem-dedup is always enabled. NOT byte-identical to the default
+                  (divergence confined to the low-confidence tail).
 Scoring options:
    -A INT        score for a sequence match, which scales options -TdBOELU unless overridden [1]
    -B INT        penalty for a mismatch [4]
