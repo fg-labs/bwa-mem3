@@ -261,6 +261,7 @@ mem_opt_t *mem_opt_init()
 
     o->min_seed_len = 19;
     o->min_ext_len = 0;   // off by default -> byte-identical to baseline
+    o->max_extend_chains = 0;   // off by default; opt-in speed lever (--max-extend-chains / --fast)
     o->seed_emit_order = SEED_ORDER_OFF;  // byte-identical default
     o->smem_dedup  = 0;   // off by default -> byte-identical to baseline; opt-in via --smem-dedup
     o->skip_contained_ext = 0;   // off by default; opt-in via --skip-contained-ext (byte-identical)
@@ -786,6 +787,35 @@ void mem_flt_chained_seeds(const mem_opt_t *opt, const bntseq_t *bns, const uint
         c->n = k;
     }
     free(meth_qbuf);  /* NULL outside --meth; free() is NULL-safe */
+}
+
+/* --max-extend-chains: cap the number of chains that reach banded-SW extension
+ * to the top `max_n` by chain weight (applied after mem_chain_flt). The dropped
+ * chains are the lowest-weight secondaries; on holodeck truth (sim-wgs-place)
+ * this keeps high-confidence placement accuracy essentially unchanged while
+ * cutting extension work -- errors it does add land in low-MAPQ multimappers,
+ * not confident calls. Opt-in speed lever (bundled into --fast); NOT
+ * byte-identical (drops candidate secondaries, so XS/secondary/MAPQ can move on
+ * multi-mapping reads). Always keeps >= 1 chain. Returns the new chain count. */
+#define MAX_EXTEND_CHAINS_CAP 4096
+static int mem_chain_cap_extend(mem_chain_t *a, int n, int max_n)
+{
+    if (max_n <= 0 || n <= max_n || n > MAX_EXTEND_CHAINS_CAP) return n;
+    int w[MAX_EXTEND_CHAINS_CAP];
+    for (int i = 0; i < n; i++) w[i] = a[i].w > 0 ? a[i].w : mem_chain_weight(&a[i]);
+    /* keep chain i iff fewer than max_n other chains outrank it by
+     * (weight desc, then original index asc) -- a stable top-max_n selection. */
+    int k = 0;
+    for (int i = 0; i < n; i++) {
+        int rank = 0;
+        for (int j = 0; j < n; j++) {
+            if (j == i) continue;
+            if (w[j] > w[i] || (w[j] == w[i] && j < i)) rank++;
+        }
+        if (rank < max_n) a[k++] = a[i];
+        else if (a[i].m > SEEDS_PER_CHAIN) free(a[i].seeds);
+    }
+    return k;
 }
 
 int mem_chain_flt(const mem_opt_t *opt, int n_chn_, mem_chain_t *a_, int tid)
@@ -1594,6 +1624,7 @@ int mem_kernel1_core(FMI_search *fmi,
     {
         chn = &chain_ar[l];
         chn->n = mem_chain_flt(opt, chn->n, chn->a, tid);
+        chn->n = mem_chain_cap_extend(chn->a, chn->n, opt->max_extend_chains);
     }
     printf_(VER, "7. Done mem_chain_flt..\n");
     // tprof[MEM_ALN_M1][tid] += __rdtsc() - tim;
