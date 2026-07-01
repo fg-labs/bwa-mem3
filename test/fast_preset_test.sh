@@ -2,7 +2,7 @@
 # test/fast_preset_test.sh
 #
 # Asserts that `bwa-mem3 mem --fast` resolves the four characterized speed
-# levers (-m 10 -y 0 --min-ext-len 30 --smem-dedup, plus -s 0 under --meth),
+# levers (-m 10 -y 0 --min-ext-len 30 --smem-dedup, plus -s 2 under --meth),
 # that explicit user flags override the preset, and that the default path is
 # untouched when --fast is absent.
 #
@@ -70,25 +70,25 @@ echo "OK:   explicit -m/-y/--min-ext-len override only their field; rest of pres
     || { echo "FAIL: audit line present without --fast" >&2; exit 1; }
 echo "OK:   no --fast => no audit line (default path untouched)"
 
-# 4. Meth path: --fast --meth additionally sets -s 0. Build a meth index on a
+# 4. Meth path: --fast --meth additionally sets -s 2. Build a meth index on a
 #    copy of phiX; if meth indexing is unavailable in this build, SKIP.
 cp "$ref" "$mdir/ref.fa"
 if "$bin" index --meth "$mdir/ref.fa" >/dev/null 2>&1; then
     "$bin" mem --meth --fast -t 1 "$mdir/ref.fa" "$reads" >/dev/null 2>"$err" \
         || { echo "FAIL: mem --meth --fast nonzero" >&2; cat "$err" >&2; exit 1; }
     line="$(grep -E '^\[M::main_mem\] --fast:' "$err" || true)"
-    [[ "$line" == *"-s 0"* ]] \
-        || { echo "FAIL: --fast --meth should resolve -s 0: '$line'" >&2; exit 1; }
-    echo "OK:   --fast --meth additionally sets -s 0"
-    # Explicit -s wins even under --meth (src/fastmap.cpp: -s 0 is gated on !opt0.split_width).
+    [[ "$line" == *"-s 2"* ]] \
+        || { echo "FAIL: --fast --meth should resolve -s 2: '$line'" >&2; exit 1; }
+    echo "OK:   --fast --meth additionally sets -s 2"
+    # Explicit -s wins even under --meth (src/fastmap.cpp: -s 2 is gated on !opt0.split_width).
     "$bin" mem --meth --fast -s 7 -t 1 "$mdir/ref.fa" "$reads" >/dev/null 2>"$err" \
         || { echo "FAIL: mem --meth --fast -s 7 nonzero" >&2; cat "$err" >&2; exit 1; }
     line="$(grep -E '^\[M::main_mem\] --fast:' "$err" || true)"
     [[ "$line" == *"-s 7"* ]] \
         || { echo "FAIL: explicit -s 7 should win under --meth: '$line'" >&2; exit 1; }
-    echo "OK:   explicit -s 7 overrides --fast --meth's -s 0"
+    echo "OK:   explicit -s 7 overrides --fast --meth's -s 2"
 else
-    echo "SKIP: index --meth unavailable; meth -s 0 case not checked" >&2
+    echo "SKIP: index --meth unavailable; meth -s 2 case not checked" >&2
 fi
 
 echo "PASS: fast_preset_test"

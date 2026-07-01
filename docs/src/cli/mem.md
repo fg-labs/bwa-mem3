@@ -253,7 +253,10 @@ the alignment score and mapping quality for each secondary hit.
 bwa-mem3 mem --fast  ≡  -m 10 -y 0 --min-ext-len 30 --smem-dedup
 ```
 
-Under `--meth` it additionally sets `-s 0` (drop Pass-2 re-seeding).
+Under `--meth` it additionally sets `-s 2` (light Pass-2 re-seeding). Earlier releases
+used `-s 0` (no re-seed), which inflated MAPQ on bisulfite reads; `-s 2` recovers the
+MAPQ/placement at nearly the same speed. See
+[Settings profiles → Pass-2 re-seeding](../best-practices/settings-profiles.md#pass-2-re-seeding-under---meth--s-2).
 
 Each lever is applied only if you did not set it explicitly, so explicit flags
 win where applicable (`--fast -m 30` keeps `-m 30`); `--smem-dedup` is always

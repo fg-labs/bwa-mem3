@@ -16,7 +16,7 @@ with explicit flags — so upgrading bwa-mem3 never silently changes your alignm
 | Your situation | Profile | Invocation |
 |---|---|---|
 | Migrating a bwa-mem2 pipeline, or validating against bwa/bwa-mem2 | **Drop-in** | `bwa-mem3 mem` (no extra flags) |
-| New pipeline, or migration already validated | **Recommended** | `bwa-mem3 mem -m 10 -y 0` (add `-s 0` under `--meth`) |
+| New pipeline, or migration already validated | **Recommended** | `bwa-mem3 mem -m 10 -y 0` (add `-s 2` under `--meth`) |
 
 > bwa-mem3 is already, by design, *not* byte-identical to bwa-mem2 even at default settings
 > (additive SAM tags, per-architecture SIMD `score2`/MAPQ convergence, deterministic tie-breaks, a
@@ -44,7 +44,7 @@ bwa-mem3 mem -t <N> -m 10 -y 0 ref.fa R1.fq R2.fq > out.sam
 ```
 
 > **Shorthand:** `bwa-mem3 mem --fast` applies `-m 10 -y 0 --min-ext-len 30
-> --smem-dedup` (and `-s 0` under `--meth`) in one flag. Explicit flags still
+> --smem-dedup` (and `-s 2` under `--meth`) in one flag. Explicit flags still
 > override individual levers where applicable; `--smem-dedup` is always enabled.
 > See [`mem` → `--fast`](../cli/mem.md#--fast--speed-preset-opt-in-not-byte-identical).
 
@@ -55,7 +55,7 @@ speed/accuracy trade-off. Current recommended deviations:
 |---|---|---|---|
 | `-m` (mate-rescue depth) | 50 | **10** | ~11–22% less alignment CPU; near-neutral accuracy (see below) |
 | `-y` (3rd-round seeding occurrence) | 20 | **0** | ~11–30% less alignment CPU; F1 near-neutral across regimes (within ±0.02; better on divergent/repeat — see below) |
-| `-s` (Pass-2 re-seed width), **`--meth` only** | 10 | **0** | ~20% less alignment CPU; near-neutral accuracy (see below) |
+| `-s` (Pass-2 re-seed width), **`--meth` only** | 10 | **2** | light re-seed: ~same speed as `-s 0` but recovers the MAPQ/placement `-s 0` lost (see below) |
 | `--min-ext-len` (skip short-seed extension), **standard-error reads** | 0 | **30** | ~10–20% less alignment CPU; accuracy change confined to the already-low-confidence tail (see below) |
 
 This table will grow as we benchmark additional tunings; each entry is gated on the same
@@ -64,7 +64,7 @@ This table will grow as we benchmark additional tunings; each entry is gated on 
 For a bisulfite (`--meth`) pipeline the recommended invocation is therefore:
 
 ```bash
-bwa-mem3 mem -t <N> --meth -m 10 -s 0 -y 0 ref.fa R1.fq R2.fq > out.sam
+bwa-mem3 mem -t <N> --meth -m 10 -s 2 -y 0 ref.fa R1.fq R2.fq > out.sam
 ```
 
 ## Mate-rescue depth: `-m 10`
@@ -146,7 +146,19 @@ alignment CPU (~50–63 %), but round 2 *is* genuine split-read/divergence sensi
 bin). Use `-y 0 -r 10` only on known-clean, low-divergence libraries; `-y 0` alone is the
 broadly-safe recommendation.
 
-## Pass-2 re-seeding under `--meth`: `-s 0`
+## Pass-2 re-seeding under `--meth`: `-s 2`
+
+> **`--fast --meth` uses `-s 2` (light Pass-2 re-seed), not `-s 0`.** Earlier releases set `-s 0`
+> (no re-seed). Read-level analysis on holodeck sim reads showed `-s 0` **inflates MAPQ**: the affected
+> reads map on occurrence-1 SMEMs that hide an *interior* repeat only Pass-2 would surface, so without
+> it they look uniquely placed and MAPQ is pushed toward 60 — the calibration caveat noted below, now
+> quantified. `-s 2` re-seeds exactly those occurrence-1 SMEMs (the cheap subset), recovering MAPQ
+> **and** placement at ≈ the speed of `-s 0` (3.6× vs 3.25× on twist-em-seq 5M; MAPQ matches the `-s 10`
+> default on 85/86 changed reads; placement 97.6% = default). This is the "cheap middle ground" the
+> read-confidence fallback at the end of this section did not find (it re-seeds by SMEM *occurrence*,
+> not by read confidence). **Validation status:** the `-s 0` recall/speed figures below are the
+> genome-wide em-seq bench; the `-s 2` MAPQ/placement recovery is read-level + chr1 sim, with a
+> genome-wide em-seq re-run pending.
 
 `-s` controls bwa-mem's Pass-2 "re-seeding" — after the first seeding pass, long super-maximal exact
 matches whose occurrence count is `≤ -s` are re-seeded from their midpoint to recover shorter, more

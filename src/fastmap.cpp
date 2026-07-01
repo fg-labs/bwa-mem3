@@ -938,7 +938,7 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "    -m INT        perform at most INT rounds of mate rescues for each read [%d]\n", opt->max_matesw);
     fprintf(stderr, "    -S            skip mate rescue\n");
     fprintf(stderr, "    -P            skip pairing; mate rescue performed unless -S also in use\n");
-    fprintf(stderr, "    --fast        speed preset: -m 10 -y 0 --min-ext-len 30 --smem-dedup (and -s 0\n");
+    fprintf(stderr, "    --fast        speed preset: -m 10 -y 0 --min-ext-len 30 --smem-dedup (and -s 2\n");
     fprintf(stderr, "                  under --meth). Opt-in; explicit flags override where applicable;\n");
     fprintf(stderr, "                  --smem-dedup is always enabled. NOT byte-identical to the default\n");
     fprintf(stderr, "                  (divergence confined to the low-confidence tail).\n");
@@ -1433,7 +1433,11 @@ int main_mem(int argc, char *argv[])
         if (!opt0.min_ext_len)  opt->min_ext_len  = 30;  /* --min-ext-len 30 */
         opt->smem_dedup = 1;                             /* --smem-dedup (plain on/off) */
         if (opt->meth_mode && !opt0.split_width)
-            opt->split_width = 0;                        /* -s 0 (meth only) */
+            opt->split_width = 2;                        /* -s 2 (meth only): light Pass-2 reseed.
+                                                          * -s 0 (no reseed) inflates MAPQ on bisulfite
+                                                          * reads (interior-repeat competitors go unfound);
+                                                          * -s 2 reseeds the occurrence-1 SMEMs that inflate,
+                                                          * recovering MAPQ+placement at ~the same speed. */
     }
 
     /* Meth-mode default tuning. bwameth.py runs bwa as
