@@ -3290,7 +3290,6 @@ int kswv::kswv512_16_impl(int16_t seq1SoA[],
     _mm_prefetch((const char*) seq2SoA, _MM_HINT_T1);
     _mm_prefetch((const char*) seq1SoA, _MM_HINT_NTA);
     _mm_prefetch((const char*) (H1 + SIMD_WIDTH16), _MM_HINT_T0);
-    _mm_prefetch((const char*) (F + SIMD_WIDTH16), _MM_HINT_T0);
 
     for (int i=ncol; i >= 0; i--) {
         _mm512_store_si512((__m512*) (H0 + i * SIMD_WIDTH16), zero512);
