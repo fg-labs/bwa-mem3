@@ -942,9 +942,10 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "    -S            skip mate rescue\n");
     fprintf(stderr, "    -P            skip pairing; mate rescue performed unless -S also in use\n");
     fprintf(stderr, "    --fast        speed preset: -m 10 -y 0 --min-ext-len 30 --smem-dedup\n");
-    fprintf(stderr, "                  --skip-contained-ext --max-extend-chains 5 (and -s 2 under\n");
-    fprintf(stderr, "                  --meth). Opt-in; explicit flags override where applicable;\n");
-    fprintf(stderr, "                  --smem-dedup and --skip-contained-ext are always enabled. NOT\n");
+    fprintf(stderr, "                  --skip-contained-ext --max-extend-chains 5 --adaptive-band (and\n");
+    fprintf(stderr, "                  -s 2 under --meth). Opt-in; explicit flags override where\n");
+    fprintf(stderr, "                  applicable; --smem-dedup, --skip-contained-ext and\n");
+    fprintf(stderr, "                  --adaptive-band are always enabled. NOT\n");
     fprintf(stderr, "                  byte-identical to the default (divergence confined to the\n");
     fprintf(stderr, "                  low-confidence tail).\n");
     fprintf(stderr, "Scoring options:\n");
@@ -1454,6 +1455,9 @@ int main_mem(int argc, char *argv[])
         opt->smem_dedup = 1;                             /* --smem-dedup (plain on/off) */
         opt->skip_contained_ext = 1;                     /* --skip-contained-ext (plain on/off;
                                                           * meth-gated internally) */
+        opt->band_start = ADAPTIVE_BAND_START;           /* --adaptive-band: no-op on short reads
+                                                          * (8-bit tier untouched), ~25% faster on
+                                                          * long-read (SBX/HiFi/ONT) runs. */
         if (opt->meth_mode && !opt0.split_width)
             opt->split_width = 2;                        /* -s 2 (meth only): light Pass-2 reseed.
                                                           * -s 0 (no reseed) inflates MAPQ on bisulfite
@@ -1574,11 +1578,12 @@ int main_mem(int argc, char *argv[])
     if (fast) {
         if (opt->meth_mode)
             /* --skip-contained-ext is set but no-ops under --meth (internal gate), so it is
-             * intentionally omitted from the meth audit line to reflect the effective levers. */
-            fprintf(stderr, "[M::%s] --fast: -m %d -y %ld --min-ext-len %d --smem-dedup --max-extend-chains %d -s %d\n",
+             * intentionally omitted from the meth audit line to reflect the effective levers.
+             * --adaptive-band is set unconditionally and applies under --meth, so it stays. */
+            fprintf(stderr, "[M::%s] --fast: -m %d -y %ld --min-ext-len %d --smem-dedup --max-extend-chains %d --adaptive-band -s %d\n",
                     __func__, opt->max_matesw, (long)opt->max_mem_intv, opt->min_ext_len, opt->max_extend_chains, opt->split_width);
         else
-            fprintf(stderr, "[M::%s] --fast: -m %d -y %ld --min-ext-len %d --smem-dedup --skip-contained-ext --max-extend-chains %d\n",
+            fprintf(stderr, "[M::%s] --fast: -m %d -y %ld --min-ext-len %d --smem-dedup --skip-contained-ext --max-extend-chains %d --adaptive-band\n",
                     __func__, opt->max_matesw, (long)opt->max_mem_intv, opt->min_ext_len, opt->max_extend_chains);
     }
 

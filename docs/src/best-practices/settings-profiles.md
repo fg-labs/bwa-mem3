@@ -44,12 +44,14 @@ bwa-mem3 mem -t <N> -m 10 -y 0 ref.fa R1.fq R2.fq > out.sam
 ```
 
 > **Shorthand:** `bwa-mem3 mem --fast` applies `-m 10 -y 0 --min-ext-len 30
-> --smem-dedup --skip-contained-ext --max-extend-chains 5` (and `-s 2` under
-> `--meth`) in one flag. Explicit flags still override individual levers where
-> applicable; `--smem-dedup` and `--skip-contained-ext` are forced on with no
-> opt-out. `--skip-contained-ext` no-ops under `--meth` (its own internal gate
-> disables it there), so on a `--meth` run the effective levers are
-> `-m 10 -y 0 --min-ext-len 30 --smem-dedup --max-extend-chains 5 -s 2`.
+> --smem-dedup --skip-contained-ext --max-extend-chains 5 --adaptive-band` (and
+> `-s 2` under `--meth`) in one flag. Explicit flags still override individual
+> levers where applicable; `--smem-dedup`, `--skip-contained-ext` and
+> `--adaptive-band` are forced on with no opt-out (`--adaptive-band` is a no-op on
+> short reads, a ~25% speedup on long-read runs). `--skip-contained-ext` no-ops
+> under `--meth` (its own internal gate disables it there), so on a `--meth` run
+> the effective levers are
+> `-m 10 -y 0 --min-ext-len 30 --smem-dedup --max-extend-chains 5 --adaptive-band -s 2`.
 > See [`mem` → `--fast`](../cli/mem.md#--fast--speed-preset-opt-in-not-byte-identical).
 
 Use this for new pipelines, or once a drop-in migration is validated and you want bwa-mem3's best

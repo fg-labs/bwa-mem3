@@ -292,12 +292,16 @@ the alignment score and mapping quality for each secondary hit.
 `--fast` is a one-flag shorthand for the characterized speed levers:
 
 ```text
-bwa-mem3 mem --fast  ≡  -m 10 -y 0 --min-ext-len 30 --smem-dedup --skip-contained-ext --max-extend-chains 5
+bwa-mem3 mem --fast  ≡  -m 10 -y 0 --min-ext-len 30 --smem-dedup --skip-contained-ext --max-extend-chains 5 --adaptive-band
 ```
 
 `--skip-contained-ext` is byte-identical to the default on non-meth single- and paired-end
 reads and no-ops under `--meth` (via its own internal gate), so it is pure upside where it
 applies (~10% lower alignment CPU on long-read inputs) and safe elsewhere.
+
+`--adaptive-band` (see above) is included because it is a strict no-op on short reads
+(the reads `--fast` primarily targets) and a ~25% alignment-CPU speedup on long-read
+(SBX/HiFi/ONT) runs, so bundling it only helps.
 
 Under `--meth` it additionally sets `-s 2` (light Pass-2 re-seeding). Earlier releases
 used `-s 0` (no re-seed), which inflated MAPQ on bisulfite reads; `-s 2` recovers the
