@@ -5460,7 +5460,7 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
     }
 
 
-// #define PFD 2 // SSE2
+#define PFD 2 // SSE2
 void BandedPairWiseSW::getScores8(SeqPair *pairArray,
                                   uint8_t *seqBufRef,
                                   uint8_t *seqBufQer,
@@ -5507,7 +5507,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
         fprintf(stderr, "Error! Mem not allocated!!!\n");
         exit(EXIT_FAILURE);
     }
-    
+
     int32_t ii;
     int32_t roundNumPairs = ((numPairs + SIMD_WIDTH8 - 1)/SIMD_WIDTH8 ) * SIMD_WIDTH8;
     // assert(roundNumPairs < BATCH_SIZE * SEEDS_PER_READ);
@@ -5516,6 +5516,15 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
         pairArray[ii].id = ii;
         pairArray[ii].len1 = 0;
         pairArray[ii].len2 = 0;
+        // Zero idr/idq so padded lanes carry the all-tier padding contract: the
+        // per-lane compute loop below still forms seqBufRef+idr / seqBufQer+idq
+        // for padded lanes (i+j reaches up to roundNumPairs-1) even though it
+        // never dereferences them (len1==len2==0). With idr/idq==0 that pointer
+        // is seqBuf+0 (in-bounds), so no lane forms a pointer from an
+        // indeterminate offset. Matches the 512-bit 8-bit and all 16-bit padding
+        // loops. Byte-identical: padded lanes contribute nothing to output.
+        pairArray[ii].idr = 0;
+        pairArray[ii].idq = 0;
     }
 
 #if RDT
@@ -5576,6 +5585,12 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
             
             for(j = 0; j < SIMD_WIDTH8; j++)
             {
+                if ((i + j + PFD) < numPairs) { // prefetch only real successors; a padded successor (>= numPairs) is non-existent, so there is no useful line to prefetch
+                    SeqPair spf = pairArray[i + j + PFD];
+                    _mm_prefetch((const char*) seqBufRef + (int64_t)spf.idr, _MM_HINT_NTA);
+                    _mm_prefetch((const char*) seqBufRef + (int64_t)spf.idr + 64, _MM_HINT_NTA);
+                }
+
                 SeqPair sp = pairArray[i + j];
                 // Seed the H arrays from the raw seed score h0. The 8-bit state is
                 // now a plain unsigned [0,255] absolute score (the re-baseline floor
@@ -5634,6 +5649,12 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
 
             for(j = 0; j < SIMD_WIDTH8; j++)
             {               
+                if ((i + j + PFD) < numPairs) { // prefetch only real successors; a padded successor (>= numPairs) is non-existent, so there is no useful line to prefetch
+                    SeqPair spf = pairArray[i + j + PFD];
+                    _mm_prefetch((const char*) seqBufQer + (int64_t)spf.idq, _MM_HINT_NTA);
+                    _mm_prefetch((const char*) seqBufQer + (int64_t)spf.idq + 64, _MM_HINT_NTA);
+                }
+
                 SeqPair sp = pairArray[i + j];
                 // seq2 = seqBuf + (2 * (int64_t)sp.id + 1) * MAX_SEQ_LEN;
                 seq2 = seqBufQer + (int64_t)sp.idq;
