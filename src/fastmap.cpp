@@ -935,6 +935,7 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "    --smem-dedup  dedup identical SMEMs before chaining: fewer SA lookups, ~10%% fewer; opt-in, NOT byte-identical (changes XS/secondary on a small fraction of reads) [off]\n");
     fprintf(stderr, "    --skip-contained-ext  skip banded-SW extension of seeds contained (same diagonal) in a longer in-chain seed; byte-identical (non-meth), ~10%% less alignment CPU; no effect under --meth [off]\n");
     fprintf(stderr, "    --max-extend-chains INT  cap chains extended per read to the top-INT by weight; ~23%% less alignment CPU, high-confidence placement unaffected; ignored for reads with >4096 chains; opt-in, NOT byte-identical (0 = off) [%d]\n", opt->max_extend_chains);
+    fprintf(stderr, "    --adaptive-band  adaptive banded-SW: start tight and expand each pair to its chain-geometry band on long-extension reads; long-read speedup (~1.3x on SBX), no-op on short reads; opt-in, NOT byte-identical [%s]\n", opt->band_start? "on":"off");
     fprintf(stderr, "    -D FLOAT      drop chains shorter than FLOAT fraction of the longest overlapping chain [%.2f]\n", opt->drop_ratio);
     fprintf(stderr, "    -W INT        discard a chain if seeded bases shorter than INT [0]\n");
     fprintf(stderr, "    -m INT        perform at most INT rounds of mate rescues for each read [%d]\n", opt->max_matesw);
@@ -1124,6 +1125,7 @@ int main_mem(int argc, char *argv[])
         OPT_SMEM_DEDUP,
         OPT_FAST,
         OPT_SKIP_CONTAINED_EXT,
+        OPT_ADAPTIVE_BAND,
 #ifdef STAGE_PROF
         OPT_PROFILE,
 #endif
@@ -1136,6 +1138,7 @@ int main_mem(int argc, char *argv[])
         {"smem-dedup",               no_argument,       0, OPT_SMEM_DEDUP},
         {"fast",                     no_argument,       0, OPT_FAST},
         {"skip-contained-ext",       no_argument,       0, OPT_SKIP_CONTAINED_EXT},
+        {"adaptive-band",            no_argument,       0, OPT_ADAPTIVE_BAND},
         {"meth",                     no_argument,       0, OPT_METH},
         {"meth-scoring",             required_argument, 0, OPT_METH_SCORING},
         {"set-as-failed",            required_argument, 0, OPT_METH_SET_AS_FAILED},
@@ -1336,6 +1339,7 @@ int main_mem(int argc, char *argv[])
         else if (c == OPT_SMEM_DEDUP) opt->smem_dedup = 1;
         else if (c == OPT_FAST) fast = 1;
         else if (c == OPT_SKIP_CONTAINED_EXT) opt->skip_contained_ext = 1;
+        else if (c == OPT_ADAPTIVE_BAND) opt->band_start = ADAPTIVE_BAND_START;
         else if (c == OPT_HELP) {
             usage(opt);
             free(opt);
