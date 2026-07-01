@@ -933,15 +933,17 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "    -y INT        seed occurrence for the 3rd round seeding [%ld]\n", (long)opt->max_mem_intv);
     fprintf(stderr, "    -c INT        skip seeds with more than INT occurrences [%d]\n", opt->max_occ);
     fprintf(stderr, "    --smem-dedup  dedup identical SMEMs before chaining: fewer SA lookups, ~10%% fewer; opt-in, NOT byte-identical (changes XS/secondary on a small fraction of reads) [off]\n");
+    fprintf(stderr, "    --skip-contained-ext  skip banded-SW extension of seeds contained (same diagonal) in a longer in-chain seed; byte-identical (non-meth), ~10%% less alignment CPU; no effect under --meth [off]\n");
     fprintf(stderr, "    -D FLOAT      drop chains shorter than FLOAT fraction of the longest overlapping chain [%.2f]\n", opt->drop_ratio);
     fprintf(stderr, "    -W INT        discard a chain if seeded bases shorter than INT [0]\n");
     fprintf(stderr, "    -m INT        perform at most INT rounds of mate rescues for each read [%d]\n", opt->max_matesw);
     fprintf(stderr, "    -S            skip mate rescue\n");
     fprintf(stderr, "    -P            skip pairing; mate rescue performed unless -S also in use\n");
-    fprintf(stderr, "    --fast        speed preset: -m 10 -y 0 --min-ext-len 30 --smem-dedup (and -s 2\n");
-    fprintf(stderr, "                  under --meth). Opt-in; explicit flags override where applicable;\n");
-    fprintf(stderr, "                  --smem-dedup is always enabled. NOT byte-identical to the default\n");
-    fprintf(stderr, "                  (divergence confined to the low-confidence tail).\n");
+    fprintf(stderr, "    --fast        speed preset: -m 10 -y 0 --min-ext-len 30 --smem-dedup\n");
+    fprintf(stderr, "                  --skip-contained-ext (and -s 2 under --meth). Opt-in; explicit\n");
+    fprintf(stderr, "                  flags override where applicable; --smem-dedup and\n");
+    fprintf(stderr, "                  --skip-contained-ext are always enabled. NOT byte-identical to\n");
+    fprintf(stderr, "                  the default (divergence confined to the low-confidence tail).\n");
     fprintf(stderr, "Scoring options:\n");
     fprintf(stderr, "   -A INT        score for a sequence match, which scales options -TdBOELU unless overridden [%d]\n", opt->a);
     fprintf(stderr, "   -B INT        penalty for a mismatch [%d]\n", opt->b);
@@ -1118,6 +1120,7 @@ int main_mem(int argc, char *argv[])
         OPT_SEED_ORDER,
         OPT_SMEM_DEDUP,
         OPT_FAST,
+        OPT_SKIP_CONTAINED_EXT,
 #ifdef STAGE_PROF
         OPT_PROFILE,
 #endif
@@ -1128,6 +1131,7 @@ int main_mem(int argc, char *argv[])
         {"min-ext-len",              required_argument, 0, OPT_MIN_EXT_LEN},
         {"smem-dedup",               no_argument,       0, OPT_SMEM_DEDUP},
         {"fast",                     no_argument,       0, OPT_FAST},
+        {"skip-contained-ext",       no_argument,       0, OPT_SKIP_CONTAINED_EXT},
         {"meth",                     no_argument,       0, OPT_METH},
         {"meth-scoring",             required_argument, 0, OPT_METH_SCORING},
         {"set-as-failed",            required_argument, 0, OPT_METH_SET_AS_FAILED},
@@ -1326,6 +1330,7 @@ int main_mem(int argc, char *argv[])
         }
         else if (c == OPT_SMEM_DEDUP) opt->smem_dedup = 1;
         else if (c == OPT_FAST) fast = 1;
+        else if (c == OPT_SKIP_CONTAINED_EXT) opt->skip_contained_ext = 1;
         else if (c == OPT_HELP) {
             usage(opt);
             free(opt);
@@ -1420,10 +1425,15 @@ int main_mem(int argc, char *argv[])
     } else update_a(opt, &opt0);
 
     /* --fast: one-flag shorthand for the characterized speed levers
-     *   -m 10  -y 0  --min-ext-len 30  --smem-dedup   (+ -s 0 under --meth).
+     *   -m 10  -y 0  --min-ext-len 30  --smem-dedup  --skip-contained-ext
+     *   (+ -s 2 under --meth).
      * Mirrors the -x preset: each lever is applied only when the user did not
-     * set it explicitly (opt0), so explicit flags win where applicable. The one
-     * exception is --smem-dedup, which is forced on unconditionally (no opt-out).
+     * set it explicitly (opt0), so explicit flags win where applicable. The
+     * exceptions are --smem-dedup and --skip-contained-ext, which are plain
+     * on/off booleans forced on unconditionally (no opt-out flag exists).
+     * --skip-contained-ext is byte-identical on non-meth SE/PE and no-ops under
+     * --meth via its own internal gate (see bwamem.cpp), so forcing it on here is
+     * safe for --fast --meth too.
      * Output is NOT byte-identical to the default; divergence is confined to the
      * low-confidence tail (see docs/best-practices/settings-profiles.md).
      * meth_mode is already resolved here (parsed in the getopt loop above). */
@@ -1432,6 +1442,8 @@ int main_mem(int argc, char *argv[])
         if (!opt0.max_mem_intv) opt->max_mem_intv = 0;   /* -y 0  */
         if (!opt0.min_ext_len)  opt->min_ext_len  = 30;  /* --min-ext-len 30 */
         opt->smem_dedup = 1;                             /* --smem-dedup (plain on/off) */
+        opt->skip_contained_ext = 1;                     /* --skip-contained-ext (plain on/off;
+                                                          * meth-gated internally) */
         if (opt->meth_mode && !opt0.split_width)
             opt->split_width = 2;                        /* -s 2 (meth only): light Pass-2 reseed.
                                                           * -s 0 (no reseed) inflates MAPQ on bisulfite
@@ -1551,10 +1563,12 @@ int main_mem(int argc, char *argv[])
         fprintf(stderr, "[M::%s] seed order: %s\n", __func__, seed_order_to_str(opt->seed_emit_order));
     if (fast) {
         if (opt->meth_mode)
+            /* --skip-contained-ext is set but no-ops under --meth (internal gate), so it is
+             * intentionally omitted from the meth audit line to reflect the effective levers. */
             fprintf(stderr, "[M::%s] --fast: -m %d -y %ld --min-ext-len %d --smem-dedup -s %d\n",
                     __func__, opt->max_matesw, (long)opt->max_mem_intv, opt->min_ext_len, opt->split_width);
         else
-            fprintf(stderr, "[M::%s] --fast: -m %d -y %ld --min-ext-len %d --smem-dedup\n",
+            fprintf(stderr, "[M::%s] --fast: -m %d -y %ld --min-ext-len %d --smem-dedup --skip-contained-ext\n",
                     __func__, opt->max_matesw, (long)opt->max_mem_intv, opt->min_ext_len);
     }
 

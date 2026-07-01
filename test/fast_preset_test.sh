@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # test/fast_preset_test.sh
 #
-# Asserts that `bwa-mem3 mem --fast` resolves the four characterized speed
-# levers (-m 10 -y 0 --min-ext-len 30 --smem-dedup, plus -s 2 under --meth),
-# that explicit user flags override the preset, and that the default path is
-# untouched when --fast is absent.
+# Asserts that `bwa-mem3 mem --fast` resolves the characterized speed levers
+# (-m 10 -y 0 --min-ext-len 30 --smem-dedup --skip-contained-ext, plus -s 2
+# under --meth), that explicit user flags override the preset, and that the
+# default path is untouched when --fast is absent. --skip-contained-ext no-ops
+# under --meth (internal gate), so it is omitted from the meth audit line.
 #
 # The assertion surface is the audit line main_mem prints to stderr when
 # --fast is active: it reports the *resolved* mem_opt_t values, so an explicit
@@ -42,25 +43,29 @@ fast_line() {
 # 1. Bundle correctness (non-meth).
 line="$(fast_line --fast)"
 [[ "$line" == *"-m 10"* && "$line" == *"-y 0"* \
-   && "$line" == *"--min-ext-len 30"* && "$line" == *"--smem-dedup"* ]] \
+   && "$line" == *"--min-ext-len 30"* && "$line" == *"--smem-dedup"* \
+   && "$line" == *"--skip-contained-ext"* ]] \
     || { echo "FAIL: --fast bundle wrong: '$line'" >&2; exit 1; }
 [[ "$line" != *"-s "* ]] \
     || { echo "FAIL: non-meth --fast must not set -s: '$line'" >&2; exit 1; }
-echo "OK:   --fast bundle resolves -m 10 -y 0 --min-ext-len 30 --smem-dedup"
+echo "OK:   --fast bundle resolves -m 10 -y 0 --min-ext-len 30 --smem-dedup --skip-contained-ext"
 
 # 2. Override precedence: an explicit flag wins *only* for its own field; the
 #    rest of the preset (including the unconditional --smem-dedup) must survive.
 line="$(fast_line --fast -m 30)"
 [[ "$line" == *"-m 30"* && "$line" == *"-y 0"* \
-   && "$line" == *"--min-ext-len 30"* && "$line" == *"--smem-dedup"* ]] \
+   && "$line" == *"--min-ext-len 30"* && "$line" == *"--smem-dedup"* \
+   && "$line" == *"--skip-contained-ext"* ]] \
     || { echo "FAIL: explicit -m 30 should only override -m: '$line'" >&2; exit 1; }
 line="$(fast_line --fast -y 5)"
 [[ "$line" == *"-m 10"* && "$line" == *"-y 5"* \
-   && "$line" == *"--min-ext-len 30"* && "$line" == *"--smem-dedup"* ]] \
+   && "$line" == *"--min-ext-len 30"* && "$line" == *"--smem-dedup"* \
+   && "$line" == *"--skip-contained-ext"* ]] \
     || { echo "FAIL: explicit -y 5 should only override -y: '$line'" >&2; exit 1; }
 line="$(fast_line --fast --min-ext-len 45)"
 [[ "$line" == *"-m 10"* && "$line" == *"-y 0"* \
-   && "$line" == *"--min-ext-len 45"* && "$line" == *"--smem-dedup"* ]] \
+   && "$line" == *"--min-ext-len 45"* && "$line" == *"--smem-dedup"* \
+   && "$line" == *"--skip-contained-ext"* ]] \
     || { echo "FAIL: explicit --min-ext-len 45 should only override min-ext-len: '$line'" >&2; exit 1; }
 echo "OK:   explicit -m/-y/--min-ext-len override only their field; rest of preset survives"
 
@@ -79,7 +84,9 @@ if "$bin" index --meth "$mdir/ref.fa" >/dev/null 2>&1; then
     line="$(grep -E '^\[M::main_mem\] --fast:' "$err" || true)"
     [[ "$line" == *"-s 2"* ]] \
         || { echo "FAIL: --fast --meth should resolve -s 2: '$line'" >&2; exit 1; }
-    echo "OK:   --fast --meth additionally sets -s 2"
+    [[ "$line" != *"--skip-contained-ext"* ]] \
+        || { echo "FAIL: --skip-contained-ext no-ops under --meth; must be absent from audit line: '$line'" >&2; exit 1; }
+    echo "OK:   --fast --meth additionally sets -s 2 (skip-contained-ext omitted, meth-gated)"
     # Explicit -s wins even under --meth (src/fastmap.cpp: -s 2 is gated on !opt0.split_width).
     "$bin" mem --meth --fast -s 7 -t 1 "$mdir/ref.fa" "$reads" >/dev/null 2>"$err" \
         || { echo "FAIL: mem --meth --fast -s 7 nonzero" >&2; cat "$err" >&2; exit 1; }

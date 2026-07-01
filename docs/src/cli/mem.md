@@ -250,8 +250,12 @@ the alignment score and mapping quality for each secondary hit.
 `--fast` is a one-flag shorthand for the characterized speed levers:
 
 ```text
-bwa-mem3 mem --fast  ≡  -m 10 -y 0 --min-ext-len 30 --smem-dedup
+bwa-mem3 mem --fast  ≡  -m 10 -y 0 --min-ext-len 30 --smem-dedup --skip-contained-ext
 ```
+
+`--skip-contained-ext` is byte-identical to the default on non-meth single- and paired-end
+reads and no-ops under `--meth` (via its own internal gate), so it is pure upside where it
+applies (~10% lower alignment CPU on long-read inputs) and safe elsewhere.
 
 Under `--meth` it additionally sets `-s 2` (light Pass-2 re-seeding). Earlier releases
 used `-s 0` (no re-seed), which inflated MAPQ on bisulfite reads; `-s 2` recovers the
@@ -259,8 +263,9 @@ MAPQ/placement at nearly the same speed. See
 [Settings profiles → Pass-2 re-seeding](../best-practices/settings-profiles.md#pass-2-re-seeding-under---meth--s-2).
 
 Each lever is applied only if you did not set it explicitly, so explicit flags
-win where applicable (`--fast -m 30` keeps `-m 30`); `--smem-dedup` is always
-enabled and cannot be opted back out of once `--fast` is set. Output is **not**
+win where applicable (`--fast -m 30` keeps `-m 30`); `--smem-dedup` and
+`--skip-contained-ext` are always enabled and cannot be opted back out of once
+`--fast` is set. Output is **not**
 byte-identical to the default; the accuracy cost of each lever is characterized in
 [Settings profiles](../best-practices/settings-profiles.md) and is confined to
 the already-low-confidence tail. `bwa-mem3 mem` prints the resolved preset to

@@ -145,6 +145,7 @@ typedef struct mem_opt_t {
     int    meth_chimera_qc; // 1 to enable bwameth.py-style longest-M <44% chimera heuristic (default off; not in Bismark)
     int    supp_rep_hard_cap; // supp alnregs whose chain's seeds share >=this many genome hits are forced to MAPQ=0; 0 disables
     int    smem_dedup;        // 1 = dedup fully-identical SMEMs before SA expansion (--smem-dedup); 0 = off (default, byte-identical to baseline)
+    int    skip_contained_ext; // 1 = skip banded-SW extension of seeds contained (same diagonal) in a longer in-chain seed (--skip-contained-ext); 0 = off. Byte-identical to baseline: the skip set is a subset of the post-extension containment purge (PE18).
 } mem_opt_t;
 
 
