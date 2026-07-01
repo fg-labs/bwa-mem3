@@ -263,6 +263,7 @@ mem_opt_t *mem_opt_init()
     o->min_ext_len = 0;   // off by default -> byte-identical to baseline
     o->seed_emit_order = SEED_ORDER_OFF;  // byte-identical default
     o->smem_dedup  = 0;   // off by default -> byte-identical to baseline; opt-in via --smem-dedup
+    o->skip_contained_ext = 0;   // off by default; opt-in via --skip-contained-ext (byte-identical)
     o->split_width = 10;
     o->max_occ = 500;
     o->max_chain_gap = 10000;
@@ -3142,6 +3143,52 @@ static inline int ungapped_analyze(const uint8_t *qs, const uint8_t *rs, int N,
     return FP_STATUS_HIT;
 }
 
+/* ------------------------------------------------------------------------
+ * Byte-identical contained-seed extension skip (--skip-contained-ext).
+ *
+ * A seed s strictly contained (same diagonal, query subinterval) in a longer
+ * seed of the same chain is dominated by that longer seed's extension: the
+ * longest seed on a diagonal is always extended, its alnreg covers s's region,
+ * so s's own alnreg is purged post-extension anyway (the PE18 containment purge
+ * later in this function). We detect this before extension and skip building s's
+ * banded-SW pair, marking its alnreg purged (qb=qe=-1) exactly as PE18 would --
+ * but s stays in c->seeds, so seedcov/MAPQ are untouched.
+ *
+ * Byte-identity: the skip set is a proven subset of PE18's purge set. (a) seed
+ * containment implies containment in the longer seed's (extension-grown) alnreg,
+ * so PE18 would purge it; (b) we replicate PE18's interference guard (a
+ * comparably-long seed overlapping s on a *different* diagonal forces
+ * extension) using seed coordinates; (c) dropping s as a container for other
+ * seeds is safe because the longest same-diagonal seed (always extended) is a
+ * superset container.
+ * ---------------------------------------------------------------------- */
+static inline int mem_seed_ext_redundant(const mem_chain_t *c, int si)
+{
+    const mem_seed_t *s = &c->seeds[si];
+    long sd = (long)s->rbeg - s->qbeg;
+    int has_container = 0, j;
+    for (j = 0; j < c->n; ++j) {
+        if (j == si) continue;
+        const mem_seed_t *t = &c->seeds[j];
+        if (t->len <= s->len) continue;                    /* strictly longer */
+        if ((long)t->rbeg - t->qbeg != sd) continue;       /* same diagonal */
+        if (s->qbeg >= t->qbeg && s->qbeg + s->len <= t->qbeg + t->len) { has_container = 1; break; }
+    }
+    if (!has_container) return 0;
+    /* interference guard: mirror PE18 (a seed >= .95*len overlapping s on a
+     * different diagonal by >= s->len/4 means s could lead to a distinct aln). */
+    for (j = 0; j < c->n; ++j) {
+        if (j == si) continue;
+        const mem_seed_t *u = &c->seeds[j];
+        if (u->len < s->len * .95) continue;
+        if (s->qbeg <= u->qbeg && s->qbeg + s->len - u->qbeg >= s->len >> 2 &&
+            u->qbeg - s->qbeg != u->rbeg - s->rbeg) return 0;
+        if (u->qbeg <= s->qbeg && u->qbeg + u->len - s->qbeg >= s->len >> 2 &&
+            s->qbeg - u->qbeg != s->rbeg - u->rbeg) return 0;
+    }
+    return 1;
+}
+
 
 void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                                    const uint8_t *pac, bseq1_t *seq_, int nseq,
@@ -3376,6 +3423,17 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                 a->rb = a->qb = a->re = a->qe = H0_;
 
                 tprof[PE19][tid] ++;
+
+                /* NB: gated off under --meth. The dominance argument assumes a
+                 * longer same-diagonal seed's extension covers the shorter one;
+                 * meth's asymmetric C->T matrix breaks this (a contained seed can
+                 * extend to a differently-scored aln), so the skip is NOT
+                 * byte-identical under --meth (measured ~0.17% of pairs diverge). */
+                if (opt->skip_contained_ext && !opt->meth_mode &&
+                    mem_seed_ext_redundant(c, (uint32_t)srt[k])) {
+                    a->qb = a->qe = -1;   /* pre-purge exactly as PE18 would */
+                    continue;
+                }
 
                 int flag = 0;
                 std::pair<int, int> pr;

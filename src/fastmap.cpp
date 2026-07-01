@@ -933,6 +933,7 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "    -y INT        seed occurrence for the 3rd round seeding [%ld]\n", (long)opt->max_mem_intv);
     fprintf(stderr, "    -c INT        skip seeds with more than INT occurrences [%d]\n", opt->max_occ);
     fprintf(stderr, "    --smem-dedup  dedup identical SMEMs before chaining: fewer SA lookups, ~10%% fewer; opt-in, NOT byte-identical (changes XS/secondary on a small fraction of reads) [off]\n");
+    fprintf(stderr, "    --skip-contained-ext  skip banded-SW extension of seeds contained (same diagonal) in a longer in-chain seed; byte-identical (non-meth), ~10%% less alignment CPU; no effect under --meth [off]\n");
     fprintf(stderr, "    -D FLOAT      drop chains shorter than FLOAT fraction of the longest overlapping chain [%.2f]\n", opt->drop_ratio);
     fprintf(stderr, "    -W INT        discard a chain if seeded bases shorter than INT [0]\n");
     fprintf(stderr, "    -m INT        perform at most INT rounds of mate rescues for each read [%d]\n", opt->max_matesw);
@@ -1118,6 +1119,7 @@ int main_mem(int argc, char *argv[])
         OPT_SEED_ORDER,
         OPT_SMEM_DEDUP,
         OPT_FAST,
+        OPT_SKIP_CONTAINED_EXT,
 #ifdef STAGE_PROF
         OPT_PROFILE,
 #endif
@@ -1128,6 +1130,7 @@ int main_mem(int argc, char *argv[])
         {"min-ext-len",              required_argument, 0, OPT_MIN_EXT_LEN},
         {"smem-dedup",               no_argument,       0, OPT_SMEM_DEDUP},
         {"fast",                     no_argument,       0, OPT_FAST},
+        {"skip-contained-ext",       no_argument,       0, OPT_SKIP_CONTAINED_EXT},
         {"meth",                     no_argument,       0, OPT_METH},
         {"meth-scoring",             required_argument, 0, OPT_METH_SCORING},
         {"set-as-failed",            required_argument, 0, OPT_METH_SET_AS_FAILED},
@@ -1326,6 +1329,7 @@ int main_mem(int argc, char *argv[])
         }
         else if (c == OPT_SMEM_DEDUP) opt->smem_dedup = 1;
         else if (c == OPT_FAST) fast = 1;
+        else if (c == OPT_SKIP_CONTAINED_EXT) opt->skip_contained_ext = 1;
         else if (c == OPT_HELP) {
             usage(opt);
             free(opt);

@@ -12,6 +12,7 @@ Options:
     -y INT        seed occurrence for the 3rd round seeding [20]
     -c INT        skip seeds with more than INT occurrences [500]
     --smem-dedup  dedup identical SMEMs before chaining: fewer SA lookups, ~10% fewer; opt-in, NOT byte-identical (changes XS/secondary on a small fraction of reads) [off]
+    --skip-contained-ext  skip banded-SW extension of seeds contained (same diagonal) in a longer in-chain seed; byte-identical (non-meth), ~10% less alignment CPU; no effect under --meth [off]
     -D FLOAT      drop chains shorter than FLOAT fraction of the longest overlapping chain [0.50]
     -W INT        discard a chain if seeded bases shorter than INT [0]
     -m INT        perform at most INT rounds of mate rescues for each read [50]
