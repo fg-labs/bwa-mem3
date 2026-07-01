@@ -241,9 +241,10 @@ exact segments the fast-path handles, so indel-rich data is free.
 
 `30` remains the recommended value. **Validation status:** the non-emptying filter changes the
 observable output of `--min-ext-len` (and therefore `--fast`), so the cross-architecture speed
-figures and the golden-truth F1 sweep need a fresh
-[bwa-mem3-bench](../related-projects/bwa-mem3-bench.md) run (multi-thread, all regimes) before
-`--min-ext-len` / `--fast` graduate from "recommended" to an unqualified default.
+figures and the golden-truth F1 sweep warrant a fresh
+[bwa-mem3-bench](../related-projects/bwa-mem3-bench.md) run (multi-thread, all regimes) to confirm
+these `--fast` accuracy figures genome-wide. `--min-ext-len` and `--fast` stay opt-in; the drop-in
+defaults are unchanged.
 
 ## Speed: drop-in and recommended
 
