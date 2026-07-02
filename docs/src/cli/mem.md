@@ -269,6 +269,41 @@ so small/mid-size indel callability is unaffected.
 borderline secondary alignments (starting tight and expanding can change which of
 several near-tied placements wins). It is therefore an opt-in flag, not a default.
 
+#### `--extend-mate-concordant` — retain mate-concordant chains under a chain cap
+
+Takes an optional window: `--extend-mate-concordant` (bare) = **auto**, sizing the
+window to the estimated proper-pair insert bound (`pes[FR].high`, inferred from the
+data during the run); `--extend-mate-concordant=INT` pins a fixed window in bp;
+`--extend-mate-concordant=0` disables it. Off by default → no effect. When on (and
+`--max-extend-chains` is capping a paired-end read), a chain that would be dropped by
+the cap is instead **retained if it is concordant with one of the mate's chains** —
+same contig, FR ("innie") orientation, within the window. It only does anything when
+a chain cap is in effect, so it is a strict no-op without `--max-extend-chains`.
+
+The window matters: too wide and it retains — and then extends — far/spurious
+concordant chains, adding alignment CPU on chain-rich reads; sizing it to the
+aligner's own proper-pair insert bound (the auto default) admits only genuine pair
+anchors. Before the insert size is estimated (the first chunk), auto falls back to a
+built-in default.
+
+**When to use it: `--meth`.** Bisulfite's collapsed 3-letter alphabet flattens chain
+weights, so under `--max-extend-chains` the cap often drops a read's true low-weight
+chain and starves PE pairing of the anchor that lets the true concordant pair win —
+flipping both mates to a wrong concordant locus. This option recovers that anchor.
+`--fast` enables it (auto) automatically **under `--meth` only**; on non-meth data the
+cap does not regress placement, so `--fast` leaves it off to preserve the speedup.
+The recovery is **partial** (it narrows, but does not fully close, the placement gap
+to default), and with the auto window the alignment-CPU cost is **~1%** — sizing the
+window to the insert bound is what keeps it there (a wide fixed window instead retains
+and extends far/spurious concordant chains, costing 15–20% on chain-rich reads). See
+the benchmarked per-dataset figures in
+[fg-labs/bwa-mem3#195](https://github.com/fg-labs/bwa-mem3/pull/195).
+
+**Not byte-identical when it retains a chain.** Like `--max-extend-chains`, keeping an
+extra candidate can move `XS`, secondaries, and `MAPQ` on multi-mapping reads;
+high-confidence placement is unaffected. For the placement/mismap validation, see
+[Settings profiles → `--extend-mate-concordant`](../best-practices/settings-profiles.md#mate-concordant-chain-retention-under---meth---extend-mate-concordant).
+
 #### `-h INT[,INT]` — secondary alignment reporting
 
 If there are fewer than `INT` hits with score exceeding `FLOAT` (see `-z`)
@@ -303,10 +338,14 @@ applies (~10% lower alignment CPU on long-read inputs) and safe elsewhere.
 (the reads `--fast` primarily targets) and a ~25% alignment-CPU speedup on long-read
 (SBX/HiFi/ONT) runs, so bundling it only helps.
 
-Under `--meth` it additionally sets `-s 2` (light Pass-2 re-seeding). Earlier releases
-used `-s 0` (no re-seed), which inflated MAPQ on bisulfite reads; `-s 2` recovers the
-MAPQ/placement at nearly the same speed. See
-[Settings profiles → Pass-2 re-seeding](../best-practices/settings-profiles.md#pass-2-re-seeding-under---meth--s-2).
+Under `--meth` it additionally sets `-s 2` (light Pass-2 re-seeding) and
+`--extend-mate-concordant`. Earlier releases used `-s 0` (no re-seed), which inflated
+MAPQ on bisulfite reads; `-s 2` recovers the MAPQ/placement at nearly the same speed
+(see [Settings profiles → Pass-2 re-seeding](../best-practices/settings-profiles.md#pass-2-re-seeding-under---meth--s-2)).
+`--extend-mate-concordant` repairs the `--max-extend-chains 5` pairing regression that
+bisulfite's flattened chain weights otherwise cause (see
+[Settings profiles → `--extend-mate-concordant`](../best-practices/settings-profiles.md#mate-concordant-chain-retention-under---meth---extend-mate-concordant)).
+Both are meth-only; non-meth `--fast` is unchanged.
 
 Each lever is applied only if you did not set it explicitly, so explicit flags
 win where applicable (`--fast -m 30` keeps `-m 30`; `--fast --max-extend-chains 8`

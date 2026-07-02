@@ -15,6 +15,7 @@ Options:
     --skip-contained-ext  skip banded-SW extension of seeds contained (same diagonal) in a longer in-chain seed; byte-identical (non-meth), ~10% less alignment CPU; no effect under --meth [off]
     --max-extend-chains INT  cap chains extended per read to the top-INT by weight; ~23% less alignment CPU, high-confidence placement unaffected; ignored for reads with >4096 chains; opt-in, NOT byte-identical (0 = off) [0]
     --adaptive-band  adaptive banded-SW: start tight and expand each pair to its chain-geometry band on long-extension reads; long-read speedup (~1.3x on SBX), no-op on short reads; opt-in, NOT byte-identical [off]
+    --extend-mate-concordant[=INT]  when --max-extend-chains caps a PE read, also keep any chain concordant (same contig, FR, within INT bp) with a mate chain; recovers the true pair's low-weight chain the cap would drop (mainly --meth). Bare = auto (window = estimated proper-pair insert high bound); =INT = fixed bp; =0 = off. Opt-in, NOT byte-identical [off]
     -D FLOAT      drop chains shorter than FLOAT fraction of the longest overlapping chain [0.50]
     -W INT        discard a chain if seeded bases shorter than INT [0]
     -m INT        perform at most INT rounds of mate rescues for each read [50]
@@ -22,10 +23,10 @@ Options:
     -P            skip pairing; mate rescue performed unless -S also in use
     --fast        speed preset: -m 10 -y 0 --min-ext-len 30 --smem-dedup
                   --skip-contained-ext --max-extend-chains 5 --adaptive-band (and
-                  -s 2 under --meth). Opt-in; explicit flags override where
-                  applicable; --smem-dedup, --skip-contained-ext and
-                  --adaptive-band are always enabled. NOT
-                  byte-identical to the default (divergence confined to the
+                  -s 2 --extend-mate-concordant under --meth). Opt-in; explicit
+                  flags override where applicable; --smem-dedup,
+                  --skip-contained-ext and --adaptive-band are always enabled.
+                  NOT byte-identical to the default (divergence confined to the
                   low-confidence tail).
 Scoring options:
    -A INT        score for a sequence match, which scales options -TdBOELU unless overridden [1]

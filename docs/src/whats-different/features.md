@@ -279,6 +279,7 @@ See [Optimization checklist → Reorder seeds longest-first](../best-practices/o
 | `--seed-order` seed reordering | [#186](https://github.com/fg-labs/bwa-mem3/pull/186) | — | fork-only (opt-in, off by default) |
 | `--skip-contained-ext` contained-seed extension skip | [#192](https://github.com/fg-labs/bwa-mem3/pull/192) | — | fork-only (opt-in, byte-identical non-meth, no-op under --meth) |
 | `--max-extend-chains` chain-extension cap | [#193](https://github.com/fg-labs/bwa-mem3/pull/193) | — | fork-only (opt-in, not byte-identical) |
+| `--extend-mate-concordant` mate-concordant chain retention | [#195](https://github.com/fg-labs/bwa-mem3/pull/195) | — | fork-only (opt-in, not byte-identical) |
 
 ---
 

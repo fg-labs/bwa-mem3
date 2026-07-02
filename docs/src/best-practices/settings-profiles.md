@@ -45,13 +45,13 @@ bwa-mem3 mem -t <N> -m 10 -y 0 ref.fa R1.fq R2.fq > out.sam
 
 > **Shorthand:** `bwa-mem3 mem --fast` applies `-m 10 -y 0 --min-ext-len 30
 > --smem-dedup --skip-contained-ext --max-extend-chains 5 --adaptive-band` (and
-> `-s 2` under `--meth`) in one flag. Explicit flags still override individual
-> levers where applicable; `--smem-dedup`, `--skip-contained-ext` and
-> `--adaptive-band` are forced on with no opt-out (`--adaptive-band` is a no-op on
-> short reads, a ~25% speedup on long-read runs). `--skip-contained-ext` no-ops
-> under `--meth` (its own internal gate disables it there), so on a `--meth` run
-> the effective levers are
-> `-m 10 -y 0 --min-ext-len 30 --smem-dedup --max-extend-chains 5 --adaptive-band -s 2`.
+> `-s 2 --extend-mate-concordant` under `--meth`) in one flag. Explicit flags
+> still override individual levers where applicable; `--smem-dedup`,
+> `--skip-contained-ext` and `--adaptive-band` are forced on with no opt-out
+> (`--adaptive-band` is a no-op on short reads, a ~25% speedup on long-read runs).
+> `--skip-contained-ext` no-ops under `--meth` (its own internal gate disables it
+> there), so on a `--meth` run the effective levers are
+> `-m 10 -y 0 --min-ext-len 30 --smem-dedup --max-extend-chains 5 --adaptive-band -s 2 --extend-mate-concordant`.
 > See [`mem` → `--fast`](../cli/mem.md#--fast--speed-preset-opt-in-not-byte-identical).
 
 Use this for new pipelines, or once a drop-in migration is validated and you want bwa-mem3's best
@@ -273,6 +273,55 @@ high-confidence (MAPQ ≥ 60) mismaps out of 9.5 M (1529 → 1549). Stacked on t
 **−15% marginal CPU** at +21 high-confidence mismaps (1559 → 1580, +0.0002% absolute; overall
 −0.045 pp). `N = 2` is too aggressive (+13.5% high-confidence mismaps), so `--fast` sets `5`.
 `--max-extend-chains` and `--fast` stay opt-in; the drop-in defaults are unchanged.
+
+## Mate-concordant chain retention under `--meth`: `--extend-mate-concordant`
+
+`--max-extend-chains 5` interacts badly with `--meth`. Bisulfite reads are projected into a
+3-letter alphabet (C→T, G→A), which collapses sequence complexity and *flattens chain weights*:
+a read carries many similarly-weighted chains instead of one clear winner. Capping to the top-5 by
+weight then frequently drops a read's *true* low-weight chain — not because it was chain-filtered
+away (in 89% of the regressions instrumented on a 50k-pair slice the true chain is still a candidate
+at cap-5), but because capping starves PE pairing and mate rescue of the secondary anchors that let
+the true concordant pair win. Both mates then flip together to a wrong concordant locus (99% flagged
+proper-pair). On a 1M-pair `sim-meth-place` slice this dropped correct placement 98.10% → 97.63% and
+raised confident (MAPQ ≥ 30) mismaps 4.4× (0.036% → 0.160%).
+
+`--extend-mate-concordant` fixes this at the chain-cap stage: when `--max-extend-chains` would cap a
+paired-end read, it additionally **retains any chain concordant with one of the mate's chains** —
+same contig, FR ("innie") orientation, within a window — even if it ranks below the cap. This keeps
+the true pair's low-weight anchor while still dropping the far/redundant chains the cap targets. The
+mate scan is bounded (`MATE_SCAN_MAX`, 256) to keep it O(n) in practice.
+
+The window is sized to the aligner's own proper-pair insert bound. `--extend-mate-concordant` (bare)
+is **auto**: it uses the estimated `pes[FR].high` (inferred from the data each chunk and read by the
+next chunk's cap, which runs before pairing), falling back to a built-in default until the insert size
+is known. `--extend-mate-concordant=INT` pins a fixed bp window; `=0` disables. Matching the window to
+the insert bound matters because retained chains are then **extended** — a wide window admits far and
+spurious concordant chains, adding alignment CPU on chain-rich reads, so auto keeps only genuine pair
+anchors.
+
+**Validation.** On the canonical bench (holodeck eval, 5 reps on m7i), the option recovers **part** of
+the `--fast --meth` regression at **~1% alignment CPU** with the auto window:
+
+| dataset (`--fast --meth`) | placement correct% | MAPQ≥30 mismap% | align CPU vs 0.5.0 |
+|---|---:|---:|---:|
+| default `--meth` (reference) | sim-meth-place 94.27 / sim-meth-vars 95.11 | 5.73 / 4.89 | — |
+| 0.5.0 cap-5 (regressed) | 93.14 / 94.22 | 6.86 / 5.78 | baseline |
+| + `--extend-mate-concordant` (auto) | 93.71 / 94.46 | 6.29 / 5.54 | **+1%** |
+
+So placement recovers roughly a quarter to a half of the gap (not to parity), confident mismaps recover
+similarly, RSS is unchanged, and the CPU cost is ~1%. The window sizing is what makes it cheap: a fixed
+2000 bp window recovered the same accuracy but cost **+16–21%** CPU on chain-rich simulated reads,
+because it retained and extended far/spurious concordant chains; the auto `pes[FR].high` window admits
+only genuine pair anchors. (Turning the chain cap off entirely under `--meth` recovers similar accuracy
+but at a larger, uniform CPU cost.) Full per-dataset figures:
+[fg-labs/bwa-mem3#195](https://github.com/fg-labs/bwa-mem3/pull/195).
+
+**`--fast` enables it automatically under
+`--meth` only** — non-meth `--fast` is unchanged, because WGS placement is already unaffected by the
+cap and the exemption would erode the speedup. It is a no-op unless a chain cap is actually in effect,
+and like `--max-extend-chains` it is **not** byte-identical when it retains a chain. `--extend-mate-concordant`
+and `--fast` stay opt-in; the drop-in defaults are unchanged.
 
 ## Speed: drop-in and recommended
 
