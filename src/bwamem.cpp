@@ -146,8 +146,16 @@ KSORT_INIT(mem_intv1, SMEM, intv_lt1)  // debug
                                           See smithWaterman128_8 re-baseline + h0-prefix seed. */
 
 static inline int bsw8_envelope_ok(int len1, int len2, int w,
-                                   int score_a, int zdrop, int h0)
+                                   int score_a, int zdrop, int h0, int meth)
 {
+    /* --meth uses an asymmetric substitution matrix (OT frees C->T, OB frees
+     * G->A). That scoring routinely produces query-end / global-extension
+     * structures for which the 8-bit kernel's gscore/gtle capture diverges from
+     * the 16-bit/scalar reference (getScores8 != scalar==getScores16 on captured
+     * meth batches; the divergence flips global 150M extensions to clipped local
+     * ones, mis-placing reads). Route every meth pair to the 16-bit tier (proven
+     * byte-identical to scalar); non-meth keeps the fast 8-bit path. */
+    if (meth) return 0;
     /* Dev A/B hook: BWAMEM3_DISABLE_BSW8=1 forces every pair off the 8-bit path
      * onto the 16-bit (then scalar) buckets. Used to validate that the 8-bit
      * kernel is byte-identical to the 16-bit reference in the full pipeline
@@ -2628,7 +2636,7 @@ void* _mm_realloc(void *ptr, int64_t csize, int64_t nsize, int16_t dsize) {
 
 inline void sortPairsLenExt(SeqPair *pairArray, int32_t count, SeqPair *tempArray,
                             int32_t *hist, int &numPairs128, int &numPairs16,
-                            int &numPairs1, int score_a, int w, int zdrop)
+                            int &numPairs1, int score_a, int w, int zdrop, int meth)
 {
     int32_t i;
     numPairs128 = numPairs16 = numPairs1 = 0;
@@ -2660,7 +2668,7 @@ inline void sortPairsLenExt(SeqPair *pairArray, int32_t count, SeqPair *tempArra
         SeqPair sp = pairArray[i];
         // int minval = sp.h0 + max_(sp.len1, sp.len2);
         int64_t minval = (int64_t)sp.h0 + (int64_t)min_(sp.len1, sp.len2) * (int64_t)score_a;
-        if (bsw8_envelope_ok(sp.len1, sp.len2, w, score_a, zdrop, sp.h0)) {
+        if (bsw8_envelope_ok(sp.len1, sp.len2, w, score_a, zdrop, sp.h0, meth)) {
             int bin = minval < 0 ? 0 : (minval < MAX_SEQ_LEN8 ? (int)minval : MAX_SEQ_LEN8 - 1);
             hist[bin]++;
         }
@@ -2693,7 +2701,7 @@ inline void sortPairsLenExt(SeqPair *pairArray, int32_t count, SeqPair *tempArra
         // int minval = sp.h0 + max_(sp.len1, sp.len2);
         int64_t minval = (int64_t)sp.h0 + (int64_t)min_(sp.len1, sp.len2) * (int64_t)score_a;
 
-        if (bsw8_envelope_ok(sp.len1, sp.len2, w, score_a, zdrop, sp.h0))
+        if (bsw8_envelope_ok(sp.len1, sp.len2, w, score_a, zdrop, sp.h0, meth))
         {
             int bin = minval < 0 ? 0 : (minval < MAX_SEQ_LEN8 ? (int)minval : MAX_SEQ_LEN8 - 1);
             int32_t pos = hist[bin];
@@ -3653,7 +3661,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                         int t_tier;
                         /* Mirror the routing decision in sortPairsLenExt: 8-bit
                          * iff the safe envelope holds (initial band opt->w). */
-                        if (bsw8_envelope_ok(sp.len1, sp.len2, opt->w, opt->a, opt->zdrop, sp.h0)) {
+                        if (bsw8_envelope_ok(sp.len1, sp.len2, opt->w, opt->a, opt->zdrop, sp.h0, opt->meth_mode)) {
                             numPairsLeft128++; t_tier = 0;
                         }
                         else if (sp.len1 < MAX_SEQ_LEN16 && sp.len2 < MAX_SEQ_LEN16 && minval >= 0 && minval < MAX_SEQ_LEN16){
@@ -3854,7 +3862,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
 
                     /* Mirror the routing decision in sortPairsLenExt: 8-bit iff
                      * the safe envelope holds (initial band opt->w). */
-                    if (bsw8_envelope_ok(sp.len1, sp.len2, opt->w, opt->a, opt->zdrop, sp.h0)) {
+                    if (bsw8_envelope_ok(sp.len1, sp.len2, opt->w, opt->a, opt->zdrop, sp.h0, opt->meth_mode)) {
                         numPairsRight128++;
                     }
                     else if(sp.len1 < MAX_SEQ_LEN16 && sp.len2 < MAX_SEQ_LEN16 && minval >= 0 && minval < MAX_SEQ_LEN16) {
@@ -3899,7 +3907,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
     /* Sorting based score is required as that affects the use of SIMD lanes */
     sortPairsLenExt(seqPairArrayLeft128, numPairsLeft, seqPairArrayAux, hist,
                     numPairsLeft128, numPairsLeft16, numPairsLeft1, opt->a,
-                    opt->w, opt->zdrop);
+                    opt->w, opt->zdrop, opt->meth_mode);
     assert(numPairsLeft == (numPairsLeft128 + numPairsLeft16 + numPairsLeft1));
 
     /* instrumentation: per-batch narrow bucket size (Group C, LEFT).
@@ -4282,7 +4290,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
 
     sortPairsLenExt(seqPairArrayRight128, numPairsRight, seqPairArrayAux,
                     hist, numPairsRight128, numPairsRight16, numPairsRight1, opt->a,
-                    opt->w, opt->zdrop);
+                    opt->w, opt->zdrop, opt->meth_mode);
 
     assert(numPairsRight == (numPairsRight128 + numPairsRight16 + numPairsRight1));
 
@@ -4296,7 +4304,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
             int tb_ = sp_->tight_band;
             int t_tier;
             int64_t minval_ = (int64_t)sp_->h0 + (int64_t)min_(sp_->len1, sp_->len2) * (int64_t)opt->a;
-            if (bsw8_envelope_ok(sp_->len1, sp_->len2, opt->w, opt->a, opt->zdrop, sp_->h0))             t_tier = 0;
+            if (bsw8_envelope_ok(sp_->len1, sp_->len2, opt->w, opt->a, opt->zdrop, sp_->h0, opt->meth_mode))             t_tier = 0;
             else if (sp_->len1 < MAX_SEQ_LEN16 && sp_->len2 < MAX_SEQ_LEN16 && minval_ >= 0 && minval_ < MAX_SEQ_LEN16) t_tier = 1;
             else                                                                                       t_tier = 2;
             int fine_bin;
