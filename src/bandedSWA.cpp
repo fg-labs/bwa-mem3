@@ -1231,7 +1231,34 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
         __m256i bmaxScore256 = maxScore256;
         __m256i tmp = _mm256_cmpeq_epi8(maxRS1, zero256);
         cval = _mm256_movemask_epi8(tmp);
-        if (cval == 0xFFFFFFFF) break;
+        if (cval == 0xFFFFFFFF) {
+            /* Finalize THIS row's query-end (gscore/gtle) capture before exiting
+             * (see smithWaterman128_8 zero-row break for the rationale): scalar
+             * records the row's gscore then hits its own m==0 break, so the vector
+             * must too, else the gscore==0 query-end tail row is dropped -> wrong
+             * gtle under asymmetric --meth matrices. Mirror of the epilogue gscore
+             * block (>= tie-break: latest query-end row wins). */
+            int8_t qf_a_[SIMD_WIDTH8] __attribute((aligned(32)));
+            int8_t hq_a_[SIMD_WIDTH8] __attribute((aligned(32)));
+            _mm256_store_si256((__m256i *) qf_a_, qfire256);
+            _mm256_store_si256((__m256i *) hq_a_, hqe256);
+            for (int g = 0; g < SIMD_WIDTH8 / 8; g++) {
+                const int base = g * 8;
+                __m256i Bg   = _mm256_loadu_si256((const __m256i *)(B + base));
+                __m256i hqeg = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)(hq_a_ + base)));
+                __m256i qfg  = _mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i *)(qf_a_ + base)));
+                __m256i gs_abs = _mm256_add_epi32(hqeg, Bg);
+                __m256i gba = _mm256_loadu_si256((const __m256i *)(gbest_abs + base));
+                __m256i ge  = _mm256_xor_si256(_mm256_cmpgt_epi32(gba, gs_abs), ff256);
+                __m256i gmask = _mm256_and_si256(qfg, ge);
+                gba = _mm256_blendv_epi8(gba, gs_abs, gmask);
+                _mm256_storeu_si256((__m256i *)(gbest_abs + base), gba);
+                __m256i ierg = _mm256_loadu_si256((const __m256i *)(ierow + base));
+                ierg = _mm256_blendv_epi8(ierg, _mm256_set1_epi32(i + 1), gmask);
+                _mm256_storeu_si256((__m256i *)(ierow + base), ierg);
+            }
+            break;
+        }
 
         exit0 = _mm256_andnot_si256(tmp, exit0);
 
@@ -3098,7 +3125,31 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
         /* exit due to zero score by a row */
         __m512i bmaxScore512 = maxScore512;
         __mmask64 tmp = _mm512_cmpeq_epi8_mask(maxRS1, zero512);
-        if (tmp == dmask) break;
+        if (tmp == dmask) {
+            /* Finalize THIS row's query-end (gscore/gtle) capture before exiting
+             * (see smithWaterman128_8 zero-row break): scalar records the row's
+             * gscore then hits its own m==0 break, so the vector must too, else the
+             * gscore==0 query-end tail row is dropped -> wrong gtle under the
+             * asymmetric --meth matrix. Mirror of the epilogue gscore block. */
+            int8_t hq_a_[SIMD_WIDTH8] __attribute((aligned(64)));
+            _mm512_store_si512((__m512i *) hq_a_, hqe512);
+            const __mmask64 qf64_ = _mm512_movepi8_mask(qfire512);
+            for (int g = 0; g < SIMD_WIDTH8 / 16; g++) {
+                const int base = g * 16;
+                const __mmask16 qfm = (__mmask16)(qf64_ >> (16 * g));
+                __m512i Bg   = _mm512_loadu_si512((const void *)(B + base));
+                __m512i hqeg = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)(hq_a_ + base)));
+                __m512i gs_abs = _mm512_add_epi32(hqeg, Bg);
+                __m512i gba = _mm512_loadu_si512((const void *)(gbest_abs + base));
+                __mmask16 gmask = qfm & _mm512_cmpge_epi32_mask(gs_abs, gba);
+                gba = _mm512_mask_mov_epi32(gba, gmask, gs_abs);
+                _mm512_storeu_si512((void *)(gbest_abs + base), gba);
+                __m512i ierg = _mm512_loadu_si512((const void *)(ierow + base));
+                ierg = _mm512_mask_mov_epi32(ierg, gmask, _mm512_set1_epi32(i + 1));
+                _mm512_storeu_si512((void *)(ierow + base), ierg);
+            }
+            break;
+        }
 
         exit0 = _mm512_mask_blend_epi8(tmp, exit0, zero512);
 
@@ -5758,11 +5809,42 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
         __m128i bmaxScore128 = maxScore128;
         __m128i tmp = _mm_cmpeq_epi8(maxRS1, zero128);
 #if defined(__ARM_NEON)
-        if (vmaxvq_u8(vreinterpretq_u8_m128i(maxRS1)) == 0) break;
+        int zero_row_ = (vmaxvq_u8(vreinterpretq_u8_m128i(maxRS1)) == 0);
 #else
-        uint16_t cval = _mm_movemask_epi8(tmp);
-        if (cval == 0xFFFF) break;
+        int zero_row_ = (_mm_movemask_epi8(tmp) == 0xFFFF);
 #endif
+        if (zero_row_) {
+            /* Finalize THIS row's query-end (gscore/gtle) capture BEFORE exiting.
+             * The capture (hqe128/qfire128) is set in the inner loop above but is
+             * folded into the wide gbest_abs/ierow only in the per-row epilogue,
+             * which this break would otherwise skip. Scalar processes the row's
+             * gscore and then hits its own m==0 break, so it records the query-end
+             * row; the vector must too. Skipping it drops the gscore==0 query-end
+             * tail row -> wrong gtle. Benign for symmetric scoring (gscore==0 gtle
+             * unused), but consumed under the asymmetric --meth (OT/OB) matrix,
+             * where it caused soft-clip / placement drift. Mirror of the epilogue's
+             * gscore block (>= tie-break: latest query-end row wins, as scalar). */
+            int8_t qf_a_[SIMD_WIDTH8] __attribute((aligned(16)));
+            int8_t hq_a_[SIMD_WIDTH8] __attribute((aligned(16)));
+            _mm_store_si128((__m128i *) qf_a_, qfire128);
+            _mm_store_si128((__m128i *) hq_a_, hqe128);
+            for (int g = 0; g < SIMD_WIDTH8 / 4; g++) {
+                const int base = g * 4;
+                __m128i Bg   = _mm_loadu_si128((const __m128i *)(B + base));
+                __m128i hqeg = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(*(const int32_t *)(hq_a_ + base)));
+                __m128i qfg  = _mm_cvtepi8_epi32(_mm_cvtsi32_si128(*(const int32_t *)(qf_a_ + base)));
+                __m128i gs_abs = _mm_add_epi32(hqeg, Bg);
+                __m128i gba = _mm_loadu_si128((const __m128i *)(gbest_abs + base));
+                __m128i ge  = _mm_xor_si128(_mm_cmpgt_epi32(gba, gs_abs), ff128); // gs_abs >= gba
+                __m128i gmask = _mm_and_si128(qfg, ge);
+                gba = _mm_blendv_epi8(gba, gs_abs, gmask);
+                _mm_storeu_si128((__m128i *)(gbest_abs + base), gba);
+                __m128i ierg = _mm_loadu_si128((const __m128i *)(ierow + base));
+                ierg = _mm_blendv_epi8(ierg, _mm_set1_epi32(i + 1), gmask);
+                _mm_storeu_si128((__m128i *)(ierow + base), ierg);
+            }
+            break;
+        }
 
         // _mm_store_si128((__m128i *) temp, exit0);
         exit0 = _mm_blendv_epi8(exit0, zero128,  tmp);
