@@ -227,6 +227,23 @@ the recommended value. For the benchmarks, behavior details, and validation
 status, see
 [Settings profiles → `--min-ext-len 30`](../best-practices/settings-profiles.md#short-seed-extension---min-ext-len-30).
 
+#### `--max-extend-chains INT` — cap chains extended per read
+
+Off by default (`0`) → output byte-identical to baseline. When `INT > 0`, only the
+top-`INT` chains by weight (after chain filtering) reach banded Smith-Waterman
+extension; the remaining lower-weight chains are dropped before extension. This is
+the only lever that reduces the *number of chains extended* per read, so it is
+orthogonal to the seed- and SW-per-chain levers and adds a real marginal speedup on
+top of them (~15 % marginal alignment CPU on top of `--fast`, ~23 % standalone, at
+`5`). It is **not** byte-identical: dropping candidate chains removes low-weight
+secondaries, so `XS`, secondary alignments, and `MAPQ` can shift on multi-mapping
+reads. High-confidence (uniquely-placed) reads are unaffected. The cap is a safety
+no-op for pathological reads with more than 4096 chains (`MAX_EXTEND_CHAINS_CAP`):
+those reads extend all of their chains as usual, so `--max-extend-chains` has no
+effect on them. `--fast` sets `5`. For the accuracy/speed curve and validation status,
+see
+[Settings profiles → `--max-extend-chains 5`](../best-practices/settings-profiles.md#chain-extension-cap---max-extend-chains-5).
+
 #### `-h INT[,INT]` — secondary alignment reporting
 
 If there are fewer than `INT` hits with score exceeding `FLOAT` (see `-z`)
@@ -250,7 +267,7 @@ the alignment score and mapping quality for each secondary hit.
 `--fast` is a one-flag shorthand for the characterized speed levers:
 
 ```text
-bwa-mem3 mem --fast  ≡  -m 10 -y 0 --min-ext-len 30 --smem-dedup --skip-contained-ext
+bwa-mem3 mem --fast  ≡  -m 10 -y 0 --min-ext-len 30 --smem-dedup --skip-contained-ext --max-extend-chains 5
 ```
 
 `--skip-contained-ext` is byte-identical to the default on non-meth single- and paired-end
@@ -263,8 +280,9 @@ MAPQ/placement at nearly the same speed. See
 [Settings profiles → Pass-2 re-seeding](../best-practices/settings-profiles.md#pass-2-re-seeding-under---meth--s-2).
 
 Each lever is applied only if you did not set it explicitly, so explicit flags
-win where applicable (`--fast -m 30` keeps `-m 30`); `--smem-dedup` and
-`--skip-contained-ext` are always enabled and cannot be opted back out of once
+win where applicable (`--fast -m 30` keeps `-m 30`; `--fast --max-extend-chains 8`
+keeps `8`); `--smem-dedup` and `--skip-contained-ext` are always enabled and
+cannot be opted back out of once
 `--fast` is set. Output is **not**
 byte-identical to the default; the accuracy cost of each lever is characterized in
 [Settings profiles](../best-practices/settings-profiles.md) and is confined to

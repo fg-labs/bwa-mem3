@@ -104,6 +104,7 @@ typedef struct mem_opt_t {
     int flag;               // see MEM_F_* macros
     int min_seed_len;       // minimum seed length
     int min_ext_len;        // seeds shorter than this are not extended (0 = off)
+    int max_extend_chains;  // cap on chains extended per read: keep only the top-N by weight before banded-SW (0 = off). Opt-in speed lever; NOT byte-identical.
     seed_order_t seed_emit_order;  // --seed-order; SEED_ORDER_OFF = byte-identical
     int min_chain_weight;
     int max_chain_extend;

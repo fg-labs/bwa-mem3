@@ -44,11 +44,12 @@ bwa-mem3 mem -t <N> -m 10 -y 0 ref.fa R1.fq R2.fq > out.sam
 ```
 
 > **Shorthand:** `bwa-mem3 mem --fast` applies `-m 10 -y 0 --min-ext-len 30
-> --smem-dedup --skip-contained-ext` (and `-s 2` under `--meth`) in one flag.
-> Explicit flags still override individual levers where applicable; `--smem-dedup`
-> and `--skip-contained-ext` are forced on with no opt-out. `--skip-contained-ext`
-> no-ops under `--meth` (its own internal gate disables it there), so on a `--meth`
-> run the effective levers are `-m 10 -y 0 --min-ext-len 30 --smem-dedup -s 2`.
+> --smem-dedup --skip-contained-ext --max-extend-chains 5` (and `-s 2` under
+> `--meth`) in one flag. Explicit flags still override individual levers where
+> applicable; `--smem-dedup` and `--skip-contained-ext` are forced on with no
+> opt-out. `--skip-contained-ext` no-ops under `--meth` (its own internal gate
+> disables it there), so on a `--meth` run the effective levers are
+> `-m 10 -y 0 --min-ext-len 30 --smem-dedup --max-extend-chains 5 -s 2`.
 > See [`mem` → `--fast`](../cli/mem.md#--fast--speed-preset-opt-in-not-byte-identical).
 
 Use this for new pipelines, or once a drop-in migration is validated and you want bwa-mem3's best
@@ -248,6 +249,28 @@ figures and the golden-truth F1 sweep warrant a fresh
 [bwa-mem3-bench](../related-projects/bwa-mem3-bench.md) run (multi-thread, all regimes) to confirm
 these `--fast` accuracy figures genome-wide. `--min-ext-len` and `--fast` stay opt-in; the drop-in
 defaults are unchanged.
+
+## Chain extension cap: `--max-extend-chains 5`
+
+`--max-extend-chains INT` caps the number of chains that reach banded Smith–Waterman extension to the
+top-`INT` by chain weight (applied after `mem_chain_flt`); the dropped chains are the lowest-weight
+secondaries. It is the only lever that reduces the *number of chains extended* per read — the other
+`--fast` levers (`-y 0`, `--min-ext-len`, `--smem-dedup`) cut seeds and SW-per-chain but leave chains
+extended nearly unchanged — so it is orthogonal and adds a real marginal speedup on top of them. Off
+by default (`0` → byte-identical to baseline). As a safety fallback the cap is a no-op for pathological
+reads with more than 4096 chains (`MAX_EXTEND_CHAINS_CAP`): those reads extend all of their chains as
+usual, so the option has no effect on them.
+
+**Not byte-identical.** Dropping candidate chains removes low-weight secondaries, so `XS`, secondary
+alignments, and `MAPQ` can move on multi-mapping reads. High-confidence (uniquely-placed) reads are
+unaffected; the default path (`0`) is verified byte-identical to the base branch.
+
+**The accuracy/speed tradeoff is a smooth monotonic curve with a knee at `N = 4–5`.** On holodeck
+truth (`sim-wgs-place`, 10.7 M reads), standalone `N = 5` is **−23% total alignment CPU** at +20
+high-confidence (MAPQ ≥ 60) mismaps out of 9.5 M (1529 → 1549). Stacked on top of `--fast` it is
+**−15% marginal CPU** at +21 high-confidence mismaps (1559 → 1580, +0.0002% absolute; overall
+−0.045 pp). `N = 2` is too aggressive (+13.5% high-confidence mismaps), so `--fast` sets `5`.
+`--max-extend-chains` and `--fast` stay opt-in; the drop-in defaults are unchanged.
 
 ## Speed: drop-in and recommended
 
