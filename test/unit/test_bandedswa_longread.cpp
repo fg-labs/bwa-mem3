@@ -345,4 +345,81 @@ TEST_CASE("bandedSWA 8-bit query-end gscore/gtle byte-identical to scalar under 
     CHECK(oracle.gtle > oracle.tle + 10);
 }
 
+// Regression test for the --meth per-hypothesis sub-slice overshoot bug.
+//
+// The batched kernels round numPairs up to their SIMD width and initialize the
+// padding lanes pairArray[numPairs .. roundUp) in place (len=0 dummy pairs).
+// A caller may legitimately invoke the kernel on a SUB-SLICE of a larger array
+// -- the --meth dispatch (bsw_run_tier) runs three contiguous slices
+// (OT | OB | SYM) of one pair array back-to-back. If the kernel scribbles
+// padding past numPairs it zeroes the START of the next slice; that slice's
+// kernel call then scores those real pairs as empty (score==h0, gscore==-1),
+// producing a spurious soft-clip / confident mismap on --meth reads. So the
+// kernels must not modify pairArray outside [0, numPairs).
+TEST_CASE("bandedSWA getScores16/getScores8 leave pairArray[numPairs..] untouched"
+          " (sub-slice overshoot safety)"
+          * doctest::test_suite("unit/bandedswa")) {
+    const int a = 1, b = 2, o = 6, e = 1, end_bonus = 10, w = 100, zdrop = 100;
+    int8_t mat[25];
+    build_mat(mat, a, b, -1);
+    BandedPairWiseSW bsw(o, e, o, e, zdrop, end_bonus, mat, a, b, 1);
+
+    // n deliberately NOT a multiple of any SIMD width so roundUp(n) > n and the
+    // kernel has padding lanes to initialize past numPairs.
+    const int n = 5;
+    const int GUARD = SIMD_WIDTH8;          // widest tier's overshoot
+    const int STRIDE = 64;
+    std::vector<uint8_t> ref((size_t)(n + GUARD) * STRIDE + MAX_LINE_LEN, 0);
+    std::vector<uint8_t> qer((size_t)(n + GUARD) * STRIDE + MAX_LINE_LEN, 0);
+    std::vector<SeqPair> pairs((size_t)(n + GUARD) + MAX_LINE_LEN, SeqPair());
+
+    // n real all-match pairs (ref A-run vs read A-run).
+    for (int c = 0; c < n; ++c) {
+        uint8_t *rs = &ref[(size_t)c * STRIDE];
+        uint8_t *qs = &qer[(size_t)c * STRIDE];
+        for (int i = 0; i < 20; ++i) rs[i] = 0;
+        for (int i = 0; i < 15; ++i) qs[i] = 0;
+        pairs[c].id = c; pairs[c].len1 = 20; pairs[c].len2 = 15; pairs[c].h0 = 30;
+        pairs[c].idr = (int64_t)c * STRIDE; pairs[c].idq = (int64_t)c * STRIDE;
+        pairs[c].seqid = c; pairs[c].regid = 0;
+        pairs[c].score = pairs[c].tle = pairs[c].gtle = pairs[c].qle =
+            pairs[c].gscore = pairs[c].max_off = -1;
+    }
+    // GUARD sentinel pairs occupying pairArray[n .. n+GUARD): stand-ins for the
+    // next slice's real pairs. Distinctive values so any kernel write is caught.
+    auto set_sentinel = [](SeqPair &p, int c) {
+        p.id = 1000 + c; p.len1 = 37; p.len2 = 21; p.h0 = 129;
+        p.idr = 700000 + c; p.idq = 800000 + c;
+        p.seqid = 500 + c; p.regid = 3;
+        p.score = 111; p.qle = 112; p.tle = 113;
+        p.gscore = 114; p.gtle = 115; p.max_off = 116;
+    };
+    std::vector<SeqPair> expected(GUARD);
+    for (int c = 0; c < GUARD; ++c) { set_sentinel(pairs[n + c], c); expected[c] = pairs[n + c]; }
+
+    auto sentinels_intact = [&](const char *which) {
+        for (int c = 0; c < GUARD; ++c) {
+            const SeqPair &g = pairs[n + c], &x = expected[c];
+            INFO("call=" << which << " sentinel=" << c);
+            CHECK(g.id == x.id); CHECK(g.len1 == x.len1); CHECK(g.len2 == x.len2);
+            CHECK(g.h0 == x.h0); CHECK(g.idr == x.idr); CHECK(g.idq == x.idq);
+            CHECK(g.seqid == x.seqid); CHECK(g.regid == x.regid);
+            CHECK(g.score == x.score); CHECK(g.gscore == x.gscore);
+            CHECK(g.qle == x.qle); CHECK(g.tle == x.tle);
+            CHECK(g.gtle == x.gtle); CHECK(g.max_off == x.max_off);
+        }
+    };
+
+    bsw.getScores16(pairs.data(), ref.data(), qer.data(), n, 1, w);
+    sentinels_intact("getScores16");
+
+    for (int c = 0; c < GUARD; ++c) set_sentinel(pairs[n + c], c);  // reset
+    for (int c = 0; c < n; ++c) {
+        pairs[c].score = pairs[c].tle = pairs[c].gtle = pairs[c].qle =
+            pairs[c].gscore = pairs[c].max_off = -1;
+    }
+    bsw.getScores8(pairs.data(), ref.data(), qer.data(), n, 1, w);
+    sentinels_intact("getScores8");
+}
+
 #endif // HAVE_BSW_VECTOR_8_16

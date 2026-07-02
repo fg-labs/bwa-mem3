@@ -40,6 +40,41 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #endif
 
 // ------------------------------------------------------------------------------------
+// Sub-slice overshoot guard.
+//
+// The batched kernels (getScores8 / getScores16) round numPairs up to their
+// SIMD width and INITIALIZE the padding lanes pairArray[numPairs .. roundUp)
+// in place (len=0 dummy pairs). That is safe when the kernel owns the whole
+// array, but a caller may pass a SUB-SLICE of a larger array -- the --meth
+// per-hypothesis dispatch (bsw_run_tier) runs three CONTIGUOUS slices
+// (OT | OB | SYM) of one pair array back-to-back. Padding writes past numPairs
+// would zero the START of the next slice, and that slice's kernel call would
+// then score those real pairs as empty (score == h0, gscore == -1) -> a
+// spurious soft-clip / confident mismap on --meth reads. This RAII guard saves
+// pairArray[numPairs .. roundUp) on construction and restores it on scope exit,
+// so getScores{8,16} never leave a caller's pairs past numPairs modified. The
+// overshoot is at most (width - 1) <= SIMD_WIDTH8 - 1 pairs; callers of a whole
+// array over-allocate by MAX_LINE_LEN so the region is always addressable.
+namespace {
+struct BswOvershootGuard {
+    SeqPair *pa;
+    int base, nOver;
+    SeqPair saved[SIMD_WIDTH8];
+    BswOvershootGuard(SeqPair *pairArray, int numPairs, int width)
+        : pa(pairArray), base(numPairs) {
+        int roundUp = ((numPairs + width - 1) / width) * width;
+        nOver = roundUp - numPairs;
+        for (int s = 0; s < nOver; s++) saved[s] = pa[base + s];
+    }
+    ~BswOvershootGuard() {
+        for (int s = 0; s < nOver; s++) pa[base + s] = saved[s];
+    }
+    BswOvershootGuard(const BswOvershootGuard &) = delete;
+    BswOvershootGuard &operator=(const BswOvershootGuard &) = delete;
+};
+}  // namespace
+
+// ------------------------------------------------------------------------------------
 // MACROs for vector code
 extern uint64_t prof[10][112];
 #define AMBIG 4
@@ -534,8 +569,11 @@ void BandedPairWiseSW::getScores8(SeqPair *pairArray,
                                   int32_t w)
 {
     int64_t startTick, endTick;
-    
-    smithWatermanBatchWrapper8(pairArray, seqBufRef, seqBufQer, numPairs, numThreads, w);
+
+    {
+        BswOvershootGuard _g(pairArray, numPairs, SIMD_WIDTH8);
+        smithWatermanBatchWrapper8(pairArray, seqBufRef, seqBufQer, numPairs, numThreads, w);
+    }
 
 #if MAXI
     printf("AVX2 Vecor code: Writing output..\n");
@@ -1572,8 +1610,10 @@ void BandedPairWiseSW::getScores16(SeqPair *pairArray,
 {
     int64_t startTick, endTick;
 
-    smithWatermanBatchWrapper16(pairArray, seqBufRef, seqBufQer, numPairs, numThreads, w);
-
+    {
+        BswOvershootGuard _g(pairArray, numPairs, SIMD_WIDTH16);
+        smithWatermanBatchWrapper16(pairArray, seqBufRef, seqBufQer, numPairs, numThreads, w);
+    }
 
 #if MAXI
     printf("AVX2 Vecor code: Writing output..\n");
@@ -1805,11 +1845,11 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
     swTicks += st4 - st3;
     sort2Ticks += st5 - st4;
 #endif
-    
+
     // free mem
     _mm_free(seq1SoA);
     _mm_free(seq2SoA);
-    
+
     return;
 }
 
@@ -2454,8 +2494,11 @@ void BandedPairWiseSW::getScores8(SeqPair *pairArray,
     int i;
     int64_t startTick, endTick;
 
-    smithWatermanBatchWrapper8(pairArray, seqBufRef, seqBufQer, numPairs, numThreads, w);
-    
+    {
+        BswOvershootGuard _g(pairArray, numPairs, SIMD_WIDTH8);
+        smithWatermanBatchWrapper8(pairArray, seqBufRef, seqBufQer, numPairs, numThreads, w);
+    }
+
 #if MAXI
     printf("AVX512/8 Vecor code: Writing output..\n");
     for (int l=0; l<numPairs; l++)
@@ -3453,8 +3496,11 @@ void BandedPairWiseSW::getScores16(SeqPair *pairArray,
     int i;
     int64_t startTick, endTick;
 
-    smithWatermanBatchWrapper16(pairArray, seqBufRef, seqBufQer, numPairs, numThreads, w);
-    
+    {
+        BswOvershootGuard _g(pairArray, numPairs, SIMD_WIDTH16);
+        smithWatermanBatchWrapper16(pairArray, seqBufRef, seqBufQer, numPairs, numThreads, w);
+    }
+
 #if MAXI
     printf("AVX512 Vecor code: Writing output..\n");
     for (int l=0; l<numPairs; l++)
@@ -3691,11 +3737,11 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
     swTicks += st4 - st3;
     sort2Ticks += st5 - st4;
 #endif
-    
+
     // free mem
     _mm_free(seq1SoA);
     _mm_free(seq2SoA);
-    
+
     return;
 }
 
@@ -4286,9 +4332,12 @@ void BandedPairWiseSW::getScores16(SeqPair *pairArray,
                                    uint16_t numThreads,
                                    int32_t w)
 {
-    smithWatermanBatchWrapper16(pairArray, seqBufRef,
-                                seqBufQer, numPairs,
-                                numThreads, w);
+    {
+        BswOvershootGuard _g(pairArray, numPairs, SIMD_WIDTH16);
+        smithWatermanBatchWrapper16(pairArray, seqBufRef,
+                                    seqBufQer, numPairs,
+                                    numThreads, w);
+    }
 
 #if MAXI
     for (int l=0; l<numPairs; l++)
@@ -4299,7 +4348,7 @@ void BandedPairWiseSW::getScores16(SeqPair *pairArray,
 
     }
 #endif
-    
+
 }
 
 void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
@@ -4517,10 +4566,11 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
     swTicks += st4 - st3;
     sort2Ticks += st5 - st4;
 #endif
+
     // free mem
     _mm_free(seq1SoA);
     _mm_free(seq2SoA);
-    
+
     return;
 }
 
@@ -5107,9 +5157,11 @@ void BandedPairWiseSW::getScores8(SeqPair *pairArray,
                                   int32_t w)
 {
     assert(SIMD_WIDTH8 == 16 && SIMD_WIDTH16 == 8);
-    smithWatermanBatchWrapper8(pairArray, seqBufRef, seqBufQer, numPairs, numThreads, w);
+    {
+        BswOvershootGuard _g(pairArray, numPairs, SIMD_WIDTH8);
+        smithWatermanBatchWrapper8(pairArray, seqBufRef, seqBufQer, numPairs, numThreads, w);
+    }
 
-    
 #if MAXI
     printf("Vecor code: Writing output..\n");
     for (int l=0; l<numPairs; l++)
