@@ -44,12 +44,14 @@ bwa-mem3 mem -t <N> -m 10 -y 0 ref.fa R1.fq R2.fq > out.sam
 ```
 
 > **Shorthand:** `bwa-mem3 mem --fast` applies `-m 10 -y 0 --min-ext-len 30
-> --smem-dedup --skip-contained-ext --max-extend-chains 5` (and `-s 2` under
-> `--meth`) in one flag. Explicit flags still override individual levers where
-> applicable; `--smem-dedup` and `--skip-contained-ext` are forced on with no
-> opt-out. `--skip-contained-ext` no-ops under `--meth` (its own internal gate
-> disables it there), so on a `--meth` run the effective levers are
-> `-m 10 -y 0 --min-ext-len 30 --smem-dedup --max-extend-chains 5 -s 2`.
+> --smem-dedup --skip-contained-ext --max-extend-chains 5 --adaptive-band` (and
+> `-s 2` under `--meth`) in one flag. Explicit flags still override individual
+> levers where applicable; `--smem-dedup`, `--skip-contained-ext` and
+> `--adaptive-band` are forced on with no opt-out (`--adaptive-band` is a no-op on
+> short reads, a ~25% speedup on long-read runs). `--skip-contained-ext` no-ops
+> under `--meth` (its own internal gate disables it there), so on a `--meth` run
+> the effective levers are
+> `-m 10 -y 0 --min-ext-len 30 --smem-dedup --max-extend-chains 5 --adaptive-band -s 2`.
 > See [`mem` → `--fast`](../cli/mem.md#--fast--speed-preset-opt-in-not-byte-identical).
 
 Use this for new pipelines, or once a drop-in migration is validated and you want bwa-mem3's best
@@ -305,6 +307,28 @@ split reads happen to land in repetitive regions.
 Caveats: this was measured on a single repeat-enriched truth set at the breakpoint level (not
 end-to-end SV calls), so treat `20` as a sensible starting point for SV workflows rather than a
 universal recommendation. It has no effect on primary-alignment MAPQ or on non-SV pipelines.
+
+## Situational: `--adaptive-band` for long reads
+
+This is **not** part of the recommended (short-read) profile — it is a **long-read** lever, and the
+default (off) is correct for standard Illumina WGS/WES.
+
+`--adaptive-band` starts banded Smith-Waterman tight and expands each extension only to the band its
+chain's seed geometry implies, instead of the fixed `-w` band (100) for every extension. The band
+only constrains the DP matrix when the extension's reference window exceeds it — an intrinsically
+**long-read** condition — so:
+
+- **Use it for long reads:** SBX, PacBio HiFi, ONT, or any run whose reads are roughly ≥ 200 bp. On
+  SBX (HG002, 240 bp+) it cut alignment CPU by **~25 %**.
+- **No-op on short reads:** WGS (~150 bp) and WES (~76 bp) extensions are already smaller than the
+  band, so there is nothing to trim; those reads run on the 8-bit kernel, which the option leaves
+  untouched. Enabling it on a short-read run neither helps nor hurts.
+
+Accuracy is preserved: placement is identical to default on holodeck `sim-wgs-place` (MAPQ-60+ mismaps
+unchanged), and indel representation matches the `-w 100` default (indels up to the chaining limit
+still emit a single `D`/`I` CIGAR, so small/mid-size indel callers are unaffected). Like `--fast`, it
+is **not** byte-identical when enabled (it shifts a small number of borderline secondary alignments),
+which is why it is an opt-in flag rather than a default.
 
 ---
 

@@ -240,6 +240,9 @@ typedef struct dnaSeqPair
     // LEFT tight_band assignment, or seeding paths that don't run
     // ungapped_analyze) start at the safe sentinel rather than indeterminate.
     int32_t tight_band = 0;
+    // --adaptive-band: per-pair band implied by the chain's seed diagonal spread
+    // (capped at opt->w). Retry-floor for adaptive banding; 0 when off/no indel.
+    int32_t chain_band = 0;
     // Q3 instrumentation: would-be ungapped extension score (full diagonal
     // walk, mirrors the HIT-path walk semantics). Computed at LEFT queue
     // time for non-HIT pairs; carried through SW retry-collect; read at

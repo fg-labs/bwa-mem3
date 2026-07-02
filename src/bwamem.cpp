@@ -199,6 +199,21 @@ static inline int bsw8_envelope_ok(int len1, int len2, int w,
 #define flt_lt(a, b) ((a).w > (b).w)
 KSORT_INIT(mem_flt, mem_chain_t, flt_lt)
 PDQSORT_INIT(mem_flt, mem_chain_t, flt_lt)
+
+/* Chain-geometry adaptive band (--adaptive-band). Start the banded-SW tight at
+ * opt->band_start on the 16-bit and scalar (long-extension) tiers; carry each
+ * pair's chain_band (= its chain's seed diagonal spread, capped at opt->w = the
+ * implied inter-seed indel). ACCEPT_PAIR gates the score/max_off "converged"
+ * accepts on w >= chain_band, so a pair whose chain implies a larger indel keeps
+ * retrying to that band while a diagonal-hugging pair (chain_band=0) accepts in
+ * one tight pass. The 8-bit tier stays at opt->w (its int8 diagonal encoding caps
+ * at 127, and short extensions are sub-band so gain nothing). tight_band keeps its
+ * ungapped-estimate accept-early role. band_start<=0 (default): INIT_W==opt->w and
+ * ACCEPT_PAIR reduces to the original condition -> byte-identical. */
+#define INIT_W(w) (opt->band_start > 0 ? min_(opt->band_start, (w)) : (w))
+#define ACCEPT_PAIR(sc,pv,mo,w,tb,cb,i) \
+    ((i)+1==MAX_BAND_TRY || ((tb)>0 && (w)>=(tb)) || \
+     (((sc)==(pv) || (mo) < ((w)>>1)+((w)>>2)) && (opt->band_start <= 0 || (w) >= (cb))))
 //------------------------------------------------------------------
 // Alignment: Construct the alignment from a chain *
 
@@ -265,6 +280,7 @@ mem_opt_t *mem_opt_init()
     o->seed_emit_order = SEED_ORDER_OFF;  // byte-identical default
     o->smem_dedup  = 0;   // off by default -> byte-identical to baseline; opt-in via --smem-dedup
     o->skip_contained_ext = 0;   // off by default; opt-in via --skip-contained-ext (byte-identical)
+    o->band_start  = 0;   // off by default (adaptive chain-geometry band); opt-in via --adaptive-band
     o->split_width = 10;
     o->max_occ = 500;
     o->max_chain_gap = 10000;
@@ -3343,6 +3359,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
             rmax[0] = l_pac<<1; rmax[1] = 0;
 
             int chain_max_n_hits = 1;
+            int64_t cb_lo=0, cb_hi=0; int cb_f=1, chain_band=0;
             for (int i = 0; i < c->n; ++i) {
                 int64_t b, e;
                 const mem_seed_t *t = &c->seeds[i];
@@ -3355,7 +3372,11 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                 rmax[1] = (rmax[1] > e)? rmax[1] : e;
                 if (t->len > max) max = t->len;
                 if (t->n_hits > chain_max_n_hits) chain_max_n_hits = t->n_hits;
+                if (opt->band_start > 0) { int64_t _d = t->rbeg - t->qbeg; if (cb_f){cb_lo=cb_hi=_d; cb_f=0;} else { if(_d<cb_lo)cb_lo=_d; if(_d>cb_hi)cb_hi=_d; } }
             }
+            int64_t cb_span = cb_hi - cb_lo;
+            if (cb_span > opt->w) cb_span = opt->w;
+            chain_band = (int)cb_span;
 
             rmax[0] = rmax[0] > 0? rmax[0] : 0;
             rmax[1] = rmax[1] < l_pac<<1? rmax[1] : l_pac<<1;
@@ -3541,7 +3562,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
 
                     sp.len2 = s->qbeg;
                     sp.len1 = tmp;
-                    sp.tight_band = 0;  // 0 sentinel: "no tight bound known"
+                    sp.tight_band = 0; sp.chain_band = chain_band;  // 0 sentinel: "no tight bound known"
                     int64_t minval;  // declared ahead of goto target for C++
 
                     // ungapped analysis.
@@ -3764,7 +3785,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
 
                     for (int i = 0; i < sp.len1; ++i) rs[i] = rseq[re + i]; //seq1
 
-                    sp.tight_band = 0;
+                    sp.tight_band = 0; sp.chain_band = chain_band;
                     sp.ugp_r_attempted = 0;
                     int64_t minval;  // declared ahead of goto target for C++
 
@@ -3967,7 +3988,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
     // heuristic exits (a->score == prev / max_off < 3w/4) can then fire
     // on a suboptimal alignment found within the narrow band, breaking
     // chr22 parity.
-    int init_w = opt->w;
+    int init_w = INIT_W(opt->w);
 
     // scalar
     for ( i=0; i<MAX_BAND_TRY; i++)
@@ -3993,9 +4014,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
             int prev = a->score;
             a->score = sp->score;
 
-            if (a->score == prev || sp->max_off < (w >> 1) + (w >> 2) ||
-                i+1 == MAX_BAND_TRY ||
-                (sp->tight_band > 0 && w >= sp->tight_band))
+            if (ACCEPT_PAIR(a->score, prev, sp->max_off, w, sp->tight_band, sp->chain_band, i))
             {
                 ugp_record_left_outcome(sp, opt->a, tid);
                 if (sp->gscore <= 0 || sp->gscore <= a->score - opt->pen_clip5) {
@@ -4036,7 +4055,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
     pair_ar_aux = seqPairArrayAux;
 
     nump = numPairsLeft16;
-    init_w = opt->w;
+    init_w = INIT_W(opt->w);
     for ( i=0; i<MAX_BAND_TRY; i++)
     {
         int32_t w = init_w << i;
@@ -4063,9 +4082,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
             a->score = sp->score;
 
 
-            if (a->score == prev || sp->max_off < (w >> 1) + (w >> 2) ||
-                i+1 == MAX_BAND_TRY ||
-                (sp->tight_band > 0 && w >= sp->tight_band))
+            if (ACCEPT_PAIR(a->score, prev, sp->max_off, w, sp->tight_band, sp->chain_band, i))
             {
                 ugp_record_left_outcome(sp, opt->a, tid);
                 if (sp->gscore <= 0 || sp->gscore <= a->score - opt->pen_clip5) {
@@ -4136,9 +4153,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
             int prev = a->score;
             a->score = sp->score;
 
-            if (a->score == prev || sp->max_off < (w >> 1) + (w >> 2) ||
-                i+1 == MAX_BAND_TRY ||
-                (sp->tight_band > 0 && w >= sp->tight_band))
+            if (ACCEPT_PAIR(a->score, prev, sp->max_off, w, sp->tight_band, sp->chain_band, i))
             {
                 ugp_record_left_outcome(sp, opt->a, tid);
                 if (sp->gscore <= 0 || sp->gscore <= a->score - opt->pen_clip5) {
@@ -4321,7 +4336,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
     pair_ar = seqPairArrayRight128 + numPairsRight128 + numPairsRight16;
     pair_ar_aux = seqPairArrayAux;
     nump = numPairsRight1;
-    init_w = opt->w;
+    init_w = INIT_W(opt->w);
 
     for ( i=0; i<MAX_BAND_TRY; i++)
     {
@@ -4347,9 +4362,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
             a->score = sp->score;
 
             // no further banding
-            if (a->score == prev || sp->max_off < (w >> 1) + (w >> 2) ||
-                i+1 == MAX_BAND_TRY ||
-                (sp->tight_band > 0 && w >= sp->tight_band))
+            if (ACCEPT_PAIR(a->score, prev, sp->max_off, w, sp->tight_band, sp->chain_band, i))
             {
                 ugp_record_right_outcome(sp, tid);
                 if (sp->gscore <= 0 || sp->gscore <= a->score - opt->pen_clip3) {
@@ -4385,7 +4398,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
     pair_ar = seqPairArrayRight128 + numPairsRight128;
     pair_ar_aux = seqPairArrayAux;
     nump = numPairsRight16;
-    init_w = opt->w;
+    init_w = INIT_W(opt->w);
 
     for ( i=0; i<MAX_BAND_TRY; i++)
     {
@@ -4414,9 +4427,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
             a->score = sp->score;
 
             // no further banding
-            if (a->score == prev || sp->max_off < (w >> 1) + (w >> 2) ||
-                i+1 == MAX_BAND_TRY ||
-                (sp->tight_band > 0 && w >= sp->tight_band))
+            if (ACCEPT_PAIR(a->score, prev, sp->max_off, w, sp->tight_band, sp->chain_band, i))
             {
                 ugp_record_right_outcome(sp, tid);
                 if (sp->gscore <= 0 || sp->gscore <= a->score - opt->pen_clip3) {
@@ -4484,9 +4495,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
             int prev = a->score;
             a->score = sp->score;
             // no further banding
-            if (a->score == prev || sp->max_off < (w >> 1) + (w >> 2) ||
-                i+1 == MAX_BAND_TRY ||
-                (sp->tight_band > 0 && w >= sp->tight_band))
+            if (ACCEPT_PAIR(a->score, prev, sp->max_off, w, sp->tight_band, sp->chain_band, i))
             {
                 ugp_record_right_outcome(sp, tid);
                 if (sp->gscore <= 0 || sp->gscore <= a->score - opt->pen_clip3) {

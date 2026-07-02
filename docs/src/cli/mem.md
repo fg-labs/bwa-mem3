@@ -244,6 +244,31 @@ effect on them. `--fast` sets `5`. For the accuracy/speed curve and validation s
 see
 [Settings profiles → `--max-extend-chains 5`](../best-practices/settings-profiles.md#chain-extension-cap---max-extend-chains-5).
 
+#### `--adaptive-band` — adaptive banded Smith-Waterman for long reads
+
+Off by default → output byte-identical to baseline. When set, banded extension
+starts at a tight band and expands each pair only to the band its chain's seed
+geometry actually needs (the inter-seed indel), rather than the fixed `-w` band
+(100) for every extension.
+
+**When to use it: long reads.** The band only constrains the DP matrix when the
+extension's reference window exceeds it (`ref_window > 2·w+1`), which happens for
+long reads. So this is a **long-read lever — SBX, PacBio HiFi, ONT, or any run
+whose reads are roughly ≥ 200 bp.** On SBX (HG002, 240 bp+) it cuts alignment CPU
+by **~25 %**. On short-read data (WGS ~150 bp, WES ~76 bp) the extension matrix is
+already smaller than the band, so there is nothing to trim: those reads run on the
+8-bit kernel, which this option deliberately leaves untouched, making it a **no-op
+on short reads** (enabling it on a WGS/WES run neither helps nor hurts).
+
+**Accuracy:** placement is unchanged (holodeck `sim-wgs-place`: MAPQ-60+ mismaps
+identical to default) and indel representation is preserved — indels up to the
+chaining limit still emit a single `D`/`I` CIGAR, matching the `-w 100` default,
+so small/mid-size indel callability is unaffected.
+
+**Not byte-identical when on.** Like `--fast`, enabling it shifts a small number of
+borderline secondary alignments (starting tight and expanding can change which of
+several near-tied placements wins). It is therefore an opt-in flag, not a default.
+
 #### `-h INT[,INT]` — secondary alignment reporting
 
 If there are fewer than `INT` hits with score exceeding `FLOAT` (see `-z`)
@@ -267,12 +292,16 @@ the alignment score and mapping quality for each secondary hit.
 `--fast` is a one-flag shorthand for the characterized speed levers:
 
 ```text
-bwa-mem3 mem --fast  ≡  -m 10 -y 0 --min-ext-len 30 --smem-dedup --skip-contained-ext --max-extend-chains 5
+bwa-mem3 mem --fast  ≡  -m 10 -y 0 --min-ext-len 30 --smem-dedup --skip-contained-ext --max-extend-chains 5 --adaptive-band
 ```
 
 `--skip-contained-ext` is byte-identical to the default on non-meth single- and paired-end
 reads and no-ops under `--meth` (via its own internal gate), so it is pure upside where it
 applies (~10% lower alignment CPU on long-read inputs) and safe elsewhere.
+
+`--adaptive-band` (see above) is included because it is a strict no-op on short reads
+(the reads `--fast` primarily targets) and a ~25% alignment-CPU speedup on long-read
+(SBX/HiFi/ONT) runs, so bundling it only helps.
 
 Under `--meth` it additionally sets `-s 2` (light Pass-2 re-seeding). Earlier releases
 used `-s 0` (no re-seed), which inflated MAPQ on bisulfite reads; `-s 2` recovers the
