@@ -1287,6 +1287,61 @@ static inline int meth_seed_to_orig(const bntseq_t *seed_bns,
     return 0;
 }
 
+/* Chain one fully-resolved seed into the per-read kbtree: find the closest
+ * existing chain and test_and_merge, else open a new chain. Extracted verbatim
+ * from mem_chain_seeds's per-seed body so the two seed-emit paths share it: the
+ * default (SEED_ORDER_OFF) streams each seed straight here as it is resolved
+ * (single pass, no buffering), while the opt-in reorder modes materialize all
+ * seeds, order them, then replay them through here. Behaviour is identical to
+ * the previous inline body; only the call site differs. */
+static inline void chain_add_one_seed(const mem_opt_t *opt, int64_t l_pac,
+                                      const bntseq_t *chain_bns, kbtree_t(chn) *tree,
+                                      mem_seed_t *seedBuf, int64_t *seedBufCount,
+                                      int64_t seedBufSize, int tid, int seqid,
+                                      int *num_seqid, const mem_seed_t *seed_in,
+                                      int rid, int8_t meth_hyp)
+{
+    mem_seed_t s = *seed_in;
+    mem_chain_t tmp, *lower, *upper;
+    int to_add = 0;
+    tmp.pos = s.rbeg;
+
+    if (kb_size(tree))
+    {
+        kb_intervalp(chn, tree, &tmp, &lower, &upper); // find the closest chain
+
+        if (!lower || !test_and_merge(opt, l_pac, lower, &s, rid, tid))
+            to_add = 1;
+    }
+    else to_add = 1;
+
+    if (to_add) // add the seed as a new chain
+    {
+        tmp.n = 1; tmp.m = SEEDS_PER_CHAIN;
+        if((*seedBufCount + tmp.m) > seedBufSize)
+        {
+            tmp.m += 1;
+            tmp.seeds = (mem_seed_t *)calloc (tmp.m, sizeof(mem_seed_t));
+            assert(tmp.seeds != NULL);
+            tprof[PE13][tid]++;
+        }
+        else {
+            tmp.seeds = seedBuf + *seedBufCount;
+            *seedBufCount += tmp.m;
+        }
+        memset((char*) (tmp.seeds), 0, tmp.m * sizeof(mem_seed_t));
+        tmp.seeds[0] = s;
+        tmp.rid = rid;
+        tmp.seqid = seqid;
+        /* is_alt indexes the chain-side bns (original in --meth). */
+        tmp.is_alt = !!chain_bns->anns[rid].is_alt;
+        /* D3: carry the OT/OB hypothesis on the chain (-1 non-meth). */
+        tmp.meth_hypothesis = meth_hyp;
+        kb_putp(chn, tree, &tmp);
+        (*num_seqid)++;
+    }
+}
+
 /** NEW ONE **/
 void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
                      const bntseq_t *bns,
@@ -1310,6 +1365,11 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
     const int meth_remap = (opt->meth_mode && meth_orig_bns != NULL);
     const bntseq_t *chain_bns = meth_remap ? meth_orig_bns : bns;
     int64_t l_pac = chain_bns->l_pac;
+    /* Seed-emit strategy. OFF (the default) streams each resolved seed straight
+     * into the kbtree in resolve order — no recs[] buffer, no order_seeds pass —
+     * which is byte-identical to, and as cheap as, the pre-seed-order baseline.
+     * Only a selected reorder mode needs the materialize/order/replay path. */
+    const int reorder = (opt->seed_emit_order != SEED_ORDER_OFF);
 
     int num[nseq];
     memset(num, 0, nseq*sizeof(int));
@@ -1369,18 +1429,31 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
             assert(sa_coord != NULL);
         }
 
-        /* Phase A buffer (Spec S4): ceiling = (#SMEMs this read) * max_occ, the
-         * same prefetch ceiling sa_coord is sized to. Grow with realloc, persist
-         * across reads. Reset nrec per read. */
+        /* Phase A buffer (Spec S4): resolved-seed records for the reorder path.
+         * Grow with realloc, persist across reads. Reset nrec per read. Only the
+         * opt-in reorder modes populate it; OFF streams straight to chaining. */
         int64_t nrec = 0;
-        int64_t recs_need = (pos - smem_ptr + 1) * (int64_t)opt->max_occ;
-        if (recs_need > recs_cap)
+        if (reorder)
         {
-            recs_cap = recs_need;
-            /* CodeRabbit: temp pointer so a NULL realloc doesn't leak recs. */
-            seed_rec_t *recs_new = (seed_rec_t *) realloc(recs, recs_cap * sizeof(seed_rec_t));
-            assert(recs_new != NULL);
-            recs = recs_new;
+            /* Tight ceiling: each SMEM contributes at most min(occ, max_occ)
+             * resolved seeds (the resolve loop below stops at the occurrence
+             * count and caps at max_occ), so summing that is a far snugger bound
+             * than the old (#SMEMs * max_occ) worst case whenever most SMEMs are
+             * low-occurrence. Still a strict upper bound on nrec. */
+            int64_t recs_need = 0;
+            for (int64_t si = smem_ptr; si <= pos; ++si)
+            {
+                int64_t occ = matchArray[si].s;
+                recs_need += occ < opt->max_occ ? occ : opt->max_occ;
+            }
+            if (recs_need > recs_cap)
+            {
+                recs_cap = recs_need;
+                /* CodeRabbit: temp pointer so a NULL realloc doesn't leak recs. */
+                seed_rec_t *recs_new = (seed_rec_t *) realloc(recs, recs_cap * sizeof(seed_rec_t));
+                assert(recs_new != NULL);
+                recs = recs_new;
+            }
         }
 
         int64_t id = 0, cnt_ = 0, mypos = 0;
@@ -1451,70 +1524,42 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
                 // don't discard it!!!
                 if (rid < 0) continue;
 
-                // Phase A: append the fully-resolved seed (drops above already
-                // consumed the SA slot). B1: copy the FULL mem_seed_t.
-                seed_rec_t *r = &recs[nrec++];
-                r->seed = s;
-                r->rid = rid;
-                r->meth_hyp = meth_hyp; // -1 when !meth_remap
-                r->orig_ix = (uint32_t)(nrec - 1);
+                if (!reorder)
+                {
+                    /* OFF (default): chain the seed immediately, in resolve
+                     * order — the single-pass streaming path. No recs[] write,
+                     * no order_seeds; byte-identical to buffering with the
+                     * identity order but without the double memory traffic. */
+                    chain_add_one_seed(opt, l_pac, chain_bns, tree, seedBuf,
+                                       &seedBufCount, seedBufSize, tid, l, &num[l],
+                                       &s, rid, meth_hyp);
+                }
+                else
+                {
+                    // Phase A: append the fully-resolved seed (drops above already
+                    // consumed the SA slot). B1: copy the FULL mem_seed_t.
+                    seed_rec_t *r = &recs[nrec++];
+                    r->seed = s;
+                    r->rid = rid;
+                    r->meth_hyp = meth_hyp; // -1 when !meth_remap
+                    r->orig_ix = (uint32_t)(nrec - 1);
+                }
             }
         } // seeds
 
-        // Phase B (order). Identity for SEED_ORDER_OFF; stable on orig_ix.
-        order_seeds(recs, nrec, opt->seed_emit_order);
-
-        // Phase C (chain). MOVED verbatim from the old per-seed body; sources
-        // s/rid/meth_hyp from the ordered buffer. S5: equal-pos insertion order
-        // into the kbtree is preserved (no dedup/compact beyond order_seeds).
-        for (int64_t ri = 0; ri < nrec; ++ri)
+        if (reorder)
         {
-            mem_seed_t s = recs[ri].seed;
-            int rid = recs[ri].rid;
-            int8_t meth_hyp = recs[ri].meth_hyp;
-            mem_chain_t tmp, *lower, *upper;
-            int to_add = 0;
-            tmp.pos = s.rbeg;
+            // Phase B (order). Stable on orig_ix.
+            order_seeds(recs, nrec, opt->seed_emit_order);
 
-            if (kb_size(tree))
-            {
-                kb_intervalp(chn, tree, &tmp, &lower, &upper); // find the closest chain
-
-                if (!lower || !test_and_merge(opt, l_pac, lower, &s, rid, tid))
-                    to_add = 1;
-            }
-            else to_add = 1;
-
-            //uint64_t tim = __rdtsc();
-            if (to_add) // add the seed as a new chain
-            {
-                tmp.n = 1; tmp.m = SEEDS_PER_CHAIN;
-                if((seedBufCount + tmp.m) > seedBufSize)
-                {
-                    tmp.m += 1;
-                    tmp.seeds = (mem_seed_t *)calloc (tmp.m, sizeof(mem_seed_t));
-                    assert(tmp.seeds != NULL);
-                    tprof[PE13][tid]++;
-                }
-                else {
-                    tmp.seeds = seedBuf + seedBufCount;
-                    seedBufCount += tmp.m;
-                }
-                memset((char*) (tmp.seeds), 0, tmp.m * sizeof(mem_seed_t));
-                tmp.seeds[0] = s;
-                tmp.rid = rid;
-                tmp.seqid = l;
-                /* is_alt indexes the chain-side bns (original in --meth). */
-                tmp.is_alt = !!chain_bns->anns[rid].is_alt;
-                /* D3: carry the OT/OB hypothesis on the chain (-1 non-meth).
-                 * All seeds of one read share a hypothesis (directional
-                 * R1→OT / R2→OB), so test_and_merge needs no hypothesis
-                 * guard; new chains for the same read get the same label. */
-                tmp.meth_hypothesis = meth_hyp;
-                kb_putp(chn, tree, &tmp);
-                num[l]++;
-            }
-        } // Phase C
+            // Phase C (chain). Replay the ordered buffer through the shared
+            // chaining helper. S5: equal-pos insertion order into the kbtree is
+            // preserved (no dedup/compact beyond order_seeds).
+            for (int64_t ri = 0; ri < nrec; ++ri)
+                chain_add_one_seed(opt, l_pac, chain_bns, tree, seedBuf,
+                                   &seedBufCount, seedBufSize, tid, l, &num[l],
+                                   &recs[ri].seed, recs[ri].rid, recs[ri].meth_hyp);
+        } // reorder
 
         smem_ptr = pos + 1;
         size = kb_size(tree);
