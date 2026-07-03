@@ -283,4 +283,66 @@ TEST_CASE("bandedSWA 8-bit byte-identical to scalar on repeat-rich, large-h0 rea
     CHECK(st.n_out_env > 0);
 }
 
+// --- Asymmetric (--meth OT/OB) query-end gscore/gtle capture --------------------
+//
+// Regression for the 8-bit "exit due to zero score by a row" break dropping the
+// current row's query-end (gscore/gtle) capture. Under --meth's asymmetric
+// substitution matrix (OT frees ref-C/read-T), a real captured extension pair
+// reaches the query end at a late target row where the whole band has decayed to
+// 0 (gscore==0). scalar records that row's gscore before its m==0 break; the 8-bit
+// kernel's zero-row break used to exit BEFORE folding the capture into the wide
+// gbest_abs/ierow, so getScores8 reported gtle from an early row (1) instead of the
+// scalar row (67). Benign for symmetric scoring (gscore==0 gtle is unused), but
+// consumed under --meth, where it produced spurious soft-clips / placement drift.
+//
+// The captured pair (from a 1M-pair meth slice) scores with the bisulfite params
+// a=1, b=2, gap open/extend 6/1, end_bonus (pen_clip) 10, band 100, seed h0 27.
+TEST_CASE("bandedSWA 8-bit query-end gscore/gtle byte-identical to scalar under an"
+          " asymmetric --meth (OT) matrix (zero-score-row break capture)"
+          * doctest::test_suite("unit/bandedswa")) {
+    const int a = 1, b = 2, o = 6, e = 1, end_bonus = 10, w = 100, zdrop = 100, h0 = 27;
+    // OT matrix: symmetric a/-b plus freed ref-C/read-T (and the collapsed mirror
+    // ref-T/read-C), ambiguous = -1 — exactly mem_opt_fill_meth_mat's OT output.
+    int8_t mat[25];
+    build_mat(mat, a, b, -1);
+    mat[1 * 5 + 3] = (int8_t)a;   // ref C / read T -> match
+    mat[3 * 5 + 1] = (int8_t)a;   // ref T / read C -> match (collapsed)
+
+    const uint8_t ref[] = {2,2,0,0,0,0,3,0,0,3,3,0,1,3,3,3,3,0,1,0,0,2,3,0,0,0,3,0,1,0,3,1,2,0,1,2,2,0,3,0,3,0,0,0,2,2,3,1,1,1,3,3,3,2,3,0,3,1,1,3,2,3,3,1,2,2,3,1,0,3,3,0,3,0,0,3,1,0,3,3,0,2,0,0,2,3,0,0,3,0,1,2,3,3,3,0,1,0,0,2,3,0,3};
+    const uint8_t qer[] = {3,3,3,3,0,0,0,3,2,3,3,3,0,3,0,3,3,2,0,0,3,3,2,0,3,0,3,0,3,2,2,3,3,3,3,3,0,3,3,3,3,3,3,3,3,3,3,0,3,3,3,0,0,2};
+    const int len1 = (int)(sizeof(ref) / sizeof(ref[0]));
+    const int len2 = (int)(sizeof(qer) / sizeof(qer[0]));
+
+    BandedPairWiseSW bsw(o, e, o, e, zdrop, end_bonus, mat, a, b, 1);
+
+    const int STRIDE = len1 + MAX_LINE_LEN;
+    std::vector<uint8_t> seqRef(STRIDE, 0), seqQer(STRIDE, 0);
+    for (int i = 0; i < len1; ++i) seqRef[i] = ref[i];
+    for (int i = 0; i < len2; ++i) seqQer[i] = qer[i];
+
+    Out oracle;
+    oracle.score = bsw.scalarBandedSWA(len2, seqQer.data(), len1, seqRef.data(), w, h0,
+                                       &oracle.qle, &oracle.tle, &oracle.gtle,
+                                       &oracle.gscore, &oracle.max_off);
+
+    std::vector<SeqPair> pairs(padPairs(1));
+    pairs[0].id = 0; pairs[0].len1 = len1; pairs[0].len2 = len2; pairs[0].h0 = h0;
+    pairs[0].idr = 0; pairs[0].idq = 0; pairs[0].seqid = 0; pairs[0].regid = 0;
+    pairs[0].score = pairs[0].tle = pairs[0].gtle = pairs[0].qle =
+        pairs[0].gscore = pairs[0].max_off = -1;
+    bsw.getScores8(pairs.data(), seqRef.data(), seqQer.data(), 1, 1, w);
+
+    MESSAGE("meth-OT query-end: scalar gtle=" << oracle.gtle << " gscore=" << oracle.gscore
+            << " | get8 gtle=" << pairs[0].gtle << " gscore=" << pairs[0].gscore);
+    CHECK(pairs[0].score   == oracle.score);
+    CHECK(pairs[0].qle     == oracle.qle);
+    CHECK(pairs[0].tle     == oracle.tle);
+    CHECK(pairs[0].gtle    == oracle.gtle);    // was 1 vs scalar 67 before the fix
+    CHECK(pairs[0].gscore  == oracle.gscore);
+    CHECK(pairs[0].max_off == oracle.max_off);
+    // Non-vacuity: this input genuinely exercises the query-end tail (gtle deep in
+    // the target, well past the local end) so the check is not trivially satisfied.
+    CHECK(oracle.gtle > oracle.tle + 10);
+}
+
 #endif // HAVE_BSW_VECTOR_8_16
