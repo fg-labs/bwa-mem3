@@ -3,11 +3,14 @@
 #
 # Asserts that `bwa-mem3 mem --fast` resolves the characterized speed levers
 # (-m 10 -y 0 --min-ext-len 30 --smem-dedup --skip-contained-ext
-# --max-extend-chains 5, plus -s 2 under --meth), that explicit user flags
-# override the preset, and that the default path is untouched when --fast is
-# absent. --skip-contained-ext no-ops under --meth (internal gate), so it is
-# omitted from the meth audit line; --max-extend-chains applies under --meth
-# too, so it stays in the meth audit line.
+# --max-extend-chains 5, plus -s 2, --max-extend-chains 10, and
+# --extend-mate-concordant under --meth), that explicit user flags override the
+# preset, and that the default path is untouched when --fast is absent.
+# --skip-contained-ext no-ops under --meth (internal gate), so it is omitted from
+# the meth audit line; --max-extend-chains applies under --meth too but at a
+# higher cap of 10 (non-meth keeps 5). --extend-mate-concordant is meth-only
+# (recovers the bisulfite pairing regression the chain cap otherwise causes) and
+# must be absent from the non-meth audit line.
 #
 # The assertion surface is the audit line main_mem prints to stderr when
 # --fast is active: it reports the *resolved* mem_opt_t values, so an explicit
@@ -51,7 +54,9 @@ line="$(fast_line --fast)"
     || { echo "FAIL: --fast bundle wrong: '$line'" >&2; exit 1; }
 [[ "$line" != *"-s "* ]] \
     || { echo "FAIL: non-meth --fast must not set -s: '$line'" >&2; exit 1; }
-echo "OK:   --fast bundle resolves -m 10 -y 0 --min-ext-len 30 --smem-dedup --skip-contained-ext --max-extend-chains 5"
+[[ "$line" != *"--extend-mate-concordant"* ]] \
+    || { echo "FAIL: non-meth --fast must not enable --extend-mate-concordant: '$line'" >&2; exit 1; }
+echo "OK:   --fast bundle resolves -m 10 -y 0 --min-ext-len 30 --smem-dedup --skip-contained-ext --max-extend-chains 5 (no -s, no mate-concordant)"
 
 # 2. Override precedence: an explicit flag wins *only* for its own field; the
 #    rest of the preset (including the unconditional --smem-dedup) must survive.
@@ -98,9 +103,11 @@ if "$bin" index --meth "$mdir/ref.fa" >/dev/null 2>&1; then
         || { echo "FAIL: --fast --meth should resolve -s 2: '$line'" >&2; exit 1; }
     [[ "$line" != *"--skip-contained-ext"* ]] \
         || { echo "FAIL: --skip-contained-ext no-ops under --meth; must be absent from audit line: '$line'" >&2; exit 1; }
-    [[ "$line" == *"--max-extend-chains 5"* ]] \
-        || { echo "FAIL: --max-extend-chains applies under --meth; must be in audit line: '$line'" >&2; exit 1; }
-    echo "OK:   --fast --meth additionally sets -s 2 (skip-contained-ext omitted meth-gated, --max-extend-chains 5 still applies)"
+    [[ "$line" == *"--max-extend-chains 10"* ]] \
+        || { echo "FAIL: --max-extend-chains applies under --meth (cap 10); must be in audit line: '$line'" >&2; exit 1; }
+    [[ "$line" == *"--extend-mate-concordant"* ]] \
+        || { echo "FAIL: --fast --meth must enable --extend-mate-concordant: '$line'" >&2; exit 1; }
+    echo "OK:   --fast --meth additionally sets -s 2 and --extend-mate-concordant (skip-contained-ext omitted meth-gated, --max-extend-chains raised to 10)"
     # Explicit -s wins even under --meth (src/fastmap.cpp: -s 2 is gated on !opt0.split_width).
     "$bin" mem --meth --fast -s 7 -t 1 "$mdir/ref.fa" "$reads" >/dev/null 2>"$err" \
         || { echo "FAIL: mem --meth --fast -s 7 nonzero" >&2; cat "$err" >&2; exit 1; }

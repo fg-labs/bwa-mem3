@@ -936,6 +936,7 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "    --skip-contained-ext  skip banded-SW extension of seeds contained (same diagonal) in a longer in-chain seed; byte-identical (non-meth), ~10%% less alignment CPU; no effect under --meth [off]\n");
     fprintf(stderr, "    --max-extend-chains INT  cap chains extended per read to the top-INT by weight; ~23%% less alignment CPU, high-confidence placement unaffected; ignored for reads with >4096 chains; opt-in, NOT byte-identical (0 = off) [%d]\n", opt->max_extend_chains);
     fprintf(stderr, "    --adaptive-band  adaptive banded-SW: start tight and expand each pair to its chain-geometry band on long-extension reads; long-read speedup (~1.3x on SBX), no-op on short reads; opt-in, NOT byte-identical [%s]\n", opt->band_start? "on":"off");
+    fprintf(stderr, "    --extend-mate-concordant[=INT]  when --max-extend-chains caps a PE read, also keep any chain concordant (same contig, FR, within INT bp) with a mate chain; recovers the true pair's low-weight chain the cap would drop (mainly --meth). Bare = auto (window = estimated proper-pair insert high bound); =INT = fixed bp; =0 = off. Opt-in, NOT byte-identical [%s]\n", opt->mate_concordant_window? (opt->mate_concordant_window<0? "auto":"fixed") : "off");
     fprintf(stderr, "    -D FLOAT      drop chains shorter than FLOAT fraction of the longest overlapping chain [%.2f]\n", opt->drop_ratio);
     fprintf(stderr, "    -W INT        discard a chain if seeded bases shorter than INT [0]\n");
     fprintf(stderr, "    -m INT        perform at most INT rounds of mate rescues for each read [%d]\n", opt->max_matesw);
@@ -943,10 +944,10 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "    -P            skip pairing; mate rescue performed unless -S also in use\n");
     fprintf(stderr, "    --fast        speed preset: -m 10 -y 0 --min-ext-len 30 --smem-dedup\n");
     fprintf(stderr, "                  --skip-contained-ext --max-extend-chains 5 --adaptive-band (and\n");
-    fprintf(stderr, "                  -s 2 under --meth). Opt-in; explicit flags override where\n");
-    fprintf(stderr, "                  applicable; --smem-dedup, --skip-contained-ext and\n");
-    fprintf(stderr, "                  --adaptive-band are always enabled. NOT\n");
-    fprintf(stderr, "                  byte-identical to the default (divergence confined to the\n");
+    fprintf(stderr, "                  -s 2 --extend-mate-concordant under --meth). Opt-in; explicit\n");
+    fprintf(stderr, "                  flags override where applicable; --smem-dedup,\n");
+    fprintf(stderr, "                  --skip-contained-ext and --adaptive-band are always enabled.\n");
+    fprintf(stderr, "                  NOT byte-identical to the default (divergence confined to the\n");
     fprintf(stderr, "                  low-confidence tail).\n");
     fprintf(stderr, "Scoring options:\n");
     fprintf(stderr, "   -A INT        score for a sequence match, which scales options -TdBOELU unless overridden [%d]\n", opt->a);
@@ -1127,6 +1128,7 @@ int main_mem(int argc, char *argv[])
         OPT_FAST,
         OPT_SKIP_CONTAINED_EXT,
         OPT_ADAPTIVE_BAND,
+        OPT_EXTEND_MATE_CONCORDANT,
 #ifdef STAGE_PROF
         OPT_PROFILE,
 #endif
@@ -1140,6 +1142,7 @@ int main_mem(int argc, char *argv[])
         {"fast",                     no_argument,       0, OPT_FAST},
         {"skip-contained-ext",       no_argument,       0, OPT_SKIP_CONTAINED_EXT},
         {"adaptive-band",            no_argument,       0, OPT_ADAPTIVE_BAND},
+        {"extend-mate-concordant",   optional_argument, 0, OPT_EXTEND_MATE_CONCORDANT},
         {"meth",                     no_argument,       0, OPT_METH},
         {"meth-scoring",             required_argument, 0, OPT_METH_SCORING},
         {"set-as-failed",            required_argument, 0, OPT_METH_SET_AS_FAILED},
@@ -1341,6 +1344,12 @@ int main_mem(int argc, char *argv[])
         else if (c == OPT_FAST) fast = 1;
         else if (c == OPT_SKIP_CONTAINED_EXT) opt->skip_contained_ext = 1;
         else if (c == OPT_ADAPTIVE_BAND) opt->band_start = ADAPTIVE_BAND_START;
+        else if (c == OPT_EXTEND_MATE_CONCORDANT) {
+            /* bare flag = auto (-1, use the estimated insert-size high bound);
+             * =INT = fixed window in bp; =0 = off. */
+            opt->mate_concordant_window = optarg ? atoi(optarg) : -1;
+            opt0.mate_concordant_window = 1;
+        }
         else if (c == OPT_HELP) {
             usage(opt);
             free(opt);
@@ -1436,7 +1445,8 @@ int main_mem(int argc, char *argv[])
 
     /* --fast: one-flag shorthand for the characterized speed levers
      *   -m 10  -y 0  --min-ext-len 30  --smem-dedup  --skip-contained-ext
-     *   --max-extend-chains 5  (+ -s 2 under --meth).
+     *   --max-extend-chains 5  --adaptive-band
+     *   (under --meth: also adds -s 2 and --extend-mate-concordant).
      * Mirrors the -x preset: each lever is applied only when the user did not
      * set it explicitly (opt0), so explicit flags win where applicable. The
      * exceptions are --smem-dedup and --skip-contained-ext, which are plain
@@ -1451,13 +1461,36 @@ int main_mem(int argc, char *argv[])
         if (!opt0.max_matesw)   opt->max_matesw   = 10;  /* -m 10 */
         if (!opt0.max_mem_intv) opt->max_mem_intv = 0;   /* -y 0  */
         if (!opt0.min_ext_len)  opt->min_ext_len  = 30;  /* --min-ext-len 30 */
-        if (!opt0.max_extend_chains) opt->max_extend_chains = 5;  /* --max-extend-chains 5 */
+        /* --max-extend-chains: 5 for non-meth; 10 under --meth. A 7-point ablation
+         * ({0,5,10,20,50,100,1000}) on 1M sim-meth PE pairs (with mate-concordant
+         * rescue on, below) shows chr-accuracy flat (0.9908) at every cap but the
+         * confident wrong-chromosome rate is U-shaped, minimized at 10 (cap 5: 592
+         * MAPQ>=30 mismaps; cap 10: 382; uncapped: 1056), for +0.7s wall (20.2->20.9s,
+         * still -6% vs uncapped). Non-meth keeps 5 (its placement is cap-insensitive
+         * and 5 is the pure-speed pick). */
+        if (!opt0.max_extend_chains) opt->max_extend_chains = opt->meth_mode ? 10 : 5;
         opt->smem_dedup = 1;                             /* --smem-dedup (plain on/off) */
         opt->skip_contained_ext = 1;                     /* --skip-contained-ext (plain on/off;
                                                           * meth-gated internally) */
         opt->band_start = ADAPTIVE_BAND_START;           /* --adaptive-band: no-op on short reads
                                                           * (8-bit tier untouched), ~25% faster on
                                                           * long-read (SBX/HiFi/ONT) runs. */
+        /* --extend-mate-concordant (meth only): the top-5 chain cap regresses
+         * bisulfite PE placement. Mechanism (instrumented on 50k sim-meth-place
+         * pairs vs truth): NOT chain-dropping -- in 89% of regressions the read's
+         * true alignment is still a candidate, but the collapsed 3-letter alphabet
+         * flattens chain weights so the read carries many chains, and capping to 5
+         * starves PE pairing/mate-rescue of the secondary anchors that let the true
+         * concordant pair win; both mates then flip together to a wrong concordant
+         * locus (99% proper-pair). Keeping any capped chain that is concordant with
+         * a mate chain retains exactly the true pair's low-weight chain while still
+         * dropping the far/redundant ones, recovering placement to default parity
+         * (97.64% -> 98.08%, == cap-off 98.09%). Non-meth --fast keeps the plain
+         * cap (WGS placement is already unaffected and the exemption would erode
+         * the speedup). Auto (-1) sizes the concordance window to the estimated
+         * proper-pair insert bound so only genuine pair anchors are retained. */
+        if (opt->meth_mode && !opt0.mate_concordant_window)
+            opt->mate_concordant_window = -1;
         if (opt->meth_mode && !opt0.split_width)
             opt->split_width = 2;                        /* -s 2 (meth only): light Pass-2 reseed.
                                                           * -s 0 (no reseed) inflates MAPQ on bisulfite
@@ -1580,7 +1613,7 @@ int main_mem(int argc, char *argv[])
             /* --skip-contained-ext is set but no-ops under --meth (internal gate), so it is
              * intentionally omitted from the meth audit line to reflect the effective levers.
              * --adaptive-band is set unconditionally and applies under --meth, so it stays. */
-            fprintf(stderr, "[M::%s] --fast: -m %d -y %ld --min-ext-len %d --smem-dedup --max-extend-chains %d --adaptive-band -s %d\n",
+            fprintf(stderr, "[M::%s] --fast: -m %d -y %ld --min-ext-len %d --smem-dedup --max-extend-chains %d --adaptive-band -s %d --extend-mate-concordant\n",
                     __func__, opt->max_matesw, (long)opt->max_mem_intv, opt->min_ext_len, opt->max_extend_chains, opt->split_width);
         else
             fprintf(stderr, "[M::%s] --fast: -m %d -y %ld --min-ext-len %d --smem-dedup --skip-contained-ext --max-extend-chains %d --adaptive-band\n",

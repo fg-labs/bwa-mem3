@@ -277,6 +277,8 @@ mem_opt_t *mem_opt_init()
     o->min_seed_len = 19;
     o->min_ext_len = 0;   // off by default -> byte-identical to baseline
     o->max_extend_chains = 0;   // off by default; opt-in speed lever (--max-extend-chains / --fast)
+    o->mate_concordant_window = 0;   // off by default; opt-in (--extend-mate-concordant / --fast --meth)
+    o->est_insert_high = 0;          // runtime state; set from data (mem_pestat) or -I during the run
     o->seed_emit_order = SEED_ORDER_OFF;  // byte-identical default
     o->smem_dedup  = 0;   // off by default -> byte-identical to baseline; opt-in via --smem-dedup
     o->skip_contained_ext = 0;   // off by default; opt-in via --skip-contained-ext (byte-identical)
@@ -829,6 +831,58 @@ static int mem_chain_cap_extend(mem_chain_t *a, int n, int max_n)
             if (w[j] > w[i] || (w[j] == w[i] && j < i)) rank++;
         }
         if (rank < max_n) a[k++] = a[i];
+        else if (a[i].m > SEEDS_PER_CHAIN) free(a[i].seeds);
+    }
+    return k;
+}
+
+/* --extend-mate-concordant: like mem_chain_cap_extend but additionally RETAINS
+ * any chain concordant with a mate chain (same contig, FR orientation, within
+ * `win` bp) even if it ranks below max_n. Targets the meth --fast pairing
+ * regression: the true chain is often low-weight under bisulfite (collapsed
+ * alphabet) and gets capped, yet it anchors the true concordant pair, so PE
+ * pairing flips both mates to a wrong concordant locus. chain.pos is in the
+ * original 2*l_pac coordinate space, so bns_depos gives the forward coord.
+ * `win` is the estimated proper-pair insert high bound (pes[FR].high) when
+ * available, else MATE_CONCORDANT_WINDOW_FALLBACK, else a fixed CLI value;
+ * matching the aligner's own concordance bound keeps only genuine pair anchors
+ * (far/spurious concordant chains stay capped, bounding the extra extension).
+ * The mate scan is bounded (MATE_SCAN_MAX) to keep this O(n) in practice; the
+ * true anchor is virtually always among a read's higher-ranked chains. */
+#define MATE_CONCORDANT_WINDOW_FALLBACK 1000  /* used only in --auto before the insert size is estimated (e.g. first chunk) */
+#define MATE_SCAN_MAX 256
+static int mem_chain_cap_extend_mate(mem_chain_t *a, int n, int max_n,
+        const mem_chain_t *mate, int mate_n, const bntseq_t *bns, int64_t win)
+{
+    if (max_n <= 0 || n <= max_n || n > MAX_EXTEND_CHAINS_CAP) return n;
+    const int MSCAN = MATE_SCAN_MAX;
+    int mn = mate_n < MSCAN ? mate_n : MSCAN;
+    int64_t mfp[MSCAN]; int mrid[MSCAN], mrev[MSCAN];
+    for (int j = 0; j < mn; j++) {
+        int is_rev; mfp[j] = bns_depos(bns, mate[j].pos, &is_rev);
+        mrid[j] = mate[j].rid; mrev[j] = is_rev;
+    }
+    int w[MAX_EXTEND_CHAINS_CAP];
+    for (int i = 0; i < n; i++) w[i] = a[i].w > 0 ? a[i].w : mem_chain_weight(&a[i]);
+    int k = 0;
+    for (int i = 0; i < n; i++) {
+        int rank = 0;
+        for (int j = 0; j < n; j++)
+            if (j != i && (w[j] > w[i] || (w[j] == w[i] && j < i))) rank++;
+        int keep = rank < max_n;
+        if (!keep && mn > 0) {
+            int is_rev; int64_t fp = bns_depos(bns, a[i].pos, &is_rev);
+            for (int j = 0; j < mn; j++)
+                if (mrid[j] == a[i].rid && mrev[j] != is_rev &&
+                    /* true FR ("innie"): the forward-strand chain must sit
+                     * at/upstream of the reverse-strand chain, else an RF
+                     * ("outie") pair within win bp would falsely qualify. */
+                    ((!is_rev && fp <= mfp[j]) || (is_rev && mfp[j] <= fp))) {
+                    int64_t d = fp > mfp[j] ? fp - mfp[j] : mfp[j] - fp;
+                    if (d <= win) { keep = 1; break; }
+                }
+        }
+        if (keep) a[k++] = a[i];
         else if (a[i].m > SEEDS_PER_CHAIN) free(a[i].seeds);
     }
     return k;
@@ -1636,11 +1690,33 @@ int mem_kernel1_core(FMI_search *fmi,
     /************** Post-processing of collected smems/chains ************/
     // tim = __rdtsc();
     printf_(VER, "6.1. Calling mem_chain_flt..\n");
+    /* Pass 1: filter every read first, so the mate's filtered chains are
+     * available to the mate-concordance-aware cap (--extend-mate-concordant) below. */
+    for (int l=0; l<nseq; l++) {
+        chn = &chain_ar[l];
+        chn->n = mem_chain_flt(opt, chn->n, chn->a, tid);
+    }
+    int cap_mate_concordant = opt->mate_concordant_window != 0 && (opt->flag & MEM_F_PE)
+                              && opt->max_extend_chains > 0;
+    /* Resolve the concordance window: fixed CLI value if >0; else (auto == -1) the
+     * estimated proper-pair insert high bound if known, else the fallback. */
+    int64_t mate_win = 0;
+    if (cap_mate_concordant)
+        mate_win = opt->mate_concordant_window > 0 ? opt->mate_concordant_window
+                 : (opt->est_insert_high > 0 ? opt->est_insert_high
+                                             : MATE_CONCORDANT_WINDOW_FALLBACK);
+    /* Pass 2: cap chains (mate-concordance-aware when --extend-mate-concordant). */
     for (int l=0; l<nseq; l++)
     {
         chn = &chain_ar[l];
-        chn->n = mem_chain_flt(opt, chn->n, chn->a, tid);
-        chn->n = mem_chain_cap_extend(chn->a, chn->n, opt->max_extend_chains);
+        if (cap_mate_concordant && (l ^ 1) < nseq) {
+            int ml = l ^ 1;  /* interleaved PE: mate is the sibling index */
+            chn->n = mem_chain_cap_extend_mate(chn->a, chn->n, opt->max_extend_chains,
+                                               chain_ar[ml].a, chain_ar[ml].n,
+                                               chain_bns, mate_win);
+        } else {
+            chn->n = mem_chain_cap_extend(chn->a, chn->n, opt->max_extend_chains);
+        }
     }
     printf_(VER, "7. Done mem_chain_flt..\n");
     // tprof[MEM_ALN_M1][tid] += __rdtsc() - tim;
@@ -1996,6 +2072,17 @@ void mem_process_seqs(mem_opt_t *opt,
     w.seqs = seqs; w.n_processed = n_processed;
     w.pes = &pes[0];
 
+    /* When -I supplied the insert-size distribution (pes0), publish its FR high
+     * bound onto opt BEFORE worker_bwt so this chunk's mate-concordant chain cap
+     * (--extend-mate-concordant auto) honors it. Otherwise the bound is only set
+     * post-pairing at the end of this function, so a single-chunk -I run would
+     * cap with the fallback window and never use the user-provided insert size.
+     * The inferred-from-data path (pes0 == NULL) still publishes below for the
+     * next chunk. pes index 1 = FR orientation. */
+    if ((opt->flag & MEM_F_PE) && opt->mate_concordant_window == -1 &&
+        pes0 && !pes0[1].failed && pes0[1].high > 0)
+        opt->est_insert_high = pes0[1].high;
+
     //int n_ = (opt->flag & MEM_F_PE) ? n : n;   // this requires n%2==0
     int n_ = n;
 
@@ -2024,6 +2111,13 @@ void mem_process_seqs(mem_opt_t *opt,
             mem_pestat(opt, pestat_bns->l_pac, n, w.regs, pes); // otherwise, infer the insert size
                                                          // distribution from data
         }
+        /* Publish the FR proper-pair insert high bound onto opt so the NEXT
+         * chunk's mate-concordant chain cap (which runs before pairing) can use
+         * it as its window (--extend-mate-concordant auto). opt is shared and
+         * mutable across chunks; this write is single-threaded (between kt_for
+         * passes), and the cap only reads it. pes index 1 = FR orientation. */
+        if (!pes[1].failed && pes[1].high > 0)
+            opt->est_insert_high = pes[1].high;
     }
 
     tim = __rdtsc();
