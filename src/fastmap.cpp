@@ -1461,7 +1461,14 @@ int main_mem(int argc, char *argv[])
         if (!opt0.max_matesw)   opt->max_matesw   = 10;  /* -m 10 */
         if (!opt0.max_mem_intv) opt->max_mem_intv = 0;   /* -y 0  */
         if (!opt0.min_ext_len)  opt->min_ext_len  = 30;  /* --min-ext-len 30 */
-        if (!opt0.max_extend_chains) opt->max_extend_chains = 5;  /* --max-extend-chains 5 */
+        /* --max-extend-chains: 5 for non-meth; 10 under --meth. A 7-point ablation
+         * ({0,5,10,20,50,100,1000}) on 1M sim-meth PE pairs (with mate-concordant
+         * rescue on, below) shows chr-accuracy flat (0.9908) at every cap but the
+         * confident wrong-chromosome rate is U-shaped, minimized at 10 (cap 5: 592
+         * MAPQ>=30 mismaps; cap 10: 382; uncapped: 1056), for +0.7s wall (20.2->20.9s,
+         * still -6% vs uncapped). Non-meth keeps 5 (its placement is cap-insensitive
+         * and 5 is the pure-speed pick). */
+        if (!opt0.max_extend_chains) opt->max_extend_chains = opt->meth_mode ? 10 : 5;
         opt->smem_dedup = 1;                             /* --smem-dedup (plain on/off) */
         opt->skip_contained_ext = 1;                     /* --skip-contained-ext (plain on/off;
                                                           * meth-gated internally) */
