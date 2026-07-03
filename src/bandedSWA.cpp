@@ -55,13 +55,22 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 // so getScores{8,16} never leave a caller's pairs past numPairs modified. The
 // overshoot is at most (width - 1) <= SIMD_WIDTH8 - 1 pairs; callers of a whole
 // array over-allocate by MAX_LINE_LEN so the region is always addressable.
+//
+// The save/restore is only needed for a SUB-SLICE caller (the --meth OT/OB
+// runs, whose overshoot lands in the next slice's live pairs). A whole-array
+// caller -- every non-meth extension, plus the last (SYM) --meth slice -- has
+// nothing but its own over-allocated padding past numPairs, so guarding it is
+// pure overhead on the hot path. It is therefore gated on `active`: only the
+// OT/OB kernel objects set it (via set_guard_overshoot); when false the guard
+// is a no-op (nOver stays 0, both loops empty).
 namespace {
 struct BswOvershootGuard {
     SeqPair *pa;
     int base, nOver;
     SeqPair saved[SIMD_WIDTH8];
-    BswOvershootGuard(SeqPair *pairArray, int numPairs, int width)
-        : pa(pairArray), base(numPairs) {
+    BswOvershootGuard(SeqPair *pairArray, int numPairs, int width, bool active)
+        : pa(pairArray), base(numPairs), nOver(0) {
+        if (!active) return;
         int roundUp = ((numPairs + width - 1) / width) * width;
         nOver = roundUp - numPairs;
         for (int s = 0; s < nOver; s++) saved[s] = pa[base + s];
@@ -571,7 +580,7 @@ void BandedPairWiseSW::getScores8(SeqPair *pairArray,
     int64_t startTick, endTick;
 
     {
-        BswOvershootGuard _g(pairArray, numPairs, SIMD_WIDTH8);
+        BswOvershootGuard _g(pairArray, numPairs, SIMD_WIDTH8, guard_overshoot_);
         smithWatermanBatchWrapper8(pairArray, seqBufRef, seqBufQer, numPairs, numThreads, w);
     }
 
@@ -1611,7 +1620,7 @@ void BandedPairWiseSW::getScores16(SeqPair *pairArray,
     int64_t startTick, endTick;
 
     {
-        BswOvershootGuard _g(pairArray, numPairs, SIMD_WIDTH16);
+        BswOvershootGuard _g(pairArray, numPairs, SIMD_WIDTH16, guard_overshoot_);
         smithWatermanBatchWrapper16(pairArray, seqBufRef, seqBufQer, numPairs, numThreads, w);
     }
 
@@ -2495,7 +2504,7 @@ void BandedPairWiseSW::getScores8(SeqPair *pairArray,
     int64_t startTick, endTick;
 
     {
-        BswOvershootGuard _g(pairArray, numPairs, SIMD_WIDTH8);
+        BswOvershootGuard _g(pairArray, numPairs, SIMD_WIDTH8, guard_overshoot_);
         smithWatermanBatchWrapper8(pairArray, seqBufRef, seqBufQer, numPairs, numThreads, w);
     }
 
@@ -3497,7 +3506,7 @@ void BandedPairWiseSW::getScores16(SeqPair *pairArray,
     int64_t startTick, endTick;
 
     {
-        BswOvershootGuard _g(pairArray, numPairs, SIMD_WIDTH16);
+        BswOvershootGuard _g(pairArray, numPairs, SIMD_WIDTH16, guard_overshoot_);
         smithWatermanBatchWrapper16(pairArray, seqBufRef, seqBufQer, numPairs, numThreads, w);
     }
 
@@ -4333,7 +4342,7 @@ void BandedPairWiseSW::getScores16(SeqPair *pairArray,
                                    int32_t w)
 {
     {
-        BswOvershootGuard _g(pairArray, numPairs, SIMD_WIDTH16);
+        BswOvershootGuard _g(pairArray, numPairs, SIMD_WIDTH16, guard_overshoot_);
         smithWatermanBatchWrapper16(pairArray, seqBufRef,
                                     seqBufQer, numPairs,
                                     numThreads, w);
@@ -5158,7 +5167,7 @@ void BandedPairWiseSW::getScores8(SeqPair *pairArray,
 {
     assert(SIMD_WIDTH8 == 16 && SIMD_WIDTH16 == 8);
     {
-        BswOvershootGuard _g(pairArray, numPairs, SIMD_WIDTH8);
+        BswOvershootGuard _g(pairArray, numPairs, SIMD_WIDTH8, guard_overshoot_);
         smithWatermanBatchWrapper8(pairArray, seqBufRef, seqBufQer, numPairs, numThreads, w);
     }
 
