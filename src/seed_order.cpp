@@ -1,5 +1,6 @@
 #include "seed_order.h"
 #include <cassert>
+#include <climits>
 #include <string.h>
 #include <vector>
 
@@ -24,20 +25,43 @@ const char *seed_order_to_str(seed_order_t m) {
     return kNames[(int)m];
 }
 
-// Stable counting sort of recs[0..n) by key[i] in [0,maxk]. desc descends
-// (via maxk-key, preserving stability). scratch is reused across passes.
-static void counting_sort_by(seed_rec_t *recs, int n, std::vector<int> &key,
-                             int maxk, bool desc, std::vector<seed_rec_t> &scratch) {
+namespace {
+
+/* Reusable per-thread scratch. order_seeds runs once per read on each worker
+ * thread, so the buffers below would otherwise be malloc'd/freed millions of
+ * times over a run. thread_local keeps one set per worker, grown to the
+ * high-water mark and reused; nothing here is shared across threads. */
+struct OrderScratch {
+    std::vector<int>           perm;      // index permutation being sorted (4 B/elem)
+    std::vector<int>           tmp;       // stable-scatter target for perm
+    std::vector<int>           key;       // per-seed sort key, indexed by orig position
+    std::vector<int>           cnt;       // counting-sort histogram
+    std::vector<seed_rec_t>    applied;   // final materialization of the permutation
+    std::vector<unsigned char> mat;       // genomic modes: n x n absorb matrix
+    std::vector<int>           rowsum;    // genomic modes: per-seed absorb count
+    std::vector<char>          consumed;  // most-absorb: greedy consumed flags
+};
+thread_local OrderScratch g;
+
+/* Stable counting sort of the index permutation g.perm[0..n) by g.key[perm[i]]
+ * in [0,maxk]. desc descends via (maxk-key) while preserving stability. Only
+ * 4-byte indices move here; order_seeds applies the final permutation to recs
+ * once, so a full seed_rec_t is copied a single time regardless of pass count. */
+void sort_perm(int n, int maxk, bool desc) {
+    int *perm = g.perm.data();
+    int *key  = g.key.data();
     if (desc) for (int i = 0; i < n; ++i) key[i] = maxk - key[i];
-    std::vector<int> cnt(maxk + 2, 0);
-    for (int i = 0; i < n; ++i) ++cnt[key[i] + 1];
+    g.cnt.assign(maxk + 2, 0);
+    int *cnt = g.cnt.data();
+    for (int i = 0; i < n; ++i) ++cnt[key[perm[i]] + 1];
     for (int k = 1; k <= maxk + 1; ++k) cnt[k] += cnt[k - 1];   // start offsets
-    scratch.resize(n);
-    for (int i = 0; i < n; ++i) scratch[cnt[key[i]]++] = recs[i];  // stable, ascending
-    for (int i = 0; i < n; ++i) recs[i] = scratch[i];
+    g.tmp.resize(n);
+    int *tmp = g.tmp.data();
+    for (int i = 0; i < n; ++i) tmp[cnt[key[perm[i]]]++] = perm[i];  // stable, ascending
+    for (int i = 0; i < n; ++i) perm[i] = tmp[i];
 }
 
-static inline bool absorbs(const seed_rec_t &A, const seed_rec_t &B) {
+inline bool absorbs(const seed_rec_t &A, const seed_rec_t &B) {
     if (A.rid != B.rid) return false;  // seeds on different chromosomes/contigs can't absorb each other
     const mem_seed_t &a = A.seed, &b = B.seed;
     bool qin = (b.qbeg >= a.qbeg) && (b.qbeg + b.len <= a.qbeg + a.len);
@@ -47,82 +71,102 @@ static inline bool absorbs(const seed_rec_t &A, const seed_rec_t &B) {
     return A.orig_ix < B.orig_ix;                        // equal-size: lower ix wins
 }
 
-static int max_of(seed_rec_t *recs, int n, bool use_qbeg) {
+int max_of(const seed_rec_t *recs, int n, bool use_qbeg) {
     int m = 0;
     for (int i = 0; i < n; ++i) { int v = use_qbeg ? recs[i].seed.qbeg : recs[i].seed.len; if (v > m) m = v; }
     return m;
 }
 
+} // namespace
+
 void order_seeds(seed_rec_t *recs, int64_t n, seed_order_t mode) {
     if (mode == SEED_ORDER_OFF || n < 2) return;
     assert(n <= INT_MAX);
     int ni = (int)n;
-    std::vector<seed_rec_t> scratch;
-    std::vector<int> key(ni);
+
+    // perm starts as the identity => recs' current (orig_ix) order, which every
+    // stable pass below preserves as the final tiebreak.
+    g.perm.resize(ni);
+    for (int i = 0; i < ni; ++i) g.perm[i] = i;
+    g.key.resize(ni);
+
     switch (mode) {
     case SEED_ORDER_GLOBAL_LONGEST: {
         int mk = max_of(recs, ni, false);
-        for (int i = 0; i < ni; ++i) key[i] = recs[i].seed.len;
-        counting_sort_by(recs, ni, key, mk, /*desc=*/true, scratch);
+        for (int i = 0; i < ni; ++i) g.key[i] = recs[i].seed.len;
+        sort_perm(ni, mk, /*desc=*/true);
         break;
     }
     case SEED_ORDER_LOCAL_LONGEST: {
         int mklen = max_of(recs, ni, false), mkq = max_of(recs, ni, true);
-        for (int i = 0; i < ni; ++i) key[i] = recs[i].seed.len;          // LSD: secondary first
-        counting_sort_by(recs, ni, key, mklen, /*desc=*/true, scratch);
-        for (int i = 0; i < ni; ++i) key[i] = recs[i].seed.qbeg;         // then primary qbeg asc
-        counting_sort_by(recs, ni, key, mkq, false, scratch);
+        for (int i = 0; i < ni; ++i) g.key[i] = recs[i].seed.len;          // LSD: secondary first
+        sort_perm(ni, mklen, /*desc=*/true);
+        for (int i = 0; i < ni; ++i) g.key[i] = recs[i].seed.qbeg;         // then primary qbeg asc
+        sort_perm(ni, mkq, /*desc=*/false);
         break;
     }
     case SEED_ORDER_ABSORB_COUNT: {
         if (ni > GENOMIC_ORDER_MAX_N) {   // O(n^2) count too costly; longest-first is ~equivalent and O(n)
             order_seeds(recs, n, SEED_ORDER_GLOBAL_LONGEST);
-            break;
+            return;
         }
         for (int i = 0; i < ni; ++i) {
             int c = 0;
             for (int j = 0; j < ni; ++j)
                 if (j != i && absorbs(recs[i], recs[j])) ++c;
-            key[i] = c;
+            g.key[i] = c;
         }
-        counting_sort_by(recs, ni, key, ni - 1, /*desc=*/true, scratch);
+        sort_perm(ni, ni - 1, /*desc=*/true);
         break;
     }
     case SEED_ORDER_MOST_ABSORB: {
         if (ni > GENOMIC_ORDER_MAX_N) {        // guard: n x n matrix + O(n^2) too costly; fall back O(n)
             order_seeds(recs, n, SEED_ORDER_GLOBAL_LONGEST);
-            break;
+            return;
         }
-        std::vector<unsigned char> M((size_t)ni * ni, 0);
-        std::vector<int> rowsum(ni, 0);
+        g.mat.assign((size_t)ni * ni, 0);
+        g.rowsum.assign(ni, 0);
+        unsigned char *M = g.mat.data();
+        int *rowsum = g.rowsum.data();
         for (int i = 0; i < ni; ++i)
             for (int j = 0; j < ni; ++j)
                 if (j != i && absorbs(recs[i], recs[j])) { M[(size_t)i*ni + j] = 1; ++rowsum[i]; }
-        std::vector<char> consumed(ni, 0);
-        std::vector<seed_rec_t> out; out.reserve(ni);
+        g.consumed.assign(ni, 0);
+        char *consumed = g.consumed.data();
+        int np = 0;  // greedy pick order is written straight into perm
         for (int picked = 0; picked < ni; ++picked) {
             int best = -1;
-            // Phase A assigns orig_ix in append order, so the buffer is in orig_ix order on entry;
-            // iterating i=0..ni-1 therefore breaks ties by orig_ix (lower orig_ix wins), as required.
-            for (int i = 0; i < ni; ++i) {       // max rowsum, tiebreak orig_ix (i is in ix order)
+            // recs is in orig_ix order, so iterating i=0..ni-1 breaks rowsum ties
+            // by orig_ix (lower wins), as required.
+            for (int i = 0; i < ni; ++i) {
                 if (consumed[i]) continue;
                 if (best < 0 || rowsum[i] > rowsum[best]) best = i;
             }
             if (best < 0) break;
-            out.push_back(recs[best]);
+            g.perm[np++] = best;
             consumed[best] = 1;
+            // No need to decrement column `best` (live absorbers of best): at
+            // selection time no live seed can absorb best. Such a seed would
+            // absorb best plus everything best absorbs (containment + length
+            // order are transitive), giving rowsum >= rowsum[best]+1 > rowsum[best],
+            // so it would have been picked as best instead. rowsum thus stays an
+            // exact live-count for every still-live seed without this decrement.
             for (int j = 0; j < ni; ++j) {       // consume everything best absorbs
                 if (consumed[j] || !M[(size_t)best*ni + j]) continue;
                 consumed[j] = 1;
-                out.push_back(recs[j]);          // absorbed seeds still chained (dropped by chainer)
+                g.perm[np++] = j;                // absorbed seeds still chained (dropped by chainer)
                 for (int i = 0; i < ni; ++i)     // decrement live absorbers of j (column j)
                     if (!consumed[i] && M[(size_t)i*ni + j]) --rowsum[i];
             }
         }
-        assert((int)out.size() == ni);
-        for (int i = 0; i < ni; ++i) recs[i] = out[i];
+        assert(np == ni);
         break;
     }
-    default: assert(0 && "unhandled seed_order_t in order_seeds"); break;
+    default: assert(0 && "unhandled seed_order_t in order_seeds"); return;
     }
+
+    // Apply the permutation to recs exactly once — the only full seed_rec_t move.
+    g.applied.resize(ni);
+    for (int i = 0; i < ni; ++i) g.applied[i] = recs[g.perm[i]];
+    for (int i = 0; i < ni; ++i) recs[i] = g.applied[i];
 }
