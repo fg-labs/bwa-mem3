@@ -1,5 +1,42 @@
 # Changelog
 
+## [0.5.0](https://github.com/fg-labs/bwa-mem3/compare/v0.4.0...v0.5.0) (2026-07-04)
+
+
+### Features
+
+* add opt-in --seed-order seed reordering (default off, byte-identical) ([#186](https://github.com/fg-labs/bwa-mem3/issues/186)) ([04749a1](https://github.com/fg-labs/bwa-mem3/commit/04749a16fb2e2a4f0bd8a318fc6bdd6439e2689f))
+* add opt-in --smem-dedup (dedup identical SMEMs before chaining) ([#187](https://github.com/fg-labs/bwa-mem3/issues/187)) ([1384972](https://github.com/fg-labs/bwa-mem3/commit/1384972417677943b68b8292181017223ad27876))
+* **mem:** add --adaptive-band (chain-geometry adaptive banding) for long reads ([#194](https://github.com/fg-labs/bwa-mem3/issues/194)) ([4fe92a6](https://github.com/fg-labs/bwa-mem3/commit/4fe92a6ea55ebe8617cabed79902bceeabecbd2c))
+* **mem:** add --extend-mate-concordant; fix --fast --meth placement regression ([#195](https://github.com/fg-labs/bwa-mem3/issues/195)) ([c9ffef1](https://github.com/fg-labs/bwa-mem3/commit/c9ffef1551d13ef22b104a75c5be785857e01efa))
+* **mem:** add --fast speed preset ([#189](https://github.com/fg-labs/bwa-mem3/issues/189)) ([a946af8](https://github.com/fg-labs/bwa-mem3/commit/a946af8fcd0309faed952662123f88d152b3b585))
+* **mem:** add --max-extend-chains and bundle it into --fast ([#193](https://github.com/fg-labs/bwa-mem3/issues/193)) ([e39b3d4](https://github.com/fg-labs/bwa-mem3/commit/e39b3d497e3e10535b2d9eabb9bb7fa48d1c1379))
+* **mem:** add --skip-contained-ext and enable it under --fast ([#192](https://github.com/fg-labs/bwa-mem3/issues/192)) ([2d2b2b4](https://github.com/fg-labs/bwa-mem3/commit/2d2b2b437b70cdc5c445ea83da7cb158af654cd1))
+
+
+### Bug Fixes
+
+* **bandedSWA:** 8-bit SW drops query-end gscore/gtle on zero-score-row exit ([#198](https://github.com/fg-labs/bwa-mem3/issues/198)) ([611e21b](https://github.com/fg-labs/bwa-mem3/commit/611e21b924d09ccbd7e2e3d18092a90dc798e4b2))
+* **bandedSWA:** getScores{8,16} must not scribble padding past numPairs ([#199](https://github.com/fg-labs/bwa-mem3/issues/199)) ([9aae808](https://github.com/fg-labs/bwa-mem3/commit/9aae808c0a721bf88dfc4c486c8bf8b785cdd508))
+
+
+### Performance
+
+* **bandedSWA:** gate the getScores overshoot guard to sub-slice callers ([#201](https://github.com/fg-labs/bwa-mem3/issues/201)) ([162e909](https://github.com/fg-labs/bwa-mem3/commit/162e90923488fea4634c00a990156794940b9797))
+
+
+### Refactoring
+
+* **kswv:** drop duplicate F warm-up prefetch in kswv512_16 ([#191](https://github.com/fg-labs/bwa-mem3/issues/191)) ([6e4cf2b](https://github.com/fg-labs/bwa-mem3/commit/6e4cf2b34a527309e8dc675e941a9fd548feadf1))
+
+
+### Documentation
+
+* **changelog:** backfill the 0.4.0 breaking-change notice ([#183](https://github.com/fg-labs/bwa-mem3/issues/183)) ([e1c381a](https://github.com/fg-labs/bwa-mem3/commit/e1c381ad4b27e7e3bcf26dbbfeea130cff6e2af0))
+* **changelog:** render the live changelog, not the frozen NEWS.md ([#184](https://github.com/fg-labs/bwa-mem3/issues/184)) ([12a46d8](https://github.com/fg-labs/bwa-mem3/commit/12a46d8317fd3dabb031f835348ebdf126e76601))
+* **contributing:** document breaking-change commit footers ([#181](https://github.com/fg-labs/bwa-mem3/issues/181)) ([4ebd122](https://github.com/fg-labs/bwa-mem3/commit/4ebd1220ffda0a0da544bfe0a9bab94840d73a8c))
+* **release:** describe the release-please flow, not manual tagging ([#182](https://github.com/fg-labs/bwa-mem3/issues/182)) ([fc0c4b6](https://github.com/fg-labs/bwa-mem3/commit/fc0c4b65f356e6571c9f33f563a13d9fc6bd3f3e))
+
 ## [0.4.0](https://github.com/fg-labs/bwa-mem3/compare/v0.3.0...v0.4.0) (2026-06-27)
 
 
