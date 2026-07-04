@@ -349,6 +349,12 @@ public:
     /* SW_cells is a public field on BandedPairWiseSW today; expose as a getter
      * on the interface so non-virtual access through the unique_ptr works. */
     virtual uint64_t sw_cells() const = 0;
+
+    /* Enable getScores{8,16}'s sub-slice overshoot guard on this object. Off by
+     * default: only sub-slice callers (the --meth OT/OB kernels) need it, and
+     * for whole-array callers the guard is pure overhead. Set once at setup,
+     * before any (possibly multi-threaded) getScores call. */
+    virtual void set_guard_overshoot(bool on) = 0;
 };
 
 /* Factory: returns a per-tier concrete BandedPairWiseSW. Construction
@@ -396,6 +402,12 @@ public:
     BandedPairWiseSW& operator=(BandedPairWiseSW&&)      = delete;
 
     uint64_t sw_cells() const override { return SW_cells; }
+
+    // When true, getScores{8,16} save/restore the padding-lane overshoot past
+    // numPairs (needed only by sub-slice callers -- the --meth OT/OB kernels).
+    // Read-only during scoring; set once at setup via set_guard_overshoot.
+    bool guard_overshoot_ = false;
+    void set_guard_overshoot(bool on) override { guard_overshoot_ = on; }
 
     // Scalar code section
     int scalarBandedSWA(int qlen, const uint8_t *query, int tlen,

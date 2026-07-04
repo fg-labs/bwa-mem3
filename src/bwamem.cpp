@@ -4110,6 +4110,14 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                                               opt->zdrop, opt->pen_clip3, m_ot, opt->a, opt->b, nthreads);
         bswRightOb = make_banded_pair_wise_sw(opt->o_del, opt->e_del, opt->o_ins, opt->e_ins,
                                               opt->zdrop, opt->pen_clip3, m_ob, opt->a, opt->b, nthreads);
+        /* OT/OB kernels score a SUB-SLICE of the pair array in bsw_run_tier, so
+         * their padding-lane overshoot would corrupt the next slice: enable the
+         * guard on exactly these objects. The SYM object (bswLeft/bswRight) is a
+         * whole-array / last-slice caller and stays unguarded. */
+        bswLeftOt->set_guard_overshoot(true);
+        bswLeftOb->set_guard_overshoot(true);
+        bswRightOt->set_guard_overshoot(true);
+        bswRightOb->set_guard_overshoot(true);
     }
 
     int i;

@@ -363,6 +363,9 @@ TEST_CASE("bandedSWA getScores16/getScores8 leave pairArray[numPairs..] untouche
     int8_t mat[25];
     build_mat(mat, a, b, -1);
     BandedPairWiseSW bsw(o, e, o, e, zdrop, end_bonus, mat, a, b, 1);
+    // This test emulates a sub-slice caller (the --meth OT/OB kernels), for which
+    // the overshoot guard is enabled; it is off by default for whole-array callers.
+    bsw.set_guard_overshoot(true);
 
     // n deliberately NOT a multiple of any SIMD width so roundUp(n) > n and the
     // kernel has padding lanes to initialize past numPairs.
