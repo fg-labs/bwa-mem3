@@ -2628,8 +2628,12 @@ mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *
     const int use_meth_orig = (opt->meth_mode && meth_orig_query != NULL
                                && ar->meth_hypothesis >= 0);
     const char *regen_query = use_meth_orig ? meth_orig_query : query_;
-    query = (uint8_t*) malloc(l_query);
-    assert(query != NULL);
+    /* Reuse a per-thread nt4 scratch instead of a malloc/free per region. The
+     * buffer is consumed within this call (copied into a.cigar via the DP), so
+     * one live instance per thread is safe; grown to the high-water l_query. */
+    static thread_local u8vec_scratch_t t_query;
+    if (t_query.v.m < (size_t)l_query) kv_resize(uint8_t, t_query.v, (size_t)l_query);
+    query = t_query.v.a;
     for (i = 0; i < l_query; ++i) // convert to the nt4 encoding
         query[i] = regen_query[i] < 5? regen_query[i] : nst_nt4_table[(int)regen_query[i]];
     a.mapq = ar->secondary < 0? mem_approx_mapq_se(opt, ar) : 0;
@@ -2716,7 +2720,7 @@ mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *
     a.pos = pos - bns->anns[a.rid].offset;
     a.score = ar->score; a.sub = ar->sub > ar->csub? ar->sub : ar->csub;
     a.is_alt = ar->is_alt; a.alt_sc = ar->alt_sc;
-    free(query);
+    /* query is the reused thread-local nt4 scratch — no free here. */
     return a;
 }
 
