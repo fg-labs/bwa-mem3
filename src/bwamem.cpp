@@ -909,6 +909,19 @@ int mem_chain_flt(const mem_opt_t *opt, int n_chn_, mem_chain_t *a_, int tid)
         else a_[k++] = *c;
     }
     n_chn_ = k;
+
+    /* Fast path for the dominant single-chain (unique-mapper) case. With one
+     * surviving chain the range split is a single [0,1) range and the pairwise-
+     * overlap pass reduces to `a_[0].kept = 3` (set unconditionally, kept through
+     * compaction) returning 1 — but the general path still builds a std::vector,
+     * a kvec, and calls ks_introsort to get there. a_[0].first was already reset
+     * to -1 in the weight-filter loop above. (Only n_chn_ == 1 is short-circuited;
+     * n_chn_ == 0 falls through to preserve the existing general-path behavior.) */
+    if (n_chn_ == 1) {
+        a_[0].kept = 3;
+        return 1;
+    }
+
     std::vector<std::pair<int, int> > range;
     std::pair<int, int> pr;
     int pseqid = a_[0].seqid;
@@ -2210,6 +2223,20 @@ int mem_mark_primary_se(const mem_opt_t *opt, int n, mem_alnreg_t *a, int64_t id
     int i, n_pri;
     int_v z = {0,0,0};
     if (n == 0) return 0;
+
+    /* Fast path for the dominant unique-mapper case. With a single region the
+     * general path below still runs two ks_introsort calls and a kv_push in
+     * mem_mark_primary_se_core (which heap-allocates z.a) only to leave a[0]
+     * with these exact values: mem_mark_primary_se_core touches nothing for
+     * n==1 (its inner loop starts at i=1), the first rewrite loop sets
+     * secondary_all to the rank 0 then normalizes it to secondary (-1), and
+     * sub_n is never touched here. Reproduce that directly. */
+    if (n == 1) {
+        a[0].sub = a[0].alt_sc = 0;
+        a[0].secondary = a[0].secondary_all = -1;
+        a[0].hash = hash_64(id);
+        return a[0].is_alt ? 0 : 1;
+    }
 
     for (i = n_pri = 0; i < n; ++i)
     {
