@@ -2771,23 +2771,36 @@ inline void sortPairsLenExt(SeqPair *pairArray, int32_t count, SeqPair *tempArra
 {
     int32_t i;
     numPairs128 = numPairs16 = numPairs1 = 0;
+    if (count <= 0) return;   /* empty extension side: nothing to sort/count */
 
     int32_t *hist2 = hist + MAX_SEQ_LEN8;
     int32_t *hist3 = hist + MAX_SEQ_LEN8 + MAX_SEQ_LEN16;
 
-    for(i = 0; i <= MAX_SEQ_LEN8 + MAX_SEQ_LEN16; i+=1)
-        //_mm256_store_si256((__m256i *)(hist + i), zero256);
-        hist[i] = 0;
-
-    /* count can be 0 for an empty extension side; calloc(0, ...) is allowed to
-     * return NULL, so guard on count rather than assert non-null (asserts are
-     * compiled in here — no -DNDEBUG). Matches the out-of-memory convention used
-     * by the other calloc sites in this file. */
-    int *arr = NULL;
-    if (count > 0) {
-        arr = (int*) calloc((size_t)count, sizeof(int));
-        if (arr == NULL) { fprintf(stderr, "ERROR: out of memory in %s\n", __func__); exit(EXIT_FAILURE); }
+    /* The counting-sort bin space is three concatenated regions: 8-bit
+     * (hist[0..MAX_SEQ_LEN8)), 16-bit (hist2[0..MAX_SEQ_LEN16)) and scalar
+     * (hist3[0]). The 16-bit region alone is 32768 bins, so clearing +
+     * cumulating the whole range every call was O(32768) irrespective of the
+     * pair count. Window the 16-bit region to the actual minval range: a 16-bit
+     * pair's bin is exactly its minval, so every touched bin lies within
+     * [min minval, max minval]; bins below the window hold no pairs (they add 0
+     * to the cross-region cumulative sum, so starting the sum at that offset is
+     * exact) and bins above are never read. The sorted output and the numPairs*
+     * tier counts are therefore byte-for-byte identical to the full-range sort.
+     * The 8-bit region (1088 bins) is small, so it is still cleared in full to
+     * avoid reasoning about its clamped bins. */
+    int64_t mn = 0, mx = 0;
+    for (i = 0; i < count; i++) {
+        SeqPair sp = pairArray[i];
+        int64_t minval = (int64_t)sp.h0 + (int64_t)min_(sp.len1, sp.len2) * (int64_t)score_a;
+        if (i == 0) { mn = mx = minval; }
+        else { if (minval < mn) mn = minval; if (minval > mx) mx = minval; }
     }
+    int32_t w_lo = mn < 0 ? 0 : (mn >= MAX_SEQ_LEN16 ? MAX_SEQ_LEN16 - 1 : (int32_t)mn);
+    int32_t w_hi = mx < 0 ? 0 : (mx >= MAX_SEQ_LEN16 ? MAX_SEQ_LEN16 - 1 : (int32_t)mx);
+
+    for (i = 0; i < MAX_SEQ_LEN8; i++) hist[i] = 0;
+    for (i = w_lo; i <= w_hi; i++)     hist2[i] = 0;
+    hist3[0] = 0;
 
     /* minval is the counting-sort bin (sorts the 8-bit bucket by score for
      * lane packing). The tier decision is the safe envelope, not minval:
@@ -2807,8 +2820,6 @@ inline void sortPairsLenExt(SeqPair *pairArray, int32_t count, SeqPair *tempArra
             hist2[(int)minval] ++;
         else
             hist3[0] ++;
-
-        arr[i] = 0;
     }
 
     int32_t cumulSum = 0;
@@ -2818,7 +2829,9 @@ inline void sortPairsLenExt(SeqPair *pairArray, int32_t count, SeqPair *tempArra
         hist[i] = cumulSum;
         cumulSum += cur;
     }
-    for(i = 0; i < MAX_SEQ_LEN16; i++)
+    /* Skipping hist2[0..w_lo) is exact: those bins were cleared to (and hold) no
+     * counts, so they would contribute 0 to cumulSum anyway. */
+    for(i = w_lo; i <= w_hi; i++)
     {
         int32_t cur = hist2[i];
         hist2[i] = cumulSum;
@@ -2839,35 +2852,17 @@ inline void sortPairsLenExt(SeqPair *pairArray, int32_t count, SeqPair *tempArra
             tempArray[pos] = sp;
             hist[bin]++;
             numPairs128 ++;
-            if (arr[pos] != 0)
-            {
-                fprintf(stderr, "[%s] Error log: repeat, pos: %d, arr: %d, minval: %d, (%d %d)\n",
-                        __func__, pos, arr[pos], (int)minval, sp.len1, sp.len2);
-                exit(EXIT_FAILURE);
-            }
-            arr[pos] = 1;
         }
         else if (sp.len1 < MAX_SEQ_LEN16 && sp.len2 < MAX_SEQ_LEN16 && minval >= 0 && minval < MAX_SEQ_LEN16) {
             int32_t pos = hist2[(int)minval];
             tempArray[pos] = sp;
             hist2[(int)minval]++;
             numPairs16 ++;
-            if (arr[pos] != 0)
-            {
-                SeqPair spt = pairArray[arr[pos]-1];
-                fprintf(stderr, "[%s] Error log: repeat, "
-                        "i: %d, pos: %d, arr: %d, hist2: %d, minval: %d, (%d %d %d) (%d %d %d)\n",
-                        __func__, i, pos, arr[pos], hist2[(int)minval],  (int)minval, sp.h0, sp.len1, sp.len2,
-                        spt.h0, spt.len1, spt.len2);
-                exit(EXIT_FAILURE);
-            }
-            arr[pos] = i + 1;
         }
         else {
             int32_t pos = hist3[0];
             tempArray[pos] = sp;
             hist3[0]++;
-            arr[pos] = i + 1;
             numPairs1 ++;
         }
     }
@@ -2875,23 +2870,27 @@ inline void sortPairsLenExt(SeqPair *pairArray, int32_t count, SeqPair *tempArra
     for(i = 0; i < count; i++) {
         pairArray[i] = tempArray[i];
     }
-
-    free(arr);
 }
 
 inline void sortPairsLen(SeqPair *pairArray, int32_t count, SeqPair *tempArray, int32_t *hist)
 {
 
     int32_t i;
-#if ((!__AVX512BW__) & (__AVX2__ | __SSE2__))
-    for(i = 0; i <= MAX_SEQ_LEN16; i++) hist[i] = 0;
-#else
-    __m512i zero512 = _mm512_setzero_si512();
-    for(i = 0; i <= MAX_SEQ_LEN16; i+=16)
+    if (count <= 0) return;
+
+    /* Bins are keyed directly by len1, so only [minLen, maxLen] is ever touched;
+     * clearing + cumulating the full [0, MAX_SEQ_LEN16] range every call was
+     * O(32768) regardless of count. Window to the actual length range — output
+     * is identical because every pair falls in [minLen, maxLen], bins below add
+     * 0 to the cumulative sum, and bins above are never read. */
+    int32_t minLen = pairArray[0].len1, maxLen = pairArray[0].len1;
+    for(i = 1; i < count; i++)
     {
-        _mm512_store_si512((__m512i *)(hist + i), zero512);
+        int32_t L = pairArray[i].len1;
+        if (L < minLen) minLen = L;
+        if (L > maxLen) maxLen = L;
     }
-#endif
+    for(i = minLen; i <= maxLen; i++) hist[i] = 0;
 
     for(i = 0; i < count; i++)
     {
@@ -2899,7 +2898,7 @@ inline void sortPairsLen(SeqPair *pairArray, int32_t count, SeqPair *tempArray, 
         hist[sp.len1]++;
     }
     int32_t cumulSum = 0;
-    for(i = 0; i <= MAX_SEQ_LEN16; i++)
+    for(i = minLen; i <= maxLen; i++)
     {
         int32_t cur = hist[i];
         hist[i] = cumulSum;
@@ -3570,7 +3569,9 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                 mem_alnreg_t *a;
                 // a = kv_pushp(mem_alnreg_t, *av);
                 a = &av->a[av->n++];
-                memset(a, 0, sizeof(mem_alnreg_t));
+                /* av->a was calloc'd to av->m entries just above; av->n only
+                 * ever increments (no slot is reused), so each slot is already
+                 * zero on first write — the per-slot memset was redundant. */
 
                 s->aln = av->n-1;
 
@@ -3702,7 +3703,6 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                     sp.len2 = s->qbeg;
                     sp.len1 = tmp;
                     sp.tight_band = 0; sp.chain_band = chain_band;  // 0 sentinel: "no tight bound known"
-                    int64_t minval;  // declared ahead of goto target for C++
 
                     // ungapped analysis.
                     //   HIT      → skip SW; fill a->* from ungapped.
@@ -3726,6 +3726,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                                                      &fp_gscore, &fp_gtle,
                                                      &fp_band);
                         if (fp_st == FP_STATUS_HIT) {
+#if BWAMEM3_UGP_PROFILE
                             tprof[UGP_L_HIT][tid]++;
                             tprof[UGP_L_UNGAPPED][tid]++;
                             tprof[UGP_SCORE_HIST_BASE + 0 * UGP_SCORE_HIST_NBINS
@@ -3746,6 +3747,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                                 tprof[UGP_L_CAT_FIN_BASE + 1 * UGP_CAT_NBINS + _bin][tid]++;
                                 tprof[UGP_L_CAT_FIN_BASE + 3 * UGP_CAT_NBINS + _bin][tid]++;
                             }
+#endif
                             // Roll back the qs/rs buffer offsets we just
                             // consumed; the batch won't reference them.
                             leftQerOffset -= s->qbeg;
@@ -3786,9 +3788,14 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                         // FALLBACK: sp.tight_band stays 0.
                     }
 
-                    minval = (int64_t)sp.h0 + (int64_t)min_(sp.len1, sp.len2) * (int64_t)opt->a;
-
+#if BWAMEM3_UGP_PROFILE
+                    /* Per-pair tier routing + tight_band histograms. The
+                     * numPairsLeft* increments here are dead (sortPairsLenExt
+                     * below resets and recomputes all three counters, and
+                     * nothing reads them before that) — only t_tier feeds the
+                     * UGP histograms, so the whole block is instrumentation. */
                     {
+                        int64_t minval = (int64_t)sp.h0 + (int64_t)min_(sp.len1, sp.len2) * (int64_t)opt->a;
                         int t_tier;
                         /* Mirror the routing decision in sortPairsLenExt: 8-bit
                          * iff the safe envelope holds (initial band opt->w). */
@@ -3824,14 +3831,17 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                             tprof[UGP_TIER_TB_BASE + 0 * 8 + t_tier * 4 + band_bin][tid]++;
                         }
                     }
+#endif
 
+#if BWAMEM3_UGP_PROFILE
                     /* Q3: compute would-be ungapped extension score for this
                      * non-HIT LEFT pair. The walk handles arbitrary N
                      * (including the bypass case len2 > FP_N_MAX where
-                     * analyze did not run). Cost: O(len2) scalar; called
-                     * for instrumentation only — discard if reverting. */
+                     * analyze did not run). Cost: O(len2) scalar; instrumentation
+                     * only (feeds ugp_record_left_outcome's tprof histograms). */
                     sp.ugp_walk_score = ungapped_walk_score(qs, rs, sp.len2,
                                                             sp.h0, opt->a, opt->b);
+#endif
 
                     seqPairArrayLeft128[numPairsLeft] = sp;
                     numPairsLeft ++;
@@ -3926,7 +3936,6 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
 
                     sp.tight_band = 0; sp.chain_band = chain_band;
                     sp.ugp_r_attempted = 0;
-                    int64_t minval;  // declared ahead of goto target for C++
 
                     // ungapped analysis on right ext.
                     // Precondition a->score != -1 means left either didn't
@@ -3989,21 +3998,14 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                         }
                     }
 
-                    minval = (int64_t)sp.h0 + (int64_t)min_(sp.len1, sp.len2) * (int64_t)opt->a;
-
-                    /* Mirror the routing decision in sortPairsLenExt: 8-bit iff
-                     * the safe envelope holds (initial band opt->w). */
-                    if (bsw8_envelope_ok(sp.len1, sp.len2, opt->w, opt->a, opt->zdrop, sp.h0)) {
-                        numPairsRight128++;
-                    }
-                    else if(sp.len1 < MAX_SEQ_LEN16 && sp.len2 < MAX_SEQ_LEN16 && minval >= 0 && minval < MAX_SEQ_LEN16) {
-                        numPairsRight16++;
-                    }
-                    else {
-                        numPairsRight1++;
-                    }
-                    /* RIGHT histograms (Groups A & B) are populated post-left-SW
-                     * once 26e/26f's right pass has finalised sp->tight_band. */
+                    /* The RIGHT-side tier counters (numPairsRight128/16/1) are
+                     * recomputed from scratch by sortPairsLenExt below (which
+                     * resets them to 0 first), and nothing reads them before
+                     * that call — so the per-pair envelope check and routing
+                     * that used to live here were dead work. Just stage the
+                     * pair; the sort assigns its tier. RIGHT histograms (Groups
+                     * A & B) are populated post-left-SW once the right pass has
+                     * finalised sp->tight_band. */
                     seqPairArrayRight128[numPairsRight] = sp;
                     numPairsRight ++;
                     a->qe = qe; a->re = rmax[0] + re;
@@ -4041,6 +4043,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                     opt->w, opt->zdrop);
     assert(numPairsLeft == (numPairsLeft128 + numPairsLeft16 + numPairsLeft1));
 
+#if BWAMEM3_UGP_PROFILE
     /* instrumentation: per-batch narrow bucket size (Group C, LEFT).
      * Counts pairs in the 8-bit tier with tight_band ∈ [1,8] for THIS worker
      * batch — the size a future narrow bucket would have. */
@@ -4061,6 +4064,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
         else                       bin = 7;
         tprof[UGP_NARROW_SZ_BASE + 0 * UGP_NARROW_SZ_NBINS + bin][tid]++;
     }
+#endif
 
 
     // SWA
@@ -4163,7 +4167,9 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
 
             if (ACCEPT_PAIR(a->score, prev, sp->max_off, w, sp->tight_band, sp->chain_band, i))
             {
+#if BWAMEM3_UGP_PROFILE
                 ugp_record_left_outcome(sp, opt->a, tid);
+#endif
                 if (sp->gscore <= 0 || sp->gscore <= a->score - opt->pen_clip5) {
                     a->qb -= sp->qle; a->rb -= sp->tle;
                     a->truesc = a->score;
@@ -4231,7 +4237,9 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
 
             if (ACCEPT_PAIR(a->score, prev, sp->max_off, w, sp->tight_band, sp->chain_band, i))
             {
+#if BWAMEM3_UGP_PROFILE
                 ugp_record_left_outcome(sp, opt->a, tid);
+#endif
                 if (sp->gscore <= 0 || sp->gscore <= a->score - opt->pen_clip5) {
                     a->qb -= sp->qle; a->rb -= sp->tle;
                     a->truesc = a->score;
@@ -4302,7 +4310,9 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
 
             if (ACCEPT_PAIR(a->score, prev, sp->max_off, w, sp->tight_band, sp->chain_band, i))
             {
+#if BWAMEM3_UGP_PROFILE
                 ugp_record_left_outcome(sp, opt->a, tid);
+#endif
                 if (sp->gscore <= 0 || sp->gscore <= a->score - opt->pen_clip5) {
                     a->qb -= sp->qle; a->rb -= sp->tle;
                     a->truesc = a->score;
@@ -4433,6 +4443,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
 
     assert(numPairsRight == (numPairsRight128 + numPairsRight16 + numPairsRight1));
 
+#if BWAMEM3_UGP_PROFILE
     /* instrumentation (Groups A, B, C — RIGHT). Run after the post-
      * left-SW analyze pass + tier sort: sp->tight_band is now final and the
      * 128 region is contiguous at the head of seqPairArrayRight128. */
@@ -4479,6 +4490,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
         else                       bin = 7;
         tprof[UGP_NARROW_SZ_BASE + 1 * UGP_NARROW_SZ_NBINS + bin][tid]++;
     }
+#endif
 
     pair_ar = seqPairArrayRight128 + numPairsRight128 + numPairsRight16;
     pair_ar_aux = seqPairArrayAux;
@@ -4511,7 +4523,9 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
             // no further banding
             if (ACCEPT_PAIR(a->score, prev, sp->max_off, w, sp->tight_band, sp->chain_band, i))
             {
+#if BWAMEM3_UGP_PROFILE
                 ugp_record_right_outcome(sp, tid);
+#endif
                 if (sp->gscore <= 0 || sp->gscore <= a->score - opt->pen_clip3) {
                     a->qe += sp->qle, a->re += sp->tle;
                     a->truesc += a->score - sp->h0;
@@ -4576,7 +4590,9 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
             // no further banding
             if (ACCEPT_PAIR(a->score, prev, sp->max_off, w, sp->tight_band, sp->chain_band, i))
             {
+#if BWAMEM3_UGP_PROFILE
                 ugp_record_right_outcome(sp, tid);
+#endif
                 if (sp->gscore <= 0 || sp->gscore <= a->score - opt->pen_clip3) {
                     a->qe += sp->qle, a->re += sp->tle;
                     a->truesc += a->score - sp->h0;
@@ -4644,7 +4660,9 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
             // no further banding
             if (ACCEPT_PAIR(a->score, prev, sp->max_off, w, sp->tight_band, sp->chain_band, i))
             {
+#if BWAMEM3_UGP_PROFILE
                 ugp_record_right_outcome(sp, tid);
+#endif
                 if (sp->gscore <= 0 || sp->gscore <= a->score - opt->pen_clip3) {
                     a->qe += sp->qle, a->re += sp->tle;
                     a->truesc += a->score - sp->h0;

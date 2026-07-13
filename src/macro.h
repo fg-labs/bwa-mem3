@@ -232,6 +232,16 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #define PE25 111
 #define PE26 112
 
+/* UGP (ungapped-path) profiling: the counters below feed the tprof[] histograms
+ * consumed by --profile diagnostics only — never the alignment result. The
+ * expensive collection (an O(len) per-pair ungapped walk, per-pair envelope
+ * re-checks, and dedicated per-batch histogram passes) is compiled out by
+ * default. Build with -DBWAMEM3_UGP_PROFILE=1 to restore it. Cheap single-
+ * counter increments are left compiled in unconditionally. */
+#ifndef BWAMEM3_UGP_PROFILE
+#define BWAMEM3_UGP_PROFILE 0
+#endif
+
 // PR 26a/c.1/e diagnostics. Per-thread, aggregated in display_stats().
 #define UGP_L_ATTEMPT     113
 #define UGP_L_HIT         114
