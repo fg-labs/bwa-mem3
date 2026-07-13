@@ -1592,11 +1592,32 @@ int64_t FMI_search::call_one_step(int64_t pos, int64_t &sa_entry, int64_t &offse
     } // else
 }
 
+/* Thread-local scratch for the pos_ar/map_ar staging buffers below. These were
+ * two _mm_malloc/_mm_free per call, and this function runs once per read — so on
+ * a WGS run that is tens of millions of aligned-allocation round-trips. The pair
+ * is pure scratch (no state carried between calls), so a per-thread grow-only
+ * holder reused across reads removes the churn. FMI_search is shared across
+ * worker threads, hence thread_local (not a member). Freed on thread exit. */
+namespace {
+struct SaPrefetchScratch {
+    int64_t *pos = nullptr, *map = nullptr;
+    int64_t  cap = 0;
+    void ensure(int64_t n) {
+        if (n <= cap) return;
+        _mm_free(pos); _mm_free(map);
+        pos = (int64_t *) _mm_malloc((size_t)n * sizeof(int64_t), 64);
+        map = (int64_t *) _mm_malloc((size_t)n * sizeof(int64_t), 64);
+        cap = n;
+    }
+    ~SaPrefetchScratch() { _mm_free(pos); _mm_free(map); }
+};
+} // namespace
+
 void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
                                          int64_t *coordCountArray, int64_t count,
                                          const int32_t max_occ, int tid, int64_t &id_)
 {
-    
+
     // uint32_t i;
     // totalCoordCount and id (below) both count entries staged into the int64
     // coordArray/pos_ar/map_ar buffers and are paired with the int64 mem_lim,
@@ -1617,11 +1638,13 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
         mem_lim += (smem.s > max_occ) ? max_occ : smem.s;
     }
 
-    size_t sa_ar_bytes = (size_t)mem_lim * sizeof(int64_t);
-    int64_t *pos_ar = (int64_t *) _mm_malloc( sa_ar_bytes, 64);
-    assert_not_null(pos_ar, sa_ar_bytes, sa_ar_bytes);
-    int64_t *map_ar = (int64_t *) _mm_malloc( sa_ar_bytes, 64);
-    assert_not_null(map_ar, sa_ar_bytes, (size_t)2 * sa_ar_bytes);
+    /* Reuse the per-thread staging buffers, grown to the high-water mem_lim.
+     * mem_lim == 0 leaves the pointers null, but the staging loop below writes
+     * nothing in that case (id stays 0), so they are never dereferenced. */
+    static thread_local SaPrefetchScratch t_sa;
+    t_sa.ensure(mem_lim);
+    int64_t *pos_ar = t_sa.pos;
+    int64_t *map_ar = t_sa.map;
 
     for(int i = 0; i < count; i++)
     {
@@ -1721,7 +1744,5 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
             }
         }
     }
-    
-    _mm_free(pos_ar);
-    _mm_free(map_ar);
+    /* pos_ar/map_ar are the reused thread-local scratch — no free here. */
 }
