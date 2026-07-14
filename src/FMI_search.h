@@ -149,15 +149,6 @@ class FMI_search: public indexEle
      * Writing past the pre-sized capacity is undefined behavior. The actual
      * number of SMEMs written is reported via *__numTotalSmem (or the
      * int64_t return value on bwtSeedStrategyAllPosOneThread). */
-    void getSMEMs(uint8_t *enc_qdb,
-                  int32_t numReads,
-                  int32_t batch_size,
-                  int32_t readlength,
-                  int32_t minSeedLengh,
-                  int32_t numthreads,
-                  SMEM *matchArray,
-                  int64_t *numTotalSmem);
-
     /* matchArray must hold at least numReads * max_readlength SMEMs (caller-sized). */
     void getSMEMsOnePosOneThread(uint8_t *enc_qdb,
                                  int32_t *query_pos_array,
