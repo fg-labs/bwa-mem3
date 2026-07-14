@@ -166,13 +166,11 @@ kswv::kswv(const int o_del, const int e_del, const int o_ins,
     F16     = (int16_t *)_mm_malloc(this->maxQerLen * SIMD_WIDTH16 * numThreads * sizeof(int16_t), 64);
     H16_0   = (int16_t *)_mm_malloc(this->maxQerLen * SIMD_WIDTH16 * numThreads * sizeof(int16_t), 64);
     H16_1   = (int16_t *)_mm_malloc(this->maxQerLen * SIMD_WIDTH16 * numThreads * sizeof(int16_t), 64);
-    H16_max = (int16_t *)_mm_malloc(this->maxQerLen * SIMD_WIDTH16 * numThreads * sizeof(int16_t), 64);
     rowMax16 = (int16_t *)_mm_malloc(this->maxRefLen * SIMD_WIDTH16 * numThreads * sizeof(int16_t), 64);
 
     F8 = (uint8_t*) F16;
     H8_0 = (uint8_t*) H16_0;
     H8_1 = (uint8_t*) H16_1;
-    H8_max = (uint8_t*) H16_max;
     rowMax8 = (uint8_t*) rowMax16;
 }
 
@@ -252,7 +250,7 @@ kswv::kswv(const int o_del, const int e_del, const int o_ins,
 
 // destructor 
 kswv::~kswv() {
-    _mm_free(F16); _mm_free(H16_0); _mm_free(H16_max); _mm_free(H16_1);
+    _mm_free(F16); _mm_free(H16_0); _mm_free(H16_1);
     _mm_free(rowMax16);
 }
 
@@ -518,7 +516,6 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
     tid = 0;
     uint8_t *H0 = H8_0 + tid * SIMD_WIDTH8 * this->maxQerLen;
     uint8_t *H1 = H8_1 + tid * SIMD_WIDTH8 * this->maxQerLen;
-    uint8_t *Hmax = H8_max + tid * SIMD_WIDTH8 * this->maxQerLen;
     uint8_t *F = F8 + tid * SIMD_WIDTH8 * this->maxQerLen;
     uint8_t *rowMax = rowMax8 + tid * SIMD_WIDTH8 * this->maxRefLen;
 
@@ -536,7 +533,6 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
     for (int i = 0; i <= ncol; i++)
     {
         vst1q_u8(H0 + i * SIMD_WIDTH8, zero_vec);
-        vst1q_u8(Hmax + i * SIMD_WIDTH8, zero_vec);
         vst1q_u8(F + i * SIMD_WIDTH8, zero_vec);
     }
 
@@ -1130,7 +1126,6 @@ int kswv::kswv_neon_16_impl(int16_t seq1SoA[],
     tid = 0;
     int16_t *H0     = H16_0    + tid * SIMD_WIDTH16 * this->maxQerLen;
     int16_t *H1     = H16_1    + tid * SIMD_WIDTH16 * this->maxQerLen;
-    int16_t *Hmax   = H16_max  + tid * SIMD_WIDTH16 * this->maxQerLen;
     int16_t *F      = F16      + tid * SIMD_WIDTH16 * this->maxQerLen;
     int16_t *rowMax = rowMax16 + tid * SIMD_WIDTH16 * this->maxRefLen;
 
@@ -1145,7 +1140,6 @@ int kswv::kswv_neon_16_impl(int16_t seq1SoA[],
 
     for (int i = 0; i <= ncol; i++) {
         vst1q_s16(H0   + i * SIMD_WIDTH16, zero_vec);
-        vst1q_s16(Hmax + i * SIMD_WIDTH16, zero_vec);
         vst1q_s16(F    + i * SIMD_WIDTH16, zero_vec);
     }
     vst1q_s16(H0, zero_vec);
@@ -1568,7 +1562,6 @@ int kswv::kswv256_u8_impl(uint8_t seq1SoA[],
     tid = 0;
     uint8_t *H0     = H8_0    + tid * SIMD_WIDTH8 * this->maxQerLen;
     uint8_t *H1     = H8_1    + tid * SIMD_WIDTH8 * this->maxQerLen;
-    uint8_t *Hmax   = H8_max  + tid * SIMD_WIDTH8 * this->maxQerLen;
     uint8_t *F      = F8      + tid * SIMD_WIDTH8 * this->maxQerLen;
     uint8_t *rowMax = rowMax8 + tid * SIMD_WIDTH8 * this->maxRefLen;
 
@@ -1582,7 +1575,6 @@ int kswv::kswv256_u8_impl(uint8_t seq1SoA[],
 
     for (int i = 0; i <= ncol; i++) {
         _mm256_storeu_si256((__m256i*)(H0   + i * SIMD_WIDTH8), zero_vec);
-        _mm256_storeu_si256((__m256i*)(Hmax + i * SIMD_WIDTH8), zero_vec);
         _mm256_storeu_si256((__m256i*)(F    + i * SIMD_WIDTH8), zero_vec);
     }
     _mm256_storeu_si256((__m256i*)H0, zero_vec);
@@ -2048,7 +2040,6 @@ int kswv::kswv256_16_impl(int16_t seq1SoA[],
     tid = 0;
     int16_t *H0     = H16_0    + tid * SIMD_WIDTH16 * this->maxQerLen;
     int16_t *H1     = H16_1    + tid * SIMD_WIDTH16 * this->maxQerLen;
-    int16_t *Hmax   = H16_max  + tid * SIMD_WIDTH16 * this->maxQerLen;
     int16_t *F      = F16      + tid * SIMD_WIDTH16 * this->maxQerLen;
     int16_t *rowMax = rowMax16 + tid * SIMD_WIDTH16 * this->maxRefLen;
 
@@ -2062,7 +2053,6 @@ int kswv::kswv256_16_impl(int16_t seq1SoA[],
 
     for (int i = 0; i <= ncol; i++) {
         _mm256_storeu_si256((__m256i*)(H0   + i * SIMD_WIDTH16), zero_vec);
-        _mm256_storeu_si256((__m256i*)(Hmax + i * SIMD_WIDTH16), zero_vec);
         _mm256_storeu_si256((__m256i*)(F    + i * SIMD_WIDTH16), zero_vec);
     }
     _mm256_storeu_si256((__m256i*)H0, zero_vec);
@@ -2691,7 +2681,6 @@ int kswv::kswv512_u8_impl(uint8_t seq1SoA[],
     tid = 0;  // no threading for now !!
     uint8_t *H0     = H8_0 + tid * SIMD_WIDTH8 * this->maxQerLen;
     uint8_t *H1     = H8_1 + tid * SIMD_WIDTH8 * this->maxQerLen;
-    uint8_t *Hmax   = H8_max + tid * SIMD_WIDTH8 * this->maxQerLen;
     uint8_t *F      = F8 + tid * SIMD_WIDTH8 * this->maxQerLen;
     uint8_t *rowMax = rowMax8 + tid * SIMD_WIDTH8 * this->maxRefLen;
 
@@ -2708,7 +2697,6 @@ int kswv::kswv512_u8_impl(uint8_t seq1SoA[],
     for (int i=0; i <=ncol; i++)
     {
         _mm512_store_si512((__m512*) (H0 + i * SIMD_WIDTH8), zero512);
-        _mm512_store_si512((__m512*) (Hmax + i * SIMD_WIDTH8), zero512);
         _mm512_store_si512((__m512*) (F + i * SIMD_WIDTH8), zero512);
     }
 
@@ -3282,7 +3270,6 @@ int kswv::kswv512_16_impl(int16_t seq1SoA[],
     tid = 0;  // no threading here.
     int16_t *H0     = H16_0 + tid * SIMD_WIDTH16 * this->maxQerLen;
     int16_t *H1     = H16_1 + tid * SIMD_WIDTH16 * this->maxQerLen;
-    int16_t *Hmax   = H16_max + tid * SIMD_WIDTH16 * this->maxQerLen;
     int16_t *F      = F16 + tid * SIMD_WIDTH16 * this->maxQerLen;
     int16_t *rowMax = rowMax16 + tid * SIMD_WIDTH16 * this->maxRefLen;
     
@@ -3293,7 +3280,6 @@ int kswv::kswv512_16_impl(int16_t seq1SoA[],
 
     for (int i=ncol; i >= 0; i--) {
         _mm512_store_si512((__m512*) (H0 + i * SIMD_WIDTH16), zero512);
-        _mm512_store_si512((__m512*) (Hmax + i * SIMD_WIDTH16), zero512);
         _mm512_store_si512((__m512*) (F + i * SIMD_WIDTH16), zero512);
     }
 
