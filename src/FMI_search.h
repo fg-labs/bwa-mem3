@@ -276,16 +276,51 @@ private:
         __attribute__((always_inline)) inline
         SMEM backwardExt(SMEM smem, uint8_t a) const
         {
-            uint8_t b;
-            int64_t k[4], l[4], s[4];
-            for (b = 0; b < 4; b++) {
-                int64_t sp = (int64_t)(smem.k);
-                int64_t ep = (int64_t)(smem.k) + (int64_t)(smem.s);
-                GET_OCC(sp, b, occ_id_sp, y_sp, occ_sp, one_hot_bwt_str_c_sp, match_mask_sp);
-                GET_OCC(ep, b, occ_id_ep, y_ep, occ_ep, one_hot_bwt_str_c_ep, match_mask_ep);
-                k[b] = count[b] + occ_sp;
-                s[b] = occ_ep - occ_sp;
+            /* sp/ep and their checkpoint block + one-hot mask do not depend on
+             * the base b, so hoist them out of the per-base occ computation.
+             * Only k[a] and s[a] are consumed for the result, but all four s[b]
+             * feed the l cumulation below, so the full 4-lane occ is computed. */
+            const int64_t sp = (int64_t)smem.k;
+            const int64_t ep = (int64_t)smem.k + (int64_t)smem.s;
+            const CP_OCC &blk_sp = cp_occ[sp >> CP_SHIFT];
+            const CP_OCC &blk_ep = cp_occ[ep >> CP_SHIFT];
+            const uint64_t mask_sp = one_hot_mask_array[sp & CP_MASK];
+            const uint64_t mask_ep = one_hot_mask_array[ep & CP_MASK];
+
+            int64_t occ_sp[4], s[4], l[4];
+
+#if defined(__ARM_NEON) || defined(__aarch64__) || defined(APPLE_SILICON)
+            /* arm64 has no scalar popcount instruction, so the scalar GET_OCC
+             * path pays a GPR<->SIMD round-trip for every __builtin_popcountl
+             * (eight per call). Compute all four bases in-lane instead: AND the
+             * one-hot BWT words with the position mask, popcount each 64-bit
+             * lane (cnt + pairwise-add reduction), and add the checkpoint
+             * counts. Bit-identical to the scalar popcount, no cross-domain
+             * moves, one load per checkpoint block. */
+            const uint64x2_t msp = vdupq_n_u64(mask_sp);
+            const uint64x2_t mep = vdupq_n_u64(mask_ep);
+            #define BWA3_PC64(v) vpaddlq_u32(vpaddlq_u16(vpaddlq_u8(vcntq_u8(vreinterpretq_u8_u64(v)))))
+            const uint64x2_t psp01 = BWA3_PC64(vandq_u64(vld1q_u64(&blk_sp.one_hot_bwt_str[0]), msp));
+            const uint64x2_t psp23 = BWA3_PC64(vandq_u64(vld1q_u64(&blk_sp.one_hot_bwt_str[2]), msp));
+            const uint64x2_t pep01 = BWA3_PC64(vandq_u64(vld1q_u64(&blk_ep.one_hot_bwt_str[0]), mep));
+            const uint64x2_t pep23 = BWA3_PC64(vandq_u64(vld1q_u64(&blk_ep.one_hot_bwt_str[2]), mep));
+            #undef BWA3_PC64
+            const uint64x2_t occ_sp01 = vaddq_u64(vld1q_u64((const uint64_t*)&blk_sp.cp_count[0]), psp01);
+            const uint64x2_t occ_sp23 = vaddq_u64(vld1q_u64((const uint64_t*)&blk_sp.cp_count[2]), psp23);
+            const uint64x2_t occ_ep01 = vaddq_u64(vld1q_u64((const uint64_t*)&blk_ep.cp_count[0]), pep01);
+            const uint64x2_t occ_ep23 = vaddq_u64(vld1q_u64((const uint64_t*)&blk_ep.cp_count[2]), pep23);
+            vst1q_u64((uint64_t*)&occ_sp[0], occ_sp01);
+            vst1q_u64((uint64_t*)&occ_sp[2], occ_sp23);
+            vst1q_u64((uint64_t*)&s[0], vsubq_u64(occ_ep01, occ_sp01));
+            vst1q_u64((uint64_t*)&s[2], vsubq_u64(occ_ep23, occ_sp23));
+#else
+            for (uint8_t b = 0; b < 4; b++) {
+                int64_t occ_s = blk_sp.cp_count[b] + _mm_countbits_64(blk_sp.one_hot_bwt_str[b] & mask_sp);
+                int64_t occ_e = blk_ep.cp_count[b] + _mm_countbits_64(blk_ep.one_hot_bwt_str[b] & mask_ep);
+                occ_sp[b] = occ_s;
+                s[b]      = occ_e - occ_s;
             }
+#endif
 
             int64_t sentinel_offset = 0;
             if ((smem.k <= sentinel_index) && ((smem.k + smem.s) > sentinel_index))
@@ -295,7 +330,7 @@ private:
             l[1] = l[2] + s[2];
             l[0] = l[1] + s[1];
 
-            smem.k = k[a];
+            smem.k = count[a] + occ_sp[a];
             smem.l = l[a];
             smem.s = s[a];
             return smem;
