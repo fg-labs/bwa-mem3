@@ -7,6 +7,7 @@
 
 #include "bam_writer.h"
 #include "cigar_util.h"
+#include "sam_encode.h"
 #include "utils.h"
 
 #include <cstdio>
@@ -225,6 +226,41 @@ static void append_sam_aux_tokens(struct bam1_t *b, const char *s, int meth_mode
     }
 }
 
+/* Per-thread scratch for the transient bam_cigar / seq_text / qual_bin buffers
+ * built in mem_aln_to_bam. These were three malloc/free per emitted record;
+ * bam_set1 copies them into b->data before returning, so a per-thread grow-only
+ * buffer reused across records is safe and removes the allocator round-trips
+ * (real pressure at tens of millions of records × many threads). Freed on
+ * thread exit. */
+namespace {
+struct BamRecScratch {
+    uint32_t *cigar = nullptr; size_t cigar_cap = 0;   // in uint32 ops
+    char     *seq   = nullptr; size_t seq_cap   = 0;   // in bytes (incl NUL)
+    char     *qual  = nullptr; size_t qual_cap  = 0;   // in bytes
+    /* Grow-only kstrings for the MC:Z (mate CIGAR, ~every paired record) and
+     * SA:Z (other primary hits, multi-mapping records) aux tags. Reset .l = 0
+     * per record and reused; the buffer persists so building them is no longer
+     * a malloc/free per record (freed on thread exit like the buffers above). */
+    kstring_t mc = {0, 0, nullptr};
+    kstring_t sa = {0, 0, nullptr};
+    uint32_t *ensure_cigar(size_t n) {
+        if (n > cigar_cap) { free(cigar); cigar = (uint32_t *)malloc(n * sizeof(uint32_t)); cigar_cap = cigar ? n : 0; }
+        return cigar;
+    }
+    char *ensure_seq(size_t n)  { if (n > seq_cap)  { free(seq);  seq  = (char *)malloc(n); seq_cap  = seq  ? n : 0; } return seq;  }
+    char *ensure_qual(size_t n) { if (n > qual_cap) { free(qual); qual = (char *)malloc(n); qual_cap = qual ? n : 0; } return qual; }
+    ~BamRecScratch() { free(cigar); free(seq); free(qual); free(mc.s); free(sa.s); }
+
+    /* Manages raw memory with a custom destructor: delete copies so an accidental
+     * copy can't double-free. Only ever used as a static thread_local (never
+     * copied), so this is future-proofing, not a live fix. Declaring the copy
+     * ctor suppresses the implicit default ctor, so default it explicitly. */
+    BamRecScratch() = default;
+    BamRecScratch(const BamRecScratch &) = delete;
+    BamRecScratch &operator=(const BamRecScratch &) = delete;
+};
+} // namespace
+
 int mem_aln_to_bam(struct bam1_t *b,
                    const mem_opt_t *opt, const bntseq_t *bns,
                    const bseq1_t *s, int n_alns,
@@ -232,6 +268,8 @@ int mem_aln_to_bam(struct bam1_t *b,
                    const mem_aln_t *m_)
 {
     if (b == NULL || opt == NULL || s == NULL || list == NULL) return -1;
+
+    static thread_local BamRecScratch bs;   /* reused per-record scratch (C2) */
 
     mem_aln_t p = list[which];
     mem_aln_t m;
@@ -256,7 +294,7 @@ int mem_aln_to_bam(struct bam1_t *b,
     uint32_t *bam_cigar = NULL;
     size_t    bam_n_cigar = 0;
     if (p.n_cigar > 0) {
-        bam_cigar = (uint32_t *)malloc((size_t)p.n_cigar * sizeof(uint32_t));
+        bam_cigar = bs.ensure_cigar((size_t)p.n_cigar);
         if (bam_cigar == NULL) return -1;
         for (int i = 0; i < p.n_cigar; ++i) {
             int op  = p.cigar[i] & 0xf;
@@ -300,17 +338,22 @@ int mem_aln_to_bam(struct bam1_t *b,
     char *qual_bin = NULL;
     if (emit_seq && qe > qb) {
         l_emit = (size_t)(qe - qb);
-        seq_text = (char *)malloc(l_emit + 1);
-        if (seq_text == NULL) { free(bam_cigar); return -1; }
+        seq_text = bs.ensure_seq(l_emit + 1);
+        if (seq_text == NULL) return -1;
+        /* C3: reuse the SAM path's SIMD SEQ encoders. Byte-identical to the
+         * scalar "ACGTN"/"TGCAN" loops (CLAMP4 is a no-op for valid 0..4 bases);
+         * for the reverse case src is s->seq+qb (the encoder reverses it, so
+         * dst[i] == "TGCAN"[s->seq[qe-1-i]]). QUAL keeps its scalar -33 subtract
+         * (the SAM reverse-copy encoder doesn't subtract). */
         if (!p.is_rev) {
-            for (size_t i = 0; i < l_emit; ++i) seq_text[i] = "ACGTN"[(int)s->seq[qb + (int)i]];
+            sam_encode_seq_fwd(seq_text, (const uint8_t *)(s->seq + qb), (int)l_emit);
         } else {
-            for (size_t i = 0; i < l_emit; ++i) seq_text[i] = "TGCAN"[(int)s->seq[qe - 1 - (int)i]];
+            sam_encode_seq_rev(seq_text, (const uint8_t *)(s->seq + qb), (int)l_emit);
         }
         seq_text[l_emit] = '\0';
         if (s->qual) {
-            qual_bin = (char *)malloc(l_emit);
-            if (qual_bin == NULL) { free(seq_text); free(bam_cigar); return -1; }
+            qual_bin = bs.ensure_qual(l_emit);
+            if (qual_bin == NULL) return -1;
             if (!p.is_rev) {
                 for (size_t i = 0; i < l_emit; ++i) qual_bin[i] = (char)((unsigned char)s->qual[qb + (int)i] - 33);
             } else {
@@ -326,7 +369,8 @@ int mem_aln_to_bam(struct bam1_t *b,
                        mp ? mp->rid : -1, mp ? (hts_pos_t)mp->pos : -1, tlen,
                        l_emit, seq_text, qual_bin,
                        /* l_aux */ 0);
-    free(bam_cigar); free(seq_text); free(qual_bin);
+    /* bam_cigar/seq_text/qual_bin are the reused thread-local scratch (C2) — no
+     * free here; bam_set1 has already copied them into b->data. */
     if (ret < 0) return -1;
 
     if (p.n_cigar > 0) {
@@ -337,18 +381,26 @@ int mem_aln_to_bam(struct bam1_t *b,
     }
     if (mp && mp->n_cigar > 0) {
         /* Dynamic buffer: CIGARs with >~800 ops would silently truncate a
-         * fixed stack buffer. kstring_t grows as needed. */
-        kstring_t mc = {0, 0, NULL};
+         * fixed stack buffer. Reused thread-local kstring, grown as needed. */
+        kstring_t *mc = &bs.mc;
+        mc->l = 0;   /* reset the reused scratch; capacity/mc->s persist */
+        /* Propagate OOM: on failure ks_resize leaves the buffer too small, and
+         * kputw/kputc swallow their own failures, so without this the record
+         * could emit with MC silently truncated/omitted. */
+        if (ks_resize(mc, (size_t)mp->n_cigar * 12 + 1) < 0) return -1;   /* worst case: 10 digits + op + NUL */
         for (int i = 0; i < mp->n_cigar; ++i) {
             int op = mp->cigar[i] & 0xf;
             int len = mp->cigar[i] >> 4;
             if (!(opt->flag & MEM_F_SOFTCLIP) && !mp->is_alt && (op == 3 || op == 4))
                 op = which ? 4 : 3;
-            ksprintf(&mc, "%d%c", len, "MIDSH"[op]);
+            /* kputw + kputc instead of ksprintf("%d%c"): same bytes, no vsnprintf
+             * (which ran twice per op — measure then format). */
+            kputw(len, mc);
+            kputc("MIDSH"[op], mc);
         }
-        if (mc.l > 0)
-            bam_aux_append(b, "MC", 'Z', (int)mc.l + 1, (const uint8_t *)mc.s);
-        free(mc.s);
+        if (mc->l > 0)
+            bam_aux_append(b, "MC", 'Z', (int)mc->l + 1, (const uint8_t *)mc->s);
+        /* no free: bs.mc.s persists across records, freed on thread exit */
     }
     if (mp) {
         int32_t mq = (int32_t)mp->mapq;
@@ -375,24 +427,35 @@ int mem_aln_to_bam(struct bam1_t *b,
         for (int i = 0; i < n_alns; ++i)
             if (i != which && !(list[i].flag & 0x100)) { has_other = 1; break; }
         if (has_other) {
-            kstring_t sa = {0, 0, NULL};
+            kstring_t *sa = &bs.sa;
+            sa->l = 0;   /* reset the reused scratch; capacity/sa->s persist */
+            /* Propagate OOM like the MC:Z path above: kputs/kputw/kputc swallow
+             * their own failures, so without pre-sizing the record could emit
+             * with SA silently truncated/omitted. Worst case per hit: rname +
+             * n_cigar*(10 digits + op) + 64 (pos/strand/mapq/NM/commas/;). */
+            size_t max_sa_len = 0;
+            for (int i = 0; i < n_alns; ++i) {
+                if (i == which || (list[i].flag & 0x100)) continue;
+                max_sa_len += strlen(bns->anns[list[i].rid].name) + (size_t)list[i].n_cigar * 12 + 64;
+            }
+            if (ks_resize(sa, max_sa_len + 1) < 0) return -1;
             for (int i = 0; i < n_alns; ++i) {
                 const mem_aln_t *r = &list[i];
                 if (i == which || (r->flag & 0x100)) continue;
-                kputs(bns->anns[r->rid].name, &sa); kputc(',', &sa);
-                kputl(r->pos + 1, &sa); kputc(',', &sa);
-                kputc("+-"[r->is_rev], &sa); kputc(',', &sa);
+                kputs(bns->anns[r->rid].name, sa); kputc(',', sa);
+                kputl(r->pos + 1, sa); kputc(',', sa);
+                kputc("+-"[r->is_rev], sa); kputc(',', sa);
                 for (int k = 0; k < r->n_cigar; ++k) {
-                    kputw(r->cigar[k] >> 4, &sa);
-                    kputc("MIDSH"[r->cigar[k] & 0xf], &sa);
+                    kputw(r->cigar[k] >> 4, sa);
+                    kputc("MIDSH"[r->cigar[k] & 0xf], sa);
                 }
-                kputc(',', &sa); kputw(r->mapq, &sa);
-                kputc(',', &sa); kputw(r->NM, &sa);
-                kputc(';', &sa);
+                kputc(',', sa); kputw(r->mapq, sa);
+                kputc(',', sa); kputw(r->NM, sa);
+                kputc(';', sa);
             }
-            if (sa.l > 0)
-                bam_aux_append(b, "SA", 'Z', (int)sa.l + 1, (const uint8_t *)sa.s);
-            free(sa.s);
+            if (sa->l > 0)
+                bam_aux_append(b, "SA", 'Z', (int)sa->l + 1, (const uint8_t *)sa->s);
+            /* no free: bs.sa.s persists across records, freed on thread exit */
         }
     }
     if (p.XA != NULL) {
