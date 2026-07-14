@@ -138,6 +138,14 @@ CASES_TOTAL="$(echo "$OUT"  | sed -nE 's/^([0-9]+) \/ ([0-9]+) cases passed$/\2/
 [[ "$CASES_PASSED" == "$CASES_TOTAL" ]] || fail "smem_lockstep_parity_test: $CASES_PASSED / $CASES_TOTAL cases passed"
 ok "smem_lockstep_parity_test ($CASES_PASSED / $CASES_TOTAL)"
 
+# --- bwtseed_lockstep_parity_test -----------------------------------------
+OUT="$(cd "$HERE" && ./bwtseed_lockstep_parity_test "$FIXTURES/phix.fa" 2>&1)"
+CASES_PASSED="$(echo "$OUT" | sed -nE 's/^([0-9]+) \/ ([0-9]+) cases passed$/\1/p')"
+CASES_TOTAL="$(echo "$OUT"  | sed -nE 's/^([0-9]+) \/ ([0-9]+) cases passed$/\2/p')"
+[[ -n "$CASES_TOTAL" ]]              || fail "bwtseed_lockstep_parity_test: no summary line"
+[[ "$CASES_PASSED" == "$CASES_TOTAL" ]] || fail "bwtseed_lockstep_parity_test: $CASES_PASSED / $CASES_TOTAL cases passed"
+ok "bwtseed_lockstep_parity_test ($CASES_PASSED / $CASES_TOTAL)"
+
 # --- long-read end-to-end (issue 44) --------------------------------------
 # Pre-fix, reads > 151 bp overran the per-thread SMEM buffer (segfault) and
 # reads > 512 bp tripped the MAX_READ_LEN_FOR_LOCKSTEP assert. Post-fix the
