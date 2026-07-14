@@ -2582,7 +2582,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
         int32_t bsize = 0;
         
         int8_t *H1 = H8_ + tid * SIMD_WIDTH8 * MAX_SEQ_LEN8;
-        int8_t *H2 = H8__ + tid * SIMD_WIDTH16 * MAX_SEQ_LEN8;
+        int8_t *H2 = H8__ + tid * SIMD_WIDTH8 * MAX_SEQ_LEN8;
 
         __m512i zero512   = _mm512_setzero_si512();
         __m512i o_ins512  = _mm512_set1_epi8(o_ins);
