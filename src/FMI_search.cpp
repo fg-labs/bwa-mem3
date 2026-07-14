@@ -1333,40 +1333,67 @@ void FMI_search::getSMEMs(uint8_t *enc_qdb,
 }
 
 
-int compare_smem(const void *a, const void *b)
-{
-    SMEM *pa = (SMEM *)a;
-    SMEM *pb = (SMEM *)b;
-
-    if(pa->rid < pb->rid)
-        return -1;
-    if(pa->rid > pb->rid)
-        return 1;
-
-    if(pa->m < pb->m)
-        return -1;
-    if(pa->m > pb->m)
-        return 1;
-    if(pa->n > pb->n)
-        return -1;
-    if(pa->n < pb->n)
-        return 1;
-    return 0;
-}
-
 void FMI_search::sortSMEMs(SMEM *matchArray,
         int64_t numTotalSmem[],
         int32_t numReads,
         int32_t readlength,
         int nthreads)
 {
+    /* The only property the caller needs from this sort is that every SMEM of a
+     * given read (rid) is contiguous and the reads appear in ascending rid
+     * order: mem_collect_smem then walks each rid block and re-sorts it with
+     * ks_introsort(mem_intv1) keyed purely on (m, n). The old qsort's secondary
+     * (m asc, n desc) ordering was therefore thrown away — and SMEMs that tie on
+     * (rid, m, n) are byte-identical (same read span => same SA interval), so the
+     * unstable re-sort's handling of them cannot depend on their incoming order.
+     *
+     * rid is a dense index in [0, numReads), so a counting sort by rid replaces
+     * the O(n log n) function-pointer qsort with an O(n + rid_range) pass. Buffers
+     * are call-local: FMI_search is shared across worker threads, so no member
+     * scratch may be used here. */
     int tid;
     int32_t perThreadQuota = (numReads + (nthreads - 1)) / nthreads;
     for(tid = 0; tid < nthreads; tid++)
     {
+        int64_t smem_count = numTotalSmem[tid];   /* scalar SMEM count; not the class `count[5]` array */
+        if (smem_count <= 1) continue;   /* 0 or 1 element is already sorted */
+
         int32_t first = tid * perThreadQuota;
-        SMEM *myMatchArray = matchArray + first * readlength;
-        qsort(myMatchArray, numTotalSmem[tid], sizeof(SMEM), compare_smem);
+        SMEM *myMatchArray = matchArray + (int64_t)first * readlength;
+
+        /* rid range actually present in this block (dense, but a per-thread
+         * block only holds its own reads, so offset by the observed minimum). */
+        uint32_t minRid = myMatchArray[0].rid, maxRid = myMatchArray[0].rid;
+        for (int64_t i = 1; i < smem_count; i++) {
+            uint32_t r = myMatchArray[i].rid;
+            if (r < minRid) minRid = r;
+            if (r > maxRid) maxRid = r;
+        }
+        int64_t range = (int64_t)maxRid - (int64_t)minRid + 1;
+
+        int64_t *cnt = (int64_t *) calloc((size_t)range, sizeof(int64_t));
+        SMEM    *tmp = (SMEM *) _mm_malloc((size_t)smem_count * sizeof(SMEM), 64);
+        if (cnt == NULL || tmp == NULL) {
+            fprintf(stderr, "ERROR: out of memory in %s\n", __func__);
+            exit(EXIT_FAILURE);
+        }
+
+        for (int64_t i = 0; i < smem_count; i++)
+            cnt[myMatchArray[i].rid - minRid]++;
+
+        int64_t sum = 0;
+        for (int64_t r = 0; r < range; r++) { int64_t c = cnt[r]; cnt[r] = sum; sum += c; }
+
+        /* stable scatter: same-rid SMEMs keep their incoming relative order */
+        for (int64_t i = 0; i < smem_count; i++) {
+            int64_t b = (int64_t)myMatchArray[i].rid - minRid;
+            tmp[cnt[b]++] = myMatchArray[i];
+        }
+        /* tmp is a fresh allocation and cannot overlap myMatchArray */
+        memcpy(myMatchArray, tmp, (size_t)smem_count * sizeof(SMEM));
+
+        _mm_free(tmp);
+        free(cnt);
     }
 }
 
