@@ -229,9 +229,9 @@ int64_t BandedPairWiseSW::getTicks()
 {
     //printf("oneCount = %ld, totalCount = %ld\n", oneCount, totalCount);
     int64_t totalTicks = sort1Ticks + setupTicks + swTicks + sort2Ticks;
-    printf("cost breakup: %ld, %ld, %ld, %ld, %ld\n",
-            sort1Ticks, setupTicks, swTicks, sort2Ticks,
-            totalTicks);
+    printf("cost breakup: %lld, %lld, %lld, %lld, %lld\n",
+            (long long)sort1Ticks, (long long)setupTicks, (long long)swTicks,
+            (long long)sort2Ticks, (long long)totalTicks);
 
     return totalTicks;
 }
@@ -2623,8 +2623,6 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
             int32_t j, k;
             int maxLen1 = 0;
             int maxLen2 = 0;
-            uint8_t minLen1 = MAX_SEQ_LEN8 + 1;
-            uint8_t minLen2 = MAX_SEQ_LEN8 + 1;
             bsize = w;
             
             uint64_t tim;
@@ -3611,8 +3609,6 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
             int32_t j, k;
             uint16_t maxLen1 = 0;
             uint16_t maxLen2 = 0;
-            uint16_t minLen1 = MAX_SEQ_LEN16 + 1;
-            uint16_t minLen2 = MAX_SEQ_LEN16 + 1;
             bsize = w;
 
             for(j = 0; j < SIMD_WIDTH16; j++)

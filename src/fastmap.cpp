@@ -376,8 +376,8 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
             ret->prof.n_bp = sz;
         }
 
-        fprintf(stderr, "[0000] read_chunk: %ld, work_chunk_size: %ld, nseq: %d\n",
-                aux->task_size, sz, ret->n_seqs);
+        fprintf(stderr, "[0000] read_chunk: %lld, work_chunk_size: %lld, nseq: %d\n",
+                (long long)aux->task_size, (long long)sz, ret->n_seqs);
 
         if (ret->seqs == 0) {
             free(ret);

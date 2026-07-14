@@ -65,20 +65,6 @@ extern uint64_t tprof[LIM_R][LIM_C];
 #define chain_cmp(a, b) (((b).pos < (a).pos) - ((a).pos < (b).pos))
 KBTREE_INIT(chn, mem_chain_t, chain_cmp)
 
-/* mem_intv: primary sort by `info` (composite (m,n) key). Tie-break on
- * x[0] then x[1] extends to a strict total order so the dedup loop in
- * mem_collect_intv walking adjacent equal-info intervals sees a
- * deterministic order regardless of sort algorithm. Without these tie-
- * breaks, klib introsort vs pdqsort produce different equal-info
- * neighbor orderings in repetitive regions, which propagates to SAM
- * via different chain compositions. Matches the mem_ars2 stabilization
- * rationale. */
-#define intv_lt(a, b) \
-    ((a).info < (b).info || ((a).info == (b).info && \
-     ((a).x[0] < (b).x[0] || ((a).x[0] == (b).x[0] && \
-      (a).x[1] < (b).x[1]))))
-KSORT_INIT(mem_intv, bwtintv_t, intv_lt)
-PDQSORT_INIT(mem_intv, bwtintv_t, intv_lt)
 #define intv_lt1(a, b) ((((uint64_t)(a).m) <<32 | ((uint64_t)(a).n)) < (((uint64_t)(b).m) <<32 | ((uint64_t)(b).n)))  // trial
 KSORT_INIT(mem_intv1, SMEM, intv_lt1)  // debug
 
@@ -198,7 +184,6 @@ static inline int bsw8_envelope_ok(int len1, int len2, int w,
 
 #define flt_lt(a, b) ((a).w > (b).w)
 KSORT_INIT(mem_flt, mem_chain_t, flt_lt)
-PDQSORT_INIT(mem_flt, mem_chain_t, flt_lt)
 
 /* Chain-geometry adaptive band (--adaptive-band). Start the banded-SW tight at
  * opt->band_start on the 16-bit and scalar (long-extension) tiers; carry each
@@ -1516,8 +1501,8 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
                 // Propagate SMEM SA-count so chain_n_hits gates --supp-rep-hard-cap.
                 s.n_hits = static_cast<int32_t>(p->s);
                 if (s.rbeg < 0 || s.len < 0)
-                    fprintf(stderr, "rbeg: %ld, slen: %d, cnt: %d, n: %d, m: %d, num_smem: %ld\n",
-                            s.rbeg, s.len, cnt-1, p->n, p->m, num_smem);
+                    fprintf(stderr, "rbeg: %lld, slen: %d, cnt: %d, n: %d, m: %d, num_smem: %lld\n",
+                            (long long)s.rbeg, s.len, cnt-1, p->n, p->m, (long long)num_smem);
 
                 /* D3 (--meth, PR-3) seed→original remap (spec §5.2). The SA coord
                  * just decoded (s.rbeg) is in SEED (f/r-doubled) coordinates. Map
@@ -1725,11 +1710,11 @@ int mem_kernel1_core(FMI_search *fmi,
     // Exact-fit (num_smem == *wsize_mem) is valid: the last write lands at
     // matchArray[*wsize_mem - 1]. Trip only on a true overrun.
     if (num_smem > *wsize_mem){
-        fprintf(stderr, "Error [bug]: num_smem: %ld are more than allocated space %ld.\n",
-                num_smem, *wsize_mem);
+        fprintf(stderr, "Error [bug]: num_smem: %lld are more than allocated space %lld.\n",
+                (long long)num_smem, (long long)*wsize_mem);
         exit(EXIT_FAILURE);
     }
-    printf_(VER, "6. Done! mem_collect_smem, num_smem: %ld\n", num_smem);
+    printf_(VER, "6. Done! mem_collect_smem, num_smem: %lld\n", (long long)num_smem);
     tprof[MEM_COLLECT][tid] += __rdtsc() - tim;
 
 
@@ -2168,7 +2153,7 @@ void mem_process_seqs(mem_opt_t *opt,
              * now in ORIGINAL doubled-pac space, so use the ORIGINAL l_pac. */
             const bntseq_t *pestat_bns = mem_aln_bns(&w);
             fprintf(stderr, "[0000] Inferring insert size distribution of PE reads from data, "
-                    "l_pac: %ld, n: %d\n", pestat_bns->l_pac, n);
+                    "l_pac: %lld, n: %d\n", (long long)pestat_bns->l_pac, n);
             mem_pestat(opt, pestat_bns->l_pac, n, w.regs, pes); // otherwise, infer the insert size
                                                          // distribution from data
         }
@@ -4733,8 +4718,8 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
     {   // refine it!
         fprintf(stderr, "Error: Unexpected behaviour!!!\n");
         fprintf(stderr, "Error: assert failed for seqPair size, "
-                "numPairsLeft: %d, numPairsRight %d, lim: %d\nExiting.\n",
-                numPairsLeft, numPairsRight, *wsize_pair);
+                "numPairsLeft: %d, numPairsRight %d, lim: %lld\nExiting.\n",
+                numPairsLeft, numPairsRight, (long long)*wsize_pair);
         exit(EXIT_FAILURE);
     }
     /* Discard seeds and hence their alignemnts */
