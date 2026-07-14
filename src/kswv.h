@@ -552,11 +552,11 @@ private:
 	int8_t w_extend;
 	int8_t w_ambig;
 	uint8_t *F8;
-	uint8_t *H8_0, *H8_max, *H8_1;
+	uint8_t *H8_0, *H8_1;
 	uint8_t *rowMax8;
 	
 	int16_t *F16;
-	int16_t *H16_0, *H16_max, *H16_1;
+	int16_t *H16_0, *H16_1;
 	int16_t *rowMax16;
 	int32_t maxRefLen, maxQerLen;
 	
