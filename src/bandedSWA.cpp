@@ -735,21 +735,24 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                 for(k = 0; k < sp.len1; k++)
                 {
                     mySeq1SoA[k * SIMD_WIDTH8 + j] = seq1[k] /* PR16: N stays 4 */;
-                    H2[k * SIMD_WIDTH8 + j] = 0;
                 }
                 qlen[j] = sp.len2 * max;
                 if(maxLen1 < sp.len1) maxLen1 = sp.len1;
             }
-            
+
             for(j = 0; j < SIMD_WIDTH8; j++)
             {
                 SeqPair sp = pairArray[i + j];
                 for(k = sp.len1; k <= maxLen1; k++) //removed "="
                 {
                     mySeq1SoA[k * SIMD_WIDTH8 + j] = DUMMY1;
-                    H2[k * SIMD_WIDTH8 + j] = DUMMY1;
                 }
             }
+            /* B5: only the boundary row H2[maxLen1] survives the h0-prefix
+             * deletion seed below (which overwrites rows [0, maxLen1)); write
+             * just that row here, before the seed, instead of the dead per-row
+             * fills removed above. */
+            _mm256_store_si256((__m256i *)(H2 + maxLen1 * SIMD_WIDTH8), _mm256_set1_epi8((char)DUMMY1));
 
 //--------------------
             __m256i h0_256 = _mm256_load_si256((__m256i*) h0);
@@ -784,7 +787,6 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                 for(k = 0; k < sp.len2; k++)
                 {
                     mySeq2SoA[k * SIMD_WIDTH8 + j] = (seq2[k]==AMBIG ? 8 : seq2[k]) /* PR16: query N→8 */;
-                    H1[k * SIMD_WIDTH8 + j] = 0;                    
                 }
                 if(maxLen2 < sp.len2) maxLen2 = sp.len2;
             }
@@ -795,9 +797,12 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                 for(k = sp.len2; k <= maxLen2; k++)
                 {
                     mySeq2SoA[k * SIMD_WIDTH8 + j] = DUMMY2;
-                    H1[k * SIMD_WIDTH8 + j] = 0;
                 }
             }
+            /* B5: only the boundary row H1[maxLen2] (value 0) survives the
+             * h0-prefix insertion seed below; write just that row, before the
+             * seed so its unconditional H1[0]/H1[1] stores still win. */
+            _mm256_store_si256((__m256i *)(H1 + maxLen2 * SIMD_WIDTH8), _mm256_setzero_si256());
 
 //------------------------
             _mm256_store_si256((__m256i *) H1, h0_256);
@@ -1735,21 +1740,22 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
                 for(k = 0; k < sp.len1; k++)
                 {
                     mySeq1SoA[k * SIMD_WIDTH16 + j] = (seq1[k] == AMBIG?0xFFFF:seq1[k]);
-                    H2[k * SIMD_WIDTH16 + j] = 0;
                 }
                 qlen[j] = sp.len2 * max;
                 if(maxLen1 < sp.len1) maxLen1 = sp.len1;
             }
-        
+
             for(j = 0; j < SIMD_WIDTH16; j++)
             {
                 SeqPair sp = pairArray[i + j];
                 for(k = sp.len1; k <= maxLen1; k++) //removed "="
                 {
                     mySeq1SoA[k * SIMD_WIDTH16 + j] = DUMMY1;
-                    H2[k * SIMD_WIDTH16 + j] = DUMMY1;
                 }
             }
+            /* B5: only the boundary row H2[maxLen1] survives the h0-prefix
+             * deletion seed below; write just that row, before the seed. */
+            _mm256_store_si256((__m256i *)(H2 + maxLen1 * SIMD_WIDTH16), _mm256_set1_epi16((short)DUMMY1));
 //--------------------
             __m256i h0_256 = _mm256_load_si256((__m256i*) h0);
             _mm256_store_si256((__m256i *) H2, h0_256);
@@ -1775,7 +1781,6 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
                 for(k = 0; k < sp.len2; k++)
                 {
                     mySeq2SoA[k * SIMD_WIDTH16 + j] = (seq2[k]==AMBIG?0xFFFF:seq2[k]);
-                    H1[k * SIMD_WIDTH16 + j] = 0;                   
                 }
                 if(maxLen2 < sp.len2) maxLen2 = sp.len2;
             }
@@ -1786,9 +1791,10 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
                 for(k = sp.len2; k <= maxLen2; k++)
                 {
                     mySeq2SoA[k * SIMD_WIDTH16 + j] = DUMMY2;
-                    H1[k * SIMD_WIDTH16 + j] = 0;
                 }
             }
+            /* B5: only boundary row H1[maxLen2]=0 survives the seed below. */
+            _mm256_store_si256((__m256i *)(H1 + maxLen2 * SIMD_WIDTH16), _mm256_setzero_si256());
 //------------------------
             _mm256_store_si256((__m256i *) H1, h0_256);
             __m256i cmp256 = _mm256_cmpgt_epi16(h0_256, oe_ins256);
@@ -2576,7 +2582,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
         int32_t bsize = 0;
         
         int8_t *H1 = H8_ + tid * SIMD_WIDTH8 * MAX_SEQ_LEN8;
-        int8_t *H2 = H8__ + tid * SIMD_WIDTH16 * MAX_SEQ_LEN8;
+        int8_t *H2 = H8__ + tid * SIMD_WIDTH8 * MAX_SEQ_LEN8;
 
         __m512i zero512   = _mm512_setzero_si512();
         __m512i o_ins512  = _mm512_set1_epi8(o_ins);
@@ -2652,7 +2658,6 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                 for(k = 0; k < sp.len1; k++)
                 {
                     mySeq1SoA[k * SIMD_WIDTH8 + j] = seq1[k] /* PR16: N stays 4 */;
-                    H2[k * SIMD_WIDTH8 + j] = 0;
                 }
                 qlen[j] = sp.len2 * max;
                 if(maxLen1 < sp.len1) maxLen1 = sp.len1;
@@ -2664,9 +2669,10 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                 for(k = sp.len1; k <= maxLen1; k++)
                 {
                     mySeq1SoA[k * SIMD_WIDTH8 + j] = DUMMY1;
-                    H2[k * SIMD_WIDTH8 + j] = DUMMY1;
                 }
             }
+            /* B5: only boundary row H2[maxLen1] survives the seed below; write just that row. */
+            _mm512_store_si512((__m512i *)(H2 + maxLen1 * SIMD_WIDTH8), _mm512_set1_epi8((char)DUMMY1));
 //--------------------
             __m512i h0_512 = _mm512_load_si512((__m512i*) h0);
             _mm512_store_si512((__m512i *) H2, h0_512);
@@ -2692,7 +2698,6 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                 for(k = 0; k < sp.len2; k++)
                 {
                     mySeq2SoA[k * SIMD_WIDTH8 + j] = (seq2[k]==AMBIG ? 8 : seq2[k]) /* PR16: query N→8 */;
-                    H1[k * SIMD_WIDTH8 + j] = 0;                    
                 }
                 if(maxLen2 < sp.len2) maxLen2 = sp.len2;
             }
@@ -2703,9 +2708,10 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                 for(k = sp.len2; k <= maxLen2; k++)
                 {
                     mySeq2SoA[k * SIMD_WIDTH8 + j] = DUMMY2;
-                    H1[k * SIMD_WIDTH8 + j] = 0;
                 }
             }
+            /* B5: only boundary row H1[maxLen2]=0 survives the seed below. */
+            _mm512_store_si512((__m512i *)(H1 + maxLen2 * SIMD_WIDTH8), _mm512_setzero_si512());
 //------------------------
             _mm512_store_si512((__m512i *) H1, h0_512);
             // h0-prefix insertion seed, unsigned-saturating [0,255]:
@@ -3624,7 +3630,6 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
                 for(k = 0; k < sp.len1; k++)
                 {
                     mySeq1SoA[k * SIMD_WIDTH16 + j] = (seq1[k] == AMBIG ? dmask4:seq1[k]);
-                    H2[k * SIMD_WIDTH16 + j] = 0;
                 }
                 
                 qlen[j] = sp.len2 * max;
@@ -3637,9 +3642,10 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
                 for(k = sp.len1; k <= maxLen1; k++)
                 {
                     mySeq1SoA[k * SIMD_WIDTH16 + j] = DUMMY1;
-                    H2[k * SIMD_WIDTH16 + j] = DUMMY1;
                 }
             }
+            /* B5: only boundary row H2[maxLen1] survives the seed below. */
+            _mm512_store_si512((__m512i *)(H2 + maxLen1 * SIMD_WIDTH16), _mm512_set1_epi16((short)DUMMY1));
 //--------------------
             __m512i h0_512 = _mm512_load_si512((__m512i*) h0);
             _mm512_store_si512((__m512i *) H2, h0_512);
@@ -3665,7 +3671,6 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
                 for(k = 0; k < sp.len2; k++)
                 {
                     mySeq2SoA[k * SIMD_WIDTH16 + j] = (seq2[k]==AMBIG?dmask4:seq2[k]);
-                    H1[k * SIMD_WIDTH16 + j] = 0;                   
                 }
                 if(maxLen2 < sp.len2) maxLen2 = sp.len2;
             }
@@ -3676,9 +3681,10 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
                 for(k = sp.len2; k <= maxLen2; k++)
                 {
                     mySeq2SoA[k * SIMD_WIDTH16 + j] = DUMMY2;
-                    H1[k * SIMD_WIDTH16 + j] = 0;
                 }
             }
+            /* B5: only boundary row H1[maxLen2]=0 survives the seed below. */
+            _mm512_store_si512((__m512i *)(H1 + maxLen2 * SIMD_WIDTH16), _mm512_setzero_si512());
 //------------------------
             _mm512_store_si512((__m512i *) H1, h0_512);
             __mmask32 mask512 = _mm512_cmpgt_epi16_mask(h0_512, oe_ins512);
@@ -4456,7 +4462,6 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
                 for(k = 0; k < sp.len1; k++)
                 {
                     mySeq1SoA[k * SIMD_WIDTH16 + j] = (seq1[k] == AMBIG?0xFFFF:seq1[k]);
-                    H2[k * SIMD_WIDTH16 + j] = 0;
                 }
                 qlen[j] = sp.len2 * max;
                 if(maxLen1 < sp.len1) maxLen1 = sp.len1;
@@ -4468,9 +4473,13 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
                 for(k = sp.len1; k <= maxLen1; k++) //removed "="
                 {
                     mySeq1SoA[k * SIMD_WIDTH16 + j] = DUMMY1;
-                    H2[k * SIMD_WIDTH16 + j] = DUMMY1;
                 }
             }
+            /* B5: only the boundary row H2[maxLen1] survives the h0-prefix
+             * deletion seed below (which overwrites rows [0, maxLen1)); write
+             * just that row here instead of the dead per-row fills removed
+             * above, before the seed to preserve store ordering. */
+            _mm_store_si128((__m128i *)(H2 + maxLen1 * SIMD_WIDTH16), _mm_set1_epi16((short)DUMMY1));
 //--------------------
             __m128i h0_128 = _mm_load_si128((__m128i*) h0);
             _mm_store_si128((__m128i *) H2, h0_128);
@@ -4496,20 +4505,22 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
                 for(k = 0; k < sp.len2; k++)
                 {
                     mySeq2SoA[k * SIMD_WIDTH16 + j] = (seq2[k]==AMBIG?0xFFFF:seq2[k]);
-                    H1[k * SIMD_WIDTH16 + j] = 0;                   
                 }
                 if(maxLen2 < sp.len2) maxLen2 = sp.len2;
             }
-            
+
             for(j = 0; j < SIMD_WIDTH16; j++)
             {
                 SeqPair sp = pairArray[i + j];
                 for(k = sp.len2; k <= maxLen2; k++)
                 {
                     mySeq2SoA[k * SIMD_WIDTH16 + j] = DUMMY2;
-                    H1[k * SIMD_WIDTH16 + j] = 0;
                 }
             }
+            /* B5: only the boundary row H1[maxLen2] (value 0) survives the
+             * h0-prefix insertion seed below; write just that row, before the
+             * seed so its unconditional H1[0]/H1[1] stores still win. */
+            _mm_store_si128((__m128i *)(H1 + maxLen2 * SIMD_WIDTH16), _mm_setzero_si128());
 //------------------------
             _mm_store_si128((__m128i *) H1, h0_128);
             __m128i cmp128 = _mm_cmpgt_epi16(h0_128, oe_ins128);
@@ -5306,7 +5317,6 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                 for(k = 0; k < sp.len1; k++)
                 {
                     mySeq1SoA[k * SIMD_WIDTH8 + j] = seq1[k] /* PR16: N stays 4 */;
-                    H2[k * SIMD_WIDTH8 + j] = 0;
                 }
                 qlen[j] = sp.len2 * max;
                 if(maxLen1 < sp.len1) maxLen1 = sp.len1;
@@ -5318,9 +5328,15 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                 for(k = sp.len1; k <= maxLen1; k++) //removed "="
                 {
                     mySeq1SoA[k * SIMD_WIDTH8 + j] = DUMMY1;
-                    H2[k * SIMD_WIDTH8 + j] = DUMMY1;
                 }
             }
+            /* B5: the h0-prefix deletion seed below fully overwrites H2 rows
+             * [0, maxLen1); only the boundary row H2[maxLen1] survives to be read
+             * as the column edge. Write just that row (all lanes = DUMMY1) here
+             * instead of the dead per-row 0/DUMMY fills removed above. Placed
+             * before the seed so the seed's unconditional H2[0] store still wins,
+             * matching the original store ordering for every maxLen1. */
+            _mm_store_si128((__m128i *)(H2 + maxLen1 * SIMD_WIDTH8), _mm_set1_epi8((char)DUMMY1));
 //--------------------
             __m128i h0_128 = _mm_load_si128((__m128i*) h0);
             _mm_store_si128((__m128i *) H2, h0_128);
@@ -5343,22 +5359,26 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                 for(k = 0; k < sp.len2; k++)
                 {
                     mySeq2SoA[k * SIMD_WIDTH8 + j] = (seq2[k]==AMBIG ? 8 : seq2[k]) /* PR16: query N→8 */;
-                    H1[k * SIMD_WIDTH8 + j] = 0;                    
                 }
                 if(maxLen2 < sp.len2) maxLen2 = sp.len2;
             }
-            
+
             //maxLen2 = ((maxLen2  + 3) >> 2) * 4;
-            
+
             for(j = 0; j < SIMD_WIDTH8; j++)
             {
                 SeqPair sp = pairArray[i + j];
                 for(k = sp.len2; k <= maxLen2; k++)
                 {
                     mySeq2SoA[k * SIMD_WIDTH8 + j] = DUMMY2;
-                    H1[k * SIMD_WIDTH8 + j] = 0;
                 }
             }
+            /* B5: the h0-prefix insertion seed below fully overwrites H1 rows
+             * [0, maxLen2); only the boundary row H1[maxLen2] survives as the row
+             * edge (value 0). Write just that row here instead of the dead
+             * per-row zero fills removed above; before the seed so its
+             * unconditional H1[0]/H1[1] stores still win for small maxLen2. */
+            _mm_store_si128((__m128i *)(H1 + maxLen2 * SIMD_WIDTH8), _mm_setzero_si128());
 //------------------------
             _mm_store_si128((__m128i *) H1, h0_128);
             // h0-prefix insertion seed, unsigned-saturating [0,255]:
