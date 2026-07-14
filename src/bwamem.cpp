@@ -1182,10 +1182,26 @@ SMEM *mem_collect_smem(FMI_search *fmi, const mem_opt_t *opt,
         for (int l=0; l<nseq; l++)
             min_intv_ar[l] = opt->max_mem_intv;
 
+// Third-pass re-seeding lockstep is gated to arm64. It overlaps the serial
+// forward-extension chain's cp_occ misses with N independent reads' chains,
+// which is a large seeding win (~-16%, ~-1.7% end-to-end) on non-SMT arm
+// (Graviton4, Apple Silicon). On SMT x86 the sibling hyperthread already hides
+// that latency, so the lockstep is redundant overhead and regresses ~+2% at
+// full-vCPU thread counts — measured across BWTSEED_LOCKSTEP_N in {4,8,16},
+// all depths regress x86-SMT. Byte-identical either way (see bwtseed lockstep
+// parity harness); the scalar path stays the x86 default.
+#if defined(__aarch64__) && BWTSEED_LOCKSTEP_N > 1
+        num_smem3 = fmi->bwtSeedStrategyAllPosOneThread_lockstep(enc_qdb, min_intv_ar,
+                                                                 nseq, seq_, query_cum_len_ar,
+                                                                 opt->min_seed_len + 1,
+                                                                 matchArray + num_smem1 + num_smem2,
+                                                                 max_readlength);
+#else
         num_smem3 = fmi->bwtSeedStrategyAllPosOneThread(enc_qdb, min_intv_ar,
                                                         nseq, seq_, query_cum_len_ar,
                                                         opt->min_seed_len + 1,
                                                         matchArray + num_smem1 + num_smem2);
+#endif
     }
     tot_smem = num_smem1 + num_smem2 + num_smem3;
     // assert(mmc->wsize_mem[tid] > (tot_smem));
