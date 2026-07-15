@@ -851,6 +851,206 @@ DONE:
 }
 // ===== End lockstep SMEM batching =====
 
+// ===== Lockstep bwtSeed batching =====
+// Per-slot state for the forward-only bwtSeed walk. Mirrors the locals of
+// the scalar bwtSeedStrategyAllPosOneThread inner-j loop, plus an outer-x
+// cursor. Each slot owns the entire scalar `while (x < readlength)` outer
+// loop — outer transitions are handled inline in bsd_advance_step (Heng
+// review action: don't burn a stepping-pass on outer-only housekeeping
+// when the inner-j loop is shallow, which is exactly bwtSeed's regime).
+//
+// match_buf[] is a per-slot accumulator flushed in input order; sized
+// by the driver from the batch's max_readlength.
+enum BwtSeedPhase : uint8_t {
+    BSD_FWD  = 0,  // in active inner-j extension (s->j is next j to step;
+                   // when s->j < 0 the next step does outer seek first)
+    BSD_DONE = 1,  // slot retired; match_buf ready for in-order flush
+};
+
+// Per-thread cache for the lockstep bwtSeed driver's match_buf[]. RAII
+// wrapper parallels LockstepSmemCache above; released at thread exit so
+// LSan stays quiet (issue #116 family). Tracked separately from the SMEM
+// cache because the access pattern is different (single buffer, not
+// prev/match pair) and the watermark can move independently.
+struct LockstepBwtSeedCache {
+    SMEM  *match    = nullptr;
+    size_t per_slot = 0;
+    ~LockstepBwtSeedCache() {
+        if (match != nullptr) _mm_free(match);
+    }
+};
+
+struct FMI_search::BwtSeedSlot {
+    int32_t input_idx;     // index into the caller's input arrays; doubles as smem.rid
+    int32_t max_intv;      // max_intv_array[input_idx] cached at init
+    int32_t readlength;    // seq_[input_idx].l_seq
+    int32_t offset;        // query_cum_len_ar[input_idx]
+
+    SMEM    smem;          // current SA interval; rid/m fixed at outer-x init
+    int32_t x;             // outer cursor: position of current smem's seed base
+    int32_t j;             // inner cursor: next j to step; j < 0 = need outer seek
+
+    BwtSeedPhase phase;
+    int32_t match_count;
+    bool    ready;
+
+    SMEM   *match_buf;     // -> thread-local cache slice, sized = max_readlength
+};
+
+// Same-slot T0 prefetch for the next inner-j step. The two CP_OCC blocks
+// the next backwardExt(smem, _) hits are at (smem.k >> CP_SHIFT) and
+// ((smem.k + smem.s) >> CP_SHIFT) — i.e. sp and ep. Matches the call
+// pattern in ls_advance_forward_step's tail prefetch.
+void FMI_search::bsd_prefetch_cp_occ(const BwtSeedSlot *s)
+{
+#ifdef ENABLE_PREFETCH
+    _mm_prefetch((const char *)(&cp_occ[(s->smem.k) >> CP_SHIFT]), _MM_HINT_T0);
+    _mm_prefetch((const char *)(&cp_occ[(s->smem.k + s->smem.s) >> CP_SHIFT]), _MM_HINT_T0);
+#else
+    (void)s;
+#endif
+}
+
+// Cross-slot T1 (L2) prefetch — same two-line target as T0 but at L2
+// hint, used in the driver's (s + N/2) % N lookahead to cover DRAM-class
+// latency when cp_occ spills out of L3.
+void FMI_search::bsd_prefetch_cp_occ_t1(const BwtSeedSlot *s)
+{
+#ifdef ENABLE_PREFETCH
+    _mm_prefetch((const char *)(&cp_occ[(s->smem.k) >> CP_SHIFT]), _MM_HINT_T1);
+    _mm_prefetch((const char *)(&cp_occ[(s->smem.k + s->smem.s) >> CP_SHIFT]), _MM_HINT_T1);
+#else
+    (void)s;
+#endif
+}
+
+// Initialize a fresh slot for the given input read. Scans forward from
+// x=0 for the first ACGT base (matching the scalar's outer while-loop
+// skipping non-ACGT) and either enters BSD_FWD with smem seeded, or jumps
+// straight to BSD_DONE when the read is entirely non-ACGT.
+void FMI_search::bsd_init_slot(BwtSeedSlot *s,
+                               int32_t input_idx,
+                               const int32_t *max_intv_array,
+                               const bseq1_t *seq_,
+                               const int32_t *query_cum_len_ar,
+                               const uint8_t *enc_qdb)
+{
+    s->input_idx   = input_idx;
+    s->max_intv    = max_intv_array[input_idx];
+    s->readlength  = seq_[input_idx].l_seq;
+    s->offset      = query_cum_len_ar[input_idx];
+    s->match_count = 0;
+    s->ready       = false;
+
+    int32_t x = 0;
+    while (x < s->readlength && enc_qdb[s->offset + x] >= 4) x++;
+    s->x = x;
+    if (x >= s->readlength) {
+        s->phase = BSD_DONE;
+        s->ready = true;
+        return;
+    }
+    uint8_t a = enc_qdb[s->offset + x];
+    s->smem.rid = (uint32_t)input_idx;
+    s->smem.m   = x;
+    s->smem.n   = x;
+    s->smem.k   = count[a];
+    s->smem.l   = count[3 - a];
+    s->smem.s   = count[a + 1] - count[a];
+    s->j        = x + 1;
+    s->phase    = BSD_FWD;
+}
+
+// Advance one slot by one unit of work. Always does at least one cp_occ
+// access per call when the slot is active, so the lockstep pipeline keeps
+// uniform per-pass memory parallelism (Heng action 2a — collapse outer
+// transition into the step function rather than burning a stepping-pass
+// on housekeeping).
+//
+// The semantics are identical to the scalar bwtSeedStrategyAllPosOneThread
+// inner-j body + outer-x advancement:
+//   for(j = x+1; j < readlength; j++) {
+//       next_x = j+1; a = enc_qdb[offset + j];
+//       if (a < 4) {
+//           SMEM newSmem = forward-ext(smem, 3-a); newSmem.n = j;
+//           smem = newSmem;
+//           if (s < max_intv && (n - m + 1) >= minSeedLen) {
+//               if (s > 0) emit smem;
+//               break;
+//           }
+//       } else { break; }
+//   }
+//   x = next_x;
+void FMI_search::bsd_advance_step(BwtSeedSlot *s,
+                                  const uint8_t *enc_qdb,
+                                  int32_t minSeedLen)
+{
+    // Outer seek: if j < 0 the slot just broke out of an inner-j extension
+    // and needs to (re-)init smem at the next ACGT x. Spin through non-ACGT
+    // bases inline (scalar does the same — at most O(N_run) here, and N runs
+    // are rare in Illumina data). Falls through to one inner-j step.
+    if (s->j < 0) {
+        while (s->x < s->readlength && enc_qdb[s->offset + s->x] >= 4) s->x++;
+        if (s->x >= s->readlength) {
+            s->phase = BSD_DONE;
+            s->ready = true;
+            return;
+        }
+        uint8_t a = enc_qdb[s->offset + s->x];
+        s->smem.rid = (uint32_t)s->input_idx;
+        s->smem.m   = s->x;
+        s->smem.n   = s->x;
+        s->smem.k   = count[a];
+        s->smem.l   = count[3 - a];
+        s->smem.s   = count[a + 1] - count[a];
+        s->j        = s->x + 1;
+        // Fall through to inner-j step.
+    }
+
+    // Inner-j step.
+    if (s->j >= s->readlength) {
+        // Scalar: inner for-loop exhausted; next_x stays at last iteration's
+        // j+1 = readlength. Setting x = readlength and j = -1 signals the
+        // next stepping pass to retire (the seek above will hit x >= L).
+        s->x = s->readlength;
+        s->j = -1;
+        return;
+    }
+
+    uint8_t a = enc_qdb[s->offset + s->j];
+    if (a >= 4) {
+        // Scalar: non-ACGT in inner-j sets next_x = j+1 and breaks.
+        s->x = s->j + 1;
+        s->j = -1;
+        return;
+    }
+
+    // Forward extension = backward extension on the BWT of the reverse
+    // complement: swap k <-> l around backwardExt(., 3-a) and swap back.
+    SMEM smem_ = s->smem;
+    smem_.k = s->smem.l;
+    smem_.l = s->smem.k;
+    SMEM newSmem_ = backwardExt(smem_, 3 - a);
+    SMEM newSmem  = newSmem_;
+    newSmem.k = newSmem_.l;
+    newSmem.l = newSmem_.k;
+    newSmem.n = s->j;
+
+    if ((newSmem.s < s->max_intv) && ((newSmem.n - newSmem.m + 1) >= minSeedLen)) {
+        if (newSmem.s > 0) {
+            s->match_buf[s->match_count++] = newSmem;
+        }
+        s->x = s->j + 1;
+        s->j = -1;
+        return;
+    }
+
+    s->smem = newSmem;
+    s->j++;
+    bsd_prefetch_cp_occ(s);
+}
+// ===== End lockstep bwtSeed batching =====
+
 void FMI_search::getSMEMsAllPosOneThread(uint8_t *enc_qdb,
                                          int32_t *min_intv_array,
                                          int32_t *rid_array,
@@ -1154,6 +1354,112 @@ int64_t FMI_search::bwtSeedStrategyAllPosOneThread(uint8_t *enc_qdb,
             x = next_x;
         }
     }
+    return numTotalSeed;
+}
+
+// Lockstep-batched bwtSeed driver. Drop-in for bwtSeedStrategyAllPosOneThread
+// — same input contract, same emission order (reads in input order; within
+// a read, outer-x ascending; at most one SMEM per outer x). The interleaving
+// runs BWTSEED_LOCKSTEP_N reads' forward-extension walks together so the
+// independent cp_occ cache-line misses issue concurrently into Zen 4's
+// load queue rather than serializing on per-read load latency.
+//
+// Structurally parallel to getSMEMsOnePosOneThread_lockstep above; see that
+// function's comments for the prefetch model (same-slot T0 inside the step
+// function + cross-slot T1 at (s + N/2) % N in the driver) and the hybrid
+// SoA per-slot/bulk-buffer layout rationale.
+int64_t FMI_search::bwtSeedStrategyAllPosOneThread_lockstep(uint8_t *enc_qdb,
+                                                            int32_t *max_intv_array,
+                                                            int32_t numReads,
+                                                            const bseq1_t *seq_,
+                                                            int32_t *query_cum_len_ar,
+                                                            int32_t minSeedLen,
+                                                            SMEM *matchArray,
+                                                            int32_t max_readlength)
+{
+    if (numReads <= 0) return 0;
+
+    const int32_t N = BWTSEED_LOCKSTEP_N;
+
+    // Per-thread cache for match_buf[] slices. One pointer (no prev[]
+    // needed — bwtSeed has only a forward pass). Sized from max_readlength;
+    // scalar's worst-case emit is one SMEM per x ∈ [0, readlength) so the
+    // bound holds. Grown monotonically across calls.
+    BwtSeedSlot slots[BWTSEED_LOCKSTEP_N] = {};
+    static thread_local LockstepBwtSeedCache cache;
+    const size_t per_slot_smems = (size_t)max_readlength;
+    if (per_slot_smems > cache.per_slot) {
+        if (cache.match != nullptr) _mm_free(cache.match);
+        const size_t total_bytes = (size_t)N * per_slot_smems * sizeof(SMEM);
+        cache.match = (SMEM *)_mm_malloc(total_bytes, 64);
+        assert_not_null(cache.match, total_bytes, total_bytes);
+        cache.per_slot = per_slot_smems;
+    }
+    for (int32_t s = 0; s < N; s++) {
+        slots[s].match_buf = cache.match + (size_t)s * cache.per_slot;
+    }
+
+    // Seed the first min(N, numReads) slots.
+    const int32_t initial = (numReads < N) ? numReads : N;
+    for (int32_t s = 0; s < initial; s++) {
+        bsd_init_slot(&slots[s], s, max_intv_array, seq_, query_cum_len_ar, enc_qdb);
+        if (slots[s].phase == BSD_FWD) bsd_prefetch_cp_occ(&slots[s]);
+    }
+    // Unused slots get input_idx = -1 so the flush pass skips them.
+    for (int32_t s = initial; s < N; s++) {
+        slots[s].phase     = BSD_DONE;
+        slots[s].ready     = false;
+        slots[s].input_idx = -1;
+    }
+
+    int32_t next_input   = initial;
+    int32_t flush_cursor = 0;
+    int64_t numTotalSeed = 0;
+
+    while (flush_cursor < numReads) {
+        // Stepping pass: advance each active slot by one unit of work.
+        for (int32_t s = 0; s < N; s++) {
+            if (slots[s].phase == BSD_FWD) {
+                bsd_advance_step(&slots[s], enc_qdb, minSeedLen);
+            }
+            // Cross-slot T1 lookahead — same pattern as the SMEM lockstep's
+            // (s + N/2) % N L2 prefetch.
+            const int32_t s_la = (s + (N / 2)) % N;
+            if (slots[s_la].phase == BSD_FWD && slots[s_la].j >= 0) {
+                bsd_prefetch_cp_occ_t1(&slots[s_la]);
+            }
+        }
+
+        // Flush pass: emit retired slots in input order; recycle into the
+        // next pending read. Loop until no progress so a chain of newly
+        // retired slots at the cursor flushes in one pass.
+        bool progress = true;
+        while (progress) {
+            progress = false;
+            for (int32_t s = 0; s < N; s++) {
+                if (slots[s].phase == BSD_DONE &&
+                    slots[s].ready &&
+                    slots[s].input_idx == flush_cursor) {
+                    for (int32_t m = 0; m < slots[s].match_count; m++) {
+                        matchArray[numTotalSeed++] = slots[s].match_buf[m];
+                    }
+                    flush_cursor++;
+
+                    if (next_input < numReads) {
+                        bsd_init_slot(&slots[s], next_input,
+                                      max_intv_array, seq_, query_cum_len_ar, enc_qdb);
+                        if (slots[s].phase == BSD_FWD) bsd_prefetch_cp_occ(&slots[s]);
+                        next_input++;
+                    } else {
+                        slots[s].input_idx = -1;
+                        slots[s].ready     = false;
+                    }
+                    progress = true;
+                }
+            }
+        }
+    }
+
     return numTotalSeed;
 }
 

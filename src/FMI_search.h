@@ -94,6 +94,16 @@ typedef struct smem_struct
 #define SMEM_LOCKSTEP_N 16
 #endif
 
+/* Lockstep depth for the third-pass (bwtSeedStrategy) re-seeding, tuned
+ * separately from the phase-2 SMEM depth above. The third-pass lockstep is
+ * gated to arm64 at its call site (bwamem.cpp) because it only wins on non-SMT
+ * cores; N=8 is the measured whole-aligner optimum on Graviton4 (-1.7% vs the
+ * scalar third pass, -16.7% on the seeding stage). Set to 1 to fall back to the
+ * scalar third-pass path even on arm. */
+#ifndef BWTSEED_LOCKSTEP_N
+#define BWTSEED_LOCKSTEP_N 8
+#endif
+
 class FMI_search: public indexEle
 {
     public:
@@ -207,6 +217,21 @@ class FMI_search: public indexEle
                                            int32_t *query_cum_len_ar,
                                            int32_t minSeedLen,
                                            SMEM *matchArray);
+
+    /* Lockstep batched variant of bwtSeedStrategyAllPosOneThread. Processes
+     * BWTSEED_LOCKSTEP_N reads' forward-extension walks in slot-interleaved
+     * order so the CP_OCC cache-line misses from independent reads issue
+     * concurrently. Same SMEM emission order as the scalar (reads in input
+     * order; within a read, outer-x ascending). matchArray must hold at
+     * least numReads * max_readlength SMEMs. */
+    int64_t bwtSeedStrategyAllPosOneThread_lockstep(uint8_t *enc_qdb,
+                                                    int32_t *max_intv_array,
+                                                    int32_t numReads,
+                                                    const bseq1_t *seq_,
+                                                    int32_t *query_cum_len_ar,
+                                                    int32_t minSeedLen,
+                                                    SMEM *matchArray,
+                                                    int32_t max_readlength);
         
     void sortSMEMs(SMEM *matchArray,
                    int64_t numTotalSmem[],
@@ -346,6 +371,20 @@ private:
     void ls_advance_backward_step(BatchSlot *s,
                                   const uint8_t *enc_qdb,
                                   int32_t minSeedLen);
+
+    // ----- Lockstep bwtSeed batching internals -----
+    struct BwtSeedSlot;
+
+    void bsd_init_slot(BwtSeedSlot *s, int32_t input_idx,
+                       const int32_t *max_intv_array,
+                       const bseq1_t *seq_,
+                       const int32_t *query_cum_len_ar,
+                       const uint8_t *enc_qdb);
+    void bsd_prefetch_cp_occ(const BwtSeedSlot *s);
+    void bsd_prefetch_cp_occ_t1(const BwtSeedSlot *s);
+    void bsd_advance_step(BwtSeedSlot *s,
+                          const uint8_t *enc_qdb,
+                          int32_t minSeedLen);
 };
 
 #endif
