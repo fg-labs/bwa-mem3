@@ -134,11 +134,20 @@ char **mem_gen_alt(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac
 	int i, k, r, *cnt, tot;
 	kstring_t *aln = 0, str = {0,0,0};
 	char **XA = 0, *has_alt;
+	/* mem_gen_alt runs once per read (twice per pair) and, for the common
+	 * unique-mapper case, exits early at `tot == 0` after only allocating these
+	 * scratch arrays. Keep the small ones off the heap: has_alt is a per-read
+	 * transient sized to a->n (typically a handful of alnregs), so a stack
+	 * buffer with a heap fallback for the rare large-a->n read avoids a
+	 * calloc/free round-trip on every call. */
+	enum { HAS_ALT_STACK_N = 256 };
+	char has_alt_stack[HAS_ALT_STACK_N];
 
 	cnt = (int *) calloc(a->n, sizeof(int));
     assert(cnt != NULL);
-	has_alt = (char *) calloc(a->n, 1);
+	has_alt = a->n <= HAS_ALT_STACK_N ? has_alt_stack : (char *) malloc(a->n);
     assert(has_alt != NULL);
+	memset(has_alt, 0, a->n);
 	for (i = 0, tot = 0; i < a->n; ++i) {
 		r = get_pri_idx(opt->XA_drop_ratio, a->a, i);
 		if (r >= 0) {
@@ -148,13 +157,10 @@ char **mem_gen_alt(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac
 	}
 	// Publish per-primary hit counts for HN:i emission before the XA_hits cap
 	// can truncate the XA string; HN should reflect what *would* have been in
-	// XA, not what was actually emitted.
-	if (out_hn) {
-		int *hn = (int *) calloc(a->n, sizeof(int));
-		assert(hn != NULL);
-		for (i = 0; i < a->n; ++i) hn[i] = cnt[i];
-		*out_hn = hn;
-	}
+	// XA, not what was actually emitted. cnt already holds exactly these counts
+	// and is not needed after this function, so hand it to the caller directly
+	// rather than allocating and copying a second array (caller owns/frees it).
+	if (out_hn) *out_hn = cnt;
 	if (tot == 0) goto end_gen_alt;
 	aln = (kstring_t*) calloc(a->n, sizeof(kstring_t));
     assert(aln != NULL);
@@ -193,6 +199,8 @@ char **mem_gen_alt(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac
 		XA[k] = aln[k].s;
 
 end_gen_alt:
-	free(has_alt); free(cnt); free(aln); free(str.s);
+	if (has_alt != has_alt_stack) free(has_alt);
+	if (!out_hn) free(cnt); // else cnt was handed to *out_hn; caller frees it
+	free(aln); free(str.s);
 	return XA;
 }
