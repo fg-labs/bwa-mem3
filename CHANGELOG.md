@@ -1,5 +1,37 @@
 # Changelog
 
+## [0.6.0](https://github.com/fg-labs/bwa-mem3/compare/v0.5.0...v0.6.0) (2026-07-16)
+
+
+### Features
+
+* **version:** report whether mimalloc is the active allocator ([#217](https://github.com/fg-labs/bwa-mem3/issues/217)) ([2cd9fe9](https://github.com/fg-labs/bwa-mem3/commit/2cd9fe9c27185af98d2f6a0b59c04431a50eea0a))
+
+
+### Performance
+
+* **bam:** cut per-record work in the --bam writer (mem_aln_to_bam) ([#212](https://github.com/fg-labs/bwa-mem3/issues/212)) ([837f40e](https://github.com/fg-labs/bwa-mem3/commit/837f40e1e974217ee1c45f7a4ceea6b3b6c00821))
+* **bsw:** drop dead per-row H1/H2 setup stores in the SW batch wrappers ([#211](https://github.com/fg-labs/bwa-mem3/issues/211)) ([039b09f](https://github.com/fg-labs/bwa-mem3/commit/039b09f8ecd11e724b098a1729d42703c2ce058d))
+* **dedup:** drop provably-dead exact-duplicate passes in mem_sort_dedup_patch ([#205](https://github.com/fg-labs/bwa-mem3/issues/205)) ([c544258](https://github.com/fg-labs/bwa-mem3/commit/c5442582e44da347d8a81e9b58a70a18ed0467a4))
+* **fmi:** arm64 lockstep for third-pass reseeding (bwtSeedStrategy) ([#215](https://github.com/fg-labs/bwa-mem3/issues/215)) ([c5f69ec](https://github.com/fg-labs/bwa-mem3/commit/c5f69ec0aaa8d2fae290228c7b24ee774f740d62))
+* **kswv:** remove write-only Hmax scratch buffer from batched SW kernels ([#214](https://github.com/fg-labs/bwa-mem3/issues/214)) ([b14ef49](https://github.com/fg-labs/bwa-mem3/commit/b14ef4993ee9a60813b0412b8a5d5d40aa19b66b))
+* **mem:** add unique-mapper fast paths to mem_chain_flt and mem_mark_primary_se ([#209](https://github.com/fg-labs/bwa-mem3/issues/209)) ([1700aab](https://github.com/fg-labs/bwa-mem3/commit/1700aabc263a8776dc12b66acbb566bda67a37ba))
+* **mem:** drop redundant per-call scratch allocations in mem_gen_alt ([#216](https://github.com/fg-labs/bwa-mem3/issues/216)) ([3418525](https://github.com/fg-labs/bwa-mem3/commit/3418525750b15df76dd0d5c5d3634dab4c8f61d4))
+* **mem:** pool per-read scratch in get_sa_entries_prefetch and mem_reg2aln ([#208](https://github.com/fg-labs/bwa-mem3/issues/208)) ([5747a13](https://github.com/fg-labs/bwa-mem3/commit/5747a131cde9c22490c5ace470b0903d395ad130))
+* **mem:** remove dead/instrumentation work from the extension hot path ([#206](https://github.com/fg-labs/bwa-mem3/issues/206)) ([439be97](https://github.com/fg-labs/bwa-mem3/commit/439be9709844a0557ad01ec7cdf3b542e9acf66d))
+* **seed:** replace sortSMEMs qsort with a counting sort by rid ([#207](https://github.com/fg-labs/bwa-mem3/issues/207)) ([4356b5c](https://github.com/fg-labs/bwa-mem3/commit/4356b5ce50348a2421b2b8e2517d12f642cfb8e8))
+* **seed:** vectorize backwardExt occ-counting on arm64 (NEON) + hoist invariants ([#210](https://github.com/fg-labs/bwa-mem3/issues/210)) ([64a55a2](https://github.com/fg-labs/bwa-mem3/commit/64a55a25c18350a66a93438d64f3d93a77259a8a))
+
+
+### Refactoring
+
+* **mem:** static cleanup — remove dead code, silence int64 format warnings ([#213](https://github.com/fg-labs/bwa-mem3/issues/213)) ([8c57b7e](https://github.com/fg-labs/bwa-mem3/commit/8c57b7ef6b0ff45d3b6d1b17031c9f0c46879199))
+
+
+### Documentation
+
+* retitle LICENSE for BWA-MEM3 and add Fulcrum copyright ([#203](https://github.com/fg-labs/bwa-mem3/issues/203)) ([089a956](https://github.com/fg-labs/bwa-mem3/commit/089a956375b27372d812a757cc87663526126fc8))
+
 ## [0.5.0](https://github.com/fg-labs/bwa-mem3/compare/v0.4.0...v0.5.0) (2026-07-04)
 
 
