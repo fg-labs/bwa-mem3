@@ -1,2 +1,2 @@
-mimalloc 3.3.0
 v<MAJOR.MINOR>-<N>-g<COMMIT>
+mimalloc 3.3.0 (active)

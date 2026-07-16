@@ -194,7 +194,25 @@ int main(int argc, char* argv[])
 #ifdef USE_MIMALLOC
         {
             int mv = mi_version();
-            fprintf(stderr, "mimalloc %d.%d.%d\n", mv / 10000, (mv / 100) % 100, mv % 100);
+            // Report whether mimalloc is actually intercepting the standard
+            // allocator, not merely linked. mi_version() resolves as long as
+            // libmimalloc is on the link line, so the version alone is a
+            // false-positive signal: a build that links a libmimalloc which
+            // exports only the mi_* API (e.g. some distro/conda libmimalloc.so
+            // built without the malloc override) prints a version here while
+            // every real malloc/free still goes to the system allocator.
+            // Probe by allocating through the standard malloc and asking
+            // mimalloc whether the pointer lives in one of its heap regions —
+            // true only when malloc was routed to mimalloc.
+            void *probe = malloc(64);
+            int active = (probe != NULL) && mi_is_in_heap_region(probe);
+            free(probe);
+            // Emit on stdout so the whole `version` block stays on one stream
+            // (PACKAGE_VERSION and the SIMD lines above also go to stdout);
+            // downstream scripts that capture stdout can then parse it.
+            fprintf(stdout, "mimalloc %d.%d.%d (%s)\n",
+                    mv / 10000, (mv / 100) % 100, mv % 100,
+                    active ? "active" : "linked but NOT overriding malloc");
         }
 #endif
         return 0;
