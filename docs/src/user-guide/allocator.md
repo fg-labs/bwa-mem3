@@ -27,10 +27,13 @@ The linkage strategy differs by OS:
 > **Warning — macOS: keep libmimalloc.dylib next to the binary**
 >
 > On macOS, `libmimalloc.dylib` must remain in the same directory as the
-> `bwa-mem3` binary (or be reachable via the embedded rpath). If you move
-> `bwa-mem3` without also moving `libmimalloc.dylib`, the binary will fall back
-> to the system allocator silently — `bwa-mem3 version` will not print a mimalloc
-> line, which is the indicator that the allocator is active.
+> `bwa-mem3` binary (or be reachable via the embedded rpath). The binary carries
+> a hard dynamic dependency on `libmimalloc.dylib`; if you move `bwa-mem3`
+> without it, dyld can no longer resolve the library and the binary fails to
+> launch (`dyld: Library not loaded`) rather than silently running on the system
+> allocator. Whenever mimalloc *is* linked and loaded, `bwa-mem3 version` reports
+> its status explicitly — see
+> [Verifying that mimalloc is active](#verifying-that-mimalloc-is-active) below.
 
 ## Verifying that mimalloc is active
 
@@ -40,13 +43,29 @@ Run:
 ./bwa-mem3 version
 ```
 
-When mimalloc is linked and loaded, the output includes a line like:
+The `version` output always carries a mimalloc line whenever the library is
+linked, with a status suffix reporting whether it is actually intercepting the
+standard allocator:
 
 ```text
-mimalloc 3.x.x
+mimalloc 3.x.x (active)
 ```
 
-If that line is absent, mimalloc is not active.
+`(active)` means a standard `malloc` allocation was routed to mimalloc — the
+allocator is doing its job. If instead you see:
+
+```text
+mimalloc 3.x.x (linked but NOT overriding malloc)
+```
+
+then a libmimalloc that exports only the `mi_*` API is linked — e.g. a
+distro/conda `libmimalloc` built without the malloc override — and every real
+`malloc`/`free` is still going to the system allocator. If the mimalloc line is
+absent entirely, the binary was built with `USE_MIMALLOC=0`.
+
+The status is probed at runtime by allocating through the standard `malloc` and
+asking mimalloc whether the pointer lives in one of its heap regions, so it
+reflects the allocator that is genuinely in effect — not merely what was linked.
 
 ## Opting out
 
