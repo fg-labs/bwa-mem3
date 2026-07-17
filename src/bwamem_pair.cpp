@@ -1094,7 +1094,21 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
         score_un = a[0].a[0].score + a[1].a[0].score - opt->pen_unpaired;
         //q_pe = o && subo < o? (int)(MEM_MAPQ_COEF * (1. - (double)subo / o) * log(a[0].a[z[0]].seedcov + a[1].a[z[1]].seedcov) + .499) : 0;
         subo = subo > score_un? subo : score_un;
-        q_pe = raw_mapq(o - subo, opt->a);
+        {
+            /* Meth PE MAPQ hardening (dragmap-style, cf. minibwa r404): fold each
+             * end's SECOND-best single-end hit into the pair MAPQ so a repeat on
+             * either end deflates confidence even when one paired alignment looks
+             * clean. Meth-gated so non-meth PE MAPQ is byte-identical. */
+            int qdiff = o - subo;
+            if (opt->meth_mode) {
+                int se2_0 = (n_pri[0] > 1) ? a[0].a[1].score : 0;
+                int se2_1 = (n_pri[1] > 1) ? a[1].a[1].score : 0;
+                int cap = o + 4 * opt->a - (se2_0 + se2_1);
+                if (qdiff > cap) qdiff = cap;
+            }
+            if (qdiff < 0) qdiff = 0;
+            q_pe = raw_mapq(qdiff, opt->a);
+        }
 
         if (n_sub > 0) q_pe -= (int)(4.343 * log(n_sub+1) + .499);
         if (q_pe < 0) q_pe = 0;
