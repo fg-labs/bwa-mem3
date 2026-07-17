@@ -3,14 +3,14 @@
 #
 # Asserts that `bwa-mem3 mem --fast` resolves the characterized speed levers
 # (-m 10 -y 0 --min-ext-len 30 --smem-dedup --skip-contained-ext
-# --max-extend-chains 5, plus -s 2, --max-extend-chains 10, and
-# --extend-mate-concordant under --meth), that explicit user flags override the
+# --max-extend-chains 20 --extend-mate-concordant, plus -s 2 and a lower
+# --max-extend-chains 10 under --meth), that explicit user flags override the
 # preset, and that the default path is untouched when --fast is absent.
 # --skip-contained-ext no-ops under --meth (internal gate), so it is omitted from
 # the meth audit line; --max-extend-chains applies under --meth too but at a
-# higher cap of 10 (non-meth keeps 5). --extend-mate-concordant is meth-only
-# (recovers the bisulfite pairing regression the chain cap otherwise causes) and
-# must be absent from the non-meth audit line.
+# lower cap of 10 (non-meth uses 20). --extend-mate-concordant recovers the
+# chain-cap pairing regression and is now enabled for both non-meth and --meth
+# --fast (fg-labs/bwa-mem3#202), so it must be present on both audit lines.
 #
 # The assertion surface is the audit line main_mem prints to stderr when
 # --fast is active: it reports the *resolved* mem_opt_t values, so an explicit
@@ -50,13 +50,13 @@ line="$(fast_line --fast)"
 [[ "$line" == *"-m 10"* && "$line" == *"-y 0"* \
    && "$line" == *"--min-ext-len 30"* && "$line" == *"--smem-dedup"* \
    && "$line" == *"--skip-contained-ext"* \
-   && "$line" == *"--max-extend-chains 5"* ]] \
+   && "$line" == *"--max-extend-chains 20"* \
+   && "$line" == *"--adaptive-band"* \
+   && "$line" == *"--extend-mate-concordant"* ]] \
     || { echo "FAIL: --fast bundle wrong: '$line'" >&2; exit 1; }
 [[ "$line" != *"-s "* ]] \
     || { echo "FAIL: non-meth --fast must not set -s: '$line'" >&2; exit 1; }
-[[ "$line" != *"--extend-mate-concordant"* ]] \
-    || { echo "FAIL: non-meth --fast must not enable --extend-mate-concordant: '$line'" >&2; exit 1; }
-echo "OK:   --fast bundle resolves -m 10 -y 0 --min-ext-len 30 --smem-dedup --skip-contained-ext --max-extend-chains 5 (no -s, no mate-concordant)"
+echo "OK:   --fast bundle resolves -m 10 -y 0 --min-ext-len 30 --smem-dedup --skip-contained-ext --max-extend-chains 20 --adaptive-band --extend-mate-concordant (no -s)"
 
 # 2. Override precedence: an explicit flag wins *only* for its own field; the
 #    rest of the preset (including the unconditional --smem-dedup) must survive.
@@ -64,27 +64,32 @@ line="$(fast_line --fast -m 30)"
 [[ "$line" == *"-m 30"* && "$line" == *"-y 0"* \
    && "$line" == *"--min-ext-len 30"* && "$line" == *"--smem-dedup"* \
    && "$line" == *"--skip-contained-ext"* \
-   && "$line" == *"--max-extend-chains 5"* ]] \
+   && "$line" == *"--max-extend-chains 20"* \
+   && "$line" == *"--adaptive-band"* && "$line" == *"--extend-mate-concordant"* ]] \
     || { echo "FAIL: explicit -m 30 should only override -m: '$line'" >&2; exit 1; }
 line="$(fast_line --fast -y 5)"
 [[ "$line" == *"-m 10"* && "$line" == *"-y 5"* \
    && "$line" == *"--min-ext-len 30"* && "$line" == *"--smem-dedup"* \
    && "$line" == *"--skip-contained-ext"* \
-   && "$line" == *"--max-extend-chains 5"* ]] \
+   && "$line" == *"--max-extend-chains 20"* \
+   && "$line" == *"--adaptive-band"* && "$line" == *"--extend-mate-concordant"* ]] \
     || { echo "FAIL: explicit -y 5 should only override -y: '$line'" >&2; exit 1; }
 line="$(fast_line --fast --min-ext-len 45)"
 [[ "$line" == *"-m 10"* && "$line" == *"-y 0"* \
    && "$line" == *"--min-ext-len 45"* && "$line" == *"--smem-dedup"* \
    && "$line" == *"--skip-contained-ext"* \
-   && "$line" == *"--max-extend-chains 5"* ]] \
+   && "$line" == *"--max-extend-chains 20"* \
+   && "$line" == *"--adaptive-band"* && "$line" == *"--extend-mate-concordant"* ]] \
     || { echo "FAIL: explicit --min-ext-len 45 should only override min-ext-len: '$line'" >&2; exit 1; }
 # --max-extend-chains is overridable under --fast (respects an explicit value).
 line="$(fast_line --fast --max-extend-chains 8)"
 [[ "$line" == *"-m 10"* && "$line" == *"-y 0"* \
    && "$line" == *"--min-ext-len 30"* && "$line" == *"--smem-dedup"* \
-   && "$line" == *"--max-extend-chains 8"* ]] \
+   && "$line" == *"--skip-contained-ext"* \
+   && "$line" == *"--max-extend-chains 8"* \
+   && "$line" == *"--adaptive-band"* && "$line" == *"--extend-mate-concordant"* ]] \
     || { echo "FAIL: explicit --max-extend-chains 8 should only override that lever: '$line'" >&2; exit 1; }
-echo "OK:   explicit -m/-y/--min-ext-len/--max-extend-chains override only their field; rest of preset survives"
+echo "OK:   explicit -m/-y/--min-ext-len/--max-extend-chains override only their field; rest of preset (--adaptive-band, --extend-mate-concordant, ...) survives"
 
 # 3. Default contract: no --fast => no audit line at all.
 "$bin" mem "$ref" "$reads" >/dev/null 2>"$err" || { echo "FAIL: plain mem nonzero" >&2; exit 1; }

@@ -22,8 +22,9 @@ Options:
     -S            skip mate rescue
     -P            skip pairing; mate rescue performed unless -S also in use
     --fast        speed preset: -m 10 -y 0 --min-ext-len 30 --smem-dedup
-                  --skip-contained-ext --max-extend-chains 5 --adaptive-band (and
-                  -s 2 --extend-mate-concordant under --meth). Opt-in; explicit
+                  --skip-contained-ext --max-extend-chains 20 --adaptive-band
+                  --extend-mate-concordant (under --meth: --max-extend-chains 10,
+                  -s 2). Opt-in; explicit
                   flags override where applicable; --smem-dedup,
                   --skip-contained-ext and --adaptive-band are always enabled.
                   NOT byte-identical to the default (divergence confined to the

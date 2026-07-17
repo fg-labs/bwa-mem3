@@ -943,8 +943,9 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "    -S            skip mate rescue\n");
     fprintf(stderr, "    -P            skip pairing; mate rescue performed unless -S also in use\n");
     fprintf(stderr, "    --fast        speed preset: -m 10 -y 0 --min-ext-len 30 --smem-dedup\n");
-    fprintf(stderr, "                  --skip-contained-ext --max-extend-chains 5 --adaptive-band (and\n");
-    fprintf(stderr, "                  -s 2 --extend-mate-concordant under --meth). Opt-in; explicit\n");
+    fprintf(stderr, "                  --skip-contained-ext --max-extend-chains 20 --adaptive-band\n");
+    fprintf(stderr, "                  --extend-mate-concordant (under --meth: --max-extend-chains 10,\n");
+    fprintf(stderr, "                  -s 2). Opt-in; explicit\n");
     fprintf(stderr, "                  flags override where applicable; --smem-dedup,\n");
     fprintf(stderr, "                  --skip-contained-ext and --adaptive-band are always enabled.\n");
     fprintf(stderr, "                  NOT byte-identical to the default (divergence confined to the\n");
@@ -1445,8 +1446,8 @@ int main_mem(int argc, char *argv[])
 
     /* --fast: one-flag shorthand for the characterized speed levers
      *   -m 10  -y 0  --min-ext-len 30  --smem-dedup  --skip-contained-ext
-     *   --max-extend-chains 5  --adaptive-band
-     *   (under --meth: also adds -s 2 and --extend-mate-concordant).
+     *   --max-extend-chains 20  --adaptive-band  --extend-mate-concordant
+     *   (under --meth: --max-extend-chains 10 and also adds -s 2).
      * Mirrors the -x preset: each lever is applied only when the user did not
      * set it explicitly (opt0), so explicit flags win where applicable. The
      * exceptions are --smem-dedup and --skip-contained-ext, which are plain
@@ -1466,9 +1467,12 @@ int main_mem(int argc, char *argv[])
          * rescue on, below) shows chr-accuracy flat (0.9908) at every cap but the
          * confident wrong-chromosome rate is U-shaped, minimized at 10 (cap 5: 592
          * MAPQ>=30 mismaps; cap 10: 382; uncapped: 1056), for +0.7s wall (20.2->20.9s,
-         * still -6% vs uncapped). Non-meth keeps 5 (its placement is cap-insensitive
-         * and 5 is the pure-speed pick). */
-        if (!opt0.max_extend_chains) opt->max_extend_chains = opt->meth_mode ? 10 : 5;
+         * still -6% vs uncapped). Non-meth uses 20 + --extend-mate-concordant
+         * (below): the non-meth sweep in #202 shows the plain cap 5 inflates the
+         * confident (MAPQ>=1) mis-placement tail 3.8x on sim-wgs-place (3,626 ->
+         * 13,921 vs uncapped); cap 20 + mate-concordant lands within +827 of that
+         * floor (verified --fast) while keeping ~-20% aligner CPU. */
+        if (!opt0.max_extend_chains) opt->max_extend_chains = opt->meth_mode ? 10 : 20;
         opt->smem_dedup = 1;                             /* --smem-dedup (plain on/off) */
         opt->skip_contained_ext = 1;                     /* --skip-contained-ext (plain on/off;
                                                           * meth-gated internally) */
@@ -1485,11 +1489,15 @@ int main_mem(int argc, char *argv[])
          * locus (99% proper-pair). Keeping any capped chain that is concordant with
          * a mate chain retains exactly the true pair's low-weight chain while still
          * dropping the far/redundant ones, recovering placement to default parity
-         * (97.64% -> 98.08%, == cap-off 98.09%). Non-meth --fast keeps the plain
-         * cap (WGS placement is already unaffected and the exemption would erode
-         * the speedup). Auto (-1) sizes the concordance window to the estimated
-         * proper-pair insert bound so only genuine pair anchors are retained. */
-        if (opt->meth_mode && !opt0.mate_concordant_window)
+         * (97.64% -> 98.08%, == cap-off 98.09%). Non-meth --fast benefits too:
+         * the same top-5 cap inflates confident (MAPQ>=1) mismaps 3.8x on
+         * sim-wgs-place (3,626 -> 13,921 vs uncapped), for the same reason -- the
+         * true chain is low-weight but mate-concordant in 98% of cap-dropped reads.
+         * Mate-concordant retention recovers ~60% of that (-> 5,521) at ~neutral
+         * CPU, so it is enabled for non-meth --fast as well (fg-labs/bwa-mem3#202).
+         * Auto (-1) sizes the concordance window to the estimated proper-pair
+         * insert bound so only genuine pair anchors are retained. */
+        if (!opt0.mate_concordant_window)
             opt->mate_concordant_window = -1;
         if (opt->meth_mode && !opt0.split_width)
             opt->split_width = 2;                        /* -s 2 (meth only): light Pass-2 reseed.
@@ -1616,7 +1624,7 @@ int main_mem(int argc, char *argv[])
             fprintf(stderr, "[M::%s] --fast: -m %d -y %ld --min-ext-len %d --smem-dedup --max-extend-chains %d --adaptive-band -s %d --extend-mate-concordant\n",
                     __func__, opt->max_matesw, (long)opt->max_mem_intv, opt->min_ext_len, opt->max_extend_chains, opt->split_width);
         else
-            fprintf(stderr, "[M::%s] --fast: -m %d -y %ld --min-ext-len %d --smem-dedup --skip-contained-ext --max-extend-chains %d --adaptive-band\n",
+            fprintf(stderr, "[M::%s] --fast: -m %d -y %ld --min-ext-len %d --smem-dedup --skip-contained-ext --max-extend-chains %d --adaptive-band --extend-mate-concordant\n",
                     __func__, opt->max_matesw, (long)opt->max_mem_intv, opt->min_ext_len, opt->max_extend_chains);
     }
 
