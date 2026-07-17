@@ -762,8 +762,12 @@ static inline void revseq(int l, uint8_t *s)
 static bool meth_batched_rescue_enabled()
 {
     static const bool enabled = []() {
+        /* Default OFF: meth mate rescue uses the scalar path that scores BOTH
+         * bisulfite hypotheses (OT and OB) and keeps the better alignment. The
+         * single-hypothesis batched SIMD path mis-scores a repeat mate whose true
+         * copy needs the opposite matrix; opt into it with =1 for benchmarking. */
         const char *e = getenv("BWAMEM3_METH_BATCHED_RESCUE");
-        return !(e != NULL && strcmp(e, "0") == 0);
+        return (e != NULL && strcmp(e, "1") == 0);
     }();
     return enabled;
 }
@@ -1546,6 +1550,7 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
         if (a->rid == rid && re - rb >= opt->min_seed_len) { // no funny things happening
             kswr_t aln;
             mem_alnreg_t b;
+            int meth_won_hyp = (a->meth_hypothesis < 0) ? -1 : !a->meth_hypothesis;
             int tmp, xtra = KSW_XSUBO | KSW_XSTART | (l_ms * opt->a < 250? KSW_XBYTE : 0) | (opt->min_seed_len * opt->a);
 
             //aln = **myaln;
@@ -1564,9 +1569,29 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                 uint8_t *ref_rw = (uint8_t*) malloc((size_t)ref_len);
                 assert(ref_rw != NULL);
                 memcpy(ref_rw, ref, (size_t)ref_len);
-                aln = ksw_align2(l_ms, seq, ref_len, ref_rw, 5,
-                                 sw_mat, opt->o_del, opt->e_del,
-                                 opt->o_ins, opt->e_ins, xtra, 0);
+                if (opt->meth_mode) {
+                    /* D3: the single seed-derived bisulfite hypothesis can cripple
+                     * a repeat mate's TRUE-locus rescue (its conversions unfreed ->
+                     * partial), so a decoy concordant pair wins and both mates flip
+                     * to a wrong chromosome. Score under BOTH OT/OB matrices and
+                     * keep the better, mirroring bwameth's both-strand alignment. */
+                    const int8_t *m0 = mem_opt_meth_mat(opt, 0);
+                    const int8_t *m1 = mem_opt_meth_mat(opt, 1);
+                    // ref is still in scope, read-only, and holds the same
+                    // slice bytes, so restore ref_rw directly from it between
+                    // the two hypotheses instead of an extra ref_bak copy.
+                    kswr_t a0 = ksw_align2(l_ms, seq, ref_len, ref_rw, 5, m0,
+                                           opt->o_del, opt->e_del, opt->o_ins, opt->e_ins, xtra, 0);
+                    memcpy(ref_rw, ref, (size_t)ref_len);
+                    kswr_t a1 = ksw_align2(l_ms, seq, ref_len, ref_rw, 5, m1,
+                                           opt->o_del, opt->e_del, opt->o_ins, opt->e_ins, xtra, 0);
+                    if (a0.score >= a1.score) { aln = a0; meth_won_hyp = 0; }
+                    else                      { aln = a1; meth_won_hyp = 1; }
+                } else {
+                    aln = ksw_align2(l_ms, seq, ref_len, ref_rw, 5,
+                                     sw_mat, opt->o_del, opt->e_del,
+                                     opt->o_ins, opt->e_ins, xtra, 0);
+                }
                 free(ref_rw);
             }
             else
@@ -1585,8 +1610,7 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                  * it is fully γ-correct, not symmetric/projected.)
                  * Coordinates are already ORIGINAL (l_pac is the original l_pac via
                  * the original bns), so the 6a coordinate fix holds. */
-                b.meth_hypothesis = (a->meth_hypothesis < 0) ? -1
-                                                             : !a->meth_hypothesis;
+                b.meth_hypothesis = meth_won_hyp;
                 b.qb = is_rev? l_ms - (aln.qe + 1) : aln.qb;
                 b.qe = is_rev? l_ms - aln.qb : aln.qe + 1;
                 b.rb = is_rev? (l_pac<<1) - (rb + aln.te + 1) : rb + aln.tb;
