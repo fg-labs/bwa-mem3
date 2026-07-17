@@ -240,9 +240,9 @@ secondaries, so `XS`, secondary alignments, and `MAPQ` can shift on multi-mappin
 reads. High-confidence (uniquely-placed) reads are unaffected. The cap is a safety
 no-op for pathological reads with more than 4096 chains (`MAX_EXTEND_CHAINS_CAP`):
 those reads extend all of their chains as usual, so `--max-extend-chains` has no
-effect on them. `--fast` sets `5`. For the accuracy/speed curve and validation status,
+effect on them. `--fast` sets `20`. For the accuracy/speed curve and validation status,
 see
-[Settings profiles → `--max-extend-chains 5`](../best-practices/settings-profiles.md#chain-extension-cap---max-extend-chains-5).
+[Settings profiles → `--max-extend-chains`](../best-practices/settings-profiles.md#chain-extension-cap---max-extend-chains).
 
 #### `--adaptive-band` — adaptive banded Smith-Waterman for long reads
 
@@ -302,7 +302,7 @@ the benchmarked per-dataset figures in
 **Not byte-identical when it retains a chain.** Like `--max-extend-chains`, keeping an
 extra candidate can move `XS`, secondaries, and `MAPQ` on multi-mapping reads;
 high-confidence placement is unaffected. For the placement/mismap validation, see
-[Settings profiles → `--extend-mate-concordant`](../best-practices/settings-profiles.md#mate-concordant-chain-retention-under---meth---extend-mate-concordant).
+[Settings profiles → `--extend-mate-concordant`](../best-practices/settings-profiles.md#mate-concordant-chain-retention---extend-mate-concordant).
 
 #### `-h INT[,INT]` — secondary alignment reporting
 
@@ -327,7 +327,7 @@ the alignment score and mapping quality for each secondary hit.
 `--fast` is a one-flag shorthand for the characterized speed levers:
 
 ```text
-bwa-mem3 mem --fast  ≡  -m 10 -y 0 --min-ext-len 30 --smem-dedup --skip-contained-ext --max-extend-chains 5 --adaptive-band
+bwa-mem3 mem --fast  ≡  -m 10 -y 0 --min-ext-len 30 --smem-dedup --skip-contained-ext --max-extend-chains 20 --adaptive-band --extend-mate-concordant
 ```
 
 `--skip-contained-ext` is byte-identical to the default on non-meth single- and paired-end
@@ -338,14 +338,15 @@ applies (~10% lower alignment CPU on long-read inputs) and safe elsewhere.
 (the reads `--fast` primarily targets) and a ~25% alignment-CPU speedup on long-read
 (SBX/HiFi/ONT) runs, so bundling it only helps.
 
-Under `--meth` it additionally sets `-s 2` (light Pass-2 re-seeding) and
-`--extend-mate-concordant`. Earlier releases used `-s 0` (no re-seed), which inflated
+`--extend-mate-concordant` repairs the chain-cap pairing regression — the true, low-weight but
+mate-concordant chain the cap would otherwise drop — and is included for both non-meth and `--meth`
+`--fast` (see
+[Settings profiles → `--extend-mate-concordant`](../best-practices/settings-profiles.md#mate-concordant-chain-retention---extend-mate-concordant)).
+
+Under `--meth` it additionally sets `-s 2` (light Pass-2 re-seeding) and lowers the chain cap to `10`.
+Earlier releases used `-s 0` (no re-seed), which inflated
 MAPQ on bisulfite reads; `-s 2` recovers the MAPQ/placement at nearly the same speed
 (see [Settings profiles → Pass-2 re-seeding](../best-practices/settings-profiles.md#pass-2-re-seeding-under---meth--s-2)).
-`--extend-mate-concordant` repairs the `--max-extend-chains 5` pairing regression that
-bisulfite's flattened chain weights otherwise cause (see
-[Settings profiles → `--extend-mate-concordant`](../best-practices/settings-profiles.md#mate-concordant-chain-retention-under---meth---extend-mate-concordant)).
-Both are meth-only; non-meth `--fast` is unchanged.
 
 Each lever is applied only if you did not set it explicitly, so explicit flags
 win where applicable (`--fast -m 30` keeps `-m 30`; `--fast --max-extend-chains 8`

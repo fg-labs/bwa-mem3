@@ -44,14 +44,15 @@ bwa-mem3 mem -t <N> -m 10 -y 0 ref.fa R1.fq R2.fq > out.sam
 ```
 
 > **Shorthand:** `bwa-mem3 mem --fast` applies `-m 10 -y 0 --min-ext-len 30
-> --smem-dedup --skip-contained-ext --max-extend-chains 5 --adaptive-band` (and
-> `-s 2 --extend-mate-concordant` under `--meth`) in one flag. Explicit flags
+> --smem-dedup --skip-contained-ext --max-extend-chains 20 --adaptive-band
+> --extend-mate-concordant` (plus `-s 2` and a lower `--max-extend-chains 10`
+> under `--meth`) in one flag. Explicit flags
 > still override individual levers where applicable; `--smem-dedup`,
 > `--skip-contained-ext` and `--adaptive-band` are forced on with no opt-out
 > (`--adaptive-band` is a no-op on short reads, a ~25% speedup on long-read runs).
 > `--skip-contained-ext` no-ops under `--meth` (its own internal gate disables it
 > there), so on a `--meth` run the effective levers are
-> `-m 10 -y 0 --min-ext-len 30 --smem-dedup --max-extend-chains 5 --adaptive-band -s 2 --extend-mate-concordant`.
+> `-m 10 -y 0 --min-ext-len 30 --smem-dedup --max-extend-chains 10 --adaptive-band -s 2 --extend-mate-concordant`.
 > See [`mem` → `--fast`](../cli/mem.md#--fast--speed-preset-opt-in-not-byte-identical).
 
 Use this for new pipelines, or once a drop-in migration is validated and you want bwa-mem3's best
@@ -252,7 +253,7 @@ figures and the golden-truth F1 sweep warrant a fresh
 these `--fast` accuracy figures genome-wide. `--min-ext-len` and `--fast` stay opt-in; the drop-in
 defaults are unchanged.
 
-## Chain extension cap: `--max-extend-chains 5`
+## Chain extension cap: `--max-extend-chains`
 
 `--max-extend-chains INT` caps the number of chains that reach banded Smith–Waterman extension to the
 top-`INT` by chain weight (applied after `mem_chain_flt`); the dropped chains are the lowest-weight
@@ -271,12 +272,14 @@ unaffected; the default path (`0`) is verified byte-identical to the base branch
 truth (`sim-wgs-place`, 10.7 M reads), standalone `N = 5` is **−23% total alignment CPU** at +20
 high-confidence (MAPQ ≥ 60) mismaps out of 9.5 M (1529 → 1549). Stacked on top of `--fast` it is
 **−15% marginal CPU** at +21 high-confidence mismaps (1559 → 1580, +0.0002% absolute; overall
-−0.045 pp). `N = 2` is too aggressive (+13.5% high-confidence mismaps), so `--fast` sets `5`.
+−0.045 pp). `N = 2` is too aggressive (+13.5% high-confidence mismaps). `--fast` sets `20` and
+pairs it with `--extend-mate-concordant` (below): the standalone MAPQ ≥ 1 tail rises 3.8× at cap 5,
+but mate-concordant retention closes most of that at cap 20 for ~−20% aligner CPU (fg-labs/bwa-mem3#202).
 `--max-extend-chains` and `--fast` stay opt-in; the drop-in defaults are unchanged.
 
-## Mate-concordant chain retention under `--meth`: `--extend-mate-concordant`
+## Mate-concordant chain retention: `--extend-mate-concordant`
 
-`--max-extend-chains 5` interacts badly with `--meth`. Bisulfite reads are projected into a
+The chain cap interacts badly with paired-end pairing, most acutely under `--meth`. Bisulfite reads are projected into a
 3-letter alphabet (C→T, G→A), which collapses sequence complexity and *flattens chain weights*:
 a read carries many similarly-weighted chains instead of one clear winner. Capping to the top-5 by
 weight then frequently drops a read's *true* low-weight chain — not because it was chain-filtered
@@ -317,9 +320,12 @@ only genuine pair anchors. (Turning the chain cap off entirely under `--meth` re
 but at a larger, uniform CPU cost.) Full per-dataset figures:
 [fg-labs/bwa-mem3#195](https://github.com/fg-labs/bwa-mem3/pull/195).
 
-**`--fast` enables it automatically under
-`--meth` only** — non-meth `--fast` is unchanged, because WGS placement is already unaffected by the
-cap and the exemption would erode the speedup. It is a no-op unless a chain cap is actually in effect,
+**`--fast` enables it automatically** for both non-meth and `--meth` runs. The
+non-meth case (fg-labs/bwa-mem3#202): the top-`INT` cap inflates the confident (MAPQ ≥ 1) mis-placement
+tail 3.8× on `sim-wgs-place` (3,626 → 13,921 vs uncapped) by the same mechanism — the true chain is
+low-weight but mate-concordant in ~98% of cap-dropped reads. Paired with `--max-extend-chains 20`,
+mate-concordant retention closes most of that tail (→ ~4,450, verified on a rebuilt `--fast`) at
+~−20% aligner CPU. It is a no-op unless a chain cap is actually in effect,
 and like `--max-extend-chains` it is **not** byte-identical when it retains a chain. `--extend-mate-concordant`
 and `--fast` stay opt-in; the drop-in defaults are unchanged.
 
