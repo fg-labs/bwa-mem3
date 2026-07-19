@@ -177,17 +177,10 @@ int mem_matesw(const mem_opt_t *opt, const bntseq_t *bns,
      * mate bases against the original ref window instead of the projected mate.
      * meth_orig_seq is ASCII in the SAME orientation as `ms`/`seq` (bwa.h
      * contract), so 2-bit-encode it here and let the existing per-orientation
-     * RC below reverse-complement it EXACTLY as it does the projected mate. */
+     * RC below reverse-complement it EXACTLY as it does the projected mate.
+     * Allocated AFTER the skip-all early return below so the consistent-pair
+     * fast path (the common case) does not leak it. */
     uint8_t *ms2 = NULL;
-    if (ms_orig != NULL) {
-        ms2 = (uint8_t*) malloc(l_ms);
-        assert(ms2 != NULL);
-        for (int k = 0; k < l_ms; ++k) {
-            unsigned char c = (unsigned char) ms_orig[k];
-            ms2[k] = (c < 4) ? c : nst_nt4_table[c];
-        }
-        ms = ms2; // alias the projected-mate pointer to the original bases
-    }
     #if MATE_SORT
     extern int mem_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns,
                                const uint8_t *pac, uint8_t *query, int n, mem_alnreg_t *a);
@@ -212,6 +205,16 @@ int mem_matesw(const mem_opt_t *opt, const bntseq_t *bns,
     }
 
     if (skip[0] + skip[1] + skip[2] + skip[3] == 4) return 0; // consistent pair exist; no need to perform SW
+
+    if (ms_orig != NULL) {
+        ms2 = (uint8_t*) malloc(l_ms);
+        assert(ms2 != NULL);
+        for (int k = 0; k < l_ms; ++k) {
+            unsigned char c = (unsigned char) ms_orig[k];
+            ms2[k] = (c < 4) ? c : nst_nt4_table[c];
+        }
+        ms = ms2; // alias the projected-mate pointer to the original bases
+    }
 
     for (r = 0; r < 4; ++r) {
         int is_rev, is_larger;
@@ -729,12 +732,13 @@ int mem_sam_pe_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
             for (j = 0; j < a[i].n; ++j)
                 if (a[i].a[j].score >= a[i].a[0].score  - opt->pen_unpaired)
                     kv_push(mem_alnreg_t, b[i], a[i].a[j]);
-        
+
         // NEW, batching
         for (i = 0; i < 2; ++i) {
             for (j = 0; j < b[i].n && j < opt->max_matesw; ++j) {
                 int64_t val = mem_matesw_batch_pre(opt, bns, pac, pes, &b[i].a[j],
                                                    s[!i].l_seq, (uint8_t*)s[!i].seq,
+                                                   opt->meth_mode ? s[!i].meth_orig_seq : NULL,
                                                    &a[!i], mmc, pcnt, gcnt,
                                                    maxRefLen, maxQerLen, tid);
 
@@ -762,12 +766,13 @@ static inline void revseq(int l, uint8_t *s)
 static bool meth_batched_rescue_enabled()
 {
     static const bool enabled = []() {
-        /* Default OFF: meth mate rescue uses the scalar path that scores BOTH
-         * bisulfite hypotheses (OT and OB) and keeps the better alignment. The
-         * single-hypothesis batched SIMD path mis-scores a repeat mate whose true
-         * copy needs the opposite matrix; opt into it with =1 for benchmarking. */
+        /* Default ON: meth mate rescue runs on the batched SIMD kswv path,
+         * which now scores BOTH bisulfite hypotheses (OT and OB) per rescue and
+         * keeps the better — the same correct decision as #219's scalar path but
+         * vectorized. Set BWAMEM3_METH_BATCHED_RESCUE=0 to force the scalar
+         * ksw_align2 both-matrix path (slower; used to A/B the two for parity). */
         const char *e = getenv("BWAMEM3_METH_BATCHED_RESCUE");
-        return (e != NULL && strcmp(e, "1") == 0);
+        return !(e != NULL && strcmp(e, "0") == 0);
     }();
     return enabled;
 }
@@ -1242,6 +1247,7 @@ no_pairing:
 int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                          const uint8_t *pac, const mem_pestat_t pes[4],
                          const mem_alnreg_t *a, int l_ms, const uint8_t *ms,
+                         const char *ms_orig,
                          mem_alnreg_v *ma, mem_cache *mmc, int pcnt, int32_t gcnt,
                          int32_t &maxRefLen, int32_t &maxQerLen, int32_t tid)
 {
@@ -1291,7 +1297,25 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
         gar[gcnt + 3] = gar[gcnt + 2] = gar[gcnt + 1] = gar[gcnt + 0] = -1;
         return pcnt;
     }
-        
+
+    /* D3 (--meth): score the ORIGINAL (unconverted) mate bases, exactly as
+     * mem_matesw_batch_post's scalar path does. Without this the batched kernel
+     * aligns the C→T/G→A-projected query (s->seq) — a strict information loss
+     * (original-C vs genomic-T is already collapsed), which degrades repeat-mate
+     * placement (wrongCHR@30 117 vs the scalar path's 88). 2-bit-encode
+     * meth_orig_seq here; the per-orientation RC in the loop below then handles
+     * it identically to the projected mate. Freed before the return. */
+    uint8_t *ms2 = NULL;
+    if (ms_orig != NULL) {
+        ms2 = (uint8_t*) malloc(l_ms);
+        assert(ms2 != NULL);
+        for (int k = 0; k < l_ms; ++k) {
+            unsigned char c = (unsigned char) ms_orig[k];
+            ms2[k] = (c < 4) ? c : nst_nt4_table[c];
+        }
+        ms = ms2;
+    }
+
     for (r = 0; r < 4; ++r)
     {
         int is_rev, is_larger;
@@ -1358,112 +1382,135 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
             //kswr_t aln;
             //mem_alnreg_t b;
             int xtra = KSW_XSUBO | KSW_XSTART | (l_ms * opt->a < 250? KSW_XBYTE : 0) | (opt->min_seed_len * opt->a);
-            int qerOffset = 0, refOffset = 0;
-            if (pcnt != 0)
+
+            /* D3 (--meth): enqueue one SW per bisulfite hypothesis (OT and OB).
+             * The two SWs share IDENTICAL ref/query BYTES (only the scoring
+             * matrix differs), but each MUST get its OWN seqBuf slice: the
+             * coordinate-recovery reverse pass in mem_sam_pe_batch_run reverses
+             * the slice IN PLACE (revseq), so a shared slice lets the
+             * first-scored hypothesis corrupt the second's bytes → the second
+             * aligns reversed garbage (qb/tb collapse to 0, spurious scores) and
+             * the mate is misplaced to the window start. The per-hi offset below
+             * (recomputed from the last enqueued pair) gives each hypothesis a
+             * distinct slice. mem_matesw_batch_post keeps the higher-scoring one.
+             * Non-meth enqueues a single pair. */
+            int n_hyp = (opt->meth_mode && meth_batched_rescue_enabled()) ? 2 : 1;
+            for (int hi = 0; hi < n_hyp; ++hi)
             {
+                int qerOffset = 0, refOffset = 0;
+                if (pcnt != 0)
+                {
+                    SeqPair prev = seqPairArray[pcnt - 1];
+                    refOffset = prev.idr + prev.len1;
+                    qerOffset = prev.idq + prev.len2;
+                }
                 SeqPair sp;
-                sp = seqPairArray[pcnt - 1];
-                refOffset = sp.idr + sp.len1;
-                qerOffset = sp.idq + sp.len2;
+                sp.h0 = xtra;
+                // assert(pcnt < BATCH_SIZE * SEEDS_PER_READ);
+                // Array is allocated (*wsize_pair + MAX_LINE_LEN); the +1024 grow
+                // below keeps pcnt <= *wsize_pair, but both-hypothesis rescue can
+                // momentarily hit pcnt == *wsize_pair before that grow fires, so
+                // bound against the true allocation to avoid a debug false-positive.
+                assert(pcnt < *wsize_pair + MAX_LINE_LEN);
+            
+                sp.idq = qerOffset;
+                sp.idr = refOffset;
+                sp.len1 = re - rb;
+                sp.len2 = l_ms;
+                sp.id = sp.score = sp.seqid = sp.gtle = sp.tle = sp.qle = sp.max_off = sp.gscore = -1; // not needed, remove while code cleaning
+            
+                assert(sp.len1 >= 0 && sp.len2 >= 0);
+                if (refOffset + sp.len1 >= *wsize_buf_ref)
+                {
+                    fprintf(stderr, "[0000][%0.4d] Re-allocating (doubling) seqBufRefs in %s\n",
+                            tid, __func__);
+                    int64_t tmp = *wsize_buf_ref;
+                    *wsize_buf_ref *= 2;
+
+                    uint8_t *seqBufRef_ = (uint8_t*)
+                        _mm_realloc(seqBufRef, tmp, *wsize_buf_ref, sizeof(uint8_t)); 
+                    mmc->seqBufLeftRef[tid*CACHE_LINE] = seqBufRef = seqBufRef_;
+
+                    seqBufRef_ = (uint8_t*)
+                        _mm_realloc(mmc->seqBufRightRef[tid*CACHE_LINE], tmp,
+                                    *wsize_buf_ref, sizeof(uint8_t)); 
+                    mmc->seqBufRightRef[tid*CACHE_LINE] = seqBufRef_;               
+                }
+            
+                if (qerOffset + sp.len2 >= *wsize_buf_qer)
+                {
+                    fprintf(stderr, "[0000][%0.4d] Re-allocating (doubling) seqBufQers in %s\n",
+                            tid, __func__);
+                    int64_t tmp = *wsize_buf_qer;
+                    *wsize_buf_qer *= 2;
+
+                    uint8_t *seqBufQer_ = (uint8_t*)
+                        _mm_realloc(seqBufQer, tmp, *wsize_buf_qer, sizeof(uint8_t)); 
+                    mmc->seqBufLeftQer[tid*CACHE_LINE] = seqBufQer = seqBufQer_;
+
+                    seqBufQer_ = (uint8_t*)
+                        _mm_realloc(mmc->seqBufRightQer[tid*CACHE_LINE], tmp,
+                                    *wsize_buf_qer, sizeof(uint8_t)); 
+                    mmc->seqBufRightQer[tid*CACHE_LINE] = seqBufQer_;               
+                }
+            
+                if (pcnt >= *wsize_pair)
+                {
+                    fprintf(stderr, "[0000][%0.4d] Re-allocating seqPairs in %s\n", tid, __func__);
+                    *wsize_pair += 1024;
+                    mmc->seqPairArrayAux[tid] = (SeqPair *) realloc(mmc->seqPairArrayAux[tid],
+                                                        (*wsize_pair + MAX_LINE_LEN)
+                                                        * sizeof(SeqPair));
+                    mmc->seqPairArrayLeft128[tid] = (SeqPair *) realloc(mmc->seqPairArrayLeft128[tid],
+                                                        (*wsize_pair + MAX_LINE_LEN)
+                                                        * sizeof(SeqPair));
+                    mmc->seqPairArrayRight128[tid] = (SeqPair *) realloc(mmc->seqPairArrayRight128[tid],
+                                                        (*wsize_pair + MAX_LINE_LEN)
+                                                        * sizeof(SeqPair));
+                    seqPairArray = mmc->seqPairArrayLeft128[tid];
+                    gar = (int32_t*) (mmc->seqPairArrayAux[tid]);               
+                }
+
+                if (maxRefLen < sp.len1) maxRefLen = sp.len1;
+                if (maxQerLen < sp.len2) maxQerLen = sp.len2;
+            
+                uint8_t *qs = seqBufQer + sp.idq;
+                uint8_t *rs = seqBufRef + sp.idr;
+                for (int l=0; l<sp.len1; l++) rs[l] = ref[l];
+                for (int l=0; l<sp.len2; l++) qs[l] = seq[l];
+
+                /* Task 5: tag the enqueued meth pair with the rescued mate's
+                 * bisulfite hypothesis = OPPOSITE strand of the anchor `a`
+                 * (mem_opt_meth_mat(opt, !a->meth_hypothesis) — the exact value
+                 * mem_matesw_batch_post's scalar fallback already uses to pick
+                 * rmat). is_rev was already baked into a->meth_hypothesis upstream,
+                 * so we reuse it verbatim and do NOT re-derive strand logic here.
+                 *
+                 * Under --meth every chain that survives to mate rescue carries a
+                 * real hypothesis (a->meth_hypothesis ∈ {0,1}): meth_seed_to_orig
+                 * either remaps a seed with a concrete hypothesis or drops it, so a
+                 * negative hypothesis never reaches an enqueued anchor. The tag is
+                 * therefore always in {0,1} under --meth, which the OT/OB partition
+                 * in mem_sam_pe_batch requires. Non-meth pairs keep the SeqPair
+                 * default (-1), which the kernels ignore. The assert documents the
+                 * invariant; mem_sam_pe_batch additionally guards it at runtime so a
+                 * future violation fails loud instead of silently dropping a pair. */
+                /* Both-hypothesis: hi selects OT/OB (meth_hyp = hi). Under --meth
+                 * n_hyp==2, so hi enumerates {OB=0, OT=1}; non-meth keeps -1. */
+                sp.meth_hyp = opt->meth_mode ? (int8_t)hi : (int8_t)-1;
+                assert(!opt->meth_mode || sp.meth_hyp == 0 || sp.meth_hyp == 1);
+
+                /* gar[gcnt+r] points at the FIRST (hi==0) hypothesis's regid; the
+                 * second is at regid+1. mem_matesw_batch_post reads both. */
+                if (hi == 0) gar[gcnt + r] = pcnt;
+                sp.regid = pcnt;
+                seqPairArray[pcnt++] = sp;
             }
-
-            SeqPair sp;
-            sp.h0 = xtra;
-            // assert(pcnt < BATCH_SIZE * SEEDS_PER_READ);
-            assert(pcnt < *wsize_pair);
-            
-            sp.idq = qerOffset;
-            sp.idr = refOffset;
-            sp.len1 = re - rb;
-            sp.len2 = l_ms;
-            sp.id = sp.score = sp.seqid = sp.gtle = sp.tle = sp.qle = sp.max_off = sp.gscore = -1; // not needed, remove while code cleaning
-            
-            assert(sp.len1 >= 0 && sp.len2 >= 0);
-            if (refOffset + sp.len1 >= *wsize_buf_ref)
-            {
-                fprintf(stderr, "[0000][%0.4d] Re-allocating (doubling) seqBufRefs in %s\n",
-                        tid, __func__);
-                int64_t tmp = *wsize_buf_ref;
-                *wsize_buf_ref *= 2;
-
-                uint8_t *seqBufRef_ = (uint8_t*)
-                    _mm_realloc(seqBufRef, tmp, *wsize_buf_ref, sizeof(uint8_t)); 
-                mmc->seqBufLeftRef[tid*CACHE_LINE] = seqBufRef = seqBufRef_;
-
-                seqBufRef_ = (uint8_t*)
-                    _mm_realloc(mmc->seqBufRightRef[tid*CACHE_LINE], tmp,
-                                *wsize_buf_ref, sizeof(uint8_t)); 
-                mmc->seqBufRightRef[tid*CACHE_LINE] = seqBufRef_;               
-            }
-            
-            if (qerOffset + sp.len2 >= *wsize_buf_qer)
-            {
-                fprintf(stderr, "[0000][%0.4d] Re-allocating (doubling) seqBufQers in %s\n",
-                        tid, __func__);
-                int64_t tmp = *wsize_buf_qer;
-                *wsize_buf_qer *= 2;
-
-                uint8_t *seqBufQer_ = (uint8_t*)
-                    _mm_realloc(seqBufQer, tmp, *wsize_buf_qer, sizeof(uint8_t)); 
-                mmc->seqBufLeftQer[tid*CACHE_LINE] = seqBufQer = seqBufQer_;
-
-                seqBufQer_ = (uint8_t*)
-                    _mm_realloc(mmc->seqBufRightQer[tid*CACHE_LINE], tmp,
-                                *wsize_buf_qer, sizeof(uint8_t)); 
-                mmc->seqBufRightQer[tid*CACHE_LINE] = seqBufQer_;               
-            }
-            
-            if (pcnt >= *wsize_pair)
-            {
-                fprintf(stderr, "[0000][%0.4d] Re-allocating seqPairs in %s\n", tid, __func__);
-                *wsize_pair += 1024;
-                mmc->seqPairArrayAux[tid] = (SeqPair *) realloc(mmc->seqPairArrayAux[tid],
-                                                    (*wsize_pair + MAX_LINE_LEN)
-                                                    * sizeof(SeqPair));
-                mmc->seqPairArrayLeft128[tid] = (SeqPair *) realloc(mmc->seqPairArrayLeft128[tid],
-                                                    (*wsize_pair + MAX_LINE_LEN)
-                                                    * sizeof(SeqPair));
-                mmc->seqPairArrayRight128[tid] = (SeqPair *) realloc(mmc->seqPairArrayRight128[tid],
-                                                    (*wsize_pair + MAX_LINE_LEN)
-                                                    * sizeof(SeqPair));
-                seqPairArray = mmc->seqPairArrayLeft128[tid];
-                gar = (int32_t*) (mmc->seqPairArrayAux[tid]);               
-            }
-
-            if (maxRefLen < sp.len1) maxRefLen = sp.len1;
-            if (maxQerLen < sp.len2) maxQerLen = sp.len2;
-            
-            uint8_t *qs = seqBufQer + sp.idq;
-            uint8_t *rs = seqBufRef + sp.idr;
-            for (int l=0; l<sp.len1; l++) rs[l] = ref[l];
-            for (int l=0; l<sp.len2; l++) qs[l] = seq[l];
-
-            /* Task 5: tag the enqueued meth pair with the rescued mate's
-             * bisulfite hypothesis = OPPOSITE strand of the anchor `a`
-             * (mem_opt_meth_mat(opt, !a->meth_hypothesis) — the exact value
-             * mem_matesw_batch_post's scalar fallback already uses to pick
-             * rmat). is_rev was already baked into a->meth_hypothesis upstream,
-             * so we reuse it verbatim and do NOT re-derive strand logic here.
-             *
-             * Under --meth every chain that survives to mate rescue carries a
-             * real hypothesis (a->meth_hypothesis ∈ {0,1}): meth_seed_to_orig
-             * either remaps a seed with a concrete hypothesis or drops it, so a
-             * negative hypothesis never reaches an enqueued anchor. The tag is
-             * therefore always in {0,1} under --meth, which the OT/OB partition
-             * in mem_sam_pe_batch requires. Non-meth pairs keep the SeqPair
-             * default (-1), which the kernels ignore. The assert documents the
-             * invariant; mem_sam_pe_batch additionally guards it at runtime so a
-             * future violation fails loud instead of silently dropping a pair. */
-            sp.meth_hyp = opt->meth_mode ? (int8_t)!a->meth_hypothesis : (int8_t)-1;
-            assert(!opt->meth_mode || sp.meth_hyp == 0 || sp.meth_hyp == 1);
-
-            gar[gcnt + r] = pcnt;
-            sp.regid = pcnt;
-            seqPairArray[pcnt++] = sp;
         }
         if (rev) free(rev);
         // ref aliases ref_string (see bns_fetch_seq_v2 above); no free.
     }
+    if (ms2) free(ms2);
     return pcnt;
 }
 
@@ -1499,21 +1546,16 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
     int64_t l_pac = bns->l_pac;
     int i, r, skip[4], n = 0, rid = -1;
 
-    /* D3 (--meth, PR-6): for the scalar ksw_align2 fallback (index == -1) point
-     * the mate query at the ORIGINAL bases (ASCII meth_orig_seq, same orientation
-     * as `ms`/seq). The per-orientation RC below then reverse-complements them
-     * exactly as the projected mate. The batched SIMD scores are unaffected (they
-     * were computed in mem_sam_pe_batch from _pre's projected query). */
+    /* D3 (--meth): point the mate query at the ORIGINAL bases (ASCII
+     * meth_orig_seq, same orientation as `ms`/seq); the per-orientation RC below
+     * reverse-complements them exactly as it would the projected mate. Both the
+     * batched kswv path (mem_matesw_batch_pre now stages meth_orig_seq too) and
+     * the scalar ksw_align2 fallback (index == -1) score these ORIGINAL bases, so
+     * the two paths are byte-identical. Aligning the C→T/G→A-projected s->seq
+     * instead would be a strict information loss and degrade repeat-mate
+     * placement. Allocated AFTER the skip-all early return below so the
+     * consistent-pair fast path (the common case) does not leak it. */
     uint8_t *ms2 = NULL;
-    if (ms_orig != NULL) {
-        ms2 = (uint8_t*) malloc(l_ms);
-        assert(ms2 != NULL);
-        for (int k = 0; k < l_ms; ++k) {
-            unsigned char c = (unsigned char) ms_orig[k];
-            ms2[k] = (c < 4) ? c : nst_nt4_table[c];
-        }
-        ms = ms2;
-    }
 
     for (r = 0; r < 4; ++r) {
         skip[r] = pes[r].failed? 1 : 0;
@@ -1526,9 +1568,19 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
             skip[r] = 1;
     }
 
-    
+
     if (skip[0] + skip[1] + skip[2] + skip[3] == 4) {
         return 0; // consistent pair exist; no need to perform SW
+    }
+
+    if (ms_orig != NULL) {
+        ms2 = (uint8_t*) malloc(l_ms);
+        assert(ms2 != NULL);
+        for (int k = 0; k < l_ms; ++k) {
+            unsigned char c = (unsigned char) ms_orig[k];
+            ms2[k] = (c < 4) ? c : nst_nt4_table[c];
+        }
+        ms = ms2;
     }
 
     for (r = 0; r < 4; ++r) {
@@ -1607,6 +1659,18 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                                      opt->o_ins, opt->e_ins, xtra, 0);
                 }
                 free(ref_rw);
+            }
+            else if (opt->meth_mode) {
+                /* Both-hypothesis batched rescue (#219 correctness, SIMD speed):
+                 * mem_matesw_batch_pre enqueued OB at `index` and OT at index+1,
+                 * both scored by the OT/OB kswv partition. Keep the better, and
+                 * record the winning hypothesis so the XG/XM output layer sources
+                 * the right strand — byte-identical to the scalar both-matrix
+                 * path (index==-1 branch above). */
+                kswr_t a0 = *(*myaln + index);      // hi==0 -> mat_ob
+                kswr_t a1 = *(*myaln + index + 1);  // hi==1 -> mat_ot
+                if (a0.score >= a1.score) { aln = a0; meth_won_hyp = 0; }
+                else                      { aln = a1; meth_won_hyp = 1; }
             }
             else
                 aln = *(*myaln + index);

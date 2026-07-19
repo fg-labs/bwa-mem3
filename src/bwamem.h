@@ -455,6 +455,7 @@ int mem_sam_pe_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
 int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                          const uint8_t *pac, const mem_pestat_t pes[4],
                          const mem_alnreg_t *a, int l_ms, const uint8_t *ms,
+                         const char *ms_orig,
                          mem_alnreg_v *ma, mem_cache *mmc, int pcnt, int32_t gcnt,
                          int32_t &maxRefLen, int32_t &maxQerLen, int32_t tid);
 
