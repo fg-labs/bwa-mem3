@@ -90,6 +90,19 @@ extern uint64_t prof[10][112];
 #define DUMMY1 99
 #define DUMMY2 100
 
+// Asymmetric ambiguous-base (N) encoding for the AVX-512 16-bit permutexvar LUT
+// prepass (SBT_PREPASS16_LUT). Ref-N and query-N map to distinct codes so that
+// every reachable ref/query XOR lands in a valid 32-entry LUT slot:
+//   ACGT match           XOR 0            -> slot 0   (w_match)
+//   ACGT mismatch        XOR 1,2,3        -> slots 1..3 (w_mismatch)
+//   ref-N(15)  x ACGT    XOR 12,13,14,15  -> slots 12..15 (w_ambig)
+//   ACGT x query-N(16)   XOR 16,17,18,19  -> slots 16..19 (w_ambig)
+//   ref-N(15)  x query-N XOR 31           -> slot 31    (w_ambig)
+// This encoding is used ONLY on the symmetric (!gen_mat) hot path; the generic-
+// matrix RANK1/AMAT paths keep the legacy symmetric N=0xFFFF encoding.
+#define AMBR16 15   // ref-N  (was 0xFFFF)
+#define AMBQ16 16   // query-N (was 0xFFFF)
+
 // Build the 16-byte LUT used by SBT_PREPASS8_LUT across all 8-bit kernel
 // variants (AVX2, AVX-512BW, SSE2/NEON). Layout:
 //   [0]      = w_match    (s1 == s2, both ACGT)
@@ -106,6 +119,25 @@ static inline void build_pmat16(int8_t out[16],
     out[2] = w_mismatch;
     out[3] = w_mismatch;
     for (int i = 4; i < 16; i++) out[i] = w_ambig;
+}
+
+// Build the 32-entry int16 LUT for the AVX-512 16-bit permutexvar prepass
+// (SBT_PREPASS16_LUT). Slot layout matches the asymmetric AMBR16/AMBQ16 SoA
+// encoding (see AMBR16/AMBQ16 above). Slots unreachable by real ACGT/N data
+// (4..11, 20..30) default to w_ambig rather than 0 -- the same "filled for
+// safety" rationale as build_pmat16 for the 8-bit LUT: DUMMY-pad cells do index
+// them (DUMMY2=100 XOR ACGT -> slots 4..7), and a penalty there preserves the
+// sign the replaced SBT_PREPASS16_SYM produced for pad cells instead of leaving
+// a neutral 0. Mirrors build_pmat16 for the 8-bit LUT.
+static inline void build_pmat16_lut(int16_t out[32],
+                                    int16_t w_match, int16_t w_mismatch, int16_t w_ambig)
+{
+    for (int i = 0; i < 32; i++) out[i] = w_ambig;
+    out[0] = w_match;                                  // ACGT match
+    out[1] = out[2] = out[3] = w_mismatch;             // ACGT mismatch
+    // Already w_ambig from the default fill, listed for the record:
+    //   12..15 = ref-N (15) x ACGT, 16..19 = ACGT x query-N (16),
+    //   31     = ref-N x query-N.
 }
 
 // Build the 16-byte ASYMMETRIC substitution LUT for the generic-matrix scoring
@@ -2432,6 +2464,18 @@ void BandedPairWiseSW::smithWaterman256_16(uint16_t seq1SoA[],
         sbt11_out = _mm512_mask_blend_epi16(amb_, sbt_, w_ambig_512);   \
     }
 
+// 2-op LUT prepass: replaces the 5-op SYM sequence with an xor + 32-entry
+// permutexvar_epi16 lookup (mirrors the 8-bit SBT_PREPASS8_XOR and kswv's
+// MAIN_SAM_CODE16_OPT). Caller MUST fill the SoA with the asymmetric
+// AMBR16=15 / AMBQ16=16 N-encoding so every reachable ref/query XOR lands in a
+// valid LUT slot {0..3, 12..19, 31}. Used only on the symmetric (!gen_mat)
+// path; pmat512 is the 32-entry int16 LUT from build_pmat16_lut.
+#define SBT_PREPASS16_LUT(s1, s2, sbt11_out, pmat512)                   \
+    {                                                                   \
+        __m512i xor_ = _mm512_xor_si512(s1, s2);                        \
+        sbt11_out = _mm512_permutexvar_epi16(xor_, pmat512);            \
+    }
+
 // D3 rank-1 fast path: symmetric + a single off-diagonal freed to a match
 // (bisulfite OT/OB). Match when (ref==read) OR (ref==fr_ref AND read==fr_read);
 // no LUT, no sign-extend. Mirrors NEON/AVX2.
@@ -3582,8 +3626,16 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
         uint16_t band[SIMD_WIDTH16];        
         uint16_t qlen[SIMD_WIDTH16] __attribute__((aligned(64)));
         int32_t bsize = 0;
-        __mmask16 dmask4 = 0xFFFF;
-        
+
+        // PR: SoA N-encoding for the AVX-512 16-bit prepass. On the symmetric
+        // (!gen_mat) hot path the LUT prepass requires the asymmetric AMBR16/
+        // AMBQ16 codes; the generic-matrix (RANK1/AMAT bisulfite) paths keep the
+        // legacy symmetric N=0xFFFF. gen_mat here MUST match smithWaterman512_16.
+        const bool gen_mat16 = bsw_generic_matrix(this->mat, this->w_match, this->w_mismatch)
+                               || bsw_force_generic_matrix();
+        const uint16_t ambRef = gen_mat16 ? (uint16_t)0xFFFF : (uint16_t)AMBR16;
+        const uint16_t ambQer = gen_mat16 ? (uint16_t)0xFFFF : (uint16_t)AMBQ16;
+
         int16_t *H1 = H16_ + tid * SIMD_WIDTH16 * MAX_SEQ_LEN16;
         int16_t *H2 = H16__ + tid * SIMD_WIDTH16 * MAX_SEQ_LEN16;
 
@@ -3625,7 +3677,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
 
                 for(k = 0; k < sp.len1; k++)
                 {
-                    mySeq1SoA[k * SIMD_WIDTH16 + j] = (seq1[k] == AMBIG ? dmask4:seq1[k]);
+                    mySeq1SoA[k * SIMD_WIDTH16 + j] = (seq1[k] == AMBIG ? ambRef : seq1[k]);
                 }
                 
                 qlen[j] = sp.len2 * max;
@@ -3666,7 +3718,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
                 seq2 = seqBufQer + (int64_t)sp.idq;
                 for(k = 0; k < sp.len2; k++)
                 {
-                    mySeq2SoA[k * SIMD_WIDTH16 + j] = (seq2[k]==AMBIG?dmask4:seq2[k]);
+                    mySeq2SoA[k * SIMD_WIDTH16 + j] = (seq2[k]==AMBIG? ambQer : seq2[k]);
                 }
                 if(maxLen2 < sp.len2) maxLen2 = sp.len2;
             }
@@ -3789,6 +3841,14 @@ void BandedPairWiseSW::smithWaterman512_16(uint16_t seq1SoA[],
     build_amat16(amat_bytes, this->mat);
     __m512i amat512   = _mm512_broadcast_i32x4(_mm_load_si128((__m128i *)amat_bytes));
     __m512i three512  = _mm512_set1_epi16(3);
+
+    // PR: 32-entry int16 LUT for the symmetric-path permutexvar prepass
+    // (SBT_PREPASS16_LUT). Built once per invocation; consumed only when
+    // !gen_mat. Requires the asymmetric AMBR16/AMBQ16 SoA encoding from
+    // getScores16 (gen_mat there matches gen_mat here).
+    int16_t pmat16_lut[32] __attribute__((aligned(64)));
+    build_pmat16_lut(pmat16_lut, this->w_match, this->w_mismatch, this->w_ambig);
+    __m512i pmat16_512 = _mm512_load_si512((__m512i *) pmat16_lut);
 
     __m512i e_del512    = _mm512_set1_epi16(this->e_del);
     __m512i oe_del512   = _mm512_set1_epi16(this->o_del + this->e_del);
@@ -3946,12 +4006,14 @@ void BandedPairWiseSW::smithWaterman512_16(uint16_t seq1SoA[],
 #endif
         
         // PR 17: AVX-512 16-bit score pre-pass (fission). gen_mat branch is
-        // loop-invariant: symmetric keeps the cheap SYM prepass.
+        // loop-invariant: the symmetric path uses the 2-op permutexvar LUT
+        // (requires the asymmetric AMBR16/AMBQ16 SoA encoding); the generic-
+        // matrix RANK1/AMAT paths keep the legacy symmetric-encoding prepass.
         if (!gen_mat) {
             for (int jp = beg; jp < end; jp++) {
                 __m512i s2 = _mm512_load_si512((__m512i *)(seq2SoA + jp * SIMD_WIDTH16));
                 __m512i sbt11;
-                SBT_PREPASS16_SYM(s10, s2, sbt11, mismatch512, match512, w_ambig_512);
+                SBT_PREPASS16_LUT(s10, s2, sbt11, pmat16_512);
                 _mm512_store_si512((__m512i *)(sbt_buf + jp * SIMD_WIDTH16), sbt11);
             }
         } else if (fc.rank1) {
