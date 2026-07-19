@@ -4307,6 +4307,21 @@ _mm_blendv_epi16(__m128i x, __m128i y, __m128i mask)
         sbt11_out = _mm_blendv_epi16(sbt_, w_ambig_128, tmp_);          \
     }
 
+// 128-bit (SSE2/NEON) byte-LUT prepass: replaces the 5-op SYM sequence with a
+// single _mm_shuffle_epi8 (NEON vqtbl) over the 16-byte int8 pmat128 built by
+// build_pmat16, then a slli+srai to discard the shuffle's pmat[0] high byte and
+// sign-extend the int8 score to int16. Caller MUST fill the SoA with the small
+// asymmetric N-encoding (ref-N=AMBIG=4, query-N=8, the 8-bit path's encoding)
+// so every reachable XOR stays in [0,12] <= 15. Used only on the symmetric
+// (!gen_mat) path; RANK1/AMAT keep the legacy N=0xFFFF symmetric encoding.
+#define SBT_PREPASS16_LUT128(s1, s2, sbt11_out, pmat128) \
+    {                                                                   \
+        __m128i xor_ = _mm_xor_si128(s1, s2);                          \
+        __m128i lu_  = _mm_shuffle_epi8(pmat128, xor_);                \
+        lu_ = _mm_slli_epi16(lu_, 8);                                  \
+        sbt11_out = _mm_srai_epi16(lu_, 8);                            \
+    }
+
 // D3 rank-1 fast path: symmetric matrix plus a single off-diagonal cell freed
 // to a match (bisulfite OT/OB). The freed transition just extends the match
 // condition — match when (ref==read) OR (ref==fr_ref AND read==fr_read) — so no
@@ -4479,7 +4494,16 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
         uint16_t h0[SIMD_WIDTH16]  __attribute__((aligned(64)));
         uint16_t qlen[SIMD_WIDTH16] __attribute__((aligned(64)));
         int32_t bsize = 0;
-        
+
+        // PR: SoA N-encoding for the 128-bit 16-bit prepass. On the symmetric
+        // (!gen_mat) path the byte-LUT prepass needs the small asymmetric codes
+        // (ref-N=AMBIG=4, query-N=8, matching the 8-bit path) so XORs stay <=15;
+        // the generic-matrix (RANK1/AMAT) paths keep the legacy N=0xFFFF.
+        const bool gen_mat16 = bsw_generic_matrix(this->mat, this->w_match, this->w_mismatch)
+                               || bsw_force_generic_matrix();
+        const uint16_t ambRef = gen_mat16 ? (uint16_t)0xFFFF : (uint16_t)AMBIG;
+        const uint16_t ambQer = gen_mat16 ? (uint16_t)0xFFFF : (uint16_t)8;
+
         int16_t *H1 = H16_ + tid * SIMD_WIDTH16 * MAX_SEQ_LEN16;
         int16_t *H2 = H16__ + tid * SIMD_WIDTH16 * MAX_SEQ_LEN16;
 
@@ -4519,7 +4543,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
                 
                 for(k = 0; k < sp.len1; k++)
                 {
-                    mySeq1SoA[k * SIMD_WIDTH16 + j] = (seq1[k] == AMBIG?0xFFFF:seq1[k]);
+                    mySeq1SoA[k * SIMD_WIDTH16 + j] = (seq1[k] == AMBIG ? ambRef : seq1[k]);
                 }
                 qlen[j] = sp.len2 * max;
                 if(maxLen1 < sp.len1) maxLen1 = sp.len1;
@@ -4562,7 +4586,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
                 seq2 = seqBufQer + (int64_t)sp.idq;             
                 for(k = 0; k < sp.len2; k++)
                 {
-                    mySeq2SoA[k * SIMD_WIDTH16 + j] = (seq2[k]==AMBIG?0xFFFF:seq2[k]);
+                    mySeq2SoA[k * SIMD_WIDTH16 + j] = (seq2[k] == AMBIG ? ambQer : seq2[k]);
                 }
                 if(maxLen2 < sp.len2) maxLen2 = sp.len2;
             }
@@ -4685,6 +4709,13 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
     build_amat16(amat_bytes, this->mat);
     __m128i amat128 = _mm_load_si128((__m128i *)amat_bytes);
     __m128i three128 = _mm_set1_epi16(3);                    // ACGT mask (base <= 3)
+
+    // PR: 16-byte int8 LUT for the symmetric-path byte-LUT prepass
+    // (SBT_PREPASS16_LUT128). Reuses build_pmat16 (the 8-bit XOR LUT); the small
+    // asymmetric N-encoding (ref-N=4, query-N=8) from getScores16 keeps XOR<=15.
+    int8_t pmat16_bytes[16] __attribute__((aligned(16)));
+    build_pmat16(pmat16_bytes, (int8_t)this->w_match, (int8_t)this->w_mismatch, (int8_t)this->w_ambig);
+    __m128i pmat16_128 = _mm_load_si128((__m128i *)pmat16_bytes);
 
     __m128i e_del128    = _mm_set1_epi16(this->e_del);
     __m128i oe_del128   = _mm_set1_epi16(this->o_del + this->e_del);
@@ -4839,7 +4870,7 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
             for (int jp = beg; jp < end; jp++) {
                 __m128i s2 = _mm_load_si128((__m128i *)(seq2SoA + jp * SIMD_WIDTH16));
                 __m128i sbt11;
-                SBT_PREPASS16_SYM(s10, s2, sbt11, mismatch128, match128, w_ambig_128, ff128);
+                SBT_PREPASS16_LUT128(s10, s2, sbt11, pmat16_128);
                 _mm_store_si128((__m128i *)(sbt_buf + jp * SIMD_WIDTH16), sbt11);
             }
         } else if (fc.rank1) {
