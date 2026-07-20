@@ -85,6 +85,10 @@ typedef struct {
 	 * SAM/XM emitters. Storing `seq` projected-forward while CIGAR/MD describe
 	 * the original (or vice versa) yields an internally inconsistent BAM. */
 	char  *meth_orig_seq;
+	/* --meth (D3) only: the read's bisulfite chemistry from read number
+	 * (R1 = 1 = OT/C->T, R2 = 0 = OB/G->A; SE = R1). -1 for non-meth. Used by the
+	 * seed-chemistry filter in meth_seed_to_orig to drop cross-chemistry seeds. */
+	int8_t meth_base_ot;
 } bseq1_t;
 
 extern int bwa_verbose;

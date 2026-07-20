@@ -52,6 +52,10 @@ static inline char *fr_dup_field(const char *src, size_t len)
 static inline void fr_rec_to_bseq1(const fr_fastq_rec_t *r, bseq1_t *s)
 {
     memset(s, 0, sizeof(*s));
+    /* Honor the bseq1_t.meth_base_ot -1 sentinel ("non-meth") from bwa.h: the
+     * memset above would otherwise leave it 0, which the seed-chemistry filter
+     * reads as OB. --meth ingest overwrites it with the read-number 0/1. */
+    s->meth_base_ot = -1;
     size_t name_l = fr_trim_readno_len(r->name, r->name_l);
     s->name    = fr_dup_field(r->name, name_l);
     s->comment = r->comment_l ? fr_dup_field(r->comment, r->comment_l) : 0;
