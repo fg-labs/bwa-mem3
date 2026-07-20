@@ -58,13 +58,23 @@ Input/output options:
                  specify the mean, standard deviation (10% of the mean if absent), max
                  (4 sigma from the mean if absent) and min of the insert size distribution.
                  FR orientation only. [inferred]
-Bisulfite (--meth) options:
-   --meth        enable inline bwameth-style C→T/G→A read conversion + meth-aware BAM
+Methylation (--meth) options:
+   --meth[=CHEM] enable inline bwameth-style C→T/G→A read conversion + meth-aware BAM
                  emission. Implies --bam. Requires the reference to have been built
                  with `bwa-mem3 index --meth` (emits the original index plus a
                  ref.fa.meth.* converted seed index).
+                 CHEM selects the chemistry and thus the XM:Z call polarity:
+                   emseq  bisulfite/EM-seq, UNmethylated C converts [default]
+                          (aliases: em-seq, bisulfite)
+                   taps   TET-assisted pyridine borane, METHYLATED C converts;
+                          also defaults --meth-scoring to genomic
+                 NOTE: use --meth=taps (with '='), not --meth taps. Running TAPS
+                 data without =taps inverts every methylation call.
    --meth-scoring collapsed|genomic
-                 bisulfite scoring mode [collapsed]. collapsed: C/T (and G/A)
+                 scoring mode. Default depends on chemistry: collapsed for
+                 --meth/--meth=emseq, genomic for --meth=taps (TAPS conversions
+                 are sparse, so collapsing costs specificity it can't repay).
+                 collapsed: C/T (and G/A)
                  interchangeable, bwameth-compatible placement (sets -B 2).
                  genomic: free only the conversion direction, keep variants as
                  mismatches (variant-aware, truthful NM/MD; -B 4).

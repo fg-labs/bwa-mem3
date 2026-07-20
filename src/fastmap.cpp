@@ -42,6 +42,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "FMI_search.h"
 #include "bam_writer.h"
 #include "meth_bam.h"
+#include "meth_xm.h"   /* meth_chem_t for --meth=emseq|taps */
 #include "stage_prof.h"
 #include "seed_order.h"
 #include "version.h"
@@ -987,13 +988,23 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "                 specify the mean, standard deviation (10%% of the mean if absent), max\n");
     fprintf(stderr, "                 (4 sigma from the mean if absent) and min of the insert size distribution.\n");
     fprintf(stderr, "                 FR orientation only. [inferred]\n");
-    fprintf(stderr, "Bisulfite (--meth) options:\n");
-    fprintf(stderr, "   --meth        enable inline bwameth-style C→T/G→A read conversion + meth-aware BAM\n");
+    fprintf(stderr, "Methylation (--meth) options:\n");
+    fprintf(stderr, "   --meth[=CHEM] enable inline bwameth-style C→T/G→A read conversion + meth-aware BAM\n");
     fprintf(stderr, "                 emission. Implies --bam. Requires the reference to have been built\n");
     fprintf(stderr, "                 with `bwa-mem3 index --meth` (emits the original index plus a\n");
     fprintf(stderr, "                 ref.fa.meth.* converted seed index).\n");
+    fprintf(stderr, "                 CHEM selects the chemistry and thus the XM:Z call polarity:\n");
+    fprintf(stderr, "                   emseq  bisulfite/EM-seq, UNmethylated C converts [default]\n");
+    fprintf(stderr, "                          (aliases: em-seq, bisulfite)\n");
+    fprintf(stderr, "                   taps   TET-assisted pyridine borane, METHYLATED C converts;\n");
+    fprintf(stderr, "                          also defaults --meth-scoring to genomic\n");
+    fprintf(stderr, "                 NOTE: use --meth=taps (with '='), not --meth taps. Running TAPS\n");
+    fprintf(stderr, "                 data without =taps inverts every methylation call.\n");
     fprintf(stderr, "   --meth-scoring collapsed|genomic\n");
-    fprintf(stderr, "                 bisulfite scoring mode [collapsed]. collapsed: C/T (and G/A)\n");
+    fprintf(stderr, "                 scoring mode. Default depends on chemistry: collapsed for\n");
+    fprintf(stderr, "                 --meth/--meth=emseq, genomic for --meth=taps (TAPS conversions\n");
+    fprintf(stderr, "                 are sparse, so collapsing costs specificity it can't repay).\n");
+    fprintf(stderr, "                 collapsed: C/T (and G/A)\n");
     fprintf(stderr, "                 interchangeable, bwameth-compatible placement (sets -B 2).\n");
     fprintf(stderr, "                 genomic: free only the conversion direction, keep variants as\n");
     fprintf(stderr, "                 mismatches (variant-aware, truthful NM/MD; -B 4).\n");
@@ -1147,7 +1158,7 @@ int main_mem(int argc, char *argv[])
         {"skip-contained-ext",       no_argument,       0, OPT_SKIP_CONTAINED_EXT},
         {"adaptive-band",            no_argument,       0, OPT_ADAPTIVE_BAND},
         {"extend-mate-concordant",   optional_argument, 0, OPT_EXTEND_MATE_CONCORDANT},
-        {"meth",                     no_argument,       0, OPT_METH},
+        {"meth",                     optional_argument, 0, OPT_METH},
         {"meth-scoring",             required_argument, 0, OPT_METH_SCORING},
         {"set-as-failed",            required_argument, 0, OPT_METH_SET_AS_FAILED},
         {"chimera-qc",               no_argument,       0, OPT_METH_CHIMERA_QC},
@@ -1295,12 +1306,31 @@ int main_mem(int argc, char *argv[])
         else if (c == OPT_METH) {
             opt->meth_mode = 1;
             opt->bam_mode = 1;  /* meth implies BAM output */
+            /* Optional chemistry argument. getopt_long's optional_argument only
+             * accepts the `--meth=taps` form (a separate word is treated as a
+             * positional), so a bare `--meth` leaves optarg NULL => em-seq. */
+            if (optarg != NULL) {
+                if (strcmp(optarg, "emseq") == 0 || strcmp(optarg, "em-seq") == 0
+                        || strcmp(optarg, "bisulfite") == 0) {
+                    opt->meth_chem = METH_CHEM_EMSEQ;
+                } else if (strcmp(optarg, "taps") == 0) {
+                    opt->meth_chem = METH_CHEM_TAPS;
+                } else {
+                    fprintf(stderr, "ERROR: --meth accepts 'emseq' (default) or 'taps', got '%s'\n"
+                                    "       note: use --meth=taps, not --meth taps\n", optarg);
+                    free(opt);
+                    if (out_opened) fclose(aux.fp);
+                    return 1;
+                }
+            }
         }
         else if (c == OPT_METH_SCORING) {
             if (optarg != NULL && strcmp(optarg, "collapsed") == 0) {
                 opt->meth_scoring = MEM_METH_SCORING_COLLAPSED;
+                opt0.meth_scoring = 1;
             } else if (optarg != NULL && strcmp(optarg, "genomic") == 0) {
                 opt->meth_scoring = MEM_METH_SCORING_GENOMIC;
+                opt0.meth_scoring = 1;
             } else {
                 fprintf(stderr, "ERROR: --meth-scoring requires 'collapsed' or 'genomic'\n");
                 free(opt);
@@ -1529,6 +1559,18 @@ int main_mem(int argc, char *argv[])
      * scaled by opt->a inside mem_opt_apply_meth_defaults — see bwamem.h. Before
      * that, they were applied flat and silently discarded -A. */
     if (opt->meth_mode) {
+        /* TAPS defaults to GENOMIC scoring. TAPS converts only the METHYLATED
+         * cytosines, so conversions are ~20-30x rarer than under em-seq (measured:
+         * 3.2% of C vs 94.6% on chr22 @ 12x). The collapsed 3-letter alphabet buys
+         * little at that density and costs specificity, and the measurement agrees:
+         * on 4.07M simulated TAPS reads vs full hg38, genomic placed 95.72% vs
+         * collapsed's 95.40% (plain: 95.53%), and put 136k more reads in the
+         * MAPQ 60+ bin at higher accuracy. An explicit --meth-scoring still wins.
+         * Set before mem_opt_apply_meth_defaults so its COLLAPSED -B 2 branch keys
+         * off the resolved scoring mode. See
+         * reports/2026-07-20-taps-alignment-experiment-results.md. */
+        if (opt->meth_chem == METH_CHEM_TAPS && !opt0.meth_scoring)
+            opt->meth_scoring = MEM_METH_SCORING_GENOMIC;
         /* Scored defaults live in mem_opt_apply_meth_defaults so they scale with
          * -A (bwameth's constants assume a==1) and can be unit-tested. */
         mem_opt_apply_meth_defaults(opt, &opt0);

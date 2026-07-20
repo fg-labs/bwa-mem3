@@ -59,6 +59,22 @@ Per-base methylation call. Each character corresponds to one SEQ base:
 | `u` / `U` | unmethylated / methylated C in unknown context (N within 1 or 2 bp downstream of the C, on the read's source strand) |
 | `.`       | non-C reference at this position, sequencing mismatch (read base ≠ C/T at a ref C), insertion, soft clip, or N at the C position itself |
 
+> **Case depends on the chemistry.** Which observed base means "methylated" is
+> inverted between EM-seq and TAPS, so the same read yields opposite-case `XM:Z`
+> under `--meth` and `--meth=taps`:
+>
+> | Read base at a reference C | `--meth` (em-seq) | `--meth=taps` |
+> |---|---|---|
+> | `C` (retained) | methylated (`Z`) | **un**methylated (`z`) |
+> | `T` (converted) | **un**methylated (`z`) | methylated (`Z`) |
+>
+> The *context* letters (`z`/`x`/`h`/`u`) are chemistry-independent — they come
+> from the reference. Only the case flips. Running TAPS data without `=taps`
+> therefore produces a fully inverted call string (measured: Pearson r = −0.956
+> against truth, versus +0.956 with `=taps`), and percent methylation comes out
+> as `1 − truth` with no warning. See
+> [Flags](flags.md#--methemseqtaps).
+
 The string is in SEQ orientation (matches the BAM SEQ field): for reads
 with the `0x10` flag set, both SEQ and `XM:Z` are reverse-complemented
 relative to FASTQ-original orientation.

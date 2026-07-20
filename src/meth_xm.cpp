@@ -44,9 +44,32 @@ static thread_local ks_scratch_t t_xm_scratch;
  * (= forward-genome orientation per BAM convention).
  */
 static const char C_MARKER[2]       = {'G', 'C'};  /* [bottom, top] */
-static const char METH_MARKER[2]    = {'G', 'C'};
-static const char UNMETH_MARKER[2]  = {'A', 'T'};
 static const char CTX_CPG_MARKER[2] = {'C', 'G'};
+
+/* Methylated / unmethylated read base, indexed [chemistry][is_top_strand].
+ *
+ * Both chemistries convert the same way as far as the ALIGNER is concerned
+ * (ref C -> read T on top, ref G -> read A on bottom), which is why seeding,
+ * the converted index and the scoring matrices are shared. They differ only in
+ * WHICH cytosines convert, and that inverts the meaning of the observed base:
+ *
+ *   EMSEQ: unmethylated C converts, so a RETAINED C reads as methylated and a
+ *          converted T reads as unmethylated.
+ *   TAPS:  methylated 5mC/5hmC converts, so a retained C reads as UNmethylated
+ *          and a converted T reads as METHYLATED — the exact inverse.
+ *
+ * Only these two tables are chemistry-dependent. C_MARKER (which base is the
+ * cytosine of interest on each strand) and CTX_CPG_MARKER (context
+ * classification) are properties of the REFERENCE, not of the chemistry, so
+ * CpG/CHG/CHH assignment is identical either way. */
+static const char METH_MARKER[2][2] = {
+    /* [METH_CHEM_EMSEQ] */ {'G', 'C'},   /* retained base  = methylated   */
+    /* [METH_CHEM_TAPS]  */ {'A', 'T'},   /* converted base = methylated   */
+};
+static const char UNMETH_MARKER[2][2] = {
+    /* [METH_CHEM_EMSEQ] */ {'A', 'T'},   /* converted base = unmethylated */
+    /* [METH_CHEM_TAPS]  */ {'G', 'C'},   /* retained base  = unmethylated */
+};
 
 /* D3 (--meth, PR-5): slice forward-genome ASCII bases [st, en) of contig
  * `real_tid` directly from the ORIGINAL (un-converted) bns + 2-bit pac,
@@ -110,7 +133,8 @@ extern "C"
 char *meth_build_xm(const bntseq_t *bns, const uint8_t *pac, int real_tid,
                     int64_t pos, int is_top_strand,
                     const uint32_t *bam_cigar, int n_cigar,
-                    const char *seq_text, int l_emit)
+                    const char *seq_text, int l_emit,
+                    meth_chem_t chem)
 {
     if (bns == NULL || pac == NULL || bam_cigar == NULL
             || seq_text == NULL || l_emit <= 0)
@@ -144,9 +168,12 @@ char *meth_build_xm(const bntseq_t *bns, const uint8_t *pac, int real_tid,
     int r = 0;        /* read cursor (index into seq_text and into xm) */
     int64_t t = 0;    /* ref cursor (offset from `pos` on forward strand) */
     int idx = is_top_strand ? 1 : 0;
+    /* Clamp defensively: an out-of-range chemistry must not index off the end
+     * of the marker tables. Unknown values fall back to em-seq, the default. */
+    int cidx = (chem == METH_CHEM_TAPS) ? METH_CHEM_TAPS : METH_CHEM_EMSEQ;
     char c_marker      = C_MARKER[idx];
-    char meth_marker   = METH_MARKER[idx];
-    char unmeth_marker = UNMETH_MARKER[idx];
+    char meth_marker   = METH_MARKER[cidx][idx];
+    char unmeth_marker = UNMETH_MARKER[cidx][idx];
     char cpg_marker    = CTX_CPG_MARKER[idx];
 
     for (int i = 0; i < n_cigar && r < l_emit; ++i) {
