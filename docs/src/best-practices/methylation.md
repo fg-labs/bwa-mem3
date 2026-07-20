@@ -58,10 +58,15 @@ bwa-mem3 mem --meth --chimera-qc -t 16 ref.fa R1.fq.gz R2.fq.gz \
 
 > **Note — Overrides are positional**
 >
-> Flags supplied after `--meth` on the command line override the defaults set by
-> `--meth`. For example, `bwa-mem3 mem --meth -B 4 ...` uses `-B 4` (not 2).
+> Scoring flags supplied after `--meth` on the command line override the defaults
+> set by `--meth`. For example, `bwa-mem3 mem --meth -B 4 ...` uses `-B 4` (not 2).
 > Flags supplied before `--meth` are silently overwritten by `--meth`'s defaults,
 > so always place overrides after `--meth`.
+>
+> This applies to `-B`, `-L`, `-U`, and `-T`. It does **not** apply to `-M` and
+> `-C`: bwa has no option that unsets either one, so `--meth` sets them
+> unconditionally and they cannot be turned off from the command line. See
+> [Flags → `-M` and split alignments](../methylation/flags.md#-m-and-split-alignments).
 
 ## Downstream tool compatibility
 

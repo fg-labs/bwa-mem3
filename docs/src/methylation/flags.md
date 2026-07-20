@@ -130,6 +130,31 @@ bwameth.py's chimera logic always runs.
 | `--set-as-failed` strand matches | Yes | No | No |
 | Both `--chimera-qc` + `--set-as-failed` active | Yes | Yes | Yes (≤1) |
 
+## `-M` and split alignments
+
+`--meth` sets `-M` and `-C` unconditionally (bwa has no option that unsets
+either), so unlike the scoring defaults these two cannot be overridden.
+
+`-M` changes how a split (chimeric) hit is **flagged**, not whether it is
+emitted: supplementary (`0x800`) becomes secondary (`0x100`). The record is
+otherwise identical — `SA:Z`, SEQ, QUAL, `NM`/`MD` and the methylation tags are
+all retained. So `samtools flagstat` on a `--meth` BAM always reports
+`0 supplementary`, and anything selecting split-read evidence by the `0x800` bit
+will miss it. Methylation calling is unaffected.
+
+> **Note — on short reads, `-T 40` filters far more split hits than `-M` does**
+>
+> A split arm covers only part of the read, so its score scales with arm length;
+> below `T` it is dropped outright, before `-M` is consulted. On 1M Twist EM-seq
+> pairs (75 bp) vs hg38, `--meth` emitted 94 split records against 4039 at
+> `-T 30` — and of those 4039, 3945 scored `AS < 40` versus 94 at `AS >= 40`,
+> exactly the default-threshold survivors. (`-L 10` accounts for ~18 more.)
+>
+> The effect shrinks with read length — a 150 bp read splits into ~75 bp arms
+> scoring well clear of 40 — though that has not been measured. To recover
+> chimeric evidence for SV calling, pass `-T 30` (optionally `-L 5`) after
+> `--meth` and accept divergence from bwameth placement.
+
 ## `-V` reference annotation `XR:Z` is suppressed under `--meth`
 
 `bwa-mem3 mem -V` normally emits the contig annotation as an `XR:Z`
