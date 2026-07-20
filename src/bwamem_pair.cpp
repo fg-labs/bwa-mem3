@@ -162,14 +162,20 @@ int mem_matesw(const mem_opt_t *opt, const bntseq_t *bns,
                const uint8_t *pac, const mem_pestat_t pes[4],
                const mem_alnreg_t *a, int l_ms, const uint8_t *ms,
                mem_alnreg_v *ma, const char *ms_orig = NULL,
-               const int8_t *mat = NULL)
+               const int8_t *mat = NULL, int mate_meth_ot = -1)
 {
-    /* D3 (--meth, PR-6): the mate-rescue dedup at the bottom of this function
-     * still passes mat=NULL (resolving to opt->mat) — but those calls pass
+    /* D3 (--meth): the mate-rescue dedup at the bottom of this function still
+     * passes mat=NULL (resolving to opt->mat) — but those calls pass
      * bns/pac/query = 0 (dedup-only, no patch SW), so the matrix is unused
-     * there regardless; leaving them on opt->mat is correct. The per-hypothesis
-     * asymmetric scorer below uses the `mat` parameter (the caller selects the
-     * OPPOSITE-strand matrix of the anchor via mem_opt_meth_mat). */
+     * there regardless; leaving them on opt->mat is correct.
+     *
+     * The per-hypothesis scorer below no longer consults the `mat` parameter
+     * under --meth: it derives the matrix from the rescued mate's own read#
+     * chemistry (mate_meth_ot ^ is_rev — see the use_mat selection below). The
+     * caller-supplied `mat` (rmat = mem_opt_meth_mat(opt, !a->meth_hypothesis)
+     * in mem_pair_resolve) is therefore dead code under --meth: it is discarded
+     * here and recomputed from the mate read#. sw_mat/`mat` survives only as the
+     * non-meth default. */
     /* Outside --meth, mat is NULL and ms_orig is NULL: behavior is byte-for-byte
      * identical to the historical symmetric/projected mate rescue. */
     const int8_t *sw_mat = mat ? mat : opt->mat;
@@ -251,26 +257,36 @@ int mem_matesw(const mem_opt_t *opt, const bntseq_t *bns,
             mem_alnreg_t b;
             int tmp, xtra = KSW_XSUBO | KSW_XSTART | (l_ms * opt->a < 250? KSW_XBYTE : 0) | (opt->min_seed_len * opt->a);
 
+            /* D3 (--meth): score the rescued mate under ITS OWN read-number
+             * chemistry (mate_meth_ot: R1=1/OT, R2=0/OB), flipped by the rescue
+             * strand because this path RC's the READ (seq=rev) against the forward
+             * reference window. One SW pass with the correct matrix — no try-both:
+             * the mate's read# is the chemistry that frees its conversions at its
+             * true locus, so the crippling that a wrong seed-derived guess caused
+             * cannot happen. matesw_hyp is the genome-strand hypothesis recorded on
+             * the rescued alnreg for the XG/XM output layer. */
+            const int8_t *use_mat = sw_mat;
+            int matesw_hyp = -1;
+            if (opt->meth_mode && mate_meth_ot >= 0) {
+                matesw_hyp = (mate_meth_ot ^ is_rev) & 1;
+                use_mat = mem_opt_meth_mat(opt, matesw_hyp);
+            }
             assert(ref !=0 && re - rb >= 0);
             aln = ksw_align2(l_ms, seq, re - rb, ref, 5,
-                             sw_mat, opt->o_del, opt->e_del,
+                             use_mat, opt->o_del, opt->e_del,
                              opt->o_ins, opt->e_ins, xtra, 0);
 
             memset(&b, 0, sizeof(mem_alnreg_t));
             if (aln.score >= opt->min_seed_len && aln.qb >= 0) { // something goes wrong if aln.qb < 0
                 b.rid = a->rid;
                 b.is_alt = a->is_alt;
-                /* D3 (--meth, PR-6, B3): the rescued mate's hypothesis is the
-                 * OPPOSITE strand of the anchor for directional libraries
-                 * (R1→OT, R2→OB): rescuing an OT anchor's mate uses OB and vice
-                 * versa. The caller selects sw_mat = mem_opt_meth_mat(opt,
-                 * !anchor_hyp) accordingly; record !a->meth_hypothesis here so
-                 * the output layer (XG/XM) sources the right strand. -1 anchor
-                 * (non-meth) stays -1. Single hypothesis per rescue ⇒ rank-1.
-                 * Coordinates are already ORIGINAL (l_pac is the original l_pac
-                 * via the original bns), so the 6a coordinate fix holds. */
-                b.meth_hypothesis = (a->meth_hypothesis < 0) ? -1
-                                                             : !a->meth_hypothesis;
+                /* D3 (--meth): record the rescued mate's genome-strand hypothesis
+                 * (matesw_hyp = mate read# XOR rescue strand, computed with the SW
+                 * above) so the XG/XM output layer sources the right strand. -1
+                 * anchor (non-meth) stays -1. Coordinates are already ORIGINAL
+                 * (l_pac is the original l_pac via the original bns), so the 6a
+                 * coordinate fix holds. */
+                b.meth_hypothesis = matesw_hyp;
                 b.qb = is_rev? l_ms - (aln.qe + 1) : aln.qb;
                 b.qe = is_rev? l_ms - aln.qb : aln.qe + 1;
                 b.rb = is_rev? (l_pac<<1) - (rb + aln.te + 1) : rb + aln.tb;
@@ -474,14 +490,16 @@ int mem_pair_resolve(const mem_opt_t *opt, const bntseq_t *bns,
             sort_alnreg_re(a[!i].n, a[!i].a);
             int val = 0, swcount = 0;
             for (j = 0; j < b[i].n && j < opt->max_matesw; ++j) {
-                /* D3 (--meth, PR-6, B3): rescue read !i against original ref using
-                 * its ORIGINAL bases and the OPPOSITE-strand matrix of anchor
-                 * b[i].a[j] (R1→OT / R2→OB ⇒ mate uses the other). Outside --meth
-                 * these stay NULL and mem_matesw is identical to before. */
+                /* D3 (--meth): rescue read !i against the original ref using its
+                 * ORIGINAL bases (ms_orig). `rmat` is vestigial — mem_matesw now
+                 * derives the matrix from the mate's own read# chemistry
+                 * (mate_meth_ot ^ is_rev) and discards `mat` under --meth, so rmat
+                 * is dead code (recomputed inside mem_matesw). Outside --meth both
+                 * stay NULL and mem_matesw is identical to before. */
                 const char  *ms_orig = opt->meth_mode ? s[!i].meth_orig_seq : NULL;
                 const int8_t *rmat    = opt->meth_mode
                     ? mem_opt_meth_mat(opt, !b[i].a[j].meth_hypothesis) : NULL;
-                int val = mem_matesw(opt, bns, pac, pes, &b[i].a[j], s[!i].l_seq, (uint8_t*)s[!i].seq, &a[!i], ms_orig, rmat);
+                int val = mem_matesw(opt, bns, pac, pes, &b[i].a[j], s[!i].l_seq, (uint8_t*)s[!i].seq, &a[!i], ms_orig, rmat, opt->meth_mode ? i : -1);
                 n += val;
                 swcount += val;
             }
@@ -498,12 +516,13 @@ int mem_pair_resolve(const mem_opt_t *opt, const bntseq_t *bns,
 
         for (i = 0; i < 2; ++i)
             for (j = 0; j < b[i].n && j < opt->max_matesw; ++j) {
-                /* D3 (--meth, PR-6, B3): see MATE_SORT branch above — original
-                 * mate bases + opposite-strand matrix of the anchor. */
+                /* D3 (--meth): see MATE_SORT branch above — original mate bases;
+                 * rmat is vestigial (mem_matesw derives its matrix from the mate
+                 * read# and discards `mat` under --meth). */
                 const char  *ms_orig = opt->meth_mode ? s[!i].meth_orig_seq : NULL;
                 const int8_t *rmat    = opt->meth_mode
                     ? mem_opt_meth_mat(opt, !b[i].a[j].meth_hypothesis) : NULL;
-                int val = mem_matesw(opt, bns, pac, pes, &b[i].a[j], s[!i].l_seq, (uint8_t*)s[!i].seq, &a[!i], ms_orig, rmat);
+                int val = mem_matesw(opt, bns, pac, pes, &b[i].a[j], s[!i].l_seq, (uint8_t*)s[!i].seq, &a[!i], ms_orig, rmat, opt->meth_mode ? i : -1);
                 n += val;
             }
         #endif
@@ -740,7 +759,8 @@ int mem_sam_pe_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                                                    s[!i].l_seq, (uint8_t*)s[!i].seq,
                                                    opt->meth_mode ? s[!i].meth_orig_seq : NULL,
                                                    &a[!i], mmc, pcnt, gcnt,
-                                                   maxRefLen, maxQerLen, tid);
+                                                   maxRefLen, maxQerLen, tid,
+                                                   opt->meth_mode ? i : -1);
 
                 pcnt = val;
                 gcnt += 4;
@@ -767,10 +787,10 @@ static bool meth_batched_rescue_enabled()
 {
     static const bool enabled = []() {
         /* Default ON: meth mate rescue runs on the batched SIMD kswv path,
-         * which now scores BOTH bisulfite hypotheses (OT and OB) per rescue and
-         * keeps the better — the same correct decision as #219's scalar path but
-         * vectorized. Set BWAMEM3_METH_BATCHED_RESCUE=0 to force the scalar
-         * ksw_align2 both-matrix path (slower; used to A/B the two for parity). */
+         * which scores the rescued mate under its read#-derived bisulfite matrix
+         * (one SW per rescue). Set BWAMEM3_METH_BATCHED_RESCUE=0 to force the
+         * scalar ksw_align2 path (same single matrix; slower, used to A/B for
+         * parity). */
         const char *e = getenv("BWAMEM3_METH_BATCHED_RESCUE");
         return !(e != NULL && strcmp(e, "0") == 0);
     }();
@@ -1027,17 +1047,19 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
             sort_alnreg_re(a[!i].n, a[!i].a);
             int val = 0, swcount = 0;
             for (j = 0; j < b[i].n && j < opt->max_matesw; ++j) {
-                /* D3 (--meth, PR-6/A1, B3): original mate bases + opposite-strand
-                 * matrix of anchor b[i].a[j], honored on the scalar ksw_align2
-                 * path through which mem_matesw_batch_post scores every meth
-                 * rescue (the batched kswv enqueue is skipped under --meth). */
+                /* D3 (--meth): original mate bases (ms_orig). rmat is vestigial —
+                 * under --meth `mat` is consulted on neither path: the batched
+                 * kswv result was scored in-kernel via the per-pair sp.meth_hyp
+                 * (set in mem_matesw_batch_pre), and the scalar index==-1 fallback
+                 * derives its matrix from the mate's own read# chemistry
+                 * (mate_meth_ot ^ is_rev). So rmat is dead code under --meth. */
                 const char  *ms_orig = opt->meth_mode ? s[!i].meth_orig_seq : NULL;
                 const int8_t *rmat    = opt->meth_mode
                     ? mem_opt_meth_mat(opt, !b[i].a[j].meth_hypothesis) : NULL;
                 val = mem_matesw_batch_post(opt, bns, pac, pes, &b[i].a[j],
                                                 s[!i].l_seq, (uint8_t*)s[!i].seq,
                                                 &a[!i], myaln, gcnt, gar, mmc,
-                                                ms_orig, rmat);
+                                                ms_orig, rmat, opt->meth_mode ? i : -1);
                 n += val;
                 swcount += val;
                 // ncnt++;
@@ -1061,7 +1083,7 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                 int val = mem_matesw_batch_post(opt, bns, pac, pes, &b[i].a[j],
                                                 s[!i].l_seq, (uint8_t*)s[!i].seq,
                                                 &a[!i], myaln, gcnt, gar, mmc,
-                                                ms_orig, rmat);
+                                                ms_orig, rmat, opt->meth_mode ? i : -1);
                 n += val;
                 // ncnt++;
                 gcnt += 4;
@@ -1249,7 +1271,8 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                          const mem_alnreg_t *a, int l_ms, const uint8_t *ms,
                          const char *ms_orig,
                          mem_alnreg_v *ma, mem_cache *mmc, int pcnt, int32_t gcnt,
-                         int32_t &maxRefLen, int32_t &maxQerLen, int32_t tid)
+                         int32_t &maxRefLen, int32_t &maxQerLen, int32_t tid,
+                         int mate_meth_ot)
 {
     /* D3 (--meth, A1/PR-6 → issue 173 Task 5): _pre stages the batched-SIMD
      * mate-rescue query for the kswv getScores8/16 kernel. As of the mat-aware
@@ -1365,9 +1388,9 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
              * asymmetric matrix. The per-pair hypothesis tag (sp.meth_hyp,
              * below) drives the OT/OB partition in mem_sam_pe_batch, which runs
              * getScores8/16 once per hypothesis group with the matching object.
-             * The rescued mate uses the OPPOSITE-strand matrix of the anchor
-             * `a` (mem_opt_meth_mat(opt, !a->meth_hypothesis)), exactly as
-             * mem_matesw_batch_post's scalar fallback does. The legacy scalar
+             * The rescued mate is scored under its OWN read# chemistry
+             * (sp.meth_hyp = (mate_meth_ot ^ is_rev) & 1, set below), matching
+             * mem_matesw_batch_post's scalar index==-1 fallback. The legacy scalar
              * path remains as a safety fallback for any pair whose object
              * reports needsScalar() (rank-1 meth never does) and is reachable
              * via BWAMEM3_METH_BATCHED_RESCUE=0 (escape hatch). */
@@ -1383,18 +1406,15 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
             //mem_alnreg_t b;
             int xtra = KSW_XSUBO | KSW_XSTART | (l_ms * opt->a < 250? KSW_XBYTE : 0) | (opt->min_seed_len * opt->a);
 
-            /* D3 (--meth): enqueue one SW per bisulfite hypothesis (OT and OB).
-             * The two SWs share IDENTICAL ref/query BYTES (only the scoring
-             * matrix differs), but each MUST get its OWN seqBuf slice: the
-             * coordinate-recovery reverse pass in mem_sam_pe_batch_run reverses
-             * the slice IN PLACE (revseq), so a shared slice lets the
-             * first-scored hypothesis corrupt the second's bytes → the second
-             * aligns reversed garbage (qb/tb collapse to 0, spurious scores) and
-             * the mate is misplaced to the window start. The per-hi offset below
-             * (recomputed from the last enqueued pair) gives each hypothesis a
-             * distinct slice. mem_matesw_batch_post keeps the higher-scoring one.
-             * Non-meth enqueues a single pair. */
-            int n_hyp = (opt->meth_mode && meth_batched_rescue_enabled()) ? 2 : 1;
+            /* D3 (--meth): enqueue ONE SW, scored under the rescued mate's own
+             * read-number chemistry (mate_meth_ot: R1=1/OT, R2=0/OB) flipped by
+             * the rescue strand (this path RC's the READ, so is_rev toggles the
+             * freed cell). This is the chemistry that frees the mate's conversions
+             * at its true locus, so the single matrix is correct — replacing the
+             * old two-hypothesis (OT+OB) enqueue + keep-max, which cost 2x the
+             * rescue SW to empirically rediscover this same matrix. Non-meth also
+             * enqueues one pair. */
+            int n_hyp = 1;
             for (int hi = 0; hi < n_hyp; ++hi)
             {
                 int qerOffset = 0, refOffset = 0;
@@ -1408,7 +1428,7 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                 sp.h0 = xtra;
                 // assert(pcnt < BATCH_SIZE * SEEDS_PER_READ);
                 // Array is allocated (*wsize_pair + MAX_LINE_LEN); the +1024 grow
-                // below keeps pcnt <= *wsize_pair, but both-hypothesis rescue can
+                // below keeps pcnt <= *wsize_pair, but a rescue enqueue can
                 // momentarily hit pcnt == *wsize_pair before that grow fires, so
                 // bound against the true allocation to avoid a debug false-positive.
                 assert(pcnt < *wsize_pair + MAX_LINE_LEN);
@@ -1479,29 +1499,21 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                 for (int l=0; l<sp.len1; l++) rs[l] = ref[l];
                 for (int l=0; l<sp.len2; l++) qs[l] = seq[l];
 
-                /* Task 5: tag the enqueued meth pair with the rescued mate's
-                 * bisulfite hypothesis = OPPOSITE strand of the anchor `a`
-                 * (mem_opt_meth_mat(opt, !a->meth_hypothesis) — the exact value
-                 * mem_matesw_batch_post's scalar fallback already uses to pick
-                 * rmat). is_rev was already baked into a->meth_hypothesis upstream,
-                 * so we reuse it verbatim and do NOT re-derive strand logic here.
-                 *
-                 * Under --meth every chain that survives to mate rescue carries a
-                 * real hypothesis (a->meth_hypothesis ∈ {0,1}): meth_seed_to_orig
-                 * either remaps a seed with a concrete hypothesis or drops it, so a
-                 * negative hypothesis never reaches an enqueued anchor. The tag is
-                 * therefore always in {0,1} under --meth, which the OT/OB partition
-                 * in mem_sam_pe_batch requires. Non-meth pairs keep the SeqPair
-                 * default (-1), which the kernels ignore. The assert documents the
-                 * invariant; mem_sam_pe_batch additionally guards it at runtime so a
-                 * future violation fails loud instead of silently dropping a pair. */
-                /* Both-hypothesis: hi selects OT/OB (meth_hyp = hi). Under --meth
-                 * n_hyp==2, so hi enumerates {OB=0, OT=1}; non-meth keeps -1. */
-                sp.meth_hyp = opt->meth_mode ? (int8_t)hi : (int8_t)-1;
+                /* Tag the enqueued meth pair with a single hypothesis = the
+                 * rescued mate's read# chemistry XOR rescue strand
+                 * ((mate_meth_ot ^ is_rev) & 1) — the matrix that frees the mate's
+                 * conversions at this locus. The kswv OT/OB partition in
+                 * mem_sam_pe_batch scores this pair with the matching matrix;
+                 * mem_matesw_batch_post's scalar index==-1 fallback derives the
+                 * same value. Non-meth keeps the SeqPair default (-1), which the
+                 * kernels ignore. The tag is always in {0,1} under --meth, which
+                 * the OT/OB partition requires; the assert (and the runtime guard
+                 * in mem_sam_pe_batch) documents that invariant so a future
+                 * violation fails loud instead of silently dropping a pair. */
+                sp.meth_hyp = opt->meth_mode ? (int8_t)((mate_meth_ot ^ is_rev) & 1) : (int8_t)-1;
                 assert(!opt->meth_mode || sp.meth_hyp == 0 || sp.meth_hyp == 1);
 
-                /* gar[gcnt+r] points at the FIRST (hi==0) hypothesis's regid; the
-                 * second is at regid+1. mem_matesw_batch_post reads both. */
+                /* gar[gcnt+r] points at this rescue's single enqueued regid. */
                 if (hi == 0) gar[gcnt + r] = pcnt;
                 sp.regid = pcnt;
                 seqPairArray[pcnt++] = sp;
@@ -1519,7 +1531,7 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                           const mem_alnreg_t *a, int l_ms, const uint8_t *ms,
                           mem_alnreg_v *ma, kswr_t **myaln, int32_t gcnt,
                           int32_t *gar, mem_cache *mmc, const char *ms_orig,
-                          const int8_t *mat)
+                          const int8_t *mat, int mate_meth_ot)
 {
     extern int mem_sort_dedup_patch_rev(const mem_opt_t *opt, const bntseq_t *bns,
                                         const uint8_t *pac, uint8_t *query, int n,
@@ -1616,7 +1628,10 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
         if (a->rid == rid && re - rb >= opt->min_seed_len) { // no funny things happening
             kswr_t aln;
             mem_alnreg_t b;
-            int meth_won_hyp = (a->meth_hypothesis < 0) ? -1 : !a->meth_hypothesis;
+            // Default -1 (non-meth anchor stays -1); under --meth this is always
+            // overwritten below with the mate read#-derived hypothesis
+            // ((mate_meth_ot ^ is_rev) & 1), mirroring the scalar mem_matesw.
+            int meth_won_hyp = -1;
             int tmp, xtra = KSW_XSUBO | KSW_XSTART | (l_ms * opt->a < 250? KSW_XBYTE : 0) | (opt->min_seed_len * opt->a);
 
             //aln = **myaln;
@@ -1635,24 +1650,18 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                 uint8_t *ref_rw = (uint8_t*) malloc((size_t)ref_len);
                 assert(ref_rw != NULL);
                 memcpy(ref_rw, ref, (size_t)ref_len);
-                if (opt->meth_mode) {
-                    /* D3: the single seed-derived bisulfite hypothesis can cripple
-                     * a repeat mate's TRUE-locus rescue (its conversions unfreed ->
-                     * partial), so a decoy concordant pair wins and both mates flip
-                     * to a wrong chromosome. Score under BOTH OT/OB matrices and
-                     * keep the better, mirroring bwameth's both-strand alignment. */
-                    const int8_t *m0 = mem_opt_meth_mat(opt, 0);
-                    const int8_t *m1 = mem_opt_meth_mat(opt, 1);
-                    // ref is still in scope, read-only, and holds the same
-                    // slice bytes, so restore ref_rw directly from it between
-                    // the two hypotheses instead of an extra ref_bak copy.
-                    kswr_t a0 = ksw_align2(l_ms, seq, ref_len, ref_rw, 5, m0,
-                                           opt->o_del, opt->e_del, opt->o_ins, opt->e_ins, xtra, 0);
-                    memcpy(ref_rw, ref, (size_t)ref_len);
-                    kswr_t a1 = ksw_align2(l_ms, seq, ref_len, ref_rw, 5, m1,
-                                           opt->o_del, opt->e_del, opt->o_ins, opt->e_ins, xtra, 0);
-                    if (a0.score >= a1.score) { aln = a0; meth_won_hyp = 0; }
-                    else                      { aln = a1; meth_won_hyp = 1; }
+                if (opt->meth_mode && mate_meth_ot >= 0) {
+                    /* D3: score the rescued mate under ITS OWN read-number chemistry
+                     * (mate_meth_ot) flipped by the rescue strand (this path RC's
+                     * the READ). One SW pass with the correct matrix — the matrix
+                     * that frees the mate's conversions at its true locus, so the
+                     * true-locus cripple that a wrong guess caused cannot happen.
+                     * (Replaces the old both-matrices keep-max, which cost 2x SW to
+                     * rediscover this same matrix.) */
+                    meth_won_hyp = (mate_meth_ot ^ is_rev) & 1;
+                    const int8_t *mm = mem_opt_meth_mat(opt, meth_won_hyp);
+                    aln = ksw_align2(l_ms, seq, ref_len, ref_rw, 5, mm,
+                                     opt->o_del, opt->e_del, opt->o_ins, opt->e_ins, xtra, 0);
                 } else {
                     aln = ksw_align2(l_ms, seq, ref_len, ref_rw, 5,
                                      sw_mat, opt->o_del, opt->e_del,
@@ -1660,17 +1669,14 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                 }
                 free(ref_rw);
             }
-            else if (opt->meth_mode) {
-                /* Both-hypothesis batched rescue (#219 correctness, SIMD speed):
-                 * mem_matesw_batch_pre enqueued OB at `index` and OT at index+1,
-                 * both scored by the OT/OB kswv partition. Keep the better, and
-                 * record the winning hypothesis so the XG/XM output layer sources
-                 * the right strand — byte-identical to the scalar both-matrix
-                 * path (index==-1 branch above). */
-                kswr_t a0 = *(*myaln + index);      // hi==0 -> mat_ob
-                kswr_t a1 = *(*myaln + index + 1);  // hi==1 -> mat_ot
-                if (a0.score >= a1.score) { aln = a0; meth_won_hyp = 0; }
-                else                      { aln = a1; meth_won_hyp = 1; }
+            else if (opt->meth_mode && mate_meth_ot >= 0) {
+                /* Single-hypothesis batched rescue: mem_matesw_batch_pre enqueued
+                 * ONE pair at `index`, scored by the kswv OT/OB partition under the
+                 * mate's read# chemistry (XOR rescue strand). Read it and record the
+                 * genome-strand hypothesis for the XG/XM output layer — identical to
+                 * the scalar single-matrix path (index==-1 branch above). */
+                aln = *(*myaln + index);
+                meth_won_hyp = (mate_meth_ot ^ is_rev) & 1;
             }
             else
                 aln = *(*myaln + index);
@@ -1679,13 +1685,12 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
             if (aln.score >= opt->min_seed_len && aln.qb >= 0) { // something goes wrong if aln.qb < 0
                 b.rid = a->rid;
                 b.is_alt = a->is_alt;
-                /* D3 (--meth, PR-6, B3): rescued mate hypothesis = OPPOSITE strand
-                 * of the anchor (directional: rescuing an OT anchor's mate uses OB
-                 * and vice versa); set from !a->meth_hypothesis so the output
-                 * layer (XG/XM) sources the right strand. -1 anchor stays -1.
-                 * (Under --meth this score came from the scalar ksw_align2 path
-                 * with the asymmetric matrix — see the top of this function — so
-                 * it is fully γ-correct, not symmetric/projected.)
+                /* D3 (--meth): rescued mate hypothesis = the mate's own read#
+                 * chemistry XOR rescue strand ((mate_meth_ot ^ is_rev) & 1,
+                 * meth_won_hyp above) so the output layer (XG/XM) sources the
+                 * right strand. -1 anchor stays -1. The score came from the batched
+                 * kswv result (or the scalar ksw_align2 index==-1 fallback) under
+                 * that same single matrix — see above.
                  * Coordinates are already ORIGINAL (l_pac is the original l_pac via
                  * the original bns), so the 6a coordinate fix holds. */
                 b.meth_hypothesis = meth_won_hyp;
