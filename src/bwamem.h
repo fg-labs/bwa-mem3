@@ -457,7 +457,8 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                          const mem_alnreg_t *a, int l_ms, const uint8_t *ms,
                          const char *ms_orig,
                          mem_alnreg_v *ma, mem_cache *mmc, int pcnt, int32_t gcnt,
-                         int32_t &maxRefLen, int32_t &maxQerLen, int32_t tid);
+                         int32_t &maxRefLen, int32_t &maxQerLen, int32_t tid,
+                         int mate_meth_ot = -1);
 
 /* Given two alignment begin positions (rb) on the 2-bit-packed concat-with-
  * reverse-complement index, infer the pair orientation (0=FF, 1=FR, 2=RF,
@@ -481,7 +482,7 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                           const mem_alnreg_t *a, int l_ms, const uint8_t *ms,
                           mem_alnreg_v *ma, kswr_t **myaln, int32_t gcnt,
                           int32_t *gar, mem_cache *mmc, const char *ms_orig = NULL,
-                          const int8_t *mat = NULL);
+                          const int8_t *mat = NULL, int mate_meth_ot = -1);
 
 int mem_sam_pe(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
                const mem_pestat_t pes[4], uint64_t id, bseq1_t s[2],
