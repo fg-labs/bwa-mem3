@@ -106,8 +106,12 @@ bwa-mem3 mem --meth --meth-scoring genomic -t 16 ref.fa R1.fq.gz R2.fq.gz \
 > mode-dependent mismatch penalty: `-B 2` for `collapsed`, `-B 4` for `genomic`.
 > These mirror bwameth's `bwa mem -T 40 -B 2 -L 10 -CM` (with `-U 100` for
 > paired-end). The scoring values (`-B`, `-L`, `-U`, `-T`) can be overridden on
-> the command line after `--meth`. `-M` and `-C` cannot — bwa has no option that
-> unsets them, so `--meth` applies them unconditionally.
+> the command line, in any position relative to `--meth`. `-M` and `-C` cannot —
+> bwa has no option that unsets them, so `--meth` applies them unconditionally.
+>
+> These constants are quoted at bwa's default match score (`-A 1`, what bwameth
+> runs). Like every other score-derived default, they scale with `-A`: under
+> `-A 2` the effective values are `-L 20 -U 200 -T 80` and `-B 4`/`-B 8`.
 
 ---
 

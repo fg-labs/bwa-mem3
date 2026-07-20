@@ -81,8 +81,13 @@ pass. Output is uncompressed BAM (`wb0`) that `samtools sort` reads natively.
 `-B 2 -L 10 -U 100 -T 40 -M -C`, mirroring bwameth's `bwa mem -T 40 -B 2 -L 10
 -CM` (plus `-U 100` for paired-end). `genomic` uses the same set but keeps
 `-B 4`. The scoring parameters (`-B`, `-L`, `-U`, `-T`) can be overridden on the
-command line after `--meth`. `-M` and `-C` cannot: bwa has no option that unsets
-them, so `--meth` applies them unconditionally.
+command line, in any position relative to `--meth`. `-M` and `-C` cannot: bwa
+has no option that unsets them, so `--meth` applies them unconditionally.
+
+These constants are quoted at bwa's default match score (`-A 1`, what bwameth
+runs). Like every other score-derived default, they scale with `-A`: under
+`-A 2` the effective values are `-L 20 -U 200 -T 80` and `-B 4` (collapsed) /
+`-B 8` (genomic).
 
 ## What stays the same (collapsed mode)
 

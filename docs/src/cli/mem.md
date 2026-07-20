@@ -166,8 +166,14 @@ individual flags are unaffected.
 > When `--meth` is active, bwa-mem3 applies `-L 10 -U 100 -T 40 -M -C` plus a
 > mode-dependent mismatch penalty: `-B 2` for `--meth-scoring collapsed` (default,
 > bwameth-compatible) and `-B 4` for `--meth-scoring genomic`. This mirrors
-> bwameth's `bwa mem -T 40 -B 2 -L 10 -CM` (with `-U 100` for paired-end). Any of
-> these can still be overridden by passing the flag explicitly after `--meth`.
+> bwameth's `bwa mem -T 40 -B 2 -L 10 -CM` (with `-U 100` for paired-end). The
+> scoring values (`-B`, `-L`, `-U`, `-T`) can still be overridden by passing the
+> flag explicitly, in any position relative to `--meth`; `-M` and `-C` cannot,
+> since bwa has no option that unsets them.
+>
+> Those constants are quoted at bwameth's match score (`-A 1`) and scale with
+> `-A` like every other score-derived default above: under `-A 2` the effective
+> values are `-L 20 -U 200 -T 80` and `-B 4` (collapsed) / `-B 8` (genomic).
 
 ### Paired-end
 

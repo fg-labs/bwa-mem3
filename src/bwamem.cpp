@@ -320,6 +320,22 @@ void mem_opt_fill_meth_mat(mem_opt_t *o) {
     }
 }
 
+/* See bwamem.h for the contract. The `* opt->a` factors are the fix for -A
+ * being discarded under --meth: bwameth's constants assume a == 1, and bwa
+ * scales every other score-derived default by opt->a in update_a(). */
+void mem_opt_apply_meth_defaults(mem_opt_t *opt, const mem_opt_t *opt0)
+{
+    if (!opt0->pen_clip5)    opt->pen_clip5    = 10 * opt->a;   /* bwameth -L 10 */
+    if (!opt0->pen_clip3)    opt->pen_clip3    = 10 * opt->a;
+    if (!opt0->pen_unpaired) opt->pen_unpaired = 100 * opt->a;  /* bwameth -U 100 (paired) */
+    if (!opt0->T)            opt->T            = 40 * opt->a;   /* bwameth -T 40 */
+    opt->flag |= MEM_F_NO_MULTI;                                /* -M */
+    if (opt->meth_scoring == MEM_METH_SCORING_COLLAPSED) {
+        if (!opt0->b) opt->b = 2 * opt->a;                      /* bwameth's lenient -B 2 */
+    }
+    /* GENOMIC keeps bwa's default b (already scaled by update_a): variant-aware. */
+}
+
 /******************************
  * De-overlap single-end hits *
  ******************************/

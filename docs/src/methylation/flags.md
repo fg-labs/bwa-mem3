@@ -49,9 +49,9 @@ the aligner to distinguish real variants from conversions.
 > **Note — `-B` follows the mode, but you can override it**
 >
 > `collapsed` sets `-B 2` and `genomic` keeps `-B 4` by default. An explicit
-> `-B` after `--meth` overrides the mode default and still reaches the per-strand
-> matrices. The other `--meth` defaults (`-L 10 -U 100 -T 40 -M -C`) are the same
-> in both modes.
+> `-B` overrides the mode default and still reaches the per-strand matrices,
+> whether it appears before or after `--meth`. The other `--meth` defaults
+> (`-L 10 -U 100 -T 40 -M -C`) are the same in both modes.
 
 ## `--set-as-failed {f|r}`
 
@@ -151,9 +151,16 @@ will miss it. Methylation calling is unaffected.
 > exactly the default-threshold survivors. (`-L 10` accounts for ~18 more.)
 >
 > The effect shrinks with read length — a 150 bp read splits into ~75 bp arms
-> scoring well clear of 40 — though that has not been measured. To recover
-> chimeric evidence for SV calling, pass `-T 30` (optionally `-L 5`) after
-> `--meth` and accept divergence from bwameth placement.
+> scoring well clear of 40 — though that has not been measured. Passing `-T 30`
+> (optionally `-L 5`) alongside `--meth` recovers those dropped split records,
+> at the cost of divergence from bwameth placement.
+>
+> **This is not a substitute for supplementary alignments.** `-M` is still
+> unconditional, so the recovered records are flagged secondary (`0x100`), not
+> supplementary (`0x800`) — an SV caller that selects split-read evidence by the
+> `0x800` bit will ignore them no matter how low `-T` goes. Lowering `-T` is
+> useful for manual inspection, or for callers that accept `0x100` records and
+> read `SA:Z` directly.
 
 ## `-V` reference annotation `XR:Z` is suppressed under `--meth`
 

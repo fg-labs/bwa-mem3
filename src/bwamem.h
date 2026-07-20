@@ -393,6 +393,22 @@ void mem_fill_scmat(int a, int b, int8_t mat[25]);
  * scoring tracks the user's options instead of the init-time defaults. */
 void mem_opt_fill_meth_mat(mem_opt_t *opt);
 
+/* Apply the --meth scoring defaults to `opt`, honouring the user's explicit
+ * settings recorded as sentinels in `opt0` (non-zero field == user supplied).
+ *
+ * The constants are bwameth's (`bwa-mem2 mem -T 40 -B 2 -L 10 -CM`, plus
+ * -U 100 for paired), and bwameth runs bwa at its default match score a == 1.
+ * They are therefore SCALED BY opt->a here: every one of these options is
+ * expressed in units of the match score, and bwa's update_a() scales the
+ * non-meth defaults the same way. Applying them flat would silently discard
+ * -A -- `--meth -A 2` would leave T at 40 while the alignment scores it gates
+ * had doubled. At the default a == 1 the scaling is a no-op, so this is
+ * byte-identical to the historical behaviour for every run that does not pass
+ * -A.
+ *
+ * Must be called AFTER -A/-B/-T/-L/-U parsing and after update_a(). */
+void mem_opt_apply_meth_defaults(mem_opt_t *opt, const mem_opt_t *opt0);
+
 // Skip-short-seed extension filter: drop seeds shorter than min_ext_len from a
 // chain in place (stable; surviving seeds keep their order). Returns the new
 // seed count. min_ext_len <= 0 is a no-op. See mem_opt_t::min_ext_len.
