@@ -65,6 +65,10 @@ static inline void kseq2bseq1(const kseq_t *ks, bseq1_t *s)
     // start well-defined — the output loop at fastmap.cpp free()s them
     // unconditionally, so garbage from realloc would otherwise be freed.
     memset(s, 0, sizeof(*s));
+    /* Honor the bseq1_t.meth_base_ot -1 sentinel ("non-meth") from bwa.h: the
+     * memset above would otherwise leave it 0, which the seed-chemistry filter
+     * reads as OB. --meth ingest overwrites it with the read-number 0/1. */
+    s->meth_base_ot = -1;
     s->name = strdup(ks->name.s);
     s->comment = ks->comment.l? strdup(ks->comment.s) : 0;
     s->seq = strdup(ks->seq.s);

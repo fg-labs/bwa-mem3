@@ -1244,9 +1244,27 @@ SMEM *mem_collect_smem(FMI_search *fmi, const mem_opt_t *opt,
  * original remap + OT/OB PE/strand placement regression tests
  * (test/regression/meth_seed_index.sh and the live mem --meth placement tests).
  */
+/* --meth seed-chemistry filter (default ON; BWAMEM3_METH_SEED_FILTER=0 disables).
+ * A directional read is projected under a single chemistry by read number
+ * (R1=OT/C->T, R2=OB/G->A). Its true seeds therefore only land on converted
+ * copies whose implied chemistry matches: a seed on copy parity P at genomic
+ * strand S implies chemistry (P XOR S), and the true locus always satisfies
+ * (P XOR S) == read#. A seed that disagrees is a paralog/low-complexity
+ * coincidence on the wrong converted copy; dropping it stops it from seeding a
+ * confident wrong-chromosome placement (the #202 tail). */
+static inline bool meth_seed_filter_enabled()
+{
+    static const bool on = []() {
+        const char *e = getenv("BWAMEM3_METH_SEED_FILTER");
+        return !(e != NULL && strcmp(e, "0") == 0);
+    }();
+    return on;
+}
+
 static inline int meth_seed_to_orig(const bntseq_t *seed_bns,
                                     const bntseq_t *orig_bns,
                                     int64_t seed_rbeg, int32_t seed_len,
+                                    int read_meth_base_ot,
                                     int64_t *orig_rbeg, int *orig_rid,
                                     int8_t *hypothesis)
 {
@@ -1263,6 +1281,15 @@ static inline int meth_seed_to_orig(const bntseq_t *seed_bns,
     int o_rid = seed_rid >> 1;
     if (o_rid < 0 || o_rid >= orig_bns->n_seqs) return -1;
     *hypothesis = (int8_t)(seed_rid & 1); /* 1=f=OT(C→T), 0=r=OB(G→A) */
+
+    /* Drop cross-chemistry seeds by read number (see meth_seed_filter_enabled).
+     * parity = seed_rid & 1 (which converted copy: 1=OT/f, 0=OB/r); seed_is_rev =
+     * genomic strand; read# = read_meth_base_ot (R1=1/OT, R2=0/OB). Keep iff the
+     * seed's implied chemistry (parity XOR strand) equals the read number. */
+    if (read_meth_base_ot >= 0 && meth_seed_filter_enabled()) {
+        if ((((int)(seed_rid & 1)) ^ seed_is_rev) != (read_meth_base_ot & 1))
+            return -1; /* cross-chemistry seed: drop */
+    }
 
     /* f/r seed contigs are forward projections of the original, so the seed-local
      * offset is the original-local offset. Reject seeds that bridge the contig
@@ -1529,8 +1556,9 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
                 if (meth_remap) {
                     int64_t o_rbeg = 0; int o_rid = -1;
                     if (meth_seed_to_orig(bns, meth_orig_bns, s.rbeg, s.len,
+                                          seq_[l].meth_base_ot,
                                           &o_rbeg, &o_rid, &meth_hyp) != 0)
-                        continue; /* un-remappable (bridge/range): drop the seed */
+                        continue; /* un-remappable, or cross-chemistry: drop the seed */
                     s.rbeg = o_rbeg;
                     rid = o_rid;
                 } else {

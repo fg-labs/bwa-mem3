@@ -455,6 +455,9 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
                  * loop below alongside s->seq. */
                 s->meth_orig_seq = strdup(s->seq);
                 assert(s->meth_orig_seq != NULL);
+                /* --meth: read-number chemistry (R1=OT=1, R2=OB=0) for the
+                 * seed-chemistry filter in meth_seed_to_orig. */
+                s->meth_base_ot = is_r2 ? 0 : 1;
                 /* Project in place. */
                 for (int j = 0; j < l; ++j) {
                     char c = s->seq[j];
