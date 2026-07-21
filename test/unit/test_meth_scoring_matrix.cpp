@@ -73,3 +73,41 @@ TEST_CASE("collapsed is the default scoring mode"
     CHECK(o->mat_ot[3 * 5 + 1] == o->a);
     free(o);
 }
+
+TEST_CASE("neutral frees the conversion cell to ZERO, not a match"
+          * doctest::test_suite("unit/meth_scoring"))
+{
+    // TAPS conversions are sparse (~3% of C), so rewarding the conversion as a
+    // full match (genomic) over-credits spurious C->T alignments. NEUTRAL scores
+    // the conversion cell as 0 -- tolerated but not rewarded -- which measured
+    // ~+0.25 pp placement over genomic across all methylation loads. See
+    // reports/2026-07-20-taps-alignment-experiment-results.md (question A).
+    mem_opt_t *o = opt_for(MEM_METH_SCORING_NEUTRAL);
+    const int b = o->b;
+
+    // OT: ref-C x read-T freed to 0 (neutral); mirror ref-T x read-C stays -b.
+    CHECK(o->mat_ot[1 * 5 + 3] == 0);
+    CHECK(o->mat_ot[3 * 5 + 1] == -b);
+    // OB: ref-G x read-A freed to 0; mirror ref-A x read-G stays -b.
+    CHECK(o->mat_ob[2 * 5 + 0] == 0);
+    CHECK(o->mat_ob[0 * 5 + 2] == -b);
+    // Diagonal matches and unrelated off-diagonals untouched.
+    CHECK(o->mat_ot[0 * 5 + 0] == o->a);   // A/A match
+    CHECK(o->mat_ot[0 * 5 + 1] == -b);     // ref-A x read-C real mismatch
+
+    free(o);
+}
+
+TEST_CASE("neutral is NOT a rank-1 batched-expressible matrix"
+          * doctest::test_suite("unit/meth_scoring"))
+{
+    // The freed cell holds 0, which is neither w_match nor w_mismatch, so the
+    // batched kswv kernel cannot express it. The aligner must fall back to the
+    // scalar rescue path rather than assert. This test pins the classifier that
+    // drives that decision.
+    mem_opt_t *o = opt_for(MEM_METH_SCORING_NEUTRAL);
+    // bsw_freed_cell requires the freed value to equal w_match for rank-1.
+    BswFreedCell fc = bsw_freed_cell(o->mat_ot, o->a, -o->b, /*forced=*/false);
+    CHECK(fc.rank1 == false);
+    free(o);
+}

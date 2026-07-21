@@ -797,6 +797,19 @@ static bool meth_batched_rescue_enabled()
     return enabled;
 }
 
+/* Whether the current --meth-scoring matrix is expressible by the batched kswv
+ * kernel. The kernel handles exactly what mem_opt_fill_meth_mat produces for
+ * COLLAPSED (conversion cell + its mirror, both freed to +a) and GENOMIC (the
+ * single conversion cell freed to +a, rank-1). NEUTRAL frees the conversion cell
+ * to 0, which is neither match nor mismatch and thus not batched-expressible, so
+ * those pairs must take the scalar ksw_align2 rescue path. Keep this in lockstep
+ * with mem_opt_fill_meth_mat. Porting the generic-LUT path from bandedSWA into
+ * kswv would let NEUTRAL run batched too (a perf follow-up). */
+static inline bool meth_scoring_batched_expressible(const mem_opt_t *opt)
+{
+    return opt->meth_scoring != MEM_METH_SCORING_NEUTRAL;
+}
+
 /* Task 5: run the two-phase batched kswv over a contiguous SeqPair slice
  * pairs[0..slice_pcnt) whose 8-bit pairs occupy [0, slice_pcnt8) and 16-bit
  * pairs [slice_pcnt8, slice_pcnt). The slice must have MAX_LINE_LEN trailing
@@ -914,7 +927,8 @@ int mem_sam_pe_batch(const mem_opt_t *opt, mem_cache *mmc,
      * ksw_align2 score with the asymmetric matrix. Non-meth and the env-OFF
      * escape hatch fall through to the single-object path below, byte-identical
      * to the pre-Task-5 code. */
-    if (opt->meth_mode && meth_batched_rescue_enabled()) {
+    if (opt->meth_mode && meth_batched_rescue_enabled()
+            && meth_scoring_batched_expressible(opt)) {
         // Scratch slice (Right128 is free here; sort_classify only used it as
         // a transient and the final layout lives in Left128). Sized
         // wsize_pair + MAX_LINE_LEN, which comfortably holds one group plus
@@ -1394,7 +1408,8 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
              * path remains as a safety fallback for any pair whose object
              * reports needsScalar() (rank-1 meth never does) and is reachable
              * via BWAMEM3_METH_BATCHED_RESCUE=0 (escape hatch). */
-            if (opt->meth_mode && !meth_batched_rescue_enabled()) {
+            if (opt->meth_mode && (!meth_batched_rescue_enabled()
+                    || !meth_scoring_batched_expressible(opt))) {
                 // Escape hatch (env=0): keep the legacy scalar rescue. Leave
                 // gar = -1 so mem_matesw_batch_post re-runs this orientation
                 // through ksw_align2 with the asymmetric matrix.

@@ -69,9 +69,11 @@ environment, no bwameth.py version pinning.
 **No intermediate files.** No converted FASTQ is written; the C→T / G→A projection
 is applied in-memory to the seeding copy of each read.
 
-**Variant-aware option.** `--meth-scoring genomic` scores real C/T and G/A
-variants as mismatches, so a single BAM supports both methylation calling and
-variant calling — something a collapsed-space aligner cannot produce.
+**Variant-aware options.** `--meth-scoring genomic` and `--meth-scoring neutral`
+(the `--meth=taps` default) both score real C/T and G/A variants as mismatches, so
+a single BAM supports both methylation calling and variant calling — something a
+collapsed-space aligner cannot produce. They differ only in what the *conversion*
+cell scores: a full match under `genomic`, `0` under `neutral`.
 
 **Inline BAM post-processing.** Header rewriting, Bismark `XR`/`XG`/`XM` tags,
 opt-in chimera QC (`--chimera-qc`), and QC-fail propagation happen in the same
@@ -79,8 +81,8 @@ pass. Output is uncompressed BAM (`wb0`) that `samtools sort` reads natively.
 
 **bwameth-aligned defaults (collapsed).** `--meth-scoring collapsed` applies
 `-B 2 -L 10 -U 100 -T 40 -M -C`, mirroring bwameth's `bwa mem -T 40 -B 2 -L 10
--CM` (plus `-U 100` for paired-end). `genomic` uses the same set but keeps
-`-B 4`. The scoring parameters (`-B`, `-L`, `-U`, `-T`) can be overridden on the
+-CM` (plus `-U 100` for paired-end). `genomic` and `neutral` use the same set but
+keep `-B 4`. The scoring parameters (`-B`, `-L`, `-U`, `-T`) can be overridden on the
 command line, in any position relative to `--meth`. `-M` and `-C` cannot: bwa
 has no option that unsets them, so `--meth` applies them unconditionally.
 

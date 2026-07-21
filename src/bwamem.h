@@ -78,12 +78,22 @@ typedef struct __smem_i smem_i;
 #define MEM_F_XB        0x2000
 
 
-/* D3 (--meth): bisulfite substitution-matrix mode, selected by --meth-scoring.
- * COLLAPSED (default) frees BOTH conversion directions so C/T (and G/A) are
- * interchangeable — reproduces bwameth's collapsed 3-letter placement (a
- * drop-in). GENOMIC frees only the bisulfite conversion direction, keeping the
- * mirror cell a real mismatch — variant-aware, truthful NM/MD. */
-enum mem_meth_scoring { MEM_METH_SCORING_COLLAPSED = 0, MEM_METH_SCORING_GENOMIC = 1 };
+/* D3 (--meth): bisulfite/TAPS SW scoring model, selected by --meth-scoring. All
+ * three free the conversion cell (OT: ref-C x read-T; OB: ref-G x read-A); they
+ * differ in to what value, and whether the mirror cell is freed too:
+ *   COLLAPSED: conversion + mirror both freed to +a (C/T interchangeable,
+ *              bwameth-compatible placement, -B 2).
+ *   GENOMIC:   conversion freed to +a, mirror kept as a mismatch (variant-aware,
+ *              -B 4, rank-1 batched-expressible).
+ *   NEUTRAL:   conversion freed to 0 (tolerated but not rewarded), mirror kept a
+ *              mismatch (-B 4). For TAPS, whose conversions are sparse (~3% of C),
+ *              a full-match reward over-credits spurious C->T alignments; scoring
+ *              the conversion neutrally measured ~+0.25 pp placement over GENOMIC
+ *              at every methylation load. NOT rank-1 (the freed value is neither
+ *              match nor mismatch), so it forces the scalar mate-rescue path.
+ *              See reports/2026-07-20-taps-alignment-experiment-results.md. */
+enum mem_meth_scoring { MEM_METH_SCORING_COLLAPSED = 0, MEM_METH_SCORING_GENOMIC = 1,
+                        MEM_METH_SCORING_NEUTRAL = 2 };
 
 typedef enum {
     SEED_ORDER_OFF = 0,
@@ -132,14 +142,20 @@ typedef struct mem_opt_t {
     int8_t mat[25];         // scoring matrix; mat[0] == 0 if unset
     /* D3 (--meth): per-hypothesis substitution matrices, built from `mat` by
      * mem_opt_fill_meth_mat() per opt->meth_scoring (target-major mat[ref*5+read],
-     * ACGT order A,C,G,T,N). Each frees the bisulfite conversion cell to a MATCH
-     * (+a): mat_ot frees mat[C][T]=mat[1*5+3] (top strand C→T), mat_ob frees
-     * mat[G][A]=mat[2*5+0] (bottom strand G→A).
-     *   GENOMIC: ONLY that cell is freed; the mirror (mat[T][C], mat[A][G]) STAYS
-     *     at −b so genuine variants score as mismatches → one freed cell ⇒ the
-     *     SIMD rank-1 fast path. Variant-aware, truthful NM/MD.
-     *   COLLAPSED: the mirror cell is ALSO freed (two cells) so C/T and G/A are
-     *     interchangeable → reproduces bwameth; uses bandedSWA's general path.
+     * ACGT order A,C,G,T,N). Each frees the conversion cell — mat_ot frees
+     * mat[C][T]=mat[1*5+3] (top strand C→T), mat_ob frees mat[G][A]=mat[2*5+0]
+     * (bottom strand G→A) — to a value that depends on the mode:
+     *   GENOMIC: that cell alone is freed, to a MATCH (+a); the mirror
+     *     (mat[T][C], mat[A][G]) STAYS at −b so genuine variants score as
+     *     mismatches → one freed cell at +a ⇒ the SIMD rank-1 fast path.
+     *     Variant-aware, truthful NM/MD.
+     *   NEUTRAL: that cell alone is freed, to 0 (tolerated, not rewarded); the
+     *     mirror STAYS at −b. One freed cell, but NOT rank-1 (the value is
+     *     neither match nor mismatch) → bandedSWA's general path; the kswv
+     *     freed-cell blend expresses it directly. Variant-aware, truthful NM/MD.
+     *   COLLAPSED: the mirror cell is ALSO freed (two cells, both to +a) so C/T
+     *     and G/A are interchangeable → reproduces bwameth; uses bandedSWA's
+     *     general path.
      * Outside --meth these are unused; selection is by mem_chain_t.meth_hypothesis
      * (1 = OT, 0 = OB) via mem_opt_meth_mat(). */
     int8_t mat_ot[25];      // OT (C→T) meth matrix; valid only under --meth
@@ -147,7 +163,8 @@ typedef struct mem_opt_t {
     int    bam_mode;        // 1 = emit BAM instead of SAM text (--bam); meth_mode implies this
     int    bam_level;       // 0..9, BGZF deflate level (0 = uncompressed)
     int    meth_mode;       // 1 = bisulfite mode (--meth); implies bam_mode
-    int    meth_scoring;    // bisulfite matrix mode (--meth-scoring): MEM_METH_SCORING_{COLLAPSED,GENOMIC}
+    int    meth_scoring;    // bisulfite matrix mode (--meth-scoring):
+                            // MEM_METH_SCORING_{COLLAPSED,GENOMIC,NEUTRAL}
     int    meth_chem;       // methylation chemistry (--meth=emseq|taps): meth_chem_t.
                             // Selects XM:Z call polarity ONLY -- seeding, the
                             // converted index and the scoring matrices are shared,

@@ -67,17 +67,21 @@ Methylation (--meth) options:
                    emseq  bisulfite/EM-seq, UNmethylated C converts [default]
                           (aliases: em-seq, bisulfite)
                    taps   TET-assisted pyridine borane, METHYLATED C converts;
-                          also defaults --meth-scoring to genomic
+                          also defaults --meth-scoring to neutral
                  NOTE: use --meth=taps (with '='), not --meth taps. Running TAPS
                  data without =taps inverts every methylation call.
-   --meth-scoring collapsed|genomic
+   --meth-scoring collapsed|genomic|neutral
                  scoring mode. Default depends on chemistry: collapsed for
-                 --meth/--meth=emseq, genomic for --meth=taps (TAPS conversions
+                 --meth/--meth=emseq, neutral for --meth=taps (TAPS conversions
                  are sparse, so collapsing costs specificity it can't repay).
-                 collapsed: C/T (and G/A)
-                 interchangeable, bwameth-compatible placement (sets -B 2).
-                 genomic: free only the conversion direction, keep variants as
-                 mismatches (variant-aware, truthful NM/MD; -B 4).
+                 collapsed: C/T (and G/A) interchangeable, bwameth-compatible
+                 placement (sets -B 2).
+                 genomic: free only the conversion direction, scored as a full
+                 match, keep variants as mismatches (variant-aware, truthful
+                 NM/MD; -B 4).
+                 neutral: free only the conversion direction but score it 0
+                 (tolerated, not rewarded); best for TAPS (variant-aware,
+                 truthful NM/MD; -B 4).
    --set-as-failed f|r
                  flag alignments to the matching strand ('f' or 'r') as QC-fail (0x200)
    --chimera-qc

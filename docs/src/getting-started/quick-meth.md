@@ -13,7 +13,8 @@ postprocessing step are required.
 > are pinned to a specific bwameth release (see
 > [bwameth.py drop-in mapping](../methylation/bwameth-mapping.md)). Add
 > `--meth-scoring genomic` to opt into variant-aware scoring (truthful `NM`/`MD`; one BAM for both
-> methylation and variant calling).
+> methylation and variant calling), or `--meth-scoring neutral` — the `--meth=taps` default — which
+> is variant-aware too but scores the conversion `0` instead of a match.
 
 ## Index the reference for methylation
 

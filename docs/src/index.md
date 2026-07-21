@@ -14,8 +14,9 @@ support for things you used to need a wrapper script for.
   measurable wall-clock wins on real workloads.
 - **Methylation in one binary.** A `--meth` flag adds native bisulfite/EM-seq
   alignment: bwameth-compatible read *placement* by default
-  (`--meth-scoring collapsed`), or variant-aware scoring on request
-  (`--meth-scoring genomic`). No Python, no inline conversion script, no separate
+  (`--meth-scoring collapsed`), or variant-aware scoring (`--meth-scoring
+  genomic`, or `neutral` — the TAPS default — which tolerates a conversion
+  without rewarding it). No Python, no inline conversion script, no separate
   post-processing step. One `bwa-mem3 index --meth ref.fa`, one
   `bwa-mem3 mem --meth ref.fa R1.fq R2.fq`, done — headers consolidated and
   Bismark tags emitted.

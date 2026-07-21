@@ -42,31 +42,41 @@ identical either way.
 > as `1 − truth`, silently. Always pass `=taps` for TAPS libraries, or suppress
 > `XM:Z` and call with a TAPS-aware extractor such as Rastair.
 
-**Scoring default.** `--meth=taps` defaults `--meth-scoring` to `genomic`
+**Scoring default.** `--meth=taps` defaults `--meth-scoring` to `neutral`
 (bare `--meth` still defaults to `collapsed`). TAPS converts only the methylated
 cytosines, so conversions are far sparser than under EM-seq — 3.2 % of cytosines
 versus 94.6 % on a matched chr22 simulation — and the collapsed 3-letter alphabet
-costs specificity it no longer buys back. Measured placement on the same TAPS set:
-`genomic` 95.72 %, plain 95.53 %, `collapsed` 95.40 %, against a 96.02 %
-unconverted baseline; `genomic` also placed 136 k more reads in the MAPQ 60+ bin
-at higher accuracy. An explicit `--meth-scoring` always wins.
+costs specificity it no longer buys back. `neutral` goes one step past `genomic`:
+it scores the conversion cell as `0` rather than a full match, so a sparse TAPS
+conversion is *tolerated* without *rewarding* spurious C→T alignments. Measured on
+4.07 M simulated TAPS reads against full hg38, across three methylation loads:
+`neutral` placed 95.95–96.01 % (essentially the 96.02 % unconverted ceiling),
+`genomic` 95.68–95.73 %, `collapsed` 95.37–95.43 % — a robust +0.24–0.28 pp over
+`genomic` — with **identical** MAPQ calibration (60+ bin 99.99 % either way) and
+`NM` (mean 1.966 vs 1.969), so the gain is not bought with over-confidence or
+inflated edit distance. An explicit `--meth-scoring` always wins.
 
-## `--meth-scoring {collapsed|genomic}`
+## `--meth-scoring {collapsed|genomic|neutral}`
 
-Selects how the 4-letter scoring matrix treats bisulfite-converted bases.
-`bwa-mem3 --meth` scores against the original reference, so it can either collapse
-the conversion (bwameth-style) or keep it variant-aware.
+Selects how the 4-letter scoring matrix treats bisulfite/TAPS-converted bases.
+`bwa-mem3 --meth` scores against the original reference, so it can collapse the
+conversion (bwameth-style), keep it variant-aware, or merely tolerate it.
 
 **Accepted values:**
 
-- `collapsed` (**default**) — free **both** conversion directions: C↔T *and* G↔A
-  are interchangeable (a two-cell matrix). Reproduces bwameth's collapsed-space
-  **placement** and sets the mismatch penalty to `-B 2`. Use this when you need
-  bwameth-compatible read placement (the drop-in default).
-- `genomic` — free **only** the conversion direction (a one-cell matrix), so the
-  mirror cell stays a real mismatch. A genuine C/T or G/A variant is penalized,
-  making `NM`/`MD` truthful and the BAM usable for variant calling. Keeps bwa's
-  default `-B 4`.
+- `collapsed` (**default for `--meth`/`--meth=emseq`**) — free **both** conversion
+  directions: C↔T *and* G↔A are interchangeable (a two-cell matrix). Reproduces
+  bwameth's collapsed-space **placement** and sets the mismatch penalty to `-B 2`.
+  Use this when you need bwameth-compatible read placement (the drop-in default).
+- `genomic` — free **only** the conversion direction (a one-cell matrix), scored
+  as a full match (`+A`), so the mirror cell stays a real mismatch. A genuine C/T
+  or G/A variant is penalized, making `NM`/`MD` truthful and the BAM usable for
+  variant calling. Keeps bwa's default `-B 4`.
+- `neutral` (**default for `--meth=taps`**) — free only the conversion direction,
+  but score it `0` rather than `+A`: tolerated but not rewarded. Best for TAPS,
+  whose conversions are sparse, where a full-match reward over-credits spurious
+  C→T alignments (see the measurement above). Keeps `-B 4`; the mirror cell stays
+  a mismatch, so `NM`/`MD` remain truthful.
 
 > **Important — `collapsed` is a placement drop-in, not byte-identical to bwameth**
 >
@@ -81,23 +91,28 @@ the conversion (bwameth-style) or keep it variant-aware.
 The mode changes alignment score, `MAPQ`, `NM`, `MD`, and occasionally placement
 and CIGAR. On a real C/T (or G/A) variant under a seed, `genomic` lowers the
 score by `-A + -B` (the match score plus the mismatch penalty) relative to
-`collapsed` — the freed match becomes a mismatch —
-which can break paralog ties in `genomic`'s favor and avoid spurious indels. The
-Bismark `XR`/`XG`/`XM` tags and the `SEQ` field are identical in both modes.
+`collapsed` — the freed match becomes a mismatch — which can break paralog ties
+in `genomic`'s favor and avoid spurious indels. `neutral` scores the conversion
+at `0`, i.e. `-A` relative to `genomic`, so a converted base neither helps nor
+hurts a seed the way a match or mismatch would; it is the strictest of the three.
+The Bismark `XR`/`XG`/`XM` tags and the `SEQ` field are identical in all modes.
 
 **When to use it:**
 
 Keep `collapsed` for methylation-only workflows that must match bwameth placement
 (e.g. clinical pipelines validated against a bwameth release). Choose `genomic`
 when you want one BAM that serves both methylation *and* variant calling, or want
-the aligner to distinguish real variants from conversions.
+the aligner to distinguish real variants from conversions. Prefer `neutral` for
+TAPS (its default), where conversions are sparse and rewarding them as matches
+costs placement specificity — it is truthful for variant calling like `genomic`
+while placing sparse-conversion reads more accurately.
 
 > **Note — `-B` follows the mode, but you can override it**
 >
-> `collapsed` sets `-B 2` and `genomic` keeps `-B 4` by default. An explicit
-> `-B` overrides the mode default and still reaches the per-strand matrices,
-> whether it appears before or after `--meth`. The other `--meth` defaults
-> (`-L 10 -U 100 -T 40 -M -C`) are the same in both modes.
+> `collapsed` sets `-B 2`; `genomic` and `neutral` keep `-B 4` by default. An
+> explicit `-B` overrides the mode default and still reaches the per-strand
+> matrices, whether it appears before or after `--meth`. The other `--meth`
+> defaults (`-L 10 -U 100 -T 40 -M -C`) are the same across modes.
 
 ## `--set-as-failed {f|r}`
 

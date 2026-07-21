@@ -5,8 +5,9 @@ bwameth.py reference implementation (in the default `collapsed` scoring mode).
 This page is prescriptive: when to keep those defaults and when to override them.
 For *what* the flags are and *how* the scoring modes work, see the reference:
 
-- **Scoring modes (`collapsed` vs `genomic`) and the full `--meth` flag set** —
-  [Methylation Reference → Flags](../methylation/flags.md#--meth-scoring-collapsedgenomic).
+- **Scoring modes (`collapsed`, `genomic`, `neutral`) and the full `--meth` flag
+  set** —
+  [Methylation Reference → Flags](../methylation/flags.md#--meth-scoring-collapsedgenomicneutral).
 - **Placement compatibility with bwameth.py** (the default `collapsed` mode is a
   placement drop-in, *not* byte-identical — ~1% of records differ in
   `POS`/`CIGAR`/`MAPQ`, so **re-validate if you are pinned to a specific bwameth

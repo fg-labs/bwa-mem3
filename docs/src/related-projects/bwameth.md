@@ -27,17 +27,20 @@ bundled with the original script.
 drop-in, not a byte-for-byte clone). The key difference is *where it scores*:
 where bwameth.py converts both reads and reference to 3-letter space and aligns
 there, bwa-mem3 uses the 3-letter projection only to **find seeds**, then extends
-and scores against the **original 4-letter reference**. That enables a second,
-opt-in mode — `--meth-scoring genomic` — which keeps real C/T and G/A variants as
-mismatches (truthful `NM`/`MD`), something a collapsed-space aligner cannot do.
+and scores against the **original 4-letter reference**. That enables two further
+variant-aware modes — `--meth-scoring genomic`, which scores the conversion cell as
+a full match, and `--meth-scoring neutral` (the `--meth=taps` default), which scores
+it `0` so a sparse conversion is tolerated but not rewarded. Both keep real C/T and
+G/A variants as mismatches (truthful `NM`/`MD`), something a collapsed-space aligner
+cannot do.
 
 It rewrites the `@SQ` headers to consolidate the per-strand contig pairs back to
 canonical chromosome names, emits Bismark-compatible `XR:Z` / `XG:Z` / `XM:Z`
 auxiliary tags, and writes a `@PG ID:bwa-mem3-meth` header. The bwameth.py-style
 chimera QC heuristic is available via `--chimera-qc` (off by default — Bismark
 behavior). The [Methylation Reference](../methylation/overview.md) documents the
-full implementation, including the two
-[`--meth-scoring` modes](../methylation/overview.md#two-scoring-modes---meth-scoring),
+full implementation, including the three
+[`--meth-scoring` modes](../methylation/overview.md#three-scoring-modes---meth-scoring),
 the Bismark tags, and the `--set-as-failed` / `--chimera-qc` flags.
 
 > **Note — external c2t interop was removed**
