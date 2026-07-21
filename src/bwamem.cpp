@@ -3470,12 +3470,40 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
     int64_t leftRefOffset = 0, rightRefOffset = 0;
     int64_t leftQerOffset = 0, rightQerOffset = 0;
 
-    // ungapped fast-path threshold, computed once per call from
-    // the scoring model. See ungapped_fastpath_walk docstring.
+    // Ungapped fast-path threshold, computed once per call from the scoring
+    // model: the largest mismatch count X for which an ungapped diagonal is
+    // provably optimal, so ungapped_analyze may return FP_STATUS_HIT and skip
+    // the banded SW entirely.
+    //
+    // An ungapped walk carrying X mismatches scores X*(a+b) below the all-match
+    // diagonal. The cheapest gapped alternative pays at least one gap open plus
+    // extend, o_min + e_min, and can at best convert every one of those X
+    // mismatches back into a match. So the ungapped walk is safe only while it
+    // wins STRICTLY:
+    //
+    //     X * (a + b) < o_min + e_min   =>   X <= (o_min + e_min - 1) / (a + b)
+    //
+    // Strictness is load-bearing, not pedantry: on an exact tie the gapped path
+    // scores the same, and ksw_extend2 breaks ties with `if (m > max)` -- the
+    // cell reached first keeps the max -- so the DP can return the gapped CIGAR
+    // while this fast path returns the ungapped one.
+    //
+    // This previously read o_min / (a + b - e_min), which coincides with the
+    // correct bound at bwa's defaults (6/4 == 1 and (6+1-1)/5 == 1) but is too
+    // permissive elsewhere. At -B 3 it admitted X = 2, yet 2*(1+3) = 8 > 6+1, so
+    // a single deletion beats that diagonal: measured 51 of 501,821 records
+    // (0.010%) differing from the DP on 250k HG002 WGS pairs, the fast path
+    // emitting e.g. 151M where the DP finds 138M1D13M. Defaults are unchanged,
+    // so this costs no fast-path coverage on a stock run.
     const int fp_o_min = opt->o_del < opt->o_ins ? opt->o_del : opt->o_ins;
     const int fp_e_min = opt->e_del < opt->e_ins ? opt->e_del : opt->e_ins;
-    const int fp_denom = opt->a + opt->b - fp_e_min;
-    const int fp_x_threshold = (fp_denom > 0) ? (fp_o_min / fp_denom) : -1;
+    // Cheapest single gap the scoring scheme allows; a degenerate scheme that
+    // makes gaps free (or a non-positive a+b) leaves nothing provable, so the
+    // fast path is disabled with -1 rather than guessed at.
+    const int fp_gap_min = fp_o_min + fp_e_min;
+    const int fp_denom   = opt->a + opt->b;
+    const int fp_x_threshold =
+        (fp_denom > 0 && fp_gap_min > 0) ? ((fp_gap_min - 1) / fp_denom) : -1;
     // (fp_o_min, fp_e_min above are reused directly by ungapped_analyze.)
 
     int srt_size = MAX_SEEDS_PER_READ, fac = FAC;
