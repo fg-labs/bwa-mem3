@@ -98,6 +98,56 @@ Use `--bam=0` (uncompressed BAM) for all pipe-to-sort workflows. See
 [Output format](output-format.md) for the full explanation and recommended
 pipeline.
 
+## Aligning bisulfite / EM-seq data without `--meth`
+
+Symptoms: alignment several times slower than expected, a low mapping rate, and
+a high mismapping rate.
+
+Both chemistries — bisulfite treatment and the enzymatic conversion used by
+EM-seq — turn nearly every unmodified C into T, so the reads are effectively a
+three-letter alphabet. Queried against the normal four-letter index they match
+only marginally — enough to generate abundant weak seeds, not enough to place
+confidently. Measured on simulated EM-seq (100,000 pairs vs GRCh38, `holodeck`
+truth):
+
+| | placement correct | unmapped | confident (MAPQ ≥ 30) mismappings |
+|---|---:|---:|---:|
+| plain mode | 14.7% | 30.9% | 46,672 |
+| `--meth` | **95.4%** | **0.0%** | **41** |
+
+Plain mode is also roughly 4.5× slower: mate-rescue fan-out rises from 2.55 to
+34.7 candidate anchors per read end, because the rescue admission bar is
+relative to each read's own best score and therefore *falls* as placement
+quality falls.
+
+**The slowness is the visible symptom; the wrong answers are the real cost.**
+Do not reach for `-m` or other speed flags to recover the runtime — add
+`--meth`, which is both faster and correct.
+
+`--meth` requires a methylation-aware index. Build it once per reference with
+`bwa-mem3 index --meth ref.fa` — that writes the normal index at the bare prefix
+plus the converted seed index under `ref.fa.meth.*`; at alignment time still
+pass the original `ref.fa` path. See
+[Indexing → Methylation index](../user-guide/indexing.md#methylation-index---meth)
+and [Methylation](methylation.md).
+
+## Tuning performance flags when the reads don't match the reference
+
+The same mechanism applies well beyond bisulfite. Mate-rescue cost rises sharply
+on any *marginally mappable* input — a wrong or diverged reference build, an
+unexpected species, or contamination — because the admission bar for rescue
+candidates is relative to each read's best alignment, so degraded placement
+admits more work rather than less.
+
+Note that genuinely *unmappable* reads are cheap: reads with no homology fail at
+seeding and never reach rescue. It is the in-between case — homologous but
+degraded — that is expensive.
+
+So an unexpectedly slow run **with a low mapping rate** is usually a data or
+reference problem, not a tuning problem. Check `samtools flagstat` mapping rate
+first. Reaching for speed flags in that situation makes a misconfigured run
+finish sooner without making it correct.
+
 ---
 
 **See also:**
