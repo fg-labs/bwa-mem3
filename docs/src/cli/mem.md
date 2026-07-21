@@ -244,18 +244,29 @@ effect on them. `--fast` sets `20`. For the accuracy/speed curve and validation 
 see
 [Settings profiles → `--max-extend-chains`](../best-practices/settings-profiles.md#chain-extension-cap---max-extend-chains).
 
-#### `--adaptive-band` — adaptive banded Smith-Waterman for long reads
+#### `--adaptive-band` — adaptive banded Smith-Waterman for medium-length reads
+
+> **Kilobase-scale long reads are not currently supported at default settings.**
+> `bwa-mem3 mem` on PacBio HiFi (~15–20 kb) or ONT reads exhausts the
+> short-read-sized extension buffers and aborts (or, before the guard, OOM'd /
+> segfaulted) — the buffer model cannot represent a kilobase-scale extension.
+> This lever helps the **medium-length** end of its range (e.g. SBX at ~240 bp,
+> where it is validated); it does **not** make HiFi/ONT usable. For a true
+> long-read workload use minimap2. Tracking issue: bounding long-read extension
+> memory (fg-labs/bwa-mem3#238).
 
 Off by default → output byte-identical to baseline. When set, banded extension
 starts at a tight band and expands each pair only to the band its chain's seed
 geometry actually needs (the inter-seed indel), rather than the fixed `-w` band
 (100) for every extension.
 
-**When to use it: long reads.** The band only constrains the DP matrix when the
-extension's reference window exceeds it (`ref_window > 2·w+1`), which happens for
-long reads. So this is a **long-read lever — SBX, PacBio HiFi, ONT, or any run
-whose reads are roughly ≥ 200 bp.** On SBX (HG002, 240 bp+) it cuts alignment CPU
-by **~25 %**. On short-read data (WGS ~150 bp, WES ~76 bp) the extension matrix is
+**When to use it: medium-length reads.** The band only constrains the DP matrix
+when the extension's reference window exceeds it (`ref_window > 2·w+1`), which
+happens once reads are roughly ≥ 200 bp. So this is a lever for the
+**medium-length** range — SBX (HG002, ~240 bp), where it cuts alignment CPU by
+**~25 %**. It nominally applies to PacBio HiFi and ONT too, but kilobase-scale
+reads do not run at default settings (see the caveat above), so in practice its
+usable range today is medium reads, not true long reads. On short-read data (WGS ~150 bp, WES ~76 bp) the extension matrix is
 already smaller than the band, so there is nothing to trim: those reads run on the
 8-bit kernel, which this option deliberately leaves untouched, making it a **no-op
 on short reads** (enabling it on a WGS/WES run neither helps nor hurts).
@@ -330,13 +341,20 @@ the alignment score and mapping quality for each secondary hit.
 bwa-mem3 mem --fast  ≡  -m 10 -y 0 --min-ext-len 30 --smem-dedup --skip-contained-ext --max-extend-chains 20 --adaptive-band --extend-mate-concordant
 ```
 
-`--skip-contained-ext` is byte-identical to the default on non-meth single- and paired-end
-reads and no-ops under `--meth` (via its own internal gate), so it is pure upside where it
-applies (~10% lower alignment CPU on long-read inputs) and safe elsewhere.
+`--skip-contained-ext` is byte-identical to the default on non-meth short- and
+medium-length single- and paired-end reads (validated on WGS/WES/HiC and SBX, and on an
+ALT/HLA-enriched set) and no-ops under `--meth` (via its own internal gate). It is **not**
+byte-identical on kilobase-scale long reads (PacBio HiFi, ONT): the "longest contained seed
+dominates" assumption its skip relies on breaks when extensions terminate early on such
+reads, dropping supplementary alignments and occasionally degrading a primary. Those inputs
+are in any case not currently usable at default settings (see the long-read caveat under
+[`--adaptive-band`](#--adaptive-band--adaptive-banded-smith-waterman-for-medium-length-reads)).
 
 `--adaptive-band` (see above) is included because it is a strict no-op on short reads
-(the reads `--fast` primarily targets) and a ~25% alignment-CPU speedup on long-read
-(SBX/HiFi/ONT) runs, so bundling it only helps.
+(the reads `--fast` primarily targets) and a ~25% alignment-CPU speedup on medium-length
+runs (e.g. SBX ~240 bp), so bundling it only helps. Note kilobase-scale HiFi/ONT reads do
+not run at default settings regardless of this flag (see
+[`--adaptive-band`](#--adaptive-band--adaptive-banded-smith-waterman-for-medium-length-reads)).
 
 `--extend-mate-concordant` repairs the chain-cap pairing regression — the true, low-weight but
 mate-concordant chain the cap would otherwise drop — and is included for both non-meth and `--meth`
