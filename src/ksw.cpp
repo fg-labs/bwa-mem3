@@ -115,6 +115,25 @@ static kswq_t *ksw_qinit(int size, int qlen, const uint8_t *query, int m, const 
 	return q;
 }
 
+/* Horizontal max of 16 unsigned bytes. On aarch64/NEON this is a single umaxv
+ * instruction; on x86 (SSE2) it is the classic shift-and-max reduction, which
+ * yields the identical result. Replaces the per-column __max_16 reduction and
+ * the lazy-F all-settled test in ksw_u8 -- both were sse2neon-emulated
+ * cross-lane ops that dominated the NEON profile (see reports/2026-07-21). */
+#if defined(__ARM_NEON) || defined(__aarch64__) || defined(APPLE_SILICON)
+static inline int ksw_hmax_u8(__m128i v) {
+	return vmaxvq_u8(vreinterpretq_u8_m128i(v));
+}
+#else
+static inline int ksw_hmax_u8(__m128i v) {
+	v = _mm_max_epu8(v, _mm_srli_si128(v, 8));
+	v = _mm_max_epu8(v, _mm_srli_si128(v, 4));
+	v = _mm_max_epu8(v, _mm_srli_si128(v, 2));
+	v = _mm_max_epu8(v, _mm_srli_si128(v, 1));
+	return _mm_extract_epi16(v, 0) & 0x00ff;
+}
+#endif
+
 static kswr_t ksw_u8(kswq_t *q, int tlen, const uint8_t *target,
 			  int _o_del, int _e_del, int _o_ins, int _e_ins,
 			  int xtra) // the first gap costs -(_o+_e)
@@ -123,14 +142,6 @@ static kswr_t ksw_u8(kswq_t *q, int tlen, const uint8_t *target,
 	uint64_t *b;
 	__m128i zero, oe_del, e_del, oe_ins, e_ins, shift, *H0, *H1, *E, *Hmax;
 	kswr_t r;
-
-#define __max_16(ret, xx) do { \
-		(xx) = _mm_max_epu8((xx), _mm_srli_si128((xx), 8)); \
-		(xx) = _mm_max_epu8((xx), _mm_srli_si128((xx), 4)); \
-		(xx) = _mm_max_epu8((xx), _mm_srli_si128((xx), 2)); \
-		(xx) = _mm_max_epu8((xx), _mm_srli_si128((xx), 1)); \
-    	(ret) = _mm_extract_epi16((xx), 0) & 0x00ff; \
-	} while (0)
 
 	// initialization
 	r = g_defr;
@@ -152,7 +163,7 @@ static kswr_t ksw_u8(kswq_t *q, int tlen, const uint8_t *target,
 	}
 	// the core loop
 	for (i = 0; i < tlen; ++i) {
-		int j, k, cmp, imax;
+		int j, k, imax;
 		__m128i e, h, t, f = zero, max = zero, *S = q->qp + target[i] * slen; // s is the 1st score vector
 		h = _mm_load_si128(H0 + slen - 1); // h={2,5,8,11,14,17,-1,-1} in the above example
 		h = _mm_slli_si128(h, 1); // h=H(i-1,-1); << instead of >> because x64 is little-endian
@@ -191,12 +202,19 @@ static kswr_t ksw_u8(kswq_t *q, int tlen, const uint8_t *target,
 				_mm_store_si128(H1 + j, h);
 				h = _mm_subs_epu8(h, oe_ins);
 				f = _mm_subs_epu8(f, e_ins);
-				cmp = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_subs_epu8(f, h), zero));
+				/* lazy-F is settled when f <= h in every lane, i.e. subs_epu8(f,h)
+				 * is all-zero. On NEON that is one umaxv (==0) instead of the
+				 * sse2neon-emulated movemask==0xffff; identical exit condition. */
+#if defined(__ARM_NEON) || defined(__aarch64__) || defined(APPLE_SILICON)
+				if (UNLIKELY(ksw_hmax_u8(_mm_subs_epu8(f, h)) == 0)) goto end_loop16;
+#else
+				int cmp = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_subs_epu8(f, h), zero));
 				if (UNLIKELY(cmp == 0xffff)) goto end_loop16;
+#endif
 			}
 		}
 end_loop16:
-		__max_16(imax, max); // imax is the maximum number in max
+		imax = ksw_hmax_u8(max); // imax is the maximum number in max
 
 		if (imax >= minsc) { // write the b array; this condition adds branching unfornately
 			if (n_b == 0 || (int32_t)b[n_b-1] + 1 != i) { // then append
