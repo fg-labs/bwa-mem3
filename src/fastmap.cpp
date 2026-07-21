@@ -1524,18 +1524,15 @@ int main_mem(int argc, char *argv[])
      *     1.8 vs 2.1).
      * pen_unpaired is only consulted for paired-end rescue, so setting it
      * unconditionally is a no-op for single-end. -A/-B always override and reach
-     * the matrices (mem_opt_fill_meth_mat below). */
+     * the matrices (mem_opt_fill_meth_mat below).
+     * NB: those constants are quoted at bwameth's match score (a == 1) and are
+     * scaled by opt->a inside mem_opt_apply_meth_defaults — see bwamem.h. Before
+     * that, they were applied flat and silently discarded -A. */
     if (opt->meth_mode) {
-        if (!opt0.pen_clip5)    opt->pen_clip5   = 10;
-        if (!opt0.pen_clip3)    opt->pen_clip3   = 10;
-        if (!opt0.pen_unpaired) opt->pen_unpaired = 100;  /* bwameth -U 100 (paired) */
-        if (!opt0.T)            opt->T           = 40;
-        opt->flag |= MEM_F_NO_MULTI;   /* -M */
+        /* Scored defaults live in mem_opt_apply_meth_defaults so they scale with
+         * -A (bwameth's constants assume a==1) and can be unit-tested. */
+        mem_opt_apply_meth_defaults(opt, &opt0);
         aux.copy_comment = 1;          /* -C, needed for YS:Z/YC:Z passthrough */
-        if (opt->meth_scoring == MEM_METH_SCORING_COLLAPSED) {
-            if (!opt0.b) opt->b = 2;   /* bwameth's lenient mismatch */
-        }
-        /* GENOMIC keeps bwa's default b=4 (variant-aware). */
     }
 
     /* Matrix for SWA */

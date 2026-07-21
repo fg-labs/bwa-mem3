@@ -56,12 +56,12 @@ bwa-mem3 mem --meth --chimera-qc -t 16 ref.fa R1.fq.gz R2.fq.gz \
   | samtools sort -@ 4 -o out.bam -
 ```
 
-> **Note — Overrides are positional**
+> **Note — Overriding scoring defaults**
 >
-> Scoring flags supplied after `--meth` on the command line override the defaults
-> set by `--meth`. For example, `bwa-mem3 mem --meth -B 4 ...` uses `-B 4` (not 2).
-> Flags supplied before `--meth` are silently overwritten by `--meth`'s defaults,
-> so always place overrides after `--meth`.
+> Scoring flags supplied on the command line override the defaults set by
+> `--meth`. For example, `bwa-mem3 mem --meth -B 4 ...` uses `-B 4` (not 2).
+> Order does not matter: the defaults are applied after the whole command line
+> is parsed, so `-B 4 --meth` and `--meth -B 4` behave identically.
 >
 > This applies to `-B`, `-L`, `-U`, and `-T`. It does **not** apply to `-M` and
 > `-C`: bwa has no option that unsets either one, so `--meth` sets them

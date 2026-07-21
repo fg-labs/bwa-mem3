@@ -95,8 +95,10 @@ meth_bam_group_propagate_qcfail(group, n)
 This function scans all records in the group. If any record has `0x200` set, it
 propagates that flag to every other record in the group and clears `0x2`
 (proper pair) on all of them. This ensures that a chimeric or strand-filtered
-primary alignment also marks its supplementary alignments and the mate as
-QC-failed, preventing inconsistent flag states in the output BAM.
+primary alignment also marks its split hits and the mate as QC-failed,
+preventing inconsistent flag states in the output BAM. (Under `--meth` those
+split hits carry `0x100`, not `0x800` — see
+[`-M` and split alignments](flags.md#-m-and-split-alignments).)
 
 ## `@PG ID:bwa-mem3-meth` insertion
 
