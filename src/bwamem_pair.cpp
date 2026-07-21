@@ -75,6 +75,24 @@ int mem_infer_dir(int64_t l_pac, int64_t b1, int64_t b2, int64_t *dist)
     return (r1 == r2? 0 : 1) ^ (p2 > b1? 0 : 3);
 }
 
+/* Mate-rescue admission: is this anchor worth spending a rescue SW on?
+ *
+ * Extracted verbatim from the three identical copies that previously lived in
+ * mem_pair_resolve, mem_sam_pe_batch_pre and mem_sam_pe_batch_post.
+ *
+ * PURITY CONSTRAINT: mem_sam_pe_batch_pre and mem_sam_pe_batch_post walk this
+ * same candidate list and pair their results BY INDEX. The predicate must
+ * therefore be pure and depend only on values stable between the two passes --
+ * no batch state, no allocation-order effects. A divergence between them does
+ * not fail loudly; it silently misassigns rescue results to the wrong anchors.
+ * Keeping one definition makes that divergence structurally impossible rather
+ * than merely discouraged by comment. */
+static inline int mem_rescue_admit(const mem_opt_t *opt, const mem_alnreg_t *r,
+                                   int best_score)
+{
+    return r->score >= best_score - opt->pen_unpaired;
+}
+
 static int cal_sub(const mem_opt_t *opt, mem_alnreg_v *r)
 {
     int j;
@@ -482,7 +500,7 @@ int mem_pair_resolve(const mem_opt_t *opt, const bntseq_t *bns,
         kv_init(b[0]); kv_init(b[1]);
         for (i = 0; i < 2; ++i)
             for (j = 0; j < a[i].n; ++j)
-                if (a[i].a[j].score >= a[i].a[0].score  - opt->pen_unpaired)
+                if (mem_rescue_admit(opt, &a[i].a[j], a[i].a[0].score))
                     kv_push(mem_alnreg_t, b[i], a[i].a[j]);
 
         #if MATE_SORT
@@ -749,7 +767,7 @@ int mem_sam_pe_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
         kv_init(b[0]); kv_init(b[1]);
         for (i = 0; i < 2; ++i)
             for (j = 0; j < a[i].n; ++j)
-                if (a[i].a[j].score >= a[i].a[0].score  - opt->pen_unpaired)
+                if (mem_rescue_admit(opt, &a[i].a[j], a[i].a[0].score))
                     kv_push(mem_alnreg_t, b[i], a[i].a[j]);
 
         // NEW, batching
@@ -1034,7 +1052,7 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
         kv_init(b[0]); kv_init(b[1]);
         for (i = 0; i < 2; ++i)
             for (j = 0; j < a[i].n; ++j)
-                if (a[i].a[j].score >= a[i].a[0].score  - opt->pen_unpaired)
+                if (mem_rescue_admit(opt, &a[i].a[j], a[i].a[0].score))
                     kv_push(mem_alnreg_t, b[i], a[i].a[j]);
                 
         for (int l=0; l<a[0].n; l++)
