@@ -1466,9 +1466,21 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
         // assert(pos - smem_ptr + 1 < 6000);
         if (pos - smem_ptr + 1 >= smem_buf_size)
         {
-            int csize = smem_buf_size;
-            smem_buf_size *= 2;
-            sa_coord = (int64_t *) _mm_realloc(sa_coord, csize, opt->max_occ * smem_buf_size,
+            /* csize is in ELEMENTS, matching nsize (see _mm_realloc). sa_coord
+             * holds max_occ entries per SMEM, so the old element count is
+             * max_occ * smem_buf_size -- not smem_buf_size, which understated it
+             * by a factor of max_occ and left the tail of the buffer uncopied.
+             * Harmless today only because sa_coord's contents are dead here (the
+             * resolve that fills it runs after this grow), but it silently
+             * corrupts any caller that makes them live across the grow. */
+            int64_t csize = (int64_t)opt->max_occ * smem_buf_size;
+            /* A single read can yield more than 2x the current SMEM count, so
+             * one doubling may not be enough -- grow until the buffer holds the
+             * whole run, or the subsequent get_sa_entries* writes overrun it. */
+            while (pos - smem_ptr + 1 >= smem_buf_size)
+                smem_buf_size *= 2;
+            sa_coord = (int64_t *) _mm_realloc(sa_coord, csize,
+                                               (int64_t)opt->max_occ * smem_buf_size,
                                                sizeof(int64_t));
             assert(sa_coord != NULL);
         }
