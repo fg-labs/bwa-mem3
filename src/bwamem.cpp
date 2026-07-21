@@ -2938,6 +2938,21 @@ static inline int get_rlen(int n_cigar, const uint32_t *cigar)
 /************************ New functions, version2*****************************************/
 #define _get_pac(pac, l) ((pac)[(l)>>2]>>((~(l)&3)<<1)&3)
 
+void seqbuf_capacity_fatal(const char *buf_name, const char *func,
+                           int64_t current) {
+    fprintf(stderr,
+            "ERROR: %s in %s cannot grow past the int32 offset range "
+            "(at %lld bytes).\n"
+            "  The extension buffers are sized on a short-read model, so a "
+            "block of very long reads\n"
+            "  (HiFi/ONT) can exhaust them. Reduce the reads per block "
+            "(lower -K, or fewer threads),\n"
+            "  or split the input. Continuing would index outside the "
+            "allocation.\n",
+            buf_name, func, (long long)current);
+    exit(EXIT_FAILURE);
+}
+
 void* _mm_realloc(void *ptr, int64_t csize, int64_t nsize, int16_t dsize) {
     if (nsize <= csize)
     {
@@ -3909,9 +3924,11 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                         fprintf(stderr, "[%0.4d] Re-allocating (doubling) seqBufQers in %s (left)\n",
                                 tid, __func__);
                         int64_t tmp = *wsize_buf_qer;
-                        *wsize_buf_qer *= 2;
+                        *wsize_buf_qer = seqbuf_grow_capacity(tmp);
+                        if (*wsize_buf_qer == SEQBUF_CAPACITY_OVERFLOW)
+                            seqbuf_capacity_fatal("seqBufQer", __func__, tmp);
                         assert(*wsize_buf_qer > leftQerOffset);
-                        
+
                         uint8_t *seqBufQer_ = (uint8_t*)
                             _mm_realloc(seqBufLeftQer, tmp, *wsize_buf_qer, sizeof(uint8_t));
                         mmc->seqBufLeftQer[tid*CACHE_LINE] = seqBufLeftQer = seqBufQer_;
@@ -3931,7 +3948,10 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                         fprintf(stderr, "[%0.4d] Re-allocating (doubling) seqBufRefs in %s (left)\n",
                                 tid, __func__);
                         int64_t tmp = *wsize_buf_ref;
-                        *wsize_buf_ref *= 2;
+                        *wsize_buf_ref = seqbuf_grow_capacity(tmp);
+                        if (*wsize_buf_ref == SEQBUF_CAPACITY_OVERFLOW)
+                            seqbuf_capacity_fatal("seqBufRef", __func__, tmp);
+                        assert(*wsize_buf_ref > leftRefOffset);
                         uint8_t *seqBufRef_ = (uint8_t*)
                             _mm_realloc(seqBufLeftRef, tmp, *wsize_buf_ref, sizeof(uint8_t));
                         mmc->seqBufLeftRef[tid*CACHE_LINE] = seqBufLeftRef = seqBufRef_;
@@ -4141,9 +4161,11 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                         fprintf(stderr, "[%0.4d] Re-allocating (doubling) seqBufQers in %s (right)\n",
                                 tid, __func__);
                         int64_t tmp = *wsize_buf_qer;
-                        *wsize_buf_qer *= 2;
+                        *wsize_buf_qer = seqbuf_grow_capacity(tmp);
+                        if (*wsize_buf_qer == SEQBUF_CAPACITY_OVERFLOW)
+                            seqbuf_capacity_fatal("seqBufQer", __func__, tmp);
                         assert(*wsize_buf_qer > rightQerOffset);
-                        
+
                         uint8_t *seqBufQer_ = (uint8_t*)
                             _mm_realloc(seqBufLeftQer, tmp, *wsize_buf_qer, sizeof(uint8_t));
                         mmc->seqBufLeftQer[tid*CACHE_LINE] = seqBufLeftQer = seqBufQer_;
@@ -4159,7 +4181,10 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                         fprintf(stderr, "[%0.4d] Re-allocating (doubling) seqBufRefs in %s (right)\n",
                                 tid, __func__);
                         int64_t tmp = *wsize_buf_ref;
-                        *wsize_buf_ref *= 2;
+                        *wsize_buf_ref = seqbuf_grow_capacity(tmp);
+                        if (*wsize_buf_ref == SEQBUF_CAPACITY_OVERFLOW)
+                            seqbuf_capacity_fatal("seqBufRef", __func__, tmp);
+                        assert(*wsize_buf_ref > rightRefOffset);
                         uint8_t *seqBufRef_ = (uint8_t*)
                             _mm_realloc(seqBufLeftRef, tmp, *wsize_buf_ref, sizeof(uint8_t));
                         mmc->seqBufLeftRef[tid*CACHE_LINE] = seqBufLeftRef = seqBufRef_;

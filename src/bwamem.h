@@ -45,6 +45,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include <stdio.h>
 #include <assert.h>
 #include <limits.h>
+#include <stdint.h>   /* INT32_MAX -- seqbuf_grow_capacity() bound */
 #include <math.h>
 #include <vector>
 #include "kstring.h"
@@ -461,6 +462,35 @@ int mem_kernel2_core(FMI_search *fmi, const mem_opt_t *opt,
                      const uint8_t  *meth_orig_pac = NULL);
 
 void* _mm_realloc(void *ptr, int64_t csize, int64_t nsize, int16_t dsize);
+
+/* Sentinel returned by seqbuf_grow_capacity() when the doubled capacity could
+ * no longer be addressed by an int32 offset. */
+#define SEQBUF_CAPACITY_OVERFLOW ((int64_t)-1)
+
+/* Double a seqBuf* capacity, refusing to exceed the int32 offset range.
+ *
+ * Offsets into the extension buffers reach the SW kernels via SeqPair.idr/.idq
+ * (src/bandedSWA.h), which are int32_t, while the accumulators that feed them
+ * are int64_t. A capacity above INT32_MAX therefore yields offsets that narrow
+ * to a negative index on assignment, and the kernel then indexes outside the
+ * allocation. Long-read blocks reach this in ~5 doublings because the buffers
+ * are sized on a short-read model (MAX_SEQ_LEN_REF bytes of reference span per
+ * seed), so returning the sentinel here is what stops silent corruption.
+ *
+ * Returns the doubled capacity, or SEQBUF_CAPACITY_OVERFLOW if it would exceed
+ * what an int32 offset can address. */
+static inline int64_t seqbuf_grow_capacity(int64_t current) {
+    if (current > ((int64_t)INT32_MAX) / 2) return SEQBUF_CAPACITY_OVERFLOW;
+    return current * 2;
+}
+
+/* Report an unrepresentable seqBuf* growth and abort.
+ *
+ * Bounding memory properly requires flushing the accumulated SW batch when the
+ * buffers fill rather than growing without limit; until that exists, failing
+ * loudly with an actionable message beats corrupting the heap. */
+void seqbuf_capacity_fatal(const char *buf_name, const char *func,
+                           int64_t current);
 
 void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                                    const uint8_t *pac, bseq1_t *seq_, int nseq,
