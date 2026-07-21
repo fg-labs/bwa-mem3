@@ -1451,6 +1451,55 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
     // filter seq at early stage than this!, shifted to collect!!!
     // if (len < opt->min_seed_len) return chain; // if the query is shorter than the seed length, no match
 
+    /* Cross-read SA resolution (default ON; BWA3_SA_PER_READ=1 restores the
+     * per-read call for A/B).
+     *
+     * get_sa_entries_prefetch is a 20-lane refill pipeline over independent
+     * compressed-SA walks. Calling it once per read starves it: the median read
+     * supplies ~13 positions, so mean lane occupancy is only 10.5/20 and ~20% of
+     * all walk rounds run with a SINGLE lane active (fully serialized DRAM
+     * latency). The whole batch's SMEMs are already resident in matchArray,
+     * rid-sorted and rid-grouped, so resolving a run of reads per call keeps the
+     * lanes full. Measured -21..-28% on MEM_SA / -2.0..-2.4% on kernel time,
+     * byte-identical, across Graviton4 / Sapphire Rapids / Zen3.
+     *
+     * Order-preserving by construction: the per-read loop below consumes SMEM
+     * runs contiguously in matchArray order, and the staging loop inside
+     * get_sa_entries_prefetch enumerates each SMEM's occurrences with the
+     * identical stride/cap rule. A chunk's coordArray is therefore the exact
+     * concatenation of the per-read ones it covers, so each read's positions stay
+     * in that read's order and `mypos` is a simple cursor from the chunk base. */
+#if SA_COMPRESSION
+    /* Treat an explicit "0" as off, matching meth_seed_filter_enabled(): a
+     * presence-only check would let BWA3_SA_PER_READ=0 silently flip on per-read
+     * mode and quietly invalidate an A/B comparison run. */
+    static const int sa_per_read = []() {
+        const char *e = getenv("BWA3_SA_PER_READ");
+        return e != NULL && strcmp(e, "0") != 0;
+    }();
+    const int sa_across = !sa_per_read;
+#else
+    /* The walk inside get_sa_entries_prefetch assumes the compressed-SA index
+     * layout; an uncompressed build resolves via get_sa_entries below instead. */
+    const int sa_across = 0;
+#endif
+    /* Resolve in read-run-aligned chunks rather than one whole-batch call. Two
+     * independent reasons, and the tighter one sets the size:
+     *   1. Memory. A whole-batch position count is unbounded on repetitive input,
+     *      and get_sa_entries_prefetch's staging (t_sa) is thread_local and
+     *      grow-only, so one pathological batch would pin that high-water for the
+     *      life of the process.
+     *   2. Cache. Staging is 16 B/position across pos_ar+map_ar. Per-read it was
+     *      L1-resident; a whole batch (~58k positions) is ~930 KB and spills L2.
+     * 16k positions = 256 KB of staging, still three orders of magnitude more than
+     * the ~13-57 a single read supplies -- far past where occupancy saturates.
+     * A chunk sweep (1k..256k) is flat, so this is a comfortable default, not a
+     * tuned one. */
+    constexpr int64_t sa_chunk_positions = 16384;
+    int64_t mypos = 0;          /* cursor into sa_coord, relative to chunk start */
+    int64_t chunk_end = 0;      /* exclusive SMEM index resolved so far */
+    int64_t sa_cap = (int64_t)opt->max_occ * smem_buf_size;   /* sa_coord elements */
+
     uint64_t tim = __rdtsc();
     for (int l=0; l<nseq && pos < num_smem - 1; l++)
     {
@@ -1482,7 +1531,9 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
 
         // bwt_sa
         // assert(pos - smem_ptr + 1 < 6000);
-        if (pos - smem_ptr + 1 >= smem_buf_size)
+        /* sa_across grows sa_coord per chunk below; a grow here would move the
+         * buffer out from under the chunk it already filled. */
+        if (!sa_across && pos - smem_ptr + 1 >= smem_buf_size)
         {
             /* csize is in ELEMENTS, matching nsize (see _mm_realloc). sa_coord
              * holds max_occ entries per SMEM, so the old element count is
@@ -1530,12 +1581,62 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
             }
         }
 
-        int64_t id = 0, cnt_ = 0, mypos = 0;
+        int64_t id = 0, cnt_ = 0;
         #if SA_COMPRESSION
-        uint64_t tim = __rdtsc();
-        fmi->get_sa_entries_prefetch(&matchArray[smem_ptr], sa_coord, &cnt_,
-                                     pos - smem_ptr + 1, opt->max_occ, tid, id);  // sa compressed prefetch
-        tprof[MEM_SA][tid] += __rdtsc() - tim;
+        if (sa_across)
+        {
+            /* Start a new chunk when this read's run falls outside the resolved
+             * one. Chunk boundaries are read-run boundaries, so a read's
+             * positions are never split across two calls and `mypos` stays a
+             * simple cursor from the chunk's base. */
+            if (smem_ptr >= chunk_end)
+            {
+                int64_t need = 0, si = smem_ptr;
+                while (si < num_smem)
+                {
+                    /* Extend by one whole read-run (matchArray is rid-grouped). */
+                    int64_t run_start = si, run_need = 0;
+                    int32_t rid_cur = matchArray[si].rid;
+                    while (si < num_smem && matchArray[si].rid == rid_cur)
+                    {
+                        int64_t occ = matchArray[si].s;
+                        run_need += occ < opt->max_occ ? occ : opt->max_occ;
+                        si++;
+                    }
+                    /* Always take at least one run, even if it alone exceeds the
+                     * budget -- a single read must never be split. */
+                    if (need > 0 && need + run_need > sa_chunk_positions)
+                    {
+                        si = run_start;
+                        break;
+                    }
+                    need += run_need;
+                    if (need >= sa_chunk_positions) break;
+                }
+                chunk_end = si;
+                if (need > sa_cap)
+                {
+                    sa_coord = (int64_t *) _mm_realloc(sa_coord, sa_cap, need, sizeof(int64_t));
+                    assert(sa_coord != NULL);
+                    sa_cap = need;
+                }
+                uint64_t tim_sa = __rdtsc();
+                fmi->get_sa_entries_prefetch(&matchArray[smem_ptr], sa_coord, &cnt_,
+                                             chunk_end - smem_ptr, opt->max_occ, tid, id);
+                tprof[MEM_SA][tid] += __rdtsc() - tim_sa;
+                mypos = 0;
+            }
+        }
+        else
+        {
+            mypos = 0;   /* per-read path: sa_coord is rewritten for each read */
+            uint64_t tim = __rdtsc();
+            fmi->get_sa_entries_prefetch(&matchArray[smem_ptr], sa_coord, &cnt_,
+                                         pos - smem_ptr + 1, opt->max_occ, tid, id);  // sa compressed prefetch
+            tprof[MEM_SA][tid] += __rdtsc() - tim;
+        }
+        #else
+        mypos = 0;
         #endif
 
         for (i = smem_ptr; i <= pos; i++)
