@@ -22,6 +22,32 @@ EXE = fmi_test smem2_test bwt_seed_strategy_test sa2ref_test xeonbsw bandedswa_z
 # `run_unit_tests.sh` keep working during the framework-scaffolding PR.
 DOCTEST_BINS = bwa_mem3_tests_unit bwa_mem3_tests_integration
 
+# Guard: refuse a standalone link, point at the supported entry point.
+#
+# Every binary here links libhts.a, whose own dependencies (libdeflate, lzma,
+# bz2, ...) are whatever htslib's configure detected on this host. Those arrive
+# only as HTSLIB_static_LIBS/_LDFLAGS, propagated by the parent's
+# `test-binaries` recipe -- see the parent Makefile's htslib_static.mk include
+# for why they cannot be resolved here. Standalone they are empty, and the link
+# dies in a wall of undefined libdeflate_*/hts_* symbols that says nothing about
+# the actual mistake. Fail immediately with the fix instead.
+#
+# Non-linking goals (notably `clean`, which the parent also invokes directly)
+# stay available standalone.
+FROM_PARENT_MAKE ?=
+LINK_GOALS         := all framework unit integration $(DOCTEST_BINS) $(EXE)
+REQUESTED_LINK_GOALS := $(filter $(LINK_GOALS),$(or $(MAKECMDGOALS),all))
+
+ifeq ($(strip $(FROM_PARENT_MAKE)),)
+ifneq ($(strip $(REQUESTED_LINK_GOALS)),)
+$(error Building test binaries directly from test/ is not supported. \
+Run `make test-binaries` (or `make test`) from the repository root instead: \
+the htslib static-link flags are resolved by the parent Makefile and are \
+empty here, so linking $(REQUESTED_LINK_GOALS) would fail with undefined \
+libdeflate_*/hts_* symbols)
+endif
+endif
+
 UNAME_M := $(shell uname -m)
 UNAME_S := $(shell uname -s)
 IS_ARM  := $(filter $(UNAME_M),arm64 aarch64)

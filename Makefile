@@ -612,7 +612,8 @@ test-binaries: $(BWA_LIB) $(HTS_LIB)
 	    COVERAGE=$(COVERAGE) \
 	    ARCH_FLAGS_FROM_PARENT='$(ARCH_FLAGS)' \
 	    HTSLIB_static_LIBS='$(HTSLIB_static_LIBS)' \
-	    HTSLIB_static_LDFLAGS='$(HTSLIB_static_LDFLAGS)'
+	    HTSLIB_static_LDFLAGS='$(HTSLIB_static_LDFLAGS)' \
+	    FROM_PARENT_MAKE=1
 
 shm_section_find_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/shm_section_find_test.o
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/shm_section_find_test.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
