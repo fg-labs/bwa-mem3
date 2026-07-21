@@ -1,9 +1,55 @@
-# Flags: --meth-scoring, --set-as-failed, --chimera-qc
+# Flags: --meth chemistry, --meth-scoring, --set-as-failed, --chimera-qc
 
-`bwa-mem3 --meth` adds three flags. `--meth-scoring` selects the bisulfite
-scoring model; `--set-as-failed` and `--chimera-qc` control QC behavior during
-BAM post-processing (both affect the chimera QC and strand-filtering logic inside
-`meth_mem_aln_to_bam`, `src/meth_bam.cpp`).
+`--meth` itself takes an optional chemistry argument. Alongside it,
+`--meth-scoring` selects the scoring model; `--set-as-failed` and `--chimera-qc`
+control QC behavior during BAM post-processing (both affect the chimera QC and
+strand-filtering logic inside `meth_mem_aln_to_bam`, `src/meth_bam.cpp`).
+
+## `--meth[={emseq|taps}]`
+
+Selects the **methylation chemistry**. Defaults to `emseq`, so a bare `--meth`
+behaves exactly as it always has.
+
+| Value | Chemistry | Which cytosines convert to T |
+|-------|-----------|------------------------------|
+| `emseq` (default) | bisulfite / EM-seq | **un**methylated C (aliases: `em-seq`, `bisulfite`) |
+| `taps` | TET-assisted pyridine borane | **methylated** 5mC/5hmC |
+
+> **Use `--meth=taps`, not `--meth taps`.** The argument is optional, and
+> `getopt_long` only accepts optional arguments in the `=` form; a separate word
+> is parsed as a positional (i.e. your first FASTQ).
+
+**What the chemistry changes — and what it does not.** Both chemistries produce
+the *same* base change as far as the aligner can see (ref C → read T on the top
+strand, ref G → read A on the bottom). Seeding, the converted index, and the
+scoring matrices are therefore **shared**, which is why TAPS reads align correctly
+even without this flag. The chemistries differ only in *which* cytosines convert,
+and that inverts the meaning of the observed base when **calling** methylation:
+
+| Read base at a reference C | `emseq` | `taps` |
+|---|---|---|
+| `C` (retained) | methylated (`Z`) | **un**methylated (`z`) |
+| `T` (converted) | **un**methylated (`z`) | methylated (`Z`) |
+
+So the flag changes the `XM:Z` call polarity, and nothing else. CpG/CHG/CHH
+context classification is a property of the reference, not the chemistry, and is
+identical either way.
+
+> **Using `--meth` on TAPS data inverts every methylation call.** Measured on
+> 4.07 M simulated TAPS reads against full hg38, aligner `XM:Z` correlated
+> **r = −0.956** with truth over ~600 k CpG sites; with `--meth=taps` the same
+> reads give **r = +0.956** (RMSE 0.777 → 0.117). Percent methylation comes out
+> as `1 − truth`, silently. Always pass `=taps` for TAPS libraries, or suppress
+> `XM:Z` and call with a TAPS-aware extractor such as Rastair.
+
+**Scoring default.** `--meth=taps` defaults `--meth-scoring` to `genomic`
+(bare `--meth` still defaults to `collapsed`). TAPS converts only the methylated
+cytosines, so conversions are far sparser than under EM-seq — 3.2 % of cytosines
+versus 94.6 % on a matched chr22 simulation — and the collapsed 3-letter alphabet
+costs specificity it no longer buys back. Measured placement on the same TAPS set:
+`genomic` 95.72 %, plain 95.53 %, `collapsed` 95.40 %, against a 96.02 %
+unconverted baseline; `genomic` also placed 136 k more reads in the MAPQ 60+ bin
+at higher accuracy. An explicit `--meth-scoring` always wins.
 
 ## `--meth-scoring {collapsed|genomic}`
 

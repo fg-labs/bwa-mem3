@@ -147,6 +147,11 @@ typedef struct mem_opt_t {
     int    bam_level;       // 0..9, BGZF deflate level (0 = uncompressed)
     int    meth_mode;       // 1 = bisulfite mode (--meth); implies bam_mode
     int    meth_scoring;    // bisulfite matrix mode (--meth-scoring): MEM_METH_SCORING_{COLLAPSED,GENOMIC}
+    int    meth_chem;       // methylation chemistry (--meth=emseq|taps): meth_chem_t.
+                            // Selects XM:Z call polarity ONLY -- seeding, the
+                            // converted index and the scoring matrices are shared,
+                            // because both chemistries produce the same C->T /
+                            // G->A base change as far as the aligner can see.
     char   meth_set_as_failed;// 'f', 'r', or 0 — flag reads on that strand 0x200
     int    meth_chimera_qc; // 1 to enable bwameth.py-style longest-M <44% chimera heuristic (default off; not in Bismark)
     int    supp_rep_hard_cap; // supp alnregs whose chain's seeds share >=this many genome hits are forced to MAPQ=0; 0 disables

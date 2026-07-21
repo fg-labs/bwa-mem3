@@ -29,6 +29,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 *****************************************************************************************/
 
 #include "bwamem.h"
+#include "meth_xm.h"   /* meth_chem_t for the --meth chemistry default */
 #include "FMI_search.h"
 #include "smem_dedup.h"
 #include "bam_writer.h"
@@ -286,6 +287,7 @@ mem_opt_t *mem_opt_init()
     o->max_chain_extend = 1<<30;
     o->mapQ_coef_len = 50; o->mapQ_coef_fac = log(o->mapQ_coef_len);
     o->meth_scoring = MEM_METH_SCORING_COLLAPSED;  /* --meth default: bwameth-compatible */
+    o->meth_chem    = METH_CHEM_EMSEQ;             /* --meth default chemistry: bisulfite/em-seq */
     bwa_fill_scmat(o->a, o->b, o->mat);
     mem_opt_fill_meth_mat(o);
     return o;

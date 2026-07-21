@@ -1,9 +1,16 @@
 # Methylation Reference Overview
 
-`bwa-mem3 mem --meth` is a single-binary, single-command bisulfite/EM-seq
-aligner. One `bwa-mem3 index --meth` builds the reference, and one
+`bwa-mem3 mem --meth` is a single-binary, single-command methylation aligner,
+supporting both **bisulfite/EM-seq** (the default) and **TAPS**
+(`--meth=taps`). One `bwa-mem3 index --meth` builds the reference, and one
 `bwa-mem3 mem --meth` aligns raw FASTQ to a sorted-ready BAM — no Python, no
 piped read-conversion preprocessor, and no separate post-processing script.
+
+> **Pick the chemistry.** Both chemistries convert C→T as far as the aligner can
+> see, so the same index and scoring serve both — but they invert the *meaning*
+> of the observed base, so `XM:Z` calls come out backwards if the chemistry is
+> wrong. Bisulfite/EM-seq is the default; pass `--meth=taps` for TAPS libraries.
+> See [Flags](flags.md#--methemseqtaps).
 
 What sets it apart from the classic [bwameth.py](https://github.com/brentp/bwa-meth)
 approach is **where the alignment is scored**. bwameth.py converts the reads

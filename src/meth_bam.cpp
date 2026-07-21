@@ -465,7 +465,8 @@ int meth_mem_aln_to_bam(bam1_t *b,
         xm = meth_build_xm(bns, pac, tid, (int64_t)p.pos,
                            is_top_strand,
                            bam_cigar, (int)bam_n_cigar,
-                           seq_text, (int)l_emit);
+                           seq_text, (int)l_emit,
+                           (meth_chem_t)opt->meth_chem);
     }
 
     /* Build the bam1_t. bam_set1 handles 4-bit packing, name storage, etc. */
