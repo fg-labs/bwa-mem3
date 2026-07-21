@@ -75,22 +75,46 @@ int mem_infer_dir(int64_t l_pac, int64_t b1, int64_t b2, int64_t *dist)
     return (r1 == r2? 0 : 1) ^ (p2 > b1? 0 : 3);
 }
 
-/* Mate-rescue admission: is this anchor worth spending a rescue SW on?
+/* ---------------------------------------------------------------------------
+ * Mate-rescue admission.
  *
- * Extracted verbatim from the three identical copies that previously lived in
- * mem_pair_resolve, mem_sam_pe_batch_pre and mem_sam_pe_batch_post.
+ * An anchor is worth a mate-rescue SW only if it is BOTH near this read's best
+ * AND plausible in absolute terms. The relative term alone (upstream bwa's
+ * `score >= best - pen_unpaired`) inverts under degradation: as the best score
+ * falls, the bar falls with it and admits MORE junk, so marginally-mappable
+ * input (bisulfite/EM-seq 3-letter collapse, wrong or diverged reference,
+ * related-species contamination) drives fan-out to the max_matesw cap.
+ * See reports/2026-07-20-marginal-mappability-mate-rescue-pathology.md.
+ *
+ * On a clean read the relative term already binds far above any sane floor
+ * (best ~150 admits only >=133), so the floor cannot bind there by
+ * construction: this is a no-op exactly where current behaviour is fine.
  *
  * PURITY CONSTRAINT: mem_sam_pe_batch_pre and mem_sam_pe_batch_post walk this
- * same candidate list and pair their results BY INDEX. The predicate must
- * therefore be pure and depend only on values stable between the two passes --
- * no batch state, no allocation-order effects. A divergence between them does
- * not fail loudly; it silently misassigns rescue results to the wrong anchors.
- * Keeping one definition makes that divergence structurally impossible rather
- * than merely discouraged by comment. */
-static inline int mem_rescue_admit(const mem_opt_t *opt, const mem_alnreg_t *r,
-                                   int best_score)
+ * same candidate list and pair results BY INDEX. The predicate must therefore
+ * be pure and depend only on values stable between the two passes -- no batch
+ * state, no allocation-order effects. A divergence silently misassigns rescue
+ * results to the wrong anchors rather than failing loudly.
+ * ------------------------------------------------------------------------- */
+static inline int mem_rescue_floor(const mem_opt_t *opt, int l_seq)
 {
-    return r->score >= best_score - opt->pen_unpaired;
+    switch (opt->rescue_floor_mode) {
+    case MEM_RESCUE_FLOOR_ABS:
+        return opt->rescue_floor_abs;
+    case MEM_RESCUE_FLOOR_FRAC:
+        return (int)(opt->rescue_floor_frac * (float)l_seq * (float)opt->a + .499f);
+    case MEM_RESCUE_FLOOR_OFF:
+    default:
+        return 0;
+    }
+}
+
+static inline int mem_rescue_admit(const mem_opt_t *opt, const mem_alnreg_t *r,
+                                   int best_score, int l_seq)
+{
+    if (r->score < best_score - opt->rescue_margin) return 0;
+    if (opt->rescue_floor_mode == MEM_RESCUE_FLOOR_OFF) return 1;
+    return r->score >= mem_rescue_floor(opt, l_seq);
 }
 
 static int cal_sub(const mem_opt_t *opt, mem_alnreg_v *r)
@@ -500,7 +524,7 @@ int mem_pair_resolve(const mem_opt_t *opt, const bntseq_t *bns,
         kv_init(b[0]); kv_init(b[1]);
         for (i = 0; i < 2; ++i)
             for (j = 0; j < a[i].n; ++j)
-                if (mem_rescue_admit(opt, &a[i].a[j], a[i].a[0].score))
+                if (mem_rescue_admit(opt, &a[i].a[j], a[i].a[0].score, s[i].l_seq))
                     kv_push(mem_alnreg_t, b[i], a[i].a[j]);
 
         #if MATE_SORT
@@ -767,7 +791,7 @@ int mem_sam_pe_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
         kv_init(b[0]); kv_init(b[1]);
         for (i = 0; i < 2; ++i)
             for (j = 0; j < a[i].n; ++j)
-                if (mem_rescue_admit(opt, &a[i].a[j], a[i].a[0].score))
+                if (mem_rescue_admit(opt, &a[i].a[j], a[i].a[0].score, s[i].l_seq))
                     kv_push(mem_alnreg_t, b[i], a[i].a[j]);
 
         // NEW, batching
@@ -1052,7 +1076,7 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
         kv_init(b[0]); kv_init(b[1]);
         for (i = 0; i < 2; ++i)
             for (j = 0; j < a[i].n; ++j)
-                if (mem_rescue_admit(opt, &a[i].a[j], a[i].a[0].score))
+                if (mem_rescue_admit(opt, &a[i].a[j], a[i].a[0].score, s[i].l_seq))
                     kv_push(mem_alnreg_t, b[i], a[i].a[j]);
                 
         for (int l=0; l<a[0].n; l++)

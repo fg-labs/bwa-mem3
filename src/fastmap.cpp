@@ -917,6 +917,10 @@ static void update_a(mem_opt_t *opt, const mem_opt_t *opt0)
         if (!opt0->pen_clip5) opt->pen_clip5 *= opt->a;
         if (!opt0->pen_clip3) opt->pen_clip3 *= opt->a;
         if (!opt0->pen_unpaired) opt->pen_unpaired *= opt->a;
+        /* rescue_margin must scale with -A exactly as pen_unpaired does: it
+         * inherited pen_unpaired's role in rescue admission, so any divergence
+         * here would change admission under a non-default -A. */
+        if (!opt0->rescue_margin) opt->rescue_margin *= opt->a;
     }
 }
 
@@ -943,6 +947,8 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "    -D FLOAT      drop chains shorter than FLOAT fraction of the longest overlapping chain [%.2f]\n", opt->drop_ratio);
     fprintf(stderr, "    -W INT        discard a chain if seeded bases shorter than INT [0]\n");
     fprintf(stderr, "    -m INT        perform at most INT rounds of mate rescues for each read [%d]\n", opt->max_matesw);
+    fprintf(stderr, "    --rescue-admit off|abs:N|frac:F  absolute floor on mate-rescue admission: an anchor is only rescued from if it also scores >= N (abs) or >= F * read_len * -A (frac). The default relative bar (best - margin) falls as read quality falls, so marginally-mappable input (wrong/diverged reference, contamination, bisulfite without --meth) inflates rescue work; a floor is inert on clean reads and prunes hardest exactly there. Opt-in, NOT byte-identical when enabled [%s]\n", opt->rescue_floor_mode == MEM_RESCUE_FLOOR_OFF? "off" : (opt->rescue_floor_mode == MEM_RESCUE_FLOOR_ABS? "abs":"frac"));
+    fprintf(stderr, "    --rescue-margin INT  mate-rescue admission margin: rescue anchors scoring within INT of the read's best. Defaults to -U, which sets both this and the unpaired penalty (as in bwa); set this to separate the two [%d]\n", opt->rescue_margin);
     fprintf(stderr, "    -S            skip mate rescue\n");
     fprintf(stderr, "    -P            skip pairing; mate rescue performed unless -S also in use\n");
     fprintf(stderr, "    --fast        speed preset: -m 10 -y 0 --min-ext-len 30 --smem-dedup\n");
@@ -1127,6 +1133,8 @@ int main_mem(int argc, char *argv[])
         OPT_LEGACY_READER,
         OPT_MIN_EXT_LEN,
         OPT_MAX_EXTEND_CHAINS,
+        OPT_RESCUE_MARGIN,
+        OPT_RESCUE_ADMIT,
         OPT_SEED_ORDER,
         OPT_SMEM_DEDUP,
         OPT_FAST,
@@ -1142,6 +1150,8 @@ int main_mem(int argc, char *argv[])
         {"bam",                      optional_argument, 0, OPT_BAM},
         {"min-ext-len",              required_argument, 0, OPT_MIN_EXT_LEN},
         {"max-extend-chains",        required_argument, 0, OPT_MAX_EXTEND_CHAINS},
+        {"rescue-margin",            required_argument, 0, OPT_RESCUE_MARGIN},
+        {"rescue-admit",             required_argument, 0, OPT_RESCUE_ADMIT},
         {"smem-dedup",               no_argument,       0, OPT_SMEM_DEDUP},
         {"fast",                     no_argument,       0, OPT_FAST},
         {"skip-contained-ext",       no_argument,       0, OPT_SKIP_CONTAINED_EXT},
@@ -1169,14 +1179,39 @@ int main_mem(int argc, char *argv[])
         if (c == 'k') opt->min_seed_len = atoi(optarg), opt0.min_seed_len = 1;
         else if (c == OPT_MIN_EXT_LEN) opt->min_ext_len = atoi(optarg), opt0.min_ext_len = 1;
         else if (c == OPT_MAX_EXTEND_CHAINS) opt->max_extend_chains = atoi(optarg), opt0.max_extend_chains = 1;
+        else if (c == OPT_RESCUE_MARGIN) opt->rescue_margin = atoi(optarg), opt0.rescue_margin = 1;
+        else if (c == OPT_RESCUE_ADMIT) {
+            /* --rescue-admit=off | abs:N | frac:F  (experimental sweep knob) */
+            if (strcmp(optarg, "off") == 0) {
+                opt->rescue_floor_mode = MEM_RESCUE_FLOOR_OFF;
+            } else if (strncmp(optarg, "abs:", 4) == 0) {
+                opt->rescue_floor_mode = MEM_RESCUE_FLOOR_ABS;
+                opt->rescue_floor_abs = atoi(optarg + 4);
+            } else if (strncmp(optarg, "frac:", 5) == 0) {
+                opt->rescue_floor_mode = MEM_RESCUE_FLOOR_FRAC;
+                opt->rescue_floor_frac = (float)atof(optarg + 5);
+            } else {
+                fprintf(stderr, "[E::%s] --rescue-admit expects off | abs:N | frac:F, got '%s'\n",
+                        __func__, optarg);
+                return 1;
+            }
+        }
         else if (c == '1') no_mt_io = 1;
         else if (c == 'x') mode = optarg;
         else if (c == 'w') opt->w = atoi(optarg), opt0.w = 1;
         else if (c == 'A') opt->a = atoi(optarg), opt0.a = 1, assert(opt->a >= INT_MIN && opt->a <= INT_MAX);
         else if (c == 'B') opt->b = atoi(optarg), opt0.b = 1, assert(opt->b >= INT_MIN && opt->b <= INT_MAX);
         else if (c == 'T') opt->T = atoi(optarg), opt0.T = 1, assert(opt->T >= INT_MIN && opt->T <= INT_MAX);
-        else if (c == 'U')
-            opt->pen_unpaired = atoi(optarg), opt0.pen_unpaired = 1, assert(opt->pen_unpaired >= INT_MIN && opt->pen_unpaired <= INT_MAX);
+        else if (c == 'U') {
+            /* -U keeps its documented meaning, which in upstream bwa covers BOTH the
+             * paired-vs-unpaired decision and the mate-rescue admission margin
+             * (docs/src/cli/mem.md: "affects mate-rescue scoring"). Setting both here
+             * preserves that behaviour exactly, so existing -U users see no change.
+             * --rescue-margin exists for callers who want to separate the two. */
+            opt->pen_unpaired = atoi(optarg), opt0.pen_unpaired = 1;
+            assert(opt->pen_unpaired >= INT_MIN && opt->pen_unpaired <= INT_MAX);
+            if (!opt0.rescue_margin) opt->rescue_margin = opt->pen_unpaired;
+        }
         else if (c == 't')
             opt->n_threads = atoi(optarg), opt->n_threads = opt->n_threads > 1? opt->n_threads : 1, assert(opt->n_threads >= INT_MIN && opt->n_threads <= INT_MAX);
         else if (c == 'o' || c == 'f')
@@ -1528,7 +1563,18 @@ int main_mem(int argc, char *argv[])
     if (opt->meth_mode) {
         if (!opt0.pen_clip5)    opt->pen_clip5   = 10;
         if (!opt0.pen_clip3)    opt->pen_clip3   = 10;
-        if (!opt0.pen_unpaired) opt->pen_unpaired = 100;  /* bwameth -U 100 (paired) */
+        /* bwameth -U 100 (paired). In upstream bwa this also widens the mate-rescue
+         * admission margin, and bwameth invokes real bwa -- so reproducing BOTH is
+         * what makes --meth a faithful bwameth drop-in. rescue_margin is therefore
+         * set to match, preserving current behaviour exactly.
+         * This is deliberate, not an oversight: measurement shows --meth fan-out is
+         * ~2.5 candidates/end (vs 34.7 for the same reads in plain mode), so the wide
+         * margin costs nothing here -- there is no pathology to fix under --meth.
+         * See reports/2026-07-20-design-rescue-admission-criterion.md. */
+        if (!opt0.pen_unpaired) {
+            opt->pen_unpaired = 100;                            /* bwameth -U 100 */
+            if (!opt0.rescue_margin) opt->rescue_margin = 100;  /* keep bwa's coupling */
+        }
         if (!opt0.T)            opt->T           = 40;
         opt->flag |= MEM_F_NO_MULTI;   /* -M */
         aux.copy_comment = 1;          /* -C, needed for YS:Z/YC:Z passthrough */

@@ -67,6 +67,13 @@ typedef struct __smem_i smem_i;
 #define MEM_F_ALL       0x8
 #define MEM_F_NO_MULTI  0x10
 #define MEM_F_NO_RESCUE 0x20
+
+/* Absolute-floor mode for mate-rescue admission (mem_opt_t::rescue_floor_mode).
+ * OFF reproduces upstream behaviour exactly and is the default. See
+ * reports/2026-07-20-design-rescue-admission-criterion.md. */
+#define MEM_RESCUE_FLOOR_OFF  0
+#define MEM_RESCUE_FLOOR_ABS  1
+#define MEM_RESCUE_FLOOR_FRAC 2
 #define MEM_F_REF_HDR   0x100
 #define MEM_F_SOFTCLIP  0x200
 #define MEM_F_SMARTPE   0x400
@@ -96,7 +103,20 @@ typedef struct mem_opt_t {
     int a, b;               // match score and mismatch penalty
     int o_del, e_del;
     int o_ins, e_ins;
-    int pen_unpaired;       // phred-scaled penalty for unpaired reads
+    int pen_unpaired;       // phred-scaled penalty for unpaired reads. Used ONLY for the
+                            // paired-vs-unpaired decision (score_un). It is deliberately NOT
+                            // used to gate mate-rescue admission -- see rescue_margin.
+    int rescue_margin;      // mate-rescue admission margin: an anchor is a rescue candidate only
+                            // if score >= best - rescue_margin. Defaults to 17, the value
+                            // pen_unpaired used to supply, so the default path is unchanged.
+                            // Split out because pen_unpaired answers a different question
+                            // ("is pairing worth this much?") and --meth sets it to 100 for
+                            // bwameth compat, which silently widened rescue admission 6x.
+    int rescue_floor_mode;  // MEM_RESCUE_FLOOR_*: absolute plausibility floor on rescue
+                            // admission. OFF (default) = byte-identical to baseline.
+    int rescue_floor_abs;   // ABS mode: minimum absolute anchor score to be rescued from.
+    float rescue_floor_frac;// FRAC mode: minimum anchor score as a fraction of perfect score
+                            // (l_seq * a); length-normalized alternative to rescue_floor_abs.
     int pen_clip5,pen_clip3;// clipping penalty. This score is not deducted from the DP score.
     int w;                  // band width
     int zdrop;              // Z-dropoff

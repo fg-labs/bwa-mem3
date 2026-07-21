@@ -158,7 +158,7 @@ individual flags are unaffected.
 | `-O INT[,INT]` | 6,6 | Gap open penalty for deletions and insertions respectively. |
 | `-E INT[,INT]` | 1,1 | Gap extension penalty per base. A gap of length k costs `-O + -E * k`. |
 | `-L INT[,INT]` | 5,5 | Clipping penalty for 5' and 3' ends. |
-| `-U INT` | 17 | Penalty for an unpaired read pair (affects mate-rescue scoring). |
+| `-U INT` | 17 | Penalty for an unpaired read pair. Also sets the mate-rescue admission margin (as in bwa); use [`--rescue-margin`](#--rescue-margin-int--rescue-admission-margin) to set the two independently. |
 | `-T INT` | 30 | Minimum alignment score to output. Alignments below this threshold are not reported. |
 
 > **Note — --meth overrides scoring defaults**
@@ -185,6 +185,37 @@ Maximum number of mate-rescue attempts per read. Reduce to speed up alignment
 on data where the default (50) wastes time on unrescuable pairs. See
 [Settings profiles](../best-practices/settings-profiles.md) for the benchmarked
 `-m 10` recommendation.
+
+#### `--rescue-admit off|abs:N|frac:F` — absolute floor on rescue admission
+
+Adds an absolute plausibility floor to mate-rescue admission. By default an anchor is a rescue candidate if it scores within `--rescue-margin` of the read's own best alignment. That bar is *relative*, so it falls as alignment quality falls: a clean 150 bp read (best ≈ 150) admits anchors ≥ 133, while a marginally-mappable read (best ≈ 25) admits anchors ≥ 8. Degraded input therefore generates more rescue work, not less.
+
+With a floor set, an anchor must additionally clear an absolute score:
+
+| mode | floor | notes |
+|------|-------|-------|
+| `off` | none | default; identical to previous behaviour |
+| `abs:N` | `N` | fixed score, tuned for short reads |
+| `frac:F` | `F * read_len * -A` | fraction of the perfect score; length-normalised |
+
+On clean data the floor is inert by construction — the relative bar already admits only near-perfect anchors, well above any sensible floor — so it engages only where alignment is genuinely marginal: a wrong or diverged reference, related-species contamination, or bisulfite data run **without** `--meth`.
+
+Measured on 100k simulated pairs vs GRCh38 with `--rescue-admit=abs:30`:
+
+| input | effect |
+|-------|--------|
+| clean | output unchanged, no measurable time difference |
+| 15% diverged (wrong-reference proxy) | 1.19x faster; −93 confident-correct, −110 confident-mismapped |
+
+On the same data `-m 10` gives 1.28x while moving only 6 confident reads, so **the count cap is the better lever at moderate divergence**. The floor's advantage is that it is provably inert on clean data and that its benefit scales with how degraded the input is.
+
+This is opt-in and **not** byte-identical when enabled.
+
+> **Not a substitute for `--meth`.** Bisulfite data aligned *without* `--meth` shows extreme rescue fan-out (34.66 candidates per read end vs 2.55 with `--meth`), and a floor speeds that up substantially — but that configuration is a mistake, not a workload. The fix is to add `--meth`, which takes placement from 14.7% to 95.4% correct. Do not reach for `--rescue-admit` to paper over a missing `--meth`.
+
+#### `--rescue-margin INT` — rescue admission margin
+
+Rescue anchors scoring within INT of the read's best alignment. Defaults to `-U`, which sets both this and the unpaired penalty — matching bwa, where the two are the same knob. Set `--rescue-margin` explicitly to control admission independently of the paired-vs-unpaired scoring decision.
 
 #### `-S` — skip mate rescue
 

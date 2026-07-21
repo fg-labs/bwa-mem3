@@ -255,6 +255,13 @@ mem_opt_t *mem_opt_init()
     o->T = 30;
     o->zdrop = 100;
     o->pen_unpaired = 17;
+    /* Mate-rescue admission. rescue_margin defaults to the value pen_unpaired
+     * used to supply, and the floor defaults to OFF, so the predicate reduces
+     * to upstream's `score >= best - 17` and the default path is unchanged. */
+    o->rescue_margin = 17;
+    o->rescue_floor_mode = MEM_RESCUE_FLOOR_OFF;
+    o->rescue_floor_abs = 0;
+    o->rescue_floor_frac = 0.0f;
     o->pen_clip5 = o->pen_clip3 = 5;
 
     o->max_mem_intv = 20;
