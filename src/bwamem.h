@@ -89,8 +89,12 @@ typedef struct __smem_i smem_i;
  *              mismatch (-B 4). For TAPS, whose conversions are sparse (~3% of C),
  *              a full-match reward over-credits spurious C->T alignments; scoring
  *              the conversion neutrally measured ~+0.25 pp placement over GENOMIC
- *              at every methylation load. NOT rank-1 (the freed value is neither
- *              match nor mismatch), so it forces the scalar mate-rescue path.
+ *              at every methylation load. Not rank-1 (the freed value is neither
+ *              match nor mismatch), but the generalized kswv freed-cell blend
+ *              scores the cell to its matrix value, so mate rescue is batched on
+ *              the freed-capable tiers (NEON/AVX2/AVX512BW) exactly like
+ *              GENOMIC/COLLAPSED, and falls back to scalar ksw_align2 on the
+ *              freed-less x86 tiers (sse41/sse42/avx) as all three modes do.
  *              See reports/2026-07-20-taps-alignment-experiment-results.md. */
 enum mem_meth_scoring { MEM_METH_SCORING_COLLAPSED = 0, MEM_METH_SCORING_GENOMIC = 1,
                         MEM_METH_SCORING_NEUTRAL = 2 };

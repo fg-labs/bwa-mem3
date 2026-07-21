@@ -171,12 +171,15 @@ public:
      * tier cannot express, so the caller must route those pairs to the scalar
      * fallback (ksw_align2). Two reasons it can be true:
      *   - the matrix shape is unsupported: a non-mirror multi-cell free, a
-     *     changed diagonal, or a freed value != w_match; or
+     *     changed diagonal, or a freed value outside [w_mismatch, w_match]
+     *     (outside that domain the 8-bit kernel's biased-u8 blend would wrap);
+     *     or
      *   - the running tier lacks the freed-cell kernel override. Only the NEON,
      *     AVX2, and AVX-512BW kernels implement it; an SSE41/SSE42/AVX kswv
      *     reports true for any freed-cell matrix.
-     * A symmetric matrix, a rank-1 freed cell (bisulfite genomic OT/OB), or an
-     * exact mirrored freed pair (collapsed --meth) returns false on a tier that
+     * A symmetric matrix, a single freed cell scored to ANY in-domain value
+     * (bisulfite genomic OT/OB frees it to +a, neutral to 0), or an exact
+     * mirrored freed pair (collapsed --meth) returns false on a tier that
      * implements the override. Declared on the abstract interface so the
      * dispatcher never depends on the concrete kswv layout. */
     virtual bool needsScalar() const = 0;
@@ -192,12 +195,12 @@ std::unique_ptr<Ikswv> make_kswv(
 
 /* Mat-aware factory overload (issue 173). `mat25` is the 5x5 scoring matrix
  * the caller will use for SW; when non-null and asymmetric, the ctor detects
- * the rank-1 freed cell (bisulfite OT/OB) or flags needsScalar() for any
- * richer asymmetry. `mat25 == nullptr` (or a symmetric matrix) reproduces the
- * 9-arg behavior exactly. The sign convention matches make_kswv's existing
- * callers: w_match is +a, w_mismatch is -b (negative), and mat25's
- * off-diagonals are likewise the negated penalty — passed straight through to
- * the Task-1 detectors without re-negation. */
+ * the freed cell (bisulfite OT/OB) and the value it is freed to, or flags
+ * needsScalar() for any richer asymmetry. `mat25 == nullptr` (or a symmetric
+ * matrix) reproduces the 9-arg behavior exactly. The sign convention matches
+ * make_kswv's existing callers: w_match is +a, w_mismatch is -b (negative),
+ * and mat25's off-diagonals are likewise the negated penalty — passed straight
+ * through to the Task-1 detectors without re-negation. */
 std::unique_ptr<Ikswv> make_kswv(
     int o_del, int e_del, int o_ins, int e_ins,
     int8_t w_match, int8_t w_mismatch,
@@ -245,7 +248,8 @@ public:
 		 int numThreads, int32_t maxRefLen, int32_t maxQerLen);
 
 	/* Mat-aware ctor (issue 173): same as above, plus a 5x5 scoring matrix
-	 * used to detect the rank-1 freed cell. `mat25 == nullptr` reproduces the
+	 * used to detect the freed cell(s) and the value they are freed to.
+	 * `mat25 == nullptr` reproduces the
 	 * 9-arg ctor exactly. Delegates to the 9-arg ctor, then runs detection. */
 	kswv(const int o_del, const int e_del, const int o_ins,
 		 const int e_ins, const int8_t w_match, const int8_t w_mismatch,
@@ -305,7 +309,7 @@ private:
 						   int phase);
 
 	/* Thin dispatcher: selects the HasFreed template instantiation based on
-	 * the rank-1 freed-cell flag. The <false> instantiation dead-code-
+	 * the freed-cell flag. The <false> instantiation dead-code-
 	 * eliminates every freed-cell override block, giving codegen identical to
 	 * the pre-issue-173 kernel for the non-meth path. */
 	int kswv_neon_u8(uint8_t seq1SoA[],
@@ -319,8 +323,8 @@ private:
 				     int32_t numPairs,
 				     int phase);
 
-	/* Templated u8 kernel body. When HasFreed, applies the rank-1 freed-cell
-	 * (fr_ref x fr_read -> match) override per cell; otherwise the override
+	/* Templated u8 kernel body. When HasFreed, applies the freed-cell
+	 * (fr_ref x fr_read -> fr_val) override per cell; otherwise the override
 	 * blocks compile out entirely. */
 	template<bool HasFreed>
 	int kswv_neon_u8_impl(uint8_t seq1SoA[],
@@ -386,7 +390,7 @@ private:
 								int phase);
 
 	/* Thin dispatcher: selects the HasFreed template instantiation based on
-	 * the rank-1 freed-cell flag. The <false> instantiation dead-code-
+	 * the freed-cell flag. The <false> instantiation dead-code-
 	 * eliminates every freed-cell override block, giving codegen identical to
 	 * the pre-issue-173 kernel for the non-meth path. Mirrors kswv_neon_u8. */
 	int kswv256_u8(uint8_t seq1SoA[],
@@ -456,7 +460,7 @@ private:
 						   int phase);
 
 	/* Thin dispatcher: selects the HasFreed template instantiation based on
-	 * the rank-1 freed-cell flag. See kswv256_u8 / kswv_neon_u8. */
+	 * the freed-cell flag. See kswv256_u8 / kswv_neon_u8. */
 	int kswv512_u8(uint8_t seq1SoA[],
 				   uint8_t seq2SoA[],
 				   int16_t nrow,
@@ -530,12 +534,18 @@ private:
 	// const int8_t *mat;
 
 	/* Freed-cell descriptor (issue 173), populated by the mat-aware ctor.
-	 * `has_freed` ⇒ off-diagonal cells were freed to a match (bisulfite). The
-	 * kernel frees a SYMMETRIC PAIR of cells: (fr_ref x fr_read) and
-	 * (fr_ref2 x fr_read2). GENOMIC (rank-1) frees ONE cell, so the mirror
+	 * `has_freed` ⇒ off-diagonal cells were freed from their symmetric value
+	 * (bisulfite). The kernel frees a SYMMETRIC PAIR of cells: (fr_ref x
+	 * fr_read) and (fr_ref2 x fr_read2). GENOMIC and NEUTRAL free ONE cell
+	 * (to +a and to 0 respectively), so the mirror
 	 * equals the primary (fr_ref2==fr_ref, fr_read2==fr_read) and the second
 	 * blend is idempotent. COLLAPSED (the --meth default) frees the conversion
 	 * cell AND its mirror, so (fr_ref2,fr_read2) = (fr_read,fr_ref).
+	 * `fr_val` is the VALUE the freed cell(s) score to: w_match for GENOMIC and
+	 * COLLAPSED (freed to a match), or any other constant for a single-cell free
+	 * that is not a match (NEUTRAL frees the conversion cell to 0). The kernel
+	 * blends the freed cell(s) to fr_val (biased by +shift in the 8-bit domain),
+	 * so fr_val==w_match reproduces the pre-generalization match blend exactly.
 	 * `needs_scalar` ⇒ the matrix is asymmetric in a way the kernel cannot
 	 * express (non-mirror multi-cell, changed diagonal, …) and the caller must
 	 * fall back to scalar. The 9-arg ctor leaves all false. ABI note: these live
@@ -543,6 +553,9 @@ private:
 	 * includes this same kswv.h. */
 	int8_t fr_ref = 0, fr_read = 0;
 	int8_t fr_ref2 = 0, fr_read2 = 0;
+	int8_t fr_val = 0;   /* set to w_match in the mat-aware ctor unless a single
+	                        non-match cell was freed (NEUTRAL); default 0 is unused
+	                        when has_freed is false. */
 	bool has_freed = false;
 	bool needs_scalar = false;
 

@@ -1,13 +1,14 @@
 // Issue 173 / Task 2: mat-aware make_kswv freed-cell detection.
 //
-// The kswv factory learns a per-strand asymmetric (rank-1 freed-cell)
+// The kswv factory learns a per-strand asymmetric (freed-cell)
 // substitution for bisulfite (--meth). A symmetric matrix (or nullptr)
 // constructs the existing kernel unchanged; a matrix that frees exactly one
-// ordered off-diagonal cell to a match (OT: ref-C/read-T, OB: ref-G/read-A)
-// records that freed cell and is handled by the kernel; an exact mirrored pair
-// (collapsed --meth) is likewise handled; any other asymmetric matrix (a
-// non-mirror multi-cell free, changed diagonal, non-match freed value) routes
-// to the scalar fallback (needsScalar() == true).
+// ordered off-diagonal cell (OT: ref-C/read-T, OB: ref-G/read-A) to ANY value
+// records that freed cell and its value and is handled by the kernel — a match
+// (+a) under GENOMIC, 0 under NEUTRAL; an exact mirrored pair (collapsed
+// --meth) is likewise handled; any other asymmetric matrix (a non-mirror
+// multi-cell free, changed diagonal) routes to the scalar fallback
+// (needsScalar() == true).
 //
 // Two layers are tested: (1) ctor-side detection (needsScalar) on every tier,
 // and (2) the kernel actually APPLYING the freed cell via getScores8. Layer (2)
@@ -34,9 +35,10 @@ static void fill_sym(int8_t m[25], int a, int b) {
 // make_kswv reports needsScalar() == true for a freed-cell matrix (so the caller
 // routes to scalar ksw_align2), and getScores8/16 are unreachable exit() stubs.
 // The freed-cell DETECTION cases below therefore assert needsScalar() == !FREED
-// for rank-1/mirror matrices, and the score-delta cases (which call getScores8)
-// run only when FREED — on a scalar-only tier the fallback contract is what the
-// detection cases verify, and there is no kernel score to compare.
+// for single-cell (any freed value) and mirror matrices, and the score-delta
+// cases (which call getScores8) run only when FREED — on a scalar-only tier the
+// fallback contract is what the detection cases verify, and there is no kernel
+// score to compare.
 //
 // This gate is derived from the INDEPENDENT SIMD dispatch tier
 // (bwamem3_simd_tier, which is the same tier make_kswv dispatches on and which
@@ -62,8 +64,8 @@ static bool tier_supports_freed_cell() {
 
 // Run getScores8 over a single ref/read pair through the batched NEON 8-bit
 // kernel and return aln[0].score. `mat25 == nullptr` constructs the symmetric
-// kernel (no freed cell); a meth matrix sets has_freed and applies the rank-1
-// override. Ref/read are base-encoded (A=0,C=1,G=2,T=3). The pair is laid out
+// kernel (no freed cell); a meth matrix sets has_freed and blends the freed
+// cell to fr_val. Ref/read are base-encoded (A=0,C=1,G=2,T=3). The pair is laid out
 // so the optimal local alignment is the full diagonal — every column is a
 // match except the deliberately planted converted base.
 static int score8(const std::vector<uint8_t>& ref,
@@ -105,8 +107,8 @@ TEST_CASE("kswv symmetric matrix is not a freed-cell case") {
     auto k = make_kswv(6,1,6,1, 1,-4, 1, 256,256, m);
     CHECK(k->needsScalar() == false);                      // symmetric ⇒ normal kernel
 }
-TEST_CASE("kswv non-rank1 asymmetric falls back to scalar") {
-    int8_t m[25]; fill_sym(m,1,4); m[1*5+3]=1; m[2*5+0]=1; // two freed cells
+TEST_CASE("kswv non-mirror multi-cell asymmetric falls back to scalar") {
+    int8_t m[25]; fill_sym(m,1,4); m[1*5+3]=1; m[2*5+0]=1; // two freed, not mirrors
     auto k = make_kswv(6,1,6,1, 1,-4, 1, 256,256, m);
     CHECK(k->needsScalar() == true);
 }
@@ -253,4 +255,84 @@ TEST_CASE("kswv non-mirror two-cell matrix (OT+OB) still routes to scalar") {
     int8_t m[25]; fill_sym(m,1,4); m[1*5+3]=1; m[2*5+0]=1;  // (C,T)+(G,A): not a mirror pair
     auto k = make_kswv(6,1,6,1, 1,-4, 1, 256,256, m);
     CHECK(k->needsScalar() == true);
+}
+
+// ---------------------------------------------------------------------------
+// NEUTRAL scoring (the --meth=taps default): the conversion cell is freed to 0
+// — tolerated but NOT rewarded — while the mirror stays a real mismatch. The
+// kernel blends the freed cell to the matrix value (fr_val), not to a match, so
+// the freed value is what these cases pin down. A freed value other than the
+// match score used to route to scalar; it must now run batched on a freed-cell
+// tier, exactly like GENOMIC.
+// ---------------------------------------------------------------------------
+TEST_CASE("kswv detects neutral OT freed cell (ref-C x read-T scored 0)") {
+    int8_t m[25]; fill_sym(m,1,4); m[1*5+3] = 0;           // free (C,T) to 0, not to +a
+    auto k = make_kswv(6,1,6,1, 1,-4, 1, 256,256, m);
+    CHECK(k->needsScalar() == !tier_supports_freed_cell());
+}
+TEST_CASE("kswv detects neutral OB freed cell (ref-G x read-A scored 0)") {
+    int8_t m[25]; fill_sym(m,1,4); m[2*5+0] = 0;
+    auto k = make_kswv(6,1,6,1, 1,-4, 1, 256,256, m);
+    CHECK(k->needsScalar() == !tier_supports_freed_cell());
+}
+// The 8-bit kernel blends fr_val into a biased u8 domain that only represents
+// [w_mismatch, w_match]. A single freed cell outside that range would wrap the
+// biased byte, so the ctor must route it to the scalar fallback instead.
+TEST_CASE("kswv freed value outside [w_mismatch, w_match] routes to scalar") {
+    int8_t lo[25]; fill_sym(lo,1,4); lo[1*5+3] = -5;   // below the mismatch score
+    CHECK(make_kswv(6,1,6,1, 1,-4, 1, 256,256, lo)->needsScalar() == true);
+    int8_t hi[25]; fill_sym(hi,1,4); hi[1*5+3] = 2;    // above the match score
+    CHECK(make_kswv(6,1,6,1, 1,-4, 1, 256,256, hi)->needsScalar() == true);
+}
+// The decisive behavior: neutral scores the conversion cell 0, so it recovers
+// exactly the mismatch penalty b relative to the symmetric matrix — and stays a
+// full match score a BELOW genomic, which rewards the same cell with +a.
+TEST_CASE("kswv NEON 8-bit: neutral OT scores the conversion cell 0") {
+    if (!tier_supports_freed_cell()) return;   // scalar-only tier: no kernel score
+    const int a = 1, b = 4;
+    std::vector<uint8_t> ref  = {0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3};
+    std::vector<uint8_t> read = ref;
+    const int p = 10;
+    ref[p]  = 1;                      // ref C
+    read[p] = 3;                      // read T (the C->T conversion)
+
+    int8_t sym[25]; fill_sym(sym, a, b);
+    int8_t gen[25]; fill_sym(gen, a, b); gen[1*5+3] = (int8_t)a;   // genomic: freed to +a
+    int8_t neu[25]; fill_sym(neu, a, b); neu[1*5+3] = 0;           // neutral: freed to 0
+
+    int s_sym = score8(ref, read, a, b, sym);
+    int s_gen = score8(ref, read, a, b, gen);
+    int s_neu = score8(ref, read, a, b, neu);
+    CHECK(s_neu - s_sym == b);        // mismatch penalty removed, no reward
+    CHECK(s_gen - s_neu == a);        // genomic additionally rewards the match
+}
+TEST_CASE("kswv NEON 8-bit: neutral OB scores the conversion cell 0") {
+    if (!tier_supports_freed_cell()) return;   // scalar-only tier: no kernel score
+    const int a = 1, b = 4;
+    std::vector<uint8_t> ref  = {0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3};
+    std::vector<uint8_t> read = ref;
+    const int p = 10;
+    ref[p]  = 2;                      // ref G
+    read[p] = 0;                      // read A (the G->A conversion)
+
+    int8_t sym[25]; fill_sym(sym, a, b);
+    int8_t neu[25]; fill_sym(neu, a, b); neu[2*5+0] = 0;
+
+    CHECK(score8(ref, read, a, b, neu) - score8(ref, read, a, b, sym) == b);
+}
+// Neutral leaves the MIRROR cell a real mismatch (that is what keeps NM/MD
+// variant-aware): freeing (C,T) to 0 must not touch (T,C).
+TEST_CASE("kswv NEON 8-bit: neutral leaves the mirror cell a mismatch") {
+    if (!tier_supports_freed_cell()) return;   // scalar-only tier: no kernel score
+    const int a = 1, b = 4;
+    std::vector<uint8_t> ref  = {0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3};
+    std::vector<uint8_t> read = ref;
+    const int p = 10;
+    ref[p]  = 3;                      // ref T
+    read[p] = 1;                      // read C → the (T,C) mirror, a real variant
+
+    int8_t sym[25]; fill_sym(sym, a, b);
+    int8_t neu[25]; fill_sym(neu, a, b); neu[1*5+3] = 0;
+
+    CHECK(score8(ref, read, a, b, neu) == score8(ref, read, a, b, sym));
 }

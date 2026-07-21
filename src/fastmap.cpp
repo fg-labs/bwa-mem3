@@ -1581,9 +1581,11 @@ int main_mem(int argc, char *argv[])
          * 95.37-95.43% -- a robust +0.24-0.28 pp over genomic -- with IDENTICAL
          * MAPQ calibration (60+ bin 99.99% both) and NM (1.966 vs 1.969), so the
          * gain is not bought with over-confidence or inflated edit distance.
-         * NEUTRAL is not batched-rescue-expressible, so it forces the scalar
-         * ksw_align2 rescue path (correct, slightly slower; a kswv generic-LUT
-         * port would recover that). An explicit --meth-scoring still wins.
+         * NEUTRAL's freed cell is not rank-1, but the generalized kswv freed-cell
+         * blend scores it to its matrix value, so mate rescue stays on the batched
+         * kernel on the freed-capable tiers (NEON/AVX2/AVX512BW) and falls back to
+         * scalar ksw_align2 only on the freed-less x86 tiers (sse41/sse42/avx),
+         * exactly as GENOMIC and COLLAPSED do. An explicit --meth-scoring still wins.
          * Set before mem_opt_apply_meth_defaults so its COLLAPSED -B 2 branch keys
          * off the resolved scoring mode. See
          * reports/2026-07-20-taps-alignment-experiment-results.md. */
