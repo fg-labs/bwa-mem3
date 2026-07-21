@@ -36,6 +36,8 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "u8vec_scratch.h"
 #include "pdqsort_wrap.h"
 #include <inttypes.h>      /* PRId64 for int64_t fprintf format strings */
+#include <mutex>           /* BWAMEM3_DUMP_PAIRS append lock */
+#include <string>          /* BWAMEM3_DUMP_PAIRS per-batch row buffer */
 
 #include "sam_encode.h"
 #include "stage_prof.h"
@@ -172,6 +174,70 @@ static inline int bsw8_envelope_ok(int len1, int len2, int w,
            zdrop + max_step <= BSW8_MAX_ZDROP_STEP &&
            h0 <= zdrop + 1 &&
            max_score < 255 - max_step;
+}
+
+/* ---------------------------------------------------------------------------
+ * BWAMEM3_DUMP_PAIRS=<path>: record the extension pairs handed to the banded-SW
+ * batch, one TSV row per SeqPair: len1, len2, h0, w, tier (8 | 16 | 1).
+ *
+ * Why this exists: the shape of an extension problem is defined by seeding and
+ * chaining, so it cannot be recovered from an alignment record after the fact —
+ * a BAM says where a read landed, not which DP problems were posed to get it
+ * there. Anything that needs to reproduce a representative extension workload
+ * (benchmarks, kernel harnesses) has to observe the pairs here.
+ *
+ * The recorded tier is the routing decision this build actually made, which
+ * lets an external mirror of bsw8_envelope_ok() be checked against ground truth
+ * rather than against a re-reading of the rule.
+ *
+ * Off by default and inert when off: one getenv behind a function-local static
+ * (C++11 thread-safe init, so the OpenMP/pthread fan-out cannot race it), and
+ * the per-batch buffer is only touched when armed. Rows are buffered per batch
+ * and appended under a lock — a batch is thousands of pairs of DP work, so the
+ * contention is irrelevant next to what it is measuring.
+ * ------------------------------------------------------------------------- */
+static FILE *bsw_dump_fp(void)
+{
+    static FILE *fp = []() -> FILE * {
+        const char *path = getenv("BWAMEM3_DUMP_PAIRS");
+        if (!path || !*path) return NULL;
+        FILE *f = fopen(path, "w");
+        if (!f) {
+            fprintf(stderr, "[bsw-dump] cannot open '%s' for writing; dump disabled\n", path);
+            return NULL;
+        }
+        fprintf(f, "len1\tlen2\th0\tw\ttier\n");
+        return f;
+    }();
+    return fp;
+}
+
+static inline bool bsw_dump_armed(void) { return bsw_dump_fp() != NULL; }
+
+static inline void bsw_dump_pair(std::string &buf, const SeqPair &sp, int w, int tier)
+{
+    char line[64];
+    int n = snprintf(line, sizeof line, "%d\t%d\t%d\t%d\t%d\n",
+                     sp.len1, sp.len2, sp.h0, w, tier);
+    if (n > 0) {
+        /* snprintf returns the would-be length; cap to what actually landed in
+         * `line` so append never over-reads the stack buffer on truncation. */
+        if ((size_t)n >= sizeof line) n = (int)(sizeof line - 1);
+        buf.append(line, (size_t)n);
+    }
+}
+
+static void bsw_dump_flush(std::string &buf)
+{
+    if (buf.empty()) return;
+    static std::mutex mtx;
+    FILE *fp = bsw_dump_fp();
+    if (!fp) return;   /* defensive: fp is non-null whenever dumping is armed */
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        fwrite(buf.data(), 1, buf.size(), fp);
+    }
+    buf.clear();
 }
 
             int tcnt = 0;
@@ -2870,6 +2936,15 @@ inline void sortPairsLenExt(SeqPair *pairArray, int32_t count, SeqPair *tempArra
      * re-baselining handles arbitrary score, so a pair can be 8-bit even with
      * minval >= MAX_SEQ_LEN8. Clamp the bin to keep it in range — only the
      * ordering, not correctness, depends on the exact key. */
+    /* BWAMEM3_DUMP_PAIRS observation buffer (empty unless the hook is armed).
+     * Recording the tier from inside the branches below — rather than
+     * re-deriving it afterwards — is deliberate: the dump is used to validate
+     * external mirrors of this routing rule, so it must report the branch this
+     * function actually took, not a second opinion that could drift from it. */
+    std::string dump_buf;
+    const bool dumping = bsw_dump_armed();
+    if (dumping) dump_buf.reserve((size_t)count * 24);
+
     for(i = 0; i < count; i++)
     {
         SeqPair sp = pairArray[i];
@@ -2878,12 +2953,18 @@ inline void sortPairsLenExt(SeqPair *pairArray, int32_t count, SeqPair *tempArra
         if (bsw8_envelope_ok(sp.len1, sp.len2, w, score_a, zdrop, sp.h0)) {
             int bin = minval < 0 ? 0 : (minval < MAX_SEQ_LEN8 ? (int)minval : MAX_SEQ_LEN8 - 1);
             hist[bin]++;
+            if (dumping) bsw_dump_pair(dump_buf, sp, w, 8);
         }
-        else if(sp.len1 < MAX_SEQ_LEN16 && sp.len2 < MAX_SEQ_LEN16 && minval >= 0 && minval < MAX_SEQ_LEN16)
+        else if(sp.len1 < MAX_SEQ_LEN16 && sp.len2 < MAX_SEQ_LEN16 && minval >= 0 && minval < MAX_SEQ_LEN16) {
             hist2[(int)minval] ++;
-        else
+            if (dumping) bsw_dump_pair(dump_buf, sp, w, 16);
+        }
+        else {
             hist3[0] ++;
+            if (dumping) bsw_dump_pair(dump_buf, sp, w, 1);
+        }
     }
+    if (dumping) bsw_dump_flush(dump_buf);
 
     int32_t cumulSum = 0;
     for(i = 0; i < MAX_SEQ_LEN8; i++)
