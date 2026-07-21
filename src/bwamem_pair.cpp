@@ -1445,7 +1445,10 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                     fprintf(stderr, "[0000][%0.4d] Re-allocating (doubling) seqBufRefs in %s\n",
                             tid, __func__);
                     int64_t tmp = *wsize_buf_ref;
-                    *wsize_buf_ref *= 2;
+                    *wsize_buf_ref = seqbuf_grow_capacity(tmp);
+                    if (*wsize_buf_ref == SEQBUF_CAPACITY_OVERFLOW)
+                        seqbuf_capacity_fatal("seqBufRef", __func__, tmp);
+                    assert(*wsize_buf_ref > refOffset + sp.len1);
 
                     uint8_t *seqBufRef_ = (uint8_t*)
                         _mm_realloc(seqBufRef, tmp, *wsize_buf_ref, sizeof(uint8_t)); 
@@ -1462,7 +1465,10 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                     fprintf(stderr, "[0000][%0.4d] Re-allocating (doubling) seqBufQers in %s\n",
                             tid, __func__);
                     int64_t tmp = *wsize_buf_qer;
-                    *wsize_buf_qer *= 2;
+                    *wsize_buf_qer = seqbuf_grow_capacity(tmp);
+                    if (*wsize_buf_qer == SEQBUF_CAPACITY_OVERFLOW)
+                        seqbuf_capacity_fatal("seqBufQer", __func__, tmp);
+                    assert(*wsize_buf_qer > qerOffset + sp.len2);
 
                     uint8_t *seqBufQer_ = (uint8_t*)
                         _mm_realloc(seqBufQer, tmp, *wsize_buf_qer, sizeof(uint8_t)); 
