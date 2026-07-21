@@ -897,28 +897,32 @@ struct FMI_search::BwtSeedSlot {
     SMEM   *match_buf;     // -> thread-local cache slice, sized = max_readlength
 };
 
-// Same-slot T0 prefetch for the next inner-j step. The two CP_OCC blocks
-// the next backwardExt(smem, _) hits are at (smem.k >> CP_SHIFT) and
-// ((smem.k + smem.s) >> CP_SHIFT) — i.e. sp and ep. Matches the call
-// pattern in ls_advance_forward_step's tail prefetch.
+// Same-slot T0 prefetch for the next inner-j step. The bwtSeed walk is
+// forward-only: bsd_advance_step swaps k<->l and calls backwardExt on the
+// swapped interval, so the next occ read lands in cp_occ at (smem.l >> CP_SHIFT)
+// and ((smem.l + smem.s) >> CP_SHIFT) — i.e. sp and ep of the swapped interval,
+// NOT smem.k. Prefetching smem.k (the un-swapped field) targets the wrong lines,
+// so every continuation-step prefetch was a no-op and each step paid full cp_occ
+// latency. smem.s is unchanged by the k<->l swap.
 void FMI_search::bsd_prefetch_cp_occ(const BwtSeedSlot *s)
 {
 #ifdef ENABLE_PREFETCH
-    _mm_prefetch((const char *)(&cp_occ[(s->smem.k) >> CP_SHIFT]), _MM_HINT_T0);
-    _mm_prefetch((const char *)(&cp_occ[(s->smem.k + s->smem.s) >> CP_SHIFT]), _MM_HINT_T0);
+    _mm_prefetch((const char *)(&cp_occ[(s->smem.l) >> CP_SHIFT]), _MM_HINT_T0);
+    _mm_prefetch((const char *)(&cp_occ[(s->smem.l + s->smem.s) >> CP_SHIFT]), _MM_HINT_T0);
 #else
     (void)s;
 #endif
 }
 
-// Cross-slot T1 (L2) prefetch — same two-line target as T0 but at L2
-// hint, used in the driver's (s + N/2) % N lookahead to cover DRAM-class
-// latency when cp_occ spills out of L3.
+// Cross-slot T1 (L2) prefetch — same two-line target as T0 (the swapped
+// interval at smem.l; see bsd_prefetch_cp_occ) but at L2 hint, used in the
+// driver's (s + N/2) % N lookahead to cover DRAM-class latency when cp_occ
+// spills out of L3.
 void FMI_search::bsd_prefetch_cp_occ_t1(const BwtSeedSlot *s)
 {
 #ifdef ENABLE_PREFETCH
-    _mm_prefetch((const char *)(&cp_occ[(s->smem.k) >> CP_SHIFT]), _MM_HINT_T1);
-    _mm_prefetch((const char *)(&cp_occ[(s->smem.k + s->smem.s) >> CP_SHIFT]), _MM_HINT_T1);
+    _mm_prefetch((const char *)(&cp_occ[(s->smem.l) >> CP_SHIFT]), _MM_HINT_T1);
+    _mm_prefetch((const char *)(&cp_occ[(s->smem.l + s->smem.s) >> CP_SHIFT]), _MM_HINT_T1);
 #else
     (void)s;
 #endif
