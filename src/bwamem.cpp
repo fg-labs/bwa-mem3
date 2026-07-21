@@ -3508,11 +3508,33 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
     //
     // This previously read o_min / (a + b - e_min), which coincides with the
     // correct bound at bwa's defaults (6/4 == 1 and (6+1-1)/5 == 1) but is too
-    // permissive elsewhere. At -B 3 it admitted X = 2, yet 2*(1+3) = 8 > 6+1, so
-    // a single deletion beats that diagonal: measured 51 of 501,821 records
-    // (0.010%) differing from the DP on 250k HG002 WGS pairs, the fast path
-    // emitting e.g. 151M where the DP finds 138M1D13M. Defaults are unchanged,
-    // so this costs no fast-path coverage on a stock run.
+    // permissive elsewhere. Measured on 250k HG002 WGS pairs vs hg38 against a
+    // build with the fast path disabled outright, i.e. always running the DP
+    // (what bwa-mem2 does -- it has no ungapped fast path at all):
+    //
+    //   -B 3             old bound admits X = 2, yet 2*(1+3) = 8 > 6+1, so one
+    //                    deletion beats the diagonal:    51/501,821 records
+    //                    (0.010%) differ from the DP -- CIGAR in all 51, POS in
+    //                    27, MAPQ in none. The fast path emits e.g. 151M and
+    //                    148M3S where the DP finds 138M1D13M and 148M1D3M.
+    //   -A1 -B1 -O1 -E1  old bound admits X = 1 and 1*(1+1) == 1+1 exactly, the
+    //                    tie case:                    1,522/501,091 records
+    //                    (0.30%) differ, including 10 MAPQ changes.
+    //
+    // Defaults are unchanged in both directions, so this costs no fast-path
+    // coverage on a stock run.
+    //
+    // That second scheme is what -x pacbio and -x ont2d set, but long reads
+    // never reached it: FP_N_MAX caps the fast path at 128 columns and their
+    // extensions are longer, so 2,000 HG002 HiFi reads under -x pacbio come out
+    // byte-identical with the bound either way. Note the cap is a coverage
+    // limit, not a correctness guard -- the bound above is sound at every
+    // scoring scheme tested, so raising FP_N_MAX does not reopen this.
+    //
+    // The fast path is disabled entirely under --meth (see the three call sites
+    // below), since ungapped_analyze hardcodes symmetric opt->a/opt->b and
+    // cannot express the asymmetric OT/OB matrix. This bound is not consulted
+    // there.
     const int fp_o_min = opt->o_del < opt->o_ins ? opt->o_del : opt->o_ins;
     const int fp_e_min = opt->e_del < opt->e_ins ? opt->e_del : opt->e_ins;
     // Cheapest single gap the scoring scheme allows; a degenerate scheme that
