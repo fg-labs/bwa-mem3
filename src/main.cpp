@@ -190,6 +190,55 @@ int main(int argc, char* argv[])
     else if (strcmp(argv[1], "version") == 0)
     {
         puts(PACKAGE_VERSION);
+        /* Report the compiler that built this binary. bwa-mem3 is markedly
+         * faster when built with clang than with g++ (see the Makefile's
+         * build-time note and docs/src/best-practices/build.md), so surfacing
+         * the compiler here makes it trivial to confirm which toolchain a
+         * given binary came from. Purely factual — one token, easy to parse. */
+        /* Order matters: both Intel front-ends impersonate another toolchain.
+         * icpx (oneAPI, LLVM-based) also defines __clang__, and icpc (Classic)
+         * also defines __GNUC__ to match the host GCC's ABI — so the Intel
+         * checks must come FIRST or an Intel build reports as clang/gcc. The
+         * Makefile has real `ifeq ($(CXX), icpc)` / `icpx` flag branches, so
+         * these are builds we actually ship flags for. */
+#if defined(__INTEL_LLVM_COMPILER)
+        /* Two encodings, split on 1000000 the way CMake's
+         * Modules/Compiler/IntelLLVM-DetermineCompiler.cmake does:
+         *   >= 1000000: 8-digit VVVVRRPP (2021.2.0 and later),
+         *               e.g. 20250100 -> 2025.1.0
+         *   <  1000000: 6-digit VVVVRP  (pre-2021.2.0),
+         *               e.g. 202110   -> 2021.1.0 */
+#  if __INTEL_LLVM_COMPILER >= 1000000
+        fprintf(stdout, "Compiler: icpx %d.%d.%d\n",
+                __INTEL_LLVM_COMPILER / 10000,
+                (__INTEL_LLVM_COMPILER / 100) % 100,
+                __INTEL_LLVM_COMPILER % 100);
+#  else
+        fprintf(stdout, "Compiler: icpx %d.%d.%d\n",
+                __INTEL_LLVM_COMPILER / 100,
+                (__INTEL_LLVM_COMPILER / 10) % 10,
+                __INTEL_LLVM_COMPILER % 10);
+#  endif
+#elif defined(__INTEL_COMPILER)
+        /* Year-based version (e.g. 2021) plus the update number. Every icpc
+         * the Makefile targets defines __INTEL_COMPILER_UPDATE, but guard it
+         * anyway: on a pre-15.0 icc it is undefined, and an undefined macro in
+         * an argument list is an undeclared identifier, not a zero. */
+#  if defined(__INTEL_COMPILER_UPDATE)
+        fprintf(stdout, "Compiler: icpc %d.%d\n",
+                __INTEL_COMPILER, __INTEL_COMPILER_UPDATE);
+#  else
+        fprintf(stdout, "Compiler: icpc %d\n", __INTEL_COMPILER);
+#  endif
+#elif defined(__clang__)
+        fprintf(stdout, "Compiler: clang %d.%d.%d\n",
+                __clang_major__, __clang_minor__, __clang_patchlevel__);
+#elif defined(__GNUC__)
+        fprintf(stdout, "Compiler: gcc %d.%d.%d\n",
+                __GNUC__, __GNUC_MINOR__, __GNUC_PATCHLEVEL__);
+#elif defined(__VERSION__)
+        fprintf(stdout, "Compiler: %s\n", __VERSION__);
+#endif
         bwamem3_print_version_simd(stdout);
 #ifdef USE_MIMALLOC
         {

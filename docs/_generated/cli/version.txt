@@ -1,2 +1,5 @@
 v<MAJOR.MINOR>-<N>-g<COMMIT>
+Compiler: <TOOLCHAIN> <VERSION>
+SIMD floor: <FLOOR-TIER> (<HOST-CLASS>); kernels: <KERNEL-LIST>
+SIMD runtime: <RUNTIME-TIER> (<FORCE-TIER-STATE>)
 mimalloc 3.3.0 (active)

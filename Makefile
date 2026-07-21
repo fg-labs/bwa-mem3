@@ -43,6 +43,18 @@ else ifeq ($(CXX), icpx)
 	CC= icx
 else ifeq ($(CXX), g++)
 	CC= gcc
+    # bwa-mem3 is consistently faster when built with clang than with g++
+    # (~15% lower wall + CPU on WGS at the AVX2 floor; see
+    # docs/src/best-practices/build.md). g++ is GNU make's default CXX, so a
+    # bare `make` lands here — but the nudge is deliberately UNguarded by
+    # $(origin CXX), so an explicit `CXX=g++` sees it too: the recommendation
+    # holds either way. (The else-branch below guards its hint on
+    # $(origin CC) because that one flags a real hazard — a defaulted CC
+    # mixing toolchains — which an explicit CC cannot hit.) NOTE: space-indented, not
+    # tab — a tab-prefixed $(warning) is parsed as a recipe by GNU make 3.81
+    # ("commands commence before first target"). Matches the space-indented
+    # warning in the else-branch below.
+    $(warning bwa-mem3: building with g++. clang builds run ~15% faster on this workload — consider `make CXX=clang++ CC=clang`. See docs/src/best-practices/build.md.)
 else ifeq ($(CXX), clang++)
 	CC= clang
 else ifeq ($(CXX), c++)
@@ -834,6 +846,21 @@ clean: pgo-clean profile-clean lto-clean
 # ----------------------------------------------------------------------------
 
 # Sub-commands whose --help is captured into docs/_generated/cli/.
+#
+# The capture below strips or normalizes every HOST-dependent line, so the
+# committed snippets are reproducible on any machine and the CI drift check
+# (`git diff --exit-code docs/_generated/`) stays meaningful. Dropped outright:
+# timing, launcher chatter, and [W:: warnings — none of which are part of the
+# documented output. Normalized to a placeholder (kept, because they ARE part
+# of the canonical output documented in docs/src/cli/version.md, which includes
+# this capture as its synopsis):
+#   - the version line (git describe),
+#   - the `Compiler:` line (`version` reports the toolchain that built the
+#     binary, so it reads `clang X.Y.Z` locally and `gcc X.Y.Z` on a g++ CI
+#     runner),
+#   - the `SIMD floor:` / `SIMD runtime:` lines (vary by build arch and host
+#     CPU: avx2/avx512bw on x86, neon on arm64).
+# Any future host-dependent line must be added here too.
 DOCS_CLI_SUBCMDS := index mem shm version
 
 docs:
@@ -851,10 +878,11 @@ docs-cli: $(EXE)
 			| grep -v '^Total time taken:' \
 			| grep -v '^Looking to launch ' \
 			| grep -v '^Launching executable ' \
-			| grep -v '^SIMD floor: ' \
-			| grep -v '^SIMD runtime: ' \
 			| grep -v '^\[W::' \
-			| awk '/^v?[0-9]+\.[0-9]+/ {print "v<MAJOR.MINOR>-<N>-g<COMMIT>"; next} {print}' \
+			| awk '/^v?[0-9]+\.[0-9]+/ {print "v<MAJOR.MINOR>-<N>-g<COMMIT>"; next} \
+			       /^Compiler: / {print "Compiler: <TOOLCHAIN> <VERSION>"; next} \
+			       /^SIMD floor: / {print "SIMD floor: <FLOOR-TIER> (<HOST-CLASS>); kernels: <KERNEL-LIST>"; next} \
+			       /^SIMD runtime: / {print "SIMD runtime: <RUNTIME-TIER> (<FORCE-TIER-STATE>)"; next} {print}' \
 			> docs/_generated/cli/$$sub.txt; \
 	done
 
