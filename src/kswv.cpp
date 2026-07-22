@@ -113,12 +113,11 @@ extern uint64_t prof[10][112];
         xor11 = _mm512_xor_si512(s1, s2);                               \
         sbt11 = _mm512_permutexvar_epi16(xor11, perm512);               \
         if (HasFreed) {                                                 \
-            __mmask32 freed = rowfreed512 &                             \
-                _mm512_cmpeq_epi16_mask(s2, frread512);                 \
+            /* One compare + one blend against the per-row active_frread512   \
+             * target (built once per row); sentinel (0x7FFF) lanes never     \
+             * match a real u16 s2 (0-3/AMBQ16=16/DUMMY3=26/0xFFFF pad). */   \
+            __mmask32 freed = _mm512_cmpeq_epi16_mask(s2, active_frread512); \
             sbt11 = _mm512_mask_blend_epi16(freed, sbt11, freedval512); \
-            __mmask32 freed2 = rowfreed2_512 &                          \
-                _mm512_cmpeq_epi16_mask(s2, frread2_512);               \
-            sbt11 = _mm512_mask_blend_epi16(freed2, sbt11, freedval512);\
         }                                                               \
         __m512i m11 = _mm512_add_epi16(h00, sbt11);                     \
         or11 =  _mm512_or_si512(s1, s2);                                \
@@ -1230,19 +1229,27 @@ int kswv::kswv_neon_16_impl(int16_t seq1SoA[],
         int16x8_t l_vec   = zero_vec;
         int16x8_t i_vec   = vdupq_n_s16((int16_t)i);
 
-        /* Freed-cell override (issue 173 + TAPS neutral). s1 is loop-invariant, so
-         * hoist the per-row fr_ref comparison. The 16-bit kernel has NO shift bias
-         * (m11 = h00 + sbt directly), so the freed value is just fr_val: fr_val==
-         * w_match (GENOMIC/COLLAPSED) equals temp8[0], NEUTRAL (fr_val==0) scores
-         * the conversion as 0. Sign-extended to int16. !HasFreed → both this and
-         * the per-cell block compile out. */
-        int16x8_t frread_vec16, frread2_vec16, freedval_vec16, rowfreed16, rowfreed2_16;
+        /* Rank-1 freed-cell override (issue 173 + TAPS neutral), folded into ONE
+         * per-row target base active_frread16 — the u16 analog of
+         * kswv_neon_u8_impl's active_frread. A lane whose ref is fr_ref frees
+         * against fr_read, a lane whose ref is fr_ref2 frees against fr_read2 (the
+         * two ref-side compares are mutually exclusive), and every other lane gets
+         * a sentinel no real s2 ever equals. u16 s2 ∈ {0-3, AMBQ16=16, DUMMY3=26,
+         * 0xFFFF pad}, so 0x7FFF is safe here — the u8 0xFF sentinel is NOT (u16 s2
+         * padding is 0xFFFF). The 16-bit kernel has NO shift bias (m11 = h00 + sbt
+         * directly), so the freed value is just fr_val: fr_val == w_match
+         * (GENOMIC/COLLAPSED) equals temp8[0], NEUTRAL (fr_val==0) scores the
+         * conversion as 0. Sign-extended to int16. When !HasFreed, this and the
+         * per-cell block below compile out. */
+        int16x8_t freedval_vec16, active_frread16;
         if (HasFreed) {
-            frread_vec16  = vdupq_n_s16((int16_t)fr_read);
-            frread2_vec16 = vdupq_n_s16((int16_t)fr_read2);
-            freedval_vec16= vdupq_n_s16((int16_t)fr_val);
-            rowfreed16    = vreinterpretq_s16_u16(vceqq_s16(s1, vdupq_n_s16((int16_t)fr_ref)));
-            rowfreed2_16  = vreinterpretq_s16_u16(vceqq_s16(s1, vdupq_n_s16((int16_t)fr_ref2)));
+            freedval_vec16 = vdupq_n_s16((int16_t)fr_val);
+            uint16x8_t rowfreed16   = vceqq_s16(s1, vdupq_n_s16((int16_t)fr_ref));
+            uint16x8_t rowfreed2_16 = vceqq_s16(s1, vdupq_n_s16((int16_t)fr_ref2));
+            active_frread16 = vbslq_s16(rowfreed2_16, vdupq_n_s16((int16_t)fr_read2),
+                                        vdupq_n_s16((int16_t)0x7FFF));
+            active_frread16 = vbslq_s16(rowfreed16,  vdupq_n_s16((int16_t)fr_read),
+                                        active_frread16);
         }
 
         for (int j = 0; j < ncol; j++) {
@@ -1260,17 +1267,13 @@ int kswv::kswv_neon_16_impl(int16_t seq1SoA[],
             int8x8_t   sbt8 = vqtbl2_s8(perm_vec, idx8);
             int16x8_t  sbt  = vmovl_s8(sbt8);
 
-            /* Freed-cell override (issue 173 + TAPS neutral): where row==fr_ref and
-             * col==fr_read, force the freed score. Real bases 0-3; fr_read ∈
-             * {0,3}; padding/ambig (DUMMY3/0xFFFF/AMBQ16) never equal fr_read,
-             * so vceqq is naturally false for them. */
+            /* Rank-1 freed-cell override (issue 173 + TAPS neutral): force the
+             * freed score where this column's read base equals the row's active
+             * freed base (built once per row in active_frread16 above). One compare
+             * + one blend; sentinel (0x7FFF) lanes never match a real s2 so they
+             * pass through. */
             if (HasFreed) {
-                int16x8_t freed  = vandq_s16(
-                    rowfreed16, vreinterpretq_s16_u16(vceqq_s16(s2, frread_vec16)));
-                sbt = vbslq_s16(vreinterpretq_u16_s16(freed), freedval_vec16, sbt);
-                int16x8_t freed2 = vandq_s16(
-                    rowfreed2_16, vreinterpretq_s16_u16(vceqq_s16(s2, frread2_vec16)));
-                sbt = vbslq_s16(vreinterpretq_u16_s16(freed2), freedval_vec16, sbt);
+                sbt = vbslq_s16(vceqq_s16(s2, active_frread16), freedval_vec16, sbt);
             }
 
             /* Boundary: high bit set in (s1 | s2) indicates padding. */
@@ -2152,21 +2155,27 @@ int kswv::kswv256_16_impl(int16_t seq1SoA[],
         __m256i l_vec   = zero_vec;
         __m256i i_vec   = _mm256_set1_epi16((int16_t)i);
 
-        /* Freed-cell override (issue 173 + TAPS neutral). s1 is loop-invariant, so
-         * hoist the per-row fr_ref comparison. The 16-bit kernel has NO shift bias
-         * (m11 = h00 + sbt directly), so the freed value is just fr_val: fr_val==
+        /* Rank-1 freed-cell override (issue 173 + TAPS neutral), folded into ONE
+         * per-row target base active_frread — the u16 analog of kswv256_u8_impl's
+         * active_frread. A lane whose ref is fr_ref frees against fr_read, a lane
+         * whose ref is fr_ref2 frees against fr_read2 (the two ref-side compares
+         * are mutually exclusive), and every other lane gets a sentinel no real s2
+         * ever equals. u16 s2 ∈ {0-3, AMBQ16=16, DUMMY3=26, 0xFFFF pad}, so 0x7FFF
+         * is safe here. cmpeq_epi16 produces whole-int16 masks, so the byte-wise
+         * blendv selects whole lanes correctly. The 16-bit kernel has NO shift bias
+         * (m11 = h00 + sbt directly), so the freed value is just fr_val: fr_val ==
          * w_match (GENOMIC/COLLAPSED) equals temp8[0], NEUTRAL (fr_val==0) scores
-         * the conversion as 0. Sign-extended to int16. !HasFreed → both this and
-         * the per-cell block compile out. */
-        /* Free a SYMMETRIC PAIR of cells (collapsed bisulfite); GENOMIC/NEUTRAL set
-         * the mirror == primary so the second blend is idempotent. */
-        __m256i frread256, frread2_256, freedval256, rowfreed, rowfreed2;
+         * the conversion as 0. !HasFreed → this and the per-cell block compile
+         * out. */
+        __m256i freedval256, active_frread;
         if (HasFreed) {
-            frread256  = _mm256_set1_epi16((int16_t)fr_read);
-            frread2_256= _mm256_set1_epi16((int16_t)fr_read2);
-            freedval256= _mm256_set1_epi16((int16_t)fr_val);
-            rowfreed   = _mm256_cmpeq_epi16(s1, _mm256_set1_epi16((int16_t)fr_ref));
-            rowfreed2  = _mm256_cmpeq_epi16(s1, _mm256_set1_epi16((int16_t)fr_ref2));
+            freedval256 = _mm256_set1_epi16((int16_t)fr_val);
+            __m256i rowfreed  = _mm256_cmpeq_epi16(s1, _mm256_set1_epi16((int16_t)fr_ref));
+            __m256i rowfreed2 = _mm256_cmpeq_epi16(s1, _mm256_set1_epi16((int16_t)fr_ref2));
+            active_frread = _mm256_blendv_epi8(_mm256_set1_epi16((int16_t)0x7FFF),
+                                               _mm256_set1_epi16((int16_t)fr_read2), rowfreed2);
+            active_frread = _mm256_blendv_epi8(active_frread,
+                                               _mm256_set1_epi16((int16_t)fr_read), rowfreed);
         }
 
         for (int j = 0; j < ncol; j++) {
@@ -2183,19 +2192,14 @@ int kswv::kswv256_16_impl(int16_t seq1SoA[],
             __m256i sbt_b   = _mm256_blendv_epi8(sbt_lo, sbt_hi, hi_sel);
             __m256i sbt     = _mm256_srai_epi16(_mm256_slli_epi16(sbt_b, 8), 8);
 
-            /* Freed-cell override (issue 173 + TAPS neutral): where row==fr_ref and
-             * col==fr_read, force the freed score. Real bases 0-3; fr_read ∈
-             * {0,3}; padding/ambig (DUMMY3/0xFFFF/AMBQ16) never equal fr_read,
-             * so cmpeq is naturally false for them. _mm256_cmpeq_epi16 produces
-             * an all-ones/all-zeros int16 mask, so the byte-wise blendv selects
-             * whole int16 lanes correctly. */
+            /* Rank-1 freed-cell override (issue 173 + TAPS neutral): force the
+             * freed score where this column's read base equals the row's active
+             * freed base (built once per row in active_frread above). One cmpeq +
+             * one blendv; sentinel (0x7FFF) lanes never match a real s2 so they
+             * pass through. cmpeq_epi16 gives whole-int16 masks, so the byte-wise
+             * blendv is lane-correct. */
             if (HasFreed) {
-                __m256i freed  = _mm256_and_si256(rowfreed,
-                                                  _mm256_cmpeq_epi16(s2, frread256));
-                sbt = _mm256_blendv_epi8(sbt, freedval256, freed);
-                __m256i freed2 = _mm256_and_si256(rowfreed2,
-                                                  _mm256_cmpeq_epi16(s2, frread2_256));
-                sbt = _mm256_blendv_epi8(sbt, freedval256, freed2);
+                sbt = _mm256_blendv_epi8(sbt, freedval256, _mm256_cmpeq_epi16(s2, active_frread));
             }
 
             /* Boundary: high bit set in (s1 | s2) marks padding (0xFFFF). */
@@ -3400,23 +3404,25 @@ int kswv::kswv512_16_impl(int16_t seq1SoA[],
         imax512 = zero512;
         __m512i iqe512 = _mm512_set1_epi16(-1);
 
-        /* Freed-cell override (issue 173 + TAPS neutral). s1 is loop-invariant, so
-         * hoist the per-row fr_ref comparison; MAIN_SAM_CODE16_OPT consumes
-         * rowfreed512/frread512/freedval512 per cell when HasFreed. The 16-bit
-         * kernel has NO shift bias (m11 = h00 + sbt directly), so the freed value
-         * is just fr_val: fr_val==w_match (GENOMIC/COLLAPSED) equals temp[0], while
-         * NEUTRAL (fr_val==0) scores the conversion as 0. !HasFreed → this and the
-         * per-cell block in the macro compile out. */
-        __m512i frread512, frread2_512, freedval512;
-        __mmask32 rowfreed512 = 0, rowfreed2_512 = 0;
+        /* Rank-1 freed-cell override (issue 173 + TAPS neutral), folded into ONE
+         * per-row target base active_frread512 — the u16 analog of
+         * kswv512_u8_impl's active_frread (consumed by MAIN_SAM_CODE16_OPT).
+         * fr_read where ref==fr_ref, fr_read2 where ref==fr_ref2 (mutually
+         * exclusive), else a sentinel no real s2 equals: u16 s2 ∈ {0-3, AMBQ16=16,
+         * DUMMY3=26, 0xFFFF pad}, so 0x7FFF is safe. The 16-bit kernel has NO shift
+         * bias (m11 = h00 + sbt directly), so the freed value is just fr_val:
+         * fr_val == w_match (GENOMIC/COLLAPSED) equals temp[0], while NEUTRAL
+         * (fr_val==0) scores the conversion as 0. !HasFreed → this and the per-cell
+         * block in the macro compile out. */
+        __m512i freedval512, active_frread512;
         if (HasFreed) {
-            __m512i frref512  = _mm512_set1_epi16((int16_t)fr_ref);
-            __m512i frref2512 = _mm512_set1_epi16((int16_t)fr_ref2);
-            frread512  = _mm512_set1_epi16((int16_t)fr_read);
-            frread2_512= _mm512_set1_epi16((int16_t)fr_read2);
-            freedval512= _mm512_set1_epi16((int16_t)fr_val);
-            rowfreed512  = _mm512_cmpeq_epi16_mask(s1, frref512);
-            rowfreed2_512= _mm512_cmpeq_epi16_mask(s1, frref2512);
+            freedval512 = _mm512_set1_epi16((int16_t)fr_val);
+            __mmask32 rowfreed512  = _mm512_cmpeq_epi16_mask(s1, _mm512_set1_epi16((int16_t)fr_ref));
+            __mmask32 rowfreed2_512= _mm512_cmpeq_epi16_mask(s1, _mm512_set1_epi16((int16_t)fr_ref2));
+            active_frread512 = _mm512_mask_blend_epi16(rowfreed2_512,
+                                   _mm512_set1_epi16((int16_t)0x7FFF), _mm512_set1_epi16((int16_t)fr_read2));
+            active_frread512 = _mm512_mask_blend_epi16(rowfreed512,
+                                   active_frread512, _mm512_set1_epi16((int16_t)fr_read));
         }
 
         __m512i l512 = zero512;
