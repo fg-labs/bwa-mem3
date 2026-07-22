@@ -66,6 +66,7 @@ speed/accuracy trade-off. Current recommended deviations:
 | `-y` (3rd-round seeding occurrence) | 20 | **0** | ~11–30% less alignment CPU; F1 near-neutral across regimes (within ±0.02; better on divergent/repeat — see below) |
 | `-s` (Pass-2 re-seed width), **`--meth` only** | 10 | **2** | light re-seed: ~same speed as `-s 0` but recovers the MAPQ/placement `-s 0` lost (see below) |
 | `--min-ext-len` (skip short-seed extension), **standard-error reads** | 0 | **30** | ~10–20% less alignment CPU; accuracy change confined to the already-low-confidence tail (see below) |
+| `--skip-contained-ext` (skip contained-seed extension), **short/medium non-meth reads** | off | **on** | ~10% less alignment CPU; **byte-identical** — zero accuracy change (see below) |
 
 This table will grow as we benchmark additional tunings; each entry is gated on the same
 "measurably faster, near-neutral accuracy" bar.
@@ -254,6 +255,39 @@ figures and the golden-truth F1 sweep warrant a fresh
 [bwa-mem3-bench](../related-projects/bwa-mem3-bench.md) run (multi-thread, all regimes) to confirm
 these `--fast` accuracy figures genome-wide. `--min-ext-len` and `--fast` stay opt-in; the drop-in
 defaults are unchanged.
+
+## Contained-seed extension skip: `--skip-contained-ext`
+
+`--skip-contained-ext` skips banded Smith–Waterman extension of a seed that is **strictly contained**
+(same diagonal, query subinterval) in a longer seed of the same chain. The longest seed on a diagonal
+is always extended, and its alignment covers the contained seed's region, so the contained seed's own
+alignment is purged after extension anyway (the post-extension containment purge). Detecting that
+before extension and skipping the redundant banded-SW pair thins the extension stage without changing
+the seed set (the seed stays in the chain, so seed coverage and MAPQ are untouched). Off by default.
+
+**For non-meth short- and medium-length reads, this recommended lever has zero accuracy cost: it is
+byte-identical.** The skip set is a proven subset of the post-extension purge set, so on those inputs
+the output is bit-for-bit identical to the default — verified (records + header + count) on WGS 5M
+PE, HiC 1M PE, and an ALT/HLA-enriched set. It no-ops under `--meth` (its own internal gate disables
+it, since bisulfite's asymmetric scoring breaks the dominance argument), so the flag neither helps
+nor hurts a `--meth` run.
+
+**In exchange, alignment CPU drops ~10%** (measured −10.6% single-thread CPU on 200k HG002 WGS
+2×150 single-end reads, md5-identical output; consistent with the −9.7% seen on SBX-SE in the
+original characterization). Because the win is pure — no accuracy trade-off to weigh on non-meth
+short- and medium-length reads — this is the safest entry in the recommended table.
+
+> **Not byte-identical on kilobase-scale long reads.** On PacBio HiFi / ONT the "longest contained
+> seed dominates" assumption breaks (extensions terminate early, so the container no longer covers
+> the contained seed), and output diverges — dropped supplementary alignments, occasionally a
+> degraded primary. Kilobase-scale long reads are outside the scope of this recommendation, which
+> covers non-meth short- and medium-length reads only; such reads do not run at default settings
+> today in any case (see
+> [`--adaptive-band`](#situational---adaptive-band-for-medium-length-reads) and
+> [fg-labs/bwa-mem3#238](https://github.com/fg-labs/bwa-mem3/issues/238)).
+
+Already bundled into `--fast`. Recommended value: **on** for standard-error non-meth short- and
+medium-read pipelines.
 
 ## Chain extension cap: `--max-extend-chains`
 
