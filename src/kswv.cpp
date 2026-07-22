@@ -566,15 +566,27 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
          * match in the biased u8 domain. When !HasFreed, all of this and the
          * per-cell block below compile out (identical codegen to today). */
         /* Free a SYMMETRIC PAIR of cells: (fr_ref,fr_read) and (fr_ref2,fr_read2).
-         * GENOMIC sets the mirror == primary (idempotent 2nd blend); COLLAPSED
-         * sets it to the transpose so C/T (or G/A) are interchangeable. */
-        uint8x16_t frread_vec, frread2_vec, match_vec, rowfreed, rowfreed2;
+         * GENOMIC sets the mirror == primary; COLLAPSED sets it to the transpose
+         * so C/T (or G/A) are interchangeable.
+         *
+         * Fold the pair into ONE per-lane target base, active_frread: a lane whose
+         * ref is fr_ref frees against fr_read, a lane whose ref is fr_ref2 frees
+         * against fr_read2, and any other lane gets the sentinel 0xFF. The two
+         * ref-side comparisons are mutually exclusive (s1 can't equal both fr_ref
+         * and fr_ref2), so at most one wins per lane. s2 only ever holds real bases
+         * 0-3 or the ambig/pad codes DUMMY5(5)/AMBQ(8) — never 0xFF — so on a
+         * sentinel lane the single per-cell compare is unconditionally false. This
+         * turns the per-cell freed path into one vceqq + one vbslq (down from two
+         * compares, two ands, an orr, and a blend). */
+        uint8x16_t match_vec, active_frread;
         if (HasFreed) {
-            frread_vec  = vdupq_n_u8((uint8_t)fr_read);
-            frread2_vec = vdupq_n_u8((uint8_t)fr_read2);
             match_vec   = vdupq_n_u8((uint8_t)temp[0]);
-            rowfreed    = vceqq_u8(s1, vdupq_n_u8((uint8_t)fr_ref));
-            rowfreed2   = vceqq_u8(s1, vdupq_n_u8((uint8_t)fr_ref2));
+            uint8x16_t rowfreed  = vceqq_u8(s1, vdupq_n_u8((uint8_t)fr_ref));
+            uint8x16_t rowfreed2 = vceqq_u8(s1, vdupq_n_u8((uint8_t)fr_ref2));
+            active_frread = vbslq_u8(rowfreed2, vdupq_n_u8((uint8_t)fr_read2),
+                                     vdupq_n_u8(0xFF));
+            active_frread = vbslq_u8(rowfreed,  vdupq_n_u8((uint8_t)fr_read),
+                                     active_frread);
         }
 
         uint8x16_t l_vec = zero_vec;
@@ -593,19 +605,13 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
             uint8x16_t cmpq = vceqq_u8(s2, five_vec);
             sbt = vbslq_u8(cmpq, sft_vec, sbt);
 
-            /* Apply the rank-1 freed-cell override: where the row is fr_ref and
-             * this column is fr_read, force the biased match score. Real bases
-             * are 0-3 and fr_read ∈ {0,3}; s1 boundary (0xFF) and s2
-             * ambig/padding (AMBQ=8, DUMMY5=5) never equal fr_read, so vceqq
-             * is naturally false for them — no extra masking needed. */
+            /* Apply the rank-1 freed-cell override: force the biased match score
+             * where this column's read base equals the row's active freed base
+             * (built once per row in active_frread above). One compare + one
+             * blend; sentinel (0xFF) lanes never match a real s2 (0-3/5/8) so
+             * they blend through unchanged. */
             if (HasFreed) {
-                /* Both freed blends select match_vec, so OR their masks and do
-                 * ONE blend instead of two serially-dependent vbsl ops. Same
-                 * op count as the original two-blend form (one vbsl swapped for
-                 * one vorr), byte-identical, one shorter link in the sbt chain. */
-                uint8x16_t freed  = vandq_u8(rowfreed,  vceqq_u8(s2, frread_vec));
-                uint8x16_t freed2 = vandq_u8(rowfreed2, vceqq_u8(s2, frread2_vec));
-                sbt = vbslq_u8(vorrq_u8(freed, freed2), match_vec, sbt);
+                sbt = vbslq_u8(vceqq_u8(s2, active_frread), match_vec, sbt);
             }
 
             /* Check for boundary (high bit set in s1 or s2). vtstq_u8 against
