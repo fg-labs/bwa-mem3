@@ -4,7 +4,7 @@ This page documents every build target available in the Makefile and what each p
 
 ## Prerequisites
 
-- A C++14-capable compiler. **Clang is recommended** — bwa-mem3 runs ~16% faster on x86 (AVX2) and ~6% faster on ARM when built with clang than with g++ (see [Best Practices → Build](../best-practices/build.md)). Clang 7+ or GCC 8+ on Linux; Clang 15+ (Xcode) on macOS. A bare `make` defaults to g++ and prints a warning suggesting clang; pass `CXX=clang++ CC=clang` to build with clang.
+- A C++14-capable compiler. **Clang is recommended** — bwa-mem3 runs ~5–10% faster on x86 (AVX2) and ~6% faster on ARM when built with clang than with g++ (see [Best Practices → Build](../best-practices/build.md)). Clang 7+ or GCC 8+ on Linux; Clang 15+ (Xcode) on macOS. A bare `make` defaults to g++ and prints a warning suggesting clang; pass `CXX=clang++ CC=clang` to build with clang.
 - GNU make 3.81+.
 - CMake 3.12+ (required only when `USE_MIMALLOC=1`, which is the default).
 - autoconf, automake, autoconf-archive, libtool, pkg-config — `ext/htslib`'s build runs `autoreconf -i && ./configure` and locates zlib via `pkg-config`.
@@ -27,7 +27,7 @@ See [Getting Started → Installation](../getting-started/installation.md) for t
 
 ```bash
 make                       # uses g++ (warns, suggesting clang)
-make CXX=clang++ CC=clang  # recommended: ~16% faster on x86, ~6% on ARM
+make CXX=clang++ CC=clang  # recommended: ~5–10% faster on x86, ~6% on ARM
 ```
 
 On x86 hosts this is equivalent to `make single` (see below): one binary

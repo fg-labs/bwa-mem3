@@ -44,7 +44,7 @@ else ifeq ($(CXX), icpx)
 else ifeq ($(CXX), g++)
 	CC= gcc
     # bwa-mem3 is consistently faster when built with clang than with g++
-    # (~15% lower wall + CPU on WGS at the AVX2 floor; see
+    # (~5-10% lower wall + CPU on x86; see
     # docs/src/best-practices/build.md). g++ is GNU make's default CXX, so a
     # bare `make` lands here — but the nudge is deliberately UNguarded by
     # $(origin CXX), so an explicit `CXX=g++` sees it too: the recommendation
@@ -54,7 +54,7 @@ else ifeq ($(CXX), g++)
     # tab — a tab-prefixed $(warning) is parsed as a recipe by GNU make 3.81
     # ("commands commence before first target"). Matches the space-indented
     # warning in the else-branch below.
-    $(warning bwa-mem3: building with g++. clang builds run ~15% faster on this workload — consider `make CXX=clang++ CC=clang`. See docs/src/best-practices/build.md.)
+    $(warning bwa-mem3: building with g++. clang builds run ~5-10% faster on x86 — consider `make CXX=clang++ CC=clang`. See docs/src/best-practices/build.md.)
 else ifeq ($(CXX), clang++)
 	CC= clang
 else ifeq ($(CXX), c++)

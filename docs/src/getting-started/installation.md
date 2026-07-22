@@ -26,7 +26,7 @@ bwa-mem3 vendors several libraries as git submodules. Building from source requi
 
 | Tool | Why it's needed | Minimum version |
 |------|-----------------|-----------------|
-| C++14 compiler (**Clang recommended**, or GCC) | bwa-mem3 itself — clang builds run ~16% faster on x86, see [Build](../best-practices/build.md) | Clang 7+ / GCC 8+ |
+| C++14 compiler (**Clang recommended**, or GCC) | bwa-mem3 itself — clang builds run ~5–10% faster on x86, see [Build](../best-practices/build.md) | Linux: Clang 7+ / GCC 8+ · macOS: Clang 15+ (Xcode) |
 | GNU make | top-level build | 3.81+ |
 | Git | submodule checkout (with `--recursive`) | any recent |
 | autoconf, automake, autoconf-archive, libtool | `ext/htslib` runs `autoreconf -i && ./configure` during build | any recent |
@@ -88,7 +88,7 @@ cd bwa-mem3
 make CXX=clang++ CC=clang
 ```
 
-> **Build with clang.** bwa-mem3 is ~16% faster on x86 (AVX2) and ~6% faster on
+> **Build with clang.** bwa-mem3 is ~5–10% faster on x86 (AVX2) and ~6% faster on
 > ARM when built with clang instead of g++ — see
 > [Best Practices → Build](../best-practices/build.md). A bare `make` uses g++
 > and prints a warning nudging you to clang. Pass `CXX=clang++ CC=clang` as

@@ -41,14 +41,20 @@ matters nearly as much as the vendor.
 
 ### x86-64
 
-The bigger, and more surprising, win is on x86 — clang's optimizer handles
-bwa-mem3's C++ notably better than g++ here. Measured on AWS `c6a.8xlarge`
-(AVX2, `-t 16`), hg38, 5M read pairs, `make arch=avx2`, median-of-3:
+clang's optimizer handles bwa-mem3's C++ better than g++ on x86 — a consistent
+win on every sample and arch, though its size depends on the microarchitecture.
+Measured across the benchmark sweep at **v0.6.0** (hg38, 5M read pairs, `-t 16`,
+per-arch median of compute-time deltas over wgs / wes / panel / hic / sbx):
 
-| Compiler | CPU-seconds | wall | vs g++ |
-|---|---:|---:|---:|
-| g++ 14.2 | 1486 | 1:39 | — |
-| clang 19.1 | 1246 | 1:23 | **~16% faster** |
+| x86 arch | clang vs g++ (compute) |
+|---|---:|
+| c6a (Zen 3, AVX2) | **~8% faster** (up to ~13% on some samples) |
+| c7a (Zen 4, AVX-512) | ~3–4% faster |
+
+The gain is largest on Zen 3 / AVX2 (~8%) and smallest on Zen 4 (~3–4%); the
+`--fast` preset shows a similar ~5–10% clang edge. (An earlier single-host
+spot-check on a `c6a.8xlarge` suggested ~16%; the release-wide numbers above
+are the representative figure.)
 
 ### ARM / aarch64
 
@@ -65,9 +71,9 @@ hand-written intrinsics, so codegen quality depends heavily on the compiler
 
 Takeaways:
 
-- **clang beats g++ on both ISAs** — ~16% on x86 (AVX2) and ~6% on ARM here.
-  The x86 gain is the larger one and applies to the mainstream deployment
-  target, so clang is the recommended production compiler across the board.
+- **clang beats g++ on both ISAs** — ~5–10% on x86 (AVX2) and ~6% on ARM here.
+  It's a consistent win on the mainstream deployment target, so clang is the
+  recommended production compiler across the board.
 - **Compiler *version* matters too.** On ARM a larger ~18% clang-over-gcc gap
   has been reported against an older gcc (~13); against a modern gcc (15.2) it
   narrows to ~6% because recent gcc closed much of the NEON gap. Prefer clang,
