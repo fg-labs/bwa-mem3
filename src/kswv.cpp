@@ -549,6 +549,17 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
     vst1q_u8(H0, zero_vec);
     vst1q_u8(H1, zero_vec);
 
+    /* Rows below the group's SHORTEST ref window have no padding lane, so the
+     * per-row boundary mask (rowboundary, below) is all-zero there and the vbsl
+     * that applies it is a no-op. Below minLen1 we skip it entirely. For a
+     * uniform-length group (the common case: production ref windows cluster
+     * tightly) minLen1 == nrow, so the vbsl never runs -- recovering the whole
+     * boundary-mask cost -- while mixed-length groups still apply it on exactly
+     * the rows where some lane has started padding. Dummy tail lanes have
+     * len1==0, pinning minLen1 to 0 for a partial final group (no skip, safe). */
+    int minLen1 = p[0].len1;
+    for (int l = 1; l < SIMD_WIDTH8; l++) if (p[l].len1 < minLen1) minLen1 = p[l].len1;
+
     int i, limit = nrow;
     for (i = 0; i < nrow; i++)
     {
@@ -602,6 +613,12 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
          * the per-cell blend remains. The byte-identity golden gate is the safety
          * net: if any s2 lane ever carried bit 7, the check would fail instantly. */
         uint8x16_t rowboundary = vtstq_u8(s1, vdupq_n_u8(0x80));
+        /* Apply the mask only once some lane has begun padding (i >= minLen1);
+         * below that every lane still holds a real base, so rowboundary is
+         * all-zero and the blend is a no-op. Loop-invariant across j, so the
+         * compiler unswitches the inner loop into a masked and an unmasked
+         * copy -- no per-cell branch. */
+        const bool apply_bound = (i >= minLen1);
 
         uint8x16_t l_vec = zero_vec;
         for (j = 0; j < ncol; j++)
@@ -629,11 +646,18 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
             }
 
             uint8x16_t m11 = vqaddq_u8(h00, sbt);
-            m11 = vbslq_u8(rowboundary, zero_vec, m11);
+            /* Zero m11 on ref-boundary/padding rows via the hoisted per-row mask
+             * (see rowboundary above). Skipped entirely below minLen1, where no
+             * lane pads and the mask is provably all-zero. */
+            if (apply_bound) m11 = vbslq_u8(rowboundary, zero_vec, m11);
             m11 = vqsubq_u8(m11, sft_vec);
 
-            h11 = vmaxq_u8(m11, e11);
-            h11 = vmaxq_u8(h11, f11);
+            /* hme = max(m11, e11); reused verbatim for `me` (gap-D) below, where
+             * the original code recomputed the identical max(m11,e11) -- e11 is
+             * not modified between the two, so this is byte-identical and drops
+             * one vmaxq per cell. */
+            uint8x16_t hme = vmaxq_u8(m11, e11);
+            h11 = vmaxq_u8(hme, f11);
 
             /* Update imax tracking */
             uint8x16_t cmp0 = vcgtq_u8(h11, imax_vec);
@@ -645,7 +669,7 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
              * dominated by its own extension arg (O>=0, saturating u8). me must
              * read the OLD e11, so compute it before the e-update overwrites e11. */
             uint8x16_t mf = vmaxq_u8(m11, f11);
-            uint8x16_t me = vmaxq_u8(m11, e11);
+            uint8x16_t me = hme;   /* == vmaxq_u8(m11, e11), reused (e11 unchanged) */
             uint8x16_t gapE = vqsubq_u8(mf, oe_ins_vec);
             e11 = vqsubq_u8(e11, e_ins_vec);
             e11 = vmaxq_u8(gapE, e11);
