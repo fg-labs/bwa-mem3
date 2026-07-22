@@ -134,6 +134,23 @@ static inline int ksw_hmax_u8(__m128i v) {
 }
 #endif
 
+/* Signed horizontal max of 8 int16 lanes (the ksw_i16 analogue of ksw_hmax_u8):
+ * one vmaxvq_s16 on NEON, the shift-and-max chain on x86. Local-SW scores are
+ * non-negative and below the overflow break, so the signed max equals the
+ * zero-extended _mm_extract_epi16 the macro returned. */
+#if defined(__ARM_NEON) || defined(__aarch64__) || defined(APPLE_SILICON)
+static inline int ksw_hmax_s16(__m128i v) {
+	return vmaxvq_s16(vreinterpretq_s16_m128i(v));
+}
+#else
+static inline int ksw_hmax_s16(__m128i v) {
+	v = _mm_max_epi16(v, _mm_srli_si128(v, 8));
+	v = _mm_max_epi16(v, _mm_srli_si128(v, 4));
+	v = _mm_max_epi16(v, _mm_srli_si128(v, 2));
+	return _mm_extract_epi16(v, 0);
+}
+#endif
+
 static kswr_t ksw_u8(kswq_t *q, int tlen, const uint8_t *target,
 			  int _o_del, int _e_del, int _o_ins, int _e_ins,
 			  int xtra) // the first gap costs -(_o+_e)
@@ -263,13 +280,6 @@ static kswr_t ksw_i16(kswq_t *q, int tlen, const uint8_t *target, int _o_del, in
 	__m128i zero, oe_del, e_del, oe_ins, e_ins, *H0, *H1, *E, *Hmax;
 	kswr_t r;
 
-#define __max_8(ret, xx) do { \
-		(xx) = _mm_max_epi16((xx), _mm_srli_si128((xx), 8)); \
-		(xx) = _mm_max_epi16((xx), _mm_srli_si128((xx), 4)); \
-		(xx) = _mm_max_epi16((xx), _mm_srli_si128((xx), 2)); \
-    	(ret) = _mm_extract_epi16((xx), 0); \
-	} while (0)
-
 	// initialization
 	r = g_defr;
 	minsc = (xtra&KSW_XSUBO)? xtra&0xffff : 0x10000;
@@ -317,11 +327,18 @@ static kswr_t ksw_i16(kswq_t *q, int tlen, const uint8_t *target, int _o_del, in
 				_mm_store_si128(H1 + j, h);
 				h = _mm_subs_epu16(h, oe_ins);
 				f = _mm_subs_epu16(f, e_ins);
+				/* lazy-F is settled when no lane has f > h. On NEON that is one
+				 * umaxv over the cmpgt mask (==0 => no lane set) instead of the
+				 * sse2neon-emulated movemask; identical exit condition. */
+#if defined(__ARM_NEON) || defined(__aarch64__) || defined(APPLE_SILICON)
+				if (UNLIKELY(vmaxvq_u16(vreinterpretq_u16_m128i(_mm_cmpgt_epi16(f, h))) == 0)) goto end_loop8;
+#else
 				if(UNLIKELY(!_mm_movemask_epi8(_mm_cmpgt_epi16(f, h)))) goto end_loop8;
+#endif
 			}
 		}
 end_loop8:
-		__max_8(imax, max);
+		imax = ksw_hmax_s16(max);
 
 		if (imax >= minsc) {
 			if (n_b == 0 || (int32_t)b[n_b-1] + 1 != i) {
