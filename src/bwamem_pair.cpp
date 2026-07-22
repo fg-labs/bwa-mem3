@@ -42,6 +42,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "ksw.h"
 #include "bandedSWA.h"
 #include "kswv.h"
+#include "simd_dispatch.h"
 
 #ifdef USE_MALLOC_WRAPPERS
 #  include "malloc_wrap.h"
@@ -797,6 +798,43 @@ static bool meth_batched_rescue_enabled()
     return enabled;
 }
 
+/* Whether the RUNNING SIMD tier implements the kswv freed-cell override. Only
+ * the NEON, AVX2, and AVX-512BW kernel bodies do; on sse41/sse42/avx the
+ * mat-aware kswv ctor reports needsScalar() for any freed-cell matrix (see
+ * kswv.cpp's `freed_simd_supported`). This must be a RUNTIME query, not a
+ * compile-time `#if`: bwamem_pair.cpp is a non-kernel TU compiled once at
+ * BASELINE_ARCH, while make_kswv dispatches to a per-tier kernel chosen at
+ * runtime (and downgradable via BWAMEM3_FORCE_TIER), so the two need not agree.
+ * Cached because the callers below sit in per-pair loops; the tier is fixed
+ * once bwamem3_simd_init() has run. */
+static bool meth_freed_cell_tier_supported()
+{
+    static const bool supported = []() {
+        bwamem3_simd_init();          /* idempotent; guarantees the tier is set */
+        const int tier = bwamem3_simd_tier();
+        return tier == BWAMEM3_TIER_AVX2 || tier == BWAMEM3_TIER_AVX512BW
+                || tier == BWAMEM3_TIER_NEON;
+    }();
+    return supported;
+}
+
+/* Whether the current --meth-scoring matrix is expressible by the batched kswv
+ * kernel. The kernel handles exactly what mem_opt_fill_meth_mat produces:
+ * COLLAPSED (conversion cell + its mirror, both freed to +a), GENOMIC (the single
+ * conversion cell freed to +a, rank-1), and NEUTRAL (the single conversion cell
+ * freed to 0). The kernel's freed-cell blend now scores the freed cell to its
+ * matrix value (fr_val), so a single freed cell of ANY value — match (genomic) or
+ * 0 (neutral) — is expressible; only a changed diagonal or a non-mirror multi-cell
+ * matrix forces scalar. Expressibility is therefore purely a tier question: every
+ * scoring mode is batched on a freed-capable tier, and every scoring mode takes
+ * the scalar ksw_align2 rescue on the freed-less x86 tiers. Keep this in lockstep
+ * with mem_opt_fill_meth_mat and the kswv mat-aware ctor. */
+static inline bool meth_scoring_batched_expressible(const mem_opt_t *opt)
+{
+    (void)opt;   /* every mem_opt_fill_meth_mat matrix is kernel-expressible */
+    return meth_freed_cell_tier_supported();
+}
+
 /* Task 5: run the two-phase batched kswv over a contiguous SeqPair slice
  * pairs[0..slice_pcnt) whose 8-bit pairs occupy [0, slice_pcnt8) and 16-bit
  * pairs [slice_pcnt8, slice_pcnt). The slice must have MAX_LINE_LEN trailing
@@ -909,12 +947,13 @@ int mem_sam_pe_batch(const mem_opt_t *opt, mem_cache *mmc,
     /* Task 5: under --meth (batched rescue enabled), partition the enqueued
      * mate-rescue pairs by bisulfite hypothesis (OT/OB) and run the kernel once
      * per group with the matching mat-aware kswv object. mat_ot frees C->T (top
-     * strand), mat_ob frees G->A (bottom strand); make_kswv installs the rank-1
+     * strand), mat_ob frees G->A (bottom strand); make_kswv installs the
      * freed-cell override for each, so the batched score equals the scalar
      * ksw_align2 score with the asymmetric matrix. Non-meth and the env-OFF
      * escape hatch fall through to the single-object path below, byte-identical
      * to the pre-Task-5 code. */
-    if (opt->meth_mode && meth_batched_rescue_enabled()) {
+    if (opt->meth_mode && meth_batched_rescue_enabled()
+            && meth_scoring_batched_expressible(opt)) {
         // Scratch slice (Right128 is free here; sort_classify only used it as
         // a transient and the final layout lives in Left128). Sized
         // wsize_pair + MAX_LINE_LEN, which comfortably holds one group plus
@@ -928,17 +967,21 @@ int mem_sam_pe_batch(const mem_opt_t *opt, mem_cache *mmc,
                                  opt->a, -1*opt->b, nthreads,
                                  maxRefLen, maxQerLen, opt->mat_ob);
         // The batched kernel expresses exactly the matrices mem_opt_fill_meth_mat
-        // produces: GENOMIC (one freed cell) and COLLAPSED (the conversion cell
-        // PLUS its mirror — a symmetric (i,j)/(j,i) pair). needsScalar() is
-        // therefore always false here. Guard it at RUNTIME rather than with a
-        // bare assert(): under NDEBUG assert is a no-op, which would let a future
-        // unsupported matrix run the batched kernel and silently mis-score. Fail
-        // loudly instead — this can only fire on a programming error in
-        // mem_opt_fill_meth_mat (a matrix that is neither rank-1 nor a mirror pair).
+        // produces: GENOMIC (one freed cell to +a), NEUTRAL (one freed cell to 0),
+        // and COLLAPSED (the conversion cell PLUS its mirror — a symmetric
+        // (i,j)/(j,i) pair). The freed-less x86 tiers never reach here —
+        // meth_scoring_batched_expressible() gates this branch on the running
+        // tier — so needsScalar() is always false. Guard it at RUNTIME rather
+        // than with a bare assert(): under NDEBUG assert is a no-op, which would
+        // let a future unsupported matrix run the batched kernel and silently
+        // mis-score. Fail loudly instead — this can only fire on a programming
+        // error in mem_opt_fill_meth_mat (a matrix that is neither a single freed
+        // cell nor a mirror pair) or a tier gate that drifted out of lockstep
+        // with the kswv mat-aware ctor.
         if (pwsw_ot->needsScalar() || pwsw_ob->needsScalar())
             err_fatal(__func__,
                       "meth mate-rescue matrix not expressible by the batched kernel "
-                      "(neither rank-1 genomic nor a collapsed mirror pair)");
+                      "(neither a single freed cell nor a collapsed mirror pair)");
 
         // hyp == 1 -> OT (mat_ot / pwsw_ot); hyp == 0 -> OB (mat_ob / pwsw_ob).
         // -1 (non-meth) cannot occur here: every enqueued pair under meth_mode
@@ -1285,8 +1328,9 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
      * scalar ksw_align2. The legacy scalar path (gar[gcnt+r] = -1 →
      * mem_matesw_batch_post re-runs ksw_align2) is retained as the escape hatch
      * (BWAMEM3_METH_BATCHED_RESCUE=0). The OT/OB matrices mem_opt_fill_meth_mat
-     * produces are always expressible (rank-1 genomic or a collapsed mirror
-     * pair), so the kswv objects never report needsScalar() here; if a future
+     * produces are always expressible on a freed-cell tier (a single cell freed
+     * to +a for genomic or to 0 for neutral, or a collapsed mirror pair), so
+     * the kswv objects never report needsScalar() here; if a future
      * matrix or tier ever did, mem_sam_pe_batch fails loud via err_fatal rather
      * than silently mis-scoring (see the needsScalar() guard there). The dedup
      * below passes query = 0 (no patch SW), so its mat default (opt->mat) is
@@ -1383,7 +1427,7 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
             /* D3 (--meth, Task 5): meth mate-rescue is now enqueued for the
              * batched kswv kernel just like a non-meth pair. The kernels are
              * mat-aware (Task 2/4): make_kswv(..., mat_ot/mat_ob) installs the
-             * rank-1 freed-cell override for the bisulfite OT/OB matrices, so
+             * freed-cell override for the bisulfite OT/OB matrices, so
              * the batched score matches the scalar ksw_align2 score with the
              * asymmetric matrix. The per-pair hypothesis tag (sp.meth_hyp,
              * below) drives the OT/OB partition in mem_sam_pe_batch, which runs
@@ -1392,12 +1436,15 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
              * (sp.meth_hyp = (mate_meth_ot ^ is_rev) & 1, set below), matching
              * mem_matesw_batch_post's scalar index==-1 fallback. The legacy scalar
              * path remains as a safety fallback for any pair whose object
-             * reports needsScalar() (rank-1 meth never does) and is reachable
-             * via BWAMEM3_METH_BATCHED_RESCUE=0 (escape hatch). */
-            if (opt->meth_mode && !meth_batched_rescue_enabled()) {
-                // Escape hatch (env=0): keep the legacy scalar rescue. Leave
-                // gar = -1 so mem_matesw_batch_post re-runs this orientation
-                // through ksw_align2 with the asymmetric matrix.
+             * reports needsScalar() (meth never does on a freed-capable tier) and
+             * is reachable via BWAMEM3_METH_BATCHED_RESCUE=0 (escape hatch) or on
+             * a freed-less SIMD tier (sse41/sse42/avx), where the kswv kernel has
+             * no freed-cell override and every scoring mode must score scalar. */
+            if (opt->meth_mode && (!meth_batched_rescue_enabled()
+                    || !meth_scoring_batched_expressible(opt))) {
+                // Escape hatch (env=0) or freed-less tier: keep the legacy scalar
+                // rescue. Leave gar = -1 so mem_matesw_batch_post re-runs this
+                // orientation through ksw_align2 with the asymmetric matrix.
                 gar[gcnt + r] = -1;
                 if (rev) free(rev);
                 continue;
@@ -1550,9 +1597,11 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
      * The scalar ksw_align2 path below (index == -1) is the ESCAPE HATCH: it
      * is reached only when BWAMEM3_METH_BATCHED_RESCUE=0 forces the legacy
      * scalar path (gar[gcnt+r] == -1 from _pre), or for any matrix where the
-     * kswv object reports needsScalar() (a non-rank-1 asymmetric matrix; the
-     * current OT/OB matrices are rank-1 and never trigger this). The path is
-     * retained as a safety net, not the primary route. */
+     * kswv object reports needsScalar() (an asymmetric matrix the kernel cannot
+     * express, or any freed-cell matrix on a tier without the override). All
+     * three --meth-scoring modes are expressible, so on a freed-cell tier the
+     * current OT/OB matrices never trigger this. The path is retained as a
+     * safety net, not the primary route. */
     const int8_t *sw_mat = mat ? mat : opt->mat;
     #if MATE_SORT    
     extern int mem_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns,

@@ -361,14 +361,18 @@ mem_opt_t *mem_opt_init()
 
 /* D3 (--meth, PR-4): (re)derive the per-hypothesis ASYMMETRIC matrices from the
  * symmetric `mat` + match score `a`. Target-major mat[ref*5+read], ACGT order
- * A,C,G,T,N. Free exactly ONE off-diagonal cell to a MATCH (+a); leave everything
- * else (incl. the mirror cell, a real variant) at the symmetric value:
+ * A,C,G,T,N. Free the conversion cell; leave everything else (incl. the mirror
+ * cell, a real variant) at the symmetric value:
  *   OT: free mat[C][T] = mat[1*5+3]  (ref C, read T = unmethylated C→T)
  *   OB: free mat[G][A] = mat[2*5+0]  (ref G, read A = bottom-strand G→A)
- * GENOMIC (opt->meth_scoring): only that one cell is freed ⇒ the mirror stays a
- * real mismatch and the SIMD kernel takes its rank-1 fast path. COLLAPSED: the
- * mirror cell is ALSO freed (two cells) so C/T and G/A are interchangeable
- * (bwameth-compatible), via bandedSWA's general-matrix path. Selected per chain
+ * The freed VALUE and whether the mirror is freed too depend on opt->meth_scoring:
+ * GENOMIC frees only that cell, to a MATCH (+a) ⇒ the mirror stays a real mismatch
+ * and the SIMD kernel takes its rank-1 fast path. NEUTRAL frees only that cell, to
+ * 0 (tolerated but not rewarded) ⇒ the mirror likewise stays a mismatch; one freed
+ * cell but not rank-1, so bandedSWA uses its general-matrix path. COLLAPSED: the
+ * mirror cell is ALSO freed (two cells, both to +a) so C/T and G/A are
+ * interchangeable (bwameth-compatible), via bandedSWA's general-matrix path.
+ * Selected per chain
  * via mem_opt_meth_mat(); valid only under --meth. MUST be called after EVERY
  * rebuild of opt->mat (mem_opt_init AND after main_mem parses -A/-B/-x and
  * re-runs bwa_fill_scmat) — otherwise the meth matrices keep the default
@@ -376,8 +380,11 @@ mem_opt_t *mem_opt_init()
 void mem_opt_fill_meth_mat(mem_opt_t *o) {
     memcpy(o->mat_ot, o->mat, sizeof(o->mat));
     memcpy(o->mat_ob, o->mat, sizeof(o->mat));
-    o->mat_ot[1 * 5 + 3] = o->a;   /* OT: ref C / read T → match (C→T conversion)   */
-    o->mat_ob[2 * 5 + 0] = o->a;   /* OB: ref G / read A → match (G→A conversion)   */
+    /* Conversion cell: +a (rewarded) for COLLAPSED/GENOMIC, 0 (tolerated but not
+     * rewarded) for NEUTRAL. See enum mem_meth_scoring for the rationale. */
+    int8_t conv = (o->meth_scoring == MEM_METH_SCORING_NEUTRAL) ? 0 : (int8_t)o->a;
+    o->mat_ot[1 * 5 + 3] = conv;   /* OT: ref C / read T (C→T conversion)   */
+    o->mat_ob[2 * 5 + 0] = conv;   /* OB: ref G / read A (G→A conversion)   */
     if (o->meth_scoring == MEM_METH_SCORING_COLLAPSED) {
         /* bwameth-compatible: free the MIRROR cell too so C/T (and G/A) are
          * mutually interchangeable (collapsed 3-letter space). Two freed cells ⇒
@@ -401,7 +408,8 @@ void mem_opt_apply_meth_defaults(mem_opt_t *opt, const mem_opt_t *opt0)
     if (opt->meth_scoring == MEM_METH_SCORING_COLLAPSED) {
         if (!opt0->b) opt->b = 2 * opt->a;                      /* bwameth's lenient -B 2 */
     }
-    /* GENOMIC keeps bwa's default b (already scaled by update_a): variant-aware. */
+    /* GENOMIC and NEUTRAL keep bwa's default b (already scaled by update_a):
+     * both are variant-aware, so the mirror cell must stay a real mismatch. */
 }
 
 /******************************

@@ -58,17 +58,24 @@ After seeds are remapped to original coordinates with their OT/OB hypothesis,
 - **OT** frees ref-`C` × read-`T` (the expected unmethylated C→T conversion).
 - **OB** frees ref-`G` × read-`A` (the expected bottom-strand G→A conversion).
 
-Under `--meth-scoring collapsed` (default) the mirror cell is freed too (ref-`T` ×
-read-`C`, ref-`A` × read-`G`), so C/T and G/A are interchangeable and placement
-matches bwameth. Under `--meth-scoring genomic` only the conversion direction is
-freed, so a real variant stays a mismatch. See
-[Overview → `--meth-scoring`](overview.md#two-scoring-modes---meth-scoring).
+Under `--meth-scoring collapsed` (the `--meth` / `--meth=emseq` default) the mirror
+cell is freed too (ref-`T` × read-`C`, ref-`A` × read-`G`), so C/T and G/A are
+interchangeable and placement matches bwameth. Under `--meth-scoring genomic` only
+the conversion direction is freed, scored as a full match. Under
+`--meth-scoring neutral` (the `--meth=taps` default) only the conversion direction
+is freed as well, but it scores `0` rather than a match: a converted base is
+tolerated, not rewarded. Both `genomic` and `neutral` leave the mirror cell a real
+mismatch, so a genuine variant stays a mismatch and `NM`/`MD` remain variant-aware.
+See [Overview → `--meth-scoring`](overview.md#three-scoring-modes---meth-scoring).
 
 The seed's own ungapped score is recomputed in the same matrix (not assumed to be
 a perfect `len × match`), so under `--meth-scoring genomic` a seed-internal C/T or
 G/A variant correctly lowers the alignment score, `AS`, and `MAPQ`. Under
 `--meth-scoring collapsed` the mirror cell is freed, so such a variant is scored
-as a conversion and does not penalize placement.
+as a conversion and does not penalize placement. Under `--meth-scoring neutral` the
+mirror cell is a mismatch as in `genomic`, and a seed-internal converted base
+contributes `0` instead of a match — so a conversion lowers `AS` relative to
+`genomic`, just by less than a mismatch would.
 
 ## Sequence restoration in the BAM SEQ field
 

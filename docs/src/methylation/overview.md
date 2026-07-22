@@ -25,23 +25,29 @@ mismatches in `NM`/`MD`.
 
 The non-`--meth` code path is byte-for-byte unchanged.
 
-## Two scoring modes: `--meth-scoring`
+## Three scoring modes: `--meth-scoring`
 
 Because scoring happens in 4-letter space, `--meth` can choose how lenient to be
-about bisulfite-converted bases. This is controlled by `--meth-scoring`:
+about converted bases. This is controlled by `--meth-scoring`:
 
 | Mode | Default? | Matrix | `-B` | Behavior |
 |------|----------|--------|------|----------|
-| **`collapsed`** | **yes** | frees C↔T *and* G↔A both ways (two cells) | `2` | bwameth-compatible **placement** — C/T and G/A are interchangeable, so it closely tracks bwameth's collapsed-space mapping. A close approximation, **not** exact: ~1% of records differ in `POS`/`CIGAR`/`MAPQ`, so re-validate if pinned to a bwameth release. |
-| **`genomic`** | no (opt-in) | frees only the conversion direction (one cell) | `4` | **variant-aware** — a real C/T or G/A variant scores as a mismatch, so `NM`/`MD` are truthful and the BAM is usable for variant calling. |
+| **`collapsed`** | **`--meth` / `--meth=emseq`** | frees C↔T *and* G↔A both ways (two cells), each scored as a full match | `2` | bwameth-compatible **placement** — C/T and G/A are interchangeable, so it closely tracks bwameth's collapsed-space mapping. A close approximation, **not** exact: ~1% of records differ in `POS`/`CIGAR`/`MAPQ`, so re-validate if pinned to a bwameth release. |
+| **`genomic`** | no (opt-in) | frees only the conversion direction (one cell), scored as a full match | `4` | **variant-aware** — a real C/T or G/A variant scores as a mismatch, so `NM`/`MD` are truthful and the BAM is usable for variant calling. |
+| **`neutral`** | **`--meth=taps`** | frees only the conversion direction (one cell), scored `0` | `4` | **variant-aware and conservative** — a conversion is tolerated but not rewarded, so a sparse TAPS conversion no longer over-credits a spurious C→T alignment. `NM`/`MD` stay truthful; measured +0.24–0.28 pp placement over `genomic` on simulated TAPS. |
 
-The default is `collapsed`, so existing methylation pipelines see
-bwameth-compatible read placement unless they explicitly opt into `genomic`.
+The default follows the chemistry: `--meth` and `--meth=emseq` default to
+`collapsed`, so existing methylation pipelines see bwameth-compatible read
+placement unless they explicitly opt into `genomic`; `--meth=taps` defaults to
+`neutral`, because TAPS conversions are sparse (~3% of cytosines vs ~95% under
+EM-seq) and collapsing costs specificity it can no longer repay. An explicit
+`--meth-scoring` always overrides the chemistry default.
+
 `collapsed` closely tracks bwameth's placement and emits the same Bismark tags,
 but it is a placement drop-in — **not** byte-identical: ~1% of records differ in
 `POS`/`CIGAR`/`MAPQ`, so re-validate if you are pinned to a specific bwameth
 release. See [bwameth.py drop-in mapping](bwameth-mapping.md) for the full
-placement-compatibility caveat.
+placement-compatibility caveat, and [TAPS](taps.md) for the `neutral` measurements.
 
 ## Pipeline at a glance
 
@@ -53,7 +59,7 @@ are required.
 flowchart LR
     A[Raw FASTQ\nR1 / R2] -->|project R1 C→T,\nR2 G→A for SEEDING ONLY| B[seed in .meth\ndoubled seed index]
     B -->|remap each seed →\noriginal coords + OT/OB hypothesis| C[extend + SCORE\nORIGINAL read vs ORIGINAL ref\nper-strand asymmetric matrix]
-    C -->|--meth-scoring\ncollapsed / genomic| D[original-alphabet\nalignment]
+    C -->|--meth-scoring\ncollapsed / genomic / neutral| D[original-alphabet\nalignment]
     D -->|XR/XG/XM Bismark tags\noptional --chimera-qc| E[BAM output]
 ```
 
@@ -77,7 +83,7 @@ Steps:
 
 4. **4-letter extension and scoring.** The **original** read is extended and
    scored against the **original** 4-letter reference window using the per-strand
-   asymmetric matrix (see [`--meth-scoring`](#two-scoring-modes---meth-scoring)).
+   asymmetric matrix (see [`--meth-scoring`](#three-scoring-modes---meth-scoring)).
    OT frees ref-`C` × read-`T` (the unmethylated C→T conversion); OB frees
    ref-`G` × read-`A`. The seed's own true score is recomputed in this matrix too,
    so a seed-internal variant correctly lowers the alignment score rather than
@@ -105,16 +111,21 @@ samtools index out.bam
 # Opt into variant-aware scoring (truthful NM/MD; BAM usable for variant calling).
 bwa-mem3 mem --meth --meth-scoring genomic -t 16 ref.fa R1.fq.gz R2.fq.gz \
   | samtools sort -o out.bam
+
+# TAPS: --meth=taps sets the TAPS XM:Z polarity and defaults to neutral scoring.
+bwa-mem3 mem --meth=taps -t 16 ref.fa R1.fq.gz R2.fq.gz \
+  | samtools sort -o out.bam
 ```
 
 > **Note — scoring defaults**
 >
-> `--meth` applies `-L 10 -U 100 -T 40 -M -C` in both modes, plus the
-> mode-dependent mismatch penalty: `-B 2` for `collapsed`, `-B 4` for `genomic`.
-> These mirror bwameth's `bwa mem -T 40 -B 2 -L 10 -CM` (with `-U 100` for
-> paired-end). The scoring values (`-B`, `-L`, `-U`, `-T`) can be overridden on
-> the command line, in any position relative to `--meth`. `-M` and `-C` cannot —
-> bwa has no option that unsets them, so `--meth` applies them unconditionally.
+> `--meth` applies `-L 10 -U 100 -T 40 -M -C` in every mode, plus the
+> mode-dependent mismatch penalty: `-B 2` for `collapsed`, `-B 4` for `genomic`
+> and `neutral`. These mirror bwameth's `bwa mem -T 40 -B 2 -L 10 -CM` (with
+> `-U 100` for paired-end). The scoring values (`-B`, `-L`, `-U`, `-T`) can be
+> overridden on the command line, in any position relative to `--meth`. `-M` and
+> `-C` cannot — bwa has no option that unsets them, so `--meth` applies them
+> unconditionally.
 >
 > These constants are quoted at bwa's default match score (`-A 1`, what bwameth
 > runs). Like every other score-derived default, they scale with `-A`: under

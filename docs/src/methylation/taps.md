@@ -43,23 +43,29 @@ either way. See [SAM tags](tags.md#xmz--methylation-call-string).
 | | `--meth` (em-seq) | `--meth=taps` |
 |---|---|---|
 | `XM:Z` polarity | retained `C` = methylated | retained `C` = **un**methylated |
-| `--meth-scoring` default | `collapsed` | **`genomic`** |
+| `--meth-scoring` default | `collapsed` | **`neutral`** |
 | Index, seeding, `XR`/`XG` | identical | identical |
 
 The scoring default differs because TAPS conversions are far sparser — 3.2 % of
 cytosines versus 94.6 % for em-seq on a matched simulation — so the collapsed
-3-letter alphabet costs specificity it can no longer repay. Measured placement
-on simulated TAPS against full hg38:
+3-letter alphabet costs specificity it can no longer repay. `neutral` goes one
+step further than `genomic`: it scores the conversion cell as `0` (tolerated but
+not rewarded) rather than a full match, so a sparse TAPS conversion no longer
+over-credits a spurious C→T alignment. Measured placement on simulated TAPS
+against full hg38, across three methylation loads:
 
 | arm | placement |
 |---|---|
-| `--meth=taps` (i.e. genomic) | **95.72 %** |
-| plain (no `--meth`) | 95.53 % |
-| `--meth` (collapsed) | 95.40 % |
+| `--meth=taps` (i.e. `neutral`) | **95.95–96.01 %** |
+| `--meth-scoring genomic` | 95.68–95.73 % |
+| plain (no `--meth`) | ~95.53 % |
+| `--meth-scoring collapsed` | 95.37–95.43 % |
 | *unconverted baseline* | *96.02 %* |
 
-`genomic` also placed 136 k more reads in the MAPQ 60+ bin at higher accuracy.
-An explicit `--meth-scoring` always overrides the default.
+`neutral` reaches essentially the unconverted ceiling — a robust +0.24–0.28 pp
+over `genomic` — with identical MAPQ calibration (60+ bin 99.99 % either way) and
+`NM` (mean 1.966 vs 1.969), so the gain is not bought with over-confidence or
+inflated edit distance. An explicit `--meth-scoring` always overrides the default.
 
 ## Downstream methylation calling
 

@@ -73,3 +73,76 @@ TEST_CASE("collapsed is the default scoring mode"
     CHECK(o->mat_ot[3 * 5 + 1] == o->a);
     free(o);
 }
+
+TEST_CASE("neutral frees the conversion cell to ZERO, not a match"
+          * doctest::test_suite("unit/meth_scoring"))
+{
+    // TAPS conversions are sparse (~3% of C), so rewarding the conversion as a
+    // full match (genomic) over-credits spurious C->T alignments. NEUTRAL scores
+    // the conversion cell as 0 -- tolerated but not rewarded -- which measured
+    // ~+0.25 pp placement over genomic across all methylation loads. See
+    // reports/2026-07-20-taps-alignment-experiment-results.md (question A).
+    mem_opt_t *o = opt_for(MEM_METH_SCORING_NEUTRAL);
+    const int b = o->b;
+
+    // OT: ref-C x read-T freed to 0 (neutral); mirror ref-T x read-C stays -b.
+    CHECK(o->mat_ot[1 * 5 + 3] == 0);
+    CHECK(o->mat_ot[3 * 5 + 1] == -b);
+    // OB: ref-G x read-A freed to 0; mirror ref-A x read-G stays -b.
+    CHECK(o->mat_ob[2 * 5 + 0] == 0);
+    CHECK(o->mat_ob[0 * 5 + 2] == -b);
+    // Diagonal matches and unrelated off-diagonals untouched.
+    CHECK(o->mat_ot[0 * 5 + 0] == o->a);   // A/A match
+    CHECK(o->mat_ot[0 * 5 + 1] == -b);     // ref-A x read-C real mismatch
+
+    free(o);
+}
+
+TEST_CASE("neutral is a SINGLE freed cell (value 0), not rank-1"
+          * doctest::test_suite("unit/meth_scoring"))
+{
+    // The freed conversion cell holds 0, which is not w_match, so it is NOT
+    // rank-1 — the pre-generalization predicate stays false, keeping the
+    // bandedSWA dispatch unchanged. But it IS a single off-diagonal free (one
+    // cell, any value, no diagonal change), which the generalized kswv freed-cell
+    // blend expresses by scoring that cell to fr_val (== 0 here). This pins the
+    // classifier that lets the batched kswv rescue kernel run neutral scoring.
+    mem_opt_t *o = opt_for(MEM_METH_SCORING_NEUTRAL);
+    BswFreedCell fc = bsw_freed_cell(o->mat_ot, o->a, -o->b, /*forced=*/false);
+    CHECK(fc.rank1 == false);              // not a match-freed cell
+    CHECK(fc.single == true);              // exactly one off-diagonal freed
+    CHECK(fc.value == 0);                  // freed to 0 (neutral)
+    CHECK(fc.ref == 1);                    // OT freed cell is ref-C (1) x read-T (3)
+    CHECK(fc.read == 3);
+    free(o);
+}
+
+TEST_CASE("genomic is rank-1 AND single, freed to w_match"
+          * doctest::test_suite("unit/meth_scoring"))
+{
+    // Genomic frees the same conversion cell but to a full match (+a). It must
+    // remain rank-1 (byte-identical dispatch) and also register as single with
+    // value == w_match, so the generalized kernel blend reproduces the old
+    // match blend exactly.
+    mem_opt_t *o = opt_for(MEM_METH_SCORING_GENOMIC);
+    BswFreedCell fc = bsw_freed_cell(o->mat_ot, o->a, -o->b, /*forced=*/false);
+    CHECK(fc.rank1 == true);
+    CHECK(fc.single == true);
+    CHECK(fc.value == o->a);
+    free(o);
+}
+
+TEST_CASE("collapsed is neither single nor rank-1 (two freed cells)"
+          * doctest::test_suite("unit/meth_scoring"))
+{
+    // Collapsed frees the conversion cell AND its mirror, so it is NOT a single
+    // off-diagonal free. This is the arm that routes the kswv mat-aware ctor
+    // past the single-cell branch into bsw_freed_pair; pin it alongside the
+    // genomic/neutral arms so a regression in the classifier can't silently send
+    // collapsed down the single-cell blend (which would drop the mirror free).
+    mem_opt_t *o = opt_for(MEM_METH_SCORING_COLLAPSED);
+    BswFreedCell fc = bsw_freed_cell(o->mat_ot, o->a, -o->b, /*forced=*/false);
+    CHECK(fc.single == false);
+    CHECK(fc.rank1 == false);
+    free(o);
+}

@@ -164,16 +164,18 @@ individual flags are unaffected.
 > **Note — --meth overrides scoring defaults**
 >
 > When `--meth` is active, bwa-mem3 applies `-L 10 -U 100 -T 40 -M -C` plus a
-> mode-dependent mismatch penalty: `-B 2` for `--meth-scoring collapsed` (default,
-> bwameth-compatible) and `-B 4` for `--meth-scoring genomic`. This mirrors
-> bwameth's `bwa mem -T 40 -B 2 -L 10 -CM` (with `-U 100` for paired-end). The
-> scoring values (`-B`, `-L`, `-U`, `-T`) can still be overridden by passing the
-> flag explicitly, in any position relative to `--meth`; `-M` and `-C` cannot,
-> since bwa has no option that unsets them.
+> mode-dependent mismatch penalty: `-B 2` for `--meth-scoring collapsed` (the
+> `--meth`/`--meth=emseq` default, bwameth-compatible) and `-B 4` for
+> `--meth-scoring genomic` and `neutral` (`neutral` is the `--meth=taps` default).
+> This mirrors bwameth's `bwa mem -T 40 -B 2 -L 10 -CM` (with `-U 100` for
+> paired-end). The scoring values (`-B`, `-L`, `-U`, `-T`) can still be overridden
+> by passing the flag explicitly, in any position relative to `--meth`; `-M` and
+> `-C` cannot, since bwa has no option that unsets them.
 >
 > Those constants are quoted at bwameth's match score (`-A 1`) and scale with
 > `-A` like every other score-derived default above: under `-A 2` the effective
-> values are `-L 20 -U 200 -T 80` and `-B 4` (collapsed) / `-B 8` (genomic).
+> values are `-L 20 -U 200 -T 80` and `-B 4` (collapsed) / `-B 8` (genomic and
+> neutral).
 
 ### Paired-end
 
@@ -398,13 +400,17 @@ index is not used directly — rebuild with `index --meth` (see
 
 See [Methylation Reference](../methylation/overview.md) for the full treatment.
 
-#### `--meth-scoring {collapsed|genomic}` — bisulfite scoring model
+#### `--meth-scoring {collapsed|genomic|neutral}` — bisulfite/TAPS scoring model
 
-Selects how the 4-letter matrix treats converted bases. `collapsed` (default)
-frees C↔T and G↔A both ways (bwameth-compatible placement, sets `-B 2`); `genomic`
-frees only the conversion direction, keeping real variants as mismatches
-(variant-aware, truthful `NM`/`MD`, keeps `-B 4`). Only meaningful with `--meth`.
-See [Flags → --meth-scoring](../methylation/flags.md#--meth-scoring-collapsedgenomic).
+Selects how the 4-letter matrix treats converted bases. `collapsed` (the
+`--meth`/`--meth=emseq` default) frees C↔T and G↔A both ways (bwameth-compatible
+placement, sets `-B 2`); `genomic` frees only the conversion direction scored as
+a full match, keeping real variants as mismatches (variant-aware, truthful
+`NM`/`MD`, keeps `-B 4`); `neutral` (the `--meth=taps` default) frees only the
+conversion direction but scores it `0` — tolerated, not rewarded — best for the
+sparse conversions of TAPS (keeps `-B 4`, truthful `NM`/`MD`). Only meaningful
+with `--meth`.
+See [Flags → --meth-scoring](../methylation/flags.md#--meth-scoring-collapsedgenomicneutral).
 
 #### `--set-as-failed {f|r}` — strand QC-fail flag
 

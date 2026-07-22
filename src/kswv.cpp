@@ -78,9 +78,11 @@ extern uint64_t prof[10][112];
             /* One compare + one blend against the per-row active_frread512   \
              * target (built once per row); sentinel (0xFF) lanes never match \
              * a real s2. Fewer ops than the two-blend form and, unlike the   \
-             * mask-OR collapse, no serializing kor on the blend's input. */  \
+             * mask-OR collapse, no serializing kor on the blend's input.     \
+             * The blend target is freedval512 (fr_val biased by +shift), so  \
+             * NEUTRAL's zero-scored conversion cell uses the same path. */   \
             __mmask64 freed = _mm512_cmpeq_epi8_mask(s2, active_frread512); \
-            sbt11 = _mm512_mask_blend_epi8(freed, sbt11, match512);     \
+            sbt11 = _mm512_mask_blend_epi8(freed, sbt11, freedval512);  \
         }                                                               \
         /* Boundary mask, gated by HasFreed (compile-time). Non-meth    \
          * hoists the per-row rowboundary512 (a big avx512 win); meth    \
@@ -113,10 +115,10 @@ extern uint64_t prof[10][112];
         if (HasFreed) {                                                 \
             __mmask32 freed = rowfreed512 &                             \
                 _mm512_cmpeq_epi16_mask(s2, frread512);                 \
-            sbt11 = _mm512_mask_blend_epi16(freed, sbt11, match512);    \
+            sbt11 = _mm512_mask_blend_epi16(freed, sbt11, freedval512); \
             __mmask32 freed2 = rowfreed2_512 &                          \
                 _mm512_cmpeq_epi16_mask(s2, frread2_512);               \
-            sbt11 = _mm512_mask_blend_epi16(freed2, sbt11, match512);   \
+            sbt11 = _mm512_mask_blend_epi16(freed2, sbt11, freedval512);\
         }                                                               \
         __m512i m11 = _mm512_add_epi16(h00, sbt11);                     \
         or11 =  _mm512_or_si512(s1, s2);                                \
@@ -181,18 +183,19 @@ kswv::kswv(const int o_del, const int e_del, const int o_ins,
 
 // Mat-aware constructor (issue 173). Delegates to the 9-arg ctor (identical
 // buffer allocation / field init), then inspects the supplied 5x5 scoring
-// matrix for the rank-1 asymmetric (bisulfite OT/OB) freed cell.
+// matrix for the asymmetric (bisulfite OT/OB) freed cell.
 //
 //   nullptr / symmetric matrix ⇒ the existing symmetric XOR-LUT kernel runs
 //     unchanged (has_freed = needs_scalar = false).
-//   exactly one off-diagonal cell freed to a match (rank-1, genomic OT/OB) ⇒
-//     has_freed, fr_ref/fr_read name it; the kernel applies the rank-1 override.
+//   exactly one off-diagonal cell freed to ANY value in [w_mismatch, w_match]
+//     (genomic OT/OB frees it to +a, neutral to 0) ⇒ has_freed, fr_ref/fr_read
+//     name it and fr_val carries the value; the kernel blends the cell to fr_val.
 //   an exact mirrored freed pair (collapsed --meth) ⇒ has_freed, both ordered
-//     cells named; the kernel applies both blends (rank-1 is the degenerate
-//     case where the mirror equals the primary).
+//     cells named; the kernel applies both blends (the single-cell case is the
+//     degenerate one where the mirror equals the primary).
 //   any other asymmetric matrix (non-mirror multi-cell free, changed diagonal,
-//     freed value != w_match) ⇒ needs_scalar; the caller routes those pairs to
-//     ksw_align2.
+//     freed value outside [w_mismatch, w_match]) ⇒ needs_scalar; the caller
+//     routes those pairs to ksw_align2.
 //   On SSE41/SSE42/AVX tiers (no HasFreed kernel override) ⇒ needs_scalar for
 //     ANY freed-cell matrix, so the caller falls back to ksw_align2 rather than
 //     running a kernel that would drop the bisulfite override.
@@ -216,6 +219,19 @@ kswv::kswv(const int o_del, const int e_del, const int o_ins,
         // freed-cell-less tier, leave needs_scalar = true so the caller routes
         // the pair to the scalar ksw_align2 fallback instead of running a
         // kernel that would silently drop the bisulfite override.
+        //
+        // This compile-time test IS the runtime-tier test, and is not a
+        // baseline-vs-host mismatch waiting to happen. kswv.cpp is compiled
+        // ONCE PER TIER (KERNEL_SRCS x {sse41,sse42,avx,avx2,avx512bw} in the
+        // Makefile), each copy under that tier's -m flags with the class name
+        // mangled to kswv_<tier> by kernel_dispatch.h. simd_dispatch.cpp's
+        // make_kswv() switches on the runtime g_tier (incl. BWAMEM3_FORCE_TIER)
+        // to call make_kswv_kernel_<tier>_mat, which constructs THIS ctor out
+        // of the <tier> TU — so the macros below are exactly the ones that
+        // selected the kernel body compiled alongside it. Forcing sse41 on an
+        // AVX2 host runs kswv_sse41::kswv from kswv.sse41.o, where __AVX2__ is
+        // undefined and needs_scalar is correctly set. Keep this predicate in
+        // sync with the #if/#elif ladder that guards the kernel bodies below.
 #if defined(__AVX512BW__) || defined(__AVX2__) \
         || defined(__ARM_NEON) || defined(__aarch64__) || defined(APPLE_SILICON)
         constexpr bool freed_simd_supported = true;
@@ -229,22 +245,37 @@ kswv::kswv(const int o_del, const int e_del, const int o_ins,
         const bool generic = bsw_generic_matrix(mat25, w_match, w_mismatch) || forced;
         if (generic) {
             BswFreedCell fc = bsw_freed_cell(mat25, w_match, w_mismatch, forced);
-            if (fc.rank1) {
-                // GENOMIC (one freed cell): mirror == primary, so the kernel's
-                // second blend is idempotent.
+            if (fc.single) {
+                // ONE off-diagonal cell freed. GENOMIC frees it to a match
+                // (fc.value == w_match); NEUTRAL frees it to 0. Either way the
+                // mirror == primary, so the kernel's second blend is idempotent.
+                // The kernel blends the freed cell to fr_val (see fr_val member);
+                // fr_val == w_match reproduces the pre-generalization match blend.
                 if (!freed_simd_supported) { needs_scalar = true; return; }
+                // bsw_freed_cell accepts ANY freed value, but the 8-bit kernel
+                // blends fr_val + shift into the biased u8 domain, which only
+                // represents [w_mismatch, w_match]. mem_opt_fill_meth_mat never
+                // produces anything outside it (+a or 0), so this cannot fire
+                // today — but a freed value below/above the domain would wrap the
+                // biased byte and SILENTLY mis-score, so route it to the scalar
+                // ksw_align2 fallback (always correct) rather than trust it.
+                if (fc.value < w_mismatch || fc.value > w_match) {
+                    needs_scalar = true; return;
+                }
                 has_freed = true;
                 fr_ref  = fr_ref2  = fc.ref;
                 fr_read = fr_read2 = fc.read;
+                fr_val  = fc.value;
             } else {
                 // COLLAPSED (the --meth default) frees the conversion cell AND
-                // its mirror; the kernel frees both ordered cells.
+                // its mirror to a match; the kernel frees both ordered cells.
                 BswFreedPair fp = bsw_freed_pair(mat25, w_match, w_mismatch);
                 if (fp.supported) {
                     if (!freed_simd_supported) { needs_scalar = true; return; }
                     has_freed = true;
                     fr_ref  = fp.refA;  fr_read  = fp.readA;
                     fr_ref2 = fp.refB;  fr_read2 = fp.readB;
+                    fr_val  = w_match;   // collapsed frees both cells to a match
                 } else {
                     needs_scalar = true;
                 }
@@ -573,17 +604,18 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
         imax_vec = zero_vec;
         uint8x16_t iqe_vec = vdupq_n_u8(0xFF);
 
-        /* Rank-1 freed-cell override (issue 173, bisulfite OT/OB). The freed
-         * cell scores (s1==fr_ref, s2==fr_read) as a true match. s1 is
+        /* Freed-cell override (issue 173, bisulfite OT/OB + TAPS neutral). The
+         * freed cell (s1==fr_ref, s2==fr_read) scores fr_val. s1 is
          * loop-invariant across the inner j loop, so hoist the per-row
          * comparison here; per-cell only the s2 compare + blend remains.
-         * match_vec is the kernel's OWN biased match entry (temp[0] already
-         * includes +shift) so the freed cell scores byte-identically to a real
-         * match in the biased u8 domain. When !HasFreed, all of this and the
-         * per-cell block below compile out (identical codegen to today). */
+         * freedval_vec is fr_val biased by +shift into the u8 domain (same bias
+         * temp[] carries): fr_val==w_match (GENOMIC/COLLAPSED) equals temp[0]
+         * exactly, NEUTRAL (fr_val==0) scores the conversion as 0 after unbiasing.
+         * When !HasFreed, all of this and the per-cell block below compile out
+         * (identical codegen to today). */
         /* Free a SYMMETRIC PAIR of cells: (fr_ref,fr_read) and (fr_ref2,fr_read2).
-         * GENOMIC sets the mirror == primary; COLLAPSED sets it to the transpose
-         * so C/T (or G/A) are interchangeable.
+         * GENOMIC/NEUTRAL set the mirror == primary; COLLAPSED sets it to the
+         * transpose so C/T (or G/A) are interchangeable.
          *
          * Fold the pair into ONE per-lane target base, active_frread: a lane whose
          * ref is fr_ref frees against fr_read, a lane whose ref is fr_ref2 frees
@@ -593,10 +625,11 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
          * 0-3 or the ambig/pad codes DUMMY5(5)/AMBQ(8) — never 0xFF — so on a
          * sentinel lane the single per-cell compare is unconditionally false. This
          * turns the per-cell freed path into one vceqq + one vbslq (down from two
-         * compares, two ands, an orr, and a blend). */
-        uint8x16_t match_vec, active_frread;
+         * compares, two ands, an orr, and a blend). Both cells of the pair score
+         * the same fr_val, so one freedval_vec covers the fold. */
+        uint8x16_t freedval_vec, active_frread;
         if (HasFreed) {
-            match_vec   = vdupq_n_u8((uint8_t)temp[0]);
+            freedval_vec = vdupq_n_u8((uint8_t)(fr_val + shift));
             uint8x16_t rowfreed  = vceqq_u8(s1, vdupq_n_u8((uint8_t)fr_ref));
             uint8x16_t rowfreed2 = vceqq_u8(s1, vdupq_n_u8((uint8_t)fr_ref2));
             active_frread = vbslq_u8(rowfreed2, vdupq_n_u8((uint8_t)fr_read2),
@@ -636,13 +669,13 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
             uint8x16_t cmpq = vceqq_u8(s2, five_vec);
             sbt = vbslq_u8(cmpq, sft_vec, sbt);
 
-            /* Apply the rank-1 freed-cell override: force the biased match score
-             * where this column's read base equals the row's active freed base
-             * (built once per row in active_frread above). One compare + one
-             * blend; sentinel (0xFF) lanes never match a real s2 (0-3/5/8) so
-             * they blend through unchanged. */
+            /* Apply the freed-cell override: force the biased freed score
+             * (fr_val + shift) where this column's read base equals the row's
+             * active freed base (built once per row in active_frread above).
+             * One compare + one blend; sentinel (0xFF) lanes never match a real
+             * s2 (0-3/5/8) so they blend through unchanged. */
             if (HasFreed) {
-                sbt = vbslq_u8(vceqq_u8(s2, active_frread), match_vec, sbt);
+                sbt = vbslq_u8(vceqq_u8(s2, active_frread), freedval_vec, sbt);
             }
 
             uint8x16_t m11 = vqaddq_u8(h00, sbt);
@@ -1197,16 +1230,17 @@ int kswv::kswv_neon_16_impl(int16_t seq1SoA[],
         int16x8_t l_vec   = zero_vec;
         int16x8_t i_vec   = vdupq_n_s16((int16_t)i);
 
-        /* Rank-1 freed-cell override (issue 173). s1 is loop-invariant, so
-         * hoist the per-row fr_ref comparison. The 16-bit kernel has NO shift
-         * bias (m11 = h00 + sbt directly), so the biased match constant is
-         * just temp8[0] (== w_match), sign-extended to int16. !HasFreed → both
-         * this and the per-cell block compile out. */
-        int16x8_t frread_vec16, frread2_vec16, match_vec16, rowfreed16, rowfreed2_16;
+        /* Freed-cell override (issue 173 + TAPS neutral). s1 is loop-invariant, so
+         * hoist the per-row fr_ref comparison. The 16-bit kernel has NO shift bias
+         * (m11 = h00 + sbt directly), so the freed value is just fr_val: fr_val==
+         * w_match (GENOMIC/COLLAPSED) equals temp8[0], NEUTRAL (fr_val==0) scores
+         * the conversion as 0. Sign-extended to int16. !HasFreed → both this and
+         * the per-cell block compile out. */
+        int16x8_t frread_vec16, frread2_vec16, freedval_vec16, rowfreed16, rowfreed2_16;
         if (HasFreed) {
             frread_vec16  = vdupq_n_s16((int16_t)fr_read);
             frread2_vec16 = vdupq_n_s16((int16_t)fr_read2);
-            match_vec16   = vdupq_n_s16((int16_t)temp8[0]);
+            freedval_vec16= vdupq_n_s16((int16_t)fr_val);
             rowfreed16    = vreinterpretq_s16_u16(vceqq_s16(s1, vdupq_n_s16((int16_t)fr_ref)));
             rowfreed2_16  = vreinterpretq_s16_u16(vceqq_s16(s1, vdupq_n_s16((int16_t)fr_ref2)));
         }
@@ -1226,17 +1260,17 @@ int kswv::kswv_neon_16_impl(int16_t seq1SoA[],
             int8x8_t   sbt8 = vqtbl2_s8(perm_vec, idx8);
             int16x8_t  sbt  = vmovl_s8(sbt8);
 
-            /* Rank-1 freed-cell override (issue 173): where row==fr_ref and
-             * col==fr_read, force the match score. Real bases 0-3; fr_read ∈
+            /* Freed-cell override (issue 173 + TAPS neutral): where row==fr_ref and
+             * col==fr_read, force the freed score. Real bases 0-3; fr_read ∈
              * {0,3}; padding/ambig (DUMMY3/0xFFFF/AMBQ16) never equal fr_read,
              * so vceqq is naturally false for them. */
             if (HasFreed) {
                 int16x8_t freed  = vandq_s16(
                     rowfreed16, vreinterpretq_s16_u16(vceqq_s16(s2, frread_vec16)));
-                sbt = vbslq_s16(vreinterpretq_u16_s16(freed), match_vec16, sbt);
+                sbt = vbslq_s16(vreinterpretq_u16_s16(freed), freedval_vec16, sbt);
                 int16x8_t freed2 = vandq_s16(
                     rowfreed2_16, vreinterpretq_s16_u16(vceqq_s16(s2, frread2_vec16)));
-                sbt = vbslq_s16(vreinterpretq_u16_s16(freed2), match_vec16, sbt);
+                sbt = vbslq_s16(vreinterpretq_u16_s16(freed2), freedval_vec16, sbt);
             }
 
             /* Boundary: high bit set in (s1 | s2) indicates padding. */
@@ -1636,19 +1670,21 @@ int kswv::kswv256_u8_impl(uint8_t seq1SoA[],
         __m256i l_vec = zero_vec;
         __m256i i_vec_s16 = _mm256_set1_epi16((int16_t)i);
 
-        /* Rank-1 freed-cell override (issue 173, bisulfite OT/OB). The freed
-         * cell scores (s1==fr_ref, s2==fr_read) as a true match. s1 is
+        /* Freed-cell override (issue 173, bisulfite OT/OB + TAPS neutral). The
+         * freed cell (s1==fr_ref, s2==fr_read) scores fr_val. s1 is
          * loop-invariant across the inner j loop, so hoist the per-row
          * comparison here; per-cell only the s2 compare + blend remains.
-         * match256 is the kernel's OWN biased match entry (temp[0] already
-         * includes +shift) so the freed cell scores byte-identically to a real
-         * match in the biased u8 domain. When !HasFreed, all of this and the
-         * per-cell block below compile out (identical codegen to today). */
-        /* Free a SYMMETRIC PAIR of cells (collapsed bisulfite); GENOMIC sets the
-         * mirror == primary so the second blend is idempotent. */
-        __m256i match256, active_frread;
+         * freedval256 is fr_val biased by +shift into the u8 domain (same bias
+         * temp[] carries): fr_val==w_match (GENOMIC/COLLAPSED) equals temp[0]
+         * exactly, NEUTRAL (fr_val==0) scores the conversion as 0 after unbiasing.
+         * When !HasFreed, all of this and the per-cell block below compile out
+         * (identical codegen to today). */
+        /* Free a SYMMETRIC PAIR of cells (collapsed bisulfite); GENOMIC/NEUTRAL set
+         * the mirror == primary so the second blend is idempotent. Both cells score
+         * the same fr_val, so one freedval256 covers the folded target below. */
+        __m256i freedval256, active_frread;
         if (HasFreed) {
-            match256 = _mm256_set1_epi8((char)temp[0]);
+            freedval256 = _mm256_set1_epi8((char)(fr_val + shift));
             __m256i rowfreed  = _mm256_cmpeq_epi8(s1, _mm256_set1_epi8((char)fr_ref));
             __m256i rowfreed2 = _mm256_cmpeq_epi8(s1, _mm256_set1_epi8((char)fr_ref2));
             /* One per-lane freed target: fr_read where ref==fr_ref, fr_read2 where
@@ -1672,12 +1708,13 @@ int kswv::kswv256_u8_impl(uint8_t seq1SoA[],
             __m256i cmpq = _mm256_cmpeq_epi8(s2, five_vec);
             sbt = avx2_blendv_u8(cmpq, sft_vec, sbt);
 
-            /* Apply the rank-1 freed-cell override: force the biased match score
-             * where this column's read base equals the row's active freed base
-             * (active_frread, built once per row above). One cmpeq + one blendv;
-             * sentinel (0xFF) lanes never match a real s2 so they pass through. */
+            /* Apply the freed-cell override: force the biased freed score
+             * (fr_val + shift) where this column's read base equals the row's
+             * active freed base (active_frread, built once per row above). One
+             * cmpeq + one blendv; sentinel (0xFF) lanes never match a real s2
+             * so they pass through. */
             if (HasFreed) {
-                sbt = _mm256_blendv_epi8(sbt, match256,
+                sbt = _mm256_blendv_epi8(sbt, freedval256,
                                          _mm256_cmpeq_epi8(s2, active_frread));
             }
 
@@ -2115,18 +2152,19 @@ int kswv::kswv256_16_impl(int16_t seq1SoA[],
         __m256i l_vec   = zero_vec;
         __m256i i_vec   = _mm256_set1_epi16((int16_t)i);
 
-        /* Rank-1 freed-cell override (issue 173). s1 is loop-invariant, so
-         * hoist the per-row fr_ref comparison. The 16-bit kernel has NO shift
-         * bias (m11 = h00 + sbt directly), so the biased match constant is
-         * just temp8[0] (== w_match), sign-extended to int16. !HasFreed → both
-         * this and the per-cell block compile out. */
-        /* Free a SYMMETRIC PAIR of cells (collapsed bisulfite); GENOMIC sets the
-         * mirror == primary so the second blend is idempotent. */
-        __m256i frread256, frread2_256, match256, rowfreed, rowfreed2;
+        /* Freed-cell override (issue 173 + TAPS neutral). s1 is loop-invariant, so
+         * hoist the per-row fr_ref comparison. The 16-bit kernel has NO shift bias
+         * (m11 = h00 + sbt directly), so the freed value is just fr_val: fr_val==
+         * w_match (GENOMIC/COLLAPSED) equals temp8[0], NEUTRAL (fr_val==0) scores
+         * the conversion as 0. Sign-extended to int16. !HasFreed → both this and
+         * the per-cell block compile out. */
+        /* Free a SYMMETRIC PAIR of cells (collapsed bisulfite); GENOMIC/NEUTRAL set
+         * the mirror == primary so the second blend is idempotent. */
+        __m256i frread256, frread2_256, freedval256, rowfreed, rowfreed2;
         if (HasFreed) {
             frread256  = _mm256_set1_epi16((int16_t)fr_read);
             frread2_256= _mm256_set1_epi16((int16_t)fr_read2);
-            match256   = _mm256_set1_epi16((int16_t)temp8[0]);
+            freedval256= _mm256_set1_epi16((int16_t)fr_val);
             rowfreed   = _mm256_cmpeq_epi16(s1, _mm256_set1_epi16((int16_t)fr_ref));
             rowfreed2  = _mm256_cmpeq_epi16(s1, _mm256_set1_epi16((int16_t)fr_ref2));
         }
@@ -2145,8 +2183,8 @@ int kswv::kswv256_16_impl(int16_t seq1SoA[],
             __m256i sbt_b   = _mm256_blendv_epi8(sbt_lo, sbt_hi, hi_sel);
             __m256i sbt     = _mm256_srai_epi16(_mm256_slli_epi16(sbt_b, 8), 8);
 
-            /* Rank-1 freed-cell override (issue 173): where row==fr_ref and
-             * col==fr_read, force the match score. Real bases 0-3; fr_read ∈
+            /* Freed-cell override (issue 173 + TAPS neutral): where row==fr_ref and
+             * col==fr_read, force the freed score. Real bases 0-3; fr_read ∈
              * {0,3}; padding/ambig (DUMMY3/0xFFFF/AMBQ16) never equal fr_read,
              * so cmpeq is naturally false for them. _mm256_cmpeq_epi16 produces
              * an all-ones/all-zeros int16 mask, so the byte-wise blendv selects
@@ -2154,10 +2192,10 @@ int kswv::kswv256_16_impl(int16_t seq1SoA[],
             if (HasFreed) {
                 __m256i freed  = _mm256_and_si256(rowfreed,
                                                   _mm256_cmpeq_epi16(s2, frread256));
-                sbt = _mm256_blendv_epi8(sbt, match256, freed);
+                sbt = _mm256_blendv_epi8(sbt, freedval256, freed);
                 __m256i freed2 = _mm256_and_si256(rowfreed2,
                                                   _mm256_cmpeq_epi16(s2, frread2_256));
-                sbt = _mm256_blendv_epi8(sbt, match256, freed2);
+                sbt = _mm256_blendv_epi8(sbt, freedval256, freed2);
             }
 
             /* Boundary: high bit set in (s1 | s2) marks padding (0xFFFF). */
@@ -2766,19 +2804,21 @@ int kswv::kswv512_u8_impl(uint8_t seq1SoA[],
         imax512 = zero512;
         __m512i iqe512 = _mm512_set1_epi8(-1);
 
-        /* Rank-1 freed-cell override (issue 173, bisulfite OT/OB). s1 is
+        /* Freed-cell override (issue 173, bisulfite OT/OB + TAPS neutral). s1 is
          * loop-invariant across the inner j loop, so hoist the per-row fr_ref
-         * comparison here; MAIN_SAM_CODE8_OPT consumes rowfreed512/frread512/
-         * match512 per cell when HasFreed. match512 is the kernel's OWN biased
-         * match entry (temp[0] already includes +shift), so the freed cell
-         * scores byte-identically to a real match in the biased u8 domain.
+         * comparisons here; MAIN_SAM_CODE8_OPT consumes active_frread512/
+         * freedval512 per cell when HasFreed. freedval512 is the freed cell's
+         * score (fr_val) biased by +shift into the u8 domain; fr_val==w_match
+         * (GENOMIC/COLLAPSED) reproduces the biased match entry temp[0] exactly,
+         * while NEUTRAL (fr_val==0) scores the conversion as 0 after unbiasing.
          * When !HasFreed, this and the per-cell block in the macro compile out
          * (identical codegen to today). Mirrors bandedSWA's blessed forms. */
-        /* Free a SYMMETRIC PAIR of cells (collapsed bisulfite); GENOMIC sets the
-         * mirror == primary so the second blend is idempotent. */
-        __m512i match512, active_frread512;
+        /* Free a SYMMETRIC PAIR of cells (collapsed bisulfite); GENOMIC/NEUTRAL set
+         * the mirror == primary so the second blend is idempotent. Both cells score
+         * the same fr_val, so one freedval512 covers the folded target below. */
+        __m512i freedval512, active_frread512;
         if (HasFreed) {
-            match512   = _mm512_set1_epi8((char)temp[0]);
+            freedval512 = _mm512_set1_epi8((char)(fr_val + shift));
             __mmask64 rowfreed512  = _mm512_cmpeq_epi8_mask(s1, _mm512_set1_epi8((char)fr_ref));
             __mmask64 rowfreed2_512= _mm512_cmpeq_epi8_mask(s1, _mm512_set1_epi8((char)fr_ref2));
             /* One per-lane freed target: fr_read where ref==fr_ref, fr_read2 where
@@ -3360,20 +3400,21 @@ int kswv::kswv512_16_impl(int16_t seq1SoA[],
         imax512 = zero512;
         __m512i iqe512 = _mm512_set1_epi16(-1);
 
-        /* Rank-1 freed-cell override (issue 173). s1 is loop-invariant, so
+        /* Freed-cell override (issue 173 + TAPS neutral). s1 is loop-invariant, so
          * hoist the per-row fr_ref comparison; MAIN_SAM_CODE16_OPT consumes
-         * rowfreed512/frread512/match512 per cell when HasFreed. The 16-bit
-         * kernel has NO shift bias (m11 = h00 + sbt directly), so the biased
-         * match constant is just temp[0] (== w_match). !HasFreed → this and the
+         * rowfreed512/frread512/freedval512 per cell when HasFreed. The 16-bit
+         * kernel has NO shift bias (m11 = h00 + sbt directly), so the freed value
+         * is just fr_val: fr_val==w_match (GENOMIC/COLLAPSED) equals temp[0], while
+         * NEUTRAL (fr_val==0) scores the conversion as 0. !HasFreed → this and the
          * per-cell block in the macro compile out. */
-        __m512i frread512, frread2_512, match512;
+        __m512i frread512, frread2_512, freedval512;
         __mmask32 rowfreed512 = 0, rowfreed2_512 = 0;
         if (HasFreed) {
             __m512i frref512  = _mm512_set1_epi16((int16_t)fr_ref);
             __m512i frref2512 = _mm512_set1_epi16((int16_t)fr_ref2);
             frread512  = _mm512_set1_epi16((int16_t)fr_read);
             frread2_512= _mm512_set1_epi16((int16_t)fr_read2);
-            match512   = _mm512_set1_epi16((int16_t)temp[0]);
+            freedval512= _mm512_set1_epi16((int16_t)fr_val);
             rowfreed512  = _mm512_cmpeq_epi16_mask(s1, frref512);
             rowfreed2_512= _mm512_cmpeq_epi16_mask(s1, frref2512);
         }

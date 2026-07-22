@@ -997,17 +997,21 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "                   emseq  bisulfite/EM-seq, UNmethylated C converts [default]\n");
     fprintf(stderr, "                          (aliases: em-seq, bisulfite)\n");
     fprintf(stderr, "                   taps   TET-assisted pyridine borane, METHYLATED C converts;\n");
-    fprintf(stderr, "                          also defaults --meth-scoring to genomic\n");
+    fprintf(stderr, "                          also defaults --meth-scoring to neutral\n");
     fprintf(stderr, "                 NOTE: use --meth=taps (with '='), not --meth taps. Running TAPS\n");
     fprintf(stderr, "                 data without =taps inverts every methylation call.\n");
-    fprintf(stderr, "   --meth-scoring collapsed|genomic\n");
+    fprintf(stderr, "   --meth-scoring collapsed|genomic|neutral\n");
     fprintf(stderr, "                 scoring mode. Default depends on chemistry: collapsed for\n");
-    fprintf(stderr, "                 --meth/--meth=emseq, genomic for --meth=taps (TAPS conversions\n");
+    fprintf(stderr, "                 --meth/--meth=emseq, neutral for --meth=taps (TAPS conversions\n");
     fprintf(stderr, "                 are sparse, so collapsing costs specificity it can't repay).\n");
-    fprintf(stderr, "                 collapsed: C/T (and G/A)\n");
-    fprintf(stderr, "                 interchangeable, bwameth-compatible placement (sets -B 2).\n");
-    fprintf(stderr, "                 genomic: free only the conversion direction, keep variants as\n");
-    fprintf(stderr, "                 mismatches (variant-aware, truthful NM/MD; -B 4).\n");
+    fprintf(stderr, "                 collapsed: C/T (and G/A) interchangeable, bwameth-compatible\n");
+    fprintf(stderr, "                 placement (sets -B 2).\n");
+    fprintf(stderr, "                 genomic: free only the conversion direction, scored as a full\n");
+    fprintf(stderr, "                 match, keep variants as mismatches (variant-aware, truthful\n");
+    fprintf(stderr, "                 NM/MD; -B 4).\n");
+    fprintf(stderr, "                 neutral: free only the conversion direction but score it 0\n");
+    fprintf(stderr, "                 (tolerated, not rewarded); best for TAPS (variant-aware,\n");
+    fprintf(stderr, "                 truthful NM/MD; -B 4).\n");
     fprintf(stderr, "   --set-as-failed f|r\n");
     fprintf(stderr, "                 flag alignments to the matching strand ('f' or 'r') as QC-fail (0x200)\n");
     fprintf(stderr, "   --chimera-qc\n");
@@ -1331,8 +1335,11 @@ int main_mem(int argc, char *argv[])
             } else if (optarg != NULL && strcmp(optarg, "genomic") == 0) {
                 opt->meth_scoring = MEM_METH_SCORING_GENOMIC;
                 opt0.meth_scoring = 1;
+            } else if (optarg != NULL && strcmp(optarg, "neutral") == 0) {
+                opt->meth_scoring = MEM_METH_SCORING_NEUTRAL;
+                opt0.meth_scoring = 1;
             } else {
-                fprintf(stderr, "ERROR: --meth-scoring requires 'collapsed' or 'genomic'\n");
+                fprintf(stderr, "ERROR: --meth-scoring requires 'collapsed', 'genomic', or 'neutral'\n");
                 free(opt);
                 if (out_opened) fclose(aux.fp);
                 return 1;
@@ -1543,8 +1550,8 @@ int main_mem(int argc, char *argv[])
     /* Meth-mode default tuning. bwameth.py runs bwa as
      * `bwa mem -T 40 -B 2 -L 10 -CM`, adding `-U 100 -p` for paired-end. We adopt
      * the soft-clip (-L 10), unpaired (-U 100), output-threshold (-T 40), -M and
-     * -C defaults for BOTH --meth-scoring modes; the ONLY mode-dependent knob is
-     * the mismatch penalty (the leniency gate):
+     * -C defaults for ALL THREE --meth-scoring modes; the ONLY mode-dependent knob
+     * is the mismatch penalty (the leniency gate):
      *   COLLAPSED (bwameth drop-in): -B 2 — bwameth's lenient mismatch. Combined
      *     with the two-cell matrix (C/T and G/A free both ways) this reproduces
      *     bwameth's collapsed-space placement.
@@ -1552,6 +1559,9 @@ int main_mem(int argc, char *argv[])
      *     A/B with the asymmetric matrix showed b=4 places better and is better
      *     MAPQ-calibrated than b=2 (placement 92.6 vs 92.5, discordant MAPQ
      *     1.8 vs 2.1).
+     *   NEUTRAL (variant-aware, the --meth=taps default): also keeps -B 4. It
+     *     differs from GENOMIC only in the freed cell's VALUE (0 vs +a), not in
+     *     the leniency gate, so the same b=4 argument applies unchanged.
      * pen_unpaired is only consulted for paired-end rescue, so setting it
      * unconditionally is a no-op for single-end. -A/-B always override and reach
      * the matrices (mem_opt_fill_meth_mat below).
@@ -1559,18 +1569,28 @@ int main_mem(int argc, char *argv[])
      * scaled by opt->a inside mem_opt_apply_meth_defaults — see bwamem.h. Before
      * that, they were applied flat and silently discarded -A. */
     if (opt->meth_mode) {
-        /* TAPS defaults to GENOMIC scoring. TAPS converts only the METHYLATED
+        /* TAPS defaults to NEUTRAL scoring. TAPS converts only the METHYLATED
          * cytosines, so conversions are ~20-30x rarer than under em-seq (measured:
          * 3.2% of C vs 94.6% on chr22 @ 12x). The collapsed 3-letter alphabet buys
-         * little at that density and costs specificity, and the measurement agrees:
-         * on 4.07M simulated TAPS reads vs full hg38, genomic placed 95.72% vs
-         * collapsed's 95.40% (plain: 95.53%), and put 136k more reads in the
-         * MAPQ 60+ bin at higher accuracy. An explicit --meth-scoring still wins.
+         * little at that density and costs specificity. NEUTRAL goes one step
+         * further: it scores the conversion cell as 0 rather than a full match,
+         * so a sparse TAPS conversion is tolerated without over-crediting spurious
+         * C->T alignments. Measured on 4.07M simulated TAPS reads vs full hg38,
+         * across three methylation loads: NEUTRAL placed 95.95-96.01% (essentially
+         * the 96.02% unconverted ceiling) vs GENOMIC 95.68-95.73% and COLLAPSED
+         * 95.37-95.43% -- a robust +0.24-0.28 pp over genomic -- with IDENTICAL
+         * MAPQ calibration (60+ bin 99.99% both) and NM (1.966 vs 1.969), so the
+         * gain is not bought with over-confidence or inflated edit distance.
+         * NEUTRAL's freed cell is not rank-1, but the generalized kswv freed-cell
+         * blend scores it to its matrix value, so mate rescue stays on the batched
+         * kernel on the freed-capable tiers (NEON/AVX2/AVX512BW) and falls back to
+         * scalar ksw_align2 only on the freed-less x86 tiers (sse41/sse42/avx),
+         * exactly as GENOMIC and COLLAPSED do. An explicit --meth-scoring still wins.
          * Set before mem_opt_apply_meth_defaults so its COLLAPSED -B 2 branch keys
          * off the resolved scoring mode. See
          * reports/2026-07-20-taps-alignment-experiment-results.md. */
         if (opt->meth_chem == METH_CHEM_TAPS && !opt0.meth_scoring)
-            opt->meth_scoring = MEM_METH_SCORING_GENOMIC;
+            opt->meth_scoring = MEM_METH_SCORING_NEUTRAL;
         /* Scored defaults live in mem_opt_apply_meth_defaults so they scale with
          * -A (bwameth's constants assume a==1) and can be unit-tested. */
         mem_opt_apply_meth_defaults(opt, &opt0);

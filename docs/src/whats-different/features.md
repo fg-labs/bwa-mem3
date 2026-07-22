@@ -12,8 +12,9 @@ which now read `bwa-mem3`).
 `bwa-mem3 mem` in a single binary — no Python, no separate post-processing step,
 no [bwameth.py](https://github.com/brentp/bwa-meth) dependency. In the default
 `--meth-scoring collapsed` mode it reproduces bwameth.py's read *placement* (a
-placement drop-in, not a byte-for-byte clone); `--meth-scoring genomic` opts into
-variant-aware scoring bwameth cannot produce.
+placement drop-in, not a byte-for-byte clone); `--meth-scoring genomic` and
+`--meth-scoring neutral` (the `--meth=taps` default) opt into variant-aware
+scoring bwameth cannot produce.
 
 ```bash
 bwa-mem3 index --meth ref.fa          # once per reference

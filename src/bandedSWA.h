@@ -158,31 +158,42 @@ static inline bool bsw_force_generic_matrix()
 // and just extend the match condition (SBT_PREPASS16_RANK1) — no TBL, no
 // sign-extend, near parity with symmetric. Any other deviation (>=2 freed cells,
 // a changed diagonal, or a freed value != w_match) falls back to the general LUT
-// path. `rank1` is the only field the kernel branches on; (ref,read) name the
-// freed cell. When `forced` is set on an otherwise-symmetric matrix we synthesize
-// the no-op cell (0,0) so the bench exercises and times the rank-1 path while
-// staying byte-identical to symmetric.
-struct BswFreedCell { bool rank1; int8_t ref; int8_t read; };
+// path. `rank1` is the only field bandedSWA's kernel branches on; (ref,read) name
+// the freed cell. When `forced` is set on an otherwise-symmetric matrix we
+// synthesize the no-op cell (0,0) so the bench exercises and times the rank-1 path
+// while staying byte-identical to symmetric.
+//
+// `single` generalizes the structural test to "exactly ONE off-diagonal cell
+// deviates from the canonical mismatch, to ANY value, with no diagonal change".
+// `value` carries that freed cell's value. `rank1` is exactly `single && value ==
+// w_match`, so it is byte-identical to the pre-generalization predicate and every
+// bandedSWA caller (which reads only `.rank1`/`.ref`/`.read`) is unaffected. The
+// kswv rescue kernel reads `single`/`value` to express NEUTRAL scoring (one cell
+// freed to 0), which is single but not rank1.
+struct BswFreedCell { bool rank1; bool single; int8_t ref; int8_t read; int8_t value; };
 static inline BswFreedCell bsw_freed_cell(const int8_t *mat, int8_t w_match,
                                           int8_t w_mismatch, bool forced)
 {
     int n_freed = 0;
-    int8_t fr_ref = 0, fr_read = 0;
-    bool ok = true;
+    int8_t fr_ref = 0, fr_read = 0, fr_val = w_match;
+    bool ok = true;   // no diagonal change (an unexpressible deviation)
     for (int i = 0; i < 4; i++)
         for (int j = 0; j < 4; j++) {
             int8_t expect = (i == j) ? w_match : w_mismatch;
             if (mat[i * 5 + j] == expect) continue;
-            if (i != j && mat[i * 5 + j] == w_match) {   // off-diagonal freed to match
+            if (i != j) {                                // off-diagonal freed (any value)
                 n_freed++; fr_ref = (int8_t)i; fr_read = (int8_t)j;
+                fr_val = mat[i * 5 + j];
             } else {
-                ok = false;                              // diagonal change / non-match freed
+                ok = false;                              // diagonal change: not expressible
             }
         }
     BswFreedCell c;
-    c.rank1 = ok && (n_freed == 1 || (forced && n_freed == 0));
-    c.ref = fr_ref;
-    c.read = fr_read;
+    c.single = ok && (n_freed == 1 || (forced && n_freed == 0));
+    c.rank1  = c.single && fr_val == w_match;   // preserves the old predicate exactly
+    c.ref    = fr_ref;
+    c.read   = fr_read;
+    c.value  = fr_val;                          // == w_match for the forced no-op
     return c;
 }
 
