@@ -599,10 +599,13 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
              * ambig/padding (AMBQ=8, DUMMY5=5) never equal fr_read, so vceqq
              * is naturally false for them — no extra masking needed. */
             if (HasFreed) {
+                /* Both freed blends select match_vec, so OR their masks and do
+                 * ONE blend instead of two serially-dependent vbsl ops. Same
+                 * op count as the original two-blend form (one vbsl swapped for
+                 * one vorr), byte-identical, one shorter link in the sbt chain. */
                 uint8x16_t freed  = vandq_u8(rowfreed,  vceqq_u8(s2, frread_vec));
-                sbt = vbslq_u8(freed, match_vec, sbt);
                 uint8x16_t freed2 = vandq_u8(rowfreed2, vceqq_u8(s2, frread2_vec));
-                sbt = vbslq_u8(freed2, match_vec, sbt);
+                sbt = vbslq_u8(vorrq_u8(freed, freed2), match_vec, sbt);
             }
 
             /* Check for boundary (high bit set in s1 or s2). vtstq_u8 against
