@@ -69,7 +69,7 @@ extern uint64_t prof[10][112];
 
 #define MAIN_SAM_CODE8_OPT(s1, s2, h00, h11, e11, f11, f21, max512, sft512) \
     {                                                                   \
-        __m512i sbt11, xor11, or11;                                     \
+        __m512i sbt11, xor11;                                           \
         xor11 = _mm512_xor_si512(s1, s2);                               \
         sbt11 = _mm512_shuffle_epi8(permSft512, xor11);                 \
         __mmask64 cmpq = _mm512_cmpeq_epu8_mask(s2, five512);           \
@@ -82,8 +82,13 @@ extern uint64_t prof[10][112];
                 _mm512_cmpeq_epi8_mask(s2, frread2_512);                \
             sbt11 = _mm512_mask_blend_epi8(freed2, sbt11, match512);    \
         }                                                               \
-        or11 =  _mm512_or_si512(s1, s2);                                \
-        __mmask64 cmp = _mm512_movepi8_mask(or11);                      \
+        /* Boundary mask, gated by HasFreed (compile-time). Non-meth    \
+         * hoists the per-row rowboundary512 (a big avx512 win); meth    \
+         * keeps the per-cell s1|s2 form — hoisting there pins a third   \
+         * live k-reg against the two freed masks and slightly regressed.*/ \
+        __mmask64 cmp = HasFreed                                        \
+            ? _mm512_movepi8_mask(_mm512_or_si512(s1, s2))              \
+            : rowboundary512;                                           \
         __m512i m11 = _mm512_adds_epu8(h00, sbt11);                     \
         m11 = _mm512_mask_blend_epi8(cmp, m11, zero512);                \
         m11 = _mm512_subs_epu8(m11, sft512);                            \
@@ -577,6 +582,15 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
             rowfreed2   = vceqq_u8(s1, vdupq_n_u8((uint8_t)fr_ref2));
         }
 
+        /* Boundary detection hoisted per-row. The per-cell test zeroed m11 where
+         * bit 7 was set in s1 OR s2. In the u8 kernel s2 only ever holds real
+         * bases (0-3) or ambig/padding (DUMMY5=5, AMBQ=8) — never the high bit —
+         * so high_bit(s1|s2) == high_bit(s1), and s1 is loop-invariant across the
+         * inner j loop. Hoist the vorr+vtst pair to a single per-row vtst; only
+         * the per-cell blend remains. The byte-identity golden gate is the safety
+         * net: if any s2 lane ever carried bit 7, the check would fail instantly. */
+        uint8x16_t rowboundary = vtstq_u8(s1, vdupq_n_u8(0x80));
+
         uint8x16_t l_vec = zero_vec;
         for (j = 0; j < ncol; j++)
         {
@@ -605,14 +619,8 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
                 sbt = vbslq_u8(freed2, match_vec, sbt);
             }
 
-            /* Check for boundary (high bit set in s1 or s2). vtstq_u8 against
-             * 0x80 sets 0xFF where bit 7 is set, 0x00 otherwise — one op vs the
-             * prior vshr+vceq pair, and this runs per cell in the inner loop. */
-            uint8x16_t or_val = vorrq_u8(s1, s2);
-            uint8x16_t is_boundary = vtstq_u8(or_val, vdupq_n_u8(0x80));
-
             uint8x16_t m11 = vqaddq_u8(h00, sbt);
-            m11 = vbslq_u8(is_boundary, zero_vec, m11);
+            m11 = vbslq_u8(rowboundary, zero_vec, m11);
             m11 = vqsubq_u8(m11, sft_vec);
 
             h11 = vmaxq_u8(m11, e11);
@@ -1641,7 +1649,10 @@ int kswv::kswv256_u8_impl(uint8_t seq1SoA[],
 
             /* High bit of (s1 | s2) indicates boundary (padding 0xFF).
              * Sign compare against zero gives 0xFF wherever high bit is
-             * set in the u8 byte. */
+             * set in the u8 byte. NB: the boundary hoist that helps NEON and
+             * AVX-512 non-meth regresses here — AVX2's 16-register file spills
+             * once the mask is loop-invariant (however computed), so this tier
+             * keeps the per-cell s1|s2 form. */
             __m256i or_val      = _mm256_or_si256(s1, s2);
             __m256i is_boundary = _mm256_cmpgt_epi8(zero_vec, or_val);
 
@@ -2741,6 +2752,13 @@ int kswv::kswv512_u8_impl(uint8_t seq1SoA[],
             rowfreed512  = _mm512_cmpeq_epi8_mask(s1, frref512);
             rowfreed2_512= _mm512_cmpeq_epi8_mask(s1, _mm512_set1_epi8((char)fr_ref2));
         }
+
+        /* Boundary detection hoisted per-row: in u8, s2 only holds 0-3/5/8 (never
+         * the high bit), so high_bit(s1|s2) == high_bit(s1). Consumed by
+         * MAIN_SAM_CODE8_OPT only in the non-meth (!HasFreed) instantiation; the
+         * meth path keeps the per-cell form, so this is DCE'd there. The golden
+         * gate fails instantly if any s2 lane ever carried bit 7. */
+        __mmask64 rowboundary512 = _mm512_movepi8_mask(s1);
 
         __m512i l512 = zero512;
         for (j=0; j<ncol; j++)
