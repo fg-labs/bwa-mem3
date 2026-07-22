@@ -503,8 +503,10 @@ void BandedPairWiseSW::scalarBandedSWAWrapper(SeqPair *seqPairArray,
          * the signed substitution score into its +bonus and -penalty parts:  \
          * adds_epu8 (no wrap past 255) then subs_epu8 (floors at 0). Mirrors  \
          * the validated NEON smithWaterman128_8 recurrence. */                \
+        /* sbt_neg = max(0,-sbt) = sbt_pos - sbt (exactly one of pos/neg nonzero); \
+         * one op, byte-identical for sbt in [-127,127] (golden gate guards -128). */ \
         __m256i sbt_pos = _mm256_max_epi8(sbt11, zero256);              \
-        __m256i sbt_neg = _mm256_max_epi8(_mm256_sub_epi8(zero256, sbt11), zero256); \
+        __m256i sbt_neg = _mm256_sub_epi8(sbt_pos, sbt11);              \
         __m256i m11 = _mm256_subs_epu8(_mm256_adds_epu8(h00, sbt_pos), sbt_neg); \
         __m256i cmp11 = _mm256_cmpeq_epi8(h00, zero256);                \
         m11 = _mm256_andnot_si256(cmp11, m11);  /* h00==0 -> local restart */ \
@@ -564,12 +566,13 @@ void BandedPairWiseSW::scalarBandedSWAWrapper(SeqPair *seqPairArray,
         m11 = _mm256_andnot_si256(cmp11, m11);                 \
         h11 = _mm256_max_epi16(m11, e11);                               \
         h11 = _mm256_max_epi16(h11, f11);                               \
-        __m256i temp256 = _mm256_sub_epi16(h11, oe_ins256);             \
-        __m256i val256  = _mm256_max_epi16(temp256, zero256);           \
+        /* max(x - open, 0) == subs_epu16(x, open): scores are non-negative and \
+         * < 32768, so unsigned-saturating sub matches the signed sub + zero  \
+         * floor (brings the u16 core to parity with the u8 core's subs_epu8). */ \
+        __m256i val256 = _mm256_subs_epu16(h11, oe_ins256);            \
         e11 = _mm256_sub_epi16(e11, e_ins256);                          \
         e11 = _mm256_max_epi16(val256, e11);                            \
-        temp256 = _mm256_sub_epi16(h11, oe_del256);                     \
-        val256  = _mm256_max_epi16(temp256, zero256);                   \
+        val256 = _mm256_subs_epu16(h11, oe_del256);                    \
         f21 = _mm256_sub_epi16(f11, e_del256);                          \
         f21 = _mm256_max_epi16(val256, f21);                            \
     }
@@ -2438,8 +2441,10 @@ void BandedPairWiseSW::smithWaterman256_16(uint16_t seq1SoA[],
          * substitution score into +bonus and -penalty parts: adds_epu8 (no   \
          * wrap past 255) then subs_epu8 (floors at 0). Mirrors the validated  \
          * NEON smithWaterman128_8 recurrence. */                              \
+        /* sbt_neg = max(0,-sbt) = sbt_pos - sbt (exactly one of pos/neg nonzero); \
+         * one op, byte-identical for sbt in [-127,127] (golden gate guards -128). */ \
         __m512i sbt_pos = _mm512_max_epi8(sbt11, zero512);              \
-        __m512i sbt_neg = _mm512_max_epi8(_mm512_sub_epi8(zero512, sbt11), zero512); \
+        __m512i sbt_neg = _mm512_sub_epi8(sbt_pos, sbt11);              \
         __m512i m11 = _mm512_subs_epu8(_mm512_adds_epu8(h00, sbt_pos), sbt_neg); \
         __mmask64 cmp11 = _mm512_cmpeq_epi8_mask(h00, zero512);         \
         m11 = _mm512_mask_blend_epi8(cmp11, m11, zero512);  /* h00==0 -> local restart */ \
@@ -2512,12 +2517,13 @@ void BandedPairWiseSW::smithWaterman256_16(uint16_t seq1SoA[],
         m11 = _mm512_mask_blend_epi16(cmp11, m11, zero512);             \
         h11 = _mm512_max_epi16(m11, e11);                               \
         h11 = _mm512_max_epi16(h11, f11);                               \
-        __m512i temp512 = _mm512_sub_epi16(h11, oe_ins512);             \
-        __m512i val512  = _mm512_max_epi16(temp512, zero512);           \
+        /* max(x - open, 0) == subs_epu16(x, open): scores are non-negative and \
+         * < 32768, so unsigned-saturating sub matches the signed sub + zero  \
+         * floor (brings the u16 core to parity with the u8 core's subs_epu8). */ \
+        __m512i val512 = _mm512_subs_epu16(h11, oe_ins512);            \
         e11 = _mm512_sub_epi16(e11, e_ins512);                          \
         e11 = _mm512_max_epi16(val512, e11);                            \
-        temp512 = _mm512_sub_epi16(h11, oe_del512);                     \
-        val512  = _mm512_max_epi16(temp512, zero512);                   \
+        val512 = _mm512_subs_epu16(h11, oe_del512);                    \
         f21 = _mm512_sub_epi16(f11, e_del512);                          \
         f21 = _mm512_max_epi16(val512, f21);                            \
     }
@@ -4387,7 +4393,7 @@ _mm_blendv_epi16(__m128i x, __m128i y, __m128i mask)
         temp128 = _mm_sub_epi16(me128, oe_del128);                     \
         val128  = _mm_max_epi16(temp128, zero128);                      \
         f21 = _mm_sub_epi16(f11, e_del128);                             \
-        f21 = _mm_max_epi16(val128, f21);                               \
+        f21 = _mm_max_epi16(val128, f21);                              \
     }
 
 
