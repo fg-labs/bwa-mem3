@@ -623,8 +623,12 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
             m11 = vbslq_u8(rowboundary, zero_vec, m11);
             m11 = vqsubq_u8(m11, sft_vec);
 
-            h11 = vmaxq_u8(m11, e11);
-            h11 = vmaxq_u8(h11, f11);
+            /* hme = max(m11, e11); reused verbatim for `me` (gap-D) below, where
+             * the original code recomputed the identical max(m11,e11) -- e11 is
+             * not modified between the two, so this is byte-identical and drops
+             * one vmaxq per cell. */
+            uint8x16_t hme = vmaxq_u8(m11, e11);
+            h11 = vmaxq_u8(hme, f11);
 
             /* Update imax tracking */
             uint8x16_t cmp0 = vcgtq_u8(h11, imax_vec);
@@ -636,7 +640,7 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
              * dominated by its own extension arg (O>=0, saturating u8). me must
              * read the OLD e11, so compute it before the e-update overwrites e11. */
             uint8x16_t mf = vmaxq_u8(m11, f11);
-            uint8x16_t me = vmaxq_u8(m11, e11);
+            uint8x16_t me = hme;   /* == vmaxq_u8(m11, e11), reused (e11 unchanged) */
             uint8x16_t gapE = vqsubq_u8(mf, oe_ins_vec);
             e11 = vqsubq_u8(e11, e_ins_vec);
             e11 = vmaxq_u8(gapE, e11);
