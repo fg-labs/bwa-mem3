@@ -40,7 +40,7 @@ docker buildx build --platform linux/amd64,linux/arm64 \
 
 > **Building the arm64 layer with clang?** A recent `clang` produces faster
 > NEON code than `gcc` on aarch64 (see
-> [Best Practices → Build](build.md#use-a-recent-compiler-especially-on-arm)).
+> [Best Practices → Build](build.md#arm--aarch64)).
 > If you switch the arm64 build to clang, swap the OpenMP runtime: clang links
 > `libomp` (LLVM) rather than `libgomp`, so the runtime stage needs `libomp5`
 > (or `llvm-openmp`) in place of `libgomp1`.

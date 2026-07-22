@@ -15,7 +15,7 @@ The translation is not zero-cost for all operations. Two patterns that sse2neon 
 - `_mm_movemask_epi16` — used heavily in `bandedSWA.cpp` to extract the sign bit of each 16-bit lane. The native implementation shifts right by 15, narrows to 8-bit with `vmovn_u16`, and reduces with position-weighted `vaddv_u8`.
 - `_mm_blendv_epi16_fast` — a bitwise select on 16-bit lanes using `vbslq_s16`. Replaces the three-operation OR/AND/ANDNOT sequence sse2neon emits for `_mm_blendv_epi8`.
 
-Because the bulk of the ARM SIMD path is compiler-translated rather than hand-written intrinsics, codegen quality is unusually sensitive to the compiler and its version — a recent `clang` or `gcc` closes most of the gap to a hypothetical full native port. See [Best Practices → Build](../best-practices/build.md#use-a-recent-compiler-especially-on-arm) for measured numbers and the recommendation.
+Because the bulk of the ARM SIMD path is compiler-translated rather than hand-written intrinsics, codegen quality is unusually sensitive to the compiler and its version — a recent `clang` or `gcc` closes most of the gap to a hypothetical full native port. See [Best Practices → Build](../best-practices/build.md#arm--aarch64) for measured numbers and the recommendation.
 
 ### Memory alignment
 

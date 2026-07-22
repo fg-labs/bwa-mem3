@@ -4,20 +4,21 @@ Already using `bwa` or `bwa-mem2`? After installing, see
 [Coming from bwa or bwa-mem2](migrating.md) — the command line is unchanged, but
 the index and output have a couple of migration notes.
 
-## Bioconda (coming soon)
+## Bioconda
 
-A Bioconda package for bwa-mem3 is in preparation. Once published, installation will be:
+bwa-mem3 is published on [Bioconda](https://bioconda.github.io/) for linux-64,
+linux-aarch64, osx-64, and osx-arm64. This is the recommended path for most
+users:
 
 ```bash
-conda install -c bioconda bwa-mem3
+conda install -c bioconda -c conda-forge bwa-mem3
 ```
 
-This will be the recommended path for most users. Check back here or watch the
-[fg-labs/bwa-mem3](https://github.com/fg-labs/bwa-mem3) repository for the announcement.
+Build from source (below) if you need a compiler/arch-tuned build — in
+particular a clang-built, arch-specific, or PGO binary for maximum throughput
+(see [Best Practices → Build](../best-practices/build.md)).
 
 ## Build from source
-
-Until the Bioconda package is available, build from source using the steps below.
 
 ### Prerequisites
 
@@ -25,7 +26,7 @@ bwa-mem3 vendors several libraries as git submodules. Building from source requi
 
 | Tool | Why it's needed | Minimum version |
 |------|-----------------|-----------------|
-| C++14 compiler (GCC or Clang) | bwa-mem3 itself | GCC 8+ / Clang 7+ |
+| C++14 compiler (**Clang recommended**, or GCC) | bwa-mem3 itself — clang builds run ~5–10% faster on x86, see [Build](../best-practices/build.md) | Linux: Clang 7+ / GCC 8+ · macOS: Clang 15+ (Xcode) |
 | GNU make | top-level build | 3.81+ |
 | Git | submodule checkout (with `--recursive`) | any recent |
 | autoconf, automake, autoconf-archive, libtool | `ext/htslib` runs `autoreconf -i && ./configure` during build | any recent |
@@ -84,8 +85,15 @@ brew install \
 ```bash
 git clone --recursive https://github.com/fg-labs/bwa-mem3
 cd bwa-mem3
-make
+make CXX=clang++ CC=clang
 ```
+
+> **Build with clang.** bwa-mem3 is ~5–10% faster on x86 (AVX2) and ~6% faster on
+> ARM when built with clang instead of g++ — see
+> [Best Practices → Build](../best-practices/build.md). A bare `make` uses g++
+> and prints a warning nudging you to clang. Pass `CXX=clang++ CC=clang` as
+> shown. (On Linux with clang, install `libomp-dev` / `libomp-devel` for
+> OpenMP; see the prerequisites above.)
 
 The `--recursive` flag is required. bwa-mem3 vendors several libraries (mimalloc, sse2neon, and
 others) as git submodules. A shallow or non-recursive clone will fail to compile.
@@ -143,11 +151,22 @@ Expected output (with mimalloc):
 
 ```text
 v0.2.0-12-gabcdef1
-mimalloc 3.x.x
+Compiler: clang X.Y.Z
+SIMD floor: avx2 (x86-64-v3, Haswell 2013+); kernels: sse41 sse42 avx avx2 avx512bw
+SIMD runtime: avx2 (BWAMEM3_FORCE_TIER unset)
+mimalloc 3.x.x (active)
 ```
 
+The `Compiler:` line reports which toolchain built the binary and its version —
+`clang`, `gcc`, `icpx`, or `icpc`. The exact version varies with your toolchain;
+what matters is that a production build says `clang` (see
+[Best Practices → Build](../best-practices/build.md)).
+
 If the `mimalloc` line is absent, the build linked the system allocator (expected when
-`USE_MIMALLOC=0` was passed or when the vendor submodule was not initialized).
+`USE_MIMALLOC=0` was passed or when the vendor submodule was not initialized). If it is
+present but reads `(linked but NOT overriding malloc)` instead of `(active)`, mimalloc is
+linked but not intercepting allocations — see
+[User Guide → Memory allocator (mimalloc)](../user-guide/allocator.md).
 
 ## Next: host requirements
 

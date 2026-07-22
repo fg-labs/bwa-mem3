@@ -31,35 +31,59 @@ the non-kernel TU compile baseline with `BASELINE_ARCH=` (default
 See [SIMD dispatch matrix](../performance/simd-dispatch.md) for the full list
 of targets and which kernels each vectorizes.
 
-## Use a recent compiler (especially on ARM)
+## Build with clang, not g++ (strongly recommended)
 
-Use the newest C++ compiler available, and on ARM/aarch64 prefer a recent
-`clang`. The compiler matters more on ARM than on x86: the aarch64 build runs
-its SIMD through the [sse2neon](../developer-guide/neon-port.md) translation
-layer rather than hand-written intrinsics, so codegen quality — and therefore
-throughput — depends heavily on the compiler **and its version**.
+**clang produces a materially faster bwa-mem3 than g++ on every platform we
+measure — build with clang unless you have a specific reason not to.** Pass
+`CXX=clang++ CC=clang` to `make` (the default `make` uses g++ and emits a
+warning nudging you here). Use the newest clang available; compiler *version*
+matters nearly as much as the vendor.
 
-Measured on AWS Graviton4 (`c8g.4xlarge`, 16 cores), hg38, 5M read pairs,
-`make arm64`, best-of-3 CPU-seconds:
+### x86-64
+
+clang's optimizer handles bwa-mem3's C++ better than g++ on x86 — a consistent
+win on every sample and arch, though its size depends on the microarchitecture.
+Measured across the benchmark sweep at **v0.6.0** (hg38, 5M read pairs, `-t 16`,
+per-arch median of compute-time deltas over wgs / wes / panel / hic / sbx):
+
+| x86 arch | clang vs g++ (compute) |
+|---|---:|
+| c6a (Zen 3, AVX2) | **~8% faster** (up to ~13% on some samples) |
+| c7a (Zen 4, AVX-512) | ~3–4% faster |
+
+The gain is largest on Zen 3 / AVX2 (~8%) and smallest on Zen 4 (~3–4%); the
+`--fast` preset shows a similar ~5–10% clang edge. (An earlier single-host
+spot-check on a `c6a.8xlarge` suggested ~16%; the release-wide numbers above
+are the representative figure.)
+
+### ARM / aarch64
+
+The aarch64 build runs its SIMD through the
+[sse2neon](../developer-guide/neon-port.md) translation layer rather than
+hand-written intrinsics, so codegen quality depends heavily on the compiler
+**and its version**. Measured on AWS Graviton4 (`c8g.4xlarge`, 16 cores), hg38,
+5M read pairs, `make arm64`, best-of-3 CPU-seconds:
 
 | Compiler | CPU-seconds | vs gcc 15.2 |
 |---|---:|---:|
 | gcc 15.2 | 1779 | — |
 | clang 22.1 | 1679 | ~6% faster |
 
-Two takeaways:
+Takeaways:
 
-- **clang generally emits better NEON than gcc** for sse2neon-translated code —
-  about 6% fewer CPU-seconds here.
-- **Compiler *version* matters as much as the vendor.** A larger ~18%
-  clang-over-gcc gap has been reported against an older gcc (~13); against a
-  modern gcc (15.2) it narrows to ~6%, because recent gcc closed most of the
-  NEON-codegen gap. Bumping the gcc version is often most of the win even
-  without switching to clang.
+- **clang beats g++ on both ISAs** — ~5–10% on x86 (AVX2) and ~6% on ARM here.
+  It's a consistent win on the mainstream deployment target, so clang is the
+  recommended production compiler across the board.
+- **Compiler *version* matters too.** On ARM a larger ~18% clang-over-gcc gap
+  has been reported against an older gcc (~13); against a modern gcc (15.2) it
+  narrows to ~6% because recent gcc closed much of the NEON gap. Prefer clang,
+  but if you must use gcc, use the newest one.
 
-If you build the arm64 binary with clang, note the OpenMP runtime changes from
-`libgomp` to `libomp` (`llvm-openmp`) — see
-[Multi-architecture deployment](multi-arch-deployment.md).
+If you build with clang, note the OpenMP runtime changes from `libgomp` to
+`libomp` (`llvm-openmp`) — see
+[Multi-architecture deployment](multi-arch-deployment.md). Confirm which
+compiler a given binary was built with via `bwa-mem3 version`, which now prints
+a `Compiler:` line.
 
 ## Profile-Guided Optimization (PGO)
 
@@ -91,22 +115,23 @@ make USE_MIMALLOC=0
 
 ## Summary
 
-For a production installation on a known x86 server with AVX2:
+For a production installation on a known x86 server with AVX2 — build with
+clang and apply PGO on top:
 
 ```bash
-make pgo-generate PGO_ARCH=avx2
+make pgo-generate PGO_ARCH=avx2 CXX=clang++ CC=clang
 ./bwa-mem3.pgo-instr.avx2 mem -t 16 ref.fa R1.fq.gz R2.fq.gz > /dev/null
-make pgo-use PGO_ARCH=avx2
+make pgo-use PGO_ARCH=avx2 CXX=clang++ CC=clang
 # Deploy: bwa-mem3.pgo.avx2
 ```
 
-On ARM/aarch64 (Apple Silicon, AWS Graviton), build with a recent `clang` and
-apply PGO on top:
+On ARM/aarch64 (Apple Silicon, AWS Graviton), likewise build with a recent
+`clang` and apply PGO on top:
 
 ```bash
-make pgo-generate PGO_ARCH=arm64 CXX=clang++
+make pgo-generate PGO_ARCH=arm64 CXX=clang++ CC=clang
 ./bwa-mem3.pgo-instr mem -t 16 ref.fa R1.fq.gz R2.fq.gz > /dev/null
-make pgo-use PGO_ARCH=arm64 CXX=clang++
+make pgo-use PGO_ARCH=arm64 CXX=clang++ CC=clang
 # Deploy: bwa-mem3.pgo
 ```
 
