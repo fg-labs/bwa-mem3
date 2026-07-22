@@ -75,12 +75,12 @@ extern uint64_t prof[10][112];
         __mmask64 cmpq = _mm512_cmpeq_epu8_mask(s2, five512);           \
         sbt11 = _mm512_mask_blend_epi8(cmpq, sbt11, sft512);            \
         if (HasFreed) {                                                 \
-            __mmask64 freed = rowfreed512 &                             \
-                _mm512_cmpeq_epi8_mask(s2, frread512);                  \
+            /* One compare + one blend against the per-row active_frread512   \
+             * target (built once per row); sentinel (0xFF) lanes never match \
+             * a real s2. Fewer ops than the two-blend form and, unlike the   \
+             * mask-OR collapse, no serializing kor on the blend's input. */  \
+            __mmask64 freed = _mm512_cmpeq_epi8_mask(s2, active_frread512); \
             sbt11 = _mm512_mask_blend_epi8(freed, sbt11, match512);     \
-            __mmask64 freed2 = rowfreed2_512 &                          \
-                _mm512_cmpeq_epi8_mask(s2, frread2_512);                \
-            sbt11 = _mm512_mask_blend_epi8(freed2, sbt11, match512);    \
         }                                                               \
         /* Boundary mask, gated by HasFreed (compile-time). Non-meth    \
          * hoists the per-row rowboundary512 (a big avx512 win); meth    \
@@ -571,15 +571,27 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
          * match in the biased u8 domain. When !HasFreed, all of this and the
          * per-cell block below compile out (identical codegen to today). */
         /* Free a SYMMETRIC PAIR of cells: (fr_ref,fr_read) and (fr_ref2,fr_read2).
-         * GENOMIC sets the mirror == primary (idempotent 2nd blend); COLLAPSED
-         * sets it to the transpose so C/T (or G/A) are interchangeable. */
-        uint8x16_t frread_vec, frread2_vec, match_vec, rowfreed, rowfreed2;
+         * GENOMIC sets the mirror == primary; COLLAPSED sets it to the transpose
+         * so C/T (or G/A) are interchangeable.
+         *
+         * Fold the pair into ONE per-lane target base, active_frread: a lane whose
+         * ref is fr_ref frees against fr_read, a lane whose ref is fr_ref2 frees
+         * against fr_read2, and any other lane gets the sentinel 0xFF. The two
+         * ref-side comparisons are mutually exclusive (s1 can't equal both fr_ref
+         * and fr_ref2), so at most one wins per lane. s2 only ever holds real bases
+         * 0-3 or the ambig/pad codes DUMMY5(5)/AMBQ(8) — never 0xFF — so on a
+         * sentinel lane the single per-cell compare is unconditionally false. This
+         * turns the per-cell freed path into one vceqq + one vbslq (down from two
+         * compares, two ands, an orr, and a blend). */
+        uint8x16_t match_vec, active_frread;
         if (HasFreed) {
-            frread_vec  = vdupq_n_u8((uint8_t)fr_read);
-            frread2_vec = vdupq_n_u8((uint8_t)fr_read2);
             match_vec   = vdupq_n_u8((uint8_t)temp[0]);
-            rowfreed    = vceqq_u8(s1, vdupq_n_u8((uint8_t)fr_ref));
-            rowfreed2   = vceqq_u8(s1, vdupq_n_u8((uint8_t)fr_ref2));
+            uint8x16_t rowfreed  = vceqq_u8(s1, vdupq_n_u8((uint8_t)fr_ref));
+            uint8x16_t rowfreed2 = vceqq_u8(s1, vdupq_n_u8((uint8_t)fr_ref2));
+            active_frread = vbslq_u8(rowfreed2, vdupq_n_u8((uint8_t)fr_read2),
+                                     vdupq_n_u8(0xFF));
+            active_frread = vbslq_u8(rowfreed,  vdupq_n_u8((uint8_t)fr_read),
+                                     active_frread);
         }
 
         /* Boundary detection hoisted per-row. The per-cell test zeroed m11 where
@@ -607,16 +619,13 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
             uint8x16_t cmpq = vceqq_u8(s2, five_vec);
             sbt = vbslq_u8(cmpq, sft_vec, sbt);
 
-            /* Apply the rank-1 freed-cell override: where the row is fr_ref and
-             * this column is fr_read, force the biased match score. Real bases
-             * are 0-3 and fr_read ∈ {0,3}; s1 boundary (0xFF) and s2
-             * ambig/padding (AMBQ=8, DUMMY5=5) never equal fr_read, so vceqq
-             * is naturally false for them — no extra masking needed. */
+            /* Apply the rank-1 freed-cell override: force the biased match score
+             * where this column's read base equals the row's active freed base
+             * (built once per row in active_frread above). One compare + one
+             * blend; sentinel (0xFF) lanes never match a real s2 (0-3/5/8) so
+             * they blend through unchanged. */
             if (HasFreed) {
-                uint8x16_t freed  = vandq_u8(rowfreed,  vceqq_u8(s2, frread_vec));
-                sbt = vbslq_u8(freed, match_vec, sbt);
-                uint8x16_t freed2 = vandq_u8(rowfreed2, vceqq_u8(s2, frread2_vec));
-                sbt = vbslq_u8(freed2, match_vec, sbt);
+                sbt = vbslq_u8(vceqq_u8(s2, active_frread), match_vec, sbt);
             }
 
             uint8x16_t m11 = vqaddq_u8(h00, sbt);
@@ -1613,13 +1622,19 @@ int kswv::kswv256_u8_impl(uint8_t seq1SoA[],
          * per-cell block below compile out (identical codegen to today). */
         /* Free a SYMMETRIC PAIR of cells (collapsed bisulfite); GENOMIC sets the
          * mirror == primary so the second blend is idempotent. */
-        __m256i frread256, frread2_256, match256, rowfreed, rowfreed2;
+        __m256i match256, active_frread;
         if (HasFreed) {
-            frread256  = _mm256_set1_epi8((char)fr_read);
-            frread2_256= _mm256_set1_epi8((char)fr_read2);
-            match256   = _mm256_set1_epi8((char)temp[0]);
-            rowfreed   = _mm256_cmpeq_epi8(s1, _mm256_set1_epi8((char)fr_ref));
-            rowfreed2  = _mm256_cmpeq_epi8(s1, _mm256_set1_epi8((char)fr_ref2));
+            match256 = _mm256_set1_epi8((char)temp[0]);
+            __m256i rowfreed  = _mm256_cmpeq_epi8(s1, _mm256_set1_epi8((char)fr_ref));
+            __m256i rowfreed2 = _mm256_cmpeq_epi8(s1, _mm256_set1_epi8((char)fr_ref2));
+            /* One per-lane freed target: fr_read where ref==fr_ref, fr_read2 where
+             * ref==fr_ref2, else sentinel 0xFF (a real s2 — 0-3/5/8 — never equals
+             * it). The two ref tests are mutually exclusive. Collapses the per-cell
+             * freed path to one cmpeq + one blendv (see NEON variant). */
+            active_frread = avx2_blendv_u8(rowfreed2, _mm256_set1_epi8((char)fr_read2),
+                                           _mm256_set1_epi8((char)0xFF));
+            active_frread = avx2_blendv_u8(rowfreed,  _mm256_set1_epi8((char)fr_read),
+                                           active_frread);
         }
 
         for (int j = 0; j < ncol; j++) {
@@ -1633,18 +1648,13 @@ int kswv::kswv256_u8_impl(uint8_t seq1SoA[],
             __m256i cmpq = _mm256_cmpeq_epi8(s2, five_vec);
             sbt = avx2_blendv_u8(cmpq, sft_vec, sbt);
 
-            /* Apply the rank-1 freed-cell override: where the row is fr_ref and
-             * this column is fr_read, force the biased match score. Real bases
-             * are 0-3 and fr_read ∈ {0,3}; padding/ambig (DUMMY5/0xFF/AMBQ)
-             * never equal fr_read, so cmpeq is naturally false for them — no
-             * extra masking needed. Mirrors bandedSWA SBT_PREPASS8_RANK1. */
+            /* Apply the rank-1 freed-cell override: force the biased match score
+             * where this column's read base equals the row's active freed base
+             * (active_frread, built once per row above). One cmpeq + one blendv;
+             * sentinel (0xFF) lanes never match a real s2 so they pass through. */
             if (HasFreed) {
-                __m256i freed  = _mm256_and_si256(rowfreed,
-                                                  _mm256_cmpeq_epi8(s2, frread256));
-                sbt = _mm256_blendv_epi8(sbt, match256, freed);
-                __m256i freed2 = _mm256_and_si256(rowfreed2,
-                                                  _mm256_cmpeq_epi8(s2, frread2_256));
-                sbt = _mm256_blendv_epi8(sbt, match256, freed2);
+                sbt = _mm256_blendv_epi8(sbt, match256,
+                                         _mm256_cmpeq_epi8(s2, active_frread));
             }
 
             /* High bit of (s1 | s2) indicates boundary (padding 0xFF).
@@ -2742,15 +2752,19 @@ int kswv::kswv512_u8_impl(uint8_t seq1SoA[],
          * (identical codegen to today). Mirrors bandedSWA's blessed forms. */
         /* Free a SYMMETRIC PAIR of cells (collapsed bisulfite); GENOMIC sets the
          * mirror == primary so the second blend is idempotent. */
-        __m512i frref512, frread512, frread2_512, match512;
-        __mmask64 rowfreed512 = 0, rowfreed2_512 = 0;
+        __m512i match512, active_frread512;
         if (HasFreed) {
-            frref512   = _mm512_set1_epi8((char)fr_ref);
-            frread512  = _mm512_set1_epi8((char)fr_read);
-            frread2_512= _mm512_set1_epi8((char)fr_read2);
             match512   = _mm512_set1_epi8((char)temp[0]);
-            rowfreed512  = _mm512_cmpeq_epi8_mask(s1, frref512);
-            rowfreed2_512= _mm512_cmpeq_epi8_mask(s1, _mm512_set1_epi8((char)fr_ref2));
+            __mmask64 rowfreed512  = _mm512_cmpeq_epi8_mask(s1, _mm512_set1_epi8((char)fr_ref));
+            __mmask64 rowfreed2_512= _mm512_cmpeq_epi8_mask(s1, _mm512_set1_epi8((char)fr_ref2));
+            /* One per-lane freed target: fr_read where ref==fr_ref, fr_read2 where
+             * ref==fr_ref2, else sentinel 0xFF (real s2 0-3/5/8 never equals it).
+             * The two ref tests are mutually exclusive; the macro then does a
+             * single per-cell cmpeq + blend. */
+            active_frread512 = _mm512_mask_blend_epi8(rowfreed2_512,
+                                   _mm512_set1_epi8((char)0xFF), _mm512_set1_epi8((char)fr_read2));
+            active_frread512 = _mm512_mask_blend_epi8(rowfreed512,
+                                   active_frread512, _mm512_set1_epi8((char)fr_read));
         }
 
         /* Boundary detection hoisted per-row: in u8, s2 only holds 0-3/5/8 (never
