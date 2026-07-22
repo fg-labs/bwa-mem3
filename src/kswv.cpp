@@ -1634,12 +1634,16 @@ int kswv::kswv256_u8_impl(uint8_t seq1SoA[],
              * never equal fr_read, so cmpeq is naturally false for them — no
              * extra masking needed. Mirrors bandedSWA SBT_PREPASS8_RANK1. */
             if (HasFreed) {
+                /* Both freed blends select match256, so OR their masks and do
+                 * ONE blend instead of two serially-dependent blendv ops. Same
+                 * op count (one blendv swapped for one or), byte-identical, one
+                 * shorter link in the sbt chain. */
                 __m256i freed  = _mm256_and_si256(rowfreed,
                                                   _mm256_cmpeq_epi8(s2, frread256));
-                sbt = _mm256_blendv_epi8(sbt, match256, freed);
                 __m256i freed2 = _mm256_and_si256(rowfreed2,
                                                   _mm256_cmpeq_epi8(s2, frread2_256));
-                sbt = _mm256_blendv_epi8(sbt, match256, freed2);
+                sbt = _mm256_blendv_epi8(sbt, match256,
+                                         _mm256_or_si256(freed, freed2));
             }
 
             /* High bit of (s1 | s2) indicates boundary (padding 0xFF).
@@ -2110,12 +2114,15 @@ int kswv::kswv256_16_impl(int16_t seq1SoA[],
              * an all-ones/all-zeros int16 mask, so the byte-wise blendv selects
              * whole int16 lanes correctly. */
             if (HasFreed) {
+                /* Both freed blends select match256, so OR their masks and do
+                 * ONE blend instead of two serially-dependent blendv ops (same
+                 * op count, byte-identical, one shorter link in the sbt chain). */
                 __m256i freed  = _mm256_and_si256(rowfreed,
                                                   _mm256_cmpeq_epi16(s2, frread256));
-                sbt = _mm256_blendv_epi8(sbt, match256, freed);
                 __m256i freed2 = _mm256_and_si256(rowfreed2,
                                                   _mm256_cmpeq_epi16(s2, frread2_256));
-                sbt = _mm256_blendv_epi8(sbt, match256, freed2);
+                sbt = _mm256_blendv_epi8(sbt, match256,
+                                         _mm256_or_si256(freed, freed2));
             }
 
             /* Boundary: high bit set in (s1 | s2) marks padding (0xFFFF). */
