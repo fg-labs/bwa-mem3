@@ -33,12 +33,163 @@ Authors: Sanchit Misra <sanchit.misra@intel.com>; Vasimuddin Md <vasimuddin.md@i
 #include <inttypes.h>
 #include <climits>
 #include <cstring>
+#include <vector>
+#include <cstdarg>
+#include <pthread.h>
+#include <unistd.h>       /* pread, _exit */
 #include <sys/mman.h>     /* munmap */
+#if defined(__linux__)
+#include <fcntl.h>        /* posix_fadvise */
+#endif
 #include "bwa_madvise.h"
 #include "bwa_shm.h"
+#include "utils.h"        /* ATTRIBUTE, err_fread_noeof */
 #include "FMI_search.h"
 #include "profiling.h"
 #include "libsais_build.h"
+
+/*
+ * Parallel index load.
+ *
+ * The bwa-mem3 FM-index (cp_occ + compressed SA samples, ~10 GB on hg38) is
+ * otherwise slurped by a single-threaded fread whose warm-cache cost is one
+ * core's page-fault + memcpy bandwidth out of the page cache (~0.8 s on hg38).
+ * Splitting each big array across a few workers is memory-bandwidth bound and
+ * cuts that ~4x. pread (not read) lets every worker share one fd without
+ * touching the shared file offset, so no locking is needed.
+ *
+ * The destination stays the _mm_malloc'd + MADV_HUGEPAGE buffer, so the
+ * transparent-hugepage coverage the hot Occ-lookup loop relies on is preserved
+ * -- unlike an mmap/shm alias of the file, which lands on non-THP pages and
+ * slows alignment enough to erase the load saving.
+ */
+
+/* Declared in FMI_search.h; see there for the contract. Uses a floor division
+ * so the chunk size never dips below FMI_PREAD_MIN_CHUNK: at `nbytes` a whole
+ * multiple of the floor, `nbytes / min_chunk + 1` would hand out one chunk more
+ * than the array can cover at that size (8 MB read across 2 workers = 4 MB
+ * chunks). Only reachable for small arrays -- a caller asking for more workers
+ * than a test-sized reference can feed, or a large BWA3_LOAD_THREADS. */
+int fmi_pread_worker_count(size_t nbytes, int nthreads)
+{
+    if (nthreads < 1) nthreads = 1;
+    size_t max_threads = nbytes / FMI_PREAD_MIN_CHUNK;
+    if (max_threads < 1) max_threads = 1;
+    if ((size_t)nthreads > max_threads) nthreads = (int)max_threads;
+    return nthreads;
+}
+
+namespace {
+
+struct PreadChunk { int fd; char *dst; size_t nbytes; off_t off; };
+
+/* Bail out of a failed chunk read.
+ *
+ * _exit, not exit: this runs on a worker thread while its siblings are still
+ * inside pread(). exit() would run atexit handlers and static destructors
+ * (mimalloc teardown, htslib) against live threads, and two workers reaching it
+ * at once -- what a truncated index produces, since every chunk past the real
+ * EOF fails together -- is undefined. stderr is unbuffered, but flush anyway so
+ * the diagnostic survives if a caller made it buffered.
+ *
+ * noreturn keeps the caller's `if (r < 0) { ... }` terminating the way the
+ * inline exit() it replaced did; format(printf) keeps -Wformat checking the
+ * call sites, matching utils.h's err_fatal family. */
+void pread_chunk_fail(const char *fmt, ...)
+    ATTRIBUTE((noreturn)) ATTRIBUTE((format(printf, 1, 2)));
+
+void pread_chunk_fail(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fflush(stderr);
+    _exit(EXIT_FAILURE);
+}
+
+void *pread_chunk_worker(void *arg)
+{
+    PreadChunk *c = static_cast<PreadChunk *>(arg);
+    size_t done = 0;
+    while (done < c->nbytes) {
+        ssize_t r = pread(c->fd, c->dst + done, c->nbytes - done, c->off + (off_t)done);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            pread_chunk_fail("ERROR: pread failed during index load: %s\n", strerror(errno));
+        }
+        if (r == 0) {  // index file shorter than the header says it should be
+            // Counts are for THIS worker's chunk, not the whole array: a
+            // truncated index trips every chunk past the real EOF, so several
+            // of these can interleave, each describing a different slice.
+            pread_chunk_fail("ERROR: unexpected EOF during index load "
+                             "(chunk at offset %lld: %zu of %zu bytes)\n",
+                             (long long)c->off, done, c->nbytes);
+        }
+        done += (size_t)r;
+    }
+    return NULL;
+}
+
+// Read `nbytes` at file offset `off` into `dst` using up to `nthreads` workers.
+void parallel_pread(int fd, void *dst, size_t nbytes, off_t off, int nthreads)
+{
+    if (nbytes == 0) return;
+    nthreads = fmi_pread_worker_count(nbytes, nthreads);
+
+    std::vector<PreadChunk> chunks((size_t)nthreads);
+    std::vector<pthread_t>  tids((size_t)nthreads);
+    std::vector<bool>       spawned((size_t)nthreads, false);
+    size_t base = nbytes / (size_t)nthreads, rem = nbytes % (size_t)nthreads, cum = 0;
+    for (int i = 0; i < nthreads; i++) {
+        size_t len = base + ((size_t)i < rem ? 1 : 0);
+        chunks[i] = PreadChunk{ fd, (char *)dst + cum, len, off + (off_t)cum };
+        cum += len;
+    }
+    // Main thread takes chunk 0; spawn workers for the rest. If a spawn fails
+    // (e.g. thread limit), fall back to reading that chunk inline so the load
+    // still completes correctly, just less parallel.
+    for (int i = 1; i < nthreads; i++) {
+        if (pthread_create(&tids[i], NULL, pread_chunk_worker, &chunks[i]) == 0)
+            spawned[i] = true;
+        else
+            pread_chunk_worker(&chunks[i]);
+    }
+    pread_chunk_worker(&chunks[0]);
+    for (int i = 1; i < nthreads; i++)
+        if (spawned[i]) pthread_join(tids[i], NULL);
+}
+
+// Worker count for the index load: the caller's -t, capped (bandwidth bound
+// past ~8), with an explicit BWA3_LOAD_THREADS override for tuning.
+int index_load_threads(int n_threads)
+{
+    int t = n_threads > 0 ? n_threads : 1;
+    if (t > 8) t = 8;
+    const char *e = getenv("BWA3_LOAD_THREADS");
+    if (e != NULL) { int v = atoi(e); if (v > 0) t = v; }
+    return t;
+}
+
+}  // namespace
+
+/* Declared in FMI_search.h; see there for the contract. ftello reports the
+ * stream's logical position (buffered bytes included), so it is the right
+ * offset to hand pread; the fseeko afterwards drops the now-stale buffer and
+ * re-anchors the stream past the array we just read behind its back. */
+void fmi_pread_from_stream(FILE *fp, void *dst, size_t nbytes, int nthreads)
+{
+    off_t off = ftello(fp);
+    if (off < 0) {
+        fprintf(stderr, "ERROR: ftello failed during index load: %s\n", strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+    parallel_pread(fileno(fp), dst, nbytes, off, nthreads);
+    if (fseeko(fp, off + (off_t)nbytes, SEEK_SET) != 0) {
+        fprintf(stderr, "ERROR: fseeko failed during index load: %s\n", strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+}
 
 /* Build "<prefix><suffix>" into `out` (sized `outsz`); aborts on overflow.
  * Replaces the prior strcpy_s/strcat_s pattern for assembling FMI sidecar
@@ -228,7 +379,7 @@ int FMI_search::build_index(bool emit_unpacked_ref) {
     return libsais_build_fm_index(prefix, pac_len, opts);
 }
 
-void FMI_search::load_index(bool load_pac)
+void FMI_search::load_index(bool load_pac, int n_threads)
 {
     /* Try the staged shm segment first. On hit, both the FMI internals
      * (cp_occ / sa_*) and the BNS+PAC are attached as views into the
@@ -252,6 +403,9 @@ void FMI_search::load_index(bool load_pac)
     // attempted size and how much we'd already committed before failing.
     int64_t index_alloc = 0;
 
+    // Worker count for the big-array reads below (read once, out of any loop).
+    const int load_nt = index_load_threads(n_threads);
+
     char *ref_file_name = file_name;
     //beCalls = 0;
     char cp_file_name[PATH_MAX];
@@ -270,6 +424,12 @@ void FMI_search::load_index(bool load_pac)
         fprintf(stderr, "* Index file found. Loading index from %s\n", cp_file_name);
     }
 
+#if defined(__linux__)
+    // Kick readahead for the whole index so the parallel preads below hit warm
+    // pages on a cold cache (no-op benefit when already cached).
+    posix_fadvise(fileno(cpstream), 0, 0, POSIX_FADV_WILLNEED);
+#endif
+
     err_fread_noeof(&reference_seq_len, sizeof(int64_t), 1, cpstream);
     assert(reference_seq_len > 0);
     assert(reference_seq_len <= 0x7fffffffffL);
@@ -287,7 +447,7 @@ void FMI_search::load_index(bool load_pac)
     assert_not_null(cp_occ, cp_occ_bytes, index_alloc);
     bwamem_madv_hugepage(cp_occ, cp_occ_bytes);
 
-    err_fread_noeof(cp_occ, sizeof(CP_OCC), cp_occ_size, cpstream);
+    fmi_pread_from_stream(cpstream, cp_occ, (size_t)cp_occ_bytes, load_nt);
     int64_t ii = 0;
     for(ii = 0; ii < 5; ii++)// update read count structure
     {
@@ -307,8 +467,8 @@ void FMI_search::load_index(bool load_pac)
     assert_not_null(sa_ls_word, sa_ls_bytes, index_alloc);
     bwamem_madv_hugepage(sa_ms_byte, sa_ms_bytes);
     bwamem_madv_hugepage(sa_ls_word, sa_ls_bytes);
-    err_fread_noeof(sa_ms_byte, sizeof(int8_t), reference_seq_len_, cpstream);
-    err_fread_noeof(sa_ls_word, sizeof(uint32_t), reference_seq_len_, cpstream);
+    fmi_pread_from_stream(cpstream, sa_ms_byte, (size_t)sa_ms_bytes, load_nt);
+    fmi_pread_from_stream(cpstream, sa_ls_word, (size_t)sa_ls_bytes, load_nt);
 
     #else
 
@@ -322,8 +482,8 @@ void FMI_search::load_index(bool load_pac)
     assert_not_null(sa_ls_word, sa_ls_bytes, index_alloc);
     bwamem_madv_hugepage(sa_ms_byte, sa_ms_bytes);
     bwamem_madv_hugepage(sa_ls_word, sa_ls_bytes);
-    err_fread_noeof(sa_ms_byte, sizeof(int8_t), reference_seq_len, cpstream);
-    err_fread_noeof(sa_ls_word, sizeof(uint32_t), reference_seq_len, cpstream);
+    fmi_pread_from_stream(cpstream, sa_ms_byte, (size_t)sa_ms_bytes, load_nt);
+    fmi_pread_from_stream(cpstream, sa_ls_word, (size_t)sa_ls_bytes, load_nt);
 
     #endif
 

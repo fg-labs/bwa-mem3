@@ -1685,7 +1685,7 @@ int main_mem(int argc, char *argv[])
     /* D3 --meth: load the SEED index's FM + bns but NOT its pac. The seed pac is
      * never read in --meth (extension/scoring/mate-rescue use meth_orig_pac);
      * skipping it saves ~1.6 GB on hg38. Outside --meth, load the pac as before. */
-    aux.fmi->load_index(/*load_pac=*/!opt->meth_mode);
+    aux.fmi->load_index(/*load_pac=*/!opt->meth_mode, /*n_threads=*/opt->n_threads);
     aux.shm_base = aux.fmi->shm_attached_base();
     tprof[FMI][0] += __rdtsc() - tim;
 
