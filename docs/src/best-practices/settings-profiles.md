@@ -49,7 +49,9 @@ bwa-mem3 mem -t <N> -m 10 -y 0 ref.fa R1.fq R2.fq > out.sam
 > under `--meth`) in one flag. Explicit flags
 > still override individual levers where applicable; `--smem-dedup`,
 > `--skip-contained-ext` and `--adaptive-band` are forced on with no opt-out
-> (`--adaptive-band` is a no-op on short reads, a ~25% speedup on long-read runs).
+> (`--adaptive-band` is a no-op on short reads, a ~25% speedup on medium-length runs
+> such as SBX ~240 bp; kilobase-scale HiFi/ONT do not run at default settings — see
+> [Situational: `--adaptive-band`](#situational---adaptive-band-for-medium-length-reads)).
 > `--skip-contained-ext` no-ops under `--meth` (its own internal gate disables it
 > there), so on a `--meth` run the effective levers are
 > `-m 10 -y 0 --min-ext-len 30 --smem-dedup --max-extend-chains 10 --adaptive-band -s 2 --extend-mate-concordant`.
@@ -363,18 +365,24 @@ Caveats: this was measured on a single repeat-enriched truth set at the breakpoi
 end-to-end SV calls), so treat `20` as a sensible starting point for SV workflows rather than a
 universal recommendation. It has no effect on primary-alignment MAPQ or on non-SV pipelines.
 
-## Situational: `--adaptive-band` for long reads
+## Situational: `--adaptive-band` for medium-length reads
 
-This is **not** part of the recommended (short-read) profile — it is a **long-read** lever, and the
-default (off) is correct for standard Illumina WGS/WES.
+This is **not** part of the recommended (short-read) profile — it is a
+**medium-length-read** lever, and the default (off) is correct for standard Illumina WGS/WES.
+
+> **Not for kilobase-scale long reads.** `bwa-mem3 mem` does not currently run on PacBio HiFi
+> (~15–20 kb) or ONT reads at default settings — the short-read-sized extension buffers cannot
+> hold a kilobase-scale extension and the run aborts. `--adaptive-band` does not change that.
+> Use minimap2 for true long-read alignment. Tracking issue: fg-labs/bwa-mem3#238.
 
 `--adaptive-band` starts banded Smith-Waterman tight and expands each extension only to the band its
 chain's seed geometry implies, instead of the fixed `-w` band (100) for every extension. The band
-only constrains the DP matrix when the extension's reference window exceeds it — an intrinsically
-**long-read** condition — so:
+only constrains the DP matrix when the extension's reference window exceeds it — which begins around
+the **~200 bp** mark — so:
 
-- **Use it for long reads:** SBX, PacBio HiFi, ONT, or any run whose reads are roughly ≥ 200 bp. On
-  SBX (HG002, 240 bp+) it cut alignment CPU by **~25 %**.
+- **Use it for medium-length reads:** SBX (HG002, ~240 bp), where it cut alignment CPU by **~25 %**.
+  It nominally covers longer reads, but kilobase-scale HiFi/ONT do not run at default settings (see
+  the note above), so its usable range today is medium reads.
 - **No-op on short reads:** WGS (~150 bp) and WES (~76 bp) extensions are already smaller than the
   band, so there is nothing to trim; those reads run on the 8-bit kernel, which the option leaves
   untouched. Enabling it on a short-read run neither helps nor hurts.
