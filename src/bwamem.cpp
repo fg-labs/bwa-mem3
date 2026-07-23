@@ -818,6 +818,17 @@ void mem_flt_chained_seeds(const mem_opt_t *opt, const bntseq_t *bns, const uint
     int i, j, k;// min_HSP_score = (int)(opt->a * min_l + .499);
     //if (min_l > MEM_SEEDSW_COEF * l_query) return; // don't run the following for short reads
 
+    /* min_l/min_HSP_score depend only on (opt, l_query). Upstream hoisted them out
+     * of the loop because it was called per read; here `a` holds chains for a whole
+     * batch, so l_query = seq_[c->seqid].l_seq varies and a plain hoist is wrong.
+     * But chains arrive grouped by seqid and libraries are usually fixed-length, so
+     * a one-entry memo on l_query collapses ~all of the per-chain libm log() calls
+     * (order 10 chains/read => ~1e8 log() on a 10M-read run). Byte-identical: the
+     * same inputs produce the same IEEE double, we just stop recomputing it. */
+    int    memo_l_query = -1;
+    double memo_min_l = 0.0;
+    int    memo_min_HSP_score = 0;
+
     /* D3 (--meth, PR-4): the chained-seed SW filter must score the ORIGINAL read
      * against the original ref with the per-chain asymmetric matrix, same as
      * extension — otherwise it over-penalizes bisulfite conversions and drops
@@ -867,9 +878,17 @@ void mem_flt_chained_seeds(const mem_opt_t *opt, const bntseq_t *bns, const uint
             mat = mem_opt_meth_mat(opt, hyp);
         }
 
-        double min_l = opt->min_chain_weight?
-        MEM_HSP_COEF * opt->min_chain_weight : MEM_MINSC_COEF * log(l_query);
-        int min_HSP_score = (int)(opt->a * min_l + .499);
+        double min_l;
+        int min_HSP_score;
+        if (l_query == memo_l_query) {          /* same read length as the previous chain */
+            min_l = memo_min_l;
+            min_HSP_score = memo_min_HSP_score;
+        } else {
+            min_l = opt->min_chain_weight?
+                MEM_HSP_COEF * opt->min_chain_weight : MEM_MINSC_COEF * log(l_query);
+            min_HSP_score = (int)(opt->a * min_l + .499);
+            memo_l_query = l_query; memo_min_l = min_l; memo_min_HSP_score = min_HSP_score;
+        }
         if (min_l > MEM_SEEDSW_COEF * l_query) continue;
 
         for (j = k = 0; j < c->n; ++j)
@@ -1037,20 +1056,34 @@ int mem_chain_flt(const mem_opt_t *opt, int n_chn_, mem_chain_t *a_, int tid)
         // original code block starts
         ks_introsort(mem_flt, n_chn, a);
 
+        /* SoA hoist (byte-identical). chn_beg()/chn_end() each chase a[].seeds --
+         * a dependent load of the seeds pointer, then a load from the 65k-entry
+         * seedBuf arena -- and the pairwise loop below evaluates them for EVERY
+         * (i,j) pair, so the j-side is re-chased on every inner iteration. Cache
+         * them once into two contiguous int arrays (typical ~25 chains/read, so a
+         * couple hundred bytes, L1-resident). The seed arrays are not modified
+         * anywhere in this loop, so these are exactly the values the macros would
+         * have recomputed. thread_local + grow-only: no per-read allocation. */
+        static thread_local std::vector<int> cb_v, ce_v;
+        if ((int)cb_v.size() < n_chn) { cb_v.resize(n_chn); ce_v.resize(n_chn); }
+        int *cb = cb_v.data(), *ce = ce_v.data();
+        for (int t = 0; t < n_chn; ++t) { cb[t] = chn_beg(a[t]); ce[t] = chn_end(a[t]); }
+
         // pairwise chain comparisons
         a[0].kept = 3;
         kv_push(int, chains, 0);
         for (i = 1; i < n_chn; ++i)
         {
             int large_ovlp = 0;
+            const int cbi = cb[i], cei = ce[i];
             for (k = 0; k < chains.n; ++k)
             {
                 int j = chains.a[k];
-                int b_max = chn_beg(a[j]) > chn_beg(a[i])? chn_beg(a[j]) : chn_beg(a[i]);
-                int e_min = chn_end(a[j]) < chn_end(a[i])? chn_end(a[j]) : chn_end(a[i]);
+                int b_max = cb[j] > cbi? cb[j] : cbi;
+                int e_min = ce[j] < cei? ce[j] : cei;
                 if (e_min > b_max && (!a[j].is_alt || a[i].is_alt)) { // have overlap; don't consider ovlp where the kept chain is ALT while the current chain is primary
-                    int li = chn_end(a[i]) - chn_beg(a[i]);
-                    int lj = chn_end(a[j]) - chn_beg(a[j]);
+                    int li = cei - cbi;
+                    int lj = ce[j] - cb[j];
                     int min_l = li < lj? li : lj;
                     if (e_min - b_max >= min_l * opt->mask_level && min_l < opt->max_chain_gap) { // significant overlap
                         large_ovlp = 1;
