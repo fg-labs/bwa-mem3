@@ -333,6 +333,7 @@ mem_opt_t *mem_opt_init()
     o->est_insert_high = 0;          // runtime state; set from data (mem_pestat) or -I during the run
     o->seed_emit_order = SEED_ORDER_OFF;  // byte-identical default
     o->smem_dedup  = 0;   // off by default -> byte-identical to baseline; opt-in via --smem-dedup
+    o->alnreg_sort_fast = 0;  // off by default -> bwa-mem2's dedup sort (see mem_sort_dedup_patch); set by --fast
     o->skip_contained_ext = 0;   // off by default; opt-in via --skip-contained-ext (byte-identical)
     o->band_start  = 0;   // off by default (adaptive chain-geometry band); opt-in via --adaptive-band
     o->split_width = 10;
@@ -416,16 +417,30 @@ void mem_opt_apply_meth_defaults(mem_opt_t *opt, const mem_opt_t *opt0)
  * De-overlap single-end hits *
  ******************************/
 
-/* mem_ars2: primary sort by reference END position (`re`). Used by
- * mem_sort_dedup_patch as the first ordering before its order-sensitive
- * dedup/patch loop. The tie-break keys (rb, score-desc, qb) make the
- * order deterministic at equal `re`; without them, the dedup outcome
- * depended on whichever ordering the underlying sort algorithm happened
- * to produce (klib introsort is unstable, pdqsort is unstable
- * differently, radix is stable) — different orderings produced
- * different surviving alnreg sets, propagating to `sub_n` and MAPQ.
- * With the full key, every sort algorithm produces the same surviving
- * set and the SAM is bit-equal regardless of which sort runs. */
+/* The two comparators below are the two halves of the same trade-off, and
+ * mem_sort_dedup_patch picks between them on opt->alnreg_sort_fast. Its first
+ * sort feeds an ORDER-SENSITIVE dedup loop, so the comparator decides which of
+ * several equal-`re` regions survives, propagating to `sub_n` and MAPQ:
+ *
+ *   mem_ars2_m2 (default) -- bwa-mem2's ORIGINAL comparator, a PARTIAL order on
+ *     `re` alone, run under klib's unstable introsort. The surviving set depends
+ *     on the *permutation* introsort produces, which is precisely what
+ *     bwa-mem2's output is defined by. Kept so the default build reproduces
+ *     upstream's dedup outcome exactly.
+ *
+ *   mem_ars2 (--fast) -- a STRICT TOTAL order: `re`, then the tie-break keys
+ *     (rb, score-desc, qb). Every sort algorithm then produces the same
+ *     surviving set, so the SAM is bit-equal regardless of which sort runs
+ *     (klib introsort is unstable, pdqsort is unstable differently, radix is
+ *     stable). Paired with pdqsort here.
+ *
+ * The two properties are mutually exclusive: any strict total order necessarily
+ * picks different winners among equal-`re` records than the permutation
+ * introsort happens to leave, so robustness-to-sort-choice and bwa-mem2 parity
+ * cannot both hold. Covered by test/unit/test_alnreg_sort_dedup.cpp. */
+#define alnreg_slt2_m2(a, b) ((a).re < (b).re)
+KSORT_INIT(mem_ars2_m2, mem_alnreg_t, alnreg_slt2_m2)
+
 #define alnreg_slt2(a, b) \
     ((a).re < (b).re || ((a).re == (b).re && \
      ((a).rb < (b).rb || ((a).rb == (b).rb && \
@@ -591,7 +606,11 @@ int mem_sort_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns,
     if (mat == NULL) mat = opt->mat;
     int m, i, j;
     if (n <= 1) return n;
-    pdqsort_mem_ars2(n, a); // sort by the END position, not START!
+    /* Default: bwa-mem2's re-only comparator + klib introsort, reproducing
+     * upstream's dedup outcome. --fast: strict total order + pdqsort, which is
+     * ~35-55% faster for n>=9 but resolves equal-`re` ties differently. */
+    if (opt->alnreg_sort_fast) pdqsort_mem_ars2(n, a);       // sort by the END position, not START!
+    else                       ks_introsort(mem_ars2_m2, n, a);
 
     for (i = 0; i < n; ++i) a[i].n_comp = 1;
     for (i = 1; i < n; ++i)
@@ -635,7 +654,8 @@ int mem_sort_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns,
             else ++m;
         }
     n = m;
-    pdqsort_mem_ars(n, a);
+    if (opt->alnreg_sort_fast) pdqsort_mem_ars(n, a);
+    else                       ks_introsort(mem_ars, n, a);
     /* The historical post-sort exact-duplicate passes (mark then exclude regions
      * sharing (score, rb, qb)) have been removed: they are provably dead. Any two
      * regions with equal (rb, qb) have the shorter fully contained in the longer,

@@ -952,6 +952,9 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "                  -s 2). Opt-in; explicit\n");
     fprintf(stderr, "                  flags override where applicable; --smem-dedup,\n");
     fprintf(stderr, "                  --skip-contained-ext and --adaptive-band are always enabled.\n");
+    fprintf(stderr, "                  Also switches the alignment-region dedup sort to a strict\n");
+    fprintf(stderr, "                  total order (faster, but resolves equal-end-position ties\n");
+    fprintf(stderr, "                  differently from bwa-mem2, which the default reproduces).\n");
     fprintf(stderr, "                  NOT byte-identical to the default (divergence confined to the\n");
     fprintf(stderr, "                  low-confidence tail).\n");
     fprintf(stderr, "Scoring options:\n");
@@ -1487,11 +1490,15 @@ int main_mem(int argc, char *argv[])
     /* --fast: one-flag shorthand for the characterized speed levers
      *   -m 10  -y 0  --min-ext-len 30  --smem-dedup  --skip-contained-ext
      *   --max-extend-chains 20  --adaptive-band  --extend-mate-concordant
-     *   (under --meth: --max-extend-chains 10 and also adds -s 2).
+     *   (under --meth: --max-extend-chains 10 and also adds -s 2),
+     *   plus the strict-total-order + pdqsort dedup sort (alnreg_sort_fast),
+     *   which has no flag of its own -- see the alnreg_sort_fast assignment
+     *   below and the comparator commentary in src/bwamem.cpp.
      * Mirrors the -x preset: each lever is applied only when the user did not
      * set it explicitly (opt0), so explicit flags win where applicable. The
-     * exceptions are --smem-dedup and --skip-contained-ext, which are plain
-     * on/off booleans forced on unconditionally (no opt-out flag exists).
+     * exceptions are --smem-dedup, --skip-contained-ext and the dedup sort,
+     * which are plain on/off booleans forced on unconditionally (no opt-out
+     * flag exists; the dedup sort has no flag at all).
      * --skip-contained-ext is byte-identical on non-meth SE/PE and no-ops under
      * --meth via its own internal gate (see bwamem.cpp), so forcing it on here is
      * safe for --fast --meth too.
@@ -1514,6 +1521,9 @@ int main_mem(int argc, char *argv[])
          * floor (verified --fast) while keeping ~-20% aligner CPU. */
         if (!opt0.max_extend_chains) opt->max_extend_chains = opt->meth_mode ? 10 : 20;
         opt->smem_dedup = 1;                             /* --smem-dedup (plain on/off) */
+        opt->alnreg_sort_fast = 1;                       /* strict-total-order + pdqsort dedup sort
+                                                          * (~35-55% faster for n>=9; diverges from
+                                                          * bwa-mem2 on equal-`re` ties) */
         opt->skip_contained_ext = 1;                     /* --skip-contained-ext (plain on/off;
                                                           * meth-gated internally) */
         opt->band_start = ADAPTIVE_BAND_START;           /* --adaptive-band: no-op on short reads
@@ -1679,14 +1689,20 @@ int main_mem(int argc, char *argv[])
     if (opt->seed_emit_order != SEED_ORDER_OFF)
         fprintf(stderr, "[M::%s] seed order: %s\n", __func__, seed_order_to_str(opt->seed_emit_order));
     if (fast) {
+        /* `alnreg-sort=fast` is deliberately spelled WITHOUT a leading `--`: unlike
+         * every other item on this line it is not a flag the user can pass, only a
+         * lever --fast turns on. That is also why it must be here: with no flag to
+         * grep for, this line is the only record a run leaves of a lever that
+         * changes output (see the comparator commentary in src/bwamem.cpp). It is
+         * not meth-gated, so it appears on both branches. */
         if (opt->meth_mode)
             /* --skip-contained-ext is set but no-ops under --meth (internal gate), so it is
              * intentionally omitted from the meth audit line to reflect the effective levers.
              * --adaptive-band is set unconditionally and applies under --meth, so it stays. */
-            fprintf(stderr, "[M::%s] --fast: -m %d -y %ld --min-ext-len %d --smem-dedup --max-extend-chains %d --adaptive-band -s %d --extend-mate-concordant\n",
+            fprintf(stderr, "[M::%s] --fast: -m %d -y %ld --min-ext-len %d --smem-dedup --max-extend-chains %d --adaptive-band -s %d --extend-mate-concordant alnreg-sort=fast\n",
                     __func__, opt->max_matesw, (long)opt->max_mem_intv, opt->min_ext_len, opt->max_extend_chains, opt->split_width);
         else
-            fprintf(stderr, "[M::%s] --fast: -m %d -y %ld --min-ext-len %d --smem-dedup --skip-contained-ext --max-extend-chains %d --adaptive-band --extend-mate-concordant\n",
+            fprintf(stderr, "[M::%s] --fast: -m %d -y %ld --min-ext-len %d --smem-dedup --skip-contained-ext --max-extend-chains %d --adaptive-band --extend-mate-concordant alnreg-sort=fast\n",
                     __func__, opt->max_matesw, (long)opt->max_mem_intv, opt->min_ext_len, opt->max_extend_chains);
     }
 
