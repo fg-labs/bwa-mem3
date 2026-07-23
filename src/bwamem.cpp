@@ -568,6 +568,8 @@ mem_opt_t *mem_opt_init()
     o->max_extend_chains = 0;   // off by default; opt-in speed lever (--max-extend-chains / --fast)
     o->mate_concordant_window = 0;   // off by default; opt-in (--extend-mate-concordant / --fast --meth)
     o->est_insert_high = 0;          // runtime state; set from data (mem_pestat) or -I during the run
+    o->extend_tie_frac = 0.0f;   // off by default -> byte-identical to baseline; opt-in via --extend-tie-frac / --fast
+    o->extend_tie_floor = 0;     // no unconditional floor; only meaningful when extend_tie_frac > 0
     o->seed_emit_order = SEED_ORDER_OFF;  // byte-identical default
     o->smem_dedup  = 0;   // off by default -> byte-identical to baseline; opt-in via --smem-dedup
     o->alnreg_sort_fast = 0;  // off by default -> bwa-mem2's dedup sort (see mem_sort_dedup_patch); set by --fast
@@ -1505,13 +1507,25 @@ void mem_flt_chained_seeds(const mem_opt_t *opt, const bntseq_t *bns, const uint
  * byte-identical (drops candidate secondaries, so XS/secondary/MAPQ can move on
  * multi-mapping reads). Always keeps >= 1 chain. Returns the new chain count. */
 #define MAX_EXTEND_CHAINS_CAP 4096
-static int mem_chain_cap_extend(mem_chain_t *a, int n, int max_n)
+static int mem_chain_cap_extend(mem_chain_t *a, int n, int max_n, float tie_frac, int tie_floor)
 {
     if (max_n <= 0 || n <= max_n || n > MAX_EXTEND_CHAINS_CAP) return n;
     int w[MAX_EXTEND_CHAINS_CAP];
-    for (int i = 0; i < n; i++) w[i] = a[i].w > 0 ? a[i].w : mem_chain_weight(&a[i]);
+    int w_best = 0;
+    for (int i = 0; i < n; i++) {
+        w[i] = a[i].w > 0 ? a[i].w : mem_chain_weight(&a[i]);
+        if (w[i] > w_best) w_best = w[i];
+    }
+    /* competitiveness gate (--extend-tie-frac): a chain ranked at/after tie_floor is
+     * extended only if its weight is within tie_frac of the best chain's -- i.e. it is
+     * a genuine near-tie that could change placement/MAPQ. tie_frac<=0 disables the gate,
+     * reducing this to the pure top-max_n cap (baseline). tie_frac is clamped to [0,1]
+     * upstream, so (int)(tie_frac*w_best) <= w_best and the best chain (rank 0) always
+     * clears the gate -- the "keep >= 1 chain" invariant holds. */
+    int gate = tie_frac > 0.0f ? (int)(tie_frac * w_best) : 0;
     /* keep chain i iff fewer than max_n other chains outrank it by
-     * (weight desc, then original index asc) -- a stable top-max_n selection. */
+     * (weight desc, then original index asc) -- a stable top-max_n selection --
+     * AND (it is within the always-extend floor OR it clears the competitiveness gate). */
     int k = 0;
     for (int i = 0; i < n; i++) {
         int rank = 0;
@@ -1519,7 +1533,7 @@ static int mem_chain_cap_extend(mem_chain_t *a, int n, int max_n)
             if (j == i) continue;
             if (w[j] > w[i] || (w[j] == w[i] && j < i)) rank++;
         }
-        if (rank < max_n) a[k++] = a[i];
+        if (rank < max_n && (rank < tie_floor || w[i] >= gate)) a[k++] = a[i];
         else if (a[i].m > SEEDS_PER_CHAIN) free(a[i].seeds);
     }
     return k;
@@ -1541,7 +1555,8 @@ static int mem_chain_cap_extend(mem_chain_t *a, int n, int max_n)
 #define MATE_CONCORDANT_WINDOW_FALLBACK 1000  /* used only in --auto before the insert size is estimated (e.g. first chunk) */
 #define MATE_SCAN_MAX 256
 static int mem_chain_cap_extend_mate(mem_chain_t *a, int n, int max_n,
-        const mem_chain_t *mate, int mate_n, const bntseq_t *bns, int64_t win)
+        const mem_chain_t *mate, int mate_n, const bntseq_t *bns, int64_t win,
+        float tie_frac, int tie_floor)
 {
     if (max_n <= 0 || n <= max_n || n > MAX_EXTEND_CHAINS_CAP) return n;
     const int MSCAN = MATE_SCAN_MAX;
@@ -1552,13 +1567,22 @@ static int mem_chain_cap_extend_mate(mem_chain_t *a, int n, int max_n,
         mrid[j] = mate[j].rid; mrev[j] = is_rev;
     }
     int w[MAX_EXTEND_CHAINS_CAP];
-    for (int i = 0; i < n; i++) w[i] = a[i].w > 0 ? a[i].w : mem_chain_weight(&a[i]);
+    int w_best = 0;
+    for (int i = 0; i < n; i++) {
+        w[i] = a[i].w > 0 ? a[i].w : mem_chain_weight(&a[i]);
+        if (w[i] > w_best) w_best = w[i];
+    }
+    /* competitiveness gate (--extend-tie-frac); see mem_chain_cap_extend. The
+     * mate-concordant override below still runs after the gate, so a gate-failed
+     * (low-weight) chain that anchors the true concordant pair is still retained --
+     * exactly the #202 fix -- and the gate cannot drop a mate-concordant true pair. */
+    int gate = tie_frac > 0.0f ? (int)(tie_frac * w_best) : 0;
     int k = 0;
     for (int i = 0; i < n; i++) {
         int rank = 0;
         for (int j = 0; j < n; j++)
             if (j != i && (w[j] > w[i] || (w[j] == w[i] && j < i))) rank++;
-        int keep = rank < max_n;
+        int keep = rank < max_n && (rank < tie_floor || w[i] >= gate);
         if (!keep && mn > 0) {
             int is_rev; int64_t fp = bns_depos(bns, a[i].pos, &is_rev);
             for (int j = 0; j < mn; j++)
@@ -2910,9 +2934,11 @@ int mem_kernel1_core(FMI_search *fmi,
             int ml = l ^ 1;  /* interleaved PE: mate is the sibling index */
             chn->n = mem_chain_cap_extend_mate(chn->a, chn->n, opt->max_extend_chains,
                                                chain_ar[ml].a, chain_ar[ml].n,
-                                               chain_bns, mate_win);
+                                               chain_bns, mate_win,
+                                               opt->extend_tie_frac, opt->extend_tie_floor);
         } else {
-            chn->n = mem_chain_cap_extend(chn->a, chn->n, opt->max_extend_chains);
+            chn->n = mem_chain_cap_extend(chn->a, chn->n, opt->max_extend_chains,
+                                          opt->extend_tie_frac, opt->extend_tie_floor);
         }
     }
     printf_(VER, "7. Done mem_chain_flt..\n");

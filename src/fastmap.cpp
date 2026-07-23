@@ -1574,6 +1574,8 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "    --no-adaptive-band  disable adaptive banded-SW (exact, byte-identical full-width extension; also disables the certified band); overrides --adaptive-band and the --adaptive-band that --fast enables\n");
     fprintf(stderr, "    --no-band-cert  disable the certified adaptive extension band (on by default): run the full-width extension ladder for every pair instead of the narrow-probe-plus-certificate. The certified band is byte-identical to full-width, so on a plain run this only removes the speedup; it has no effect under --fast, --adaptive-band, or --no-adaptive-band (which already disable the certified band). Escape hatch / A-B handle [%s]\n", opt->band_cert? "on":"off");
     fprintf(stderr, "    --extend-mate-concordant[=INT]  when --max-extend-chains caps a PE read, also keep any chain concordant (same contig, FR, within INT bp) with a mate chain; recovers the true pair's low-weight chain the cap would drop (mainly --meth). Bare = auto (window = estimated proper-pair insert high bound); =INT = fixed bp; =0 = off. Opt-in, NOT byte-identical [%s]\n", opt->mate_concordant_window? (opt->mate_concordant_window<0? "auto":"fixed") : "off");
+    fprintf(stderr, "    --extend-tie-frac FLOAT  with --max-extend-chains, extend a capped chain (ranked at/after --extend-tie-floor) only if its weight >= FLOAT * the best chain's weight -- trims non-competitive tail chains from banded-SW while still extending genuine near-ties; clamped to [0,1]; opt-in, NOT byte-identical (0 = off) [%.2f]\n", opt->extend_tie_frac);
+    fprintf(stderr, "    --extend-tie-floor INT  always extend at least the top-INT chains regardless of --extend-tie-frac (0 = no floor; the fraction gate governs from rank 0, best chain always kept); only meaningful with --extend-tie-frac > 0 [%d]\n", opt->extend_tie_floor);
     fprintf(stderr, "    -D FLOAT      drop chains shorter than FLOAT fraction of the longest overlapping chain [%.2f]\n", opt->drop_ratio);
     fprintf(stderr, "    -W INT        discard a chain if seeded bases shorter than INT [0]\n");
     fprintf(stderr, "    -m INT        perform at most INT rounds of mate rescues for each read [%d]\n", opt->max_matesw);
@@ -1979,6 +1981,8 @@ int main_mem(int argc, char *argv[])
         OPT_COHORT_RAMP_RATIO,
         OPT_COHORT_RAMP_FIRST,
         OPT_HIC,
+        OPT_EXTEND_TIE_FRAC,
+        OPT_EXTEND_TIE_FLOOR,
 #ifdef STAGE_PROF
         OPT_PROFILE,
 #endif
@@ -2007,6 +2011,8 @@ int main_mem(int argc, char *argv[])
         {"rescue-skip",              no_argument,       0, OPT_RESCUE_SKIP},
         {"cohort-ramp-ratio",        required_argument, 0, OPT_COHORT_RAMP_RATIO},
         {"cohort-ramp-first",        required_argument, 0, OPT_COHORT_RAMP_FIRST},
+        {"extend-tie-frac",          required_argument, 0, OPT_EXTEND_TIE_FRAC},
+        {"extend-tie-floor",         required_argument, 0, OPT_EXTEND_TIE_FLOOR},
         {"meth",                     optional_argument, 0, OPT_METH},
         {"meth-scoring",             required_argument, 0, OPT_METH_SCORING},
         {"meth-tags",                required_argument, 0, OPT_METH_TAGS},
@@ -2035,6 +2041,16 @@ int main_mem(int argc, char *argv[])
         if (c == 'k') opt->min_seed_len = atoi(optarg), opt0.min_seed_len = 1;
         else if (c == OPT_MIN_EXT_LEN) opt->min_ext_len = atoi(optarg), opt0.min_ext_len = 1;
         else if (c == OPT_MAX_EXTEND_CHAINS) opt->max_extend_chains = atoi(optarg), opt0.max_extend_chains = 1;
+        else if (c == OPT_EXTEND_TIE_FRAC) {
+            float f = atof(optarg);
+            if (f < 0.0f) f = 0.0f; else if (f > 1.0f) f = 1.0f;  /* clamp to [0,1]; keeps the best chain always extended */
+            opt->extend_tie_frac = f; opt0.extend_tie_frac = 1;
+        }
+        else if (c == OPT_EXTEND_TIE_FLOOR) {
+            int v = atoi(optarg);
+            if (v < 0) v = 0;
+            opt->extend_tie_floor = v; opt0.extend_tie_floor = 1;
+        }
         else if (c == '1') no_mt_io = 1;
         else if (c == 'x') mode = optarg;
         else if (c == 'w') opt->w = atoi(optarg), opt0.w = 1;

@@ -197,6 +197,8 @@ typedef struct mem_opt_t {
     int max_extend_chains;  // cap on chains extended per read: keep only the top-N by weight before banded-SW (0 = off). Opt-in speed lever; NOT byte-identical.
     int mate_concordant_window;  // --extend-mate-concordant: when max_extend_chains caps a PE read, also retain chains concordant with a mate chain within this many bp. 0 = off; -1 = auto (use the estimated proper-pair insert high bound); >0 = fixed window. Recovers the true pair's low-weight chain (mainly --meth). NOT byte-identical.
     int est_insert_high;         // runtime state (NOT a user option): upper proper-pair insert bound (pes[FR].high) estimated from data during the run, or from -I; 0 = not yet estimated. Read by the mate-concordant cap when mate_concordant_window == -1 (auto).
+    float extend_tie_frac;       // --extend-tie-frac: with max_extend_chains, extend a capped chain (ranked at/after extend_tie_floor) only if its weight >= this fraction of the best chain's weight. 0 = off (byte-identical); clamped to [0,1]. Trims non-competitive tail chains from banded-SW. NOT byte-identical when > 0.
+    int extend_tie_floor;        // --extend-tie-floor: always extend at least this many top-ranked chains regardless of extend_tie_frac. 0 = no unconditional floor (the fraction gate governs from rank 0 up; the best chain always survives). Only meaningful when extend_tie_frac > 0.
     seed_order_t seed_emit_order;  // --seed-order; SEED_ORDER_OFF = byte-identical
     int min_chain_weight;
     int max_chain_extend;
