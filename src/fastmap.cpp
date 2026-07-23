@@ -1575,6 +1575,7 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "    --no-band-cert  disable the certified adaptive extension band (on by default): run the full-width extension ladder for every pair instead of the narrow-probe-plus-certificate. The certified band is byte-identical to full-width, so on a plain run this only removes the speedup; it has no effect under --fast, --adaptive-band, or --no-adaptive-band (which already disable the certified band). Escape hatch / A-B handle [%s]\n", opt->band_cert? "on":"off");
     fprintf(stderr, "    --extend-mate-concordant[=INT]  when --max-extend-chains caps a PE read, also keep any chain concordant (same contig, FR, within INT bp) with a mate chain; recovers the true pair's low-weight chain the cap would drop (mainly --meth). Bare = auto (window = estimated proper-pair insert high bound); =INT = fixed bp; =0 = off. Opt-in, NOT byte-identical [%s]\n", opt->mate_concordant_window? (opt->mate_concordant_window<0? "auto":"fixed") : "off");
     fprintf(stderr, "    --extend-tie-frac FLOAT  with --max-extend-chains, extend a capped chain (ranked at/after --extend-tie-floor) only if its weight >= FLOAT * the best chain's weight -- trims non-competitive tail chains from banded-SW while still extending genuine near-ties; clamped to [0,1]; opt-in, NOT byte-identical (0 = off) [%.2f]\n", opt->extend_tie_frac);
+    fprintf(stderr, "    --extend-csub  when --extend-tie-frac/--max-extend-chains drops chains, seed the primary's competitor score with a calibrated estimate of the best dropped chain so MAPQ is not inflated by the pruning; opt-in, NOT byte-identical [%s]\n", opt->extend_csub? "on":"off");
     fprintf(stderr, "    --extend-tie-floor INT  always extend at least the top-INT chains regardless of --extend-tie-frac (0 = no floor; the fraction gate governs from rank 0, best chain always kept); only meaningful with --extend-tie-frac > 0 [%d]\n", opt->extend_tie_floor);
     fprintf(stderr, "    -D FLOAT      drop chains shorter than FLOAT fraction of the longest overlapping chain [%.2f]\n", opt->drop_ratio);
     fprintf(stderr, "    -W INT        discard a chain if seeded bases shorter than INT [0]\n");
@@ -1983,6 +1984,7 @@ int main_mem(int argc, char *argv[])
         OPT_HIC,
         OPT_EXTEND_TIE_FRAC,
         OPT_EXTEND_TIE_FLOOR,
+        OPT_EXTEND_CSUB,
 #ifdef STAGE_PROF
         OPT_PROFILE,
 #endif
@@ -2013,6 +2015,7 @@ int main_mem(int argc, char *argv[])
         {"cohort-ramp-first",        required_argument, 0, OPT_COHORT_RAMP_FIRST},
         {"extend-tie-frac",          required_argument, 0, OPT_EXTEND_TIE_FRAC},
         {"extend-tie-floor",         required_argument, 0, OPT_EXTEND_TIE_FLOOR},
+        {"extend-csub",              no_argument,       0, OPT_EXTEND_CSUB},
         {"meth",                     optional_argument, 0, OPT_METH},
         {"meth-scoring",             required_argument, 0, OPT_METH_SCORING},
         {"meth-tags",                required_argument, 0, OPT_METH_TAGS},
@@ -2046,6 +2049,7 @@ int main_mem(int argc, char *argv[])
             if (f < 0.0f) f = 0.0f; else if (f > 1.0f) f = 1.0f;  /* clamp to [0,1]; keeps the best chain always extended */
             opt->extend_tie_frac = f; opt0.extend_tie_frac = 1;
         }
+        else if (c == OPT_EXTEND_CSUB) opt->extend_csub = 1;
         else if (c == OPT_EXTEND_TIE_FLOOR) {
             int v = atoi(optarg);
             if (v < 0) v = 0;

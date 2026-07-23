@@ -907,6 +907,30 @@ void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str, bseq
 // Returns the number of mate-rescue hits produced (same meaning as the
 // historical `n` return from mem_sam_pe — i.e. a caller-visible accounting
 // of mate-SW work done).
+/* --extend-csub (PE): estimate the pair score of a competitor pruned before
+ * extension, so the pairing MAPQ raw_mapq(o - subo) reflects it. Each mate contributes
+ * its pruned-competitor SE score, estimated from the dropped chain weight scaled by that
+ * mate's OBSERVED per-base score rate (score/span). Note this is deliberately gentler
+ * than the all-match upper bound (weight * a) that mem_seed_capped_csub uses on the SE
+ * side: a pair score is the sum of two such estimates, so the generous bound would
+ * overstate subo roughly twice over. The sum is clamped strictly below o, so q_pe drops
+ * proportionally to a near-tie rather than being forced to 0.
+ * Returns a floor for subo, or 0 to leave subo unchanged. */
+static int mem_capped_pair_subo(const mem_alnreg_v a[2], const int z[2], int o)
+{
+    long est = 0;
+    for (int i = 0; i < 2; i++) {
+        if (a[i].capped_w <= 0 || z[i] < 0 || (size_t)z[i] >= a[i].n) continue;
+        const mem_alnreg_t *p = &a[i].a[z[i]];
+        int span = p->qe - p->qb;
+        if (span > 0 && p->score > 0)
+            est += (long)a[i].capped_w * p->score / span;
+    }
+    if (est <= 0) return 0;
+    if (est > (long)o - 1) est = (long)o - 1;   /* clamp: never force q_pe to 0 */
+    return (int)est;
+}
+
 int mem_pair_resolve(const mem_opt_t *opt, const bntseq_t *bns,
                      const uint8_t *pac, const mem_pestat_t pes[4],
                      uint64_t id, bseq1_t s[2], mem_alnreg_v a[2],
@@ -914,6 +938,7 @@ int mem_pair_resolve(const mem_opt_t *opt, const bntseq_t *bns,
                      int *extra_flag_out, int *paired_out)
 {
     extern int mem_mark_primary_se(const mem_opt_t *opt, int n, mem_alnreg_t *a, int64_t id);
+    extern void mem_seed_capped_csub(mem_alnreg_v *a, int match_a);
     extern int mem_approx_mapq_se(const mem_opt_t *opt, const mem_alnreg_t *a);
 
     #if MATE_SORT
@@ -992,6 +1017,11 @@ int mem_pair_resolve(const mem_opt_t *opt, const bntseq_t *bns,
     }
     #endif
 
+    /* --extend-csub: seed each end's primary competitor score from the chains the
+     * cap/gate dropped, before pairing/MAPQ below reads csub. No-op when off. */
+    mem_seed_capped_csub(&a[0], opt->a);
+    mem_seed_capped_csub(&a[1], opt->a);
+
     if (opt->flag & MEM_F_NOPAIRING) {
         *extra_flag_out = extra_flag;
         return n;
@@ -1018,6 +1048,7 @@ int mem_pair_resolve(const mem_opt_t *opt, const bntseq_t *bns,
     // compute mapQ for the best SE hit
     score_un = a[0].a[0].score + a[1].a[0].score - opt->pen_unpaired;
     subo = subo > score_un ? subo : score_un;
+    if (opt->extend_csub) { int fl = mem_capped_pair_subo(a, z, o); if (fl > subo) subo = fl; }
     q_pe = raw_mapq(o - subo, opt->a);
     if (n_sub > 0) q_pe -= (int)(4.343 * log(n_sub + 1) + .499);
     if (q_pe < 0) q_pe = 0;
@@ -1506,6 +1537,7 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                           int32_t &gcnt, int tid)
 {
     extern int mem_mark_primary_se(const mem_opt_t *opt, int n, mem_alnreg_t *a, int64_t id);
+    extern void mem_seed_capped_csub(mem_alnreg_v *a, int match_a);
     extern int mem_approx_mapq_se(const mem_opt_t *opt, const mem_alnreg_t *a);
     extern void mem_reg2sam(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
                             bseq1_t *s, mem_alnreg_v *a, int extra_flag, const mem_aln_t *m);
@@ -1605,6 +1637,11 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
         mem_reorder_primary5(opt->T, &a[1]);
     }
     #endif
+
+    /* --extend-csub: seed each end's primary competitor score from the chains the
+     * cap/gate dropped, before pairing/MAPQ below reads csub. No-op when off. */
+    mem_seed_capped_csub(&a[0], opt->a);
+    mem_seed_capped_csub(&a[1], opt->a);
     
     if (opt->flag&MEM_F_NOPAIRING) goto no_pairing;
 
@@ -1624,6 +1661,7 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
         score_un = a[0].a[0].score + a[1].a[0].score - opt->pen_unpaired;
         //q_pe = o && subo < o? (int)(MEM_MAPQ_COEF * (1. - (double)subo / o) * log(a[0].a[z[0]].seedcov + a[1].a[z[1]].seedcov) + .499) : 0;
         subo = subo > score_un? subo : score_un;
+        if (opt->extend_csub) { int fl = mem_capped_pair_subo(a, z, o); if (fl > subo) subo = fl; }
         {
             /* Meth PE MAPQ hardening (dragmap-style, cf. minibwa r404): fold each
              * end's SECOND-best single-end hit into the pair MAPQ so a repeat on
