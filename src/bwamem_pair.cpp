@@ -278,7 +278,7 @@ int mem_matesw(const mem_opt_t *opt, const bntseq_t *bns,
                              opt->o_ins, opt->e_ins, xtra, 0);
 
             memset(&b, 0, sizeof(mem_alnreg_t));
-            if (aln.score >= opt->min_seed_len && aln.qb >= 0) { // something goes wrong if aln.qb < 0
+            if (aln.score >= opt->min_seed_len && aln.qb >= 0 && aln.qe < l_ms) { // something goes wrong if aln.qb < 0, or if aln.qe runs past the read
                 b.rid = a->rid;
                 b.is_alt = a->is_alt;
                 /* D3 (--meth): record the rescued mate's genome-strand hypothesis
@@ -1737,7 +1737,7 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                 aln = *(*myaln + index);
 
             memset(&b, 0, sizeof(mem_alnreg_t));
-            if (aln.score >= opt->min_seed_len && aln.qb >= 0) { // something goes wrong if aln.qb < 0
+            if (aln.score >= opt->min_seed_len && aln.qb >= 0 && aln.qe < l_ms) { // something goes wrong if aln.qb < 0, or if aln.qe runs past the read
                 b.rid = a->rid;
                 b.is_alt = a->is_alt;
                 /* D3 (--meth): rescued mate hypothesis = the mate's own read#
