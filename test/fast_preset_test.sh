@@ -52,11 +52,12 @@ line="$(fast_line --fast)"
    && "$line" == *"--skip-contained-ext"* \
    && "$line" == *"--max-extend-chains 20"* \
    && "$line" == *"--adaptive-band"* \
-   && "$line" == *"--extend-mate-concordant"* ]] \
+   && "$line" == *"--extend-mate-concordant"* \
+   && "$line" == *"alnreg-sort=fast"* ]] \
     || { echo "FAIL: --fast bundle wrong: '$line'" >&2; exit 1; }
 [[ "$line" != *"-s "* ]] \
     || { echo "FAIL: non-meth --fast must not set -s: '$line'" >&2; exit 1; }
-echo "OK:   --fast bundle resolves -m 10 -y 0 --min-ext-len 30 --smem-dedup --skip-contained-ext --max-extend-chains 20 --adaptive-band --extend-mate-concordant (no -s)"
+echo "OK:   --fast bundle resolves -m 10 -y 0 --min-ext-len 30 --smem-dedup --skip-contained-ext --max-extend-chains 20 --adaptive-band --extend-mate-concordant alnreg-sort=fast (no -s)"
 
 # 2. Override precedence: an explicit flag wins *only* for its own field; the
 #    rest of the preset (including the unconditional --smem-dedup) must survive.
@@ -65,21 +66,24 @@ line="$(fast_line --fast -m 30)"
    && "$line" == *"--min-ext-len 30"* && "$line" == *"--smem-dedup"* \
    && "$line" == *"--skip-contained-ext"* \
    && "$line" == *"--max-extend-chains 20"* \
-   && "$line" == *"--adaptive-band"* && "$line" == *"--extend-mate-concordant"* ]] \
+   && "$line" == *"--adaptive-band"* && "$line" == *"--extend-mate-concordant"* \
+   && "$line" == *"alnreg-sort=fast"* ]] \
     || { echo "FAIL: explicit -m 30 should only override -m: '$line'" >&2; exit 1; }
 line="$(fast_line --fast -y 5)"
 [[ "$line" == *"-m 10"* && "$line" == *"-y 5"* \
    && "$line" == *"--min-ext-len 30"* && "$line" == *"--smem-dedup"* \
    && "$line" == *"--skip-contained-ext"* \
    && "$line" == *"--max-extend-chains 20"* \
-   && "$line" == *"--adaptive-band"* && "$line" == *"--extend-mate-concordant"* ]] \
+   && "$line" == *"--adaptive-band"* && "$line" == *"--extend-mate-concordant"* \
+   && "$line" == *"alnreg-sort=fast"* ]] \
     || { echo "FAIL: explicit -y 5 should only override -y: '$line'" >&2; exit 1; }
 line="$(fast_line --fast --min-ext-len 45)"
 [[ "$line" == *"-m 10"* && "$line" == *"-y 0"* \
    && "$line" == *"--min-ext-len 45"* && "$line" == *"--smem-dedup"* \
    && "$line" == *"--skip-contained-ext"* \
    && "$line" == *"--max-extend-chains 20"* \
-   && "$line" == *"--adaptive-band"* && "$line" == *"--extend-mate-concordant"* ]] \
+   && "$line" == *"--adaptive-band"* && "$line" == *"--extend-mate-concordant"* \
+   && "$line" == *"alnreg-sort=fast"* ]] \
     || { echo "FAIL: explicit --min-ext-len 45 should only override min-ext-len: '$line'" >&2; exit 1; }
 # --max-extend-chains is overridable under --fast (respects an explicit value).
 line="$(fast_line --fast --max-extend-chains 8)"
@@ -87,9 +91,10 @@ line="$(fast_line --fast --max-extend-chains 8)"
    && "$line" == *"--min-ext-len 30"* && "$line" == *"--smem-dedup"* \
    && "$line" == *"--skip-contained-ext"* \
    && "$line" == *"--max-extend-chains 8"* \
-   && "$line" == *"--adaptive-band"* && "$line" == *"--extend-mate-concordant"* ]] \
+   && "$line" == *"--adaptive-band"* && "$line" == *"--extend-mate-concordant"* \
+   && "$line" == *"alnreg-sort=fast"* ]] \
     || { echo "FAIL: explicit --max-extend-chains 8 should only override that lever: '$line'" >&2; exit 1; }
-echo "OK:   explicit -m/-y/--min-ext-len/--max-extend-chains override only their field; rest of preset (--adaptive-band, --extend-mate-concordant, ...) survives"
+echo "OK:   explicit -m/-y/--min-ext-len/--max-extend-chains override only their field; rest of preset (--adaptive-band, --extend-mate-concordant, alnreg-sort=fast, ...) survives"
 
 # 3. Default contract: no --fast => no audit line at all.
 "$bin" mem "$ref" "$reads" >/dev/null 2>"$err" || { echo "FAIL: plain mem nonzero" >&2; exit 1; }
@@ -112,7 +117,10 @@ if "$bin" index --meth "$mdir/ref.fa" >/dev/null 2>&1; then
         || { echo "FAIL: --max-extend-chains applies under --meth (cap 10); must be in audit line: '$line'" >&2; exit 1; }
     [[ "$line" == *"--extend-mate-concordant"* ]] \
         || { echo "FAIL: --fast --meth must enable --extend-mate-concordant: '$line'" >&2; exit 1; }
-    echo "OK:   --fast --meth additionally sets -s 2 and --extend-mate-concordant (skip-contained-ext omitted meth-gated, --max-extend-chains raised to 10)"
+    # The dedup-sort lever is not meth-gated; it must be reported under --meth too.
+    [[ "$line" == *"alnreg-sort=fast"* ]] \
+        || { echo "FAIL: --fast --meth must enable alnreg-sort=fast: '$line'" >&2; exit 1; }
+    echo "OK:   --fast --meth additionally sets -s 2, --extend-mate-concordant and alnreg-sort=fast (skip-contained-ext omitted meth-gated, --max-extend-chains raised to 10)"
     # Explicit -s wins even under --meth (src/fastmap.cpp: -s 2 is gated on !opt0.split_width).
     "$bin" mem --meth --fast -s 7 -t 1 "$mdir/ref.fa" "$reads" >/dev/null 2>"$err" \
         || { echo "FAIL: mem --meth --fast -s 7 nonzero" >&2; cat "$err" >&2; exit 1; }

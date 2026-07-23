@@ -369,6 +369,20 @@ mate-concordant chain the cap would otherwise drop — and is included for both 
 `--fast` (see
 [Settings profiles → `--extend-mate-concordant`](../best-practices/settings-profiles.md#mate-concordant-chain-retention---extend-mate-concordant)).
 
+`--fast` also flips one lever that has **no flag of its own**: the sort that orders alignment
+regions by reference end position before the order-sensitive dedup/patch pass. The default
+build uses bwa-mem2's comparator — a partial order on the end position alone — under the same
+unstable introsort bwa-mem2 uses, which reproduces upstream's dedup outcome exactly. `--fast`
+switches to a strict total order (end position, then start, score and query start) under
+pdqsort, which is measurably faster and can resolve equal-end-position ties
+differently. The two orderings only diverge when the strict order's deterministic result differs
+from the permutation the unstable sort happens to leave; because bwa-mem2's output is defined by
+that permutation, a strict total order and exact bwa-mem2 parity cannot both hold in general. The
+effect is confined to reads carrying several regions that end
+at the same reference base, and it surfaces as different `XS`/MAPQ and occasionally a different
+primary or supplementary record. Runs report the lever as `alnreg-sort=fast` on the audit line
+below.
+
 Under `--meth` it additionally sets `-s 2` (light Pass-2 re-seeding) and lowers the chain cap to `10`.
 Earlier releases used `-s 0` (no re-seed), which inflated
 MAPQ on bisulfite reads; `-s 2` recovers the MAPQ/placement at nearly the same speed

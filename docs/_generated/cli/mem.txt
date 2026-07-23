@@ -27,6 +27,9 @@ Options:
                   -s 2). Opt-in; explicit
                   flags override where applicable; --smem-dedup,
                   --skip-contained-ext and --adaptive-band are always enabled.
+                  Also switches the alignment-region dedup sort to a strict
+                  total order (faster, but resolves equal-end-position ties
+                  differently from bwa-mem2, which the default reproduces).
                   NOT byte-identical to the default (divergence confined to the
                   low-confidence tail).
 Scoring options:
