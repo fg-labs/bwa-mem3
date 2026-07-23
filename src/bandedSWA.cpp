@@ -345,18 +345,21 @@ int BandedPairWiseSW::scalarBandedSWA(int qlen, const uint8_t *query,
             h1 = h;             // save H(i,j) to h1 for the next column
             mj = m > h? mj : j; // record the position where max score is achieved
             m = m > h? m : h;   // m is stored at eh[mj+1]
-            // gap-from-H (standard Gotoh): gap-open is subtracted from the cell
-            // max H(i,j)=h, not the diagonal-only M. This matches ksw2/minimap2
-            // and is the convention the int8 delta recurrence requires. The final
-            // reported CIGAR/score still come from ksw_global2 (gap-from-M), so
-            // alignment output is unchanged; this only governs the extension
-            // boundary scorer. See FINDINGS-delta-recurrence.md (task #16).
-            t = h - oe_del;
+            // gap-from-M (bwa/bwa-mem2 convention): gap-open is subtracted from
+            // the diagonal-only M, not the cell max H. This is deliberate --
+            // "separating H and M to disallow a cigar like 100M3I3D20M" -- and it
+            // is what upstream ksw_extend2 and bwa-mem2's bandedSWA do, so it is
+            // required for bwa-mem2 output compatibility. (ksw2/minimap2 use
+            // gap-from-H; the mate-rescue kernels in ksw.cpp/kswv.cpp keep
+            // gap-from-H because that is what bwa's own ksw_u8/ksw_i16 do. The two
+            // conventions are intentionally NOT unified.) See PR #141 and its
+            // revert for the int8-delta-recurrence history.
+            t = M - oe_del;
             t = t > 0? t : 0;
             e -= e_del;
             e = e > t? e : t;   // computed E(i+1,j)
             p->e = e;           // save E(i+1,j) for the next row
-            t = h - oe_ins;
+            t = M - oe_ins;
             t = t > 0? t : 0;
             f -= e_ins;
             f = f > t? f : t;   // computed F(i,j+1)
@@ -513,10 +516,10 @@ void BandedPairWiseSW::scalarBandedSWAWrapper(SeqPair *seqPairArray,
         h11 = _mm256_max_epu8(m11, e11);                                \
         h11 = _mm256_max_epu8(h11, f11);                                \
         /* gap-open from H (standard Gotoh), unsigned-saturating */      \
-        __m256i temp256 = _mm256_subs_epu8(h11, oe_ins256);            \
+        __m256i temp256 = _mm256_subs_epu8(m11, oe_ins256);            \
         e11 = _mm256_subs_epu8(e11, e_ins256);                          \
         e11 = _mm256_max_epu8(temp256, e11);                            \
-        temp256 = _mm256_subs_epu8(h11, oe_del256);                    \
+        temp256 = _mm256_subs_epu8(m11, oe_del256);                    \
         f21 = _mm256_subs_epu8(f11, e_del256);                          \
         f21 = _mm256_max_epu8(temp256, f21);                            \
     }
@@ -569,10 +572,10 @@ void BandedPairWiseSW::scalarBandedSWAWrapper(SeqPair *seqPairArray,
         /* max(x - open, 0) == subs_epu16(x, open): scores are non-negative and \
          * < 32768, so unsigned-saturating sub matches the signed sub + zero  \
          * floor (brings the u16 core to parity with the u8 core's subs_epu8). */ \
-        __m256i val256 = _mm256_subs_epu16(h11, oe_ins256);            \
+        __m256i val256 = _mm256_subs_epu16(m11, oe_ins256);            \
         e11 = _mm256_sub_epi16(e11, e_ins256);                          \
         e11 = _mm256_max_epi16(val256, e11);                            \
-        val256 = _mm256_subs_epu16(h11, oe_del256);                    \
+        val256 = _mm256_subs_epu16(m11, oe_del256);                    \
         f21 = _mm256_sub_epi16(f11, e_del256);                          \
         f21 = _mm256_max_epi16(val256, f21);                            \
     }
@@ -2451,10 +2454,10 @@ void BandedPairWiseSW::smithWaterman256_16(uint16_t seq1SoA[],
         h11 = _mm512_max_epu8(m11, e11);                                \
         h11 = _mm512_max_epu8(h11, f11);                                \
         /* gap-open from H (standard Gotoh), unsigned-saturating */      \
-        __m512i temp512 = _mm512_subs_epu8(h11, oe_ins512);            \
+        __m512i temp512 = _mm512_subs_epu8(m11, oe_ins512);            \
         e11 = _mm512_subs_epu8(e11, e_ins512);                          \
         e11 = _mm512_max_epu8(temp512, e11);                            \
-        temp512 = _mm512_subs_epu8(h11, oe_del512);                    \
+        temp512 = _mm512_subs_epu8(m11, oe_del512);                    \
         f21 = _mm512_subs_epu8(f11, e_del512);                          \
         f21 = _mm512_max_epu8(temp512, f21);                            \
     }
@@ -2520,10 +2523,10 @@ void BandedPairWiseSW::smithWaterman256_16(uint16_t seq1SoA[],
         /* max(x - open, 0) == subs_epu16(x, open): scores are non-negative and \
          * < 32768, so unsigned-saturating sub matches the signed sub + zero  \
          * floor (brings the u16 core to parity with the u8 core's subs_epu8). */ \
-        __m512i val512 = _mm512_subs_epu16(h11, oe_ins512);            \
+        __m512i val512 = _mm512_subs_epu16(m11, oe_ins512);            \
         e11 = _mm512_sub_epi16(e11, e_ins512);                          \
         e11 = _mm512_max_epi16(val512, e11);                            \
-        val512 = _mm512_subs_epu16(h11, oe_del512);                    \
+        val512 = _mm512_subs_epu16(m11, oe_del512);                    \
         f21 = _mm512_sub_epi16(f11, e_del512);                          \
         f21 = _mm512_max_epi16(val512, f21);                            \
     }
@@ -4382,15 +4385,13 @@ _mm_blendv_epi16(__m128i x, __m128i y, __m128i mask)
         m11 = _mm_blendv_epi16(m11, zero128, cmp11);                    \
         h11 = _mm_max_epi16(m11, e11);                                  \
         h11 = _mm_max_epi16(h11, f11);                                  \
-        /* Reassociate gap recurrences off h11 (variant B, signed; keep   \
-         * the existing max(.,0) floor). me reads OLD e11. */              \
-        __m128i mf128 = _mm_max_epi16(m11, f11);                        \
-        __m128i me128 = _mm_max_epi16(m11, e11);                        \
-        __m128i temp128 = _mm_sub_epi16(mf128, oe_ins128);             \
+        /* Gaps open from m11 (bwa-mem2 convention), not h11: m11 does not \
+         * depend on the carried f, so this recurrence is naturally short. */ \
+        __m128i temp128 = _mm_sub_epi16(m11, oe_ins128);                \
         __m128i val128  = _mm_max_epi16(temp128, zero128);              \
         e11 = _mm_sub_epi16(e11, e_ins128);                             \
         e11 = _mm_max_epi16(val128, e11);                               \
-        temp128 = _mm_sub_epi16(me128, oe_del128);                     \
+        temp128 = _mm_sub_epi16(m11, oe_del128);                        \
         val128  = _mm_max_epi16(temp128, zero128);                      \
         f21 = _mm_sub_epi16(f11, e_del128);                             \
         f21 = _mm_max_epi16(val128, f21);                              \
@@ -5250,14 +5251,12 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
         m11 = _mm_blendv_epi8(m11, zero128, cmp11);  /* h00==0 -> local restart */ \
         h11 = _mm_max_epu8(m11, e11);                                   \
         h11 = _mm_max_epu8(h11, f11);                                   \
-        /* Reassociate gap recurrences off h11 (variant A, saturating u8). \
-         * me reads OLD e11 — compute before the e-update. */               \
-        __m128i mf128 = _mm_max_epu8(m11, f11);                         \
-        __m128i me128 = _mm_max_epu8(m11, e11);                         \
-        __m128i temp128 = _mm_subs_epu8(mf128, oe_ins128);             \
+        /* Gaps open from m11 (bwa-mem2 convention), not h11: m11 does not \
+         * depend on the carried f, so this recurrence is naturally short. */ \
+        __m128i temp128 = _mm_subs_epu8(m11, oe_ins128);                \
         e11 = _mm_subs_epu8(e11, e_ins128);                            \
         e11 = _mm_max_epu8(temp128, e11);                               \
-        temp128 = _mm_subs_epu8(me128, oe_del128);                     \
+        temp128 = _mm_subs_epu8(m11, oe_del128);                        \
         f21 = _mm_subs_epu8(f11, e_del128);                            \
         f21 = _mm_max_epu8(temp128, f21);                               \
     }
