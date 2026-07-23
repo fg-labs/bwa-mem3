@@ -252,3 +252,141 @@ TEST_CASE("distinct-score redundant regions: the best scoring one wins in both m
     CHECK(rbs(dedup(in, 0)) == std::vector<int64_t>(1, best_rb));
     CHECK(rbs(dedup(in, 1)) == std::vector<int64_t>(1, best_rb));
 }
+
+// ---------------------------------------------------------------------------
+// The tie-free fast path must be invisible
+// ---------------------------------------------------------------------------
+//
+// In the default mode each of mem_sort_dedup_patch's two sorts runs pdqsort
+// whenever the sorted array has no tied adjacent pair -- the ordering is then
+// unique, so every correct comparison sort agrees -- and otherwise restores the
+// input and runs ks_introsort over it. Both regimes have to be indistinguishable
+// from running ks_introsort unconditionally. That is the whole correctness
+// claim, so it is asserted directly on the sorts rather than inferred from the
+// dedup output.
+
+// src/bwamem.cpp: each fast path and the exact introsort it must reproduce.
+extern void bwamem3_dedup_sort_by_re(int n, mem_alnreg_t *a);
+extern void bwamem3_dedup_sort_by_re_exact(int n, mem_alnreg_t *a);
+extern void bwamem3_dedup_sort_by_score(int n, mem_alnreg_t *a);
+extern void bwamem3_dedup_sort_by_score_exact(int n, mem_alnreg_t *a);
+
+namespace {
+
+// Deterministic 64-bit LCG. std::rand would make the fixtures platform-defined.
+struct Rng {
+    uint64_t s;  // LCG state; seeded per test so every fixture is reproducible.
+    explicit Rng(uint64_t seed) : s(seed) {}
+    // Advances the state and returns the high bits, whose period is the long one.
+    uint64_t next() { s = s * 6364136223846793005ULL + 1442695040888963407ULL; return s >> 11; }
+    // A draw from the inclusive range [lo, hi]; the modulo bias is irrelevant here.
+    int in(int lo, int hi) { return lo + static_cast<int>(next() % static_cast<uint64_t>(hi - lo + 1)); }
+};
+
+// `n` regions on one reference. re_pool > 0 draws the reference end from that
+// many slots, so equal-`re` ties (the fallback) are common; re_pool == 0 gives
+// every region a distinct end, so the `re` sort is tie-free (the fast path).
+// Scores are drawn from a small range so the closing sort sees ties too.
+std::vector<mem_alnreg_t> random_regs(Rng &rng, int n, int re_pool) {
+    std::vector<int64_t> ends;
+    for (int i = 0; i < n; ++i)
+        ends.push_back(1000 + 37 * (re_pool > 0 ? rng.in(0, re_pool - 1) : i));
+    for (int i = n - 1; i > 0; --i) std::swap(ends[i], ends[rng.in(0, i)]);  // shuffle
+
+    std::vector<mem_alnreg_t> v;
+    for (int i = 0; i < n; ++i) {
+        const int len = rng.in(20, 150);
+        const int qb = rng.in(0, 150 - len);
+        v.push_back(reg(ends[i] - len, ends[i], qb, qb + len, rng.in(1, 12)));
+    }
+    return v;
+}
+
+// Byte-identity over the whole record, not just the sort key: the fast path has
+// to reproduce introsort's *permutation*, so two arrays that merely compare equal
+// under the comparator are not good enough.
+bool same_records(const std::vector<mem_alnreg_t> &x, const std::vector<mem_alnreg_t> &y) {
+    if (x.size() != y.size()) return false;
+    for (size_t i = 0; i < x.size(); ++i)
+        if (memcmp(&x[i], &y[i], sizeof(mem_alnreg_t)) != 0) return false;
+    return true;
+}
+
+// Sort one fixture both ways and report whether they agree; `tied` reports
+// whether the sorted array actually contained a tie, so a test can prove it
+// exercised the fallback instead of passing vacuously.
+typedef void (*sort_fn)(int, mem_alnreg_t *);
+bool agrees(const std::vector<mem_alnreg_t> &in, sort_fn fast, sort_fn exact,
+            bool (*tied)(const mem_alnreg_t &, const mem_alnreg_t &), bool *saw_tie) {
+    std::vector<mem_alnreg_t> f(in), e(in);
+    fast(static_cast<int>(f.size()), f.data());
+    exact(static_cast<int>(e.size()), e.data());
+    for (size_t i = 1; i < e.size(); ++i)
+        if (tied(e[i - 1], e[i])) { *saw_tie = true; break; }
+    return same_records(f, e);
+}
+
+// The two `tied` predicates `agrees` takes: each says when its comparator ranks
+// the pair equally, i.e. when the fast path's tie scan would fire.
+
+// alnreg_slt2_m2 orders on `re` alone, so equal ends are a tie.
+bool tied_by_re(const mem_alnreg_t &x, const mem_alnreg_t &y) { return x.re == y.re; }
+// alnreg_slt breaks score ties on (rb, qb), so all three must match.
+bool tied_by_score(const mem_alnreg_t &x, const mem_alnreg_t &y) {
+    return x.score == y.score && x.rb == y.rb && x.qb == y.qb;
+}
+
+}  // namespace
+
+TEST_CASE("the `re` fast path is byte-identical to unconditional ks_introsort"
+          * doctest::test_suite("unit/alnreg_sort_dedup")) {
+    const int TRIALS = 150;
+
+    SUBCASE("tie-free arrays (the pdqsort path itself)") {
+        Rng rng(0x51ed0001ULL);
+        bool saw_tie = false;
+        for (int t = 0; t < TRIALS; ++t) {
+            // n spans both sides of the n >= 9 gate.
+            CHECK(agrees(random_regs(rng, 1 + t, 0), bwamem3_dedup_sort_by_re,
+                         bwamem3_dedup_sort_by_re_exact, tied_by_re, &saw_tie));
+        }
+        CHECK_FALSE(saw_tie);  // distinct ends by construction
+    }
+
+    SUBCASE("tie-heavy arrays (the restore-and-introsort fallback)") {
+        Rng rng(0x51ed0002ULL);
+        bool saw_tie = false;
+        for (int t = 0; t < TRIALS; ++t) {
+            CHECK(agrees(random_regs(rng, 1 + t, 3), bwamem3_dedup_sort_by_re,
+                         bwamem3_dedup_sort_by_re_exact, tied_by_re, &saw_tie));
+        }
+        CHECK(saw_tie);  // guards against a vacuous pass
+    }
+
+    SUBCASE("mixed arrays") {
+        Rng rng(0x51ed0003ULL);
+        bool saw_tie = false;
+        for (int t = 0; t < TRIALS; ++t) {
+            const int n = 1 + t;
+            CHECK(agrees(random_regs(rng, n, n / 2 + 1), bwamem3_dedup_sort_by_re,
+                         bwamem3_dedup_sort_by_re_exact, tied_by_re, &saw_tie));
+        }
+        CHECK(saw_tie);
+    }
+}
+
+TEST_CASE("the by-score fast path is byte-identical to unconditional ks_introsort"
+          * doctest::test_suite("unit/alnreg_sort_dedup")) {
+    // Real inputs never tie here -- two survivors cannot share (rb, qb) -- but
+    // the fast path must not depend on that, so feed it ties anyway. Duplicated
+    // regions give equal (score, rb, qb).
+    Rng rng(0x51ed0004ULL);
+    bool saw_tie = false;
+    for (int t = 0; t < 150; ++t) {
+        std::vector<mem_alnreg_t> in = random_regs(rng, 1 + t, 4);
+        for (size_t i = 1; i < in.size(); i += 3) in[i] = in[i - 1];  // force exact duplicates
+        CHECK(agrees(in, bwamem3_dedup_sort_by_score,
+                     bwamem3_dedup_sort_by_score_exact, tied_by_score, &saw_tie));
+    }
+    CHECK(saw_tie);
+}
