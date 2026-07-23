@@ -371,17 +371,24 @@ mate-concordant chain the cap would otherwise drop — and is included for both 
 
 `--fast` also flips one lever that has **no flag of its own**: the sort that orders alignment
 regions by reference end position before the order-sensitive dedup/patch pass. The default
-build uses bwa-mem2's comparator — a partial order on the end position alone — under the same
-unstable introsort bwa-mem2 uses, which reproduces upstream's dedup outcome exactly. `--fast`
-switches to a strict total order (end position, then start, score and query start) under
-pdqsort, which is measurably faster and can resolve equal-end-position ties
-differently. The two orderings only diverge when the strict order's deterministic result differs
-from the permutation the unstable sort happens to leave; because bwa-mem2's output is defined by
-that permutation, a strict total order and exact bwa-mem2 parity cannot both hold in general. The
+build uses bwa-mem2's comparator — a partial order on the end position alone — and reproduces the
+permutation bwa-mem2's unstable introsort leaves, and so its dedup outcome, exactly. `--fast`
+switches to a strict total order (end position, then start, score and query start) under pdqsort,
+which can resolve equal-end-position ties differently. The two orderings only diverge when the
+strict order's deterministic result differs from the permutation that unstable sort leaves;
+because bwa-mem2's output is defined by that permutation, a strict total order and exact
+bwa-mem2 parity cannot both hold in general. The
 effect is confined to reads carrying several regions that end
 at the same reference base, and it surfaces as different `XS`/MAPQ and occasionally a different
 primary or supplementary record. Runs report the lever as `alnreg-sort=fast` on the audit line
 below.
+
+The lever is no longer worth much speed. The default path only needs the unstable introsort when
+the comparator actually sees a tie — with no tie the ordering is unique, so pdqsort's result is
+what introsort would have produced — and ties occur on under 1% of calls. Detecting them costs a
+save-copy and a linear scan, which leaves the bwa-mem2-compatible default within ~0.7% of the
+strict-total-order path on 5M HG00096 WGS pairs (arm64/NEON, `-t 16`, 5 interleaved reps), at or
+below this benchmark's run-to-run spread.
 
 Under `--meth` it additionally sets `-s 2` (light Pass-2 re-seeding) and lowers the chain cap to `10`.
 Earlier releases used `-s 0` (no re-seed), which inflated

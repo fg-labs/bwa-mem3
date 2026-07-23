@@ -449,9 +449,100 @@ KSORT_INIT(mem_ars2_m2, mem_alnreg_t, alnreg_slt2_m2)
 KSORT_INIT(mem_ars2, mem_alnreg_t, alnreg_slt2)
 PDQSORT_INIT(mem_ars2, mem_alnreg_t, alnreg_slt2)
 
+PDQSORT_INIT(mem_ars2_m2, mem_alnreg_t, alnreg_slt2_m2)
+
 #define alnreg_slt(a, b) ((a).score > (b).score || ((a).score == (b).score && ((a).rb < (b).rb || ((a).rb == (b).rb && (a).qb < (b).qb))))
 KSORT_INIT(mem_ars, mem_alnreg_t, alnreg_slt)
 PDQSORT_INIT(mem_ars, mem_alnreg_t, alnreg_slt)
+
+/*----------------------------------------------------------------------------
+ * Tie-free fast path for the default (bwa-mem2-compatible) dedup sorts.
+ *
+ * Under alnreg_sort_fast == 0 the surviving alnreg set is defined by the
+ * *permutation* klib's unstable introsort happens to produce, so substituting a
+ * faster sort changes which regions survive -- but only when the comparator
+ * actually sees a tie. With no tied pair the sorted sequence is unique, so
+ * pdqsort's result is bit-for-bit what introsort would have produced and the
+ * substitution is free. Ties are therefore detected, not avoided.
+ *
+ * Ties are rare. Instrumented over 2.32M calls / 186M regions (533,334 HG00096
+ * WGS pairs, -t 16): the `re` sort ties on 0.98% of calls and the closing
+ * by-score sort on 0 of them -- two survivors cannot share (rb, qb), see the
+ * comment at the end of mem_sort_dedup_patch. So ~99% of calls get pdqsort and
+ * the rest pay pdqsort plus a restore plus introsort.
+ *
+ * Saving the input first is what makes the fallback exact: ks_introsort is
+ * input-order-dependent, so running it on the pdqsort-permuted array would give
+ * a different permutation -- and a different SAM -- than bwa-mem2.
+ *--------------------------------------------------------------------------*/
+
+/* Below ~9 elements pdqsort wins nothing: on the alnreg microbench
+ * (reports/2026-07-12-dedup-sort-benchmark-arm64.md, 2-8 bucket) klib's introsort
+ * leads on the `re` sort (127.4 vs 119.0 Mcell/s) and ties it on the by-score
+ * sort (130.8 vs 130.1). Short arrays are ~46% of calls, so the save-copy is not
+ * worth paying there for either. */
+#define DEDUP_SORT_PDQ_MIN 9
+
+/* Per-thread save buffer, grown geometrically and released at thread exit. Held
+ * as bytes so it can reuse the u8vec scratch holder; realloc returns storage
+ * suitably aligned for mem_alnreg_t. Returns NULL only if the allocation fails,
+ * in which case the caller takes the exact (introsort) path. */
+static inline mem_alnreg_t *alnreg_save_buf(int n)
+{
+    static thread_local u8vec_scratch_t save;
+    const size_t want = (size_t)n * sizeof(mem_alnreg_t);
+    if (save.v.m < want) {
+        size_t cap = save.v.m * 2;
+        if (cap < want) cap = want;
+        uint8_t *p = (uint8_t *)realloc(save.v.a, cap);
+        if (p == NULL) return NULL;   /* keep the existing buffer intact */
+        save.v.a = p;
+        save.v.m = cap;
+    }
+    return (mem_alnreg_t *)save.v.a;
+}
+
+/* Emit `static void fn(int n, mem_alnreg_t *a)` that sorts `a` exactly as
+ * ks_introsort(name, n, a) would, but via pdqsort_##name whenever `lt` sees no
+ * tie. `lt` must be the comparator KSORT_INIT and PDQSORT_INIT were given. */
+#define DEDUP_TIE_SORT_INIT(fn, name, lt)                                        \
+    static void fn(int n, mem_alnreg_t *a)                                       \
+    {                                                                            \
+        mem_alnreg_t *save;                                                      \
+        if (n < DEDUP_SORT_PDQ_MIN || (save = alnreg_save_buf(n)) == NULL) {     \
+            ks_introsort(name, n, a);                                            \
+            return;                                                              \
+        }                                                                        \
+        memcpy(save, a, (size_t)n * sizeof(*a));                                 \
+        pdqsort_##name(n, a);                                                    \
+        for (int i = 1; i < n; ++i) {                                            \
+            /* `a` is sorted, so !lt(a[i-1], a[i]) means the pair is tied. */    \
+            if (!lt(a[i - 1], a[i])) {                                           \
+                memcpy(a, save, (size_t)n * sizeof(*a));                         \
+                ks_introsort(name, n, a);                                        \
+                return;                                                          \
+            }                                                                    \
+        }                                                                        \
+    }
+
+DEDUP_TIE_SORT_INIT(dedup_sort_by_re,    mem_ars2_m2, alnreg_slt2_m2)
+DEDUP_TIE_SORT_INIT(dedup_sort_by_score, mem_ars,     alnreg_slt)
+
+/* Exposed for test/unit/test_alnreg_sort_dedup.cpp, which asserts each fast path
+ * against the introsort it claims to reproduce, array for array. Thin enough not
+ * to perturb the call sites above, which still call the static helpers. Each
+ * takes the region count `n` and the array `a`, sorted in place. */
+
+/* The `re` sort as mem_sort_dedup_patch runs it by default: pdqsort, or restore
+ * plus introsort on a tie. */
+void bwamem3_dedup_sort_by_re(int n, mem_alnreg_t *a)          { dedup_sort_by_re(n, a); }
+/* The `re` sort bwa-mem2 runs: klib introsort, unconditionally. The oracle the
+ * fast path above must match record for record. */
+void bwamem3_dedup_sort_by_re_exact(int n, mem_alnreg_t *a)    { ks_introsort(mem_ars2_m2, n, a); }
+/* The closing by-score sort as mem_sort_dedup_patch runs it by default. */
+void bwamem3_dedup_sort_by_score(int n, mem_alnreg_t *a)       { dedup_sort_by_score(n, a); }
+/* The closing by-score sort bwa-mem2 runs, i.e. the oracle for the above. */
+void bwamem3_dedup_sort_by_score_exact(int n, mem_alnreg_t *a) { ks_introsort(mem_ars, n, a); }
 
 #define alnreg_hlt(a, b)  ((a).score > (b).score || ((a).score == (b).score && ((a).is_alt < (b).is_alt || ((a).is_alt == (b).is_alt && (a).hash < (b).hash))))
 KSORT_INIT(mem_ars_hash, mem_alnreg_t, alnreg_hlt)
@@ -606,11 +697,13 @@ int mem_sort_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns,
     if (mat == NULL) mat = opt->mat;
     int m, i, j;
     if (n <= 1) return n;
-    /* Default: bwa-mem2's re-only comparator + klib introsort, reproducing
-     * upstream's dedup outcome. --fast: strict total order + pdqsort, which is
-     * ~35-55% faster for n>=9 but resolves equal-`re` ties differently. */
+    /* Default: bwa-mem2's re-only comparator, ordered exactly as klib introsort
+     * would order it -- dedup_sort_by_re runs pdqsort and restores-and-introsorts
+     * only on a tie -- reproducing upstream's dedup outcome. --fast: strict total
+     * order + pdqsort unconditionally, which skips the save-copy and the tie scan
+     * but resolves equal-`re` ties differently. */
     if (opt->alnreg_sort_fast) pdqsort_mem_ars2(n, a);       // sort by the END position, not START!
-    else                       ks_introsort(mem_ars2_m2, n, a);
+    else                       dedup_sort_by_re(n, a);
 
     for (i = 0; i < n; ++i) a[i].n_comp = 1;
     for (i = 1; i < n; ++i)
@@ -655,7 +748,7 @@ int mem_sort_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns,
         }
     n = m;
     if (opt->alnreg_sort_fast) pdqsort_mem_ars(n, a);
-    else                       ks_introsort(mem_ars, n, a);
+    else                       dedup_sort_by_score(n, a);
     /* The historical post-sort exact-duplicate passes (mark then exclude regions
      * sharing (score, rb, qb)) have been removed: they are provably dead. Any two
      * regions with equal (rb, qb) have the shorter fully contained in the longer,
