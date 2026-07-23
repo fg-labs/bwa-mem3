@@ -1,5 +1,50 @@
 # Changelog
 
+## [0.7.0](https://github.com/fg-labs/bwa-mem3/compare/v0.6.0...v0.7.0) (2026-07-23)
+
+
+### Features
+
+* **bsw:** add BWAMEM3_DUMP_PAIRS to observe extension pairs ([#239](https://github.com/fg-labs/bwa-mem3/issues/239)) ([c4d7480](https://github.com/fg-labs/bwa-mem3/commit/c4d748084e4d844e1448f3c7f7b0c5039f9d8406))
+* **meth:** add --meth=taps for TAPS methylation chemistry ([#228](https://github.com/fg-labs/bwa-mem3/issues/228)) ([0b8163d](https://github.com/fg-labs/bwa-mem3/commit/0b8163d2632bd168d2848617858176ac9ce5c127))
+* **meth:** drop cross-chemistry seeds by read number ([#225](https://github.com/fg-labs/bwa-mem3/issues/225)) ([6e21a37](https://github.com/fg-labs/bwa-mem3/commit/6e21a37e40e0013916863673622b01fd694dbf58))
+* **meth:** NEUTRAL --meth-scoring (TAPS default) + batched kswv rescue ([#243](https://github.com/fg-labs/bwa-mem3/issues/243)) ([f36dc5a](https://github.com/fg-labs/bwa-mem3/commit/f36dc5a05e820985ed3f9f802f5a88840c3ea978))
+
+
+### Bug Fixes
+
+* **ext:** tighten ungapped fast-path mismatch bound to the strict form ([#231](https://github.com/fg-labs/bwa-mem3/issues/231)) ([5c53540](https://github.com/fg-labs/bwa-mem3/commit/5c5354042b2036882fa8840b3ad62a78f7eed853))
+* **fast:** enable --extend-mate-concordant and raise chain cap to 20 for non-meth --fast ([#218](https://github.com/fg-labs/bwa-mem3/issues/218)) ([50a3293](https://github.com/fg-labs/bwa-mem3/commit/50a329390753e77640449eafa564ecf13ade6ec3))
+* **mem:** guard extension-buffer growth against int32 offset overflow ([#237](https://github.com/fg-labs/bwa-mem3/issues/237)) ([6acd6b4](https://github.com/fg-labs/bwa-mem3/commit/6acd6b43d4d1712b71f9244f85addc3ca8cd920b))
+* **mem:** size sa_coord realloc in elements, not SMEM count ([#235](https://github.com/fg-labs/bwa-mem3/issues/235)) ([7fa501c](https://github.com/fg-labs/bwa-mem3/commit/7fa501c1a6e67d419b1a216f5c8b282385d518c6))
+* **meth:** recover repeat placement via both-hypothesis mate rescue + PE MAPQ hardening ([#219](https://github.com/fg-labs/bwa-mem3/issues/219)) ([6705bbf](https://github.com/fg-labs/bwa-mem3/commit/6705bbfa89c2ab40f4fb81f2f6a6a9518c1cf35c))
+* **meth:** scale --meth scoring defaults with the match score ([#227](https://github.com/fg-labs/bwa-mem3/issues/227)) ([9811767](https://github.com/fg-labs/bwa-mem3/commit/98117672a6bd0780a9a39ef8b4e50b4f1a6a539e))
+
+
+### Performance
+
+* **bandedSWA:** fewer ops in the AVX2/AVX-512 extend cores (x86-only) ([#255](https://github.com/fg-labs/bwa-mem3/issues/255)) ([d52842f](https://github.com/fg-labs/bwa-mem3/commit/d52842feef5b8c7cb6137e552c02c2234ddd206c))
+* **bsw:** 128-bit (SSE/NEON) 16-bit prepass via byte-LUT + sign-extend ([#223](https://github.com/fg-labs/bwa-mem3/issues/223)) ([239a334](https://github.com/fg-labs/bwa-mem3/commit/239a334b0d6dcbc60ee4e76076353ea79e342479))
+* **bsw:** AVX-512 16-bit prepass via 32-entry permutexvar LUT ([#222](https://github.com/fg-labs/bwa-mem3/issues/222)) ([0e8c0b6](https://github.com/fg-labs/bwa-mem3/commit/0e8c0b6674229243c26196e421caeb48580f2c23))
+* **index:** parallel pread of the FM-index for faster startup ([#248](https://github.com/fg-labs/bwa-mem3/issues/248)) ([8d88fe5](https://github.com/fg-labs/bwa-mem3/commit/8d88fe5700be4bbbb757976b51a03bcd7e8b2032))
+* **kswv:** fold the freed-cell pair into a per-row active_frread on the u16 kernels ([#254](https://github.com/fg-labs/bwa-mem3/issues/254)) ([eaf649f](https://github.com/fg-labs/bwa-mem3/commit/eaf649fcc5943d91f9d70bd4e215a6d489871bc5))
+* **kswv:** hoist the freed-cell target into a per-row active_frread vector ([#252](https://github.com/fg-labs/bwa-mem3/issues/252)) ([fc0eb91](https://github.com/fg-labs/bwa-mem3/commit/fc0eb9132179ccac9d79ffe6c480951160582e60))
+* **kswv:** hoist the u8 boundary test per-row on NEON and AVX-512 non-meth ([#253](https://github.com/fg-labs/bwa-mem3/issues/253)) ([a25e3b7](https://github.com/fg-labs/bwa-mem3/commit/a25e3b7bf7b3444cc0eadccce6243cd23279e076))
+* **kswv:** skip the ref-boundary vbsl on all-real rows in 8-bit mate rescue (+7.5%) ([#244](https://github.com/fg-labs/bwa-mem3/issues/244)) ([78420a5](https://github.com/fg-labs/bwa-mem3/commit/78420a5553b85a7a3fbb98f61017354c8bf7e20a))
+* **mem:** resolve SA lookups across reads, not per read ([#236](https://github.com/fg-labs/bwa-mem3/issues/236)) ([79a2425](https://github.com/fg-labs/bwa-mem3/commit/79a24254168c4cbef086dcfeb073ecbd5632e438))
+* **meth:** score mate rescue with one read#-derived matrix, not both ([#224](https://github.com/fg-labs/bwa-mem3/issues/224)) ([1baa39b](https://github.com/fg-labs/bwa-mem3/commit/1baa39b17c69584263694fda5ddb666bcc65ad71))
+* **meth:** vectorize both-hypothesis mate rescue on the batched kswv path ([#221](https://github.com/fg-labs/bwa-mem3/issues/221)) ([46aeaae](https://github.com/fg-labs/bwa-mem3/commit/46aeaaeb818ae8e5272f29ba8807e76db59f7d5b)), closes [#219](https://github.com/fg-labs/bwa-mem3/issues/219)
+* **seed:** prefetch the correct cp_occ lines in the bwtSeed third round ([#242](https://github.com/fg-labs/bwa-mem3/issues/242)) ([c5e3827](https://github.com/fg-labs/bwa-mem3/commit/c5e3827df83b5dd85a998423d03cb93bec99263f))
+
+
+### Documentation
+
+* **best-practices:** add anti-patterns for marginally-mappable input ([#232](https://github.com/fg-labs/bwa-mem3/issues/232)) ([1344ab8](https://github.com/fg-labs/bwa-mem3/commit/1344ab86826cf6b3ba4a563bb4b482addb506428))
+* **ext:** record the measured evidence behind the ungapped fast-path bound ([#233](https://github.com/fg-labs/bwa-mem3/issues/233)) ([878bda0](https://github.com/fg-labs/bwa-mem3/commit/878bda0972509f44aa2073bafd0fb51997002b33))
+* **mem:** scope long-read claims to what actually works ([#240](https://github.com/fg-labs/bwa-mem3/issues/240)) ([ac090bc](https://github.com/fg-labs/bwa-mem3/commit/ac090bc13a3b2e37217b0989e204fce15f9fd07e))
+* **meth:** correct --meth override claims and document -T 40 split filtering ([#226](https://github.com/fg-labs/bwa-mem3/issues/226)) ([50a8d3f](https://github.com/fg-labs/bwa-mem3/commit/50a8d3f7fb56a631ec030eef4edfd1042619710f))
+* **profiles:** recommend --skip-contained-ext for short-read pipelines ([#241](https://github.com/fg-labs/bwa-mem3/issues/241)) ([37fa409](https://github.com/fg-labs/bwa-mem3/commit/37fa4098e5180a8a0b99e878b65095562ec3ec15))
+
 ## [0.6.0](https://github.com/fg-labs/bwa-mem3/compare/v0.5.0...v0.6.0) (2026-07-16)
 
 
