@@ -79,6 +79,12 @@ int fmi_pread_worker_count(size_t nbytes, int nthreads)
     return nthreads;
 }
 
+size_t fmi_pread_request_size(size_t remaining)
+{
+    const size_t PREAD_MAX_ONCE = (size_t)1 << 30;   /* 1GiB, well under INT_MAX */
+    return remaining > PREAD_MAX_ONCE ? PREAD_MAX_ONCE : remaining;
+}
+
 namespace {
 
 struct PreadChunk { int fd; char *dst; size_t nbytes; off_t off; };
@@ -112,8 +118,15 @@ void *pread_chunk_worker(void *arg)
 {
     PreadChunk *c = static_cast<PreadChunk *>(arg);
     size_t done = 0;
+    /* macOS pread() rejects any count > INT_MAX with EINVAL, so a chunk larger
+     * than 2GiB fails outright -- with the 8-worker cap that is every index over
+     * ~17.2GB (the hg38 --meth FM-index is 20.9GB). Request a bounded slice per
+     * call; the loop already accumulates partial reads. Linux has no such limit,
+     * which is why this only ever bit local macOS runs. */
     while (done < c->nbytes) {
-        ssize_t r = pread(c->fd, c->dst + done, c->nbytes - done, c->off + (off_t)done);
+        ssize_t r = pread(c->fd, c->dst + done,
+                          fmi_pread_request_size(c->nbytes - done),
+                          c->off + (off_t)done);
         if (r < 0) {
             if (errno == EINTR) continue;
             pread_chunk_fail("ERROR: pread failed during index load: %s\n", strerror(errno));

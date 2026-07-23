@@ -124,6 +124,15 @@ typedef struct smem_struct
  * arithmetic is unit-testable without a real index on disk. */
 int fmi_pread_worker_count(size_t nbytes, int nthreads);
 
+/* Bytes to request from a single pread() call, given how many remain in this
+ * worker's chunk. macOS fails a pread() whose count exceeds INT_MAX with EINVAL,
+ * so a chunk larger than 2GiB can never be read in one call -- and with the
+ * 8-worker load cap that is every index over ~17.2GB.
+ *
+ * Exposed (rather than kept file-local with the pread machinery) so the clamp
+ * is unit-testable without materialising a multi-GB file. */
+size_t fmi_pread_request_size(size_t remaining);
+
 /* Read the next `nbytes` of `fp` into `dst` using up to `nthreads` pread
  * workers, then leave the stream positioned exactly past them so a following
  * sequential read (the trailing sentinel index) still lands correctly.
