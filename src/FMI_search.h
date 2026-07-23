@@ -104,6 +104,35 @@ typedef struct smem_struct
 #define BWTSEED_LOCKSTEP_N 8
 #endif
 
+/* Smallest slice of an index array a parallel-load worker is given. The load is
+ * memory-bandwidth bound, so below this the per-thread create/join overhead is
+ * a larger share of the work than the bandwidth it unlocks. */
+#define FMI_PREAD_MIN_CHUNK (8UL << 20)
+
+/* Number of workers to split an `nbytes` index-array read across, given the
+ * caller's requested `nthreads`.
+ *
+ * Never returns more than `nthreads` when `nthreads` is positive, and never so
+ * many that a chunk would fall below FMI_PREAD_MIN_CHUNK -- except for the
+ * unavoidable single-worker case where `nbytes` is itself below the floor. A
+ * non-positive `nthreads` clamps UP to 1: the result is always >= 1, since the
+ * caller divides `nbytes` by it. Small references and a large BWA3_LOAD_THREADS
+ * are what push against the floor; on a GB-scale index the load's own 8-worker
+ * cap binds first.
+ *
+ * Exposed (rather than kept file-local with the pread machinery) so the chunk
+ * arithmetic is unit-testable without a real index on disk. */
+int fmi_pread_worker_count(size_t nbytes, int nthreads);
+
+/* Read the next `nbytes` of `fp` into `dst` using up to `nthreads` pread
+ * workers, then leave the stream positioned exactly past them so a following
+ * sequential read (the trailing sentinel index) still lands correctly.
+ *
+ * Aborts the process on a read error or short file. Exposed alongside the
+ * worker count so the chunk-splitting and the stream postcondition are
+ * unit-testable against a synthetic file. */
+void fmi_pread_from_stream(FILE *fp, void *dst, size_t nbytes, int nthreads);
+
 class FMI_search: public indexEle
 {
     public:
@@ -137,7 +166,9 @@ class FMI_search: public indexEle
      * --meth uses this for the SEED index: seeding needs the FM-index + bns
      * (for the seed->original remap) but never the seed pac — extension/scoring
      * runs against the ORIGINAL pac (meth_orig_pac). Saves ~1.6 GB on hg38. */
-    void load_index(bool load_pac = true);
+    /* n_threads: worker count for the big-array disk reads (capped internally,
+     * overridable via BWA3_LOAD_THREADS). Default 1 preserves prior behavior. */
+    void load_index(bool load_pac = true, int n_threads = 1);
 
     /* Attach to a packed bwa-mem3 index segment from bwa_shm_attach. Sets
      * scalars and the cp_occ / sa_ms_byte / sa_ls_word pointers; the
