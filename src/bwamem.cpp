@@ -1521,7 +1521,15 @@ void mem_flt_chained_seeds(const mem_opt_t *opt, const bntseq_t *bns, const uint
 #define MAX_EXTEND_CHAINS_CAP 4096
 static int mem_chain_cap_extend(mem_chain_t *a, int n, int max_n, float tie_frac, int tie_floor)
 {
-    if (max_n <= 0 || n <= max_n || n > MAX_EXTEND_CHAINS_CAP) return n;
+    /* The competitiveness gate applies even when the count cap does NOT engage
+     * (n <= max_n): a read with a handful of chains still pays banded-SW for every
+     * non-competitive one, and those reads are the bulk of the workload. Gating only
+     * reads that exceed max_n removes almost nothing (measured: -1% to -6% of
+     * extension work, vs -20% for a plain top-5 cap). With tie_frac <= 0 the original
+     * early-return is preserved exactly, so the gate-off path stays byte-identical. */
+    const int cap_on = max_n > 0;
+    if (n > MAX_EXTEND_CHAINS_CAP) return n;
+    if (tie_frac <= 0.0f && (!cap_on || n <= max_n)) return n;
     int w[MAX_EXTEND_CHAINS_CAP];
     int w_best = 0;
     for (int i = 0; i < n; i++) {
@@ -1545,7 +1553,7 @@ static int mem_chain_cap_extend(mem_chain_t *a, int n, int max_n, float tie_frac
             if (j == i) continue;
             if (w[j] > w[i] || (w[j] == w[i] && j < i)) rank++;
         }
-        if (rank < max_n && (rank < tie_floor || w[i] >= gate)) a[k++] = a[i];
+        if ((!cap_on || rank < max_n) && (rank < tie_floor || w[i] >= gate)) a[k++] = a[i];
         else if (a[i].m > SEEDS_PER_CHAIN) free(a[i].seeds);
     }
     return k;
@@ -1570,7 +1578,11 @@ static int mem_chain_cap_extend_mate(mem_chain_t *a, int n, int max_n,
         const mem_chain_t *mate, int mate_n, const bntseq_t *bns, int64_t win,
         float tie_frac, int tie_floor)
 {
-    if (max_n <= 0 || n <= max_n || n > MAX_EXTEND_CHAINS_CAP) return n;
+    /* See mem_chain_cap_extend: the competitiveness gate also applies when the count
+     * cap does not engage. tie_frac <= 0 preserves the original early-return exactly. */
+    const int cap_on = max_n > 0;
+    if (n > MAX_EXTEND_CHAINS_CAP) return n;
+    if (tie_frac <= 0.0f && (!cap_on || n <= max_n)) return n;
     const int MSCAN = MATE_SCAN_MAX;
     int mn = mate_n < MSCAN ? mate_n : MSCAN;
     int64_t mfp[MSCAN]; int mrid[MSCAN], mrev[MSCAN];
@@ -1594,7 +1606,7 @@ static int mem_chain_cap_extend_mate(mem_chain_t *a, int n, int max_n,
         int rank = 0;
         for (int j = 0; j < n; j++)
             if (j != i && (w[j] > w[i] || (w[j] == w[i] && j < i))) rank++;
-        int keep = rank < max_n && (rank < tie_floor || w[i] >= gate);
+        int keep = (!cap_on || rank < max_n) && (rank < tie_floor || w[i] >= gate);
         if (!keep && mn > 0) {
             int is_rev; int64_t fp = bns_depos(bns, a[i].pos, &is_rev);
             for (int j = 0; j < mn; j++)
