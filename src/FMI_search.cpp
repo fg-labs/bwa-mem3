@@ -605,8 +605,12 @@ void FMI_search::getSMEMsOnePosOneThread(uint8_t *enc_qdb,
                     }
                     smem = newSmem;
 #ifdef ENABLE_PREFETCH
-                    _mm_prefetch((const char *)(&cp_occ[(smem.k) >> CP_SHIFT]), _MM_HINT_T0);
+                    /* Next iteration swaps k<->l then backwardExt reads
+                     * sp = smem.l, ep = smem.l + smem.s (see ls_advance_forward_step
+                     * for the full derivation). Prefetching smem.k targeted an
+                     * address never touched; ep was never prefetched. Pure hint. */
                     _mm_prefetch((const char *)(&cp_occ[(smem.l) >> CP_SHIFT]), _MM_HINT_T0);
+                    _mm_prefetch((const char *)(&cp_occ[(smem.l + smem.s) >> CP_SHIFT]), _MM_HINT_T0);
 #endif
                 }
                 else
@@ -798,14 +802,39 @@ void FMI_search::ls_prefetch_cp_occ(const BatchSlot *s)
  * above lands at "this slot's next step" granularity; T1 here lands at
  * "this slot's step ~N/2 from now". For N=8 that's 4 stepping-passes ahead,
  * giving DRAM-latency-class lookahead when the cp_occ working set spills
- * out of L2/L3. */
+ * out of L2/L3.
+ *
+ * Target the interval the lookahead slot will actually read next, which
+ * differs by phase:
+ *
+ *   PH_FWD: smem is live and the next forward step consumes it, so warm all
+ *           four of its checkpoint blocks (k, l, k+s, l+s).
+ *
+ *   PH_BWD: ls_advance_backward_step runs entirely out of prev[] and NEVER
+ *           rewrites smem, so smem here is the STALE leftover from the end of
+ *           the forward phase -- warming it prefetches lines the backward walk
+ *           will not touch. The next backward step instead calls backwardExt on
+ *           each live prev[p], reading cp_occ[prev[p].k] and cp_occ[prev[p].k +
+ *           prev[p].s]. Aim the lookahead at those. This keeps the N/2-ahead L2
+ *           memory-level parallelism (the part that was actually hiding DRAM
+ *           latency) but points it at blocks that are really read. Pure hint,
+ *           so output is unchanged. */
 void FMI_search::ls_prefetch_cp_occ_t1(const BatchSlot *s)
 {
 #ifdef ENABLE_PREFETCH
-    _mm_prefetch((const char *)(&cp_occ[(s->smem.k) >> CP_SHIFT]), _MM_HINT_T1);
-    _mm_prefetch((const char *)(&cp_occ[(s->smem.l) >> CP_SHIFT]), _MM_HINT_T1);
-    _mm_prefetch((const char *)(&cp_occ[(s->smem.k + s->smem.s) >> CP_SHIFT]), _MM_HINT_T1);
-    _mm_prefetch((const char *)(&cp_occ[(s->smem.l + s->smem.s) >> CP_SHIFT]), _MM_HINT_T1);
+    if (s->phase == PH_BWD) {
+        const int32_t np = s->numPrev;
+        for (int32_t p = 0; p < np; p++) {
+            const SMEM m = s->prev[p];
+            _mm_prefetch((const char *)(&cp_occ[(m.k) >> CP_SHIFT]), _MM_HINT_T1);
+            _mm_prefetch((const char *)(&cp_occ[(m.k + m.s) >> CP_SHIFT]), _MM_HINT_T1);
+        }
+    } else {
+        _mm_prefetch((const char *)(&cp_occ[(s->smem.k) >> CP_SHIFT]), _MM_HINT_T1);
+        _mm_prefetch((const char *)(&cp_occ[(s->smem.l) >> CP_SHIFT]), _MM_HINT_T1);
+        _mm_prefetch((const char *)(&cp_occ[(s->smem.k + s->smem.s) >> CP_SHIFT]), _MM_HINT_T1);
+        _mm_prefetch((const char *)(&cp_occ[(s->smem.l + s->smem.s) >> CP_SHIFT]), _MM_HINT_T1);
+    }
 #else
     (void)s;
 #endif
@@ -903,8 +932,16 @@ void FMI_search::ls_advance_forward_step(BatchSlot *s, const uint8_t *enc_qdb)
     s->smem = newSmem;
     s->j++;
 #ifdef ENABLE_PREFETCH
-    _mm_prefetch((const char *)(&cp_occ[(s->smem.k) >> CP_SHIFT]), _MM_HINT_T0);
+    /* The NEXT forward step swaps k<->l (see smem_ above) before calling
+     * backwardExt, which reads sp = smem.k and ep = smem.k + smem.s. After the
+     * swap that is OUR smem.l and smem.l + smem.s -- so those are the two lines
+     * to prefetch. The old code prefetched smem.k (an address the next step
+     * never touches) and smem.l, leaving the ep line to always miss cold.
+     * Same targets as bsd_prefetch_cp_occ(), which fixed this for round 3 in
+     * #242; the fix was simply never propagated here. Prefetch is a pure hint,
+     * so this cannot change output. */
     _mm_prefetch((const char *)(&cp_occ[(s->smem.l) >> CP_SHIFT]), _MM_HINT_T0);
+    _mm_prefetch((const char *)(&cp_occ[(s->smem.l + s->smem.s) >> CP_SHIFT]), _MM_HINT_T0);
 #endif
 }
 
@@ -1492,8 +1529,12 @@ int64_t FMI_search::bwtSeedStrategyAllPosOneThread(uint8_t *enc_qdb,
                         newSmem.n = j;
                         smem = newSmem;
 #ifdef ENABLE_PREFETCH
-                        _mm_prefetch((const char *)(&cp_occ[(smem.k) >> CP_SHIFT]), _MM_HINT_T0);
+                        /* Same correction as the lockstep path: the next step reads
+                         * sp = smem.l, ep = smem.l + smem.s after the k<->l swap.
+                         * This is the x86 default round-3 path (the lockstep variant
+                         * is arm64-gated), so it was missing the #242 fix entirely. */
                         _mm_prefetch((const char *)(&cp_occ[(smem.l) >> CP_SHIFT]), _MM_HINT_T0);
+                        _mm_prefetch((const char *)(&cp_occ[(smem.l + smem.s) >> CP_SHIFT]), _MM_HINT_T0);
 #endif
 
 
