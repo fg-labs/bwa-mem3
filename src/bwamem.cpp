@@ -568,6 +568,7 @@ mem_opt_t *mem_opt_init()
     o->max_extend_chains = 0;   // off by default; opt-in speed lever (--max-extend-chains / --fast)
     o->mate_concordant_window = 0;   // off by default; opt-in (--extend-mate-concordant / --fast --meth)
     o->est_insert_high = 0;          // runtime state; set from data (mem_pestat) or -I during the run
+    o->extend_csub = 0;          // off by default -> byte-identical; opt-in via --extend-csub
     o->extend_tie_frac = 0.0f;   // off by default -> byte-identical to baseline; opt-in via --extend-tie-frac / --fast
     o->extend_tie_floor = 0;     // no unconditional floor; only meaningful when extend_tie_frac > 0
     o->seed_emit_order = SEED_ORDER_OFF;  // byte-identical default
@@ -1519,8 +1520,10 @@ void mem_flt_chained_seeds(const mem_opt_t *opt, const bntseq_t *bns, const uint
  * byte-identical (drops candidate secondaries, so XS/secondary/MAPQ can move on
  * multi-mapping reads). Always keeps >= 1 chain. Returns the new chain count. */
 #define MAX_EXTEND_CHAINS_CAP 4096
-static int mem_chain_cap_extend(mem_chain_t *a, int n, int max_n, float tie_frac, int tie_floor)
+static int mem_chain_cap_extend(mem_chain_t *a, int n, int max_n, float tie_frac, int tie_floor,
+                                int *capped_w_out)
 {
+    if (capped_w_out) *capped_w_out = 0;  /* max weight among dropped chains, for csub */
     /* The competitiveness gate applies even when the count cap does NOT engage
      * (n <= max_n): a read with a handful of chains still pays banded-SW for every
      * non-competitive one, and those reads are the bulk of the workload. Gating only
@@ -1554,7 +1557,10 @@ static int mem_chain_cap_extend(mem_chain_t *a, int n, int max_n, float tie_frac
             if (w[j] > w[i] || (w[j] == w[i] && j < i)) rank++;
         }
         if ((!cap_on || rank < max_n) && (rank < tie_floor || w[i] >= gate)) a[k++] = a[i];
-        else if (a[i].m > SEEDS_PER_CHAIN) free(a[i].seeds);
+        else {
+            if (capped_w_out && w[i] > *capped_w_out) *capped_w_out = w[i];
+            if (a[i].m > SEEDS_PER_CHAIN) free(a[i].seeds);
+        }
     }
     return k;
 }
@@ -1576,8 +1582,9 @@ static int mem_chain_cap_extend(mem_chain_t *a, int n, int max_n, float tie_frac
 #define MATE_SCAN_MAX 256
 static int mem_chain_cap_extend_mate(mem_chain_t *a, int n, int max_n,
         const mem_chain_t *mate, int mate_n, const bntseq_t *bns, int64_t win,
-        float tie_frac, int tie_floor)
+        float tie_frac, int tie_floor, int *capped_w_out)
 {
+    if (capped_w_out) *capped_w_out = 0;  /* max weight among dropped chains, for csub */
     /* See mem_chain_cap_extend: the competitiveness gate also applies when the count
      * cap does not engage. tie_frac <= 0 preserves the original early-return exactly. */
     const int cap_on = max_n > 0;
@@ -1620,7 +1627,12 @@ static int mem_chain_cap_extend_mate(mem_chain_t *a, int n, int max_n,
                 }
         }
         if (keep) a[k++] = a[i];
-        else if (a[i].m > SEEDS_PER_CHAIN) free(a[i].seeds);
+        else {
+            /* --extend-csub: remember the heaviest chain we dropped, so the SAM stage
+             * can seed the pruned competitor back into MAPQ (mem_seed_capped_csub). */
+            if (capped_w_out && w[i] > *capped_w_out) *capped_w_out = w[i];
+            if (a[i].m > SEEDS_PER_CHAIN) free(a[i].seeds);
+        }
     }
     return k;
 }
@@ -2954,16 +2966,20 @@ int mem_kernel1_core(FMI_search *fmi,
     for (int l=0; l<nseq; l++)
     {
         chn = &chain_ar[l];
+        int capped_w = 0;
         if (cap_mate_concordant && (l ^ 1) < nseq) {
             int ml = l ^ 1;  /* interleaved PE: mate is the sibling index */
             chn->n = mem_chain_cap_extend_mate(chn->a, chn->n, opt->max_extend_chains,
                                                chain_ar[ml].a, chain_ar[ml].n,
                                                chain_bns, mate_win,
-                                               opt->extend_tie_frac, opt->extend_tie_floor);
+                                               opt->extend_tie_frac, opt->extend_tie_floor,
+                                               &capped_w);
         } else {
             chn->n = mem_chain_cap_extend(chn->a, chn->n, opt->max_extend_chains,
-                                          opt->extend_tie_frac, opt->extend_tie_floor);
+                                          opt->extend_tie_frac, opt->extend_tie_floor,
+                                          &capped_w);
         }
+        chn->capped_w = opt->extend_csub ? capped_w : 0;  /* carried to worker_sam via regs */
     }
     printf_(VER, "7. Done mem_chain_flt..\n");
     // tprof[MEM_ALN_M1][tid] += __rdtsc() - tim;
@@ -3114,6 +3130,7 @@ int mem_kernel2_core(FMI_search *fmi,
         /* SAM-A18: stamp is_alt in this same pass. Each read's regions are now
          * final (dedup done) and is_alt is not read by any later read's dedup,
          * so folding the former separate full pass in here is byte-identical. */
+        regs[l].capped_w = chain_ar[l].capped_w;  /* ride the dropped-weight to worker_sam */
         for (i = 0; i < regs[l].n; ++i)
         {
             mem_alnreg_t *p = &regs[l].a[i];
@@ -3514,6 +3531,7 @@ static void worker_sam(void *data, int seqid, int batch_size, int tid)
 #if V17  // Feature from v0.7.17 of orig. bwa-mem
             if (w->opt->flag & MEM_F_PRIMARY5) mem_reorder_primary5(w->opt->T, &w->regs[i]);
 #endif
+            mem_seed_capped_csub(&w->regs[i], w->opt->a);  /* --extend-csub (no-op when off) */
             /* D3 (--meth): emit in ORIGINAL coords/alphabet via mem_aln_bns/pac. */
             mem_reg2sam(w->opt, mem_aln_bns(w), mem_aln_pac(w), &w->seqs[i],
                         &w->regs[i], 0, 0);
@@ -3875,6 +3893,31 @@ int mem_mark_primary_se(const mem_opt_t *opt, int n, mem_alnreg_t *a, int64_t id
 /************************
  * Integrated interface *
  ************************/
+
+/* --extend-csub: seed each PRIMARY region's csub with a calibrated estimate of the
+ * best chain the cap/gate dropped before extension, so MAPQ (which reads
+ * max(sub, csub)) reflects the pruned competitor instead of inflating. The estimate
+ * scales the dropped chain's covered bases by THIS region's observed per-base score
+ * rate (never the all-match upper bound weight*a), and is clamped strictly below the
+ * region's own score, so it lowers MAPQ proportionally rather than forcing it to 0
+ * (the naive weight*a version tripped `sub >= score -> return 0`, which the PE MAPQ
+ * recombination then turned into spurious promotions). No-op when nothing was
+ * dropped (capped_w == 0), so --extend-csub off is byte-identical. */
+void mem_seed_capped_csub(mem_alnreg_v *a, int match_a)
+{
+    if (a->capped_w <= 0) return;
+    for (size_t r = 0; r < a->n; ++r) {
+        mem_alnreg_t *p = &a->a[r];
+        if (p->secondary >= 0) continue;            /* primary regions only */
+        int span = p->qe - p->qb;
+        if (span <= 0 || p->score <= 0) continue;
+        /* TUNING(csub): all-match rate (weight*a). The clamp below is what makes this
+         * safe (the naive unclamped weight*a tripped `sub>=score -> mapq 0`). */
+        long est = (long)a->capped_w * match_a;
+        if (est >= p->score) est = p->score - 1;    /* clamp: never force mapq 0 */
+        if (est > p->csub) p->csub = (int)est;
+    }
+}
 
 int mem_approx_mapq_se(const mem_opt_t *opt, const mem_alnreg_t *a)
 {
