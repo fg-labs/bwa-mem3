@@ -18,12 +18,26 @@ with explicit flags — so upgrading bwa-mem3 never silently changes your alignm
 | Migrating a bwa-mem2 pipeline, or validating against bwa/bwa-mem2 | **Drop-in** | `bwa-mem3 mem` (no extra flags) |
 | New pipeline, or migration already validated | **Recommended** | `bwa-mem3 mem -m 10 -y 0` (add `-s 2` under `--meth`) |
 
-> bwa-mem3 is already, by design, *not* byte-identical to bwa-mem2 even at default settings
-> (additive SAM tags, per-architecture SIMD `score2`/MAPQ convergence, deterministic tie-breaks, a
-> few extra supplementary alignments) — it is 99.94%–99.9996% concordant on primary records
-> (panel-twist to WES). See
-> [Equivalence with bwa-mem2](../whats-different/equivalence.md). "Drop-in" therefore means *as close
-> to bwa-mem2 as bwa-mem3 gets*; the recommended profile is a further, documented deviation.
+> **As of 0.7.1 the drop-in profile produces the same primary alignment as bwa-mem2 on every
+> cell re-measured since the parity restoration** — identical
+> `FLAG`/`RNAME`/`POS`/`MAPQ`/`CIGAR`/`AS`/`XS` on all 1,066,668 records of the HG00096 WGS
+> slice re-run on x86. On those records the SAM byte stream differs by **three things — two
+> additive tags plus a renamed header line**: the extra `MQ:i` and `HN:i` tags, and a `@PG`
+> line naming `bwa-mem3`. No alignment record bwa-mem2 emits is changed or removed; strip
+> those two tags and normalize `@PG` and the
+> records are byte-for-byte identical. The three earlier changes that *did* move primaries
+> were reverted for 0.7.1
+> ([#256](https://github.com/fg-labs/bwa-mem3/pull/256), [#257](https://github.com/fg-labs/bwa-mem3/pull/257)/[#261](https://github.com/fg-labs/bwa-mem3/pull/261),
+> [#268](https://github.com/fg-labs/bwa-mem3/pull/268)).
+>
+> **Scope:** a residual **+4 supplementary alignments** on the 5 M WGS cell is still
+> outstanding (last measured after [#257](https://github.com/fg-labs/bwa-mem3/pull/257), not
+> re-measured on a build carrying [#268](https://github.com/fg-labs/bwa-mem3/pull/268)), and the
+> genome-wide, multi-sample, cross-architecture re-run is pending — so validate your own
+> workload before treating parity as a guarantee. See
+> [Equivalence with bwa-mem2](../whats-different/equivalence.md) for the full audit trail. The
+> **recommended** profile (and `--fast`) is a further, deliberate, documented deviation — it is
+> *not* byte-identical.
 
 ## Drop-in profile (default)
 
