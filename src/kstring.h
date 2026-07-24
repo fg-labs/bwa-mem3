@@ -160,11 +160,33 @@ static inline void kputs_u(const char *p, kstring_t *s) {
 	s->l += l;
 }
 
+/* Two-digit lookup table: entry 2*d/2*d+1 is the tens/ones ASCII of d (00..99).
+ * Lets kputuw_u emit two decimal digits per div/mod, halving the divisions. */
+static const char kputuw_digits2[201] =
+	"0001020304050607080910111213141516171819"
+	"2021222324252627282930313233343536373839"
+	"4041424344454647484950515253545556575859"
+	"6061626364656667686970717273747576777879"
+	"8081828384858687888990919293949596979899";
+
 static inline void kputuw_u(unsigned c, kstring_t *s) {
 	if (c == 0) { s->s[s->l++] = '0'; return; }
 	char buf[12];
 	int l = 0;
-	while (c > 0) { buf[l++] = (char)(c % 10 + '0'); c /= 10; }
+	/* Peel two digits per iteration (ones then tens into the reversed buffer). */
+	while (c >= 100) {
+		unsigned d = (c % 100) << 1;
+		c /= 100;
+		buf[l++] = kputuw_digits2[d + 1];
+		buf[l++] = kputuw_digits2[d];
+	}
+	if (c >= 10) {
+		unsigned d = c << 1;
+		buf[l++] = kputuw_digits2[d + 1];
+		buf[l++] = kputuw_digits2[d];
+	} else {
+		buf[l++] = (char)(c + '0');
+	}
 	while (l-- > 0) s->s[s->l++] = buf[l];
 }
 

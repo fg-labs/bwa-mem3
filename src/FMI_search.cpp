@@ -229,17 +229,8 @@ FMI_search::FMI_search(const char *fname)
     shm_base = NULL;
     shm_len = 0;
 
-    /* one_hot_mask_array is constant across the FMI's lifetime and is
-     * identical on disk and shm paths; initialize it once at construction. */
-    int64_t one_hot_bytes = 64 * (int64_t)sizeof(uint64_t);
-    one_hot_mask_array = (uint64_t *)_mm_malloc(one_hot_bytes, 64);
-    assert_not_null(one_hot_mask_array, one_hot_bytes, one_hot_bytes);
-    one_hot_mask_array[0] = 0;
-    uint64_t base = 0x8000000000000000L;
-    one_hot_mask_array[1] = base;
-    for (int64_t i = 2; i < 64; ++i) {
-        one_hot_mask_array[i] = (one_hot_mask_array[i - 1] >> 1) | base;
-    }
+    /* one_hot_mask_array is now a file-scope compile-time constant table (see
+     * FMI_search.h); nothing to allocate or initialize here. */
 }
 
 FMI_search::~FMI_search()
@@ -257,7 +248,6 @@ FMI_search::~FMI_search()
         if (sa_ls_word) _mm_free(sa_ls_word);
         if (cp_occ)     _mm_free(cp_occ);
     }
-    if (one_hot_mask_array) _mm_free(one_hot_mask_array);
 }
 
 int64_t FMI_search::cp_occ_size_bytes() const {
@@ -563,6 +553,13 @@ void FMI_search::getSMEMsOnePosOneThread(uint8_t *enc_qdb,
     SMEM *prevArray = (SMEM *)_mm_malloc((size_t)prevArray_bytes, 64);
     assert_not_null(prevArray, prevArray_bytes, prevArray_bytes);
 
+    // Hoist the FM-index cumulative-count table into a local for the batch (as
+    // the bwa-mem2 reference does). count[] is a lifetime-constant member never
+    // mutated during seeding, so this is a pure cache of identical values: it
+    // trades the per-seed `this->count[..]` member loads for stack reads. Byte-
+    // identical to reading the member directly.
+    const int64_t counts[5] = {count[0], count[1], count[2], count[3], count[4]};
+
     uint32_t i;
     // Perform SMEM for original reads
     for(i = 0; i < numReads; i++)
@@ -582,9 +579,9 @@ void FMI_search::getSMEMsOnePosOneThread(uint8_t *enc_qdb,
             smem.rid = rid;
             smem.m = x;
             smem.n = x;
-            smem.k = count[a];
-            smem.l = count[3 - a];
-            smem.s = count[a+1] - count[a];
+            smem.k = counts[a];
+            smem.l = counts[3 - a];
+            smem.s = counts[a+1] - counts[a];
             int numPrev = 0;
             
             int j;
@@ -1999,16 +1996,20 @@ int64_t FMI_search::call_one_step(int64_t pos, int64_t &sa_entry, int64_t &offse
  * worker threads, hence thread_local (not a member). Freed on thread exit. */
 namespace {
 struct SaPrefetchScratch {
-    int64_t *pos = nullptr, *map = nullptr;
+    // Only pos is staged now: the former map_ar array held map_ar[k] == k for
+    // every entry (the staging loop writes map_ar[id] = totalCoordCount + c,
+    // and totalCoordCount == id on entry to each SMEM while both advance in
+    // lockstep with c), so the map index is just the buffer index and the
+    // second allocation was dead. Downstream consumers use the index directly.
+    int64_t *pos = nullptr;
     int64_t  cap = 0;
     void ensure(int64_t n) {
         if (n <= cap) return;
-        _mm_free(pos); _mm_free(map);
+        _mm_free(pos);
         pos = (int64_t *) _mm_malloc((size_t)n * sizeof(int64_t), 64);
-        map = (int64_t *) _mm_malloc((size_t)n * sizeof(int64_t), 64);
         cap = n;
     }
-    ~SaPrefetchScratch() { _mm_free(pos); _mm_free(map); }
+    ~SaPrefetchScratch() { _mm_free(pos); }
 };
 } // namespace
 
@@ -2043,7 +2044,6 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
     static thread_local SaPrefetchScratch t_sa;
     t_sa.ensure(mem_lim);
     int64_t *pos_ar = t_sa.pos;
-    int64_t *map_ar = t_sa.map;
 
     for(int i = 0; i < count; i++)
     {
@@ -2055,8 +2055,9 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
         for(j = smem.k; (j < hi) && (c < max_occ); j+=step, c++)
         {
             int64_t pos = j;
-             pos_ar[id]  = pos;
-             map_ar[id++] = totalCoordCount + c;
+             pos_ar[id++]  = pos;
+            // map_ar[k] == k (== id here), so the staging index is stored
+            // implicitly; map_pos below reads the index directly.
             // int64_t sa_entry = get_sa_entry_compressed(pos, tid);
             // coordArray[totalCoordCount + c] = sa_entry;
         }
@@ -2076,7 +2077,7 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
     {
         int64_t pos =  pos_ar[i];
         working_set[j] = pos;
-        map_pos[j] = map_ar[i];
+        map_pos[j] = i;   // map_ar[i] == i (see staging loop invariant)
         offset[j] = 0;
         
         if ((pos & SA_COMPX_MASK) == 0) {
@@ -2115,7 +2116,7 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
                 {
                     pos = pos_ar[i];
                     working_set[k] = pos;
-                    map_pos[k] = map_ar[i++];
+                    map_pos[k] = i++;   // map_ar[i] == i (staging invariant)
                     offset[k] = 0;
                     
                     if ((pos & SA_COMPX_MASK) == 0) {
@@ -2143,5 +2144,5 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
             }
         }
     }
-    /* pos_ar/map_ar are the reused thread-local scratch — no free here. */
+    /* pos_ar is the reused thread-local scratch — no free here. */
 }

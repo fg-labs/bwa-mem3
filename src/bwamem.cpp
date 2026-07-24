@@ -1344,9 +1344,11 @@ SMEM *mem_collect_smem(FMI_search *fmi, const mem_opt_t *opt,
         // w.mmc.enc_qdb[l]       = (uint8_t *) malloc(w.mmc.wsize_mem[l] * sizeof(uint8_t));
         // w.mmc.rid[l]           = (int32_t *) malloc(w.mmc.wsize_mem[l] * sizeof(int32_t));
         //w.mmc.lim[l]         = (int32_t *) _mm_malloc((BATCH_SIZE + 32) * sizeof(int32_t), 64);
-        for (int i=0; i<num_smem1; i++) {
-            mmc->matchArray[tid][i] = ptr1[i];
-        }
+        // SMEM is trivially copyable POD; ptr1 (old buffer) and the freshly
+        // _mm_malloc'd destination are distinct, non-overlapping allocations, so
+        // a bulk memcpy of num_smem1 records is byte-identical to the per-element
+        // copy it replaces.
+        memcpy(mmc->matchArray[tid], ptr1, (size_t)num_smem1 * sizeof(SMEM));
         _mm_free(ptr1);
     }
     #endif
@@ -1408,9 +1410,10 @@ SMEM *mem_collect_smem(FMI_search *fmi, const mem_opt_t *opt,
 		    // num_smem1. Preserve both — bwtSeedStrategyAllPosOneThread() below
 		    // appends at offset num_smem1 + num_smem2.
 		    int64_t already_written = (int64_t)num_smem1 + num_smem2;
-		    for (int64_t i = 0; i < already_written; ++i) {
-		        mmc->matchArray[tid][i] = ptr1[i];
-		    }
+		    // Bulk-copy the already-written prefix: SMEM is trivially copyable
+		    // POD and src/dst are distinct non-overlapping allocations, so this
+		    // memcpy is byte-identical to the per-element loop it replaces.
+		    memcpy(mmc->matchArray[tid], ptr1, (size_t)already_written * sizeof(SMEM));
 		    _mm_free(ptr1);
 		}
         #endif
@@ -2309,11 +2312,9 @@ int mem_kernel2_core(FMI_search *fmi,
                                          aln_pac,
                                          dd_query,
                                          regs[l].n, regs[l].a, dd_mat);
-    }
-    free(dd_qbuf);  /* NULL outside --meth; free() is NULL-safe */
-
-    for (int l=0; l<nseq; l++)
-    {
+        /* SAM-A18: stamp is_alt in this same pass. Each read's regions are now
+         * final (dedup done) and is_alt is not read by any later read's dedup,
+         * so folding the former separate full pass in here is byte-identical. */
         for (i = 0; i < regs[l].n; ++i)
         {
             mem_alnreg_t *p = &regs[l].a[i];
@@ -2321,6 +2322,7 @@ int mem_kernel2_core(FMI_search *fmi,
                 p->is_alt = 1;
         }
     }
+    free(dd_qbuf);  /* NULL outside --meth; free() is NULL-safe */
     // tprof[POST_SWA][tid] += __rdtsc() - tim;
 
     return 1;
@@ -2632,10 +2634,29 @@ static void mem_mark_primary_se_core(const mem_opt_t *opt, int n, mem_alnreg_t *
     }
 }
 
+/* Thread-local holder for mem_mark_primary_se's index scratch. Frees the buffer
+ * in its destructor, i.e. at thread exit, which is the whole reason it is a
+ * struct rather than a bare `static thread_local int_v`: a buffer that is never
+ * released is a leak by LeakSanitizer's definition — still-reachable at exit is
+ * still unfreed — and the ASan CI row aborts on it. Same shape and rationale as
+ * u8vec_scratch_t, kept local because this is its only user. */
+struct mark_primary_scratch_t {
+    int_v v;
+    mark_primary_scratch_t() { kv_init(v); }
+    ~mark_primary_scratch_t() { kv_destroy(v); }
+};
+
 int mem_mark_primary_se(const mem_opt_t *opt, int n, mem_alnreg_t *a, int64_t id)
 {
     int i, n_pri;
-    int_v z = {0,0,0};
+    /* Per-thread scratch for the overlap index set. Reused across every read on
+     * this thread instead of malloc/free per call: it is pure scratch (only
+     * indices, never observable in output), so reuse is byte-identical. Held for
+     * the thread's lifetime rather than freed per call, and released at thread
+     * exit by the holder's destructor; mem_mark_primary_se_core resets z.n = 0
+     * before repopulating, so no stale entry is ever read. */
+    static thread_local mark_primary_scratch_t z_scratch;
+    int_v &z = z_scratch.v;
     if (n == 0) return 0;
 
     /* Fast path for the dominant unique-mapper case. With a single region the
@@ -2688,7 +2709,8 @@ int mem_mark_primary_se(const mem_opt_t *opt, int n, mem_alnreg_t *a, int64_t id
         for (i = 0; i < n; ++i)
             a[i].secondary_all = a[i].secondary;
     }
-    free(z.a);
+    /* z.a intentionally NOT freed here: it is a thread-lifetime scratch buffer,
+     * released by z_scratch's destructor at thread exit. */
     return n_pri;
 }
 
@@ -2877,21 +2899,29 @@ void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str,
      * SEQ + QUAL + tags + headers; rare overflow falls back to ks_resize.
      */
     l_name = (int)strlen(s->name);
+    /* Cache lengths that are needed both for pre-sizing and for the actual
+     * unsafe writes below, so each string is measured exactly once per record:
+     *   - md_len   : MD:Z string (SAM-A16)
+     *   - rname_len: RNAME contig name (SAM-A14)
+     *   - rnext_len: RNEXT contig name (SAM-A14)
+     * Each is only *used* at its write site under the same guard that makes it
+     * hold a real strlen here, so the cached value is byte-identical to the
+     * strlen kputs_u() would have recomputed. */
+    size_t md_len = 0;
+    if (p->n_cigar)
+        md_len = strlen((const char*)(p->cigar + p->n_cigar));
+    /* RNAME/RNEXT contig names can be very long (T2T-style assemblies).
+     * Mate CIGAR (MC:Z) under V17 is also written via add_cigar(). */
+    size_t rname_len = (p->rid >= 0) ? strlen(bns->anns[p->rid].name) : 1;
+    size_t rnext_len = (m && m->rid >= 0 && m->rid != p->rid)
+                       ? strlen(bns->anns[m->rid].name) : 1;
     {
-        size_t md_len = 0;
-        if (p->n_cigar)
-            md_len = strlen((const char*)(p->cigar + p->n_cigar));
         size_t comm_len = s->comment ? strlen(s->comment) : 0;
         size_t anno_len = ((opt->flag & MEM_F_REF_HDR) && p->rid >= 0
                            && bns->anns[p->rid].anno && bns->anns[p->rid].anno[0])
                           ? strlen(bns->anns[p->rid].anno) : 0;
         size_t xa_len   = p->XA ? strlen(p->XA) : 0;
         size_t rg_len   = bwa_rg_id[0] ? strlen(bwa_rg_id) : 0;
-        /* RNAME/RNEXT contig names can be very long (T2T-style assemblies).
-         * Mate CIGAR (MC:Z) under V17 is also written via add_cigar(). */
-        size_t rname_len = (p->rid >= 0) ? strlen(bns->anns[p->rid].name) : 1;
-        size_t rnext_len = (m && m->rid >= 0 && m->rid != p->rid)
-                           ? strlen(bns->anns[m->rid].name) : 1;
         size_t mate_cigar_len = (m && m->n_cigar) ? (size_t)m->n_cigar * 16 : 0;
         /* SA:Z worst case (only emitted when n>1 and there are other primary
          * hits, but priced unconditionally so the local ks_resize at the
@@ -2917,7 +2947,7 @@ void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str,
     kputsn_u(s->name, l_name, str); kputc_u('\t', str); // QNAME
     kputw_u((p->flag&0xffff) | (p->flag&0x10000? 0x100 : 0), str); kputc_u('\t', str); // FLAG
     if (p->rid >= 0) { // with coordinate
-        kputs_u(bns->anns[p->rid].name, str); kputc_u('\t', str); // RNAME
+        kputsn_u(bns->anns[p->rid].name, (int)rname_len, str); kputc_u('\t', str); // RNAME
         kputl_u(p->pos + 1, str); kputc_u('\t', str); // POS
         kputw_u(p->mapq, str); kputc_u('\t', str); // MAPQ
 #if OLD // from v15
@@ -2939,7 +2969,7 @@ void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str,
     // print the mate position if applicable
     if (m && m->rid >= 0) {
         if (p->rid == m->rid) kputc_u('=', str);
-        else kputs_u(bns->anns[m->rid].name, str);
+        else kputsn_u(bns->anns[m->rid].name, (int)rnext_len, str);
         kputc_u('\t', str);
         kputl_u(m->pos + 1, str); kputc_u('\t', str);
         if (p->rid == m->rid) {
@@ -2987,7 +3017,7 @@ void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str,
     // print optional tags
     if (p->n_cigar) {
         kputsn_u("\tNM:i:", 6, str); kputw_u(p->NM, str);
-        kputsn_u("\tMD:Z:", 6, str); kputs_u((char*)(p->cigar + p->n_cigar), str);
+        kputsn_u("\tMD:Z:", 6, str); kputsn_u((char*)(p->cigar + p->n_cigar), (int)md_len, str);
     }
 #if V17
     if (m && m->n_cigar) { kputsn_u("\tMC:Z:", 6, str); add_cigar(opt, m, str, which); }
@@ -3072,7 +3102,11 @@ mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *
     static thread_local u8vec_scratch_t t_query;
     if (t_query.v.m < (size_t)l_query) kv_resize(uint8_t, t_query.v, (size_t)l_query);
     query = t_query.v.a;
-    for (i = 0; i < l_query; ++i) // convert to the nt4 encoding
+    /* SAM-A10: only [qb,qe) of `query` is ever read (bwa_gen_cigar2 below is
+     * handed &query[qb] with length qe-qb); the encode was over the whole read.
+     * Encode only the consumed window — the untouched prefix/suffix are never
+     * referenced, so output is byte-identical. */
+    for (i = qb; i < qe; ++i) // convert to the nt4 encoding
         query[i] = regen_query[i] < 5? regen_query[i] : nst_nt4_table[(int)regen_query[i]];
     a.mapq = ar->secondary < 0? mem_approx_mapq_se(opt, ar) : 0;
     if (ar->secondary >= 0) a.flag |= 0x100; // secondary alignment
@@ -3153,8 +3187,13 @@ mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *
             a.cigar[a.n_cigar++] = clip3<<4 | 3;
         }
     }
-    a.rid = bns_pos2rid(bns, pos);
-    assert(a.rid == ar->rid);
+    /* SAM-A9: the region already carries its rid and bns_pos2rid(bns, pos) is
+     * provably equal to it (the original code asserted exactly this). Use the
+     * known value and keep the equality as a debug-only check against the
+     * recompute, so NDEBUG builds skip the bns_pos2rid scan entirely. Output is
+     * byte-identical: a.rid == ar->rid == old bns_pos2rid result. */
+    a.rid = ar->rid;
+    assert(a.rid == bns_pos2rid(bns, pos));
     a.pos = pos - bns->anns[a.rid].offset;
     a.score = ar->score; a.sub = ar->sub > ar->csub? ar->sub : ar->csub;
     a.is_alt = ar->is_alt; a.alt_sc = ar->alt_sc;
