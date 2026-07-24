@@ -2,13 +2,21 @@
 //
 // Byte-identity test for the banded Smith-Waterman batched SIMD kernels
 // (BandedPairWiseSW::getScores8 / getScores16) versus the scalar oracle
-// (scalarBandedSWA), across SHORT and LONG reads.
+// (scalarBandedSWA).
 //
-// Locks in the recovered long-read 8-bit path (reads >=128bp): every one of the
-// six outputs (score, tle, gtle, qle, gscore, max_off) must match the scalar
-// reference on the host SIMD tier. Pairs are generated with target >= query
-// (len1 >= len2) -- the saturation-safe domain the 8-bit routing envelope
-// targets. Runs on every CI matrix row that defines a vector kernel.
+// getScores8 is byte-identical to scalar only WITHIN the 8-bit routing envelope
+// (bwamem.cpp:bsw8_envelope_ok) -- the saturation-safe domain where every DP
+// cell fits the unsigned [0,255] byte state. That envelope is the only regime
+// production ever routes to the 8-bit kernel (the dispatch in bwamem.cpp sends
+// out-of-envelope pairs to getScores16), so it is the whole of getScores8's
+// contract. Its coverage here is the in-envelope short-read case plus the
+// repeat-rich, large-h0 case, which straddles the envelope boundary and checks
+// 8-bit only on admitted pairs. Long / out-of-envelope reads are the domain of
+// getScores16 -- it has no byte ceiling and is checked byte-identical to scalar
+// over the whole (short + long) set below. Pairs are generated with target >=
+// query (len1 >= len2), the envelope's domain. Every one of the six outputs
+// (score, tle, gtle, qle, gscore, max_off) must match the scalar reference on
+// the host SIMD tier. Runs on every CI matrix row that defines a vector kernel.
 
 #include <cstdint>
 #include <random>
@@ -237,10 +245,15 @@ RepeatStats run_repeat_parity(int n, int maxlen, int maxh0, unsigned long seed) 
 
 } // namespace
 
-TEST_CASE("bandedSWA getScores8 byte-identical to scalar (short + long reads)"
+TEST_CASE("bandedSWA getScores8 byte-identical to scalar within the 8-bit envelope"
           * doctest::test_suite("unit/bandedswa")) {
+    // getScores8 is exact only inside bsw8_envelope_ok (scores stay < 255): maxlen
+    // 120 with h0 <= 100 and a=1 keeps every pair's max attainable score in that
+    // envelope. There is deliberately no long-read 8-bit subcase -- out-of-envelope
+    // long reads are not part of getScores8's contract (production routes them to
+    // getScores16, covered below); in-envelope [128,254] coverage lives in the
+    // repeat-rich regression case further down.
     SUBCASE("short reads (maxlen 120)") { check_width(8, 3000, 120, 12345); }
-    SUBCASE("long reads (maxlen 1000)") { check_width(8, 1500, 1000, 12345); }
 }
 
 TEST_CASE("bandedSWA getScores16 byte-identical to scalar (short + long reads)"
