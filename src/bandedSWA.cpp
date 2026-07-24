@@ -5826,10 +5826,39 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
 
         exit0 = _mm_blendv_epi8(exit0, zero128, cmpim);
 
+        /* Row-invariant part of the gscore query-end gate (see the per-cell block
+         * below). Of its four terms, only cmpeq(j128, qlen_off128) varies with j:
+         * tail128 is finalised by the band-grow above, qlen_valid128 is loaded in
+         * the row prologue, and exit0 was just updated for this row -- none are
+         * touched inside the j loop. Factoring them out turns a 4-op mask into a
+         * 1-op cmpeq + 1 and, and lets a row whose gate is entirely zero skip the
+         * capture (both blends would be identity). AND is associative, so this is
+         * byte-identical. Worth doing because `minq` is min(len2) over all 16
+         * lanes, so ONE short-query lane switches this block on for nearly the
+         * whole band, for every lane, on every row. */
+        /* MEASURED DEAD END -- do not retry without new evidence.
+         *
+         * The gscore gate below ANDs four terms per DP cell, three of which are
+         * row-invariant (tail128, qlen_valid128, exit0). Hoisting them into a
+         * per-row `gscore_row_gate` is provably byte-identical and strictly fewer
+         * ops per cell, so it looks like free money. It measured:
+         *
+         *   +3.9%  SLOWER  (hoist + an _mm_movemask_epi8 row-skip)
+         *   +4.5%  SLOWER  (hoist alone, no movemask)
+         *
+         * Both regressed, so it is the hoist, not the movemask. The mechanism is
+         * register pressure: keeping the gate vector live across the whole j loop
+         * costs a register in a kernel that is already spilling, and the spill
+         * traffic dwarfs the 2 ALU ops per cell it saves. Recomputing inside the
+         * loop is cheaper than keeping it alive.
+         *
+         * Lesson: in this kernel, op-count reduction does not predict wall time.
+         */
+
 #if RDT
         tim1 = __rdtsc();
 #endif
-        
+
         // PR 17: pre-pass — build score vector sbt[j] for all band columns
         // once. Independent per-j, so vectorized loads/stores run at peak
         // throughput without carrying the DP core's dep chain. The gen_mat
@@ -5889,9 +5918,17 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
             // UNSIGNED >: maxRS1 = max_epu8(.,h11) >= bmaxRS always, so
             // (maxRS1 >u bmaxRS) == (maxRS1 != bmaxRS). Signed cmpgt_epi8 here
             // mis-read scores >127 (long reads) as negative.
-            __m128i cmpA = _mm_xor_si128(_mm_cmpeq_epi8(maxRS1, bmaxRS), ff128);
-            __m128i cmpB =_mm_cmpeq_epi8(maxRS1, h11);                  
-            cmpA = _mm_or_si128(cmpA, cmpB);
+            //
+            // The old form was  cmpA = (maxRS1 != bmaxRS) | (maxRS1 == h11).
+            // maxRS1 = max_epu8(bmaxRS, h11) is BY CONSTRUCTION either bmaxRS or
+            // h11, so (maxRS1 != bmaxRS) implies (maxRS1 == h11) and the OR
+            // collapses to the second term alone. Per lane:
+            //   h11 >  bmaxRS -> maxRS1 = h11   -> both terms true
+            //   h11 == bmaxRS -> maxRS1 = h11   -> first false, second true
+            //   h11 <  bmaxRS -> maxRS1 = bmaxRS-> both false
+            // Identical in all three cases, so this drops a cmpeq + xor + or per
+            // DP cell (10 ops -> 7 in this block). Byte-identical.
+            __m128i cmpA = _mm_cmpeq_epi8(maxRS1, h11);
             cmp1 = _mm_cmpgt_epi8(j128, tail128);
             cmp1 = _mm_or_si128(cmp1, cmp2);
             cmpA = _mm_blendv_epi8(y1_128, j128, cmpA);
