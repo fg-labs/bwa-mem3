@@ -858,26 +858,24 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
 //------------------------
             /* Banding calculation in pre-processing */
             uint8_t myband[SIMD_WIDTH8] __attribute__((aligned(64)));
-            uint8_t temp[SIMD_WIDTH8] __attribute__((aligned(64)));
             {
-                __m256i qlen256 = _mm256_load_si256((__m256i *) qlen);
-                __m256i sum256 = _mm256_add_epi8(qlen256, eb_ins256);
-                _mm256_store_si256((__m256i *) temp, sum256);               
-                for (int l=0; l<SIMD_WIDTH8; l++)
-                {
-                    double val = temp[l]/e_ins + 1.0;
-                    int max_ins = (int) val;
-                    max_ins = max_ins > 1? max_ins : 1;
-                    myband[l] = min_(bsize, max_ins);
-                }
-                sum256 = _mm256_add_epi8(qlen256, eb_del256);
-                _mm256_store_si256((__m256i *) temp, sum256);               
-                for (int l=0; l<SIMD_WIDTH8; l++) {
-                    double val = temp[l]/e_del + 1.0;
-                    int max_ins = (int) val;
-                    max_ins = max_ins > 1? max_ins : 1;
-                    myband[l] = min_(myband[l], max_ins);
-                    bsize = bsize < myband[l] ? myband[l] : bsize;
+                /* Per-lane band clamp in WIDE arithmetic, mirroring scalarBandedSWA's
+                 * "adjust $w if it is too large" block. See smithWatermanBatchWrapper8
+                 * (128-bit) for the full rationale: the previous 8-bit SIMD form wrapped
+                 * whenever qlen*max_sc + end_bonus - o was negative, silently disabling
+                 * the clamp and running a far wider band than the scalar reference.
+                 * Per-batch (SIMD_WIDTH8 lanes), not per-cell, so wide math is free. */
+                for (int l = 0; l < SIMD_WIDTH8; l++) {
+                    const int ql    = (int) qlen[l];
+                    const int reach = ql + eb;
+                    int max_ins = (int)((double)(reach - o_ins) / e_ins + 1.0);
+                    if (max_ins < 1) max_ins = 1;
+                    int max_del = (int)((double)(reach - o_del) / e_del + 1.0);
+                    if (max_del < 1) max_del = 1;
+                    int band = bsize;
+                    if (max_ins < band) band = max_ins;
+                    if (max_del < band) band = max_del;
+                    myband[l] = (uint8_t) band;
                 }
             }
             
@@ -2694,25 +2692,24 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
 //------------------------
             /* Banding calculation in pre-processing */
             uint8_t myband[SIMD_WIDTH8] __attribute__((aligned(64)));
-            uint8_t temp[SIMD_WIDTH8] __attribute__((aligned(64)));
             {
-                __m512i qlen512 = _mm512_load_si512((__m512i *) qlen);
-                __m512i sum512 = _mm512_add_epi8(qlen512, eb_ins512);
-                _mm512_store_si512((__m512i *) temp, sum512);               
-                for (int l=0; l<SIMD_WIDTH8; l++) {
-                    double val = temp[l]/e_ins + 1.0;
-                    int max_ins = val;
-                    max_ins = max_ins > 1? max_ins : 1;
-                    myband[l] = min_(bsize, max_ins);
-                }
-                sum512 = _mm512_add_epi8(qlen512, eb_del512);
-                _mm512_store_si512((__m512i *) temp, sum512);               
-                for (int l=0; l<SIMD_WIDTH8; l++) {
-                    double val = temp[l]/e_del + 1.0;
-                    int max_ins = val;
-                    max_ins = max_ins > 1? max_ins : 1;
-                    myband[l] = min_(myband[l], max_ins);
-                    bsize = bsize < myband[l] ? myband[l] : bsize;
+                /* Per-lane band clamp in WIDE arithmetic, mirroring scalarBandedSWA's
+                 * "adjust $w if it is too large" block. See smithWatermanBatchWrapper8
+                 * (128-bit) for the full rationale: the previous 8-bit SIMD form wrapped
+                 * whenever qlen*max_sc + end_bonus - o was negative, silently disabling
+                 * the clamp and running a far wider band than the scalar reference.
+                 * Per-batch (SIMD_WIDTH8 lanes), not per-cell, so wide math is free. */
+                for (int l = 0; l < SIMD_WIDTH8; l++) {
+                    const int ql    = (int) qlen[l];
+                    const int reach = ql + eb;
+                    int max_ins = (int)((double)(reach - o_ins) / e_ins + 1.0);
+                    if (max_ins < 1) max_ins = 1;
+                    int max_del = (int)((double)(reach - o_del) / e_del + 1.0);
+                    if (max_del < 1) max_del = 1;
+                    int band = bsize;
+                    if (max_ins < band) band = max_ins;
+                    if (max_del < band) band = max_del;
+                    myband[l] = (uint8_t) band;
                 }
             }
 
@@ -5318,25 +5315,41 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
             }
 //------------------------
             uint8_t myband[SIMD_WIDTH8] __attribute__((aligned(64)));
-            uint8_t temp[SIMD_WIDTH8] __attribute__((aligned(64)));
             {
-                __m128i qlen128 = _mm_load_si128((__m128i *) qlen);
-                __m128i sum128 = _mm_add_epi8(qlen128, eb_ins128);
-                _mm_store_si128((__m128i *) temp, sum128);              
-                for (int l=0; l<SIMD_WIDTH8; l++) {
-                    double val = temp[l]/e_ins + 1.0;
-                    int max_ins = (int) val;
-                    max_ins = max_ins > 1? max_ins : 1;
-                    myband[l] = min_(bsize, max_ins);
-                }
-                sum128 = _mm_add_epi8(qlen128, eb_del128);
-                _mm_store_si128((__m128i *) temp, sum128);              
-                for (int l=0; l<SIMD_WIDTH8; l++) {
-                    double val = temp[l]/e_del + 1.0;
-                    int max_ins = (int) val;
-                    max_ins = max_ins > 1? max_ins : 1;
-                    myband[l] = min_(myband[l], max_ins);
-                    bsize = bsize < myband[l] ? myband[l] : bsize;
+                // Per-lane band clamp, mirroring scalarBandedSWA's "adjust $w if it is
+                // too large" exactly (see the max_ins / max_del block there):
+                //   max_ins = max(1, (qlen*max_sc + end_bonus - o_ins)/e_ins + 1)
+                //   max_del = max(1, (qlen*max_sc + end_bonus - o_del)/e_del + 1)
+                //   band    = min(w, max_ins, max_del)
+                // where max_sc is the largest entry of the scoring matrix. It bounds how
+                // far a gap can profitably run before the end bonus can no longer repay
+                // it, so a wider band cannot contain the optimum.
+                //
+                // WIDE (int) ARITHMETIC IS LOAD-BEARING. This was computed with
+                // _mm_add_epi8(qlen, end_bonus - o) stored into a uint8_t: whenever
+                // qlen + end_bonus - o was NEGATIVE the int8 add wrapped and the byte read
+                // back near 255, so the clamp evaluated to ~256 and silently vanished.
+                // The kernel then ran the FULL band w where the scalar ran a band of 1,
+                // explored cells scalar never visits, and returned different gscore/gtle
+                // (the query-end fields) -- for example qlen=10, end_bonus=5, -O16 gives
+                // 10 + 5 - 16 = -1 -> 255. Reachable at bwa's DEFAULT -O6 as soon as
+                // end_bonus is small and the query is short (1 + 0 - 6 < 0). qlen[l]
+                // already holds qlen*max_sc (see the qlen SoA fill), so reach is just
+                // qlen[l] + end_bonus; that scaled reach does not fit int8, and this
+                // loop is per-batch (16 lanes), not per-cell, so there is nothing to
+                // gain by vectorizing it.
+                // Regression: test/unit/test_bandedswa_band_clamp.cpp.
+                for (int l = 0; l < SIMD_WIDTH8; l++) {
+                    const int ql   = (int) qlen[l];
+                    const int reach = ql + eb;
+                    int max_ins = (int)((double)(reach - o_ins) / e_ins + 1.0);
+                    if (max_ins < 1) max_ins = 1;
+                    int max_del = (int)((double)(reach - o_del) / e_del + 1.0);
+                    if (max_del < 1) max_del = 1;
+                    int band = bsize;
+                    if (max_ins < band) band = max_ins;
+                    if (max_del < band) band = max_del;
+                    myband[l] = (uint8_t) band;
                 }
             }
 
