@@ -345,6 +345,13 @@ typedef struct
     SMEM    *lockstep_match_buf[MAX_THREADS];
     int64_t  lockstep_buf_cap[MAX_THREADS];
 
+    // Reusable per-thread scratch for FMI_search::sortSMEMs' rid counting sort
+    // (audit SEED-15). Owned here so the count/offset and stable-scatter buffers
+    // are allocated once and grown on demand instead of malloc/free'd per batch.
+    // Each worker thread touches only its own [tid] slot, so the reuse is safe
+    // by construction even though the FMI_search instance itself is shared.
+    SmemSortScratch smem_sort_scratch[MAX_THREADS];
+
     // Pointer into worker_t::ref_string (the unpacked .0123 reference).
     // Set once in the worker_aln/worker_sam entry points; lets helpers like
     // mem_seed_sw and the mem_matesw_* family invoke bns_fetch_seq_v2 without

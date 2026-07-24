@@ -88,6 +88,22 @@ typedef struct smem_struct
     int64_t k, l, s;
 }SMEM;
 
+/* Reusable scratch for FMI_search::sortSMEMs' rid counting sort. Hoisted out of
+ * the per-batch malloc/free + memcpy (audit SEED-15): the caller owns one of
+ * these per worker thread (see mem_cache in bwamem.h) and passes it in on every
+ * batch, so the count/offset array (`cnt`) and the stable-scatter buffer (`tmp`)
+ * are allocated once and grown on demand instead of allocated and freed per
+ * call. Zero-initialize the struct before first use (all-NULL, zero caps); the
+ * owner frees `cnt`/`tmp` with _mm_free at teardown (both NULL-safe). One
+ * instance is single-threaded scratch — never share it across threads. */
+typedef struct smem_sort_scratch
+{
+    int64_t *cnt;     /* counting-sort count/offset array; >= observed rid range */
+    int64_t  cntCap;  /* allocated capacity of cnt, in int64_t entries           */
+    SMEM    *tmp;     /* stable-scatter output buffer; >= observed SMEM count     */
+    int64_t  tmpCap;  /* allocated capacity of tmp, in SMEM entries              */
+}SmemSortScratch;
+
 #define SAL_PFD 16
 
 #ifndef SMEM_LOCKSTEP_N
@@ -277,7 +293,8 @@ class FMI_search: public indexEle
                    int64_t numTotalSmem[],
                    int32_t numReads,
                    int32_t readlength,
-                   int nthreads);
+                   int nthreads,
+                   SmemSortScratch &scratch);
     int64_t get_sa_entry(int64_t pos);
     void get_sa_entries(int64_t *posArray,
                         int64_t *coordArray,

@@ -1686,7 +1686,8 @@ void FMI_search::sortSMEMs(SMEM *matchArray,
         int64_t numTotalSmem[],
         int32_t numReads,
         int32_t readlength,
-        int nthreads)
+        int nthreads,
+        SmemSortScratch &scratch)
 {
     /* The only property the caller needs from this sort is that every SMEM of a
      * given read (rid) is contiguous and the reads appear in ascending rid
@@ -1697,9 +1698,14 @@ void FMI_search::sortSMEMs(SMEM *matchArray,
      * unstable re-sort's handling of them cannot depend on their incoming order.
      *
      * rid is a dense index in [0, numReads), so a counting sort by rid replaces
-     * the O(n log n) function-pointer qsort with an O(n + rid_range) pass. Buffers
-     * are call-local: FMI_search is shared across worker threads, so no member
-     * scratch may be used here. */
+     * the O(n log n) function-pointer qsort with an O(n + rid_range) pass.
+     *
+     * The count/offset array (`cnt`) and the stable-scatter buffer (`tmp`) live
+     * in caller-owned scratch that is allocated once and reused across batches
+     * (audit SEED-15), replacing the old per-batch calloc/_mm_malloc + free.
+     * FMI_search is shared across worker threads, so no member scratch may be
+     * used here; the scratch instead comes from the caller's per-thread
+     * mem_cache slot (mmc->smem_sort_scratch[tid]) and is never shared. */
     int tid;
     int32_t perThreadQuota = (numReads + (nthreads - 1)) / nthreads;
     for(tid = 0; tid < nthreads; tid++)
@@ -1720,12 +1726,32 @@ void FMI_search::sortSMEMs(SMEM *matchArray,
         }
         int64_t range = (int64_t)maxRid - (int64_t)minRid + 1;
 
-        int64_t *cnt = (int64_t *) calloc((size_t)range, sizeof(int64_t));
-        SMEM    *tmp = (SMEM *) _mm_malloc((size_t)smem_count * sizeof(SMEM), 64);
-        if (cnt == NULL || tmp == NULL) {
-            fprintf(stderr, "ERROR: out of memory in %s\n", __func__);
-            exit(EXIT_FAILURE);
+        /* Grow the reused scratch on demand; it is never shrunk. cnt is zeroed
+         * over [0, range) below — exactly what the old per-call calloc did — so
+         * only the used prefix must be reset, not the whole capacity. tmp is
+         * fully overwritten by the scatter, so it needs no initialization. */
+        if (range > scratch.cntCap) {
+            _mm_free(scratch.cnt);
+            scratch.cnt = (int64_t *) _mm_malloc((size_t)range * sizeof(int64_t), 64);
+            if (scratch.cnt == NULL) {
+                fprintf(stderr, "ERROR: out of memory in %s\n", __func__);
+                exit(EXIT_FAILURE);
+            }
+            scratch.cntCap = range;
         }
+        if (smem_count > scratch.tmpCap) {
+            _mm_free(scratch.tmp);
+            scratch.tmp = (SMEM *) _mm_malloc((size_t)smem_count * sizeof(SMEM), 64);
+            if (scratch.tmp == NULL) {
+                fprintf(stderr, "ERROR: out of memory in %s\n", __func__);
+                exit(EXIT_FAILURE);
+            }
+            scratch.tmpCap = smem_count;
+        }
+        int64_t *cnt = scratch.cnt;
+        SMEM    *tmp = scratch.tmp;
+
+        memset(cnt, 0, (size_t)range * sizeof(int64_t));
 
         for (int64_t i = 0; i < smem_count; i++)
             cnt[myMatchArray[i].rid - minRid]++;
@@ -1738,11 +1764,8 @@ void FMI_search::sortSMEMs(SMEM *matchArray,
             int64_t b = (int64_t)myMatchArray[i].rid - minRid;
             tmp[cnt[b]++] = myMatchArray[i];
         }
-        /* tmp is a fresh allocation and cannot overlap myMatchArray */
+        /* tmp is distinct scratch storage and cannot overlap myMatchArray */
         memcpy(myMatchArray, tmp, (size_t)smem_count * sizeof(SMEM));
-
-        _mm_free(tmp);
-        free(cnt);
     }
 }
 
