@@ -965,6 +965,13 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "                  differently from bwa-mem2, which the default reproduces).\n");
     fprintf(stderr, "                  NOT byte-identical to the default (divergence confined to the\n");
     fprintf(stderr, "                  low-confidence tail).\n");
+    fprintf(stderr, "    --compat      byte-identical bwa-mem2 records: suppress the bwa-mem3-only\n");
+    fprintf(stderr, "                  MQ:i / HN:i tags, leaving records identical to bwa-mem2 v2.2.1\n");
+    fprintf(stderr, "                  on the drop-in profile. Suppresses output only; changes no\n");
+    fprintf(stderr, "                  alignment. @PG still differs (it is run-specific) -- exclude it\n");
+    fprintf(stderr, "                  when comparing. Mutually exclusive with --fast (which changes\n");
+    fprintf(stderr, "                  alignments) and with --meth (bwa-mem2 has no bisulfite mode) --\n");
+    fprintf(stderr, "                  combining them is an error [off]\n");
     fprintf(stderr, "Scoring options:\n");
     fprintf(stderr, "   -A INT        score for a sequence match, which scales options -TdBOELU unless overridden [%d]\n", opt->a);
     fprintf(stderr, "   -B INT        penalty for a mismatch [%d]\n", opt->b);
@@ -1159,6 +1166,7 @@ int main_mem(int argc, char *argv[])
         OPT_SKIP_CONTAINED_EXT,
         OPT_ADAPTIVE_BAND,
         OPT_EXTEND_MATE_CONCORDANT,
+        OPT_COMPAT,
 #ifdef STAGE_PROF
         OPT_PROFILE,
 #endif
@@ -1179,6 +1187,7 @@ int main_mem(int argc, char *argv[])
         {"chimera-qc",               no_argument,       0, OPT_METH_CHIMERA_QC},
         {"supp-rep-hard-cap",        required_argument, 0, OPT_SUPP_REP_HARD_CAP},
         {"seed-order",               required_argument, 0, OPT_SEED_ORDER},
+        {"compat",                   no_argument,       0, OPT_COMPAT},
         {"legacy-reader",            no_argument,       0, OPT_LEGACY_READER},
 #ifdef STAGE_PROF
         {"profile",                  required_argument, 0, OPT_PROFILE},
@@ -1392,6 +1401,7 @@ int main_mem(int argc, char *argv[])
                 return 1;
             }
         }
+        else if (c == OPT_COMPAT) opt->flag |= MEM_F_COMPAT;
         else if (c == OPT_SMEM_DEDUP) opt->smem_dedup = 1;
         else if (c == OPT_FAST) fast = 1;
         else if (c == OPT_SKIP_CONTAINED_EXT) opt->skip_contained_ext = 1;
@@ -1513,6 +1523,31 @@ int main_mem(int argc, char *argv[])
      * Output is NOT byte-identical to the default; divergence is confined to the
      * low-confidence tail (see docs/best-practices/settings-profiles.md).
      * meth_mode is already resolved here (parsed in the getopt loop above). */
+    /* --fast and --compat are mutually exclusive. --compat suppresses only
+     * additive output (MQ:i/HN:i) to reproduce bwa-mem2 byte-for-byte, but
+     * --fast deliberately CHANGES alignments; combining them would yield a
+     * diff-clean-looking stream over genuinely different alignments, defeating
+     * the parity-validation purpose of --compat. Reject up front. */
+    if (fast && (opt->flag & MEM_F_COMPAT)) {
+        fprintf(stderr, "[E::%s] --compat and --fast are mutually exclusive: "
+                "--compat targets byte-identical bwa-mem2 output, but --fast changes alignments\n",
+                __func__);
+        free(opt);
+        if (out_opened) fclose(aux.fp);
+        return 1;
+    }
+    /* --compat is a bwa-mem2 parity flag, but bwa-mem2 has no bisulfite mode, so
+     * "byte-identical to bwa-mem2" is undefined under --meth, which also emits
+     * meth-specific tags that --compat does not model. Reject the combination
+     * rather than silently half-suppress. */
+    if (opt->meth_mode && (opt->flag & MEM_F_COMPAT)) {
+        fprintf(stderr, "[E::%s] --compat is not supported with --meth: "
+                "--compat reproduces bwa-mem2 output, which has no methylation mode\n",
+                __func__);
+        free(opt);
+        if (out_opened) fclose(aux.fp);
+        return 1;
+    }
     if (fast) {
         if (!opt0.max_matesw)   opt->max_matesw   = 10;  /* -m 10 */
         if (!opt0.max_mem_intv) opt->max_mem_intv = 0;   /* -y 0  */

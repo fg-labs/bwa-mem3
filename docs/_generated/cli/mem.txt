@@ -32,6 +32,13 @@ Options:
                   differently from bwa-mem2, which the default reproduces).
                   NOT byte-identical to the default (divergence confined to the
                   low-confidence tail).
+    --compat      byte-identical bwa-mem2 records: suppress the bwa-mem3-only
+                  MQ:i / HN:i tags, leaving records identical to bwa-mem2 v2.2.1
+                  on the drop-in profile. Suppresses output only; changes no
+                  alignment. @PG still differs (it is run-specific) -- exclude it
+                  when comparing. Mutually exclusive with --fast (which changes
+                  alignments) and with --meth (bwa-mem2 has no bisulfite mode) --
+                  combining them is an error [off]
 Scoring options:
    -A INT        score for a sequence match, which scales options -TdBOELU unless overridden [1]
    -B INT        penalty for a mismatch [4]

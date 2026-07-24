@@ -76,6 +76,11 @@ typedef struct __smem_i smem_i;
 #define MEM_F_PRIMARY5  0x800
 #define MEM_F_KEEP_SUPP_MAPQ 0x1000
 #define MEM_F_XB        0x2000
+// --compat: suppress the bwa-mem3-only record additions (the MQ:i / HN:i tags)
+// so the SAM/BAM records are byte-identical to bwa-mem2 v2.2.1 on the drop-in
+// profile. Purely output-suppressing; changes no alignment. @PG is deliberately
+// left alone -- bwa-mem2 emits its own, and CL: is run-specific either way.
+#define MEM_F_COMPAT    0x4000
 
 
 /* D3 (--meth): bisulfite/TAPS SW scoring model, selected by --meth-scoring. All

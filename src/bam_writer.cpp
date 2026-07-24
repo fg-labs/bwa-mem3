@@ -402,7 +402,7 @@ int mem_aln_to_bam(struct bam1_t *b,
             bam_aux_append(b, "MC", 'Z', (int)mc->l + 1, (const uint8_t *)mc->s);
         /* no free: bs.mc.s persists across records, freed on thread exit */
     }
-    if (mp) {
+    if (mp && !(opt->flag & MEM_F_COMPAT)) {
         int32_t mq = (int32_t)mp->mapq;
         bam_aux_append(b, "MQ", 'i', sizeof(mq), (const uint8_t *)&mq);
     }
@@ -461,7 +461,7 @@ int mem_aln_to_bam(struct bam1_t *b,
     if (p.XA != NULL) {
         bam_aux_append(b, "XA", 'Z', (int)strlen(p.XA) + 1, (const uint8_t *)p.XA);
     }
-    if (p.HN >= 0) {
+    if (p.HN >= 0 && !(opt->flag & MEM_F_COMPAT)) {
         int32_t hn = (int32_t)p.HN;
         bam_aux_append(b, "HN", 'i', sizeof(hn), (const uint8_t *)&hn);
     }

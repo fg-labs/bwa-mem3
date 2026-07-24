@@ -383,6 +383,14 @@ jobs:
           SUPP_REP_PHIX_FA="$GITHUB_WORKSPACE/test/fixtures/phix.fa" \
           bash test/regression/supp_rep_hard_cap.sh
 
+      - name: --compat byte-identical regression (phix)
+        if: matrix.canonical == true
+        run: |
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          COMPAT_PHIX_FA="$GITHUB_WORKSPACE/test/fixtures/phix.fa" \
+          COMPAT_WORK_DIR=/tmp/compat-bytes \
+          bash test/regression/compat_byte_identical.sh
+
       - name: SE alignment smoke (chr22)
         if: matrix.canonical == true
         run: |

@@ -62,6 +62,47 @@ writing directly to final storage without a downstream sort step.
 > pipeline that immediately sorts or processes the output, this is faster than
 > SAM at no quality cost.
 
+#### `--compat` — byte-identical bwa-mem2 records
+
+Suppresses the two (and only two) things that keep the bwa-mem3 drop-in profile
+from being a literal byte-for-byte match to bwa-mem2 v2.2.1: the additive
+auxiliary tags `MQ:i` (mate MAPQ) and `HN:i` (hit count). With `--compat`,
+neither is emitted, so the SAM/BAM records are **byte-identical to bwa-mem2** on
+the drop-in profile (verified by stripping `MQ`/`HN` from a default run and
+diffing — the streams match exactly). It applies to both SAM text and `--bam`
+output.
+
+`--compat` is **output-suppressing only** — it changes no alignment, no score,
+no flag, and no other tag. It exists so that pipelines validating bwa-mem3
+against a bwa-mem2 golden can diff raw records without a tag-stripping step.
+
+Notes and caveats:
+
+- **Mutually exclusive with `--fast`.** Passing both is a hard error
+  (`--compat and --fast are mutually exclusive`), because `--fast` deliberately
+  *changes alignments* while `--compat` only removes additive fields — so
+  `--fast --compat` would produce a diff-clean-*looking* stream over genuinely
+  different alignments, defeating the parity-validation purpose. `--compat` is
+  for the drop-in profile. (It composes fine with the other opt-in levers that
+  are individually byte-identical, but if your goal is a bwa-mem2 match, run the
+  plain drop-in profile.)
+- **`@PG` is still emitted, by design.** bwa-mem2 writes its own `@PG`, so
+  suppressing ours would turn a *changed* line into a *missing* one — the diff is
+  non-empty either way, and suppression would only cost the record of what
+  actually produced the file. `@PG` is unmatchable by construction regardless:
+  `CL:` embeds the invocation and its paths, so even two bwa-mem2 runs from
+  different directories differ. Exclude `@PG` on both sides when comparing (e.g.
+  `samtools view` without the header, or `samtools view -H --no-PG`). Every
+  `@HD`/`@SQ`/`@RG` header line is preserved.
+- **`--compat` is non-`--meth` only, and combining them is a hard error**
+  (`--compat is not supported with --meth`). bwa-mem2 has no bisulfite mode, so
+  "byte-identical to bwa-mem2" is undefined under `--meth`, which also emits
+  methylation-specific tags that `--compat` does not model. It is meaningful
+  only on the standard bwa-mem2 drop-in path.
+
+See [Equivalence with bwa-mem2 → Byte-identical records
+(`--compat`)](../whats-different/equivalence.md#byte-identical-records---compat).
+
 #### `-R STR` — read group header
 
 Injects a `@RG` header line and tags every alignment with `RG:Z:<ID>`. The
