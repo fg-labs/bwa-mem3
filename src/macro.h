@@ -209,9 +209,8 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #define PE6 88
 #define PE7 89
 #define PE8 90
-#define PE11 91
-#define PE12 92
-#define PE13 93
+/* 91-93 (formerly PE11/PE12/PE13) are unused: the chaining-path seed-buffer
+ * re-alloc counters they named were removed along with their only reader. */
 #define PE14 94
 #define PE15 95
 #define PE16 96

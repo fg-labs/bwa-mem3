@@ -67,6 +67,58 @@ TEST_CASE("mem_chain_flt: single-chain fast path keeps the sole chain") {
     free(opt);
 }
 
+// bwa-mem2 parity for the degenerate "weight filter dropped everything" case.
+// The array is never compacted, so slot 0 still holds chain 0, and the legacy
+// seqid-range scan built the range {0,1} over that uncompacted slot -- returning
+// 1 with the chain marked kept = 3 rather than reporting zero survivors. That is
+// bwa-mem2's observable behaviour and this pins it.
+//
+// bwa-mem2 free()s slot 0's seeds in the filter and then returns the chain
+// pointing at the freed block, so its extension reads whatever the allocator
+// left behind. bwa-mem3 defers that one free, giving the same chain with its own
+// seeds intact. Reachable via -W, -x ont2d and -x pacbio/pbref, the only modes
+// that set a nonzero min_chain_weight. Build with ASAN=1 to catch a regression
+// here as a use-after-free rather than a silent data change.
+TEST_CASE("mem_chain_flt: dropping every chain resurrects slot 0 with live seeds") {
+    mem_opt_t *opt = mem_opt_init();
+    opt->min_chain_weight = 1000;  // far above the weight of the chains below
+
+    // m > SEEDS_PER_CHAIN puts the seeds on the heap rather than in the caller's
+    // seedBuf arena, so the weight filter's free(c->seeds) branch is the one taken.
+    const int m = SEEDS_PER_CHAIN + 1;
+    mem_chain_t chains[2]{};
+    for (int i = 0; i < 2; ++i) {
+        mem_seed_t *seeds = (mem_seed_t *)calloc(m, sizeof(mem_seed_t));
+        REQUIRE(seeds != NULL);
+        seeds[0].qbeg = 0;
+        seeds[0].rbeg = 1000 + 10000 * i;
+        seeds[0].len = 100;   // weight 100, well under min_chain_weight
+        seeds[0].score = 100;
+
+        chains[i].seqid = 0;
+        chains[i].rid = 0;
+        chains[i].n = 1;
+        chains[i].m = m;
+        chains[i].seeds = seeds;
+        chains[i].first = 7;
+        chains[i].kept = 0;
+    }
+    const mem_seed_t *slot0_seeds = chains[0].seeds;
+
+    CHECK(mem_chain_flt(opt, 2, chains, /*tid=*/0) == 1);
+
+    int kept = chains[0].kept;  // copy out of the bitfield: doctest binds a ref
+    CHECK(kept == 3);                          // resurrected slot is marked kept
+    CHECK(chains[0].first == -1);              // sentinel cleared by the filter loop
+    CHECK(chains[0].seeds == slot0_seeds);     // slot 0's seeds survived the filter
+    CHECK(chains[0].seeds[0].len == 100);      // ...and are readable (ASAN gate)
+
+    // Slot 0 comes back live, so its seeds are the caller's to release -- exactly
+    // what mem_kernel2_core's chain teardown does. Chain 1 was dropped and freed.
+    free(chains[0].seeds);
+    free(opt);
+}
+
 TEST_CASE("mem_mark_primary_se: single-region fast path normalizes the sole hit") {
     mem_opt_t *opt = mem_opt_init();
     const int64_t id = 12345;

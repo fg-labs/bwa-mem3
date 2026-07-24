@@ -202,7 +202,6 @@ struct mem_alnreg_t;
 // * Chaining *
 typedef struct abc {
     abc() {
-        done = 0;
         rbeg = qbeg = len = score = aln = 0;
         n_hits = 1;
     }
@@ -210,7 +209,6 @@ typedef struct abc {
     int32_t qbeg;
     int32_t len;
     int32_t score;
-    int8_t done;
     int aln;
     int32_t n_hits;  // SMEM SA occurrence count this seed came from; 1 = unique
 } mem_seed_t; // unaligned memory

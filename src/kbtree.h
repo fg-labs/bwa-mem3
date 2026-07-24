@@ -156,19 +156,24 @@ typedef struct {
 	}
 
 #define __KB_INTERVAL(name, key_t)										\
+	/* CHN-13: `upper` is optional -- pass NULL to skip its (often unused)		\
+	 * computation. Callers that only need the closest lower bound (e.g. the		\
+	 * chaining probe in mem_chain_seeds) avoid the extra per-level stores. When	\
+	 * upper != NULL the behaviour is byte-for-byte the original. */				\
 	static void kb_intervalp_##name(kbtree_##name##_t *b, const key_t * __restrict k, key_t **lower, key_t **upper)	\
 	{																	\
 		int i, r = 0;													\
 		kbnode_t *x = b->root;											\
-		*lower = *upper = 0;											\
+		*lower = 0; if (upper) *upper = 0;								\
 		while (x) {														\
 			i = __kb_getp_aux_##name(x, k, &r);							\
 			if (i >= 0 && r == 0) {										\
-				*lower = *upper = &__KB_KEY(key_t, x)[i];				\
+				*lower = &__KB_KEY(key_t, x)[i];						\
+				if (upper) *upper = &__KB_KEY(key_t, x)[i];				\
 				return;													\
 			}															\
 			if (i >= 0) *lower = &__KB_KEY(key_t, x)[i];				\
-			if (i < x->n - 1) *upper = &__KB_KEY(key_t, x)[i + 1];		\
+			if (upper && i < x->n - 1) *upper = &__KB_KEY(key_t, x)[i + 1];		\
 			if (x->is_internal == 0) return;							\
 			x = __KB_PTR(b, x)[i + 1];									\
 		}																\
