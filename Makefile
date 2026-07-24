@@ -844,7 +844,7 @@ $(ZLIBNG_LIB):
 	cd $(ZLIBNG_BUILD) && cmake $(ZLIBNG_CMAKE_FLAGS) .. && $(MAKE)
 
 clean: pgo-clean profile-clean lto-clean
-	rm -fr src/*.o src/version.h test/*.o $(BWA_LIB) $(EXE) kswv_nrow_zero_test kswv_freed_cell_test bandedswa_padding_test bandedswa_highzdrop_seed_test shm_section_find_test shm_pack_round_trip_test shm_lock_destroy_test kt_for_pool_test bwa-mem3.arm64
+	rm -fr src/*.o src/version.h test/*.o $(BWA_LIB) $(EXE) kswv_nrow_zero_test kswv_freed_cell_test bandedswa_padding_test bandedswa_highzdrop_seed_test bandedswa_high_h0_zdrop_test shm_section_find_test shm_pack_round_trip_test shm_lock_destroy_test kt_for_pool_test bwa-mem3.arm64
 	rm -f $(LIBSAIS_OBJS)
 	rm -f src/*.gcno src/*.gcda
 	$(MAKE) -C test clean

@@ -162,21 +162,13 @@ static inline void build_amat16(int8_t out[16], const int8_t *mat)
 template <typename T>
 static inline T effective_threads(T n) { return n < 1 ? T(1) : n; }
 
-// ---------------------------------------------------------------------------
-// 8-bit re-baseline floor helpers (shared by wrapper + every SIMD kernel tier)
-//
-// Initial 8-bit score floor: keep the seed score h0 inside the re-baseline
-// keep-window so the stored byte (= H_abs - B) stays within the unsigned [0,255] range.
-// Clamping prefixes >REBASE_KEEP below h0 is lossless (REBASE_KEEP=zdrop+1 >
-// zdrop => already past the z-drop horizon). MUST be used by every SIMD tier.
-// Defined at file scope (before any tier #if block) so every kernel variant
-// (AVX2, AVX-512BW, SSE2/NEON) sees the same definition.
-static inline int bsw8_rebase_keep(int zdrop)            { return zdrop + 1; }
-static inline int bsw8_initial_floor(int h0, int zdrop) {
-    int b0 = h0 - bsw8_rebase_keep(zdrop);
-    return b0 > 0 ? b0 : 0;
-}
-// ---------------------------------------------------------------------------
+// NOTE: the 8-bit re-baseline floor helpers that used to live here
+// (bsw8_rebase_keep / bsw8_initial_floor, computing the per-lane floor
+// B0 = max(0, h0 - (zdrop+1))) were removed together with the re-baseline
+// machinery itself: the routing gate bsw8_envelope_ok() admits a pair only
+// when its max attainable score stays inside the unsigned byte range, so the
+// floor was identically 0 for every admitted pair. Every 8-bit kernel tier now
+// stores plain absolute [0,255] scores and seeds from the raw h0.
 
 //-----------------------------------------------------------------------------------
 // constructor
@@ -714,21 +706,11 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
         if (max < w_mismatch) max = w_mismatch;
         if (max < w_ambig) max = w_ambig;
 
-        // Initial per-lane score floor B0 = max(0, h0 - REBASE_KEEP_W) (long-read
-        // 8-bit, seed score h0 >= 128). Seeding the H bytes from raw h0 overflows
-        // the signed-int8 score state on row 0, so we seed from the rebaselined
-        // h0' = min(h0, REBASE_KEEP_W) instead (see the per-lane h0 init below).
-        // REBASE_KEEP_W MUST equal the kernel's REBASE_KEEP (bsw8_rebase_keep)
-        // so the two agree on B0; smithWaterman256_8 recomputes B0 via
-        // bsw8_initial_floor(p[].h0, zdrop).
-        const int REBASE_KEEP_W = bsw8_rebase_keep(zdrop);
-        // The h0-prefix column/row seed below is unsigned-saturating [0,255], so
-        // the seeded byte min(h0, REBASE_KEEP_W) only needs to fit a uint8. The
-        // routing gate (bsw8_envelope_ok) enforces zdrop + maxStep <= 253 (so the
-        // re-baseline window REBASE_HI = 255 - maxStep > REBASE_KEEP holds);
-        // assert the byte bound for any direct caller that bypasses the gate.
-        assert(REBASE_KEEP_W <= 255 &&
-               "8-bit h0-prefix seed byte min(h0,REBASE_KEEP) must fit uint8 (zdrop<=254)");
+        // The h0-prefix column/row seed below is unsigned-saturating [0,255] and
+        // is seeded from the raw seed score h0 (no re-baseline floor): the only
+        // requirement is that the seed byte fit a uint8, which bsw8_envelope_ok()
+        // guarantees (h0 + min(len1,len2)*maxStep < 255 - maxStep => h0 < 255).
+        assert(this->zdrop >= 0 && "8-bit banded SW: negative zdrop");
 
         int nstart = 0, nend = numPairs;
 
@@ -740,7 +722,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
             int maxLen1 = 0;
             int maxLen2 = 0;
             bsize = w;
-            
+
             uint64_t tim;
             for(j = 0; j < SIMD_WIDTH8; j++)
             {
@@ -751,20 +733,20 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                 }
 
                 SeqPair sp = pairArray[i + j];
-                // Re-baseline the seed score into the int8 byte frame: seed the H
-                // arrays from h0' = h0 - B0 = min(h0, REBASE_KEEP_W) (clamped >= 0)
-                // so the initial bytes fit signed-int8 even when the true seed h0
-                // is several hundred (long-read). smithWaterman256_8 recomputes the
-                // matching B0 = max(0, h0 - REBASE_KEEP) from p[].h0 + zdrop and
-                // starts that lane's floor B there, so byte == H_absolute - B.
+                // Seed the H arrays from the raw seed score h0. The 8-bit state is
+                // now a plain unsigned [0,255] absolute score (the re-baseline floor
+                // B was removed with the inert re-baseline machinery), and the H
+                // seed uses unsigned-saturating ops, so the only bound is that the
+                // seed byte fit a uint8 -- guaranteed by bsw8_envelope_ok(), which
+                // admits a pair only when h0 + min(len1,len2)*maxStep < 255 - maxStep
+                // (hence h0 < 255). The previous prefix clamp min(h0, zdrop+1) existed
+                // only to keep the removed floor B0 = max(0, h0 - (zdrop+1)) at zero;
+                // with B gone it is pure loss -- it truncated the seed relative to
+                // best_abs (which records the raw h0), so a high-h0 pair that never
+                // beat its seed reported the wrong score. Clamp to uint8 only.
                 {
                     int h0p = sp.h0;
-                    if (h0p > REBASE_KEEP_W) h0p = REBASE_KEEP_W;
                     if (h0p < 0) h0p = 0;
-                    // Always-on uint8 guard (asserts are compiled out in release):
-                    // a direct caller that bypasses the gate with zdrop > 254 would
-                    // otherwise truncate the seed byte. In-envelope REBASE_KEEP_W <= 253,
-                    // so this never fires on the production path.
                     if (h0p > 255) h0p = 255;
                     h0[j] = (uint8_t) h0p;
                 }
@@ -796,9 +778,9 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
             __m256i h0_256 = _mm256_load_si256((__m256i*) h0);
             _mm256_store_si256((__m256i *) H2, h0_256);
             // h0-prefix deletion seed, unsigned-saturating [0,255]. Was signed
-            // sub_epi8 + max_epi8(.,0) floor, which required the seed byte
-            // min(h0,REBASE_KEEP) <= 127 and so capped zdrop at 126. subs_epu8
-            // floors at 0 inherently and feeds the floored value forward;
+            // sub_epi8 + max_epi8(.,0) floor, which required the seed byte to be
+            // <= 127 and so capped zdrop at 126. subs_epu8 floors at 0
+            // inherently and feeds the floored value forward;
             // byte-identical for the monotone-decreasing affine prefix. Mirrors
             // smithWaterman128_8 (the NEON reference, already unsigned here).
             __m256i tmp256 = _mm256_subs_epu8(h0_256, o_del256);
@@ -1407,6 +1389,18 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
 
                 __m256i y1c  = _mm256_add_epi32(y1g, vi);
                 __m256i yc   = _mm256_add_epi32(yg, _mm256_sub_epi32(xrg, vone));
+                // z-drop unset-best sentinel: y1c and yc each carry the +1 frame
+                // bias (y1 stores col-i+1) so the biases cancel in tmpj = mj-max_j,
+                // BUT only when a best score has been captured (xrow >= 1). While
+                // the best is still the h0 seed (xrow == 0), scalar's max_j == -1
+                // and its drift uses (mj - max_j) = mj + 1; the raw reconstruction
+                // yc = y256 + (xrow-1) gives -1 instead of the required max_j+1 = 0,
+                // under-counting the drift by 1 and firing the z-drop one row early.
+                // Force yc = 0 (== max_j+1 for the -1 sentinel) where xrow == 0 so
+                // the drift matches scalarBandedSWA exactly in the high-h0 regime
+                // (seed score never beaten before the z-drop horizon). This is a
+                // no-op once any row has beaten the seed (xrow >= 1).
+                yc = _mm256_andnot_si256(_mm256_cmpeq_epi32(xrg, _mm256_setzero_si256()), yc);
                 __m256i tmpi = _mm256_sub_epi32(vip1, xrg);
                 __m256i tmpj = _mm256_sub_epi32(y1c, yc);
                 // z-drop gap term weighted by gap-extend penalty, matching the
@@ -2566,21 +2560,11 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
         if (max < w_mismatch) max = w_mismatch;
         if (max < w_ambig) max = w_ambig;
 
-        // Initial per-lane score floor B0 = max(0, h0 - REBASE_KEEP_W) (long-read
-        // 8-bit, seed score h0 >= 128). Seeding the H bytes from raw h0 overflows
-        // the signed-int8 score state on row 0, so we seed from the rebaselined
-        // h0' = min(h0, REBASE_KEEP_W) instead (see the per-lane h0 init below).
-        // REBASE_KEEP_W MUST equal the kernel's REBASE_KEEP (bsw8_rebase_keep)
-        // so the two agree on B0; smithWaterman512_8 recomputes B0 via
-        // bsw8_initial_floor(p[].h0, zdrop).
-        const int REBASE_KEEP_W = bsw8_rebase_keep(zdrop);
-        // The h0-prefix column/row seed below is unsigned-saturating [0,255], so
-        // the seeded byte min(h0, REBASE_KEEP_W) only needs to fit a uint8. The
-        // routing gate (bsw8_envelope_ok) enforces zdrop + maxStep <= 253 (so the
-        // re-baseline window REBASE_HI = 255 - maxStep > REBASE_KEEP holds);
-        // assert the byte bound for any direct caller that bypasses the gate.
-        assert(REBASE_KEEP_W <= 255 &&
-               "8-bit h0-prefix seed byte min(h0,REBASE_KEEP) must fit uint8 (zdrop<=254)");
+        // The h0-prefix column/row seed below is unsigned-saturating [0,255] and
+        // is seeded from the raw seed score h0 (no re-baseline floor): the only
+        // requirement is that the seed byte fit a uint8, which bsw8_envelope_ok()
+        // guarantees (h0 + min(len1,len2)*maxStep < 255 - maxStep => h0 < 255).
+        assert(this->zdrop >= 0 && "8-bit banded SW: negative zdrop");
 
         int nstart = 0, nend = numPairs;
 
@@ -2592,7 +2576,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
             int maxLen1 = 0;
             int maxLen2 = 0;
             bsize = w;
-            
+
             uint64_t tim;
             for(j = 0; j < SIMD_WIDTH8; j++)
             {
@@ -2602,20 +2586,20 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                     _mm_prefetch((const char*) seqBufRef + (int64_t)spf.idr + 64, _MM_HINT_NTA);
                 }
                 SeqPair sp = pairArray[i + j];
-                // Re-baseline the seed score into the int8 byte frame: seed the H
-                // arrays from h0' = h0 - B0 = min(h0, REBASE_KEEP_W) (clamped >= 0)
-                // so the initial bytes fit signed-int8 even when the true seed h0
-                // is several hundred (long-read). smithWaterman512_8 recomputes the
-                // matching B0 = max(0, h0 - REBASE_KEEP) from p[].h0 + zdrop and
-                // starts that lane's floor B there, so byte == H_absolute - B.
+                // Seed the H arrays from the raw seed score h0. The 8-bit state is
+                // now a plain unsigned [0,255] absolute score (the re-baseline floor
+                // B was removed with the inert re-baseline machinery), and the H
+                // seed uses unsigned-saturating ops, so the only bound is that the
+                // seed byte fit a uint8 -- guaranteed by bsw8_envelope_ok(), which
+                // admits a pair only when h0 + min(len1,len2)*maxStep < 255 - maxStep
+                // (hence h0 < 255). The previous prefix clamp min(h0, zdrop+1) existed
+                // only to keep the removed floor B0 = max(0, h0 - (zdrop+1)) at zero;
+                // with B gone it is pure loss -- it truncated the seed relative to
+                // best_abs (which records the raw h0), so a high-h0 pair that never
+                // beat its seed reported the wrong score. Clamp to uint8 only.
                 {
                     int h0p = sp.h0;
-                    if (h0p > REBASE_KEEP_W) h0p = REBASE_KEEP_W;
                     if (h0p < 0) h0p = 0;
-                    // Always-on uint8 guard (asserts are compiled out in release):
-                    // a direct caller that bypasses the gate with zdrop > 254 would
-                    // otherwise truncate the seed byte. In-envelope REBASE_KEEP_W <= 253,
-                    // so this never fires on the production path.
                     if (h0p > 255) h0p = 255;
                     h0[j] = (uint8_t) h0p;
                 }
@@ -3233,6 +3217,19 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
 
                 __m512i y1c  = _mm512_add_epi32(y1g, vi);
                 __m512i yc   = _mm512_add_epi32(yg, _mm512_sub_epi32(xrg, vone));
+                // z-drop unset-best sentinel: y1c and yc each carry the +1 frame
+                // bias (y1 stores col-i+1) so the biases cancel in tmpj = mj-max_j,
+                // BUT only when a best score has been captured (xrow >= 1). While
+                // the best is still the h0 seed (xrow == 0), scalar's max_j == -1
+                // and its drift uses (mj - max_j) = mj + 1; the raw reconstruction
+                // yc = y512 + (xrow-1) gives -1 instead of the required max_j+1 = 0,
+                // under-counting the drift by 1 and firing the z-drop one row early.
+                // Force yc = 0 (== max_j+1 for the -1 sentinel) where xrow == 0 so
+                // the drift matches scalarBandedSWA exactly in the high-h0 regime
+                // (seed score never beaten before the z-drop horizon). This is a
+                // no-op once any row has beaten the seed (xrow >= 1).
+                const __mmask16 seedm = _mm512_cmpeq_epi32_mask(xrg, _mm512_setzero_si512());
+                yc = _mm512_mask_mov_epi32(yc, seedm, _mm512_setzero_si512());
                 __m512i tmpi = _mm512_sub_epi32(vip1, xrg);
                 __m512i tmpj = _mm512_sub_epi32(y1c, yc);
                 // z-drop gap term weighted by gap-extend penalty, matching the
