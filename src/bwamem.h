@@ -204,22 +204,32 @@ typedef struct abc {
 typedef struct {
     int32_t seqid, cseed;
     int32_t n, m, first, rid;
-    uint32_t w:29, kept:2, is_alt:1;
+    /* meth_hypothesis lives in this bitfield word — NOT as a trailing byte — so
+     * sizeof(mem_chain_t) is unchanged from upstream bwa-mem2 (48 B). This struct
+     * is the klib kbtree key type (KBTREE_INIT(chn, mem_chain_t, chain_cmp) in
+     * bwamem.cpp), and kbtree derives its B-tree node fan-out from sizeof(key_t)
+     * (ext .../kbtree.h: b->t = ((size-4-sizeof(void*))/(sizeof(void*)+sizeof(key_t))+1)>>1).
+     * Growing the struct changes the tree shape, which changes WHICH chain kb_getp
+     * returns as the merge neighbour when two chains tie on chain_cmp (== .pos),
+     * which regroups seeds into different chains and silently moves default output.
+     * Adding it as a trailing `int8_t` (padded to +8 B) did exactly that — it moved
+     * non-meth output away from bwa-mem2 (see the static_assert in bwamem.cpp).
+     * Values: 1 = OT (C→T, odd "f" seed contig), 0 = OB (G→A, even "r" seed
+     * contig), -1 = not a meth chain (non-meth runs leave this at -1). A signed
+     * 2-bit field represents {-2,-1,0,1}, covering all three values.
+     *
+     * For directional libraries (the --meth contract) each read is projected under
+     * a SINGLE hypothesis (R1→OT, R2→OB), so all of a read's seeds carry the same
+     * label and no cross-hypothesis merge can occur; test_and_merge is therefore
+     * NOT hypothesis-guarded. NOTE (--meth directional invariant): if non-
+     * directional / dual-hypothesis-per-read support is ever added, test_and_merge
+     * MUST gain a hypothesis guard (it is currently safe only because each read is
+     * single-hypothesis). */
+    uint32_t w:27, kept:2, is_alt:1;   /* unsigned: w/kept/is_alt are 0..N flags (kept reaches 3) */
+    int32_t  meth_hypothesis:2;        /* signed: needs -1; packs into the same 4-byte word (static_assert below) */
     float frac_rep;
     int64_t pos;
     mem_seed_t *seeds;
-    /* D3 (--meth, PR-3): per-chain bisulfite hypothesis label, carried from the
-     * seed→original remap so PR-4 can pick the asymmetric OT/OB matrix. Encoding
-     * matches the seed contig parity (seed_rid & 1): 1 = OT (C→T, odd "f" seed
-     * contig), 0 = OB (G→A, even "r" seed contig). -1 = not a meth chain
-     * (non-meth runs leave this at -1). For directional libraries (the --meth
-     * contract) each read is projected under a SINGLE hypothesis (R1→OT, R2→OB),
-     * so all of a read's seeds carry the same label and no cross-hypothesis merge
-     * can occur; test_and_merge is therefore NOT hypothesis-guarded.
-     * NOTE (--meth directional invariant): if non-directional / dual-hypothesis-
-     * per-read support is ever added, test_and_merge MUST gain a hypothesis guard
-     * (it is currently safe only because each read is single-hypothesis). */
-    int8_t meth_hypothesis;
 } mem_chain_t;
 
 typedef struct { size_t n, m, cc; mem_chain_t *a;  } mem_chain_v;

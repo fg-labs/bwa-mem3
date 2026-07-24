@@ -68,6 +68,18 @@ extern uint64_t tprof[LIM_R][LIM_C];
 #define chain_cmp(a, b) (((b).pos < (a).pos) - ((a).pos < (b).pos))
 KBTREE_INIT(chn, mem_chain_t, chain_cmp)
 
+/* chain_cmp orders chains by .pos ONLY, so chains that share a .pos are a tie
+ * whose resolution is left to the kbtree's internal structure. klib derives the
+ * B-tree node fan-out from sizeof(mem_chain_t) (kbtree.h), so changing that size
+ * changes which chain kb_getp returns at a tie, which regroups seeds and silently
+ * moves default (non-meth) output. This guard fails the build if mem_chain_t ever
+ * grows again — repack new fields into the existing bitfield word (see bwamem.h),
+ * do not append. 48 B is upstream bwa-mem2's size; keeping it preserves bwa-mem2
+ * chaining parity. */
+static_assert(sizeof(mem_chain_t) == 48,
+              "sizeof(mem_chain_t) feeds klib kbtree node fan-out; changing it moves default "
+              "output at chain_cmp .pos ties. Repack fields into the bitfield word, don't append.");
+
 #define intv_lt1(a, b) ((((uint64_t)(a).m) <<32 | ((uint64_t)(a).n)) < (((uint64_t)(b).m) <<32 | ((uint64_t)(b).n)))  // trial
 KSORT_INIT(mem_intv1, SMEM, intv_lt1)  // debug
 
