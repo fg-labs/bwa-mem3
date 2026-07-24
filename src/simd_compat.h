@@ -74,9 +74,33 @@
     #define _mm_malloc(size, align) _mm_malloc_compat(size, (align) < CACHE_LINE_BYTES ? CACHE_LINE_BYTES : (align))
     #define _mm_free(ptr) _mm_free_compat(ptr)
 
-    /* Prefetch compatibility */
+    /* Prefetch compatibility.
+     *
+     * Do NOT pass the SSE hint enum straight through as GCC's locality argument:
+     * the two scales are different, and for _MM_HINT_T0 they actively disagree.
+     *
+     *   SSE hint:            NTA=0    T0=1 (L1)   T1=2 (L2)   T2=3 (L3)
+     *   __builtin_prefetch:  0=stream 1=L3        2=L2        3=L1
+     *
+     * Passing the enum through maps T0 -> locality 1 -> `prfm pldl3keep`, i.e. the
+     * one hint that means "bring this to L1" was the one that landed in L3. NTA and
+     * T1 happen to coincide on both scales, so only T0 was wrong -- which is the hint
+     * used by the FM-index walk, whose entire lockstep design exists to make those
+     * lines L1-resident by the time the dependent load issues.
+     *
+     * Measured before this fix on arm64 (objdump src/FMI_search.o): 47 pldl3keep,
+     * 12 pldl2keep, ZERO pldl1keep.
+     *
+     * Note sse2neon does provide a correct _mm_prefetch, but as a FORCE_INLINE
+     * *function*, so `#ifndef _mm_prefetch` does not see it and this macro shadowed
+     * it. Mapping explicitly here is correct whether or not sse2neon is in play.
+     *
+     * Prefetches are pure hints: this cannot change output bytes. */
     #ifndef _mm_prefetch
-    #define _mm_prefetch(addr, hint) __builtin_prefetch((const void*)(addr), 0, (hint))
+    #define BWA3_PF_LOCALITY(hint) \
+        ((hint) == 0 ? 0 : (hint) == 1 ? 3 : (hint) == 2 ? 2 : 1)
+    #define _mm_prefetch(addr, hint) \
+        __builtin_prefetch((const void*)(addr), 0, BWA3_PF_LOCALITY(hint))
     #endif
 
     /* Mask types for SSE compatibility (sse2neon should provide these) */
