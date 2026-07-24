@@ -471,6 +471,40 @@ int bns_cnt_ambi(const bntseq_t *bns, int64_t pos_f, int len, int *ref_id)
 	return ctx.nn;
 }
 
+/* Byte->4-base lookup tables for the 2-bit packed `.pac`.
+ *
+ * A packed byte holds 4 bases, most-significant-first, matching `_get_pac`:
+ * for a global position `p`, the base occupies bits `(~p & 3) << 1 .. +1`, so
+ * the base at intra-byte position `j` (j == p & 3) is `(byte >> ((3-j)<<1)) & 3`.
+ *
+ *   fwd[byte][j] = base at intra-byte position j  (forward order, j = 0..3)
+ *   rev[byte][j] = 3 - base at intra-byte position (3-j)  (reverse strand:
+ *                  bases emitted high-position-first and base-complemented,
+ *                  i.e. rev[byte][j] = 3 - ((byte >> (j<<1)) & 3))
+ *
+ * The tables are `const` and populated exactly once at first use; the
+ * function-local static gives C++11 thread-safe initialization with no
+ * per-call rebuild.
+ */
+namespace {
+struct Pac2Nt4Lut {
+	uint8_t fwd[256][4];
+	uint8_t rev[256][4];
+	Pac2Nt4Lut() {
+		for (int b = 0; b < 256; ++b) {
+			for (int j = 0; j < 4; ++j) {
+				fwd[b][j] = (uint8_t)((b >> ((3 - j) << 1)) & 3);
+				rev[b][j] = (uint8_t)(3 - ((b >> (j << 1)) & 3));
+			}
+		}
+	}
+};
+const Pac2Nt4Lut &pac2nt4_lut() {
+	static const Pac2Nt4Lut lut;
+	return lut;
+}
+}  // namespace
+
 void bns_get_seq_into(int64_t l_pac, const uint8_t *pac,
                       int64_t beg, int64_t end,
                       uint8_t *dst, int64_t *len_out)
@@ -484,13 +518,29 @@ void bns_get_seq_into(int64_t l_pac, const uint8_t *pac,
 		if (beg >= l_pac) { // reverse strand
 			int64_t beg_f = (l_pac<<1) - 1 - end;
 			int64_t end_f = (l_pac<<1) - 1 - beg;
-			for (k = end_f; k > beg_f; --k) {
-				dst[l++] = 3 - _get_pac(pac, k);
+			const uint8_t (*rev)[4] = pac2nt4_lut().rev;
+			k = end_f;
+			// leading partial bases until k is the last base of its byte
+			for (; k > beg_f && (k & 3) != 3; --k) dst[l++] = 3 - _get_pac(pac, k);
+			// whole packed bytes: expand 4 rev-complemented bases per indexed load
+			for (; k - 4 >= beg_f; k -= 4) {
+				const uint8_t *q = rev[pac[k >> 2]];
+				dst[l++] = q[0]; dst[l++] = q[1]; dst[l++] = q[2]; dst[l++] = q[3];
 			}
+			// trailing partial bases
+			for (; k > beg_f; --k) dst[l++] = 3 - _get_pac(pac, k);
 		} else { // forward strand
-			for (k = beg; k < end; ++k) {
-				dst[l++] = _get_pac(pac, k);
+			const uint8_t (*fwd)[4] = pac2nt4_lut().fwd;
+			k = beg;
+			// leading partial bases until k is byte-aligned
+			for (; k < end && (k & 3) != 0; ++k) dst[l++] = _get_pac(pac, k);
+			// whole packed bytes: expand 4 bases per indexed load
+			for (; k + 4 <= end; k += 4) {
+				const uint8_t *q = fwd[pac[k >> 2]];
+				dst[l++] = q[0]; dst[l++] = q[1]; dst[l++] = q[2]; dst[l++] = q[3];
 			}
+			// trailing partial bases
+			for (; k < end; ++k) dst[l++] = _get_pac(pac, k);
 		}
 	} else {
 		*len_out = 0; // if bridging the forward-reverse boundary, return nothing
