@@ -468,7 +468,7 @@ ifneq ($(strip $(DISABLE_BATCHED_MATESW)),)
     CPPFLAGS += -DDISABLE_BATCHED_MATESW=$(DISABLE_BATCHED_MATESW)
 endif
 
-.PHONY:all myall arm64 clean depend single all-single print-mimalloc-config kswv_nrow_zero_test kswv_freed_cell_test bandedswa_padding_test bandedswa_highzdrop_seed_test shm_section_find_test shm_pack_round_trip_test shm_lock_destroy_test kt_for_pool_test test test-injection FORCE pgo-generate pgo-use pgo-clean profile-build profile-clean lto-build lto-clean docs docs-serve docs-cli docs-clean docs-install-tools
+.PHONY:all myall arm64 clean depend single all-single print-mimalloc-config kswv_nrow_zero_test kswv_freed_cell_test bandedswa_padding_test bandedswa_highzdrop_seed_test bandedswa_high_h0_zdrop_test shm_section_find_test shm_pack_round_trip_test shm_lock_destroy_test kt_for_pool_test test test-injection FORCE pgo-generate pgo-use pgo-clean profile-build profile-clean lto-build lto-clean docs docs-serve docs-cli docs-clean docs-install-tools
 .SUFFIXES:.cpp .o
 
 .cpp.o:
@@ -607,6 +607,13 @@ bandedswa_padding_test: $(BWA_LIB) $(HTS_LIB) src/bandedSWA.native.o test/banded
 bandedswa_highzdrop_seed_test: $(BWA_LIB) $(HTS_LIB) src/bandedSWA.native.o test/bandedswa_highzdrop_seed_test.o
 	$(CXX) $(BASE_CXXFLAGS) -march=native $(LDFLAGS) test/bandedswa_highzdrop_seed_test.o src/bandedSWA.native.o $(BWA_LIB) $(LIBS) -o $@
 
+# High-h0 / small-zdrop z-drop regression: getScores8 vs scalar with the seed
+# score h0 above zdrop+1 at small zdrop (the region a relaxed 8-bit routing
+# envelope would newly admit), where the z-drop drift's unset-best sentinel used
+# to fire the z-drop one row early.
+bandedswa_high_h0_zdrop_test: $(BWA_LIB) $(HTS_LIB) src/bandedSWA.native.o test/bandedswa_high_h0_zdrop_test.o
+	$(CXX) $(BASE_CXXFLAGS) -march=native $(LDFLAGS) test/bandedswa_high_h0_zdrop_test.o src/bandedSWA.native.o $(BWA_LIB) $(LIBS) -o $@
+
 # Build the test binaries with the same ARCH_FLAGS as libbwa.a so the
 # test binary's kswv.h preprocessor state (SIMD_WIDTH8, BWA_TESTS_HAVE_KSWV)
 # matches what libbwa.a was compiled with. Consumed by ci.yml so that e.g.
@@ -708,13 +715,14 @@ test/shm_pack_round_trip_test.o: test/shm_pack_round_trip_test.cpp
 # Note: depends on `bwa-mem3` so version_banner.sh has a binary to grep —
 # previously `test:` only built the test harness binaries, not the main
 # executable.
-test: test-binaries kswv_nrow_zero_test kswv_freed_cell_test bandedswa_padding_test bandedswa_highzdrop_seed_test shm_section_find_test shm_lock_destroy_test kt_for_pool_test bwa-mem3
+test: test-binaries kswv_nrow_zero_test kswv_freed_cell_test bandedswa_padding_test bandedswa_highzdrop_seed_test bandedswa_high_h0_zdrop_test shm_section_find_test shm_lock_destroy_test kt_for_pool_test bwa-mem3
 	./test/bwa_mem3_tests_unit
 	./test/bwa_mem3_tests_integration
 	./kswv_nrow_zero_test
 	./kswv_freed_cell_test
 	./bandedswa_padding_test
 	./bandedswa_highzdrop_seed_test
+	./bandedswa_high_h0_zdrop_test
 	./shm_section_find_test
 	./kt_for_pool_test
 	./shm_lock_destroy_test
@@ -743,6 +751,9 @@ test/bandedswa_padding_test.o: test/bandedswa_padding_test.cpp
 	$(CXX) -c $(BASE_CXXFLAGS) -march=native $(CPPFLAGS) $(INCLUDES) $< -o $@
 
 test/bandedswa_highzdrop_seed_test.o: test/bandedswa_highzdrop_seed_test.cpp
+	$(CXX) -c $(BASE_CXXFLAGS) -march=native $(CPPFLAGS) $(INCLUDES) $< -o $@
+
+test/bandedswa_high_h0_zdrop_test.o: test/bandedswa_high_h0_zdrop_test.cpp
 	$(CXX) -c $(BASE_CXXFLAGS) -march=native $(CPPFLAGS) $(INCLUDES) $< -o $@
 
 test/shm_section_find_test.o: test/shm_section_find_test.cpp
