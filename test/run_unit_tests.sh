@@ -124,6 +124,13 @@ ok "help_prescan_test"
 "$HERE/proc_freq_calibration_test.sh" "$BWAMEM3" "$FIXTURES" || fail "proc_freq_calibration_test failed"
 ok "proc_freq_calibration_test"
 
+# --- bam_compress_warn_test -----------------------------------------------
+# The compressed-BAM (--bam=N, N>0) single-writer-thread warning must fire
+# once, from the resolved --bam level, not once per occurrence and not for a
+# level a later --bam=0 overrides.
+"$HERE/bam_compress_warn_test.sh" "$BWAMEM3" "$FIXTURES" || fail "bam_compress_warn_test failed"
+ok "bam_compress_warn_test"
+
 # --- fast_preset_test -----------------------------------------------------
 # --fast bundles the four characterized speed levers; explicit flags override;
 # default path stays clean. Asserts on the resolved-opts audit line.

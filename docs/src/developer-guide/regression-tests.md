@@ -129,6 +129,7 @@ Additional integration shell scripts in `test/`:
 | `shm_meth_test.sh` | `--meth` index compatibility with `shm` |
 | `help_prescan_test.sh` | `--help` prints without running alignment |
 | `proc_freq_calibration_test.sh` | startup does not sleep to calibrate `proc_freq`, and the calibrated tick rate is plausible |
+| `bam_compress_warn_test.sh` | the `--bam=N` single-writer-thread warning fires once, for the resolved level only |
 | `libsais_*.sh` | libsais index correctness vs. BWA / determinism |
 
 ## Benchmark harness (`bench/`)
