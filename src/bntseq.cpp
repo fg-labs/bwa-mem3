@@ -536,6 +536,7 @@ namespace {
 struct PacFetchScratch {
     uint8_t *buf = nullptr;
     int64_t  cap = 0;
+    int64_t  prev_len = 0;  // length of the window currently held in buf (debug poison only)
     ~PacFetchScratch() { free(buf); }
 };
 }  // namespace
@@ -562,8 +563,8 @@ uint8_t *bns_get_seq_v2(int64_t l_pac, const uint8_t *pac, int64_t beg, int64_t 
 		 * (extension consumes rseq within the chain iteration; both mate-rescue
 		 * sites copy the window into seqBufRef immediately). This is a convention,
 		 * NOT enforceable as an in-function assert (the function cannot observe a
-		 * caller's later deref). The NDEBUG poison-fill below is a best-effort
-		 * detector: it 0xFF's the prior window so a stale read trips the byte-
+		 * caller's later deref). The BWA_MEM3_DEBUG_POISON poison-fill below is a
+		 * best-effort detector: it 0xFF's the prior window so a stale read trips the byte-
 		 * identity / BAM-cmp golden gate rather than silently mis-scoring.
 		 * seqb (the caller's scratch) is intentionally left untouched. */
 		static thread_local PacFetchScratch t_pf;
@@ -588,13 +589,30 @@ uint8_t *bns_get_seq_v2(int64_t l_pac, const uint8_t *pac, int64_t beg, int64_t 
 			t_pf.buf = nb; t_pf.cap = need;
 		}
 		(void)seqb;
-#ifndef NDEBUG
-		if (t_pf.buf && t_pf.cap > 0) memset(t_pf.buf, 0xFF, (size_t)t_pf.cap); /* poison prior window */
+		/* Poisoning the prior window is a DEBUG aid, not production behaviour. It was
+		 * gated on `#ifndef NDEBUG`, but this build never defines NDEBUG, so it ran in
+		 * every shipped binary -- and it memset the whole high-water `cap`, not the
+		 * `need` bytes actually about to be written. On a 5M-pair PE run that is tens of
+		 * millions of ~1 KB memsets (tens of GB of stores) whose result is immediately
+		 * overwritten by bns_get_seq_into below.
+		 *
+		 * Now opt-in via BWA_MEM3_DEBUG_POISON so it cannot silently return. Poison the
+		 * FULL prior window (`t_pf.prev_len`, recorded after the last fetch), not the
+		 * current `need`: the point is to catch a caller that stale-reads the previous
+		 * window, which may be LONGER than this fetch -- scoping to `need` would leave
+		 * the prior window's tail (bytes need..prev_len) un-poisoned and stale reads
+		 * there undetected. prev_len is always <= cap by construction, so this stays in
+		 * bounds. Byte-identical: production never defines the macro, so nothing runs. */
+#ifdef BWA_MEM3_DEBUG_POISON
+		if (t_pf.buf && t_pf.prev_len > 0) memset(t_pf.buf, 0xFF, (size_t)t_pf.prev_len); /* poison prior window */
 #endif
 		/* Fetch with the already-clamped [b, e) so the bytes written stay in
 		 * lock-step with `need` (the buffer size). bns_get_seq_into re-derives
 		 * the same clamp, so this is byte-identical to passing [beg, end). */
 		bns_get_seq_into(l_pac, pac, b, e, t_pf.buf, len);
+#ifdef BWA_MEM3_DEBUG_POISON
+		t_pf.prev_len = *len;  /* record this window's length so the NEXT call poisons all of it */
+#endif
 		return (*len > 0) ? t_pf.buf : 0;
 	}
 	if (end < beg) end ^= beg, beg ^= end, end ^= beg; // if end is smaller, swap
