@@ -1386,7 +1386,7 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
     for (r = 0; r < 4; ++r)
     {
         int is_rev, is_larger;
-        uint8_t *seq, *rev = 0, *ref = 0;
+        uint8_t *ref = 0;
         int64_t rb, re;
         if (skip[r]) {
             gar[gcnt + r] = -1;
@@ -1395,12 +1395,13 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
         is_rev = (r>>1 != (r&1)); // whether to reverse complement the mate
         is_larger = !(r>>1); // whether the mate has larger coordinate
 
-        if (is_rev) {
-            rev = (uint8_t*) malloc(l_ms); // this is the reverse complement of $ms
-            assert(rev != NULL);
-            for (i = 0; i < l_ms; ++i) rev[l_ms - 1 - i] = ms[i] < 4? 3 - ms[i] : 4;
-            seq = rev;
-        } else seq = (uint8_t*)ms;
+        /* RESC-A7: the mate query bases ($ms) are directly readable, so the
+         * reverse-complement (is_rev orientations) is built straight into the
+         * kernel input buffer (seqBufQer) at enqueue time below — eliminating
+         * the per-orientation `rev` scratch malloc/free and the redundant
+         * second copy that staged rev -> seqBufQer. The forward orientation
+         * likewise copies $ms directly. Byte-identical to the old rev buffer
+         * (see the enqueue copy below for the equivalence argument). */
 
         if (!is_rev) {
             rb = is_larger? a->rb + pes[r].low : a->rb - pes[r].high;
@@ -1446,7 +1447,6 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                 // rescue. Leave gar = -1 so mem_matesw_batch_post re-runs this
                 // orientation through ksw_align2 with the asymmetric matrix.
                 gar[gcnt + r] = -1;
-                if (rev) free(rev);
                 continue;
             }
             //kswr_t aln;
@@ -1549,8 +1549,29 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
             
                 uint8_t *qs = seqBufQer + sp.idq;
                 uint8_t *rs = seqBufRef + sp.idr;
-                for (int l=0; l<sp.len1; l++) rs[l] = ref[l];
-                for (int l=0; l<sp.len2; l++) qs[l] = seq[l];
+                /* RESC-A7: the ref-window copy into seqBufRef is IRREDUCIBLE and
+                 * is retained. It cannot be replaced by aliasing mmc->ref_string
+                 * (the "phase-0 reads ref_string directly" idea) because:
+                 *   (1) mem_sam_pe_batch_run reverses seqBufRef+idr IN PLACE
+                 *       (revseq) between the two kswv phases, and ref_string may be
+                 *       a PROT_READ shm mapping — writing it would corrupt the
+                 *       shared reference / SIGSEGV (mirrored by the ref_rw scratch
+                 *       copy in mem_matesw_batch_post's scalar fallback); and
+                 *   (2) SeqPair.idr is int32, so seqBufRef+idr cannot address the
+                 *       doubled reference (~6.4e9 on hg38) even if we tried.
+                 * The per-byte loop is kept as memcpy (same bytes, matches the
+                 * _post ref_rw memcpy), which is byte-identical. */
+                memcpy(rs, ref, (size_t)sp.len1);
+                /* Query: stage the mate bases directly from $ms (no `rev`
+                 * scratch). For is_rev, reverse-complement into qs; this is
+                 * byte-identical to the removed two-step (build rev, then
+                 * qs[l]=rev[l]) because rev[l] == ms[l_ms-1-l]<4 ? 3-ms[l_ms-1-l]
+                 * : 4 and sp.len2 == l_ms. */
+                if (is_rev)
+                    for (int l = 0; l < sp.len2; l++)
+                        qs[l] = ms[sp.len2 - 1 - l] < 4 ? 3 - ms[sp.len2 - 1 - l] : 4;
+                else
+                    memcpy(qs, ms, (size_t)sp.len2);
 
                 /* Tag the enqueued meth pair with a single hypothesis = the
                  * rescued mate's read# chemistry XOR rescue strand
@@ -1572,7 +1593,7 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                 seqPairArray[pcnt++] = sp;
             }
         }
-        if (rev) free(rev);
+        // RESC-A7: no `rev` scratch to free (mate query staged directly above).
         // ref aliases ref_string (see bns_fetch_seq_v2 above); no free.
     }
     if (ms2) free(ms2);
@@ -1652,19 +1673,17 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
 
     for (r = 0; r < 4; ++r) {
         int is_rev, is_larger;
-        uint8_t *seq, *rev = 0, *ref = 0;
+        uint8_t *seq = 0, *rev = 0, *ref = 0;
         int64_t rb, re;
         if (skip[r]) {
                 continue;
         }
         is_rev = (r>>1 != (r&1)); // whether to reverse complement the mate
         is_larger = !(r>>1); // whether the mate has larger coordinate
-        if (is_rev) {
-            rev = (uint8_t*) malloc(l_ms); // this is the reverse complement of $ms
-            assert(rev != NULL);
-            for (i = 0; i < l_ms; ++i) rev[l_ms - 1 - i] = ms[i] < 4? 3 - ms[i] : 4;
-            seq = rev;
-        } else seq = (uint8_t*)ms;
+        // The mate query `seq` (and its reverse-complement buffer `rev`) is read
+        // only by the scalar ksw_align2 fallback (index == -1); the batched kswv
+        // path reads its result out of *myaln and never touches `seq`. Defer the
+        // malloc + fill into that branch so the common batched path skips it.
         if (!is_rev) {
             rb = is_larger? a->rb + pes[r].low : a->rb - pes[r].high;
             re = (is_larger? a->rb + pes[r].high: a->rb - pes[r].low) + l_ms; // if on the same strand, end position should be larger to make room for the seq length
@@ -1696,6 +1715,16 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                 // fprintf(stderr, "Re-routing: Encountered -ve index for "
                 // "gcnt: %d, look into pre.\n", gcnt + r);
                 assert(ref != 0);
+                // Build the mate query here (only the scalar path reads it):
+                // reverse-complement `ms` into `rev` for the RC orientations,
+                // else point straight at `ms`. Freed by the `if (rev) free(rev)`
+                // at the bottom of the r-loop (rev stays 0 on the batched path).
+                if (is_rev) {
+                    rev = (uint8_t*) malloc(l_ms); // reverse complement of $ms
+                    assert(rev != NULL);
+                    for (i = 0; i < l_ms; ++i) rev[l_ms - 1 - i] = ms[i] < 4? 3 - ms[i] : 4;
+                    seq = rev;
+                } else seq = (uint8_t*)ms;
                 // ksw_align2 reverses its target argument in place via
                 // revseq (see ksw.cpp:375,381). When mmc->ref_string is
                 // shm-backed (PROT_READ mmap of /dev/shm/bwaidx-*), that
