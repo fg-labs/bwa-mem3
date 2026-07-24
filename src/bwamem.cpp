@@ -2335,6 +2335,7 @@ static void worker_aln(void *data, int seq_id, int batch_size, int tid)
 
 }
 
+
 /* Kernel, called by threads */
 static void worker_bwt(void *data, int seq_id, int batch_size, int tid)
 {
@@ -2388,6 +2389,18 @@ int64_t sort_classify(mem_cache *mmc, int64_t pcnt, int tid)
     }
 
     return pos8;
+}
+
+/* Fused seed+extend work item: runs mem_kernel1_core then mem_kernel2_core on the
+ * SAME reads while they are still hot in this thread's cache, instead of paying a
+ * global barrier and a full DRAM round-trip of chain_ar/seedBuf between two
+ * separate kt_for passes. Both halves are per-read independent, so this is
+ * byte-identical; worker_bwt's seedBufSz tail adjustment is preserved verbatim by
+ * delegating rather than inlining. */
+static void worker_bwt_aln(void *data, int seq_id, int batch_size, int tid)
+{
+    worker_bwt(data, seq_id, batch_size, tid);
+    worker_aln(data, seq_id, batch_size, tid);
 }
 
 static void worker_sam(void *data, int seqid, int batch_size, int tid)
@@ -2528,13 +2541,19 @@ void mem_process_seqs(mem_opt_t *opt,
     int n_ = n;
 
     uint64_t tim = __rdtsc();
-    fprintf(stderr, "[0000] 1. Calling kt_for - worker_bwt\n");
+    fprintf(stderr, "[0000] 1. Calling kt_for - worker_bwt_aln (fused)\n");
 
-    kt_for(worker_bwt, &w, n_); // SMEMs (+SAL)
-
-    fprintf(stderr, "[0000] 2. Calling kt_for - worker_aln\n");
-
-    kt_for(worker_aln, &w, n_); // BSW
+    /* FUSED: these were two separate kt_for passes over the whole chunk. Both are
+     * strictly per-work-item -- worker_bwt writes chain_ar[seq_id..] / seedBuf for
+     * its own reads and worker_aln reads exactly those, with no cross-read
+     * dependency, and the only thing that sat between them was an fprintf. Running
+     * them as one pass removes a 16-way global barrier per chunk and, more
+     * importantly, keeps that chunk's chains and seeds in L2 instead of streaming
+     * them out to DRAM at the end of pass 1 and back in at the start of pass 2
+     * (order of GB per chunk). Byte-identical: per-read results are independent and
+     * the only tid-keyed state (w.mmc) is scratch consumed inside a single call.
+     * mem_pestat's barrier below is unaffected and must stay. */
+    kt_for(worker_bwt_aln, &w, n_); // SMEMs (+SAL) then BSW, fused
     tprof[WORKER10][0] += __rdtsc() - tim;
 
 
