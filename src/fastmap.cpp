@@ -283,6 +283,11 @@ void worker_alloc(const mem_opt_t *opt, worker_t &w, int32_t nreads, int32_t nth
         w.mmc.lockstep_prev[l]      = NULL;
         w.mmc.lockstep_match_buf[l] = NULL;
         w.mmc.lockstep_buf_cap[l]   = 0;
+
+        w.mmc.smem_sort_scratch[l].cnt    = NULL;
+        w.mmc.smem_sort_scratch[l].cntCap = 0;
+        w.mmc.smem_sort_scratch[l].tmp    = NULL;
+        w.mmc.smem_sort_scratch[l].tmpCap = 0;
     }
 
     allocMem = nthreads * (BATCH_SIZE + 32) * sizeof(int32_t);
@@ -331,6 +336,9 @@ void worker_free(worker_t &w, int32_t nthreads)
 
         _mm_free(w.mmc.lockstep_prev[l]);
         _mm_free(w.mmc.lockstep_match_buf[l]);
+
+        _mm_free(w.mmc.smem_sort_scratch[l].cnt);
+        _mm_free(w.mmc.smem_sort_scratch[l].tmp);
     }
 }
 

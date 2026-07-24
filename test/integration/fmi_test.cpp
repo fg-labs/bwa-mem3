@@ -175,6 +175,9 @@ int main(int argc, char **argv) {
     {
         int32_t *rid_array = (int32_t *)_mm_malloc(batch_size * sizeof(int32_t), 64);
         int32_t tid = omp_get_thread_num();
+        // Per-thread sortSMEMs counting-sort scratch: allocated once here and
+        // grown on demand inside sortSMEMs, never shared across threads.
+        SmemSortScratch sortScratch = {NULL, 0, NULL, 0};
         // Initial capacity must hold at least one batch's worst case so the
         // first grow check below has a real budget to compare against. When
         // numthreads > numReads, perThreadQuota is 0 and the legacy
@@ -228,7 +231,8 @@ int main(int argc, char **argv) {
                     numTotalSmem + batch_id,
                     batch_count,
                     max_readlength,
-                    1);
+                    1,
+                    sortScratch);
             for(j = 0; j < numTotalSmem[batch_id]; j++)
             {
                 matchArray[tid][myTotalSmems + j].rid += i;
@@ -241,6 +245,8 @@ int main(int argc, char **argv) {
         int64_t endTick = __rdtsc();
         printf("%d] %ld ticks, workTicks = %ld\n", tid, endTick - startTick, workTicks[tid]);
         _mm_free(rid_array);
+        _mm_free(sortScratch.cnt);
+        _mm_free(sortScratch.tmp);
     }
 
     endTick = __rdtsc();

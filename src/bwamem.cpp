@@ -1441,7 +1441,7 @@ SMEM *mem_collect_smem(FMI_search *fmi, const mem_opt_t *opt,
     tot_smem = num_smem1 + num_smem2 + num_smem3;
     // assert(mmc->wsize_mem[tid] > (tot_smem));
     // fprintf(stderr, "num_smems: %d %d %d, %d\n", num_smem1, num_smem2, num_smem3, tot_smem);
-    fmi->sortSMEMs(matchArray, &tot_smem, nseq, seq_[0].l_seq, 1); // seq_[0].l_seq - only used for blocking when using nthreads
+    fmi->sortSMEMs(matchArray, &tot_smem, nseq, seq_[0].l_seq, 1, mmc->smem_sort_scratch[tid]); // seq_[0].l_seq - only used for blocking when using nthreads
 
     pos = 0;
     int64_t smem_ptr = 0;

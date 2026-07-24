@@ -178,11 +178,16 @@ int main(int argc, char **argv) {
     }
     printf("totalSmems = %ld\n", totalSmem);
 
+    // sortSMEMs' counting-sort scratch is caller-owned; this call site is
+    // single-threaded (sortSMEMs loops over the per-thread blocks itself), so
+    // one instance suffices.
+    SmemSortScratch sortScratch = {NULL, 0, NULL, 0};
     fmiSearch->sortSMEMs(matchArray,
             numTotalSmem,
             numReads,
             readlength,
-            numthreads);
+            numthreads,
+            sortScratch);
 
     int32_t perThreadQuota = (numReads + (numthreads - 1)) / numthreads;
     for(tid = 0; tid < numthreads; tid++)
@@ -205,6 +210,8 @@ int main(int argc, char **argv) {
     }
     
     free(enc_qdb);
+    _mm_free(sortScratch.cnt);
+    _mm_free(sortScratch.tmp);
     _mm_free(matchArray);
     _mm_free(max_intv_array);
     delete fmiSearch;
