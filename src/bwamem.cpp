@@ -3347,21 +3347,37 @@ inline void sortPairsLenExt(SeqPair *pairArray, int32_t count, SeqPair *tempArra
     }
 }
 
-inline void sortPairsLen(SeqPair *pairArray, int32_t count, SeqPair *tempArray, int32_t *hist)
+/* Counting-sort the tier's pairs so lanes packed into one SIMD group have
+ * similar dimensions. `key_by_max` selects the sort key:
+ *   false (16-bit tier): key = len1 (the historical bwa-mem2 behavior).
+ *   true  (8-bit tier, EXT-13): key = max(len1, len2). The int8 kernel derives
+ *     its per-group column count (`ncol`, from maxLen2) and gscore threshold
+ *     (`minq`, from min len2) across the whole lane group, so packing purely by
+ *     len1 leaves both pessimal whenever len2 varies. Keying on max(len1,len2)
+ *     groups pairs of similar total extent, tightening ncol/minq.
+ *
+ * This changes only the ORDER in which pairs are packed into lane groups: each
+ * pair's banded-SW result is computed per-lane from its own len1/len2/band, and
+ * the caller scatters results back by the pair's unique (seqid, regid), so the
+ * reorder is output-invariant (byte-identical). The counting sort remains stable
+ * (equal keys keep input order) regardless of which key is chosen. */
+inline void sortPairsLen(SeqPair *pairArray, int32_t count, SeqPair *tempArray, int32_t *hist,
+                         bool key_by_max)
 {
 
     int32_t i;
     if (count <= 0) return;
 
-    /* Bins are keyed directly by len1, so only [minLen, maxLen] is ever touched;
-     * clearing + cumulating the full [0, MAX_SEQ_LEN16] range every call was
-     * O(32768) regardless of count. Window to the actual length range — output
+    /* Bins are keyed directly by the sort key, so only [minLen, maxLen] is ever
+     * touched; clearing + cumulating the full [0, MAX_SEQ_LEN16] range every call
+     * was O(32768) regardless of count. Window to the actual key range — output
      * is identical because every pair falls in [minLen, maxLen], bins below add
      * 0 to the cumulative sum, and bins above are never read. */
-    int32_t minLen = pairArray[0].len1, maxLen = pairArray[0].len1;
+    int32_t key0 = key_by_max ? max_(pairArray[0].len1, pairArray[0].len2) : pairArray[0].len1;
+    int32_t minLen = key0, maxLen = key0;
     for(i = 1; i < count; i++)
     {
-        int32_t L = pairArray[i].len1;
+        int32_t L = key_by_max ? max_(pairArray[i].len1, pairArray[i].len2) : pairArray[i].len1;
         if (L < minLen) minLen = L;
         if (L > maxLen) maxLen = L;
     }
@@ -3370,7 +3386,8 @@ inline void sortPairsLen(SeqPair *pairArray, int32_t count, SeqPair *tempArray, 
     for(i = 0; i < count; i++)
     {
         SeqPair sp = pairArray[i];
-        hist[sp.len1]++;
+        int32_t key = key_by_max ? max_(sp.len1, sp.len2) : sp.len1;
+        hist[key]++;
     }
     int32_t cumulSum = 0;
     for(i = minLen; i <= maxLen; i++)
@@ -3383,10 +3400,11 @@ inline void sortPairsLen(SeqPair *pairArray, int32_t count, SeqPair *tempArray, 
     for(i = 0; i < count; i++)
     {
         SeqPair sp = pairArray[i];
-        int32_t pos = hist[sp.len1];
+        int32_t key = key_by_max ? max_(sp.len1, sp.len2) : sp.len1;
+        int32_t pos = hist[key];
 
         tempArray[pos] = sp;
-        hist[sp.len1]++;
+        hist[key]++;
     }
 
     for(i = 0; i < count; i++) {
@@ -3429,7 +3447,7 @@ static inline void bsw_tier_kernel(BswMethTier tier, IBandedPairWiseSW *bsw,
 #if !HAVE_BSW_VECTOR_8_16
         bsw->scalarBandedSWAWrapper(pa, ref, qer, n, nthreads, w);
 #else
-        sortPairsLen(pa, n, sort_scratch, hist);
+        sortPairsLen(pa, n, sort_scratch, hist, /*key_by_max=*/false);
         bsw->getScores16(pa, ref, qer, n, nthreads, w);
 #endif
         break;
@@ -3437,7 +3455,10 @@ static inline void bsw_tier_kernel(BswMethTier tier, IBandedPairWiseSW *bsw,
 #if !HAVE_BSW_VECTOR_8_16
         bsw->scalarBandedSWAWrapper(pa, ref, qer, n, nthreads, w);
 #else
-        sortPairsLen(pa, n, sort_scratch, hist);
+        /* EXT-13: pack the int8 lane groups by max(len1,len2) so ncol/minq are
+         * tight (len2 varies within a len1-keyed group). Byte-identical: only
+         * the packing order changes; results scatter back by (seqid,regid). */
+        sortPairsLen(pa, n, sort_scratch, hist, /*key_by_max=*/true);
         /* int8 diagonal encoding can't represent a band >= 128; divert to the
          * 16-bit kernel once the doubling retry pushes w past the envelope. */
         if (w <= BSW8_MAX_W) bsw->getScores8(pa, ref, qer, n, nthreads, w);
