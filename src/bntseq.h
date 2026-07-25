@@ -53,6 +53,14 @@ typedef struct {
 	char amb;
 } bntamb1_t;
 
+/* SAM-A3: bucket width (in bp, as a power-of-two shift) for the position->rid
+ * acceleration table. One int32 table entry per 2^SHIFT bp of the packed
+ * forward genome, plus one trailing bracket entry. At 2^14 (16 KiB) the hg38
+ * (~3.1 Gbp) table is ~189k entries (~0.75 MB); the per-query search is bounded
+ * by log2 of the number of contig starts inside a single bucket window (see
+ * bns_pos2rid / bns_build_pos2rid). */
+#define BNS_POS2RID_SHIFT 14
+
 typedef struct {
 	int64_t l_pac;
 	int32_t n_seqs;
@@ -61,6 +69,22 @@ typedef struct {
 	int32_t n_holes;
 	bntamb1_t *ambs; // n_holes elements
 	FILE *fp_pac;
+	/* SAM-A3: coarse position->rid bucket table, or NULL when not built.
+	 * pos2rid_bucket[p >> BNS_POS2RID_SHIFT] holds the largest rid whose
+	 * anns[rid].offset <= (bucket start); that entry and the next one bracket
+	 * the exact rid, which bns_pos2rid resolves with a binary search over the
+	 * bracket.
+	 *
+	 * Derived from anns[].offset and NOT serialized. Both ends uphold that:
+	 * every writer that copies this struct wholesale detaches the pointer
+	 * first so the image carries NULL (bwa_shm_pack_into, bwa_idx2mem), and
+	 * every restore path that memcpy's it back (shm attach, mem-blob restore)
+	 * resets this to NULL and rebuilds via bns_build_pos2rid before the first
+	 * lookup. The reader-side reset is deliberately unconditional rather than
+	 * relying on the writer: an image staged by an older or out-of-tree writer
+	 * may still carry a heap address from that process, which is meaningless
+	 * (and unfreeable) here. */
+	int32_t *pos2rid_bucket;
 } bntseq_t;
 
 extern unsigned char nst_nt4_table[256];
@@ -91,6 +115,11 @@ extern "C" {
 	void bns_destroy(bntseq_t *bns);
 	int64_t bns_fasta2bntseq(gzFile fp_fa, const char *prefix, int for_only);
 	int bns_pos2rid(const bntseq_t *bns, int64_t pos_f);
+	/* SAM-A3: build the coarse position->rid bucket table (see bntseq_t).
+	 * Idempotent and safe on NULL: a no-op if bns is NULL, the table is
+	 * already built, or l_pac/n_seqs are non-positive (bns_pos2rid then
+	 * transparently falls back to the exact binary search). */
+	void bns_build_pos2rid(bntseq_t *bns);
 	int bns_cnt_ambi(const bntseq_t *bns, int64_t pos_f, int len, int *ref_id);
 	/* Iterate over the bns->ambs intervals overlapping [pos_f, pos_f + len),
 	 * in sorted (offset) order. `fn` receives the half-open interval

@@ -109,6 +109,13 @@ int main(int argc, char *argv[]) {
     CHECK_EQ(got_bns.n_seqs,   ref.idx->bns->n_seqs);
     CHECK_EQ(got_bns.n_holes,  ref.idx->bns->n_holes);
     CHECK_EQ(got_bns.seed,     ref.idx->bns->seed);
+    /* pos2rid_bucket is derived and process-private: the packer must stage a
+     * NULL, not the writer's heap address. The attach path rebuilds it locally.
+     * Assert the source table was actually built first — otherwise a loader
+     * regression that stopped building it would satisfy the NULL check
+     * vacuously and this test would stop guarding the packer at all. */
+    CHECK(ref.idx->bns->pos2rid_bucket != NULL);
+    CHECK(got_bns.pos2rid_bucket == NULL);
 
     /* AMBS — direct byte compare. */
     section(BWA_SHM_SEC_BNS_AMBS, &off, &sz);

@@ -423,8 +423,16 @@ int bwa_shm_pack_into(const bwa_shm_layout_t *layout, uint8_t *dest)
     err_fread_noeof(dest + sec[3].offset, 1, (size_t)sec[3].size, cp);
     err_fclose(cp);
 
-    /* 5. BNS_STRUCT, BNS_AMBS, BNS_ANNS — all small. */
-    memcpy(dest + sec[4].offset, bns,       (size_t)sec[4].size);
+    /* 5. BNS_STRUCT, BNS_AMBS, BNS_ANNS — all small. SAM-A3: pos2rid_bucket is
+     * a derived, process-private heap allocation that the attach path rebuilds
+     * against its own anns[] (bwa_idx_load_ele_from_shm), so stage a NULL
+     * rather than publishing this process's heap address to every reader of
+     * the segment. Copy through a local so the caller's bns is untouched. */
+    {
+        bntseq_t bns_image = *bns;
+        bns_image.pos2rid_bucket = NULL;
+        memcpy(dest + sec[4].offset, &bns_image, sizeof(bns_image));
+    }
     memcpy(dest + sec[5].offset, bns->ambs, (size_t)sec[5].size);
     memcpy(dest + sec[6].offset, bns->anns, (size_t)sec[6].size);
 

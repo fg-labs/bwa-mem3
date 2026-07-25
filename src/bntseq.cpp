@@ -185,6 +185,7 @@ bntseq_t *bns_restore_core(const char *ann_filename, const char* amb_filename, c
 	{ // open .pac
 		bns->fp_pac = xopen(pac_filename, "rb");
 	}
+	bns_build_pos2rid(bns); // SAM-A3: build the position->rid acceleration table once
 	return bns;
 
  badread:
@@ -251,6 +252,7 @@ void bns_destroy(bntseq_t *bns)
 	else {
 		int i;
 		if (bns->fp_pac) err_fclose(bns->fp_pac);
+		free(bns->pos2rid_bucket); // SAM-A3: free(NULL) is a no-op when never built
 		free(bns->ambs);
 		for (i = 0; i < bns->n_seqs; ++i) {
 			free(bns->anns[i].name);
@@ -393,20 +395,76 @@ int bwa_fa2pac(int argc, char *argv[])
 	return 0;
 }
 
+/* SAM-A3: build the coarse position->rid bucket table. bucket[b] is the
+ * largest rid whose anns[rid].offset <= (b << BNS_POS2RID_SHIFT), i.e. the
+ * contig that covers the first position of bucket b. Because anns[].offset is
+ * monotonically increasing, a single linear merge over contigs fills the whole
+ * table in O(n_buckets + n_seqs).
+ *
+ * The table carries one extra trailing entry past the last in-range bucket so
+ * that bns_pos2rid can always read bucket[b + 1]; that pair brackets the answer
+ * and is what bounds the lookup (see bns_pos2rid). */
+void bns_build_pos2rid(bntseq_t *bns)
+{
+	int64_t n_buckets, b;
+	int rid;
+	if (bns == NULL || bns->pos2rid_bucket != NULL) return; // NULL or already built
+	if (bns->l_pac <= 0 || bns->n_seqs <= 0) return;        // leave NULL: fall back to binary search
+	n_buckets = (bns->l_pac >> BNS_POS2RID_SHIFT) + 1;
+	bns->pos2rid_bucket = (int32_t*)calloc((size_t)n_buckets + 1, sizeof(int32_t));
+	if (bns->pos2rid_bucket == NULL) return;                // OOM: fall back to binary search
+	rid = 0;
+	for (b = 0; b <= n_buckets; ++b) { // <=: fill the trailing bracket entry too
+		int64_t pos = b << BNS_POS2RID_SHIFT;
+		while (rid + 1 < bns->n_seqs && bns->anns[rid + 1].offset <= pos) ++rid;
+		bns->pos2rid_bucket[b] = rid;
+	}
+}
+
 int bns_pos2rid(const bntseq_t *bns, int64_t pos_f)
 {
-	int left, mid, right;
 	if (pos_f >= bns->l_pac) return -1;
-	left = 0; mid = 0; right = bns->n_seqs;
-	while (left < right) { // binary search
-		mid = (left + right) >> 1;
-		if (pos_f >= bns->anns[mid].offset) {
-			if (mid == bns->n_seqs - 1) break;
-			if (pos_f < bns->anns[mid+1].offset) break; // bracketed
-			left = mid + 1;
-		} else right = mid;
+	if (bns->pos2rid_bucket != NULL) { // SAM-A3: O(1) bucket bracket + bounded search
+		int lo, hi;
+		// Negative pos_f clamps to bucket 0, matching the binary-search branch
+		// below (which returns rid 0 for any pos_f < anns[0].offset).
+		int64_t b = pos_f < 0? 0 : (pos_f >> BNS_POS2RID_SHIFT);
+		// bucket[b] is the last contig starting at or before this bucket's
+		// first position, so anns[bucket[b]].offset <= pos_f; bucket[b+1] is
+		// the last one starting at or before the NEXT bucket's first position,
+		// which pos_f is below. So the answer is bracketed by [lo, hi], and
+		// hi - lo is just the number of contig starts inside this bucket
+		// window. The common case (no contig starts inside the window) has
+		// lo == hi and returns without touching anns[] at all.
+		lo = bns->pos2rid_bucket[b];
+		hi = bns->pos2rid_bucket[b + 1];
+		// Narrow to the largest rid with anns[rid].offset <= pos_f. This is
+		// the exact same predicate the binary search resolves, so the returned
+		// rid is byte-identical (including on-offset boundaries and, since
+		// offsets are strictly increasing, ties resolve to the largest index).
+		// Searching rather than scanning keeps a reference packed with many
+		// sub-bucket-width contigs (panels, transcriptomes) logarithmic in the
+		// bucket's contig count instead of linear in it.
+		while (lo < hi) {
+			int mid = lo + ((hi - lo + 1) >> 1); // round up: mid > lo, so this terminates
+			if (bns->anns[mid].offset <= pos_f) lo = mid;
+			else hi = mid - 1;
+		}
+		return lo;
 	}
-	return mid;
+	{ // fallback: exact original binary search (bns without a built table)
+		int left, mid, right;
+		left = 0; mid = 0; right = bns->n_seqs;
+		while (left < right) { // binary search
+			mid = (left + right) >> 1;
+			if (pos_f >= bns->anns[mid].offset) {
+				if (mid == bns->n_seqs - 1) break;
+				if (pos_f < bns->anns[mid+1].offset) break; // bracketed
+				left = mid + 1;
+			} else right = mid;
+		}
+		return mid;
+	}
 }
 
 int bns_intv2rid(const bntseq_t *bns, int64_t rb, int64_t re)

@@ -451,7 +451,8 @@ void bwa_idx_destroy(bwaidx_t *idx)
         if (idx->bns) bns_destroy(idx->bns);
         if (idx->pac) free(idx->pac);
     } else {
-        free(idx->bwt); free(idx->bns->anns); free(idx->bns);
+        // SAM-A3: pos2rid_bucket is a private heap allocation (see read_index_ele.cpp).
+        free(idx->bwt); free(idx->bns->pos2rid_bucket); free(idx->bns->anns); free(idx->bns);
         if (!idx->is_shm) free(idx->mem);
     }
     free(idx);
@@ -478,6 +479,12 @@ int bwa_mem3idx(int64_t l_mem, uint8_t *mem, bwaidx_t *idx)
     idx->pac = (uint8_t*)(mem + k); k += idx->bns->l_pac/4+1;
     assert(k == l_mem);
 
+    // SAM-A3: bwa_idx2mem stages a NULL pos2rid_bucket, but a blob written by
+    // an older or out-of-tree writer may carry that writer's heap address, so
+    // drop whatever came in unconditionally and rebuild against our own anns[].
+    idx->bns->pos2rid_bucket = NULL;
+    bns_build_pos2rid(idx->bns);
+
     idx->l_mem = k; idx->mem = mem;
     return 0;
 }
@@ -487,6 +494,7 @@ int bwa_idx2mem(bwaidx_t *idx)
     int i;
     int64_t k, x, tmp;
     uint8_t *mem;
+    int32_t *pos2rid_bucket;
 
     // copy idx->bwt
     x = idx->bwt->bwt_size * 4;
@@ -498,6 +506,12 @@ int bwa_idx2mem(bwaidx_t *idx)
     free(idx->bwt); idx->bwt = 0;
 
     // copy idx->bns
+    // SAM-A3: the derived pos2rid table is not serialized (see bntseq.h), so
+    // detach it BEFORE the struct memcpy below — otherwise the packed image
+    // would carry this process's heap address into every consumer of the blob.
+    // The detached allocation is freed once the copy is done.
+    pos2rid_bucket = idx->bns->pos2rid_bucket;
+    idx->bns->pos2rid_bucket = NULL;
     tmp = idx->bns->n_seqs * sizeof(bntann1_t) + idx->bns->n_holes * sizeof(bntamb1_t);
     for (i = 0; i < idx->bns->n_seqs; ++i) // compute the size of heap-allocated memory
         tmp += strlen(idx->bns->anns[i].name) + strlen(idx->bns->anns[i].anno) + 2;
@@ -517,6 +531,7 @@ int bwa_idx2mem(bwaidx_t *idx)
     x = idx->bns->l_pac/4+1;
     mem = (uint8_t*) realloc(mem, k + x);
     memcpy(mem + k, idx->pac, x); k += x;
+    free(pos2rid_bucket); // SAM-A3: derived table is rebuilt on restore, not serialized
     free(idx->bns); idx->bns = 0;
     free(idx->pac); idx->pac = 0;
 
