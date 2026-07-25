@@ -33,6 +33,18 @@ expect roughly 11 GB total across all four files.
 >
 > See [Coming from bwa or bwa-mem2](../getting-started/migrating.md).
 
+<!-- Separates adjacent blockquotes: a bare blank line between two of them is
+     ambiguous (markdownlint MD028) and some renderers fuse them into one. -->
+
+> **Note — ALT-aware references**
+>
+> If the reference has a `<prefix>.alt` file *and* a `<prefix>.hdr` /
+> `<baseprefix>.dict` header sidecar, `index` warns when the sidecar's `@SQ`
+> records lack `AH:*` on the ALT contigs — a Picard/GATK `.dict` never has
+> them. See [`@SQ` in Output](output.md#sq) for why, and how to fix it.
+
+<!-- Separates adjacent blockquotes -- see above. -->
+
 > **Note — no `.0123` by default**
 >
 > Earlier releases (and bwa-mem2) also wrote `ref.fa.0123`, an *unpacked*
