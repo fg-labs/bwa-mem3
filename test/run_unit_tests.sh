@@ -117,6 +117,13 @@ ok "meth_sidecar_enrich_test"
 "$HERE/help_prescan_test.sh" "$BWAMEM3" "$FIXTURES" || fail "help_prescan_test failed"
 ok "help_prescan_test"
 
+# --- proc_freq_calibration_test -------------------------------------------
+# Startup must not sleep to calibrate proc_freq (it used to sleep(1) on
+# every invocation, which dominated this very suite), and the replacement
+# short-window calibration must still report a plausible tick rate.
+"$HERE/proc_freq_calibration_test.sh" "$BWAMEM3" "$FIXTURES" || fail "proc_freq_calibration_test failed"
+ok "proc_freq_calibration_test"
+
 # --- fast_preset_test -----------------------------------------------------
 # --fast bundles the four characterized speed levers; explicit flags override;
 # default path stays clean. Asserts on the resolved-opts audit line.
