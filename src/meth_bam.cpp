@@ -173,7 +173,14 @@ meth_bam_writer_t *meth_bam_writer_open(const char *path_or_dash,
     if (w->hdr == NULL) { hts_close(w->fp); free(w); return NULL; }
 
     /* @HD — skip the default when the user's -H already supplies one, else
-     * htslib would write two @HD lines (it does not de-dup @HD). */
+     * htslib would write two @HD lines (it does not de-dup @HD).
+     *
+     * This writer does not consult a compat target, unlike bwa.cpp and
+     * bam_writer.cpp: --compat with --meth is a hard error (rejected in
+     * main_mem's option validation), so only COMPAT_TARGET_OFF can reach here
+     * and OFF keeps each path's own default. A future target that relaxes the
+     * --meth exclusion must plumb compat->emit_hd/hd_line through here too.
+     * The string also differs from the SAM text path's -- fg-labs/bwa-mem3#288. */
     if (!hdr_text_has_type(hdr_line, "@HD\t") &&
         sam_hdr_add_line(w->hdr, "HD", "VN", "1.6", "SO", "unsorted", NULL) < 0) goto fail;
 
@@ -181,11 +188,20 @@ meth_bam_writer_t *meth_bam_writer_open(const char *path_or_dash,
      * f/r consolidation — alignments already carry original rids). Each @SQ is
      * enriched by SN with the original reference's identity tags (M5/UR/AS/SP)
      * from its .hdr/.dict sidecar when available; the extra tags are appended
-     * verbatim, gated on a matching SN+LN. */
+     * verbatim, gated on a matching SN+LN.
+     *
+     * AH:* on ALT contigs is appended from the ORIGINAL bns, matching both
+     * upstreams' generated @SQ (bwa/bwa.c:432, bwa-mem2/src/bwa.cpp:538) and
+     * our SAM text path; this consolidated block was written without it and
+     * dropped ALT status for every ALT-aware reference. It cannot collide with
+     * the sidecar enrichment: meth_append_sq_extra_tags copies only
+     * M5/UR/AS/SP, never AH. Appended BEFORE those tags so the line reads
+     * SN, LN, AH, then identity tags -- the order bwa emits. */
     for (int i = 0; i < bns->n_seqs; ++i) {
         kstring_t sq = {0, 0, NULL};
         ksprintf(&sq, "@SQ\tSN:%s\tLN:%lld",
                  bns->anns[i].name, (long long)bns->anns[i].len);
+        if (bns->anns[i].is_alt) kputs("\tAH:*", &sq);
         meth_append_sq_extra_tags(orig_idx_hdr_lines, bns->anns[i].name,
                                   bns->anns[i].len, &sq);
         int rc = (sq.s != NULL) ? sam_hdr_add_lines(w->hdr, sq.s, sq.l) : -1;

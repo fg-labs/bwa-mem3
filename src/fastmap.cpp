@@ -38,6 +38,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #endif
 #include <sstream>
 #include <getopt.h>
+#include <unistd.h>   /* access(): --compat's "you passed a file" diagnostic */
 #include "fastmap.h"
 #include "FMI_search.h"
 #include "bam_writer.h"
@@ -988,6 +989,16 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "                  differently from bwa-mem2, which the default reproduces).\n");
     fprintf(stderr, "                  NOT byte-identical to the default (divergence confined to the\n");
     fprintf(stderr, "                  low-confidence tail).\n");
+    fprintf(stderr, "    --compat STR  shape output to be byte-identical to another aligner.\n");
+    fprintf(stderr, "                  Targets: %s\n", compat_target_selectable_list());
+    fprintf(stderr, "                  bwa-mem2: suppress the MQ:i and HN:i tags and the default @HD,\n");
+    fprintf(stderr, "                  and ignore the <prefix>.hdr / <baseprefix>.dict sidecar so @SQ\n");
+    fprintf(stderr, "                  is generated as bare SN/LN (+AH:* on ALT contigs) -- matching\n");
+    fprintf(stderr, "                  bwa-mem2 v2.2.1 on the drop-in profile. Suppresses output only;\n");
+    fprintf(stderr, "                  changes no alignment. @PG still differs (it is run-specific) --\n");
+    fprintf(stderr, "                  exclude it when comparing. Mutually exclusive with --fast (which\n");
+    fprintf(stderr, "                  changes alignments) and with --meth (bwa-mem2 has no bisulfite\n");
+    fprintf(stderr, "                  mode) -- combining them is an error [off]\n");
     fprintf(stderr, "Scoring options:\n");
     fprintf(stderr, "   -A INT        score for a sequence match, which scales options -TdBOELU unless overridden [%d]\n", opt->a);
     fprintf(stderr, "   -B INT        penalty for a mismatch [%d]\n", opt->b);
@@ -1182,6 +1193,7 @@ int main_mem(int argc, char *argv[])
         OPT_SKIP_CONTAINED_EXT,
         OPT_ADAPTIVE_BAND,
         OPT_EXTEND_MATE_CONCORDANT,
+        OPT_COMPAT,
 #ifdef STAGE_PROF
         OPT_PROFILE,
 #endif
@@ -1202,6 +1214,7 @@ int main_mem(int argc, char *argv[])
         {"chimera-qc",               no_argument,       0, OPT_METH_CHIMERA_QC},
         {"supp-rep-hard-cap",        required_argument, 0, OPT_SUPP_REP_HARD_CAP},
         {"seed-order",               required_argument, 0, OPT_SEED_ORDER},
+        {"compat",                   required_argument, 0, OPT_COMPAT},
         {"legacy-reader",            no_argument,       0, OPT_LEGACY_READER},
 #ifdef STAGE_PROF
         {"profile",                  required_argument, 0, OPT_PROFILE},
@@ -1415,6 +1428,40 @@ int main_mem(int argc, char *argv[])
                 return 1;
             }
         }
+        else if (c == OPT_COMPAT) {
+            const compat_target_t *t = compat_target_from_name(optarg);
+            if (t == NULL) {
+                fprintf(stderr, "[E::%s] unknown --compat target '%s' (%s)\n",
+                        __func__, optarg, compat_target_selectable_list());
+                /* --compat takes a required argument, so a bare `--compat`
+                 * silently swallows the next token -- usually the index
+                 * prefix. Recognize that shape and say so, rather than leaving
+                 * the user staring at their own reference path being called a
+                 * compat target. */
+                if (access(optarg, R_OK) == 0)
+                    fprintf(stderr, "[E::%s] ('%s' is an existing file -- "
+                            "--compat requires a target, e.g. --compat=bwa-mem2)\n",
+                            __func__, optarg);
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+            /* A recognized-but-unavailable target gets its own diagnostic:
+             * "unknown target" would be a lie, and a user asking for bwa-mem
+             * deserves the real reason rather than a shrug. The reason travels
+             * with the table row, not with this parser. */
+            if (t->unavailable_reason != NULL) {
+                fprintf(stderr,
+                        "[E::%s] compat target '%s' is recognized but not yet selectable: "
+                        "%s. Supported: %s\n",
+                        __func__, t->name, t->unavailable_reason,
+                        compat_target_selectable_list());
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+            opt->compat = t;
+        }
         else if (c == OPT_SMEM_DEDUP) opt->smem_dedup = 1;
         else if (c == OPT_FAST) fast = 1;
         else if (c == OPT_SKIP_CONTAINED_EXT) opt->skip_contained_ext = 1;
@@ -1536,6 +1583,62 @@ int main_mem(int argc, char *argv[])
      * Output is NOT byte-identical to the default; divergence is confined to the
      * low-confidence tail (see docs/best-practices/settings-profiles.md).
      * meth_mode is already resolved here (parsed in the getopt loop above). */
+    /* The two guards and the warning below all key on "a target other than
+     * `off` is selected" -- --compat=off is exactly equivalent to not passing
+     * the flag, so it must trip none of them. */
+    const int compat_on = (opt->compat != &COMPAT_TARGET_OFF);
+    /* --fast and --compat are mutually exclusive. --compat suppresses only
+     * additive output (MQ:i/HN:i, @HD, sidecar @SQ tags) to reproduce another
+     * aligner byte-for-byte, but --fast deliberately CHANGES alignments;
+     * combining them would yield a diff-clean-looking stream over genuinely
+     * different alignments, defeating the parity-validation purpose of
+     * --compat. Reject up front. */
+    if (fast && compat_on) {
+        fprintf(stderr, "[E::%s] --compat and --fast are mutually exclusive: "
+                "--compat targets byte-identical %s output, but --fast changes alignments\n",
+                __func__, opt->compat->name);
+        free(opt);
+        if (out_opened) fclose(aux.fp);
+        return 1;
+    }
+    /* --compat is an output-parity target, but no target has a bisulfite mode,
+     * so "byte-identical" is undefined under --meth, which also emits
+     * meth-specific tags that no target models. Reject the combination rather
+     * than silently half-suppress. */
+    if (opt->meth_mode && compat_on) {
+        fprintf(stderr, "[E::%s] --compat is not supported with --meth: "
+                "--compat reproduces %s output, which has no methylation mode\n",
+                __func__, opt->compat->name);
+        free(opt);
+        if (out_opened) fclose(aux.fp);
+        return 1;
+    }
+    /* --compat with an @HD in -H: WARN, do not reject. Emitted only after both
+     * rejections above, so a run that is about to be refused does not also
+     * collect a warning about how its header would have been ordered.
+     *
+     * bwa-mem3 hoists a LEADING user @HD above the @SQ block, so the header is
+     * spec-valid (@HD must come first). Neither target does that: bwa 0.7.19
+     * emits -H records after @SQ and only warns (bwa.c:426-428), bwa-mem2 has
+     * no @HD logic at all. So the header differs from the target in line ORDER.
+     *
+     * This is not rejected, unlike --fast and --meth, because it is an explicit
+     * and coherent request: "give me a valid SAM header, everything else the
+     * same". --fast silently moves alignments and --meth is a different mode --
+     * the user cannot see those in their own command line. An @HD they typed
+     * themselves, they can. Records are unaffected either way.
+     *
+     * Only a LEADING @HD is hoisted, and only that case diverges; a later @HD
+     * is emitted inline after @SQ exactly as upstream does. Warn precisely, so
+     * the warning means something when it fires. */
+    if (compat_on && hdr_line != NULL &&
+        strncmp(hdr_line, "@HD\t", 4) == 0 && bwa_verbose >= 2) {
+        fprintf(stderr, "[W::%s] --compat=%s with an @HD from -H: bwa-mem3 emits it before "
+                "@SQ (the SAM spec requires @HD first), but %s emits -H records after @SQ, "
+                "so the header will differ from %s in line order. Records are unaffected. "
+                "Continue anyway.\n",
+                __func__, opt->compat->name, opt->compat->name, opt->compat->name);
+    }
     if (fast) {
         if (!opt0.max_matesw)   opt->max_matesw   = 10;  /* -m 10 */
         if (!opt0.max_mem_intv) opt->max_mem_intv = 0;   /* -y 0  */
@@ -1924,11 +2027,33 @@ int main_mem(int argc, char *argv[])
      * <baseprefix>.dict) once and route them into both output paths. The
      * SAM text path merges these with user -H per lh3/bwa#348 precedence;
      * the --bam path forwards them to htslib's sam_hdr_add_lines so the
-     * rich @SQ (AS/M5/SP/AH/…) also makes it into the BAM header. */
-    char *idx_hdr_lines = bwa_load_hdr_from_index(ref_prefix);
+     * rich @SQ (AS/M5/SP/AH/…) also makes it into the BAM header.
+     *
+     * Skipped entirely under a compat target: the sidecar is a bwa-mem3-only
+     * feature (a port of lh3/bwa#348, which lh3 closed unmerged), so neither
+     * bwa nor bwa-mem2 has anything to load. Its @SQ block adds M5/AS/UR/SP
+     * that no upstream emits, and on the bench hg38 index its @HD as well.
+     * Skipping restores the generated bare SN/LN @SQ block -- including the
+     * AH:* on ALT contigs that both upstreams emit -- which is exactly the
+     * target output. */
+    char *idx_hdr_lines = opt->compat->read_sidecar
+                        ? bwa_load_hdr_from_index(ref_prefix)
+                        : NULL;
+    /* A sidecar @SQ block that omits AH on ALT contigs silently strips ALT
+     * status from the output. We do not rewrite it (it is authoritative --
+     * see the function's comment), but we do say so. Not reached under a
+     * compat target: idx_hdr_lines is NULL there and @SQ is regenerated from
+     * bns, AH included. */
+    if (idx_hdr_lines != NULL && !opt->meth_mode)
+        bwa_warn_sidecar_missing_AH(aux.fmi->idx->bns, idx_hdr_lines, ref_prefix);
     /* --meth only: the original (pre-c2t) reference's .hdr/.dict sidecar, for
      * @SQ M5/UR enrichment and @CO/@PG/@RG pass-through in meth_bam_writer_open.
-     * NULL outside --meth or when the original has no sidecar. */
+     * NULL outside --meth or when the original has no sidecar.
+     *
+     * Deliberately NOT gated on opt->compat->read_sidecar, unlike the load
+     * above: --compat with --meth is rejected during option validation (see the
+     * guard earlier in this function), so this load is unreachable under any
+     * compat target. If that exclusion is ever relaxed, this needs the gate. */
     char *meth_orig_hdr_lines = (meth_orig_ref_prefix != NULL)
                                 ? bwa_load_hdr_from_index(meth_orig_ref_prefix)
                                 : NULL;
@@ -2017,7 +2142,7 @@ int main_mem(int argc, char *argv[])
         }
         bam_writer = bam_writer_open(bam_path, aux.fmi->idx->bns,
                                      bam_idx_hdr, hdr_line,
-                                     bwa_pg, opt->bam_level);
+                                     bwa_pg, opt->bam_level, opt->compat);
         if (bam_writer == NULL) {
             fprintf(stderr, "ERROR: failed to open BAM writer at '%s'\n", bam_path);
             free(opt);
@@ -2037,7 +2162,8 @@ int main_mem(int argc, char *argv[])
             }
             out_opened = true;
         }
-        bwa_print_sam_hdr2(aux.fmi->idx->bns, idx_hdr_lines, hdr_line, aux.fp);
+        bwa_print_sam_hdr2(aux.fmi->idx->bns, idx_hdr_lines, hdr_line, aux.fp,
+                           opt->compat);
     }
 #endif
 

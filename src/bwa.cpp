@@ -543,24 +543,45 @@ int bwa_idx2mem(bwaidx_t *idx)
  * SAM header routines *
  ***********************/
 
-// Write the first line from `lines` to `fp` if print is nonzero, and return
-// a pointer to the remainder (or NULL when consumed). `lines` is newline-
-// separated but not required to be newline-terminated.
-static const char *remove_line(const char *lines, int print, FILE *fp)
+// Write the first line from `lines` to `fp` and return a pointer to the
+// remainder (or NULL when consumed). `lines` is newline-separated but not
+// required to be newline-terminated.
+static const char *hoist_line(const char *lines, FILE *fp)
 {
     const char *nl = strchr(lines, '\n');
     if (nl) {
-        if (print) {
-            err_fwrite(lines, 1, (size_t)(nl - lines), fp);
-            err_fputc('\n', fp);
-        }
+        err_fwrite(lines, 1, (size_t)(nl - lines), fp);
+        err_fputc('\n', fp);
         return nl + 1;
     } else {
-        if (print) {
-            err_fputs(lines, fp);
+        err_fputs(lines, fp);
+        err_fputc('\n', fp);
+        return NULL;
+    }
+}
+
+// Write `lines` (newline-separated, not newline-terminated) to `fp`, dropping
+// every @HD record except -- when `keep_first_HD` is set -- the first one.
+//
+// Only ONE @HD may reach the output, and the loser can sit anywhere in either
+// stream, so it cannot always be consumed off the front the way hoist_line
+// handles a leading record. A winner that is not leading has to stay inline,
+// where the caller put it, hence `keep_first_HD` rather than an unconditional
+// drop. Empty lines are skipped, matching the BAM writer's equivalent filter
+// (bam_writer.cpp) -- a blank line is not a valid header record.
+static void fputs_filtering_HD(const char *lines, int keep_first_HD, FILE *fp)
+{
+    int seen_HD = 0;
+    for (const char *p = lines; *p != '\0'; ) {
+        const char *eol = strchr(p, '\n');
+        const size_t len = eol ? (size_t)(eol - p) : strlen(p);
+        const int is_HD = (len >= 4 && strncmp(p, "@HD\t", 4) == 0);
+        if (len > 0 && (!is_HD || (keep_first_HD && !seen_HD))) {
+            err_fwrite(p, 1, len, fp);
             err_fputc('\n', fp);
         }
-        return NULL;
+        if (is_HD) seen_HD = 1;
+        p = eol ? eol + 1 : p + len;
     }
 }
 
@@ -570,6 +591,14 @@ static int has_SQ(const char *lines)
     if (lines == NULL) return 0;
     if (strncmp(lines, "@SQ\t", 4) == 0) return 1;
     return strstr(lines, "\n@SQ\t") != NULL;
+}
+
+// Return 1 iff `lines` contains an @HD record (first line, or after a newline).
+static int has_HD(const char *lines)
+{
+    if (lines == NULL) return 0;
+    if (strncmp(lines, "@HD\t", 4) == 0) return 1;
+    return strstr(lines, "\n@HD\t") != NULL;
 }
 
 // Count the number of @SQ header records in `lines`.
@@ -586,31 +615,166 @@ static int count_SQ(const char *lines)
     return n_SQ;
 }
 
+/* Contig name -> bns index, for the ALT/AH sidecar check below. khash emits
+ * static functions, so instantiating a set here does not collide with the
+ * kh_str map bntseq.cpp builds for the same kind of lookup. */
+#include "khash.h"
+KHASH_MAP_INIT_STR(sqname, int)
+
+/* Scan one @SQ record for its SN value and whether it carries an AH tag.
+ * `line`/`line_len` delimit the record (no trailing newline). On a match sets
+ * *sn/*sn_len to the SN value (pointing into `line`) and *has_ah, and returns
+ * 1; returns 0 if the record has no SN. Tokens are matched whole, so an SN:
+ * lookup can never confuse chr1 with chr1_alt. */
+static int sq_scan(const char *line, size_t line_len,
+                   const char **sn, size_t *sn_len, int *has_ah)
+{
+    if (line_len < 4 || strncmp(line, "@SQ\t", 4) != 0) return 0;
+    const char *end = line + line_len;
+    int found = 0;
+    *has_ah = 0;
+    for (const char *p = line + 3; p < end; ) {
+        const char *tok = p + 1;                          /* skip the '\t' */
+        const char *tok_end = (const char *)memchr(tok, '\t', (size_t)(end - tok));
+        if (tok_end == NULL) tok_end = end;
+        const size_t tok_len = (size_t)(tok_end - tok);
+        if (tok_len > 3 && strncmp(tok, "SN:", 3) == 0) {
+            *sn = tok + 3; *sn_len = tok_len - 3; found = 1;
+        } else if (tok_len > 3 && strncmp(tok, "AH:", 3) == 0) {
+            *has_ah = 1;
+        }
+        p = tok_end;
+    }
+    return found;
+}
+
+/* Warn when the index knows about ALT contigs but the sidecar's @SQ block does
+ * not carry AH for them.
+ *
+ * The sidecar's @SQ is authoritative by design -- it is a port of lh3/bwa#348,
+ * whose author intended the block to be produced complete by an external dict
+ * tool, and `samtools dict --alt <ref>.alt` (samtools/samtools#1676) exists to
+ * do exactly that. So we do NOT enrich it: silently rewriting a block the user
+ * owns would be a surprise, and it would raise an unanswerable question about
+ * an AH the index contradicts. But losing ALT status is also not something to
+ * discover downstream in bwa-postalt.js, so say it out loud with the remedy. */
+void bwa_warn_sidecar_missing_AH(const bntseq_t *bns, const char *idx_hdr_lines,
+                                 const char *prefix)
+{
+    if (bns == NULL || !has_SQ(idx_hdr_lines) || bwa_verbose < 2) return;
+
+    /* One pass over bns to collect the ALT names, then ONE pass over the
+     * sidecar. Looking each ALT contig up separately would rescan the whole
+     * block per contig: on hg38 (~3.4k records, ~800 ALT contigs, most of them
+     * at the end of the file) that measured ~500x more work, and it was paid
+     * even when every record already carries AH and nothing is reported.
+     * Keys are borrowed from bns->anns, so kh_destroy must not free them --
+     * same ownership as the .alt parser in bntseq.cpp. */
+    khash_t(sqname) *alt = kh_init(sqname);
+    for (int i = 0; i < bns->n_seqs; ++i) {
+        if (!bns->anns[i].is_alt) continue;
+        int absent;
+        khiter_t k = kh_put(sqname, alt, bns->anns[i].name, &absent);
+        kh_val(alt, k) = i;              /* recover the stable name below */
+    }
+    if (kh_size(alt) == 0) { kh_destroy(sqname, alt); return; }
+
+    /* Counts only ALT contigs that the sidecar actually HAS an @SQ for. An ALT
+     * contig the sidecar omits entirely is a different (larger) problem -- that
+     * contig gets no @SQ at all -- and "missing AH" would misdescribe it; it is
+     * already reported by the @SQ-count mismatch warning in
+     * bwa_print_sam_hdr2 ("N @SQ lines loaded from index; M sequences"). */
+    int n_missing = 0, first_id = -1;
+    for (const char *line = idx_hdr_lines; *line != '\0'; ) {
+        const char *eol = strchr(line, '\n');
+        const size_t line_len = eol ? (size_t)(eol - line) : strlen(line);
+        const char *sn = NULL; size_t sn_len = 0; int has_ah = 0;
+        if (sq_scan(line, line_len, &sn, &sn_len, &has_ah) && !has_ah) {
+            /* kh_get needs a NUL-terminated key and `sn` points into the
+             * header text. A name too long to fit cannot match a bns name
+             * either, so skipping it loses nothing -- but say so rather than
+             * dropping an @SQ record silently. */
+            char name[256];
+            if (sn_len >= sizeof(name)) {
+                if (bwa_verbose >= 3)
+                    fprintf(stderr, "[W::%s] sidecar @SQ has an SN of %zu bytes "
+                            "(max %zu); skipped in the ALT/AH check.\n",
+                            __func__, sn_len, sizeof(name) - 1);
+            } else {
+                memcpy(name, sn, sn_len);
+                name[sn_len] = '\0';
+                khiter_t k = kh_get(sqname, alt, name);
+                /* Report bns's copy of the name, not the stack buffer. */
+                if (k != kh_end(alt) && n_missing++ == 0) first_id = kh_val(alt, k);
+            }
+        }
+        if (eol == NULL) break;
+        line = eol + 1;
+    }
+    kh_destroy(sqname, alt);
+    if (n_missing == 0) return;
+    const char *first = bns->anns[first_id].name;
+    fprintf(stderr,
+            "[W::%s] the index marks %d contig%s as ALT (e.g. %s) but the "
+            "<prefix>.hdr / <baseprefix>.dict sidecar supplies @SQ without an AH tag; "
+            "ALT status will be absent from the output header. The sidecar's @SQ is "
+            "authoritative and is not modified. Regenerate it with the ALT list:\n"
+            "[W::%s]   samtools dict --alt %s.alt -o <sidecar> %s\n",
+            __func__, n_missing, n_missing == 1 ? "" : "s", first,
+            __func__, prefix ? prefix : "<ref>", prefix ? prefix : "<ref>");
+}
+
 // Emit the full SAM header, merging (in precedence order) user `hdr_line`
 // (from -H), `bns_hdr` (loaded from <prefix>.hdr or <baseprefix>.dict), and
 // the index's @SQ records. Precedence mirrors lh3/bwa#348:
-//   @HD : user's > index's > default "@HD\tVN:1.5\tSO:unsorted\tGO:query".
+//   @HD : user's > index's > the target's default (none, under a target that
+//         emits no @HD -- see below).
 //   @SQ : if user supplies any, use user's alone (index .hdr was already
 //         skipped by the caller); else index's @SQ; else generated from bns.
 //   Other: all remaining lines from bns_hdr, then hdr_line, then bwa_pg.
 static void print_sam_hdr(const bntseq_t *bns, const char *bns_hdr,
-                          const char *hdr_line, FILE *fp)
+                          const char *hdr_line, FILE *fp,
+                          const compat_target_t *compat)
 {
-    int i, n_HD = 0, n_SQ = count_SQ(hdr_line);
+    int i, n_SQ = count_SQ(hdr_line);
     extern char *bwa_pg;
+    if (compat == NULL) compat = &COMPAT_TARGET_OFF;
 
-    // Emit an @HD record — prefer user's, else index's, else default — and
-    // consume any leading @HD from both streams so they are not re-emitted.
-    if (hdr_line && strncmp(hdr_line, "@HD\t", 4) == 0) {
-        hdr_line = remove_line(hdr_line, n_HD == 0, fp);
-        ++n_HD;
+    // Emit exactly one @HD record — the user's (-H) if they gave any, else the
+    // sidecar's, else the target's default. Whichever stream owns the winner,
+    // EVERY other @HD in either stream is dropped: emitting two is a spec
+    // violation, and one bwa does not have (bwa.c:412-426 counts @HD at any
+    // line start before deciding). The BAM writer already filtered the losing
+    // sidecar records this way, so this keeps the two paths in agreement.
+    const int user_HD = has_HD(hdr_line);
+    const int idx_HD  = has_HD(bns_hdr);
+    int keep_user_HD = user_HD;             // does the tail below keep its @HD?
+    int keep_idx_HD  = !user_HD && idx_HD;  // user's -H beats the sidecar's
+
+    // A LEADING winner is consumed off the front of its stream and emitted up
+    // front, so it precedes @SQ as the spec requires. A later one cannot be
+    // hoisted without reordering the user's own records, so it stays inline and
+    // is emitted with the rest of the stream after @SQ — which is where bwa
+    // puts every -H record anyway.
+    if (keep_user_HD && strncmp(hdr_line, "@HD\t", 4) == 0) {
+        hdr_line = hoist_line(hdr_line, fp);
+        keep_user_HD = 0;                   // already emitted; drop any others
     }
-    if (bns_hdr && strncmp(bns_hdr, "@HD\t", 4) == 0) {
-        bns_hdr = remove_line(bns_hdr, n_HD == 0, fp);
-        ++n_HD;
+    if (keep_idx_HD && strncmp(bns_hdr, "@HD\t", 4) == 0) {
+        bns_hdr = hoist_line(bns_hdr, fp);
+        keep_idx_HD = 0;
     }
-    if (n_HD == 0)
-        err_fputs("@HD\tVN:1.5\tSO:unsorted\tGO:query\n", fp);
+    /* @HD policy comes from the selected compat target; the evidence for each
+     * row is in src/compat_target.cpp. DO NOT "fix" the missing @HD under a
+     * compat target -- suppressing it is deliberate, not an oversight.
+     * compat->hd_line == NULL keeps this path's historical default, which
+     * differs from the BAM writer's (fg-labs/bwa-mem3#288). */
+    if (!user_HD && !idx_HD && compat->emit_hd) {
+        err_fputs(compat->hd_line != NULL ? compat->hd_line
+                                          : "@HD\tVN:1.5\tSO:unsorted\tGO:query",
+                  fp);
+        err_fputc('\n', fp);
+    }
 
     // Generate @SQ from bns only when neither hdr_line nor bns_hdr supply any.
     if (n_SQ == 0 && !has_SQ(bns_hdr)) {
@@ -628,14 +792,9 @@ static void print_sam_hdr(const bntseq_t *bns, const char *bns_hdr,
         fprintf(stderr, "[W::%s] %d @SQ lines provided with -H; %d sequences in the index. "
                 "Continue anyway.\n", __func__, n_SQ, bns->n_seqs);
 
-    if (bns_hdr) { err_fputs(bns_hdr, fp); err_fputc('\n', fp); }
-    if (hdr_line) { err_fputs(hdr_line, fp); err_fputc('\n', fp); }
+    if (bns_hdr) fputs_filtering_HD(bns_hdr, keep_idx_HD, fp);
+    if (hdr_line) fputs_filtering_HD(hdr_line, keep_user_HD, fp);
     if (bwa_pg) err_fputs(bwa_pg, fp);
-}
-
-void bwa_print_sam_hdr(const bntseq_t *bns, const char *hdr_line, FILE *fp)
-{
-    print_sam_hdr(bns, NULL, hdr_line, fp);
 }
 
 // Load the contents of `<prefix>.hdr` if present, else `<baseprefix>.dict`
@@ -688,7 +847,8 @@ char *bwa_load_hdr_from_index(const char *prefix)
 }
 
 void bwa_print_sam_hdr2(const bntseq_t *bns, const char *idx_hdr_lines,
-                        const char *hdr_line, FILE *fp)
+                        const char *hdr_line, FILE *fp,
+                        const compat_target_t *compat)
 {
     // If the user's -H supplies any @SQ, ignore the index .hdr/.dict content
     // entirely — the user has taken responsibility for the @SQ block.
@@ -701,7 +861,7 @@ void bwa_print_sam_hdr2(const bntseq_t *bns, const char *idx_hdr_lines,
                     "[W::%s] %d @SQ lines loaded from index; %d sequences in the index. "
                     "Continue anyway.\n", __func__, n_SQ, bns->n_seqs);
     }
-    print_sam_hdr(bns, bns_hdr, hdr_line, fp);
+    print_sam_hdr(bns, bns_hdr, hdr_line, fp, compat);
 }
 
 static char *bwa_escape(char *s)

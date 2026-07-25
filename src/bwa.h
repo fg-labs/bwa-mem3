@@ -37,6 +37,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "bntseq.h"
 #include "bwt.h"
 #include "macro.h"
+#include "compat_target.h"
 
 #define BWA_IDX_BWT 0x1
 #define BWA_IDX_BNS 0x2
@@ -142,10 +143,20 @@ extern "C" {
 	bwaidx_t *bwa_idx_load(const char *hint, int which);
 	
 	void bwa_idx_destroy(bwaidx_t *idx);
-	void bwa_print_sam_hdr(const bntseq_t *bns, const char *hdr_line, FILE *fp);
+	/* `compat` selects the output-compatibility target whose @HD policy the
+	 * header follows; NULL means COMPAT_TARGET_OFF (bwa-mem3's native output).
+	 * It shapes only the default @HD -- a user's -H or the index sidecar still
+	 * wins, and @SQ is untouched. */
 	void bwa_print_sam_hdr2(const bntseq_t *bns, const char *idx_hdr_lines,
-	                        const char *hdr_line, FILE *fp);
+	                        const char *hdr_line, FILE *fp,
+	                        const compat_target_t *compat);
 	char *bwa_load_hdr_from_index(const char *prefix);
+	/* Warn (at bwa_verbose >= 2) when the index marks contigs ALT but the
+	 * sidecar's @SQ block carries no AH for them. The sidecar is authoritative
+	 * and is never modified; this only reports the gap and its remedy. */
+	void bwa_warn_sidecar_missing_AH(const bntseq_t *bns,
+	                                 const char *idx_hdr_lines,
+	                                 const char *prefix);
 	char *bwa_set_rg(const char *s);
 	char *bwa_insert_header(const char *s, char *hdr);
 	char *bwa_insert_header_file(FILE *fp, char *hdr);

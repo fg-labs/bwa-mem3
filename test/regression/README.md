@@ -14,6 +14,8 @@ matrix row; the rest run on the canonical AVX2 row only. Each script:
 | `bam_roundtrip.sh`           | `--bam=6` BAM decodes and has same record count as SAM (chr22)        | "--bam=6 roundtrip smoke (chr22)"                   |
 | `short_read_smoke.sh`        | ASAN SE on 25-50 bp variable-length dense-chr22 reads (PR #100 fix)   | "Short-read SE smoke (chr22, ASAN, dense+variable-length)" |
 | `supp_rep_hard_cap.sh`       | `--supp-rep-hard-cap` forces MAPQ=0 on repetitive-seed supps (#101)   | "--supp-rep-hard-cap repetitive-seed regression"    |
+| `compat_byte_identical.sh`   | `--compat=bwa-mem2` suppresses only MQ/HN/@HD; rest byte-identical    | "--compat byte-identical regression (phix)"         |
+| `header_parity.sh`           | `AH:*` on generated @SQ (#281); `--compat` skips the .hdr/.dict sidecar | "header parity regression (AH:*, --compat @HD/@SQ)" |
 | `meth_oracle.sh`             | `--meth` Layers 1–3 match bwa-meth oracle                             | "Run --meth Layers 1-3"                             |
 
 Each script reads its inputs from environment variables — see the comment

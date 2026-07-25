@@ -367,6 +367,7 @@ mem_opt_t *mem_opt_init()
     o->mapQ_coef_len = 50; o->mapQ_coef_fac = log(o->mapQ_coef_len);
     o->meth_scoring = MEM_METH_SCORING_COLLAPSED;  /* --meth default: bwameth-compatible */
     o->meth_chem    = METH_CHEM_EMSEQ;             /* --meth default chemistry: bisulfite/em-seq */
+    o->compat       = &COMPAT_TARGET_OFF;          /* --compat off: bwa-mem3's native output */
     bwa_fill_scmat(o->a, o->b, o->mat);
     mem_opt_fill_meth_mat(o);
     return o;
@@ -2992,7 +2993,7 @@ void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str,
 #if V17
     if (m && m->n_cigar) { kputsn_u("\tMC:Z:", 6, str); add_cigar(opt, m, str, which); }
 #endif
-    if (m) { kputsn_u("\tMQ:i:", 6, str); kputw_u(m->mapq, str); }
+    if (m && opt->compat->emit_mq) { kputsn_u("\tMQ:i:", 6, str); kputw_u(m->mapq, str); }
     if (p->score >= 0) { kputsn_u("\tAS:i:", 6, str); kputw_u(p->score, str); }
     if (p->sub >= 0) { kputsn_u("\tXS:i:", 6, str); kputw_u(p->sub, str); }
     if (bwa_rg_id[0]) { kputsn_u("\tRG:Z:", 6, str); kputs_u(bwa_rg_id, str); }
@@ -3022,7 +3023,7 @@ void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str,
     }
 
     if (p->XA) { kputsn_u("\tXA:Z:", 6, str); kputs_u(p->XA, str); }
-    if (p->HN >= 0) { kputsn_u("\tHN:i:", 6, str); kputw_u(p->HN, str); }
+    if (p->HN >= 0 && opt->compat->emit_hn) { kputsn_u("\tHN:i:", 6, str); kputw_u(p->HN, str); }
 
     if (s->comment) { kputc_u('\t', str); kputs_u(s->comment, str); }
     if ((opt->flag&MEM_F_REF_HDR) && !opt->meth_mode && p->rid >= 0 && bns->anns[p->rid].anno != 0 && bns->anns[p->rid].anno[0] != 0) {

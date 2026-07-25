@@ -62,6 +62,93 @@ writing directly to final storage without a downstream sort step.
 > pipeline that immediately sorts or processes the output, this is faster than
 > SAM at no quality cost.
 
+#### `--compat=TARGET` — byte-identical output for another aligner
+
+Shapes bwa-mem3's output so it is byte-for-byte identical to another aligner's.
+`--compat` takes a required target:
+
+| target | meaning |
+|---|---|
+| `bwa-mem2` (alias `mem2`) | match bwa-mem2 v2.2.1 |
+| `off` | bwa-mem3's native output — identical to omitting the flag |
+
+```bash
+bwa-mem3 mem --compat=bwa-mem2 -t 16 ref.fa R1.fq R2.fq > out.sam
+bwa-mem3 mem --compat bwa-mem2 -t 16 ref.fa R1.fq R2.fq > out.sam   # same
+```
+
+Under `--compat=bwa-mem2`, bwa-mem3 suppresses exactly the differences that are
+bwa-mem3-side additions, and nothing else:
+
+- **`MQ:i`** (mate MAPQ) and **`HN:i`** (hit count) are not emitted. Note only
+  `HN` is genuinely a bwa-mem3 invention — bwa emits `MQ` too
+  ([lh3/bwa#330](https://github.com/lh3/bwa/pull/330), merged 2022-03-06);
+  bwa-mem2 lacks it only because it forked at 0.7.17, before that landed.
+- **The default `@HD` line** is not emitted. bwa-mem2 v2.2.1 writes no `@HD` at
+  all; bwa gained one in 0.7.18 (`6b18630`), again after the fork. A user `@HD`
+  from `-H` is still honored.
+- **The `<prefix>.hdr` / `<baseprefix>.dict` sidecar is not read**, so `@SQ` is
+  generated from the index as bare `SN`/`LN` (plus `AH:*` on ALT contigs, which
+  bwa-mem2 does emit). The sidecar is a bwa-mem3-only feature — a port of
+  [lh3/bwa#348](https://github.com/lh3/bwa/pull/348), which upstream closed
+  unmerged — so its `M5`/`AS`/`UR`/`SP` have no counterpart to match.
+
+`--compat` is **output-shaping only** — it changes no alignment, no score, no
+flag, and no tag's value. It exists so pipelines validating bwa-mem3 against a
+bwa-mem2 golden can diff raw output without a post-processing step.
+
+Verify it with:
+
+```bash
+# records
+diff <(samtools view out.compat.bam) <(samtools view out.mem2.bam)
+# header, @PG excluded on both sides (see below)
+diff <(samtools view -H --no-PG out.compat.bam | grep -v '^@PG') \
+     <(samtools view -H --no-PG out.mem2.bam   | grep -v '^@PG')
+```
+
+Notes and caveats:
+
+- **`@PG` is still emitted, by design.** bwa-mem2 writes its own `@PG`, so
+  suppressing ours would turn a *changed* line into a *missing* one — the diff is
+  non-empty either way, and suppression would only cost the record of what
+  actually produced the file. `@PG` is unmatchable by construction regardless:
+  `CL:` embeds the invocation and its paths, so even two bwa-mem2 runs from
+  different directories differ. Exclude `@PG` on both sides when comparing.
+- **Mutually exclusive with `--fast`.** Passing both is a hard error
+  (`--compat and --fast are mutually exclusive`), because `--fast` deliberately
+  *changes alignments* while `--compat` only shapes output — so `--fast
+  --compat=bwa-mem2` would produce a diff-clean-*looking* stream over genuinely
+  different alignments, defeating the parity-validation purpose. `--compat` is
+  for the drop-in profile. (`--compat=off --fast` is fine: `off` selects no
+  target.)
+- **An `@HD` in `-H` warns but is allowed.** bwa-mem3 hoists a *leading* user
+  `@HD` above the `@SQ` block, so the header is spec-valid (`@HD` must come
+  first). Neither target does that — bwa emits `-H` records after `@SQ` and
+  bwa-mem2 has no `@HD` handling at all — so the header differs from the target
+  in **line order**. Records are unaffected.
+
+  This is not rejected, unlike `--fast` and `--meth`, because it is an explicit
+  and coherent request: *give me a valid SAM header, everything else the same*.
+  `--fast` silently moves alignments and `--meth` is a different mode — a user
+  cannot see either in their own command line. An `@HD` they typed, they can.
+
+  Only a *leading* `@HD` diverges; a later one is emitted inline after `@SQ`
+  exactly as upstream does, and does not warn. Every other `-H` record (`@RG`,
+  `@CO`, `@PG`, `@SQ`) and all of `-R` compose with `--compat` normally.
+- **Non-`--meth` only; combining them is a hard error**
+  (`--compat is not supported with --meth`). bwa-mem2 has no bisulfite mode, so
+  byte-identity is undefined under `--meth`, which also emits
+  methylation-specific tags that no target models.
+- **`--compat=bwa-mem` is recognized but rejected.** bwa-mem3 and bwa still
+  differ on 224 of 63,583 records (53 above MAPQ 30) in MAPQ, CIGAR, POS and
+  TLEN, so byte-identity is not achievable no matter what output is suppressed.
+  The target's output shaping is already specified in `src/compat_target.cpp`;
+  it becomes selectable when the alignment work lands.
+
+See [Equivalence with bwa-mem2 → Byte-identical output
+(`--compat`)](../whats-different/equivalence.md#byte-identical-output---compat).
+
 #### `-R STR` — read group header
 
 Injects a `@RG` header line and tags every alignment with `RG:Z:<ID>`. The

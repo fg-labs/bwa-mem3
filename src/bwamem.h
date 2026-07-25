@@ -38,6 +38,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "bntseq.h"
 #include "bwa.h"
 #include "kthread.h"
+#include "compat_target.h"
 #include "macro.h"
 #include "bandedSWA.h"
 #include <stdlib.h>
@@ -76,6 +77,10 @@ typedef struct __smem_i smem_i;
 #define MEM_F_PRIMARY5  0x800
 #define MEM_F_KEEP_SUPP_MAPQ 0x1000
 #define MEM_F_XB        0x2000
+// --compat is NOT a flag bit: it selects one of several output-compatibility
+// targets, which disagree with each other on the fields it shapes (bwa emits
+// MQ:i and a default @HD; bwa-mem2 emits neither). See mem_opt_t::compat and
+// src/compat_target.h.
 
 
 /* D3 (--meth): bisulfite/TAPS SW scoring model, selected by --meth-scoring. All
@@ -181,6 +186,15 @@ typedef struct mem_opt_t {
     int    alnreg_sort_fast;  // 1 = strict-total-order comparator + pdqsort at the mem_sort_dedup_patch sort sites (set by --fast); 0 = bwa-mem2's re-only comparator + ks_introsort (default, bwa-mem2-compatible)
     int    skip_contained_ext; // 1 = skip banded-SW extension of seeds contained (same diagonal) in a longer in-chain seed (--skip-contained-ext); 0 = off. Byte-identical to baseline: the skip set is a subset of the post-extension containment purge (PE18).
     int    band_start;       // >0 = adaptive chain-geometry banding active (start band; set to ADAPTIVE_BAND_START by --adaptive-band); 0 = off (byte-identical). Long-read speed lever; no-op on the 8-bit short-read tier.
+    /* --compat: the selected output-compatibility target. Non-NULL on any
+     * mem_opt_t from mem_opt_init(), which sets it to &COMPAT_TARGET_OFF
+     * (bwa-mem3's native output), so consumers can dereference it
+     * unconditionally. (main_mem's `opt0` "was this set explicitly" sentinel is
+     * memset to zero and is NOT such a struct; only its scalars are ever read.)
+     * Points into the static table in compat_target.cpp -- not owned, never
+     * freed, so the shallow struct copy in the MEM_F_SMARTPE path is correct.
+     * Shapes OUTPUT ONLY: no alignment, score, flag, or tag VALUE depends on it. */
+    const compat_target_t *compat;
 } mem_opt_t;
 
 
