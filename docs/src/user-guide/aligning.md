@@ -65,11 +65,36 @@ string is embedded as an `RG:Z:` tag on every output record.
 ### Chunk size: `-K`
 
 ```text
--K INT   process INT input bases in each batch [10000000]
+-K INT   process INT input bases in each batch, regardless of -t []
 ```
 
 Larger `-K` values increase memory use but can improve throughput on very deep
-or very wide batches. The default is appropriate for most workloads.
+or very wide batches.
+
+**`-K` is strongly recommended whenever reproducibility matters.** Without it,
+the batch size is `chunk_size × -t` (10,000,000 × `-t` by default), so it
+*changes with the thread count* — and the batch boundaries are not cosmetic.
+`mem_pestat` infers the paired-end insert-size distribution from whatever reads
+land in a batch, and those bounds feed pairing, mate rescue and MAPQ. Two runs
+of the same input at different `-t` can therefore differ in a small number of
+records. This is inherited behaviour, not a bwa-mem3 quirk: `bwa` and
+`bwa-mem2` compute the batch size with exactly the same formula, and `-K` exists
+in all three precisely to pin it.
+
+Passing `-K` makes output **independent of `-t`**, which is what you want for:
+
+- byte-for-byte comparison against `bwa` or `bwa-mem2` (pass the same `-K` to both),
+- regression tests and release gating,
+- any pipeline where the thread count varies with the machine it lands on.
+
+```bash
+# reproducible regardless of how many threads the host gives us
+bwa-mem3 mem -t "$(nproc)" -K 100000000 ref.fa R1.fq R2.fq > out.sam
+```
+
+A good starting value is `10000000 × <the -t you would normally use>`, which
+reproduces the batching you already get today. `-K` is never overridden by
+`--chunk-cap` or `--fast`.
 
 ### SAM output control: `-S`, `-P`
 

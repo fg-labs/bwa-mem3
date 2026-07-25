@@ -273,6 +273,17 @@ The following changes can move alignments, scores, or MAPQ relative to upstream,
 
 (The resolve→order→chain seeding refactor that backs `--seed-order` is byte-identical in its default `off` mode; it is described in the dedicated section below rather than listed here, since only its non-`off` modes are divergent.)
 
+### Batch size, `-t`, and why comparisons need `-K`
+
+Any equivalence claim on this page is implicitly a claim **at a fixed batch size**, and the default batch size is `chunk_size × -t`. That is inherited: `bwa`, `bwa-mem2` and bwa-mem3 all compute it the same way. It matters because batch boundaries are not purely a scheduling concern — `mem_pestat` estimates the paired-end insert-size distribution from whatever reads happen to land in a batch, and those percentile bounds feed pairing, mate rescue and MAPQ. Change the partition and a small number of records can change with it.
+
+Two consequences:
+
+- **`bwa-mem3 -t N` must be compared against `bwa-mem2 -t N`**, not against `bwa-mem2 -t M`. Comparing across thread counts measures the batching, not the aligner.
+- **Pass `-K` to both sides** if you want the comparison to be independent of `-t` altogether. `-K` pins the batch size exactly, is never capped, and is the reason it exists in all three tools.
+
+`--chunk-cap` (off by default) bounds the auto-scaled batch and therefore re-partitions the input; it is opt-in for exactly this reason, warns on stderr when it engages, and is implied by `--fast`. A run with `--chunk-cap` in effect is **not** byte-identical to `bwa`/`bwa-mem2` at the same `-t`. See [`mem` → `--chunk-cap`](../cli/mem.md) and [Aligning → `-K`](../user-guide/aligning.md).
+
 ### Seed ordering (`--seed-order`, opt-in)
 
 `--seed-order off` (the default) preserves byte-identical output. The internal resolve→order→chain refactor that enables it was verified to be bit-for-bit identical to the previous code path across single-end, paired-end, and threaded runs.

@@ -50,6 +50,18 @@ If you validate against a previous bwa/bwa-mem2 release, expect (and audit)
 these differences — see [Equivalence with bwa-mem2](../whats-different/equivalence.md)
 for the field-by-field comparison and a per-PR trail.
 
+**Use `-K` on both sides when you validate.** The default batch size is
+`chunk_size × -t` in all three tools, and each batch's `mem_pestat` insert-size
+estimate comes from the reads in that batch — so a run at `-t 16` and a run at
+`-t 32` can legitimately differ on a few records, in bwa-mem2 as much as in
+bwa-mem3. Pinning `-K` to the same value on both binaries removes that variable
+and makes the diff attributable to the aligner:
+
+```bash
+bwa-mem2 mem -t 16 -K 100000000 ref.fa R1.fq.gz R2.fq.gz > mem2.sam
+bwa-mem3 mem -t 16 -K 100000000 ref.fa R1.fq.gz R2.fq.gz > mem3.sam
+```
+
 ## Recommended migration sequence
 
 1. **Install** bwa-mem3 — see [Installation](installation.md).

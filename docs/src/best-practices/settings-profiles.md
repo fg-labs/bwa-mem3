@@ -53,6 +53,20 @@ No extra flags. Use this when you are:
 - migrating an existing bwa-mem2 pipeline and want to change one variable (the aligner binary) at a
   time before tuning anything else.
 
+> **Add `-K` if you are comparing against bwa/bwa-mem2, or need reproducible output.**
+> The default batch size is `chunk_size × -t`, so it moves with the thread count, and batch
+> boundaries determine each batch's `mem_pestat` insert-size cohort — which feeds pairing, mate
+> rescue and MAPQ. `bwa` and `bwa-mem2` use the identical formula, so this is inherited behaviour,
+> not a bwa-mem3 difference; but it does mean a drop-in comparison is only apples-to-apples when
+> both sides see the same batching. Pass the **same `-K` to both binaries** (or match the `-t`):
+>
+> ```bash
+> bwa-mem3 mem -t <N> -K 100000000 ref.fa R1.fq R2.fq > mem3.sam
+> bwa-mem2 mem -t <M> -K 100000000 ref.fa R1.fq R2.fq > mem2.sam   # any -t; -K pins the batching
+> ```
+>
+> See [Aligning → `-K`](../user-guide/aligning.md) for the full explanation.
+
 ## Recommended profile
 
 ```bash
