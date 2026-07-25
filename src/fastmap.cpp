@@ -38,6 +38,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #endif
 #include <sstream>
 #include <getopt.h>
+#include <errno.h>    /* errno/ERANGE: strtoll validation of the INT options */
 #include <unistd.h>   /* access(): --compat's "you passed a file" diagnostic */
 #include "fastmap.h"
 #include "FMI_search.h"
@@ -1068,7 +1069,7 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "                  total order (faster, but resolves equal-end-position ties\n");
     fprintf(stderr, "                  differently from bwa-mem2, which the default reproduces).\n");
     fprintf(stderr, "                  NOT byte-identical to the default (divergence confined to the\n");
-    fprintf(stderr, "                  low-confidence tail).\n");
+    fprintf(stderr, "                  low-confidence tail). Also implies --chunk-cap 256000000.\n");
     fprintf(stderr, "    --compat STR  shape output to be byte-identical to another aligner.\n");
     fprintf(stderr, "                  Targets: %s\n", compat_target_selectable_list());
     fprintf(stderr, "                  bwa-mem2: suppress the MQ:i and HN:i tags and the default @HD,\n");
@@ -1098,6 +1099,12 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "   -5            for split alignment, take the alignment with the smallest coordinate as primary\n");
     fprintf(stderr, "   -q            don't modify mapQ of supplementary alignments\n");
     fprintf(stderr, "   -K INT        process INT input bases in each batch regardless of nThreads (for reproducibility) []\n");
+    fprintf(stderr, "   --chunk-cap INT\n");
+    fprintf(stderr, "                 upper bound (bases) on the default nThreads-scaled batch size;\n");
+    fprintf(stderr, "                 0 = off. Off by default so batching matches bwa/bwa-mem2 exactly\n");
+    fprintf(stderr, "                 at any -t. Capping re-partitions the input and is NOT\n");
+    fprintf(stderr, "                 byte-identical. Prefer -K if you want a fixed batch size AND\n");
+    fprintf(stderr, "                 reproducibility [0]\n");
     fprintf(stderr, "   -v INT        verbose level: 1=error, 2=warning, 3=message, 4+=debugging [%d]\n", bwa_verbose);
     fprintf(stderr, "   -T INT        minimum score to output [%d]\n", opt->T);
     fprintf(stderr, "   -h INT[,INT]  if there are <INT hits with score >%.2f%% of the max score, output all in XA [%d,%d]\n",
@@ -1227,6 +1234,14 @@ int main_mem(int argc, char *argv[])
     char        *p, *rg_line               = 0, *hdr_line = 0;
     const char  *mode                      = 0;
     int          fast                      = 0;
+    /* --chunk-cap: upper bound (bases) on the default `chunk_size * n_threads`
+     * batch size. 0 = off, which is the DEFAULT and matches bwa and bwa-mem2
+     * exactly (both compute `chunk_size * n_threads` with no cap). Capping
+     * re-partitions the input, which changes each batch's mem_pestat cohort and
+     * therefore the output, so it must never be on by default -- see the
+     * task_size block below. */
+    int64_t      chunk_cap                 = 0;
+    int          chunk_cap_set             = 0;
 
     mem_opt_t    *opt, opt0;
     gzFile        fp = 0, fp2 = 0;
@@ -1274,6 +1289,7 @@ int main_mem(int argc, char *argv[])
         OPT_ADAPTIVE_BAND,
         OPT_EXTEND_MATE_CONCORDANT,
         OPT_COMPAT,
+        OPT_CHUNK_CAP,
 #ifdef STAGE_PROF
         OPT_PROFILE,
 #endif
@@ -1288,6 +1304,7 @@ int main_mem(int argc, char *argv[])
         {"skip-contained-ext",       no_argument,       0, OPT_SKIP_CONTAINED_EXT},
         {"adaptive-band",            no_argument,       0, OPT_ADAPTIVE_BAND},
         {"extend-mate-concordant",   optional_argument, 0, OPT_EXTEND_MATE_CONCORDANT},
+        {"chunk-cap",                required_argument, 0, OPT_CHUNK_CAP},
         {"meth",                     optional_argument, 0, OPT_METH},
         {"meth-scoring",             required_argument, 0, OPT_METH_SCORING},
         {"set-as-failed",            required_argument, 0, OPT_METH_SET_AS_FAILED},
@@ -1548,6 +1565,26 @@ int main_mem(int argc, char *argv[])
         }
         else if (c == OPT_SMEM_DEDUP) opt->smem_dedup = 1;
         else if (c == OPT_FAST) fast = 1;
+        else if (c == OPT_CHUNK_CAP) {
+            /* Validated the same way as --supp-rep-hard-cap below rather than via
+             * a bare atoll, which maps every unparseable value to 0 -- and 0 here
+             * means "no cap". A typo would therefore silently change the batch
+             * size, which is the exact class of invisible batching change this
+             * option exists to make explicit. */
+            char *end = NULL;
+            errno = 0;
+            long long v = strtoll(optarg, &end, 10);
+            if (end == optarg || end == NULL || *end != '\0' ||
+                errno == ERANGE || v < 0) {
+                fprintf(stderr, "ERROR: --chunk-cap requires a non-negative "
+                                "integer number of bases (0 = off), got '%s'\n", optarg);
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+            chunk_cap = (int64_t)v;
+            chunk_cap_set = 1;
+        }
         else if (c == OPT_SKIP_CONTAINED_EXT) opt->skip_contained_ext = 1;
         else if (c == OPT_ADAPTIVE_BAND) opt->band_start = ADAPTIVE_BAND_START;
         else if (c == OPT_EXTEND_MATE_CONCORDANT) {
@@ -1939,6 +1976,11 @@ int main_mem(int argc, char *argv[])
         else
             fprintf(stderr, "[M::%s] --fast: -m %d -y %ld --min-ext-len %d --smem-dedup --skip-contained-ext --max-extend-chains %d --adaptive-band --extend-mate-concordant alnreg-sort=fast\n",
                     __func__, opt->max_matesw, (long)opt->max_mem_intv, opt->min_ext_len, opt->max_extend_chains);
+        /* --fast also caps the batch size, which keeps the read/compute/write
+         * pipeline overlapped at high -t. It re-partitions the input and so is not
+         * byte-identical -- which --fast already is not -- hence it rides here
+         * rather than in the default path. An explicit --chunk-cap still wins. */
+        if (!chunk_cap_set) chunk_cap = 256000000;
     }
 
     /* Load bwt2/FMI index */
@@ -2273,23 +2315,68 @@ int main_mem(int argc, char *argv[])
          * exactly, never cap. */
         aux.task_size = fixed_chunk_size;
     } else {
-        /* Default batch size is chunk_size (~10M bases) per thread. That keeps
-         * each thread well-fed, but at very high -t it makes a single chunk
-         * enormous (10M * 192 ~= 1.9G bases), so the input is only ~3-4 chunks
-         * and the pipeline starves: the first chunk's read and the last chunk's
-         * write don't overlap anything, leaving cores idle (fill/drain). Cap the
-         * default so high -t still produces enough chunks to keep read/compute/
-         * write overlapped, while keeping each chunk far above the ~33k-pairs
-         * floor below which per-chunk overhead (pestat/barriers) starts to bite.
-         * Output stays identical for -t small enough that the cap doesn't engage
-         * (scaled <= cap); above that, batch composition changes exactly as -K
-         * would (validated to leave proper-pair rate unchanged). The cap is
-         * overridable via BWA_MEM3_CHUNK_CAP (bases; <=0 disables, for sweeps). */
-        int64_t cap = 256000000;
+        /* Default batch size is chunk_size (~10M bases) per thread -- byte-for-byte
+         * the same formula as bwa (fastmap.c: `opt->chunk_size * opt->n_threads`)
+         * and bwa-mem2 v2.2.1 (fastmap.cpp: same), with NO cap.
+         *
+         * A cap is tempting: at very high -t a single chunk becomes enormous
+         * (10M * 192 ~= 1.9G bases), so the input is only ~3-4 chunks and the
+         * pipeline starves -- the first chunk's read and the last chunk's write
+         * overlap nothing (fill/drain). Measured on c8g.16xlarge / wgs-5M, that
+         * costs ~1.6s of a 25.8s PROCESS() at -t 64.
+         *
+         * But capping RE-PARTITIONS THE INPUT, and the partition is not an
+         * implementation detail: mem_pestat() infers the insert-size distribution
+         * from whatever reads land in a batch (bwamem.cpp), and those percentile
+         * bounds feed pairing, mate rescue and MAPQ. Different batches => different
+         * pes => different output. Everything else in the aligner is batch-invariant
+         * (read ids come from the global n_processed counter, so the hash_64 tie
+         * breaks are stable), which makes mem_pestat the single reason a cap is
+         * observable at all -- and it is enough.
+         *
+         * A default cap of 256M therefore silently broke byte-identity with
+         * bwa/bwa-mem2 for every -t >= 26 (10M * 26 > 256M) -- ordinary production
+         * settings -- while looking safe because the benchmark aligns at -t 16,
+         * where the cap never engaged. So the cap is now OPT-IN:
+         *
+         *   default            no cap; identical batching to bwa/bwa-mem2 at any -t
+         *   --chunk-cap N      cap at N bases (0 = off)
+         *   --fast             implies --chunk-cap 256000000 (--fast already does
+         *                      not promise byte-identical output)
+         *   BWA_MEM3_CHUNK_CAP env override, for sweeps; wins over both
+         *
+         * If you want a specific batch size AND reproducibility, use -K: it pins
+         * the size exactly and is never capped (see the branch above), which also
+         * makes output independent of -t. */
+        int64_t cap = chunk_cap;
+        /* An unset or EMPTY value leaves the CLI/--fast cap alone -- atoll("") is
+         * 0, which would otherwise read as "no cap" and silently switch an
+         * explicit --chunk-cap off. A malformed value is reported rather than
+         * silently treated as 0 for the same reason: this variable changes how
+         * the input is partitioned, so a typo in it must not quietly change the
+         * output. Reported, not fatal -- unlike the --chunk-cap flag, the index
+         * is already loaded here, and an unusable sweep value should not throw
+         * that work away when the documented default is still correct. */
         const char *cap_env = getenv("BWA_MEM3_CHUNK_CAP");
-        if (cap_env && *cap_env) cap = (int64_t)atoll(cap_env);
+        if (cap_env && *cap_env) {
+            char *cap_end = NULL;
+            errno = 0;
+            long long env_v = strtoll(cap_env, &cap_end, 10);
+            if (cap_end == cap_env || cap_end == NULL || *cap_end != '\0' ||
+                errno == ERANGE || env_v < 0) {
+                fprintf(stderr, "WARNING: BWA_MEM3_CHUNK_CAP='%s' is not a "
+                                "non-negative integer; ignoring it and using "
+                                "chunk cap %lld\n", cap_env, (long long)cap);
+            } else {
+                cap = (int64_t)env_v;
+            }
+        }
         int64_t scaled = (int64_t)opt->chunk_size * (int64_t)opt->n_threads;
         aux.task_size = (cap > 0 && scaled > cap) ? cap : scaled;
+        if (cap > 0 && scaled > cap)
+            fprintf(stderr, "[M::%s] chunk cap engaged: batch %lld -> %lld bases; "
+                    "output is NOT byte-identical to bwa/bwa-mem2 at this -t\n",
+                    __func__, (long long)scaled, (long long)cap);
     }
     tprof[MISC][1] = opt->chunk_size = aux.actual_chunk_size = aux.task_size;
 
