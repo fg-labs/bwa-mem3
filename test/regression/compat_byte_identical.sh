@@ -253,8 +253,41 @@ compat_err "unknown --compat target"  --compat=bogus
 compat_err "not yet selectable"       --compat=bwa-mem
 echo "PASS: --compat enum grammar (=/space, alias, off, unknown, unselectable)"
 
+# --- --compat with an @HD in -H warns, and does NOT reject. --------------
+# bwa-mem3 hoists a LEADING user @HD above @SQ so the header is spec-valid;
+# bwa emits -H records after @SQ and bwa-mem2 has no @HD logic, so the header
+# differs from the target in line ORDER. That is an explicit, coherent request
+# ("valid header, everything else the same") -- unlike --fast/--meth, which the
+# user cannot see in their own command line -- so it warns and continues.
 hd_h=$(printf '@HD\tVN:1.6\tSO:coordinate')
 rg_h=$(printf '@RG\tID:x\tSM:y')
+if ! "$BWA_MEM3" mem --compat=bwa-mem2 -H "$hd_h" "$ref" "$r1" "$r2" \
+        > "$COMPAT_WORK_DIR/hdwarn.sam" 2>"$COMPAT_WORK_DIR/hdwarn.log"; then
+    echo "FAIL: --compat with -H @HD exited nonzero; it must warn, not reject" >&2
+    cat "$COMPAT_WORK_DIR/hdwarn.log" >&2; exit 1
+fi
+grep -q 'will differ from bwa-mem2 in line order' "$COMPAT_WORK_DIR/hdwarn.log" \
+    || { echo "FAIL: --compat with -H @HD did not warn about line order:" >&2
+         cat "$COMPAT_WORK_DIR/hdwarn.log" >&2; exit 1; }
+# The user's @HD must win and be hoisted above @SQ (that is the whole point).
+head -1 "$COMPAT_WORK_DIR/hdwarn.sam" | grep -q '^@HD' \
+    || { echo "FAIL: user @HD from -H is not the first header line" >&2; exit 1; }
+echo "PASS: --compat with -H @HD warns and continues, user @HD wins"
+
+# A LATER @HD is emitted inline after @SQ, exactly as upstream does, so there
+# is nothing to warn about -- the warning must stay quiet or it means nothing.
+"$BWA_MEM3" mem --compat=bwa-mem2 -H "$rg_h" -H "$hd_h" "$ref" "$r1" "$r2" \
+    > /dev/null 2>"$COMPAT_WORK_DIR/hdquiet.log"
+if grep -q 'in line order' "$COMPAT_WORK_DIR/hdquiet.log"; then
+    echo "FAIL: warned about a non-leading @HD, which does not diverge" >&2
+    cat "$COMPAT_WORK_DIR/hdquiet.log" >&2; exit 1
+fi
+# ...and no warning at all without a compat target.
+"$BWA_MEM3" mem -H "$hd_h" "$ref" "$r1" "$r2" > /dev/null 2>"$COMPAT_WORK_DIR/hdoff.log"
+if grep -q 'in line order' "$COMPAT_WORK_DIR/hdoff.log"; then
+    echo "FAIL: warned without a compat target selected" >&2; exit 1
+fi
+echo "PASS: the -H @HD warning fires only when the header actually diverges"
 
 # --- Exactly one @HD, always, on both output paths. -----------------------
 # A non-leading @HD in -H used to leave the SAM path emitting the DEFAULT @HD

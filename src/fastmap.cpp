@@ -1560,9 +1560,9 @@ int main_mem(int argc, char *argv[])
      * Output is NOT byte-identical to the default; divergence is confined to the
      * low-confidence tail (see docs/best-practices/settings-profiles.md).
      * meth_mode is already resolved here (parsed in the getopt loop above). */
-    /* Both guards below key on "a target other than `off` is selected" --
-     * --compat=off is exactly equivalent to not passing the flag, so it must
-     * not trip either one. */
+    /* The two guards and the warning below all key on "a target other than
+     * `off` is selected" -- --compat=off is exactly equivalent to not passing
+     * the flag, so it must trip none of them. */
     const int compat_on = (opt->compat != &COMPAT_TARGET_OFF);
     /* --fast and --compat are mutually exclusive. --compat suppresses only
      * additive output (MQ:i/HN:i, @HD, sidecar @SQ tags) to reproduce another
@@ -1589,6 +1589,32 @@ int main_mem(int argc, char *argv[])
         free(opt);
         if (out_opened) fclose(aux.fp);
         return 1;
+    }
+    /* --compat with an @HD in -H: WARN, do not reject. Emitted only after both
+     * rejections above, so a run that is about to be refused does not also
+     * collect a warning about how its header would have been ordered.
+     *
+     * bwa-mem3 hoists a LEADING user @HD above the @SQ block, so the header is
+     * spec-valid (@HD must come first). Neither target does that: bwa 0.7.19
+     * emits -H records after @SQ and only warns (bwa.c:426-428), bwa-mem2 has
+     * no @HD logic at all. So the header differs from the target in line ORDER.
+     *
+     * This is not rejected, unlike --fast and --meth, because it is an explicit
+     * and coherent request: "give me a valid SAM header, everything else the
+     * same". --fast silently moves alignments and --meth is a different mode --
+     * the user cannot see those in their own command line. An @HD they typed
+     * themselves, they can. Records are unaffected either way.
+     *
+     * Only a LEADING @HD is hoisted, and only that case diverges; a later @HD
+     * is emitted inline after @SQ exactly as upstream does. Warn precisely, so
+     * the warning means something when it fires. */
+    if (compat_on && hdr_line != NULL &&
+        strncmp(hdr_line, "@HD\t", 4) == 0 && bwa_verbose >= 2) {
+        fprintf(stderr, "[W::%s] --compat=%s with an @HD from -H: bwa-mem3 emits it before "
+                "@SQ (the SAM spec requires @HD first), but %s emits -H records after @SQ, "
+                "so the header will differ from %s in line order. Records are unaffected. "
+                "Continue anyway.\n",
+                __func__, opt->compat->name, opt->compat->name, opt->compat->name);
     }
     if (fast) {
         if (!opt0.max_matesw)   opt->max_matesw   = 10;  /* -m 10 */

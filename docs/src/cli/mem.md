@@ -122,6 +122,20 @@ Notes and caveats:
   different alignments, defeating the parity-validation purpose. `--compat` is
   for the drop-in profile. (`--compat=off --fast` is fine: `off` selects no
   target.)
+- **An `@HD` in `-H` warns but is allowed.** bwa-mem3 hoists a *leading* user
+  `@HD` above the `@SQ` block, so the header is spec-valid (`@HD` must come
+  first). Neither target does that — bwa emits `-H` records after `@SQ` and
+  bwa-mem2 has no `@HD` handling at all — so the header differs from the target
+  in **line order**. Records are unaffected.
+
+  This is not rejected, unlike `--fast` and `--meth`, because it is an explicit
+  and coherent request: *give me a valid SAM header, everything else the same*.
+  `--fast` silently moves alignments and `--meth` is a different mode — a user
+  cannot see either in their own command line. An `@HD` they typed, they can.
+
+  Only a *leading* `@HD` diverges; a later one is emitted inline after `@SQ`
+  exactly as upstream does, and does not warn. Every other `-H` record (`@RG`,
+  `@CO`, `@PG`, `@SQ`) and all of `-R` compose with `--compat` normally.
 - **Non-`--meth` only; combining them is a hard error**
   (`--compat is not supported with --meth`). bwa-mem2 has no bisulfite mode, so
   byte-identity is undefined under `--meth`, which also emits
