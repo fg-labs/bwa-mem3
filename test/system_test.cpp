@@ -72,6 +72,77 @@ int main() {
     // big memory-optimised cloud / HPC instances.
     CHECK(mem <= (int64_t)1 << 50);
 
+    // Batch memory budget policy. The regression this guards: an hg38 build
+    // needs ~72 GiB, and the previous `min(50% of RAM, 32 GiB)` default
+    // refused it on every host — including a 256 GiB server.
+    const int64_t kGiB      = 1LL << 30;
+    const int64_t kHg38Need = 77216326020LL;   // (2 * 3217346917 + 1) * 12 B
+    using bwa::resolve_batch_memory_budget;
+    using bwa::required_total_for_batch_budget;
+
+    CHECK(resolve_batch_memory_budget(0) == -1);
+    CHECK(resolve_batch_memory_budget(-1) == -1);
+
+    // Reserve floor dominates below 40 GiB: budget = total - 2 GiB.
+    CHECK(resolve_batch_memory_budget(8 * kGiB) == 6 * kGiB);
+    CHECK(resolve_batch_memory_budget(32 * kGiB) == 30 * kGiB);
+    // Proportional reserve (5%) takes over above 40 GiB.
+    CHECK(resolve_batch_memory_budget(40 * kGiB) == 38 * kGiB);
+    CHECK(resolve_batch_memory_budget(80 * kGiB) == 76 * kGiB);
+    CHECK(resolve_batch_memory_budget(256 * kGiB) == 256 * kGiB - 256 * kGiB / 20);
+    // Small hosts still resolve to something usable, never <= 0.
+    CHECK(resolve_batch_memory_budget(1 * kGiB) == 512 * 1024 * 1024);
+    CHECK(resolve_batch_memory_budget(1) > 0);
+    // Monotonic: more RAM never yields a smaller budget.
+    for (int64_t t = 1; t <= 512 * kGiB; t = t * 3 / 2 + 1)
+        CHECK(resolve_batch_memory_budget(t) <= resolve_batch_memory_budget(t * 3 / 2 + 1));
+
+    // hg38 must build on hosts that can plainly hold it, and must not be
+    // promised on hosts that cannot.
+    CHECK(resolve_batch_memory_budget(96 * kGiB) >= kHg38Need);
+    CHECK(resolve_batch_memory_budget(128 * kGiB) >= kHg38Need);
+    CHECK(resolve_batch_memory_budget(256 * kGiB) >= kHg38Need);
+    CHECK(resolve_batch_memory_budget(64 * kGiB) < kHg38Need);
+
+    // The inverse is what the error message quotes, so it must be both
+    // sufficient AND minimal: quoting a host size larger than necessary sends
+    // someone shopping for RAM they do not need.
+    CHECK(required_total_for_batch_budget(0) == -1);
+    CHECK(required_total_for_batch_budget(-1) == -1);
+
+    // Sufficiency and minimality across all three reserve regimes.
+    for (int64_t b = 1; b <= 512 * kGiB; b = b * 3 / 2 + 1) {
+        int64_t total = required_total_for_batch_budget(b);
+        CHECK(total > 0);
+        CHECK(resolve_batch_memory_budget(total) >= b);
+        // Minimal: one byte less must not suffice.
+        if (total > 1) CHECK(resolve_batch_memory_budget(total - 1) < b);
+    }
+
+    // Half-reserve regime (total <= 4 GiB): budget = ceil(total/2), so the
+    // smallest sufficient total is 2b-1 -- NOT b + 2 GiB. A 1-byte host
+    // resolves to a 1-byte budget.
+    CHECK(required_total_for_batch_budget(1) == 1);
+    CHECK(required_total_for_batch_budget(2) == 3);
+    CHECK(required_total_for_batch_budget(2 * kGiB) == 4 * kGiB - 1);
+
+    // Transition into the fixed 2 GiB reserve, then into the 5% reserve.
+    CHECK(required_total_for_batch_budget(2 * kGiB + 1) == 4 * kGiB + 1);
+    CHECK(required_total_for_batch_budget(38 * kGiB - 1) == 40 * kGiB - 1);
+    CHECK(required_total_for_batch_budget(38 * kGiB) == 40 * kGiB);
+
+    // Large budgets whose required total still fits int64_t must be answered,
+    // not rejected: the answer is only ~1.053x the budget.
+    const int64_t huge = INT64_MAX / 2;
+    const int64_t huge_total = required_total_for_batch_budget(huge);
+    CHECK(huge_total > 0);
+    CHECK(resolve_batch_memory_budget(huge_total) >= huge);
+    // Genuinely infeasible: no total resolves to a budget of INT64_MAX, since
+    // the reserve is always positive at that scale.
+    CHECK(required_total_for_batch_budget(INT64_MAX) == -1);
+
+    CHECK(required_total_for_batch_budget(kHg38Need) < 80 * kGiB);
+
     int cpu = bwa::detect_cpu_count();
     CHECK(cpu >= 1);
     // 4096 was too tight for HPC / cloud nodes: AWS u-7i.metal-224xl already

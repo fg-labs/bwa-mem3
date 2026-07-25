@@ -40,8 +40,6 @@
 #include <sys/stat.h>
 #include <zlib.h>
 
-#include <algorithm>
-
 #include "bntseq.h"
 #include "bwa.h"
 #include "bwt.h"
@@ -212,7 +210,8 @@ static void index_usage(void)
 	        "  -t INT             worker threads [auto: detected cores, cgroup-aware]\n"
 	        "  --max-memory SIZE  peak memory budget; SIZE accepts a G/M/K suffix\n"
 	        "                     (case-insensitive) or bare bytes\n"
-	        "                     [auto: min(50%% of RAM, 32G), cgroup-aware]\n"
+	        "                     [auto: RAM less a reserve of min(max(2G, 5%%), 50%%),\n"
+	        "                     cgroup-aware]\n"
 	        "  --tmp-dir PATH     scratch directory [$TMPDIR]\n"
 	        "  --meth             build a BS-aware dual index. Writes the original-alphabet\n"
 	        "                     index at <in.fasta>.* plus a converted seed FM-index at\n"
@@ -293,8 +292,11 @@ int bwa_index(int argc, char *argv[]) // the "index" command
 			fprintf(stderr, "[bwa_index] --max-memory = %.1f GiB (user-specified)\n",
 			        (double)resolved_mem / (double)(1LL << 30));
 		} else if (detected_mem > 0) {
-			resolved_mem = std::min<int64_t>(detected_mem / 2, 32LL << 30);
-			fprintf(stderr, "[bwa_index] --max-memory = %.1f GiB (auto: 50%% of %.1f GiB detected, capped at 32 GiB)\n",
+			// Index construction is a one-shot batch job: give it the host less
+			// a reserve, not a fraction. A fractional default refuses hg38 on
+			// every machine below ~144 GiB even though the build fits in ~58 GiB.
+			resolved_mem = bwa::resolve_batch_memory_budget(detected_mem);
+			fprintf(stderr, "[bwa_index] --max-memory = %.1f GiB (auto: %.1f GiB detected less a reserve, cgroup-aware)\n",
 			        (double)resolved_mem  / (double)(1LL << 30),
 			        (double)detected_mem  / (double)(1LL << 30));
 		} else {

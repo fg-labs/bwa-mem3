@@ -18,6 +18,25 @@ int64_t detect_total_memory_bytes();
 // Always returns >= 1.
 int detect_cpu_count();
 
+// Peak-memory budget for a one-shot batch job, given the total memory
+// available to the process (i.e. detect_total_memory_bytes()).
+//
+// The policy is "the machine, less a headroom reserve" rather than a fixed
+// fraction: a batch build exists to consume the host it was given, and a
+// fractional split refuses work that the host can plainly do. The reserve is
+// max(2 GiB, 5% of total), itself clamped to half of total so that small hosts
+// still resolve to a usable budget instead of zero.
+//
+// Returns -1 when total_bytes <= 0; callers must supply their own fallback.
+int64_t resolve_batch_memory_budget(int64_t total_bytes);
+
+// The SMALLEST total memory for which resolve_batch_memory_budget() yields at
+// least `budget_bytes` -- exact in every reserve regime, so the "retry on a host
+// with >= N" hint it feeds never overstates what a host needs. Returns -1 when
+// `budget_bytes` is non-positive, or when no total is sufficient (the reserve is
+// always positive, so budgets within ~5% of INT64_MAX are unreachable).
+int64_t required_total_for_batch_budget(int64_t budget_bytes);
+
 namespace system_detail {
 
 // Parse cgroup v2 memory.max content. Returns -1 for "max" or unparseable

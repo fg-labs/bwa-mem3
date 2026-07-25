@@ -5,6 +5,7 @@
 #include "io_utils.h"
 #include "macro.h"
 #include "packed_text.h"
+#include "system.h"
 #include "utils.h"
 
 #include <atomic>
@@ -149,14 +150,32 @@ int libsais_build_fm_index(const char* prefix, int64_t pac_len,
     const int64_t per_base_bytes   = use_int64_sa ? 12 : 6;
     const int64_t est_bytes        = (N + 1) * per_base_bytes;
     if (opts.max_memory_bytes > 0 && est_bytes > opts.max_memory_bytes) {
+        // Name both remedies in the units the user has to act in: the exact
+        // --max-memory value that clears the estimate, and the host size whose
+        // auto-resolved budget would clear it without an override. "Use a
+        // smaller reference" is not an option for a whole-genome aligner.
+        const int64_t gib             = 1LL << 30;
+        const int64_t suggest_gib     = (est_bytes + gib - 1) / gib;
+        const int64_t required_total  = bwa::required_total_for_batch_budget(est_bytes);
         std::fprintf(stderr,
-                "ERROR: libsais build would use ~%s (%d-bit SA); --max-memory is %s.\n",
+                "ERROR: libsais needs ~%s (%d-bit SA) to index a %.2f Gbp reference; "
+                "--max-memory is %s.\n",
                 fmt_bytes(est_bytes).c_str(),
                 use_int64_sa ? 64 : 32,
+                (double)l_pac / 1e9,
                 fmt_bytes(opts.max_memory_bytes).c_str());
-        std::fprintf(stderr,
-                "       Raise --max-memory or use a smaller reference. "
-                "(Bounded-memory SA construction is not yet implemented.)\n");
+        if (required_total > 0)
+            std::fprintf(stderr,
+                    "       Retry on a host with >= %s of RAM, or pass "
+                    "--max-memory %lldG to build within a smaller budget\n"
+                    "       (which may swap). Bounded-memory SA construction is "
+                    "not yet implemented.\n",
+                    fmt_bytes(required_total).c_str(), (long long)suggest_gib);
+        else
+            std::fprintf(stderr,
+                    "       Pass --max-memory %lldG to proceed. Bounded-memory SA "
+                    "construction is not yet implemented.\n",
+                    (long long)suggest_gib);
         return 3;
     }
     std::fprintf(stderr, "[libsais_build] estimate ~%s (budget %s)\n",
