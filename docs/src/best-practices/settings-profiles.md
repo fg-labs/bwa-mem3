@@ -21,20 +21,22 @@ with explicit flags — so upgrading bwa-mem3 never silently changes your alignm
 > **As of 0.7.1 the drop-in profile produces the same primary alignment as bwa-mem2 on every
 > cell re-measured since the parity restoration** — identical
 > `FLAG`/`RNAME`/`POS`/`MAPQ`/`CIGAR`/`AS`/`XS` on all 1,066,668 records of the HG00096 WGS
-> slice re-run on x86. On those records the SAM byte stream differs by **three things — two
-> additive tags plus a renamed header line**: the extra `MQ:i` and `HN:i` tags, and a `@PG`
-> line naming `bwa-mem3`. No alignment record bwa-mem2 emits is changed or removed; strip
-> those two tags and normalize `@PG` and the
-> records are byte-for-byte identical. The three earlier changes that *did* move primaries
-> were reverted for 0.7.1
+> slice re-run on x86. Those record bytes differ by **two additive tags** and nothing else: the
+> extra `MQ:i` and `HN:i`. No alignment record bwa-mem2 emits is changed or
+> removed; strip those two tags and the records are byte-for-byte identical. The **header** is
+> not covered by that statement — the `@PG` line names `bwa-mem3`, and bwa-mem3 writes a default
+> `@HD` that bwa-mem2 never emits ([#288](https://github.com/fg-labs/bwa-mem3/issues/288)).
+> The three earlier changes that *did* move primaries were reverted for 0.7.1
 > ([#256](https://github.com/fg-labs/bwa-mem3/pull/256), [#257](https://github.com/fg-labs/bwa-mem3/pull/257)/[#261](https://github.com/fg-labs/bwa-mem3/pull/261),
 > [#268](https://github.com/fg-labs/bwa-mem3/pull/268)).
 >
-> **Scope:** a residual **+4 supplementary alignments** on the 5 M WGS cell is still
-> outstanding (last measured after [#257](https://github.com/fg-labs/bwa-mem3/pull/257), not
-> re-measured on a build carrying [#268](https://github.com/fg-labs/bwa-mem3/pull/268)), and the
-> genome-wide, multi-sample, cross-architecture re-run is pending — so validate your own
-> workload before treating parity as a guarantee. See
+> **Scope:** the earlier residual of **+4 supplementary alignments** has since been
+> re-measured on a build carrying [#268](https://github.com/fg-labs/bwa-mem3/pull/268) and is
+> **+0** on `wgs-5M`, `wes-5M` and `hic-1M` (x86), with the complete *alignment-record* stream
+> byte-identical once `MQ:i`/`HN:i` are stripped — records only; the header block was not part
+> of that comparison. The remaining samples have not been re-measured, and the genome-wide,
+> multi-sample, cross-architecture re-run is still pending —
+> so validate your own workload before treating parity as a guarantee. See
 > [Equivalence with bwa-mem2](../whats-different/equivalence.md) for the full audit trail. The
 > **recommended** profile (and `--fast`) is a further, deliberate, documented deviation — it is
 > *not* byte-identical.
