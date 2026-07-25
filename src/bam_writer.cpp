@@ -98,15 +98,18 @@ bam_writer_t *bam_writer_open(const char *path, const bntseq_t *bns,
     }
     // Merge the index's .hdr/.dict records after the default @HD (and
     // auto-generated @SQ, when the index didn't supply its own) but before
-    // the user's -H lines. If the user has an @HD in -H, strip the @HD
-    // records from idx_hdr_lines first — htslib's sam_hdr_add_lines does
-    // not de-dup @HD, so without filtering we'd emit two @HD records. This
-    // matches the SAM text path's precedence: user > index > default.
+    // the user's -H lines. Only one @HD may survive — htslib's
+    // sam_hdr_add_lines does not de-dup them — so strip every @HD from
+    // idx_hdr_lines except, when the user's -H supplies none, the first: that
+    // one is the winner. This matches the SAM text path's precedence
+    // (user > index > default) and its identical filter in bwa.cpp.
     if (idx_hdr_lines != NULL && idx_hdr_lines[0] != '\0') {
         const char *to_add = idx_hdr_lines;
         char *filtered = NULL;
-        if (user_has_hd && idx_has_hd) {
-            // Copy idx_hdr_lines, dropping any @HD records.
+        if (idx_has_hd) {
+            const int keep_first_hd = !user_has_hd;
+            int seen_hd = 0;
+            // Copy idx_hdr_lines, dropping the losing @HD records.
             size_t n = strlen(idx_hdr_lines);
             filtered = (char *)malloc(n + 1);
             if (filtered == NULL) goto fail;
@@ -116,10 +119,11 @@ bam_writer_t *bam_writer_open(const char *path, const bntseq_t *bns,
                 const char *eol = strchr(p, '\n');
                 size_t len = eol ? (size_t)(eol - p) : strlen(p);
                 int is_hd = (len >= 4 && strncmp(p, "@HD\t", 4) == 0);
-                if (!is_hd && len > 0) {
+                if (len > 0 && (!is_hd || (keep_first_hd && !seen_hd))) {
                     memcpy(filtered + w, p, len); w += len;
                     filtered[w++] = '\n';
                 }
+                if (is_hd) seen_hd = 1;
                 p = eol ? eol + 1 : p + len;
             }
             filtered[w] = '\0';

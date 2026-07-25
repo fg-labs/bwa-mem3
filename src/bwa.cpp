@@ -543,24 +543,45 @@ int bwa_idx2mem(bwaidx_t *idx)
  * SAM header routines *
  ***********************/
 
-// Write the first line from `lines` to `fp` if print is nonzero, and return
-// a pointer to the remainder (or NULL when consumed). `lines` is newline-
-// separated but not required to be newline-terminated.
-static const char *remove_line(const char *lines, int print, FILE *fp)
+// Write the first line from `lines` to `fp` and return a pointer to the
+// remainder (or NULL when consumed). `lines` is newline-separated but not
+// required to be newline-terminated.
+static const char *hoist_line(const char *lines, FILE *fp)
 {
     const char *nl = strchr(lines, '\n');
     if (nl) {
-        if (print) {
-            err_fwrite(lines, 1, (size_t)(nl - lines), fp);
-            err_fputc('\n', fp);
-        }
+        err_fwrite(lines, 1, (size_t)(nl - lines), fp);
+        err_fputc('\n', fp);
         return nl + 1;
     } else {
-        if (print) {
-            err_fputs(lines, fp);
+        err_fputs(lines, fp);
+        err_fputc('\n', fp);
+        return NULL;
+    }
+}
+
+// Write `lines` (newline-separated, not newline-terminated) to `fp`, dropping
+// every @HD record except -- when `keep_first_HD` is set -- the first one.
+//
+// Only ONE @HD may reach the output, and the loser can sit anywhere in either
+// stream, so it cannot always be consumed off the front the way hoist_line
+// handles a leading record. A winner that is not leading has to stay inline,
+// where the caller put it, hence `keep_first_HD` rather than an unconditional
+// drop. Empty lines are skipped, matching the BAM writer's equivalent filter
+// (bam_writer.cpp) -- a blank line is not a valid header record.
+static void fputs_filtering_HD(const char *lines, int keep_first_HD, FILE *fp)
+{
+    int seen_HD = 0;
+    for (const char *p = lines; *p != '\0'; ) {
+        const char *eol = strchr(p, '\n');
+        const size_t len = eol ? (size_t)(eol - p) : strlen(p);
+        const int is_HD = (len >= 4 && strncmp(p, "@HD\t", 4) == 0);
+        if (len > 0 && (!is_HD || (keep_first_HD && !seen_HD))) {
+            err_fwrite(p, 1, len, fp);
             err_fputc('\n', fp);
         }
-        return NULL;
+        if (is_HD) seen_HD = 1;
+        p = eol ? eol + 1 : p + len;
     }
 }
 
@@ -570,6 +591,14 @@ static int has_SQ(const char *lines)
     if (lines == NULL) return 0;
     if (strncmp(lines, "@SQ\t", 4) == 0) return 1;
     return strstr(lines, "\n@SQ\t") != NULL;
+}
+
+// Return 1 iff `lines` contains an @HD record (first line, or after a newline).
+static int has_HD(const char *lines)
+{
+    if (lines == NULL) return 0;
+    if (strncmp(lines, "@HD\t", 4) == 0) return 1;
+    return strstr(lines, "\n@HD\t") != NULL;
 }
 
 // Count the number of @SQ header records in `lines`.
@@ -707,27 +736,40 @@ static void print_sam_hdr(const bntseq_t *bns, const char *bns_hdr,
                           const char *hdr_line, FILE *fp,
                           const compat_target_t *compat)
 {
-    int i, n_HD = 0, n_SQ = count_SQ(hdr_line);
+    int i, n_SQ = count_SQ(hdr_line);
     extern char *bwa_pg;
     if (compat == NULL) compat = &COMPAT_TARGET_OFF;
 
-    // Emit an @HD record — prefer user's, else index's, else the target's
-    // default — and consume any leading @HD from both streams so they are not
-    // re-emitted.
-    if (hdr_line && strncmp(hdr_line, "@HD\t", 4) == 0) {
-        hdr_line = remove_line(hdr_line, n_HD == 0, fp);
-        ++n_HD;
+    // Emit exactly one @HD record — the user's (-H) if they gave any, else the
+    // sidecar's, else the target's default. Whichever stream owns the winner,
+    // EVERY other @HD in either stream is dropped: emitting two is a spec
+    // violation, and one bwa does not have (bwa.c:412-426 counts @HD at any
+    // line start before deciding). The BAM writer already filtered the losing
+    // sidecar records this way, so this keeps the two paths in agreement.
+    const int user_HD = has_HD(hdr_line);
+    const int idx_HD  = has_HD(bns_hdr);
+    int keep_user_HD = user_HD;             // does the tail below keep its @HD?
+    int keep_idx_HD  = !user_HD && idx_HD;  // user's -H beats the sidecar's
+
+    // A LEADING winner is consumed off the front of its stream and emitted up
+    // front, so it precedes @SQ as the spec requires. A later one cannot be
+    // hoisted without reordering the user's own records, so it stays inline and
+    // is emitted with the rest of the stream after @SQ — which is where bwa
+    // puts every -H record anyway.
+    if (keep_user_HD && strncmp(hdr_line, "@HD\t", 4) == 0) {
+        hdr_line = hoist_line(hdr_line, fp);
+        keep_user_HD = 0;                   // already emitted; drop any others
     }
-    if (bns_hdr && strncmp(bns_hdr, "@HD\t", 4) == 0) {
-        bns_hdr = remove_line(bns_hdr, n_HD == 0, fp);
-        ++n_HD;
+    if (keep_idx_HD && strncmp(bns_hdr, "@HD\t", 4) == 0) {
+        bns_hdr = hoist_line(bns_hdr, fp);
+        keep_idx_HD = 0;
     }
     /* @HD policy comes from the selected compat target; the evidence for each
      * row is in src/compat_target.cpp. DO NOT "fix" the missing @HD under a
      * compat target -- suppressing it is deliberate, not an oversight.
      * compat->hd_line == NULL keeps this path's historical default, which
      * differs from the BAM writer's (fg-labs/bwa-mem3#288). */
-    if (n_HD == 0 && compat->emit_hd) {
+    if (!user_HD && !idx_HD && compat->emit_hd) {
         err_fputs(compat->hd_line != NULL ? compat->hd_line
                                           : "@HD\tVN:1.5\tSO:unsorted\tGO:query",
                   fp);
@@ -750,8 +792,8 @@ static void print_sam_hdr(const bntseq_t *bns, const char *bns_hdr,
         fprintf(stderr, "[W::%s] %d @SQ lines provided with -H; %d sequences in the index. "
                 "Continue anyway.\n", __func__, n_SQ, bns->n_seqs);
 
-    if (bns_hdr) { err_fputs(bns_hdr, fp); err_fputc('\n', fp); }
-    if (hdr_line) { err_fputs(hdr_line, fp); err_fputc('\n', fp); }
+    if (bns_hdr) fputs_filtering_HD(bns_hdr, keep_idx_HD, fp);
+    if (hdr_line) fputs_filtering_HD(hdr_line, keep_user_HD, fp);
     if (bwa_pg) err_fputs(bwa_pg, fp);
 }
 

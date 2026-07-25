@@ -253,4 +253,30 @@ compat_err "unknown --compat target"  --compat=bogus
 compat_err "not yet selectable"       --compat=bwa-mem
 echo "PASS: --compat enum grammar (=/space, alias, off, unknown, unselectable)"
 
+hd_h=$(printf '@HD\tVN:1.6\tSO:coordinate')
+rg_h=$(printf '@RG\tID:x\tSM:y')
+
+# --- Exactly one @HD, always, on both output paths. -----------------------
+# A non-leading @HD in -H used to leave the SAM path emitting the DEFAULT @HD
+# too, for two @HD records in one header -- a spec violation, and one bwa does
+# not have (bwa.c:412-426 counts @HD at any line start). The BAM writer was
+# already correct, so this also re-aligns the two paths.
+one_hd() {   # <description> [extra bwa-mem3 args...]
+    local desc="$1"; shift
+    local n m
+    n=$("$BWA_MEM3" mem "$@" "$ref" "$r1" "$r2" 2>/dev/null | grep -c '^@HD' || true)
+    [ "$n" -eq 1 ] \
+        || { echo "FAIL: SAM emitted $n @HD lines ($desc), expected exactly 1" >&2; exit 1; }
+    if command -v samtools > /dev/null 2>&1; then
+        m=$("$BWA_MEM3" mem --bam "$@" "$ref" "$r1" "$r2" 2>/dev/null \
+            | samtools view -H --no-PG - 2>/dev/null | grep -c '^@HD' || true)
+        [ "$m" -eq 1 ] \
+            || { echo "FAIL: BAM emitted $m @HD lines ($desc), expected exactly 1" >&2; exit 1; }
+    fi
+}
+one_hd "no -H"
+one_hd "leading @HD" -H "$hd_h"
+one_hd "later @HD"   -H "$rg_h" -H "$hd_h"
+echo "PASS: exactly one @HD on both paths, leading or later -H @HD"
+
 echo "PASS: compat byte-identical regression"
