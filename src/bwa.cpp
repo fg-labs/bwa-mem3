@@ -58,8 +58,8 @@ static inline void trim_readno(kstring_t *s)
         s->l -= 2, s->s[s->l] = 0;
 }
 
-static inline void kseq2bseq1(const kseq_t *ks, bseq1_t *s)
-{ // TODO: it would be better to allocate one chunk of memory, but probably it does not matter in practice
+static inline void kseq2bseq1(const kseq_t *ks, bseq1_t *s, read_arena_t *arena)
+{
     // bseq_read/bseq_read_orig grow `seqs` with realloc, which leaves the
     // new entries uninitialized. Zero first so sam/bams/n_bams/cap_bams
     // start well-defined — the output loop at fastmap.cpp free()s them
@@ -69,21 +69,29 @@ static inline void kseq2bseq1(const kseq_t *ks, bseq1_t *s)
      * memset above would otherwise leave it 0, which the seed-chemistry filter
      * reads as OB. --meth ingest overwrites it with the read-number 0/1. */
     s->meth_base_ot = -1;
-    s->name = strdup(ks->name.s);
+    /* PIPE-F6: name/seq/qual are carved from the per-chunk bump arena instead
+     * of individually strdup'd. Byte-identical to strdup — read_arena_dup does
+     * malloc-then-memcpy-then-NUL, and kseq kstrings are NUL-terminated so
+     * ks->name.l/seq.l/qual.l are the exact strlen()s strdup would have copied.
+     * `comment` stays heap-owned: --meth (fastmap step 0) frees and reassigns
+     * it to a fresh heap string, and the non-copy_comment path frees it early,
+     * so its ownership is not uniform enough to live in the arena. */
+    s->name = read_arena_dup(arena, ks->name.s, ks->name.l);
     s->comment = ks->comment.l? strdup(ks->comment.s) : 0;
-    s->seq = strdup(ks->seq.s);
-    s->qual = ks->qual.l? strdup(ks->qual.s) : 0;
+    s->seq = read_arena_dup(arena, ks->seq.s, ks->seq.l);
+    s->qual = ks->qual.l? read_arena_dup(arena, ks->qual.s, ks->qual.l) : 0;
     s->l_seq = strlen(s->seq);
 }
 
 /* Customized for MPI processing */
 bseq1_t *bseq_read(int64_t chunk_size, int *n_, void *ks1_, void *ks2_,
-                   FILE* fpp, int len, int64_t *s)
+                   FILE* fpp, int len, int64_t *s, read_arena_t **arena_out)
 {
     kseq_t *ks = (kseq_t*)ks1_, *ks2 = (kseq_t*)ks2_;
     int64_t size = 0, m, n, size2 = 0;
     bseq1_t *seqs;
     m = n = 0; seqs = 0;
+    read_arena_t *arena = read_arena_create();
     char buf[len];
     
     while (kseq_read(ks) >= 0)
@@ -97,7 +105,7 @@ bseq1_t *bseq_read(int64_t chunk_size, int *n_, void *ks1_, void *ks2_,
             seqs = (bseq1_t*) realloc(seqs, m * sizeof(bseq1_t));
         }
         trim_readno(&ks->name);
-        kseq2bseq1(ks, &seqs[n]);
+        kseq2bseq1(ks, &seqs[n], arena);
         seqs[n].id = n;
         {
             //kseq_t *ksd = ks;
@@ -150,7 +158,7 @@ bseq1_t *bseq_read(int64_t chunk_size, int *n_, void *ks1_, void *ks2_,
         
         if (ks2) {
             trim_readno(&ks2->name);
-            kseq2bseq1(ks2, &seqs[n]);
+            kseq2bseq1(ks2, &seqs[n], arena);
             seqs[n].id = n;
             n++;
             // size += seqs[n++].l_seq;
@@ -164,17 +172,24 @@ bseq1_t *bseq_read(int64_t chunk_size, int *n_, void *ks1_, void *ks2_,
         if (ks2 && kseq_read(ks2) >= 0)
             fprintf(stderr, "[W::%s] the 1st file has fewer sequences.\n", __func__);
     }
+    /* PIPE-F6: hand the arena to the caller, or destroy it if this batch
+     * carved nothing (n == 0 → seqs stays NULL and the pipeline treats it as
+     * clean EOF, freeing nothing). */
+    if (n == 0) { read_arena_destroy(arena); arena = NULL; }
+    *arena_out = arena;
     *n_ = n;
     *s = size;
     return seqs;
 }
 
-bseq1_t *bseq_read_orig(int64_t chunk_size, int *n_, void *ks1_, void *ks2_, int64_t *s)
+bseq1_t *bseq_read_orig(int64_t chunk_size, int *n_, void *ks1_, void *ks2_, int64_t *s,
+                        read_arena_t **arena_out)
 {
     kseq_t *ks = (kseq_t*)ks1_, *ks2 = (kseq_t*)ks2_;
     int64_t size = 0, m, n;
     bseq1_t *seqs;
     m = n = 0; seqs = 0;
+    read_arena_t *arena = read_arena_create();
     while (kseq_read(ks) >= 0)
     {
         if (ks2 && kseq_read(ks2) < 0) { // the 2nd file has fewer reads
@@ -186,7 +201,7 @@ bseq1_t *bseq_read_orig(int64_t chunk_size, int *n_, void *ks1_, void *ks2_, int
             seqs = (bseq1_t*) realloc(seqs, m * sizeof(bseq1_t));
         }
         trim_readno(&ks->name);
-        kseq2bseq1(ks, &seqs[n]);
+        kseq2bseq1(ks, &seqs[n], arena);
         seqs[n].id = n;
         //{
         //  size += strlen(seqs[n].name);
@@ -199,7 +214,7 @@ bseq1_t *bseq_read_orig(int64_t chunk_size, int *n_, void *ks1_, void *ks2_, int
 
         if (ks2) {
             trim_readno(&ks2->name);
-            kseq2bseq1(ks2, &seqs[n]);
+            kseq2bseq1(ks2, &seqs[n], arena);
             seqs[n].id = n;
             size += seqs[n++].l_seq;
         }
@@ -212,15 +227,19 @@ bseq1_t *bseq_read_orig(int64_t chunk_size, int *n_, void *ks1_, void *ks2_, int
         if (ks2 && kseq_read(ks2) >= 0)
             fprintf(stderr, "[W::%s] the 1st file has fewer sequences.\n", __func__);
     }
+    /* PIPE-F6: see bseq_read above — hand off, or free the empty arena at EOF. */
+    if (n == 0) { read_arena_destroy(arena); arena = NULL; }
+    *arena_out = arena;
     *n_ = n;
     *s = size;
     return seqs;
 }
 
-bseq1_t *bseq_read_one_fasta_file(int64_t chunk_size, int *n_, gzFile fp, int64_t *s)
+bseq1_t *bseq_read_one_fasta_file(int64_t chunk_size, int *n_, gzFile fp, int64_t *s,
+                                  read_arena_t **arena_out)
 {
     kseq_t *ks = kseq_init(fp);
-    bseq1_t *seq = bseq_read_orig(chunk_size, n_, ks, NULL, s);
+    bseq1_t *seq = bseq_read_orig(chunk_size, n_, ks, NULL, s, arena_out);
     kseq_destroy(ks);
     return seq;
 }

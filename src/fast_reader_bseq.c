@@ -8,6 +8,7 @@
 #include "fr_fastq.h"
 #include "utils.h"   /* err_fatal */
 #include "stage_prof.h"
+#include "read_arena.h"
 
 /* This adapter turns fr_fastq record slices into the bseq1_t array the pipeline
  * consumes. fr_fastq replaced the kseq layer (see fr_fastq.c): records are now
@@ -49,7 +50,7 @@ static inline char *fr_dup_field(const char *src, size_t len)
  * well-defined. Zeroing the whole struct (rather than hand-listing
  * sam/bams/n_bams/cap_bams) stays correct if a field is ever added to bseq1_t.
  * id is overwritten by the caller. */
-static inline void fr_rec_to_bseq1(const fr_fastq_rec_t *r, bseq1_t *s)
+static inline void fr_rec_to_bseq1(const fr_fastq_rec_t *r, bseq1_t *s, read_arena_t *arena)
 {
     memset(s, 0, sizeof(*s));
     /* Honor the bseq1_t.meth_base_ot -1 sentinel ("non-meth") from bwa.h: the
@@ -57,10 +58,17 @@ static inline void fr_rec_to_bseq1(const fr_fastq_rec_t *r, bseq1_t *s)
      * reads as OB. --meth ingest overwrites it with the read-number 0/1. */
     s->meth_base_ot = -1;
     size_t name_l = fr_trim_readno_len(r->name, r->name_l);
-    s->name    = fr_dup_field(r->name, name_l);
+    /* PIPE-F6: name/seq/qual are carved from the per-chunk bump arena instead
+     * of individually malloc'd. read_arena_dup does the same length-known
+     * malloc+memcpy+NUL as fr_dup_field, so the bytes, lengths, and NUL
+     * termination are identical — only the backing allocation changes. comment
+     * stays heap-owned (fr_dup_field): --meth (fastmap step 0) frees and
+     * reassigns it, and the non-copy_comment path frees it early, so its
+     * ownership is not uniform enough to live in the arena. */
+    s->name    = read_arena_dup(arena, r->name, name_l);
     s->comment = r->comment_l ? fr_dup_field(r->comment, r->comment_l) : 0;
-    s->seq     = fr_dup_field(r->seq, r->seq_l);
-    s->qual    = r->qual_l ? fr_dup_field(r->qual, r->qual_l) : 0;
+    s->seq     = read_arena_dup(arena, r->seq, r->seq_l);
+    s->qual    = r->qual_l ? read_arena_dup(arena, r->qual, r->qual_l) : 0;
     s->l_seq   = (int)r->seq_l;
 }
 
@@ -68,12 +76,14 @@ void *fast_kseq_init(fast_reader_t *fr) { return fr_fastq_init(fr); }
 
 void fast_kseq_destroy(void *p) { fr_fastq_destroy((fr_fastq_t *)p); }
 
-bseq1_t *bseq_read_fast(int64_t chunk_size, int *n_, void *ks1_, void *ks2_, int64_t *s)
+bseq1_t *bseq_read_fast(int64_t chunk_size, int *n_, void *ks1_, void *ks2_, int64_t *s,
+                        read_arena_t **arena_out)
 {
     fr_fastq_t *p1 = (fr_fastq_t *)ks1_, *p2 = (fr_fastq_t *)ks2_;
     int64_t size = 0, m, n;
     bseq1_t *seqs;
     m = n = 0; seqs = 0;
+    read_arena_t *arena = read_arena_create();
     for (;;) {
         /* Tokenize the next record(s). fr_fastq_next scans record boundaries and
          * pulls bytes through the codec layer, which charges its read()/inflate
@@ -109,11 +119,11 @@ bseq1_t *bseq_read_fast(int64_t chunk_size, int *n_, void *ks1_, void *ks2_, int
             seqs = tmp;
         }
         double _tp = sp_enabled() ? sp_wall() : 0.0;
-        fr_rec_to_bseq1(&r1, &seqs[n]);
+        fr_rec_to_bseq1(&r1, &seqs[n], arena);
         seqs[n].id = n;
         size += seqs[n++].l_seq;
         if (p2) {
-            fr_rec_to_bseq1(&r2, &seqs[n]);
+            fr_rec_to_bseq1(&r2, &seqs[n], arena);
             seqs[n].id = n;
             size += seqs[n++].l_seq;
         }
@@ -125,6 +135,12 @@ bseq1_t *bseq_read_fast(int64_t chunk_size, int *n_, void *ks1_, void *ks2_, int
         if (p2 && fr_fastq_next(p2, &rr) == 1)
             fprintf(stderr, "[W::%s] the 1st file has fewer sequences.\n", __func__);
     }
+    /* PIPE-F6: hand the per-chunk arena (backing every read's name/seq/qual) to
+     * the caller, which destroys it in the write stage once the chunk is fully
+     * consumed. An empty batch (n == 0 → seqs == NULL, read as clean EOF by the
+     * pipeline) carved nothing, so free the arena here and report none. */
+    if (n == 0) { read_arena_destroy(arena); arena = NULL; }
+    *arena_out = arena;
     *n_ = n;
     *s = size;
     return seqs;
