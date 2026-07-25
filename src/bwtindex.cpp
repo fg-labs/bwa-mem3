@@ -224,6 +224,34 @@ static void index_usage(void)
 	        "  -h, --help         print this help message and exit\n");
 }
 
+/* Report, at index time, the ALT/AH gap `mem` also reports -- see
+ * bwa_warn_sidecar_missing_AH (bwa.cpp) for why a sidecar's @SQ is emitted
+ * verbatim rather than enriched. Worth saying here as well: this is when the
+ * reference layout is in front of the user and regenerating the sidecar still
+ * costs nothing, whereas `mem` reports it only once an alignment is running.
+ *
+ * `mem` remains the authoritative check -- the .alt and the sidecar are both
+ * optional and either may be dropped in after indexing, so a quiet `index` is
+ * not a guarantee.
+ *
+ * The .alt existence test is what makes this cheap: with no .alt no contig can
+ * be ALT, so the check is provably a no-op, and skipping it avoids reading the
+ * sidecar and the .ann/.amb (~1 MB on hg38) to reach that conclusion. */
+static void warn_if_sidecar_hides_alt(const char *prefix)
+{
+	char alt_path[PATH_MAX];
+	int n = snprintf(alt_path, sizeof(alt_path), "%s.alt", prefix);
+	if (n <= 0 || (size_t)n >= sizeof(alt_path)) return;
+	if (access(alt_path, F_OK) != 0) return;
+
+	char *idx_hdr = bwa_load_hdr_from_index(prefix);   /* NULL when no sidecar */
+	if (idx_hdr == NULL) return;
+	bntseq_t *bns = bns_restore(prefix);               /* applies .alt -> is_alt */
+	bwa_warn_sidecar_missing_AH(bns, idx_hdr, prefix); /* no-ops on a NULL bns */
+	bns_destroy(bns);                                  /* NULL-safe */
+	free(idx_hdr);
+}
+
 int bwa_index(int argc, char *argv[]) // the "index" command
 {
 	int c;
@@ -328,10 +356,19 @@ int bwa_index(int argc, char *argv[]) // the "index" command
 			fprintf(stderr, "ERROR: --meth does not accept -p (outputs <in.fasta>.* and <in.fasta>.meth.*)\n");
 			return 1;
 		}
-		return meth_index_build(argv[optind], emit_unpacked_ref);
+		int rc = meth_index_build(argv[optind], emit_unpacked_ref);
+		/* The real reference only. The `.meth` seed index has no .alt of its own
+		 * and its contigs are f/r-prefixed, so it can never have ALT status to
+		 * lose -- the same reason `mem` skips this check in meth mode
+		 * (fastmap.cpp). Stating it here beats relying on the seed prefix
+		 * happening not to resolve a sidecar. */
+		if (rc == 0) warn_if_sidecar_hides_alt(argv[optind]);
+		return rc;
 	}
 	if (prefix == 0) prefix = argv[optind];
-	return bwa_idx_build(argv[optind], prefix, emit_unpacked_ref);
+	int rc = bwa_idx_build(argv[optind], prefix, emit_unpacked_ref);
+	if (rc == 0) warn_if_sidecar_hides_alt(prefix);
+	return rc;
 }
 
 int bwa_idx_build(const char *fa, const char *prefix, int emit_unpacked_ref)
