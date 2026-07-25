@@ -382,10 +382,15 @@ typedef struct worker_t {
     bseq1_t          *seqs;
     mem_alnreg_v     *regs;
     int64_t           n_processed;
-    mem_chain_v      *chain_ar;
+    /* Per-THREAD chaining scratch: nthreads * BATCH_SIZE entries, indexed by
+     * tid (see worker_alloc). Renamed from chain_ar/seedBuf when they stopped
+     * being nreads-sized seq_id-indexed arrays, so that any out-of-tree code
+     * still doing `w.chain_ar + seq_id` fails to compile rather than silently
+     * running off the end of a much smaller allocation. */
+    mem_chain_v      *chain_scratch;
     mem_cache         mmc;
-    mem_seed_t       *seedBuf;
-    int64_t           seedBufSize;
+    mem_seed_t       *seed_scratch;
+    int64_t           seed_scratch_size;   /* one thread's window, in seeds */
     mem_seed_t       *auxSeedBuf;
     int64_t           auxSeedBufSize;
     uint8_t          *ref_string;

@@ -195,6 +195,13 @@ void worker_alloc(const mem_opt_t *opt, worker_t &w, int32_t nreads, int32_t nth
     assert(opt != NULL);
     assert(nreads >= 0);
     assert(nthreads > 0);
+    /* The assert above compiles out under NDEBUG, and the chaining scratch is
+     * now sized FROM nthreads rather than from nreads -- so a release build
+     * given nthreads <= 0 would allocate a zero-entry scratch that kt_for then
+     * writes into, because kt_for makes the same input safe by clamping
+     * (`if (n_threads < 1) n_threads = 1`, kthread.cpp) instead of refusing.
+     * Clamp identically so the two agree on how many windows exist. */
+    if (nthreads < 1) nthreads = 1;
 
     // Record the thread count on the worker so worker_free can validate the
     // paired call and the per-thread loops can never walk past the slots
@@ -203,38 +210,76 @@ void worker_alloc(const mem_opt_t *opt, worker_t &w, int32_t nreads, int32_t nth
 
     int32_t memSize = nreads;
 
-    /* Mem allocation section for core kernels.
-     *
-     * PIPE-F24: regs/chain_ar/seedBuf are the only nreads-sized scratch here,
-     * and seedBuf alone is memSize*AVG_SEEDS_PER_READ*sizeof(mem_seed_t) —
-     * multiple GB for a capped (~256M-base) chunk. When memSize == 0 the caller
-     * is deferring this sizing to the grow-on-demand path in kt_pipeline
-     * (step 1), which allocates the trio EXACTLY from the parsed read count
-     * (ret->n_seqs) and reuses it across chunks. Leaving the pointers NULL here
-     * is a valid state: that path free()s them (free(NULL) is a no-op) before
-     * its own calloc/malloc, and worker_free is NULL-safe too. For memSize > 0
-     * (e.g. language-binding consumers that size the trio themselves) the
-     * behavior is byte-identical to before. */
-    w.regs = NULL; w.chain_ar = NULL; w.seedBuf = NULL;
+    /* Mem allocation section for core kernels */
+    w.regs = NULL; w.chain_scratch = NULL; w.seed_scratch = NULL;
 
+    /* regs is genuinely chunk-lifetime, and the only nreads-sized allocation
+     * left here: it is filled by the align pass, read by mem_pestat, and
+     * consumed (and freed per read) by worker_sam.
+     *
+     * PIPE-F24: when memSize == 0 the caller is deferring that sizing to the
+     * grow-on-demand path in kt_pipeline (step 1), which allocates regs EXACTLY
+     * from the parsed read count (ret->n_seqs) and reuses it across chunks.
+     * Leaving the pointer NULL here is a valid state: that path free()s it
+     * (free(NULL) is a no-op) before its own calloc, and worker_free is
+     * NULL-safe too. For memSize > 0 (e.g. language-binding consumers that size
+     * regs themselves) the behavior is byte-identical to before. */
     if (memSize > 0) {
         w.regs = (mem_alnreg_v *) calloc(memSize, sizeof(mem_alnreg_v));
-        w.chain_ar = (mem_chain_v*) malloc (memSize * sizeof(mem_chain_v));
-        w.seedBuf = (mem_seed_t *) calloc(sizeof(mem_seed_t),  memSize * AVG_SEEDS_PER_READ);
-
-        assert(w.seedBuf  != NULL);
-        assert(w.regs     != NULL);
-        assert(w.chain_ar != NULL);
+        assert(w.regs != NULL);
     }
 
-    w.seedBufSize = BATCH_SIZE * AVG_SEEDS_PER_READ;
+    /* chain_scratch / seed_scratch are PER-THREAD scratch, not per-read arrays.
+     * They used to be sized by nreads and indexed by seq_id, because worker_bwt
+     * and worker_aln were two separate kt_for passes and the chains + their
+     * seeds had to survive the barrier between them. The fused worker_bwt_aln
+     * removed that requirement: mem_kernel2_core frees chain->a for every read
+     * in the item before returning, so both buffers are dead the moment a work
+     * item ends and a thread can reuse its own window for the next item.
+     *
+     * kt_for dispatches items of at most BATCH_SIZE reads and never hands the
+     * same tid to two concurrent invocations, so nthreads windows of BATCH_SIZE
+     * entries each is exactly sufficient.
+     *
+     * At -t 64 and the default -K this takes seed_scratch from 13.1 GB to 67 MB
+     * and chain_scratch from 204.8 MB to 1.0 MB. The old sizing came off the
+     * read-count estimate (chunk_bases / NREADS_ESTIMATE_AVG_BASES, and
+     * chunk_bases is -K * -t), so it grew in BOTH -t and -K -- 39.3 GB of
+     * seed_scratch alone at -t 192. The new sizing drops the -K dependence
+     * entirely and leaves a per-thread constant.
+     *
+     * Those new figures are for BATCH_SIZE 512; arm64 uses 1024, so double them
+     * there (134 MB / 2.1 MB). The old figures do not depend on BATCH_SIZE.
+     *
+     * Both are sized from nthreads, so PIPE-F24's memSize == 0 deferral does not
+     * apply to them: that exists so an nreads-shaped buffer is not sized before
+     * the read count is known, and neither of these is nreads-shaped any more.
+     * They are allocated unconditionally, and the reallocation in kt_pipeline
+     * step 1 correspondingly regrows only regs. */
+    const int64_t scratch_reads = (int64_t) nthreads * BATCH_SIZE;
+    w.chain_scratch = (mem_chain_v*) malloc (scratch_reads * sizeof(mem_chain_v));
+    w.seed_scratch  = (mem_seed_t *) calloc(scratch_reads * AVG_SEEDS_PER_READ,
+                                            sizeof(mem_seed_t));
+
+    assert(w.seed_scratch  != NULL);
+    assert(w.chain_scratch != NULL);
+
+    /* Size of ONE thread's seed window. */
+    w.seed_scratch_size = BATCH_SIZE * AVG_SEEDS_PER_READ;
 
     /*** printing ***/
-    int64_t allocMem = memSize * sizeof(mem_alnreg_v) +
-        memSize * sizeof(mem_chain_v) +
-        sizeof(mem_seed_t) * memSize * AVG_SEEDS_PER_READ;
+    int64_t scratchMem = scratch_reads * sizeof(mem_chain_v) +
+        sizeof(mem_seed_t) * scratch_reads * AVG_SEEDS_PER_READ;
+    int64_t allocMem = memSize * sizeof(mem_alnreg_v) + scratchMem;
     fprintf(stderr, "------------------------------------------\n");
     fprintf(stderr, "1. Memory pre-allocation for Chaining: %0.4lf MB\n", allocMem/1e6);
+    /* Reported separately from the total because the two scale differently and
+     * conflating them hides regressions: regs is legitimately per-read (it
+     * tracks -K), whereas the chaining scratch must depend only on the thread
+     * count. test/regression/chain_scratch_per_thread.sh asserts this figure is
+     * invariant across -K. */
+    fprintf(stderr, "   per-thread chaining scratch: %0.4lf MB (%d threads)\n",
+            scratchMem/1e6, nthreads);
 
 
     /* SWA mem allocation */
@@ -320,9 +365,9 @@ void worker_free(worker_t &w, int32_t nthreads)
     // Catch mismatched alloc/free pairs before they drive out-of-bounds frees.
     assert(w.nthreads == nthreads);
 
-    free(w.chain_ar);
+    free(w.chain_scratch);
     free(w.regs);
-    free(w.seedBuf);
+    free(w.seed_scratch);
 
     for(int l=0; l<nthreads; l++) {
         _mm_free(w.mmc.seqBufLeftRef[l*CACHE_LINE]);
@@ -504,12 +549,35 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
         if (w.nreads < ret->n_seqs)
         {
             fprintf(stderr, "[0000] Reallocating initial memory allocations!!\n");
-            free(w.regs); free(w.chain_ar); free(w.seedBuf);
+            /* Only regs is sized by the read count. chain_scratch/seed_scratch
+             * are per-thread windows sized by nthreads * BATCH_SIZE and are
+             * unaffected by how many reads a chunk turns out to hold. */
+            free(w.regs);
             w.nreads = ret->n_seqs;
             w.regs = (mem_alnreg_v *) calloc(w.nreads, sizeof(mem_alnreg_v));
-            w.chain_ar = (mem_chain_v*) malloc (w.nreads * sizeof(mem_chain_v));
-            w.seedBuf = (mem_seed_t *) calloc(sizeof(mem_seed_t), w.nreads * AVG_SEEDS_PER_READ);
-            assert(w.regs != NULL); assert(w.chain_ar != NULL); assert(w.seedBuf != NULL);
+            assert(w.regs != NULL);
+        }
+
+        /* The per-thread chaining scratch must never be resized per chunk: it is
+         * sized from nthreads * BATCH_SIZE in worker_alloc and indexed by tid, so
+         * an nreads-shaped reallocation here would give back the memory this
+         * sizing reclaimed, and a SMALLER one would hand two threads overlapping
+         * windows.
+         *
+         * Enforced rather than merely commented because the mistake is invisible
+         * downstream: the alignments are byte-identical either way, so every
+         * parity and determinism test in the suite would still pass. Deliberately
+         * not an assert -- this has to survive NDEBUG, which is exactly the build
+         * a memory regression would be noticed in. Costs one comparison per
+         * chunk. */
+        if (w.seed_scratch_size != (int64_t) BATCH_SIZE * AVG_SEEDS_PER_READ) {
+            fprintf(stderr,
+                    "ERROR: per-thread seed scratch was resized per chunk "
+                    "(%lld seeds, expected %lld); the chaining scratch must be "
+                    "sized only in worker_alloc (src/fastmap.cpp).\n",
+                    (long long) w.seed_scratch_size,
+                    (long long) BATCH_SIZE * AVG_SEEDS_PER_READ);
+            exit(EXIT_FAILURE);
         }
 
         fprintf(stderr, "[0000] Calling mem_process_seqs.., task: %d\n", task++);
@@ -852,16 +920,20 @@ static int process(void *shared, gzFile gfp, gzFile gfp2, int pipe_threads)
     }
 #endif
 
-    /* PIPE-F24: do NOT pre-size the per-read chaining scratch (regs/chain_ar/
-     * seedBuf) from a bytes/NREADS_ESTIMATE_AVG_BASES heuristic. That estimate
-     * (chunk_bytes/100 + 10) is right only for ~100 bp reads: it OVER-allocates
-     * a multi-GB seedBuf for longer reads (pure waste — the pool is never
-     * shrunk) and UNDER-allocates for shorter reads, forcing a free() + multi-GB
-     * calloc() on the first chunk. Start at 0 and let the grow-on-demand path in
-     * kt_pipeline (step 1) size the trio EXACTLY from the actual parsed read
-     * count (ret->n_seqs) and reuse it across chunks. Correctness is unchanged:
-     * that path runs BEFORE any read indexes these buffers and guarantees
-     * w.nreads >= n_seqs, with identical calloc zero-init. */
+    /* PIPE-F24: do NOT pre-size the read-count-sized scratch from a
+     * bytes/NREADS_ESTIMATE_AVG_BASES heuristic. That estimate (chunk_bytes/100
+     * + 10) is right only for ~100 bp reads: it OVER-allocates for longer reads
+     * (pure waste — the pool is never shrunk) and UNDER-allocates for shorter
+     * ones, forcing a free() + large calloc() on the first chunk. Start at 0 and
+     * let the grow-on-demand path in kt_pipeline (step 1) size it EXACTLY from
+     * the actual parsed read count (ret->n_seqs) and reuse it across chunks.
+     * Correctness is unchanged: that path runs BEFORE any read indexes the
+     * buffer and guarantees w.nreads >= n_seqs, with identical calloc zero-init.
+     *
+     * `regs` is the only such buffer now — chain_scratch/seed_scratch are sized
+     * from nthreads * BATCH_SIZE in worker_alloc and never depend on nreads, so
+     * a 0 here costs them nothing. That is also what retires the worst case this
+     * comment was written about: the multi-GB overshoot was seed_scratch's. */
     int32_t nreads = 0;
 
     /* All memory allocation */
