@@ -16,6 +16,7 @@ matrix row; the rest run on the canonical AVX2 row only. Each script:
 | `supp_rep_hard_cap.sh`       | `--supp-rep-hard-cap` forces MAPQ=0 on repetitive-seed supps (#101)   | "--supp-rep-hard-cap repetitive-seed regression"    |
 | `compat_byte_identical.sh`   | `--compat=bwa-mem2` suppresses only MQ/HN/@HD; rest byte-identical    | "--compat byte-identical regression (phix)"         |
 | `header_parity.sh`           | `AH:*` on generated @SQ (#281); `--compat` skips the .hdr/.dict sidecar | "header parity regression (AH:*, --compat @HD/@SQ)" |
+| `default_hd_parity.sh`       | default `@HD` byte-identical across SAM/`--bam`/`--meth` (#288)        | "default @HD parity across output paths"            |
 | `meth_oracle.sh`             | `--meth` Layers 1–3 match bwa-meth oracle                             | "Run --meth Layers 1-3"                             |
 
 Each script reads its inputs from environment variables — see the comment

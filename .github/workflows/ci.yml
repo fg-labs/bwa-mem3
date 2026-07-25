@@ -398,6 +398,14 @@ jobs:
           HEADER_PARITY_WORK_DIR=/tmp/header-parity \
           bash test/regression/header_parity.sh
 
+      - name: default @HD parity across output paths
+        if: matrix.canonical == true
+        run: |
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          HD_PARITY_PHIX_FA="$GITHUB_WORKSPACE/test/fixtures/phix.fa" \
+          HD_PARITY_WORK_DIR=/tmp/hd-parity \
+          bash test/regression/default_hd_parity.sh
+
       - name: SE alignment smoke (chr22)
         if: matrix.canonical == true
         run: |

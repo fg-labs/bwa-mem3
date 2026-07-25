@@ -177,12 +177,12 @@ meth_bam_writer_t *meth_bam_writer_open(const char *path_or_dash,
      *
      * This writer does not consult a compat target, unlike bwa.cpp and
      * bam_writer.cpp: --compat with --meth is a hard error (rejected in
-     * main_mem's option validation), so only COMPAT_TARGET_OFF can reach here
-     * and OFF keeps each path's own default. A future target that relaxes the
-     * --meth exclusion must plumb compat->emit_hd/hd_line through here too.
-     * The string also differs from the SAM text path's -- fg-labs/bwa-mem3#288. */
+     * main_mem's option validation), so only COMPAT_TARGET_OFF can reach here,
+     * and OFF's hd_line IS BWAMEM3_DEFAULT_HD_LINE. A future target that
+     * relaxes the --meth exclusion must plumb compat->emit_hd/hd_line through
+     * here too. */
     if (!hdr_text_has_type(hdr_line, "@HD\t") &&
-        sam_hdr_add_line(w->hdr, "HD", "VN", "1.6", "SO", "unsorted", NULL) < 0) goto fail;
+        sam_hdr_add_lines(w->hdr, BWAMEM3_DEFAULT_HD_LINE, 0) < 0) goto fail;
 
     /* @SQ directly from the ORIGINAL (un-converted) bns contigs (D3 PR-5: no
      * f/r consolidation — alignments already carry original rids). Each @SQ is
