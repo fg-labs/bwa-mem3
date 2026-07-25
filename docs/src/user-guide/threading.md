@@ -68,6 +68,14 @@ and [Best Practices: multi-sample workflows](../best-practices/multi-sample.md).
 
 ## Memory use
 
+> **`-t` changes the output, not just the speed.** The default batch size is
+> `chunk_size × -t`, and each batch's `mem_pestat` insert-size estimate is drawn
+> from the reads in that batch — so the same input aligned at different thread
+> counts can differ on a small number of records. `bwa` and `bwa-mem2` behave
+> identically here. Pass **`-K INT`** to pin the batch size and make output
+> independent of `-t`; do this for regression tests, release gating, and any
+> comparison against `bwa`/`bwa-mem2`. See [Aligning → `-K`](aligning.md).
+
 Peak RAM is the resident index (~15 GB for hg38, ~22 GB under `--meth`) plus a
 per-batch working set that scales with the *effective* batch size
 (`chunk_size × n_threads`), and is fixed with respect to `-t`. The per-batch term

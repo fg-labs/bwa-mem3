@@ -158,6 +158,8 @@ locus. All uniquely-mapped reads are unaffected.
 | Multi-threaded sort | `samtools sort -@` with appropriate thread split | [User Guide — Threading](../user-guide/threading.md) |
 | Reorder seeds longest-first | `--seed-order local-longest` | [Equivalence](../whats-different/equivalence.md) |
 | SMEM deduplication | `--smem-dedup`; ~10 % fewer SA lookups; opt-in, not byte-identical | [Features → --smem-dedup](../whats-different/features.md#--smem-dedup-smem-deduplication) |
+| Reproducible output | `-K INT`; pins the batch size so output does not move with `-t` | [Aligning → `-K`](../user-guide/aligning.md) |
+| Pipeline overlap at very high `-t` | `--chunk-cap INT`; off by default, opt-in, not byte-identical | [`mem` → `--chunk-cap`](../cli/mem.md) |
 
 ---
 
