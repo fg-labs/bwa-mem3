@@ -591,46 +591,130 @@ static const char *hoist_line(const char *lines, FILE *fp)
 static void fputs_filtering_HD(const char *lines, int keep_first_HD, FILE *fp)
 {
     int seen_HD = 0;
-    for (const char *p = lines; *p != '\0'; ) {
-        const char *eol = strchr(p, '\n');
-        const size_t len = eol ? (size_t)(eol - p) : strlen(p);
-        const int is_HD = (len >= 4 && strncmp(p, "@HD\t", 4) == 0);
+    const char *cur = lines, *line; size_t len;
+    while (bwa_hdr_next_line(&cur, &line, &len)) {
+        const int is_HD = (len >= 4 && strncmp(line, "@HD\t", 4) == 0);
         if (len > 0 && (!is_HD || (keep_first_HD && !seen_HD))) {
-            err_fwrite(p, 1, len, fp);
+            err_fwrite(line, 1, len, fp);
             err_fputc('\n', fp);
         }
         if (is_HD) seen_HD = 1;
-        p = eol ? eol + 1 : p + len;
     }
+}
+
+/* Iterate the records of newline-separated SAM header text.
+ *
+ * Start with *p at the beginning of the text. Each call sets *line/*len to the
+ * next record (newline excluded), advances *p past it, and returns 1; returns 0
+ * at end of text. Text with or without a trailing newline both yield exactly
+ * the records present -- no phantom empty final record.
+ *
+ * Exists because this exact walk -- strchr('\n'), length, advance-or-stop --
+ * was hand-rolled in six places across three files (fg-labs/bwa-mem3#289),
+ * each subtly its own; all six now call here. Callers that care about empty
+ * records must still skip them; the iterator reports what is there.
+ *
+ *     const char *p = hdr_text, *line; size_t len;
+ *     while (bwa_hdr_next_line(&p, &line, &len)) { ... }
+ */
+int bwa_hdr_next_line(const char **p, const char **line, size_t *len)
+{
+    if (p == NULL || *p == NULL || **p == '\0') return 0;
+    const char *start = *p;
+    const char *eol = strchr(start, '\n');
+    *line = start;
+    *len  = eol ? (size_t)(eol - start) : strlen(start);
+    *p    = eol ? eol + 1 : start + *len;      /* lands on the NUL when no eol */
+    return 1;
+}
+
+/* Format the generated @SQ record for contig `ann` into `out` (appended, no
+ * trailing newline). Returns 0, or -1 if `out` could not be grown.
+ *
+ * ONE definition on purpose. This record used to be built independently in
+ * three writers -- snprintf+err_fputs here, sam_hdr_add_line varargs in
+ * bam_writer.cpp, ksprintf in meth_bam.cpp -- and they drifted: AH:* was
+ * correct only in this copy, so --bam and --meth lost ALT status for every
+ * ALT-aware reference until each copy was fixed separately
+ * (fg-labs/bwa-mem3#281); consolidating them so it cannot recur again is
+ * fg-labs/bwa-mem3#289. The three sinks all accept SAM header TEXT, so there
+ * is no reason for three spellings.
+ *
+ * Contents match what bwa (bwa.c:430-433) and bwa-mem2 (bwa.cpp:535-548) emit.
+ * The DECISION to emit is deliberately NOT here -- each writer gates it
+ * differently (-H precedence, sidecar precedence, --meth always-emit) and that
+ * is genuine per-path policy.
+ *
+ * Uses kstring rather than a fixed buffer: the old snprintf into char[512]
+ * truncated silently on a long contig name. The one cost of that is that the
+ * append can now fail, and ksprintf/kputs swallow their own failures -- so the
+ * worst case is reserved up front and the status returned, the same way the
+ * MC:Z and SA:Z builders in bam_writer.cpp handle it. Without this, a caller
+ * has no way to tell a failed append from a formatted record and would emit
+ * (or fputs) a NULL or truncated one. */
+int bwa_format_sq_line(kstring_t *out, const bntann1_t *ann)
+{
+    /* "@SQ\tSN:" + name + "\tLN:" + int + "\tAH:*" + NUL: 7 + 4 + 11 + 5 + 1,
+     * rounded up. Pre-sized, the appends below cannot need to grow `out`.
+     *
+     * The failure test is on `out` rather than a return value because this file
+     * uses bwa's kstring.h, whose ks_resize is void and leaves s->s NULL when
+     * the realloc fails -- not htslib's, which returns a status. (bam_writer.cpp
+     * gets htslib's and can check directly; see the MC:Z path there.) */
+    const size_t need = out->l + strlen(ann->name) + 32;
+    ks_resize(out, need);
+    if (out->s == NULL || out->m < need) return -1;
+    ksprintf(out, "@SQ\tSN:%s\tLN:%d", ann->name, ann->len);
+    /* AH:* marks an alternate locus. `is_alt` comes from <prefix>.alt via
+     * bwa_idx_load and has no representation in an htslib sam_hdr_t, so every
+     * writer must re-apply it from bns rather than expect it to survive. */
+    if (ann->is_alt) kputs("\tAH:*", out);
+    return 0;
+}
+
+/* True if the SAM header text `s` contains a record whose type is `tag` (e.g.
+ * "@HD\t"), either as the first line or following a newline. Hoisted out of
+ * meth_bam.cpp, where it was static, so the BAM writers stop open-coding it.
+ *
+ * `tag` is any NUL-terminated prefix, not specifically a 4-character "@XX\t" --
+ * hence the name, rather than the `tag4` this carried while it was static with
+ * two 4-character call sites.
+ *
+ * Implemented on the record iterator rather than as a strstr for "\n" + tag.
+ * The needle form needs a fixed buffer, and this is public now: a caller
+ * passing a longer type than the buffer holds would have its tag silently
+ * truncated and get a wrong answer instead of no match. Walking records has no
+ * length ceiling, and it keeps this file to one scanner. */
+int bwa_hdr_text_has_type(const char *s, const char *tag)
+{
+    if (s == NULL || tag == NULL) return 0;
+    const size_t n = strlen(tag);
+    if (n == 0) return 0;
+    const char *cur = s, *line; size_t len;
+    while (bwa_hdr_next_line(&cur, &line, &len))
+        if (len >= n && strncmp(line, tag, n) == 0) return 1;
+    return 0;
 }
 
 // Return 1 iff `lines` contains any @SQ header records.
 static int has_SQ(const char *lines)
 {
-    if (lines == NULL) return 0;
-    if (strncmp(lines, "@SQ\t", 4) == 0) return 1;
-    return strstr(lines, "\n@SQ\t") != NULL;
+    return bwa_hdr_text_has_type(lines, "@SQ\t");
 }
 
 // Return 1 iff `lines` contains an @HD record (first line, or after a newline).
 static int has_HD(const char *lines)
 {
-    if (lines == NULL) return 0;
-    if (strncmp(lines, "@HD\t", 4) == 0) return 1;
-    return strstr(lines, "\n@HD\t") != NULL;
+    return bwa_hdr_text_has_type(lines, "@HD\t");
 }
 
 // Count the number of @SQ header records in `lines`.
 static int count_SQ(const char *lines)
 {
     int n_SQ = 0;
-    if (lines) {
-        const char *p = lines;
-        while ((p = strstr(p, "@SQ\t")) != 0) {
-            if (p == lines || *(p - 1) == '\n') ++n_SQ;
-            p += 4;
-        }
-    }
+    const char *cur = lines, *line; size_t len;
+    while (bwa_hdr_next_line(&cur, &line, &len))
+        if (len >= 4 && strncmp(line, "@SQ\t", 4) == 0) ++n_SQ;
     return n_SQ;
 }
 
@@ -704,9 +788,8 @@ void bwa_warn_sidecar_missing_AH(const bntseq_t *bns, const char *idx_hdr_lines,
      * already reported by the @SQ-count mismatch warning in
      * bwa_print_sam_hdr2 ("N @SQ lines loaded from index; M sequences"). */
     int n_missing = 0, first_id = -1;
-    for (const char *line = idx_hdr_lines; *line != '\0'; ) {
-        const char *eol = strchr(line, '\n');
-        const size_t line_len = eol ? (size_t)(eol - line) : strlen(line);
+    const char *cur = idx_hdr_lines, *line; size_t line_len;
+    while (bwa_hdr_next_line(&cur, &line, &line_len)) {
         const char *sn = NULL; size_t sn_len = 0; int has_ah = 0;
         if (sq_scan(line, line_len, &sn, &sn_len, &has_ah) && !has_ah) {
             /* kh_get needs a NUL-terminated key and `sn` points into the
@@ -727,8 +810,6 @@ void bwa_warn_sidecar_missing_AH(const bntseq_t *bns, const char *idx_hdr_lines,
                 if (k != kh_end(alt) && n_missing++ == 0) first_id = kh_val(alt, k);
             }
         }
-        if (eol == NULL) break;
-        line = eol + 1;
     }
     kh_destroy(sqname, alt);
     if (n_missing == 0) return;
@@ -793,14 +874,19 @@ static void print_sam_hdr(const bntseq_t *bns, const char *bns_hdr,
 
     // Generate @SQ from bns only when neither hdr_line nor bns_hdr supply any.
     if (n_SQ == 0 && !has_SQ(bns_hdr)) {
+        kstring_t sq = {0, 0, NULL};
         for (i = 0; i < bns->n_seqs; ++i) {
-            char buf[512];
-            snprintf(buf, sizeof(buf), "@SQ\tSN:%s\tLN:%d",
-                     bns->anns[i].name, bns->anns[i].len);
-            err_fputs(buf, fp);
-            if (bns->anns[i].is_alt) err_fputs("\tAH:*\n", fp);
-            else                     err_fputc('\n', fp);
+            sq.l = 0;                      /* reuse the buffer across contigs */
+            /* Fatal, like every other write failure on this path (err_fputs
+             * aborts): a header missing contigs is not a usable output, and
+             * this function has no way to report a partial one to its caller. */
+            if (bwa_format_sq_line(&sq, &bns->anns[i]) < 0)
+                err_fatal(__func__, "failed to allocate the @SQ record for contig %s",
+                          bns->anns[i].name);
+            err_fputs(sq.s, fp);
+            err_fputc('\n', fp);
         }
+        free(sq.s);
     }
 
     if (n_SQ != 0 && n_SQ != bns->n_seqs && bwa_verbose >= 2)

@@ -2235,12 +2235,8 @@ int main_mem(int argc, char *argv[])
         extern char *bwa_pg;
         /* Suppress idx .hdr/.dict records entirely when the user's -H
          * supplies any @SQ, matching bwa_print_sam_hdr2's SAM precedence. */
-        const char *bam_idx_hdr = idx_hdr_lines;
-        if (hdr_line != NULL) {
-            if (strncmp(hdr_line, "@SQ\t", 4) == 0 ||
-                strstr(hdr_line, "\n@SQ\t") != NULL)
-                bam_idx_hdr = NULL;
-        }
+        const char *bam_idx_hdr = bwa_hdr_text_has_type(hdr_line, "@SQ\t")
+                                ? NULL : idx_hdr_lines;
         bam_writer = bam_writer_open(bam_path, aux.fmi->idx->bns,
                                      bam_idx_hdr, hdr_line,
                                      bwa_pg, opt->bam_level, opt->compat);
