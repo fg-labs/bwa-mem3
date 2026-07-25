@@ -146,13 +146,38 @@ make profile-clean
 | `DISABLE_BATCHED_MATESW` | _(unset)_ | Set to `1` to disable the batched mate-rescue SW path on ARM |
 | `CXX` | `c++` | Compiler. Paired `CC` is auto-derived from `CXX` for libsais. |
 
+## Incremental builds and header dependencies
+
+Every compile emits a sidecar `.d` file next to its object listing the headers that
+translation unit included (`-MMD -MP`), and the Makefile includes them, so editing a header
+rebuilds exactly the objects that read it. There is no `make depend` step to remember.
+
+Objects additionally depend on `.build-flags`, a stamp holding the expanded compile flags.
+It is rewritten only when that text changes, so switching flags (`make arch=avx2` after
+`arch=sse41`, adding `ASAN=1`, changing `CXX`) rebuilds the objects built with the old ones,
+while editing an unrelated part of the Makefile does not.
+
+Both are build artifacts: `make clean` removes them and `.gitignore` covers them.
+`test/regression/make_header_deps.sh` guards the mechanism — it enumerates the Makefile's
+object lists and checks that every one of them that the tree has actually *built* has a
+generated `.d`, so a compile rule added without `$(DEPFLAGS)` fails the check. Objects absent
+from the build tree are skipped (a run that skipped everything fails), so run it against a
+tree built the way you want covered. CI runs it on the canonical row.
+
+The Makefile also states its default goal (`.DEFAULT_GOAL`) rather than letting make fall back
+to the first target of the first rule. `myall` has a rule only for a bare `make`; once `arch=`
+is set — which CI's build step and `single:`'s own recursion both do — the goal is `all`, and
+without the explicit setting any rule added above `all:` would take that slot instead. An
+object landing there makes a build compile one file, exit 0, and produce no binary.
+`test/regression/make_default_goal.sh` guards it, also on the canonical row.
+
 ## Cleaning
 
 ```bash
 make clean
 ```
 
-Removes object files, `libbwa.a`, all binaries, test binaries, libsais objects, htslib, and the mimalloc build tree.
+Removes object files, dependency files, `libbwa.a`, all binaries, test binaries, libsais objects, htslib, and the mimalloc build tree.
 
 ```bash
 make docs-clean

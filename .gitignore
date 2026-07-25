@@ -1,6 +1,8 @@
 *.o
 *.a
+*.d
 *.dSYM
+.build-flags
 .*.swp
 a.out
 bwa-mem2
