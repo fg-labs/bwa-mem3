@@ -202,16 +202,29 @@ void worker_alloc(const mem_opt_t *opt, worker_t &w, int32_t nreads, int32_t nth
 
     int32_t memSize = nreads;
 
-    /* Mem allocation section for core kernels */
+    /* Mem allocation section for core kernels.
+     *
+     * PIPE-F24: regs/chain_ar/seedBuf are the only nreads-sized scratch here,
+     * and seedBuf alone is memSize*AVG_SEEDS_PER_READ*sizeof(mem_seed_t) —
+     * multiple GB for a capped (~256M-base) chunk. When memSize == 0 the caller
+     * is deferring this sizing to the grow-on-demand path in kt_pipeline
+     * (step 1), which allocates the trio EXACTLY from the parsed read count
+     * (ret->n_seqs) and reuses it across chunks. Leaving the pointers NULL here
+     * is a valid state: that path free()s them (free(NULL) is a no-op) before
+     * its own calloc/malloc, and worker_free is NULL-safe too. For memSize > 0
+     * (e.g. language-binding consumers that size the trio themselves) the
+     * behavior is byte-identical to before. */
     w.regs = NULL; w.chain_ar = NULL; w.seedBuf = NULL;
 
-    w.regs = (mem_alnreg_v *) calloc(memSize, sizeof(mem_alnreg_v));
-    w.chain_ar = (mem_chain_v*) malloc (memSize * sizeof(mem_chain_v));
-    w.seedBuf = (mem_seed_t *) calloc(sizeof(mem_seed_t),  memSize * AVG_SEEDS_PER_READ);
+    if (memSize > 0) {
+        w.regs = (mem_alnreg_v *) calloc(memSize, sizeof(mem_alnreg_v));
+        w.chain_ar = (mem_chain_v*) malloc (memSize * sizeof(mem_chain_v));
+        w.seedBuf = (mem_seed_t *) calloc(sizeof(mem_seed_t),  memSize * AVG_SEEDS_PER_READ);
 
-    assert(w.seedBuf  != NULL);
-    assert(w.regs     != NULL);
-    assert(w.chain_ar != NULL);
+        assert(w.seedBuf  != NULL);
+        assert(w.regs     != NULL);
+        assert(w.chain_ar != NULL);
+    }
 
     w.seedBufSize = BATCH_SIZE * AVG_SEEDS_PER_READ;
 
@@ -830,7 +843,17 @@ static int process(void *shared, gzFile gfp, gzFile gfp2, int pipe_threads)
     }
 #endif
 
-    int32_t nreads = aux->actual_chunk_size / NREADS_ESTIMATE_AVG_BASES + 10;
+    /* PIPE-F24: do NOT pre-size the per-read chaining scratch (regs/chain_ar/
+     * seedBuf) from a bytes/NREADS_ESTIMATE_AVG_BASES heuristic. That estimate
+     * (chunk_bytes/100 + 10) is right only for ~100 bp reads: it OVER-allocates
+     * a multi-GB seedBuf for longer reads (pure waste — the pool is never
+     * shrunk) and UNDER-allocates for shorter reads, forcing a free() + multi-GB
+     * calloc() on the first chunk. Start at 0 and let the grow-on-demand path in
+     * kt_pipeline (step 1) size the trio EXACTLY from the actual parsed read
+     * count (ret->n_seqs) and reuse it across chunks. Correctness is unchanged:
+     * that path runs BEFORE any read indexes these buffers and guarantees
+     * w.nreads >= n_seqs, with identical calloc zero-init. */
+    int32_t nreads = 0;
 
     /* All memory allocation */
     memoryAlloc(aux, w, nreads, nthreads);
