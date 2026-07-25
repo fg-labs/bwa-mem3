@@ -15,6 +15,7 @@ matrix row; the rest run on the canonical AVX2 row only. Each script:
 | `short_read_smoke.sh`        | ASAN SE on 25-50 bp variable-length dense-chr22 reads (PR #100 fix)   | "Short-read SE smoke (chr22, ASAN, dense+variable-length)" |
 | `supp_rep_hard_cap.sh`       | `--supp-rep-hard-cap` forces MAPQ=0 on repetitive-seed supps (#101)   | "--supp-rep-hard-cap repetitive-seed regression"    |
 | `compat_byte_identical.sh`   | `--compat` suppresses only MQ/HN; rest byte-identical (SAM+BAM)       | "--compat byte-identical regression (phix)"         |
+| `header_parity.sh`           | `AH:*` on generated @SQ for ALT contigs (SAM+BAM+meth, #281)          | "ALT contig header regression (AH:*)"               |
 | `meth_oracle.sh`             | `--meth` Layers 1–3 match bwa-meth oracle                             | "Run --meth Layers 1-3"                             |
 
 Each script reads its inputs from environment variables — see the comment

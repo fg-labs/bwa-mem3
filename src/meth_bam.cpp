@@ -181,11 +181,20 @@ meth_bam_writer_t *meth_bam_writer_open(const char *path_or_dash,
      * f/r consolidation — alignments already carry original rids). Each @SQ is
      * enriched by SN with the original reference's identity tags (M5/UR/AS/SP)
      * from its .hdr/.dict sidecar when available; the extra tags are appended
-     * verbatim, gated on a matching SN+LN. */
+     * verbatim, gated on a matching SN+LN.
+     *
+     * AH:* on ALT contigs is appended from the ORIGINAL bns, matching both
+     * upstreams' generated @SQ (bwa/bwa.c:432, bwa-mem2/src/bwa.cpp:538) and
+     * our SAM text path; this consolidated block was written without it and
+     * dropped ALT status for every ALT-aware reference. It cannot collide with
+     * the sidecar enrichment: meth_append_sq_extra_tags copies only
+     * M5/UR/AS/SP, never AH. Appended BEFORE those tags so the line reads
+     * SN, LN, AH, then identity tags -- the order bwa emits. */
     for (int i = 0; i < bns->n_seqs; ++i) {
         kstring_t sq = {0, 0, NULL};
         ksprintf(&sq, "@SQ\tSN:%s\tLN:%lld",
                  bns->anns[i].name, (long long)bns->anns[i].len);
+        if (bns->anns[i].is_alt) kputs("\tAH:*", &sq);
         meth_append_sq_extra_tags(orig_idx_hdr_lines, bns->anns[i].name,
                                   bns->anns[i].len, &sq);
         int rc = (sq.s != NULL) ? sam_hdr_add_lines(w->hdr, sq.s, sq.l) : -1;

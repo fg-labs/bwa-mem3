@@ -391,6 +391,13 @@ jobs:
           COMPAT_WORK_DIR=/tmp/compat-bytes \
           bash test/regression/compat_byte_identical.sh
 
+      - name: ALT contig header regression (AH:*)
+        if: matrix.canonical == true
+        run: |
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          HEADER_PARITY_WORK_DIR=/tmp/header-parity \
+          bash test/regression/header_parity.sh
+
       - name: SE alignment smoke (chr22)
         if: matrix.canonical == true
         run: |

@@ -146,6 +146,12 @@ extern "C" {
 	void bwa_print_sam_hdr2(const bntseq_t *bns, const char *idx_hdr_lines,
 	                        const char *hdr_line, FILE *fp);
 	char *bwa_load_hdr_from_index(const char *prefix);
+	/* Warn (at bwa_verbose >= 2) when the index marks contigs ALT but the
+	 * sidecar's @SQ block carries no AH for them. The sidecar is authoritative
+	 * and is never modified; this only reports the gap and its remedy. */
+	void bwa_warn_sidecar_missing_AH(const bntseq_t *bns,
+	                                 const char *idx_hdr_lines,
+	                                 const char *prefix);
 	char *bwa_set_rg(const char *s);
 	char *bwa_insert_header(const char *s, char *hdr);
 	char *bwa_insert_header_file(FILE *fp, char *hdr);

@@ -68,8 +68,19 @@ bam_writer_t *bam_writer_open(const char *path, const bntseq_t *bns,
         for (int i = 0; i < bns->n_seqs; ++i) {
             char len_buf[32];
             snprintf(len_buf, sizeof(len_buf), "%lld", (long long)bns->anns[i].len);
-            if (sam_hdr_add_line(hdr, "SQ", "SN", bns->anns[i].name, "LN", len_buf, NULL) < 0)
-                goto fail;
+            // AH:* on ALT contigs. Both upstreams emit it on the generated
+            // @SQ block (bwa/bwa.c:432, bwa-mem2/src/bwa.cpp:538) and so does
+            // our SAM text path (bwa.cpp); this writer was ported as an
+            // SN+LN-only loop and silently dropped it for EVERY ALT-aware
+            // reference, sidecar or not. `is_alt` comes from <prefix>.alt via
+            // bwa_idx_load and has no representation in an htslib sam_hdr_t,
+            // so it must be re-applied here.
+            int rc = bns->anns[i].is_alt
+                   ? sam_hdr_add_line(hdr, "SQ", "SN", bns->anns[i].name,
+                                      "LN", len_buf, "AH", "*", NULL)
+                   : sam_hdr_add_line(hdr, "SQ", "SN", bns->anns[i].name,
+                                      "LN", len_buf, NULL);
+            if (rc < 0) goto fail;
         }
     }
     // Merge the index's .hdr/.dict records after the default @HD (and

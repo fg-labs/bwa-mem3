@@ -1938,6 +1938,11 @@ int main_mem(int argc, char *argv[])
      * the --bam path forwards them to htslib's sam_hdr_add_lines so the
      * rich @SQ (AS/M5/SP/AH/…) also makes it into the BAM header. */
     char *idx_hdr_lines = bwa_load_hdr_from_index(ref_prefix);
+    /* A sidecar @SQ block that omits AH on ALT contigs silently strips ALT
+     * status from the output. We do not rewrite it (it is authoritative --
+     * see the function's comment), but we do say so. */
+    if (idx_hdr_lines != NULL && !opt->meth_mode)
+        bwa_warn_sidecar_missing_AH(aux.fmi->idx->bns, idx_hdr_lines, ref_prefix);
     /* --meth only: the original (pre-c2t) reference's .hdr/.dict sidecar, for
      * @SQ M5/UR enrichment and @CO/@PG/@RG pass-through in meth_bam_writer_open.
      * NULL outside --meth or when the original has no sidecar. */
