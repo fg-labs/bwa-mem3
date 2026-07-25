@@ -28,12 +28,15 @@ typedef struct bam_writer_s bam_writer_t;
  * win on any @HD/@SQ collision via htslib's header de-dup rules. `hdr_line`
  * carries user-supplied header lines (e.g., `@RG` from `-R` and `-H`
  * insertions, as accumulated by bwa_insert_header); it is inserted before
- * `@PG`. `bwa_pg` is inserted as-is. All three may be NULL. Returns NULL on
- * failure. */
+ * `@PG`. `bwa_pg` is inserted as-is. All three may be NULL. `compat` selects
+ * the output-compatibility target whose @HD policy the header follows (NULL =
+ * COMPAT_TARGET_OFF); it shapes only the default @HD, never @SQ. Returns NULL
+ * on failure. */
 bam_writer_t *bam_writer_open(const char *path, const bntseq_t *bns,
                               const char *idx_hdr_lines,
                               const char *hdr_line, const char *bwa_pg,
-                              int compression_level);
+                              int compression_level,
+                              const compat_target_t *compat);
 
 /* Write one record. Returns 0 on success, -1 on error. */
 int bam_writer_write(bam_writer_t *w, struct bam1_t *b);

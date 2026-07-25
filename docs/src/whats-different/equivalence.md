@@ -7,7 +7,7 @@ On the drop-in profile (plain <code>bwa-mem3 mem</code>, no flags), release 0.7.
 <li><code>MQ:i</code> — mate mapping quality (an extra tag bwa-mem2 never wrote)</li>
 <li><code>HN:i</code> — hit count (an extra tag bwa-mem2 never wrote)</li>
 </ul>
-Strip those two tags and those records are byte-for-byte identical — or pass <strong><code>--compat</code></strong> to suppress both at the source (see <a href="#byte-identical-records---compat">Byte-identical records</a>). The <strong>header</strong> is a separate question that these measurements do not cover: the <code>@PG</code> line names <code>bwa-mem3</code>, and bwa-mem3 emits a default <code>@HD</code> line that bwa-mem2 has no code to write at all (<a href="https://github.com/fg-labs/bwa-mem3/issues/288">#288</a>). Every byte-identity claim on this page is about <em>alignment records</em>, not the header block.
+Strip those two tags and those records are byte-for-byte identical — or pass <strong><code>--compat=bwa-mem2</code></strong> to suppress both at the source (see <a href="#byte-identical-output---compat">Byte-identical output</a>). The <strong>header</strong> is a separate question that these measurements do not cover: on the default path the <code>@PG</code> line names <code>bwa-mem3</code> and bwa-mem3 emits a default <code>@HD</code> line that bwa-mem2 has no code to write at all (<a href="https://github.com/fg-labs/bwa-mem3/issues/288">#288</a>). <code>--compat=bwa-mem2</code> brings the <code>@HD</code> and <code>@SQ</code> blocks to parity as well, leaving only <code>@PG</code> to exclude. Every byte-identity claim measured on this page is about <em>alignment records</em>, not the header block.
 <br><br>
 <strong>The supplementary gap is now closed.</strong> The residual <strong>+4 supplementary alignments</strong> has been re-measured on <code>e722ed0</code> (a build carrying <a href="https://github.com/fg-labs/bwa-mem3/pull/268">#268</a>) and is <strong>+0</strong>: on <code>wgs-5M</code>, <code>wes-5M</code> and <code>hic-1M</code> the full <em>alignment-record</em> stream is byte-identical to bwa-mem2 v2.2.1 once <code>MQ:i</code>/<code>HN:i</code> are stripped — 22.5 M records including 436 k supplementary alignments. That comparison covers alignment records only, not the header block. What remains open is the genome-wide, multi-sample re-run that would extend this past the cells named on this page. Treat every claim here as scoped to the evidence it cites, not as a guarantee across all inputs and architectures. (The opt-in <code>--fast</code> speed levers are a separate, deliberate deviation — see below.)
 </div>
@@ -90,44 +90,72 @@ regenerate the [declared divergence catalog](#declared-divergence-catalog) is pe
 > chooses bwa-mem2 output compatibility over the convention because bwa-mem3 is a drop-in
 > replacement. `IPNP-BIPN/bwa-mem4` made the same call (`990df3a`) for the same reason.
 
-## Byte-identical records (`--compat`)
+## Byte-identical output (`--compat`)
 
-With the primary alignments restored (above), the only thing standing between the drop-in
-profile's **records** and a byte-for-byte match with bwa-mem2 is the additive tag layer:
-`MQ:i` and `HN:i`. The `--compat` flag removes exactly those:
+With the primary alignments restored (above), a small set of bwa-mem3-side additions is all
+that stands between the drop-in profile and a byte-for-byte match with bwa-mem2 v2.2.1.
+`--compat=bwa-mem2` removes exactly those:
 
 ```bash
-bwa-mem3 mem --compat -t <N> ref.fa R1.fq R2.fq > out.sam
+bwa-mem3 mem --compat=bwa-mem2 -t <N> ref.fa R1.fq R2.fq > out.sam
 ```
 
-Under `--compat`, bwa-mem3 emits no `MQ:i` tag and no `HN:i` tag. Every alignment, score,
-flag, and other tag is untouched — it is **output-suppressing only, never an alignment
-change**. On both the SAM-text and `--bam` paths the records are then byte-identical to
-bwa-mem2 v2.2.1 on the drop-in profile: stripping `MQ`/`HN` from a default run and diffing
-against a `--compat` run yields identical streams (same md5).
+| | default | `--compat=bwa-mem2` | bwa-mem2 v2.2.1 |
+|---|---|---|---|
+| `MQ:i` | emitted | suppressed | absent |
+| `HN:i` | emitted | suppressed | absent |
+| default `@HD` | emitted | suppressed | **none emitted** |
+| `.hdr`/`.dict` sidecar `@SQ` | honored (`M5`/`AS`/`UR`/`SP`) | ignored → bare `SN`/`LN` (+`AH:*`) | bare `SN`/`LN` (+`AH:*`) |
+| `@PG` | `ID:bwa-mem3` | `ID:bwa-mem3` | `ID:bwa-mem2` |
+
+Two of those rows are not what they look like. **`MQ:i` is not a bwa-mem3 invention** — bwa
+emits it too ([lh3/bwa#330](https://github.com/lh3/bwa/pull/330), merged 2022-03-06);
+bwa-mem2 lacks it only because it forked at 0.7.17, before that landed. Likewise **bwa emits
+a default `@HD`** (0.7.18, `6b18630`) and bwa-mem2 does not, for the same reason. Only `HN:i`
+and the sidecar are genuinely bwa-mem3-only — which is why `--compat` takes a *target* rather
+than being a boolean: bwa and bwa-mem2 disagree with each other on half of this table.
+
+`--compat` is **output-shaping only, never an alignment change**. Every alignment, score,
+flag, and tag value is untouched.
+
+**Verified** against a real bwa-mem2 v2.2.1 run on hg38: with `@PG` excluded on both sides —
+it still names `bwa-mem3` and is unmatchable by construction, see the caveats below — the
+header is byte-identical on both the SAM-text and `--bam` paths (3,366 lines, md5
+`34dabb50dd7a704866e841d3e5a7f68d` on all three), and the records are byte-identical on the
+drop-in profile.
+
+```bash
+# records
+diff <(samtools view out.compat.bam) <(samtools view out.mem2.bam)
+# header, @PG excluded on both sides
+diff <(samtools view -H --no-PG out.compat.bam | grep -v '^@PG') \
+     <(samtools view -H --no-PG out.mem2.bam   | grep -v '^@PG')
+```
 
 Caveats:
 
+- **`@PG` is still emitted**, and still names `bwa-mem3`. Suppressing it would only turn a
+  changed line into a missing one, since bwa-mem2 writes its own. It is unmatchable by
+  construction anyway — `CL:` embeds the invocation and its paths, so even two bwa-mem2 runs
+  from different directories differ. Exclude `@PG` on both sides when comparing.
 - **`--compat` and `--fast` are mutually exclusive** — passing both is a hard error.
-  `--fast` deliberately moves alignments; `--compat` only removes additive fields, so
-  `--fast --compat` would produce a diff-clean-looking stream over genuinely different
+  `--fast` deliberately moves alignments; `--compat` only shapes output, so `--fast
+  --compat=bwa-mem2` would produce a diff-clean-looking stream over genuinely different
   alignments. `--compat` is meaningful only on the drop-in profile.
-- **`--compat` covers records, not the header.** `@PG` is still emitted and still names
-  `bwa-mem3`; suppressing it would only turn a changed line into a missing one, since
-  bwa-mem2 writes its own. It is unmatchable by construction anyway — `CL:` embeds the
-  invocation and its paths, so even two bwa-mem2 runs from different directories differ.
-  Exclude `@PG` on both sides when comparing (`samtools view` without the header, or
-  `samtools view -H --no-PG`).
-- **`@HD` and `@SQ` may also differ**, independently of `--compat`. bwa-mem2 emits no `@HD`
-  at all, and when a `<prefix>.hdr` / `<baseprefix>.dict` sidecar is present bwa-mem3
-  emits its richer `@SQ` block (`M5`/`AS`/`UR`/`SP`). `SN`/`LN` are identical in identical
-  order, so this is additive, but a comparator that checks every `@SQ` field will still
-  flag it. Bringing these under `--compat` is tracked separately.
+- **The sidecar `@SQ` is skipped, not rewritten.** Outside `--compat` the
+  `<prefix>.hdr` / `<baseprefix>.dict` block remains authoritative and is emitted verbatim —
+  it is a port of [lh3/bwa#348](https://github.com/lh3/bwa/pull/348), designed for the block
+  to be produced complete by an external tool. If your index has a `.alt` file, generate the
+  sidecar with `samtools dict --alt <ref>.alt` so `AH:*` is carried; bwa-mem3 warns when it
+  sees ALT contigs and a sidecar `@SQ` without `AH`.
+- **`--compat=bwa-mem` is recognized but rejected.** bwa-mem3 and bwa still differ on 224 of
+  63,583 records (53 above MAPQ 30) in MAPQ, CIGAR, POS and TLEN, so no amount of output
+  shaping makes them byte-identical. Tracked separately.
 
 `--compat` is for the standard drop-in path only: bwa-mem2 has no `--meth` mode to be
 identical to, so **`--compat --meth` is a hard error**. See
-[`mem` → `--compat`](../cli/mem.md#--compat--byte-identical-bwa-mem2-records) for the
-flag reference.
+[`mem` → `--compat`](../cli/mem.md#--compattarget--byte-identical-output-for-another-aligner)
+for the flag reference.
 
 ## What is preserved
 

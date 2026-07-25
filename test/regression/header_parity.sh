@@ -1,15 +1,21 @@
 #!/usr/bin/env bash
 # test/regression/header_parity.sh
 #
-# Regression: AH:* on ALT contigs must be emitted by the GENERATED @SQ block
-# on BOTH output paths. Upstream bwa (bwa.c:432) and bwa-mem2 (bwa.cpp:538)
-# both emit it, and bwa-mem3's SAM text path did, but the BAM writer was
-# ported as an SN+LN-only loop and dropped it for EVERY ALT-aware reference,
-# sidecar or not (fg-labs/bwa-mem3#281). --meth's consolidated @SQ had the
-# same omission.
+# Regression for the two header behaviors that compat_byte_identical.sh
+# cannot reach with its phix fixture, because both need a reference that
+# has ALT contigs and a .hdr/.dict sidecar:
 #
-# Needs a reference with ALT contigs and a .hdr/.dict sidecar, which the phix
-# fixture used elsewhere in this directory does not have.
+#   1. AH:* on ALT contigs is emitted by the GENERATED @SQ block on BOTH
+#      output paths. Upstream bwa (bwa.c:432) and bwa-mem2 (bwa.cpp:538)
+#      both emit it; bwa-mem3's SAM text path did, but the BAM writer was
+#      ported as an SN+LN-only loop and dropped it for EVERY ALT-aware
+#      reference, sidecar or not (fg-labs/bwa-mem3#281).
+#
+#   2. `--compat=bwa-mem2` ignores the sidecar entirely, so @SQ regenerates
+#      as bare SN/LN (+AH:*). The <prefix>.hdr / <baseprefix>.dict sidecar
+#      is bwa-mem3-only -- a port of lh3/bwa#348, which lh3 closed unmerged
+#      -- so neither upstream has anything to load, and its M5/AS/UR/SP
+#      would break byte-identity.
 #
 # The sidecar's own @SQ is AUTHORITATIVE and is never rewritten: lh3/bwa#348
 # was designed for the block to be produced complete by an external dict
@@ -114,6 +120,14 @@ sq_of() {   # <tag> [bwa-mem3 args...]
         || { echo "FAIL: $tag emitted no @SQ header block" >&2; exit 1; }
 }
 
+# Assert the run emitted no @HD at all.
+assert_no_HD() {   # <tag> <human description>
+    if grep -q '^@HD' "$1.hdr"; then
+        echo "FAIL: $2 — @HD emitted under compat (bwa-mem2 emits none)" >&2
+        exit 1
+    fi
+}
+
 assert_alt_has_AH() {   # <tag> <human description>
     grep -q "SN:${ALT_CONTIG}.*AH:\*" "$1.sq" \
         || { echo "FAIL: $2 — AH:* missing on $ALT_CONTIG:" >&2; cat "$1.sq" >&2; exit 1; }
@@ -132,24 +146,28 @@ assert_no_primary_AH() {   # <tag> <human description>
     fi
 }
 
-# --- 1. No sidecar: AH:* on the generated @SQ, SAM text and BAM. ----------
-# The BAM cell is fg-labs/bwa-mem3#281's broader half: it dropped AH for
-# every ALT-aware reference, sidecar or not.
+# --- 1. No sidecar: AH:* on BOTH paths, default AND compat. ---------------
+# The BAM/no-sidecar cell is fg-labs/bwa-mem3#281's broader half: it dropped
+# AH for every ALT-aware reference, independent of --compat.
 rm -f ref.dict ref.fasta.hdr
 sq_of nosc_sam_def
 assert_alt_has_AH nosc_sam_def "SAM text, no sidecar, default"
 assert_no_primary_AH nosc_sam_def "SAM text, no sidecar, default"
+sq_of nosc_sam_cmp --compat=bwa-mem2
+assert_alt_has_AH nosc_sam_cmp "SAM text, no sidecar, --compat=bwa-mem2"
 if [ "$have_samtools" -eq 1 ]; then
     sq_of nosc_bam_def --bam
     assert_alt_has_AH nosc_bam_def "BAM, no sidecar, default (issue #281)"
     assert_no_primary_AH nosc_bam_def "BAM, no sidecar, default"
+    sq_of nosc_bam_cmp --bam --compat=bwa-mem2
+    assert_alt_has_AH nosc_bam_cmp "BAM, no sidecar, --compat=bwa-mem2"
 fi
-echo "PASS: AH:* emitted on generated @SQ (SAM text + BAM)"
+echo "PASS: AH:* emitted on generated @SQ (SAM+BAM, default and --compat)"
 
 # The remaining cases need a sidecar, which we build with `samtools dict`.
 if [ "$have_samtools" -eq 0 ]; then
     echo "SKIP: sidecar cases need samtools dict"
-    echo "PASS: ALT contig header regression (partial — no samtools)"
+    echo "PASS: compat header parity regression (partial — no samtools)"
     exit 0
 fi
 
@@ -179,6 +197,28 @@ grep -q 'samtools dict --alt' sc_sam_def.err \
     || { echo "FAIL: missing-AH warning does not name the remedy" >&2; cat sc_sam_def.err >&2; exit 1; }
 echo "PASS: sidecar @SQ is authoritative (AH absent), and the gap is warned about"
 
+# compat: sidecar skipped entirely -> bare SN/LN + AH:*, no identity tags.
+assert_compat_ignores_sidecar() {   # <tag>
+    assert_alt_has_AH "$1" "$1"
+    if grep -qE "\t(M5|AS|UR|SP):" "$1.sq"; then
+        echo "FAIL: $1 — sidecar identity tags leaked into compat output:" >&2
+        head -3 "$1.sq" >&2
+        exit 1
+    fi
+    # The sidecar's own @HD must not sneak through either.
+    assert_no_HD "$1" "$1"
+    # No warning: the sidecar was never read.
+    if grep -q 'sidecar supplies @SQ without an AH tag' "$1.err"; then
+        echo "FAIL: $1 — warned about a sidecar that compat does not read" >&2
+        exit 1
+    fi
+}
+sq_of sc_sam_cmp --compat=bwa-mem2
+assert_compat_ignores_sidecar sc_sam_cmp
+sq_of sc_bam_cmp --bam --compat=bwa-mem2
+assert_compat_ignores_sidecar sc_bam_cmp
+echo "PASS: --compat=bwa-mem2 ignores the sidecar (bare SN/LN + AH:*, no @HD)"
+
 # --- 3. Sidecar WITH AH (`samtools dict --alt`, the supported remedy). ----
 samtools dict -a testasm -s testus --alt ref.fasta.alt -o ref.dict ref.fasta
 grep -q "SN:${ALT_CONTIG}.*AH:" ref.dict \
@@ -198,4 +238,4 @@ sq_of ah_sam;        assert_sidecar_AH_passthrough ah_sam
 sq_of ah_bam --bam;  assert_sidecar_AH_passthrough ah_bam
 echo "PASS: 'samtools dict --alt' sidecar carries AH:* through both paths, no warning"
 
-echo "PASS: ALT contig header regression"
+echo "PASS: compat header parity regression"

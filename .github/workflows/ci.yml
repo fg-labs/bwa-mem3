@@ -391,7 +391,7 @@ jobs:
           COMPAT_WORK_DIR=/tmp/compat-bytes \
           bash test/regression/compat_byte_identical.sh
 
-      - name: ALT contig header regression (AH:*)
+      - name: header parity regression (AH:*, --compat @HD/@SQ)
         if: matrix.canonical == true
         run: |
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \

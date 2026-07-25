@@ -698,18 +698,22 @@ void bwa_warn_sidecar_missing_AH(const bntseq_t *bns, const char *idx_hdr_lines,
 // Emit the full SAM header, merging (in precedence order) user `hdr_line`
 // (from -H), `bns_hdr` (loaded from <prefix>.hdr or <baseprefix>.dict), and
 // the index's @SQ records. Precedence mirrors lh3/bwa#348:
-//   @HD : user's > index's > default "@HD\tVN:1.5\tSO:unsorted\tGO:query".
+//   @HD : user's > index's > the target's default (none, under a target that
+//         emits no @HD -- see below).
 //   @SQ : if user supplies any, use user's alone (index .hdr was already
 //         skipped by the caller); else index's @SQ; else generated from bns.
 //   Other: all remaining lines from bns_hdr, then hdr_line, then bwa_pg.
 static void print_sam_hdr(const bntseq_t *bns, const char *bns_hdr,
-                          const char *hdr_line, FILE *fp)
+                          const char *hdr_line, FILE *fp,
+                          const compat_target_t *compat)
 {
     int i, n_HD = 0, n_SQ = count_SQ(hdr_line);
     extern char *bwa_pg;
+    if (compat == NULL) compat = &COMPAT_TARGET_OFF;
 
-    // Emit an @HD record — prefer user's, else index's, else default — and
-    // consume any leading @HD from both streams so they are not re-emitted.
+    // Emit an @HD record — prefer user's, else index's, else the target's
+    // default — and consume any leading @HD from both streams so they are not
+    // re-emitted.
     if (hdr_line && strncmp(hdr_line, "@HD\t", 4) == 0) {
         hdr_line = remove_line(hdr_line, n_HD == 0, fp);
         ++n_HD;
@@ -718,8 +722,17 @@ static void print_sam_hdr(const bntseq_t *bns, const char *bns_hdr,
         bns_hdr = remove_line(bns_hdr, n_HD == 0, fp);
         ++n_HD;
     }
-    if (n_HD == 0)
-        err_fputs("@HD\tVN:1.5\tSO:unsorted\tGO:query\n", fp);
+    /* @HD policy comes from the selected compat target; the evidence for each
+     * row is in src/compat_target.cpp. DO NOT "fix" the missing @HD under a
+     * compat target -- suppressing it is deliberate, not an oversight.
+     * compat->hd_line == NULL keeps this path's historical default, which
+     * differs from the BAM writer's (fg-labs/bwa-mem3#288). */
+    if (n_HD == 0 && compat->emit_hd) {
+        err_fputs(compat->hd_line != NULL ? compat->hd_line
+                                          : "@HD\tVN:1.5\tSO:unsorted\tGO:query",
+                  fp);
+        err_fputc('\n', fp);
+    }
 
     // Generate @SQ from bns only when neither hdr_line nor bns_hdr supply any.
     if (n_SQ == 0 && !has_SQ(bns_hdr)) {
@@ -740,11 +753,6 @@ static void print_sam_hdr(const bntseq_t *bns, const char *bns_hdr,
     if (bns_hdr) { err_fputs(bns_hdr, fp); err_fputc('\n', fp); }
     if (hdr_line) { err_fputs(hdr_line, fp); err_fputc('\n', fp); }
     if (bwa_pg) err_fputs(bwa_pg, fp);
-}
-
-void bwa_print_sam_hdr(const bntseq_t *bns, const char *hdr_line, FILE *fp)
-{
-    print_sam_hdr(bns, NULL, hdr_line, fp);
 }
 
 // Load the contents of `<prefix>.hdr` if present, else `<baseprefix>.dict`
@@ -797,7 +805,8 @@ char *bwa_load_hdr_from_index(const char *prefix)
 }
 
 void bwa_print_sam_hdr2(const bntseq_t *bns, const char *idx_hdr_lines,
-                        const char *hdr_line, FILE *fp)
+                        const char *hdr_line, FILE *fp,
+                        const compat_target_t *compat)
 {
     // If the user's -H supplies any @SQ, ignore the index .hdr/.dict content
     // entirely — the user has taken responsibility for the @SQ block.
@@ -810,7 +819,7 @@ void bwa_print_sam_hdr2(const bntseq_t *bns, const char *idx_hdr_lines,
                     "[W::%s] %d @SQ lines loaded from index; %d sequences in the index. "
                     "Continue anyway.\n", __func__, n_SQ, bns->n_seqs);
     }
-    print_sam_hdr(bns, bns_hdr, hdr_line, fp);
+    print_sam_hdr(bns, bns_hdr, hdr_line, fp, compat);
 }
 
 static char *bwa_escape(char *s)

@@ -173,7 +173,14 @@ meth_bam_writer_t *meth_bam_writer_open(const char *path_or_dash,
     if (w->hdr == NULL) { hts_close(w->fp); free(w); return NULL; }
 
     /* @HD — skip the default when the user's -H already supplies one, else
-     * htslib would write two @HD lines (it does not de-dup @HD). */
+     * htslib would write two @HD lines (it does not de-dup @HD).
+     *
+     * This writer does not consult a compat target, unlike bwa.cpp and
+     * bam_writer.cpp: --compat with --meth is a hard error (rejected in
+     * main_mem's option validation), so only COMPAT_TARGET_OFF can reach here
+     * and OFF keeps each path's own default. A future target that relaxes the
+     * --meth exclusion must plumb compat->emit_hd/hd_line through here too.
+     * The string also differs from the SAM text path's -- fg-labs/bwa-mem3#288. */
     if (!hdr_text_has_type(hdr_line, "@HD\t") &&
         sam_hdr_add_line(w->hdr, "HD", "VN", "1.6", "SO", "unsorted", NULL) < 0) goto fail;
 

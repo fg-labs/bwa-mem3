@@ -29,9 +29,11 @@ void           bam_writer_free(struct bam1_t *b)  { if (b) bam_destroy1(b); }
 bam_writer_t *bam_writer_open(const char *path, const bntseq_t *bns,
                               const char *idx_hdr_lines,
                               const char *hdr_line, const char *bwa_pg,
-                              int compression_level)
+                              int compression_level,
+                              const compat_target_t *compat)
 {
     if (path == NULL || bns == NULL) return NULL;
+    if (compat == NULL) compat = &COMPAT_TARGET_OFF;
 
     // Detect whether the index .hdr/.dict content already supplies @SQ or
     // @HD records. If @SQ: skip auto-generating @SQ from `bns` — adding
@@ -62,8 +64,18 @@ bam_writer_t *bam_writer_open(const char *path, const bntseq_t *bns,
     // .hdr/.dict supplies one. Precedence (user > index > default) is
     // enforced by ordering: we add idx_hdr_lines before hdr_line, and the
     // SAM text path uses the same precedence via bwa_print_sam_hdr2.
-    if (!idx_has_hd && !user_has_hd &&
-        sam_hdr_add_line(hdr, "HD", "VN", "1.6", "SO", "unsorted", NULL) < 0) goto fail;
+    //
+    // @HD policy comes from the selected compat target; the evidence for each
+    // row is in src/compat_target.cpp. DO NOT "fix" the missing @HD under a
+    // compat target -- suppressing it is deliberate, not an oversight.
+    // compat->hd_line == NULL keeps this path's historical default, which
+    // differs from the SAM text path's (fg-labs/bwa-mem3#288).
+    if (!idx_has_hd && !user_has_hd && compat->emit_hd) {
+        int rc = compat->hd_line != NULL
+               ? sam_hdr_add_lines(hdr, compat->hd_line, 0)
+               : sam_hdr_add_line(hdr, "HD", "VN", "1.6", "SO", "unsorted", NULL);
+        if (rc < 0) goto fail;
+    }
     if (!idx_has_sq) {
         for (int i = 0; i < bns->n_seqs; ++i) {
             char len_buf[32];
@@ -74,7 +86,8 @@ bam_writer_t *bam_writer_open(const char *path, const bntseq_t *bns,
             // SN+LN-only loop and silently dropped it for EVERY ALT-aware
             // reference, sidecar or not. `is_alt` comes from <prefix>.alt via
             // bwa_idx_load and has no representation in an htslib sam_hdr_t,
-            // so it must be re-applied here.
+            // so it must be re-applied here. Not gated on `compat`: it is what
+            // both upstreams do, so it is correct output, not a divergence.
             int rc = bns->anns[i].is_alt
                    ? sam_hdr_add_line(hdr, "SQ", "SN", bns->anns[i].name,
                                       "LN", len_buf, "AH", "*", NULL)
@@ -413,7 +426,7 @@ int mem_aln_to_bam(struct bam1_t *b,
             bam_aux_append(b, "MC", 'Z', (int)mc->l + 1, (const uint8_t *)mc->s);
         /* no free: bs.mc.s persists across records, freed on thread exit */
     }
-    if (mp && !(opt->flag & MEM_F_COMPAT)) {
+    if (mp && opt->compat->emit_mq) {
         int32_t mq = (int32_t)mp->mapq;
         bam_aux_append(b, "MQ", 'i', sizeof(mq), (const uint8_t *)&mq);
     }
@@ -472,7 +485,7 @@ int mem_aln_to_bam(struct bam1_t *b,
     if (p.XA != NULL) {
         bam_aux_append(b, "XA", 'Z', (int)strlen(p.XA) + 1, (const uint8_t *)p.XA);
     }
-    if (p.HN >= 0 && !(opt->flag & MEM_F_COMPAT)) {
+    if (p.HN >= 0 && opt->compat->emit_hn) {
         int32_t hn = (int32_t)p.HN;
         bam_aux_append(b, "HN", 'i', sizeof(hn), (const uint8_t *)&hn);
     }

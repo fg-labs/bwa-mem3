@@ -1,10 +1,17 @@
 #!/usr/bin/env bash
 # test/regression/compat_byte_identical.sh
 #
-# Regression: `bwa-mem3 mem --compat` must suppress exactly the two
-# bwa-mem3-only record additions that keep the drop-in profile from being
-# a byte-for-byte match to bwa-mem2 — the `MQ:i` and `HN:i` tags — and
-# must change NOTHING else.
+# Regression: `bwa-mem3 mem --compat=bwa-mem2` must suppress exactly the
+# three things that keep the drop-in profile from being a byte-for-byte
+# match to bwa-mem2 — the `MQ:i` and `HN:i` tags and the default `@HD`
+# line — and must change NOTHING else.
+#
+# `@HD`: bwa-mem2 v2.2.1 emits none at all (its bwa_print_sam_hdr has no
+# @HD logic); bwa gained one only in 0.7.18, after bwa-mem2 forked at
+# 0.7.17. Suppressing ours is deliberate. The sidecar `@SQ` half of header
+# parity is covered by compat_header_parity.sh, which needs an ALT-aware
+# fixture; phix here has no sidecar, so its `@SQ` block is identical
+# either way and this script's byte-diff still covers it.
 #
 # `@PG` is deliberately NOT suppressed: bwa-mem2 emits its own, so
 # dropping ours would turn a changed line into a missing one, and `CL:`
@@ -18,8 +25,8 @@
 # (drops another tag, drops @HD/@SQ) or too little (leaks MQ/HN), or
 # perturbs an alignment, the streams diverge and this fails. Both the
 # SAM-text and --bam paths are checked, since the tags are emitted from
-# two independent code paths (bwamem.cpp and bam_writer.cpp) gated on the
-# same MEM_F_COMPAT flag.
+# two independent code paths (bwamem.cpp and bam_writer.cpp) reading the
+# same compat target row (src/compat_target.cpp).
 #
 # Fixture (deterministic, no PRNG): PE reads are sliced directly from the
 # committed phix.fa so the FASTQ is byte-identical across awk
@@ -79,7 +86,7 @@ echo "fixture: $n_pairs PE pairs sliced from phix"
 def_sam="$COMPAT_WORK_DIR/default.sam"
 cmp_sam="$COMPAT_WORK_DIR/compat.sam"
 "$BWA_MEM3" mem          "$ref" "$r1" "$r2" > "$def_sam" 2>/dev/null
-"$BWA_MEM3" mem --compat "$ref" "$r1" "$r2" > "$cmp_sam" 2>/dev/null
+"$BWA_MEM3" mem --compat=bwa-mem2 "$ref" "$r1" "$r2" > "$cmp_sam" 2>/dev/null
 
 # The default run must actually contain the tags we claim to suppress,
 # else the byte-identity check below would pass vacuously.
@@ -98,42 +105,71 @@ if [ "$cmp_mq" -ne 0 ] || [ "$cmp_hn" -ne 0 ]; then
     exit 1
 fi
 
-# --compat must preserve the header, @PG included -- suppressing @PG would
-# only trade a changed line for a missing one (bwa-mem2 emits its own).
-if ! grep -q '^@HD' "$cmp_sam" || ! grep -q '^@SQ' "$cmp_sam"; then
-    echo "FAIL: --compat SAM dropped @HD/@SQ header lines" >&2
+# The default run must emit an @HD (else the suppression check is vacuous),
+# and --compat must emit none: bwa-mem2 writes no @HD at all.
+if ! grep -q '^@HD' "$def_sam"; then
+    echo "FAIL: default SAM has no @HD to suppress — fixture or default changed" >&2
     exit 1
 fi
+if grep -q '^@HD' "$cmp_sam"; then
+    echo "FAIL: --compat SAM still emits @HD (bwa-mem2 emits none):" >&2
+    grep '^@HD' "$cmp_sam" >&2
+    exit 1
+fi
+
+# @SQ must survive. Whether --compat SUPPRESSES a sidecar's identity tags is
+# not testable here -- phix has no .hdr/.dict, so there would be nothing to
+# suppress and the assertion would pass vacuously. header_parity.sh covers it
+# against a real `samtools dict` sidecar.
+if ! grep -q '^@SQ' "$cmp_sam"; then
+    echo "FAIL: --compat SAM dropped the @SQ header block" >&2
+    exit 1
+fi
+
+# @PG is preserved -- suppressing it would only trade a changed line for a
+# missing one (bwa-mem2 emits its own).
 if ! grep -q '^@PG.*ID:bwa-mem3' "$cmp_sam"; then
     echo "FAIL: --compat SAM dropped the bwa-mem3 @PG line (it must be preserved)" >&2
     exit 1
 fi
 
-# The load-bearing check: default (minus MQ/HN) is byte-identical to --compat.
-# @PG is excluded from BOTH sides -- its CL: records the actual argv, which
-# necessarily differs between the default and --compat invocations.
+# The load-bearing check: default (minus MQ/HN/@HD) is byte-identical to
+# --compat. @PG is excluded from BOTH sides -- its CL: records the actual
+# argv, which necessarily differs between the two invocations. @HD is
+# excluded from both because its presence/absence is asserted directly
+# above; excluding it here keeps THIS diff about everything else.
 def_stripped="$COMPAT_WORK_DIR/default.stripped.sam"
 cmp_stripped="$COMPAT_WORK_DIR/compat.stripped.sam"
-grep -v '^@PG' "$def_sam" \
+grep -vE '^@PG|^@HD' "$def_sam" \
   | sed -E 's/\tMQ:i:[0-9-]+//; s/\tHN:i:[0-9-]+//' > "$def_stripped"
-grep -v '^@PG' "$cmp_sam" > "$cmp_stripped"
+grep -vE '^@PG|^@HD' "$cmp_sam" > "$cmp_stripped"
 if ! diff -q "$def_stripped" "$cmp_stripped" > /dev/null; then
-    echo "FAIL: --compat SAM differs from default beyond MQ/HN:" >&2
+    echo "FAIL: --compat SAM differs from default beyond MQ/HN/@HD:" >&2
     diff "$def_stripped" "$cmp_stripped" | head -20 >&2
     exit 1
 fi
-echo "PASS: SAM-text --compat is byte-identical to default minus MQ/HN (@PG excluded)"
+echo "PASS: SAM-text --compat is byte-identical to default minus MQ/HN/@HD (@PG excluded)"
 
 # --- BAM path: same assertion, if samtools is available. ---
 if command -v samtools > /dev/null 2>&1; then
     def_bam="$COMPAT_WORK_DIR/default.bam"
     cmp_bam="$COMPAT_WORK_DIR/compat.bam"
     "$BWA_MEM3" mem --bam          "$ref" "$r1" "$r2" > "$def_bam" 2>/dev/null
-    "$BWA_MEM3" mem --bam --compat "$ref" "$r1" "$r2" > "$cmp_bam" 2>/dev/null
+    "$BWA_MEM3" mem --bam --compat=bwa-mem2 "$ref" "$r1" "$r2" > "$cmp_bam" 2>/dev/null
 
     # --no-PG so samtools does not inject its own @PG line into the header dump.
     if [ "$(samtools view -H --no-PG "$cmp_bam" | grep -c '^@PG.*ID:bwa-mem3')" -ne 1 ]; then
         echo "FAIL: --compat BAM lacks the bwa-mem3 @PG line (it must be preserved)" >&2
+        exit 1
+    fi
+    # The BAM header is built by a separate writer (bam_writer.cpp), so
+    # assert @HD suppression independently of the SAM-text path above.
+    if [ "$(samtools view -H --no-PG "$def_bam" | grep -c '^@HD')" -lt 1 ]; then
+        echo "FAIL: default BAM has no @HD to suppress" >&2
+        exit 1
+    fi
+    if [ "$(samtools view -H --no-PG "$cmp_bam" | grep -c '^@HD')" -ne 0 ]; then
+        echo "FAIL: --compat BAM still emits @HD (bwa-mem2 emits none)" >&2
         exit 1
     fi
     bam_def_rec="$COMPAT_WORK_DIR/default.bam.rec"
@@ -146,7 +182,7 @@ if command -v samtools > /dev/null 2>&1; then
         diff "$bam_def_rec" "$bam_cmp_rec" | head -20 >&2
         exit 1
     fi
-    echo "PASS: BAM --compat records are byte-identical to default minus MQ/HN"
+    echo "PASS: BAM --compat suppresses @HD; records byte-identical to default minus MQ/HN"
 else
     echo "SKIP: samtools not on PATH — BAM-path assertion skipped"
 fi
@@ -154,7 +190,7 @@ fi
 # --- --compat and --fast are mutually exclusive: must be a hard error. ---
 # (A diff-clean-looking stream over --fast's changed alignments would defeat
 # the parity-validation purpose of --compat, so combining them is rejected.)
-if "$BWA_MEM3" mem --compat --fast "$ref" "$r1" "$r2" > /dev/null 2>"$COMPAT_WORK_DIR/mutex.log"; then
+if "$BWA_MEM3" mem --compat=bwa-mem2 --fast "$ref" "$r1" "$r2" > /dev/null 2>"$COMPAT_WORK_DIR/mutex.log"; then
     echo "FAIL: --compat --fast exited 0 (expected a hard error)" >&2
     exit 1
 fi
@@ -169,7 +205,7 @@ echo "PASS: --compat --fast is rejected as a hard error"
 # bwa-mem2 has no methylation mode, so byte-identity is undefined under --meth.
 # The guard fires during option validation, before any index load, so the
 # non-meth phix reference here is sufficient to exercise it.
-if "$BWA_MEM3" mem --compat --meth "$ref" "$r1" "$r2" > /dev/null 2>"$COMPAT_WORK_DIR/meth.log"; then
+if "$BWA_MEM3" mem --compat=bwa-mem2 --meth "$ref" "$r1" "$r2" > /dev/null 2>"$COMPAT_WORK_DIR/meth.log"; then
     echo "FAIL: --compat --meth exited 0 (expected a hard error)" >&2
     exit 1
 fi
@@ -179,5 +215,42 @@ if ! grep -q 'not supported with --meth' "$COMPAT_WORK_DIR/meth.log"; then
     exit 1
 fi
 echo "PASS: --compat --meth is rejected as a hard error"
+
+# --- --compat is an enum: check the grammar the CLI advertises. ---
+# `--compat` takes a required argument, so every accepted spelling and every
+# rejection below is a contract the docs state. A regression here is silent
+# otherwise: a wrong optstring turns `--compat=off` into a hard error, or
+# `--compat=bwa-mem` into a claim of parity we cannot deliver.
+compat_ok() {   # spelling... -- must exit 0
+    if ! "$BWA_MEM3" mem "$@" "$ref" "$r1" "$r2" > /dev/null 2>"$COMPAT_WORK_DIR/cli.log"; then
+        echo "FAIL: 'mem $*' exited nonzero, expected success:" >&2
+        cat "$COMPAT_WORK_DIR/cli.log" >&2
+        exit 1
+    fi
+}
+compat_err() {  # <expected-substring> <spelling...> -- must exit nonzero AND say why
+    want="$1"; shift
+    if "$BWA_MEM3" mem "$@" "$ref" "$r1" "$r2" > /dev/null 2>"$COMPAT_WORK_DIR/cli.log"; then
+        echo "FAIL: 'mem $*' exited 0, expected a hard error" >&2
+        exit 1
+    fi
+    if ! grep -q "$want" "$COMPAT_WORK_DIR/cli.log"; then
+        echo "FAIL: 'mem $*' failed without the expected message '$want':" >&2
+        cat "$COMPAT_WORK_DIR/cli.log" >&2
+        exit 1
+    fi
+}
+
+compat_ok  --compat=bwa-mem2          # canonical, '=' form
+compat_ok  --compat bwa-mem2          # canonical, space form (required_argument)
+compat_ok  --compat=mem2              # documented alias
+compat_ok  --compat=off               # explicit no-op
+compat_ok  --compat=off --fast        # off must NOT trip the --fast guard
+compat_err "unknown --compat target"  --compat=bogus
+# bwa-mem is a real row in the table, deliberately not selectable. It must
+# get its own diagnostic -- calling it "unknown" would be a lie, and a user
+# asking for it deserves the actual reason.
+compat_err "not yet selectable"       --compat=bwa-mem
+echo "PASS: --compat enum grammar (=/space, alias, off, unknown, unselectable)"
 
 echo "PASS: compat byte-identical regression"
