@@ -318,7 +318,7 @@ uint32_t *bwa_gen_cigar2(const int8_t mat[25], int o_del, int e_del, int o_ins, 
         // UPDATE: we come to this block now... FIXME: due to an issue in mem_reg2aln(), we never come to this block. This does not affect accuracy, but it hurts performance.
         if (n_cigar) {
             cigar = (uint32_t*) malloc(4);
-            assert(cigar != NULL);
+            xassert(cigar != NULL, "out of memory: cigar");
             cigar[0] = l_query<<4 | 0;
             *n_cigar = 1;
         }
@@ -447,17 +447,19 @@ bwaidx_t *bwa_idx_load_from_disk(const char *hint, int which)
         return 0;
     }
     idx = (bwaidx_t*) calloc(1, sizeof(bwaidx_t));
+    xassert(idx != NULL, "out of memory: idx");
     if (which & BWA_IDX_BWT) idx->bwt = bwa_idx_load_bwt(hint);
     if (which & BWA_IDX_BNS) {
         int i, c;
         idx->bns = bns_restore(prefix);
-        assert(idx->bns != 0);
+        xassert(idx->bns != NULL, "out of memory: idx->bns");
         for (i = c = 0; i < idx->bns->n_seqs; ++i)
             if (idx->bns->anns[i].is_alt) ++c;
         if (bwa_verbose >= 3)
             fprintf(stderr, "[M::%s] read %d ALT contigs\n", __func__, c);
         if (which & BWA_IDX_PAC) {
             idx->pac = (uint8_t*) calloc(idx->bns->l_pac/4+1, 1);
+            xassert(idx->pac != NULL, "out of memory: idx->pac");
             err_fread_noeof(idx->pac, 1, idx->bns->l_pac/4+1, idx->bns->fp_pac); // concatenated 2-bit encoded sequence
             err_fclose(idx->bns->fp_pac);
             idx->bns->fp_pac = 0;
@@ -1068,7 +1070,7 @@ char *bwa_insert_header_file(FILE *fp, char *hdr)
     if (file_size <= 0) return hdr;
 
     char *buf = (char *) calloc(1, (size_t) file_size + 1);
-    assert(buf != NULL);
+    xassert(buf != NULL, "out of memory: buf");
     char *p = buf;
     // Budget for the per-call fgets: use LINE_MAX'ish 64 KiB minus 1 to
     // match the pre-patch loop. Bound each read by the remaining buffer so

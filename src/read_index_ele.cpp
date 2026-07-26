@@ -37,7 +37,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 indexEle::indexEle()
 {
     idx = (bwaidx_fm_t*) calloc(1, sizeof(bwaidx_fm_t));
-    assert(idx != NULL);
+    xassert(idx != NULL, "out of memory: idx");
 }
 
 indexEle::~indexEle()
@@ -62,7 +62,7 @@ void indexEle::bwa_idx_load_ele(const char *hint, int which)
     char *prefix;
     int l_hint = strlen(hint);
     prefix = (char *) malloc(l_hint + 3 + 4 + 1);
-    assert(prefix != NULL);
+    xassert(prefix != NULL, "out of memory: prefix");
     strcpy(prefix, hint);
 
     fprintf(stderr, "* Index prefix: %s\n", prefix);
@@ -84,7 +84,7 @@ void indexEle::bwa_idx_load_ele(const char *hint, int which)
         {
             int64_t pac_bytes = idx->bns->l_pac/4+1;
             idx->pac = (uint8_t*) calloc(pac_bytes, 1);
-            assert(idx->pac != NULL);
+            xassert(idx->pac != NULL, "out of memory: idx->pac");
             bwamem_madv_hugepage(idx->pac, pac_bytes);
             err_fread_noeof(idx->pac, 1, pac_bytes, idx->bns->fp_pac); // concatenated 2-bit encoded sequence
             err_fclose(idx->bns->fp_pac);
@@ -269,7 +269,7 @@ char* indexEle::bwa_idx_infer_prefix(const char *hint)
     FILE *fp;
     l_hint = strlen(hint);
     prefix = (char *) malloc(l_hint + 3 + 4 + 1);
-    assert(prefix != NULL);
+    xassert(prefix != NULL, "out of memory: prefix");
     strcpy(prefix, hint);
     strcpy(prefix + l_hint, ".64.bwt");
     if ((fp = fopen(prefix, "rb")) != 0)
