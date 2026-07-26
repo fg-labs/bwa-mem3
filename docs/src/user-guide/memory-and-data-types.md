@@ -77,6 +77,43 @@ Two consequences worth remembering:
   [`-K` in the mem reference](../cli/mem.md)), which is why it is useful for
   reproducibility independent of memory.
 
+### What the multiplier costs, measured
+
+hg38, 5M read pairs, `c8g.16xlarge`, warm page cache, peak RSS from the aligner's
+own profiler. Batch size and thread count are varied independently, one run per
+cell:
+
+| effective batch | `-t 16` | `-t 64` |
+|---|---:|---:|
+| 160,000,000 bases | **14.45 GB** — default at `-t 16` | 16.94 GB — `-K 160000000` |
+| 640,000,000 bases | 22.29 GB — `-K 640000000` | **24.27 GB** — default at `-t 64` |
+
+Read it two ways:
+
+- **Down a column: the batch is what costs memory.** Quadrupling it adds 7.8 GB at
+  `-t 16` and 7.3 GB at `-t 64`.
+- **Across a row: threads cost little once the batch is pinned.** 48 extra threads
+  add 2.49 GB and 1.98 GB respectively — on the order of 40–50 MB per thread of
+  per-thread scratch.
+
+The bold cells are the defaults, and they sit on the diagonal. That is the whole
+point: with no `-K`, raising `-t` moves you down *and* across at the same time, so
+peak memory tracks the thread count even though only the batch term requires it.
+Along that diagonal peak RSS is **14.45 / 18.44 / 24.27 GB at `-t 16 / 32 / 64`**.
+Extrapolating the batch term (this part is arithmetic, not measurement) puts
+`-t 128` near 37 GB and `-t 192` near 50 GB — enough to decide a machine type.
+
+Pinning the batch is close to free: at `-t 64`, `-K 160000000` measured 23.88 s of
+in-process alignment time against the default's 23.98 s, so the ~30 % memory
+reduction cost no throughput. Those are single runs, so read the wall figures as
+"no measurable cost" rather than as a speedup.
+
+Two caveats before generalising. Every absolute value above includes the resident
+hg38 index, so it is the *differences* between cells that transfer to another
+reference, not the totals. And `-K` changes how reads are grouped into batches,
+which changes each batch's `mem_pestat` insert-size estimate — so a run with `-K`
+is not byte-identical to one without, even though it is stable across `-t`.
+
 ## Fitting a run inside a memory cap
 
 Under a hard cap (a `--memory` cgroup limit, a Slurm `--mem`, a container limit),
