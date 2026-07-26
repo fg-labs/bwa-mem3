@@ -448,27 +448,81 @@ jobs:
         if: matrix.arch == 'arm'
         run: echo "MAKE_ARCH=arm64" >> "$GITHUB_ENV"
 
+      # Fingerprint what `-march=native` actually resolves to on THIS runner.
+      #
+      # Several targets in this job compile src/kswv.cpp and src/bandedSWA.cpp
+      # at -march=native (Makefile: src/kswv.native.o, src/bandedSWA.native.o,
+      # consumed by kswv_nrow_zero_test, kswv_freed_cell_test,
+      # bandedswa_padding_test, bandedswa_highzdrop_seed_test and
+      # bandedswa_high_h0_zdrop_test). ccache hashes the literal command line
+      # and the compiler binary -- NOT the host CPU -- so on two runners with
+      # the same gcc the string "-march=native" hashes identically while the
+      # emitted code does not. A newer-microarch object then gets served to an
+      # older-microarch runner and the test dies with SIGILL (exit 132) before
+      # its first assertion.
+      #
+      # MAKE_ARCH alone does not separate them: it has three values
+      # (avx2 / avx512bw / arm64) while -march=native encodes the exact
+      # microarch, so Ice Lake, Sapphire Rapids and Granite Rapids all share
+      # the avx512bw bucket and collide. Observed on PR #290 -- a
+      # bandedSWA.native.o built by the previous run SIGILL'd on the next one.
+      #
+      # `-Q --help=target` prints the target options AS RESOLVED for the
+      # selected -march, so it is the authoritative answer to "what will the
+      # compiler emit here", and it tracks the compiler version too.
+      - name: Fingerprint native ISA
+        run: |
+          set -euo pipefail
+          # Preferred source: the resolved target options themselves.
+          if dump=$(g++ -march=native -Q --help=target 2>/dev/null) && [ -n "$dump" ]; then
+            src="gcc -Q --help=target"
+          else
+            # Coarser, but still varies with both host CPU and compiler. Only
+            # here so an environment where -Q --help=target is unavailable
+            # degrades the key's precision instead of failing the whole job.
+            dump=$(g++ -v 2>&1; grep -E '^(model name|flags|Features)' /proc/cpuinfo | sort -u)
+            src="compiler version + cpuinfo (fallback)"
+          fi
+          # A constant hash would silently re-merge every microarch into one
+          # bucket -- the exact bug this guards -- so refuse to emit one.
+          if [ -z "$dump" ]; then
+            echo "::error::could not fingerprint the native ISA"
+            exit 1
+          fi
+          echo "fingerprint source: $src"
+          printf '%s\n' "$dump" > /tmp/native-isa.txt
+          isa=$(sha256sum < /tmp/native-isa.txt | cut -c1-16)
+          echo "NATIVE_ISA=$isa" >> "$GITHUB_ENV"
+          # Belt and braces: feed the same dump into ccache's own hash, so a
+          # false hit is impossible even if two microarchs ever do land in one
+          # cache entry (e.g. a future job that forgets the key component).
+          echo "CCACHE_EXTRAFILES=/tmp/native-isa.txt" >> "$GITHUB_ENV"
+          # Breadcrumbs for triaging a future SIGILL.
+          echo "native ISA fingerprint: $isa"
+          grep -m1 'model name' /proc/cpuinfo || true
+
       - name: Cache ccache
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ${{ env.CCACHE_DIR }}
-          # Include MAKE_ARCH in the key/restore-keys so cache entries
-          # don't leak across x86 microarch boundaries. The
-          # `kswv_nrow_zero_test` target compiles src/kswv.cpp at
-          # -march=native to exercise the host's native-ISA kswv class
-          # (see parent Makefile's src/kswv.native.o rule). ccache hashes
-          # the literal command line, NOT host CPUID -- so an
-          # AVX-512-built kswv.native.o was previously served to runners
-          # that lacked AVX-512 (via the `ccache-${{ runner.arch }}-`
-          # prefix matching across microarchs) and the test would SIGILL
-          # on its first kswv operation. Partitioning by MAKE_ARCH
-          # (avx2 / avx512bw / arm64) keeps the cache microarch-aware.
-          # This drops the historical sharing with run-mem-${arch} jobs,
-          # which is fine -- run-mem-x86 builds with explicit -m flags
-          # tied to MAKE_ARCH anyway, not -march=native.
-          key: ccache-${{ runner.arch }}-${{ env.MAKE_ARCH }}-kswv-${{ github.sha }}
+          # Partitioned by NATIVE_ISA -- the hash of what `-march=native`
+          # resolves to on this runner (see "Fingerprint native ISA" above for
+          # why, and for the SIGILL it prevents). MAKE_ARCH stays in the key so
+          # the entries remain readable at a glance, but NATIVE_ISA is the part
+          # that makes them correct: it is strictly finer, since every
+          # avx512bw-class microarch shares one MAKE_ARCH value.
+          #
+          # Both key and restore-keys carry it. A restore-key prefix that
+          # stopped at MAKE_ARCH would re-admit exactly the cross-microarch
+          # match this is meant to exclude, which is how the original bug
+          # survived an earlier attempt to fix it.
+          #
+          # This drops the historical sharing with run-mem-${arch} jobs, which
+          # is fine -- run-mem-x86 builds with explicit -m flags tied to
+          # MAKE_ARCH, never -march=native, so it has no such hazard.
+          key: ccache-${{ runner.arch }}-${{ env.MAKE_ARCH }}-n${{ env.NATIVE_ISA }}-kswv-${{ github.sha }}
           restore-keys: |
-            ccache-${{ runner.arch }}-${{ env.MAKE_ARCH }}-
+            ccache-${{ runner.arch }}-${{ env.MAKE_ARCH }}-n${{ env.NATIVE_ISA }}-
 
       - name: Build + run kswv unit test
         # Builds the doctest-based test/bwa_mem3_tests_unit binary via the
