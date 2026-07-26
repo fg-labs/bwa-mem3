@@ -128,6 +128,7 @@ Additional integration shell scripts in `test/`:
 | `shm_round_trip_test.sh` | `bwa-mem3 shm` load / list / drop cycle |
 | `shm_meth_test.sh` | `--meth` index compatibility with `shm` |
 | `help_prescan_test.sh` | `--help` prints without running alignment |
+| `proc_freq_calibration_test.sh` | startup does not sleep to calibrate `proc_freq`, and the calibrated tick rate is plausible |
 | `libsais_*.sh` | libsais index correctness vs. BWA / determinism |
 
 ## Benchmark harness (`bench/`)
