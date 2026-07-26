@@ -2,7 +2,7 @@
 # test/regression/meth_output_integrity.sh
 #
 # Regression (D3 B6): the --meth BAM is original-alphabet and Bismark-compatible.
-# Three invariants downstream methylation + variant callers depend on:
+# Five invariants downstream methylation + variant callers depend on:
 #
 #  1. Real-SNP vs bisulfite-conversion. The asymmetric matrix frees conversions
 #     in SCORING but NM/MD count every literal mismatch. An OT read with 10 C->T
@@ -27,6 +27,10 @@
 #     equal to that mate's MAPQ, and a mapped record carries HN:i equal to its
 #     XA hit count. Checked on a pair with asymmetric MAPQ and asymmetric hit
 #     counts, so both tags are pinned to a value and not merely to presence.
+#
+#  5. SA:Z on a split alignment. The two records a chimeric read splits into must
+#     cross-reference each other's placement, with all six SA fields intact --
+#     the meth writer builds SA:Z itself and nothing else in the suite splits.
 #
 # Inputs:
 #   BWA_MEM3 — path to the bwa-mem3 binary under test
@@ -151,4 +155,50 @@ read -r mapq2 mq2 hn2 < <(mq_hn dup.bam 128)
 [ "$hn1" = "0" ] || fail "MQ/HN: R1 HN:i $hn1, want 0 (unique mapper, no XA hits)"
 [ "$hn2" = "1" ] || fail "MQ/HN: R2 HN:i $hn2, want 1 (the chrA copy of the duplicated locus)"
 
-echo "PASS: meth_output_integrity (real-SNP vs conversion in AS/NM/MD; Bismark four-strand XR/XG; reverse SEQ orientation; MQ:i/HN:i tag parity)"
+# --- 5. SA:Z on a split (chimeric) alignment -------------------------------
+# The meth writer builds SA:Z itself, and nothing else in the --meth suite
+# produces a split alignment, so the whole builder is otherwise untested. A read
+# whose halves come from chrA:101 and chrA:1001 splits into two records that must
+# cross-reference each other's position. Asserting the cross-reference and the
+# field count — rather than a literal CIGAR — keeps this robust to scoring
+# changes that move the split point, while still catching a truncated SA:Z.
+CHIM="${REF:100:75}${REF:1000:75}"
+printf '@chim\n%s\n+\n%s\n' "$CHIM" "$(printf 'I%.0s' $(seq 1 150))" > chim.fq
+"$BWA_MEM3" mem --meth --meth-scoring genomic -t 1 ref.fa chim.fq > chim.bam 2>/dev/null \
+    || fail "chim mem --meth nonzero exit"
+samtools quickcheck chim.bam || fail "chim invalid BAM"
+n_chim=$(samtools view -c chim.bam)
+[ "$n_chim" = "2" ] || fail "SA: stale fixture — chimeric read gave $n_chim records, want 2 (a split alignment)"
+
+sa_of() { # $1 record number -> "RNAME POS SA:Z-value"
+    samtools view chim.bam | mawk -v n="$1" 'NR==n {
+        sa = ""
+        for (i = 12; i <= NF; i++) if ($i ~ /^SA:Z:/) sa = substr($i, 6)
+        print $3, $4, sa
+    }'
+}
+read -r rname1 pos1 sa1 < <(sa_of 1)
+read -r rname2 pos2 sa2 < <(sa_of 2)
+[ -n "$sa1" ] || fail "SA: split record 1 has no SA:Z"
+[ -n "$sa2" ] || fail "SA: split record 2 has no SA:Z"
+# SA:Z is `rname,pos,strand,cigar,mapq,NM;` — a truncated build loses the
+# trailing ';' or a field, which is exactly the silent-truncation failure mode.
+for sa in "$sa1" "$sa2"; do
+    case "$sa" in
+        *\;) ;;
+        *)   fail "SA: '$sa' does not end in ';' (truncated?)" ;;
+    esac
+    nf=$(printf '%s' "${sa%;}" | mawk -F, '{print NF}')
+    [ "$nf" = "6" ] || fail "SA: '$sa' has $nf comma-separated fields, want 6 (truncated?)"
+done
+# Each half points at the other's placement.
+[ "$(printf '%s' "$sa1" | cut -d, -f1)" = "$rname2" ] \
+    || fail "SA: record 1's SA:Z names $(printf '%s' "$sa1" | cut -d, -f1), want record 2's RNAME $rname2"
+[ "$(printf '%s' "$sa1" | cut -d, -f2)" = "$pos2" ] \
+    || fail "SA: record 1's SA:Z points at $(printf '%s' "$sa1" | cut -d, -f2), want record 2's POS $pos2"
+[ "$(printf '%s' "$sa2" | cut -d, -f1)" = "$rname1" ] \
+    || fail "SA: record 2's SA:Z names $(printf '%s' "$sa2" | cut -d, -f1), want record 1's RNAME $rname1"
+[ "$(printf '%s' "$sa2" | cut -d, -f2)" = "$pos1" ] \
+    || fail "SA: record 2's SA:Z points at $(printf '%s' "$sa2" | cut -d, -f2), want record 1's POS $pos1"
+
+echo "PASS: meth_output_integrity (real-SNP vs conversion in AS/NM/MD; Bismark four-strand XR/XG; reverse SEQ orientation; MQ:i/HN:i tag parity; SA:Z cross-reference on a split alignment)"
