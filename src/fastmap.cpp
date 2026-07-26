@@ -382,8 +382,8 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
         /* Read "reads" from input file (fread) */
         int64_t sz = 0;
         ret->seqs = aux->legacy_reader
-            ? bseq_read_orig(aux->task_size, &ret->n_seqs, aux->ks, aux->ks2, &sz)
-            : bseq_read_fast(aux->task_size, &ret->n_seqs, aux->frks, aux->frks2, &sz);
+            ? bseq_read_orig(aux->task_size, &ret->n_seqs, aux->ks, aux->ks2, &sz, &ret->read_arena)
+            : bseq_read_fast(aux->task_size, &ret->n_seqs, aux->frks, aux->frks2, &sz, &ret->read_arena);
 
         tprof[READ_IO][0] += __rdtsc() - tim;
 
@@ -672,13 +672,16 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
 
             for (int k = 0; k < group_size; ++k) {
                 if (sp_enabled() && ret->seqs[i+k].sam) sp_wbytes += (long)strlen(ret->seqs[i+k].sam);
-                free(ret->seqs[i+k].name);
+                /* PIPE-F6: name/seq/qual are carved from ret->read_arena, which
+                 * is freed once below — do NOT free them individually here.
+                 * comment stays heap-owned (see the reader / --meth notes), and
+                 * sam/bams are allocated during processing; those still free
+                 * per-read. meth_orig_seq is a step-0 heap strdup (NULL outside
+                 * --meth; free() is NULL-safe). */
                 free(ret->seqs[i+k].comment);
-                free(ret->seqs[i+k].seq);
-                free(ret->seqs[i+k].qual);
                 free(ret->seqs[i+k].sam);
                 free(ret->seqs[i+k].bams);
-                free(ret->seqs[i+k].meth_orig_seq); /* NULL outside --meth; free() is NULL-safe */
+                free(ret->seqs[i+k].meth_orig_seq);
             }
             i += group_size;
         }
@@ -695,6 +698,11 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
             ret->prof.chunk = __sync_fetch_and_add(&g_sp_chunk, 1);
             sp_add_chunk(&ret->prof);
         }
+        /* PIPE-F6: every name/seq/qual freed above by the former per-field loop
+         * now lives in this one arena; release it once for the whole chunk.
+         * All uses are done: output was written above and the seq/qual bytes
+         * are never read after the SAM/BAM string was built. NULL-safe. */
+        read_arena_destroy(ret->read_arena);
         free(ret->seqs);
         free(ret);
         tprof[SAM_IO][0] += __rdtsc() - tim;

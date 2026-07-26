@@ -64,7 +64,13 @@ int main(int argc, char **argv) {
 	}
     
     printf("before reading sequences\n");
-    bseq1_t *seqs = bseq_read_one_fasta_file(QUERY_DB_SIZE, &numReads, fp, &total_size);
+    /* The per-read name/seq/qual strings are carved from this arena rather than
+     * malloc'd individually, so the reader hands it back for the caller to
+     * release once for the whole chunk — see read_arena_destroy() below. The
+     * seqs[] fields point into it and must not outlive it. */
+    read_arena_t *read_arena = NULL;
+    bseq1_t *seqs = bseq_read_one_fasta_file(QUERY_DB_SIZE, &numReads, fp,
+                                            &total_size, &read_arena);
 
     if(seqs == NULL)
     {
@@ -320,6 +326,10 @@ int main(int argc, char **argv) {
     _mm_free(batchTid);
     _mm_free(batchOffset);
     delete fmiSearch;
+    /* Releases every name/seq/qual string in seqs[] in one call; nothing reads
+     * them after this point. free() on the seqs[] array itself is NULL-safe. */
+    read_arena_destroy(read_arena);
+    free(seqs);
     return 0;
 }
 

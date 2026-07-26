@@ -38,6 +38,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "bwt.h"
 #include "macro.h"
 #include "compat_target.h"
+#include "read_arena.h"
 
 #define BWA_IDX_BWT 0x1
 #define BWA_IDX_BNS 0x2
@@ -98,13 +99,20 @@ extern char bwa_rg_id[256];
 #ifdef __cplusplus
 extern "C" {
 #endif
-    bseq1_t *bseq_read_orig(int64_t chunk_size, int *n_, void *ks1_, void *ks2_, int64_t *s);
+    /* On success (return != NULL) *arena_out receives the per-chunk bump arena
+     * that backs the returned reads' name/seq/qual fields; the caller owns it
+     * and must read_arena_destroy() it after the chunk is fully consumed. At
+     * EOF (return NULL) *arena_out is set to NULL and there is nothing to free.
+     * See read_arena.h and the PIPE-F6 note for the ownership contract. */
+    bseq1_t *bseq_read_orig(int64_t chunk_size, int *n_, void *ks1_, void *ks2_, int64_t *s,
+                            read_arena_t **arena_out);
 
     bseq1_t *bseq_read(int64_t chunk_size, int *n_, void *ks1_,
                        void *ks2_, FILE* fpp, int len,
-                       int64_t *sz);
-    
-    bseq1_t *bseq_read_one_fasta_file(int64_t chunk_size, int *n_, gzFile fp, int64_t *s);
+                       int64_t *sz, read_arena_t **arena_out);
+
+    bseq1_t *bseq_read_one_fasta_file(int64_t chunk_size, int *n_, gzFile fp, int64_t *s,
+                                      read_arena_t **arena_out);
     
     void bseq_classify(int n, bseq1_t *seqs, int m[2], bseq1_t *sep[2]);
     

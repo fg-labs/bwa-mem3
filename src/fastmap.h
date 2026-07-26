@@ -101,6 +101,10 @@ typedef struct {
 	ktp_aux_t *aux;
 	int n_seqs;
 	bseq1_t *seqs;
+	/* PIPE-F6: per-chunk bump arena backing every read's name/seq/qual fields.
+	 * Set by the reader in step 0; destroyed once in step 2 after the chunk's
+	 * output is written. NULL when the chunk carried no reads (clean EOF). */
+	read_arena_t *read_arena;
 	prof_chunk_t prof;   /* stage_prof: per-chunk read/process/write timing (--profile) */
 } ktp_data_t;
 

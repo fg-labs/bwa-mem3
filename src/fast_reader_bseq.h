@@ -31,8 +31,14 @@ void  fast_kseq_destroy(void *p);
  * required; `ks2_` is the second mate handle and may be NULL for single-end /
  * interleaved input. At EOF the function sets *n_ = 0 and *s = 0; the returned
  * pointer is then NULL (no records were allocated). Mismatched record counts
- * between the two files are reported to stderr and truncate the batch. */
-bseq1_t *bseq_read_fast(int64_t chunk_size, int *n_, void *ks1_, void *ks2_, int64_t *s);
+ * between the two files are reported to stderr and truncate the batch.
+ *
+ * On success *arena_out receives the per-chunk bump arena backing the returned
+ * reads' name/seq/qual fields; the caller owns it and must read_arena_destroy()
+ * it after the chunk is fully consumed. At EOF (*n_ == 0, return NULL)
+ * *arena_out is set to NULL. See read_arena.h for the ownership contract. */
+bseq1_t *bseq_read_fast(int64_t chunk_size, int *n_, void *ks1_, void *ks2_, int64_t *s,
+                        read_arena_t **arena_out);
 
 #ifdef __cplusplus
 }
