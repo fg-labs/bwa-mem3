@@ -60,9 +60,10 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #define AVG_SEEDS_PER_READ 64        /* Used for storing seeds in chains*/
 
 // Average bases per read, used as a coarse upper-bound estimate (#reads
-// per chunk) for per-run regs/chain_ar/seedBuf allocation. Not a
-// correctness bound — the SMEM and related per-thread buffers are sized
-// at batch time from the observed maximum read length and grown on demand.
+// per chunk) for per-run `regs` allocation. Not a correctness bound — the
+// SMEM and related per-thread buffers are sized at batch time from the
+// observed maximum read length and grown on demand, and the chaining
+// scratch (chain_scratch/seed_scratch) is sized from the thread count.
 #define NREADS_ESTIMATE_AVG_BASES 100
 
 /* BWAMEM_BATCHED_MATESW:

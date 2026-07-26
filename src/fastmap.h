@@ -121,6 +121,19 @@ int main_mem(int argc, char *argv[]);
 // `w.nthreads` so the matching worker_free can validate the pairing. Prints
 // a small summary to stderr. Asserts on allocation failure (matching the
 // rest of bwa-mem3).
+//
+// Buffer lifetimes, which callers driving the kernels themselves MUST respect:
+//   * `w.regs` is sized by `nreads` and indexed by the read's position in the
+//     chunk (`seq_id`). It must stay live from the align pass through pairing
+//     and SAM emission.
+//   * `w.chain_scratch` and `w.seed_scratch` are PER-THREAD scratch, sized by
+//     `nthreads * BATCH_SIZE` and indexed by `tid`, NOT by `seq_id`. Thread
+//     `tid` owns `chain_scratch[tid * BATCH_SIZE ..]` and
+//     `seed_scratch[tid * BATCH_SIZE * AVG_SEEDS_PER_READ ..]` and may reuse
+//     that window for every work item it runs, because mem_kernel2_core frees
+//     every chain in the item before returning. Indexing either by `seq_id`
+//     (as bwa-mem3 did before these buffers were shrunk) now runs off the end
+//     of the allocation and corrupts other threads' windows.
 void worker_alloc(const mem_opt_t *opt, worker_t &w, int32_t nreads, int32_t nthreads);
 
 // Release all per-worker scratch buffers previously allocated by

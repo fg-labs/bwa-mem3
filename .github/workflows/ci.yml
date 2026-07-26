@@ -375,6 +375,13 @@ jobs:
           CHR22_SIM_DIR=/tmp/chr22-sim \
           bash test/regression/thread_determinism.sh
 
+      - name: Chaining scratch is per-thread, not per-read
+        if: matrix.canonical == true
+        run: |
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          CHR22_FA=/tmp/chr22/chr22.fa \
+          bash test/regression/chain_scratch_per_thread.sh
+
       - name: --supp-rep-hard-cap repetitive-seed regression
         if: matrix.canonical == true
         run: |

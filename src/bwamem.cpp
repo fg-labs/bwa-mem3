@@ -2294,6 +2294,17 @@ int mem_kernel2_core(FMI_search *fmi,
                 free(chn.seeds);
         }
         free(chain_ar[l].a);
+
+        /* mem_chain2aln_across_reads_V2 parks a back-pointer to the originating
+         * chain on every alnreg (a->c) and walks a->c->seeds to compute
+         * a->seedcov. Every one of those reads happens above, inside that
+         * function; nothing downstream of this point touches a->c. The chain it
+         * points at has just been freed, and its seeds lived in this thread's
+         * seed_scratch window -- which the very next work item on this thread
+         * will overwrite. Clear the pointer so a future reader gets a null
+         * dereference instead of silently-recycled seeds. */
+        for (int i2 = 0; i2 < (int) regs[l].n; ++i2)
+            regs[l].a[i2].c = NULL;
     }
 
     int m = 0;
@@ -2371,7 +2382,10 @@ static void worker_aln(void *data, int seq_id, int batch_size, int tid)
                      w->seqs + seq_id,
                      w->regs + seq_id,
                      batch_size,
-                     w->chain_ar + seq_id,
+                     /* This thread's chain window -- the SAME one worker_bwt
+                      * just filled for this work item. Per-tid, not per-seq_id;
+                      * see worker_alloc. */
+                     w->chain_scratch + (size_t) tid * BATCH_SIZE,
                      &w->mmc,
                      mem_aln_ref_string(w),
                      tid,
@@ -2386,19 +2400,28 @@ static void worker_bwt(void *data, int seq_id, int batch_size, int tid)
 {
     worker_t *w = (worker_t*) data;
     printf_(VER, "4. Calling mem_kernel1_core..%d %d\n", seq_id, tid);
-    int seedBufSz = w->seedBufSize;
 
-    int memSize = w->nreads;
-    if (batch_size < BATCH_SIZE) {
-        seedBufSz = (memSize - seq_id) * AVG_SEEDS_PER_READ;
-        // fprintf(stderr, "[%0.4d] Info: adjusted seedBufSz %d\n", tid, seedBufSz);
-    }
+    /* One fixed-size window per thread. The old code additionally granted the
+     * final (ragged) work item the whole unused remainder of a global,
+     * nreads-sized arena via `(w->nreads - seq_id) * AVG_SEEDS_PER_READ` --
+     * which, because nreads is a deliberate over-estimate of the read count
+     * (chunk_bases / NREADS_ESTIMATE_AVG_BASES + 10), handed that item millions
+     * of extra seed slots. With per-thread windows there is no remainder to
+     * grant, so that adjustment is gone.
+     *
+     * Dropping it only moves where a chain's seeds are allocated: on overflow
+     * chain_add_one_seed falls back to calloc and marks the chain with
+     * m == SEEDS_PER_CHAIN + 1. That flag is output-dead -- it is read only by
+     * the capacity-growth ladder in test_and_merge (which preserves
+     * seeds[0..n-1] either way) and by the `m > SEEDS_PER_CHAIN` free sites --
+     * so a chain's contents, and therefore every alignment, are unchanged. */
+    int seedBufSz = w->seed_scratch_size;
 
     mem_kernel1_core(w->fmi, w->opt,
                      w->seqs + seq_id,
                      batch_size,
-                     w->chain_ar + seq_id,
-                     w->seedBuf + seq_id * AVG_SEEDS_PER_READ,
+                     w->chain_scratch + (size_t) tid * BATCH_SIZE,
+                     w->seed_scratch + (size_t) tid * BATCH_SIZE * AVG_SEEDS_PER_READ,
                      seedBufSz,
                      &(w->mmc),
                      tid,
