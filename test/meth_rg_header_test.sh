@@ -124,7 +124,8 @@ samtools view    "$tmp/meth.bam" >"$tmp/meth.recs" 2>/dev/null \
 assert_rg_consistent "--meth" "$tmp/meth.hdr" "$tmp/meth.recs"
 
 # --- --meth @HD de-dup: a user -H @HD must suppress the default @HD ---------
-# meth_bam_writer_open emits a default "@HD VN:1.6 SO:unsorted" UNLESS the
+# meth_bam_writer_open emits a default @HD (BWAMEM3_DEFAULT_HD_LINE,
+# "@HD VN:1.5 SO:unsorted GO:query") UNLESS the
 # user's -H already supplies an @HD (the hdr_text_has_type() guard). Without
 # that guard htslib would write two @HD lines (it does not de-dup @HD). Pass a
 # DISTINCT @HD (SO:coordinate) alongside -R and assert the output carries

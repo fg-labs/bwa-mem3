@@ -68,14 +68,12 @@ bam_writer_t *bam_writer_open(const char *path, const bntseq_t *bns,
     // @HD policy comes from the selected compat target; the evidence for each
     // row is in src/compat_target.cpp. DO NOT "fix" the missing @HD under a
     // compat target -- suppressing it is deliberate, not an oversight.
-    // compat->hd_line == NULL keeps this path's historical default, which
-    // differs from the SAM text path's (fg-labs/bwa-mem3#288).
-    if (!idx_has_hd && !user_has_hd && compat->emit_hd) {
-        int rc = compat->hd_line != NULL
-               ? sam_hdr_add_lines(hdr, compat->hd_line, 0)
-               : sam_hdr_add_line(hdr, "HD", "VN", "1.6", "SO", "unsorted", NULL);
-        if (rc < 0) goto fail;
-    }
+    //
+    // sam_hdr_add_lines over the target's exact text, NOT sam_hdr_add_line with
+    // key/value pairs: the point of #288 is that all three writers emit ONE
+    // string, and a key/value call here would be a second place to spell it.
+    if (!idx_has_hd && !user_has_hd && compat->emit_hd &&
+        sam_hdr_add_lines(hdr, compat->hd_line, 0) < 0) goto fail;
     if (!idx_has_sq) {
         for (int i = 0; i < bns->n_seqs; ++i) {
             char len_buf[32];

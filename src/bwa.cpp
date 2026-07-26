@@ -766,13 +766,9 @@ static void print_sam_hdr(const bntseq_t *bns, const char *bns_hdr,
     }
     /* @HD policy comes from the selected compat target; the evidence for each
      * row is in src/compat_target.cpp. DO NOT "fix" the missing @HD under a
-     * compat target -- suppressing it is deliberate, not an oversight.
-     * compat->hd_line == NULL keeps this path's historical default, which
-     * differs from the BAM writer's (fg-labs/bwa-mem3#288). */
+     * compat target -- suppressing it is deliberate, not an oversight. */
     if (!user_HD && !idx_HD && compat->emit_hd) {
-        err_fputs(compat->hd_line != NULL ? compat->hd_line
-                                          : "@HD\tVN:1.5\tSO:unsorted\tGO:query",
-                  fp);
+        err_fputs(compat->hd_line, fp);
         err_fputc('\n', fp);
     }
 

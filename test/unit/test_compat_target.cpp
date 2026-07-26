@@ -36,11 +36,11 @@ TEST_CASE("compat target `off` is bwa-mem3's native output") {
     CHECK(t->read_sidecar == 1);
     CHECK(t->emit_mq      == 1);
     CHECK(t->emit_hn      == 1);
-    // NULL, not a literal: each output path keeps the default it already
-    // emits. The SAM text and BAM paths disagree ("VN:1.5 ... GO:query" vs
-    // "VN:1.6 SO:unsorted"); pinning a string here would change default output
-    // on one of them, which --compat must never do.
-    CHECK(t->hd_line == nullptr);
+    // `off` pins the one canonical default. It used to be NULL, meaning "each
+    // path keeps whatever it emits" -- which was a different string on the SAM
+    // text and BAM paths until #288 unified them.
+    REQUIRE(t->hd_line != nullptr);
+    CHECK(std::string(t->hd_line) == "@HD\tVN:1.5\tSO:unsorted\tGO:query");
 }
 
 TEST_CASE("compat target `bwa-mem2` matches bwa-mem2 v2.2.1") {
@@ -71,10 +71,12 @@ TEST_CASE("compat target `bwa-mem` is fully specified but not selectable") {
     // evidence below; when the alignment work lands, this becomes nullptr.
     REQUIRE(t->unavailable_reason != nullptr);
     CHECK(std::string(t->unavailable_reason).find("byte-identity") != std::string::npos);
-    // bwa.c:426 — emitted unconditionally when -H supplies no @HD.
+    // bwa.c:426 — emitted unconditionally when -H supplies no @HD. bwa-mem3's
+    // own default is byte-identical to it, so this row shares the constant.
     REQUIRE(t->emit_hd == 1);
     REQUIRE(t->hd_line != nullptr);
     CHECK(std::string(t->hd_line) == "@HD\tVN:1.5\tSO:unsorted\tGO:query");
+    CHECK(std::string(t->hd_line) == std::string(BWAMEM3_DEFAULT_HD_LINE));
     // lh3/bwa#348 closed unmerged; bwa has no sidecar.
     CHECK(t->read_sidecar == 0);
     // THE field a single compat boolean could not express: bwa DOES emit MQ:i
@@ -137,10 +139,14 @@ TEST_CASE("every table row is reachable by name, and rows are self-consistent") 
         if (t->alias != nullptr)
             CHECK_MESSAGE(compat_target_from_name(t->alias) == t,
                           "row ", t->name, " is not reachable by its alias");
-        // A pinned @HD is meaningless unless the row emits one.
-        if (t->hd_line != nullptr)
-            CHECK_MESSAGE(t->emit_hd == 1,
-                          "row ", t->name, " pins hd_line but does not emit @HD");
+        // #288: a row that emits @HD must say exactly what, so no emission
+        // site ever needs a fallback literal of its own.
+        if (t->emit_hd)
+            CHECK_MESSAGE(t->hd_line != nullptr,
+                          "row ", t->name, " emits @HD but pins no hd_line");
+        else
+            CHECK_MESSAGE(t->hd_line == nullptr,
+                          "row ", t->name, " pins hd_line but emits no @HD");
     }
 }
 

@@ -13,20 +13,15 @@
 
 /* --- `off`: bwa-mem3's native output -------------------------------------
  *
- * hd_line is NULL, meaning each output path keeps the default it already
- * emits. Those defaults DISAGREE -- SAM text writes
- * "@HD\tVN:1.5\tSO:unsorted\tGO:query" (bwa.cpp) while the BAM writer writes
- * "@HD\tVN:1.6\tSO:unsorted" (bam_writer.cpp). That is a real latent
- * inconsistency, tracked as fg-labs/bwa-mem3#288; reconciling it changes
- * default output on one of the two paths and so does not belong to --compat.
- * NULL here preserves both bytewise. A target that pins an exact string (see
- * bwa-mem) is what would force the question. */
+ * hd_line is the one canonical default (#288). It used to be NULL, meaning
+ * "whatever that output path emits" -- which was a different string on the
+ * SAM-text and BAM paths. */
 const compat_target_t COMPAT_TARGET_OFF = {
     /* .name               */ "off",
     /* .alias              */ NULL,
     /* .unavailable_reason */ NULL,
     /* .emit_hd            */ 1,
-    /* .hd_line            */ NULL,
+    /* .hd_line            */ BWAMEM3_DEFAULT_HD_LINE,
     /* .read_sidecar       */ 1,
     /* .emit_mq            */ 1,
     /* .emit_hn            */ 1,
@@ -74,7 +69,7 @@ static const compat_target_t COMPAT_TARGET_BWA_MEM = {
     /* .unavailable_reason */ "bwa-mem3 and bwa still differ on 224/63583 records "
                               "(53 above MAPQ 30), so byte-identity is not achievable",
     /* .emit_hd            */ 1,
-    /* .hd_line            */ "@HD\tVN:1.5\tSO:unsorted\tGO:query",
+    /* .hd_line            */ BWAMEM3_DEFAULT_HD_LINE,   /* == bwa.c:426 */
     /* .read_sidecar       */ 0,
     /* .emit_mq            */ 1,
     /* .emit_hn            */ 0,

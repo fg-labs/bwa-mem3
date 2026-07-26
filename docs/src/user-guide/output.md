@@ -26,9 +26,16 @@ bwa-mem3 mem --bam=6 -t 16 ref.fa R1.fq.gz R2.fq.gz > out.bam
 
 ### `@HD`
 
-A default `@HD VN:1.6 SO:unsorted` line is emitted unless the user supplies
-one via `-H`. The sort order is `unsorted` because bwa-mem3 writes records in
-input read order; downstream sorting is always a separate step.
+A default `@HD VN:1.5 SO:unsorted GO:query` line is emitted unless the user
+supplies one via `-H` (or the index sidecar does). The sort order is `unsorted`
+because bwa-mem3 writes records in input read order; downstream sorting is
+always a separate step, and `GO:query` records that the records for one query
+are adjacent.
+
+The same line is emitted on every output path — SAM text, `--bam` and
+`--meth`. Through 0.7.1 the BAM writers emitted `@HD VN:1.6 SO:unsorted`
+instead, so the same run produced a different `@HD` depending on `--bam`; they
+now agree, on the string upstream bwa uses.
 
 ### `@SQ`
 

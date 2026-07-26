@@ -21,6 +21,14 @@
 extern "C" {
 #endif
 
+/* The default @HD record bwa-mem3 emits when neither -H nor the index sidecar
+ * supplies one. Byte-identical to upstream bwa (bwa.c:426, added in 0.7.18
+ * 6b18630). ONE definition on purpose: the SAM-text, BAM and --meth writers
+ * each used to hardcode their own, and the BAM ones had drifted to
+ * "VN:1.6 SO:unsorted" -- so the same run emitted a different @HD depending on
+ * --bam (fg-labs/bwa-mem3#288). Every emission site now spells it this way. */
+#define BWAMEM3_DEFAULT_HD_LINE "@HD\tVN:1.5\tSO:unsorted\tGO:query"
+
 typedef struct compat_target_t {
     /* Canonical spelling, as documented and as reported in diagnostics. */
     const char *name;
@@ -39,10 +47,9 @@ typedef struct compat_target_t {
     /* Emit a default @HD when neither -H nor the index sidecar supplies one. */
     int emit_hd;
 
-    /* Exact @HD text (no trailing newline) when emit_hd is set. NULL means
-     * "keep whatever default that output path already emits" -- the SAM text
-     * and BAM paths currently disagree (fg-labs/bwa-mem3#288), and only the
-     * `off` row tolerates that. */
+    /* Exact @HD text (no trailing newline). Always non-NULL when emit_hd is
+     * set, so an emitting site never has to fall back to a literal of its own
+     * -- that is exactly how the three writers drifted apart before #288. */
     const char *hd_line;
 
     /* Honor the bwa-mem3-only <prefix>.hdr / <baseprefix>.dict sidecar. Both
