@@ -14,7 +14,29 @@ struct LibsaisBuildOpts {
      * doubled --meth seed). The FM build itself never consumes the `.0123`.
      * Set true only to emit it for an external consumer (e.g. bwa-mem2). */
     bool        emit_unpacked_ref = false;
+    /* True when --max-memory came from the command line rather than from
+     * host detection. Only affects diagnostics: a "retry on a bigger host"
+     * hint is noise when the binding constraint is the user's own flag. */
+    bool        max_memory_user_specified = false;
 };
+
+// True when a doubled text of length `N` forces libsais's 64-bit SA path,
+// which doubles the per-suffix cost.
+bool libsais_sa_is_64bit(int64_t N);
+
+// Estimated peak bytes for a libsais build over a doubled text of length `N`
+// (= 2 * l_pac). 6 B/base on the int32 SA path, 12 B/base once `N` forces the
+// int64 SA; both cover measured peaks with margin for libsais aux arrays and
+// OMP/allocator overhead. Exposed so callers can preflight a build they have
+// not started yet.
+int64_t libsais_estimate_peak_bytes(int64_t N);
+
+// Report a memory-budget shortfall on stderr in one standard form, naming what
+// is needed, the budget, and the remedies. `what` labels the build being
+// refused (e.g. "libsais"); `ref_bases` is the reference length in bp.
+void libsais_report_budget_shortfall(const char* what, int64_t need_bytes,
+                                     int64_t budget_bytes, bool budget_user_specified,
+                                     int64_t ref_bases);
 
 // Build the bwa-mem3 FM index via libsais's generalized-suffix-array
 // construction. Precondition: `<prefix>.pac` and `<prefix>.ann` already

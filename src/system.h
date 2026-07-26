@@ -2,8 +2,13 @@
 #define BWA_SYSTEM_H
 
 #include <cstdint>
+#include <string>
 
 namespace bwa {
+
+// Format a byte count for human-facing output: "N.N GiB", "N.N MiB", or "N B".
+// Sized so a --max-memory of 15M reads as "15.0 MiB" rather than "0.0 GiB".
+std::string fmt_bytes(int64_t bytes);
 
 // Total memory available to the process in bytes. On Linux returns
 // min(cgroup v2 memory.max, cgroup v1 memory.limit_in_bytes, physical RAM).

@@ -18,6 +18,14 @@
 
 namespace bwa {
 
+std::string fmt_bytes(int64_t b) {
+    char out[32];
+    if      (b >= (1LL << 30)) std::snprintf(out, sizeof(out), "%.1f GiB", (double)b / (double)(1LL << 30));
+    else if (b >= (1LL << 20)) std::snprintf(out, sizeof(out), "%.1f MiB", (double)b / (double)(1LL << 20));
+    else                       std::snprintf(out, sizeof(out), "%lld B",   (long long)b);
+    return std::string(out);
+}
+
 namespace {
 
 // Slurp up to 4 KiB from `path` into `out`; returns true on success.

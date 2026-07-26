@@ -143,6 +143,17 @@ int main() {
 
     CHECK(required_total_for_batch_budget(kHg38Need) < 80 * kGiB);
 
+    // fmt_bytes: a --max-memory of 15M must not read as "0.0 GiB" (it did).
+    CHECK(bwa::fmt_bytes(15 * 1024 * 1024) == "15.0 MiB");
+    CHECK(bwa::fmt_bytes(1200 * 1024 * 1024) == "1.2 GiB");
+    CHECK(bwa::fmt_bytes(64 * kGiB) == "64.0 GiB");
+    CHECK(bwa::fmt_bytes(512) == "512 B");
+    CHECK(bwa::fmt_bytes(0) == "0 B");
+    // Boundaries: exactly 1 MiB / 1 GiB step up to the larger unit.
+    CHECK(bwa::fmt_bytes(1024 * 1024) == "1.0 MiB");
+    CHECK(bwa::fmt_bytes(1024 * 1024 - 1) == "1048575 B");
+    CHECK(bwa::fmt_bytes(kGiB) == "1.0 GiB");
+
     int cpu = bwa::detect_cpu_count();
     CHECK(cpu >= 1);
     // 4096 was too tight for HPC / cloud nodes: AWS u-7i.metal-224xl already
