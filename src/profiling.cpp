@@ -381,21 +381,11 @@ int display_stats(int nthreads)
     } /* end bwa_verbose >= 4 gate for diagnostic histograms */
 
     #if HIDE
-    int agg1 = 0, agg2 = 0, agg3 = 0;
-    for (int i=0; i<nthreads; i++) {
-        agg1 += tprof[PE11][i];
-        agg2 += tprof[PE12][i];
-        agg3 += tprof[PE13][i];
-    }
-    if (agg1 != agg3) 
-        fprintf(stderr, "There is a discrepancy re-allocs, plz rectify!!\n");
-
-    if(agg2 > 0)
-    {
-        fprintf(stderr, "\n\tTotal re-allocs: %d out of total requests: %d, Rate: %0.2f\n",
-                agg1, agg2, agg1*1.0/agg2);
-    }
-
+    /* The seed-buffer re-alloc report that used to live here read tprof[PE11],
+     * [PE12] and [PE13]. Those counters were removed from the chaining path (they
+     * were never reported outside this disabled block and caused cross-thread
+     * false sharing), so the report is gone with its writers rather than left to
+     * print a permanent zero. */
     double res = 0.0, max_ = 0, min_=1e10;
     for (int i=0; i<nthreads; i++) {
         double val = (tprof[ALIGN1][i]*1.0) / tprof[MEM_CHAIN][i];

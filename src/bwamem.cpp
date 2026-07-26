@@ -806,10 +806,13 @@ static int test_and_merge(const mem_opt_t *opt, int64_t l_pac, mem_chain_t *c,
             int pm = c->m;
             c->m <<= 1;
             if (pm == SEEDS_PER_CHAIN) {  // re-new memory
-                if ((auxSeedBuf = (mem_seed_t *) calloc(c->m, sizeof(mem_seed_t))) == NULL) { fprintf(stderr, "ERROR: out of memory auxSeedBuf\n"); exit(1); }
+                /* CHN-11: was calloc; the zero-fill it did over [0, m) was pure
+                 * waste -- [0, n) is immediately overwritten by the memcpy below
+                 * and [n, m) by the shared memset that follows (identical to the
+                 * realloc branch). malloc leaves exactly the same final bytes. */
+                if ((auxSeedBuf = (mem_seed_t *) malloc(c->m * sizeof(mem_seed_t))) == NULL) { fprintf(stderr, "ERROR: out of memory auxSeedBuf\n"); exit(1); }
                 memcpy((char*) (auxSeedBuf), c->seeds, c->n * sizeof(mem_seed_t));
                 c->seeds = auxSeedBuf;
-                tprof[PE13][tid]++;
             } else {  // new memory
                 // fprintf(stderr, "[%0.4d] re-allocing old seed, m: %d\n", tid, c->m);
                 if ((auxSeedBuf = (mem_seed_t *) realloc(c->seeds, c->m * sizeof(mem_seed_t))) == NULL) { fprintf(stderr, "ERROR: out of memory auxSeedBuf\n"); exit(1); }
@@ -1115,149 +1118,169 @@ static int mem_chain_cap_extend_mate(mem_chain_t *a, int n, int max_n,
 
 int mem_chain_flt(const mem_opt_t *opt, int n_chn_, mem_chain_t *a_, int tid)
 {
-    int i, k, n_numc = 0;
+    int i, k;
     if (n_chn_ == 0) return 0; // no need to filter
     // compute the weight of each chain and drop chains with small weight
-    for (i = k = 0; i < n_chn_; ++i)
+    /* CHN-17: with min_chain_weight <= 0 no chain can ever be dropped -- c->w is
+     * an unsigned 27-bit bitfield, so it is always >= 0 and `c->w < min_chain_weight`
+     * is never true. The general loop below then degenerates to `a_[k++] = *c` with
+     * k == i throughout: a per-chain self-copy of a 48-byte mem_chain_t. Take a fast
+     * path that updates the gate fields in place and skips the copy. Byte-identical:
+     * the surviving array (all chains), their order, and every field value are
+     * unchanged, and nothing is freed because nothing is dropped. min_chain_weight
+     * defaults to 0, so this is the dominant case. */
+    if (opt->min_chain_weight <= 0)
     {
-        mem_chain_t *c = &a_[i];
-        c->first = -1; c->kept = 0;
-        c->w = mem_chain_weight(c);
-        if (c->w < opt->min_chain_weight)
+        for (i = 0; i < n_chn_; ++i)
         {
-            if (c->m > SEEDS_PER_CHAIN) {
-                tprof[PE11][tid] ++;
-                free(c->seeds);
-            }
-            //free(c->seeds);
+            mem_chain_t *c = &a_[i];
+            c->first = -1; c->kept = 0;
+            c->w = mem_chain_weight(c);
         }
-        else a_[k++] = *c;
+        /* No chain can be dropped, so there is no compaction and n_chn_ is
+         * unchanged; the general path's `k` would have ended at n_chn_. */
     }
-    n_chn_ = k;
+    else
+    {
+        /* Slot 0's seeds are freed LATE. If every chain is dropped the array is
+         * never compacted, so a_[0] still holds chain 0 -- and the empty-array
+         * path below hands exactly that slot back to the caller with kept = 3
+         * (bwa-mem2 behaviour, preserved verbatim; see the CHN-6/19 note).
+         * bwa-mem2 frees those seeds here and then returns the chain pointing at
+         * the freed block, so what the caller extends depends on whether the
+         * allocator has reused it. Deferring this one free yields the same chain
+         * with its own seeds still intact -- the result bwa-mem2 produces
+         * whenever the block is untouched -- without the use-after-free. When at
+         * least one chain survives, slot 0 was either kept or overwritten by
+         * compaction, and the seeds are freed immediately after the loop. */
+        mem_seed_t *slot0_seeds = NULL;
+        for (i = k = 0; i < n_chn_; ++i)
+        {
+            mem_chain_t *c = &a_[i];
+            c->first = -1; c->kept = 0;
+            c->w = mem_chain_weight(c);
+            if (c->w < opt->min_chain_weight)
+            {
+                if (c->m > SEEDS_PER_CHAIN)  // CHN-16: dead tprof[PE11] counter removed
+                {
+                    if (i == 0) slot0_seeds = c->seeds;  // may be resurrected below
+                    else free(c->seeds);
+                }
+            }
+            else a_[k++] = *c;
+        }
+        // Not resurrected -- drop it now. free(NULL) when chain 0 was kept.
+        if (k != 0) free(slot0_seeds);
+        n_chn_ = k;
+    }
 
     /* Fast path for the dominant single-chain (unique-mapper) case. With one
-     * surviving chain the range split is a single [0,1) range and the pairwise-
-     * overlap pass reduces to `a_[0].kept = 3` (set unconditionally, kept through
-     * compaction) returning 1 — but the general path still builds a std::vector,
-     * a kvec, and calls ks_introsort to get there. a_[0].first was already reset
-     * to -1 in the weight-filter loop above. (Only n_chn_ == 1 is short-circuited;
-     * n_chn_ == 0 falls through to preserve the existing general-path behavior.) */
+     * surviving chain the pairwise-overlap pass reduces to `a_[0].kept = 3` (set
+     * unconditionally, kept through compaction) returning 1 — but the general path
+     * still builds a kvec and calls ks_introsort to get there. a_[0].first was
+     * already reset to -1 in the weight-filter loop above. (Only n_chn_ == 1 is
+     * short-circuited; n_chn_ == 0 falls through to preserve the existing
+     * general-path behavior.) */
     if (n_chn_ == 1) {
         a_[0].kept = 3;
         return 1;
     }
 
-    std::vector<std::pair<int, int> > range;
-    std::pair<int, int> pr;
-    int pseqid = a_[0].seqid;
-    pr.first = 0;
-    for (i=1; i<n_chn_; i++)
-    {
-        mem_chain_t *c =&a_[i];
-        if (c->seqid != pseqid) {
-            //if (flag == -1) {
-            //  pr.first = i;
-            //flag = 1;
-            //}
-            //else
-            {
-                pr.second = i;
-                range.push_back(pr);
-                pr.first = i;
-                // flag = -1;
-            }
-        }
-        pseqid = c->seqid;
-    }
-    pr.second = i;
-    range.push_back(pr);
+    /* CHN-6/19: mem_chain_flt runs once per read (chn = &chain_ar[l]); every chain
+     * chain_add_one_seed emits for that read is stamped seqid = l, so all chains
+     * reaching here share a single seqid and the removed seqid-run scan always
+     * produced exactly one range [0, n_chn_) -- the `c->seqid != pseqid` test could
+     * never fire. Run the former per-range body once over the whole array.
+     * Byte-identical: with one range `ilag` stays 0, so `a[k++ - ilag] == a[k++]`,
+     * and the return value equals `k` (the old `n_numc`). The post-weight-filter
+     * n_chn_ == 0 case is preserved exactly: the old scan built the range {0,1} and
+     * ran the body over one uncompacted slot, so n_chn falls back to 1 and slot 0
+     * is returned with kept = 3. Its seeds are still live -- see the deferred free
+     * in the weight filter above. */
+    mem_chain_t *a = a_;
+    int n_chn = n_chn_ ? n_chn_ : 1;
+    kvec_t(int) chains = {0,0,0};
+    kv_resize(int, chains, n_chn);   // CHN-19: reserve up front (kept count <= n_chn)
+    ks_introsort(mem_flt, n_chn, a);
 
-    int ilag = 0;
-    for (int l=0; l<range.size(); l++)
-    {
-        // this keeps int indices of the non-overlapping chains
-        kvec_t(int) chains = {0,0,0};
-        mem_chain_t *a =&a_[range[l].first];
-        int n_chn = range[l].second - range[l].first;
-        // original code block starts
-        ks_introsort(mem_flt, n_chn, a);
-
-        /* SoA hoist (byte-identical). chn_beg()/chn_end() each chase a[].seeds --
-         * a dependent load of the seeds pointer, then a load from the 65k-entry
-         * seedBuf arena -- and the pairwise loop below evaluates them for EVERY
-         * (i,j) pair, so the j-side is re-chased on every inner iteration. Cache
-         * them once into two contiguous int arrays (typical ~25 chains/read, so a
-         * couple hundred bytes, L1-resident). The seed arrays are not modified
-         * anywhere in this loop, so these are exactly the values the macros would
-         * have recomputed. thread_local + grow-only: no per-read allocation. */
-        static thread_local std::vector<int> cb_v, ce_v;
+    /* SoA hoist (#265, byte-identical). chn_beg()/chn_end() each chase a[].seeds --
+     * a dependent load of the seeds pointer, then a load from the 65k-entry seedBuf
+     * arena -- and the pairwise loop below evaluates them for EVERY (i,j) pair, so
+     * the j-side is re-chased on every inner iteration. Cache them once into two
+     * contiguous int arrays (typical ~25 chains/read, so a couple hundred bytes,
+     * L1-resident). The seed arrays are not modified anywhere in this loop, so
+     * these are exactly the values the macros would have recomputed. thread_local
+     * + grow-only: no per-read allocation. */
+    static thread_local std::vector<int> cb_v, ce_v;
+    int *cb = NULL, *ce = NULL;
+    /* Skipped for n_chn < 2. cb/ce are read only by the `i >= 1` pairwise loop
+     * below, so with a single chain they are dead -- and the one way to reach
+     * here with n_chn == 1 is the resurrected-empty-array path, where bwa-mem2
+     * evaluates chn_beg()/chn_end() inline inside that same never-entered loop
+     * and so never touches a_[0].seeds at all. Hoisting unconditionally would
+     * add a seeds dereference bwa-mem2 does not perform. */
+    if (n_chn > 1) {
         if ((int)cb_v.size() < n_chn) { cb_v.resize(n_chn); ce_v.resize(n_chn); }
-        int *cb = cb_v.data(), *ce = ce_v.data();
+        cb = cb_v.data(); ce = ce_v.data();
         for (int t = 0; t < n_chn; ++t) { cb[t] = chn_beg(a[t]); ce[t] = chn_end(a[t]); }
-
-        // pairwise chain comparisons
-        a[0].kept = 3;
-        kv_push(int, chains, 0);
-        for (i = 1; i < n_chn; ++i)
-        {
-            int large_ovlp = 0;
-            const int cbi = cb[i], cei = ce[i];
-            for (k = 0; k < chains.n; ++k)
-            {
-                int j = chains.a[k];
-                int b_max = cb[j] > cbi? cb[j] : cbi;
-                int e_min = ce[j] < cei? ce[j] : cei;
-                if (e_min > b_max && (!a[j].is_alt || a[i].is_alt)) { // have overlap; don't consider ovlp where the kept chain is ALT while the current chain is primary
-                    int li = cei - cbi;
-                    int lj = ce[j] - cb[j];
-                    int min_l = li < lj? li : lj;
-                    if (e_min - b_max >= min_l * opt->mask_level && min_l < opt->max_chain_gap) { // significant overlap
-                        large_ovlp = 1;
-                        if (a[j].first < 0) a[j].first = i; // keep the first shadowed hit s.t. mapq can be more accurate
-                        if (a[i].w < a[j].w * opt->drop_ratio && a[j].w - a[i].w >= opt->min_seed_len<<1)
-                            break;
-                    }
-                }
-            }
-            if (k == chains.n)
-            {
-                kv_push(int, chains, i);
-                a[i].kept = large_ovlp? 2 : 3;
-            }
-        }
-        for (i = 0; i < chains.n; ++i)
-        {
-            mem_chain_t *c = &a[chains.a[i]];
-            if (c->first >= 0) a[c->first].kept = 1;
-        }
-        free(chains.a);
-        for (i = k = 0; i < n_chn; ++i) { // don't extend more than opt->max_chain_extend .kept=1/2 chains
-            if (a[i].kept == 0 || a[i].kept == 3) continue;
-            if (++k >= opt->max_chain_extend) break;
-        }
-
-        for (; i < n_chn; ++i)
-            if (a[i].kept < 3) a[i].kept = 0;
-
-        for (i = k = 0; i < n_chn; ++i)  // free discarded chains
-        {
-            mem_chain_t *c = &a[i];
-            if (c->kept == 0)
-            {
-                if (c->m > SEEDS_PER_CHAIN) {
-                    tprof[PE11][tid] ++;
-                    free(c->seeds);
-                }
-                //free(c->seeds);
-            }
-            else a[k++ - ilag] = a[i];
-        }
-        // original code block ends
-        ilag += n_chn - k;
-        n_numc += k;
     }
 
-    return n_numc;
+    // pairwise chain comparisons
+    a[0].kept = 3;
+    kv_push(int, chains, 0);
+    for (i = 1; i < n_chn; ++i)
+    {
+        int large_ovlp = 0;
+        const int cbi = cb[i], cei = ce[i];
+        for (k = 0; k < chains.n; ++k)
+        {
+            int j = chains.a[k];
+            int b_max = cb[j] > cbi? cb[j] : cbi;
+            int e_min = ce[j] < cei? ce[j] : cei;
+            if (e_min > b_max && (!a[j].is_alt || a[i].is_alt)) { // have overlap; don't consider ovlp where the kept chain is ALT while the current chain is primary
+                int li = cei - cbi;
+                int lj = ce[j] - cb[j];
+                int min_l = li < lj? li : lj;
+                if (e_min - b_max >= min_l * opt->mask_level && min_l < opt->max_chain_gap) { // significant overlap
+                    large_ovlp = 1;
+                    if (a[j].first < 0) a[j].first = i; // keep the first shadowed hit s.t. mapq can be more accurate
+                    if (a[i].w < a[j].w * opt->drop_ratio && a[j].w - a[i].w >= opt->min_seed_len<<1)
+                        break;
+                }
+            }
+        }
+        if (k == chains.n)
+        {
+            kv_push(int, chains, i);
+            a[i].kept = large_ovlp? 2 : 3;
+        }
+    }
+    for (i = 0; i < chains.n; ++i)
+    {
+        mem_chain_t *c = &a[chains.a[i]];
+        if (c->first >= 0) a[c->first].kept = 1;
+    }
+    free(chains.a);
+    for (i = k = 0; i < n_chn; ++i) { // don't extend more than opt->max_chain_extend .kept=1/2 chains
+        if (a[i].kept == 0 || a[i].kept == 3) continue;
+        if (++k >= opt->max_chain_extend) break;
+    }
+
+    for (; i < n_chn; ++i)
+        if (a[i].kept < 3) a[i].kept = 0;
+
+    for (i = k = 0; i < n_chn; ++i)  // free discarded chains
+    {
+        mem_chain_t *c = &a[i];
+        if (c->kept == 0)
+        {
+            if (c->m > SEEDS_PER_CHAIN)  // CHN-16: dead tprof[PE11] counter removed
+                free(c->seeds);
+        }
+        else a[k++] = a[i];
+    }
+
+    return k;
 }
 
 SMEM *mem_collect_smem(FMI_search *fmi, const mem_opt_t *opt,
@@ -1593,19 +1616,21 @@ static inline void chain_add_one_seed(const mem_opt_t *opt, int64_t l_pac,
                                       const bntseq_t *chain_bns, kbtree_t(chn) *tree,
                                       mem_seed_t *seedBuf, int64_t *seedBufCount,
                                       int64_t seedBufSize, int tid, int seqid,
-                                      int *num_seqid, const mem_seed_t *seed_in,
+                                      const mem_seed_t *seed_in,
                                       int rid, int8_t meth_hyp)
 {
-    mem_seed_t s = *seed_in;
-    mem_chain_t tmp, *lower, *upper;
+    /* CHN-15: no local `mem_seed_t s = *seed_in` copy -- seed_in is const and is
+     * never mutated here (test_and_merge takes const mem_seed_t*), so the probe
+     * and the new-chain store read straight from seed_in. */
+    mem_chain_t tmp, *lower;   // CHN-13: `upper` dropped; kb_intervalp never read it
     int to_add = 0;
-    tmp.pos = s.rbeg;
+    tmp.pos = seed_in->rbeg;
 
     if (kb_size(tree))
     {
-        kb_intervalp(chn, tree, &tmp, &lower, &upper); // find the closest chain
+        kb_intervalp(chn, tree, &tmp, &lower, NULL); // find the closest chain
 
-        if (!lower || !test_and_merge(opt, l_pac, lower, &s, rid, tid))
+        if (!lower || !test_and_merge(opt, l_pac, lower, seed_in, rid, tid))
             to_add = 1;
     }
     else to_add = 1;
@@ -1616,16 +1641,22 @@ static inline void chain_add_one_seed(const mem_opt_t *opt, int64_t l_pac,
         if((*seedBufCount + tmp.m) > seedBufSize)
         {
             tmp.m += 1;
-            tmp.seeds = (mem_seed_t *)calloc (tmp.m, sizeof(mem_seed_t));
-            assert(tmp.seeds != NULL);
-            tprof[PE13][tid]++;
+            /* CHN-16: dead tprof[PE13] counter removed. The allocation is guarded
+             * the same way test_and_merge guards its seed-buffer growth: an
+             * `assert` alone compiles out under NDEBUG, so a release build would
+             * fall through and dereference NULL at `tmp.seeds[0] = *seed_in`. */
+            if ((tmp.seeds = (mem_seed_t *)calloc(tmp.m, sizeof(mem_seed_t))) == NULL) { fprintf(stderr, "ERROR: out of memory tmp.seeds\n"); exit(1); }
         }
         else {
             tmp.seeds = seedBuf + *seedBufCount;
             *seedBufCount += tmp.m;
         }
-        memset((char*) (tmp.seeds), 0, tmp.m * sizeof(mem_seed_t));
-        tmp.seeds[0] = s;
+        /* CHN-11: the per-new-chain memset(tmp.seeds, 0, ...) was dead. tmp.n == 1,
+         * so only slot 0 is live and it is overwritten immediately below; any
+         * further slots (the +1 overflow buffer, already calloc-zeroed) are never
+         * read while zero -- every seed read is bounded by c->n and each slot is
+         * written before n reaches it (test_and_merge: c->seeds[c->n++] = *p). */
+        tmp.seeds[0] = *seed_in;
         tmp.rid = rid;
         tmp.seqid = seqid;
         /* is_alt indexes the chain-side bns (original in --meth). */
@@ -1633,7 +1664,7 @@ static inline void chain_add_one_seed(const mem_opt_t *opt, int64_t l_pac,
         /* D3: carry the OT/OB hypothesis on the chain (-1 non-meth). */
         tmp.meth_hypothesis = meth_hyp;
         kb_putp(chn, tree, &tmp);
-        (*num_seqid)++;
+        // CHN-12: (*num_seqid)++ removed with the dead num[] array (see mem_chain_seeds)
     }
 }
 
@@ -1666,8 +1697,9 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
      * Only a selected reorder mode needs the materialize/order/replay path. */
     const int reorder = (opt->seed_emit_order != SEED_ORDER_OFF);
 
-    int num[nseq];
-    memset(num, 0, nseq*sizeof(int));
+    /* CHN-12: the per-read `int num[nseq]` counter (zeroed each batch, incremented
+     * once per opened chain via a stack-passed pointer) was never read anywhere --
+     * pure dead work. Removed along with chain_add_one_seed's num_seqid parameter. */
     int smem_buf_size = 6000;
     int64_t *sa_coord = (int64_t *) _mm_malloc(sizeof(int64_t) * opt->max_occ * smem_buf_size, 64);
     int64_t seedBufCount = 0;
@@ -1907,9 +1939,10 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
                 s.score= s.len = slen;
                 // Propagate SMEM SA-count so chain_n_hits gates --supp-rep-hard-cap.
                 s.n_hits = static_cast<int32_t>(p->s);
-                if (s.rbeg < 0 || s.len < 0)
-                    fprintf(stderr, "rbeg: %lld, slen: %d, cnt: %d, n: %d, m: %d, num_smem: %lld\n",
-                            (long long)s.rbeg, s.len, cnt-1, p->n, p->m, (long long)num_smem);
+                /* CHN-18: dropped the per-seed `if (s.rbeg < 0 || s.len < 0) fprintf`
+                 * sanity branch -- a never-firing debug guard (valid SA decodes give
+                 * rbeg >= 0 and len = p->n+1-p->m >= 0) that only wrote to stderr and
+                 * never altered s or control flow, so removal is output-identical. */
 
                 /* D3 (--meth, PR-3) seed→original remap (spec §5.2). The SA coord
                  * just decoded (s.rbeg) is in SEED (f/r-doubled) coordinates. Map
@@ -1940,7 +1973,7 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
                      * no order_seeds; byte-identical to buffering with the
                      * identity order but without the double memory traffic. */
                     chain_add_one_seed(opt, l_pac, chain_bns, tree, seedBuf,
-                                       &seedBufCount, seedBufSize, tid, l, &num[l],
+                                       &seedBufCount, seedBufSize, tid, l,
                                        &s, rid, meth_hyp);
                 }
                 else
@@ -1966,7 +1999,7 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
             // preserved (no dedup/compact beyond order_seeds).
             for (int64_t ri = 0; ri < nrec; ++ri)
                 chain_add_one_seed(opt, l_pac, chain_bns, tree, seedBuf,
-                                   &seedBufCount, seedBufSize, tid, l, &num[l],
+                                   &seedBufCount, seedBufSize, tid, l,
                                    &recs[ri].seed, recs[ri].rid, recs[ri].meth_hyp);
         } // reorder
 
@@ -2253,12 +2286,9 @@ int mem_kernel2_core(FMI_search *fmi,
         for (int i = 0; i < chain->n; ++i)
         {
             mem_chain_t chn = chain->a[i];
+            // CHN-16: dead tprof[PE11]/[PE12] false-sharing counters removed
             if (chn.m > SEEDS_PER_CHAIN)
-            {
-                tprof[PE11][tid] ++;
                 free(chn.seeds);
-            }
-            tprof[PE12][tid]++;
         }
         free(chain_ar[l].a);
     }
@@ -5341,7 +5371,6 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                         const mem_seed_t *t;
                         if (srt2[v] == UINT_MAX) continue;
                         t = &c->seeds[srt2[v]];
-                        //if (t->done == H0_) continue;  //check for interferences!!!
                         // only check overlapping if t is long enough;
                         // TODO: more efficient by early stopping
                         if (t->len < s->len * .95) continue;
