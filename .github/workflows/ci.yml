@@ -410,6 +410,17 @@ jobs:
           CHR22_SIM_DIR=/tmp/chr22-sim \
           bash test/regression/cohort_slice_identity.sh
 
+      - name: Cohort ramp values are validated (flag and environment alike)
+        if: matrix.canonical == true
+        # --cohort-ramp-first takes plain bases, and atoll("16M") is 16 -- a
+        # positive value, so an unvalidated parse configures a 16-BYTE first
+        # slice for a user who asked for 16 Mbases, silently. The flag must
+        # refuse it and the env spelling must report and ignore it.
+        run: |
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          FIXTURES="$GITHUB_WORKSPACE/test/fixtures" \
+          bash test/regression/cohort_ramp_validation.sh
+
       - name: Chunk cap stays opt-in (batching matches bwa-mem2 at every -t)
         if: matrix.canonical == true
         # bwa and bwa-mem2 both use an uncapped `chunk_size * n_threads` batch.
