@@ -425,11 +425,95 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
             sp_r0 = sp_wall();
         }
 
-        /* Read "reads" from input file (fread) */
+        /* Read "reads" from input file (fread).
+         *
+         * A cohort is one task_size batch. Normally it is read in a single call
+         * and this is exactly the old code path. When slicing is enabled the
+         * FIRST cohort is read in a geometric ramp (task/8, task/4, ...) so the
+         * compute pipeline starts working while the rest is still being read --
+         * only the first read of a run overlaps nothing, and it is the largest
+         * single unhidden cost in the pipeline.
+         *
+         * The target for every slice is clamped to the bases the cohort still
+         * needs. That clamp is load-bearing, not defensive: both readers stop at
+         * the first whole-record, even-n boundary at or PAST the requested size,
+         * so each slice overshoots independently. Reading T/8 + T/4 + T/2 + T/8
+         * without the clamp lands at T + e1+e2+e3+e4, whereas one read of T lands
+         * at T + e -- a different last record, hence a different cohort, hence a
+         * different mem_pestat. With the clamp, the first even-n boundary at or
+         * past (cohort_bases + slice_target) is provably the same record as the
+         * first at or past T whenever the slice crosses T, because every earlier
+         * boundary sits strictly below it. */
+        int64_t slice_target = aux->task_size - aux->cohort_bases;
+        if (slice_target <= 0) slice_target = aux->task_size;   /* new cohort */
+        /* Normally only the first cohort ramps -- later ones are already
+         * overlapped by the pipeline. slice_all is a STRESS knob for the
+         * identity test: it slices EVERY cohort and drops the efficiency floor,
+         * so a short run exercises the accumulator, the cohort-id advance and
+         * the boundary clamp at dozens of boundaries instead of one. It is not
+         * a performance mode -- tiny slices cost more in kt_for passes and lost
+         * SIMD batching than they can ever recover in overlap. */
+        if (aux->cohort_slices > 0 &&
+            (aux->cohort_slice_all || aux->cohort_index == 0) &&
+            aux->cohort_slice < aux->cohort_slices) {
+            int shift = (int)(aux->cohort_slices - aux->cohort_slice);
+            if (shift > 20) shift = 20;
+            int64_t ramped = aux->task_size >> shift;
+            /* A slice must stay large enough for its own SMEM/BSW batching to be
+             * efficient; below this the extra kt_for passes cost more than the
+             * overlap they buy. The stress knob deliberately bypasses this. */
+            int64_t floor_bases = aux->cohort_slice_all ? 1 : 1000000;
+            if (ramped < floor_bases) ramped = floor_bases;
+            if (ramped < slice_target) slice_target = ramped;
+        }
+
         int64_t sz = 0;
+        /* ONE arena per cohort, not per read call. The accumulator below copies
+         * only the bseq1_t structs into aux->cohort_seqs and shares name/seq/qual
+         * BY POINTER -- so those bytes must outlive the slice that carved them and
+         * stay alive until the whole cohort has been paired and written. Carrying
+         * the cohort's arena into each slice's read gives exactly that: the reader
+         * appends to it (see read_arena.h -- blocks are chained and never moved,
+         * so earlier pointers stay valid), and the completing slice hands the
+         * single arena to the write stage, which destroys it once.
+         *
+         * Scoping the arena per read call instead is a use-after-free: the write
+         * stage destroys every item's arena unconditionally, including the empty
+         * items partial slices return, freeing the strings the cohort still
+         * references. */
+        ret->read_arena = aux->cohort_arena;
         ret->seqs = aux->legacy_reader
-            ? bseq_read_orig(aux->task_size, &ret->n_seqs, aux->ks, aux->ks2, &sz, &ret->read_arena)
-            : bseq_read_fast(aux->task_size, &ret->n_seqs, aux->frks, aux->frks2, &sz, &ret->read_arena);
+            ? bseq_read_orig(slice_target, &ret->n_seqs, aux->ks, aux->ks2, &sz, &ret->read_arena)
+            : bseq_read_fast(slice_target, &ret->n_seqs, aux->frks, aux->frks2, &sz, &ret->read_arena);
+        aux->cohort_arena = ret->read_arena;
+
+        /* A short read means the input ran out, which ends the cohort early. */
+        aux->cohort_bases += sz;
+        /* Is a cohort mid-accumulation? cohort_slice counts the partial slices of
+         * the current cohort and is reset the moment one completes, so a non-zero
+         * value means step 1 is holding earlier slices that still have to be
+         * paired and emitted. Read from cohort_slice rather than cohort_n because
+         * only step 0 touches it: step 0 and step 1 run concurrently on different
+         * items, and cohort_n belongs to step 1. Captured before the bookkeeping
+         * below resets it. */
+        const int mid_cohort = (aux->cohort_slice > 0);
+        ret->cohort_complete = (sz < slice_target) ||
+                               (aux->cohort_bases >= aux->task_size) ||
+                               (ret->seqs == NULL) || (ret->n_seqs == 0);
+        if (ret->cohort_complete) {
+            aux->cohort_bases = 0;
+            aux->cohort_slice = 0;
+            aux->cohort_index++;
+            /* This item carries the cohort's arena to the write stage, which
+             * destroys it. Drop our reference so the NEXT cohort starts fresh. */
+            aux->cohort_arena = NULL;
+        } else {
+            aux->cohort_slice++;
+            /* Partial slice: the arena stays with the cohort, not this item. The
+             * write stage destroys ret->read_arena unconditionally, so it must
+             * not see it here -- the strings are still live. */
+            ret->read_arena = NULL;
+        }
 
         tprof[READ_IO][0] += __rdtsc() - tim;
 
@@ -445,10 +529,37 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
             ret->prof.n_bp = sz;
         }
 
-        fprintf(stderr, "[0000] read_chunk: %lld, work_chunk_size: %lld, nseq: %d\n",
-                (long long)aux->task_size, (long long)sz, ret->n_seqs);
+        /* `read_chunk` keeps meaning the COHORT (batch) target, as it did before
+         * slicing existed. Reporting slice_target here instead would repurpose an
+         * existing field rather than add one: the batch size is the thing this
+         * change is careful NOT to move -- byte-identity depends on it -- so it is
+         * exactly what a reader of this line wants, and
+         * test/regression/chunk_cap_optin.sh asserts on it. The slice request is
+         * reported as its own field, and only when the cohort is actually being
+         * sliced, so the common single-slice line stays character-for-character
+         * what it was. `work_chunk_size` is unchanged: bases actually delivered by
+         * this read, which for a slice is that slice's real size (the readers stop
+         * at the first whole-record boundary at or past the request, so delivered
+         * and requested differ). */
+        if (slice_target != aux->task_size)
+            fprintf(stderr, "[0000] read_chunk: %lld, slice: %lld, work_chunk_size: %lld, nseq: %d%s\n",
+                    (long long)aux->task_size, (long long)slice_target,
+                    (long long)sz, ret->n_seqs,
+                    ret->cohort_complete ? "" : " (cohort slice)");
+        else
+            fprintf(stderr, "[0000] read_chunk: %lld, work_chunk_size: %lld, nseq: %d%s\n",
+                    (long long)aux->task_size, (long long)sz, ret->n_seqs,
+                    ret->cohort_complete ? "" : " (cohort slice)");
 
-        if (ret->seqs == 0) {
+        /* No reads. Normally that is clean EOF: returning 0 retires this worker.
+         * But if a cohort is still accumulating, the input ended exactly ON a
+         * slice boundary (the previous slice delivered at least its target, so it
+         * did not end the cohort, and there is nothing left to read). Its earlier
+         * slices are already aligned and still have to be paired, emitted, and
+         * have their arena destroyed. Retiring here dropped them silently --
+         * short output, exit status 0. Hand step 1 an empty item instead: the
+         * accumulator appends nothing, aligns nothing, and flushes the cohort. */
+        if (ret->seqs == 0 && !mid_cohort) {
             free(ret);
             return 0;
         }
@@ -547,16 +658,31 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
     else if (step == 1)  /* Step 2: Main processing-engine */
     {
         static int task = 0;
-        if (w.nreads < ret->n_seqs)
+        /* regs must hold the whole COHORT, not just the reads this item carries.
+         * A sliced cohort aligns each slice as it arrives and keeps the results
+         * until mem_pair_and_emit_cohort consumes them, so growing this array
+         * must PRESERVE what the earlier slices already wrote -- hence realloc,
+         * not free() + calloc(). The old free()+calloc() sized from this slice's
+         * ret->n_seqs alone and discarded every earlier slice of the cohort,
+         * which emitted the cohort's leading reads as unmapped.
+         *
+         * Not zeroed: mem_kernel2_core kv_init()s every entry of the range it is
+         * given before writing it (src/bwamem.cpp), so no reader ever observes
+         * an entry the align phase has not initialized. That is also why the
+         * pre-existing `w.nreads >= n_seqs` case has always been safe without
+         * zeroing, and why dropping the whole-array calloc is output-neutral.
+         *
+         * Only regs is sized by the read count. chain_scratch/seed_scratch are
+         * per-thread windows sized by nthreads * BATCH_SIZE and are unaffected
+         * by how many reads a chunk turns out to hold. */
+        int32_t regs_want = aux->cohort_n + ret->n_seqs;
+        if (w.nreads < regs_want)
         {
             fprintf(stderr, "[0000] Reallocating initial memory allocations!!\n");
-            /* Only regs is sized by the read count. chain_scratch/seed_scratch
-             * are per-thread windows sized by nthreads * BATCH_SIZE and are
-             * unaffected by how many reads a chunk turns out to hold. */
-            free(w.regs);
-            w.nreads = ret->n_seqs;
-            w.regs = (mem_alnreg_v *) calloc(w.nreads, sizeof(mem_alnreg_v));
+            w.regs = (mem_alnreg_v *) realloc(w.regs,
+                                              (size_t) regs_want * sizeof(mem_alnreg_v));
             assert(w.regs != NULL);
+            w.nreads = regs_want;
         }
 
         /* The per-thread chaining scratch must never be resized per chunk: it is
@@ -642,14 +768,85 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
             }
             free(sep[0]); free(sep[1]);
         }
-        else {
-            /* pure (single/paired-end), reads processing */
+        else if (ret->cohort_complete && aux->cohort_n == 0) {
+            /* The common case: this slice IS the whole cohort. Byte-for-byte the
+             * pre-slicing code path -- no accumulation, no copy. */
             mem_process_seqs(opt,
                              aux->n_processed,
                              ret->n_seqs,
                              ret->seqs,
                              aux->pes0,
                              w);
+        }
+        else {
+            /* Multi-slice cohort. Append this slice to the cohort array, align
+             * just this slice, and only pair + emit once the cohort is whole.
+             *
+             * Only the bseq1_t structs are copied; the per-read name/seq/qual
+             * allocations are shared by pointer and the slice's own array is
+             * freed. The pipeline is one-item-in / one-item-out, so the cohort
+             * must be handed to the write step as a single contiguous array. */
+            if (aux->cohort_n == 0) aux->cohort_first_id = aux->n_processed;
+
+            if (aux->cohort_n + ret->n_seqs > aux->cohort_cap) {
+                int want = aux->cohort_n + ret->n_seqs;
+                int cap  = aux->cohort_cap ? aux->cohort_cap : 1024;
+                while (cap < want) cap <<= 1;
+                aux->cohort_seqs = (bseq1_t *) realloc(aux->cohort_seqs,
+                                                       (size_t) cap * sizeof(bseq1_t));
+                assert(aux->cohort_seqs != NULL);
+                aux->cohort_cap = cap;
+            }
+            memcpy(aux->cohort_seqs + aux->cohort_n, ret->seqs,
+                   (size_t) ret->n_seqs * sizeof(bseq1_t));
+            int slice_off = aux->cohort_n;
+            aux->cohort_n += ret->n_seqs;
+            free(ret->seqs);            /* structs copied out; strings still owned */
+            ret->seqs = NULL; ret->n_seqs = 0;
+
+            /* Re-base ids to the cohort. Only bseq_classify reads .id, and that
+             * path is excluded from slicing, but a stale per-slice id would be a
+             * trap for the next reader. */
+            for (int i = 0; i < aux->cohort_n - slice_off; ++i)
+                aux->cohort_seqs[slice_off + i].id = slice_off + i;
+
+            /* regs is sized once per item, at the top of this step, to the whole
+             * cohort (cohort_n + this slice's reads) and grown with realloc so
+             * the earlier slices' alignments survive -- they are computed as each
+             * slice arrives but consumed only by mem_pair_and_emit_cohort once
+             * the cohort is whole. Nothing to do here but rely on that.
+             *
+             * Sizing there rather than here is what makes the invariant hold for
+             * BOTH paths: the single-slice fast path above needs the same array
+             * and never reaches this branch. */
+            assert(w.nreads >= aux->cohort_n);
+
+            mem_align_cohort_slice(opt,
+                                   aux->cohort_first_id + slice_off,
+                                   aux->cohort_n - slice_off,
+                                   aux->cohort_seqs + slice_off,
+                                   w.regs + slice_off,
+                                   w);
+
+            if (!ret->cohort_complete) {
+                /* Partial cohort: hand the pipeline a non-NULL empty item. NULL
+                 * would retire this worker (see ktp_worker's step advance). */
+                tprof[MEM_PROCESS2][0] += __rdtsc() - tim;
+                if (sp_enabled()) ret->prof.proc_wall = sp_wall() - sp_p0;
+                return ret;
+            }
+
+            mem_pair_and_emit_cohort(opt,
+                                     aux->cohort_first_id,
+                                     aux->cohort_n,
+                                     aux->cohort_seqs,
+                                     aux->pes0,
+                                     w);
+
+            /* Hand the cohort to the write step, which frees the array. */
+            ret->seqs   = aux->cohort_seqs;
+            ret->n_seqs = aux->cohort_n;
+            aux->cohort_seqs = NULL; aux->cohort_n = 0; aux->cohort_cap = 0;
         }
         tprof[MEM_PROCESS2][0] += __rdtsc() - tim;
 
@@ -1242,6 +1439,18 @@ int main_mem(int argc, char *argv[])
      * task_size block below. */
     int64_t      chunk_cap                 = 0;
     int          chunk_cap_set             = 0;
+    /* --cohort-slices: how many geometric slices to read the FIRST batch in, so
+     * compute can start before the whole batch has been read. Byte-identical --
+     * the batch (pestat cohort) boundary is unchanged, only the physical read
+     * granularity inside it. 0 = one slice, i.e. the pre-slicing behaviour.
+     *
+     * Default swept on c8g.16xlarge / wgs-5M / -t 64 (main_mem seconds):
+     *   0 -> 26.08   2 -> 24.36   3 -> 24.27   4 -> 24.09   6 -> 23.94
+     * Monotonically better with depth because each extra slice halves the
+     * still-unoverlapped head again; 6 takes the first slice to task/64, by
+     * which point it is small next to the compute it unblocks. Deeper than
+     * that runs into the 1 Mbase floor on most inputs anyway. */
+    int64_t      cohort_slices             = 6;
 
     mem_opt_t    *opt, opt0;
     gzFile        fp = 0, fp2 = 0;
@@ -1290,6 +1499,7 @@ int main_mem(int argc, char *argv[])
         OPT_EXTEND_MATE_CONCORDANT,
         OPT_COMPAT,
         OPT_CHUNK_CAP,
+        OPT_COHORT_SLICES,
 #ifdef STAGE_PROF
         OPT_PROFILE,
 #endif
@@ -1305,6 +1515,7 @@ int main_mem(int argc, char *argv[])
         {"adaptive-band",            no_argument,       0, OPT_ADAPTIVE_BAND},
         {"extend-mate-concordant",   optional_argument, 0, OPT_EXTEND_MATE_CONCORDANT},
         {"chunk-cap",                required_argument, 0, OPT_CHUNK_CAP},
+        {"cohort-slices",            required_argument, 0, OPT_COHORT_SLICES},
         {"meth",                     optional_argument, 0, OPT_METH},
         {"meth-scoring",             required_argument, 0, OPT_METH_SCORING},
         {"set-as-failed",            required_argument, 0, OPT_METH_SET_AS_FAILED},
@@ -1580,6 +1791,27 @@ int main_mem(int argc, char *argv[])
             }
             chunk_cap = (int64_t)v;
             chunk_cap_set = 1;
+        }
+        else if (c == OPT_COHORT_SLICES) {
+            /* Same validation as --chunk-cap above, for the same reason: a bare
+             * atoll maps every unparseable value to 0, and 0 here means "no
+             * slicing". `--cohort-slices 3x` would silently disable the feature
+             * it was meant to configure. Capped at 20 because the ramp shift is
+             * clamped there anyway (task_size >> 20), so a larger value is
+             * indistinguishable from 20 and asking for it is a mistake worth
+             * naming. */
+            char *end = NULL;
+            errno = 0;
+            long long v = strtoll(optarg, &end, 10);
+            if (end == optarg || end == NULL || *end != '\0' ||
+                errno == ERANGE || v < 0 || v > 20) {
+                fprintf(stderr, "ERROR: --cohort-slices requires an integer in "
+                                "0..20 (0 = off), got '%s'\n", optarg);
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+            cohort_slices = (int64_t)v;
         }
         else if (c == OPT_SKIP_CONTAINED_EXT) opt->skip_contained_ext = 1;
         else if (c == OPT_ADAPTIVE_BAND) opt->band_start = ADAPTIVE_BAND_START;
@@ -2358,6 +2590,64 @@ int main_mem(int argc, char *argv[])
                     __func__, (long long)scaled, (long long)cap);
     }
     tprof[MISC][1] = opt->chunk_size = aux.actual_chunk_size = aux.task_size;
+
+    /* Cohort slicing. The first batch's read overlaps nothing -- the compute
+     * pipeline has nothing to chew on until it lands -- and with the cap now
+     * opt-in that first read is `chunk_size * n_threads` bases, the largest
+     * single unhidden cost in the run. Reading the FIRST cohort as a geometric
+     * ramp lets compute start on task/8 while the rest is still arriving.
+     *
+     * This does not move the cohort boundary, so mem_pestat sees exactly the
+     * read set it would have seen otherwise and the output is unchanged. See
+     * the slice-target clamp in the read step for why the boundary is preserved
+     * even though each read overshoots its request.
+     *
+     * Steady-state cohorts stay single-slice: once the pipeline is full,
+     * read(N+1) already overlaps compute(N), so slicing them would only add
+     * kt_for passes and shrink the SIMD batches for no overlap gain. */
+    {
+        int64_t slices = cohort_slices;
+        /* Validated like BWA_MEM3_CHUNK_CAP, and non-fatal for the same reason
+         * (the index is already loaded here): a bare atoll turns a typo into 0,
+         * which means "no slicing" -- silently disabling the thing the variable
+         * was set to configure. An empty value leaves the CLI/default alone. */
+        const char *cs_env = getenv("BWA_MEM3_COHORT_SLICES");
+        if (cs_env && *cs_env) {
+            char *cs_end = NULL;
+            errno = 0;
+            long long cs_v = strtoll(cs_env, &cs_end, 10);
+            if (cs_end == cs_env || cs_end == NULL || *cs_end != '\0' ||
+                errno == ERANGE || cs_v < 0 || cs_v > 20) {
+                fprintf(stderr, "WARNING: BWA_MEM3_COHORT_SLICES='%s' is not an "
+                                "integer in 0..20; ignoring it and using %lld\n",
+                        cs_env, (long long)slices);
+            } else {
+                slices = (int64_t)cs_v;
+            }
+        }
+        /* -p re-derives pairing from adjacency across the WHOLE array
+         * (bseq_classify carries has_last state), so a slice boundary between
+         * two mates would classify them as two SEs, change n_sep[], and shift
+         * the read-id base handed to the second mem_process_seqs. Classification
+         * must therefore precede alignment, which is incompatible with aligning
+         * slices early. Fall back to un-sliced cohorts. */
+        if (opt->flag & MEM_F_SMARTPE) {
+            if (slices > 0)
+                fprintf(stderr, "[M::%s] -p (smart pairing) is incompatible with "
+                        "cohort slicing; reading each batch in one slice\n", __func__);
+            slices = 0;
+        }
+        aux.cohort_slices = slices > 0 ? slices : 0;
+        /* Stress knob for test/regression/cohort_slice_identity.sh: slice every
+         * cohort, not just the first, so a small input exercises the accumulator
+         * and the boundary clamp many times over. Deliberately env-only -- it
+         * trades throughput for coverage and is not a mode users should pick. */
+        const char *sa_env = getenv("BWA_MEM3_COHORT_SLICE_ALL");
+        aux.cohort_slice_all = (sa_env && *sa_env && strcmp(sa_env, "0") != 0) ? 1 : 0;
+        if (aux.cohort_slice_all && aux.cohort_slices > 0)
+            fprintf(stderr, "[M::%s] BWA_MEM3_COHORT_SLICE_ALL set: slicing every "
+                    "cohort (stress mode; slower)\n", __func__);
+    }
 
     /* Pipeline depth. The 3-step pipeline (read / process / write) is gated by
      * how many of those steps can run at once. With 2 workers only 2 of the 3

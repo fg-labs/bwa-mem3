@@ -91,7 +91,11 @@ bseq1_t *bseq_read(int64_t chunk_size, int *n_, void *ks1_, void *ks2_,
     int64_t size = 0, m, n, size2 = 0;
     bseq1_t *seqs;
     m = n = 0; seqs = 0;
-    read_arena_t *arena = read_arena_create();
+    /* In/out: see bseq_read_fast. NULL in = fresh arena; non-NULL = keep carving
+     * from the caller's, so one cohort read in several slices ends up with one
+     * arena whose lifetime spans them all. */
+    const int arena_created_here = (*arena_out == NULL);
+    read_arena_t *arena = arena_created_here ? read_arena_create() : *arena_out;
     char buf[len];
     
     while (kseq_read(ks) >= 0)
@@ -172,10 +176,11 @@ bseq1_t *bseq_read(int64_t chunk_size, int *n_, void *ks1_, void *ks2_,
         if (ks2 && kseq_read(ks2) >= 0)
             fprintf(stderr, "[W::%s] the 1st file has fewer sequences.\n", __func__);
     }
-    /* PIPE-F6: hand the arena to the caller, or destroy it if this batch
-     * carved nothing (n == 0 → seqs stays NULL and the pipeline treats it as
-     * clean EOF, freeing nothing). */
-    if (n == 0) { read_arena_destroy(arena); arena = NULL; }
+    /* PIPE-F6: hand the arena to the caller, or destroy it if this batch carved
+     * nothing (n == 0 → seqs stays NULL and the pipeline treats it as clean EOF,
+     * freeing nothing). Only an arena created here may be destroyed here; a
+     * carried one still backs earlier slices of an in-flight cohort. */
+    if (n == 0 && arena_created_here) { read_arena_destroy(arena); arena = NULL; }
     *arena_out = arena;
     *n_ = n;
     *s = size;
@@ -189,7 +194,11 @@ bseq1_t *bseq_read_orig(int64_t chunk_size, int *n_, void *ks1_, void *ks2_, int
     int64_t size = 0, m, n;
     bseq1_t *seqs;
     m = n = 0; seqs = 0;
-    read_arena_t *arena = read_arena_create();
+    /* In/out: see bseq_read_fast. NULL in = fresh arena; non-NULL = keep carving
+     * from the caller's, so one cohort read in several slices ends up with one
+     * arena whose lifetime spans them all. */
+    const int arena_created_here = (*arena_out == NULL);
+    read_arena_t *arena = arena_created_here ? read_arena_create() : *arena_out;
     while (kseq_read(ks) >= 0)
     {
         if (ks2 && kseq_read(ks2) < 0) { // the 2nd file has fewer reads
@@ -227,8 +236,9 @@ bseq1_t *bseq_read_orig(int64_t chunk_size, int *n_, void *ks1_, void *ks2_, int
         if (ks2 && kseq_read(ks2) >= 0)
             fprintf(stderr, "[W::%s] the 1st file has fewer sequences.\n", __func__);
     }
-    /* PIPE-F6: see bseq_read above — hand off, or free the empty arena at EOF. */
-    if (n == 0) { read_arena_destroy(arena); arena = NULL; }
+    /* PIPE-F6: see bseq_read above — hand off, or free the empty arena at EOF,
+     * but only when this call created it. */
+    if (n == 0 && arena_created_here) { read_arena_destroy(arena); arena = NULL; }
     *arena_out = arena;
     *n_ = n;
     *s = size;

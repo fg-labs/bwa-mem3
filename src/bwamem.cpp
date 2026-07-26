@@ -2579,6 +2579,93 @@ static void worker_sam(void *data, int seqid, int batch_size, int tid)
     }
 }
 
+/* Align phase for one slice of a pestat cohort: seeding + BSW only.
+ *
+ * Split out of mem_process_seqs so the pipeline can align a cohort in several
+ * smaller physical reads while mem_pestat still sees the whole cohort. Nothing
+ * here depends on how the cohort is partitioned: seeding and BSW are per-read
+ * independent, and the read ids that feed the tie-break hashes come from the
+ * global n_processed counter, so a read gets the same id under any slicing.
+ *
+ * `seqs` and `regs` point at THIS slice (i.e. cohort base + offset), and
+ * `n_processed` is the global id of the slice's first read. The caller's
+ * w.seqs / w.regs / w.n_processed are saved and restored, so a slice can never
+ * leave w.regs pointing into the middle of the allocation -- worker_free()
+ * frees that pointer. */
+void mem_align_cohort_slice(mem_opt_t *opt,
+                            int64_t n_processed,
+                            int n,
+                            bseq1_t *seqs,
+                            mem_alnreg_v *regs,
+                            worker_t &w)
+{
+    bseq1_t      *saved_seqs = w.seqs;
+    mem_alnreg_v *saved_regs = w.regs;
+    int64_t       saved_np   = w.n_processed;
+
+    w.opt = opt;
+    w.seqs = seqs;
+    w.regs = regs;
+    w.n_processed = n_processed;
+
+    uint64_t tim = __rdtsc();
+    kt_for(worker_bwt_aln, &w, n);
+    tprof[WORKER10][0] += __rdtsc() - tim;
+
+    w.seqs = saved_seqs;
+    w.regs = saved_regs;
+    w.n_processed = saved_np;
+}
+
+/* Pair + emit phase for a complete pestat cohort.
+ *
+ * mem_pestat runs here, over the cohort's contiguous regs -- exactly the read
+ * set bwa-mem2 would have handed it for the same batch -- so the inferred
+ * insert-size distribution, and therefore pairing, mate rescue and MAPQ, are
+ * unchanged by however many slices the align phase used. */
+void mem_pair_and_emit_cohort(mem_opt_t *opt,
+                              int64_t n_processed,
+                              int n,
+                              bseq1_t *seqs,
+                              const mem_pestat_t *pes0,
+                              worker_t &w)
+{
+    mem_pestat_t pes[4];
+    double ctime = cputime(), rtime = realtime();
+
+    w.opt = opt;
+    w.seqs = seqs;
+    w.n_processed = n_processed;
+    w.pes = &pes[0];
+
+    if (opt->flag & MEM_F_PE) {
+        if (pes0)
+            memcpy(pes, pes0, 4 * sizeof(mem_pestat_t));
+        else {
+            /* D3 (--meth): insert-size inference operates on alnreg.rb which are
+             * in ORIGINAL doubled-pac space, so use the ORIGINAL l_pac. */
+            const bntseq_t *pestat_bns = mem_aln_bns(&w);
+            fprintf(stderr, "[0000] Inferring insert size distribution of PE reads from data, "
+                    "l_pac: %lld, n: %d\n", (long long)pestat_bns->l_pac, n);
+            mem_pestat(opt, pestat_bns->l_pac, n, w.regs, pes);
+        }
+        /* Publish the FR proper-pair insert high bound onto opt so the NEXT
+         * cohort's mate-concordant chain cap (which runs before pairing) can use
+         * it as its window (--extend-mate-concordant auto). pes index 1 = FR. */
+        if (!pes[1].failed && pes[1].high > 0)
+            opt->est_insert_high = pes[1].high;
+    }
+
+    uint64_t tim = __rdtsc();
+    fprintf(stderr, "[0000] 3. Calling kt_for - worker_sam\n");
+    kt_for(worker_sam, &w, n);
+    tprof[WORKER20][0] += __rdtsc() - tim;
+
+    fprintf(stderr, "\t[0000][ M::%s] Processed %d reads in %.3f "
+            "CPU sec, %.3f real sec\n",
+            __func__, n, cputime() - ctime, realtime() - rtime);
+}
+
 void mem_process_seqs(mem_opt_t *opt,
                       int64_t n_processed,
                       int n,

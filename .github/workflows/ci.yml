@@ -382,6 +382,14 @@ jobs:
           CHR22_FA=/tmp/chr22/chr22.fa \
           bash test/regression/chain_scratch_per_thread.sh
 
+      - name: Cohort slicing does not change output
+        if: matrix.canonical == true
+        run: |
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          CHR22_FA=/tmp/chr22/chr22.fa \
+          CHR22_SIM_DIR=/tmp/chr22-sim \
+          bash test/regression/cohort_slice_identity.sh
+
       - name: Chunk cap stays opt-in (batching matches bwa-mem2 at every -t)
         if: matrix.canonical == true
         # bwa and bwa-mem2 both use an uncapped `chunk_size * n_threads` batch.
