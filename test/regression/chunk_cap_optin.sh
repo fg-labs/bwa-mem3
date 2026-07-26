@@ -98,8 +98,16 @@ expect 160000000 -t 16 --chunk-cap 256000000   # below the cap: untouched
 expect 320000000 -t 32 --chunk-cap 0           # 0 disables
 
 # --- --fast implies the cap; explicit flags still win -----------------------
+# Both argument orders, and both a non-zero cap and an explicit 0. --fast's cap is
+# applied after the option loop and only when --chunk-cap was absent
+# (`if (!chunk_cap_set)`), so precedence is order-independent by construction --
+# these cases pin that, so a parser change that started consuming --fast after the
+# flag (and clobbering it) cannot silently re-enable the implied cap.
 expect 256000000 -t 32 --fast
 expect  64000000 -t 32 --fast --chunk-cap 64000000
+expect  64000000 -t 32 --chunk-cap 64000000 --fast
+expect 320000000 -t 32 --fast --chunk-cap 0     # explicit 0 beats --fast's cap
+expect 320000000 -t 32 --chunk-cap 0 --fast
 
 # --- BWA_MEM3_CHUNK_CAP wins over everything except -K ----------------------
 # The env override exists for cap sweeps, so it has to beat both the CLI flag and

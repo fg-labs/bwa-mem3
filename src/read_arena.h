@@ -15,12 +15,20 @@
  * are byte-identical to the former per-field malloc/strdup path.
  *
  * Ownership / lifetime contract:
- *   - Exactly one arena is created per read-chunk, by the reader, and returned
- *     to the pipeline alongside the bseq1_t array. It is stored on the chunk
- *     (ktp_data_t.read_arena) and destroyed exactly once, in the write stage,
- *     after every field it backs has been consumed.
- *   - The arena is owned by a single chunk and never shared mutably between the
- *     threads processing different chunks (each chunk carries its own).
+ *   - Exactly one arena per COHORT -- the set of reads whose fields are consumed
+ *     together, which is one mem_pestat batch. It is created by the reader on the
+ *     first read of the cohort, returned to the pipeline alongside the bseq1_t
+ *     array, stored on the chunk (ktp_data_t.read_arena), and destroyed exactly
+ *     once, in the write stage, after every field it backs has been consumed.
+ *   - A cohort may be READ in several calls (cohort slicing exists so compute can
+ *     start before the whole batch has arrived). The `read_arena_t **arena_out`
+ *     parameter is therefore in/out: NULL in means "create a fresh arena",
+ *     non-NULL means "keep carving from this one". Only the call that CREATED an
+ *     arena may destroy it on the empty-batch path; a carried arena still backs
+ *     the earlier slices. This is why the unit is the cohort and not the read
+ *     call -- the fields outlive the call that carved them.
+ *   - The arena is owned by a single cohort and never shared mutably between the
+ *     threads processing different cohorts (each carries its own).
  *   - Only allocation grows the arena, and that happens solely on the read
  *     thread during ingest; the process/write stages only READ the fields (the
  *     in-place 2-bit sequence encoding and --meth C->T/G->A projection mutate

@@ -63,6 +63,14 @@ Input/output options:
                  at any -t. Capping re-partitions the input and is NOT
                  byte-identical. Prefer -K if you want a fixed batch size AND
                  reproducibility [0]
+   --cohort-slices INT
+                 read the FIRST batch in INT slices as a geometric ramp ending at
+                 half the batch (INT=6 => batch/64, batch/32, ... batch/2), so
+                 alignment starts before the whole batch has been read. 0 = off
+                 (single read). Later batches are always read whole, since their
+                 read already overlaps the previous batch's compute. Does NOT move
+                 the batch boundary, so output is unchanged. Max 20. Overridden by
+                 BWA_MEM3_COHORT_SLICES [6]
    -v INT        verbose level: 1=error, 2=warning, 3=message, 4+=debugging [3]
    -T INT        minimum score to output [30]
    -h INT[,INT]  if there are <INT hits with score >80.00% of the max score, output all in XA [5,200]

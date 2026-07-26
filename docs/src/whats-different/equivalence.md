@@ -280,7 +280,7 @@ Any equivalence claim on this page is implicitly a claim **at a fixed batch size
 Two consequences:
 
 - **`bwa-mem3 -t N` must be compared against `bwa-mem2 -t N`**, not against `bwa-mem2 -t M`. Comparing across thread counts measures the batching, not the aligner.
-- **Pass `-K` to both sides** if you want the comparison to be independent of `-t` altogether. `-K` pins the batch size exactly, is never capped, and is the reason it exists in all three tools.
+- **Pass `-K` to both sides** if you want the comparison to be independent of `-t` altogether. `-K` pins the batch target for reproducible partitioning, is never capped, and is the reason it exists in all three tools. (It is a target, not a hard delivered-base limit — the reader finishes the record it is on — but all three tools round it the same way, so the partition matches.)
 
 `--chunk-cap` (off by default) bounds the auto-scaled batch and therefore re-partitions the input; it is opt-in for exactly this reason, warns on stderr when it engages, and is implied by `--fast`. A run with `--chunk-cap` in effect is **not** byte-identical to `bwa`/`bwa-mem2` at the same `-t`. See [`mem` → `--chunk-cap`](../cli/mem.md) and [Aligning → `-K`](../user-guide/aligning.md).
 

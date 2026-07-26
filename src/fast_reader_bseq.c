@@ -83,7 +83,13 @@ bseq1_t *bseq_read_fast(int64_t chunk_size, int *n_, void *ks1_, void *ks2_, int
     int64_t size = 0, m, n;
     bseq1_t *seqs;
     m = n = 0; seqs = 0;
-    read_arena_t *arena = read_arena_create();
+    /* `arena_out` is in/out: NULL in means "create a fresh arena", non-NULL means
+     * "keep carving from this one". Cohort slicing reads one batch in several
+     * calls but consumes all of its fields together at output, so the arena's
+     * lifetime is the COHORT, not the individual read -- carrying it across
+     * slices is what keeps that one arena, destroyed once, correct. */
+    const int arena_created_here = (*arena_out == NULL);
+    read_arena_t *arena = arena_created_here ? read_arena_create() : *arena_out;
     for (;;) {
         /* Tokenize the next record(s). fr_fastq_next scans record boundaries and
          * pulls bytes through the codec layer, which charges its read()/inflate
@@ -135,11 +141,13 @@ bseq1_t *bseq_read_fast(int64_t chunk_size, int *n_, void *ks1_, void *ks2_, int
         if (p2 && fr_fastq_next(p2, &rr) == 1)
             fprintf(stderr, "[W::%s] the 1st file has fewer sequences.\n", __func__);
     }
-    /* PIPE-F6: hand the per-chunk arena (backing every read's name/seq/qual) to
-     * the caller, which destroys it in the write stage once the chunk is fully
-     * consumed. An empty batch (n == 0 → seqs == NULL, read as clean EOF by the
-     * pipeline) carved nothing, so free the arena here and report none. */
-    if (n == 0) { read_arena_destroy(arena); arena = NULL; }
+    /* PIPE-F6: hand the arena (backing every read's name/seq/qual) to the caller,
+     * which destroys it in the write stage once everything it backs is consumed.
+     * An empty batch (n == 0 → seqs == NULL, read as clean EOF by the pipeline)
+     * carved nothing, so an arena created HERE is freed here and reported as
+     * none. A CARRIED arena is never destroyed on this path: it still backs the
+     * earlier slices of an in-flight cohort, and it is not ours to free. */
+    if (n == 0 && arena_created_here) { read_arena_destroy(arena); arena = NULL; }
     *arena_out = arena;
     *n_ = n;
     *s = size;

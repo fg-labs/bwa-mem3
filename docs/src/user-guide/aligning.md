@@ -65,8 +65,12 @@ string is embedded as an `RG:Z:` tag on every output record.
 ### Chunk size: `-K`
 
 ```text
--K INT   process INT input bases in each batch, regardless of -t []
+-K INT   per-batch target of INT input bases, regardless of -t []
 ```
+
+`INT` is a target, not a hard delivered-base limit: the reader finishes the
+record it is on, so a batch delivers a little more than `INT` bases and never a
+partial record or a split pair. `bwa` and `bwa-mem2` behave the same way.
 
 Larger `-K` values increase memory use but can improve throughput on very deep
 or very wide batches.
