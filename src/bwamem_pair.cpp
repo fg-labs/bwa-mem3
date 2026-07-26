@@ -1489,7 +1489,7 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                 assert(sp.len1 >= 0 && sp.len2 >= 0);
                 if (refOffset + sp.len1 >= *wsize_buf_ref)
                 {
-                    fprintf(stderr, "[0000][%0.4d] Re-allocating (doubling) seqBufRefs in %s\n",
+                    if (bwa_verbose >= 4) fprintf(stderr, "[0000][%0.4d] Re-allocating (doubling) seqBufRefs in %s\n",
                             tid, __func__);
                     int64_t tmp = *wsize_buf_ref;
                     *wsize_buf_ref = seqbuf_grow_capacity(tmp);
@@ -1509,7 +1509,7 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
             
                 if (qerOffset + sp.len2 >= *wsize_buf_qer)
                 {
-                    fprintf(stderr, "[0000][%0.4d] Re-allocating (doubling) seqBufQers in %s\n",
+                    if (bwa_verbose >= 4) fprintf(stderr, "[0000][%0.4d] Re-allocating (doubling) seqBufQers in %s\n",
                             tid, __func__);
                     int64_t tmp = *wsize_buf_qer;
                     *wsize_buf_qer = seqbuf_grow_capacity(tmp);
@@ -1529,7 +1529,7 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
             
                 if (pcnt >= *wsize_pair)
                 {
-                    fprintf(stderr, "[0000][%0.4d] Re-allocating seqPairs in %s\n", tid, __func__);
+                    if (bwa_verbose >= 4) fprintf(stderr, "[0000][%0.4d] Re-allocating seqPairs in %s\n", tid, __func__);
                     *wsize_pair += 1024;
                     mmc->seqPairArrayAux[tid] = (SeqPair *) realloc(mmc->seqPairArrayAux[tid],
                                                         (*wsize_pair + MAX_LINE_LEN)

@@ -296,8 +296,25 @@ void worker_alloc(const mem_opt_t *opt, worker_t &w, int32_t nreads, int32_t nth
             scratchMem/1e6, nthreads);
 
 
-    /* SWA mem allocation */
-    int64_t wsize = BATCH_SIZE * SEEDS_PER_READ;
+    /* SWA mem allocation.
+     *
+     * These are a STARTING size, not a bound: seqBufRef/Qer double via
+     * seqbuf_grow_capacity() and the seqPairArrays realloc on demand, both in
+     * mem_chain2aln_across_reads_V2 and the batched mate-rescue path. So the
+     * only thing the initial value buys is avoiding a few early reallocs.
+     *
+     * It used to start at BATCH_SIZE * SEEDS_PER_READ. SEEDS_PER_READ is 500 --
+     * a worst-case seeds-per-read bound -- but these arrays hold extension
+     * PAIRS, roughly a couple per chain, not one per seed. The result was
+     * ~504 MB per thread reserved up front and, being per-thread, growth linear
+     * in -t: 32.2 GB at -t 64 and ~97 GB at -t 192, dwarfing even the index.
+     *
+     * Start from AVG_SEEDS_PER_READ instead -- the same per-read seed estimate
+     * the chaining scratch is sized with -- for an 8x smaller reservation, and
+     * let the existing growth paths cover anything heavier. Byte-identical:
+     * capacity affects only where the extension data lives, never its
+     * contents. */
+    int64_t wsize = BATCH_SIZE * AVG_SEEDS_PER_READ;
     for(int l=0; l<nthreads; l++)
     {
         w.mmc.seqBufLeftRef[l*CACHE_LINE]  = (uint8_t *)
