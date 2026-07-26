@@ -55,6 +55,12 @@ CPU and is the recommended mode for piping to `samtools sort`. Values `1`–`9`
 select increasing BGZF deflate levels; use `--bam=6` or `--bam=9` only when
 writing directly to final storage without a downstream sort step.
 
+Any level above `0` prints a one-line warning to stderr: BGZF deflate runs on
+the single writer thread, so for large outputs that serial compression — not
+alignment — is usually what caps throughput. The warning reflects the resolved
+level, so it is emitted once and not at all when a later `--bam=0` overrides an
+earlier compressed level.
+
 > **Tip — Prefer --bam for production pipelines**
 >
 > Uncompressed BAM (`--bam` or `--bam=0`) eliminates the text-formatting cost on

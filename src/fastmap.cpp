@@ -1427,6 +1427,10 @@ int main_mem(int argc, char *argv[])
                     return 1;
                 }
                 opt->bam_level = lvl;
+                /* The compressed-BAM warning is emitted once after parsing,
+                 * from the resolved bam_level -- see below. Warning here would
+                 * fire per occurrence and would warn for a level a later
+                 * --bam=0 goes on to override. */
             }
         }
 #ifdef STAGE_PROF
@@ -1599,6 +1603,23 @@ int main_mem(int argc, char *argv[])
             fclose(aux.fp);
         return 1;
     }
+
+    /* In-process BGZF deflate runs on the single writer thread, so for large
+     * outputs it -- not alignment -- is usually what caps throughput. Warn
+     * once, here rather than in the parsing loop, so the message describes the
+     * *resolved* setting: `--bam=6 --bam=0` must stay silent (the last --bam
+     * wins and it is uncompressed) and `--bam=6 --bam=6` must warn once, not
+     * per occurrence. Placed after the positional-argument check so a usage
+     * error is not preceded by a warning about output it never writes. */
+    if (opt->bam_mode && opt->bam_level > 0)
+        fprintf(stderr,
+            "WARNING: --bam=%d writes compressed BAM on a single writer "
+            "thread; BGZF deflate is not parallelized here, so for large "
+            "outputs this serial compression is usually the bottleneck. "
+            "Prefer uncompressed output (--bam, i.e. --bam=0) piped to a "
+            "threaded compressor, e.g. "
+            "`bwa-mem3 mem --bam ... | samtools view -@ N -b -o out.bam`.\n",
+            opt->bam_level);
 
     /* Further input parsing */
     if (mode)
