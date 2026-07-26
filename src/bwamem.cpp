@@ -934,6 +934,7 @@ int mem_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns,
             }
             else if (q->rb < p->rb && (score = mem_patch_reg(opt, bns, pac, query, q, p, &w, opt->mat)) > 0) { // then merge q into p
                 p->n_comp += q->n_comp + 1;
+                p->ungapped = 0;  /* merged span may cross an indel (patch DP) -> not provably ungapped */
                 p->seedcov = p->seedcov > q->seedcov? p->seedcov : q->seedcov;
                 p->sub = p->sub > q->sub? p->sub : q->sub;
                 p->csub = p->csub > q->csub? p->csub : q->csub;
@@ -1015,6 +1016,7 @@ int mem_sort_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns,
             }
             else if (q->rb < p->rb && (score = mem_patch_reg(opt, bns, pac, query, q, p, &w, mat)) > 0) { // then merge q into p
                 p->n_comp += q->n_comp + 1;
+                p->ungapped = 0;  /* merged span may cross an indel (patch DP) -> not provably ungapped */
                 p->seedcov = p->seedcov > q->seedcov? p->seedcov : q->seedcov;
                 p->sub = p->sub > q->sub? p->sub : q->sub;
                 p->csub = p->csub > q->csub? p->csub : q->csub;
@@ -3881,15 +3883,85 @@ mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *
     if (regen_hyp >= 0 && ar->rb >= bns->l_pac) regen_hyp ^= 1;
     const int8_t *regen_mat = use_meth_orig
         ? mem_opt_meth_mat(opt, regen_hyp) : opt->mat;
-    do {
-        free(a.cigar);
-        w2 = w2 < opt->w<<2? w2 : opt->w<<2;
-        a.cigar = bwa_gen_cigar3(regen_mat, opt->o_del, opt->e_del, opt->o_ins, opt->e_ins, w2, bns->l_pac, pac, qe - qb, (uint8_t*)&query[qb], rb, re, &score, &a.n_cigar, &NM, use_meth_orig);
-        if (bwa_verbose >= 4) fprintf(stderr, "* Final alignment: w2=%d, global_sc=%d, local_sc=%d\n", w2, score, ar->truesc);
-        if (score == last_sc || w2 == opt->w<<2) break; // it is possible that global alignment and local alignment give different scores
-        last_sc = score;
-        w2 <<= 1;
-    } while (++i < 3 && score < ar->truesc - opt->a);
+    if (ar->ungapped && !opt->meth_mode) {
+        /* Ungapped-CIGAR fast path. ar->ungapped is set in
+         * mem_chain2aln_across_reads_V2 only when every extension this region
+         * needed was an ungapped_analyze HIT (or absent) and the region was never
+         * merged. Under the strict fast-path bound (fp_x_threshold there), such a
+         * region is a provably-ungapped diagonal: qe-qb == re-rb, and any gapped
+         * global alignment on an equal-length window needs a balanced ins+del
+         * costing >= 2*(o_min+e_min) > 0 that no rearrangement of the same bases
+         * can recover, so the pure-M diagonal is the STRICT unique max-score
+         * alignment. ksw_global2 can therefore only return <len>M.
+         *
+         * Passing w_=0 makes bwa_gen_cigar2 take its existing equal-length
+         * no-gap block (bwa.cpp ~307, the "hurts performance" FIXME): it emits the
+         * single-M CIGAR and the direct score, then runs the SAME shared NM/MD +
+         * reverse-strand pass as the DP path. The result is byte-identical to the
+         * banded DP for a strict-unique-max diagonal, but skips ksw_global2's
+         * banded fill + traceback. Non-meth only (the meth regen uses an
+         * asymmetric matrix; ar->ungapped is never set under --meth). */
+        assert(qe - qb == re - rb);  // necessary for ungapped; a mis-plumbed verdict trips here
+        a.cigar = bwa_gen_cigar3(regen_mat, opt->o_del, opt->e_del, opt->o_ins, opt->e_ins,
+                                 0 /* w_=0: reach the no-DP equal-length block */,
+                                 bns->l_pac, pac, qe - qb, (uint8_t*)&query[qb], rb, re,
+                                 &score, &a.n_cigar, &NM, use_meth_orig);
+        assert(a.cigar != NULL);
+        assert(a.n_cigar == 1 && (a.cigar[0] & 0xf) == 0);  // exactly one pure-M op
+        /* Expensive proof cross-check: run the banded DP the legacy path would
+         * have run and assert the fast path is byte-identical -- CIGAR ops,
+         * n_cigar, NM, and the MD string appended after the ops.
+         *
+         * Opt-in via BWA_MEM3_DEBUG_UNGAPPED_XCHECK, NOT `#ifndef NDEBUG`: no
+         * target in this build system ever defines NDEBUG, so an NDEBUG gate
+         * would leave this block -- the very banded DP this fast path exists to
+         * skip, plus up to three widening retries -- running on every ungapped
+         * alignment of every shipped binary, making the "fast" path strictly
+         * more expensive than the code it replaces. The throughput numbers in
+         * the commit message were measured with -DNDEBUG passed by hand, a
+         * build nothing here produces; this gate is what makes a stock build
+         * match them. Same trap recorded for the pac-fetch poison in
+         * bntseq.cpp. Enable with
+         *   make EXTRA_CXXFLAGS=-DBWA_MEM3_DEBUG_UNGAPPED_XCHECK
+         *
+         * xassert rather than assert so that enabling the macro alongside
+         * -DNDEBUG cannot compile the DP in while stripping every comparison,
+         * which is the one configuration strictly worse than leaving it off. */
+#ifdef BWA_MEM3_DEBUG_UNGAPPED_XCHECK
+        {
+            int dbg_w2 = w2, dbg_sc = 0, dbg_last = -(1<<30), dbg_nc = 0, dbg_NM = -1, dbg_i = 0;
+            uint32_t *dbg_cigar = 0;
+            do {
+                free(dbg_cigar);
+                dbg_w2 = dbg_w2 < opt->w<<2 ? dbg_w2 : opt->w<<2;
+                dbg_cigar = bwa_gen_cigar3(regen_mat, opt->o_del, opt->e_del, opt->o_ins,
+                                           opt->e_ins, dbg_w2, bns->l_pac, pac, qe - qb,
+                                           (uint8_t*)&query[qb], rb, re, &dbg_sc, &dbg_nc, &dbg_NM, use_meth_orig);
+                if (dbg_sc == dbg_last || dbg_w2 == opt->w<<2) break;
+                dbg_last = dbg_sc;
+                dbg_w2 <<= 1;
+            } while (++dbg_i < 3 && dbg_sc < ar->truesc - opt->a);
+            xassert(dbg_nc == a.n_cigar, "ungapped fast path: n_cigar differs from banded DP");
+            xassert(dbg_NM == NM, "ungapped fast path: NM differs from banded DP");
+            for (int _k = 0; _k < dbg_nc; ++_k)
+                xassert(dbg_cigar[_k] == a.cigar[_k],
+                        "ungapped fast path: CIGAR op differs from banded DP");
+            xassert(strcmp((char*)(dbg_cigar + dbg_nc), (char*)(a.cigar + a.n_cigar)) == 0,
+                    "ungapped fast path: MD string differs from banded DP");
+            free(dbg_cigar);
+        }
+#endif /* BWA_MEM3_DEBUG_UNGAPPED_XCHECK */
+    } else {
+        do {
+            free(a.cigar);
+            w2 = w2 < opt->w<<2? w2 : opt->w<<2;
+            a.cigar = bwa_gen_cigar3(regen_mat, opt->o_del, opt->e_del, opt->o_ins, opt->e_ins, w2, bns->l_pac, pac, qe - qb, (uint8_t*)&query[qb], rb, re, &score, &a.n_cigar, &NM, use_meth_orig);
+            if (bwa_verbose >= 4) fprintf(stderr, "* Final alignment: w2=%d, global_sc=%d, local_sc=%d\n", w2, score, ar->truesc);
+            if (score == last_sc || w2 == opt->w<<2) break; // it is possible that global alignment and local alignment give different scores
+            last_sc = score;
+            w2 <<= 1;
+        } while (++i < 3 && score < ar->truesc - opt->a);
+    }
     assert(a.cigar != NULL);
     l_MD = strlen((char*)(a.cigar + a.n_cigar)) + 1;
     a.NM = NM;
@@ -4904,6 +4976,12 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
 
                 a->w = opt->w;
                 a->score = a->truesc = -1;
+                /* Ungapped-CIGAR fast path: assume provably-ungapped until a side
+                 * is enqueued for banded SW (LEFT/RIGHT below) or the region is
+                 * merged (mem_*_dedup_patch). HIT and no-extension sides leave it
+                 * set. calloc'd av->a starts these at 0, so any region that never
+                 * reaches this init (e.g. memset mate-rescue regs) stays non-fast-path. */
+                a->ungapped = 1;
                 a->rid = c->rid;
                 a->frac_rep = c->frac_rep;
                 a->seedlen0 = s->len;
@@ -5178,6 +5256,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                     seqPairArrayLeft128[numPairsLeft] = sp;
                     numPairsLeft ++;
                     a->qb = s->qbeg; a->rb = s->rbeg;
+                    a->ungapped = 0;  /* left extension goes through banded SW; not provably ungapped */
                     LEFT_DONE: ;
                 }
                 else
@@ -5775,6 +5854,11 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                 }
             }
             if (keep) {
+                /* Right side is going through banded SW (deferred FALLBACK/TIGHT,
+                 * or a construction-time non-HIT pair): not provably ungapped.
+                 * Right HITs (keep==0) and no-right-extension seeds never reach
+                 * here, so their ungapped bit survives. */
+                a->ungapped = 0;
                 if (compacted != l)
                     seqPairArrayRight128[compacted] = *sp;
                 compacted++;

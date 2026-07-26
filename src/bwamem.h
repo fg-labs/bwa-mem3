@@ -378,7 +378,15 @@ typedef struct mem_alnreg_t {
     int secondary_all;
     int seedlen0;   // length of the starting seed
     int chain_n_hits; // max SMEM SA-occurrence count across this chain's seeds (1 = no repetitive seed)
-    int n_comp:30, is_alt:2; // number of sub-alignments chained together
+    /* n_comp: number of sub-alignments chained together (>=1; bumped by the
+     * dedup/patch merge). ungapped: 1 iff this region is a provably-ungapped
+     * diagonal (every extension it needed was an ungapped_analyze HIT or absent,
+     * and it was never merged), so mem_reg2aln can pass w_=0 to bwa_gen_cigar2 and
+     * take its no-gap block (single-M CIGAR + shared NM/MD), skipping the banded
+     * DP + traceback. Unsigned so the 1-bit field is a clean {0,1}. Repartitioned
+     * from n_comp:30 -> n_comp:29 (+ ungapped:1); same 32 bits, no
+     * sizeof(mem_alnreg_t) growth. n_comp:29 still holds ~5e8. */
+    unsigned n_comp:29, ungapped:1, is_alt:2;
     float frac_rep;
     uint64_t hash;
     int flg;
