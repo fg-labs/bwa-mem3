@@ -37,14 +37,15 @@ BatchBuffers::BatchBuffers(const std::vector<TestPair> &pairs, int xtra_flags)
         }
     }
     // SIMD tail padding: the kernel may read past the last pair when
-    // lane-filling.
-    ref_total += static_cast<size_t>(SIMD_WIDTH8) * maxRefLen;
-    qer_total += static_cast<size_t>(SIMD_WIDTH8) * maxQerLen;
+    // lane-filling. Sized for MAX_SIMD_WIDTH8, not this TU's SIMD_WIDTH8 --
+    // see the constant's comment in seqpair_batch.h.
+    ref_total += static_cast<size_t>(MAX_SIMD_WIDTH8) * maxRefLen;
+    qer_total += static_cast<size_t>(MAX_SIMD_WIDTH8) * maxQerLen;
 
     seqBufRef_.assign(ref_total, 0);
     seqBufQer_.assign(qer_total, 0);
-    pairs_.assign(n_ + SIMD_WIDTH8, SeqPair{});
-    aln_.assign(n_ + SIMD_WIDTH8, g_defr);
+    pairs_.assign(n_ + MAX_SIMD_WIDTH8, SeqPair{});
+    aln_.assign(n_ + MAX_SIMD_WIDTH8, g_defr);
 
     size_t ref_off = 0, qer_off = 0;
     for (int i = 0; i < n_; i++) {

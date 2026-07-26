@@ -17,11 +17,24 @@
 
 namespace bwa_tests {
 
+// Tail padding is sized for the WIDEST 8-bit lane count of any tier (64, the
+// AVX-512BW SIMD_WIDTH8), not this translation unit's compile-time
+// SIMD_WIDTH8. The kernel rounds the batch up to a whole SIMD group and writes
+// those dummy lanes, so a test that reaches a kernel wider than the tier the
+// framework was compiled at -- which any test going through make_kswv() can
+// do, since that dispatches on the runtime tier and honors BWAMEM3_FORCE_TIER
+// -- would otherwise write past the end of these buffers.
+//
+// It backs getScores16 batches too: the widest SIMD_WIDTH16 is 32, so the
+// 8-bit bound covers both and there is no reason to carry two constants.
+constexpr int MAX_SIMD_WIDTH8 = 64;
+
 class BatchBuffers {
 public:
-    // Pack `pairs` into internal seqBufRef/seqBufQer with SIMD_WIDTH8 tail
-    // padding. After construction, pairs()/ref_buf()/qer_buf()/aln() are
-    // the correctly-shaped arguments for kswv::getScores8.
+    // Pack `pairs` into internal seqBufRef/seqBufQer with tail padding for the
+    // widest supported SIMD group. After construction,
+    // pairs()/ref_buf()/qer_buf()/aln() are the correctly-shaped arguments for
+    // kswv::getScores8.
     //
     // xtra_flags is written into every pair's h0 field — pass the exact
     // value production uses at bwamem_pair.cpp:1004 so that the minsc

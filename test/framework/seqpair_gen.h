@@ -40,6 +40,18 @@ TestPair gen_sub_cluster_pair(std::mt19937 &rng, int qlen, int rlen,
 TestPair gen_with_n_bases_pair(std::mt19937 &rng, int qlen, int rlen,
                                int n_frac_pct);
 
+// Reference is a random motif of 18-31 bases tiled to `rlen` with scattered
+// substitutions (a tandem repeat); query is a mutated copy of a random window
+// of that reference. Unlike gen_random_pair -- whose ref and query are
+// independent, so the DP never rises far above zero -- this yields a high
+// primary score PLUS many near-threshold secondary maxima against the other
+// repeat copies. That plateau structure is what exercises the second-best
+// (KSW_XSUBO) machinery: score2/te2 and the b[]-collapse it depends on.
+// Asserts `qlen > 0 && rlen > qlen` — the query window is drawn from strictly
+// inside the reference — so a mis-parameterized call fails loudly instead of
+// sampling an empty window range. tag = "tandem_repeat".
+TestPair gen_tandem_repeat_pair(std::mt19937 &rng, int qlen, int rlen);
+
 } // namespace bwa_tests
 
 #endif

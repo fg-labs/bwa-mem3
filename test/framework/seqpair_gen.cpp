@@ -59,6 +59,36 @@ TestPair gen_sub_cluster_pair(std::mt19937 &rng, int qlen, int rlen,
     return p;
 }
 
+TestPair gen_tandem_repeat_pair(std::mt19937 &rng, int qlen, int rlen) {
+    assert(qlen > 0 && rlen > qlen &&
+           "gen_tandem_repeat_pair: rlen must exceed qlen");
+    std::uniform_int_distribution<int> base(0, 3);
+    std::uniform_int_distribution<int> pct(0, 99);
+    std::uniform_int_distribution<int> period_d(18, 31);
+
+    TestPair p;
+    p.ref.resize(rlen);
+    p.qry.resize(qlen);
+    p.tag = "tandem_repeat";
+
+    const int period = period_d(rng);
+    std::vector<uint8_t> motif(period);
+    for (int i = 0; i < period; i++) motif[i] = static_cast<uint8_t>(base(rng));
+
+    for (int i = 0; i < rlen; i++) {
+        p.ref[i] = (pct(rng) < 12) ? static_cast<uint8_t>(base(rng))
+                                   : motif[i % period];
+    }
+
+    std::uniform_int_distribution<int> start_d(0, rlen - qlen - 1);
+    const int start = start_d(rng);
+    for (int i = 0; i < qlen; i++) {
+        p.qry[i] = (pct(rng) < 18) ? static_cast<uint8_t>(base(rng))
+                                   : p.ref[start + i];
+    }
+    return p;
+}
+
 TestPair gen_with_n_bases_pair(std::mt19937 &rng, int qlen, int rlen,
                                int n_frac_pct) {
     TestPair p = gen_random_pair(rng, qlen, rlen);
