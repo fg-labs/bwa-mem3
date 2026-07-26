@@ -624,3 +624,14 @@ jobs:
 
       - name: stage_prof unit test
         run: make stage_prof_test && ./stage_prof_test
+
+      - name: Partial cohort slices report their compute CPU
+        # Only a STAGE_PROF build can run this, which is why it lives here and
+        # not in the matrix rows above. Cohort slicing gives step 1 an early
+        # exit; if that exit forgets to harvest g_ktfor, the slice's compute CPU
+        # is destroyed rather than merely unreported, and --profile under-counts
+        # in proportion to how much slicing is happening.
+        run: |
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          FIXTURES="$GITHUB_WORKSPACE/test/fixtures" \
+          bash test/regression/profile_slice_cpu.sh

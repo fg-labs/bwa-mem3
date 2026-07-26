@@ -425,6 +425,33 @@ void memoryAlloc(ktp_aux_t *aux, worker_t &w, int32_t nreads, int32_t nthreads)
     worker_alloc(aux->opt, w, nreads, nthreads);
 }
 
+/* Copy the compute step's --profile counters out of the per-thread kt_for
+ * accumulator and into this chunk's profile row (see stage_prof.h).
+ *
+ * Step 1 has two exits -- a whole cohort, and a partial cohort that is still
+ * accumulating slices -- and g_ktfor is reset at every step-1 entry, so a path
+ * that forgets to harvest does not merely lose detail: that slice's compute CPU
+ * is gone. Both exits call this, so adding a third cannot silently drop it.
+ *
+ * `sp_p0` is the sp_wall() reading taken at step-1 entry.
+ */
+static void sp_harvest_proc(prof_chunk_t *p, double sp_p0)
+{
+    p->proc_wall      = sp_wall() - sp_p0;
+    p->proc_cpu       = g_ktfor.proc_cpu;
+    p->thr_busy_min   = g_ktfor.thr_busy_min;
+    p->thr_busy_max   = g_ktfor.thr_busy_max;
+    p->thr_busy_mean  = g_ktfor.thr_busy_mean;
+    p->thr_busy_stdev = g_ktfor.thr_busy_stdev;
+    /* encode = SAM/BAM-build CPU (accurate, summed over compute threads);
+     * compute = the rest of the alignment CPU. Same clock, so subtractable.
+     * A slice that only seeds and extends never enters mem_aln2sam, so its
+     * encode is legitimately 0 and compute is the whole of proc_cpu. */
+    p->encode  = g_ktfor.encode;
+    p->compute = (g_ktfor.proc_cpu > g_ktfor.encode)
+                 ? g_ktfor.proc_cpu - g_ktfor.encode : NAN;
+}
+
 ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, worker_t &w)
 {
     ktp_aux_t *aux = (ktp_aux_t*) shared;
@@ -849,7 +876,7 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
                 /* Partial cohort: hand the pipeline a non-NULL empty item. NULL
                  * would retire this worker (see ktp_worker's step advance). */
                 tprof[MEM_PROCESS2][0] += __rdtsc() - tim;
-                if (sp_enabled()) ret->prof.proc_wall = sp_wall() - sp_p0;
+                if (sp_enabled()) sp_harvest_proc(&ret->prof, sp_p0);
                 return ret;
             }
 
@@ -867,19 +894,7 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
         }
         tprof[MEM_PROCESS2][0] += __rdtsc() - tim;
 
-        if (sp_enabled()) {
-            ret->prof.proc_wall      = sp_wall() - sp_p0;
-            ret->prof.proc_cpu       = g_ktfor.proc_cpu;
-            ret->prof.thr_busy_min   = g_ktfor.thr_busy_min;
-            ret->prof.thr_busy_max   = g_ktfor.thr_busy_max;
-            ret->prof.thr_busy_mean  = g_ktfor.thr_busy_mean;
-            ret->prof.thr_busy_stdev = g_ktfor.thr_busy_stdev;
-            /* encode = SAM/BAM-build CPU (accurate, summed over compute threads);
-             * compute = the rest of the alignment CPU. Same clock, so subtractable. */
-            ret->prof.encode  = g_ktfor.encode;
-            ret->prof.compute = (g_ktfor.proc_cpu > g_ktfor.encode)
-                                ? g_ktfor.proc_cpu - g_ktfor.encode : NAN;
-        }
+        if (sp_enabled()) sp_harvest_proc(&ret->prof, sp_p0);
 
         aux->n_processed += ret->n_seqs;
         return ret;
