@@ -525,6 +525,14 @@ int meth_mem_aln_to_bam(bam1_t *b,
             bam_aux_append(b, "MC", 'Z', (int)mc.l + 1, (const uint8_t *)mc.s);
         free(mc.s);
     }
+    /* MQ:i — guarded on `mp` alone, not on the MC block's `mp->n_cigar > 0`, so
+     * a mate with no CIGAR still gets its MAPQ. The compat gate is always open
+     * under --meth (fastmap.cpp refuses --compat with --meth) but is read here
+     * anyway so this stays a copy of bam_writer.cpp rather than a divergence. */
+    if (mp && opt->compat->emit_mq) {
+        int32_t mq = (int32_t)mp->mapq;
+        bam_aux_append(b, "MQ", 'i', sizeof(mq), (const uint8_t *)&mq);
+    }
     if (p.score >= 0) {
         int32_t as = (int32_t)p.score;
         bam_aux_append(b, "AS", 'i', sizeof(as), (const uint8_t *)&as);
@@ -577,6 +585,14 @@ int meth_mem_aln_to_bam(bam1_t *b,
      * names. No f/r prefix stripping or chrom rewrite is needed; emit verbatim. */
     if (p.XA != NULL) {
         bam_aux_append(b, "XA", 'Z', (int)strlen(p.XA) + 1, (const uint8_t *)p.XA);
+    }
+    /* HN:i — the same mem_gen_alt call that fills p.XA fills p.HN, so this
+     * counts the hits XA enumerates. Like XA above it is already stated against
+     * the ORIGINAL bns, so the doubled C->T/G->A reference does not double-count
+     * it. See the MQ:i note above re: the compat gate. */
+    if (p.HN >= 0 && opt->compat->emit_hn) {
+        int32_t hn = (int32_t)p.HN;
+        bam_aux_append(b, "HN", 'i', sizeof(hn), (const uint8_t *)&hn);
     }
     /* Bismark-compatible XR:Z (read conversion) emitted on every record;
      * XG:Z (genome strand) and XM:Z (methylation call string) only on
