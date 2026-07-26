@@ -4363,7 +4363,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                     sp.regid = av->n - 1;
 
                     if (numPairsLeft >= *wsize_pair) {
-                        fprintf(stderr, "[0000][%0.4d] Re-allocating seqPairArrays, in Left\n", tid);
+                        if (bwa_verbose >= 4) fprintf(stderr, "[0000][%0.4d] Re-allocating seqPairArrays, in Left\n", tid);
                         *wsize_pair +=  1024;
                         // assert(*wsize_pair > numPairsLeft);
                         *wsize_pair += numPairsLeft + 1024;
@@ -4388,7 +4388,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                     leftQerOffset += s->qbeg;
                     if (leftQerOffset >= *wsize_buf_qer)
                     {
-                        fprintf(stderr, "[%0.4d] Re-allocating (doubling) seqBufQers in %s (left)\n",
+                        if (bwa_verbose >= 4) fprintf(stderr, "[%0.4d] Re-allocating (doubling) seqBufQers in %s (left)\n",
                                 tid, __func__);
                         int64_t tmp = *wsize_buf_qer;
                         *wsize_buf_qer = seqbuf_grow_capacity(tmp);
@@ -4412,7 +4412,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                     leftRefOffset += tmp;
                     if (leftRefOffset >= *wsize_buf_ref)
                     {
-                        fprintf(stderr, "[%0.4d] Re-allocating (doubling) seqBufRefs in %s (left)\n",
+                        if (bwa_verbose >= 4) fprintf(stderr, "[%0.4d] Re-allocating (doubling) seqBufRefs in %s (left)\n",
                                 tid, __func__);
                         int64_t tmp = *wsize_buf_ref;
                         *wsize_buf_ref = seqbuf_grow_capacity(tmp);
