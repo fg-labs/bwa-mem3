@@ -93,6 +93,14 @@ typedef struct {
 	 * goes back to NULL so the next cohort creates a fresh one. See read_arena.h
 	 * for why the cohort, not the read call, is the arena's unit. */
 	read_arena_t *cohort_arena;
+	/* How fast the ramp grows per slice, and the previous slice's requested size
+	 * to grow from. The ratio is what decides whether step 1 ever waits: while
+	 * step 1 computes slice k the reader must deliver slice k+1, so the ramp is
+	 * only free while ratio <= (read seconds per base) / (compute seconds per
+	 * base). Both are step-0-only state, which kt_pipeline serialises. */
+	double  cohort_ramp_ratio;  /* growth per slice; see --cohort-ramp-ratio */
+	int64_t cohort_ramp_first;  /* first slice, in bases; 0 = fraction of task_size */
+	int64_t ramp_prev_target;   /* previous slice's REQUESTED size, in bases */
 	/* Accumulator for a multi-slice cohort, owned by step 1. */
 	bseq1_t *cohort_seqs;       /* contiguous reads for the cohort being built */
 	int      cohort_n;          /* reads accumulated so far */

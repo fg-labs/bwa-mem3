@@ -74,6 +74,64 @@ extern uint64_t tprof[LIM_R][LIM_C];
 #define COHORT_SLICES_DEFAULT 6
 #define COHORT_SLICES_MAX     20
 
+/* Ramp SHAPE defaults (--cohort-ramp-first / --cohort-ramp-ratio). At file scope
+ * for the same reason as the constants above: usage() is defined before
+ * main_mem, so a function-local default cannot be printed in `mem --help` and
+ * would have to be duplicated as a literal there. See the derivation at the
+ * cohort_ramp_ratio declaration in main_mem.
+ *
+ * Kept ABOVE the architecture split below, like the constants above: these are
+ * read by kt_pipeline, usage() and main_mem on every architecture, so defining
+ * them inside the ARM branch would leave them undeclared on x86. */
+static const double  cohort_ramp_ratio_default = 1.6;
+static const int64_t cohort_ramp_first_default = 16000000;
+
+/* Strict parsers shared by the batch-shaping options (--chunk-cap,
+ * --cohort-slices, --cohort-ramp-ratio, --cohort-ramp-first) and by each one's
+ * BWA_MEM3_* env override.
+ *
+ * Every one of those options had to reject what atoll()/atof() silently accept:
+ * a typo parses as 0, and 0 means "off" or "use the default" for all of them,
+ * so an unvalidated parse quietly disables the very thing the option was set to
+ * configure -- and atoll("16M") is 16, a SIXTEEN-BYTE first slice rather than
+ * 16 Mbases. That made every site carry the same errno/end-pointer/range
+ * checks, which is how one site once shipped a bare atoll() while its siblings
+ * were already hardened, and how the env spelling of --cohort-slices came to
+ * hardcode its upper bound instead of naming COHORT_SLICES_MAX. One
+ * implementation each removes both failure modes.
+ *
+ * Both return 0 on success and -1 on rejection, leaving *out untouched, so the
+ * caller keeps its own choice of fatal (CLI, nothing loaded yet) versus warn
+ * and carry on (env, index already read). */
+
+/* Reject unless `s` is a complete decimal integer within [min, max]. */
+static int parse_bounded_i64(const char *s, int64_t min, int64_t max, int64_t *out)
+{
+    char *end = NULL;
+    errno = 0;
+    const long long v = strtoll(s, &end, 10);
+    if (end == s || end == NULL || *end != '\0' || errno == ERANGE ||
+        (int64_t)v < min || (int64_t)v > max)
+        return -1;
+    *out = (int64_t)v;
+    return 0;
+}
+
+/* Reject unless `s` is a complete floating-point number. Range is deliberately
+ * NOT checked: the ramp-ratio sites share a documented `<= 1` fallback that
+ * reports and substitutes the default rather than failing, so only parseability
+ * belongs here. */
+static int parse_full_double(const char *s, double *out)
+{
+    char *end = NULL;
+    errno = 0;
+    const double v = strtod(s, &end);
+    if (end == s || end == NULL || *end != '\0' || errno == ERANGE)
+        return -1;
+    *out = v;
+    return 0;
+}
+
 #if defined(__ARM_NEON) || defined(__aarch64__) || defined(APPLE_SILICON)
 /* ARM/Apple Silicon - no CPUID instruction, use system calls */
 
@@ -486,11 +544,13 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
          *
          * A cohort is one task_size batch. Normally it is read in a single call
          * and this is exactly the old code path. When slicing is enabled the
-         * FIRST cohort is read in a geometric ramp that doubles each slice and
-         * ends at task/2: with the default cohort_slices = 6 that is task/64,
-         * task/32, ... task/2. Compute therefore starts working while the rest
-         * is still being read -- only the first read of a run overlaps nothing,
-         * and it is the largest single unhidden cost in the pipeline.
+         * FIRST cohort is read as a ramp of growing slices: the first is an
+         * absolute cohort_ramp_first bases (16 Mbase by default, capped at
+         * task/2) and each next is cohort_ramp_ratio times the previous (1.6 by
+         * default), for at most cohort_slices slices. Compute therefore starts
+         * working while the rest is still being read -- only the first read of a
+         * run overlaps nothing, and it is the largest single unhidden cost in
+         * the pipeline.
          *
          * The target for every slice is clamped to the bases the cohort still
          * needs. That clamp is load-bearing, not defensive: both readers stop at
@@ -514,14 +574,70 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
         if (aux->cohort_slices > 0 &&
             (aux->cohort_slice_all || aux->cohort_index == 0) &&
             aux->cohort_slice < aux->cohort_slices) {
-            int shift = (int)(aux->cohort_slices - aux->cohort_slice);
-            if (shift > COHORT_SLICES_MAX) shift = COHORT_SLICES_MAX;
-            int64_t ramped = aux->task_size >> shift;
+            /* How fast the ramp is allowed to grow. Doubling every slice is only
+             * free while the reader can deliver slice k+1 inside the time step 1
+             * spends on slice k; past that the ramp starves the very pipeline it
+             * exists to fill. See cohort_ramp_ratio in fastmap.h. */
+            double ratio = aux->cohort_ramp_ratio;
+            int64_t ramped;
+            if (aux->cohort_slice == 0 || aux->ramp_prev_target <= 0) {
+                /* The first slice is an ABSOLUTE size, not a fraction of the
+                 * cohort. Both costs it trades against are absolute -- its own
+                 * read overlaps nothing, and every extra slice costs one more
+                 * kt_for pass -- so nothing about the right answer scales with
+                 * task_size. Sizing it as task_size/ratio^depth made it grow with
+                 * -t, which is backwards: task_size is chunk_size * n_threads, so
+                 * at -t 128 a 1280 Mbase cohort would open with a 76 Mbase slice
+                 * and 0.37 s of pure unhidden fill, against 0.077 s for a fixed
+                 * 16 Mbase. The penalty grows linearly with thread count.
+                 *
+                 * Capped at half the cohort so a small task_size (a short test,
+                 * or an explicit -K) still gets at least two slices.
+                 *
+                 * The stress knob keeps the fractional shape on purpose: it
+                 * exists to make a short run cross as many cohort boundaries as
+                 * possible, and is explicitly not a performance mode. */
+                if (aux->cohort_ramp_first > 0 && !aux->cohort_slice_all) {
+                    ramped = aux->cohort_ramp_first;
+                    if (ramped > aux->task_size >> 1) ramped = aux->task_size >> 1;
+                } else if (ratio == 2.0) {
+                    /* Ratio 2 keeps the original integer shift, so pinning the
+                     * ratio to 2 with --cohort-ramp-first 0 reproduces the
+                     * pre-existing slice sizes exactly rather than approximately
+                     * via pow(). That exactness is what makes an A/B against the
+                     * old shape meaningful. */
+                    int shift = (int)(aux->cohort_slices - aux->cohort_slice);
+                    if (shift > COHORT_SLICES_MAX) shift = COHORT_SLICES_MAX;
+                    ramped = aux->task_size >> shift;
+                } else {
+                    double denom = pow(ratio, (double)aux->cohort_slices);
+                    ramped = (denom > 1.0)
+                             ? (int64_t)((double)aux->task_size / denom)
+                             : aux->task_size;
+                }
+            } else {
+                /* Saturate in double space, before the narrowing cast. The
+                 * ratio is only validated as > 1.0, so a sweep value like 30
+                 * or 100 compounds ramp_prev_target past INT64_MAX within a
+                 * handful of slices, and converting an out-of-range double to
+                 * int64_t is undefined behaviour. Saturating at task_size
+                 * costs nothing: slice_target is never above task_size, so a
+                 * ramp at or past it already means "the whole cohort", and it
+                 * keeps the stored ramp_prev_target from compounding away. */
+                const double grown = (double)aux->ramp_prev_target * ratio;
+                ramped = (grown >= (double)aux->task_size)
+                         ? aux->task_size
+                         : (int64_t)grown;
+            }
+
             /* A slice must stay large enough for its own SMEM/BSW batching to be
              * efficient; below this the extra kt_for passes cost more than the
              * overlap they buy. The stress knob deliberately bypasses this. */
             int64_t floor_bases = aux->cohort_slice_all ? 1 : 1000000;
             if (ramped < floor_bases) ramped = floor_bases;
+            /* Remember the REQUESTED size, not what the reader returns: the ramp
+             * shape must not drift with each slice's whole-record overshoot. */
+            aux->ramp_prev_target = ramped;
             if (ramped < slice_target) slice_target = ramped;
         }
 
@@ -561,6 +677,7 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
         if (ret->cohort_complete) {
             aux->cohort_bases = 0;
             aux->cohort_slice = 0;
+            aux->ramp_prev_target = 0;
             aux->cohort_index++;
             /* This item carries the cohort's arena to the write stage, which
              * destroys it. Drop our reference so the NEXT cohort starts fresh. */
@@ -1368,13 +1485,29 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "                 byte-identical. Prefer -K if you want a fixed batch size AND\n");
     fprintf(stderr, "                 reproducibility [0]\n");
     fprintf(stderr, "   --cohort-slices INT\n");
-    fprintf(stderr, "                 read the FIRST batch in INT slices as a geometric ramp ending at\n");
-    fprintf(stderr, "                 half the batch (INT=6 => batch/64, batch/32, ... batch/2), so\n");
+    fprintf(stderr, "                 read the FIRST batch as a ramp of up to INT growing slices, so\n");
     fprintf(stderr, "                 alignment starts before the whole batch has been read. 0 = off\n");
-    fprintf(stderr, "                 (single read). Later batches are always read whole, since their\n");
-    fprintf(stderr, "                 read already overlaps the previous batch's compute. Does NOT move\n");
-    fprintf(stderr, "                 the batch boundary, so output is unchanged. Max 20. Overridden by\n");
-    fprintf(stderr, "                 BWA_MEM3_COHORT_SLICES [%d]\n", (int)COHORT_SLICES_DEFAULT);
+    fprintf(stderr, "                 (single read). The slice SIZES come from --cohort-ramp-first and\n");
+    fprintf(stderr, "                 --cohort-ramp-ratio. Later batches are always read whole, since\n");
+    fprintf(stderr, "                 their read already overlaps the previous batch's compute. Does NOT\n");
+    fprintf(stderr, "                 move the batch boundary, so output is unchanged. Max %d. Overridden\n",
+            (int)COHORT_SLICES_MAX);
+    fprintf(stderr, "                 by BWA_MEM3_COHORT_SLICES [%d]\n", (int)COHORT_SLICES_DEFAULT);
+    fprintf(stderr, "   --cohort-ramp-first INT\n");
+    fprintf(stderr, "                 bases in the FIRST ramp slice. An absolute size, not a fraction of\n");
+    fprintf(stderr, "                 the batch: this slice's read overlaps nothing and each extra slice\n");
+    fprintf(stderr, "                 costs one more pipeline pass, and neither cost scales with the\n");
+    fprintf(stderr, "                 batch. Capped at half the batch so a small batch still gets two\n");
+    fprintf(stderr, "                 slices. 0 selects the fractional shape (batch / ratio^slices).\n");
+    fprintf(stderr, "                 Output-neutral. Overridden by BWA_MEM3_COHORT_RAMP_FIRST [%lld]\n",
+            (long long)cohort_ramp_first_default);
+    fprintf(stderr, "   --cohort-ramp-ratio FLOAT\n");
+    fprintf(stderr, "                 growth factor between consecutive ramp slices. Growing faster than\n");
+    fprintf(stderr, "                 the reader can deliver the next slice while the current one is\n");
+    fprintf(stderr, "                 being aligned stalls the pipeline, and that ceiling FALLS as -t\n");
+    fprintf(stderr, "                 rises because only compute scales with threads. Output-neutral.\n");
+    fprintf(stderr, "                 Overridden by BWA_MEM3_COHORT_RAMP_RATIO [%.1f]\n",
+            cohort_ramp_ratio_default);
     fprintf(stderr, "   -v INT        verbose level: 1=error, 2=warning, 3=message, 4+=debugging [%d]\n", bwa_verbose);
     fprintf(stderr, "   -T INT        minimum score to output [%d]\n", opt->T);
     fprintf(stderr, "   -h INT[,INT]  if there are <INT hits with score >%.2f%% of the max score, output all in XA [%d,%d]\n",
@@ -1517,16 +1650,90 @@ int main_mem(int argc, char *argv[])
      * the batch (pestat cohort) boundary is unchanged, only the physical read
      * granularity inside it. 0 = one slice, i.e. the pre-slicing behaviour.
      *
-     * The default was swept, not guessed. Wall time improves monotonically with
-     * depth because each extra slice halves the still-unoverlapped head again,
-     * and 6 takes the first slice to task/64 -- small next to the compute it
-     * unblocks, and about where the 1 Mbase slice floor starts truncating the
-     * ramp on ordinary inputs anyway. The measured sweep is in the PR that
+     * The default was swept, not guessed. This is the ramp's DEPTH only -- an
+     * upper bound on how many slices the first cohort is carved into. Their sizes
+     * come from cohort_ramp_first and cohort_ramp_ratio below, so the depth binds
+     * only until the ramp reaches the cohort or the 1 Mbase slice floor, which is
+     * about where 6 lands on ordinary inputs. The measured sweep is in the PR that
      * introduced this option rather than here: it is a wall-clock result for one
      * host, thread count and input, so it dates in a way the shape of the curve
      * does not, and it would read as live justification long after it stopped
      * being one. */
     int64_t      cohort_slices             = COHORT_SLICES_DEFAULT;
+    /* --cohort-ramp-first / --cohort-ramp-ratio: the ramp's shape. Output-neutral
+     * at any setting -- these change slice SIZES, and the cohort boundary is
+     * pinned by the slice-target clamp, not by how the cohort is carved up.
+     *
+     * A ramp schedule pays exactly three costs, all measured on wgs-5M/hg38
+     * (c8g.16xlarge, warm cache, from --profile):
+     *
+     *   fill      the first slice's read, which by definition overlaps nothing.
+     *             Reading is single-threaded and flat at 4.83 ms/Mbase at every -t.
+     *   stalls    while step 1 computes slice k the reader must deliver slice k+1,
+     *             so growth of r stalls unless r <= (compute s/base)/(read s/base).
+     *             Compute is 31.5 / 15.4 / 7.87 ms/Mbase at -t 16 / 32 / 64, so
+     *             that ceiling is 6.5 / 3.2 / 1.63 -- it FALLS as threads are
+     *             added, because only compute scales.
+     *   overhead  every extra slice is one more kt_for pass over the pipeline:
+     *             0.0351 / 0.0498 / 0.0689 s per slice at -t 16 / 32 / 64,
+     *             measured from Sproc_wall against ramp slice count.
+     *
+     * Those pull in opposite directions and the third is easy to forget: at low
+     * -t stalls are impossible and overhead rules, so few large slices win; at
+     * high -t the stall ceiling binds and the ratio must stay under it.
+     *
+     * A cost model over those three terms suggested r=1.80, and measurement
+     * refused it: at -t 64 that is ABOVE the 1.63 ceiling, and the run sat right on
+     * the cliff -- mid-run stall 0.109 s on one rep and 0.614 s on the next, with a
+     * 0.54 s PROCESS spread. The model under-predicts stalls near the ceiling, so
+     * the ratio stays at 1.6, under it.
+     *
+     * Measured in one binary, three shapes selected by the env knobs, 3 reps
+     * interleaved, warm cache, warmup discarded, EVERY arm writing SAM to a real
+     * file (head / mid / overhead from --profile; ramp = slice count):
+     *
+     *    -t   shape                 ramp    head     mid    ovhd    PROCESS
+     *    16   fractional, r=2.0        7   0.018   0.000   0.211   86.44
+     *    16   fractional, r=1.6        6   0.051   0.000   0.175   86.51
+     *    16   absolute 16 Mb, r=1.6    5   0.081   0.000   0.140   86.50
+     *    32   fractional, r=2.0        7   0.034   0.000   0.299   44.45
+     *    32   fractional, r=1.6        6   0.099   0.000   0.249   44.47
+     *    32   absolute 16 Mb, r=1.6    6   0.087   0.000   0.249   44.49
+     *    64   fractional, r=2.0        7   0.066   0.416   0.413   23.99
+     *    64   fractional, r=1.6        6   0.199   0.000   0.345   23.62
+     *    64   absolute 16 Mb, r=1.6    7   0.095   0.018   0.413   23.61
+     *
+     * The ratio is what buys wall time: at -t 64 it takes the mid-run stall from
+     * 0.416 s to zero, -1.5% end to end. It costs 0.06-0.07 s (0.07%) at -t 16/32,
+     * where no stall was possible to begin with.
+     *
+     * The absolute first slice is a WASH on this input at every rung -- -0.005 /
+     * -0.012 / -0.017 s in the ramp terms, and inside the run-to-run spread end to
+     * end. It is here for what the table shows about how the fractional form
+     * SCALES, not for a speedup. Sizing the first slice as task_size/ratio^depth
+     * makes it grow with -t, because task_size is chunk_size * n_threads, and the
+     * measured head fill tracks that exactly: 0.051 -> 0.099 -> 0.199 s across
+     * -t 16 -> 32 -> 64, doubling with every rung. The absolute form is flat at
+     * 0.081 -> 0.087 -> 0.095 s. Extending the same arithmetic, -t 128 would open
+     * a 1280 Mbase cohort with a 76 Mbase slice and ~0.37 s of wholly unhidden
+     * fill. Fill and overhead are both absolute costs, so nothing about the right
+     * first slice scales with the cohort; the fractional form only looked free
+     * because it was never measured above -t 64.
+     *
+     * The honest cost of pinning it: at -t 64 the absolute slice needs one extra
+     * ramp slice (7 vs 6), and that +0.068 s of kt_for overhead eats most of the
+     * 0.104 s of head fill it saves. That trade gets better with -t, since fill
+     * would keep doubling while the per-slice cost does not.
+     *
+     * Deriving the ratio at run time from the ramp's own slices was implemented
+     * and rejected. Beyond a sign error, it is not robust: the estimate must come
+     * from the small early slices, which under-report compute throughput because
+     * fixed kt_for costs dominate, and its outcome at -t 64 flips sign on whether
+     * step 1 is one or two slices behind step 0 -- a scheduling artifact, not
+     * something a policy can pin. A fixed pair is deterministic and measured
+     * better. */
+    double       cohort_ramp_ratio         = cohort_ramp_ratio_default;
+    int64_t      cohort_ramp_first         = cohort_ramp_first_default;
 
     mem_opt_t    *opt, opt0;
     gzFile        fp = 0, fp2 = 0;
@@ -1576,6 +1783,8 @@ int main_mem(int argc, char *argv[])
         OPT_COMPAT,
         OPT_CHUNK_CAP,
         OPT_COHORT_SLICES,
+        OPT_COHORT_RAMP_RATIO,
+        OPT_COHORT_RAMP_FIRST,
 #ifdef STAGE_PROF
         OPT_PROFILE,
 #endif
@@ -1592,6 +1801,8 @@ int main_mem(int argc, char *argv[])
         {"extend-mate-concordant",   optional_argument, 0, OPT_EXTEND_MATE_CONCORDANT},
         {"chunk-cap",                required_argument, 0, OPT_CHUNK_CAP},
         {"cohort-slices",            required_argument, 0, OPT_COHORT_SLICES},
+        {"cohort-ramp-ratio",        required_argument, 0, OPT_COHORT_RAMP_RATIO},
+        {"cohort-ramp-first",        required_argument, 0, OPT_COHORT_RAMP_FIRST},
         {"meth",                     optional_argument, 0, OPT_METH},
         {"meth-scoring",             required_argument, 0, OPT_METH_SCORING},
         {"set-as-failed",            required_argument, 0, OPT_METH_SET_AS_FAILED},
@@ -1858,18 +2069,13 @@ int main_mem(int argc, char *argv[])
              * means "no cap". A typo would therefore silently change the batch
              * size, which is the exact class of invisible batching change this
              * option exists to make explicit. */
-            char *end = NULL;
-            errno = 0;
-            long long v = strtoll(optarg, &end, 10);
-            if (end == optarg || end == NULL || *end != '\0' ||
-                errno == ERANGE || v < 0) {
+            if (parse_bounded_i64(optarg, 0, INT64_MAX, &chunk_cap) != 0) {
                 fprintf(stderr, "ERROR: --chunk-cap requires a non-negative "
                                 "integer number of bases (0 = off), got '%s'\n", optarg);
                 free(opt);
                 if (out_opened) fclose(aux.fp);
                 return 1;
             }
-            chunk_cap = (int64_t)v;
             chunk_cap_set = 1;
         }
         else if (c == OPT_COHORT_SLICES) {
@@ -1880,11 +2086,7 @@ int main_mem(int argc, char *argv[])
              * ramp shift is clamped there anyway, so a larger value is
              * indistinguishable from it and asking for it is a mistake worth
              * naming. */
-            char *end = NULL;
-            errno = 0;
-            long long v = strtoll(optarg, &end, 10);
-            if (end == optarg || end == NULL || *end != '\0' ||
-                errno == ERANGE || v < 0 || v > COHORT_SLICES_MAX) {
+            if (parse_bounded_i64(optarg, 0, COHORT_SLICES_MAX, &cohort_slices) != 0) {
                 fprintf(stderr, "ERROR: --cohort-slices requires an integer in "
                                 "0..%d (0 = off), got '%s'\n",
                         (int)COHORT_SLICES_MAX, optarg);
@@ -1892,7 +2094,37 @@ int main_mem(int argc, char *argv[])
                 if (out_opened) fclose(aux.fp);
                 return 1;
             }
-            cohort_slices = (int64_t)v;
+        }
+        else if (c == OPT_COHORT_RAMP_RATIO) {
+            /* Validated like the two above. atof() maps anything unparseable to
+             * 0.0, which the `ratio <= 1` guard below then reports as a ratio the
+             * user never asked for and silently replaces with the default -- a
+             * confusing way to learn you made a typo. Only PARSEABILITY is
+             * enforced here; the `<= 1` range check stays where it is, because it
+             * is shared with the env override and is a documented fallback rather
+             * than an error. */
+            if (parse_full_double(optarg, &cohort_ramp_ratio) != 0) {
+                fprintf(stderr, "ERROR: --cohort-ramp-ratio requires a number, "
+                                "got '%s'\n", optarg);
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+        }
+        else if (c == OPT_COHORT_RAMP_FIRST) {
+            /* Validated for the same reason, and this one is the sharpest of the
+             * four: atoll("16M") is 16, which is > 0 and therefore accepted as a
+             * SIXTEEN-BYTE first slice rather than 16 Mbases. That is a silent
+             * ~million-fold error in the option this PR exists to introduce.
+             * --chunk-cap already rejects '100M' for exactly this reason. */
+            if (parse_bounded_i64(optarg, 0, INT64_MAX, &cohort_ramp_first) != 0) {
+                fprintf(stderr, "ERROR: --cohort-ramp-first requires a "
+                                "non-negative integer number of bases "
+                                "(0 = fraction of the batch), got '%s'\n", optarg);
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
         }
         else if (c == OPT_SKIP_CONTAINED_EXT) opt->skip_contained_ext = 1;
         else if (c == OPT_ADAPTIVE_BAND) opt->band_start = ADAPTIVE_BAND_START;
@@ -2664,17 +2896,10 @@ int main_mem(int argc, char *argv[])
          * that work away when the documented default is still correct. */
         const char *cap_env = getenv("BWA_MEM3_CHUNK_CAP");
         if (cap_env && *cap_env) {
-            char *cap_end = NULL;
-            errno = 0;
-            long long env_v = strtoll(cap_env, &cap_end, 10);
-            if (cap_end == cap_env || cap_end == NULL || *cap_end != '\0' ||
-                errno == ERANGE || env_v < 0) {
+            if (parse_bounded_i64(cap_env, 0, INT64_MAX, &cap) != 0)
                 fprintf(stderr, "WARNING: BWA_MEM3_CHUNK_CAP='%s' is not a "
                                 "non-negative integer; ignoring it and using "
                                 "chunk cap %lld\n", cap_env, (long long)cap);
-            } else {
-                cap = (int64_t)env_v;
-            }
         }
         int64_t scaled = (int64_t)opt->chunk_size * (int64_t)opt->n_threads;
         aux.task_size = (cap > 0 && scaled > cap) ? cap : scaled;
@@ -2689,8 +2914,9 @@ int main_mem(int argc, char *argv[])
      * pipeline has nothing to chew on until it lands -- and with the cap now
      * opt-in that first read is `chunk_size * n_threads` bases, the largest
      * single unhidden cost in the run. Reading the FIRST cohort as a geometric
-     * ramp lets compute start on the first slice -- task/64 at the default
-     * cohort_slices = 6 -- while the rest is still arriving.
+     * ramp lets compute start on the first slice -- cohort_ramp_first bases,
+     * 16 Mbase by default, independent of -t -- while the rest is still
+     * arriving.
      *
      * This does not move the cohort boundary, so mem_pestat sees exactly the
      * read set it would have seen otherwise and the output is unchanged. See
@@ -2708,17 +2934,10 @@ int main_mem(int argc, char *argv[])
          * was set to configure. An empty value leaves the CLI/default alone. */
         const char *cs_env = getenv("BWA_MEM3_COHORT_SLICES");
         if (cs_env && *cs_env) {
-            char *cs_end = NULL;
-            errno = 0;
-            long long cs_v = strtoll(cs_env, &cs_end, 10);
-            if (cs_end == cs_env || cs_end == NULL || *cs_end != '\0' ||
-                errno == ERANGE || cs_v < 0 || cs_v > 20) {
+            if (parse_bounded_i64(cs_env, 0, COHORT_SLICES_MAX, &slices) != 0)
                 fprintf(stderr, "WARNING: BWA_MEM3_COHORT_SLICES='%s' is not an "
-                                "integer in 0..20; ignoring it and using %lld\n",
-                        cs_env, (long long)slices);
-            } else {
-                slices = (int64_t)cs_v;
-            }
+                                "integer in 0..%d; ignoring it and using %lld\n",
+                        cs_env, (int)COHORT_SLICES_MAX, (long long)slices);
         }
         /* -p re-derives pairing from adjacency across the WHOLE array
          * (bseq_classify carries has_last state), so a slice boundary between
@@ -2742,6 +2961,62 @@ int main_mem(int argc, char *argv[])
         if (aux.cohort_slice_all && aux.cohort_slices > 0)
             fprintf(stderr, "[M::%s] BWA_MEM3_COHORT_SLICE_ALL set: slicing every "
                     "cohort (stress mode; slower)\n", __func__);
+
+        /* Ramp growth ratio. Env override for sweeps, as with the slice count.
+         * A ratio at or below 1 would shrink the ramp rather than grow it, so it
+         * cannot reach the cohort at all; that is user error, not a mode, and the
+         * default is restored rather than reading the input in equal dribbles. */
+        double ramp_ratio = cohort_ramp_ratio;
+        const char *rr_env = getenv("BWA_MEM3_COHORT_RAMP_RATIO");
+        if (rr_env && *rr_env) {
+            /* Parsed exactly like --cohort-ramp-ratio, and for the same reason:
+             * atof() accepts a prefix, so '1.5x' silently becomes 1.5 and
+             * 'abc' becomes 0.0. The 0.0 case would at least surface via the
+             * `<= 1` guard below, but as a ratio the user never typed. Only
+             * PARSEABILITY is checked here -- the `<= 1` range check stays
+             * below, shared with the CLI value, because it is a documented
+             * fallback rather than an error. */
+            if (parse_full_double(rr_env, &ramp_ratio) != 0)
+                fprintf(stderr, "WARNING: BWA_MEM3_COHORT_RAMP_RATIO='%s' is not "
+                                "a number; ignoring it and using %.2f\n",
+                        rr_env, ramp_ratio);
+        }
+        /* Spelled as the negation of the ACCEPT condition, not `<= 1.0`, so NaN
+         * lands here too: strtod("nan") parses cleanly and every comparison
+         * against NaN is false, so `<= 1.0` would wave it through as a valid
+         * ratio. It would then poison the ramp -- prev * NaN is NaN, which is
+         * neither >= task_size nor convertible to int64_t, putting the ramp back
+         * on the undefined conversion the saturation in the read step exists to
+         * avoid. A ratio that cannot grow the ramp is user error either way. */
+        if (!(ramp_ratio > 1.0)) {
+            fprintf(stderr, "[M::%s] a cohort ramp ratio of %.3f would never grow "
+                    "the ramp to the cohort; using %.2f\n",
+                    __func__, ramp_ratio, cohort_ramp_ratio_default);
+            ramp_ratio = cohort_ramp_ratio_default;
+        }
+        aux.cohort_ramp_ratio = ramp_ratio;
+
+        /* First-slice size, also env-overridable for sweeps. 0 selects the old
+         * fractional shape (task_size / ratio^depth), which is what makes an
+         * exact A/B against the pre-absolute behaviour possible; negative is
+         * meaningless, so it is treated as 0 rather than silently clamped. */
+        int64_t ramp_first = cohort_ramp_first;
+        const char *rf_env = getenv("BWA_MEM3_COHORT_RAMP_FIRST");
+        if (rf_env && *rf_env) {
+            /* Validated exactly like --cohort-ramp-first. Without this, the env
+             * spelling reintroduces the bug the flag's validation exists to
+             * prevent: atoll("16M") is 16, a positive value, so
+             * BWA_MEM3_COHORT_RAMP_FIRST=16M would silently request a SIXTEEN
+             * BYTE first slice instead of 16 Mbases. Non-fatal here, unlike the
+             * flag, because the index is already loaded by this point -- same
+             * choice BWA_MEM3_CHUNK_CAP and BWA_MEM3_COHORT_SLICES make above. */
+            if (parse_bounded_i64(rf_env, 0, INT64_MAX, &ramp_first) != 0)
+                fprintf(stderr, "WARNING: BWA_MEM3_COHORT_RAMP_FIRST='%s' is not "
+                                "a non-negative integer number of bases; ignoring "
+                                "it and using %lld\n",
+                        rf_env, (long long)ramp_first);
+        }
+        aux.cohort_ramp_first = ramp_first > 0 ? ramp_first : 0;
     }
 
     /* Pipeline depth. The 3-step pipeline (read / process / write) is gated by
