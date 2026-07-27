@@ -524,29 +524,41 @@ jobs:
           restore-keys: |
             ccache-${{ runner.arch }}-${{ env.MAKE_ARCH }}-n${{ env.NATIVE_ISA }}-
 
-      - name: Build + run kswv unit test
+      - name: Build + run kswv unit test (all host-reachable SIMD tiers)
         # Builds the doctest-based test/bwa_mem3_tests_unit binary via the
         # parent `test-binaries` target so ARCH_FLAGS_FROM_PARENT plumbing
         # propagates and the test TU sees the same __AVX2__ / __AVX512BW__
         # / NEON surface libbwa was built with.
+        #
+        # bwa-mem3 itself is built too, purely as the tier oracle: its version
+        # banner is the only thing that reliably reports which tier a given
+        # BWAMEM3_FORCE_TIER actually selected (an unreachable request is
+        # ignored, not refused). Incremental on top of libbwa.a -- one compile
+        # and a link. See .github/scripts/kswv-tier-sweep.sh for the rest.
+        #
+        # Sweeping matters because a single run only ever exercises ONE tier,
+        # and which one was decided by whichever runner we landed on. The
+        # kernels differ per tier by construction, and avx512bw is one of the
+        # two that carried the #290 padding bug.
         run: |
           mkdir -p /tmp/ci-out
           ccache --zero-stats >/dev/null
           make arch="$MAKE_ARCH" CXX="ccache g++" CC="ccache gcc" test-binaries
-          ./test/bwa_mem3_tests_unit --test-suite="unit/kswv" \
-            --reporters=junit \
-            --out=/tmp/ci-out/kswv-unit-${{ matrix.arch }}.xml \
-            2>&1 | tee /tmp/selftest.log
-          status=${PIPESTATUS[0]}
-          tail -25 /tmp/selftest.log >> "$GITHUB_STEP_SUMMARY"
-          exit $status
+          make arch="$MAKE_ARCH" CXX="ccache g++" CC="ccache gcc" bwa-mem3
+          BWA_MEM3=./bwa-mem3 \
+          TEST_BIN=./test/bwa_mem3_tests_unit \
+          OUT_DIR=/tmp/ci-out \
+          ARCH_LABEL=${{ matrix.arch }} \
+            bash .github/scripts/kswv-tier-sweep.sh
 
-      - name: Upload kswv unit test JUnit report
+      - name: Upload kswv unit test JUnit reports
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: kswv-unit-${{ matrix.arch }}
-          path: /tmp/ci-out/kswv-unit-${{ matrix.arch }}.xml
+          # One XML per tier that ran (kswv-unit-<arch>-<tier>.xml), so the
+          # artifact set itself records which tiers were covered.
+          path: /tmp/ci-out/kswv-unit-${{ matrix.arch }}-*.xml
           if-no-files-found: warn
           retention-days: 1
 
