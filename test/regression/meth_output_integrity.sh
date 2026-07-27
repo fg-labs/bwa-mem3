@@ -21,6 +21,13 @@
 #     complement of the input read with a consistent CIGAR length (no S1
 #     inconsistent-BAM); samtools quickcheck passes.
 #
+#  4. MQ:i / HN:i tag-set parity with the non-meth writer. src/meth_bam.cpp is a
+#     second BAM emitter alongside src/bam_writer.cpp, and a --meth BAM must not
+#     be a subset of a non-meth one: a record whose mate is mapped carries MQ:i
+#     equal to that mate's MAPQ, and a mapped record carries HN:i equal to its
+#     XA hit count. Checked on a pair with asymmetric MAPQ and asymmetric hit
+#     counts, so both tags are pinned to a value and not merely to presence.
+#
 # Inputs:
 #   BWA_MEM3 — path to the bwa-mem3 binary under test
 set -euo pipefail
@@ -98,4 +105,50 @@ read -r rev seq cig < <(samtools view seq.bam | mawk '(int($2/128)%2)==1{print (
 [ "${#seq}" = "60" ]       || fail "SEQ orient: SEQ length ${#seq}, want 60 (CIGAR consistency)"
 [ "$seq" = "$SEQ_R2_RC" ]  || fail "SEQ orient: reverse-mate SEQ is not revcomp(input read)"
 
-echo "PASS: meth_output_integrity (real-SNP vs conversion in AS/NM/MD; Bismark four-strand XR/XG; reverse SEQ orientation)"
+# --- 4. MQ:i / HN:i parity with the non-meth writer ------------------------
+# The fixture is deliberately ASYMMETRIC on both tags: chrB repeats chrA:241-420,
+# which contains R2's locus, so R2 has two equally good hits (MAPQ 0, one XA hit)
+# while R1 stays unique (MAPQ 60, no XA hits). That pins both tags to a VALUE
+# rather than to presence — a writer emitting the record's own MAPQ as MQ:i would
+# survive a symmetric MAPQ-60 pair, and an HN:i wired to a constant 0 would
+# survive a fixture with no repeats. Neither survives this one.
+#
+# The MAPQ preconditions are asserted first so that a future scoring change which
+# flattens the asymmetry is reported as a stale fixture rather than passing
+# vacuously.
+printf '>chrA\n%s\n>chrB\n%s\n' "$REF" "${REF:240:180}" > dup.fa
+"$BWA_MEM3" index --meth dup.fa >/dev/null 2>&1 || fail "dup index --meth nonzero exit"
+"$BWA_MEM3" mem --meth --meth-scoring genomic -t 1 dup.fa f1.fq f2.fq > dup.bam 2>/dev/null \
+    || fail "dup mem --meth nonzero exit"
+samtools quickcheck dup.bam || fail "dup invalid BAM"
+
+mq_hn() { # $1 bam  $2 mate flag bit -> "MAPQ MQ HN"
+    samtools view "$1" | mawk -v bit="$2" '
+        (int($2/bit)%2)==1 {
+            mq = ""; hn = ""
+            for (i = 12; i <= NF; i++) {
+                if ($i ~ /^MQ:i:/) mq = substr($i, 6)
+                if ($i ~ /^HN:i:/) hn = substr($i, 6)
+            }
+            print $5, mq, hn
+            exit
+        }'
+}
+read -r mapq1 mq1 hn1 < <(mq_hn dup.bam 64)
+read -r mapq2 mq2 hn2 < <(mq_hn dup.bam 128)
+[ "$mapq1" = "60" ] || fail "MQ/HN: stale fixture — R1 MAPQ $mapq1, want 60 (unique locus)"
+[ "$mapq2" = "0" ]  || fail "MQ/HN: stale fixture — R2 MAPQ $mapq2, want 0 (locus duplicated on chrB)"
+# Non-empty first, so an absent tag is reported as absent rather than as a value
+# mismatch against the empty string.
+[ -n "$mq1" ] || fail "MQ/HN: R1 has no MQ:i (the non-meth BAM writer emits it)"
+[ -n "$mq2" ] || fail "MQ/HN: R2 has no MQ:i (the non-meth BAM writer emits it)"
+[ "$mq1" = "$mapq2" ] || fail "MQ/HN: R1 MQ:i $mq1, want R2's MAPQ $mapq2 (not R1's own $mapq1)"
+[ "$mq2" = "$mapq1" ] || fail "MQ/HN: R2 MQ:i $mq2, want R1's MAPQ $mapq1 (not R2's own $mapq2)"
+# HN counts the hits XA enumerates: 0 for the unique mate, 1 for the mate whose
+# locus is duplicated on chrB.
+[ -n "$hn1" ] || fail "MQ/HN: R1 has no HN:i (the non-meth BAM writer emits it)"
+[ -n "$hn2" ] || fail "MQ/HN: R2 has no HN:i (the non-meth BAM writer emits it)"
+[ "$hn1" = "0" ] || fail "MQ/HN: R1 HN:i $hn1, want 0 (unique mapper, no XA hits)"
+[ "$hn2" = "1" ] || fail "MQ/HN: R2 HN:i $hn2, want 1 (the chrA copy of the duplicated locus)"
+
+echo "PASS: meth_output_integrity (real-SNP vs conversion in AS/NM/MD; Bismark four-strand XR/XG; reverse SEQ orientation; MQ:i/HN:i tag parity)"
