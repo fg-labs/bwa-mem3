@@ -22,3 +22,8 @@ matrix row; the rest run on the canonical AVX2 row only. Each script:
 Each script reads its inputs from environment variables — see the comment
 block at the top of each file. `.github/workflows/ci.yml` sets those vars
 and invokes the scripts.
+
+One exception to "any binary will do": `profile_slice_cpu.sh` asserts on
+`--profile` output, which a default build compiles out entirely, so it needs a
+binary from `make STAGE_PROF=1`. It fails loudly rather than skipping if handed
+one without `--profile`, and CI runs it from the `profiling-build` job.
