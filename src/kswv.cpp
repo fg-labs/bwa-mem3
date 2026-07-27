@@ -638,8 +638,31 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
      * len2 = qe + 1 per pair (bwamem_pair.cpp:875): those groups are ragged
      * whatever the input lengths were, so jsplit < ncol and the per-cell range
      * covers most of the row. The measured phase-0 parity therefore does not
-     * carry over to phase 1, and bwa-bsw-bench cannot see it -- that harness
-     * only ever calls getScores* with phase 0.
+     * carry over to phase 1.
+     *
+     * That cost is now MEASURED, not just predicted: bwa-bsw-bench drives phase 1
+     * and times it separately (its rescue mode prints a phase-1 table alongside
+     * phase 0), and on quiet cloud hosts the per-cell range costs phase-1 8-bit
+     * throughput -7.2% at qlen 100 and -4.3% at qlen 150 on avx512bw, and
+     * -2.1% / -1.4% on Graviton4 NEON. Phase 0 is at parity on every tier, as
+     * this fast path intends.
+     *
+     * Two cross-checks fall out of that, and both hold, which is what makes the
+     * attribution to THIS range rather than something ambient:
+     *   - avx2 measures ~0 (-0.8% / +0.5%, i.e. noise). It must: avx2 never had
+     *     the hoist to restore, so the fix did not change its code at all (see
+     *     the register-pressure note in the avx2 kernel below).
+     *   - the cost vanishes at qlen 250 (+0.5% avx512bw, -0.0% NEON), where the
+     *     router picks the 16-bit kernel, which this hoist does not touch.
+     *
+     * The lever, if that ever matters: sort a phase-1 batch by len2 so each lane
+     * group's quanta agree and jsplit returns to ncol. bwamem.cpp:3462 already
+     * does precisely this for the extend path (sortPairsLen with key_by_max,
+     * "so ncol/minq are tight"), and it is byte-identical there because results
+     * scatter back by regid. Not done here because the end-to-end payoff is
+     * projected below the +/-0.5% noise floor: kswv is ~31% of mem CPU and phase 1
+     * is a fraction of that, and EXT-13 -- the same technique -- was predicted at
+     * 1-3% and measured -0.19%.
      * Dummy tail lanes carry len1 == len2 == 0, pinning both to 0 for
      * a partial final group: no fast path, still correct. */
     int minLen1 = p[0].len1, jsplit = ncol;
