@@ -120,17 +120,20 @@ KSORT_INIT(mem_intv1, SMEM, intv_lt1)  // debug
  *     as a diagonal offset d = j - i in [-w, +w], which fits signed int8
  *     only for w <= 127. The default opt->w = 100 qualifies; wide-band
  *     retries (w doubling to 200/400/800) do NOT and fall back to 16-bit.
- *   - zdrop + maxStep <= 253      : keeps the re-baseline window non-empty,
- *     REBASE_HI = 255 - maxStep > REBASE_KEEP = zdrop + 1. The DP body AND the
- *     h0-prefix column/row seed (smithWaterman*_8 setup) are both unsigned-
- *     saturating [0,255], so the seeded byte h0' = min(h0, REBASE_KEEP) only
- *     needs to fit a uint8. maxStep is the largest per-step score increment,
+ *   - zdrop + maxStep <= 253      : zdrop is broadcast into the DP as a byte
+ *     (_mm256_set1_epi8), so it must fit one, and the maxStep headroom keeps the
+ *     z-drop comparison from wrapping at the top of the range. The DP body AND
+ *     the h0-prefix column/row seed (smithWaterman*_8 setup) are both unsigned-
+ *     saturating [0,255], and the seed is the raw h0 clamped to uint8 (the old
+ *     min(h0, zdrop+1) prefix clamp went away with the re-baseline floor).
+ *     maxStep is the largest per-step score increment,
  *     max(w_match, w_ambig, 1) = max(opt->a, 1).
- *   - h0 <= zdrop + 1             : keeps the initial floor B0 = max(0, h0 -
- *     REBASE_KEEP) == 0, so the seed score does not itself force a re-baseline.
  *   - h0 + min(len1,len2)*a < 255 - maxStep : the MAX ATTAINABLE score (seed
- *     plus an all-match diagonal over the shorter sequence) stays below REBASE_HI,
- *     so the running row max never reaches it and re-baseline never fires.
+ *     plus an all-match diagonal over the shorter sequence) stays below the byte
+ *     ceiling, so no row max can ever reach it. This is also what bounds h0
+ *     itself, which is why there is no separate h0 gate: the former
+ *     h0 <= zdrop + 1 condition existed to zero the removed re-baseline floor
+ *     and was dropped in EXT-4 (see bsw8_envelope_ok below).
  *
  * NOTE: minval (= h0 + min(len)*a) is still used by sortPairsLenExt as the
  * counting-sort bin index (hist[minval]) and must stay < MAX_SEQ_LEN8 there for
@@ -138,13 +141,17 @@ KSORT_INIT(mem_intv1, SMEM, intv_lt1)  // debug
  * decision. Pairs failing this envelope fall through to the existing 16-bit
  * (then scalar) buckets exactly as before. */
 #define BSW8_MAX_W 127                 /* max band: diagonal offset d=j-i must fit signed int8 */
-#define BSW8_MAX_ZDROP_STEP 253        /* keep the re-baseline window non-empty:
-                                          REBASE_HI=255-max_step > REBASE_KEEP=zdrop+1, i.e.
-                                          zdrop+max_step <= 253. The DP body AND the h0-prefix
-                                          column/row seed in the 8-bit wrappers are both
-                                          unsigned-saturating [0,255], so the seed byte
-                                          min(h0,REBASE_KEEP) just needs to fit a uint8.
-                                          See smithWaterman128_8 re-baseline + h0-prefix seed. */
+#define BSW8_MAX_ZDROP_STEP 253        /* zdrop is broadcast into the DP as a byte
+                                          (_mm256_set1_epi8), so it must fit one, and the
+                                          max_step headroom keeps the z-drop comparison from
+                                          wrapping: zdrop+max_step <= 253. The DP body AND the
+                                          h0-prefix column/row seed in the 8-bit wrappers are
+                                          both unsigned-saturating [0,255], and the seed is the
+                                          raw h0 clamped to uint8. NOTE: the 253 value dates from
+                                          the re-baseline era, where it also kept
+                                          255-max_step > zdrop+1; with re-baseline gone that
+                                          second role is moot, so this bound is now conservative
+                                          rather than tight. See smithWaterman128_8 h0-prefix seed. */
 
 static inline int bsw8_envelope_ok(int len1, int len2, int w,
                                    int score_a, int zdrop, int h0)
@@ -167,9 +174,10 @@ static inline int bsw8_envelope_ok(int len1, int len2, int w,
     int64_t max_step = score_a > 1 ? (int64_t)score_a : 1;   /* max(w_match, w_ambig, 1) */
     int64_t shorter  = len1 < len2 ? (int64_t)len1 : (int64_t)len2;
     /* Max attainable SW score: seed h0 plus an all-match diagonal over the
-     * shorter sequence. Must stay strictly below REBASE_HI = 255 - max_step so
-     * the running row max never triggers a (lossy) re-baseline; combined with
-     * h0 <= zdrop+1 (B0 == 0) the kernel runs as an exact unsigned [0,255] SW. */
+     * shorter sequence. Must stay strictly below the byte ceiling 255 - max_step
+     * so no row max can ever reach it; that alone makes the kernel an exact
+     * unsigned [0,255] SW, and since h0 <= max_score it also bounds the seed
+     * byte, so no separate h0 gate is needed. */
     int64_t max_score = (int64_t)h0 + shorter * (int64_t)score_a;
     return len1 < MAX_SEQ_LEN8 && len2 < MAX_SEQ_LEN8 &&
            /* target (rows, len1) >= query (cols, len2). The re-baseline 8-bit
@@ -185,7 +193,20 @@ static inline int bsw8_envelope_ok(int len1, int len2, int w,
            len1 >= len2 &&
            w <= BSW8_MAX_W &&
            zdrop + max_step <= BSW8_MAX_ZDROP_STEP &&
-           h0 <= zdrop + 1 &&
+           /* EXT-4: the former `h0 <= zdrop + 1` gate has been dropped. It was
+            * introduced to force the per-lane re-baseline floor B0 = max(0, h0 -
+            * (zdrop+1)) to zero; that re-baseline machinery was removed (the 8-bit
+            * DP is now a plain unsigned [0,255] SW), so h0's only remaining
+            * constraint is that the seed byte fit a uint8 — guaranteed by the
+            * max_score bound below (h0 <= max_score < 255 - max_step). A second,
+            * subtler role — bounding the seed against the z-drop horizon so a
+            * high-h0 lane does not z-drop before its row max builds up — was fixed
+            * in the kernel by #273 (correct 8-bit z-drop/seed clamp at high seed
+            * scores). getScores8 is now byte-identical to scalarBandedSWA across
+            * the newly-admitted h0 > zdrop+1 region for the default, moderate, and
+            * harsh scoring sweeps (see test/bandedswa_high_h0_zdrop_test.cpp).
+            * Admitting these pairs moves ~7.41% of Illumina extension pairs from
+            * the 8-lane 16-bit tier to the 16-lane 8-bit tier. */
            max_score < 255 - max_step;
 }
 

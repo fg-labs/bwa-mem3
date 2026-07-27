@@ -160,6 +160,8 @@ int main() {
         {2, 8, 12, 2,  20, 100, "-A2 -B8 -O12 -E2 zdrop=20"},
         {3, 4,  6, 1,  20, 100, "-A3 zdrop=20"},
         {1, 4,  6, 1,  10,  20, "defaults zdrop=10 narrow band"},
+        {1, 9, 16, 3, 100, 100, "-B9 -O16 -E3 zdrop=100 (harsh probe)"},
+        {2, 20, 30, 5, 20, 100, "-A2 -B20 -O30 -E5 zdrop=20 (very harsh probe)"},
     };
     const long n = 20000;
 
