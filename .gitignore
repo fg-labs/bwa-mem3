@@ -1,5 +1,6 @@
 *.o
 *.a
+*.d
 *.dSYM
 .*.swp
 a.out
@@ -7,6 +8,23 @@ bwa-mem2
 bwa-mem2.*
 !docs/src/related-projects/bwa-mem2.md
 src/version.h
+
+# Build outputs, all produced at the repo root. Anchored with a leading slash so
+# they cannot shadow same-named docs pages the way bwa-mem2.* would without the
+# negation above.
+/bwa-mem3
+/bwa-mem3.arm64
+
+# Standalone test and benchmark binaries (see the `clean` targets in Makefile
+# and test/Makefile). /*_test covers the doctest and regression binaries; the
+# rest do not fit that suffix.
+/*_test
+/fast_reader_selftest
+/fr_fastq_bench
+
+# doctest suites built by test/Makefile
+/test/bwa_mem3_tests_unit
+/test/bwa_mem3_tests_integration
 *.gcno
 *.gcda
 coverage.info
