@@ -134,10 +134,31 @@ bool libsais_sa_is_64bit(int64_t N) {
 }
 
 int64_t libsais_estimate_peak_bytes(int64_t N) {
-    // Per-base preflight headroom: 6 B/base (int32) / 12 B/base (int64) covers
-    // measured peaks on chr22 and chr1-6 with margin for libsais aux arrays and
-    // OMP/mimalloc overhead on small inputs.
-    return (N + 1) * (libsais_sa_is_64bit(N) ? 12 : 6);
+    // Per-base cost, calibrated against measured peak RSS rather than derived
+    // from the buffer arithmetic alone (buf is 1 B/base, the SA 4 or 8, and
+    // libsais's aux arrays plus the OMP/allocator arenas add the rest).
+    //
+    // Two properties have to hold, and the second is the binding one because
+    // `index --meth` runs two builds in one process -- the original over
+    // N = 2*l_pac, then a seed over 4*l_pac -- and does not return the first
+    // build's memory before the second starts. So the estimate for a build must
+    // also cover a --meth invocation whose *dominant* build is that size.
+    //
+    // Worst measured cost per base of N, over a size ladder from chr17 (0.08
+    // Gbp) to chr1-9 (1.67 Gbp) on a 64 GiB 12-core host:
+    //
+    //             single build   --meth process   estimate   margins
+    //   int32 SA      5.90 B         7.07 B          8         1.36 / 1.13
+    //   int64 SA      9.84 B        10.04 B         12         1.22 / 1.20
+    //
+    // The int32 constant was 6, i.e. only 1.02x over a single build's own peak
+    // and *below* the --meth process peak -- so a small-reference `--meth` build
+    // could exceed its budget by ~17% while every individual estimate cleared
+    // it. int64's 1.22x margin already absorbed the same carry-over, which is
+    // why the defect was confined to the int32 path. 8 restores a comparable
+    // margin; no --meth-specific term is needed, and none is wanted, since the
+    // carry-over measures as bounded rather than proportional.
+    return (N + 1) * (libsais_sa_is_64bit(N) ? 12 : 8);
 }
 
 void libsais_report_budget_shortfall(const char* what, int64_t need_bytes,

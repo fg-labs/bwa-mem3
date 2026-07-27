@@ -12,7 +12,8 @@
 // estimate (12 B/base over a doubled 6.43 Gbase text = 71.9 GiB) lost to a
 // 32 GiB budget on every host, including a 256 GiB server. The thresholds below
 // are derived from the constants themselves — INT32_MAX - 10000 for the SA-width
-// switch, 6/12 B/base for the cost — not recorded from a run.
+// switch, 8/12 B/base for the cost — plus, in the last two cases, peak-RSS
+// figures recorded from real builds.
 //
 // `N` throughout is the DOUBLED text length (2 * l_pac), which is what libsais
 // is handed; a `--meth` seed index doubles it again (4 * l_pac).
@@ -41,14 +42,15 @@ TEST_CASE("libsais_sa_is_64bit: switches exactly at INT32_MAX - 10000") {
     CHECK(libsais_sa_is_64bit(0) == false);
 }
 
-TEST_CASE("libsais_estimate_peak_bytes: 6 B/base int32, 12 B/base int64") {
-    CHECK(libsais_estimate_peak_bytes(1000) == 1001 * 6);
+TEST_CASE("libsais_estimate_peak_bytes: 8 B/base int32, 12 B/base int64") {
+    CHECK(libsais_estimate_peak_bytes(1000) == 1001 * 8);
     CHECK(libsais_estimate_peak_bytes(kSwitchPoint) == (kSwitchPoint + 1) * 12);
-    // Crossing the width switch makes the estimate jump, not grow smoothly.
+    // Crossing the width switch makes the estimate jump, not grow smoothly:
+    // 8 -> 12 B/base, so a one-base increase costs 1.5x.
     const int64_t below = libsais_estimate_peak_bytes(kSwitchPoint - 2);
     const int64_t above = libsais_estimate_peak_bytes(kSwitchPoint - 1);
     CHECK(above > below);
-    CHECK(above >= below * 2);
+    CHECK(above == doctest::Approx((double)below * 1.5).epsilon(0.001));
 }
 
 TEST_CASE("libsais_estimate_peak_bytes: hg38 needs ~72 GiB, well past the old 32 GiB cap") {
@@ -87,4 +89,71 @@ TEST_CASE("libsais_estimate_peak_bytes: a --meth seed costs ~2x its original") {
     const int64_t budget = (c_orig + c_seed) / 2;
     CHECK(c_orig <= budget);
     CHECK(c_seed > budget);
+}
+
+// The estimate is a promise: the build it gates must not exceed it. These are
+// peak-RSS figures MEASURED with /usr/bin/time -l and RSS sampling on one
+// 64 GiB 12-core arm64 host, so they are a floor on the required margin rather
+// than a universal bound -- another host's allocator or thread count can peak
+// higher. They exist to stop the per-base constants being lowered back to a
+// value that real builds overrun, which is exactly what the int32 constant did
+// at 6 B/base.
+namespace {
+
+struct MeasuredPeak {
+    const char* label;
+    int64_t     N;            // doubled text length handed to libsais
+    int64_t     peak_bytes;   // observed peak RSS
+};
+
+// Single builds: `index` on cumulative hg38 slices (and each --meth run's
+// first build, which is an ordinary build of the original reference).
+const MeasuredPeak kSingleBuildPeaks[] = {
+    {"chr17       (int32)",   166514882,   902348800LL},
+    {"chr17 seed  (int32)",   333029764,  1776664576LL},
+    {"chr1        (int32)",   497912844,  2812051456LL},
+    {"chr1-2      (int32)",   982299902,  5185159168LL},
+    {"chr1-3      (int32)",  1378891020,  8129052672LL},
+    {"chr1-4      (int32)",  1759320130, 10151133184LL},
+    {"chr1-5      (int32)",  2122396648, 12057460736LL},
+    {"chr1-6      (int64)",  2464008606, 24248434688LL},
+    {"chr1-7      (int64)",  2782700552, 27249328128LL},
+    {"chr1-8      (int64)",  3072977824, 29934387200LL},
+    {"chr1-9      (int64)",  3349767258, 30999101440LL},
+};
+
+// `index --meth` whole-process peaks, keyed by the SEED build's N (= 4*l_pac),
+// which is the dominant build and therefore what the preflight checks.
+const MeasuredPeak kMethProcessPeaks[] = {
+    {"chr17 --meth  (int32)",  333029764,  2311536640LL},
+    {"chr1 --meth   (int32)",  995825688,  7044399104LL},
+    {"chr1-2 --meth (int32)", 1964599804, 11325145088LL},
+    {"chr1-3 --meth (int64)", 2757782040, 26843906048LL},
+    {"chr1-4 --meth (int64)", 3518640260, 35315105792LL},
+    {"chr1-5 --meth (int64)", 4244793296, 38338084864LL},
+};
+
+} // namespace
+
+TEST_CASE("libsais_estimate_peak_bytes: covers every measured single-build peak") {
+    for (const MeasuredPeak& m : kSingleBuildPeaks) {
+        const int64_t est = libsais_estimate_peak_bytes(m.N);
+        CAPTURE(m.label);
+        CAPTURE(est);
+        CAPTURE(m.peak_bytes);
+        CHECK(est > m.peak_bytes);
+    }
+}
+
+TEST_CASE("libsais_estimate_peak_bytes: covers every measured --meth process peak") {
+    // This is the property the old int32 constant broke: the seed build's
+    // estimate has to cover the whole invocation, because the original build's
+    // memory is still resident when the seed build runs.
+    for (const MeasuredPeak& m : kMethProcessPeaks) {
+        const int64_t est = libsais_estimate_peak_bytes(m.N);
+        CAPTURE(m.label);
+        CAPTURE(est);
+        CAPTURE(m.peak_bytes);
+        CHECK(est > m.peak_bytes);
+    }
 }

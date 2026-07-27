@@ -68,7 +68,8 @@ precondition that is checked before the build starts, not a target the builder
 spills to meet. A reference whose estimated requirement exceeds the budget is
 rejected with exit code 3 and a message naming both the `--max-memory` value
 that would clear it and the host RAM that would clear it automatically. Human
-genomes need roughly 12 bytes per base of doubled text — about 72 GB for hg38 —
+genomes need roughly 12 bytes per base of doubled text (8 below ~1.07 Gbp, where
+the suffix array still fits 32-bit entries) — about 72 GB for hg38 —
 so plan on a host with ~76 GB of RAM or more.
 
 ### `--tmp-dir PATH` — scratch directory

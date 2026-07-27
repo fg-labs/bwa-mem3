@@ -121,11 +121,18 @@ typical multi-core host, indexing hg38 takes a few minutes (longer if pinned to 
 single core).
 
 Peak memory is roughly **12 bytes per base of doubled text**, i.e. ~72 GB for
-hg38. `--max-memory` is a precondition checked before the build starts, not a
-spill target: a reference that does not fit the budget is rejected up front
-(exit code 3) rather than built more slowly. Budget hg38 on a host with ~76 GB
-of RAM or more; the rejection message names both the `--max-memory` override
-and the host size that would work without one.
+hg38. Below ~1.07 Gbp the suffix array still fits 32-bit entries and the cost
+drops to ~8 bytes per base. `--max-memory` is a precondition checked before the
+build starts, not a spill target: a reference that does not fit the budget is
+rejected up front (exit code 3) rather than built more slowly. Budget hg38 on a
+host with ~76 GB of RAM or more; the rejection message names both the
+`--max-memory` override and the host size that would work without one.
+
+`--meth` needs about **twice** that, because it builds a second index over a
+per-strand-converted reference whose text is twice as long: ~144 GB estimated for
+hg38, so budget a host with ~152 GB of RAM or more. Both builds run in one
+process and the first does not fully release its memory before the second starts,
+so the per-base figures above already account for that overlap.
 
 bwa-mem3 builds the suffix array with
 [libsais](https://github.com/IlyaGrebnov/libsais), whose OpenMP-parallel
