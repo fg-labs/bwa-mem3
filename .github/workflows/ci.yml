@@ -354,6 +354,26 @@ jobs:
           PIXI_MANIFEST="$GITHUB_WORKSPACE/test/holodeck/pixi.toml" \
           bash test/regression/longread_pe_parity.sh
 
+      - name: SIMD tier parity (avx2 vs avx512bw, chr22)
+        if: matrix.canonical == true
+        # One binary must emit byte-identical SAM whichever usable kernel tier it
+        # dispatches. Scope is avx2/avx512bw: there is no batched kswv kernel
+        # below AVX2 and forcing those tiers aborts the aligner (see the script
+        # header). Cross-build parity is a different property, already covered by
+        # chr22_parity.sh running on the sse41, avx2 and arm64 build jobs.
+        #
+        # On a runner without AVX-512BW there is only one sweepable tier and the
+        # script reports SKIPPED, not PASS — so this step is a no-op there rather
+        # than a false green. It still earns its place: the script had rotted
+        # unrun to the point of aborting on its first tier, and this keeps that
+        # from recurring silently.
+        run: |
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          PARITY_FA=/tmp/chr22/chr22.fa \
+          PARITY_R1=/tmp/chr22-sim/reads.r1.fastq.gz \
+          PARITY_R2=/tmp/chr22-sim/reads.r2.fastq.gz \
+          bash test/regression/all_tiers_parity.sh
+
       - name: Run unit-test harness
         if: matrix.canonical == true || matrix.arch_flag == 'sse41'
         run: |
