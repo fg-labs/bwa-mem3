@@ -17,8 +17,21 @@ peak RSS  ≈  resident index  +  per-batch working set
 
 **Resident index.** The FM-index, packed reference (`.pac`), and related
 structures are loaded once and shared across all threads (there is no per-thread
-copy). For hg38 the resident index baseline is roughly **15 GB**. This is fixed
+copy). For hg38 the resident index baseline is roughly **10.5 GB**. This is fixed
 for a given reference and does not change with `-t` or `-K`.
+
+That figure is measured, not estimated: aligning 1,000 read pairs with `-K 1000000`
+(so the per-batch term is negligible) peaks at **10.57 GiB (11.4 GB)** at `-t 1`. It
+matches the files actually loaded — `.bwt.2bit.64` (9.73 GiB) plus `.pac`
+(0.74 GiB) — which is why it is what it is. The previous figure on this page, 15 GB,
+was `.bwt.2bit.64` **plus `.0123`** (15.73 GiB): the pre-pac-fetch load, superseded by
+the paragraph below.
+
+The *memory* figures on this page are binary (GiB) even where written "GB" — that is
+the convention the old 15 GB figure used, and the aligner's own profiler reports
+mebibytes. The `.0123` **file sizes** are the exception: those are decimal, so the
+~6.4 GB quoted below is the same 5.99 GiB file, stated the way the rest of the
+documentation states it.
 
 `mem` reconstructs the reference bases it needs for scoring and extension
 directly from the packed `.pac` on demand (*pac-fetch*), so the unpacked
@@ -41,7 +54,9 @@ larger.
 **original** reference's packed `.pac` for scoring/extension. The seed FM-index
 is roughly twice the size of a plain FM-index (its contigs are doubled), so the
 resident index for hg38 is on the order of **22 GB** (seed FM-index ~21 GB +
-original `.pac` ~1 GB), versus ~15 GB for a plain alignment.
+original `.pac` ~1 GB), versus ~10.5 GB for a plain alignment. (The `--meth`
+figure is an estimate from the index sizes; unlike the plain figure above it has
+not been re-measured.)
 
 As with plain alignment, the original reference's bases are pac-fetched from its
 `.pac` — the original unpacked `.0123` (~6.4 GB) is **neither built nor loaded**.
@@ -123,8 +138,11 @@ budget like this:
 per-batch budget  ≈  memory cap  −  resident index  −  headroom
 ```
 
-For hg38 under a 22 GB cap, that is roughly `22 − 15 − a couple GB ≈ a few GB`
-for the per-batch working set — not much. The levers, in order of preference:
+For hg38 under a 22 GB cap, that is roughly `22 − 10.5 − a couple GB ≈ 9 GB` for
+the per-batch working set. That is more headroom than this page used to claim,
+because the index baseline was overstated — but note from the grid above that the
+**default** batch at `-t 64` alone wants ~14 GB, so a 22 GB cap still needs `-K`.
+The levers, in order of preference:
 
 1. **Lower `-K`.** `-K 1000000` keeps the per-batch working set well under 1 GB
    for typical short reads and costs little throughput. This is the first thing
@@ -134,7 +152,7 @@ for the per-batch working set — not much. The levers, in order of preference:
    adjusting `-K` first so you keep your cores busy.
 3. **Use `bwa-mem3 shm`** if you run several samples on one host: the index is
    mapped from a shared segment and its pages are shared across processes, so the
-   ~15 GB index is paid once rather than per process. See
+   ~10.5 GB index is paid once rather than per process. See
    [Quick start: shared-memory index](../getting-started/quick-shm.md).
 
 > **Tip — a silent OOM looks like a truncated BAM**
