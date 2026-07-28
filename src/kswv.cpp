@@ -96,6 +96,38 @@ static inline int query_quantum16(int len2) { return ((len2 + 8 - 1) / 8) * 8; }
  * A lane's own inert region therefore starts at query_quantum, and a whole
  * group's starts at the min over its lanes. */
 
+/* First column of a group at which ANY lane can hold the DUMMY5 query pad:
+ *
+ *     min{ len2 : query_quantum8(len2) > len2 }   over the group's lanes
+ *
+ * A lane writes DUMMY5 only on [len2, quantum), so a lane whose len2 is already
+ * a multiple of 16 contributes no such column at all and is skipped. Below the
+ * minimum, the per-cell "is this the query's DUMMY5 tail padding?" test cannot
+ * fire on any lane, so the 8-bit kernels elide it there. This is not a claim
+ * about what that test COMPUTES -- it is that no input below the returned
+ * column can select it, so the bytes written are identical either way.
+ *
+ * `cap` clamps the result to the range the caller actually subdivides: the NEON
+ * and AVX-512BW kernels pass jsplit, because a group can have a jdummy above
+ * jsplit (one lane padding from a long len2 while another has a short
+ * exact-multiple len2) and splitting the expensive range as well would cost
+ * more loop bodies than it saves. The AVX2 kernel has no jsplit range and
+ * passes ncol, which the initial value already satisfies.
+ *
+ * `width` is the caller's lane count rather than SIMD_WIDTH8 directly so the
+ * three kernels share one definition of a derivation the DUMMY5 elision's
+ * correctness rests on -- three hand-maintained copies is how one tier comes to
+ * drift from the others. */
+static inline int compute_jdummy(const SeqPair *p, int width, int ncol, int cap)
+{
+    int jdummy = ncol;
+    for (int l = 0; l < width; l++) {
+        const int len2_l = p[l].len2;
+        if (query_quantum8(len2_l) > len2_l && len2_l < jdummy) jdummy = len2_l;
+    }
+    return jdummy < cap ? jdummy : cap;
+}
+
 /* "No freed cell active on this lane" markers for the freed-cell (--meth)
  * blend, one per kernel width. Each must be a value a query byte can never
  * take, so the blend provably never fires on a lane with no active freed cell:
@@ -117,13 +149,19 @@ static inline int query_quantum16(int len2) { return ((len2 + 8 - 1) / 8) * 8; }
  * diagonal term must be zeroed. Callers pass the hoisted per-row
  * rowboundary512 below jsplit, where no query byte can carry the high bit, and
  * the full per-cell movepi8_mask(or(s1,s2)) from jsplit on. */
-#define MAIN_SAM_CODE8_OPT(s1, s2, h00, h11, e11, f11, f21, max512, sft512, BND) \
+#define MAIN_SAM_CODE8_OPT(s1, s2, h00, h11, e11, f11, f21, max512, sft512, BND, \
+                           NEED_DUMMY)                                  \
     {                                                                   \
         __m512i sbt11, xor11;                                           \
         xor11 = _mm512_xor_si512(s1, s2);                               \
         sbt11 = _mm512_shuffle_epi8(permSft512, xor11);                 \
-        __mmask64 cmpq = _mm512_cmpeq_epu8_mask(s2, five512);           \
-        sbt11 = _mm512_mask_blend_epi8(cmpq, sbt11, sft512);            \
+        /* DUMMY5 tail test; provably unselectable below jdummy, so the \
+         * cmp+blend pair is elided there. See the jdummy derivation in \
+         * the u8 kernel. */                                            \
+        if (NEED_DUMMY) {                                               \
+            __mmask64 cmpq = _mm512_cmpeq_epu8_mask(s2, five512);       \
+            sbt11 = _mm512_mask_blend_epi8(cmpq, sbt11, sft512);        \
+        }                                                               \
         if (HasFreed) {                                                 \
             /* One compare + one blend against the per-row active_frread512   \
              * target (built once per row); FREED_INACTIVE8 lanes never match \
@@ -672,6 +710,18 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
         if (quanta < jsplit) jsplit = quanta;
     }
 
+    /* Same unswitch one alphabet symbol over. Every cell pays a vceqq+vbslq to
+     * ask "is this column the query's DUMMY5 tail padding?", and per the fill
+     * contract above that is a provable no-op below compute_jdummy's column --
+     * nothing else in the alphabet is 5 (real bases are 0-3, ambiguous is
+     * AMBQ=8, the tail is 0xFF). See compute_jdummy for the derivation and for
+     * why the result is clamped to jsplit.
+     *
+     * Production pays this on 150 bp queries padded to 160, so 150 of every 160
+     * columns take the cheap body. Ragged phase-1 groups (len2 = qe + 1 per
+     * pair) push jdummy down and get correspondingly less. */
+    const int jdummy = compute_jdummy(p, SIMD_WIDTH8, ncol, jsplit);
+
     int i, limit = nrow;
     for (i = 0; i < nrow; i++)
     {
@@ -731,7 +781,7 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
          * the half that can actually fire: nothing below both minLen1 and
          * jsplit, the hoisted per-row reference mask below jsplit, and the full
          * per-cell form from jsplit on. */
-#define KSWV_NEON_U8_CELL(APPLY_BND, BND)                                       \
+#define KSWV_NEON_U8_CELL(APPLY_BND, BND, NEED_DUMMY)                           \
         {                                                                       \
             uint8x16_t f11, s2, f21;                                            \
             h00 = vld1q_u8(H0 + j * SIMD_WIDTH8);                               \
@@ -742,9 +792,12 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
             uint8x16_t xor_val = veorq_u8(s1, s2);                              \
             uint8x16_t sbt = vqtbl1q_u8(permSft, xor_val);                      \
                                                                                 \
-            /* Check for ambiguous query base (DUMMY5) */                       \
-            uint8x16_t cmpq = vceqq_u8(s2, five_vec);                           \
-            sbt = vbslq_u8(cmpq, sft_vec, sbt);                                 \
+            /* Check for ambiguous query base (DUMMY5). Elided below jdummy,   \
+             * where no lane can hold one -- see the derivation above. */       \
+            if (NEED_DUMMY) {                                                   \
+                uint8x16_t cmpq = vceqq_u8(s2, five_vec);                       \
+                sbt = vbslq_u8(cmpq, sft_vec, sbt);                             \
+            }                                                                   \
                                                                                 \
             /* Apply the freed-cell override: force the biased freed score      \
              * (fr_val + shift) where this column's read base equals the row's  \
@@ -796,16 +849,20 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
         if (i < minLen1) {
             /* No lane has begun reference padding and no column below jsplit
              * carries query padding: the mask is provably all-zero here. */
+            for (; j < jdummy; j++)
+                KSWV_NEON_U8_CELL(false, zero_vec, false)
             for (; j < jsplit; j++)
-                KSWV_NEON_U8_CELL(false, zero_vec)
+                KSWV_NEON_U8_CELL(false, zero_vec, true)
         } else {
             /* Reference half only; loop-invariant across j. */
             const uint8x16_t rowboundary = vtstq_u8(s1, highbit_vec);
+            for (; j < jdummy; j++)
+                KSWV_NEON_U8_CELL(true, rowboundary, false)
             for (; j < jsplit; j++)
-                KSWV_NEON_U8_CELL(true, rowboundary)
+                KSWV_NEON_U8_CELL(true, rowboundary, true)
         }
         for (; j < ncol; j++)
-            KSWV_NEON_U8_CELL(true, vtstq_u8(vorrq_u8(s1, s2), highbit_vec))
+            KSWV_NEON_U8_CELL(true, vtstq_u8(vorrq_u8(s1, s2), highbit_vec), true)
 #undef KSWV_NEON_U8_CELL
 
         /* Block I - row max tracking */
@@ -1709,6 +1766,19 @@ int kswv::kswv256_u8_impl(uint8_t seq1SoA[],
     const __m256i e_ins_vec  = _mm256_set1_epi8((char)this->e_ins);
     const __m256i oe_ins_vec = _mm256_set1_epi8((char)(this->o_ins + this->e_ins));
     const __m256i five_vec   = _mm256_set1_epi8((char)DUMMY5);
+
+    /* First column any lane can hold the DUMMY5 query pad. Below it the
+     * cmpeq+blendv pair that tests for it cannot fire, so it is elided --
+     * same derivation and byte-identity argument as the NEON kernel.
+     * Unlike the boundary-mask hoist noted in the loop below, this REMOVES a
+     * live vector (five_vec is dead in the cheap body) rather than pinning
+     * one, so it does not provoke the AVX2 register-file spill that made the
+     * boundary hoist a regression on this tier.
+     *
+     * ncol as the cap, not jsplit: this kernel has no jsplit range to subdivide,
+     * so the cap is a no-op here (compute_jdummy starts at ncol and only ever
+     * lowers it). */
+    const int jdummy_a2 = compute_jdummy(p, SIMD_WIDTH8, ncol, ncol);
     const __m256i cmax_vec   = _mm256_set1_epi8((char)255);
 
     __m256i gmax_vec   = zero_vec;
@@ -1792,9 +1862,7 @@ int kswv::kswv256_u8_impl(uint8_t seq1SoA[],
                                            active_frread);
         }
 
-        /* Cell body as a macro, matching NEON and AVX-512, so a column loop
-         * can instantiate it more than once. Single instantiation here. */
-#define KSWV_AVX2_U8_CELL() \
+#define KSWV_AVX2_U8_CELL(NEED_DUMMY) \
 { \
             __m256i h00 = _mm256_loadu_si256((const __m256i*)(H0 + j * SIMD_WIDTH8)); \
             __m256i s2  = _mm256_loadu_si256((const __m256i*)(seq2SoA + j * SIMD_WIDTH8)); \
@@ -1803,8 +1871,10 @@ int kswv::kswv256_u8_impl(uint8_t seq1SoA[],
             __m256i xor_val = _mm256_xor_si256(s1, s2); \
             __m256i sbt     = _mm256_shuffle_epi8(permSft, xor_val); \
  \
-            __m256i cmpq = _mm256_cmpeq_epi8(s2, five_vec); \
-            sbt = avx2_blendv_u8(cmpq, sft_vec, sbt); \
+            if (NEED_DUMMY) { \
+                __m256i cmpq = _mm256_cmpeq_epi8(s2, five_vec); \
+                sbt = avx2_blendv_u8(cmpq, sft_vec, sbt); \
+            } \
  \
             /* Apply the freed-cell override: force the biased freed score \
              * (fr_val + shift) where this column's read base equals the row's \
@@ -1851,7 +1921,9 @@ int kswv::kswv256_u8_impl(uint8_t seq1SoA[],
             _mm256_storeu_si256((__m256i*)(F  + (j + 1) * SIMD_WIDTH8), f21); \
             l_vec = _mm256_add_epi8(l_vec, one_vec); \
 }
-        for (int j = 0; j < ncol; j++) KSWV_AVX2_U8_CELL()
+        int j = 0;
+        for (; j < jdummy_a2; j++) KSWV_AVX2_U8_CELL(false)
+        for (; j < ncol; j++)      KSWV_AVX2_U8_CELL(true)
 #undef KSWV_AVX2_U8_CELL
 
         /* Block I - rowMax tracking. Same shape as NEON. */
@@ -2910,6 +2982,12 @@ int kswv::kswv512_u8_impl(uint8_t seq1SoA[],
         if (quanta < jsplit) jsplit = quanta;
     }
 
+    /* First column any lane can hold the DUMMY5 query pad, so the cmp+blend
+     * for it can be elided below this. Same derivation and same byte-identity
+     * argument as the NEON kernel above; clamped to jsplit because it only
+     * subdivides the [0, jsplit) range. */
+    const int jdummy = compute_jdummy(p, SIMD_WIDTH8, ncol, jsplit);
+
     int i, limit = nrow;
     for (i=0; i < nrow; i++)
     {
@@ -2953,7 +3031,7 @@ int kswv::kswv512_u8_impl(uint8_t seq1SoA[],
         /* Reference-side half of the boundary mask; loop-invariant across j. */
         const __mmask64 rowboundary512 = _mm512_movepi8_mask(s1);
 
-#define KSWV_AVX512_U8_CELL(BND)                                                    \
+#define KSWV_AVX512_U8_CELL(BND, NEED_DUMMY)                                        \
         {                                                                           \
             __m512i f11, s2, f21;                                                   \
             h00 = _mm512_load_si512((__m512i *)(H0 + j * SIMD_WIDTH8));             \
@@ -2961,7 +3039,7 @@ int kswv::kswv512_u8_impl(uint8_t seq1SoA[],
             f11 = _mm512_load_si512((__m512i *)(F + (j+1) * SIMD_WIDTH8));          \
                                                                                     \
             MAIN_SAM_CODE8_OPT(s1, s2, h00, h11, e11, f11, f21, max512, sft512,     \
-                               (BND));                                              \
+                               (BND), (NEED_DUMMY));                                \
                                                                                     \
             _mm512_store_si512((__m512i *)(H1 + (j + 1) * SIMD_WIDTH8), h11);       \
             _mm512_store_si512((__m512i *)(F + (j + 1)* SIMD_WIDTH8), f21);         \
@@ -2975,12 +3053,16 @@ int kswv::kswv512_u8_impl(uint8_t seq1SoA[],
          * Above jsplit, OR the already-computed s1 half with the s2 half as
          * masks rather than re-ORing the vectors -- a kord instead of a vpord,
          * off the contended vector ports. */
-        for (j = 0; j < jsplit; j++)
+        for (j = 0; j < jdummy; j++)
             KSWV_AVX512_U8_CELL(HasFreed
                 ? _mm512_movepi8_mask(_mm512_or_si512(s1, s2))
-                : rowboundary512)
+                : rowboundary512, false)
+        for (; j < jsplit; j++)
+            KSWV_AVX512_U8_CELL(HasFreed
+                ? _mm512_movepi8_mask(_mm512_or_si512(s1, s2))
+                : rowboundary512, true)
         for (; j < ncol; j++)
-            KSWV_AVX512_U8_CELL(rowboundary512 | _mm512_movepi8_mask(s2))
+            KSWV_AVX512_U8_CELL(rowboundary512 | _mm512_movepi8_mask(s2), true)
 #undef KSWV_AVX512_U8_CELL
 
         // Block I
