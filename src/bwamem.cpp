@@ -1228,23 +1228,34 @@ int mem_chain_flt(const mem_opt_t *opt, int n_chn_, mem_chain_t *a_, int tid)
     // pairwise chain comparisons
     a[0].kept = 3;
     kv_push(int, chains, 0);
+    /* CL-4: hoist the filter constants read every iteration of the nested pass.
+     * opt is const and non-aliasing so the compiler most likely already does
+     * this; pulling them into locals makes the invariance explicit and pins the
+     * `opt->min_seed_len << 1` shift that was recomputed per comparison. Purely
+     * a readability/redundancy cleanup -- byte-identical, no perf claim. */
+    const float mask_level    = opt->mask_level;
+    const float drop_ratio    = opt->drop_ratio;
+    const int   max_chain_gap = opt->max_chain_gap;
+    const int   min_seed_gap  = opt->min_seed_len << 1;
     for (i = 1; i < n_chn; ++i)
     {
         int large_ovlp = 0;
         const int cbi = cb[i], cei = ce[i];
+        const int li = cei - cbi;       /* CL-4: invariant across the inner k-loop */
+        const int wi = a[i].w;          /* CL-4 */
+        const int ai_alt = a[i].is_alt; /* CL-4 */
         for (k = 0; k < chains.n; ++k)
         {
             int j = chains.a[k];
             int b_max = cb[j] > cbi? cb[j] : cbi;
             int e_min = ce[j] < cei? ce[j] : cei;
-            if (e_min > b_max && (!a[j].is_alt || a[i].is_alt)) { // have overlap; don't consider ovlp where the kept chain is ALT while the current chain is primary
-                int li = cei - cbi;
+            if (e_min > b_max && (!a[j].is_alt || ai_alt)) { // have overlap; don't consider ovlp where the kept chain is ALT while the current chain is primary
                 int lj = ce[j] - cb[j];
                 int min_l = li < lj? li : lj;
-                if (e_min - b_max >= min_l * opt->mask_level && min_l < opt->max_chain_gap) { // significant overlap
+                if (e_min - b_max >= min_l * mask_level && min_l < max_chain_gap) { // significant overlap
                     large_ovlp = 1;
                     if (a[j].first < 0) a[j].first = i; // keep the first shadowed hit s.t. mapq can be more accurate
-                    if (a[i].w < a[j].w * opt->drop_ratio && a[j].w - a[i].w >= opt->min_seed_len<<1)
+                    if (wi < a[j].w * drop_ratio && a[j].w - wi >= min_seed_gap)
                         break;
                 }
             }
@@ -1265,13 +1276,17 @@ int mem_chain_flt(const mem_opt_t *opt, int n_chn_, mem_chain_t *a_, int tid)
         if (a[i].kept == 0 || a[i].kept == 3) continue;
         if (++k >= opt->max_chain_extend) break;
     }
+    /* CL-5: the former standalone demotion loop (demote kept<3 chains from the
+     * extend-cap cutoff onward to 0) is fused into the free+compact pass below,
+     * one scan instead of two. `cap_cutoff` is the index the cap-count loop above
+     * stopped at (n_chn if the cap was never reached); chains at or beyond it with
+     * kept<3 are demoted inline as we compact. Byte-identical to the two-loop form. */
+    const int cap_cutoff = i;
 
-    for (; i < n_chn; ++i)
-        if (a[i].kept < 3) a[i].kept = 0;
-
-    for (i = k = 0; i < n_chn; ++i)  // free discarded chains
+    for (i = k = 0; i < n_chn; ++i)  // demote-beyond-cap + free discarded + compact
     {
         mem_chain_t *c = &a[i];
+        if (i >= cap_cutoff && c->kept < 3) c->kept = 0;   // CL-5: former step-10 demotion
         if (c->kept == 0)
         {
             if (c->m > SEEDS_PER_CHAIN)  // CHN-16: dead tprof[PE11] counter removed
