@@ -1792,62 +1792,67 @@ int kswv::kswv256_u8_impl(uint8_t seq1SoA[],
                                            active_frread);
         }
 
-        for (int j = 0; j < ncol; j++) {
-            __m256i h00 = _mm256_loadu_si256((const __m256i*)(H0 + j * SIMD_WIDTH8));
-            __m256i s2  = _mm256_loadu_si256((const __m256i*)(seq2SoA + j * SIMD_WIDTH8));
-            __m256i f11 = _mm256_loadu_si256((const __m256i*)(F + (j + 1) * SIMD_WIDTH8));
-
-            __m256i xor_val = _mm256_xor_si256(s1, s2);
-            __m256i sbt     = _mm256_shuffle_epi8(permSft, xor_val);
-
-            __m256i cmpq = _mm256_cmpeq_epi8(s2, five_vec);
-            sbt = avx2_blendv_u8(cmpq, sft_vec, sbt);
-
-            /* Apply the freed-cell override: force the biased freed score
-             * (fr_val + shift) where this column's read base equals the row's
-             * active freed base (active_frread, built once per row above). One
-             * cmpeq + one blendv; FREED_INACTIVE8 lanes never match any s2 value
-             * (0-3/5/8 or the 0xFF pad) so they pass through. */
-            if (HasFreed) {
-                sbt = _mm256_blendv_epi8(sbt, freedval256,
-                                         _mm256_cmpeq_epi8(s2, active_frread));
-            }
-
-            /* High bit of (s1 | s2) indicates boundary (padding 0xFF).
-             * Sign compare against zero gives 0xFF wherever high bit is
-             * set in the u8 byte. NB: the jsplit-bounded hoist that NEON and
-             * AVX-512 use below their group's first padded query column
-             * regresses here — AVX2's 16-register file spills once the mask is
-             * loop-invariant (however computed), so this tier keeps the
-             * per-cell s1|s2 form over the whole row. Never hoist the s2 half
-             * away on any tier: query columns past a lane's quantum DO carry
-             * bit 7 (see the query-padding contract at the top of this file). */
-            __m256i or_val      = _mm256_or_si256(s1, s2);
-            __m256i is_boundary = _mm256_cmpgt_epi8(zero_vec, or_val);
-
-            __m256i m11 = _mm256_adds_epu8(h00, sbt);
-            m11 = avx2_blendv_u8(is_boundary, zero_vec, m11);
-            m11 = _mm256_subs_epu8(m11, sft_vec);
-
-            __m256i h11 = _mm256_max_epu8(m11, e11);
-            h11 = _mm256_max_epu8(h11, f11);
-
-            __m256i cmp0 = avx2_cmpgt_u8(h11, imax_vec);
-            imax_vec = _mm256_max_epu8(imax_vec, h11);
-            iqe_vec  = avx2_blendv_u8(cmp0, l_vec, iqe_vec);
-
-            __m256i gapE = _mm256_subs_epu8(h11, oe_ins_vec);
-            e11 = _mm256_subs_epu8(e11, e_ins_vec);
-            e11 = _mm256_max_epu8(gapE, e11);
-
-            __m256i gapD = _mm256_subs_epu8(h11, oe_del_vec);
-            __m256i f21  = _mm256_subs_epu8(f11, e_del_vec);
-            f21 = _mm256_max_epu8(gapD, f21);
-
-            _mm256_storeu_si256((__m256i*)(H1 + (j + 1) * SIMD_WIDTH8), h11);
-            _mm256_storeu_si256((__m256i*)(F  + (j + 1) * SIMD_WIDTH8), f21);
-            l_vec = _mm256_add_epi8(l_vec, one_vec);
-        }
+        /* Cell body as a macro, matching NEON and AVX-512, so a column loop
+         * can instantiate it more than once. Single instantiation here. */
+#define KSWV_AVX2_U8_CELL() \
+{ \
+            __m256i h00 = _mm256_loadu_si256((const __m256i*)(H0 + j * SIMD_WIDTH8)); \
+            __m256i s2  = _mm256_loadu_si256((const __m256i*)(seq2SoA + j * SIMD_WIDTH8)); \
+            __m256i f11 = _mm256_loadu_si256((const __m256i*)(F + (j + 1) * SIMD_WIDTH8)); \
+ \
+            __m256i xor_val = _mm256_xor_si256(s1, s2); \
+            __m256i sbt     = _mm256_shuffle_epi8(permSft, xor_val); \
+ \
+            __m256i cmpq = _mm256_cmpeq_epi8(s2, five_vec); \
+            sbt = avx2_blendv_u8(cmpq, sft_vec, sbt); \
+ \
+            /* Apply the freed-cell override: force the biased freed score \
+             * (fr_val + shift) where this column's read base equals the row's \
+             * active freed base (active_frread, built once per row above). One \
+             * cmpeq + one blendv; FREED_INACTIVE8 lanes never match any s2 value \
+             * (0-3/5/8 or the 0xFF pad) so they pass through. */ \
+            if (HasFreed) { \
+                sbt = _mm256_blendv_epi8(sbt, freedval256, \
+                                         _mm256_cmpeq_epi8(s2, active_frread)); \
+            } \
+ \
+            /* High bit of (s1 | s2) indicates boundary (padding 0xFF). \
+             * Sign compare against zero gives 0xFF wherever high bit is \
+             * set in the u8 byte. NB: the jsplit-bounded hoist that NEON and \
+             * AVX-512 use below their group's first padded query column \
+             * regresses here — AVX2's 16-register file spills once the mask is \
+             * loop-invariant (however computed), so this tier keeps the \
+             * per-cell s1|s2 form over the whole row. Never hoist the s2 half \
+             * away on any tier: query columns past a lane's quantum DO carry \
+             * bit 7 (see the query-padding contract at the top of this file). */ \
+            __m256i or_val      = _mm256_or_si256(s1, s2); \
+            __m256i is_boundary = _mm256_cmpgt_epi8(zero_vec, or_val); \
+ \
+            __m256i m11 = _mm256_adds_epu8(h00, sbt); \
+            m11 = avx2_blendv_u8(is_boundary, zero_vec, m11); \
+            m11 = _mm256_subs_epu8(m11, sft_vec); \
+ \
+            __m256i h11 = _mm256_max_epu8(m11, e11); \
+            h11 = _mm256_max_epu8(h11, f11); \
+ \
+            __m256i cmp0 = avx2_cmpgt_u8(h11, imax_vec); \
+            imax_vec = _mm256_max_epu8(imax_vec, h11); \
+            iqe_vec  = avx2_blendv_u8(cmp0, l_vec, iqe_vec); \
+ \
+            __m256i gapE = _mm256_subs_epu8(h11, oe_ins_vec); \
+            e11 = _mm256_subs_epu8(e11, e_ins_vec); \
+            e11 = _mm256_max_epu8(gapE, e11); \
+ \
+            __m256i gapD = _mm256_subs_epu8(h11, oe_del_vec); \
+            __m256i f21  = _mm256_subs_epu8(f11, e_del_vec); \
+            f21 = _mm256_max_epu8(gapD, f21); \
+ \
+            _mm256_storeu_si256((__m256i*)(H1 + (j + 1) * SIMD_WIDTH8), h11); \
+            _mm256_storeu_si256((__m256i*)(F  + (j + 1) * SIMD_WIDTH8), f21); \
+            l_vec = _mm256_add_epi8(l_vec, one_vec); \
+}
+        for (int j = 0; j < ncol; j++) KSWV_AVX2_U8_CELL()
+#undef KSWV_AVX2_U8_CELL
 
         /* Block I - rowMax tracking. Same shape as NEON. */
         if (i > 0) {
