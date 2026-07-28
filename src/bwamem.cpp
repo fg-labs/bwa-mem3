@@ -869,22 +869,24 @@ int mem_seed_sw(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
 
 int mem_chain_weight(const mem_chain_t *c)
 {
-    int64_t end;
-    int j, w = 0, tmp;
-    for (j = 0, end = 0; j < c->n; ++j) {
+    /* CL-1: fused query- and reference-axis coverage into a single seed sweep.
+     * The two accumulations are independent (query coverage keys off qbeg/len,
+     * reference coverage off rbeg/len), so interleaving them in one pass with a
+     * separate running end per axis is byte-identical to the former two sweeps
+     * -- it only halves the loop iterations (the second sweep re-read the same
+     * L1-resident seeds), a tidy-up rather than a speedup. */
+    int64_t qend, rend;
+    int j, wq = 0, wr = 0, w;
+    for (j = 0, qend = 0, rend = 0; j < c->n; ++j) {
         const mem_seed_t *s = &c->seeds[j];
-        if (s->qbeg >= end) w += s->len;
-        else if (s->qbeg + s->len > end) w += s->qbeg + s->len - end;
-        end = end > s->qbeg + s->len? end : s->qbeg + s->len;
+        if (s->qbeg >= qend) wq += s->len;
+        else if (s->qbeg + s->len > qend) wq += s->qbeg + s->len - qend;
+        qend = qend > s->qbeg + s->len? qend : s->qbeg + s->len;
+        if (s->rbeg >= rend) wr += s->len;
+        else if (s->rbeg + s->len > rend) wr += s->rbeg + s->len - rend;
+        rend = rend > s->rbeg + s->len? rend : s->rbeg + s->len;
     }
-    tmp = w; w = 0;
-    for (j = 0, end = 0; j < c->n; ++j) {
-        const mem_seed_t *s = &c->seeds[j];
-        if (s->rbeg >= end) w += s->len;
-        else if (s->rbeg + s->len > end) w += s->rbeg + s->len - end;
-        end = end > s->rbeg + s->len? end : s->rbeg + s->len;
-    }
-    w = w < tmp? w : tmp;
+    w = wq < wr? wq : wr;
     return w < 1<<30? w : (1<<30)-1;
 }
 
