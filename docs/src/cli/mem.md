@@ -191,10 +191,59 @@ By default, bwa-mem3 may downgrade the MAPQ of supplementary alignments.
 
 #### `-K INT` — fixed batch size
 
-Forces each thread batch to process exactly `INT` input bases regardless of
-the number of threads. Useful when you need bit-for-bit reproducible output
-across runs with different `-t` values: fix `-K` to the same value and the
-output is deterministic.
+Forces each batch to process exactly `INT` input bases regardless of the number
+of threads. **Recommended whenever reproducibility or bwa/bwa-mem2 comparison
+matters.**
+
+Without `-K` the batch size is `chunk_size × -t` (10,000,000 × `-t` by default),
+so it moves with the thread count. That is not merely a scheduling detail:
+`mem_pestat` estimates the paired-end insert-size distribution from whichever
+reads land in a batch, and the resulting bounds feed pairing, mate rescue and
+MAPQ. Two runs over the same input at different `-t` can therefore disagree on a
+small number of records. `bwa` and `bwa-mem2` compute the batch size with the
+same formula and have the same property — `-K` exists in all three to pin it.
+
+Fix `-K` to the same value on both sides and the output becomes independent of
+`-t`. `-K` always wins: it is never overridden by `--chunk-cap` or `--fast`.
+
+#### `--chunk-cap INT` — upper bound on the auto-scaled batch size
+
+Caps the default `chunk_size × -t` batch at `INT` bases. `0` (the default)
+disables it, so out of the box bwa-mem3 batches **exactly** like `bwa` and
+`bwa-mem2` at any `-t`.
+
+Capping keeps the read/compute/write pipeline overlapped at very high `-t`,
+where a single batch would otherwise be enormous (10M × 192 ≈ 1.9 Gbase) and the
+input would be only three or four batches — the first batch's read and the last
+batch's write then overlap nothing. On a 64-core host that fill/drain costs
+roughly 1.6 s of a 26 s alignment.
+
+It is **opt-in because it re-partitions the input**, and by the `mem_pestat`
+mechanism described under `-K` that changes output. A capped run is not
+byte-identical to `bwa`/`bwa-mem2` at the same `-t`, and bwa-mem3 prints a
+warning to stderr when the cap actually engages. `--fast` implies
+`--chunk-cap 256000000` (`--fast` already does not promise byte-identical
+output). If you want a bounded batch *and* reproducibility, use `-K` instead.
+
+The value must be a plain non-negative base count — no `K`/`M`/`G` suffix.
+`--chunk-cap 100M` is rejected with an error rather than accepted and silently
+read as `0` (that is, as no cap at all).
+
+For cap sweeps, `BWA_MEM3_CHUNK_CAP` overrides all of the above, including
+`--fast`'s implied cap; setting it to `0` switches an explicit `--chunk-cap`
+back off. An empty value is ignored, and a malformed one is reported on stderr
+and ignored rather than being read as `0`. `-K` still wins over it — a fixed
+batch size is never capped.
+
+Precedence, highest first:
+
+| Setting | Effect |
+|---|---|
+| `-K INT` | pins the batch size exactly; never capped |
+| `BWA_MEM3_CHUNK_CAP` | overrides the cap from either source below (`0` = off) |
+| `--chunk-cap INT` | caps the auto-scaled batch (`0` = off) |
+| `--fast` | implies `--chunk-cap 256000000` |
+| *(default)* | no cap — identical batching to `bwa`/`bwa-mem2` |
 
 #### `-v INT` — verbosity
 

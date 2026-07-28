@@ -31,7 +31,7 @@ Options:
                   total order (faster, but resolves equal-end-position ties
                   differently from bwa-mem2, which the default reproduces).
                   NOT byte-identical to the default (divergence confined to the
-                  low-confidence tail).
+                  low-confidence tail). Also implies --chunk-cap 256000000.
     --compat STR  shape output to be byte-identical to another aligner.
                   Targets: bwa-mem2 (alias mem2), off
                   bwa-mem2: suppress the MQ:i and HN:i tags and the default @HD,
@@ -57,6 +57,12 @@ Input/output options:
    -5            for split alignment, take the alignment with the smallest coordinate as primary
    -q            don't modify mapQ of supplementary alignments
    -K INT        process INT input bases in each batch regardless of nThreads (for reproducibility) []
+   --chunk-cap INT
+                 upper bound (bases) on the default nThreads-scaled batch size;
+                 0 = off. Off by default so batching matches bwa/bwa-mem2 exactly
+                 at any -t. Capping re-partitions the input and is NOT
+                 byte-identical. Prefer -K if you want a fixed batch size AND
+                 reproducibility [0]
    -v INT        verbose level: 1=error, 2=warning, 3=message, 4+=debugging [3]
    -T INT        minimum score to output [30]
    -h INT[,INT]  if there are <INT hits with score >80.00% of the max score, output all in XA [5,200]
