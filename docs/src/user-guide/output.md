@@ -40,9 +40,44 @@ now agree, on the string upstream bwa uses.
 ### `@SQ`
 
 One `@SQ` line is written per reference sequence, with the sequence name
-(`SN:`) and length (`LN:`) derived from the FM-index. If the index was built
-with a `.dict` or `.hdr` file that supplies `@SQ` records, those records are
-used instead of the auto-generated ones.
+(`SN:`) and length (`LN:`) derived from the FM-index. Contigs listed in
+`<prefix>.alt` additionally get `AH:*`, marking them as alternate loci.
+
+If a `<prefix>.hdr` or `<baseprefix>.dict` file sits next to the index and
+supplies `@SQ` records, those records are used **verbatim** instead of the
+auto-generated ones. This is deliberate: the sidecar is authoritative, so
+bwa-mem3 neither adds nor removes tags in it.
+
+> **Warning — a Picard/GATK `.dict` drops `AH:*`**
+>
+> `picard CreateSequenceDictionary` has no notion of a `.alt` file, so the
+> `.dict` it writes carries no `AH` tag. Because the sidecar is used verbatim,
+> **ALT contigs lose their `AH:*` in the output header** — which matters to
+> anything that keys on it, notably `bwa-postalt.js` and ALT-aware duplicate
+> marking and QC.
+>
+> This bites the standard Broad reference layout, because the discovery order
+> is `<prefix>.hdr` then `<baseprefix>.dict` — so
+> `Homo_sapiens_assembly38.fasta` resolves to `Homo_sapiens_assembly38.dict`,
+> exactly the file the GATK resource bundle ships.
+>
+> Both `index` and `mem` warn when the index has ALT contigs and the sidecar's
+> `@SQ` has no `AH`. Two paths do not, because on them there is nothing to lose:
+> `mem --meth` (the doubled reference's contigs are `f`/`r`-prefixed and have no
+> ALT status of their own — `index --meth` still checks the real reference), and
+> `--compat=bwa-mem2`, which ignores the sidecar entirely and generates `@SQ`
+> with `AH:*` from the index.
+>
+> The fix is to regenerate the sidecar with the ALT list — `samtools dict` reads
+> a bwa-style `.alt` and emits `AH:*` for you:
+>
+> ```bash
+> samtools dict --alt ref.fasta.alt -o ref.dict ref.fasta
+> ```
+>
+> Alternatively, delete the sidecar and let bwa-mem3 generate `@SQ` itself,
+> which always emits `AH:*` — at the cost of the `M5`/`UR`/`AS`/`SP` metadata
+> the `.dict` carries.
 
 In methylation mode (`--meth`), the doubled reference contains sequences with
 an `f` or `r` prefix in their names. The inline BAM post-processor collapses

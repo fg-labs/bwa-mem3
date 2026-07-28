@@ -111,6 +111,16 @@ ok "meth_rg_header_test"
 "$HERE/meth_sidecar_enrich_test.sh" "$BWAMEM3" "$FIXTURES" || fail "meth_sidecar_enrich_test failed"
 ok "meth_sidecar_enrich_test"
 
+# --- index_alt_sidecar_warn_test ------------------------------------------
+# `index` must warn when the reference has ALT contigs (<prefix>.alt) but the
+# header sidecar supplies @SQ with no AH tag -- the Picard/GATK .dict case,
+# where ALT status is silently lost from every output header. It must stay quiet
+# with no sidecar, with no ALT contig, and when the sidecar already carries
+# AH:*. The remaining --compat and --bam gating is covered at `mem` level by
+# regression/header_parity.sh.
+"$HERE/index_alt_sidecar_warn_test.sh" "$BWAMEM3" || fail "index_alt_sidecar_warn_test failed"
+ok "index_alt_sidecar_warn_test"
+
 # --- help_prescan_test ----------------------------------------------------
 # `mem --help` pre-scan must not match `--help` when it is the value of
 # an option that takes an argument (-R, -o, --set-as-failed, ...).

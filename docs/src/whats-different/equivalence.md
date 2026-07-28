@@ -143,11 +143,13 @@ Caveats:
   --compat=bwa-mem2` would produce a diff-clean-looking stream over genuinely different
   alignments. `--compat` is meaningful only on the drop-in profile.
 - **The sidecar `@SQ` is skipped, not rewritten.** Outside `--compat` the
-  `<prefix>.hdr` / `<baseprefix>.dict` block remains authoritative and is emitted verbatim —
-  it is a port of [lh3/bwa#348](https://github.com/lh3/bwa/pull/348), designed for the block
-  to be produced complete by an external tool. If your index has a `.alt` file, generate the
-  sidecar with `samtools dict --alt <ref>.alt` so `AH:*` is carried; bwa-mem3 warns when it
-  sees ALT contigs and a sidecar `@SQ` without `AH`.
+  `<prefix>.hdr` / `<baseprefix>.dict` block remains authoritative and is emitted verbatim.
+  On those sidecar-honoring paths — the default profile, `--bam` and `--meth` — an index with
+  a `.alt` file needs that block to carry `AH:*` itself, because nothing re-derives it from
+  the index; see [`@SQ` in Output](../user-guide/output.md#sq) for why, which commands warn,
+  and how to regenerate the sidecar. Under `--compat=bwa-mem2` the requirement does not
+  apply: the sidecar is ignored entirely and `AH:*` is generated from the index (the table
+  row above), so a sidecar missing `AH` cannot affect that output.
 - **`--compat=bwa-mem` is recognized but rejected.** bwa-mem3 and bwa still differ on 224 of
   63,583 records (53 above MAPQ 30) in MAPQ, CIGAR, POS and TLEN, so no amount of output
   shaping makes them byte-identical. Tracked separately.
