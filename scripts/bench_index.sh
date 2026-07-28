@@ -21,8 +21,9 @@
 #   BWA_TEST_HG38_FASTA / BWA_TEST_HG38_MET_C2T - source FASTA paths
 #   BWA_INDEX_THREADS    - passed to `bwa-mem3 index -t`. Unset = auto-detect.
 #   BWA_INDEX_MAX_MEMORY - passed to `bwa-mem3 index --max-memory`. Unset =
-#       auto-detect (min(50% RAM, 32G)). The 32G cap rejects hg38 (~58 GiB
-#       peak) and hg38_meth, so override here to reproduce the PR's numbers
+#       auto-detect (RAM less a min(max(2G, 5%), 50%) reserve), which accepts hg38
+#       (~58 GiB peak) on any host with >= ~76 GiB of RAM. Set an explicit
+#       budget to make wall-time / peak-RSS comparable across hosts
 #       (e.g. BWA_INDEX_MAX_MEMORY=128G on a 256 GiB host).
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"

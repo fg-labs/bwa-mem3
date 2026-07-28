@@ -18,6 +18,14 @@
 
 namespace bwa {
 
+std::string fmt_bytes(int64_t b) {
+    char out[32];
+    if      (b >= (1LL << 30)) std::snprintf(out, sizeof(out), "%.1f GiB", (double)b / (double)(1LL << 30));
+    else if (b >= (1LL << 20)) std::snprintf(out, sizeof(out), "%.1f MiB", (double)b / (double)(1LL << 20));
+    else                       std::snprintf(out, sizeof(out), "%lld B",   (long long)b);
+    return std::string(out);
+}
+
 namespace {
 
 // Slurp up to 4 KiB from `path` into `out`; returns true on success.
@@ -192,6 +200,49 @@ int detect_cpu_count() {
     if (cgroup < 1) return phys;
     int r = std::min(phys, cgroup);
     return r < 1 ? 1 : r;
+}
+
+namespace {
+
+// Headroom left to the OS and to whatever else shares the host: the larger of
+// an absolute floor and a proportional share.
+constexpr int64_t kBatchReserveFloorBytes = 2LL << 30;   // 2 GiB
+constexpr int64_t kBatchReserveDivisor    = 20;          // 5% of total
+
+} // namespace
+
+int64_t resolve_batch_memory_budget(int64_t total_bytes) {
+    if (total_bytes <= 0) return -1;
+    int64_t reserve = std::max(kBatchReserveFloorBytes,
+                               total_bytes / kBatchReserveDivisor);
+    // Never reserve more than half: on a host smaller than 2x the floor the
+    // proportional rule would otherwise resolve to a zero or negative budget.
+    reserve = std::min(reserve, total_bytes / 2);
+    return total_bytes - reserve;
+}
+
+int64_t required_total_for_batch_budget(int64_t budget_bytes) {
+    if (budget_bytes <= 0) return -1;
+    // The reserve has three regimes -- half of total below 4 GiB, a flat 2 GiB
+    // up to 40 GiB, then 5% -- so a closed-form inverse needs three branches
+    // plus their boundary cases, and any of them can silently disagree with the
+    // forward policy. Binary search the forward function instead: it is
+    // monotonic non-decreasing, so the smallest sufficient total is well
+    // defined, the answer is exact in every regime by construction, and the
+    // inverse cannot drift if the policy above is ever retuned. ~63 iterations,
+    // evaluated at most once per refused build.
+    int64_t lo = 1, hi = INT64_MAX, best = -1;
+    while (lo <= hi) {
+        int64_t mid = lo + (hi - lo) / 2;          // no overflow
+        if (resolve_batch_memory_budget(mid) >= budget_bytes) {
+            best = mid;
+            hi = mid - 1;                          // mid >= lo >= 1, so no underflow
+        } else {
+            if (mid == INT64_MAX) break;           // infeasible: nothing suffices
+            lo = mid + 1;
+        }
+    }
+    return best;
 }
 
 } // namespace bwa

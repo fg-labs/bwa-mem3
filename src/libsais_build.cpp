@@ -5,6 +5,7 @@
 #include "io_utils.h"
 #include "macro.h"
 #include "packed_text.h"
+#include "system.h"
 #include "utils.h"
 
 #include <atomic>
@@ -47,13 +48,17 @@ double elapsed_since(clock_t_::time_point t) {
 }
 
 
-std::string fmt_bytes(int64_t b) {
+// Reference length in the unit a user thinks in, so a small fixture does not
+// report "0.00 Gbp".
+std::string fmt_bases(int64_t bp) {
     char out[32];
-    if      (b >= (1LL << 30)) std::snprintf(out, sizeof(out), "%.1f GiB", (double)b / (double)(1LL << 30));
-    else if (b >= (1LL << 20)) std::snprintf(out, sizeof(out), "%.1f MiB", (double)b / (double)(1LL << 20));
-    else                        std::snprintf(out, sizeof(out), "%lld B",   (long long)b);
+    if      (bp >= 1000000000LL) std::snprintf(out, sizeof(out), "%.2f Gbp", (double)bp / 1e9);
+    else if (bp >= 1000000LL)    std::snprintf(out, sizeof(out), "%.1f Mbp", (double)bp / 1e6);
+    else                         std::snprintf(out, sizeof(out), "%lld bp",  (long long)bp);
     return std::string(out);
 }
+
+using bwa::fmt_bytes;
 
 // Pack the forward-only .pac (l_pac bases) plus its reverse-complement into
 // a doubled .pac on disk. The sais-lite path built this doubled text in
@@ -123,6 +128,76 @@ std::string resolve_tmpdir(const LibsaisBuildOpts& opts) {
 
 } // anonymous namespace
 
+bool libsais_sa_is_64bit(int64_t N) {
+    const int64_t kSais32Threshold = (int64_t)INT32_MAX - 10000;
+    return (N + 1) >= kSais32Threshold;
+}
+
+int64_t libsais_estimate_peak_bytes(int64_t N) {
+    // Per-base cost, calibrated against measured peak RSS rather than derived
+    // from the buffer arithmetic alone (buf is 1 B/base, the SA 4 or 8, and
+    // libsais's aux arrays plus the OMP/allocator arenas add the rest).
+    //
+    // Two properties have to hold, and the second is the binding one because
+    // `index --meth` runs two builds in one process -- the original over
+    // N = 2*l_pac, then a seed over 4*l_pac -- and does not return the first
+    // build's memory before the second starts. So the estimate for a build must
+    // also cover a --meth invocation whose *dominant* build is that size.
+    //
+    // Worst measured cost per base of N, over a size ladder from chr17 (0.08
+    // Gbp) to chr1-9 (1.67 Gbp) on a 64 GiB 12-core host:
+    //
+    //             single build   --meth process   estimate   margins
+    //   int32 SA      5.90 B         7.07 B          8         1.36 / 1.13
+    //   int64 SA      9.84 B        10.04 B         12         1.22 / 1.20
+    //
+    // The int32 constant was 6, i.e. only 1.02x over a single build's own peak
+    // and *below* the --meth process peak -- so a small-reference `--meth` build
+    // could exceed its budget by ~17% while every individual estimate cleared
+    // it. int64's 1.22x margin already absorbed the same carry-over, which is
+    // why the defect was confined to the int32 path. 8 restores a comparable
+    // margin; no --meth-specific term is needed, and none is wanted, since the
+    // carry-over measures as bounded rather than proportional.
+    return (N + 1) * (libsais_sa_is_64bit(N) ? 12 : 8);
+}
+
+void libsais_report_budget_shortfall(const char* what, int64_t need_bytes,
+                                     int64_t budget_bytes, bool budget_user_specified,
+                                     int64_t ref_bases) {
+    const bool use_int64_sa = libsais_sa_is_64bit(2 * ref_bases);
+    // Round the --max-memory suggestion up to a whole unit the flag accepts, in
+    // the unit the requirement actually lands in: ceil-to-GiB overshoots ~44x on
+    // a 23 MiB requirement.
+    const bool      suggest_g   = need_bytes >= (1LL << 30);
+    const int64_t   unit        = suggest_g ? (1LL << 30) : (1LL << 20);
+    const long long suggest_n   = (long long)((need_bytes + unit - 1) / unit);
+    const char      suggest_sfx = suggest_g ? 'G' : 'M';
+
+    std::fprintf(stderr,
+            "ERROR: %s needs ~%s (%d-bit SA) to index a %s reference; "
+            "--max-memory is %s.\n",
+            what, fmt_bytes(need_bytes).c_str(), use_int64_sa ? 64 : 32,
+            fmt_bases(ref_bases).c_str(), fmt_bytes(budget_bytes).c_str());
+
+    // A host-size hint is noise when the user pinned the budget themselves: the
+    // binding constraint is their flag, not the machine. "Use a smaller
+    // reference" is never an option for a whole-genome aligner, so it is gone.
+    const int64_t required_total = budget_user_specified
+                                 ? -1
+                                 : bwa::required_total_for_batch_budget(need_bytes);
+    if (required_total > 0)
+        std::fprintf(stderr,
+                "       Retry on a host with >= %s of RAM, or pass --max-memory %lld%c\n"
+                "       to build within a smaller budget (which may swap). Bounded-memory\n"
+                "       SA construction is not yet implemented.\n",
+                fmt_bytes(required_total).c_str(), suggest_n, suggest_sfx);
+    else
+        std::fprintf(stderr,
+                "       Raise --max-memory to at least %lld%c. Bounded-memory SA "
+                "construction is not yet implemented.\n",
+                suggest_n, suggest_sfx);
+}
+
 int libsais_build_fm_index(const char* prefix, int64_t pac_len,
                            const LibsaisBuildOpts& opts)
 {
@@ -141,22 +216,11 @@ int libsais_build_fm_index(const char* prefix, int64_t pac_len,
     std::fprintf(stderr, "[libsais_build] N=%lld threads=%d (user-requested=%d)\n",
             (long long)N, T, T_user);
 
-    // Per-base preflight headroom: 6 B/base (int32) / 12 B/base (int64)
-    // covers measured peaks on chr22 and chr1-6 with ~20% margin for
-    // libsais aux arrays and OMP/mimalloc overhead on small inputs.
-    const int64_t kSais32Threshold = (int64_t)INT32_MAX - 10000;
-    const bool    use_int64_sa     = (N + 1) >= kSais32Threshold;
-    const int64_t per_base_bytes   = use_int64_sa ? 12 : 6;
-    const int64_t est_bytes        = (N + 1) * per_base_bytes;
+    const bool    use_int64_sa = libsais_sa_is_64bit(N);
+    const int64_t est_bytes    = libsais_estimate_peak_bytes(N);
     if (opts.max_memory_bytes > 0 && est_bytes > opts.max_memory_bytes) {
-        std::fprintf(stderr,
-                "ERROR: libsais build would use ~%s (%d-bit SA); --max-memory is %s.\n",
-                fmt_bytes(est_bytes).c_str(),
-                use_int64_sa ? 64 : 32,
-                fmt_bytes(opts.max_memory_bytes).c_str());
-        std::fprintf(stderr,
-                "       Raise --max-memory or use a smaller reference. "
-                "(Bounded-memory SA construction is not yet implemented.)\n");
+        libsais_report_budget_shortfall("libsais", est_bytes, opts.max_memory_bytes,
+                                        opts.max_memory_user_specified, l_pac);
         return 3;
     }
     std::fprintf(stderr, "[libsais_build] estimate ~%s (budget %s)\n",

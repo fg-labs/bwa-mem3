@@ -112,17 +112,34 @@ bwa-mem3 index /data/indexes/hg38/hg38.fa
 
 ## Time and memory
 
-Index construction is **multi-threaded and memory-bounded**. `index -t` defaults
-to the detected core count (cgroup-aware), and `--max-memory` caps peak RAM at
-`min(50% of RAM, 32 GB)` by default — raise or lower it to trade memory against
-spill I/O. On a typical multi-core host, indexing hg38 takes a few minutes
-(longer if pinned to a single core).
+Index construction is **multi-threaded**. `index -t` defaults to the detected
+core count (cgroup-aware), and `--max-memory` defaults to the memory available
+to the process less a reserve of `min(max(2 GB, 5%), 50%)` — a batch build is
+allowed to use the host it was given. The reserve never exceeds half of total, so
+a host below 4 GB still gets a usable budget (a 1 GB host budgets 512 MB). On a
+typical multi-core host, indexing hg38 takes a few minutes (longer if pinned to a
+single core).
+
+Peak memory is roughly **12 bytes per base of doubled text**, i.e. ~72 GB for
+hg38. Below ~1.07 Gbp the suffix array still fits 32-bit entries and the cost
+drops to ~8 bytes per base. `--max-memory` is a precondition checked before the
+build starts, not a spill target: a reference that does not fit the budget is
+rejected up front (exit code 3) rather than built more slowly. Budget hg38 on a
+host with ~76 GB of RAM or more; the rejection message names both the
+`--max-memory` override and the host size that would work without one.
+
+`--meth` needs about **twice** that, because it builds a second index over a
+per-strand-converted reference whose text is twice as long: ~144 GB estimated for
+hg38, so budget a host with ~152 GB of RAM or more. Both builds run in one
+process and the first does not fully release its memory before the second starts,
+so the per-base figures above already account for that overlap.
 
 bwa-mem3 builds the suffix array with
-[libsais](https://github.com/IlyaGrebnov/libsais), whose OpenMP-parallel,
-memory-bounded construction is faster and leaner than the original bwa-mem2
-approach. See [Performance improvements](../whats-different/performance.md) for
-benchmark numbers.
+[libsais](https://github.com/IlyaGrebnov/libsais), whose OpenMP-parallel
+construction is faster and leaner than the original bwa-mem2 approach. It is not
+a bounded-memory construction — see the per-base cost above. See
+[Performance improvements](../whats-different/performance.md) for benchmark
+numbers.
 
 > **Warning — Do not index over a live shared-memory segment**
 >

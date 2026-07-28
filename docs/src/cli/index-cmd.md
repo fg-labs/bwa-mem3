@@ -56,18 +56,27 @@ cap CPU usage.
 ### `--max-memory SIZE` — peak memory budget
 
 Limits how much RAM the indexer may use at once. `SIZE` accepts a `G`, `M`, or
-`K` suffix (case-insensitive) or a bare byte count. The default is
-`min(50% of RAM, 32 GB)`, computed in a cgroup-aware manner.
+`K` suffix (case-insensitive) or a bare byte count. The default is the memory
+available to the process less a reserve of `min(max(2 GB, 5%), 50%)`, computed in
+a cgroup-aware manner — index construction is a one-shot batch job, so the
+default lets it use the host it was given. The reserve is the larger of 2 GB and
+5% of total, except that it never exceeds half of total, so a host below 4 GB
+still resolves to a usable budget (a 1 GB host budgets 512 MB) instead of zero.
 
-For large references (hg38 and above) on machines with limited RAM, setting
-this to a value lower than the reference size causes the indexer to partition
-work and use `--tmp-dir` for intermediate files, at the cost of extra I/O.
+Suffix-array construction is **not** currently bounded-memory: the budget is a
+precondition that is checked before the build starts, not a target the builder
+spills to meet. A reference whose estimated requirement exceeds the budget is
+rejected with exit code 3 and a message naming both the `--max-memory` value
+that would clear it and the host RAM that would clear it automatically. Human
+genomes need roughly 12 bytes per base of doubled text (8 below ~1.07 Gbp, where
+the suffix array still fits 32-bit entries) — about 72 GB for hg38 —
+so plan on a host with ~76 GB of RAM or more.
 
 ### `--tmp-dir PATH` — scratch directory
 
-Scratch directory for intermediate files when memory is partitioned. Defaults
-to `$TMPDIR`. Point this at a fast local disk (NVMe or ramdisk) to minimize
-wall-clock time when `--max-memory` forces partitioned construction.
+Scratch directory for intermediate files. Defaults to `$TMPDIR`. The builder
+stages a doubled `.pac` here during construction, so point this at a fast local
+disk (NVMe or ramdisk) with room for ~2 bits per base of doubled text.
 
 ### `--emit-unpacked-ref` — also write `<prefix>.0123`
 

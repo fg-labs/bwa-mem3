@@ -66,6 +66,46 @@ for budget_mib in 128 512 2048; do
     trap - EXIT
 done
 
+# `--meth` builds two indexes sequentially in one process: the original over
+# N = 2*l_pac, then a seed over a per-strand-converted text twice as long
+# (4*l_pac), so the seed costs ~2x the original and decides whether the
+# invocation can run. Pick a budget between the two estimates: the original
+# would fit, the seed cannot. The preflight must refuse UP FRONT and leave no
+# index behind -- previously the seed's own check fired only once that build
+# started, i.e. after the original index had been built and written (an hour
+# into an hg38 run, leaving a half-populated index directory).
+TD="$(mktemp -d)"
+trap 'rm -rf "$TD"' EXIT
+cp "$FA_SRC" "$TD/m.fa"
+# The fixture is ~1 Mbp -> original est ~11.4 MiB, seed est ~22.9 MiB.
+if "$BWAMEM3" index --meth --max-memory 16M "$TD/m.fa" >"$TD/out" 2>"$TD/err"; then
+    echo "FAIL: --meth --max-memory 16M should have been refused (seed needs ~23 MiB)"
+    FAIL=1
+else
+    rc=$?
+    if [[ "$rc" -ne 3 ]]; then
+        echo "FAIL: --meth budget refusal exited $rc, expected 3"
+        cat "$TD/err"
+        FAIL=1
+    elif ! grep -q 'seed index dominates' "$TD/err"; then
+        echo "FAIL: --meth refusal did not explain that the seed dominates"
+        cat "$TD/err"
+        FAIL=1
+    else
+        # The point of the up-front check: nothing was built before refusing.
+        leaked="$(find "$TD" -name 'm.fa.*' -not -name '*.fai' | head -5)"
+        if [[ -n "$leaked" ]]; then
+            echo "FAIL: --meth refusal left index artifacts behind:"
+            echo "$leaked"
+            FAIL=1
+        else
+            echo "OK:   --meth --max-memory 16M refused up front (exit 3, nothing written)"
+        fi
+    fi
+fi
+rm -rf "$TD"
+trap - EXIT
+
 if [[ $FAIL -ne 0 ]]; then
     echo "libsais_memory_budget_test: FAILED"
     exit 1

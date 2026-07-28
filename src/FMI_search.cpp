@@ -378,6 +378,8 @@ int FMI_search::build_index(bool emit_unpacked_ref) {
         opts.max_memory_bytes = parse_ll(mm, "BWA_INDEX_MAX_MEMORY");
     if (const char* td = getenv("BWA_INDEX_TMPDIR"))
         opts.tmpdir           = td;
+    if (const char* mu = getenv("BWA_INDEX_MAX_MEMORY_USER"))
+        opts.max_memory_user_specified = (mu[0] == '1');
     opts.emit_unpacked_ref = emit_unpacked_ref;
     return libsais_build_fm_index(prefix, pac_len, opts);
 }

@@ -4,7 +4,8 @@ Usage: bwa-mem3 index [-p prefix] [-t N] [--max-memory SIZE] [--tmp-dir PATH] [-
   -t INT             worker threads [auto: detected cores, cgroup-aware]
   --max-memory SIZE  peak memory budget; SIZE accepts a G/M/K suffix
                      (case-insensitive) or bare bytes
-                     [auto: min(50% of RAM, 32G), cgroup-aware]
+                     [auto: RAM less a reserve of min(max(2G, 5%), 50%),
+                     cgroup-aware]
   --tmp-dir PATH     scratch directory [$TMPDIR]
   --meth             build a BS-aware dual index. Writes the original-alphabet
                      index at <in.fasta>.* plus a converted seed FM-index at

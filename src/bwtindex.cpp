@@ -40,14 +40,13 @@
 #include <sys/stat.h>
 #include <zlib.h>
 
-#include <algorithm>
-
 #include "bntseq.h"
 #include "bwa.h"
 #include "bwt.h"
 #include "utils.h"
 #include "FMI_search.h"
 #include "kseq.h"
+#include "libsais_build.h"
 #include "system.h"
 
 KSEQ_DECLARE(gzFile)
@@ -98,8 +97,57 @@ static int meth_c2t_is_fresh(const char *in_fa, const char *out_fa)
  *      SA-intervals, which are then remapped to original coordinates for chaining and
  *      extension. The `.meth` separation is by file PREFIX (not by changing the global
  *      CP_FILENAME_SUFFIX, which serves every index). */
-static int meth_index_build(const char *fa, int emit_unpacked_ref)
+/* Sum the reference length the way bns_fasta2bntseq will pack it, so the seed
+ * index's cost can be estimated before any index is built. Costs one extra
+ * sequential pass over the reference on every --meth run, including the ones
+ * that go on to succeed: ~10 s for an uncompressed hg38, longer for a gzipped
+ * one where the pass is decompression-bound. That is under 1% of the two SA
+ * constructions it guards, and it buys a refusal that leaves no partial index
+ * behind. Returns -1 on read error. */
+static int64_t fasta_count_bases(const char *fa)
 {
+    gzFile in = gzopen(fa, "r");
+    if (in == NULL) return -1;
+    kseq_t *seq = kseq_init(in);
+    int64_t total = 0;
+    int kr = 0;
+    while ((kr = kseq_read(seq)) >= 0) total += (int64_t)seq->seq.l;
+    kseq_destroy(seq);
+    gzclose(in);
+    return kr < -1 ? -1 : total;
+}
+
+static int meth_index_build(const char *fa, int emit_unpacked_ref,
+                            int64_t max_memory_bytes, int max_memory_user_specified)
+{
+    /* 0. Preflight the DOMINANT build before writing anything. --meth builds two
+     * indexes sequentially in one process: the original over N = 2*l_pac, then a
+     * seed over a per-strand-converted FASTA whose text is twice as long again
+     * (4*l_pac). The seed therefore costs ~2x the original and is what decides
+     * whether the invocation can run at all -- but the per-build check inside
+     * libsais_build_fm_index only fires once that build starts, i.e. after the
+     * original index has already been built and written. On hg38 that wastes an
+     * hour and leaves a half-populated index directory. The seed's size is known
+     * from the reference length alone, so refuse up front instead. */
+    if (max_memory_bytes > 0) {
+        int64_t l_pac = fasta_count_bases(fa);
+        if (l_pac < 0) {
+            fprintf(stderr, "ERROR: cannot read %s to estimate index memory\n", fa);
+            return 2;
+        }
+        int64_t seed_need = libsais_estimate_peak_bytes(4 * l_pac);
+        if (seed_need > max_memory_bytes) {
+            fprintf(stderr, "[bwa_index:--meth] the seed index dominates: ~%s vs ~%s for "
+                            "the original, because its per-strand-converted text is "
+                            "twice as long\n",
+                    bwa::fmt_bytes(seed_need).c_str(),
+                    bwa::fmt_bytes(libsais_estimate_peak_bytes(2 * l_pac)).c_str());
+            libsais_report_budget_shortfall("index --meth", seed_need, max_memory_bytes,
+                                            max_memory_user_specified != 0, 2 * l_pac);
+            return 3;
+        }
+    }
+
     /* 1. Original-alphabet index (extension reference). emit_unpacked_ref applies
      * to the original only (its `.0123` is the legacy bwa-mem2 extension target);
      * the seed index never needs an unpacked ref (step 2b passes false). */
@@ -212,7 +260,8 @@ static void index_usage(void)
 	        "  -t INT             worker threads [auto: detected cores, cgroup-aware]\n"
 	        "  --max-memory SIZE  peak memory budget; SIZE accepts a G/M/K suffix\n"
 	        "                     (case-insensitive) or bare bytes\n"
-	        "                     [auto: min(50%% of RAM, 32G), cgroup-aware]\n"
+	        "                     [auto: RAM less a reserve of min(max(2G, 5%%), 50%%),\n"
+	        "                     cgroup-aware]\n"
 	        "  --tmp-dir PATH     scratch directory [$TMPDIR]\n"
 	        "  --meth             build a BS-aware dual index. Writes the original-alphabet\n"
 	        "                     index at <in.fasta>.* plus a converted seed FM-index at\n"
@@ -283,20 +332,23 @@ int bwa_index(int argc, char *argv[]) // the "index" command
 
 	// Resolve --max-memory and -t: user value wins; otherwise auto from
 	// cgroup-aware host detection. Emit a one-line audit per flag.
+	int64_t resolved_mem = 0;
 	{
 		int64_t detected_mem = bwa::detect_total_memory_bytes();
 		int     detected_cpu = bwa::detect_cpu_count();
 
-		int64_t resolved_mem;
 		if (user_max_memory > 0) {
 			resolved_mem = user_max_memory;
-			fprintf(stderr, "[bwa_index] --max-memory = %.1f GiB (user-specified)\n",
-			        (double)resolved_mem / (double)(1LL << 30));
+			fprintf(stderr, "[bwa_index] --max-memory = %s (user-specified)\n",
+			        bwa::fmt_bytes(resolved_mem).c_str());
 		} else if (detected_mem > 0) {
-			resolved_mem = std::min<int64_t>(detected_mem / 2, 32LL << 30);
-			fprintf(stderr, "[bwa_index] --max-memory = %.1f GiB (auto: 50%% of %.1f GiB detected, capped at 32 GiB)\n",
-			        (double)resolved_mem  / (double)(1LL << 30),
-			        (double)detected_mem  / (double)(1LL << 30));
+			// Index construction is a one-shot batch job: give it the host less
+			// a reserve, not a fraction. A fractional default refuses hg38 on
+			// every machine below ~144 GiB even though the build fits in ~58 GiB.
+			resolved_mem = bwa::resolve_batch_memory_budget(detected_mem);
+			fprintf(stderr, "[bwa_index] --max-memory = %s (auto: %s detected less a reserve, cgroup-aware)\n",
+			        bwa::fmt_bytes(resolved_mem).c_str(),
+			        bwa::fmt_bytes(detected_mem).c_str());
 		} else {
 			resolved_mem = 4LL << 30;
 			fprintf(stderr, "[bwa_index] --max-memory = 4.0 GiB (fallback: host detection failed; "
@@ -321,6 +373,9 @@ int bwa_index(int argc, char *argv[]) // the "index" command
 		setenv("BWA_INDEX_MAX_MEMORY", buf, 1);
 		snprintf(buf, sizeof(buf), "%d", resolved_cpu);
 		setenv("BWA_INDEX_THREADS", buf, 1);
+		// Diagnostics only: lets the preflight suppress a "retry on a bigger
+		// host" hint when the budget came from the command line.
+		setenv("BWA_INDEX_MAX_MEMORY_USER", user_max_memory > 0 ? "1" : "0", 1);
 	}
 
 	if (meth) {
@@ -328,7 +383,8 @@ int bwa_index(int argc, char *argv[]) // the "index" command
 			fprintf(stderr, "ERROR: --meth does not accept -p (outputs <in.fasta>.* and <in.fasta>.meth.*)\n");
 			return 1;
 		}
-		return meth_index_build(argv[optind], emit_unpacked_ref);
+		return meth_index_build(argv[optind], emit_unpacked_ref,
+		                       resolved_mem, user_max_memory > 0);
 	}
 	if (prefix == 0) prefix = argv[optind];
 	return bwa_idx_build(argv[optind], prefix, emit_unpacked_ref);
