@@ -6,6 +6,7 @@
 #include "htslib/kstring.h"
 
 #include "meth_bam.h"
+#include "bam_rec_scratch.h"
 #include "bam_writer.h"
 #include "cigar_util.h"
 #include "meth_xm.h"
@@ -293,6 +294,16 @@ int meth_bam_writer_close(meth_bam_writer_t *w)
  * alignment run covers < MIN_LONGEST_M_PCT% of the read. */
 static constexpr int MIN_LONGEST_M_PCT = 44;
 
+/* Contig name for an SA:Z hit, "*" when the rid names no contig. The SA:Z
+ * block sizes its buffer in one loop and fills it in another; both must agree
+ * on the name — and therefore on its length — or the buffer is under-sized, so
+ * they share this resolver rather than each repeating the bounds check. */
+static inline const char *meth_sa_ref_name(const bntseq_t *bns, int32_t rid)
+{
+    const char *name = (rid >= 0 && rid < bns->n_seqs) ? bns->anns[rid].name : NULL;
+    return name != NULL ? name : "*";
+}
+
 int meth_mem_aln_to_bam(bam1_t *b,
                         const mem_opt_t *opt, const bntseq_t *bns,
                         const uint8_t *pac,
@@ -302,6 +313,9 @@ int meth_mem_aln_to_bam(bam1_t *b,
 {
     if (b == NULL || opt == NULL || s == NULL || list == NULL
             || bns == NULL || pac == NULL) return -1;
+
+    /* Reused per-record scratch, shared with the non-meth writer. */
+    static thread_local bwamem3::BamRecScratch bs;
 
     /* Local copies so flag/rid can be mutated without touching the caller's. */
     mem_aln_t p = list[which];
@@ -341,7 +355,7 @@ int meth_mem_aln_to_bam(bam1_t *b,
     uint32_t *bam_cigar = NULL;
     size_t    bam_n_cigar = 0;
     if (p.n_cigar > 0) {
-        bam_cigar = (uint32_t *)malloc((size_t)p.n_cigar * sizeof(uint32_t));
+        bam_cigar = bs.ensure_cigar((size_t)p.n_cigar);
         if (bam_cigar == NULL) return -1;
         for (int i = 0; i < p.n_cigar; ++i) {
             int op  = p.cigar[i] & 0xf;
@@ -402,8 +416,8 @@ int meth_mem_aln_to_bam(bam1_t *b,
     char *qual_bin = NULL;
     if (emit_seq && qe > qb) {
         l_emit = (size_t)(qe - qb);
-        seq_text = (char *)malloc(l_emit + 1);
-        if (seq_text == NULL) { free(bam_cigar); return -1; }
+        seq_text = bs.ensure_seq(l_emit + 1);
+        if (seq_text == NULL) return -1;
         if (orig_seq != NULL) {
             /* Apply is_rev RC + supp soft-clip trim over pre-c2t bases. */
             if (!p.is_rev) {
@@ -432,8 +446,8 @@ int meth_mem_aln_to_bam(bam1_t *b,
         }
         seq_text[l_emit] = '\0';
         if (s->qual) {
-            qual_bin = (char *)malloc(l_emit);
-            if (qual_bin == NULL) { free(seq_text); free(bam_cigar); return -1; }
+            qual_bin = bs.ensure_qual(l_emit);
+            if (qual_bin == NULL) return -1;
             if (!p.is_rev) {
                 for (size_t i = 0; i < l_emit; ++i) qual_bin[i] = (char)((unsigned char)s->qual[qb + (int)i] - 33);
             } else {
@@ -498,10 +512,10 @@ int meth_mem_aln_to_bam(bam1_t *b,
                        l_emit, seq_text, qual_bin,
                        /* l_aux */ 0);
 
-    free(bam_cigar);
-    free(seq_text);
-    free(qual_bin);
-    if (ret < 0) return -1;  /* xm aliases thread-local scratch; no free */
+    /* bam_cigar/seq_text/qual_bin are the reused thread-local scratch — no free
+     * here; bam_set1 has already copied them into b->data. Same for xm, which
+     * aliases meth_xm.cpp's own thread-local scratch. */
+    if (ret < 0) return -1;
 
     /* Aux tags — roughly match mem_aln2sam emission order */
     if (p.n_cigar > 0) {
@@ -511,18 +525,26 @@ int meth_mem_aln_to_bam(bam1_t *b,
         bam_aux_append(b, "MD", 'Z', (int)strlen(md) + 1, (const uint8_t *)md);
     }
     if (mp && mp->n_cigar > 0) {
-        /* Growable so long mate CIGARs don't silently truncate. */
-        kstring_t mc = {0, 0, NULL};
+        /* Reused thread-local kstring, grown as needed. */
+        kstring_t *mc = &bs.mc;
+        mc->l = 0;   /* reset the reused scratch; capacity/mc->s persist */
+        /* Propagate OOM: on failure ks_resize leaves the buffer too small, and
+         * kputw/kputc swallow their own failures, so without this the record
+         * could emit with MC silently truncated/omitted. */
+        if (ks_resize(mc, (size_t)mp->n_cigar * 12 + 1) < 0) return -1;   /* worst case: 10 digits + op + NUL */
         for (int i = 0; i < mp->n_cigar; ++i) {
             int op = mp->cigar[i] & 0xf;
             int len = mp->cigar[i] >> 4;
             if (!(opt->flag & MEM_F_SOFTCLIP) && !mp->is_alt && (op == 3 || op == 4))
                 op = which ? 4 : 3;
-            ksprintf(&mc, "%d%c", len, "MIDSH"[op]);
+            /* kputw + kputc instead of ksprintf("%d%c"): same bytes, no vsnprintf
+             * (which ran twice per op — measure then format). */
+            kputw(len, mc);
+            kputc("MIDSH"[op], mc);
         }
-        if (mc.l > 0)
-            bam_aux_append(b, "MC", 'Z', (int)mc.l + 1, (const uint8_t *)mc.s);
-        free(mc.s);
+        if (mc->l > 0)
+            bam_aux_append(b, "MC", 'Z', (int)mc->l + 1, (const uint8_t *)mc->s);
+        /* no free: bs.mc.s persists across records, freed on thread exit */
     }
     /* MQ:i — guarded on `mp` alone, not on the MC block's `mp->n_cigar > 0`, so
      * a mate with no CIGAR still gets its MAPQ. The compat gate is always open
@@ -555,28 +577,40 @@ int meth_mem_aln_to_bam(bam1_t *b,
         for (int i = 0; i < n_alns; ++i)
             if (i != which && !(list[i].flag & 0x100)) { has_other = 1; break; }
         if (has_other) {
-            kstring_t sa = {0, 0, NULL};
+            kstring_t *sa = &bs.sa;
+            sa->l = 0;   /* reset the reused scratch; capacity/sa->s persist */
+            /* Propagate OOM like the MC:Z path above: kputs/kputw/kputc swallow
+             * their own failures, so without pre-sizing the record could emit
+             * with SA silently truncated/omitted. Worst case per hit: rname +
+             * n_cigar*(10 digits + op) + 64 (pos/strand/mapq/NM/commas/;). Both
+             * loops resolve the name through meth_sa_ref_name so the length
+             * measured here is the length written below. */
+            size_t max_sa_len = 0;
+            for (int i = 0; i < n_alns; ++i) {
+                if (i == which || (list[i].flag & 0x100)) continue;
+                const mem_aln_t *r = &list[i];
+                max_sa_len += strlen(meth_sa_ref_name(bns, r->rid))
+                            + (size_t)r->n_cigar * 12 + 64;
+            }
+            if (ks_resize(sa, max_sa_len + 1) < 0) return -1;
             for (int i = 0; i < n_alns; ++i) {
                 const mem_aln_t *r = &list[i];
                 if (i == which || (r->flag & 0x100)) continue;
-                const char *r_name = NULL;
-                if (r->rid >= 0 && r->rid < bns->n_seqs)
-                    r_name = bns->anns[r->rid].name;
-                if (r_name == NULL) r_name = "*";
-                kputs(r_name, &sa); kputc(',', &sa);
-                kputl(r->pos + 1, &sa); kputc(',', &sa);
-                kputc("+-"[r->is_rev], &sa); kputc(',', &sa);
+                const char *r_name = meth_sa_ref_name(bns, r->rid);
+                kputs(r_name, sa); kputc(',', sa);
+                kputl(r->pos + 1, sa); kputc(',', sa);
+                kputc("+-"[r->is_rev], sa); kputc(',', sa);
                 for (int k = 0; k < r->n_cigar; ++k) {
-                    kputw(r->cigar[k] >> 4, &sa);
-                    kputc("MIDSH"[r->cigar[k] & 0xf], &sa);
+                    kputw(r->cigar[k] >> 4, sa);
+                    kputc("MIDSH"[r->cigar[k] & 0xf], sa);
                 }
-                kputc(',', &sa); kputw(r->mapq, &sa);
-                kputc(',', &sa); kputw(r->NM, &sa);
-                kputc(';', &sa);
+                kputc(',', sa); kputw(r->mapq, sa);
+                kputc(',', sa); kputw(r->NM, sa);
+                kputc(';', sa);
             }
-            if (sa.l > 0)
-                bam_aux_append(b, "SA", 'Z', (int)sa.l + 1, (const uint8_t *)sa.s);
-            free(sa.s);
+            if (sa->l > 0)
+                bam_aux_append(b, "SA", 'Z', (int)sa->l + 1, (const uint8_t *)sa->s);
+            /* no free: bs.sa.s persists across records, freed on thread exit */
         }
     }
     /* XA:Z — D3 (PR-5): p.XA is produced by mem_gen_alt against the ORIGINAL

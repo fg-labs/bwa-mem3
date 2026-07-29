@@ -5,6 +5,7 @@
 #include "htslib/sam.h"
 #include "htslib/kstring.h"
 
+#include "bam_rec_scratch.h"
 #include "bam_writer.h"
 #include "cigar_util.h"
 #include "sam_encode.h"
@@ -248,41 +249,6 @@ static void append_sam_aux_tokens(struct bam1_t *b, const char *s, int meth_mode
     }
 }
 
-/* Per-thread scratch for the transient bam_cigar / seq_text / qual_bin buffers
- * built in mem_aln_to_bam. These were three malloc/free per emitted record;
- * bam_set1 copies them into b->data before returning, so a per-thread grow-only
- * buffer reused across records is safe and removes the allocator round-trips
- * (real pressure at tens of millions of records × many threads). Freed on
- * thread exit. */
-namespace {
-struct BamRecScratch {
-    uint32_t *cigar = nullptr; size_t cigar_cap = 0;   // in uint32 ops
-    char     *seq   = nullptr; size_t seq_cap   = 0;   // in bytes (incl NUL)
-    char     *qual  = nullptr; size_t qual_cap  = 0;   // in bytes
-    /* Grow-only kstrings for the MC:Z (mate CIGAR, ~every paired record) and
-     * SA:Z (other primary hits, multi-mapping records) aux tags. Reset .l = 0
-     * per record and reused; the buffer persists so building them is no longer
-     * a malloc/free per record (freed on thread exit like the buffers above). */
-    kstring_t mc = {0, 0, nullptr};
-    kstring_t sa = {0, 0, nullptr};
-    uint32_t *ensure_cigar(size_t n) {
-        if (n > cigar_cap) { free(cigar); cigar = (uint32_t *)malloc(n * sizeof(uint32_t)); cigar_cap = cigar ? n : 0; }
-        return cigar;
-    }
-    char *ensure_seq(size_t n)  { if (n > seq_cap)  { free(seq);  seq  = (char *)malloc(n); seq_cap  = seq  ? n : 0; } return seq;  }
-    char *ensure_qual(size_t n) { if (n > qual_cap) { free(qual); qual = (char *)malloc(n); qual_cap = qual ? n : 0; } return qual; }
-    ~BamRecScratch() { free(cigar); free(seq); free(qual); free(mc.s); free(sa.s); }
-
-    /* Manages raw memory with a custom destructor: delete copies so an accidental
-     * copy can't double-free. Only ever used as a static thread_local (never
-     * copied), so this is future-proofing, not a live fix. Declaring the copy
-     * ctor suppresses the implicit default ctor, so default it explicitly. */
-    BamRecScratch() = default;
-    BamRecScratch(const BamRecScratch &) = delete;
-    BamRecScratch &operator=(const BamRecScratch &) = delete;
-};
-} // namespace
-
 int mem_aln_to_bam(struct bam1_t *b,
                    const mem_opt_t *opt, const bntseq_t *bns,
                    const bseq1_t *s, int n_alns,
@@ -291,7 +257,7 @@ int mem_aln_to_bam(struct bam1_t *b,
 {
     if (b == NULL || opt == NULL || s == NULL || list == NULL) return -1;
 
-    static thread_local BamRecScratch bs;   /* reused per-record scratch (C2) */
+    static thread_local bwamem3::BamRecScratch bs;   /* reused per-record scratch (C2) */
 
     mem_aln_t p = list[which];
     mem_aln_t m;

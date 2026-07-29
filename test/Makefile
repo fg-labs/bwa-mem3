@@ -58,10 +58,10 @@ LDFLAGS += $(HTSLIB_static_LDFLAGS)
 
 ifneq ($(IS_ARM),)
     CPPFLAGS = -DENABLE_PREFETCH -D__SSE__=1 -D__SSE2__=1 -D__SSE3__=1 -D__SSSE3__=1 -D__SSE4_1__=1 -D__SSE4_2__=1 -DAPPLE_SILICON=1 -DCACHE_LINE_BYTES=128
-    INCLUDES = -I../src -I../ext/sse2neon -I../ext
+    INCLUDES = -I../src -I../ext/sse2neon -I../ext -I../ext/htslib
 else
     CPPFLAGS = -DENABLE_PREFETCH
-    INCLUDES = -I../src -I../ext
+    INCLUDES = -I../src -I../ext -I../ext/htslib
 endif
 
 FRAMEWORK_DIR   := framework
