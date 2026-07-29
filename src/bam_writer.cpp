@@ -10,6 +10,7 @@
 #include "sam_encode.h"
 #include "utils.h"
 
+#include <cassert>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -42,21 +43,9 @@ bam_writer_t *bam_writer_open(const char *path, const bntseq_t *bns,
     // @HD records, so emitting both would produce two @HD lines. The
     // caller (fastmap.cpp) has already nulled `idx_hdr_lines` when the
     // user's -H supplies @SQ, so if we see @SQ here, they're authoritative.
-    int idx_has_sq = 0, idx_has_hd = 0;
-    if (idx_hdr_lines != NULL && idx_hdr_lines[0] != '\0') {
-        if (strncmp(idx_hdr_lines, "@SQ\t", 4) == 0 ||
-            strstr(idx_hdr_lines, "\n@SQ\t") != NULL)
-            idx_has_sq = 1;
-        if (strncmp(idx_hdr_lines, "@HD\t", 4) == 0 ||
-            strstr(idx_hdr_lines, "\n@HD\t") != NULL)
-            idx_has_hd = 1;
-    }
-    int user_has_hd = 0;
-    if (hdr_line != NULL && hdr_line[0] != '\0') {
-        if (strncmp(hdr_line, "@HD\t", 4) == 0 ||
-            strstr(hdr_line, "\n@HD\t") != NULL)
-            user_has_hd = 1;
-    }
+    const int idx_has_sq  = bwa_hdr_text_has_type(idx_hdr_lines, "@SQ\t");
+    const int idx_has_hd  = bwa_hdr_text_has_type(idx_hdr_lines, "@HD\t");
+    const int user_has_hd = bwa_hdr_text_has_type(hdr_line, "@HD\t");
 
     sam_hdr_t *hdr = sam_hdr_init();
     if (hdr == NULL) return NULL;
@@ -75,24 +64,20 @@ bam_writer_t *bam_writer_open(const char *path, const bntseq_t *bns,
     if (!idx_has_hd && !user_has_hd && compat->emit_hd &&
         sam_hdr_add_lines(hdr, compat->hd_line, 0) < 0) goto fail;
     if (!idx_has_sq) {
+        // One shared formatter (bwa.cpp) rather than sam_hdr_add_line varargs:
+        // the @SQ contents -- including AH:* on ALT contigs -- are identical on
+        // every path, and this writer having its own spelling is how it came to
+        // silently drop AH for every ALT-aware reference (#281, fixed per-copy;
+        // #289 consolidates them). Not gated on `compat`: both upstreams emit
+        // this block, so it is correct output, not a divergence.
+        kstring_t sq = {0, 0, NULL};
         for (int i = 0; i < bns->n_seqs; ++i) {
-            char len_buf[32];
-            snprintf(len_buf, sizeof(len_buf), "%lld", (long long)bns->anns[i].len);
-            // AH:* on ALT contigs. Both upstreams emit it on the generated
-            // @SQ block (bwa/bwa.c:432, bwa-mem2/src/bwa.cpp:538) and so does
-            // our SAM text path (bwa.cpp); this writer was ported as an
-            // SN+LN-only loop and silently dropped it for EVERY ALT-aware
-            // reference, sidecar or not. `is_alt` comes from <prefix>.alt via
-            // bwa_idx_load and has no representation in an htslib sam_hdr_t,
-            // so it must be re-applied here. Not gated on `compat`: it is what
-            // both upstreams do, so it is correct output, not a divergence.
-            int rc = bns->anns[i].is_alt
-                   ? sam_hdr_add_line(hdr, "SQ", "SN", bns->anns[i].name,
-                                      "LN", len_buf, "AH", "*", NULL)
-                   : sam_hdr_add_line(hdr, "SQ", "SN", bns->anns[i].name,
-                                      "LN", len_buf, NULL);
-            if (rc < 0) goto fail;
+            sq.l = 0;                      // reuse the buffer across contigs
+            if (bwa_format_sq_line(&sq, &bns->anns[i]) < 0) { free(sq.s); goto fail; }
+            int rc = sam_hdr_add_lines(hdr, sq.s, sq.l);
+            if (rc < 0) { free(sq.s); goto fail; }
         }
+        free(sq.s);
     }
     // Merge the index's .hdr/.dict records after the default @HD (and
     // auto-generated @SQ, when the index didn't supply its own) but before
@@ -108,22 +93,33 @@ bam_writer_t *bam_writer_open(const char *path, const bntseq_t *bns,
             const int keep_first_hd = !user_has_hd;
             int seen_hd = 0;
             // Copy idx_hdr_lines, dropping the losing @HD records.
+            //
+            // n + 2, not n + 1: the loop below writes a '\n' after EVERY record
+            // it keeps, but bwa_load_hdr_from_index strips the trailing newline
+            // from the text it returns, so `n` counts one separator fewer than
+            // the loop emits. Keeping every record of unterminated text
+            // therefore needs n + 1 bytes plus the NUL -- the exact case a
+            // sidecar with one @HD and no user -H produces, which overflowed
+            // this buffer by one byte on every such run.
             size_t n = strlen(idx_hdr_lines);
-            filtered = (char *)malloc(n + 1);
+            filtered = (char *)malloc(n + 2);
             if (filtered == NULL) goto fail;
             size_t w = 0;
-            const char *p = idx_hdr_lines;
-            while (*p) {
-                const char *eol = strchr(p, '\n');
-                size_t len = eol ? (size_t)(eol - p) : strlen(p);
-                int is_hd = (len >= 4 && strncmp(p, "@HD\t", 4) == 0);
+            const char *cur = idx_hdr_lines, *line; size_t len;
+            while (bwa_hdr_next_line(&cur, &line, &len)) {
+                int is_hd = (len >= 4 && strncmp(line, "@HD\t", 4) == 0);
                 if (len > 0 && (!is_hd || (keep_first_hd && !seen_hd))) {
-                    memcpy(filtered + w, p, len); w += len;
+                    memcpy(filtered + w, line, len); w += len;
                     filtered[w++] = '\n';
                 }
                 if (is_hd) seen_hd = 1;
-                p = eol ? eol + 1 : p + len;
             }
+            /* The n + 2 bound above is derived from bwa_hdr_next_line never
+             * yielding a phantom empty final record. Pin that derivation here:
+             * if the iterator's trailing-newline handling ever changes, this
+             * trips in a debug/ASAN build instead of silently overflowing the
+             * buffer by one byte again. */
+            assert(w <= n + 1);
             filtered[w] = '\0';
             to_add = filtered;
         }

@@ -37,22 +37,6 @@ static void sanitize_cl(char *s)
     for (; *s; ++s) if (*s == '\t') *s = ' ';
 }
 
-/* True if the SAM header text `s` contains a line whose type is `tag4`
- * (e.g. "@HD\t"): either as the first line or following a newline. Used to
- * avoid emitting a default @HD when the user's -H already supplies one —
- * htslib's sam_hdr_add_lines does not de-dup @HD records, so two would be
- * written. Mirrors the same guard in bam_writer.cpp's default path. */
-static int hdr_text_has_type(const char *s, const char *tag4)
-{
-    if (s == NULL || s[0] == '\0') return 0;
-    size_t n = strlen(tag4);
-    if (strncmp(s, tag4, n) == 0) return 1;
-    char needle[8] = "\n";
-    /* tag4 is always 4 chars ("@XX\t"); "\n" + tag4 fits in 8. */
-    strncpy(needle + 1, tag4, sizeof(needle) - 2);
-    return strstr(s, needle) != NULL;
-}
-
 /* True if the tab-delimited @SQ `line` (length `line_len`) carries a token
  * exactly equal to `key``val` (whole token, not a prefix) — e.g. key="SN:"
  * val="<name>", or key="LN:" val="<decimal>". */
@@ -84,27 +68,29 @@ static int sq_line_has_kv(const char *line, size_t line_len,
  * whose M5/UR would misidentify the sequence, so nothing is appended in that
  * case. Appends nothing if `hdr_text` is NULL/empty or has no matching @SQ.
  * SN is unique in a valid header, so the first match wins. */
-static void meth_append_sq_extra_tags(const char *hdr_text, const char *sn,
-                                      int64_t expected_len, kstring_t *out)
+/* Returns 0 on success (including "nothing to append"), -1 if a kstring append
+ * failed. The caller must not add the @SQ line on -1: `out` would be a
+ * truncated record, and emitting a header line missing half its identity tags
+ * is worse than failing the open. */
+static int meth_append_sq_extra_tags(const char *hdr_text, const char *sn,
+                                     int64_t expected_len, kstring_t *out)
 {
-    if (hdr_text == NULL || hdr_text[0] == '\0' || sn == NULL) return;
+    if (hdr_text == NULL || hdr_text[0] == '\0' || sn == NULL) return 0;
     static const char *const WANT[] = { "M5:", "UR:", "AS:", "SP:" };
     const int n_want = (int)(sizeof(WANT) / sizeof(WANT[0]));
     const size_t sn_len = strlen(sn);
     char ln_buf[32];
     int ln_len = snprintf(ln_buf, sizeof(ln_buf), "%lld", (long long)expected_len);
-    if (ln_len <= 0 || (size_t)ln_len >= sizeof(ln_buf)) return;
+    if (ln_len <= 0 || (size_t)ln_len >= sizeof(ln_buf)) return 0;
 
-    const char *line = hdr_text;
-    while (*line != '\0') {
-        const char *eol = strchr(line, '\n');
-        size_t line_len = eol ? (size_t)(eol - line) : strlen(line);
+    const char *cur = hdr_text, *line; size_t line_len;
+    while (bwa_hdr_next_line(&cur, &line, &line_len)) {
         if (line_len >= 4 && strncmp(line, "@SQ\t", 4) == 0 &&
             sq_line_has_kv(line, line_len, "SN:", 3, sn, sn_len)) {
             /* SN matched: only enrich when LN agrees, else the sidecar is
              * stale/foreign and its identity tags can't be trusted. */
             if (!sq_line_has_kv(line, line_len, "LN:", 3, ln_buf, (size_t)ln_len))
-                return;
+                return 0;
             const char *end = line + line_len;
             const char *p = line + 3;
             while (p < end) {
@@ -113,41 +99,42 @@ static void meth_append_sq_extra_tags(const char *hdr_text, const char *sn,
                 if (tok_end == NULL) tok_end = end;
                 for (int i = 0; i < n_want; ++i) {
                     if ((size_t)(tok_end - tok) > 3 && strncmp(tok, WANT[i], 3) == 0) {
-                        kputc('\t', out);
-                        kputsn(tok, (int)(tok_end - tok), out);
+                        if (kputc('\t', out) < 0 ||
+                            kputsn(tok, (int)(tok_end - tok), out) < 0)
+                            return -1;
                         break;
                     }
                 }
                 p = tok_end;
             }
-            return;                           /* SN is unique; first match wins */
+            return 0;                         /* SN is unique; first match wins */
         }
-        if (eol == NULL) break;
-        line = eol + 1;
     }
+    return 0;
 }
 
 /* Append to `out` every record line of `hdr_text` that is NOT @HD or @SQ
  * (i.e. @CO/@PG/@RG and any others), each terminated by '\n'. @SQ is skipped
  * because the consolidated @SQ block is authoritative (its identity tags are
  * merged separately by meth_append_sq_extra_tags); @HD is skipped because the
- * writer emits its own. */
-static void meth_append_passthrough_records(const char *hdr_text, kstring_t *out)
+ * writer emits its own.
+ *
+ * Returns 0 on success, -1 if a kstring append failed -- the same contract as
+ * meth_append_sq_extra_tags above, and for the same reason: on -1 `out` holds a
+ * truncated record set, so the caller must not pass it to sam_hdr_add_lines. */
+static int meth_append_passthrough_records(const char *hdr_text, kstring_t *out)
 {
-    if (hdr_text == NULL) return;
-    const char *line = hdr_text;
-    while (*line != '\0') {
-        const char *eol = strchr(line, '\n');
-        size_t line_len = eol ? (size_t)(eol - line) : strlen(line);
+    if (hdr_text == NULL) return 0;
+    const char *cur = hdr_text, *line; size_t line_len;
+    while (bwa_hdr_next_line(&cur, &line, &line_len)) {
         int skip = (line_len >= 4 && (strncmp(line, "@HD\t", 4) == 0 ||
                                       strncmp(line, "@SQ\t", 4) == 0));
         if (!skip && line_len > 0) {
-            kputsn(line, (int)line_len, out);
-            kputc('\n', out);
+            if (kputsn(line, (int)line_len, out) < 0 || kputc('\n', out) < 0)
+                return -1;
         }
-        if (eol == NULL) break;
-        line = eol + 1;
     }
+    return 0;
 }
 
 meth_bam_writer_t *meth_bam_writer_open(const char *path_or_dash,
@@ -181,7 +168,7 @@ meth_bam_writer_t *meth_bam_writer_open(const char *path_or_dash,
      * and OFF's hd_line IS BWAMEM3_DEFAULT_HD_LINE. A future target that
      * relaxes the --meth exclusion must plumb compat->emit_hd/hd_line through
      * here too. */
-    if (!hdr_text_has_type(hdr_line, "@HD\t") &&
+    if (!bwa_hdr_text_has_type(hdr_line, "@HD\t") &&
         sam_hdr_add_lines(w->hdr, BWAMEM3_DEFAULT_HD_LINE, 0) < 0) goto fail;
 
     /* @SQ directly from the ORIGINAL (un-converted) bns contigs (D3 PR-5: no
@@ -197,16 +184,25 @@ meth_bam_writer_t *meth_bam_writer_open(const char *path_or_dash,
      * the sidecar enrichment: meth_append_sq_extra_tags copies only
      * M5/UR/AS/SP, never AH. Appended BEFORE those tags so the line reads
      * SN, LN, AH, then identity tags -- the order bwa emits. */
-    for (int i = 0; i < bns->n_seqs; ++i) {
+    {
         kstring_t sq = {0, 0, NULL};
-        ksprintf(&sq, "@SQ\tSN:%s\tLN:%lld",
-                 bns->anns[i].name, (long long)bns->anns[i].len);
-        if (bns->anns[i].is_alt) kputs("\tAH:*", &sq);
-        meth_append_sq_extra_tags(orig_idx_hdr_lines, bns->anns[i].name,
-                                  bns->anns[i].len, &sq);
-        int rc = (sq.s != NULL) ? sam_hdr_add_lines(w->hdr, sq.s, sq.l) : -1;
+        for (int i = 0; i < bns->n_seqs; ++i) {
+            sq.l = 0;                    /* reuse the buffer across contigs */
+            if (bwa_format_sq_line(&sq, &bns->anns[i]) < 0) { free(sq.s); goto fail; }
+            if (meth_append_sq_extra_tags(orig_idx_hdr_lines, bns->anns[i].name,
+                                          bns->anns[i].len, &sq) < 0) {
+                free(sq.s);
+                goto fail;
+            }
+            /* No `sq.s != NULL` guard: that check existed because the old
+             * inline ksprintf could leave sq.s NULL with no way to say so.
+             * bwa_format_sq_line reports that as -1 above, and a failed
+             * enrichment append is reported as -1 too -- so by here sq holds a
+             * complete record. bam_writer.cpp's copy of this loop never had it. */
+            int rc = sam_hdr_add_lines(w->hdr, sq.s, sq.l);
+            if (rc < 0) { free(sq.s); goto fail; }
+        }
         free(sq.s);
-        if (rc < 0) goto fail;
     }
 
     /* Original reference's non-@HD/@SQ sidecar records (@CO/@PG/@RG),
@@ -219,7 +215,10 @@ meth_bam_writer_t *meth_bam_writer_open(const char *path_or_dash,
      * contigs) is never consulted. */
     if (orig_idx_hdr_lines != NULL && orig_idx_hdr_lines[0] != '\0') {
         kstring_t pt = {0, 0, NULL};
-        meth_append_passthrough_records(orig_idx_hdr_lines, &pt);
+        if (meth_append_passthrough_records(orig_idx_hdr_lines, &pt) < 0) {
+            free(pt.s);
+            goto fail;
+        }
         int rc = (pt.l > 0) ? sam_hdr_add_lines(w->hdr, pt.s, pt.l) : 0;
         free(pt.s);
         if (rc < 0) goto fail;

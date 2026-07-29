@@ -5,6 +5,25 @@ on:
     branches: [main]
   pull_request:
 
+# Least-privilege GITHUB_TOKEN. Without this block the token inherits the
+# repository default, which -- depending on the org/repo setting -- can be
+# read/write across contents, issues, pull requests and more, far beyond what
+# any job here needs. Nothing in this workflow uses the token except
+# actions/checkout, so `contents: read` is the whole requirement:
+#
+#   - actions/upload-artifact and actions/cache authenticate with
+#     ACTIONS_RUNTIME_TOKEN, which the runner injects independently of
+#     `permissions:` -- they need no grant here.
+#   - codecov-action uploads tokenless (no `token:`/`use_oidc:` below), so it
+#     needs neither `id-token: write` nor a secret.
+#
+# release.yml is the counterexample worth keeping in view: it starts from
+# `permissions: {}` and grants `contents`/`pull-requests` write per job,
+# because its jobs genuinely differ. Here all three jobs need exactly
+# `contents: read`, so it is declared once at the workflow level.
+permissions:
+  contents: read
+
 jobs:
   build-and-test:
     strategy:
@@ -78,6 +97,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
+          # Do not leave the GITHUB_TOKEN in .git/config after checkout. The
+          # steps that follow run the repository's own build scripts and the
+          # vendored submodules' configure/make, none of which does any git
+          # operation needing auth -- so a persisted credential is reachable
+          # by that code for no benefit. `submodules: recursive` is unaffected;
+          # checkout authenticates the submodule fetch inline. profiling-build
+          # below already set this; all four checkouts now agree.
+          persist-credentials: false
           submodules: recursive
 
       - name: Install dependencies (Linux)
@@ -493,6 +520,11 @@ jobs:
         if: matrix.canonical == true
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
+          # Most important of the four: this is a THIRD-PARTY tree, and the
+          # steps below copy fixtures out of it and run test/regression scripts
+          # against it. Persisting this repository's token inside a foreign
+          # checkout's .git/config has no use here at all.
+          persist-credentials: false
           repository: brentp/bwa-meth
           path: bwa-meth-oracle
 
@@ -552,6 +584,15 @@ jobs:
           CHR22_SIM_DIR=/tmp/chr22-sim-dense \
           PIXI_MANIFEST="$GITHUB_WORKSPACE/test/holodeck/pixi.toml" \
           bash test/regression/short_read_smoke.sh
+          # Re-run the header regression against the SAME asan binary. The
+          # header writers size buffers from header text, and a one-byte
+          # overrun there changes no output byte, so the non-asan run of this
+          # script earlier in the row cannot see it -- only asan can. Cheap
+          # (it builds its own 3-contig ALT fixture) and it needs the samtools
+          # apt package this row already installs for `samtools dict`.
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          HEADER_PARITY_WORK_DIR=/tmp/header-parity-asan \
+          bash test/regression/header_parity.sh
 
   coverage:
     name: Coverage (Linux AVX2, gcov → Codecov)
@@ -560,6 +601,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
+          persist-credentials: false
           submodules: recursive
 
       - name: Install dependencies

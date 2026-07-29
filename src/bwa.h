@@ -38,6 +38,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "bwt.h"
 #include "macro.h"
 #include "compat_target.h"
+#include "kstring.h"
 #include "read_arena.h"
 
 #define BWA_IDX_BWT 0x1
@@ -158,6 +159,20 @@ extern "C" {
 	void bwa_print_sam_hdr2(const bntseq_t *bns, const char *idx_hdr_lines,
 	                        const char *hdr_line, FILE *fp,
 	                        const compat_target_t *compat);
+	/* Append the generated @SQ record for `ann` (SN, LN, and AH:* when the
+	 * contig is ALT) to `out`, without a trailing newline. The single
+	 * definition shared by the SAM-text, --bam and --meth writers. Returns 0,
+	 * or -1 if `out` could not be grown -- on -1 no record was appended and
+	 * `out->s` may be NULL, so callers must not emit `out`. */
+	int bwa_format_sq_line(kstring_t *out, const bntann1_t *ann);
+	/* True if SAM header text `s` contains a record whose type is `tag`
+	 * ("@HD\t", "@SQ\t", ...), as the first line or after a newline. The type
+	 * may be any length; an empty one matches nothing. */
+	int bwa_hdr_text_has_type(const char *s, const char *tag);
+	/* Iterate newline-separated SAM header records. Start with *p at the text;
+	 * sets *line/*len to the next record (no newline) and advances *p, returning
+	 * 1, or returns 0 at end of text. */
+	int bwa_hdr_next_line(const char **p, const char **line, size_t *len);
 	char *bwa_load_hdr_from_index(const char *prefix);
 	/* Warn (at bwa_verbose >= 2) when the index marks contigs ALT but the
 	 * sidecar's @SQ block carries no AH for them. The sidecar is authoritative
