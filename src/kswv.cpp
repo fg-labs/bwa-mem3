@@ -178,6 +178,18 @@ static inline int compute_jdummy(const SeqPair *p, int width, int ncol, int cap)
         m11 = _mm512_subs_epu8(m11, sft512);                            \
         h11 = _mm512_max_epu8(m11, e11);                                \
         h11 = _mm512_max_epu8(h11, f11);                                \
+        /* AVX-512 deliberately KEEPS the per-cell query-end tracking    \
+         * that NEON and AVX2 defer to a post-row rescan. Measured on    \
+         * c7i/wgs-5M: deferring is worth -6.69 % here (the largest gain \
+         * of any tier) but recovering qe by rescanning costs ~7 pp on   \
+         * top, for a net +1.23 % REGRESSION. The rescan is dearer at 64 \
+         * lanes because its trigger is "did ANY lane advance", so it    \
+         * fires on 39.9 % of rows versus 18.9 % at 16 lanes. Masking    \
+         * the scan to the active lanes and exiting once they are all    \
+         * found recovers only ~1 pp (+0.24 %), because a firing row     \
+         * usually has many active lanes and the last match tends to sit \
+         * late in the row. Capturing the -6.69 % needs a cheaper way to \
+         * obtain qe, not a cheaper scan. */                             \
         __mmask64 cmp0 = _mm512_cmpgt_epu8_mask(h11, imax512);          \
         imax512 = _mm512_max_epu8(imax512, h11);                        \
         iqe512 = _mm512_mask_blend_epi8(cmp0, iqe512, l512);            \
@@ -260,6 +272,15 @@ kswv::kswv(const int o_del, const int e_del, const int o_ins,
     H8_0 = (uint8_t*) H16_0;
     H8_1 = (uint8_t*) H16_1;
     rowMax8 = (uint8_t*) rowMax16;
+
+    /* Column-index broadcast table for the u8 kernels' post-row query-end
+     * rescan; see kswv.h. Shared by all threads and never written after
+     * construction. */
+    colIdx8 = (uint8_t *)_mm_malloc((size_t) this->maxQerLen * SIMD_WIDTH8
+                                    * sizeof(uint8_t), 64);
+    for (int32_t j = 0; j < this->maxQerLen; ++j)
+        for (int k = 0; k < SIMD_WIDTH8; ++k)
+            colIdx8[(size_t) j * SIMD_WIDTH8 + k] = (uint8_t) j;
 }
 
 // Mat-aware constructor (issue 173). Delegates to the 9-arg ctor (identical
@@ -369,6 +390,7 @@ kswv::kswv(const int o_del, const int e_del, const int o_ins,
 kswv::~kswv() {
     _mm_free(F16); _mm_free(H16_0); _mm_free(H16_1);
     _mm_free(rowMax16);
+    _mm_free(colIdx8);
 }
 
 
@@ -545,7 +567,6 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
     uint64_t *b;
 
     uint8x16_t zero_vec = vdupq_n_u8(0);
-    uint8x16_t one_vec = vdupq_n_u8(1);
 
     m_b = n_b = 0; b = 0;
 
@@ -733,7 +754,6 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
         s1 = vld1q_u8(seq1SoA + (i + 0) * SIMD_WIDTH8);
         h10 = zero_vec;
         imax_vec = zero_vec;
-        uint8x16_t iqe_vec = vdupq_n_u8(0xFF);
 
         /* Freed-cell override (issue 173, bisulfite OT/OB + TAPS neutral). The
          * freed cell (s1==fr_ref, s2==fr_read) scores fr_val. s1 is
@@ -769,8 +789,6 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
             active_frread = vbslq_u8(rowfreed,  vdupq_n_u8((uint8_t)fr_read),
                                      active_frread);
         }
-
-        uint8x16_t l_vec = zero_vec;
 
         /* One DP cell. BND is the boundary mask -- bit 7 set in the reference
          * base (rows past len1) or the query base (columns past this lane's
@@ -820,10 +838,10 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
             uint8x16_t hme = vmaxq_u8(m11, e11);                                \
             h11 = vmaxq_u8(hme, f11);                                           \
                                                                                 \
-            /* Update imax tracking */                                          \
-            uint8x16_t cmp0 = vcgtq_u8(h11, imax_vec);                          \
+            /* Row max only. The COLUMN at which it sits (the query end) is    \
+             * recovered after the row, and only on the rows that actually     \
+             * advance a lane's global max -- see the rescan below. */         \
             imax_vec = vmaxq_u8(imax_vec, h11);                                 \
-            iqe_vec = vbslq_u8(cmp0, l_vec, iqe_vec);                           \
                                                                                 \
             /* Reassociate BOTH gap recurrences off h11 (Daily-scan algebra).   \
              * e uses max(m11,f11), f uses max(m11,e11) — each drops the term   \
@@ -842,7 +860,6 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
                                                                                 \
             vst1q_u8(H1 + (j + 1) * SIMD_WIDTH8, h11);                          \
             vst1q_u8(F + (j + 1) * SIMD_WIDTH8, f21);                           \
-            l_vec = vaddq_u8(l_vec, one_vec);                                    \
         }
 
         j = 0;
@@ -918,7 +935,40 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
         /* Update te/qe only for active lanes (imax > gmax AND not frozen) */
         te_vec_lo = vbslq_s16(cmp_lo_16, i_vec, te_vec_lo);
         te_vec_hi = vbslq_s16(cmp_hi_16, i_vec, te_vec_hi);
-        qe_vec = vbslq_u8(cmp0_active, iqe_vec, qe_vec);
+
+        /* Query end (qe) of this row's max. The inner loop used to carry it
+         * cell by cell -- a compare against the running row max, a blend of
+         * the column index, and the counter feeding that blend, three of the
+         * seventeen SIMD ALU ops -- on every cell of every row. But qe is only
+         * ever CONSUMED on a row that advances some lane's global max, which
+         * instrumenting wgs-5M puts at 18.9 % of rows. So recover it here
+         * instead, by rescanning this row's H1 for the first column equal to
+         * the row max. At 4 ops per scanned column the amortised cost is
+         * 0.19 * 4 = 0.76 ops per cell against 3 removed.
+         *
+         * Identical by construction. The per-cell form blended iqe on a STRICT
+         * `h11 > running row max`, so what it computed was
+         * min{ j : H1[j+1] == imax } -- exactly what this scan returns. Every
+         * column in [0, ncol) is written to H1 on every row (the jsplit ranges
+         * partition the width, they do not skip any of it), so the scan never
+         * reads a cell left over from an earlier row. Pad columns participate
+         * in column order in both forms, so a row max attained only by a
+         * carried-forward pad column still reports that pad column. Lanes that
+         * did not advance get a garbage index, discarded by the same vbsl the
+         * per-cell form already relied on. */
+        if (neon_movemask_u8(cmp0_active))
+        {
+            uint8x16_t iqe_vec = vdupq_n_u8(0xFF);
+            uint8x16_t found = zero_vec;
+            const uint8_t *colIdx = this->colIdx8;
+            for (int j2 = 0; j2 < ncol; j2++) {
+                uint8x16_t eq = vceqq_u8(vld1q_u8(H1 + (j2 + 1) * SIMD_WIDTH8), imax_vec);
+                uint8x16_t first = vbicq_u8(eq, found);
+                iqe_vec = vbslq_u8(first, vld1q_u8(colIdx + j2 * SIMD_WIDTH8), iqe_vec);
+                found = vorrq_u8(found, eq);
+            }
+            qe_vec = vbslq_u8(cmp0_active, iqe_vec, qe_vec);
+        }
 
         /* Check end score threshold */
         uint8x16_t cmp_end = vcgeq_u8(gmax_vec, endsc_vec);
@@ -1726,7 +1776,6 @@ int kswv::kswv256_u8_impl(uint8_t seq1SoA[],
     uint8_t endsc[SIMD_WIDTH8] __attribute__((aligned(64))) = {0};
 
     const __m256i zero_vec = _mm256_setzero_si256();
-    const __m256i one_vec  = _mm256_set1_epi8(1);
 
     /* Score lookup table (16 bytes). Indexed by (s1 ^ s2). */
     int8_t temp[SIMD_WIDTH8] __attribute__((aligned(64))) = {0};
@@ -1830,8 +1879,6 @@ int kswv::kswv256_u8_impl(uint8_t seq1SoA[],
         __m256i e11 = zero_vec;
         __m256i s1  = _mm256_loadu_si256((const __m256i*)(seq1SoA + i * SIMD_WIDTH8));
         imax_vec    = zero_vec;
-        __m256i iqe_vec = _mm256_set1_epi8((char)0xFF);
-        __m256i l_vec = zero_vec;
         __m256i i_vec_s16 = _mm256_set1_epi16((int16_t)i);
 
         /* Freed-cell override (issue 173, bisulfite OT/OB + TAPS neutral). The
@@ -1905,9 +1952,9 @@ int kswv::kswv256_u8_impl(uint8_t seq1SoA[],
             __m256i h11 = _mm256_max_epu8(m11, e11); \
             h11 = _mm256_max_epu8(h11, f11); \
  \
-            __m256i cmp0 = avx2_cmpgt_u8(h11, imax_vec); \
+            /* Row max only; the query-end column is recovered after the row. \
+             * See the rescan below kswv_neon_u8_impl's equivalent. */ \
             imax_vec = _mm256_max_epu8(imax_vec, h11); \
-            iqe_vec  = avx2_blendv_u8(cmp0, l_vec, iqe_vec); \
  \
             __m256i gapE = _mm256_subs_epu8(h11, oe_ins_vec); \
             e11 = _mm256_subs_epu8(e11, e_ins_vec); \
@@ -1919,7 +1966,6 @@ int kswv::kswv256_u8_impl(uint8_t seq1SoA[],
  \
             _mm256_storeu_si256((__m256i*)(H1 + (j + 1) * SIMD_WIDTH8), h11); \
             _mm256_storeu_si256((__m256i*)(F  + (j + 1) * SIMD_WIDTH8), f21); \
-            l_vec = _mm256_add_epi8(l_vec, one_vec); \
 }
         int j = 0;
         for (; j < jdummy_a2; j++) KSWV_AVX2_U8_CELL(false)
@@ -1963,7 +2009,27 @@ int kswv::kswv256_u8_impl(uint8_t seq1SoA[],
 
         te_vec_lo = avx2_blendv_u8(cmp_lo_16, i_vec_s16, te_vec_lo);
         te_vec_hi = avx2_blendv_u8(cmp_hi_16, i_vec_s16, te_vec_hi);
-        qe_vec    = avx2_blendv_u8(cmp0_active, iqe_vec, qe_vec);
+
+        /* Deferred query-end recovery; see the rescan in kswv_neon_u8_impl for
+         * the full derivation of why this is identical to the per-cell form. */
+        if (_mm256_movemask_epi8(cmp0_active))
+        {
+            __m256i iqe_vec = _mm256_set1_epi8((char)0xFF);
+            __m256i found = zero_vec;
+            const uint8_t *colIdx = this->colIdx8;
+            for (int j2 = 0; j2 < ncol; j2++) {
+                __m256i eq = _mm256_cmpeq_epi8(
+                    _mm256_loadu_si256((const __m256i*)(H1 + (j2 + 1) * SIMD_WIDTH8)),
+                    imax_vec);
+                __m256i first = _mm256_andnot_si256(found, eq);
+                iqe_vec = avx2_blendv_u8(
+                    first,
+                    _mm256_loadu_si256((const __m256i*)(colIdx + j2 * SIMD_WIDTH8)),
+                    iqe_vec);
+                found = _mm256_or_si256(found, eq);
+            }
+            qe_vec = avx2_blendv_u8(cmp0_active, iqe_vec, qe_vec);
+        }
 
         /* End-score check + freeze update. */
         __m256i cmp_end = avx2_cmpge_u8(gmax_vec, endsc_vec);

@@ -567,7 +567,23 @@ private:
 	uint8_t *F8;
 	uint8_t *H8_0, *H8_1;
 	uint8_t *rowMax8;
-	
+
+	/* Column index broadcast across all lanes: colIdx8[j*W + k] == (uint8_t) j.
+	 * The NEON and AVX2 u8 kernels' post-row query-end rescan needs the scanned
+	 * column index in every lane; reading it from this table costs one load,
+	 * where deriving it would cost a broadcast or a running vector add.
+	 * maxQerLen * SIMD_WIDTH8 bytes -- 8 KB at 16 lanes, 33 KB at 64 -- swept in
+	 * column order, so it stays L1-resident alongside H0/H1/F. Unused by the
+	 * AVX-512 u8 kernel, which keeps the per-cell form (see MAIN_SAM_CODE8_OPT
+	 * for why), so on an AVX-512 build this is built once and never read; it is
+	 * left unconditional rather than #ifdef'd because 33 KB of one-time setup
+	 * does not earn another preprocessor branch through the constructor.
+	 *
+	 * Only the low byte matters: the 8-bit kernels' width guard (l_ms * a <
+	 * 250) caps ncol well under 255, and the per-cell counter this replaced was
+	 * itself a u8 that wrapped identically. */
+	uint8_t *colIdx8;
+
 	int16_t *F16;
 	int16_t *H16_0, *H16_1;
 	int16_t *rowMax16;
