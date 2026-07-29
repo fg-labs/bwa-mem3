@@ -406,6 +406,35 @@ jobs:
         run: |
           bash test/run_unit_tests.sh
 
+      - name: Makefile header-dependency check
+        # Runs after the build because it inspects an already-built tree; on an
+        # unbuilt one it would drag in the htslib configure first.
+        #
+        # MAKE_ARGS must carry the same flags this row built with, matching the
+        # `Build bwa-mem3` step above: the wiring probe recompiles one object, and
+        # recompiling it at different flags than libbwa.a was built with is the
+        # hazard this check exists to catch. The empty-arch_flag branch is
+        # unreachable while `canonical` sits on an avx2 row — it is kept so the
+        # step keeps working if canonical ever moves to an ARM or single-binary
+        # row, where an empty `arch=` would select a different build path.
+        if: matrix.canonical == true
+        run: |
+          if [ "${{ matrix.arch_flag }}" = "" ]; then
+            MAKE_ARGS="BASELINE_ARCH=${{ matrix.baseline_arch || 'avx2' }} CXX=${{ matrix.cxx || 'g++' }} USE_MIMALLOC=${{ matrix.use_mimalloc }}" \
+              bash test/regression/make_header_deps.sh
+          else
+            MAKE_ARGS="arch=${{ matrix.arch_flag }} CXX=${{ matrix.cxx || 'g++' }} USE_MIMALLOC=${{ matrix.use_mimalloc }}" \
+              bash test/regression/make_header_deps.sh
+          fi
+
+      - name: Makefile default-goal check
+        # Also post-build, for the same reason as the step above. No arch= here:
+        # the script sets it per case, since the goal is what it is checking.
+        if: matrix.canonical == true
+        run: |
+          MAKE_ARGS="CXX=${{ matrix.cxx || 'g++' }} USE_MIMALLOC=${{ matrix.use_mimalloc }}" \
+            bash test/regression/make_default_goal.sh
+
       - name: --bam=6 roundtrip smoke (chr22)
         if: matrix.canonical == true
         run: |
