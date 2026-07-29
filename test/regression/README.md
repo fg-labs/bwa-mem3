@@ -1,7 +1,9 @@
 # Regression scripts
 
 End-to-end parity and invariant checks. `chr22_parity.sh` runs on every
-matrix row; the rest run on the canonical AVX2 row only. Each script:
+matrix row; the rest run on the canonical AVX2 row only, except
+`profile_slice_cpu.sh`, which runs from the `profiling-build` job (see below).
+Each script:
 
 - is self-contained (set -euo pipefail; explicit env-var contract)
 - emits `PASS:` on success and `FAIL:` on failure
@@ -18,7 +20,16 @@ matrix row; the rest run on the canonical AVX2 row only. Each script:
 | `header_parity.sh`           | `AH:*` on generated @SQ (#281); `--compat` skips the .hdr/.dict sidecar | "header parity regression (AH:*, --compat @HD/@SQ)" |
 | `default_hd_parity.sh`       | default `@HD` byte-identical across SAM/`--bam`/`--meth` (#288)        | "default @HD parity across output paths"            |
 | `meth_oracle.sh`             | `--meth` Layers 1–3 match bwa-meth oracle                             | "Run --meth Layers 1-3"                             |
+| `profile_slice_cpu.sh`       | `--profile` accounts for a partial cohort slice's compute CPU (needs `STAGE_PROF=1`) | "Partial cohort slices report their compute CPU"    |
+
+The table is a reading guide, not an inventory — `ls test/regression/*.sh` is
+the authoritative list, and `ci.yml` is where each one is actually wired up.
 
 Each script reads its inputs from environment variables — see the comment
 block at the top of each file. `.github/workflows/ci.yml` sets those vars
 and invokes the scripts.
+
+One exception to "any binary will do": `profile_slice_cpu.sh` asserts on
+`--profile` output, which a default build compiles out entirely, so it needs a
+binary from `make STAGE_PROF=1`. It fails loudly rather than skipping if handed
+one without `--profile`, and CI runs it from the `profiling-build` job.

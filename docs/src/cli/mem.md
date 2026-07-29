@@ -191,9 +191,16 @@ By default, bwa-mem3 may downgrade the MAPQ of supplementary alignments.
 
 #### `-K INT` — fixed batch size
 
-Forces each batch to process exactly `INT` input bases regardless of the number
-of threads. **Recommended whenever reproducibility or bwa/bwa-mem2 comparison
+Sets the per-batch **target** to `INT` input bases regardless of the number of
+threads. **Recommended whenever reproducibility or bwa/bwa-mem2 comparison
 matters.**
+
+`INT` is a target rather than a hard delivered-base limit: the reader stops at
+the first whole record on or past `INT`, so a batch delivers slightly more than
+`INT` bases (never a partial record, and never a split read pair). This is the
+same behaviour as `bwa` and `bwa-mem2`, and it is what makes the batch boundary
+reproducible — for a given input and `INT`, the boundary always falls on the same
+record.
 
 Without `-K` the batch size is `chunk_size × -t` (10,000,000 × `-t` by default),
 so it moves with the thread count. That is not merely a scheduling detail:
@@ -208,15 +215,20 @@ Fix `-K` to the same value on both sides and the output becomes independent of
 
 #### `--chunk-cap INT` — upper bound on the auto-scaled batch size
 
-Caps the default `chunk_size × -t` batch at `INT` bases. `0` (the default)
-disables it, so out of the box bwa-mem3 batches **exactly** like `bwa` and
-`bwa-mem2` at any `-t`.
+Caps the default `chunk_size × -t` batch **target** at `INT` bases. As with `-K`,
+`INT` bounds the target the reader aims for, not the bases it delivers — the
+final record is always read whole. `0` (the default) disables the cap, so out of
+the box bwa-mem3 batches **exactly** like `bwa` and `bwa-mem2` at any `-t`.
 
 Capping keeps the read/compute/write pipeline overlapped at very high `-t`,
 where a single batch would otherwise be enormous (10M × 192 ≈ 1.9 Gbase) and the
 input would be only three or four batches — the first batch's read and the last
-batch's write then overlap nothing. On a 64-core host that fill/drain costs
-roughly 1.6 s of a 26 s alignment.
+batch's write then overlap nothing. On a 64-core host that fill/drain cost was
+measured at roughly 1.6 s of a 26 s alignment.
+
+> **Note:** that 1.6 s / 26 s figure predates the read-arena lifetime rework and
+> has not been re-measured against the current implementation. Treat it as an
+> indication of the effect's scale, not as a current number.
 
 It is **opt-in because it re-partitions the input**, and by the `mem_pestat`
 mechanism described under `-K` that changes output. A capped run is not
@@ -239,7 +251,7 @@ Precedence, highest first:
 
 | Setting | Effect |
 |---|---|
-| `-K INT` | pins the batch size exactly; never capped |
+| `-K INT` | pins the batch target; never capped |
 | `BWA_MEM3_CHUNK_CAP` | overrides the cap from either source below (`0` = off) |
 | `--chunk-cap INT` | caps the auto-scaled batch (`0` = off) |
 | `--fast` | implies `--chunk-cap 256000000` |

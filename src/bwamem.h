@@ -646,6 +646,47 @@ void mem_process_seqs(mem_opt_t *opt, int64_t n_processed,
                       int n, bseq1_t *seqs, const mem_pestat_t *pes0,
                       worker_t &w);
 
+/**
+ * Align one slice of a pestat cohort: seeding + banded SW only, no pairing.
+ *
+ * mem_process_seqs() is the single-slice special case of
+ * mem_align_cohort_slice() + mem_pair_and_emit_cohort(). Splitting them lets the
+ * pipeline read and align a cohort in several smaller pieces -- so the first
+ * read of a run does not stall the whole compute pipeline -- while mem_pestat
+ * still sees exactly the read set it would have seen for the un-sliced batch.
+ * That is what keeps the output byte-identical: seeding and BSW are per-read
+ * independent, and read ids come from the global n_processed counter rather
+ * than from a position within the batch.
+ *
+ * @param n_processed global id of this slice's FIRST read (cohort base + offset)
+ * @param n           reads in this slice; must be even for paired input so a
+ *                    slice boundary never splits a pair
+ * @param seqs        this slice's reads (cohort array + offset)
+ * @param regs        this slice's alnreg output (cohort regs + the same offset);
+ *                    must remain live until mem_pair_and_emit_cohort() runs
+ *
+ * w.seqs / w.regs / w.n_processed are saved and restored around the call.
+ */
+void mem_align_cohort_slice(mem_opt_t *opt, int64_t n_processed,
+                            int n, bseq1_t *seqs, mem_alnreg_v *regs,
+                            worker_t &w);
+
+/**
+ * Infer the insert size over a complete cohort, then pair and emit it.
+ *
+ * Must be called with `w.regs` still pointing at the cohort's base and with
+ * every slice's alnregs intact: mem_pestat() reads regs[0..n) to build the
+ * insert-size distribution, and worker_sam then consumes and frees them.
+ *
+ * @param n_processed global id of the cohort's first read
+ * @param n           reads in the whole cohort
+ * @param seqs        the cohort's contiguous reads
+ * @param pes0        insert-size info from -I, or NULL to infer from data
+ */
+void mem_pair_and_emit_cohort(mem_opt_t *opt, int64_t n_processed,
+                              int n, bseq1_t *seqs, const mem_pestat_t *pes0,
+                              worker_t &w);
+
 
 /**
  * Generate CIGAR and forward-strand position from alignment region
