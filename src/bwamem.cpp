@@ -3368,11 +3368,19 @@ mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *
     }
     /* SAM-A9: the region already carries its rid and bns_pos2rid(bns, pos) is
      * provably equal to it (the original code asserted exactly this). Use the
-     * known value and keep the equality as a debug-only check against the
-     * recompute, so NDEBUG builds skip the bns_pos2rid scan entirely. Output is
-     * byte-identical: a.rid == ar->rid == old bns_pos2rid result. */
+     * known value rather than recomputing. Output is byte-identical:
+     * a.rid == ar->rid == old bns_pos2rid result.
+     *
+     * The equality is kept as a cross-check, but opt-in rather than under a
+     * bare `assert`. Nothing in this build system defines NDEBUG, so an assert
+     * here is live in every shipped binary -- meaning the recompute this
+     * optimization exists to avoid ran on every emitted alignment, and the
+     * saving the comment claimed was never realized anywhere. Enable with
+     *   make EXTRA_CXXFLAGS=-DBWA_MEM3_DEBUG_RID_CHECK */
     a.rid = ar->rid;
+#ifdef BWA_MEM3_DEBUG_RID_CHECK
     assert(a.rid == bns_pos2rid(bns, pos));
+#endif
     a.pos = pos - bns->anns[a.rid].offset;
     a.score = ar->score; a.sub = ar->sub > ar->csub? ar->sub : ar->csub;
     a.is_alt = ar->is_alt; a.alt_sc = ar->alt_sc;
