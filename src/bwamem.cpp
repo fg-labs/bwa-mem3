@@ -35,6 +35,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "bam_writer.h"
 #include "meth_bam.h"
 #include "u8vec_scratch.h"
+#include "kvec.h"          /* kvec_t/kv_push/kv_resize used directly below */
 #include "pdqsort_wrap.h"
 #include <inttypes.h>      /* PRId64 for int64_t fprintf format strings */
 #include <mutex>           /* BWAMEM3_DUMP_PAIRS append lock */
@@ -1139,6 +1140,183 @@ static int mem_chain_cap_extend_mate(mem_chain_t *a, int n, int max_n,
     return k;
 }
 
+/* ---- mem_chain_flt greedy pairwise overlap pass (CHN-FLT-2) ----------------
+ * The pass compares each weight-sorted chain i against the already-kept chains
+ * and decides which chains survive. Two implementations share one signature so
+ * a debug build can run both and assert they agree byte-for-byte:
+ *   - chn_flt_pairwise_ref : the historical O(n^2) naive scan (reference).
+ *   - chn_flt_pairwise_fast: the BI-1 skip that visits only effect-bearing
+ *     comparisons (the case analysis is in the block comment above it).
+ *
+ * Both read the sorted chain array `a` (weight-descending) and the SoA-hoisted
+ * query coordinates cb/ce, and write their results into caller-owned arrays:
+ *   first[t]  first shadowing chain of sorted-chain t, or -1 (init by caller)
+ *   kept[t]   0/2/3 kept-class of sorted-chain t (init 0 by caller)
+ *   *surv     survivor list, in scan (weight-descending) order
+ * Nothing in `a` is mutated, so the two runs are independent. All indices are
+ * into the post-ks_introsort array `a`.
+ *
+ * The reference is compiled only for the opt-in cross-check build (see the
+ * BWA_MEM3_DEBUG_CHN_FLT_XCHECK note at the call site); production builds
+ * contain the fast pass alone. */
+typedef kvec_t(int) kvi_t;
+
+#ifdef BWA_MEM3_DEBUG_CHN_FLT_XCHECK
+static void chn_flt_pairwise_ref(int n_chn, const mem_chain_t *a,
+    const int *cb, const int *ce,
+    float mask_level, float drop_ratio, int max_chain_gap, int min_seed_gap,
+    int *first, int *kept, kvi_t *surv)
+{
+    int i, k;
+    kept[0] = 3;
+    kv_push(int, *surv, 0);
+    for (i = 1; i < n_chn; ++i)
+    {
+        int large_ovlp = 0;
+        const int cbi = cb[i], cei = ce[i];
+        const int li = cei - cbi;
+        const int wi = a[i].w;
+        const int ai_alt = a[i].is_alt;
+        for (k = 0; k < (int)surv->n; ++k)
+        {
+            int j = surv->a[k];
+            int b_max = cb[j] > cbi? cb[j] : cbi;
+            int e_min = ce[j] < cei? ce[j] : cei;
+            if (e_min > b_max && (!a[j].is_alt || ai_alt)) { // have overlap; don't consider ovlp where the kept chain is ALT while the current chain is primary
+                int lj = ce[j] - cb[j];
+                int min_l = li < lj? li : lj;
+                if (e_min - b_max >= min_l * mask_level && min_l < max_chain_gap) { // significant overlap
+                    large_ovlp = 1;
+                    if (first[j] < 0) first[j] = i; // keep the first shadowed hit s.t. mapq can be more accurate
+                    if (wi < a[j].w * drop_ratio && a[j].w - wi >= min_seed_gap)
+                        break;
+                }
+            }
+        }
+        if (k == (int)surv->n)
+        {
+            kv_push(int, *surv, i);
+            kept[i] = large_ovlp? 2 : 3;
+        }
+    }
+}
+#endif /* BWA_MEM3_DEBUG_CHN_FLT_XCHECK */
+
+/* BI-1 skip: the naive pass wastes the vast majority of its comparisons on kept
+ * chains j that can have no observable effect on i -- j already has a first
+ * shadower, is too light to dominate i, and is reached after i's large_ovlp latch
+ * has fired. This visits only the effect-bearing comparisons and is byte-identical
+ * to chn_flt_pairwise_ref (proven by case analysis; asserted per-read in debug).
+ *
+ * Per i, the three observable effects of a comparison are localized:
+ *   (C) large_ovlp latch: fires only on i's FIRST significant overlap; found by a
+ *       linear scan (phase 1) that stops there -- exactly what the ref does before
+ *       any skipping could begin.
+ *   (B) domination break: needs `wi < wj*drop_ratio && wj-wi >= gap`, a pure weight
+ *       test. Since `surv` is weight-descending, any chain reached after i's first
+ *       significant overlap is no heavier than that one, so if that first overlap did
+ *       not dominate i, nothing later can either: the break can only fire at the first
+ *       significant overlap (handled in phase 1) or never. i then survives.
+ *   (A) first[j]=i: only for j with first<0 that i significantly overlaps. Tracked in
+ *       an intrusive doubly-linked list of surv positions whose chain still has
+ *       first<0 (phase 2); the list only shrinks (a chain leaves once shadowed) and
+ *       grows by one per newly kept chain. */
+static void chn_flt_pairwise_fast(int n_chn, const mem_chain_t *a,
+    const int *cb, const int *ce,
+    float mask_level, float drop_ratio, int max_chain_gap, int min_seed_gap,
+    int *first, int *kept, kvi_t *surv)
+{
+    /* Intrusive DLL over surv positions (0..surv->n-1) with first<0. A position is
+     * appended once (when its chain is kept) and removed once (when its chain gets
+     * a first shadower), so each entry is live for one contiguous span and phase 2
+     * visits every still-unshadowed chain exactly once.
+     * Grow-only thread_local scratch; only touched entries are initialized. */
+    static thread_local std::vector<int> nxt_v, prv_v;
+    if ((int)nxt_v.size() < n_chn) { nxt_v.resize(n_chn); prv_v.resize(n_chn); }
+    int *nxt = nxt_v.data(), *prv = prv_v.data();
+    int f0_head, f0_tail;
+
+    kept[0] = 3;
+    kv_push(int, *surv, 0);
+    nxt[0] = -1; prv[0] = -1; f0_head = 0; f0_tail = 0;   // f0 = { position 0 }
+
+    for (int i = 1; i < n_chn; ++i)
+    {
+        const int cbi = cb[i], cei = ce[i];
+        const int li = cei - cbi;
+        const int wi = a[i].w;
+        const int ai_alt = a[i].is_alt;
+
+        /* significant overlap of i with chain j (identical test to the ref). */
+        auto sig = [&](int j) -> bool {
+            int b_max = cb[j] > cbi? cb[j] : cbi;
+            int e_min = ce[j] < cei? ce[j] : cei;
+            if (!(e_min > b_max && (!a[j].is_alt || ai_alt))) return false;
+            int lj = ce[j] - cb[j];
+            int min_l = li < lj? li : lj;
+            return (e_min - b_max >= min_l * mask_level && min_l < max_chain_gap);
+        };
+        /* j is heavy enough to dominate i (pure weight test; overlap-independent). */
+        auto wdom = [&](int j) -> bool {
+            return (wi < a[j].w * drop_ratio && a[j].w - wi >= min_seed_gap);
+        };
+        auto f0_remove = [&](int p) {
+            int pv = prv[p], nx = nxt[p];
+            if (pv >= 0) nxt[pv] = nx; else f0_head = nx;
+            if (nx >= 0) prv[nx] = pv; else f0_tail = pv;
+        };
+        auto f0_append = [&](int p) {
+            nxt[p] = -1; prv[p] = f0_tail;
+            if (f0_tail >= 0) nxt[f0_tail] = p; else f0_head = p;
+            f0_tail = p;
+        };
+
+        int large_ovlp = 0, dominated = 0, k0 = -1, k;
+        const int nsurv = (int)surv->n;
+
+        /* Phase 1: linear scan to i's first significant overlap (latches large_ovlp).
+         * Nothing is skippable before the latch, so this mirrors the ref exactly. */
+        for (k = 0; k < nsurv; ++k) {
+            int j = surv->a[k];
+            if (sig(j)) {
+                large_ovlp = 1;
+                if (first[j] < 0) { first[j] = i; f0_remove(k); }
+                if (wdom(j)) dominated = 1;   // first sig overlap is a dominator -> break here
+                k0 = k;
+                break;
+            }
+        }
+
+        if (large_ovlp == 0) {                // no significant overlap: keep, kept=3
+            int p = surv->n;
+            kv_push(int, *surv, i);
+            kept[i] = 3; first[i] = -1;
+            f0_append(p);
+            continue;
+        }
+        if (dominated) continue;              // dominated at k0: i dropped, ref broke here too
+
+        /* i survives (kept=2): no chain after k0 can dominate it (see (B) above), so
+         * the ref would scan on without breaking. Phase 2: record i as the first
+         * shadower of every still-unshadowed chain it significantly overlaps at a
+         * position after k0. Positions <= k0 either did not overlap (k0 is the first
+         * overlap) or were handled in phase 1. */
+        for (int p = f0_head; p >= 0; ) {
+            int nx = nxt[p];
+            if (p > k0) {
+                int j = surv->a[p];
+                if (sig(j)) { first[j] = i; f0_remove(p); }
+            }
+            p = nx;
+        }
+
+        int p = surv->n;                      // survives with a large overlap: kept=2
+        kv_push(int, *surv, i);
+        kept[i] = 2; first[i] = -1;
+        f0_append(p);
+    }
+}
+
 int mem_chain_flt(const mem_opt_t *opt, int n_chn_, mem_chain_t *a_, int tid)
 {
     int i, k;
@@ -1222,7 +1400,7 @@ int mem_chain_flt(const mem_opt_t *opt, int n_chn_, mem_chain_t *a_, int tid)
      * in the weight filter above. */
     mem_chain_t *a = a_;
     int n_chn = n_chn_ ? n_chn_ : 1;
-    kvec_t(int) chains = {0,0,0};
+    kvi_t chains = {0,0,0};
     kv_resize(int, chains, n_chn);   // CHN-19: reserve up front (kept count <= n_chn)
     ks_introsort(mem_flt, n_chn, a);
 
@@ -1249,46 +1427,77 @@ int mem_chain_flt(const mem_opt_t *opt, int n_chn_, mem_chain_t *a_, int tid)
     }
 
     // pairwise chain comparisons
-    a[0].kept = 3;
-    kv_push(int, chains, 0);
-    /* CL-4: hoist the filter constants read every iteration of the nested pass.
-     * opt is const and non-aliasing so the compiler most likely already does
-     * this; pulling them into locals makes the invariance explicit and pins the
-     * `opt->min_seed_len << 1` shift that was recomputed per comparison. Purely
-     * a readability/redundancy cleanup -- byte-identical, no perf claim. */
+    /* CL-4: hoist the filter constants read every iteration of the nested pass. */
     const float mask_level    = opt->mask_level;
     const float drop_ratio    = opt->drop_ratio;
     const int   max_chain_gap = opt->max_chain_gap;
     const int   min_seed_gap  = opt->min_seed_len << 1;
-    for (i = 1; i < n_chn; ++i)
+
+    /* Run the pairwise pass into caller-owned first[]/kept[] scratch, then write
+     * the results back into a[]. Keeping the pass out of a[] lets a debug build
+     * cross-check the fast skip against the naive reference on identical inputs.
+     * Grow-only thread_local scratch: no per-read allocation. */
+    static thread_local std::vector<int> first_v, kept_v;
+    if ((int)first_v.size() < n_chn) { first_v.resize(n_chn); kept_v.resize(n_chn); }
+    int *first = first_v.data(), *kept = kept_v.data();
+    for (int t = 0; t < n_chn; ++t) { first[t] = -1; kept[t] = 0; }
+
+    chn_flt_pairwise_fast(n_chn, a, cb, ce,
+                          mask_level, drop_ratio, max_chain_gap, min_seed_gap,
+                          first, kept, &chains);
+
+    /* Adversarial cross-check: run the naive reference into separate scratch and
+     * assert the fast skip produced identical survivors, first[] and kept[] for
+     * this read.
+     *
+     * Opt-in via BWA_MEM3_DEBUG_CHN_FLT_XCHECK rather than `#ifndef NDEBUG`: no
+     * target in this build system ever defines NDEBUG, so an NDEBUG gate would
+     * leave the O(n^2) reference -- precisely the work this pass exists to skip --
+     * running on every read of every shipped binary. That is the same trap already
+     * recorded for the pac-fetch poison in bntseq.cpp. Enable the cross-check with
+     *   make EXTRA_CXXFLAGS=-DBWA_MEM3_DEBUG_CHN_FLT_XCHECK
+     * Byte-identical: production never defines the macro, so nothing here runs. */
+#ifdef BWA_MEM3_DEBUG_CHN_FLT_XCHECK
     {
-        int large_ovlp = 0;
-        const int cbi = cb[i], cei = ce[i];
-        const int li = cei - cbi;       /* CL-4: invariant across the inner k-loop */
-        const int wi = a[i].w;          /* CL-4 */
-        const int ai_alt = a[i].is_alt; /* CL-4 */
-        for (k = 0; k < chains.n; ++k)
-        {
-            int j = chains.a[k];
-            int b_max = cb[j] > cbi? cb[j] : cbi;
-            int e_min = ce[j] < cei? ce[j] : cei;
-            if (e_min > b_max && (!a[j].is_alt || ai_alt)) { // have overlap; don't consider ovlp where the kept chain is ALT while the current chain is primary
-                int lj = ce[j] - cb[j];
-                int min_l = li < lj? li : lj;
-                if (e_min - b_max >= min_l * mask_level && min_l < max_chain_gap) { // significant overlap
-                    large_ovlp = 1;
-                    if (a[j].first < 0) a[j].first = i; // keep the first shadowed hit s.t. mapq can be more accurate
-                    if (wi < a[j].w * drop_ratio && a[j].w - wi >= min_seed_gap)
-                        break;
-                }
-            }
-        }
-        if (k == chains.n)
-        {
-            kv_push(int, chains, i);
-            a[i].kept = large_ovlp? 2 : 3;
+        static thread_local std::vector<int> rf_v, rk_v;
+        if ((int)rf_v.size() < n_chn) { rf_v.resize(n_chn); rk_v.resize(n_chn); }
+        int *rfirst = rf_v.data(), *rkept = rk_v.data();
+        for (int t = 0; t < n_chn; ++t) { rfirst[t] = -1; rkept[t] = 0; }
+        /* Reference survivor list. Grow-only thread_local like rf_v/rk_v above, so
+         * the cross-check adds no per-read malloc/free on top of the one the pass
+         * itself already does. The RAII holder mirrors u8vec_scratch_t: kv_destroy
+         * runs at thread exit, so a sanitizer debug build sees no leak (a bare
+         * thread_local kvi_t would never be freed). kv_resize reallocs
+         * unconditionally, hence the capacity guard. */
+        struct kvi_scratch_t {
+            kvi_t v;
+            kvi_scratch_t() { kv_init(v); }
+            ~kvi_scratch_t() { kv_destroy(v); }
+        };
+        static thread_local kvi_scratch_t rs;
+        rs.v.n = 0;
+        if (rs.v.m < (size_t)n_chn) kv_resize(int, rs.v, n_chn);
+        chn_flt_pairwise_ref(n_chn, a, cb, ce,
+                             mask_level, drop_ratio, max_chain_gap, min_seed_gap,
+                             rfirst, rkept, &rs.v);
+        /* xassert, not assert: defining this macro alongside -DNDEBUG would
+         * otherwise compile the quadratic reference into the hot path while
+         * stripping every check -- full cost, zero verification, which is the
+         * one configuration in which enabling the cross-check is strictly
+         * worse than not. xassert survives NDEBUG (utils.h), so the check is
+         * live whenever the reference is compiled. */
+        xassert(rs.v.n == chains.n, "BI-1: survivor count differs from reference");
+        for (int t = 0; t < (int)chains.n; ++t)
+            xassert(rs.v.a[t] == chains.a[t], "BI-1: survivor set/order differs");
+        for (int t = 0; t < n_chn; ++t) {
+            xassert(rfirst[t] == first[t], "BI-1: first[] differs from reference");
+            xassert(rkept[t] == kept[t], "BI-1: kept[] differs from reference");
         }
     }
+#endif /* BWA_MEM3_DEBUG_CHN_FLT_XCHECK */
+
+    for (int t = 0; t < n_chn; ++t) { a[t].first = first[t]; a[t].kept = kept[t]; }
+
     for (i = 0; i < chains.n; ++i)
     {
         mem_chain_t *c = &a[chains.a[i]];
