@@ -972,18 +972,24 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
     // with UNSIGNED order (== after _mm256_max_epu8), so the full [0,255] is usable.
     //
     // PRECONDITION (enforced by the caller): every pair reaching this kernel has
-    // passed bwamem.cpp's bsw8_envelope_ok(), which admits a pair only when
-    //   (a) its MAX ATTAINABLE score h0 + min(len1,len2)*maxStep stays below
-    //       255 - maxStep, so no row max can ever reach the byte ceiling, and
-    //   (b) h0 <= zdrop + 1.
+    // passed bwamem.cpp's bsw8_envelope_ok(), which admits a pair only when its
+    // MAX ATTAINABLE score h0 + min(len1,len2)*maxStep stays below 255 - maxStep,
+    // so no row max can ever reach the byte ceiling. That same bound caps the seed
+    // (h0 <= max attainable), so the seed byte fits a uint8 with no separate gate.
     // Under that gate the byte state is an exact absolute score for every cell:
     // it can neither overflow nor need rescaling, so this is a plain exact
     // unsigned [0,255] Smith-Waterman.
     //
+    // There is deliberately NO h0 <= zdrop + 1 precondition. That gate existed only
+    // to force the removed re-baseline floor B0 = max(0, h0 - (zdrop+1)) to zero;
+    // the separate concern it also covered — a high-h0 lane z-dropping before its
+    // row max builds up — is handled by the 8-bit z-drop/seed clamp fixed in #273.
+    // See EXT-4 in bsw8_envelope_ok().
+    //
     // This kernel previously carried a per-lane running score FLOOR B[l] (stored
     // byte = H_absolute - B[l]) plus a per-row probe that lowered B whenever a row
     // max climbed toward 255 — a "re-baseline" safety net for scores that overflow
-    // a byte. Condition (a) makes that net UNREACHABLE: it never fired on any
+    // a byte. The max-attainable bound makes that net UNREACHABLE: it never fired on any
     // in-envelope pair, so B was identically 0 and every stored byte already equalled
     // the absolute score. It has been removed, which deletes per row: a
     // _mm256_movemask_epi8 probe plus, per lane group, a B load and two int32 adds
@@ -2810,18 +2816,24 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
     // with UNSIGNED order (_mm512_cmpgt_epu8_mask), so the full [0,255] is usable.
     //
     // PRECONDITION (enforced by the caller): every pair reaching this kernel has
-    // passed bwamem.cpp's bsw8_envelope_ok(), which admits a pair only when
-    //   (a) its MAX ATTAINABLE score h0 + min(len1,len2)*maxStep stays below
-    //       255 - maxStep, so no row max can ever reach the byte ceiling, and
-    //   (b) h0 <= zdrop + 1.
+    // passed bwamem.cpp's bsw8_envelope_ok(), which admits a pair only when its
+    // MAX ATTAINABLE score h0 + min(len1,len2)*maxStep stays below 255 - maxStep,
+    // so no row max can ever reach the byte ceiling. That same bound caps the seed
+    // (h0 <= max attainable), so the seed byte fits a uint8 with no separate gate.
     // Under that gate the byte state is an exact absolute score for every cell:
     // it can neither overflow nor need rescaling, so this is a plain exact
     // unsigned [0,255] Smith-Waterman.
     //
+    // There is deliberately NO h0 <= zdrop + 1 precondition. That gate existed only
+    // to force the removed re-baseline floor B0 = max(0, h0 - (zdrop+1)) to zero;
+    // the separate concern it also covered — a high-h0 lane z-dropping before its
+    // row max builds up — is handled by the 8-bit z-drop/seed clamp fixed in #273.
+    // See EXT-4 in bsw8_envelope_ok().
+    //
     // This kernel previously carried a per-lane running score FLOOR B[l] (stored
     // byte = H_absolute - B[l]) plus a per-row probe that lowered B whenever a row
     // max climbed toward 255 — a "re-baseline" safety net for scores that overflow
-    // a byte. Condition (a) makes that net UNREACHABLE: it never fired on any
+    // a byte. The max-attainable bound makes that net UNREACHABLE: it never fired on any
     // in-envelope pair, so B was identically 0 and every stored byte already equalled
     // the absolute score. It has been removed, which deletes per row: a
     // per-lane row-max probe plus, per lane group, a B load and two int32 adds in
@@ -5543,18 +5555,24 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
     // with UNSIGNED order (== after _mm_max_epu8), so the full [0,255] is usable.
     //
     // PRECONDITION (enforced by the caller): every pair reaching this kernel has
-    // passed bwamem.cpp's bsw8_envelope_ok(), which admits a pair only when
-    //   (a) its MAX ATTAINABLE score h0 + min(len1,len2)*maxStep stays below
-    //       255 - maxStep, so no row max can ever reach the byte ceiling, and
-    //   (b) h0 <= zdrop + 1.
+    // passed bwamem.cpp's bsw8_envelope_ok(), which admits a pair only when its
+    // MAX ATTAINABLE score h0 + min(len1,len2)*maxStep stays below 255 - maxStep,
+    // so no row max can ever reach the byte ceiling. That same bound caps the seed
+    // (h0 <= max attainable), so the seed byte fits a uint8 with no separate gate.
     // Under that gate the byte state is an exact absolute score for every cell:
     // it can neither overflow nor need rescaling, so this is a plain exact
     // unsigned [0,255] Smith-Waterman.
     //
+    // There is deliberately NO h0 <= zdrop + 1 precondition. That gate existed only
+    // to force the removed re-baseline floor B0 = max(0, h0 - (zdrop+1)) to zero;
+    // the separate concern it also covered — a high-h0 lane z-dropping before its
+    // row max builds up — is handled by the 8-bit z-drop/seed clamp fixed in #273.
+    // See EXT-4 in bsw8_envelope_ok().
+    //
     // This kernel previously carried a per-lane running score FLOOR B[l] (stored
     // byte = H_absolute - B[l]) plus a per-row probe that lowered B whenever a row
     // max climbed toward 255 — a "re-baseline" safety net for scores that overflow
-    // a byte. Condition (a) makes that net UNREACHABLE: it never fired on any
+    // a byte. The max-attainable bound makes that net UNREACHABLE: it never fired on any
     // in-envelope pair, so B was identically 0 and every stored byte already equalled
     // the absolute score. It has been removed, which deletes per row: a
     // _mm_movemask_epi8 probe (a multi-instruction addv reduction on NEON) plus,

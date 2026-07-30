@@ -4,9 +4,13 @@
 // The 8-bit banded-SW DP body is unsigned [0,255]. The h0-prefix column/row
 // seed (smithWaterman*_8 wrapper setup) is now also unsigned-saturating
 // (subs_epu8); it previously used signed int8 ops, which required the seeded
-// byte min(h0, REBASE_KEEP) <= 127 and so capped zdrop at 126
-// (BSW8_MAX_ZDROP_STEP). With the unsigned seed the gate admits zdrop up to
-// ~252, and seed prefix bytes range over (127, 254].
+// byte -- then min(h0, zdrop + 1) -- to be <= 127, and so capped zdrop at 126
+// whenever h0 reached that clamp. With the unsigned seed the gate admits zdrop
+// up to 252 (zdrop + maxStep <= BSW8_MAX_ZDROP_STEP, which is 253), and seed
+// prefix bytes above 127: the `h0 <= zdrop + 1` clause this test retains permits
+// h0 up to 253, which the max-attainable-score bound
+// (h0 + shorter*a < 255 - maxStep) then narrows by the shorter sequence's
+// length -- to 233 for the len2 >= 20 this test draws. Never 254.
 //
 // This test exercises exactly that new regime: zdrop = 200 with h0 in
 // (127, 200], so every admitted pair seeds prefix bytes > 127 — the range the
@@ -31,6 +35,14 @@ struct Out { int score, tle, gtle, qle, gscore, max_off; };
 
 // Mirror of bwamem.cpp bsw8_envelope_ok for a = maxStep = 1 (this test's
 // scoring). Only admitted pairs are required to match scalar.
+//
+// Deliberately a SUBSET of the production gate: it retains the `h0 <= zdrop + 1`
+// condition that bsw8_envelope_ok dropped in EXT-4. This test is about the
+// unsigned h0-prefix seed above 127, not about the widened h0 envelope, so
+// holding its admitted set fixed keeps it a regression test for that one
+// property. Being stricter than production can only shrink the admitted set, so
+// it cannot produce a false failure. The newly admitted h0 > zdrop+1 region is
+// covered by test/bandedswa_high_h0_zdrop_test.cpp instead.
 bool envelope_ok(int len1, int len2, int w, int zdrop, int h0, int maxStep) {
     int shorter = len1 < len2 ? len1 : len2;
     return len1 < MAX_SEQ_LEN8 && len2 < MAX_SEQ_LEN8 && len1 >= len2 &&
@@ -120,7 +132,11 @@ int main() {
     for (long k = 0; k < admitted; ++k) {
         const SeqPair &q = apairs[k];
         long c = admittedIdx[k];
-        int h0p = q.h0 < zdrop + 1 ? q.h0 : zdrop + 1;   // seeded byte min(h0,REBASE_KEEP)
+        /* The kernel seeds the raw h0, clamped to uint8 only (the old
+         * min(h0, zdrop+1) prefix clamp went away with the re-baseline floor).
+         * Within this test's envelope h0 <= zdrop+1 <= 201, so the clamp is
+         * inert here; compute it the way the kernel does regardless. */
+        int h0p = q.h0 < 0 ? 0 : (q.h0 > 255 ? 255 : q.h0);   // seeded byte
         if (h0p > 127) seed_hi++;
         const Out &O = oracle[c];
         if (O.score != q.score || O.tle != q.tle || O.gtle != q.gtle ||
