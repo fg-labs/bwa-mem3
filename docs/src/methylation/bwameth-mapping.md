@@ -17,9 +17,9 @@ differs, and where the two approaches diverge by design.
 > WGBS/EM-seq, with true mapped-position (`POS`) changes affecting a smaller
 > subset (a few tenths of a percent). The 4-letter scoring path **widens** this
 > versus a pure collapsed-space aligner — and versus the older 3-letter `--meth`
-> releases — and the opt-in `genomic` mode diverges further on purpose (it
-> penalizes real variants). The tag schema is also Bismark (`XR`/`XG`/`XM`), not
-> bwameth (`YS`/`YC`/`YD`).
+> releases — and the variant-aware modes (`genomic`, `neutral`) diverge further
+> on purpose (they penalize real variants). The tag schema is also Bismark
+> (`XR`/`XG`/`XM`), not bwameth (`YS`/`YC`/`YD`).
 >
 > **If you are pinned to a specific bwameth release** (e.g. a clinical pipeline
 > validated against a bwameth version), treat `collapsed` as a *new aligner* and
@@ -70,10 +70,13 @@ environment, no bwameth.py version pinning.
 is applied in-memory to the seeding copy of each read.
 
 **Variant-aware options.** `--meth-scoring genomic` and `--meth-scoring neutral`
-(the `--meth=taps` default) both score real C/T and G/A variants as mismatches, so
-a single BAM supports both methylation calling and variant calling — something a
-collapsed-space aligner cannot produce. They differ only in what the *conversion*
-cell scores: a full match under `genomic`, `0` under `neutral`.
+(the `--meth=taps` default) both score a real C/T or G/A variant on the mirror cell
+as a mismatch, so a single BAM supports both methylation calling and variant
+calling — something a collapsed-space aligner cannot produce. (A variant in the
+conversion direction itself remains hidden; see
+[which real variants stay visible](overview.md#which-real-variants-stay-visible).)
+They differ only in what the *conversion* cell scores: a full match under
+`genomic`, `0` under `neutral`.
 
 **Inline BAM post-processing.** Header rewriting, Bismark `XR`/`XG`/`XM` tags,
 opt-in chimera QC (`--chimera-qc`), and QC-fail propagation happen in the same
@@ -89,7 +92,7 @@ has no option that unsets them, so `--meth` applies them unconditionally.
 These constants are quoted at bwa's default match score (`-A 1`, what bwameth
 runs). Like every other score-derived default, they scale with `-A`: under
 `-A 2` the effective values are `-L 20 -U 200 -T 80` and `-B 4` (collapsed) /
-`-B 8` (genomic).
+`-B 8` (genomic and neutral).
 
 ## What stays the same (collapsed mode)
 
@@ -109,7 +112,16 @@ differ:
 | Chimera QC threshold | Longest M < 44% of read | Same (44%), opt-in via `--chimera-qc` |
 | Chimera QC flags | `0x200`, clear `0x2`, MAPQ ≤ 1 | Same |
 | SEQ field | Pre-conversion bases (RC-flipped when `is_rev`) | Same |
-| `NM`/`MD` | Collapsed (conversions and real variants both hidden) | Conversions hidden; real variants hidden in `collapsed`, **shown in `genomic`** |
+| `NM`/`MD` | Collapsed (conversions and real variants both hidden) | Conversions hidden; real variants hidden in `collapsed`, **shown in `genomic` and `neutral`**[^nmmd] |
+
+[^nmmd]: `genomic` and `neutral` both free only the conversion direction — they
+    differ solely in what that cell scores (a full match vs. `0`) and both leave
+    the *mirror* cell penalised — so both keep a real variant in the *opposite*
+    direction (ref `T` × read `C` on OT) visible. A real variant in the
+    conversion direction itself (a genuine C→T SNP at a reference C) is
+    indistinguishable from a conversion in a single read under any mode — that
+    aliasing is resolved downstream at the pileup, not by the aligner. See
+    [which real variants stay visible](overview.md#which-real-variants-stay-visible).
 
 bwa-mem3 emits the **Bismark-compatible** `XR:Z` / `XG:Z` / `XM:Z` tag set rather
 than bwameth's `YS:Z` / `YC:Z` / `YD:Z`, so output is directly consumable by
@@ -123,7 +135,8 @@ If your workflow requires bwameth.py-specific features (e.g. `bwameth.py
 markduplicates` or non-standard post-processors), or strict byte-for-byte
 reproduction of a bwameth release, continue using bwameth.py. `bwa-mem3 --meth`
 targets the indexing + alignment + standard post-processing path, with
-bwameth-compatible placement (`collapsed`) or variant-aware scoring (`genomic`).
+bwameth-compatible placement (`collapsed`) or variant-aware scoring (`genomic`,
+`neutral`).
 
 ---
 

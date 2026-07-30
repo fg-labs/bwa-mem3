@@ -30,9 +30,11 @@ there, bwa-mem3 uses the 3-letter projection only to **find seeds**, then extend
 and scores against the **original 4-letter reference**. That enables two further
 variant-aware modes — `--meth-scoring genomic`, which scores the conversion cell as
 a full match, and `--meth-scoring neutral` (the `--meth=taps` default), which scores
-it `0` so a sparse conversion is tolerated but not rewarded. Both keep real C/T and
-G/A variants as mismatches (truthful `NM`/`MD`), something a collapsed-space aligner
-cannot do.
+it `0` so a sparse conversion is tolerated but not rewarded. Both keep a real C/T or
+G/A variant in the direction *opposite* the conversion as a mismatch (visible in
+`NM`/`MD`), something a collapsed-space aligner cannot do; a variant in the conversion
+direction itself is indistinguishable from a conversion under either design
+([why](../methylation/overview.md#which-real-variants-stay-visible)).
 
 It rewrites the `@SQ` headers to consolidate the per-strand contig pairs back to
 canonical chromosome names, emits Bismark-compatible `XR:Z` / `XG:Z` / `XM:Z`

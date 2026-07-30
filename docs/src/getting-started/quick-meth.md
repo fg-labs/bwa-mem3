@@ -12,9 +12,13 @@ postprocessing step are required.
 > of records (~1% on typical WGBS/EM-seq) still differ in `POS`/`CIGAR`/`MAPQ`, so re-validate if you
 > are pinned to a specific bwameth release (see
 > [bwameth.py drop-in mapping](../methylation/bwameth-mapping.md)). Add
-> `--meth-scoring genomic` to opt into variant-aware scoring (truthful `NM`/`MD`; one BAM for both
-> methylation and variant calling), or `--meth-scoring neutral` — the `--meth=taps` default — which
-> is variant-aware too but scores the conversion `0` instead of a match.
+> `--meth-scoring genomic` to opt into variant-aware scoring (variants outside the conversion
+> direction visible in `NM`/`MD` — a genuine C→T at a reference `C` is indistinguishable from a
+> conversion and stays hidden, see
+> [which real variants stay visible](../methylation/overview.md#which-real-variants-stay-visible);
+> one BAM for both methylation and variant calling), or `--meth-scoring neutral` — the
+> `--meth=taps` default — which is variant-aware too but scores the conversion `0` instead of a
+> match.
 
 ## Index the reference for methylation
 

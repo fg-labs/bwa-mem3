@@ -684,7 +684,7 @@ int mem_sam_pe(const mem_opt_t *opt, const bntseq_t *bns,
                uint64_t id, bseq1_t s[2], mem_alnreg_v a[2])
 {
     extern void mem_reg2sam(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, bseq1_t *s, mem_alnreg_v *a, int extra_flag, const mem_aln_t *m);
-    extern char **mem_gen_alt(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, const mem_alnreg_v *a, int l_query, const char *query, int **out_hn);
+    extern char **mem_gen_alt(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, const mem_alnreg_v *a, int l_query, const char *query, int **out_hn, const char *meth_orig_query);
 
     int i, j, z[2], extra_flag, n_pri[2], q_se[2], n_aa[2], paired;
     kstring_t str;
@@ -703,7 +703,7 @@ int mem_sam_pe(const mem_opt_t *opt, const bntseq_t *bns,
         int *HN[2] = { 0, 0 };
         if (!(opt->flag & MEM_F_ALL)) {
             for (i = 0; i < 2; ++i)
-                XA[i] = mem_gen_alt(opt, bns, pac, &a[i], s[i].l_seq, s[i].seq, &HN[i]);
+                XA[i] = mem_gen_alt(opt, bns, pac, &a[i], s[i].l_seq, s[i].seq, &HN[i], s[i].meth_orig_seq);
         } else XA[0] = XA[1] = 0;
         // write SAM
         for (i = 0; i < 2; ++i) {
@@ -1119,7 +1119,7 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                             bseq1_t *s, mem_alnreg_v *a, int extra_flag, const mem_aln_t *m);
     extern char **mem_gen_alt(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
                               const mem_alnreg_v *a, int l_query, const char *query,
-                              int **out_hn);
+                              int **out_hn, const char *meth_orig_query);
     #if MATE_SORT
     extern void sort_alnreg_re(int n, mem_alnreg_t* a);
     extern void sort_alnreg_score(int n, mem_alnreg_t* a);
@@ -1291,7 +1291,7 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
         int *HN[2] = { 0, 0 };
         if (!(opt->flag & MEM_F_ALL)) {
             for (i = 0; i < 2; ++i)
-                XA[i] = mem_gen_alt(opt, bns, pac, &a[i], s[i].l_seq, s[i].seq, &HN[i]);
+                XA[i] = mem_gen_alt(opt, bns, pac, &a[i], s[i].l_seq, s[i].seq, &HN[i], s[i].meth_orig_seq);
         } else XA[0] = XA[1] = 0;
         // write SAM
         for (i = 0; i < 2; ++i) {

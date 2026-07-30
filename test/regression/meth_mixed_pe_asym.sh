@@ -8,12 +8,13 @@
 # matrix for the batched-SIMD placement scorer, so bisulfite conversions were
 # penalized as mismatches (deflated AS/MAPQ). After A1's per-hypothesis partition
 # pass each mate is scored against its OT/OB object, so conversions are FREE in
-# scoring (AS == perfect) while remaining literal mismatches in NM/MD (for
-# downstream Revelio-style masking).
+# scoring (AS == perfect). Since NM/MD are derived from that same matrix, the
+# conversions are hidden from NM/MD as well (issue #327).
 #
-# The decisive assertion per mate: AS == read length (60) AND NM == #conversions
-# (> 0). A symmetric-scored conversion would cost (a + b) per event, dropping AS
-# well below 60.
+# The decisive assertion per mate: AS == read length (60) AND NM == 0, with the
+# lowercase call count in XM:Z proving the read really carries #conversions > 0
+# (otherwise NM == 0 would pass vacuously). A symmetric-scored conversion would
+# cost (a + b) per event, dropping AS well below 60.
 #
 # Inputs:
 #   BWA_MEM3 — path to the bwa-mem3 binary under test
@@ -31,9 +32,9 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 # Deterministic 1500 bp reference (PRNG seed 4242; see test generation notes).
 REF=TCATTGGCTATCCTAACCCGACCCTAGGAGCGGTTGGCGTGTATGCCGTGAATTTTCTCATTTCCGCTAGACATAATCGTTCTGCCTATATCTGGACAACATCCCGGCGACTTAGGCGACCCACAGAATCGTCCCTTCTAACGTAGTTCGCATAGTTCCCGTCCGTAGCCGGACTATTCGAACACCCAGTATTCGATTAACTCGGGCTTGACGTATTAGAGGCGTTAGTGTGCCAGGTAAGATACGCCAACGGAATTAACCTCTGTGACACTCCGCGGAGCCTTCGGACATATAAGTGATCGGGTCTACGTTTGTTAGACTTGAGACGTCTGTTAAGAGTTGGGTCTAATAAATCGCCTACACGTGGAGTCTAACGGGGAAGCGTCGAATCCTGATACATCATATAATGGAGCGTGTTATGAAAAAAGAGCATTCCATTGTACGAGCCGTGCCAGAAACGGCTTGACTACGTGAGCGTAGTGTTAGATAAACAGGAAACACTGACGCGGTTAGAAGGCGGATTGCCGGTAGGTTTTGGAAACATAAATACACACGGTATCATGTTGGGTCACGATTCCTATCACCGCACAGGGCCAACCATAGAAGAACTGAAAGAACTAATCTGGCGGCGGGCTCGGTGCTTATATTTTCCACCCAACATCGTGCACATTAGGCTCACCGCGCCCTACGGGCGAAGGGTGCGTACGGTGTTTATAAGGCGTGACGGCCCCAAGTAGAGGGTAATTCTGTGAAAGAATCTCAGGACGGTGGCATGAATTCAATTCCTTTTAAACCTATCGTTCCGACCTTATGCAATCCTTCAATGAAGATCGTCAACGACCATCGTTCTTCTGCTTTAAGTGTGAGTTCTCTCTTACAAGCTAATACACCCCAGCGTTCTCCGTACTCTTCACTGCCCAAGCGAGGCTAACCTTTTGAAATGTCACAGTCGAAGCATATCTCCCGTACATCTTTTTCGGAGATCGCAGCTCGCGGAGCTATAAGCGACTTAAGCCCTTGTGTCGGTGATCCCAAGGGTCTGACTCCTGTACCAGGGTTACTGTTTCGCTTTACGGAGTAGCCTGTGAGGTGAACTGAAAGGAGCATATTTGAGATCTAAGATAGGGTCCTCCTCTGCGTCTACGTTCTCTCCGTTACGTACGGCTTCGCACCGGAGTGCATCTTGGCCCCGAAACGCACTGTGTGTGCTGATACAGCGTCCCTGGCCGGCCATGGGTTCAGAACTCCCGGGAACGCTTTTCAACTTAGAGGAACCCCGTCATGGAAGTAGATCGCGTCGAATGAGGGAGTTAGTCCTCGTTCCAGCTGGTAATTGTTTTACCGCTTGGGACCACTATAGGCCGCGGGTAGAAGTTGCTGGGTGTTGATTCCAACCCTCGAACCACGATACGACCTGCCATTTATGGCACAGTAAGGTTCAAACAGCATAATGAATACAGTTATAGTAACTTCCTCACGTACGATTAGGACGCAGCCTTG
 
-# R1: OT (C->T) read over chrA[100:160] (1-based pos 101), forward.  NM == 10 conversions.
+# R1: OT (C->T) read over chrA[100:160] (1-based pos 101), forward.  10 C->T conversions.
 R1=ATTCTGGCGATTTAGGTGACTCACAGAATCGTTCTTTCTAACGTAGTTTGTATAGTTCTC
-# R2: OB (G->A) read, reverse mate over chrA[300:360] (1-based pos 301).  NM == 5 conversions.
+# R2: OB (G->A) read, reverse mate over chrA[300:360] (1-based pos 301).  5 G->A conversions.
 R2=TAAGCGATTTATTAAACCCAACTCTTAACAAACGTCTCAAATCTAACAAACGTAAACCCG
 
 printf '>chrA\n%s\n' "$REF" > ref.fa
@@ -46,34 +47,43 @@ printf '@p\n%s\n+\n%s\n' "$R2" "$Q" > r2.fq
 samtools quickcheck pe.bam || fail "mem --meth produced an invalid BAM"
 
 # Extract one decoded line per mate (READ1 = flag&64, READ2 = flag&128).
-get() { # $1 = mate-flag-bit (64=READ1, 128=READ2)  -> echo "RNAME POS MAPQ rev CIGAR AS NM XR"
+get() { # $1 = mate-flag-bit (64=READ1, 128=READ2)  -> echo "RNAME POS MAPQ rev CIGAR AS NM XR NCONV"
     # mawk has no bitwise and(); extract a flag bit via integer arithmetic.
+    # NCONV = count of lowercase methylation calls in XM:Z, i.e. the number of
+    # bases that were actually bisulfite-converted in this read. The lowercase
+    # classes are z (CpG), x (CHG), h (CHH) and u (context unresolvable -- e.g.
+    # a read at a contig edge, where meth_xm.cpp defaults the context to N).
     samtools view pe.bam | mawk -v bit="$1" '
         (int($2/bit) % 2) == 1 {
-            rev = (int($2/16) % 2) == 1 ? 1 : 0; as=""; nm=""; xr="";
-            for (i=12;i<=NF;i++){ if($i~/^AS:i:/){as=substr($i,6)} if($i~/^NM:i:/){nm=substr($i,6)} if($i~/^XR:Z:/){xr=substr($i,6)} }
-            print $3, $4, $5, rev, $6, as, nm, xr; exit
+            rev = (int($2/16) % 2) == 1 ? 1 : 0; as=""; nm=""; xr=""; nconv=0;
+            for (i=12;i<=NF;i++){ if($i~/^AS:i:/){as=substr($i,6)} if($i~/^NM:i:/){nm=substr($i,6)} if($i~/^XR:Z:/){xr=substr($i,6)} if($i~/^XM:Z:/){xm=substr($i,6); nconv=gsub(/[zxhu]/,"",xm)} }
+            print $3, $4, $5, rev, $6, as, nm, xr, nconv; exit
         }'
 }
 
-check_mate() { # $1=label $2=mateflag $3=want_pos $4=want_rev $5=want_as $6=want_nm $7=want_xr
-    read -r rn pos mapq rev cig as nm xr < <(get "$2")
+check_mate() { # $1=label $2=mateflag $3=want_pos $4=want_rev $5=want_as $6=want_nconv $7=want_xr
+    read -r rn pos mapq rev cig as nm xr nconv < <(get "$2")
     [ "$rn" = "chrA" ]      || fail "$1: RNAME $rn, want chrA"
     [ "$pos" = "$3" ]       || fail "$1: POS $pos, want $3"
     [ "$rev" = "$4" ]       || fail "$1: strand rev=$rev, want $4"
     [ "$cig" = "60M" ]      || fail "$1: CIGAR $cig, want 60M"
     [ "$mapq" = "60" ]      || fail "$1: MAPQ $mapq, want 60 (asym scoring must not deflate MAPQ)"
     [ "$xr" = "$7" ]        || fail "$1: XR $xr, want $7"
-    # The A1 contract: conversions are FREE in scoring (AS == full length) yet
-    # appear as literal mismatches in NM (> 0). A symmetric fallback would give AS < $5.
+    # The A1 contract: conversions are FREE in scoring (AS == full length). A
+    # symmetric fallback would give AS < $5.
     [ "$as" = "$5" ]        || fail "$1: AS $as, want $5 (conversions must be scored free under the per-hypothesis matrix)"
-    [ "$nm" = "$6" ]        || fail "$1: NM $nm, want $6 (conversions must remain literal mismatches for downstream masking)"
-    [ "$nm" -gt 0 ]         || fail "$1: NM must be > 0 (test must actually exercise conversions)"
+    # NM is derived from the same matrix, so a read whose only differences are
+    # conversions is NM:i:0. XM's lowercase call count is the independent witness
+    # that the read really does carry conversions -- without it, NM==0 would also
+    # pass on a read with none, making this test vacuous.
+    [ "$nconv" = "$6" ]     || fail "$1: XM shows $nconv converted bases, want $6 (fixture must actually exercise conversions)"
+    [ "$nconv" -gt 0 ]      || fail "$1: converted-base count must be > 0 (test must actually exercise conversions)"
+    [ "$nm" = "0" ]         || fail "$1: NM $nm, want 0 ($nconv conversions are matrix-freed, so they are matches for NM/MD)"
 }
 
-# R1 OT forward @101, AS 60 (10 C->T free), NM 10, XR CT.
+# R1 OT forward @101, AS 60 (10 C->T free), 10 conversions in XM, NM 0, XR CT.
 check_mate "R1/OT" 64  101 0 60 10 CT
-# R2 OB reverse @301, AS 60 (5 G->A free), NM 5, XR GA.
+# R2 OB reverse @301, AS 60 (5 G->A free), 5 conversions in XM, NM 0, XR GA.
 check_mate "R2/OB" 128 301 1 60 5  GA
 
-echo "PASS: meth_mixed_pe_asym (mixed OT+OB PE batch scored per-hypothesis; conversions free in AS, literal in NM)"
+echo "PASS: meth_mixed_pe_asym (mixed OT+OB PE batch scored per-hypothesis; conversions free in AS and hidden in NM)"

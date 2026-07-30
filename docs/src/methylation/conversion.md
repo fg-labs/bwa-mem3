@@ -65,8 +65,11 @@ the conversion direction is freed, scored as a full match. Under
 `--meth-scoring neutral` (the `--meth=taps` default) only the conversion direction
 is freed as well, but it scores `0` rather than a match: a converted base is
 tolerated, not rewarded. Both `genomic` and `neutral` leave the mirror cell a real
-mismatch, so a genuine variant stays a mismatch and `NM`/`MD` remain variant-aware.
-See [Overview → `--meth-scoring`](overview.md#three-scoring-modes---meth-scoring).
+mismatch, so a genuine variant *in that direction* stays a mismatch and `NM`/`MD`
+remain variant-aware; a variant in the conversion direction itself shares the freed
+cell with a conversion and is hidden in every mode. See
+[Overview → `--meth-scoring`](overview.md#three-scoring-modes---meth-scoring) and
+[which real variants stay visible](overview.md#which-real-variants-stay-visible).
 
 The seed's own ungapped score is recomputed in the same matrix (not assumed to be
 a perfect `len × match`), so under `--meth-scoring genomic` a seed-internal C/T or

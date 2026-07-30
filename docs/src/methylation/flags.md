@@ -70,13 +70,17 @@ conversion (bwameth-style), keep it variant-aware, or merely tolerate it.
   Use this when you need bwameth-compatible read placement (the drop-in default).
 - `genomic` — free **only** the conversion direction (a one-cell matrix), scored
   as a full match (`+A`), so the mirror cell stays a real mismatch. A genuine C/T
-  or G/A variant is penalized, making `NM`/`MD` truthful and the BAM usable for
-  variant calling. Keeps bwa's default `-B 4`.
+  or G/A variant on that mirror cell (ref `T` × read `C` on OT, ref `A` × read
+  `G` on OB) is penalized and stays visible in `NM`/`MD`, making the BAM usable
+  for variant calling; a variant in the conversion direction itself shares the
+  freed cell with a conversion and stays hidden
+  ([why](overview.md#which-real-variants-stay-visible)). Keeps bwa's default `-B 4`.
 - `neutral` (**default for `--meth=taps`**) — free only the conversion direction,
   but score it `0` rather than `+A`: tolerated but not rewarded. Best for TAPS,
   whose conversions are sparse, where a full-match reward over-credits spurious
   C→T alignments (see the measurement above). Keeps `-B 4`; the mirror cell stays
-  a mismatch, so `NM`/`MD` remain truthful.
+  a mismatch, so real variants remain visible in `NM`/`MD` on the same terms as
+  `genomic`.
 
 > **Important — `collapsed` is a placement drop-in, not byte-identical to bwameth**
 >
@@ -104,8 +108,8 @@ Keep `collapsed` for methylation-only workflows that must match bwameth placemen
 when you want one BAM that serves both methylation *and* variant calling, or want
 the aligner to distinguish real variants from conversions. Prefer `neutral` for
 TAPS (its default), where conversions are sparse and rewarding them as matches
-costs placement specificity — it is truthful for variant calling like `genomic`
-while placing sparse-conversion reads more accurately.
+costs placement specificity — it keeps variants visible for variant calling on the
+same terms as `genomic` while placing sparse-conversion reads more accurately.
 
 > **Note — `-B` follows the mode, but you can override it**
 >

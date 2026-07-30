@@ -71,7 +71,7 @@ read -r rn pos mapq rev cig as nm xr unm < <(get pe.bam 64)
 [ "$cig" = "75M" ] || fail "R1: CIGAR $cig, want 75M (no soft-clip — conversions freed by strand-adjusted matrix)"
 [ "$mapq" = "60" ] || fail "R1: MAPQ $mapq, want 60"
 [ "$xr" = "CT" ]   || fail "R1: XR $xr, want CT (OT hypothesis)"
-[ "$nm" = "25" ]   || fail "R1: NM $nm, want 25 (24 conversions + 1 real mismatch; all literal in NM)"
+[ "$nm" = "1" ]    || fail "R1: NM $nm, want 1 (the real mismatch only; the 24 conversions are matrix-freed, so they are matches for NM/MD as well as for the DP)"
 # Conversions are scored free; the 1 real mismatch costs the bwa default penalty b=4 (--meth keeps b=4):
 # 74 match/freed columns (+74) - 1 real mismatch (-4) = 70.
 [ "$as" = "70" ]   || fail "R1: AS $as, want 70 (conversions free; 1 real mismatch at b=4)"
