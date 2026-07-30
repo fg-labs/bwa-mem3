@@ -615,13 +615,21 @@ jobs:
         # OT/OB x strand placement; original-alphabet output integrity (Bismark
         # four-strand XR/XG); and the reverse-strand-conversion matrix flip
         # (meth_strand_hyp) — a reverse read that is unmapped under the unflipped
-        # matrix and full-length under the fix.
+        # matrix and full-length under the fix; the batched OT/OB-partition mate
+        # rescue being byte-identical to the scalar rescue; and the `collapsed`
+        # --meth-scoring model.
         env:
           BWA_MEM3: ${{ github.workspace }}/bwa-mem3
         run: |
+          # All but meth_seed_index `exit 0` with "SKIP: samtools not on PATH"
+          # when samtools is missing, so without this assertion a runner that
+          # lost the apt package would turn the whole step into a green no-op.
+          command -v samtools >/dev/null 2>&1 \
+            || { echo "FAIL: samtools not on PATH; the --meth regressions would all SKIP"; exit 1; }
           for t in meth_seed_index meth_mixed_pe_asym meth_pe_placement \
                    meth_output_integrity meth_reverse_strand_conversion \
-                   meth_seed_unpacked_ref_not_loaded; do
+                   meth_seed_unpacked_ref_not_loaded \
+                   meth_rescue_batched_identical meth_collapsed_scoring; do
             echo "::group::$t"; bash "test/regression/$t.sh"; echo "::endgroup::"
           done
 
