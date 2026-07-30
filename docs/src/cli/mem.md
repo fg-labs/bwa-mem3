@@ -591,6 +591,16 @@ with a conversion and stays hidden
 with `--meth`.
 See [Flags → --meth-scoring](../methylation/flags.md#--meth-scoring-collapsedgenomicneutral).
 
+#### `--meth-tags SPEC` — select which Bismark tags are emitted
+
+`all` (default), `none`, a comma-separated inclusion list (`XR,XG`), or
+`^`-prefixed exclusions (`^XM`). Inclusion and exclusion forms cannot be mixed.
+A deselected tag is not computed, so `^XM` skips the per-read methylation-call
+pass as well as its bytes — `XM:Z` is a read-length string and is ~33% of the
+BAM. Keep it for Bismark-family tools; drop it for MethylDackel/biscuit, which
+recompute from the reference. Only meaningful with `--meth`.
+See [Flags → --meth-tags](../methylation/flags.md#--meth-tags-spec).
+
 #### `--set-as-failed {f|r}` — strand QC-fail flag
 
 Forces the QC-fail bit (`0x200`) on all alignments to the forward (`f`) or

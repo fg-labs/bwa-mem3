@@ -104,6 +104,24 @@ typedef struct __smem_i smem_i;
 enum mem_meth_scoring { MEM_METH_SCORING_COLLAPSED = 0, MEM_METH_SCORING_GENOMIC = 1,
                         MEM_METH_SCORING_NEUTRAL = 2 };
 
+/* Bismark tag selection under --meth (--meth-tags). XR:Z and XG:Z are two-byte
+ * strand labels; XM:Z is a read-length methylation-call string and dominates the
+ * BAM's aux payload, so it is the one worth being able to turn off. */
+#define MEM_METH_TAG_XR   0x1
+#define MEM_METH_TAG_XG   0x2
+#define MEM_METH_TAG_XM   0x4
+#define MEM_METH_TAGS_ALL (MEM_METH_TAG_XR | MEM_METH_TAG_XG | MEM_METH_TAG_XM)
+
+/* Parse a --meth-tags spec into a MEM_METH_TAG_* bitmask.
+ *
+ * Grammar: `all` | `none` | a comma-separated list of tag names, either all
+ * plain (an inclusion set: `XR,XG`) or all `^`-prefixed (subtracted from the
+ * full set: `^XM`). Mixing plain and `^` terms is rejected. Tag names are
+ * case-insensitive. Returns 0 on success and writes *out; returns -1 on a
+ * malformed spec and writes a human-readable reason to *err (a static string).
+ * Exposed for unit testing. */
+int mem_opt_parse_meth_tags(const char *spec, int *out, const char **err);
+
 typedef enum {
     SEED_ORDER_OFF = 0,
     SEED_ORDER_GLOBAL_LONGEST,
@@ -180,6 +198,10 @@ typedef struct mem_opt_t {
                             // converted index and the scoring matrices are shared,
                             // because both chemistries produce the same C->T /
                             // G->A base change as far as the aligner can see.
+    int    meth_tags;       // bitmask of Bismark tags to emit (--meth-tags):
+                            // MEM_METH_TAG_{XR,XG,XM}. Tags not selected are
+                            // neither computed nor emitted -- clearing XM skips
+                            // the per-read meth_build_xm() pass entirely.
     char   meth_set_as_failed;// 'f', 'r', or 0 — flag reads on that strand 0x200
     int    meth_chimera_qc; // 1 to enable bwameth.py-style longest-M <44% chimera heuristic (default off; not in Bismark)
     int    supp_rep_hard_cap; // supp alnregs whose chain's seeds share >=this many genome hits are forced to MAPQ=0; 0 disables

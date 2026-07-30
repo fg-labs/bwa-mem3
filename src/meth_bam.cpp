@@ -485,7 +485,8 @@ int meth_mem_aln_to_bam(bam1_t *b,
      * the original rid); meth_build_xm reads the original read-C-vs-T at ref-C
      * from `seq_text`, which is restored from meth_orig_seq above. */
     char *xm = NULL;
-    if (mapped && seq_text != NULL && bam_cigar != NULL && l_emit > 0) {
+    if ((opt->meth_tags & MEM_METH_TAG_XM)
+        && mapped && seq_text != NULL && bam_cigar != NULL && l_emit > 0) {
         /* Match the XG `direction` guard at line ~322: a -1 hypothesis maps to
          * XG:Z:GA (bottom strand), so treat it as bottom here too. ((-1)&1)==1
          * would otherwise mislabel a -1-hypothesis record (e.g. mate rescued off
@@ -629,12 +630,15 @@ int meth_mem_aln_to_bam(bam1_t *b,
     }
     /* Bismark-compatible XR:Z (read conversion) emitted on every record;
      * XG:Z (genome strand) and XM:Z (methylation call string) only on
-     * mapped records. The YC:Z payload in s->comment carries the (CT|GA)
+     * mapped records. Each is additionally gated on its --meth-tags bit, and
+     * the gate wraps the value's derivation rather than just the append, so a
+     * deselected tag costs nothing to compute -- the contract --help and the
+     * methylation docs state. The YC:Z payload in s->comment carries the (CT|GA)
      * value (the comment buffer is "YS:Z:<seq>\tYC:Z:<dir>", see
      * src/fastmap.cpp:415-425). Locate it with a marker search rather
      * than l_seq arithmetic so any future YS framing change (alternate
      * prefix length, prior FASTQ comments folded in) stays detectable. */
-    {
+    if (opt->meth_tags & MEM_METH_TAG_XR) {
         const char *xr = NULL;
         if (s->comment != NULL) {
             const char *yc = strstr(s->comment, "\tYC:Z:");
@@ -649,10 +653,12 @@ int meth_mem_aln_to_bam(bam1_t *b,
         }
     }
     if (mapped) {
-        /* XG:Z genome strand from the winning hypothesis: OT→CT, OB→GA
-         * (direction is the 'f'/'r' encoding of p.meth_hypothesis above). */
-        const char *xg = (direction == 'f') ? "CT" : "GA";
-        bam_aux_append(b, "XG", 'Z', 3, (const uint8_t *)xg);
+        if (opt->meth_tags & MEM_METH_TAG_XG) {
+            /* XG:Z genome strand from the winning hypothesis: OT→CT, OB→GA
+             * (direction is the 'f'/'r' encoding of p.meth_hypothesis above). */
+            const char *xg = (direction == 'f') ? "CT" : "GA";
+            bam_aux_append(b, "XG", 'Z', 3, (const uint8_t *)xg);
+        }
         if (xm != NULL) {
             /* xm aliases thread-local scratch in meth_xm.cpp; do not free. */
             bam_aux_append(b, "XM", 'Z', (int)l_emit + 1,
