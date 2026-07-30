@@ -569,19 +569,19 @@ private:
 	uint8_t *rowMax8;
 
 	/* Column index broadcast across all lanes: colIdx8[j*W + k] == (uint8_t) j.
-	 * The NEON and AVX2 u8 kernels' post-row query-end rescan needs the scanned
-	 * column index in every lane; reading it from this table costs one load,
-	 * where deriving it would cost a broadcast or a running vector add.
-	 * maxQerLen * SIMD_WIDTH8 bytes -- 8 KB at 16 lanes, 33 KB at 64 -- swept in
-	 * column order, so it stays L1-resident alongside H0/H1/F. Unused by the
-	 * AVX-512 u8 kernel, which keeps the per-cell form (see MAIN_SAM_CODE8_OPT
-	 * for why), so on an AVX-512 build this is built once and never read; it is
-	 * left unconditional rather than #ifdef'd because 33 KB of one-time setup
-	 * does not earn another preprocessor branch through the constructor.
+	 * All three u8 kernels -- NEON, AVX2 and AVX-512BW -- read it when they
+	 * recover the query end after the row: the scan needs the scanned column
+	 * index in every lane, and one load is cheaper there than a broadcast or a
+	 * running vector add.
 	 *
-	 * Only the low byte matters: the 8-bit kernels' width guard (l_ms * a <
-	 * 250) caps ncol well under 255, and the per-cell counter this replaced was
-	 * itself a u8 that wrapped identically. */
+	 * maxQerLen * SIMD_WIDTH8 bytes -- 8 KB at 16 lanes, 33 KB at 64 -- but a
+	 * row only touches the block(s) the QE_BLK checkpoints select, so the live
+	 * working set is a fraction of that and stays L1-resident alongside H0/H1/F.
+	 *
+	 * Only the low byte matters: ncol cannot exceed 255 in the 8-bit kernels,
+	 * capped by the width guard (l_ms * a < 250). That is the same bound
+	 * QE_MAXBLK sizes the checkpoint array against -- see the QE_BLK comment in
+	 * kswv.cpp. */
 	uint8_t *colIdx8;
 
 	int16_t *F16;
