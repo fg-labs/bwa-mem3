@@ -25,6 +25,27 @@ permissions:
   contents: read
 
 jobs:
+  # Source-only lint; no toolchain, no build. Kept as its own job so the
+  # failure reads as "you wrote an NDEBUG gate" rather than being buried in a
+  # matrix row, and so it reports in seconds instead of after a full build.
+  ndebug-gate-lint:
+    name: NDEBUG gate lint (src/)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      # Runs first: the lint's PASS is indistinguishable from the PASS a lint
+      # whose matcher has stopped matching prints, so the step below only means
+      # something once the matcher has been shown to still reject real gates.
+      - name: NDEBUG gate lint still detects gates
+        run: bash test/regression/ndebug_gate_lint_selftest.sh
+
+      - name: No NDEBUG preprocessor gates in src/
+        run: bash test/regression/ndebug_gate_lint.sh
+
   build-and-test:
     strategy:
       fail-fast: false
@@ -632,6 +653,43 @@ jobs:
                    meth_rescue_batched_identical meth_collapsed_scoring; do
             echo "::group::$t"; bash "test/regression/$t.sh"; echo "::endgroup::"
           done
+
+      - name: Opt-in debug/instrumentation macro build (chr22 parity)
+        if: matrix.canonical == true
+        # The expensive debug checks and instrumentation in this tree sit behind
+        # opt-in macros rather than `#ifndef NDEBUG`, because nothing here
+        # defines NDEBUG (see test/regression/ndebug_gate_lint.sh). That is
+        # correct, but it means no CI row compiles them, so they can rot
+        # unnoticed until the dead code is deleted -- or, worse, until someone
+        # enables one to debug a live problem and finds it no longer builds.
+        #
+        # One rebuild with every such macro on at once, then the same chr22
+        # parity check the row already runs against the normal binary. This
+        # asserts two things: the guarded code still compiles, and every check
+        # it enables holds on real data. Five of the six are pure assertions or
+        # scratch poisoning and the sixth (BWAMEM3_UGP_PROFILE) is profiling
+        # counters that never feed the alignment result, so output must be
+        # unchanged -- a failure here is a genuine invariant violation, not a
+        # debug-build artifact.
+        #
+        # BWA_MEM3_DEBUG_CHN_FLT_XCHECK, BWA_MEM3_DEBUG_RID_CHECK and
+        # BWA_MEM3_DEBUG_UNGAPPED_XCHECK are defined ahead of the changes that
+        # introduce them; until those land the flags are simply unused, which
+        # costs nothing and avoids a follow-up CI edit.
+        #
+        # Placed immediately before the ASAN step because both replace
+        # $GITHUB_WORKSPACE/bwa-mem3 with a differently-configured binary; the
+        # ASAN step does its own `make clean` and so is unaffected by this one.
+        run: |
+          make clean
+          make -j"$(nproc)" arch=${{ matrix.arch_flag }} \
+            CXX=${{ matrix.cxx || 'g++' }} \
+            EXTRA_CXXFLAGS="-DBWA_MEM3_DEBUG_CHN_FLT_XCHECK -DBWA_MEM3_DEBUG_RID_CHECK -DBWA_MEM3_DEBUG_UNGAPPED_XCHECK -DBSW8_ASSERT_ENVELOPE -DBWA_MEM3_DEBUG_POISON -DBWAMEM3_UGP_PROFILE=1"
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          CHR22_FA=/tmp/chr22/chr22.fa \
+          BWA_CHR22_FA=/tmp/chr22/bwa_chr22.fa \
+          CHR22_SIM_DIR=/tmp/chr22-sim \
+          bash test/regression/chr22_parity.sh
 
       - name: Short-read SE smoke (chr22, ASAN, dense+variable-length)
         if: matrix.canonical == true
