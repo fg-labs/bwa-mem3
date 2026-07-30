@@ -194,6 +194,24 @@ jobs:
           name: unit-results-${{ matrix.artifact_slug }}
           path: unit-results-*.xml
 
+      - name: Zero-sequence index loads when calloc(0) returns NULL
+        # A standalone binary, not a doctest case: it interposes calloc so a
+        # zero-size request returns NULL, which is the only way to tell a
+        # correct allocation guard from an unconditional one -- glibc and macOS
+        # libmalloc both hand back non-NULL there, so on the real allocator the
+        # buggy and fixed code are indistinguishable. Interposing inside the
+        # doctest binary would redirect every other test case's allocations
+        # through it, hence the separate executable. Run on every row so the
+        # interposition itself is exercised on each toolchain; the test fails
+        # loudly rather than silently passing if it is not in effect.
+        run: |
+          if [ "${{ matrix.arch_flag }}" = "" ]; then
+            make bns_zero_calloc_test CXX=${{ matrix.cxx || 'g++' }}
+          else
+            make bns_zero_calloc_test arch=${{ matrix.arch_flag }} CXX=${{ matrix.cxx || 'g++' }}
+          fi
+          ./bns_zero_calloc_test
+
       - name: Run integration tests
         if: matrix.run_integration == true
         env:

@@ -215,7 +215,7 @@ int mem_matesw(const mem_opt_t *opt, const bntseq_t *bns,
 
     if (ms_orig != NULL) {
         ms2 = (uint8_t*) malloc(l_ms);
-        assert(ms2 != NULL);
+        xassert(ms2 != NULL, "out of memory: ms2");
         for (int k = 0; k < l_ms; ++k) {
             unsigned char c = (unsigned char) ms_orig[k];
             ms2[k] = (c < 4) ? c : nst_nt4_table[c];
@@ -232,7 +232,7 @@ int mem_matesw(const mem_opt_t *opt, const bntseq_t *bns,
         is_larger = !(r>>1); // whether the mate has larger coordinate
         if (is_rev) {
             rev = (uint8_t*) malloc(l_ms); // this is the reverse complement of $ms
-            assert(rev != NULL);
+            xassert(rev != NULL, "out of memory: rev");
             for (i = 0; i < l_ms; ++i) rev[l_ms - 1 - i] = ms[i] < 4? 3 - ms[i] : 4;
             seq = rev;
         } else seq = (uint8_t*)ms;
@@ -1375,7 +1375,7 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
     uint8_t *ms2 = NULL;
     if (ms_orig != NULL) {
         ms2 = (uint8_t*) malloc(l_ms);
-        assert(ms2 != NULL);
+        xassert(ms2 != NULL, "out of memory: ms2");
         for (int k = 0; k < l_ms; ++k) {
             unsigned char c = (unsigned char) ms_orig[k];
             ms2[k] = (c < 4) ? c : nst_nt4_table[c];
@@ -1663,7 +1663,7 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
 
     if (ms_orig != NULL) {
         ms2 = (uint8_t*) malloc(l_ms);
-        assert(ms2 != NULL);
+        xassert(ms2 != NULL, "out of memory: ms2");
         for (int k = 0; k < l_ms; ++k) {
             unsigned char c = (unsigned char) ms_orig[k];
             ms2[k] = (c < 4) ? c : nst_nt4_table[c];
@@ -1721,7 +1721,7 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                 // at the bottom of the r-loop (rev stays 0 on the batched path).
                 if (is_rev) {
                     rev = (uint8_t*) malloc(l_ms); // reverse complement of $ms
-                    assert(rev != NULL);
+                    xassert(rev != NULL, "out of memory: rev");
                     for (i = 0; i < l_ms; ++i) rev[l_ms - 1 - i] = ms[i] < 4? 3 - ms[i] : 4;
                     seq = rev;
                 } else seq = (uint8_t*)ms;
@@ -1732,7 +1732,7 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                 // buffer before handing it to ksw_align2.
                 int64_t ref_len = re - rb;
                 uint8_t *ref_rw = (uint8_t*) malloc((size_t)ref_len);
-                assert(ref_rw != NULL);
+                xassert(ref_rw != NULL, "out of memory: ref_rw");
                 memcpy(ref_rw, ref, (size_t)ref_len);
                 if (opt->meth_mode && mate_meth_ot >= 0) {
                     /* D3: score the rescued mate under ITS OWN read-number chemistry

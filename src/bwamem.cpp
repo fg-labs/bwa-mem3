@@ -992,7 +992,7 @@ void mem_flt_chained_seeds(const mem_opt_t *opt, const bntseq_t *bns, const uint
                 /* CodeRabbit: don't assign realloc() result back to meth_qbuf
                  * directly — a NULL return would leak the old buffer. */
                 uint8_t *meth_qbuf_new = (uint8_t *) realloc(meth_qbuf, (size_t) meth_qbuf_cap);
-                assert(meth_qbuf_new != NULL);
+                xassert(meth_qbuf_new != NULL, "out of memory: meth_qbuf_new");
                 meth_qbuf = meth_qbuf_new;
             }
             const char *os = seq_[c->seqid].meth_orig_seq;
@@ -1378,7 +1378,7 @@ SMEM *mem_collect_smem(FMI_search *fmi, const mem_opt_t *opt,
                     tid, tmp, mmc->wsize_mem[tid]);
         }
         mmc->matchArray[tid]    = (SMEM *) _mm_malloc(mmc->wsize_mem[tid] * sizeof(SMEM), 64);
-        assert(mmc->matchArray[tid] != NULL);
+        xassert(mmc->matchArray[tid] != NULL, "out of memory: mmc->matchArray[tid]");
         matchArray = mmc->matchArray[tid];
         // w.mmc.min_intv_ar[l]   = (int32_t *) malloc(w.mmc.wsize_mem[l] * sizeof(int32_t));
         // w.mmc.query_pos_ar[tid]  = (int16_t *) malloc(w.mmc.wsize_mem[l] * sizeof(int16_t));
@@ -1444,7 +1444,7 @@ SMEM *mem_collect_smem(FMI_search *fmi, const mem_opt_t *opt,
                         tid, tmp, mmc->wsize_mem[tid]);
             }
 		    mmc->matchArray[tid]    = (SMEM *) _mm_malloc(mmc->wsize_mem[tid] * sizeof(SMEM), 64);
-		    assert(mmc->matchArray[tid] != NULL);
+		    xassert(mmc->matchArray[tid] != NULL, "out of memory: mmc->matchArray[tid]");
 		    matchArray = mmc->matchArray[tid];
 		    // First pass wrote num_smem1 records at offset 0; the second pass
 		    // (getSMEMsOnePosOneThread*) just wrote num_smem2 records at offset
@@ -1836,7 +1836,7 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
             sa_coord = (int64_t *) _mm_realloc(sa_coord, csize,
                                                (int64_t)opt->max_occ * smem_buf_size,
                                                sizeof(int64_t));
-            assert(sa_coord != NULL);
+            xassert(sa_coord != NULL, "out of memory: sa_coord");
         }
 
         /* Phase A buffer (Spec S4): resolved-seed records for the reorder path.
@@ -1861,7 +1861,7 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
                 recs_cap = recs_need;
                 /* CodeRabbit: temp pointer so a NULL realloc doesn't leak recs. */
                 seed_rec_t *recs_new = (seed_rec_t *) realloc(recs, recs_cap * sizeof(seed_rec_t));
-                assert(recs_new != NULL);
+                xassert(recs_new != NULL, "out of memory: recs_new");
                 recs = recs_new;
             }
         }
@@ -1902,7 +1902,7 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
                 if (need > sa_cap)
                 {
                     sa_coord = (int64_t *) _mm_realloc(sa_coord, sa_cap, need, sizeof(int64_t));
-                    assert(sa_coord != NULL);
+                    xassert(sa_coord != NULL, "out of memory: sa_coord");
                     sa_cap = need;
                 }
                 uint64_t tim_sa = __rdtsc();
@@ -2354,7 +2354,7 @@ int mem_kernel2_core(FMI_search *fmi,
             if (l_query > dd_qbuf_cap) {
                 dd_qbuf_cap = l_query;
                 dd_qbuf = (uint8_t *) realloc(dd_qbuf, (size_t) dd_qbuf_cap);
-                assert(dd_qbuf != NULL);
+                xassert(dd_qbuf != NULL, "out of memory: dd_qbuf");
             }
             const char *os = seq_[l].meth_orig_seq;
             for (int q = 0; q < l_query; ++q) {
@@ -2549,7 +2549,7 @@ static void worker_sam(void *data, int seqid, int batch_size, int tid)
         int64_t pcnt8 = sort_classify(&w->mmc, pcnt, tid);
 
         kswr_t *aln = (kswr_t *) _mm_malloc ((pcnt + SIMD_WIDTH8) * sizeof(kswr_t), 64);
-        assert(aln != NULL);
+        xassert(aln != NULL, "out of memory: aln");
 
         // processing
         mem_sam_pe_batch(w->opt, &w->mmc, pcnt, pcnt8, aln, maxRefLen, maxQerLen, tid);
@@ -3408,7 +3408,7 @@ void* _mm_realloc(void *ptr, int64_t csize, int64_t nsize, int16_t dsize) {
         return ptr;
     }
     void *nptr = _mm_malloc(nsize * dsize, 64);
-    assert(nptr != NULL);
+    xassert(nptr != NULL, "out of memory: nptr");
     /* csize is in elements (matching nsize), not bytes — multiply by dsize so
      * callers passing dsize > 1 (sa_coord with sizeof(int64_t), matchArray
      * with sizeof(SMEM)) get the full pre-grow contents copied across, not
@@ -4200,7 +4200,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                 meth_qbuf_cap = l_query;
                 /* CodeRabbit: temp pointer so a NULL realloc doesn't leak. */
                 uint8_t *meth_qbuf_new = (uint8_t *) realloc(meth_qbuf, (size_t) meth_qbuf_cap);
-                assert(meth_qbuf_new != NULL);
+                xassert(meth_qbuf_new != NULL, "out of memory: meth_qbuf_new");
                 meth_qbuf = meth_qbuf_new;
             }
             const char *os = seq_[l].meth_orig_seq;

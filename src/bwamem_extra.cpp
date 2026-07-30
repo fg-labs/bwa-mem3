@@ -144,9 +144,9 @@ char **mem_gen_alt(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac
 	char has_alt_stack[HAS_ALT_STACK_N];
 
 	cnt = (int *) calloc(a->n, sizeof(int));
-    assert(cnt != NULL);
+    xassert(cnt != NULL, "out of memory: cnt");
 	has_alt = a->n <= HAS_ALT_STACK_N ? has_alt_stack : (char *) malloc(a->n);
-    assert(has_alt != NULL);
+    xassert(has_alt != NULL, "out of memory: has_alt");
 	memset(has_alt, 0, a->n);
 	for (i = 0, tot = 0; i < a->n; ++i) {
 		r = get_pri_idx(opt->XA_drop_ratio, a->a, i);
@@ -163,7 +163,7 @@ char **mem_gen_alt(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac
 	if (out_hn) *out_hn = cnt;
 	if (tot == 0) goto end_gen_alt;
 	aln = (kstring_t*) calloc(a->n, sizeof(kstring_t));
-    assert(aln != NULL);
+    xassert(aln != NULL, "out of memory: aln");
 	for (i = 0; i < a->n; ++i) {
 		mem_aln_t t;
 		if ((r = get_pri_idx(opt->XA_drop_ratio, a->a, i)) < 0) continue;
@@ -194,7 +194,7 @@ char **mem_gen_alt(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac
 		kputsn(str.s, str.l, &aln[r]);
 	}
 	XA = (char**) calloc(a->n, sizeof(char*));
-    assert(XA != NULL);
+    xassert(XA != NULL, "out of memory: XA");
 	for (k = 0; k < a->n; ++k)
 		XA[k] = aln[k].s;
 

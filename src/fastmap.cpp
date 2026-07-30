@@ -240,7 +240,7 @@ void worker_alloc(const mem_opt_t *opt, worker_t &w, int32_t nreads, int32_t nth
      * regs themselves) the behavior is byte-identical to before. */
     if (memSize > 0) {
         w.regs = (mem_alnreg_v *) calloc(memSize, sizeof(mem_alnreg_v));
-        assert(w.regs != NULL);
+        xassert(w.regs != NULL, "out of memory: w.regs");
     }
 
     /* chain_scratch / seed_scratch are PER-THREAD scratch, not per-read arrays.
@@ -275,8 +275,8 @@ void worker_alloc(const mem_opt_t *opt, worker_t &w, int32_t nreads, int32_t nth
     w.seed_scratch  = (mem_seed_t *) calloc(scratch_reads * AVG_SEEDS_PER_READ,
                                             sizeof(mem_seed_t));
 
-    assert(w.seed_scratch  != NULL);
-    assert(w.chain_scratch != NULL);
+    xassert(w.seed_scratch  != NULL, "out of memory: w.seed_scratch");
+    xassert(w.chain_scratch != NULL, "out of memory: w.chain_scratch");
 
     /* Size of ONE thread's seed window. */
     w.seed_scratch_size = BATCH_SIZE * AVG_SEEDS_PER_READ;
@@ -341,9 +341,9 @@ void worker_alloc(const mem_opt_t *opt, worker_t &w, int32_t nreads, int32_t nth
         w.mmc.seqPairArrayRight128[l] = (SeqPair *) malloc((wsize + MAX_LINE_LEN)* sizeof(SeqPair));
         w.mmc.wsize[l] = wsize;
 
-        assert(w.mmc.seqPairArrayAux[l] != NULL);
-        assert(w.mmc.seqPairArrayLeft128[l] != NULL);
-        assert(w.mmc.seqPairArrayRight128[l] != NULL);
+        xassert(w.mmc.seqPairArrayAux[l] != NULL, "out of memory: w.mmc.seqPairArrayAux[l]");
+        xassert(w.mmc.seqPairArrayLeft128[l] != NULL, "out of memory: w.mmc.seqPairArrayLeft128[l]");
+        xassert(w.mmc.seqPairArrayRight128[l] != NULL, "out of memory: w.mmc.seqPairArrayRight128[l]");
     }
 
 
@@ -473,7 +473,7 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
     if (step == 0)
     {
         ktp_data_t *ret = (ktp_data_t *) calloc(1, sizeof(ktp_data_t));
-        assert(ret != NULL);
+        xassert(ret != NULL, "out of memory: ret");
         uint64_t tim = __rdtsc();
         double sp_r0 = 0.0;
         if (sp_enabled()) {
@@ -675,7 +675,7 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
                 size_t prior_len = prior ? strlen(prior) : 0;
                 size_t yslen = (size_t)l + 32 + (prior_len ? prior_len + 1 : 0);
                 char *comment = (char *)malloc(yslen);
-                assert(comment != NULL);
+                xassert(comment != NULL, "out of memory: comment");
                 int off = snprintf(comment, yslen, "YS:Z:");
                 memcpy(comment + off, s->seq, (size_t)l);
                 off += l;
@@ -692,7 +692,7 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
                  * strdup is fine for the draft; freed in the per-batch free
                  * loop below alongside s->seq. */
                 s->meth_orig_seq = strdup(s->seq);
-                assert(s->meth_orig_seq != NULL);
+                xassert(s->meth_orig_seq != NULL, "out of memory: s->meth_orig_seq");
                 /* --meth: read-number chemistry (R1=OT=1, R2=OB=0) for the
                  * seed-chemistry filter in meth_seed_to_orig. */
                 s->meth_base_ot = is_r2 ? 0 : 1;
@@ -1239,7 +1239,7 @@ static int process(void *shared, gzFile gfp, gzFile gfp2, int pipe_threads)
 
     fprintf(stderr, "* No. of pipeline threads: %d\n\n", p_nt);
     aux_.workers = (ktp_worker_t*) malloc(p_nt * sizeof(ktp_worker_t));
-    assert(aux_.workers != NULL);
+    xassert(aux_.workers != NULL, "out of memory: aux_.workers");
 
     for (int i = 0; i < p_nt; ++i) {
         ktp_worker_t *wr = &aux_.workers[i];
@@ -1251,7 +1251,7 @@ static int process(void *shared, gzFile gfp, gzFile gfp2, int pipe_threads)
     }
 
     pthread_t *ptid = (pthread_t *) calloc(p_nt, sizeof(pthread_t));
-    assert(ptid != NULL);
+    xassert(ptid != NULL, "out of memory: ptid");
 
     for (int i = 0; i < p_nt; ++i)
         pthread_create(&ptid[i], 0, ktp_worker, (void*) &aux_.workers[i]);

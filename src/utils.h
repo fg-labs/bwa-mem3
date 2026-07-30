@@ -46,7 +46,16 @@
 #define xreopen(fn, mode, fp) err_xreopen_core(__func__, fn, mode, fp)
 #define xzopen(fn, mode) err_xzopen_core(__func__, fn, mode)
 
-#define xassert(cond, msg) if ((cond) == 0) _err_fatal_simple_core(__func__, msg)
+/* Unconditional fatal check -- unlike assert(), it is NOT compiled out under
+ * NDEBUG, so it is the right guard for a condition that must be enforced in a
+ * release build (allocation failure, corrupt index, inconsistent sidecar).
+ *
+ * Wrapped in do/while(0): the bare `if` this expanded to before would bind a
+ * trailing `else` to the macro's own `if` rather than to the caller's, so
+ * `if (x) xassert(...); else foo();` silently attached `foo()` to the wrong
+ * branch. Harmless at the single call site that existed then, not something to
+ * leave armed now that the macro is used throughout. */
+#define xassert(cond, msg) do { if ((cond) == 0) _err_fatal_simple_core(__func__, msg); } while (0)
 
 #if defined(__GNUC__) && __GNUC__ < 11 && !defined(__clang__)
 #if defined(__i386__)

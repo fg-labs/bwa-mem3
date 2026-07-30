@@ -122,7 +122,7 @@ bntseq_t *bns_restore_core(const char *ann_filename, const char* amb_filename, c
 	int i;
 	int scanres;
 	bns = (bntseq_t*)calloc(1, sizeof(bntseq_t));
-	assert(bns != 0);
+	xassert(bns != NULL, "out of memory: bns");
 	{ // read .ann
 		fp = xopen(fname = ann_filename, "r");
 		scanres = fscanf(fp, "%lld%d%u", &xx, &bns->n_seqs, &bns->seed);
@@ -130,7 +130,10 @@ bntseq_t *bns_restore_core(const char *ann_filename, const char* amb_filename, c
 		if (scanres != 3) goto badread;
 		bns->l_pac = xx;
 		bns->anns = (bntann1_t*)calloc(bns->n_seqs, sizeof(bntann1_t));
-        assert(bns->anns != NULL);
+        // A zero-sequence .ann is degenerate but not an allocation failure:
+        // calloc(0, ...) is free to return NULL, so only a non-empty request
+        // coming back NULL means we are out of memory.
+        xassert(bns->n_seqs == 0 || bns->anns != NULL, "out of memory: bns->anns");
 		for (i = 0; i < bns->n_seqs; ++i) {
 			bntann1_t *p = bns->anns + i;
 			char *q = str;
@@ -168,7 +171,7 @@ bntseq_t *bns_restore_core(const char *ann_filename, const char* amb_filename, c
 		xassert(l_pac == bns->l_pac && n_seqs == bns->n_seqs, "inconsistent .ann and .amb files.");
         if(bns->n_holes){
             bns->ambs = (bntamb1_t*)calloc(bns->n_holes, sizeof(bntamb1_t));
-            assert(bns->ambs != NULL);
+            xassert(bns->ambs != NULL, "out of memory: bns->ambs");
         }
         else{
             bns->ambs = 0;
@@ -212,7 +215,7 @@ bntseq_t *bns_restore(const char *prefix)
 		int c, i, absent;
 		khint_t k;
 		h = kh_init(str);
-        assert(h != NULL);
+        xassert(h != NULL, "out of memory: bns name hash");
 		for (i = 0; i < bns->n_seqs; ++i) {
 			k = kh_put(str, h, bns->anns[i].name, &absent);
 			kh_val(h, k) = i;
@@ -274,7 +277,7 @@ static uint8_t *add1(const kseq_t *seq, bntseq_t *bns, uint8_t *pac, int64_t *m_
 	if (bns->n_seqs == *m_seqs) {
 		*m_seqs <<= 1;
 		bns->anns = (bntann1_t*)realloc(bns->anns, *m_seqs * sizeof(bntann1_t));
-        assert(bns->anns != NULL);
+        xassert(bns->anns != NULL, "out of memory: bns->anns");
 	}
 	p = bns->anns + bns->n_seqs;
 	p->name = strdup((char*)seq->name.s);
@@ -331,14 +334,14 @@ int64_t bns_fasta2bntseq(gzFile fp_fa, const char *prefix, int for_only)
 	// initialization
 	seq = kseq_init(fp_fa);
 	bns = (bntseq_t*)calloc(1, sizeof(bntseq_t));
-    assert(bns != NULL);
+    xassert(bns != NULL, "out of memory: bns");
 	bns->seed = 11; // fixed seed for random generator
 	srand48(bns->seed);
 	m_seqs = m_holes = 8; m_pac = 0x10000;
 	bns->anns = (bntann1_t*)calloc(m_seqs, sizeof(bntann1_t));
-    assert(bns->anns != NULL);
+    xassert(bns->anns != NULL, "out of memory: bns->anns");
 	bns->ambs = (bntamb1_t*)calloc(m_holes, sizeof(bntamb1_t));
-    assert(bns->ambs != NULL);
+    xassert(bns->ambs != NULL, "out of memory: bns->ambs");
 	pac = (uint8_t*) calloc(m_pac/4, 1);
 	if (pac == NULL) { perror("Allocation of pac failed"); exit(EXIT_FAILURE); }
 	q = bns->ambs;
