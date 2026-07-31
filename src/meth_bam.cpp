@@ -347,6 +347,20 @@ int meth_mem_aln_to_bam(bam1_t *b,
      * existing encoding. */
     int32_t tid = (p.rid >= 0 && p.rid < bns->n_seqs) ? p.rid : -1;
     int32_t mtid = (mp && mp->rid >= 0 && mp->rid < bns->n_seqs) ? mp->rid : -1;
+    /* The `meth_hypothesis >= 0` term is DEFENSIVE, not a reachable branch: a
+     * mapped record under --meth always carries 0 or 1. The value reaches `p`
+     * through mem_reg2aln, which defaults it to -1 and then copies the region's
+     * hypothesis over that default. A region (mem_alnreg_t) gets its hypothesis
+     * in exactly three places, all of which supply 0 or 1 under --meth:
+     *   - mem_chain2aln_across_reads_V2 (bwamem.cpp), copying the chain's
+     *     hypothesis (itself set in chain_add_one_seed) -- chain seeds that
+     *     cannot be remapped to an OT/OB hypothesis are dropped rather than
+     *     carried as -1;
+     *   - mem_matesw and mem_matesw_batch_post (bwamem_pair.cpp), the two
+     *     mate-rescue paths.
+     * The term is kept so an unmapped or non-meth record, which does keep the
+     * -1 default, cannot index off ((-1)&1)==1 and be labelled top-strand. Do
+     * not read it as evidence that -1 reaches a mapped record. */
     char direction = 0;
     if (tid >= 0 && p.meth_hypothesis >= 0)
         direction = (p.meth_hypothesis & 1) ? 'f' : 'r';
@@ -487,10 +501,18 @@ int meth_mem_aln_to_bam(bam1_t *b,
     char *xm = NULL;
     if ((opt->meth_tags & MEM_METH_TAG_XM)
         && mapped && seq_text != NULL && bam_cigar != NULL && l_emit > 0) {
-        /* Match the XG `direction` guard at line ~322: a -1 hypothesis maps to
-         * XG:Z:GA (bottom strand), so treat it as bottom here too. ((-1)&1)==1
-         * would otherwise mislabel a -1-hypothesis record (e.g. mate rescued off
-         * a -1 anchor) as top strand, emitting XG:GA with a top-strand XM. */
+        /* The `>= 0` term cannot fire here: this block is gated on `mapped`,
+         * which requires `direction != 0`, and `direction` is only set when
+         * meth_hypothesis >= 0. So -1 is already excluded before this line --
+         * the term is redundant under the current control flow, not a guard
+         * against something that happens.
+         *
+         * It is kept for symmetry with the XG `direction` guard above, and so
+         * the two stay consistent if `mapped` is ever loosened: should a -1
+         * reach here then, it is treated as bottom strand, matching the
+         * XG:Z:GA that guard would emit. Dropping the term instead would let
+         * ((-1)&1)==1 mislabel such a record top-strand and pair XG:GA with a
+         * top-strand XM. */
         int is_top_strand = (p.meth_hypothesis >= 0 && (p.meth_hypothesis & 1)) ? 1 : 0;
         xm = meth_build_xm(bns, pac, tid, (int64_t)p.pos,
                            is_top_strand,

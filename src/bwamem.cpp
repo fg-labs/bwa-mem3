@@ -3513,6 +3513,36 @@ void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str,
     str->s[str->l] = 0;  /* single trailing NUL — unsafe writers skipped this */
 }
 
+/* Does this region's CIGAR/NM/MD regeneration run in NATIVE (--meth) mode?
+ *
+ * One predicate, because it selects THREE things at once and they must never
+ * disagree: the query bases (original vs projected), the scoring matrix
+ * (per-hypothesis asymmetric vs symmetric), and the NM/MD predicate
+ * (matrix-derived vs literal). A caller that satisfies two of the three inputs
+ * but not the third silently produces a record with the OTHER tag semantics and
+ * no diagnostic — which is exactly how XA:Z sub-entries ended up reporting
+ * conversion-counting NM alongside a conversion-hiding primary (fixed by
+ * threading meth_orig_query through mem_gen_alt). Keeping the decision in one
+ * named place is what makes that class of mistake reviewable.
+ *
+ * On the `meth_hypothesis >= 0` term: for a MAPPED region under --meth this is
+ * always true, so the term is defensive rather than a real branch.
+ *   - Chain seeds that cannot be remapped to an OT/OB hypothesis are DROPPED,
+ *     not carried with -1 (mem_chain_seeds -> meth_seed_to_orig returns
+ *     non-zero and the seed is skipped).
+ *   - meth_orig_bns is NULL only if the reference prefix overflowed PATH_MAX,
+ *     which warns loudly at startup.
+ *   - Every mem_matesw call site passes `opt->meth_mode ? i : -1`, so a rescued
+ *     mate under --meth inherits 0 or 1, never -1.
+ * Were it ever false, the fallback is still self-consistent rather than mixed:
+ * the symmetric opt->mat has every off-diagonal at -b < 0 (--meth rejects
+ * -B 0), so the matrix-derived and literal NM/MD predicates agree on it. */
+static int mem_use_native_regen(const mem_opt_t *opt, const mem_alnreg_t *ar,
+                                const char *meth_orig_query)
+{
+    return opt->meth_mode && meth_orig_query != NULL && ar->meth_hypothesis >= 0;
+}
+
 mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, int l_query, const char *query_, const mem_alnreg_t *ar, const char *meth_orig_query)
 {
     mem_aln_t a;
@@ -3537,8 +3567,7 @@ mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *
      * bases; else fall back to the projected `query_` (non-meth path,
      * byte-for-byte identical to legacy). How conversions themselves are treated
      * in NM/MD is governed by the policy note below, not here. */
-    const int use_meth_orig = (opt->meth_mode && meth_orig_query != NULL
-                               && ar->meth_hypothesis >= 0);
+    const int use_meth_orig = mem_use_native_regen(opt, ar, meth_orig_query);
     const char *regen_query = use_meth_orig ? meth_orig_query : query_;
     /* Reuse a per-thread nt4 scratch instead of a malloc/free per region. The
      * buffer is consumed within this call (copied into a.cigar via the DP), so
