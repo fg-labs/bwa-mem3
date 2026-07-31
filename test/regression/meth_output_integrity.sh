@@ -4,13 +4,17 @@
 # Regression (D3 B6): the --meth BAM is original-alphabet and Bismark-compatible.
 # Five invariants downstream methylation + variant callers depend on:
 #
-#  1. Real-SNP vs bisulfite-conversion. The asymmetric matrix frees conversions
-#     in SCORING but NM/MD count every literal mismatch. An OT read with 10 C->T
-#     conversions plus one real A->G SNP must score AS = 60 - (a+b) (only the SNP
-#     penalized, conversions free), NM = 11, and an MD string with ten ref-C
-#     mismatches (the conversions, the Revelio masking substrate) and exactly one
-#     ref-A mismatch (the real variant) -- so a downstream caller sees the SNP and
-#     a Revelio double-mask hides the conversions.
+#  1. Real-SNP vs bisulfite-conversion. Under --meth, NM/MD are derived from the
+#     per-hypothesis asymmetric matrix rather than from literal base inequality,
+#     so a column is a mismatch iff the matrix penalizes it. An OT read with 10
+#     C->T conversions plus one real A->G SNP must score AS = 60 - (a+b) (only the
+#     SNP penalized, conversions free), NM = 1, and an MD string with exactly one
+#     ref-A mismatch (the real variant) and NO ref-C entries -- the conversions
+#     are matches for NM/MD exactly as they already are for the DP (issue #327).
+#
+#     (The complementary case -- that `collapsed` additionally hides a real T->C
+#     variant while `genomic` keeps it -- is covered by meth_collapsed_scoring.sh,
+#     which owns that fixture.)
 #
 #  2. Bismark four-strand XR/XG. XR is the per-read conversion (R1=CT, R2=GA); XG
 #     is the genome strand shared by both mates of a fragment. A top-strand
@@ -62,12 +66,13 @@ as=$(tag "$line" AS); nm=$(tag "$line" NM); md=$(tag "$line" MD)
 # --meth keeps the bwa default mismatch penalty b=4 (not bwameth's b=2), so the single real SNP costs -4
 # (conversions free): 59 match/freed columns (+59) - 1 SNP (-4) = 55.
 [ "$as" = "55" ] || fail "SNP/conv: AS $as, want 55 (only the real SNP penalized at b=4; conversions free)"
-[ "$nm" = "11" ] || fail "SNP/conv: NM $nm, want 11 (10 conversions + 1 SNP)"
-# MD reference-base mismatch letters: ten ref-C (conversions) + exactly one ref-A (SNP).
+[ "$nm" = "1" ]  || fail "SNP/conv: NM $nm, want 1 (the real SNP only; conversions are matches for NM/MD)"
+# MD reference-base mismatch letters: exactly one ref-A (the SNP), no ref-C (the
+# conversions must not appear at all).
 nC=$(printf '%s' "$md" | tr -cd 'C' | wc -c | tr -d ' ')
 nA=$(printf '%s' "$md" | tr -cd 'A' | wc -c | tr -d ' ')
 nG=$(printf '%s' "$md" | tr -cd 'G' | wc -c | tr -d ' ')
-[ "$nC" = "10" ] || fail "SNP/conv: MD has $nC ref-C mismatches, want 10 (conversions); MD=$md"
+[ "$nC" = "0" ]  || fail "SNP/conv: MD has $nC ref-C mismatches, want 0 (conversions must be hidden); MD=$md"
 [ "$nA" = "1" ]  || fail "SNP/conv: MD has $nA ref-A mismatches, want 1 (the real SNP); MD=$md"
 [ "$nG" = "0" ]  || fail "SNP/conv: MD has $nG ref-G mismatches, want 0; MD=$md"
 

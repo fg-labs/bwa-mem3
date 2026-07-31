@@ -130,6 +130,16 @@ extern "C" {
 							 int64_t rb, int64_t re, int *score,
 							 int *n_cigar, int *NM);
 
+	/* As bwa_gen_cigar2, plus `nm_from_mat`: 0 derives NM/MD from literal base
+	 * inequality (bwa default); 1 derives them from the scoring matrix, so a
+	 * cell the matrix does not penalise is a match. --meth uses 1 so bisulfite
+	 * conversions are matches for NM/MD as well as for the DP. */
+	uint32_t *bwa_gen_cigar3(const int8_t mat[25], int o_del, int e_del,
+							 int o_ins, int e_ins, int w_, int64_t l_pac,
+							 const uint8_t *pac, int l_query, uint8_t *query,
+							 int64_t rb, int64_t re, int *score,
+							 int *n_cigar, int *NM, int nm_from_mat);
+
 	/* emit_unpacked_ref=0 (the default) skips writing `<prefix>.0123`. `mem`
 	 * pac-fetches the original reference from `<prefix>.pac` on demand
 	 * (bns_get_seq_v2), so the unpacked `.0123` (~8x the `.pac`) is never read

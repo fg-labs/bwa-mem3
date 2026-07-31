@@ -287,8 +287,23 @@ void bwa_fill_scmat(int a, int b, int8_t mat[25])
     for (j = 0; j < 5; ++j) mat[k++] = -1;   // DEFAULT AMBIG
 }
 
-// Generate CIGAR when the alignment end points are known
-uint32_t *bwa_gen_cigar2(const int8_t mat[25], int o_del, int e_del, int o_ins, int e_ins, int w_, int64_t l_pac, const uint8_t *pac, int l_query, uint8_t *query, int64_t rb, int64_t re, int *score, int *n_cigar, int *NM)
+/* Generate CIGAR when the alignment end points are known.
+ *
+ * `nm_from_mat` selects how the NM/MD pass classifies an aligned column:
+ *   0 (default, non-meth): a column is a mismatch iff the bases differ literally
+ *     (`query != rseq`) -- the historical bwa behaviour, byte-for-byte.
+ *   1 (--meth): a column is a mismatch iff the SCORING MATRIX penalises it
+ *     (`mat[ref*5 + query] < 0`). Under --meth `mat` is the per-hypothesis
+ *     asymmetric matrix whose bisulfite-conversion cell is set to the match
+ *     score (mem_opt_fill_meth_mat), so a C->T (OT) / G->A (OB) conversion is a
+ *     match for NM/MD exactly as it already is for the DP. See the policy note
+ *     in mem_reg2aln().
+ *
+ * The matrix is safe to reuse here because the NM/MD pass and the DP share BOTH
+ * buffers and frame: on the reverse strand (rb >= l_pac) `query`/`rseq` are
+ * reversed in place above and the caller has already flipped the OT/OB
+ * hypothesis to match, so `mat` indexes the same way in both passes. */
+uint32_t *bwa_gen_cigar3(const int8_t mat[25], int o_del, int e_del, int o_ins, int e_ins, int w_, int64_t l_pac, const uint8_t *pac, int l_query, uint8_t *query, int64_t rb, int64_t re, int *score, int *n_cigar, int *NM, int nm_from_mat)
 {
     uint32_t *cigar = 0;
     uint8_t tmp, *rseq;
@@ -353,7 +368,11 @@ uint32_t *bwa_gen_cigar2(const int8_t mat[25], int o_del, int e_del, int o_ins, 
             op  = cigar[k]&0xf, len = cigar[k]>>4;
             if (op == 0) { // match
                 for (i = 0; i < len; ++i) {
-                    if (query[x + i] != rseq[y + i]) {
+                    /* loop-invariant select; see the nm_from_mat contract above */
+                    const int is_mm = nm_from_mat
+                        ? (mat[rseq[y + i] * 5 + query[x + i]] < 0)
+                        : (query[x + i] != rseq[y + i]);
+                    if (is_mm) {
                         kputw(u, &str);
                         kputc(int2base[rseq[y+i]], &str);
                         ++n_mm; u = 0;
@@ -381,6 +400,11 @@ uint32_t *bwa_gen_cigar2(const int8_t mat[25], int o_del, int e_del, int o_ins, 
 ret_gen_cigar:
     /* rseq aliases thread-local kvec scratch in this function; do not free. */
     return cigar;
+}
+
+uint32_t *bwa_gen_cigar2(const int8_t mat[25], int o_del, int e_del, int o_ins, int e_ins, int w_, int64_t l_pac, const uint8_t *pac, int l_query, uint8_t *query, int64_t rb, int64_t re, int *score, int *n_cigar, int *NM)
+{
+    return bwa_gen_cigar3(mat, o_del, e_del, o_ins, e_ins, w_, l_pac, pac, l_query, query, rb, re, score, n_cigar, NM, 0);
 }
 
 uint32_t *bwa_gen_cigar(const int8_t mat[25], int q, int r, int w_, int64_t l_pac, const uint8_t *pac, int l_query, uint8_t *query, int64_t rb, int64_t re, int *score, int *n_cigar, int *NM)

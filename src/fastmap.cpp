@@ -1542,11 +1542,14 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "                 collapsed: C/T (and G/A) interchangeable, bwameth-compatible\n");
     fprintf(stderr, "                 placement (sets -B 2).\n");
     fprintf(stderr, "                 genomic: free only the conversion direction, scored as a full\n");
-    fprintf(stderr, "                 match, keep variants as mismatches (variant-aware, truthful\n");
-    fprintf(stderr, "                 NM/MD; -B 4).\n");
+    fprintf(stderr, "                 match, keep variants as mismatches (variant-aware: variants\n");
+    fprintf(stderr, "                 outside the conversion direction visible in NM/MD; -B 4).\n");
     fprintf(stderr, "                 neutral: free only the conversion direction but score it 0\n");
-    fprintf(stderr, "                 (tolerated, not rewarded); best for TAPS (variant-aware,\n");
-    fprintf(stderr, "                 truthful NM/MD; -B 4).\n");
+    fprintf(stderr, "                 (tolerated, not rewarded); best for TAPS (variant-aware:\n");
+    fprintf(stderr, "                 variants visible in NM/MD as in genomic; -B 4).\n");
+    fprintf(stderr, "                 In genomic/neutral a real variant in the conversion direction\n");
+    fprintf(stderr, "                 itself (C->T at a reference C) is indistinguishable from a\n");
+    fprintf(stderr, "                 conversion and stays hidden in NM/MD.\n");
     fprintf(stderr, "   --set-as-failed f|r\n");
     fprintf(stderr, "                 flag alignments to the matching strand ('f' or 'r') as QC-fail (0x200)\n");
     fprintf(stderr, "   --chimera-qc\n");
@@ -2418,6 +2421,28 @@ int main_mem(int argc, char *argv[])
          * -A (bwameth's constants assume a==1) and can be unit-tested. */
         mem_opt_apply_meth_defaults(opt, &opt0);
         aux.copy_comment = 1;          /* -C, needed for YS:Z/YC:Z passthrough */
+    }
+
+    /* Under --meth, NM/MD are derived from the scoring matrix (a column is a
+     * mismatch iff the matrix penalizes it), so a non-positive -B makes every
+     * substitution cell non-negative and silently collapses NM to 0 and MD to
+     * a bare match run -- hiding real variants, not just conversions. Refuse it
+     * rather than emit output that looks clean because scoring is degenerate.
+     * The bound is `<= 0`, not `== 0`: bwa_fill_scmat stores -b, so a NEGATIVE
+     * -B turns every substitution into a positive reward, which hides real
+     * variants at least as thoroughly as -B 0 does.
+     * The message reports the EFFECTIVE penalty rather than echoing "-B":
+     * update_a() scales b by -A when -B was not given, so `-A 0` reaches b == 0
+     * without the user ever passing -B, and naming -B there would misdirect.
+     * The non-meth path keeps the literal comparison and is unaffected. */
+    if (opt->meth_mode && opt->b <= 0) {
+        fprintf(stderr, "ERROR: --meth requires a positive mismatch penalty, but the "
+                        "effective penalty is %d; a non-positive penalty makes every "
+                        "substitution free or rewarded, which collapses NM/MD to zero "
+                        "and hides real variants (check -B and -A)\n", opt->b);
+        free(opt);
+        if (out_opened) fclose(aux.fp);
+        return 1;
     }
 
     /* Matrix for SWA */

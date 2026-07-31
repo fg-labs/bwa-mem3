@@ -157,11 +157,12 @@ typedef struct mem_opt_t {
      *   GENOMIC: that cell alone is freed, to a MATCH (+a); the mirror
      *     (mat[T][C], mat[A][G]) STAYS at −b so genuine variants score as
      *     mismatches → one freed cell at +a ⇒ the SIMD rank-1 fast path.
-     *     Variant-aware, truthful NM/MD.
+     *     Variant-aware: real variants stay visible in NM/MD.
      *   NEUTRAL: that cell alone is freed, to 0 (tolerated, not rewarded); the
      *     mirror STAYS at −b. One freed cell, but NOT rank-1 (the value is
      *     neither match nor mismatch) → bandedSWA's general path; the kswv
-     *     freed-cell blend expresses it directly. Variant-aware, truthful NM/MD.
+     *     freed-cell blend expresses it directly. Variant-aware: real variants
+     *     stay visible in NM/MD.
      *   COLLAPSED: the mirror cell is ALSO freed (two cells, both to +a) so C/T
      *     and G/A are interchangeable → reproduces bwameth; uses bandedSWA's
      *     general path.
@@ -485,9 +486,13 @@ int mem_mark_primary_se(const mem_opt_t *opt, int n, mem_alnreg_t *a, int64_t id
 
 static void mem_mark_primary_se_core(const mem_opt_t *opt, int n, mem_alnreg_t *a, int_v *z);
 
+/* ONLY work after mem_mark_primary_se(); out_hn may be NULL.
+ * `meth_orig_query` is forwarded to mem_reg2aln for each XA sub-entry so they
+ * regenerate under the same NM/MD policy as the primary record (see
+ * mem_reg2aln). NULL (the default) keeps the legacy literal regen. */
 char **mem_gen_alt(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
                    const mem_alnreg_v *a, int l_query, const char *query,
-                   int **out_hn); // ONLY work after mem_mark_primary_se(); out_hn may be NULL
+                   int **out_hn, const char *meth_orig_query = NULL);
 void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str, bseq1_t *s,
                  int n, const mem_aln_t *list, int which, const mem_aln_t *m_);
 

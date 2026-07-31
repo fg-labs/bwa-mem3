@@ -3167,7 +3167,7 @@ void mem_reg2sam(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
     int *HN = 0;
 
     if (!(opt->flag & MEM_F_ALL))
-        XA = mem_gen_alt(opt, bns, pac, a, s->l_seq, s->seq, &HN);
+        XA = mem_gen_alt(opt, bns, pac, a, s->l_seq, s->seq, &HN, s->meth_orig_seq);
 
     kv_init(aa);
     str.l = str.m = 0; str.s = 0;
@@ -3475,12 +3475,12 @@ mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *
     qb = ar->qb, qe = ar->qe;
     rb = ar->rb, re = ar->re;
     /* D3 (--meth, PR-5): output CIGAR/NM/MD must reflect the ORIGINAL read vs the
-     * ORIGINAL reference in the original alphabet, so a real (non-converting) SNP
-     * shows as a mismatch and the bisulfite C→T/G→A conversion shows as read-T at
-     * ref-C (the substrate a downstream double-masking step like Revelio expects;
-     * plan §4 / spec §6.1). When `meth_orig_query` is supplied, regen from the
-     * original bases; else fall back to the projected `query_` (non-meth path,
-     * byte-for-byte identical to legacy). */
+     * ORIGINAL reference in the original alphabet, so placement and gap shape are
+     * expressed in real coordinates and a real (non-converting) SNP stays a
+     * mismatch. When `meth_orig_query` is supplied, regen from the original
+     * bases; else fall back to the projected `query_` (non-meth path,
+     * byte-for-byte identical to legacy). How conversions themselves are treated
+     * in NM/MD is governed by the policy note below, not here. */
     const int use_meth_orig = (opt->meth_mode && meth_orig_query != NULL
                                && ar->meth_hypothesis >= 0);
     const char *regen_query = use_meth_orig ? meth_orig_query : query_;
@@ -3513,19 +3513,31 @@ mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *
      *     re-penalize every conversion as a mismatch and can shift gaps); for
      *     non-meth it is the symmetric opt->mat (legacy, unchanged).
      *
-     * NOTE (--meth NM/MD-vs-conversion policy, RESOLVED — plan §4): bwa_gen_cigar2
-     * computes NM/MD by LITERAL base comparison (query[x+i] != rseq[y+i]),
-     * independent of `regen_mat`. So a bisulfite C→T (OT) / G→A (OB) at a
-     * ref-C/ref-G is COUNTED as one mismatch in NM and emitted in MD, exactly like
-     * a real SNP — it is NOT hidden. This is deliberate: it is the substrate a
-     * downstream Revelio-style double-mask + conventional caller expects (the
-     * conversion is visible as read-T at ref-C, then BQ-masked downstream; the
-     * aligner does no masking). The conversion is NOT double-counted against the
-     * alignment SCORE: the asymmetric `regen_mat` frees the conversion cell to a
-     * match (+a) for the DP, while NM/MD count it once as a literal mismatch — two
-     * separate concerns. Hiding conversions from NM/MD (e.g. a Bismark-style
-     * XM-only consumer) would be a different, explicit choice and must be made
-     * here, not assumed. */
+     * NOTE (--meth NM/MD-vs-conversion policy): under --meth, NM/MD are derived
+     * from `regen_mat`, not from literal base inequality — a column is a mismatch
+     * iff the matrix penalises it (`bwa_gen_cigar3(..., nm_from_mat=1)`). Because
+     * the asymmetric matrix scores the conversion cell as a match, a bisulfite
+     * C→T (OT) / G→A (OB) at a ref-C/ref-G is a MATCH for NM/MD exactly as it
+     * already is for the DP. One definition drives both; there is no bisulfite
+     * special case in the NM/MD pass itself.
+     *
+     * Consequences, by design and by scoring mode:
+     *   - Conversions never reach NM/MD. A perfectly converted read is NM:i:0,
+     *     and MD does not enumerate every ref-C (which otherwise dominates the
+     *     record; see issue #327).
+     *   - `genomic` frees only the conversion direction, so a real variant in the
+     *     opposite direction stays a mismatch and remains visible.
+     *   - `collapsed` frees the mirror cell too, so C/T (and G/A) are fully
+     *     interchangeable and real variants in that class are hidden as well —
+     *     the documented cost of bwameth-compatible placement.
+     *
+     * A read alone cannot distinguish a bisulfite C→T from a real C→T SNP; that
+     * aliasing is resolved downstream at the pileup, not here. The aligner
+     * therefore reports what its scoring model treats as divergence rather than
+     * adjudicating chemistry-vs-genotype per base. NOTE: this makes NM/MD
+     * deliberately non-conformant with the SAM spec's "edit distance to the
+     * reference" under --meth (the same divergence class as BISCUIT's NM and
+     * bwameth's collapsed-space NM); the non-meth path is unchanged. */
     /* D3 (--meth, fix): the CIGAR regen must use the SAME strand-adjusted matrix
      * as the extension (see mem_alnreg_t.meth_strand_hyp). ar->rb is final here,
      * so derive is_rev directly (rb in doubled-pac; >= l_pac = reverse) and flip
@@ -3538,7 +3550,7 @@ mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *
     do {
         free(a.cigar);
         w2 = w2 < opt->w<<2? w2 : opt->w<<2;
-        a.cigar = bwa_gen_cigar2(regen_mat, opt->o_del, opt->e_del, opt->o_ins, opt->e_ins, w2, bns->l_pac, pac, qe - qb, (uint8_t*)&query[qb], rb, re, &score, &a.n_cigar, &NM);
+        a.cigar = bwa_gen_cigar3(regen_mat, opt->o_del, opt->e_del, opt->o_ins, opt->e_ins, w2, bns->l_pac, pac, qe - qb, (uint8_t*)&query[qb], rb, re, &score, &a.n_cigar, &NM, use_meth_orig);
         if (bwa_verbose >= 4) fprintf(stderr, "* Final alignment: w2=%d, global_sc=%d, local_sc=%d\n", w2, score, ar->truesc);
         if (score == last_sc || w2 == opt->w<<2) break; // it is possible that global alignment and local alignment give different scores
         last_sc = score;

@@ -12,9 +12,12 @@
 #   Reverse fragment:  R1 OT reverse @701,  R2 OB forward @501
 #
 # Directional contract: R1 -> OT (XR:CT), R2 -> OB (XR:GA), regardless of which
-# genomic strand the mate maps to. Conversions are scored free (AS == 60) but
-# remain literal mismatches (NM == #conversions), confirming placement and
-# original-alphabet scoring are jointly correct on every strand/hypothesis.
+# genomic strand the mate maps to. Conversions are scored free (AS == 60), and
+# because NM/MD are derived from the same matrix they are hidden from NM too
+# (NM == 0; issue #327) -- with XM's lowercase call count proving the read really
+# carries #conversions > 0, so NM == 0 cannot pass vacuously. Together these
+# confirm placement and original-alphabet scoring are jointly correct on every
+# strand/hypothesis.
 #
 # Inputs:
 #   BWA_MEM3 — path to the bwa-mem3 binary under test
@@ -44,12 +47,12 @@ emit() { printf '@%s\n%s\n+\n%s\n' "$1" "$2" "$Q" > "$3"; }
 # Decode one mate (mate-flag bit 64=READ1, 128=READ2) from $1.bam.
 get() { samtools view "$1" | mawk -v bit="$2" '
     (int($2/bit) % 2) == 1 {
-        rev = (int($2/16) % 2); as=""; nm=""; xr="";
-        for (i=12;i<=NF;i++){ if($i~/^AS:i:/)as=substr($i,6); if($i~/^NM:i:/)nm=substr($i,6); if($i~/^XR:Z:/)xr=substr($i,6) }
-        print $3, $4, $5, rev, $6, as, nm, xr; exit }'
+        rev = (int($2/16) % 2); as=""; nm=""; xr=""; nconv=0;
+        for (i=12;i<=NF;i++){ if($i~/^AS:i:/)as=substr($i,6); if($i~/^NM:i:/)nm=substr($i,6); if($i~/^XR:Z:/)xr=substr($i,6); if($i~/^XM:Z:/){xm=substr($i,6); nconv=gsub(/[zxhu]/,"",xm)} }
+        print $3, $4, $5, rev, $6, as, nm, xr, nconv; exit }'
 }
-check() { # $1 bam  $2 mateflag  $3 label  $4 pos  $5 rev  $6 xr  $7 as  $8 nm
-    read -r rn pos mapq rev cig as nm xr < <(get "$1" "$2")
+check() { # $1 bam  $2 mateflag  $3 label  $4 pos  $5 rev  $6 xr  $7 as  $8 nconv
+    read -r rn pos mapq rev cig as nm xr nconv < <(get "$1" "$2")
     [ "$rn" = "chrA" ]  || fail "$3: RNAME $rn, want chrA"
     [ "$pos" = "$4" ]   || fail "$3: POS $pos, want $4 (remap placement)"
     [ "$rev" = "$5" ]   || fail "$3: strand rev=$rev, want $5 (reverse-strand re-encode)"
@@ -57,7 +60,9 @@ check() { # $1 bam  $2 mateflag  $3 label  $4 pos  $5 rev  $6 xr  $7 as  $8 nm
     [ "$mapq" = "60" ]  || fail "$3: MAPQ $mapq, want 60"
     [ "$xr" = "$6" ]    || fail "$3: XR $xr, want $6 (hypothesis label)"
     [ "$as" = "$7" ]    || fail "$3: AS $as, want $7 (conversions scored free)"
-    [ "$nm" = "$8" ]    || fail "$3: NM $nm, want $8 (conversions remain literal mismatches)"
+    [ "$nconv" = "$8" ] || fail "$3: XM shows $nconv converted bases, want $8 (fixture must actually exercise conversions)"
+    [ "$nconv" -gt 0 ]  || fail "$3: converted-base count must be > 0 (test must actually exercise conversions)"
+    [ "$nm" = "0" ]     || fail "$3: NM $nm, want 0 ($nconv conversions are matrix-freed, so they are matches for NM/MD)"
 }
 
 # --- forward fragment ---

@@ -117,11 +117,14 @@ Methylation (--meth) options:
                  collapsed: C/T (and G/A) interchangeable, bwameth-compatible
                  placement (sets -B 2).
                  genomic: free only the conversion direction, scored as a full
-                 match, keep variants as mismatches (variant-aware, truthful
-                 NM/MD; -B 4).
+                 match, keep variants as mismatches (variant-aware: variants
+                 outside the conversion direction visible in NM/MD; -B 4).
                  neutral: free only the conversion direction but score it 0
-                 (tolerated, not rewarded); best for TAPS (variant-aware,
-                 truthful NM/MD; -B 4).
+                 (tolerated, not rewarded); best for TAPS (variant-aware:
+                 variants visible in NM/MD as in genomic; -B 4).
+                 In genomic/neutral a real variant in the conversion direction
+                 itself (C->T at a reference C) is indistinguishable from a
+                 conversion and stays hidden in NM/MD.
    --set-as-failed f|r
                  flag alignments to the matching strand ('f' or 'r') as QC-fail (0x200)
    --chimera-qc
