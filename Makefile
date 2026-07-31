@@ -854,6 +854,8 @@ test: test-binaries $(STANDALONE_TESTS_IN_TEST_TARGET) bwa-mem3
 	./test/regression/debug_macro_flag_lint.sh
 	./test/regression/shell_lint_selftest.sh
 	./test/regression/shell_lint.sh
+	./test/regression/regression_coverage_lint_selftest.sh
+	./test/regression/regression_coverage_lint.sh
 
 # Shell lint on its own, and its autofix. Separate from `test` because the
 # whole point is to run them without a build: both are source-only and finish
@@ -870,8 +872,9 @@ shell-fix:
 # Regression test that requires a binary built with TESTING_BUILD=1
 # (enables BWAMEM3_TESTING_HOST_TIER env-var injection). Not invoked by
 # the default `test` target because it requires a non-production build.
-# CI runs `make clean && make TESTING_BUILD=1 && make test-injection`
-# as a separate matrix row.
+# No workflow invokes this target, so host_floor_enforce.sh currently runs
+# nowhere in CI; test/regression/regression_coverage_lint.sh records that
+# as an explicit exemption rather than letting it pass for coverage.
 test-injection: bwa-mem3
 	BWA_MEM3_TESTING=./bwa-mem3 INJECTED_TIER=sse41 PARITY_FA=/dev/null \
 		./test/regression/host_floor_enforce.sh

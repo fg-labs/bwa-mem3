@@ -1,0 +1,15 @@
+# Regression scripts deliberately not run by CI.
+#
+# Read by test/regression/regression_coverage_lint.sh. One script basename per
+# line (no .sh), blank lines and # comments ignored. Every entry needs a reason
+# above it: an exemption is a decision to leave a regression script uncovered,
+# and it should cost a reviewable line rather than passing in silence.
+#
+# The lint also fails when an entry here IS run by CI, and when an entry names
+# no script under test/regression/ at all -- so an exemption that has become
+# untrue, or that outlived the script it covered, cannot quietly accumulate.
+
+# Needs a TESTING_BUILD=1 binary (BWAMEM3_TESTING_HOST_TIER injection), which
+# no workflow builds. Covering it means paying for another build; until that is
+# decided it is honestly uncovered rather than quietly assumed covered.
+host_floor_enforce
