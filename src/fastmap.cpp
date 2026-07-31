@@ -1413,6 +1413,61 @@ static void update_a(mem_opt_t *opt, const mem_opt_t *opt0)
     }
 }
 
+/* True if `p` names something on disk, or is the base of a bwa index (the
+ * <idxbase> argument is a prefix, not a file: "ref.fa" with "ref.fa.amb"
+ * alongside it). Used only to decide whether a positional that *looks* like an
+ * option value is in fact a real path the user meant. */
+static int path_exists(const char *p)
+{
+    char buf[PATH_MAX];
+    if (p == NULL || *p == '\0') return 0;
+    if (access(p, F_OK) == 0) return 1;
+    /* Probe one index sidecar rather than all of them: .amb is written by every
+     * index variant (plain and --meth) and is the smallest. */
+    if (snprintf(buf, sizeof(buf), "%s.amb", p) < (int)sizeof(buf)
+        && access(buf, F_OK) == 0) return 1;
+    return 0;
+}
+
+/* If `s` is a value that belongs to one of the --meth family's options rather
+ * than a path, return the flag it belongs to; else NULL. Deliberately narrow:
+ * every token here is a closed-vocabulary keyword no one would name a reference
+ * after, and the caller additionally requires that no such path exists. */
+static const char *stray_option_value_flag(const char *s)
+{
+    static const struct { const char *value, *flag; } known[] = {
+        { "taps",      "--meth"         }, { "emseq",     "--meth" },
+        { "em-seq",    "--meth"         }, { "bisulfite", "--meth" },
+        { "collapsed", "--meth-scoring" }, { "genomic",   "--meth-scoring" },
+        { "neutral",   "--meth-scoring" },
+        { "XR",        "--meth-tags"    }, { "XG",        "--meth-tags" },
+        { "XM",        "--meth-tags"    }, { "all",       "--meth-tags" },
+        { "none",      "--meth-tags"    },
+    };
+    if (s == NULL) return NULL;
+    /* A `^`-prefixed exclusion can only have come from --meth-tags. Its `-XM`
+     * synonym needs no case here: `X` takes an argument in the short optstring,
+     * so getopt binds `-XM` as `-X M` and it never reaches a positional slot. */
+    if (s[0] == '^') return "--meth-tags";
+    for (size_t i = 0; i < sizeof(known) / sizeof(known[0]); ++i)
+        if (strcasecmp(s, known[i].value) == 0) return known[i].flag;
+    return NULL;
+}
+
+/* The corrective spelling for a stray value, tailored to how it got orphaned. */
+static const char *stray_option_value_advice(const char *s)
+{
+    const char *flag = stray_option_value_flag(s);
+    if (flag == NULL) return "";
+    if (strcmp(flag, "--meth") == 0)
+        return "       --meth takes an OPTIONAL argument, which getopt only binds with '=':\n"
+               "       write --meth=taps, not --meth taps.";
+    if (strcmp(flag, "--meth-tags") == 0)
+        return "       --meth-tags takes ONE comma-separated list, not a space-separated one:\n"
+               "       write --meth-tags XR,XG (or --meth-tags '^XM'), not --meth-tags XR XG.";
+    return "       Pass it as the argument to that flag, e.g. --meth-scoring genomic.";
+}
+
 static void usage(const mem_opt_t *opt)
 {
     fprintf(stderr, "Usage: bwa-mem3 mem [options] <idxbase> <in1.fq> [in2.fq]\n");
@@ -1554,8 +1609,8 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "                 which Bismark tags to emit: 'all' (default), 'none', a\n");
     fprintf(stderr, "                 comma-separated list (XR,XG), or ^-prefixed exclusions (^XM).\n");
     fprintf(stderr, "                 Comma-separated, NOT space-separated (a second word becomes\n");
-    fprintf(stderr, "                 the reference). Quote ^ specs: '^XM' -- bare ^ is a negated\n");
-    fprintf(stderr, "                 glob in zsh with EXTENDED_GLOB.\n");
+    fprintf(stderr, "                 the reference). An exclusion may be written ^XM or -XM; prefer\n");
+    fprintf(stderr, "                 -XM in scripts (bare ^ is a negated glob in zsh EXTENDED_GLOB).\n");
     fprintf(stderr, "                 Unselected tags are not computed. XM:Z is a read-length string\n");
     fprintf(stderr, "                 and dominates the BAM's aux payload; '^XM' drops it for callers\n");
     fprintf(stderr, "                 that recompute from the reference (MethylDackel, biscuit).\n");
@@ -2203,6 +2258,29 @@ int main_mem(int argc, char *argv[])
     }
 
     if (opt->n_threads < 1) opt->n_threads = 1;
+    /* A stray word on the command line slides silently into a positional slot.
+     * Two spellings invite it:
+     *   --meth taps        (optional argument: getopt_long only binds it with '=')
+     *   --meth-tags XR XG  (required argument: 'XR' binds, 'XG' does not)
+     * In both cases the orphan lands in <idxbase>, and with a single-end read
+     * file the result still has three positionals -- a perfectly well-formed
+     * paired-end invocation whose reference happens to be "taps" or "XG". The
+     * user then gets a missing-index error naming a token they never meant as a
+     * path. Diagnose it here, before any index work, whenever a positional
+     * matches a known option-value vocabulary and is not an actual path. */
+    for (int pos = optind; pos < argc; ++pos) {
+        const char *flag = stray_option_value_flag(argv[pos]);
+        if (flag == NULL || path_exists(argv[pos])) continue;
+        fprintf(stderr,
+                "ERROR: '%s' was taken as a positional argument (%s), but it looks like\n"
+                "       the value for %s and no such file exists.\n"
+                "%s\n",
+                argv[pos], pos == optind ? "the <idxbase> reference" : "a read file",
+                flag, stray_option_value_advice(argv[pos]));
+        free(opt);
+        if (out_opened) fclose(aux.fp);
+        return 1;
+    }
     if (optind + 2 != argc && optind + 3 != argc) {
         usage(opt);
         free(opt);

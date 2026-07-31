@@ -130,11 +130,11 @@ deselecting `XM` skips its per-read pass as well as its bytes.
 | `all` | emit `XR`, `XG`, `XM` (the default) |
 | `none` | emit none of the three |
 | `XR,XG` | inclusion list — emit exactly these |
-| `^XM` | exclusion — everything except `XM` |
+| `^XM` or `-XM` | exclusion — everything except `XM` (`-` needs no shell quoting) |
 
-A spec is either an inclusion list or a set of `^` exclusions; mixing the two
-(`XR,^XM`) is rejected rather than given an arbitrary reading. Tag names are
-case-insensitive.
+A spec is either an inclusion list or a set of exclusions (`^XM`, or its `-XM`
+synonym below); mixing the two (`XR,^XM`) is rejected rather than given an
+arbitrary reading. Tag names are case-insensitive.
 
 ```bash
 # Drop the methylation call string; keep the strand labels.
@@ -144,21 +144,30 @@ bwa-mem3 mem --meth --meth-tags '^XM' ref.fa r1.fq r2.fq > out.bam
 bwa-mem3 mem --meth --meth-tags XR,XG ref.fa r1.fq r2.fq > out.bam
 ```
 
-> **Quote `^`-prefixed specs.** In `zsh` with `EXTENDED_GLOB` enabled — the
-> default under oh-my-zsh and prezto — a bare `^XM` is a *negated glob* and
-> expands to every file in the working directory except `XM`. The aligner then
-> receives a filename as the tag spec and the remaining filenames as positional
-> arguments. `bash` and stock `zsh` leave `^` alone, so this bites only some
-> users; quoting it (`'^XM'`) is always safe, and `XR,XG` sidesteps it entirely.
+An exclusion may be written `^XM` **or** `-XM`. Prefer `-XM` in scripts: a bare
+`^XM` is a *negated glob* in `zsh` with `EXTENDED_GLOB` enabled (the oh-my-zsh
+and prezto default), where it expands to every file in the working directory
+except `XM`. `bash` and stock `zsh` leave `^` alone, so this bites only some
+users — but `-XM` and `XR,XG` need no quoting anywhere.
 
 > **The list is comma-separated, not space-separated.** `--meth-tags XR XG`
-> passes only `XR` to the flag; `XG` becomes the next positional argument, i.e.
-> the reference. The failure surfaces as a confusing
-> `--meth seed index 'XG.meth.*' not found` rather than a flag error. This is the
-> same shape as the `--meth taps` trap above, though the cause differs:
-> `--meth` takes an *optional* argument and so requires `=`, whereas
-> `--meth-tags` takes a *required* argument and happily consumes the first word
-> but not the second.
+> passes only `XR` to the flag; `XG` then becomes the next positional argument,
+> i.e. the reference. This is the same *shape* as the `--meth taps` trap above,
+> though the cause differs: `--meth` takes an *optional* argument and so
+> requires `=`, whereas `--meth-tags` takes a *required* argument and binds the
+> first word but not the second.
+>
+> Both spellings are detected and reported by name:
+>
+> ```text
+> ERROR: 'XG' was taken as a positional argument (the <idxbase> reference), but it looks like
+>        the value for --meth-tags and no such file exists.
+>        --meth-tags takes ONE comma-separated list, not a space-separated one:
+>        write --meth-tags XR,XG (or --meth-tags '^XM'), not --meth-tags XR XG.
+> ```
+>
+> The check fires only when the orphaned token names nothing on disk, so a
+> reference genuinely called `taps` or `all` still works.
 
 **Why you would drop `XM`.** It is a read-length string, so it dominates the
 aux payload: on a 151 bp EM-seq-style library it is **~33 % of the BAM**

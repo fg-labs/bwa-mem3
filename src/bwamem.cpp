@@ -446,7 +446,11 @@ int mem_opt_parse_meth_tags(const char *spec, int *out, const char **err)
          * for a misspelling that isn't there. `XR,` is caught as a trailing
          * comma at the bottom of the loop. */
         if (len == 0) { *err = "empty tag in list"; return -1; }
-        int is_exclusion = (*p == '^');
+        /* '-' is accepted as a synonym for '^' because a bare ^XM is a negated
+         * glob in zsh with EXTENDED_GLOB (the oh-my-zsh/prezto default), where
+         * it silently expands to every file in the directory except XM. '-XM'
+         * needs no quoting in any common shell. */
+        int is_exclusion = (*p == '^' || *p == '-');
         const char *name = is_exclusion ? p + 1 : p;
         size_t name_len  = is_exclusion ? len - 1 : len;
         int bit = meth_tag_bit(name, name_len);

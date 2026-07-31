@@ -115,8 +115,9 @@ enum mem_meth_scoring { MEM_METH_SCORING_COLLAPSED = 0, MEM_METH_SCORING_GENOMIC
 /* Parse a --meth-tags spec into a MEM_METH_TAG_* bitmask.
  *
  * Grammar: `all` | `none` | a comma-separated list of tag names, either all
- * plain (an inclusion set: `XR,XG`) or all `^`-prefixed (subtracted from the
- * full set: `^XM`). Mixing plain and `^` terms is rejected. Tag names are
+ * plain (an inclusion set: `XR,XG`) or all exclusions (subtracted from the full
+ * set: `^XM`). An exclusion may be written `^XM` or `-XM`; the latter needs no
+ * shell quoting. Mixing plain and excluded terms is rejected. Tag names are
  * case-insensitive. Returns 0 on success and writes *out; returns -1 on a
  * malformed spec and writes a human-readable reason to *err (a static string).
  * Exposed for unit testing. */
