@@ -8,8 +8,7 @@
 # The lint also fails when an entry here IS run by CI, and when an entry names
 # no script under test/regression/ at all -- so an exemption that has become
 # untrue, or that outlived the script it covered, cannot quietly accumulate.
-
-# Needs a TESTING_BUILD=1 binary (BWAMEM3_TESTING_HOST_TIER injection), which
-# no workflow builds. Covering it means paying for another build; until that is
-# decided it is honestly uncovered rather than quietly assumed covered.
-host_floor_enforce
+#
+# Currently empty, and worth keeping that way. The only entry this file ever
+# held was host_floor_enforce, which is now covered by an in-row TESTING_BUILD=1
+# rebuild on the canonical row rather than left uncovered.
