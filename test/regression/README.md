@@ -2,8 +2,9 @@
 
 End-to-end parity and invariant checks. `chr22_parity.sh` runs on every
 matrix row; the rest run on the canonical AVX2 row only, except
-`profile_slice_cpu.sh`, which runs from the `profiling-build` job (see below).
-Each script:
+`profile_slice_cpu.sh`, which runs from the `profiling-build` job (see below),
+and the two `ndebug_gate_lint*` scripts, which need no binary at all and run
+from the `ndebug-gate-lint` job. Each script:
 
 - is self-contained (set -euo pipefail; explicit env-var contract)
 - emits `PASS:` on success and `FAIL:` on failure
@@ -22,6 +23,8 @@ Each script:
 | `meth_oracle.sh`             | `--meth` Layers 1–3 match bwa-meth oracle                             | "Run --meth Layers 1-3"                             |
 | `cohort_ramp_validation.sh`  | `--cohort-ramp-first`/`-ratio` reject malformed values; env warns and falls back | "Cohort ramp values are validated (flag and environment alike)" |
 | `profile_slice_cpu.sh`       | `--profile` accounts for a partial cohort slice's compute CPU (needs `STAGE_PROF=1`) | "Partial cohort slices report their compute CPU"    |
+| `ndebug_gate_lint.sh`        | no `#if`/`#ifdef`/`#ifndef`/`#elif` NDEBUG gates in `src/` — nothing here defines NDEBUG, so they never compile out | "No NDEBUG preprocessor gates in src/"              |
+| `ndebug_gate_lint_selftest.sh` | the lint above still flags real gates, so its `PASS` means something | "NDEBUG gate lint still detects gates"              |
 
 The table is a reading guide, not an inventory — `ls test/regression/*.sh` is
 the authoritative list, and `ci.yml` is where each one is actually wired up.

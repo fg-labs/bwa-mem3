@@ -848,6 +848,8 @@ test: test-binaries $(STANDALONE_TESTS_IN_TEST_TARGET) bwa-mem3
 	for t in $(STANDALONE_TESTS_IN_TEST_TARGET); do echo "./$$t"; ./$$t || exit 1; done
 	BWA_MEM3=./bwa-mem3 ./test/regression/version_banner.sh
 	BWA_MEM3=./bwa-mem3 ./test/regression/meth_rescue_batched_identical.sh
+	./test/regression/ndebug_gate_lint_selftest.sh
+	./test/regression/ndebug_gate_lint.sh
 
 # Regression test that requires a binary built with TESTING_BUILD=1
 # (enables BWAMEM3_TESTING_HOST_TIER env-var injection). Not invoked by
