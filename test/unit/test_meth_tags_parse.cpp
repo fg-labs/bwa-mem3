@@ -67,6 +67,24 @@ TEST_CASE("exclusions subtract from the full set")
     CHECK(parse_ok("^XM") == parse_ok("XR,XG"));
 }
 
+TEST_CASE("'-' is a shell-safe synonym for '^'")
+{
+    // A bare ^XM is a negated glob in zsh with EXTENDED_GLOB (the oh-my-zsh
+    // default), so it expands to every file in the directory except XM. '-XM'
+    // needs no quoting in any common shell and must mean the same thing.
+    CHECK(parse_ok("-XM") == parse_ok("^XM"));
+    CHECK(parse_ok("-XR,-XG") == parse_ok("^XR,^XG"));
+    CHECK(parse_ok("-xm") == parse_ok("^XM"));
+    // The two prefixes may be freely intermixed -- both are exclusions, so
+    // there is no ambiguity to guard against.
+    CHECK(parse_ok("^XR,-XG") == MEM_METH_TAG_XM);
+    // But an exclusion still cannot be mixed with an inclusion.
+    CHECK(parse_err("XR,-XM") != nullptr);
+    CHECK(parse_err("-XR,XM") != nullptr);
+    // A lone prefix is not a tag.
+    CHECK(parse_err("-") != nullptr);
+}
+
 TEST_CASE("tag names are case-insensitive")
 {
     CHECK(parse_ok("xr,xg") == parse_ok("XR,XG"));

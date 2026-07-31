@@ -129,8 +129,8 @@ Methylation (--meth) options:
                  which Bismark tags to emit: 'all' (default), 'none', a
                  comma-separated list (XR,XG), or ^-prefixed exclusions (^XM).
                  Comma-separated, NOT space-separated (a second word becomes
-                 the reference). Quote ^ specs: '^XM' -- bare ^ is a negated
-                 glob in zsh with EXTENDED_GLOB.
+                 the reference). An exclusion may be written ^XM or -XM; prefer
+                 -XM in scripts (bare ^ is a negated glob in zsh EXTENDED_GLOB).
                  Unselected tags are not computed. XM:Z is a read-length string
                  and dominates the BAM's aux payload; '^XM' drops it for callers
                  that recompute from the reference (MethylDackel, biscuit).
