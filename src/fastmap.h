@@ -111,7 +111,10 @@ typedef struct {
 	int      ref_string_is_shm;   /* 1 if ref_string aliases shm pages; do not _mm_free. */
 	FMI_search *fmi;
 	uint8_t *shm_base;            /* if non-NULL, the active /bwaidx-<base> mapping */
-	struct bam_writer_s *bam_writer;  /* non-NULL when opt->bam_mode is set */
+	/* Generic (non-meth) BAM writer: non-NULL only when opt->bam_mode is set
+	 * AND opt->meth_mode is not -- under --meth the meth writer owns output
+	 * (g_meth_bam_writer) in both containers, and this stays NULL. */
+	struct bam_writer_s *bam_writer;
 	/* D3 (--meth) ORIGINAL-reference handles, resident alongside (and distinct
 	 * from) the seed FM-index in `fmi`. The seed index (`fmi->idx->bns/pac`) is
 	 * the f/r-doubled converted reference used for candidate generation; these

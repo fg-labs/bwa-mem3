@@ -3,8 +3,10 @@
 `bwa-mem3 mem --meth` is a single-binary, single-command methylation aligner,
 supporting both **bisulfite/EM-seq** (the default) and **TAPS**
 (`--meth=taps`). One `bwa-mem3 index --meth` builds the reference, and one
-`bwa-mem3 mem --meth` aligns raw FASTQ to a sorted-ready BAM — no Python, no
+`bwa-mem3 mem --meth` aligns raw FASTQ to sorted-ready records — no Python, no
 piped read-conversion preprocessor, and no separate post-processing script.
+`--meth` selects alignment semantics only; the output container is `--bam`'s
+job — SAM text by default, BAM with `--bam`.
 
 > **Pick the chemistry.** Both chemistries convert C→T as far as the aligner can
 > see, so the same index and scoring serve both — but they invert the *meaning*
@@ -26,7 +28,12 @@ variant in the conversion direction itself (a genuine C→T at a reference `C`),
 which no single read can tell apart from a conversion — see
 [how `NM`/`MD` are computed](#how-nmmd-are-computed-under---meth).
 
-The non-`--meth` code path is byte-for-byte unchanged.
+`--meth` adds no divergence to the non-`--meth` path: without the flag, output
+is unchanged. As everywhere on this fork, a byte comparison that demonstrates
+that must hold the batch partition fixed — compare at the same `-t`, or pass
+`-K` to both sides — since batch boundaries feed `mem_pestat` and can move a
+small number of records on their own. See
+[Equivalence → batch size, `-t`, and why comparisons need `-K`](../whats-different/equivalence.md#batch-size--t-and-why-comparisons-need--k).
 
 ## How `NM`/`MD` are computed under `--meth`
 
@@ -78,9 +85,9 @@ about converted bases. This is controlled by `--meth-scoring`:
 
 | Mode | Default? | Matrix | `-B` | Behavior |
 |------|----------|--------|------|----------|
-| **`collapsed`** | **`--meth` / `--meth=emseq`** | frees C↔T *and* G↔A both ways (two cells), each scored as a full match | `2` | bwameth-compatible **placement** — C/T and G/A are interchangeable, so it closely tracks bwameth's collapsed-space mapping. A close approximation, **not** exact: ~1% of records differ in `POS`/`CIGAR`/`MAPQ`, so re-validate if pinned to a bwameth release. |
+| **`collapsed`** | **`--meth` / `--meth=emseq`** | frees C↔T *and* G↔A both ways (two cells), each scored as a full match | `2` | bwameth-compatible **placement** — C/T and G/A are interchangeable, so it closely tracks bwameth's collapsed-space mapping. A close approximation, **not** exact: ~1% of records differ in `POS`/`CIGAR`/`MAPQ` on typical WGBS/EM-seq ([full caveat](bwameth-mapping.md)), so re-validate if pinned to a bwameth release. |
 | **`genomic`** | no (opt-in) | frees only the conversion direction (one cell), scored as a full match | `4` | **variant-aware** — the mirror cell stays penalised, so a real C/T or G/A variant scores as a mismatch and stays visible in `NM`/`MD`, making the BAM usable for variant calling. A variant in the conversion direction itself is still hidden ([why](#which-real-variants-stay-visible)). |
-| **`neutral`** | **`--meth=taps`** | frees only the conversion direction (one cell), scored `0` | `4` | **variant-aware and conservative** — a conversion is tolerated but not rewarded, so a sparse TAPS conversion no longer over-credits a spurious C→T alignment. Real variants stay visible in `NM`/`MD` on the same terms as `genomic`; measured +0.24–0.28 pp placement over `genomic` on simulated TAPS. |
+| **`neutral`** | **`--meth=taps`** | frees only the conversion direction (one cell), scored `0` | `4` | **variant-aware and conservative** — a conversion is tolerated but not rewarded, so a sparse TAPS conversion no longer over-credits a spurious C→T alignment. Real variants stay visible in `NM`/`MD` on the same terms as `genomic`; +0.24–0.28 pp placement over `genomic`, measured on 4.07 M simulated TAPS reads against full hg38 across three methylation loads ([full arms and method](taps.md#what---methtaps-changes)). |
 
 The default follows the chemistry: `--meth` and `--meth=emseq` default to
 `collapsed`, so existing methylation pipelines see bwameth-compatible read
@@ -106,7 +113,7 @@ flowchart LR
     A[Raw FASTQ\nR1 / R2] -->|project R1 C→T,\nR2 G→A for SEEDING ONLY| B[seed in .meth\ndoubled seed index]
     B -->|remap each seed →\noriginal coords + OT/OB hypothesis| C[extend + SCORE\nORIGINAL read vs ORIGINAL ref\nper-strand asymmetric matrix]
     C -->|--meth-scoring\ncollapsed / genomic / neutral| D[original-alphabet\nalignment]
-    D -->|XR/XG/XM Bismark tags\noptional --chimera-qc| E[BAM output]
+    D -->|XR/XG/XM Bismark tags\noptional --chimera-qc| E[SAM text by default\nBAM on request]
 ```
 
 Steps:
@@ -140,8 +147,8 @@ Steps:
    Bismark `XR:Z` (read conversion), `XG:Z` (genome strand), and `XM:Z` (per-base
    methylation call) tags. Optional `--chimera-qc` (off by default, matching
    Bismark) flags chimeric reads. The `@PG ID:bwa-mem3-meth` line records the
-   command line. Output is uncompressed BAM (`wb0`); pipe directly to
-   `samtools sort`.
+   command line. Output is SAM text by default and uncompressed BAM (`wb0`)
+   under `--bam`; pipe either directly to `samtools sort`.
 
 ## Quick-start commands
 
@@ -184,5 +191,5 @@ bwa-mem3 mem --meth=taps -t 16 ref.fa R1.fq.gz R2.fq.gz \
 [bwameth.py drop-in mapping](bwameth-mapping.md) ·
 [Conversion details](conversion.md) ·
 [SAM tags: XR, XG, XM](tags.md) ·
-[Chimera QC and header rewriting](post-processing.md) ·
+[Chimera QC and header construction](post-processing.md) ·
 [Quick start: methylation alignment](../getting-started/quick-meth.md)

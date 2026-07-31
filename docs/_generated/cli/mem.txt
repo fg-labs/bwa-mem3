@@ -104,10 +104,11 @@ Input/output options:
                  (4 sigma from the mean if absent) and min of the insert size distribution.
                  FR orientation only. [inferred]
 Methylation (--meth) options:
-   --meth[=CHEM] enable inline bwameth-style C→T/G→A read conversion + meth-aware BAM
-                 emission. Implies --bam. Requires the reference to have been built
-                 with `bwa-mem3 index --meth` (emits the original index plus a
-                 ref.fa.meth.* converted seed index).
+   --meth[=CHEM] enable inline bwameth-style C→T/G→A read conversion + meth-aware
+                 record emission (XM:Z/XG:Z/XR:Z). Output is SAM text by default,
+                 as without --meth; add --bam for BAM. Requires the reference to
+                 have been built with `bwa-mem3 index --meth` (emits the original
+                 index plus a ref.fa.meth.* converted seed index).
                  CHEM selects the chemistry and thus the XM:Z call polarity:
                    emseq  bisulfite/EM-seq, UNmethylated C converts [default]
                           (aliases: em-seq, bisulfite)

@@ -650,6 +650,14 @@ jobs:
           HD_PARITY_WORK_DIR=/tmp/hd-parity \
           bash test/regression/default_hd_parity.sh
 
+      - name: --meth output container follows --bam
+        if: matrix.canonical == true
+        run: |
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          METH_SAM_PHIX_FA="$GITHUB_WORKSPACE/test/fixtures/phix.fa" \
+          METH_SAM_WORK_DIR=/tmp/meth-sam-output \
+          bash test/regression/meth_sam_output.sh
+
       - name: SE alignment smoke (chr22)
         if: matrix.canonical == true
         run: |

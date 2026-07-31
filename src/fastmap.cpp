@@ -32,6 +32,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h> /* strcasecmp(): POSIX declares it here, not in string.h */
 #include "bwa_madvise.h"
 #if NUMA_ENABLED
 #include <numa.h>
@@ -1136,6 +1137,10 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
         if (sp_enabled()) {
             ret->prof.write_wall = sp_wall() - sp_w0;
             ret->prof.write_bytes = sp_wbytes;
+            /* bam_mode, NOT mem_opt_records_are_bam(): this asks whether the
+             * write path DEFLATES, and only --bam does. A --meth run without
+             * --bam builds bam1_t but htslib serializes them as plain text, so
+             * there is no compression stage to fuse — it belongs in `else`. */
             if (aux->opt->bam_mode) {            /* htslib fuses compress+diskwrite */
                 ret->prof.write_compress = ret->prof.write_wall;   /* diskwrite stays NaN */
             } else {
@@ -1586,10 +1591,11 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "                 (4 sigma from the mean if absent) and min of the insert size distribution.\n");
     fprintf(stderr, "                 FR orientation only. [inferred]\n");
     fprintf(stderr, "Methylation (--meth) options:\n");
-    fprintf(stderr, "   --meth[=CHEM] enable inline bwameth-style C→T/G→A read conversion + meth-aware BAM\n");
-    fprintf(stderr, "                 emission. Implies --bam. Requires the reference to have been built\n");
-    fprintf(stderr, "                 with `bwa-mem3 index --meth` (emits the original index plus a\n");
-    fprintf(stderr, "                 ref.fa.meth.* converted seed index).\n");
+    fprintf(stderr, "   --meth[=CHEM] enable inline bwameth-style C→T/G→A read conversion + meth-aware\n");
+    fprintf(stderr, "                 record emission (XM:Z/XG:Z/XR:Z). Output is SAM text by default,\n");
+    fprintf(stderr, "                 as without --meth; add --bam for BAM. Requires the reference to\n");
+    fprintf(stderr, "                 have been built with `bwa-mem3 index --meth` (emits the original\n");
+    fprintf(stderr, "                 index plus a ref.fa.meth.* converted seed index).\n");
     fprintf(stderr, "                 CHEM selects the chemistry and thus the XM:Z call polarity:\n");
     fprintf(stderr, "                   emseq  bisulfite/EM-seq, UNmethylated C converts [default]\n");
     fprintf(stderr, "                          (aliases: em-seq, bisulfite)\n");
@@ -1835,7 +1841,8 @@ int main_mem(int argc, char *argv[])
     // comment: added option '5' in the list
     //
     // Long-only options for bisulfite mode (bwa-mem3 meth fork):
-    //   --meth              Enable inline bwameth-style c2t + post-processing + BAM output.
+    //   --meth              Enable inline bwameth-style c2t + post-processing. Output
+    //                       container is --bam's job, same as without --meth.
     //                       Expects a reference built with `bwa-mem3 index --meth`.
     //   --set-as-failed f|r Flag alignments to this strand as QC-fail (0x200)
     //   --chimera-qc        Enable the bwameth.py-style longest-M <44% chimera heuristic
@@ -2037,7 +2044,10 @@ int main_mem(int argc, char *argv[])
 #endif
         else if (c == OPT_METH) {
             opt->meth_mode = 1;
-            opt->bam_mode = 1;  /* meth implies BAM output */
+            /* --meth selects bisulfite ALIGNMENT semantics only; the output
+             * container is --bam's job here exactly as it is without --meth.
+             * (Through 0.7.x this set bam_mode=1, which made text SAM
+             * unreachable under --meth — there was no flag that undid it.) */
             /* Optional chemistry argument. getopt_long's optional_argument only
              * accepts the `--meth=taps` form (a separate word is treated as a
              * positional), so a bare `--meth` leaves optarg NULL => em-seq. */
@@ -2929,12 +2939,15 @@ int main_mem(int argc, char *argv[])
                                 ? bwa_load_hdr_from_index(meth_orig_ref_prefix)
                                 : NULL;
 
-    /* Output path:
-     *  - --meth: open meth_bam_writer with strand-consolidated SQ headers.
-     *    Honors -o/-f (target path) or stdout ("-").
+    /* Output path. --meth picks the WRITER (it owns the meth @SQ/@PG header and
+     * the bam1_t overlay); --bam picks the CONTAINER within whichever writer.
+     *  - --meth [--bam]: open meth_bam_writer, which serializes its bam1_t to
+     *    BGZF under --bam and to SAM text without it. Honors -o/-f or stdout.
      *  - --bam (no --meth): open generic bam_writer; htslib writes its own
      *    @HD + @SQ + @PG header. Honors -o/-f or stdout.
-     *  - SAM text: open -o/-f path (if any) as a FILE*; bwa_print_sam_hdr2. */
+     *  - SAM text (no --meth, no --bam): open -o/-f path (if any) as a FILE*;
+     *    bwa_print_sam_hdr2. Note the meth writer claims -o itself in the first
+     *    branch, so this fopen stays unreachable under --meth. */
     bam_writer_t *bam_writer = NULL;
 #ifdef DISABLE_OUTPUT
     /* profile-build (-DDISABLE_OUTPUT) skips ALL filesystem-touching output
@@ -2992,9 +3005,10 @@ int main_mem(int argc, char *argv[])
         g_meth_bam_writer = meth_bam_writer_open(meth_out_path, aux.meth_orig_bns,
                                                  bwa_pg, NULL,
                                                  hdr_line, meth_orig_hdr_lines,
-                                                 opt->bam_level);
+                                                 opt->bam_mode, opt->bam_level);
         if (g_meth_bam_writer == NULL) {
-            fprintf(stderr, "ERROR: meth: failed to open BAM writer for '%s'\n", meth_out_path);
+            fprintf(stderr, "ERROR: meth: failed to open %s writer for '%s'\n",
+                    opt->bam_mode ? "BAM" : "SAM", meth_out_path);
             g_meth_orig_pac = NULL;
             free(opt);
             delete aux.fmi;

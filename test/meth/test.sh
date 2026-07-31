@@ -3,7 +3,8 @@
 #
 # Layer 1 (always runs):  valid BAM emission.
 #   - binary builds and runs with --meth
-#   - produces uncompressed BAM readable by samtools
+#   - produces uncompressed BAM readable by samtools (--bam; --meth alone emits
+#     SAM text, so the BGZF assertions below require it explicitly)
 #   - @PG ID:bwa-mem3-meth present
 #   - BGZF EOF marker at tail
 #   - --set-as-failed / --chimera-qc parse cleanly
@@ -48,7 +49,7 @@ if [[ ! -f ref.fa.bwameth.c2t.bwt.2bit.64 ]]; then
     "$BWAMEM3" index --meth ref.fa > /dev/null 2>&1
 fi
 
-"$BWAMEM3" mem --meth -t 2 ref.fa t_R1.fastq.gz 2> /dev/null > "$BAM"
+"$BWAMEM3" mem --meth --bam -t 2 ref.fa t_R1.fastq.gz 2> /dev/null > "$BAM"
 
 EXPECT_EOF="1f8b08040000000000ff0600424302001b0003000000000000000000"
 ACTUAL_EOF="$(tail -c 28 "$BAM" | od -An -v -t x1 | tr -d ' \n')"
@@ -74,14 +75,14 @@ if [[ "$TOTAL" -lt 1 ]]; then
     exit 1
 fi
 
-"$BWAMEM3" mem --meth --set-as-failed f --chimera-qc \
+"$BWAMEM3" mem --meth --bam --set-as-failed f --chimera-qc \
     ref.fa t_R1.fastq.gz 2> /dev/null > "$BAM2"
 if [[ ! -s "$BAM2" ]]; then
     echo "FAIL: --set-as-failed + --chimera-qc produced empty output"
     exit 1
 fi
 
-echo "OK layer 1: bwa-mem3 mem --meth (records=$TOTAL, BGZF-EOF ok, @PG bwa-mem3-meth ok)"
+echo "OK layer 1: bwa-mem3 mem --meth --bam (records=$TOTAL, BGZF-EOF ok, @PG bwa-mem3-meth ok)"
 
 # --- Bismark XR:Z / XG:Z / XM:Z emission assertions ----------------------
 # Every primary mapped record (FLAG & 0x904 == 0) must carry XR:Z:(CT|GA),

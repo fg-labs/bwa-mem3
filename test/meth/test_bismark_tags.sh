@@ -86,7 +86,10 @@ fi
 
 # Run bwa-mem3 on the simulated FASTQs.
 MINE_BAM="$SCRATCH/bismark-tags-mine.bam"
-"$BWAMEM3" mem --meth -t 2 ref.fa "$R1" "$R2" 2> /dev/null > "$MINE_BAM"
+# --bam: samtools would autodetect --meth's default SAM text just fine, but this
+# test compares against a BAM golden through `samtools sort -O bam`, so keep both
+# sides in the same container.
+"$BWAMEM3" mem --meth --bam -t 2 ref.fa "$R1" "$R2" 2> /dev/null > "$MINE_BAM"
 
 # Sort both by qname so per-qname comparison is straightforward.
 "$SAMTOOLS" sort -n -@ 2 -O bam -o "${PREFIX}.golden.qsort.bam" "$GOLDEN_BAM"

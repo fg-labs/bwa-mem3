@@ -208,9 +208,11 @@ typedef struct mem_opt_t {
      * (1 = OT, 0 = OB) via mem_opt_meth_mat(). */
     int8_t mat_ot[25];      // OT (C→T) meth matrix; valid only under --meth
     int8_t mat_ob[25];      // OB (G→A) meth matrix; valid only under --meth
-    int    bam_mode;        // 1 = emit BAM instead of SAM text (--bam); meth_mode implies this
+    int    bam_mode;        // 1 = emit BAM instead of SAM text (--bam). Orthogonal
+                            // to meth_mode: --meth picks alignment semantics, --bam
+                            // picks the container, on every mode alike.
     int    bam_level;       // 0..9, BGZF deflate level (0 = uncompressed)
-    int    meth_mode;       // 1 = bisulfite mode (--meth); implies bam_mode
+    int    meth_mode;       // 1 = bisulfite mode (--meth)
     int    meth_scoring;    // bisulfite matrix mode (--meth-scoring):
                             // MEM_METH_SCORING_{COLLAPSED,GENOMIC,NEUTRAL}
     int    meth_chem;       // methylation chemistry (--meth=emseq|taps): meth_chem_t.
@@ -480,6 +482,20 @@ static inline uint8_t *mem_aln_ref_string(const worker_t *w) {
 static inline const int8_t *mem_opt_meth_mat(const mem_opt_t *opt, int meth_hypothesis) {
     if (!opt->meth_mode || meth_hypothesis < 0) return opt->mat;
     return (meth_hypothesis & 1) ? opt->mat_ot : opt->mat_ob;
+}
+
+/* True when mem_aln2sam() builds records as bam1_t (pushed to bseq1_t.bams) and
+ * leaves the SAM kstring_t untouched, rather than formatting SAM text into it.
+ *
+ * This is NOT the same question as "is the output file BAM". --meth always
+ * builds bam1_t — the bisulfite overlay (XM:Z, XG:Z, chimera QC) is written into
+ * the aux block, and htslib serializes that to either container — so a --meth run
+ * WITHOUT --bam still takes the bam1_t path and then writes SAM text. Callers
+ * that skip the `str.s` handoff must test THIS, not opt->bam_mode; testing
+ * bam_mode alone would send `--meth` (no `--bam`) down the text branch and trip
+ * its `assert(str.s != 0)` on a string nothing ever wrote to. */
+static inline int mem_opt_records_are_bam(const mem_opt_t *opt) {
+    return opt->bam_mode || opt->meth_mode;
 }
 
 

@@ -2,7 +2,7 @@
 # test/regression/default_hd_parity.sh
 #
 # Regression: the DEFAULT `@HD` record must be byte-identical on every output
-# path — SAM text, `--bam`, and `--meth`.
+# path — SAM text, `--bam`, `--meth` (SAM text) and `--meth --bam`.
 #
 # It was not. Each of the three writers hardcoded its own literal, and the two
 # BAM ones had drifted, so the same run emitted a different `@HD` depending on
@@ -17,12 +17,18 @@
 # a fourth writer, or a "fix" to any one of the three, has to keep them equal.
 #
 # The assertion is equality ACROSS PATHS *and* against the expected string.
-# Equality alone would pass if all three drifted together; the literal alone
+# Equality alone would pass if they all drifted together; the literal alone
 # would not catch one path diverging on a value the test did not think to
 # check. Both are cheap, so assert both.
 #
 # `--compat` is out of scope here: it suppresses the default `@HD` entirely,
 # which compat_byte_identical.sh covers. This is about DEFAULT output.
+#
+# `samtools` is a REQUIRED dependency, not an optional one: two of the four
+# paths under test (`--bam` and `--meth --bam`) are BGZF, so without it the
+# script can only check the two text paths — half the parity this test exists
+# to assert. Exiting zero on that partial run would report the cross-path
+# assertion as passing when it never executed.
 #
 # Inputs (env vars):
 #   BWA_MEM3        — path to the bwa-mem3 binary under test
@@ -35,6 +41,11 @@ set -euo pipefail
 : "${HD_PARITY_PHIX_FA:?HD_PARITY_PHIX_FA must be set}"
 : "${HD_PARITY_WORK_DIR:?HD_PARITY_WORK_DIR must be set}"
 
+command -v samtools > /dev/null 2>&1 || {
+    echo "FAIL: samtools not on PATH; the --bam and --meth --bam @HD paths cannot be checked" >&2
+    exit 1
+}
+
 # The one true default, duplicated here ON PURPOSE: a test that read the
 # constant from the source it is testing could not catch the constant changing.
 EXPECT=$'@HD\tVN:1.5\tSO:unsorted\tGO:query'
@@ -42,7 +53,7 @@ EXPECT=$'@HD\tVN:1.5\tSO:unsorted\tGO:query'
 mkdir -p "$HD_PARITY_WORK_DIR"
 cd "$HD_PARITY_WORK_DIR"
 # Remove only this script's own artifacts (never `rm -rf` a caller-supplied path).
-rm -f phix.fa phix.fa.* phix.dict phix.meth.* r1.fq r2.fq ./*.sam ./*.bam ./*.hdr ./*.log
+rm -f phix.fa phix.fa.* phix.dict phix.meth.* r1.fq r2.fq ./*.sam ./*.bam ./*.hdr ./*.log ./*.err
 
 cp "$HD_PARITY_PHIX_FA" phix.fa
 ref=phix.fa
@@ -86,41 +97,46 @@ echo "default @HD by output path:"
 sam_hd=$(grep -m1 '^@HD' sam.sam || true)
 check "SAM text" "$sam_hd"
 
-if ! command -v samtools > /dev/null 2>&1; then
-    echo "SKIP: samtools not on PATH — --bam and --meth paths not checked"
-    echo "PASS: default @HD parity (SAM text only)"
-    exit 0
-fi
+# --- --meth, no --bam: SAM text, so no samtools needed ---
+# Built unconditionally: the cleanup above removes phix.fa.* (which includes
+# phix.fa.meth.*), so an "is it already there" guard would never be false.
+# Built before the samtools gate so this path is checked on hosts without it.
+"$BWA_MEM3" index --meth "$ref" > index-meth.log 2>&1 \
+    || {
+        echo "FAIL: bwa-mem3 index --meth failed" >&2
+        cat index-meth.log >&2
+        exit 1
+    }
+"$BWA_MEM3" mem --meth "$ref" r1.fq > meth.sam 2> meth-sam.err \
+    || {
+        echo "FAIL: bwa-mem3 mem --meth exited non-zero" >&2
+        cat meth-sam.err >&2
+        exit 1
+    }
+meth_sam_hd=$(grep -m1 '^@HD' meth.sam || true)
+check "--meth" "$meth_sam_hd"
 
 # --- --bam ---
 "$BWA_MEM3" mem --bam "$ref" r1.fq r2.fq > bam.bam 2> bam.err
 bam_hd=$(samtools view -H --no-PG bam.bam | grep -m1 '^@HD' || true)
 check "--bam" "$bam_hd"
 
-# --- --meth (needs the D3 seed index) ---
-if [[ ! -s "$ref.meth.bwt.2bit.64" || ! -s "$ref.meth.amb" ||
-    ! -s "$ref.meth.ann" || ! -s "$ref.meth.pac" ]]; then
-    "$BWA_MEM3" index --meth "$ref" > index-meth.log 2>&1 \
-        || {
-            echo "FAIL: bwa-mem3 index --meth failed" >&2
-            cat index-meth.log >&2
-            exit 1
-        }
-fi
-"$BWA_MEM3" mem --meth "$ref" r1.fq > meth.bam 2> meth.err \
+# --- --meth --bam (the meth writer's BGZF container) ---
+"$BWA_MEM3" mem --meth --bam "$ref" r1.fq > meth.bam 2> meth-bam.err \
     || {
-        echo "FAIL: bwa-mem3 mem --meth exited non-zero" >&2
-        cat meth.err >&2
+        echo "FAIL: bwa-mem3 mem --meth --bam exited non-zero" >&2
+        cat meth-bam.err >&2
         exit 1
     }
 meth_hd=$(samtools view -H --no-PG meth.bam | grep -m1 '^@HD' || true)
-check "--meth" "$meth_hd"
+check "--meth --bam" "$meth_hd"
 
-# Equality across paths is implied by all three matching EXPECT, but assert it
+# Equality across paths is implied by all of them matching EXPECT, but assert it
 # directly so a future change that relaxes EXPECT still cannot let them drift.
-if [ "$sam_hd" != "$bam_hd" ] || [ "$sam_hd" != "$meth_hd" ]; then
+if [ "$sam_hd" != "$bam_hd" ] || [ "$sam_hd" != "$meth_sam_hd" ] \
+    || [ "$sam_hd" != "$meth_hd" ]; then
     echo "FAIL: default @HD differs across output paths" >&2
     exit 1
 fi
 
-echo "PASS: default @HD is byte-identical across SAM text, --bam and --meth"
+echo "PASS: default @HD is byte-identical across SAM text, --bam, --meth and --meth --bam"

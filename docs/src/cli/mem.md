@@ -606,8 +606,17 @@ stderr (`[M::main_mem] --fast: ...`) so runs are self-documenting.
 
 Activates bisulfite alignment: each read is projected (R1 `C→T`, R2 `G→A`) to find
 seeds in the converted `.meth` seed index, then extended and scored against the
-**original** 4-letter reference, with inline BAM post-processing and forced
-`--bam` output. The reference must have been indexed with `bwa-mem3 index --meth`.
+**original** 4-letter reference, with inline meth post-processing (Bismark
+`XR:Z`/`XG:Z`/`XM:Z`, opt-in chimera QC). The reference must have been indexed with
+`bwa-mem3 index --meth`.
+
+`--meth` does not choose an output format: records are SAM text by default and BAM
+under `--bam`, the same rule as without `--meth`. Both containers serialize the same
+`bam1_t` and differ only in the `htsFile` mode string, so the two decode to identical
+**records** — headers differ in the `@PG` `CL:` field, which records the invoking
+command line. A regression script pins record and (`CL:`-stripped) header equality on
+the committed phiX fixture in single-end and paired-end layouts. (Through 0.7.x
+`--meth` forced `--bam`; add `--bam` to any script that depended on that.)
 
 Pass the original FASTA prefix as `<idxbase>` (e.g. `ref.fa`); the `ref.fa.meth.*`
 seed index alongside it is found automatically. A legacy bwameth `.bwameth.c2t`

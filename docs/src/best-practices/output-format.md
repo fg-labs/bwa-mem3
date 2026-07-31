@@ -47,17 +47,37 @@ contend. A 16:8 split (bwa-mem3:samtools) works well on 24-core machines.
 
 ## Methylation output
 
-The `--meth` path always writes uncompressed BAM internally, regardless of
-the `--bam` flag.  The post-processing step (header rewrite, Bismark
-`XR:Z` / `XG:Z` / `XM:Z` tag emission, opt-in chimera QC) is performed
-inline before the record is handed to htslib, so the same pipeline shape
-applies:
+`--meth` selects bisulfite alignment semantics; it does not select an output
+format.  The container is chosen by `--bam` exactly as it is without `--meth`:
+SAM text by default, BAM with `--bam`.  The post-processing step (`@SQ` built
+from the original reference, Bismark `XR:Z` / `XG:Z` / `XM:Z` tag emission,
+opt-in chimera QC) is
+performed inline before the record is handed to htslib, so the same pipeline
+shape applies:
 
 ```bash
 bwa-mem3 mem --meth --bam=0 -t 16 ref.fa R1.fq.gz R2.fq.gz \
   | samtools sort -@ 8 -o out.bam -
 samtools index out.bam
 ```
+
+**What the two containers share.** `--meth` and `--meth --bam` run one
+`bam1_t` construction path and hand the finished record to htslib, differing
+only in the `htsFile` mode string, so the equivalence is structural rather than
+sampled: it does not vary with workload, thread count, or SIMD tier. It is over
+decoded **records**, not over headers — the `@PG` `CL:` field records the
+invoking command line and therefore differs, since one run was given `--bam`
+and the other was not. A regression script pins both halves on the committed
+phiX fixture in single-end and paired-end layouts (which take different
+emission paths): records must compare byte-identical, headers byte-identical
+once `CL:` is stripped.
+
+> **Changed in 0.8.0**
+>
+> Through 0.7.x, `--meth` forced BAM and text SAM was unreachable.  If you have
+> a script that relies on `bwa-mem3 mem --meth` producing BAM on stdout, add
+> `--bam` to it.  Piping into `samtools` needs no change: samtools autodetects
+> SAM text.
 
 ## When SAM is appropriate
 
