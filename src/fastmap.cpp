@@ -974,6 +974,55 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
             if (aux->cohort_n + ret->n_seqs > aux->cohort_cap) {
                 int want = aux->cohort_n + ret->n_seqs;
                 int cap  = aux->cohort_cap ? aux->cohort_cap : 1024;
+                /* A cohort with more slices still coming: project its final read
+                 * count from this slice's mean read length and reserve it in one
+                 * go.
+                 *
+                 * Doubling from 1024 instead takes ~13 reallocs to reach a
+                 * default t=64 cohort (task_size = chunk_size * nthreads = 640
+                 * Mbase, ~4.27M reads) and lands on the next power of two --
+                 * 8388608 slots for 4266668 reads, i.e. ~330 MB of bseq1_t held
+                 * and never used. The cohort's size is not a surprise: the ramp
+                 * appends slices until it reaches aux->task_size bases, so one
+                 * projection is enough.
+                 *
+                 * Deliberately NOT projected on the cohort's first slice, even
+                 * though that is where the reallocs would be saved. On the first
+                 * slice "more is coming" is not yet known: a file that ends
+                 * exactly at the slice boundary returns sz == slice_target with
+                 * seqs != NULL, which fails every cohort_complete test, so the
+                 * slice looks mid-cohort and EOF only surfaces on the next read
+                 * as the empty flush item (see the memcpy guard below). Projecting
+                 * there would reserve a whole task_size -- ~330 MB for what turns
+                 * out to be one ~16 Mbase slice, strictly worse than the doubling
+                 * this replaces. Waiting for cohort_n > 0 makes a second slice the
+                 * proof that the input did not end, and costs only the first
+                 * slice's doublings, which are small and cheap.
+                 *
+                 * Idempotent across later slices: the projected total is the same
+                 * each time and cap only ever moves up, so slices 3+ recompute it
+                 * and find nothing to do.
+                 *
+                 * The doubling below is kept as the fallback: if reads later in
+                 * the cohort are shorter than this slice's mean, the projection
+                 * undershoots and growth proceeds exactly as before. Capacity
+                 * only ever affects allocation, never which reads land in the
+                 * cohort, so output is unchanged either way. */
+                if (aux->cohort_n > 0 && !ret->cohort_complete && ret->n_seqs > 0) {
+                    int64_t slice_bases = 0;
+                    for (int i = 0; i < ret->n_seqs; ++i)
+                        slice_bases += ret->seqs[i].l_seq;
+                    if (slice_bases > 0 && aux->task_size > slice_bases) {
+                        /* +2 for the rounding slack: both readers stop at the
+                         * first whole-record, even-n boundary at or PAST each
+                         * request, so the cohort can end a record or two past
+                         * task_size. */
+                        double projected = (double) ret->n_seqs *
+                                           ((double) aux->task_size / (double) slice_bases) + 2.0;
+                        if (projected > (double) cap && projected < (double) INT_MAX)
+                            cap = (int) projected;
+                    }
+                }
                 while (cap < want) cap <<= 1;
                 /* Temporary + err_fatal, not assert -- see the regs growth in
                  * step 1. A release-build realloc failure here would null the
@@ -985,6 +1034,13 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
                     err_fatal(__func__, "failed to grow the cohort buffer to %d reads", cap);
                 aux->cohort_seqs = cohort_tmp;
                 aux->cohort_cap = cap;
+                /* -v 4 only: capacity has no effect on output, so this exists
+                 * purely so a test can tell a projected reservation from a
+                 * doubled one. Default verbosity is 3, so ordinary runs and every
+                 * stderr-parsing test see exactly what they saw before. */
+                if (bwa_verbose >= 4)
+                    fprintf(stderr, "[0000] cohort_reserve: cap: %d, held: %d\n",
+                            cap, aux->cohort_n + ret->n_seqs);
             }
             /* Guarded because the EOF-on-slice-boundary item reaches here with
              * seqs == NULL and n_seqs == 0 -- it exists only to flush the cohort
