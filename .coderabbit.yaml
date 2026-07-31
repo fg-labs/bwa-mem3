@@ -1,10 +1,556 @@
-# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# yaml-language-server: $schema=https://storage.googleapis.com/coderabbit_public_assets/schema.v2.json
 #
-# Review PRs targeting our fg-main integration branch in addition to the
-# repository's default branch (master). The default branch is always
-# reviewed; this list adds extra base branches.
-language: "en"
+# CodeRabbit review configuration for bwa-mem3 (short-read aligner, C/C++).
+#
+# bwa-mem3 is output-stability-critical and performance-critical: it is a fork of
+# bwa-mem2 whose divergence from upstream is an explicitly maintained, published
+# contract (docs/src/whats-different/equivalence.md), its Smith-Waterman kernels
+# are ~60% of `mem` CPU and exist in four hand-maintained ISA variants
+# (SSE4.1 / AVX2 / AVX-512BW / NEON) that must agree, and it is plain C/C++ with
+# manual memory management over attacker-shaped input (FASTQ, BAM, FM-index).
+# The `assertive` profile + the path instructions below aim the review at the
+# failure modes that actually bite here (unreported SAM divergence, per-tier SIMD
+# disagreement, buffer sizing/overflow, thread non-determinism, index/shm
+# staleness) rather than generic style.
+#
+# MAINTENANCE: the path instructions below name specific files, invariants, and
+# tests. Re-read and update them whenever those are refactored or renamed — a
+# stale instruction silently misdirects the reviewer, which is worse than none.
+
+language: "en-US"
+
+# Terse and technical, matching the project's review style.
+# NB: CodeRabbit caps tone_instructions at 250 characters — keep this terse.
+tone_instructions: >-
+  Concise and technical. Skip praise and restating the code. Lead with the risk
+  and a one-line fix. Favor correctness, SAM-output equivalence, memory safety,
+  and SIMD tier parity over style. Skip formatting nits; CI enforces them.
+
 reviews:
+  # Surface borderline correctness/memory-safety findings, not just
+  # high-confidence ones. For an aligner whose output is diffed against upstream
+  # bwa-mem2 and against bwa-meth, a false positive is cheaper than a missed
+  # output divergence or a missed out-of-bounds write.
+  profile: assertive
+  high_level_summary: true
+  poem: false
+  collapse_walkthrough: false
+  # Findings are advisory; never auto-block a merge on a review verdict.
+  request_changes_workflow: false
+  # Useful here, where a two-line kernel change is far more consequential than a
+  # 500-line docs change.
+  estimate_code_review_effort: true
+  enable_prompt_for_ai_agents: true
+
+  # Review PRs targeting the `fg-main` integration branch in addition to the
+  # repository's default branch (`main`). The default branch is always reviewed;
+  # this list adds extra base branches. Without it, CodeRabbit posts "auto
+  # reviews are disabled on base/target branches other than the default branch"
+  # and skips stacked PRs.
   auto_review:
+    enabled: true
+    drafts: false
     base_branches:
       - "fg-main"
+
+  # Don't spend review budget on vendored submodules, build output, committed
+  # binaries, or generated docs. `ext/` is upstream code (htslib, libsais,
+  # mimalloc, sse2neon, zlib-ng) refreshed by submodule bump and never edited in
+  # place — findings there belong upstream, not here.
+  path_filters:
+    - "!ext/**"
+    - "!**/*.o"
+    - "!**/*.a"
+    - "!**/*.so"
+    - "!**/*.dylib"
+    - "!docs/_generated/**"
+    - "!docs/theme/**"
+    - "!test/fixtures/**"
+    - "!test/meth/ref.fa*"
+    - "!**/pixi.lock"
+    - "!images/**"
+
+  path_instructions:
+    # Repo-wide rules for production sources. Listed first because they apply on
+    # top of the module-specific blocks below, not instead of them.
+    - path: "src/**/*.{c,cpp,h}"
+      instructions: >-
+        NO target in this build system defines NDEBUG — not the Makefile, not
+        any workflow, including the release build. So an `#if` / `#ifdef` /
+        `#ifndef` / `#elif` directive testing NDEBUG never compiles out of
+        anything this repository produces: the "debug-only" work runs in every
+        shipped binary while the comment claims it does not. That has bitten
+        this codebase twice (a pac-fetch poison that memset whole buffers on
+        every fetch, and a chaining cross-check that ran the O(n^2) reference
+        pass the surrounding optimization existed to skip). Flag any such gate;
+        the idiom that works here is a dedicated opt-in macro, off by default
+        and named in the comment (`BWA_MEM3_DEBUG_*`, `BSW8_ASSERT_ENVELOPE`,
+        `BWAMEM3_UGP_PROFILE`), built with `make EXTRA_CXXFLAGS=-D<macro>`.
+        test/regression/ndebug_gate_lint.sh enforces this as a hard CI error.
+        Plain `assert()` is live in every build here and is fine; `xassert(cond,
+        msg)` (src/utils.h) is the guard for a check that must survive a
+        hypothetical -DNDEBUG build — flag an allocation, bounds, or invariant
+        guard whose only enforcement is a plain `assert()` and whose failure
+        would be silent corruption rather than a crash. Also flag: malloc /
+        calloc / realloc without a null check, and `realloc` assigned back onto
+        the pointer it was passed (leaks the original on failure). House
+        conventions, not findings: diagnostics use a bare `ERROR:` prefix (54
+        sites) with no program name, and functions are documented with leading
+        `//` or `/* */` block comments rather than a docstring format — do not
+        raise docstring-coverage or logging-prefix findings.
+    - path: "src/{bandedSWA,kswv,ksw}.{cpp,h}"
+      instructions: >-
+        These are the Smith-Waterman kernels — banded extension
+        (`BandedPairWiseSW` in bandedSWA.cpp), batched mate rescue (`kswv`), and
+        the scalar reference (`ksw_align2`). They are ~60% of `mem` CPU and are
+        hand-maintained in four ISA variants whose lane counts differ
+        (`SIMD_WIDTH8`/`SIMD_WIDTH16`: 16/8 on SSE4.1 and NEON, 32/16 on AVX2,
+        64/32 on AVX-512BW). Treat every change as BOTH output-changing and
+        tier-specific. Flag: buffer or stripe sizing computed from a hardcoded
+        lane count instead of the SIMD_WIDTH macros; 8-bit vs 16-bit path
+        selection and saturation/overflow at the score-range boundary
+        (test/regression/longread_pe_parity.sh pins this — a change here needs
+        it to still hold); z-drop and band-boundary off-by-one; the
+        suboptimal-score computation (`score2` → `XS:i`, and therefore MAPQ),
+        which has a documented history of diverging from the scalar `ksw_align2`
+        reference differently on each architecture; freed or uninitialized cell
+        reads (see the `kswv_freed_cell` and `kswv_nrow_zero` unit tests); and
+        ambiguous-base (`N`) handling in the kswv path. Any semantic change here
+        must be reflected in docs/src/whats-different/equivalence.md — a
+        "perf-only" change that alters any emitted field is a bug, not an
+        optimization.
+    - path: "src/{simd_compat.h,neon_utils.h,simd_dispatch.cpp,simd_dispatch.h,kernel_dispatch.h}"
+      instructions: >-
+        This is the SIMD abstraction and tier-dispatch layer. `simd_compat.h` is
+        the single point of platform detection; the ARM path routes through
+        sse2neon plus hand-written NEON helpers (`_mm_movemask_epi16`,
+        `_mm_blendv_epi16_fast`) that must be semantically identical to the x86
+        intrinsics they replace — verify lane order, signedness, and saturation
+        element by element, not just "looks equivalent". Flag: a tier-detection
+        ladder that keys off a compiler-defined macro (`__SSE4_2__`, `__AVX2__`)
+        rather than a runtime CPUID check, since some toolchains define a higher
+        macro than the requested `-m` flag and the ladder then misreports the
+        tier; a new intrinsic used in a shared translation unit without a
+        definition in every platform branch of simd_compat.h (this breaks the
+        arm64 and SSE4.1 CI rows, which build the same sources); and any dispatch
+        change not exercised across all tiers by
+        test/regression/all_tiers_parity.sh. Calibration, from a finding that
+        cost a full golden-gate re-run to refute: the reference for a NEON
+        kernel is the EXISTING NEON behavior, not the SSE2 instruction sequence
+        it is derived from. sse2neon's comparison intrinsics already differ from
+        their x86 namesakes in lane semantics, and the two paths have long
+        produced different intermediate clamp orders while agreeing on every
+        emitted field. Do not report a NEON-vs-x86 divergence as a regression
+        unless you can name an in-range input for which the emitted result — not
+        an intermediate — differs from what the NEON path produced before.
+    - path: "src/{FMI_search,bwt,read_index_ele,smem_dedup,seed_order}.{cpp,h}"
+      instructions: >-
+        This is FM-index search, SMEM extraction, seed dedup, and seed ordering —
+        the source of this project's historical buffer-sizing and
+        prefetch-precedence bugs (seeds overflowing a buffer sized for 151 bp
+        reads; a prefetch mask with wrong operator precedence). Flag: any seed,
+        interval, or SA-hit buffer whose capacity is a function of a hardcoded
+        read length or fixed constant rather than the actual input; a missing
+        bounds re-check after a batch grows; `int`/`int64_t` narrowing in SA or
+        reference-offset math (the index addresses a multi-gigabase concatenated
+        reference — 32-bit is not enough); and prefetch or bit-mask expressions
+        without explicit parentheses. Seed ordering must stay deterministic:
+        `--seed-order off` is contractually byte-identical to the pre-refactor
+        path, so flag any change that could reorder seeds in the default mode.
+        Require lockstep parity coverage (test/bwtseed_lockstep_parity_test.cpp,
+        test/smem_lockstep_parity_test.cpp) for extraction changes.
+    - path: "src/{bwamem,bwamem_pair,bwamem_extra}.cpp"
+      instructions: >-
+        This is chaining, pairing, MAPQ, and alignment selection — where an
+        innocuous-looking change silently moves reads. Flag: any change to tie
+        resolution or a sort comparator that could reorder equal-scoring
+        alignments (ordering is contractually deterministic across runs AND
+        across thread counts — test/regression/thread_determinism.sh diffs `-t 1`
+        against `-t 4`); changes to the proper-pair `0x2` flag computation; MAPQ
+        formula changes, including the opt-in `--supp-rep-hard-cap` path, which
+        must lower MAPQ only and must never add or drop records
+        (test/regression/supp_rep_hard_cap.sh); insert-size and
+        pairing-statistics estimation that can divide by zero or use an
+        unconverged distribution; and supplementary/secondary emission changes,
+        since the count of supplementary records relative to upstream bwa-mem2 is
+        a published, measured number. Any behavior change here requires a
+        corresponding update to docs/src/whats-different/equivalence.md.
+    - path: "src/{fastmap,main}.{cpp,h}"
+      instructions: >-
+        This is the CLI entry point: option parsing, validation, usage text, and
+        the startup banner. Flag: a new or changed flag whose default is not
+        also updated in docs/src/whats-different/features.md and the usage block
+        (they drift silently and the docs are a published contract); a numeric
+        option accepted without range validation, or one that falls back to a
+        default on malformed input without warning
+        (test/regression/cohort_ramp_validation.sh pins that both the flag and
+        its environment variable reject malformed values and warn on fallback);
+        an option that
+        changes default behavior rather than being strictly opt-in — the opt-in
+        contract is pinned by chunk_cap_optin.sh, cohort_slice_identity.sh, and
+        compat_byte_identical.sh; a change to the version banner or its source
+        of truth in version.txt (version_banner.sh); and a change to the
+        host-capability floor or its enforcement (host_floor_enforce.sh), which
+        must fail loudly at startup rather than executing an unsupported
+        instruction. Diagnostics use a bare `ERROR:` prefix here by convention.
+    - path: "src/{sam_encode,bam_writer,cigar_util,kstring,compat_target}.{cpp,h}"
+      instructions: >-
+        This is SAM/BAM record encoding and output. Flag: tag emission that
+        changes the presence, order, or type of existing auxiliary tags (`MQ:i`,
+        `HN:i`, `MC:Z`, `AS:i`, `XS:i`, `NM`, `MD` are part of the published
+        equivalence contract); CIGAR construction that can emit a zero-length or
+        adjacent same-op operation, or whose reference span disagrees with the
+        alignment; `@PG`/`@RG` header construction, especially command-line
+        escaping (there is a dedicated pg_cl_escape test); and unchecked
+        `kstring` growth or `sprintf`-family use on read-derived data. BAM output
+        must round-trip — confirm test/regression/bam_roundtrip.sh still covers
+        the change. Three more gates pin this area and a change here should keep
+        them true: compat_byte_identical.sh (`--compat=bwa-mem2` suppresses only
+        MQ/HN/@HD, everything else byte-identical), header_parity.sh (`AH:*` on
+        generated @SQ, and `--compat` skipping the .hdr/.dict sidecar), and
+        default_hd_parity.sh (the default `@HD` is byte-identical across the
+        SAM, `--bam`, and `--meth` output paths).
+    - path: "src/meth_*.{cpp,h}"
+      instructions: >-
+        This is the bisulfite/EM-seq (`--meth`) path. Its defining invariant is
+        that seeds are found in collapsed 3-letter (C→T) space but extension,
+        scoring, and reporting all happen against the ORIGINAL 4-letter reference
+        via a per-strand asymmetric substitution matrix, so `NM`/`MD` stay
+        truthful. Flag any change that leaks collapsed-space sequence into a
+        scored or emitted field. The two `--meth-scoring` modes differ in exactly
+        which matrix cells are freed (`collapsed`: C↔T and G↔A both ways, `-B 2`;
+        `genomic`: only the conversion direction, `-B 4`) — flag a change that
+        alters one mode's matrix or default without saying so. Also flag:
+        `XR`/`XG`/`XM` tag semantics drifting from Bismark convention;
+        reverse-strand conversion-direction errors; asymmetric handling between
+        the two mates of a pair; and mate rescue that scores only one bisulfite
+        hypothesis (test/regression/meth_rescue_batched_identical.sh pins the
+        batched rescue against the per-pair path). Require coverage by the meth
+        regression scripts (test/regression/meth_*.sh), including the bwa-meth
+        oracle comparison (meth_oracle.sh).
+        CRITICAL: the non-`--meth` code path is contractually byte-for-byte
+        unchanged — flag any edit that puts a methylation branch, extra field, or
+        changed default on the normal path.
+    - path: "src/{bwtindex,libsais_build,fm_index_writer,packed_text,index_prelude,bntseq}.{cpp,h}"
+      instructions: >-
+        This is index construction and the on-disk index format. Flag: any change
+        to the serialized layout, magic, or version that is not accompanied by a
+        version bump and a compatibility note — a silently changed format
+        mis-aligns reads rather than failing loudly. Index construction must be
+        deterministic (same reference in, byte-identical index out — see
+        test/libsais_determinism_test.sh) and must respect its memory budget
+        (test/libsais_memory_budget_test.sh). Flag 32-bit offset arithmetic,
+        lengths or offsets read back from the index file without validation
+        against the mapping bounds (fail closed on a malformed or truncated
+        index, never read past the end), and ambiguous-base / bntseq hole
+        bookkeeping errors. Calibration: `bns_iter_ambi` already clips every
+        visited hole to the caller's query window (`st = max(a->offset, pos_f)`,
+        `en = min(a->offset + a->len, pos_f + len)`, and skips when `st >= en`),
+        so a caller writing one entry per visited interval is bounded by the
+        window, not by `n_holes` — do not report that as an overflow without
+        showing a call site that violates the window contract.
+    - path: "src/{bwa_shm,bwa_madvise,system}.{cpp,h}"
+      instructions: >-
+        This is the POSIX shared-memory index stager. Known constraints: shm
+        object names are capped at ~31 characters on macOS, and the stager has NO
+        staleness check — a rebuilt index against a live segment silently
+        mis-aligns reads. Flag: new segment-name construction that can exceed the
+        name cap or collide; a stager lock that can be left held on an error or
+        signal path (there is a dedicated shm_lock_destroy test); a section
+        lookup that trusts an offset or size from the segment without validating
+        it against the mapping bounds; and a missing `shm_unlink`/cleanup on
+        partial failure. Round-trip must hold (shm_round_trip and
+        shm_pack_round_trip tests).
+    - path: "src/{fast_reader,fast_reader_bseq,fr_fastq}.{c,h}"
+      instructions: >-
+        This is the hand-rolled FASTQ reader — plain C, parsing untrusted input,
+        on the hot path. Flag: any length or offset taken from the input without
+        validation against the buffer end; a record split across a refill
+        boundary that is not handled; unterminated or over-long name / sequence /
+        quality fields; sequence and quality length mismatch; CRLF and
+        trailing-newline handling; and interleaved or paired-input
+        desynchronization (a truncated file must fail loudly, never silently pair
+        the wrong reads). Output must match the reference reader byte-for-byte —
+        confirm the differential test (test/fr_fastq_diff_test.c) still covers
+        the change.
+    - path: "src/{kthread,profiling,stage_prof}.{cpp,h}"
+      instructions: >-
+        This is the worker-thread pool and profiling instrumentation. Flag: work
+        partitioning whose result depends on thread count or completion order
+        (output must be identical for `-t 1` and `-t N` — see
+        test/regression/thread_determinism.sh); data races on shared scratch
+        buffers or counters (test/regression/chain_scratch_per_thread.sh pins
+        that the per-thread chaining scratch is not resized or shared per
+        chunk); a work-stealing or chunk-assignment change that can drop or
+        double-process a chunk; and profiling counters added to the hot path
+        without an opt-in `BWA_MEM3_DEBUG_*`-style macro guarding them — an
+        `#ifndef NDEBUG` guard does not compile anything out in this build.
+    - path: "test/**/*.{c,cpp,h}"
+      instructions: >-
+        Unit tests must use only programmatically generated synthetic inputs and
+        run in under ~100 ms each; integration tests may load the small committed
+        fixtures in test/fixtures/ with a ~10 s budget. Do not add new committed
+        binary fixtures. New correctness-critical behavior needs an INDEPENDENT
+        oracle — the scalar reference kernel, another SIMD tier, upstream bwa, or
+        bwa-meth — not a self-consistency check that would pass against the bug
+        itself. Flag: assertions weaker than the stated contract (asserting a
+        score but not the full result record, or a record count but not record
+        identity); a test that pins the current buggy output; and a test whose
+        pass/fail silently depends on the host's SIMD tier.
+    - path: "test/**/*.sh"
+      instructions: >-
+        Regression scripts shell out to the built binary and diff against
+        third-party tools. Flag: missing `set -euo pipefail`; a pipeline whose
+        real exit status is masked by a later `grep`/`head`; unquoted paths;
+        a comparison that succeeds vacuously when a fixture or tool is absent (a
+        skipped check must be reported as skipped, never as a pass); and
+        hardcoded absolute or machine-local paths. Per test/regression/README.md
+        each script is self-contained (`set -euo pipefail`, explicit env-var
+        contract), prints `PASS:` on success and `FAIL:` on failure, and returns
+        nonzero on failure — flag a new script that does not, and flag a new
+        script that is not wired into a ci.yml step. Calibration: the bwa `.ann`
+        index file stores TWO lines per reference sequence, so a parser that
+        reads alternating lines is correct, not an off-by-one.
+    - path: "src/{kseq,khash,ksort,kvec,kbtree}.h"
+      instructions: >-
+        These are vendored klib headers (Attractive Chaos, MIT) carried in-tree
+        the way upstream bwa carries them. Review ONLY the local modification
+        the diff makes — whether it is necessary, minimal, and marked as a local
+        change — and do not raise style, naming, macro-hygiene, or modernization
+        findings against the surrounding upstream code. A rewrite here has to be
+        justified as a bug fix we cannot get upstream, not as a cleanup.
+    - path: "{scripts,bench,.github/scripts}/**/*.sh"
+      instructions: >-
+        Developer and benchmark helper scripts. They are not run by CI, which
+        makes them the likeliest place for a private path or an internal tool
+        name to reach a PUBLIC repository — flag any machine-local path
+        (anything beginning `/Users/`, `/home/`, `/Volumes/`, or `~/`), internal
+        host or bucket name, object-store URL, or cloud account or instance id,
+        and
+        suggest a variable with a documented default instead. Otherwise the same
+        shell rules apply as for the regression scripts: `set -euo pipefail`, no
+        exit status masked by a later pipeline stage, quoted paths, and a check
+        that cannot pass vacuously when a tool or input is missing. A benchmark
+        script that prints a timing must also verify the run succeeded and
+        produced the expected output — a wrapper reports wall-clock even for a
+        command that died early.
+    - path: "{CHANGELOG.md,NEWS.md,version.txt,release-please-config.json,.release-please-manifest.json}"
+      instructions: >-
+        Release automation. CHANGELOG.md and the release-please manifest are
+        generated — flag hand edits, which the next release overwrites. Flag a
+        version bumped in one place but not the others, and any version change
+        that does not follow semantic versioning given the diff it ships (an
+        output-changing or flag-removing change is not a patch release).
+        test/regression/version_banner.sh pins the banner against version.txt.
+    - path: "{README.md,bench/README.md,test/TESTING.md,test/regression/README.md}"
+      instructions: >-
+        Repository prose outside docs/src. Hold it to the same two rules as the
+        published docs: no internal harness, bucket, host, account, or
+        machine-local path (this repository is public — describe the
+        requirement, not the tool), and no performance or concordance claim
+        without the workload, host, architecture, and SIMD tier behind it. Flag
+        instructions that no longer match the build targets, script names, or
+        flags in this diff.
+    - path: "docs/src/**/*.md"
+      instructions: >-
+        These docs are a published contract, not commentary — in particular
+        whats-different/equivalence.md, correctness.md, features.md, and
+        performance.md record exactly where bwa-mem3 diverges from upstream
+        bwa-mem2, with an auditable link back to the PR that caused each
+        divergence. Flag: a claim of concordance, throughput, or byte-identity
+        stated without the workload, host, architecture, and SIMD tier it was
+        measured on; a divergence described without a linked PR; documented CLI
+        flags, defaults, or tag semantics that no longer match the code in this
+        diff; and a new SUMMARY.md entry pointing at a file the diff does not
+        add. Prose describing benchmark methodology must not name internal
+        harnesses, buckets, hosts, or local filesystem paths — describe the
+        requirement, not the tool.
+    - path: "{Makefile,test/Makefile}"
+      instructions: >-
+        Flag: a per-tier compile flag (`-msse4.1`, `-mavx2`, `-mavx512bw`)
+        applied to a translation unit that is also compiled for another tier or
+        for arm64; a new source file added to one build path but not the others
+        (single-binary dispatch, the per-arch builds, and the test binaries each
+        list objects separately); missing header dependencies that let a stale
+        object survive a header change (test/regression/make_header_deps.sh);
+        a change to the default goal (test/regression/make_default_goal.sh); and
+        changes to the default optimization or LTO flags without a stated
+        reason, since published throughput numbers assume them. Nothing here may
+        define NDEBUG: the whole codebase's debug-gate policy assumes it is never
+        defined, and test/regression/ndebug_gate_lint.sh encodes that assumption.
+    - path: ".github/workflows/**"
+      instructions: >-
+        Actions must be pinned by full commit SHA with the version in a trailing
+        comment, never by a mutable tag. Flag: a new build-matrix row that skips
+        the unit or integration test steps; a cached reference or index whose
+        cache key omits an input that produces it (a stale cached index is a
+        silent wrong answer, not a build failure); a `continue-on-error` or
+        unchecked step that lets a failing parity/regression check pass the job;
+        and secrets or token permissions broader than the job needs. A lint job
+        needs its own self-test, and the self-test must run FIRST: a lint whose
+        matcher has silently stopped matching prints the same PASS as a lint that
+        found nothing (see the `ndebug-gate-lint` job, which runs
+        ndebug_gate_lint_selftest.sh before ndebug_gate_lint.sh). Flag a new lint
+        or parity job added without one, and flag a new matrix row that does not
+        also appear in the regression-script table in test/regression/README.md.
+
+  # Deterministic gates specific to this repo. `warning` posts a comment;
+  # `error` marks the check as requiring resolution, and can block the PR only
+  # when request_changes_workflow is enabled — it is disabled above, so nothing
+  # here blocks a merge today. Reserve `error` for policy a reviewer must not be
+  # able to wave through by habit (currently: public-repo hygiene).
+  pre_merge_checks:
+    title:
+      mode: "warning"
+      requirements: >-
+        Title must follow Conventional Commits (feat:, fix:, perf:, refactor:,
+        docs:, test:, chore:, ci:, build:) with an optional scope, and must name
+        the component touched (e.g. kswv, bandedSWA, meth, shm, index, seeding)
+        rather than a generic phrase like "improvements" or "updates". It must
+        not contain an internal tool name, bucket name, host name, or local
+        filesystem path — this repository is public.
+    description:
+      mode: "warning"
+    # No docstring convention in this codebase; the check would be pure noise.
+    docstrings:
+      mode: "off"
+    custom_checks:
+      # Stated as an allowlist on purpose. A denylist of the actual internal
+      # names would have to spell them out in a world-readable file, which is
+      # the exact disclosure this check exists to prevent.
+      - name: "Public-repo hygiene"
+        mode: "error"
+        instructions: >-
+          This repository is public: PR titles and bodies, commit messages,
+          issue text, review comments, and all committed files are
+          world-readable. Some of the tooling this project is developed against
+          is not. FAIL if the pull request title, body, or any added or modified
+          line in the diff contains any of the following. (1) A named benchmark
+          harness, dataset, repository, or internal service that is NOT a
+          publicly citable project. Treat as allowed only names a reader could
+          look up: this repository and its own scripts, upstream bwa, bwa-mem2,
+          bwa-meth, Bismark, samtools, htslib, libsais, mimalloc, sse2neon,
+          zlib-ng, dwgsim, and standard OS or cloud instance-type designations.
+          Any other proper-noun tool, harness, bucket, fleet, queue, or internal
+          project name is a FAIL. (2) An object-store URL (`s3://`, `gs://`,
+          `az://`) or bucket name. (3) A cloud account number, an EC2 instance
+          id (`i-` followed by hex), an internal hostname, or a private IP. (4)
+          A machine-local filesystem path — anything beginning `/Users/`,
+          `/home/`, `/Volumes/`, `~/`, or a Windows drive letter — including
+          inside example commands and log excerpts. Benchmark numbers,
+          methodology, and hardware descriptions are fine, as are public
+          instance types and CPU model names: it is the names, buckets,
+          accounts, and paths that are not. When failing, quote the offending
+          text and suggest a neutral rewording that keeps the requirement but
+          drops the name — for example "separate byte-identity and throughput
+          validation of the kernels" instead of naming a harness, or a
+          documented environment variable instead of a local path. PASS if none
+          of these appear.
+      - name: "Equivalence contract updated"
+        mode: "warning"
+        instructions: >-
+          bwa-mem3's divergence from upstream bwa-mem2 is a published contract in
+          docs/src/whats-different/equivalence.md, with a per-PR audit trail.
+          First decide whether this diff can change the emitted SAM/BAM byte
+          stream. Treat as output-changing any modification to src/bwamem.cpp,
+          src/bwamem_pair.cpp, src/bwamem_extra.cpp, src/sam_encode.cpp,
+          src/bam_writer.cpp, src/bandedSWA.cpp, src/kswv.cpp, src/ksw.cpp,
+          src/meth_*.cpp, src/seed_order.cpp, src/smem_dedup.cpp, or
+          src/FMI_search.cpp that touches scoring, tie resolution, MAPQ, flags,
+          tag emission, CIGAR construction, or record selection. If the diff is
+          output-changing, PASS only if it also modifies
+          docs/src/whats-different/equivalence.md (or correctness.md or
+          features.md) to record the new divergence, OR the PR description states
+          explicitly that output is unchanged and how that was verified.
+          Otherwise FAIL, naming the specific field or record type that can move.
+          PASS trivially for changes confined to docs, CI, tests, or the build
+          system.
+      - name: "Kernel change validation reported"
+        mode: "warning"
+        instructions: >-
+          If this diff modifies src/bandedSWA.cpp, src/kswv.cpp, src/ksw.cpp,
+          src/neon_utils.h, or src/simd_compat.h, the pull request description
+          MUST report two things: (1) a byte-identity correctness result against
+          a baseline build — every result field per aligned pair, not just the
+          score — stated as PASS, or, if it deliberately FAILs, an explanation of
+          the intended semantic change; and (2) before/after throughput together
+          with the host, CPU architecture, and SIMD tier it was measured on,
+          since throughput is comparable only within a host. FAIL if either is
+          missing, and say which. Do not name the harness used — describe the
+          requirement in neutral terms. PASS if the diff does not touch those
+          files.
+      - name: "SIMD tier coverage"
+        mode: "warning"
+        instructions: >-
+          bwa-mem3 maintains four SIMD variants that must agree: SSE4.1, AVX2,
+          AVX-512BW, and ARM NEON. If this diff changes vectorized code, tier
+          dispatch, or a SIMD_WIDTH-dependent buffer size, PASS only if the
+          change is either tier-agnostic by construction (expressed through the
+          SIMD_WIDTH macros and the simd_compat.h abstraction, with no hardcoded
+          lane count and no raw intrinsic outside that header) or is covered by
+          an all-tiers parity check. FAIL if the change adds a raw intrinsic to a
+          shared translation unit without a corresponding definition in every
+          platform branch of simd_compat.h — that breaks the arm64 and SSE4.1 CI
+          rows. PASS if the diff touches no SIMD code.
+
+  # NB: every tool defaults to enabled, so the `true` entries below change no
+  # behavior — they are here to record which analyzers we consider load-bearing
+  # for this stack, so a future disable is a deliberate edit rather than a
+  # silent omission. The functional changes are the two disables at the end.
+  tools:
+    cppcheck:
+      enabled: true
+    clang:
+      enabled: true
+    shellcheck:
+      enabled: true
+    checkmake:
+      enabled: true
+    actionlint:
+      enabled: true
+    # Static security analysis of the workflows themselves; this repo pins every
+    # action by commit SHA and that policy is worth having checked mechanically.
+    zizmor:
+      enabled: true
+    yamllint:
+      enabled: true
+    gitleaks:
+      enabled: true
+    # The docs are long-form mdBook prose with intentional formatting; both of
+    # these bury real findings under style noise.
+    markdownlint:
+      enabled: false
+    languagetool:
+      enabled: false
+
+  # Both finishing touches default to enabled and neither fits this codebase:
+  # there is no docstring convention (see pre_merge_checks.docstrings above),
+  # and generated unit tests would violate the test contract stated in the
+  # test/** instructions — synthetic inputs only, an INDEPENDENT oracle, and no
+  # new committed fixtures.
+  finishing_touches:
+    docstrings:
+      enabled: false
+    unit_tests:
+      enabled: false
+
+knowledge_base:
+  # Let CodeRabbit carry forward what it learns about this repo's conventions
+  # across PRs, scoped to this repository only (it is public). `auto` already
+  # resolves to `local` for a public repo; all three are pinned explicitly so
+  # the scope is a stated decision rather than a consequence of repo visibility.
+  learnings:
+    scope: "local"
+  issues:
+    scope: "local"
+  pull_requests:
+    scope: "local"
+  code_guidelines:
+    enabled: true
+    filePatterns:
+      - "docs/src/developer-guide/*.md"
+      # The published divergence contract and the regression-script conventions
+      # are both written standards a review should be held to.
+      - "docs/src/whats-different/*.md"
+      - "test/TESTING.md"
+      - "test/regression/README.md"
