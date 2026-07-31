@@ -383,6 +383,8 @@ mem_opt_t *mem_opt_init()
     o->max_XA_hits = 5;
     o->max_XA_hits_alt = 200;
     o->max_matesw = 50;
+    o->rescue_kmer = 0;      /* off by default (opt-in, not byte-identical) */
+    o->rescue_band = MEM_RESCUE_BAND_DEFAULT;
     o->mask_level_redun = 0.95;
     o->min_chain_weight = 0;
     o->max_chain_extend = 1<<30;

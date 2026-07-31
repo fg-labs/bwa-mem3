@@ -61,6 +61,23 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #define MEM_MAPQ_COEF 30.0
 #define MEM_MAPQ_MAX  60
 
+/* Bounds on the --rescue-kmer / --rescue-band options (mem_opt_t::rescue_kmer,
+ * ::rescue_band below). K is capped where a k-mer code stops fitting the uint32
+ * the anchor index packs it into; beyond that every K would behave as K=16, so
+ * the CLI rejects it rather than silently clamping. The band is capped well past
+ * any insert-sized rescue window -- a wider band already covers the whole window,
+ * so asking for one is a mistake worth naming -- and the cap also keeps the
+ * `anchor_diagonal + read_length + band` arithmetic clear of int overflow. */
+#define MEM_RESCUE_KMER_MAX 16
+#define MEM_RESCUE_BAND_MAX 1000000
+/* K used by both bare `--rescue-kmer` and the --fast preset (the measured
+ * wall-time optimum); named so the two parse sites and the help text cannot
+ * drift apart. The band default is named for the same reason: mem_opt_init sets
+ * it and matesw_kmer_narrow repeats it as a defensive fallback for a caller that
+ * sets the field directly, and those two must not drift. */
+#define MEM_RESCUE_KMER_DEFAULT 6
+#define MEM_RESCUE_BAND_DEFAULT 50
+
 struct __smem_i;
 typedef struct __smem_i smem_i;
 
@@ -147,6 +164,8 @@ typedef struct mem_opt_t {
     int mapQ_coef_fac;
     int max_ins;            // when estimating insert size distribution, skip pairs with insert longer than this value
     int max_matesw;         // perform maximally max_matesw rounds of mate-SW for each end
+    int rescue_kmer;        // k-mer-anchored banded mate rescue: 0=off, else anchor k-mer length in [1,MEM_RESCUE_KMER_MAX] (opt-in, not byte-identical)
+    int rescue_band;        // half-width (bp) of the band around the k-mer anchor diagonal, in [1,MEM_RESCUE_BAND_MAX]
     int max_XA_hits, max_XA_hits_alt; // if there are max_hits or fewer, output them all
     int8_t mat[25];         // scoring matrix; mat[0] == 0 if unset
     /* D3 (--meth): per-hypothesis substitution matrices, built from `mat` by

@@ -48,6 +48,159 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #  include "malloc_wrap.h"
 #endif
 
+/* ---- k-mer-anchored banded mate rescue (opt->rescue_kmer) --------------------
+ * Mate rescue Smith-Watermans a read against a ~kilobase reference window chosen
+ * by insert size (mem_matesw_batch_pre/post). With --rescue-kmer set, find the
+ * read's dominant k-mer exact-match diagonal within that window and band the SW
+ * to that diagonal +/- rescue_band, falling back to the full window when no
+ * anchor gathers enough votes. Opt-in and NOT byte-identical: the narrowed
+ * window yields a different suboptimal score (csub -> MAPQ), so it is off by
+ * default and enabled by --fast. The kswv kernel is unchanged -- narrowing just
+ * hands it a shorter reference window. */
+#include <vector>
+#include <cstdint>
+#include <algorithm>
+namespace {
+
+/* Find the dominant k-mer exact-match diagonal of the (oriented) read within the
+ * reference window ref[0..M) and return the window sub-range [ob,oe) a band of
+ * half-width opt->rescue_band around it covers. Returns false (=> full window)
+ * when no diagonal gathers >= 3 votes, or when the banded span would come out
+ * shorter than the query. Only mem_matesw_batch_pre calls this: it runs the scan
+ * once per enqueued pair and stores the resulting offset in g_rescue_narrow_off
+ * (keyed by regid) for mem_matesw_batch_post to read back, so _post never
+ * re-derives the window. `collapse` reduces the alphabet for the anchor scan only
+ * (1 = C->T / OT, 2 = G->A / OB, 0 = none) so exact k-mers survive the bisulfite
+ * conversion under --meth; the SW still sees the real bases. */
+static bool matesw_kmer_narrow(const mem_opt_t *opt, const uint8_t *ref, int M,
+                               const uint8_t *ms, int l_ms, int is_rev, int collapse,
+                               int *ob, int *oe)
+{
+    /* The CLI rejects K outside [1,MEM_RESCUE_KMER_MAX]; clamp defensively so a
+     * caller that sets opt->rescue_kmer directly cannot overflow the uint32 code. */
+    int k = opt->rescue_kmer;
+    if (k < 1) k = 1;
+    if (k > MEM_RESCUE_KMER_MAX) k = MEM_RESCUE_KMER_MAX;
+    if (M < k || l_ms < k) return false;
+
+    auto col = [collapse](uint8_t b) -> uint8_t {
+        if (b > 3) return b;
+        if (collapse == 1 && b == 1) return 3;   /* C -> T */
+        if (collapse == 2 && b == 2) return 0;   /* G -> A */
+        return b;
+    };
+
+    /* oriented (RC for is_rev), collapsed query bases */
+    static thread_local std::vector<uint8_t> q;
+    if ((int)q.size() < l_ms) q.resize(l_ms);
+    if (is_rev) for (int i = 0; i < l_ms; ++i) { uint8_t c = ms[l_ms-1-i]; q[i] = col((c < 4)? 3-c : 4); }
+    else        for (int i = 0; i < l_ms; ++i) q[i] = col(ms[i]);
+
+    /* index the read's k-mers in a fixed open-addressing hash (O(read) build,
+     * O(1) lookup); reset only the touched slots each call.
+     *
+     * HMAX caps occupancy so both probe loops below always terminate on an empty
+     * slot: a read offers up to l_ms - k + 1 distinct k-mers, which exceeds the
+     * HS slots for a mate of ~1 kb or longer (the K=6 code space is 4096), and a
+     * full table would make linear probing spin forever. touched.size() IS the
+     * occupancy -- every insert pushes exactly one slot and the reset loop below
+     * empties exactly those -- so no separate counter is needed. Stopping early
+     * leaves a partial index, which is safe: the vote scan then sees fewer
+     * anchors and falls back to the full window if votes stay under threshold. */
+    constexpr int HS = 1024, HMASK = HS - 1;
+    constexpr int HMAX = HS - (HS >> 2);                   /* stop inserting at 75% load */
+    static_assert(HMAX < HS, "the table must retain empty slots or linear probing cannot terminate");
+    static thread_local std::vector<uint32_t> slot_code;   /* 0xFFFFFFFF = empty */
+    static thread_local std::vector<int>      slot_head;
+    static thread_local std::vector<int>      nxt;         /* read-pos chain */
+    static thread_local std::vector<int>      touched;
+    if ((int)slot_code.size() < HS) { slot_code.assign(HS, 0xFFFFFFFFu); slot_head.assign(HS, -1); }
+    if ((int)nxt.size() < l_ms) nxt.resize(l_ms);
+    touched.clear();
+
+    uint32_t mask = (k >= 16) ? 0xffffffffu : ((1u << (2*k)) - 1);
+    { uint32_t code = 0; int valid = 0;
+      for (int i = 0; i < l_ms; ++i) {
+          uint8_t c = q[i];
+          if (c > 3) { valid = 0; code = 0; continue; }
+          code = ((code << 2) | c) & mask;
+          if (++valid >= k) {
+              int pos = i - k + 1;
+              uint32_t h = (code * 2654435761u) >> (32 - 10);   /* HS = 1<<10 */
+              while (slot_code[h] != 0xFFFFFFFFu && slot_code[h] != code) h = (h + 1) & HMASK;
+              if (slot_code[h] == 0xFFFFFFFFu) {
+                  if ((int)touched.size() >= HMAX) break;   /* table full enough: stop indexing */
+                  slot_code[h] = code; slot_head[h] = -1; touched.push_back((int)h);
+              }
+              nxt[pos] = slot_head[h]; slot_head[h] = pos;
+          }
+      } }
+    if (touched.empty()) return false;
+
+    /* vote diagonals d = (ref k-mer start) - (read k-mer start), index by d+l_ms */
+    int span = M + l_ms + 1;
+    static thread_local std::vector<int> dv;
+    if ((int)dv.size() < span) dv.resize(span);
+    std::fill(dv.begin(), dv.begin() + span, 0);
+    int best_d = 0, best_v = 0;
+    { uint32_t code = 0; int valid = 0;
+      for (int o = 0; o < M; ++o) {
+          uint8_t c = col(ref[o]);
+          if (c > 3) { valid = 0; code = 0; continue; }
+          code = ((code << 2) | c) & mask;
+          if (++valid >= k) {
+              int opos = o - k + 1;
+              uint32_t h = (code * 2654435761u) >> (32 - 10);
+              while (slot_code[h] != 0xFFFFFFFFu && slot_code[h] != code) h = (h + 1) & HMASK;
+              if (slot_code[h] == code) {
+                  for (int p = slot_head[h]; p >= 0; p = nxt[p]) {
+                      int idx = (opos - p) + l_ms;
+                      if (idx < 0 || idx >= span) continue;
+                      int v = ++dv[idx];
+                      if (v > best_v) { best_v = v; best_d = opos - p; }
+                  }
+              }
+          }
+      } }
+    for (int h : touched) slot_code[h] = 0xFFFFFFFFu;
+
+    if (best_v < 3) return false;
+    int W = opt->rescue_band > 0 ? opt->rescue_band : MEM_RESCUE_BAND_DEFAULT;
+    int lo_off = best_d - W;             /* read-0 maps to window offset best_d */
+    int hi_off = best_d + l_ms + W;
+    if (lo_off < 0) lo_off = 0;
+    if (hi_off > M) hi_off = M;
+    /* An anchor diagonal near a window edge clamps to a span that can be far
+     * shorter than the query (down to ~k + W when the read hangs off the left
+     * edge). Such a window cannot host a full-length rescue alignment, so the
+     * SW would return a truncated, low score that the caller's
+     * `score >= min_seed_len` gate is liable to reject -- a rescue the full
+     * window might have kept. Keep the full window in that case. */
+    if (hi_off - lo_off < l_ms) return false;
+    *ob = lo_off; *oe = hi_off;
+    return true;
+}
+
+/* mem_matesw_batch_pre stores the narrowing offset per enqueued pair (keyed by
+ * regid, stable under the batch's sort_classify / length-sort reorder) so
+ * mem_matesw_batch_post reads it back instead of re-running the anchor scan. */
+static thread_local std::vector<int> g_rescue_narrow_off;
+
+/* --rescue-kmer: length-sort each SIMD-width partition of `sp[0,pcnt)` (8-bit
+ * below pcnt8, 16-bit above) so the narrowed short windows group together --
+ * getScores8/16 runs each SIMD-lane group out to the group's longest len1, so a
+ * full fallback window mixed into a narrowed group wastes the saving. The
+ * 8/16-bit split at pcnt8 is preserved by sorting each side independently.
+ * Result-safe: aln[] and g_rescue_narrow_off are keyed by regid and seqBuf* by
+ * idr/idq, so every key travels with the SeqPair it belongs to. */
+static void matesw_sort_partitions_by_len(SeqPair *sp, int64_t pcnt8, int64_t pcnt)
+{
+    auto by_len1 = [](const SeqPair &x, const SeqPair &y) { return x.len1 < y.len1; };
+    std::sort(sp, sp + pcnt8, by_len1);
+    if (pcnt > pcnt8) std::sort(sp + pcnt8, sp + pcnt, by_len1);
+}
+} // namespace
+
 /* File-scope forward declaration of the dedup/patch entry point defined in
  * src/bwamem.cpp (kept default-free there). The `mat = NULL` default lives
  * here only, so [dcl.fct.default]/4 (no redefining a default in one TU) is
@@ -1077,6 +1230,13 @@ int mem_sam_pe_batch(const mem_opt_t *opt, mem_cache *mmc,
             scored += group_pcnt;
             if (group_pcnt == 0) continue;
 
+            /* --rescue-kmer: same length sort as the non-meth path below, applied
+             * per OT/OB partition -- otherwise --fast --meth would enqueue narrowed
+             * windows but leave them mixed with full ones inside each SIMD group,
+             * paying the scan cost without collecting the saving. */
+            if (opt->rescue_kmer)
+                matesw_sort_partitions_by_len(scratch, group_pcnt8, group_pcnt);
+
             Ikswv *pwsw = (hyp == 1) ? pwsw_ot.get() : pwsw_ob.get();
             mem_sam_pe_batch_run(pwsw, scratch, seqBufRef, seqBufQer,
                                  aln, group_pcnt, group_pcnt8, nthreads);
@@ -1098,6 +1258,8 @@ int mem_sam_pe_batch(const mem_opt_t *opt, mem_cache *mmc,
     auto pwsw = make_kswv(opt->o_del, opt->e_del, opt->o_ins, opt->e_ins,
                           opt->a, -1*opt->b, nthreads,
                           maxRefLen, maxQerLen);
+
+    if (opt->rescue_kmer) matesw_sort_partitions_by_len(seqPairArray, pcnt8, pcnt);
 
     mem_sam_pe_batch_run(pwsw.get(), seqPairArray, seqBufRef, seqBufQer,
                          aln, pcnt, pcnt8, nthreads);
@@ -1517,6 +1679,19 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                 gar[gcnt + r] = -1;
                 continue;
             }
+            /* --rescue-kmer: band this window to the anchor diagonal before enqueue
+             * (meth collapses the anchor scan to 3 letters on this pair's strand).
+             * mem_matesw_batch_post applies the same offset, so coords stay
+             * consistent; narrow_ob (0 = full window) is recorded at enqueue. */
+            int narrow_ob = 0;
+            if (opt->rescue_kmer) {
+                int collapse = 0;
+                if (opt->meth_mode) { int hyp = (mate_meth_ot ^ is_rev) & 1; collapse = hyp ? 1 : 2; }
+                int ob, oe;
+                if (matesw_kmer_narrow(opt, ref, (int)(re - rb), ms, l_ms, is_rev, collapse, &ob, &oe)) {
+                    int64_t rb_full = rb; ref += ob; rb = rb_full + ob; re = rb_full + oe; narrow_ob = ob;
+                }
+            }
             //kswr_t aln;
             //mem_alnreg_t b;
             int xtra = KSW_XSUBO | KSW_XSTART | (l_ms * opt->a < 250? KSW_XBYTE : 0) | (opt->min_seed_len * opt->a);
@@ -1658,6 +1833,11 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                 /* gar[gcnt+r] points at this rescue's single enqueued regid. */
                 if (hi == 0) gar[gcnt + r] = pcnt;
                 sp.regid = pcnt;
+                if (opt->rescue_kmer) {   /* record narrow offset by regid for _post */
+                    if ((int)g_rescue_narrow_off.size() <= pcnt)
+                        g_rescue_narrow_off.resize(pcnt + 1024, 0);
+                    g_rescue_narrow_off[pcnt] = narrow_ob;
+                }
                 seqPairArray[pcnt++] = sp;
             }
         }
@@ -1779,6 +1959,11 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
             //aln = **myaln;
             //(*myaln)++;
             int index = gar[gcnt + r];
+            /* --rescue-kmer: apply the same narrowing offset _pre stored for this
+             * regid, so aln.tb/te map against the narrowed window start (batched
+             * pairs only; index==-1 scalar-fallback pairs were never narrowed). */
+            if (opt->rescue_kmer && index >= 0)
+                rb += g_rescue_narrow_off[index];
             if (index == -1) {
                 // fprintf(stderr, "Re-routing: Encountered -ve index for "
                 // "gcnt: %d, look into pre.\n", gcnt + r);
