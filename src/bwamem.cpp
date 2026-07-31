@@ -38,6 +38,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "kvec.h"          /* kvec_t/kv_push/kv_resize used directly below */
 #include "pdqsort_wrap.h"
 #include <inttypes.h>      /* PRId64 for int64_t fprintf format strings */
+#include <strings.h>       /* strcasecmp in mem_opt_parse_meth_tags */
 #include <mutex>           /* BWAMEM3_DUMP_PAIRS append lock */
 #include <string>          /* BWAMEM3_DUMP_PAIRS per-batch row buffer */
 
@@ -389,6 +390,7 @@ mem_opt_t *mem_opt_init()
     o->mapQ_coef_len = 50; o->mapQ_coef_fac = log(o->mapQ_coef_len);
     o->meth_scoring = MEM_METH_SCORING_COLLAPSED;  /* --meth default: bwameth-compatible */
     o->meth_chem    = METH_CHEM_EMSEQ;             /* --meth default chemistry: bisulfite/em-seq */
+    o->meth_tags    = MEM_METH_TAGS_ALL;           /* --meth default: emit XR/XG/XM (Bismark set) */
     o->compat       = &COMPAT_TARGET_OFF;          /* --compat off: bwa-mem3's native output */
     bwa_fill_scmat(o->a, o->b, o->mat);
     mem_opt_fill_meth_mat(o);
@@ -413,6 +415,56 @@ mem_opt_t *mem_opt_init()
  * rebuild of opt->mat (mem_opt_init AND after main_mem parses -A/-B/-x and
  * re-runs bwa_fill_scmat) — otherwise the meth matrices keep the default
  * match/mismatch and silently ignore the user's scoring options. */
+/* Map one tag name to its MEM_METH_TAG_* bit; 0 if unknown. Case-insensitive. */
+static int meth_tag_bit(const char *name, size_t len)
+{
+    if (len != 2 || (name[0] != 'X' && name[0] != 'x')) return 0;
+    switch (name[1]) {
+        case 'R': case 'r': return MEM_METH_TAG_XR;
+        case 'G': case 'g': return MEM_METH_TAG_XG;
+        case 'M': case 'm': return MEM_METH_TAG_XM;
+        default:            return 0;
+    }
+}
+
+int mem_opt_parse_meth_tags(const char *spec, int *out, const char **err)
+{
+    if (spec == NULL || *spec == '\0') { *err = "empty tag spec"; return -1; }
+    if (strcasecmp(spec, "all")  == 0) { *out = MEM_METH_TAGS_ALL; return 0; }
+    if (strcasecmp(spec, "none") == 0) { *out = 0;                 return 0; }
+
+    /* A spec is either all-inclusion (`XR,XG`) or all-exclusion (`^XM`).
+     * Mixing the two has no obvious reading -- is `XR,^XM` "only XR" or
+     * "everything but XM"? -- so reject it rather than pick a meaning. */
+    int included = 0, excluded = 0, n_inc = 0, n_exc = 0;
+    const char *p = spec;
+    while (*p != '\0') {
+        const char *comma = strchr(p, ',');
+        size_t len = comma != NULL ? (size_t)(comma - p) : strlen(p);
+        /* Separate from the unknown-tag case below: in `,XR` or `XR,,XG` there
+         * is no tag name to be unknown, and saying so sends the user hunting
+         * for a misspelling that isn't there. `XR,` is caught as a trailing
+         * comma at the bottom of the loop. */
+        if (len == 0) { *err = "empty tag in list"; return -1; }
+        int is_exclusion = (*p == '^');
+        const char *name = is_exclusion ? p + 1 : p;
+        size_t name_len  = is_exclusion ? len - 1 : len;
+        int bit = meth_tag_bit(name, name_len);
+        if (bit == 0) { *err = "unknown tag (expected XR, XG or XM)"; return -1; }
+        if (is_exclusion) { excluded |= bit; ++n_exc; }
+        else              { included |= bit; ++n_inc; }
+        if (comma == NULL) break;
+        p = comma + 1;
+        if (*p == '\0') { *err = "trailing comma"; return -1; }
+    }
+    if (n_inc > 0 && n_exc > 0) {
+        *err = "cannot mix included and ^excluded tags in one spec";
+        return -1;
+    }
+    *out = n_exc > 0 ? (MEM_METH_TAGS_ALL & ~excluded) : included;
+    return 0;
+}
+
 void mem_opt_fill_meth_mat(mem_opt_t *o) {
     memcpy(o->mat_ot, o->mat, sizeof(o->mat));
     memcpy(o->mat_ob, o->mat, sizeof(o->mat));

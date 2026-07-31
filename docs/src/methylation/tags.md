@@ -1,5 +1,10 @@
 # SAM Tags: XR, XG, XM (Bismark-compatible)
 
+> All three are emitted by default. Use [`--meth-tags`](flags.md#--meth-tags-spec)
+> to select a subset — e.g. `--meth-tags ^XM` drops the read-length call
+> string (~33 % of the BAM) for callers that recompute from the reference,
+> such as MethylDackel and biscuit. A deselected tag is not computed.
+
 `bwa-mem3 mem --meth` emits three Bismark-compatible auxiliary tags on
 each output record: `XR:Z`, `XG:Z`, and `XM:Z`. These tags are read by
 `bismark_methylation_extractor`, `deduplicate_bismark`, methylKit

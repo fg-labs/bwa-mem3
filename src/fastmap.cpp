@@ -1550,6 +1550,17 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "                 In genomic/neutral a real variant in the conversion direction\n");
     fprintf(stderr, "                 itself (C->T at a reference C) is indistinguishable from a\n");
     fprintf(stderr, "                 conversion and stays hidden in NM/MD.\n");
+    fprintf(stderr, "   --meth-tags SPEC\n");
+    fprintf(stderr, "                 which Bismark tags to emit: 'all' (default), 'none', a\n");
+    fprintf(stderr, "                 comma-separated list (XR,XG), or ^-prefixed exclusions (^XM).\n");
+    fprintf(stderr, "                 Comma-separated, NOT space-separated (a second word becomes\n");
+    fprintf(stderr, "                 the reference). Quote ^ specs: '^XM' -- bare ^ is a negated\n");
+    fprintf(stderr, "                 glob in zsh with EXTENDED_GLOB.\n");
+    fprintf(stderr, "                 Unselected tags are not computed. XM:Z is a read-length string\n");
+    fprintf(stderr, "                 and dominates the BAM's aux payload; '^XM' drops it for callers\n");
+    fprintf(stderr, "                 that recompute from the reference (MethylDackel, biscuit).\n");
+    fprintf(stderr, "                 Keep XM for Bismark-family tools (bismark_methylation_extractor,\n");
+    fprintf(stderr, "                 methylKit, methtuple, DMRfinder, epialleleR).\n");
     fprintf(stderr, "   --set-as-failed f|r\n");
     fprintf(stderr, "                 flag alignments to the matching strand ('f' or 'r') as QC-fail (0x200)\n");
     fprintf(stderr, "   --chimera-qc\n");
@@ -1771,6 +1782,7 @@ int main_mem(int argc, char *argv[])
         OPT_BAM = 1000,
         OPT_METH,
         OPT_METH_SCORING,
+        OPT_METH_TAGS,
         OPT_METH_SET_AS_FAILED,
         OPT_METH_CHIMERA_QC,
         OPT_SUPP_REP_HARD_CAP,
@@ -1808,6 +1820,7 @@ int main_mem(int argc, char *argv[])
         {"cohort-ramp-first",        required_argument, 0, OPT_COHORT_RAMP_FIRST},
         {"meth",                     optional_argument, 0, OPT_METH},
         {"meth-scoring",             required_argument, 0, OPT_METH_SCORING},
+        {"meth-tags",                required_argument, 0, OPT_METH_TAGS},
         {"set-as-failed",            required_argument, 0, OPT_METH_SET_AS_FAILED},
         {"chimera-qc",               no_argument,       0, OPT_METH_CHIMERA_QC},
         {"supp-rep-hard-cap",        required_argument, 0, OPT_SUPP_REP_HARD_CAP},
@@ -1993,6 +2006,19 @@ int main_mem(int argc, char *argv[])
                 if (out_opened) fclose(aux.fp);
                 return 1;
             }
+        }
+        else if (c == OPT_METH_TAGS) {
+            const char *tag_err = NULL;
+            if (mem_opt_parse_meth_tags(optarg, &opt->meth_tags, &tag_err) != 0) {
+                fprintf(stderr, "ERROR: --meth-tags '%s': %s\n"
+                                "       expected 'all', 'none', a comma-separated list "
+                                "(e.g. XR,XG), or ^-prefixed exclusions (e.g. ^XM)\n",
+                        optarg != NULL ? optarg : "", tag_err);
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+            opt0.meth_tags = 1;
         }
         else if (c == OPT_METH_SET_AS_FAILED) {
             if (optarg == NULL || !(optarg[0] == 'f' || optarg[0] == 'r') || optarg[1] != '\0') {

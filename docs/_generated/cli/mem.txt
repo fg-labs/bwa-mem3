@@ -125,6 +125,17 @@ Methylation (--meth) options:
                  In genomic/neutral a real variant in the conversion direction
                  itself (C->T at a reference C) is indistinguishable from a
                  conversion and stays hidden in NM/MD.
+   --meth-tags SPEC
+                 which Bismark tags to emit: 'all' (default), 'none', a
+                 comma-separated list (XR,XG), or ^-prefixed exclusions (^XM).
+                 Comma-separated, NOT space-separated (a second word becomes
+                 the reference). Quote ^ specs: '^XM' -- bare ^ is a negated
+                 glob in zsh with EXTENDED_GLOB.
+                 Unselected tags are not computed. XM:Z is a read-length string
+                 and dominates the BAM's aux payload; '^XM' drops it for callers
+                 that recompute from the reference (MethylDackel, biscuit).
+                 Keep XM for Bismark-family tools (bismark_methylation_extractor,
+                 methylKit, methtuple, DMRfinder, epialleleR).
    --set-as-failed f|r
                  flag alignments to the matching strand ('f' or 'r') as QC-fail (0x200)
    --chimera-qc
