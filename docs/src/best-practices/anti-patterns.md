@@ -72,8 +72,8 @@ bwa-mem3 adds several custom SAM tags that bwa-mem2 does not emit: `HN:i`
 aligner found for this read, before the `-h` supplementary cap is applied),
 and — in `--meth` mode — the Bismark-compatible `XR:Z` (read conversion
 direction), `XG:Z` (genome strand), and `XM:Z` (per-base methylation call
-string) tags. It also rewrites `@SQ` header lines in `--meth` mode
-(collapsing `f`/`r` strand prefixes back to one entry per chromosome).
+string) tags. In `--meth` mode it also builds each `@SQ` line from the original
+reference; the doubled `f`/`r` seed contigs never reach the output.
 
 > **Warning — Header and tag mismatch**
 >

@@ -79,11 +79,15 @@ bwa-mem3 neither adds nor removes tags in it.
 > which always emits `AH:*` — at the cost of the `M5`/`UR`/`AS`/`SP` metadata
 > the `.dict` carries.
 
-In methylation mode (`--meth`), the doubled reference contains sequences with
-an `f` or `r` prefix in their names. The inline BAM post-processor collapses
-these back to canonical chromosome names so that the output `@SQ` lines match
-a standard non-methylation alignment. See
-[Chimera QC and header rewriting](../methylation/post-processing.md).
+In methylation mode (`--meth`), the `f`/`r`-prefixed contigs of the doubled
+`.meth` seed reference are used for seeding only and never reach the output.
+`@SQ` is written directly from the original (un-converted) reference, so the
+lines carry the same reference names and lengths a standard non-methylation
+alignment does. They are not guaranteed to be byte-identical to it: the
+standard path can emit the index's `.hdr`/`.dict` sidecar `@SQ` records
+verbatim, whereas methylation mode builds each line from `bns->anns` and then
+merges the sidecar's identity tags onto it. See
+[Chimera QC and header construction](../methylation/post-processing.md).
 
 ### `@PG`
 
@@ -161,7 +165,7 @@ MAPQ semantics are inherited from bwa-mem2 and follow the same scoring model.
 In methylation mode, alignments identified as chimeras (longest `M`/`=`/`X`
 run covering less than 44% of the read length) have their MAPQ capped at 1 and
 the `0x200` (QC fail) flag set. See
-[Chimera QC and header rewriting](../methylation/post-processing.md).
+[Chimera QC and header construction](../methylation/post-processing.md).
 
 ---
 

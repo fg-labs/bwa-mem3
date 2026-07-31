@@ -313,7 +313,7 @@ don't collide. There is no flag to override this — `-V` is a no-op for
 
 **See also:**
 [Overview](overview.md) ·
-[Chimera QC and header rewriting](post-processing.md) ·
+[Chimera QC and header construction](post-processing.md) ·
 [SAM tags: XR, XG, XM](tags.md) ·
 [Best Practices → Methylation defaults](../best-practices/methylation.md) ·
 [CLI Reference → mem](../cli/mem.md)

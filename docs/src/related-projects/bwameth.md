@@ -36,8 +36,8 @@ G/A variant in the direction *opposite* the conversion as a mismatch (visible in
 direction itself is indistinguishable from a conversion under either design
 ([why](../methylation/overview.md#which-real-variants-stay-visible)).
 
-It rewrites the `@SQ` headers to consolidate the per-strand contig pairs back to
-canonical chromosome names, emits Bismark-compatible `XR:Z` / `XG:Z` / `XM:Z`
+It writes `@SQ` headers directly from the original reference, so output carries
+the original reference contig names, emits Bismark-compatible `XR:Z` / `XG:Z` / `XM:Z`
 auxiliary tags, and writes a `@PG ID:bwa-mem3-meth` header. The bwameth.py-style
 chimera QC heuristic is available via `--chimera-qc` (off by default — Bismark
 behavior). The [Methylation Reference](../methylation/overview.md) documents the

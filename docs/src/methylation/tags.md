@@ -32,14 +32,17 @@ biscuit's per-read methylation tools.
 | Property | Value |
 |----------|-------|
 | Type | `Z` (NUL-terminated string) |
-| Values | `CT` (aligned to original top, `f-`-prefixed contig) or `GA` (aligned to original bottom, `r-`-prefixed contig) |
-| Set by | `meth_mem_aln_to_bam` from `meth_chrom_map_t.direction` |
+| Values | `CT` (aligned to the original top strand, OT) or `GA` (aligned to the original bottom strand, OB) |
+| Set by | `meth_mem_aln_to_bam` from the winning hypothesis `mem_aln_t.meth_hypothesis` (`1` = OT → `CT`, `0` = OB → `GA`) — not from a contig-name prefix |
 | Emitted on | Mapped records only |
 
-`XG:Z` indicates which doubled-reference strand the read aligned to:
+`XG:Z` indicates which strand of the original genome the read aligned to. The
+call comes from the hypothesis that won scoring, which corresponds to the seed
+contig the read seeded against — but the contig name itself never reaches the
+output, since RNAME is an original-reference contig:
 
-- `CT` — read aligned under the OT (top-strand) hypothesis (`f`-prefixed seed contig).
-- `GA` — read aligned under the OB (bottom-strand) hypothesis (`r`-prefixed seed contig).
+- `CT` — read aligned under the OT (top-strand) hypothesis (seeded on `f`*).
+- `GA` — read aligned under the OB (bottom-strand) hypothesis (seeded on `r`*).
 
 For properly paired directional reads, R1 and R2 of a fragment naturally
 share `XG:Z`. Discordant pairs (flagged with `0x200` only when `--chimera-qc`
@@ -147,6 +150,6 @@ XM:Z:..z..h..Z..x..h.....Z..
 [Overview](overview.md) ·
 [bwameth.py drop-in mapping](bwameth-mapping.md) ·
 [Conversion details](conversion.md) ·
-[Chimera QC and header rewriting](post-processing.md) ·
+[Chimera QC and header construction](post-processing.md) ·
 [Flags: --set-as-failed, --chimera-qc](flags.md) ·
 [User Guide → Output: SAM/BAM, headers, tags](../user-guide/output.md)

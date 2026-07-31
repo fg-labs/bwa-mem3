@@ -47,7 +47,7 @@
   - [Conversion details (C->T, G->A)](methylation/conversion.md)
   - [TAPS libraries](methylation/taps.md)
   - [SAM tags: XR, XG, XM](methylation/tags.md)
-  - [Chimera QC and header rewriting](methylation/post-processing.md)
+  - [Chimera QC and header construction](methylation/post-processing.md)
   - [Flags: --meth chemistry, --meth-scoring, QC](methylation/flags.md)
   - [Migrating from bwameth.py c2t](methylation/external-c2t.md)
 - [What's Different from bwa-mem2]()

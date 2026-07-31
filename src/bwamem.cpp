@@ -3302,9 +3302,11 @@ void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str,
                  bseq1_t *s, int n, const mem_aln_t *list, int which, const mem_aln_t *m_)
 {
     SpEncodeScope _enc;   /* stage_prof: time the SAM/BAM build (all return paths) */
-    /* BAM short-circuit: meth_mode applies the bisulfite overlay (chrom
-     * consolidation, YD:Z, chimera QC), plain bam_mode uses the generic
-     * writer. Either path leaves `str` untouched. */
+    /* bam1_t short-circuit: meth_mode applies the bisulfite overlay (Bismark
+     * XR:Z/XG:Z/XM:Z, opt-in chimera QC), plain bam_mode uses the generic
+     * writer. Either path leaves `str` untouched, so callers must branch on
+     * mem_opt_records_are_bam(), not opt->bam_mode — --meth builds bam1_t even
+     * when the container is SAM text. */
     if (opt->meth_mode) {
         struct bam1_t *b = bam_writer_alloc();
         if (b == NULL)
