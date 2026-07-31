@@ -3,10 +3,14 @@
 End-to-end parity and invariant checks. `chr22_parity.sh` runs on every
 matrix row; the rest run on the canonical AVX2 row only, except
 `profile_slice_cpu.sh`, which runs from the `profiling-build` job (see below),
-and the two `ndebug_gate_lint*` scripts, which need no binary at all and run
-from the `ndebug-gate-lint` job. Each script:
+and the `ndebug_gate_lint*` and `debug_macro_flag_lint*` scripts, which need no
+binary at all and run from the `ndebug-gate-lint` and `debug-macro-flag-lint`
+jobs. Each script:
 
-- is self-contained (set -euo pipefail; explicit env-var contract)
+- is self-contained (set -euo pipefail; explicit input contract — env vars for
+  every script but the source-only lints, which instead take an optional
+  positional directory so their self-tests can aim the same checks at a fixture
+  tree)
 - emits `PASS:` on success and `FAIL:` on failure
 - returns nonzero on failure
 
@@ -32,9 +36,14 @@ from the `ndebug-gate-lint` job. Each script:
 The table is a reading guide, not an inventory — `ls test/regression/*.sh` is
 the authoritative list, and `ci.yml` is where each one is actually wired up.
 
-Each script reads its inputs from environment variables — see the comment
-block at the top of each file. `.github/workflows/ci.yml` sets those vars
-and invokes the scripts.
+Every script but the source-only lints reads its inputs from environment
+variables — see the comment block at the top of each file. The lints read no
+environment at all: `ndebug_gate_lint.sh` takes the directory to scan (default
+`src/`) and `debug_macro_flag_lint.sh` takes the repository root to check
+(default: this repository), each as an optional positional argument, and the
+two `*_selftest.sh` scripts take no input, since they build the fixture trees
+they aim those lints at. `.github/workflows/ci.yml` sets the required vars and
+invokes the scripts.
 
 One exception to "any binary will do": `profile_slice_cpu.sh` asserts on
 `--profile` output, which a default build compiles out entirely, so it needs a
