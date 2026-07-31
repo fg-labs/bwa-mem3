@@ -46,6 +46,26 @@ jobs:
       - name: No NDEBUG preprocessor gates in src/
         run: bash test/regression/ndebug_gate_lint.sh
 
+  # Same shape and rationale as the job above, kept separate so the failure
+  # reads as "the opt-in macro list drifted" rather than as an NDEBUG finding.
+  debug-macro-flag-lint:
+    name: Opt-in debug macro list (ci.yml <-> src/)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      # Runs first, for the same reason as the NDEBUG job: an empty flag set
+      # satisfies every check over it, so PASS only means something once the
+      # extraction has been shown to still detect a drifted list.
+      - name: Macro list lint still detects drift
+        run: bash test/regression/debug_macro_flag_lint_selftest.sh
+
+      - name: Opt-in macro -D list matches the macros in src/
+        run: bash test/regression/debug_macro_flag_lint.sh
+
   build-and-test:
     strategy:
       fail-fast: false
