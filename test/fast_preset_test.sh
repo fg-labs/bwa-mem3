@@ -3,8 +3,8 @@
 #
 # Asserts that `bwa-mem3 mem --fast` resolves the characterized speed levers
 # (-m 10 -y 0 --min-ext-len 30 --smem-dedup --skip-contained-ext
-# --max-extend-chains 20 --extend-mate-concordant, plus -s 2 and a lower
-# --max-extend-chains 10 under --meth), that explicit user flags override the
+# --max-extend-chains 20 --extend-mate-concordant --rescue-kmer=6, plus -s 2 and a
+# lower --max-extend-chains 10 under --meth), that explicit user flags override the
 # preset, and that the default path is untouched when --fast is absent.
 # --skip-contained-ext no-ops under --meth (internal gate), so it is omitted from
 # the meth audit line; --max-extend-chains applies under --meth too but at a
@@ -53,11 +53,12 @@ line="$(fast_line --fast)"
    && "$line" == *"--max-extend-chains 20"* \
    && "$line" == *"--adaptive-band"* \
    && "$line" == *"--extend-mate-concordant"* \
+   && "$line" == *"--rescue-kmer=6"* \
    && "$line" == *"alnreg-sort=fast"* ]] \
     || { echo "FAIL: --fast bundle wrong: '$line'" >&2; exit 1; }
 [[ "$line" != *"-s "* ]] \
     || { echo "FAIL: non-meth --fast must not set -s: '$line'" >&2; exit 1; }
-echo "OK:   --fast bundle resolves -m 10 -y 0 --min-ext-len 30 --smem-dedup --skip-contained-ext --max-extend-chains 20 --adaptive-band --extend-mate-concordant alnreg-sort=fast (no -s)"
+echo "OK:   --fast bundle resolves -m 10 -y 0 --min-ext-len 30 --smem-dedup --skip-contained-ext --max-extend-chains 20 --adaptive-band --extend-mate-concordant --rescue-kmer=6 alnreg-sort=fast (no -s)"
 
 # 2. Override precedence: an explicit flag wins *only* for its own field; the
 #    rest of the preset (including the unconditional --smem-dedup) must survive.
@@ -96,6 +97,22 @@ line="$(fast_line --fast --max-extend-chains 8)"
     || { echo "FAIL: explicit --max-extend-chains 8 should only override that lever: '$line'" >&2; exit 1; }
 echo "OK:   explicit -m/-y/--min-ext-len/--max-extend-chains override only their field; rest of preset (--adaptive-band, --extend-mate-concordant, alnreg-sort=fast, ...) survives"
 
+# --rescue-kmer is overridable both ways under --fast. The `=0` case is the one
+# that matters: 0 means "off", so a parser that treated an explicitly-set 0 as
+# "unset" would silently re-enable the preset's K=6 -- and since --rescue-kmer
+# changes MAPQ on rescued reads, that is an invisible output change. The value
+# must be attached with `=`: the option takes an OPTIONAL argument, so a
+# space-separated `--rescue-kmer 0` would leave 0 as a positional instead.
+line="$(fast_line --fast --rescue-kmer=0)"
+[[ "$line" == *"-m 10"* && "$line" == *"--smem-dedup"* \
+   && "$line" == *"--rescue-kmer=0"* \
+   && "$line" == *"alnreg-sort=fast"* ]] \
+    || { echo "FAIL: explicit --rescue-kmer=0 should opt out of just that lever: '$line'" >&2; exit 1; }
+line="$(fast_line --fast --rescue-kmer=11)"
+[[ "$line" == *"--rescue-kmer=11"* && "$line" == *"--max-extend-chains 20"* ]] \
+    || { echo "FAIL: explicit --rescue-kmer=11 should override the preset K: '$line'" >&2; exit 1; }
+echo "OK:   explicit --rescue-kmer=0/=11 overrides the preset K without disturbing the rest"
+
 # 3. Default contract: no --fast => no audit line at all.
 "$bin" mem "$ref" "$reads" >/dev/null 2>"$err" || { echo "FAIL: plain mem nonzero" >&2; exit 1; }
 ! grep -qE '^\[M::main_mem\] --fast:' "$err" \
@@ -117,6 +134,10 @@ if "$bin" index --meth "$mdir/ref.fa" >/dev/null 2>&1; then
         || { echo "FAIL: --max-extend-chains applies under --meth (cap 10); must be in audit line: '$line'" >&2; exit 1; }
     [[ "$line" == *"--extend-mate-concordant"* ]] \
         || { echo "FAIL: --fast --meth must enable --extend-mate-concordant: '$line'" >&2; exit 1; }
+    # --rescue-kmer applies under --meth as well (the anchor scan collapses to the
+    # pair's bisulfite alphabet there), so the meth audit line must report it too.
+    [[ "$line" == *"--rescue-kmer=6"* ]] \
+        || { echo "FAIL: --fast --meth must enable --rescue-kmer=6: '$line'" >&2; exit 1; }
     # The dedup-sort lever is not meth-gated; it must be reported under --meth too.
     [[ "$line" == *"alnreg-sort=fast"* ]] \
         || { echo "FAIL: --fast --meth must enable alnreg-sort=fast: '$line'" >&2; exit 1; }

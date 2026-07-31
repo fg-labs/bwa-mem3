@@ -19,9 +19,14 @@ Options:
     -D FLOAT      drop chains shorter than FLOAT fraction of the longest overlapping chain [0.50]
     -W INT        discard a chain if seeded bases shorter than INT [0]
     -m INT        perform at most INT rounds of mate rescues for each read [50]
+    --rescue-kmer[=K]  band the mate-rescue Smith-Waterman to a K-mer exact-match anchor
+                  diagonal, falling back to the full insert window when no anchor. K is
+                  1..16 (bare = 6, =0 = off); the value must be attached with '='.
+                  Opt-in speedup, NOT byte-identical; enabled by --fast [off]
+    --rescue-band INT  half-width (bp) of the band around the anchor diagonal, 1..1000000 [50]
     -S            skip mate rescue
     -P            skip pairing; mate rescue performed unless -S also in use
-    --fast        speed preset: -m 10 -y 0 --min-ext-len 30 --smem-dedup
+    --fast        speed preset: -m 10 -y 0 --min-ext-len 30 --smem-dedup --rescue-kmer=6
                   --skip-contained-ext --max-extend-chains 20 --adaptive-band
                   --extend-mate-concordant (under --meth: --max-extend-chains 10,
                   -s 2). Opt-in; explicit

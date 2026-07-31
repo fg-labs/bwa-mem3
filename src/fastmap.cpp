@@ -1491,9 +1491,16 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "    -D FLOAT      drop chains shorter than FLOAT fraction of the longest overlapping chain [%.2f]\n", opt->drop_ratio);
     fprintf(stderr, "    -W INT        discard a chain if seeded bases shorter than INT [0]\n");
     fprintf(stderr, "    -m INT        perform at most INT rounds of mate rescues for each read [%d]\n", opt->max_matesw);
+    fprintf(stderr, "    --rescue-kmer[=K]  band the mate-rescue Smith-Waterman to a K-mer exact-match anchor\n");
+    fprintf(stderr, "                  diagonal, falling back to the full insert window when no anchor. K is\n");
+    fprintf(stderr, "                  1..%d (bare = %d, =0 = off); the value must be attached with '='.\n",
+            MEM_RESCUE_KMER_MAX, MEM_RESCUE_KMER_DEFAULT);
+    fprintf(stderr, "                  Opt-in speedup, NOT byte-identical; enabled by --fast [off]\n");
+    fprintf(stderr, "    --rescue-band INT  half-width (bp) of the band around the anchor diagonal, 1..%d [%d]\n",
+            MEM_RESCUE_BAND_MAX, opt->rescue_band);
     fprintf(stderr, "    -S            skip mate rescue\n");
     fprintf(stderr, "    -P            skip pairing; mate rescue performed unless -S also in use\n");
-    fprintf(stderr, "    --fast        speed preset: -m 10 -y 0 --min-ext-len 30 --smem-dedup\n");
+    fprintf(stderr, "    --fast        speed preset: -m 10 -y 0 --min-ext-len 30 --smem-dedup --rescue-kmer=6\n");
     fprintf(stderr, "                  --skip-contained-ext --max-extend-chains 20 --adaptive-band\n");
     fprintf(stderr, "                  --extend-mate-concordant (under --meth: --max-extend-chains 10,\n");
     fprintf(stderr, "                  -s 2). Opt-in; explicit\n");
@@ -1853,6 +1860,8 @@ int main_mem(int argc, char *argv[])
         OPT_COMPAT,
         OPT_CHUNK_CAP,
         OPT_COHORT_SLICES,
+        OPT_RESCUE_KMER,
+        OPT_RESCUE_BAND,
         OPT_COHORT_RAMP_RATIO,
         OPT_COHORT_RAMP_FIRST,
 #ifdef STAGE_PROF
@@ -1871,6 +1880,8 @@ int main_mem(int argc, char *argv[])
         {"extend-mate-concordant",   optional_argument, 0, OPT_EXTEND_MATE_CONCORDANT},
         {"chunk-cap",                required_argument, 0, OPT_CHUNK_CAP},
         {"cohort-slices",            required_argument, 0, OPT_COHORT_SLICES},
+        {"rescue-kmer",              optional_argument, 0, OPT_RESCUE_KMER},
+        {"rescue-band",              required_argument, 0, OPT_RESCUE_BAND},
         {"cohort-ramp-ratio",        required_argument, 0, OPT_COHORT_RAMP_RATIO},
         {"cohort-ramp-first",        required_argument, 0, OPT_COHORT_RAMP_FIRST},
         {"meth",                     optional_argument, 0, OPT_METH},
@@ -2147,6 +2158,42 @@ int main_mem(int argc, char *argv[])
         }
         else if (c == OPT_SMEM_DEDUP) opt->smem_dedup = 1;
         else if (c == OPT_FAST) fast = 1;
+        else if (c == OPT_RESCUE_KMER) {
+            /* Validated rather than atoi'd for the same reason as --chunk-cap
+             * below: atoi maps every unparseable value to 0, and 0 here means
+             * "off" -- so `--rescue-kmer=x` would silently disable the option it
+             * was meant to configure, and would keep it disabled under --fast
+             * (which defers to any explicitly-set value). K above the uint32 code
+             * width is rejected rather than clamped so `--rescue-kmer=20` cannot
+             * masquerade as a distinct setting from K=16. */
+            int64_t k = MEM_RESCUE_KMER_DEFAULT;   /* bare --rescue-kmer */
+            if (optarg && parse_bounded_i64(optarg, 0, MEM_RESCUE_KMER_MAX, &k) != 0) {
+                fprintf(stderr, "ERROR: --rescue-kmer requires an integer in "
+                                "0..%d (0 = off), got '%s'\n",
+                        MEM_RESCUE_KMER_MAX, optarg);
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+            opt->rescue_kmer = (int)k;
+            opt0.rescue_kmer = 1;
+        }
+        else if (c == OPT_RESCUE_BAND) {
+            /* Validated like --rescue-kmer above. A bare atoi accepted both
+             * unparseable text and negatives, and the kernel's `band > 0 ? band
+             * : 50` guard then turned either into the default -- so a typo read
+             * as a deliberate band width but silently ran the default one. */
+            int64_t band = 0;
+            if (parse_bounded_i64(optarg, 1, MEM_RESCUE_BAND_MAX, &band) != 0) {
+                fprintf(stderr, "ERROR: --rescue-band requires an integer in "
+                                "1..%d bp, got '%s'\n",
+                        MEM_RESCUE_BAND_MAX, optarg);
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+            opt->rescue_band = (int)band;
+        }
         else if (c == OPT_CHUNK_CAP) {
             /* Validated the same way as --supp-rep-hard-cap below rather than via
              * a bare atoll, which maps every unparseable value to 0 -- and 0 here
@@ -2429,6 +2476,12 @@ int main_mem(int argc, char *argv[])
         if (!opt0.max_matesw)   opt->max_matesw   = 10;  /* -m 10 */
         if (!opt0.max_mem_intv) opt->max_mem_intv = 0;   /* -y 0  */
         if (!opt0.min_ext_len)  opt->min_ext_len  = 30;  /* --min-ext-len 30 */
+        /* Band mate rescue to a 6-mer anchor diagonal (--rescue-kmer=6). Opt-in,
+         * not byte-identical, but truth-based ROC (holodeck, hg38 + bisulfite
+         * chr20) shows accuracy neutral-to-positive and confident (MAPQ>=60)
+         * mismaps unchanged; k=6 is the measured wall-time peak (~-22% on the
+         * rescue-heavy WGS tail). */
+        if (!opt0.rescue_kmer)  opt->rescue_kmer  = MEM_RESCUE_KMER_DEFAULT;
         /* --max-extend-chains: 5 for non-meth; 10 under --meth. A 7-point ablation
          * ({0,5,10,20,50,100,1000}) on 1M sim-meth PE pairs (with mate-concordant
          * rescue on, below) shows chr-accuracy flat (0.9908) at every cap but the
@@ -2637,15 +2690,20 @@ int main_mem(int argc, char *argv[])
          * grep for, this line is the only record a run leaves of a lever that
          * changes output (see the comparator commentary in src/bwamem.cpp). It is
          * not meth-gated, so it appears on both branches. */
+        /* --rescue-kmer reports its RESOLVED K, and reports `=0` when the user opted
+         * back out, because 0 is the one --fast lever whose off-state is invisible
+         * anywhere else in the run -- it changes MAPQ on rescued reads, so which way
+         * it resolved has to be on the record. It applies under --meth too (the
+         * anchor scan collapses to 3 letters there), so it is on both branches. */
         if (opt->meth_mode)
             /* --skip-contained-ext is set but no-ops under --meth (internal gate), so it is
              * intentionally omitted from the meth audit line to reflect the effective levers.
              * --adaptive-band is set unconditionally and applies under --meth, so it stays. */
-            fprintf(stderr, "[M::%s] --fast: -m %d -y %ld --min-ext-len %d --smem-dedup --max-extend-chains %d --adaptive-band -s %d --extend-mate-concordant alnreg-sort=fast\n",
-                    __func__, opt->max_matesw, (long)opt->max_mem_intv, opt->min_ext_len, opt->max_extend_chains, opt->split_width);
+            fprintf(stderr, "[M::%s] --fast: -m %d -y %ld --min-ext-len %d --smem-dedup --max-extend-chains %d --adaptive-band -s %d --extend-mate-concordant --rescue-kmer=%d alnreg-sort=fast\n",
+                    __func__, opt->max_matesw, (long)opt->max_mem_intv, opt->min_ext_len, opt->max_extend_chains, opt->split_width, opt->rescue_kmer);
         else
-            fprintf(stderr, "[M::%s] --fast: -m %d -y %ld --min-ext-len %d --smem-dedup --skip-contained-ext --max-extend-chains %d --adaptive-band --extend-mate-concordant alnreg-sort=fast\n",
-                    __func__, opt->max_matesw, (long)opt->max_mem_intv, opt->min_ext_len, opt->max_extend_chains);
+            fprintf(stderr, "[M::%s] --fast: -m %d -y %ld --min-ext-len %d --smem-dedup --skip-contained-ext --max-extend-chains %d --adaptive-band --extend-mate-concordant --rescue-kmer=%d alnreg-sort=fast\n",
+                    __func__, opt->max_matesw, (long)opt->max_mem_intv, opt->min_ext_len, opt->max_extend_chains, opt->rescue_kmer);
         /* --fast also caps the batch size, which keeps the read/compute/write
          * pipeline overlapped at high -t. It re-partitions the input and so is not
          * byte-identical -- which --fast already is not -- hence it rides here

@@ -526,6 +526,18 @@ jobs:
           FIXTURES="$GITHUB_WORKSPACE/test/fixtures" \
           bash test/regression/chunk_cap_optin.sh
 
+      - name: --rescue-kmer/--rescue-band reject malformed values
+        if: matrix.canonical == true
+        # Both were parsed with atoi(), which maps unparseable text to 0. For
+        # --rescue-kmer 0 means "off" and counts as explicitly set, so a typo
+        # would silently disable the largest lever in --fast; for --rescue-band
+        # the kernel's `band > 0 ? band : 50` guard turned a bad value back into
+        # the default. Neither is visible in the output.
+        run: |
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          FIXTURES="$GITHUB_WORKSPACE/test/fixtures" \
+          bash test/regression/rescue_kmer_options.sh
+
       - name: --supp-rep-hard-cap repetitive-seed regression
         if: matrix.canonical == true
         run: |

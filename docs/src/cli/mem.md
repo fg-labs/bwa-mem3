@@ -348,6 +348,40 @@ on data where the default (50) wastes time on unrescuable pairs. See
 [Settings profiles](../best-practices/settings-profiles.md) for the benchmarked
 `-m 10` recommendation.
 
+#### `--rescue-kmer[=K]` / `--rescue-band INT` — banded mate rescue (opt-in, not byte-identical)
+
+Mate rescue Smith-Watermans a read against a reference window sized by the insert
+distribution — on the order of a kilobase for a ~150 bp read — and that unbanded
+window is the single largest kernel in the aligner on paired WGS. `--rescue-kmer`
+finds the read's dominant K-mer exact-match diagonal within the window and bands the
+rescue SW to that diagonal ± `--rescue-band` (default 50 bp), falling back to the full
+window when no anchor is found — or when the banded window would come out shorter than
+the read, which cannot host a full-length rescue alignment. The `kswv` kernel is
+unchanged — it is simply handed a shorter reference window — so the speedup comes from
+doing far less DP.
+
+`K` ranges over `1…16` — a K-mer code has to fit the `uint32` the anchor index packs it
+into, so larger values are rejected rather than silently treated as `K=16`. Bare
+`--rescue-kmer` selects `K=6`. Smaller K makes the anchor scan degenerate and slow (the
+diagonal vote's hash chains grow as `read_length / alphabet^K`); larger K lowers the
+fraction of rescues that find an anchor. K=6 is the measured wall-time peak (~−22% on the
+rescue-heavy WGS tail). `--rescue-band` takes `1…1000000` bp; the default 50 bp band means
+the narrowed window is the read length plus 100 bp, against the ~kilobase full window.
+Under `--meth` the anchor scan collapses to three letters on each pair's bisulfite strand
+(C→T for OT, G→A for OB) so exact K-mers survive the conversion; the SW still scores the
+real bases with the methylation matrix.
+
+The value must be attached with `=`: `--rescue-kmer` takes an *optional* argument, so
+`--rescue-kmer 6` selects the bare default and leaves `6` as a positional argument. Write
+`--rescue-kmer=6`.
+
+**Off by default and NOT byte-identical.** A narrowed window computes a different
+suboptimal alignment score, so a rescued read's `csub` — and therefore its MAPQ — can
+change; ~0.2% of records move. Truth-based ROC (holodeck simulated hg38 WGS, and
+bisulfite chr20) shows accuracy neutral-to-positive and confident (MAPQ ≥ 60) mismaps
+unchanged across `K = 1…16`. Enabled by [`--fast`](#--fast--speed-preset-opt-in-not-byte-identical);
+use `--rescue-kmer=0` to force it off even under `--fast`.
+
 #### `-S` — skip mate rescue
 
 Disables mate rescue entirely. Faster but may reduce sensitivity for
@@ -500,7 +534,7 @@ the alignment score and mapping quality for each secondary hit.
 `--fast` is a one-flag shorthand for the characterized speed levers:
 
 ```text
-bwa-mem3 mem --fast  ≡  -m 10 -y 0 --min-ext-len 30 --smem-dedup --skip-contained-ext --max-extend-chains 20 --adaptive-band --extend-mate-concordant
+bwa-mem3 mem --fast  ≡  -m 10 -y 0 --min-ext-len 30 --smem-dedup --skip-contained-ext --max-extend-chains 20 --adaptive-band --extend-mate-concordant --rescue-kmer=6
 ```
 
 `--skip-contained-ext` is byte-identical to the default on non-meth short- and
@@ -522,6 +556,13 @@ not run at default settings regardless of this flag (see
 mate-concordant chain the cap would otherwise drop — and is included for both non-meth and `--meth`
 `--fast` (see
 [Settings profiles → `--extend-mate-concordant`](../best-practices/settings-profiles.md#mate-concordant-chain-retention---extend-mate-concordant)).
+
+`--rescue-kmer=6` (see
+[`--rescue-kmer`](#--rescue-kmerk----rescue-band-int--banded-mate-rescue-opt-in-not-byte-identical))
+bands the mate-rescue Smith-Waterman to a 6-mer anchor diagonal. It is the largest single
+lever in `--fast` on paired WGS (mate rescue is the biggest kernel there) and is validated
+accuracy-neutral by truth-based ROC in both non-meth and `--meth` modes. Pass `--rescue-kmer=0`
+to opt back out while keeping the rest of `--fast`.
 
 `--fast` also flips one lever that has **no flag of its own**: the sort that orders alignment
 regions by reference end position before the order-sensitive dedup/patch pass. The default
