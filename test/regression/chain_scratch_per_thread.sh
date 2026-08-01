@@ -74,18 +74,15 @@ PY
 # Report the isolated per-thread scratch allocation, in MB, for a given -t / -K.
 scratch_mb_for() {
     local t="$1" k="$2" err="$WORK/t$1k$2.err"
-    local rc mb
+    local rc=0 mb
 
     # The exit status is asserted, not assumed, for two reasons. worker_alloc
     # reports the scratch line early, so a run that printed it and then died
     # would otherwise yield a perfectly comparable number from a failed run. And
     # the per-chunk resize guard in kt_pipeline step 1 reports a violation by
     # exiting non-zero -- see the note below on why that guard exists.
-    set +e
     "$BWA_MEM3" mem -t "$t" -K "$k" "$CHR22_FA" \
-        "$WORK/r1.fq.gz" "$WORK/r2.fq.gz" > /dev/null 2> "$err"
-    rc=$?
-    set -e
+        "$WORK/r1.fq.gz" "$WORK/r2.fq.gz" > /dev/null 2> "$err" || rc=$?
     if [ "$rc" -ne 0 ]; then
         echo "FAIL: 'bwa-mem3 mem -t $t -K $k' exited $rc" >&2
         tail -20 "$err" >&2
@@ -95,9 +92,7 @@ scratch_mb_for() {
     # grep exits 1 when the line is absent, which under `set -e` (plus pipefail)
     # would abort the script on the assignment itself and never reach the
     # diagnostic below -- so the failure is caught explicitly instead.
-    set +e
-    mb=$(grep -m1 "per-thread chaining scratch" "$err" | sed 's/.*scratch: *//; s/ MB.*//')
-    set -e
+    mb="$(grep -m1 "per-thread chaining scratch" "$err" | sed 's/.*scratch: *//; s/ MB.*//')" || mb=""
     if [ -z "$mb" ]; then
         echo "FAIL: could not find the per-thread scratch line in $err" >&2
         echo "      (worker_alloc must report it; see src/fastmap.cpp)" >&2

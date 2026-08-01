@@ -29,12 +29,10 @@ OUT_DIR="$(mktemp -d -t bwamem3-enforce-XXXXXX)"
 trap 'rm -rf "$OUT_DIR"' EXIT
 
 # --- Scenario 1: bwa-mem3 mem refuses ---
-set +e
+rc=0
 BWAMEM3_TESTING_HOST_TIER="$INJECTED_TIER" \
     "$BWA_MEM3_TESTING" mem "$PARITY_FA" /dev/null /dev/null \
-    > "$OUT_DIR/mem.stdout" 2> "$OUT_DIR/mem.stderr"
-rc=$?
-set -e
+    > "$OUT_DIR/mem.stdout" 2> "$OUT_DIR/mem.stderr" || rc=$?
 
 if [[ $rc -ne 2 ]]; then
     echo "FAIL: bwa-mem3 mem exited $rc (expected 2)" >&2
@@ -66,11 +64,9 @@ if ! grep -q 'BASELINE_ARCH' "$OUT_DIR/mem.stderr"; then
 fi
 
 # --- Scenario 2: bwa-mem3 version warns but exits 0 ---
-set +e
+rc=0
 BWAMEM3_TESTING_HOST_TIER="$INJECTED_TIER" \
-    "$BWA_MEM3_TESTING" version > "$OUT_DIR/version.stdout" 2> "$OUT_DIR/version.stderr"
-rc=$?
-set -e
+    "$BWA_MEM3_TESTING" version > "$OUT_DIR/version.stdout" 2> "$OUT_DIR/version.stderr" || rc=$?
 
 if [[ $rc -ne 0 ]]; then
     echo "FAIL: bwa-mem3 version exited $rc (expected 0)" >&2

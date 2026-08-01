@@ -199,14 +199,11 @@ echo "  EOF-on-boundary: truncating to $pairs pairs ($expected records), the fir
 echo "                   partial slice's exact size"
 
 align_eof() { # $1 = tag, $2 = --cohort-slices value, $3 = slice-every-cohort (0/1)
-    local tag="$1" slices="$2" all="$3" n rc
-    set +e
+    local tag="$1" slices="$2" all="$3" n rc=0
     BWA_MEM3_COHORT_SLICE_ALL="$all" \
         "$BWA_MEM3" mem -t 4 -K "$K" --cohort-slices "$slices" \
         "$CHR22_FA" "$WORK/eof.r1.fastq.gz" "$WORK/eof.r2.fastq.gz" \
-        > "$WORK/$tag.full.sam" 2> "$WORK/$tag.err"
-    rc=$?
-    set -e
+        > "$WORK/$tag.full.sam" 2> "$WORK/$tag.err" || rc=$?
     [ "$rc" -eq 0 ] || {
         echo "FAIL: $tag exited $rc" >&2
         tail -15 "$WORK/$tag.err" >&2

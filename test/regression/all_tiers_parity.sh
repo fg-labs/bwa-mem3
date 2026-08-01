@@ -174,12 +174,10 @@ for vi in "${!VARIANT_LABELS[@]}"; do
         # whole script with no message at all -- the aligner's stderr goes to a
         # per-tier log, so the operator saw "Generating SAM for tier=X" and a
         # bare exit code. Say what happened and show the log.
-        set +e
+        rc=0
         BWAMEM3_FORCE_TIER="$t" "$BWA_MEM3" mem -t 1 ${vargs[@]+"${vargs[@]}"} \
             "$PARITY_FA" "$PARITY_R1" "$PARITY_R2" \
-            > "$OUT_DIR/$vlabel.$t.sam" 2> "$OUT_DIR/$vlabel.$t.log"
-        rc=$?
-        set -e
+            > "$OUT_DIR/$vlabel.$t.sam" 2> "$OUT_DIR/$vlabel.$t.log" || rc=$?
         if [[ $rc -ne 0 ]]; then
             echo "FAIL: [$vlabel] bwa-mem3 exited $rc at tier=$t" >&2
             sed 's/^/      /' "$OUT_DIR/$vlabel.$t.log" | tail -10 >&2
