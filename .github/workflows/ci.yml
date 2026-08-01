@@ -276,8 +276,14 @@ jobs:
       # line. It was wired only into `make test`, which no workflow invokes, so
       # until now it ran nowhere in CI. Every row rather than the canonical one:
       # the lines it checks are exactly what differs across arch and floor.
+      #
+      # EXPECTED_FLOOR makes the floor line an assertion rather than a presence
+      # check -- without it the row only proves the banner has a floor, not that
+      # it names the tier this row was built for. The script skips the
+      # comparison when EXPECTED_FLOOR is empty, so the arch_flag="" rows (ARM,
+      # macOS, single-binary) still run the rest of the checks.
       - name: Version banner regression
-        run: BWA_MEM3=./bwa-mem3 bash test/regression/version_banner.sh
+        run: BWA_MEM3=./bwa-mem3 EXPECTED_FLOOR=${{ matrix.arch_flag }} bash test/regression/version_banner.sh
 
       - name: Build doctest framework and unit binary
         # Invoke via the parent `test-binaries` target so ARCH_FLAGS
@@ -809,12 +815,48 @@ jobs:
           make clean
           make -j"$(nproc)" arch=${{ matrix.arch_flag }} \
             CXX=${{ matrix.cxx || 'g++' }} \
+            USE_MIMALLOC=${{ matrix.use_mimalloc }} \
             EXTRA_CXXFLAGS="-DBWA_MEM3_DEBUG_CHN_FLT_XCHECK -DBWA_MEM3_DEBUG_RID_CHECK -DBWA_MEM3_DEBUG_UNGAPPED_XCHECK -DBSW8_ASSERT_ENVELOPE -DBWA_MEM3_DEBUG_POISON -DBWAMEM3_UGP_PROFILE=1"
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           CHR22_FA=/tmp/chr22/chr22.fa \
           BWA_CHR22_FA=/tmp/chr22/bwa_chr22.fa \
           CHR22_SIM_DIR=/tmp/chr22-sim \
           bash test/regression/chr22_parity.sh
+
+      - name: SIMD floor enforcement (TESTING_BUILD, injected below-floor tier)
+        if: matrix.canonical == true
+        # What happens when the binary lands on a host older than the floor it
+        # was built for is a user-facing promise: refuse with exit 2 and a
+        # readable [E::bwamem3] message, not a SIGILL. host_floor_enforce.sh
+        # asserts exactly that, using the BWAMEM3_TESTING_HOST_TIER hook to
+        # inject a below-floor tier, and it had never run in CI -- it hangs off
+        # `test-injection`, a target no workflow invoked.
+        #
+        # Invoked through the target rather than by calling the script, so the
+        # env contract (injected tier, PARITY_FA) lives in one place and the
+        # target itself stays exercised. The row is avx2, so sse41 is below
+        # floor. The reference is never opened -- the precheck fires first --
+        # so /dev/null is a real fixture here, not a shortcut.
+        #
+        # Placed here for the same reason as the step above: it replaces
+        # $GITHUB_WORKSPACE/bwa-mem3 with a differently-configured binary, and
+        # the ASAN step that follows does its own `make clean`. The flags are
+        # repeated on the second `make` so it sees the same configuration and
+        # treats the build as up to date instead of rebuilding.
+        #
+        # USE_MIMALLOC is carried from the row rather than left to the Makefile
+        # default, which is what every other build step here does. TESTING_BUILD
+        # is meant to vary one thing against the row's configuration; the
+        # canonical row happens to be USE_MIMALLOC=1 and so is the default, so
+        # omitting it is a no-op only until that row changes.
+        run: |
+          make clean
+          make -j"$(nproc)" arch=${{ matrix.arch_flag }} \
+            CXX=${{ matrix.cxx || 'g++' }} \
+            USE_MIMALLOC=${{ matrix.use_mimalloc }} TESTING_BUILD=1
+          make test-injection arch=${{ matrix.arch_flag }} \
+            CXX=${{ matrix.cxx || 'g++' }} \
+            USE_MIMALLOC=${{ matrix.use_mimalloc }} TESTING_BUILD=1
 
       - name: Short-read SE smoke (chr22, ASAN, dense+variable-length)
         if: matrix.canonical == true

@@ -1,11 +1,13 @@
 # Regression scripts
 
-End-to-end parity and invariant checks. `chr22_parity.sh` runs on every
-matrix row; the rest run on the canonical AVX2 row only, except
-`profile_slice_cpu.sh`, which runs from the `profiling-build` job (see below),
-and the `ndebug_gate_lint*` and `debug_macro_flag_lint*` scripts, which need no
-binary at all and run from the `ndebug-gate-lint` and `debug-macro-flag-lint`
-jobs. Each script:
+End-to-end parity and invariant checks. `chr22_parity.sh` and
+`version_banner.sh` run on every matrix row; the rest run on the canonical
+AVX2 row only, except for the ones wired to a job of their own:
+`profile_slice_cpu.sh` runs from `profiling-build` (see below), and the
+`ndebug_gate_lint*`, `debug_macro_flag_lint*`, `shell_lint*` and
+`regression_coverage_lint*` pairs need no binary at all and run from
+`ndebug-gate-lint`, `debug-macro-flag-lint`, `shell-lint` and
+`regression-coverage-lint` respectively. Each script:
 
 - is self-contained (set -euo pipefail; explicit input contract — env vars for
   every script but the source-only lints, which instead take an optional
@@ -32,8 +34,11 @@ jobs. Each script:
 | `ndebug_gate_lint_selftest.sh` | the lint above still flags real gates, so its `PASS` means something | "NDEBUG gate lint still detects gates"              |
 | `debug_macro_flag_lint.sh`   | the opt-in macro build's `-D` list and the `BWA_MEM3_DEBUG_*` macros in `src/` still name each other | "Opt-in macro -D list matches the macros in src/"   |
 | `debug_macro_flag_lint_selftest.sh` | the lint above still detects a drifted list, so its `PASS` means something | "Macro list lint still detects drift"               |
+| `shell_lint.sh`              | every tracked `*.sh` is shellcheck-clean and shfmt-formatted           | "Tracked shell scripts are shellcheck-clean and shfmt-formatted" |
+| `shell_lint_selftest.sh`     | the lint above still rejects bad scripts, so its `PASS` means something | "Shell lint still detects bad scripts"             |
 | `regression_coverage_lint.sh` | every script in this directory is named by a CI workflow, or by a Makefile target CI invokes — not just by `make test` | "Every regression script is run by CI"              |
 | `regression_coverage_lint_selftest.sh` | the lint above still detects an unrun script, so its `PASS` means something | "Coverage lint still detects an unrun script"       |
+| `host_floor_enforce.sh`      | below-floor hosts get exit 2 + a readable error, not a SIGILL (needs `TESTING_BUILD=1`) | "SIMD floor enforcement (TESTING_BUILD, injected below-floor tier)" |
 | `version_banner.sh`          | `bwa-mem3 version` prints the SIMD floor and runtime tier lines        | "Version banner regression"                         |
 
 The table is a reading guide, not an inventory — `ls test/regression/*.sh` is

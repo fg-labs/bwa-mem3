@@ -872,9 +872,13 @@ shell-fix:
 # Regression test that requires a binary built with TESTING_BUILD=1
 # (enables BWAMEM3_TESTING_HOST_TIER env-var injection). Not invoked by
 # the default `test` target because it requires a non-production build.
-# No workflow invokes this target, so host_floor_enforce.sh currently runs
-# nowhere in CI; test/regression/regression_coverage_lint.sh records that
-# as an explicit exemption rather than letting it pass for coverage.
+# CI invokes this target on the canonical row, after rebuilding in-row with
+# TESTING_BUILD=1 (see "SIMD floor enforcement" in .github/workflows/ci.yml).
+# Keep it invoked from there -- and do not treat
+# test/regression/regression_coverage_lint.sh as the backstop for that. It
+# counts a script as covered when a workflow *names* it, and that step's own
+# explanatory comment names host_floor_enforce.sh, so deleting the `make
+# test-injection` line would leave the lint green.
 test-injection: bwa-mem3
 	BWA_MEM3_TESTING=./bwa-mem3 INJECTED_TIER=sse41 PARITY_FA=/dev/null \
 		./test/regression/host_floor_enforce.sh
