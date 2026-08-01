@@ -41,7 +41,18 @@ fi
 # Optional argument so debug_macro_flag_lint_selftest.sh can aim the same
 # checks at a fixture tree; there is no other way to tell "the lists agree"
 # apart from "the extraction stopped extracting".
+#
+# Checked rather than left to `cd` to fail under `set -e`: bash's own `cd:` line
+# carries no FAIL: prefix, so the one way of pointing this lint at nothing that
+# is reachable from the command line would be the one failure a caller scanning
+# for the family's format does not see. Same guard as
+# test/regression/regression_coverage_lint.sh, the other lint taking this
+# argument.
 if (($# == 1)); then
+    if [[ ! -d $1 ]]; then
+        echo "FAIL: '$1' is not a directory -- nothing was checked" >&2
+        exit 1
+    fi
     cd "$1"
 fi
 
