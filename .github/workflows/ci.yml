@@ -127,6 +127,23 @@ jobs:
       - name: Tracked shell scripts are shellcheck-clean and shfmt-formatted
         run: bash test/regression/shell_lint.sh
 
+  # Fourth source-only lint, same shape as the three above. Kept separate so the
+  # failure reads as "a regression script runs nowhere" on its own line.
+  regression-coverage-lint:
+    name: Regression scripts are run by CI
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Coverage lint still detects an unrun script
+        run: bash test/regression/regression_coverage_lint_selftest.sh
+
+      - name: Every regression script is run by CI
+        run: bash test/regression/regression_coverage_lint.sh
+
   build-and-test:
     strategy:
       fail-fast: false
@@ -252,6 +269,15 @@ jobs:
 
       - name: Verify binary
         run: ./bwa-mem3 version
+
+      # `./bwa-mem3 version` above only proves the binary runs. The regression
+      # script asserts what the banner actually says -- the SIMD floor and
+      # runtime tier lines, and that BWAMEM3_FORCE_TIER downgrades the runtime
+      # line. It was wired only into `make test`, which no workflow invokes, so
+      # until now it ran nowhere in CI. Every row rather than the canonical one:
+      # the lines it checks are exactly what differs across arch and floor.
+      - name: Version banner regression
+        run: BWA_MEM3=./bwa-mem3 bash test/regression/version_banner.sh
 
       - name: Build doctest framework and unit binary
         # Invoke via the parent `test-binaries` target so ARCH_FLAGS
