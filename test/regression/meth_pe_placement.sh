@@ -53,15 +53,26 @@ emit() { printf '@%s\n%s\n+\n%s\n' "$1" "$2" "$Q" > "$3"; }
 "$BWA_MEM3" index --meth ref.fa > /dev/null 2>&1 || fail "index --meth nonzero exit"
 
 # Decode one mate (mate-flag bit 64=READ1, 128=READ2) from $1.bam.
+#
+# mawk keeps the first matching record and prints it from END rather than
+# `exit`ing on the match. Quitting early closed the pipe under samtools, and the
+# old `read ... < <(get ...)` discarded samtools' status on top of that -- so a
+# truncated or unparseable BAM whose first record happened to satisfy every
+# assertion below would pass. Draining the stream lets pipefail see a real
+# samtools failure, and check() tests get()'s status before parsing fields.
 get() {
     samtools view "$1" | mawk -v bit="$2" '
-    (int($2/bit) % 2) == 1 {
+    out == "" && (int($2/bit) % 2) == 1 {
         rev = (int($2/16) % 2); as=""; nm=""; xr=""; nconv=0;
         for (i=12;i<=NF;i++){ if($i~/^AS:i:/)as=substr($i,6); if($i~/^NM:i:/)nm=substr($i,6); if($i~/^XR:Z:/)xr=substr($i,6); if($i~/^XM:Z:/){xm=substr($i,6); nconv=gsub(/[zxhu]/,"",xm)} }
-        print $3, $4, $5, rev, $6, as, nm, xr, nconv; exit }'
+        out = $3 " " $4 " " $5 " " rev " " $6 " " as " " nm " " xr " " nconv }
+    END { if (out != "") print out }'
 }
 check() { # $1 bam  $2 mateflag  $3 label  $4 pos  $5 rev  $6 xr  $7 as  $8 nconv
-    read -r rn pos mapq rev cig as nm xr nconv < <(get "$1" "$2")
+    local fields
+    fields="$(get "$1" "$2")" || fail "$3: reading $1 failed (samtools/mawk exited non-zero)"
+    [ -n "$fields" ] || fail "$3: no record with mate flag $2 in $1"
+    read -r rn pos mapq rev cig as nm xr nconv <<< "$fields"
     [ "$rn" = "chrA" ] || fail "$3: RNAME $rn, want chrA"
     [ "$pos" = "$4" ] || fail "$3: POS $pos, want $4 (remap placement)"
     [ "$rev" = "$5" ] || fail "$3: strand rev=$rev, want $5 (reverse-strand re-encode)"

@@ -56,12 +56,16 @@ for budget_mib in 128 512 2048; do
         cat "$TIMING" | tail -20
         exit 1
     }
-    peak="$(parse_peak "$TIMING")"
-    [[ -n "$peak" ]] || {
+    # parse_peak's grep exits non-zero when the timing output has no matching
+    # line, and under `set -e` that status ends the script on the assignment
+    # itself -- so the diagnostic below never printed and an unparseable timing
+    # file died silently. Fold the failure into the same branch as an empty
+    # value so both reach the message.
+    if ! peak="$(parse_peak "$TIMING")" || [[ -z "$peak" ]]; then
         echo "FAIL: could not parse peak RSS"
         cat "$TIMING"
         exit 1
-    }
+    fi
     if [[ "$peak" -gt "$slack_bytes" ]]; then
         echo "FAIL: --max-memory ${budget_mib}M -> peak $((peak / 1024 / 1024)) MiB (budget ${budget_mib}M + 10% = $((slack_bytes / 1024 / 1024)) MiB)"
         FAIL=1

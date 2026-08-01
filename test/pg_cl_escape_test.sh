@@ -96,9 +96,14 @@ assert_pg_well_formed() {
 
     # Belt-and-braces: exactly one `ID:` tag and exactly one `CL:` tag.
     # Stray tabs from -R would produce a second `ID:` tag (from the RG).
+    #
+    # `|| true` on each grep: a zero count is exactly the failure this block
+    # exists to report, but grep exits 1 when it matches nothing, and under
+    # `set -o pipefail` that would end the script before the assertion could
+    # print which tag was missing.
     local id_count cl_count
-    id_count="$(grep -o $'\tID:' <<< "$pg_line" | wc -l | tr -d ' ')"
-    cl_count="$(grep -o $'\tCL:' <<< "$pg_line" | wc -l | tr -d ' ')"
+    id_count="$({ grep -o $'\tID:' <<< "$pg_line" || true; } | wc -l | tr -d ' ')"
+    cl_count="$({ grep -o $'\tCL:' <<< "$pg_line" || true; } | wc -l | tr -d ' ')"
     if [[ "$id_count" -ne 1 || "$cl_count" -ne 1 ]]; then
         echo "FAIL [$label]: @PG line has ID:=$id_count CL:=$cl_count (expected 1 of each)" >&2
         printf '%s\n' "$pg_line" | sed $'s/\t/<TAB>/g' >&2

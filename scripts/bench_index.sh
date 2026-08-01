@@ -159,14 +159,20 @@ if [[ " ${TARGETS[*]} " == *" hg38_slice "* && ! -s "$HG38_SLICE" ]]; then
     fi
 fi
 
+# `|| status=1` rather than `|| true`: every target still gets its turn (one
+# failed build should not hide the results for the rest), but a run that
+# printed FAIL must not go on to exit 0 with a partial results table. run_one
+# already returns 0 for its SKIP path, so a missing optional input stays a
+# skip and only real build failures are recorded here.
+status=0
 for t in "${TARGETS[@]}"; do
     case "$t" in
-        chr1_4_6mb) run_one "chr1_4_6mb" "$CHR1_4_6MB" || true ;;
-        synthetic_1mb) run_one "synthetic_1mb" "$SYNTH" || true ;;
-        chr22) run_one "chr22" "$CHR22" || true ;;
-        hg38_slice) run_one "hg38_slice" "$HG38_SLICE" || true ;;
-        hg38) run_one "hg38_plain" "$HG38_FASTA" || true ;;
-        hg38_meth) run_one "hg38_meth_c2t" "$HG38_MET_C2T" || true ;;
+        chr1_4_6mb) run_one "chr1_4_6mb" "$CHR1_4_6MB" || status=1 ;;
+        synthetic_1mb) run_one "synthetic_1mb" "$SYNTH" || status=1 ;;
+        chr22) run_one "chr22" "$CHR22" || status=1 ;;
+        hg38_slice) run_one "hg38_slice" "$HG38_SLICE" || status=1 ;;
+        hg38) run_one "hg38_plain" "$HG38_FASTA" || status=1 ;;
+        hg38_meth) run_one "hg38_meth_c2t" "$HG38_MET_C2T" || status=1 ;;
         *) echo "WARN: unknown target '$t'" ;;
     esac
 done
@@ -174,3 +180,6 @@ done
 echo
 echo "--- results written to $RESULTS_TSV ---"
 echo "--- summary in $SUMMARY ---"
+
+# Non-zero if any target failed to build (see the dispatch loop above).
+exit "$status"

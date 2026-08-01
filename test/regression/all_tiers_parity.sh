@@ -194,7 +194,12 @@ for vi in "${!VARIANT_LABELS[@]}"; do
         fi
         if ! diff -q "$REF_SAM" "$OUT_DIR/$vlabel.$t.sam" > /dev/null; then
             echo "FAIL: [$vlabel] tier $t differs from $REF_TIER"
-            diff "$REF_SAM" "$OUT_DIR/$vlabel.$t.sam" | head -20
+            # `|| true`: we are already inside the "files differ" branch, so
+            # this diff exits 1 by construction. Under `set -o pipefail` that
+            # status would end the script right here -- losing EXIT=1 and every
+            # remaining tier comparison -- turning a real parity failure into a
+            # silent partial run.
+            diff "$REF_SAM" "$OUT_DIR/$vlabel.$t.sam" | head -20 || true
             EXIT=1
         else
             echo "OK: [$vlabel] tier $t matches $REF_TIER"

@@ -127,21 +127,33 @@ run_trial() {
     local md5=""
 
     # Drop the time_file (and the golden SAM, if created) if the trial aborts
-    # before reaching the explicit cleanup below. RETURN fires for normal
-    # returns, errors under `set -e`, and signals. The trap body is a string
-    # eval'd by the shell on RETURN, so paths are escaped via printf %q
-    # (which produces a shell-safe quoting of arbitrary bytes) rather than
-    # wrapped in single quotes — single quotes don't survive an embedded
-    # apostrophe in BENCH_OUTDIR.
-    local time_file_q sam_file_q
+    # before reaching the explicit cleanup below.
+    #
+    # RETURN on its own is not enough. It fires for normal returns and for
+    # errors under `set -e`, but a SIGINT or SIGTERM arriving during the timed
+    # `mem` run kills the shell without ever running it, stranding a
+    # hundreds-of-MB golden SAM in BENCH_OUTDIR. EXIT covers the remaining
+    # abort paths; INT and TERM clean up and then re-raise on a cleared trap so
+    # the caller still observes a signal death rather than a plain exit.
+    #
+    # The trap body is a string eval'd by the shell when the trap fires, so
+    # paths are escaped via printf %q (which produces a shell-safe quoting of
+    # arbitrary bytes) rather than wrapped in single quotes — single quotes
+    # don't survive an embedded apostrophe in BENCH_OUTDIR.
+    local time_file_q sam_file_q rm_cmd
     printf -v time_file_q '%q' "$time_file"
     printf -v sam_file_q '%q' "$sam_file"
-    # shellcheck disable=SC2064
     if [[ "$sam_file" != "/dev/null" ]]; then
-        trap "rm -f -- $time_file_q $sam_file_q" RETURN
+        rm_cmd="rm -f -- $time_file_q $sam_file_q"
     else
-        trap "rm -f -- $time_file_q" RETURN
+        rm_cmd="rm -f -- $time_file_q"
     fi
+    # shellcheck disable=SC2064  # bake the quoted paths in now, not at trap time
+    trap "$rm_cmd" RETURN EXIT
+    # shellcheck disable=SC2064
+    trap "$rm_cmd; trap - INT; kill -INT \$\$" INT
+    # shellcheck disable=SC2064
+    trap "$rm_cmd; trap - TERM; kill -TERM \$\$" TERM
 
     # Run. stdout → SAM (or /dev/null); stderr → time_file (includes bwa-mem3 log + /usr/bin/time output).
     # shellcheck disable=SC2086
@@ -167,6 +179,24 @@ run_trial() {
         rss_kb=NA
     fi
 
+    # Refuse to record a trial that exited 0 having aligned nothing.
+    #
+    # Perf trials send their SAM to /dev/null, so the stream itself cannot be
+    # inspected without putting a consumer back into the timed path — which is
+    # the very I/O the redirect above exists to keep out of wall_s. The
+    # aligner's own progress log is already captured in $time_file for the
+    # wall/RSS parse, so count the reads it reports processing instead: that
+    # costs nothing, perturbs no measurement, and covers both trial kinds.
+    local processed
+    processed="$(awk '/Processed [0-9]+ reads/ {
+        for (i = 1; i <= NF; i++) if ($i == "Processed") { n += $(i + 1); break }
+    } END {print n + 0}' "$time_file")"
+    if [[ "$processed" -le 0 ]]; then
+        echo "error: trial '$trial' exited 0 but processed no reads; refusing to record it" >&2
+        tail -20 "$time_file" >&2
+        return 1
+    fi
+
     # Golden md5 only on single-thread trial.
     if [[ "$trial" == "golden" ]]; then
         md5="$(grep -v '^@PG' "$sam_file" | md5_stream)"
@@ -183,10 +213,11 @@ run_trial() {
         rm -f "$sam_file"
     fi
 
-    # Bash `trap … RETURN` is global (no functrace / `local -` here), so leaving
-    # it set would clobber any caller's RETURN trap and persist into the next
-    # run_trial invocation. Clear it now that cleanup is done.
-    trap - RETURN
+    # Bash traps are global (no functrace / `local -` here), so leaving these
+    # set would clobber any caller's handlers and persist into the next
+    # run_trial invocation. Clear them now that cleanup is done; the next trial
+    # registers its own against its own paths.
+    trap - RETURN EXIT INT TERM
 }
 
 echo "# run.sh tag=$TAG bin=$BIN host=$HOST arch=$ARCH" >&2

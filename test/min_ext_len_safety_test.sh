@@ -51,8 +51,18 @@ trap 'rm -rf "$d"' EXIT
 # Alignment records only (strip @ header lines, whose @PG CL: differs by flags).
 # -t 1 for deterministic output. A min-ext-len far above any seed length makes
 # every chain all-short, which the fixed filter must leave untouched.
-"$bin" mem -t 1 "$ref" "$reads" 2> /dev/null | grep -v '^@' > "$d/default.sam"
-"$bin" mem -t 1 --min-ext-len 1000000 "$ref" "$reads" 2> /dev/null | grep -v '^@' > "$d/huge.sam"
+#
+# The aligner and the header strip run as separate steps so their exit statuses
+# stay distinguishable. Piped together, a run that emitted headers but no
+# alignments makes `grep -v` exit 1 (it selected nothing), and under
+# `set -o pipefail` that ends the script before the explicit "produced no
+# alignment records" check below -- the one failure this test most needs to
+# report. Split apart, a genuine aligner failure still aborts via `set -e`
+# while an empty record set reaches its diagnostic.
+"$bin" mem -t 1 "$ref" "$reads" 2> /dev/null > "$d/default.raw"
+"$bin" mem -t 1 --min-ext-len 1000000 "$ref" "$reads" 2> /dev/null > "$d/huge.raw"
+grep -v '^@' "$d/default.raw" > "$d/default.sam" || true
+grep -v '^@' "$d/huge.raw" > "$d/huge.sam" || true
 
 [[ -s "$d/default.sam" ]] || {
     echo "FAIL: default run produced no alignment records" >&2
@@ -80,7 +90,9 @@ if diff -q "$d/default.sam" "$d/huge.sam" > /dev/null; then
     echo "OK:   huge --min-ext-len output byte-identical to default (all-short chains untouched)"
 else
     echo "FAIL: huge --min-ext-len diverged from default output" >&2
-    diff "$d/default.sam" "$d/huge.sam" | head -10 >&2
+    # `|| true`: this runs in the "files differ" branch, so diff exits 1 by
+    # construction and pipefail would abort before the explicit exit below.
+    diff "$d/default.sam" "$d/huge.sam" | head -10 >&2 || true
     exit 1
 fi
 

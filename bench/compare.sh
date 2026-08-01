@@ -68,11 +68,22 @@ echo "tag B: $TAG_B"
 echo ""
 echo "golden md5 A: $MD5_A"
 echo "golden md5 B: $MD5_B"
+# A missing golden md5 means SAM byte-identity was never checked, so this run
+# cannot gate the comparison it exists to gate. Say so and remember it, but
+# still print the perf deltas below — they are independently useful — then fail
+# at the end rather than exiting 0 on an unchecked comparison.
+#
+# The tests are spelled `[[ -n ... ]] ||` rather than `[[ -z ... ]] &&` because
+# under `set -e` the latter aborts the script: with exactly one md5 missing the
+# second `&&` list ends in a false `[[`, so its non-zero status ends the run
+# before the diagnostic is ever printed.
+golden_gated=1
 if [[ -z "$MD5_A" || -z "$MD5_B" ]]; then
     missing=()
-    [[ -z "$MD5_A" ]] && missing+=("$TAG_A")
-    [[ -z "$MD5_B" ]] && missing+=("$TAG_B")
+    [[ -n "$MD5_A" ]] || missing+=("$TAG_A")
+    [[ -n "$MD5_B" ]] || missing+=("$TAG_B")
     echo "golden: NA — no golden md5 recorded for: ${missing[*]}"
+    golden_gated=0
 elif [[ "$MD5_A" == "$MD5_B" ]]; then
     echo "golden: MATCH (byte-identical SAM)"
 else
@@ -98,3 +109,7 @@ if [[ "$RA" != "NA" && "$RB" != "NA" ]]; then
     printf "RSS delta:  %+.2f%% (B vs A)\n", (b-a)/a*100
   }'
 fi
+
+# Fail if byte-identity could not be checked (see the golden block above).
+# MATCH and MISMATCH keep their existing exit-0 reporting semantics.
+[[ "$golden_gated" -eq 1 ]] || exit 1

@@ -17,7 +17,17 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
-base="$(cat "${here}/../version.txt" 2> /dev/null || echo unknown)"
+
+# version.txt is the single source of truth, so a checkout that cannot supply
+# it is broken rather than merely unlabelled. The old `|| echo unknown` turned
+# that into a successful run printing a plausible-looking version string, which
+# the Makefile then baked into the binary; fail loudly instead.
+version_file="${here}/../version.txt"
+if [ ! -r "$version_file" ] || [ ! -s "$version_file" ]; then
+    echo "error: $version_file is missing, unreadable, or empty" >&2
+    exit 1
+fi
+base="$(cat "$version_file")"
 
 sha=""
 dirty=""

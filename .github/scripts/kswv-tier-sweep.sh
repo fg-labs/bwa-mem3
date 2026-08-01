@@ -77,9 +77,14 @@ esac
 # could be exercised", which reads as "old runner" and buries the real fault.
 # Returning a distinct status lets the caller tell "can't" from "broken".
 effective_tier() {
-    local want="$1" line
-    line="$(BWAMEM3_FORCE_TIER="$want" "$BWA_MEM3" version 2> /dev/null \
-        | grep '^SIMD runtime:' || true)"
+    local want="$1" line version_output
+    # Take the binary's own exit status before looking at what it printed.
+    # Piping straight into grep discards that status, so a `version` that
+    # printed the line and then died would be read as a real tier answer
+    # instead of the broken oracle it is.
+    version_output="$(BWAMEM3_FORCE_TIER="$want" "$BWA_MEM3" version 2> /dev/null)" \
+        || return 2
+    line="$(printf '%s\n' "$version_output" | grep '^SIMD runtime:' || true)"
     [ -n "$line" ] || return 2
     case "$line" in
         *", ignored"*) return 0 ;; # refused: host cannot reach this tier

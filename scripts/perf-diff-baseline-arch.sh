@@ -105,7 +105,12 @@ while [ $# -gt 0 ]; do
             shift
             ;;
         -h | --help)
-            sed -n '/^# /,/^$/p' "$0" | sed 's/^# //;s/^#$//' | head -55
+            # `sed -n '1,55p'` rather than `head -55`: head closes the pipe as
+            # soon as it has its 55 lines, and under `set -o pipefail` the
+            # SIGPIPE that kills the upstream sed becomes the pipeline's exit
+            # status, so `--help` would start failing the moment the help block
+            # grows past the cap. sed reads to EOF and applies the same limit.
+            sed -n '/^# /,/^$/p' "$0" | sed 's/^# //;s/^#$//' | sed -n '1,55p'
             exit 0
             ;;
         *)
