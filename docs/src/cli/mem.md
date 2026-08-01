@@ -391,6 +391,35 @@ bisulfite chr20) shows accuracy neutral-to-positive and confident (MAPQ ≥ 60) 
 unchanged across `K = 1…16`. Enabled by [`--fast`](#--fast--speed-preset-opt-in-not-byte-identical);
 use `--rescue-kmer=0` to force it off even under `--fast`.
 
+#### `--rescue-skip` — drop hopeless mate rescues (opt-in, not byte-identical)
+
+`--rescue-kmer` alone always runs the rescue SW: a window with no usable anchor simply
+falls back to the full width. `--rescue-skip` instead declines the rescue outright when
+the best diagonal clears neither an absolute vote floor nor a fraction of the distinct
+K-mers the anchor index actually holds for the query. That index stops inserting at 768
+distinct codes, so the denominator is the read's full distinct-K-mer count only up to that
+point — which at short-read lengths it always is, since a 150 bp read yields only ~145
+6-mers in total. Removing SWs is a larger saving than shortening them.
+
+Requires `--rescue-kmer` — the decision reuses the same anchor scan, so `--rescue-skip`
+with `--rescue-kmer=0` is rejected rather than silently ignored.
+
+**This changes which reads map, not just their MAPQ, and it costs recall.** A read the
+full-window SW would have rescued can now stay unmapped. Measured against `--rescue-kmer`
+alone on real bisulfite data, on the same 16-vCPU Graviton4 host (arm64, NEON tier): 16 lost
+alignments at MAPQ ≥ 30 per 200k primaries on 125 bp WGBS, and 420 per 2M on 75 bp em-seq.
+Which reads are lost is tier-dependent in principle, since the rescue SW is one of the
+per-ISA kernels — these are the NEON numbers.
+
+The cost scales with read length, because the vote floor does not. A 150 bp read offers
+~145 6-mers and a 75 bp read ~70, so the same 10-vote floor is twice as harsh a test on
+short reads — skipping 14 % of scans at 150 bp, 42 % at 125 bp and 79 % at 75 bp. Treat it
+as a speed/recall trade to evaluate on your own read length, not a free win.
+
+**Not part of [`--fast`](#--fast--speed-preset-opt-in-not-byte-identical)**, which is a
+characterized speed preset rather than a recall trade. Combining them explicitly
+(`--fast --rescue-skip`) is supported, and the `--fast` audit line then names it.
+
 #### `-S` — skip mate rescue
 
 Disables mate rescue entirely. Faster but may reduce sensitivity for
