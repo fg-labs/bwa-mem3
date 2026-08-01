@@ -20,12 +20,13 @@ fi
 need_index=0
 for ext in .amb .ann .bwt.2bit.64 .pac; do
     if [[ ! -s "${PREFIX}${ext}" ]]; then
-        need_index=1; break
+        need_index=1
+        break
     fi
 done
 if [[ "$need_index" -eq 1 ]]; then
     echo "[setup] Building phix index..."
-    "$BIN" index "$PREFIX" >/dev/null 2>&1
+    "$BIN" index "$PREFIX" > /dev/null 2>&1
 fi
 
 echo "[run] $INNER $PREFIX"

@@ -32,16 +32,29 @@ FIXTURES="${FIXTURES:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../fixtures" && pwd)}
 
 src_ref="$FIXTURES/phix.fa"
 reads="$FIXTURES/reads.fa"
-[[ -x "$BWA_MEM3" ]] || { echo "FAIL: binary not executable: $BWA_MEM3" >&2; exit 1; }
-[[ -s "$src_ref" ]]  || { echo "FAIL: phix.fa missing: $src_ref" >&2; exit 1; }
-[[ -s "$reads" ]]    || { echo "FAIL: reads.fa missing: $reads" >&2; exit 1; }
+[[ -x "$BWA_MEM3" ]] || {
+    echo "FAIL: binary not executable: $BWA_MEM3" >&2
+    exit 1
+}
+[[ -s "$src_ref" ]] || {
+    echo "FAIL: phix.fa missing: $src_ref" >&2
+    exit 1
+}
+[[ -s "$reads" ]] || {
+    echo "FAIL: reads.fa missing: $reads" >&2
+    exit 1
+}
 
 # Index a private copy so the test never writes into the fixtures tree.
-mdir="$(mktemp -d)"; err="$mdir/err.log"
+mdir="$(mktemp -d)"
+err="$mdir/err.log"
 trap 'rm -rf "$mdir"' EXIT
 ref="$mdir/phix.fa"
 cp "$src_ref" "$ref"
-"$BWA_MEM3" index "$ref" >/dev/null 2>&1 || { echo "FAIL: index phix.fa" >&2; exit 1; }
+"$BWA_MEM3" index "$ref" > /dev/null 2>&1 || {
+    echo "FAIL: index phix.fa" >&2
+    exit 1
+}
 
 fails=0
 
@@ -49,14 +62,20 @@ fails=0
 # Note the args must be passed as separate words: under zsh an unquoted "$1"
 # holding "-t 32 -K 100" is ONE argv entry and atoi() silently eats the rest.
 batch_size() {
-    "$BWA_MEM3" mem "$@" "$ref" "$reads" >/dev/null 2>"$err" \
-        || { echo "FAIL: mem exited nonzero (args: $*)" >&2; cat "$err" >&2; exit 1; }
+    "$BWA_MEM3" mem "$@" "$ref" "$reads" > /dev/null 2> "$err" \
+        || {
+            echo "FAIL: mem exited nonzero (args: $*)" >&2
+            cat "$err" >&2
+            exit 1
+        }
     grep -m1 -oE 'read_chunk: [0-9]+' "$err" | grep -oE '[0-9]+$'
 }
 
-expect() {  # $1 = expected batch size, rest = mem args
-    local want="$1"; shift
-    local got; got="$(batch_size "$@")"
+expect() { # $1 = expected batch size, rest = mem args
+    local want="$1"
+    shift
+    local got
+    got="$(batch_size "$@")"
     if [[ "$got" != "$want" ]]; then
         echo "FAIL: 'mem $*' batch=$got, expected $want"
         fails=$((fails + 1))
@@ -76,7 +95,8 @@ expect() {  # $1 = expected batch size, rest = mem args
 #
 # $1 = env value (may be empty), $2 = expected batch size, rest = mem args
 expect_env() {
-    local envval="$1" want="$2"; shift 2
+    local envval="$1" want="$2"
+    shift 2
     local got
     got="$(BWA_MEM3_CHUNK_CAP="$envval" batch_size "$@")"
     if [[ "$got" != "$want" ]]; then
@@ -94,8 +114,8 @@ expect 160000000 -t 16
 
 # --- opt-in cap -------------------------------------------------------------
 expect 256000000 -t 32 --chunk-cap 256000000
-expect 160000000 -t 16 --chunk-cap 256000000   # below the cap: untouched
-expect 320000000 -t 32 --chunk-cap 0           # 0 disables
+expect 160000000 -t 16 --chunk-cap 256000000 # below the cap: untouched
+expect 320000000 -t 32 --chunk-cap 0         # 0 disables
 
 # --- --fast implies the cap; explicit flags still win -----------------------
 # Both argument orders, and both a non-zero cap and an explicit 0. --fast's cap is
@@ -104,20 +124,20 @@ expect 320000000 -t 32 --chunk-cap 0           # 0 disables
 # these cases pin that, so a parser change that started consuming --fast after the
 # flag (and clobbering it) cannot silently re-enable the implied cap.
 expect 256000000 -t 32 --fast
-expect  64000000 -t 32 --fast --chunk-cap 64000000
-expect  64000000 -t 32 --chunk-cap 64000000 --fast
-expect 320000000 -t 32 --fast --chunk-cap 0     # explicit 0 beats --fast's cap
+expect 64000000 -t 32 --fast --chunk-cap 64000000
+expect 64000000 -t 32 --chunk-cap 64000000 --fast
+expect 320000000 -t 32 --fast --chunk-cap 0 # explicit 0 beats --fast's cap
 expect 320000000 -t 32 --chunk-cap 0 --fast
 
 # --- BWA_MEM3_CHUNK_CAP wins over everything except -K ----------------------
 # The env override exists for cap sweeps, so it has to beat both the CLI flag and
 # --fast's implied cap, and be able to switch a cap back OFF.
-expect_env 128000000 128000000 -t 32                          # enables a cap the default lacks
-expect_env 128000000 128000000 -t 32 --chunk-cap 256000000     # beats an explicit cap
-expect_env 128000000 128000000 -t 32 --fast                    # beats --fast's implied cap
-expect_env 0         320000000 -t 32 --chunk-cap 256000000     # 0 switches an explicit cap off
-expect_env 0         320000000 -t 32 --fast                    # ... and --fast's implied one
-expect_env 512000000 320000000 -t 32                           # cap above scaled: untouched
+expect_env 128000000 128000000 -t 32                       # enables a cap the default lacks
+expect_env 128000000 128000000 -t 32 --chunk-cap 256000000 # beats an explicit cap
+expect_env 128000000 128000000 -t 32 --fast                # beats --fast's implied cap
+expect_env 0 320000000 -t 32 --chunk-cap 256000000         # 0 switches an explicit cap off
+expect_env 0 320000000 -t 32 --fast                        # ... and --fast's implied one
+expect_env 512000000 320000000 -t 32                       # cap above scaled: untouched
 
 # An EMPTY value is ignored rather than parsed as 0 -- `cap_env && *cap_env` in
 # main_mem. Without this case, dropping the `*cap_env` check would go unnoticed:
@@ -128,12 +148,14 @@ expect_env "" 256000000 -t 32 --chunk-cap 256000000
 # would silently switch an explicit cap off -- a typo in a sweep variable
 # quietly changing how the input is partitioned is the failure mode this whole
 # option exists to prevent.
-expect_env abc 320000000 -t 32                          # falls back to no cap
-expect_env xyz 256000000 -t 32 --chunk-cap 256000000    # falls back to the CLI cap
-BWA_MEM3_CHUNK_CAP=abc batch_size -t 32 >/dev/null
+expect_env abc 320000000 -t 32                       # falls back to no cap
+expect_env xyz 256000000 -t 32 --chunk-cap 256000000 # falls back to the CLI cap
+BWA_MEM3_CHUNK_CAP=abc batch_size -t 32 > /dev/null
 grep -q "BWA_MEM3_CHUNK_CAP='abc' is not a non-negative integer" "$err" \
-    || { echo "FAIL: a malformed BWA_MEM3_CHUNK_CAP must be reported, not silently ignored"
-         fails=$((fails + 1)); }
+    || {
+        echo "FAIL: a malformed BWA_MEM3_CHUNK_CAP must be reported, not silently ignored"
+        fails=$((fails + 1))
+    }
 
 # --- -K always wins and is never capped ------------------------------------
 expect 100000000 -t 32 -K 100000000
@@ -146,14 +168,17 @@ expect_env 1000000 100000000 -t 32 -K 100000000
 # Three cases, because the warning is gated on `scaled > cap`, not on "a cap is
 # configured": an implementation that warns whenever --chunk-cap is present
 # would pass the first and third checks and still be wrong.
-batch_size -t 32 --chunk-cap 256000000 >/dev/null   # 320M > 256M: clipped
-grep -q 'chunk cap engaged' "$err" || { echo "FAIL: expected 'chunk cap engaged' warning"; fails=$((fails + 1)); }
-batch_size -t 16 --chunk-cap 256000000 >/dev/null   # 160M < 256M: configured but inert
+batch_size -t 32 --chunk-cap 256000000 > /dev/null # 320M > 256M: clipped
+grep -q 'chunk cap engaged' "$err" || {
+    echo "FAIL: expected 'chunk cap engaged' warning"
+    fails=$((fails + 1))
+}
+batch_size -t 16 --chunk-cap 256000000 > /dev/null # 160M < 256M: configured but inert
 if grep -q 'chunk cap engaged' "$err"; then
     echo "FAIL: an unengaged chunk cap must not report a warning"
     fails=$((fails + 1))
 fi
-batch_size -t 32 >/dev/null                          # no cap at all
+batch_size -t 32 > /dev/null # no cap at all
 if grep -q 'chunk cap engaged' "$err"; then
     echo "FAIL: default run must not report a chunk cap"
     fails=$((fails + 1))
@@ -163,12 +188,12 @@ fi
 # atoll() maps every unparseable value to 0, and 0 means "no cap" -- so without
 # validation `--chunk-cap 100M` would look accepted and quietly leave batching
 # uncapped. Uses `=` form so a leading '-' is not taken for another option.
-reject() {  # $1 = the --chunk-cap value that must be refused
+reject() { # $1 = the --chunk-cap value that must be refused
     # `|| rc=$?` rather than toggling errexit off around the call: a `set +e`
     # window silently stops checking every command inside it, including any
     # later added between the call and `rc=$?`.
     local rc=0
-    "$BWA_MEM3" mem "--chunk-cap=$1" "$ref" "$reads" >/dev/null 2>"$err" || rc=$?
+    "$BWA_MEM3" mem "--chunk-cap=$1" "$ref" "$reads" > /dev/null 2> "$err" || rc=$?
     if [[ "$rc" -eq 0 ]]; then
         echo "FAIL: '--chunk-cap=$1' was accepted; expected a non-zero exit"
         fails=$((fails + 1))
@@ -179,9 +204,9 @@ reject() {  # $1 = the --chunk-cap value that must be refused
         echo "  ok: '--chunk-cap=$1' rejected"
     fi
 }
-reject abc      # not a number at all
-reject 100M     # trailing suffix: the option takes plain bases, not 100M
-reject -5       # negative
+reject abc  # not a number at all
+reject 100M # trailing suffix: the option takes plain bases, not 100M
+reject -5   # negative
 
 if [[ "$fails" -ne 0 ]]; then
     echo "FAIL: chunk-cap opt-in regression ($fails failure(s))"

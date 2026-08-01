@@ -25,7 +25,7 @@ if [[ -z "$HG38" || ! -s "$HG38" ]]; then
     echo "SKIP: BWA_TEST_HG38_FASTA unset or fixture missing"
     exit 0
 fi
-if ! command -v samtools >/dev/null; then
+if ! command -v samtools > /dev/null; then
     echo "SKIP: samtools not in PATH"
     exit 0
 fi
@@ -61,7 +61,7 @@ if [[ ! -s "$SLICE_DIR/baseline/slice.fa.bwt.2bit.64" ]]; then
     echo "INFO: BWA_TEST_HG38_SLICE_BASELINE_BOOTSTRAP=1 -- bootstrapping baseline at $SLICE_DIR/baseline"
     mkdir -p "$SLICE_DIR/baseline"
     cp "$SLICE_DIR/slice.fa" "$SLICE_DIR/baseline/slice.fa"
-    "$BWAMEM3" index --emit-unpacked-ref "$SLICE_DIR/baseline/slice.fa" >/dev/null
+    "$BWAMEM3" index --emit-unpacked-ref "$SLICE_DIR/baseline/slice.fa" > /dev/null
 fi
 
 TD="$(mktemp -d)"
@@ -69,7 +69,7 @@ trap 'rm -rf "$TD"' EXIT
 
 cp "$SLICE_DIR/slice.fa" "$TD/slice.fa"
 # --emit-unpacked-ref: this test byte-diffs .0123, which is no longer built by default.
-"$BWAMEM3" index --emit-unpacked-ref "$TD/slice.fa" >/dev/null
+"$BWAMEM3" index --emit-unpacked-ref "$TD/slice.fa" > /dev/null
 
 FAIL=0
 for ext in pac ann amb 0123 bwt.2bit.64; do

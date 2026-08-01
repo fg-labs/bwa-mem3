@@ -28,15 +28,27 @@ fixtures="$(abspath "$2")"
 ref="$fixtures/phix.fa"
 reads="$fixtures/reads.fa"
 
-[[ -x "$bin" ]]   || { echo "FAIL: bwa-mem3 binary not executable at $bin" >&2; exit 1; }
-[[ -s "$ref" ]]   || { echo "FAIL: phix.fa missing at $ref" >&2; exit 1; }
-[[ -s "$reads" ]] || { echo "FAIL: reads.fa missing at $reads" >&2; exit 1; }
+[[ -x "$bin" ]] || {
+    echo "FAIL: bwa-mem3 binary not executable at $bin" >&2
+    exit 1
+}
+[[ -s "$ref" ]] || {
+    echo "FAIL: phix.fa missing at $ref" >&2
+    exit 1
+}
+[[ -s "$reads" ]] || {
+    echo "FAIL: reads.fa missing at $reads" >&2
+    exit 1
+}
 
 # Build the phiX FMI index if not already present.
-if [[ ! -s "$ref.bwt.2bit.64" || ! -s "$ref.amb" \
-      || ! -s "$ref.ann"       || ! -s "$ref.pac" ]]; then
-    "$bin" index "$ref" >/dev/null 2>&1 \
-        || { echo "FAIL: bwa-mem3 index on phix.fa failed" >&2; exit 1; }
+if [[ ! -s "$ref.bwt.2bit.64" || ! -s "$ref.amb" ||
+    ! -s "$ref.ann" || ! -s "$ref.pac" ]]; then
+    "$bin" index "$ref" > /dev/null 2>&1 \
+        || {
+            echo "FAIL: bwa-mem3 index on phix.fa failed" >&2
+            exit 1
+        }
 fi
 
 tmpdir="$(mktemp -d)"
@@ -55,11 +67,14 @@ budget=3
 SECONDS=0
 for _ in $(seq "$runs"); do
     "$bin" version > "$tmpdir/version.out" 2> "$tmpdir/version.err" \
-        || { echo "FAIL: bwa-mem3 version exited non-zero" >&2
-             cat "$tmpdir/version.err" >&2; exit 1; }
+        || {
+            echo "FAIL: bwa-mem3 version exited non-zero" >&2
+            cat "$tmpdir/version.err" >&2
+            exit 1
+        }
 done
 elapsed=$SECONDS
-if (( elapsed > budget )); then
+if ((elapsed > budget)); then
     echo "FAIL: $runs 'bwa-mem3 version' calls took ${elapsed}s (budget ${budget}s)." >&2
     echo "      Startup is sleeping again -- see calibrate_proc_freq() in src/main.cpp." >&2
     exit 1
@@ -74,8 +89,11 @@ fi
 # real tick source (a ~24 MHz arm64 CNTVCT_EL0 through a multi-GHz x86 TSC)
 # falls outside of.
 "$bin" mem "$ref" "$reads" > "$tmpdir/mem.sam" 2> "$tmpdir/mem.err" \
-    || { echo "FAIL: bwa-mem3 mem on phix.fa exited non-zero" >&2
-         cat "$tmpdir/mem.err" >&2; exit 1; }
+    || {
+        echo "FAIL: bwa-mem3 mem on phix.fa exited non-zero" >&2
+        cat "$tmpdir/mem.err" >&2
+        exit 1
+    }
 
 # Capture the field verbatim ([^ ]+, not just digits) so whatever %lf
 # actually printed -- 0.000000, an absurd magnitude, or a non-numeric
@@ -83,11 +101,16 @@ fi
 # failing and reporting a missing line.
 freq_mhz="$(sed -nE 's/^Processor is running @([^ ]+) MHz$/\1/p' "$tmpdir/mem.err" | head -n1)"
 [[ -n "$freq_mhz" ]] \
-    || { echo "FAIL: 'Processor is running @... MHz' line missing from mem stderr" >&2
-         cat "$tmpdir/mem.err" >&2; exit 1; }
+    || {
+        echo "FAIL: 'Processor is running @... MHz' line missing from mem stderr" >&2
+        cat "$tmpdir/mem.err" >&2
+        exit 1
+    }
 
 awk -v f="$freq_mhz" 'BEGIN { exit !(f + 0 >= 1 && f + 0 <= 100000) }' \
-    || { echo "FAIL: implausible calibrated frequency: ${freq_mhz} MHz (expected 1 .. 100000)" >&2
-         exit 1; }
+    || {
+        echo "FAIL: implausible calibrated frequency: ${freq_mhz} MHz (expected 1 .. 100000)" >&2
+        exit 1
+    }
 
 echo "PASS: startup does not sleep ($runs version calls in ${elapsed}s); calibrated @${freq_mhz} MHz"

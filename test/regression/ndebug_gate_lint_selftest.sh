@@ -59,15 +59,15 @@ check_line() {
 }
 
 echo "== gates the lint must reject =="
-check_line "plain #ifndef"              FLAG '#ifndef NDEBUG'
-check_line "plain #ifdef"               FLAG '#ifdef NDEBUG'
-check_line "#if !defined()"             FLAG '#if !defined(NDEBUG)'
-check_line "space between # and elif"   FLAG '#  elif defined NDEBUG'
-check_line "leading tab"                FLAG $'\t#ifndef NDEBUG'
-check_line "NDEBUG last on the line"    FLAG '#if defined(FOO) && !defined NDEBUG'
+check_line "plain #ifndef" FLAG '#ifndef NDEBUG'
+check_line "plain #ifdef" FLAG '#ifdef NDEBUG'
+check_line "#if !defined()" FLAG '#if !defined(NDEBUG)'
+check_line "space between # and elif" FLAG '#  elif defined NDEBUG'
+check_line "leading tab" FLAG $'\t#ifndef NDEBUG'
+check_line "NDEBUG last on the line" FLAG '#if defined(FOO) && !defined NDEBUG'
 # The compiler splices a backslash-continued line before it sees a directive,
 # so this is one `#if defined(NDEBUG)`. A physical-line matcher misses it.
-check_line "backslash continuation"     FLAG '#if \
+check_line "backslash continuation" FLAG '#if \
 defined(NDEBUG)'
 check_line "continuation mid-expression" FLAG '#if defined(FOO) || \
     defined(NDEBUG)'
@@ -75,25 +75,25 @@ check_line "continuation mid-expression" FLAG '#if defined(FOO) || \
 echo "== non-gates the lint must accept =="
 # bntseq.cpp documents the historical bug in exactly this shape; a matcher that
 # flags prose makes the lint unusable in the file that motivated it.
-check_line "NDEBUG in block comment"    PASS ' * this was once gated on #ifndef NDEBUG and never compiled out'
-check_line "NDEBUG in line comment"     PASS '// see the #ifndef NDEBUG note above'
-check_line "unrelated directive"        PASS '#define NDEBUG_FOO 1'
-check_line "NDEBUG as a name prefix"    PASS '#ifndef NDEBUG_TRACE'
-check_line "NDEBUG as a name suffix"    PASS '#ifdef MY_NDEBUG'
-check_line "#endif trailing comment"    PASS '#endif // NDEBUG'
-check_line "ordinary code"              PASS 'int main(void) { return 0; }'
+check_line "NDEBUG in block comment" PASS ' * this was once gated on #ifndef NDEBUG and never compiled out'
+check_line "NDEBUG in line comment" PASS '// see the #ifndef NDEBUG note above'
+check_line "unrelated directive" PASS '#define NDEBUG_FOO 1'
+check_line "NDEBUG as a name prefix" PASS '#ifndef NDEBUG_TRACE'
+check_line "NDEBUG as a name suffix" PASS '#ifdef MY_NDEBUG'
+check_line "#endif trailing comment" PASS '#endif // NDEBUG'
+check_line "ordinary code" PASS 'int main(void) { return 0; }'
 
 echo "== a lint that scanned nothing must not report PASS =="
 empty_dir="$fixture_root/empty"
 mkdir -p "$empty_dir"
-if bash "$lint" "$empty_dir" >/dev/null 2>&1; then
+if bash "$lint" "$empty_dir" > /dev/null 2>&1; then
     echo "  FAIL directory with no sources reported PASS" >&2
     failures=$((failures + 1))
 else
     echo "  ok   directory with no sources -> FAIL"
 fi
 
-if bash "$lint" "$fixture_root/does-not-exist" >/dev/null 2>&1; then
+if bash "$lint" "$fixture_root/does-not-exist" > /dev/null 2>&1; then
     echo "  FAIL missing directory reported PASS" >&2
     failures=$((failures + 1))
 else
@@ -102,8 +102,8 @@ fi
 
 # Exit 2 rather than 1, so a caller that mis-invokes the lint cannot read the
 # result as "gates found" -- or, worse, as a clean run.
-bash "$lint" one two >/dev/null 2>&1 && usage_status=0 || usage_status=$?
-if (( usage_status == 2 )); then
+bash "$lint" one two > /dev/null 2>&1 && usage_status=0 || usage_status=$?
+if ((usage_status == 2)); then
     echo "  ok   too many arguments -> usage error (exit 2)"
 else
     echo "  FAIL too many arguments: expected exit 2, got $usage_status" >&2
@@ -117,14 +117,14 @@ artifact_dir="$fixture_root/artifacts"
 mkdir -p "$artifact_dir"
 printf '%s\n' 'int main(void) { return 0; }' > "$artifact_dir/fixture.cpp"
 head -c 4096 /dev/urandom > "$artifact_dir/fixture.o"
-if bash "$lint" "$artifact_dir" >/dev/null 2>&1; then
+if bash "$lint" "$artifact_dir" > /dev/null 2>&1; then
     echo "  ok   binary artifact alongside sources -> PASS"
 else
     echo "  FAIL binary artifact alongside sources aborted the lint" >&2
     failures=$((failures + 1))
 fi
 
-if (( failures > 0 )); then
+if ((failures > 0)); then
     echo "FAIL: ndebug_gate_lint_selftest ($failures case(s))" >&2
     exit 1
 fi

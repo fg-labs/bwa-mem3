@@ -17,10 +17,10 @@ set -euo pipefail
 
 cd "$CHR22_SIM_DIR"
 "$BWA_MEM3" mem -t 1 "$CHR22_FA" \
-    reads.r1.fastq.gz reads.r2.fastq.gz 2>/dev/null \
+    reads.r1.fastq.gz reads.r2.fastq.gz 2> /dev/null \
     | grep -v '^@PG' | sort > t1.sam
 "$BWA_MEM3" mem -t 4 "$CHR22_FA" \
-    reads.r1.fastq.gz reads.r2.fastq.gz 2>/dev/null \
+    reads.r1.fastq.gz reads.r2.fastq.gz 2> /dev/null \
     | grep -v '^@PG' | sort > t4.sam
 if ! diff t1.sam t4.sam > /dev/null 2>&1; then
     echo "FAIL: -t 1 and -t 4 outputs differ after sort"

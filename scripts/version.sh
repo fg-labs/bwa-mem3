@@ -17,21 +17,21 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
-base="$(cat "${here}/../version.txt" 2>/dev/null || echo unknown)"
+base="$(cat "${here}/../version.txt" 2> /dev/null || echo unknown)"
 
 sha=""
 dirty=""
 at_target_tag=false
 
-if command -v git >/dev/null 2>&1 \
-        && git -C "${here}/.." rev-parse --git-dir >/dev/null 2>&1; then
-    if sha="$(git -C "${here}/.." rev-parse --short=7 HEAD 2>/dev/null)"; then
-        if ! git -C "${here}/.." diff --quiet HEAD 2>/dev/null; then
+if command -v git > /dev/null 2>&1 \
+    && git -C "${here}/.." rev-parse --git-dir > /dev/null 2>&1; then
+    if sha="$(git -C "${here}/.." rev-parse --short=7 HEAD 2> /dev/null)"; then
+        if ! git -C "${here}/.." diff --quiet HEAD 2> /dev/null; then
             dirty="-dirty"
         fi
-        exact="$(git -C "${here}/.." describe --exact-match --tags HEAD 2>/dev/null || true)"
+        exact="$(git -C "${here}/.." describe --exact-match --tags HEAD 2> /dev/null || true)"
         case "$exact" in
-            "v$base"|"$base") at_target_tag=true ;;
+            "v$base" | "$base") at_target_tag=true ;;
         esac
     else
         sha=""

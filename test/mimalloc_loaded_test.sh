@@ -20,13 +20,13 @@ fi
 bin="$1"
 out="$("$bin" version 2>&1 || true)"
 
-if grep -Eq '^mimalloc [0-9]+\.[0-9]+\.[0-9]+ \(active\)$' <<<"$out"; then
+if grep -Eq '^mimalloc [0-9]+\.[0-9]+\.[0-9]+ \(active\)$' <<< "$out"; then
     echo "PASS: $bin reports mimalloc as the active allocator"
-    grep '^mimalloc' <<<"$out"
+    grep '^mimalloc' <<< "$out"
     exit 0
-elif grep -Eq '^mimalloc [0-9]+\.[0-9]+\.[0-9]+ ' <<<"$out"; then
+elif grep -Eq '^mimalloc [0-9]+\.[0-9]+\.[0-9]+ ' <<< "$out"; then
     echo "FAIL: $bin links mimalloc but it is NOT the active allocator"
-    grep '^mimalloc' <<<"$out"
+    grep '^mimalloc' <<< "$out"
     exit 1
 else
     echo "FAIL: $bin does not report mimalloc in 'version' output"

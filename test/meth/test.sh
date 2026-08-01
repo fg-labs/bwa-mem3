@@ -24,7 +24,7 @@ if [[ ! -x "$BWAMEM3" ]]; then
     echo "ERROR: bwa-mem3 binary not found at $BWAMEM3. Run 'make arm64' first."
     exit 2
 fi
-if ! command -v "$SAMTOOLS" >/dev/null 2>&1; then
+if ! command -v "$SAMTOOLS" > /dev/null 2>&1; then
     echo "ERROR: samtools not found on PATH."
     exit 2
 fi
@@ -45,30 +45,37 @@ BAM2="$SCRATCH/meth_test2.bam"
 # ---------------------------------------------------------------------------
 
 if [[ ! -f ref.fa.bwameth.c2t.bwt.2bit.64 ]]; then
-    "$BWAMEM3" index --meth ref.fa >/dev/null 2>&1
+    "$BWAMEM3" index --meth ref.fa > /dev/null 2>&1
 fi
 
-"$BWAMEM3" mem --meth -t 2 ref.fa t_R1.fastq.gz 2>/dev/null > "$BAM"
+"$BWAMEM3" mem --meth -t 2 ref.fa t_R1.fastq.gz 2> /dev/null > "$BAM"
 
 EXPECT_EOF="1f8b08040000000000ff0600424302001b0003000000000000000000"
 ACTUAL_EOF="$(tail -c 28 "$BAM" | od -An -v -t x1 | tr -d ' \n')"
 if [[ "${ACTUAL_EOF%$'\n'}" != "${EXPECT_EOF}" ]]; then
-    echo "FAIL: BGZF EOF marker mismatch (actual=$ACTUAL_EOF)"; exit 1
+    echo "FAIL: BGZF EOF marker mismatch (actual=$ACTUAL_EOF)"
+    exit 1
 fi
 
 HDR="$("$SAMTOOLS" view -H "$BAM" 2>&1)"
 if echo "$HDR" | grep -qi 'truncated\|EOF marker is absent'; then
-    echo "FAIL: samtools reports truncated BAM"; echo "$HDR"; exit 1
+    echo "FAIL: samtools reports truncated BAM"
+    echo "$HDR"
+    exit 1
 fi
 if ! echo "$HDR" | grep -q 'ID:bwa-mem3-meth'; then
-    echo "FAIL: @PG ID:bwa-mem3-meth missing"; exit 1
+    echo "FAIL: @PG ID:bwa-mem3-meth missing"
+    exit 1
 fi
 
-TOTAL="$("$SAMTOOLS" view -c "$BAM" 2>/dev/null)"
-if [[ "$TOTAL" -lt 1 ]]; then echo "FAIL: zero records in output BAM"; exit 1; fi
+TOTAL="$("$SAMTOOLS" view -c "$BAM" 2> /dev/null)"
+if [[ "$TOTAL" -lt 1 ]]; then
+    echo "FAIL: zero records in output BAM"
+    exit 1
+fi
 
 "$BWAMEM3" mem --meth --set-as-failed f --chimera-qc \
-    ref.fa t_R1.fastq.gz 2>/dev/null > "$BAM2"
+    ref.fa t_R1.fastq.gz 2> /dev/null > "$BAM2"
 if [[ ! -s "$BAM2" ]]; then
     echo "FAIL: --set-as-failed + --chimera-qc produced empty output"
     exit 1

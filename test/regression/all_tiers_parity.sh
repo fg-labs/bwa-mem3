@@ -106,7 +106,10 @@ echo "Host tier: $HOST_TIER"
 # avx512bw -- tiers ABOVE the host, which the dispatcher refuses.
 host_rank=-1
 for i in "${!KNOWN_TIERS[@]}"; do
-    if [[ "${KNOWN_TIERS[$i]}" == "$HOST_TIER" ]]; then host_rank=$i; break; fi
+    if [[ "${KNOWN_TIERS[$i]}" == "$HOST_TIER" ]]; then
+        host_rank=$i
+        break
+    fi
 done
 
 if [[ "$HOST_TIER" == "neon" ]]; then
@@ -139,7 +142,7 @@ echo "Testing tiers: ${TIERS[*]}"
 
 # Pick a reference SAM (the highest tier — usually the host's actual tier).
 # Use ${#TIERS[@]}-1 instead of negative indexing so we work on macOS bash 3.2.
-REF_TIER="${TIERS[$((${#TIERS[@]}-1))]}"
+REF_TIER="${TIERS[$((${#TIERS[@]} - 1))]}"
 
 # Scoring variants to diff under. Each entry is a label plus extra `mem`
 # args. The default run drives the 8-bit kswv mate-rescue kernel; the
@@ -174,7 +177,7 @@ for vi in "${!VARIANT_LABELS[@]}"; do
         set +e
         BWAMEM3_FORCE_TIER="$t" "$BWA_MEM3" mem -t 1 ${vargs[@]+"${vargs[@]}"} \
             "$PARITY_FA" "$PARITY_R1" "$PARITY_R2" \
-            > "$OUT_DIR/$vlabel.$t.sam" 2>"$OUT_DIR/$vlabel.$t.log"
+            > "$OUT_DIR/$vlabel.$t.sam" 2> "$OUT_DIR/$vlabel.$t.log"
         rc=$?
         set -e
         if [[ $rc -ne 0 ]]; then
@@ -189,13 +192,13 @@ for vi in "${!VARIANT_LABELS[@]}"; do
         if [[ "$t" == "$REF_TIER" ]]; then
             continue
         fi
-        if ! diff -q "$REF_SAM" "$OUT_DIR/$vlabel.$t.sam" >/dev/null; then
+        if ! diff -q "$REF_SAM" "$OUT_DIR/$vlabel.$t.sam" > /dev/null; then
             echo "FAIL: [$vlabel] tier $t differs from $REF_TIER"
             diff "$REF_SAM" "$OUT_DIR/$vlabel.$t.sam" | head -20
             EXIT=1
         else
             echo "OK: [$vlabel] tier $t matches $REF_TIER"
-            COMPARISONS=$((COMPARISONS+1))
+            COMPARISONS=$((COMPARISONS + 1))
         fi
     done
 done

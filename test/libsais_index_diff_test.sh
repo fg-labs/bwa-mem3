@@ -11,7 +11,10 @@ BASELINES="$HERE/fixtures/baselines"
 FAIL=0
 for fa in phix.fa synthetic_1mb.fa; do
     for ext in 0123 bwt.2bit.64; do
-        [[ -s "$BASELINES/$fa.$ext" ]] || { echo "FAIL: baseline $BASELINES/$fa.$ext missing"; exit 1; }
+        [[ -s "$BASELINES/$fa.$ext" ]] || {
+            echo "FAIL: baseline $BASELINES/$fa.$ext missing"
+            exit 1
+        }
     done
 done
 
@@ -19,11 +22,14 @@ TD="$(mktemp -d)"
 trap 'rm -rf "$TD"' EXIT
 
 for fa in phix.fa synthetic_1mb.fa; do
-    [[ -s "$HERE/fixtures/$fa" ]] || { echo "FAIL: source fixture $HERE/fixtures/$fa missing"; exit 1; }
+    [[ -s "$HERE/fixtures/$fa" ]] || {
+        echo "FAIL: source fixture $HERE/fixtures/$fa missing"
+        exit 1
+    }
     cp "$HERE/fixtures/$fa" "$TD/$fa"
     # --emit-unpacked-ref: byte-diff the .0123 baseline too; .0123 is no longer
     # built by default (mem pac-fetches from .pac).
-    "$BWAMEM3" index --emit-unpacked-ref "$TD/$fa" >/dev/null 2>&1
+    "$BWAMEM3" index --emit-unpacked-ref "$TD/$fa" > /dev/null 2>&1
     for ext in 0123 bwt.2bit.64; do
         if ! cmp -s "$BASELINES/$fa.$ext" "$TD/$fa.$ext"; then
             echo "FAIL: $fa.$ext diverges from baseline"

@@ -42,7 +42,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$repo_root"
 
-if (( $# > 1 )); then
+if (($# > 1)); then
     echo "usage: ${BASH_SOURCE[0]##*/} [directory-to-scan]" >&2
     exit 2
 fi
@@ -74,7 +74,7 @@ done < <(find "$scan_root" -type f \( \
     -name '*.h' -o -name '*.hh' -o -name '*.hpp' -o -name '*.hxx' -o \
     -name '*.inc' -o -name '*.ipp' -o -name '*.tcc' \) -print0)
 
-if (( ${#sources[@]} == 0 )); then
+if ((${#sources[@]} == 0)); then
     echo "FAIL: no C/C++ sources under $scan_root/ -- nothing was linted" >&2
     exit 1
 fi

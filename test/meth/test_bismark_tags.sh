@@ -24,11 +24,11 @@ if [[ ! -x "$BWAMEM3" ]]; then
     echo "ERROR: bwa-mem3 not built at $BWAMEM3 (run 'make' or 'make arm64' first)." >&2
     exit 2
 fi
-if ! command -v "$SAMTOOLS" >/dev/null 2>&1; then
+if ! command -v "$SAMTOOLS" > /dev/null 2>&1; then
     echo "ERROR: samtools not found on PATH." >&2
     exit 2
 fi
-if ! command -v cargo >/dev/null 2>&1; then
+if ! command -v cargo > /dev/null 2>&1; then
     echo "SKIP layer 3: cargo not on PATH (needed to build holodeck)"
     exit 0
 fi
@@ -36,8 +36,8 @@ fi
 if [[ ! -x "$HOLODECK_BIN" ]]; then
     echo "[layer 3] cloning + building holodeck @ $HOLODECK_SHA ..."
     rm -rf "$HOLODECK_DIR"
-    git clone --filter=blob:none "$HOLODECK_REPO" "$HOLODECK_DIR" >/dev/null 2>&1
-    git -C "$HOLODECK_DIR" checkout "$HOLODECK_SHA" >/dev/null 2>&1
+    git clone --filter=blob:none "$HOLODECK_REPO" "$HOLODECK_DIR" > /dev/null 2>&1
+    git -C "$HOLODECK_DIR" checkout "$HOLODECK_SHA" > /dev/null 2>&1
     (cd "$HOLODECK_DIR" && cargo build --release --quiet)
 fi
 
@@ -45,7 +45,7 @@ cd "$HERE"
 
 # Refresh the bwa-mem3 c2t index for the existing test fixture.
 if [[ ! -f ref.fa.bwameth.c2t.bwt.2bit.64 ]]; then
-    "$BWAMEM3" index --meth ref.fa >/dev/null 2>&1
+    "$BWAMEM3" index --meth ref.fa > /dev/null 2>&1
 fi
 
 # Index the original ref.fa with samtools faidx (holodeck needs .fai).
@@ -71,7 +71,7 @@ PREFIX="$SCRATCH/holodeck-bismark-tags"
     --simple-names \
     --seed 42 \
     -c 30 -l 150 -t 2 \
-    >/dev/null 2>&1
+    > /dev/null 2>&1
 
 GOLDEN_BAM="${PREFIX}.golden.bam"
 R1="${PREFIX}.r1.fastq.gz"
@@ -86,11 +86,11 @@ fi
 
 # Run bwa-mem3 on the simulated FASTQs.
 MINE_BAM="$SCRATCH/bismark-tags-mine.bam"
-"$BWAMEM3" mem --meth -t 2 ref.fa "$R1" "$R2" 2>/dev/null > "$MINE_BAM"
+"$BWAMEM3" mem --meth -t 2 ref.fa "$R1" "$R2" 2> /dev/null > "$MINE_BAM"
 
 # Sort both by qname so per-qname comparison is straightforward.
-"$SAMTOOLS" sort -n -@ 2 -O bam -o "${PREFIX}.golden.qsort.bam"  "$GOLDEN_BAM"
-"$SAMTOOLS" sort -n -@ 2 -O bam -o "${PREFIX}.mine.qsort.bam"    "$MINE_BAM"
+"$SAMTOOLS" sort -n -@ 2 -O bam -o "${PREFIX}.golden.qsort.bam" "$GOLDEN_BAM"
+"$SAMTOOLS" sort -n -@ 2 -O bam -o "${PREFIX}.mine.qsort.bam" "$MINE_BAM"
 
 # Extract (qname, flag, pos, cigar, XR, XG, XM) per primary record
 # (flag & 0x904 == 0: mapped, not secondary, not supplementary). The pos+cigar
@@ -134,7 +134,7 @@ extract_tags() {
 }
 
 extract_tags "${PREFIX}.golden.qsort.bam" > "${PREFIX}.golden.tags"
-extract_tags "${PREFIX}.mine.qsort.bam"   > "${PREFIX}.mine.tags"
+extract_tags "${PREFIX}.mine.qsort.bam" > "${PREFIX}.mine.tags"
 
 # Join on (qname, is_r1) and assert XR/XG always match, XM matches when
 # (pos, cigar) match.
@@ -186,7 +186,7 @@ mawk_check=$(mawk -F '\t' '
 # Last line of mawk_check is the tab-separated summary; everything before is diags.
 SUMMARY=$(echo "$mawk_check" | tail -1)
 DIAGS=$(echo "$mawk_check" | sed '$d')
-read -r N_TOTAL N_ALN_MATCH N_XM_MATCH FAIL_XR FAIL_XG FAIL_XM FAIL_XMLEN N_ALN_DIVERGE <<<"$(echo "$SUMMARY" | tr '\t' ' ')"
+read -r N_TOTAL N_ALN_MATCH N_XM_MATCH FAIL_XR FAIL_XG FAIL_XM FAIL_XMLEN N_ALN_DIVERGE <<< "$(echo "$SUMMARY" | tr '\t' ' ')"
 
 echo "Layer 3 summary:"
 echo "  records compared:             $N_TOTAL"

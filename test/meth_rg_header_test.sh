@@ -38,9 +38,18 @@ fixtures="$2"
 ref="$fixtures/phix.fa"
 reads="$fixtures/reads.fa"
 
-[[ -x "$bin" ]]   || { echo "FAIL: bwa-mem3 binary not executable at $bin" >&2; exit 1; }
-[[ -s "$ref" ]]   || { echo "FAIL: phix.fa missing at $ref" >&2; exit 1; }
-[[ -s "$reads" ]] || { echo "FAIL: reads.fa missing at $reads" >&2; exit 1; }
+[[ -x "$bin" ]] || {
+    echo "FAIL: bwa-mem3 binary not executable at $bin" >&2
+    exit 1
+}
+[[ -s "$ref" ]] || {
+    echo "FAIL: phix.fa missing at $ref" >&2
+    exit 1
+}
+[[ -s "$reads" ]] || {
+    echo "FAIL: reads.fa missing at $reads" >&2
+    exit 1
+}
 
 # A read group whose ID is distinct from every other token so a stray match
 # can't accidentally satisfy the assertions.
@@ -67,7 +76,10 @@ assert_rg_consistent() {
 
     local n_recs n_tagged
     n_recs="$(wc -l < "$recs" | tr -d ' ')"
-    [[ "$n_recs" -ge 1 ]] || { echo "FAIL [$label]: no alignment records emitted" >&2; exit 1; }
+    [[ "$n_recs" -ge 1 ]] || {
+        echo "FAIL [$label]: no alignment records emitted" >&2
+        exit 1
+    }
 
     # RG:Z:<RG_ID> may be the last tag on a record (no trailing tab) — match
     # a tab-or-end boundary so a record ending in RG:Z still counts.
@@ -83,20 +95,25 @@ assert_rg_consistent() {
 # --- default (non-meth) path: SAM output -----------------------------------
 # This path was always correct; it is the control that proves --meth must
 # match it.
-if [[ ! -s "$ref.bwt.2bit.64" || ! -s "$ref.amb" \
-      || ! -s "$ref.ann"       || ! -s "$ref.pac" ]]; then
-    "$bin" index "$ref" >/dev/null 2>&1 || { echo "FAIL: bwa-mem3 index on phix.fa failed" >&2; exit 1; }
+if [[ ! -s "$ref.bwt.2bit.64" || ! -s "$ref.amb" ||
+    ! -s "$ref.ann" || ! -s "$ref.pac" ]]; then
+    "$bin" index "$ref" > /dev/null 2>&1 || {
+        echo "FAIL: bwa-mem3 index on phix.fa failed" >&2
+        exit 1
+    }
 fi
 
-"$bin" mem -R "$RG" "$ref" "$reads" >"$tmp/plain.sam" 2>"$tmp/plain.err" || {
-    echo "FAIL: bwa-mem3 mem (non-meth) exited non-zero" >&2; cat "$tmp/plain.err" >&2; exit 1
+"$bin" mem -R "$RG" "$ref" "$reads" > "$tmp/plain.sam" 2> "$tmp/plain.err" || {
+    echo "FAIL: bwa-mem3 mem (non-meth) exited non-zero" >&2
+    cat "$tmp/plain.err" >&2
+    exit 1
 }
-grep '^@'  "$tmp/plain.sam" >"$tmp/plain.hdr" || true
-grep -v '^@' "$tmp/plain.sam" >"$tmp/plain.recs" || true
+grep '^@' "$tmp/plain.sam" > "$tmp/plain.hdr" || true
+grep -v '^@' "$tmp/plain.sam" > "$tmp/plain.recs" || true
 assert_rg_consistent "non-meth" "$tmp/plain.hdr" "$tmp/plain.recs"
 
 # --- --meth path: BAM output (needs samtools to read the header) -----------
-if ! command -v samtools >/dev/null 2>&1; then
+if ! command -v samtools > /dev/null 2>&1; then
     echo "SKIP: samtools not found; --meth half not checked" >&2
     echo "PASS: @RG header emitted in non-meth mode (--meth skipped)"
     exit 0
@@ -107,20 +124,31 @@ fi
 # so a partial index left by an interrupted run is rebuilt rather than skipped —
 # matching the non-meth block above. The seed has no `.0123` (never read in
 # --meth; extension uses the original reference, which itself pac-fetches).
-if [[ ! -s "$ref.meth.fa"            || ! -s "$ref.meth.bwt.2bit.64" \
-      || ! -s "$ref.meth.amb"        || ! -s "$ref.meth.ann"         \
-      || ! -s "$ref.meth.pac" ]]; then
-    "$bin" index --meth "$ref" >/dev/null 2>&1 \
-        || { echo "FAIL: bwa-mem3 index --meth on phix.fa failed" >&2; exit 1; }
+if [[ ! -s "$ref.meth.fa" || ! -s "$ref.meth.bwt.2bit.64" ||
+    ! -s "$ref.meth.amb" || ! -s "$ref.meth.ann" ||
+    ! -s "$ref.meth.pac" ]]; then
+    "$bin" index --meth "$ref" > /dev/null 2>&1 \
+        || {
+            echo "FAIL: bwa-mem3 index --meth on phix.fa failed" >&2
+            exit 1
+        }
 fi
 
-"$bin" mem --meth -R "$RG" "$ref" "$reads" >"$tmp/meth.bam" 2>"$tmp/meth.err" || {
-    echo "FAIL: bwa-mem3 mem --meth exited non-zero" >&2; cat "$tmp/meth.err" >&2; exit 1
+"$bin" mem --meth -R "$RG" "$ref" "$reads" > "$tmp/meth.bam" 2> "$tmp/meth.err" || {
+    echo "FAIL: bwa-mem3 mem --meth exited non-zero" >&2
+    cat "$tmp/meth.err" >&2
+    exit 1
 }
-samtools view -H "$tmp/meth.bam" >"$tmp/meth.hdr" 2>/dev/null \
-    || { echo "FAIL: samtools could not read --meth BAM header" >&2; exit 1; }
-samtools view    "$tmp/meth.bam" >"$tmp/meth.recs" 2>/dev/null \
-    || { echo "FAIL: samtools could not read --meth BAM records" >&2; exit 1; }
+samtools view -H "$tmp/meth.bam" > "$tmp/meth.hdr" 2> /dev/null \
+    || {
+        echo "FAIL: samtools could not read --meth BAM header" >&2
+        exit 1
+    }
+samtools view "$tmp/meth.bam" > "$tmp/meth.recs" 2> /dev/null \
+    || {
+        echo "FAIL: samtools could not read --meth BAM records" >&2
+        exit 1
+    }
 assert_rg_consistent "--meth" "$tmp/meth.hdr" "$tmp/meth.recs"
 
 # --- --meth @HD de-dup: a user -H @HD must suppress the default @HD ---------
@@ -134,11 +162,16 @@ assert_rg_consistent "--meth" "$tmp/meth.hdr" "$tmp/meth.recs"
 # assertions above never exercise (an @RG line carries no @HD).
 USER_HD=$'@HD\tVN:1.6\tSO:coordinate'
 "$bin" mem --meth -R "$RG" -H "$USER_HD" "$ref" "$reads" \
-    >"$tmp/meth_hd.bam" 2>"$tmp/meth_hd.err" || {
-    echo "FAIL: bwa-mem3 mem --meth -H @HD exited non-zero" >&2; cat "$tmp/meth_hd.err" >&2; exit 1
+    > "$tmp/meth_hd.bam" 2> "$tmp/meth_hd.err" || {
+    echo "FAIL: bwa-mem3 mem --meth -H @HD exited non-zero" >&2
+    cat "$tmp/meth_hd.err" >&2
+    exit 1
 }
-samtools view -H "$tmp/meth_hd.bam" >"$tmp/meth_hd.hdr" 2>/dev/null \
-    || { echo "FAIL: samtools could not read --meth -H @HD BAM header" >&2; exit 1; }
+samtools view -H "$tmp/meth_hd.bam" > "$tmp/meth_hd.hdr" 2> /dev/null \
+    || {
+        echo "FAIL: samtools could not read --meth -H @HD BAM header" >&2
+        exit 1
+    }
 
 n_hd="$(grep -c $'^@HD\t' "$tmp/meth_hd.hdr" || true)"
 if [[ "$n_hd" -ne 1 ]]; then

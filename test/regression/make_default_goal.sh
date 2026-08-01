@@ -47,7 +47,7 @@ fi
 # tier is enough to cover the branch.
 case "$(uname -m)" in
     arm64 | aarch64) arch_cases=(arm64 native) ;;
-    *)               arch_cases=(sse41 avx2 avx512bw native) ;;
+    *) arch_cases=(sse41 avx2 avx512bw native) ;;
 esac
 
 fail=0
@@ -82,7 +82,7 @@ for arch in "${arch_cases[@]}"; do
     check all "arch=$arch"
 done
 
-if (( fail != 0 )); then
+if ((fail != 0)); then
     echo "FAIL: root Makefile default goal does not build the aligner"
     exit 1
 fi

@@ -53,7 +53,7 @@ rm -f "$ref.hdr" phix.dict
 "$BWA_MEM3" index "$ref" > index.log 2>&1
 
 # PE reads sliced from phix — deterministic, no PRNG.
-python3 - <<'PY'
+python3 - << 'PY'
 seq = "".join(l.strip() for l in open("phix.fa") if not l.startswith(">")).upper()
 comp = str.maketrans("ACGT", "TGCA")
 with open("r1.fq", "w") as a, open("r2.fq", "w") as b:
@@ -64,7 +64,7 @@ with open("r1.fq", "w") as a, open("r2.fq", "w") as b:
         b.write("@p%d/2\n%s\n+\n%s\n" % (i, y, "I"*120))
 PY
 
-check() {   # <label> <actual-@HD>
+check() { # <label> <actual-@HD>
     if [ -z "$2" ]; then
         echo "FAIL: $1 emitted no default @HD" >&2
         exit 1
@@ -73,7 +73,7 @@ check() {   # <label> <actual-@HD>
         echo "FAIL: $1 default @HD differs from the expected default" >&2
         printf '  expected: %s\n  actual:   %s\n' \
             "$(printf '%s' "$EXPECT" | sed 's/\t/\\t/g')" \
-            "$(printf '%s' "$2"      | sed 's/\t/\\t/g')" >&2
+            "$(printf '%s' "$2" | sed 's/\t/\\t/g')" >&2
         exit 1
     fi
     printf '  %-12s %s\n' "$1" "$(printf '%s' "$2" | sed 's/\t/\\t/g')"
@@ -82,7 +82,7 @@ check() {   # <label> <actual-@HD>
 echo "default @HD by output path:"
 
 # --- SAM text ---
-"$BWA_MEM3" mem "$ref" r1.fq r2.fq > sam.sam 2>sam.err
+"$BWA_MEM3" mem "$ref" r1.fq r2.fq > sam.sam 2> sam.err
 sam_hd=$(grep -m1 '^@HD' sam.sam || true)
 check "SAM text" "$sam_hd"
 
@@ -93,18 +93,26 @@ if ! command -v samtools > /dev/null 2>&1; then
 fi
 
 # --- --bam ---
-"$BWA_MEM3" mem --bam "$ref" r1.fq r2.fq > bam.bam 2>bam.err
+"$BWA_MEM3" mem --bam "$ref" r1.fq r2.fq > bam.bam 2> bam.err
 bam_hd=$(samtools view -H --no-PG bam.bam | grep -m1 '^@HD' || true)
 check "--bam" "$bam_hd"
 
 # --- --meth (needs the D3 seed index) ---
-if [[ ! -s "$ref.meth.bwt.2bit.64" || ! -s "$ref.meth.amb" \
-      || ! -s "$ref.meth.ann"      || ! -s "$ref.meth.pac" ]]; then
+if [[ ! -s "$ref.meth.bwt.2bit.64" || ! -s "$ref.meth.amb" ||
+    ! -s "$ref.meth.ann" || ! -s "$ref.meth.pac" ]]; then
     "$BWA_MEM3" index --meth "$ref" > index-meth.log 2>&1 \
-        || { echo "FAIL: bwa-mem3 index --meth failed" >&2; cat index-meth.log >&2; exit 1; }
+        || {
+            echo "FAIL: bwa-mem3 index --meth failed" >&2
+            cat index-meth.log >&2
+            exit 1
+        }
 fi
-"$BWA_MEM3" mem --meth "$ref" r1.fq > meth.bam 2>meth.err \
-    || { echo "FAIL: bwa-mem3 mem --meth exited non-zero" >&2; cat meth.err >&2; exit 1; }
+"$BWA_MEM3" mem --meth "$ref" r1.fq > meth.bam 2> meth.err \
+    || {
+        echo "FAIL: bwa-mem3 mem --meth exited non-zero" >&2
+        cat meth.err >&2
+        exit 1
+    }
 meth_hd=$(samtools view -H --no-PG meth.bam | grep -m1 '^@HD' || true)
 check "--meth" "$meth_hd"
 
