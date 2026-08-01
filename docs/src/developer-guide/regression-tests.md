@@ -8,13 +8,13 @@ bwa-mem3 has three categories of tests — **unit**, **integration**, and **regr
 |---|---|---|---|
 | unit | `test/bwa_mem3_tests_unit` | None; all inputs synthetic | Every matrix row |
 | integration | `test/bwa_mem3_tests_integration` | Small committed FASTAs / FMI in `test/fixtures/` | SSE4.1, AVX2, ARM64 Linux, macOS ARM |
-| regression | `test/regression/*.sh` | Downloaded references (phiX, chr22) + bwa + dwgsim | Canonical AVX2 row only |
+| regression | `test/regression/*.sh` | Committed phiX in `test/fixtures/`; chr22 downloaded by CI, with reads simulated by holodeck; bwa for the parity diffs | Canonical AVX2 row, except `chr22_parity.sh` (every row) and the source-only lints (their own jobs) |
 
 **Unit tests** must use only synthetic inputs generated programmatically and complete in under 100 ms each. They exercise individual kernels in isolation: kswv scoring, banded Smith-Waterman, KSW, FM-index operations, SMEM extraction, BAM encoding, and pair handling.
 
 **Integration tests** may load small committed fixtures from `test/fixtures/` and have a per-test budget of 10 seconds. They exercise cross-component paths: index loading, SMEM-to-alignment pipelines, and output format validation.
 
-**Regression tests** are standalone bash scripts that shell out to the `bwa-mem3` binary, may diff against third-party tool output (bwa, bwa-meth, samtools), and require fixtures that are either committed to the fixtures directory or downloaded by CI at run time.
+**Regression tests** are standalone bash scripts that shell out to the `bwa-mem3` binary, may diff against third-party tool output (bwa, bwa-meth, samtools), and require fixtures that are either committed to the fixtures directory or downloaded by CI at run time. The source-only lints are the exception: they read `src/` and `ci.yml` directly, need no binary and no fixtures, and run in their own CI jobs.
 
 ## Running tests locally
 
@@ -46,15 +46,24 @@ make test
 
 ### Running a regression test locally
 
-Regression scripts expect certain environment variables to point at fixtures. The phiX parity test requires `dwgsim`:
+Most regression scripts take their inputs from environment variables naming a binary and its fixtures — see the comment block at the top of each script, and `test/regression/README.md` for the contract. The source-only lints take neither, so they are the cheapest thing to run:
 
 ```bash
-mkdir -p /tmp/ci-test && cd /tmp/ci-test
-curl -sL "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/819/615/GCF_000819615.1_ViralProj14015/GCF_000819615.1_ViralProj14015_genomic.fna.gz" | gunzip > phix174.fa
-dwgsim -z 42 -N 500 -1 150 -2 150 -r 0.001 -S 2 phix174.fa reads
-cd -
-BWA_MEM2="$(pwd)/bwa-mem3" CI_TEST_DIR=/tmp/ci-test bash test/regression/phix_parity.sh
+bash test/regression/ndebug_gate_lint.sh        # no build, no fixtures
+bash test/regression/debug_macro_flag_lint.sh
 ```
+
+For a script that does need the binary, the phiX-backed ones use a committed fixture, so they need no download and no third-party tool:
+
+```bash
+make                                             # builds ./bwa-mem3
+BWA_MEM3="$(pwd)/bwa-mem3" \
+COMPAT_PHIX_FA="$(pwd)/test/fixtures/phix.fa" \
+COMPAT_WORK_DIR=/tmp/compat-bytes \
+bash test/regression/compat_byte_identical.sh
+```
+
+The chr22 scripts are the expensive end: they want a chr22 reference indexed for both `bwa` and `bwa-mem3` plus a holodeck read simulation, which is why CI caches them. `ci.yml` is the reference for how each script's inputs get staged.
 
 ## Test framework
 
