@@ -4,10 +4,10 @@ End-to-end parity and invariant checks. `chr22_parity.sh` and
 `version_banner.sh` run on every matrix row; the rest run on the canonical
 AVX2 row only, except for the ones wired to a job of their own:
 `profile_slice_cpu.sh` runs from `profiling-build` (see below), and the
-`ndebug_gate_lint*`, `debug_macro_flag_lint*`, `shell_lint*` and
-`regression_coverage_lint*` pairs need no binary at all and run from
-`ndebug-gate-lint`, `debug-macro-flag-lint`, `shell-lint` and
-`regression-coverage-lint` respectively. Each script:
+`ndebug_gate_lint*`, `debug_macro_flag_lint*`, `shell_lint*`,
+`regression_coverage_lint*` and `readme_contract_lint*` pairs need no binary at
+all and run from `ndebug-gate-lint`, `debug-macro-flag-lint`, `shell-lint`,
+`regression-coverage-lint` and `readme-contract-lint` respectively. Each script:
 
 - is self-contained (set -euo pipefail; explicit input contract — env vars for
   every script but the source-only lints, which instead take an optional
@@ -41,18 +41,32 @@ AVX2 row only, except for the ones wired to a job of their own:
 | `regression_coverage_lint_selftest.sh` | the lint above still detects an unrun script, so its `PASS` means something | "Coverage lint still detects an unrun script"       |
 | `host_floor_enforce.sh`      | below-floor hosts get exit 2 + a readable error, not a SIGILL (needs `TESTING_BUILD=1`) | "SIMD floor enforcement (TESTING_BUILD, injected below-floor tier)" |
 | `version_banner.sh`          | `bwa-mem3 version` prints the SIMD floor and runtime tier lines        | "Version banner regression"                         |
+| `readme_contract_lint.sh`    | this README names no script that was deleted, and its source-only-lint block lists exactly the scripts that read no environment | "README still describes the regression scripts"     |
+| `readme_contract_lint_selftest.sh` | the lint above still detects a stale README, so its `PASS` means something | "README lint still detects drift"                  |
 
 The table is a reading guide, not an inventory — `ls test/regression/*.sh` is
 the authoritative list, and `ci.yml` is where each one is actually wired up.
 
 Every script but the source-only lints reads its inputs from environment
-variables — see the comment block at the top of each file. The lints read no
-environment at all: `ndebug_gate_lint.sh` takes the directory to scan (default
-`src/`) and `debug_macro_flag_lint.sh` takes the repository root to check
-(default: this repository), each as an optional positional argument, and the
-two `*_selftest.sh` scripts take no input, since they build the fixture trees
-they aim those lints at. `.github/workflows/ci.yml` sets the required vars and
-invokes the scripts.
+variables — see the comment block at the top of each file.
+`.github/workflows/ci.yml` sets the required vars and invokes the scripts.
+
+<!-- source-only lints: begin -->
+The source-only lints read no environment at all. Each takes the directory to
+work on as an optional positional argument, so that its self-test can aim the
+same checks at a fixture tree; each self-test takes no input, since it builds
+the trees it aims its lint at.
+
+| Lint | Positional argument | Self-test |
+|------|---------------------|-----------|
+| `ndebug_gate_lint.sh`         | directory to scan (default `src/`)                  | `ndebug_gate_lint_selftest.sh`         |
+| `debug_macro_flag_lint.sh`    | repository root to check (default: this repository) | `debug_macro_flag_lint_selftest.sh`    |
+| `regression_coverage_lint.sh` | repository root to check (default: this repository) | `regression_coverage_lint_selftest.sh` |
+| `readme_contract_lint.sh`     | repository root to check (default: this repository) | `readme_contract_lint_selftest.sh`     |
+<!-- source-only lints: end -->
+
+`readme_contract_lint.sh` checks that block against the scripts themselves, so
+a lint added without a row here fails CI rather than going unmentioned.
 
 One exception to "any binary will do": `profile_slice_cpu.sh` asserts on
 `--profile` output, which a default build compiles out entirely, so it needs a
