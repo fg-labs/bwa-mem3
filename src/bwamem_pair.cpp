@@ -62,6 +62,19 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include <algorithm>
 namespace {
 
+/* Storage model: the index keeps only the NEWEST query position per k-mer code,
+ * so each window k-mer casts exactly one vote. The alternative -- chaining every
+ * query position, so a code occurring m times in the read and n times in the
+ * window casts m*n votes -- never misses a vote on the true diagonal, but costs
+ * a chain walk whose length grows as read_length / alphabet^k, which is what
+ * makes small k expensive.
+ *
+ * Measured on a 644k-pair bisulfite set (150 bp, k=6): single-position storage
+ * narrows 98.29% of scans against chaining's 98.84%, at equal-or-better accuracy
+ * (recall at MAPQ>=60 was 5 reads higher out of 1.29M) and ~1% less wall time.
+ * The lost votes are the repeated-k-mer case, where keeping the newest
+ * occurrence can retain the wrong one. */
+
 /* Find the dominant k-mer exact-match diagonal of the (oriented) read within the
  * reference window ref[0..M) and return the window sub-range [ob,oe) a band of
  * half-width opt->rescue_band around it covers. Returns false (=> full window)
@@ -111,11 +124,9 @@ static bool matesw_kmer_narrow(const mem_opt_t *opt, const uint8_t *ref, int M,
     constexpr int HMAX = HS - (HS >> 2);                   /* stop inserting at 75% load */
     static_assert(HMAX < HS, "the table must retain empty slots or linear probing cannot terminate");
     static thread_local std::vector<uint32_t> slot_code;   /* 0xFFFFFFFF = empty */
-    static thread_local std::vector<int>      slot_head;
-    static thread_local std::vector<int>      nxt;         /* read-pos chain */
+    static thread_local std::vector<int>      slot_pos;     /* newest query pos per code */
     static thread_local std::vector<int>      touched;
-    if ((int)slot_code.size() < HS) { slot_code.assign(HS, 0xFFFFFFFFu); slot_head.assign(HS, -1); }
-    if ((int)nxt.size() < l_ms) nxt.resize(l_ms);
+    if ((int)slot_code.size() < HS) { slot_code.assign(HS, 0xFFFFFFFFu); slot_pos.assign(HS, -1); }
     touched.clear();
 
     uint32_t mask = (k >= 16) ? 0xffffffffu : ((1u << (2*k)) - 1);
@@ -130,9 +141,9 @@ static bool matesw_kmer_narrow(const mem_opt_t *opt, const uint8_t *ref, int M,
               while (slot_code[h] != 0xFFFFFFFFu && slot_code[h] != code) h = (h + 1) & HMASK;
               if (slot_code[h] == 0xFFFFFFFFu) {
                   if ((int)touched.size() >= HMAX) break;   /* table full enough: stop indexing */
-                  slot_code[h] = code; slot_head[h] = -1; touched.push_back((int)h);
+                  slot_code[h] = code; touched.push_back((int)h);
               }
-              nxt[pos] = slot_head[h]; slot_head[h] = pos;
+              slot_pos[h] = pos;   /* keep the newest occurrence only */
           }
       } }
     if (touched.empty()) return false;
@@ -153,9 +164,9 @@ static bool matesw_kmer_narrow(const mem_opt_t *opt, const uint8_t *ref, int M,
               uint32_t h = (code * 2654435761u) >> (32 - 10);
               while (slot_code[h] != 0xFFFFFFFFu && slot_code[h] != code) h = (h + 1) & HMASK;
               if (slot_code[h] == code) {
-                  for (int p = slot_head[h]; p >= 0; p = nxt[p]) {
-                      int idx = (opos - p) + l_ms;
-                      if (idx < 0 || idx >= span) continue;
+                  int p = slot_pos[h];
+                  int idx = (opos - p) + l_ms;
+                  if (idx >= 0 && idx < span) {
                       int v = ++dv[idx];
                       if (v > best_v) { best_v = v; best_d = opos - p; }
                   }

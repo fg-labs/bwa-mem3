@@ -360,6 +360,15 @@ the read, which cannot host a full-length rescue alignment. The `kswv` kernel is
 unchanged — it is simply handed a shorter reference window — so the speedup comes from
 doing far less DP.
 
+The anchor index keeps one query position per K-mer, so each window K-mer casts a single
+diagonal vote. Chaining every occurrence instead would never miss a vote on the true
+diagonal, but costs a walk whose length grows as `read_length / alphabet^K` — which is what
+makes small K slow. Measured on a 644k-pair simulated bisulfite set (chr20, 150 bp, `K=6`,
+`-t 16`) on a 16-vCPU Graviton4 host (arm64, NEON tier), single-position indexing narrows
+98.29 % of scans against chaining's 98.84 %, at equal-or-better accuracy (recall at MAPQ ≥ 60
+1204271 vs 1204266 of 1288884 primaries; one confident mismap either way) and ~1 % less wall
+time — 13.46 s against 13.58 s.
+
 `K` ranges over `1…16` — a K-mer code has to fit the `uint32` the anchor index packs it
 into, so larger values are rejected rather than silently treated as `K=16`. Bare
 `--rescue-kmer` selects `K=6`. Smaller K makes the anchor scan degenerate and slow (the
