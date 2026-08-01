@@ -106,13 +106,13 @@ sq="$(sq_for_sn "$tmp/hdr")"
 want_tag() {
     grep -qF -- "$1" <<<"$sq" \
         || { echo "FAIL [meth sidecar]: @SQ missing '$1'" >&2
-             echo "$sq" | sed $'s/\t/<TAB>/g' >&2; exit 1; }
+             echo "${sq//$'\t'/<TAB>}" >&2; exit 1; }
 }
 want_tag $'\tM5:'"$M5"
 want_tag $'\tUR:'"$UR"
 want_tag $'\tAS:'"$AS"
 want_tag $'\tSP:'"$SP"
-grep -qE $'\tLN:'"$LN"$'(\t|$)' <<<"$sq" || fail "@SQ LN is not $LN (chrom map); got: $(sed $'s/\t/<TAB>/g' <<<"$sq")"
+grep -qE $'\tLN:'"$LN"$'(\t|$)' <<<"$sq" || fail "@SQ LN is not $LN (chrom map); got: ${sq//$'\t'/<TAB>}"
 
 # @CO/@PG/@RG provenance from the original sidecar is forwarded (the writer
 # passes through every non-@HD/non-@SQ record, not just @CO).

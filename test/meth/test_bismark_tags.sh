@@ -51,8 +51,15 @@ fi
 # Index the original ref.fa with samtools faidx (holodeck needs .fai).
 [[ -f ref.fa.fai ]] || "$SAMTOOLS" faidx ref.fa
 
-PREFIX="/tmp/holodeck-bismark-tags"
-rm -f "$PREFIX".* "$PREFIX".golden.bam
+# Everything this test generates goes into a private per-run directory. Fixed
+# names under /tmp can be pre-created as symlinks by another local user, in
+# which case the redirections below would follow them and clobber an unrelated
+# file; they also stop two runs of this script from coexisting. HOLODECK_DIR
+# above is deliberately NOT moved here: it caches a cargo build tree across
+# runs, and it is overridable from the environment.
+SCRATCH="$(mktemp -d)"
+trap 'rm -rf "$SCRATCH"' EXIT
+PREFIX="$SCRATCH/holodeck-bismark-tags"
 
 "$HOLODECK_BIN" simulate \
     -r ref.fa \
@@ -72,12 +79,13 @@ R2="${PREFIX}.r2.fastq.gz"
 
 if [[ ! -s "$GOLDEN_BAM" || ! -s "$R1" || ! -s "$R2" ]]; then
     echo "FAIL layer 3: holodeck did not produce expected outputs"
+    # shellcheck disable=SC2012  # human-readable failure dump, not parsed
     ls -la "${PREFIX}".* 2>&1 | head -10
     exit 1
 fi
 
 # Run bwa-mem3 on the simulated FASTQs.
-MINE_BAM="/tmp/bismark-tags-mine.bam"
+MINE_BAM="$SCRATCH/bismark-tags-mine.bam"
 "$BWAMEM3" mem --meth -t 2 ref.fa "$R1" "$R2" 2>/dev/null > "$MINE_BAM"
 
 # Sort both by qname so per-qname comparison is straightforward.

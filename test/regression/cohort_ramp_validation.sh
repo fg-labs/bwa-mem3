@@ -98,6 +98,7 @@ accept_flag cohort-ramp-ratio 2.5
 # --- the env spellings warn and fall back, rather than parsing a prefix -----
 env_warns() {   # $1 = variable, $2 = malformed value
     local var="$1" val="$2" rc=0
+    # shellcheck disable=SC2016  # $0..$3 are the inner bash -c positionals
     env "$var=$val" bash -c '"$0" mem "$1" "$2" >/dev/null 2>"$3"' \
         "$BWA_MEM3" "$ref" "$reads" "$err" || rc=$?
     if [[ "$rc" -ne 0 ]]; then
@@ -114,6 +115,7 @@ env_warns() {   # $1 = variable, $2 = malformed value
 
 env_quiet() {   # $1 = variable, $2 = well-formed value
     local var="$1" val="$2" rc=0
+    # shellcheck disable=SC2016  # $0..$3 are the inner bash -c positionals
     env "$var=$val" bash -c '"$0" mem "$1" "$2" >/dev/null 2>"$3"' \
         "$BWA_MEM3" "$ref" "$reads" "$err" || rc=$?
     if [[ "$rc" -ne 0 ]]; then

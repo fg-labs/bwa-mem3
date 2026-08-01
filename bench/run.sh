@@ -65,6 +65,7 @@ else
 fi
 
 # Pick /usr/bin/time invocation per OS. Both emit max RSS; units differ.
+# shellcheck disable=SC2016  # $1/$2/$NF below are awk fields, not shell vars
 if [[ "$OS" == "Darwin" ]]; then
   TIME_CMD=(/usr/bin/time -l)
   # macOS time -l:

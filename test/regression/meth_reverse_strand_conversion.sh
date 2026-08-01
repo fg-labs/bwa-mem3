@@ -77,7 +77,9 @@ read -r rn pos mapq rev cig as nm xr unm < <(get pe.bam 64)
 [ "$as" = "70" ]   || fail "R1: AS $as, want 70 (conversions free; 1 real mismatch at b=4)"
 
 # --- R2: forward-strand OB mate — strand-unaffected control (passes on buggy + fixed) ---
-read -r rn2 pos2 mapq2 rev2 cig2 as2 nm2 xr2 unm2 < <(get pe.bam 128)
+# `_` for mapq/as/nm: this control asserts placement and strand only, so those
+# three columns are consumed positionally but deliberately not checked.
+read -r rn2 pos2 _ rev2 cig2 _ _ xr2 unm2 < <(get pe.bam 128)
 [ "$unm2" = "0" ]  || fail "R2 forward-OB should map (control)"
 [ "$rn2" = "chrT" ] || fail "R2: RNAME $rn2, want chrT"
 [ "$pos2" = "96" ]  || fail "R2: POS $pos2, want 96"

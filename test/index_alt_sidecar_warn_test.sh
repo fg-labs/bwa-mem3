@@ -231,7 +231,8 @@ grep -q "$WARN_RE" "$e/err.txt" \
 # leave a subshell).
 # --------------------------------------------------------------------------
 case_F () {
-    local ALT_SN="chrX_$(printf 'L%.0s' $(seq 1 300))_alt"   # ~306 bytes
+    local ALT_SN
+    ALT_SN="chrX_$(printf 'L%.0s' $(seq 1 300))_alt"   # ~306 bytes
     [[ ${#ALT_SN} -ge 256 ]] \
         || { echo "FAIL [index alt sidecar warn]: case F fixture bug -- ALT_SN is only ${#ALT_SN} bytes, need >= 256" >&2; exit 1; }
     local f="$tmp/f"; mkdir -p "$f"

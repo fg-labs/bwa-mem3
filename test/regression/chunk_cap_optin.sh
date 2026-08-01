@@ -164,11 +164,11 @@ fi
 # validation `--chunk-cap 100M` would look accepted and quietly leave batching
 # uncapped. Uses `=` form so a leading '-' is not taken for another option.
 reject() {  # $1 = the --chunk-cap value that must be refused
-    local rc
-    set +e
-    "$BWA_MEM3" mem "--chunk-cap=$1" "$ref" "$reads" >/dev/null 2>"$err"
-    rc=$?
-    set -e
+    # `|| rc=$?` rather than toggling errexit off around the call: a `set +e`
+    # window silently stops checking every command inside it, including any
+    # later added between the call and `rc=$?`.
+    local rc=0
+    "$BWA_MEM3" mem "--chunk-cap=$1" "$ref" "$reads" >/dev/null 2>"$err" || rc=$?
     if [[ "$rc" -eq 0 ]]; then
         echo "FAIL: '--chunk-cap=$1' was accepted; expected a non-zero exit"
         fails=$((fails + 1))

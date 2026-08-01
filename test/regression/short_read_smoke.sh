@@ -57,6 +57,8 @@ mkdir -p "$CHR22_SIM_DIR"
 # catch) is killed by `set -e` before the ASAN report is echoed,
 # leaving CI with only "exit 134" and no backtrace.
 short_log="$CHR22_SIM_DIR/short_dense_var.log"
+# shellcheck disable=SC2154  # rc IS assigned by `rc=$?` below; shellcheck does
+# not track assignments made inside a quoted trap body (false positive).
 trap 'rc=$?; if [ $rc -ne 0 ] && [ -f "$short_log" ]; then
         echo "--- bwa-mem3 stderr ($short_log) ---" >&2
         tail -n 200 "$short_log" >&2
