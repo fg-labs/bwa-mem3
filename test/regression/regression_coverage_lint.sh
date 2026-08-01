@@ -20,9 +20,12 @@
 # workflow names.
 #
 # A script counts as covered when a workflow names it, or when it is in the
-# recipe of a Makefile target a workflow actually invokes. Anything else has to
-# be listed in test/regression/coverage_exemptions.txt with the reason -- so a
-# script nothing runs is a reviewable line there rather than silence.
+# recipe of a Makefile target a workflow actually invokes. Comments do not
+# count, on either side: a step's comment usually names the script the step
+# runs, so counting it would let the coverage outlive the invocation that
+# produced it. Anything else has to be listed in
+# test/regression/coverage_exemptions.txt with the reason -- so a script nothing
+# runs is a reviewable line there rather than silence.
 #
 # Sibling lints: ndebug_gate_lint.sh, debug_macro_flag_lint.sh. Same failure
 # in each case -- a check that reads as green while doing no work.
@@ -104,7 +107,96 @@ if ((${#scripts[@]} == 0)); then
     exit 1
 fi
 
-workflow_text="$(cat "${workflow_files[@]}")"
+# ---------------------------------------------------------------------------
+# Comments are stripped before anything is matched against this text.
+#
+# A script counts as covered when a workflow names it. Without this, a workflow
+# *comment* naming a script satisfies that -- and comments here routinely name
+# the very script the step below runs, because the comment explains why it runs.
+# So the coverage survives deleting the thing that produces it: remove the
+# invocation, leave the comment that describes it, and the lint stays green
+# while nothing runs the script. That is the same read-as-green-while-doing-no-
+# work failure the lint exists to catch, one level up.
+#
+# `#` opens a comment only where a word starts and only outside quotes, which
+# is the rule in both YAML and the shell inside a `run:` block. Both halves
+# matter, and they pull in opposite directions:
+#
+#   - A word starts at the start of a line, after whitespace, and after a
+#     control operator -- `;`, `&`, `|`, `(`, `)` -- which ends the command
+#     before it. Treating only whitespace as the boundary reads `echo hi;# bash
+#     foo.sh` as a token, so the commented-out invocation counts as coverage:
+#     this lint's own bug, one level down.
+#   - Inside '...' or "..." a `#` is a literal, whatever precedes it. Truncating
+#     at the `#` in `echo "counted # of reads" && bash foo.sh` drops the real
+#     invocation after it and calls a script CI does run uncovered.
+#
+# A `#` inside a token (`sha256#...`, a URL fragment) is left alone by the same
+# word-start rule, and a backslash escapes the character after it.
+#
+# A quote opens a quoted run only when it does not follow a word character and
+# its partner is on the same line, and state resets at each newline rather than
+# carrying across the file. All three rules exist for the same reason: an
+# apostrophe in prose -- `- name: Don't rebuild` -- is far more common here than
+# a string spanning lines, and treating one as an opening quote would make every
+# `#` after it on that line read as a literal. That is the false-coverage
+# direction, which is the one that fails silently.
+#
+# Pairing alone does not get there, because the partner it finds may be another
+# prose apostrophe on the far side of the comment: in `- name: Don't rebuild  #
+# runs alpha.sh when it's stale` the two apostrophes pair across the `#`, the
+# comment reads as quoted text, and the script it names counts as covered. So a
+# quote must also start a word. An apostrophe inside one is prose (`Don't`,
+# `it's`); a real opening quote follows whitespace or punctuation (`bash -c
+# '...'`, `--flag='a # b'`, `$'...'`), never a letter or digit.
+#
+# The Makefile recipes gathered below are stripped the same way, and so is the
+# text the target-invocation search reads: a comment mentioning
+# `make test-injection` must not count as invoking that target either.
+# ---------------------------------------------------------------------------
+strip_comments() {
+    awk '
+    {
+        n = length($0)
+        in_single = 0
+        in_double = 0
+        kept = ""
+        for (i = 1; i <= n; i++) {
+            c = substr($0, i, 1)
+            if (in_single) {
+                if (c == "\047") in_single = 0
+                kept = kept c
+                continue
+            }
+            if (c == "\\" && i < n) {
+                kept = kept c substr($0, i + 1, 1)
+                i++
+                continue
+            }
+            if (in_double) {
+                if (c == "\"") in_double = 0
+                kept = kept c
+                continue
+            }
+            if (c == "\047" || c == "\"") {
+                prev = (i == 1) ? "" : substr($0, i - 1, 1)
+                if (prev !~ /[A-Za-z0-9]/ && index(substr($0, i + 1), c)) {
+                    if (c == "\047") in_single = 1; else in_double = 1
+                }
+                kept = kept c
+                continue
+            }
+            if (c == "#") {
+                prev = (i == 1) ? "" : substr($0, i - 1, 1)
+                if (prev == "" || prev ~ /[ \t;&|()]/) break
+            }
+            kept = kept c
+        }
+        print kept
+    }'
+}
+
+workflow_text="$(cat "${workflow_files[@]}" | strip_comments)"
 
 # ---------------------------------------------------------------------------
 # Recipes of Makefile targets that a workflow actually invokes.
@@ -155,7 +247,7 @@ while IFS= read -r target; do
         }
         in_recipe && /^\t/ { print; next }
         in_recipe && !/^\t/ && !/^#/ && NF { in_recipe = 0 }
-    ' "$makefile")"
+    ' "$makefile" | strip_comments)"
     invoked_recipes+="$recipe"$'\n'
 done < <(awk '
     # Rule lines only. Plenty of other lines carry a ":": assignments
