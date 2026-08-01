@@ -41,6 +41,10 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include <getopt.h>
 #include <errno.h>    /* errno/ERANGE: strtoll validation of the INT options */
 #include <unistd.h>   /* access(): --compat's "you passed a file" diagnostic */
+#ifdef BWA_MEM3_DEBUG_RESCUE_STATS
+#  include <atomic>
+#  include <cstdint>
+#endif
 #include "fastmap.h"
 #include "FMI_search.h"
 #include "bam_writer.h"
@@ -3432,6 +3436,28 @@ int main_mem(int argc, char *argv[])
     tprof[MEM][0] = __rdtsc() - tprof[MEM][0];
     display_stats(nt);
 
+#ifdef BWA_MEM3_DEBUG_RESCUE_STATS
+    /* How the --rescue-kmer anchor gate resolved over the whole run. A wall-time
+     * delta is uninterpretable without these: a vote floor tuned too high drives
+     * the narrowing rate toward zero while the scan still costs its full pass,
+     * which reads as "the optimization did nothing" rather than "the gate
+     * rejected everything". Printed unconditionally under the macro so a run with
+     * the knob off shows 0/0/0 rather than nothing at all. */
+    {
+        extern std::atomic<uint64_t> g_rescue_stat_scans;
+        extern std::atomic<uint64_t> g_rescue_stat_narrowed;
+        extern std::atomic<uint64_t> g_rescue_stat_skipped;
+        uint64_t sc = g_rescue_stat_scans.load(std::memory_order_relaxed);
+        uint64_t nw = g_rescue_stat_narrowed.load(std::memory_order_relaxed);
+        uint64_t sk = g_rescue_stat_skipped.load(std::memory_order_relaxed);
+        fprintf(stderr, "[M::%s] rescue-anchor: scans %llu narrowed %llu (%.2f%%) "
+                        "skipped %llu (%.2f%%)\n", __func__,
+                (unsigned long long)sc, (unsigned long long)nw,
+                sc ? 100.0 * (double)nw / (double)sc : 0.0,
+                (unsigned long long)sk,
+                sc ? 100.0 * (double)sk / (double)sc : 0.0);
+    }
+#endif
 
     return exit_code;
 }

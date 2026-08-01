@@ -61,6 +61,21 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include <cstdint>
 #include <algorithm>
 
+/* BWA_MEM3_DEBUG_RESCUE_STATS: count how the anchor gate actually resolved.
+ * Wall time alone cannot distinguish "narrowing helped" from "narrowing almost
+ * never fired", and the vote floor and uniqueness guard can silently drive the
+ * narrowing rate to zero while the scan still costs its O(M + l_ms) pass. These
+ * rates are the metric that explains a wall delta, so they are instrumented
+ * rather than inferred. Off in normal builds (the counters do not exist), and
+ * named per the BWA_MEM3_DEBUG_* convention the ci.yml -D list is linted
+ * against. */
+#ifdef BWA_MEM3_DEBUG_RESCUE_STATS
+#  include <atomic>
+std::atomic<uint64_t> g_rescue_stat_scans{0};      /* anchor scans that ran the vote */
+std::atomic<uint64_t> g_rescue_stat_narrowed{0};   /* ... that banded the SW         */
+std::atomic<uint64_t> g_rescue_stat_skipped{0};    /* ... that dropped the SW        */
+#endif
+
 namespace {
 
 /* Result of one anchor scan. `scanned` is the contract that matters: it is false
@@ -1777,6 +1792,13 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                 matesw_anchor_t anc = matesw_kmer_anchor(opt, ref, (int)(re - rb),
                                                          ms, l_ms, is_rev, collapse);
                 const bool declined = matesw_anchor_declines_rescue(opt, anc);
+#ifdef BWA_MEM3_DEBUG_RESCUE_STATS
+                if (anc.scanned) {
+                    g_rescue_stat_scans.fetch_add(1, std::memory_order_relaxed);
+                    if (anc.narrowed) g_rescue_stat_narrowed.fetch_add(1, std::memory_order_relaxed);
+                    if (declined)     g_rescue_stat_skipped.fetch_add(1, std::memory_order_relaxed);
+                }
+#endif
                 /* --rescue-skip: no anchor worth the SW. Mark the orientation
                  * declined and do not enqueue. mem_matesw_batch_post reads this
                  * same gar slot under the identical `a->rid == rid && re - rb >=
