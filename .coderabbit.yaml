@@ -418,6 +418,11 @@ reviews:
       # Stated as an allowlist on purpose. A denylist of the actual internal
       # names would have to spell them out in a world-readable file, which is
       # the exact disclosure this check exists to prevent.
+      #
+      # The bar for an entry is "a reader could look it up", not "we wrote it":
+      # holodeck is on the list because it is a public repository whose clone
+      # URL is already hardcoded in test/meth/test_bismark_tags.sh, so the name
+      # discloses nothing that the tree does not already say out loud.
       - name: "Public-repo hygiene"
         mode: "error"
         instructions: >-
@@ -430,7 +435,9 @@ reviews:
           publicly citable project. Treat as allowed only names a reader could
           look up: this repository and its own scripts, upstream bwa, bwa-mem2,
           bwa-meth, Bismark, samtools, htslib, libsais, mimalloc, sse2neon,
-          zlib-ng, dwgsim, and standard OS or cloud instance-type designations.
+          zlib-ng, dwgsim, holodeck (the public read simulator this repository
+          already clones by URL in test/meth/test_bismark_tags.sh), and standard
+          OS or cloud instance-type designations.
           Any other proper-noun tool, harness, bucket, fleet, queue, or internal
           project name is a FAIL. (2) An object-store URL (`s3://`, `gs://`,
           `az://`) or bucket name. (3) A cloud account number, an EC2 instance

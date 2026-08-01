@@ -776,10 +776,11 @@ jobs:
           cp bwa-meth-oracle/example/t_R2.fastq.gz test/meth/
           ls -la test/meth/
 
+      # No BWAMETH_DIR: the checkout above is a fixture source, not an oracle
+      # binary, and the copy step is what makes it reachable. Nothing under
+      # test/meth/ has read that variable since Layers 2-3 were retired.
       - name: Run --meth Layers 1-3
         if: matrix.canonical == true
-        env:
-          BWAMETH_DIR: ${{ github.workspace }}/bwa-meth-oracle
         run: bash test/regression/meth_oracle.sh
 
       - name: --meth whole-aligner regressions (D3)

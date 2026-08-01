@@ -12,7 +12,7 @@ all and run from `ndebug-gate-lint`, `debug-macro-flag-lint`, `shell-lint`,
 - is self-contained (set -euo pipefail; explicit input contract — env vars for
   every script but the source-only lints, which instead take an optional
   positional directory so their self-tests can aim the same checks at a fixture
-  tree)
+  tree, and `meth_oracle.sh`, which reads no input at all)
 - emits `PASS:` on success and `FAIL:` on failure
 - returns nonzero on failure
 
@@ -47,15 +47,17 @@ all and run from `ndebug-gate-lint`, `debug-macro-flag-lint`, `shell-lint`,
 The table is a reading guide, not an inventory — `ls test/regression/*.sh` is
 the authoritative list, and `ci.yml` is where each one is actually wired up.
 
-Every script but the source-only lints reads its inputs from environment
-variables — see the comment block at the top of each file.
+Every script but the ones named in the block below reads its inputs from
+environment variables — see the comment block at the top of each file.
 `.github/workflows/ci.yml` sets the required vars and invokes the scripts.
 
 <!-- source-only lints: begin -->
-The source-only lints read no environment at all. Each takes the directory to
-work on as an optional positional argument, so that its self-test can aim the
-same checks at a fixture tree; each self-test takes no input, since it builds
-the trees it aims its lint at.
+These scripts read no environment at all.
+
+The source-only lints each take the directory to work on as an optional
+positional argument, so that its self-test can aim the same checks at a fixture
+tree; each self-test takes no input, since it builds the trees it aims its lint
+at.
 
 | Lint | Positional argument | Self-test |
 |------|---------------------|-----------|
@@ -63,10 +65,16 @@ the trees it aims its lint at.
 | `debug_macro_flag_lint.sh`    | repository root to check (default: this repository) | `debug_macro_flag_lint_selftest.sh`    |
 | `regression_coverage_lint.sh` | repository root to check (default: this repository) | `regression_coverage_lint_selftest.sh` |
 | `readme_contract_lint.sh`     | repository root to check (default: this repository) | `readme_contract_lint_selftest.sh`     |
+
+`meth_oracle.sh` is the one env-free script that is not a lint, and it takes no
+argument either. It wraps the `--meth` harness under `test/meth/`, whose inputs
+are the gitignored fixtures CI copies in there; the wrapper's whole job is to
+invoke that harness and mark the result.
 <!-- source-only lints: end -->
 
 `readme_contract_lint.sh` checks that block against the scripts themselves, so
-a lint added without a row here fails CI rather than going unmentioned.
+a script that stops reading the environment without gaining a mention here
+fails CI rather than going unnoticed.
 
 One exception to "any binary will do": `profile_slice_cpu.sh` asserts on
 `--profile` output, which a default build compiles out entirely, so it needs a
