@@ -30,14 +30,26 @@ fixtures="$2"
 ref="$fixtures/phix.fa"
 reads="$fixtures/reads.fa"
 
-[[ -x "$bin" ]]   || { echo "FAIL: bwa-mem3 binary not executable at $bin" >&2; exit 1; }
-[[ -s "$ref" ]]   || { echo "FAIL: phix.fa missing at $ref" >&2; exit 1; }
-[[ -s "$reads" ]] || { echo "FAIL: reads.fa missing at $reads" >&2; exit 1; }
+[[ -x "$bin" ]] || {
+    echo "FAIL: bwa-mem3 binary not executable at $bin" >&2
+    exit 1
+}
+[[ -s "$ref" ]] || {
+    echo "FAIL: phix.fa missing at $ref" >&2
+    exit 1
+}
+[[ -s "$reads" ]] || {
+    echo "FAIL: reads.fa missing at $reads" >&2
+    exit 1
+}
 
 # Build the phiX FMI index if not already present.
-if [[ ! -s "$ref.bwt.2bit.64" || ! -s "$ref.amb" \
-      || ! -s "$ref.ann"       || ! -s "$ref.pac" ]]; then
-    "$bin" index "$ref" >/dev/null 2>&1 || { echo "FAIL: bwa-mem3 index on phix.fa failed" >&2; exit 1; }
+if [[ ! -s "$ref.bwt.2bit.64" || ! -s "$ref.amb" ||
+    ! -s "$ref.ann" || ! -s "$ref.pac" ]]; then
+    "$bin" index "$ref" > /dev/null 2>&1 || {
+        echo "FAIL: bwa-mem3 index on phix.fa failed" >&2
+        exit 1
+    }
 fi
 
 sam="$(mktemp)"
@@ -51,7 +63,7 @@ assert_pg_well_formed() {
     local label="$1"
     local rg="$2"
 
-    "$bin" mem -R "$rg" "$ref" "$reads" >"$sam" 2>"$err" || {
+    "$bin" mem -R "$rg" "$ref" "$reads" > "$sam" 2> "$err" || {
         echo "FAIL [$label]: bwa-mem3 mem exited non-zero" >&2
         echo "---- stderr ----" >&2
         cat "$err" >&2
@@ -73,7 +85,7 @@ assert_pg_well_formed() {
     # Field count: @PG plus 4 tags (ID, PN, VN, CL) = 5 tab-separated columns.
     # Any extra column means a tab leaked into one of the tag values.
     local pg_field_count
-    pg_field_count="$(awk -F'\t' '{print NF}' <<<"$pg_line")"
+    pg_field_count="$(awk -F'\t' '{print NF}' <<< "$pg_line")"
     if [[ "$pg_field_count" -ne 5 ]]; then
         echo "FAIL [$label]: @PG line has $pg_field_count tab-separated fields, expected 5" >&2
         echo "---- @PG line (tabs shown as <TAB>) ----" >&2
@@ -84,9 +96,14 @@ assert_pg_well_formed() {
 
     # Belt-and-braces: exactly one `ID:` tag and exactly one `CL:` tag.
     # Stray tabs from -R would produce a second `ID:` tag (from the RG).
+    #
+    # `|| true` on each grep: a zero count is exactly the failure this block
+    # exists to report, but grep exits 1 when it matches nothing, and under
+    # `set -o pipefail` that would end the script before the assertion could
+    # print which tag was missing.
     local id_count cl_count
-    id_count="$(grep -o $'\tID:' <<<"$pg_line" | wc -l | tr -d ' ')"
-    cl_count="$(grep -o $'\tCL:' <<<"$pg_line" | wc -l | tr -d ' ')"
+    id_count="$({ grep -o $'\tID:' <<< "$pg_line" || true; } | wc -l | tr -d ' ')"
+    cl_count="$({ grep -o $'\tCL:' <<< "$pg_line" || true; } | wc -l | tr -d ' ')"
     if [[ "$id_count" -ne 1 || "$cl_count" -ne 1 ]]; then
         echo "FAIL [$label]: @PG line has ID:=$id_count CL:=$cl_count (expected 1 of each)" >&2
         printf '%s\n' "$pg_line" | sed $'s/\t/<TAB>/g' >&2
@@ -99,17 +116,19 @@ assert_pg_well_formed() {
     # the CL: value ends with the reads path (the last argv token) —
     # this catches an embedded \n that truncated the @PG line.
     local cl_value
-    cl_value="$(awk -F'\t' '{for (i=1;i<=NF;i++) if ($i ~ /^CL:/) { sub(/^CL:/, "", $i); print $i; exit }}' <<<"$pg_line")"
+    cl_value="$(awk -F'\t' '{for (i=1;i<=NF;i++) if ($i ~ /^CL:/) { sub(/^CL:/, "", $i); print $i; exit }}' <<< "$pg_line")"
     if [[ "$cl_value" != *"$reads" ]]; then
         echo "FAIL [$label]: CL: value does not end with reads path '$reads'" >&2
         echo "CL: was: $cl_value" >&2
         exit 1
     fi
     if [[ "$cl_value" == *$'\t'* ]]; then
-        echo "FAIL [$label]: CL: value contains a literal tab" >&2; exit 1
+        echo "FAIL [$label]: CL: value contains a literal tab" >&2
+        exit 1
     fi
     if [[ "$cl_value" == *$'\r'* ]]; then
-        echo "FAIL [$label]: CL: value contains a literal carriage return" >&2; exit 1
+        echo "FAIL [$label]: CL: value contains a literal carriage return" >&2
+        exit 1
     fi
 }
 
@@ -117,8 +136,8 @@ assert_pg_well_formed() {
 # All three values parse as a valid @RG (they start with "@RG\tID:" before
 # the injected character); bwa-mem3 will emit a @RG line but we only
 # assert @PG structure here — that is the fix under test.
-assert_pg_well_formed "tab"             $'@RG\tID:x\tSM:y\tLB:z'
-assert_pg_well_formed "newline"         $'@RG\tID:x\tSM:y\tLB:z\nTRAIL'
+assert_pg_well_formed "tab" $'@RG\tID:x\tSM:y\tLB:z'
+assert_pg_well_formed "newline" $'@RG\tID:x\tSM:y\tLB:z\nTRAIL'
 assert_pg_well_formed "carriage-return" $'@RG\tID:x\tSM:y\tLB:z\rTRAIL'
 
 # --- @RG assertions (tab-only case) ----------------------------------------
@@ -128,7 +147,7 @@ assert_pg_well_formed "carriage-return" $'@RG\tID:x\tSM:y\tLB:z\rTRAIL'
 # "tab" call above but re-running keeps the test self-contained if the
 # call order above ever changes.
 rg=$'@RG\tID:x\tSM:y\tLB:z'
-"$bin" mem -R "$rg" "$ref" "$reads" >"$sam" 2>"$err" || {
+"$bin" mem -R "$rg" "$ref" "$reads" > "$sam" 2> "$err" || {
     echo "FAIL: bwa-mem3 mem exited non-zero (@RG assertion)" >&2
     echo "---- stderr ----" >&2
     cat "$err" >&2
@@ -136,10 +155,13 @@ rg=$'@RG\tID:x\tSM:y\tLB:z'
     exit 1
 }
 rg_line="$(grep '^@RG' "$sam" || true)"
-[[ -n "$rg_line" ]] || { echo "FAIL: no @RG line in output" >&2; exit 1; }
+[[ -n "$rg_line" ]] || {
+    echo "FAIL: no @RG line in output" >&2
+    exit 1
+}
 
 for tag in $'\tID:x' $'\tSM:y' $'\tLB:z'; do
-    if ! grep -qF -- "$tag" <<<"$rg_line"; then
+    if ! grep -qF -- "$tag" <<< "$rg_line"; then
         echo "FAIL: @RG line missing tag '${tag//$'\t'/<TAB>}'" >&2
         printf '%s\n' "$rg_line" | sed $'s/\t/<TAB>/g' >&2
         exit 1

@@ -36,7 +36,7 @@ mkdir -p "$CHR22_SIM_DIR"
 # gate without dominating CI wall time.
 pfx="$CHR22_SIM_DIR/longread_pe"
 pixi run --frozen --manifest-path "$PIXI_MANIFEST" -- \
-  holodeck simulate \
+    holodeck simulate \
     -r "$CHR22_FA" \
     -o "$pfx" \
     --coverage 0.3 \
@@ -48,7 +48,10 @@ pixi run --frozen --manifest-path "$PIXI_MANIFEST" -- \
 
 r1="$pfx.r1.fastq.gz"
 r2="$pfx.r2.fastq.gz"
-[ -s "$r1" ] && [ -s "$r2" ] || { echo "FAIL: holodeck produced no PE fastqs ($r1, $r2)" >&2; exit 1; }
+[ -s "$r1" ] && [ -s "$r2" ] || {
+    echo "FAIL: holodeck produced no PE fastqs ($r1, $r2)" >&2
+    exit 1
+}
 
 # Normalize: drop @PG (carries the command line) and @HD; sort so thread
 # interleaving does not affect the comparison.
@@ -57,10 +60,10 @@ normalize() { grep -v '^@PG' "$1" | grep -v '^@HD' | sort; }
 sam8="$CHR22_SIM_DIR/longread_pe.8bit.sam"
 sam16="$CHR22_SIM_DIR/longread_pe.16bit.sam"
 
-"$BWA_MEM3" mem -t 4 "$CHR22_FA" "$r1" "$r2" > "$sam8.raw" 2>"$CHR22_SIM_DIR/longread_pe.8bit.log"
-BWAMEM3_DISABLE_BSW8=1 "$BWA_MEM3" mem -t 4 "$CHR22_FA" "$r1" "$r2" > "$sam16.raw" 2>"$CHR22_SIM_DIR/longread_pe.16bit.log"
+"$BWA_MEM3" mem -t 4 "$CHR22_FA" "$r1" "$r2" > "$sam8.raw" 2> "$CHR22_SIM_DIR/longread_pe.8bit.log"
+BWAMEM3_DISABLE_BSW8=1 "$BWA_MEM3" mem -t 4 "$CHR22_FA" "$r1" "$r2" > "$sam16.raw" 2> "$CHR22_SIM_DIR/longread_pe.16bit.log"
 
-normalize "$sam8.raw"  > "$sam8"
+normalize "$sam8.raw" > "$sam8"
 normalize "$sam16.raw" > "$sam16"
 
 n8=$(grep -cv '^@' "$sam8" || true)

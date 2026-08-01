@@ -62,25 +62,61 @@ R2=""
 OUT=""
 MODE="time"
 REPS=3
-THREADS="$(nproc 2>/dev/null || echo 4)"
+THREADS="$(nproc 2> /dev/null || echo 4)"
 VARIANTS_RAW="avx2:,avx512bw:"
 USE_SHM=1
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --ref)       REF="$2"; shift 2 ;;
-        --r1)        R1="$2"; shift 2 ;;
-        --r2)        R2="$2"; shift 2 ;;
-        --out)       OUT="$2"; shift 2 ;;
-        --mode)      MODE="$2"; shift 2 ;;
-        --reps)      REPS="$2"; shift 2 ;;
-        --threads)   THREADS="$2"; shift 2 ;;
-        --variants)  VARIANTS_RAW="$2"; shift 2 ;;
-        --no-shm)    USE_SHM=0; shift ;;
-        -h|--help)
-            sed -n '/^# /,/^$/p' "$0" | sed 's/^# //;s/^#$//' | head -55
-            exit 0 ;;
-        *) echo "unknown arg: $1" >&2; exit 2 ;;
+        --ref)
+            REF="$2"
+            shift 2
+            ;;
+        --r1)
+            R1="$2"
+            shift 2
+            ;;
+        --r2)
+            R2="$2"
+            shift 2
+            ;;
+        --out)
+            OUT="$2"
+            shift 2
+            ;;
+        --mode)
+            MODE="$2"
+            shift 2
+            ;;
+        --reps)
+            REPS="$2"
+            shift 2
+            ;;
+        --threads)
+            THREADS="$2"
+            shift 2
+            ;;
+        --variants)
+            VARIANTS_RAW="$2"
+            shift 2
+            ;;
+        --no-shm)
+            USE_SHM=0
+            shift
+            ;;
+        -h | --help)
+            # `sed -n '1,55p'` rather than `head -55`: head closes the pipe as
+            # soon as it has its 55 lines, and under `set -o pipefail` the
+            # SIGPIPE that kills the upstream sed becomes the pipeline's exit
+            # status, so `--help` would start failing the moment the help block
+            # grows past the cap. sed reads to EOF and applies the same limit.
+            sed -n '/^# /,/^$/p' "$0" | sed 's/^# //;s/^#$//' | sed -n '1,55p'
+            exit 0
+            ;;
+        *)
+            echo "unknown arg: $1" >&2
+            exit 2
+            ;;
     esac
 done
 
@@ -90,11 +126,14 @@ done
 : "${OUT:?--out is required}"
 
 case "$MODE" in
-    time|record) ;;
-    *) echo "--mode must be time or record (got: $MODE)" >&2; exit 2 ;;
+    time | record) ;;
+    *)
+        echo "--mode must be time or record (got: $MODE)" >&2
+        exit 2
+        ;;
 esac
 
-if [ "$MODE" = "time" ] && ! command -v tricorder >/dev/null 2>&1; then
+if [ "$MODE" = "time" ] && ! command -v tricorder > /dev/null 2>&1; then
     echo "tricorder not found on PATH; install with: cargo install tricord" >&2
     exit 2
 fi
@@ -149,7 +188,7 @@ run_tricord_rep() {
     echo "=== tricord $label rep $rep ==="
     tricorder --out "$tsv" -- \
         "$bin" mem -t "$THREADS" "$REF" "$R1" "$R2" \
-        > /dev/null 2>"$OUT/stderr-$label-rep$rep.log"
+        > /dev/null 2> "$OUT/stderr-$label-rep$rep.log"
 }
 
 run_record() {
@@ -176,7 +215,7 @@ done
 shm_cleanup() {
     if [ "$USE_SHM" = "1" ] && [ -n "${SHM_PREWARM_BIN:-}" ]; then
         echo "=== shm teardown ==="
-        "$SHM_PREWARM_BIN" shm -d 2>/dev/null || true
+        "$SHM_PREWARM_BIN" shm -d 2> /dev/null || true
     fi
 }
 trap shm_cleanup EXIT
@@ -184,7 +223,7 @@ trap shm_cleanup EXIT
 if [ "$USE_SHM" = "1" ]; then
     SHM_PREWARM_BIN="$OUT/bwa-mem3.${LABELS[0]}"
     echo "=== shm prewarm via $SHM_PREWARM_BIN ==="
-    "$SHM_PREWARM_BIN" shm -d 2>/dev/null || true
+    "$SHM_PREWARM_BIN" shm -d 2> /dev/null || true
     "$SHM_PREWARM_BIN" shm "$REF"
 fi
 
@@ -207,11 +246,11 @@ if [ "$MODE" = "time" ]; then
             for col_idx in 1 3 7 8 9 10; do
                 # Map col_idx → metric name
                 case $col_idx in
-                    1)  metric=wall_seconds ;;
-                    3)  metric=max_rss_mib ;;
-                    7)  metric=io_in_mib ;;
-                    8)  metric=io_out_mib ;;
-                    9)  metric=mean_load_pct_one_core ;;
+                    1) metric=wall_seconds ;;
+                    3) metric=max_rss_mib ;;
+                    7) metric=io_in_mib ;;
+                    8) metric=io_out_mib ;;
+                    9) metric=mean_load_pct_one_core ;;
                     10) metric=cpu_seconds ;;
                 esac
                 vals=()
@@ -222,8 +261,8 @@ if [ "$MODE" = "time" ]; then
                     [ -n "$v" ] && [ "$v" != "NA" ] && [ "$v" != "-" ] && vals+=("$v")
                 done
                 if [ ${#vals[@]} -gt 0 ]; then
-                    median=$(printf '%s\n' "${vals[@]}" | sort -n | \
-                        awk -v n=${#vals[@]} 'NR==int((n+1)/2)')
+                    median=$(printf '%s\n' "${vals[@]}" | sort -n \
+                        | awk -v n=${#vals[@]} 'NR==int((n+1)/2)')
                     echo "$label,$metric,$median"
                 fi
             done
@@ -306,8 +345,12 @@ elif [ "$MODE" = "record" ]; then
                 }
             }
         ' "$OUT/.self-$L0.tsv" "$OUT/.self-$L1.tsv" \
-          | { read -r header; printf '%s\n' "$header"; sort -t$'\t' -k4,4 -gr; } \
-          > "$OUT/delta.tsv"
+            | {
+                read -r header
+                printf '%s\n' "$header"
+                sort -t$'\t' -k4,4 -gr
+            } \
+                > "$OUT/delta.tsv"
         rm -f "$OUT/.self-$L0.tsv" "$OUT/.self-$L1.tsv"
 
         echo

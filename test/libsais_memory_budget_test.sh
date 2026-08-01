@@ -10,7 +10,10 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 BWAMEM3="$ROOT/bwa-mem3"
 FA_SRC="$HERE/fixtures/synthetic_1mb.fa"
-[[ -s "$FA_SRC" ]] || { echo "FAIL: $FA_SRC missing"; exit 1; }
+[[ -s "$FA_SRC" ]] || {
+    echo "FAIL: $FA_SRC missing"
+    exit 1
+}
 
 UNAME_S="$(uname -s)"
 if [[ "$UNAME_S" == "Darwin" ]]; then
@@ -40,27 +43,35 @@ parse_peak() {
 # contract at larger scales.
 FAIL=0
 for budget_mib in 128 512 2048; do
-    budget_bytes=$(( budget_mib * 1024 * 1024 ))
-    slack_bytes=$(( budget_bytes * 11 / 10 ))
+    budget_bytes=$((budget_mib * 1024 * 1024))
+    slack_bytes=$((budget_bytes * 11 / 10))
     TD="$(mktemp -d)"
     # Cleanup unconditionally on exit (parse-failure / set -e / signal)
     # so $TD doesn't leak between iterations or on the early-exit paths.
     trap 'rm -rf "$TD"' EXIT
     cp "$FA_SRC" "$TD/t.fa"
     TIMING="$TD/time.out"
-    "${TIME_CMD[@]}" "$BWAMEM3" index --max-memory "${budget_mib}M" "$TD/t.fa" >"$TD/stdout" 2>"$TIMING" || {
+    "${TIME_CMD[@]}" "$BWAMEM3" index --max-memory "${budget_mib}M" "$TD/t.fa" > "$TD/stdout" 2> "$TIMING" || {
         echo "FAIL: build failed at --max-memory ${budget_mib}M"
         cat "$TIMING" | tail -20
         exit 1
     }
-    peak="$(parse_peak "$TIMING")"
-    [[ -n "$peak" ]] || { echo "FAIL: could not parse peak RSS"; cat "$TIMING"; exit 1; }
+    # parse_peak's grep exits non-zero when the timing output has no matching
+    # line, and under `set -e` that status ends the script on the assignment
+    # itself -- so the diagnostic below never printed and an unparseable timing
+    # file died silently. Fold the failure into the same branch as an empty
+    # value so both reach the message.
+    if ! peak="$(parse_peak "$TIMING")" || [[ -z "$peak" ]]; then
+        echo "FAIL: could not parse peak RSS"
+        cat "$TIMING"
+        exit 1
+    fi
     if [[ "$peak" -gt "$slack_bytes" ]]; then
-        echo "FAIL: --max-memory ${budget_mib}M -> peak $(( peak / 1024 / 1024 )) MiB (budget ${budget_mib}M + 10% = $(( slack_bytes / 1024 / 1024 )) MiB)"
+        echo "FAIL: --max-memory ${budget_mib}M -> peak $((peak / 1024 / 1024)) MiB (budget ${budget_mib}M + 10% = $((slack_bytes / 1024 / 1024)) MiB)"
         FAIL=1
     else
         printf "OK:   --max-memory %dM -> peak %d MiB (under budget+10%%)\n" \
-            "$budget_mib" "$(( peak / 1024 / 1024 ))"
+            "$budget_mib" "$((peak / 1024 / 1024))"
     fi
     rm -rf "$TD"
     trap - EXIT
@@ -78,7 +89,7 @@ TD="$(mktemp -d)"
 trap 'rm -rf "$TD"' EXIT
 cp "$FA_SRC" "$TD/m.fa"
 # The fixture is ~1 Mbp -> original est ~11.4 MiB, seed est ~22.9 MiB.
-if "$BWAMEM3" index --meth --max-memory 16M "$TD/m.fa" >"$TD/out" 2>"$TD/err"; then
+if "$BWAMEM3" index --meth --max-memory 16M "$TD/m.fa" > "$TD/out" 2> "$TD/err"; then
     echo "FAIL: --meth --max-memory 16M should have been refused (seed needs ~23 MiB)"
     FAIL=1
 else

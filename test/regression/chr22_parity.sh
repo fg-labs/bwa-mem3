@@ -25,16 +25,16 @@ set -euo pipefail
 bwa mem -t 4 "$BWA_CHR22_FA" \
     "$CHR22_SIM_DIR/reads.r1.fastq.gz" \
     "$CHR22_SIM_DIR/reads.r2.fastq.gz" \
-    > "$CHR22_SIM_DIR/bwa.sam" 2>"$CHR22_SIM_DIR/bwa.log"
+    > "$CHR22_SIM_DIR/bwa.sam" 2> "$CHR22_SIM_DIR/bwa.log"
 
 "$BWA_MEM3" mem -t 4 "$CHR22_FA" \
     "$CHR22_SIM_DIR/reads.r1.fastq.gz" \
     "$CHR22_SIM_DIR/reads.r2.fastq.gz" \
-    > "$CHR22_SIM_DIR/bwamem3.sam" 2>"$CHR22_SIM_DIR/bwamem3.log"
+    > "$CHR22_SIM_DIR/bwamem3.sam" 2> "$CHR22_SIM_DIR/bwamem3.log"
 
 cd "$CHR22_SIM_DIR"
 normalize() { grep -v '^@PG' "$1" | grep -v '^@HD' | sed 's/\tMQ:i:[0-9]*//' | sed 's/\tHN:i:[0-9]*//' | sed 's/\tXS:i:[-0-9]*//'; }
-normalize bwa.sam     | sort > bwa.normalized.sam
+normalize bwa.sam | sort > bwa.normalized.sam
 normalize bwamem3.sam | sort > bwamem3.normalized.sam
 echo "bwa records:      $(grep -cv '^@' bwa.normalized.sam)"
 echo "bwa-mem3 records: $(grep -cv '^@' bwamem3.normalized.sam)"

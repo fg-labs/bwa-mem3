@@ -33,7 +33,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$repo_root"
 
-if (( $# > 1 )); then
+if (($# > 1)); then
     echo "usage: ${BASH_SOURCE[0]##*/} [repo-root-to-check]" >&2
     exit 2
 fi
@@ -41,7 +41,7 @@ fi
 # Optional argument so debug_macro_flag_lint_selftest.sh can aim the same
 # checks at a fixture tree; there is no other way to tell "the lists agree"
 # apart from "the extraction stopped extracting".
-if (( $# == 1 )); then
+if (($# == 1)); then
     cd "$1"
 fi
 
@@ -183,14 +183,14 @@ fi
 # `/\*\//` address below are portable BRE and behave identically on both.
 # ---------------------------------------------------------------------------
 src_macros="$(find "$src_dir" -type f \( \
-        -name '*.c' -o -name '*.cc' -o -name '*.cpp' -o -name '*.cxx' -o \
-        -name '*.h' -o -name '*.hh' -o -name '*.hpp' -o -name '*.hxx' \) \
-        -exec cat {} + 2>/dev/null \
+    -name '*.c' -o -name '*.cc' -o -name '*.cpp' -o -name '*.cxx' -o \
+    -name '*.h' -o -name '*.hh' -o -name '*.hpp' -o -name '*.hxx' \) \
+    -exec cat {} + 2> /dev/null \
     | join_continuations \
     | grep -E '^[[:space:]]*#[[:space:]]*(if|ifdef|ifndef|elif)' \
     | sed -e 's://.*::' \
-          -e 's:/\*.*\*/[[:space:]]*$: :' \
-          -e '/\*\//!s:/\*.*$: :' \
+        -e 's:/\*.*\*/[[:space:]]*$: :' \
+        -e '/\*\//!s:/\*.*$: :' \
     | grep -oE '[A-Za-z_][A-Za-z0-9_]*' | sort -u || true)"
 
 if [[ -z $src_macros ]]; then
@@ -220,7 +220,7 @@ while IFS= read -r flag; do
     for pending in ${pending_flags[@]+"${pending_flags[@]}"}; do
         [[ $flag == "$pending" ]] && exempt=1 && break
     done
-    if (( exempt )); then
+    if ((exempt)); then
         echo "note: $flag names no macro in $src_dir/ yet (listed as pending)"
     else
         echo "FAIL: $workflow passes -D$flag, but no preprocessor conditional in" >&2
@@ -245,7 +245,7 @@ while IFS= read -r macro; do
     failures=$((failures + 1))
 done <<< "$src_macros"
 
-if (( failures > 0 )); then
+if ((failures > 0)); then
     echo "FAIL: debug_macro_flag_lint ($failures problem(s))" >&2
     exit 1
 fi

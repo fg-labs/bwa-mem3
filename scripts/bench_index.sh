@@ -34,7 +34,7 @@ BWAMEM3="${BWAMEM3:-$ROOT/bwa-mem3}"
 # which is the documented auto-detect path. Setting an explicit budget makes
 # wall-time / peak-RSS comparable across hosts.
 INDEX_ARGS=()
-[[ -n "${BWA_INDEX_THREADS:-}"    ]] && INDEX_ARGS+=(-t "$BWA_INDEX_THREADS")
+[[ -n "${BWA_INDEX_THREADS:-}" ]] && INDEX_ARGS+=(-t "$BWA_INDEX_THREADS")
 [[ -n "${BWA_INDEX_MAX_MEMORY:-}" ]] && INDEX_ARGS+=(--max-memory "$BWA_INDEX_MAX_MEMORY")
 BENCH_DIR="${BENCH_DIR:-${TMPDIR:-/tmp}/bwa-index-bench}"
 # hg38 / hg38_meth FASTAs are too large to ship; if unset, the run_one
@@ -72,7 +72,10 @@ parse_wall_sec() {
 
 run_one() {
     local label="$1" fasta="$2"
-    [[ -s "$fasta" ]] || { echo "SKIP: $label ($fasta missing)"; return 0; }
+    [[ -s "$fasta" ]] || {
+        echo "SKIP: $label ($fasta missing)"
+        return 0
+    }
     echo "=== $label: $fasta ==="
     local wd="$BENCH_DIR/$label"
     rm -rf "$wd"
@@ -88,12 +91,16 @@ run_one() {
     # set, else nothing" under set -u. Plain "${INDEX_ARGS[@]}" trips
     # `unbound variable` on an empty array under macOS's system bash.
     if [[ "$UNAME_S" == "Darwin" ]]; then
-        /usr/bin/time -l "$BWAMEM3" index ${INDEX_ARGS[@]+"${INDEX_ARGS[@]}"} "$wd/ref.fa" >"$logfile" 2>"$timing" || {
-            echo "FAIL: $label build failed"; cat "$timing"; return 1;
+        /usr/bin/time -l "$BWAMEM3" index ${INDEX_ARGS[@]+"${INDEX_ARGS[@]}"} "$wd/ref.fa" > "$logfile" 2> "$timing" || {
+            echo "FAIL: $label build failed"
+            cat "$timing"
+            return 1
         }
     else
-        /usr/bin/time -v "$BWAMEM3" index ${INDEX_ARGS[@]+"${INDEX_ARGS[@]}"} "$wd/ref.fa" >"$logfile" 2>"$timing" || {
-            echo "FAIL: $label build failed"; cat "$timing"; return 1;
+        /usr/bin/time -v "$BWAMEM3" index ${INDEX_ARGS[@]+"${INDEX_ARGS[@]}"} "$wd/ref.fa" > "$logfile" 2> "$timing" || {
+            echo "FAIL: $label build failed"
+            cat "$timing"
+            return 1
         }
     fi
 
@@ -105,7 +112,7 @@ run_one() {
         cat "$timing" >&2
         return 1
     fi
-    size="$(stat -f%z "$fasta" 2>/dev/null || stat -c%s "$fasta")"
+    size="$(stat -f%z "$fasta" 2> /dev/null || stat -c%s "$fasta")"
     printf "%s\t%s\t%.2f\t%s\n" "$label" "$size" "$wall" "$peak" >> "$RESULTS_TSV"
     printf "%-18s wall %7.2fs  peak %5.2f GiB  fasta %5.2f MiB\n" \
         "$label" "$wall" "$(awk -v b="$peak" 'BEGIN{printf "%.2f", b/1024/1024/1024}')" \
@@ -129,7 +136,7 @@ fi
 # E. coli K-12.
 CHR1_4_6MB="$BENCH_DIR/chr1_4_6mb.fa"
 if [[ " ${TARGETS[*]} " == *" chr1_4_6mb "* && ! -s "$CHR1_4_6MB" ]]; then
-    if command -v samtools >/dev/null 2>&1 && [[ -s "$HG38_FASTA" ]]; then
+    if command -v samtools > /dev/null 2>&1 && [[ -s "$HG38_FASTA" ]]; then
         echo "INFO: no chr1_4_6mb fixture; slicing hg38 chr1:1-4600000"
         samtools faidx "$HG38_FASTA" chr1:1-4600000 > "$CHR1_4_6MB"
     fi
@@ -138,7 +145,7 @@ fi
 SYNTH="$ROOT/test/fixtures/synthetic_1mb.fa"
 CHR22="$BENCH_DIR/chr22.fa"
 if [[ " ${TARGETS[*]} " == *" chr22 "* && ! -s "$CHR22" ]]; then
-    if command -v samtools >/dev/null 2>&1 && [[ -s "$HG38_FASTA" ]]; then
+    if command -v samtools > /dev/null 2>&1 && [[ -s "$HG38_FASTA" ]]; then
         samtools faidx "$HG38_FASTA" chr22 > "$CHR22"
     fi
 fi
@@ -146,20 +153,26 @@ fi
 HG38_SLICE_DIR="$BENCH_DIR/hg38-slice"
 HG38_SLICE="$HG38_SLICE_DIR/slice.fa"
 if [[ " ${TARGETS[*]} " == *" hg38_slice "* && ! -s "$HG38_SLICE" ]]; then
-    if command -v samtools >/dev/null 2>&1 && [[ -s "$HG38_FASTA" ]]; then
+    if command -v samtools > /dev/null 2>&1 && [[ -s "$HG38_FASTA" ]]; then
         mkdir -p "$HG38_SLICE_DIR"
         samtools faidx "$HG38_FASTA" chr1:1-10000000 > "$HG38_SLICE"
     fi
 fi
 
+# `|| status=1` rather than `|| true`: every target still gets its turn (one
+# failed build should not hide the results for the rest), but a run that
+# printed FAIL must not go on to exit 0 with a partial results table. run_one
+# already returns 0 for its SKIP path, so a missing optional input stays a
+# skip and only real build failures are recorded here.
+status=0
 for t in "${TARGETS[@]}"; do
     case "$t" in
-        chr1_4_6mb)     run_one "chr1_4_6mb"     "$CHR1_4_6MB"  || true ;;
-        synthetic_1mb)  run_one "synthetic_1mb"  "$SYNTH"       || true ;;
-        chr22)          run_one "chr22"          "$CHR22"       || true ;;
-        hg38_slice)     run_one "hg38_slice"     "$HG38_SLICE"  || true ;;
-        hg38)           run_one "hg38_plain"     "$HG38_FASTA"  || true ;;
-        hg38_meth)      run_one "hg38_meth_c2t"  "$HG38_MET_C2T" || true ;;
+        chr1_4_6mb) run_one "chr1_4_6mb" "$CHR1_4_6MB" || status=1 ;;
+        synthetic_1mb) run_one "synthetic_1mb" "$SYNTH" || status=1 ;;
+        chr22) run_one "chr22" "$CHR22" || status=1 ;;
+        hg38_slice) run_one "hg38_slice" "$HG38_SLICE" || status=1 ;;
+        hg38) run_one "hg38_plain" "$HG38_FASTA" || status=1 ;;
+        hg38_meth) run_one "hg38_meth_c2t" "$HG38_MET_C2T" || status=1 ;;
         *) echo "WARN: unknown target '$t'" ;;
     esac
 done
@@ -167,3 +180,6 @@ done
 echo
 echo "--- results written to $RESULTS_TSV ---"
 echo "--- summary in $SUMMARY ---"
+
+# Non-zero if any target failed to build (see the dispatch loop above).
+exit "$status"

@@ -37,10 +37,16 @@ set -euo pipefail
 : "${BWA_MEM3:?BWA_MEM3 must be set}"
 FIXTURES="${FIXTURES:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../fixtures" && pwd)}"
 
-[[ -x "$BWA_MEM3" ]] || { echo "FAIL: binary not executable: $BWA_MEM3" >&2; exit 1; }
+[[ -x "$BWA_MEM3" ]] || {
+    echo "FAIL: binary not executable: $BWA_MEM3" >&2
+    exit 1
+}
 
 src_ref="$FIXTURES/synthetic_1mb.fa"
-[[ -s "$src_ref" ]] || { echo "FAIL: synthetic_1mb.fa missing: $src_ref" >&2; exit 1; }
+[[ -s "$src_ref" ]] || {
+    echo "FAIL: synthetic_1mb.fa missing: $src_ref" >&2
+    exit 1
+}
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/profile_slice_cpu.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
@@ -58,7 +64,11 @@ fi
 ref="$WORK/ref.fa"
 cp "$src_ref" "$ref"
 "$BWA_MEM3" index "$ref" > "$WORK/index.log" 2>&1 \
-    || { echo "FAIL: could not index the reference" >&2; tail -20 "$WORK/index.log" >&2; exit 1; }
+    || {
+        echo "FAIL: could not index the reference" >&2
+        tail -20 "$WORK/index.log" >&2
+        exit 1
+    }
 
 # Reads are generated here rather than committed. They must come FROM the
 # reference so they align and the aligner does real per-slice work -- a slice
@@ -83,24 +93,34 @@ awk -v len="$READ_LEN" -v n="$N_READS" '
         }
     }
 ' "$ref" > "$READS"
-[[ -s "$READS" ]] || { echo "FAIL: read generation produced nothing" >&2; exit 1; }
+[[ -s "$READS" ]] || {
+    echo "FAIL: read generation produced nothing" >&2
+    exit 1
+}
 
 # -K is deliberately small so the input spans many cohorts, each of which
 # SLICE_ALL then splits -- exercising the partial-cohort exit repeatedly.
 K=200000
 
-align() {   # $1 = tag, $2 = --cohort-slices, $3 = slice-every-cohort (0/1)
+align() { # $1 = tag, $2 = --cohort-slices, $3 = slice-every-cohort (0/1)
     local tag="$1" slices="$2" all="$3"
     BWA_MEM3_COHORT_SLICE_ALL="$all" \
         "$BWA_MEM3" mem -t 4 -K "$K" --cohort-slices "$slices" \
         --profile "$WORK/$tag.tsv" "$ref" "$READS" \
         > "$WORK/$tag.sam" 2> "$WORK/$tag.err" \
-        || { echo "FAIL: $tag exited nonzero" >&2; tail -20 "$WORK/$tag.err" >&2; exit 1; }
-    [[ -s "$WORK/$tag.tsv" ]] || { echo "FAIL: $tag wrote no profile TSV" >&2; exit 1; }
+        || {
+            echo "FAIL: $tag exited nonzero" >&2
+            tail -20 "$WORK/$tag.err" >&2
+            exit 1
+        }
+    [[ -s "$WORK/$tag.tsv" ]] || {
+        echo "FAIL: $tag wrote no profile TSV" >&2
+        exit 1
+    }
 }
 
 align unsliced 0 0
-align sliced   4 1
+align sliced 4 1
 
 # Resolve columns by header name: the TSV schema is append-friendly and a
 # hard-coded index would rot the next time a field is added.
@@ -111,7 +131,7 @@ align sliced   4 1
 # would pass on a broken build. It is also implementation-dependent -- mawk and
 # gawk (what CI runs) take the `$0` reading, while the BWK awk on macOS errors
 # out -- so checking here is what makes the behaviour the same everywhere.
-col() {   # $1 = tsv, $2 = header name -> 1-based column index; fails if absent
+col() { # $1 = tsv, $2 = header name -> 1-based column index; fails if absent
     local idx
     idx=$(awk -F'\t' -v want="$2" 'NR==1 { for (i=1;i<=NF;i++) if ($i==want) { print i; exit } }' "$1")
     if [[ -z "$idx" ]]; then
@@ -122,10 +142,10 @@ col() {   # $1 = tsv, $2 = header name -> 1-based column index; fails if absent
 }
 
 # Rows that read bases (n_bp > 0), excluding the ALL aggregate.
-data_rows() {   # $1 = tsv
+data_rows() { # $1 = tsv
     local f="$1" c_chunk c_bp
     c_chunk=$(col "$f" chunk) || return 1
-    c_bp=$(col "$f" n_bp)     || return 1
+    c_bp=$(col "$f" n_bp) || return 1
     awk -F'\t' -v ch="$c_chunk" -v bp="$c_bp" \
         'NR>1 && $ch!="ALL" && $bp+0 > 0' "$f"
 }
@@ -151,12 +171,12 @@ fi
 # The assertion: a chunk that read bases ran kt_for, so it cannot have used
 # zero compute CPU. `compute` is derived from proc_cpu, so it must be populated
 # too (an empty cell is NaN -- see sp_chunk_init).
-check() {   # $1 = tsv, $2 = tag
+check() { # $1 = tsv, $2 = tag
     local f="$1" tag="$2" c_chunk c_bp c_cpu c_comp
-    c_chunk=$(col "$f" chunk)    || return 1
-    c_bp=$(col "$f" n_bp)        || return 1
-    c_cpu=$(col "$f" proc_cpu)   || return 1
-    c_comp=$(col "$f" compute)   || return 1
+    c_chunk=$(col "$f" chunk) || return 1
+    c_bp=$(col "$f" n_bp) || return 1
+    c_cpu=$(col "$f" proc_cpu) || return 1
+    c_comp=$(col "$f" compute) || return 1
     awk -F'\t' -v ch="$c_chunk" -v bp="$c_bp" -v cpu="$c_cpu" -v comp="$c_comp" -v tag="$tag" '
         NR>1 && $ch!="ALL" && $bp+0 > 0 {
             rows++
@@ -173,7 +193,7 @@ check() {   # $1 = tsv, $2 = tag
 
 fail=0
 check "$WORK/unsliced.tsv" unsliced || fail=1
-check "$WORK/sliced.tsv"   sliced   || fail=1
+check "$WORK/sliced.tsv" sliced || fail=1
 
 if [ "$fail" -ne 0 ]; then
     # Two causes reach here, and the diagnostics above say which: an unresolved

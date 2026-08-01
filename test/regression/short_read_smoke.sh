@@ -57,6 +57,8 @@ mkdir -p "$CHR22_SIM_DIR"
 # catch) is killed by `set -e` before the ASAN report is echoed,
 # leaving CI with only "exit 134" and no backtrace.
 short_log="$CHR22_SIM_DIR/short_dense_var.log"
+# shellcheck disable=SC2154  # rc IS assigned by `rc=$?` below; shellcheck does
+# not track assignments made inside a quoted trap body (false positive).
 trap 'rc=$?; if [ $rc -ne 0 ] && [ -f "$short_log" ]; then
         echo "--- bwa-mem3 stderr ($short_log) ---" >&2
         tail -n 200 "$short_log" >&2
@@ -75,7 +77,7 @@ printf 'chr22\t14000000\t20000000\n' > "$bed"
 # loosened because the dense region is N-rich; --single-end emits R1
 # only.
 pixi run --frozen --manifest-path "$PIXI_MANIFEST" -- \
-  holodeck simulate \
+    holodeck simulate \
     -r "$CHR22_FA" \
     -b "$bed" \
     -o "$CHR22_SIM_DIR/short_dense" \
@@ -99,12 +101,12 @@ pixi run --frozen --manifest-path "$PIXI_MANIFEST" -- \
 short_fq="$CHR22_SIM_DIR/short_dense_var.fq"
 short_count="$CHR22_SIM_DIR/short_dense_var.count"
 gunzip -c "$CHR22_SIM_DIR/short_dense.r1.fastq.gz" \
-  | mawk -v count_out="$short_count" 'BEGIN{srand(42)}
+    | mawk -v count_out="$short_count" 'BEGIN{srand(42)}
       NR%4==1 { cur_len = 25 + int(26*rand()); print; next }
       NR%4==2 || NR%4==0 { print substr($0, 1, cur_len); next }
       { print }
       END { print NR/4 > count_out }' \
-  > "$short_fq"
+        > "$short_fq"
 
 short_records=$(cat "$short_count")
 echo "short-read fastq: $short_records records (25-50bp, pericentromeric)"
@@ -125,8 +127,8 @@ fi
 # (e.g. the FMI_search lockstep SMEM caches fixed in #116).
 short_sam="$CHR22_SIM_DIR/short_dense_var.sam"
 ASAN_OPTIONS=abort_on_error=1:halt_on_error=1 \
-"$BWA_MEM3" mem -t 4 "$CHR22_FA" "$short_fq" \
-    > "$short_sam" 2>"$short_log"
+    "$BWA_MEM3" mem -t 4 "$CHR22_FA" "$short_fq" \
+    > "$short_sam" 2> "$short_log"
 
 # `|| true` because grep -c returns 1 on zero matches (a header-only SAM
 # with set -e would die here instead of at the explicit FAIL below).

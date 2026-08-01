@@ -42,7 +42,10 @@ set -euo pipefail
 
 R1="$CHR22_SIM_DIR/reads.r1.fastq.gz"
 R2="$CHR22_SIM_DIR/reads.r2.fastq.gz"
-[ -f "$R1" ] && [ -f "$R2" ] || { echo "FAIL: missing $R1 / $R2" >&2; exit 1; }
+[ -f "$R1" ] && [ -f "$R2" ] || {
+    echo "FAIL: missing $R1 / $R2" >&2
+    exit 1
+}
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/cohort_slice.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
@@ -54,26 +57,35 @@ K=2000000
 
 # Partial slices are the reads that did NOT end their cohort; step 0 marks
 # exactly those lines with a trailing " (cohort slice)".
-slice_count() {   # $1 = a run's stderr log
+slice_count() { # $1 = a run's stderr log
     grep -c '(cohort slice)$' "$1" || true
 }
 
-align() {   # $1 = tag, $2 = --cohort-slices value, $3 = slice-every-cohort (0/1)
+align() { # $1 = tag, $2 = --cohort-slices value, $3 = slice-every-cohort (0/1)
     local tag="$1" slices="$2" all="$3"
+    # The aligner and the header strip run as separate steps so their exit
+    # statuses stay distinguishable. Piped together, a run that emitted headers
+    # but no records makes `grep -v` exit 1 (it selected nothing), and under
+    # `set -o pipefail` that ends the script before the explicit "produced no
+    # records" check below -- the failure this function most needs to report.
     BWA_MEM3_COHORT_SLICE_ALL="$all" \
         "$BWA_MEM3" mem -t 4 -K "$K" --cohort-slices "$slices" \
-        "$CHR22_FA" "$R1" "$R2" 2> "$WORK/$tag.err" \
-        | grep -v '^@' > "$WORK/$tag.sam"
-    local n; n=$(wc -l < "$WORK/$tag.sam")
-    [ "$n" -gt 0 ] || { echo "FAIL: $tag produced no records" >&2
-                        tail -15 "$WORK/$tag.err" >&2; exit 1; }
+        "$CHR22_FA" "$R1" "$R2" 2> "$WORK/$tag.err" > "$WORK/$tag.raw"
+    grep -v '^@' "$WORK/$tag.raw" > "$WORK/$tag.sam" || true
+    local n
+    n=$(wc -l < "$WORK/$tag.sam")
+    [ "$n" -gt 0 ] || {
+        echo "FAIL: $tag produced no records" >&2
+        tail -15 "$WORK/$tag.err" >&2
+        exit 1
+    }
     echo "  $tag: $n records, $(grep -c 'Inferring insert size' "$WORK/$tag.err" || true) cohorts, $(slice_count "$WORK/$tag.err") partial slice(s)"
 }
 
 align unsliced 0 0
-align first3   3 0
-align all3     3 1
-align all8     8 1
+align first3 3 0
+align all3 3 1
+align all8 8 1
 
 # The all-cohort runs have to actually slice more than the first cohort, or the
 # comparisons below prove nothing about the path they exist to cover. If
@@ -105,8 +117,12 @@ echo "  slice-all effective: first3=$first3_slices all3=$all3_slices all8=$all8_
 # Non-vacuity. If every cohort infers the same insert-size bounds then cohort
 # composition cannot influence the output and an IDENTICAL result below would
 # prove nothing about the clamp.
-distinct=$(grep -h "percentile" "$WORK/unsliced.err" | sort -u | wc -l | tr -d ' ')
-total=$(grep -hc "percentile" "$WORK/unsliced.err" | tr -d ' ')
+# `|| true` on both greps: zero "percentile" lines is precisely the vacuous
+# fixture the check below exists to report, but grep exits 1 when it matches
+# nothing (as does `grep -c` on a zero count), so pipefail would end the run
+# before the diagnostic could print.
+distinct=$({ grep -h "percentile" "$WORK/unsliced.err" || true; } | sort -u | wc -l | tr -d ' ')
+total=$({ grep -hc "percentile" "$WORK/unsliced.err" || true; } | tr -d ' ')
 echo "  non-vacuity: $distinct distinct percentile tuples across $total cohorts"
 if [ "${distinct:-0}" -lt 2 ]; then
     echo "FAIL: mem_pestat inferred identical bounds for every cohort, so this" >&2
@@ -151,25 +167,38 @@ fi
 # computed, so it stays correct regardless of read length, -K or the ramp shape.
 # ---------------------------------------------------------------------------
 first_slice_reads=$(awk '/\(cohort slice\)$/ { sub(/.*nseq: /, ""); sub(/ .*/, ""); print; exit }' \
-                    "$WORK/all3.err")
+    "$WORK/all3.err")
 if [ -z "${first_slice_reads:-}" ] || [ "$first_slice_reads" -lt 2 ]; then
     echo "FAIL: could not read the first partial slice's record count from the" >&2
     echo "      all3 log, so the EOF-on-a-slice-boundary case cannot be built." >&2
     exit 1
 fi
 
-pairs=$(( first_slice_reads / 2 ))
-expected=$(( pairs * 2 ))
-# gzip exits non-zero when head closes the pipe early; that is expected here.
-set +o pipefail
-gzip -cd "$R1" | head -n $(( pairs * 4 )) | gzip > "$WORK/eof.r1.fastq.gz"
-gzip -cd "$R2" | head -n $(( pairs * 4 )) | gzip > "$WORK/eof.r2.fastq.gz"
-set -o pipefail
+pairs=$((first_slice_reads / 2))
+expected=$((pairs * 2))
+# `sed -n '1,Np'` rather than `head -n N`, so pipefail can stay on.
+#
+# head closes the pipe as soon as it has its lines; the SIGPIPE that kills the
+# upstream gzip is what forced `set +o pipefail` here. But that window also hid
+# a genuine decompression failure: a corrupt R1/R2 whose first N lines happen to
+# inflate cleanly would still produce both fixtures, and this identity check
+# would pass on truncated input -- exactly the outcome it exists to catch. sed
+# drains the decompressor instead, so a real gzip failure surfaces and fails the
+# fixture build loudly.
+eof_lines=$((pairs * 4))
+if ! gzip -cd "$R1" | sed -n "1,${eof_lines}p" | gzip > "$WORK/eof.r1.fastq.gz"; then
+    echo "FAIL: could not create EOF R1 fixture" >&2
+    exit 1
+fi
+if ! gzip -cd "$R2" | sed -n "1,${eof_lines}p" | gzip > "$WORK/eof.r2.fastq.gz"; then
+    echo "FAIL: could not create EOF R2 fixture" >&2
+    exit 1
+fi
 
 echo "  EOF-on-boundary: truncating to $pairs pairs ($expected records), the first"
 echo "                   partial slice's exact size"
 
-align_eof() {   # $1 = tag, $2 = --cohort-slices value, $3 = slice-every-cohort (0/1)
+align_eof() { # $1 = tag, $2 = --cohort-slices value, $3 = slice-every-cohort (0/1)
     local tag="$1" slices="$2" all="$3" n rc
     set +e
     BWA_MEM3_COHORT_SLICE_ALL="$all" \
@@ -178,8 +207,11 @@ align_eof() {   # $1 = tag, $2 = --cohort-slices value, $3 = slice-every-cohort 
         > "$WORK/$tag.full.sam" 2> "$WORK/$tag.err"
     rc=$?
     set -e
-    [ "$rc" -eq 0 ] || { echo "FAIL: $tag exited $rc" >&2
-                         tail -15 "$WORK/$tag.err" >&2; exit 1; }
+    [ "$rc" -eq 0 ] || {
+        echo "FAIL: $tag exited $rc" >&2
+        tail -15 "$WORK/$tag.err" >&2
+        exit 1
+    }
     grep -v '^@' "$WORK/$tag.full.sam" > "$WORK/$tag.sam" || true
     n=$(wc -l < "$WORK/$tag.sam" | tr -d ' ')
     if [ "$n" -ne "$expected" ]; then
@@ -194,9 +226,9 @@ align_eof() {   # $1 = tag, $2 = --cohort-slices value, $3 = slice-every-cohort 
 }
 
 align_eof eof_unsliced 0 0
-align_eof eof_first3   3 0
-align_eof eof_all3     3 1
-align_eof eof_all8     8 1
+align_eof eof_first3 3 0
+align_eof eof_all3 3 1
+align_eof eof_all8 8 1
 
 for t in eof_first3 eof_all3 eof_all8; do
     if cmp -s "$WORK/eof_unsliced.sam" "$WORK/$t.sam"; then

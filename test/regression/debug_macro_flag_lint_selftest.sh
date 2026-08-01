@@ -90,7 +90,7 @@ check_dir() {
     local output status
     output="$(bash "$lint" "$dir" 2>&1)" && status=0 || status=$?
 
-    if (( status == expect_status )) \
+    if ((status == expect_status)) \
         && [[ -z $expect_text || "$output" == *"$expect_text"* ]]; then
         echo "  ok   $description -> exit $status"
     else
@@ -205,10 +205,10 @@ empty_dir="$(build_fixture '-DBWA_MEM3_DEBUG_ALPHA -DBWA_MEM3_DEBUG_TYPO' \
 #endif')"
 empty_out="$("$empty_pending_lint" "$empty_dir" 2>&1)" \
     && empty_status=0 || empty_status=$?
-if (( remaining != 0 )); then
+if ((remaining != 0)); then
     echo "  FAIL could not empty pending_flags; the empty-array case checked nothing" >&2
     failures=$((failures + 1))
-elif (( empty_status == 1 )) \
+elif ((empty_status == 1)) \
     && [[ "$empty_out" == *'passes -DBWA_MEM3_DEBUG_TYPO'* ]]; then
     echo "  ok   empty pending_flags -> FAIL (no unbound-variable abort)"
 else
@@ -353,7 +353,7 @@ check_dir "src path is a regular file" "$wrong_src_dir" 1 \
 # prints its own basename, so a hardcoded name would make this case fail for a
 # renamed copy of the script instead of for the behaviour under test.
 usage_out="$(bash "$lint" one two 2>&1)" && usage_status=0 || usage_status=$?
-if (( usage_status == 2 )) && [[ "$usage_out" == *"usage: ${lint##*/}"* ]]; then
+if ((usage_status == 2)) && [[ "$usage_out" == *"usage: ${lint##*/}"* ]]; then
     echo "  ok   too many arguments -> usage error (exit 2)"
 else
     echo "  FAIL too many arguments: expected the usage message and exit 2, got exit $usage_status" >&2
@@ -361,7 +361,7 @@ else
     failures=$((failures + 1))
 fi
 
-if (( failures > 0 )); then
+if ((failures > 0)); then
     echo "FAIL: debug_macro_flag_lint_selftest ($failures case(s))" >&2
     exit 1
 fi

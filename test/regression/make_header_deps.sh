@@ -75,10 +75,10 @@ run_make() {
 # (and fails only on the literal `%m`), the || never reaches the GNU form cleanly,
 # and that text lands in the arithmetic below as a bareword -- "File: unbound
 # variable" under `set -u`.
-if stat -c %Y . >/dev/null 2>&1; then
-    mtime_sec() { stat -c %Y "$1"; }    # GNU coreutils
+if stat -c %Y . > /dev/null 2>&1; then
+    mtime_sec() { stat -c %Y "$1"; } # GNU coreutils
 else
-    mtime_sec() { stat -f %m "$1"; }    # BSD / macOS
+    mtime_sec() { stat -f %m "$1"; } # BSD / macOS
 fi
 
 # ---------------------------------------------------------------------------
@@ -89,10 +89,10 @@ for var in "${OBJ_VARS[@]}"; do
     # `read -a` rather than mapfile: bash 3.2 (macOS) has no mapfile, and the
     # variable expands to one space-separated line of object paths.
     read -r -a var_objs <<< "$(run_make -s "print-$var")"
-    objects+=( "${var_objs[@]}" )
+    objects+=("${var_objs[@]}")
 done
 
-if (( ${#objects[@]} == 0 )); then
+if ((${#objects[@]} == 0)); then
     echo "FAIL: no objects enumerated from ${OBJ_VARS[*]} — is print-% missing?"
     exit 1
 fi
@@ -102,12 +102,15 @@ for obj in "${objects[@]}"; do
     # Only objects that have actually been built can have a .d yet, so an unbuilt
     # object is skipped rather than failed — but a run where *everything* was
     # skipped verified nothing, and is failed below.
-    [[ -f "$obj" ]] || { skipped=$(( skipped + 1 )); continue; }
-    checked=$(( checked + 1 ))
+    [[ -f "$obj" ]] || {
+        skipped=$((skipped + 1))
+        continue
+    }
+    checked=$((checked + 1))
     dep="${obj%.o}.d"
     if [[ ! -s "$dep" ]]; then
         echo "FAIL: $obj has no dependency file ($dep) — its compile rule is missing" \
-             "\$(DEPFLAGS), or the object predates it and has not been recompiled"
+            "\$(DEPFLAGS), or the object predates it and has not been recompiled"
         fail=1
     elif ! grep -q "^$obj:" "$dep"; then
         # A .d that does not declare its own object is not wired to anything.
@@ -119,7 +122,7 @@ for obj in "${objects[@]}"; do
     fi
 done
 echo "coverage: $checked objects checked, $skipped not built"
-if (( checked == 0 )); then
+if ((checked == 0)); then
     echo "FAIL: no built objects to check — run this against a built tree"
     fail=1
 fi
@@ -133,7 +136,7 @@ TOUCHED_HEADER=""
 restore_header() {
     # Put the mtime back so the next build does not see a spurious change.
     # Content is never modified, only the timestamp.
-    [[ -n "$TOUCHED_HEADER" ]] && touch -r "$MTIME_REF" "$TOUCHED_HEADER" 2>/dev/null || true
+    [[ -n "$TOUCHED_HEADER" ]] && touch -r "$MTIME_REF" "$TOUCHED_HEADER" 2> /dev/null || true
     TOUCHED_HEADER=""
 }
 trap 'restore_header; rm -f "$MTIME_REF"' EXIT
@@ -155,11 +158,11 @@ else
     obj_mtime="$(mtime_sec "$PROBE_OBJ")"
     for _ in 1 2 3; do
         touch "$PROBE_HEADER"
-        (( $(mtime_sec "$PROBE_HEADER") > obj_mtime )) && break
+        (($(mtime_sec "$PROBE_HEADER") > obj_mtime)) && break
         sleep 1
     done
 
-    if (( $(mtime_sec "$PROBE_HEADER") <= obj_mtime )); then
+    if (($(mtime_sec "$PROBE_HEADER") <= obj_mtime)); then
         echo "FAIL: could not make $PROBE_HEADER newer than $PROBE_OBJ (timestamp granularity?)"
         fail=1
     elif ! run_make "$PROBE_OBJ" > /dev/null; then
@@ -175,7 +178,7 @@ else
     restore_header
 fi
 
-if (( fail != 0 )); then
+if ((fail != 0)); then
     echo "FAIL: root Makefile header dependencies are incomplete"
     exit 1
 fi

@@ -9,8 +9,11 @@ ROOT="$(cd "$HERE/.." && pwd)"
 BWAMEM3="$ROOT/bwa-mem3"
 FIXTURES="$HERE/fixtures"
 
-fail() { echo "FAIL: $*" >&2; exit 1; }
-ok()   { echo "OK:   $*"; }
+fail() {
+    echo "FAIL: $*" >&2
+    exit 1
+}
+ok() { echo "OK:   $*"; }
 
 [[ -x "$BWAMEM3" ]] || fail "bwa-mem3 not built at $BWAMEM3 (run 'make' or 'make arm64' first)"
 
@@ -18,7 +21,7 @@ ok()   { echo "OK:   $*"; }
 (cd "$HERE" && make) || fail "test/ make failed"
 
 # Build any test binaries that live outside test/Makefile.
-( cd "$ROOT" && make -j4 shm_section_find_test shm_pack_round_trip_test shm_lock_destroy_test ) >/dev/null
+(cd "$ROOT" && make -j4 shm_section_find_test shm_pack_round_trip_test shm_lock_destroy_test) > /dev/null
 
 # synthetic_1mb.fa is checked in alongside its committed baselines so the
 # byte-diff test stays reproducible across Python versions and platforms.
@@ -31,32 +34,32 @@ ok()   { echo "OK:   $*"; }
 # Build the phiX FMI index if not already present. Check all four artifacts
 # that `bwa-mem3 index` produces by default (no `.0123`: mem pac-fetches from
 # `.pac`) so a corrupt/partial prior run is re-indexed.
-if [[ ! -s "$FIXTURES/phix.fa.bwt.2bit.64" || \
-      ! -s "$FIXTURES/phix.fa.amb"         || \
-      ! -s "$FIXTURES/phix.fa.ann"         || \
-      ! -s "$FIXTURES/phix.fa.pac" ]]; then
-    "$BWAMEM3" index "$FIXTURES/phix.fa" >/dev/null 2>&1 || fail "bwa-mem3 index on phix.fa failed"
+if [[ ! -s "$FIXTURES/phix.fa.bwt.2bit.64" ||
+    ! -s "$FIXTURES/phix.fa.amb" ||
+    ! -s "$FIXTURES/phix.fa.ann" ||
+    ! -s "$FIXTURES/phix.fa.pac" ]]; then
+    "$BWAMEM3" index "$FIXTURES/phix.fa" > /dev/null 2>&1 || fail "bwa-mem3 index on phix.fa failed"
 fi
 
 # --- fmi_test --------------------------------------------------------------
 OUT="$(cd "$HERE" && ./fmi_test "$FIXTURES/phix.fa" "$FIXTURES/reads.fa" 10 19 1 2>&1)"
-echo "$OUT" | grep -q 'numReads = 10'       || fail "fmi_test: numReads line missing"
-echo "$OUT" | grep -q 'totalSmems ='        || fail "fmi_test: totalSmems line missing"
-echo "$OUT" | grep -qE '\[[0-9]+,[0-9]+\]'  || fail "fmi_test: no SMEM output (PRINT_OUTPUT patch not applied?)"
+echo "$OUT" | grep -q 'numReads = 10' || fail "fmi_test: numReads line missing"
+echo "$OUT" | grep -q 'totalSmems =' || fail "fmi_test: totalSmems line missing"
+echo "$OUT" | grep -qE '\[[0-9]+,[0-9]+\]' || fail "fmi_test: no SMEM output (PRINT_OUTPUT patch not applied?)"
 ok "fmi_test"
 
 # --- smem2_test ------------------------------------------------------------
 OUT="$(cd "$HERE" && ./smem2_test "$FIXTURES/phix.fa" "$FIXTURES/smem2_input.txt" 5 50 19 1 2>&1)"
-echo "$OUT" | grep -q 'numReads = 5'        || fail "smem2_test: numReads line missing"
-echo "$OUT" | grep -q 'totalSmems ='        || fail "smem2_test: totalSmems line missing"
+echo "$OUT" | grep -q 'numReads = 5' || fail "smem2_test: numReads line missing"
+echo "$OUT" | grep -q 'totalSmems =' || fail "smem2_test: totalSmems line missing"
 ok "smem2_test"
 
 # --- bwt_seed_strategy_test ------------------------------------------------
 # Note: unlike fmi_test and smem2_test, this binary doesn't emit a
 # "numReads = N" line. Only assert the post-SW totalSmems marker.
 OUT="$(cd "$HERE" && ./bwt_seed_strategy_test "$FIXTURES/phix.fa" "$FIXTURES/bwt_seed_input.fa" 5 50 19 20 2>&1)"
-echo "$OUT" | grep -q 'minSeedLen ='        || fail "bwt_seed_strategy_test: minSeedLen line missing (read-parsing broken?)"
-echo "$OUT" | grep -q 'totalSmems ='        || fail "bwt_seed_strategy_test: totalSmems line missing"
+echo "$OUT" | grep -q 'minSeedLen =' || fail "bwt_seed_strategy_test: minSeedLen line missing (read-parsing broken?)"
+echo "$OUT" | grep -q 'totalSmems =' || fail "bwt_seed_strategy_test: totalSmems line missing"
 ok "bwt_seed_strategy_test"
 
 # --- sa2ref_test -----------------------------------------------------------
@@ -64,18 +67,18 @@ OUT_FILE="$(mktemp)"
 FKSW="$HERE/fksw.txt"
 HEADER_OUT="$(mktemp)"
 trap 'rm -f "$OUT_FILE" "$FKSW" "$HEADER_OUT"' EXIT
-(cd "$HERE" && ./sa2ref_test "$FIXTURES/phix.fa" "$FIXTURES/sa2ref_input.txt" "$OUT_FILE" 20 >/dev/null 2>&1) || fail "sa2ref_test crashed"
+(cd "$HERE" && ./sa2ref_test "$FIXTURES/phix.fa" "$FIXTURES/sa2ref_input.txt" "$OUT_FILE" 20 > /dev/null 2>&1) || fail "sa2ref_test crashed"
 [[ -s "$OUT_FILE" ]] || fail "sa2ref_test: output file empty"
 ok "sa2ref_test (wrote $(wc -l < "$OUT_FILE" | tr -d ' ') coords)"
 
 # --- header_insert_test ----------------------------------------------------
-(cd "$HERE" && ./header_insert_test 2>&1) | tee "$HEADER_OUT" >/dev/null || fail "header_insert_test crashed"
+(cd "$HERE" && ./header_insert_test 2>&1) | tee "$HEADER_OUT" > /dev/null || fail "header_insert_test crashed"
 grep -q 'ALL HEADER INSERT TESTS PASSED' "$HEADER_OUT" \
     || fail "header_insert_test: final banner missing ($(tail -n1 "$HEADER_OUT"))"
 ok "header_insert_test"
 
 # --- xeonbsw (main_banded) -------------------------------------------------
-(cd "$HERE" && ./xeonbsw -pairs "$FIXTURES/pairs.txt" >/dev/null 2>&1) || fail "xeonbsw crashed"
+(cd "$HERE" && ./xeonbsw -pairs "$FIXTURES/pairs.txt" > /dev/null 2>&1) || fail "xeonbsw crashed"
 [[ -s "$FKSW" ]] || fail "xeonbsw: fksw.txt empty (main_banded fksw-write patch not applied?)"
 LINES="$(wc -l < "$FKSW" | tr -d ' ')"
 [[ "$LINES" -eq 3 ]] || fail "xeonbsw: expected 3 lines in fksw.txt, got $LINES"
@@ -85,7 +88,7 @@ ok "xeonbsw ($LINES pair scores emitted)"
 # Self-contained: generates tandem-repeat fixtures and compares getScores8 to
 # the scalar oracle at non-default gap-extend (e_del/e_ins != 1). Exits non-zero
 # on any score-field mismatch.
-(cd "$HERE" && ./bandedswa_zdrop_eweight_test >/dev/null 2>&1) || fail "bandedswa_zdrop_eweight_test (z-drop e_del/e_ins weighting)"
+(cd "$HERE" && ./bandedswa_zdrop_eweight_test > /dev/null 2>&1) || fail "bandedswa_zdrop_eweight_test (z-drop e_del/e_ins weighting)"
 ok "bandedswa_zdrop_eweight_test (z-drop gap-extend weighting parity)"
 
 # --- pg_cl_escape_test ----------------------------------------------------
@@ -157,16 +160,16 @@ ok "min_ext_len_safety_test"
 # --- smem_lockstep_parity_test --------------------------------------------
 OUT="$(cd "$HERE" && ./smem_lockstep_parity_test "$FIXTURES/phix.fa" 2>&1)"
 CASES_PASSED="$(echo "$OUT" | sed -nE 's/^([0-9]+) \/ ([0-9]+) cases passed$/\1/p')"
-CASES_TOTAL="$(echo "$OUT"  | sed -nE 's/^([0-9]+) \/ ([0-9]+) cases passed$/\2/p')"
-[[ -n "$CASES_TOTAL" ]]              || fail "smem_lockstep_parity_test: no summary line"
+CASES_TOTAL="$(echo "$OUT" | sed -nE 's/^([0-9]+) \/ ([0-9]+) cases passed$/\2/p')"
+[[ -n "$CASES_TOTAL" ]] || fail "smem_lockstep_parity_test: no summary line"
 [[ "$CASES_PASSED" == "$CASES_TOTAL" ]] || fail "smem_lockstep_parity_test: $CASES_PASSED / $CASES_TOTAL cases passed"
 ok "smem_lockstep_parity_test ($CASES_PASSED / $CASES_TOTAL)"
 
 # --- bwtseed_lockstep_parity_test -----------------------------------------
 OUT="$(cd "$HERE" && ./bwtseed_lockstep_parity_test "$FIXTURES/phix.fa" 2>&1)"
 CASES_PASSED="$(echo "$OUT" | sed -nE 's/^([0-9]+) \/ ([0-9]+) cases passed$/\1/p')"
-CASES_TOTAL="$(echo "$OUT"  | sed -nE 's/^([0-9]+) \/ ([0-9]+) cases passed$/\2/p')"
-[[ -n "$CASES_TOTAL" ]]              || fail "bwtseed_lockstep_parity_test: no summary line"
+CASES_TOTAL="$(echo "$OUT" | sed -nE 's/^([0-9]+) \/ ([0-9]+) cases passed$/\2/p')"
+[[ -n "$CASES_TOTAL" ]] || fail "bwtseed_lockstep_parity_test: no summary line"
 [[ "$CASES_PASSED" == "$CASES_TOTAL" ]] || fail "bwtseed_lockstep_parity_test: $CASES_PASSED / $CASES_TOTAL cases passed"
 ok "bwtseed_lockstep_parity_test ($CASES_PASSED / $CASES_TOTAL)"
 
@@ -176,7 +179,7 @@ ok "bwtseed_lockstep_parity_test ($CASES_PASSED / $CASES_TOTAL)"
 # SMEM and lockstep-slot buffers are sized per-batch, so these must align
 # cleanly and produce SAM lines.
 for LEN_FQ in long_read_300bp long_read_1kbp long_read_3kbp; do
-    RAW="$("$BWAMEM3" mem "$FIXTURES/phix.fa" "$FIXTURES/${LEN_FQ}.fq" 2>/dev/null)" \
+    RAW="$("$BWAMEM3" mem "$FIXTURES/phix.fa" "$FIXTURES/${LEN_FQ}.fq" 2> /dev/null)" \
         || fail "bwa-mem3 mem ${LEN_FQ}.fq: non-zero exit (crash regression)"
     OUT="$(printf '%s\n' "$RAW" | grep -v '^@' || true)"
     [[ -n "$OUT" ]] || fail "bwa-mem3 mem ${LEN_FQ}.fq: no SAM records emitted"
@@ -185,7 +188,6 @@ for LEN_FQ in long_read_300bp long_read_1kbp long_read_3kbp; do
     [[ "$UNMAPPED" == "0" ]] || fail "bwa-mem3 mem ${LEN_FQ}.fq: $UNMAPPED unmapped record(s)"
     ok "bwa-mem3 mem ${LEN_FQ}.fq (all records mapped)"
 done
-
 
 # --- ultra-long-read crash regression (read length > INT16_MAX) -----------
 # Pre-fix, read positions in the SMEM seeding path were int16_t:
@@ -200,9 +202,9 @@ done
 # (~5 kb) is too small to host the alignment, so use the checked-in 1 Mb
 # synthetic reference and a 40 kb read sliced from it.
 SYN="$FIXTURES/synthetic_1mb.fa"
-if [[ ! -s "$SYN.bwt.2bit.64" || ! -s "$SYN.amb" || \
-      ! -s "$SYN.ann"         || ! -s "$SYN.pac" ]]; then
-    "$BWAMEM3" index "$SYN" >/dev/null 2>&1 || fail "bwa-mem3 index on synthetic_1mb.fa failed"
+if [[ ! -s "$SYN.bwt.2bit.64" || ! -s "$SYN.amb" ||
+    ! -s "$SYN.ann" || ! -s "$SYN.pac" ]]; then
+    "$BWAMEM3" index "$SYN" > /dev/null 2>&1 || fail "bwa-mem3 index on synthetic_1mb.fa failed"
 fi
 # Slice a 40 kb read (> 32767) from the middle of the reference so it maps
 # back cleanly. Derived at run time rather than committed as a fixture.
@@ -215,16 +217,15 @@ awk 'NR==1 && /^>/ {next} {seq = seq $0}
     "$SYN" > "$ULTRALONG_FA"
 LR_LEN="$(awk 'NR==2 {print length($0)}' "$ULTRALONG_FA")"
 [[ "$LR_LEN" -gt 32767 ]] || fail "ultralong fixture is ${LR_LEN}bp, need > 32767 (INT16_MAX)"
-RAW="$("$BWAMEM3" mem "$SYN" "$ULTRALONG_FA" 2>/dev/null)" \
+RAW="$("$BWAMEM3" mem "$SYN" "$ULTRALONG_FA" 2> /dev/null)" \
     || fail "bwa-mem3 mem ultralong ${LR_LEN}bp: non-zero exit (int16 position-overflow regression)"
 OUT="$(printf '%s\n' "$RAW" | grep -v '^@' || true)"
 [[ -n "$OUT" ]] || fail "bwa-mem3 mem ultralong: no SAM records emitted"
 # The primary record (flag < 256, not 4=unmapped) must align.
 PRIMARY_MAPPED="$(echo "$OUT" | awk '$2 < 256 && $2 != 4 {c++} END {print c+0}')"
 [[ "$PRIMARY_MAPPED" -ge 1 ]] || fail "bwa-mem3 mem ultralong ${LR_LEN}bp: primary read unmapped"
-rm -f "$ULTRALONG_FA"   # cleaned here on success; EXIT trap covers early-failure paths
+rm -f "$ULTRALONG_FA" # cleaned here on success; EXIT trap covers early-failure paths
 ok "bwa-mem3 mem ultralong ${LR_LEN}bp (> 32767, mapped)"
-
 
 # --- interleaved -p mode regression --------------------------------------
 # Bugs covered:
@@ -245,7 +246,7 @@ trap 'rm -f "$OUT_FILE" "$FKSW" "$HEADER_OUT"; rm -rf "$PE_TMP"' EXIT
 # Build a small properly-interleaved FASTQ from phix. Use python so the
 # fixture is generated programmatically (per repo convention) and so the
 # interleaving is correct at FASTQ-record granularity.
-python3 - "$FIXTURES/phix.fa" "$PE_TMP/interleaved.fq" <<'PY'
+python3 - "$FIXTURES/phix.fa" "$PE_TMP/interleaved.fq" << 'PY'
 import random, sys
 ref_path, out_path = sys.argv[1], sys.argv[2]
 ref = ''
@@ -266,7 +267,7 @@ with open(out_path, 'w') as out:
         out.write(f'@pe{i}/2\n{r2}\n+\n{q}\n')
 PY
 
-OUT="$("$BWAMEM3" mem -p "$FIXTURES/phix.fa" "$PE_TMP/interleaved.fq" 2>/dev/null)" \
+OUT="$("$BWAMEM3" mem -p "$FIXTURES/phix.fa" "$PE_TMP/interleaved.fq" 2> /dev/null)" \
     || fail "bwa-mem3 mem -p interleaved.fq: non-zero exit (crash regression)"
 RECORDS="$(printf '%s\n' "$OUT" | grep -cv '^@' || true)"
 [[ "$RECORDS" -ge 100 ]] || fail "bwa-mem3 mem -p: expected >=100 records (50 pairs × 2), got $RECORDS"
@@ -275,12 +276,12 @@ ok "bwa-mem3 mem -p interleaved.fq ($RECORDS records)"
 # Empty FASTQ + zero-length-read FASTQ regressions for the empty-batch
 # defensive path in mem_collect_smem / mem_kernel1_core.
 : > "$PE_TMP/empty.fq"
-"$BWAMEM3" mem "$FIXTURES/phix.fa" "$PE_TMP/empty.fq" >/dev/null 2>&1 \
+"$BWAMEM3" mem "$FIXTURES/phix.fa" "$PE_TMP/empty.fq" > /dev/null 2>&1 \
     || fail "bwa-mem3 mem on empty FASTQ: non-zero exit"
 ok "bwa-mem3 mem on empty FASTQ (no crash)"
 
 printf '@zero\n\n+\n\n' > "$PE_TMP/zero.fq"
-"$BWAMEM3" mem "$FIXTURES/phix.fa" "$PE_TMP/zero.fq" >/dev/null 2>&1 \
+"$BWAMEM3" mem "$FIXTURES/phix.fa" "$PE_TMP/zero.fq" > /dev/null 2>&1 \
     || fail "bwa-mem3 mem on zero-length read: non-zero exit"
 ok "bwa-mem3 mem on zero-length read (no crash)"
 
@@ -314,12 +315,12 @@ ok "libsais_memory_budget_test"
 
 # --- shm_section_find_test (unit: section-find helper) -----------------------
 echo "==> shm_section_find_test"
-( cd "$ROOT" && ./shm_section_find_test )
+(cd "$ROOT" && ./shm_section_find_test)
 echo "OK:   shm_section_find_test"
 
 # --- shm_lock_destroy_test (unit: bwa_shm_destroy unlinks /bwactl_lock) ------
 echo "==> shm_lock_destroy_test"
-( cd "$ROOT" && ./shm_lock_destroy_test )
+(cd "$ROOT" && ./shm_lock_destroy_test)
 echo "OK:   shm_lock_destroy_test"
 
 # --- shm pack round-trip (unit: pack/unpack a phiX segment) ------------------

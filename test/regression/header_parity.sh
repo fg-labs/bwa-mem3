@@ -48,12 +48,12 @@ cd "$HEADER_PARITY_WORK_DIR"
 # of a caller-supplied variable; the `:?` guard above catches unset and empty,
 # but not `/` or `$HOME`.
 rm -f ref.fasta ref.fasta.* ref.dict index.log probe.sam \
-      ./*.sq ./*.hdr ./*.out ./*.err r1.fq r2.fq
+    ./*.sq ./*.hdr ./*.out ./*.err r1.fq r2.fq
 
 ALT_CONTIG=chr1_alt
 
 # --- Generate the ALT-aware fixture (deterministic; fixed PRNG seed). ---
-python3 - <<'PY'
+python3 - << 'PY'
 import random
 random.seed(282)                      # fixed: fixture must be reproducible
 def rnd(n): return "".join(random.choice("ACGT") for _ in range(n))
@@ -82,7 +82,10 @@ with open("r1.fq", "w") as a, open("r2.fq", "w") as b:
 PY
 
 [ -s ref.fasta ] && [ -s ref.fasta.alt ] && [ -s r1.fq ] && [ -s r2.fq ] \
-    || { echo "FAIL: fixture generation produced empty files" >&2; exit 1; }
+    || {
+        echo "FAIL: fixture generation produced empty files" >&2
+        exit 1
+    }
 
 "$BWA_MEM3" index ref.fasta > index.log 2>&1
 
@@ -90,10 +93,13 @@ PY
 # passes vacuously. `mem` prints no is_alt summary, so infer it from the one
 # path that has always emitted AH: SAM text with no sidecar.
 rm -f ref.dict ref.fasta.hdr
-"$BWA_MEM3" mem ref.fasta r1.fq r2.fq 2>/dev/null > probe.sam
+"$BWA_MEM3" mem ref.fasta r1.fq r2.fq 2> /dev/null > probe.sam
 grep -q "^@SQ.*SN:${ALT_CONTIG}.*AH:\*" probe.sam \
-    || { echo "FAIL: .alt not honored — no AH:* on $ALT_CONTIG even on the SAM/no-sidecar path" >&2
-         grep '^@SQ' probe.sam >&2; exit 1; }
+    || {
+        echo "FAIL: .alt not honored — no AH:* on $ALT_CONTIG even on the SAM/no-sidecar path" >&2
+        grep '^@SQ' probe.sam >&2
+        exit 1
+    }
 echo "fixture: 3 contigs, $ALT_CONTIG marked ALT via ref.fasta.alt"
 
 have_samtools=0
@@ -106,33 +112,41 @@ command -v samtools > /dev/null 2>&1 && have_samtools=1
 # over a file and none of them needs to know which output path ran.
 # ('@' cannot start a SAM record -- it is excluded from QNAME -- so grep '^@'
 # over SAM text picks up header lines only.)
-sq_of() {   # <tag> [bwa-mem3 args...]
-    local tag="$1"; shift
+sq_of() { # <tag> [bwa-mem3 args...]
+    local tag="$1"
+    shift
     local a is_bam=0
     for a in "$@"; do [ "$a" = "--bam" ] && is_bam=1; done
-    "$BWA_MEM3" mem "$@" ref.fasta r1.fq r2.fq 2>"$tag.err" > "$tag.out"
+    "$BWA_MEM3" mem "$@" ref.fasta r1.fq r2.fq 2> "$tag.err" > "$tag.out"
     if [ "$is_bam" -eq 1 ]; then
         samtools view -H --no-PG "$tag.out" > "$tag.hdr"
     else
         grep '^@' "$tag.out" > "$tag.hdr"
     fi
     grep '^@SQ' "$tag.hdr" > "$tag.sq" \
-        || { echo "FAIL: $tag emitted no @SQ header block" >&2; exit 1; }
+        || {
+            echo "FAIL: $tag emitted no @SQ header block" >&2
+            exit 1
+        }
 }
 
 # Assert the run emitted no @HD at all.
-assert_no_HD() {   # <tag> <human description>
+assert_no_HD() { # <tag> <human description>
     if grep -q '^@HD' "$1.hdr"; then
         echo "FAIL: $2 — @HD emitted under compat (bwa-mem2 emits none)" >&2
         exit 1
     fi
 }
 
-assert_alt_has_AH() {   # <tag> <human description>
+assert_alt_has_AH() { # <tag> <human description>
     grep -q "SN:${ALT_CONTIG}.*AH:\*" "$1.sq" \
-        || { echo "FAIL: $2 — AH:* missing on $ALT_CONTIG:" >&2; cat "$1.sq" >&2; exit 1; }
+        || {
+            echo "FAIL: $2 — AH:* missing on $ALT_CONTIG:" >&2
+            cat "$1.sq" >&2
+            exit 1
+        }
 }
-assert_no_primary_AH() {   # <tag> <human description>
+assert_no_primary_AH() { # <tag> <human description>
     # Spec: AH "must not be present on sequences in the primary assembly".
     # Match SN as a whole tab-delimited token. Not load-bearing for the current
     # fixture (chr1_alt is the longer name, so a substring filter happens to
@@ -180,25 +194,38 @@ fi
 
 # Default: the sidecar is authoritative, so its tags appear and AH does not.
 # This is DESIGNED behavior (lh3/bwa#348), not a bug -- do not "fix" it.
-assert_sidecar_verbatim() {   # <tag>
+assert_sidecar_verbatim() { # <tag>
     grep -q 'M5:' "$1.sq" \
-        || { echo "FAIL: $1 — sidecar identity tags missing; sidecar not honored" >&2; exit 1; }
+        || {
+            echo "FAIL: $1 — sidecar identity tags missing; sidecar not honored" >&2
+            exit 1
+        }
     if grep -q 'AH:' "$1.sq"; then
         echo "FAIL: $1 — AH present, but the sidecar is authoritative and has none" >&2
         exit 1
     fi
 }
-sq_of sc_sam_def;        assert_sidecar_verbatim sc_sam_def
-sq_of sc_bam_def --bam;  assert_sidecar_verbatim sc_bam_def
+sq_of sc_sam_def
+assert_sidecar_verbatim sc_sam_def
+sq_of sc_bam_def --bam
+assert_sidecar_verbatim sc_bam_def
 # ...and the run must SAY so, rather than losing ALT status silently.
 grep -q 'sidecar supplies @SQ without an AH tag' sc_sam_def.err \
-    || { echo "FAIL: no warning about the sidecar's missing AH:" >&2; cat sc_sam_def.err >&2; exit 1; }
+    || {
+        echo "FAIL: no warning about the sidecar's missing AH:" >&2
+        cat sc_sam_def.err >&2
+        exit 1
+    }
 grep -q 'samtools dict --alt' sc_sam_def.err \
-    || { echo "FAIL: missing-AH warning does not name the remedy" >&2; cat sc_sam_def.err >&2; exit 1; }
+    || {
+        echo "FAIL: missing-AH warning does not name the remedy" >&2
+        cat sc_sam_def.err >&2
+        exit 1
+    }
 echo "PASS: sidecar @SQ is authoritative (AH absent), and the gap is warned about"
 
 # compat: sidecar skipped entirely -> bare SN/LN + AH:*, no identity tags.
-assert_compat_ignores_sidecar() {   # <tag>
+assert_compat_ignores_sidecar() { # <tag>
     assert_alt_has_AH "$1" "$1"
     if grep -qE "\t(M5|AS|UR|SP):" "$1.sq"; then
         echo "FAIL: $1 — sidecar identity tags leaked into compat output:" >&2
@@ -222,20 +249,28 @@ echo "PASS: --compat=bwa-mem2 ignores the sidecar (bare SN/LN + AH:*, no @HD)"
 # --- 3. Sidecar WITH AH (`samtools dict --alt`, the supported remedy). ----
 samtools dict -a testasm -s testus --alt ref.fasta.alt -o ref.dict ref.fasta
 grep -q "SN:${ALT_CONTIG}.*AH:" ref.dict \
-    || { echo "FAIL: 'samtools dict --alt' produced no AH — fixture/samtools mismatch" >&2; exit 1; }
-assert_sidecar_AH_passthrough() {   # <tag>
+    || {
+        echo "FAIL: 'samtools dict --alt' produced no AH — fixture/samtools mismatch" >&2
+        exit 1
+    }
+assert_sidecar_AH_passthrough() { # <tag>
     assert_alt_has_AH "$1" "$1 (sidecar carries AH)"
     assert_no_primary_AH "$1" "$1"
     grep -q 'M5:' "$1.sq" \
-        || { echo "FAIL: $1 — sidecar identity tags missing" >&2; exit 1; }
+        || {
+            echo "FAIL: $1 — sidecar identity tags missing" >&2
+            exit 1
+        }
     # No warning: the sidecar supplies AH, so there is no gap to report.
     if grep -q 'sidecar supplies @SQ without an AH tag' "$1.err"; then
         echo "FAIL: $1 — warned despite the sidecar carrying AH" >&2
         exit 1
     fi
 }
-sq_of ah_sam;        assert_sidecar_AH_passthrough ah_sam
-sq_of ah_bam --bam;  assert_sidecar_AH_passthrough ah_bam
+sq_of ah_sam
+assert_sidecar_AH_passthrough ah_sam
+sq_of ah_bam --bam
+assert_sidecar_AH_passthrough ah_bam
 echo "PASS: 'samtools dict --alt' sidecar carries AH:* through both paths, no warning"
 
 echo "PASS: compat header parity regression"

@@ -56,27 +56,27 @@ CAP=3
 # drop all 30 cap=N MAPQ=0 supps to 0).
 MIN_SUPP=20
 
-mawk -v MODE=ref   -f "$SUPP_REP_FIXTURE_AWK" "$SUPP_REP_PHIX_FA" > "$REF"
+mawk -v MODE=ref -f "$SUPP_REP_FIXTURE_AWK" "$SUPP_REP_PHIX_FA" > "$REF"
 mawk -v MODE=reads -f "$SUPP_REP_FIXTURE_AWK" "$SUPP_REP_PHIX_FA" > "$READS"
 
 "$BWA_MEM3" index "$REF" > "$OUT_DIR/index.log" 2>&1
 
 "$BWA_MEM3" mem -t 1 "$REF" "$READS" \
-    > "$CAP0_SAM" 2>"$OUT_DIR/cap0.log"
+    > "$CAP0_SAM" 2> "$OUT_DIR/cap0.log"
 "$BWA_MEM3" mem -t 1 --supp-rep-hard-cap "$CAP" "$REF" "$READS" \
-    > "$CAP_N_SAM" 2>"$OUT_DIR/cap_n.log"
+    > "$CAP_N_SAM" 2> "$OUT_DIR/cap_n.log"
 
 # Count supplementary alignments (SAM flag bit 0x800 / 2048) and split each
 # count by MAPQ==0 vs MAPQ>0.
-count_supps()        { samtools view -c -f 2048 "$1"; }
-count_supps_mapq0()  { samtools view    -f 2048 "$1" | mawk '$5 == 0' | wc -l | tr -d ' '; }
-count_supps_mapqpos(){ samtools view    -f 2048 "$1" | mawk '$5 >  0' | wc -l | tr -d ' '; }
+count_supps() { samtools view -c -f 2048 "$1"; }
+count_supps_mapq0() { samtools view -f 2048 "$1" | mawk '$5 == 0' | wc -l | tr -d ' '; }
+count_supps_mapqpos() { samtools view -f 2048 "$1" | mawk '$5 >  0' | wc -l | tr -d ' '; }
 
-cap0_supps=$(count_supps        "$CAP0_SAM")
-cap0_mapq0=$(count_supps_mapq0  "$CAP0_SAM")
+cap0_supps=$(count_supps "$CAP0_SAM")
+cap0_mapq0=$(count_supps_mapq0 "$CAP0_SAM")
 cap0_mapqp=$(count_supps_mapqpos "$CAP0_SAM")
-capn_supps=$(count_supps        "$CAP_N_SAM")
-capn_mapq0=$(count_supps_mapq0  "$CAP_N_SAM")
+capn_supps=$(count_supps "$CAP_N_SAM")
+capn_mapq0=$(count_supps_mapq0 "$CAP_N_SAM")
 capn_mapqp=$(count_supps_mapqpos "$CAP_N_SAM")
 
 echo "cap=0:      $cap0_supps supps ($cap0_mapqp at MAPQ>0, $cap0_mapq0 at MAPQ=0)"

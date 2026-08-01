@@ -17,7 +17,7 @@ if [[ ! -x "$BIN" ]]; then
 fi
 
 # Clean up any stale registry from a prior run (and on exit).
-"$BIN" shm -d >/dev/null 2>&1 || true
+"$BIN" shm -d > /dev/null 2>&1 || true
 trap '"$BIN" shm -d >/dev/null 2>&1 || true' EXIT
 
 # Build the phix index if any of the index files are missing. No `.0123`: it is
@@ -25,12 +25,13 @@ trap '"$BIN" shm -d >/dev/null 2>&1 || true' EXIT
 need_index=0
 for ext in .amb .ann .bwt.2bit.64 .pac; do
     if [[ ! -s "${PREFIX}${ext}" ]]; then
-        need_index=1; break
+        need_index=1
+        break
     fi
 done
 if [[ "$need_index" -eq 1 ]]; then
     echo "[setup] Building phix index..."
-    "$BIN" index "$PREFIX" >/dev/null 2>&1
+    "$BIN" index "$PREFIX" > /dev/null 2>&1
 fi
 
 if [[ ! -f "$READS" ]]; then
@@ -68,7 +69,7 @@ if grep -q "attached from shm" "$DISK_ERR"; then
 fi
 
 # (c) Byte-identical SAM.
-if ! diff -q "$DISK_SAM" "$SHM_SAM" >/dev/null; then
+if ! diff -q "$DISK_SAM" "$SHM_SAM" > /dev/null; then
     echo "FAIL: SAM differs between disk and shm runs" >&2
     diff -u "$DISK_SAM" "$SHM_SAM" | head -40 >&2
     exit 1
@@ -77,7 +78,7 @@ fi
 # (d) After dropping the segment, mem reverts to the disk path.
 "$BIN" shm -d
 DROP_ERR=$(mktemp -t shm_drop.XXXXXX).err
-"$BIN" mem "$PREFIX" "$READS" >/dev/null 2>"$DROP_ERR"
+"$BIN" mem "$PREFIX" "$READS" > /dev/null 2> "$DROP_ERR"
 if grep -q "attached from shm" "$DROP_ERR"; then
     echo "FAIL: mem still shows 'attached from shm' after drop" >&2
     rm -f "$DROP_ERR"

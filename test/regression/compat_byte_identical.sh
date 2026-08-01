@@ -57,20 +57,21 @@ cp "$COMPAT_PHIX_FA" "$ref"
 seq="$(grep -v '^>' "$ref" | tr -d '\n' | tr 'acgt' 'ACGT')"
 r1="$COMPAT_WORK_DIR/r1.fq"
 r2="$COMPAT_WORK_DIR/r2.fq"
-: > "$r1"; : > "$r2"
-L=120          # read length
-G=300          # inner gap between the two windows (fragment ~ G+L)
+: > "$r1"
+: > "$r2"
+L=120 # read length
+G=300 # inner gap between the two windows (fragment ~ G+L)
 n_pairs=0
 for off in 200 900 1600 2300 3000 3700; do
     s1="${seq:$off:$L}"
-    s2fwd="${seq:$((off+G)):$L}"
+    s2fwd="${seq:$((off + G)):$L}"
     # reverse complement of s2fwd
     s2="$(printf '%s' "$s2fwd" | rev | tr 'ACGT' 'TGCA')"
     [ "${#s1}" -eq "$L" ] && [ "${#s2}" -eq "$L" ] || continue
     q="$(printf 'I%.0s' $(seq 1 "$L"))"
     printf '@pair%d/1\n%s\n+\n%s\n' "$n_pairs" "$s1" "$q" >> "$r1"
     printf '@pair%d/2\n%s\n+\n%s\n' "$n_pairs" "$s2" "$q" >> "$r2"
-    n_pairs=$((n_pairs+1))
+    n_pairs=$((n_pairs + 1))
 done
 
 if [ "$n_pairs" -lt 3 ]; then
@@ -85,21 +86,21 @@ echo "fixture: $n_pairs PE pairs sliced from phix"
 # --- SAM-text path: default vs --compat. ---
 def_sam="$COMPAT_WORK_DIR/default.sam"
 cmp_sam="$COMPAT_WORK_DIR/compat.sam"
-"$BWA_MEM3" mem          "$ref" "$r1" "$r2" > "$def_sam" 2>/dev/null
-"$BWA_MEM3" mem --compat=bwa-mem2 "$ref" "$r1" "$r2" > "$cmp_sam" 2>/dev/null
+"$BWA_MEM3" mem "$ref" "$r1" "$r2" > "$def_sam" 2> /dev/null
+"$BWA_MEM3" mem --compat=bwa-mem2 "$ref" "$r1" "$r2" > "$cmp_sam" 2> /dev/null
 
 # The default run must actually contain the tags we claim to suppress,
 # else the byte-identity check below would pass vacuously.
-def_mq=$(grep -c 'MQ:i:'  "$def_sam" || true)
-def_hn=$(grep -c 'HN:i:'  "$def_sam" || true)
+def_mq=$(grep -c 'MQ:i:' "$def_sam" || true)
+def_hn=$(grep -c 'HN:i:' "$def_sam" || true)
 if [ "$def_mq" -lt 1 ] || [ "$def_hn" -lt 1 ]; then
     echo "FAIL: default SAM lacks MQ/HN to suppress (MQ=$def_mq HN=$def_hn) — fixture too weak" >&2
     exit 1
 fi
 
 # --compat must emit neither tag.
-cmp_mq=$(grep -c 'MQ:i:'  "$cmp_sam" || true)
-cmp_hn=$(grep -c 'HN:i:'  "$cmp_sam" || true)
+cmp_mq=$(grep -c 'MQ:i:' "$cmp_sam" || true)
+cmp_hn=$(grep -c 'HN:i:' "$cmp_sam" || true)
 if [ "$cmp_mq" -ne 0 ] || [ "$cmp_hn" -ne 0 ]; then
     echo "FAIL: --compat SAM still emits MQ=$cmp_mq HN=$cmp_hn (expected 0/0)" >&2
     exit 1
@@ -141,7 +142,7 @@ fi
 def_stripped="$COMPAT_WORK_DIR/default.stripped.sam"
 cmp_stripped="$COMPAT_WORK_DIR/compat.stripped.sam"
 grep -vE '^@PG|^@HD' "$def_sam" \
-  | sed -E 's/\tMQ:i:[0-9-]+//; s/\tHN:i:[0-9-]+//' > "$def_stripped"
+    | sed -E 's/\tMQ:i:[0-9-]+//; s/\tHN:i:[0-9-]+//' > "$def_stripped"
 grep -vE '^@PG|^@HD' "$cmp_sam" > "$cmp_stripped"
 if ! diff -q "$def_stripped" "$cmp_stripped" > /dev/null; then
     echo "FAIL: --compat SAM differs from default beyond MQ/HN/@HD:" >&2
@@ -154,8 +155,8 @@ echo "PASS: SAM-text --compat is byte-identical to default minus MQ/HN/@HD (@PG 
 if command -v samtools > /dev/null 2>&1; then
     def_bam="$COMPAT_WORK_DIR/default.bam"
     cmp_bam="$COMPAT_WORK_DIR/compat.bam"
-    "$BWA_MEM3" mem --bam          "$ref" "$r1" "$r2" > "$def_bam" 2>/dev/null
-    "$BWA_MEM3" mem --bam --compat=bwa-mem2 "$ref" "$r1" "$r2" > "$cmp_bam" 2>/dev/null
+    "$BWA_MEM3" mem --bam "$ref" "$r1" "$r2" > "$def_bam" 2> /dev/null
+    "$BWA_MEM3" mem --bam --compat=bwa-mem2 "$ref" "$r1" "$r2" > "$cmp_bam" 2> /dev/null
 
     # --no-PG so samtools does not inject its own @PG line into the header dump.
     if [ "$(samtools view -H --no-PG "$cmp_bam" | grep -c '^@PG.*ID:bwa-mem3')" -ne 1 ]; then
@@ -175,7 +176,7 @@ if command -v samtools > /dev/null 2>&1; then
     bam_def_rec="$COMPAT_WORK_DIR/default.bam.rec"
     bam_cmp_rec="$COMPAT_WORK_DIR/compat.bam.rec"
     samtools view --no-PG "$def_bam" \
-      | sed -E 's/\tMQ:i:[0-9-]+//; s/\tHN:i:[0-9-]+//' > "$bam_def_rec"
+        | sed -E 's/\tMQ:i:[0-9-]+//; s/\tHN:i:[0-9-]+//' > "$bam_def_rec"
     samtools view --no-PG "$cmp_bam" > "$bam_cmp_rec"
     if ! diff -q "$bam_def_rec" "$bam_cmp_rec" > /dev/null; then
         echo "FAIL: --compat BAM records differ from default beyond MQ/HN:" >&2
@@ -190,7 +191,7 @@ fi
 # --- --compat and --fast are mutually exclusive: must be a hard error. ---
 # (A diff-clean-looking stream over --fast's changed alignments would defeat
 # the parity-validation purpose of --compat, so combining them is rejected.)
-if "$BWA_MEM3" mem --compat=bwa-mem2 --fast "$ref" "$r1" "$r2" > /dev/null 2>"$COMPAT_WORK_DIR/mutex.log"; then
+if "$BWA_MEM3" mem --compat=bwa-mem2 --fast "$ref" "$r1" "$r2" > /dev/null 2> "$COMPAT_WORK_DIR/mutex.log"; then
     echo "FAIL: --compat --fast exited 0 (expected a hard error)" >&2
     exit 1
 fi
@@ -205,7 +206,7 @@ echo "PASS: --compat --fast is rejected as a hard error"
 # bwa-mem2 has no methylation mode, so byte-identity is undefined under --meth.
 # The guard fires during option validation, before any index load, so the
 # non-meth phix reference here is sufficient to exercise it.
-if "$BWA_MEM3" mem --compat=bwa-mem2 --meth "$ref" "$r1" "$r2" > /dev/null 2>"$COMPAT_WORK_DIR/meth.log"; then
+if "$BWA_MEM3" mem --compat=bwa-mem2 --meth "$ref" "$r1" "$r2" > /dev/null 2> "$COMPAT_WORK_DIR/meth.log"; then
     echo "FAIL: --compat --meth exited 0 (expected a hard error)" >&2
     exit 1
 fi
@@ -221,16 +222,17 @@ echo "PASS: --compat --meth is rejected as a hard error"
 # rejection below is a contract the docs state. A regression here is silent
 # otherwise: a wrong optstring turns `--compat=off` into a hard error, or
 # `--compat=bwa-mem` into a claim of parity we cannot deliver.
-compat_ok() {   # spelling... -- must exit 0
-    if ! "$BWA_MEM3" mem "$@" "$ref" "$r1" "$r2" > /dev/null 2>"$COMPAT_WORK_DIR/cli.log"; then
+compat_ok() { # spelling... -- must exit 0
+    if ! "$BWA_MEM3" mem "$@" "$ref" "$r1" "$r2" > /dev/null 2> "$COMPAT_WORK_DIR/cli.log"; then
         echo "FAIL: 'mem $*' exited nonzero, expected success:" >&2
         cat "$COMPAT_WORK_DIR/cli.log" >&2
         exit 1
     fi
 }
-compat_err() {  # <expected-substring> <spelling...> -- must exit nonzero AND say why
-    want="$1"; shift
-    if "$BWA_MEM3" mem "$@" "$ref" "$r1" "$r2" > /dev/null 2>"$COMPAT_WORK_DIR/cli.log"; then
+compat_err() { # <expected-substring> <spelling...> -- must exit nonzero AND say why
+    want="$1"
+    shift
+    if "$BWA_MEM3" mem "$@" "$ref" "$r1" "$r2" > /dev/null 2> "$COMPAT_WORK_DIR/cli.log"; then
         echo "FAIL: 'mem $*' exited 0, expected a hard error" >&2
         exit 1
     fi
@@ -241,16 +243,16 @@ compat_err() {  # <expected-substring> <spelling...> -- must exit nonzero AND sa
     fi
 }
 
-compat_ok  --compat=bwa-mem2          # canonical, '=' form
-compat_ok  --compat bwa-mem2          # canonical, space form (required_argument)
-compat_ok  --compat=mem2              # documented alias
-compat_ok  --compat=off               # explicit no-op
-compat_ok  --compat=off --fast        # off must NOT trip the --fast guard
-compat_err "unknown --compat target"  --compat=bogus
+compat_ok --compat=bwa-mem2   # canonical, '=' form
+compat_ok --compat bwa-mem2   # canonical, space form (required_argument)
+compat_ok --compat=mem2       # documented alias
+compat_ok --compat=off        # explicit no-op
+compat_ok --compat=off --fast # off must NOT trip the --fast guard
+compat_err "unknown --compat target" --compat=bogus
 # bwa-mem is a real row in the table, deliberately not selectable. It must
 # get its own diagnostic -- calling it "unknown" would be a lie, and a user
 # asking for it deserves the actual reason.
-compat_err "not yet selectable"       --compat=bwa-mem
+compat_err "not yet selectable" --compat=bwa-mem
 echo "PASS: --compat enum grammar (=/space, alias, off, unknown, unselectable)"
 
 # --- --compat with an @HD in -H warns, and does NOT reject. --------------
@@ -262,30 +264,39 @@ echo "PASS: --compat enum grammar (=/space, alias, off, unknown, unselectable)"
 hd_h=$(printf '@HD\tVN:1.6\tSO:coordinate')
 rg_h=$(printf '@RG\tID:x\tSM:y')
 if ! "$BWA_MEM3" mem --compat=bwa-mem2 -H "$hd_h" "$ref" "$r1" "$r2" \
-        > "$COMPAT_WORK_DIR/hdwarn.sam" 2>"$COMPAT_WORK_DIR/hdwarn.log"; then
+    > "$COMPAT_WORK_DIR/hdwarn.sam" 2> "$COMPAT_WORK_DIR/hdwarn.log"; then
     echo "FAIL: --compat with -H @HD exited nonzero; it must warn, not reject" >&2
-    cat "$COMPAT_WORK_DIR/hdwarn.log" >&2; exit 1
+    cat "$COMPAT_WORK_DIR/hdwarn.log" >&2
+    exit 1
 fi
 grep -q 'will differ from bwa-mem2 in line order' "$COMPAT_WORK_DIR/hdwarn.log" \
-    || { echo "FAIL: --compat with -H @HD did not warn about line order:" >&2
-         cat "$COMPAT_WORK_DIR/hdwarn.log" >&2; exit 1; }
+    || {
+        echo "FAIL: --compat with -H @HD did not warn about line order:" >&2
+        cat "$COMPAT_WORK_DIR/hdwarn.log" >&2
+        exit 1
+    }
 # The user's @HD must win and be hoisted above @SQ (that is the whole point).
 head -1 "$COMPAT_WORK_DIR/hdwarn.sam" | grep -q '^@HD' \
-    || { echo "FAIL: user @HD from -H is not the first header line" >&2; exit 1; }
+    || {
+        echo "FAIL: user @HD from -H is not the first header line" >&2
+        exit 1
+    }
 echo "PASS: --compat with -H @HD warns and continues, user @HD wins"
 
 # A LATER @HD is emitted inline after @SQ, exactly as upstream does, so there
 # is nothing to warn about -- the warning must stay quiet or it means nothing.
 "$BWA_MEM3" mem --compat=bwa-mem2 -H "$rg_h" -H "$hd_h" "$ref" "$r1" "$r2" \
-    > /dev/null 2>"$COMPAT_WORK_DIR/hdquiet.log"
+    > /dev/null 2> "$COMPAT_WORK_DIR/hdquiet.log"
 if grep -q 'in line order' "$COMPAT_WORK_DIR/hdquiet.log"; then
     echo "FAIL: warned about a non-leading @HD, which does not diverge" >&2
-    cat "$COMPAT_WORK_DIR/hdquiet.log" >&2; exit 1
+    cat "$COMPAT_WORK_DIR/hdquiet.log" >&2
+    exit 1
 fi
 # ...and no warning at all without a compat target.
-"$BWA_MEM3" mem -H "$hd_h" "$ref" "$r1" "$r2" > /dev/null 2>"$COMPAT_WORK_DIR/hdoff.log"
+"$BWA_MEM3" mem -H "$hd_h" "$ref" "$r1" "$r2" > /dev/null 2> "$COMPAT_WORK_DIR/hdoff.log"
 if grep -q 'in line order' "$COMPAT_WORK_DIR/hdoff.log"; then
-    echo "FAIL: warned without a compat target selected" >&2; exit 1
+    echo "FAIL: warned without a compat target selected" >&2
+    exit 1
 fi
 echo "PASS: the -H @HD warning fires only when the header actually diverges"
 
@@ -294,22 +305,29 @@ echo "PASS: the -H @HD warning fires only when the header actually diverges"
 # too, for two @HD records in one header -- a spec violation, and one bwa does
 # not have (bwa.c:412-426 counts @HD at any line start). The BAM writer was
 # already correct, so this also re-aligns the two paths.
-one_hd() {   # <description> [extra bwa-mem3 args...]
-    local desc="$1"; shift
+one_hd() { # <description> [extra bwa-mem3 args...]
+    local desc="$1"
+    shift
     local n m
-    n=$("$BWA_MEM3" mem "$@" "$ref" "$r1" "$r2" 2>/dev/null | grep -c '^@HD' || true)
+    n=$("$BWA_MEM3" mem "$@" "$ref" "$r1" "$r2" 2> /dev/null | grep -c '^@HD' || true)
     [ "$n" -eq 1 ] \
-        || { echo "FAIL: SAM emitted $n @HD lines ($desc), expected exactly 1" >&2; exit 1; }
+        || {
+            echo "FAIL: SAM emitted $n @HD lines ($desc), expected exactly 1" >&2
+            exit 1
+        }
     if command -v samtools > /dev/null 2>&1; then
-        m=$("$BWA_MEM3" mem --bam "$@" "$ref" "$r1" "$r2" 2>/dev/null \
-            | samtools view -H --no-PG - 2>/dev/null | grep -c '^@HD' || true)
+        m=$("$BWA_MEM3" mem --bam "$@" "$ref" "$r1" "$r2" 2> /dev/null \
+            | samtools view -H --no-PG - 2> /dev/null | grep -c '^@HD' || true)
         [ "$m" -eq 1 ] \
-            || { echo "FAIL: BAM emitted $m @HD lines ($desc), expected exactly 1" >&2; exit 1; }
+            || {
+                echo "FAIL: BAM emitted $m @HD lines ($desc), expected exactly 1" >&2
+                exit 1
+            }
     fi
 }
 one_hd "no -H"
 one_hd "leading @HD" -H "$hd_h"
-one_hd "later @HD"   -H "$rg_h" -H "$hd_h"
+one_hd "later @HD" -H "$rg_h" -H "$hd_h"
 echo "PASS: exactly one @HD on both paths, leading or later -H @HD"
 
 echo "PASS: compat byte-identical regression"

@@ -66,6 +66,67 @@ jobs:
       - name: Opt-in macro -D list matches the macros in src/
         run: bash test/regression/debug_macro_flag_lint.sh
 
+  # Same shape and rationale as the two jobs above: source-only, no toolchain,
+  # its own job so the failure reads as "your shell script is unformatted"
+  # rather than being buried in a matrix row. Runs in seconds.
+  shell-lint:
+    name: Shell lint (shellcheck + shfmt)
+    runs-on: ubuntu-latest
+    env:
+      # Pinned, and kept in lockstep with the constants at the top of
+      # test/regression/shell_lint.sh. ubuntu-latest ships a shellcheck of its
+      # own at a floating version; an upgrade there that adds a check would
+      # otherwise turn this job red on a pull request that never touched
+      # shell. The gate gets stricter only when someone bumps these.
+      SHELLCHECK_VERSION: "0.11.0"
+      SHFMT_VERSION: "v3.13.1"
+      SHELLCHECK_SHA256: "8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198"
+      SHFMT_SHA256: "fb096c5d1ac6beabbdbaa2874d025badb03ee07929f0c9ff67563ce8c75398b1"
+      # Turns a missing tool into a hard error instead of the SKIP that keeps
+      # `make test` working on a developer box. Without it a broken install
+      # step below would leave this job permanently, silently green.
+      SHELL_LINT_REQUIRED: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      # Checksum-verified for the same reason the actions above are pinned by
+      # commit hash rather than tag: a release asset can be replaced in place.
+      - name: Install pinned shellcheck and shfmt
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.local/bin"
+
+          curl -fsSL -o /tmp/shellcheck.tar.xz \
+            "https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/shellcheck-v${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          echo "${SHELLCHECK_SHA256}  /tmp/shellcheck.tar.xz" | sha256sum -c -
+          tar -xJf /tmp/shellcheck.tar.xz -C /tmp
+          install -m 0755 "/tmp/shellcheck-v${SHELLCHECK_VERSION}/shellcheck" "$HOME/.local/bin/shellcheck"
+
+          curl -fsSL -o /tmp/shfmt \
+            "https://github.com/mvdan/sh/releases/download/${SHFMT_VERSION}/shfmt_${SHFMT_VERSION}_linux_amd64"
+          echo "${SHFMT_SHA256}  /tmp/shfmt" | sha256sum -c -
+          install -m 0755 /tmp/shfmt "$HOME/.local/bin/shfmt"
+
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Report tool versions
+        run: |
+          shellcheck --version
+          shfmt --version
+
+      # Runs first, for the same reason as the two lint jobs above: this gate's
+      # PASS is indistinguishable from the PASS it would print if it had
+      # stopped checking anything, so the step below only means something once
+      # the gate has been shown to still reject bad scripts.
+      - name: Shell lint still detects bad scripts
+        run: bash test/regression/shell_lint_selftest.sh
+
+      - name: Tracked shell scripts are shellcheck-clean and shfmt-formatted
+        run: bash test/regression/shell_lint.sh
+
   build-and-test:
     strategy:
       fail-fast: false

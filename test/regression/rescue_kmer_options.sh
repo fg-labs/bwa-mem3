@@ -33,16 +33,29 @@ FIXTURES="${FIXTURES:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../fixtures" && pwd)}
 
 src_ref="$FIXTURES/phix.fa"
 reads="$FIXTURES/reads.fa"
-[[ -x "$BWA_MEM3" ]] || { echo "FAIL: binary not executable: $BWA_MEM3" >&2; exit 1; }
-[[ -s "$src_ref" ]]  || { echo "FAIL: phix.fa missing: $src_ref" >&2; exit 1; }
-[[ -s "$reads" ]]    || { echo "FAIL: reads.fa missing: $reads" >&2; exit 1; }
+[[ -x "$BWA_MEM3" ]] || {
+    echo "FAIL: binary not executable: $BWA_MEM3" >&2
+    exit 1
+}
+[[ -s "$src_ref" ]] || {
+    echo "FAIL: phix.fa missing: $src_ref" >&2
+    exit 1
+}
+[[ -s "$reads" ]] || {
+    echo "FAIL: reads.fa missing: $reads" >&2
+    exit 1
+}
 
 # Index a private copy so the test never writes into the fixtures tree.
-mdir="$(mktemp -d)"; err="$mdir/err.log"
+mdir="$(mktemp -d)"
+err="$mdir/err.log"
 trap 'rm -rf "$mdir"' EXIT
 ref="$mdir/phix.fa"
 cp "$src_ref" "$ref"
-"$BWA_MEM3" index "$ref" >/dev/null 2>&1 || { echo "FAIL: index phix.fa" >&2; exit 1; }
+"$BWA_MEM3" index "$ref" > /dev/null 2>&1 || {
+    echo "FAIL: index phix.fa" >&2
+    exit 1
+}
 
 fails=0
 
@@ -52,7 +65,7 @@ fails=0
 reject() {
     local optword="$1" want="$2" rc
     set +e
-    "$BWA_MEM3" mem "$optword" "$ref" "$reads" >/dev/null 2>"$err"
+    "$BWA_MEM3" mem "$optword" "$ref" "$reads" > /dev/null 2> "$err"
     rc=$?
     set -e
     if [[ "$rc" -eq 0 ]]; then
@@ -69,7 +82,7 @@ reject() {
 # $1 = full option word that must be ACCEPTED (the run itself must succeed).
 accept() {
     local optword="$1"
-    if "$BWA_MEM3" mem "$optword" "$ref" "$reads" >/dev/null 2>"$err"; then
+    if "$BWA_MEM3" mem "$optword" "$ref" "$reads" > /dev/null 2> "$err"; then
         echo "  ok: '$optword' accepted"
     else
         echo "FAIL: '$optword' was rejected; expected it to run"
@@ -82,28 +95,28 @@ kmer_err='ERROR: --rescue-kmer requires an integer in 0..16'
 band_err='ERROR: --rescue-band requires an integer in 1..1000000 bp'
 
 # --- --rescue-kmer -----------------------------------------------------------
-reject "--rescue-kmer=abc" "$kmer_err"   # not a number at all -> would have meant "off"
-reject "--rescue-kmer=6x"  "$kmer_err"   # trailing junk: partial parse must not pass
-reject "--rescue-kmer=-1"  "$kmer_err"   # negative
+reject "--rescue-kmer=abc" "$kmer_err" # not a number at all -> would have meant "off"
+reject "--rescue-kmer=6x" "$kmer_err"  # trailing junk: partial parse must not pass
+reject "--rescue-kmer=-1" "$kmer_err"  # negative
 # Above the uint32 k-mer code width. Rejected rather than clamped: a clamped K=20
 # behaves exactly as K=16, so accepting it would report a setting that does not
 # exist. This is also what the documented 1..16 range promises.
-reject "--rescue-kmer=17"  "$kmer_err"
-reject "--rescue-kmer=20"  "$kmer_err"
+reject "--rescue-kmer=17" "$kmer_err"
+reject "--rescue-kmer=20" "$kmer_err"
 
-accept "--rescue-kmer"     # bare: selects the default K
-accept "--rescue-kmer=0"   # explicit off
-accept "--rescue-kmer=1"   # low edge
-accept "--rescue-kmer=16"  # high edge -- must be INSIDE the accepted range
+accept "--rescue-kmer"    # bare: selects the default K
+accept "--rescue-kmer=0"  # explicit off
+accept "--rescue-kmer=1"  # low edge
+accept "--rescue-kmer=16" # high edge -- must be INSIDE the accepted range
 
 # --- --rescue-band -----------------------------------------------------------
-reject "--rescue-band=abc"     "$band_err"
-reject "--rescue-band=50bp"    "$band_err"   # trailing suffix: the option takes plain bp
-reject "--rescue-band=-5"      "$band_err"   # negative
+reject "--rescue-band=abc" "$band_err"
+reject "--rescue-band=50bp" "$band_err" # trailing suffix: the option takes plain bp
+reject "--rescue-band=-5" "$band_err"   # negative
 # 0 is rejected rather than accepted-and-ignored: it reads as "no band" but the
 # kernel's `band > 0 ? band : 50` guard would have silently run the 50 bp default.
-reject "--rescue-band=0"       "$band_err"
-reject "--rescue-band=1000001" "$band_err"   # above the documented cap
+reject "--rescue-band=0" "$band_err"
+reject "--rescue-band=1000001" "$band_err" # above the documented cap
 
 accept "--rescue-band=1"
 accept "--rescue-band=1000000"
@@ -114,7 +127,7 @@ accept "--rescue-band=1000000"
 # `6` is taken as the index base. Pinning this keeps the docs and the --help
 # --fast expansion honest about the `=` form.
 set +e
-"$BWA_MEM3" mem --rescue-kmer 6 "$ref" "$reads" >/dev/null 2>"$err"
+"$BWA_MEM3" mem --rescue-kmer 6 "$ref" "$reads" > /dev/null 2> "$err"
 rc=$?
 set -e
 if [[ "$rc" -eq 0 ]]; then

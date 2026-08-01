@@ -19,50 +19,64 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 BWAMEM3="$HERE/../../bwa-mem3"
 SAMTOOLS="${SAMTOOLS:-samtools}"
-BWAMETH_DIR="${BWAMETH_DIR:-$HOME/work/git/bwa-meth}"
-BWAMETH_PY="$BWAMETH_DIR/bwameth.py"
 
 if [[ ! -x "$BWAMEM3" ]]; then
     echo "ERROR: bwa-mem3 binary not found at $BWAMEM3. Run 'make arm64' first."
     exit 2
 fi
-if ! command -v "$SAMTOOLS" >/dev/null 2>&1; then
+if ! command -v "$SAMTOOLS" > /dev/null 2>&1; then
     echo "ERROR: samtools not found on PATH."
     exit 2
 fi
 
 cd "$HERE"
 
+# Every BAM this test writes goes into a private per-run directory. Fixed names
+# under /tmp can be pre-created as symlinks by another local user, in which case
+# the redirections below would follow them and clobber an unrelated file; they
+# also stop two runs of this script from coexisting.
+SCRATCH="$(mktemp -d)"
+trap 'rm -rf "$SCRATCH"' EXIT
+BAM="$SCRATCH/meth_test.bam"
+BAM2="$SCRATCH/meth_test2.bam"
+
 # ---------------------------------------------------------------------------
 # Layer 1: BAM emission smoke test
 # ---------------------------------------------------------------------------
 
 if [[ ! -f ref.fa.bwameth.c2t.bwt.2bit.64 ]]; then
-    "$BWAMEM3" index --meth ref.fa >/dev/null 2>&1
+    "$BWAMEM3" index --meth ref.fa > /dev/null 2>&1
 fi
 
-"$BWAMEM3" mem --meth -t 2 ref.fa t_R1.fastq.gz 2>/dev/null > /tmp/meth_test.bam
+"$BWAMEM3" mem --meth -t 2 ref.fa t_R1.fastq.gz 2> /dev/null > "$BAM"
 
 EXPECT_EOF="1f8b08040000000000ff0600424302001b0003000000000000000000"
-ACTUAL_EOF="$(tail -c 28 /tmp/meth_test.bam | od -An -v -t x1 | tr -d ' \n')"
+ACTUAL_EOF="$(tail -c 28 "$BAM" | od -An -v -t x1 | tr -d ' \n')"
 if [[ "${ACTUAL_EOF%$'\n'}" != "${EXPECT_EOF}" ]]; then
-    echo "FAIL: BGZF EOF marker mismatch (actual=$ACTUAL_EOF)"; exit 1
+    echo "FAIL: BGZF EOF marker mismatch (actual=$ACTUAL_EOF)"
+    exit 1
 fi
 
-HDR="$("$SAMTOOLS" view -H /tmp/meth_test.bam 2>&1)"
+HDR="$("$SAMTOOLS" view -H "$BAM" 2>&1)"
 if echo "$HDR" | grep -qi 'truncated\|EOF marker is absent'; then
-    echo "FAIL: samtools reports truncated BAM"; echo "$HDR"; exit 1
+    echo "FAIL: samtools reports truncated BAM"
+    echo "$HDR"
+    exit 1
 fi
 if ! echo "$HDR" | grep -q 'ID:bwa-mem3-meth'; then
-    echo "FAIL: @PG ID:bwa-mem3-meth missing"; exit 1
+    echo "FAIL: @PG ID:bwa-mem3-meth missing"
+    exit 1
 fi
 
-TOTAL="$("$SAMTOOLS" view -c /tmp/meth_test.bam 2>/dev/null)"
-if [[ "$TOTAL" -lt 1 ]]; then echo "FAIL: zero records in output BAM"; exit 1; fi
+TOTAL="$("$SAMTOOLS" view -c "$BAM" 2> /dev/null)"
+if [[ "$TOTAL" -lt 1 ]]; then
+    echo "FAIL: zero records in output BAM"
+    exit 1
+fi
 
 "$BWAMEM3" mem --meth --set-as-failed f --chimera-qc \
-    ref.fa t_R1.fastq.gz 2>/dev/null > /tmp/meth_test2.bam
-if [[ ! -s /tmp/meth_test2.bam ]]; then
+    ref.fa t_R1.fastq.gz 2> /dev/null > "$BAM2"
+if [[ ! -s "$BAM2" ]]; then
     echo "FAIL: --set-as-failed + --chimera-qc produced empty output"
     exit 1
 fi
@@ -74,21 +88,21 @@ echo "OK layer 1: bwa-mem3 mem --meth (records=$TOTAL, BGZF-EOF ok, @PG bwa-mem3
 # XG:Z:(CT|GA), and XM:Z whose payload length equals SEQ length. Unmapped
 # records (FLAG & 0x4) carry XR:Z only. No record emits the legacy Y* tags.
 
-PRIMARY_MAPPED_NO_XR=$("$SAMTOOLS" view -F 0x904 /tmp/meth_test.bam \
+PRIMARY_MAPPED_NO_XR=$("$SAMTOOLS" view -F 0x904 "$BAM" \
     | mawk '!/\tXR:Z:(CT|GA)/{n++} END{print n+0}')
 if [[ "$PRIMARY_MAPPED_NO_XR" -ne 0 ]]; then
     echo "FAIL: $PRIMARY_MAPPED_NO_XR primary mapped record(s) missing XR:Z:(CT|GA)"
     exit 1
 fi
 
-PRIMARY_MAPPED_NO_XG=$("$SAMTOOLS" view -F 0x904 /tmp/meth_test.bam \
+PRIMARY_MAPPED_NO_XG=$("$SAMTOOLS" view -F 0x904 "$BAM" \
     | mawk '!/\tXG:Z:(CT|GA)/{n++} END{print n+0}')
 if [[ "$PRIMARY_MAPPED_NO_XG" -ne 0 ]]; then
     echo "FAIL: $PRIMARY_MAPPED_NO_XG primary mapped record(s) missing XG:Z:(CT|GA)"
     exit 1
 fi
 
-XM_LEN_BAD=$("$SAMTOOLS" view -F 0x904 /tmp/meth_test.bam \
+XM_LEN_BAD=$("$SAMTOOLS" view -F 0x904 "$BAM" \
     | mawk '
         {
             seq_len = length($10)
@@ -105,7 +119,7 @@ if [[ "$XM_LEN_BAD" -ne 0 ]]; then
     exit 1
 fi
 
-UNMAPPED_BAD=$("$SAMTOOLS" view -f 0x4 /tmp/meth_test.bam \
+UNMAPPED_BAD=$("$SAMTOOLS" view -f 0x4 "$BAM" \
     | mawk '
         {
             has_xr = 0; has_xg = 0; has_xm = 0
@@ -122,8 +136,19 @@ if [[ "$UNMAPPED_BAD" -ne 0 ]]; then
     exit 1
 fi
 
-Y_LEAKS=$("$SAMTOOLS" view /tmp/meth_test.bam \
-    | grep -cE '\b(YS|YC|YD):[ZA]:' || true)
+# Counted with mawk rather than `grep -c ... || true`: grep exits 1 on "no
+# match", so the `|| true` needed to tolerate the (expected) zero-match case
+# would equally swallow a `samtools view` failure, leaving Y_LEAKS=0 and the
+# check passing without ever reading "$BAM". mawk prints 0 on no match and
+# exits 0, so pipefail still propagates a samtools failure.
+Y_LEAKS=$("$SAMTOOLS" view "$BAM" \
+    | mawk '
+        {
+            for (i = 12; i <= NF; i++) {
+                if ($i ~ /^(YS|YC|YD):[ZA]:/) { n++; break }
+            }
+        }
+        END { print n+0 }')
 if [[ "$Y_LEAKS" -ne 0 ]]; then
     echo "FAIL: $Y_LEAKS record(s) still emit YS/YC/YD legacy tags"
     exit 1

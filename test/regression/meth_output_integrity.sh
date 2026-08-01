@@ -40,10 +40,18 @@
 #   BWA_MEM3 — path to the bwa-mem3 binary under test
 set -euo pipefail
 : "${BWA_MEM3:?BWA_MEM3 must be set}"
-command -v samtools >/dev/null 2>&1 || { echo "SKIP: samtools not on PATH (--meth emits BAM)"; exit 0; }
+command -v samtools > /dev/null 2>&1 || {
+    echo "SKIP: samtools not on PATH (--meth emits BAM)"
+    exit 0
+}
 
-WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT; cd "$WORK"
-fail() { echo "FAIL: $*" >&2; exit 1; }
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+cd "$WORK"
+fail() {
+    echo "FAIL: $*" >&2
+    exit 1
+}
 
 # Deterministic 1500 bp reference (PRNG seed 4242).
 REF=TCATTGGCTATCCTAACCCGACCCTAGGAGCGGTTGGCGTGTATGCCGTGAATTTTCTCATTTCCGCTAGACATAATCGTTCTGCCTATATCTGGACAACATCCCGGCGACTTAGGCGACCCACAGAATCGTCCCTTCTAACGTAGTTCGCATAGTTCCCGTCCGTAGCCGGACTATTCGAACACCCAGTATTCGATTAACTCGGGCTTGACGTATTAGAGGCGTTAGTGTGCCAGGTAAGATACGCCAACGGAATTAACCTCTGTGACACTCCGCGGAGCCTTCGGACATATAAGTGATCGGGTCTACGTTTGTTAGACTTGAGACGTCTGTTAAGAGTTGGGTCTAATAAATCGCCTACACGTGGAGTCTAACGGGGAAGCGTCGAATCCTGATACATCATATAATGGAGCGTGTTATGAAAAAAGAGCATTCCATTGTACGAGCCGTGCCAGAAACGGCTTGACTACGTGAGCGTAGTGTTAGATAAACAGGAAACACTGACGCGGTTAGAAGGCGGATTGCCGGTAGGTTTTGGAAACATAAATACACACGGTATCATGTTGGGTCACGATTCCTATCACCGCACAGGGCCAACCATAGAAGAACTGAAAGAACTAATCTGGCGGCGGGCTCGGTGCTTATATTTTCCACCCAACATCGTGCACATTAGGCTCACCGCGCCCTACGGGCGAAGGGTGCGTACGGTGTTTATAAGGCGTGACGGCCCCAAGTAGAGGGTAATTCTGTGAAAGAATCTCAGGACGGTGGCATGAATTCAATTCCTTTTAAACCTATCGTTCCGACCTTATGCAATCCTTCAATGAAGATCGTCAACGACCATCGTTCTTCTGCTTTAAGTGTGAGTTCTCTCTTACAAGCTAATACACCCCAGCGTTCTCCGTACTCTTCACTGCCCAAGCGAGGCTAACCTTTTGAAATGTCACAGTCGAAGCATATCTCCCGTACATCTTTTTCGGAGATCGCAGCTCGCGGAGCTATAAGCGACTTAAGCCCTTGTGTCGGTGATCCCAAGGGTCTGACTCCTGTACCAGGGTTACTGTTTCGCTTTACGGAGTAGCCTGTGAGGTGAACTGAAAGGAGCATATTTGAGATCTAAGATAGGGTCCTCCTCTGCGTCTACGTTCTCTCCGTTACGTACGGCTTCGCACCGGAGTGCATCTTGGCCCCGAAACGCACTGTGTGTGCTGATACAGCGTCCCTGGCCGGCCATGGGTTCAGAACTCCCGGGAACGCTTTTCAACTTAGAGGAACCCCGTCATGGAAGTAGATCGCGTCGAATGAGGGAGTTAGTCCTCGTTCCAGCTGGTAATTGTTTTACCGCTTGGGACCACTATAGGCCGCGGGTAGAAGTTGCTGGGTGTTGATTCCAACCCTCGAACCACGATACGACCTGCCATTTATGGCACAGTAAGGTTCAAACAGCATAATGAATACAGTTATAGTAACTTCCTCACGTACGATTAGGACGCAGCCTTG
@@ -51,30 +59,32 @@ REF=TCATTGGCTATCCTAACCCGACCCTAGGAGCGGTTGGCGTGTATGCCGTGAATTTTCTCATTTCCGCTAGACATAA
 printf '>chrA\n%s\n' "$REF" > ref.fa
 Q=$(printf 'I%.0s' $(seq 1 60))
 emit() { printf '@%s\n%s\n+\n%s\n' "$1" "$2" "$Q" > "$3"; }
-"$BWA_MEM3" index --meth ref.fa >/dev/null 2>&1 || fail "index --meth nonzero exit"
+"$BWA_MEM3" index --meth ref.fa > /dev/null 2>&1 || fail "index --meth nonzero exit"
 
-tag() { mawk -v k="$2" '{for(i=12;i<=NF;i++) if(substr($i,1,5)==k":Z:"||substr($i,1,5)==k":i:") {print substr($i,6); exit}}' <<<"$1"; }
+tag() { mawk -v k="$2" '{for(i=12;i<=NF;i++) if(substr($i,1,5)==k":Z:"||substr($i,1,5)==k":i:") {print substr($i,6); exit}}' <<< "$1"; }
 
 # --- 1. real SNP vs conversion ---------------------------------------------
 # OT fwd @101: 10 C->T conversions (free) + 1 real A->G SNP at read pos 22 (penalized).
 SNP_READ=ATTCTGGCGATTTAGGTGACTCGCAGAATCGTTCTTTCTAACGTAGTTTGTATAGTTCTC
 emit snp "$SNP_READ" snp.fq
-"$BWA_MEM3" mem --meth --meth-scoring genomic -t 1 ref.fa snp.fq > snp.bam 2>/dev/null || fail "snp mem --meth nonzero exit"
+"$BWA_MEM3" mem --meth --meth-scoring genomic -t 1 ref.fa snp.fq > snp.bam 2> /dev/null || fail "snp mem --meth nonzero exit"
 samtools quickcheck snp.bam || fail "snp invalid BAM"
 line=$(samtools view snp.bam | mawk 'NR==1')
-as=$(tag "$line" AS); nm=$(tag "$line" NM); md=$(tag "$line" MD)
+as=$(tag "$line" AS)
+nm=$(tag "$line" NM)
+md=$(tag "$line" MD)
 # --meth keeps the bwa default mismatch penalty b=4 (not bwameth's b=2), so the single real SNP costs -4
 # (conversions free): 59 match/freed columns (+59) - 1 SNP (-4) = 55.
 [ "$as" = "55" ] || fail "SNP/conv: AS $as, want 55 (only the real SNP penalized at b=4; conversions free)"
-[ "$nm" = "1" ]  || fail "SNP/conv: NM $nm, want 1 (the real SNP only; conversions are matches for NM/MD)"
+[ "$nm" = "1" ] || fail "SNP/conv: NM $nm, want 1 (the real SNP only; conversions are matches for NM/MD)"
 # MD reference-base mismatch letters: exactly one ref-A (the SNP), no ref-C (the
 # conversions must not appear at all).
 nC=$(printf '%s' "$md" | tr -cd 'C' | wc -c | tr -d ' ')
 nA=$(printf '%s' "$md" | tr -cd 'A' | wc -c | tr -d ' ')
 nG=$(printf '%s' "$md" | tr -cd 'G' | wc -c | tr -d ' ')
-[ "$nC" = "0" ]  || fail "SNP/conv: MD has $nC ref-C mismatches, want 0 (conversions must be hidden); MD=$md"
-[ "$nA" = "1" ]  || fail "SNP/conv: MD has $nA ref-A mismatches, want 1 (the real SNP); MD=$md"
-[ "$nG" = "0" ]  || fail "SNP/conv: MD has $nG ref-G mismatches, want 0; MD=$md"
+[ "$nC" = "0" ] || fail "SNP/conv: MD has $nC ref-C mismatches, want 0 (conversions must be hidden); MD=$md"
+[ "$nA" = "1" ] || fail "SNP/conv: MD has $nA ref-A mismatches, want 1 (the real SNP); MD=$md"
+[ "$nG" = "0" ] || fail "SNP/conv: MD has $nG ref-G mismatches, want 0; MD=$md"
 
 # --- 2. Bismark four-strand XR/XG ------------------------------------------
 # Forward (top-strand) fragment: R1 OT fwd, R2 CTOT rev -> both XG:CT.
@@ -92,27 +102,30 @@ check_strand() { # $1 bam $2 mateflag $3 label $4 wantXR $5 wantXG
     [ "$xr" = "$4" ] || fail "$3: XR $xr, want $4"
     [ "$xg" = "$5" ] || fail "$3: XG $xg, want $5 (Bismark genome strand)"
 }
-emit f "$FWD_R1" f1.fq; emit f "$FWD_R2" f2.fq
-"$BWA_MEM3" mem --meth --meth-scoring genomic -t 1 ref.fa f1.fq f2.fq > fwd.bam 2>/dev/null || fail "fwd nonzero exit"
-check_strand fwd.bam 64  "OT   R1" CT CT
+emit f "$FWD_R1" f1.fq
+emit f "$FWD_R2" f2.fq
+"$BWA_MEM3" mem --meth --meth-scoring genomic -t 1 ref.fa f1.fq f2.fq > fwd.bam 2> /dev/null || fail "fwd nonzero exit"
+check_strand fwd.bam 64 "OT   R1" CT CT
 check_strand fwd.bam 128 "CTOT R2" GA CT
-emit r "$REV_R1" r1.fq; emit r "$REV_R2" r2.fq
-"$BWA_MEM3" mem --meth --meth-scoring genomic -t 1 ref.fa r1.fq r2.fq > rev.bam 2>/dev/null || fail "rev nonzero exit"
-check_strand rev.bam 64  "OB   R1" CT GA
+emit r "$REV_R1" r1.fq
+emit r "$REV_R2" r2.fq
+"$BWA_MEM3" mem --meth --meth-scoring genomic -t 1 ref.fa r1.fq r2.fq > rev.bam 2> /dev/null || fail "rev nonzero exit"
+check_strand rev.bam 64 "OB   R1" CT GA
 check_strand rev.bam 128 "CTOB R2" GA GA
 
 # --- 3. SEQ<->CIGAR orientation on a reverse-mapped mate -------------------
 SEQ_R1=ATCCCGGCGACTTAGGCGACCCACAGAATCGTCCCTTCTAACGTAGTTCGCATAGTTCCC
 SEQ_R2=TAGGCGATTTATTAGACCCAACTCTTAACAGACGTCTCAAGTCTAACAAACGTAGACCCG
 SEQ_R2_RC=CGGGTCTACGTTTGTTAGACTTGAGACGTCTGTTAAGAGTTGGGTCTAATAAATCGCCTA
-emit pp "$SEQ_R1" s1.fq; emit pp "$SEQ_R2" s2.fq
-"$BWA_MEM3" mem --meth --meth-scoring genomic -t 1 ref.fa s1.fq s2.fq > seq.bam 2>/dev/null || fail "seq nonzero exit"
+emit pp "$SEQ_R1" s1.fq
+emit pp "$SEQ_R2" s2.fq
+"$BWA_MEM3" mem --meth --meth-scoring genomic -t 1 ref.fa s1.fq s2.fq > seq.bam 2> /dev/null || fail "seq nonzero exit"
 samtools quickcheck seq.bam || fail "seq invalid BAM (S1 inconsistent-BAM trap)"
 read -r rev seq cig < <(samtools view seq.bam | mawk '(int($2/128)%2)==1{print (int($2/16)%2),$10,$6;exit}')
-[ "$rev" = "1" ]            || fail "SEQ orient: R2 expected reverse-mapped (rev=$rev)"
-[ "$cig" = "60M" ]         || fail "SEQ orient: CIGAR $cig, want 60M"
-[ "${#seq}" = "60" ]       || fail "SEQ orient: SEQ length ${#seq}, want 60 (CIGAR consistency)"
-[ "$seq" = "$SEQ_R2_RC" ]  || fail "SEQ orient: reverse-mate SEQ is not revcomp(input read)"
+[ "$rev" = "1" ] || fail "SEQ orient: R2 expected reverse-mapped (rev=$rev)"
+[ "$cig" = "60M" ] || fail "SEQ orient: CIGAR $cig, want 60M"
+[ "${#seq}" = "60" ] || fail "SEQ orient: SEQ length ${#seq}, want 60 (CIGAR consistency)"
+[ "$seq" = "$SEQ_R2_RC" ] || fail "SEQ orient: reverse-mate SEQ is not revcomp(input read)"
 
 # --- 4. MQ:i / HN:i parity with the non-meth writer ------------------------
 # The fixture is deliberately ASYMMETRIC on both tags: chrB repeats chrA:241-420,
@@ -126,8 +139,8 @@ read -r rev seq cig < <(samtools view seq.bam | mawk '(int($2/128)%2)==1{print (
 # flattens the asymmetry is reported as a stale fixture rather than passing
 # vacuously.
 printf '>chrA\n%s\n>chrB\n%s\n' "$REF" "${REF:240:180}" > dup.fa
-"$BWA_MEM3" index --meth dup.fa >/dev/null 2>&1 || fail "dup index --meth nonzero exit"
-"$BWA_MEM3" mem --meth --meth-scoring genomic -t 1 dup.fa f1.fq f2.fq > dup.bam 2>/dev/null \
+"$BWA_MEM3" index --meth dup.fa > /dev/null 2>&1 || fail "dup index --meth nonzero exit"
+"$BWA_MEM3" mem --meth --meth-scoring genomic -t 1 dup.fa f1.fq f2.fq > dup.bam 2> /dev/null \
     || fail "dup mem --meth nonzero exit"
 samtools quickcheck dup.bam || fail "dup invalid BAM"
 
@@ -146,7 +159,7 @@ mq_hn() { # $1 bam  $2 mate flag bit -> "MAPQ MQ HN"
 read -r mapq1 mq1 hn1 < <(mq_hn dup.bam 64)
 read -r mapq2 mq2 hn2 < <(mq_hn dup.bam 128)
 [ "$mapq1" = "60" ] || fail "MQ/HN: stale fixture — R1 MAPQ $mapq1, want 60 (unique locus)"
-[ "$mapq2" = "0" ]  || fail "MQ/HN: stale fixture — R2 MAPQ $mapq2, want 0 (locus duplicated on chrB)"
+[ "$mapq2" = "0" ] || fail "MQ/HN: stale fixture — R2 MAPQ $mapq2, want 0 (locus duplicated on chrB)"
 # Non-empty first, so an absent tag is reported as absent rather than as a value
 # mismatch against the empty string.
 [ -n "$mq1" ] || fail "MQ/HN: R1 has no MQ:i (the non-meth BAM writer emits it)"
@@ -169,7 +182,7 @@ read -r mapq2 mq2 hn2 < <(mq_hn dup.bam 128)
 # changes that move the split point, while still catching a truncated SA:Z.
 CHIM="${REF:100:75}${REF:1000:75}"
 printf '@chim\n%s\n+\n%s\n' "$CHIM" "$(printf 'I%.0s' $(seq 1 150))" > chim.fq
-"$BWA_MEM3" mem --meth --meth-scoring genomic -t 1 ref.fa chim.fq > chim.bam 2>/dev/null \
+"$BWA_MEM3" mem --meth --meth-scoring genomic -t 1 ref.fa chim.fq > chim.bam 2> /dev/null \
     || fail "chim mem --meth nonzero exit"
 samtools quickcheck chim.bam || fail "chim invalid BAM"
 n_chim=$(samtools view -c chim.bam)
@@ -191,7 +204,7 @@ read -r rname2 pos2 sa2 < <(sa_of 2)
 for sa in "$sa1" "$sa2"; do
     case "$sa" in
         *\;) ;;
-        *)   fail "SA: '$sa' does not end in ';' (truncated?)" ;;
+        *) fail "SA: '$sa' does not end in ';' (truncated?)" ;;
     esac
     nf=$(printf '%s' "${sa%;}" | mawk -F, '{print NF}')
     [ "$nf" = "6" ] || fail "SA: '$sa' has $nf comma-separated fields, want 6 (truncated?)"

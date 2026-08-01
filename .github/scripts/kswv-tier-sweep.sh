@@ -60,7 +60,10 @@ mkdir -p "$OUT_DIR"
 case "$ARCH_LABEL" in
     arm) CANDIDATES="neon" ;;
     x86) CANDIDATES="avx512bw avx2 sse41" ;;
-    *)   echo "::error::unknown ARCH_LABEL '$ARCH_LABEL' (expected x86 or arm)"; exit 1 ;;
+    *)
+        echo "::error::unknown ARCH_LABEL '$ARCH_LABEL' (expected x86 or arm)"
+        exit 1
+        ;;
 esac
 
 # Ask the dispatcher what a given force actually selects. Prints the effective
@@ -74,12 +77,17 @@ esac
 # could be exercised", which reads as "old runner" and buries the real fault.
 # Returning a distinct status lets the caller tell "can't" from "broken".
 effective_tier() {
-    local want="$1" line
-    line="$(BWAMEM3_FORCE_TIER="$want" "$BWA_MEM3" version 2>/dev/null \
-            | grep '^SIMD runtime:' || true)"
+    local want="$1" line version_output
+    # Take the binary's own exit status before looking at what it printed.
+    # Piping straight into grep discards that status, so a `version` that
+    # printed the line and then died would be read as a real tier answer
+    # instead of the broken oracle it is.
+    version_output="$(BWAMEM3_FORCE_TIER="$want" "$BWA_MEM3" version 2> /dev/null)" \
+        || return 2
+    line="$(printf '%s\n' "$version_output" | grep '^SIMD runtime:' || true)"
     [ -n "$line" ] || return 2
     case "$line" in
-        *", ignored"*) return 0 ;;   # refused: host cannot reach this tier
+        *", ignored"*) return 0 ;; # refused: host cannot reach this tier
     esac
     printf '%s\n' "$line" | sed -n 's/^SIMD runtime: \([a-z0-9]*\).*/\1/p'
 }
@@ -130,7 +138,7 @@ for tier in $CANDIDATES; do
     BWAMEM3_FORCE_TIER="$tier" "$TEST_BIN" --test-suite="unit/kswv" \
         --reporters=junit --out="$report"
     status=$?
-    read -r n_tests n_fail n_err <<EOF
+    read -r n_tests n_fail n_err << EOF
 $(counts_from_junit "$report")
 EOF
     if [ "$status" -ne 0 ]; then
@@ -174,7 +182,10 @@ esac
 for req in $REQUIRE_TIERS; do
     case " $ran " in
         *" $req "*) ;;
-        *) echo "::error::required tier '$req' was not exercised"; overall=1 ;;
+        *)
+            echo "::error::required tier '$req' was not exercised"
+            overall=1
+            ;;
     esac
 done
 

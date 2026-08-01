@@ -31,10 +31,18 @@
 #   BWA_MEM3 — path to the bwa-mem3 binary under test
 set -euo pipefail
 : "${BWA_MEM3:?BWA_MEM3 must be set}"
-command -v samtools >/dev/null 2>&1 || { echo "SKIP: samtools not on PATH (--meth emits BAM)"; exit 0; }
+command -v samtools > /dev/null 2>&1 || {
+    echo "SKIP: samtools not on PATH (--meth emits BAM)"
+    exit 0
+}
 
-WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT; cd "$WORK"
-fail() { echo "FAIL: $*" >&2; exit 1; }
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+cd "$WORK"
+fail() {
+    echo "FAIL: $*" >&2
+    exit 1
+}
 
 # 601 bp reference window (chr22:20563900-20564500, GRCh38).
 REF=TCAGAAAATCTTGTAATTGACTGTTCATATAAGCAGTTTTCATAATAGCCACAAAGTAGAAGCAGCGCAAATGTTCATCACAGGAAATCGGTGTAGTAGAATATTATTTGGCGATAAAAATAACACAGAAAAACTGATAACATGCCACGACATGGGCGAACTCGTAAATATTATGCTAAAGAAGCTAGTCACAAAAGAGCACATGTTCGATGCCATTCGTACAAAGAGTCCGGAAGTGGCCAATCCATAGAGACAGAGAGGAGATTACTGATTGCCAGAGTCTAGGCTTCTTATTTATCCAAAAGACTTAGTTGTCCCTTTTCTTTTGTCTTTGGTTATTATAGAGTAACTCATGATAGGAAATCCCAAAATCAACACAAATGCTACTTCGTATTCTATCTTTCTGTCTGTGGTAAATGGAACGTTCAGATTCCAGCGGCAGCCGTGGCAGTGGGGCTTTTGCTGGCTGTTTTGTCCCTTGCTGTGCAGCCCTGCAGCGTTTCTGGGAATCTGCCCTGTGGACTGACTGGCGACTCTGGTCTTTTCTCAGCCCAGCTGCAGCTCCAGCAGGTGGCGCTGCAGCAGCAGCAGCAACAGCAGC
@@ -49,12 +57,13 @@ Q=$(printf 'I%.0s' $(seq 1 75))
 printf '@p\n%s\n+\n%s\n' "$R1" "$Q" > r1.fq
 printf '@p\n%s\n+\n%s\n' "$R2" "$Q" > r2.fq
 
-"$BWA_MEM3" index --meth ref.fa >/dev/null 2>&1 || fail "index --meth nonzero exit"
-"$BWA_MEM3" mem --meth --meth-scoring genomic -t 1 ref.fa r1.fq r2.fq > pe.bam 2>/dev/null || fail "mem --meth nonzero exit"
+"$BWA_MEM3" index --meth ref.fa > /dev/null 2>&1 || fail "index --meth nonzero exit"
+"$BWA_MEM3" mem --meth --meth-scoring genomic -t 1 ref.fa r1.fq r2.fq > pe.bam 2> /dev/null || fail "mem --meth nonzero exit"
 samtools quickcheck pe.bam || fail "produced an invalid BAM"
 
 # Decode one mate (mate-flag bit 64=READ1, 128=READ2) into: rname pos mapq rev cigar as nm xr.
-get() { samtools view "$1" | mawk -v bit="$2" '
+get() {
+    samtools view "$1" | mawk -v bit="$2" '
     (int($2/bit) % 2) == 1 {
         unm = (int($2/4) % 2); rev = (int($2/16) % 2); as=""; nm=""; xr="";
         for (i=12;i<=NF;i++){ if($i~/^AS:i:/)as=substr($i,6); if($i~/^NM:i:/)nm=substr($i,6); if($i~/^XR:Z:/)xr=substr($i,6) }
@@ -64,25 +73,27 @@ get() { samtools view "$1" | mawk -v bit="$2" '
 # --- R1: reverse-strand OT read maps full-length with conversions scored free ---
 # This is the assertion the bug fails: under the unflipped matrix R1 is unmapped.
 read -r rn pos mapq rev cig as nm xr unm < <(get pe.bam 64)
-[ "$unm" = "0" ]  || fail "R1 reverse-OT is UNMAPPED (flag 0x4) — the strand-matrix bug: conversions scored as mismatches collapsed the extension"
+[ "$unm" = "0" ] || fail "R1 reverse-OT is UNMAPPED (flag 0x4) — the strand-matrix bug: conversions scored as mismatches collapsed the extension"
 [ "$rn" = "chrT" ] || fail "R1: RNAME $rn, want chrT"
 [ "$pos" = "435" ] || fail "R1: POS $pos, want 435 (reverse-strand placement)"
-[ "$rev" = "1" ]   || fail "R1: strand rev=$rev, want 1 (reverse)"
+[ "$rev" = "1" ] || fail "R1: strand rev=$rev, want 1 (reverse)"
 [ "$cig" = "75M" ] || fail "R1: CIGAR $cig, want 75M (no soft-clip — conversions freed by strand-adjusted matrix)"
 [ "$mapq" = "60" ] || fail "R1: MAPQ $mapq, want 60"
-[ "$xr" = "CT" ]   || fail "R1: XR $xr, want CT (OT hypothesis)"
-[ "$nm" = "1" ]    || fail "R1: NM $nm, want 1 (the real mismatch only; the 24 conversions are matrix-freed, so they are matches for NM/MD as well as for the DP)"
+[ "$xr" = "CT" ] || fail "R1: XR $xr, want CT (OT hypothesis)"
+[ "$nm" = "1" ] || fail "R1: NM $nm, want 1 (the real mismatch only; the 24 conversions are matrix-freed, so they are matches for NM/MD as well as for the DP)"
 # Conversions are scored free; the 1 real mismatch costs the bwa default penalty b=4 (--meth keeps b=4):
 # 74 match/freed columns (+74) - 1 real mismatch (-4) = 70.
-[ "$as" = "70" ]   || fail "R1: AS $as, want 70 (conversions free; 1 real mismatch at b=4)"
+[ "$as" = "70" ] || fail "R1: AS $as, want 70 (conversions free; 1 real mismatch at b=4)"
 
 # --- R2: forward-strand OB mate — strand-unaffected control (passes on buggy + fixed) ---
-read -r rn2 pos2 mapq2 rev2 cig2 as2 nm2 xr2 unm2 < <(get pe.bam 128)
-[ "$unm2" = "0" ]  || fail "R2 forward-OB should map (control)"
+# `_` for mapq/as/nm: this control asserts placement and strand only, so those
+# three columns are consumed positionally but deliberately not checked.
+read -r rn2 pos2 _ rev2 cig2 _ _ xr2 unm2 < <(get pe.bam 128)
+[ "$unm2" = "0" ] || fail "R2 forward-OB should map (control)"
 [ "$rn2" = "chrT" ] || fail "R2: RNAME $rn2, want chrT"
-[ "$pos2" = "96" ]  || fail "R2: POS $pos2, want 96"
-[ "$rev2" = "0" ]   || fail "R2: strand rev=$rev2, want 0 (forward)"
+[ "$pos2" = "96" ] || fail "R2: POS $pos2, want 96"
+[ "$rev2" = "0" ] || fail "R2: strand rev=$rev2, want 0 (forward)"
 [ "$cig2" = "75M" ] || fail "R2: CIGAR $cig2, want 75M"
-[ "$xr2" = "GA" ]   || fail "R2: XR $xr2, want GA (OB hypothesis)"
+[ "$xr2" = "GA" ] || fail "R2: XR $xr2, want GA (OB hypothesis)"
 
 echo "PASS: meth_reverse_strand_conversion (reverse-strand asymmetric matrix flip; R1 reverse-OT maps full-length, conversions free)"

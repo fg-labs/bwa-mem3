@@ -34,31 +34,44 @@ FIXTURES="${FIXTURES:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../fixtures" && pwd)}
 
 src_ref="$FIXTURES/phix.fa"
 reads="$FIXTURES/reads.fa"
-[[ -x "$BWA_MEM3" ]] || { echo "FAIL: binary not executable: $BWA_MEM3" >&2; exit 1; }
-[[ -s "$src_ref" ]]  || { echo "FAIL: phix.fa missing: $src_ref" >&2; exit 1; }
-[[ -s "$reads" ]]    || { echo "FAIL: reads.fa missing: $reads" >&2; exit 1; }
+[[ -x "$BWA_MEM3" ]] || {
+    echo "FAIL: binary not executable: $BWA_MEM3" >&2
+    exit 1
+}
+[[ -s "$src_ref" ]] || {
+    echo "FAIL: phix.fa missing: $src_ref" >&2
+    exit 1
+}
+[[ -s "$reads" ]] || {
+    echo "FAIL: reads.fa missing: $reads" >&2
+    exit 1
+}
 
 # Index a private copy so the test never writes into the fixtures tree.
-mdir="$(mktemp -d)"; err="$mdir/err.log"
+mdir="$(mktemp -d)"
+err="$mdir/err.log"
 trap 'rm -rf "$mdir"' EXIT
 ref="$mdir/phix.fa"
 cp "$src_ref" "$ref"
-"$BWA_MEM3" index "$ref" >/dev/null 2>&1 || { echo "FAIL: index phix.fa" >&2; exit 1; }
+"$BWA_MEM3" index "$ref" > /dev/null 2>&1 || {
+    echo "FAIL: index phix.fa" >&2
+    exit 1
+}
 
 fails=0
 
-run_mem() {   # rest = mem args; env comes from the caller. Returns mem's exit code.
+run_mem() { # rest = mem args; env comes from the caller. Returns mem's exit code.
     # `|| rc=$?` rather than toggling errexit, matching every other exit-code-
     # capturing helper below. Disabling `set -e` around the call would also
     # suppress failures from any command later added inside the window.
     local rc=0
-    "$BWA_MEM3" mem "$@" "$ref" "$reads" >/dev/null 2>"$err" || rc=$?
+    "$BWA_MEM3" mem "$@" "$ref" "$reads" > /dev/null 2> "$err" || rc=$?
     return "$rc"
 }
 
 # --- the flags reject a malformed value outright ----------------------------
 # `=` form so a leading '-' is not taken for another option.
-reject_flag() {   # $1 = option name, $2 = value that must be refused
+reject_flag() { # $1 = option name, $2 = value that must be refused
     local opt="$1" val="$2" rc=0
     run_mem "--$opt=$val" || rc=$?
     if [[ "$rc" -eq 0 ]]; then
@@ -72,14 +85,14 @@ reject_flag() {   # $1 = option name, $2 = value that must be refused
     fi
 }
 
-reject_flag cohort-ramp-first 16M     # the millionfold case: bases take no suffix
-reject_flag cohort-ramp-first abc     # not a number at all
-reject_flag cohort-ramp-first -5      # negative
-reject_flag cohort-ramp-ratio 1.5x    # trailing junk after a valid prefix
-reject_flag cohort-ramp-ratio abc     # not a number at all
+reject_flag cohort-ramp-first 16M  # the millionfold case: bases take no suffix
+reject_flag cohort-ramp-first abc  # not a number at all
+reject_flag cohort-ramp-first -5   # negative
+reject_flag cohort-ramp-ratio 1.5x # trailing junk after a valid prefix
+reject_flag cohort-ramp-ratio abc  # not a number at all
 
 # --- the flags accept a well-formed value -----------------------------------
-accept_flag() {   # $1 = option name, $2 = value that must be accepted
+accept_flag() { # $1 = option name, $2 = value that must be accepted
     local opt="$1" val="$2" rc=0
     run_mem "--$opt=$val" || rc=$?
     if [[ "$rc" -ne 0 ]]; then
@@ -92,12 +105,13 @@ accept_flag() {   # $1 = option name, $2 = value that must be accepted
 }
 
 accept_flag cohort-ramp-first 4000000
-accept_flag cohort-ramp-first 0        # 0 selects the fractional ramp shape
+accept_flag cohort-ramp-first 0 # 0 selects the fractional ramp shape
 accept_flag cohort-ramp-ratio 2.5
 
 # --- the env spellings warn and fall back, rather than parsing a prefix -----
-env_warns() {   # $1 = variable, $2 = malformed value
+env_warns() { # $1 = variable, $2 = malformed value
     local var="$1" val="$2" rc=0
+    # shellcheck disable=SC2016  # $0..$3 are the inner bash -c positionals
     env "$var=$val" bash -c '"$0" mem "$1" "$2" >/dev/null 2>"$3"' \
         "$BWA_MEM3" "$ref" "$reads" "$err" || rc=$?
     if [[ "$rc" -ne 0 ]]; then
@@ -112,8 +126,9 @@ env_warns() {   # $1 = variable, $2 = malformed value
     fi
 }
 
-env_quiet() {   # $1 = variable, $2 = well-formed value
+env_quiet() { # $1 = variable, $2 = well-formed value
     local var="$1" val="$2" rc=0
+    # shellcheck disable=SC2016  # $0..$3 are the inner bash -c positionals
     env "$var=$val" bash -c '"$0" mem "$1" "$2" >/dev/null 2>"$3"' \
         "$BWA_MEM3" "$ref" "$reads" "$err" || rc=$?
     if [[ "$rc" -ne 0 ]]; then
@@ -172,7 +187,7 @@ strip_pg() { grep -v '^@PG' "$1"; }
 baseline="$mdir/baseline.sam"
 extreme="$mdir/extreme.sam"
 rc=0
-"$BWA_MEM3" mem --cohort-slices=0 "$ref" "$reads" >"$baseline" 2>"$err" || rc=$?
+"$BWA_MEM3" mem --cohort-slices=0 "$ref" "$reads" > "$baseline" 2> "$err" || rc=$?
 if [[ "$rc" -ne 0 ]]; then
     echo "FAIL: unsliced baseline run exited $rc"
     cat "$err" >&2
@@ -184,7 +199,7 @@ else
         rc=0
         env BWA_MEM3_COHORT_SLICE_ALL=1 \
             "$BWA_MEM3" mem --cohort-ramp-ratio="$ratio" "$ref" "$reads" \
-            >"$extreme" 2>"$err" || rc=$?
+            > "$extreme" 2> "$err" || rc=$?
         if [[ "$rc" -ne 0 ]]; then
             echo "FAIL: '--cohort-ramp-ratio=$ratio' exited $rc; an extreme ratio"
             echo "      must saturate the ramp, not abort the run"
@@ -195,7 +210,7 @@ else
             echo "      ramp multiplication never ran and this case proved nothing."
             echo "      See the BWA_MEM3_COHORT_SLICE_ALL note above."
             fails=$((fails + 1))
-        elif ! diff -q <(strip_pg "$baseline") <(strip_pg "$extreme") >/dev/null; then
+        elif ! diff -q <(strip_pg "$baseline") <(strip_pg "$extreme") > /dev/null; then
             echo "FAIL: '--cohort-ramp-ratio=$ratio' changed the output; the ramp"
             echo "      schedules reads and must not move the cohort boundary"
             fails=$((fails + 1))
@@ -215,7 +230,7 @@ else
     rc=0
     env BWA_MEM3_COHORT_SLICE_ALL=1 \
         "$BWA_MEM3" mem --cohort-ramp-ratio=nan "$ref" "$reads" \
-        >"$extreme" 2>"$err" || rc=$?
+        > "$extreme" 2> "$err" || rc=$?
     if [[ "$rc" -ne 0 ]]; then
         echo "FAIL: '--cohort-ramp-ratio=nan' exited $rc; it must fall back, not abort"
         cat "$err" >&2
@@ -224,7 +239,7 @@ else
         echo "FAIL: '--cohort-ramp-ratio=nan' was accepted as a ratio; NaN must take"
         echo "      the same documented fallback as a ratio at or below 1"
         fails=$((fails + 1))
-    elif ! diff -q <(strip_pg "$baseline") <(strip_pg "$extreme") >/dev/null; then
+    elif ! diff -q <(strip_pg "$baseline") <(strip_pg "$extreme") > /dev/null; then
         echo "FAIL: '--cohort-ramp-ratio=nan' changed the output"
         fails=$((fails + 1))
     else

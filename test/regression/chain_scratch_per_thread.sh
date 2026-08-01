@@ -58,7 +58,7 @@ trap 'rm -rf "$WORK"' EXIT
 # A tiny read set: the assertion is about ALLOCATION, not alignment, so the
 # reads only need to be real enough to get through worker_alloc. Generated
 # here rather than committed, per the project's no-test-data-files rule.
-python3 - "$WORK" <<'PY'
+python3 - "$WORK" << 'PY'
 import gzip, random, sys
 out = sys.argv[1]
 random.seed(20260725)          # fixed seed: fixture must be reproducible
@@ -108,8 +108,8 @@ scratch_mb_for() {
 }
 
 # --- 1. Invariant across -K -------------------------------------------------
-SMALL=$(scratch_mb_for 4 4000000)      #   4 Mbase
-LARGE=$(scratch_mb_for 4 64000000)     #  64 Mbase, 16x
+SMALL=$(scratch_mb_for 4 4000000)  #   4 Mbase
+LARGE=$(scratch_mb_for 4 64000000) #  64 Mbase, 16x
 
 echo "per-thread chaining scratch:  -K 4M => ${SMALL} MB    -K 64M => ${LARGE} MB"
 
@@ -146,7 +146,7 @@ awk -v a="$SMALL" -v b="$T8" 'BEGIN {
 # ever softened to a warning: a reallocation at THAT site is invisible to the
 # figures above, because worker_alloc reports them before the first chunk is
 # read.
-if grep -l "per-thread seed scratch was resized" "$WORK"/*.err >/dev/null 2>&1; then
+if grep -l "per-thread seed scratch was resized" "$WORK"/*.err > /dev/null 2>&1; then
     echo "FAIL: the per-chunk scratch resize guard fired:" >&2
     grep -h "per-thread seed scratch was resized" "$WORK"/*.err >&2
     exit 1

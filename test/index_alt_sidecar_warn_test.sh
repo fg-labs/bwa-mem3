@@ -32,10 +32,14 @@ if [[ $# -ne 1 ]]; then
 fi
 
 bin="$1"
-[[ -x "$bin" ]] || { echo "FAIL: bwa-mem3 binary not executable at $bin" >&2; exit 1; }
+[[ -x "$bin" ]] || {
+    echo "FAIL: bwa-mem3 binary not executable at $bin" >&2
+    exit 1
+}
 
-fail () {  # $1 = stderr file to dump, $2... = message
-    local err="$1"; shift
+fail() { # $1 = stderr file to dump, $2... = message
+    local err="$1"
+    shift
     echo "FAIL [index alt sidecar warn]: $*" >&2
     echo "--- index stderr:" >&2
     cat "$err" >&2
@@ -53,16 +57,16 @@ WARN_RE="sidecar supplies @SQ without an AH tag"
 # One line per sequence: `fold` drops the final newline when the length is not a
 # multiple of the width, gluing the next '>' onto the sequence -- silently, and
 # the index then builds with a single contig.
-emit_contig () {  # $1 = name, $2 = length
+emit_contig() { # $1 = name, $2 = length
     printf '>%s\n' "$1"
     head -c "$2" /dev/zero | tr '\0' 'A'
     printf '\n'
 }
 
-make_ref () {  # $1 = destination fasta
+make_ref() { # $1 = destination fasta
     {
-        emit_contig chr1      2000
-        emit_contig chr2      1500
+        emit_contig chr1 2000
+        emit_contig chr2 1500
         emit_contig "$ALT_SN" 1000
     } > "$1"
 }
@@ -70,7 +74,7 @@ make_ref () {  # $1 = destination fasta
 # Picard/GATK-style sequence dictionary (SN/LN/M5/AS/UR/SP) -- what
 # CreateSequenceDictionary emits and what the Broad bundle ships as
 # <basename>.dict. $2 appends tags to the ALT record: '' for Picard (no AH).
-write_dict () {  # $1 = destination sidecar, $2 = extra tags on the ALT record
+write_dict() { # $1 = destination sidecar, $2 = extra tags on the ALT record
     {
         printf '@HD\tVN:1.5\tSO:unsorted\n'
         printf '@SQ\tSN:chr1\tLN:2000\tM5:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tAS:test\tUR:file:/refs/ref.fa\tSP:synthetic\n'
@@ -89,28 +93,32 @@ SIDECAR_KINDS=(dict hdr)
 # Assigns the path to the global SIDECAR rather than printing it: a `$(...)`
 # substitution runs in a subshell, where the unknown-kind `exit` below would
 # kill only that subshell and leave the script running with an empty path.
-set_sidecar () {  # $1 = case dir, $2 = kind (dict|hdr)
+set_sidecar() { # $1 = case dir, $2 = kind (dict|hdr)
     case "$2" in
-        dict) SIDECAR="$1/ref.dict"   ;;   # <baseprefix>.dict, the fallback
-        hdr)  SIDECAR="$1/ref.fa.hdr" ;;   # <prefix>.hdr, tried first
-        *)    echo "internal error: unknown sidecar kind '$2'" >&2; exit 2 ;;
+        dict) SIDECAR="$1/ref.dict" ;;  # <baseprefix>.dict, the fallback
+        hdr) SIDECAR="$1/ref.fa.hdr" ;; # <prefix>.hdr, tried first
+        *)
+            echo "internal error: unknown sidecar kind '$2'" >&2
+            exit 2
+            ;;
     esac
 }
 
-write_alt () {  # $1 = destination .alt
+write_alt() { # $1 = destination .alt
     printf '%s\t0\tchr1\t1\t60\t1000M\t*\t0\t0\t*\t*\n' "$ALT_SN" > "$1"
 }
 
 # --------------------------------------------------------------------------
 # Case A: .alt present, sidecar present without AH -> MUST warn
 # --------------------------------------------------------------------------
-case_A () {  # $1 = sidecar kind
+case_A() { # $1 = sidecar kind
     local kind="$1"
-    local a="$tmp/a-$kind"; mkdir -p "$a"
-    make_ref   "$a/ref.fa"
-    write_alt  "$a/ref.fa.alt"                 # .alt is <prefix>.alt
+    local a="$tmp/a-$kind"
+    mkdir -p "$a"
+    make_ref "$a/ref.fa"
+    write_alt "$a/ref.fa.alt" # .alt is <prefix>.alt
     set_sidecar "$a" "$kind"
-    write_dict "$SIDECAR"                      # no AH on the ALT record
+    write_dict "$SIDECAR" # no AH on the ALT record
     "$bin" index "$a/ref.fa" > /dev/null 2> "$a/err.txt" \
         || fail "$a/err.txt" "case A[$kind]: index exited non-zero"
 
@@ -131,8 +139,9 @@ for kind in "${SIDECAR_KINDS[@]}"; do case_A "$kind"; done
 # Not parameterized over SIDECAR_KINDS: the case is defined by the absence of
 # every sidecar name, so there is only one variant of it to run.
 # --------------------------------------------------------------------------
-b="$tmp/b"; mkdir -p "$b"
-make_ref  "$b/ref.fa"
+b="$tmp/b"
+mkdir -p "$b"
+make_ref "$b/ref.fa"
 write_alt "$b/ref.fa.alt"
 "$bin" index "$b/ref.fa" > /dev/null 2> "$b/err.txt" \
     || fail "$b/err.txt" "case B: index exited non-zero"
@@ -145,10 +154,11 @@ write_alt "$b/ref.fa.alt"
 # a missing AH is correct rather than a loss. This is the common case for most
 # references, where a spurious warning would be pure noise.
 # --------------------------------------------------------------------------
-case_C () {  # $1 = sidecar kind
+case_C() { # $1 = sidecar kind
     local kind="$1"
-    local c="$tmp/c-$kind"; mkdir -p "$c"
-    make_ref   "$c/ref.fa"
+    local c="$tmp/c-$kind"
+    mkdir -p "$c"
+    make_ref "$c/ref.fa"
     set_sidecar "$c" "$kind"
     write_dict "$SIDECAR"
     "$bin" index "$c/ref.fa" > /dev/null 2> "$c/err.txt" \
@@ -167,18 +177,19 @@ for kind in "${SIDECAR_KINDS[@]}"; do case_C "$kind"; done
 # also the only negative case that exercises the AH-detection itself rather
 # than an early return: cases B and C bail before any @SQ is scanned.
 # --------------------------------------------------------------------------
-case_D () {  # $1 = sidecar kind
+case_D() { # $1 = sidecar kind
     local kind="$1"
-    local d="$tmp/d-$kind"; mkdir -p "$d"
+    local d="$tmp/d-$kind"
+    mkdir -p "$d"
     set_sidecar "$d" "$kind"
-    make_ref   "$d/ref.fa"
-    write_alt  "$d/ref.fa.alt"
+    make_ref "$d/ref.fa"
+    write_alt "$d/ref.fa.alt"
     # $'...' rather than '\tAH:*': write_dict passes the extra tags through a
     # printf %s, which does NOT expand escapes, so a plain '\tAH:*' would leave a
     # literal backslash-t in the record. The AH token would not be tab-delimited,
     # the sidecar would still be AH-less as far as the scanner is concerned, and the
     # case would "fail" on a fixture bug rather than on the code.
-    write_dict "$SIDECAR" $'\tAH:*'   # what `samtools dict --alt` produces
+    write_dict "$SIDECAR" $'\tAH:*' # what `samtools dict --alt` produces
     # Verify the fixture is what the case claims: AH:* must be a whole tab-delimited
     # field on the ALT record, which is the only form bwa_warn_sidecar_missing_AH
     # recognizes.
@@ -205,11 +216,12 @@ for kind in "${SIDECAR_KINDS[@]}"; do case_D "$kind"; done
 # disagreeing pair proves .hdr is consulted first. If the precedence ever
 # flipped to .dict, the AH-carrying .dict would silence the warning here.
 # --------------------------------------------------------------------------
-e="$tmp/e"; mkdir -p "$e"
-make_ref   "$e/ref.fa"
-write_alt  "$e/ref.fa.alt"
-write_dict "$e/ref.fa.hdr"            # no AH -- the winner, so this must warn
-write_dict "$e/ref.dict" $'\tAH:*'    # has AH -- must be ignored
+e="$tmp/e"
+mkdir -p "$e"
+make_ref "$e/ref.fa"
+write_alt "$e/ref.fa.alt"
+write_dict "$e/ref.fa.hdr"         # no AH -- the winner, so this must warn
+write_dict "$e/ref.dict" $'\tAH:*' # has AH -- must be ignored
 "$bin" index "$e/ref.fa" > /dev/null 2> "$e/err.txt" \
     || fail "$e/err.txt" "case E: index exited non-zero"
 
@@ -230,14 +242,19 @@ grep -q "$WARN_RE" "$e/err.txt" \
 # name here, while `fail`'s exit still terminates the script (it would only
 # leave a subshell).
 # --------------------------------------------------------------------------
-case_F () {
-    local ALT_SN="chrX_$(printf 'L%.0s' $(seq 1 300))_alt"   # ~306 bytes
+case_F() {
+    local ALT_SN
+    ALT_SN="chrX_$(printf 'L%.0s' $(seq 1 300))_alt" # ~306 bytes
     [[ ${#ALT_SN} -ge 256 ]] \
-        || { echo "FAIL [index alt sidecar warn]: case F fixture bug -- ALT_SN is only ${#ALT_SN} bytes, need >= 256" >&2; exit 1; }
-    local f="$tmp/f"; mkdir -p "$f"
-    make_ref   "$f/ref.fa"
-    write_alt  "$f/ref.fa.alt"
-    write_dict "$f/ref.dict"          # no AH on the long-named ALT record
+        || {
+            echo "FAIL [index alt sidecar warn]: case F fixture bug -- ALT_SN is only ${#ALT_SN} bytes, need >= 256" >&2
+            exit 1
+        }
+    local f="$tmp/f"
+    mkdir -p "$f"
+    make_ref "$f/ref.fa"
+    write_alt "$f/ref.fa.alt"
+    write_dict "$f/ref.dict" # no AH on the long-named ALT record
     "$bin" index "$f/ref.fa" > /dev/null 2> "$f/err.txt" \
         || fail "$f/err.txt" "case F: index exited non-zero"
 
