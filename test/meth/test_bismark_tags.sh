@@ -33,6 +33,19 @@ if ! command -v cargo > /dev/null 2>&1; then
     exit 0
 fi
 
+# Checked BEFORE the holodeck build below, which clones and compiles a Rust
+# project and costs minutes -- failing after that for a file we could have
+# checked first is a poor trade. ref.fa is gitignored and is copied in from the
+# bwa-meth checkout; see the "Copy bwa-meth fixtures into test/meth/" step in
+# ci.yml. Without this check a missing ref.fa surfaced as a bare `exit 2` with
+# no output, because the indexing step below sends both streams to /dev/null.
+if [[ ! -f "$HERE/ref.fa" || ! -s "$HERE/ref.fa" ]]; then
+    echo "ERROR: fixture $HERE/ref.fa is missing, empty, or not a regular file." >&2
+    echo "       It is gitignored. Copy it from a bwa-meth checkout:" >&2
+    echo "         cp <bwa-meth>/example/ref.fa $HERE/" >&2
+    exit 2
+fi
+
 if [[ ! -x "$HOLODECK_BIN" ]]; then
     echo "[layer 3] cloning + building holodeck @ $HOLODECK_SHA ..."
     rm -rf "$HOLODECK_DIR"
