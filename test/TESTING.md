@@ -6,7 +6,7 @@ bwa-mem3 tests are organized into three categories — **unit**, **integration**
 |----------------|------------------------------------|----------------------------------------------|--------------------------------------|
 | **unit**       | `test/bwa_mem3_tests_unit`         | None. All inputs synthetic.                  | Every matrix row                     |
 | **integration**| `test/bwa_mem3_tests_integration`  | Small committed FASTAs / FMI under `test/fixtures/` | SSE4.1, AVX2, ARM64 Linux, macOS ARM |
-| **regression** | `test/regression/*.sh`             | Downloaded references (phiX, chr22) + bwa + dwgsim | Canonical AVX2 row only      |
+| **regression** | `test/regression/*.sh`             | Committed phiX in `test/fixtures/`; chr22 downloaded by CI, reads simulated by holodeck; bwa for the parity diffs | Canonical AVX2 row, except `chr22_parity.sh` (every row) and the source-only lints (own jobs) |
 
 Design rationale: see the internal test framework design spec (not committed).
 
@@ -48,21 +48,29 @@ bash test/run_unit_tests.sh               # runs fmi_test, smem2_test, sa2ref_te
 
 ### Run regression checks
 
-Regression scripts expect upstream CI to have staged their inputs. To run one locally:
+Most regression scripts expect the caller to have staged their inputs, named by environment variables — see the comment block at the top of each script, and `test/regression/README.md` for the contract. The source-only lints take neither a binary nor fixtures, so they are the cheapest thing to run:
 
 ```bash
-# Example: phiX parity. Needs dwgsim to be installed.
-mkdir -p /tmp/ci-test && cd /tmp/ci-test
-curl -sL "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/819/615/GCF_000819615.1_ViralProj14015/GCF_000819615.1_ViralProj14015_genomic.fna.gz" \
-  | gunzip > phix174.fa
-dwgsim -z 42 -N 500 -1 150 -2 150 -r 0.001 -S 2 phix174.fa reads
-cd -
-BWA_MEM3="$(pwd)/bwa-mem3" CI_TEST_DIR=/tmp/ci-test bash test/regression/phix_parity.sh
+# No build, no fixtures: these read src/ and ci.yml directly.
+bash test/regression/ndebug_gate_lint.sh
+bash test/regression/debug_macro_flag_lint.sh
 ```
+
+For a script that does need the binary, the phiX-backed ones use a committed fixture, so they need no download and no third-party tool:
+
+```bash
+make                                             # builds ./bwa-mem3
+BWA_MEM3="$(pwd)/bwa-mem3" \
+COMPAT_PHIX_FA="$(pwd)/test/fixtures/phix.fa" \
+COMPAT_WORK_DIR=/tmp/compat-bytes \
+bash test/regression/compat_byte_identical.sh
+```
+
+The chr22 scripts are the expensive end: they want a chr22 reference indexed for both `bwa` and `bwa-mem3` plus a holodeck read simulation, which is why CI caches them. `ci.yml` is the reference for how each script's inputs get staged.
 
 ## Running tests in CI
 
-- **ci.yml** runs unit tests on every matrix row, integration tests on the four widened canonical rows, and regression tests on the canonical AVX2 row only.
+- **ci.yml** runs unit tests on every matrix row, integration tests on the four widened canonical rows, and regression tests on the canonical AVX2 row — except `chr22_parity.sh`, which runs on every row, and the source-only lints, which run in their own jobs alongside the build matrix (they need no binary, so they do not wait on it).
 - JUnit artifacts are uploaded per row (`unit-results-<name>.xml`, `integration-results-<name>.xml`). Download them from a failed run's Actions page to see fine-grained assertion output.
 - **proto-neon-kswv.yml** runs `./test/bwa_mem3_tests_unit --test-suite="unit/kswv"` on proto branches.
 
