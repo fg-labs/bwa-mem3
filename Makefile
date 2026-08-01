@@ -852,6 +852,20 @@ test: test-binaries $(STANDALONE_TESTS_IN_TEST_TARGET) bwa-mem3
 	./test/regression/ndebug_gate_lint.sh
 	./test/regression/debug_macro_flag_lint_selftest.sh
 	./test/regression/debug_macro_flag_lint.sh
+	./test/regression/shell_lint_selftest.sh
+	./test/regression/shell_lint.sh
+
+# Shell lint on its own, and its autofix. Separate from `test` because the
+# whole point is to run them without a build: both are source-only and finish
+# in seconds, so `make shell-fix` is the answer to a red shell-lint job.
+# Both no-op with a visible SKIP when shellcheck/shfmt are not installed.
+.PHONY: shell-lint shell-fix
+shell-lint:
+	./test/regression/shell_lint_selftest.sh
+	./test/regression/shell_lint.sh
+
+shell-fix:
+	./test/regression/shell_lint.sh --fix
 
 # Regression test that requires a binary built with TESTING_BUILD=1
 # (enables BWAMEM3_TESTING_HOST_TIER env-var injection). Not invoked by
