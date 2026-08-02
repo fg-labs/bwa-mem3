@@ -856,6 +856,8 @@ test: test-binaries $(STANDALONE_TESTS_IN_TEST_TARGET) bwa-mem3
 	./test/regression/shell_lint.sh
 	./test/regression/regression_coverage_lint_selftest.sh
 	./test/regression/regression_coverage_lint.sh
+	./test/regression/readme_contract_lint_selftest.sh
+	./test/regression/readme_contract_lint.sh
 
 # Shell lint on its own, and its autofix. Separate from `test` because the
 # whole point is to run them without a build: both are source-only and finish

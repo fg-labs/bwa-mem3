@@ -144,6 +144,26 @@ jobs:
       - name: Every regression script is run by CI
         run: bash test/regression/regression_coverage_lint.sh
 
+  # Same shape again. Separate so the failure reads as "the regression README
+  # went stale" rather than as a finding about src/.
+  readme-contract-lint:
+    name: Regression README contract (README <-> test/regression/)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      # Runs first, for the same reason as the three jobs above: deciding which
+      # scripts read no environment is a heuristic over shell text, and a
+      # heuristic that has stopped matching reports a clean README.
+      - name: README lint still detects drift
+        run: bash test/regression/readme_contract_lint_selftest.sh
+
+      - name: README still describes the regression scripts
+        run: bash test/regression/readme_contract_lint.sh
+
   build-and-test:
     strategy:
       fail-fast: false
