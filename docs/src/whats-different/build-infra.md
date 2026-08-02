@@ -23,7 +23,10 @@ PR #34 establishes the long-term test infrastructure for bwa-mem3:
   keep working.
 - Five inline CI bash regression blocks are extracted to
   `test/regression/*.sh` (phix_parity, chr22_parity, thread_determinism,
-  bam_roundtrip, meth_oracle).
+  bam_roundtrip, meth_oracle). `phix_parity.sh` no longer exists:
+  [PR #89](https://github.com/fg-labs/bwa-mem3/pull/89) migrated the parity
+  checks from dwgsim/phiX174 to holodeck/chr22 and folded it into
+  `chr22_parity.sh`.
 - A `coverage` CI job builds `libbwa.a` and both test binaries with
   `COVERAGE=1` (`-O0 --coverage`), runs both test binaries, collects Cobertura
   XML via `gcovr`, and uploads to Codecov via `codecov/codecov-action`.

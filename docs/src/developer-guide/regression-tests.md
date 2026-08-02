@@ -8,13 +8,13 @@ bwa-mem3 has three categories of tests — **unit**, **integration**, and **regr
 |---|---|---|---|
 | unit | `test/bwa_mem3_tests_unit` | None; all inputs synthetic | Every matrix row |
 | integration | `test/bwa_mem3_tests_integration` | Small committed FASTAs / FMI in `test/fixtures/` | SSE4.1, AVX2, ARM64 Linux, macOS ARM |
-| regression | `test/regression/*.sh` | Committed phiX in `test/fixtures/`; chr22 downloaded by CI, with reads simulated by holodeck; bwa for the parity diffs | Canonical AVX2 row, except `chr22_parity.sh` (every row) and the source-only lints (their own jobs) |
+| regression | `test/regression/*.sh` | Committed phiX in `test/fixtures/`; chr22 downloaded by CI, with reads simulated by holodeck; bwa for the parity diffs | Mostly the canonical AVX2 row; a few run on every row, and the source-only lints run in jobs of their own. `test/regression/README.md` has the per-script breakdown |
 
 **Unit tests** must use only synthetic inputs generated programmatically and complete in under 100 ms each. They exercise individual kernels in isolation: kswv scoring, banded Smith-Waterman, KSW, FM-index operations, SMEM extraction, BAM encoding, and pair handling.
 
 **Integration tests** may load small committed fixtures from `test/fixtures/` and have a per-test budget of 10 seconds. They exercise cross-component paths: index loading, SMEM-to-alignment pipelines, and output format validation.
 
-**Regression tests** are standalone bash scripts that shell out to the `bwa-mem3` binary, may diff against third-party tool output (bwa, bwa-meth, samtools), and require fixtures that are either committed to the fixtures directory or downloaded by CI at run time. The source-only lints are the exception: they read `src/` and `ci.yml` directly, need no binary and no fixtures, and run in their own CI jobs.
+**Regression tests** are standalone bash scripts that shell out to the `bwa-mem3` binary, may diff against third-party tool output (bwa, bwa-meth, samtools), and require fixtures that are either committed to the fixtures directory or downloaded by CI at run time. The source-only lints are the exception: each one reads files already in the repository — `src/`, `ci.yml`, the `Makefile`, the regression scripts, or the README beside them, depending on the lint — so they need no binary and no fixtures, and run in their own CI jobs.
 
 ## Running tests locally
 
@@ -46,7 +46,7 @@ make test
 
 ### Running a regression test locally
 
-Most regression scripts take their inputs from environment variables naming a binary and its fixtures — see the comment block at the top of each script, and `test/regression/README.md` for the contract. The source-only lints take neither, so they are the cheapest thing to run:
+Most regression scripts take their inputs from environment variables naming a binary and its fixtures — see the comment block at the top of each script, and `test/regression/README.md` for the contract. The lints need no binary and no fixtures, so they are the cheapest thing to run. Most take no environment either, only an optional directory naming what to check: the delimited source-only-lint block in `test/regression/README.md` names exactly those, with the argument each one takes. `shell_lint.sh` is the near-miss worth knowing about — it takes the same optional directory, but also honours `SHELL_LINT_REQUIRED`, so it is deliberately *not* in that block. Two examples:
 
 ```bash
 bash test/regression/ndebug_gate_lint.sh        # no build, no fixtures
