@@ -78,9 +78,10 @@ conversion direction itself remains hidden; see
 They differ only in what the *conversion* cell scores: a full match under
 `genomic`, `0` under `neutral`.
 
-**Inline BAM post-processing.** Header rewriting, Bismark `XR`/`XG`/`XM` tags,
-opt-in chimera QC (`--chimera-qc`), and QC-fail propagation happen in the same
-pass. Output is uncompressed BAM (`wb0`) that `samtools sort` reads natively.
+**Inline post-processing.** `@SQ` built from the original reference, Bismark
+`XR`/`XG`/`XM` tags, opt-in chimera QC (`--chimera-qc`), and QC-fail propagation
+happen in the same pass. Output is SAM text by default and uncompressed BAM
+(`wb0`) under `--bam`; `samtools sort` reads either natively.
 
 **bwameth-aligned defaults (collapsed).** `--meth-scoring collapsed` applies
 `-B 2 -L 10 -U 100 -T 40 -M -C`, mirroring bwameth's `bwa mem -T 40 -B 2 -L 10
@@ -105,8 +106,8 @@ differ:
 
 | Field | bwameth.py | bwa-mem3 --meth |
 |-------|-----------|-----------------|
-| `@SQ` headers | One per real chromosome | One per real chromosome |
-| Read placement (collapsed) | reference | Closely tracks at the standard case; ~1% of records differ in `POS`/`CIGAR`/`MAPQ` (re-validate if pinned to a bwameth release) |
+| `@SQ` headers | One per original reference sequence | One per original reference sequence |
+| Read placement (collapsed) | reference | Closely tracks at the standard case; ~1% of records differ in `POS`/`CIGAR`/`MAPQ` on typical WGBS/EM-seq, `POS` alone in a few tenths of a percent (see the callout at the top of this page) — re-validate if pinned to a bwameth release |
 | Methylation aux tags | `YS:Z`, `YC:Z`, `YD:Z` | `XR:Z`, `XG:Z`, `XM:Z` (Bismark) |
 | `@PG` | `ID:bwameth` | `ID:bwa-mem3-meth` |
 | Chimera QC threshold | Longest M < 44% of read | Same (44%), opt-in via `--chimera-qc` |
@@ -144,5 +145,5 @@ bwameth-compatible placement (`collapsed`) or variant-aware scoring (`genomic`,
 [Overview](overview.md) ·
 [Conversion details](conversion.md) ·
 [SAM tags: XR, XG, XM](tags.md) ·
-[Chimera QC and header rewriting](post-processing.md) ·
+[Chimera QC and header construction](post-processing.md) ·
 [Related Projects: bwameth.py](../related-projects/bwameth.md)

@@ -110,7 +110,10 @@ when you want one BAM that serves both methylation *and* variant calling, or wan
 the aligner to distinguish real variants from conversions. Prefer `neutral` for
 TAPS (its default), where conversions are sparse and rewarding them as matches
 costs placement specificity — it keeps variants visible for variant calling on the
-same terms as `genomic` while placing sparse-conversion reads more accurately.
+same terms as `genomic` while placing sparse-conversion reads more accurately
+(+0.24–0.28 pp over `genomic` on the 4.07 M-read simulated-TAPS-against-hg38
+measurement described under [`--meth[={emseq|taps}]`](#--methemseqtaps); no
+equivalent measurement exists for real TAPS libraries yet).
 
 > **Note — `-B` follows the mode, but you can override it**
 >
@@ -138,10 +141,11 @@ arbitrary reading. Tag names are case-insensitive.
 
 ```bash
 # Drop the methylation call string; keep the strand labels.
-bwa-mem3 mem --meth --meth-tags '^XM' ref.fa r1.fq r2.fq > out.bam
+# (SAM text, since `--bam` is absent — add `--bam` for a BAM container.)
+bwa-mem3 mem --meth --meth-tags '^XM' ref.fa r1.fq r2.fq > out.sam
 
 # Identical, spelled as an inclusion list (no quoting needed).
-bwa-mem3 mem --meth --meth-tags XR,XG ref.fa r1.fq r2.fq > out.bam
+bwa-mem3 mem --meth --meth-tags XR,XG ref.fa r1.fq r2.fq > out.sam
 ```
 
 An exclusion may be written `^XM` **or** `-XM`. Prefer `-XM` in scripts: a bare
@@ -309,7 +313,7 @@ don't collide. There is no flag to override this — `-V` is a no-op for
 
 **See also:**
 [Overview](overview.md) ·
-[Chimera QC and header rewriting](post-processing.md) ·
+[Chimera QC and header construction](post-processing.md) ·
 [SAM tags: XR, XG, XM](tags.md) ·
 [Best Practices → Methylation defaults](../best-practices/methylation.md) ·
 [CLI Reference → mem](../cli/mem.md)

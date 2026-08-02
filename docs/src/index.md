@@ -18,8 +18,8 @@ support for things you used to need a wrapper script for.
   genomic`, or `neutral` — the TAPS default — which tolerates a conversion
   without rewarding it). No Python, no inline conversion script, no separate
   post-processing step. One `bwa-mem3 index --meth ref.fa`, one
-  `bwa-mem3 mem --meth ref.fa R1.fq R2.fq`, done — headers consolidated and
-  Bismark tags emitted.
+  `bwa-mem3 mem --meth ref.fa R1.fq R2.fq`, done — original-reference headers
+  and Bismark tags emitted.
 - **Stage the index once, align many.** A `bwa-mem3 shm` subcommand
   pins the FM-index in shared memory so back-to-back runs on the same host
   skip the ~11 GB index read every time.

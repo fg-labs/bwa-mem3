@@ -62,10 +62,10 @@ static int sq_line_has_kv(const char *line, size_t line_len,
 
 /* Append to `out` the reference-identity tags (M5/UR/AS/SP) found on the @SQ
  * line of `hdr_text` whose SN equals `sn`, each as "\t<TAG>:<value>". Used to
- * enrich the consolidated --meth @SQ with identity tags from the *original*
- * (pre-c2t) reference's .hdr/.dict sidecar, matched by SN. Enrichment is gated
- * on the sidecar line's LN also equalling `expected_len` (the chrom-map
- * length): a SN match with a differing LN means a stale or foreign sidecar
+ * enrich the --meth @SQ with identity tags from the *original* (pre-c2t)
+ * reference's .hdr/.dict sidecar, matched by SN. Enrichment is gated on the
+ * sidecar line's LN also equalling `expected_len` (the contig length from the
+ * original bns): a SN match with a differing LN means a stale or foreign sidecar
  * whose M5/UR would misidentify the sequence, so nothing is appended in that
  * case. Appends nothing if `hdr_text` is NULL/empty or has no matching @SQ.
  * SN is unique in a valid header, so the first match wins. */
@@ -116,8 +116,9 @@ static int meth_append_sq_extra_tags(const char *hdr_text, const char *sn,
 
 /* Append to `out` every record line of `hdr_text` that is NOT @HD or @SQ
  * (i.e. @CO/@PG/@RG and any others), each terminated by '\n'. @SQ is skipped
- * because the consolidated @SQ block is authoritative (its identity tags are
- * merged separately by meth_append_sq_extra_tags); @HD is skipped because the
+ * because the @SQ block built from the original reference is authoritative
+ * (its identity tags are merged separately by meth_append_sq_extra_tags); @HD
+ * is skipped because the
  * writer emits its own.
  *
  * Returns 0 on success, -1 if a kstring append failed -- the same contract as
@@ -144,6 +145,7 @@ meth_bam_writer_t *meth_bam_writer_open(const char *path_or_dash,
                                         const char *meth_pg_cl,
                                         const char *hdr_line,
                                         const char *orig_idx_hdr_lines,
+                                        int bam,
                                         int compression_level)
 {
     if (path_or_dash == NULL || bns == NULL) return NULL;
@@ -152,8 +154,13 @@ meth_bam_writer_t *meth_bam_writer_open(const char *path_or_dash,
 
     if (compression_level < 0) compression_level = 0;
     if (compression_level > 9) compression_level = 9;
+    /* The container is the ONLY difference between the two output formats: the
+     * records below are the same bam1_t either way, and htslib serializes them
+     * to BGZF ("wb<level>") or to text ("w"). Keeping one construction path is
+     * what makes `--meth` and `--meth --bam` byte-identical after decode. */
     char mode[8];
-    snprintf(mode, sizeof(mode), "wb%d", compression_level);
+    if (bam) snprintf(mode, sizeof(mode), "wb%d", compression_level);
+    else     snprintf(mode, sizeof(mode), "w");
     w->fp = hts_open(path_or_dash, mode);
     if (w->fp == NULL) { free(w); return NULL; }
 
@@ -180,7 +187,7 @@ meth_bam_writer_t *meth_bam_writer_open(const char *path_or_dash,
      *
      * AH:* on ALT contigs is appended from the ORIGINAL bns, matching both
      * upstreams' generated @SQ (bwa/bwa.c:432, bwa-mem2/src/bwa.cpp:538) and
-     * our SAM text path; this consolidated block was written without it and
+     * our SAM text path; this block was written without it and
      * dropped ALT status for every ALT-aware reference. It cannot collide with
      * the sidecar enrichment: meth_append_sq_extra_tags copies only
      * M5/UR/AS/SP, never AH. Appended BEFORE those tags so the line reads
@@ -209,7 +216,7 @@ meth_bam_writer_t *meth_bam_writer_open(const char *path_or_dash,
     /* Original reference's non-@HD/@SQ sidecar records (@CO/@PG/@RG),
      * forwarded after @SQ and before the user header — mirroring the index
      * tier of bam_writer_open's precedence (index > default, below user). Its
-     * @SQ is consumed into the enriched consolidated block above and its @HD
+     * @SQ is consumed into the enriched @SQ block above and its @HD
      * is the writer's own, so both are dropped here. `orig_idx_hdr_lines` is
      * loaded from the *original* (pre-c2t) reference prefix by main_mem; the
      * c2t index's own sidecar (which describes the doubled f/r converted
@@ -229,7 +236,7 @@ meth_bam_writer_t *meth_bam_writer_open(const char *path_or_dash,
      * forwarded sidecar records, before the @PG lines, matching the default
      * writer's precedence (user > index > default) so a -R read group becomes
      * an @RG header that the per-record RG:Z tags (stamped from bwa_rg_id
-     * below) actually reference. The consolidated @SQ above is authoritative
+     * below) actually reference. The @SQ block above is authoritative
      * for --meth, so a user -H that re-supplies @SQ for an already-emitted
      * contig will make htslib reject the add and the open fails loudly rather
      * than emitting duplicate references. */
@@ -382,11 +389,13 @@ int meth_mem_aln_to_bam(bam1_t *b,
         bam_n_cigar = (size_t)p.n_cigar;
     }
 
-    /* TLEN is emitted on the consolidated (post-remap) contigs, so it must be
-     * gated on tid/mtid equality — not p.rid/mp->rid. Mates that rescue onto
-     * opposite projected strands (f* vs r*) of the same real chromosome have
-     * different internal rids but the same output tid, and SAM expects a real
-     * TLEN when RNAME==RNEXT. */
+    /* TLEN is defined only when both mates are placed on the same contig, which
+     * is what SAM means by RNAME==RNEXT. Since D3 PR-5, tid/mtid ARE p.rid /
+     * mp->rid (original rids straight from the seed→original remap), so this is
+     * a plain same-chromosome test. Pre-D3 it was not: output ran on
+     * consolidated contigs, and mates rescued onto opposite projected strands
+     * (f* vs r*) of one real chromosome had different internal rids but the same
+     * output tid — hence the gate on tid/mtid rather than the raw rids. */
     hts_pos_t tlen = 0;
     if (mp && tid >= 0 && mtid >= 0 && tid == mtid
         && p.n_cigar > 0 && m.n_cigar > 0) {

@@ -11,7 +11,7 @@ The first line of a SAM file header. Specifies the SAM format version (`VN`) and
 A SAM header line recording a program that processed the file, including `ID`, `PN`, `VN`, and `CL` fields. bwa-mem3 inserts `ID:bwa-mem3` (or `ID:bwa-mem3-meth` in methylation mode). See [Output: SAM/BAM, headers, tags](../user-guide/output.md).
 
 **@SQ header**
-A SAM header line describing a reference sequence (chromosome). Contains the sequence name (`SN`) and length (`LN`). In methylation mode, bwa-mem3 post-processes `@SQ` lines to collapse `f`/`r`-prefixed contig names back to one entry per chromosome. See [Chimera QC and header rewriting](../methylation/post-processing.md).
+A SAM header line describing a reference sequence (chromosome). Contains the sequence name (`SN`) and length (`LN`). In methylation mode, `@SQ` is written directly from the original (un-converted) reference, so the `f`/`r`-prefixed contigs of the `.meth` seed index never appear in output. See [Chimera QC and header construction](../methylation/post-processing.md).
 
 **BAM**
 Binary Alignment Map — a compressed, binary encoding of SAM. Produced by bwa-mem3 when the `--bam` flag is given or when output is piped through samtools. See [Output: SAM/BAM, headers, tags](../user-guide/output.md).
@@ -23,7 +23,7 @@ A heuristic variant of the Smith-Waterman alignment algorithm that restricts the
 Cytosine-to-thymine in-silico conversion applied to reads (or reference) before methylation alignment. In `--meth` mode, bwa-mem3 converts R1 reads C→T and R2 reads G→A inline, without writing intermediate FASTQ files. See [Conversion details (C->T, G->A)](../methylation/conversion.md).
 
 **Chimera**
-A read alignment where the aligned portion is short relative to the read length, often indicating a mapping artefact or a true chimeric molecule. In methylation mode, bwa-mem3 applies a chimera QC heuristic: if the longest contiguous M/=/X CIGAR run is less than 44% of the read length, the alignment is flagged 0x200, the proper-pair bit is cleared, and MAPQ is capped at 1. See [Chimera QC and header rewriting](../methylation/post-processing.md).
+A read alignment where the aligned portion is short relative to the read length, often indicating a mapping artefact or a true chimeric molecule. In methylation mode, bwa-mem3 applies a chimera QC heuristic: if the longest contiguous M/=/X CIGAR run is less than 44% of the read length, the alignment is flagged 0x200, the proper-pair bit is cleared, and MAPQ is capped at 1. See [Chimera QC and header construction](../methylation/post-processing.md).
 
 **FASTQ**
 A text format for raw sequencing reads. Each record contains a sequence identifier, the nucleotide sequence, a separator, and per-base quality scores in ASCII-encoded Phred format. bwa-mem3 accepts gzip-compressed FASTQ as input. See [Quick start: align paired-end FASTQs](../getting-started/quick-align.md).

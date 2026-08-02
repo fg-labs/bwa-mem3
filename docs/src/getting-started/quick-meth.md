@@ -68,9 +68,10 @@ In one process, `--meth` replaces what bwameth.py does with external tools:
   against the *original* reference, restoring the original bases in `SEQ`.
 - **Applies bwameth-aligned defaults** — `-L 10 -U 100 -T 40 -M -C` plus
   mode-dependent `-B` (`2` for `collapsed`, `4` for `genomic`).
-- **Post-processes the BAM inline** — consolidates `f`/`r` `@SQ` headers back to
-  real chromosomes, emits Bismark `XR`/`XG`/`XM` tags, runs optional
-  `--chimera-qc`, and writes uncompressed BAM ready for `samtools sort`.
+- **Post-processes records inline** — writes `@SQ` from the original reference
+  (the `f`/`r` seed contigs never reach the output), emits Bismark `XR`/`XG`/`XM`
+  tags, and runs optional `--chimera-qc`. Output is SAM text by default and
+  uncompressed BAM under `--bam`, either one ready for `samtools sort`.
 
 See the [Methylation Reference — Overview](../methylation/overview.md) for the
 mechanism in detail, [Flags](../methylation/flags.md) for the scoring modes and

@@ -39,10 +39,15 @@ extern meth_bam_writer_t *g_meth_bam_writer;
  * outside --meth. */
 extern const uint8_t *g_meth_orig_pac;
 
-/* Open a BAM writer at path ("-" for stdout). `bns` is the ORIGINAL
- * (un-converted) reference whose contigs become the @SQ block directly
- * (D3 PR-5: no f/r consolidation). `compression_level` is the BGZF deflate
- * level: 0 = uncompressed, 1..9 = deflate. `hdr_line` is the assembled user
+/* Open a meth record writer at path ("-" for stdout). `bam` selects the
+ * container: non-zero = BGZF BAM (`--bam`), 0 = plain-text SAM (the default,
+ * matching non-meth output). Both write the SAME bam1_t records built by
+ * meth_mem_aln_to_bam — only htslib's serialization differs — so the meth
+ * overlay (XM:Z/XG:Z/XR:Z, chimera QC) is identical either way.
+ * `bns` is the ORIGINAL (un-converted) reference whose contigs become the @SQ
+ * block directly (D3 PR-5: no f/r consolidation). `compression_level` is the
+ * BGZF deflate level: 0 = uncompressed, 1..9 = deflate; ignored when `bam` is
+ * 0. `hdr_line` is the assembled user
  * header text (-R read group and/or -H lines, '\n'-joined, no trailing
  * newline), or NULL — emitted verbatim after the @SQ block so a -R read
  * group lands as an @RG header, matching the default (non-meth) writer.
@@ -58,13 +63,14 @@ meth_bam_writer_t *meth_bam_writer_open(const char *path_or_dash,
                                         const char *meth_pg_cl,
                                         const char *hdr_line,
                                         const char *orig_idx_hdr_lines,
+                                        int bam,
                                         int compression_level);
 
 /* Write one bam1_t. Returns 0 on success, -1 on error. */
 int meth_bam_writer_write(meth_bam_writer_t *w, struct bam1_t *b);
 
-/* Close the writer and flush the BGZF EOF marker. Frees internal hdr and
- * htsFile. Returns 0 on success, -1 on error. */
+/* Close the writer, flushing the BGZF EOF marker when the container is BAM.
+ * Frees internal hdr and htsFile. Returns 0 on success, -1 on error. */
 int meth_bam_writer_close(meth_bam_writer_t *w);
 
 /* --- mem_aln_t -> bam1_t --------------------------------------------- */

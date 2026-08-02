@@ -1,43 +1,51 @@
-# Chimera QC and Header Rewriting
+# Chimera QC and header construction
 
 After the alignment kernel produces `mem_aln_t` records, `bwa-mem3 --meth`
-applies a set of post-processing steps before writing BAM output. These steps
+applies a set of post-processing steps before writing its output. These steps
 are implemented in `src/meth_bam.cpp` and run in the same process, in the same
-pass over the aligned records.
+pass over the aligned records. They are independent of the output container —
+`--meth` writes SAM text by default and BAM under `--bam`, and the records are
+identical either way.
 
-## `@SQ` header consolidation
+## `@SQ` headers come from the original reference
 
-The `.meth` seed reference (`ref.fa.meth.fa`) contains two contigs for each
+The `.meth` **seed** reference (`ref.fa.meth.fa`) contains two contigs for each
 chromosome:
 
 - `fchr1`, `fchr2`, … — C→T projections of each chromosome.
 - `rchr1`, `rchr2`, … — G→A projections of each chromosome.
 
-If the raw alignment header were written directly, every downstream tool would
-see twice as many sequences as there are real chromosomes, with unfamiliar
-`f`/`r`-prefixed names. `meth_bam_writer_open` instead builds a consolidated
-header using the `meth_chrom_map_t`:
+Those `f`/`r` contigs exist only for seeding, and they never reach the output.
+Since D3 (#174), `--meth` emits native original-alphabet output: seeds are
+remapped to original coordinates plus an OT/OB hypothesis at the end of the
+seeding phase (`orig_tid = seed_rid / 2`, `hypothesis = seed_rid & 1`), so every
+mapped `mem_aln_t` that reaches the writer already carries an **original** rid.
+Unmapped records keep the `rid = -1` sentinel `mem_reg2aln` gives them.
 
-1. `meth_chrom_map_build_from_bns` iterates over `bns->anns` and strips the
-   leading `f`/`r` from each contig name.
-2. The first contig with a given stripped name registers that name in the output
-   list; subsequent contigs with the same stripped name map to the same output
-   index.
-3. The BAM `@SQ` lines are written from the consolidated list — one `SN:` per
-   real chromosome.
+`meth_bam_writer_open` therefore builds `@SQ` straight from the original
+(un-converted) reference's `bns->anns` — one `SN:` per reference sequence, in the
+original reference's order — and enriches each line with the `M5`/`UR`/`AS`/`SP`
+identity tags from that reference's `.hdr`/`.dict` sidecar when one is present.
 
-RNAME, RNEXT, and SA/XA tag contig references in every record are rewritten
-through `cmap->out_tid` and `cmap->output_names` so they reference the
-consolidated names. The mapping from internal (doubled-ref) contig index to
-output contig index is `cmap->out_tid[p.rid]`.
+Per record, `meth_mem_aln_to_bam` sets RNAME and RNEXT from `p.rid` and
+`mp->rid` directly. `SA:Z` names are looked up in `bns->anns` and `XA:Z` is
+emitted verbatim. There is no name rewriting and no contig-index translation
+anywhere on the path.
 
-> **Note — TLEN computation uses consolidated TIDs**
+> **Historical note**
 >
-> Template length (TLEN) is computed using the consolidated output TIDs, not the
-> internal `p.rid` values. Two mates that rescue onto `fchr1` and `rchr1`
-> respectively both map to output `chr1`, so TLEN is reported as a non-zero
-> distance rather than zero (which would happen if the mismatched internal TIDs
-> were used).
+> Before D3, output carried the doubled reference's coordinates and a
+> `meth_chrom_map_t` collapsed the `f`/`r` names at emit time, translating every
+> RNAME/RNEXT/SA/XA reference through an `out_tid` table. That map and its
+> consolidation step were removed when the coordinate cutover landed; the
+> original-alphabet rids make it unnecessary. Documentation describing
+> `meth_chrom_map_*`, `out_tid`, or `output_names` refers to the pre-D3 design.
+
+TLEN is computed from `p.pos`/`mp->pos` when both mates carry a CIGAR and land
+on the same contig (`tid == mtid`). Because rids are already original, that test
+is a plain same-chromosome check — the pre-D3 subtlety, where two mates rescued
+onto `fchr1` and `rchr1` had different internal rids for the same real
+chromosome, cannot arise.
 
 ## Chimera QC heuristic (opt-in)
 
@@ -116,13 +124,14 @@ and reproducibility.
 
 > **Tip — Verifying the header**
 >
-> After alignment, confirm consolidation and provenance with:
+> After alignment, confirm the header and provenance with (samtools autodetects
+> both containers, so this works on `--meth` and `--meth --bam` output alike):
 >
 > ```bash
 > samtools view -H out.bam | grep -E '^@SQ|^@PG'
 > ```
 >
-> You should see one @SQ line per chromosome (no f/r prefixes) and both
+> You should see one @SQ line per reference sequence (no f/r prefixes) and both
 > `@PG ID:bwa-mem3` and `@PG ID:bwa-mem3-meth` entries.
 
 ---

@@ -882,9 +882,11 @@ int mem_sam_pe(const mem_opt_t *opt, const bntseq_t *bns,
         for (i = 0; i < n_aa[0]; ++i)
             mem_aln2sam(opt, bns, &str, &s[0], n_aa[0], aa[0], i, &h[1]);
 
-        if (opt->bam_mode) {
-            /* BAM path (meth or generic): mem_aln2sam short-circuited
-             * into s->bams, leaving str untouched. Skip the str.s dance. */
+        if (mem_opt_records_are_bam(opt)) {
+            /* bam1_t path (meth or generic): mem_aln2sam short-circuited into
+             * s->bams, leaving str untouched. Skip the str.s dance. Note this
+             * is NOT opt->bam_mode — --meth without --bam still builds bam1_t
+             * and would hit the `assert(str.s != 0)` below. */
             s[0].sam = NULL;
             str.l = 0;
             for (i = 0; i < n_aa[1]; ++i)
@@ -1479,9 +1481,11 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
         for (i = 0; i < n_aa[0]; ++i)
             mem_aln2sam(opt, bns, &str, &s[0], n_aa[0], aa[0], i, &h[1]);
 
-        if (opt->bam_mode) {
-            /* BAM path (meth or generic): mem_aln2sam short-circuited
-             * into s->bams, leaving str untouched. Skip the str.s dance. */
+        if (mem_opt_records_are_bam(opt)) {
+            /* bam1_t path (meth or generic): mem_aln2sam short-circuited into
+             * s->bams, leaving str untouched. Skip the str.s dance. Note this
+             * is NOT opt->bam_mode — --meth without --bam still builds bam1_t
+             * and would hit the `assert(str.s != 0)` below. */
             s[0].sam = NULL;
             str.l = 0;
             for (i = 0; i < n_aa[1]; ++i)

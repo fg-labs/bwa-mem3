@@ -31,8 +31,11 @@ index layout is **not** the same as bwameth.py's single `.bwameth.c2t` reference
 index, preserving the original bases on the first-class `bseq1_t.meth_orig_seq`
 field (a `YS:Z`/`YC:Z` comment carrier is a fallback only; neither reaches the
 BAM). It then extends and **scores against the original 4-letter reference** with
-a per-strand asymmetric matrix, consolidates the `f`/`r` contig pairs back to one
-`@SQ` per real chromosome, emits Bismark-compatible `XR:Z` (read conversion
+a per-strand asymmetric matrix, writes one `@SQ` per original reference
+sequence straight from the original reference
+([#174](https://github.com/fg-labs/bwa-mem3/pull/174), which moved seeds onto
+original coordinates and removed the `f`/`r` header-rewrite step), emits
+Bismark-compatible `XR:Z` (read conversion
 direction), `XG:Z` (genome strand), and `XM:Z` (per-base methylation call string)
 auxiliary tags, restores the original bases into the BAM SEQ field for CpG-calling
 tools, optionally applies a chimera QC heuristic (longest M/=/X run < 44% of read
