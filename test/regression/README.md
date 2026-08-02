@@ -12,7 +12,7 @@ all and run from `ndebug-gate-lint`, `debug-macro-flag-lint`, `shell-lint`,
 - is self-contained (set -euo pipefail; explicit input contract — env vars for
   every script but the source-only lints, which instead take an optional
   positional directory so their self-tests can aim the same checks at a fixture
-  tree)
+  tree, and `meth_oracle.sh`, which reads no input at all)
 - emits `PASS:` on success and `FAIL:` on failure
 - returns nonzero on failure
 
@@ -27,7 +27,7 @@ all and run from `ndebug-gate-lint`, `debug-macro-flag-lint`, `shell-lint`,
 | `header_parity.sh`           | `AH:*` on generated @SQ (#281); `--compat` skips the .hdr/.dict sidecar | "header parity regression (AH:*, --compat @HD/@SQ)" |
 | `default_hd_parity.sh`       | default `@HD` byte-identical across SAM/`--bam`/`--meth` (#288)        | "default @HD parity across output paths"            |
 | `meth_sam_output.sh`         | `--meth` emits SAM text by default and BAM under `--bam`, same records | "--meth output container follows --bam"             |
-| `meth_oracle.sh`             | `--meth` Layers 1–3 match bwa-meth oracle                             | "Run --meth Layers 1-3"                             |
+| `meth_oracle.sh`             | `--meth` Layer 1 (valid BAM emission) via the harness under `test/meth/`; Layers 2–3 retired in D3 | "Run --meth Layer 1"                                |
 | `cohort_ramp_validation.sh`  | `--cohort-ramp-first`/`-ratio` reject malformed values; env warns and falls back | "Cohort ramp values are validated (flag and environment alike)" |
 | `rescue_kmer_options.sh`     | `--rescue-kmer`/`--rescue-band` reject malformed and out-of-range values; the `=` form is required | "--rescue-kmer/--rescue-band reject malformed values" |
 | `profile_slice_cpu.sh`       | `--profile` accounts for a partial cohort slice's compute CPU (needs `STAGE_PROF=1`) | "Partial cohort slices report their compute CPU"    |
@@ -47,15 +47,17 @@ all and run from `ndebug-gate-lint`, `debug-macro-flag-lint`, `shell-lint`,
 The table is a reading guide, not an inventory — `ls test/regression/*.sh` is
 the authoritative list, and `ci.yml` is where each one is actually wired up.
 
-Every script but the source-only lints reads its inputs from environment
-variables — see the comment block at the top of each file.
+Every script but the ones named in the block below reads its inputs from
+environment variables — see the comment block at the top of each file.
 `.github/workflows/ci.yml` sets the required vars and invokes the scripts.
 
 <!-- source-only lints: begin -->
-The source-only lints read no environment at all. Each takes the directory to
-work on as an optional positional argument, so that its self-test can aim the
-same checks at a fixture tree; each self-test takes no input, since it builds
-the trees it aims its lint at.
+These scripts read no environment at all.
+
+The source-only lints each take the directory to work on as an optional
+positional argument, so that its self-test can aim the same checks at a fixture
+tree; each self-test takes no input, since it builds the trees it aims its lint
+at.
 
 | Lint | Positional argument | Self-test |
 |------|---------------------|-----------|
@@ -63,10 +65,20 @@ the trees it aims its lint at.
 | `debug_macro_flag_lint.sh`    | repository root to check (default: this repository) | `debug_macro_flag_lint_selftest.sh`    |
 | `regression_coverage_lint.sh` | repository root to check (default: this repository) | `regression_coverage_lint_selftest.sh` |
 | `readme_contract_lint.sh`     | repository root to check (default: this repository) | `readme_contract_lint_selftest.sh`     |
+
+`meth_oracle.sh` is the one env-free script that is not a lint, and it takes no
+argument either. It wraps the `--meth` harness under `test/meth/`, whose inputs
+are the gitignored fixtures CI copies in there, plus an optional `SAMTOOLS`
+naming a samtools off `PATH`; the wrapper's whole job is to invoke that harness
+and mark the result, so it passes the environment through rather than reading
+or pinning any of it. "Reads no environment" is a claim about each script
+itself — which is also how `readme_contract_lint.sh` decides it — not about
+everything it may go on to run.
 <!-- source-only lints: end -->
 
 `readme_contract_lint.sh` checks that block against the scripts themselves, so
-a lint added without a row here fails CI rather than going unmentioned.
+a script that stops reading the environment without gaining a mention here
+fails CI rather than going unnoticed.
 
 One exception to "any binary will do": `profile_slice_cpu.sh` asserts on
 `--profile` output, which a default build compiles out entirely, so it needs a

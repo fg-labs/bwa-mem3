@@ -226,8 +226,12 @@ reviews:
         the two mates of a pair; and mate rescue that scores only one bisulfite
         hypothesis (test/regression/meth_rescue_batched_identical.sh pins the
         batched rescue against the per-pair path). Require coverage by the meth
-        regression scripts (test/regression/meth_*.sh), including the bwa-meth
-        oracle comparison (meth_oracle.sh).
+        regression scripts (test/regression/meth_*.sh), including the end-to-end
+        `--meth` harness wrapper (meth_oracle.sh). Do not ask that wrapper for
+        bwameth equivalence: despite the name, Layers 2-3 (bwameth structural
+        and byte equivalence) were retired in D3, since the genomic
+        `--meth-scoring` mode is variant-aware rather than collapsed and so
+        diverges from bwameth by design. It asserts Layer 1 only.
         CRITICAL: the non-`--meth` code path is contractually byte-for-byte
         unchanged — flag any edit that puts a methylation branch, extra field, or
         changed default on the normal path.
@@ -418,6 +422,11 @@ reviews:
       # Stated as an allowlist on purpose. A denylist of the actual internal
       # names would have to spell them out in a world-readable file, which is
       # the exact disclosure this check exists to prevent.
+      #
+      # The bar for an entry is "a reader could look it up", not "we wrote it":
+      # holodeck is on the list because it is a public repository whose clone
+      # URL is already hardcoded in test/meth/test_bismark_tags.sh, so the name
+      # discloses nothing that the tree does not already say out loud.
       - name: "Public-repo hygiene"
         mode: "error"
         instructions: >-
@@ -430,7 +439,9 @@ reviews:
           publicly citable project. Treat as allowed only names a reader could
           look up: this repository and its own scripts, upstream bwa, bwa-mem2,
           bwa-meth, Bismark, samtools, htslib, libsais, mimalloc, sse2neon,
-          zlib-ng, dwgsim, and standard OS or cloud instance-type designations.
+          zlib-ng, dwgsim, holodeck (the public read simulator this repository
+          already clones by URL in test/meth/test_bismark_tags.sh), and standard
+          OS or cloud instance-type designations.
           Any other proper-noun tool, harness, bucket, fleet, queue, or internal
           project name is a FAIL. (2) An object-store URL (`s3://`, `gs://`,
           `az://`) or bucket name. (3) A cloud account number, an EC2 instance

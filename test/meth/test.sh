@@ -32,6 +32,20 @@ fi
 
 cd "$HERE"
 
+# The fixtures are gitignored and are copied in from the bwa-meth checkout --
+# see the "Copy bwa-meth fixtures into test/meth/" step in ci.yml. Checked here
+# because the indexing step below sends both streams to /dev/null: without
+# this, a missing ref.fa surfaced as a bare `exit 2` with no output at all,
+# since `set -e` aborts before any of this script's own diagnostics can run.
+for fixture in ref.fa t_R1.fastq.gz; do
+    if [[ ! -f "$fixture" || ! -s "$fixture" ]]; then
+        echo "ERROR: fixture $PWD/$fixture is missing, empty, or not a regular file."
+        echo "       These are gitignored. Copy them from a bwa-meth checkout:"
+        echo "         cp <bwa-meth>/example/{ref.fa,t_R1.fastq.gz,t_R2.fastq.gz} $PWD/"
+        exit 2
+    fi
+done
+
 # Every BAM this test writes goes into a private per-run directory. Fixed names
 # under /tmp can be pre-created as symlinks by another local user, in which case
 # the redirections below would follow them and clobber an unrelated file; they
