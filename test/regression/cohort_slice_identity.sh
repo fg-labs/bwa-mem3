@@ -248,6 +248,47 @@ if [ "$fail" -ne 0 ]; then
     exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# The same EOF-on-a-boundary input, now checking what the cohort RESERVED.
+#
+# Capacity never changes the output, so the identity checks above pass either
+# way and cannot see this. The cohort accumulator projects its final read count
+# from a slice's mean read length, which is only sound while more input is
+# coming -- and on the first slice that is not yet known. A file ending exactly
+# on the boundary returns a full-size slice with seqs != NULL, so it fails every
+# cohort_complete test and reads as mid-cohort; EOF only surfaces on the next
+# read. Projecting there reserves a whole task_size for a cohort that turns out
+# to be one slice (measured: 40002 slots held 9766 reads at -K 4000000, and the
+# ratio grows with task_size -- ~330 MB of never-used bseq1_t at a default t=64).
+#
+# Doubling alone never exceeds 2x what it holds, so that is the bound: it passes
+# for any growth by doubling and fails for a task_size projection. -v 4 because
+# the reservation line is opt-in; default verbosity is unchanged.
+# ---------------------------------------------------------------------------
+BWA_MEM3_COHORT_SLICE_ALL=1 \
+    "$BWA_MEM3" mem -t 4 -K "$K" --cohort-slices 3 -v 4 \
+    "$CHR22_FA" "$WORK/eof.r1.fastq.gz" "$WORK/eof.r2.fastq.gz" \
+    > /dev/null 2> "$WORK/eof_reserve.err"
+
+reserve_line=$(grep -m1 'cohort_reserve:' "$WORK/eof_reserve.err" || true)
+if [ -z "$reserve_line" ]; then
+    echo "FAIL: no 'cohort_reserve:' line under -v 4, so the reservation could" >&2
+    echo "      not be checked. The accumulator must still log it." >&2
+    exit 1
+fi
+res_cap=$(echo "$reserve_line" | sed -E 's/.*cap: ([0-9]+).*/\1/')
+res_held=$(echo "$reserve_line" | sed -E 's/.*held: ([0-9]+).*/\1/')
+
+if [ "$res_held" -ge 1024 ] && [ "$res_cap" -ge $(( res_held * 2 )) ]; then
+    echo "FAIL: the cohort reserved $res_cap slots while holding $res_held reads." >&2
+    echo "      Growth by doubling never exceeds 2x, so this is a task_size" >&2
+    echo "      projection fired on a cohort whose input had already ended." >&2
+    echo "      See the cohort_n > 0 gate in kt_pipeline step 1 (src/fastmap.cpp):" >&2
+    echo "      a second slice is what proves more input exists." >&2
+    exit 1
+fi
+echo "  EOF-on-boundary reservation: cap $res_cap for $res_held reads (under 2x)"
+
 echo "PASS: output is identical with and without cohort slicing, including with"
 echo "      every cohort sliced 8 ways, and when the input ends exactly on a"
-echo "      slice boundary."
+echo "      slice boundary -- which also reserves no more than doubling would."
