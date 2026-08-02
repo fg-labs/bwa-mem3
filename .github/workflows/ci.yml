@@ -768,12 +768,17 @@ jobs:
           repository: brentp/bwa-meth
           path: bwa-meth-oracle
 
+      # Only the two fixtures something actually reads. t_R2.fastq.gz was copied
+      # here too until nothing was found to consume it: test/meth/test.sh runs
+      # single-end, and test/meth/test_bismark_tags.sh simulates its own reads.
+      # PE --meth coverage lives in the whole-aligner regressions that exercise
+      # it directly (test/regression/meth_pe_placement.sh and
+      # test/regression/meth_mixed_pe_asym.sh), not here.
       - name: Copy bwa-meth fixtures into test/meth/
         if: matrix.canonical == true
         run: |
           cp bwa-meth-oracle/example/ref.fa test/meth/
           cp bwa-meth-oracle/example/t_R1.fastq.gz test/meth/
-          cp bwa-meth-oracle/example/t_R2.fastq.gz test/meth/
           ls -la test/meth/
 
       # No BWAMETH_DIR: the checkout above is a fixture source, not an oracle

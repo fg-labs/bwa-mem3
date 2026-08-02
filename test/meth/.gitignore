@@ -3,6 +3,9 @@ ref.fa.*
 ref.c2t.fasta*
 ref_idx.fa*
 t_R1.fastq.gz
+# Nothing here reads t_R2, and CI no longer copies it -- but the bwa-meth
+# example directory ships it, so anyone copying that directory wholesale still
+# lands one here. Kept so it cannot be committed by accident.
 t_R2.fastq.gz
 *.bam
 *.sorted.bam

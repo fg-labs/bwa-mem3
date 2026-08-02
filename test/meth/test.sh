@@ -41,7 +41,7 @@ for fixture in ref.fa t_R1.fastq.gz; do
     if [[ ! -f "$fixture" || ! -s "$fixture" ]]; then
         echo "ERROR: fixture $PWD/$fixture is missing, empty, or not a regular file."
         echo "       These are gitignored. Copy them from a bwa-meth checkout:"
-        echo "         cp <bwa-meth>/example/{ref.fa,t_R1.fastq.gz,t_R2.fastq.gz} $PWD/"
+        echo "         cp <bwa-meth>/example/{ref.fa,t_R1.fastq.gz} $PWD/"
         exit 2
     fi
 done
