@@ -279,7 +279,7 @@ fi
 res_cap=$(echo "$reserve_line" | sed -E 's/.*cap: ([0-9]+).*/\1/')
 res_held=$(echo "$reserve_line" | sed -E 's/.*held: ([0-9]+).*/\1/')
 
-if [ "$res_held" -ge 1024 ] && [ "$res_cap" -ge $(( res_held * 2 )) ]; then
+if [ "$res_held" -ge 1024 ] && [ "$res_cap" -ge $((res_held * 2)) ]; then
     echo "FAIL: the cohort reserved $res_cap slots while holding $res_held reads." >&2
     echo "      Growth by doubling never exceeds 2x, so this is a task_size" >&2
     echo "      projection fired on a cohort whose input had already ended." >&2
