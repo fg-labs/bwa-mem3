@@ -671,6 +671,21 @@ jobs:
           FIXTURES="$GITHUB_WORKSPACE/test/fixtures" \
           bash test/regression/rescue_kmer_options.sh
 
+      # Its own step rather than appended to the one above, matching every other
+      # regression check in this job: bundled, a failure in the first script
+      # leaves the second unrun and the step name cannot say which one failed.
+      - name: --rescue-skip requires --rescue-kmer and composes with --fast
+        if: matrix.canonical == true
+        # --rescue-skip keys on the --rescue-kmer anchor scan, so with the scan
+        # off it would be silently inert -- a flag that changes which reads get
+        # rescued going quietly nowhere. It must hard-error instead, in either
+        # flag order, while still accepting `--fast --rescue-kmer=0` (a
+        # supported opt-out) and `--fast --rescue-skip` (opt-in, audit-named).
+        run: |
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          FIXTURES="$GITHUB_WORKSPACE/test/fixtures" \
+          bash test/regression/rescue_skip_options.sh
+
       - name: --supp-rep-hard-cap repetitive-seed regression
         if: matrix.canonical == true
         run: |
@@ -850,7 +865,7 @@ jobs:
           make -j"$(nproc)" arch=${{ matrix.arch_flag }} \
             CXX=${{ matrix.cxx || 'g++' }} \
             USE_MIMALLOC=${{ matrix.use_mimalloc }} \
-            EXTRA_CXXFLAGS="-DBWA_MEM3_DEBUG_CHN_FLT_XCHECK -DBWA_MEM3_DEBUG_RID_CHECK -DBWA_MEM3_DEBUG_UNGAPPED_XCHECK -DBSW8_ASSERT_ENVELOPE -DBWA_MEM3_DEBUG_POISON -DBWAMEM3_UGP_PROFILE=1"
+            EXTRA_CXXFLAGS="-DBWA_MEM3_DEBUG_CHN_FLT_XCHECK -DBWA_MEM3_DEBUG_RID_CHECK -DBWA_MEM3_DEBUG_UNGAPPED_XCHECK -DBSW8_ASSERT_ENVELOPE -DBWA_MEM3_DEBUG_POISON -DBWAMEM3_UGP_PROFILE=1 -DBWA_MEM3_DEBUG_RESCUE_STATS"
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           CHR22_FA=/tmp/chr22/chr22.fa \
           BWA_CHR22_FA=/tmp/chr22/bwa_chr22.fa \

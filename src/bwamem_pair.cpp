@@ -60,28 +60,79 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include <vector>
 #include <cstdint>
 #include <algorithm>
+
+/* BWA_MEM3_DEBUG_RESCUE_STATS: count how the anchor gate actually resolved.
+ * Wall time alone cannot distinguish "narrowing helped" from "narrowing almost
+ * never fired", and the vote floor and uniqueness guard can silently drive the
+ * narrowing rate to zero while the scan still costs its O(M + l_ms) pass. These
+ * rates are the metric that explains a wall delta, so they are instrumented
+ * rather than inferred. Off in normal builds (the counters do not exist), and
+ * named per the BWA_MEM3_DEBUG_* convention the ci.yml -D list is linted
+ * against. */
+#ifdef BWA_MEM3_DEBUG_RESCUE_STATS
+#  include <atomic>
+std::atomic<uint64_t> g_rescue_stat_scans{0};      /* anchor scans that ran the vote */
+std::atomic<uint64_t> g_rescue_stat_narrowed{0};   /* ... that banded the SW         */
+std::atomic<uint64_t> g_rescue_stat_skipped{0};    /* ... that dropped the SW        */
+#endif
+
 namespace {
 
+/* Result of one anchor scan. `scanned` is the contract that matters: it is false
+ * on the two paths that return BEFORE the diagonal vote runs (window or read
+ * shorter than k; no k-mer indexed at all), and on those paths best_v and
+ * n_kmer are meaningless and MUST NOT be consumed. In particular the skip gate
+ * keys on `scanned && best_v < ...`, never on `!narrowed` -- the edge-clamp
+ * decline below scans successfully and can carry a strong best_v, so treating
+ * "did not narrow" as "no anchor" would skip exactly the windows where the read
+ * hangs off the window edge. */
+struct matesw_anchor_t {
+    int  best_v;     /* votes on the winning diagonal (valid iff scanned)       */
+    int  n_kmer;     /* distinct query k-mers indexed (valid iff scanned)       */
+    int  ob, oe;     /* narrowed window sub-range (valid iff narrowed)          */
+    bool narrowed;   /* band the rescue SW to [ob,oe)                           */
+    bool scanned;    /* the diagonal vote ran; the counts above are meaningful  */
+};
+
+/* Storage model: the index keeps only the NEWEST query position per k-mer code,
+ * so each window k-mer casts exactly one vote.
+ * The alternative -- chaining every query position, so a code occurring m times
+ * in the read and n times in the window casts m*n votes -- never misses a vote
+ * on the true diagonal, but costs a chain walk whose length grows as
+ * read_length / alphabet^k and is what makes small k expensive.
+ *
+ * Measured on a 644k-pair bisulfite set: single-position storage narrows 98.29%
+ * of scans versus 98.84% for chaining, at equal-or-better accuracy (recall at
+ * MAPQ>=60 was 5 reads higher) and ~1% less wall time. The lost votes are the
+ * repeated-k-mer case, where keeping the newest occurrence can retain the wrong
+ * one; that costs half a percent of narrowing and buys back the chain walk. */
+
 /* Find the dominant k-mer exact-match diagonal of the (oriented) read within the
- * reference window ref[0..M) and return the window sub-range [ob,oe) a band of
- * half-width opt->rescue_band around it covers. Returns false (=> full window)
- * when no diagonal gathers >= 3 votes, or when the banded span would come out
- * shorter than the query. Only mem_matesw_batch_pre calls this: it runs the scan
- * once per enqueued pair and stores the resulting offset in g_rescue_narrow_off
- * (keyed by regid) for mem_matesw_batch_post to read back, so _post never
- * re-derives the window. `collapse` reduces the alphabet for the anchor scan only
- * (1 = C->T / OT, 2 = G->A / OB, 0 = none) so exact k-mers survive the bisulfite
- * conversion under --meth; the SW still sees the real bases. */
-static bool matesw_kmer_narrow(const mem_opt_t *opt, const uint8_t *ref, int M,
-                               const uint8_t *ms, int l_ms, int is_rev, int collapse,
-                               int *ob, int *oe)
+ * reference window ref[0..M) and report both the banding decision and the raw
+ * vote statistics the caller's skip gate needs. Narrowing requires the winning
+ * diagonal to clear MEM_RESCUE_MIN_VOTES; the band is opt->rescue_band either
+ * side, and is declined when the clamped span would come out shorter than the
+ * query.
+ *
+ * Only mem_matesw_batch_pre calls this: it runs the scan once per enqueued pair
+ * and stores the resulting offset in g_rescue_narrow_off (keyed by regid) for
+ * mem_matesw_batch_post to read back, so _post never re-derives the window.
+ * `collapse` reduces the alphabet for the anchor scan only (1 = C->T / OT,
+ * 2 = G->A / OB, 0 = none) so exact k-mers survive the bisulfite conversion
+ * under --meth; the SW still sees the real bases. */
+static matesw_anchor_t matesw_kmer_anchor(const mem_opt_t *opt, const uint8_t *ref, int M,
+                                          const uint8_t *ms, int l_ms, int is_rev, int collapse)
 {
+    matesw_anchor_t res = { 0, 0, 0, 0, false, false };
+
     /* The CLI rejects K outside [1,MEM_RESCUE_KMER_MAX]; clamp defensively so a
      * caller that sets opt->rescue_kmer directly cannot overflow the uint32 code. */
     int k = opt->rescue_kmer;
     if (k < 1) k = 1;
     if (k > MEM_RESCUE_KMER_MAX) k = MEM_RESCUE_KMER_MAX;
-    if (M < k || l_ms < k) return false;
+    /* Returns before the indexing loop below, so no slot was claimed and the
+     * touched-slot reset is vacuous. See the reset-invariant note there. */
+    if (M < k || l_ms < k) return res;
 
     auto col = [collapse](uint8_t b) -> uint8_t {
         if (b > 3) return b;
@@ -111,11 +162,9 @@ static bool matesw_kmer_narrow(const mem_opt_t *opt, const uint8_t *ref, int M,
     constexpr int HMAX = HS - (HS >> 2);                   /* stop inserting at 75% load */
     static_assert(HMAX < HS, "the table must retain empty slots or linear probing cannot terminate");
     static thread_local std::vector<uint32_t> slot_code;   /* 0xFFFFFFFF = empty */
-    static thread_local std::vector<int>      slot_head;
-    static thread_local std::vector<int>      nxt;         /* read-pos chain */
+    static thread_local std::vector<int>      slot_pos;     /* newest query pos per code */
     static thread_local std::vector<int>      touched;
-    if ((int)slot_code.size() < HS) { slot_code.assign(HS, 0xFFFFFFFFu); slot_head.assign(HS, -1); }
-    if ((int)nxt.size() < l_ms) nxt.resize(l_ms);
+    if ((int)slot_code.size() < HS) { slot_code.assign(HS, 0xFFFFFFFFu); slot_pos.assign(HS, -1); }
     touched.clear();
 
     uint32_t mask = (k >= 16) ? 0xffffffffu : ((1u << (2*k)) - 1);
@@ -130,12 +179,18 @@ static bool matesw_kmer_narrow(const mem_opt_t *opt, const uint8_t *ref, int M,
               while (slot_code[h] != 0xFFFFFFFFu && slot_code[h] != code) h = (h + 1) & HMASK;
               if (slot_code[h] == 0xFFFFFFFFu) {
                   if ((int)touched.size() >= HMAX) break;   /* table full enough: stop indexing */
-                  slot_code[h] = code; slot_head[h] = -1; touched.push_back((int)h);
+                  slot_code[h] = code; touched.push_back((int)h);
               }
-              nxt[pos] = slot_head[h]; slot_head[h] = pos;
+              /* Keep only the NEWEST occurrence of this code, so each window
+               * k-mer casts exactly one vote. See the storage-model note above
+               * the function. */
+              slot_pos[h] = pos;
           }
       } }
-    if (touched.empty()) return false;
+    /* Nothing was inserted, so the reset below would be a no-op: returning here
+     * cannot leave a stale slot behind. Every path that DID insert falls through
+     * to the single reset + return at the bottom -- see the invariant there. */
+    if (touched.empty()) return res;
 
     /* vote diagonals d = (ref k-mer start) - (read k-mer start), index by d+l_ms */
     int span = M + l_ms + 1;
@@ -153,33 +208,76 @@ static bool matesw_kmer_narrow(const mem_opt_t *opt, const uint8_t *ref, int M,
               uint32_t h = (code * 2654435761u) >> (32 - 10);
               while (slot_code[h] != 0xFFFFFFFFu && slot_code[h] != code) h = (h + 1) & HMASK;
               if (slot_code[h] == code) {
-                  for (int p = slot_head[h]; p >= 0; p = nxt[p]) {
-                      int idx = (opos - p) + l_ms;
-                      if (idx < 0 || idx >= span) continue;
+                  int p = slot_pos[h];
+                  int idx = (opos - p) + l_ms;
+                  if (idx >= 0 && idx < span) {
                       int v = ++dv[idx];
                       if (v > best_v) { best_v = v; best_d = opos - p; }
                   }
               }
           }
       } }
+    /* RESET INVARIANT: every path that claimed a slot must reach this line. The
+     * table is static thread_local and initialized exactly once, so a return
+     * placed above it leaves stale slot_code/slot_pos entries; the next call's
+     * probe would then find a live-looking slot pointing at the PREVIOUS read's
+     * position, casting votes on a garbage diagonal. That corruption does not
+     * crash and is invisible to the byte-identity gate, because --rescue-kmer
+     * output is not covered by it. Keep the single exit below: do not add an
+     * early return past this point. */
     for (int h : touched) slot_code[h] = 0xFFFFFFFFu;
 
-    if (best_v < 3) return false;
-    int W = opt->rescue_band > 0 ? opt->rescue_band : MEM_RESCUE_BAND_DEFAULT;
-    int lo_off = best_d - W;             /* read-0 maps to window offset best_d */
-    int hi_off = best_d + l_ms + W;
-    if (lo_off < 0) lo_off = 0;
-    if (hi_off > M) hi_off = M;
-    /* An anchor diagonal near a window edge clamps to a span that can be far
-     * shorter than the query (down to ~k + W when the read hangs off the left
-     * edge). Such a window cannot host a full-length rescue alignment, so the
-     * SW would return a truncated, low score that the caller's
-     * `score >= min_seed_len` gate is liable to reject -- a rescue the full
-     * window might have kept. Keep the full window in that case. */
-    if (hi_off - lo_off < l_ms) return false;
-    *ob = lo_off; *oe = hi_off;
-    return true;
+    res.scanned = true;
+    res.best_v  = best_v;
+    res.n_kmer  = (int)touched.size();
+
+    if (best_v >= MEM_RESCUE_MIN_VOTES) {
+        int W = opt->rescue_band > 0 ? opt->rescue_band : MEM_RESCUE_BAND_DEFAULT;
+        int lo_off = best_d - W;         /* read-0 maps to window offset best_d */
+        int hi_off = best_d + l_ms + W;
+        if (lo_off < 0) lo_off = 0;
+        if (hi_off > M) hi_off = M;
+        /* An anchor diagonal near a window edge clamps to a span that can be far
+         * shorter than the query (down to ~k + W when the read hangs off the left
+         * edge). Such a window cannot host a full-length rescue alignment, so the
+         * SW would return a truncated, low score that the caller's
+         * `score >= min_seed_len` gate is liable to reject -- a rescue the full
+         * window might have kept. Keep the full window in that case. Note this
+         * declines NARROWING only: the scan succeeded, so res.scanned stays true
+         * and the caller's skip gate still sees a valid best_v. */
+        if (hi_off - lo_off >= l_ms) {
+            res.ob = lo_off; res.oe = hi_off; res.narrowed = true;
+        }
+    }
+    return res;
 }
+
+/* --rescue-skip: should this orientation's rescue SW be dropped entirely rather
+ * than run against the full window? Only when the scan actually ran and the best
+ * diagonal clears neither the absolute floor nor a fraction of the distinct
+ * query k-mers the anchor index holds (n_kmer = touched.size(), the read's full
+ * distinct count until indexing stops at HMAX = 768 codes). The fractional term
+ * binds only for n_kmer below ~30 -- reads under ~36 bp at k=6 -- and is inert
+ * at 150 bp.
+ *
+ * The floor is an absolute vote count while the vote budget is not: a read offers
+ * l_ms - k + 1 k-mers, so ~145 at 150 bp and ~70 at 75 bp, and the same 10 votes
+ * is twice as harsh a test on the shorter read. Measured skip rates track read
+ * length accordingly -- 14% at 150 bp, 42% at 125 bp, 79% at 75 bp -- so the rate
+ * this gate produces has to be measured per read length rather than assumed. */
+static bool matesw_anchor_declines_rescue(const mem_opt_t *opt, const matesw_anchor_t &anc)
+{
+    if (!opt->rescue_skip || !anc.scanned) return false;
+    return anc.best_v < MEM_RESCUE_SKIP_MIN_VOTES
+        && (double)anc.best_v < (double)anc.n_kmer * MEM_RESCUE_SKIP_FRAC;
+}
+
+/* gar[gcnt+r] sentinel for --rescue-skip: "the anchor gate declined this
+ * orientation; no rescue SW runs for it". A DISTINCT value from -1 is required:
+ * -1 already means "re-run this orientation through the scalar ksw_align2" in
+ * mem_matesw_batch_post, so reusing it would run the full UNBANDED scalar SW --
+ * the exact opposite of skipping, and slower than doing nothing. */
+static const int32_t MATESW_GAR_DECLINED = -2;
 
 /* mem_matesw_batch_pre stores the narrowing offset per enqueued pair (keyed by
  * regid, stable under the batch's sort_classify / length-sort reorder) so
@@ -1691,9 +1789,28 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
             if (opt->rescue_kmer) {
                 int collapse = 0;
                 if (opt->meth_mode) { int hyp = (mate_meth_ot ^ is_rev) & 1; collapse = hyp ? 1 : 2; }
-                int ob, oe;
-                if (matesw_kmer_narrow(opt, ref, (int)(re - rb), ms, l_ms, is_rev, collapse, &ob, &oe)) {
-                    int64_t rb_full = rb; ref += ob; rb = rb_full + ob; re = rb_full + oe; narrow_ob = ob;
+                matesw_anchor_t anc = matesw_kmer_anchor(opt, ref, (int)(re - rb),
+                                                         ms, l_ms, is_rev, collapse);
+                const bool declined = matesw_anchor_declines_rescue(opt, anc);
+#ifdef BWA_MEM3_DEBUG_RESCUE_STATS
+                if (anc.scanned) {
+                    g_rescue_stat_scans.fetch_add(1, std::memory_order_relaxed);
+                    if (anc.narrowed) g_rescue_stat_narrowed.fetch_add(1, std::memory_order_relaxed);
+                    if (declined)     g_rescue_stat_skipped.fetch_add(1, std::memory_order_relaxed);
+                }
+#endif
+                /* --rescue-skip: no anchor worth the SW. Mark the orientation
+                 * declined and do not enqueue. mem_matesw_batch_post reads this
+                 * same gar slot under the identical `a->rid == rid && re - rb >=
+                 * min_seed_len` guard, so the sentinel is always observed. */
+                if (declined) {
+                    gar[gcnt + r] = MATESW_GAR_DECLINED;
+                    continue;
+                }
+                if (anc.narrowed) {
+                    int64_t rb_full = rb;
+                    ref += anc.ob; rb = rb_full + anc.ob; re = rb_full + anc.oe;
+                    narrow_ob = anc.ob;
                 }
             }
             //kswr_t aln;
@@ -1963,6 +2080,17 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
             //aln = **myaln;
             //(*myaln)++;
             int index = gar[gcnt + r];
+            /* --rescue-skip: _pre found no anchor worth an SW for this orientation
+             * and did not enqueue it. Nothing to read back -- `rev` and `ref_rw`
+             * are not allocated yet, so this leaves nothing to unwind.
+             *
+             * `++n` still fires. n counts SW ATTEMPTS, not successes, and its only
+             * live effect is gating mem_sort_dedup_patch at the bottom of this
+             * loop (the caller discards the return value). Skipping an SW should
+             * not silently change how often the dedup runs -- that coupling is
+             * incidental, and letting it into the ROC signal would confound the
+             * skip gate's measured accuracy cost with a dedup difference. */
+            if (index == MATESW_GAR_DECLINED) { ++n; continue; }
             /* --rescue-kmer: apply the same narrowing offset _pre stored for this
              * regid, so aln.tb/te map against the narrowed window start (batched
              * pairs only; index==-1 scalar-fallback pairs were never narrowed). */

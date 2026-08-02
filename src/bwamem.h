@@ -78,6 +78,37 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #define MEM_RESCUE_KMER_DEFAULT 6
 #define MEM_RESCUE_BAND_DEFAULT 50
 
+/* Vote thresholds on the anchor scan (matesw_kmer_anchor in bwamem_pair.cpp).
+ * Fixed constants rather than CLI knobs: they are chosen from a truth-based
+ * sweep, and exposing them would ship combinations no sweep ever covered. The
+ * #ifndef guards exist so a characterization build can override one from the
+ * command line (-DMEM_RESCUE_MIN_VOTES=N) without editing this header.
+ *
+ * MIN_VOTES gates NARROWING: the winning diagonal must gather at least this many
+ * k-mer votes before the rescue SW is banded to it.
+ *
+ * SKIP_MIN_VOTES / SKIP_FRAC gate SKIPPING the rescue SW outright
+ * (opt->rescue_skip): skip when the best diagonal clears neither an absolute
+ * floor nor a fraction of the distinct query k-mers the anchor index holds
+ * (n_kmer, which is the read's full distinct count until the index stops
+ * inserting at 768 codes). The fractional term only binds when n_kmer < ~30
+ * (reads under ~36 bp at k=6).
+ *
+ * Note the skip floor is an absolute count while the vote budget is not: a
+ * 150 bp read offers ~145 6-mers and a 75 bp read ~70, so the same 10 votes is
+ * twice as harsh a test on short reads. Measured skip rates bear this out --
+ * 14% on 150 bp simulated reads, 42% on 125 bp, 79% on 75 bp -- which is why
+ * --rescue-skip is opt-in and is NOT part of --fast. */
+#ifndef MEM_RESCUE_MIN_VOTES
+#  define MEM_RESCUE_MIN_VOTES 3
+#endif
+#ifndef MEM_RESCUE_SKIP_MIN_VOTES
+#  define MEM_RESCUE_SKIP_MIN_VOTES 10
+#endif
+#ifndef MEM_RESCUE_SKIP_FRAC
+#  define MEM_RESCUE_SKIP_FRAC 0.33
+#endif
+
 struct __smem_i;
 typedef struct __smem_i smem_i;
 
@@ -185,6 +216,7 @@ typedef struct mem_opt_t {
     int max_matesw;         // perform maximally max_matesw rounds of mate-SW for each end
     int rescue_kmer;        // k-mer-anchored banded mate rescue: 0=off, else anchor k-mer length in [1,MEM_RESCUE_KMER_MAX] (opt-in, not byte-identical)
     int rescue_band;        // half-width (bp) of the band around the k-mer anchor diagonal, in [1,MEM_RESCUE_BAND_MAX]
+    int rescue_skip;        // 1 = skip the mate-rescue SW outright when no k-mer anchor clears the vote floor; requires rescue_kmer (opt-in, not byte-identical)
     int max_XA_hits, max_XA_hits_alt; // if there are max_hits or fewer, output them all
     int8_t mat[25];         // scoring matrix; mat[0] == 0 if unset
     /* D3 (--meth): per-hypothesis substitution matrices, built from `mat` by

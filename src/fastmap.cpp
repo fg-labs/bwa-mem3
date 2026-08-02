@@ -41,6 +41,10 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include <getopt.h>
 #include <errno.h>    /* errno/ERANGE: strtoll validation of the INT options */
 #include <unistd.h>   /* access(): --compat's "you passed a file" diagnostic */
+#ifdef BWA_MEM3_DEBUG_RESCUE_STATS
+#  include <atomic>
+#  include <cstdint>
+#endif
 #include "fastmap.h"
 #include "FMI_search.h"
 #include "bam_writer.h"
@@ -1559,6 +1563,10 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "                  Opt-in speedup, NOT byte-identical; enabled by --fast [off]\n");
     fprintf(stderr, "    --rescue-band INT  half-width (bp) of the band around the anchor diagonal, 1..%d [%d]\n",
             MEM_RESCUE_BAND_MAX, opt->rescue_band);
+    fprintf(stderr, "    --rescue-skip  skip the mate-rescue Smith-Waterman outright when no K-mer anchor\n");
+    fprintf(stderr, "                  clears the vote floor, instead of falling back to the full window.\n");
+    fprintf(stderr, "                  Requires --rescue-kmer. Drops rescues rather than shortening them,\n");
+    fprintf(stderr, "                  so it can lose alignments; NOT part of --fast [off]\n");
     fprintf(stderr, "    -S            skip mate rescue\n");
     fprintf(stderr, "    -P            skip pairing; mate rescue performed unless -S also in use\n");
     fprintf(stderr, "    --fast        speed preset: -m 10 -y 0 --min-ext-len 30 --smem-dedup --rescue-kmer=6\n");
@@ -1925,6 +1933,7 @@ int main_mem(int argc, char *argv[])
         OPT_COHORT_SLICES,
         OPT_RESCUE_KMER,
         OPT_RESCUE_BAND,
+        OPT_RESCUE_SKIP,
         OPT_COHORT_RAMP_RATIO,
         OPT_COHORT_RAMP_FIRST,
 #ifdef STAGE_PROF
@@ -1945,6 +1954,7 @@ int main_mem(int argc, char *argv[])
         {"cohort-slices",            required_argument, 0, OPT_COHORT_SLICES},
         {"rescue-kmer",              optional_argument, 0, OPT_RESCUE_KMER},
         {"rescue-band",              required_argument, 0, OPT_RESCUE_BAND},
+        {"rescue-skip",              no_argument,       0, OPT_RESCUE_SKIP},
         {"cohort-ramp-ratio",        required_argument, 0, OPT_COHORT_RAMP_RATIO},
         {"cohort-ramp-first",        required_argument, 0, OPT_COHORT_RAMP_FIRST},
         {"meth",                     optional_argument, 0, OPT_METH},
@@ -2260,6 +2270,16 @@ int main_mem(int argc, char *argv[])
             }
             opt->rescue_band = (int)band;
         }
+        else if (c == OPT_RESCUE_SKIP) {
+            /* A plain switch: there is no `=0` form because there is no preset to
+             * opt out of -- --fast deliberately does not enable this. Validated
+             * AFTER getopt (below), not here: it needs a non-zero rescue_kmer,
+             * but --rescue-kmer may not be parsed yet and --fast resolves it
+             * later still, so an inline check would make the diagnostic depend
+             * on flag order. */
+            opt->rescue_skip = 1;
+            opt0.rescue_skip = 1;
+        }
         else if (c == OPT_CHUNK_CAP) {
             /* Validated the same way as --supp-rep-hard-cap below rather than via
              * a bare atoll, which maps every unparseable value to 0 -- and 0 here
@@ -2548,6 +2568,13 @@ int main_mem(int argc, char *argv[])
          * mismaps unchanged; k=6 is the measured wall-time peak (~-22% on the
          * rescue-heavy WGS tail). */
         if (!opt0.rescue_kmer)  opt->rescue_kmer  = MEM_RESCUE_KMER_DEFAULT;
+        /* --rescue-skip is deliberately NOT part of --fast. It drops mate
+         * rescues rather than shortening them, and on real reads that costs
+         * confident alignments: measured against --rescue-kmer alone, 16 losses
+         * at MAPQ>=30 per 200k primaries on 125 bp WGBS and 420 per 2M on 75 bp
+         * em-seq, because the fixed vote floor is read-length-blind and skips
+         * 42%/79% of scans at those lengths. --fast is meant to be a
+         * characterized speed preset, not a recall trade. */
         /* --max-extend-chains: 5 for non-meth; 10 under --meth. A 7-point ablation
          * ({0,5,10,20,50,100,1000}) on 1M sim-meth PE pairs (with mate-concordant
          * rescue on, below) shows chr-accuracy flat (0.9908) at every cap but the
@@ -2765,16 +2792,35 @@ int main_mem(int argc, char *argv[])
             /* --skip-contained-ext is set but no-ops under --meth (internal gate), so it is
              * intentionally omitted from the meth audit line to reflect the effective levers.
              * --adaptive-band is set unconditionally and applies under --meth, so it stays. */
-            fprintf(stderr, "[M::%s] --fast: -m %d -y %ld --min-ext-len %d --smem-dedup --max-extend-chains %d --adaptive-band -s %d --extend-mate-concordant --rescue-kmer=%d alnreg-sort=fast\n",
-                    __func__, opt->max_matesw, (long)opt->max_mem_intv, opt->min_ext_len, opt->max_extend_chains, opt->split_width, opt->rescue_kmer);
+            fprintf(stderr, "[M::%s] --fast: -m %d -y %ld --min-ext-len %d --smem-dedup --max-extend-chains %d --adaptive-band -s %d --extend-mate-concordant --rescue-kmer=%d%s alnreg-sort=fast\n",
+                    __func__, opt->max_matesw, (long)opt->max_mem_intv, opt->min_ext_len, opt->max_extend_chains, opt->split_width, opt->rescue_kmer, opt->rescue_skip ? " --rescue-skip" : "");
         else
-            fprintf(stderr, "[M::%s] --fast: -m %d -y %ld --min-ext-len %d --smem-dedup --skip-contained-ext --max-extend-chains %d --adaptive-band --extend-mate-concordant --rescue-kmer=%d alnreg-sort=fast\n",
-                    __func__, opt->max_matesw, (long)opt->max_mem_intv, opt->min_ext_len, opt->max_extend_chains, opt->rescue_kmer);
+            fprintf(stderr, "[M::%s] --fast: -m %d -y %ld --min-ext-len %d --smem-dedup --skip-contained-ext --max-extend-chains %d --adaptive-band --extend-mate-concordant --rescue-kmer=%d%s alnreg-sort=fast\n",
+                    __func__, opt->max_matesw, (long)opt->max_mem_intv, opt->min_ext_len, opt->max_extend_chains, opt->rescue_kmer, opt->rescue_skip ? " --rescue-skip" : "");
         /* --fast also caps the batch size, which keeps the read/compute/write
          * pipeline overlapped at high -t. It re-partitions the input and so is not
          * byte-identical -- which --fast already is not -- hence it rides here
          * rather than in the default path. An explicit --chunk-cap still wins. */
         if (!chunk_cap_set) chunk_cap = 256000000;
+    }
+
+    /* --rescue-skip keys entirely off the --rescue-kmer anchor scan, so without
+     * that scan it has nothing to decide on and would silently do nothing. Reject
+     * rather than no-op, matching how --rescue-kmer and --rescue-band already
+     * reject out-of-range values instead of clamping: a flag that changes which
+     * reads get rescued must not be quietly inert.
+     *
+     * Deliberately placed AFTER getopt and after the --fast block: rescue_kmer is
+     * not final until --fast has resolved it, so checking inline in the getopt
+     * case would make the diagnostic depend on the order the flags were typed.
+     * --fast does not set rescue_skip, so `--fast --rescue-kmer=0` reaches here
+     * with rescue_skip == 0 and passes. */
+    if (opt->rescue_skip && !opt->rescue_kmer) {
+        fprintf(stderr, "ERROR: --rescue-skip requires --rescue-kmer (the skip decision "
+                        "reuses the k-mer anchor scan); got --rescue-kmer=0\n");
+        free(opt);
+        if (out_opened) fclose(aux.fp);
+        return 1;
     }
 
     /* Load bwt2/FMI index */
@@ -3389,6 +3435,29 @@ int main_mem(int argc, char *argv[])
     /* Display runtime profiling stats */
     tprof[MEM][0] = __rdtsc() - tprof[MEM][0];
     display_stats(nt);
+
+#ifdef BWA_MEM3_DEBUG_RESCUE_STATS
+    /* How the --rescue-kmer anchor gate resolved over the whole run. A wall-time
+     * delta is uninterpretable without these: a vote floor tuned too high drives
+     * the narrowing rate toward zero while the scan still costs its full pass,
+     * which reads as "the optimization did nothing" rather than "the gate
+     * rejected everything". Printed unconditionally under the macro so a run with
+     * the knob off shows 0/0/0 rather than nothing at all. */
+    {
+        extern std::atomic<uint64_t> g_rescue_stat_scans;
+        extern std::atomic<uint64_t> g_rescue_stat_narrowed;
+        extern std::atomic<uint64_t> g_rescue_stat_skipped;
+        uint64_t sc = g_rescue_stat_scans.load(std::memory_order_relaxed);
+        uint64_t nw = g_rescue_stat_narrowed.load(std::memory_order_relaxed);
+        uint64_t sk = g_rescue_stat_skipped.load(std::memory_order_relaxed);
+        fprintf(stderr, "[M::%s] rescue-anchor: scans %llu narrowed %llu (%.2f%%) "
+                        "skipped %llu (%.2f%%)\n", __func__,
+                (unsigned long long)sc, (unsigned long long)nw,
+                sc ? 100.0 * (double)nw / (double)sc : 0.0,
+                (unsigned long long)sk,
+                sc ? 100.0 * (double)sk / (double)sc : 0.0);
+    }
+#endif
 
     return exit_code;
 }
