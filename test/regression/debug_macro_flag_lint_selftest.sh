@@ -349,6 +349,18 @@ printf '#ifdef BWA_MEM3_DEBUG_ALPHA\n#endif\n' > "$wrong_src_dir/src"
 check_dir "src path is a regular file" "$wrong_src_dir" 1 \
     'src is not a directory'
 
+# The argument itself, rather than the tree under it. Asserted on the message
+# and not just the status, because an unguarded `cd` into a missing directory
+# also dies with exit 1 under `set -e` -- a status-only case passes whether or
+# not the path is checked. What is under test is that the failure arrives in
+# this family's own format instead of as bash's raw `cd:` diagnostic. Hence the
+# FAIL: prefix in the expected text, which the other cases leave off: elsewhere
+# the message body alone identifies the branch, but here the prefix *is* the
+# behaviour under test.
+absent_dir="$fixture_root/absent"
+check_dir "argument that is not a directory" "$absent_dir" 1 \
+    "FAIL: '$absent_dir' is not a directory"
+
 # The expected text is derived from $lint rather than spelled out: the lint
 # prints its own basename, so a hardcoded name would make this case fail for a
 # renamed copy of the script instead of for the behaviour under test.
