@@ -63,11 +63,8 @@ fails=0
 # Always uses the `=` form so a leading '-' in the value is not taken for another
 # option.
 reject() {
-    local optword="$1" want="$2" rc
-    set +e
-    "$BWA_MEM3" mem "$optword" "$ref" "$reads" > /dev/null 2> "$err"
-    rc=$?
-    set -e
+    local optword="$1" want="$2" rc=0
+    "$BWA_MEM3" mem "$optword" "$ref" "$reads" > /dev/null 2> "$err" || rc=$?
     if [[ "$rc" -eq 0 ]]; then
         echo "FAIL: '$optword' was accepted; expected a non-zero exit"
         fails=$((fails + 1))
@@ -126,10 +123,8 @@ accept "--rescue-band=1000000"
 # following word: `mem --rescue-kmer 6 ref reads` leaves THREE positionals, and
 # `6` is taken as the index base. Pinning this keeps the docs and the --help
 # --fast expansion honest about the `=` form.
-set +e
-"$BWA_MEM3" mem --rescue-kmer 6 "$ref" "$reads" > /dev/null 2> "$err"
-rc=$?
-set -e
+rc=0
+"$BWA_MEM3" mem --rescue-kmer 6 "$ref" "$reads" > /dev/null 2> "$err" || rc=$?
 if [[ "$rc" -eq 0 ]]; then
     echo "FAIL: '--rescue-kmer 6' (space-separated) unexpectedly succeeded;"
     echo "      it should leave 6 as a positional argument"

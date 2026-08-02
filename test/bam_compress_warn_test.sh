@@ -77,14 +77,10 @@ expect() {
     local label="$1" want_rc="$2" want_warns="$3"
     shift 3
     local err="$tmpdir/$label.err"
-    local rc warns grep_rc
+    local rc=0 warns grep_rc=0
 
-    set +e
-    "$bin" mem "$@" > /dev/null 2> "$err"
-    rc=$?
-    warns="$(grep -c 'WARNING: --bam=' "$err")"
-    grep_rc=$?
-    set -e
+    "$bin" mem "$@" > /dev/null 2> "$err" || rc=$?
+    warns="$(grep -c 'WARNING: --bam=' "$err")" || grep_rc=$?
 
     # grep exits 1 when there are no matches -- an expected result here -- and
     # >1 only on a real error such as an unreadable capture file.

@@ -53,10 +53,8 @@ tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 
 # --- 1. Real `mem --help` short-circuits: option list, no banner, exit 0. ---
-set +e
-"$bin" mem --help > "$tmpdir/help.out" 2> "$tmpdir/help.err"
-rc=$?
-set -e
+rc=0
+"$bin" mem --help > "$tmpdir/help.out" 2> "$tmpdir/help.err" || rc=$?
 [[ $rc -eq 0 ]] \
     || {
         echo "FAIL: mem --help exited with $rc, expected 0" >&2
@@ -81,10 +79,8 @@ fi
 # exit 0, and SAM must be written to a file literally named `--help`. Run
 # from the tmp dir so the output file lands there even though `--help`
 # looks like an option.
-set +e
-(cd "$tmpdir" && "$bin" mem -o "--help" "$ref" "$reads" > run.out 2> run.err)
-rc=$?
-set -e
+rc=0
+(cd "$tmpdir" && "$bin" mem -o "--help" "$ref" "$reads" > run.out 2> run.err) || rc=$?
 [[ $rc -eq 0 ]] \
     || {
         echo "FAIL: 'mem -o --help' exited $rc, expected 0" >&2
@@ -111,10 +107,8 @@ grep -q 'Executing in' "$tmpdir/run.err" \
 # invalid @RG, but the banner must still be printed first and the run must
 # exit non-zero (so the test can't pass if `--help` were ever wrongly
 # consumed and the run completed successfully).
-set +e
-"$bin" mem -R "--help" "$ref" "$reads" > "$tmpdir/rg.out" 2> "$tmpdir/rg.err"
-rc=$?
-set -e
+rc=0
+"$bin" mem -R "--help" "$ref" "$reads" > "$tmpdir/rg.out" 2> "$tmpdir/rg.err" || rc=$?
 [[ $rc -ne 0 ]] \
     || {
         echo "FAIL: 'mem -R --help' exited 0; expected non-zero (invalid @RG)" >&2
@@ -133,11 +127,9 @@ grep -q 'Executing in' "$tmpdir/rg.err" \
 # --- 4. `mem --set-as-failed --help <ref> <reads>` -- long option with a ----
 # required argument; the banner must still be printed and the run must
 # exit non-zero.
-set +e
+rc=0
 "$bin" mem --set-as-failed "--help" "$ref" "$reads" \
-    > "$tmpdir/saf.out" 2> "$tmpdir/saf.err"
-rc=$?
-set -e
+    > "$tmpdir/saf.out" 2> "$tmpdir/saf.err" || rc=$?
 [[ $rc -ne 0 ]] \
     || {
         echo "FAIL: 'mem --set-as-failed --help' exited 0; expected non-zero (--help is not a valid 'f'|'r' value)" >&2
