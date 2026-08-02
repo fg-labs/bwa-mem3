@@ -562,7 +562,7 @@ jobs:
         # chr22_parity.sh running on the sse41, avx2 and arm64 build jobs.
         #
         # On a runner without AVX-512BW there is only one sweepable tier and the
-        # script reports SKIPPED, not PASS — so this step is a no-op there rather
+        # script reports SKIP:, not PASS: — so this step is a no-op there rather
         # than a false green. It still earns its place: the script had rotted
         # unrun to the point of aborting on its first tier, and this keeps that
         # from recurring silently.

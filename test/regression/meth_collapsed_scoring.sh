@@ -185,4 +185,4 @@ NM_LIT=$(mawk '!/^@/{for(i=12;i<=NF;i++) if(substr($i,1,5)=="NM:i:"){print subst
 # even at -B 0, which is exactly why -B 0 is harmless off the --meth path.
 [ "$NM_LIT" = "1" ] || fail "non-meth -B 0 should keep literal NM: NM=$NM_LIT, want 1"
 
-echo "OK"
+echo "PASS: meth_collapsed_scoring (collapsed-space --meth scoring, and literal NM preserved off the --meth path at -B 0)"
