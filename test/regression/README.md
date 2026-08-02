@@ -42,7 +42,7 @@ all and run from `ndebug-gate-lint`, `debug-macro-flag-lint`, `shell-lint`,
 | `regression_coverage_lint_selftest.sh` | the lint above still detects an unrun script, so its `PASS` means something | "Coverage lint still detects an unrun script"       |
 | `host_floor_enforce.sh`      | below-floor hosts get exit 2 + a readable error, not a SIGILL (needs `TESTING_BUILD=1`) | "SIMD floor enforcement (TESTING_BUILD, injected below-floor tier)" |
 | `version_banner.sh`          | `bwa-mem3 version` prints the SIMD floor and runtime tier lines        | "Version banner regression"                         |
-| `readme_contract_lint.sh`    | this README names no script that was deleted, and its source-only-lint block lists exactly the scripts that read no environment | "README still describes the regression scripts"     |
+| `readme_contract_lint.sh`    | this README names no script that was deleted, its source-only-lint block lists exactly the scripts that read no environment, and every row's `Origin in ci.yml` names a step a workflow defines | "README still describes the regression scripts"     |
 | `readme_contract_lint_selftest.sh` | the lint above still detects a stale README, so its `PASS` means something | "README lint still detects drift"                  |
 
 The table is a reading guide, not an inventory — `ls test/regression/*.sh` is

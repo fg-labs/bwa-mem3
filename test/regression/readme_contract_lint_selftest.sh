@@ -33,16 +33,42 @@ failures=0
 readonly BEGIN_MARKER='<!-- source-only lints: begin -->'
 readonly END_MARKER='<!-- source-only lints: end -->'
 
-# Build a fixture tree: a README, plus one script per "name:body" pair given
-# after it. Returns the tree's path on stdout.
+# The step name every fixture's workflow defines, and that readme_naming puts
+# in the table's origin column. Check 3 compares the two, so the default tree
+# has to satisfy it or every case below would fail for the wrong reason.
+readonly DEFAULT_STEP='Run the regression scripts'
+readonly FIXTURE_JOB_NAME='The build job'
+
+# Extra step names for the fixture workflow, one per line, written into the
+# workflow verbatim so a case can give a step the YAML quoting a real one needs.
+# Set around the case that wants it; reset after, the way FIXTURE_EXEMPTIONS is
+# used in the sibling coverage-lint self-test.
+FIXTURE_STEPS=""
+
+# Build a fixture tree: a README, a workflow, plus one script per "name:body"
+# pair given after it. Returns the tree's path on stdout.
 make_tree() {
     local name="$1" readme_body="$2"
     shift 2
 
     local dir="$fixture_root/$name"
     rm -rf "$dir"
-    mkdir -p "$dir/test/regression"
+    mkdir -p "$dir/test/regression" "$dir/.github/workflows"
     printf '%s\n' "$readme_body" > "$dir/test/regression/README.md"
+
+    # Every tree carries a workflow, because check 3 treats a missing one as
+    # "nothing was checked" rather than as a pass -- so a tree without it would
+    # make every case here fail on the workflow instead of on what it tests.
+    # The job carries a name of its own, so a case can aim the origin column at
+    # it and confirm a job name does not satisfy a column that names steps.
+    {
+        printf 'jobs:\n  build:\n    name: %s\n    steps:\n' "$FIXTURE_JOB_NAME"
+        printf '      - name: %s\n' "$DEFAULT_STEP"
+        local step
+        while IFS= read -r step; do
+            [[ -n $step ]] && printf '      - name: %s\n' "$step"
+        done <<< "$FIXTURE_STEPS"
+    } > "$dir/.github/workflows/ci.yml"
 
     local spec
     for spec in "$@"; do
@@ -54,8 +80,14 @@ make_tree() {
 
 # Run the lint over a fixture tree and check the verdict. `expected` is FLAG
 # (the lint must reject it, exit 1) or PASS (must accept it, exit 0).
+#
+# The optional fourth argument is a phrase the report has to carry. A verdict
+# alone cannot tell two rejection branches apart, so a case that exists to move
+# a tree from one branch to another reads the same before and after the change
+# it pins -- green while checking nothing, which is the failure this whole file
+# is here to prevent. Such a case names its branch.
 check_tree() {
-    local description="$1" expected="$2" dir="$3"
+    local description="$1" expected="$2" dir="$3" must_say="${4-}"
 
     local output status
     output="$(bash "$lint" "$dir" 2>&1)" && status=0 || status=$?
@@ -67,23 +99,48 @@ check_tree() {
         *) verdict="EXIT$status" ;;
     esac
 
-    if [[ $verdict == "$expected" ]]; then
-        echo "  ok   $description -> $expected"
-    else
+    if [[ $verdict != "$expected" ]]; then
         echo "  FAIL $description -> got $verdict, wanted $expected" >&2
         printf '       %s\n' "$output" >&2
         failures=1
+        return
     fi
+
+    if [[ -n $must_say && $output != *"$must_say"* ]]; then
+        echo "  FAIL $description -> $expected, but the report never says" >&2
+        echo "       '$must_say'" >&2
+        printf '       %s\n' "$output" >&2
+        failures=1
+        return
+    fi
+
+    echo "  ok   $description -> $expected"
 }
 
-# A README whose source-only block names exactly the scripts passed in.
+# A README whose source-only block names exactly the scripts passed in, and
+# whose table gives each one an origin step the fixture workflow defines.
+#
+# `ORIGIN_OVERRIDE` replaces the origin cell of every row, so a case can aim a
+# stale or unquoted value at check 3 without rebuilding the README by hand.
+ORIGIN_OVERRIDE=""
 readme_naming() {
-    local rows="" name
+    local rows="" table="" name origin
+    # Spelled out rather than as `${ORIGIN_OVERRIDE:-...}`: check 2 of the lint
+    # under test reads a name used in a `:-` expansion as an environment input
+    # by design, which would move this self-test out of the source-only set it
+    # belongs in -- and the lint would then correctly fail on its own README.
+    if [[ -n $ORIGIN_OVERRIDE ]]; then
+        origin="$ORIGIN_OVERRIDE"
+    else
+        origin="\"$DEFAULT_STEP\""
+    fi
     for name in "$@"; do
         rows+="- \`$name\` takes an optional positional directory"$'\n'
+        table+="| \`$name\` | what it checks | $origin |"$'\n'
     done
-    printf '%s\n\n%s\n%s%s\n' \
+    printf '%s\n\n| Script | What it checks | Origin in ci.yml |\n|---|---|---|\n%s\n%s\n%s%s\n' \
         "Every script but the source-only lints reads its inputs from the environment." \
+        "$table" \
         "$BEGIN_MARKER" "$rows" "$END_MARKER"
 }
 
@@ -212,7 +269,133 @@ payload='\${BWA_MEM3:?BWA_MEM3 must be set}'
 echo \"\$label \$payload\" > /dev/null
 echo \"PASS: fixture\"")"
 
+echo "== the ci.yml origin column ==" # check 3
+
+# The drift this check was added for: two rows named steps that no longer
+# existed, because a PR merged the two steps they described into one and only
+# the workflow was updated. A reader following the column looks for a step name
+# that is not there.
+ORIGIN_OVERRIDE='"A step no workflow defines"'
+check_tree "origin column names a step ci.yml does not define" FLAG \
+    "$(make_tree stale-origin "$(readme_naming lint.sh)" \
+        "lint.sh:$SOURCE_ONLY_SCRIPT")"
+
+# An unquoted cell is rejected rather than skipped: a row that opts out of the
+# check silently is how the column rots again.
+ORIGIN_OVERRIDE='Run the regression scripts'
+check_tree "origin cell that is not quoted is rejected" FLAG \
+    "$(make_tree unquoted-origin "$(readme_naming lint.sh)" \
+        "lint.sh:$SOURCE_ONLY_SCRIPT")"
+
+# An empty pair of quotes names no step, so it belongs with the unquoted cells
+# rather than downstream, where the name strips to an empty grep pattern and is
+# reported as a blank line under a heading about missing steps. Both branches
+# exit 1, so the branch is named: on the verdict alone this case reads green
+# against a lint that still routes the cell the wrong way.
+ORIGIN_OVERRIDE='""'
+check_tree "origin cell holding an empty pair of quotes is rejected" FLAG \
+    "$(make_tree empty-origin "$(readme_naming lint.sh)" \
+        "lint.sh:$SOURCE_ONLY_SCRIPT")" \
+    "does not hold a"
+ORIGIN_OVERRIDE=""
+
+# The column names a *step*, not a job. A job name would let a row point at
+# something that runs no script, so it must not satisfy the check.
+ORIGIN_OVERRIDE="\"$FIXTURE_JOB_NAME\""
+check_tree "a job name does not satisfy the origin column" FLAG \
+    "$(make_tree job-name-origin "$(readme_naming lint.sh)" \
+        "lint.sh:$SOURCE_ONLY_SCRIPT")"
+ORIGIN_OVERRIDE=""
+
+# The README has more than one three-column table, and the other one's third
+# column holds a script name rather than a step name. Locating the table by
+# position instead of by its header reads those rows as origins and reports
+# every one of them as a step that does not exist.
+check_tree "a second table is not read as origins" PASS \
+    "$(make_tree second-table "$(readme_naming lint.sh)
+
+| Lint | Positional argument | Self-test |
+|------|---------------------|-----------|
+| \`lint.sh\` | directory to scan | \`lint.sh\` |" \
+        "lint.sh:$SOURCE_ONLY_SCRIPT")"
+
+# A data cell may contain three hyphens. Recognising the separator row by
+# "contains ---" rather than by its shape drops such a row from the check and
+# from the row count -- a row opting out of check 3 in silence, which is what an
+# unquoted cell is rejected for two cases above. Only the second row here is
+# stale, so the case can only reach FLAG if that row was read.
+emdash_readme="$(
+    cat << EOF
+Every script but the source-only lints reads its inputs from the environment.
+
+| Script | What it checks | Origin in ci.yml |
+|---|---|---|
+| \`lint.sh\` | a plain cell | "$DEFAULT_STEP" |
+| \`other.sh\` | a cell holding --- three hyphens | "A step no workflow defines" |
+
+$BEGIN_MARKER
+- \`lint.sh\` takes an optional positional directory
+- \`other.sh\` takes an optional positional directory
+$END_MARKER
+EOF
+)"
+check_tree "a data cell holding --- is still read as a row" FLAG \
+    "$(make_tree emdash-cell "$emdash_readme" \
+        "lint.sh:$SOURCE_ONLY_SCRIPT" "other.sh:$SOURCE_ONLY_SCRIPT")"
+
+# YAML's quoting is not part of the step name. A name containing `: ` cannot be
+# written unquoted at all, so a check that compares the quoted spelling reports
+# a step the workflow plainly defines as missing -- and tells the reader to fix
+# a column that is already correct.
+FIXTURE_STEPS='"Regression: option validation"'
+ORIGIN_OVERRIDE='"Regression: option validation"'
+check_tree "a double-quoted step name satisfies the column" PASS \
+    "$(make_tree double-quoted-step "$(readme_naming lint.sh)" \
+        "lint.sh:$SOURCE_ONLY_SCRIPT")"
+
+FIXTURE_STEPS="'Regression: single quoted'"
+ORIGIN_OVERRIDE='"Regression: single quoted"'
+check_tree "a single-quoted step name satisfies the column" PASS \
+    "$(make_tree single-quoted-step "$(readme_naming lint.sh)" \
+        "lint.sh:$SOURCE_ONLY_SCRIPT")"
+FIXTURE_STEPS=""
+ORIGIN_OVERRIDE=""
+
+# The header string is not unique in the file: the real README quotes it inside
+# the row that describes this very check. Locating the table with a plain match
+# takes the first prose mention instead and reports the table under it as empty.
+check_tree "the column header named in prose above the table" PASS \
+    "$(make_tree prose-header "$(printf '%s\n\n%s\n' \
+        "The Origin in ci.yml column names the step that runs each script." \
+        "$(readme_naming lint.sh)")" \
+        "lint.sh:$SOURCE_ONLY_SCRIPT")"
+
 echo "== a lint that checked nothing must not report PASS =="
+
+no_workflows_dir="$(make_tree no-workflows "$(readme_naming lint.sh)" \
+    "lint.sh:$SOURCE_ONLY_SCRIPT")"
+rm -rf "$no_workflows_dir/.github"
+check_tree "no workflows directory" FLAG "$no_workflows_dir"
+
+empty_workflow_dir="$(make_tree empty-workflow "$(readme_naming lint.sh)" \
+    "lint.sh:$SOURCE_ONLY_SCRIPT")"
+printf 'jobs: {}\n' > "$empty_workflow_dir/.github/workflows/ci.yml"
+check_tree "workflow defining no steps" FLAG "$empty_workflow_dir"
+
+# A README with no origin table at all leaves check 3 with nothing to compare,
+# which is the same green-while-doing-no-work state the rest of this block
+# guards against.
+#
+# Named rather than left to the status, because the header search is a grep
+# pipeline: with no table to match, an unguarded grep exits 1 and `pipefail`
+# carries that out of the command substitution, killing the script on the
+# assignment with exit 1 -- the same status this branch reports, and no message
+# at all. Status alone reads FLAG either way.
+check_tree "README with no origin table" FLAG \
+    "$(make_tree no-origin-table "$(printf '%s\n\n%s\n- %s takes a directory\n%s\n' \
+        "Prose naming lint.sh but carrying no table." "$BEGIN_MARKER" "lint.sh" "$END_MARKER")" \
+        "lint.sh:$SOURCE_ONLY_SCRIPT")" \
+    "no table column headed 'Origin in ci.yml'"
 
 no_readme_dir="$(make_tree no-readme "$(readme_naming lint.sh)" \
     "lint.sh:$SOURCE_ONLY_SCRIPT")"

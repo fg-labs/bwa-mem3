@@ -17,7 +17,7 @@
 #     single job that ran them.
 #
 # Both were caught by a human reading the file for an unrelated reason. This
-# lint makes the two claims that actually drifted checkable:
+# lint makes the three claims that actually drifted checkable:
 #
 #   1. Every test/regression/*.sh the README names still exists. The reverse --
 #      requiring every script to appear -- is deliberately NOT checked: the
@@ -32,6 +32,14 @@
 #      named in the README's source-only-lint block. Add a lint and forget the
 #      prose, or give an existing lint an env var without moving it out, and
 #      this fails.
+#
+#   3. Every row of the table names a CI step that a workflow actually defines.
+#      This one drifted too, and in the same direction: two rows named steps
+#      that did not exist, because a later change merged the two steps they
+#      described into a single step and only the workflow was updated. The
+#      column exists to send a reader to the step that runs the script, so a
+#      name that is not in any workflow is a broken reference -- check 1's
+#      failure with the two sides swapped.
 #
 # Check 2 needs to know where the claim lives, so the README marks it:
 #
@@ -347,8 +355,155 @@ if ((${#wrongly_in_block[@]} > 0)); then
     failures=1
 fi
 
+# --- Check 3: the table's "Origin in ci.yml" column names real steps. -------
+
+# The table's third column quotes the name of the CI step that runs each
+# script. Nothing kept it honest, and it drifted: two rows named steps that did
+# not exist, because a later PR merged the two steps they described into one
+# and only the workflow was updated. The column then sends a reader to a step
+# name they cannot find, which is the same broken reference check 1 catches in
+# the other direction.
+#
+# The table is located by its header rather than by position, so the README can
+# grow other tables without this check wandering into them -- the lint block
+# further down has three columns too, and its third is a script name.
+workflow_dir=".github/workflows"
+column_header='Origin in ci.yml'
+
+if [[ ! -d $workflow_dir ]]; then
+    echo "FAIL: no $workflow_dir/ under $PWD -- check 3 cannot verify step names" >&2
+    exit 1
+fi
+
+workflow_files=()
+while IFS= read -r file; do
+    [[ -n $file ]] && workflow_files+=("$file")
+done < <(find "$workflow_dir" -type f \( -name '*.yml' -o -name '*.yaml' \) | sort)
+
+if ((${#workflow_files[@]} == 0)); then
+    echo "FAIL: no workflow files under $workflow_dir/ -- check 3 cannot verify" >&2
+    echo "      step names" >&2
+    exit 1
+fi
+
+# Step names only (`- name:`), not job names: the column names steps, and a job
+# name would let a row point at something that runs no script.
+#
+# `|| true` on the grep, because a workflow set that defines no steps at all is
+# a state this check reports itself, below, with a message that says so. Left to
+# fail, `set -o pipefail` propagates grep's exit 1 out of the substitution and
+# the script dies on it instead -- as 123 under GNU xargs and 1 under BSD, which
+# is how the self-test case for this came to pass locally and fail in CI while
+# never once reaching the branch it was written to exercise.
+#
+# The last two expressions drop YAML's optional quoting around the value. A step
+# name containing `: ` has to be written `- name: "Regression: option
+# validation"` or YAML reads it as a nested mapping, and comparing that spelling
+# against the README's bare name reports a step the workflow plainly defines as
+# missing -- with a remediation line telling the reader to correct a column that
+# is already right.
+step_names="$({ grep -hE '^[[:space:]]*-[[:space:]]+name:[[:space:]]' \
+    "${workflow_files[@]}" || true; } \
+    | sed -E -e 's/^[[:space:]]*-[[:space:]]+name:[[:space:]]*//' \
+        -e 's/[[:space:]]+$//' \
+        -e 's/^"(.*)"$/\1/' \
+        -e "s/^'(.*)'\$/\1/" \
+    | sort -u)"
+
+if [[ -z $step_names ]]; then
+    echo "FAIL: no '- name:' steps found under $workflow_dir/ -- check 3 detected" >&2
+    echo "      nothing, which means it is no longer checking" >&2
+    exit 1
+fi
+
+# Table rows only. The header string is not unique in the file: the table's own
+# row for this lint quotes it while describing what check 3 does, and prose is
+# free to name the column too. The row is below the header so `head -1` gets
+# past it either way, but a sentence naming the column *above* the table would
+# otherwise be taken for the header, and the row loop then finds no rows under
+# it and reports a table that is fine as empty.
+#
+# `|| true` for the same reason as the step-name grep above: a README carrying
+# no such table is the state the next branch reports, but an unguarded grep
+# exits 1 and `set -o pipefail` carries that out of the substitution, killing
+# the script on this assignment before it can say so.
+header_line="$({ grep -nE "^\|.*$column_header" "$readme" || true; } \
+    | head -1 | cut -d: -f1)"
+if [[ -z $header_line ]]; then
+    echo "FAIL: $readme has no table column headed '$column_header'" >&2
+    echo "      -- check 3 cannot locate the table" >&2
+    exit 1
+fi
+
+# Rows run from the separator line under the header to the first line that is
+# no longer a table row.
+#
+# The separator is matched by shape -- a line of nothing but pipes, hyphens,
+# colons and spaces -- rather than by "contains ---". A data cell is free to
+# contain three hyphens, and the loose test drops that row from both the check
+# and row_count: a row opting out of check 3 in silence, which is the thing
+# check 3 exists to prevent.
+separator_row='^\|[[:space:]:|-]+$'
+origins=()
+row_count=0
+while IFS= read -r line; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    [[ $line == '|'* ]] || break
+    [[ $line =~ $separator_row ]] && continue
+    cell="$(cut -d'|' -f4 <<< "$line")"
+    cell="${cell#"${cell%%[![:space:]]*}"}"
+    cell="${cell%"${cell##*[![:space:]]}"}"
+    row_count=$((row_count + 1))
+    origins+=("$cell")
+done < <(tail -n "+$((header_line + 1))" "$readme")
+
+if ((row_count == 0)); then
+    echo "FAIL: the '$column_header' table in $readme has no rows -- nothing checked" >&2
+    exit 1
+fi
+
+# Every row must quote a step name. An unquoted cell is reported rather than
+# skipped: a row that opts out silently is how the column would rot again.
+#
+# `?*` between the quotes, so an empty `""` lands here rather than downstream. A
+# name stripped to nothing is an empty grep pattern, which reports as a step no
+# workflow defines -- true, but printed as a blank line under a heading that
+# says the column names steps, which tells the reader nothing about which row.
+unquoted=()
+missing_steps=()
+for cell in "${origins[@]}"; do
+    if [[ $cell != '"'?*'"' ]]; then
+        unquoted+=("$cell")
+        continue
+    fi
+    name="${cell%\"}"
+    name="${name#\"}"
+    if ! grep -qxF -- "$name" <<< "$step_names"; then
+        missing_steps+=("$name")
+    fi
+done
+
+if ((${#unquoted[@]} > 0)); then
+    echo "FAIL: rows in the '$column_header' table whose cell does not hold a" >&2
+    echo "      quoted step name:" >&2
+    printf '  %s\n' "${unquoted[@]}" | sort -u >&2
+    echo >&2
+    echo "The column names the ci.yml step that runs the script, in double quotes." >&2
+    failures=1
+fi
+
+if ((${#missing_steps[@]} > 0)); then
+    echo "FAIL: the '$column_header' column in $readme names steps that no workflow" >&2
+    echo "      under $workflow_dir/ defines:" >&2
+    printf '  %s\n' "${missing_steps[@]}" | sort -u >&2
+    echo >&2
+    echo "A reader looking for these in ci.yml will not find them. Update the column" >&2
+    echo "to the step's current name, or add the step." >&2
+    failures=1
+fi
+
 if ((failures != 0)); then
     exit 1
 fi
 
-echo "PASS: readme_contract_lint (${#mentioned[@]} scripts named and present; ${#source_only[@]} source-only)"
+echo "PASS: readme_contract_lint (${#mentioned[@]} scripts named and present; ${#source_only[@]} source-only; $row_count ci.yml step names)"
