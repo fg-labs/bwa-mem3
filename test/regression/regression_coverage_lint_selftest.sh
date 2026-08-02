@@ -150,6 +150,149 @@ run_case "make invoked by path still resolves its target" PASS \
         'check:
 	./test/regression/alpha.sh' alpha)"
 
+# A comment naming a script is not coverage. This is the case that made the
+# check dishonest: a step's comment routinely names the very script the step
+# runs, because the comment is there to explain why it runs. So the coverage
+# outlived the thing producing it -- delete the invocation, keep the comment,
+# and the lint stayed green with nothing running the script.
+run_case "a workflow comment naming a script is not coverage" FAIL \
+    "$(build_fixture 'jobs:
+  build:
+    steps:
+      # runs test/regression/alpha.sh on the canonical row
+      - run: echo hi' \
+        'test:
+	echo nothing' alpha)"
+
+# The same rule on the target-invocation side: a comment mentioning `make check`
+# must not resolve the check recipe and drag its scripts in.
+run_case "a commented-out make invocation does not resolve a target" FAIL \
+    "$(build_fixture 'jobs:
+  build:
+    steps:
+      # we used to run: make check
+      - run: echo hi' \
+        'check:
+	./test/regression/alpha.sh' alpha)"
+
+# Stripping must take the comment and nothing else: a real invocation with a
+# trailing comment on the same line is the normal way these steps are written.
+run_case "an invocation with a trailing comment still counts" PASS \
+    "$(build_fixture 'jobs:
+  build:
+    steps:
+      - run: bash test/regression/alpha.sh  # the canonical row runs this' \
+        'test:
+	echo nothing' alpha)"
+
+# `#` opens a comment only at line start or after whitespace. Inside a token it
+# is just a character, and truncating there would drop real text.
+run_case "a mid-token # does not start a comment" PASS \
+    "$(build_fixture 'jobs:
+  build:
+    steps:
+      - run: curl -o x https://example.invalid/a#frag && bash test/regression/alpha.sh' \
+        'test:
+	echo nothing' alpha)"
+
+# "After whitespace" is not the whole rule for where a word starts. A control
+# operator ends the command before it, so `#` directly after one opens a comment
+# just as it does after a space -- and reading that as a token instead means the
+# commented-out invocation behind it counts, which is this lint's own bug.
+run_case "a comment opened after a control operator is not coverage" FAIL \
+    "$(build_fixture 'jobs:
+  build:
+    steps:
+      - run: echo hi;# bash test/regression/alpha.sh' \
+        'test:
+	echo nothing' alpha)"
+
+# The other direction, and the reason the rule cannot just add `;&|()` to the
+# set of characters a comment may follow: inside a quoted string `#` is a
+# literal, whatever precedes it. Truncating there drops the real invocation
+# after it and reports a script that CI does run as uncovered.
+run_case "a # inside a quoted string does not start a comment" PASS \
+    "$(build_fixture 'jobs:
+  build:
+    steps:
+      - run: echo "counted # of reads" && bash test/regression/alpha.sh' \
+        'test:
+	echo nothing' alpha)"
+
+# A backslash escapes the character after it, which matters exactly once: an
+# escaped quote inside a quoted string must not close it. Read as a closing
+# quote, the rest of the line is outside quotes, the `#` after it opens a
+# comment, and the real invocation behind that is dropped -- a script CI does
+# run reported as uncovered.
+#
+# Spelled with an escaped quote rather than the more obvious `echo hi \# bash
+# alpha.sh`, which does not test this at all: there the `#` is preceded by a
+# backslash, which is not a word boundary, so the word-start rule alone keeps
+# the line whole and the case passes with escape handling deleted. Deleting it
+# turns this case red, which is the only reason to write it down.
+run_case "an escaped quote does not close a quoted string" PASS \
+    "$(build_fixture 'jobs:
+  build:
+    steps:
+      - run: printf "a\"b # c" && bash test/regression/alpha.sh' \
+        'test:
+	echo nothing' alpha)"
+
+# An apostrophe in prose is not an opening quote. Reading it as one would leave
+# the rest of the line quoted, so the comment after it never strips and the
+# script it names counts -- the silent direction of being wrong, reached by a
+# step name that is merely written in English.
+run_case "an apostrophe does not quote the rest of the line" FAIL \
+    "$(build_fixture "jobs:
+  build:
+    steps:
+      - name: Don't rebuild  # bash test/regression/alpha.sh
+        run: echo hi" \
+        'test:
+	echo nothing' alpha)"
+
+# Pairing alone is not enough to keep a prose apostrophe from quoting the line,
+# because the partner it finds may be a second prose apostrophe on the far side
+# of the comment. Here `Don't` pairs with `it's`, the `#` between them lands
+# inside the quoted run, the comment survives stripping, and the script it names
+# counts as covered -- the whole defect this lint was changed to remove, reached
+# through a step name and a comment both merely written in English. So a quote
+# must start a word as well as pair.
+run_case "a comment between two prose apostrophes is not coverage" FAIL \
+    "$(build_fixture "jobs:
+  build:
+    steps:
+      - name: Don't rebuild  # runs test/regression/alpha.sh when it's stale
+        run: echo hi" \
+        'test:
+	echo nothing' alpha)"
+
+# Word start is not the whole guard either. A lone apostrophe after whitespace
+# starts a word, so only the same-line partner rule keeps it from opening a run
+# that swallows the comment behind it. Without this case nothing pins that rule:
+# every other quoted case here is decided by word start before pairing is
+# consulted, so pairing could be deleted and the suite would stay green.
+run_case "a lone apostrophe with no partner does not open a quoted run" FAIL \
+    "$(build_fixture "jobs:
+  build:
+    steps:
+      - name: The ' character  # bash test/regression/alpha.sh
+        run: echo hi" \
+        'test:
+	echo nothing' alpha)"
+
+# The other direction of the word-start rule: a real opening quote follows
+# whitespace or punctuation, never a letter or digit, and must still open. An
+# `=` before it is the common spelling in these steps, and the `#` it protects
+# has to stay a literal so the invocation after it survives.
+run_case "a quote after punctuation still opens a quoted run" PASS \
+    "$(build_fixture 'jobs:
+  build:
+    steps:
+      - run: grep --regexp='"'"'a # b'"'"' x || bash test/regression/alpha.sh' \
+        'test:
+	echo nothing' alpha)"
+
 run_case "referenced nowhere at all" FAIL \
     "$(build_fixture 'jobs:
   build:
