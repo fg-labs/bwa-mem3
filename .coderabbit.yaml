@@ -42,15 +42,16 @@ reviews:
   estimate_code_review_effort: true
   enable_prompt_for_ai_agents: true
 
-  # Review PRs targeting the `fg-main` integration branch in addition to the
-  # repository's default branch (`main`). The default branch is always reviewed;
-  # this list adds extra base branches. Without it, CodeRabbit posts "auto
-  # reviews are disabled on base/target branches other than the default branch"
-  # and skips stacked PRs.
+  # Base branches whose PRs are auto-reviewed. This list REPLACES the default
+  # (the repository's default branch) rather than extending it, so `main` must
+  # be listed explicitly — omitting it made CodeRabbit post "auto reviews are
+  # disabled on base/target branches other than the default branch" and skip
+  # every PR in the repo. `fg-main` is the integration branch stacked PRs target.
   auto_review:
     enabled: true
     drafts: false
     base_branches:
+      - "main"
       - "fg-main"
 
   # Don't spend review budget on vendored submodules, build output, committed
