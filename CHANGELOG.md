@@ -1,5 +1,95 @@
 # Changelog
 
+## [0.8.0](https://github.com/fg-labs/bwa-mem3/compare/v0.7.0...v0.8.0) (2026-08-03)
+
+
+### ⚠ BREAKING CHANGES
+
+* **meth:** `bwa-mem3 mem --meth` now writes SAM text instead of BAM. Add `--bam` to any script that depended on the old behavior. Pipelines that pipe into samtools need no change — samtools autodetects SAM text.
+
+### Features
+
+* **bam:** warn that in-process compressed BAM is single-threaded ([#287](https://github.com/fg-labs/bwa-mem3/issues/287)) ([9cd414d](https://github.com/fg-labs/bwa-mem3/commit/9cd414dcfd4f98b75f1fb71f570a769143455923))
+* **mem:** --compat target enum with record + header byte-identity to bwa-mem2 ([#277](https://github.com/fg-labs/bwa-mem3/issues/277)) ([265b427](https://github.com/fg-labs/bwa-mem3/commit/265b42769731b09d8cca1221148c5f2be98faeb6))
+* **mem:** band mate rescue to a k-mer anchor diagonal (--rescue-kmer) ([#335](https://github.com/fg-labs/bwa-mem3/issues/335)) ([6ce2b70](https://github.com/fg-labs/bwa-mem3/commit/6ce2b70509446c874fb7f6bd037bd6553e0a1e23))
+* **meth:** add --meth-tags to select which Bismark tags are emitted ([#333](https://github.com/fg-labs/bwa-mem3/issues/333)) ([3ec4500](https://github.com/fg-labs/bwa-mem3/commit/3ec4500fc3e26c9e3140db1c0d4aa81fd84d1f8d)), closes [#331](https://github.com/fg-labs/bwa-mem3/issues/331)
+* **meth:** let --bam choose the output container under --meth ([#341](https://github.com/fg-labs/bwa-mem3/issues/341)) ([ed4400c](https://github.com/fg-labs/bwa-mem3/commit/ed4400c5f09302160366403789eddbcf7d41a5f5))
+
+
+### Bug Fixes
+
+* **bntseq:** don't poison the pac-fetch buffer in release builds ([#263](https://github.com/fg-labs/bwa-mem3/issues/263)) ([1252f1b](https://github.com/fg-labs/bwa-mem3/commit/1252f1bf4245fa4f2245c64157109e6cc17bd88e))
+* **bsw:** compute the 8-bit band clamp in wide arithmetic ([#270](https://github.com/fg-labs/bwa-mem3/issues/270)) ([00ade6d](https://github.com/fg-labs/bwa-mem3/commit/00ade6d9930bf4d5bf0609dd3480b58b4fee7509))
+* **bsw:** correct 8-bit banded-SW z-drop and seed clamp at high seed scores (all tiers) ([#273](https://github.com/fg-labs/bwa-mem3/issues/273)) ([e722ed0](https://github.com/fg-labs/bwa-mem3/commit/e722ed06dd71d0186c401ce2f0e163d32b0a7ad7))
+* **build:** generate header dependencies instead of a hand-maintained list ([#299](https://github.com/fg-labs/bwa-mem3/issues/299)) ([414ac7e](https://github.com/fg-labs/bwa-mem3/commit/414ac7e614db17a3564ae5f9cfdab4f5e6d54ad4))
+* **chain:** keep sizeof(mem_chain_t) at 48 B to preserve bwa-mem2 chaining parity ([#268](https://github.com/fg-labs/bwa-mem3/issues/268)) ([a9d9445](https://github.com/fg-labs/bwa-mem3/commit/a9d9445cb984115887184e5bdb0a5ddc41e74708))
+* check debug_macro_flag_lint's directory argument before cd ([#352](https://github.com/fg-labs/bwa-mem3/issues/352)) ([14d8096](https://github.com/fg-labs/bwa-mem3/commit/14d8096fec6e657e6008044267354f57c42c3fea))
+* **coderabbit:** list main in auto_review.base_branches ([#358](https://github.com/fg-labs/bwa-mem3/issues/358)) ([63add93](https://github.com/fg-labs/bwa-mem3/commit/63add93a2a2cc2f02f216ff4ddbf1cb07ede634d))
+* **header:** emit one default @HD on every output path ([#291](https://github.com/fg-labs/bwa-mem3/issues/291)) ([56889e1](https://github.com/fg-labs/bwa-mem3/commit/56889e1f5733b72f333fa12faf0ea82157f92d3f)), closes [#288](https://github.com/fg-labs/bwa-mem3/issues/288)
+* **index:** cap each pread() at 1GiB so large indexes load on macOS ([#259](https://github.com/fg-labs/bwa-mem3/issues/259)) ([1db6697](https://github.com/fg-labs/bwa-mem3/commit/1db6697cb5456a5905c1e7ce736f4f4d63431334))
+* **index:** resolve the auto memory budget from the host, not a 32 GiB cap ([#300](https://github.com/fg-labs/bwa-mem3/issues/300)) ([a8ac368](https://github.com/fg-labs/bwa-mem3/commit/a8ac3683c521bd7f388bb201f75b9a23af1280d4))
+* **kswv:** zero query padding in the NEON and AVX-512BW 8-bit mate-rescue kernels ([#290](https://github.com/fg-labs/bwa-mem3/issues/290)) ([b8d5aa3](https://github.com/fg-labs/bwa-mem3/commit/b8d5aa38856d7149bcdf9161a1d5ca38ec5a5bdc))
+* **mem:** guard allocations with xassert so OOM checks survive NDEBUG ([#312](https://github.com/fg-labs/bwa-mem3/issues/312)) ([8898782](https://github.com/fg-labs/bwa-mem3/commit/88987823179e8aa179a53d15b8743fa17f22b947))
+* **mem:** make the batch-size cap opt-in so default batching matches bwa-mem2 ([#298](https://github.com/fg-labs/bwa-mem3/issues/298)) ([5a85305](https://github.com/fg-labs/bwa-mem3/commit/5a85305fee874ba16aa3e47d10eedbf4e7ea248e))
+* **meth:** derive NM/MD from the scoring matrix so conversions are not counted ([#332](https://github.com/fg-labs/bwa-mem3/issues/332)) ([6aa4675](https://github.com/fg-labs/bwa-mem3/commit/6aa4675636673d94fdbbe768671e4ff56e4cad07)), closes [#327](https://github.com/fg-labs/bwa-mem3/issues/327)
+* **meth:** diagnose orphaned --meth/--meth-tags values instead of aligning to them ([#334](https://github.com/fg-labs/bwa-mem3/issues/334)) ([a18b19b](https://github.com/fg-labs/bwa-mem3/commit/a18b19bf48a45d1bfb303645b04e73f458365743)), closes [#331](https://github.com/fg-labs/bwa-mem3/issues/331)
+* **meth:** emit MQ:i and HN:i from the --meth BAM writer ([#304](https://github.com/fg-labs/bwa-mem3/issues/304)) ([70d1270](https://github.com/fg-labs/bwa-mem3/commit/70d1270666b3d50d5a51c94b795a7570cd28531a)), closes [#296](https://github.com/fg-labs/bwa-mem3/issues/296)
+* **meth:** reject mate rescues whose SW alignment runs past the read ([#258](https://github.com/fg-labs/bwa-mem3/issues/258)) ([6ecc61b](https://github.com/fg-labs/bwa-mem3/commit/6ecc61b30a3a38c225cd7641de4ae7ed372e25fa))
+* **sam:** make the SAM-A9 rid check opt-in so the recompute is skipped ([#330](https://github.com/fg-labs/bwa-mem3/issues/330)) ([87f3bd6](https://github.com/fg-labs/bwa-mem3/commit/87f3bd6b56eac5b01b97e496fd5730106f52a6b0))
+* **simd:** map _MM_HINT_T0 to L1, not L3, on arm64 ([#262](https://github.com/fg-labs/bwa-mem3/issues/262)) ([34cb389](https://github.com/fg-labs/bwa-mem3/commit/34cb3891d5afd773279900b8428d0b5bf956a921))
+
+
+### Performance
+
+* **bntseq:** O(1) contig bucket table for bns_pos2rid ([#275](https://github.com/fg-labs/bwa-mem3/issues/275)) ([e0291ec](https://github.com/fg-labs/bwa-mem3/commit/e0291ec3a352e79b3dcd16a254f4ea6ce451313c))
+* **bntseq:** unpack the 2-bit reference with a byte-&gt;4-base LUT ([#274](https://github.com/fg-labs/bwa-mem3/issues/274)) ([a9b570f](https://github.com/fg-labs/bwa-mem3/commit/a9b570fb302b5b365612164b85ddad6339b1b28c))
+* **bsw:** admit high-h0 pairs to the 8-bit banded-SW tier ([#321](https://github.com/fg-labs/bwa-mem3/issues/321)) ([35f3238](https://github.com/fg-labs/bwa-mem3/commit/35f3238c1f4d52d2b0e94fc037db68a22d6314f6))
+* **bsw:** drop a redundant compare in the 8-bit row argmax ([#266](https://github.com/fg-labs/bwa-mem3/issues/266)) ([ed34d5d](https://github.com/fg-labs/bwa-mem3/commit/ed34d5d9787313aab2ed012dcce1a8ec04870f76))
+* **bsw:** fuse the SBT pre-pass into the 8-bit DP loop with two LUTs ([#280](https://github.com/fg-labs/bwa-mem3/issues/280)) ([94cbdf2](https://github.com/fg-labs/bwa-mem3/commit/94cbdf271a08c70ebf20abe645b412df33bc8ff5))
+* **bsw:** pack the int8 lane groups by max(len1,len2) ([#283](https://github.com/fg-labs/bwa-mem3/issues/283)) ([7898254](https://github.com/fg-labs/bwa-mem3/commit/78982548c6b306daaea945a9333a70390ea34fb2))
+* **chain:** hoist chain bounds and memoize the per-chain log() ([#265](https://github.com/fg-labs/bwa-mem3/issues/265)) ([7703634](https://github.com/fg-labs/bwa-mem3/commit/7703634884c5cc7c70f1479b121c2782ce527932))
+* **chain:** skip side-effect-free comparisons in mem_chain_flt ([#326](https://github.com/fg-labs/bwa-mem3/issues/326)) ([6ca3c7e](https://github.com/fg-labs/bwa-mem3/commit/6ca3c7ef6bea30f09f927867bcf145c8cd20b9de))
+* **io:** pool per-read string fields in a per-chunk arena ([#293](https://github.com/fg-labs/bwa-mem3/issues/293)) ([c63eba0](https://github.com/fg-labs/bwa-mem3/commit/c63eba080791c864e95000aa979b9733cfb7ec02))
+* **kswv:** recover the query end after the row, via block checkpoints ([#328](https://github.com/fg-labs/bwa-mem3/issues/328)) ([f099e79](https://github.com/fg-labs/bwa-mem3/commit/f099e79d1c4e0cf2f06b00fe23ee60f013f20ba2))
+* **kswv:** stop testing for query padding on columns that cannot have any ([#324](https://github.com/fg-labs/bwa-mem3/issues/324)) ([90be8df](https://github.com/fg-labs/bwa-mem3/commit/90be8df08bb2823b95dfa27897da92c08c17e7d9))
+* **main:** calibrate proc_freq without sleeping a full second ([#295](https://github.com/fg-labs/bwa-mem3/issues/295)) ([052a84a](https://github.com/fg-labs/bwa-mem3/commit/052a84a20f229a915592f975181de9eaf4bf7ff2))
+* **mem:** fuse the seed and extend kt_for passes ([#264](https://github.com/fg-labs/bwa-mem3/issues/264)) ([d4127e9](https://github.com/fg-labs/bwa-mem3/commit/d4127e9cb7a02b8b033402d622954d183c71d656))
+* **mem:** read a pestat cohort in slices so compute starts sooner ([#305](https://github.com/fg-labs/bwa-mem3/issues/305)) ([212ed34](https://github.com/fg-labs/bwa-mem3/commit/212ed34d3a0254db78e7a7db3c029582f53e65d7))
+* **mem:** reserve the cohort accumulator from task_size instead of doubling ([#342](https://github.com/fg-labs/bwa-mem3/issues/342)) ([80e40ad](https://github.com/fg-labs/bwa-mem3/commit/80e40ad351c41a1a23e4c7a8278cdee809e57b56))
+* **mem:** size chaining scratch per thread instead of per read ([#297](https://github.com/fg-labs/bwa-mem3/issues/297)) ([3d66be4](https://github.com/fg-labs/bwa-mem3/commit/3d66be4da53acea114cf45de25c347c798e70f6a))
+* **mem:** size the cohort ramp so it cannot outrun the reader ([#315](https://github.com/fg-labs/bwa-mem3/issues/315)) ([160adae](https://github.com/fg-labs/bwa-mem3/commit/160adae9b418adcf320247a016bb9caea3a186f0))
+* **mem:** size the per-chunk read pool from the actual read count ([#279](https://github.com/fg-labs/bwa-mem3/issues/279)) ([3848339](https://github.com/fg-labs/bwa-mem3/commit/3848339b55706bcece1fc18ccbc884ed27651448))
+* **meth:** share the generic writer's per-record scratch with the meth writer ([#306](https://github.com/fg-labs/bwa-mem3/issues/306)) ([8fade15](https://github.com/fg-labs/bwa-mem3/commit/8fade150e18195fd863d7bdda9b07a07684b5607))
+* **rescue:** drop redundant mate-query copies in batched mate-SW ([#284](https://github.com/fg-labs/bwa-mem3/issues/284)) ([32f17e5](https://github.com/fg-labs/bwa-mem3/commit/32f17e5809fa744a0d74d20d24365d45b893d8bb))
+* **rescue:** single-position anchor index, plus an opt-in --rescue-skip gate ([#349](https://github.com/fg-labs/bwa-mem3/issues/349)) ([e7e00af](https://github.com/fg-labs/bwa-mem3/commit/e7e00af4471a6f400a34346cf868016223f5e8a8))
+* **sam,seed:** micro-cleanups in SAM formatting and seeding ([#286](https://github.com/fg-labs/bwa-mem3/issues/286)) ([82257ab](https://github.com/fg-labs/bwa-mem3/commit/82257abcf33a6056c49490e444165d48ee803973))
+* **seed:** correct the FM-index checkpoint prefetch targets ([#267](https://github.com/fg-labs/bwa-mem3/issues/267)) ([6455cad](https://github.com/fg-labs/bwa-mem3/commit/6455cadea07e60859740b3174ebb79fbfd397ed2))
+* **seed:** reuse sortSMEMs counting-sort scratch across batches ([#278](https://github.com/fg-labs/bwa-mem3/issues/278)) ([394f8f8](https://github.com/fg-labs/bwa-mem3/commit/394f8f8110f7d15be7ef2ca38c335590aa1e0284))
+* **sort:** move the pdqsort/total-order dedup sort behind --fast ([#257](https://github.com/fg-labs/bwa-mem3/issues/257)) ([34b3446](https://github.com/fg-labs/bwa-mem3/commit/34b34466bce9412842d7eed1da3c772d38bad87d))
+* **sort:** run pdqsort in the dedup sorts when the comparator sees no tie ([#261](https://github.com/fg-labs/bwa-mem3/issues/261)) ([7481c4f](https://github.com/fg-labs/bwa-mem3/commit/7481c4ffa7ac9a1a55b249fd0f7269b5e4c38f9b))
+
+
+### Refactoring
+
+* **bsw:** derive extension gaps from M again (bwa-mem2 compatibility) ([#256](https://github.com/fg-labs/bwa-mem3/issues/256)) ([771376e](https://github.com/fg-labs/bwa-mem3/commit/771376e3839275910704972d9a1a1915766b1eec))
+* **bsw:** drop the unreachable 8-bit re-baselining in the AVX2/AVX-512 kernels ([#272](https://github.com/fg-labs/bwa-mem3/issues/272)) ([f1a0da6](https://github.com/fg-labs/bwa-mem3/commit/f1a0da65bab8f1cdca2192b9e56671767df0cabd))
+* **bsw:** drop the unreachable 8-bit score re-baselining ([#271](https://github.com/fg-labs/bwa-mem3/issues/271)) ([ecebf2b](https://github.com/fg-labs/bwa-mem3/commit/ecebf2b34fb26bdddd212007bf58b25cf893032e))
+* **chain:** fuse mem_chain_weight's two seed sweeps into one ([#322](https://github.com/fg-labs/bwa-mem3/issues/322)) ([500c9cb](https://github.com/fg-labs/bwa-mem3/commit/500c9cbcb3a62c023673c58fdc5cc985619dc4f8))
+* **chain:** remove dead work from the chaining path ([#285](https://github.com/fg-labs/bwa-mem3/issues/285)) ([8de7e5b](https://github.com/fg-labs/bwa-mem3/commit/8de7e5bb91229b7b6efb9684d82f0cb6d22f4c4f))
+* **chain:** tidy mem_chain_flt's filter loops ([#323](https://github.com/fg-labs/bwa-mem3/issues/323)) ([095b401](https://github.com/fg-labs/bwa-mem3/commit/095b401be04aa65348b5f65da7438f0347e3edc1))
+* **header:** one generated-@SQ builder, one scanner, one record iterator ([#292](https://github.com/fg-labs/bwa-mem3/issues/292)) ([37e5e4a](https://github.com/fg-labs/bwa-mem3/commit/37e5e4a6a18c66ed3e4be5e818a4b57f5dafff86))
+* **meth:** name the native-regen decision and document the hypothesis invariant ([#337](https://github.com/fg-labs/bwa-mem3/issues/337)) ([97eb3be](https://github.com/fg-labs/bwa-mem3/commit/97eb3be3a92c3f5963b41e1ad0cfef6a5aeaa55c))
+
+
+### Documentation
+
+* correct the developer guide's account of the source-only lints ([#354](https://github.com/fg-labs/bwa-mem3/issues/354)) ([a8825f5](https://github.com/fg-labs/bwa-mem3/commit/a8825f52a59a8abe4eed9673c1c3e77a33c046ff))
+* **equivalence:** reflect restored bwa-mem2 byte-identity on the drop-in profile ([#276](https://github.com/fg-labs/bwa-mem3/issues/276)) ([8dbf218](https://github.com/fg-labs/bwa-mem3/commit/8dbf218adeeb1215e04619d921bbec18e0746d6f))
+* **kswv:** the phase-1 boundary-mask cost is measured now, not unmeasurable ([#308](https://github.com/fg-labs/bwa-mem3/issues/308)) ([136cc9f](https://github.com/fg-labs/bwa-mem3/commit/136cc9ffac6ce857933b9bd7850549402e63de47))
+* **memory:** measure the -t batch multiplier cost and correct the resident index figure ([#319](https://github.com/fg-labs/bwa-mem3/issues/319)) ([804f20b](https://github.com/fg-labs/bwa-mem3/commit/804f20bd41b806af4873325583681a0bc1bad1dc))
+* **test:** describe the source-only lints' input contract ([#339](https://github.com/fg-labs/bwa-mem3/issues/339)) ([de77830](https://github.com/fg-labs/bwa-mem3/commit/de77830153e019b829d8f33ccd609e55703e149e))
+* **test:** replace the dead phiX example for running a regression test ([#345](https://github.com/fg-labs/bwa-mem3/issues/345)) ([d3d9a53](https://github.com/fg-labs/bwa-mem3/commit/d3d9a5322123fc45320e017ae52650af19a94cf2))
+
 ## [0.7.0](https://github.com/fg-labs/bwa-mem3/compare/v0.6.0...v0.7.0) (2026-07-23)
 
 
