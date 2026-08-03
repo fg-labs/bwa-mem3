@@ -41,6 +41,27 @@
 #      name that is not in any workflow is a broken reference -- check 1's
 #      failure with the two sides swapped.
 #
+#   4. Every script can emit both of the markers the README requires of it:
+#      "emits `PASS:` on success and `FAIL:` on failure". That bullet had been
+#      in the README since the directory existed and had never been checked,
+#      and three of the forty-three scripts did not honour it --
+#      all_tiers_parity.sh printed "ALL TIERS PARITY: PASS (" with no colon
+#      after PASS, meth_collapsed_scoring.sh ended on a bare `echo "OK"`, and
+#      meth_oracle.sh `exec`d its child and emitted nothing of its own. The
+#      last one matters most: a wrapper that prints no marker looks exactly
+#      like a wrapper that never ran, which is the failure the markers exist
+#      to make visible.
+#
+#      This is a source check, not a runtime one -- it asks whether the
+#      literals are reachable in the file, not whether a given run printed
+#      them. A script that emits PASS: only down a branch this lint cannot
+#      evaluate still satisfies it. That is the same bargain the other lints
+#      here make, and it is enough to catch all three cases above. What it does
+#      not accept is a marker the script cannot print: comments are dropped
+#      first, using the same quote-state walk check 2 needs, because a header
+#      block quoting the contract -- or a `# PASS:` after live code -- is the
+#      one shape a raw substring match reliably gets wrong.
+#
 # Check 2 needs to know where the claim lives, so the README marks it:
 #
 #     <!-- source-only lints: begin -->
@@ -190,27 +211,48 @@ block="$(sed -n "$((begin_line + 1)),$((end_line - 1))p" "$readme")"
 # configuration from its caller, so it still counts as source-only.
 shell_provided_names='^(BASH|BASHPID|BASH_ARGC|BASH_ARGV|BASH_COMMAND|BASH_LINENO|BASH_REMATCH|BASH_SOURCE|BASH_SUBSHELL|BASH_VERSINFO|BASH_VERSION|COLUMNS|EUID|FUNCNAME|GROUPS|HISTFILE|HOME|HOSTNAME|HOSTTYPE|IFS|LINENO|LINES|MACHTYPE|OLDPWD|OPTARG|OPTIND|OSTYPE|PATH|PIPESTATUS|PPID|PS1|PS2|PS4|PWD|RANDOM|REPLY|SECONDS|SHELL|SHLVL|UID)$'
 
-# Emit only the parts of a script where a `$NAME` would actually expand:
-# comments, single-quoted spans, and backslash-escaped dollars are dropped.
+# Walk a script tracking shell quote state, and emit it with the parts the
+# shell would not read as code dropped. Two checks want different parts
+# dropped, but finding either needs the same tracking, so the walk is written
+# once and the difference is one flag:
+#
+#   $2 = 0  keep only where a `$NAME` would expand: comments, single-quoted
+#           spans, and backslash-escaped characters all go (check 2).
+#   $2 = 1  keep everything the script could still print: only comments go,
+#           and both kinds of quoted span keep their contents (check 4).
 #
 # This is the difference between reading a script and grepping it. Two of these
 # scripts hold shell text as data -- fixture bodies for their self-tests --
 # inside single quotes that may run over several lines, so a line-at-a-time
 # filter cannot see where the quote opened. `'${MAKE:-make}'` is a string; the
-# same characters unquoted are an environment read. Tracking the quote state
-# across the whole file is what tells them apart.
+# same characters unquoted are an environment read, and `# PASS:` after live
+# code is a comment where `"# PASS:"` is output. Tracking the quote state
+# across the whole file is what tells each pair apart.
 #
 # Not handled: quoted heredocs (`<<'EOF'`), whose body is also literal. Their
-# contents are still scanned, which can only over-detect inputs -- a script
-# would be kept out of the source-only block rather than slipped into it, so
-# the failure is loud.
-strip_non_expanding() {
+# contents are still scanned as code. For check 2 that can only over-detect
+# inputs -- a script would be kept out of the source-only block rather than
+# slipped into it, so the failure is loud. For check 4 a `#` opening a line of
+# heredoc body is read as a comment, which is what the whole-line filter this
+# replaced did to every heredoc alike.
+#
+# Also not handled: command substitution, whose body re-opens quoting the walk
+# reads as a continuation of the enclosing line. `v="$(mawk -F'"' '/x/' "$f")"`
+# leaves the walk one quote out of step, and every line after it is scanned in
+# the wrong state until something happens to re-balance it. Two scripts in this
+# tree do that today, both self-tests that build fixture scripts. The two checks
+# fail in opposite directions again, and only one of them is loud: check 2 reads
+# quoted text as code and over-detects inputs, while check 4 stops stripping
+# comments and would accept a script that only describes the markers. Neither
+# does so on this tree -- no script's markers come from a comment -- but that is
+# the shape to re-check here if a marker case ever passes when it should not.
+scan_shell_text() {
     # Both quote states are tracked, not just single. A single quote inside a
     # double-quoted string is a literal character and opens nothing -- the
     # `'"'"'` idiom these scripts use to embed a quote is exactly that shape,
     # and reading its quote as an opener inverts the state for the whole rest
     # of the file.
-    awk '
+    awk -v keep_quoted="$2" '
     BEGIN { single = 0; double = 0 }
     {
         line = $0
@@ -221,13 +263,19 @@ strip_non_expanding() {
             c = substr(line, i, 1)
             if (single) {
                 if (c == "\047") single = 0
+                else if (keep_quoted) out = out c
                 i++
                 continue
             }
             if (double) {
                 # Inside double quotes a backslash still escapes, and `$` still
                 # expands, so the contents are kept.
-                if (c == "\\") { out = out " "; i += 2; continue }
+                if (c == "\\") {
+                    if (keep_quoted) out = out substr(line, i, 2)
+                    else out = out " "
+                    i += 2
+                    continue
+                }
                 if (c == "\"") double = 0
                 else out = out c
                 i++
@@ -236,9 +284,15 @@ strip_non_expanding() {
             if (c == "\047") { single = 1; i++; continue }
             if (c == "\"") { double = 1; i++; continue }
             # A backslash quotes the next character, so `\$FOO` is a literal
-            # dollar sign. Drop both, leaving a space so adjacent words do not
-            # fuse into a new token.
-            if (c == "\\") { out = out " "; i += 2; continue }
+            # dollar sign and `\#` is not a comment. For check 2 both go,
+            # leaving a space so adjacent words do not fuse into a new token;
+            # for check 4 the quoted character is still printable text.
+            if (c == "\\") {
+                if (keep_quoted) out = out substr(line, i, 2)
+                else out = out " "
+                i += 2
+                continue
+            }
             # A `#` starting a word begins a comment that runs to end of line.
             if (c == "#" && (i == 1 || substr(line, i - 1, 1) ~ /[ \t;&|()]/)) break
             out = out c
@@ -246,6 +300,16 @@ strip_non_expanding() {
         }
         print out
     }' "$1"
+}
+
+# The parts of a script where a `$NAME` would expand.
+strip_non_expanding() {
+    scan_shell_text "$1" 0
+}
+
+# The parts of a script that are not comments -- quoted spans kept whole.
+strip_comments() {
+    scan_shell_text "$1" 1
 }
 
 # A variable that is referenced but never assigned anywhere in the file is an
@@ -502,8 +566,57 @@ if ((${#missing_steps[@]} > 0)); then
     failures=1
 fi
 
+# --- Check 4: every script can emit the PASS:/FAIL: markers. ---------------
+
+# Matched on the literal `PASS:` / `FAIL:` rather than on an `echo` line,
+# because the marker is just as legitimate coming out of a `printf`, a helper
+# like meth_collapsed_scoring.sh's `fail()`, or a heredoc. A stricter pattern
+# would start arguing with how each script chooses to write.
+#
+# Comments are dropped first, though, because the one shape the loose match
+# gets wrong is the one these scripts all have: a header comment block that
+# quotes the contract it is documenting. This very file's comments name `PASS:`
+# ten times between them. Left in, a script could satisfy a contract about
+# what it prints purely by describing it -- and the header describing the
+# marker is exactly what survives when the `echo` that printed it is deleted.
+#
+# Both whole-line and trailing comments go, which is why this reuses check 2's
+# quote-state walk rather than a `^[[:space:]]*#` filter. The tail of a line is
+# where the two spellings are hardest to tell apart -- `echo done # PASS:`
+# prints nothing while `echo "done # PASS:"` prints the marker -- and only
+# knowing the quote state distinguishes them. Dropping whole-line comments
+# alone leaves the first shape satisfying the contract while emitting nothing,
+# which is the same hole the comment strip exists to close.
+#
+# Marker text held as fixture data is still accepted: a quoted span keeps its
+# contents, so the self-tests next to this one -- which build fixture scripts
+# that print markers -- match on those. That is deliberate, not a leak; each of
+# them prints its own marker too.
+missing_markers=()
+for script in "${scripts[@]}"; do
+    code="$(strip_comments "$regression_dir/$script")"
+    missing=()
+    for marker in 'PASS:' 'FAIL:'; do
+        grep -qF -- "$marker" <<< "$code" || missing+=("$marker")
+    done
+    if ((${#missing[@]} > 0)); then
+        missing_markers+=("$script (${missing[*]})")
+    fi
+done
+
+if ((${#missing_markers[@]} > 0)); then
+    echo "FAIL: these scripts cannot emit the markers $readme requires of them" >&2
+    echo "      (\"emits \`PASS:\` on success and \`FAIL:\` on failure\"):" >&2
+    printf '  %s\n' "${missing_markers[@]}" >&2
+    echo >&2
+    echo "A run that prints no marker is indistinguishable from a script that never" >&2
+    echo "ran. Print \`PASS: <script> (<what was checked>)\` on the success path and" >&2
+    echo "\`FAIL: <what went wrong>\` on each failure path." >&2
+    failures=1
+fi
+
 if ((failures != 0)); then
     exit 1
 fi
 
-echo "PASS: readme_contract_lint (${#mentioned[@]} scripts named and present; ${#source_only[@]} source-only; $row_count ci.yml step names)"
+echo "PASS: readme_contract_lint (${#mentioned[@]} scripts named and present; ${#source_only[@]} source-only; $row_count ci.yml step names; ${#scripts[@]} emit both markers)"

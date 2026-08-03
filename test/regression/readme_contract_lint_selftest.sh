@@ -151,17 +151,26 @@ readme_naming() {
 # shellcheck disable=SC2016
 
 # A script that takes the named environment variable, and one that takes none.
+#
+# Every fixture below carries both a PASS: and a FAIL: literal, because check 4
+# requires them of any script in the tree. The cases here are aimed at checks 1
+# and 2, so the markers are scaffolding rather than the thing under test -- a
+# fixture missing one would FLAG for a reason the case never meant to exercise.
+# The dedicated check-4 cases further down drop a marker on purpose.
 readonly ENV_SCRIPT='set -euo pipefail
 : "${BWA_MEM3:?BWA_MEM3 must be set}"
+[[ -n ${BWA_MEM3:-} ]] || { echo "FAIL: fixture" >&2; exit 1; }
 echo "PASS: fixture"'
 # shellcheck disable=SC2016
 readonly SOURCE_ONLY_SCRIPT='set -euo pipefail
 scan_root="${1:-src}"
+[[ -n $scan_root ]] || { echo "FAIL: fixture" >&2; exit 1; }
 echo "PASS: fixture $scan_root"'
 # shellcheck disable=SC2016
 readonly DEFAULTED_ENV_SCRIPT='set -euo pipefail
 MAKE="${MAKE:-make}"
-"$MAKE" --version'
+"$MAKE" --version || { echo "FAIL: fixture" >&2; exit 1; }
+echo "PASS: fixture"'
 
 # A script that holds shell text as data -- the shape of the self-tests next to
 # this one, which build fixture scripts from single-quoted constants spanning
@@ -173,7 +182,7 @@ readonly QUOTED_DATA_SCRIPT='set -euo pipefail
 payload='"'"'set -euo pipefail
 MAKE="${MAKE:-make}"
 : "${BWA_MEM3:?BWA_MEM3 must be set}"'"'"'
-printf '"'"'%s\n'"'"' "$payload" > /dev/null
+printf '"'"'%s\n'"'"' "$payload" > /dev/null || { echo "FAIL: fixture" >&2; exit 1; }
 echo "PASS: fixture"'
 
 echo "== stale READMEs the lint must reject =="
@@ -266,7 +275,7 @@ check_tree "apostrophe in a double-quoted string does not shift quote state" PAS
         "lint.sh:set -euo pipefail
 label=\"the lint's own message\"
 payload='\${BWA_MEM3:?BWA_MEM3 must be set}'
-echo \"\$label \$payload\" > /dev/null
+echo \"\$label \$payload\" > /dev/null || { echo \"FAIL: fixture\" >&2; exit 1; }
 echo \"PASS: fixture\"")"
 
 echo "== the ci.yml origin column ==" # check 3
@@ -369,6 +378,109 @@ check_tree "the column header named in prose above the table" PASS \
         "The Origin in ci.yml column names the step that runs each script." \
         "$(readme_naming lint.sh)")" \
         "lint.sh:$SOURCE_ONLY_SCRIPT")"
+
+echo "== the PASS:/FAIL: marker contract ==" # check 4
+
+# Every case below names this branch rather than resting on the verdict. Each
+# one hands the lint a tree that is stale in exactly one way, and checks 1-3
+# reject a tree for three other reasons with the same exit 1 -- so a case that
+# tripped one of those by accident reads green while never reaching check 4.
+readonly MARKER_REPORT='cannot emit the markers'
+
+# The three shapes that were actually in the tree when check 4 was written: no
+# PASS: at all (meth_collapsed_scoring.sh ended on a bare `echo "OK"`), a PASS
+# without the colon (all_tiers_parity.sh printed "ALL TIERS PARITY: PASS ("),
+# and neither marker (meth_oracle.sh `exec`d its child and said nothing).
+# shellcheck disable=SC2016
+readonly NO_PASS_SCRIPT='set -euo pipefail
+scan_root="${1:-src}"
+[[ -n $scan_root ]] || { echo "FAIL: fixture" >&2; exit 1; }
+echo "OK"'
+# shellcheck disable=SC2016
+readonly UNCOLONED_PASS_SCRIPT='set -euo pipefail
+scan_root="${1:-src}"
+[[ -n $scan_root ]] || { echo "FAIL: fixture" >&2; exit 1; }
+echo "FIXTURE PARITY: PASS (1 comparison)"'
+readonly NO_MARKER_SCRIPT='set -euo pipefail
+exec bash some/other/harness'
+# The asymmetric case. Every shape above is missing PASS: or missing both, so a
+# check that dropped the FAIL: half entirely would still turn all of them FLAG
+# and this file would report green while covering half the contract.
+# shellcheck disable=SC2016
+readonly NO_FAIL_SCRIPT='set -euo pipefail
+scan_root="${1:-src}"
+[[ -n $scan_root ]] || exit 1
+echo "PASS: fixture"'
+# Both markers present, and neither reachable: a script that documents the
+# contract in its header and prints nothing. That is what a raw substring match
+# accepts, and what the header of the lint itself would have satisfied.
+readonly COMMENT_ONLY_SCRIPT='set -euo pipefail
+# Prints PASS: on success and FAIL: on failure.
+exec bash some/other/harness'
+# The same shape one column over: the markers trail live code instead of
+# starting the line, so a `^[[:space:]]*#` filter leaves them in place while
+# the shell reads them as comment text and the script still prints nothing.
+# Distinguishing this from the quoted `"... # PASS:"` on the line below it is
+# what the lint needs quote state for, and the `PASS` case pins that both ways:
+# the marker in the comment must not count, and the one in the string must.
+readonly TRAILING_COMMENT_SCRIPT='set -euo pipefail
+echo "ran # PASS: fixture"
+exec bash some/other/harness # reports FAIL: on a bad exit'
+# The accepted half of the same rule, in the other quote. Dropping comments has
+# to leave both kinds of quoted span intact, and single quotes are the ones a
+# strip written for `$NAME` expansion would throw away wholesale -- check 2
+# drops them by design, and the two checks share a walk. shell_lint_selftest.sh
+# is this shape today, so getting it wrong would fail a healthy tree.
+# shellcheck disable=SC2016
+readonly SINGLE_QUOTED_MARKER_SCRIPT='set -euo pipefail
+scan_root="${1:-src}"
+[[ -n $scan_root ]] || { printf '"'"'FAIL: fixture\n'"'"' >&2; exit 1; }
+printf '"'"'PASS: fixture\n'"'"''
+
+check_tree "script with no PASS: marker" FLAG \
+    "$(make_tree no-pass-marker "$(readme_naming lint.sh)" \
+        "lint.sh:$NO_PASS_SCRIPT")" \
+    "$MARKER_REPORT"
+
+check_tree "script with no FAIL: marker" FLAG \
+    "$(make_tree no-fail-marker "$(readme_naming lint.sh)" \
+        "lint.sh:$NO_FAIL_SCRIPT")" \
+    "$MARKER_REPORT"
+
+check_tree "script whose PASS lacks the colon" FLAG \
+    "$(make_tree uncoloned-pass "$(readme_naming lint.sh)" \
+        "lint.sh:$UNCOLONED_PASS_SCRIPT")" \
+    "$MARKER_REPORT"
+
+# `other.sh` carries the bad shape while `lint.sh` stays healthy, and both are
+# named in the block because neither reads the environment. Putting the shape on
+# a second script is what keeps check 2 from flagging the tree first, which
+# would let the case pass without ever reaching check 4.
+check_tree "markers only in a comment" FLAG \
+    "$(make_tree comment-only-markers "$(readme_naming lint.sh other.sh)" \
+        "lint.sh:$SOURCE_ONLY_SCRIPT" "other.sh:$COMMENT_ONLY_SCRIPT")" \
+    "$MARKER_REPORT"
+
+# Split across two scripts for the same reason. The report is checked down to
+# the marker this tree is missing, because the script's other marker is inside
+# a string on the line above: a lint that dropped the whole line -- comment,
+# quoted text and all -- would flag the tree for both markers and read green
+# here while rejecting every script that prints a marker mid-line.
+check_tree "marker only in a trailing comment" FLAG \
+    "$(make_tree trailing-comment-markers "$(readme_naming lint.sh other.sh)" \
+        "lint.sh:$SOURCE_ONLY_SCRIPT" "other.sh:$TRAILING_COMMENT_SCRIPT")" \
+    "other.sh (FAIL:)"
+
+# Both markers missing at once -- the wrapper shape. Split across two scripts
+# for the same reason as the case above.
+check_tree "wrapper emitting neither marker" FLAG \
+    "$(make_tree no-markers "$(readme_naming lint.sh other.sh)" \
+        "lint.sh:$SOURCE_ONLY_SCRIPT" "other.sh:$NO_MARKER_SCRIPT")" \
+    "$MARKER_REPORT"
+
+check_tree "markers only inside single quotes" PASS \
+    "$(make_tree single-quoted-markers "$(readme_naming lint.sh)" \
+        "lint.sh:$SINGLE_QUOTED_MARKER_SCRIPT")"
 
 echo "== a lint that checked nothing must not report PASS =="
 

@@ -16,7 +16,7 @@
 # stronger oracle than self-comparison, and transitive across the three builds.
 #
 # Real coverage needs an avx512bw host: on an avx2-only x86 runner, or on arm64,
-# there is exactly one sweepable tier and the script reports SKIPPED rather than
+# there is exactly one sweepable tier and the script reports SKIP: rather than
 # claiming a pass it did not earn.
 #
 # Inputs:
@@ -131,7 +131,7 @@ fi
 # A host below the batched floor (an sse41/sse42/avx baseline build) has nothing
 # to sweep. Say so plainly instead of reporting an empty pass.
 if [[ "${#TIERS[@]}" -eq 0 ]]; then
-    echo "ALL TIERS PARITY: SKIPPED -- host tier '$HOST_TIER' is below the batched-kswv"
+    echo "SKIP: all_tiers_parity -- host tier '$HOST_TIER' is below the batched-kswv"
     echo "  floor (avx2), so this build has no sweepable tiers. Its correctness is covered"
     echo "  by chr22_parity.sh, which runs on this build in CI and asserts byte-identity"
     echo "  against bwa. This is NOT a pass."
@@ -216,10 +216,10 @@ if [[ "$EXIT" -ne 0 ]]; then
     exit "$EXIT"
 fi
 if [[ "$COMPARISONS" -eq 0 ]]; then
-    echo "ALL TIERS PARITY: SKIPPED -- only one testable tier on this host (${TIERS[*]}),"
+    echo "SKIP: all_tiers_parity -- only one testable tier on this host (${TIERS[*]}),"
     echo "  so nothing was compared. This is expected on arm64 and on x86 hosts without"
     echo "  AVX-512BW; it is NOT a pass. Run on an avx512bw host for real coverage."
     exit 0
 fi
-echo "ALL TIERS PARITY: PASS ($COMPARISONS comparison(s) across ${#TIERS[@]} tiers: ${TIERS[*]})"
+echo "PASS: all_tiers_parity ($COMPARISONS comparison(s) across ${#TIERS[@]} tiers: ${TIERS[*]})"
 exit 0

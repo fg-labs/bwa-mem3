@@ -13,13 +13,16 @@ all and run from `ndebug-gate-lint`, `debug-macro-flag-lint`, `shell-lint`,
   every script but the source-only lints, which instead take an optional
   positional directory so their self-tests can aim the same checks at a fixture
   tree, and `meth_oracle.sh`, which reads no input at all)
-- emits `PASS:` on success and `FAIL:` on failure
+- emits `PASS:` on success and `FAIL:` on failure, and `SKIP:` where a check
+  cannot run (a missing tool, a host with nothing to compare) — a skipped check
+  is reported as skipped, never as a pass
 - returns nonzero on failure
 
 | Script                       | What it checks                                                        | Origin in ci.yml                                    |
 |------------------------------|-----------------------------------------------------------------------|-----------------------------------------------------|
 | `chr22_parity.sh`            | bwa vs bwa-mem3 SAM parity on ~50k PE holodeck reads (chr22)          | "Compare chr22 bwa vs bwa-mem3 (parity)"            |
 | `thread_determinism.sh`      | `-t 1` == `-t 4` output after sort on chr22                           | "Thread-determinism smoke (chr22, -t 1 vs -t 4)"    |
+| `all_tiers_parity.sh`        | one binary, one host: byte-identical SAM on the staged `PARITY_FA`/`PARITY_R1`/`PARITY_R2` workload (the same chr22 holodeck PE reads as `chr22_parity.sh`) whichever kernel `BWAMEM3_FORCE_TIER` selects. Real coverage needs an x86 host where both avx2 and avx512bw are sweepable; anywhere else — arm64, or x86 without AVX-512BW — there is one tier and it reports `SKIP:` | "SIMD tier parity (avx2 vs avx512bw, chr22)"        |
 | `bam_roundtrip.sh`           | `--bam=6` BAM decodes and has same record count as SAM (chr22)        | "--bam=6 roundtrip smoke (chr22)"                   |
 | `short_read_smoke.sh`        | ASAN SE on 25-50 bp variable-length dense-chr22 reads (PR #100 fix)   | "Short-read SE smoke (chr22, ASAN, dense+variable-length)" |
 | `supp_rep_hard_cap.sh`       | `--supp-rep-hard-cap` forces MAPQ=0 on repetitive-seed supps (#101)   | "--supp-rep-hard-cap repetitive-seed regression"    |
@@ -27,6 +30,7 @@ all and run from `ndebug-gate-lint`, `debug-macro-flag-lint`, `shell-lint`,
 | `header_parity.sh`           | `AH:*` on generated @SQ (#281); `--compat` skips the .hdr/.dict sidecar | "header parity regression (AH:*, --compat @HD/@SQ)" |
 | `default_hd_parity.sh`       | default `@HD` byte-identical across SAM/`--bam`/`--meth` (#288)        | "default @HD parity across output paths"            |
 | `meth_sam_output.sh`         | `--meth` emits SAM text by default and BAM under `--bam`, same records | "--meth output container follows --bam"             |
+| `meth_collapsed_scoring.sh`  | `--meth-scoring collapsed` also frees the conversion mirror cell, so a ref-T→read-C substitution scores `a+b` above `genomic` and reports NM=0 against its NM=1 | "--meth whole-aligner regressions (D3)"             |
 | `meth_oracle.sh`             | `--meth` Layer 1 (valid BAM emission) via the harness under `test/meth/`; Layers 2–3 retired in D3 | "Run --meth Layer 1"                                |
 | `cohort_ramp_validation.sh`  | `--cohort-ramp-first`/`-ratio` reject malformed values; env warns and falls back | "Cohort ramp values are validated (flag and environment alike)" |
 | `rescue_kmer_options.sh`     | `--rescue-kmer`/`--rescue-band` reject malformed and out-of-range values; the `=` form is required | "--rescue-kmer/--rescue-band reject malformed values" |
@@ -42,7 +46,7 @@ all and run from `ndebug-gate-lint`, `debug-macro-flag-lint`, `shell-lint`,
 | `regression_coverage_lint_selftest.sh` | the lint above still detects an unrun script, so its `PASS` means something | "Coverage lint still detects an unrun script"       |
 | `host_floor_enforce.sh`      | below-floor hosts get exit 2 + a readable error, not a SIGILL (needs `TESTING_BUILD=1`) | "SIMD floor enforcement (TESTING_BUILD, injected below-floor tier)" |
 | `version_banner.sh`          | `bwa-mem3 version` prints the SIMD floor and runtime tier lines        | "Version banner regression"                         |
-| `readme_contract_lint.sh`    | this README names no script that was deleted, its source-only-lint block lists exactly the scripts that read no environment, and every row's `Origin in ci.yml` names a step a workflow defines | "README still describes the regression scripts"     |
+| `readme_contract_lint.sh`    | this README names no script that was deleted, its source-only-lint block lists exactly the scripts that read no environment, every row's `Origin in ci.yml` names a step a workflow defines, and every script can emit the `PASS:`/`FAIL:` markers above | "README still describes the regression scripts"     |
 | `readme_contract_lint_selftest.sh` | the lint above still detects a stale README, so its `PASS` means something | "README lint still detects drift"                  |
 
 The table is a reading guide, not an inventory — `ls test/regression/*.sh` is
