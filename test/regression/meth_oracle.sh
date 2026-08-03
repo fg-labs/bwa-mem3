@@ -8,9 +8,11 @@
 # D3; this is a thin wrapper that re-invokes what is left of it.
 #
 # Inputs:
-#   The test/meth fixtures (ref.fa, t_R1.fastq.gz), copied into test/meth/ by
-#   the caller -- see the "Copy bwa-meth fixtures into test/meth/" step in
-#   ci.yml. test/meth/test.sh checks for them and says where they come from.
+#   The test/meth fixtures (ref.fa, t_R1.fastq.gz, t_R2.fastq.gz), copied into
+#   test/meth/ by the caller -- see the "Copy bwa-meth fixtures into test/meth/"
+#   step in ci.yml. The harness runs paired-end, so the mate is as required as
+#   the other two; test/meth/test.sh checks for all three and says where they
+#   come from.
 #
 #   Nothing is read from the environment HERE, which is what puts this script in
 #   the source-only block of test/regression/README.md -- that contract is about
