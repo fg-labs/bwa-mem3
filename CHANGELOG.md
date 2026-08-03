@@ -25,7 +25,7 @@
 * **chain:** keep sizeof(mem_chain_t) at 48 B to preserve bwa-mem2 chaining parity ([#268](https://github.com/fg-labs/bwa-mem3/issues/268)) ([a9d9445](https://github.com/fg-labs/bwa-mem3/commit/a9d9445cb984115887184e5bdb0a5ddc41e74708))
 * check debug_macro_flag_lint's directory argument before cd ([#352](https://github.com/fg-labs/bwa-mem3/issues/352)) ([14d8096](https://github.com/fg-labs/bwa-mem3/commit/14d8096fec6e657e6008044267354f57c42c3fea))
 * **coderabbit:** list main in auto_review.base_branches ([#358](https://github.com/fg-labs/bwa-mem3/issues/358)) ([63add93](https://github.com/fg-labs/bwa-mem3/commit/63add93a2a2cc2f02f216ff4ddbf1cb07ede634d))
-* **header:** emit one default @HD on every output path ([#291](https://github.com/fg-labs/bwa-mem3/issues/291)) ([56889e1](https://github.com/fg-labs/bwa-mem3/commit/56889e1f5733b72f333fa12faf0ea82157f92d3f)), closes [#288](https://github.com/fg-labs/bwa-mem3/issues/288)
+* **header:** emit one default `@HD` on every output path ([#291](https://github.com/fg-labs/bwa-mem3/issues/291)) ([56889e1](https://github.com/fg-labs/bwa-mem3/commit/56889e1f5733b72f333fa12faf0ea82157f92d3f)), closes [#288](https://github.com/fg-labs/bwa-mem3/issues/288)
 * **index:** cap each pread() at 1GiB so large indexes load on macOS ([#259](https://github.com/fg-labs/bwa-mem3/issues/259)) ([1db6697](https://github.com/fg-labs/bwa-mem3/commit/1db6697cb5456a5905c1e7ce736f4f4d63431334))
 * **index:** resolve the auto memory budget from the host, not a 32 GiB cap ([#300](https://github.com/fg-labs/bwa-mem3/issues/300)) ([a8ac368](https://github.com/fg-labs/bwa-mem3/commit/a8ac3683c521bd7f388bb201f75b9a23af1280d4))
 * **kswv:** zero query padding in the NEON and AVX-512BW 8-bit mate-rescue kernels ([#290](https://github.com/fg-labs/bwa-mem3/issues/290)) ([b8d5aa3](https://github.com/fg-labs/bwa-mem3/commit/b8d5aa38856d7149bcdf9161a1d5ca38ec5a5bdc))
@@ -77,7 +77,7 @@
 * **chain:** fuse mem_chain_weight's two seed sweeps into one ([#322](https://github.com/fg-labs/bwa-mem3/issues/322)) ([500c9cb](https://github.com/fg-labs/bwa-mem3/commit/500c9cbcb3a62c023673c58fdc5cc985619dc4f8))
 * **chain:** remove dead work from the chaining path ([#285](https://github.com/fg-labs/bwa-mem3/issues/285)) ([8de7e5b](https://github.com/fg-labs/bwa-mem3/commit/8de7e5bb91229b7b6efb9684d82f0cb6d22f4c4f))
 * **chain:** tidy mem_chain_flt's filter loops ([#323](https://github.com/fg-labs/bwa-mem3/issues/323)) ([095b401](https://github.com/fg-labs/bwa-mem3/commit/095b401be04aa65348b5f65da7438f0347e3edc1))
-* **header:** one generated-@SQ builder, one scanner, one record iterator ([#292](https://github.com/fg-labs/bwa-mem3/issues/292)) ([37e5e4a](https://github.com/fg-labs/bwa-mem3/commit/37e5e4a6a18c66ed3e4be5e818a4b57f5dafff86))
+* **header:** one generated-`@SQ` builder, one scanner, one record iterator ([#292](https://github.com/fg-labs/bwa-mem3/issues/292)) ([37e5e4a](https://github.com/fg-labs/bwa-mem3/commit/37e5e4a6a18c66ed3e4be5e818a4b57f5dafff86))
 * **meth:** name the native-regen decision and document the hypothesis invariant ([#337](https://github.com/fg-labs/bwa-mem3/issues/337)) ([97eb3be](https://github.com/fg-labs/bwa-mem3/commit/97eb3be3a92c3f5963b41e1ad0cfef6a5aeaa55c))
 
 
@@ -241,7 +241,7 @@
 * **bsw:** make the 8-bit h0-prefix seed unsigned [0,255] ([#151](https://github.com/fg-labs/bwa-mem3/issues/151)) ([9f51c5f](https://github.com/fg-labs/bwa-mem3/commit/9f51c5f521612a7c3e1c0dae9d71db38be0121b8))
 * **bsw:** recover the 8-bit banded Smith–Waterman path for reads ≥128 bp ([#140](https://github.com/fg-labs/bwa-mem3/issues/140)) ([155a916](https://github.com/fg-labs/bwa-mem3/commit/155a91632de602663377197ff1168d200a24f344))
 * **kswv:** AVX2 16-bit mate-rescue kernel (kswv256_16) ([#162](https://github.com/fg-labs/bwa-mem3/issues/162)) ([9107b82](https://github.com/fg-labs/bwa-mem3/commit/9107b825189da87822bccac152e4a98daf00aac1))
-* **meth:** carry original-reference @SQ M5/UR and @CO/@PG into --meth headers ([#139](https://github.com/fg-labs/bwa-mem3/issues/139)) ([e94ad8b](https://github.com/fg-labs/bwa-mem3/commit/e94ad8b847b6637b95aea6dff3e07f560e22a532))
+* **meth:** carry original-reference `@SQ` `M5`/`UR` and `@CO`/`@PG` into `--meth` headers ([#139](https://github.com/fg-labs/bwa-mem3/issues/139)) ([e94ad8b](https://github.com/fg-labs/bwa-mem3/commit/e94ad8b847b6637b95aea6dff3e07f560e22a532))
 * **prof:** off-by-default --profile stage-timing instrumentation ([#152](https://github.com/fg-labs/bwa-mem3/issues/152)) ([83cf7ab](https://github.com/fg-labs/bwa-mem3/commit/83cf7ab9d8e4589354e16654726fbdfaa1b4b63c))
 * **reader:** content-detecting FASTQ reader fast path (libdeflate BGZF) ([#128](https://github.com/fg-labs/bwa-mem3/issues/128)) ([cdd71bf](https://github.com/fg-labs/bwa-mem3/commit/cdd71bf4590cf2e1a5d908d6e852f780c93c3a8a))
 
@@ -251,7 +251,7 @@
 * **bsw:** bound getScores8/16 prefetch reads to the padding contract ([#150](https://github.com/fg-labs/bwa-mem3/issues/150)) ([87ed5d4](https://github.com/fg-labs/bwa-mem3/commit/87ed5d4a78b6b78789bca45be5649373576ee668))
 * **fmi:** widen mem_lim to int64 and guard SA-entry allocations ([#156](https://github.com/fg-labs/bwa-mem3/issues/156)) ([2d18c1e](https://github.com/fg-labs/bwa-mem3/commit/2d18c1ed00de5e4a60fa31d15fec04c7b74877a0))
 * **kthread:** drive kt_for with a persistent worker pool ([#154](https://github.com/fg-labs/bwa-mem3/issues/154)) ([26b24e7](https://github.com/fg-labs/bwa-mem3/commit/26b24e7bac9fd7f73921b902ba98a628776087b6))
-* **meth:** emit -R read group as @RG header in --meth mode ([#137](https://github.com/fg-labs/bwa-mem3/issues/137)) ([ccd1fc5](https://github.com/fg-labs/bwa-mem3/commit/ccd1fc56d26bfd54ab1f9604845332353afd75a6))
+* **meth:** emit `-R` read group as `@RG` header in `--meth` mode ([#137](https://github.com/fg-labs/bwa-mem3/issues/137)) ([ccd1fc5](https://github.com/fg-labs/bwa-mem3/commit/ccd1fc56d26bfd54ab1f9604845332353afd75a6))
 * **seeding:** widen SMEM read positions from int16_t to int32_t ([#142](https://github.com/fg-labs/bwa-mem3/issues/142)) ([037c418](https://github.com/fg-labs/bwa-mem3/commit/037c418b3b3c49deeb41bd57e37eacc7895e6fca))
 * **test:** make meth layer-2 FAIL diagnostics reachable under set -e ([#133](https://github.com/fg-labs/bwa-mem3/issues/133)) ([d2d6688](https://github.com/fg-labs/bwa-mem3/commit/d2d66880bce736900b81e7610cbae1d1556ba7ea))
 
