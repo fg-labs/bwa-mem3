@@ -2,9 +2,9 @@
 
 End-to-end parity and invariant checks. `chr22_parity.sh` and
 `version_banner.sh` run on every matrix row; the rest run on the canonical
-AVX2 row only, except for the ones wired to a job of their own:
-`profile_slice_cpu.sh` runs from `profiling-build` (see below), and the
-`ndebug_gate_lint*`, `debug_macro_flag_lint*`, `shell_lint*`,
+`Linux x86_64 AVX2 (mimalloc)` row only, except for the ones wired to a job of
+their own: `profile_slice_cpu.sh` runs from `profiling-build` (see below), and
+the `ndebug_gate_lint*`, `debug_macro_flag_lint*`, `shell_lint*`,
 `regression_coverage_lint*` and `readme_contract_lint*` pairs need no binary at
 all and run from `ndebug-gate-lint`, `debug-macro-flag-lint`, `shell-lint`,
 `regression-coverage-lint` and `readme-contract-lint` respectively. Each script:
@@ -18,6 +18,16 @@ all and run from `ndebug-gate-lint`, `debug-macro-flag-lint`, `shell-lint`,
   is reported as skipped, never as a pass
 - returns nonzero on failure
 
+Where a script runs is also what backs its claim: unless a row says otherwise,
+read that row's byte-identity or parity claim as holding on the canonical row —
+Linux x86_64, AVX2 tier, mimalloc. Two rows say otherwise, and neither is one of
+the job-of-its-own cases above. `chr22_parity.sh` runs on every matrix row, so
+its parity claim is not AVX2-specific. `all_tiers_parity.sh` does run on the
+canonical row, but it drives the binary through each usable tier with
+`BWAMEM3_FORCE_TIER`, so the tier is the one thing its claim deliberately does
+not hold fixed. (`version_banner.sh` runs everywhere too, but its row asserts no
+parity or byte-identity, so nothing here scopes it.)
+
 | Script                       | What it checks                                                        | Origin in ci.yml                                    |
 |------------------------------|-----------------------------------------------------------------------|-----------------------------------------------------|
 | `chr22_parity.sh`            | bwa vs bwa-mem3 SAM parity on ~50k PE holodeck reads (chr22)          | "Compare chr22 bwa vs bwa-mem3 (parity)"            |
@@ -26,9 +36,9 @@ all and run from `ndebug-gate-lint`, `debug-macro-flag-lint`, `shell-lint`,
 | `bam_roundtrip.sh`           | `--bam=6` BAM decodes and has same record count as SAM (chr22)        | "--bam=6 roundtrip smoke (chr22)"                   |
 | `short_read_smoke.sh`        | ASAN SE on 25-50 bp variable-length dense-chr22 reads (PR #100 fix)   | "Short-read SE smoke (chr22, ASAN, dense+variable-length)" |
 | `supp_rep_hard_cap.sh`       | `--supp-rep-hard-cap` forces MAPQ=0 on repetitive-seed supps (#101)   | "--supp-rep-hard-cap repetitive-seed regression"    |
-| `compat_byte_identical.sh`   | `--compat=bwa-mem2` suppresses only MQ/HN/@HD; rest byte-identical    | "--compat byte-identical regression (phix)"         |
-| `header_parity.sh`           | `AH:*` on generated @SQ (#281); `--compat` skips the .hdr/.dict sidecar | "header parity regression (AH:*, --compat @HD/@SQ)" |
-| `default_hd_parity.sh`       | default `@HD` byte-identical across SAM/`--bam`/`--meth` (#288)        | "default @HD parity across output paths"            |
+| `compat_byte_identical.sh`   | one binary, one host: `--compat=bwa-mem2` suppresses only `MQ`/`HN`/`@HD`, and the rest of the SAM is byte-identical to the same binary's default run on PE reads sliced from phix. bwa-mem2 itself is never run — this is a default-vs-`--compat` invariant, not a cross-aligner one. `@PG` is excluded from both sides: its `CL:` records the argv, which necessarily differs between the two runs | "--compat byte-identical regression (phix)"         |
+| `header_parity.sh`           | `AH:*` on generated `@SQ` (#281); `--compat` skips the .hdr/.dict sidecar | "header parity regression (AH:*, --compat @HD/@SQ)" |
+| `default_hd_parity.sh`       | one binary, one host: default `@HD` byte-identical across SAM/`--bam`/`--meth` on PE reads sliced from phix (#288) | "default @HD parity across output paths"            |
 | `meth_sam_output.sh`         | `--meth` emits SAM text by default and BAM under `--bam`, same records | "--meth output container follows --bam"             |
 | `meth_collapsed_scoring.sh`  | `--meth-scoring collapsed` also frees the conversion mirror cell, so a ref-T→read-C substitution scores `a+b` above `genomic` and reports NM=0 against its NM=1 | "--meth whole-aligner regressions (D3)"             |
 | `meth_oracle.sh`             | `--meth` Layer 1 (valid BAM emission) via the harness under `test/meth/`; Layers 2–3 retired in D3 | "Run --meth Layer 1"                                |
