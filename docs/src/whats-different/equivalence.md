@@ -100,20 +100,35 @@ that stands between the drop-in profile and a byte-for-byte match with bwa-mem2 
 bwa-mem3 mem --compat=bwa-mem2 -t <N> ref.fa R1.fq R2.fq > out.sam
 ```
 
-| | default | `--compat=bwa-mem2` | bwa-mem2 v2.2.1 |
-|---|---|---|---|
-| `MQ:i` | emitted | suppressed | absent |
-| `HN:i` | emitted | suppressed | absent |
-| default `@HD` | emitted | suppressed | **none emitted** |
-| `.hdr`/`.dict` sidecar `@SQ` | honored (`M5`/`AS`/`UR`/`SP`) | ignored → bare `SN`/`LN` (+`AH:*`) | bare `SN`/`LN` (+`AH:*`) |
-| `@PG` | `ID:bwa-mem3` | `ID:bwa-mem3` | `ID:bwa-mem2` |
+| | default | `--compat=bwa-mem2` | bwa-mem2 v2.2.1 | `--compat=bwa-mem` | bwa 0.7.19 |
+|---|---|---|---|---|---|
+| `MQ:i` | emitted | suppressed | absent | emitted | **present** |
+| `HN:i` | emitted | suppressed | absent | suppressed | absent |
+| default `@HD` | emitted | suppressed | **none emitted** | emitted | **present** |
+| `.hdr`/`.dict` sidecar `@SQ` | honored (`M5`/`AS`/`UR`/`SP`) | ignored → bare `SN`/`LN` (+`AH:*`) | bare `SN`/`LN` (+`AH:*`) | ignored → bare `SN`/`LN` (+`AH:*`) | bare `SN`/`LN` (+`AH:*`) |
+| `@PG` | `ID:bwa-mem3` | `ID:bwa-mem3` | `ID:bwa-mem2` | `ID:bwa-mem3` | `ID:bwa` |
 
-Two of those rows are not what they look like. **`MQ:i` is not a bwa-mem3 invention** — bwa
+**The two upstreams disagree with each other on half of this table, which is why `--compat`
+takes a *target* rather than being a boolean.** `MQ:i` is not a bwa-mem3 invention — bwa
 emits it too ([lh3/bwa#330](https://github.com/lh3/bwa/pull/330), merged 2022-03-06);
 bwa-mem2 lacks it only because it forked at 0.7.17, before that landed. Likewise **bwa emits
 a default `@HD`** (0.7.18, `6b18630`) and bwa-mem2 does not, for the same reason. Only `HN:i`
-and the sidecar are genuinely bwa-mem3-only — which is why `--compat` takes a *target* rather
-than being a boolean: bwa and bwa-mem2 disagree with each other on half of this table.
+and the sidecar are genuinely bwa-mem3-only, and both targets drop them; every other row is
+the fork point showing through. `bwa-mem` is pinned at **0.7.19** for exactly this reason — a
+0.7.17 target would be the `bwa-mem2` column with a different `@PG`.
+
+**Why a bwa target needs no alignment work.** bwa-mem2 v2.2.1 advertises output identical to
+bwa 0.7.17, and auditing `git diff v0.7.17 v0.7.19` in lh3/bwa shows the only
+output-affecting changes in that range are the additive `MQ:i` and `@HD` above plus the
+opt-in `-u` (`XB:Z`) and `-z` (XA drop ratio) flags — **nothing touches seeding, chaining,
+extension, pairing, MAPQ or dedup**. So bwa-mem2's claim carries forward to 0.7.19, and the
+bwa-mem2 parity restored in 0.7.1 (see above) is bwa parity too. That is what the measured
+three-way agreement below reflects, rather than a coincidence of the cells chosen.
+
+**One structural limit.** `--compat` shapes output and never moves an alignment, so on any
+record where bwa and bwa-mem2 disagree on an alignment field, at most one of the two targets
+can be byte-identical. No such record has been observed across the cells measured here, but
+the rare-event tail is not proven empty — see the statistical-power caveat below.
 
 `--compat` is **output-shaping only, never an alignment change**. Every alignment, score,
 flag, and tag value is untouched.
@@ -150,9 +165,19 @@ Caveats:
   and how to regenerate the sidecar. Under `--compat=bwa-mem2` the requirement does not
   apply: the sidecar is ignored entirely and `AH:*` is generated from the index (the table
   row above), so a sidecar missing `AH` cannot affect that output.
-- **`--compat=bwa-mem` is recognized but rejected.** bwa-mem3 and bwa still differ on 224 of
-  63,583 records (53 above MAPQ 30) in MAPQ, CIGAR, POS and TLEN, so no amount of output
-  shaping makes them byte-identical. Tracked separately.
+- **`--compat=bwa-mem` and `--compat=bwa-mem2` do not carry equal evidence.** The bwa-mem2
+  target is validated at 22.5 M records across `wgs-5M`/`wes-5M`/`hic-1M` plus full header
+  byte-identity on both output paths. The bwa target rests on the 12.4 M-record three-way run
+  described below, plus a phiX-scale end-to-end check against the real `bwa` 0.7.19 binary
+  (records *and* header, `@PG` excluded) asserted by `test/regression/compat_byte_identical.sh`.
+  Strong evidence, not the same guarantee.
+
+  > An earlier revision of this page and of `src/compat_target.cpp` stated that bwa-mem3 and
+  > bwa differed on 224 of 63,583 records. **That figure is retracted** — it was measured
+  > against a baseline binary built from a worktree on an unmerged branch 48 commits behind
+  > `main`, and the corrected re-run of the same cell found the record stream byte-identical
+  > (78,547 records including secondary and supplementary). It is recorded here rather than
+  > deleted because it was quoted in a shipped CLI error message.
 
 `--compat` is for the standard drop-in path only: bwa-mem2 has no `--meth` mode to be
 identical to, so **`--compat --meth` is a hard error**. See

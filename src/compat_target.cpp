@@ -1,9 +1,9 @@
 /* src/compat_target.cpp — the `--compat` target table.
  *
  * Every field below is derived from the upstream source cited beside it,
- * verified against ~/work/git/bwa @ 91fb301 (0.7.19-r1273) and bwa-mem2 v2.2.1.
- * test/unit/test_compat_target.cpp asserts each field, so a row that no CLI
- * path can reach still cannot silently rot.
+ * verified against lh3/bwa v0.7.19 (b92993c, 0.7.19-r1273) and bwa-mem2 v2.2.1.
+ * test/unit/test_compat_target.cpp asserts each field, so a transcription error
+ * cannot silently rot into a target that claims a parity it does not deliver.
  */
 
 #include "compat_target.h"
@@ -50,24 +50,38 @@ static const compat_target_t COMPAT_TARGET_BWA_MEM2 = {
     /* .emit_hn            */ 0,
 };
 
-/* --- `bwa-mem`: bwa 0.7.19 -- SPECIFIED BUT NOT SELECTABLE ----------------
+/* --- `bwa-mem`: bwa 0.7.19 -------------------------------------------------
  *
- * @HD:      "@HD\tVN:1.5\tSO:unsorted\tGO:query" (bwa.c:426).
+ * @HD:      "@HD\tVN:1.5\tSO:unsorted\tGO:query" (bwa.c:426) -- byte-identical
+ *           to bwa-mem3's own default, so this row shares the constant.
  * sidecar:  absent; lh3/bwa#348 was closed unmerged 2025-03-21.
  * MQ:i:     PRESENT (bwamem.c:935) -- this is the field a single compat
  *           boolean could not express, and the reason this table exists.
  * HN:i:     absent; bwa-mem3-only.
  *
- * The shaping above is complete, but bwa-mem3 and bwa still differ on the
- * ALIGNMENTS, so offering the target would advertise a byte-identity we cannot
- * deliver -- the same trap that makes --compat --fast a hard error. The row is
- * kept because its shaping is fully determined by the evidence above; when the
- * alignment work lands, clearing unavailable_reason is the whole change. */
+ * Pinned at 0.7.19, and the pin matters: bwa gained both the default @HD
+ * (6b18630) and MQ:i (d8dd308) in 0.7.18, so a 0.7.17 target would be this
+ * row's opposite on those two fields -- and identical to the bwa-mem2 row.
+ *
+ * This row was unselectable until 0.9.0, on the strength of a measurement
+ * (224/63583 differing records) that was retracted as having been taken
+ * against a mis-pinned baseline binary. Re-measured, bwa 0.7.19, bwa-mem2
+ * v2.2.1 and bwa-mem3 agree byte-for-byte on alignment records once the
+ * additive tags are removed. Auditing 0.7.17..0.7.19 says that is structural
+ * rather than incidental: the only output-affecting changes in that range are
+ * the two additive items above plus the opt-in -u/-z flags -- nothing touches
+ * seeding, chaining, extension, pairing, MAPQ or dedup. So bwa-mem2's
+ * "identical to bwa-mem 0.7.17" carries forward to 0.7.19, and bwa-mem2 parity
+ * is bwa parity.
+ *
+ * The limit worth knowing: --compat shapes output and never moves an
+ * alignment, so on any record where bwa and bwa-mem2 disagree on an alignment
+ * field, at most one of these two targets can be byte-identical. No such
+ * record has been observed. */
 static const compat_target_t COMPAT_TARGET_BWA_MEM = {
     /* .name               */ "bwa-mem",
     /* .alias              */ NULL,
-    /* .unavailable_reason */ "bwa-mem3 and bwa still differ on 224/63583 records "
-                              "(53 above MAPQ 30), so byte-identity is not achievable",
+    /* .unavailable_reason */ NULL,
     /* .emit_hd            */ 1,
     /* .hd_line            */ BWAMEM3_DEFAULT_HD_LINE,   /* == bwa.c:426 */
     /* .read_sidecar       */ 0,

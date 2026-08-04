@@ -225,6 +225,8 @@ grep -q 'samtools dict --alt' sc_sam_def.err \
 echo "PASS: sidecar @SQ is authoritative (AH absent), and the gap is warned about"
 
 # compat: sidecar skipped entirely -> bare SN/LN + AH:*, no identity tags.
+# Both targets set read_sidecar=0, so this holds for either; they differ only on
+# whether a default @HD is emitted, which the caller asserts separately.
 assert_compat_ignores_sidecar() { # <tag>
     assert_alt_has_AH "$1" "$1"
     if grep -qE "\t(M5|AS|UR|SP):" "$1.sq"; then
@@ -232,8 +234,6 @@ assert_compat_ignores_sidecar() { # <tag>
         head -3 "$1.sq" >&2
         exit 1
     fi
-    # The sidecar's own @HD must not sneak through either.
-    assert_no_HD "$1" "$1"
     # No warning: the sidecar was never read.
     if grep -q 'sidecar supplies @SQ without an AH tag' "$1.err"; then
         echo "FAIL: $1 — warned about a sidecar that compat does not read" >&2
@@ -242,9 +242,34 @@ assert_compat_ignores_sidecar() { # <tag>
 }
 sq_of sc_sam_cmp --compat=bwa-mem2
 assert_compat_ignores_sidecar sc_sam_cmp
+# The sidecar's own @HD must not sneak through under bwa-mem2 either.
+assert_no_HD sc_sam_cmp sc_sam_cmp
 sq_of sc_bam_cmp --bam --compat=bwa-mem2
 assert_compat_ignores_sidecar sc_bam_cmp
+assert_no_HD sc_bam_cmp sc_bam_cmp
 echo "PASS: --compat=bwa-mem2 ignores the sidecar (bare SN/LN + AH:*, no @HD)"
+
+# The bwa-mem target shares read_sidecar=0 but KEEPS the default @HD, so the
+# sidecar's identity tags must still be dropped while an @HD is still written.
+# Asserting it here rather than trusting the bwa-mem2 case is the point: these
+# are two independent row fields and only a real run proves they compose.
+assert_compat_bwa_mem_hd() { # <tag>
+    want="$(printf '@HD\tVN:1.5\tSO:unsorted\tGO:query')"
+    got="$(grep '^@HD' "$1.hdr" || true)"
+    if [[ "$got" != "$want" ]]; then
+        echo "FAIL: $1 — --compat=bwa-mem @HD is not bwa 0.7.19's (bwa.c:426):" >&2
+        echo "  want: $want" >&2
+        echo "  got:  ${got:-<none>}" >&2
+        exit 1
+    fi
+}
+sq_of sc_sam_bm --compat=bwa-mem
+assert_compat_ignores_sidecar sc_sam_bm
+assert_compat_bwa_mem_hd sc_sam_bm
+sq_of sc_bam_bm --bam --compat=bwa-mem
+assert_compat_ignores_sidecar sc_bam_bm
+assert_compat_bwa_mem_hd sc_bam_bm
+echo "PASS: --compat=bwa-mem ignores the sidecar but keeps bwa's default @HD"
 
 # --- 3. Sidecar WITH AH (`samtools dict --alt`, the supported remedy). ----
 samtools dict -a testasm -s testus --alt ref.fasta.alt -o ref.dict ref.fasta
