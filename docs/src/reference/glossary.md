@@ -4,13 +4,13 @@ Terms used throughout this book, listed alphabetically.
 
 ---
 
-**@HD header**
+**`@HD` header**
 The first line of a SAM file header. Specifies the SAM format version (`VN`) and sort order (`SO`). Required when any other header lines are present. See [Output: SAM/BAM, headers, tags](../user-guide/output.md).
 
-**@PG header**
+**`@PG` header**
 A SAM header line recording a program that processed the file, including `ID`, `PN`, `VN`, and `CL` fields. bwa-mem3 inserts `ID:bwa-mem3` (or `ID:bwa-mem3-meth` in methylation mode). See [Output: SAM/BAM, headers, tags](../user-guide/output.md).
 
-**@SQ header**
+**`@SQ` header**
 A SAM header line describing a reference sequence (chromosome). Contains the sequence name (`SN`) and length (`LN`). In methylation mode, `@SQ` is written directly from the original (un-converted) reference, so the `f`/`r`-prefixed contigs of the `.meth` seed index never appear in output. See [Chimera QC and header construction](../methylation/post-processing.md).
 
 **BAM**

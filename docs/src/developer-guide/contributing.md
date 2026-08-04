@@ -25,10 +25,14 @@ bwa-mem3 follows [Conventional Commits](https://www.conventionalcommits.org/) (`
 
 The subject line is lowercase after the prefix, imperative mood, no trailing period. Keep it under 72 characters. Body lines wrap at 100 characters.
 
+Backtick code literals in the subject: command-line flags (`--meth`, `-R`), SAM header records and tag keys (`@HD`, `@SQ`, `@RG`, `@CO`, `@PG`, `M5`, `UR`), and function, type, and file names. release-please carries the subject text into the `CHANGELOG.md` entry and the GitHub release body: it drops the type prefix, renders any scope in bold and the trailing PR number as a link, and appends a commit link, but reproduces the rest of the subject as written. Both render as Markdown, so the subject is the only cheap place to get that rendering right — correcting it later costs a changelog edit plus one edit per published release body. The body is out of scope for this rule: release-please never copies it, and GitHub shows a commit message as plain monospace text, so a backtick there is displayed literally rather than opening a code span. Backticking body literals anyway is harmless — the example below does it — it just buys no rendering.
+
+Literals beginning with `@` are the exception, and for them the backticks are not merely formatting: they must be backticked throughout the whole message, body included. GitHub linkifies a bare `@XX` as a user mention wherever the text appears — the commit page, the `CHANGELOG.md` entry, and the release body — and each of the five `@` header records above resolves to a real, uninvolved account, so the rendered text links a stranger's profile and the release page reads as though they contributed. Backticks suppress that link on all three surfaces — on the commit page they do so even though they are displayed literally. Notification is the narrower point and no longer the reason: GitHub [stopped notifying on commit-message mentions](https://github.blog/changelog/2025-11-07-removing-notifications-for-mentions-in-commit-messages/) on 2025-12-08. The link is what remains.
+
 **Good:**
 
 ```text
-fix: kswv nrow==0 batch skips rowMax store when i==0
+fix: guard the post-loop `rowMax` store in `kswv` nrow==0 batches
 
 Exercises the all-len1==0 path across SSE4.1, AVX2, AVX-512BW, and ARM NEON.
 Without the `if (i > 0)` guard, the store writes SIMD_WIDTH* bytes before the

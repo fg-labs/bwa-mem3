@@ -131,7 +131,7 @@ and reproducibility.
 > samtools view -H out.bam | grep -E '^@SQ|^@PG'
 > ```
 >
-> You should see one @SQ line per reference sequence (no f/r prefixes) and both
+> You should see one `@SQ` line per reference sequence (no f/r prefixes) and both
 > `@PG ID:bwa-mem3` and `@PG ID:bwa-mem3-meth` entries.
 
 ---
