@@ -341,8 +341,29 @@ reviews:
         command that died early.
     - path: "{CHANGELOG.md,NEWS.md,version.txt,release-please-config.json,.release-please-manifest.json}"
       instructions: >-
-        Release automation. CHANGELOG.md and the release-please manifest are
-        generated — flag hand edits, which the next release overwrites. Flag a
+        Release automation. Both CHANGELOG.md and the release-please manifest
+        are generated, but they are not overwritten alike, so do not flag hand
+        edits to them the same way. release-please rewrites
+        .release-please-manifest.json on every release, so a hand edit there is
+        lost — flag it. It only prepends a new section to CHANGELOG.md and never
+        rewrites an already-released one, so a hand edit to a released section
+        persists — flag it only when it contradicts the commits it claims to
+        describe, not merely for being hand-written. Editing CHANGELOG.md also
+        does not reach an already-published GitHub release body; a correction
+        that must appear in published notes has to be applied there too.
+        The next two checks apply only to CHANGELOG.md and NEWS.md, the two
+        Markdown files this path matches; version.txt,
+        release-please-config.json and .release-please-manifest.json are not
+        Markdown, render nothing, and are exempt from both. In those two files
+        code literals in an entry belong in code spans: flag a bare
+        command-line flag, SAM header record or tag key, or function, type, or
+        file name in an entry the diff touches, and flag a bare literal
+        beginning with `@` anywhere in them, because GitHub renders it as a
+        user mention. Do not flag the code-literal cases in entries the diff
+        leaves alone; the `@` case stands wherever it appears in those two
+        files, because a bare `@` is linkified after any non-word character —
+        `/` and `,` included — and only a preceding letter or digit suppresses
+        it. Flag a
         version bumped in one place but not the others, and any version change
         that does not follow semantic versioning given the diff it ships (an
         output-changing or flag-removing change is not a patch release).
@@ -441,8 +462,11 @@ reviews:
           look up: this repository and its own scripts, upstream bwa, bwa-mem2,
           bwa-meth, Bismark, samtools, htslib, libsais, mimalloc, sse2neon,
           zlib-ng, dwgsim, holodeck (the public read simulator this repository
-          already clones by URL in test/meth/test_bismark_tags.sh), and standard
-          OS or cloud instance-type designations.
+          already clones by URL in test/meth/test_bismark_tags.sh),
+          release-please (the public release-automation project this repository
+          already links by URL in docs/src/developer-guide/release.md and pins
+          by action ref in .github/workflows/release.yml), and standard OS or
+          cloud instance-type designations.
           Any other proper-noun tool, harness, bucket, fleet, queue, or internal
           project name is a FAIL. (2) An object-store URL (`s3://`, `gs://`,
           `az://`) or bucket name. (3) A cloud account number, an EC2 instance
