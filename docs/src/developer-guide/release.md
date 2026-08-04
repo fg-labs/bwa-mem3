@@ -1,6 +1,6 @@
 # Release process
 
-bwa-mem3 follows [semantic versioning](https://semver.org). Releases are automated with [release-please](https://github.com/googleapis/release-please): every push to `main` updates a standing "release PR" that bumps the version and regenerates the changelog from the [Conventional Commits](contributing.md#commit-message-conventions) history; merging that PR tags the release and publishes a GitHub Release. The version string is derived from `version.txt` and embedded in every binary at compile time.
+bwa-mem3 follows [semantic versioning](https://semver.org). Releases are automated with [release-please](https://github.com/googleapis/release-please): every push to `main` updates a standing "release PR" that bumps the version and prepends a new changelog section generated from the [Conventional Commits](contributing.md#commit-message-conventions) history; merging that PR tags the release and publishes a GitHub Release. An already-released section is never rewritten, so a correction to one persists across later releases (but does not reach an already-published release body, which has to be edited separately). The version string is derived from `version.txt` and embedded in every binary at compile time.
 
 ## Version stamping
 
