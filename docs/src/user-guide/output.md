@@ -140,6 +140,30 @@ relying solely on MAPQ.
 
 `HN:i` is emitted on the primary alignment record only.
 
+### `pa:f` — ratio to the better ALT hit
+
+```text
+pa:f:<ratio>
+```
+
+The record's alignment score divided by the score of the better overlapping
+hit on an ALT contig. Emitted, as in bwa and bwa-mem2, only on non-secondary
+records of a non-ALT hit that an ALT hit beats — so it never appears unless
+the index has an ALT sidecar (`<prefix>.alt`) marking contigs as alternate.
+
+The value is rounded to three decimals, matching both upstreams. `--bam` is
+defined to store the float32 that rounded decimal parses to — the same value
+`samtools view -b` of the SAM text would store — so the container is a format
+choice for this tag rather than a content change.
+
+The three writers disagreed on all of this before
+[#366](https://github.com/fg-labs/bwa-mem3/pull/366), so a pre-0.8.1 `--bam` or
+`--meth --bam` file carries a different `pa:f` value, on a different set of
+records, in a different tag position. See
+[Equivalence → `pa:f:` renders identically in SAM text and
+BAM](../whats-different/equivalence.md#paf-renders-identically-in-sam-text-and-bam-resolved-2026-08-05)
+for the divergence record and its verification scope.
+
 ### Methylation-only tags
 
 The following Bismark-compatible tags are emitted only when `--meth` is

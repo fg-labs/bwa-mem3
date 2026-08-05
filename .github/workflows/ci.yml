@@ -717,6 +717,20 @@ jobs:
           HD_PARITY_WORK_DIR=/tmp/hd-parity \
           bash test/regression/default_hd_parity.sh
 
+      - name: "pa:f: SAM vs --bam parity (ALT-aware fixture)"
+        if: matrix.canonical == true
+        run: |
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          ALT_PA_WORK_DIR=/tmp/alt-pa-parity \
+          bash test/regression/alt_pa_parity.sh
+
+      - name: "pa:f: --meth parity (ALT-aware bisulfite fixture)"
+        if: matrix.canonical == true
+        run: |
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          METH_ALT_PA_WORK_DIR=/tmp/meth-alt-pa-parity \
+          bash test/regression/meth_alt_pa_parity.sh
+
       - name: --meth output container follows --bam
         if: matrix.canonical == true
         run: |

@@ -3388,7 +3388,9 @@ void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str,
                     + rname_len + rnext_len    /* RNAME + RNEXT */
                     + md_len + xa_len + rg_len + comm_len + anno_len
                     + sa_need                  /* SA:Z (multi-supp) */
-                    + 256;                      /* slack for ints + tags */
+                    + 256;                      /* slack for ints + tags
+                                                 * (incl. pa:f:, bounded by
+                                                 * BWA_PA_TEXT_MAX) */
         ks_resize(str, str->l + need);
     }
 
@@ -3496,8 +3498,15 @@ void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str,
                 kputc_u(';', str);
             }
         }
-        if (p->alt_sc > 0)
-            ksprintf(str, "\tpa:f:%.3f", (double)p->score / p->alt_sc);
+        if (p->alt_sc > 0) {
+            /* Shared with the --bam and --meth writers so the three cannot
+             * drift again; see bwa_format_pa_value. The token is at most
+             * BWA_PA_TEXT_MAX-1 bytes, covered by the tag slack in the
+             * pre-size above, so the unsafe writes stay in bounds. */
+            char pa[BWA_PA_TEXT_MAX];
+            const int pa_len = bwa_format_pa_value(pa, p->score, p->alt_sc);
+            kputsn_u("\tpa:f:", 6, str); kputsn_u(pa, pa_len, str);
+        }
     }
 
     if (p->XA) { kputsn_u("\tXA:Z:", 6, str); kputs_u(p->XA, str); }

@@ -597,13 +597,11 @@ int meth_mem_aln_to_bam(bam1_t *b,
     if (bwa_rg_id[0]) {
         bam_aux_append(b, "RG", 'Z', (int)strlen(bwa_rg_id) + 1, (const uint8_t *)bwa_rg_id);
     }
-    if (p.alt_sc > 0) {
-        float pa_f = (float)((double)p.score / (double)p.alt_sc);
-        bam_aux_append(b, "pa", 'f', sizeof(pa_f), (const uint8_t *)&pa_f);
-    }
-    /* SA:Z (other primary hits) — mirrors mem_aln2sam. D3 (PR-5): rids are
-     * already ORIGINAL, so the contig name comes straight from bns->anns (no
-     * f/r→chrom rewrite). */
+    /* SA:Z (other primary hits) and pa:f — mirrors mem_aln2sam, which emits
+     * both only for non-secondary records and in this order.
+     *
+     * D3 (PR-5), SA:Z only: rids are already ORIGINAL, so the contig name comes
+     * straight from bns->anns (no f/r→chrom rewrite). */
     if (!(p.flag & 0x100)) {
         int has_other = 0;
         for (int i = 0; i < n_alns; ++i)
@@ -643,6 +641,13 @@ int meth_mem_aln_to_bam(bam1_t *b,
             if (sa->l > 0)
                 bam_aux_append(b, "SA", 'Z', (int)sa->l + 1, (const uint8_t *)sa->s);
             /* no free: bs.sa.s persists across records, freed on thread exit */
+        }
+        if (p.alt_sc > 0) {
+            /* Same shared value as the SAM-text and --bam writers; see
+             * bwa_pa_tag_value. --compat is refused under --meth, but a
+             * --meth --bam consumer still has to see the SAM rendering. */
+            float pa_f = bwa_pa_tag_value(p.score, p.alt_sc);
+            bam_aux_append(b, "pa", 'f', sizeof(pa_f), (const uint8_t *)&pa_f);
         }
     }
     /* XA:Z — D3 (PR-5): p.XA is produced by mem_gen_alt against the ORIGINAL
