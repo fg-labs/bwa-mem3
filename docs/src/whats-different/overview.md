@@ -40,6 +40,14 @@ The flat per-PR record — every fork-carried change with its bwa-mem3 PR, class
   to stock bwa-mem2. Typical values are 5–20 (lower = more aggressive); the
   upstream #260 repro drops from MAPQ=60 to MAPQ=0 at `--supp-rep-hard-cap 18`.
 
+- **`--proper-pair-from-emitted`** (opt-in, default disabled): derives the
+  proper-pair `FLAG` bit (`0x2`) from the alignment bwa-mem3 actually emits
+  rather than the top-scoring region. bwa and bwa-mem2 both use the top-scoring
+  region, so this deviates from both and is a hard error with `--compat`. It has
+  no effect without a `.alt` sidecar — the two derivations differ only for reads
+  with ALT hits. This was the default until
+  [#362](https://github.com/fg-labs/bwa-mem3/issues/362); see
+  [Correctness fixes](correctness.md).
 
 ## Version stamping
 

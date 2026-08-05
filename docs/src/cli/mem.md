@@ -151,16 +151,24 @@ Notes and caveats:
   different alignments, defeating the parity-validation purpose. `--compat` is
   for the drop-in profile. (`--compat=off --fast` is fine: `off` selects no
   target.)
+- **Mutually exclusive with [`--proper-pair-from-emitted`](#--proper-pair-from-emitted--derive-flag-0x2-from-the-emitted-alignment).**
+  Passing both is a hard error (`--compat and --proper-pair-from-emitted are
+  mutually exclusive`), for the same reason as `--fast`: that flag derives
+  `FLAG` `0x2` from the emitted alignment, which neither target does, so the
+  pair asks for byte-identity and for a documented deviation from it in one
+  command. (`--compat=off --proper-pair-from-emitted` is fine.)
 - **An `@HD` in `-H` warns but is allowed.** bwa-mem3 hoists a *leading* user
   `@HD` above the `@SQ` block, so the header is spec-valid (`@HD` must come
   first). Neither target does that — bwa emits `-H` records after `@SQ` and
   bwa-mem2 has no `@HD` handling at all — so the header differs from the target
   in **line order**. Records are unaffected.
 
-  This is not rejected, unlike `--fast` and `--meth`, because it is an explicit
-  and coherent request: *give me a valid SAM header, everything else the same*.
-  `--fast` silently moves alignments and `--meth` is a different mode — a user
-  cannot see either in their own command line. An `@HD` they typed, they can.
+  This is not rejected, unlike `--fast`, `--proper-pair-from-emitted` and
+  `--meth`, because it is an explicit and coherent request: *give me a valid SAM
+  header, everything else the same*. Those three change what the records say —
+  `--fast` silently moves alignments, `--proper-pair-from-emitted` moves `FLAG`
+  `0x2`, and `--meth` is a different mode — and a user cannot see any of them in
+  their own command line. An `@HD` they typed, they can.
 
   Only a *leading* `@HD` diverges; a later one is emitted inline after `@SQ`
   exactly as upstream does, and does not warn. Every other `-H` record (`@RG`,
@@ -766,6 +774,31 @@ at least `INT` occurrences in the genome. This targets supplementary
 alignments anchored in repetitive regions that upstream MAPQ scoring may
 overestimate. `0` disables the cap (default). Typical values are 5–20; lower
 values are more aggressive. Primary alignment MAPQ is unaffected.
+
+#### `--proper-pair-from-emitted` — derive FLAG `0x2` from the emitted alignment
+
+Derives the proper-pair `FLAG` bit (`0x2`) from the alignment bwa-mem3 actually
+emits (`a[which]`) rather than from the top-scoring region (`a[0]`).
+
+**bwa and bwa-mem2 both use `a[0]`**, even when the record they emit is
+`a[which]` — so this flag deviates from *both* upstreams, and is a **hard error**
+combined with [`--compat`](#--compattarget--byte-identical-output-for-another-aligner).
+
+**It has no effect on alignment output unless the index carries a `.alt`
+sidecar** (the `@PG` `CL:` field records the command line either way, so that
+one record always reflects the flag). The two
+derivations differ only when the top region scores below `-T` and the first ALT
+region clears it, which requires the read to have ALT hits; without a sidecar
+`is_alt` is never set and the branch is unreachable.
+
+This was bwa-mem3's default until
+[#362](https://github.com/fg-labs/bwa-mem3/issues/362), which found it moved
+`0x2` on 3,013 of 10,134,006 records on a 5 M-pair WGS slice (HG00096, GRCh38
+with the standard `.alt`), measured on an AWS c6a.4xlarge host (AMD EPYC Milan,
+x86_64, AVX2 tier) — all on decoy and ALT/HLA contigs, none on the primary
+assembly. Because `0x2` is aligner-defined,
+the drop-in path now takes upstream's answer and this became opt-in. See
+[Correctness fixes → Proper-pair flag](../whats-different/correctness.md).
 
 ### Debug
 

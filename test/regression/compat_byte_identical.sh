@@ -256,7 +256,51 @@ compat_err "unknown --compat target" --compat=bogus
 # and they disagree on MQ:i and @HD, which is the entire point of the enum.
 compat_err "unknown --compat target" --compat=bwa
 compat_err "unknown --compat target" --compat=BWA-MEM
+# --proper-pair-from-emitted deviates from BOTH upstreams on FLAG 0x2, so asking
+# for it alongside a byte-identity target is contradictory (fg-labs/bwa-mem3#362).
+# Same contract as --fast. It must be accepted on its own, or the opt-in escape
+# hatch #17's reasoning justifies would not exist.
+compat_err "mutually exclusive" --compat=bwa-mem2 --proper-pair-from-emitted
+compat_err "mutually exclusive" --compat=bwa-mem --proper-pair-from-emitted
+compat_ok --proper-pair-from-emitted
+compat_ok --compat=off --proper-pair-from-emitted
 echo "PASS: --compat enum grammar (=/space, alias, off, both targets, unknown, exactness)"
+
+# --- Source guard: both proper-pair sites share one derivation. --------------
+# The behavioural difference is reachable ONLY with a `.alt` sidecar, which no
+# fixture here has, so a consumer that ignored `proper_pair_from_emitted` and
+# hardcoded #17's `which[i]` would pass every other test in this suite and would
+# only surface as 3,013-per-10M FLAG diffs on a real ALT-aware run
+# (fg-labs/bwa-mem3#362). mem_sam_pe's scalar and batched no-pairing blocks are
+# verbatim copies of each other, so a fix applied to one and not the other is the
+# specific mistake to catch. Both now call mem_proper_pair_extra_flag, whose
+# behavior proper_pair_alt.sh checks end to end and whose region selection
+# test/unit/test_proper_pair_source.cpp pins against an independent oracle -- so
+# what is left to assert here is structural: exactly one definition, and no block
+# that quietly grew a private copy of the decision.
+PAIR_SRC="$(dirname "$0")/../../src/bwamem_pair.cpp"
+[[ -f "$PAIR_SRC" ]] || {
+    echo "FAIL: cannot find src/bwamem_pair.cpp at $PAIR_SRC" >&2
+    exit 1
+}
+n_calls=$(grep -c 'extra_flag |= mem_proper_pair_extra_flag(' "$PAIR_SRC" || true)
+n_guard=$(grep -c 'opt->proper_pair_from_emitted ? which\[' "$PAIR_SRC" || true)
+if [[ "$n_calls" -ne 2 ]]; then
+    echo "FAIL: expected 2 mem_proper_pair_extra_flag call sites (scalar + batched)," >&2
+    echo "      found $n_calls in bwamem_pair.cpp -- a no-pairing block either lost" >&2
+    echo "      the call or re-inlined the derivation" >&2
+    exit 1
+fi
+# Exactly one w0/w1 selection, i.e. inside the helper and nowhere else. A block
+# that re-inlined the ternary would push this to 4 and fail here even if it also
+# kept its call above.
+if [[ "$n_guard" -ne 2 ]]; then
+    echo "FAIL: expected exactly 2 'opt->proper_pair_from_emitted ? which[' lines -- the" >&2
+    echo "      w0 and w1 selections inside mem_proper_pair_extra_flag, and nowhere else" >&2
+    echo "      -- but found $n_guard in bwamem_pair.cpp" >&2
+    exit 1
+fi
+echo "PASS: both proper-pair sites derive FLAG 0x2 through one guarded helper"
 
 # --- The two targets must actually differ, not merely both be accepted. ---
 # bwa-mem keeps MQ:i and the default @HD; bwa-mem2 suppresses both. If a future

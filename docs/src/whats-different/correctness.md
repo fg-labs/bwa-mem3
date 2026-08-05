@@ -135,11 +135,40 @@ below the reporting threshold `opt->T` but a non-primary ALT hit cleared it,
 below-threshold primary. In that case the SAM flag did not reflect the
 coordinates in the record.
 
-The fix stores the selected alignment index per mate in a `which[2]` array and
-passes `a[i].a[which[i]].rb` to `mem_infer_dir`, ensuring the proper-pair
-flag always matches the emitted record. The bug was present in the bwa-mem2
-initial commit from 2019. Upstream reference: pre-existing bug, no open
-upstream PR at time of merge.
+`#17` stored the selected alignment index per mate in a `which[2]` array and
+passed `a[i].a[which[i]].rb` to `mem_infer_dir`, so the proper-pair flag matched
+the emitted record. **That derivation is now opt-in**: since
+[#362](https://github.com/fg-labs/bwa-mem3/issues/362) the default reads `a[0]`,
+as bwa and bwa-mem2 do, and `a[which]` is selected only under
+`--proper-pair-from-emitted` — see the note below for why. The `a[0]` derivation
+was present in the bwa-mem2 initial commit from 2019, inherited from bwa, which
+still has it at 0.7.19 (`bwamem_pair.c:411`). Upstream reference: pre-existing,
+no open upstream PR.
+
+> **Opt-in since [#362](https://github.com/fg-labs/bwa-mem3/issues/362) — the
+> default now matches both upstreams.** `0x2` is aligner-defined ("properly
+> aligned according to the aligner"), so deriving it from `a[which]` is a
+> defensible choice rather than a correction — and as a *default* it made
+> bwa-mem3's output differ from bwa **and** bwa-mem2 simultaneously. The
+> difference is confined to ALT-aware runs, and within those to the records
+> where the emitted alignment is not the top-scoring one (`a[which] != a[0]`,
+> which needs the read's top primary region to score below `-T` while its top
+> ALT region clears it); a run without a `.alt` sidecar is byte-identical
+> either way, excluding the `@PG` record, which records the command line.
+> Measured at **3,013 of 10,134,006 records** on a 5 M-pair WGS
+> slice (HG00096, GRCh38 with the standard `.alt`), on an AWS c6a.4xlarge host
+> (AMD EPYC Milan, x86_64, AVX2 tier), all on decoy and ALT/HLA contigs, none
+> on the primary assembly.
+>
+> The behavior is now reached via `--proper-pair-from-emitted` (a hard error
+> with `--compat`), and the default derives `0x2` from `a[0]` as bwa and
+> bwa-mem2 do. This follows the same call [#256](https://github.com/fg-labs/bwa-mem3/pull/256)
+> made on gap-open convention: where a fork-carried improvement moves output,
+> the drop-in path takes upstream's answer and the improvement becomes opt-in.
+>
+> The divergence is unreachable without a `.alt` sidecar — `a[which] != a[0]`
+> requires `n_pri < a.n`, i.e. the read has ALT hits, and `is_alt` is never set
+> without one.
 
 ---
 
@@ -157,7 +186,7 @@ upstream PR at time of merge.
 | AVX-512BW 16-bit score2 fix | [#30](https://github.com/fg-labs/bwa-mem3/pull/30) | — | fork-only |
 | NEON 16-bit kernel rewrite | [#31](https://github.com/fg-labs/bwa-mem3/pull/31) | — | fork-only |
 | kseq2bseq1 zero-initialization | [#22](https://github.com/fg-labs/bwa-mem3/pull/22) | — | fork-only |
-| Proper-pair flag from emitted alignment | [#17](https://github.com/fg-labs/bwa-mem3/pull/17) | — | fork-only |
+| Proper-pair flag from emitted alignment | [#17](https://github.com/fg-labs/bwa-mem3/pull/17) | — | fork-only, **opt-in** (`--proper-pair-from-emitted`; default matches both upstreams, [#362](https://github.com/fg-labs/bwa-mem3/issues/362)) |
 
 ---
 

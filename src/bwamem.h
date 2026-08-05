@@ -258,6 +258,26 @@ typedef struct mem_opt_t {
                             // the per-read meth_build_xm() pass entirely.
     char   meth_set_as_failed;// 'f', 'r', or 0 — flag reads on that strand 0x200
     int    meth_chimera_qc; // 1 to enable bwameth.py-style longest-M <44% chimera heuristic (default off; not in Bismark)
+    /* Derive the proper-pair FLAG bit (0x2) from the alignment actually EMITTED
+     * (a[which]) instead of the top-scoring region (a[0]). Opt-in; 0 = match
+     * bwa and bwa-mem2, which both use a[0] unconditionally.
+     *
+     * fg-labs/bwa-mem3#17 made a[which] the default, reasoning that deriving the
+     * bit from a[0] lets it describe a placement no emitted record carries. That
+     * reasoning stands, which is why the behavior is still reachable -- but 0x2
+     * is aligner-defined ("properly aligned according to the aligner"), so it is
+     * a choice rather than a correction, and as a default it made bwa-mem3
+     * differ from BOTH upstreams at once (fg-labs/bwa-mem3#362).
+     *
+     * Inert without a `.alt` sidecar: a[which] != a[0] requires n_pri < a.n (the
+     * read has ALT hits), and is_alt is never set without one.
+     *
+     * Deliberately NOT a compat_target_t field. Making the default match both
+     * upstreams means no target needs a say in it, which keeps that table's
+     * "output shaping only, never an alignment change" invariant intact -- FLAG
+     * is an alignment-record field. --compat and this option are instead
+     * mutually exclusive (see main_mem). */
+    int    proper_pair_from_emitted;
     int    supp_rep_hard_cap; // supp alnregs whose chain's seeds share >=this many genome hits are forced to MAPQ=0; 0 disables
     int    smem_dedup;        // 1 = dedup fully-identical SMEMs before SA expansion (--smem-dedup); 0 = off (default, byte-identical to baseline)
     int    alnreg_sort_fast;  // 1 = strict-total-order comparator + pdqsort at the mem_sort_dedup_patch sort sites (set by --fast); 0 = bwa-mem2's re-only comparator + ks_introsort (default, bwa-mem2-compatible)
@@ -668,6 +688,24 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
  * can share the same proper-pair classification used by mem_sam_pe's
  * no_pairing fallback. */
 int mem_infer_dir(int64_t l_pac, int64_t b1, int64_t b2, int64_t *dist);
+
+/* Proper-pair bit (FLAG 0x2) for a pair emitted on mem_sam_pe's no-pairing
+ * path. Returns 2 when properly paired and 0 otherwise, so the result ORs
+ * straight into extra_flag. `which[i]` is the index of the region mate i
+ * actually emits; both entries must be >= 0 and the two EMITTED regions
+ * (a[i].a[which[i]]) must already be known to share a reference sequence. That
+ * is all the caller checks, so on the default path -- which reads a[i].a[0] --
+ * the two coordinates may sit on different reference sequences and yield a
+ * cross-sequence distance. bwa and bwa-mem2 compute it the same way.
+ *
+ * The single definition of a decision the two no-pairing blocks make
+ * identically: derive 0x2 from the top-scoring region a[0] (bwa and bwa-mem2,
+ * the default) or from the emitted a[which] (#17, opt-in via
+ * --proper-pair-from-emitted). Inert without a `.alt` sidecar, since the two
+ * indices coincide unless the read has ALT hits. */
+int mem_proper_pair_extra_flag(const mem_opt_t *opt, int64_t l_pac,
+                               const mem_alnreg_v a[2], const int which[2],
+                               const mem_pestat_t pes[4]);
 
 int mem_sam_pe_batch(const mem_opt_t *opt, mem_cache *mmc,
                      int64_t &pcnt, int64_t &pcnt8, kswr_t *aln,
