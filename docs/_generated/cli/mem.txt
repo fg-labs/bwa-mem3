@@ -42,15 +42,17 @@ Options:
                   NOT byte-identical to the default (divergence confined to the
                   low-confidence tail). Also implies --chunk-cap 256000000.
     --compat STR  shape output to be byte-identical to another aligner.
-                  Targets: bwa-mem2 (alias mem2), off
-                  bwa-mem2: suppress the MQ:i and HN:i tags and the default @HD,
-                  and ignore the <prefix>.hdr / <baseprefix>.dict sidecar so @SQ
-                  is generated as bare SN/LN (+AH:* on ALT contigs) -- matching
-                  bwa-mem2 v2.2.1 on the drop-in profile. Suppresses output only;
-                  changes no alignment. @PG still differs (it is run-specific) --
-                  exclude it when comparing. Mutually exclusive with --fast (which
-                  changes alignments) and with --meth (bwa-mem2 has no bisulfite
-                  mode) -- combining them is an error [off]
+                  Targets: bwa-mem2 (alias mem2), bwa-mem, off
+                  Both targets drop the HN:i tag and ignore the <prefix>.hdr /
+                  <baseprefix>.dict sidecar, so @SQ is generated as bare SN/LN
+                  (+AH:* on ALT contigs). They differ where the upstreams do:
+                  bwa-mem2: also suppress MQ:i and the default @HD -- bwa-mem2
+                  v2.2.1 forked at bwa 0.7.17, before either landed.
+                  bwa-mem:  keep both -- bwa 0.7.18+ emits them. Pinned at 0.7.19.
+                  Shapes output only; changes no alignment. @PG still differs (it
+                  is run-specific) -- exclude it when comparing. Mutually exclusive
+                  with --fast (which changes alignments) and with --meth (neither
+                  target has a bisulfite mode) -- combining them is an error [off]
 Scoring options:
    -A INT        score for a sequence match, which scales options -TdBOELU unless overridden [1]
    -B INT        penalty for a mismatch [4]

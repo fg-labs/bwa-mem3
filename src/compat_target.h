@@ -40,8 +40,16 @@ typedef struct compat_target_t {
      * fully specified and unit-tested, but --compat refuses it and prints this
      * instead of a generic "unknown target". For a target whose output shaping
      * we know exactly but whose byte-identity we cannot deliver for other
-     * reasons -- see the bwa-mem row. The reason lives here, next to the
-     * evidence the row is built from, so the two cannot drift apart. */
+     * reasons. The reason lives here, next to the evidence the row is built
+     * from, so the two cannot drift apart.
+     *
+     * NO ROW SETS THIS TODAY -- `bwa-mem` was the one, until its blocking
+     * measurement was retracted (see compat_target.cpp). The field and its
+     * parser arm are kept because they are the row grammar's way of saying
+     * "specified, not yet offered", and the next target to need staging will
+     * want it rather than a hardcoded string in main_mem's getopt arm. The
+     * table test asserts every row is currently selectable, so a row that sets
+     * this has to say so deliberately. */
     const char *unavailable_reason;
 
     /* Emit a default @HD when neither -H nor the index sidecar supplies one. */

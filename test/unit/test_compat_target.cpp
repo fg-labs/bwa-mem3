@@ -1,14 +1,12 @@
 // test/unit/test_compat_target.cpp — the `--compat` target table.
 //
 // The table in src/compat_target.cpp is DATA transcribed from upstream
-// sources, and one of its rows (bwa-mem) is deliberately not reachable from
-// the CLI. Both facts make it prone to silent rot: a transcription error is
-// invisible until someone diffs against the real aligner, and an unreachable
-// row is exercised by nothing else. So assert every field of every row here,
-// against the same citations the table comments carry.
+// sources, which makes it prone to silent rot: a transcription error is
+// invisible until someone diffs against the real aligner. So assert every
+// field of every row here, against the same citations the table comments carry.
 //
-// Verified 2026-07-24 against ~/work/git/bwa @ 91fb301 (0.7.19-r1273) and
-// bwa-mem2 v2.2.1. If a row changes, the upstream evidence must change with it.
+// Verified against lh3/bwa v0.7.19 (b92993c, 0.7.19-r1273) and bwa-mem2
+// v2.2.1. If a row changes, the upstream evidence must change with it.
 
 #include <cstring>
 #include <string>
@@ -62,15 +60,15 @@ TEST_CASE("compat target `bwa-mem2` matches bwa-mem2 v2.2.1") {
     CHECK(t->emit_hn == 0);
 }
 
-TEST_CASE("compat target `bwa-mem` is fully specified but not selectable") {
+TEST_CASE("compat target `bwa-mem` matches bwa 0.7.19") {
     const compat_target_t *t = row("bwa-mem");
     CHECK(std::string(t->name) == "bwa-mem");
-    // Not selectable: bwa-mem3 and bwa still differ on the ALIGNMENTS, so
-    // offering the target would advertise a byte-identity we cannot deliver.
-    // The row exists because its output shaping is fully determined by the
-    // evidence below; when the alignment work lands, this becomes nullptr.
-    REQUIRE(t->unavailable_reason != nullptr);
-    CHECK(std::string(t->unavailable_reason).find("byte-identity") != std::string::npos);
+    CHECK(t->alias == nullptr);
+    // Selectable since 0.9.0. It was staged behind unavailable_reason on the
+    // strength of a divergence measurement later retracted as mis-pinned; the
+    // re-measurement puts bwa 0.7.19, bwa-mem2 v2.2.1 and bwa-mem3 in
+    // byte-for-byte agreement on records once the additive tags come off.
+    CHECK(t->unavailable_reason == nullptr);
     // bwa.c:426 — emitted unconditionally when -H supplies no @HD. bwa-mem3's
     // own default is byte-identical to it, so this row shares the constant.
     REQUIRE(t->emit_hd == 1);
@@ -105,11 +103,6 @@ TEST_CASE("compat target lookup: aliases, unknown names, NULL") {
     CHECK(compat_target_from_name("bwa-mem4") == nullptr);
     CHECK(compat_target_from_name("") == nullptr);
     CHECK(compat_target_from_name(nullptr) == nullptr);
-    // ...while a RECOGNIZED but unavailable name resolves, so the caller can
-    // tell the user the real reason instead of "unknown target".
-    const compat_target_t *t = compat_target_from_name("bwa-mem");
-    REQUIRE(t != nullptr);
-    CHECK(t->unavailable_reason != nullptr);
     // Lookup is exact: no prefix or case folding.
     CHECK(compat_target_from_name("bwa") == nullptr);
     CHECK(compat_target_from_name("BWA-MEM2") == nullptr);
@@ -147,15 +140,24 @@ TEST_CASE("every table row is reachable by name, and rows are self-consistent") 
         else
             CHECK_MESSAGE(t->hd_line == nullptr,
                           "row ", t->name, " pins hd_line but emits no @HD");
+        // Every row is currently selectable. `unavailable_reason` is still part
+        // of the row grammar (see compat_target.h) but has no user, so staging
+        // a row behind it again must be a deliberate act that edits this test
+        // -- not something a half-finished row falls into.
+        CHECK_MESSAGE(t->unavailable_reason == nullptr,
+                      "row ", t->name, " is staged as unavailable; if that is "
+                      "intended, relax this assertion and say why");
     }
 }
 
 TEST_CASE("the selectable list is derived from the table") {
-    // Pinned exactly. A membership loop would be the obvious test, but
-    // `find(t->name)` cannot express it: "bwa-mem" is a prefix of "bwa-mem2",
-    // so the unavailable bwa-mem row would look listed. Splitting the string
-    // to fix that restates, at length, what this one comparison already says --
-    // any table change that would break membership breaks equality first, with
-    // a clearer failure message.
-    CHECK(std::string(compat_target_selectable_list()) == "bwa-mem2 (alias mem2), off");
+    // Pinned exactly, including ORDER: the table is ordered so diagnostics read
+    // real targets first and `off` last, and this is the only assertion that
+    // would catch a reordering. A membership loop would be the obvious test,
+    // but `find(t->name)` cannot express it -- "bwa-mem" is a prefix of
+    // "bwa-mem2", so a listed bwa-mem2 would make an absent bwa-mem look
+    // listed. Any table change that breaks membership breaks equality first,
+    // with a clearer failure message.
+    CHECK(std::string(compat_target_selectable_list())
+          == "bwa-mem2 (alias mem2), bwa-mem, off");
 }

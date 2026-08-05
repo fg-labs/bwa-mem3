@@ -76,28 +76,51 @@ Shapes bwa-mem3's output so it is byte-for-byte identical to another aligner's.
 | target | meaning |
 |---|---|
 | `bwa-mem2` (alias `mem2`) | match bwa-mem2 v2.2.1 |
+| `bwa-mem` | match bwa 0.7.19 |
 | `off` | bwa-mem3's native output — identical to omitting the flag |
 
 ```bash
 bwa-mem3 mem --compat=bwa-mem2 -t 16 ref.fa R1.fq R2.fq > out.sam
 bwa-mem3 mem --compat bwa-mem2 -t 16 ref.fa R1.fq R2.fq > out.sam   # same
+bwa-mem3 mem --compat=bwa-mem  -t 16 ref.fa R1.fq R2.fq > out.sam
 ```
 
-Under `--compat=bwa-mem2`, bwa-mem3 suppresses exactly the differences that are
-bwa-mem3-side additions, and nothing else:
+**`--compat` takes a target rather than being a boolean because the two
+upstreams disagree with each other** on half of what it shapes. bwa gained a
+default `@HD` ([lh3/bwa#336](https://github.com/lh3/bwa/pull/336), merged 2022-03-06,
+shipped in 0.7.18 as `6b18630`) and the `MQ:i` tag
+([lh3/bwa#330](https://github.com/lh3/bwa/pull/330), merged 2022-03-06) *after*
+bwa-mem2 forked at 0.7.17, so matching one means emitting exactly what matching
+the other means suppressing:
 
-- **`MQ:i`** (mate MAPQ) and **`HN:i`** (hit count) are not emitted. Note only
-  `HN` is genuinely a bwa-mem3 invention — bwa emits `MQ` too
-  ([lh3/bwa#330](https://github.com/lh3/bwa/pull/330), merged 2022-03-06);
-  bwa-mem2 lacks it only because it forked at 0.7.17, before that landed.
-- **The default `@HD` line** is not emitted. bwa-mem2 v2.2.1 writes no `@HD` at
-  all; bwa gained one in 0.7.18 (`6b18630`), again after the fork. A user `@HD`
-  from `-H` is still honored.
-- **The `<prefix>.hdr` / `<baseprefix>.dict` sidecar is not read**, so `@SQ` is
-  generated from the index as bare `SN`/`LN` (plus `AH:*` on ALT contigs, which
-  bwa-mem2 does emit). The sidecar is a bwa-mem3-only feature — a port of
-  [lh3/bwa#348](https://github.com/lh3/bwa/pull/348), which upstream closed
-  unmerged — so its `M5`/`AS`/`UR`/`SP` have no counterpart to match.
+| | `off` (default) | `--compat=bwa-mem2` | `--compat=bwa-mem` |
+|---|---|---|---|
+| `MQ:i` mate MAPQ | emitted | **suppressed** | emitted |
+| `HN:i` hit count | emitted | **suppressed** | **suppressed** |
+| default `@HD` | emitted | **suppressed** | emitted |
+| `.hdr`/`.dict` sidecar `@SQ` | honored | **ignored** | **ignored** |
+| `@PG` | `ID:bwa-mem3` | `ID:bwa-mem3` | `ID:bwa-mem3` |
+
+Only **`HN:i`** and the sidecar are genuinely bwa-mem3 inventions, which is why
+both targets drop them. The rest is the fork point.
+
+- **`HN:i`** (hit count) is emitted by neither upstream, so both targets
+  suppress it.
+- **The `<prefix>.hdr` / `<baseprefix>.dict` sidecar is not read** under either
+  target, so `@SQ` is generated from the index as bare `SN`/`LN` (plus `AH:*` on
+  ALT contigs, which both upstreams emit). The sidecar is a bwa-mem3-only
+  feature — a port of [lh3/bwa#348](https://github.com/lh3/bwa/pull/348), which
+  upstream closed unmerged — so its `M5`/`AS`/`UR`/`SP` have no counterpart to
+  match.
+- **`MQ:i` and the default `@HD`** are suppressed only under
+  `--compat=bwa-mem2`. Under `--compat=bwa-mem` both are emitted, and the `@HD`
+  string bwa-mem3 writes is byte-identical to bwa's (`bwa.c:426`), so no
+  reshaping is needed. A user `@HD` from `-H` is honored under both.
+
+**`bwa-mem` means bwa 0.7.19 specifically**, and the pin is load-bearing: a
+0.7.17 target would be this row's opposite on `MQ:i` and `@HD` — and therefore
+identical to `bwa-mem2` except for the `@PG` `ID`. If you are on bwa 0.7.17,
+`--compat=bwa-mem2` is the target you want.
 
 `--compat` is **output-shaping only** — it changes no alignment, no score, no
 flag, and no tag's value. It exists so pipelines validating bwa-mem3 against a
@@ -143,14 +166,31 @@ Notes and caveats:
   exactly as upstream does, and does not warn. Every other `-H` record (`@RG`,
   `@CO`, `@PG`, `@SQ`) and all of `-R` compose with `--compat` normally.
 - **Non-`--meth` only; combining them is a hard error**
-  (`--compat is not supported with --meth`). bwa-mem2 has no bisulfite mode, so
-  byte-identity is undefined under `--meth`, which also emits
+  (`--compat is not supported with --meth`). Neither target has a bisulfite
+  mode, so byte-identity is undefined under `--meth`, which also emits
   methylation-specific tags that no target models.
-- **`--compat=bwa-mem` is recognized but rejected.** bwa-mem3 and bwa still
-  differ on 224 of 63,583 records (53 above MAPQ 30) in MAPQ, CIGAR, POS and
-  TLEN, so byte-identity is not achievable no matter what output is suppressed.
-  The target's output shaping is already specified in `src/compat_target.cpp`;
-  it becomes selectable when the alignment work lands.
+- **The two targets differ on every mated record, by design.** This is worth
+  stating because "both upstreams are the same aligner" invites the opposite
+  assumption. Measured on a 4.06 M-pair GRCh37 run, bwa 0.7.19 and bwa-mem2
+  v2.2.1 differ on **all 8,116,326 records** — and on **0** once `MQ:i` is
+  stripped. So the two targets are not interchangeable today, and picking the
+  wrong one produces a diff on essentially every record with a mapped mate.
+- **Evidence.** `--compat=bwa-mem` is validated at **322,978,938 alignment
+  records across two reference builds** (GATK hg38 and hs37d5), every record
+  byte-identical to a real `bwa` 0.7.19 run; `--compat=bwa-mem2` at 22.5 M
+  records plus full header byte-identity on both the SAM-text and `--bam` paths.
+  Both also carry a phiX-scale end-to-end check in the regression suite. The
+  datasets, hosts, architectures and SIMD tiers behind those totals — and the
+  one path they leave untested — are itemized in [Equivalence → Byte-identical
+  output](../whats-different/equivalence.md#byte-identical-output---compat),
+  which is the single scope of record for both targets. Read it before treating
+  either number as a general guarantee.
+- **Only one target can be byte-identical on a record where the upstreams
+  themselves disagree.** `--compat` shapes output and never moves an alignment,
+  so if bwa and bwa-mem2 ever emit different alignment fields for the same read,
+  bwa-mem3 matches at most one of them. No such record has been observed, and an
+  audit of bwa 0.7.17…0.7.19 finds no change to seeding, chaining, extension,
+  pairing, MAPQ or dedup — but the tail is not proven empty.
 
 See [Equivalence with bwa-mem2 → Byte-identical output
 (`--compat`)](../whats-different/equivalence.md#byte-identical-output---compat).

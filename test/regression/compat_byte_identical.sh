@@ -220,8 +220,8 @@ echo "PASS: --compat --meth is rejected as a hard error"
 # --- --compat is an enum: check the grammar the CLI advertises. ---
 # `--compat` takes a required argument, so every accepted spelling and every
 # rejection below is a contract the docs state. A regression here is silent
-# otherwise: a wrong optstring turns `--compat=off` into a hard error, or
-# `--compat=bwa-mem` into a claim of parity we cannot deliver.
+# otherwise -- a wrong optstring turns `--compat=off` into a hard error, or
+# swallows the index prefix as if it were a target name.
 compat_ok() { # spelling... -- must exit 0
     if ! "$BWA_MEM3" mem "$@" "$ref" "$r1" "$r2" > /dev/null 2> "$COMPAT_WORK_DIR/cli.log"; then
         echo "FAIL: 'mem $*' exited nonzero, expected success:" >&2
@@ -248,12 +248,59 @@ compat_ok --compat bwa-mem2   # canonical, space form (required_argument)
 compat_ok --compat=mem2       # documented alias
 compat_ok --compat=off        # explicit no-op
 compat_ok --compat=off --fast # off must NOT trip the --fast guard
+compat_ok --compat=bwa-mem    # selectable since 0.9.0
+compat_ok --compat bwa-mem    # space form, and NOT confusable with bwa-mem2
 compat_err "unknown --compat target" --compat=bogus
-# bwa-mem is a real row in the table, deliberately not selectable. It must
-# get its own diagnostic -- calling it "unknown" would be a lie, and a user
-# asking for it deserves the actual reason.
-compat_err "not yet selectable" --compat=bwa-mem
-echo "PASS: --compat enum grammar (=/space, alias, off, unknown, unselectable)"
+# Exact match only. `bwa-mem` is a prefix of `bwa-mem2`, so a lookup that ever
+# grew prefix or case folding would silently route one target to the other --
+# and they disagree on MQ:i and @HD, which is the entire point of the enum.
+compat_err "unknown --compat target" --compat=bwa
+compat_err "unknown --compat target" --compat=BWA-MEM
+echo "PASS: --compat enum grammar (=/space, alias, off, both targets, unknown, exactness)"
+
+# --- The two targets must actually differ, not merely both be accepted. ---
+# bwa-mem keeps MQ:i and the default @HD; bwa-mem2 suppresses both. If a future
+# refactor collapsed the rows, every assertion above would still pass while the
+# flag silently stopped meaning anything.
+mem_sam="$COMPAT_WORK_DIR/target-bwa-mem.sam"
+"$BWA_MEM3" mem --compat=bwa-mem "$ref" "$r1" "$r2" > "$mem_sam" 2> /dev/null
+if ! grep -q '^@HD' "$mem_sam"; then
+    echo "FAIL: --compat=bwa-mem emitted no @HD (bwa 0.7.19 emits one; bwa.c:426)" >&2
+    exit 1
+fi
+if [[ "$(grep -c '^@HD' "$mem_sam")" -ne 1 ]]; then
+    echo "FAIL: --compat=bwa-mem emitted more than one @HD" >&2
+    exit 1
+fi
+if [[ "$(grep '^@HD' "$mem_sam")" != "$(printf '@HD\tVN:1.5\tSO:unsorted\tGO:query')" ]]; then
+    echo "FAIL: --compat=bwa-mem @HD is not byte-identical to bwa 0.7.19's (bwa.c:426):" >&2
+    grep '^@HD' "$mem_sam" >&2
+    exit 1
+fi
+# The tag assertions below are single greps, not `grep -v '^@' | grep -q ...`
+# pipelines: under `set -o pipefail` a downstream `grep -q` closes the pipe on
+# its first match, so the upstream `grep -v` can die of SIGPIPE and fail the
+# whole pipeline on output that is in fact correct. `^[^@]` selects record lines
+# without a pipe, and anchoring the tag to a leading tab additionally pins it to
+# a field boundary rather than matching the same bytes inside SEQ or QUAL.
+if ! grep -q '^[^@]' "$mem_sam"; then
+    echo "FAIL: --compat=bwa-mem emitted a header but no alignment records" >&2
+    exit 1
+fi
+if ! grep -q $'^[^@].*\tMQ:i:' "$mem_sam"; then
+    echo "FAIL: --compat=bwa-mem suppressed MQ:i (bwa emits it; bwamem.c:935)" >&2
+    exit 1
+fi
+if grep -q $'^[^@].*\tHN:i:' "$mem_sam"; then
+    echo "FAIL: --compat=bwa-mem emitted HN:i, which bwa has no counterpart for" >&2
+    exit 1
+fi
+# ...and the bwa-mem2 stream, already written above, must be its opposite.
+if grep -q '^@HD' "$cmp_sam" || grep -q $'^[^@].*\tMQ:i:' "$cmp_sam"; then
+    echo "FAIL: --compat=bwa-mem2 emitted @HD or MQ:i; the two targets have collapsed" >&2
+    exit 1
+fi
+echo "PASS: bwa-mem keeps @HD + MQ:i and drops HN:i; bwa-mem2 drops all three"
 
 # --- --compat with an @HD in -H warns, and does NOT reject. --------------
 # bwa-mem3 hoists a LEADING user @HD above @SQ so the header is spec-valid;
