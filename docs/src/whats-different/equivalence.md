@@ -232,7 +232,13 @@ Caveats:
   did not execute in any of those 314.9 M records. That is proven rather than assumed: the
   comparison runs a strict expected-tag allowlist with no `pa` entry and fails by name on an
   unexpected tag, and no `pa:f:` tag — emitted only when the ALT score is positive — appeared
-  anywhere in the matrix. Two further upstream divergence reports
+  anywhere in the matrix. That gap is now partly closed in CI rather than only
+  documented: `test/regression/alt_pa_parity.sh` builds an ALT sidecar and aligns
+  reads sampled from the ALT contig, so `is_alt` → `alt_sc` → `pa:f:` executes on
+  every canonical run (see [`pa:f:` renders identically in SAM text and
+  BAM](#paf-renders-identically-in-sam-text-and-bam-resolved-2026-08-05)). ALT
+  primary selection, ALT MAPQ adjustment and the `-h INT,INT` cap remain
+  unmeasured. Two further upstream divergence reports
   ([bwa-mem2#227](https://github.com/bwa-mem2/bwa-mem2/issues/227),
   [bwa-mem2#61](https://github.com/bwa-mem2/bwa-mem2/issues/61)) are specifically about ALT
   handling, and nothing on this page covers them.
@@ -309,6 +315,39 @@ while upstream emits:
 Same alignment, same scores — two extra tags. Because these tags are inserted into the optional-field area of the record, the line is no longer byte-identical to upstream even though the alignment it describes is. `MQ:i` is one of the lh3/bwa tags ported in [#35](https://github.com/fg-labs/bwa-mem3/pull/35); `HN:i` is added in [#42](https://github.com/fg-labs/bwa-mem3/pull/42). See [Features → `HN:i` hit count tag](features.md) for the full semantics.
 
 Separately, the `@PG` header line reports `ID:bwa-mem3` / `PN:bwa-mem3` rather than `bwa-mem2`, which is also a byte-level header difference by design. It is not the only one: bwa-mem3 emits a default `@HD` line, which bwa-mem2 v2.2.1 has no code to write at all, so the header block differs by more than `@PG` alone ([#288](https://github.com/fg-labs/bwa-mem3/issues/288)). None of the record-level byte-identity results above depend on the header — every one of them compares alignment records only.
+
+### `pa:f:` renders identically in SAM text and BAM (resolved 2026-08-05)
+
+`pa:f:` is not additive — bwa and bwa-mem2 both emit it — but bwa-mem3 has three
+writers where they have one, and the three disagreed with each other until
+[#366](https://github.com/fg-labs/bwa-mem3/pull/366)
+([#365](https://github.com/fg-labs/bwa-mem3/issues/365)):
+
+| writer | value | guard | position |
+| --- | --- | --- | --- |
+| `mem_aln2sam` (SAM text) | `"%.3f"`, as both upstreams | non-secondary only | after `SA:Z` |
+| `mem_aln_to_bam` (`--bam`) | raw unrounded `float` quotient | none | before `SA:Z` |
+| `meth_mem_aln_to_bam` (`--meth`) | raw unrounded `float` quotient | none | before `SA:Z` |
+
+So `bwa-mem3 mem --bam` stored `0.806723` where `bwa-mem3 mem \| samtools view -b`
+stored `float32("0.807")`, and under `--compat` the BAM path matched neither
+upstream. All three now render through one shared definition, so `--bam` is a
+container choice for this tag rather than a content change: the stored float32 is
+by construction the one the three-decimal SAM token parses to.
+
+**This is an intentional change to `--bam` and `--meth --bam` output.** A consumer
+that read `pa` from a pre-0.8.1 `--bam` file sees a different (correctly rounded)
+value, no `pa` on secondary records, and `pa` after `SA:Z` instead of before it.
+SAM-text output is unchanged.
+
+Verification scope: `test/regression/alt_pa_parity.sh` (canonical CI row — Linux
+x86_64, AVX2, mimalloc) generates an ALT-aware fixture whose reads come from the
+ALT contig and asserts the decoded float32 is equal record-for-record across the
+two containers, at 3,904 records of which 1,904 carry the tag. It fails on the
+merge base with 1,356 of those 1,904 differing. Rounding semantics and tag order
+are pinned separately in `test/unit/test_bam_pa_tag_parity.cpp`. Nothing here is a
+cross-aligner measurement: bwa-mem2 is not run, because the SAM rendering that
+both upstreams produce is what the BAM path is being held to.
 
 ### Additional supplementary alignments (resolved)
 

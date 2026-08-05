@@ -30,6 +30,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <zlib.h>
 #include <assert.h>
 #include "bntseq.h"
@@ -706,6 +707,36 @@ int bwa_format_sq_line(kstring_t *out, const bntann1_t *ann)
      * writer must re-apply it from bns rather than expect it to survive. */
     if (ann->is_alt) kputs("\tAH:*", out);
     return 0;
+}
+
+int bwa_format_pa_value(char *buf, int score, int alt_sc)
+{
+    /* "%.3f" is what both upstreams emit (bwa bwamem.c, bwa-mem2 bwamem.cpp),
+     * and it is the rendering every consumer that goes through SAM text sees.
+     *
+     * Deliberately no failure return. A short render would make the SAM path
+     * emit a valueless `pa:f:` while bwa_pa_tag_value's strtod of the same
+     * buffer stored 0 in BAM -- the very disagreement this function exists to
+     * remove, reintroduced on an error path. BWA_PA_TEXT_MAX bounds "%.3f" of
+     * any int/int ratio, so the guard is unreachable rather than a policy. */
+    xassert(alt_sc != 0, "pa:f: has no value when alt_sc is zero");
+    const int n = snprintf(buf, BWA_PA_TEXT_MAX, "%.3f", (double)score / alt_sc);
+    xassert(n > 0 && n < BWA_PA_TEXT_MAX, "pa:f: value did not fit its buffer");
+    return n;
+}
+
+float bwa_pa_tag_value(int score, int alt_sc)
+{
+    /* Round-tripping the SAM token is not a roundabout way to round -- it is
+     * the definition. A BAM `pa:f:` field has to hold what `samtools view -b`
+     * of the SAM text would store, and htslib parses an 'f' aux field with
+     * strtod and narrows to float. Reproducing that literally is the only
+     * construction guaranteed to agree with the text path on every input,
+     * including the halfway cases where printf's round-to-even and round()'s
+     * round-away-from-zero disagree. */
+    char buf[BWA_PA_TEXT_MAX];
+    bwa_format_pa_value(buf, score, alt_sc);
+    return (float)strtod(buf, NULL);
 }
 
 /* True if the SAM header text `s` contains a record whose type is `tag` (e.g.

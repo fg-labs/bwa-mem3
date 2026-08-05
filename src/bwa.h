@@ -48,6 +48,10 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 
 #define BWA_CTL_SIZE 0x10000
 
+/* Buffer size for bwa_format_pa_value(). The widest "%.3f" of an int/int
+ * ratio is "-2147483648.000" (15 chars + NUL), so this cannot truncate. */
+#define BWA_PA_TEXT_MAX 20
+
 typedef struct {
 	// bwt2_t   *bwt2;
 	bwt_t    *bwt; // FM-index
@@ -175,6 +179,26 @@ extern "C" {
 	 * or -1 if `out` could not be grown -- on -1 no record was appended and
 	 * `out->s` may be NULL, so callers must not emit `out`. */
 	int bwa_format_sq_line(kstring_t *out, const bntann1_t *ann);
+	/* Render the `pa` tag value -- the ratio of a hit's score to the score of
+	 * the better overlapping ALT hit -- into `buf`, which must be at least
+	 * BWA_PA_TEXT_MAX bytes. Returns the length written, excluding the NUL.
+	 *
+	 * The single definition shared by the SAM-text, --bam and --meth writers.
+	 * It exists because those three used to render `pa` independently: the SAM
+	 * path rounded to three decimals (as both upstreams do) while the two BAM
+	 * paths stored the raw quotient, so a `--bam` run and a `samtools view -b`
+	 * of the same run's SAM disagreed on ~90% of the records that carry the
+	 * tag (fg-labs/bwa-mem3#365). `alt_sc` must be non-zero. The return is
+	 * always positive: there is no short-render path, because one would make
+	 * the SAM and BAM writers disagree again. */
+	int bwa_format_pa_value(char *buf, int score, int alt_sc);
+	/* The same value as the float32 a BAM `pa:f:` field holds, i.e. exactly
+	 * what a consumer that parses the SAM token above would store. Derived
+	 * from that token rather than computed independently: rounding the
+	 * quotient arithmetically is NOT equivalent, because printf breaks a tie
+	 * at the fourth decimal to even where round() breaks it away from zero
+	 * (39/48 renders as 0.812, not 0.813). */
+	float bwa_pa_tag_value(int score, int alt_sc);
 	/* True if SAM header text `s` contains a record whose type is `tag`
 	 * ("@HD\t", "@SQ\t", ...), as the first line or after a newline. The type
 	 * may be any length; an empty one matches nothing. */

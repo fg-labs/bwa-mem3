@@ -405,11 +405,8 @@ int mem_aln_to_bam(struct bam1_t *b,
     if (bwa_rg_id[0]) {
         bam_aux_append(b, "RG", 'Z', (int)strlen(bwa_rg_id) + 1, (const uint8_t *)bwa_rg_id);
     }
-    if (p.alt_sc > 0) {
-        float pa_f = (float)((double)p.score / (double)p.alt_sc);
-        bam_aux_append(b, "pa", 'f', sizeof(pa_f), (const uint8_t *)&pa_f);
-    }
-    /* SA:Z (other primary hits) — mirrors mem_aln2sam */
+    /* SA:Z (other primary hits) and pa:f — mirrors mem_aln2sam, which emits
+     * both only for non-secondary records and in this order. */
     if (!(p.flag & 0x100)) {
         int has_other = 0;
         for (int i = 0; i < n_alns; ++i)
@@ -444,6 +441,13 @@ int mem_aln_to_bam(struct bam1_t *b,
             if (sa->l > 0)
                 bam_aux_append(b, "SA", 'Z', (int)sa->l + 1, (const uint8_t *)sa->s);
             /* no free: bs.sa.s persists across records, freed on thread exit */
+        }
+        if (p.alt_sc > 0) {
+            /* The float32 the SAM token decodes to, not the raw quotient —
+             * --bam is a container choice, not a content change. Shared with
+             * the SAM-text writer; see bwa_pa_tag_value. */
+            float pa_f = bwa_pa_tag_value(p.score, p.alt_sc);
+            bam_aux_append(b, "pa", 'f', sizeof(pa_f), (const uint8_t *)&pa_f);
         }
     }
     if (p.XA != NULL) {
