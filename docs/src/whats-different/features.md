@@ -85,6 +85,14 @@ upstream [bwa-mem2#260](https://github.com/bwa-mem2/bwa-mem2/issues/260)
 reporter case drops from MAPQ=60 to MAPQ=0 at `--supp-rep-hard-cap 18`.
 Closes [issue #46](https://github.com/fg-labs/bwa-mem3/issues/46).
 
+## `--proper-pair-from-emitted` proper-pair `FLAG` source (PR #363)
+
+`--proper-pair-from-emitted` derives the proper-pair bit (`FLAG` `0x2`) from the alignment each record actually carries (`a[which]`) instead of the top-scoring region (`a[0]`). Default off, which is bwa's and bwa-mem2's behavior — both derive the bit from `a[0]` unconditionally, even when the record they emit is `a[which]`.
+
+The option is a deliberate deviation from both upstreams, so it is **incompatible with `--compat`**: supplying both is a hard error, the same contract `--fast` has. It is also inert without a `.alt` sidecar — the two regions coincide unless the read has ALT hits — so on a reference without one, the alignment output is byte-identical either way, excluding the `@PG` record, whose `CL:` field records the command line and therefore always reflects the flag.
+
+This is a correctness-argument item rather than a capability, so the reasoning, the measurement, and the [#17](https://github.com/fg-labs/bwa-mem3/pull/17) → [#362](https://github.com/fg-labs/bwa-mem3/issues/362) history live in [Correctness fixes → Proper-pair flag](correctness.md), with the divergence recorded in [Equivalence](equivalence.md).
+
 ## Shared-memory index: `bwa-mem3 shm` (PR #65)
 
 `bwa-mem3 mem` reloads the FM-index from disk on every invocation. For hg38
@@ -274,6 +282,7 @@ See [Optimization checklist → Reorder seeds longest-first](../best-practices/o
 | `--meth` bisulfite alignment mode | [#13](https://github.com/fg-labs/bwa-mem3/pull/13) | — | fork-only |
 | Vendored mimalloc allocator | [#19](https://github.com/fg-labs/bwa-mem3/pull/19) | — | fork-only |
 | `--supp-rep-hard-cap` MAPQ rescoring | [#56](https://github.com/fg-labs/bwa-mem3/pull/56) | [bwa-mem2#260](https://github.com/bwa-mem2/bwa-mem2/issues/260) | fork-only (upstream issue open) |
+| `--proper-pair-from-emitted` `FLAG` `0x2` source | [#363](https://github.com/fg-labs/bwa-mem3/pull/363) | — | fork-only (opt-in, off by default; default matches both upstreams) |
 | `bwa-mem3 shm` shared-memory index | [#65](https://github.com/fg-labs/bwa-mem3/pull/65) | — | fork-only |
 | `shm --meth` symmetry | [#67](https://github.com/fg-labs/bwa-mem3/pull/67) | — | fork-only |
 | `HN:i` hit count tag | [#42](https://github.com/fg-labs/bwa-mem3/pull/42) | [lh3/bwa#438](https://github.com/lh3/bwa/pull/438) | fork-only (analogous to bwa aln) |

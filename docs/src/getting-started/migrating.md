@@ -38,7 +38,9 @@ bwa-mem3 mem -t 16 -R '@RG\tID:s1\tSM:s1' ref.fa R1.fq.gz R2.fq.gz > out.sam
 
 bwa-mem3 adds a few flags on top (none change default behavior): `--bam[=N]`
 (emit BAM directly), `--meth` (native bisulfite/EM-seq), `--supp-rep-hard-cap`
-and `--min-ext-len` (opt-in tuning). See the [CLI reference](../cli/mem.md).
+and `--min-ext-len` (opt-in tuning), and `--proper-pair-from-emitted` (opt-in;
+moves `FLAG` `0x2` away from what bwa and bwa-mem2 emit, so it is a hard error
+with `--compat`). See the [CLI reference](../cli/mem.md).
 
 ## 3. Output is equivalent, not byte-identical
 

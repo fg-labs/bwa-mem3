@@ -395,6 +395,14 @@ mem_opt_t *mem_opt_init()
     o->meth_chem    = METH_CHEM_EMSEQ;             /* --meth default chemistry: bisulfite/em-seq */
     o->meth_tags    = MEM_METH_TAGS_ALL;           /* --meth default: emit XR/XG/XM (Bismark set) */
     o->compat       = &COMPAT_TARGET_OFF;          /* --compat off: bwa-mem3's native output */
+    /* Match bwa and bwa-mem2, which both derive FLAG 0x2 from a[0]. Explicit
+     * rather than left to calloc: this default is what keeps the proper-pair
+     * bit agreeing with both upstreams on ALT-aware runs (fg-labs/bwa-mem3#362)
+     * -- it settles FLAG 0x2 alone, not the rest of the record, which still
+     * carries bwa-mem3's own MQ/HN tags and header unless --compat shapes them
+     * away -- and a default that important should be visible where the others
+     * are set. */
+    o->proper_pair_from_emitted = 0;
     bwa_fill_scmat(o->a, o->b, o->mat);
     mem_opt_fill_meth_mat(o);
     return o;

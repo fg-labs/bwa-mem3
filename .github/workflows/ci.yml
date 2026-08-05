@@ -709,6 +709,13 @@ jobs:
           HEADER_PARITY_WORK_DIR=/tmp/header-parity \
           bash test/regression/header_parity.sh
 
+      - name: proper-pair ALT derivation regression (--proper-pair-from-emitted)
+        if: matrix.canonical == true
+        run: |
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          PROPER_PAIR_ALT_WORK_DIR=/tmp/proper-pair-alt \
+          bash test/regression/proper_pair_alt.sh
+
       - name: default @HD parity across output paths
         if: matrix.canonical == true
         run: |

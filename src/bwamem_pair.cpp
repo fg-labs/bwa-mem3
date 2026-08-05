@@ -327,6 +327,47 @@ int mem_infer_dir(int64_t l_pac, int64_t b1, int64_t b2, int64_t *dist)
     return (r1 == r2? 0 : 1) ^ (p2 > b1? 0 : 3);
 }
 
+/* Proper-pair bit (FLAG 0x2) for a pair emitted on the no-pairing path.
+ * Returns 2 if the pair is properly paired, 0 otherwise, so callers can OR the
+ * result straight into extra_flag. `which[i]` is the index of the region mate i
+ * actually EMITS; both entries must already be >= 0 and the two EMITTED regions
+ * must be on the same reference sequence (the caller checks h[].rid, which is
+ * derived from a[i].a[which[i]] and so is not recoverable here). Note what that
+ * does NOT cover: on the default path the coordinates read are a[i].a[0].rb,
+ * whose rids nobody compared, so an ALT read can produce a distance spanning
+ * two reference sequences. It then lands outside every pes window and the bit
+ * stays clear. bwa (bwamem_pair.c:411) and bwa-mem2 do exactly the same.
+ *
+ * Which alignment the bit is derived from is the whole point of this function.
+ * Both upstreams use a[0] unconditionally, even though the record they emit is
+ * a[which] (bwa bwamem_pair.c:411; bwa-mem2 inherited it verbatim). #17 switched
+ * bwa-mem3 to a[which] so the bit describes the record it rides on -- sound
+ * reasoning, but 0x2 is aligner-defined, so it is a choice, and as a default it
+ * made bwa-mem3 differ from BOTH upstreams (#362). The default now matches them;
+ * #17's behavior is opt-in via --proper-pair-from-emitted.
+ *
+ * The two expressions differ only when which != 0, which requires the read to
+ * have ALT hits, so this is inert on any run without a `.alt` sidecar.
+ *
+ * Extracted rather than inlined at both mem_sam_pe sites on purpose. The blocks
+ * are verbatim copies of each other, the behavioral difference is unreachable
+ * without an ALT sidecar, and a fix applied to one copy and not the other would
+ * pass every fixture in the suite -- so the duplication is the actual hazard.
+ * One definition also gives the option a testable seam
+ * (test/unit/test_proper_pair_source.cpp). */
+int mem_proper_pair_extra_flag(const mem_opt_t *opt, int64_t l_pac,
+                               const mem_alnreg_v a[2], const int which[2],
+                               const mem_pestat_t pes[4])
+{
+    int64_t dist;
+    int d;
+    const int w0 = opt->proper_pair_from_emitted ? which[0] : 0;
+    const int w1 = opt->proper_pair_from_emitted ? which[1] : 0;
+    d = mem_infer_dir(l_pac, a[0].a[w0].rb, a[1].a[w1].rb, &dist);
+    if (!pes[d].failed && dist >= pes[d].low && dist <= pes[d].high) return 2;
+    return 0;
+}
+
 static int cal_sub(const mem_opt_t *opt, mem_alnreg_v *r)
 {
     int j;
@@ -1021,16 +1062,13 @@ int mem_sam_pe(const mem_opt_t *opt, const bntseq_t *bns,
         if (which[i] >= 0) h[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, &a[i].a[which[i]], s[i].meth_orig_seq);
         else h[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, 0);
     }
-    // Proper-pair flag must be computed from the same alignments that were just
-    // emitted via mem_reg2aln — i.e. a[i].a[which[i]]. Using a[i].a[0] here is
-    // wrong when which[i] == n_pri[i] (below-T primary + above-T ALT case).
+    // Proper-pair bit. Which alignment it is derived from -- the top-scoring
+    // region a[0] (both upstreams, the default) or the emitted a[which] (#17,
+    // opt-in via --proper-pair-from-emitted) -- lives in one place so this block
+    // and its verbatim twin cannot drift apart; see mem_proper_pair_extra_flag.
     if (!(opt->flag & MEM_F_NOPAIRING) && which[0] >= 0 && which[1] >= 0 &&
-        h[0].rid == h[1].rid && h[0].rid >= 0) {
-        int64_t dist;
-        int d;
-        d = mem_infer_dir(bns->l_pac, a[0].a[which[0]].rb, a[1].a[which[1]].rb, &dist);
-        if (!pes[d].failed && dist >= pes[d].low && dist <= pes[d].high) extra_flag |= 2;
-    }
+        h[0].rid == h[1].rid && h[0].rid >= 0)
+        extra_flag |= mem_proper_pair_extra_flag(opt, bns->l_pac, a, which, pes);
     mem_reg2sam(opt, bns, pac, &s[0], &a[0], 0x41|extra_flag, &h[1]);
     mem_reg2sam(opt, bns, pac, &s[1], &a[1], 0x81|extra_flag, &h[0]);
     if (strcmp(s[0].name, s[1].name) != 0)
@@ -1620,16 +1658,13 @@ no_pairing:
         if (which[i] >= 0) h[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, &a[i].a[which[i]], s[i].meth_orig_seq);
         else h[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, 0);
     }
-    // Proper-pair flag must be computed from the same alignments that were just
-    // emitted via mem_reg2aln — i.e. a[i].a[which[i]]. Using a[i].a[0] here is
-    // wrong when which[i] == n_pri[i] (below-T primary + above-T ALT case).
+    // Proper-pair bit. Which alignment it is derived from -- the top-scoring
+    // region a[0] (both upstreams, the default) or the emitted a[which] (#17,
+    // opt-in via --proper-pair-from-emitted) -- lives in one place so this block
+    // and its verbatim twin cannot drift apart; see mem_proper_pair_extra_flag.
     if (!(opt->flag & MEM_F_NOPAIRING) && which[0] >= 0 && which[1] >= 0 &&
-        h[0].rid == h[1].rid && h[0].rid >= 0) {
-        int64_t dist;
-        int d;
-        d = mem_infer_dir(bns->l_pac, a[0].a[which[0]].rb, a[1].a[which[1]].rb, &dist);
-        if (!pes[d].failed && dist >= pes[d].low && dist <= pes[d].high) extra_flag |= 2;
-    }
+        h[0].rid == h[1].rid && h[0].rid >= 0)
+        extra_flag |= mem_proper_pair_extra_flag(opt, bns->l_pac, a, which, pes);
     mem_reg2sam(opt, bns, pac, &s[0], &a[0], 0x41|extra_flag, &h[1]);
     mem_reg2sam(opt, bns, pac, &s[1], &a[1], 0x81|extra_flag, &h[0]);
     if (strcmp(s[0].name, s[1].name) != 0)

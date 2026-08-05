@@ -112,6 +112,7 @@ scannable *what*.
 | [#161](https://github.com/fg-labs/bwa-mem3/pull/161) | AVX2 SW tuning | Performance | — | fork-only |
 | [#162](https://github.com/fg-labs/bwa-mem3/pull/162) | AVX2 16-bit `kswv256_16` | Performance | — | fork-only |
 | [#164](https://github.com/fg-labs/bwa-mem3/pull/164) | NEON `movemask` parity test | Performance | — | fork-only |
+| [#363](https://github.com/fg-labs/bwa-mem3/pull/363) | fix(pair): derive FLAG `0x2` from `a[0]` by default, matching both upstreams; [#17](https://github.com/fg-labs/bwa-mem3/pull/17)'s emitted-alignment derivation moves behind `--proper-pair-from-emitted` ([#362](https://github.com/fg-labs/bwa-mem3/issues/362)) | Correctness | — | fork-only |
 <!-- FG-MAIN-TABLE:end -->
 
 ## Upstream issues tracked but not yet fixed

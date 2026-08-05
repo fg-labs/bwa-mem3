@@ -1706,6 +1706,12 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "                 with >=INT genome occurrences (i.e. the supp region is repetitive on its\n");
     fprintf(stderr, "                 own). 0 disables (default). Typical values 5-20; lower = more aggressive.\n");
     fprintf(stderr, "                 Primary MAPQ is unaffected.\n");
+    fprintf(stderr, "   --proper-pair-from-emitted\n");
+    fprintf(stderr, "                 derive the proper-pair FLAG bit (0x2) from the alignment actually\n");
+    fprintf(stderr, "                 emitted rather than the top-scoring one. bwa and bwa-mem2 both use\n");
+    fprintf(stderr, "                 the top-scoring one, so this deviates from both and is mutually\n");
+    fprintf(stderr, "                 exclusive with --compat. Has no effect unless the index has a .alt\n");
+    fprintf(stderr, "                 sidecar: the two differ only for reads with ALT hits [off]\n");
     fprintf(stderr, "Seed ordering (fg-labs extension):\n");
     fprintf(stderr, "   --seed-order STR\n");
     fprintf(stderr, "                 seed emission order before chaining: off|local-longest [off]\n");
@@ -1921,6 +1927,7 @@ int main_mem(int argc, char *argv[])
         OPT_METH_SET_AS_FAILED,
         OPT_METH_CHIMERA_QC,
         OPT_SUPP_REP_HARD_CAP,
+        OPT_PROPER_PAIR_FROM_EMITTED,
         OPT_LEGACY_READER,
         OPT_MIN_EXT_LEN,
         OPT_MAX_EXTEND_CHAINS,
@@ -1965,6 +1972,7 @@ int main_mem(int argc, char *argv[])
         {"set-as-failed",            required_argument, 0, OPT_METH_SET_AS_FAILED},
         {"chimera-qc",               no_argument,       0, OPT_METH_CHIMERA_QC},
         {"supp-rep-hard-cap",        required_argument, 0, OPT_SUPP_REP_HARD_CAP},
+        {"proper-pair-from-emitted", no_argument,       0, OPT_PROPER_PAIR_FROM_EMITTED},
         {"seed-order",               required_argument, 0, OPT_SEED_ORDER},
         {"compat",                   required_argument, 0, OPT_COMPAT},
         {"legacy-reader",            no_argument,       0, OPT_LEGACY_READER},
@@ -2236,6 +2244,7 @@ int main_mem(int argc, char *argv[])
         }
         else if (c == OPT_SMEM_DEDUP) opt->smem_dedup = 1;
         else if (c == OPT_FAST) fast = 1;
+        else if (c == OPT_PROPER_PAIR_FROM_EMITTED) opt->proper_pair_from_emitted = 1;
         else if (c == OPT_RESCUE_KMER) {
             /* Validated rather than atoi'd for the same reason as --chunk-cap
              * below: atoi maps every unparseable value to 0, and 0 here means
@@ -2522,6 +2531,20 @@ int main_mem(int argc, char *argv[])
         if (out_opened) fclose(aux.fp);
         return 1;
     }
+    /* --proper-pair-from-emitted deliberately derives FLAG 0x2 differently from
+     * both upstreams (fg-labs/bwa-mem3#17, #362), so pairing it with a --compat
+     * target asks for byte-identity and for a documented deviation from it in
+     * the same command. Same shape as --fast above: refuse rather than emit a
+     * stream that diffs clean everywhere except the ALT records. */
+    if (opt->proper_pair_from_emitted && compat_on) {
+        fprintf(stderr, "[E::%s] --compat and --proper-pair-from-emitted are mutually exclusive: "
+                "--compat targets byte-identical %s output, but --proper-pair-from-emitted "
+                "derives FLAG 0x2 from the emitted alignment, which %s does not\n",
+                __func__, opt->compat->name, opt->compat->name);
+        free(opt);
+        if (out_opened) fclose(aux.fp);
+        return 1;
+    }
     /* --compat is an output-parity target, but no target has a bisulfite mode,
      * so "byte-identical" is undefined under --meth, which also emits
      * meth-specific tags that no target models. Reject the combination rather
@@ -2534,9 +2557,11 @@ int main_mem(int argc, char *argv[])
         if (out_opened) fclose(aux.fp);
         return 1;
     }
-    /* --compat with an @HD in -H: WARN, do not reject. Emitted only after both
-     * rejections above, so a run that is about to be refused does not also
-     * collect a warning about how its header would have been ordered.
+    /* --compat with an @HD in -H: WARN, do not reject. Emitted only after every
+     * rejection above (--fast, --proper-pair-from-emitted, --meth), so a run
+     * that is about to be refused does not also collect a warning about how its
+     * header would have been ordered. A new --compat guard belongs above this
+     * comment, not below it.
      *
      * bwa-mem3 hoists a LEADING user @HD above the @SQ block, so the header is
      * spec-valid (@HD must come first). Neither target does that: bwa 0.7.19
