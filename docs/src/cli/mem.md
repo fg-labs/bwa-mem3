@@ -87,7 +87,8 @@ bwa-mem3 mem --compat=bwa-mem  -t 16 ref.fa R1.fq R2.fq > out.sam
 
 **`--compat` takes a target rather than being a boolean because the two
 upstreams disagree with each other** on half of what it shapes. bwa gained a
-default `@HD` (0.7.18, `6b18630`) and the `MQ:i` tag
+default `@HD` ([lh3/bwa#336](https://github.com/lh3/bwa/pull/336), merged 2022-03-06,
+shipped in 0.7.18 as `6b18630`) and the `MQ:i` tag
 ([lh3/bwa#330](https://github.com/lh3/bwa/pull/330), merged 2022-03-06) *after*
 bwa-mem2 forked at 0.7.17, so matching one means emitting exactly what matching
 the other means suppressing:
@@ -165,18 +166,25 @@ Notes and caveats:
   exactly as upstream does, and does not warn. Every other `-H` record (`@RG`,
   `@CO`, `@PG`, `@SQ`) and all of `-R` compose with `--compat` normally.
 - **Non-`--meth` only; combining them is a hard error**
-  (`--compat is not supported with --meth`). bwa-mem2 has no bisulfite mode, so
-  byte-identity is undefined under `--meth`, which also emits
+  (`--compat is not supported with --meth`). Neither target has a bisulfite
+  mode, so byte-identity is undefined under `--meth`, which also emits
   methylation-specific tags that no target models.
-- **The two targets are not backed by equal evidence.** `--compat=bwa-mem2` is
-  validated at 22.5 M alignment records across three cells plus full header
-  byte-identity on both the SAM-text and `--bam` paths. `--compat=bwa-mem` rests
-  on a narrower base: bwa 0.7.19 was run alongside bwa-mem2 and bwa-mem3 on
-  `hic-1M` and `wes-5M` (12.4 M records, x86) and agreed with both, and a
-  phiX-scale end-to-end check against the real `bwa` binary is asserted by the
-  regression suite. Read it as strong evidence rather than the same guarantee.
-  See [Equivalence → Byte-identical
-  output](../whats-different/equivalence.md#byte-identical-output---compat).
+- **The two targets differ on every mated record, by design.** This is worth
+  stating because "both upstreams are the same aligner" invites the opposite
+  assumption. Measured on a 4.06 M-pair GRCh37 run, bwa 0.7.19 and bwa-mem2
+  v2.2.1 differ on **all 8,116,326 records** — and on **0** once `MQ:i` is
+  stripped. So the two targets are not interchangeable today, and picking the
+  wrong one produces a diff on essentially every record with a mapped mate.
+- **Evidence.** `--compat=bwa-mem` is validated at **322,978,938 alignment
+  records across two reference builds** (GATK hg38 and hs37d5), every record
+  byte-identical to a real `bwa` 0.7.19 run; `--compat=bwa-mem2` at 22.5 M
+  records plus full header byte-identity on both the SAM-text and `--bam` paths.
+  Both also carry a phiX-scale end-to-end check in the regression suite. The
+  datasets, hosts, architectures and SIMD tiers behind those totals — and the
+  one path they leave untested — are itemized in [Equivalence → Byte-identical
+  output](../whats-different/equivalence.md#byte-identical-output---compat),
+  which is the single scope of record for both targets. Read it before treating
+  either number as a general guarantee.
 - **Only one target can be byte-identical on a record where the upstreams
   themselves disagree.** `--compat` shapes output and never moves an alignment,
   so if bwa and bwa-mem2 ever emit different alignment fields for the same read,
