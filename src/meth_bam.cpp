@@ -552,9 +552,9 @@ int meth_mem_aln_to_bam(bam1_t *b,
     /* Aux tags — roughly match mem_aln2sam emission order */
     if (p.n_cigar > 0) {
         int32_t nm = (int32_t)p.NM;
-        bam_aux_append(b, "NM", 'i', sizeof(nm), (const uint8_t *)&nm);
+        if (bam_aux_append(b, "NM", 'i', sizeof(nm), (const uint8_t *)&nm) < 0) return -1;
         const char *md = (const char *)(p.cigar + p.n_cigar);
-        bam_aux_append(b, "MD", 'Z', (int)strlen(md) + 1, (const uint8_t *)md);
+        if (bam_aux_append(b, "MD", 'Z', (int)strlen(md) + 1, (const uint8_t *)md) < 0) return -1;
     }
     if (mp && mp->n_cigar > 0) {
         /* Reused thread-local kstring, grown as needed. */
@@ -575,7 +575,7 @@ int meth_mem_aln_to_bam(bam1_t *b,
             kputc("MIDSH"[op], mc);
         }
         if (mc->l > 0)
-            bam_aux_append(b, "MC", 'Z', (int)mc->l + 1, (const uint8_t *)mc->s);
+            if (bam_aux_append(b, "MC", 'Z', (int)mc->l + 1, (const uint8_t *)mc->s) < 0) return -1;
         /* no free: bs.mc.s persists across records, freed on thread exit */
     }
     /* MQ:i — guarded on `mp` alone, not on the MC block's `mp->n_cigar > 0`, so
@@ -584,18 +584,18 @@ int meth_mem_aln_to_bam(bam1_t *b,
      * anyway so this stays a copy of bam_writer.cpp rather than a divergence. */
     if (mp && opt->compat->emit_mq) {
         int32_t mq = (int32_t)mp->mapq;
-        bam_aux_append(b, "MQ", 'i', sizeof(mq), (const uint8_t *)&mq);
+        if (bam_aux_append(b, "MQ", 'i', sizeof(mq), (const uint8_t *)&mq) < 0) return -1;
     }
     if (p.score >= 0) {
         int32_t as = (int32_t)p.score;
-        bam_aux_append(b, "AS", 'i', sizeof(as), (const uint8_t *)&as);
+        if (bam_aux_append(b, "AS", 'i', sizeof(as), (const uint8_t *)&as) < 0) return -1;
     }
     if (p.sub >= 0) {
         int32_t xs = (int32_t)p.sub;
-        bam_aux_append(b, "XS", 'i', sizeof(xs), (const uint8_t *)&xs);
+        if (bam_aux_append(b, "XS", 'i', sizeof(xs), (const uint8_t *)&xs) < 0) return -1;
     }
     if (bwa_rg_id[0]) {
-        bam_aux_append(b, "RG", 'Z', (int)strlen(bwa_rg_id) + 1, (const uint8_t *)bwa_rg_id);
+        if (bam_aux_append(b, "RG", 'Z', (int)strlen(bwa_rg_id) + 1, (const uint8_t *)bwa_rg_id) < 0) return -1;
     }
     /* SA:Z (other primary hits) and pa:f — mirrors mem_aln2sam, which emits
      * both only for non-secondary records and in this order.
@@ -639,7 +639,7 @@ int meth_mem_aln_to_bam(bam1_t *b,
                 kputc(';', sa);
             }
             if (sa->l > 0)
-                bam_aux_append(b, "SA", 'Z', (int)sa->l + 1, (const uint8_t *)sa->s);
+                if (bam_aux_append(b, "SA", 'Z', (int)sa->l + 1, (const uint8_t *)sa->s) < 0) return -1;
             /* no free: bs.sa.s persists across records, freed on thread exit */
         }
         if (p.alt_sc > 0) {
@@ -647,14 +647,14 @@ int meth_mem_aln_to_bam(bam1_t *b,
              * bwa_pa_tag_value. --compat is refused under --meth, but a
              * --meth --bam consumer still has to see the SAM rendering. */
             float pa_f = bwa_pa_tag_value(p.score, p.alt_sc);
-            bam_aux_append(b, "pa", 'f', sizeof(pa_f), (const uint8_t *)&pa_f);
+            if (bam_aux_append(b, "pa", 'f', sizeof(pa_f), (const uint8_t *)&pa_f) < 0) return -1;
         }
     }
     /* XA:Z — D3 (PR-5): p.XA is produced by mem_gen_alt against the ORIGINAL
      * bns, so its `name,+/-pos,cigar,NM;` entries already carry original contig
      * names. No f/r prefix stripping or chrom rewrite is needed; emit verbatim. */
     if (p.XA != NULL) {
-        bam_aux_append(b, "XA", 'Z', (int)strlen(p.XA) + 1, (const uint8_t *)p.XA);
+        if (bam_aux_append(b, "XA", 'Z', (int)strlen(p.XA) + 1, (const uint8_t *)p.XA) < 0) return -1;
     }
     /* HN:i — the same mem_gen_alt call that fills p.XA fills p.HN, so this
      * counts the hits XA enumerates. Like XA above it is already stated against
@@ -662,7 +662,7 @@ int meth_mem_aln_to_bam(bam1_t *b,
      * it. See the MQ:i note above re: the compat gate. */
     if (p.HN >= 0 && opt->compat->emit_hn) {
         int32_t hn = (int32_t)p.HN;
-        bam_aux_append(b, "HN", 'i', sizeof(hn), (const uint8_t *)&hn);
+        if (bam_aux_append(b, "HN", 'i', sizeof(hn), (const uint8_t *)&hn) < 0) return -1;
     }
     /* Bismark-compatible XR:Z (read conversion) emitted on every record;
      * XG:Z (genome strand) and XM:Z (methylation call string) only on
@@ -685,7 +685,7 @@ int meth_mem_aln_to_bam(bam1_t *b,
             }
         }
         if (xr != NULL) {
-            bam_aux_append(b, "XR", 'Z', 3, (const uint8_t *)xr);
+            if (bam_aux_append(b, "XR", 'Z', 3, (const uint8_t *)xr) < 0) return -1;
         }
     }
     if (mapped) {
@@ -693,12 +693,12 @@ int meth_mem_aln_to_bam(bam1_t *b,
             /* XG:Z genome strand from the winning hypothesis: OT→CT, OB→GA
              * (direction is the 'f'/'r' encoding of p.meth_hypothesis above). */
             const char *xg = (direction == 'f') ? "CT" : "GA";
-            bam_aux_append(b, "XG", 'Z', 3, (const uint8_t *)xg);
+            if (bam_aux_append(b, "XG", 'Z', 3, (const uint8_t *)xg) < 0) return -1;
         }
         if (xm != NULL) {
             /* xm aliases thread-local scratch in meth_xm.cpp; do not free. */
-            bam_aux_append(b, "XM", 'Z', (int)l_emit + 1,
-                           (const uint8_t *)xm);
+            if (bam_aux_append(b, "XM", 'Z', (int)l_emit + 1,
+                               (const uint8_t *)xm) < 0) return -1;
         }
     }
 
@@ -708,7 +708,7 @@ int meth_mem_aln_to_bam(bam1_t *b,
      * the BAM output (they're internal carriers only — XR:Z replaces YC,
      * SEQ restoration replaces YS). D3 (PR-5): p.rid is the ORIGINAL contig
      * index, which is what the original `bns` passed here uses. */
-    bam_writer_append_generic_aux(b, s, opt, bns, p.rid);
+    if (bam_writer_append_generic_aux(b, s, opt, bns, p.rid) < 0) return -1;
 
     return 0;
 }

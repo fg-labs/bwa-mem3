@@ -180,9 +180,9 @@ int bam_writer_close(bam_writer_t *w)
  * (A/i/f/Z/H) are handled; B (typed array) is skipped because parsing it
  * is non-trivial and FASTQ comments effectively never use it. Malformed
  * tokens are skipped silently. */
-static void append_sam_aux_tokens(struct bam1_t *b, const char *s, int meth_mode)
+static int append_sam_aux_tokens(struct bam1_t *b, const char *s, int meth_mode)
 {
-    if (s == NULL) return;
+    if (s == NULL) return 0;
     while (*s) {
         while (*s == '\t') ++s;
         if (!*s) break;
@@ -208,7 +208,7 @@ static void append_sam_aux_tokens(struct bam1_t *b, const char *s, int meth_mode
             case 'A':
                 if (vlen >= 1) {
                     char c = val[0];
-                    bam_aux_append(b, tag, 'A', 1, (const uint8_t *)&c);
+                    if (bam_aux_append(b, tag, 'A', 1, (const uint8_t *)&c) < 0) return -1;
                 }
                 break;
             case 'i': {
@@ -216,8 +216,8 @@ static void append_sam_aux_tokens(struct bam1_t *b, const char *s, int meth_mode
                 int64_t iv = (int64_t)strtoll(val, &end, 10);
                 if (end != val) {
                     int32_t i32 = (int32_t)iv;
-                    bam_aux_append(b, tag, 'i', sizeof(i32),
-                                   (const uint8_t *)&i32);
+                    if (bam_aux_append(b, tag, 'i', sizeof(i32),
+                                       (const uint8_t *)&i32) < 0) return -1;
                 }
                 break;
             }
@@ -225,20 +225,21 @@ static void append_sam_aux_tokens(struct bam1_t *b, const char *s, int meth_mode
                 char *end = NULL;
                 float fv = strtof(val, &end);
                 if (end != val) {
-                    bam_aux_append(b, tag, 'f', sizeof(fv),
-                                   (const uint8_t *)&fv);
+                    if (bam_aux_append(b, tag, 'f', sizeof(fv),
+                                       (const uint8_t *)&fv) < 0) return -1;
                 }
                 break;
             }
             case 'Z':
             case 'H': {
                 char *buf = (char *)malloc(vlen + 1);
-                if (buf == NULL) break;
+                if (buf == NULL) return -1;
                 memcpy(buf, val, vlen);
                 buf[vlen] = '\0';
-                bam_aux_append(b, tag, type, (int)vlen + 1,
-                               (const uint8_t *)buf);
-                free(buf);
+                const int rc = bam_aux_append(b, tag, type, (int)vlen + 1,
+                                              (const uint8_t *)buf);
+                free(buf);   /* before the failure return: bam_aux_append copies */
+                if (rc < 0) return -1;
                 break;
             }
             default:
@@ -247,6 +248,7 @@ static void append_sam_aux_tokens(struct bam1_t *b, const char *s, int meth_mode
                 break;
         }
     }
+    return 0;
 }
 
 int mem_aln_to_bam(struct bam1_t *b,
@@ -363,9 +365,9 @@ int mem_aln_to_bam(struct bam1_t *b,
 
     if (p.n_cigar > 0) {
         int32_t nm = (int32_t)p.NM;
-        bam_aux_append(b, "NM", 'i', sizeof(nm), (const uint8_t *)&nm);
+        if (bam_aux_append(b, "NM", 'i', sizeof(nm), (const uint8_t *)&nm) < 0) return -1;
         const char *md = (const char *)(p.cigar + p.n_cigar);
-        bam_aux_append(b, "MD", 'Z', (int)strlen(md) + 1, (const uint8_t *)md);
+        if (bam_aux_append(b, "MD", 'Z', (int)strlen(md) + 1, (const uint8_t *)md) < 0) return -1;
     }
     if (mp && mp->n_cigar > 0) {
         /* Dynamic buffer: CIGARs with >~800 ops would silently truncate a
@@ -387,23 +389,23 @@ int mem_aln_to_bam(struct bam1_t *b,
             kputc("MIDSH"[op], mc);
         }
         if (mc->l > 0)
-            bam_aux_append(b, "MC", 'Z', (int)mc->l + 1, (const uint8_t *)mc->s);
+            if (bam_aux_append(b, "MC", 'Z', (int)mc->l + 1, (const uint8_t *)mc->s) < 0) return -1;
         /* no free: bs.mc.s persists across records, freed on thread exit */
     }
     if (mp && opt->compat->emit_mq) {
         int32_t mq = (int32_t)mp->mapq;
-        bam_aux_append(b, "MQ", 'i', sizeof(mq), (const uint8_t *)&mq);
+        if (bam_aux_append(b, "MQ", 'i', sizeof(mq), (const uint8_t *)&mq) < 0) return -1;
     }
     if (p.score >= 0) {
         int32_t as = (int32_t)p.score;
-        bam_aux_append(b, "AS", 'i', sizeof(as), (const uint8_t *)&as);
+        if (bam_aux_append(b, "AS", 'i', sizeof(as), (const uint8_t *)&as) < 0) return -1;
     }
     if (p.sub >= 0) {
         int32_t xs = (int32_t)p.sub;
-        bam_aux_append(b, "XS", 'i', sizeof(xs), (const uint8_t *)&xs);
+        if (bam_aux_append(b, "XS", 'i', sizeof(xs), (const uint8_t *)&xs) < 0) return -1;
     }
     if (bwa_rg_id[0]) {
-        bam_aux_append(b, "RG", 'Z', (int)strlen(bwa_rg_id) + 1, (const uint8_t *)bwa_rg_id);
+        if (bam_aux_append(b, "RG", 'Z', (int)strlen(bwa_rg_id) + 1, (const uint8_t *)bwa_rg_id) < 0) return -1;
     }
     /* SA:Z (other primary hits) and pa:f — mirrors mem_aln2sam, which emits
      * both only for non-secondary records and in this order. */
@@ -439,7 +441,7 @@ int mem_aln_to_bam(struct bam1_t *b,
                 kputc(';', sa);
             }
             if (sa->l > 0)
-                bam_aux_append(b, "SA", 'Z', (int)sa->l + 1, (const uint8_t *)sa->s);
+                if (bam_aux_append(b, "SA", 'Z', (int)sa->l + 1, (const uint8_t *)sa->s) < 0) return -1;
             /* no free: bs.sa.s persists across records, freed on thread exit */
         }
         if (p.alt_sc > 0) {
@@ -447,36 +449,36 @@ int mem_aln_to_bam(struct bam1_t *b,
              * --bam is a container choice, not a content change. Shared with
              * the SAM-text writer; see bwa_pa_tag_value. */
             float pa_f = bwa_pa_tag_value(p.score, p.alt_sc);
-            bam_aux_append(b, "pa", 'f', sizeof(pa_f), (const uint8_t *)&pa_f);
+            if (bam_aux_append(b, "pa", 'f', sizeof(pa_f), (const uint8_t *)&pa_f) < 0) return -1;
         }
     }
     if (p.XA != NULL) {
-        bam_aux_append(b, "XA", 'Z', (int)strlen(p.XA) + 1, (const uint8_t *)p.XA);
+        if (bam_aux_append(b, "XA", 'Z', (int)strlen(p.XA) + 1, (const uint8_t *)p.XA) < 0) return -1;
     }
     if (p.HN >= 0 && opt->compat->emit_hn) {
         int32_t hn = (int32_t)p.HN;
-        bam_aux_append(b, "HN", 'i', sizeof(hn), (const uint8_t *)&hn);
+        if (bam_aux_append(b, "HN", 'i', sizeof(hn), (const uint8_t *)&hn) < 0) return -1;
     }
 
-    bam_writer_append_generic_aux(b, s, opt, bns, p.rid);
+    if (bam_writer_append_generic_aux(b, s, opt, bns, p.rid) < 0) return -1;
 
     return 0;
 }
 
-extern "C" void bam_writer_append_generic_aux(struct bam1_t *b,
-                                              const bseq1_t *s,
-                                              const mem_opt_t *opt,
-                                              const bntseq_t *bns,
-                                              int rid)
+extern "C" int bam_writer_append_generic_aux(struct bam1_t *b,
+                                             const bseq1_t *s,
+                                             const mem_opt_t *opt,
+                                             const bntseq_t *bns,
+                                             int rid)
 {
-    if (b == NULL || s == NULL || opt == NULL) return;
+    if (b == NULL || s == NULL || opt == NULL) return -1;
 
     /* FASTQ-carried tags (-C; also YS:Z/YC:Z in --meth mode). mem_aln2sam
      * appends s->comment literally to the SAM line; here we parse it as
      * SAM-text aux tokens and emit each as a packed BAM aux so the BAM and
      * SAM paths carry the same tags. */
     if (s->comment != NULL && s->comment[0] != '\0') {
-        append_sam_aux_tokens(b, s->comment, opt->meth_mode);
+        if (append_sam_aux_tokens(b, s->comment, opt->meth_mode) < 0) return -1;
     }
 
     /* Reference annotation (-V / MEM_F_REF_HDR). Mirrors mem_aln2sam: emit
@@ -489,14 +491,15 @@ extern "C" void bam_writer_append_generic_aux(struct bam1_t *b,
         const char *anno = bns->anns[rid].anno;
         size_t alen = strlen(anno);
         char *xr = (char *)malloc(alen + 1);
-        if (xr != NULL) {
-            for (size_t i = 0; i < alen; ++i)
-                xr[i] = (anno[i] == '\t') ? ' ' : anno[i];
-            xr[alen] = '\0';
-            bam_aux_append(b, "XR", 'Z', (int)alen + 1, (const uint8_t *)xr);
-            free(xr);
-        }
+        if (xr == NULL) return -1;
+        for (size_t i = 0; i < alen; ++i)
+            xr[i] = (anno[i] == '\t') ? ' ' : anno[i];
+        xr[alen] = '\0';
+        const int rc = bam_aux_append(b, "XR", 'Z', (int)alen + 1, (const uint8_t *)xr);
+        free(xr);   /* before the failure return: bam_aux_append copies */
+        if (rc < 0) return -1;
     }
+    return 0;
 }
 
 extern "C" void bam_writer_bseq_push(bseq1_t *s, struct bam1_t *b)

@@ -75,11 +75,15 @@ int bam_writer_push_aln(bseq1_t *s,
  * Factored out so both the generic bam_writer path and the meth_bam path
  * produce identical output for --bam vs --meth. `rid` is the bwa-mem3
  * internal contig index (bns-relative), not a post-remap output tid. */
-void bam_writer_append_generic_aux(struct bam1_t *b,
-                                   const bseq1_t *s,
-                                   const mem_opt_t *opt,
-                                   const bntseq_t *bns,
-                                   int rid);
+/* Returns 0 on success, -1 if a tag could not be appended (htslib sets errno
+ * to ENOMEM or EINVAL). On -1 the record is incomplete and must not be
+ * emitted -- a partially-tagged record is the silent corruption this return
+ * exists to prevent. */
+int bam_writer_append_generic_aux(struct bam1_t *b,
+                                  const bseq1_t *s,
+                                  const mem_opt_t *opt,
+                                  const bntseq_t *bns,
+                                  int rid);
 
 #ifdef __cplusplus
 }
