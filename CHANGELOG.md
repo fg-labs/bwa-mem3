@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.9.0](https://github.com/fg-labs/bwa-mem3/compare/v0.8.0...v0.9.0) (2026-08-06)
+
+
+### Features
+
+* **mem:** make --compat=bwa-mem selectable ([#360](https://github.com/fg-labs/bwa-mem3/issues/360)) ([22d604d](https://github.com/fg-labs/bwa-mem3/commit/22d604d98a9d55d982dbb5e121bb96c9ef3f61b6))
+
+
+### Bug Fixes
+
+* **bam:** propagate bam_aux_append failures instead of dropping tags ([#367](https://github.com/fg-labs/bwa-mem3/issues/367)) ([9e7c600](https://github.com/fg-labs/bwa-mem3/commit/9e7c6001b866ec3f044c8f54a5f63d0c6af28c60))
+* **bam:** render pa:f from the same definition as the SAM writer ([#366](https://github.com/fg-labs/bwa-mem3/issues/366)) ([fd7e3fe](https://github.com/fg-labs/bwa-mem3/commit/fd7e3fe04a5345d68bd60d73095602f3493c8848)), closes [#365](https://github.com/fg-labs/bwa-mem3/issues/365)
+* **pair:** derive FLAG 0x2 from a[0] by default, matching both upstreams ([#363](https://github.com/fg-labs/bwa-mem3/issues/363)) ([a9a96cc](https://github.com/fg-labs/bwa-mem3/commit/a9a96ccfaf4cd7e6f74aa6a510c4ecf97ab3013e))
+
+
+### Documentation
+
+* **changelog:** backtick SAM header tags to stop @-mentioning users ([#359](https://github.com/fg-labs/bwa-mem3/issues/359)) ([769baec](https://github.com/fg-labs/bwa-mem3/commit/769baeccd5341eb2b30f3f83be5c22b4186bf023))
+* **readme:** state bwa-mem2 parity and surface --compat ([#364](https://github.com/fg-labs/bwa-mem3/issues/364)) ([668b21e](https://github.com/fg-labs/bwa-mem3/commit/668b21ecfa2645f9a37eba63dd6a9f7e093794dd))
+
 ## [0.8.0](https://github.com/fg-labs/bwa-mem3/compare/v0.7.0...v0.8.0) (2026-08-03)
 
 
