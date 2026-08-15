@@ -389,6 +389,18 @@ FR-orientation paired-end reads. By default bwa-mem3 infers these parameters
 from the first batch of reads. Provide them explicitly for speed or when the
 reference is short and inference may be inaccurate.
 
+> **`-I` replaces inference; it does not seed it.** Only the FR distribution is
+> set, and the estimation pass is skipped, so FF/RF/RR are left without one for
+> the whole run — inference would have built a distribution for every
+> orientation clearing its thresholds. Pairs in an orientation without one are
+> never flagged proper (`0x2`), get no mate rescue, and are skipped when scoring
+> the best pair. Nothing is *filtered* by orientation, but the run is not
+> otherwise unchanged either: the FR values you supply replace the inferred
+> ones, which shifts proper-pair flags, rescue windows and MAPQ on their own.
+> The non-FR gap matters most where such an orientation is genuinely populated
+> (Hi-C, mate-pair). bwa and bwa-mem2 handle `-I` the same way; `--compat` does
+> not affect it.
+
 #### `-m INT` — mate rescue rounds
 
 Maximum number of mate-rescue attempts per read. Reduce to speed up alignment
