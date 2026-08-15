@@ -11,6 +11,15 @@ on:
   push:
     branches: [main]
 
+# The single job builds mdbook and drift-checks the generated CLI snippets. Its
+# only git operation is a local `git diff --exit-code docs/_generated/`, which
+# needs no auth; cache and artifact traffic authenticates with
+# ACTIONS_RUNTIME_TOKEN, independently of this block. So `contents: read` (what
+# actions/checkout needs, and nothing more) is the whole requirement, declared
+# once at the workflow level as in ci.yml.
+permissions:
+  contents: read
+
 jobs:
   build:
     name: build mdbook + drift check CLI snippets
@@ -18,6 +27,7 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
+          persist-credentials: false
           submodules: recursive
 
       - name: Install build deps for bwa-mem3

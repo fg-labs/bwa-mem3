@@ -64,6 +64,16 @@ env:
   SIM_SEED: "42"
   N_REPS: "3"
 
+# Only the two jobs that check out source (run-mem, kswv) consume the token at
+# all, and `contents: read` is all actions/checkout needs. prepare and report
+# check nothing out -- they install tools, generate data, and move artifacts --
+# and their cache/artifact traffic authenticates with ACTIONS_RUNTIME_TOKEN,
+# independently of this block. Declared once at the workflow level rather than
+# `{}` on those two: the tighter form buys nothing over `contents: read` on a
+# public repo, and one block is what ci.yml does.
+permissions:
+  contents: read
+
 jobs:
   prepare:
     name: prepare (holodeck + chr17 + reads)
@@ -194,6 +204,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
+          persist-credentials: false
           submodules: recursive
 
       - name: Install apt dependencies
@@ -430,6 +441,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
+          persist-credentials: false
           submodules: recursive
 
       - name: Install apt dependencies
