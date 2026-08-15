@@ -1569,6 +1569,8 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "                  so it can lose alignments; NOT part of --fast [off]\n");
     fprintf(stderr, "    -S            skip mate rescue\n");
     fprintf(stderr, "    -P            skip pairing; mate rescue performed unless -S also in use\n");
+    fprintf(stderr, "    --hic         map Hi-C reads; equivalent to -5SP (note: -P alone still runs\n");
+    fprintf(stderr, "                  mate rescue -- use --hic or -5SP to skip it too) [off]\n");
     fprintf(stderr, "    --fast        speed preset: -m 10 -y 0 --min-ext-len 30 --smem-dedup --rescue-kmer=6\n");
     fprintf(stderr, "                  --skip-contained-ext --max-extend-chains 20 --adaptive-band\n");
     fprintf(stderr, "                  --extend-mate-concordant (under --meth: --max-extend-chains 10,\n");
@@ -1945,6 +1947,7 @@ int main_mem(int argc, char *argv[])
         OPT_RESCUE_SKIP,
         OPT_COHORT_RAMP_RATIO,
         OPT_COHORT_RAMP_FIRST,
+        OPT_HIC,
 #ifdef STAGE_PROF
         OPT_PROFILE,
 #endif
@@ -1976,6 +1979,7 @@ int main_mem(int argc, char *argv[])
         {"seed-order",               required_argument, 0, OPT_SEED_ORDER},
         {"compat",                   required_argument, 0, OPT_COMPAT},
         {"legacy-reader",            no_argument,       0, OPT_LEGACY_READER},
+        {"hic",                      no_argument,       0, OPT_HIC},
 #ifdef STAGE_PROF
         {"profile",                  required_argument, 0, OPT_PROFILE},
 #endif
@@ -2017,6 +2021,19 @@ int main_mem(int argc, char *argv[])
         else if (c == 'Y') opt->flag |= MEM_F_SOFTCLIP;
         else if (c == 'V') opt->flag |= MEM_F_REF_HDR;
         else if (c == '5') opt->flag |= MEM_F_PRIMARY5 | MEM_F_KEEP_SUPP_MAPQ; // always apply MEM_F_KEEP_SUPP_MAPQ with -5
+        /* --hic: exactly -5SP, no more. Set here rather than deferred like
+         * --fast because there is no opt0 interaction to resolve -- these are
+         * plain flag bits, so ORing them at parse time composes with -5/-S/-P
+         * in any order, and `--hic -P` stays idempotent.
+         *
+         * -S is the letter that matters and the one a reader is least likely
+         * to infer: mate rescue runs BEFORE the pairing bail-out in mem_sam_pe
+         * (bwamem_pair.cpp -- the MEM_F_NO_RESCUE block precedes the
+         * MEM_F_NOPAIRING goto), so -P alone skips pairing while leaving the
+         * full rescue SW in place. Note minibwa gates rescue inside pairing
+         * instead, so its --hic is -5P; the flag letters differ but the
+         * intended behavior is the same, which is the point of the alias. */
+        else if (c == OPT_HIC) opt->flag |= MEM_F_PRIMARY5 | MEM_F_KEEP_SUPP_MAPQ | MEM_F_NO_RESCUE | MEM_F_NOPAIRING;
         else if (c == 'q') opt->flag |= MEM_F_KEEP_SUPP_MAPQ;
         else if (c == 'u') opt->flag |= MEM_F_XB;
         else if (c == 'c') opt->max_occ = atoi(optarg), opt0.max_occ = 1;

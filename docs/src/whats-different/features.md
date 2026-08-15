@@ -283,6 +283,7 @@ See [Optimization checklist → Reorder seeds longest-first](../best-practices/o
 | Vendored mimalloc allocator | [#19](https://github.com/fg-labs/bwa-mem3/pull/19) | — | fork-only |
 | `--supp-rep-hard-cap` MAPQ rescoring | [#56](https://github.com/fg-labs/bwa-mem3/pull/56) | [bwa-mem2#260](https://github.com/bwa-mem2/bwa-mem2/issues/260) | fork-only (upstream issue open) |
 | `--proper-pair-from-emitted` `FLAG` `0x2` source | [#363](https://github.com/fg-labs/bwa-mem3/pull/363) | — | fork-only (opt-in, off by default; default matches both upstreams) |
+| `--hic` Hi-C preset | [#372](https://github.com/fg-labs/bwa-mem3/pull/372) | — | fork-only spelling (opt-in, off by default; sets the same flag bits as `-5SP`, which both upstreams also accept, so identical by construction — the regression confirms byte-identity on phix-derived PE reads with `@PG` excluded, not a cross-host/cross-tier claim) |
 | `bwa-mem3 shm` shared-memory index | [#65](https://github.com/fg-labs/bwa-mem3/pull/65) | — | fork-only |
 | `shm --meth` symmetry | [#67](https://github.com/fg-labs/bwa-mem3/pull/67) | — | fork-only |
 | `HN:i` hit count tag | [#42](https://github.com/fg-labs/bwa-mem3/pull/42) | [lh3/bwa#438](https://github.com/lh3/bwa/pull/438) | fork-only (analogous to bwa aln) |

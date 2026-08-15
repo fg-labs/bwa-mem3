@@ -30,6 +30,8 @@ Options:
                   so it can lose alignments; NOT part of --fast [off]
     -S            skip mate rescue
     -P            skip pairing; mate rescue performed unless -S also in use
+    --hic         map Hi-C reads; equivalent to -5SP (note: -P alone still runs
+                  mate rescue -- use --hic or -5SP to skip it too) [off]
     --fast        speed preset: -m 10 -y 0 --min-ext-len 30 --smem-dedup --rescue-kmer=6
                   --skip-contained-ext --max-extend-chains 20 --adaptive-band
                   --extend-mate-concordant (under --meth: --max-extend-chains 10,

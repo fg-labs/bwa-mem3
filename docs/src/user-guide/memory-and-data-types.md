@@ -176,20 +176,23 @@ enormously wide and the per-attempt rescue window balloons to tens of kilobases.
 The result is both wasted compute and a large per-batch working set, which is a
 common cause of OOM on Hi-C.
 
-The fix is to align Hi-C the way Hi-C pipelines expect, with `-5SP`:
+The fix is to align Hi-C the way Hi-C pipelines expect, with `--hic`
+(equivalently, `-5SP`):
 
 ```bash
-bwa-mem3 mem -5SP -t 16 --bam ref.fa hic_R1.fq.gz hic_R2.fq.gz \
+bwa-mem3 mem --hic -t 16 --bam ref.fa hic_R1.fq.gz hic_R2.fq.gz \
   | samtools sort -n -@ 2 -o hic.namesorted.bam -
 ```
 
 - **`-S`** skips mate rescue — this removes the wide rescue windows entirely and
   is the bulk of the memory and time saving.
-- **`-P`** skips pairing, which is meaningless for Hi-C contacts.
+- **`-P`** skips pairing, which is meaningless for Hi-C contacts. On its own it
+  is *not* enough: mate rescue runs before the pairing step, so `-P` without
+  `-S` still pays the full rescue cost this section is about.
 - **`-5`** marks the alignment with the smallest coordinate as primary for split
   reads, the convention expected by Hi-C tools (Juicer, Arima, pairtools, etc.).
 
-`-5SP` is the standard Hi-C invocation for the `bwa mem` family; it is the
+`--hic`/`-5SP` is the standard Hi-C invocation for the `bwa mem` family; it is the
 *correct* mode for Hi-C, not merely a memory workaround. Because it changes which
 alignments are reported, apply it consistently across any runs you intend to
 compare. Hi-C output is typically name-sorted (`samtools sort -n`) for the
