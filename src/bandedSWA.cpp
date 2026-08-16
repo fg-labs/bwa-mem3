@@ -3073,10 +3073,11 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
             /* Part of main code MAIN_CODE */
             __m512i bmaxRS = maxRS1, blend512;
             maxRS1 =_mm512_max_epu8(maxRS1, h11);
-            // UNSIGNED >: signed cmpgt_epi8 mis-read scores >127 (long reads).
-            __mmask64 cmpA = _mm512_cmpgt_epu8_mask(maxRS1, bmaxRS);
-            __mmask64 cmpB =_mm512_cmpeq_epi8_mask(maxRS1, h11);                    
-            cmpA = cmpA | cmpB;
+            // maxRS1 = max_epu8(bmaxRS,h11), so cmpgt(maxRS1,bmaxRS) is a strict
+            // subset of cmpeq(maxRS1,h11) (both mean h11 >= bmaxRS); the OR was
+            // redundant. cmpeq is the exact combined mask -- mirrors the AVX2
+            // twin, bit-identical, drops a cmpgt + kor per cell.
+            __mmask64 cmpA = _mm512_cmpeq_epi8_mask(maxRS1, h11);
             cmp1 = _mm512_cmpgt_epi8_mask(j512, tail512);
             cmp1 = cmp1 | cmp2;
             blend512 = _mm512_mask_blend_epi8(cmpA, y1_512, j512);
@@ -3903,9 +3904,10 @@ void BandedPairWiseSW::smithWaterman512_16(uint16_t seq1SoA[],
             /* Part of main code MAIN_CODE */
             __m512i bmaxRS = maxRS1, blend512;                                      
             maxRS1 =_mm512_max_epi16(maxRS1, h11);                          
-            __mmask32 cmpA = _mm512_cmpgt_epi16_mask(maxRS1, bmaxRS);                   
-            __mmask32 cmpB =_mm512_cmpeq_epi16_mask(maxRS1, h11);                   
-            cmpA = cmpA | cmpB;
+            // maxRS1 = max_epi16(bmaxRS,h11): cmpgt(maxRS1,bmaxRS) is a strict
+            // subset of cmpeq(maxRS1,h11); the OR was redundant (mirrors the AVX2
+            // twin). Drops a cmpgt + kor per cell.
+            __mmask32 cmpA = _mm512_cmpeq_epi16_mask(maxRS1, h11);
             cmp1 = _mm512_cmpgt_epi16_mask(j512, tail512);
             cmp1 = cmp1 | cmp2;         
             blend512 = _mm512_mask_blend_epi16(cmpA, y1_512, j512);
@@ -4757,11 +4759,12 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
             h10 = _mm_blendv_epi16(h10, zero128, cmp1);
             f21 = _mm_blendv_epi16(f21, zero128, cmp1);
             
-            __m128i bmaxRS = maxRS1;                                        
-            maxRS1 =_mm_max_epi16(maxRS1, h11);                         
-            __m128i cmpA = _mm_cmpgt_epi16(maxRS1, bmaxRS);                 
-            __m128i cmpB =_mm_cmpeq_epi16(maxRS1, h11);                 
-            cmpA = _mm_or_si128(cmpA, cmpB);
+            __m128i bmaxRS = maxRS1;
+            maxRS1 =_mm_max_epi16(maxRS1, h11);
+            // maxRS1 = max_epi16(bmaxRS,h11): cmpgt(maxRS1,bmaxRS) is a strict
+            // subset of cmpeq(maxRS1,h11); the OR was redundant (mirrors the
+            // AVX2 and 128-bit-8 twins). Runs on NEON and x86 SSE4.1.
+            __m128i cmpA = _mm_cmpeq_epi16(maxRS1, h11);
             cmp1 = _mm_cmpgt_epi16(j128, tail128); // change
             cmp1 = _mm_or_si128(cmp1, cmp2);            // change           
             cmpA = _mm_blendv_epi16(y1_128, j128, cmpA);
