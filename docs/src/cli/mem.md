@@ -488,6 +488,38 @@ discordant pairs.
 #### `-P` — skip pairing
 
 Skips the pairing step; mate rescue still runs unless `-S` is also given.
+Mate rescue is performed *before* the pairing step, so `-P` on its own leaves
+the full rescue Smith-Waterman in place. On Hi-C, where the goal is to skip
+rescue too, use `--hic` (or spell out `-5SP`).
+
+#### `--hic` — Hi-C preset
+
+Equivalent to `-5SP`, and nothing more: leftmost-coordinate primary, skip
+mate rescue, skip pairing. `-5SP` keeps working unchanged; this is an alias
+for the invocation Arima, Juicer and Omni-C pipelines already pass, given a
+name so it is greppable in a pipeline and self-documenting in `--help`.
+
+Note that minibwa spells its equivalent `--hic` as `-5P`, because it gates
+mate rescue inside the pairing step rather than before it: its
+[`map-main.c`](https://github.com/lh3/minibwa/blob/master/map-main.c) maps
+`--hic` to `-5P` (setting `PRIMARY5 | NO_PAIRING`, no separate no-rescue bit),
+and mate rescue runs only inside the pairing routine
+([`pe.c`](https://github.com/lh3/minibwa/blob/master/pe.c), reached from the
+`!NO_PAIRING` block in
+[`map-algo.c`](https://github.com/lh3/minibwa/blob/master/map-algo.c)), so `-P`
+skips it wholesale and no `-S` is needed. The letters
+differ between the two tools; `--hic` means the same thing in both, which is
+the point of having it.
+
+Not to be confused with
+[`--rescue-skip`](#--rescue-skip--drop-hopeless-mate-rescues-opt-in-not-byte-identical),
+which is not a Hi-C
+preset: it leaves the rescue stage, pairing and insert-size estimation all
+enabled and only drops the individual rescue attempts whose k-mer anchor fails
+a vote floor. Hi-C wants those paths off wholesale, which is what `-5SP` does.
+
+See [Hi-C and other wide-insert data](../user-guide/memory-and-data-types.md)
+for why this matters for memory as well as speed.
 
 ### Filtering
 
