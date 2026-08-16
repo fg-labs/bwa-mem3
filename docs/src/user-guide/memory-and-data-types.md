@@ -199,6 +199,11 @@ For other data with genuinely large but real inserts (e.g. some long-fragment or
 mate-pair libraries), mate rescue is still meaningful — keep it, but lower `-K`
 to bound the per-batch working set rather than disabling rescue.
 
+> **Don't reach for `-I` here.** `-I` sets the FR distribution and skips
+> inference for the rest, so on an RF library it disables mate rescue for
+> exactly the orientation you care about. Bound the per-batch working set with
+> `-K`, as above. See [`-I` in the mem reference](../cli/mem.md).
+
 ---
 
 **See also:**

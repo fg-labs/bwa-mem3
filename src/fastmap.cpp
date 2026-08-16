@@ -1655,7 +1655,8 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "   -I FLOAT[,FLOAT[,INT[,INT]]]\n");
     fprintf(stderr, "                 specify the mean, standard deviation (10%% of the mean if absent), max\n");
     fprintf(stderr, "                 (4 sigma from the mean if absent) and min of the insert size distribution.\n");
-    fprintf(stderr, "                 FR orientation only. [inferred]\n");
+    fprintf(stderr, "                 Sets the FR distribution only and skips inference, so FF/RF/RR get none:\n");
+    fprintf(stderr, "                 no proper-pair flag or mate rescue there. As in bwa/bwa-mem2. [inferred]\n");
     fprintf(stderr, "Methylation (--meth) options:\n");
     fprintf(stderr, "   --meth[=CHEM] enable inline bwameth-style C→T/G→A read conversion + meth-aware\n");
     fprintf(stderr, "                 record emission (XM:Z/XG:Z/XR:Z). Output is SAM text by default,\n");
