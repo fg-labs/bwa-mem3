@@ -34,6 +34,9 @@ TEST_CASE("compat target `off` is bwa-mem3's native output") {
     CHECK(t->read_sidecar == 1);
     CHECK(t->emit_mq      == 1);
     CHECK(t->emit_hn      == 1);
+    // #310: `off` keeps bwa-mem2's all-chains-dropped behavior, because the
+    // default path is the drop-in and must not move an alignment.
+    CHECK(t->chain_flt_resurrect_empty == 1);
     // `off` pins the one canonical default. It used to be NULL, meaning "each
     // path keeps whatever it emits" -- which was a different string on the SAM
     // text and BAM paths until #288 unified them.
@@ -58,6 +61,8 @@ TEST_CASE("compat target `bwa-mem2` matches bwa-mem2 v2.2.1") {
     CHECK(t->emit_mq == 0);
     // HN:i exists in neither upstream.
     CHECK(t->emit_hn == 0);
+    // #310: bwa-mem2 resurrects the rejected slot-0 chain; that IS the target.
+    CHECK(t->chain_flt_resurrect_empty == 1);
 }
 
 TEST_CASE("compat target `bwa-mem` matches bwa 0.7.19") {
@@ -82,6 +87,9 @@ TEST_CASE("compat target `bwa-mem` matches bwa 0.7.19") {
     // is a target enum rather than a flag bit.
     CHECK(t->emit_mq == 1);
     CHECK(t->emit_hn == 0);
+    // #310: THE field that is not output shaping. bwa returns 0 survivors and
+    // leaves the read unmapped; modelling that is the whole point of the row.
+    CHECK(t->chain_flt_resurrect_empty == 0);
 }
 
 TEST_CASE("bwa and bwa-mem2 rows differ exactly where the upstreams do") {
@@ -94,6 +102,9 @@ TEST_CASE("bwa and bwa-mem2 rows differ exactly where the upstreams do") {
     // @HD (bwa 0.7.18, 6b18630) and MQ:i (lh3/bwa#330), both post-0.7.17.
     CHECK(mem->emit_hd != mem2->emit_hd);
     CHECK(mem->emit_mq != mem2->emit_mq);
+    // ...plus the one alignment-affecting divergence (#310), which is NOT a
+    // fork-point artifact: bwa-mem2 introduced it, and bwa never had it.
+    CHECK(mem->chain_flt_resurrect_empty != mem2->chain_flt_resurrect_empty);
 }
 
 TEST_CASE("compat target lookup: aliases, unknown names, NULL") {

@@ -25,6 +25,7 @@ const compat_target_t COMPAT_TARGET_OFF = {
     /* .read_sidecar       */ 1,
     /* .emit_mq            */ 1,
     /* .emit_hn            */ 1,
+    /* .chain_flt_resurrect_empty */ 1,   /* bwa-mem2 behavior: the drop-in default */
 };
 
 /* --- `bwa-mem2`: bwa-mem2 v2.2.1 -----------------------------------------
@@ -48,6 +49,7 @@ static const compat_target_t COMPAT_TARGET_BWA_MEM2 = {
     /* .read_sidecar       */ 0,
     /* .emit_mq            */ 0,
     /* .emit_hn            */ 0,
+    /* .chain_flt_resurrect_empty */ 1,   /* seqid-range machinery synthesizes {0,1} */
 };
 
 /* --- `bwa-mem`: bwa 0.7.19 -------------------------------------------------
@@ -74,10 +76,21 @@ static const compat_target_t COMPAT_TARGET_BWA_MEM2 = {
  * "identical to bwa-mem 0.7.17" carries forward to 0.7.19, and bwa-mem2 parity
  * is bwa parity.
  *
- * The limit worth knowing: --compat shapes output and never moves an
- * alignment, so on any record where bwa and bwa-mem2 disagree on an alignment
- * field, at most one of these two targets can be byte-identical. No such
- * record has been observed. */
+ * That audit holds for the DEFAULT path, and the bench harness's strict
+ * bwa-parity arm has cleared it empirically there. It does not hold once
+ * min_chain_weight > 0: `mem_chain_flt`'s all-chains-dropped case is a real
+ * record on which bwa and bwa-mem2 disagree about the alignment itself
+ * (fg-labs/bwa-mem3#310), which is what `chain_flt_resurrect_empty` below
+ * models. Measured on 9 150 bp phix reads at -W 200: bwa leaves all 9
+ * unmapped, bwa-mem2 (and bwa-mem3 before #310) aligns all 9.
+ *
+ * So the old note here -- "at most one of these two targets can be
+ * byte-identical, and no such record has been observed" -- was true only
+ * because nothing had looked at -W or the -x long-read presets. Now that a row
+ * can model the difference, both targets can be right at once. What is still
+ * unaudited is the REST of that preset space: 0.7.17..0.7.19 was audited for
+ * output-affecting changes on the default path, and nothing exercises
+ * -x pacbio/pbref/ont2d end to end against bwa. */
 static const compat_target_t COMPAT_TARGET_BWA_MEM = {
     /* .name               */ "bwa-mem",
     /* .alias              */ NULL,
@@ -87,6 +100,7 @@ static const compat_target_t COMPAT_TARGET_BWA_MEM = {
     /* .read_sidecar       */ 0,
     /* .emit_mq            */ 1,
     /* .emit_hn            */ 0,
+    /* .chain_flt_resurrect_empty */ 0,   /* bwa returns 0; the read stays unmapped */
 };
 
 /* Ordered as the diagnostics should read: real targets first, `off` last. */

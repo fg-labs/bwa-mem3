@@ -100,6 +100,7 @@ the other means suppressing:
 | default `@HD` | emitted | **suppressed** | emitted |
 | `.hdr`/`.dict` sidecar `@SQ` | honored | **ignored** | **ignored** |
 | `@PG` | `ID:bwa-mem3` | `ID:bwa-mem3` | `ID:bwa-mem3` |
+| all chains dropped by the weight filter (`-W`, `-x pacbio`/`pbref`/`ont2d`) | read aligned | read aligned | **read unmapped** |
 
 Only **`HN:i`** and the sidecar are genuinely bwa-mem3 inventions, which is why
 both targets drop them. The rest is the fork point.
@@ -122,9 +123,36 @@ both targets drop them. The rest is the fork point.
 identical to `bwa-mem2` except for the `@PG` `ID`. If you are on bwa 0.7.17,
 `--compat=bwa-mem2` is the target you want.
 
-`--compat` is **output-shaping only** — it changes no alignment, no score, no
-flag, and no tag's value. It exists so pipelines validating bwa-mem3 against a
-bwa-mem2 golden can diff raw output without a post-processing step.
+`--compat` is **output-shaping** — with one exception, it changes no alignment,
+no score, no flag, and no tag's value. It exists so pipelines validating
+bwa-mem3 against a bwa-mem2 golden can diff raw output without a
+post-processing step. The equivalence is a *versioned behavioral target*, not an
+unconditional byte-identity guarantee across hosts or SIMD tiers: each `--compat`
+value tracks a specific pinned upstream (see the bwa 0.7.19 pin above), and the
+raw diff holds for the same invocation on both binaries with `@PG` excluded, as
+the verification below shows.
+
+The exception is the last row above, and it exists because the rule and the
+purpose collide there. When the chain weight filter drops *every* chain for a
+read, bwa reports zero survivors and the read goes out unmapped, while
+bwa-mem2 hands back the chain it just rejected and aligns the read
+([#310](https://github.com/fg-labs/bwa-mem3/issues/310) for background;
+modeled here by [#374](https://github.com/fg-labs/bwa-mem3/pull/374)). Those are different
+alignments for the same input, so a target that declined to model the
+difference would reproduce neither upstream faithfully — and
+`--compat=bwa-mem` returning bwa-mem2's alignments is not a weaker guarantee,
+it is a false one. The default path keeps bwa-mem2's behavior, so the drop-in
+profile is unchanged.
+
+This is reachable only when `min_chain_weight > 0`, which is never the default:
+`-W`, or the `-x pacbio`/`pbref`/`ont2d` presets. In practice `-x pacbio`
+almost never reaches it — instrumenting the empty-array case over 500 real HiFi
+reads at `-x pacbio` counted zero reads with every chain dropped, because real
+long reads build chains far above the threshold. That is a deterministic count
+of a code path firing, not a timed measurement, so it does not vary by host,
+architecture, or SIMD tier; `pbref` and `ont2d` share the same chain-weight
+mechanism but were not separately measured. A `-W` above the read length reaches
+it on every read.
 
 Verify it with:
 

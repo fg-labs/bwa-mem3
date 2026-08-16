@@ -710,6 +710,14 @@ jobs:
           HIC_WORK_DIR=/tmp/hic-alias \
           bash test/regression/hic_alias_identical.sh
 
+      - name: chain-flt empty-array compat regression (#310)
+        if: matrix.canonical == true
+        run: |
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          CHAIN_FLT_PHIX_FA="$GITHUB_WORKSPACE/test/fixtures/phix.fa" \
+          CHAIN_FLT_WORK_DIR=/tmp/chain-flt-empty \
+          bash test/regression/chain_flt_empty_compat.sh
+
       - name: header parity regression (AH:*, --compat @HD/@SQ)
         if: matrix.canonical == true
         run: |

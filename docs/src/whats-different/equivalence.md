@@ -162,8 +162,14 @@ orders of magnitude.
 total does not improve the bound: a record on which only one upstream ran cannot exhibit an
 upstream-vs-upstream divergence at any rate.
 
-`--compat` is **output-shaping only, never an alignment change**. Every alignment, score,
-flag, and tag value is untouched.
+`--compat` is **output-shaping, with one deliberate exception**. Every alignment, score,
+flag, and tag value is untouched except on the path where the two upstreams themselves
+disagree about the alignment: when the chain weight filter drops every chain for a read,
+bwa leaves it unmapped and bwa-mem2 aligns it from the chain it just rejected
+([#310](https://github.com/fg-labs/bwa-mem3/issues/310)). `--compat=bwa-mem` reproduces
+bwa there, `--compat=bwa-mem2` and the default reproduce bwa-mem2, and the drop-in profile
+is unchanged. The path is unreachable without `-W` or an `-x pacbio`/`pbref`/`ont2d`
+preset, since `min_chain_weight` defaults to 0.
 
 **Verified** against a real bwa-mem2 v2.2.1 run on hg38: with `@PG` excluded on both sides —
 it still names `bwa-mem3` and is unmatchable by construction, see the caveats below — the

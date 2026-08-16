@@ -10,8 +10,21 @@
  * the very fields this shapes -- bwa emits MQ:i and a default @HD, bwa-mem2
  * emits neither -- so "compat" is a choice among targets, not an on/off switch.
  *
- * Compat targets shape OUTPUT ONLY. They never change an alignment, a score, a
- * flag, or any tag's value. See docs/src/whats-different/equivalence.md.
+ * Compat targets shape OUTPUT. Almost every field here is header or tag
+ * shaping and changes no alignment, no score and no flag -- and that remains
+ * the rule a new field should expect to follow.
+ *
+ * The exception is `chain_flt_resurrect_empty`, and it exists because the rule
+ * and the purpose collide: on that one path bwa and bwa-mem2 emit DIFFERENT
+ * ALIGNMENTS for the same read, so a target that refused to model it would
+ * reproduce neither faithfully. `--compat=bwa-mem` that returns bwa-mem2's
+ * alignments is not a weaker guarantee, it is a false one. A row therefore
+ * records whichever behavior ITS target has, alignment-affecting or not.
+ *
+ * This does not license `--fast` or `--proper-pair-from-emitted` into a row:
+ * those deviate from BOTH targets, so asking for target parity and for a
+ * deviation from it in one command stays incoherent, and main_mem still
+ * rejects the pair. See docs/src/whats-different/equivalence.md.
  */
 
 #ifndef BWAMEM3_COMPAT_TARGET_H
@@ -73,6 +86,29 @@ typedef struct compat_target_t {
     /* Emit the HN:i hit-count tag. Genuinely bwa-mem3-only: absent from both
      * upstreams. */
     int emit_hn;
+
+    /* When mem_chain_flt's weight filter drops EVERY chain for a read, hand
+     * slot 0 -- a chain the filter just rejected -- back to the caller with
+     * kept = 3 (1), or report zero survivors (0).
+     *
+     * This is the one field that is not output shaping, and it is here because
+     * the two upstreams genuinely disagree on it. bwa returns 0: `n_chn = k`
+     * with no post-filter check, so its tail loops are bounded by 0 and the
+     * function returns 0 (bwa 0.7.19 bwamem.c). bwa-mem2's seqid-range
+     * machinery synthesizes the range {0,1} for an emptied array, so n_chn
+     * comes back as 1, the unconditional `kept[0] = 3` becomes load-bearing,
+     * and the rejected chain is extended. bwa-mem3 inherited the latter at the
+     * fork point (fg-labs/bwa-mem3#310).
+     *
+     * Reachable only when min_chain_weight > 0 -- never the default -- via -W
+     * or the -x pacbio/pbref/ont2d presets. Measured on 500 HiFi reads at
+     * -x pacbio it never fires (real long reads build chains far above the
+     * threshold); with -W above the read length it fires on every read.
+     *
+     * `off` and `bwa-mem2` resurrect, preserving the drop-in default;
+     * `bwa-mem` does not, because reproducing bwa is the entire contract of
+     * that target and on this path bwa leaves the read unmapped. */
+    int chain_flt_resurrect_empty;
 } compat_target_t;
 
 /* The `off` row: bwa-mem3's own native output. Never NULL on any mem_opt_t
