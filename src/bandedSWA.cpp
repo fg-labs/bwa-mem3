@@ -4124,6 +4124,53 @@ _mm_blendv_epi16(__m128i x, __m128i y, __m128i mask)
 #endif
 }
 
+// blendv_fullmask8: byte-wise select (b where mask set, a where clear) for a
+// mask that is ALREADY full-width -- every byte exactly 0x00 or 0xFF. That holds
+// for every mask fed to blendv in the 128-bit banded-SW kernels: they come from
+// _mm_cmpeq_epi8/_mm_cmpgt_epi8 (or _epi16/_epi32 compares, or AND/OR/NOT of
+// those, or cvtepi8_epi32 of a 0x00/0xFF byte), all of which set every selected
+// bit uniformly. Result is identical to _mm_blendv_epi8(a, b, mask) for such a
+// mask. On NEON this skips the sign-broadcast vshrq_n_s8(mask, 7) that sse2neon's
+// _mm_blendv_epi8 issues to rebuild a full mask it was already handed -- pure
+// redundant port pressure on a port-bound kernel. x86 keeps native PBLENDVB,
+// which reads the high bit directly with no separate maskgen, so it is unchanged.
+static inline __m128i blendv_fullmask8(__m128i a, __m128i b, __m128i mask)
+{
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    return vreinterpretq_m128i_u8(vbslq_u8(vreinterpretq_u8_m128i(mask),
+                                           vreinterpretq_u8_m128i(b),
+                                           vreinterpretq_u8_m128i(a)));
+#else
+    return _mm_blendv_epi8(a, b, mask);
+#endif
+}
+
+// any_lane_set8 / all_lanes_set8: reduce a FULL-WIDTH mask (every byte 0x00 or
+// 0xFF -- as produced by the _epi8/_epi16 compares in these kernels) to a
+// boolean, for the band-trim loop guards. Those previously routed through
+// _mm_movemask_epi8, which sse2neon expands on NEON to ~10 instructions
+// including a constant-pool load; vmaxvq_u8 / vminvq_u8 answer "any lane set" /
+// "all lanes set" in 3. A byte-wise reduction gives the same all/any result at
+// any lane width, because a full-width lane's bytes agree (a 16-bit lane is
+// 0x0000 or 0xFFFF). x86 keeps the native movemask (== 0xFFFF is "all set" for a
+// full-width mask regardless of lane width, matching the old & dmask16 form).
+static inline bool any_lane_set8(__m128i mask)
+{
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    return vmaxvq_u8(vreinterpretq_u8_m128i(mask)) != 0;
+#else
+    return _mm_movemask_epi8(mask) != 0;
+#endif
+}
+static inline bool all_lanes_set8(__m128i mask)
+{
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    return vminvq_u8(vreinterpretq_u8_m128i(mask)) == 0xFF;
+#else
+    return _mm_movemask_epi8(mask) == 0xFFFF;
+#endif
+}
+
 #define ZSCORE16(i4_128, y4_128)                                            \
     {                                                                   \
         __m128i tmpi = _mm_sub_epi16(i4_128, x128);                     \
@@ -4664,10 +4711,11 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
         __m128i cmpt = _mm_cmpeq_epi16(tail128, ptail128);
         // cmph &= cmpt;
         cmph = _mm_and_si128(cmph, cmpt);
-        //__mmask16 cmp_ht = _mm_movepi16_mask(cmph);
-        __mmask16 cmp_ht = _mm_movemask_epi8(cmph) & dmask16;
-        
-        for (int l=beg; l<end && cmp_ht != dmask16; l++)
+        // All 8 sixteen-bit lanes stopped moving? all-lanes-set on a full-width
+        // mask (was _mm_movemask_epi8 & dmask16 == dmask16).
+        bool cmp_ht_all = all_lanes_set8(cmph);
+
+        for (int l=beg; l<end && !cmp_ht_all; l++)
         {
             __m128i h128 = _mm_load_si128((__m128i *)(H_h + l * SIMD_WIDTH16));
             __m128i f128 = _mm_load_si128((__m128i *)(F + l * SIMD_WIDTH16));
@@ -4675,10 +4723,7 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
             __m128i pj128 = _mm_set1_epi16(l);
             __m128i j128 = _mm_set1_epi16(l+1);
             __m128i cmp1 = _mm_cmpgt_epi16(head128, pj128);
-            // uint32_t cval = _mm_movemask_epi16(cmp1);
-            // uint16_t cval = _mm_movepi16_mask(cmp1);
-            uint16_t cval = _mm_movemask_epi8(cmp1) & dmask16;          
-            if (cval == 0x00) break;
+            if (!any_lane_set8(cmp1)) break;
             // __m128i cmp2 = _mm_cmpgt_epi16(pj128, tail128);
             __m128i cmp2 = _mm_cmpgt_epi16(j128, tail128);
             cmp1 = _mm_or_si128(cmp1, cmp2);
@@ -4947,7 +4992,7 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
             tmp = _mm_and_si128(tmp,tmpb);
             l128 = _mm_sub_epi16(l128, one128);
             // NEW
-            index128 = _mm_blendv_epi8(index128, l128, tmp);
+            index128 = blendv_fullmask8(index128, l128, tmp);
 
             tmpb = tmp;
         }
@@ -5068,7 +5113,7 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
         __m128i xor_  = _mm_xor_si128(s1, s2);                          \
         __m128i sbt_  = _mm_shuffle_epi8(pmat128, xor_);                \
         __m128i freed_ = _mm_and_si128(rowfreed, _mm_cmpeq_epi8(s2, frread128)); \
-        sbt11_out = _mm_blendv_epi8(sbt_, match128, freed_);            \
+        sbt11_out = blendv_fullmask8(sbt_, match128, freed_);            \
     }
 
 // MAIN_CODE8_CORE_SPLIT runs the cell-update half of MAIN_CODE8 from a score
@@ -5085,7 +5130,7 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
          * adds_epu8 (no wrap past 255) then subs_epu8 (floors at 0). */       \
         __m128i m11 = _mm_subs_epu8(_mm_adds_epu8(h00, sbt_pos), sbt_neg); \
         __m128i cmp11 = _mm_cmpeq_epi8(h00, zero128);                   \
-        m11 = _mm_blendv_epi8(m11, zero128, cmp11);  /* h00==0 -> local restart */ \
+        m11 = blendv_fullmask8(m11, zero128, cmp11);  /* h00==0 -> local restart */ \
         h11 = _mm_max_epu8(m11, e11);                                   \
         h11 = _mm_max_epu8(h11, f11);                                   \
         /* Gaps open from m11 (bwa-mem2 convention), not h11: m11 does not \
@@ -5151,8 +5196,8 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
         __m128i cmp1 = _mm_cmpgt_epi8(head128, pj128);                  \
         __m128i cmp2 = _mm_cmpgt_epi8(pj128, tail128);                  \
         cmp1 = _mm_or_si128(cmp1, cmp2);                                \
-        h10 = _mm_blendv_epi8(h10, zero128, cmp1);                      \
-        f21 = _mm_blendv_epi8(f21, zero128, cmp1);                      \
+        h10 = blendv_fullmask8(h10, zero128, cmp1);                     \
+        f21 = blendv_fullmask8(f21, zero128, cmp1);                     \
                                                                         \
         /* got this block out of MAIN_CODE */                           \
         __m128i bmaxRS = maxRS1;                                        \
@@ -5160,9 +5205,9 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
         __m128i cmpA = _mm_cmpeq_epi8(maxRS1, h11);                     \
         cmp1 = _mm_cmpgt_epi8(j128, tail128);                           \
         cmp1 = _mm_or_si128(cmp1, cmp2);                                \
-        cmpA = _mm_blendv_epi8(y1_128, j128, cmpA);                     \
-        y1_128 = _mm_blendv_epi8(cmpA, y1_128, cmp1);                   \
-        maxRS1 = _mm_blendv_epi8(maxRS1, bmaxRS, cmp1);                 \
+        cmpA = blendv_fullmask8(y1_128, j128, cmpA);                    \
+        y1_128 = blendv_fullmask8(cmpA, y1_128, cmp1);                  \
+        maxRS1 = blendv_fullmask8(maxRS1, bmaxRS, cmp1);                \
                                                                         \
         _mm_store_si128((__m128i *)(F + j * SIMD_WIDTH8), f21);         \
         _mm_store_si128((__m128i *)(H_h + j * SIMD_WIDTH8), h10);       \
@@ -5175,8 +5220,8 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
             cmp = _mm_and_si128(cmp, _mm_cmpeq_epi8(tail128, qlen_off128)); \
             cmp = _mm_and_si128(cmp, qlen_valid128);                    \
             cmp = _mm_and_si128(cmp, exit0);                            \
-            hqe128   = _mm_blendv_epi8(hqe128, h11, cmp);               \
-            qfire128 = _mm_blendv_epi8(qfire128, ff128, cmp);          \
+            hqe128   = blendv_fullmask8(hqe128, h11, cmp);               \
+            qfire128 = blendv_fullmask8(qfire128, ff128, cmp);          \
         }                                                               \
     }
 
@@ -5730,22 +5775,22 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
         __m128i cmpt = _mm_cmpeq_epi8(tail128, ptail128);
         // cmph &= cmpt;
         cmph = _mm_and_si128(cmph, cmpt);
-        // __mmask32 cmp_ht = _mm_movemask_epi8(cmph);
-        __mmask16 cmp_ht = _mm_movemask_epi8(cmph);
+        // Loop-invariant "did head & tail both stop moving in every lane?" —
+        // all-lanes-set test on a full-width mask (was _mm_movemask_epi8 != dmask).
+        bool cmp_ht_all = all_lanes_set8(cmph);
 
-        for (int l=beg; l<end && cmp_ht != dmask; l++)
+        for (int l=beg; l<end && !cmp_ht_all; l++)
         {
             __m128i h128 = _mm_load_si128((__m128i *)(H_h + l * SIMD_WIDTH8));
             __m128i f128 = _mm_load_si128((__m128i *)(F + l * SIMD_WIDTH8));
 
             __m128i pj128 = _mm_set1_epi8(l - i);   // diagonal offset of column l
             __m128i cmp1 = _mm_cmpgt_epi8(head128, pj128);
-            uint32_t cval = _mm_movemask_epi8(cmp1);
-            if (cval == 0x00) break;
+            if (!any_lane_set8(cmp1)) break;
             __m128i cmp2 = _mm_cmpgt_epi8(pj128, tail128);
             cmp1 = _mm_or_si128(cmp1, cmp2);
-            h128 = _mm_blendv_epi8(h128, zero128, cmp1);
-            f128 = _mm_blendv_epi8(f128, zero128, cmp1);
+            h128 = blendv_fullmask8(h128, zero128, cmp1);
+            f128 = blendv_fullmask8(f128, zero128, cmp1);
 
             _mm_store_si128((__m128i *)(F + l * SIMD_WIDTH8), f128);
             _mm_store_si128((__m128i *)(H_h + l * SIMD_WIDTH8), h128);
@@ -5764,7 +5809,7 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
         cmpht = _mm_cmpgt_epi8(head128, tail128);
         cmpim = _mm_or_si128(cmpim, cmpht);
 
-        exit0 = _mm_blendv_epi8(exit0, zero128, cmpim);
+        exit0 = blendv_fullmask8(exit0, zero128, cmpim);
 
         /* Row-invariant part of the gscore query-end gate (see the per-cell block
          * below). Of its four terms, only cmpeq(j128, qlen_off128) varies with j:
@@ -5848,7 +5893,7 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
         __m128i cmp1 = _mm_cmpgt_epi8(head128, j128);
         __m128i cmp2 = _mm_cmpgt_epi8(j128, tail128);
         cmp1 = _mm_or_si128(cmp1, cmp2);
-        h10 = _mm_blendv_epi8(h10, zero128, cmp1);
+        h10 = blendv_fullmask8(h10, zero128, cmp1);
             
         _mm_store_si128((__m128i *)(H_h + j * SIMD_WIDTH8), h10);
         _mm_store_si128((__m128i *)(F + j * SIMD_WIDTH8), zero128);
@@ -5884,20 +5929,20 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
                 __m128i gba = _mm_loadu_si128((const __m128i *)(gbest_abs + base));
                 __m128i ge  = _mm_xor_si128(_mm_cmpgt_epi32(gba, hqeg), ff128); // hqe >= gba
                 __m128i gmask = _mm_and_si128(qfg, ge);
-                gba = _mm_blendv_epi8(gba, hqeg, gmask);
+                gba = blendv_fullmask8(gba, hqeg, gmask);
                 _mm_storeu_si128((__m128i *)(gbest_abs + base), gba);
                 __m128i ierg = _mm_loadu_si128((const __m128i *)(ierow + base));
-                ierg = _mm_blendv_epi8(ierg, _mm_set1_epi32(i + 1), gmask);
+                ierg = blendv_fullmask8(ierg, _mm_set1_epi32(i + 1), gmask);
                 _mm_storeu_si128((__m128i *)(ierow + base), ierg);
             }
             break;
         }
 
         // _mm_store_si128((__m128i *) temp, exit0);
-        exit0 = _mm_blendv_epi8(exit0, zero128,  tmp);
+        exit0 = blendv_fullmask8(exit0, zero128,  tmp);
 
         __m128i score128 = _mm_max_epu8(maxScore128, maxRS1);   // epi8 not present, modif
-        maxScore128 = _mm_blendv_epi8(maxScore128, score128, exit0);
+        maxScore128 = blendv_fullmask8(maxScore128, score128, exit0);
 
         // UNSIGNED >: maxScore128 (post-update, = max_epu8 of old & maxRS1 on
         // alive lanes, else unchanged) is >= bmaxScore128, so (>u) == (!=).
@@ -5905,7 +5950,7 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
         __m128i cmp = _mm_xor_si128(_mm_cmpeq_epi8(maxScore128, bmaxScore128), ff128);
         // y128 (best col) stays a diagonal offset captured in the best row's
         // frame; the best row itself moves to the wide xrow[] side channel.
-        y128 = _mm_blendv_epi8(y128, y1_128, cmp);
+        y128 = blendv_fullmask8(y128, y1_128, cmp);
 
         // max_off = max running diagonal-distance of the row-max from the main
         // diagonal: |y1col - (i+1)| = |y1_off - 1| in the offset frame.
@@ -5915,7 +5960,7 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
         tmp = _mm_abs_epi8(y1_minus1);                    // |y1_off - 1|
         __m128i bmax_off128 = max_off128;
         tmp = _mm_max_epu8(max_off128, tmp);  // modif
-        max_off128 = _mm_blendv_epi8(bmax_off128, tmp, cmp);
+        max_off128 = blendv_fullmask8(bmax_off128, tmp, cmp);
 
         // Per-lane wide updates (O(rows)): best-score row (xrow), best-gscore
         // row (ierow), and the z-drop test — all done in wide scalars so row
@@ -5965,7 +6010,7 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
 
                 // (1) best-score row: xrow = cmp ? i+1 : xrow
                 __m128i xrg = _mm_loadu_si128((const __m128i *)(xrow + base));
-                xrg = _mm_blendv_epi8(xrg, vip1, cmpg);
+                xrg = blendv_fullmask8(xrg, vip1, cmpg);
                 _mm_storeu_si128((__m128i *)(xrow + base), xrg);
 
                 // (2) best_abs = max(best_abs, (uint8)ms)
@@ -5977,10 +6022,10 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
                 __m128i gba = _mm_loadu_si128((const __m128i *)(gbest_abs + base));
                 __m128i ge  = _mm_xor_si128(_mm_cmpgt_epi32(gba, hqeg), ff128); // hqe >= gba
                 __m128i gmask = _mm_and_si128(qfg, ge);
-                gba = _mm_blendv_epi8(gba, hqeg, gmask);
+                gba = blendv_fullmask8(gba, hqeg, gmask);
                 _mm_storeu_si128((__m128i *)(gbest_abs + base), gba);
                 __m128i ierg = _mm_loadu_si128((const __m128i *)(ierow + base));
-                ierg = _mm_blendv_epi8(ierg, vip1, gmask);
+                ierg = blendv_fullmask8(ierg, vip1, gmask);
                 _mm_storeu_si128((__m128i *)(ierow + base), ierg);
 
                 // (4) z-drop (alive lanes): dif = |((i+1)-xr) - (y1c-yc)|,
@@ -6004,7 +6049,7 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
                 // z-drop gap term weighted by gap-extend penalty, matching the
                 // scalar reference (drift>0 -> deletion side *e_del, else *e_ins).
                 __m128i zdelta = _mm_sub_epi32(tmpi, tmpj);
-                __m128i zesel  = _mm_blendv_epi8(veins, vedel,
+                __m128i zesel  = blendv_fullmask8(veins, vedel,
                                      _mm_cmpgt_epi32(zdelta, _mm_setzero_si128()));
                 __m128i dif  = _mm_mullo_epi32(_mm_abs_epi32(zdelta), zesel);
                 __m128i drop = _mm_sub_epi32(msg, rsg);
@@ -6092,7 +6137,7 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
             tmp = _mm_and_si128(tmp,tmpb);
             l128 = _mm_add_epi8(l128, one128);
             // NEW
-            head128 = _mm_blendv_epi8(head128, l128, tmp);
+            head128 = blendv_fullmask8(head128, l128, tmp);
 
             tmpb = tmp;
         }
@@ -6122,7 +6167,7 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
             tmp = _mm_and_si128(tmp,tmpb);
             l128 = _mm_sub_epi8(l128, one128);
             // NEW
-            index128 = _mm_blendv_epi8(index128, l128, tmp);
+            index128 = blendv_fullmask8(index128, l128, tmp);
 
             tmpb = tmp;
         }

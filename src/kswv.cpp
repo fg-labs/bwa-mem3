@@ -985,7 +985,7 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
          * carried-forward pad column still reports that pad column. Lanes that
          * did not advance get a garbage index, discarded by the same vbsl the
          * per-cell form already relied on. */
-        if (neon_movemask_u8(cmp0_active))
+        if (vmaxvq_u8(cmp0_active))  // any active lane? (was neon_movemask_u8 != 0)
         {
             uint8x16_t iqe_vec = vdupq_n_u8(0xFF);
             uint8x16_t foundBlk = zero_vec;
@@ -1000,7 +1000,7 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
                 uint8x16_t reached = vceqq_u8(vld1q_u8(blockMax + b * SIMD_WIDTH8), imax_vec);
                 uint8x16_t newly = vandq_u8(vbicq_u8(reached, foundBlk), cmp0_active);
                 foundBlk = vorrq_u8(foundBlk, reached);
-                if (neon_movemask_u8(newly)) {
+                if (vmaxvq_u8(newly)) {  // any newly-maxed lane? (was neon_movemask_u8 != 0)
                     const int j0 = b * QE_BLK;
                     const int j1 = (j0 + QE_BLK < ncol) ? (j0 + QE_BLK) : ncol;
                     uint8x16_t got = zero_vec;
