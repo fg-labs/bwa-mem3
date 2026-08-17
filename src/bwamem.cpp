@@ -5140,7 +5140,16 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                 else
                 {
                     a->qe = l_query, a->re = s->rbeg + s->len;
-                    // seedcov business, this "if" block should be redundant, check and remove.
+                    // Do NOT remove this seedcov recompute: it is load-bearing.
+                    // This is the no-right-extension branch (s->qbeg + s->len ==
+                    // l_query). When the seed also needs no left extension
+                    // (s->qbeg == 0, i.e. it spans the whole read, as perfect-match
+                    // reads do) no SW pair is staged on either side, so none of the
+                    // other seedcov recompute sites run -- neither the right-HIT
+                    // path above, nor the post-SW LEFT-accept loops, nor the
+                    // RIGHT-accept loops. In that case this block is the ONLY writer
+                    // of a->seedcov. Dropping it would leave seedcov stale and change
+                    // mem_approx_mapq_se (log(seedcov)), altering the emitted MAPQ.
                     if (a->rb != H0_ && a->qb != H0_)
                     {
                         int i;
