@@ -316,6 +316,18 @@ reviews:
         script that is not wired into a ci.yml step. Calibration: the bwa `.ann`
         index file stores TWO lines per reference sequence, so a parser that
         reads alternating lines is correct, not an off-by-one.
+        Formatting and shellcheck conformance are enforced in CI by
+        test/regression/shell_lint.sh, which PINS shellcheck 0.11.0 at default
+        severity and shfmt with flags `-i 4 -ci -bn -sr`. That gate is
+        authoritative: do NOT raise shfmt/formatting findings or shellcheck
+        findings that these pinned tools already accept. shfmt DEFAULTS (tabs,
+        default redirect spacing) do not apply here, so do not propose reformatting
+        toward them; and intentional, controlled word-splitting the pinned
+        shellcheck does not flag (e.g. building a printf argument list from `seq`,
+        which does not trigger SC2046 at default severity) is not a defect. Keep
+        raising real correctness findings — a masked exit status, a vacuous pass,
+        an unquoted expansion that causes an actual glob/whitespace bug — since CI
+        checks formatting, not those.
     - path: "src/{kseq,khash,ksort,kvec,kbtree}.h"
       instructions: >-
         These are vendored klib headers (Attractive Chaos, MIT) carried in-tree
@@ -338,7 +350,11 @@ reviews:
         that cannot pass vacuously when a tool or input is missing. A benchmark
         script that prints a timing must also verify the run succeeded and
         produced the expected output — a wrapper reports wall-clock even for a
-        command that died early.
+        command that died early. These scripts are not executed by CI but are
+        still linted by test/regression/shell_lint.sh, so the same pinned
+        shellcheck/shfmt rule as the regression scripts applies: do not raise
+        formatting or shellcheck findings the pinned tools (shellcheck 0.11.0
+        default severity, shfmt `-i 4 -ci -bn -sr`) already accept.
     - path: "{CHANGELOG.md,NEWS.md,version.txt,release-please-config.json,.release-please-manifest.json}"
       instructions: >-
         Release automation. Both CHANGELOG.md and the release-please manifest
