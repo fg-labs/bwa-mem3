@@ -135,6 +135,38 @@ jobs:
           packages: zlib1g-dev libdeflate-dev autoconf automake
           version: 1.0
 
+      - name: Install clang-19 for the smoke test
+        # The smoke test builds the tarball with clang-19 -- the compiler
+        # bioconda and the performance benchmarks actually ship -- from
+        # apt.llvm.org (bookworm/noble ship an older clang). Installed via a
+        # pinned repo rather than piping llvm.sh into `sudo bash`: fetch LLVM's
+        # archive signing key, VERIFY its fingerprint against LLVM's published
+        # value before trusting it, keep it in a dedicated keyring, and add the
+        # repo `signed-by` that keyring so a tampered mirror or a changed
+        # installer script can't run code as root or slip in unsigned packages.
+        # libomp-19-dev provides -lomp for clang's -fopenmp (libsais). clang-19
+        # is also the Makefile's compiler-floor minimum.
+        run: |
+          set -euo pipefail
+          . /etc/os-release
+          codename="${VERSION_CODENAME:-$(lsb_release -cs)}"
+          # LLVM's published apt archive signing key fingerprint.
+          expected_fpr="6084F3CF814B57C1CF12EFD515CF4D18AF4F7421"
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key -o /tmp/llvm-snapshot.gpg.key
+          got_fpr="$(gpg --show-keys --with-colons --with-fingerprint /tmp/llvm-snapshot.gpg.key \
+            | awk -F: '/^fpr:/ {print $10; exit}')"
+          if [ "$got_fpr" != "$expected_fpr" ]; then
+            echo "FATAL: LLVM archive key fingerprint mismatch: got '$got_fpr', expected '$expected_fpr'" >&2
+            exit 1
+          fi
+          sudo install -m 0755 -d /etc/apt/keyrings
+          sudo gpg --dearmor -o /etc/apt/keyrings/llvm-snapshot.gpg /tmp/llvm-snapshot.gpg.key
+          echo "deb [signed-by=/etc/apt/keyrings/llvm-snapshot.gpg] http://apt.llvm.org/${codename}/ llvm-toolchain-${codename}-19 main" \
+            | sudo tee /etc/apt/sources.list.d/llvm-19.list
+          sudo apt-get update
+          sudo apt-get install -y clang-19 libomp-19-dev
+          clang++-19 --version | head -1
+
       - name: Install git-archive-all
         # Pinned to a known-good release so a future breaking version
         # bump can't silently change the tarball layout or sha256.
@@ -225,15 +257,15 @@ jobs:
       - name: Smoke test the tarball
         # Extract the asset and run the same make invocation bioconda's
         # build.sh uses (`make -j${CPU_COUNT} CC=${CC} CXX=${CXX}` with
-        # the default `myall` target). Note this exercises the build
-        # against the runner's *system* gcc, not conda-forge's
-        # toolchain — so it validates "the source tree builds" but not
-        # "the source tree builds under conda-forge's gcc / libstdc++ /
-        # glibc". A conda-only ABI breakage will pass here and fail
-        # only on bioconda CI. If the smoke step fails the upload step
-        # doesn't run; the tag and (asset-less) GH release still exist
-        # and can be repaired via workflow_dispatch once the underlying
-        # issue is fixed.
+        # the default `myall` target), building with clang-19 — the compiler
+        # bioconda's recipe forces and the one the performance benchmarks ship —
+        # so the smoke test exercises the toolchain users actually get, and
+        # satisfies the Makefile's compiler floor. Note this still uses the
+        # runner's clang-19 + glibc, not conda-forge's, so a conda-only ABI
+        # breakage can still pass here and fail only on bioconda CI. If the
+        # smoke step fails the upload step doesn't run; the tag and (asset-less)
+        # GH release still exist and can be repaired via workflow_dispatch once
+        # the underlying issue is fixed.
         #
         # The trailing assertion is the second half of the single-source
         # contract: the binary's reported version must start with
@@ -245,7 +277,7 @@ jobs:
           VERSION='${{ steps.ver.outputs.version }}'
           tar -xzf Source_code_including_submodules.tar.gz -C /tmp
           cd "/tmp/bwa-mem3-${VERSION}"
-          make -j"$(nproc)" CC=cc CXX=c++
+          make -j"$(nproc)" CXX=clang++-19 CC=clang-19
           # Read stdout only -- bwa-mem3 prints its version string to
           # stdout, while mimalloc emits a startup banner ("mimalloc
           # 3.3.x") to stderr. With `2>&1` the banner can flush first

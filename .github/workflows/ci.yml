@@ -200,6 +200,10 @@ jobs:
             arch_flag: ""
             use_mimalloc: "1"
             run_integration: true
+            # macOS uses Apple clang (its `g++`/`clang++` are Apple clang), which
+            # is above the Apple-clang floor — no llvm.sh install needed here.
+            cxx: "clang++"
+            cc: "clang"
             name: "macOS ARM64 (mimalloc)"
             artifact_slug: "macos-arm64-mimalloc"
           - os: ubuntu-latest
@@ -222,15 +226,37 @@ jobs:
             run_integration: true
             name: "Linux x86_64 single-binary BASELINE_ARCH=sse41 (mimalloc)"
             artifact_slug: "linux-x86_64-single-sse41-baseline-mimalloc"
+          # gcc build-compatibility lane. The rest of the matrix builds with
+          # clang-19 (the shipping/benchmarked compiler); this one row keeps the
+          # g++ build exercised. g++ on ubuntu-latest is below the compiler floor,
+          # so it opts out with ALLOW_UNSUPPORTED_COMPILER=1 — deliberate here.
           - os: ubuntu-latest
             arch_flag: "avx2"
             use_mimalloc: "1"
-            cxx: "clang++"
-            name: "Linux x86_64 AVX2 clang (mimalloc)"
-            artifact_slug: "linux-x86_64-avx2-clang-mimalloc"
+            run_integration: true
+            cxx: "g++"
+            cc: "gcc"
+            allow_unsupported: "1"
+            name: "Linux x86_64 AVX2 (gcc compat)"
+            artifact_slug: "linux-x86_64-avx2-gcc-compat"
 
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
+
+    # Compiler is set per row: CXX defaults to clang-19 (installed from
+    # apt.llvm.org below), overridden to g++ on the gcc-compat row. CC and the
+    # compiler-floor opt-out are provided here at the job level so every `make`
+    # invocation in the job (main build, test binaries, ASAN, integration)
+    # inherits them without repeating the flags on each command line. The gcc
+    # row is below the floor by design, so it sets allow_unsupported: "1".
+    env:
+      # CXX and CC at the job level so EVERY make invocation inherits them,
+      # including nested sub-makes (e.g. the integration step's `make -C ..` to
+      # build the reference binary) that don't pass the compiler explicitly.
+      # Command-line CXX=/CC= on individual steps still override these.
+      CXX: ${{ matrix.cxx || 'clang++-19' }}
+      CC: ${{ matrix.cc || 'clang-19' }}
+      ALLOW_UNSUPPORTED_COMPILER: ${{ matrix.allow_unsupported || '0' }}
 
     steps:
       - name: Checkout
@@ -266,6 +292,41 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install bwa autoconf automake libomp libdeflate
 
+      - name: Install clang-19 (Linux)
+        # The matrix builds with clang-19 by default — the shipping/benchmarked
+        # compiler and the compiler-floor minimum (see the Makefile's compiler
+        # version floor). Installed from apt.llvm.org via a pinned repo rather
+        # than piping llvm.sh into `sudo bash`: fetch LLVM's archive signing key,
+        # VERIFY its fingerprint against LLVM's published value before trusting
+        # it, store it in a dedicated keyring, and add the repo `signed-by` that
+        # keyring so a tampered mirror or a changed installer script can't run
+        # code as root or slip in unsigned packages. Skipped on the gcc-compat
+        # lane, which deliberately builds with the runner's g++ +
+        # ALLOW_UNSUPPORTED_COMPILER=1.
+        if: runner.os == 'Linux' && matrix.cxx != 'g++'
+        run: |
+          set -euo pipefail
+          . /etc/os-release
+          codename="${VERSION_CODENAME:-$(lsb_release -cs)}"
+          # LLVM's published apt archive signing key fingerprint.
+          expected_fpr="6084F3CF814B57C1CF12EFD515CF4D18AF4F7421"
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key -o /tmp/llvm-snapshot.gpg.key
+          got_fpr="$(gpg --show-keys --with-colons --with-fingerprint /tmp/llvm-snapshot.gpg.key \
+            | awk -F: '/^fpr:/ {print $10; exit}')"
+          if [ "$got_fpr" != "$expected_fpr" ]; then
+            echo "FATAL: LLVM archive key fingerprint mismatch: got '$got_fpr', expected '$expected_fpr'" >&2
+            exit 1
+          fi
+          sudo install -m 0755 -d /etc/apt/keyrings
+          sudo gpg --dearmor -o /etc/apt/keyrings/llvm-snapshot.gpg /tmp/llvm-snapshot.gpg.key
+          echo "deb [signed-by=/etc/apt/keyrings/llvm-snapshot.gpg] http://apt.llvm.org/${codename}/ llvm-toolchain-${codename}-19 main" \
+            | sudo tee /etc/apt/sources.list.d/llvm-19.list
+          sudo apt-get update
+          # libomp-19-dev provides omp.h in clang-19's search path (libsais.c
+          # uses -fopenmp); ubuntu's libomp-dev matches the distro clang, not 19.
+          sudo apt-get install -y clang-19 libomp-19-dev
+          clang++-19 --version | head -1
+
       - name: Verify CMake is available
         run: cmake --version
 
@@ -280,11 +341,11 @@ jobs:
           if [ "${{ matrix.arch_flag }}" = "" ]; then
             make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)" \
               BASELINE_ARCH=${{ matrix.baseline_arch || 'avx2' }} \
-              CXX=${{ matrix.cxx || 'g++' }} USE_MIMALLOC=${{ matrix.use_mimalloc }}
+              CXX=${{ matrix.cxx || 'clang++-19' }} USE_MIMALLOC=${{ matrix.use_mimalloc }}
           else
             make -j"$(nproc)" \
               arch=${{ matrix.arch_flag }} \
-              CXX=${{ matrix.cxx || 'g++' }} USE_MIMALLOC=${{ matrix.use_mimalloc }}
+              CXX=${{ matrix.cxx || 'clang++-19' }} USE_MIMALLOC=${{ matrix.use_mimalloc }}
           fi
 
       - name: Verify binary
@@ -319,9 +380,9 @@ jobs:
         # and skip when the test TU lacks __AVX2__/__AVX512BW__).
         run: |
           if [ "${{ matrix.arch_flag }}" = "" ]; then
-            make test-binaries CXX=${{ matrix.cxx || 'g++' }}
+            make test-binaries CXX=${{ matrix.cxx || 'clang++-19' }}
           else
-            make test-binaries arch=${{ matrix.arch_flag }} CXX=${{ matrix.cxx || 'g++' }}
+            make test-binaries arch=${{ matrix.arch_flag }} CXX=${{ matrix.cxx || 'clang++-19' }}
           fi
 
       - name: Run unit tests (all rows)
@@ -360,9 +421,9 @@ jobs:
         # loudly rather than silently passing if it is not in effect.
         run: |
           if [ "${{ matrix.arch_flag }}" = "" ]; then
-            make bns_zero_calloc_test CXX=${{ matrix.cxx || 'g++' }}
+            make bns_zero_calloc_test CXX=${{ matrix.cxx || 'clang++-19' }}
           else
-            make bns_zero_calloc_test arch=${{ matrix.arch_flag }} CXX=${{ matrix.cxx || 'g++' }}
+            make bns_zero_calloc_test arch=${{ matrix.arch_flag }} CXX=${{ matrix.cxx || 'clang++-19' }}
           fi
           ./bns_zero_calloc_test
 
@@ -592,10 +653,10 @@ jobs:
         if: matrix.canonical == true
         run: |
           if [ "${{ matrix.arch_flag }}" = "" ]; then
-            MAKE_ARGS="BASELINE_ARCH=${{ matrix.baseline_arch || 'avx2' }} CXX=${{ matrix.cxx || 'g++' }} USE_MIMALLOC=${{ matrix.use_mimalloc }}" \
+            MAKE_ARGS="BASELINE_ARCH=${{ matrix.baseline_arch || 'avx2' }} CXX=${{ matrix.cxx || 'clang++-19' }} USE_MIMALLOC=${{ matrix.use_mimalloc }}" \
               bash test/regression/make_header_deps.sh
           else
-            MAKE_ARGS="arch=${{ matrix.arch_flag }} CXX=${{ matrix.cxx || 'g++' }} USE_MIMALLOC=${{ matrix.use_mimalloc }}" \
+            MAKE_ARGS="arch=${{ matrix.arch_flag }} CXX=${{ matrix.cxx || 'clang++-19' }} USE_MIMALLOC=${{ matrix.use_mimalloc }}" \
               bash test/regression/make_header_deps.sh
           fi
 
@@ -604,7 +665,7 @@ jobs:
         # the script sets it per case, since the goal is what it is checking.
         if: matrix.canonical == true
         run: |
-          MAKE_ARGS="CXX=${{ matrix.cxx || 'g++' }} USE_MIMALLOC=${{ matrix.use_mimalloc }}" \
+          MAKE_ARGS="CXX=${{ matrix.cxx || 'clang++-19' }} USE_MIMALLOC=${{ matrix.use_mimalloc }}" \
             bash test/regression/make_default_goal.sh
 
       - name: --bam=6 roundtrip smoke (chr22)
@@ -900,7 +961,7 @@ jobs:
         run: |
           make clean
           make -j"$(nproc)" arch=${{ matrix.arch_flag }} \
-            CXX=${{ matrix.cxx || 'g++' }} \
+            CXX=${{ matrix.cxx || 'clang++-19' }} \
             USE_MIMALLOC=${{ matrix.use_mimalloc }} \
             EXTRA_CXXFLAGS="-DBWA_MEM3_DEBUG_CHN_FLT_XCHECK -DBWA_MEM3_DEBUG_RID_CHECK -DBWA_MEM3_DEBUG_UNGAPPED_XCHECK -DBSW8_ASSERT_ENVELOPE -DBWA_MEM3_DEBUG_POISON -DBWAMEM3_UGP_PROFILE=1 -DBWA_MEM3_DEBUG_RESCUE_STATS"
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
@@ -938,10 +999,10 @@ jobs:
         run: |
           make clean
           make -j"$(nproc)" arch=${{ matrix.arch_flag }} \
-            CXX=${{ matrix.cxx || 'g++' }} \
+            CXX=${{ matrix.cxx || 'clang++-19' }} \
             USE_MIMALLOC=${{ matrix.use_mimalloc }} TESTING_BUILD=1
           make test-injection arch=${{ matrix.arch_flag }} \
-            CXX=${{ matrix.cxx || 'g++' }} \
+            CXX=${{ matrix.cxx || 'clang++-19' }} \
             USE_MIMALLOC=${{ matrix.use_mimalloc }} TESTING_BUILD=1
 
       - name: Short-read SE smoke (chr22, ASAN, dense+variable-length)
@@ -963,7 +1024,7 @@ jobs:
         run: |
           make clean
           make -j"$(nproc)" arch=${{ matrix.arch_flag }} \
-            CXX=${{ matrix.cxx || 'g++' }} ASAN=1
+            CXX=${{ matrix.cxx || 'clang++-19' }} ASAN=1
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           CHR22_FA=/tmp/chr22/chr22.fa \
           CHR22_SIM_DIR=/tmp/chr22-sim-dense \
@@ -982,6 +1043,14 @@ jobs:
   coverage:
     name: Coverage (Linux AVX2, gcov → Codecov)
     runs-on: ubuntu-latest
+    # Coverage uses gcov/gcovr, which are GCC tools, so this lane must build with
+    # g++ — below the compiler floor by necessity, so it opts out.
+    env:
+      # Select the below-floor compiler explicitly at job scope so every direct
+      # and nested `make` uses it, rather than relying on the runner default.
+      CXX: g++
+      CC: gcc
+      ALLOW_UNSUPPORTED_COMPILER: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -1040,6 +1109,15 @@ jobs:
   profiling-build:
     name: Profiling build (STAGE_PROF=1)
     runs-on: ubuntu-latest
+    # A specialized instrumentation lane exercising the STAGE_PROF=1 code path;
+    # builds with the runner's g++ (below the floor) and opts out. Migrating it
+    # to clang-19 is a possible follow-up.
+    env:
+      # Select the below-floor compiler explicitly at job scope so every direct
+      # and nested `make` uses it, rather than relying on the runner default.
+      CXX: g++
+      CC: gcc
+      ALLOW_UNSUPPORTED_COMPILER: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
