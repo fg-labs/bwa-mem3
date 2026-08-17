@@ -297,6 +297,18 @@ static void matesw_sort_partitions_by_len(SeqPair *sp, int64_t pcnt8, int64_t pc
     std::sort(sp, sp + pcnt8, by_len1);
     if (pcnt > pcnt8) std::sort(sp + pcnt8, sp + pcnt, by_len1);
 }
+
+/* T5/L3: RAII holder for mem_pair's per-thread scratch vectors. Retaining a
+ * vector's grown capacity across calls (reset n=0, keep .a/.m) removes two
+ * malloc/free pairs per read-pair, but a bare `static thread_local pair64_v`
+ * is a POD with no destructor: its backing .a allocation would never be freed
+ * and LeakSanitizer (the ASan CI row runs LSan) flags it as a per-thread leak
+ * at exit. Wrapping the vector in a type whose destructor frees .a releases the
+ * buffer when the worker thread ends, so the reuse is genuinely leak-free. */
+struct pair64_scratch {
+    pair64_v v = {0, 0, 0};
+    ~pair64_scratch() { free(v.a); }
+};
 } // namespace
 
 /* File-scope forward declaration of the dedup/patch entry point defined in
@@ -718,10 +730,28 @@ int mem_matesw(const mem_opt_t *opt, const bntseq_t *bns,
 
 int mem_pair(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, const mem_pestat_t pes[4], bseq1_t s[2], mem_alnreg_v a[2], int id, int *sub, int *n_sub, int z[2], int n_pri[2])
 {
-    pair64_v v, u;
+    /* T5/L3: v and u are pure per-call working buffers -- rebuilt from n=0 every
+     * call, only [0,n) is ever read, and no state survives the return. Making
+     * them thread-local persistent buffers (reset n=0, keep the grown capacity)
+     * removes two malloc/free pairs per read-pair without changing any bytes:
+     * a reset-to-empty vector with retained capacity behaves identically to a
+     * fresh kv_init'd one. The pair64_scratch wrapper frees .a at thread exit
+     * (LSan-clean; see its definition above). */
+    static thread_local pair64_scratch v_buf, u_buf;
+    pair64_v &v = v_buf.v, &u = u_buf.v;
     int r, i, k, y[4], ret; // y[] keeps the last hit
     int64_t l_pac = bns->l_pac;
-    kv_init(v); kv_init(u);
+    /* Bound the retained capacity so one pathological high-cardinality pair does
+     * not pin a large allocation for the worker thread's lifetime. Below the cap
+     * the grown buffer is reused as-is; above it we release and let the next call
+     * re-grow from empty. Capacity-only -- [0,n) content and output are
+     * byte-identical either way. The cap (64Ki entries = 1 MiB per buffer) sits
+     * orders of magnitude above any realistic per-pair candidate count, so the
+     * common path never trims. */
+    const size_t PAIR_SCRATCH_MAX_M = (size_t)1 << 16;
+    if (v.m > PAIR_SCRATCH_MAX_M) { free(v.a); v.a = 0; v.m = 0; }
+    if (u.m > PAIR_SCRATCH_MAX_M) { free(u.a); u.a = 0; u.m = 0; }
+    v.n = 0; u.n = 0;
     for (r = 0; r < 2; ++r) { // loop through read number
         for (i = 0; i < n_pri[r]; ++i) {
             pair64_t key;
@@ -775,7 +805,8 @@ int mem_pair(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, cons
             if (*sub - (int)(u.a[i].x>>32) <= tmp) ++*n_sub;
 
     } else ret = 0, *sub = 0, *n_sub = 0;
-    free(u.a); free(v.a);
+    /* T5/L3: no per-call free -- v/u keep their capacity for reuse across calls;
+     * the pair64_scratch destructor releases .a when the worker thread exits. */
     return ret;
 }
 

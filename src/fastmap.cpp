@@ -663,7 +663,7 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
         ret->read_arena = aux->cohort_arena;
         ret->seqs = aux->legacy_reader
             ? bseq_read_orig(slice_target, &ret->n_seqs, aux->ks, aux->ks2, &sz, &ret->read_arena)
-            : bseq_read_fast(slice_target, &ret->n_seqs, aux->frks, aux->frks2, &sz, &ret->read_arena);
+            : bseq_read_fast(slice_target, &ret->n_seqs, aux->frks, aux->frks2, &sz, &ret->read_arena, aux->copy_comment);
         aux->cohort_arena = ret->read_arena;
 
         /* A short read means the input ran out, which ends the cohort early. */
@@ -1117,16 +1117,28 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
         double sp_w0 = sp_enabled() ? sp_wall() : 0.0;
         long sp_wbytes = 0;
 
+        /* L17: hoist the chunk-constant writer/mode selectors out of the
+         * per-record loop. opt->meth_mode and opt->flag never change within a
+         * chunk, and neither writer pointer is reassigned during output; the
+         * loop body only calls bam_writer_write/free, which touch records, not
+         * these. Without this the compiler must reload aux->opt->meth_mode (a
+         * two-level deref) and the g_meth_bam_writer global after every external
+         * write call. Byte-identical (same control flow, same values). */
+        const int   out_meth_mode = aux->opt->meth_mode;
+        const int   out_flag_pe   = (aux->opt->flag & MEM_F_PE);
+        meth_bam_writer_t *const out_meth_bw = g_meth_bam_writer;
+        struct bam_writer_s *const out_bam_bw = aux->bam_writer;
+
         for (int i = 0; i < ret->n_seqs; )
         {
             int group_size = 1;
-            if (aux->opt->meth_mode && (aux->opt->flag & MEM_F_PE)
+            if (out_meth_mode && out_flag_pe
                 && i + 1 < ret->n_seqs
                 && strcmp(ret->seqs[i].name, ret->seqs[i+1].name) == 0) {
                 group_size = 2;
             }
 
-            if (aux->opt->meth_mode && g_meth_bam_writer != NULL) {
+            if (out_meth_mode && out_meth_bw != NULL) {
                 /* Gather all bam1_t* in the QNAME group, propagate QC fail, emit. */
                 int total = 0;
                 for (int k = 0; k < group_size; ++k) total += ret->seqs[i+k].n_bams;
@@ -1143,18 +1155,18 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
                     meth_bam_group_propagate_qcfail(group, total);
                     for (int j = 0; j < total; ++j) {
 #ifndef DISABLE_OUTPUT
-                        if (meth_bam_writer_write(g_meth_bam_writer, group[j]) < 0)
+                        if (meth_bam_writer_write(out_meth_bw, group[j]) < 0)
                             err_fatal(__func__, "failed to write meth BAM record");
 #endif
                         bam_writer_free(group[j]);
                     }
                     free(group);
                 }
-            } else if (aux->bam_writer != NULL) {
+            } else if (out_bam_bw != NULL) {
                 for (int k = 0; k < group_size; ++k) {
                     for (int j = 0; j < ret->seqs[i+k].n_bams; ++j) {
 #ifndef DISABLE_OUTPUT
-                        if (bam_writer_write(aux->bam_writer, (struct bam1_t *)ret->seqs[i+k].bams[j]) < 0)
+                        if (bam_writer_write(out_bam_bw, (struct bam1_t *)ret->seqs[i+k].bams[j]) < 0)
                             err_fatal(__func__, "failed to write BAM record");
 #endif
                         bam_writer_free((struct bam1_t *)ret->seqs[i+k].bams[j]);

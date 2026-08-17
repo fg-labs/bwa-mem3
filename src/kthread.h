@@ -71,12 +71,18 @@ typedef struct ktp_t {
 
 struct kt_for_t;
 
+/* L27: pad each worker to a full cache line so adjacent workers' steal counter
+ * `i` (bumped with __sync_fetch_and_add during the end-of-pass steal phase) do
+ * not share a line and false-share. Layout-only: no field is added or reordered
+ * that any code reads, so output is byte-identical. The backing array is
+ * allocated cache-line-aligned (see kthread.cpp) so the stride actually lands
+ * each element on its own line. */
 typedef struct {
 	struct kt_for_t *t;
 	long i;
 	double cpu_busy;   /* stage_prof: per-thread CLOCK_THREAD_CPUTIME seconds (--profile) */
 	double encode;     /* stage_prof: per-thread SAM/BAM-build CPU seconds */
-} ktf_worker_t;
+} __attribute__((aligned(64))) ktf_worker_t;
 
 typedef struct kt_for_t {
 	int n_threads;
