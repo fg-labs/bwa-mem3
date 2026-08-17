@@ -1410,17 +1410,24 @@ int mem_chain_flt(const mem_opt_t *opt, int n_chn_, mem_chain_t *a_, int tid)
     }
     else
     {
-        /* Slot 0's seeds are freed LATE. If every chain is dropped the array is
-         * never compacted, so a_[0] still holds chain 0 -- and the empty-array
-         * path below hands exactly that slot back to the caller with kept = 3
-         * (bwa-mem2 behaviour, preserved verbatim; see the CHN-6/19 note).
-         * bwa-mem2 frees those seeds here and then returns the chain pointing at
-         * the freed block, so what the caller extends depends on whether the
-         * allocator has reused it. Deferring this one free yields the same chain
-         * with its own seeds still intact -- the result bwa-mem2 produces
-         * whenever the block is untouched -- without the use-after-free. When at
-         * least one chain survives, slot 0 was either kept or overwritten by
-         * compaction, and the seeds are freed immediately after the loop. */
+        /* Slot 0's seeds are freed LATE *when the target resurrects slot 0*. If
+         * every chain is dropped the array is never compacted, so a_[0] still
+         * holds chain 0, and the empty-array path below hands exactly that slot
+         * back to the caller with kept = 3 (bwa-mem2 behaviour; see the CHN-6/19
+         * note). bwa-mem2 frees those seeds here and then returns the chain
+         * pointing at the freed block, so what the caller extends depends on
+         * whether the allocator has reused it. Deferring this one free yields the
+         * same chain with its own seeds still intact -- the result bwa-mem2
+         * produces whenever the block is untouched -- without the use-after-free.
+         * When at least one chain survives, slot 0 was either kept or overwritten
+         * by compaction, and the seeds are freed immediately after the loop.
+         *
+         * Under a target that does NOT resurrect (--compat=bwa-mem), nothing
+         * reads slot 0 again, so the deferral has nothing to protect and holding
+         * the pointer past the early return below would simply leak it. Free it
+         * in the loop, exactly as bwa does. */
+        const int resurrect_empty =
+            (opt->compat == NULL) || opt->compat->chain_flt_resurrect_empty;
         mem_seed_t *slot0_seeds = NULL;
         for (i = k = 0; i < n_chn_; ++i)
         {
@@ -1431,7 +1438,7 @@ int mem_chain_flt(const mem_opt_t *opt, int n_chn_, mem_chain_t *a_, int tid)
             {
                 if (c->m > SEEDS_PER_CHAIN)  // CHN-16: dead tprof[PE11] counter removed
                 {
-                    if (i == 0) slot0_seeds = c->seeds;  // may be resurrected below
+                    if (i == 0 && resurrect_empty) slot0_seeds = c->seeds;  // may be resurrected below
                     else free(c->seeds);
                 }
             }
@@ -1440,6 +1447,15 @@ int mem_chain_flt(const mem_opt_t *opt, int n_chn_, mem_chain_t *a_, int tid)
         // Not resurrected -- drop it now. free(NULL) when chain 0 was kept.
         if (k != 0) free(slot0_seeds);
         n_chn_ = k;
+
+        /* #310: the weight filter emptied the array. bwa reports that honestly
+         * (its tail loops are bounded by n_chn == 0, so it returns 0 and the read
+         * goes out unmapped); bwa-mem2's seqid-range machinery instead rebuilds a
+         * count of 1 and extends the chain it just rejected. Returning here is
+         * bwa's answer -- selected per target rather than unconditionally,
+         * because a `bwa-mem2` or `off` run that stopped resurrecting would no
+         * longer be the drop-in it advertises. */
+        if (n_chn_ == 0 && !resurrect_empty) return 0;
     }
 
     /* Fast path for the dominant single-chain (unique-mapper) case. With one
