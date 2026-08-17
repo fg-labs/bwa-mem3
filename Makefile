@@ -153,8 +153,38 @@ ifneq ($(IS_ARM),)
     SSE2NEON_INCLUDES = -Iext/sse2neon
     CPPFLAGS += $(SSE2NEON_FLAGS)
     INCLUDES += $(SSE2NEON_INCLUDES)
-    # Apple Silicon uses 128-byte cache lines
-    CPPFLAGS += -DCACHE_LINE_BYTES=128
+    # CPU tuning. Default is generic/portable scheduling — safe for any ARM core
+    # including Apple Silicon, and what portable release binaries should ship.
+    # Set ARM_CPU=<name> for a core-tuned build, e.g. ARM_CPU=neoverse-v2
+    # (Graviton4) or ARM_CPU=native (match the build host). This goes in CPPFLAGS
+    # (not ARCH_FLAGS) because ARCH_FLAGS is reset with `=` in the arch=arm64
+    # branch below; CPPFLAGS uses `+=` and reaches every compile line.
+    ifneq ($(ARM_CPU),)
+        CPPFLAGS += -mcpu=$(ARM_CPU)
+    endif
+    # Cache-line size used as the minimum SIMD allocation alignment. Apple
+    # Silicon uses 128-byte lines; Neoverse/Graviton use 64. Default 128 —
+    # over-aligning on a 64-byte core is harmless. A tuned build overrides it
+    # with ARM_CACHE_LINE=64.
+    ARM_CACHE_LINE ?= 128
+    # Reject unsupported alignments before they reach CACHE_LINE_BYTES. An
+    # invalid value would make SIMD_ALIGNED_ALLOC call posix_memalign with a bad
+    # alignment, which returns EINVAL/NULL and is then dereferenced unchecked in
+    # the kswv constructor. CACHE_LINE_BYTES must be exactly one supported value:
+    # guard the token count first ($(filter) matches per word, so a multi-token
+    # value like "64 128" would slip past a bare membership test; this also
+    # rejects empty), then the value itself. The supported values are the
+    # $(filter) PATTERN and the user value is the text, not the reverse: a user
+    # value used as the pattern could carry a `%` wildcard (e.g. ARM_CACHE_LINE=%)
+    # that matches everything and passes the check. Fail at parse time with a
+    # clear message instead of building a broken binary.
+    ifneq ($(words $(ARM_CACHE_LINE)),1)
+        $(error ARM_CACHE_LINE must be a single value, 64 or 128 (got '$(ARM_CACHE_LINE)'))
+    endif
+    ifeq ($(filter 64 128,$(ARM_CACHE_LINE)),)
+        $(error ARM_CACHE_LINE must be 64 or 128 (got '$(ARM_CACHE_LINE)'))
+    endif
+    CPPFLAGS += -DCACHE_LINE_BYTES=$(ARM_CACHE_LINE)
     # Link Accelerate framework on macOS for potential BLAS/vecLib usage
     ifeq ($(UNAME_S),Darwin)
         LIBS_EXTRA = -framework Accelerate
@@ -745,6 +775,8 @@ test-binaries: $(BWA_LIB) $(HTS_LIB)
 	    CXX="$(CXX)" \
 	    COVERAGE=$(COVERAGE) \
 	    ARCH_FLAGS_FROM_PARENT='$(ARCH_FLAGS)' \
+	    ARM_CPU='$(ARM_CPU)' \
+	    ARM_CACHE_LINE='$(or $(ARM_CACHE_LINE),128)' \
 	    HTSLIB_static_LIBS='$(HTSLIB_static_LIBS)' \
 	    HTSLIB_static_LDFLAGS='$(HTSLIB_static_LDFLAGS)'
 
