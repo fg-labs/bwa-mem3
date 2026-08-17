@@ -2899,6 +2899,24 @@ int main_mem(int argc, char *argv[])
     aux.shm_base = aux.fmi->shm_attached_base();
     tprof[FMI][0] += __rdtsc() - tim;
 
+#if SMEM_LOCKSTEP_N > 1
+    /* Resolve the phase-2 SMEM lockstep width once, before the seeding workers
+     * spawn: a startup probe of the core's memory-level parallelism sets how
+     * many reads' FM-index walks the driver keeps in flight (BWA3_SMEM_LOCKSTEP_N
+     * overrides and skips the probe). The probe chases the just-loaded cp_occ
+     * checkpoint array (opaque here: base, block count, block stride, and the
+     * byte offset of a 64-bit word per block). Width changes scheduling only,
+     * never output. */
+    bwa3_init_smem_lockstep_width(
+        aux.fmi->cp_occ_data(),
+        aux.fmi->cp_occ_size_bytes() / (int64_t)sizeof(CP_OCC),
+        sizeof(CP_OCC),
+        offsetof(CP_OCC, one_hot_bwt_str));
+    if (bwa_verbose >= 3)
+        fprintf(stderr, "[M::%s] phase-2 SMEM lockstep width: %d\n",
+                __func__, g_smem_lockstep_n);
+#endif
+
     /* D3: load the ORIGINAL reference's bns/pac as resident handles for the
      * (future) extension/scoring phase — distinct from the seed FM-index above.
      * The seed BNS (aux.fmi->idx->bns) is the f/r-doubled converted reference

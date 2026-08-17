@@ -1352,7 +1352,7 @@ void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
 
     if (numReads == 0) return;
 
-    const int32_t N = SMEM_LOCKSTEP_N;
+    const int32_t N = g_smem_lockstep_n;
     // LISA trick #4: hybrid SoA layout. `slots[]` holds only the small hot
     // state (~80 B per slot, full array fits in 1-2 cache lines for N=8).
     // Bulk per-slot buffers (prev/match_buf) live separately and are reused
@@ -1375,7 +1375,9 @@ void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
     // service pipeline appears: gate the realloc on a configured upper
     // bound (e.g. MAX_SMEM_PER_SLOT) or shrink when cache.per_slot greatly
     // exceeds the current batch.
-    BatchSlot slots[SMEM_LOCKSTEP_N] = {};
+    /* Fixed-size on the stack (compile-time MAX); only the first N are used,
+     * where N = g_smem_lockstep_n is the startup-probed runtime width. */
+    BatchSlot slots[SMEM_LOCKSTEP_N_MAX] = {};
     static thread_local LockstepSmemCache cache;
     const size_t per_slot_smems = (size_t)max_readlength;
     if (per_slot_smems > cache.per_slot) {
