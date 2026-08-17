@@ -35,8 +35,9 @@ of targets and which kernels each vectorizes.
 
 **clang produces a materially faster bwa-mem3 than g++ on every platform we
 measure — build with clang unless you have a specific reason not to.** Pass
-`CXX=clang++ CC=clang` to `make` (the default `make` uses g++ and emits a
-warning nudging you here). Use the newest clang available; compiler *version*
+`CXX=clang++ CC=clang` to `make` (the default `make` uses g++, which builds and
+emits a warning nudging you here only when g++ meets the GCC ≥ 15 floor, and
+otherwise fails). Use the newest clang available; compiler *version*
 matters nearly as much as the vendor.
 
 ### x86-64
