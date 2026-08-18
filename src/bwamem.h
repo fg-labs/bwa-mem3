@@ -310,6 +310,23 @@ typedef struct abc {
     int32_t n_hits;  // SMEM SA occurrence count this seed came from; 1 = unique
 } mem_seed_t; // unaligned memory
 
+/* Width of mem_chain_t::w, and the largest value that field can hold.
+ *
+ * These exist so the bitfield and mem_chain_weight()'s saturating clamp cannot
+ * drift apart. They used to disagree: the clamp saturated at (1<<30)-1 while
+ * the field was 27 bits, so a weight in [2^27, 2^30) wrapped modulo 2^27 on
+ * store and a very heavy chain could come back with a tiny w -- dropped by the
+ * `c->w < opt->min_chain_weight` gate, or losing a `drop_ratio` shadowing
+ * comparison it should have won (fg-labs/bwa-mem3#309).
+ *
+ * Unreachable on real data, and the fix is byte-identical because of it: chain
+ * weight accumulates non-overlapping seed spans and takes min(query, ref)
+ * coverage, so it is bounded by the query length and saturating needs a single
+ * ~134 Mbp read. The point is that the two constants now have one definition,
+ * not that the old arithmetic ever fired. */
+#define MEM_CHAIN_W_BITS 27
+#define MEM_CHAIN_W_MAX  ((1u << MEM_CHAIN_W_BITS) - 1u)
+
 typedef struct {
     int32_t seqid, cseed;
     int32_t n, m, first, rid;
@@ -334,7 +351,7 @@ typedef struct {
      * directional / dual-hypothesis-per-read support is ever added, test_and_merge
      * MUST gain a hypothesis guard (it is currently safe only because each read is
      * single-hypothesis). */
-    uint32_t w:27, kept:2, is_alt:1;   /* unsigned: w/kept/is_alt are 0..N flags (kept reaches 3) */
+    uint32_t w:MEM_CHAIN_W_BITS, kept:2, is_alt:1;   /* unsigned: w/kept/is_alt are 0..N flags (kept reaches 3) */
     int32_t  meth_hypothesis:2;        /* signed: needs -1; packs into the same 4-byte word (static_assert below) */
     float frac_rep;
     int64_t pos;
@@ -586,6 +603,13 @@ void mem_opt_apply_meth_defaults(mem_opt_t *opt, const mem_opt_t *opt0);
 // chain in place (stable; surviving seeds keep their order). Returns the new
 // seed count. min_ext_len <= 0 is a no-op. See mem_opt_t::min_ext_len.
 int mem_chain_drop_short_seeds(mem_chain_t *c, int min_ext_len);
+
+// Chain weight: the smaller of the chain's query-axis and reference-axis
+// coverage, counting each base once however many seeds span it. Saturates at
+// MEM_CHAIN_W_MAX, the largest value mem_chain_t::w can hold (#309). Declared
+// here (it was file-local to bwamem.cpp) so the clamp is unit-testable; the
+// only callers in the aligner remain the two stores in mem_chain_flt.
+int mem_chain_weight(const mem_chain_t *c);
 
 void mem_reg2sam(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
                  bseq1_t *s, mem_alnreg_v *a, int extra_flag, const mem_aln_t *m);

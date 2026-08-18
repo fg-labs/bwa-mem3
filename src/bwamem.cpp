@@ -82,6 +82,17 @@ static_assert(sizeof(mem_chain_t) == 48,
               "sizeof(mem_chain_t) feeds klib kbtree node fan-out; changing it moves default "
               "output at chain_cmp .pos ties. Repack fields into the bitfield word, don't append.");
 
+/* #309: `w` shares its 32-bit word with kept:2, is_alt:1 and meth_hypothesis:2.
+ * Narrowing `w` to make room for something else is the drift this catches --
+ * mem_chain_weight() saturates at MEM_CHAIN_W_MAX, so a narrower field would
+ * silently start wrapping again. Widening it past the word is caught by the
+ * sizeof assert above; this one catches the other direction. */
+static_assert(MEM_CHAIN_W_BITS + 2 + 1 + 2 == 32,
+              "mem_chain_t's bitfield word is full: w + kept + is_alt + meth_hypothesis must be "
+              "exactly 32 bits. If w is narrowed, MEM_CHAIN_W_MAX follows it and mem_chain_weight "
+              "keeps saturating correctly -- but re-check that the new max still exceeds any "
+              "reachable chain weight (bounded by query length).");
+
 #define intv_lt1(a, b) ((((uint64_t)(a).m) <<32 | ((uint64_t)(a).n)) < (((uint64_t)(b).m) <<32 | ((uint64_t)(b).n)))  // trial
 KSORT_INIT(mem_intv1, SMEM, intv_lt1)  // debug
 
@@ -976,7 +987,11 @@ int mem_chain_weight(const mem_chain_t *c)
         rend = rend > s->rbeg + s->len? rend : s->rbeg + s->len;
     }
     w = wq < wr? wq : wr;
-    return w < 1<<30? w : (1<<30)-1;
+    /* Saturate at what mem_chain_t::w can actually hold. The clamp used to be
+     * (1<<30)-1, three bits wider than the field, so a weight in [2^27, 2^30)
+     * wrapped to a small number on store instead of staying large (#309). The
+     * shared MEM_CHAIN_W_MAX keeps the two in step. */
+    return w < (int)MEM_CHAIN_W_MAX ? w : (int)MEM_CHAIN_W_MAX;
 }
 
 void mem_print_chain(const bntseq_t *bns, mem_chain_v *chn)
