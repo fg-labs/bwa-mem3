@@ -63,6 +63,12 @@ env:
   SIM_READ_LENGTH: "100"
   SIM_SEED: "42"
   N_REPS: "3"
+  # This proto harness builds with `ccache g++` (the runner's gcc), which is
+  # below the Makefile's compiler floor. It is a NEON correctness/proto lane, so
+  # it opts out here rather than pulling in clang-19. (Migrating the perf half of
+  # this harness to clang-19 -- the shipping compiler -- is a follow-up; its
+  # throughput numbers should not be read as representative while it builds gcc.)
+  ALLOW_UNSUPPORTED_COMPILER: "1"
 
 # Only the two jobs that check out source (run-mem, kswv) consume the token at
 # all, and `contents: read` is all actions/checkout needs. prepare and report

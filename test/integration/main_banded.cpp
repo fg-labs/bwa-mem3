@@ -195,9 +195,9 @@ int main(int argc, char *argv[])
 		exit(0);
 	}
 	
-	clock_freq = _rdtsc();
+	clock_freq = __rdtsc();
 	sleep(1);
-	clock_freq = _rdtsc() - clock_freq;
+	clock_freq = __rdtsc() - clock_freq;
 	
     parseCmdLine(argc, argv);
     SeqPair *seqPairArray = (SeqPair *)_mm_malloc(MAX_NUM_PAIRS * sizeof(SeqPair), 64);
@@ -231,9 +231,9 @@ int main(int argc, char *argv[])
 	// SW_cells = 0;
 	int32_t numPairs = 0, totalPairs = 0;
 	
-	uint64_t tim = _rdtsc();
+	uint64_t tim = __rdtsc();
 	numPairs = loadPairs(seqPairArray, seqBufRef, seqBufQer);
-	readTim += _rdtsc() - tim;
+	readTim += __rdtsc() - tim;
 	
 	while(numPairs)
 	{
@@ -253,11 +253,11 @@ int main(int argc, char *argv[])
 		
 #if __AVX2__
 		// printf("Executing AVX2 vector code...\n");
-		uint64_t timM = _rdtsc();
+		uint64_t timM = __rdtsc();
 		// bsw->getScores8(seqPairArray, seqBufRef, seqBufQer, numPairs, 1, w);
 		bsw->getScores16(seqPairArray, seqBufRef, seqBufQer, numPairs, 1, w);
 		//bsw->scalarBandedSWAWrapper(seqPairArray, seqBufRef, seqBufQer, numPairs, 1, w);
-		myTicks += _rdtsc() - timM;
+		myTicks += __rdtsc() - timM;
 #else
 		// printf("Executing scalar code...\n");
 		bsw->scalarBandedSWAWrapper(seqPairArray, seqBufRef, seqBufQer, numPairs, 1, w);
@@ -272,9 +272,9 @@ int main(int argc, char *argv[])
 		}
 		totalTicks += __rdtsc() - startTick;
 		
-		uint64_t tim = _rdtsc();
+		uint64_t tim = __rdtsc();
 		numPairs = loadPairs(seqPairArray, seqBufRef, seqBufQer);
-		readTim += _rdtsc() - tim;
+		readTim += __rdtsc() - tim;
 		
 		totalPairs += numPairs;
 	}
@@ -285,9 +285,9 @@ int main(int argc, char *argv[])
 		printf("Executed scalar code...\n");
 #endif
 
-	tim = _rdtsc();
+	tim = __rdtsc();
 	sleep(1);
-	freq = _rdtsc() - tim;
+	freq = __rdtsc() - tim;
 	
 	printf("Processor freq: %0.2lf MHz\n", freq/1e6);
 	

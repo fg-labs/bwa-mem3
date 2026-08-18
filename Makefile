@@ -71,6 +71,67 @@ else
     endif
 endif
 
+# ---- Compiler version floor -------------------------------------------------
+# bwa-mem3's shipping and benchmarked builds use clang-19 (bioconda forces
+# clang; the performance benchmark suite builds with clang-19). Older toolchains
+# produce materially slower binaries: clang-19 is ~5% faster than gcc-15 and
+# ~15%+ faster than gcc-11 on ARM (~5-16% on x86), because older compilers emit
+# redundant SIMD ops (e.g. extra blend mask-broadcasts) that a modern clang
+# already elides. To keep an accidentally-slow build from being mistaken for
+# bwa-mem3 being slow, a bare `make` on a below-floor compiler FAILS. Deliberate
+# builds on old toolchains (packagers on older distros, compatibility CI, A/B
+# tests) opt out with ALLOW_UNSUPPORTED_COMPILER=1.
+#
+# Thresholds are overridable (?=) so a distro/packager can set its own policy.
+# Apple clang has its own, lower floor because its version numbers do not track
+# upstream LLVM.
+CLANG_MIN      ?= 19
+GCC_MIN        ?= 15
+APPLECLANG_MIN ?= 15
+
+ifneq ($(ALLOW_UNSUPPORTED_COMPILER),1)
+    # Family from the --version banner; major from -dumpversion (gcc/clang/Apple
+    # clang all report a usable "<major>[.minor.patch]" there). If $(CXX) can't
+    # be probed (missing, or an unrecognized toolchain), CXX_KIND stays empty and
+    # the floor is not enforced — fail open, never block an unknown-but-working CXX.
+    CXX_VER_1ST  := $(shell $(CXX) --version 2>/dev/null | head -1)
+    CXX_VER_FULL := $(shell $(CXX) --version 2>/dev/null)
+    CXX_MAJOR    := $(shell $(CXX) -dumpversion 2>/dev/null | cut -d. -f1)
+    ifneq (,$(findstring Apple clang,$(CXX_VER_1ST)))
+        CXX_KIND  := Apple clang
+        CXX_FLOOR := $(APPLECLANG_MIN)
+    else ifneq (,$(findstring clang,$(CXX_VER_1ST)))
+        CXX_KIND  := clang
+        CXX_FLOOR := $(CLANG_MIN)
+    else ifneq (,$(findstring Free Software Foundation,$(CXX_VER_FULL)))
+        CXX_KIND  := gcc
+        CXX_FLOOR := $(GCC_MIN)
+    else
+        CXX_KIND  :=
+    endif
+    ifneq ($(CXX_KIND),)
+    ifneq (,$(CXX_MAJOR))
+    ifeq ($(shell test $(CXX_MAJOR) -lt $(CXX_FLOOR) 2>/dev/null && echo old),old)
+        $(info )
+        $(info bwa-mem3: unsupported compiler -- $(CXX_KIND) $(CXX_MAJOR) is below the floor ($(CXX_KIND) >= $(CXX_FLOOR)).)
+        $(info )
+        $(info   Modern compilers are REQUIRED for performance. clang-19 -- what bioconda and the)
+        $(info   performance benchmarks ship -- is ~5% faster than gcc-15 and ~15%+ faster than gcc-11)
+        $(info   on ARM (~5-16% on x86); older compilers emit redundant SIMD ops a modern clang elides.)
+        $(info   An old-compiler build is needlessly slow and must not be benchmarked as representative.)
+        $(info )
+        $(info   Fix (recommended): install clang >= $(CLANG_MIN) and build with `make CXX=clang++ CC=clang`.)
+        $(info   Or gcc >= $(GCC_MIN) (acceptable, ~5% slower on ARM).)
+        $(info   Override (packagers / compat CI / deliberate A/B on old toolchains):)
+        $(info       make ALLOW_UNSUPPORTED_COMPILER=1 ...)
+        $(info )
+        $(error unsupported compiler: $(CXX_KIND) $(CXX_MAJOR) < $(CXX_FLOOR); set ALLOW_UNSUPPORTED_COMPILER=1 to override)
+    endif
+    endif
+    endif
+endif
+# -----------------------------------------------------------------------------
+
 # AddressSanitizer support for catching kswv rowMax / SIMD store overruns
 # in regression tests (e.g. kswv_nrow_zero_test). Opt-in with `make ASAN=1 ...`
 # Forces USE_MIMALLOC off: mimalloc's malloc override interposes before asan

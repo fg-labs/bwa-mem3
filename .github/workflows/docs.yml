@@ -24,6 +24,10 @@ jobs:
   build:
     name: build mdbook + drift check CLI snippets
     runs-on: ubuntu-24.04
+    # Builds bwa-mem3 only to dump CLI help for the docs (compiler-agnostic), so
+    # it opts out of the compiler floor and uses the runner's default compiler.
+    env:
+      ALLOW_UNSUPPORTED_COMPILER: "1"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:

@@ -4,7 +4,7 @@ This page documents every build target available in the Makefile and what each p
 
 ## Prerequisites
 
-- A C++14-capable compiler. **Clang is recommended** — bwa-mem3 runs ~5–10% faster on x86 (AVX2) and ~6% faster on ARM when built with clang than with g++ (see [Best Practices → Build](../best-practices/build.md)). Clang 7+ or GCC 8+ on Linux; Clang 15+ (Xcode) on macOS. A bare `make` defaults to g++ and prints a warning suggesting clang; pass `CXX=clang++ CC=clang` to build with clang.
+- A C++14-capable compiler, **modern by default**. **Clang is recommended** — across the benchmark sweep (hg38, 5M read pairs, `-t 16`) bwa-mem3 built with clang runs ~5–10% faster on x86 (AVX2, on AWS `c6a`; the AVX-512 `c7a` gain is smaller — see the per-arch record) and ~6% faster on ARM (NEON, on AWS Graviton4 `c8g`) than the same source built with g++, because older compilers emit redundant SIMD ops a modern clang already elides (full per-arch record — workload, host, architecture, and SIMD tier — in [Best Practices → Build](../best-practices/build.md)). To keep an accidentally-slow build from being mistaken for bwa-mem3 being slow, the build **fails by default on a compiler below the supported floor**: **clang ≥ 19** (recommended — what bioconda and the performance benchmarks ship), **GCC ≥ 15** (acceptable, ~5% slower on ARM), or **Apple clang ≥ 15** on macOS. A bare `make` defaults to g++: it builds (with a warning suggesting clang) only when g++ meets the **GCC ≥ 15** floor, and otherwise fails at the floor check as above; pass `CXX=clang++ CC=clang` to build with clang. To build anyway on an older toolchain (packagers on older distros, compatibility testing, deliberate A/B), pass `ALLOW_UNSUPPORTED_COMPILER=1`. The floor versions are overridable — e.g. `GCC_MIN=13` — for a distro that sets its own policy.
 - GNU make 3.81+.
 - CMake 3.12+ (required only when `USE_MIMALLOC=1`, which is the default).
 - autoconf, automake, autoconf-archive, libtool, pkg-config — `ext/htslib`'s build runs `autoreconf -i && ./configure` and locates zlib via `pkg-config`.
@@ -26,7 +26,7 @@ See [Getting Started → Installation](../getting-started/installation.md) for t
 ### Default build (host-native)
 
 ```bash
-make                       # uses g++ (warns, suggesting clang)
+make                       # g++ ≥ 15: builds + warns; older g++ fails (see Prerequisites)
 make CXX=clang++ CC=clang  # recommended: ~5–10% faster on x86, ~6% on ARM
 ```
 
