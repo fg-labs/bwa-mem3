@@ -4201,6 +4201,24 @@ static inline bool all_lanes_set8(__m128i mask)
         sbt11_out = _mm_blendv_epi16(sbt_, w_ambig_128, tmp_);          \
     }
 
+// shuffle_lut_lowidx8: byte-gather tbl[idx] for a LUT index whose every lane is
+// provably in [0,15] with the high bit clear (the score-LUT gathers: idx = s^s'
+// over the small N-encoding, reachable range [0,12]). For such indices pshufb and
+// vqtbl1q agree, so on NEON this skips the vandq_u8(idx, 0x8F) that sse2neon's
+// _mm_shuffle_epi8 must emit to reproduce pshufb's index-mask / high-bit-zero
+// semantics for the general case -- 2 wasted vand/cell in the hot 8-bit DP loop.
+// x86 keeps native PSHUFB. NOT for indices that can reach [16,127] (e.g. the AMAT
+// (s1<<2)|s2 path on N lanes), where masked-pshufb and raw-vqtbl differ.
+static inline __m128i shuffle_lut_lowidx8(__m128i tbl, __m128i idx)
+{
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    return vreinterpretq_m128i_u8(vqtbl1q_u8(vreinterpretq_u8_m128i(tbl),
+                                             vreinterpretq_u8_m128i(idx)));
+#else
+    return _mm_shuffle_epi8(tbl, idx);
+#endif
+}
+
 // 128-bit (SSE2/NEON) byte-LUT prepass: replaces the 5-op SYM sequence with a
 // single _mm_shuffle_epi8 (NEON vqtbl) over the 16-byte int8 pmat128 built by
 // build_pmat16, then a slli+srai to discard the shuffle's pmat[0] high byte and
@@ -4211,7 +4229,7 @@ static inline bool all_lanes_set8(__m128i mask)
 #define SBT_PREPASS16_LUT128(s1, s2, sbt11_out, pmat128) \
     {                                                                   \
         __m128i xor_ = _mm_xor_si128(s1, s2);                          \
-        __m128i lu_  = _mm_shuffle_epi8(pmat128, xor_);                \
+        __m128i lu_  = shuffle_lut_lowidx8(pmat128, xor_);                \
         lu_ = _mm_slli_epi16(lu_, 8);                                  \
         sbt11_out = _mm_srai_epi16(lu_, 8);                            \
     }
@@ -5082,7 +5100,7 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
 #define SBT_PREPASS8_XOR(s1, s2, sbt11_out, pmat128)                    \
     {                                                                   \
         __m128i xor_ = _mm_xor_si128(s1, s2);                           \
-        sbt11_out = _mm_shuffle_epi8(pmat128, xor_);                    \
+        sbt11_out = shuffle_lut_lowidx8(pmat128, xor_);                    \
     }
 
 // D3 generic-matrix seam (gated on an asymmetric matrix; the default symmetric
@@ -5114,7 +5132,7 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
 #define SBT_PREPASS8_RANK1(s1, s2, rowfreed, sbt11_out, pmat128, match128, frread128) \
     {                                                                   \
         __m128i xor_  = _mm_xor_si128(s1, s2);                          \
-        __m128i sbt_  = _mm_shuffle_epi8(pmat128, xor_);                \
+        __m128i sbt_  = shuffle_lut_lowidx8(pmat128, xor_);                \
         __m128i freed_ = _mm_and_si128(rowfreed, _mm_cmpeq_epi8(s2, frread128)); \
         sbt11_out = blendv_fullmask8(sbt_, match128, freed_);            \
     }
@@ -5869,8 +5887,8 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
             for (j = beg; j < end; j++) {
                 __m128i s2 = _mm_load_si128((__m128i *)(seq2SoA + j * SIMD_WIDTH8));
                 __m128i xor_ = _mm_xor_si128(s10, s2);
-                __m128i sbt_pos = _mm_shuffle_epi8(pmat_pos128, xor_);
-                __m128i sbt_neg = _mm_shuffle_epi8(pmat_neg128, xor_);
+                __m128i sbt_pos = shuffle_lut_lowidx8(pmat_pos128, xor_);
+                __m128i sbt_neg = shuffle_lut_lowidx8(pmat_neg128, xor_);
                 DP_CELL_BODY8_128(sbt_pos, sbt_neg);
             }
         } else if (fc.rank1) {
