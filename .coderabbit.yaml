@@ -433,8 +433,8 @@ reviews:
         matcher has silently stopped matching prints the same PASS as a lint that
         found nothing (see the `ndebug-gate-lint` job, which runs
         ndebug_gate_lint_selftest.sh before ndebug_gate_lint.sh). Flag a new lint
-        or parity job added without one, and flag a new matrix row that does not
-        also appear in the regression-script table in test/regression/README.md.
+        or parity job added without one, and flag a new build-matrix row added
+        without an explanatory comment in the workflow stating why the row exists.
 
   # Deterministic gates specific to this repo. `warning` posts a comment;
   # `error` marks the check as requiring resolution, and can block the PR only
