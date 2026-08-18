@@ -50,7 +50,8 @@ static inline char *fr_dup_field(const char *src, size_t len)
  * well-defined. Zeroing the whole struct (rather than hand-listing
  * sam/bams/n_bams/cap_bams) stays correct if a field is ever added to bseq1_t.
  * id is overwritten by the caller. */
-static inline void fr_rec_to_bseq1(const fr_fastq_rec_t *r, bseq1_t *s, read_arena_t *arena)
+static inline void fr_rec_to_bseq1(const fr_fastq_rec_t *r, bseq1_t *s, read_arena_t *arena,
+                                   int copy_comment)
 {
     memset(s, 0, sizeof(*s));
     /* Honor the bseq1_t.meth_base_ot -1 sentinel ("non-meth") from bwa.h: the
@@ -66,7 +67,11 @@ static inline void fr_rec_to_bseq1(const fr_fastq_rec_t *r, bseq1_t *s, read_are
      * reassigns it, and the non-copy_comment path frees it early, so its
      * ownership is not uniform enough to live in the arena. */
     s->name    = read_arena_dup(arena, r->name, name_l);
-    s->comment = r->comment_l ? fr_dup_field(r->comment, r->comment_l) : 0;
+    /* T6/L7: only dup the comment when the caller will actually pass it through
+     * (copy_comment). Without it, fastmap's output stage frees every comment
+     * back to 0 anyway, so producing 0 here reaches the identical NULL while
+     * skipping a malloc+memcpy per read on the serial read thread. */
+    s->comment = (copy_comment && r->comment_l) ? fr_dup_field(r->comment, r->comment_l) : 0;
     s->seq     = read_arena_dup(arena, r->seq, r->seq_l);
     s->qual    = r->qual_l ? read_arena_dup(arena, r->qual, r->qual_l) : 0;
     s->l_seq   = (int)r->seq_l;
@@ -77,7 +82,7 @@ void *fast_kseq_init(fast_reader_t *fr) { return fr_fastq_init(fr); }
 void fast_kseq_destroy(void *p) { fr_fastq_destroy((fr_fastq_t *)p); }
 
 bseq1_t *bseq_read_fast(int64_t chunk_size, int *n_, void *ks1_, void *ks2_, int64_t *s,
-                        read_arena_t **arena_out)
+                        read_arena_t **arena_out, int copy_comment)
 {
     fr_fastq_t *p1 = (fr_fastq_t *)ks1_, *p2 = (fr_fastq_t *)ks2_;
     int64_t size = 0, m, n;
@@ -113,7 +118,22 @@ bseq1_t *bseq_read_fast(int64_t chunk_size, int *n_, void *ks1_, void *ks2_, int
             break;
         }
         if (n >= m) {
-            m = m ? m << 1 : 256;
+            if (m == 0) {
+                /* L8: size the buffer once from the chunk's base budget and the
+                 * first read length, instead of doubling 256->512->... up to the
+                 * final count (~8-10 reallocs + full copies per chunk on the
+                 * serial read thread). `size` counts bases across all reads and
+                 * the loop stops at size >= chunk_size, so the final record count
+                 * is ~chunk_size / l_seq for both SE and PE. Adaptive on the
+                 * measured length, so long reads don't over-reserve; the doubling
+                 * path below still covers any under-estimate. Capacity only ->
+                 * byte-identical. */
+                int64_t est = r1.seq_l > 0 ? chunk_size / (int64_t)r1.seq_l : 256;
+                est += 256;   /* slack for the even-parity tail + estimate error */
+                m = est < 256 ? 256 : est;
+            } else {
+                m <<= 1;
+            }
             /* Grow via a temp so a failed realloc doesn't leak the old buffer
              * (cppcheck memleakOnRealloc). Abort loudly on OOM rather than
              * returning a short batch: the pipeline reads n_seqs==0 as clean
@@ -125,11 +145,11 @@ bseq1_t *bseq_read_fast(int64_t chunk_size, int *n_, void *ks1_, void *ks2_, int
             seqs = tmp;
         }
         double _tp = sp_enabled() ? sp_wall() : 0.0;
-        fr_rec_to_bseq1(&r1, &seqs[n], arena);
+        fr_rec_to_bseq1(&r1, &seqs[n], arena, copy_comment);
         seqs[n].id = n;
         size += seqs[n++].l_seq;
         if (p2) {
-            fr_rec_to_bseq1(&r2, &seqs[n], arena);
+            fr_rec_to_bseq1(&r2, &seqs[n], arena, copy_comment);
             seqs[n].id = n;
             size += seqs[n++].l_seq;
         }

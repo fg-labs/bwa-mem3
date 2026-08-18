@@ -38,7 +38,7 @@ void  fast_kseq_destroy(void *p);
  * it after the chunk is fully consumed. At EOF (*n_ == 0, return NULL)
  * *arena_out is set to NULL. See read_arena.h for the ownership contract. */
 bseq1_t *bseq_read_fast(int64_t chunk_size, int *n_, void *ks1_, void *ks2_, int64_t *s,
-                        read_arena_t **arena_out);
+                        read_arena_t **arena_out, int copy_comment);
 
 #ifdef __cplusplus
 }

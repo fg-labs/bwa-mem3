@@ -179,7 +179,10 @@ static void kt_pool_init(int n_threads)
 {
 	g_kt_pool.n_threads = n_threads;
 	g_kt_pool.threads = (pthread_t*) malloc(n_threads * sizeof(pthread_t));
-	g_kt_pool.w       = (ktf_worker_t*) malloc(n_threads * sizeof(ktf_worker_t));
+	/* L27: cache-line-aligned so each worker's steal counter sits on its own
+	 * line (sizeof(ktf_worker_t) is padded to 64, so n_threads*sizeof is a
+	 * multiple of 64 as aligned_alloc requires). free() handles it. */
+	g_kt_pool.w       = (ktf_worker_t*) aligned_alloc(64, n_threads * sizeof(ktf_worker_t));
 	if (g_kt_pool.threads == NULL || g_kt_pool.w == NULL) {
 		perror("Allocation of kt_for worker pool failed");
 		exit(EXIT_FAILURE);
