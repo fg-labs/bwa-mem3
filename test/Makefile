@@ -57,7 +57,33 @@ LIBS    += $(HTSLIB_static_LIBS)
 LDFLAGS += $(HTSLIB_static_LDFLAGS)
 
 ifneq ($(IS_ARM),)
-    CPPFLAGS = -DENABLE_PREFETCH -D__SSE__=1 -D__SSE2__=1 -D__SSE3__=1 -D__SSSE3__=1 -D__SSE4_1__=1 -D__SSE4_2__=1 -DAPPLE_SILICON=1 -DCACHE_LINE_BYTES=128
+    # Keep the ARM cache-line alignment in lock-step with the top-level Makefile:
+    # CACHE_LINE_BYTES feeds SIMD_ALIGNED_ALLOC, so a build overriding
+    # ARM_CACHE_LINE=64 (Neoverse/Graviton) must exercise the same allocation
+    # configuration here as in the shipped libbwa.a objects. Command-line and
+    # environment overrides win over this default; the top-level test-binaries
+    # recipe also forwards it explicitly.
+    ARM_CACHE_LINE ?= 128
+    # Keep the ARM_CACHE_LINE validation in lock-step with the top-level Makefile:
+    # CACHE_LINE_BYTES must be exactly one supported value, or SIMD_ALIGNED_ALLOC's
+    # posix_memalign fails. Guard the token count first ($(filter) matches per
+    # word, so "64 128" would slip past a bare membership test; this also rejects
+    # empty), then the value itself with the supported values as the $(filter)
+    # pattern (a user value used as the pattern could carry a `%` wildcard that
+    # matches everything).
+    ifneq ($(words $(ARM_CACHE_LINE)),1)
+        $(error ARM_CACHE_LINE must be a single value, 64 or 128 (got '$(ARM_CACHE_LINE)'))
+    endif
+    ifeq ($(filter 64 128,$(ARM_CACHE_LINE)),)
+        $(error ARM_CACHE_LINE must be 64 or 128 (got '$(ARM_CACHE_LINE)'))
+    endif
+    CPPFLAGS = -DENABLE_PREFETCH -D__SSE__=1 -D__SSE2__=1 -D__SSE3__=1 -D__SSSE3__=1 -D__SSE4_1__=1 -D__SSE4_2__=1 -DAPPLE_SILICON=1 -DCACHE_LINE_BYTES=$(ARM_CACHE_LINE)
+    # Match the top-level Makefile's ARM_CPU tuning so the test binaries are built
+    # with the same -mcpu as the shipped objects (forwarded by the test-binaries
+    # recipe). Unset -> generic scheduling, identical to before.
+    ifneq ($(ARM_CPU),)
+        CPPFLAGS += -mcpu=$(ARM_CPU)
+    endif
     INCLUDES = -I../src -I../ext/sse2neon -I../ext -I../ext/htslib
 else
     CPPFLAGS = -DENABLE_PREFETCH
