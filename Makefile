@@ -89,6 +89,26 @@ CLANG_MIN      ?= 19
 GCC_MIN        ?= 15
 APPLECLANG_MIN ?= 15
 
+# The floor gates *builds* — clean-only goals invoke no compiler (they just
+# `rm` artifacts) and so must not require a floor-passing toolchain. Without
+# this, `make clean` on GNU make's default CXX (`g++`, i.e. gcc-13 on Ubuntu
+# 24.04) trips the parse-time $(error) below and aborts — breaking both
+# contributor cleanups and any CI step that runs `make clean` before a build
+# with a pinned CXX (e.g. the kswv ASan steps in proto-neon-kswv.yml, which
+# `make clean` bare, then `make ... CXX="ccache clang++-19"`). Enforce only when
+# a real build is requested: a bare `make` (empty MAKECMDGOALS → the default
+# build goal) or any goal list containing a non-clean target still enforces it;
+# a goal list of clean targets only is exempt.
+FLOOR_EXEMPT_GOALS := clean pgo-clean profile-clean lto-clean
+ifeq ($(strip $(MAKECMDGOALS)),)
+    ENFORCE_COMPILER_FLOOR := 1
+else ifeq ($(strip $(filter-out $(FLOOR_EXEMPT_GOALS),$(MAKECMDGOALS))),)
+    ENFORCE_COMPILER_FLOOR :=
+else
+    ENFORCE_COMPILER_FLOOR := 1
+endif
+
+ifeq ($(ENFORCE_COMPILER_FLOOR),1)
 ifneq ($(ALLOW_UNSUPPORTED_COMPILER),1)
     # Family from the --version banner; major from -dumpversion (gcc/clang/Apple
     # clang all report a usable "<major>[.minor.patch]" there). If $(CXX) can't
@@ -129,6 +149,7 @@ ifneq ($(ALLOW_UNSUPPORTED_COMPILER),1)
     endif
     endif
     endif
+endif
 endif
 # -----------------------------------------------------------------------------
 

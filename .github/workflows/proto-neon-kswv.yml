@@ -63,12 +63,6 @@ env:
   SIM_READ_LENGTH: "100"
   SIM_SEED: "42"
   N_REPS: "3"
-  # This proto harness builds with `ccache g++` (the runner's gcc), which is
-  # below the Makefile's compiler floor. It is a NEON correctness/proto lane, so
-  # it opts out here rather than pulling in clang-19. (Migrating the perf half of
-  # this harness to clang-19 -- the shipping compiler -- is a follow-up; its
-  # throughput numbers should not be read as representative while it builds gcc.)
-  ALLOW_UNSUPPORTED_COMPILER: "1"
 
 # Only the two jobs that check out source (run-mem, kswv) consume the token at
 # all, and `contents: read` is all actions/checkout needs. prepare and report
@@ -214,7 +208,14 @@ jobs:
           submodules: recursive
 
       - name: Install apt dependencies
-        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev libdeflate-dev samtools libomp-dev ccache
+        run: |
+          sudo apt-get update && sudo apt-get install -y zlib1g-dev libdeflate-dev samtools libomp-dev ccache
+          # clang-19 (the shipping/benchmarked compiler) from apt.llvm.org so the
+          # perf harness builds representatively; libomp-19-dev provides omp.h for
+          # clang's -fopenmp. Matches the compiler floor added in the parent PR.
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh && chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh 19 && sudo apt-get install -y libomp-19-dev
+          clang++-19 --version | head -1
 
       - name: Detect x86 ISA (avx2 / avx512bw)
         if: matrix.arch == 'x86'
@@ -257,7 +258,7 @@ jobs:
           # the cold-build case when this misses.
           key: bwa-mem3-${{ runner.arch }}-${{ matrix.flags_slug }}-${{ env.MAKE_ARCH }}-${{ github.sha }}
 
-      - name: Build bwa-mem3 (ccache wrapping g++)
+      - name: Build bwa-mem3 (ccache wrapping clang-19)
         if: steps.cache-binary.outputs.cache-hit != 'true'
         run: |
           # Pair CC with CXX explicitly: the Makefile only auto-pairs bare
@@ -269,9 +270,9 @@ jobs:
           # Makes the produced artifact name (bwa-mem3.arm64) unambiguous.
           ccache --zero-stats >/dev/null
           if [ "${{ matrix.arch }}" = "arm" ]; then
-            make -j"$(nproc)" CXX="ccache g++" CC="ccache gcc" ${{ matrix.build_flags }} arm64
+            make -j"$(nproc)" CXX="ccache clang++-19" CC="ccache clang-19" ${{ matrix.build_flags }} arm64
           else
-            make -j"$(nproc)" arch="$MAKE_ARCH" CXX="ccache g++" CC="ccache gcc" ${{ matrix.build_flags }}
+            make -j"$(nproc)" arch="$MAKE_ARCH" CXX="ccache clang++-19" CC="ccache clang-19" ${{ matrix.build_flags }}
           fi
           ccache --show-stats | tee -a "$GITHUB_STEP_SUMMARY"
 
@@ -451,7 +452,13 @@ jobs:
           submodules: recursive
 
       - name: Install apt dependencies
-        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev libdeflate-dev libomp-dev ccache
+        run: |
+          sudo apt-get update && sudo apt-get install -y zlib1g-dev libdeflate-dev libomp-dev ccache
+          # clang-19 from apt.llvm.org (shipping compiler + floor minimum);
+          # libomp-19-dev provides omp.h for clang's -fopenmp.
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh && chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh 19 && sudo apt-get install -y libomp-19-dev
+          clang++-19 --version | head -1
 
       - name: Detect x86 ISA
         if: matrix.arch == 'x86'
@@ -561,8 +568,8 @@ jobs:
         run: |
           mkdir -p /tmp/ci-out
           ccache --zero-stats >/dev/null
-          make arch="$MAKE_ARCH" CXX="ccache g++" CC="ccache gcc" test-binaries
-          make arch="$MAKE_ARCH" CXX="ccache g++" CC="ccache gcc" bwa-mem3
+          make arch="$MAKE_ARCH" CXX="ccache clang++-19" CC="ccache clang-19" test-binaries
+          make arch="$MAKE_ARCH" CXX="ccache clang++-19" CC="ccache clang-19" bwa-mem3
           BWA_MEM3=./bwa-mem3 \
           TEST_BIN=./test/bwa_mem3_tests_unit \
           OUT_DIR=/tmp/ci-out \
@@ -587,7 +594,7 @@ jobs:
         # silently. `make clean` forces full recompile under instrumentation.
         run: |
           make clean
-          make ASAN=1 arch="$MAKE_ARCH" CXX="ccache g++" CC="ccache gcc" kswv_nrow_zero_test
+          make ASAN=1 arch="$MAKE_ARCH" CXX="ccache clang++-19" CC="ccache clang-19" kswv_nrow_zero_test
           ./kswv_nrow_zero_test
           ccache --show-stats | tee -a "$GITHUB_STEP_SUMMARY"
 
@@ -598,6 +605,6 @@ jobs:
         # prefetch runs clean. `make clean` forces full recompile under asan.
         run: |
           make clean
-          make ASAN=1 arch="$MAKE_ARCH" CXX="ccache g++" CC="ccache gcc" bandedswa_padding_test
+          make ASAN=1 arch="$MAKE_ARCH" CXX="ccache clang++-19" CC="ccache clang-19" bandedswa_padding_test
           ./bandedswa_padding_test
           ccache --show-stats | tee -a "$GITHUB_STEP_SUMMARY"
