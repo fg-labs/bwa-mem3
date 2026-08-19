@@ -50,7 +50,12 @@ bwa-mem3 emits a few additional tags, converges per-architecture SIMD
 `score2`/MAPQ toward the scalar reference, and breaks ties deterministically.
 If you validate against a previous bwa/bwa-mem2 release, expect (and audit)
 these differences — see [Equivalence with bwa-mem2](../whats-different/equivalence.md)
-for the field-by-field comparison and a per-PR trail.
+for the field-by-field comparison and a per-PR trail. For a byte-clean `diff`
+of the **alignment records** against a specific bwa/bwa-mem2 golden, run
+`--compat=<target>` and exclude the `@PG` line from both sides — it still names
+`bwa-mem3` and is unmatchable by construction; see
+[Alignment modes: plain, `--compat`, `--fast`](../whats-different/modes.md) for
+which mode fits which situation.
 
 **Use `-K` on both sides when you validate.** The default batch size is
 `chunk_size × -t` in all three tools, and each batch's `mem_pestat` insert-size

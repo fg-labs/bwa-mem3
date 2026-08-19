@@ -52,6 +52,7 @@
   - [Migrating from bwameth.py c2t](methylation/external-c2t.md)
 - [What's Different from bwa-mem2]()
   - [Overview](whats-different/overview.md)
+  - [Alignment modes: plain, --compat, --fast](whats-different/modes.md)
   - [Equivalence with bwa-mem2](whats-different/equivalence.md)
   - [Correctness fixes](whats-different/correctness.md)
   - [Performance improvements](whats-different/performance.md)

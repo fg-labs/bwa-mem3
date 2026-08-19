@@ -10,6 +10,7 @@ bwa-mem3 is **not byte-identical** to bwa-mem2. Upstream reproduces the original
 
 Each page covers one category of change:
 
+- [Alignment modes: plain, `--compat`, `--fast`](modes.md) — the three ways to run bwa-mem3 and how each one changes the output, side by side. Start here if you just want to know which mode to use.
 - [Equivalence with bwa-mem2](equivalence.md) — what is and isn't preserved, with the verified concordance check and the declared-divergence catalog.
 - [Correctness fixes](correctness.md) — upstream bugs fixed in bwa-mem3 (the kswv `score2` series, the proper-pair regression, the zero-init crash, the SMEM overflow, `@PG` tab-escaping).
 - [Performance improvements](performance.md) — lockstep SMEM batching, batched `-H` ingestion, libsais FM-index construction, and the consolidated mapping speedups.
