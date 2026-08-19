@@ -100,9 +100,10 @@ are maintained at [bwa-mem3-bench](https://github.com/fg-labs/bwa-mem3-bench).
 
 ## Full change list
 
-Every performance PR — with its upstream disposition — is in the
-[PR catalog](../reference/pr-catalog.md) (filter on the *Performance* class).
-The sections above narrate the load-bearing ones.
+The sections above narrate the load-bearing performance changes. For the
+complete list, the git history is authoritative — filter the
+[merged pull requests](https://github.com/fg-labs/bwa-mem3/pulls?q=is%3Apr+is%3Amerged+base%3Amain)
+on the `perf:` conventional-commit prefix, or `git log --no-merges master..main`.
 
 ## Open / in progress
 

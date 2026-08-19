@@ -17,7 +17,7 @@ Each page covers one category of change:
 - [Architecture support](arch-support.md) — Linux ARM64/aarch64, `arch=avx512bw`, and the NEON / AVX2 kswv mate-rescue kernels.
 - [Build & infrastructure](build-infra.md) — the doctest framework, version stamping, PGO targets, flag forwarding, and the CI matrix.
 
-The flat per-PR record — every fork-carried change with its bwa-mem3 PR, class, and upstream bwa-mem2 disposition — lives in one place: the [**PR catalog**](../reference/pr-catalog.md). The pages here explain the *why* behind each class.
+The pages here explain the *why* behind each class of change. The full list of fork-carried commits is the git history itself (`git log --no-merges master..main`) and the [merged pull requests](https://github.com/fg-labs/bwa-mem3/pulls?q=is%3Apr+is%3Amerged+base%3Amain); the output-affecting divergences are catalogued in [Equivalence](equivalence.md). (The old hand-maintained per-PR table has been [retired](../reference/pr-catalog.md).)
 
 ## Notable fork-level changes
 
@@ -70,7 +70,6 @@ commits past upstream tag `v2.3` at commit `61813ef`.
 - `master` tracks upstream unchanged.
 - `main` is `upstream/master` plus the commits above. Rebased onto upstream roughly quarterly, or sooner when an upstream release we care about lands.
 - Contributions go via PR targeting `main`. CI and CodeRabbit gate merges.
-- Any PR that adds or removes a fork-carried commit must add a row to the [PR catalog](../reference/pr-catalog.md) in the same PR (the FG-MAIN-TABLE rule).
 
 ## Consuming
 

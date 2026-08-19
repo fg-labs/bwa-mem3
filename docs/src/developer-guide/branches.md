@@ -120,7 +120,6 @@ git branch -D <prefix>/issue-<N>-<slug>
 
 - All PRs target `main`.
 - PRs from fork contributors should be opened against `fg-labs/bwa-mem3 main`.
-- Every PR that adds a fork-carried commit must update the `FG-MAIN-TABLE` in `docs/src/reference/pr-catalog.md` in the same PR. See [Contributing](contributing.md#the-fg-main-table-rule).
 - Merge policy: squash-merge for single-commit changes; rebase-merge for multi-commit PRs with a clean commit history.
 
 ---

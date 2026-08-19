@@ -474,9 +474,11 @@ The divergences described above are tracked as a structured registry in [bwa-mem
 
 ## Per-PR audit trail
 
-Every fork-carried change is listed — with its class and upstream bwa-mem2
-disposition — in the [PR catalog](../reference/pr-catalog.md). The declared
-divergence catalog above calls out the entries that actually affect output.
+The declared divergence catalog above is the curated, reviewed record of the
+changes that actually affect output. For the full list of fork-carried commits,
+the git history is authoritative (`git log --no-merges master..main`) alongside
+the [merged pull requests](https://github.com/fg-labs/bwa-mem3/pulls?q=is%3Apr+is%3Amerged+base%3Amain).
+(The old hand-maintained per-PR table has been [retired](../reference/pr-catalog.md).)
 
 ---
 
