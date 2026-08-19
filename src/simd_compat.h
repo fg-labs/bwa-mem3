@@ -32,10 +32,14 @@
 #define SIMD_COMPAT_H
 
 /*
- * Platform detection and SIMD abstraction layer
+ * ARM/sse2neon compatibility shim -- ARM targets ONLY.
  *
- * On x86: Use native SSE/AVX intrinsics via immintrin.h
- * On ARM: Use sse2neon for SSE->NEON translation, plus native NEON for hot paths
+ * This header is the sse2neon-based SSE->NEON translation layer plus the
+ * native-NEON hot-path helpers (_mm_movemask_epi16, _mm_blendv_epi16_fast) and
+ * ARM aligned-allocation macros. It is NOT a cross-tier SIMD abstraction: every
+ * consumer includes it only under `#if defined(__ARM_NEON) || defined(__aarch64__)`,
+ * so on x86 it is never seen and x86 uses <immintrin.h> directly. The `#else`
+ * guard below enforces that invariant -- do not add x86/AVX/SSE branches here.
  */
 
 #if defined(__ARM_NEON) || defined(__aarch64__)
@@ -160,46 +164,20 @@
                       vreinterpretq_s16_m128i(x)));
     }
 
-#elif defined(__AVX512BW__)
-    /* x86 with AVX-512 */
-    #include <immintrin.h>
-    #define CACHE_LINE_BYTES 64
-
-#elif defined(__AVX2__)
-    /* x86 with AVX2 */
-    #include <immintrin.h>
-    #define CACHE_LINE_BYTES 64
-
-#elif defined(__SSE4_1__) || defined(__SSE2__)
-    /* x86 with SSE */
-    #include <smmintrin.h>
-    #include <emmintrin.h>
-    #define CACHE_LINE_BYTES 64
-    #ifndef __mmask8
-    typedef uint8_t __mmask8;
-    #endif
-    #ifndef __mmask16
-    typedef uint16_t __mmask16;
-    #endif
-
 #else
-    /* Scalar fallback */
-    #define CACHE_LINE_BYTES 64
-    #warning "No SIMD support detected, using scalar code paths"
+    /* This header is the ARM/sse2neon compatibility shim only. It must never be
+     * compiled on a non-ARM target: on x86 the consumers include <immintrin.h>
+     * directly and never reach this header. A non-ARM include here means a guard
+     * regressed -- fail loudly rather than silently first-activating dead code. */
+    #error "simd_compat.h is ARM-only; include it under #if defined(__ARM_NEON) || defined(__aarch64__)"
 #endif
 
-/* Cross-platform aligned allocation macro.
- * On ARM the minimum alignment is the cache-line size: 128 on Apple Silicon,
- * overridable to 64 for Neoverse/Graviton via -DCACHE_LINE_BYTES=64. The guard
- * matches the ARM detection used elsewhere in the tree rather than the
- * Apple-specific spelling, so every ARM target (not just Apple Silicon) picks up
- * the configurable CACHE_LINE_BYTES alignment. */
-#if defined(__ARM_NEON) || defined(__aarch64__) || defined(APPLE_SILICON)
-    #define SIMD_ALIGNED_ALLOC(size, align) _mm_malloc_compat(size, (align) < CACHE_LINE_BYTES ? CACHE_LINE_BYTES : (align))
-    #define SIMD_ALIGNED_FREE(ptr) free(ptr)
-#else
-    #define SIMD_ALIGNED_ALLOC(size, align) _mm_malloc(size, align)
-    #define SIMD_ALIGNED_FREE(ptr) _mm_free(ptr)
-#endif
+/* ARM aligned allocation macro.
+ * The minimum alignment is the cache-line size: 128 on Apple Silicon,
+ * overridable to 64 for Neoverse/Graviton via -DCACHE_LINE_BYTES=64. The header
+ * is ARM-only (enforced by the `#error` guard above), so these are defined
+ * unconditionally rather than behind an x86/ARM fork. */
+#define SIMD_ALIGNED_ALLOC(size, align) _mm_malloc_compat(size, (align) < CACHE_LINE_BYTES ? CACHE_LINE_BYTES : (align))
+#define SIMD_ALIGNED_FREE(ptr) free(ptr)
 
 #endif /* SIMD_COMPAT_H */
