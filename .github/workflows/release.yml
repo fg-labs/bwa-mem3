@@ -17,6 +17,8 @@ jobs:
     name: release-please
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
+    # A single action run that opens/updates the release PR; seconds of work.
+    timeout-minutes: 10
     permissions:
       contents: write
       pull-requests: write
@@ -41,6 +43,8 @@ jobs:
         (github.event_name == 'push' && needs.release-please.outputs.release_created == 'true')
       )
     runs-on: ubuntu-latest
+    # Builds the vendored tarball and smoke-tests it with a full clang-19 build.
+    timeout-minutes: 30
     permissions:
       contents: write
     env:

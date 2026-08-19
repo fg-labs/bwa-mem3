@@ -31,6 +31,9 @@ jobs:
   ndebug-gate-lint:
     name: NDEBUG gate lint (src/)
     runs-on: ubuntu-latest
+    # Source-only lint that reports in seconds; a generous ceiling so only a
+    # genuinely hung runner trips it, never a slow-but-normal one.
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -51,6 +54,8 @@ jobs:
   debug-macro-flag-lint:
     name: Opt-in debug macro list (ci.yml <-> src/)
     runs-on: ubuntu-latest
+    # Source-only lint, seconds of work; ceiling catches a hung runner only.
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -72,6 +77,8 @@ jobs:
   shell-lint:
     name: Shell lint (shellcheck + shfmt)
     runs-on: ubuntu-latest
+    # Downloads two small pinned tools then lints; well under a minute normally.
+    timeout-minutes: 10
     env:
       # Pinned, and kept in lockstep with the constants at the top of
       # test/regression/shell_lint.sh. ubuntu-latest ships a shellcheck of its
@@ -132,6 +139,8 @@ jobs:
   regression-coverage-lint:
     name: Regression scripts are run by CI
     runs-on: ubuntu-latest
+    # Source-only lint, seconds of work; ceiling catches a hung runner only.
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -149,6 +158,8 @@ jobs:
   readme-contract-lint:
     name: Regression README contract (README <-> test/regression/)
     runs-on: ubuntu-latest
+    # Source-only lint, seconds of work; ceiling catches a hung runner only.
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -242,6 +253,12 @@ jobs:
 
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
+    # Heaviest job here: the canonical row does several full `make clean`
+    # rebuilds (debug-macro build, SIMD-floor build, ASAN build) on top of the
+    # mimalloc build plus reference download/index. Normal rows finish in a few
+    # minutes; the canonical row runs longest. Sized well above that so a hung
+    # runner fails fast instead of at the 6h default, without flaking a slow row.
+    timeout-minutes: 45
 
     # Compiler is set per row: CXX defaults to clang-19 (installed from
     # apt.llvm.org below), overridden to g++ on the gcc-compat row. CC and the
@@ -1051,6 +1068,8 @@ jobs:
   coverage:
     name: Coverage (Linux AVX2, gcov → Codecov)
     runs-on: ubuntu-latest
+    # Build + tests under coverage instrumentation, ~a few minutes normally.
+    timeout-minutes: 30
     # Coverage uses gcov/gcovr, which are GCC tools, so this lane must build with
     # g++ — below the compiler floor by necessity, so it opts out.
     env:
@@ -1117,6 +1136,8 @@ jobs:
   profiling-build:
     name: Profiling build (STAGE_PROF=1)
     runs-on: ubuntu-latest
+    # Single instrumented build plus a small unit test and one regression.
+    timeout-minutes: 20
     # A specialized instrumentation lane exercising the STAGE_PROF=1 code path;
     # builds with the runner's g++ (below the floor) and opts out. Migrating it
     # to clang-19 is a possible follow-up.
