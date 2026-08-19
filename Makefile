@@ -919,6 +919,20 @@ fr_fastq_diff_test: src/fr_fastq.c src/fast_reader.c test/fr_fastq_diff_test.c $
 fr_fastq_bench: src/fr_fastq.c src/fast_reader.c test/fr_fastq_bench.c $(FAST_READER_TEST_DEP)
 	$(CC) -O2 -Wall -Wextra $(FAST_READER_TEST_INC) test/fr_fastq_bench.c src/fr_fastq.c src/fast_reader.c $(FAST_READER_TEST_LIB) -lz $(FAST_READER_TEST_ZLIBNG) -ldeflate -o $@
 
+# Regression: bseq_read_fast must not overrun its buffer in paired-end mode when
+# the initial capacity estimate is odd (a paired iteration writes two records
+# but capacity is checked once). Always built with ASan so the overflowing write
+# aborts on regression; links only the reader TUs (no bwa-mem3 build), like
+# fr_fastq_diff_test. Built and run per-row by the CI matrix (ci.yml).
+bseq_read_pe_oob_test: src/fr_fastq.c src/fast_reader.c src/fast_reader_bseq.c test/bseq_read_pe_oob_test.c $(FAST_READER_TEST_DEP)
+	$(CC) -O1 -g -fsanitize=address -fno-omit-frame-pointer -Isrc -Wall -Wextra $(FAST_READER_TEST_INC) test/bseq_read_pe_oob_test.c src/fr_fastq.c src/fast_reader.c src/fast_reader_bseq.c $(FAST_READER_TEST_LIB) -lz $(FAST_READER_TEST_ZLIBNG) -ldeflate -o $@
+
+# Coverage for bseq_read_fast's copy_comment/-C gate (bseq1_t.comment set only
+# when the caller asked AND the record had a comment), across SE/PE. The parser
+# is covered by fr_fastq_diff_test; this drives the adapter. Reader TUs only.
+bseq_read_comment_copy_test: src/fr_fastq.c src/fast_reader.c src/fast_reader_bseq.c test/bseq_read_comment_copy_test.c $(FAST_READER_TEST_DEP)
+	$(CC) -O2 -Isrc -Wall -Wextra $(FAST_READER_TEST_INC) test/bseq_read_comment_copy_test.c src/fr_fastq.c src/fast_reader.c src/fast_reader_bseq.c $(FAST_READER_TEST_LIB) -lz $(FAST_READER_TEST_ZLIBNG) -ldeflate -o $@
+
 test/shm_pack_round_trip_test.o: test/shm_pack_round_trip_test.cpp
 
 # Run the in-tree tests via the unit-test harness in test/, plus the

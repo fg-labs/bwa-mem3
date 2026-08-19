@@ -117,7 +117,13 @@ bseq1_t *bseq_read_fast(int64_t chunk_size, int *n_, void *ks1_, void *ks2_, int
             fprintf(stderr, "[W::%s] the 2nd file has fewer sequences.\n", __func__);
             break;
         }
-        if (n >= m) {
+        /* Capacity check for BOTH writes this iteration. In paired-end mode `n`
+         * advances by two and the loop writes seqs[n] and seqs[n+1], but the
+         * initial estimate below can be odd (an odd chunk_size/seq_l quotient),
+         * so a bare `n >= m` lets n reach m-1 and the second write overrun the
+         * buffer by one. `p2 && n + 1 >= m` grows one record early so the paired
+         * write always fits; single-end (p2 == NULL) is unchanged. */
+        if (n >= m || (p2 && n + 1 >= m)) {
             if (m == 0) {
                 /* L8: size the buffer once from the chunk's base budget and the
                  * first read length, instead of doubling 256->512->... up to the
