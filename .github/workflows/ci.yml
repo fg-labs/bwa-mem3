@@ -668,6 +668,14 @@ jobs:
           MAKE_ARGS="CXX=${{ matrix.cxx || 'clang++-19' }} USE_MIMALLOC=${{ matrix.use_mimalloc }}" \
             bash test/regression/make_default_goal.sh
 
+      - name: Makefile compiler floor exempts clean goals
+        # Parse-time behaviour, so it needs no built tree, but the canonical row
+        # is where the other Makefile-behaviour checks live. Self-contained: the
+        # script stubs a below-floor compiler and drives `make -n`, so it takes
+        # no MAKE_ARGS and compiles nothing.
+        if: matrix.canonical == true
+        run: bash test/regression/make_clean_no_compiler_floor.sh
+
       - name: --bam=6 roundtrip smoke (chr22)
         if: matrix.canonical == true
         run: |
