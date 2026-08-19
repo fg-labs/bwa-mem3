@@ -16,7 +16,10 @@ narrative *What's Different* pages explain the *why* behind each class of change
 > real source of truth and a parallel hand-typed copy adds no information for the
 > ~90 % of changes that are fork-only. What a copy *can* add — the upstream
 > disposition of the handful of changes we tried to send upstream — is preserved
-> below and is small enough to keep current by hand.
+> below and is small enough to keep current by hand. If a full per-PR catalog is
+> ever wanted back, *generate* it from git history (classified by
+> conventional-commit type) with a CI check that fails when the checked-in copy
+> is stale — never hand-maintain it again.
 
 ## Changes offered upstream
 
