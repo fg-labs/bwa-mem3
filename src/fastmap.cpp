@@ -55,6 +55,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "version.h"
 #include <sys/resource.h>
 #include "bwa_shm.h"
+#include "bwa_hugepages.h"
 #include "fast_reader_bseq.h"
 
 #if AFF && (__linux__)
@@ -1561,6 +1562,7 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "    -y INT        seed occurrence for the 3rd round seeding [%ld]\n", (long)opt->max_mem_intv);
     fprintf(stderr, "    -c INT        skip seeds with more than INT occurrences [%d]\n", opt->max_occ);
     fprintf(stderr, "    --smem-dedup  dedup identical SMEMs before chaining: fewer SA lookups, ~10%% fewer; opt-in, NOT byte-identical (changes XS/secondary on a small fraction of reads) [off]\n");
+    fprintf(stderr, "    --huge-pages  back the index with 1 GB huge pages via mimalloc when the host has enough free 1 GB pages reserved; cuts dTLB misses in seeding; Linux only, alignment records byte-identical (only @PG CL differs, recording the flag), safe no-op otherwise [off]\n");
     fprintf(stderr, "    --skip-contained-ext  skip banded-SW extension of seeds contained (same diagonal) in a longer in-chain seed; byte-identical on short/medium non-meth reads (NOT on kilobase-scale long reads); no effect under --meth [off]\n");
     fprintf(stderr, "    --max-extend-chains INT  cap chains extended per read to the top-INT by weight; ~23%% less alignment CPU, high-confidence placement unaffected; ignored for reads with >4096 chains; opt-in, NOT byte-identical (0 = off) [%d]\n", opt->max_extend_chains);
     fprintf(stderr, "    --adaptive-band  adaptive banded-SW: start tight and expand each pair to its chain-geometry band on long-extension reads; ~1.3x on medium reads (SBX ~240bp), no-op on short reads; kilobase-scale HiFi/ONT do not run at default settings; opt-in, NOT byte-identical [%s]\n", opt->band_start? "on":"off");
@@ -1806,6 +1808,7 @@ int main_mem(int argc, char *argv[])
     char        *p, *rg_line               = 0, *hdr_line = 0;
     const char  *mode                      = 0;
     int          fast                      = 0;
+    int          want_huge_pages           = 0;
     /* --chunk-cap: upper bound (bases) on the default `chunk_size * n_threads`
      * batch size. 0 = off, which is the DEFAULT and matches bwa and bwa-mem2
      * exactly (both compute `chunk_size * n_threads` with no cap). Capping
@@ -1949,6 +1952,7 @@ int main_mem(int argc, char *argv[])
         OPT_SEED_ORDER,
         OPT_SMEM_DEDUP,
         OPT_FAST,
+        OPT_HUGE_PAGES,
         OPT_SKIP_CONTAINED_EXT,
         OPT_ADAPTIVE_BAND,
         OPT_EXTEND_MATE_CONCORDANT,
@@ -1972,6 +1976,7 @@ int main_mem(int argc, char *argv[])
         {"max-extend-chains",        required_argument, 0, OPT_MAX_EXTEND_CHAINS},
         {"smem-dedup",               no_argument,       0, OPT_SMEM_DEDUP},
         {"fast",                     no_argument,       0, OPT_FAST},
+        {"huge-pages",               no_argument,       0, OPT_HUGE_PAGES},
         {"skip-contained-ext",       no_argument,       0, OPT_SKIP_CONTAINED_EXT},
         {"adaptive-band",            no_argument,       0, OPT_ADAPTIVE_BAND},
         {"extend-mate-concordant",   optional_argument, 0, OPT_EXTEND_MATE_CONCORDANT},
@@ -2274,6 +2279,7 @@ int main_mem(int argc, char *argv[])
         }
         else if (c == OPT_SMEM_DEDUP) opt->smem_dedup = 1;
         else if (c == OPT_FAST) fast = 1;
+        else if (c == OPT_HUGE_PAGES) want_huge_pages = 1;
         else if (c == OPT_PROPER_PAIR_FROM_EMITTED) opt->proper_pair_from_emitted = 1;
         else if (c == OPT_RESCUE_KMER) {
             /* Validated rather than atoi'd for the same reason as --chunk-cap
@@ -2884,6 +2890,10 @@ int main_mem(int argc, char *argv[])
     uint64_t tim = __rdtsc();
 
     fprintf(stderr, "* Ref file: %s\n", ref_prefix);
+    /* Opt-in --huge-pages: reserve 1 GB pages for the index BEFORE it is
+     * allocated below, so the FM-index / SA arrays land on them. Safe no-op when
+     * the host has no reserved 1 GB pool. See bwa_hugepages.{h,cpp}, issue #402. */
+    if (want_huge_pages) bwamem_reserve_huge_pages(ref_prefix);
     aux.fmi = new FMI_search(ref_prefix);
     /* D3 dual-index: the FM-index AND its BNS/PAC come from the `.meth` SEED prefix.
      * The seed BNS is required to decode seed positions into (seed contig, local pos,
