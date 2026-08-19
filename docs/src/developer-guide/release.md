@@ -149,9 +149,11 @@ release PR** (merging it is what tags and publishes the release — see
       [Flagging breaking changes](contributing.md#flagging-breaking-changes)).
       `NEWS.md` is **not** updated — it is frozen at 0.2.0; 0.3.0 and
       later live only in `CHANGELOG.md` and the GitHub Releases page.
-- [ ] `docs/src/reference/pr-catalog.md` `FG-MAIN-TABLE` block has a row for
-      every fork-carried PR landed since the previous tag, with its upstream
-      disposition (see [Contributing](contributing.md#the-fg-main-table-rule)).
+- [ ] `docs/src/reference/pr-catalog.md` records any change landed since the
+      previous tag that was proposed back to an upstream project (bwa-mem2 or
+      Heng Li's `lh3/bwa`), or whose upstream disposition changed; fork-only
+      changes need no entry (see
+      [Contributing](contributing.md#recording-upstream-submitted-changes)).
 - [ ] `docs/src/reference/changelog.md` and `docs/src/cli/version.md`
       examples reference the new release string.
 - [ ] Spot-check the bwa-mem3-bench reference numbers in
@@ -245,9 +247,9 @@ After the release PR is merged and the GitHub release is published:
 - Pre-release tags use a `-pre` suffix: `v0.1.0-pre`.
 - Patch releases increment the third component: `v0.1.1`.
 
-## What's Different table update
+## Upstream-disposition update
 
-When a release bundles new fork-carried commits that were not previously documented, update the `FG-MAIN-TABLE` in `docs/src/reference/pr-catalog.md` in the same PR before tagging. See [Contributing](contributing.md#the-fg-main-table-rule) for the rule.
+When a release bundles a change that was proposed back to an upstream project (bwa-mem2 or Heng Li's `lh3/bwa`), or whose upstream disposition changed since the last tag, update `docs/src/reference/pr-catalog.md` before tagging. Fork-only changes need no entry — git history and the GitHub PR list are the record of the change list itself. See [Contributing](contributing.md#recording-upstream-submitted-changes).
 
 ---
 

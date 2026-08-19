@@ -1,8 +1,11 @@
 # What's Different from bwa-mem2
 
-This section tracks every change that bwa-mem3 carries on top of upstream
-[bwa-mem2/bwa-mem2](https://github.com/bwa-mem2/bwa-mem2)'s `master` branch,
-explains why each change was made, and records its upstream disposition.
+This section explains why bwa-mem3 diverges from upstream
+[bwa-mem2/bwa-mem2](https://github.com/bwa-mem2/bwa-mem2)'s `master` branch:
+curated pages that group the changes by category and give the rationale for each
+class. Exhaustive per-change tracking lives in git history and the GitHub PR
+list; a separate catalog records which fork changes were proposed upstream and
+how each was received.
 
 bwa-mem3 is **not byte-identical** to bwa-mem2. Upstream reproduces the original `bwa` exactly; bwa-mem3 does not — it emits extra SAM tags, fixes crashes and SIMD scoring bugs, and changes tie resolution. On the data tested, the core alignment (position, CIGAR, MAPQ, FLAG) is preserved, but the SAM byte stream is not. See [Equivalence with bwa-mem2](equivalence.md) for the field-by-field comparison.
 
@@ -18,7 +21,7 @@ Each page covers one category of change:
 - [Architecture support](arch-support.md) — Linux ARM64/aarch64, `arch=avx512bw`, and the NEON / AVX2 kswv mate-rescue kernels.
 - [Build & infrastructure](build-infra.md) — the doctest framework, version stamping, PGO targets, flag forwarding, and the CI matrix.
 
-The flat per-PR record — every fork-carried change with its bwa-mem3 PR, class, and upstream bwa-mem2 disposition — lives in one place: the [**PR catalog**](../reference/pr-catalog.md). The pages here explain the *why* behind each class.
+The exhaustive per-PR record is git history and the [GitHub PR list](https://github.com/fg-labs/bwa-mem3/pulls?q=is%3Apr+is%3Amerged+base%3Amain); the pages here explain the *why* behind each class. For the fork changes that were proposed back upstream — and where each stands — see [**Fork changes vs. upstream**](../reference/pr-catalog.md).
 
 ## Notable fork-level changes
 
@@ -71,7 +74,7 @@ commits past upstream tag `v2.3` at commit `61813ef`.
 - `master` tracks upstream unchanged.
 - `main` is `upstream/master` plus the commits above. Rebased onto upstream roughly quarterly, or sooner when an upstream release we care about lands.
 - Contributions go via PR targeting `main`. CI and CodeRabbit gate merges.
-- Any PR that adds or removes a fork-carried commit must add a row to the [PR catalog](../reference/pr-catalog.md) in the same PR (the FG-MAIN-TABLE rule).
+- A PR that proposes one of its changes back to an upstream project (bwa-mem2 or Heng Li's `lh3/bwa`), or learns the upstream disposition of one, should record it on the [Fork changes vs. upstream](../reference/pr-catalog.md) page. There is no longer a mandatory per-PR table row — git history and the GitHub PR list are the source of truth for the change list itself.
 
 ## Consuming
 
@@ -100,5 +103,5 @@ and we drop them from `main` once they appear upstream.
 [Correctness fixes](correctness.md) ·
 [Performance improvements](performance.md) ·
 [Features](features.md) ·
-[PR catalog](../reference/pr-catalog.md) ·
+[Fork changes vs. upstream](../reference/pr-catalog.md) ·
 [Developer Guide → Contributing](../developer-guide/contributing.md)

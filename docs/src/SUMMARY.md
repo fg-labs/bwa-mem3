@@ -76,7 +76,7 @@
   - [fgumi](related-projects/fgumi.md)
   - [bwameth.py](related-projects/bwameth.md)
 - [Reference]()
-  - [PR catalog](reference/pr-catalog.md)
+  - [Fork changes vs. upstream](reference/pr-catalog.md)
   - [Glossary](reference/glossary.md)
   - [Citation](reference/citation.md)
   - [License](reference/license.md)

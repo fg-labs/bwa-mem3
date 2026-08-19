@@ -1,6 +1,6 @@
 # Contributing
 
-This page covers the mechanics of submitting changes to bwa-mem3: commit conventions, PR workflow, CI requirements, and the rule for keeping the fork-lineage table current.
+This page covers the mechanics of submitting changes to bwa-mem3: commit conventions, PR workflow, CI requirements, and how to record a change proposed back to an upstream project.
 
 ## Before you start
 
@@ -94,25 +94,20 @@ release-please then emits a `⚠ BREAKING CHANGES` section automatically. While 
 > to ready-for-review only when the branch is stable, CI is green, and you have
 > self-reviewed the diff.
 
-## The FG-MAIN-TABLE rule
+## Recording upstream-submitted changes
 
-Every PR that introduces a new fork-carried commit — a commit that is on `main` but not on `master` (the upstream bwa-mem2 mirror) — **must** update the `FG-MAIN-TABLE` block in `docs/src/reference/pr-catalog.md` in the same PR.
+The project used to require every fork-carried PR to add a row to a
+hand-maintained table (the "FG-MAIN-TABLE") in `docs/src/reference/pr-catalog.md`.
+That rule is **retired**: the table drifted badly, and git history
+(`git log --reverse --no-merges master..main`) plus the GitHub PR list are the
+authoritative record of *what* changed on top of upstream — a parallel hand-typed
+copy added no information for the ~90 % of changes that are fork-only.
 
-The table records each fork-carried change, its bwa-mem3 PR number, the corresponding upstream bwa-mem2 PR or issue (if any), and its upstream status. Keeping this table current is the primary mechanism by which the project maintains transparency about its relationship to upstream.
-
-> **Warning — Do not skip the table update**
->
-> A PR that adds a fork-carried commit but omits the table update will be sent back
-> for revision. The table is reviewed as part of the standard PR checklist.
-
-### What counts as a fork-carried commit
-
-A commit is fork-carried if:
-
-- It adds new behaviour, fixes a bug, or changes build infrastructure in a way that diverges from upstream bwa-mem2 `master`.
-- It is present on `fg-labs/bwa-mem3 main` but not (yet) merged upstream.
-
-Pure documentation commits, CI-only changes, and upstream-rebase bookkeeping commits do not need a table entry.
+What is still worth recording by hand is small: when a PR **proposes one of its
+changes back to bwa-mem2** (or upstream, or Heng Li's `lh3/bwa`), or when you
+learn the upstream disposition of an existing change, add or update its entry on
+the [Fork changes vs. upstream](../reference/pr-catalog.md) page. Fork-only
+changes — the overwhelming majority — need no entry.
 
 ## CI matrix
 
