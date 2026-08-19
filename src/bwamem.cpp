@@ -596,23 +596,31 @@ PDQSORT_INIT(mem_ars, mem_alnreg_t, alnreg_slt)
  * worth paying there for either. */
 #define DEDUP_SORT_PDQ_MIN 9
 
+/* Geometric-growth backing for the per-thread dedup scratch buffers below.
+ * Grows `s` to hold at least `want` bytes, doubling to amortize repeated calls.
+ * realloc returns storage suitably aligned for mem_alnreg_t and the pair types.
+ * Returns the buffer, or NULL on allocation failure -- leaving the existing
+ * buffer intact so the caller can take the exact (introsort) fallback. */
+static inline void *scratch_grow(u8vec_scratch_t &s, size_t want)
+{
+    if (s.v.m < want) {
+        size_t cap = s.v.m * 2;
+        if (cap < want) cap = want;
+        uint8_t *p = (uint8_t *)realloc(s.v.a, cap);
+        if (p == NULL) return NULL;   /* keep the existing buffer intact */
+        s.v.a = p;
+        s.v.m = cap;
+    }
+    return s.v.a;
+}
+
 /* Per-thread save buffer, grown geometrically and released at thread exit. Held
- * as bytes so it can reuse the u8vec scratch holder; realloc returns storage
- * suitably aligned for mem_alnreg_t. Returns NULL only if the allocation fails,
- * in which case the caller takes the exact (introsort) path. */
+ * as bytes so it can reuse the u8vec scratch holder. Returns NULL only if the
+ * allocation fails, in which case the caller takes the exact (introsort) path. */
 static inline mem_alnreg_t *alnreg_save_buf(int n)
 {
     static thread_local u8vec_scratch_t save;
-    const size_t want = (size_t)n * sizeof(mem_alnreg_t);
-    if (save.v.m < want) {
-        size_t cap = save.v.m * 2;
-        if (cap < want) cap = want;
-        uint8_t *p = (uint8_t *)realloc(save.v.a, cap);
-        if (p == NULL) return NULL;   /* keep the existing buffer intact */
-        save.v.a = p;
-        save.v.m = cap;
-    }
-    return (mem_alnreg_t *)save.v.a;
+    return (mem_alnreg_t *)scratch_grow(save, (size_t)n * sizeof(mem_alnreg_t));
 }
 
 /* Emit `static void fn(int n, mem_alnreg_t *a)` that sorts `a` exactly as
@@ -656,6 +664,141 @@ void bwamem3_dedup_sort_by_re_exact(int n, mem_alnreg_t *a)    { ks_introsort(me
 void bwamem3_dedup_sort_by_score(int n, mem_alnreg_t *a)       { dedup_sort_by_score(n, a); }
 /* The closing by-score sort bwa-mem2 runs, i.e. the oracle for the above. */
 void bwamem3_dedup_sort_by_score_exact(int n, mem_alnreg_t *a) { ks_introsort(mem_ars, n, a); }
+
+/*----------------------------------------------------------------------------
+ * Permutation-gather dedup sorts (default path).
+ *
+ * The in-place dedup_sort_by_re/_by_score above keep bwa-mem2 parity on tied
+ * `re` (klib introsort's unstable permutation) by saving the whole array aside
+ * on every call >= DEDUP_SORT_PDQ_MIN, so a tie can be resolved by restoring and
+ * re-running ks_introsort. That 112-byte-per-element save-copy is paid on 100%
+ * of calls to cover the ~1% that actually tie.
+ *
+ * These variants remove it. They sort (key, index) pairs -- 16 or 24 bytes, not
+ * 112 -- with the SAME algorithms (pdqsort when tie-free, klib ks_introsort on a
+ * tie), so the index order is exactly the permutation the in-place sort would
+ * apply, ties included; then one gather materialises the records into a separate
+ * `dst`. Since `src` is never overwritten, the tie fallback just rebuilds and
+ * re-sorts the cheap pairs -- there is no struct save-copy. Each swap during the
+ * sort moves a pair; the records move exactly once, at the gather.
+ *
+ * `dst` differs from `src`, so mem_sort_dedup_patch alternates its two sorts
+ * src<->scratch (an A/B ping-pong) to land the final records back in the
+ * caller's own array. Byte-identity to unconditional ks_introsort is asserted in
+ * test/unit/test_alnreg_sort_dedup.cpp via the same harness as the in-place
+ * fast paths.
+ *--------------------------------------------------------------------------*/
+
+typedef struct { int64_t re;    uint32_t idx; } dedup_pair_re;
+typedef struct { int score; int64_t rb; int qb; uint32_t idx; } dedup_pair_sc;
+
+/* Pair comparators MUST mirror the record comparators' keys exactly:
+ * dedup_pre_lt == alnreg_slt2_m2 (re only); dedup_psc_lt == alnreg_slt. */
+#define dedup_pre_lt(a, b) ((a).re < (b).re)
+#define dedup_psc_lt(a, b) ((a).score > (b).score || ((a).score == (b).score && \
+                            ((a).rb < (b).rb || ((a).rb == (b).rb && (a).qb < (b).qb))))
+KSORT_INIT(dedup_pre, dedup_pair_re, dedup_pre_lt)
+KSORT_INIT(dedup_psc, dedup_pair_sc, dedup_psc_lt)
+PDQSORT_INIT(dedup_pre, dedup_pair_re, dedup_pre_lt)
+PDQSORT_INIT(dedup_psc, dedup_pair_sc, dedup_psc_lt)
+
+/* Below this the pair indirection costs more than the 112-byte moves it saves,
+ * and the in-place path pays no save-copy there anyway (< DEDUP_SORT_PDQ_MIN). */
+#define DEDUP_PERM_MIN 9
+
+/* Thread-local scratch for the (key,index) pairs and the record gather target,
+ * each grown geometrically and reused across calls (bytes-backed to share the
+ * u8vec holder). Return NULL only on allocation failure, leaving the existing
+ * buffer intact; the caller then takes the in-place path. */
+static inline void *dedup_pair_buf(size_t want)
+{
+    static thread_local u8vec_scratch_t pairs;
+    return scratch_grow(pairs, want);
+}
+static inline mem_alnreg_t *dedup_gather_buf(int n)
+{
+    static thread_local u8vec_scratch_t gather;
+    return (mem_alnreg_t *)scratch_grow(gather, (size_t)n * sizeof(mem_alnreg_t));
+}
+
+/* Sort `src` into `dst` by `re` (the default comparator), reproducing
+ * ks_introsort(mem_ars2_m2)'s array exactly. On pair-buffer OOM, falls back to an
+ * in-place introsort on a straight copy -- still byte-identical. */
+static void dedup_perm_sort_by_re(int n, const mem_alnreg_t *src, mem_alnreg_t *dst)
+{
+    /* The gather below reads `src` and writes `dst`; they must be distinct
+     * buffers. mem_sort_dedup_patch guarantees this by ping-ponging the caller
+     * array against the thread-local gather scratch (dedup_gather_buf), so `scr`
+     * owns that buffer for the whole call. Aliasing would corrupt records with
+     * no diagnostic, so catch it in all builds -- xassert fires under -DNDEBUG,
+     * unlike assert, which would compile the check out on the release path. */
+    xassert(src != dst, "dedup permutation sort requires distinct source and destination buffers");
+    dedup_pair_re *p =
+        (dedup_pair_re *)dedup_pair_buf((size_t)n * sizeof(dedup_pair_re));
+    if (p == NULL) {
+        memcpy(dst, src, (size_t)n * sizeof(*src));
+        ks_introsort(mem_ars2_m2, n, dst);
+        return;
+    }
+    for (int i = 0; i < n; ++i) { p[i].re = src[i].re; p[i].idx = (uint32_t)i; }
+    pdqsort_dedup_pre((size_t)n, p);
+    int tie = 0;
+    for (int i = 1; i < n; ++i)
+        if (!dedup_pre_lt(p[i - 1], p[i])) { tie = 1; break; }
+    if (tie) {  /* restore the pairs and reproduce introsort's permutation */
+        for (int i = 0; i < n; ++i) { p[i].re = src[i].re; p[i].idx = (uint32_t)i; }
+        ks_introsort_dedup_pre((size_t)n, p);
+    }
+    for (int i = 0; i < n; ++i) dst[i] = src[p[i].idx];  /* the single gather */
+}
+
+/* The by-score analogue, reproducing ks_introsort(mem_ars). */
+static void dedup_perm_sort_by_score(int n, const mem_alnreg_t *src, mem_alnreg_t *dst)
+{
+    xassert(src != dst, "dedup permutation sort requires distinct source and destination buffers");  /* see dedup_perm_sort_by_re: src/dst must not alias */
+    dedup_pair_sc *p =
+        (dedup_pair_sc *)dedup_pair_buf((size_t)n * sizeof(dedup_pair_sc));
+    if (p == NULL) {
+        memcpy(dst, src, (size_t)n * sizeof(*src));
+        ks_introsort(mem_ars, n, dst);
+        return;
+    }
+    for (int i = 0; i < n; ++i) {
+        p[i].score = src[i].score; p[i].rb = src[i].rb; p[i].qb = src[i].qb;
+        p[i].idx = (uint32_t)i;
+    }
+    pdqsort_dedup_psc((size_t)n, p);
+    int tie = 0;
+    for (int i = 1; i < n; ++i)
+        if (!dedup_psc_lt(p[i - 1], p[i])) { tie = 1; break; }
+    if (tie) {
+        for (int i = 0; i < n; ++i) {
+            p[i].score = src[i].score; p[i].rb = src[i].rb; p[i].qb = src[i].qb;
+            p[i].idx = (uint32_t)i;
+        }
+        ks_introsort_dedup_psc((size_t)n, p);
+    }
+    for (int i = 0; i < n; ++i) dst[i] = src[p[i].idx];
+}
+
+/* Exposed for test/unit/test_alnreg_sort_dedup.cpp: thin in-place wrappers (perm
+ * into the gather scratch, then copy back) so the byte-identity harness -- which
+ * drives an in-place sort_fn -- can validate the src->dst core. The hot path in
+ * mem_sort_dedup_patch calls the core directly and never copies back. */
+void bwamem3_dedup_perm_sort_by_re(int n, mem_alnreg_t *a)
+{
+    mem_alnreg_t *tmp = dedup_gather_buf(n);
+    if (tmp == NULL) { ks_introsort(mem_ars2_m2, n, a); return; }
+    dedup_perm_sort_by_re(n, a, tmp);
+    memcpy(a, tmp, (size_t)n * sizeof(*a));
+}
+void bwamem3_dedup_perm_sort_by_score(int n, mem_alnreg_t *a)
+{
+    mem_alnreg_t *tmp = dedup_gather_buf(n);
+    if (tmp == NULL) { ks_introsort(mem_ars, n, a); return; }
+    dedup_perm_sort_by_score(n, a, tmp);
+    memcpy(a, tmp, (size_t)n * sizeof(*a));
+}
 
 #define alnreg_hlt(a, b)  ((a).score > (b).score || ((a).score == (b).score && ((a).is_alt < (b).is_alt || ((a).is_alt == (b).is_alt && (a).hash < (b).hash))))
 KSORT_INIT(mem_ars_hash, mem_alnreg_t, alnreg_hlt)
@@ -810,13 +953,26 @@ int mem_sort_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns,
     if (mat == NULL) mat = opt->mat;
     int m, i, j;
     if (n <= 1) return n;
+
+    /* The default path reorders the 112-byte records by sorting a (key,index)
+     * permutation and gathering once, which drops the per-call save-copy the
+     * in-place tie-detection scheme pays (dedup_perm_sort_by_re/_by_score). The
+     * gather writes a DIFFERENT buffer than it reads, so the two sorts ping-pong
+     * a<->scr and the final records land back in the caller's own array `a_orig`.
+     * `scr` is the gather target, sized to the entry n; NULL disables the
+     * permutation form (small n, --fast, or scratch OOM), leaving the exact
+     * in-place behaviour. The dedup loop below operates on `a`, which the sort1
+     * swap may repoint at `scr`. */
+    mem_alnreg_t *const a_orig = a;
+    mem_alnreg_t *scr = (!opt->alnreg_sort_fast && n >= DEDUP_PERM_MIN)
+                        ? dedup_gather_buf(n) : NULL;
+
     /* Default: bwa-mem2's re-only comparator, ordered exactly as klib introsort
-     * would order it -- dedup_sort_by_re runs pdqsort and restores-and-introsorts
-     * only on a tie -- reproducing upstream's dedup outcome. --fast: strict total
-     * order + pdqsort unconditionally, which skips the save-copy and the tie scan
-     * but resolves equal-`re` ties differently. */
+     * would order it -- reproducing upstream's dedup outcome. --fast: strict total
+     * order + pdqsort unconditionally, resolving equal-`re` ties differently. */
     if (opt->alnreg_sort_fast) pdqsort_mem_ars2(n, a);       // sort by the END position, not START!
-    else                       dedup_sort_by_re(n, a);
+    else if (scr) { dedup_perm_sort_by_re(n, a, scr); mem_alnreg_t *t = a; a = scr; scr = t; }
+    else           dedup_sort_by_re(n, a);
 
     for (i = 0; i < n; ++i) a[i].n_comp = 1;
     for (i = 1; i < n; ++i)
@@ -860,8 +1016,15 @@ int mem_sort_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns,
             else ++m;
         }
     n = m;
-    if (opt->alnreg_sort_fast) pdqsort_mem_ars(n, a);
-    else                       dedup_sort_by_score(n, a);
+    if (opt->alnreg_sort_fast)                 pdqsort_mem_ars(n, a);
+    else if (scr && n >= DEDUP_PERM_MIN) { dedup_perm_sort_by_score(n, a, scr); mem_alnreg_t *t = a; a = scr; scr = t; }
+    else                                       dedup_sort_by_score(n, a);
+    /* Return the records to the caller's own buffer. With both sorts permuting
+     * (the common large-n case) the a<->scr ping-pong already leaves `a == a_orig`
+     * and this is a no-op; the copy only runs when an odd number of gathers landed
+     * the data in `scr` (e.g. dedup shrank n below DEDUP_PERM_MIN before sort2),
+     * and then only over the few surviving records. */
+    if (a != a_orig) memcpy(a_orig, a, (size_t)n * sizeof(*a));
     /* The historical post-sort exact-duplicate passes (mark then exclude regions
      * sharing (score, rb, qb)) have been removed: they are provably dead. Any two
      * regions with equal (rb, qb) have the shorter fully contained in the longer,
