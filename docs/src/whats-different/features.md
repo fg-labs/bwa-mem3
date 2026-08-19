@@ -275,6 +275,32 @@ complete. For that reason, all non-`off` modes are opt-in only and the default s
 
 See [Optimization checklist → Reorder seeds longest-first](../best-practices/optimization-checklist.md#6-reorder-seeds-longest-first---seed-order-local-longest) and [Equivalence → Seed ordering](equivalence.md#seed-ordering---seed-order-opt-in) for full details.
 
+## `--huge-pages` 1 GB huge pages for the index
+
+`--huge-pages` (Linux, off by default) backs the FM-index and suffix-array
+structures with explicit **1 GB huge pages** to cut data-TLB misses on the random
+SA/BWT accesses that dominate seeding. bwa-mem3's allocator is the vendored
+mimalloc (above), so the flag reserves the pages through it
+(`mi_reserve_huge_os_pages_interleave`) — sizing the reservation from the index
+footprint and reserving before the index loads.
+
+It is **safe by default**: when the host has no free 1 GB hugepage pool, has too
+few pages, is not Linux, or was built without mimalloc, the flag prints a one-line
+`[M::]` note and runs on the default page size. The pages must be pre-reserved on
+the host (`nr_hugepages`); transparent huge pages (2 MB) do not reproduce the win.
+
+The **alignment records are byte-identical** — page size does not change
+alignments; only the `@PG` record differs, since its `CL:` field records the
+`--huge-pages` flag on the command line. Measured effect: ~1.5 % whole-aligner
+wall and ~0.9 % user CPU on a 5 M-read WGS slice (HG00096, hg38), AMD Zen3, avx2
+tier, 32 threads ([#405](https://github.com/fg-labs/bwa-mem3/pull/405)). This is a
+single-host, single-config measurement, not a cross-architecture or cross-thread
+claim.
+
+See [Memory allocator → Large pages for the index](../user-guide/allocator.md#large-pages-for-the-index-linux-deployment-lever)
+and [Optimization checklist → Reserve 1 GB huge pages](../best-practices/optimization-checklist.md#8-reserve-1-gb-huge-pages-for-the-index-linux-opt-in)
+for reservation, verification, and the manual `MIMALLOC_RESERVE_HUGE_OS_PAGES` equivalent.
+
 ## Changes catalog
 
 | Item | bwa-mem3 PR | Upstream PR/issue | Status |
@@ -294,6 +320,7 @@ See [Optimization checklist → Reorder seeds longest-first](../best-practices/o
 | `--skip-contained-ext` contained-seed extension skip | [#192](https://github.com/fg-labs/bwa-mem3/pull/192) | — | fork-only (opt-in, byte-identical on short/medium non-meth reads, **not** byte-identical on kilobase-scale long reads, no-op under --meth) |
 | `--max-extend-chains` chain-extension cap | [#193](https://github.com/fg-labs/bwa-mem3/pull/193) | — | fork-only (opt-in, not byte-identical) |
 | `--extend-mate-concordant` mate-concordant chain retention | [#195](https://github.com/fg-labs/bwa-mem3/pull/195) | — | fork-only (opt-in, not byte-identical) |
+| `--huge-pages` 1 GB huge pages for the index | [#405](https://github.com/fg-labs/bwa-mem3/pull/405) | — | fork-only (Linux, opt-in, off by default; alignment records byte-identical, `@PG` `CL:` excepted; single-host measurement, not a cross-host/cross-tier claim) |
 
 ---
 

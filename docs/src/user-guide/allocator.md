@@ -100,37 +100,84 @@ arrays for transparent huge pages (`madvise(MADV_HUGEPAGE)` → 2 MB pages), whi
 helps but does not fully cover the working set.
 
 On **Linux** you can back the index arrays with **explicit 1 GB huge pages** for
-a further speedup; the output stays byte-identical (see
-[Measured effect](#measured-effect) below). Because the allocator is mimalloc
-(above), the lever is one of mimalloc's own options — no rebuild and no code
-change. It requires an **active mimalloc build** (`bwa-mem3 version` reports
-`mimalloc … (active)`); a `USE_MIMALLOC=0` build ignores the reservation:
+a further speedup, with byte-identical alignment output (see
+[Measured effect](#measured-effect) below). bwa-mem3's allocator is mimalloc
+(above), so the reservation goes through it — either automatically via the
+`--huge-pages` flag, or manually via mimalloc's own environment variable. Both
+paths reserve through the **shipping mimalloc build**, where the executable
+whole-archives libmimalloc so its `malloc`/`free` are the ones the index arrays
+actually allocate through — the build `bwa-mem3 version` reports as
+`mimalloc … (active)`. A `USE_MIMALLOC=0` build has no mimalloc to reserve
+through, and a libmimalloc linked without the malloc override
+(`linked but NOT overriding malloc`) would reserve pages the index never
+allocates from; the reservation code checks only that mimalloc's reservation
+entry point is present, so confirm `(active)` before relying on the win.
+
+### The `--huge-pages` flag (recommended)
+
+Reserve 1 GB hugepages on the host, then pass `--huge-pages`:
 
 ```bash
-# N = number of 1 GB pages; must cover the resident index. hg38 (≈ 11 GB) → 14.
-# Size this to *your* reference; the value below is the hg38 example.
-N=14
+# Reserve 1 GB hugepages (root). Works at runtime on a freshly booted machine
+# with enough free contiguous RAM — no reboot needed. hg38 needs ~13 pages;
+# rounding up is harmless. 1 GB HugeTLB support is architecture-dependent, so the
+# pool directory only exists on hosts that provide it — reserve only when it does
+# (the flag itself no-ops safely, but the reservation write would error otherwise).
+#
+# nr_hugepages is the HOST-WIDE TOTAL, not a delta: `echo 16` sets the whole 1 GB
+# pool to 16 pages (it does not add 16). On a shared host, writing an absolute
+# value BELOW the current pool shrinks it and can starve other processes already
+# using it — read the current count first and pick a non-decreasing target:
+#   cur=$(cat /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages)
+#   echo $(( cur > 16 ? cur : 16 )) | sudo tee .../nr_hugepages
+if [ -d /sys/kernel/mm/hugepages/hugepages-1048576kB ]; then
+    echo 16 | sudo tee /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages
+fi
 
-# Preflight (fail closed): the lever works only when BOTH hold, so gate the
-# reservation AND the run on both, and do nothing otherwise:
-#   * bwa-mem3 must report an ACTIVE mimalloc — a USE_MIMALLOC=0 build (no
-#     mimalloc line) or a linked-but-not-overriding build silently ignores
-#     MIMALLOC_RESERVE_HUGE_OS_PAGES;
-#   * the 1 GB HugeTLB pool must exist (architecture- and kernel-dependent).
+bwa-mem3 mem --huge-pages ref.fa r1.fq r2.fq > out.sam
+```
+
+`--huge-pages` sizes the reservation from the index footprint automatically and
+reserves the pages before the index loads. It is **safe by default**: if the host
+has no 1 GB pool, or too few free pages, it prints a one-line `[M::]` note and
+runs on the default page size — it does not fail the alignment. The reservation
+itself makes only a bounded attempt (a finite timeout, at least 5 s and up to
+~1 s per requested page) before falling back to default pages, so a heavily
+fragmented host may see a brief startup delay, never a failed run:
+
+```text
+[M::bwamem_reserve_huge_pages] --huge-pages: reserved 13 x 1 GB huge pages for the index via mimalloc
+# or, when unavailable:
+[M::bwamem_reserve_huge_pages] --huge-pages: the index needs ~13 free 1 GB pages but only 0 are available; not reserving (raise nr_hugepages). Running on default pages
+```
+
+### Manual: `MIMALLOC_RESERVE_HUGE_OS_PAGES`
+
+Equivalently, without the flag, reserve the pages and tell mimalloc directly. `N`
+is the 1 GB page count, sized to the resident index (hg38 ≈ 11 GB → 11 pages + a
+2-page margin = 13, the same count `--huge-pages` auto-sizes):
+
+```bash
+N=13   # hg38 example; size to your reference
+# Fail closed: reserve and run only with an active mimalloc override AND a 1 GB
+# HugeTLB pool. A USE_MIMALLOC=0 build silently ignores MIMALLOC_RESERVE_HUGE_OS_PAGES.
+# As above, nr_hugepages is the HOST-WIDE TOTAL: `echo "$N"` sets the whole pool
+# to N (it does not add N). On a shared host, don't write a value below the
+# current pool or you shrink it under other processes — use a non-decreasing
+# target: cur=$(cat .../nr_hugepages); N=$(( cur > N ? cur : N )).
 if bwa-mem3 version | grep -q 'mimalloc.*(active)' \
    && [ -d /sys/kernel/mm/hugepages/hugepages-1048576kB ]; then
-    # Reserve N x 1 GB hugepages on the host (root). Works at runtime on a freshly
-    # booted machine with enough free contiguous RAM — no reboot needed.
     echo "$N" | sudo tee /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages
-    # Run with mimalloc reserving them at startup.
     MIMALLOC_RESERVE_HUGE_OS_PAGES="$N" bwa-mem3 mem ref.fa r1.fq r2.fq > out.sam
 else
     echo "1 GB huge pages unavailable (need active mimalloc + 1 GB HugeTLB); running on default pages"
 fi
 ```
 
-Verify the index actually landed on 1 GB pages, rather than silently falling back
-to the default page size:
+### Verifying
+
+Confirm the index actually landed on 1 GB pages, rather than silently falling
+back to the default page size:
 
 ```bash
 # while a run is in flight — resolve exactly one 'bwa-mem3 mem' PID first, so a
@@ -154,34 +201,39 @@ awk '
 
 ### Measured effect
 
-Measured on a 5 M-read WGS slice (HG00096, hg38), AMD Zen3 (AVX2 tier), 32
-threads, with the index warm in the page cache and everything else held fixed —
-compared against the default path (transparent huge pages, 2 MB) on the same
-host and input:
+Measured on a 5 M-read WGS slice (5 M paired reads — the total workload, not the
+batch size — HG00096 aligned to hg38); host AMD Zen3, 16 physical cores / 32
+threads; SIMD tier avx2; built with clang-19; index warm in the page cache;
+compared against the default path (transparent huge pages, 2 MB) on the same host
+and input ([PR #405](https://github.com/fg-labs/bwa-mem3/pull/405); the
+reproducible, multi-architecture throughput methodology this follows is
+[bwa-mem3-bench](../related-projects/bwa-mem3-bench.md)). Both runs used matching
+`-t 32` and no explicit `-K`, i.e. the default per-batch size (`chunk_size` =
+10 Mbp per thread), and differed only by `--huge-pages`, so the batch boundaries
+were identical:
 
 - **wall time:** ~1.5 % lower
 - **user CPU:** ~0.9 % lower
 - **system CPU:** ~25 % lower, from the eliminated page-table walks
 
-Output was **byte-identical** to the default path — page size does not change
-alignments, so this is purely a performance lever, not an output change. This is
-a single-configuration measurement; the effect at other thread counts, hosts, or
-references is not characterized here.
+The **alignment records are byte-identical** to the default path — page size does
+not change alignments; only the `@PG` header line differs, since it records the
+`--huge-pages` flag on the command line. This is a single-host, single-config
+measurement; the effect at other thread counts, architectures, or references is
+not characterized here.
 
-> **Note — why this is a deployment lever, not a default**
+> **Note — why this is opt-in, not a default**
 >
 > 1 GB hugepages must be pre-reserved (privileged, host-global, pinned
-> non-swappable RAM), the right `N` depends on the reference size, and with no
-> pages reserved the reservation fails and falls back. It is therefore opt-in
-> host configuration, not something the binary enables by default. It is also
-> **Linux-only**, and transparent huge pages (2 MB) alone do not reproduce it.
+> non-swappable RAM), the number needed depends on the reference size, and with
+> no pages reserved there is nothing to use. `--huge-pages` therefore stays off
+> by default and no-ops when the host is not configured for it. It is also
+> **Linux-only** (and needs the bundled mimalloc), and transparent huge pages
+> (2 MB) alone do not reproduce the win.
 >
-> The reservation must go through **mimalloc**
-> (`MIMALLOC_RESERVE_HUGE_OS_PAGES`), not an `LD_PRELOAD` `posix_memalign` shim:
-> mimalloc overrides the allocator, so a libc-level preload never sees the index
-> allocations and quietly does nothing. A future opt-in `--huge-pages` flag that
-> auto-sizes `N` from the index and no-ops when pages are unavailable is tracked
-> in [issue #402](https://github.com/fg-labs/bwa-mem3/issues/402).
+> Both paths go through **mimalloc**, never an `LD_PRELOAD` `posix_memalign`
+> shim: mimalloc overrides the allocator, so a libc-level preload never sees the
+> index allocations and quietly does nothing.
 
 ## Build internals
 

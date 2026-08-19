@@ -151,27 +151,34 @@ locus. All uniquely-mapped reads are unaffected.
 
 Seeding is memory-latency-bound. On Linux, backing the FM-index / suffix-array
 arrays with explicit 1 GB huge pages cuts data-TLB pressure for a small
-wall-time gain — ~1.5 % on a 5 M-read WGS slice (HG00096, hg38) at 32 threads.
-Output is byte-identical (page size does not change alignments). Because the
-allocator is mimalloc, the lever is one environment variable plus a host-side
-page reservation — no rebuild. `N` is the 1 GB page count, sized to the resident
-index (hg38 ≈ 11 GB → 14). It needs an active mimalloc build and 1 GB HugeTLB
-support, so the snippet fails closed on both (`bwa-mem3 version` must report
-`mimalloc … (active)`; a `USE_MIMALLOC=0` build silently ignores the reservation):
+wall-time gain — ~1.5 % on a 5 M-read WGS slice (HG00096/hg38, AMD Zen3, avx2
+tier, `-t 32` with no explicit `-K`, so the default per-batch size — `chunk_size`
+= 10 Mbp per thread — applied identically to both runs, index warm in the page
+cache; the two runs differed only by `--huge-pages`;
+[PR #405](https://github.com/fg-labs/bwa-mem3/pull/405), reproducible method in
+[bwa-mem3-bench](../related-projects/bwa-mem3-bench.md)). The alignment records
+stay byte-identical (page size does not change alignments); only the `@PG`
+`CL:` header field differs, since it records the `--huge-pages` option on the
+command line. Reserve some 1 GB hugepages on the host, then pass `--huge-pages` —
+it sizes the reservation from the index and is a safe no-op when the pool is
+missing or too small. Needs the shipping mimalloc build (`bwa-mem3 version`
+reports `(active)`); 1 GB HugeTLB support is host-dependent, so reserve only when
+the pool exists.
+
+`nr_hugepages` is a **host-wide total**, not a delta: `echo 16` sets the whole
+1 GB pool to 16 pages (it does not add 16), so on a shared host writing an
+absolute value below the current pool shrinks it under other processes — read the
+current count first and pick a non-decreasing target.
 
 ```bash
-N=14   # hg38 example; size to your reference
-if bwa-mem3 version | grep -q 'mimalloc.*(active)' \
-   && [ -d /sys/kernel/mm/hugepages/hugepages-1048576kB ]; then
-    echo "$N" | sudo tee /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages
-    MIMALLOC_RESERVE_HUGE_OS_PAGES="$N" bwa-mem3 mem ref.fa r1.fq r2.fq > out.sam
-else
-    echo "1 GB huge pages unavailable (need active mimalloc + 1 GB HugeTLB); running on default pages"
+if [ -d /sys/kernel/mm/hugepages/hugepages-1048576kB ]; then
+    echo 16 | sudo tee /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages
 fi
+bwa-mem3 mem --huge-pages ref.fa r1.fq r2.fq > out.sam
 ```
 
-This is host configuration (privileged, pinned RAM, sized to the reference), so
-it is opt-in, not a default, and Linux-only. See
+This is host configuration (privileged, pinned RAM), so the flag is opt-in, not a
+default, and Linux-only. See
 [Memory allocator → Large pages for the index](../user-guide/allocator.md#large-pages-for-the-index-linux-deployment-lever).
 
 ## Summary table
@@ -187,7 +194,7 @@ it is opt-in, not a default, and Linux-only. See
 | SMEM deduplication | `--smem-dedup`; ~10 % fewer SA lookups; opt-in, not byte-identical | [Features → --smem-dedup](../whats-different/features.md#--smem-dedup-smem-deduplication) |
 | Reproducible output | `-K INT`; pins the batch size so output does not move with `-t` | [Aligning → `-K`](../user-guide/aligning.md) |
 | Pipeline overlap at very high `-t` | `--chunk-cap INT`; off by default, opt-in, not byte-identical | [`mem` → `--chunk-cap`](../cli/mem.md) |
-| 1 GB huge pages for the index (Linux) | reserve `nr_hugepages` + `MIMALLOC_RESERVE_HUGE_OS_PAGES=N`; ~1.5 % lower wall on a 32-thread WGS slice, output byte-identical | [Memory allocator → Large pages](../user-guide/allocator.md#large-pages-for-the-index-linux-deployment-lever) |
+| 1 GB huge pages for the index (Linux) | reserve `nr_hugepages` (host-wide total), run `mem --huge-pages`; ~1.5 % lower wall on a 32-thread WGS slice (Zen3, avx2, warm page cache); alignment records byte-identical, only the `@PG` `CL:` field differs | [Memory allocator → Large pages](../user-guide/allocator.md#large-pages-for-the-index-linux-deployment-lever) |
 
 ---
 
