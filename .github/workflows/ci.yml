@@ -459,6 +459,19 @@ jobs:
           make bseq_read_pe_oob_test bseq_read_comment_copy_test
           ./bseq_read_pe_oob_test
           ./bseq_read_comment_copy_test
+      - name: kvec growth aborts on realloc failure
+        # Header-only standalone binary, forked like a death test: it forces the
+        # realloc behind kvec.h's growth macros to fail and asserts the child
+        # aborts with an out-of-memory diagnostic (SIGABRT) rather than leaking
+        # the old buffer and writing through the NULL realloc returns. On the
+        # real allocator realloc effectively never hands back NULL (overcommit +
+        # the OOM killer), so only a forced failure distinguishes the guarded
+        # path from the unguarded one. Arch-independent (pure C control flow, no
+        # SIMD), so it needs no arch_flag row-branching; CC comes from the
+        # job-level env.
+        run: |
+          make kvec_alloc_fail_test
+          ./kvec_alloc_fail_test
 
       - name: Run integration tests
         if: matrix.run_integration == true
