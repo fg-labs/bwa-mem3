@@ -193,6 +193,6 @@ no open upstream PR.
 **See also:**
 [Performance improvements](performance.md) ·
 [Architecture support](arch-support.md) ·
-[PR catalog](../reference/pr-catalog.md) ·
+[Fork changes vs. upstream](../reference/pr-catalog.md) ·
 [Developer Guide → Regression test framework](../developer-guide/regression-tests.md) ·
 [Performance → SIMD dispatch matrix](../performance/simd-dispatch.md)

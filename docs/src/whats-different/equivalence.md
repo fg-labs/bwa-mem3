@@ -478,9 +478,11 @@ The divergences described above are tracked as a structured registry in [bwa-mem
 
 ## Per-PR audit trail
 
-Every fork-carried change is listed — with its class and upstream bwa-mem2
-disposition — in the [PR catalog](../reference/pr-catalog.md). The declared
-divergence catalog above calls out the entries that actually affect output.
+The declared divergence catalog above calls out the fork changes that actually
+affect output. For the fork changes that were *proposed back upstream* — and
+where each stands — see [Fork changes vs. upstream](../reference/pr-catalog.md);
+the exhaustive per-PR change list lives in git history and the GitHub PR list, not
+in a hand-maintained table.
 
 ---
 
@@ -489,4 +491,4 @@ divergence catalog above calls out the entries that actually affect output.
 [Correctness fixes](correctness.md) ·
 [Performance improvements](performance.md) ·
 [Features](features.md) ·
-[PR catalog](../reference/pr-catalog.md)
+[Fork changes vs. upstream](../reference/pr-catalog.md)

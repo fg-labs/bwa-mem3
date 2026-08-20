@@ -105,4 +105,4 @@ for what runs and how to run it locally.
 [Developer Guide → Release process](../developer-guide/release.md) ·
 [Performance → PGO build](../performance/pgo.md) ·
 [Performance improvements](performance.md) ·
-[PR catalog](../reference/pr-catalog.md)
+[Fork changes vs. upstream](../reference/pr-catalog.md)

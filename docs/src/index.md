@@ -79,8 +79,8 @@ cd bwa-mem3 && make
   dispatch, regression tests, contributing.
 - **[Related Projects](related-projects/bwa-mem3-bench.md)** —
   bwa-mem3-bench, bwa-mem3-rs, fgumi, bwa-mem2 upstream.
-- **[Reference](reference/pr-catalog.md)** — PR catalog, glossary, citation,
-  license, changelog.
+- **[Reference](reference/pr-catalog.md)** — fork-vs-upstream disposition, glossary,
+  citation, license, changelog.
 
 ---
 
