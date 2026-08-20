@@ -486,7 +486,7 @@ void FMI_search::load_index(bool load_pac, int n_threads)
                              + sa_sample_cnt * (int64_t)sizeof(uint32_t);
         };
 
-        if (candidate > 0 && candidate < 63 &&
+        if (candidate >= 0 && candidate < 63 &&
             off_sent_for(candidate) + 2 * (int64_t)sizeof(int64_t) == file_size) {
             sa_compx = candidate;
         } else {
