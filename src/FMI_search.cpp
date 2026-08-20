@@ -279,6 +279,15 @@ void FMI_search::load_index_from_shm(uint8_t *base, size_t len)
     memcpy(&reference_seq_len, base + off,                                    sizeof(int64_t));
     memcpy(count,              base + off + sizeof(int64_t),                  sizeof(int64_t) * 5);
     memcpy(&sentinel_index,    base + off + sizeof(int64_t) * 6,              sizeof(int64_t));
+    /* sa_compx: the SA sample-rate shift the staged index was built with.
+     * IMPORTANT FIX: this used to stay at the constructor's compile-time
+     * default (SA_COMPX) because nothing here overrode it, so a non-default
+     * `-u`-built index attached via shm was mis-sized (sa_sample_count() and
+     * every sa_ms_byte/sa_ls_word index below used the wrong shift). Reading
+     * it from the packed scalars (see BWA_SHM_FMI_SCALARS_BYTES / the PACK
+     * side in bwa_shm.cpp) makes shm-attach agree with the disk loader's
+     * tail-detected rate. */
+    memcpy(&sa_compx,          base + off + sizeof(int64_t) * 7,              sizeof(int64_t));
 
     /* Validate scalars before we use reference_seq_len in cp_occ_size_bytes()
      * and the SA size accessors. Bounds match the disk path's asserts in
@@ -305,6 +314,17 @@ void FMI_search::load_index_from_shm(uint8_t *base, size_t len)
             (long long)sentinel_index, (long long)reference_seq_len);
         exit(EXIT_FAILURE);
     }
+    /* [0,6]: same range the -u CLI validates and write_fm_index_streaming
+     * enforces (the sample period 1<<sa_compx must divide CP_BLOCK_SIZE=64). */
+    if (sa_compx < 0 || sa_compx > 6) {
+        fprintf(stderr,
+            "ERROR! shm FMI_SCALARS: sa_compx=%lld out of bounds\n",
+            (long long)sa_compx);
+        exit(EXIT_FAILURE);
+    }
+    /* Only compute the mask once sa_compx is known to be in [0,6]; shifting by
+     * an out-of-range value (e.g. a corrupt -1 or 64) would be UB. */
+    sa_compx_mask = (1LL << sa_compx) - 1;
 
     if (bwa_shm_section_find(base, BWA_SHM_SEC_FMI_CP_OCC, &off, &sz) != 0
         || (int64_t)sz != cp_occ_size_bytes()) {
@@ -334,7 +354,7 @@ void FMI_search::load_index_from_shm(uint8_t *base, size_t len)
             (long)reference_seq_len, (long)sentinel_index);
 }
 
-int FMI_search::build_index(bool emit_unpacked_ref) {
+int FMI_search::build_index(bool emit_unpacked_ref, int sa_compx) {
 
     char *prefix = file_name;
 
@@ -386,6 +406,7 @@ int FMI_search::build_index(bool emit_unpacked_ref) {
     if (const char* mu = getenv("BWA_INDEX_MAX_MEMORY_USER"))
         opts.max_memory_user_specified = (mu[0] == '1');
     opts.emit_unpacked_ref = emit_unpacked_ref;
+    opts.sa_compx          = sa_compx;
     return libsais_build_fm_index(prefix, pac_len, opts);
 }
 

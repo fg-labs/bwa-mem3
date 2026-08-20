@@ -3095,6 +3095,14 @@ int main_mem(int argc, char *argv[])
      * skipping it saves ~1.6 GB on hg38. Outside --meth, load the pac as before. */
     aux.fmi->load_index(/*load_pac=*/!opt->meth_mode, /*n_threads=*/opt->n_threads);
     aux.shm_base = aux.fmi->shm_attached_base();
+    /* Report the LOADED sample rate, not the compile-time SA_COMPX default:
+     * a `bwa-mem3 index -u INT`-built index (or one attached from shm) can
+     * differ from it, and this is the first point after load_index() where
+     * aux.fmi->sa_compx reflects the real value (disk path: tail-detected
+     * in load_index; shm path: read from the packed FMI_SCALARS section). */
+    #if SA_COMPRESSION
+    fprintf(stderr, "* SA compression enabled with xfactor: %d\n", 1 << (int)aux.fmi->sa_compx);
+    #endif
     tprof[FMI][0] += __rdtsc() - tim;
 
 #if SMEM_LOCKSTEP_N > 1

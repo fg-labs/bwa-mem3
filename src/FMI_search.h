@@ -213,8 +213,10 @@ class FMI_search: public indexEle
 
     /* emit_unpacked_ref defaults false: skip writing the unpacked `<prefix>.0123`.
      * `mem` pac-fetches the original reference from `.pac`, so `.0123` is never
-     * read; pass true only to emit it for an external consumer (e.g. bwa-mem2). */
-    int build_index(bool emit_unpacked_ref = false);
+     * read; pass true only to emit it for an external consumer (e.g. bwa-mem2).
+     * sa_compx defaults to 3 (the historical rate); `bwa-mem3 index -u INT`
+     * threads its validated [0,6] value down to here via bwa_idx_build. */
+    int build_index(bool emit_unpacked_ref = false, int sa_compx = 3);
     /* load_pac=false skips loading the 2-bit packed reference (BNS only). D3
      * --meth uses this for the SEED index: seeding needs the FM-index + bns
      * (for the seed->original remap) but never the seed pac — extension/scoring

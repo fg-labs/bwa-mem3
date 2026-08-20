@@ -270,6 +270,7 @@ static void index_usage(void)
 	        "                     default: `mem` pac-fetches bases from `.pac`, so `.0123`\n"
 	        "                     is never read. Enable only for an external consumer that\n"
 	        "                     still requires it (e.g. bwa-mem2); ~8x the size of `.pac`.\n"
+	        "  -u INT             SA sample rate 1/(1<<INT) [3]\n"
 	        "  -h, --help         print this help message and exit\n");
 }
 
@@ -309,6 +310,7 @@ int bwa_index(int argc, char *argv[]) // the "index" command
 	int emit_unpacked_ref = 0;     // 0 => don't write <prefix>.0123 (mem pac-fetches)
 	int64_t user_max_memory = 0;   // 0 => auto default
 	int     user_threads    = 0;   // 0 => auto default
+	int     user_sa_compx   = 3;   // SA sample-rate shift; 3 reproduces the historical rate
 	static struct option long_opts[] = {
 		{"meth",              no_argument,       0, 1000},
 		{"max-memory",        required_argument, 0, 1001},
@@ -318,7 +320,7 @@ int bwa_index(int argc, char *argv[]) // the "index" command
 		{"help",              no_argument,       0, 'h'},
 		{0, 0, 0, 0}
 	};
-	while ((c = getopt_long(argc, argv, "p:t:h", long_opts, NULL)) >= 0) {
+	while ((c = getopt_long(argc, argv, "p:t:u:h", long_opts, NULL)) >= 0) {
 		if (c == 'p') prefix = optarg;
 		else if (c == 't') {
 			// Mirror parse_memory_spec's strict strtol parsing: atoi
@@ -332,6 +334,19 @@ int bwa_index(int argc, char *argv[]) // the "index" command
 				return 1;
 			}
 			user_threads = (int)t;
+		} else if (c == 'u') {
+			// Strict strtol, mirroring -t: reject non-numeric or
+			// numeric-prefix-garbage input rather than silently truncating.
+			// [0,6] is the writer's supported range (write_fm_index_streaming
+			// requires the sample period 1<<u to divide CP_BLOCK_SIZE=64).
+			char *end = NULL;
+			errno = 0;
+			long v = strtol(optarg, &end, 10);
+			if (errno || end == optarg || *end != '\0' || v < 0 || v > 6) {
+				fprintf(stderr, "[index] -u must be an integer in [0,6]\n");
+				return 1;
+			}
+			user_sa_compx = (int)v;
 		} else if (c == 1000) {
 			meth = 1;
 		} else if (c == 1001) {
@@ -422,12 +437,12 @@ int bwa_index(int argc, char *argv[]) // the "index" command
 		return rc;
 	}
 	if (prefix == 0) prefix = argv[optind];
-	int rc = bwa_idx_build(argv[optind], prefix, emit_unpacked_ref);
+	int rc = bwa_idx_build(argv[optind], prefix, emit_unpacked_ref, user_sa_compx);
 	if (rc == 0) warn_if_sidecar_hides_alt(prefix);
 	return rc;
 }
 
-int bwa_idx_build(const char *fa, const char *prefix, int emit_unpacked_ref)
+int bwa_idx_build(const char *fa, const char *prefix, int emit_unpacked_ref, int sa_compx)
 {
 	extern void bwa_pac_rev_core(const char *fn, const char *fn_rev);
 
@@ -442,7 +457,7 @@ int bwa_idx_build(const char *fa, const char *prefix, int emit_unpacked_ref)
 		fprintf(stderr, "%.2f sec\n", (float)(clock() - t) / CLOCKS_PER_SEC);
 		err_gzclose(fp);
         FMI_search *fmi = new FMI_search(prefix);
-        rc = fmi->build_index(emit_unpacked_ref);
+        rc = fmi->build_index(emit_unpacked_ref, sa_compx);
         delete fmi;
 	}
 	return rc;

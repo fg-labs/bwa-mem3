@@ -39,7 +39,13 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
  *   'B'=0x42 'W'=0x57 'A'=0x41 'M'=0x4D 'E'=0x45 'M'=0x4D '2'=0x32 '\0'=0x00
  * little-endian => bytes 0x42 0x57 0x41 0x4D 0x45 0x4D 0x32 0x00 read as u64. */
 #define BWA_SHM_MAGIC          0x00324D454D415742ull
-#define BWA_SHM_VERSION        1u
+/* Bumped 1 -> 2 when FMI_SCALARS grew from 56 to 64 bytes (sa_compx appended).
+ * A stale v1 segment would otherwise pass bwa_shm_attach() and then hard-fail
+ * the 64-byte FMI_SCALARS size check in load_index_from_shm() with no disk
+ * fallback; rejecting it at attach lets load_index() fall back to disk.
+ * Increment whenever any packed section layout (e.g. BWA_SHM_FMI_SCALARS_BYTES)
+ * changes. */
+#define BWA_SHM_VERSION        2u
 #define BWA_SHM_CTL_NAME       "/bwactl"
 #define BWA_SHM_IDX_PREFIX     "/bwaidx-"
 #define BWA_SHM_CTL_SIZE       0x10000   /* 64 KiB. Must equal bwa.h::BWA_CTL_SIZE
@@ -47,8 +53,11 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
                                           * bwa_shm.cpp will enforce equality once
                                           * that translation unit is added. */
 
-/* FMI_SCALARS section: int64_t reference_seq_len, count[5], sentinel_index. */
-#define BWA_SHM_FMI_SCALARS_BYTES (sizeof(int64_t) * 7)
+/* FMI_SCALARS section: int64_t reference_seq_len, count[5], sentinel_index,
+ * sa_compx. sa_compx (the SA sample-rate shift) is carried so a non-default
+ * `-u`-built index attached via shm is sized correctly rather than assuming
+ * the compile-time default. */
+#define BWA_SHM_FMI_SCALARS_BYTES (sizeof(int64_t) * 8)
 
 /* Section kinds — see implementation plan for what each holds. */
 #define BWA_SHM_SEC_FMI_SCALARS  1u
@@ -107,6 +116,7 @@ extern "C" {
 		int64_t  reference_seq_len;
 		int64_t  count[5];               /* +1-adjusted, ready to write */
 		int64_t  sentinel_index;
+		int64_t  sa_compx;                /* SA sample-rate shift; tail-detected from disk */
 		int64_t  ref_string_len;         /* file size of <prefix>.0123 */
 		uint64_t total_size;
 		uint32_t n_sections;

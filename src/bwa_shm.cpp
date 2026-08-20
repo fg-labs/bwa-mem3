@@ -287,8 +287,55 @@ int bwa_shm_compute(const char *prefix, bwa_shm_layout_t *layout, bool bns_only)
         layout->count[i] += 1;
     }
 
+    /* Peek the trailing sa_compx tag (written by write_fm_index_streaming,
+     * see fm_index_writer.cpp) before sizing the SA sample arrays: the tag's
+     * own offset scales with sa_compx, so it can't be seeked to directly
+     * without already knowing it. Mirrors FMI_search::load_index's disk-path
+     * detection exactly, so bwa_shm_compute (which sizes the shm segment)
+     * agrees with the loader it stages for. A legacy index (built before
+     * this field existed) has no tail; its last 8 bytes are sentinel_index
+     * and won't satisfy the check, so fall back to the historical rate. */
+    {
+        struct stat st;
+        /* A failed fstat() must not silently fall back to file_size=0: that
+         * would make the tail-detection below treat a genuinely non-default-
+         * rate index as legacy (rate 3), sizing this staged segment's SA-
+         * sample sections for the wrong rate. Fail the load instead of
+         * guessing, mirroring FMI_search::load_index's disk-path handling of
+         * the same fstat() call. */
+        if (fstat(fileno(cp), &st) != 0) {
+            fprintf(stderr, "[E::%s] fstat(%s) failed: %s\n",
+                    __func__, cp_path, strerror(errno));
+            err_fclose(cp);
+            bwa_shm_layout_free(layout);
+            return -1;
+        }
+        int64_t file_size = (int64_t)st.st_size;
+        int64_t candidate = -1;
+        if (file_size >= (int64_t)(2 * sizeof(int64_t)))
+            pread(fileno(cp), &candidate, sizeof(int64_t),
+                  file_size - (int64_t)sizeof(int64_t));
+
+        const int64_t ref_seq_len_for_tail = layout->reference_seq_len;
+        auto off_sent_for = [ref_seq_len_for_tail](int64_t compx) -> int64_t {
+            const int64_t cp_occ_cnt    = (ref_seq_len_for_tail >> CP_SHIFT) + 1;
+            const int64_t sa_sample_cnt = (ref_seq_len_for_tail >> compx) + 1;
+            return (int64_t)BWA_BWT_2BIT_HEADER_BYTES
+                 + cp_occ_cnt * (int64_t)sizeof(CP_OCC)
+                 + sa_sample_cnt * (int64_t)sizeof(int8_t)
+                 + sa_sample_cnt * (int64_t)sizeof(uint32_t);
+        };
+
+        if (candidate >= 0 && candidate < 63 &&
+            off_sent_for(candidate) + 2 * (int64_t)sizeof(int64_t) == file_size) {
+            layout->sa_compx = candidate;
+        } else {
+            layout->sa_compx = SA_COMPX;   // legacy default: index predates this field
+        }
+    }
+
     int64_t cp_occ_count = (layout->reference_seq_len >> CP_SHIFT) + 1;
-    int64_t sa_count     = (layout->reference_seq_len >> SA_COMPX) + 1;
+    int64_t sa_count     = (layout->reference_seq_len >> layout->sa_compx) + 1;
     int64_t cp_occ_bytes = cp_occ_count * (int64_t)sizeof(CP_OCC);
     int64_t sa_ms_bytes  = sa_count     * (int64_t)sizeof(int8_t);
     int64_t sa_ls_bytes  = sa_count     * (int64_t)sizeof(uint32_t);
@@ -406,6 +453,7 @@ int bwa_shm_pack_into(const bwa_shm_layout_t *layout, uint8_t *dest)
         memcpy(scratch,        &layout->reference_seq_len, sizeof(int64_t));
         memcpy(scratch + 8,    layout->count,              sizeof(int64_t) * 5);
         memcpy(scratch + 48,   &layout->sentinel_index,    sizeof(int64_t));
+        memcpy(scratch + 56,   &layout->sa_compx,          sizeof(int64_t));
         memcpy(dest + sec[0].offset, scratch, sizeof(scratch));
     }
 

@@ -68,15 +68,18 @@ int main(int argc, char *argv[]) {
 
     uint64_t off = 0, sz = 0;
 
-    /* FMI scalars: 8 (refseq_len) + 40 (count[5]) + 8 (sentinel_index) = 56. */
+    /* FMI scalars: 8 (refseq_len) + 40 (count[5]) + 8 (sentinel_index)
+     * + 8 (sa_compx) = 64. */
     section(BWA_SHM_SEC_FMI_SCALARS, &off, &sz);
-    CHECK_EQ(sz, 56ull);
-    int64_t got_refseq = 0, got_count[5] = {0}, got_sentinel = 0;
+    CHECK_EQ(sz, 64ull);
+    int64_t got_refseq = 0, got_count[5] = {0}, got_sentinel = 0, got_sa_compx = 0;
     std::memcpy(&got_refseq,   buf + off,            sizeof(int64_t));
     std::memcpy(got_count,     buf + off + 8,        sizeof(int64_t) * 5);
     std::memcpy(&got_sentinel, buf + off + 8 + 40,   sizeof(int64_t));
+    std::memcpy(&got_sa_compx, buf + off + 8 + 40 + 8, sizeof(int64_t));
     CHECK_EQ(got_refseq,   ref.reference_seq_len);
     CHECK_EQ(got_sentinel, ref.sentinel_index);
+    CHECK_EQ(got_sa_compx, ref.sa_compx);
     for (int i = 0; i < 5; ++i) CHECK_EQ(got_count[i], ref.count_data()[i]);
 
     /* CP_OCC. */
