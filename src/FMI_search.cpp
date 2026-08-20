@@ -225,6 +225,8 @@ FMI_search::FMI_search(const char *fname)
     fmi_build_path(file_name, sizeof(file_name), fname, "");
     reference_seq_len = 0;
     sentinel_index = 0;
+    sa_compx = SA_COMPX;
+    sa_compx_mask = SA_COMPX_MASK;
     sa_ls_word = NULL;
     sa_ms_byte = NULL;
     cp_occ = NULL;
@@ -257,7 +259,7 @@ int64_t FMI_search::cp_occ_size_bytes() const {
 }
 
 int64_t FMI_search::sa_sample_count() const {
-    return (reference_seq_len >> SA_COMPX) + 1;
+    return (reference_seq_len >> sa_compx) + 1;
 }
 
 void FMI_search::load_index_from_shm(uint8_t *base, size_t len)
@@ -463,7 +465,7 @@ void FMI_search::load_index(bool load_pac, int n_threads)
 
     #if SA_COMPRESSION
 
-    int64_t reference_seq_len_ = (reference_seq_len >> SA_COMPX) + 1;
+    int64_t reference_seq_len_ = (reference_seq_len >> sa_compx) + 1;
     int64_t sa_ms_bytes = reference_seq_len_ * sizeof(int8_t);
     int64_t sa_ls_bytes = reference_seq_len_ * sizeof(uint32_t);
     sa_ms_byte = (int8_t *)_mm_malloc(sa_ms_bytes, 64);
@@ -1909,10 +1911,10 @@ void FMI_search::get_sa_entries(SMEM *smemArray, int64_t *coordArray, int32_t *c
 // sa_compression
 int64_t FMI_search::get_sa_entry_compressed(int64_t pos, int tid)
 {
-    if ((pos & SA_COMPX_MASK) == 0) {
+    if ((pos & sa_compx_mask) == 0) {
         
         #if  SA_COMPRESSION
-        int64_t sa_entry = sa_ms_byte[pos >> SA_COMPX];
+        int64_t sa_entry = sa_ms_byte[pos >> sa_compx];
         #else
         int64_t sa_entry = sa_ms_byte[pos];     // simulation
         #endif
@@ -1920,7 +1922,7 @@ int64_t FMI_search::get_sa_entry_compressed(int64_t pos, int tid)
         sa_entry = sa_entry << 32;
         
         #if  SA_COMPRESSION
-        sa_entry = sa_entry + sa_ls_word[pos >> SA_COMPX];
+        sa_entry = sa_entry + sa_ls_word[pos >> sa_compx];
         #else
         sa_entry = sa_entry + sa_ls_word[pos];   // simulation
         #endif
@@ -1959,11 +1961,11 @@ int64_t FMI_search::get_sa_entry_compressed(int64_t pos, int tid)
             
             offset ++;
             // tprof[ALIGN1][tid] ++;
-            if ((sp & SA_COMPX_MASK) == 0) break;
+            if ((sp & sa_compx_mask) == 0) break;
         }
-        // assert((reference_seq_len >> SA_COMPX) - 1 >= (sp >> SA_COMPX));
+        // assert((reference_seq_len >> sa_compx) - 1 >= (sp >> sa_compx));
         #if  SA_COMPRESSION
-        int64_t sa_entry = sa_ms_byte[sp >> SA_COMPX];
+        int64_t sa_entry = sa_ms_byte[sp >> sa_compx];
         #else
         int64_t sa_entry = sa_ms_byte[sp];      // simultion
         #endif
@@ -1971,7 +1973,7 @@ int64_t FMI_search::get_sa_entry_compressed(int64_t pos, int tid)
         sa_entry = sa_entry << 32;
 
         #if  SA_COMPRESSION
-        sa_entry = sa_entry + sa_ls_word[sp >> SA_COMPX];
+        sa_entry = sa_entry + sa_ls_word[sp >> sa_compx];
         #else
         sa_entry = sa_entry + sa_ls_word[sp];      // simulation
         #endif
@@ -2008,10 +2010,10 @@ void FMI_search::get_sa_entries(SMEM *smemArray, int64_t *coordArray, int32_t *c
 // SA_COPMRESSION w/ PREFETCH
 int64_t FMI_search::call_one_step(int64_t pos, int64_t &sa_entry, int64_t &offset)
 {
-    if ((pos & SA_COMPX_MASK) == 0) {        
-        sa_entry = sa_ms_byte[pos >> SA_COMPX];        
+    if ((pos & sa_compx_mask) == 0) {        
+        sa_entry = sa_ms_byte[pos >> sa_compx];        
         sa_entry = sa_entry << 32;        
-        sa_entry = sa_entry + sa_ls_word[pos >> SA_COMPX];        
+        sa_entry = sa_entry + sa_ls_word[pos >> sa_compx];        
         // return sa_entry;
         return 1;
     }
@@ -2044,11 +2046,11 @@ int64_t FMI_search::call_one_step(int64_t pos, int64_t &sa_entry, int64_t &offse
         sp = count[b] + occ_sp;
         
         offset ++;
-        if ((sp & SA_COMPX_MASK) == 0) {
+        if ((sp & sa_compx_mask) == 0) {
     
-            sa_entry = sa_ms_byte[sp >> SA_COMPX];        
+            sa_entry = sa_ms_byte[sp >> sa_compx];        
             sa_entry = sa_entry << 32;
-            sa_entry = sa_entry + sa_ls_word[sp >> SA_COMPX];
+            sa_entry = sa_entry + sa_ls_word[sp >> sa_compx];
             
             sa_entry += offset;
             // return sa_entry;
@@ -2153,9 +2155,9 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
         map_pos[j] = i;   // map_ar[i] == i (see staging loop invariant)
         offset[j] = 0;
         
-        if ((pos & SA_COMPX_MASK) == 0) {
-            _mm_prefetch(&sa_ms_byte[pos >> SA_COMPX], _MM_HINT_T0);
-            _mm_prefetch(&sa_ls_word[pos >> SA_COMPX], _MM_HINT_T0);
+        if ((pos & sa_compx_mask) == 0) {
+            _mm_prefetch(&sa_ms_byte[pos >> sa_compx], _MM_HINT_T0);
+            _mm_prefetch(&sa_ls_word[pos >> sa_compx], _MM_HINT_T0);
         }
         else {
             int64_t occ_id_pp_ = pos >> CP_SHIFT;
@@ -2192,9 +2194,9 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
                     map_pos[k] = i++;   // map_ar[i] == i (staging invariant)
                     offset[k] = 0;
                     
-                    if ((pos & SA_COMPX_MASK) == 0) {
-                        _mm_prefetch(&sa_ms_byte[pos >> SA_COMPX], _MM_HINT_T0);
-                        _mm_prefetch(&sa_ls_word[pos >> SA_COMPX], _MM_HINT_T0);
+                    if ((pos & sa_compx_mask) == 0) {
+                        _mm_prefetch(&sa_ms_byte[pos >> sa_compx], _MM_HINT_T0);
+                        _mm_prefetch(&sa_ls_word[pos >> sa_compx], _MM_HINT_T0);
                     }
                     else {
                         int64_t occ_id_pp_ = pos >> CP_SHIFT;
@@ -2206,9 +2208,9 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
             }
             else {
                 working_set[k] = sp;
-                if ((sp & SA_COMPX_MASK) == 0) {
-                    _mm_prefetch(&sa_ms_byte[sp >> SA_COMPX], _MM_HINT_T0);
-                    _mm_prefetch(&sa_ls_word[sp >> SA_COMPX], _MM_HINT_T0);
+                if ((sp & sa_compx_mask) == 0) {
+                    _mm_prefetch(&sa_ms_byte[sp >> sa_compx], _MM_HINT_T0);
+                    _mm_prefetch(&sa_ls_word[sp >> sa_compx], _MM_HINT_T0);
                 }
                 else {
                     int64_t occ_id_pp_ = sp >> CP_SHIFT;

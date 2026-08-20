@@ -347,6 +347,8 @@ class FMI_search: public indexEle
     
     int64_t reference_seq_len;
     int64_t sentinel_index;
+    int64_t sa_compx;        // SA sample shift; sample rate 1/(1<<sa_compx). Loaded per-index.
+    int64_t sa_compx_mask;   // (1<<sa_compx)-1
 private:
         char file_name[PATH_MAX];
         int64_t count[5];
