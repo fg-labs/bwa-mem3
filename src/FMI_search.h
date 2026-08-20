@@ -46,6 +46,7 @@ Authors: Sanchit Misra <sanchit.misra@intel.com>; Vasimuddin Md <vasimuddin.md@i
 
 #include "read_index_ele.h"
 #include "bwa.h"
+#include "lockstep_width.h"  /* SMEM_LOCKSTEP_N (+ _MAX), runtime width + probe */
 
 #define DUMMY_CHAR 6
 
@@ -132,9 +133,10 @@ typedef struct smem_sort_scratch
 
 #define SAL_PFD 16
 
-#ifndef SMEM_LOCKSTEP_N
-#define SMEM_LOCKSTEP_N 16
-#endif
+/* SMEM_LOCKSTEP_N (phase-2 SMEM lockstep width, the compile-time floor/default
+ * and the enable guard) and SMEM_LOCKSTEP_N_MAX now live in lockstep_width.h,
+ * included above, alongside the runtime width g_smem_lockstep_n and the startup
+ * MLP probe that resolves it. */
 
 /* Lockstep depth for the third-pass (bwtSeedStrategy) re-seeding, tuned
  * separately from the phase-2 SMEM depth above. The third-pass lockstep is
