@@ -271,6 +271,17 @@ extern void bwamem3_dedup_sort_by_re_exact(int n, mem_alnreg_t *a);
 extern void bwamem3_dedup_sort_by_score(int n, mem_alnreg_t *a);
 extern void bwamem3_dedup_sort_by_score_exact(int n, mem_alnreg_t *a);
 
+// The permutation-gather sorts mem_sort_dedup_patch uses on the default path:
+// they sort a (key,index) permutation and gather the 112-byte records once,
+// dropping the per-call save-copy the tie-detection scheme otherwise pays. They
+// MUST reproduce the exact same array (permutation included) as the unconditional
+// ks_introsort oracle -- the whole correctness claim -- so they run through the
+// identical `agrees()` harness. Thin in-place wrappers (perm into a thread-local
+// buffer, then copy back) so the existing sort_fn harness can drive them; the
+// hot path calls the src->dst core directly and never copies back.
+extern void bwamem3_dedup_perm_sort_by_re(int n, mem_alnreg_t *a);
+extern void bwamem3_dedup_perm_sort_by_score(int n, mem_alnreg_t *a);
+
 namespace {
 
 // Deterministic 64-bit LCG. std::rand would make the fixtures platform-defined.
@@ -386,6 +397,70 @@ TEST_CASE("the by-score fast path is byte-identical to unconditional ks_introsor
         std::vector<mem_alnreg_t> in = random_regs(rng, 1 + t, 4);
         for (size_t i = 1; i < in.size(); i += 3) in[i] = in[i - 1];  // force exact duplicates
         CHECK(agrees(in, bwamem3_dedup_sort_by_score,
+                     bwamem3_dedup_sort_by_score_exact, tied_by_score, &saw_tie));
+    }
+    CHECK(saw_tie);
+}
+
+// ---------------------------------------------------------------------------
+// The permutation-gather sorts must be byte-identical to the same oracle
+// ---------------------------------------------------------------------------
+//
+// Same contract as the fast paths above, and tested the same way: not merely
+// "sorted" but the SAME ARRAY ks_introsort produces, element for element. The
+// permutation is what makes this non-trivial -- the (key,index) pairs are sorted
+// with klib's OWN ks_introsort, so on tied keys the gathered order can only match
+// if the two sorts applied the same permutation. These wrappers have no
+// DEDUP_PERM_MIN gate (that gate lives in mem_sort_dedup_patch), so the n-sweep
+// drives the permutation core directly at every n in [1, 150].
+
+TEST_CASE("the `re` permutation sort is byte-identical to unconditional ks_introsort"
+          * doctest::test_suite("unit/alnreg_sort_dedup")) {
+    const int TRIALS = 150;
+
+    SUBCASE("tie-free arrays") {
+        Rng rng(0x9e370001ULL);
+        bool saw_tie = false;
+        for (int t = 0; t < TRIALS; ++t)
+            CHECK(agrees(random_regs(rng, 1 + t, 0), bwamem3_dedup_perm_sort_by_re,
+                         bwamem3_dedup_sort_by_re_exact, tied_by_re, &saw_tie));
+        CHECK_FALSE(saw_tie);
+    }
+    SUBCASE("tie-heavy arrays (the introsort-on-pairs permutation)") {
+        Rng rng(0x9e370002ULL);
+        bool saw_tie = false;
+        for (int t = 0; t < TRIALS; ++t)
+            CHECK(agrees(random_regs(rng, 1 + t, 3), bwamem3_dedup_perm_sort_by_re,
+                         bwamem3_dedup_sort_by_re_exact, tied_by_re, &saw_tie));
+        CHECK(saw_tie);
+    }
+    SUBCASE("mixed arrays") {
+        Rng rng(0x9e370003ULL);
+        bool saw_tie = false;
+        for (int t = 0; t < TRIALS; ++t) {
+            const int n = 1 + t;
+            CHECK(agrees(random_regs(rng, n, n / 2 + 1), bwamem3_dedup_perm_sort_by_re,
+                         bwamem3_dedup_sort_by_re_exact, tied_by_re, &saw_tie));
+        }
+        CHECK(saw_tie);
+    }
+}
+
+TEST_CASE("the by-score permutation sort is byte-identical to unconditional ks_introsort"
+          * doctest::test_suite("unit/alnreg_sort_dedup")) {
+    Rng rng(0x9e370004ULL);
+    bool saw_tie = false;
+    for (int t = 0; t < 150; ++t) {
+        std::vector<mem_alnreg_t> in = random_regs(rng, 1 + t, 4);
+        // Force a (score, rb, qb) tie, then perturb a NON-key field (seedcov) so
+        // the two records stay distinguishable by memcmp. Byte-identical dupes
+        // pass under either permutation, so the tie would prove nothing; with a
+        // distinct seedcov a wrong permutation on the tied pair is observable.
+        for (size_t i = 1; i < in.size(); i += 3) {
+            in[i] = in[i - 1];
+            in[i].seedcov = in[i - 1].seedcov + 1;
+        }
+        CHECK(agrees(in, bwamem3_dedup_perm_sort_by_score,
                      bwamem3_dedup_sort_by_score_exact, tied_by_score, &saw_tie));
     }
     CHECK(saw_tie);
