@@ -11,6 +11,11 @@ necessary. This page defines two profiles:
 The defaults ship as the drop-in profile. The recommended profile is **opt-in** — you turn it on
 with explicit flags — so upgrading bwa-mem3 never silently changes your alignments.
 
+> For the higher-level picture — how the drop-in default, `--compat`, and the `--fast` preset
+> differ in the alignments they produce — see
+> [Alignment modes: plain, `--compat`, `--fast`](../whats-different/modes.md). This page is the
+> detail on the individual recommended levers.
+
 **Which profile?**
 
 | Your situation | Profile | Invocation |

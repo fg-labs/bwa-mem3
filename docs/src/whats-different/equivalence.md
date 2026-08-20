@@ -12,6 +12,10 @@ Strip those two tags and those records are byte-for-byte identical — or pass <
 <strong>The supplementary gap is now closed.</strong> The residual <strong>+4 supplementary alignments</strong> has been re-measured on <code>e722ed0</code> (a build carrying <a href="https://github.com/fg-labs/bwa-mem3/pull/268">#268</a>) and is <strong>+0</strong>: on <code>wgs-5M</code>, <code>wes-5M</code> and <code>hic-1M</code> the full <em>alignment-record</em> stream is byte-identical to bwa-mem2 v2.2.1 once <code>MQ:i</code>/<code>HN:i</code> are stripped — 22.5 M records including 436 k supplementary alignments. That comparison covers alignment records only, not the header block. What remains open is the genome-wide, multi-sample re-run that would extend this past the cells named on this page. Treat every claim here as scoped to the evidence it cites, not as a guarantee across all inputs and architectures. (The opt-in <code>--fast</code> speed levers are a separate, deliberate deviation — see below.)
 </div>
 
+> New here? [Alignment modes: plain, `--compat`, `--fast`](modes.md) is the short, side-by-side
+> overview of the three ways to run bwa-mem3; this page is the detailed equivalence audit behind
+> the plain and `--compat` claims.
+
 As of **release 0.7.1**, the bwa-mem3 **drop-in profile** (plain `bwa-mem3 mem`, no
 extra flags) produces the **same primary alignment** as bwa-mem2 — same `FLAG`,
 `RNAME`, `POS`, `MAPQ`, `CIGAR`, `AS`, `XS` — on the data we have re-measured since
