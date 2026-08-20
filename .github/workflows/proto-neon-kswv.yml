@@ -78,6 +78,8 @@ jobs:
   prepare:
     name: prepare (holodeck + chr17 + reads)
     runs-on: ubuntu-24.04
+    # ~3 min warm; a cold cache installs holodeck via cargo and simulates reads.
+    timeout-minutes: 20
     steps:
       - name: Install apt dependencies
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends curl ca-certificates samtools
@@ -169,6 +171,8 @@ jobs:
     name: ${{ matrix.label }}
     needs: prepare
     runs-on: ${{ matrix.runs-on }}
+    # Build bwa-mem3 (cold: full clang-19 build) plus index and N_REPS mem runs.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -336,6 +340,8 @@ jobs:
     name: report (perf table + cross-arch SAM identity)
     needs: run-mem
     runs-on: ubuntu-24.04
+    # Downloads artifacts, renders tables, and md5s two sorted BAMs; quick.
+    timeout-minutes: 10
     steps:
       - name: Install apt dependencies
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends samtools
@@ -431,6 +437,8 @@ jobs:
   kswv:
     name: ${{ matrix.label }}
     runs-on: ${{ matrix.runs-on }}
+    # Unit-test tier sweep plus two `make clean` ASan rebuilds; ~4-6 min normally.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:

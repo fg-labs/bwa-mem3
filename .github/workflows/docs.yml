@@ -24,6 +24,9 @@ jobs:
   build:
     name: build mdbook + drift check CLI snippets
     runs-on: ubuntu-24.04
+    # ~3.5 min warm; a cold cargo cache rebuilds mdbook + plugins from source,
+    # so the ceiling accommodates a cold build while still failing a hung runner.
+    timeout-minutes: 30
     # Builds bwa-mem3 only to dump CLI help for the docs (compiler-agnostic), so
     # it opts out of the compiler floor and uses the runner's default compiler.
     env:
