@@ -7,7 +7,9 @@
 // curated edge cases. Runs on every CI matrix row (SSE4.1, AVX2, AVX2
 // clang, AVX2 no-mimalloc, multi-arch, ARM64 Linux, macOS ARM64).
 
+#include <cstdlib>
 #include <random>
+#include <string>
 #include <vector>
 
 #include "doctest/doctest.h"
@@ -239,6 +241,94 @@ TEST_CASE("kswv handles every curated edge case identically to scalar"
     SUBCASE("homopolymer A")        { check_pair_parity(bwa_tests::gen_homopolymer_pair(50, 0)); }
     SUBCASE("sub cluster len 10")   { check_pair_parity(bwa_tests::gen_sub_cluster_pair(rng, 100, 150, 40, 10)); }
     SUBCASE("20% N bases")          { check_pair_parity(bwa_tests::gen_with_n_bases_pair(rng, 100, 150, 20)); }
+}
+
+// The two-row (KSWV_NEON_U8_CELL_PAIR) and one-row (KSWV_NEON_U8_CELL) macros
+// restate the same u8-rescue recurrence, so a change applied to one but not the
+// other would diverge silently. rescue_rowpair_enabled() reads BWA3_RESCUE_ROWPAIR
+// on every call (the NEON u8 kernel only), so this drives one batch through
+// getScores8 with pairing off then on. Two gates:
+//   * strict all-field A/B (one-row == two-row) catches drift between the macros;
+//   * an INDEPENDENT scalar oracle on the one-row arm — the shared KSWV_U8_EPILOGUE
+//     means a bug there shifts BOTH arms together, so the A/B alone would stay
+//     green; the existing scalar-oracle cases run only the default (pairing-on)
+//     mode, leaving the one-row path without a reference otherwise.
+TEST_CASE("kswv u8 rescue: BWA3_RESCUE_ROWPAIR off == on, and one-row matches scalar"
+          * doctest::test_suite("unit/kswv")) {
+
+#if !defined(__ARM_NEON) && !defined(__aarch64__)
+    // BWA3_RESCUE_ROWPAIR gates only the NEON u8 rescue kernel; on x86 tiers
+    // run_kswv_batch dispatches to kswv256/512_u8 where both arms run identical
+    // code, so this case would pass without exercising the row-pair logic.
+    MESSAGE("skipped: BWA3_RESCUE_ROWPAIR affects the NEON u8 rescue kernel only");
+    return;
+#else
+    auto mat = bwa_tests::build_scoring_matrix(1, 4, 1);
+
+    std::mt19937 rng(1234);
+    auto pairs = build_edge_cases(rng);
+    // A few hundred bulk pairs is plenty: macro drift surfaces on the first
+    // affected cell, and each batch sweeps the full DP twice, so keep well under
+    // the ~100 ms per-case budget (the scalar-oracle cases above use 10k).
+    auto bulk  = build_bulk_random(rng, 300);
+    pairs.insert(pairs.end(), bulk.begin(), bulk.end());
+
+    // Independent oracle: scalar ksw_align2 for every pair.
+    std::vector<kswr_t> scalar_aln;
+    scalar_aln.reserve(pairs.size());
+    for (const auto &p : pairs) scalar_aln.push_back(bwa_tests::run_scalar_ksw(p, mat));
+
+    // Save/restore the caller's env so doctest run order can't leak the override
+    // into a sibling case that assumes the default (pairing on).
+    const char *saved = getenv("BWA3_RESCUE_ROWPAIR");
+    const std::string saved_val = saved ? saved : "";
+    const bool had_saved = saved != nullptr;
+
+    setenv("BWA3_RESCUE_ROWPAIR", "0", 1);
+    auto one_row = bwa_tests::run_kswv_batch(pairs, mat);
+    setenv("BWA3_RESCUE_ROWPAIR", "1", 1);
+    auto two_row = bwa_tests::run_kswv_batch(pairs, mat);
+
+    if (had_saved) setenv("BWA3_RESCUE_ROWPAIR", saved_val.c_str(), 1);
+    else           unsetenv("BWA3_RESCUE_ROWPAIR");
+
+    REQUIRE(one_row.size() == pairs.size());
+    REQUIRE(two_row.size() == pairs.size());
+
+    int drift = 0, oracle_mism = 0;
+    for (size_t i = 0; i < pairs.size(); i++) {
+        const kswr_t &a = one_row[i];
+        const kswr_t &b = two_row[i];
+        // (1) Strict all-field A/B: rowpair is the same kernel row-blocked, so the
+        // two arms must match exactly -- not the scalar-vs-batched tolerant compare.
+        const bool eq = a.score == b.score && a.te == b.te && a.qe == b.qe
+                     && a.score2 == b.score2 && a.te2 == b.te2
+                     && a.tb == b.tb && a.qb == b.qb;
+        if (!eq) {
+            ++drift;
+            CAPTURE(i); CAPTURE(pairs[i].tag);
+            CAPTURE(a.score); CAPTURE(b.score);
+            CAPTURE(a.te); CAPTURE(b.te); CAPTURE(a.qe); CAPTURE(b.qe);
+            CHECK(eq);
+        }
+        // (2) Independent oracle on the one-row arm: a bug in the shared epilogue
+        // shifts both arms together, so check one_row against scalar ksw_align2
+        // (tolerant compare — scalar vs batched has known-benign discrepancies).
+        const bool o_score  = bwa_tests::kswr_score_eq(scalar_aln[i], a);
+        const bool o_coord  = bwa_tests::kswr_coords_eq(scalar_aln[i], a);
+        const bool o_score2 = bwa_tests::kswr_score2_eq(scalar_aln[i], a);
+        if (!(o_score && o_coord && o_score2)) {
+            ++oracle_mism;
+            CAPTURE(i); CAPTURE(pairs[i].tag);
+            CAPTURE(scalar_aln[i].score); CAPTURE(a.score);
+            CHECK(o_score); CHECK(o_coord); CHECK(o_score2);
+        }
+    }
+    MESSAGE("rowpair off-vs-on drift=" << drift << ", one-row vs scalar mism="
+            << oracle_mism << " over " << pairs.size() << " pairs");
+    CHECK(drift == 0);
+    CHECK(oracle_mism == 0);
+#endif
 }
 
 #endif // BWA_TESTS_HAVE_KSWV
