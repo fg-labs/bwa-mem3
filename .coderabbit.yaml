@@ -123,7 +123,9 @@ reviews:
     - path: "src/{simd_compat.h,neon_utils.h,simd_dispatch.cpp,simd_dispatch.h,kernel_dispatch.h}"
       instructions: >-
         This is the SIMD abstraction and tier-dispatch layer. `simd_compat.h` is
-        the single point of platform detection; the ARM path routes through
+        the ARM-only sse2neon shim (it `#error`s if included on a non-ARM
+        target); platform/ISA detection lives in each kernel header's own `#if`
+        guard, not here. On ARM the path routes through
         sse2neon plus hand-written NEON helpers (`_mm_movemask_epi16`,
         `_mm_blendv_epi16_fast`) that must be semantically identical to the x86
         intrinsics they replace — verify lane order, signedness, and saturation
@@ -131,9 +133,11 @@ reviews:
         ladder that keys off a compiler-defined macro (`__SSE4_2__`, `__AVX2__`)
         rather than a runtime CPUID check, since some toolchains define a higher
         macro than the requested `-m` flag and the ladder then misreports the
-        tier; a new intrinsic used in a shared translation unit without a
-        definition in every platform branch of simd_compat.h (this breaks the
-        arm64 and SSE4.1 CI rows, which build the same sources); and any dispatch
+        tier; a new SSE/AVX intrinsic used in a shared kernel translation unit
+        that is not available on both targets — provided on x86 by the Intel
+        intrinsic headers and on ARM by sse2neon or a native-NEON helper in
+        simd_compat.h (a gap breaks the arm64 or SSE4.1 CI rows, which build the
+        same sources); and any dispatch
         change not exercised across all tiers by
         test/regression/all_tiers_parity.sh. Calibration, from a finding that
         cost a full golden-gate re-run to refute: the reference for a NEON
@@ -538,12 +542,13 @@ reviews:
           AVX-512BW, and ARM NEON. If this diff changes vectorized code, tier
           dispatch, or a SIMD_WIDTH-dependent buffer size, PASS only if the
           change is either tier-agnostic by construction (expressed through the
-          SIMD_WIDTH macros and the simd_compat.h abstraction, with no hardcoded
-          lane count and no raw intrinsic outside that header) or is covered by
-          an all-tiers parity check. FAIL if the change adds a raw intrinsic to a
-          shared translation unit without a corresponding definition in every
-          platform branch of simd_compat.h — that breaks the arm64 and SSE4.1 CI
-          rows. PASS if the diff touches no SIMD code.
+          SIMD_WIDTH macros with no hardcoded lane count — the kernels' SSE
+          intrinsics resolve to native SSE on x86 and to NEON via sse2neon on
+          ARM) or is covered by an all-tiers parity check. FAIL if the change
+          adds an SSE/AVX intrinsic to a shared kernel translation unit that is
+          not available on both targets — native on x86 and mapped by sse2neon
+          (or a native-NEON helper in simd_compat.h) on ARM — since that breaks
+          the arm64 or SSE4.1 CI rows. PASS if the diff touches no SIMD code.
 
   # NB: every tool defaults to enabled, so the `true` entries below change no
   # behavior — they are here to record which analyzers we consider load-bearing
