@@ -38,6 +38,7 @@ Authors: Sanchit Misra <sanchit.misra@intel.com>; Vasimuddin Md <vasimuddin.md@i
 #include <pthread.h>
 #include <unistd.h>       /* pread, _exit */
 #include <sys/mman.h>     /* munmap */
+#include <sys/stat.h>     /* fstat */
 #if defined(__linux__)
 #include <fcntl.h>        /* posix_fadvise */
 #endif
@@ -444,6 +445,55 @@ void FMI_search::load_index(bool load_pac, int n_threads)
     assert(reference_seq_len <= 0x7fffffffffL);
 
     fprintf(stderr, "* Reference seq len for bi-index = %lld\n", (long long)reference_seq_len);
+
+    // Peek the trailing sa_compx field (if present) before sizing the SA
+    // sample arrays below: off_sent -- the byte offset of the tail -- scales
+    // with sa_compx via sa_sample_cnt = (reference_seq_len >> sa_compx) + 1,
+    // so it cannot be seeked to directly without already knowing sa_compx.
+    // Instead, read a candidate value from the file's last 8 bytes (pread,
+    // so it doesn't disturb cpstream's buffered read position) and verify
+    // it makes the implied layout (header + cp_occ + SA samples at that
+    // rate + sentinel_index + tail) match the file's actual size on disk.
+    // A legacy index (built before this field existed) has no tail; its
+    // last 8 bytes are sentinel_index and won't satisfy the check, so we
+    // fall back to the historical rate (SA_COMPX == 3).
+    {
+        struct stat st;
+        /* A failed fstat() must not silently fall back to file_size=0: that
+         * would make the tail-detection below treat a genuinely non-default-
+         * rate index as legacy (rate 3), mis-sizing the SA-sample arrays and
+         * producing wrong seed coordinates with no diagnostic. Fail the load
+         * instead -- consistent with the ftello/fseeko error handling just
+         * above in fmi_pread_from_stream(). */
+        if (fstat(fileno(cpstream), &st) != 0) {
+            fprintf(stderr, "ERROR: fstat failed during index load: %s\n", strerror(errno));
+            exit(EXIT_FAILURE);
+        }
+        int64_t file_size = (int64_t)st.st_size;
+        int64_t candidate = -1;
+        if (file_size >= (int64_t)(2 * sizeof(int64_t)))
+            pread(fileno(cpstream), &candidate, sizeof(int64_t),
+                  file_size - (int64_t)sizeof(int64_t));
+
+        const int64_t ref_seq_len_for_tail = reference_seq_len;   // local copy: lambdas can't capture a class member by name
+        auto off_sent_for = [ref_seq_len_for_tail](int64_t compx) -> int64_t {
+            // Mirrors HDR_BYTES in fm_index_writer.cpp: ref_seq_len + count[5].
+            const int64_t hdr_bytes      = (int64_t)sizeof(int64_t) + 5 * (int64_t)sizeof(int64_t);
+            const int64_t cp_occ_cnt     = (ref_seq_len_for_tail >> CP_SHIFT) + 1;
+            const int64_t sa_sample_cnt  = (ref_seq_len_for_tail >> compx) + 1;
+            return hdr_bytes + cp_occ_cnt * (int64_t)sizeof(CP_OCC)
+                             + sa_sample_cnt * (int64_t)sizeof(int8_t)
+                             + sa_sample_cnt * (int64_t)sizeof(uint32_t);
+        };
+
+        if (candidate > 0 && candidate < 63 &&
+            off_sent_for(candidate) + 2 * (int64_t)sizeof(int64_t) == file_size) {
+            sa_compx = candidate;
+        } else {
+            sa_compx = SA_COMPX;   // legacy default: index predates this field
+        }
+        sa_compx_mask = (1LL << sa_compx) - 1;
+    }
 
     // create checkpointed occ
     int64_t cp_occ_size = (reference_seq_len >> CP_SHIFT) + 1;

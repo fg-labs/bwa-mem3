@@ -349,7 +349,7 @@ int libsais_build_fm_index(const char* prefix, int64_t pac_len,
         bwt_path.c_str(), buf_ptr,
         sa_ptr,
         /*sa_is_64bit=*/use_int64_sa,
-        N, count, &sentinel_index, T);
+        N, count, &sentinel_index, opts.sa_compx, T);
     std::fprintf(stderr,
             "[libsais_build] phase 3 (streaming FM-index write) %.2fs, sentinel_index=%lld; total %.2fs\n",
             elapsed_since(t3), (long long)sentinel_index, elapsed_since(t0));
