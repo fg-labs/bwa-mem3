@@ -5,5 +5,10 @@ int main() {
     unsigned long m = one_hot_mask_array[3];
     int pc = _mm_countbits_64(m);
     printf("CP_SHIFT=%d CP_MASK=%d popcount=%d\n", CP_SHIFT, CP_MASK, pc);
+
+    // link-check the facade symbols exist in libbwa.a:
+    FmiSeed *(*open)(const char*) = &fmi_seed_open;
+    void (*close)(FmiSeed*)       = &fmi_seed_close;
+    (void)open; (void)close;
     return 0;
 }

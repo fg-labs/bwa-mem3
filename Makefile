@@ -428,7 +428,7 @@ LDFLAGS += $(HTSLIB_static_LDFLAGS)
 OBJS=		src/fastmap.o src/bwtindex.o src/utils.o src/kthread.o \
 			src/kstring.o src/bntseq.o src/bwamem.o src/seed_order.o src/profiling.o \
 			src/compat_target.o \
-			src/FMI_search.o src/read_index_ele.o src/bwamem_pair.o src/bwa.o \
+			src/FMI_search.o src/fmi_seed_api.o src/read_index_ele.o src/bwamem_pair.o src/bwa.o \
 			src/bwamem_extra.o src/kopen.o src/bam_writer.o src/meth_bam.o \
 			src/meth_xm.o \
 			src/packed_text.o src/fm_index_writer.o src/index_prelude.o \

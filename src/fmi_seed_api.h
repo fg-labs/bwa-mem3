@@ -60,4 +60,24 @@ typedef struct smem_struct
     int64_t k, l, s;
 }SMEM;
 
+/* ---- Opaque-handle facade over FMI_search. ----
+ * External consumers (e.g. minibwa's cp_occ backend) load an index, resolve
+ * SA entries, and read the raw cp_occ/count/sentinel arrays through this
+ * facade instead of including FMI_search.h and touching the full class.
+ * Stable: signatures here are API-breaking to change. */
+
+struct FmiSeed;                                             /* opaque handle */
+
+FmiSeed       *fmi_seed_open(const char *prefix);            /* new FMI_search + load_index() */
+void           fmi_seed_close(FmiSeed *h);                   /* delete */
+const CP_OCC  *fmi_seed_cp_occ(const FmiSeed *h);             /* cp_occ_data() */
+const int64_t *fmi_seed_count(const FmiSeed *h);              /* count_data() */
+int64_t        fmi_seed_sentinel(const FmiSeed *h);           /* sentinel_index */
+void           fmi_seed_sa_prefetch(FmiSeed *h, SMEM *smems, int64_t *coords,
+                    int64_t *coord_counts, int64_t n, int32_t max_occ,
+                    int tid, int64_t *id);                    /* get_sa_entries_prefetch */
+
+/* fmi_seed_sa_intv() (sampling-interval accessor) is reserved for a later PR
+ * (B2/M3); do not add it here. */
+
 #endif /* FMI_SEED_API_H */
