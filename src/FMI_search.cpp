@@ -492,9 +492,11 @@ void FMI_search::load_index(bool load_pac, int n_threads)
         }
         int64_t file_size = (int64_t)st.st_size;
         int64_t candidate = -1;
-        if (file_size >= (int64_t)(2 * sizeof(int64_t)))
-            pread(fileno(cpstream), &candidate, sizeof(int64_t),
-                  file_size - (int64_t)sizeof(int64_t));
+        if (file_size >= (int64_t)(2 * sizeof(int64_t))) {
+            ssize_t r = pread(fileno(cpstream), &candidate, sizeof(int64_t),
+                               file_size - (int64_t)sizeof(int64_t));
+            if (r != (ssize_t)sizeof(int64_t)) candidate = -1;
+        }
 
         const int64_t ref_seq_len_for_tail = reference_seq_len;   // local copy: lambdas can't capture a class member by name
         auto off_sent_for = [ref_seq_len_for_tail](int64_t compx) -> int64_t {
@@ -507,7 +509,7 @@ void FMI_search::load_index(bool load_pac, int n_threads)
                              + sa_sample_cnt * (int64_t)sizeof(uint32_t);
         };
 
-        if (candidate >= 0 && candidate < 63 &&
+        if (candidate >= 0 && candidate <= CP_SHIFT &&
             off_sent_for(candidate) + 2 * (int64_t)sizeof(int64_t) == file_size) {
             sa_compx = candidate;
         } else {

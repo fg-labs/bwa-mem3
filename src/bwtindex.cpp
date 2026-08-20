@@ -426,6 +426,10 @@ int bwa_index(int argc, char *argv[]) // the "index" command
 			fprintf(stderr, "ERROR: --meth does not accept -p (outputs <in.fasta>.* and <in.fasta>.meth.*)\n");
 			return 1;
 		}
+		if (user_sa_compx != 3) {
+			fprintf(stderr, "[index] -u is not supported with --meth\n");
+			return 1;
+		}
 		int rc = meth_index_build(argv[optind], emit_unpacked_ref,
 		                         resolved_mem, user_max_memory > 0);
 		/* The real reference only. The `.meth` seed index has no .alt of its own

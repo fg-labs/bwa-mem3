@@ -312,9 +312,11 @@ int bwa_shm_compute(const char *prefix, bwa_shm_layout_t *layout, bool bns_only)
         }
         int64_t file_size = (int64_t)st.st_size;
         int64_t candidate = -1;
-        if (file_size >= (int64_t)(2 * sizeof(int64_t)))
-            pread(fileno(cp), &candidate, sizeof(int64_t),
-                  file_size - (int64_t)sizeof(int64_t));
+        if (file_size >= (int64_t)(2 * sizeof(int64_t))) {
+            ssize_t r = pread(fileno(cp), &candidate, sizeof(int64_t),
+                               file_size - (int64_t)sizeof(int64_t));
+            if (r != (ssize_t)sizeof(int64_t)) candidate = -1;
+        }
 
         const int64_t ref_seq_len_for_tail = layout->reference_seq_len;
         auto off_sent_for = [ref_seq_len_for_tail](int64_t compx) -> int64_t {
