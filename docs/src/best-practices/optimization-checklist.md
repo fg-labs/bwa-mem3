@@ -147,6 +147,33 @@ locus. All uniquely-mapped reads are unaffected.
 > validation set). Do not enable in pipelines that compare output to a bwa-mem2
 > baseline.
 
+## 8. Reserve 1 GB huge pages for the index (Linux, opt-in)
+
+Seeding is memory-latency-bound. On Linux, backing the FM-index / suffix-array
+arrays with explicit 1 GB huge pages cuts data-TLB pressure for a small
+wall-time gain — ~1.5 % on a 5 M-read WGS slice (HG00096, hg38) at 32 threads.
+Output is byte-identical (page size does not change alignments). Because the
+allocator is mimalloc, the lever is one environment variable plus a host-side
+page reservation — no rebuild. `N` is the 1 GB page count, sized to the resident
+index (hg38 ≈ 11 GB → 14). It needs an active mimalloc build and 1 GB HugeTLB
+support, so the snippet fails closed on both (`bwa-mem3 version` must report
+`mimalloc … (active)`; a `USE_MIMALLOC=0` build silently ignores the reservation):
+
+```bash
+N=14   # hg38 example; size to your reference
+if bwa-mem3 version | grep -q 'mimalloc.*(active)' \
+   && [ -d /sys/kernel/mm/hugepages/hugepages-1048576kB ]; then
+    echo "$N" | sudo tee /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages
+    MIMALLOC_RESERVE_HUGE_OS_PAGES="$N" bwa-mem3 mem ref.fa r1.fq r2.fq > out.sam
+else
+    echo "1 GB huge pages unavailable (need active mimalloc + 1 GB HugeTLB); running on default pages"
+fi
+```
+
+This is host configuration (privileged, pinned RAM, sized to the reference), so
+it is opt-in, not a default, and Linux-only. See
+[Memory allocator → Large pages for the index](../user-guide/allocator.md#large-pages-for-the-index-linux-deployment-lever).
+
 ## Summary table
 
 | Item | Action | Reference |
@@ -160,6 +187,7 @@ locus. All uniquely-mapped reads are unaffected.
 | SMEM deduplication | `--smem-dedup`; ~10 % fewer SA lookups; opt-in, not byte-identical | [Features → --smem-dedup](../whats-different/features.md#--smem-dedup-smem-deduplication) |
 | Reproducible output | `-K INT`; pins the batch size so output does not move with `-t` | [Aligning → `-K`](../user-guide/aligning.md) |
 | Pipeline overlap at very high `-t` | `--chunk-cap INT`; off by default, opt-in, not byte-identical | [`mem` → `--chunk-cap`](../cli/mem.md) |
+| 1 GB huge pages for the index (Linux) | reserve `nr_hugepages` + `MIMALLOC_RESERVE_HUGE_OS_PAGES=N`; ~1.5 % lower wall on a 32-thread WGS slice, output byte-identical | [Memory allocator → Large pages](../user-guide/allocator.md#large-pages-for-the-index-linux-deployment-lever) |
 
 ---
 
