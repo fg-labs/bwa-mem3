@@ -2587,7 +2587,15 @@ int kswv::kswv256_16_impl(int16_t seq1SoA[],
             __m256i is_boundary = _mm256_srai_epi16(or_val, 15);
 
             __m256i m11 = _mm256_add_epi16(h00, sbt);
-            m11 = avx2_blendv_u8(is_boundary, zero_vec, m11);
+            /* Zero m11 on padding lanes. is_boundary is full-width (0x0000/
+             * 0xFFFF per lane), so andnot(is_boundary, m11) is byte-identical to
+             * blendv(m11, 0, is_boundary) but cheaper here: on this 16-bit kernel
+             * andnot lets clang-19 pick a tighter register allocation, measured
+             * at +8-10% on Intel Sapphire Rapids and neutral on AMD Zen3, avx2
+             * tier (issue #380). NB: the 8-bit twin at the top of this file keeps
+             * blendv on purpose — there andnot perturbs regalloc the other way
+             * and regresses ~2-3% on both vendors. */
+            m11 = _mm256_andnot_si256(is_boundary, m11);
 
             __m256i h11 = _mm256_max_epi16(m11, e11);
             h11 = _mm256_max_epi16(h11, f11);
