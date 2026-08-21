@@ -81,6 +81,12 @@
 #define NEON_ADDS_U8(a, b)   vqaddq_u8(a, b)
 #define NEON_ADDS_U16(a, b)  vqaddq_u16(a, b)
 
+/* Unsigned-saturating add of a SIGNED addend into an unsigned accumulator:
+ * clamp(a + (int8)b, 0, 255). NEON's USQADD; `b` is passed as uint8x16_t and
+ * reinterpreted, matching how the scoring table is laid out. The u8 mate-rescue
+ * diagonal uses it to fold the de-bias vqsubq_u8 out of the h00->m11 chain. */
+#define NEON_SQADD_U8(a, b)  vsqaddq_u8((a), vreinterpretq_s8_u8(b))
+
 /* Unsigned saturating subtract */
 #define NEON_SUBS_U8(a, b)   vqsubq_u8(a, b)
 #define NEON_SUBS_U16(a, b)  vqsubq_u16(a, b)

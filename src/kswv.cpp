@@ -33,6 +33,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "kernel_dispatch.h"
 #include "kswv.h"
 #include "limits.h"
+#include "utils.h"  /* xassert: release-active invariant guard */
 
 /* Column blocking for the u8 kernels' post-row query-end recovery. The row's
  * running max is checkpointed every QE_BLK columns, so the recovery scans only
@@ -531,9 +532,29 @@ void kswv::kswvBatchWrapper8(SeqPair *pairArray,
     return;
 }
 
-/* Thin dispatcher: route to the HasFreed template instantiation. The <false>
- * path dead-code-eliminates every freed-cell override → byte-identical to the
- * pre-issue-173 kernel for symmetric (non-meth) matrices. */
+/* USQADD: apply the substitution score with a single
+ * vsqaddq_u8 (AArch64 USQADD, unsigned-saturating accumulate of a SIGNED addend)
+ * on a signed-delta score table, instead of the biased vqaddq_u8 + de-biasing
+ * vqsubq_u8 pair. One op fewer, and it removes the de-bias from the DIAGONAL
+ * loop-carried chain (h00 -> m11 -> h11), shortening the critical path of this
+ * latency-bound kernel. Byte-identical: usqadd(h00, delta) == clamp(h00+delta,
+ * 0, 255), the exact value the biased pair produces in the non-saturating range
+ * the assert below guarantees; the H domain is unbiased in BOTH forms (the bias
+ * cancels within the cell), so every downstream H comparison is unchanged.
+ * Default ON; BWA3_RESCUE_USQADD=0 restores the biased form. Monomorphised as a
+ * template bool (folds like HasFreed), never a per-cell branch. */
+static bool rescue_usqadd_enabled()
+{
+    static bool on = [] {
+        const char *e = getenv("BWA3_RESCUE_USQADD");
+        return !e || e[0] != '0';
+    }();
+    return on;
+}
+
+/* Thin dispatcher: route to the HasFreed × USQADD template instantiation. The
+ * <false> HasFreed path dead-code-eliminates every freed-cell override →
+ * byte-identical to the pre-issue-173 kernel for symmetric (non-meth) matrices. */
 int kswv::kswv_neon_u8(uint8_t seq1SoA[],
                        uint8_t seq2SoA[],
                        int16_t nrow,
@@ -545,14 +566,22 @@ int kswv::kswv_neon_u8(uint8_t seq1SoA[],
                        int32_t numPairs,
                        int phase)
 {
-    return has_freed
-        ? kswv_neon_u8_impl<true>(seq1SoA, seq2SoA, nrow, ncol, p, aln,
-                                  po_ind, tid, numPairs, phase)
-        : kswv_neon_u8_impl<false>(seq1SoA, seq2SoA, nrow, ncol, p, aln,
-                                   po_ind, tid, numPairs, phase);
+    const bool usq = rescue_usqadd_enabled();
+    if (has_freed) {
+        return usq
+            ? kswv_neon_u8_impl<true, true>(seq1SoA, seq2SoA, nrow, ncol, p, aln,
+                                            po_ind, tid, numPairs, phase)
+            : kswv_neon_u8_impl<true, false>(seq1SoA, seq2SoA, nrow, ncol, p, aln,
+                                             po_ind, tid, numPairs, phase);
+    }
+    return usq
+        ? kswv_neon_u8_impl<false, true>(seq1SoA, seq2SoA, nrow, ncol, p, aln,
+                                         po_ind, tid, numPairs, phase)
+        : kswv_neon_u8_impl<false, false>(seq1SoA, seq2SoA, nrow, ncol, p, aln,
+                                          po_ind, tid, numPairs, phase);
 }
 
-template<bool HasFreed>
+template<bool HasFreed, bool USQADD>
 int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
                             uint8_t seq2SoA[],
                             int16_t nrow,
@@ -596,8 +625,35 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
     temp[8] = temp[9] = temp[10] = temp[11] = this->w_ambig;
     temp[12] = this->w_ambig;
 
-    for (int i = 0; i < 16; i++)
-        temp[i] += shift;
+    /* USQADD: the table holds the SIGNED deltas themselves and there is no bias
+     * (the single vsqaddq_u8 is clamp(h + delta, 0, 255) directly, the exact
+     * value the biased add+de-bias pair yields whenever the unbiased result is
+     * in [0,255] -- which holds for every live cell of the u8 tier, selected
+     * only when the max attainable score fits u8). The biased form instead adds
+     * `shift` to every entry here and removes it per cell. Byte-identity is
+     * gated per-field by the golden check. */
+    if (!USQADD) {
+        for (int i = 0; i < 16; i++)
+            temp[i] += shift;
+    }
+
+    /* The u8 tier is only selected when the max attainable score fits u8; that
+     * is what keeps every live cell's unbiased h+delta in [0,255], where USQADD
+     * (clamp) and the biased add+de-bias pair produce the identical value. Guard
+     * it: a param set that violated this would make the two forms DIVERGE
+     * SILENTLY (wrong score/XS/MAPQ), not crash.
+     *
+     * The bound is the max attainable score PLUS `shift`, not the score alone:
+     * the biased running value is stored as h+shift, so it saturates once
+     * ncol*w_match + shift exceeds 255 -- and there the biased form caps while
+     * USQADD (unbiased) keeps climbing, so the two diverge. The max SW score is
+     * the query columns times the match reward. The u8-tier width guard
+     * (l_ms*a < 250) keeps this well under 256 for real params, so this never
+     * fires in production; it only trips a pathological param set. Use xassert
+     * (release-active), since a violation is silent corruption, not a crash. */
+    xassert((int64_t)ncol * (int64_t)this->w_match + (int64_t)shift < 256,
+            "u8 rescue tier: max score + bias can saturate; USQADD and biased "
+            "forms would diverge -- the 16-bit tier must handle this score range");
 
     uint8x16_t permSft = vld1q_u8((const uint8_t*)temp);
     uint8x16_t sft_vec = vdupq_n_u8(shift);
@@ -789,7 +845,8 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
          * the same fr_val, so one freedval_vec covers the fold. */
         uint8x16_t freedval_vec, active_frread;
         if (HasFreed) {
-            freedval_vec = vdupq_n_u8((uint8_t)(fr_val + shift));
+            /* USQADD: signed delta fr_val (no +shift bias). */
+            freedval_vec = vdupq_n_u8((uint8_t)(fr_val + (USQADD ? 0 : (int)shift)));
             uint8x16_t rowfreed  = vceqq_u8(s1, vdupq_n_u8((uint8_t)fr_ref));
             uint8x16_t rowfreed2 = vceqq_u8(s1, vdupq_n_u8((uint8_t)fr_ref2));
             active_frread = vbslq_u8(rowfreed2, vdupq_n_u8((uint8_t)fr_read2),
@@ -822,7 +879,7 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
              * where no lane can hold one -- see the derivation above. */       \
             if (NEED_DUMMY) {                                                   \
                 uint8x16_t cmpq = vceqq_u8(s2, five_vec);                       \
-                sbt = vbslq_u8(cmpq, sft_vec, sbt);                             \
+                sbt = vbslq_u8(cmpq, USQADD ? zero_vec : sft_vec, sbt);         \
             }                                                                   \
                                                                                 \
             /* Apply the freed-cell override: force the biased freed score      \
@@ -835,9 +892,19 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
                 sbt = vbslq_u8(vceqq_u8(s2, active_frread), freedval_vec, sbt); \
             }                                                                   \
                                                                                 \
-            uint8x16_t m11 = vqaddq_u8(h00, sbt);                               \
-            if (APPLY_BND) m11 = vbslq_u8((BND), zero_vec, m11);                \
-            m11 = vqsubq_u8(m11, sft_vec);                                      \
+            /* Diagonal: USQADD applies the signed delta and clamps in one op,   \
+             * dropping the de-bias vqsubq_u8 from the h00->m11->h11 chain. The   \
+             * BND blend to zero still runs after (boundary cells -> 0 in both).  \
+             * The biased form: add, blend, then de-bias. */                      \
+            uint8x16_t m11;                                                       \
+            if (USQADD) {                                                         \
+                m11 = NEON_SQADD_U8(h00, sbt);                                    \
+                if (APPLY_BND) m11 = vbslq_u8((BND), zero_vec, m11);             \
+            } else {                                                             \
+                m11 = vqaddq_u8(h00, sbt);                                       \
+                if (APPLY_BND) m11 = vbslq_u8((BND), zero_vec, m11);             \
+                m11 = vqsubq_u8(m11, sft_vec);                                   \
+            }                                                                    \
                                                                                 \
             /* hme = max(m11, e11); reused verbatim for `me` (gap-D) below,     \
              * where the original code recomputed the identical max(m11,e11) -- \

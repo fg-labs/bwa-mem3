@@ -326,7 +326,7 @@ private:
 	/* Templated u8 kernel body. When HasFreed, applies the freed-cell
 	 * (fr_ref x fr_read -> fr_val) override per cell; otherwise the override
 	 * blocks compile out entirely. */
-	template<bool HasFreed>
+	template<bool HasFreed, bool USQADD>
 	int kswv_neon_u8_impl(uint8_t seq1SoA[],
 					      uint8_t seq2SoA[],
 					      int16_t nrow,
