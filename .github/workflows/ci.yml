@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  merge_group:
 
 # Least-privilege GITHUB_TOKEN. Without this block the token inherits the
 # repository default, which -- depending on the org/repo setting -- can be
