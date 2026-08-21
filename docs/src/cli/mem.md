@@ -837,6 +837,30 @@ for measured guidance and per-machine recommendations.
 See [User Guide — Threading and resource use](../user-guide/threading.md) for
 guidance on thread counts at various machine sizes.
 
+### Memory
+
+#### `--huge-pages` — back the index with 1 GB huge pages (Linux, opt-in)
+
+Reserve the FM-index / suffix-array structures on explicit **1 GB huge pages** to
+cut data-TLB misses in seeding. bwa-mem3's allocator is mimalloc, and this flag
+sizes the reservation from the index footprint and reserves it before the index
+loads. **Safe by default:** when the host has no free 1 GB hugepage pool (or too
+few pages), it prints a one-line `[M::]` note and runs on the default page size —
+it never fails or degrades a run.
+
+Requires 1 GB hugepages reserved on the host
+(`echo N | sudo tee /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages`).
+**Linux only**, needs the bundled mimalloc. The **alignment records are
+byte-identical** — page size does not affect alignments; only the `@PG` record
+differs, since its `CL:` field records the `--huge-pages` flag. Measured ~1.5 %
+whole-aligner wall on a 5 M-read WGS slice (HG00096, hg38), AMD Zen3, avx2 tier,
+32 threads ([PR #405](https://github.com/fg-labs/bwa-mem3/pull/405)) — a
+single-host, single-config measurement, not a cross-architecture or cross-thread
+claim. See
+[Memory allocator → Large pages for the index](../user-guide/allocator.md#large-pages-for-the-index-linux-deployment-lever)
+for reservation, verification, the measurement conditions, and the manual
+`MIMALLOC_RESERVE_HUGE_OS_PAGES` equivalent.
+
 ### Supplementary MAPQ rescoring
 
 #### `--supp-rep-hard-cap INT` — cap MAPQ for repetitive supplementary alignments
