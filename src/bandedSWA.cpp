@@ -1207,66 +1207,106 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
             }
         }
 
-        j256 = _mm256_set1_epi8(beg - i);   // diagonal offset of first band column
-#pragma unroll(4)
-        for(j = beg; j < end; j++)
-        {
-            __m256i f11, f21, sbt11;
-            h00 = _mm256_load_si256((__m256i *)(H_h + j * SIMD_WIDTH8));
-            f11 = _mm256_load_si256((__m256i *)(F + j * SIMD_WIDTH8));
-            sbt11 = _mm256_load_si256((__m256i *)(sbt_buf + j * SIMD_WIDTH8));
-
-            __m256i pj256 = j256;
-            j256 = _mm256_add_epi8(j256, one256);
-
-            MAIN_CODE8_CORE(sbt11, h00, h11, e11, f11, f21, zero256,
-                            e_ins256, oe_ins256,
-                            e_del256, oe_del256);
-
-            // Masked writing
-            __m256i cmp1 = _mm256_cmpgt_epi8(head256, pj256);
-            __m256i cmp2 = _mm256_cmpgt_epi8(pj256, tail256);
-            cmp1 = _mm256_or_si256(cmp1, cmp2);
-            h10 = _mm256_andnot_si256(cmp1, h10);
-            f21 = _mm256_andnot_si256(cmp1, f21);
-
-            __m256i bmaxRS = maxRS1;
-            maxRS1 =_mm256_max_epu8(maxRS1, h11);
-            // "new row-max" argmax mask. maxRS1 = max(bmaxRS,h11), so
-            // (maxRS1 != bmaxRS) is a strict subset of (maxRS1 == h11) (both
-            // mean h11 >= bmaxRS); the OR was redundant. cmpeq(maxRS1,h11) is
-            // the exact combined mask — bit-identical, drops a cmpeq+xor+or.
-            __m256i cmpA = _mm256_cmpeq_epi8(maxRS1, h11);
-            cmp1 = _mm256_cmpgt_epi8(j256, tail256);
-            cmp1 = _mm256_or_si256(cmp1, cmp2);
-            cmpA = _mm256_blendv_epi8(y1_256, j256, cmpA);
-            y1_256 = _mm256_blendv_epi8(cmpA, y1_256, cmp1);
-            maxRS1 = _mm256_blendv_epi8(maxRS1, bmaxRS, cmp1);
-
-            _mm256_store_si256((__m256i *)(F + j * SIMD_WIDTH8), f21);
-            _mm256_store_si256((__m256i *)(H_h + j * SIMD_WIDTH8), h10);
-
-            h10 = h11;
-
-            // gscore query-end capture (see smithWaterman128_8 for the full
-            // rationale: the re-baseline saturating-subtract zeroes off-diagonal
-            // query-end cells, so gscore cannot be reconstructed from the trimmed
-            // tail; capture (byte+B) per row and finalize wide). Fire exactly like
-            // the byte-identical 16-bit tier: col == qlen-1 (j256 == qlen_off) AND
-            // the band-grown tail reached the query end (tail256 == qlen_off ==
-            // scalar's end == qlen) AND in-band (qlen_valid) AND lane alive (exit0).
-            // gtle CONTRACT (see smithWaterman128_8): exact vs scalar for
-            // gscore > 0; may differ only in the unused gscore == 0 tail.
-            if (j >= minq)
-            {
-                __m256i cmp = _mm256_cmpeq_epi8(j256, qlen_off256);
-                cmp = _mm256_and_si256(cmp, _mm256_cmpeq_epi8(tail256, qlen_off256));
-                cmp = _mm256_and_si256(cmp, qlen_valid256);
-                cmp = _mm256_and_si256(cmp, exit0);
-                hqe256   = _mm256_blendv_epi8(hqe256, h11, cmp);
-                qfire256 = _mm256_blendv_epi8(qfire256, ff256, cmp);
+        // EXT-13: unmasked fast-regime bounds (see smithWaterman128_8). When every
+        // one of the 32 lanes is active the band mask is all-zero for pj in
+        // [max(head), min(tail)), so the middle sub-loop drops it. Not-all-active
+        // (finished/padding lane) leaves fast_lo == fast_hi == beg, so the whole
+        // band runs the masked body -- byte-identical to the un-split loop. Applied
+        // to the 8-bit tiers only; the parallel 16-bit kernels (smithWaterman*_16)
+        // share this band-mask shape but stay masked as the cold high-score fallback.
+        int fast_lo = beg, fast_hi = beg;
+        if (_mm256_movemask_epi8(exit0) == -1) {   // all 32 lanes' sign bits set
+            int8_t hh_[SIMD_WIDTH8] __attribute((aligned(SIMD_WIDTH8)));
+            int8_t tt_[SIMD_WIDTH8] __attribute((aligned(SIMD_WIDTH8)));
+            _mm256_store_si256((__m256i *) hh_, head256);
+            _mm256_store_si256((__m256i *) tt_, tail256);
+            int maxhead = -128, mintail = 127;
+            for (int l = 0; l < SIMD_WIDTH8; l++) {
+                if (hh_[l] > maxhead) maxhead = hh_[l];
+                if (tt_[l] < mintail) mintail = tt_[l];
             }
+            fast_lo = i + maxhead; if (fast_lo < beg) fast_lo = beg; if (fast_lo > end) fast_lo = end;
+            fast_hi = i + mintail; if (fast_hi < fast_lo) fast_hi = fast_lo; if (fast_hi > end) fast_hi = end;
         }
+
+        j256 = _mm256_set1_epi8(beg - i);   // diagonal offset of first band column
+
+#define EXT13_CELL8_256_COMMON \
+            __m256i f11, f21, sbt11; \
+            h00 = _mm256_load_si256((__m256i *)(H_h + j * SIMD_WIDTH8)); \
+            f11 = _mm256_load_si256((__m256i *)(F + j * SIMD_WIDTH8)); \
+            sbt11 = _mm256_load_si256((__m256i *)(sbt_buf + j * SIMD_WIDTH8)); \
+            __m256i pj256 = j256; (void) pj256; /* pre-increment col: masked body only */ \
+            j256 = _mm256_add_epi8(j256, one256); \
+            MAIN_CODE8_CORE(sbt11, h00, h11, e11, f11, f21, zero256, \
+                            e_ins256, oe_ins256, e_del256, oe_del256);
+#define EXT13_CELL8_256_GSCORE \
+            if (j >= minq) { \
+                __m256i cmp = _mm256_cmpeq_epi8(j256, qlen_off256); \
+                cmp = _mm256_and_si256(cmp, _mm256_cmpeq_epi8(tail256, qlen_off256)); \
+                cmp = _mm256_and_si256(cmp, qlen_valid256); \
+                cmp = _mm256_and_si256(cmp, exit0); \
+                hqe256   = _mm256_blendv_epi8(hqe256, h11, cmp); \
+                qfire256 = _mm256_blendv_epi8(qfire256, ff256, cmp); \
+            }
+        // Masked body: verbatim the pre-EXT-13 inline loop.
+#define EXT13_CELL8_256_MASKED { \
+            EXT13_CELL8_256_COMMON \
+            __m256i cmp1 = _mm256_cmpgt_epi8(head256, pj256); \
+            __m256i cmp2 = _mm256_cmpgt_epi8(pj256, tail256); \
+            cmp1 = _mm256_or_si256(cmp1, cmp2); \
+            h10 = _mm256_andnot_si256(cmp1, h10); \
+            f21 = _mm256_andnot_si256(cmp1, f21); \
+            __m256i bmaxRS = maxRS1; \
+            maxRS1 =_mm256_max_epu8(maxRS1, h11); \
+            __m256i cmpA = _mm256_cmpeq_epi8(maxRS1, h11); \
+            cmp1 = _mm256_cmpgt_epi8(j256, tail256); \
+            cmp1 = _mm256_or_si256(cmp1, cmp2); \
+            cmpA = _mm256_blendv_epi8(y1_256, j256, cmpA); \
+            y1_256 = _mm256_blendv_epi8(cmpA, y1_256, cmp1); \
+            maxRS1 = _mm256_blendv_epi8(maxRS1, bmaxRS, cmp1); \
+            _mm256_store_si256((__m256i *)(F + j * SIMD_WIDTH8), f21); \
+            _mm256_store_si256((__m256i *)(H_h + j * SIMD_WIDTH8), h10); \
+            h10 = h11; \
+            EXT13_CELL8_256_GSCORE \
+        }
+        // Debug-only (off by default) envelope guard; see BSW8_ASSERT_FAST8_128.
+#ifdef BSW8_ASSERT_ENVELOPE
+#define BSW8_ASSERT_FAST8_256(pjv, jpostv) \
+        do { \
+            __m256i _msk = _mm256_or_si256(_mm256_cmpgt_epi8(head256, (pjv)), \
+                                           _mm256_cmpgt_epi8((jpostv), tail256)); \
+            assert(_mm256_movemask_epi8(_msk) == 0 && \
+                   "EXT-13: EXT13_CELL8_256_FAST ran a column with a non-empty " \
+                   "band mask -- fast_lo/fast_hi no longer bound the in-band range"); \
+        } while (0)
+#else
+#define BSW8_ASSERT_FAST8_256(pjv, jpostv) ((void) 0)
+#endif
+        // Fast body: band mask all-ones here, so h/f stores go unmasked and the
+        // argmax updates without the cmp1 (out-of-band) exclusion.
+#define EXT13_CELL8_256_FAST { \
+            EXT13_CELL8_256_COMMON \
+            BSW8_ASSERT_FAST8_256(pj256, j256); \
+            maxRS1 =_mm256_max_epu8(maxRS1, h11); \
+            __m256i cmpA = _mm256_cmpeq_epi8(maxRS1, h11); \
+            y1_256 = _mm256_blendv_epi8(y1_256, j256, cmpA); \
+            _mm256_store_si256((__m256i *)(F + j * SIMD_WIDTH8), f21); \
+            _mm256_store_si256((__m256i *)(H_h + j * SIMD_WIDTH8), h10); \
+            h10 = h11; \
+            EXT13_CELL8_256_GSCORE \
+        }
+#pragma unroll(4)
+        for (j = beg; j < fast_lo; j++)   EXT13_CELL8_256_MASKED
+#pragma unroll(4)
+        for (j = fast_lo; j < fast_hi; j++) EXT13_CELL8_256_FAST
+#pragma unroll(4)
+        for (j = fast_hi; j < end; j++)   EXT13_CELL8_256_MASKED
+#undef EXT13_CELL8_256_COMMON
+#undef EXT13_CELL8_256_GSCORE
+#undef EXT13_CELL8_256_MASKED
+#undef EXT13_CELL8_256_FAST
+#undef BSW8_ASSERT_FAST8_256
         __m256i cmp1 = _mm256_cmpgt_epi8(head256, j256);
         __m256i cmp2 = _mm256_cmpgt_epi8(j256, tail256);
         cmp1 = _mm256_or_si256(cmp1, cmp2);
@@ -3048,64 +3088,103 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
             }
         }
 
-        j512 = _mm512_set1_epi8(beg - i);   // diagonal offset of first band column
-        for(j = beg; j < end; j++)
-        {
-            __m512i f11, f21, f31, f41, f51, jj512, sbt11;
-            h00 = _mm512_load_si512((__m512i *)(H_h + j * SIMD_WIDTH8));
-            f11 = _mm512_load_si512((__m512i *)(F + j * SIMD_WIDTH8));
-            sbt11 = _mm512_load_si512((__m512i *)(sbt_buf + j * SIMD_WIDTH8));
-
-            __m512i pj512 = j512;
-            j512 = _mm512_add_epi8(j512, one512);
-            
-            MAIN_CODE8_CORE(sbt11, h00, h11, e11, f11, f21, zero512,
-                            e_ins512, oe_ins512,
-                            e_del512, oe_del512);
-
-            // Masked writing
-            __mmask64 cmp2 = _mm512_cmpgt_epi8_mask(head512, pj512);
-            __mmask64 cmp1 = _mm512_cmpgt_epi8_mask(pj512, tail512);
-            cmp1 = cmp1 | cmp2;
-            h10 = _mm512_mask_blend_epi8(cmp1, h10, zero512);
-            f21 = _mm512_mask_blend_epi8(cmp1, f21, zero512);
-            
-            /* Part of main code MAIN_CODE */
-            __m512i bmaxRS = maxRS1, blend512;
-            maxRS1 =_mm512_max_epu8(maxRS1, h11);
-            // maxRS1 = max_epu8(bmaxRS,h11), so cmpgt(maxRS1,bmaxRS) is a strict
-            // subset of cmpeq(maxRS1,h11) (both mean h11 >= bmaxRS); the OR was
-            // redundant. cmpeq is the exact combined mask -- mirrors the AVX2
-            // twin, bit-identical, drops a cmpgt + kor per cell.
-            __mmask64 cmpA = _mm512_cmpeq_epi8_mask(maxRS1, h11);
-            cmp1 = _mm512_cmpgt_epi8_mask(j512, tail512);
-            cmp1 = cmp1 | cmp2;
-            blend512 = _mm512_mask_blend_epi8(cmpA, y1_512, j512);
-            y1_512 = _mm512_mask_blend_epi8(cmp1, blend512, y1_512);
-            maxRS1 = _mm512_mask_blend_epi8(cmp1, maxRS1, bmaxRS);                      
-
-            _mm512_store_si512((__m512i *)(F + j * SIMD_WIDTH8), f21);
-            _mm512_store_si512((__m512i *)(H_h + j * SIMD_WIDTH8), h10);
-
-            h10 = h11;
-                        
-            // gscore query-end capture (see smithWaterman128_8). Fire exactly like
-            // the byte-identical 16-bit tier: col == qlen-1 (j512 == qlen_off) AND
-            // band-grown tail reached the query end (tail512 == qlen_off == scalar's
-            // end == qlen) AND in-band (qlen_valid) AND lane alive (exit0 high bit).
-            // mask_blend(k, a, b) selects b where k, a where ~k.
-            // gtle CONTRACT (see smithWaterman128_8): exact vs scalar for
-            // gscore > 0; may differ only in the unused gscore == 0 tail.
-            if (j >= minq)
-            {
-                __mmask64 cmp = _mm512_cmpeq_epi8_mask(j512, qlen_off512);
-                cmp = cmp & _mm512_cmpeq_epi8_mask(tail512, qlen_off512);
-                cmp = cmp & qlen_valid_k;
-                cmp = cmp & _mm512_movepi8_mask(exit0);
-                hqe512   = _mm512_mask_blend_epi8(cmp, hqe512, h11);
-                qfire512 = _mm512_mask_blend_epi8(cmp, qfire512, ff512);
+        // EXT-13: unmasked fast-regime bounds (see smithWaterman128_8). When all 64
+        // lanes are active the band mask is empty for pj in [max(head), min(tail)),
+        // so the middle sub-loop drops it. Not-all-active leaves fast_lo == fast_hi
+        // == beg, so the band runs fully masked -- byte-identical to the un-split loop.
+        // Applied to the 8-bit tiers only; the parallel 16-bit kernels
+        // (smithWaterman*_16) share this band-mask shape but stay masked as the cold
+        // high-score fallback.
+        int fast_lo = beg, fast_hi = beg;
+        if (_mm512_movepi8_mask(exit0) == dmask) {   // all 64 lanes active
+            int8_t hh_[SIMD_WIDTH8] __attribute((aligned(SIMD_WIDTH8)));
+            int8_t tt_[SIMD_WIDTH8] __attribute((aligned(SIMD_WIDTH8)));
+            _mm512_store_si512((__m512i *) hh_, head512);
+            _mm512_store_si512((__m512i *) tt_, tail512);
+            int maxhead = -128, mintail = 127;
+            for (int l = 0; l < SIMD_WIDTH8; l++) {
+                if (hh_[l] > maxhead) maxhead = hh_[l];
+                if (tt_[l] < mintail) mintail = tt_[l];
             }
+            fast_lo = i + maxhead; if (fast_lo < beg) fast_lo = beg; if (fast_lo > end) fast_lo = end;
+            fast_hi = i + mintail; if (fast_hi < fast_lo) fast_hi = fast_lo; if (fast_hi > end) fast_hi = end;
         }
+
+        j512 = _mm512_set1_epi8(beg - i);   // diagonal offset of first band column
+
+#define EXT13_CELL8_512_COMMON \
+            __m512i f11, f21, sbt11; \
+            h00 = _mm512_load_si512((__m512i *)(H_h + j * SIMD_WIDTH8)); \
+            f11 = _mm512_load_si512((__m512i *)(F + j * SIMD_WIDTH8)); \
+            sbt11 = _mm512_load_si512((__m512i *)(sbt_buf + j * SIMD_WIDTH8)); \
+            __m512i pj512 = j512; (void) pj512; /* pre-increment col: masked body only */ \
+            j512 = _mm512_add_epi8(j512, one512); \
+            MAIN_CODE8_CORE(sbt11, h00, h11, e11, f11, f21, zero512, \
+                            e_ins512, oe_ins512, e_del512, oe_del512);
+#define EXT13_CELL8_512_GSCORE \
+            if (j >= minq) { \
+                __mmask64 cmp = _mm512_cmpeq_epi8_mask(j512, qlen_off512); \
+                cmp = cmp & _mm512_cmpeq_epi8_mask(tail512, qlen_off512); \
+                cmp = cmp & qlen_valid_k; \
+                cmp = cmp & _mm512_movepi8_mask(exit0); \
+                hqe512   = _mm512_mask_blend_epi8(cmp, hqe512, h11); \
+                qfire512 = _mm512_mask_blend_epi8(cmp, qfire512, ff512); \
+            }
+        // Masked body: verbatim the pre-EXT-13 inline loop.
+#define EXT13_CELL8_512_MASKED { \
+            EXT13_CELL8_512_COMMON \
+            __mmask64 cmp2 = _mm512_cmpgt_epi8_mask(head512, pj512); \
+            __mmask64 cmp1 = _mm512_cmpgt_epi8_mask(pj512, tail512); \
+            cmp1 = cmp1 | cmp2; \
+            h10 = _mm512_mask_blend_epi8(cmp1, h10, zero512); \
+            f21 = _mm512_mask_blend_epi8(cmp1, f21, zero512); \
+            __m512i bmaxRS = maxRS1, blend512; \
+            maxRS1 =_mm512_max_epu8(maxRS1, h11); \
+            __mmask64 cmpA = _mm512_cmpeq_epi8_mask(maxRS1, h11); \
+            cmp1 = _mm512_cmpgt_epi8_mask(j512, tail512); \
+            cmp1 = cmp1 | cmp2; \
+            blend512 = _mm512_mask_blend_epi8(cmpA, y1_512, j512); \
+            y1_512 = _mm512_mask_blend_epi8(cmp1, blend512, y1_512); \
+            maxRS1 = _mm512_mask_blend_epi8(cmp1, maxRS1, bmaxRS); \
+            _mm512_store_si512((__m512i *)(F + j * SIMD_WIDTH8), f21); \
+            _mm512_store_si512((__m512i *)(H_h + j * SIMD_WIDTH8), h10); \
+            h10 = h11; \
+            EXT13_CELL8_512_GSCORE \
+        }
+        // Debug-only (off by default) envelope guard; see BSW8_ASSERT_FAST8_128.
+#ifdef BSW8_ASSERT_ENVELOPE
+#define BSW8_ASSERT_FAST8_512(pjv, jpostv) \
+        do { \
+            __mmask64 _msk = _mm512_cmpgt_epi8_mask(head512, (pjv)) | \
+                             _mm512_cmpgt_epi8_mask((jpostv), tail512); \
+            assert(_msk == 0 && \
+                   "EXT-13: EXT13_CELL8_512_FAST ran a column with a non-empty " \
+                   "band mask -- fast_lo/fast_hi no longer bound the in-band range"); \
+        } while (0)
+#else
+#define BSW8_ASSERT_FAST8_512(pjv, jpostv) ((void) 0)
+#endif
+        // Fast body: band mask empty here, so h/f stores go unmasked and the argmax
+        // updates without the cmp1 (out-of-band) exclusion.
+#define EXT13_CELL8_512_FAST { \
+            EXT13_CELL8_512_COMMON \
+            BSW8_ASSERT_FAST8_512(pj512, j512); \
+            maxRS1 =_mm512_max_epu8(maxRS1, h11); \
+            __mmask64 cmpA = _mm512_cmpeq_epi8_mask(maxRS1, h11); \
+            y1_512 = _mm512_mask_blend_epi8(cmpA, y1_512, j512); \
+            _mm512_store_si512((__m512i *)(F + j * SIMD_WIDTH8), f21); \
+            _mm512_store_si512((__m512i *)(H_h + j * SIMD_WIDTH8), h10); \
+            h10 = h11; \
+            EXT13_CELL8_512_GSCORE \
+        }
+        for (j = beg; j < fast_lo; j++)   EXT13_CELL8_512_MASKED
+        for (j = fast_lo; j < fast_hi; j++) EXT13_CELL8_512_FAST
+        for (j = fast_hi; j < end; j++)   EXT13_CELL8_512_MASKED
+#undef EXT13_CELL8_512_COMMON
+#undef EXT13_CELL8_512_GSCORE
+#undef EXT13_CELL8_512_MASKED
+#undef EXT13_CELL8_512_FAST
+#undef BSW8_ASSERT_FAST8_512
         __mmask64 cmp1 = _mm512_cmpgt_epi8_mask(head512, j512);
         __mmask64 cmp2 = _mm512_cmpgt_epi8_mask(j512, tail512);
         cmp1 = cmp1 | cmp2;
@@ -4170,6 +4249,38 @@ static inline bool all_lanes_set8(__m128i mask)
     return vminvq_u8(vreinterpretq_u8_m128i(mask)) == 0xFF;
 #else
     return _mm_movemask_epi8(mask) == 0xFFFF;
+#endif
+}
+
+// hmax_epi8 / hmin_epi8: horizontal max / min of the 16 SIGNED bytes of a
+// 128-bit vector, for the EXT-13 per-row max(head)/min(tail) reduce. NEON has a
+// one-op reduce (vmaxvq_s8 / vminvq_s8); x86 has no single-op signed-byte
+// horizontal reduce, so fall back to a store + scalar lane loop -- identical
+// result, run once per row. Same two-way arch guard as the any_lane_set8 /
+// all_lanes_set8 reduces above (Apple Silicon defines __aarch64__). The 16 is
+// the __m128i byte count, not a tier lane count.
+static inline int hmax_epi8(__m128i v)
+{
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    return vmaxvq_s8(vreinterpretq_s8_m128i(v));
+#else
+    int8_t a[16] __attribute((aligned(16)));
+    _mm_store_si128((__m128i *) a, v);
+    int m = -128;
+    for (int l = 0; l < 16; l++) if (a[l] > m) m = a[l];
+    return m;
+#endif
+}
+static inline int hmin_epi8(__m128i v)
+{
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    return vminvq_s8(vreinterpretq_s8_m128i(v));
+#else
+    int8_t a[16] __attribute((aligned(16)));
+    _mm_store_si128((__m128i *) a, v);
+    int m = 127;
+    for (int l = 0; l < 16; l++) if (a[l] < m) m = a[l];
+    return m;
 #endif
 }
 
@@ -5246,6 +5357,73 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
         }                                                               \
     }
 
+// EXT-13: unmasked fast-regime twin of DP_CELL_BODY8_128. For columns where
+// EVERY active lane is strictly in band -- pj in [max(head), min(tail)) over
+// active lanes -- the band mask (head>pj)|(pj>tail) is provably all-zero, so the
+// two store blends AND the argmax's cmp1 exclusion all fold to identity. This
+// body drops them: it computes the DP cell, updates the row argmax unconditionally
+// (y1_128 <- j128 where h11 is the new max), and stores h10/f21 unmasked. Every
+// other observable -- h/e/f recurrence, the h10=h11 carry, and the gscore
+// query-end capture -- is bit-identical to the masked body. Callers MUST restrict
+// this to [fast_lo, fast_hi) computed from all_lanes_set8(exit0); outside that
+// range the mask is not all-ones and this body would corrupt out-of-band cells.
+// Debug-only (off by default) guard for the three EXT-13 fast bodies. Each is
+// correct only while EVERY lane's pre-increment column pj is in [head, tail): the
+// store mask (head>pj)|(pj>tail) and the argmax's (jpost>tail) exclusion both fold
+// to identity there. That precondition lives only in the fast_lo/fast_hi arithmetic
+// and comments, so a later change to the diagonal-offset band frame would silently
+// corrupt out-of-band H_h/F/maxRS1/y1 (changing score/qle/max_off). Build with
+// `make EXTRA_CXXFLAGS=-DBSW8_ASSERT_ENVELOPE` to trap loudly instead. Same opt-in
+// idiom as the BSW8_ASSERT_ENVELOPE byte-ceiling checks above.
+#ifdef BSW8_ASSERT_ENVELOPE
+#define BSW8_ASSERT_FAST8_128(pjv)                                             \
+    do {                                                                       \
+        __m128i _pj  = (pjv);                                                  \
+        __m128i _msk = _mm_or_si128(_mm_cmpgt_epi8(head128, _pj),              \
+                                    _mm_cmpgt_epi8(_mm_add_epi8(_pj, one128),  \
+                                                   tail128));                  \
+        assert(!any_lane_set8(_msk) &&                                         \
+               "EXT-13: DP_CELL_BODY8_128_FAST ran a column with a non-empty " \
+               "band mask -- fast_lo/fast_hi no longer bound the in-band range"); \
+    } while (0)
+#else
+#define BSW8_ASSERT_FAST8_128(pjv) ((void) 0)
+#endif
+#define DP_CELL_BODY8_128_FAST(sbt_pos, sbt_neg)                        \
+    {                                                                   \
+        __m128i f11, f21;                                               \
+        h00 = _mm_load_si128((__m128i *)(H_h + j * SIMD_WIDTH8));       \
+        f11 = _mm_load_si128((__m128i *)(F + j * SIMD_WIDTH8));         \
+                                                                        \
+        BSW8_ASSERT_FAST8_128(j128);                                    \
+        j128 = _mm_add_epi8(j128, one128);                             \
+                                                                        \
+        MAIN_CODE8_CORE_SPLIT(sbt_pos, sbt_neg, h00, h11, e11, f11, f21, zero128, \
+                              e_ins128, oe_ins128, e_del128, oe_del128); \
+                                                                        \
+        /* Unmasked argmax: cmp1 (out-of-band) is all-zero here, so the masked \
+         * body's `y1_128 = cmp1 ? y1_128 : (cmpA ? j128 : y1_128)` and         \
+         * `maxRS1 = cmp1 ? bmaxRS : maxRS1` reduce to the two lines below. */   \
+        maxRS1 = _mm_max_epu8(maxRS1, h11);                            \
+        __m128i cmpA = _mm_cmpeq_epi8(maxRS1, h11);                     \
+        y1_128 = blendv_fullmask8(y1_128, j128, cmpA);                  \
+                                                                        \
+        _mm_store_si128((__m128i *)(F + j * SIMD_WIDTH8), f21);         \
+        _mm_store_si128((__m128i *)(H_h + j * SIMD_WIDTH8), h10);       \
+                                                                        \
+        h10 = h11;                                                      \
+                                                                        \
+        if (j >= minq)                                                  \
+        {                                                               \
+            __m128i cmp = _mm_cmpeq_epi8(j128, qlen_off128);            \
+            cmp = _mm_and_si128(cmp, _mm_cmpeq_epi8(tail128, qlen_off128)); \
+            cmp = _mm_and_si128(cmp, qlen_valid128);                    \
+            cmp = _mm_and_si128(cmp, exit0);                            \
+            hqe128   = blendv_fullmask8(hqe128, h11, cmp);               \
+            qfire128 = blendv_fullmask8(qfire128, ff128, cmp);          \
+        }                                                               \
+    }
+
 
 // #define PFD 2 // SSE2
 void BandedPairWiseSW::getScores8(SeqPair *pairArray,
@@ -5883,34 +6061,74 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
         // s10 nor s2 is mutated by the DP body, so the fused score is identical to
         // the pre-pass score.
         j128 = _mm_set1_epi8(beg - i);   // diagonal offset of first band column
+
+        // EXT-13: unmasked fast-regime bounds. When EVERY lane is active the
+        // band mask (head>pj)|(pj>tail) is empty (all-zero) for columns pj in
+        // [max(head), min(tail)) over the lanes, so the middle sub-loop runs
+        // DP_CELL_BODY8_128_FAST (mask folded away). head128/tail128 are
+        // diagonal offsets (col - i), matching pj, so
+        // the column split is [i+max(head), i+min(tail)). When a lane has finished
+        // (exit0 zero) the all-lanes gate fails and fast_lo == fast_hi == beg, so
+        // the whole band falls through the third (masked) sub-loop -- byte-identical
+        // to the un-split loop. j128 is advanced only inside the cell bodies, so the
+        // three consecutive sub-loops carry it seamlessly. Applied to the 8-bit tiers
+        // only; the parallel 16-bit kernels (smithWaterman*_16) share this band-mask
+        // shape but stay masked as the cold high-score fallback.
+        int fast_lo = beg, fast_hi = beg;
+        if (all_lanes_set8(exit0)) {
+            // Horizontal max(head)/min(tail) over the lanes, run once per row,
+            // via the cross-ISA hmax_epi8 / hmin_epi8 helpers (NEON one-op reduce,
+            // x86 store + scalar fallback).
+            const int maxhead = hmax_epi8(head128);
+            const int mintail = hmin_epi8(tail128);
+            fast_lo = i + maxhead;
+            fast_hi = i + mintail;
+            if (fast_lo < beg) fast_lo = beg;
+            if (fast_lo > end) fast_lo = end;
+            if (fast_hi < fast_lo) fast_hi = fast_lo;
+            if (fast_hi > end) fast_hi = end;
+        }
+
+        // EXT-13 three-way band split, defined once: the masked/unmasked/masked
+        // sub-loops are identical across the three matrix branches -- only the
+        // per-cell score prologue (SBT_PROLOGUE, which declares sbt_pos/sbt_neg)
+        // differs. Parameterising it here keeps the beg->fast_lo->fast_hi->end
+        // traversal in one place so a future change can't drift between branches.
+#define EXT13_RUN_SPLIT8_128(SBT_PROLOGUE) \
+        do { \
+            for (j = beg; j < fast_lo; j++)     { SBT_PROLOGUE DP_CELL_BODY8_128(sbt_pos, sbt_neg); }      \
+            for (j = fast_lo; j < fast_hi; j++) { SBT_PROLOGUE DP_CELL_BODY8_128_FAST(sbt_pos, sbt_neg); } \
+            for (j = fast_hi; j < end; j++)     { SBT_PROLOGUE DP_CELL_BODY8_128(sbt_pos, sbt_neg); }      \
+        } while (0)
         if (!gen_mat) {
-            for (j = beg; j < end; j++) {
-                __m128i s2 = _mm_load_si128((__m128i *)(seq2SoA + j * SIMD_WIDTH8));
-                __m128i xor_ = _mm_xor_si128(s10, s2);
-                __m128i sbt_pos = shuffle_lut_lowidx8(pmat_pos128, xor_);
+#define EXT13_SBT8_XOR \
+                __m128i s2 = _mm_load_si128((__m128i *)(seq2SoA + j * SIMD_WIDTH8)); \
+                __m128i xor_ = _mm_xor_si128(s10, s2); \
+                __m128i sbt_pos = shuffle_lut_lowidx8(pmat_pos128, xor_); \
                 __m128i sbt_neg = shuffle_lut_lowidx8(pmat_neg128, xor_);
-                DP_CELL_BODY8_128(sbt_pos, sbt_neg);
-            }
+            EXT13_RUN_SPLIT8_128(EXT13_SBT8_XOR);
+#undef EXT13_SBT8_XOR
         } else if (fc.rank1) {
             __m128i rowfreed = _mm_cmpeq_epi8(s10, frref128);
-            for (j = beg; j < end; j++) {
-                __m128i s2 = _mm_load_si128((__m128i *)(seq2SoA + j * SIMD_WIDTH8));
-                __m128i sbt11;
-                SBT_PREPASS8_RANK1(s10, s2, rowfreed, sbt11, pmat128, match128, frread128);
-                __m128i sbt_pos, sbt_neg;
+#define EXT13_SBT8_RANK1 \
+                __m128i s2 = _mm_load_si128((__m128i *)(seq2SoA + j * SIMD_WIDTH8)); \
+                __m128i sbt11; \
+                SBT_PREPASS8_RANK1(s10, s2, rowfreed, sbt11, pmat128, match128, frread128); \
+                __m128i sbt_pos, sbt_neg; \
                 SBT_SPLIT8(sbt11, sbt_pos, sbt_neg, zero128);
-                DP_CELL_BODY8_128(sbt_pos, sbt_neg);
-            }
+            EXT13_RUN_SPLIT8_128(EXT13_SBT8_RANK1);
+#undef EXT13_SBT8_RANK1
         } else {
-            for (j = beg; j < end; j++) {
-                __m128i s2 = _mm_load_si128((__m128i *)(seq2SoA + j * SIMD_WIDTH8));
-                __m128i sbt11;
-                SBT_PREPASS8_AMAT(s10, s2, sbt11, amat128, w_ambig_128, three128);
-                __m128i sbt_pos, sbt_neg;
+#define EXT13_SBT8_AMAT \
+                __m128i s2 = _mm_load_si128((__m128i *)(seq2SoA + j * SIMD_WIDTH8)); \
+                __m128i sbt11; \
+                SBT_PREPASS8_AMAT(s10, s2, sbt11, amat128, w_ambig_128, three128); \
+                __m128i sbt_pos, sbt_neg; \
                 SBT_SPLIT8(sbt11, sbt_pos, sbt_neg, zero128);
-                DP_CELL_BODY8_128(sbt_pos, sbt_neg);
-            }
+            EXT13_RUN_SPLIT8_128(EXT13_SBT8_AMAT);
+#undef EXT13_SBT8_AMAT
         }
+#undef EXT13_RUN_SPLIT8_128
         __m128i cmp1 = _mm_cmpgt_epi8(head128, j128);
         __m128i cmp2 = _mm_cmpgt_epi8(j128, tail128);
         cmp1 = _mm_or_si128(cmp1, cmp2);
