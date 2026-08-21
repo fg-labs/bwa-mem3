@@ -1,5 +1,49 @@
 # Changelog
 
+## [0.10.0](https://github.com/fg-labs/bwa-mem3/compare/v0.9.0...v0.10.0) (2026-08-21)
+
+
+### Features
+
+* **cli:** add --hic as an alias for -5SP ([#372](https://github.com/fg-labs/bwa-mem3/issues/372)) ([d00d97d](https://github.com/fg-labs/bwa-mem3/commit/d00d97dbeec4646862f97ebcfb125e678a40ea5f)), closes [#368](https://github.com/fg-labs/bwa-mem3/issues/368)
+* **mem:** --huge-pages to back the index with 1 GB pages when available ([#405](https://github.com/fg-labs/bwa-mem3/issues/405)) ([371a181](https://github.com/fg-labs/bwa-mem3/commit/371a1819802c2962b768c3b165f0d1319a6a75b3))
+
+
+### Bug Fixes
+
+* **chain:** clamp mem_chain_weight to the width of mem_chain_t::w ([#376](https://github.com/fg-labs/bwa-mem3/issues/376)) ([ad3045f](https://github.com/fg-labs/bwa-mem3/commit/ad3045fe9b371dd8523451ccf9a5083e471aac13)), closes [#309](https://github.com/fg-labs/bwa-mem3/issues/309)
+* **compat:** model the all-chains-dropped divergence per --compat target ([#374](https://github.com/fg-labs/bwa-mem3/issues/374)) ([a73ada0](https://github.com/fg-labs/bwa-mem3/commit/a73ada0318ff2f19146183ad4fedd0a96b0ab384)), closes [#310](https://github.com/fg-labs/bwa-mem3/issues/310)
+* **kvec:** abort on realloc failure instead of leaking + NULL-deref ([#398](https://github.com/fg-labs/bwa-mem3/issues/398)) ([d199db1](https://github.com/fg-labs/bwa-mem3/commit/d199db15b0e1e15e15dcab67e7e69fb2ba13be3f))
+* **reader:** prevent a paired-end out-of-bounds write in bseq_read_fast ([#395](https://github.com/fg-labs/bwa-mem3/issues/395)) ([6fb093c](https://github.com/fg-labs/bwa-mem3/commit/6fb093c98824ce95483dc292a1bebd6e74101d0f))
+
+
+### Performance
+
+* **bandedSWA:** unmasked fast-regime for the fully-in-band extension columns ([#408](https://github.com/fg-labs/bwa-mem3/issues/408)) ([70c3baa](https://github.com/fg-labs/bwa-mem3/commit/70c3baa78b19f79a17c33c2e73ff160a7f7ed7da))
+* **bsw,kswv:** drop sse2neon translation overhead in the NEON banded-SW kernels ([#378](https://github.com/fg-labs/bwa-mem3/issues/378)) ([aecc30d](https://github.com/fg-labs/bwa-mem3/commit/aecc30d166a63e711d710f6b24186a74f9e35501))
+* **bsw:** drop a redundant per-cell argmax compare the AVX2 twin already dropped ([#379](https://github.com/fg-labs/bwa-mem3/issues/379)) ([0c68c84](https://github.com/fg-labs/bwa-mem3/commit/0c68c84ac8b038a816a4252c1378e05f49ac0cb5))
+* **bsw:** skip sse2neon's index-mask in the NEON score-LUT gathers ([#381](https://github.com/fg-labs/bwa-mem3/issues/381)) ([9f7514c](https://github.com/fg-labs/bwa-mem3/commit/9f7514c4dced93db91b3f68165be674b61200a36))
+* **classa:** stacked byte-identical local-opts (F3,L3,L7,L8,L17,L27) ([#387](https://github.com/fg-labs/bwa-mem3/issues/387)) ([f8bc444](https://github.com/fg-labs/bwa-mem3/commit/f8bc444d52169b125a9f65fd61b3378e8fe63e5a))
+* **dedup:** sort a (key,index) permutation, dropping the per-call save-copy ([#399](https://github.com/fg-labs/bwa-mem3/issues/399)) ([937c2fa](https://github.com/fg-labs/bwa-mem3/commit/937c2fac9a5996fb1a48f7cf54353527c4353957))
+* **kswv:** use andnot for the AVX2 16-bit rescue boundary-zero ([#401](https://github.com/fg-labs/bwa-mem3/issues/401)) ([b798992](https://github.com/fg-labs/bwa-mem3/commit/b7989929e1b8ab28e8601a1fa354aeb951042ba7))
+* **rescue:** fuse the u8 mate-rescue diagonal with USQADD ([#406](https://github.com/fg-labs/bwa-mem3/issues/406)) ([1d2e20f](https://github.com/fg-labs/bwa-mem3/commit/1d2e20fb8eb6618c8921f9bcfa6dd02ee5c5311c))
+* **rescue:** process the u8 mate-rescue kernel two target rows per pass ([#407](https://github.com/fg-labs/bwa-mem3/issues/407)) ([0020016](https://github.com/fg-labs/bwa-mem3/commit/0020016cf8ebe06605b6b576e9e00fe6703def05))
+* **seed:** auto-tune the phase-2 SMEM lockstep width at startup ([#393](https://github.com/fg-labs/bwa-mem3/issues/393)) ([6a7f146](https://github.com/fg-labs/bwa-mem3/commit/6a7f1466864a49e84f9638f72851e507eddd81a3))
+
+
+### Refactoring
+
+* **simd:** make simd_compat.h explicitly ARM-only; drop dead x86 branches ([#394](https://github.com/fg-labs/bwa-mem3/issues/394)) ([8cc29e3](https://github.com/fg-labs/bwa-mem3/commit/8cc29e3b73125679e9d4bc19c2c1870e6b203795))
+
+
+### Documentation
+
+* **bwamem:** document that the no-extension seedcov recompute is load-bearing ([#386](https://github.com/fg-labs/bwa-mem3/issues/386)) ([c0526e5](https://github.com/fg-labs/bwa-mem3/commit/c0526e55c86b46dda8fc231ec9cab9208f356111))
+* document 1 GB huge pages for the index as a Linux deployment lever ([#404](https://github.com/fg-labs/bwa-mem3/issues/404)) ([017925a](https://github.com/fg-labs/bwa-mem3/commit/017925a2381a1b4eede5f9400a963b127c32a7d8)), closes [#377](https://github.com/fg-labs/bwa-mem3/issues/377)
+* document plain, --compat, and --fast alignment modes ([#392](https://github.com/fg-labs/bwa-mem3/issues/392)) ([a6c3c86](https://github.com/fg-labs/bwa-mem3/commit/a6c3c861ed1cdb3d950ca04e58d8b210880fe52a))
+* note that -I leaves non-FR orientations without a distribution ([#370](https://github.com/fg-labs/bwa-mem3/issues/370)) ([236b270](https://github.com/fg-labs/bwa-mem3/commit/236b27099c8f7596a12aaae3de8e11a6797a8f33)), closes [#369](https://github.com/fg-labs/bwa-mem3/issues/369)
+* retire drifted PR catalog for a verified upstream-disposition record ([#400](https://github.com/fg-labs/bwa-mem3/issues/400)) ([593ca59](https://github.com/fg-labs/bwa-mem3/commit/593ca5959ed9a679666dd7dd34db8c7a2665e606))
+
 ## [0.9.0](https://github.com/fg-labs/bwa-mem3/compare/v0.8.0...v0.9.0) (2026-08-06)
 
 
