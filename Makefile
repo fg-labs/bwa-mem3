@@ -880,6 +880,21 @@ kt_for_pool_test: $(BWA_LIB) $(HTS_LIB) test/kt_for_pool_test.o
 bns_zero_calloc_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/bns_zero_calloc_test.o
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/bns_zero_calloc_test.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
 
+# Compile+link smoke test for the fmi_seed_api.h facade: proves the header's
+# extern "C" section and every declared symbol actually resolve against
+# libbwa.a, standing in for the external (e.g. minibwa) consumer build. Not
+# part of $(STANDALONE_TESTS)/`test:` -- it is a link-surface check, not a
+# behavioral regression test.
+.PHONY: smoke
+smoke: fmi_seed_api_smoke
+	./fmi_seed_api_smoke
+
+fmi_seed_api_smoke: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) $(if $(filter 1,$(USE_MIMALLOC)),$(MIMALLOC_LIB)) test/fmi_seed_api_smoke.o
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/fmi_seed_api_smoke.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) $(MIMALLOC_LDFLAGS) -o $@
+
+test/fmi_seed_api_smoke.o: test/fmi_seed_api_smoke.cpp
+	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
+
 # fast_reader is C (not C++); the implicit .c rule omits $(INCLUDES), so give
 # these objects explicit rules carrying the project include paths (incl.
 # libdeflate) and preprocessor defines.
