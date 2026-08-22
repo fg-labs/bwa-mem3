@@ -427,7 +427,7 @@ int bwa_index(int argc, char *argv[]) // the "index" command
 			return 1;
 		}
 		if (user_sa_compx != 3) {
-			fprintf(stderr, "[index] -u is not supported with --meth\n");
+			fprintf(stderr, "ERROR: --meth does not accept -u (SA sampling rate is fixed for meth indexes)\n");
 			return 1;
 		}
 		int rc = meth_index_build(argv[optind], emit_unpacked_ref,
