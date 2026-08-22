@@ -67,6 +67,11 @@ typedef struct smem_struct
  * Stable: signatures here are API-breaking to change. */
 
 struct FmiSeed;                                             /* opaque handle */
+typedef struct FmiSeed FmiSeed;               /* lets C consumers name the type */
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 FmiSeed       *fmi_seed_open(const char *prefix);            /* new FMI_search + load_index() */
 void           fmi_seed_close(FmiSeed *h);                   /* delete */
@@ -76,6 +81,10 @@ int64_t        fmi_seed_sentinel(const FmiSeed *h);           /* sentinel_index 
 void           fmi_seed_sa_prefetch(FmiSeed *h, SMEM *smems, int64_t *coords,
                     int64_t *coord_counts, int64_t n, int32_t max_occ,
                     int tid, int64_t *id);                    /* get_sa_entries_prefetch */
+
+#ifdef __cplusplus
+}
+#endif
 
 /* fmi_seed_sa_intv() (sampling-interval accessor) is reserved for a later PR
  * (B2/M3); do not add it here. */
