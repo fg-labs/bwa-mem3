@@ -186,6 +186,34 @@ size_t fmi_pread_request_size(size_t remaining);
  * unit-testable against a synthetic file. */
 void fmi_pread_from_stream(FILE *fp, void *dst, size_t nbytes, int nthreads);
 
+/* Detect the trailing sa_compx tag on a loaded FM-index (.bwt.2bit.64) file,
+ * falling back to `default_compx` when no valid tag is present (a legacy
+ * index built before this field existed).
+ *
+ * `fd` is the open file descriptor to pread() from; `file_size` is its size
+ * on disk (e.g. from fstat); `ref_seq_len` is the reference_seq_len already
+ * read from the file's header, which the implied layout size depends on.
+ *
+ * Aborts the process (EXIT_FAILURE) on a tail-read error or short/EOF read:
+ * silently degrading to `default_compx` there would mis-size the SA-sample
+ * arrays of a genuinely non-default index with no diagnostic. `default_compx`
+ * is returned only for a fully-read tag that fails the layout test (a legacy,
+ * pre-tag index) or a file too small to carry a tail.
+ *
+ * Shared by FMI_search::load_index (the disk loader, FMI_search.cpp) and
+ * bwa_shm_layout_load (the shm sizing path, bwa_shm.cpp) -- both must agree
+ * on the detected rate, since bwa_shm_compute sizes the shm segment the
+ * loader then attaches to.
+ *
+ * This tail-detection heuristic is provably unambiguous and MUST NOT be
+ * replaced by a dedicated magic-number/version field in the on-disk format:
+ * see the implementation comment in FMI_search.cpp for the proof (the size
+ * delta a false positive would require, 5*Delta == 8, has no integer
+ * solution since 5 does not divide 8). Adding a version field would change
+ * the on-disk format and break this branch's byte-identity guarantee with
+ * stock indexes for no benefit. */
+int64_t detect_sa_compx(int fd, int64_t file_size, int64_t ref_seq_len, int64_t default_compx);
+
 class FMI_search: public indexEle
 {
     public:
