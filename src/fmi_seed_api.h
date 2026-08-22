@@ -50,11 +50,15 @@ static const uint64_t one_hot_mask_array[64] = {
     0xfffffffffffffff0ULL, 0xfffffffffffffff8ULL, 0xfffffffffffffffcULL, 0xfffffffffffffffeULL,
 };
 
+/* `info` is unconditional (not gated on DEBUG): this struct crosses a
+ * library/consumer build boundary through fmi_seed_sa_prefetch, so its
+ * layout must be identical regardless of the DEBUG setting the library was
+ * built with vs. what a consumer TU defines when it includes this header.
+ * A conditional field here would silently desync array-element offsets and
+ * sizes between mismatched builds. */
 typedef struct smem_struct
 {
-#ifdef DEBUG
     uint64_t info; // for debug
-#endif
     uint32_t rid;
     uint32_t m, n;
     int64_t k, l, s;
@@ -73,14 +77,17 @@ typedef struct FmiSeed FmiSeed;               /* lets C consumers name the type 
 extern "C" {
 #endif
 
-FmiSeed       *fmi_seed_open(const char *prefix);            /* new FMI_search + load_index() */
+FmiSeed       *fmi_seed_open(const char *prefix);            /* new FMI_search + load_index(load_pac=false) */
 void           fmi_seed_close(FmiSeed *h);                   /* delete */
 const CP_OCC  *fmi_seed_cp_occ(const FmiSeed *h);             /* cp_occ_data() */
 const int64_t *fmi_seed_count(const FmiSeed *h);              /* count_data() */
 int64_t        fmi_seed_sentinel(const FmiSeed *h);           /* sentinel_index */
+/* get_sa_entries_prefetch(). max_occ <= 0 is a safe no-op (resolves nothing,
+ * does not forward to FMI_search): the underlying implementation divides by
+ * max_occ for any SMEM with s > max_occ. */
 void           fmi_seed_sa_prefetch(FmiSeed *h, SMEM *smems, int64_t *coords,
                     int64_t *coord_counts, int64_t n, int32_t max_occ,
-                    int tid, int64_t *id);                    /* get_sa_entries_prefetch */
+                    int tid, int64_t *id);
 
 #ifdef __cplusplus
 }

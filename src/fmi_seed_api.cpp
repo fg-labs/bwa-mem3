@@ -10,18 +10,24 @@
 struct FmiSeed { FMI_search *fmi; };
 
 FmiSeed *fmi_seed_open(const char *prefix) {
-    // Build the FMI_search fully before allocating the handle, so a throw out
-    // of `new FMI_search` or `load_index()` leaves nothing for the caller to
-    // leak -- there is no partially-constructed FmiSeed to clean up.
-    FMI_search *fmi = new FMI_search(prefix);
+    // Allocate the handle first (value-initialized, so h->fmi == nullptr), then
+    // build the FMI_search inside a try/catch. A throw out of `new FMI_search`,
+    // `load_index()`, or the handle allocation itself leaves nothing to leak: on
+    // a throw after the handle exists we delete both (delete of a null h->fmi is
+    // a no-op), and if `new FmiSeed()` itself throws there is nothing to clean up.
+    FmiSeed *h = new FmiSeed();
     try {
-        fmi->load_index();                // defaults: load_pac=true, n_threads=1
+        h->fmi = new FMI_search(prefix);
+        // load_pac=false: this facade exposes only FM-index seeding data
+        // (cp_occ/count/sentinel/SA resolution); the 2-bit packed reference
+        // is never read through it, so skip the ~1.6 GB load (see
+        // FMI_search::load_index's doc comment).
+        h->fmi->load_index(/*load_pac=*/false);
     } catch (...) {
-        delete fmi;
+        delete h->fmi;                    // null-safe if `new FMI_search` threw
+        delete h;
         throw;
     }
-    FmiSeed *h = new FmiSeed();
-    h->fmi = fmi;
     return h;
 }
 
@@ -45,5 +51,10 @@ int64_t fmi_seed_sentinel(const FmiSeed *h) {
 void fmi_seed_sa_prefetch(FmiSeed *h, SMEM *smems, int64_t *coords,
         int64_t *coord_counts, int64_t n, int32_t max_occ, int tid, int64_t *id) {
     if (!h) return;                       // precondition: h from a live fmi_seed_open()
+    // FMI_search::get_sa_entries_prefetch divides by max_occ for any SMEM
+    // with s > max_occ; max_occ <= 0 is a division by zero (or an invalid
+    // negative staging size) rather than a meaningful "resolve nothing"
+    // request. Reject it as a safe no-op instead of forwarding it.
+    if (max_occ <= 0) return;
     h->fmi->get_sa_entries_prefetch(smems, coords, coord_counts, n, max_occ, tid, *id);
 }
