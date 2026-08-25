@@ -81,7 +81,15 @@ int32_t bwa3_lockstep_width_parse_env(const char *env);
  * array of `n_blocks` fixed-size blocks; `word_off` is the byte offset of a
  * 64-bit word to read from each block. Returns the knee width (raw, pre-clamp),
  * or 0 if the array is absent or too small to measure (caller floors to the
- * default). ~10-20 ms; intended to run once at startup. */
+ * default). Each candidate in the sweep is measured on its own thread where
+ * possible (the seeding workers have not spawned yet, so -t's worth of cores
+ * are otherwise idle); a candidate whose thread cannot be created is measured
+ * inline instead, so a thread-count cap degrades to a sequential sweep rather
+ * than dropping candidates. On an idle host wall time trends toward the SLOWEST
+ * candidate rather than the sum of all of them. The actual speedup over a
+ * sequential sweep is hardware-dependent -- the candidates share CPU, LLC, and
+ * memory bandwidth -- and need not approach the candidate count.
+ * Intended to run once at startup. */
 int32_t bwa3_measure_mlp(const void *base, int64_t n_blocks,
                          size_t stride, size_t word_off);
 
