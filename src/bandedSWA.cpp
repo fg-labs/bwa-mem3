@@ -4516,14 +4516,23 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
         uint16_t qlen[SIMD_WIDTH16] __attribute__((aligned(64)));
         int32_t bsize = 0;
 
-        // PR: SoA N-encoding for the 128-bit 16-bit prepass. On the symmetric
-        // (!gen_mat) path the byte-LUT prepass needs the small asymmetric codes
-        // (ref-N=AMBIG=4, query-N=8, matching the 8-bit path) so XORs stay <=15;
-        // the generic-matrix (RANK1/AMAT) paths keep the legacy N=0xFFFF.
+        // SoA N-encoding for the 128-bit 16-bit prepass, chosen per architecture.
+        // On x86 (SSE4.1/4.2) the symmetric (!gen_mat) path uses the byte-LUT
+        // prepass, which needs the small asymmetric codes (ref-N=AMBIG=4, query-N=8,
+        // matching the 8-bit path) so XORs stay <=15; the generic-matrix (RANK1/AMAT)
+        // paths keep the legacy N=0xFFFF. On NEON the byte-LUT prepass is a measured
+        // ~3% regression (the vqtbl lookup + sign-extend cost more than the cheap
+        // SYM sequence it replaces on Neoverse), so the symmetric path stays on SYM
+        // and every path uses the legacy N=0xFFFF encoding SYM expects.
+#if defined(__ARM_NEON) || defined(__aarch64__)
+        const uint16_t ambRef = (uint16_t)0xFFFF;
+        const uint16_t ambQer = (uint16_t)0xFFFF;
+#else
         const bool gen_mat16 = bsw_generic_matrix(this->mat, this->w_match, this->w_mismatch)
                                || bsw_force_generic_matrix();
         const uint16_t ambRef = gen_mat16 ? (uint16_t)0xFFFF : (uint16_t)AMBIG;
         const uint16_t ambQer = gen_mat16 ? (uint16_t)0xFFFF : (uint16_t)8;
+#endif
 
         int16_t *H1 = H16_ + tid * SIMD_WIDTH16 * MAX_SEQ_LEN16;
         int16_t *H2 = H16__ + tid * SIMD_WIDTH16 * MAX_SEQ_LEN16;
@@ -4731,12 +4740,16 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
     __m128i amat128 = _mm_load_si128((__m128i *)amat_bytes);
     __m128i three128 = _mm_set1_epi16(3);                    // ACGT mask (base <= 3)
 
-    // PR: 16-byte int8 LUT for the symmetric-path byte-LUT prepass
+    // 16-byte int8 LUT for the x86 symmetric-path byte-LUT prepass
     // (SBT_PREPASS16_LUT128). Reuses build_pmat16 (the 8-bit XOR LUT); the small
     // asymmetric N-encoding (ref-N=4, query-N=8) from getScores16 keeps XOR<=15.
+    // NEON keeps the SYM prepass (the LUT form regresses there), so this LUT is
+    // built only for the x86 tiers that use it.
+#if !(defined(__ARM_NEON) || defined(__aarch64__))
     int8_t pmat16_bytes[16] __attribute__((aligned(16)));
     build_pmat16(pmat16_bytes, (int8_t)this->w_match, (int8_t)this->w_mismatch, (int8_t)this->w_ambig);
     __m128i pmat16_128 = _mm_load_si128((__m128i *)pmat16_bytes);
+#endif
 
     __m128i e_del128    = _mm_set1_epi16(this->e_del);
     __m128i oe_del128   = _mm_set1_epi16(this->o_del + this->e_del);
@@ -4889,7 +4902,12 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
             for (int jp = beg; jp < end; jp++) {
                 __m128i s2 = _mm_load_si128((__m128i *)(seq2SoA + jp * SIMD_WIDTH16));
                 __m128i sbt11;
+#if defined(__ARM_NEON) || defined(__aarch64__)
+                // NEON: SYM is cheaper than the byte-LUT prepass (see getScores16).
+                SBT_PREPASS16_SYM(s10, s2, sbt11, mismatch128, match128, w_ambig_128, ff128);
+#else
                 SBT_PREPASS16_LUT128(s10, s2, sbt11, pmat16_128);
+#endif
                 _mm_store_si128((__m128i *)(sbt_buf + jp * SIMD_WIDTH16), sbt11);
             }
         } else if (fc.rank1) {
