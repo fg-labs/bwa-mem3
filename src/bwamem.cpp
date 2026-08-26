@@ -37,6 +37,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "u8vec_scratch.h"
 #include "kvec.h"          /* kvec_t/kv_push/kv_resize used directly below */
 #include "pdqsort_wrap.h"
+#include "robin_hood.h"    /* per-batch DP-job dedup: missidx candidate map */
 #include <inttypes.h>      /* PRId64 for int64_t fprintf format strings */
 #include <strings.h>       /* strcasecmp in mem_opt_parse_meth_tags */
 #include <mutex>           /* BWAMEM3_DUMP_PAIRS append lock */
@@ -4237,14 +4238,179 @@ static inline void bsw_score_batch(BswMethTier tier, IBandedPairWiseSW *bsw,
     }
 }
 
-/* Pass-through wrapper over bsw_score_batch. Subsequent commits extend this
- * with per-batch extension-DP job dedup; at this commit it is the plain path. */
+struct BswJobId     { int32_t idr, idq, len1, len2, h0; };
+struct BswJobResult { int32_t score, tle, qle, gscore, gtle, max_off; };
+
+static inline void bsw_apply_result(SeqPair &sp, const BswJobResult &r)
+{
+    sp.score = r.score; sp.tle = r.tle; sp.qle = r.qle;
+    sp.gscore = r.gscore; sp.gtle = r.gtle; sp.max_off = r.max_off;
+}
+
+enum { BSW_DEDUP_OFF = 0, BSW_DEDUP_ON = 1, BSW_DEDUP_AUTO = 2 };
+/* Parse a dedup mode string. Returns -1 on an unrecognized value. Legacy
+ * numeric values from the experimental phase are accepted for pipeline
+ * compatibility: "1"/"perbatch" -> on; "4"/"net" -> auto; "2"(crossbatch) and
+ * "3"(adaptive) were removed -- they map to auto with a warning. */
+static int bsw_parse_dedup_mode(const char *e)
+{
+    if (!strcmp(e, "0") || !strcmp(e, "off"))                            return BSW_DEDUP_OFF;
+    if (!strcmp(e, "1") || !strcmp(e, "on") || !strcmp(e, "perbatch"))   return BSW_DEDUP_ON;
+    if (!strcmp(e, "auto") || !strcmp(e, "net") || !strcmp(e, "4"))      return BSW_DEDUP_AUTO;
+    if (!strcmp(e, "2") || !strcmp(e, "3")) {
+        fprintf(stderr, "[dedup] mode '%s' (crossbatch/adaptive) was removed; using 'auto'\n", e);
+        return BSW_DEDUP_AUTO;
+    }
+    return -1;
+}
+static inline int bsw_dedup_mode(void)   /* C2 form; replaced by cfg in C5 */
+{
+    static const int mode = []() -> int {
+        const char *e = getenv("BWAMEM3_DEDUP");
+        if (!e || !*e) return BSW_DEDUP_ON;   /* C2 default; C3 flips to AUTO */
+        int v = bsw_parse_dedup_mode(e);
+        if (v < 0) { fprintf(stderr, "[dedup] unrecognized BWAMEM3_DEDUP='%s'; expected off|on|auto\n", e); return BSW_DEDUP_ON; }
+        return v;
+    }();
+    return mode;
+}
+
+/* Fold up to LIMIT bytes from each END of `s` into `h`, eight bytes (one 64-bit
+ * word) at a time. Fingerprinting only the ends as words -- rather than hashing
+ * every byte scalar -- is what keeps dedup's cost a few percent of a job's DP
+ * instead of a third of it: a full byte-wise hash over the ~230-byte target
+ * would eat most of what the dedup saves. Fingerprint collisions are harmless
+ * because every candidate is byte-verified (bsw_job_eq / cache memcmp) before a
+ * result is reused, so this only needs to separate distinct jobs *well*, not
+ * perfectly. */
+static inline void bsw_hash_fold(uint64_t &h, const uint8_t *s, int len)
+{
+    const int LIMIT = 32;
+    auto mix = [&](const uint8_t *p, int n) {
+        int k = 0;
+        for (; k + 8 <= n; k += 8) {
+            uint64_t v; memcpy(&v, p + k, 8);
+            h ^= v; h *= 1099511628211ULL;
+        }
+        if (k < n) {                                   /* < 8-byte tail */
+            uint64_t v = 0;
+            for (int i = 0; k + i < n; i++) v |= (uint64_t)p[k + i] << (8 * i);
+            h ^= v; h *= 1099511628211ULL;
+        }
+    };
+    if (len <= 2 * LIMIT) mix(s, len);
+    else { mix(s, LIMIT); mix(s + len - LIMIT, LIMIT); }
+}
+
+static inline uint64_t bsw_job_hash(const uint8_t *s1, int len1,
+                                    const uint8_t *s2, int len2, int h0)
+{
+    uint64_t h = 1469598103934665603ULL;              /* FNV-1a offset basis */
+    h ^= ((uint64_t)(uint32_t)len1 << 32) | (uint32_t)len2;
+    h *= 1099511628211ULL;
+    h ^= (uint64_t)(uint32_t)h0;
+    h *= 1099511628211ULL;
+    bsw_hash_fold(h, s1, len1);
+    bsw_hash_fold(h, s2, len2);
+    return h;
+}
+
+/* Dedup wrapper over bsw_score_batch: score each distinct (seq1,seq2,h0) job
+ * once within this batch and copy its result to the repeats. Byte-identical to
+ * scoring all n: every candidate sharing a fingerprint is byte-verified
+ * (memcmp on both sequences) before its result is reused, so a fingerprint
+ * collision can only cost an extra memcmp, never a wrong or lost dedup. */
 static inline void bsw_tier_kernel(BswMethTier tier, IBandedPairWiseSW *bsw,
         SeqPair *pa, uint8_t *ref, uint8_t *qer, int n, int nthreads, int32_t w,
         SeqPair *sort_scratch, int32_t *hist)
 {
     if (n <= 0) return;
-    bsw_score_batch(tier, bsw, pa, ref, qer, n, nthreads, w, sort_scratch, hist);
+    const int mode = bsw_dedup_mode();
+    if (mode == BSW_DEDUP_OFF || n < 2) {
+        bsw_score_batch(tier, bsw, pa, ref, qer, n, nthreads, w, sort_scratch, hist);
+        return;
+    }
+
+    static thread_local std::vector<int>          miss_grp;    /* per pair: miss-group, or -1 if cache-resolved */
+    static thread_local std::vector<SeqPair>      repbuf;      /* one rep per distinct miss (to score) */
+    static thread_local std::vector<BswJobId>     miss_id;     /* per miss-group: identity (captured pre-scoring) */
+    static thread_local std::vector<BswJobResult> miss_res;    /* per miss-group: scored result */
+    static thread_local robin_hood::unordered_flat_map<uint64_t,std::vector<int>> missidx; /* content hash -> candidate miss-groups (this batch) */
+
+    miss_grp.assign(n, -1);
+    repbuf.clear();
+    missidx.clear();
+
+    for (int i = 0; i < n; i++) {
+        const uint8_t *s1 = ref + pa[i].idr; const int len1 = pa[i].len1;
+        const uint8_t *s2 = qer + pa[i].idq; const int len2 = pa[i].len2;
+        const int      h0 = pa[i].h0;
+        const uint64_t hv = bsw_job_hash(s1, len1, s2, len2, h0);
+
+        /* miss: dedup against distinct misses already seen in THIS batch. Every
+         * candidate sharing this fingerprint is byte-compared (per-bucket vector),
+         * so a fingerprint collision costs an extra memcmp -- it never SPLITS a
+         * true group and loses the dedup, which a single-slot map would on
+         * collision. */
+        int g = -1;
+        std::vector<int> &bucket = missidx[hv];   /* empty vector if new fingerprint */
+        for (int cand : bucket) {
+            const SeqPair &rep = repbuf[cand];
+            if (rep.len1 == len1 && rep.len2 == len2 && rep.h0 == h0
+                && memcmp(ref + rep.idr, s1, (size_t)len1) == 0
+                && memcmp(qer + rep.idq, s2, (size_t)len2) == 0) { g = cand; break; }
+        }
+        if (g < 0) {
+            g = (int)repbuf.size();
+            repbuf.push_back(pa[i]);
+            bucket.push_back(g);
+        }
+        miss_grp[i] = g;
+    }
+
+    const int m = (int)repbuf.size();
+    if (m > 0) {
+        /* capture identities BEFORE scoring permutes repbuf, and tag each rep's
+         * group in the unused `id` field. The kernels write `id` only on the
+         * padding lanes (pairArray[ii].id = ii for ii >= numPairs), never on a
+         * real slot, and sortPairsLen moves whole SeqPairs -- so id survives the
+         * reorder and identifies each scored rep's group with no second map
+         * (the old (seqid,regid) repkey2grp). */
+        miss_id.resize(m);
+        for (int g = 0; g < m; g++) {
+            miss_id[g] = BswJobId{repbuf[g].idr, repbuf[g].idq,
+                                  repbuf[g].len1, repbuf[g].len2, repbuf[g].h0};
+            repbuf[g].id = g;
+        }
+
+        /* The kernels write and (guardedly) prefetch padding lanes past
+         * numPairs; the caller's seqPair buffers are ALWAYS allocated as
+         * (numPairs-bound + MAX_LINE_LEN), so every kernel is written against
+         * that guaranteed slack. repbuf must honor the same contract -- a tight
+         * roundup(m, SIMD_WIDTH8) is not enough and overruns the heap. Value-
+         * initialization zeroes len1/len2/idr/idq so the slack lanes stay inert. */
+        repbuf.resize((size_t)((m + SIMD_WIDTH8 - 1) / SIMD_WIDTH8) * SIMD_WIDTH8
+                      + MAX_LINE_LEN);
+
+        bsw_score_batch(tier, bsw, repbuf.data(), ref, qer, m, nthreads, w, sort_scratch, hist);
+
+        /* map each scored rep back to its miss-group by the `id` tag set above.
+         * `id` is kernel-controlled: guard it before indexing so a tier that
+         * violates the "id survives untouched on real slots" contract fails
+         * loudly (xassert fires under -DNDEBUG too) instead of scattering out of
+         * bounds and corrupting the heap. */
+        miss_res.resize(m);
+        for (int k = 0; k < m; k++) {
+            const int32_t rk = repbuf[k].id;
+            xassert(rk >= 0 && rk < m, "dedup scatter: kernel-controlled repbuf.id out of [0, m)");
+            miss_res[rk] =
+                BswJobResult{repbuf[k].score, repbuf[k].tle, repbuf[k].qle,
+                             repbuf[k].gscore, repbuf[k].gtle, repbuf[k].max_off};
+        }
+
+        for (int i = 0; i < n; i++)   /* apply miss results to their pending pairs */
+            if (miss_grp[i] >= 0) bsw_apply_result(pa[i], miss_res[miss_grp[i]]);
+    }
 }
 
 /* Dispatch one tier of `nump` pairs. Non-meth: a single call on `sym` with the
