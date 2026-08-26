@@ -40,7 +40,9 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "robin_hood.h"    /* per-batch DP-job dedup: missidx candidate map */
 #include <inttypes.h>      /* PRId64 for int64_t fprintf format strings */
 #include <strings.h>       /* strcasecmp in mem_opt_parse_meth_tags */
-#include <mutex>           /* BWAMEM3_DUMP_PAIRS append lock */
+#include <atomic>          /* net-cycles auto-dedup controller state */
+#include <chrono>          /* net-cycles auto-dedup controller timing */
+#include <mutex>           /* BWAMEM3_DUMP_PAIRS append lock; net-cycles Welford state */
 #include <string>          /* BWAMEM3_DUMP_PAIRS per-batch row buffer */
 
 #include "sam_encode.h"
@@ -4238,7 +4240,6 @@ static inline void bsw_score_batch(BswMethTier tier, IBandedPairWiseSW *bsw,
     }
 }
 
-struct BswJobId     { int32_t idr, idq, len1, len2, h0; };
 struct BswJobResult { int32_t score, tle, qle, gscore, gtle, max_off; };
 
 static inline void bsw_apply_result(SeqPair &sp, const BswJobResult &r)
@@ -4267,12 +4268,98 @@ static inline int bsw_dedup_mode(void)   /* C2 form; replaced by cfg in C5 */
 {
     static const int mode = []() -> int {
         const char *e = getenv("BWAMEM3_DEDUP");
-        if (!e || !*e) return BSW_DEDUP_ON;   /* C2 default; C3 flips to AUTO */
+        if (!e || !*e) return BSW_DEDUP_AUTO;   /* C3 flips to AUTO */
         int v = bsw_parse_dedup_mode(e);
         if (v < 0) { fprintf(stderr, "[dedup] unrecognized BWAMEM3_DEDUP='%s'; expected off|on|auto\n", e); return BSW_DEDUP_ON; }
         return v;
     }();
     return mode;
+}
+
+/* ---------------------------------------------------------------------------
+ * Net-cycles adaptive dedup (BWAMEM3_DEDUP=auto): decide ON/OFF from
+ * MEASURED wall time, not a dup-rate threshold. Dedup wins exactly when the
+ * bookkeeping it adds (fingerprint + map build + result scatter) costs less
+ * than the kernel time it removes by scoring m distinct reps instead of n. Both
+ * sides are observable per batch, so the decision is the sign of a measured net:
+ *
+ *   overhead_ns = whole dedup-wrapper time  -  kernel time on the m reps
+ *   c_cell      = kernel_ns / dp_cells       (this host's real per-cell DP cost)
+ *   benefit_ns  = cells_saved * c_cell       (cells_saved = total_cells - dp_cells)
+ *   net_ns      = overhead_ns - benefit_ns   (< 0  =>  dedup won this batch)
+ *
+ * c_cell is measured, so the break-even self-calibrates to CPU / compiler /
+ * SIMD tier / substrate -- there is no magic dup-rate constant. We run dedup ON
+ * while measuring (real data is dup-rich, so ON is the productive default and
+ * pays ~zero tax; instrumenting a batch we already run is two clock reads), pool
+ * per-batch net/job across threads (Welford), and latch the moment a two-sided
+ * z-test clears |z| >= NET_Z (a dimensionless confidence level, not a rate).
+ * mean net < 0 -> latch ON (keep dedup); > 0 -> latch OFF (flip to plain score).
+ * Below NET_MIN_BATCHES we never latch (CLT warmup); past NET_MAX_JOBS with no
+ * significance the data is at break-even (cost ~0 either way) so we keep ON.
+ * The running net sum is the warmup tax in nanoseconds, reported at latch. */
+enum { NET_MEASURING = 0, NET_LATCH_ON = 1, NET_LATCH_OFF = 2 };
+static std::atomic<int>      g_net_state{NET_MEASURING};
+static const uint64_t        NET_MIN_BATCHES = 24;         /* CLT floor before any latch */
+static const uint64_t        NET_MAX_JOBS    = 3000000;    /* give up measuring past this */
+/* Confidence level for the latch, overridable (the only knob, and a benign one:
+ * a wrong value costs a little decision latency, never a wrong ON/OFF call). */
+static inline double net_z_crit(void)
+{
+    static const double z = []() {
+        const char *e = getenv("BWAMEM3_DEDUP_Z");
+        double v = (e && *e) ? atof(e) : 0.0;
+        return (v > 0.0) ? v : 2.0;   /* default ~95% */
+    }();
+    return z;
+}
+/* Pooled measurement state, guarded by g_net_mtx (held for a few doubles per
+ * instrumented batch; batches are milliseconds, so contention is negligible). */
+static std::mutex   g_net_mtx;
+static uint64_t     g_net_k    = 0;    /* instrumented batches */
+static uint64_t     g_net_jobs = 0;    /* jobs measured */
+static double       g_net_mean = 0.0;  /* Welford mean of net_ns/job */
+static double       g_net_m2   = 0.0;  /* Welford sum of squares */
+static double       g_net_sum  = 0.0;  /* raw sum of net_ns (the warmup tax) */
+
+/* Feed one measured batch into the controller and latch when significant. */
+static inline void net_observe(double net_ns, int n)
+{
+    if (n <= 0) return;
+    /* The objective is TOTAL wall = sum of per-batch net, so the decision
+     * statistic is per-BATCH net (work-weighted), not net/job: normalizing by n
+     * and averaging batches equally lets tiny high-variance batches dominate and
+     * inverts the sign (a big winning batch would be outvoted by many small ones). */
+    const double x = net_ns;
+    std::lock_guard<std::mutex> lk(g_net_mtx);
+    if (g_net_state.load(std::memory_order_relaxed) != NET_MEASURING) return;
+    g_net_sum  += net_ns;
+    g_net_jobs += (uint64_t)n;
+    g_net_k    += 1;
+    const double d  = x - g_net_mean;                /* Welford update */
+    g_net_mean += d / (double)g_net_k;
+    g_net_m2   += d * (x - g_net_mean);
+    int decision = 0;
+    if (g_net_k >= NET_MIN_BATCHES) {
+        const double var = g_net_m2 / (double)(g_net_k - 1);
+        const double sd  = var > 0.0 ? sqrt(var) : 0.0;
+        const double z   = sd > 0.0 ? g_net_mean * sqrt((double)g_net_k) / sd : 0.0;
+        if (fabs(z) >= net_z_crit())
+            decision = (g_net_mean < 0.0) ? NET_LATCH_ON : NET_LATCH_OFF;
+        else if (g_net_jobs >= NET_MAX_JOBS)
+            decision = NET_LATCH_ON;                 /* break-even: keep the default */
+        if (decision) {
+            int expected = NET_MEASURING;
+            if (g_net_state.compare_exchange_strong(expected, decision,
+                                                    std::memory_order_relaxed))
+                fprintf(stderr,
+                    "[dedup-auto] measured %llu jobs / %llu batches, "
+                    "mean net=%.1f us/batch -> dedup %s (warmup net %.2f ms)\n",
+                    (unsigned long long)g_net_jobs, (unsigned long long)g_net_k,
+                    g_net_mean / 1e3, decision == NET_LATCH_ON ? "ON" : "OFF",
+                    g_net_sum / 1e6);
+        }
+    }
 }
 
 /* Fold up to LIMIT bytes from each END of `s` into `h`, eight bytes (one 64-bit
@@ -4330,56 +4417,82 @@ static inline void bsw_tier_kernel(BswMethTier tier, IBandedPairWiseSW *bsw,
         bsw_score_batch(tier, bsw, pa, ref, qer, n, nthreads, w, sort_scratch, hist);
         return;
     }
+    if (mode == BSW_DEDUP_AUTO && g_net_state.load(std::memory_order_relaxed) == NET_LATCH_OFF) {
+        bsw_score_batch(tier, bsw, pa, ref, qer, n, nthreads, w, sort_scratch, hist);
+        return;   /* net-cycles controller measured dedup net-negative here */
+    }
+
+    /* net-cycles controller: while measuring (AUTO), run the dedup path AND
+     * time it, so the ON/OFF decision comes from observed net wall (see
+     * net_observe). net_t0 spans everything the OFF path would NOT do; the
+     * kernel call is timed separately and subtracted out to isolate the
+     * dedup-wrapper overhead from the DP-kernel cost. */
+    const bool net_measure = (mode == BSW_DEDUP_AUTO
+                        && g_net_state.load(std::memory_order_relaxed) == NET_MEASURING);
+    std::chrono::steady_clock::time_point net_t0;
+    int64_t net_total_cells = 0, net_dp_cells = 0;
+    double  net_kernel_ns = 0.0;
+    /* Banded-SW cost model: a job computes ~ len2 * band cells, NOT len1*len2 --
+     * the band (2w+1, capped by the target length) is far narrower than len1, so
+     * len1*len2 wildly over-weights long targets and skews the per-cell rate,
+     * biasing the ON/OFF decision toward OFF. min(len1, 2w+1) is the true DP width. */
+    const int64_t net_band = 2 * (int64_t)w + 1;
+    if (net_measure) net_t0 = std::chrono::steady_clock::now();
 
     static thread_local std::vector<int>          miss_grp;    /* per pair: miss-group, or -1 if cache-resolved */
     static thread_local std::vector<SeqPair>      repbuf;      /* one rep per distinct miss (to score) */
-    static thread_local std::vector<BswJobId>     miss_id;     /* per miss-group: identity (captured pre-scoring) */
+    static thread_local std::vector<int>          next_grp;    /* per miss-group: next group (1-based) in its hash chain, 0 = end (intrusive bucket) */
     static thread_local std::vector<BswJobResult> miss_res;    /* per miss-group: scored result */
-    static thread_local robin_hood::unordered_flat_map<uint64_t,std::vector<int>> missidx; /* content hash -> candidate miss-groups (this batch) */
+    static thread_local robin_hood::unordered_flat_map<uint64_t,int> missidx; /* content hash -> head miss-group of the chain (this batch) */
 
     miss_grp.assign(n, -1);
     repbuf.clear();
+    next_grp.clear();
     missidx.clear();
 
     for (int i = 0; i < n; i++) {
         const uint8_t *s1 = ref + pa[i].idr; const int len1 = pa[i].len1;
         const uint8_t *s2 = qer + pa[i].idq; const int len2 = pa[i].len2;
         const int      h0 = pa[i].h0;
+        if (net_measure) {
+            const int64_t cells = (int64_t)len2 * ((int64_t)len1 < net_band ? (int64_t)len1 : net_band);
+            net_total_cells += cells;
+        }
         const uint64_t hv = bsw_job_hash(s1, len1, s2, len2, h0);
 
         /* miss: dedup against distinct misses already seen in THIS batch. Every
-         * candidate sharing this fingerprint is byte-compared (per-bucket vector),
-         * so a fingerprint collision costs an extra memcmp -- it never SPLITS a
-         * true group and loses the dedup, which a single-slot map would on
-         * collision. */
+         * candidate sharing this fingerprint is byte-compared (walking the
+         * intrusive chain), so a fingerprint collision costs an extra memcmp --
+         * it never SPLITS a true group and loses the dedup, which a single-slot
+         * map would on collision. */
         int g = -1;
-        std::vector<int> &bucket = missidx[hv];   /* empty vector if new fingerprint */
-        for (int cand : bucket) {
-            const SeqPair &rep = repbuf[cand];
+        int &head = missidx[hv];        /* value-inits to 0 on a new key; groups are stored 1-based, 0 = empty chain */
+        for (int cand = head; cand > 0; cand = next_grp[cand - 1]) {
+            const SeqPair &rep = repbuf[cand - 1];
             if (rep.len1 == len1 && rep.len2 == len2 && rep.h0 == h0
                 && memcmp(ref + rep.idr, s1, (size_t)len1) == 0
-                && memcmp(qer + rep.idq, s2, (size_t)len2) == 0) { g = cand; break; }
+                && memcmp(qer + rep.idq, s2, (size_t)len2) == 0) { g = cand - 1; break; }
         }
         if (g < 0) {
             g = (int)repbuf.size();
             repbuf.push_back(pa[i]);
-            bucket.push_back(g);
+            next_grp.push_back(head);   /* prepend: new group's chain-next is the old head (0 = end) */
+            head = g + 1;               /* store 1-based so a fresh map slot (0) reads as "empty" */
         }
         miss_grp[i] = g;
     }
 
     const int m = (int)repbuf.size();
     if (m > 0) {
-        /* capture identities BEFORE scoring permutes repbuf, and tag each rep's
-         * group in the unused `id` field. The kernels write `id` only on the
-         * padding lanes (pairArray[ii].id = ii for ii >= numPairs), never on a
-         * real slot, and sortPairsLen moves whole SeqPairs -- so id survives the
-         * reorder and identifies each scored rep's group with no second map
-         * (the old (seqid,regid) repkey2grp). */
-        miss_id.resize(m);
+        /* tag each rep's group in the unused `id` field before scoring permutes
+         * repbuf. The kernels write `id` only on the padding lanes
+         * (pairArray[ii].id = ii for ii >= numPairs), never on a real slot, and
+         * sortPairsLen moves whole SeqPairs -- so id survives the reorder and
+         * identifies each scored rep's group with no second map (the old
+         * (seqid,regid) repkey2grp). */
         for (int g = 0; g < m; g++) {
-            miss_id[g] = BswJobId{repbuf[g].idr, repbuf[g].idq,
-                                  repbuf[g].len1, repbuf[g].len2, repbuf[g].h0};
+            if (net_measure) { const int64_t l1 = repbuf[g].len1;
+                net_dp_cells += (int64_t)repbuf[g].len2 * (l1 < net_band ? l1 : net_band); }
             repbuf[g].id = g;
         }
 
@@ -4392,7 +4505,12 @@ static inline void bsw_tier_kernel(BswMethTier tier, IBandedPairWiseSW *bsw,
         repbuf.resize((size_t)((m + SIMD_WIDTH8 - 1) / SIMD_WIDTH8) * SIMD_WIDTH8
                       + MAX_LINE_LEN);
 
+        std::chrono::steady_clock::time_point net_k0;
+        if (net_measure) net_k0 = std::chrono::steady_clock::now();
         bsw_score_batch(tier, bsw, repbuf.data(), ref, qer, m, nthreads, w, sort_scratch, hist);
+        if (net_measure)
+            net_kernel_ns = std::chrono::duration<double, std::nano>(
+                                std::chrono::steady_clock::now() - net_k0).count();
 
         /* map each scored rep back to its miss-group by the `id` tag set above.
          * `id` is kernel-controlled: guard it before indexing so a tier that
@@ -4410,6 +4528,19 @@ static inline void bsw_tier_kernel(BswMethTier tier, IBandedPairWiseSW *bsw,
 
         for (int i = 0; i < n; i++)   /* apply miss results to their pending pairs */
             if (miss_grp[i] >= 0) bsw_apply_result(pa[i], miss_res[miss_grp[i]]);
+    }
+
+    /* net-cycles decision: overhead = whole dedup wrapper minus the kernel; the
+     * benefit is the kernel time the skipped duplicate cells would have cost, at
+     * this batch's measured per-cell rate. Feed the signed net to the controller. */
+    if (net_measure && net_dp_cells > 0 && net_kernel_ns > 0.0) {
+        const double total_ns = std::chrono::duration<double, std::nano>(
+                                    std::chrono::steady_clock::now() - net_t0).count();
+        const double overhead_ns  = total_ns - net_kernel_ns;
+        const double c_cell       = net_kernel_ns / (double)net_dp_cells;
+        const double cells_saved  = (double)(net_total_cells - net_dp_cells);
+        const double benefit_ns   = cells_saved * c_cell;
+        net_observe(overhead_ns - benefit_ns, n);
     }
 }
 
