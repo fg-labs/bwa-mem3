@@ -203,6 +203,41 @@ analysis](https://github.com/fg-labs/bwa-mem3/pull/187) for the full characteriz
 > Do not enable in pipelines that compare output to a bwa-mem2 or bwa-mem3
 > baseline. The changes are benign and bounded, but they are real SAM changes.
 
+## `--dedup` extension-DP job deduplication
+
+`--dedup STR` scores each distinct extension Smith-Waterman job once per batch and
+copies the result to every identical job, instead of re-running the kernel on
+duplicates. Unlike `--smem-dedup`, this preserves **byte-identical alignment
+records in every mode**; headers such as `@PG` (which embed argv) are outside this
+guarantee. The duplicates would have produced the same score, so collapsing them
+changes only how much kernel work runs, never the alignment output. It accepts
+three values:
+
+- `off` — always run the kernel on every job (the pre-feature behavior).
+- `on` — always dedup identical `(query, target, h0)` jobs within each batch.
+- `auto` — **the default**: measure the net benefit at runtime (the bookkeeping
+  dedup adds versus the kernel time it removes), latch ON or OFF from the measured
+  sign, and periodically re-probe. Because the default is `auto`, dedup can run
+  without any flag; alignment records stay byte-identical either way (headers excluded).
+
+Any value other than `off`/`on`/`auto` — including an empty `--dedup=` — is
+rejected with a non-zero exit; there is no silent fallback. An explicit `--dedup`
+value takes precedence over `BWAMEM3_DEDUP`, and when the flag is set an invalid
+`BWAMEM3_DEDUP` mode is ignored rather than fatal.
+
+Three expert env knobs tune the `auto` controller (env-only, no CLI flag). Each is
+full-string parsed: a malformed or out-of-range value is fatal, and trailing
+non-numeric junk (`2x`, `12M`) is rejected rather than accepted as a numeric prefix.
+
+- `BWAMEM3_DEDUP` — override the mode (`off`/`on`/`auto`); same values as the flag.
+  An unrecognized mode is fatal (unless an explicit `--dedup` flag overrides it).
+- `BWAMEM3_DEDUP_Z` — the z-score confidence threshold for latching and for
+  confirming a re-probe (a number > 0). Reversing an existing latch needs a
+  higher bar, `BWAMEM3_DEDUP_Z + 1`, so noise near break-even cannot flap the
+  decision.
+- `BWAMEM3_DEDUP_REPROBE` — re-probe cadence in jobs (a non-negative integer;
+  `0` disables re-probing).
+
 ## `--min-ext-len` short-seed extension filter
 
 `--min-ext-len INT` opts into skipping banded Smith-Waterman extension of short
@@ -315,6 +350,7 @@ for reservation, verification, and the manual `MIMALLOC_RESERVE_HUGE_OS_PAGES` e
 | `HN:i` hit count tag | [#42](https://github.com/fg-labs/bwa-mem3/pull/42) | [lh3/bwa#438](https://github.com/lh3/bwa/pull/438) | fork-only (analogous to bwa aln) |
 | `--bam=LEVEL` direct BAM output | [#12](https://github.com/fg-labs/bwa-mem3/pull/12) | — | fork-only |
 | `--smem-dedup` SMEM deduplication | [#187](https://github.com/fg-labs/bwa-mem3/pull/187) | — | fork-only (opt-in, not byte-identical) |
+| `--dedup` extension-DP job deduplication | [#415](https://github.com/fg-labs/bwa-mem3/pull/415) | — | fork-only (on by default via `auto`; alignment records byte-identical in every mode; headers excluded) |
 | `--min-ext-len` short-seed extension filter | _pending_ | — | fork-only (opt-in, off by default) |
 | `--seed-order` seed reordering | [#186](https://github.com/fg-labs/bwa-mem3/pull/186) | — | fork-only (opt-in, off by default) |
 | `--skip-contained-ext` contained-seed extension skip | [#192](https://github.com/fg-labs/bwa-mem3/pull/192) | — | fork-only (opt-in, byte-identical on short/medium non-meth reads, **not** byte-identical on kilobase-scale long reads, no-op under --meth) |

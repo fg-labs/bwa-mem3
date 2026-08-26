@@ -599,6 +599,14 @@ void mem_opt_fill_meth_mat(mem_opt_t *opt);
  * Must be called AFTER -A/-B/-T/-L/-U parsing and after update_a(). */
 void mem_opt_apply_meth_defaults(mem_opt_t *opt, const mem_opt_t *opt0);
 
+/* Configure extension-DP job dedup. mode_arg is the --dedup CLI value (NULL =>
+ * fall back to env BWAMEM3_DEDUP, then default 'auto'). The controller knobs z
+ * and reprobe are expert-only, resolved from env (BWAMEM3_DEDUP_Z default 2.0,
+ * BWAMEM3_DEDUP_REPROBE default 12000000) -- no CLI flag, matching the house
+ * style for BWAMEM3_* tuning knobs. Must be called before the first alignment
+ * batch; invalid values are fatal. CLI(mode) > env > default. */
+void mem_dedup_configure(const char *mode_arg);
+
 // Skip-short-seed extension filter: drop seeds shorter than min_ext_len from a
 // chain in place (stable; surviving seeds keep their order). Returns the new
 // seed count. min_ext_len <= 0 is a no-op. See mem_opt_t::min_ext_len.

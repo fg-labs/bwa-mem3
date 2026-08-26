@@ -39,6 +39,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "pdqsort_wrap.h"
 #include "robin_hood.h"    /* per-batch DP-job dedup: missidx candidate map */
 #include <inttypes.h>      /* PRId64 for int64_t fprintf format strings */
+#include <errno.h>         /* errno/ERANGE: full-string parse of the dedup env knobs */
 #include <strings.h>       /* strcasecmp in mem_opt_parse_meth_tags */
 #include <atomic>          /* net-cycles auto-dedup controller state */
 #include <chrono>          /* net-cycles auto-dedup controller timing */
@@ -4264,16 +4265,71 @@ static int bsw_parse_dedup_mode(const char *e)
     }
     return -1;
 }
-static inline int bsw_dedup_mode(void)   /* C2 form; replaced by cfg in C5 */
+/* Extension-DP dedup configuration store. mode -1 means "unresolved" -- the
+ * only valid state before mem_dedup_configure() has run once; every reader
+ * goes through bsw_dedup_cfg(), which lazily resolves via mem_dedup_configure
+ * if some entry point (unit binaries, library use) never called it. */
+struct BswDedupCfg { int mode; double z; int64_t reprobe_jobs; };
+static BswDedupCfg g_dedup_cfg = { -1, 2.0, 12000000 };   /* mode -1 = unresolved */
+
+void mem_dedup_configure(const char *mode_arg)
 {
-    static const int mode = []() -> int {
-        const char *e = getenv("BWAMEM3_DEDUP");
-        if (!e || !*e) return BSW_DEDUP_AUTO;   /* C3 flips to AUTO */
-        int v = bsw_parse_dedup_mode(e);
-        if (v < 0) { fprintf(stderr, "[dedup] unrecognized BWAMEM3_DEDUP='%s'; expected off|on|auto\n", e); return BSW_DEDUP_ON; }
-        return v;
-    }();
-    return mode;
+    /* A non-empty --dedup wins outright (and overrides even an explicitly-empty
+     * BWAMEM3_DEDUP); otherwise consult the env, distinguishing "unset" (use the
+     * default) from "set but empty" (an explicit misconfiguration -> fatal, so a
+     * cleared BWAMEM3_DEDUP= cannot silently fall back to the default). An empty
+     * CLI value is rejected earlier by the getopt handler. */
+    if (mode_arg && *mode_arg) {
+        const int v = bsw_parse_dedup_mode(mode_arg);
+        if (v < 0) { fprintf(stderr, "ERROR: --dedup: expected off|on|auto, got '%s'\n", mode_arg); exit(1); }
+        g_dedup_cfg.mode = v;
+    } else {
+        const char *m = getenv("BWAMEM3_DEDUP");
+        if (m == NULL) g_dedup_cfg.mode = BSW_DEDUP_AUTO;   /* unset -> default */
+        else {
+            const int v = bsw_parse_dedup_mode(m);          /* "" -> -1 -> fatal */
+            if (v < 0) { fprintf(stderr, "ERROR: BWAMEM3_DEDUP: expected off|on|auto, got '%s'\n", m); exit(1); }
+            g_dedup_cfg.mode = v;
+        }
+    }
+    const char *z = getenv("BWAMEM3_DEDUP_Z");            /* expert knob, env-only */
+    if (z) {                                             /* set (empty -> rejected by the full-string parse) */
+        char        *end = NULL;
+        errno = 0;
+        const double zv  = strtod(z, &end);
+        /* Full-string parse: reject trailing junk ("2x") rather than silently
+         * taking the leading number, the way atof would. */
+        if (end == z || end == NULL || *end != '\0' || errno == ERANGE || zv <= 0.0) {
+            fprintf(stderr, "ERROR: BWAMEM3_DEDUP_Z: must be a number > 0, got '%s'\n", z);
+            exit(1);
+        }
+        g_dedup_cfg.z = zv;
+    }
+    const char *r = getenv("BWAMEM3_DEDUP_REPROBE");      /* expert knob, env-only */
+    if (r) {                                             /* set (empty -> rejected by the full-string parse) */
+        char           *end = NULL;
+        errno = 0;
+        const long long rv  = strtoll(r, &end, 10);
+        /* Full-string parse: reject trailing junk ("12M") rather than silently
+         * taking the leading number, the way atoll would. */
+        if (end == r || end == NULL || *end != '\0' || errno == ERANGE || rv < 0) {
+            fprintf(stderr, "ERROR: BWAMEM3_DEDUP_REPROBE: must be a non-negative integer number of jobs (0 = off), got '%s'\n", r);
+            exit(1);
+        }
+        g_dedup_cfg.reprobe_jobs = rv;
+    }
+}
+/* Lazy resolution for entry points that never call mem_dedup_configure()
+ * (unit binaries, library use): resolve from env/defaults on first touch. */
+static inline const BswDedupCfg &bsw_dedup_cfg(void)
+{
+    static std::once_flag once;
+    std::call_once(once, []() { if (g_dedup_cfg.mode < 0) mem_dedup_configure(NULL); });
+    return g_dedup_cfg;
+}
+static inline int bsw_dedup_mode(void)
+{
+    return bsw_dedup_cfg().mode;
 }
 
 /* ---------------------------------------------------------------------------
@@ -4306,12 +4362,7 @@ static const uint64_t        NET_MAX_JOBS    = 3000000;    /* give up measuring 
  * a wrong value costs a little decision latency, never a wrong ON/OFF call). */
 static inline double net_z_crit(void)
 {
-    static const double z = []() {
-        const char *e = getenv("BWAMEM3_DEDUP_Z");
-        double v = (e && *e) ? atof(e) : 0.0;
-        return (v > 0.0) ? v : 2.0;   /* default ~95% */
-    }();
-    return z;
+    return bsw_dedup_cfg().z;
 }
 /* Periodic re-probe (C4): once latched, the controller stays ON or OFF
  * forever unless re-checked. `g_net_incumbent` records the current latched
@@ -4322,7 +4373,7 @@ static inline double net_z_crit(void)
 static std::atomic<int>     g_net_incumbent{0};     /* 0 = none (initial phase) */
 static std::atomic<int64_t> g_net_since_latch{0};   /* jobs since last latch */
 static const uint64_t       NET_PROBE_MAX_JOBS = 1500000; /* probe cap -> keep incumbent */
-static inline int64_t bsw_dedup_reprobe_jobs(void); /* env BWAMEM3_DEDUP_REPROBE, default 12000000, 0=off; cfg in C5 */
+static inline int64_t bsw_dedup_reprobe_jobs(void); /* env BWAMEM3_DEDUP_REPROBE, default 12000000, 0=off */
 static inline void net_maybe_reprobe(int n);
 /* Pooled measurement state, guarded by g_net_mtx (held for a few doubles per
  * instrumented batch; batches are milliseconds, so contention is negligible). */
@@ -4387,13 +4438,7 @@ static inline void net_observe(double net_ns, int n)
  * re-probing (net_maybe_reprobe short-circuits on period <= 0). */
 static inline int64_t bsw_dedup_reprobe_jobs(void)
 {
-    static const int64_t period = []() -> int64_t {
-        const char *e = getenv("BWAMEM3_DEDUP_REPROBE");
-        if (!e || !*e) return 12000000;
-        int64_t v = atoll(e);
-        return (v >= 0) ? v : 12000000;
-    }();
-    return period;
+    return bsw_dedup_cfg().reprobe_jobs;
 }
 
 /* Work-based re-probe: called from BOTH latched paths with this batch's job

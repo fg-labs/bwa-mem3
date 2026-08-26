@@ -12,6 +12,7 @@ Options:
     -y INT        seed occurrence for the 3rd round seeding [20]
     -c INT        skip seeds with more than INT occurrences [500]
     --smem-dedup  dedup identical SMEMs before chaining: fewer SA lookups, ~10% fewer; opt-in, NOT byte-identical (changes XS/secondary on a small fraction of reads) [off]
+    --dedup STR   extension-DP job dedup: 'off', 'on' (dedup identical jobs within each batch), or 'auto' (measure net benefit at runtime, latch, and periodically re-probe); alignment records byte-identical in every mode (@PG excluded, it embeds argv) [auto]
     --huge-pages  back the index with 1 GB huge pages via mimalloc when the host has enough free 1 GB pages reserved; cuts dTLB misses in seeding; Linux only, alignment records byte-identical (only @PG CL differs, recording the flag), safe no-op otherwise [off]
     --skip-contained-ext  skip banded-SW extension of seeds contained (same diagonal) in a longer in-chain seed; byte-identical on short/medium non-meth reads (NOT on kilobase-scale long reads); no effect under --meth [off]
     --max-extend-chains INT  cap chains extended per read to the top-INT by weight; ~23% less alignment CPU, high-confidence placement unaffected; ignored for reads with >4096 chains; opt-in, NOT byte-identical (0 = off) [0]

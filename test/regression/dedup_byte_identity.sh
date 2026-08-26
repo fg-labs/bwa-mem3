@@ -36,3 +36,21 @@ done
 # line-count sanity: every input pair produced >=2 alignment records
 n=$(grep -vc '^@' "$W/off_dup_t1.sam"); [[ "$n" -ge 9600 ]] || fail "record count $n < 9600"
 ok "record-count sanity ($n records)"
+
+# CLI flags: --dedup must mirror the env, flag wins over env, bad values fatal
+"$BWA_MEM3" mem -t 1 --dedup on "$W/phix.fa" "$W/dup_1.fq" "$W/dup_2.fq" 2>/dev/null \
+    | grep -v '^@PG' > "$W/cli_on.sam" || fail "--dedup on run failed"
+cmp "$W/off_dup_t1.sam" "$W/cli_on.sam" || fail "--dedup on != off (byte-identity)"
+BWAMEM3_DEDUP=off "$BWA_MEM3" mem -t 1 --dedup on "$W/phix.fa" "$W/dup_1.fq" "$W/dup_2.fq" \
+    2>/dev/null | grep -v '^@PG' > "$W/cli_prec.sam" || fail "flag-over-env run failed"
+cmp "$W/off_dup_t1.sam" "$W/cli_prec.sam" || fail "flag/env precedence output mismatch"
+if "$BWA_MEM3" mem --dedup bogus "$W/phix.fa" "$W/dup_1.fq" "$W/dup_2.fq" >/dev/null 2>"$W/bogus.err"; then
+    fail "--dedup bogus should be fatal"; fi
+grep -q "expected off|on|auto" "$W/bogus.err" || fail "--dedup bogus: wrong error"
+# `mem` with no args exits non-zero after printing usage() to stderr; under
+# `set -o pipefail` a direct `... | grep -q` would fail the pipeline on that
+# exit code even when grep matches, so capture first (matches the
+# all_tiers_parity.sh / cohort_slice_identity.sh `|| true` house pattern).
+USAGE_OUT="$("$BWA_MEM3" mem 2>&1 || true)"
+grep -q -- '--dedup STR' <<<"$USAGE_OUT" || fail "usage() missing --dedup"
+ok "CLI flags (--dedup / precedence / validation / usage)"
