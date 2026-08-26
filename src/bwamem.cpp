@@ -4313,6 +4313,17 @@ static inline double net_z_crit(void)
     }();
     return z;
 }
+/* Periodic re-probe (C4): once latched, the controller stays ON or OFF
+ * forever unless re-checked. `g_net_incumbent` records the current latched
+ * direction (0 = none yet, i.e. still in the initial MEASURING phase) so a
+ * re-probe can tell "confirm" from "flip" apart, and `g_net_since_latch`
+ * counts jobs run under the current latch toward the next re-probe cadence
+ * (BWAMEM3_DEDUP_REPROBE jobs; cfg in C5). */
+static std::atomic<int>     g_net_incumbent{0};     /* 0 = none (initial phase) */
+static std::atomic<int64_t> g_net_since_latch{0};   /* jobs since last latch */
+static const uint64_t       NET_PROBE_MAX_JOBS = 1500000; /* probe cap -> keep incumbent */
+static inline int64_t bsw_dedup_reprobe_jobs(void); /* env BWAMEM3_DEDUP_REPROBE, default 12000000, 0=off; cfg in C5 */
+static inline void net_maybe_reprobe(int n);
 /* Pooled measurement state, guarded by g_net_mtx (held for a few doubles per
  * instrumented batch; batches are milliseconds, so contention is negligible). */
 static std::mutex   g_net_mtx;
@@ -4322,44 +4333,88 @@ static double       g_net_mean = 0.0;  /* Welford mean of net_ns/job */
 static double       g_net_m2   = 0.0;  /* Welford sum of squares */
 static double       g_net_sum  = 0.0;  /* raw sum of net_ns (the warmup tax) */
 
-/* Feed one measured batch into the controller and latch when significant. */
+/* Feed one measured batch into the controller and latch when significant.
+ * Incumbent-aware (C4): the initial decision (incumbent == 0) uses a plain
+ * z-test with the MAX_JOBS break-even fallback, same as before. A re-probe
+ * (incumbent != 0) instead asks whether the NEW evidence still supports the
+ * incumbent direction: agreement only needs to *confirm* at the ordinary z
+ * (or is kept on an inconclusive probe-cap timeout); disagreement needs a
+ * higher bar (z+1) to *flip* the incumbent, so noise near break-even cannot
+ * flap the decision back and forth every cadence. */
 static inline void net_observe(double net_ns, int n)
 {
     if (n <= 0) return;
-    /* The objective is TOTAL wall = sum of per-batch net, so the decision
-     * statistic is per-BATCH net (work-weighted), not net/job: normalizing by n
-     * and averaging batches equally lets tiny high-variance batches dominate and
-     * inverts the sign (a big winning batch would be outvoted by many small ones). */
-    const double x = net_ns;
     std::lock_guard<std::mutex> lk(g_net_mtx);
     if (g_net_state.load(std::memory_order_relaxed) != NET_MEASURING) return;
     g_net_sum  += net_ns;
     g_net_jobs += (uint64_t)n;
     g_net_k    += 1;
-    const double d  = x - g_net_mean;                /* Welford update */
+    const double d  = net_ns - g_net_mean;            /* Welford, per-BATCH statistic */
     g_net_mean += d / (double)g_net_k;
-    g_net_m2   += d * (x - g_net_mean);
-    int decision = 0;
+    g_net_m2   += d * (net_ns - g_net_mean);
+    const int incumbent = g_net_incumbent.load(std::memory_order_relaxed);
+    int decision = 0; const char *why = "";
     if (g_net_k >= NET_MIN_BATCHES) {
         const double var = g_net_m2 / (double)(g_net_k - 1);
         const double sd  = var > 0.0 ? sqrt(var) : 0.0;
         const double z   = sd > 0.0 ? g_net_mean * sqrt((double)g_net_k) / sd : 0.0;
-        if (fabs(z) >= net_z_crit())
-            decision = (g_net_mean < 0.0) ? NET_LATCH_ON : NET_LATCH_OFF;
-        else if (g_net_jobs >= NET_MAX_JOBS)
-            decision = NET_LATCH_ON;                 /* break-even: keep the default */
-        if (decision) {
-            int expected = NET_MEASURING;
-            if (g_net_state.compare_exchange_strong(expected, decision,
-                                                    std::memory_order_relaxed))
-                fprintf(stderr,
-                    "[dedup-auto] measured %llu jobs / %llu batches, "
-                    "mean net=%.1f us/batch -> dedup %s (warmup net %.2f ms)\n",
-                    (unsigned long long)g_net_jobs, (unsigned long long)g_net_k,
-                    g_net_mean / 1e3, decision == NET_LATCH_ON ? "ON" : "OFF",
-                    g_net_sum / 1e6);
+        const int    fav = (g_net_mean < 0.0) ? NET_LATCH_ON : NET_LATCH_OFF;
+        const double zc  = net_z_crit();
+        if (incumbent == 0) {                       /* initial: plain test, cap -> ON */
+            if      (fabs(z) >= zc)               { decision = fav;           why = "measured"; }
+            else if (g_net_jobs >= NET_MAX_JOBS)  { decision = NET_LATCH_ON;  why = "break-even, keeping default"; }
+        } else if (fav == incumbent) {              /* re-probe, evidence agrees */
+            if      (fabs(z) >= zc)                       { decision = incumbent; why = "re-probe confirmed"; }
+            else if (g_net_jobs >= NET_PROBE_MAX_JOBS)    { decision = incumbent; why = "re-probe inconclusive, kept"; }
+        } else {                                    /* re-probe, evidence opposes: flip bar is z+1 */
+            if      (fabs(z) >= zc + 1.0)                 { decision = fav;       why = "re-probe FLIPPED"; }
+            else if (g_net_jobs >= NET_PROBE_MAX_JOBS)    { decision = incumbent; why = "below flip margin, kept"; }
         }
     }
+    if (decision) {
+        g_net_incumbent.store(decision, std::memory_order_relaxed);
+        g_net_since_latch.store(0, std::memory_order_relaxed);
+        g_net_state.store(decision, std::memory_order_relaxed);
+        if (bwa_verbose >= 3)
+            fprintf(stderr, "[dedup-auto] %s: %llu jobs / %llu batches, mean net=%.1f us/batch -> dedup %s\n",
+                    why, (unsigned long long)g_net_jobs, (unsigned long long)g_net_k,
+                    g_net_mean / 1e3, decision == NET_LATCH_ON ? "ON" : "OFF");
+    }
+}
+
+/* Env-configured re-probe cadence, in jobs (same style as net_z_crit): 0 or a
+ * negative/unset value falls back to the default; 0 explicitly disables
+ * re-probing (net_maybe_reprobe short-circuits on period <= 0). */
+static inline int64_t bsw_dedup_reprobe_jobs(void)
+{
+    static const int64_t period = []() -> int64_t {
+        const char *e = getenv("BWAMEM3_DEDUP_REPROBE");
+        if (!e || !*e) return 12000000;
+        int64_t v = atoll(e);
+        return (v >= 0) ? v : 12000000;
+    }();
+    return period;
+}
+
+/* Work-based re-probe: called from BOTH latched paths with this batch's job
+ * count. When the cadence elapses, reset the accumulator and re-enter
+ * MEASURING. All stats mutation is under g_net_mtx; the reset happens before
+ * the state store, so no thread can feed a stale accumulator. Byte-identity is
+ * unaffected: a probe only changes when the kernel is skipped. */
+static inline void net_maybe_reprobe(int n)
+{
+    const int64_t period = bsw_dedup_reprobe_jobs();
+    if (period <= 0) return;
+    if (g_net_since_latch.fetch_add(n, std::memory_order_relaxed) + n < period) return;
+    std::lock_guard<std::mutex> lk(g_net_mtx);
+    const int st = g_net_state.load(std::memory_order_relaxed);
+    if (st == NET_MEASURING) return;                                   /* probe already running */
+    if (g_net_since_latch.load(std::memory_order_relaxed) < period) return;  /* lost the race */
+    g_net_k = 0; g_net_jobs = 0; g_net_mean = 0.0; g_net_m2 = 0.0; g_net_sum = 0.0;
+    g_net_since_latch.store(0, std::memory_order_relaxed);
+    if (bwa_verbose >= 3)
+        fprintf(stderr, "[dedup-auto] re-probe (incumbent %s)\n", st == NET_LATCH_ON ? "ON" : "OFF");
+    g_net_state.store(NET_MEASURING, std::memory_order_relaxed);
 }
 
 /* Fold up to LIMIT bytes from each END of `s` into `h`, eight bytes (one 64-bit
@@ -4417,9 +4472,12 @@ static inline void bsw_tier_kernel(BswMethTier tier, IBandedPairWiseSW *bsw,
         bsw_score_batch(tier, bsw, pa, ref, qer, n, nthreads, w, sort_scratch, hist);
         return;
     }
-    if (mode == BSW_DEDUP_AUTO && g_net_state.load(std::memory_order_relaxed) == NET_LATCH_OFF) {
-        bsw_score_batch(tier, bsw, pa, ref, qer, n, nthreads, w, sort_scratch, hist);
-        return;   /* net-cycles controller measured dedup net-negative here */
+    if (mode == BSW_DEDUP_AUTO) {
+        net_maybe_reprobe(n);
+        if (g_net_state.load(std::memory_order_relaxed) == NET_LATCH_OFF) {
+            bsw_score_batch(tier, bsw, pa, ref, qer, n, nthreads, w, sort_scratch, hist);
+            return;   /* net-cycles controller measured dedup net-negative here */
+        }
     }
 
     /* net-cycles controller: while measuring (AUTO), run the dedup path AND
