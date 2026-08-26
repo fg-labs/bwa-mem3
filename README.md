@@ -10,7 +10,67 @@ bwa-mem3 is a short-read aligner derived from [bwa-mem2](https://github.com/bwa-
 carrying correctness fixes, performance improvements, and new features (methylation alignment,
 shared-memory index, mimalloc allocator) maintained by [Fulcrum Genomics](https://fulcrumgenomics.com).
 
-**Three ways to run it — plain, `--compat`, `--fast`.** bwa-mem3 has three alignment modes that differ in *what alignments come out*, not just in speed:
+## Performance
+
+Wall-clock speedup of the current release (v0.10.0) against `bwa` 0.7.19, `bwa-mem2` v2.2.1, and `minibwa`, on the `wgs-5M` sample. Cells are `stock / --fast`.
+
+| arch | wall_s | vs bwa | vs bwa-mem2 | vs minibwa |
+|---|---:|---:|---:|---:|
+| ARM | 72.23 / 28.26 | 3.32x / 8.47x | — | 0.57x / 1.46x |
+| x86 | 44.70 / 19.40 | 4.44x / 10.24x | 2.22x / 5.12x | 0.69x / 1.59x |
+
+> [!TIP]
+> **📈 Full release-history table** — every bwa-mem3 release since v0.2.1, full methodology, and version pins.
+>
+> <details>
+> <summary><strong>Click to expand</strong></summary>
+>
+> **Graviton4 (c8g, arm64/NEON)**
+>
+> | release | wall_s | vs bwa | vs bwa-mem2 | vs minibwa |
+> |---|---:|---:|---:|---:|
+> | bwa | 239.49 | 1.00x | — | 0.17x |
+> | bwa-mem2 | — | — | — | — |
+> | minibwa | 41.35 | 5.79x | — | 1.00x |
+> | v0.2.1 | 140.74 | 1.70x | — | 0.29x |
+> | v0.2.2 | 141.57 | 1.69x | — | 0.29x |
+> | v0.3.0 | 123.35 | 1.94x | — | 0.34x |
+> | v0.4.0 | 108.09 | 2.22x | — | 0.38x |
+> | v0.5.0 | 106.18 / 38.03 | 2.26x / 6.30x | — | 0.39x / 1.09x |
+> | v0.6.0 | 99.01 / 37.06 | 2.42x / 6.46x | — | 0.42x / 1.12x |
+> | v0.7.0 | 96.57 / 40.38 | 2.48x / 5.93x | — | 0.43x / 1.02x |
+> | v0.8.0 | 77.21 / 28.95 | 3.10x / 8.27x | — | 0.54x / 1.43x |
+> | v0.9.0 | 77.49 / 29.00 | 3.09x / 8.26x | — | 0.53x / 1.43x |
+> | **v0.10.0** | **72.23 / 28.26** | **3.32x / 8.47x** | — | **0.57x / 1.46x** |
+>
+> **AMD (c8a, x86)**
+>
+> | release | wall_s | vs bwa | vs bwa-mem2 | vs minibwa |
+> |---|---:|---:|---:|---:|
+> | bwa | 198.63 | 1.00x | 0.50x | 0.16x |
+> | bwa-mem2 | 99.33 | 2.00x | 1.00x | 0.31x |
+> | minibwa | 30.90 | 6.43x | 3.21x | 1.00x |
+> | v0.2.1 | 80.04 | 2.48x | 1.24x | 0.39x |
+> | v0.2.2 | 72.85 | 2.73x | 1.36x | 0.42x |
+> | v0.3.0 | 64.43 | 3.08x | 1.54x | 0.48x |
+> | v0.4.0 | 54.57 | 3.64x | 1.82x | 0.57x |
+> | v0.5.0 | 55.02 / 23.87 | 3.61x / 8.32x | 1.81x / 4.16x | 0.56x / 1.29x |
+> | v0.6.0 | 55.87 / 23.23 | 3.56x / 8.55x | 1.78x / 4.28x | 0.55x / 1.33x |
+> | v0.7.0 | 51.64 / 23.78 | 3.85x / 8.35x | 1.92x / 4.18x | 0.60x / 1.30x |
+> | v0.8.0 | 47.05 / 18.82 | 4.22x / 10.55x | 2.11x / 5.28x | 0.66x / 1.64x |
+> | v0.9.0 | 45.96 / 18.74 | 4.32x / 10.60x | 2.16x / 5.30x | 0.67x / 1.65x |
+> | **v0.10.0** | **44.70 / 19.40** | **4.44x / 10.24x** | **2.22x / 5.12x** | **0.69x / 1.59x** |
+>
+> Version pins: `bwa` 0.7.19 · `bwa-mem2` v2.2.1 · `minibwa` commit [`d6d9f87d`](https://github.com/lh3/minibwa) (`minibwa-0.7`). "ARM" = Graviton4 c8g (arm64/NEON, no SMT); "x86" = AMD c8a (no SMT — replaces an earlier Intel c7i arm, which ran 16 vCPUs over 8 physical cores under 2-way SMT and so wasn't a real core-for-core match for Graviton's 16 real cores); no ARM `bwa-mem2` build exists, hence the blank cells there. Every arm for a given arch ran interleaved on one fixed on-demand host — 3 reps each, median wall-clock shown — so these are same-host comparisons, not medians pooled across separate runs. `—` means the release predates the comparator or predates `--fast`. Regenerate via `bench release-speedup` in [bwa-mem3-bench](https://github.com/fg-labs/bwa-mem3-bench).
+>
+> </details>
+
+> [!WARNING]
+> `--fast` is **not alignment-identical** to the default preset — it trades some sensitivity/specificity at the extremes (repetitive/multi-mapping regions, low-`MAPQ` reads) for the speedup above. See "Three ways to run it" below before switching a production pipeline to it.
+
+## Three ways to run it — plain, `--compat`, `--fast`
+
+bwa-mem3 has three alignment modes that differ in *what alignments come out*, not just in speed:
 
 | mode | where reads align | when to use |
 |---|---|---|
