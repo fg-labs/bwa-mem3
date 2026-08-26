@@ -4204,11 +4204,10 @@ enum BswMethTier { BSW_TIER_SCALAR, BSW_TIER_16, BSW_TIER_8 };
 /* One tier kernel call over pa[0..n). `sort_scratch` must be a SeqPair buffer
  * DISTINCT from `pa` (sortPairsLen is a counting sort that scatters through it;
  * aliasing pa would corrupt the sort). Scalar tier ignores sort_scratch. */
-static inline void bsw_tier_kernel(BswMethTier tier, IBandedPairWiseSW *bsw,
+static inline void bsw_score_batch(BswMethTier tier, IBandedPairWiseSW *bsw,
         SeqPair *pa, uint8_t *ref, uint8_t *qer, int n, int nthreads, int32_t w,
         SeqPair *sort_scratch, int32_t *hist)
 {
-    if (n <= 0) return;
     switch (tier) {
     case BSW_TIER_SCALAR:
         bsw->scalarBandedSWAWrapper(pa, ref, qer, n, nthreads, w);
@@ -4236,6 +4235,16 @@ static inline void bsw_tier_kernel(BswMethTier tier, IBandedPairWiseSW *bsw,
 #endif
         break;
     }
+}
+
+/* Pass-through wrapper over bsw_score_batch. Subsequent commits extend this
+ * with per-batch extension-DP job dedup; at this commit it is the plain path. */
+static inline void bsw_tier_kernel(BswMethTier tier, IBandedPairWiseSW *bsw,
+        SeqPair *pa, uint8_t *ref, uint8_t *qer, int n, int nthreads, int32_t w,
+        SeqPair *sort_scratch, int32_t *hist)
+{
+    if (n <= 0) return;
+    bsw_score_batch(tier, bsw, pa, ref, qer, n, nthreads, w, sort_scratch, hist);
 }
 
 /* Dispatch one tier of `nump` pairs. Non-meth: a single call on `sym` with the
