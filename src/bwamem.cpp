@@ -82,6 +82,21 @@ static_assert(sizeof(mem_chain_t) == 48,
               "sizeof(mem_chain_t) feeds klib kbtree node fan-out; changing it moves default "
               "output at chain_cmp .pos ties. Repack fields into the bitfield word, don't append.");
 
+/* RAII holder for the per-thread persistent chaining B-tree used in
+ * mem_chain_seeds. The tree is init'd once per thread (not once per read) and
+ * kb_reset between reads to remove per-read kb_init/kb_destroy malloc churn;
+ * this destructor kb_destroy's it at thread exit so the thread_local stays
+ * leak-clean under ASan, matching the house-style u8vec_scratch_t. */
+namespace {
+struct ChnTreeScratch {
+    kbtree_t(chn) *t;
+    ChnTreeScratch() : t(kb_init(chn, KB_DEFAULT_SIZE + 8)) {} // +8, counters in chain
+    ~ChnTreeScratch() { if (t) kb_destroy(chn, t); }
+    ChnTreeScratch(const ChnTreeScratch&) = delete;
+    ChnTreeScratch& operator=(const ChnTreeScratch&) = delete;
+};
+} // namespace
+
 /* #309: `w` shares its 32-bit word with kept:2, is_alt:1 and meth_hypothesis:2.
  * Narrowing `w` to make room for something else is the drift this catches --
  * mem_chain_weight() saturates at MEM_CHAIN_W_MAX, so a narrower field would
@@ -2286,8 +2301,15 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
         if (seq_[l].l_seq < opt->min_seed_len) continue;
         assert(matchArray[smem_ptr].rid == l);
 
-        kbtree_t(chn) *tree;
-        tree = kb_init(chn, KB_DEFAULT_SIZE + 8); // +8, due to addition of counters in chain
+        /* Per-thread persistent chaining B-tree (see ChnTreeScratch above):
+         * init once per thread, kb_reset (below) between reads instead of a
+         * per-read kb_init/kb_destroy. Byte-identical -- tree structure,
+         * comparisons, and traversal order depend only on the seeds inserted,
+         * never on node provenance, and chaining never deletes, so the reset
+         * reproduces the fresh kb_init state exactly -- and the common
+         * single-leaf-root read then does zero allocations. */
+        static thread_local ChnTreeScratch chn_scratch;
+        kbtree_t(chn) *tree = chn_scratch.t;
         mem_chain_v *chain = &chain_ar[l];
         size = 0;
 
@@ -2527,7 +2549,7 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
         for (i = 0; i < chain->n; ++i)
             chain->a[i].frac_rep = (float)l_rep / seq_[l].l_seq;
 
-        kb_destroy(chn, tree);
+        kb_reset(chn, tree); // reuse the tree for the next read (no destroy/re-init)
 
     } // iterations over input reads
     tprof[MEM_SA_BLOCK][tid] += __rdtsc() - tim;
