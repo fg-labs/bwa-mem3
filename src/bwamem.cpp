@@ -43,6 +43,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include <strings.h>       /* strcasecmp in mem_opt_parse_meth_tags */
 #include <atomic>          /* net-cycles auto-dedup controller state */
 #include <chrono>          /* net-cycles auto-dedup controller timing */
+#include <cmath>           /* std::isfinite: reject nan/inf BWAMEM3_DEDUP_Z */
 #include <mutex>           /* BWAMEM3_DUMP_PAIRS append lock; net-cycles Welford state */
 #include <string>          /* BWAMEM3_DUMP_PAIRS per-batch row buffer */
 
@@ -4299,8 +4300,8 @@ void mem_dedup_configure(const char *mode_arg)
         const double zv  = strtod(z, &end);
         /* Full-string parse: reject trailing junk ("2x") rather than silently
          * taking the leading number, the way atof would. */
-        if (end == z || end == NULL || *end != '\0' || errno == ERANGE || zv <= 0.0) {
-            fprintf(stderr, "ERROR: BWAMEM3_DEDUP_Z: must be a number > 0, got '%s'\n", z);
+        if (end == z || end == NULL || *end != '\0' || errno == ERANGE || !std::isfinite(zv) || zv <= 0.0) {
+            fprintf(stderr, "ERROR: BWAMEM3_DEDUP_Z: must be a finite number > 0, got '%s'\n", z);
             exit(1);
         }
         g_dedup_cfg.z = zv;
@@ -4502,6 +4503,64 @@ static inline uint64_t bsw_job_hash(const uint8_t *s1, int len1,
     return h;
 }
 
+/* BWAMEM3_DEDUP_STATS=1: count distinct-within-batch (m) vs total (n) extension
+ * DP jobs and print the batch dup rate once at exit. Measurement only; a single
+ * cached-bool branch per batch, inert unless armed. */
+static std::atomic<uint64_t> g_dedup_total{0};
+static std::atomic<uint64_t> g_dedup_distinct{0};
+static inline bool bsw_dedup_stats_on(void)
+{
+    static const bool on = []() {
+        const char *e = getenv("BWAMEM3_DEDUP_STATS");
+        return e && *e && !(e[0] == '0' && e[1] == '\0');
+    }();
+    return on;
+}
+static struct BswDedupStatsDumper {
+    ~BswDedupStatsDumper() {
+        if (!bsw_dedup_stats_on()) return;
+        uint64_t t = g_dedup_total.load(), d = g_dedup_distinct.load();
+        fprintf(stderr,
+            "[dedup-stats] total_jobs=%llu distinct_jobs=%llu perbatch_dup_rate=%.4f\n",
+            (unsigned long long)t, (unsigned long long)d,
+            t ? 1.0 - (double)d / (double)t : 0.0);
+    }
+} g_bsw_dedup_stats_dumper;
+
+/* BWAMEM3_EXT_TIME=1: sum the wall time spent inside bsw_tier_kernel (the
+ * extension dedup + banded-SW path) across all worker threads, print at exit.
+ * Dedup changes only affect this phase, so a small-read smoke run reports the
+ * extension delta directly instead of burying it under the fixed index-load +
+ * I/O wall. Sums thread-time, which is fine for A/B ratios. Inert unless armed. */
+static std::atomic<uint64_t> g_ext_ns{0};
+static inline bool bsw_ext_time_on() {
+    static const bool on = []() {
+        const char *e = getenv("BWAMEM3_EXT_TIME");
+        return e && *e && !(e[0] == '0' && e[1] == '\0');
+    }();
+    return on;
+}
+static struct BswExtTimeDumper {
+    ~BswExtTimeDumper() {
+        if (bsw_ext_time_on())
+            fprintf(stderr, "[ext-time] bsw_tier_kernel_thread_ms=%.1f\n",
+                    g_ext_ns.load() / 1e6);
+    }
+} g_bsw_ext_time_dumper;
+struct BswExtTimer {
+    std::chrono::steady_clock::time_point t0;
+    bool on;
+    BswExtTimer() : on(bsw_ext_time_on()) {
+        if (on) t0 = std::chrono::steady_clock::now();
+    }
+    ~BswExtTimer() {
+        if (on) g_ext_ns.fetch_add(
+            (uint64_t)std::chrono::duration<double, std::nano>(
+                std::chrono::steady_clock::now() - t0).count(),
+            std::memory_order_relaxed);
+    }
+};
+
 /* Dedup wrapper over bsw_score_batch: score each distinct (seq1,seq2,h0) job
  * once within this batch and copy its result to the repeats. Byte-identical to
  * scoring all n: every candidate sharing a fingerprint is byte-verified
@@ -4512,6 +4571,7 @@ static inline void bsw_tier_kernel(BswMethTier tier, IBandedPairWiseSW *bsw,
         SeqPair *sort_scratch, int32_t *hist)
 {
     if (n <= 0) return;
+    BswExtTimer _ext_timer;           /* inert unless BWAMEM3_EXT_TIME set */
     const int mode = bsw_dedup_mode();
     if (mode == BSW_DEDUP_OFF || n < 2) {
         bsw_score_batch(tier, bsw, pa, ref, qer, n, nthreads, w, sort_scratch, hist);
@@ -4586,6 +4646,10 @@ static inline void bsw_tier_kernel(BswMethTier tier, IBandedPairWiseSW *bsw,
     }
 
     const int m = (int)repbuf.size();
+    if (bsw_dedup_stats_on()) {   /* count distinct-within-batch vs total */
+        g_dedup_total.fetch_add((uint64_t)n, std::memory_order_relaxed);
+        g_dedup_distinct.fetch_add((uint64_t)m, std::memory_order_relaxed);
+    }
     if (m > 0) {
         /* tag each rep's group in the unused `id` field before scoring permutes
          * repbuf. The kernels write `id` only on the padding lanes
