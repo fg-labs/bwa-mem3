@@ -2911,12 +2911,12 @@ int main_mem(int argc, char *argv[])
 
 #if SMEM_LOCKSTEP_N > 1
     /* Resolve the phase-2 SMEM lockstep width once, before the seeding workers
-     * spawn: a startup probe of the core's memory-level parallelism sets how
-     * many reads' FM-index walks the driver keeps in flight (BWA3_SMEM_LOCKSTEP_N
-     * overrides and skips the probe). The probe chases the just-loaded cp_occ
-     * checkpoint array (opaque here: base, block count, block stride, and the
-     * byte offset of a 64-bit word per block). Width changes scheduling only,
-     * never output. */
+     * spawn: how many reads' FM-index walks the driver keeps in flight. Defaults
+     * to the compile-time SMEM_LOCKSTEP_N; BWA3_SMEM_LOCKSTEP_N pins an explicit
+     * value, and BWA3_SMEM_LOCKSTEP_PROBE opts into a startup memory-level-
+     * parallelism probe that chases the just-loaded cp_occ checkpoint array
+     * (opaque here: base, block count, block stride, and the byte offset of a
+     * 64-bit word per block). Width changes scheduling only, never output. */
     bwa3_init_smem_lockstep_width(
         aux.fmi->cp_occ_data(),
         aux.fmi->cp_occ_size_bytes() / (int64_t)sizeof(CP_OCC),

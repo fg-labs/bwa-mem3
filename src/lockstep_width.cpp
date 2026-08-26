@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <string.h>
 #include <time.h>
 #include <errno.h>
 
@@ -18,7 +19,7 @@ int32_t bwa3_lockstep_width_from_probe(int32_t raw_mlp) {
 }
 
 int32_t bwa3_lockstep_width_parse_env(const char *env) {
-    if (env == NULL || env[0] == '\0') return 0;  /* unset: run the probe */
+    if (env == NULL || env[0] == '\0') return 0;  /* unset/empty: no override */
 
     errno = 0;
     char *end = NULL;
@@ -28,6 +29,13 @@ int32_t bwa3_lockstep_width_parse_env(const char *env) {
     if (v < 1)                      return -1;  /* non-positive */
     if (v > SMEM_LOCKSTEP_N_MAX)    return SMEM_LOCKSTEP_N_MAX;  /* clamp large to ceiling */
     return (int32_t)v;
+}
+
+int bwa3_lockstep_probe_enabled(const char *env) {
+    /* Truthy opt-in: enable only for a present, non-empty value that is not "0".
+     * Unset (NULL), empty, and "0" all leave the probe off, so neither an empty
+     * value nor an explicit =0 can silently pay the startup sweep's cost. */
+    return env != NULL && env[0] != '\0' && strcmp(env, "0") != 0;
 }
 
 /* ---- startup memory-level-parallelism probe --------------------------------
@@ -140,19 +148,31 @@ void bwa3_init_smem_lockstep_width(const void *base, int64_t n_blocks,
     const char *env = getenv("BWA3_SMEM_LOCKSTEP_N");
     const int32_t pinned = bwa3_lockstep_width_parse_env(env);
     if (pinned > 0) {
-        /* A valid override pins the width and disables the probe, so gated/CI
-         * runs pay no measurement cost and stay deterministic. */
+        /* A valid override pins the width explicitly, so gated/CI runs pay no
+         * measurement cost and stay deterministic. */
         g_smem_lockstep_n = pinned;
     } else {
         if (pinned < 0)
-            /* Set but invalid: do NOT silently fall through to the floor -- that
-             * would disable auto-tuning without a trace. Diagnose and probe. */
+            /* Set but invalid: do NOT silently accept it. Diagnose, then fall
+             * through to the same resolution as an unset value below. */
             fprintf(stderr,
                     "ERROR: BWA3_SMEM_LOCKSTEP_N=\"%s\" is not a positive integer "
-                    "(<= %d); ignoring it and auto-tuning the lockstep width.\n",
+                    "(<= %d); ignoring it (resolving as if unset).\n",
                     env, SMEM_LOCKSTEP_N_MAX);
-        g_smem_lockstep_n = bwa3_lockstep_width_from_probe(
-            bwa3_measure_mlp(base, n_blocks, stride, word_off));
+        /* No explicit pin. The startup MLP probe is OPT-IN, not the default:
+         * measured across architectures (x86/arm), core counts, and page sizes,
+         * the lockstep width is a flat ~1% knob end-to-end, while the probe
+         * itself costs a non-trivial single-threaded startup pass. So by default
+         * we keep the compile-time SMEM_LOCKSTEP_N (the value the probe converges
+         * to on all benchmarked hardware -- output is unchanged, the probe cost
+         * is not paid). BWA3_SMEM_LOCKSTEP_PROBE=1 opts back into the probe to
+         * self-calibrate on new/untested hardware. Truthy opt-in
+         * (bwa3_lockstep_probe_enabled): any value other than unset, empty, or
+         * "0" enables it, so unset it (or set it to 0) to disable. */
+        if (bwa3_lockstep_probe_enabled(getenv("BWA3_SMEM_LOCKSTEP_PROBE")))
+            g_smem_lockstep_n = bwa3_lockstep_width_from_probe(
+                bwa3_measure_mlp(base, n_blocks, stride, word_off));
+        /* else: g_smem_lockstep_n keeps its compile-time SMEM_LOCKSTEP_N init. */
     }
     done = 1;
 }
