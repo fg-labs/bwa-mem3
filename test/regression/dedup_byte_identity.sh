@@ -37,6 +37,16 @@ done
 n=$(grep -vc '^@' "$W/off_dup_t1.sam"); [[ "$n" -ge 9600 ]] || fail "record count $n < 9600"
 ok "record-count sanity ($n records)"
 
+# Guard: the dedup path must ACTUALLY be exercised. The fixture's 3 bp deletion
+# forces gapped extension so reads reach banded SW; if that ever regresses to an
+# exact-substring / ungapped-fast-path fixture, total_jobs would be 0 and the
+# byte-identity checks above would be vacuously true. Assert it is non-zero.
+tj=$(BWAMEM3_DEDUP=on BWAMEM3_DEDUP_STATS=1 "$BWA_MEM3" mem -t 1 "$W/phix.fa" \
+        "$W/dup_1.fq" "$W/dup_2.fq" 2>&1 >/dev/null \
+     | awk -F'total_jobs=' '/dedup-stats/{split($2,a," "); print a[1]}')
+[[ "${tj:-0}" -gt 0 ]] || fail "dedup path not exercised (total_jobs=${tj:-0}); fixture is vacuous"
+ok "dedup path exercised (${tj} banded-SW jobs deduped)"
+
 # CLI flags: --dedup must mirror the env, flag wins over env, bad values fatal
 "$BWA_MEM3" mem -t 1 --dedup on "$W/phix.fa" "$W/dup_1.fq" "$W/dup_2.fq" 2>/dev/null \
     | grep -v '^@PG' > "$W/cli_on.sam" || fail "--dedup on run failed"
