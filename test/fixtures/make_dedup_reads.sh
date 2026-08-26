@@ -13,16 +13,22 @@
 # test vacuous. The deletion is identical across a window's repeats, so repeats
 # stay byte-identical duplicate jobs.
 set -euo pipefail
-FA=$1; OUT=$2; NW=$3; REP=$4
+FA=$1
+OUT=$2
+NW=$3
+REP=$4
 SEQ=$(awk '/^>/{next}{printf "%s",$0}' "$FA")
 QUAL=$(printf 'I%.0s' $(seq 97))
-: > "${OUT}_1.fq"; : > "${OUT}_2.fq"
-for ((i=0; i<NW; i++)); do
-    start=$(( (i * 37) % 4900 ))                     # stride 37, stay inside 5386-300
-    fwd=${SEQ:$start:100};              fwd="${fwd:0:44}${fwd:47}"      # 3 bp deletion -> banded SW
-    m2=${SEQ:$((start+200)):100}
-    rev=$(printf '%s' "$m2" | rev | tr ACGTacgt TGCAtgca); rev="${rev:0:44}${rev:47}"
-    for ((r=0; r<REP; r++)); do
+: > "${OUT}_1.fq"
+: > "${OUT}_2.fq"
+for ((i = 0; i < NW; i++)); do
+    start=$(((i * 37) % 4900)) # stride 37, stay inside 5386-300
+    fwd=${SEQ:$start:100}
+    fwd="${fwd:0:44}${fwd:47}" # 3 bp deletion -> banded SW
+    m2=${SEQ:$((start + 200)):100}
+    rev=$(printf '%s' "$m2" | rev | tr ACGTacgt TGCAtgca)
+    rev="${rev:0:44}${rev:47}"
+    for ((r = 0; r < REP; r++)); do
         printf '@dd_%05d_%02d/1\n%s\n+\n%s\n' "$i" "$r" "$fwd" "$QUAL" >> "${OUT}_1.fq"
         printf '@dd_%05d_%02d/2\n%s\n+\n%s\n' "$i" "$r" "$rev" "$QUAL" >> "${OUT}_2.fq"
     done
