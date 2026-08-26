@@ -82,8 +82,11 @@ bwa-mem3 mem -t <N> -m 10 -y 0 ref.fa R1.fq R2.fq > out.sam
 > --smem-dedup --skip-contained-ext --max-extend-chains 20 --adaptive-band
 > --extend-mate-concordant` (plus `-s 2` and a lower `--max-extend-chains 10`
 > under `--meth`) in one flag. Explicit flags
-> still override individual levers where applicable; `--smem-dedup`,
-> `--skip-contained-ext` and `--adaptive-band` are forced on with no opt-out
+> still override individual levers where applicable; `--smem-dedup` and
+> `--skip-contained-ext` are forced on with no opt-out, and `--adaptive-band` is
+> forced on but can be opted back out with `--no-adaptive-band` (which restores the exact
+> full-width extension step — byte-identical to a run without `--adaptive-band` — while
+> keeping the rest of `--fast`, whose other levers can still change output)
 > (`--adaptive-band` is a no-op on short reads, a ~25% speedup on medium-length runs
 > such as SBX ~240 bp; kilobase-scale HiFi/ONT do not run at default settings — see
 > [Situational: `--adaptive-band`](#situational---adaptive-band-for-medium-length-reads)).

@@ -1566,6 +1566,7 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "    --skip-contained-ext  skip banded-SW extension of seeds contained (same diagonal) in a longer in-chain seed; byte-identical on short/medium non-meth reads (NOT on kilobase-scale long reads); no effect under --meth [off]\n");
     fprintf(stderr, "    --max-extend-chains INT  cap chains extended per read to the top-INT by weight; ~23%% less alignment CPU, high-confidence placement unaffected; ignored for reads with >4096 chains; opt-in, NOT byte-identical (0 = off) [%d]\n", opt->max_extend_chains);
     fprintf(stderr, "    --adaptive-band  adaptive banded-SW: start tight and expand each pair to its chain-geometry band on long-extension reads; ~1.3x on medium reads (SBX ~240bp), no-op on short reads; kilobase-scale HiFi/ONT do not run at default settings; opt-in, NOT byte-identical [%s]\n", opt->band_start? "on":"off");
+    fprintf(stderr, "    --no-adaptive-band  disable adaptive banded-SW (exact, byte-identical extension); overrides --adaptive-band and the --adaptive-band that --fast enables\n");
     fprintf(stderr, "    --extend-mate-concordant[=INT]  when --max-extend-chains caps a PE read, also keep any chain concordant (same contig, FR, within INT bp) with a mate chain; recovers the true pair's low-weight chain the cap would drop (mainly --meth). Bare = auto (window = estimated proper-pair insert high bound); =INT = fixed bp; =0 = off. Opt-in, NOT byte-identical [%s]\n", opt->mate_concordant_window? (opt->mate_concordant_window<0? "auto":"fixed") : "off");
     fprintf(stderr, "    -D FLOAT      drop chains shorter than FLOAT fraction of the longest overlapping chain [%.2f]\n", opt->drop_ratio);
     fprintf(stderr, "    -W INT        discard a chain if seeded bases shorter than INT [0]\n");
@@ -1590,7 +1591,8 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "                  --extend-mate-concordant (under --meth: --max-extend-chains 10,\n");
     fprintf(stderr, "                  -s 2). Opt-in; explicit\n");
     fprintf(stderr, "                  flags override where applicable; --smem-dedup,\n");
-    fprintf(stderr, "                  --skip-contained-ext and --adaptive-band are always enabled.\n");
+    fprintf(stderr, "                  --skip-contained-ext and --adaptive-band are enabled\n");
+    fprintf(stderr, "                  (pass --no-adaptive-band to keep exact extension under --fast).\n");
     fprintf(stderr, "                  Also switches the alignment-region dedup sort to a strict\n");
     fprintf(stderr, "                  total order (faster, but resolves equal-end-position ties\n");
     fprintf(stderr, "                  differently from bwa-mem2, which the default reproduces).\n");
@@ -1817,6 +1819,10 @@ int main_mem(int argc, char *argv[])
      * task_size block below. */
     int64_t      chunk_cap                 = 0;
     int          chunk_cap_set             = 0;
+    /* --no-adaptive-band: user opted out of adaptive banded-SW extension. Tracked
+     * separately so the opt-out beats both an explicit --adaptive-band (either
+     * order) and the --adaptive-band that --fast would otherwise turn on. */
+    int          no_adaptive_band          = 0;
     /* --cohort-slices: how many geometric slices to read the FIRST batch in, so
      * compute can start before the whole batch has been read. Byte-identical --
      * the batch (pestat cohort) boundary is unchanged, only the physical read
@@ -1955,6 +1961,7 @@ int main_mem(int argc, char *argv[])
         OPT_HUGE_PAGES,
         OPT_SKIP_CONTAINED_EXT,
         OPT_ADAPTIVE_BAND,
+        OPT_NO_ADAPTIVE_BAND,
         OPT_EXTEND_MATE_CONCORDANT,
         OPT_COMPAT,
         OPT_CHUNK_CAP,
@@ -1979,6 +1986,7 @@ int main_mem(int argc, char *argv[])
         {"huge-pages",               no_argument,       0, OPT_HUGE_PAGES},
         {"skip-contained-ext",       no_argument,       0, OPT_SKIP_CONTAINED_EXT},
         {"adaptive-band",            no_argument,       0, OPT_ADAPTIVE_BAND},
+        {"no-adaptive-band",         no_argument,       0, OPT_NO_ADAPTIVE_BAND},
         {"extend-mate-concordant",   optional_argument, 0, OPT_EXTEND_MATE_CONCORDANT},
         {"chunk-cap",                required_argument, 0, OPT_CHUNK_CAP},
         {"cohort-slices",            required_argument, 0, OPT_COHORT_SLICES},
@@ -2391,7 +2399,8 @@ int main_mem(int argc, char *argv[])
             }
         }
         else if (c == OPT_SKIP_CONTAINED_EXT) opt->skip_contained_ext = 1;
-        else if (c == OPT_ADAPTIVE_BAND) opt->band_start = ADAPTIVE_BAND_START;
+        else if (c == OPT_ADAPTIVE_BAND) { if (!no_adaptive_band) opt->band_start = ADAPTIVE_BAND_START; }
+        else if (c == OPT_NO_ADAPTIVE_BAND) { no_adaptive_band = 1; opt->band_start = 0; }
         else if (c == OPT_EXTEND_MATE_CONCORDANT) {
             /* bare flag = auto (-1, use the estimated insert-size high bound);
              * =INT = fixed window in bp; =0 = off. */
@@ -2655,9 +2664,12 @@ int main_mem(int argc, char *argv[])
                                                           * bwa-mem2 on equal-`re` ties) */
         opt->skip_contained_ext = 1;                     /* --skip-contained-ext (plain on/off;
                                                           * meth-gated internally) */
-        opt->band_start = ADAPTIVE_BAND_START;           /* --adaptive-band: no-op on short reads
+        if (!no_adaptive_band)
+            opt->band_start = ADAPTIVE_BAND_START;        /* --adaptive-band: no-op on short reads
                                                           * (8-bit tier untouched), ~25% faster on
-                                                          * long-read (SBX/HiFi/ONT) runs. */
+                                                          * long-read (SBX/HiFi/ONT) runs.
+                                                          * --no-adaptive-band opts back out, keeping
+                                                          * band_start=0 (exact extension) here. */
         /* --extend-mate-concordant (meth only): the top-5 chain cap regresses
          * bisulfite PE placement. Mechanism (instrumented on 50k sim-meth-place
          * pairs vs truth): NOT chain-dropping -- in 89% of regressions the read's
@@ -2851,15 +2863,19 @@ int main_mem(int argc, char *argv[])
          * anywhere else in the run -- it changes MAPQ on rescued reads, so which way
          * it resolved has to be on the record. It applies under --meth too (the
          * anchor scan collapses to 3 letters there), so it is on both branches. */
+        /* Report the RESOLVED adaptive-band state: --no-adaptive-band opts back out
+         * (band_start=0), and like --rescue-kmer=0 that off-state is otherwise
+         * invisible in the run record, so spell it out on the audit line. */
+        const char *adaptive_band_label = opt->band_start ? "--adaptive-band" : "--no-adaptive-band";
         if (opt->meth_mode)
             /* --skip-contained-ext is set but no-ops under --meth (internal gate), so it is
              * intentionally omitted from the meth audit line to reflect the effective levers.
-             * --adaptive-band is set unconditionally and applies under --meth, so it stays. */
-            fprintf(stderr, "[M::%s] --fast: -m %d -y %ld --min-ext-len %d --smem-dedup --max-extend-chains %d --adaptive-band -s %d --extend-mate-concordant --rescue-kmer=%d%s alnreg-sort=fast\n",
-                    __func__, opt->max_matesw, (long)opt->max_mem_intv, opt->min_ext_len, opt->max_extend_chains, opt->split_width, opt->rescue_kmer, opt->rescue_skip ? " --rescue-skip" : "");
+             * --adaptive-band applies under --meth, so it stays (unless opted out). */
+            fprintf(stderr, "[M::%s] --fast: -m %d -y %ld --min-ext-len %d --smem-dedup --max-extend-chains %d %s -s %d --extend-mate-concordant --rescue-kmer=%d%s alnreg-sort=fast\n",
+                    __func__, opt->max_matesw, (long)opt->max_mem_intv, opt->min_ext_len, opt->max_extend_chains, adaptive_band_label, opt->split_width, opt->rescue_kmer, opt->rescue_skip ? " --rescue-skip" : "");
         else
-            fprintf(stderr, "[M::%s] --fast: -m %d -y %ld --min-ext-len %d --smem-dedup --skip-contained-ext --max-extend-chains %d --adaptive-band --extend-mate-concordant --rescue-kmer=%d%s alnreg-sort=fast\n",
-                    __func__, opt->max_matesw, (long)opt->max_mem_intv, opt->min_ext_len, opt->max_extend_chains, opt->rescue_kmer, opt->rescue_skip ? " --rescue-skip" : "");
+            fprintf(stderr, "[M::%s] --fast: -m %d -y %ld --min-ext-len %d --smem-dedup --skip-contained-ext --max-extend-chains %d %s --extend-mate-concordant --rescue-kmer=%d%s alnreg-sort=fast\n",
+                    __func__, opt->max_matesw, (long)opt->max_mem_intv, opt->min_ext_len, opt->max_extend_chains, adaptive_band_label, opt->rescue_kmer, opt->rescue_skip ? " --rescue-skip" : "");
         /* --fast also caps the batch size, which keeps the read/compute/write
          * pipeline overlapped at high -t. It re-partitions the input and so is not
          * byte-identical -- which --fast already is not -- hence it rides here

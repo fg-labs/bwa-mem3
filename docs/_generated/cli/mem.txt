@@ -16,6 +16,7 @@ Options:
     --skip-contained-ext  skip banded-SW extension of seeds contained (same diagonal) in a longer in-chain seed; byte-identical on short/medium non-meth reads (NOT on kilobase-scale long reads); no effect under --meth [off]
     --max-extend-chains INT  cap chains extended per read to the top-INT by weight; ~23% less alignment CPU, high-confidence placement unaffected; ignored for reads with >4096 chains; opt-in, NOT byte-identical (0 = off) [0]
     --adaptive-band  adaptive banded-SW: start tight and expand each pair to its chain-geometry band on long-extension reads; ~1.3x on medium reads (SBX ~240bp), no-op on short reads; kilobase-scale HiFi/ONT do not run at default settings; opt-in, NOT byte-identical [off]
+    --no-adaptive-band  disable adaptive banded-SW (exact, byte-identical extension); overrides --adaptive-band and the --adaptive-band that --fast enables
     --extend-mate-concordant[=INT]  when --max-extend-chains caps a PE read, also keep any chain concordant (same contig, FR, within INT bp) with a mate chain; recovers the true pair's low-weight chain the cap would drop (mainly --meth). Bare = auto (window = estimated proper-pair insert high bound); =INT = fixed bp; =0 = off. Opt-in, NOT byte-identical [off]
     -D FLOAT      drop chains shorter than FLOAT fraction of the longest overlapping chain [0.50]
     -W INT        discard a chain if seeded bases shorter than INT [0]
@@ -38,7 +39,8 @@ Options:
                   --extend-mate-concordant (under --meth: --max-extend-chains 10,
                   -s 2). Opt-in; explicit
                   flags override where applicable; --smem-dedup,
-                  --skip-contained-ext and --adaptive-band are always enabled.
+                  --skip-contained-ext and --adaptive-band are enabled
+                  (pass --no-adaptive-band to keep exact extension under --fast).
                   Also switches the alignment-region dedup sort to a strict
                   total order (faster, but resolves equal-end-position ties
                   differently from bwa-mem2, which the default reproduces).

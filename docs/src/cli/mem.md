@@ -634,6 +634,25 @@ so small/mid-size indel callability is unaffected.
 borderline secondary alignments (starting tight and expanding can change which of
 several near-tied placements wins). It is therefore an opt-in flag, not a default.
 
+#### `--no-adaptive-band` — force exact extension (opt out of `--adaptive-band`)
+
+Disables adaptive banded Smith-Waterman, restoring the exact full-width `-w`
+extension. This makes the **extension step** byte-identical to a run without
+`--adaptive-band` (it is the same full-width code path, by construction) — it does
+**not** make a whole `--fast` run byte-identical, since `--fast`'s other levers
+(`--max-extend-chains`, `--smem-dedup`, `--skip-contained-ext`, …) can still change
+output. It is the explicit opt-out for `--adaptive-band` and matters mainly under
+`--fast`, which turns `--adaptive-band` on for you: passing `--no-adaptive-band`
+alongside `--fast` keeps that one lever off (exact extension) while retaining the rest
+of the preset — the same "opt back out" role `--rescue-kmer=0` plays.
+
+The opt-out is order-independent and always wins: `--no-adaptive-band` beats an explicit
+`--adaptive-band` given in either order, and beats the `--adaptive-band` that `--fast`
+enables. On the default preset (where `--adaptive-band` is already off) it is a no-op.
+The resolved state is recorded on the `--fast` audit line — `[M::main_mem] --fast: …
+--no-adaptive-band …` — so the run record shows exact extension was in force (the off
+state would otherwise be invisible, exactly as for `--rescue-kmer=0`).
+
 #### `--extend-mate-concordant` — retain mate-concordant chains under a chain cap
 
 Takes an optional window: `--extend-mate-concordant` (bare) = **auto**, sizing the
@@ -709,6 +728,10 @@ are in any case not currently usable at default settings (see the long-read cave
 runs (e.g. SBX ~240 bp), so bundling it only helps. Note kilobase-scale HiFi/ONT reads do
 not run at default settings regardless of this flag (see
 [`--adaptive-band`](#--adaptive-band--adaptive-banded-smith-waterman-for-medium-length-reads)).
+Pass [`--no-adaptive-band`](#--no-adaptive-band--force-exact-extension-opt-out-of---adaptive-band)
+to opt back out — restoring the exact full-width extension step (byte-identical to a
+run without `--adaptive-band`) while retaining the rest of `--fast`, whose other levers
+can still change output.
 
 `--extend-mate-concordant` repairs the chain-cap pairing regression — the true, low-weight but
 mate-concordant chain the cap would otherwise drop — and is included for both non-meth and `--meth`
