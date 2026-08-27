@@ -342,6 +342,51 @@ typedef struct {
 		return kb_delp_##name(b, &k);									\
 	}
 
+#define __KB_RESET(name, key_t)											\
+	/* BWA-MEM3 local addition (not in upstream klib): __KB_RESET / kb_reset.	\
+	 * Reset a tree to the fresh kb_init state, reusing the root buffer	\
+	 * instead of freeing and reallocating it. Valid only for a pure-grow	\
+	 * tree (no interleaved kb_del) -- the chaining B-tree qualifies. The	\
+	 * result is byte-for-byte the state kb_init leaves: every constant		\
+	 * field (t, n, off_key, off_ptr, ilen, elen) is preserved, the root is	\
+	 * returned to an empty leaf, and the key/node counters are zeroed. Node	\
+	 * addresses never affect output (comparisons are value-only, traversal	\
+	 * is structural), so reusing the buffer is observably identical to a	\
+	 * destroy+init. The common single-leaf-root case performs ZERO			\
+	 * allocations; only an internal root (rare) walks to free descendants,	\
+	 * mirroring __kb_destroy's stack discipline. */						\
+	static void kb_reset_##name(kbtree_##name##_t *b)					\
+	{																	\
+		if (b == 0 || b->root == 0) return;								\
+		if (b->root->is_internal) { /* rare: free descendants, keep root */	\
+			int i, max = 8;												\
+			kbnode_t *x, **top, **stack;								\
+			top = stack = (kbnode_t**)malloc(max * sizeof(kbnode_t*));	\
+			assert(stack != NULL);										\
+			*top++ = b->root;											\
+			while (top != stack) {										\
+				x = *--top;												\
+				if (x->is_internal)										\
+					for (i = 0; i <= x->n; ++i)							\
+						if (__KB_PTR(b, x)[i]) {						\
+							if (top - stack == max) {					\
+								max <<= 1;								\
+								kbnode_t **grown = (kbnode_t**)realloc(stack, max * sizeof(kbnode_t*)); \
+								assert(grown != NULL);						\
+								stack = grown;								\
+								top = stack + (max>>1);					\
+							}											\
+							*top++ = __KB_PTR(b, x)[i];					\
+						}											\
+				if (x != b->root) free(x); /* keep the root buffer */	\
+			}															\
+			free(stack);												\
+		}																\
+		memset(b->root, 0, b->ilen);									\
+		b->n_keys = 0;													\
+		b->n_nodes = 1;													\
+	}
+
 typedef struct {
 	kbnode_t *x;
 	int i;
@@ -379,7 +424,8 @@ typedef struct {
 	__KB_GET(name, key_t)						\
 	__KB_INTERVAL(name, key_t)					\
 	__KB_PUT(name, key_t, __cmp)				\
-	__KB_DEL(name, key_t)
+	__KB_DEL(name, key_t)						\
+	__KB_RESET(name, key_t)
 
 #define KB_DEFAULT_SIZE 512
 
@@ -394,6 +440,7 @@ typedef struct {
 #define kb_putp(name, b, k) kb_putp_##name(b, k)
 #define kb_delp(name, b, k) kb_delp_##name(b, k)
 #define kb_intervalp(name, b, k, l, u) kb_intervalp_##name(b, k, l, u)
+#define kb_reset(name, b) kb_reset_##name(b)
 
 #define kb_size(b) ((b)->n_keys)
 
