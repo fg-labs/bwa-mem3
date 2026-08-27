@@ -41,6 +41,26 @@
     * at link time. */
 #  define ksw_extend2         BWAMEM3_PASTE(ksw_extend2,         KERNEL_VARIANT)
 #  define ksw_global2         BWAMEM3_PASTE(ksw_global2,         KERNEL_VARIANT)
+   /* Test-only: scalar reference behind ksw_global2 (see ksw.cpp), mangled
+    * per tier like the rest so it links once per tier and is resolved by a
+    * dispatch wrapper in simd_dispatch.cpp. Used only by the wavefront
+    * byte-identity unit test. */
+#  define ksw_global2_scalar_ref BWAMEM3_PASTE(ksw_global2_scalar_ref, KERNEL_VARIANT)
+   /* Internal wavefront kernels (ksw_global2_wave.h, included only by ksw.cpp).
+    * Static, so linking never needs these renamed — but each per-tier TU emits
+    * a copy at a different source line (the AVX-512/AVX2/NEON blocks are
+    * mutually exclusive), and gcov's default strict function-merge rejects one
+    * demangled name mapped to two lines when the per-tier .gcda are merged.
+    * Mangling per tier gives each copy a distinct name, mirroring the exported
+    * kernels above. */
+#  define ksw_g2_wave         BWAMEM3_PASTE(ksw_g2_wave,         KERNEL_VARIANT)
+#  define ksw_g2_wave16       BWAMEM3_PASTE(ksw_g2_wave16,       KERNEL_VARIANT)
+   /* Test-only per-thread wavefront-exec counter getters (ksw.cpp). Defined in
+    * every tier TU and dispatched to the active tier by simd_dispatch.cpp, like
+    * ksw_global2_scalar_ref. The int16 variant counts only int16-kernel entries. */
+#  define ksw_g2_wave_exec_count BWAMEM3_PASTE(ksw_g2_wave_exec_count, KERNEL_VARIANT)
+#  define ksw_g2_wave16_exec_count BWAMEM3_PASTE(ksw_g2_wave16_exec_count, KERNEL_VARIANT)
+#  define ksw_g2_wave_zr_capacity BWAMEM3_PASTE(ksw_g2_wave_zr_capacity, KERNEL_VARIANT)
 #  define ksw_extend          BWAMEM3_PASTE(ksw_extend,          KERNEL_VARIANT)
 #  define ksw_global          BWAMEM3_PASTE(ksw_global,          KERNEL_VARIANT)
 #  define ksw_align2          BWAMEM3_PASTE(ksw_align2,          KERNEL_VARIANT)

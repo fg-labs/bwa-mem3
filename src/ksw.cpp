@@ -46,6 +46,7 @@
 
 #include "ksw.h"
 #include "macro.h"
+#include "utils.h"   // xassert — bounds guard for the wavefront direction-byte store
 
 extern uint64_t tprof[LIM_R][LIM_C];
 
@@ -526,7 +527,12 @@ static inline uint32_t *push_cigar(int *n_cigar, int *m_cigar, uint32_t *cigar, 
 	return cigar;
 }
 
-int ksw_global2(int qlen, const uint8_t *query, int tlen, const uint8_t *target, int m, const int8_t *mat, int o_del, int e_del, int o_ins, int e_ins, int w, int *n_cigar_, uint32_t **cigar_)
+#include "ksw_global2_wave.h"
+
+/* Scalar reference banded Gotoh NW with CIGAR traceback. The per-tier entry
+ * point `ksw_global2` (below) routes wide-band CIGAR calls to the byte-identical
+ * wavefront SIMD kernel in ksw_global2_wave.h and everything else here. */
+static int ksw_global2_scalar(int qlen, const uint8_t *query, int tlen, const uint8_t *target, int m, const int8_t *mat, int o_del, int e_del, int o_ins, int e_ins, int w, int *n_cigar_, uint32_t **cigar_)
 {
 	eh_t *eh;
 	int8_t *qp; // query profile
@@ -636,6 +642,84 @@ int ksw_global2(int qlen, const uint8_t *query, int tlen, const uint8_t *target,
 	}
 	free(eh); free(qp); free(z);
 	return score;
+}
+
+/* Test-only instrumentation: counts wavefront-kernel entries on the calling
+ * thread. The differential unit test (test/unit/test_ksw_global2_wave.cpp) reads
+ * these to assert that, on a SIMD tier, the wavefront path actually executed — a
+ * scalar tier (sse41/sse42/avx, or any build with no wavefront kernel) leaves
+ * them at zero, so a scalar-vs-scalar run cannot silently masquerade as SIMD
+ * coverage. Two counters: the aggregate counts int16 OR int32 entries; the
+ * int16-specific one counts only int16-kernel entries, so the int16-tier test
+ * can prove the narrow kernel actually ran rather than every pair falling back
+ * to the int32 wave. Defined in every per-tier TU (the getters are mangled per
+ * tier and dispatched exactly like ksw_global2); thread_local keeps them
+ * race-free under the production multi-thread aligner. Not read on any
+ * production path. */
+static thread_local unsigned long g_ksw_wave_exec_count = 0;
+static thread_local unsigned long g_ksw_wave16_exec_count = 0;
+extern "C" unsigned long ksw_g2_wave_exec_count(void) { return g_ksw_wave_exec_count; }
+extern "C" unsigned long ksw_g2_wave16_exec_count(void) { return g_ksw_wave16_exec_count; }
+
+/* Per-thread wavefront scratch. File-scope (previously a function-local static
+ * inside ksw_global2, same static thread_local lifetime) so the test-only
+ * capacity getter below can observe the retained direction-byte store zr and
+ * prove the windowed decay policy in KswWaveScratch::ensure() actually releases
+ * it. Not read on any production path other than as the kernels' scratch. */
+static thread_local KswWaveScratch g_ksw_wave_scratch;
+extern "C" unsigned long ksw_g2_wave_zr_capacity(void) { return (unsigned long)g_ksw_wave_scratch.zr.capacity(); }
+
+/* Per-tier entry point. Routes to the byte-identical wavefront SIMD kernel when:
+ *   - a CIGAR is requested (the only production call shape), and
+ *   - the query is non-empty (qlen >= 1 — the proof excludes qlen == 0), and
+ *   - the standard DNA alphabet is in use (m == 5), and
+ *   - the direction-byte store area fits int (ksw_g2_wave_area_ok — only a
+ *     pathological multi-megabase region fails this), and
+ *   - the band is wide enough that SIMD beats scalar on this arch (w >= WMIN).
+ * Output is byte-identical for ANY w; the width gate is purely a throughput
+ * choice (narrow bands are faster scalar — see the per-arch crossover). Anything
+ * that misses a precondition (qlen == 0, an over-large region, tiers without a
+ * wavefront kernel: sse41/sse42/avx) falls through to the scalar path, which is
+ * the reference these kernels are proven identical to. */
+int ksw_global2(int qlen, const uint8_t *query, int tlen, const uint8_t *target, int m, const int8_t *mat, int o_del, int e_del, int o_ins, int e_ins, int w, int *n_cigar_, uint32_t **cigar_)
+{
+	/* Byte-identical wavefront cascade (every tier produces identical output;
+	 * the widths only choose the fastest safe path):
+	 *   1. int16 SIMD  — where the score range provably fits int16;
+	 *   2. int32 SIMD  — otherwise, above the per-arch width crossover;
+	 *   3. scalar      — narrow bands and everything else.
+	 * All tiers share one per-thread scratch. */
+#if defined(KSW_WAVE16_WMIN) || defined(KSW_WAVE_WMIN)
+	if (qlen >= 1 && n_cigar_ && cigar_ && m == 5 && ksw_g2_wave_area_ok(qlen, tlen, w)) {
+#  ifdef KSW_WAVE16_WMIN
+		if (w >= KSW_WAVE16_WMIN &&
+		    ksw_g2_wave16_safe(qlen, tlen, w, o_del, e_del, o_ins, e_ins, m, mat)) {
+			g_ksw_wave_scratch.ensure(qlen, tlen, w);
+			++g_ksw_wave_exec_count;
+			++g_ksw_wave16_exec_count;
+			return ksw_g2_wave16(qlen, query, tlen, target, m, mat, o_del, e_del, o_ins, e_ins, w, n_cigar_, cigar_, g_ksw_wave_scratch);
+		}
+#  endif
+#  ifdef KSW_WAVE_WMIN
+		if (w >= KSW_WAVE_WMIN) {
+			g_ksw_wave_scratch.ensure(qlen, tlen, w);
+			++g_ksw_wave_exec_count;
+			return ksw_g2_wave(qlen, query, tlen, target, m, mat, o_del, e_del, o_ins, e_ins, w, n_cigar_, cigar_, g_ksw_wave_scratch);
+		}
+#  endif
+	}
+#endif
+	return ksw_global2_scalar(qlen, query, tlen, target, m, mat, o_del, e_del, o_ins, e_ins, w, n_cigar_, cigar_);
+}
+
+/* Test-only hook: exposes the scalar reference implementation so the unit test
+ * (test/unit/test_ksw_global2_wave.cpp) can gate the wavefront kernel against it
+ * on the same input. The public ksw_global2 above routes a given (input, w) to
+ * exactly one path, so a differential test needs a second, unconditional entry
+ * to the scalar oracle. Not called on any production path. */
+int ksw_global2_scalar_ref(int qlen, const uint8_t *query, int tlen, const uint8_t *target, int m, const int8_t *mat, int o_del, int e_del, int o_ins, int e_ins, int w, int *n_cigar_, uint32_t **cigar_)
+{
+	return ksw_global2_scalar(qlen, query, tlen, target, m, mat, o_del, e_del, o_ins, e_ins, w, n_cigar_, cigar_);
 }
 
 int ksw_global(int qlen, const uint8_t *query, int tlen, const uint8_t *target, int m, const int8_t *mat, int gapo, int gape, int w, int *n_cigar_, uint32_t **cigar_)
