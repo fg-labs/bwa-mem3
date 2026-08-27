@@ -43,9 +43,9 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
  * ~34 -- 4.7x. QE_BLK=16 is the flat part of that curve; 8 is a wash and 32 is
  * worse, because halving the block-index sweep doubles the block being scanned.
  *
- * QE_MAXBLK bounds the checkpoint array. ncol cannot exceed 255 in the 8-bit
- * kernels -- the width guard (l_ms * a < 250) caps it, and the u8 column index
- * the kernel records would wrap otherwise -- so 256/QE_BLK blocks plus one for
+ * QE_MAXBLK bounds the checkpoint array. In the 8-bit kernels ncol cannot exceed
+ * 256 -- the u8 admission bound (matesw_use_u8) caps the real query at len2 <=
+ * 250, whose padded quantum8 is at most 256 -- so 256/QE_BLK blocks plus one for
  * a partial tail is always enough. */
 #define QE_BLK    16
 #define QE_MAXBLK (256 / QE_BLK + 1)
@@ -398,6 +398,30 @@ kswv::~kswv() {
 }
 
 
+/* u8-tier saturation guard, shared by every u8 kernel (NEON/AVX2/AVX-512).
+ * Defined ahead of the per-arch kernel-body ladder so all three tiers see it.
+ *
+ * The u8 tier is byte-identical to the 16-bit tier only while the max attainable
+ * biased score cannot saturate the uint8_t running value. Bound it on the
+ * group's REAL max query length -- max over the lanes of p[i].len2 (padding
+ * lanes carry len2 == 0, and every column past a lane's quantum is inert and
+ * adds no score) -- NOT the padded column count `ncol`. query_quantum8 rounds a
+ * 241..249 bp mate up to 256, so a guard on `ncol` false-trips (256*1 + shift >=
+ * 256) on inputs the u8 admission bound in mem_matesw already proved safe; that
+ * over-conservative guard aborted lightly-trimmed 2x250 mates on release builds.
+ *
+ * The routing contract (see matesw_use_u8) admits a pair only when
+ * len2*w_match + shift <= 254, which also implies no biased saturation. A
+ * violation here is silent score/XS/MAPQ corruption, not a crash, so it is an
+ * xassert (release-active). */
+static inline void kswv_u8_saturation_guard(const SeqPair *p, int8_t w_match, uint8_t shift) {
+    int maxq = 0;
+    for (int i = 0; i < SIMD_WIDTH8; ++i) if (p[i].len2 > maxq) maxq = p[i].len2;
+    xassert((int64_t)maxq * (int64_t)w_match + (int64_t)shift <= 254,
+            "u8 rescue tier: max score + bias can saturate; USQADD and biased "
+            "forms would diverge -- the 16-bit tier must handle this score range");
+}
+
 /*******************************************************************************
  * ARM/NEON Implementation
  * Native NEON for 128-bit vectors (16 x 8-bit or 8 x 16-bit elements)
@@ -668,23 +692,10 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
             temp[i] += shift;
     }
 
-    /* The u8 tier is only selected when the max attainable score fits u8; that
-     * is what keeps every live cell's unbiased h+delta in [0,255], where USQADD
-     * (clamp) and the biased add+de-bias pair produce the identical value. Guard
-     * it: a param set that violated this would make the two forms DIVERGE
-     * SILENTLY (wrong score/XS/MAPQ), not crash.
-     *
-     * The bound is the max attainable score PLUS `shift`, not the score alone:
-     * the biased running value is stored as h+shift, so it saturates once
-     * ncol*w_match + shift exceeds 255 -- and there the biased form caps while
-     * USQADD (unbiased) keeps climbing, so the two diverge. The max SW score is
-     * the query columns times the match reward. The u8-tier width guard
-     * (l_ms*a < 250) keeps this well under 256 for real params, so this never
-     * fires in production; it only trips a pathological param set. Use xassert
-     * (release-active), since a violation is silent corruption, not a crash. */
-    xassert((int64_t)ncol * (int64_t)this->w_match + (int64_t)shift < 256,
-            "u8 rescue tier: max score + bias can saturate; USQADD and biased "
-            "forms would diverge -- the 16-bit tier must handle this score range");
+    /* u8-tier saturation guard. Bounds on the group's REAL max query length,
+     * not the padded `ncol` (which rounds 241..249 up to 256 and false-trips on
+     * safe, admitted mates). See kswv_u8_saturation_guard. */
+    kswv_u8_saturation_guard(p, this->w_match, shift);
 
     uint8x16_t permSft = vld1q_u8((const uint8_t*)temp);
     uint8x16_t sft_vec = vdupq_n_u8(shift);
@@ -2043,6 +2054,11 @@ int kswv::kswv256_u8_impl(uint8_t seq1SoA[],
     __m256i permSft     = _mm256_broadcastsi128_si256(permSft_128);
     __m256i sft_vec     = _mm256_set1_epi8((char)shift);
 
+    /* u8-tier saturation guard (see kswv_u8_saturation_guard). The u8 admission
+     * bound keeps every admitted pair safe; this catches a violating param set
+     * before it silently corrupts scores. */
+    kswv_u8_saturation_guard(p, this->w_match, shift);
+
     uint32_t minsc_msk_a = 0, endsc_msk_a = 0;
     for (int i = 0; i < SIMD_WIDTH8; i++) {
         int xtra = p[i].h0;
@@ -3245,6 +3261,11 @@ int kswv::kswv512_u8_impl(uint8_t seq1SoA[],
     
     __m512i permSft512 = _mm512_load_si512(temp);
     __m512i sft512 = _mm512_set1_epi8(shift);
+
+    /* u8-tier saturation guard (see kswv_u8_saturation_guard). The u8 admission
+     * bound keeps every admitted pair safe; this catches a violating param set
+     * before it silently corrupts scores. */
+    kswv_u8_saturation_guard(p, this->w_match, shift);
     __m512i cmax512 = _mm512_set1_epi8(255);
     
     // __m512i minsc512, endsc512;

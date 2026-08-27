@@ -57,6 +57,7 @@
 // the two precisions legitimately collect different b[] entries.
 
 #include <random>
+#include <set>
 #include <vector>
 
 #include "doctest/doctest.h"
@@ -170,6 +171,21 @@ void compare_batch(uint64_t seed, const std::vector<bwa_tests::TestPair> &pairs,
     // run the loop below zero times and still report green.
     const int survivors = bb.prepare_phase1();
     REQUIRE(survivors > 0);
+    // survivors > 0 alone is vacuous for the ragged-quantum contract: if every
+    // survivor shares one query length, the short/long lanes never coexist in a
+    // phase-1 group and the padding-column exposure this test exists to cover is
+    // untested. Require each distinct input query length to have cleared the
+    // KSW_XSTART/KSW_XSUBO gate so both lengths reach the tb/qb checks below.
+    std::set<size_t> requested_qlens;
+    for (const auto &p : pairs) requested_qlens.insert(p.qry.size());
+    std::set<size_t> survivor_qlens;
+    for (int i = 0; i < survivors; i++) {
+        survivor_qlens.insert(pairs[bb.pairs()[i].regid].qry.size());
+    }
+    for (const size_t qlen : requested_qlens) {
+        CAPTURE(qlen);
+        REQUIRE(survivor_qlens.count(qlen) > 0);
+    }
     if (use16) {
         pwsw->getScores16(bb.pairs(), bb.ref_buf(), bb.qer_buf(), bb.aln(), survivors, 1, 1);
     } else {
@@ -332,6 +348,45 @@ TEST_CASE("kswv matches scalar on uniform-query-length batches"
     for (uint64_t seed = 101; seed <= 104; ++seed) {
         check_batch_matches_scalar(seed, 129, 151, 151);
         check_batch_matches_scalar(seed, 129, 151, 151, /*use16=*/true);
+    }
+}
+
+// The tightened u8 mate-rescue admission bound (matesw_use_u8) routes 250 bp
+// mates (match=1: 250 + shift 4 == 254) to the u8 kernel, which the historical
+// `l_ms*a < 250` bound sent to the 2x-slower 16-bit tier. That is only sound if
+// the u8 kernel is byte-identical to the exact alignment at those lengths, and
+// if the kernel's saturation guard bounds on the REAL max query length rather
+// than the padded quantum8. This case runs getScores8 across the 240..250
+// region and compares every field against the scalar oracle:
+//   - 241..249: query_quantum8 rounds these up to 256, so origin/main's
+//     ncol-based assert (256*1 + 4 = 260 >= 256) ABORTS the process on these
+//     perfectly safe mates. Running them clean here is the B1 regression gate.
+//   - 250: the newly-admitted length. Byte-identity vs the oracle is the proof
+//     that flipping its tier does not change output.
+// 251 is deliberately absent: 251 + 4 = 255 genuinely saturates the u8 DP, the
+// admission bound rejects it, and the guard would (correctly) fire if it ran.
+TEST_CASE("kswv::getScores8 u8 tier is byte-identical across the 240-250 admission boundary"
+          * doctest::test_suite("unit/kswv")) {
+    // A minimal representative boundary set, sized to stay within the ~100 ms
+    // unit-test budget. All four lengths that matter are covered -- 240 (the
+    // control just below the quantum step, rounds to 240), 241 and 249 (the ends
+    // of the 241..249 range that round up to 256 and tripped origin/main's abort),
+    // and 250 (the newly-admitted length) -- each with two seeds where the padded
+    // content interaction is subtle. The uniform SUBCASE anchors the 240 control
+    // and the 250 admission; the ragged SUBCASE carries 241 and 249 in groups
+    // whose quantum8 still rounds to 256, so it exercises the same abort gate.
+    // The exhaustive seed/length sweep lives in the standalone kernel
+    // byte-identity harness, not in this unit test.
+    SUBCASE("uniform query lengths at the boundary") {
+        for (uint64_t seed = 1; seed <= 2; ++seed)
+            for (int len : {240, 250})
+                check_batch_matches_scalar(seed, 129, len, len);   // uniform at the boundary
+    }
+    SUBCASE("ragged query lengths straddling a quantum") {
+        for (uint64_t seed = 1; seed <= 2; ++seed) {
+            check_batch_matches_scalar(seed, 129, 241, 250);       // 241 rounds to 256
+            check_batch_matches_scalar(seed, 129, 249, 250);       // 249 rounds to 256
+        }
     }
 }
 
