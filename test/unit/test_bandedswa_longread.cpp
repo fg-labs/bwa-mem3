@@ -62,8 +62,8 @@ void build_mat(int8_t mat[25], int a, int b, int ambig) {
 // target>=query pairs up to maxlen, and tally per-field mismatches. Returns the
 // total number of pairs with any mismatch.
 int run_parity(int width, int n, int maxlen, unsigned long seed, int zdrop,
-               int &bs, int &bt, int &bg, int &bq, int &bgs, int &bm) {
-    const int a = 1, b = 4, ambig = -1, o = 6, e = 1, end_bonus = 5, w = 100;
+               int &bs, int &bt, int &bg, int &bq, int &bgs, int &bm, int w = 100) {
+    const int a = 1, b = 4, ambig = -1, o = 6, e = 1, end_bonus = 5;
     const int STRIDE = maxlen + MAX_LINE_LEN;   // per-pair seq slot; scales with read
                                                 // length, + slack for prefetch look-ahead
                                                 // (16-bit handles up to MAX_SEQ_LEN16=32768)
@@ -120,11 +120,12 @@ int run_parity(int width, int n, int maxlen, unsigned long seed, int zdrop,
     return bad;
 }
 
-void check_width(int width, int n, int maxlen, unsigned long seed, int zdrop = 100) {
+void check_width(int width, int n, int maxlen, unsigned long seed, int zdrop = 100,
+                 int w = 100) {
     int bs, bt, bg, bq, bgs, bm;
-    int bad = run_parity(width, n, maxlen, seed, zdrop, bs, bt, bg, bq, bgs, bm);
+    int bad = run_parity(width, n, maxlen, seed, zdrop, bs, bt, bg, bq, bgs, bm, w);
     MESSAGE("bandedSWA getScores" << width << " vs scalar: maxlen=" << maxlen
-            << " zdrop=" << zdrop
+            << " zdrop=" << zdrop << " w=" << w
             << " n=" << n << " ANY=" << bad
             << " (score=" << bs << " tle=" << bt << " gtle=" << bg
             << " qle=" << bq << " gscore=" << bgs << " max_off=" << bm << ")");
@@ -162,7 +163,7 @@ bool envelope_ok_8(int len1, int len2, int h0) {
     int shorter = len1 < len2 ? len1 : len2;
     int max_score = h0 + shorter * a;
     return len1 < MAX_SEQ_LEN8 && len2 < MAX_SEQ_LEN8 && len1 >= len2 &&
-           w <= 127 && zdrop + max_step <= 127 &&
+           w <= 124 && zdrop + max_step <= 127 &&
            h0 <= zdrop + 1 && max_score < 255 - max_step;
 }
 
@@ -254,6 +255,37 @@ TEST_CASE("bandedSWA getScores8 byte-identical to scalar within the 8-bit envelo
     // getScores16, covered below); in-envelope [128,254] coverage lives in the
     // repeat-rich regression case further down.
     SUBCASE("short reads (maxlen 120)") { check_width(8, 3000, 120, 12345); }
+}
+
+// C1 boundary: the 8-bit diagonal-offset encoding spans [-(w+1), w+3], all int8,
+// so BSW8_MAX_W = 124 is the widest band getScores8 can run without wrapping past
+// +127. bsw8_envelope_ok now caps the envelope there (was 127, which collapsed the
+// band on row 0 and silently returned "no extension" for essentially every
+// 8-bit-routed pair). Confirm getScores8 is byte-identical to scalar at exactly
+// w=124 -- lengths run up to 140 (> 124) so the band genuinely reaches the bound
+// rather than being clamped to the query, while h0 + len2 stays < 254 (in the
+// unsigned-[0,255] envelope). Bands 125..127 are excluded by the envelope and so
+// never reach getScores8; the corruption they cause is demonstrated at the
+// whole-aligner level (a -w 127 run), not here.
+TEST_CASE("bandedSWA getScores8 byte-identical to scalar at the w=124 band bound"
+          * doctest::test_suite("unit/bandedswa")) {
+    check_width(8, 4000, 140, 0xC1B0, /*zdrop=*/100, /*w=*/124);
+}
+
+// Characterization guard for the BSW8_MAX_W = 124 cap. At w >= 125 the int8
+// diagonal-offset encoding wraps past +127 (`index+2` reaches w+3), the band
+// collapses, and getScores8 diverges from scalar on in-envelope pairs. This is
+// exactly why bsw8_envelope_ok must NOT admit w in {125,126,127} to the 8-bit
+// tier. The kernel is unchanged here -- if a future edit makes it handle w=127
+// correctly, this test fails and BSW8_MAX_W should be re-derived. (Same pairs,
+// same envelope as the w=124 case above; only the band widens by 3.)
+TEST_CASE("bandedSWA getScores8 diverges from scalar at w=127 (why BSW8_MAX_W=124)"
+          * doctest::test_suite("unit/bandedswa")) {
+    int bs, bt, bg, bq, bgs, bm;
+    const int bad = run_parity(8, 4000, 140, 0xC1B0, /*zdrop=*/100,
+                               bs, bt, bg, bq, bgs, bm, /*w=*/127);
+    MESSAGE("getScores8 w=127 mismatches vs scalar: " << bad << "/4000 (expected > 0)");
+    CHECK(bad > 0);
 }
 
 TEST_CASE("bandedSWA getScores16 byte-identical to scalar (short + long reads)"

@@ -170,6 +170,33 @@ no open upstream PR.
 > requires `n_pri < a.n`, i.e. the read has ALT hits, and `is_alt` is never set
 > without one.
 
+## 8-bit banded-SW envelope cap at `w = 124` (PR #422)
+
+`bsw8_envelope_ok` — the gate that routes a seed-extension pair to the 8-bit
+banded-SW kernel — admitted band widths up to `BSW8_MAX_W = 127`. The 8-bit kernel
+encodes its band/position quantities as **signed-int8 diagonal offsets** spanning
+`[-(w+1), w+3]` (the band-grow term `myband+1` and the tail-trim term `index+2`,
+which reaches `w+3`). At `w >= 125` the positive edge `w+3` exceeds `+127` and wraps
+negative: the band collapses on row 0, `head > tail`, and lanes die mid-alignment —
+the pair then silently returns "no extension" (`score = h0`, `tle = qle = 0`,
+`gscore = -1`) where the scalar and 16-bit kernels return the real extension. The
+fix drops `BSW8_MAX_W` to **124**, so `w` in {125, 126, 127} route to the 16-bit
+tier (exact, byte-identical to scalar) instead.
+
+The overflow begins at `w >= 125`; `-w 127` is the characterized case — the one
+user-supplied width that reaches the wrap on essentially every 8-bit-routed
+extension (the wide-band retry doubling to 200/400 is already diverted to 16-bit).
+`w = 125/126` also cross the boundary but corrupt only exotic pair shapes, so `-w 127`
+is the width the tests reproduce. The default `opt->w = 100` never reaches the 8-bit
+cap, so the drop-in path is **byte-identical** — verified by a records-only
+(header-excluded) whole-aligner md5 on a 2×150 bp WGS workload, where `-w 100` output
+is identical to `main`. A `getScores8` characterization test
+(`test/unit/test_bandedswa_longread.cpp`, all six result fields vs the scalar
+`scalarBandedSWA` oracle across the SIMD tiers exercised in CI) is byte-identical at
+the `w = 124` bound and diverges at `w = 127`, locking the reason for the cap; at
+`-w 127` this branch's records-only md5 matches an all-16-bit reference while `main`'s
+8-bit tier differs.
+
 ---
 
 ## Changes catalog
@@ -185,6 +212,7 @@ no open upstream PR.
 | NEON + AVX-512BW 8-bit score2 fix | [#29](https://github.com/fg-labs/bwa-mem3/pull/29) | — | fork-only |
 | AVX-512BW 16-bit score2 fix | [#30](https://github.com/fg-labs/bwa-mem3/pull/30) | — | fork-only |
 | NEON 16-bit kernel rewrite | [#31](https://github.com/fg-labs/bwa-mem3/pull/31) | — | fork-only |
+| 8-bit banded-SW envelope cap at `w = 124` | [#422](https://github.com/fg-labs/bwa-mem3/pull/422) | — | fork-only (only affects `-w >= 125`; default `-w 100` byte-identical) |
 | kseq2bseq1 zero-initialization | [#22](https://github.com/fg-labs/bwa-mem3/pull/22) | — | fork-only |
 | Proper-pair flag from emitted alignment | [#17](https://github.com/fg-labs/bwa-mem3/pull/17) | — | fork-only, **opt-in** (`--proper-pair-from-emitted`; default matches both upstreams, [#362](https://github.com/fg-labs/bwa-mem3/issues/362)) |
 
