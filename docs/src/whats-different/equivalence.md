@@ -305,6 +305,36 @@ on rather than a standing property: a later `panel-twist-5M` run found exactly o
 differing between `c6a` and `c8g` (see [the cross-architecture
 exception](#additional-supplementary-alignments-resolved) below).
 
+### Certified adaptive extension band (default, byte-identical)
+
+The default seed-extension path changed *internally* without changing any emitted
+alignment-record field (the `@PG` `CL:` command line excepted). `bwa-mem3 mem` now
+runs banded Smith-Waterman extension with a **certified
+adaptive band**: it scores each pair at a narrow probe band first and finalizes
+only the pairs it can *prove* are already optimal there — every other pair falls
+through to the exact full-width ceiling ladder and is scored identically to the
+non-adaptive path. The proof is per pair (a gapped alignment reaching diagonal
+offset `d` costs ≥ `o_min + d·e_min`, bounding its score by
+`h0 + min_len·a − o_min − d·e_min`, which can tie-or-beat the achieved score only
+for offsets the probe band already covers), anchored on the achieved score minus
+the clip penalty so the query-end score, its coordinate, and the clip-vs-extend
+decision are band-invariant too — not just the local maximum. The certificate
+bounds the optimal *score* but not the extension kernel's early-termination
+heuristics (z-drop, all-zero-row break, band-edge shrink), so the certified band
+is applied only inside a conservative parameter envelope (a large enough z-drop
+relative to the certifiable band, clip penalties below one gap's cost, a matrix
+not scoring above the match reward) and **falls back to the exact full-width
+ladder outside it** — making the output byte-identical for any
+`-d`/`-L`/`-O`/`-E`/`-A`/`-B`. The result is byte-identical to a full-width
+extension: measured md5 of the alignment records (`@PG` `CL:` excepted) is unchanged
+on a 1M-read WGS slice (HG00096, hg38, Apple Silicon / NEON tier, clang) at
+default parameters and across a `-d`/`-L`/`-O`/`-E`/`-A`/`-B` sweep, and the
+opt-out **`--no-band-cert`** (which forces the full-width ladder) reproduces the
+same md5 exactly. See
+[Features → Certified adaptive extension band](features.md#certified-adaptive-extension-band-default-on---no-band-cert-to-disable).
+This is distinct from the aggressive, opt-in, *not* byte-identical `--adaptive-band`
+narrowing catalogued under [opt-in divergences](#divergences-that-are-latent-opt-in-or-per-architecture).
+
 ## What differs
 
 ### Additive SAM tags

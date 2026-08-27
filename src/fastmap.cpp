@@ -1567,7 +1567,8 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "    --skip-contained-ext  skip banded-SW extension of seeds contained (same diagonal) in a longer in-chain seed; byte-identical on short/medium non-meth reads (NOT on kilobase-scale long reads); no effect under --meth [off]\n");
     fprintf(stderr, "    --max-extend-chains INT  cap chains extended per read to the top-INT by weight; ~23%% less alignment CPU, high-confidence placement unaffected; ignored for reads with >4096 chains; opt-in, NOT byte-identical (0 = off) [%d]\n", opt->max_extend_chains);
     fprintf(stderr, "    --adaptive-band  adaptive banded-SW: start tight and expand each pair to its chain-geometry band on long-extension reads; ~1.3x on medium reads (SBX ~240bp), no-op on short reads; kilobase-scale HiFi/ONT do not run at default settings; opt-in, NOT byte-identical [%s]\n", opt->band_start? "on":"off");
-    fprintf(stderr, "    --no-adaptive-band  disable adaptive banded-SW (exact, byte-identical extension); overrides --adaptive-band and the --adaptive-band that --fast enables\n");
+    fprintf(stderr, "    --no-adaptive-band  disable adaptive banded-SW (exact, byte-identical full-width extension; also disables the certified band); overrides --adaptive-band and the --adaptive-band that --fast enables\n");
+    fprintf(stderr, "    --no-band-cert  disable the certified adaptive extension band (on by default): run the full-width extension ladder for every pair instead of the narrow-probe-plus-certificate. The certified band is byte-identical to full-width, so on a plain run this only removes the speedup; it has no effect under --fast, --adaptive-band, or --no-adaptive-band (which already disable the certified band). Escape hatch / A-B handle [%s]\n", opt->band_cert? "on":"off");
     fprintf(stderr, "    --extend-mate-concordant[=INT]  when --max-extend-chains caps a PE read, also keep any chain concordant (same contig, FR, within INT bp) with a mate chain; recovers the true pair's low-weight chain the cap would drop (mainly --meth). Bare = auto (window = estimated proper-pair insert high bound); =INT = fixed bp; =0 = off. Opt-in, NOT byte-identical [%s]\n", opt->mate_concordant_window? (opt->mate_concordant_window<0? "auto":"fixed") : "off");
     fprintf(stderr, "    -D FLOAT      drop chains shorter than FLOAT fraction of the longest overlapping chain [%.2f]\n", opt->drop_ratio);
     fprintf(stderr, "    -W INT        discard a chain if seeded bases shorter than INT [0]\n");
@@ -1963,6 +1964,7 @@ int main_mem(int argc, char *argv[])
         OPT_SKIP_CONTAINED_EXT,
         OPT_ADAPTIVE_BAND,
         OPT_NO_ADAPTIVE_BAND,
+        OPT_NO_BAND_CERT,
         OPT_EXTEND_MATE_CONCORDANT,
         OPT_COMPAT,
         OPT_CHUNK_CAP,
@@ -1990,6 +1992,7 @@ int main_mem(int argc, char *argv[])
         {"skip-contained-ext",       no_argument,       0, OPT_SKIP_CONTAINED_EXT},
         {"adaptive-band",            no_argument,       0, OPT_ADAPTIVE_BAND},
         {"no-adaptive-band",         no_argument,       0, OPT_NO_ADAPTIVE_BAND},
+        {"no-band-cert",             no_argument,       0, OPT_NO_BAND_CERT},
         {"extend-mate-concordant",   optional_argument, 0, OPT_EXTEND_MATE_CONCORDANT},
         {"chunk-cap",                required_argument, 0, OPT_CHUNK_CAP},
         {"cohort-slices",            required_argument, 0, OPT_COHORT_SLICES},
@@ -2416,8 +2419,15 @@ int main_mem(int argc, char *argv[])
             }
         }
         else if (c == OPT_SKIP_CONTAINED_EXT) opt->skip_contained_ext = 1;
-        else if (c == OPT_ADAPTIVE_BAND) { if (!no_adaptive_band) opt->band_start = ADAPTIVE_BAND_START; }
-        else if (c == OPT_NO_ADAPTIVE_BAND) { no_adaptive_band = 1; opt->band_start = 0; }
+        else if (c == OPT_ADAPTIVE_BAND) { if (!no_adaptive_band) opt->band_start = ADAPTIVE_BAND_START; opt->band_cert = 0; }
+        else if (c == OPT_NO_ADAPTIVE_BAND) { no_adaptive_band = 1; opt->band_start = 0; opt->band_cert = 0; }  /* disable adaptive
+                                                               * banding entirely: aggressive band off
+                                                               * AND certified band off -> exact
+                                                               * full-width extension, by construction. */
+        else if (c == OPT_NO_BAND_CERT) opt->band_cert = 0;   /* opt out of the certified adaptive
+                                                               * band -> full-width exact ladder;
+                                                               * output stays byte-identical, only
+                                                               * slower. Escape hatch + test A/B. */
         else if (c == OPT_EXTEND_MATE_CONCORDANT) {
             /* bare flag = auto (-1, use the estimated insert-size high bound);
              * =INT = fixed window in bp; =0 = off. */
@@ -2688,6 +2698,10 @@ int main_mem(int argc, char *argv[])
                                                           * long-read (SBX/HiFi/ONT) runs.
                                                           * --no-adaptive-band opts back out, keeping
                                                           * band_start=0 (exact extension) here. */
+        opt->band_cert  = 0;                             /* --fast opts out of the certified (byte-identical)
+                                                          * band: either the aggressive band_start heuristic
+                                                          * above is in force, or --no-adaptive-band opted
+                                                          * back out to exact full-width extension. */
         /* --extend-mate-concordant (meth only): the top-5 chain cap regresses
          * bisulfite PE placement. Mechanism (instrumented on 50k sim-meth-place
          * pairs vs truth): NOT chain-dropping -- in 89% of regressions the read's
@@ -2764,6 +2778,13 @@ int main_mem(int argc, char *argv[])
          * -A (bwameth's constants assume a==1) and can be unit-tested. */
         mem_opt_apply_meth_defaults(opt, &opt0);
         aux.copy_comment = 1;          /* -C, needed for YS:Z/YC:Z passthrough */
+        /* The certified adaptive band is a non-meth optimization: --meth extension
+         * scores against the original 4-letter reference through per-strand
+         * asymmetric matrices, and its reads are short (no band win to reclaim), so
+         * keep the exact full-width ladder here rather than reason about the
+         * certificate under the meth matrices. (Also avoids the safety-envelope
+         * downgrade note firing on every --meth run.) */
+        opt->band_cert = 0;
     }
 
     /* Under --meth, NM/MD are derived from the scoring matrix (a column is a
@@ -2794,6 +2815,21 @@ int main_mem(int argc, char *argv[])
      * we just rebuilt, so -A/-B and the -x presets reach meth scoring (they set
      * opt->a/opt->b above; without this the meth matrices keep init-time defaults). */
     mem_opt_fill_meth_mat(opt);
+
+    /* Certified adaptive band: apply the narrow probe only inside the parameter
+     * envelope where the extension kernel's early-termination heuristics are
+     * provably quiescent (see mem_band_cert_params_safe). Outside it -- small
+     * -d/zdrop, large -L clip penalties, a custom -A/-B matrix scoring above the
+     * match reward -- fall back to the exact full-width ladder so output stays
+     * byte-identical for any parameters. Default parameters are inside the
+     * envelope, so this never fires on a plain run. Checked after the matrices are
+     * final because the envelope depends on max(mat). */
+    if (opt->band_cert && !mem_band_cert_params_safe(opt)) {
+        opt->band_cert = 0;
+        fprintf(stderr, "[M::%s] extension parameters (-d/-L/-A/-B/-O/-E) are outside the "
+                        "certified-band safety envelope; using exact full-width extension\n",
+                __func__);
+    }
 
     /* In --meth (D3) the canonical UX is "bwa-mem3 mem --meth ref.fa": we
      * auto-append ".meth" to find the converted SEED FM-index built by

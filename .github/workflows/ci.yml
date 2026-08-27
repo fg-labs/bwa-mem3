@@ -834,6 +834,14 @@ jobs:
           HIC_WORK_DIR=/tmp/hic-alias \
           bash test/regression/hic_alias_identical.sh
 
+      - name: band_cert byte-identical regression (--no-band-cert A/B, phix)
+        if: matrix.canonical == true
+        run: |
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          BAND_CERT_PHIX_FA="$GITHUB_WORKSPACE/test/fixtures/phix.fa" \
+          BAND_CERT_WORK_DIR=/tmp/band-cert-bytes \
+          bash test/regression/band_cert_identity.sh
+
       - name: chain-flt empty-array compat regression (#310)
         if: matrix.canonical == true
         run: |

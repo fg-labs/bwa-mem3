@@ -652,7 +652,10 @@ of the preset — the same "opt back out" role `--rescue-kmer=0` plays.
 
 The opt-out is order-independent and always wins: `--no-adaptive-band` beats an explicit
 `--adaptive-band` given in either order, and beats the `--adaptive-band` that `--fast`
-enables. On the default preset (where `--adaptive-band` is already off) it is a no-op.
+enables. On the default preset (where `--adaptive-band` is already off) it also disables the
+on-by-default **certified** adaptive band, forcing the exact full-width code path there too:
+output stays byte-identical, but the run forgoes the certified band's speedup — that is precisely
+what `--no-band-cert` toggles on its own.
 The resolved state is recorded on the `--fast` audit line — `[M::main_mem] --fast: …
 --no-adaptive-band …` — so the run record shows exact extension was in force (the off
 state would otherwise be invisible, exactly as for `--rescue-kmer=0`).
