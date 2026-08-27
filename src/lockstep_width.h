@@ -64,12 +64,20 @@ int32_t bwa3_lockstep_width_from_probe(int32_t raw_mlp);
  *   > 0  the width to pin, clamped up to SMEM_LOCKSTEP_N_MAX -- a valid positive
  *        integer override (it MAY sit below the floor, an explicit operator/gate
  *        escape hatch); the caller skips the probe and uses this;
- *     0  env is unset or empty -- no override; the caller runs the probe;
+ *     0  env is unset or empty -- no override; the caller keeps the compile-time
+ *        default (and probes only if BWA3_SMEM_LOCKSTEP_PROBE is set);
  *    -1  env is set but malformed, non-positive, or overflowed -- an invalid
- *        override; the caller reports it and falls back to the probe.
+ *        override; the caller reports it and resolves it as if unset.
  * Pure and side-effect-free (emits no diagnostic), so it is unit-testable; the
  * ERROR message for the -1 case is the initializer's responsibility. */
 int32_t bwa3_lockstep_width_parse_env(const char *env);
+
+/* Gate the startup MLP probe opt-in on a BWA3_SMEM_LOCKSTEP_PROBE value (env may
+ * be NULL/empty). Returns nonzero (enable the probe) only for a truthy value:
+ * present, non-empty, and not "0"; unset, empty, and "0" return 0 (disabled).
+ * Pure and side-effect-free, so the gating is unit-testable independently of the
+ * initializer that consults it. */
+int bwa3_lockstep_probe_enabled(const char *env);
 
 /* Measure the core's memory-level parallelism: the number of independent
  * dependent-load chains it keeps outstanding before per-access latency stops
@@ -81,16 +89,31 @@ int32_t bwa3_lockstep_width_parse_env(const char *env);
  * array of `n_blocks` fixed-size blocks; `word_off` is the byte offset of a
  * 64-bit word to read from each block. Returns the knee width (raw, pre-clamp),
  * or 0 if the array is absent or too small to measure (caller floors to the
- * default). ~10-20 ms; intended to run once at startup. */
+ * default). Cost is host-dependent: ~10-20 ms on low-latency memory (e.g. Apple
+ * Silicon), ~0.4 s on server-class DRAM (a ~100 ns dependent-load latency over
+ * the sweep). This is the raw measurement primitive: it retains only its input
+ * guard (returns 0 when base == NULL or n_blocks < 4096) and has no one-shot or
+ * opt-in guard, so a direct caller with a large enough array runs the full sweep
+ * on every call. The "at most once at startup, and only when opted in" contract
+ * is enforced by the sole intended caller, bwa3_init_smem_lockstep_width
+ * (idempotent, gated on BWA3_SMEM_LOCKSTEP_PROBE) -- see below. */
 int32_t bwa3_measure_mlp(const void *base, int64_t n_blocks,
                          size_t stride, size_t word_off);
 
-/* Resolve and install g_smem_lockstep_n once, from the startup probe and the
- * BWA3_SMEM_LOCKSTEP_N override. Idempotent (subsequent calls are no-ops).
- * A VALID env value skips the (costly) probe and is taken alone, keeping
- * gated/CI runs deterministic; an invalid one is reported (ERROR to stderr) and
- * ignored, falling back to the probe. With no env value the probe chases the
- * cp_occ array described by base/n_blocks/stride/word_off.
+/* Resolve and install g_smem_lockstep_n once. Idempotent (subsequent calls are
+ * no-ops). Resolution order:
+ *   1. BWA3_SMEM_LOCKSTEP_N=<n>   -- explicit pin, taken alone.
+ *   2. BWA3_SMEM_LOCKSTEP_PROBE=1 -- opt into the startup MLP probe, which
+ *      chases the cp_occ array (base/n_blocks/stride/word_off) to self-calibrate
+ *      the width for this host. Truthy opt-in (bwa3_lockstep_probe_enabled): any
+ *      value other than unset, empty, or "0" enables it, so unset the variable
+ *      (or set it to 0) to disable -- BWA3_SMEM_LOCKSTEP_PROBE=0 does NOT enable.
+ *   3. neither set (the default)  -- keep the compile-time SMEM_LOCKSTEP_N.
+ * The probe is OPT-IN because the width is a measured ~1% flat knob end-to-end
+ * across architectures, core counts, and page sizes, so paying its startup cost
+ * on every run buys no throughput; the default constant is what the probe
+ * converges to on all benchmarked hardware. An invalid env value is reported
+ * (ERROR to stderr) and ignored, resolving as if unset.
  * Call after the index is loaded and before the seeding workers spawn. */
 void bwa3_init_smem_lockstep_width(const void *base, int64_t n_blocks,
                                    size_t stride, size_t word_off);

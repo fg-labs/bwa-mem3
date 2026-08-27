@@ -63,14 +63,15 @@ TEST_CASE("lockstep width: from_probe clamps a raw MLP estimate to [floor, ceili
 // --- bwa3_lockstep_width_parse_env: classify the BWA3_SMEM_LOCKSTEP_N override ---
 //
 // Tri-state contract the initializer keys off: > 0 pins the width (skip probe),
-// 0 means unset (run probe), -1 means set-but-invalid (report + run probe).
+// 0 means unset (no override -- keep the compile-time default, probe only if
+// opted in), -1 means set-but-invalid (report, then resolve as if unset).
 // The regression this guards: an invalid override must NOT resolve to a usable
 // width -- previously a nonempty-but-garbage value silently disabled auto-tuning
 // by flooring, and an overflowed value silently selected the max.
 
 TEST_CASE("lockstep width: parse_env classifies the override into pin/unset/invalid"
           * doctest::test_suite("unit/smem")) {
-    SUBCASE("unset or empty is 0 (no override; the caller runs the probe)") {
+    SUBCASE("unset or empty is 0 (no override; caller keeps default, probes only if opted in)") {
         CHECK(bwa3_lockstep_width_parse_env(nullptr) == 0);
         CHECK(bwa3_lockstep_width_parse_env("")      == 0);
     }
@@ -94,15 +95,37 @@ TEST_CASE("lockstep width: parse_env classifies the override into pin/unset/inva
         CHECK(bwa3_lockstep_width_parse_env(buf) == SMEM_LOCKSTEP_N_MAX);
     }
 #endif
-    SUBCASE("a malformed value is -1 (invalid: report and probe, not a silent floor)") {
+    SUBCASE("a malformed value is -1 (invalid: reported, not a silent floor)") {
         CHECK(bwa3_lockstep_width_parse_env("garbage") == -1);
         CHECK(bwa3_lockstep_width_parse_env("12x")     == -1);
     }
-    SUBCASE("a non-positive value is -1 (invalid: report and probe, not a silent floor)") {
+    SUBCASE("a non-positive value is -1 (invalid: reported, not a silent floor)") {
         CHECK(bwa3_lockstep_width_parse_env("0")  == -1);
         CHECK(bwa3_lockstep_width_parse_env("-5") == -1);
     }
-    SUBCASE("an overflowed value is -1 (invalid: report and probe, not a silent clamp to max)") {
+    SUBCASE("an overflowed value is -1 (invalid: reported, not a silent clamp to max)") {
         CHECK(bwa3_lockstep_width_parse_env("99999999999999999999999999") == -1);
+    }
+}
+
+// --- bwa3_lockstep_probe_enabled: gate the startup MLP probe opt-in ---
+//
+// BWA3_SMEM_LOCKSTEP_PROBE is a truthy opt-in: the startup sweep runs only for
+// a value that is present, non-empty, and not "0". Unset, empty, and "0" all
+// leave the probe off (the shipped default keeps the compile-time width). This
+// pins the gating the initializer keys off so an empty or "0" value can never
+// silently pay the probe's startup cost.
+
+TEST_CASE("lockstep width: probe_enabled is a truthy opt-in (unset/empty/\"0\" disable)"
+          * doctest::test_suite("unit/smem")) {
+    SUBCASE("unset, empty, or \"0\" leaves the probe disabled") {
+        CHECK(bwa3_lockstep_probe_enabled(nullptr) == 0);
+        CHECK(bwa3_lockstep_probe_enabled("")      == 0);
+        CHECK(bwa3_lockstep_probe_enabled("0")     == 0);
+    }
+    SUBCASE("any other value enables the probe") {
+        CHECK(bwa3_lockstep_probe_enabled("1")   != 0);
+        CHECK(bwa3_lockstep_probe_enabled("2")   != 0);
+        CHECK(bwa3_lockstep_probe_enabled("yes") != 0);
     }
 }
