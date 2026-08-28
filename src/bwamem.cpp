@@ -5167,7 +5167,14 @@ static inline int ungapped_analyze(const uint8_t *qs, const uint8_t *rs, int N,
             band = default_w;
         } else {
             band = (int)((numerator + e_min - 1) / e_min);
-            if (band > default_w) band = default_w;
+            // The band proof only excludes diagonal offsets >= band. When the
+            // proven band exceeds default_w, clamping to default_w would falsely
+            // certify that a width-default_w run is complete, letting the retry
+            // ladder short-circuit and skip the wider rungs a gapped alignment
+            // in the unproven window (default_w, band) genuinely needs. Emit the
+            // tight_band = 0 fallback sentinel instead, so such a pair runs the
+            // exact full-width ladder (byte-identical to non-adaptive extension).
+            if (band > default_w) band = 0;
         }
         *out_tight_band = band;
         // Outputs unused on TIGHT; set sane values for any future caller.
