@@ -4957,6 +4957,11 @@ static inline void bsw_run_tier(BswMethTier tier, const mem_opt_t *opt,
 // when the gapped alternative score is < min_len·a. Starting SW at
 // tight_band is strictly correct and avoids over-banded DP work.
 #define FP_N_MAX 128
+/* Words in the per-pair mismatch bitmap. Sized to FP_N_MAX so every scanned
+ * position 0..FP_N_MAX-1 has a bit; a shift by the in-word offset (< 64) can
+ * never alias. (Must track FP_N_MAX: at 128 this is 2 words = the old
+ * mis_lo/mis_hi pair.) */
+#define FP_MIS_NWORDS ((FP_N_MAX + 63) / 64)
 #define FP_STATUS_FALLBACK  0
 #define FP_STATUS_HIT       1
 #define FP_STATUS_TIGHT     2
@@ -5065,7 +5070,7 @@ static inline int ungapped_analyze(const uint8_t *qs, const uint8_t *rs, int N,
     if (N <= 0 || N > FP_N_MAX || x_threshold < 0) return FP_STATUS_FALLBACK;
 
     const __m128i v3 = _mm_set1_epi8(3);
-    uint64_t mis_lo = 0, mis_hi = 0;
+    uint64_t mis[FP_MIS_NWORDS] = {0};
     int total_mis = 0;
     int i = 0;
     for (; i + 16 <= N; i += 16) {
@@ -5078,20 +5083,17 @@ static inline int ungapped_analyze(const uint8_t *qs, const uint8_t *rs, int N,
         __m128i eqv = _mm_cmpeq_epi8(qv, rv);
         unsigned mism_mask = (~(unsigned)_mm_movemask_epi8(eqv)) & 0xFFFFu;
         total_mis += __builtin_popcount(mism_mask);
-        if (i < 64) {
-            mis_lo |= ((uint64_t)mism_mask) << i;
-            if (i + 16 > 64) mis_hi |= ((uint64_t)mism_mask) >> (64 - i);
-        } else {
-            mis_hi |= ((uint64_t)mism_mask) << (i - 64);
-        }
+        /* i is 16-aligned, so (i & 63) in {0,16,32,48}: a 16-bit mask shifted
+         * by at most 48 fills bits [i&63, (i&63)+15] within a single word and
+         * never straddles a 64-bit boundary. */
+        mis[i >> 6] |= ((uint64_t)mism_mask) << (i & 63);
     }
     for (; i < N; i++) {
         uint8_t qi = qs[i], ri = rs[i];
         if (qi >= 4 || ri >= 4) return FP_STATUS_FALLBACK;
         if (qi != ri) {
             total_mis++;
-            if (i < 64) mis_lo |= (1ULL << i);
-            else        mis_hi |= (1ULL << (i - 64));
+            mis[i >> 6] |= (1ULL << (i & 63));
         }
     }
 
@@ -5184,8 +5186,7 @@ static inline int ungapped_analyze(const uint8_t *qs, const uint8_t *rs, int N,
     // from SW on tied-score walks, breaking byte-identical SAM.
     int cur = h0, max_sc = h0, max_i = 0;
     for (int j = 0; j < N; j++) {
-        int is_mis = (j < 64) ? (int)((mis_lo >> j) & 1ULL)
-                              : (int)((mis_hi >> (j - 64)) & 1ULL);
+        int is_mis = (int)((mis[j >> 6] >> (j & 63)) & 1ULL);
         if (cur == 0) continue;
         if (!is_mis) cur += a;
         else {
