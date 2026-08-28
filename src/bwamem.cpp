@@ -4956,7 +4956,17 @@ static inline void bsw_run_tier(BswMethTier tier, const mem_opt_t *opt,
 // So any band ≥ tight_band is sufficient; narrower bands suffice too
 // when the gapped alternative score is < min_len·a. Starting SW at
 // tight_band is strictly correct and avoids over-banded DP work.
-#define FP_N_MAX 128
+#define FP_N_MAX 512
+/* TIGHT routing (accepting a narrow banded-SW result early via the retry
+ * ladder's tight_band clause) is byte-identity-proven only up to this length.
+ * Beyond it, a width-w accepted result and the width-2w result a FALLBACK pair
+ * would retry can differ in extent fields (qle/tle/gscore/max_off and a->w)
+ * even at an identical optimal score -- the ladder clause is score-sound but
+ * not extent-invariant. So a pair longer than this may only HIT (skip SW,
+ * whose scalar walk mirrors kernel semantics at any length) or FALLBACK to the
+ * exact full-width ladder; it must never emit a tight_band. Keep <= the old
+ * scanner cap so behavior at those lengths is unchanged. */
+#define FP_TIGHT_MAX 128
 /* Words in the per-pair mismatch bitmap. Sized to FP_N_MAX so every scanned
  * position 0..FP_N_MAX-1 has a bit; a shift by the in-word offset (< 64) can
  * never alias. (Must track FP_N_MAX: at 128 this is 2 words = the old
@@ -5098,6 +5108,10 @@ static inline int ungapped_analyze(const uint8_t *qs, const uint8_t *rs, int N,
     }
 
     if (total_mis > x_threshold) {
+        /* TIGHT routing is extent-invariant only up to FP_TIGHT_MAX (see the
+         * define). A longer pair that is not a HIT falls back to the exact
+         * full-width ladder rather than accepting a narrow banded-SW result. */
+        if (N > FP_TIGHT_MAX) return FP_STATUS_FALLBACK;
         // S in the band proof must be REALIZABLE by an actual offset-0 extension.
         // The tight_band derivation shows every out-of-band alignment (band
         // offset B >= tb) scores <= S, so a band >= tb is sufficient ONLY IF the
@@ -5112,8 +5126,9 @@ static inline int ungapped_analyze(const uint8_t *qs, const uint8_t *rs, int N,
         // feeding that larger S shrinks tb below what is sound, letting the retry
         // ladder skip the wider rung a gapped alignment in (default_w, wider]
         // genuinely needs -- a CIGAR/coordinate divergence from the full-width
-        // ladder (breaking byte-identity). The walk is O(N) and computed only on
-        // the TIGHT branch, so its cost is negligible.
+        // ladder (breaking byte-identity). The walk is O(N) and runs only on the
+        // TIGHT branch after the FP_TIGHT_MAX gate above (N <= 128), so its cost
+        // is negligible.
         //
         // Band derivation (see comment above):
         //     B < (min_len·a − S − o_min) / e_min        with S = max_sc − h0
