@@ -582,6 +582,7 @@ jobs:
           TEST_BIN=./test/bwa_mem3_tests_unit \
           OUT_DIR=/tmp/ci-out \
           ARCH_LABEL=${{ matrix.arch }} \
+          SUITE_ARGS="--test-suite=unit/kswv,unit/bandedswa" \
             bash .github/scripts/kswv-tier-sweep.sh
 
       - name: Upload kswv unit test JUnit reports
@@ -589,8 +590,10 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: kswv-unit-${{ matrix.arch }}
-          # One XML per tier that ran (kswv-unit-<arch>-<tier>.xml), so the
-          # artifact set itself records which tiers were covered.
+          # One XML per (tier, suite) that ran -- kswv-unit-<arch>-<tier>-<suite>.xml
+          # for a --test-suite filter, or kswv-unit-<arch>-<tier>.xml when SUITE_ARGS
+          # carries no suite to split -- so the artifact set itself records which
+          # tiers and suites were covered.
           path: /tmp/ci-out/kswv-unit-${{ matrix.arch }}-*.xml
           if-no-files-found: warn
           retention-days: 1

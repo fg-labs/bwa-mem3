@@ -144,9 +144,98 @@ long trial(int a, int b, int o, int e, int zdrop, int w, int end_bonus,
     return diffs;
 }
 
+/// 16-bit analogue of `trial`. The 16-bit wrappers had the SAME wrap bug the 8-bit
+/// wrappers were fixed for, but it was never ported: the per-lane band clamp added
+/// `qlen*max_sc + (end_bonus - o)` with a 16-bit modular add and read the sum back
+/// through `uint16_t`, so a NEGATIVE reach wrapped to ~65525, the clamp evaluated to a
+/// huge band and disappeared -- the kernel then ran the full band `w` where the scalar
+/// ran a band as narrow as 1, exploring off-diagonal cells the scalar never visits.
+///
+/// The clamp reach depends only on the QUERY length `len2` (`qlen[l] == len2*max_sc`),
+/// not on the target, so a short query under a large gap-open
+/// (`len2*max_sc + end_bonus < o`) triggers the wrap regardless of `len1`. This stays
+/// in getScores16's byte-identity domain by keeping `len1 >= len2` (the same shape the
+/// getScores16 longread parity test uses); the query-end contract for `len2 > len1` is
+/// separate and not exercised here. Every pair is routed to getScores16 directly.
+long trial16(int a, int b, int o, int e, int zdrop, int w, int end_bonus,
+             int minq, int maxq, long n, long *checked)
+{
+    const int STRIDE = 400;
+
+    int8_t mat[25];
+    { int k = 0;
+      for (int i = 0; i < 4; ++i) { for (int j = 0; j < 4; ++j) mat[k++] = (i == j) ? (int8_t)a : (int8_t)-b; mat[k++] = -1; }
+      for (int j = 0; j < 5; ++j) mat[k++] = -1; }
+
+    BandedPairWiseSW bsw(o, e, o, e, zdrop, end_bonus, mat, (int8_t)a, (int8_t)b, 1);
+
+    std::mt19937_64 rng(0x16B0C0DEull);
+    std::vector<uint8_t> ref((size_t)STRIDE * n, 0), qer((size_t)STRIDE * n, 0);
+    std::vector<SeqPair> pairs(n);
+    std::vector<Out> oracle(n);
+    std::uniform_int_distribution<int> lenD(minq, maxq), hD(1, zdrop + 1), unit(3, 12);
+
+    for (long c = 0; c < n; ++c) {
+        int aa = lenD(rng), bb = lenD(rng);
+        int len1 = aa > bb ? aa : bb, len2 = aa > bb ? bb : aa;   /* len1 >= len2 (in-domain) */
+        int h0 = hD(rng);
+        uint8_t *s1 = &ref[(size_t)c * STRIDE];   /* target (ref, len1) */
+        uint8_t *s2 = &qer[(size_t)c * STRIDE];   /* query  (read, len2) */
+        int u = unit(rng); uint8_t ub[16];
+        for (int i = 0; i < u; i++) ub[i] = (uint8_t)(rng() % 4);
+        for (int i = 0; i < len1; i++) s1[i] = ub[i % u];
+        int ti = 0;
+        for (int i = 0; i < len2; i++) {
+            uint8_t base = (ti < len1) ? s1[ti] : (uint8_t)(rng() % 4);
+            if ((int)(rng() % 100) < 5) base = (uint8_t)(rng() % 4);
+            s2[i] = base;
+            if ((rng() % 20) == 0) { if (rng() & 1) ti += 2; } else ti++;   /* sparse indels */
+        }
+        SeqPair &p = pairs[c];
+        p.id = c; p.len1 = len1; p.len2 = len2; p.h0 = h0;
+        p.idr = (int)((size_t)c * STRIDE); p.idq = (int)((size_t)c * STRIDE);
+        p.seqid = c; p.regid = c;
+        p.score = p.tle = p.gtle = p.qle = p.gscore = p.max_off = -1;
+        Out &O = oracle[c];
+        O.score = bsw.scalarBandedSWA(len2, s2, len1, s1, w, h0,
+                                      &O.qle, &O.tle, &O.gtle, &O.gscore, &O.max_off);
+    }
+
+    *checked = n;
+    const long round_n = ((n + SIMD_WIDTH16 - 1) / SIMD_WIDTH16) * SIMD_WIDTH16;
+    std::vector<SeqPair> ap(round_n);   /* padding lanes value-initialized: len2 == 0 */
+    for (long k = 0; k < n; ++k) ap[k] = pairs[k];
+    bsw.getScores16(ap.data(), ref.data(), qer.data(), (int32_t)n, 1, w);
+
+    long diffs = 0;
+    for (long k = 0; k < n; ++k) {
+        const SeqPair &g = ap[k];
+        const Out &O = oracle[k];
+        /* Same query-end contract as the 8-bit trial: local fields unconditional,
+         * gscore/gtle only when a to-end alignment is observable on either side. */
+        const bool local_differs = g.score != O.score || g.tle != O.tle ||
+                                   g.qle != O.qle || g.max_off != O.max_off;
+        const bool toend_observable = g.gscore > 0 || O.gscore > 0;
+        const bool toend_differs = toend_observable &&
+                                   (g.gscore != O.gscore || g.gtle != O.gtle);
+        if (local_differs || toend_differs) {
+            if (diffs < 5) {
+                MESSAGE("  len1=" << g.len1 << " len2=" << g.len2 << " h0=" << g.h0
+                        << " | vec " << g.score << "/" << g.tle << "/" << g.gtle << "/"
+                        << g.qle << "/" << g.gscore << "/" << g.max_off
+                        << " | scalar " << O.score << "/" << O.tle << "/" << O.gtle << "/"
+                        << O.qle << "/" << O.gscore << "/" << O.max_off);
+            }
+            diffs++;
+        }
+    }
+    return diffs;
+}
+
 } // namespace
 
-TEST_CASE("bandedSWA 8-bit per-lane band clamp matches the scalar reference") {
+TEST_CASE("bandedSWA 8-bit per-lane band clamp matches the scalar reference"
+          * doctest::test_suite("unit/bandedswa")) {
     // Scoring sets straddling the wrap boundary in both directions. The `wrap`
     // sets are the ones that reproduced the bug: they make
     // qlen*max_sc + end_bonus - o negative for the shortest generated query.
@@ -165,13 +254,43 @@ TEST_CASE("bandedSWA 8-bit per-lane band clamp matches the scalar reference") {
     };
 
     for (const Case &c : cases) {
-        INFO("scoring set: " << c.label);
-        long checked = 0;
-        const long diffs = trial(c.a, c.b, c.o, c.e, 100, 100, c.end_bonus,
-                                 c.minq, c.maxq, 8000, &checked);
-        // A trial that admitted nothing would pass vacuously.
-        CHECK(checked > 0);
-        CHECK(diffs == 0);
+        SUBCASE(c.label) {
+            long checked = 0;
+            const long diffs = trial(c.a, c.b, c.o, c.e, 100, 100, c.end_bonus,
+                                     c.minq, c.maxq, 8000, &checked);
+            // A trial that admitted nothing would pass vacuously.
+            CHECK(checked > 0);
+            CHECK(diffs == 0);
+        }
+    }
+}
+
+TEST_CASE("bandedSWA 16-bit per-lane band clamp matches the scalar reference"
+          * doctest::test_suite("unit/bandedswa")) {
+    // The 16-bit wrappers had the same wrap the 8-bit fix cured, but it was never
+    // ported. The `wrap` sets make qlen*max_sc + end_bonus - o negative for the short
+    // len2 > len1 pairs that reach the 16-bit tier, so the OLD 16-bit clamp disabled
+    // itself and getScores16 diverged from the scalar oracle. On the DEFAULT (non-wrap)
+    // set the old and new 16-bit outputs are byte-identical -- the fix only changes the
+    // wrapping path -- so this case must pass on the fixed build and FAIL on the old one.
+    struct Case { int a, o, e, b, end_bonus, minq, maxq; const char *label; };
+    const Case cases[] = {
+        {1,  6, 1, 4,  5, 40, 400, "bwa defaults (no wrap)"},
+        {1, 16, 1, 4,  5,  4,  14, "-O16 short query (wrap)"},
+        {1, 16, 1, 9,  5,  4,  14, "-B9 -O16 short query (wrap)"},
+        {1, 16, 3, 9,  5,  4,  14, "-B9 -O16 -E3 short query (wrap)"},
+        {1,  6, 1, 4,  0,  4,  10, "-O6 -L0 short query (wrap, DEFAULT -O)"},
+        {2, 16, 1, 8,  5,  4,  10, "-A2 -O16 short query (wrap, max_sc factor)"},
+    };
+
+    for (const Case &c : cases) {
+        SUBCASE(c.label) {
+            long checked = 0;
+            const long diffs = trial16(c.a, c.b, c.o, c.e, 100, 100, c.end_bonus,
+                                       c.minq, c.maxq, 8000, &checked);
+            CHECK(checked > 0);
+            CHECK(diffs == 0);
+        }
     }
 }
 

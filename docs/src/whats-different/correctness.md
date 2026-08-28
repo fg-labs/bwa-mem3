@@ -228,6 +228,39 @@ at default parameters (extend and rescue). A regression test
 `zdrop == 0` to `scalarBandedSWA` on NEON, AVX2, and AVX-512BW: it fails on the old
 kernels and passes on the fixed ones.
 
+## 16-bit banded-SW per-lane band clamp (PR #423)
+
+The three 16-bit banded-SW wrappers (`smithWatermanBatchWrapper16`, at 128/256/512
+bits) computed the per-lane band-clamp reach with a **16-bit modular add**, reading
+the sum back through a `uint16_t`. Because `qlen[l]` already holds `qlen * max_sc`,
+the reach `qlen*max_sc + (end_bonus - o)` can go negative (a short query under a
+large gap-open, e.g. `-O16`) or exceed 65535; the 16-bit add then wraps and the
+clamp evaluates to a huge band that effectively disappears, so `getScores16` runs
+the full band `w` where the scalar reference (`scalarBandedSWA`) clamps it as narrow
+as 1. The 8-bit wrappers were already fixed for this; this ports the identical wide
+`int` computation (mirroring the scalar "adjust `w` if it is too large" block) to
+the three 16-bit wrappers.
+
+The effect is scoped to **non-default scoring** (`-B9 -O16 -E3` and similar) on
+short-query pairs, where the mis-sized band diverged from the scalar reference on
+the query-end fields (`gscore`/`gtle`) and could change `score`, endpoints, and the
+emitted alignment records. On bwa's default `-O6 -E1` at normal read lengths the
+intermediate provably never wraps, so the wide-int path computes the identical
+band and the drop-in path is **byte-identical by construction** — an
+integer-arithmetic invariant that holds independent of host, compiler, and thread
+count, so the proof (not any single benchmark) is the load-bearing evidence. A
+controlled records-only (header-excluded) whole-aligner md5 A/B corroborates it:
+control (`main`) versus this branch on a 2×150 bp WGS workload (HG002, hg38) at
+default flags, with inputs, flags, thread count (`-t`), and batching (`-K`) all
+held fixed across the two runs — so the batch composition is identical — on both
+the ARM64 (NEON) and x86_64 (AVX2 and AVX-512BW) tiers. A `getScores16` band-clamp
+regression test (`test/unit/test_bandedswa_band_clamp.cpp`) compares `score`,
+`tle`, `qle`, and `max_off` to the `scalarBandedSWA` oracle unconditionally, and
+`gscore`/`gtle`
+only when either side reports `gscore > 0` (a to-end alignment is observable),
+across the wrap scoring sets on NEON, AVX2, and AVX-512BW: it fails on the old
+kernel and passes on the fixed one.
+
 ---
 
 ## Changes catalog
@@ -245,6 +278,7 @@ kernels and passes on the fixed ones.
 | NEON 16-bit kernel rewrite | [#31](https://github.com/fg-labs/bwa-mem3/pull/31) | — | fork-only |
 | 8-bit banded-SW envelope cap at `w = 124` | [#422](https://github.com/fg-labs/bwa-mem3/pull/422) | — | fork-only (only affects `-w >= 125`; default `-w 100` byte-identical) |
 | Vector banded-SW z-drop gate at `-d 0` | [#424](https://github.com/fg-labs/bwa-mem3/pull/424) | — | fork-only (z-drop-disabled only; default `-d 100` byte-identical) |
+| 16-bit banded-SW per-lane band clamp (wide arithmetic) | [#423](https://github.com/fg-labs/bwa-mem3/pull/423) | — | fork-only (non-default scoring only; default path unchanged — see the correctness note above) |
 | kseq2bseq1 zero-initialization | [#22](https://github.com/fg-labs/bwa-mem3/pull/22) | — | fork-only |
 | Proper-pair flag from emitted alignment | [#17](https://github.com/fg-labs/bwa-mem3/pull/17) | — | fork-only, **opt-in** (`--proper-pair-from-emitted`; default matches both upstreams, [#362](https://github.com/fg-labs/bwa-mem3/issues/362)) |
 
