@@ -444,7 +444,7 @@ void BandedPairWiseSW::scalarBandedSWAWrapper(SeqPair *seqPairArray,
         tmp = _mm256_blendv_epi16(sub_b256, sub_a256, cmp);             \
         tmp = _mm256_sub_epi16(score256, tmp);                          \
         cmp = _mm256_cmpgt_epi16(tmp, zdrop256);                            \
-        exit0 = _mm256_andnot_si256(cmp, exit0);               \
+        if (zdrop > 0) exit0 = _mm256_andnot_si256(cmp, exit0);               \
     }
 
 
@@ -1461,7 +1461,7 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
                                               _mm256_extracti128_si256(die, 1));
                 __m128i d8  = _mm_packs_epi16(d16, d16);
                 __m128i ex  = _mm_loadl_epi64((const __m128i *)(exit_a + base));
-                _mm_storel_epi64((__m128i *)(exit_a + base), _mm_andnot_si128(d8, ex));
+                if (zdrop > 0) _mm_storel_epi64((__m128i *)(exit_a + base), _mm_andnot_si128(d8, ex));
             }
             exit0 = _mm256_load_si256((__m256i *) exit_a);
         }
@@ -2348,7 +2348,7 @@ void BandedPairWiseSW::smithWaterman256_16(uint16_t seq1SoA[],
         __m512i tmp1 = _mm512_mask_blend_epi16(cmp, sub_b512, sub_a512);            \
         tmp1 = _mm512_sub_epi16(score512, tmp1);                            \
         cmp = _mm512_cmpgt_epi16_mask(tmp1, zdrop512);                  \
-        exit0 = _mm512_mask_blend_epi16(cmp, exit0, zero512);           \
+        if (zdrop > 0) exit0 = _mm512_mask_blend_epi16(cmp, exit0, zero512);           \
     }
 
 
@@ -3331,7 +3331,7 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
                 __mmask16 diem = exm & _mm512_cmpgt_epi32_mask(_mm512_sub_epi32(drop, dif), vzd);
                 die64 |= ((__mmask64)diem) << (16 * g);
             }
-            exit0 = _mm512_mask_mov_epi8(exit0, die64, _mm512_setzero_si512());
+            if (zdrop > 0) exit0 = _mm512_mask_mov_epi8(exit0, die64, _mm512_setzero_si512());
         }
 
 #if RDT
@@ -4296,7 +4296,7 @@ static inline int hmin_epi8(__m128i v)
         tmp = _mm_blendv_epi16(sub_b128, sub_a128, cmp);                \
         tmp = _mm_sub_epi16(score128, tmp);                             \
         cmp = _mm_cmpgt_epi16(tmp, zdrop128);                           \
-        exit0 = _mm_blendv_epi16(exit0, zero128, cmp);                  \
+        if (zdrop > 0) exit0 = _mm_blendv_epi16(exit0, zero128, cmp);                  \
     }
 
 
@@ -6317,7 +6317,7 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
             __m128i die01 = _mm_packs_epi32(die_g[0], die_g[1]);
             __m128i die23 = _mm_packs_epi32(die_g[2], die_g[3]);
             __m128i die_bytes = _mm_packs_epi16(die01, die23);
-            exit0 = _mm_andnot_si128(die_bytes, exit0);
+            if (zdrop > 0) exit0 = _mm_andnot_si128(die_bytes, exit0);
         }
 
 #if RDT
