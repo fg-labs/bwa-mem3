@@ -127,6 +127,26 @@ extern "C" {
 	int ksw_global(int qlen, const uint8_t *query, int tlen, const uint8_t *target, int m, const int8_t *mat, int gapo, int gape, int w, int *n_cigar, uint32_t **cigar);
 	int ksw_global2(int qlen, const uint8_t *query, int tlen, const uint8_t *target, int m, const int8_t *mat, int o_del, int e_del, int o_ins, int e_ins, int w, int *n_cigar, uint32_t **cigar);
 
+	/* Test-only hook (see ksw.cpp): the scalar reference behind ksw_global2,
+	 * exposed so unit tests can differentially gate the wavefront SIMD kernel
+	 * against it. Not used on any production path. */
+	int ksw_global2_scalar_ref(int qlen, const uint8_t *query, int tlen, const uint8_t *target, int m, const int8_t *mat, int o_del, int e_del, int o_ins, int e_ins, int w, int *n_cigar, uint32_t **cigar);
+
+	/* Test-only hook (see ksw.cpp): number of wavefront-kernel entries on the
+	 * calling thread. Lets the unit test assert that the SIMD path actually ran
+	 * on a wavefront-capable tier rather than degenerating to scalar-vs-scalar.
+	 * ksw_g2_wave16_exec_count counts only int16-kernel entries, so the int16-tier
+	 * test can prove the narrow kernel ran rather than every pair falling back to
+	 * the int32 wave. Not used on any production path. */
+	unsigned long ksw_g2_wave_exec_count(void);
+	unsigned long ksw_g2_wave16_exec_count(void);
+
+	/* Test-only hook (see ksw.cpp): retained capacity (bytes) of the per-thread
+	 * wavefront direction-byte store zr. Lets the unit test prove the windowed
+	 * decay policy in KswWaveScratch::ensure() actually releases zr after a wide
+	 * spike gives way to narrow calls. Not used on any production path. */
+	unsigned long ksw_g2_wave_zr_capacity(void);
+
 	/**
 	 * Extend alignment
 	 *
