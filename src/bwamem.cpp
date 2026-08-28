@@ -3798,6 +3798,17 @@ mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *
     a.meth_hypothesis = ar->meth_hypothesis; // carry hypothesis to the output layer
     qb = ar->qb, qe = ar->qe;
     rb = ar->rb, re = ar->re;
+    /* AP6: prefetch the CIGAR-emission reference window's first pac[] cache line.
+     * bwa_gen_cigar3 -> bns_get_seq_into makes a random ~DRAM-latency load on the
+     * first pac[] byte; the ~dozens of setup instructions below (and the CIGAR-gen
+     * entry) hide it. The window-start byte differs by strand: the forward strand
+     * (rb < l_pac) reads pac[rb>>2] ascending, the reverse reads pac[((2*l_pac-1-rb)>>2)]
+     * descending (bns_get_seq_into). A prefetch is a pure hint -> byte-identical. */
+    {
+        int64_t pf_pac = (rb < bns->l_pac) ? (rb >> 2)
+                                           : (((bns->l_pac << 1) - 1 - rb) >> 2);
+        __builtin_prefetch(&pac[pf_pac], 0, 3);
+    }
     /* D3 (--meth, PR-5): output CIGAR/NM/MD must reflect the ORIGINAL read vs the
      * ORIGINAL reference in the original alphabet, so placement and gap shape are
      * expressed in real coordinates and a real (non-converting) SNP stays a
