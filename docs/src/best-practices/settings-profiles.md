@@ -82,8 +82,10 @@ bwa-mem3 mem -t <N> -m 10 -y 0 ref.fa R1.fq R2.fq > out.sam
 > --smem-dedup --skip-contained-ext --max-extend-chains 20 --adaptive-band
 > --extend-mate-concordant` (plus `-s 2` and a lower `--max-extend-chains 10`
 > under `--meth`) in one flag. Explicit flags
-> still override individual levers where applicable; `--smem-dedup` and
-> `--skip-contained-ext` are forced on with no opt-out, and `--adaptive-band` is
+> still override individual levers where applicable;
+> [`--smem-dedup`](https://github.com/fg-labs/bwa-mem3/pull/187) and
+> [`--skip-contained-ext`](https://github.com/fg-labs/bwa-mem3/pull/192) are forced on with no opt-out, and
+> [`--adaptive-band`](https://github.com/fg-labs/bwa-mem3/pull/194) is
 > forced on but can be opted back out with `--no-adaptive-band` (which restores the exact
 > full-width extension step — byte-identical to a run without `--adaptive-band` — while
 > keeping the rest of `--fast`, whose other levers can still change output)

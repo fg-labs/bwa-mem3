@@ -638,10 +638,14 @@ several near-tied placements wins). It is therefore an opt-in flag, not a defaul
 
 Disables adaptive banded Smith-Waterman, restoring the exact full-width `-w`
 extension. This makes the **extension step** byte-identical to a run without
-`--adaptive-band` (it is the same full-width code path, by construction) — it does
-**not** make a whole `--fast` run byte-identical, since `--fast`'s other levers
-(`--max-extend-chains`, `--smem-dedup`, `--skip-contained-ext`, …) can still change
-output. It is the explicit opt-out for `--adaptive-band` and matters mainly under
+`--adaptive-band` (the adaptive-banded extension introduced in
+[fg-labs/bwa-mem3#194](https://github.com/fg-labs/bwa-mem3/pull/194); it is the same full-width
+code path, by construction) — it does **not** make a whole `--fast` run
+byte-identical, since `--fast`'s other levers
+([`--max-extend-chains`](https://github.com/fg-labs/bwa-mem3/pull/193),
+[`--smem-dedup`](https://github.com/fg-labs/bwa-mem3/pull/187),
+[`--skip-contained-ext`](https://github.com/fg-labs/bwa-mem3/pull/192), …) can
+still change output. It is the explicit opt-out for `--adaptive-band` and matters mainly under
 `--fast`, which turns `--adaptive-band` on for you: passing `--no-adaptive-band`
 alongside `--fast` keeps that one lever off (exact extension) while retaining the rest
 of the preset — the same "opt back out" role `--rescue-kmer=0` plays.
@@ -730,8 +734,9 @@ not run at default settings regardless of this flag (see
 [`--adaptive-band`](#--adaptive-band--adaptive-banded-smith-waterman-for-medium-length-reads)).
 Pass [`--no-adaptive-band`](#--no-adaptive-band--force-exact-extension-opt-out-of---adaptive-band)
 to opt back out — restoring the exact full-width extension step (byte-identical to a
-run without `--adaptive-band`) while retaining the rest of `--fast`, whose other levers
-can still change output.
+run without `--adaptive-band`, the adaptive banding introduced in
+[fg-labs/bwa-mem3#194](https://github.com/fg-labs/bwa-mem3/pull/194)) while retaining the rest of
+`--fast`, whose other levers can still change output.
 
 `--extend-mate-concordant` repairs the chain-cap pairing regression — the true, low-weight but
 mate-concordant chain the cap would otherwise drop — and is included for both non-meth and `--meth`
