@@ -5047,52 +5047,6 @@ static inline int ungapped_walk_score(const uint8_t *qs, const uint8_t *rs,
     return max_sc;
 }
 
-/* optimal ungapped score (no floor) from a per-base mismatch bitmap.
- *
- *     score(i) = h0 + (i − mismatches_i)·a − mismatches_i·b
- *              = h0 + i·a − mismatches_i·(a+b)        for i ∈ [0, N]
- *
- * f(i) is monotone non-decreasing within match runs and drops by b at each
- * mismatch. Local maxima therefore live at one of:
- *   (a) i = 0                                    f(0)  = h0
- *   (b) i = p,  bitmap[p] == 1                   f(p)  = h0 + p·a − k·(a+b)
- *                                                where k = mismatches in [0,p)
- *   (c) i = N                                    f(N)  = h0 + N·a − total·(a+b)
- *
- * Iterating set bits of the bitmap via ctz + clear-low is O(total_mis), not
- * O(N) — typically a handful of operations for HIT/TIGHT candidates.
- *
- * Unlike ungapped_walk_score, there is NO floor: score is allowed to dip
- * below 0 and recover. This yields max_sc ≥ walk's max_sc, giving a strictly
- * tighter (still safe) bound on the SW band in the tight_band proof. The
- * walk's floor exists to mirror SW kernel local-SW semantics for SAM
- * byte-identity on qle/gscore — irrelevant for the band proof. */
-static inline int ungapped_max_sc_from_bitmap(uint64_t mis_lo, uint64_t mis_hi,
-                                               int N, int h0, int a, int b)
-{
-    int max_sc = h0;            /* candidate (a): empty extension */
-    int gap    = a + b;         /* score drop per mismatch (relative to match) */
-    int k      = 0;             /* mismatches counted so far */
-    uint64_t lo = mis_lo, hi = mis_hi;
-    while (lo) {
-        int p = __builtin_ctzll(lo);
-        int s = h0 + p * a - k * gap;
-        if (s > max_sc) max_sc = s;
-        lo &= lo - 1;
-        k++;
-    }
-    while (hi) {
-        int p = 64 + __builtin_ctzll(hi);
-        int s = h0 + p * a - k * gap;
-        if (s > max_sc) max_sc = s;
-        hi &= hi - 1;
-        k++;
-    }
-    int s_end = h0 + N * a - k * gap;       /* candidate (c) */
-    if (s_end > max_sc) max_sc = s_end;
-    return max_sc;
-}
-
 static inline int ungapped_analyze(const uint8_t *qs, const uint8_t *rs, int N,
                                     int h0, int a, int b,
                                     int o_min, int e_min,
@@ -5134,29 +5088,31 @@ static inline int ungapped_analyze(const uint8_t *qs, const uint8_t *rs, int N,
         }
     }
 
-    // precise max_sc (no floor) from the mismatch bitmap.
-    //
-    // An earlier formulation used `S = h0 + first_mis_pos·a` — a loose lower bound on the
-    // walk's max_sc — to skip the scalar walk on TIGHT pairs. That preserved
-    // walk-time but left the band proof loose: any matching run after the
-    // first mismatch could not contribute to S, so the proven band stayed
-    // wider than necessary.
-    //
-    // The bitmap-derived max_sc is the optimal ungapped score over all
-    // prefix lengths in [0, N], with no floor (score is allowed to dip and
-    // recover). It is ≥ the walk's max_sc, so substituting it into the band
-    // proof yields a strictly tighter (still safe) bound. Computing it from
-    // the bitmap is O(total_mis), independent of N.
-    //
-    // Band derivation (see comment above):
-    //     B < (min_len·a − S − o_min) / e_min        with S = max_sc − h0
-    // For LEFT extensions where the caller gates on len1 ≥ len2,
-    // min_len = N. Substituting:
-    //     numerator = N·a − (max_sc_proof − h0) − o_min
-    //               = N·a + h0 − max_sc_proof − o_min
-    int max_sc_proof = ungapped_max_sc_from_bitmap(mis_lo, mis_hi, N, h0, a, b);
-
     if (total_mis > x_threshold) {
+        // S in the band proof must be REALIZABLE by an actual offset-0 extension.
+        // The tight_band derivation shows every out-of-band alignment (band
+        // offset B >= tb) scores <= S, so a band >= tb is sufficient ONLY IF the
+        // in-band (offset-0) run actually achieves S. ungapped_walk_score is the
+        // floored ungapped score under ksw_extend local-truncation semantics
+        // (once the running score hits 0 it stays 0) -- exactly the score the
+        // rung-1 banded DP can reach on the diagonal, so it is a valid lower
+        // bound on the in-band optimum.
+        //
+        // A no-floor score (which lets a negative prefix recover via later
+        // matches) can EXCEED the floor-killed value the DP actually reaches;
+        // feeding that larger S shrinks tb below what is sound, letting the retry
+        // ladder skip the wider rung a gapped alignment in (default_w, wider]
+        // genuinely needs -- a CIGAR/coordinate divergence from the full-width
+        // ladder (breaking byte-identity). The walk is O(N) and computed only on
+        // the TIGHT branch, so its cost is negligible.
+        //
+        // Band derivation (see comment above):
+        //     B < (min_len·a − S − o_min) / e_min        with S = max_sc − h0
+        // For LEFT extensions where the caller gates on len1 ≥ len2,
+        // min_len = N. Substituting:
+        //     numerator = N·a − (max_sc_proof − h0) − o_min
+        //               = N·a + h0 − max_sc_proof − o_min
+        int max_sc_proof = ungapped_walk_score(qs, rs, N, h0, a, b);
         int64_t numerator = (int64_t)N * a + h0 - max_sc_proof - o_min;
         int band;
         if (numerator <= 0) {

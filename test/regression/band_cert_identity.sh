@@ -296,4 +296,34 @@ if ! grep -qE 'mem_band_cert_params_safe\(opt_in\)' "$BWAMEM_SRC"; then
 fi
 echo "PASS: band_cert defaults on; --fast/--adaptive-band/--no-band-cert clear it; envelope gate wired at the CLI and the public entry point (source guard)"
 
+# --- Source guard: the tight_band (tb) bound must be derived from a REALIZABLE
+# ungapped extension score. tb short-circuits the retry ladder (a band >= tb is
+# certified complete), which is sound only if the offset-0 in-band run actually
+# ACHIEVES the score S fed into the bound. ungapped_walk_score is the floored
+# score under ksw_extend local-truncation semantics (once the running score hits
+# 0 it stays 0) -- the value the rung-1 banded DP reaches on the diagonal, i.e. a
+# valid lower bound on the in-band optimum. A NO-FLOOR score (one that lets a
+# negative prefix recover via later matches) can EXCEED the floor-killed value
+# the DP actually reaches; feeding that larger S shrinks tb below soundness and
+# lets the ladder skip the wider rung a gapped alignment in (default_w, wider]
+# genuinely needs -- a CIGAR/coordinate divergence from the full-width ladder.
+# The trigger is an adversarial double-deletion geometry (a diag-0 floor-death
+# whose out-of-band gapped optimum sits just past default_w); on single reads it
+# is masked by mem_reg2aln recomputing the final CIGAR at its own band, so it
+# cannot be pinned as a SAM byte-fixture. Guard the realizable-score choice
+# structurally instead, the same way the wiring guards above do.
+if ! grep -qE 'max_sc_proof = ungapped_walk_score\(' "$BWAMEM_SRC"; then
+    echo "FAIL: tight_band no longer derives max_sc_proof from the realizable" >&2
+    echo "      floored ungapped_walk_score -- the band proof requires an" >&2
+    echo "      in-band-achievable score; a no-floor bound makes tb unsound" >&2
+    exit 1
+fi
+if grep -qE 'ungapped_max_sc_from_bitmap' "$BWAMEM_SRC"; then
+    echo "FAIL: the NO-FLOOR ungapped_max_sc_from_bitmap bound was reintroduced --" >&2
+    echo "      it over-estimates the realizable extension optimum and makes the" >&2
+    echo "      tight_band bound unsound (breaks byte-identity vs the full-width ladder)" >&2
+    exit 1
+fi
+echo "PASS: tight_band bound uses the realizable floored ungapped score (source guard)"
+
 echo "PASS: band_cert byte-identity regression"
