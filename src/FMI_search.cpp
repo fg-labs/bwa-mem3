@@ -44,6 +44,7 @@ Authors: Sanchit Misra <sanchit.misra@intel.com>; Vasimuddin Md <vasimuddin.md@i
 #include "bwa_madvise.h"
 #include "bwa_shm.h"
 #include "utils.h"        /* ATTRIBUTE, err_fread_noeof */
+#include "io_utils.h"     /* io_request_size, IO_MAX_ONCE */
 #include "FMI_search.h"
 #include "profiling.h"
 #include "libsais_build.h"
@@ -81,8 +82,9 @@ int fmi_pread_worker_count(size_t nbytes, int nthreads)
 
 size_t fmi_pread_request_size(size_t remaining)
 {
-    const size_t PREAD_MAX_ONCE = (size_t)1 << 30;   /* 1GiB, well under INT_MAX */
-    return remaining > PREAD_MAX_ONCE ? PREAD_MAX_ONCE : remaining;
+    // Delegate to the one shared clamp so read and write agree on the cap; see
+    // io_utils.h. pread() has the same macOS >INT_MAX EINVAL cap as pwrite().
+    return io_request_size(remaining, IO_MAX_ONCE);
 }
 
 namespace {
