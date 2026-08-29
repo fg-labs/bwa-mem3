@@ -37,9 +37,14 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "u8vec_scratch.h"
 #include "kvec.h"          /* kvec_t/kv_push/kv_resize used directly below */
 #include "pdqsort_wrap.h"
+#include "robin_hood.h"    /* per-batch DP-job dedup: missidx candidate map */
 #include <inttypes.h>      /* PRId64 for int64_t fprintf format strings */
+#include <errno.h>         /* errno/ERANGE: full-string parse of the dedup env knobs */
 #include <strings.h>       /* strcasecmp in mem_opt_parse_meth_tags */
-#include <mutex>           /* BWAMEM3_DUMP_PAIRS append lock */
+#include <atomic>          /* net-cycles auto-dedup controller state */
+#include <chrono>          /* net-cycles auto-dedup controller timing */
+#include <cmath>           /* std::isfinite: reject nan/inf BWAMEM3_DEDUP_Z */
+#include <mutex>           /* BWAMEM3_DUMP_PAIRS append lock; net-cycles Welford state */
 #include <string>          /* BWAMEM3_DUMP_PAIRS per-batch row buffer */
 
 #include "sam_encode.h"
@@ -4215,11 +4220,10 @@ enum BswMethTier { BSW_TIER_SCALAR, BSW_TIER_16, BSW_TIER_8 };
 /* One tier kernel call over pa[0..n). `sort_scratch` must be a SeqPair buffer
  * DISTINCT from `pa` (sortPairsLen is a counting sort that scatters through it;
  * aliasing pa would corrupt the sort). Scalar tier ignores sort_scratch. */
-static inline void bsw_tier_kernel(BswMethTier tier, IBandedPairWiseSW *bsw,
+static inline void bsw_score_batch(BswMethTier tier, IBandedPairWiseSW *bsw,
         SeqPair *pa, uint8_t *ref, uint8_t *qer, int n, int nthreads, int32_t w,
         SeqPair *sort_scratch, int32_t *hist)
 {
-    if (n <= 0) return;
     switch (tier) {
     case BSW_TIER_SCALAR:
         bsw->scalarBandedSWAWrapper(pa, ref, qer, n, nthreads, w);
@@ -4246,6 +4250,475 @@ static inline void bsw_tier_kernel(BswMethTier tier, IBandedPairWiseSW *bsw,
         else                 bsw->getScores16(pa, ref, qer, n, nthreads, w);
 #endif
         break;
+    }
+}
+
+struct BswJobResult { int32_t score, tle, qle, gscore, gtle, max_off; };
+
+static inline void bsw_apply_result(SeqPair &sp, const BswJobResult &r)
+{
+    sp.score = r.score; sp.tle = r.tle; sp.qle = r.qle;
+    sp.gscore = r.gscore; sp.gtle = r.gtle; sp.max_off = r.max_off;
+}
+
+enum { BSW_DEDUP_OFF = 0, BSW_DEDUP_ON = 1, BSW_DEDUP_AUTO = 2 };
+/* Parse a dedup mode string. Returns -1 on an unrecognized value. Legacy
+ * numeric values from the experimental phase are accepted for pipeline
+ * compatibility: "1"/"perbatch" -> on; "4"/"net" -> auto; "2"(crossbatch) and
+ * "3"(adaptive) were removed -- they map to auto with a warning. */
+static int bsw_parse_dedup_mode(const char *e)
+{
+    if (!strcmp(e, "0") || !strcmp(e, "off"))                            return BSW_DEDUP_OFF;
+    if (!strcmp(e, "1") || !strcmp(e, "on") || !strcmp(e, "perbatch"))   return BSW_DEDUP_ON;
+    if (!strcmp(e, "auto") || !strcmp(e, "net") || !strcmp(e, "4"))      return BSW_DEDUP_AUTO;
+    if (!strcmp(e, "2") || !strcmp(e, "3")) {
+        fprintf(stderr, "[dedup] mode '%s' (crossbatch/adaptive) was removed; using 'auto'\n", e);
+        return BSW_DEDUP_AUTO;
+    }
+    return -1;
+}
+/* Extension-DP dedup configuration store. mode -1 means "unresolved" -- the
+ * only valid state before mem_dedup_configure() has run once; every reader
+ * goes through bsw_dedup_cfg(), which lazily resolves via mem_dedup_configure
+ * if some entry point (unit binaries, library use) never called it. */
+struct BswDedupCfg { int mode; double z; int64_t reprobe_jobs; };
+static BswDedupCfg g_dedup_cfg = { -1, 2.0, 12000000 };   /* mode -1 = unresolved */
+
+void mem_dedup_configure(const char *mode_arg)
+{
+    /* A non-empty --dedup wins outright (and overrides even an explicitly-empty
+     * BWAMEM3_DEDUP); otherwise consult the env, distinguishing "unset" (use the
+     * default) from "set but empty" (an explicit misconfiguration -> fatal, so a
+     * cleared BWAMEM3_DEDUP= cannot silently fall back to the default). An empty
+     * CLI value is rejected earlier by the getopt handler. */
+    if (mode_arg && *mode_arg) {
+        const int v = bsw_parse_dedup_mode(mode_arg);
+        if (v < 0) { fprintf(stderr, "ERROR: --dedup: expected off|on|auto, got '%s'\n", mode_arg); exit(1); }
+        g_dedup_cfg.mode = v;
+    } else {
+        const char *m = getenv("BWAMEM3_DEDUP");
+        if (m == NULL) g_dedup_cfg.mode = BSW_DEDUP_AUTO;   /* unset -> default */
+        else {
+            const int v = bsw_parse_dedup_mode(m);          /* "" -> -1 -> fatal */
+            if (v < 0) { fprintf(stderr, "ERROR: BWAMEM3_DEDUP: expected off|on|auto, got '%s'\n", m); exit(1); }
+            g_dedup_cfg.mode = v;
+        }
+    }
+    const char *z = getenv("BWAMEM3_DEDUP_Z");            /* expert knob, env-only */
+    if (z) {                                             /* set (empty -> rejected by the full-string parse) */
+        char        *end = NULL;
+        errno = 0;
+        const double zv  = strtod(z, &end);
+        /* Full-string parse: reject trailing junk ("2x") rather than silently
+         * taking the leading number, the way atof would. */
+        if (end == z || end == NULL || *end != '\0' || errno == ERANGE || !std::isfinite(zv) || zv <= 0.0) {
+            fprintf(stderr, "ERROR: BWAMEM3_DEDUP_Z: must be a finite number > 0, got '%s'\n", z);
+            exit(1);
+        }
+        g_dedup_cfg.z = zv;
+    }
+    const char *r = getenv("BWAMEM3_DEDUP_REPROBE");      /* expert knob, env-only */
+    if (r) {                                             /* set (empty -> rejected by the full-string parse) */
+        char           *end = NULL;
+        errno = 0;
+        const long long rv  = strtoll(r, &end, 10);
+        /* Full-string parse: reject trailing junk ("12M") rather than silently
+         * taking the leading number, the way atoll would. */
+        if (end == r || end == NULL || *end != '\0' || errno == ERANGE || rv < 0) {
+            fprintf(stderr, "ERROR: BWAMEM3_DEDUP_REPROBE: must be a non-negative integer number of jobs (0 = off), got '%s'\n", r);
+            exit(1);
+        }
+        g_dedup_cfg.reprobe_jobs = rv;
+    }
+}
+/* Lazy resolution for entry points that never call mem_dedup_configure()
+ * (unit binaries, library use): resolve from env/defaults on first touch. */
+static inline const BswDedupCfg &bsw_dedup_cfg(void)
+{
+    static std::once_flag once;
+    std::call_once(once, []() { if (g_dedup_cfg.mode < 0) mem_dedup_configure(NULL); });
+    return g_dedup_cfg;
+}
+static inline int bsw_dedup_mode(void)
+{
+    return bsw_dedup_cfg().mode;
+}
+
+/* ---------------------------------------------------------------------------
+ * Net-cycles adaptive dedup (BWAMEM3_DEDUP=auto): decide ON/OFF from
+ * MEASURED wall time, not a dup-rate threshold. Dedup wins exactly when the
+ * bookkeeping it adds (fingerprint + map build + result scatter) costs less
+ * than the kernel time it removes by scoring m distinct reps instead of n. Both
+ * sides are observable per batch, so the decision is the sign of a measured net:
+ *
+ *   overhead_ns = whole dedup-wrapper time  -  kernel time on the m reps
+ *   c_cell      = kernel_ns / dp_cells       (this host's real per-cell DP cost)
+ *   benefit_ns  = cells_saved * c_cell       (cells_saved = total_cells - dp_cells)
+ *   net_ns      = overhead_ns - benefit_ns   (< 0  =>  dedup won this batch)
+ *
+ * c_cell is measured, so the break-even self-calibrates to CPU / compiler /
+ * SIMD tier / substrate -- there is no magic dup-rate constant. We run dedup ON
+ * while measuring (real data is dup-rich, so ON is the productive default and
+ * pays ~zero tax; instrumenting a batch we already run is two clock reads), pool
+ * per-batch net/job across threads (Welford), and latch the moment a two-sided
+ * z-test clears |z| >= NET_Z (a dimensionless confidence level, not a rate).
+ * mean net < 0 -> latch ON (keep dedup); > 0 -> latch OFF (flip to plain score).
+ * Below NET_MIN_BATCHES we never latch (CLT warmup); past NET_MAX_JOBS with no
+ * significance the data is at break-even (cost ~0 either way) so we keep ON.
+ * The running net sum is the warmup tax in nanoseconds, reported at latch. */
+enum { NET_MEASURING = 0, NET_LATCH_ON = 1, NET_LATCH_OFF = 2 };
+static std::atomic<int>      g_net_state{NET_MEASURING};
+static const uint64_t        NET_MIN_BATCHES = 24;         /* CLT floor before any latch */
+static const uint64_t        NET_MAX_JOBS    = 3000000;    /* give up measuring past this */
+/* Confidence level for the latch, overridable (the only knob, and a benign one:
+ * a wrong value costs a little decision latency, never a wrong ON/OFF call). */
+static inline double net_z_crit(void)
+{
+    return bsw_dedup_cfg().z;
+}
+/* Periodic re-probe (C4): once latched, the controller stays ON or OFF
+ * forever unless re-checked. `g_net_incumbent` records the current latched
+ * direction (0 = none yet, i.e. still in the initial MEASURING phase) so a
+ * re-probe can tell "confirm" from "flip" apart, and `g_net_since_latch`
+ * counts jobs run under the current latch toward the next re-probe cadence
+ * (BWAMEM3_DEDUP_REPROBE jobs; cfg in C5). */
+static std::atomic<int>     g_net_incumbent{0};     /* 0 = none (initial phase) */
+static std::atomic<int64_t> g_net_since_latch{0};   /* jobs since last latch */
+static const uint64_t       NET_PROBE_MAX_JOBS = 1500000; /* probe cap -> keep incumbent */
+static inline int64_t bsw_dedup_reprobe_jobs(void); /* env BWAMEM3_DEDUP_REPROBE, default 12000000, 0=off */
+static inline void net_maybe_reprobe(int n);
+/* Pooled measurement state, guarded by g_net_mtx (held for a few doubles per
+ * instrumented batch; batches are milliseconds, so contention is negligible). */
+static std::mutex   g_net_mtx;
+static uint64_t     g_net_k    = 0;    /* instrumented batches */
+static uint64_t     g_net_jobs = 0;    /* jobs measured */
+static double       g_net_mean = 0.0;  /* Welford mean of net_ns/job */
+static double       g_net_m2   = 0.0;  /* Welford sum of squares */
+static double       g_net_sum  = 0.0;  /* raw sum of net_ns (the warmup tax) */
+
+/* Feed one measured batch into the controller and latch when significant.
+ * Incumbent-aware (C4): the initial decision (incumbent == 0) uses a plain
+ * z-test with the MAX_JOBS break-even fallback, same as before. A re-probe
+ * (incumbent != 0) instead asks whether the NEW evidence still supports the
+ * incumbent direction: agreement only needs to *confirm* at the ordinary z
+ * (or is kept on an inconclusive probe-cap timeout); disagreement needs a
+ * higher bar (z+1) to *flip* the incumbent, so noise near break-even cannot
+ * flap the decision back and forth every cadence. */
+static inline void net_observe(double net_ns, int n)
+{
+    if (n <= 0) return;
+    std::lock_guard<std::mutex> lk(g_net_mtx);
+    if (g_net_state.load(std::memory_order_relaxed) != NET_MEASURING) return;
+    g_net_sum  += net_ns;
+    g_net_jobs += (uint64_t)n;
+    g_net_k    += 1;
+    const double d  = net_ns - g_net_mean;            /* Welford, per-BATCH statistic */
+    g_net_mean += d / (double)g_net_k;
+    g_net_m2   += d * (net_ns - g_net_mean);
+    const int incumbent = g_net_incumbent.load(std::memory_order_relaxed);
+    int decision = 0; const char *why = "";
+    if (g_net_k >= NET_MIN_BATCHES) {
+        const double var = g_net_m2 / (double)(g_net_k - 1);
+        const double sd  = var > 0.0 ? sqrt(var) : 0.0;
+        const double z   = sd > 0.0 ? g_net_mean * sqrt((double)g_net_k) / sd : 0.0;
+        const int    fav = (g_net_mean < 0.0) ? NET_LATCH_ON : NET_LATCH_OFF;
+        const double zc  = net_z_crit();
+        if (incumbent == 0) {                       /* initial: plain test, cap -> ON */
+            if      (fabs(z) >= zc)               { decision = fav;           why = "measured"; }
+            else if (g_net_jobs >= NET_MAX_JOBS)  { decision = NET_LATCH_ON;  why = "break-even, keeping default"; }
+        } else if (fav == incumbent) {              /* re-probe, evidence agrees */
+            if      (fabs(z) >= zc)                       { decision = incumbent; why = "re-probe confirmed"; }
+            else if (g_net_jobs >= NET_PROBE_MAX_JOBS)    { decision = incumbent; why = "re-probe inconclusive, kept"; }
+        } else {                                    /* re-probe, evidence opposes: flip bar is z+1 */
+            if      (fabs(z) >= zc + 1.0)                 { decision = fav;       why = "re-probe FLIPPED"; }
+            else if (g_net_jobs >= NET_PROBE_MAX_JOBS)    { decision = incumbent; why = "below flip margin, kept"; }
+        }
+    }
+    if (decision) {
+        g_net_incumbent.store(decision, std::memory_order_relaxed);
+        g_net_since_latch.store(0, std::memory_order_relaxed);
+        g_net_state.store(decision, std::memory_order_relaxed);
+        if (bwa_verbose >= 3)
+            fprintf(stderr, "[dedup-auto] %s: %llu jobs / %llu batches, mean net=%.1f us/batch -> dedup %s\n",
+                    why, (unsigned long long)g_net_jobs, (unsigned long long)g_net_k,
+                    g_net_mean / 1e3, decision == NET_LATCH_ON ? "ON" : "OFF");
+    }
+}
+
+/* Env-configured re-probe cadence, in jobs (same style as net_z_crit): 0 or a
+ * negative/unset value falls back to the default; 0 explicitly disables
+ * re-probing (net_maybe_reprobe short-circuits on period <= 0). */
+static inline int64_t bsw_dedup_reprobe_jobs(void)
+{
+    return bsw_dedup_cfg().reprobe_jobs;
+}
+
+/* Work-based re-probe: called from BOTH latched paths with this batch's job
+ * count. When the cadence elapses, reset the accumulator and re-enter
+ * MEASURING. All stats mutation is under g_net_mtx; the reset happens before
+ * the state store, so no thread can feed a stale accumulator. Byte-identity is
+ * unaffected: a probe only changes when the kernel is skipped. */
+static inline void net_maybe_reprobe(int n)
+{
+    const int64_t period = bsw_dedup_reprobe_jobs();
+    if (period <= 0) return;
+    if (g_net_since_latch.fetch_add(n, std::memory_order_relaxed) + n < period) return;
+    std::lock_guard<std::mutex> lk(g_net_mtx);
+    const int st = g_net_state.load(std::memory_order_relaxed);
+    if (st == NET_MEASURING) return;                                   /* probe already running */
+    if (g_net_since_latch.load(std::memory_order_relaxed) < period) return;  /* lost the race */
+    g_net_k = 0; g_net_jobs = 0; g_net_mean = 0.0; g_net_m2 = 0.0; g_net_sum = 0.0;
+    g_net_since_latch.store(0, std::memory_order_relaxed);
+    if (bwa_verbose >= 3)
+        fprintf(stderr, "[dedup-auto] re-probe (incumbent %s)\n", st == NET_LATCH_ON ? "ON" : "OFF");
+    g_net_state.store(NET_MEASURING, std::memory_order_relaxed);
+}
+
+/* Fold up to LIMIT bytes from each END of `s` into `h`, eight bytes (one 64-bit
+ * word) at a time. Fingerprinting only the ends as words -- rather than hashing
+ * every byte scalar -- is what keeps dedup's cost a few percent of a job's DP
+ * instead of a third of it: a full byte-wise hash over the ~230-byte target
+ * would eat most of what the dedup saves. Fingerprint collisions are harmless
+ * because every candidate is byte-verified (bsw_job_eq / cache memcmp) before a
+ * result is reused, so this only needs to separate distinct jobs *well*, not
+ * perfectly. */
+static inline void bsw_hash_fold(uint64_t &h, const uint8_t *s, int len)
+{
+    const int LIMIT = 32;
+    auto mix = [&](const uint8_t *p, int n) {
+        int k = 0;
+        for (; k + 8 <= n; k += 8) {
+            uint64_t v; memcpy(&v, p + k, 8);
+            h ^= v; h *= 1099511628211ULL;
+        }
+        if (k < n) {                                   /* < 8-byte tail */
+            uint64_t v = 0;
+            for (int i = 0; k + i < n; i++) v |= (uint64_t)p[k + i] << (8 * i);
+            h ^= v; h *= 1099511628211ULL;
+        }
+    };
+    if (len <= 2 * LIMIT) mix(s, len);
+    else { mix(s, LIMIT); mix(s + len - LIMIT, LIMIT); }
+}
+
+static inline uint64_t bsw_job_hash(const uint8_t *s1, int len1,
+                                    const uint8_t *s2, int len2, int h0)
+{
+    uint64_t h = 1469598103934665603ULL;              /* FNV-1a offset basis */
+    h ^= ((uint64_t)(uint32_t)len1 << 32) | (uint32_t)len2;
+    h *= 1099511628211ULL;
+    h ^= (uint64_t)(uint32_t)h0;
+    h *= 1099511628211ULL;
+    bsw_hash_fold(h, s1, len1);
+    bsw_hash_fold(h, s2, len2);
+    return h;
+}
+
+/* BWAMEM3_DEDUP_STATS=1: count distinct-within-batch (m) vs total (n) extension
+ * DP jobs and print the batch dup rate once at exit. Measurement only; a single
+ * cached-bool branch per batch, inert unless armed. */
+static std::atomic<uint64_t> g_dedup_total{0};
+static std::atomic<uint64_t> g_dedup_distinct{0};
+static inline bool bsw_dedup_stats_on(void)
+{
+    static const bool on = []() {
+        const char *e = getenv("BWAMEM3_DEDUP_STATS");
+        return e && *e && !(e[0] == '0' && e[1] == '\0');
+    }();
+    return on;
+}
+static struct BswDedupStatsDumper {
+    ~BswDedupStatsDumper() {
+        if (!bsw_dedup_stats_on()) return;
+        uint64_t t = g_dedup_total.load(), d = g_dedup_distinct.load();
+        fprintf(stderr,
+            "[dedup-stats] total_jobs=%llu distinct_jobs=%llu perbatch_dup_rate=%.4f\n",
+            (unsigned long long)t, (unsigned long long)d,
+            t ? 1.0 - (double)d / (double)t : 0.0);
+    }
+} g_bsw_dedup_stats_dumper;
+
+/* BWAMEM3_EXT_TIME=1: sum the wall time spent inside bsw_tier_kernel (the
+ * extension dedup + banded-SW path) across all worker threads, print at exit.
+ * Dedup changes only affect this phase, so a small-read smoke run reports the
+ * extension delta directly instead of burying it under the fixed index-load +
+ * I/O wall. Sums thread-time, which is fine for A/B ratios. Inert unless armed. */
+static std::atomic<uint64_t> g_ext_ns{0};
+static inline bool bsw_ext_time_on() {
+    static const bool on = []() {
+        const char *e = getenv("BWAMEM3_EXT_TIME");
+        return e && *e && !(e[0] == '0' && e[1] == '\0');
+    }();
+    return on;
+}
+static struct BswExtTimeDumper {
+    ~BswExtTimeDumper() {
+        if (bsw_ext_time_on())
+            fprintf(stderr, "[ext-time] bsw_tier_kernel_thread_ms=%.1f\n",
+                    g_ext_ns.load() / 1e6);
+    }
+} g_bsw_ext_time_dumper;
+struct BswExtTimer {
+    std::chrono::steady_clock::time_point t0;
+    bool on;
+    BswExtTimer() : on(bsw_ext_time_on()) {
+        if (on) t0 = std::chrono::steady_clock::now();
+    }
+    ~BswExtTimer() {
+        if (on) g_ext_ns.fetch_add(
+            (uint64_t)std::chrono::duration<double, std::nano>(
+                std::chrono::steady_clock::now() - t0).count(),
+            std::memory_order_relaxed);
+    }
+};
+
+/* Dedup wrapper over bsw_score_batch: score each distinct (seq1,seq2,h0) job
+ * once within this batch and copy its result to the repeats. Byte-identical to
+ * scoring all n: every candidate sharing a fingerprint is byte-verified
+ * (memcmp on both sequences) before its result is reused, so a fingerprint
+ * collision can only cost an extra memcmp, never a wrong or lost dedup. */
+static inline void bsw_tier_kernel(BswMethTier tier, IBandedPairWiseSW *bsw,
+        SeqPair *pa, uint8_t *ref, uint8_t *qer, int n, int nthreads, int32_t w,
+        SeqPair *sort_scratch, int32_t *hist)
+{
+    if (n <= 0) return;
+    BswExtTimer _ext_timer;           /* inert unless BWAMEM3_EXT_TIME set */
+    const int mode = bsw_dedup_mode();
+    if (mode == BSW_DEDUP_OFF || n < 2) {
+        bsw_score_batch(tier, bsw, pa, ref, qer, n, nthreads, w, sort_scratch, hist);
+        return;
+    }
+    if (mode == BSW_DEDUP_AUTO) {
+        net_maybe_reprobe(n);
+        if (g_net_state.load(std::memory_order_relaxed) == NET_LATCH_OFF) {
+            bsw_score_batch(tier, bsw, pa, ref, qer, n, nthreads, w, sort_scratch, hist);
+            return;   /* net-cycles controller measured dedup net-negative here */
+        }
+    }
+
+    /* net-cycles controller: while measuring (AUTO), run the dedup path AND
+     * time it, so the ON/OFF decision comes from observed net wall (see
+     * net_observe). net_t0 spans everything the OFF path would NOT do; the
+     * kernel call is timed separately and subtracted out to isolate the
+     * dedup-wrapper overhead from the DP-kernel cost. */
+    const bool net_measure = (mode == BSW_DEDUP_AUTO
+                        && g_net_state.load(std::memory_order_relaxed) == NET_MEASURING);
+    std::chrono::steady_clock::time_point net_t0;
+    int64_t net_total_cells = 0, net_dp_cells = 0;
+    double  net_kernel_ns = 0.0;
+    /* Banded-SW cost model: a job computes ~ len2 * band cells, NOT len1*len2 --
+     * the band (2w+1, capped by the target length) is far narrower than len1, so
+     * len1*len2 wildly over-weights long targets and skews the per-cell rate,
+     * biasing the ON/OFF decision toward OFF. min(len1, 2w+1) is the true DP width. */
+    const int64_t net_band = 2 * (int64_t)w + 1;
+    if (net_measure) net_t0 = std::chrono::steady_clock::now();
+
+    static thread_local std::vector<int>          miss_grp;    /* per pair: miss-group, or -1 if cache-resolved */
+    static thread_local std::vector<SeqPair>      repbuf;      /* one rep per distinct miss (to score) */
+    static thread_local std::vector<int>          next_grp;    /* per miss-group: next group (1-based) in its hash chain, 0 = end (intrusive bucket) */
+    static thread_local std::vector<BswJobResult> miss_res;    /* per miss-group: scored result */
+    static thread_local robin_hood::unordered_flat_map<uint64_t,int> missidx; /* content hash -> head miss-group of the chain (this batch) */
+
+    miss_grp.assign(n, -1);
+    repbuf.clear();
+    next_grp.clear();
+    missidx.clear();
+
+    for (int i = 0; i < n; i++) {
+        const uint8_t *s1 = ref + pa[i].idr; const int len1 = pa[i].len1;
+        const uint8_t *s2 = qer + pa[i].idq; const int len2 = pa[i].len2;
+        const int      h0 = pa[i].h0;
+        if (net_measure) {
+            const int64_t cells = (int64_t)len2 * ((int64_t)len1 < net_band ? (int64_t)len1 : net_band);
+            net_total_cells += cells;
+        }
+        const uint64_t hv = bsw_job_hash(s1, len1, s2, len2, h0);
+
+        /* miss: dedup against distinct misses already seen in THIS batch. Every
+         * candidate sharing this fingerprint is byte-compared (walking the
+         * intrusive chain), so a fingerprint collision costs an extra memcmp --
+         * it never SPLITS a true group and loses the dedup, which a single-slot
+         * map would on collision. */
+        int g = -1;
+        int &head = missidx[hv];        /* value-inits to 0 on a new key; groups are stored 1-based, 0 = empty chain */
+        for (int cand = head; cand > 0; cand = next_grp[cand - 1]) {
+            const SeqPair &rep = repbuf[cand - 1];
+            if (rep.len1 == len1 && rep.len2 == len2 && rep.h0 == h0
+                && memcmp(ref + rep.idr, s1, (size_t)len1) == 0
+                && memcmp(qer + rep.idq, s2, (size_t)len2) == 0) { g = cand - 1; break; }
+        }
+        if (g < 0) {
+            g = (int)repbuf.size();
+            repbuf.push_back(pa[i]);
+            next_grp.push_back(head);   /* prepend: new group's chain-next is the old head (0 = end) */
+            head = g + 1;               /* store 1-based so a fresh map slot (0) reads as "empty" */
+        }
+        miss_grp[i] = g;
+    }
+
+    const int m = (int)repbuf.size();
+    if (bsw_dedup_stats_on()) {   /* count distinct-within-batch vs total */
+        g_dedup_total.fetch_add((uint64_t)n, std::memory_order_relaxed);
+        g_dedup_distinct.fetch_add((uint64_t)m, std::memory_order_relaxed);
+    }
+    if (m > 0) {
+        /* tag each rep's group in the unused `id` field before scoring permutes
+         * repbuf. The kernels write `id` only on the padding lanes
+         * (pairArray[ii].id = ii for ii >= numPairs), never on a real slot, and
+         * sortPairsLen moves whole SeqPairs -- so id survives the reorder and
+         * identifies each scored rep's group with no second map (the old
+         * (seqid,regid) repkey2grp). */
+        for (int g = 0; g < m; g++) {
+            if (net_measure) { const int64_t l1 = repbuf[g].len1;
+                net_dp_cells += (int64_t)repbuf[g].len2 * (l1 < net_band ? l1 : net_band); }
+            repbuf[g].id = g;
+        }
+
+        /* The kernels write and (guardedly) prefetch padding lanes past
+         * numPairs; the caller's seqPair buffers are ALWAYS allocated as
+         * (numPairs-bound + MAX_LINE_LEN), so every kernel is written against
+         * that guaranteed slack. repbuf must honor the same contract -- a tight
+         * roundup(m, SIMD_WIDTH8) is not enough and overruns the heap. Value-
+         * initialization zeroes len1/len2/idr/idq so the slack lanes stay inert. */
+        repbuf.resize((size_t)((m + SIMD_WIDTH8 - 1) / SIMD_WIDTH8) * SIMD_WIDTH8
+                      + MAX_LINE_LEN);
+
+        std::chrono::steady_clock::time_point net_k0;
+        if (net_measure) net_k0 = std::chrono::steady_clock::now();
+        bsw_score_batch(tier, bsw, repbuf.data(), ref, qer, m, nthreads, w, sort_scratch, hist);
+        if (net_measure)
+            net_kernel_ns = std::chrono::duration<double, std::nano>(
+                                std::chrono::steady_clock::now() - net_k0).count();
+
+        /* map each scored rep back to its miss-group by the `id` tag set above.
+         * `id` is kernel-controlled: guard it before indexing so a tier that
+         * violates the "id survives untouched on real slots" contract fails
+         * loudly (xassert fires under -DNDEBUG too) instead of scattering out of
+         * bounds and corrupting the heap. */
+        miss_res.resize(m);
+        for (int k = 0; k < m; k++) {
+            const int32_t rk = repbuf[k].id;
+            xassert(rk >= 0 && rk < m, "dedup scatter: kernel-controlled repbuf.id out of [0, m)");
+            miss_res[rk] =
+                BswJobResult{repbuf[k].score, repbuf[k].tle, repbuf[k].qle,
+                             repbuf[k].gscore, repbuf[k].gtle, repbuf[k].max_off};
+        }
+
+        for (int i = 0; i < n; i++)   /* apply miss results to their pending pairs */
+            if (miss_grp[i] >= 0) bsw_apply_result(pa[i], miss_res[miss_grp[i]]);
+    }
+
+    /* net-cycles decision: overhead = whole dedup wrapper minus the kernel; the
+     * benefit is the kernel time the skipped duplicate cells would have cost, at
+     * this batch's measured per-cell rate. Feed the signed net to the controller. */
+    if (net_measure && net_dp_cells > 0 && net_kernel_ns > 0.0) {
+        const double total_ns = std::chrono::duration<double, std::nano>(
+                                    std::chrono::steady_clock::now() - net_t0).count();
+        const double overhead_ns  = total_ns - net_kernel_ns;
+        const double c_cell       = net_kernel_ns / (double)net_dp_cells;
+        const double cells_saved  = (double)(net_total_cells - net_dp_cells);
+        const double benefit_ns   = cells_saved * c_cell;
+        net_observe(overhead_ns - benefit_ns, n);
     }
 }
 

@@ -1562,6 +1562,7 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "    -y INT        seed occurrence for the 3rd round seeding [%ld]\n", (long)opt->max_mem_intv);
     fprintf(stderr, "    -c INT        skip seeds with more than INT occurrences [%d]\n", opt->max_occ);
     fprintf(stderr, "    --smem-dedup  dedup identical SMEMs before chaining: fewer SA lookups, ~10%% fewer; opt-in, NOT byte-identical (changes XS/secondary on a small fraction of reads) [off]\n");
+    fprintf(stderr, "    --dedup STR   extension-DP job dedup: 'off', 'on' (dedup identical jobs within each batch), or 'auto' (measure net benefit at runtime, latch, and periodically re-probe); alignment records byte-identical in every mode (@PG excluded, it embeds argv) [auto]\n");
     fprintf(stderr, "    --huge-pages  back the index with 1 GB huge pages via mimalloc when the host has enough free 1 GB pages reserved; cuts dTLB misses in seeding; Linux only, alignment records byte-identical (only @PG CL differs, recording the flag), safe no-op otherwise [off]\n");
     fprintf(stderr, "    --skip-contained-ext  skip banded-SW extension of seeds contained (same diagonal) in a longer in-chain seed; byte-identical on short/medium non-meth reads (NOT on kilobase-scale long reads); no effect under --meth [off]\n");
     fprintf(stderr, "    --max-extend-chains INT  cap chains extended per read to the top-INT by weight; ~23%% less alignment CPU, high-confidence placement unaffected; ignored for reads with >4096 chains; opt-in, NOT byte-identical (0 = off) [%d]\n", opt->max_extend_chains);
@@ -1968,6 +1969,7 @@ int main_mem(int argc, char *argv[])
 #ifdef STAGE_PROF
         OPT_PROFILE,
 #endif
+        OPT_DEDUP,
         OPT_HELP,
     };
     static struct option long_opts[] = {
@@ -1975,6 +1977,7 @@ int main_mem(int argc, char *argv[])
         {"min-ext-len",              required_argument, 0, OPT_MIN_EXT_LEN},
         {"max-extend-chains",        required_argument, 0, OPT_MAX_EXTEND_CHAINS},
         {"smem-dedup",               no_argument,       0, OPT_SMEM_DEDUP},
+        {"dedup",                    required_argument, 0, OPT_DEDUP},
         {"fast",                     no_argument,       0, OPT_FAST},
         {"huge-pages",               no_argument,       0, OPT_HUGE_PAGES},
         {"skip-contained-ext",       no_argument,       0, OPT_SKIP_CONTAINED_EXT},
@@ -2007,6 +2010,7 @@ int main_mem(int argc, char *argv[])
 #ifdef STAGE_PROF
     const char *profile_path = NULL;   /* --profile <path>: stage_prof TSV output */
 #endif
+    const char *dedup_mode_arg = NULL; /* --dedup <off|on|auto>; resolved via mem_dedup_configure after getopt */
     while ((c = getopt_long(argc, argv, "51qpaMCSPVYjuk:c:v:s:r:t:R:A:B:O:E:U:w:L:d:T:Q:D:m:I:N:W:x:G:h:y:K:X:H:o:f:z:",
                             long_opts, NULL)) >= 0)
     {
@@ -2278,6 +2282,19 @@ int main_mem(int argc, char *argv[])
             opt->compat = t;
         }
         else if (c == OPT_SMEM_DEDUP) opt->smem_dedup = 1;
+        else if (c == OPT_DEDUP) {
+            /* Reject an explicit-but-empty CLI value (`--dedup=` / `--dedup ''`):
+             * mem_dedup_configure() treats an empty mode_arg as "no CLI value" and
+             * falls back to BWAMEM3_DEDUP, so without this guard a malformed flag
+             * would silently inherit the env instead of being fatal. */
+            if (!*optarg) {
+                fprintf(stderr, "ERROR: --dedup: expected off|on|auto, got empty value\n");
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+            dedup_mode_arg = optarg;
+        }
         else if (c == OPT_FAST) fast = 1;
         else if (c == OPT_HUGE_PAGES) want_huge_pages = 1;
         else if (c == OPT_PROPER_PAIR_FROM_EMITTED) opt->proper_pair_from_emitted = 1;
@@ -2438,6 +2455,7 @@ int main_mem(int argc, char *argv[])
     }
 
     if (opt->n_threads < 1) opt->n_threads = 1;
+    mem_dedup_configure(dedup_mode_arg);   /* --dedup CLI > env BWAMEM3_DEDUP > default 'auto'; fatal on bad value */
     /* A stray word on the command line slides silently into a positional slot.
      * Two spellings invite it:
      *   --meth taps        (optional argument: getopt_long only binds it with '=')

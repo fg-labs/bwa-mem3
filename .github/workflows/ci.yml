@@ -818,6 +818,14 @@ jobs:
           COMPAT_WORK_DIR=/tmp/compat-bytes \
           bash test/regression/compat_byte_identical.sh
 
+      - name: byte-identity off==on==auto (extension-DP job dedup)
+        if: matrix.canonical == true
+        run: |
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          DEDUP_PHIX_FA="$GITHUB_WORKSPACE/test/fixtures/phix.fa" \
+          DEDUP_WORK_DIR=/tmp/dedup-bytes \
+          bash test/regression/dedup_byte_identity.sh
+
       - name: --hic alias regression (byte-identical to -5SP)
         if: matrix.canonical == true
         run: |
