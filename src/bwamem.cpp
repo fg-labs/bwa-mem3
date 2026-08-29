@@ -4923,6 +4923,160 @@ static inline void bsw_run_tier(BswMethTier tier, const mem_opt_t *opt,
     bsw_tier_kernel(tier, sym, pair_ar + mid, ref, qer, n_sym, nthreads, w, meth_scratch, hist);
 }
 
+/* ------------------------------------------------------------------------
+ * Certified tight_band probe rung (8-bit tier).
+ *
+ * The scalar and 16-bit tiers already run a narrow probe at INIT_W(opt->w) = 20
+ * and finalize the pairs a per-pair certificate proves optimal there. The 8-bit
+ * tier does not: its ladder starts at opt->w, so short-read extensions that carry
+ * a proven tight_band still pay the full-width band. This rung gives the 8-bit
+ * tier the same narrow probe: it runs the eligible pairs at the probe width
+ * BEFORE the ladder and finalizes only those band_cert_accept certifies there --
+ * byte-identical to the full-width ladder result, by the same certificate the
+ * other tiers ship (band_cert_accept's w < opt->w branch: the S - pen_clip anchor
+ * pins score/qle/tle/gscore/gtle and the clip decision; mem_band_cert_params_safe
+ * -- implied by opt->band_cert, see fastmap.cpp -- pins the control flow, and its
+ * w0 = 20 conditions cover the probe width verbatim).
+ *
+ * Eligibility (gate A): opt->band_cert AND 0 < tight_band <= ADAPTIVE_BAND_START.
+ * Ineligible pairs (no proof, or a band wider than the probe) skip the rung and
+ * reach the untouched ladder unchanged. Uncertified pairs GAP2-restore a->score
+ * and fall through to the ladder too. The rung returns the count of pairs left
+ * for the ladder (ineligible + uncertified), compacted to the front of pair_ar.
+ *
+ * The bucket call scores a sub-slice of pair_ar, so its padding-lane overshoot
+ * would clobber the following region: guard the sym object for its duration
+ * (OT/OB are already guarded under --meth). pen_clip / is_left select the
+ * extension-direction clip penalty and profiling hook.
+ * ------------------------------------------------------------------------- */
+/* Forward declarations: the certified probe rung below records post-SW outcomes
+ * through these profiling helpers, whose definitions live after the ladder
+ * blocks further down this file. */
+static inline void ugp_record_left_outcome(const SeqPair *sp, int a_match, int tid);
+static inline void ugp_record_right_outcome(const SeqPair *sp, int tid);
+
+static inline int bsw_tb_probe_rung(const mem_opt_t *opt, mem_alnreg_v *av_v,
+        IBandedPairWiseSW *sym, IBandedPairWiseSW *ot, IBandedPairWiseSW *ob,
+        SeqPair *pair_ar, uint8_t *ref, uint8_t *qer, int nump,
+        int nthreads, SeqPair *scratch, int32_t *hist,
+        const bseq1_t *seq_, int pen_clip, int is_left, int tid)
+{
+    if (nump <= 0 || !opt->band_cert) return nump;
+
+    /* Quantized bucket ceilings (<= ADAPTIVE_BAND_START). A pair runs at the
+     * smallest ceiling >= its tight_band, so a proven-narrow pair does its DP at
+     * a band near its tb rather than the uniform probe width -- the whole point,
+     * since on the short 8-bit extensions band 20 costs about what band opt->w
+     * does. The certificate is evaluated at the bucket ceiling W_b >= tb, so
+     * acceptance is byte-identical for every ceiling. */
+    static const int32_t BUCKET_CEIL[] = {4, 8, 12, 16, ADAPTIVE_BAND_START};
+    const int NBUCK = (int)(sizeof(BUCKET_CEIL) / sizeof(BUCKET_CEIL[0]));
+
+    /* The certificate at run width W_b needs W_b >= tb + ceil(pen_clip/e_min): tight_band is
+     * anchored on the raw ungapped score with no clip slack, but the accept below certifies at
+     * S - pen_clip (the direction's clip). So key eligibility and buckets on the width the
+     * certificate actually demands, w_need = tb + clip_slack, NOT tb -- otherwise the modal
+     * ungapped-optimal pair (sc == max_sc_proof) fails the certificate by exactly that margin and
+     * re-runs the ladder. This is a heuristic width choice only; the certificate is still evaluated
+     * at the actual run width, so byte-identity is unchanged. */
+    const int e_min = opt->e_del < opt->e_ins ? opt->e_del : opt->e_ins;
+    const int clip_slack = (e_min > 0) ? (pen_clip + e_min - 1) / e_min : ADAPTIVE_BAND_START;
+    auto w_need_of = [&](int tb) { return tb + clip_slack; };
+
+    /* Partition [ineligible | eligible]; eligible = proven narrow (w_need <= 20). */
+    int n_inelig = 0;
+    for (int l = 0; l < nump; l++) {
+        int tb = pair_ar[l].tight_band;
+        if (!(tb > 0 && w_need_of(tb) <= ADAPTIVE_BAND_START)) {
+            SeqPair t = pair_ar[n_inelig]; pair_ar[n_inelig] = pair_ar[l]; pair_ar[l] = t;
+            n_inelig++;
+        }
+    }
+    int n_elig = nump - n_inelig;
+    if (n_elig <= 0) return nump;
+    SeqPair *elig = pair_ar + n_inelig;
+
+    /* Counting-sort the eligible pairs into contiguous ceiling-buckets keyed on w_need (scratch
+     * as temp; freed before any bsw_run_tier call reuses it as sort scratch). */
+    int cnt[8] = {0}, off[8] = {0};
+    auto bucket_of = [&](int w_need) { int b = 0; while (b < NBUCK - 1 && BUCKET_CEIL[b] < w_need) b++; return b; };
+    for (int l = 0; l < n_elig; l++) cnt[bucket_of(w_need_of(elig[l].tight_band))]++;
+    for (int b = 1; b < NBUCK; b++) off[b] = off[b - 1] + cnt[b - 1];
+    { int cur[8]; for (int b = 0; b < NBUCK; b++) cur[b] = off[b];
+      for (int l = 0; l < n_elig; l++) { int b = bucket_of(w_need_of(elig[l].tight_band)); scratch[cur[b]++] = elig[l]; }
+      for (int l = 0; l < n_elig; l++) elig[l] = scratch[l]; }
+
+    /* Score each non-empty bucket at its ceiling and certify there; failures from
+     * all buckets compact after the ineligible run (write cursor <= read cursor)
+     * for the untouched ladder. Guard the sym object: each bucket is a sub-slice. */
+    int n_fail = 0;
+    for (int b = 0; b < NBUCK; b++) {
+      if (cnt[b] <= 0) continue;
+      const int32_t Wb = BUCKET_CEIL[b];
+      SeqPair *bkt = elig + off[b];
+      sym->set_guard_overshoot(true);
+      bsw_run_tier(BSW_TIER_8, opt, av_v, sym, ot, ob,
+                   bkt, ref, qer, cnt[b], nthreads, Wb, scratch, scratch, hist);
+      sym->set_guard_overshoot(false);
+      for (int l = 0; l < cnt[b]; l++) {
+        SeqPair *sp = &bkt[l];
+        mem_alnreg_t *a = &(av_v[sp->seqid].a[sp->regid]);
+        int prev = a->score;
+        a->score = sp->score;
+        /* Fix 2 (branch-A accept): certify at the direction's pen_clip anchor with NO gscore
+         * precondition, then let the finalize block below pick branch A (clipped: qle/tle) or
+         * branch B (query-end: gscore/gtle) by the same threshold the ladder uses. band_cert_ok
+         * at S - pen_clip proves every out-of-band cell scores strictly below S - pen_clip, so the
+         * wide run's branch decision and both branches' finalized fields are band-invariant
+         * (Fable-verified against the kernel update rules). The direction's pen_clip is REQUIRED:
+         * min(pen_clip5,pen_clip3) is unsound for branch A under asymmetric -L. This is a SEPARATE
+         * accept from the shared band_cert_accept, so the shipped scalar/16-bit probes are untouched. */
+        if (band_cert_ok(a->score - pen_clip, sp->h0, sp->len1, sp->len2, Wb, opt)) {
+            /* Finalize exactly as the direction's ladder does (LEFT: qb/rb backward, truesc=;
+             * RIGHT: qe/re forward, truesc+=, branch B sets qe=l_query). */
+            if (is_left) {
+#if BWAMEM3_UGP_PROFILE
+                ugp_record_left_outcome(sp, opt->a, tid);
+#endif
+                if (sp->gscore <= 0 || sp->gscore <= a->score - pen_clip) {
+                    a->qb -= sp->qle; a->rb -= sp->tle;
+                    a->truesc = a->score;
+                } else {
+                    a->qb = 0; a->rb -= sp->gtle;
+                    a->truesc = sp->gscore;
+                }
+            } else {
+#if BWAMEM3_UGP_PROFILE
+                ugp_record_right_outcome(sp, tid);
+#endif
+                if (sp->gscore <= 0 || sp->gscore <= a->score - pen_clip) {
+                    a->qe += sp->qle; a->re += sp->tle;
+                    a->truesc += a->score - sp->h0;
+                } else {
+                    int l_query = seq_[sp->seqid].l_seq;
+                    a->qe = l_query; a->re += sp->gtle;
+                    a->truesc += sp->gscore - sp->h0;
+                }
+            }
+            a->w = max_(a->w, Wb);
+            if (a->rb != H0_ && a->qb != H0_ && a->qe != H0_ && a->re != H0_) {
+                int ii = 0;
+                for (ii = 0, a->seedcov = 0; ii < a->c->n; ++ii) {
+                    const mem_seed_t *t = &(a->c->seeds[ii]);
+                    if (t->qbeg >= a->qb && t->qbeg + t->len <= a->qe &&
+                        t->rbeg >= a->rb && t->rbeg + t->len <= a->re)
+                        a->seedcov += t->len;
+                }
+            }
+        } else {
+            a->score = prev;              /* GAP2 restore (unconditional) */
+            elig[n_fail++] = *sp;          /* carry to the ladder */
+        }
+      }
+    }
+    return n_inelig + n_fail;
+}
+
 /* Restructured BSW parent function */
 #define FAC 8
 #define PFD 2
@@ -6262,6 +6416,12 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
 
     nump = numPairsLeft128;
     init_w = opt->w;
+    /* commit 4: certified tight_band probe rung. Finalizes the proven-narrow
+     * 8-bit pairs at the probe width (byte-identical); returns the count left
+     * (ineligible + uncertified), compacted to the front, for the ladder. */
+    nump = bsw_tb_probe_rung(opt, av_v, bswLeft.get(), bswLeftOt.get(), bswLeftOb.get(),
+                             pair_ar, seqBufLeftRef, seqBufLeftQer, nump, nthreads,
+                             pair_ar_aux, hist, seq_, opt->pen_clip5, /*is_left=*/1, tid);
     for ( i=0; i<BAND_NBAND(init_w); i++)
     {
         int32_t w = BAND_WIDTH(init_w, i);
@@ -6621,6 +6781,10 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
     pair_ar_aux = seqPairArrayAux;
     nump = numPairsRight128;
     init_w = opt->w;
+    /* commit 4: certified tight_band probe rung (mirror of the LEFT rung; pen_clip3). */
+    nump = bsw_tb_probe_rung(opt, av_v, bswRight.get(), bswRightOt.get(), bswRightOb.get(),
+                             pair_ar, seqBufRightRef, seqBufRightQer, nump, nthreads,
+                             pair_ar_aux, hist, seq_, opt->pen_clip3, /*is_left=*/0, tid);
 
     for ( i=0; i<BAND_NBAND(init_w); i++)
     {
