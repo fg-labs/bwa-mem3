@@ -173,6 +173,19 @@ CASES_TOTAL="$(echo "$OUT" | sed -nE 's/^([0-9]+) \/ ([0-9]+) cases passed$/\2/p
 [[ "$CASES_PASSED" == "$CASES_TOTAL" ]] || fail "bwtseed_lockstep_parity_test: $CASES_PASSED / $CASES_TOTAL cases passed"
 ok "bwtseed_lockstep_parity_test ($CASES_PASSED / $CASES_TOTAL)"
 
+# --- backwardext_konly_parity_test ----------------------------------------
+# Direct kernel parity: backwardExt_konly vs the full backwardExt across a sweep
+# of block offsets, locking the s==1 MSB-first bit path (bit CP_MASK-pos), which
+# had a real byte-identity bug during development.
+if OUT="$(cd "$HERE" && ./backwardext_konly_parity_test "$FIXTURES/phix.fa" 2>&1)"; then
+    echo "$OUT" | grep -q "backwardExt_konly PARITY PASS" \
+        || fail "backwardext_konly_parity_test: no PASS line"
+    ok "backwardext_konly_parity_test"
+else
+    echo "$OUT"
+    fail "backwardext_konly_parity_test: non-zero exit"
+fi
+
 # --- long-read end-to-end (issue 44) --------------------------------------
 # Pre-fix, reads > 151 bp overran the per-thread SMEM buffer (segfault) and
 # reads > 512 bp tripped the MAX_READ_LEN_FOR_LOCKSTEP assert. Post-fix the

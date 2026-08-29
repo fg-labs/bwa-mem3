@@ -435,6 +435,63 @@ private:
             return smem;
         }
 
+        /* K-only backward extension for the pure-backward SMEM phase
+         * (ls_advance_backward_step). Computes ONLY smem.k and smem.s, leaving
+         * smem.l untouched: in the backward phase the reverse-complement interval
+         * start `l` is dead — it is consumed only to compute the next step's `l`,
+         * and every downstream reader of an emitted seed's `l` is redundant by the
+         * (rid,m,n) => (k,l,s) invariant. Those readers were the smem_dedup
+         * comparator (smem_dedup_inplace) and the scalar/lockstep field comparator
+         * in the parity harness (test/smem_lockstep_parity_test.cpp); both have
+         * been updated to drop `l`, so an emitted seed's identity is (rid,m,n,k,s).
+         * NOTE this means the l this phase emits is intentionally stale (frozen at
+         * its forward-phase value); it must never be resurrected as an observable
+         * field without also restoring the l-chain here. Dropping the l-chain
+         * removes the sentinel test, the l cumulation, and (on x86) six of eight
+         * popcounts — same two cache lines read, far fewer instructions.
+         * Byte-identical in observable (SAM) output.
+         *
+         * s==1 fast path: when the interval is a single suffix (common once the
+         * match is unique), occ(a, sp+1) - occ(a, sp) is exactly the one BWT bit
+         * at sp, so s' is a single bit test on the sp block — no ep block, no
+         * second popcount. one_hot_mask_array is MSB-first (mask[i] = top i bits),
+         * so BWT position `pos` lives at bit (CP_MASK - pos). On the s'->0 exit the
+         * new k is left stale (unset): this is safe ONLY because every caller
+         * discards a seed with s < min_intv while emitting the OLD smem, and every
+         * caller uses min_intv >= 1 (enforced by an xassert in ls_init_slot), so an
+         * s'==0 result is always discarded and its k is never read. Under that
+         * precondition the remaining popcount is skipped too. */
+        __attribute__((always_inline)) inline
+        SMEM backwardExt_konly(SMEM smem, uint8_t a) const
+        {
+            const int64_t sp = (int64_t)smem.k;
+            if (smem.s == 1) {
+                const CP_OCC &blk = cp_occ[sp >> CP_SHIFT];
+                const int pos = (int)(sp & CP_MASK);
+                const uint64_t oh = blk.one_hot_bwt_str[a];
+                if ((oh >> (CP_MASK - pos)) & 1ULL) {  /* BWT[sp] == a  => s' = 1 */
+                    smem.k = count[a] + blk.cp_count[a] +
+                             (int64_t)__builtin_popcountll(oh & one_hot_mask_array[pos]);
+                    smem.s = 1;
+                } else {                               /* s' = 0; new k is dead */
+                    smem.s = 0;
+                }
+                return smem;
+            }
+            const int64_t ep = sp + (int64_t)smem.s;
+            const CP_OCC &blk_sp = cp_occ[sp >> CP_SHIFT];
+            const CP_OCC &blk_ep = cp_occ[ep >> CP_SHIFT];
+            const uint64_t mask_sp = one_hot_mask_array[sp & CP_MASK];
+            const uint64_t mask_ep = one_hot_mask_array[ep & CP_MASK];
+            const int64_t occ_s = blk_sp.cp_count[a] +
+                (int64_t)__builtin_popcountll(blk_sp.one_hot_bwt_str[a] & mask_sp);
+            const int64_t occ_e = blk_ep.cp_count[a] +
+                (int64_t)__builtin_popcountll(blk_ep.one_hot_bwt_str[a] & mask_ep);
+            smem.k = count[a] + occ_s;
+            smem.s = occ_e - occ_s;
+            return smem;
+        }
+
     // ----- Lockstep SMEM batching internals -----
     // Defined in FMI_search.cpp. Phases and per-slot state are scoped to
     // the lockstep driver; not used anywhere else.

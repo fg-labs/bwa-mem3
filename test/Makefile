@@ -15,7 +15,7 @@
 ##  direct builds — see the ARM branch below).
 ##*****************************************************************************
 
-EXE = fmi_test smem2_test bwt_seed_strategy_test sa2ref_test xeonbsw bandedswa_zdrop_eweight_test smem_lockstep_parity_test bwtseed_lockstep_parity_test header_insert_test packed_text_test system_test
+EXE = fmi_test smem2_test bwt_seed_strategy_test sa2ref_test xeonbsw bandedswa_zdrop_eweight_test smem_lockstep_parity_test bwtseed_lockstep_parity_test backwardext_konly_parity_test header_insert_test packed_text_test system_test
 
 # Doctest binaries — rules populated in Task 14 (unit) and Task 15
 # (integration). Listed separately from $(EXE) so `all` and
@@ -254,6 +254,9 @@ smem_lockstep_parity_test: smem_lockstep_parity_test.o
 bwtseed_lockstep_parity_test: bwtseed_lockstep_parity_test.o
 	$(CXX) $(LDFLAGS) -o $@ $^ $(LIBS)
 
+backwardext_konly_parity_test: backwardext_konly_parity_test.o
+	$(CXX) $(LDFLAGS) -o $@ $^ $(LIBS)
+
 header_insert_test: header_insert_test.o
 	$(CXX) $(LDFLAGS) -o $@ $^ $(LIBS)
 
@@ -310,4 +313,5 @@ integration/sa2ref_test.o: $(FMI_TEST_HEADERS)
 integration/smem2_test.o: $(FMI_TEST_HEADERS)
 smem_lockstep_parity_test.o: $(FMI_TEST_HEADERS)
 bwtseed_lockstep_parity_test.o: $(FMI_TEST_HEADERS)
+backwardext_konly_parity_test.o: $(FMI_TEST_HEADERS)
 header_insert_test.o: ../src/bwa.h
