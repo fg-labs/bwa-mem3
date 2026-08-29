@@ -330,7 +330,10 @@ extension: measured md5 of the alignment records (`@PG` `CL:` excepted) is uncha
 on a 1M-read WGS slice (HG00096, hg38, Apple Silicon / NEON tier, clang) at
 default parameters and across a `-d`/`-L`/`-O`/`-E`/`-A`/`-B` sweep, and the
 opt-out **`--no-band-cert`** (which forces the full-width ladder) reproduces the
-same md5 exactly. See
+same md5 exactly. Every comparison uses an identical `-t` on both runs, so the
+batch boundaries — and therefore `mem_pestat` and record order — match between
+the two streams being compared (`-t`/`-K` change batching and so must be held
+equal across a byte-identity comparison). See
 [Features → Certified adaptive extension band](features.md#certified-adaptive-extension-band-default-on---no-band-cert-to-disable).
 This is distinct from the aggressive, opt-in, *not* byte-identical `--adaptive-band`
 narrowing catalogued under [opt-in divergences](#divergences-that-are-latent-opt-in-or-per-architecture).
