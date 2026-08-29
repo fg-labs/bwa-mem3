@@ -176,6 +176,24 @@ static inline long ksw_wave_zneed(int qlen,int tlen,int w){
 static constexpr long KSW_ZR_SHRINK_FLOOR = 4L << 20;   // never shrink zr below 4 MiB
 static constexpr int  KSW_ZR_DECAY_WINDOW = 64;         // wave calls per decay check
 
+/* Anonymous namespace (internal linkage) is load-bearing, not cosmetic. ksw.cpp
+ * is compiled once per SIMD tier (sse41/sse42/avx/avx2/avx512bw on x86), and the
+ * int16 ring buffers Hb16/Eb16/Fb16 below are #if-guarded so KswWaveScratch has
+ * 12 vector members on the int16-capable tiers (avx2/avx512bw/NEON) but only 9
+ * on the scalar tiers. With external linkage that divergence is a silent ODR
+ * violation: the implicit ctor/dtor become linkonce_odr (COMDAT) and the linker
+ * folds every TU's copy to ONE — and if it keeps a 9-member destructor, the
+ * int16 vectors allocated by ensure() on an int16 tier are never freed at
+ * worker-thread exit, so LeakSanitizer flags 3 live allocations per worker
+ * thread (x86 only; arm64 has a single tier, hence no divergent copy to fold
+ * against). Internal linkage gives every tier TU its own complete ctor/dtor, so
+ * the int16 vectors are freed by the same tier that allocated them. Same
+ * anonymous-namespace idiom as PacFetchScratch in bntseq.cpp, but not for the
+ * same reason: there it is plain internal-linkage hygiene (bntseq.cpp is a
+ * single TU with no #if-divergent layout, so nothing folds — its leak is
+ * handled by the thread-exit destructor itself); here the internal linkage is
+ * load-bearing, preventing the per-tier destructor fold described above. */
+namespace {
 struct KswWaveScratch {
     int maxlen=0, pad=64, stride=0;
     std::vector<int32_t> Hb,Eb,Fb; std::vector<uint8_t> tpad,qpad,qrev,zr;
@@ -220,6 +238,7 @@ struct KswWaveScratch {
         if(zneed>(long)zr.size()) zr.assign(zneed,0);
     }
 };
+}  // anonymous namespace
 
 /* Arch-independent traceback: walk the diagonal-major direction bytes from
  * (tlen-1, qlen-1) back to the origin and emit the CIGAR. No SIMD — shared
