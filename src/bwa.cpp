@@ -331,7 +331,12 @@ uint32_t *bwa_gen_cigar3(const int8_t mat[25], int o_del, int e_del, int o_ins, 
             tmp = rseq[i], rseq[i] = rseq[rlen - 1 - i], rseq[rlen - 1 - i] = tmp;
     }
     if (l_query == re - rb && w_ == 0) { // no gap; no need to do DP
-        // UPDATE: we come to this block now... FIXME: due to an issue in mem_reg2aln(), we never come to this block. This does not affect accuracy, but it hurts performance.
+        // Reached routinely for provably-ungapped, equal-length alignments. mem_reg2aln()
+        // derives the emission band from infer_bw() (bwamem.cpp), which returns 0 whenever
+        // the score deficit is below the two-gap threshold -- i.e. no balanced indel could
+        // improve the score, so the optimal alignment is gap-free. A zero band lands here
+        // and emits the single <len>M CIGAR directly, with no ksw_global2 fill or traceback.
+        // (An earlier FIXME here claimed this block was unreachable; that was stale.)
         if (n_cigar) {
             cigar = (uint32_t*) malloc(4);
             xassert(cigar != NULL, "out of memory: cigar");
