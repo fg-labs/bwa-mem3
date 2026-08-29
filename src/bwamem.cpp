@@ -4942,6 +4942,15 @@ static inline void bsw_run_tier(BswMethTier tier, const mem_opt_t *opt,
     bsw_tier_kernel(tier, sym, pair_ar + mid, ref, qer, n_sym, nthreads, w, meth_scratch, hist);
 }
 
+/* The rung's finalize blocks call the ugp_record_*_outcome profiling hooks, which are
+ * defined further below (after the rung). Those calls compile only under the profiling
+ * build (-DBWAMEM3_UGP_PROFILE=1, off by default), so forward-declare them here to avoid
+ * a use-before-definition under that flag. No effect on the default (non-profiling) build. */
+#if BWAMEM3_UGP_PROFILE
+static inline void ugp_record_left_outcome(const SeqPair *sp, int a_match, int tid);
+static inline void ugp_record_right_outcome(const SeqPair *sp, int tid);
+#endif
+
 /* ------------------------------------------------------------------------
  * Certified tight_band probe rung (8-bit tier).
  *
