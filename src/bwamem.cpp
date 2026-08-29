@@ -457,8 +457,14 @@ static inline int band_cert_mat_max(const int8_t *mat) {
  *       / mem_reg2aln). A within-w0 pair meets it at defaults; a custom small -w
  *       (opt->w ~ 21..26) or a large -A can fail it, and we fall back to the exact ladder.
  *       Default opt->w=100, a=1 -> 75 > 21. */
-int mem_band_cert_params_safe(const mem_opt_t *opt) {
-    const int w0 = ADAPTIVE_BAND_START;
+/* Envelope check at an arbitrary probe width w0. The two w0-dependent conditions (the
+ * zdrop margin and the a->w first-rung-accept condition) TIGHTEN monotonically as w0 grows,
+ * so `_w(opt, W) == 1` implies `_w(opt, W') == 1` for every W' <= W. The startup gate below
+ * evaluates this at w0 = ADAPTIVE_BAND_START = 20; the certified probe rung re-evaluates it
+ * at each wider bucket ceiling (Gate B) so it may only route a pair to a wider band when the
+ * control-flow envelope still provably holds AT that band. The parameter-only conditions
+ * (e_min>0, a_max<=a, pen_clip<o_min+e_min) are w0-independent and carry over unchanged. */
+static int mem_band_cert_params_safe_w(const mem_opt_t *opt, int w0) {
     int o_min = min_(opt->o_del, opt->o_ins);
     int e_min = min_(opt->e_del, opt->e_ins);
     int e_max = max_(opt->e_del, opt->e_ins);
@@ -474,6 +480,9 @@ int mem_band_cert_params_safe(const mem_opt_t *opt) {
     if ((long)opt->zdrop <= zmargin) return 0;
     if ((opt->w >> 1) + (opt->w >> 2) <= w0 + 1 + (opt->a - 1) / e_min) return 0;
     return 1;
+}
+int mem_band_cert_params_safe(const mem_opt_t *opt) {
+    return mem_band_cert_params_safe_w(opt, ADAPTIVE_BAND_START);
 }
 #define BAND_NBAND(init_w) (opt->band_cert ? band_cert_nband((init_w), opt) : MAX_BAND_TRY)
 #define BAND_WIDTH(init_w,i) (opt->band_cert ? band_cert_width((init_w), (i), opt) : ((int32_t)((init_w) << (i))))
@@ -4946,13 +4955,16 @@ static inline void bsw_run_tier(BswMethTier tier, const mem_opt_t *opt,
  * other tiers ship (band_cert_accept's w < opt->w branch: the S - pen_clip anchor
  * pins score/qle/tle/gscore/gtle and the clip decision; mem_band_cert_params_safe
  * -- implied by opt->band_cert, see fastmap.cpp -- pins the control flow, and its
- * w0 = 20 conditions cover the probe width verbatim).
+ * w0 = 20 conditions cover a 20-wide probe verbatim; wider bucket ceilings re-check
+ * that envelope at their own width via mem_band_cert_params_safe_w, see Gate B below).
  *
- * Eligibility (gate A): opt->band_cert AND 0 < tight_band <= ADAPTIVE_BAND_START.
- * Ineligible pairs (no proof, or a band wider than the probe) skip the rung and
- * reach the untouched ladder unchanged. Uncertified pairs GAP2-restore a->score
- * and fall through to the ladder too. The rung returns the count of pairs left
- * for the ladder (ineligible + uncertified), compacted to the front of pair_ar.
+ * Eligibility (gate A): opt->band_cert AND 0 < tight_band AND w_need(tb) <= w_cap,
+ * where w_cap is the widest bucket ceiling whose control-flow envelope still holds
+ * (ADAPTIVE_BAND_START = 20 at minimum, 30 at default params -- Gate B). Ineligible
+ * pairs (no proof, or a band wider than w_cap) skip the rung and reach the untouched
+ * ladder unchanged. Uncertified pairs GAP2-restore a->score and fall through to the
+ * ladder too. The rung returns the count of pairs left for the ladder (ineligible +
+ * uncertified), compacted to the front of pair_ar.
  *
  * The bucket call scores a sub-slice of pair_ar, so its padding-lane overshoot
  * would clobber the following region: guard the sym object for its duration
@@ -4973,14 +4985,28 @@ static inline int bsw_tb_probe_rung(const mem_opt_t *opt, mem_alnreg_v *av_v,
 {
     if (nump <= 0 || !opt->band_cert) return nump;
 
-    /* Quantized bucket ceilings (<= ADAPTIVE_BAND_START). A pair runs at the
-     * smallest ceiling >= its tight_band, so a proven-narrow pair does its DP at
-     * a band near its tb rather than the uniform probe width -- the whole point,
-     * since on the short 8-bit extensions band 20 costs about what band opt->w
-     * does. The certificate is evaluated at the bucket ceiling W_b >= tb, so
-     * acceptance is byte-identical for every ceiling. */
-    static const int32_t BUCKET_CEIL[] = {4, 8, 12, 16, ADAPTIVE_BAND_START};
+    /* Quantized bucket ceilings. A pair runs at the smallest ceiling >= its w_need, so a
+     * proven-narrow pair does its DP at a band near its tb rather than the uniform probe
+     * width -- the whole point, since on the short 8-bit extensions band 20 costs about
+     * what band opt->w does. The certificate is evaluated at the bucket ceiling W_b >= tb,
+     * so acceptance is byte-identical for every ceiling.
+     *
+     * Gate B: ceilings ABOVE ADAPTIVE_BAND_START (20) recover the ~10-17% of eligible pairs
+     * whose w_need exceeds the startup probe width. They may only be used where the certificate's
+     * control-flow envelope still holds AT the wider band, so each such ceiling is admitted only
+     * when mem_band_cert_params_safe_w(opt, W_b) passes. Because that predicate tightens
+     * monotonically in W_b, the admissible ceilings form a prefix up to a single cap w_cap
+     * (= 30 at default params, where the zdrop margin binds: zdrop 100 > 7 + 3*30). Ceilings
+     * <= 20 are already covered by the startup gate (opt->band_cert on <=> _w(opt,20) passed). */
+    static const int32_t BUCKET_CEIL[] = {4, 8, 12, 16, ADAPTIVE_BAND_START, 24, 28, 30};
     const int NBUCK = (int)(sizeof(BUCKET_CEIL) / sizeof(BUCKET_CEIL[0]));
+    int w_cap = ADAPTIVE_BAND_START;
+    for (int b = 0; b < NBUCK; b++) {
+        const int32_t Wc = BUCKET_CEIL[b];
+        if (Wc <= ADAPTIVE_BAND_START) { w_cap = Wc; continue; }
+        if (!mem_band_cert_params_safe_w(opt, Wc)) break;  /* monotone: wider ceilings also fail */
+        w_cap = Wc;
+    }
 
     /* The certificate at run width W_b needs W_b >= tb + ceil(pen_clip/e_min): tight_band is
      * anchored on the raw ungapped score with no clip slack, but the accept below certifies at
@@ -4993,11 +5019,11 @@ static inline int bsw_tb_probe_rung(const mem_opt_t *opt, mem_alnreg_v *av_v,
     const int clip_slack = (e_min > 0) ? (pen_clip + e_min - 1) / e_min : ADAPTIVE_BAND_START;
     auto w_need_of = [&](int tb) { return tb + clip_slack; };
 
-    /* Partition [ineligible | eligible]; eligible = proven narrow (w_need <= 20). */
+    /* Partition [ineligible | eligible]; eligible = proven narrow (w_need <= w_cap). */
     int n_inelig = 0;
     for (int l = 0; l < nump; l++) {
         int tb = pair_ar[l].tight_band;
-        if (!(tb > 0 && w_need_of(tb) <= ADAPTIVE_BAND_START)) {
+        if (!(tb > 0 && w_need_of(tb) <= w_cap)) {
             SeqPair t = pair_ar[n_inelig]; pair_ar[n_inelig] = pair_ar[l]; pair_ar[l] = t;
             n_inelig++;
         }
@@ -5008,11 +5034,11 @@ static inline int bsw_tb_probe_rung(const mem_opt_t *opt, mem_alnreg_v *av_v,
 
     /* Counting-sort the eligible pairs into contiguous ceiling-buckets keyed on w_need (scratch
      * as temp; freed before any bsw_run_tier call reuses it as sort scratch). */
-    int cnt[8] = {0}, off[8] = {0};
+    int cnt[NBUCK] = {0}, off[NBUCK] = {0};
     auto bucket_of = [&](int w_need) { int b = 0; while (b < NBUCK - 1 && BUCKET_CEIL[b] < w_need) b++; return b; };
     for (int l = 0; l < n_elig; l++) cnt[bucket_of(w_need_of(elig[l].tight_band))]++;
     for (int b = 1; b < NBUCK; b++) off[b] = off[b - 1] + cnt[b - 1];
-    { int cur[8]; for (int b = 0; b < NBUCK; b++) cur[b] = off[b];
+    { int cur[NBUCK]; for (int b = 0; b < NBUCK; b++) cur[b] = off[b];
       for (int l = 0; l < n_elig; l++) { int b = bucket_of(w_need_of(elig[l].tight_band)); scratch[cur[b]++] = elig[l]; }
       for (int l = 0; l < n_elig; l++) elig[l] = scratch[l]; }
 
