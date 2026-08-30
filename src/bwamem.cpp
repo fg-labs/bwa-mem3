@@ -4956,7 +4956,22 @@ static inline void bsw_run_tier(BswMethTier tier, const mem_opt_t *opt,
 // So any band ≥ tight_band is sufficient; narrower bands suffice too
 // when the gapped alternative score is < min_len·a. Starting SW at
 // tight_band is strictly correct and avoids over-banded DP work.
-#define FP_N_MAX 128
+#define FP_N_MAX 512
+/* TIGHT routing (accepting a narrow banded-SW result early via the retry
+ * ladder's tight_band clause) is byte-identity-proven only up to this length.
+ * Beyond it, a width-w accepted result and the width-2w result a FALLBACK pair
+ * would retry can differ in extent fields (qle/tle/gscore/max_off and a->w)
+ * even at an identical optimal score -- the ladder clause is score-sound but
+ * not extent-invariant. So a pair longer than this may only HIT (skip SW,
+ * whose scalar walk mirrors kernel semantics at any length) or FALLBACK to the
+ * exact full-width ladder; it must never emit a tight_band. Keep <= the old
+ * scanner cap so behavior at those lengths is unchanged. */
+#define FP_TIGHT_MAX 128
+/* Words in the per-pair mismatch bitmap. Sized to FP_N_MAX so every scanned
+ * position 0..FP_N_MAX-1 has a bit; a shift by the in-word offset (< 64) can
+ * never alias. (Must track FP_N_MAX: at 128 this is 2 words = the old
+ * mis_lo/mis_hi pair.) */
+#define FP_MIS_NWORDS ((FP_N_MAX + 63) / 64)
 #define FP_STATUS_FALLBACK  0
 #define FP_STATUS_HIT       1
 #define FP_STATUS_TIGHT     2
@@ -5065,7 +5080,7 @@ static inline int ungapped_analyze(const uint8_t *qs, const uint8_t *rs, int N,
     if (N <= 0 || N > FP_N_MAX || x_threshold < 0) return FP_STATUS_FALLBACK;
 
     const __m128i v3 = _mm_set1_epi8(3);
-    uint64_t mis_lo = 0, mis_hi = 0;
+    uint64_t mis[FP_MIS_NWORDS] = {0};
     int total_mis = 0;
     int i = 0;
     for (; i + 16 <= N; i += 16) {
@@ -5078,24 +5093,25 @@ static inline int ungapped_analyze(const uint8_t *qs, const uint8_t *rs, int N,
         __m128i eqv = _mm_cmpeq_epi8(qv, rv);
         unsigned mism_mask = (~(unsigned)_mm_movemask_epi8(eqv)) & 0xFFFFu;
         total_mis += __builtin_popcount(mism_mask);
-        if (i < 64) {
-            mis_lo |= ((uint64_t)mism_mask) << i;
-            if (i + 16 > 64) mis_hi |= ((uint64_t)mism_mask) >> (64 - i);
-        } else {
-            mis_hi |= ((uint64_t)mism_mask) << (i - 64);
-        }
+        /* i is 16-aligned, so (i & 63) in {0,16,32,48}: a 16-bit mask shifted
+         * by at most 48 fills bits [i&63, (i&63)+15] within a single word and
+         * never straddles a 64-bit boundary. */
+        mis[i >> 6] |= ((uint64_t)mism_mask) << (i & 63);
     }
     for (; i < N; i++) {
         uint8_t qi = qs[i], ri = rs[i];
         if (qi >= 4 || ri >= 4) return FP_STATUS_FALLBACK;
         if (qi != ri) {
             total_mis++;
-            if (i < 64) mis_lo |= (1ULL << i);
-            else        mis_hi |= (1ULL << (i - 64));
+            mis[i >> 6] |= (1ULL << (i & 63));
         }
     }
 
     if (total_mis > x_threshold) {
+        /* TIGHT routing is extent-invariant only up to FP_TIGHT_MAX (see the
+         * define). A longer pair that is not a HIT falls back to the exact
+         * full-width ladder rather than accepting a narrow banded-SW result. */
+        if (N > FP_TIGHT_MAX) return FP_STATUS_FALLBACK;
         // S in the band proof must be REALIZABLE by an actual offset-0 extension.
         // The tight_band derivation shows every out-of-band alignment (band
         // offset B >= tb) scores <= S, so a band >= tb is sufficient ONLY IF the
@@ -5110,8 +5126,9 @@ static inline int ungapped_analyze(const uint8_t *qs, const uint8_t *rs, int N,
         // feeding that larger S shrinks tb below what is sound, letting the retry
         // ladder skip the wider rung a gapped alignment in (default_w, wider]
         // genuinely needs -- a CIGAR/coordinate divergence from the full-width
-        // ladder (breaking byte-identity). The walk is O(N) and computed only on
-        // the TIGHT branch, so its cost is negligible.
+        // ladder (breaking byte-identity). The walk is O(N) and runs only on the
+        // TIGHT branch after the FP_TIGHT_MAX gate above (N <= 128), so its cost
+        // is negligible.
         //
         // Band derivation (see comment above):
         //     B < (min_len·a − S − o_min) / e_min        with S = max_sc − h0
@@ -5184,8 +5201,7 @@ static inline int ungapped_analyze(const uint8_t *qs, const uint8_t *rs, int N,
     // from SW on tied-score walks, breaking byte-identical SAM.
     int cur = h0, max_sc = h0, max_i = 0;
     for (int j = 0; j < N; j++) {
-        int is_mis = (j < 64) ? (int)((mis_lo >> j) & 1ULL)
-                              : (int)((mis_hi >> (j - 64)) & 1ULL);
+        int is_mis = (int)((mis[j >> 6] >> (j & 63)) & 1ULL);
         if (cur == 0) continue;
         if (!is_mis) cur += a;
         else {
