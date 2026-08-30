@@ -283,6 +283,7 @@ typedef struct mem_opt_t {
     int    alnreg_sort_fast;  // 1 = strict-total-order comparator + pdqsort at the mem_sort_dedup_patch sort sites (set by --fast); 0 = bwa-mem2's re-only comparator + ks_introsort (default, bwa-mem2-compatible)
     int    skip_contained_ext; // 1 = skip banded-SW extension of seeds contained (same diagonal) in a longer in-chain seed (--skip-contained-ext); 0 = off. Byte-identical to baseline: the skip set is a subset of the post-extension containment purge (PE18).
     int    band_start;       // >0 = adaptive chain-geometry banding active (start band; set to ADAPTIVE_BAND_START by --adaptive-band); 0 = off (byte-identical). Long-read speed lever; no-op on the 8-bit short-read tier.
+    int    band_cert;        // 1 = sound (byte-identical) adaptive band via per-pair tie-break certificate (default); 0 = off, set by --fast/--adaptive-band (which use the aggressive band_start heuristic instead). Skips the wide DP on provably-narrow pairs with bit-for-bit-identical output.
     /* --compat: the selected output-compatibility target. Non-NULL on any
      * mem_opt_t from mem_opt_init(), which sets it to &COMPAT_TARGET_OFF
      * (bwa-mem3's native output), so consumers can dereference it
@@ -578,6 +579,13 @@ const bwtintv_v *smem_next(smem_i *itr);
 
 mem_opt_t *mem_opt_init(void);
 void mem_fill_scmat(int a, int b, int8_t mat[25]);
+/* True iff the certified adaptive band (opt->band_cert) is safe to apply under the
+ * current scoring/gap/zdrop parameters. The certificate bounds the optimal score but
+ * not the extension kernel's early-termination heuristics; outside a conservative
+ * parameter envelope (small zdrop, large clip penalties, a matrix scoring above a)
+ * the caller must fall back to the exact full-width ladder. No-op at default
+ * parameters. Defined in bwamem.cpp. */
+int mem_band_cert_params_safe(const mem_opt_t *opt);
 /* (Re)derive the --meth per-hypothesis matrices (mat_ot/mat_ob) from opt->mat +
  * opt->a. Call after any rebuild of opt->mat (e.g. CLI -A/-B/-x parsing) so meth
  * scoring tracks the user's options instead of the init-time defaults. */

@@ -333,12 +333,166 @@ KSORT_INIT(mem_flt, mem_chain_t, flt_lt)
  * retrying to that band while a diagonal-hugging pair (chain_band=0) accepts in
  * one tight pass. The 8-bit tier stays at opt->w (its int8 diagonal encoding caps
  * at 127, and short extensions are sub-band so gain nothing). tight_band keeps its
- * ungapped-estimate accept-early role. band_start<=0 (default): INIT_W==opt->w and
- * ACCEPT_PAIR reduces to the original condition -> byte-identical. */
-#define INIT_W(w) (opt->band_start > 0 ? min_(opt->band_start, (w)) : (w))
+ * ungapped-estimate accept-early role. band_start<=0 with band_cert off: INIT_W==opt->w and
+ * ACCEPT_PAIR reduces to the original full-width condition -> byte-identical.
+ *
+ * NOTE: the DEFAULT is now the sound band_cert path below (band_cert=1), which narrows to
+ * ADAPTIVE_BAND_START and is byte-identical via a per-pair certificate. This band_start path is
+ * the separate opt-in AGGRESSIVE narrowing selected by --adaptive-band / --fast (band_cert=0),
+ * which trades byte-identity for more speed via the max_off "converged" heuristic above. */
+/* ------------------------------------------------------------------------
+ * Sound (byte-identical) adaptive extension band  [opt->band_cert, default on]
+ *
+ * Runs one narrow probe at ADAPTIVE_BAND_START and finalizes only the pairs it can
+ * PROVE are already optimal there; every other pair falls through to the standard
+ * ceiling ladder and is scored exactly as the non-adaptive path scores it. So the
+ * output is bit-for-bit identical to a full-width extension, while the proven-narrow
+ * pairs skip the wide DP.
+ *
+ * Certificate: a gapped alignment reaching diagonal offset d costs >= o_min + d*e_min,
+ * so its best possible score is h0 + min_len*a - o_min - d*e_min. That can tie-or-beat
+ * the achieved score S only for d <= floor((h0 + min_len*a - o_min - S)/e_min) =: d_max.
+ * If the width-w band covers every such offset (w >= d_max) no tying/better alignment
+ * exists beyond w -> the width-w cell set (hence the optimal score) matches the ceiling.
+ * Recall of the optimal score is 100% by construction. */
+static inline bool band_cert_ok(int S, int h0, int len1, int len2, int w, const mem_opt_t *opt) {
+    int min_len = len1 < len2 ? len1 : len2;
+    int o_min = opt->o_del < opt->o_ins ? opt->o_del : opt->o_ins;
+    int e_min = opt->e_del < opt->e_ins ? opt->e_del : opt->e_ins;
+    if (e_min <= 0) return false;
+    long num = (long)h0 + (long)min_len * opt->a - o_min - (long)S;
+    if (num < 0) return true;                 /* no gapped alt can even tie */
+    long d_max = num / e_min;                  /* largest offset that could tie/beat S */
+    return (long)w >= d_max;                   /* band covers all tying offsets */
+}
+/* Rung count: narrowing tiers (init_w < opt->w) get one extra rung so the narrow probe
+ * sits ahead of the full ceiling ladder [opt->w, 2w, 4w, 8w]. */
+static inline int band_cert_nband(int init_w, const mem_opt_t *opt) {
+    return (init_w < opt->w) ? MAX_BAND_TRY + 1 : MAX_BAND_TRY;
+}
+/* Width per rung: narrowing tiers -> [init_w, opt->w, 2w, 4w, 8w]; already-wide tiers ->
+ * the standard ladder [opt->w, 2w, 4w, 8w]. */
+static inline int32_t band_cert_width(int init_w, int i, const mem_opt_t *opt) {
+    if (init_w < opt->w) return (i == 0) ? (int32_t)init_w : (int32_t)(opt->w << (i - 1));
+    return (int32_t)(opt->w << i);
+}
+/* Accept: at the narrow probe (w < opt->w) finalize only on the certificate AND the clip
+ * guard (the pair must reach the query end within the clip penalty of the local max, so a
+ * band-truncated gscore cannot drive the clip-vs-extend choice at bwamem.cpp's clip
+ * branch). Uncertified pairs fall to w >= opt->w and use the standard ceiling-ladder
+ * accept clause -> identical to the non-adaptive path.
+ *
+ * GAP2 (the "restore" at each retry site): before this accept test the caller runs
+ * `prev = a->score; a->score = sp->score;`, so the narrow probe overwrites a->score with
+ * the width-w0 score. For a pair that fails to certify here, the retry loops restore
+ * `a->score = prev` so the opt->w rung reads the pre-probe a->score as its `prev` -- exactly
+ * what the non-adaptive ladder reads -- and the `score == prev` converged-accept fires
+ * identically. The narrow rung writes no other a->* field before acceptance, so restoring
+ * a->score fully un-pollutes the ladder. */
+static inline bool band_cert_accept(int sc, int pv, int mo, int w, int tb, int i, int nband,
+                                    const SeqPair *sp, const mem_opt_t *opt) {
+    if (w < opt->w) {
+        /* Left extensions clip on pen_clip5, right on pen_clip3; this accept is shared by both
+         * directions, so guard with the smaller penalty -> the strictest threshold, which can only
+         * under-certify (widen), never wrongly certify, under an asymmetric -L. */
+        int pen_clip = opt->pen_clip5 < opt->pen_clip3 ? opt->pen_clip5 : opt->pen_clip3;
+        /* Anchor the certificate on S - pen_clip, not S. band_cert_ok(S) alone only proves the
+         * LOCAL max S (and its qle/tle) is band-invariant; a certified branch-B pair, however,
+         * finalizes with the query-END gscore VALUE and gtle (truesc = gscore, rb -= gtle). Those
+         * are a max over the last query row and can still grow when the band widens -- unless we
+         * prove no out-of-band cell reaches even S - pen_clip. Since an accepted pair has
+         * gscore > S - pen_clip (branch B), certifying at S - pen_clip forces every out-of-band
+         * cell (incl. last-row) below the narrow gscore, so gscore's value, gtle, AND the
+         * clip-vs-extend decision (threshold S - pen_clip5/pen_clip3 >= S - pen_clip) are all
+         * band-invariant. This subsumes the old separate clip guard's soundness role. */
+        if (!band_cert_ok(sc - pen_clip, sp->h0, sp->len1, sp->len2, w, opt)) return false;
+        return sp->gscore > 0 && sp->gscore > sc - pen_clip;
+    }
+    return (i + 1 == nband) || (tb > 0 && w >= tb) || (sc == pv || mo < ((w >> 1) + (w >> 2)));
+}
+static inline int band_cert_mat_max(const int8_t *mat) {
+    int mx = mat[0];
+    for (int k = 1; k < 25; ++k) if (mat[k] > mx) mx = mat[k];
+    return mx;
+}
+/* Runtime safety envelope for the certified adaptive band.
+ *
+ * band_cert_ok proves the OPTIMAL SCORE (and, with the S - pen_clip anchor, the
+ * accepted pair's gscore value / gtle / clip decision) is band-invariant. It does
+ * NOT bound the extension kernel's early-termination CONTROL FLOW: the zdrop break,
+ * the all-zero-row (m==0) break, and the band-edge shrink read cells (out-of-band,
+ * and in-band cells near the edge whose out-of-band neighbours differ between a
+ * narrow and a wide run) that the certificate does not pin. In principle the narrow
+ * probe and the full-width run can therefore terminate at different rows and report
+ * a different gscore/gtle. On real reads this does not manifest even far from
+ * default parameters, but it is only PROVABLY absent inside a parameter envelope
+ * where those heuristics cannot diverge; outside it we fall back to the exact
+ * full-width ladder (byte-identical for any -d/-L/-O/-E/-A/-B).
+ *
+ * Each condition is conservative -- it can only DISABLE the probe, never wrongly
+ * enable it -- and default parameters are inside the envelope (so this is a no-op
+ * at defaults and the ~3% win is preserved):
+ *   - e_min > 0                                 division guard.
+ *   - max(mat) <= opt->a                        the certificate uses opt->a as the
+ *       per-column ceiling (num = h0 + min_len*a - ...); a custom or meth matrix
+ *       scoring above a would break that bound. opt->a >= max(mat) keeps it a valid
+ *       (conservative) ceiling, so band_cert_ok needs no matrix argument.
+ *   - max(pen_clip5,pen_clip3) < o_min + e_min  no gapped path can reach within a
+ *       clip penalty of the local max, closing the clip/gtle tie channel on either
+ *       extension direction.
+ *   - zdrop > o_min + (2*w0+1)*e_max + w0*a      a certified pair wastes <= w0*e_min
+ *       and its optimal excursion is <= w0; this bounds the running-max lead an
+ *       out-of-band cell can give the wide run, so neither run can zdrop where the
+ *       other survives. Default zdrop=100 clears the default bound of 67.
+ *   - (opt->w>>1)+(opt->w>>2) > w0 + 1 + (opt->a-1)/e_min   a certified pair finalizes
+ *       at the narrow rung with a->w = max(a->w_init=opt->w, w0) = opt->w. The full-width
+ *       ladder must reach the same a->w, i.e. accept the pair at its first rung (w=opt->w)
+ *       via the max_off heuristic max_off < (w>>1)+(w>>2). max_off advances only on a cell
+ *       that beats the running max (bandedSWA.cpp: `if (m > max) max_off = max(max_off,
+ *       |mj-i|)`), and that running max is propped by the optimal path itself; combined
+ *       with the certificate bounding gains, every record-setting offset on the wide run
+ *       is < w0 + 1 + (a-pen_clip-1)/e_min <= w0 + 1 + (a-1)/e_min. Requiring the rung
+ *       threshold to exceed that guarantees rung-1 acceptance, so a->w converges on both
+ *       paths (else it would diverge -- opt->w vs a widened value -- feeding mem_patch_reg
+ *       / mem_reg2aln). A within-w0 pair meets it at defaults; a custom small -w
+ *       (opt->w ~ 21..26) or a large -A can fail it, and we fall back to the exact ladder.
+ *       Default opt->w=100, a=1 -> 75 > 21. */
+int mem_band_cert_params_safe(const mem_opt_t *opt) {
+    const int w0 = ADAPTIVE_BAND_START;
+    int o_min = min_(opt->o_del, opt->o_ins);
+    int e_min = min_(opt->e_del, opt->e_ins);
+    int e_max = max_(opt->e_del, opt->e_ins);
+    int pen_clip_max = max_(opt->pen_clip5, opt->pen_clip3);
+    if (e_min <= 0) return 0;
+    int a_max = band_cert_mat_max(opt->mat);
+    if (opt->meth_mode) {
+        a_max = max_(a_max, max_(band_cert_mat_max(opt->mat_ot), band_cert_mat_max(opt->mat_ob)));
+    }
+    if (a_max > opt->a) return 0;
+    if (pen_clip_max >= o_min + e_min) return 0;
+    long zmargin = (long)o_min + (long)(2 * w0 + 1) * e_max + (long)w0 * opt->a;
+    if ((long)opt->zdrop <= zmargin) return 0;
+    if ((opt->w >> 1) + (opt->w >> 2) <= w0 + 1 + (opt->a - 1) / e_min) return 0;
+    return 1;
+}
+#define BAND_NBAND(init_w) (opt->band_cert ? band_cert_nband((init_w), opt) : MAX_BAND_TRY)
+#define BAND_WIDTH(init_w,i) (opt->band_cert ? band_cert_width((init_w), (i), opt) : ((int32_t)((init_w) << (i))))
+#define INIT_W(w) (opt->band_cert ? min_(ADAPTIVE_BAND_START, (w)) \
+                   : (opt->band_start > 0 ? min_(opt->band_start, (w)) : (w)))
+/* The band_cert branch does not consult chain_band (cb): cb only gates the
+ * aggressive band_start narrowing, and band_cert is mutually exclusive with it
+ * -- band_cert=1 implies band_start=0 (the default), while --adaptive-band/--fast
+ * set band_start>0 AND band_cert=0. No CLI path enables both, so cb has no role
+ * under the certificate; band_cert_accept is a pure per-pair proof + clip guard.
+ *
+ * Implicit captures (like the sibling INIT_W/BAND_WIDTH macros): ACCEPT_PAIR reads
+ * `opt`, `sp`, and `init_w` from the calling scope in addition to its parameters --
+ * every retry-loop call site has all three in scope with those exact names. */
 #define ACCEPT_PAIR(sc,pv,mo,w,tb,cb,i) \
-    ((i)+1==MAX_BAND_TRY || ((tb)>0 && (w)>=(tb)) || \
-     (((sc)==(pv) || (mo) < ((w)>>1)+((w)>>2)) && (opt->band_start <= 0 || (w) >= (cb))))
+    (opt->band_cert \
+      ? band_cert_accept((sc),(pv),(mo),(w),(tb),(i),band_cert_nband(init_w,opt),sp,opt) \
+      : ((i)+1==MAX_BAND_TRY || ((tb)>0 && (w)>=(tb)) || \
+         (((sc)==(pv) || (mo) < ((w)>>1)+((w)>>2)) && (opt->band_start <= 0 || (w) >= (cb)))))
 //------------------------------------------------------------------
 // Alignment: Construct the alignment from a chain *
 
@@ -409,6 +563,7 @@ mem_opt_t *mem_opt_init()
     o->alnreg_sort_fast = 0;  // off by default -> bwa-mem2's dedup sort (see mem_sort_dedup_patch); set by --fast
     o->skip_contained_ext = 0;   // off by default; opt-in via --skip-contained-ext (byte-identical)
     o->band_start  = 0;   // off by default (adaptive chain-geometry band); opt-in via --adaptive-band
+    o->band_cert   = 1;   // on by default: sound (byte-identical) adaptive band via per-pair tie-break certificate
     o->split_width = 10;
     o->max_occ = 500;
     o->max_chain_gap = 10000;
@@ -4899,52 +5054,6 @@ static inline int ungapped_walk_score(const uint8_t *qs, const uint8_t *rs,
     return max_sc;
 }
 
-/* optimal ungapped score (no floor) from a per-base mismatch bitmap.
- *
- *     score(i) = h0 + (i − mismatches_i)·a − mismatches_i·b
- *              = h0 + i·a − mismatches_i·(a+b)        for i ∈ [0, N]
- *
- * f(i) is monotone non-decreasing within match runs and drops by b at each
- * mismatch. Local maxima therefore live at one of:
- *   (a) i = 0                                    f(0)  = h0
- *   (b) i = p,  bitmap[p] == 1                   f(p)  = h0 + p·a − k·(a+b)
- *                                                where k = mismatches in [0,p)
- *   (c) i = N                                    f(N)  = h0 + N·a − total·(a+b)
- *
- * Iterating set bits of the bitmap via ctz + clear-low is O(total_mis), not
- * O(N) — typically a handful of operations for HIT/TIGHT candidates.
- *
- * Unlike ungapped_walk_score, there is NO floor: score is allowed to dip
- * below 0 and recover. This yields max_sc ≥ walk's max_sc, giving a strictly
- * tighter (still safe) bound on the SW band in the tight_band proof. The
- * walk's floor exists to mirror SW kernel local-SW semantics for SAM
- * byte-identity on qle/gscore — irrelevant for the band proof. */
-static inline int ungapped_max_sc_from_bitmap(uint64_t mis_lo, uint64_t mis_hi,
-                                               int N, int h0, int a, int b)
-{
-    int max_sc = h0;            /* candidate (a): empty extension */
-    int gap    = a + b;         /* score drop per mismatch (relative to match) */
-    int k      = 0;             /* mismatches counted so far */
-    uint64_t lo = mis_lo, hi = mis_hi;
-    while (lo) {
-        int p = __builtin_ctzll(lo);
-        int s = h0 + p * a - k * gap;
-        if (s > max_sc) max_sc = s;
-        lo &= lo - 1;
-        k++;
-    }
-    while (hi) {
-        int p = 64 + __builtin_ctzll(hi);
-        int s = h0 + p * a - k * gap;
-        if (s > max_sc) max_sc = s;
-        hi &= hi - 1;
-        k++;
-    }
-    int s_end = h0 + N * a - k * gap;       /* candidate (c) */
-    if (s_end > max_sc) max_sc = s_end;
-    return max_sc;
-}
-
 static inline int ungapped_analyze(const uint8_t *qs, const uint8_t *rs, int N,
                                     int h0, int a, int b,
                                     int o_min, int e_min,
@@ -4986,29 +5095,31 @@ static inline int ungapped_analyze(const uint8_t *qs, const uint8_t *rs, int N,
         }
     }
 
-    // precise max_sc (no floor) from the mismatch bitmap.
-    //
-    // An earlier formulation used `S = h0 + first_mis_pos·a` — a loose lower bound on the
-    // walk's max_sc — to skip the scalar walk on TIGHT pairs. That preserved
-    // walk-time but left the band proof loose: any matching run after the
-    // first mismatch could not contribute to S, so the proven band stayed
-    // wider than necessary.
-    //
-    // The bitmap-derived max_sc is the optimal ungapped score over all
-    // prefix lengths in [0, N], with no floor (score is allowed to dip and
-    // recover). It is ≥ the walk's max_sc, so substituting it into the band
-    // proof yields a strictly tighter (still safe) bound. Computing it from
-    // the bitmap is O(total_mis), independent of N.
-    //
-    // Band derivation (see comment above):
-    //     B < (min_len·a − S − o_min) / e_min        with S = max_sc − h0
-    // For LEFT extensions where the caller gates on len1 ≥ len2,
-    // min_len = N. Substituting:
-    //     numerator = N·a − (max_sc_proof − h0) − o_min
-    //               = N·a + h0 − max_sc_proof − o_min
-    int max_sc_proof = ungapped_max_sc_from_bitmap(mis_lo, mis_hi, N, h0, a, b);
-
     if (total_mis > x_threshold) {
+        // S in the band proof must be REALIZABLE by an actual offset-0 extension.
+        // The tight_band derivation shows every out-of-band alignment (band
+        // offset B >= tb) scores <= S, so a band >= tb is sufficient ONLY IF the
+        // in-band (offset-0) run actually achieves S. ungapped_walk_score is the
+        // floored ungapped score under ksw_extend local-truncation semantics
+        // (once the running score hits 0 it stays 0) -- exactly the score the
+        // rung-1 banded DP can reach on the diagonal, so it is a valid lower
+        // bound on the in-band optimum.
+        //
+        // A no-floor score (which lets a negative prefix recover via later
+        // matches) can EXCEED the floor-killed value the DP actually reaches;
+        // feeding that larger S shrinks tb below what is sound, letting the retry
+        // ladder skip the wider rung a gapped alignment in (default_w, wider]
+        // genuinely needs -- a CIGAR/coordinate divergence from the full-width
+        // ladder (breaking byte-identity). The walk is O(N) and computed only on
+        // the TIGHT branch, so its cost is negligible.
+        //
+        // Band derivation (see comment above):
+        //     B < (min_len·a − S − o_min) / e_min        with S = max_sc − h0
+        // For LEFT extensions where the caller gates on len1 ≥ len2,
+        // min_len = N. Substituting:
+        //     numerator = N·a − (max_sc_proof − h0) − o_min
+        //               = N·a + h0 − max_sc_proof − o_min
+        int max_sc_proof = ungapped_walk_score(qs, rs, N, h0, a, b);
         int64_t numerator = (int64_t)N * a + h0 - max_sc_proof - o_min;
         int band;
         if (numerator <= 0) {
@@ -5019,7 +5130,14 @@ static inline int ungapped_analyze(const uint8_t *qs, const uint8_t *rs, int N,
             band = default_w;
         } else {
             band = (int)((numerator + e_min - 1) / e_min);
-            if (band > default_w) band = default_w;
+            // The band proof only excludes diagonal offsets >= band. When the
+            // proven band exceeds default_w, clamping to default_w would falsely
+            // certify that a width-default_w run is complete, letting the retry
+            // ladder short-circuit and skip the wider rungs a gapped alignment
+            // in the unproven window (default_w, band) genuinely needs. Emit the
+            // tight_band = 0 fallback sentinel instead, so such a pair runs the
+            // exact full-width ladder (byte-identical to non-adaptive extension).
+            if (band > default_w) band = 0;
         }
         *out_tight_band = band;
         // Outputs unused on TIGHT; set sane values for any future caller.
@@ -5132,11 +5250,34 @@ static inline int mem_seed_ext_redundant(const mem_chain_t *c, int si)
 }
 
 
-void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
+void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
                                    const uint8_t *pac, bseq1_t *seq_, int nseq,
                                    mem_chain_v* chain_ar, mem_alnreg_v *av_v,
                                    mem_cache *mmc, uint8_t *ref_string, int tid)
 {
+    /* Enforce the certified-band safety envelope at this public entry point.
+     * band_cert is default-on, but the certificate is sound only inside the
+     * parameter envelope (see mem_band_cert_params_safe). main_mem() applies
+     * this same guard for the CLI, so for the shipping binary this is a no-op
+     * (opt_in->band_cert already agrees with the guard) and the run stays
+     * byte-identical. A library caller that mutates scoring/gap fields after
+     * mem_opt_init(), or sets an aggressive adaptive-band start (band_start > 0)
+     * without also clearing band_cert the way the --adaptive-band CLI path does,
+     * and calls this entry point directly would otherwise select certified
+     * narrowing outside the envelope and change alignment records; sanitize a
+     * local copy here so every band_cert decision and restore below falls back
+     * to the exact full-width ladder when band_start is set or the parameters
+     * are unsafe. The short-circuit keeps the mat scan off the hot path whenever
+     * band_cert is already off. */
+    mem_opt_t opt_sanitized;
+    const mem_opt_t *opt = opt_in;
+    if (opt_in->band_cert &&
+        (opt_in->band_start > 0 || !mem_band_cert_params_safe(opt_in))) {
+        opt_sanitized = *opt_in;
+        opt_sanitized.band_cert = 0;
+        opt = &opt_sanitized;
+    }
+
     SeqPair *seqPairArrayAux      = mmc->seqPairArrayAux[tid];
     SeqPair *seqPairArrayLeft128  = mmc->seqPairArrayLeft128[tid];
     SeqPair *seqPairArrayRight128 = mmc->seqPairArrayRight128[tid];
@@ -5968,9 +6109,9 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
     int init_w = INIT_W(opt->w);
 
     // scalar
-    for ( i=0; i<MAX_BAND_TRY; i++)
+    for ( i=0; i<BAND_NBAND(init_w); i++)
     {
-        int32_t w = init_w << i;
+        int32_t w = BAND_WIDTH(init_w, i);
         // uint64_t tim = __rdtsc();
         bsw_run_tier(BSW_TIER_SCALAR, opt, av_v,
                      bswLeft.get(), bswLeftOt.get(), bswLeftOb.get(),
@@ -6017,6 +6158,8 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                 }
 
             } else {
+                /* GAP2 restore (see band_cert_accept): un-pollute the ladder's `prev`. */
+                if (opt->band_cert && w < opt->w) a->score = prev;
                 pair_ar_aux[num++] = *sp;
             }
         }
@@ -6035,9 +6178,9 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
 
     nump = numPairsLeft16;
     init_w = INIT_W(opt->w);
-    for ( i=0; i<MAX_BAND_TRY; i++)
+    for ( i=0; i<BAND_NBAND(init_w); i++)
     {
-        int32_t w = init_w << i;
+        int32_t w = BAND_WIDTH(init_w, i);
         // int64_t tim = __rdtsc();
         bsw_run_tier(BSW_TIER_16, opt, av_v,
                      bswLeft.get(), bswLeftOt.get(), bswLeftOb.get(),
@@ -6086,6 +6229,8 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                     }
                 }
             } else {
+                /* GAP2 restore (see band_cert_accept): un-pollute the ladder's `prev`. */
+                if (opt->band_cert && w < opt->w) a->score = prev;
                 pair_ar_aux[num++] = *sp;
             }
         }
@@ -6101,9 +6246,9 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
 
     nump = numPairsLeft128;
     init_w = opt->w;
-    for ( i=0; i<MAX_BAND_TRY; i++)
+    for ( i=0; i<BAND_NBAND(init_w); i++)
     {
-        int32_t w = init_w << i;
+        int32_t w = BAND_WIDTH(init_w, i);
         // int64_t tim = __rdtsc();
 
         /* These pairs were bucketed for the 8-bit path at the initial band
@@ -6159,6 +6304,8 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                     }
                 }
             } else {
+                /* GAP2 restore (see band_cert_accept): un-pollute the ladder's `prev`. */
+                if (opt->band_cert && w < opt->w) a->score = prev;
                 pair_ar_aux[num++] = *sp;
             }
         }
@@ -6323,9 +6470,9 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
     nump = numPairsRight1;
     init_w = INIT_W(opt->w);
 
-    for ( i=0; i<MAX_BAND_TRY; i++)
+    for ( i=0; i<BAND_NBAND(init_w); i++)
     {
-        int32_t w = init_w << i;
+        int32_t w = BAND_WIDTH(init_w, i);
         // tim = __rdtsc();
         bsw_run_tier(BSW_TIER_SCALAR, opt, av_v,
                      bswRight.get(), bswRightOt.get(), bswRightOb.get(),
@@ -6372,6 +6519,8 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                     }
                 }
             } else {
+                /* GAP2 restore (see band_cert_accept): un-pollute the ladder's `prev`. */
+                if (opt->band_cert && w < opt->w) a->score = prev;
                 pair_ar_aux[num++] = *sp;
             }
         }
@@ -6387,9 +6536,9 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
     nump = numPairsRight16;
     init_w = INIT_W(opt->w);
 
-    for ( i=0; i<MAX_BAND_TRY; i++)
+    for ( i=0; i<BAND_NBAND(init_w); i++)
     {
-        int32_t w = init_w << i;
+        int32_t w = BAND_WIDTH(init_w, i);
         // uint64_t tim = __rdtsc();
         bsw_run_tier(BSW_TIER_16, opt, av_v,
                      bswRight.get(), bswRightOt.get(), bswRightOb.get(),
@@ -6439,6 +6588,8 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                     }
                 }
             } else {
+                /* GAP2 restore (see band_cert_accept): un-pollute the ladder's `prev`. */
+                if (opt->band_cert && w < opt->w) a->score = prev;
                 pair_ar_aux[num++] = *sp;
             }
         }
@@ -6455,9 +6606,9 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
     nump = numPairsRight128;
     init_w = opt->w;
 
-    for ( i=0; i<MAX_BAND_TRY; i++)
+    for ( i=0; i<BAND_NBAND(init_w); i++)
     {
-        int32_t w = init_w << i;
+        int32_t w = BAND_WIDTH(init_w, i);
         // uint64_t tim = __rdtsc();
 
         /* See the LEFT int8 loop: bsw_run_tier (BSW_TIER_8) diverts w >= 128
@@ -6509,6 +6660,8 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt, const bntseq_t *bns,
                     }
                 }
             } else {
+                /* GAP2 restore (see band_cert_accept): un-pollute the ladder's `prev`. */
+                if (opt->band_cert && w < opt->w) a->score = prev;
                 pair_ar_aux[num++] = *sp;
             }
         }

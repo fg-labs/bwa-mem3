@@ -336,6 +336,73 @@ See [Memory allocator → Large pages for the index](../user-guide/allocator.md#
 and [Optimization checklist → Reserve 1 GB huge pages](../best-practices/optimization-checklist.md#8-reserve-1-gb-huge-pages-for-the-index-linux-opt-in)
 for reservation, verification, and the manual `MIMALLOC_RESERVE_HUGE_OS_PAGES` equivalent.
 
+## Certified adaptive extension band (default on; `--no-band-cert` to disable)
+
+By default, `bwa-mem3 mem` now runs the banded Smith-Waterman **seed extension**
+with a *certified adaptive band*: instead of opening every extension at the full
+band width `opt->w` and doubling on retry, it first scores each pair at a narrow
+probe band and **finalizes only the pairs it can prove are already optimal there**.
+Every pair it cannot prove falls through to the exact full-width ceiling ladder
+(`[opt->w, 2·opt->w, 4·opt->w, 8·opt->w]`) and is scored identically to the
+non-adaptive path.
+
+The narrow probe runs on the scalar and 16-bit extension kernels. The 8-bit kernel
+(`BSW_TIER_8`) is deliberately excluded: it serves short reads whose band already
+fits its `BSW8_MAX_W` ceiling, so it opens at `opt->w` and runs the standard ladder
+— there is no narrow-band win to reclaim there.
+
+**The alignment records are byte-identical to a full-width extension** (the `@PG`
+`CL:` command line excepted) — this is a default behavior change to the
+*internals* of extension, not to any emitted alignment field. The
+proof is per pair: a gapped alignment that reaches diagonal offset `d` costs at
+least `o_min + d·e_min` in gap penalty, so its best possible score is bounded by
+`h0 + min_len·a − o_min − d·e_min`. That bound can tie or beat the achieved
+score only for offsets up to a computable `d_max`; if the probe band already
+covers every such offset, no tying-or-better alignment exists beyond it, and the
+narrow result equals the full-width result — score, query-end score, and
+coordinates alike. A pair is finalized narrow only when that certificate holds
+**and** it reaches the query end within the clip penalty of its local maximum, so
+the clip-vs-extend decision cannot flip when the band widens. The certificate is
+anchored on the achieved score *minus the clip penalty*, which makes the query-end
+score, its coordinate, and the clip decision band-invariant too — not just the
+local maximum.
+
+The certificate bounds the optimal *score*; it does not bound the extension
+kernel's early-termination heuristics (the z-drop and all-zero-row breaks and the
+band-edge shrink), which read cells a narrow and a full-width run can compute
+differently. Those heuristics stay quiescent across a conservative parameter
+envelope — a large enough `-d`/z-drop relative to the certifiable band, clip
+penalties below a single gap's cost, and a scoring matrix whose entries do not
+exceed the match reward. **Outside that envelope the certified band is disabled
+automatically and the exact full-width ladder runs instead**, so output is
+byte-identical for any `-d`/`-L`/`-O`/`-E`/`-A`/`-B`. Default parameters are inside
+the envelope, so a plain run always takes the fast path.
+
+This differs from **`--adaptive-band`** (below / in the divergence catalog), which
+is an *aggressive, opt-in, not byte-identical* narrowing that trades exactness for
+more speed. The certified band is the opposite trade: full exactness, a smaller
+but free speedup.
+
+```bash
+bwa-mem3 mem ref.fa R1.fq R2.fq              # certified adaptive band (default)
+bwa-mem3 mem --no-band-cert ref.fa R1.fq R2.fq   # full-width exact ladder, byte-identical, slower
+```
+
+On the default preset, pass **`--no-band-cert`** to disable certification and run
+the full-width ladder for every pair. The alignment records are byte-identical either
+way (the `@PG` `CL:` command line excepted); the flag exists as an escape hatch and
+as an A/B handle for the byte-identity regression test. It scopes to the default
+preset only: `--no-band-cert` clears `band_cert` but does not reset `band_start`, so
+under `--adaptive-band` or `--fast` the aggressive band is already in force (the
+certificate off) and `--no-band-cert` is a no-op there — use **`--no-adaptive-band`**
+when you need exact full-width extension alongside an aggressive preset. Measured effect: ~3 %
+whole-aligner wall on a 5 M-read WGS slice (HG00096, hg38), measured on an
+**Apple M2 Max** (MacBook Pro 14″, `Mac14,6`; arm64 / NEON tier), clang, 16
+threads — a single-host, single-config measurement, not a cross-architecture or
+cross-thread claim. `--fast` and `--adaptive-band` turn the
+certificate off (they select the aggressive band instead); `--meth` also runs the
+exact full-width ladder (the certificate is a non-meth optimization).
+
 ## Changes catalog
 
 | Item | bwa-mem3 PR | Upstream PR/issue | Status |
@@ -357,6 +424,7 @@ for reservation, verification, and the manual `MIMALLOC_RESERVE_HUGE_OS_PAGES` e
 | `--max-extend-chains` chain-extension cap | [#193](https://github.com/fg-labs/bwa-mem3/pull/193) | — | fork-only (opt-in, not byte-identical) |
 | `--extend-mate-concordant` mate-concordant chain retention | [#195](https://github.com/fg-labs/bwa-mem3/pull/195) | — | fork-only (opt-in, not byte-identical) |
 | `--huge-pages` 1 GB huge pages for the index | [#405](https://github.com/fg-labs/bwa-mem3/pull/405) | — | fork-only (Linux, opt-in, off by default; alignment records byte-identical, `@PG` `CL:` excepted; single-host measurement, not a cross-host/cross-tier claim) |
+| Certified adaptive extension band (`--no-band-cert` to disable) | [#420](https://github.com/fg-labs/bwa-mem3/pull/420) | — | fork-only (**default on**, alignment records byte-identical by a per-pair certificate — `@PG` `CL:` excepted; throughput measured on a 5M-read WGS slice, Apple M2 Max / arm64 NEON tier — see [the measurement](#certified-adaptive-extension-band-default-on---no-band-cert-to-disable) for full scope) |
 
 ---
 
