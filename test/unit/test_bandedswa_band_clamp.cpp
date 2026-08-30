@@ -98,7 +98,7 @@ long trial(int a, int b, int o, int e, int zdrop, int w, int end_bonus,
         const SeqPair &p = pairs[c];
         int shorter = p.len1 < p.len2 ? p.len1 : p.len2;
         if (p.len1 < MAX_SEQ_LEN8 && p.len2 < MAX_SEQ_LEN8 && p.len1 >= p.len2 &&
-            w <= 127 && zdrop + maxStep <= 253 && p.h0 <= zdrop + 1 &&
+            w <= 124 && zdrop + maxStep <= 253 && p.h0 <= zdrop + 1 &&
             (p.h0 + shorter * maxStep) < 255 - maxStep) {
             idx.push_back(c);
         }

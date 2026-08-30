@@ -149,10 +149,13 @@ KSORT_INIT(mem_intv1, SMEM, intv_lt1)  // debug
  *   - len1 >= len2 (target >= query) : the gscore (query-end) capture is
  *     byte-identical to scalar only when the query-end column lies on/left of
  *     the main diagonal. See smithWaterman128_8 gscore capture.
- *   - w <= BSW8_MAX_W (= 127)     : every band/position quantity is encoded
- *     as a diagonal offset d = j - i in [-w, +w], which fits signed int8
- *     only for w <= 127. The default opt->w = 100 qualifies; wide-band
- *     retries (w doubling to 200/400/800) do NOT and fall back to 16-bit.
+ *   - w <= BSW8_MAX_W (= 124)     : the band/position quantities are encoded as
+ *     signed-int8 diagonal offsets spanning [-(w+1), w+3] (the band-grow term
+ *     `myband+1` and the tail-trim term `index+2`, which reaches w+3). The
+ *     positive edge w+3 must fit signed int8, so w <= 124; at w >= 125 it wraps
+ *     past +127, the band collapses and lanes die mid-alignment. The default
+ *     opt->w = 100 qualifies; wide-band retries (w doubling to 200/400/800) do
+ *     NOT and fall back to 16-bit.
  *   - zdrop + maxStep <= 253      : zdrop is broadcast into the DP as a byte
  *     (_mm256_set1_epi8), so it must fit one, and the maxStep headroom keeps the
  *     z-drop comparison from wrapping at the top of the range. The DP body AND
@@ -173,7 +176,11 @@ KSORT_INIT(mem_intv1, SMEM, intv_lt1)  // debug
  * the bin to be in range; that is a histogram-sizing constraint, NOT the tier
  * decision. Pairs failing this envelope fall through to the existing 16-bit
  * (then scalar) buckets exactly as before. */
-#define BSW8_MAX_W 127                 /* max band: diagonal offset d=j-i must fit signed int8 */
+#define BSW8_MAX_W 124                 /* max band: the diagonal-offset encoding spans
+                                          [-(w+1), w+3] (band-grow `myband+1`, tail-trim
+                                          `index+2` reaching w+3), all int8, so w <= 124.
+                                          At w>=125 the positive edge wraps past +127:
+                                          the band collapses and lanes die mid-alignment. */
 #define BSW8_MAX_ZDROP_STEP 253        /* zdrop is broadcast into the DP as a byte
                                           (_mm256_set1_epi8), so it must fit one, and the
                                           max_step headroom keeps the z-drop comparison from
