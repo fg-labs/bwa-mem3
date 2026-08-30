@@ -7,6 +7,7 @@
  */
 
 #include <assert.h>
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,15 +22,27 @@
 #error "smem_lockstep_parity_test requires SMEM_LOCKSTEP_N > 1 to exercise the lockstep path"
 #endif
 
-/* Field-by-field SMEM equality. memcmp is unsuitable because the SMEM struct
- * has implicit padding between `n` and `k` that upstream leaves
- * uninitialized — the padding bytes are not part of the semantic contract. */
+/* Field-by-field SMEM equality on the OBSERVABLE fields (rid,m,n,k,s).
+ *
+ * `l` (the reverse-complement interval start) is deliberately excluded, mirroring
+ * smem_dedup_inplace: the pure-backward phase (backwardExt_konly) intentionally
+ * leaves `l` frozen at its forward-phase value while the scalar reference path
+ * keeps recomputing it, so the two paths legitimately differ on `l` for any seed
+ * emitted after a multi-step backward walk through an s>1 interval. That
+ * divergence is inert — no consumer of an emitted seed reads `l` (SA resolution
+ * uses only k/s; sort/dedup key on (rid,m,n[,k,s])) — and `l` is a deterministic
+ * function of (rid,m,n) anyway, so it carries no independent information. Asserting
+ * a.l==b.l here would be a false invariant the K-only backward kernel does not
+ * uphold; the observable seed identity is (rid,m,n,k,s).
+ *
+ * memcmp is unsuitable because the SMEM struct has implicit padding between `n`
+ * and `k` that upstream leaves uninitialized — padding is not part of the
+ * contract, and neither (now) is `l`. */
 static bool smem_fields_equal(const SMEM &a, const SMEM &b) {
     return a.rid == b.rid &&
            a.m   == b.m   &&
            a.n   == b.n   &&
            a.k   == b.k   &&
-           a.l   == b.l   &&
            a.s   == b.s;
 }
 
@@ -163,6 +176,40 @@ static void encode_reads(const char * const *reads, int32_t numReads,
     *out_enc_qdb = enc;
     *out_seq = seq;
     *out_cum_len = cum;
+}
+
+/* Read a (small) FASTA into a flat uppercase ACGT/N sequence string. Used to
+ * derive reads that actually MATCH the reference, so the backward-extension
+ * path is exercised against real SA intervals rather than the non-matching
+ * synthetic reads above (which all resolve to n_smem=0 and never run a backward
+ * step). Returns a malloc'd buffer (caller frees) or NULL if the file cannot be
+ * opened / has no sequence. */
+static char *read_fasta_seq(const char *path, int32_t *out_len) {
+    FILE *f = fopen(path, "r");
+    if (!f) return NULL;
+    size_t cap = 8192, len = 0;
+    char *seq = (char *)malloc(cap);
+    if (!seq) { fclose(f); return NULL; }
+    int c;
+    bool in_header = false;
+    while ((c = fgetc(f)) != EOF) {
+        if (c == '>') { in_header = true; continue; }
+        if (c == '\n') { in_header = false; continue; }
+        if (in_header) continue;
+        if (c == '\r' || c == ' ' || c == '\t') continue;
+        if (len + 1 >= cap) {
+            cap *= 2;
+            char *tmp = (char *)realloc(seq, cap);
+            if (!tmp) { free(seq); fclose(f); return NULL; }
+            seq = tmp;
+        }
+        seq[len++] = (char)toupper(c);
+    }
+    fclose(f);
+    if (len == 0) { free(seq); return NULL; }
+    seq[len] = '\0';
+    *out_len = (int32_t)len;
+    return seq;
 }
 
 int main(int argc, char *argv[]) {
@@ -583,6 +630,65 @@ int main(int argc, char *argv[]) {
                  numReads, max_readlength, 19,
                  enc_qdb, qpa, mia, rid, seq_, cum_len);
         free(enc_qdb); free(seq_); free(cum_len);
+    }
+
+    /* Case 13: reads that ACTUALLY MATCH the reference, driven from an interior
+     * start_pos so the pure-backward phase (backwardExt_konly) runs a real
+     * multi-step walk. Cases 1-12 use non-matching synthetic reads and/or
+     * start_pos=0, so every one resolves to n_smem=0 and the backward step
+     * (the code this PR changed) is never exercised — a vacuous gate. Here each
+     * read is a substring of the loaded reference at a spread of offsets, with
+     * an interior pivot, so the backward walk narrows a real s>1 SA interval
+     * down to a unique match and emits SMEMs. This is the case that gives
+     * backwardExt_konly (and the numPrev==1 fast path) genuine parity coverage;
+     * with the pre-refactor comparator (which compared `l`) it FAILS on the now
+     * intentionally-stale `l`, and PASSES on (rid,m,n,k,s). */
+    {
+        int32_t ref_len = 0;
+        char *ref = read_fasta_seq(argv[1], &ref_len);
+        if (!ref) {
+            /* argv[1] was a bare index prefix, not a readable FASTA — skip
+             * rather than fail (CI passes fixtures/phix.fa, so coverage is
+             * real there). Do NOT count it as a passed case. */
+            fprintf(stderr, "[SKIP] Case 13: could not read reference FASTA '%s' "
+                    "(backward-path parity coverage skipped)\n", argv[1]);
+        } else {
+            const int32_t rl = 60;               /* > minSeedLen (19) */
+            const int32_t want = 6;
+            int32_t off[6] = {0, 400, 900, 1500, 2600, 4000};
+            int32_t numReads = 0;
+            char *bufs[6] = {0};
+            for (int32_t i = 0; i < want; i++) {
+                if (off[i] + rl > ref_len) continue;   /* keep in-bounds */
+                char *b = (char *)malloc(rl + 1);
+                memcpy(b, ref + off[i], rl);
+                b[rl] = '\0';
+                bufs[numReads++] = b;
+            }
+            if (numReads == 0) {
+                fprintf(stderr, "[SKIP] Case 13: reference too short for any read\n");
+            } else {
+                const char *reads[6];
+                int32_t qpa[6], mia[6], rid[6];
+                for (int32_t i = 0; i < numReads; i++) {
+                    reads[i] = bufs[i];
+                    /* Alternate the pivot: even reads start at the last base
+                     * (longest backward walk), odd reads start mid-read (both
+                     * forward and backward walks run). */
+                    qpa[i] = (i & 1) ? (rl / 2) : (rl - 1);
+                    mia[i] = 1;
+                    rid[i] = i;   /* rid indexes the per-read seq_/cum_len layout */
+                }
+                uint8_t *enc_qdb; bseq1_t *seq_; int32_t *cum_len;
+                encode_reads(reads, numReads, &enc_qdb, &seq_, &cum_len);
+                run_case(fmi, "Case 13: real reference substrings, interior start_pos",
+                         numReads, rl, 19,
+                         enc_qdb, qpa, mia, rid, seq_, cum_len);
+                free(enc_qdb); free(seq_); free(cum_len);
+            }
+            for (int32_t i = 0; i < numReads; i++) free(bufs[i]);
+            free(ref);
+        }
     }
 
     fprintf(stderr, "%d / %d cases passed\n", passed_cases, total_cases);

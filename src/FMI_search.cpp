@@ -598,7 +598,12 @@ void FMI_search::getSMEMsOnePosOneThread(uint8_t *enc_qdb,
                 {
                     SMEM smem_ = smem;
 
-                    // Forward extension is backward extension with the BWT of reverse complement
+                    // Forward extension is backward extension with the BWT of reverse complement:
+                    // swap k <-> l, backwardExt, swap back. `l` is LIVE here — after the swap it is
+                    // the k that drives the next forward step, and the full backwardExt's
+                    // l-cumulation is what produces it. So backwardExt_konly (which drops the
+                    // backward-phase-dead l-chain) does NOT apply to the forward pass; the full
+                    // backwardExt is required. konly is backward-only by construction.
                     smem_.k = smem.l;
                     smem_.l = smem.k;
                     SMEM newSmem_ = backwardExt(smem_, 3 - a);
@@ -650,7 +655,25 @@ void FMI_search::getSMEMsOnePosOneThread(uint8_t *enc_qdb,
                 prev[numPrev - p - 1] = temp;
             }
 
-            // Backward search
+            // Backward search.
+            //
+            // This scalar path deliberately keeps the FULL backwardExt (which
+            // also maintains the reverse-complement start `l`), NOT the
+            // backwardExt_konly used by the lockstep production path
+            // (ls_advance_backward_step). Two reasons, both intentional — do not
+            // "unify" this to konly:
+            //   1. Oracle independence. This function is the reference the
+            //      lockstep path is validated against in
+            //      test/smem_lockstep_parity_test.cpp; that test cross-checks
+            //      konly's k/s against this full implementation's k/s. Making
+            //      both use konly would remove the independent check.
+            //   2. It is compiled out of production at the shipping
+            //      SMEM_LOCKSTEP_N > 1 (getSMEMsAllPosOneThread dispatches to the
+            //      lockstep driver), so the extra l-chain work here is off every
+            //      shipped path — there is nothing to optimize.
+            // (A SMEM_LOCKSTEP_N <= 1 build would run this in production and pay
+            // the full-backwardExt cost, but that config is unsupported and the
+            // parity test #errors on it.)
             int cur_j = readlength;
             for(j = x - 1; j >= 0; j--)
             {
@@ -872,6 +895,14 @@ void FMI_search::ls_init_slot(BatchSlot *s,
     s->rid         = rid_array[input_idx];
     s->start_pos   = query_pos_array[input_idx];
     s->min_intv    = min_intv_array[input_idx];
+    /* backwardExt_konly leaves the new k stale on its s'->0 exit and relies on
+     * the caller discarding that seed via `newSmem.s < min_intv` — which only
+     * holds when min_intv >= 1 (an s'==0 result must compare < min_intv). Every
+     * current source of min_intv satisfies this (mem_collect_smem seeds 1 or
+     * p->s+1 >= 2; max_mem_intv is guarded > 0 and never reaches this path), so
+     * this guard documents and enforces the precondition rather than papering
+     * over a live bug. Once per slot init — off the per-step hot path. */
+    xassert(s->min_intv >= 1, "ls_init_slot: min_intv must be >= 1");
     s->readlength  = seq_[s->rid].l_seq;
     s->offset      = query_cum_len_ar[s->rid];
     s->next_x      = s->start_pos + 1;
@@ -1008,10 +1039,42 @@ void FMI_search::ls_advance_backward_step(BatchSlot *s,
         uint8_t a = enc_qdb[s->offset + s->j];
         if (a > 3) goto DONE;
 
+        /* numPrev==1 straight-line path: the two-loop machinery and the curr_s
+         * dedup collapse to a single element. Byte-identical. This is a hand-kept
+         * specialization of the two general loops below (the emit predicate, the
+         * prefetch pair, and the numCurr/j-- bookkeeping are duplicated here) — a
+         * future edit to that logic in the general loops MUST be mirrored into
+         * this block, or numPrev==1 reads (unique matches — the common case this
+         * path accelerates) silently diverge. The lockstep parity test guards
+         * this (see Case 13, which drives real interior-start backward walks). */
+        if (s->numPrev == 1) {
+            SMEM smem = s->prev[0];
+            SMEM newSmem = backwardExt_konly(smem, a);
+            newSmem.m = s->j;
+            if (newSmem.s < s->min_intv) {
+                if ((smem.n - smem.m + 1) >= minSeedLen) {
+                    s->cur_j = s->j;
+                    s->match_buf[s->match_count++] = smem;
+                }
+                /* numCurr stays 0 */
+            } else {
+                s->prev[0] = newSmem;
+#ifdef ENABLE_PREFETCH
+                _mm_prefetch((const char *)(&cp_occ[(newSmem.k) >> CP_SHIFT]), _MM_HINT_T0);
+                _mm_prefetch((const char *)(&cp_occ[(newSmem.k + newSmem.s) >> CP_SHIFT]), _MM_HINT_T0);
+#endif
+                numCurr = 1;
+            }
+            s->numPrev = numCurr;
+            s->j--;
+            if (numCurr == 0) goto DONE;
+            return;
+        }
+
         int p;
         for (p = 0; p < s->numPrev; p++) {
             SMEM smem = s->prev[p];
-            SMEM newSmem = backwardExt(smem, a);
+            SMEM newSmem = backwardExt_konly(smem, a);
             newSmem.m = s->j;
             if ((newSmem.s < s->min_intv) && ((smem.n - smem.m + 1) >= minSeedLen)) {
                 s->cur_j = s->j;
@@ -1031,7 +1094,7 @@ void FMI_search::ls_advance_backward_step(BatchSlot *s,
         p++;
         for (; p < s->numPrev; p++) {
             SMEM smem = s->prev[p];
-            SMEM newSmem = backwardExt(smem, a);
+            SMEM newSmem = backwardExt_konly(smem, a);
             newSmem.m = s->j;
             if ((newSmem.s >= s->min_intv) && (newSmem.s != curr_s)) {
                 curr_s = newSmem.s;
@@ -1443,7 +1506,11 @@ void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
             // the next single-step access; this T1 prefetch on slot[s+N/2] keeps
             // a copy in L2 for that slot's access ~N/2 stepping-passes from now,
             // hiding DRAM-class latency when cp_occ entries spill out of L3.
-            const int32_t s_la = (s + (N / 2)) % N;
+            // N is runtime (g_smem_lockstep_n), so `% N` is a real idiv every
+            // step. s < N and N/2 < N => s + N/2 < 2N, so one compare + subtract
+            // replaces the division. Byte-identical.
+            int32_t s_la = s + (N >> 1);
+            if (s_la >= N) s_la -= N;
             if (slots[s_la].phase == PH_FWD || slots[s_la].phase == PH_BWD) {
                 ls_prefetch_cp_occ_t1(&slots[s_la]);
             }

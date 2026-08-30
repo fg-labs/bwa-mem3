@@ -1,6 +1,11 @@
-// Unit tests for smem_dedup_inplace: adjacent fully-identical SMEM deduplication.
-// The function compacts a sorted SMEM array in-place, removing duplicates
-// (entries identical on rid,m,n,k,l,s) from adjacent positions.
+// Unit tests for smem_dedup_inplace: adjacent duplicate SMEM deduplication.
+// The function compacts a sorted SMEM array in-place, removing adjacent entries
+// identical on the OBSERVABLE key (rid,m,n,k,s). The reverse-complement interval
+// start `l` is deliberately NOT part of the key: it is a deterministic function
+// of (rid,m,n), so two entries equal on (rid,m,n) are equal on `l` anyway — and
+// dropping it lets the pure-backward SMEM phase skip maintaining the (dead)
+// l-chain (see backwardExt_konly in FMI_search.h). See the "differing only on l
+// are merged" case below, which pins this contract.
 //
 // Precondition tested here: identical SMEMs are adjacent (true after
 // sortSMEMs + per-read intv_lt1 sort in mem_collect_smem).
@@ -190,6 +195,30 @@ TEST_CASE("entries differing only on s are distinct"
     std::vector<SMEM> arr = {a, b};
     auto result = run_dedup(arr);
     REQUIRE(result.size() == 2);
+}
+
+// `l` is NOT part of the dedup key: two entries equal on (rid,m,n,k,s) but
+// differing only on `l` MERGE. This pins the contract change that lets the
+// pure-backward SMEM phase (backwardExt_konly) stop maintaining the l-chain;
+// a future reintroduction of an `l` comparison would fail this case. The
+// scenario is not merely hypothetical — the K-only backward kernel emits a
+// stale `l`, so two seeds with identical (rid,m,n,k,s) can genuinely carry
+// different `l`. Assert on size and the non-l fields (smem_eq compares l, and
+// the surviving entry keeps whichever `l` came first — here a's l=110).
+TEST_CASE("entries differing only on l are merged"
+          * doctest::test_suite("unit/smem_dedup"))
+{
+    SMEM a = make_smem(0, 5, 20, 100, 110, 2);
+    SMEM b = make_smem(0, 5, 20, 100, 999, 2);  // only l differs
+    std::vector<SMEM> arr = {a, b};
+    auto result = run_dedup(arr);
+    REQUIRE(result.size() == 1);
+    const SMEM &kept = result[0];
+    CHECK(kept.rid == 0u);
+    CHECK(kept.m   == 5u);
+    CHECK(kept.n   == 20u);
+    CHECK(kept.k   == 100);
+    CHECK(kept.s   == 2);
 }
 
 // ---------------------------------------------------------------------------
