@@ -197,6 +197,37 @@ the `w = 124` bound and diverges at `w = 127`, locking the reason for the cap; a
 `-w 127` this branch's records-only md5 matches an all-16-bit reference while `main`'s
 8-bit tier differs.
 
+## Vector banded-SW z-drop gate at `-d 0` (PR #424)
+
+`scalarBandedSWA` gates its z-drop early-exit on `zdrop > 0`, so with z-drop
+disabled (`-d 0`) it never truncates. The vector banded-SW kernels (8-bit and
+16-bit, every SIMD tier) applied the z-drop test **unconditionally**: at
+`zdrop == 0` they compared the running drop against a zero threshold and killed a
+lane as soon as its score fell one point below the row max, truncating alignments
+the scalar reference runs to completion. The two then disagreed on the query-end
+fields (`gscore`/`gtle`), and once the vector stopped early, on the local fields
+(`score`/`tle`/`qle`/`max_off`) too. The fix gates all six vector z-drop mask
+updates (the three `ZSCORE16` macros and the three 8-bit wide-`epi32` paths) on
+`zdrop > 0`, matching the scalar.
+
+The effect is confined to **`-d 0` (z-drop disabled)**, where essentially all
+extension pairs previously diverged between the vector tiers and the scalar
+reference; disabled z-drop now preserves the alignments the old kernels wrongly
+truncated. On the default `-d 100` the guarded branch is always taken, so the
+kernels are **byte-identical** there and the drop-in path is unchanged. This was
+verified by a controlled records-only (header-excluded) whole-aligner md5 A/B —
+control (`main`) versus this branch on identical inputs, default flags, and
+batching (`-K` held fixed for both runs) — on a 2×150 bp WGS workload (HG002,
+hg38): the default-`-d 100` output matches the pre-fix baseline on both the ARM64
+(NEON) and x86_64 (AVX2) tiers. At `-d 0` the fixed kernels' records-only md5
+instead equals that same default-flags output — disabling z-drop preserves
+exactly the alignments the default z-drop leaves untruncated on these reads —
+while the old kernels diverge. A standalone kernel byte-identity gate also passes
+at default parameters (extend and rescue). A regression test
+(`test/unit/test_bandedswa_zdrop_gate.cpp`) compares `getScores8`/`getScores16` at
+`zdrop == 0` to `scalarBandedSWA` on NEON, AVX2, and AVX-512BW: it fails on the old
+kernels and passes on the fixed ones.
+
 ---
 
 ## Changes catalog
@@ -213,6 +244,7 @@ the `w = 124` bound and diverges at `w = 127`, locking the reason for the cap; a
 | AVX-512BW 16-bit score2 fix | [#30](https://github.com/fg-labs/bwa-mem3/pull/30) | — | fork-only |
 | NEON 16-bit kernel rewrite | [#31](https://github.com/fg-labs/bwa-mem3/pull/31) | — | fork-only |
 | 8-bit banded-SW envelope cap at `w = 124` | [#422](https://github.com/fg-labs/bwa-mem3/pull/422) | — | fork-only (only affects `-w >= 125`; default `-w 100` byte-identical) |
+| Vector banded-SW z-drop gate at `-d 0` | [#424](https://github.com/fg-labs/bwa-mem3/pull/424) | — | fork-only (z-drop-disabled only; default `-d 100` byte-identical) |
 | kseq2bseq1 zero-initialization | [#22](https://github.com/fg-labs/bwa-mem3/pull/22) | — | fork-only |
 | Proper-pair flag from emitted alignment | [#17](https://github.com/fg-labs/bwa-mem3/pull/17) | — | fork-only, **opt-in** (`--proper-pair-from-emitted`; default matches both upstreams, [#362](https://github.com/fg-labs/bwa-mem3/issues/362)) |
 
