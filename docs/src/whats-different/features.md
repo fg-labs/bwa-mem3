@@ -240,12 +240,6 @@ non-numeric junk (`2x`, `12M`) is rejected rather than accepted as a numeric pre
 
 ## `--dedup-reads` whole-read-pair memoization
 
-> **Status: measurement only in this build.** The flag, the `auto` controller,
-> and the duplicate-rate measurement are wired, but no alignment work is skipped
-> yet — output is byte-identical in every mode because the memoize path is not
-> live. The behavior described below lands in a follow-up; `on` today measures
-> without collapsing.
-
 `--dedup-reads STR` aligns each **distinct read-pair** once within a chunk and
 reuses the result for byte-identical duplicate pairs, instead of running the full
 seed → chain → extend pipeline on every duplicate. Where `--dedup` collapses

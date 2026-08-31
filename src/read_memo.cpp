@@ -193,11 +193,11 @@ read_memo_result read_memo_prepass(const mem_opt_t * /*opt*/, const bseq1_t *seq
             }
         }
         if (rep >= 0) {
-            st->role[i] = 2;                             /* DUP */
+            st->role[i] = READ_MEMO_ROLE_DUP;
             st->rep_pair[i] = rep;
             dup++;
         } else {
-            st->role[i] = 1;                             /* REP */
+            st->role[i] = READ_MEMO_ROLE_REP;
             st->rep_pair[i] = -1;
             g_chain_next[i] = (it != g_map.end()) ? it->second : -1;
             g_map[fp] = i;                               /* new chain head */
@@ -258,7 +258,8 @@ static void readmemo_reprobe(int64_t pairs)
     g_net_state.store(NET_MEASURING, std::memory_order_relaxed);
 }
 
-void read_memo_controller_observe(const read_memo_result &r, uint64_t align_ns)
+void read_memo_controller_observe(const read_memo_result &r, uint64_t align_ns,
+                                  bool armed)
 {
     if (readmemo_stats_on()) {
         g_stat_pairs.fetch_add((uint64_t)r.pairs, std::memory_order_relaxed);
@@ -266,12 +267,22 @@ void read_memo_controller_observe(const read_memo_result &r, uint64_t align_ns)
     }
     if (r.pairs <= 0) return;
 
+    /* Advance the work-based re-probe counter first; this may reset a latched
+     * state back to MEASURING within this call. */
+    readmemo_reprobe(r.pairs);
+
+    /* An armed invocation ran the memo ON, so align_ns already excludes the
+     * duplicates' work -- it is not a clean per-pair baseline and must never
+     * feed the measuring window. Skipping it here also makes the reprobe
+     * transition above safe: the invocation that crosses the threshold is the
+     * armed one, so it is dropped and the next (now-unarmed) invocation starts
+     * the fresh window. */
+    if (armed) return;
+
     /* predicted net for THIS invocation (ns). */
     const double per_pair = (double)align_ns / (double)r.pairs;
     const double benefit  = (double)r.dup_pairs * per_pair;
     const double net_ns   = (double)r.probe_ns - benefit;
-
-    readmemo_reprobe(r.pairs);
 
     std::lock_guard<std::mutex> lk(g_net_mtx);
     if (g_net_state.load(std::memory_order_relaxed) != NET_MEASURING) return;

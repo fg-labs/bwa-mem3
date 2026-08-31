@@ -19,11 +19,13 @@
  * (est_insert_high from per-chunk mem_pestat), which is constant within a chunk
  * but varies across chunks -- so a cross-chunk cache would not be byte-identical.
  *
- * PHASE 1 (this): the CLI knob, the env config, the fingerprint pre-pass, and the
- * net-cycles controller are all wired, but NOTHING consumes role[]/rep_pair[] --
- * the memoize path is added in Phase 2. Phase 1 is byte-identical by construction
- * and exists to (a) land the surface and (b) confirm the probe cost is ~0 on
- * low-duplicate workloads (WGS).
+ * The memoize path (Phase 2): when the controller latches ON (or mode==on), the
+ * aligner runs seed->chain->extend only on the REP pairs (compacted at the
+ * worker_bwt level; kernels unmodified) and a parallel copy pass replicates each
+ * REP's regs into its DUP pairs before pestat/pairing. The per-read SAM stage
+ * then replays with each read's own id/name/qual, so output is byte-identical.
+ * In auto mode the first chunks measure with the memo OFF (clean align-cost
+ * baseline for the controller); the latch turns the copy path on thereafter.
  *
  * The design mirrors the shipped extension-DP dedup controller (BWAMEM3_DEDUP /
  * --dedup, "#415") deliberately: same off|on|auto surface, same net-cycles
@@ -36,6 +38,11 @@ struct mem_opt_t;
 
 /* Resolved mode. */
 enum { READMEMO_OFF = 0, READMEMO_ON = 1, READMEMO_AUTO = 2 };
+
+/* Per-pair role assigned by the pre-pass. NONE is an odd tail (never happens on
+ * the PE-gated path); REP pairs are aligned; DUP pairs skip alignment and copy
+ * their representative's regs. */
+enum { READ_MEMO_ROLE_NONE = 0, READ_MEMO_ROLE_REP = 1, READ_MEMO_ROLE_DUP = 2 };
 
 /* Resolve the mode from --dedup-reads (mode_arg) > BWAMEM3_DEDUP_READS env >
  * default "auto". Fatal (exit 1) on an unrecognized value. An empty CLI value is
@@ -75,9 +82,15 @@ read_memo_result read_memo_prepass(const mem_opt_t *opt, const bseq1_t *seqs,
 /* Feed one invocation's pre-pass result + that invocation's measured align-phase
  * cost (WORKER10 delta, ns) into the net-cycles controller, which predicts the
  * net benefit of memoizing (avoided align work - probe/copy overhead) and latches
- * ON/OFF once a z-test clears, with a work-based periodic re-probe. In Phase 1
- * this only drives the STATS/verbose reporting; nothing acts on the latch yet. */
-void read_memo_controller_observe(const read_memo_result &r, uint64_t align_ns);
+ * ON/OFF once a z-test clears, with a work-based periodic re-probe.
+ *
+ * `armed` says whether the memo actually ran ON for this invocation. An armed
+ * invocation's align_ns excludes the duplicates' avoided work, so it is NOT a
+ * clean baseline: it advances the re-probe work counter but is never accumulated
+ * into the measuring window (which keeps the "auto measures with the memo OFF"
+ * guarantee true even across a re-probe that resets the latch mid-call). */
+void read_memo_controller_observe(const read_memo_result &r, uint64_t align_ns,
+                                  bool armed);
 
 /* Current controller decision for the memoize path (Phase 2 will gate on this):
  * READMEMO_ON while auto is latched-on or mode==on; READMEMO_OFF otherwise. */

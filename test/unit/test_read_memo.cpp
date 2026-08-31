@@ -148,7 +148,9 @@ TEST_CASE("controller latches auto ON when memoizing clearly wins") {
     const uint64_t align_ns[4] = { 1000000, 1100000, 900000, 1050000 };
     for (int i = 0; i < 4; ++i) {
         read_memo_result r{ /*pairs*/ 1000, /*dup_pairs*/ 500, /*probe_ns*/ 1000 };
-        read_memo_controller_observe(r, align_ns[i]);
+        // armed=false: these observations simulate the MEASURING phase (memo OFF),
+        // the only invocations that feed the controller's window.
+        read_memo_controller_observe(r, align_ns[i], /*armed*/ false);
     }
     CHECK(read_memo_active() == READMEMO_ON);   // auto + latched-on
     mem_dedup_reads_configure("off");
