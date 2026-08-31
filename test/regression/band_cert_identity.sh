@@ -170,6 +170,97 @@ if [ "$widest_del" -le 20 ]; then
 fi
 echo "  ok: default output exercises the certificate (widest deletion = ${widest_del} > w0=20)"
 
+# --- Cross-tier byte-identity of the certified (default) path on the widened route. ---
+# The deletion-bearing pairs drive w_need into the widened band range the certified
+# probe now routes through the 8-bit kernel (bsw_run_tier(BSW_TIER_8) at bucket
+# ceilings above the startup width): with DEL=24 the optimal band is ~24, comfortably
+# inside the widened cap, so these pairs are certified at a wide ceiling rather than
+# declined. That kernel must emit byte-identical SAM whichever SIMD tier the dispatcher
+# selects, so run the default path under each usable tier and assert one output.
+#
+# Scope mirrors all_tiers_parity.sh: only tiers with a batched kswv kernel are
+# sweepable -- avx2/avx512bw on x86, neon on arm64. sse41/sse42/avx have no batched
+# kernel and forcing them aborts on PE input, so they are excluded. FORCE_TIER is
+# downgrade-only, so only tiers at or below the host are swept. A host with a single
+# sweepable tier (arm64, or x86 without AVX-512BW) has nothing to compare and reports
+# SKIP rather than a vacuous PASS; the real avx2-vs-avx512bw evidence is earned on an
+# AVX-512BW x86 runner.
+host_tier_raw="$(BWAMEM3_DEBUG_SIMD=1 "$BWA_MEM3" 2>&1 || true)"
+host_tier="$(printf '%s\n' "$host_tier_raw" | sed -n 's/.*SIMD tier: \([a-z0-9]*\).*/\1/p' | head -1)"
+known_tiers="sse41 sse42 avx avx2 avx512bw neon"
+case " $known_tiers " in
+    *" $host_tier "*) ;;
+    *)
+        echo "SKIP: could not detect host SIMD tier (parsed '$host_tier') — cross-tier band_cert sweep skipped"
+        host_tier=""
+        ;;
+esac
+if [ -n "$host_tier" ]; then
+    # Select the sweepable tiers, family-aware: neon is arm64-only and is NOT
+    # "above" the x86 tiers, so a flat rank across both families would wrongly
+    # force x86 tiers on arm64 (where FORCE_TIER silently ignores the cross-family
+    # request and re-runs neon -- a vacuous self-comparison). Mirror
+    # all_tiers_parity.sh: neon hosts sweep {neon} only; x86 hosts sweep the
+    # batched tiers (avx2, avx512bw) at or below the host (FORCE_TIER is
+    # downgrade-only; sse41/sse42/avx have no batched kswv kernel).
+    if [ "$host_tier" = "neon" ]; then
+        sweep_tiers="neon"
+    else
+        host_rank=-1
+        i=0
+        for t in $known_tiers; do
+            [ "$t" = "$host_tier" ] && host_rank="$i"
+            i=$((i + 1))
+        done
+        sweep_tiers=""
+        i=0
+        for t in $known_tiers; do
+            case "$t" in
+                avx2 | avx512bw) [ "$i" -le "$host_rank" ] && sweep_tiers="$sweep_tiers $t" ;;
+            esac
+            i=$((i + 1))
+        done
+    fi
+    n_sweep=0
+    for t in $sweep_tiers; do n_sweep=$((n_sweep + 1)); done
+    if [ "$n_sweep" -lt 2 ]; then
+        echo "SKIP: only one sweepable tier ($sweep_tiers ) on this host — cross-tier band_cert parity needs an AVX-512BW x86 host"
+    else
+        ref_tsam=""
+        ref_tier=""
+        for t in $sweep_tiers; do
+            tsam="$BAND_CERT_WORK_DIR/default.$t.sam"
+            terr="$BAND_CERT_WORK_DIR/default.$t.simd"
+            # Enable the SIMD diagnostic and capture stderr so the dispatcher's
+            # own report of which tier it ran can be asserted. FORCE_TIER is
+            # downgrade-only and silently ignores a request it cannot honor
+            # (unknown/cross-family/up-tier); the sweep set is built to stay at or
+            # below the host, so a mismatch here means a dispatch regression --
+            # and without this check every pass would fall back to the host tier
+            # and diff would report byte-identity with no real cross-tier coverage.
+            # The effective tier is printed after FORCE_TIER is applied (see the
+            # BWAMEM3_DEBUG_SIMD block in src/simd_dispatch.cpp), so it reflects
+            # the tier actually used, not the host's native tier.
+            BWAMEM3_DEBUG_SIMD=1 BWAMEM3_FORCE_TIER="$t" "$BWA_MEM3" mem "$ref" "$r1" "$r2" 2> "$terr" \
+                | grep -v '^@PG' > "$tsam"
+            eff_tier="$(sed -n 's/.*SIMD tier: \([a-z0-9]*\).*/\1/p' "$terr" | head -1)"
+            if [ "$eff_tier" != "$t" ]; then
+                echo "FAIL: forced tier '$t' but dispatcher ran '${eff_tier:-<none>}' — cross-tier band_cert coverage would be vacuous" >&2
+                exit 1
+            fi
+            if [ -z "$ref_tsam" ]; then
+                ref_tsam="$tsam"
+                ref_tier="$t"
+            elif ! diff -q "$ref_tsam" "$tsam" > /dev/null; then
+                echo "FAIL: certified-path SAM differs between tiers '$ref_tier' and '$t' on the widened route:" >&2
+                diff "$ref_tsam" "$tsam" | head -20 >&2
+                exit 1
+            fi
+        done
+        echo "PASS: certified (default) path byte-identical across tiers [$sweep_tiers ] on the widened deletion route"
+    fi
+fi
+
 # --- Non-default parameter sweep: default vs --no-band-cert must match under
 # scoring/gap/zdrop knobs too. The certificate bounds the optimal score but not the
 # extension kernel's early-termination heuristics (zdrop / m==0 / band-edge shrink),
