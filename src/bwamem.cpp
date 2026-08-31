@@ -4114,6 +4114,16 @@ mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *
  * Basic hit->SAM conversion *
  *****************************/
 
+/* Infer the DP band width needed to realize an alignment of the given lengths and score.
+ *
+ * The l1 == l2 early-return is the load-bearing ungapped-CIGAR fast path. On an equal-length
+ * window, closing any gap requires a balanced insertion + deletion (two gaps), so the guard
+ * returns a zero band whenever the score deficit (l1*a - score) is below the implemented
+ * two-gap threshold 2*(q + r - a): no balanced indel could recover that deficit, so the
+ * optimal alignment is provably gap-free and a zero band suffices. Emission (mem_reg2aln)
+ * feeds that 0 to bwa_gen_cigar3, which then takes bwa.cpp's no-DP equal-length block and
+ * emits a single <len>M with no ksw_global2 fill or traceback. This shortcut is what makes the
+ * common ungapped case skip the banded DP; keep it. */
 static inline int infer_bw(int l1, int l2, int score, int a, int q, int r)
 {
     int w;
