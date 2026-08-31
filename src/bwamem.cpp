@@ -4952,13 +4952,14 @@ static inline void ugp_record_right_outcome(const SeqPair *sp, int tid);
 #endif
 
 /* ------------------------------------------------------------------------
- * Certified tight_band probe rung (8-bit tier).
+ * Certified tight_band probe rung (tier-parameterized; see `tier`).
  *
- * The scalar and 16-bit tiers already run a narrow probe at INIT_W(opt->w) = 20
- * and finalize the pairs a per-pair certificate proves optimal there. The 8-bit
- * tier does not: its ladder starts at opt->w, so short-read extensions that carry
- * a proven tight_band still pay the full-width band. This rung gives the 8-bit
- * tier the same narrow probe: it runs the eligible pairs at the probe width
+ * 8-bit tier: its ladder starts at opt->w, so short-read extensions that carry a proven
+ * tight_band still pay the full-width band. This rung gives it a narrow probe it lacked.
+ * 16-bit tier: its ladder already probes narrow (first rung INIT_W(opt->w) = 20); here the
+ * rung REPLACES that single uniform-20 probe with a per-w_need bucketed one and the caller
+ * then starts the ladder at opt->w. Both are byte-identical by the same certificate, and both
+ * feed the identical downstream ladder. This rung runs the eligible pairs at the probe width
  * BEFORE the ladder and finalizes only those band_cert_accept certifies there --
  * byte-identical to the full-width ladder result, by the same certificate the
  * other tiers ship (band_cert_accept's w < opt->w branch: the S - pen_clip anchor
@@ -4986,7 +4987,7 @@ static inline void ugp_record_right_outcome(const SeqPair *sp, int tid);
 static inline void ugp_record_left_outcome(const SeqPair *sp, int a_match, int tid);
 static inline void ugp_record_right_outcome(const SeqPair *sp, int tid);
 
-static inline int bsw_tb_probe_rung(const mem_opt_t *opt, mem_alnreg_v *av_v,
+static inline int bsw_tb_probe_rung(BswMethTier tier, const mem_opt_t *opt, mem_alnreg_v *av_v,
         IBandedPairWiseSW *sym, IBandedPairWiseSW *ot, IBandedPairWiseSW *ob,
         SeqPair *pair_ar, uint8_t *ref, uint8_t *qer, int nump,
         int nthreads, SeqPair *scratch, int32_t *hist,
@@ -5060,7 +5061,7 @@ static inline int bsw_tb_probe_rung(const mem_opt_t *opt, mem_alnreg_v *av_v,
       const int32_t Wb = BUCKET_CEIL[b];
       SeqPair *bkt = elig + off[b];
       sym->set_guard_overshoot(true);
-      bsw_run_tier(BSW_TIER_8, opt, av_v, sym, ot, ob,
+      bsw_run_tier(tier, opt, av_v, sym, ot, ob,
                    bkt, ref, qer, cnt[b], nthreads, Wb, scratch, scratch, hist);
       sym->set_guard_overshoot(false);
       for (int l = 0; l < cnt[b]; l++) {
@@ -6393,6 +6394,22 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
 
     nump = numPairsLeft16;
     init_w = INIT_W(opt->w);
+    /* item 2: certified tight_band probe rung on the 16-bit tier, as a PURE PREPEND. The 16-bit
+     * ladder already probes narrow (its first rung is INIT_W(opt->w) = 20); the rung certifies the
+     * proven-narrow (tb>0, w_need <= w_cap) pairs at a per-w_need bucket <= 20/30 and removes them
+     * early, byte-identically (a certified pair's fields are band-invariant beyond its bucket, so
+     * the bucket and the width-20 probe finalize identically). Everything else -- ineligible pairs
+     * (tb=0, or w_need > w_cap) and the rare uncertified pair -- falls through to the UNCHANGED
+     * [20, opt->w, ...] ladder and keeps its cheap w=20 first probe.
+     *
+     * init_w is deliberately NOT raised to opt->w here (it is on the 8-bit tier, which has no w=20
+     * probe to preserve). The 16-bit tier is ~all tb=0 on short reads; raising init_w would force
+     * those ineligible pairs to probe at opt->w first (5x wider) -- a measured ~0.12% regression on
+     * 2x150 with no offsetting narrow population. As a pure prepend the rung is zero-cost on short
+     * reads (no eligible pairs -> immediate return) and wins on long-read/SBX (~25% 16-bit tier). */
+    nump = bsw_tb_probe_rung(BSW_TIER_16, opt, av_v, bswLeft.get(), bswLeftOt.get(), bswLeftOb.get(),
+                             pair_ar, seqBufLeftRef, seqBufLeftQer, nump, nthreads,
+                             pair_ar_aux, hist, seq_, opt->pen_clip5, /*is_left=*/1, tid);
     for ( i=0; i<BAND_NBAND(init_w); i++)
     {
         int32_t w = BAND_WIDTH(init_w, i);
@@ -6464,7 +6481,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
     /* commit 4: certified tight_band probe rung. Finalizes the proven-narrow
      * 8-bit pairs at the probe width (byte-identical); returns the count left
      * (ineligible + uncertified), compacted to the front, for the ladder. */
-    nump = bsw_tb_probe_rung(opt, av_v, bswLeft.get(), bswLeftOt.get(), bswLeftOb.get(),
+    nump = bsw_tb_probe_rung(BSW_TIER_8, opt, av_v, bswLeft.get(), bswLeftOt.get(), bswLeftOb.get(),
                              pair_ar, seqBufLeftRef, seqBufLeftQer, nump, nthreads,
                              pair_ar_aux, hist, seq_, opt->pen_clip5, /*is_left=*/1, tid);
     for ( i=0; i<BAND_NBAND(init_w); i++)
@@ -6756,6 +6773,12 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
     pair_ar_aux = seqPairArrayAux;
     nump = numPairsRight16;
     init_w = INIT_W(opt->w);
+    /* item 2: certified tight_band probe rung on the 16-bit tier (mirror of the LEFT 16-bit
+     * rung; pen_clip3, is_left=0). See the LEFT block for the byte-identity argument and why
+     * init_w stays at INIT_W(opt->w) (pure prepend; no short-read regression). */
+    nump = bsw_tb_probe_rung(BSW_TIER_16, opt, av_v, bswRight.get(), bswRightOt.get(), bswRightOb.get(),
+                             pair_ar, seqBufRightRef, seqBufRightQer, nump, nthreads,
+                             pair_ar_aux, hist, seq_, opt->pen_clip3, /*is_left=*/0, tid);
 
     for ( i=0; i<BAND_NBAND(init_w); i++)
     {
@@ -6827,7 +6850,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
     nump = numPairsRight128;
     init_w = opt->w;
     /* commit 4: certified tight_band probe rung (mirror of the LEFT rung; pen_clip3). */
-    nump = bsw_tb_probe_rung(opt, av_v, bswRight.get(), bswRightOt.get(), bswRightOb.get(),
+    nump = bsw_tb_probe_rung(BSW_TIER_8, opt, av_v, bswRight.get(), bswRightOt.get(), bswRightOb.get(),
                              pair_ar, seqBufRightRef, seqBufRightQer, nump, nthreads,
                              pair_ar_aux, hist, seq_, opt->pen_clip3, /*is_left=*/0, tid);
 
