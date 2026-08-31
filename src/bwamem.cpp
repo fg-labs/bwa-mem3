@@ -3562,25 +3562,38 @@ void mem_process_seqs(mem_opt_t *opt,
     //int n_ = (opt->flag & MEM_F_PE) ? n : n;   // this requires n%2==0
     int n_ = n;
 
-    /* [dedup-reads] Fingerprint this chunk's read-pairs, feed the pre-pass cost +
-     * the chunk's align cost into the net-cycles controller, and -- once the
-     * controller has latched ON (or --dedup-reads on) -- arm the memo so this
-     * chunk aligns each distinct pair once and copies its regs to the duplicates.
+    /* [dedup-reads] Fingerprint this chunk's read-pairs and, when armed, align
+     * each distinct pair once and copy its regs to the duplicates. read_memo_should_arm
+     * returns the latch (auto/on) and, while auto is measuring, alternates the arm
+     * decision so the A/B controller gathers both armed and unarmed samples; the
+     * measured realized cost of this chunk (align + copy) is fed back below.
      * PE + non-meth + even n only; the cohort-slice entry paths are not memoized
-     * in this version (they stay byte-identical, unarmed). In auto mode the memo
-     * is left OFF while the controller measures, so align_ns is a clean baseline.
+     * in this version (they stay byte-identical, unarmed).
      * EXIT GATE: a regression pinning `--dedup-reads off == on == auto == baseline`
      * SAM byte-identity (compat_byte_identical.sh / cohort_slice_identity.sh
      * style), plus the BWAMEM3_DEDUP_READS_VERIFY regs-invariance instrument. */
     static read_memo_state g_readmemo_state = { 0, NULL, NULL, 0 };
     read_memo_result rm_r; bool rm_measure = false, rm_arm = false;
-    if (read_memo_mode() != READMEMO_OFF && (opt->flag & MEM_F_PE)
+    /* VERIFY (BWAMEM3_DEDUP_READS_VERIFY) is a correctness instrument, not a
+     * memoization mode: it must run whenever the prepass can identify DUP pairs,
+     * independently of whether the memo is armed. Force the prepass on under
+     * VERIFY even in `off` mode (and in `auto` while latched OFF, where rm_arm
+     * stays false), so the regs-invariance check actually fires instead of
+     * silently doing nothing. */
+    const bool rm_verify = read_memo_verify();
+    if ((read_memo_mode() != READMEMO_OFF || rm_verify) && (opt->flag & MEM_F_PE)
         && !opt->meth_mode && n_ > 0 && (n_ & 1) == 0) {
         rm_r = read_memo_prepass(opt, seqs, n_, &g_readmemo_state);
         rm_measure = true;
-        rm_arm = (read_memo_active() == READMEMO_ON) && rm_r.dup_pairs > 0;
+        rm_arm = read_memo_should_arm(rm_r.dup_pairs) != 0;
     }
-    w.memo = rm_arm ? &g_readmemo_state : NULL;
+    /* Set w.memo (so the per-pair pass can find DUP/REP roles) when the memo is
+     * armed OR when VERIFY needs to compare unarmed DUP pairs. Under VERIFY the
+     * compaction in worker_bwt is suppressed, so DUP pairs are aligned normally
+     * and their independently-computed regs are compared to the representative's;
+     * real memo copying stays gated on rm_arm below. */
+    const bool rm_run_pairs = rm_arm || (rm_measure && rm_verify);
+    w.memo = rm_run_pairs ? &g_readmemo_state : NULL;
     const auto rm_t0 = std::chrono::steady_clock::now();
 
     uint64_t tim = __rdtsc();
@@ -3598,25 +3611,27 @@ void mem_process_seqs(mem_opt_t *opt,
      * mem_pestat's barrier below is unaffected and must stay. */
     kt_for(worker_bwt_aln, &w, n_); // SMEMs (+SAL) then BSW, fused
     tprof[WORKER10][0] += __rdtsc() - tim;
-    if (rm_measure) {
-        const uint64_t align_ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                      std::chrono::steady_clock::now() - rm_t0).count();
-        read_memo_controller_observe(rm_r, align_ns, rm_arm);
-    }
+    const uint64_t rm_align_ns = rm_measure
+        ? (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - rm_t0).count()
+        : 0;
 
     /* [dedup-reads] Copy each DUP pair's regs from its representative. Runs after
      * the (REP-only) align pass and strictly before pestat/pairing, so the
      * inferred insert-size distribution and every downstream stage see the same
-     * regs a full alignment would have produced.
-     *
-     * Note the controller does not (yet) charge the compact/copy wall cost into
-     * its net-cycles model: in auto mode it only observes while the memo is OFF
-     * (read_memo_active()==OFF ⇒ rm_arm false), so that cost is never part of the
-     * measured baseline -- it is pure addition once latched, dwarfed by the
-     * avoided align work on the panels this targets. A realized-vs-predicted net
-     * comparison (timing this pass) is a follow-up, not a correctness gap. */
-    if (rm_arm)
+     * regs a full alignment would have produced. Time it: the A/B controller
+     * charges this copy cost (plus the compaction folded into the align phase
+     * above) into the armed sample, so it never latches ON when the memo's own
+     * overhead exceeds the align work saved (e.g. cheap reads at a high dup rate). */
+    uint64_t rm_copy_ns = 0;
+    if (rm_arm) {
+        const auto rm_c0 = std::chrono::steady_clock::now();
         kt_for(worker_copy_regs, &w, n_);
+        rm_copy_ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                         std::chrono::steady_clock::now() - rm_c0).count();
+    }
+    if (rm_measure)
+        read_memo_controller_observe(rm_r, rm_align_ns, rm_copy_ns, rm_arm);
 
 
     // PAIRED_END

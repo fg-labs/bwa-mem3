@@ -79,18 +79,22 @@ struct read_memo_result {
 read_memo_result read_memo_prepass(const mem_opt_t *opt, const bseq1_t *seqs,
                                    int n, read_memo_state *st);
 
-/* Feed one invocation's pre-pass result + that invocation's measured align-phase
- * cost (WORKER10 delta, ns) into the net-cycles controller, which predicts the
- * net benefit of memoizing (avoided align work - probe/copy overhead) and latches
- * ON/OFF once a z-test clears, with a work-based periodic re-probe.
- *
- * `armed` says whether the memo actually ran ON for this invocation. An armed
- * invocation's align_ns excludes the duplicates' avoided work, so it is NOT a
- * clean baseline: it advances the re-probe work counter but is never accumulated
- * into the measuring window (which keeps the "auto measures with the memo OFF"
- * guarantee true even across a re-probe that resets the latch mid-call). */
+/* Whether to arm the memo for the NEXT align invocation of `dup_pairs` duplicate
+ * pairs. OFF mode / no duplicates -> 0; ON mode -> 1; auto -> the current latch,
+ * except while measuring, when it alternates so the A/B controller gathers both
+ * armed and unarmed samples. Call exactly once per invocation (it advances the
+ * alternation counter) and pass the same value to read_memo_controller_observe. */
+int read_memo_should_arm(int64_t dup_pairs);
+
+/* Feed one invocation's pre-pass result, its measured align-phase cost (WORKER10
+ * delta, ns), and -- when armed -- the measured regs copy-pass cost (ns) into the
+ * two-sample A/B controller. It records this chunk's REALIZED per-pair total cost
+ * (probe + align + copy) into the ON or OFF accumulator (per `armed`, which MUST
+ * match read_memo_should_arm) and latches on the measured mean difference, so the
+ * copy/compaction overhead is charged rather than assumed away. `copy_ns` is
+ * ignored when `armed` is false (no copy pass ran). Controller runs in auto only. */
 void read_memo_controller_observe(const read_memo_result &r, uint64_t align_ns,
-                                  bool armed);
+                                  uint64_t copy_ns, bool armed);
 
 /* Current controller decision for the memoize path:
  * READMEMO_ON while auto is latched-on or mode==on; READMEMO_OFF otherwise. */

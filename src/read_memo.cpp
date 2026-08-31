@@ -210,29 +210,42 @@ read_memo_result read_memo_prepass(const mem_opt_t * /*opt*/, const bseq1_t *seq
 }
 
 /* ------------------------------------------------------------------------- *
- * Net-cycles controller (clone of net_observe/net_maybe_reprobe,
- *   bwamem.cpp:4525-4665), observation unit = one align invocation.
+ * Two-sample A/B controller. The observation unit is one align invocation; the
+ * quantity is that chunk's REALIZED per-pair total cost:
  *
- *   benefit_ns = dup_pairs * (align_ns / pairs)   [align work avoided by skipping
- *                                                  the dups' seed->chain->extend]
- *   overhead_ns = probe_ns                         [+ per-dup copy, added in Phase 2
- *                                                  where it is measurable]
- *   net_ns = overhead_ns - benefit_ns              [< 0 => memoizing wins]
+ *   cost_per_pair = (probe_ns + align_ns + (armed ? copy_ns : 0)) / pairs
  *
- *   Chunks are huge, so the CLT floor is small (3) rather than #415's 24.
+ * For an ARMED chunk align_ns already reflects the memo (REP-only align, minus
+ * the skipped duplicates, PLUS the compaction overhead), and copy_ns is the
+ * regs copy pass -- so EVERY overhead the memo adds is charged. For an UNARMED
+ * chunk it is the full align. While auto is measuring we alternate the arm
+ * decision (read_memo_should_arm) so both samples accumulate, then latch on the
+ * MEASURED difference of the two means -- not a benefit model that could omit
+ * the copy/compaction cost (which is exactly how a dup-rate-blind model would
+ * wrongly latch ON on cheap reads, where skipping cheap alignments saves less
+ * than the memo's own overhead).
+ *
+ *   delta = mean(cost | ON) - mean(cost | OFF)      [< 0 => memoizing is cheaper]
+ *
+ * Chunks are huge, so the per-arm CLT floor is small (3) rather than #415's 24;
+ * a decision needs NET_MIN_OBS of EACH arm (so ~2*NET_MIN_OBS chunks).
  * ------------------------------------------------------------------------- */
 
 enum { NET_MEASURING = 0, NET_LATCH_ON = 1, NET_LATCH_OFF = 2 };
 static std::atomic<int>     g_net_state{NET_MEASURING};
-static const uint64_t       NET_MIN_OBS      = 3;         /* CLT floor before any latch */
+static const uint64_t       NET_MIN_OBS      = 3;         /* per-arm CLT floor       */
 static const uint64_t       NET_MAX_PAIRS    = 20000000;  /* give up measuring past this */
 static const uint64_t       NET_PROBE_MAX_PAIRS = 10000000;
 static std::atomic<int>     g_net_incumbent{0};
 static std::atomic<int64_t> g_net_since_latch{0};
 
 static std::mutex g_net_mtx;
-static uint64_t   g_net_k = 0, g_net_pairs = 0;
-static double     g_net_mean = 0.0, g_net_m2 = 0.0, g_net_sum = 0.0;
+/* Welford accumulators of per-pair cost (ns), split by arm state. */
+struct ReadMemoAcc { uint64_t n; double mean, m2; };
+static ReadMemoAcc g_on  = {0, 0.0, 0.0};
+static ReadMemoAcc g_off = {0, 0.0, 0.0};
+static uint64_t    g_meas_pairs = 0;   /* pairs measured this window (for the cap) */
+static uint64_t    g_meas_arm   = 0;   /* arm-alternation counter while measuring  */
 
 /* STATS accounting (BWAMEM3_DEDUP_READS_STATS=1). */
 static std::atomic<uint64_t> g_stat_pairs{0}, g_stat_dups{0};
@@ -259,7 +272,8 @@ static void readmemo_reprobe(int64_t pairs)
     std::lock_guard<std::mutex> lk(g_net_mtx);
     if (g_net_state.load(std::memory_order_relaxed) == NET_MEASURING) return;
     if (g_net_since_latch.load(std::memory_order_relaxed) < period) return;
-    g_net_k = g_net_pairs = 0; g_net_mean = g_net_m2 = g_net_sum = 0.0;
+    g_on = ReadMemoAcc{0, 0.0, 0.0}; g_off = ReadMemoAcc{0, 0.0, 0.0};
+    g_meas_pairs = 0; g_meas_arm = 0;
     g_net_since_latch.store(0, std::memory_order_relaxed);
     if (bwa_verbose >= 3)
         fprintf(stderr, "[dedup-reads] re-probe (incumbent %s)\n",
@@ -267,66 +281,92 @@ static void readmemo_reprobe(int64_t pairs)
     g_net_state.store(NET_MEASURING, std::memory_order_relaxed);
 }
 
+int read_memo_should_arm(int64_t dup_pairs)
+{
+    const int mode = readmemo_cfg().mode;
+    if (mode == READMEMO_OFF) return 0;
+    if (dup_pairs <= 0)       return 0;      /* nothing to memoize this chunk */
+    if (mode == READMEMO_ON)  return 1;
+    /* auto: honor the latch; while measuring, alternate so the A/B gets both
+     * armed and unarmed samples on comparable (dup-bearing) chunks. */
+    const int st = g_net_state.load(std::memory_order_relaxed);
+    if (st == NET_LATCH_ON)  return 1;
+    if (st == NET_LATCH_OFF) return 0;
+    std::lock_guard<std::mutex> lk(g_net_mtx);
+    const int st2 = g_net_state.load(std::memory_order_relaxed);
+    if (st2 != NET_MEASURING) return st2 == NET_LATCH_ON ? 1 : 0;
+    return ((g_meas_arm++ & 1ULL) == 0ULL) ? 1 : 0;   /* arm even, unarm odd */
+}
+
 void read_memo_controller_observe(const read_memo_result &r, uint64_t align_ns,
-                                  bool armed)
+                                  uint64_t copy_ns, bool armed)
 {
     if (readmemo_stats_on()) {
         g_stat_pairs.fetch_add((uint64_t)r.pairs, std::memory_order_relaxed);
         g_stat_dups.fetch_add((uint64_t)r.dup_pairs, std::memory_order_relaxed);
     }
     if (r.pairs <= 0) return;
+    if (readmemo_cfg().mode != READMEMO_AUTO) return;   /* forced on/off: controller inert */
 
     /* Advance the work-based re-probe counter first; this may reset a latched
      * state back to MEASURING within this call. */
     readmemo_reprobe(r.pairs);
 
-    /* An armed invocation ran the memo ON, so align_ns already excludes the
-     * duplicates' work -- it is not a clean per-pair baseline and must never
-     * feed the measuring window. Skipping it here also makes the reprobe
-     * transition above safe: the invocation that crosses the threshold is the
-     * armed one, so it is dropped and the next (now-unarmed) invocation starts
-     * the fresh window. */
-    if (armed) return;
-
-    /* predicted net for THIS invocation (ns). */
-    const double per_pair = (double)align_ns / (double)r.pairs;
-    const double benefit  = (double)r.dup_pairs * per_pair;
-    const double net_ns   = (double)r.probe_ns - benefit;
-
     std::lock_guard<std::mutex> lk(g_net_mtx);
     if (g_net_state.load(std::memory_order_relaxed) != NET_MEASURING) return;
-    g_net_sum += net_ns; g_net_pairs += (uint64_t)r.pairs; g_net_k += 1;
-    const double d = net_ns - g_net_mean;
-    g_net_mean += d / (double)g_net_k;
-    g_net_m2   += d * (net_ns - g_net_mean);
+
+    /* Only dup-bearing chunks inform the A/B: a dup-free chunk is never armed
+     * (read_memo_should_arm returns 0 for it), so folding it into the OFF arm
+     * would blend "alternated-OFF" with "structurally-can't-arm" samples and bias
+     * the comparison. Excluding them also means an all-unique workload (WGS/exome)
+     * accumulates nothing, stays MEASURING (== auto OFF), and never arms -- zero
+     * measuring-phase exposure there. */
+    if (r.dup_pairs <= 0) return;
+
+    /* Realized per-pair total cost of THIS chunk (see the header comment): the
+     * pre-pass, the align phase (armed => REP-only + compaction; unarmed => full),
+     * and the copy pass (armed only). Route it to the matching A/B accumulator. */
+    const double cost = (double)(r.probe_ns + align_ns + (armed ? copy_ns : 0))
+                        / (double)r.pairs;
+    ReadMemoAcc &acc = armed ? g_on : g_off;
+    acc.n += 1;
+    const double d = cost - acc.mean;
+    acc.mean += d / (double)acc.n;
+    acc.m2   += d * (cost - acc.mean);
+    g_meas_pairs += (uint64_t)r.pairs;
 
     const int incumbent = g_net_incumbent.load(std::memory_order_relaxed);
     int decision = 0; const char *why = "";
-    if (g_net_k >= NET_MIN_OBS) {
-        const double var = g_net_m2 / (double)(g_net_k - 1);
-        const double sd  = var > 0.0 ? sqrt(var) : 0.0;
-        const double z   = sd > 0.0 ? g_net_mean * sqrt((double)g_net_k) / sd : 0.0;
-        const int    fav = (g_net_mean < 0.0) ? NET_LATCH_ON : NET_LATCH_OFF;
+    if (g_on.n >= NET_MIN_OBS && g_off.n >= NET_MIN_OBS) {
+        const double var_on  = g_on.n  > 1 ? g_on.m2  / (double)(g_on.n  - 1) : 0.0;
+        const double var_off = g_off.n > 1 ? g_off.m2 / (double)(g_off.n - 1) : 0.0;
+        const double se = sqrt(var_on / (double)g_on.n + var_off / (double)g_off.n);
+        const double delta = g_on.mean - g_off.mean;   /* < 0 => armed cheaper */
+        const double z = se > 0.0 ? delta / se : (delta < 0.0 ? -1e9 : (delta > 0.0 ? 1e9 : 0.0));
+        const int    fav = (delta < 0.0) ? NET_LATCH_ON : NET_LATCH_OFF;
         const double zc  = readmemo_cfg().z;
         if (incumbent == 0) {
             if      (fabs(z) >= zc)                 { decision = fav;          why = "measured"; }
-            else if (g_net_pairs >= NET_MAX_PAIRS)  { decision = NET_LATCH_OFF; why = "break-even, default off"; }
+            else if (g_meas_pairs >= NET_MAX_PAIRS) { decision = NET_LATCH_OFF; why = "break-even, default off"; }
         } else if (fav == incumbent) {
             if      (fabs(z) >= zc)                        { decision = incumbent; why = "re-probe confirmed"; }
-            else if (g_net_pairs >= NET_PROBE_MAX_PAIRS)   { decision = incumbent; why = "re-probe inconclusive, kept"; }
+            else if (g_meas_pairs >= NET_PROBE_MAX_PAIRS)  { decision = incumbent; why = "re-probe inconclusive, kept"; }
         } else {
             if      (fabs(z) >= zc + 1.0)                  { decision = fav;       why = "re-probe FLIPPED"; }
-            else if (g_net_pairs >= NET_PROBE_MAX_PAIRS)   { decision = incumbent; why = "below flip margin, kept"; }
+            else if (g_meas_pairs >= NET_PROBE_MAX_PAIRS)  { decision = incumbent; why = "below flip margin, kept"; }
         }
+    } else if (g_meas_pairs >= NET_MAX_PAIRS) {
+        decision = incumbent ? incumbent : NET_LATCH_OFF; why = "insufficient A/B, default off";
     }
     if (decision) {
         g_net_incumbent.store(decision, std::memory_order_relaxed);
         g_net_since_latch.store(0, std::memory_order_relaxed);
         g_net_state.store(decision, std::memory_order_relaxed);
         if (bwa_verbose >= 3)
-            fprintf(stderr, "[dedup-reads] %s: %llu pairs / %llu obs, mean net=%.1f us/chunk -> dedup %s\n",
-                    why, (unsigned long long)g_net_pairs, (unsigned long long)g_net_k,
-                    g_net_mean / 1e3, decision == NET_LATCH_ON ? "ON" : "OFF");
+            fprintf(stderr, "[dedup-reads] %s: on=%.1f off=%.1f ns/pair (n=%llu/%llu) -> dedup %s\n",
+                    why, g_on.mean, g_off.mean,
+                    (unsigned long long)g_on.n, (unsigned long long)g_off.n,
+                    decision == NET_LATCH_ON ? "ON" : "OFF");
     }
 }
 
@@ -336,8 +376,8 @@ void read_memo_reset_for_testing(void)
     g_net_state.store(NET_MEASURING, std::memory_order_relaxed);
     g_net_incumbent.store(0, std::memory_order_relaxed);
     g_net_since_latch.store(0, std::memory_order_relaxed);
-    g_net_k = g_net_pairs = 0;
-    g_net_mean = g_net_m2 = g_net_sum = 0.0;
+    g_on = ReadMemoAcc{0, 0.0, 0.0}; g_off = ReadMemoAcc{0, 0.0, 0.0};
+    g_meas_pairs = 0; g_meas_arm = 0;
     g_stat_pairs.store(0, std::memory_order_relaxed);
     g_stat_dups.store(0, std::memory_order_relaxed);
 }
