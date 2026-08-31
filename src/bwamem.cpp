@@ -29,6 +29,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 *****************************************************************************************/
 
 #include "bwamem.h"
+#include "read_memo.h"     /* --dedup-reads whole-read-pair memoization (Phase 1: measure-only) */
 #include "meth_xm.h"   /* meth_chem_t for the --meth chemistry default */
 #include "FMI_search.h"
 #include "smem_dedup.h"
@@ -3401,6 +3402,23 @@ void mem_process_seqs(mem_opt_t *opt,
     //int n_ = (opt->flag & MEM_F_PE) ? n : n;   // this requires n%2==0
     int n_ = n;
 
+    /* [dedup-reads] Phase 1 (measure-only): fingerprint this chunk's read-pairs
+     * and feed the pre-pass cost + the chunk's align cost into the net-cycles
+     * controller. Nothing consumes role[]/rep_pair[] yet (Phase 2 adds the copy
+     * path), so this is byte-identical. PE + non-meth + even n only.
+     * EXIT GATE (before this flag ships enabled): a regression pinning
+     * `--dedup-reads off == on == auto == baseline` SAM byte-identity, in the
+     * style of compat_byte_identical.sh / cohort_slice_identity.sh. Structural
+     * in Phase 1; required once Phase 2 makes the path consume the memo. */
+    static read_memo_state g_readmemo_state = { 0, NULL, NULL, 0 };
+    read_memo_result rm_r; bool rm_measure = false;
+    if (read_memo_mode() != READMEMO_OFF && (opt->flag & MEM_F_PE)
+        && !opt->meth_mode && n_ > 0 && (n_ & 1) == 0) {
+        rm_r = read_memo_prepass(opt, seqs, n_, &g_readmemo_state);
+        rm_measure = true;
+    }
+    const auto rm_t0 = std::chrono::steady_clock::now();
+
     uint64_t tim = __rdtsc();
     fprintf(stderr, "[0000] 1. Calling kt_for - worker_bwt_aln (fused)\n");
 
@@ -3416,6 +3434,11 @@ void mem_process_seqs(mem_opt_t *opt,
      * mem_pestat's barrier below is unaffected and must stay. */
     kt_for(worker_bwt_aln, &w, n_); // SMEMs (+SAL) then BSW, fused
     tprof[WORKER10][0] += __rdtsc() - tim;
+    if (rm_measure) {
+        const uint64_t align_ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                      std::chrono::steady_clock::now() - rm_t0).count();
+        read_memo_controller_observe(rm_r, align_ns);
+    }
 
 
     // PAIRED_END
