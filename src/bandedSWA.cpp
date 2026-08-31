@@ -1697,8 +1697,6 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
         __m256i oe_ins256 = _mm256_set1_epi16(o_ins + e_ins);
         __m256i o_del256  = _mm256_set1_epi16(o_del);
         __m256i e_del256  = _mm256_set1_epi16(e_del);
-        __m256i eb_ins256 = _mm256_set1_epi16(eb - o_ins);
-        __m256i eb_del256 = _mm256_set1_epi16(eb - o_del);
         
         int16_t max = 0;
         if (max < w_match) max = w_match;
@@ -1802,25 +1800,28 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
             }
 //------------------------
             uint16_t myband[SIMD_WIDTH16] __attribute__((aligned(64)));
-            uint16_t temp[SIMD_WIDTH16] __attribute__((aligned(64)));
             {
-                __m256i qlen256 = _mm256_load_si256((__m256i *) qlen);
-                __m256i sum256 = _mm256_add_epi16(qlen256, eb_ins256);
-                _mm256_store_si256((__m256i *) temp, sum256);               
-                for (int l=0; l<SIMD_WIDTH16; l++) {
-                    double val = temp[l]/e_ins + 1.0;
-                    int max_ins = val;
-                    max_ins = max_ins > 1? max_ins : 1;
-                    myband[l] = min_(bsize, max_ins);
-                }
-                sum256 = _mm256_add_epi16(qlen256, eb_del256);
-                _mm256_store_si256((__m256i *) temp, sum256);               
-                for (int l=0; l<SIMD_WIDTH16; l++) {
-                    double val = temp[l]/e_del + 1.0;
-                    int max_ins = val;
-                    max_ins = max_ins > 1? max_ins : 1;
-                    myband[l] = min_(myband[l], max_ins);
-                    bsize = bsize < myband[l] ? myband[l] : bsize;                  
+                /* Per-lane band clamp in WIDE arithmetic, mirroring
+                 * scalarBandedSWA's "adjust $w if it is too large" block and the
+                 * 8-bit wrappers' fix. The previous 16-bit form added
+                 * qlen*max_sc + (end_bonus - o) with a 16-bit modular add and read
+                 * the sum back through uint16_t, so a negative or >65535 reach
+                 * wrapped -- silently disabling the clamp and running a far wider
+                 * band than the scalar reference on non-default gap penalties.
+                 * qlen[l] already holds qlen*max_sc (see the qlen SoA fill), so
+                 * reach is qlen[l] + end_bonus. Per-batch (SIMD_WIDTH16 lanes),
+                 * not per-cell, so wide math is free. */
+                for (int l = 0; l < SIMD_WIDTH16; l++) {
+                    const int ql    = (int) qlen[l];
+                    const int reach = ql + eb;
+                    int max_ins = (int)((double)(reach - o_ins) / e_ins + 1.0);
+                    if (max_ins < 1) max_ins = 1;
+                    int max_del = (int)((double)(reach - o_del) / e_del + 1.0);
+                    if (max_del < 1) max_del = 1;
+                    int band = bsize;
+                    if (max_ins < band) band = max_ins;
+                    if (max_del < band) band = max_del;
+                    myband[l] = (uint16_t) band;
                 }
             }
 
@@ -3570,8 +3571,6 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
         __m512i oe_ins512 = _mm512_set1_epi16(o_ins + e_ins);
         __m512i o_del512  = _mm512_set1_epi16(o_del);
         __m512i e_del512  = _mm512_set1_epi16(e_del);
-        __m512i eb_ins512 = _mm512_set1_epi16(eb - o_ins);
-        __m512i eb_del512 = _mm512_set1_epi16(eb - o_del);
         
         int16_t max = 0;
         if (max < w_match) max = w_match;
@@ -3676,26 +3675,29 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
 
             /* Banding calculation in pre-processing */
             uint16_t myband[SIMD_WIDTH16] __attribute__((aligned(64)));
-            uint16_t temp[SIMD_WIDTH16] __attribute__((aligned(64)));
             {
-                __m512i qlen512 = _mm512_load_si512((__m512i *) qlen);
-                __m512i sum512 = _mm512_add_epi16(qlen512, eb_ins512);
-                _mm512_store_si512((__m512i *) temp, sum512);               
-                for (int l=0; l<SIMD_WIDTH16; l++) {
-                    double val = temp[l]/e_ins + 1.0;
-                    int max_ins = val;
-                    max_ins = max_ins > 1? max_ins : 1;
-                    myband[l] = min_(bsize, max_ins);
+                /* Per-lane band clamp in WIDE arithmetic, mirroring
+                 * scalarBandedSWA's "adjust $w if it is too large" block and the
+                 * 8-bit wrappers' fix. The previous 16-bit form added
+                 * qlen*max_sc + (end_bonus - o) with a 16-bit modular add and read
+                 * the sum back through uint16_t, so a negative or >65535 reach
+                 * wrapped -- silently disabling the clamp and running a far wider
+                 * band than the scalar reference on non-default gap penalties.
+                 * qlen[l] already holds qlen*max_sc (see the qlen SoA fill), so
+                 * reach is qlen[l] + end_bonus. Per-batch (SIMD_WIDTH16 lanes),
+                 * not per-cell, so wide math is free. */
+                for (int l = 0; l < SIMD_WIDTH16; l++) {
+                    const int ql    = (int) qlen[l];
+                    const int reach = ql + eb;
+                    int max_ins = (int)((double)(reach - o_ins) / e_ins + 1.0);
+                    if (max_ins < 1) max_ins = 1;
+                    int max_del = (int)((double)(reach - o_del) / e_del + 1.0);
+                    if (max_del < 1) max_del = 1;
+                    int band = bsize;
+                    if (max_ins < band) band = max_ins;
+                    if (max_del < band) band = max_del;
+                    myband[l] = (uint16_t) band;
                 }
-                sum512 = _mm512_add_epi16(qlen512, eb_del512);
-                _mm512_store_si512((__m512i *) temp, sum512);               
-                for (int l=0; l<SIMD_WIDTH16; l++) {
-                    double val = temp[l]/e_del + 1.0;
-                    int max_ins = val;
-                    max_ins = max_ins > 1? max_ins : 1;
-                    myband[l] = min_(myband[l], max_ins);
-                    bsize = bsize < myband[l] ? myband[l] : bsize;
-                }               
             }
 
             smithWaterman512_16(mySeq1SoA,
@@ -4542,8 +4544,6 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
         __m128i oe_ins128 = _mm_set1_epi16(o_ins + e_ins);
         __m128i o_del128  = _mm_set1_epi16(o_del);
         __m128i e_del128  = _mm_set1_epi16(e_del);
-        __m128i eb_ins128 = _mm_set1_epi16(eb - o_ins);
-        __m128i eb_del128 = _mm_set1_epi16(eb - o_del);
         
         int16_t max = 0;
         if (max < w_match) max = w_match;
@@ -4649,25 +4649,28 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
             }           
 //------------------------
             uint16_t myband[SIMD_WIDTH16] __attribute__((aligned(64)));
-            uint16_t temp[SIMD_WIDTH16] __attribute__((aligned(64)));
             {
-                __m128i qlen128 = _mm_load_si128((__m128i *) qlen);
-                __m128i sum128 = _mm_add_epi16(qlen128, eb_ins128);
-                _mm_store_si128((__m128i *) temp, sum128);              
-                for (int l=0; l<SIMD_WIDTH16; l++) {
-                    double val = temp[l]/e_ins + 1.0;
-                    int max_ins = (int) val;
-                    max_ins = max_ins > 1? max_ins : 1;
-                    myband[l] = min_(bsize, max_ins);
-                }
-                sum128 = _mm_add_epi16(qlen128, eb_del128);
-                _mm_store_si128((__m128i *) temp, sum128);              
-                for (int l=0; l<SIMD_WIDTH16; l++) {
-                    double val = temp[l]/e_del + 1.0;
-                    int max_ins = (int) val;
-                    max_ins = max_ins > 1? max_ins : 1;
-                    myband[l] = min_(myband[l], max_ins);
-                    bsize = bsize < myband[l] ? myband[l] : bsize;                  
+                /* Per-lane band clamp in WIDE arithmetic, mirroring
+                 * scalarBandedSWA's "adjust $w if it is too large" block and the
+                 * 8-bit wrappers' fix. The previous 16-bit form added
+                 * qlen*max_sc + (end_bonus - o) with a 16-bit modular add and read
+                 * the sum back through uint16_t, so a negative or >65535 reach
+                 * wrapped -- silently disabling the clamp and running a far wider
+                 * band than the scalar reference on non-default gap penalties.
+                 * qlen[l] already holds qlen*max_sc (see the qlen SoA fill), so
+                 * reach is qlen[l] + end_bonus. Per-batch (SIMD_WIDTH16 lanes),
+                 * not per-cell, so wide math is free. */
+                for (int l = 0; l < SIMD_WIDTH16; l++) {
+                    const int ql    = (int) qlen[l];
+                    const int reach = ql + eb;
+                    int max_ins = (int)((double)(reach - o_ins) / e_ins + 1.0);
+                    if (max_ins < 1) max_ins = 1;
+                    int max_del = (int)((double)(reach - o_del) / e_del + 1.0);
+                    if (max_del < 1) max_del = 1;
+                    int band = bsize;
+                    if (max_ins < band) band = max_ins;
+                    if (max_del < band) band = max_del;
+                    myband[l] = (uint16_t) band;
                 }
             }
 

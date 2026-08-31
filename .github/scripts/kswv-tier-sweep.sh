@@ -39,8 +39,22 @@
 #                 to ignore this job. Set it on a runner class you control to
 #                 turn "we lost the avx512bw leg" into a hard error.
 #   SUMMARY_FILE  file to append a markdown summary to (default $GITHUB_STEP_SUMMARY)
+#   SUITE_ARGS    doctest --test-suite filter selecting which unit suites to sweep
+#                 per tier (default: "--test-suite=unit/kswv"). doctest ORs a single
+#                 --test-suite's comma-separated values (repeating the flag does NOT
+#                 OR -- the last one wins), so sweep several kernel suites at once with
+#                 "--test-suite=unit/kswv,unit/bandedswa". This is how a vector kernel
+#                 other than kswv (e.g. the banded-SW getScores16 wrappers) gets
+#                 exercised on the avx512bw tier, which no unit-test matrix row builds.
+#                 Each comma-separated suite is run and validated SEPARATELY: every
+#                 named suite must match >= 1 test case per tier or the tier is
+#                 reported EMPTY (exit 1). A union run cannot enforce this -- doctest
+#                 does not tag its JUnit testcases with the owning suite, so one
+#                 misspelled suite would ride on a sibling's count and be dropped
+#                 silently. Any non---test-suite tokens in SUITE_ARGS are preserved
+#                 and passed through to every per-suite run.
 
-set -uo pipefail
+set -euo pipefail
 
 : "${BWA_MEM3:?BWA_MEM3 must be set}"
 : "${TEST_BIN:?TEST_BIN must be set}"
@@ -49,6 +63,7 @@ set -uo pipefail
 
 SUMMARY_FILE="${SUMMARY_FILE:-${GITHUB_STEP_SUMMARY:-/dev/null}}"
 REQUIRE_TIERS="${REQUIRE_TIERS:-}"
+SUITE_ARGS="${SUITE_ARGS:---test-suite=unit/kswv}"
 
 mkdir -p "$OUT_DIR"
 
@@ -96,18 +111,65 @@ effective_tier() {
 # prints nothing to stdout, so the run itself leaves no readable trace in the
 # CI log. Recover the counts from the report so both the log and the summary
 # say what actually happened per tier.
+#
+# Emits four fields: assertions failures errors testcases. The <testsuite>
+# `tests` attribute is doctest's *assertion* count (p.numAsserts), NOT the
+# number of test cases -- so it reads 0 for an empty selection but is also a
+# poor liveness signal in general. The count of executed test cases is the
+# number of <testcase> child elements, which doctest emits one-per-case at
+# test_case_start (before the body runs), so a case that detects its tier and
+# skips still shows up. That is the value the empty-selection gate keys on.
 counts_from_junit() {
-    local f="$1" line
+    local f="$1" line cases
     if [ ! -s "$f" ]; then
-        echo "? ? ?"
+        echo "? ? ? ?"
         return
     fi
-    line="$(grep -m1 -oE '<testsuite [^>]*' "$f")"
-    printf '%s %s %s\n' \
+    # grep returns nonzero when it finds nothing (no <testsuite> line, zero
+    # <testcase> children); under errexit that would abort the sweep, so absorb
+    # it -- an empty match is a real state the callers below handle, not a fault.
+    line="$(grep -m1 -oE '<testsuite [^>]*' "$f" || true)"
+    cases="$(grep -c '<testcase ' "$f" || true)"
+    printf '%s %s %s %s\n' \
         "$(printf '%s' "$line" | sed -n 's/.*tests="\([0-9]*\)".*/\1/p')" \
         "$(printf '%s' "$line" | sed -n 's/.*failures="\([0-9]*\)".*/\1/p')" \
-        "$(printf '%s' "$line" | sed -n 's/.*errors="\([0-9]*\)".*/\1/p')"
+        "$(printf '%s' "$line" | sed -n 's/.*errors="\([0-9]*\)".*/\1/p')" \
+        "$cases"
 }
+
+# Suite names requested by SUITE_ARGS: split the LAST --test-suite=<csv> token on
+# commas, one per line. doctest itself is last-flag-wins for a repeated
+# --test-suite (only the final flag selects), so honor that here rather than
+# unioning every token -- otherwise this per-suite runner would exercise suites a
+# direct doctest invocation with the same args would ignore. Empty when SUITE_ARGS
+# carries no --test-suite= token (a caller passing some other doctest filter --
+# handled by the :ALL: fallback).
+suites_from_args() {
+    local tok suites=""
+    # shellcheck disable=SC2086  # SUITE_ARGS is a deliberately word-split arg list
+    for tok in $SUITE_ARGS; do
+        case "$tok" in
+            --test-suite=*) suites="${tok#--test-suite=}" ;; # last flag wins
+        esac
+    done
+    [ -z "$suites" ] || printf '%s\n' "$suites" | tr ',' '\n'
+}
+
+# SUITE_ARGS with every --test-suite= token removed, so each per-suite run can
+# re-add exactly one --test-suite filter while preserving any other doctest args.
+other_args_from_suite_args() {
+    local tok out=""
+    # shellcheck disable=SC2086  # SUITE_ARGS is a deliberately word-split arg list
+    for tok in $SUITE_ARGS; do
+        case "$tok" in
+            --test-suite=*) ;; # dropped; re-added one suite at a time
+            *) out="$out $tok" ;;
+        esac
+    done
+    printf '%s' "${out# }"
+}
+
+OTHER_ARGS="$(other_args_from_suite_args)"
 
 ran=""
 skipped=""
@@ -115,8 +177,14 @@ rows=""
 overall=0
 
 for tier in $CANDIDATES; do
-    got="$(effective_tier "$tier")"
-    rc=$?
+    # effective_tier returns 2 (oracle broken) as well as 0 (tier printed, or
+    # empty when refused). Capture that status through `if` so errexit does not
+    # abort before the rc==2 "broken oracle" branch below can report it.
+    if got="$(effective_tier "$tier")"; then
+        rc=0
+    else
+        rc=$?
+    fi
     if [ "$rc" -eq 2 ]; then
         echo "::error::no 'SIMD runtime:' banner from $BWA_MEM3 -- tier oracle is broken, not a low-tier runner"
         exit 1
@@ -133,21 +201,88 @@ for tier in $CANDIDATES; do
         exit 1
     fi
 
-    echo "--- tier $tier: running unit/kswv"
-    report="$OUT_DIR/kswv-unit-${ARCH_LABEL}-${tier}.xml"
-    BWAMEM3_FORCE_TIER="$tier" "$TEST_BIN" --test-suite="unit/kswv" \
-        --reporters=junit --out="$report"
-    status=$?
-    read -r n_tests n_fail n_err << EOF
+    echo "--- tier $tier: running $SUITE_ARGS"
+
+    # Validate each requested suite INDEPENDENTLY. A multi-suite filter such as
+    # --test-suite=unit/kswv,unit/bandedswa selects the UNION, and doctest does
+    # not tag its JUnit <testcase> elements with the suite that owns them -- so a
+    # single union run whose aggregate testcase count is positive cannot tell
+    # that one named suite (renamed or misspelled) matched nothing while a sibling
+    # carried the count. That would silently drop the coverage the missing suite
+    # was added to guarantee. Run each suite on its own and require every one to
+    # match >= 1 test case before recording a pass.
+    suites=()
+    while IFS= read -r s; do [ -n "$s" ] && suites+=("$s"); done < <(suites_from_args)
+    if [ "${#suites[@]}" -eq 0 ]; then
+        # SUITE_ARGS carried no --test-suite= token; run it as-is and gate on the
+        # aggregate non-empty count (there are no individual suites to split).
+        suites=(":ALL:")
+    fi
+
+    tier_status=pass # pass | FAILED | EMPTY
+    empty_suites=""
+    agg_tests=0
+    agg_fail=0
+    agg_err=0
+    agg_cases=0
+    for s in "${suites[@]}"; do
+        if [ "$s" = ":ALL:" ]; then
+            slabel="all"
+            sfilter=()
+            report="$OUT_DIR/kswv-unit-${ARCH_LABEL}-${tier}.xml"
+        else
+            slabel="$s"
+            sfilter=(--test-suite="$s")
+            report="$OUT_DIR/kswv-unit-${ARCH_LABEL}-${tier}-$(printf '%s' "$s" | tr '/,' '__').xml"
+        fi
+        # A failing suite exits nonzero; capture that through `if` so errexit
+        # does not abort before the FAILED aggregation below records it.
+        # shellcheck disable=SC2086  # OTHER_ARGS is a deliberately word-split arg list
+        if BWAMEM3_FORCE_TIER="$tier" "$TEST_BIN" $OTHER_ARGS "${sfilter[@]}" \
+            --reporters=junit --out="$report"; then
+            s_status=0
+        else
+            s_status=$?
+        fi
+        read -r s_tests s_fail s_err s_cases << EOF
 $(counts_from_junit "$report")
 EOF
-    if [ "$status" -ne 0 ]; then
-        overall=$status
-        echo "::error::unit/kswv failed at tier $tier (exit $status, ${n_fail} failures, ${n_err} errors)"
-        rows="$rows| \`$tier\` | $n_tests | $n_fail | $n_err | **FAILED** |"$'\n'
+        # counts_from_junit emits "?" placeholders when the report is missing;
+        # normalize to 0 so the aggregate arithmetic below never chokes.
+        [ "$s_tests" -ge 0 ] 2> /dev/null || s_tests=0
+        [ "$s_fail" -ge 0 ] 2> /dev/null || s_fail=0
+        [ "$s_err" -ge 0 ] 2> /dev/null || s_err=0
+        [ "$s_cases" -ge 0 ] 2> /dev/null || s_cases=0
+        agg_tests=$((agg_tests + s_tests))
+        agg_fail=$((agg_fail + s_fail))
+        agg_err=$((agg_err + s_err))
+        agg_cases=$((agg_cases + s_cases))
+        if [ "$s_status" -ne 0 ]; then
+            tier_status=FAILED
+            echo "::error::suite '$slabel' failed at tier $tier (exit $s_status, ${s_fail} failures, ${s_err} errors)"
+        elif [ "$s_cases" -le 0 ]; then
+            # doctest exits 0 for a filter that matches no test cases, emitting
+            # tests="0" with no <testcase> children. Refuse to record that as a
+            # pass -- it means a suite was renamed out from under us or typo'd.
+            [ "$tier_status" = pass ] && tier_status=EMPTY
+            empty_suites="$empty_suites $slabel"
+            echo "::error::suite '$slabel' selected 0 test cases at tier $tier -- empty selection, not a pass"
+        else
+            echo "    tier $tier / suite $slabel: $s_cases test cases, $s_tests assertions, $s_fail failures, $s_err errors"
+        fi
+    done
+
+    if [ "$tier_status" = FAILED ]; then
+        overall=1
+        echo "::error::unit suite ($SUITE_ARGS) failed at tier $tier"
+        rows="$rows| \`$tier\` | $agg_tests | $agg_fail | $agg_err | **FAILED** |"$'\n'
+    elif [ "$tier_status" = EMPTY ]; then
+        overall=1
+        echo "::error::tier $tier: empty suite selection(s) --$empty_suites -- not a pass"
+        rows="$rows| \`$tier\` | $agg_tests | $agg_fail | $agg_err | **EMPTY** |"$'\n'
     else
-        echo "    tier $tier: $n_tests tests, $n_fail failures, $n_err errors -- pass"
-        rows="$rows| \`$tier\` | $n_tests | $n_fail | $n_err | pass |"$'\n'
+        echo "    tier $tier: ${#suites[@]} suite(s), $agg_cases test cases, $agg_tests assertions, $agg_fail failures, $agg_err errors -- pass"
+        rows="$rows| \`$tier\` | $agg_tests | $agg_fail | $agg_err | pass |"$'\n'
     fi
     ran="$ran $tier"
 done
@@ -155,7 +290,7 @@ done
 # The point of the whole exercise: make the tier set a visible, durable fact
 # rather than something you have to reconstruct from a ccache key.
 {
-    echo "### kswv unit suite — SIMD tier sweep (${ARCH_LABEL})"
+    echo "### vector-kernel unit suites ($SUITE_ARGS) — SIMD tier sweep (${ARCH_LABEL})"
     echo
     echo "| tier | tests | failures | errors | status |"
     echo "|---|---|---|---|---|"
@@ -173,7 +308,7 @@ case " $ran " in
     *" avx512bw "*) ;;
     *)
         if [ "$ARCH_LABEL" = "x86" ]; then
-            echo "::warning::AVX-512BW was NOT exercised on this runner; the avx512bw kswv kernel is untested by this run"
+            echo "::warning::AVX-512BW was NOT exercised on this runner; the avx512bw vector kernels are untested by this run"
             echo "> :warning: \`avx512bw\` not exercised — that kernel is untested by this run." >> "$SUMMARY_FILE"
         fi
         ;;
