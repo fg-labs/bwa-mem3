@@ -468,6 +468,14 @@ void kswv::kswvBatchWrapper8(SeqPair *pairArray,
         pairArray[ii].id = ii;
         pairArray[ii].len1 = 0;
         pairArray[ii].len2 = 0;
+        // The kernel's per-lane loop reads idr/idq/h0 for every lane up to
+        // SIMD_WIDTH, so it reads these padded lanes too; zero them (as id/len1/
+        // len2 above) to keep those reads well-defined. Padded lanes join the SIMD
+        // batch (and its cross-lane reductions), but the caller reads results back
+        // only for real lanes and whole-aligner output is byte-identical (validated).
+        pairArray[ii].idr = 0;
+        pairArray[ii].idq = 0;
+        pairArray[ii].h0 = 0;
     }
 
     {
@@ -1433,6 +1441,14 @@ void kswv::kswvBatchWrapper16(SeqPair *pairArray,
         pairArray[ii].id = ii;
         pairArray[ii].len1 = 0;
         pairArray[ii].len2 = 0;
+        // The kernel's per-lane loop reads idr/idq/h0 for every lane up to
+        // SIMD_WIDTH, so it reads these padded lanes too; zero them (as id/len1/
+        // len2 above) to keep those reads well-defined. Padded lanes join the SIMD
+        // batch (and its cross-lane reductions), but the caller reads results back
+        // only for real lanes and whole-aligner output is byte-identical (validated).
+        pairArray[ii].idr = 0;
+        pairArray[ii].idq = 0;
+        pairArray[ii].h0 = 0;
     }
 
     {
@@ -2480,6 +2496,14 @@ void kswv::kswvBatchWrapper8_avx2(SeqPair *pairArray,
         pairArray[ii].id    = ii;
         pairArray[ii].len1  = 0;
         pairArray[ii].len2  = 0;
+        // The kernel's per-lane loop reads idr/idq/h0 for every lane up to
+        // SIMD_WIDTH, so it reads these padded lanes too; zero them (as id/len1/
+        // len2 above) to keep those reads well-defined. Padded lanes join the SIMD
+        // batch (and its cross-lane reductions), but the caller reads results back
+        // only for real lanes and whole-aligner output is byte-identical (validated).
+        pairArray[ii].idr = 0;
+        pairArray[ii].idq = 0;
+        pairArray[ii].h0 = 0;
     }
 
     uint16_t tid = 0;
@@ -2920,6 +2944,14 @@ void kswv::kswvBatchWrapper16_avx2(SeqPair *pairArray,
         pairArray[ii].id    = ii;
         pairArray[ii].len1  = 0;
         pairArray[ii].len2  = 0;
+        // The kernel's per-lane loop reads idr/idq/h0 for every lane up to
+        // SIMD_WIDTH, so it reads these padded lanes too; zero them (as id/len1/
+        // len2 above) to keep those reads well-defined. Padded lanes join the SIMD
+        // batch (and its cross-lane reductions), but the caller reads results back
+        // only for real lanes and whole-aligner output is byte-identical (validated).
+        pairArray[ii].idr = 0;
+        pairArray[ii].idq = 0;
+        pairArray[ii].h0 = 0;
     }
 
     uint16_t tid = 0;
@@ -3026,6 +3058,14 @@ void kswv::kswvBatchWrapper8(SeqPair *pairArray,
         pairArray[ii].id = ii;
         pairArray[ii].len1 = 0;
         pairArray[ii].len2 = 0;
+        // The kernel's per-lane loop reads idr/idq/h0 for every lane up to
+        // SIMD_WIDTH, so it reads these padded lanes too; zero them (as id/len1/
+        // len2 above) to keep those reads well-defined. Padded lanes join the SIMD
+        // batch (and its cross-lane reductions), but the caller reads results back
+        // only for real lanes and whole-aligner output is byte-identical (validated).
+        pairArray[ii].idr = 0;
+        pairArray[ii].idq = 0;
+        pairArray[ii].h0 = 0;
     }
 
 #if RDT
@@ -3707,6 +3747,14 @@ void kswv::kswvBatchWrapper16(SeqPair *pairArray,
         pairArray[ii].id = ii;
         pairArray[ii].len1 = 0;
         pairArray[ii].len2 = 0;
+        // The kernel's per-lane loop reads idr/idq/h0 for every lane up to
+        // SIMD_WIDTH, so it reads these padded lanes too; zero them (as id/len1/
+        // len2 above) to keep those reads well-defined. Padded lanes join the SIMD
+        // batch (and its cross-lane reductions), but the caller reads results back
+        // only for real lanes and whole-aligner output is byte-identical (validated).
+        pairArray[ii].idr = 0;
+        pairArray[ii].idq = 0;
+        pairArray[ii].h0 = 0;
     }
 
 #if RDT
