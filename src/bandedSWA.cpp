@@ -665,6 +665,11 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
         // read is well-defined and the hint lands at seqBuf offset 0 (in-bounds).
         pairArray[ii].idr = 0;
         pairArray[ii].idq = 0;
+        // The per-lane seed loop below reads h0 for padded lanes (index >= numPairs);
+        // keep it defined. Padded lanes join the SIMD batch (and its cross-lane
+        // reductions), but the caller reads results back only for real lanes and
+        // whole-aligner output is byte-identical (validated across all tiers).
+        pairArray[ii].h0 = 0;
     }
 
 #if RDT
@@ -1670,6 +1675,11 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
         pairArray[ii].len2 = 0;
         pairArray[ii].idr = 0;
         pairArray[ii].idq = 0;
+        // The per-lane seed loop below reads h0 for padded lanes (index >= numPairs);
+        // keep it defined. Padded lanes join the SIMD batch (and its cross-lane
+        // reductions), but the caller reads results back only for real lanes and
+        // whole-aligner output is byte-identical (validated across all tiers).
+        pairArray[ii].h0 = 0;
     }
 
 #if RDT 
@@ -2577,6 +2587,11 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
         pairArray[ii].len2 = 0;
         pairArray[ii].idr = 0;
         pairArray[ii].idq = 0;
+        // The per-lane seed loop below reads h0 for padded lanes (index >= numPairs);
+        // keep it defined. Padded lanes join the SIMD batch (and its cross-lane
+        // reductions), but the caller reads results back only for real lanes and
+        // whole-aligner output is byte-identical (validated across all tiers).
+        pairArray[ii].h0 = 0;
     }
 
 #if RDT
@@ -3542,6 +3557,11 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
         pairArray[ii].len2 = 0;
         pairArray[ii].idr = 0;
         pairArray[ii].idq = 0;
+        // The per-lane seed loop below reads h0 for padded lanes (index >= numPairs);
+        // keep it defined. Padded lanes join the SIMD batch (and its cross-lane
+        // reductions), but the caller reads results back only for real lanes and
+        // whole-aligner output is byte-identical (validated across all tiers).
+        pairArray[ii].h0 = 0;
     }
 
 #if RDT
@@ -4506,6 +4526,11 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
         pairArray[ii].len2 = 0;
         pairArray[ii].idr = 0;
         pairArray[ii].idq = 0;
+        // The per-lane seed loop below reads h0 for padded lanes (index >= numPairs);
+        // keep it defined. Padded lanes join the SIMD batch (and its cross-lane
+        // reductions), but the caller reads results back only for real lanes and
+        // whole-aligner output is byte-identical (validated across all tiers).
+        pairArray[ii].h0 = 0;
     }
 
 #if RDT
@@ -5525,6 +5550,11 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
         // loops. Byte-identical: padded lanes contribute nothing to output.
         pairArray[ii].idr = 0;
         pairArray[ii].idq = 0;
+        // The per-lane seed loop below reads h0 for padded lanes (index >= numPairs);
+        // keep it defined. Padded lanes join the SIMD batch (and its cross-lane
+        // reductions), but the caller reads results back only for real lanes and
+        // whole-aligner output is byte-identical (validated across all tiers).
+        pairArray[ii].h0 = 0;
     }
 
 #if RDT
