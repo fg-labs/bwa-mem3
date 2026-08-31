@@ -92,9 +92,16 @@ read_memo_result read_memo_prepass(const mem_opt_t *opt, const bseq1_t *seqs,
 void read_memo_controller_observe(const read_memo_result &r, uint64_t align_ns,
                                   bool armed);
 
-/* Current controller decision for the memoize path (Phase 2 will gate on this):
+/* Current controller decision for the memoize path:
  * READMEMO_ON while auto is latched-on or mode==on; READMEMO_OFF otherwise. */
 int read_memo_active(void);
+
+/* Diagnostic: BWAMEM3_DEDUP_READS_VERIFY=1 makes the armed path align DUP pairs
+ * NORMALLY (no compaction) and, instead of copying, COMPARE each duplicate's
+ * independently-computed regs against its representative's field-by-field --
+ * i.e. it executes the position-invariance claim on real data. Non-zero only
+ * when the env knob is set; production runs it off. Returns 1 if set. */
+int read_memo_verify(void);
 
 /* Test-only: reset the process-global controller + stats to their initial
  * (unlatched, MEASURING) state so a unit test does not depend on prior state or

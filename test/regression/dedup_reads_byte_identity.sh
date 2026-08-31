@@ -94,6 +94,18 @@ fin=$(awk -F'final=' '{split($2, a, " "); print a[1]}' <<< "$stats")
 [[ "$fin" == "ON" ]] || fail "on-mode did not engage the memoize path (final=$fin)"
 ok "memoize path exercised (${dup} duplicate pairs, final=ON)"
 
+# Invariance instrument: BWAMEM3_DEDUP_READS_VERIFY aligns duplicates NORMALLY
+# and asserts each one's regs equal its representative's, field-by-field
+# (err_fatal on any divergence -> nonzero exit). This executes the
+# position-invariance claim the copy path relies on, on real alignments. Output
+# must still equal off (duplicates use their own regs; the copy is replaced by a
+# compare).
+BWAMEM3_DEDUP_READS_VERIFY=1 "$BWA_MEM3" mem --dedup-reads on -t 4 "$W/phix.fa" \
+    "$W/dup_1.fq" "$W/dup_2.fq" 2> "$W/verify.err" | grep -v '^@PG' > "$W/verify.sam" \
+    || fail "VERIFY run reported a regs-invariance divergence: $(tail -1 "$W/verify.err")"
+cmp "$W/off_dup_t4.sam" "$W/verify.sam" || fail "VERIFY output != off"
+ok "regs-invariance VERIFY holds (duplicate regs == representative regs)"
+
 # CLI validation: a bad value and an explicit-but-empty value are both fatal
 # (the empty form must NOT silently inherit the env), and usage advertises the
 # flag. Mirrors dedup_byte_identity.sh's --dedup checks.

@@ -3166,7 +3166,9 @@ static void worker_bwt_memo(worker_t *w, int seq_id, int batch_size, int tid)
 static void worker_bwt(void *data, int seq_id, int batch_size, int tid)
 {
     worker_t *w = (worker_t*) data;
-    if (w->memo) { worker_bwt_memo(w, seq_id, batch_size, tid); return; }
+    /* Armed: compact to REP-only. VERIFY suppresses the compaction so DUP pairs
+     * align normally and worker_copy_regs can compare instead of copy. */
+    if (w->memo && !read_memo_verify()) { worker_bwt_memo(w, seq_id, batch_size, tid); return; }
     printf_(VER, "4. Calling mem_kernel1_core..%d %d\n", seq_id, tid);
 
     /* One fixed-size window per thread. The old code additionally granted the
@@ -3259,22 +3261,65 @@ static inline void read_memo_copy_regs(mem_alnreg_v *dst, const mem_alnreg_v *sr
     dst->n = dst->m = (size_t) n;
 }
 
+/* [dedup-reads] VERIFY (BWAMEM3_DEDUP_READS_VERIFY): the first mem_alnreg_t field
+ * that differs between a duplicate's own regs and its representative's, or NULL
+ * if identical. Excludes ->c (dangling, NULL'd at kernel2 exit) and ->hash (set
+ * per-read later in the SAM stage); everything else is the position-invariant
+ * payload the memo copies. */
+static const char *read_memo_alnreg_field_diff(const mem_alnreg_t *a, const mem_alnreg_t *b)
+{
+#define RM_D(f) do { if ((a)->f != (b)->f) return #f; } while (0)
+    RM_D(rb); RM_D(re); RM_D(qb); RM_D(qe); RM_D(rid);
+    RM_D(score); RM_D(truesc); RM_D(sub); RM_D(alt_sc); RM_D(csub); RM_D(sub_n);
+    RM_D(w); RM_D(seedcov); RM_D(secondary); RM_D(secondary_all);
+    RM_D(seedlen0); RM_D(chain_n_hits); RM_D(frac_rep); RM_D(flg);
+    RM_D(meth_hypothesis); RM_D(meth_strand_hyp);
+#undef RM_D
+    if (a->n_comp != b->n_comp) return "n_comp";
+    if (a->is_alt != b->is_alt) return "is_alt";
+    return NULL;
+}
+
+/* [dedup-reads] VERIFY: assert a duplicate read's independently-computed regs
+ * equal its representative's (the position-invariance claim, on real data). */
+static void read_memo_verify_regs(const mem_alnreg_v *dup, const mem_alnreg_v *rep, int read_idx)
+{
+    if (dup->n != rep->n)
+        err_fatal(__func__, "dedup-reads VERIFY: read %d has n=%zu but its representative has n=%zu",
+                  read_idx, dup->n, rep->n);
+    for (size_t i = 0; i < dup->n; ++i) {
+        const char *f = read_memo_alnreg_field_diff(&dup->a[i], &rep->a[i]);
+        if (f)
+            err_fatal(__func__, "dedup-reads VERIFY: read %d alnreg %zu field '%s' diverges from its representative",
+                      read_idx, i, f);
+    }
+}
+
 /* [dedup-reads] Phase 2 copy pass: for each DUP pair in this work item, replicate
  * its representative pair's post-extension regs (both mates). Runs as its own
  * kt_for after worker_bwt_aln (all REP regs are final) and strictly before either
  * mem_pestat site, so pairing/MAPQ see the same regs the DUP would have computed.
  * Each DUP read is written by exactly one work item and a REP is never a DUP, so
- * there are no write/write or read/write conflicts across threads. */
+ * there are no write/write or read/write conflicts across threads.
+ *
+ * Under VERIFY the DUP pairs were aligned normally (worker_bwt did not compact),
+ * so instead of copying we compare each DUP's own regs to the REP's. */
 static void worker_copy_regs(void *data, int seq_id, int batch_size, int tid)
 {
     worker_t *w = (worker_t*) data;
     const read_memo_state *memo = w->memo;
+    const int verify = read_memo_verify();
     for (int l = 0; l < batch_size; l += 2) {
         const int gr = seq_id + l;                 /* global read index (pair R1) */
         if (memo->role[gr >> 1] != READ_MEMO_ROLE_DUP) continue;
         const int rep_r1 = (int) memo->rep_pair[gr >> 1] << 1;
-        read_memo_copy_regs(&w->regs[gr],     &w->regs[rep_r1]);
-        read_memo_copy_regs(&w->regs[gr + 1], &w->regs[rep_r1 + 1]);
+        if (verify) {
+            read_memo_verify_regs(&w->regs[gr],     &w->regs[rep_r1],     gr);
+            read_memo_verify_regs(&w->regs[gr + 1], &w->regs[rep_r1 + 1], gr + 1);
+        } else {
+            read_memo_copy_regs(&w->regs[gr],     &w->regs[rep_r1]);
+            read_memo_copy_regs(&w->regs[gr + 1], &w->regs[rep_r1 + 1]);
+        }
     }
     (void) tid;
 }

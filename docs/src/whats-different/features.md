@@ -274,6 +274,11 @@ knobs tune the `auto` controller (env-only, full-string parsed, malformed values
 fatal): `BWAMEM3_DEDUP_READS` (override the mode), `BWAMEM3_DEDUP_READS_Z` (z-score
 latch threshold, > 0; reversing a latch needs `+ 1`), and
 `BWAMEM3_DEDUP_READS_REPROBE` (re-probe cadence in read-pairs; `0` disables).
+`BWAMEM3_DEDUP_READS_STATS=1` dumps the duplicate rate and final latch state at
+exit. `BWAMEM3_DEDUP_READS_VERIFY=1` is a correctness diagnostic: it aligns
+duplicate pairs normally (no work is skipped) and asserts each duplicate's
+alignment regions match its representative's field-by-field, aborting on any
+divergence — the position-invariance guarantee, checked on real data.
 
 ## `--min-ext-len` short-seed extension filter
 
