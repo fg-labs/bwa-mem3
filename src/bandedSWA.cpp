@@ -659,6 +659,12 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
         pairArray[ii].id = ii;
         pairArray[ii].len1 = 0;
         pairArray[ii].len2 = 0;
+        // The i+j+PFD look-ahead prefetch below is bounded by roundNumPairs and so
+        // reads a padded lane's idr/idq to form its (hint-only) prefetch address;
+        // zero them here -- as every other tier that prefetches does -- so that
+        // read is well-defined and the hint lands at seqBuf offset 0 (in-bounds).
+        pairArray[ii].idr = 0;
+        pairArray[ii].idq = 0;
     }
 
 #if RDT
