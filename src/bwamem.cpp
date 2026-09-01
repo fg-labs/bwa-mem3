@@ -3314,6 +3314,10 @@ static inline void read_memo_copy_regs(mem_alnreg_v *dst, const mem_alnreg_v *sr
         dst->a = NULL;
     }
     dst->n = dst->m = (size_t) n;
+    /* --extend-csub side channel: the dropped-chain weight rides the vector, not
+     * the regions, so it must be copied too or a DUP loses its csub seed and
+     * --dedup-reads on/off stop being byte-identical under --extend-csub. */
+    dst->capped_w = src->capped_w;
 }
 
 /* [dedup-reads] VERIFY (BWAMEM3_DEDUP_READS_VERIFY): the first mem_alnreg_t field
@@ -3342,6 +3346,9 @@ static void read_memo_verify_regs(const mem_alnreg_v *dup, const mem_alnreg_v *r
     if (dup->n != rep->n)
         err_fatal(__func__, "dedup-reads VERIFY: read %d has n=%zu but its representative has n=%zu",
                   read_idx, dup->n, rep->n);
+    if (dup->capped_w != rep->capped_w)
+        err_fatal(__func__, "dedup-reads VERIFY: read %d has capped_w=%d but its representative has capped_w=%d",
+                  read_idx, dup->capped_w, rep->capped_w);
     for (size_t i = 0; i < dup->n; ++i) {
         const char *f = read_memo_alnreg_field_diff(&dup->a[i], &rep->a[i]);
         if (f)
@@ -3845,10 +3852,11 @@ int mem_mark_primary_se(const mem_opt_t *opt, int n, mem_alnreg_t *a, int64_t id
 /* --extend-csub: seed each PRIMARY region's csub with a calibrated estimate of the
  * best chain the cap/gate dropped before extension, so MAPQ (which reads
  * max(sub, csub)) reflects the pruned competitor instead of inflating. The estimate
- * scales the dropped chain's covered bases by THIS region's observed per-base score
- * rate (never the all-match upper bound weight*a), and is clamped strictly below the
- * region's own score, so it lowers MAPQ proportionally rather than forcing it to 0
- * (the naive weight*a version tripped `sub >= score -> return 0`, which the PE MAPQ
+ * scales the dropped chain's weight by the all-match rate (weight*a; the PE path in
+ * mem_capped_pair_subo deliberately uses the observed per-base rate instead, since a
+ * pair score sums two estimates), and is clamped strictly below the region's own
+ * score, so it lowers MAPQ proportionally rather than forcing it to 0 (the UNCLAMPED
+ * weight*a version tripped `sub >= score -> return 0`, which the PE MAPQ
  * recombination then turned into spurious promotions). No-op when nothing was
  * dropped (capped_w == 0), so --extend-csub off is byte-identical. */
 void mem_seed_capped_csub(mem_alnreg_v *a, int match_a)
