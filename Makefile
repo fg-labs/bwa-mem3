@@ -156,14 +156,32 @@ endif
 # AddressSanitizer support for catching kswv rowMax / SIMD store overruns
 # in regression tests (e.g. kswv_nrow_zero_test). Opt-in with `make ASAN=1 ...`
 # Forces USE_MIMALLOC off: mimalloc's malloc override interposes before asan
-# and the two can't coexist cleanly. Must be set before the mimalloc block so
-# USE_MIMALLOC=0 actually takes effect there. CXXFLAGS picks up $(ASAN_FLAGS)
+# and the two can't coexist cleanly. Uses `override` so an explicit
+# `USE_MIMALLOC=1` on the command line cannot re-enable the incompatible
+# allocator under the sanitizer. CXXFLAGS picks up $(ASAN_FLAGS)
 # unconditionally later in the file; it stays empty when ASAN is unset.
 ifneq ($(strip $(ASAN)),)
-    USE_MIMALLOC = 0
+    override USE_MIMALLOC = 0
     ASAN_FLAGS   = -fsanitize=address -fno-omit-frame-pointer -O1
     LDFLAGS     += -fsanitize=address
     CFLAGS      += $(ASAN_FLAGS)
+endif
+
+# MemorySanitizer support for catching uninitialized reads, specifically the
+# padded-lane input fields the SW kernels read back (see
+# kernel_padded_lane_uninit_test). Opt-in with `make MSAN=1 ...`. MSan is a
+# clang-only instrumentation; it forces USE_MIMALLOC off via `override` (mimalloc's
+# malloc override interposes before the sanitizer runtime, and `override` keeps a
+# command-line USE_MIMALLOC=1 from re-enabling it) and reuses the ASAN_FLAGS
+# slot so the flags reach CXXFLAGS/CFLAGS/the test link lines unconditionally.
+# ASAN and MSAN are mutually exclusive; ASAN wins if both are set.
+ifneq ($(strip $(MSAN)),)
+ifeq ($(strip $(ASAN)),)
+    override USE_MIMALLOC = 0
+    ASAN_FLAGS   = -fsanitize=memory -fsanitize-memory-track-origins=2 -fno-omit-frame-pointer -O1
+    LDFLAGS     += -fsanitize=memory
+    CFLAGS      += $(ASAN_FLAGS)
+endif
 endif
 
 # TESTING_BUILD=1 defines BWAMEM3_TESTING which enables test-only injection
@@ -458,7 +476,8 @@ STANDALONE_TESTS = kswv_nrow_zero_test kswv_freed_cell_test \
                    bandedswa_padding_test bandedswa_highzdrop_seed_test \
                    bandedswa_high_h0_zdrop_test shm_section_find_test \
                    shm_pack_round_trip_test shm_lock_destroy_test \
-                   kt_for_pool_test bns_zero_calloc_test
+                   kt_for_pool_test bns_zero_calloc_test \
+                   kernel_padded_lane_uninit_test
 STANDALONE_TEST_OBJS = $(STANDALONE_TESTS:%=test/%.o)
 
 # shm_pack_round_trip_test is excluded from `test:` because it runs via
@@ -829,6 +848,18 @@ src/bandedSWA.native.o: src/bandedSWA.cpp
 bandedswa_padding_test: $(BWA_LIB) $(HTS_LIB) src/bandedSWA.native.o test/bandedswa_padding_test.o
 	$(CXX) $(BASE_CXXFLAGS) -march=native $(LDFLAGS) test/bandedswa_padding_test.o src/bandedSWA.native.o $(BWA_LIB) $(LIBS) -o $@
 
+# Uninitialized-padded-lane gate for the banded-SW kernels
+# (BandedPairWiseSW::getScores8/16). Meaningful under MemorySanitizer
+# (`make MSAN=1 kernel_padded_lane_uninit_test`) or Valgrind memcheck: it hands
+# the kernels a RAW-malloc'd (never value-initialized) pair array so the padding
+# lanes are genuinely uninitialized, and any tier that reads a padded-lane field
+# it did not first write is reported as a use of an uninitialized value. Links
+# the native-tier bandedSWA object so the host's widest getScores8/16 wrappers
+# are the ones exercised. (The kswv counterpart is a follow-up -- see the test's
+# header comment -- so this recipe links bandedSWA only.)
+kernel_padded_lane_uninit_test: $(BWA_LIB) $(HTS_LIB) src/bandedSWA.native.o test/kernel_padded_lane_uninit_test.o
+	$(CXX) $(BASE_CXXFLAGS) -march=native $(LDFLAGS) test/kernel_padded_lane_uninit_test.o src/bandedSWA.native.o $(BWA_LIB) $(LIBS) -o $@
+
 # Unsigned h0-prefix seed regression: getScores8 vs scalar at zdrop > 126 with
 # seed prefix bytes > 127 (the range the old signed seed could not represent).
 bandedswa_highzdrop_seed_test: $(BWA_LIB) $(HTS_LIB) src/bandedSWA.native.o test/bandedswa_highzdrop_seed_test.o
@@ -1038,6 +1069,15 @@ test/bandedswa_highzdrop_seed_test.o: test/bandedswa_highzdrop_seed_test.cpp
 	$(CXX) -c $(BASE_CXXFLAGS) -march=native $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
 
 test/bandedswa_high_h0_zdrop_test.o: test/bandedswa_high_h0_zdrop_test.cpp
+	$(CXX) -c $(BASE_CXXFLAGS) -march=native $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
+
+# Must be built -march=native like its sibling banded-SW tests: it links against
+# src/bandedSWA.native.o (host SIMD widths), and getScores8/16 write padding
+# lanes sized by SIMD_WIDTH8/16. The generic .cpp.o rule would compile this TU at
+# the baseline (SSE4.1, width 16), so on an AVX2/AVX-512 host the native kernel
+# would write padding beyond the test's baseline-sized allocation -- an OOB
+# access. Compiling the test at -march=native keeps its widths in lockstep.
+test/kernel_padded_lane_uninit_test.o: test/kernel_padded_lane_uninit_test.cpp
 	$(CXX) -c $(BASE_CXXFLAGS) -march=native $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
 
 test/shm_section_find_test.o: test/shm_section_find_test.cpp
