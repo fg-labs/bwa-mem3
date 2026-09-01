@@ -2560,7 +2560,15 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
     {
         pairArray[ii].id = ii;
         pairArray[ii].len1 = 0;
-        pairArray[ii].len2 = pairArray[numPairs - 1].len2;
+        // Zero len2 to honor the getScores8 padding-lane contract (bandedSWA.h),
+        // matching every other tier. This lone wrapper previously copied
+        // pairArray[numPairs - 1].len2 instead. It is byte-identical: the copied
+        // value is the last real pair's query length, and numPairs - 1 is itself
+        // a real lane in this same final partial group, so the cross-lane maxLen2
+        // the group's DP column count derives from is unchanged either way. The
+        // copy left the padded lane packing len2 real (dummy-destined) query bytes
+        // for no benefit; zero makes the padded query empty, as the contract says.
+        pairArray[ii].len2 = 0;
         pairArray[ii].idr = 0;
         pairArray[ii].idq = 0;
     }
