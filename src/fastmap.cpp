@@ -46,6 +46,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #  include <cstdint>
 #endif
 #include "fastmap.h"
+#include "read_memo.h"
 #include "FMI_search.h"
 #include "bam_writer.h"
 #include "meth_bam.h"
@@ -290,6 +291,8 @@ void worker_alloc(const mem_opt_t *opt, worker_t &w, int32_t nreads, int32_t nth
 
     /* Mem allocation section for core kernels */
     w.regs = NULL; w.chain_scratch = NULL; w.seed_scratch = NULL;
+    w.memo = NULL;   /* [dedup-reads] armed per-chunk by mem_process_seqs when the
+                      * controller latches ON; NULL elsewhere (unarmed = no memo) */
 
     /* regs is genuinely chunk-lifetime, and the only nreads-sized allocation
      * left here: it is filled by the align pass, read by mem_pestat, and
@@ -1563,6 +1566,7 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "    -c INT        skip seeds with more than INT occurrences [%d]\n", opt->max_occ);
     fprintf(stderr, "    --smem-dedup  dedup identical SMEMs before chaining: fewer SA lookups, ~10%% fewer; opt-in, NOT byte-identical (changes XS/secondary on a small fraction of reads) [off]\n");
     fprintf(stderr, "    --dedup STR   extension-DP job dedup: 'off', 'on' (dedup identical jobs within each batch), or 'auto' (measure net benefit at runtime, latch, and periodically re-probe); alignment records byte-identical in every mode (@PG excluded, it embeds argv) [auto]\n");
+    fprintf(stderr, "    --dedup-reads STR  whole-read-pair memoization: 'off', 'on', or 'auto' (measure the duplicate rate and net benefit at runtime, latch, and periodically re-probe); aligns once per distinct pair within a chunk and replays the per-read SAM stage, so alignment records are byte-identical in every mode. Benefits amplicon/UMI panels with PCR duplicates; ~no effect on WGS/exome [auto]\n");
     fprintf(stderr, "    --huge-pages  back the index with 1 GB huge pages via mimalloc when the host has enough free 1 GB pages reserved; cuts dTLB misses in seeding; Linux only, alignment records byte-identical (only @PG CL differs, recording the flag), safe no-op otherwise [off]\n");
     fprintf(stderr, "    --skip-contained-ext  skip banded-SW extension of seeds contained (same diagonal) in a longer in-chain seed; byte-identical on short/medium non-meth reads (NOT on kilobase-scale long reads); no effect under --meth [off]\n");
     fprintf(stderr, "    --max-extend-chains INT  cap chains extended per read to the top-INT by weight; ~23%% less alignment CPU, high-confidence placement unaffected; ignored for reads with >4096 chains; opt-in, NOT byte-identical (0 = off) [%d]\n", opt->max_extend_chains);
@@ -1979,6 +1983,7 @@ int main_mem(int argc, char *argv[])
         OPT_PROFILE,
 #endif
         OPT_DEDUP,
+        OPT_DEDUP_READS,
         OPT_HELP,
     };
     static struct option long_opts[] = {
@@ -1987,6 +1992,7 @@ int main_mem(int argc, char *argv[])
         {"max-extend-chains",        required_argument, 0, OPT_MAX_EXTEND_CHAINS},
         {"smem-dedup",               no_argument,       0, OPT_SMEM_DEDUP},
         {"dedup",                    required_argument, 0, OPT_DEDUP},
+        {"dedup-reads",              required_argument, 0, OPT_DEDUP_READS},
         {"fast",                     no_argument,       0, OPT_FAST},
         {"huge-pages",               no_argument,       0, OPT_HUGE_PAGES},
         {"skip-contained-ext",       no_argument,       0, OPT_SKIP_CONTAINED_EXT},
@@ -2022,6 +2028,7 @@ int main_mem(int argc, char *argv[])
     const char *profile_path = NULL;   /* --profile <path>: stage_prof TSV output */
 #endif
     const char *dedup_mode_arg = NULL; /* --dedup <off|on|auto>; resolved via mem_dedup_configure after getopt */
+    const char *dedup_reads_mode_arg = NULL; /* --dedup-reads <off|on|auto>; resolved via mem_dedup_reads_configure after getopt */
     while ((c = getopt_long(argc, argv, "51qpaMCSPVYjuk:c:v:s:r:t:R:A:B:O:E:U:w:L:d:T:Q:D:m:I:N:W:x:G:h:y:K:X:H:o:f:z:",
                             long_opts, NULL)) >= 0)
     {
@@ -2306,6 +2313,18 @@ int main_mem(int argc, char *argv[])
             }
             dedup_mode_arg = optarg;
         }
+        else if (c == OPT_DEDUP_READS) {
+            /* Reject an explicit-but-empty CLI value, same as --dedup: an empty
+             * mode_arg reads as "no CLI value" in mem_dedup_reads_configure() and
+             * would silently inherit BWAMEM3_DEDUP_READS instead of being fatal. */
+            if (!*optarg) {
+                fprintf(stderr, "ERROR: --dedup-reads: expected off|on|auto, got empty value\n");
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+            dedup_reads_mode_arg = optarg;
+        }
         else if (c == OPT_FAST) fast = 1;
         else if (c == OPT_HUGE_PAGES) want_huge_pages = 1;
         else if (c == OPT_PROPER_PAIR_FROM_EMITTED) opt->proper_pair_from_emitted = 1;
@@ -2475,6 +2494,7 @@ int main_mem(int argc, char *argv[])
 
     if (opt->n_threads < 1) opt->n_threads = 1;
     mem_dedup_configure(dedup_mode_arg);   /* --dedup CLI > env BWAMEM3_DEDUP > default 'auto'; fatal on bad value */
+    mem_dedup_reads_configure(dedup_reads_mode_arg); /* --dedup-reads CLI > env BWAMEM3_DEDUP_READS > default 'auto'; fatal on bad value */
     /* A stray word on the command line slides silently into a positional slot.
      * Two spellings invite it:
      *   --meth taps        (optional argument: getopt_long only binds it with '=')

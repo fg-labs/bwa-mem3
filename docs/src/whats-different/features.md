@@ -238,6 +238,48 @@ non-numeric junk (`2x`, `12M`) is rejected rather than accepted as a numeric pre
 - `BWAMEM3_DEDUP_REPROBE` — re-probe cadence in jobs (a non-negative integer;
   `0` disables re-probing).
 
+## `--dedup-reads` whole-read-pair memoization
+
+`--dedup-reads STR` aligns each **distinct read-pair** once within a chunk and
+reuses the result for byte-identical duplicate pairs, instead of running the full
+seed → chain → extend pipeline on every duplicate. Where `--dedup` collapses
+identical *extension jobs* (a fine-grained slice), this collapses identical whole
+*read-pairs* (a coarse slice) — useful on high-duplication library preps such as
+amplicon/UMI panels, and near-inert on WGS/exome where exact-duplicate pairs are
+rare. Like `--dedup`, it preserves **byte-identical alignment records in every
+mode**: a duplicate replays the per-read SAM stage (pairing, MAPQ, tie-break,
+QNAME/QUAL) over the representative's alignment, so nothing position-dependent is
+copied. This is a by-construction invariant, verified by an in-repo regression
+(`test/regression/dedup_reads_byte_identity.sh`) that asserts `off`==`on`==`auto`
+on dup-rich, low-dup, and N+lowercase phix-derived PE reads, single- and
+multi-threaded, on one host/binary — not a cross-host or cross-tier measurement.
+It accepts three values:
+
+- `off` — always align every pair (the pre-feature behavior).
+- `on` — always memoize identical pairs within a chunk.
+- `auto` — **the default**: measure the duplicate rate and the net benefit at
+  runtime (align work avoided versus fingerprint/copy overhead), latch ON or OFF
+  from the measured sign, and periodically re-probe. Alignment records stay
+  byte-identical either way.
+
+The dedup window is one align invocation (the `-K` chunk): duplicates are
+collapsed within a chunk only, because the alignment result depends on chunk-scoped
+insert-size state (`mem_pestat`) that is constant within a chunk but varies across
+chunks — so cross-chunk reuse would not be byte-identical.
+
+Any value other than `off`/`on`/`auto` — including an empty `--dedup-reads=` — is
+rejected with a non-zero exit; there is no silent fallback. An explicit
+`--dedup-reads` value takes precedence over `BWAMEM3_DEDUP_READS`. Three expert env
+knobs tune the `auto` controller (env-only, full-string parsed, malformed values
+fatal): `BWAMEM3_DEDUP_READS` (override the mode), `BWAMEM3_DEDUP_READS_Z` (z-score
+latch threshold, > 0; reversing a latch needs `+ 1`), and
+`BWAMEM3_DEDUP_READS_REPROBE` (re-probe cadence in read-pairs; `0` disables).
+`BWAMEM3_DEDUP_READS_STATS=1` dumps the duplicate rate and final latch state at
+exit. `BWAMEM3_DEDUP_READS_VERIFY=1` is a correctness diagnostic: it aligns
+duplicate pairs normally (no work is skipped) and asserts each duplicate's
+alignment regions match its representative's field-by-field, aborting on any
+divergence — the position-invariance guarantee, checked on real data.
+
 ## `--min-ext-len` short-seed extension filter
 
 `--min-ext-len INT` opts into skipping banded Smith-Waterman extension of short
@@ -418,6 +460,7 @@ exact full-width ladder (the certificate is a non-meth optimization).
 | `--bam=LEVEL` direct BAM output | [#12](https://github.com/fg-labs/bwa-mem3/pull/12) | — | fork-only |
 | `--smem-dedup` SMEM deduplication | [#187](https://github.com/fg-labs/bwa-mem3/pull/187) | — | fork-only (opt-in, not byte-identical) |
 | `--dedup` extension-DP job deduplication | [#415](https://github.com/fg-labs/bwa-mem3/pull/415) | — | fork-only (on by default via `auto`; alignment records byte-identical in every mode; headers excluded) |
+| `--dedup-reads` whole-read-pair memoization | [#433](https://github.com/fg-labs/bwa-mem3/pull/433) | — | fork-only (on by default via `auto`; alignment records byte-identical in every mode; collapses duplicate read-pairs within a `-K` chunk) |
 | `--min-ext-len` short-seed extension filter | _pending_ | — | fork-only (opt-in, off by default) |
 | `--seed-order` seed reordering | [#186](https://github.com/fg-labs/bwa-mem3/pull/186) | — | fork-only (opt-in, off by default) |
 | `--skip-contained-ext` contained-seed extension skip | [#192](https://github.com/fg-labs/bwa-mem3/pull/192) | — | fork-only (opt-in, byte-identical on short/medium non-meth reads, **not** byte-identical on kilobase-scale long reads, no-op under --meth) |

@@ -29,6 +29,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 *****************************************************************************************/
 
 #include "bwamem.h"
+#include "read_memo.h"     /* --dedup-reads whole-read-pair memoization (Phase 1: measure-only) */
 #include "meth_xm.h"   /* meth_chem_t for the --meth chemistry default */
 #include "FMI_search.h"
 #include "smem_dedup.h"
@@ -3101,10 +3102,73 @@ static void worker_aln(void *data, int seq_id, int batch_size, int tid)
 }
 
 
+/* [dedup-reads] Phase 2 seed/chain stage for a work item when the memo is armed:
+ * run kernel1 on the REP pairs only, then scatter each REP's chains back to its
+ * original slot and leave DUP slots empty. Kernel2 (worker_aln) then runs
+ * UNMODIFIED over the original view -- a DUP's empty chains yield empty regs,
+ * which read_memo_copy_regs later overwrites with the REP's. The work item
+ * [seq_id, seq_id+batch_size) is pair-aligned (kt_for splits on the even
+ * BATCH_SIZE and the PE tail is even), so whole pairs move as a unit and
+ * kernel1's l^1 mate-concordant cap still pairs mates correctly. */
+static void worker_bwt_memo(worker_t *w, int seq_id, int batch_size, int tid)
+{
+    const read_memo_state *memo = w->memo;
+    bseq1_t     *seqs = w->seqs + seq_id;
+    mem_chain_v *cw   = w->chain_scratch + (size_t) tid * BATCH_SIZE;
+
+    /* D1: kernel1 converts bases ASCII->2-bit in place, but DUP reads skip
+     * kernel1 -- so convert EVERY read here (idempotent, guarded on seq[i] < 4)
+     * so worker_sam sees 2-bit bases for the DUPs too; REPs re-convert harmlessly
+     * inside kernel1. */
+    for (int l = 0; l < batch_size; ++l) {
+        char *s = seqs[l].seq;
+        const int len = seqs[l].l_seq;
+        for (int i = 0; i < len; ++i)
+            s[i] = s[i] < 4 ? s[i] : nst_nt4_table[(int) s[i]];
+    }
+
+    /* Compact REP pairs into a dense view (struct copies; seq/name/qual pointers
+     * shared). REPs preserve their relative order, so the j-th REP read maps to
+     * the j-th compacted slot. */
+    static thread_local bseq1_t compact[BATCH_SIZE];
+    int n_rep = 0;
+    for (int l = 0; l < batch_size; ++l)
+        if (memo->role[(seq_id + l) >> 1] == READ_MEMO_ROLE_REP)
+            compact[n_rep++] = seqs[l];
+
+    if (n_rep > 0)
+        mem_kernel1_core(w->fmi, w->opt, compact, n_rep, cw,
+                         w->seed_scratch + (size_t) tid * BATCH_SIZE * AVG_SEEDS_PER_READ,
+                         w->seed_scratch_size, &(w->mmc), tid,
+                         w->meth_orig_bns, w->meth_orig_pac);
+
+    /* Scatter cw[0..n_rep) back to the original slots. The j-th REP read sits at
+     * original index R[j] >= j, so a single descending pull (original slot l,
+     * compact cursor j) moves each REP's chains to its slot and empties every DUP
+     * slot, touching each slot exactly once with no aliasing / no double-free.
+     * mem_chain_seeds stamped each chain's seqid = its COMPACT index; kernel2
+     * asserts c->seqid == l and routes extension results to regs[seqid], so
+     * re-stamp seqid to the original slot after moving. */
+    int j = n_rep - 1;
+    for (int l = batch_size - 1; l >= 0; --l) {
+        if (memo->role[(seq_id + l) >> 1] == READ_MEMO_ROLE_REP) {
+            if (l != j) cw[l] = cw[j];
+            for (size_t k = 0; k < cw[l].n; ++k) cw[l].a[k].seqid = l;
+            --j;
+        } else {
+            kv_init(cw[l]);
+        }
+    }
+    xassert(j == -1, "read_memo: REP scatter cursor mismatch");
+}
+
 /* Kernel, called by threads */
 static void worker_bwt(void *data, int seq_id, int batch_size, int tid)
 {
     worker_t *w = (worker_t*) data;
+    /* Armed: compact to REP-only. VERIFY suppresses the compaction so DUP pairs
+     * align normally and worker_copy_regs can compare instead of copy. */
+    if (w->memo && !read_memo_verify()) { worker_bwt_memo(w, seq_id, batch_size, tid); return; }
     printf_(VER, "4. Calling mem_kernel1_core..%d %d\n", seq_id, tid);
 
     /* One fixed-size window per thread. The old code additionally granted the
@@ -3175,6 +3239,89 @@ static void worker_bwt_aln(void *data, int seq_id, int batch_size, int tid)
 {
     worker_bwt(data, seq_id, batch_size, tid);
     worker_aln(data, seq_id, batch_size, tid);
+}
+
+/* [dedup-reads] Phase 2: deep-copy one read's regs from its representative.
+ * mem_alnreg_t is POD (its only pointer, ->c, is dangling-by-design and NULL'd
+ * at kernel2 exit; ->hash is (re)stamped later per-read in the SAM stage), so a
+ * plain memcpy is a valid deep copy. Capacity m := n is fine -- the SAM stage's
+ * rescue kv_push appends realloc on n == m. Ownership matches worker_sam's
+ * free(w->regs[i].a): each DUP owns an independent allocation. */
+static inline void read_memo_copy_regs(mem_alnreg_v *dst, const mem_alnreg_v *src)
+{
+    free(dst->a);
+    const int n = (int) src->n;
+    if (n > 0) {
+        dst->a = (mem_alnreg_t *) malloc((size_t) n * sizeof(mem_alnreg_t));
+        xassert(dst->a != NULL, "read_memo: out of memory copying regs");
+        memcpy(dst->a, src->a, (size_t) n * sizeof(mem_alnreg_t));
+    } else {
+        dst->a = NULL;
+    }
+    dst->n = dst->m = (size_t) n;
+}
+
+/* [dedup-reads] VERIFY (BWAMEM3_DEDUP_READS_VERIFY): the first mem_alnreg_t field
+ * that differs between a duplicate's own regs and its representative's, or NULL
+ * if identical. Excludes ->c (dangling, NULL'd at kernel2 exit) and ->hash (set
+ * per-read later in the SAM stage); everything else is the position-invariant
+ * payload the memo copies. */
+static const char *read_memo_alnreg_field_diff(const mem_alnreg_t *a, const mem_alnreg_t *b)
+{
+#define RM_D(f) do { if ((a)->f != (b)->f) return #f; } while (0)
+    RM_D(rb); RM_D(re); RM_D(qb); RM_D(qe); RM_D(rid);
+    RM_D(score); RM_D(truesc); RM_D(sub); RM_D(alt_sc); RM_D(csub); RM_D(sub_n);
+    RM_D(w); RM_D(seedcov); RM_D(secondary); RM_D(secondary_all);
+    RM_D(seedlen0); RM_D(chain_n_hits); RM_D(frac_rep); RM_D(flg);
+    RM_D(meth_hypothesis); RM_D(meth_strand_hyp);
+#undef RM_D
+    if (a->n_comp != b->n_comp) return "n_comp";
+    if (a->is_alt != b->is_alt) return "is_alt";
+    return NULL;
+}
+
+/* [dedup-reads] VERIFY: assert a duplicate read's independently-computed regs
+ * equal its representative's (the position-invariance claim, on real data). */
+static void read_memo_verify_regs(const mem_alnreg_v *dup, const mem_alnreg_v *rep, int read_idx)
+{
+    if (dup->n != rep->n)
+        err_fatal(__func__, "dedup-reads VERIFY: read %d has n=%zu but its representative has n=%zu",
+                  read_idx, dup->n, rep->n);
+    for (size_t i = 0; i < dup->n; ++i) {
+        const char *f = read_memo_alnreg_field_diff(&dup->a[i], &rep->a[i]);
+        if (f)
+            err_fatal(__func__, "dedup-reads VERIFY: read %d alnreg %zu field '%s' diverges from its representative",
+                      read_idx, i, f);
+    }
+}
+
+/* [dedup-reads] Phase 2 copy pass: for each DUP pair in this work item, replicate
+ * its representative pair's post-extension regs (both mates). Runs as its own
+ * kt_for after worker_bwt_aln (all REP regs are final) and strictly before either
+ * mem_pestat site, so pairing/MAPQ see the same regs the DUP would have computed.
+ * Each DUP read is written by exactly one work item and a REP is never a DUP, so
+ * there are no write/write or read/write conflicts across threads.
+ *
+ * Under VERIFY the DUP pairs were aligned normally (worker_bwt did not compact),
+ * so instead of copying we compare each DUP's own regs to the REP's. */
+static void worker_copy_regs(void *data, int seq_id, int batch_size, int tid)
+{
+    worker_t *w = (worker_t*) data;
+    const read_memo_state *memo = w->memo;
+    const int verify = read_memo_verify();
+    for (int l = 0; l < batch_size; l += 2) {
+        const int gr = seq_id + l;                 /* global read index (pair R1) */
+        if (memo->role[gr >> 1] != READ_MEMO_ROLE_DUP) continue;
+        const int rep_r1 = (int) memo->rep_pair[gr >> 1] << 1;
+        if (verify) {
+            read_memo_verify_regs(&w->regs[gr],     &w->regs[rep_r1],     gr);
+            read_memo_verify_regs(&w->regs[gr + 1], &w->regs[rep_r1 + 1], gr + 1);
+        } else {
+            read_memo_copy_regs(&w->regs[gr],     &w->regs[rep_r1]);
+            read_memo_copy_regs(&w->regs[gr + 1], &w->regs[rep_r1 + 1]);
+        }
+    }
+    (void) tid;
 }
 
 static void worker_sam(void *data, int seqid, int batch_size, int tid)
@@ -3313,6 +3460,20 @@ void mem_align_cohort_slice(mem_opt_t *opt,
     w.seqs = seqs;
     w.regs = regs;
     w.n_processed = n_processed;
+    /* [dedup-reads] the cohort-slice align path is not memoized in this version
+     * (a DUP's representative can live in another slice, so the copy pass would
+     * have to run after all slices, before pestat in mem_pair_and_emit_cohort);
+     * keep it byte-identical by leaving the memo unarmed. Note it once under
+     * verbose so a --dedup-reads run on this path isn't silently un-accelerated. */
+    if (read_memo_mode() != READMEMO_OFF && (opt->flag & MEM_F_PE) && bwa_verbose >= 3) {
+        static bool warned = false;   /* serialized caller (pipeline step 1) */
+        if (!warned) {
+            warned = true;
+            fprintf(stderr, "[dedup-reads] cohort/multi-slice align path is not "
+                    "memoized in this build; --dedup-reads has no effect here\n");
+        }
+    }
+    w.memo = NULL;
 
     uint64_t tim = __rdtsc();
     kt_for(worker_bwt_aln, &w, n);
@@ -3401,6 +3562,40 @@ void mem_process_seqs(mem_opt_t *opt,
     //int n_ = (opt->flag & MEM_F_PE) ? n : n;   // this requires n%2==0
     int n_ = n;
 
+    /* [dedup-reads] Fingerprint this chunk's read-pairs and, when armed, align
+     * each distinct pair once and copy its regs to the duplicates. read_memo_should_arm
+     * returns the latch (auto/on) and, while auto is measuring, alternates the arm
+     * decision so the A/B controller gathers both armed and unarmed samples; the
+     * measured realized cost of this chunk (align + copy) is fed back below.
+     * PE + non-meth + even n only; the cohort-slice entry paths are not memoized
+     * in this version (they stay byte-identical, unarmed).
+     * EXIT GATE: a regression pinning `--dedup-reads off == on == auto == baseline`
+     * SAM byte-identity (compat_byte_identical.sh / cohort_slice_identity.sh
+     * style), plus the BWAMEM3_DEDUP_READS_VERIFY regs-invariance instrument. */
+    static read_memo_state g_readmemo_state = { 0, NULL, NULL, 0 };
+    read_memo_result rm_r; bool rm_measure = false, rm_arm = false;
+    /* VERIFY (BWAMEM3_DEDUP_READS_VERIFY) is a correctness instrument, not a
+     * memoization mode: it must run whenever the prepass can identify DUP pairs,
+     * independently of whether the memo is armed. Force the prepass on under
+     * VERIFY even in `off` mode (and in `auto` while latched OFF, where rm_arm
+     * stays false), so the regs-invariance check actually fires instead of
+     * silently doing nothing. */
+    const bool rm_verify = read_memo_verify();
+    if ((read_memo_mode() != READMEMO_OFF || rm_verify) && (opt->flag & MEM_F_PE)
+        && !opt->meth_mode && n_ > 0 && (n_ & 1) == 0) {
+        rm_r = read_memo_prepass(opt, seqs, n_, &g_readmemo_state);
+        rm_measure = true;
+        rm_arm = read_memo_should_arm(rm_r.dup_pairs) != 0;
+    }
+    /* Set w.memo (so the per-pair pass can find DUP/REP roles) when the memo is
+     * armed OR when VERIFY needs to compare unarmed DUP pairs. Under VERIFY the
+     * compaction in worker_bwt is suppressed, so DUP pairs are aligned normally
+     * and their independently-computed regs are compared to the representative's;
+     * real memo copying stays gated on rm_arm below. */
+    const bool rm_run_pairs = rm_arm || (rm_measure && rm_verify);
+    w.memo = rm_run_pairs ? &g_readmemo_state : NULL;
+    const auto rm_t0 = std::chrono::steady_clock::now();
+
     uint64_t tim = __rdtsc();
     fprintf(stderr, "[0000] 1. Calling kt_for - worker_bwt_aln (fused)\n");
 
@@ -3416,6 +3611,27 @@ void mem_process_seqs(mem_opt_t *opt,
      * mem_pestat's barrier below is unaffected and must stay. */
     kt_for(worker_bwt_aln, &w, n_); // SMEMs (+SAL) then BSW, fused
     tprof[WORKER10][0] += __rdtsc() - tim;
+    const uint64_t rm_align_ns = rm_measure
+        ? (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - rm_t0).count()
+        : 0;
+
+    /* [dedup-reads] Copy each DUP pair's regs from its representative. Runs after
+     * the (REP-only) align pass and strictly before pestat/pairing, so the
+     * inferred insert-size distribution and every downstream stage see the same
+     * regs a full alignment would have produced. Time it: the A/B controller
+     * charges this copy cost (plus the compaction folded into the align phase
+     * above) into the armed sample, so it never latches ON when the memo's own
+     * overhead exceeds the align work saved (e.g. cheap reads at a high dup rate). */
+    uint64_t rm_copy_ns = 0;
+    if (rm_arm) {
+        const auto rm_c0 = std::chrono::steady_clock::now();
+        kt_for(worker_copy_regs, &w, n_);
+        rm_copy_ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                         std::chrono::steady_clock::now() - rm_c0).count();
+    }
+    if (rm_measure)
+        read_memo_controller_observe(rm_r, rm_align_ns, rm_copy_ns, rm_arm);
 
 
     // PAIRED_END
@@ -3446,6 +3662,11 @@ void mem_process_seqs(mem_opt_t *opt,
 
     kt_for(worker_sam, &w,  n_);   // SAM
     tprof[WORKER20][0] += __rdtsc() - tim;
+
+    /* [dedup-reads] The memo points at g_readmemo_state, whose role[]/rep_pair[]
+     * describe THIS chunk only; clear it so it can never be reused by a later
+     * chunk or a different align entry path. */
+    w.memo = NULL;
 
     fprintf(stderr, "\t[0000][ M::%s] Processed %d reads in %.3f "
             "CPU sec, %.3f real sec\n",

@@ -826,6 +826,14 @@ jobs:
           DEDUP_WORK_DIR=/tmp/dedup-bytes \
           bash test/regression/dedup_byte_identity.sh
 
+      - name: byte-identity off==on==auto (whole-read-pair memoization)
+        if: matrix.canonical == true
+        run: |
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          DEDUP_READS_PHIX_FA="$GITHUB_WORKSPACE/test/fixtures/phix.fa" \
+          DEDUP_READS_WORK_DIR=/tmp/dedup-reads-bytes \
+          bash test/regression/dedup_reads_byte_identity.sh
+
       - name: --hic alias regression (byte-identical to -5SP)
         if: matrix.canonical == true
         run: |

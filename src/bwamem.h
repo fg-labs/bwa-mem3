@@ -524,6 +524,9 @@ typedef struct worker_t {
     const bntseq_t   *meth_orig_bns;
     const uint8_t    *meth_orig_pac;
     uint8_t          *meth_orig_ref_string;
+    /* [dedup-reads] per-chunk memoization state (Phase 2 consumer). NULL = no
+     * memoization; Phase 1 always leaves it NULL (measure-only). */
+    const struct read_memo_state *memo;
 } worker_t;
 
 /* D3 (--meth, PR-3) helpers. In --meth, this returns the ORIGINAL bns/pac/
