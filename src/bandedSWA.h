@@ -324,7 +324,8 @@ public:
      * (SIMD_WIDTH8 for getScores8, SIMD_WIDTH16 for getScores16 — tier
      * dependent, up to 64) and *writes* the trailing padding lanes
      * pairArray[numPairs .. roundup(numPairs, SIMD_WIDTH)) itself, setting
-     * their id and zeroing len1/len2/idr/idq. The caller MUST therefore allocate at
+     * their id and zeroing len1/len2/idr/idq/h0 on every tier (idr/idq handling
+     * is described below). The caller MUST therefore allocate at
      * least roundup(numPairs, SIMD_WIDTH) SeqPair slots, NOT just numPairs, or those
      * writes (and the SoA gather that reads len1/len2 back) run off the end of
      * the array. A caller that does not know the active tier should round up to
@@ -354,7 +355,18 @@ public:
      *   - Every getScores16 (and the 256-bit/512-bit 8-bit getScores8) bounds the
      *     prefetch to < roundNumPairs, so it reads padded lanes' idr/idq to form
      *     a prefetch address; its padding loop zeroes idr/idq so that read, and
-     *     the per-lane compute pointer, both land at seqBuf offset 0. */
+     *     the per-lane compute pointer, both land at seqBuf offset 0.
+     *
+     * The per-lane SoA seed loop likewise reads back each lane's h0 (the tail of
+     * a batch indexes padding lanes, since the inner loop spans a full SIMD_WIDTH);
+     * the padding loop zeroes h0 above for the same reason. A padded lane's result
+     * is never consumed -- every tier sets its len1 = 0 (so its DP body does no
+     * work) and the caller reads results back only for pairArray[0 .. numPairs).
+     * Padded lanes do still take part in the batch's cross-lane reductions (e.g.
+     * the all-lanes-done exit test), so the zeroing is not purely cosmetic; it is
+     * whole-aligner output that is byte-identical with vs. without it (validated
+     * across all SIMD tiers), and the zeroing keeps the padded-lane read well-
+     * defined for MemorySanitizer besides. */
     virtual void getScores8(SeqPair *pairArray,
                             uint8_t *seqBufRef,
                             uint8_t *seqBufQer,
