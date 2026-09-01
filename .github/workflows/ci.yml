@@ -1176,6 +1176,101 @@ jobs:
           fail_ci_if_error: false
           verbose: true
 
+  # MemorySanitizer gate for the batched banded-SW kernels' padded-lane
+  # initialization. The kernels round each batch up to a whole SIMD width and
+  # process the trailing padding lanes, reading their input fields back
+  # (idr/idq -> seq pointers; h0 -> the banded DP seed and the cross-lane
+  # all-lanes-done reduction). A tier that leaves one of those fields
+  # uninitialized reads indeterminate memory -- benign in output (proven
+  # byte-identical) but real UB. The in-tree tests build the batch with a
+  # std::vector, which value-initializes the padding to 0, so they cannot see
+  # it; this gate hands the kernels a raw-malloc'd (genuinely uninitialized)
+  # pair array and runs under MSan, which reports any padded-lane read the
+  # kernel did not first write. It is the automated form of the manual review
+  # that caught this class -- see test/kernel_padded_lane_uninit_test.cpp.
+  #
+  # continue-on-error until the padded-lane fixes land: on a tree that still
+  # has an uninitialized padded field this gate FAILS (exit 77) -- that is the
+  # gate working, not a flake. This lane is added alongside the fixes, so on the
+  # current base it is expected red; the soft-fail keeps it from blocking while
+  # it and the fixes merge, then it flips to a hard gate. FLIP TO A HARD GATE
+  # (delete `continue-on-error`) ONCE THE PADDED-LANE INITIALIZATION FIXES ARE
+  # IN main.
+  msan-padded-lane-gate:
+    name: MSan padded-lane gate (banded-SW)
+    runs-on: ubuntu-latest
+    # One instrumented build of the kernel + a single fast run. Ceiling catches
+    # a hung runner only.
+    timeout-minutes: 20
+    continue-on-error: true
+    # MSan is a clang-only instrumentation; clang-19 is the shipping/floor
+    # compiler, installed from apt.llvm.org below (same as the matrix), so no
+    # ALLOW_UNSUPPORTED_COMPILER opt-out is needed here.
+    env:
+      CXX: clang++-19
+      CC: clang-19
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Install dependencies (Linux)
+        # Same set the matrix rows install: zlib/libdeflate for htslib's static
+        # link path, autoconf/automake for its configure, libomp for the
+        # libsais -fopenmp compile pulled in when building libbwa.a. libomp-19-dev
+        # (matching clang-19) is added by the clang-19 install step below.
+        uses: awalsh128/cache-apt-pkgs-action@acb598e5ddbc6f68a970c5da0688d2f3a9f04d05 # v1.6.0
+        with:
+          packages: zlib1g-dev libdeflate-dev autoconf automake libomp-dev
+          version: 1.1
+
+      - name: Install clang-19 (Linux)
+        # Identical verified-key install to the build-and-test matrix: fetch
+        # LLVM's archive signing key, verify its fingerprint against LLVM's
+        # published value, store it in a dedicated keyring, and add the repo
+        # signed-by that keyring so a tampered mirror can't run code as root or
+        # slip in unsigned packages.
+        run: |
+          set -euo pipefail
+          . /etc/os-release
+          codename="${VERSION_CODENAME:-$(lsb_release -cs)}"
+          expected_fpr="6084F3CF814B57C1CF12EFD515CF4D18AF4F7421"
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key -o /tmp/llvm-snapshot.gpg.key
+          got_fpr="$(gpg --show-keys --with-colons --with-fingerprint /tmp/llvm-snapshot.gpg.key \
+            | awk -F: '/^fpr:/ {print $10; exit}')"
+          if [ "$got_fpr" != "$expected_fpr" ]; then
+            echo "FATAL: LLVM archive key fingerprint mismatch: got '$got_fpr', expected '$expected_fpr'" >&2
+            exit 1
+          fi
+          sudo install -m 0755 -d /etc/apt/keyrings
+          sudo gpg --dearmor -o /etc/apt/keyrings/llvm-snapshot.gpg /tmp/llvm-snapshot.gpg.key
+          echo "deb [signed-by=/etc/apt/keyrings/llvm-snapshot.gpg] http://apt.llvm.org/${codename}/ llvm-toolchain-${codename}-19 main" \
+            | sudo tee /etc/apt/sources.list.d/llvm-19.list
+          sudo apt-get update
+          sudo apt-get install -y clang-19 libomp-19-dev
+          clang++-19 --version | head -1
+
+      - name: Build the padded-lane gate under MemorySanitizer
+        # MSAN=1 forces USE_MIMALLOC off (mimalloc's malloc override interposes
+        # ahead of the sanitizer runtime) and compiles with -fsanitize=memory
+        # -fsanitize-memory-track-origins=2. Built at -march=native against the
+        # native-tier kernel object, so this runner's widest getScores8/16
+        # wrappers are the ones exercised (avx2/avx512bw on this x86 lane).
+        run: |
+          make -j"$(nproc)" MSAN=1 CXX=clang++-19 CC=clang-19 \
+            kernel_padded_lane_uninit_test
+
+      - name: Run the padded-lane gate
+        # exitcode=77 so an uninitialized padded-lane read is a distinct,
+        # unmistakable failure code (not the 1 a build/link error would give);
+        # halt_on_error=1 stops at the first report. Exit 0 == every padded-lane
+        # field the kernel reads was written first.
+        run: |
+          MSAN_OPTIONS=exitcode=77:halt_on_error=1 \
+            ./kernel_padded_lane_uninit_test
+
   # Profiling (--profile) is compiled out of the default build, so the matrix
   # rows above never exercise the STAGE_PROF=1 code path. Build it here (and run
   # the stage_prof unit test) so the opt-in path cannot silently bit-rot.
