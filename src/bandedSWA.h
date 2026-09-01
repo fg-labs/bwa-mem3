@@ -334,13 +334,27 @@ public:
      * (test/framework/seqpair_batch.h), which allocates numPairs + SIMD_WIDTH8
      * SeqPair slots and so satisfies this rule.
      *
-     * Prefetch reads of pairArray[i+j+PFD] are bounded to < roundNumPairs, so
-     * the kernel never reads past the rounded-up region (no extra +PFD slack is
-     * required of the caller). Those bounded prefetches still touch the kernel's
-     * own padding lanes, reading back their idr/idq to form a prefetch address;
-     * the kernel zeroes idr/idq above so that read is well-defined and the
-     * resulting hint lands at seqBufRef/seqBufQer offset 0 (in-bounds) even when
-     * the caller left the padding slots uninitialized. */
+     * Every tier's per-lane compute loop iterates over the padded tail (its
+     * inner j-loop reaches i+j == roundNumPairs-1) and forms seqBufRef+idr /
+     * seqBufQer+idq for each padded lane, though it never dereferences them
+     * (padded len1==len2==0, so the copy loops run zero iterations). A padding
+     * loop therefore keeps idr/idq in a defined state (zeroed) so that
+     * pointer is seqBuf+0 (in-bounds) rather than seqBuf+<indeterminate>. Tiers
+     * whose prefetch is bounded to < roundNumPairs also read padded idr/idq to
+     * form a prefetch address, which the same zeroing keeps in-bounds. No tier
+     * ever reads past the rounded-up region, so no +PFD slack beyond
+     * roundup(numPairs, SIMD_WIDTH) is required of the caller:
+     *
+     *   - The 128-bit 8-bit implementation (SSE2/NEON getScores8) zeroes padded
+     *     idr/idq (like the tiers below) and additionally bounds the prefetch of
+     *     pairArray[i+j+PFD] to < numPairs -- a pure locality choice, since a
+     *     padded successor is non-existent and there is no useful line to
+     *     prefetch; the numPairs bound loses no real prefetch.
+     *
+     *   - Every getScores16 (and the 256-bit/512-bit 8-bit getScores8) bounds the
+     *     prefetch to < roundNumPairs, so it reads padded lanes' idr/idq to form
+     *     a prefetch address; its padding loop zeroes idr/idq so that read, and
+     *     the per-lane compute pointer, both land at seqBuf offset 0. */
     virtual void getScores8(SeqPair *pairArray,
                             uint8_t *seqBufRef,
                             uint8_t *seqBufQer,
@@ -348,8 +362,9 @@ public:
                             uint16_t numThreads,
                             int32_t w) = 0;
 
-    /* See getScores8 for the padding-lane / prefetch contract (identical, with
-     * SIMD_WIDTH16 lanes). */
+    /* See getScores8 for the padding-lane / prefetch contract. getScores16
+     * always takes the < roundNumPairs prefetch branch described there (with
+     * SIMD_WIDTH16 lanes) and zeroes padded idr/idq accordingly. */
     virtual void getScores16(SeqPair *pairArray,
                              uint8_t *seqBufRef,
                              uint8_t *seqBufQer,
