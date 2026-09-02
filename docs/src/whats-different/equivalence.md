@@ -269,6 +269,33 @@ identical to, so **`--compat --meth` is a hard error** for both. See
 [`mem` → `--compat`](../cli/mem.md#--compattarget--byte-identical-output-for-another-aligner)
 for the flag reference.
 
+Because `--meth` has no upstream reference to preserve, its default seeding is **not** frozen
+the way the plain path is: `--meth` now enables the `--meth-seed-prune=spec30` seed prune by
+default ([#441](https://github.com/fg-labs/bwa-mem3/pull/441); see
+[features](features.md#--meth-seed-prune-bisulfite-seed-prune)), so its
+output is not byte-identical to pre-prune `--meth` releases. This is a deliberate `--meth`-only
+default (like the `--fast` levers, but scoped to bisulfite); truth-based accuracy is unchanged
+at `mapq ≥ 20` (measured on a 5M-read bisulfite slice, hg38, arm64 NEON tier, clang-19, `-t 16`).
+Pass **`--meth-seed-prune=off`** to restore the pre-prune seeding: `off` skips the compaction
+entirely, so its seeding — and record stream — is the un-pruned code path by construction. The
+`test/regression/meth_seed_prune.sh` regression (run in CI) pins that `--meth-seed-prune=off` and
+its `BWAMEM3_METH_SEED_PRUNE=off` env spelling emit byte-identical records, and that the prune
+leaves confidently-mapped reads (POS/MAPQ/CIGAR) unchanged.
+
+The prune is gated on `--meth`, so it never runs on the non-`--meth` path. The one line it
+shares with that path is the seed-resolve-loop guard, corrected here from `pos < num_smem - 1`
+to `smem_ptr < num_smem`: because `smem_ptr == pos + 1` after any read is processed, the two are
+identical for every batch with ≥ 2 SMEMs — the entire non-`--meth` path and all normal `--meth`
+batches — and diverge only for a batch that prunes down to a single SMEM, where the old bound
+skipped the read and dropped it as unmapped. That single-SMEM case is not reachable on the
+non-`--meth` path with real reads (they reseed to ≥ 2 SMEMs); the prune makes it routine under
+`--meth`. So the non-`--meth` record stream is byte-identical — the prune never runs there, and
+the guard fix is a no-op for every ≥ 2-SMEM batch — with the guard fix additionally hardening the
+degenerate single-SMEM case. This is backed in CI by a record-level byte-identity regression on
+the canonical build: a default (non-`--meth`) run of a deterministic phiX paired-end fixture must
+match, byte-for-byte, its `--compat` counterpart with `MQ:i`/`HN:i` stripped — so any perturbation
+of the default path fails CI.
+
 ## What is preserved
 
 The figures in this section were measured **before** the 0.7.1 parity restoration and so
@@ -507,7 +534,7 @@ The divergences described above are tracked as a structured registry in [bwa-mem
 | id | pr | affected | samples | budget_% | summary |
 | --- | --- | --- | --- | --- | --- |
 | FG-PRIMARY-DRIFT | fg-labs/bwa-mem3#123 | primary_alignment | wgs-5M, wes-5M, panel-twist-5M, smoke-1M | 0.1000 | Per-architecture SIMD score2/MAPQ convergence (#21, #26, #28-#31) and deterministic tie-break ordering (#123) shift MAPQ, CIGAR, or position on a small fraction of primary alignments relative to bwa-mem2 v2.2.1. Where each read maps is preserved; the affected reads differ in placement detail, and the set varies by SIMD architecture. |
-| FG-METH-DIVERGENCE | fg-labs/bwa-mem3#90 | meth_alignment | meth-twist-emseq-5M, smoke-meth | 1.5000 | Bisulfite (--meth) mode against the bwameth.py baseline diverges beyond the ignored YD/XM/XG tag set (Bismark-compatible XR/XG/XM tags and C->T/G->A conversion handling), giving a larger but still-bounded concordance drift on methylation workloads. |
+| FG-METH-DIVERGENCE | fg-labs/bwa-mem3#90 | meth_alignment | meth-twist-emseq-5M, smoke-meth | 1.5000 | Bisulfite (--meth) mode against the bwameth.py baseline diverges beyond the ignored YD/XM/XG tag set (Bismark-compatible XR/XG/XM tags and C->T/G->A conversion handling), giving a larger but still-bounded concordance drift on methylation workloads. `--meth` also defaults to the `--meth-seed-prune=spec30` seed prune ([#441](https://github.com/fg-labs/bwa-mem3/pull/441); see [features](features.md#--meth-seed-prune-bisulfite-seed-prune)), so its output is not byte-identical to pre-prune `--meth` releases; truth-based accuracy is unchanged at `mapq ≥ 20`, and `--meth-seed-prune=off` restores the pre-prune seeding. |
 | FG-SUPP-ADDITIONS | RESOLVED | supplementary_alignment | all | 0.0000 | Earlier builds emitted additional supplementary (split/chimeric) alignments vs bwa-mem2 v2.2.1 (e.g. wes-5M: 5123 vs 5118). Re-measured 2026-07-24 on `e722ed0`: **+0** on wgs-5M, wes-5M and hic-1M (x86; the other samples have not been re-measured), with the complete alignment-record stream byte-identical (MQ/HN stripped; header lines not compared) across 22.5 M records incl. 436 k supplementary. Primary alignments were unchanged throughout. |
 <!-- FG-DIVERGENCE-CATALOG:end -->
 

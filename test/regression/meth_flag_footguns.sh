@@ -4,9 +4,10 @@
 # Regression: a stray word from a mis-spelled --meth-family flag must be
 # diagnosed, not silently consumed as the reference.
 #
-# Two spellings orphan their value on the command line:
-#   --meth taps        -- an OPTIONAL argument; getopt_long only binds it with '='
-#   --meth-tags XR XG  -- a REQUIRED argument; 'XR' binds, 'XG' does not
+# Several spellings orphan their value on the command line:
+#   --meth taps                -- OPTIONAL argument; getopt_long only binds it with '='
+#   --meth-seed-prune baseline -- OPTIONAL argument; same, silently selects spec30
+#   --meth-tags XR XG          -- REQUIRED argument; 'XR' binds, 'XG' does not
 #
 # The orphan lands in the <idxbase> slot. With a single-end read file the
 # invocation still has three positionals, which is a well-formed paired-end
@@ -30,6 +31,10 @@ set -euo pipefail
 : "${BWA_MEM3:?BWA_MEM3 must be set}"
 command -v samtools > /dev/null 2>&1 || {
     echo "SKIP: samtools not on PATH (--meth emits BAM)"
+    exit 0
+}
+command -v mawk > /dev/null 2>&1 || {
+    echo "SKIP: mawk not on PATH (required to inspect BAM tags)"
     exit 0
 }
 
@@ -72,6 +77,10 @@ expect_diagnosed() { # $1 = label, $2 = stray token, $3 = flag it belongs to, re
 expect_diagnosed "--meth-tags space-separated" XG --meth-tags mem --meth --meth-tags XR XG ref.fa r.fq
 expect_diagnosed "--meth separated argument" taps --meth mem --meth taps ref.fa r.fq
 expect_diagnosed "--meth-scoring orphan" genomic --meth-scoring mem --meth --meth-scoring collapsed genomic ref.fa r.fq
+# --meth-seed-prune is also OPTIONAL-argument, so `--meth-seed-prune baseline`
+# (space, no '=') silently selects spec30 and orphans `baseline` into <idxbase>.
+# Diagnose it by name rather than letting it slide into a missing-index error.
+expect_diagnosed "--meth-seed-prune orphan" baseline --meth-seed-prune mem --meth --meth-seed-prune baseline ref.fa r.fq
 
 # --- 2. no false positive on a real file with a vocabulary name -------------
 # A reference genuinely named `taps` must still work: the guard fires only when
@@ -98,4 +107,4 @@ c=$(tags_of caret.bam)
 [ "$d" = "XG XR" ] || fail "--meth-tags -XM: tags '$d', want 'XG XR'"
 [ "$d" = "$c" ] || fail "-XM and ^XM disagree: '$d' vs '$c'"
 
-echo "PASS: meth_flag_footguns (orphaned --meth/--meth-tags/--meth-scoring values diagnosed by name; real files with vocabulary names unaffected; -XM == ^XM)"
+echo "PASS: meth_flag_footguns (orphaned --meth/--meth-tags/--meth-scoring/--meth-seed-prune values diagnosed by name; real files with vocabulary names unaffected; -XM == ^XM)"

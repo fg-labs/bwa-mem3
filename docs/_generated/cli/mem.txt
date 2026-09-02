@@ -146,6 +146,16 @@ Methylation (--meth) options:
                  In genomic/neutral a real variant in the conversion direction
                  itself (C->T at a reference C) is indistinguishable from a
                  conversion and stays hidden in NM/MD.
+   --meth-seed-prune[=spec30|baseline|off]
+                 prune the 3-letter alphabet's short, repetitive spurious SMEMs
+                 before SA resolution: ~30% faster --meth at ~0 accuracy cost
+                 vs truth (measured WGS/WES/em-seq, mapq>=20 accuracy identical).
+                 ON by default under --meth (spec30) -- --meth is bwa-mem3-native,
+                 so there is no upstream reference output to preserve. spec30:
+                 per-read two-regime rule; baseline: drop len<25 & SA-count>1;
+                 off: restore the un-pruned seeding (byte-identical). NOT
+                 byte-identical vs off. Env BWAMEM3_METH_SEED_PRUNE (off|spec30|
+                 baseline) overrides this flag for A/B testing.
    --meth-tags SPEC
                  which Bismark tags to emit: 'all' (default), 'none', a
                  comma-separated list (XR,XG), or ^-prefixed exclusions (^XM).

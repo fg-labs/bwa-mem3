@@ -595,6 +595,8 @@ mem_opt_t *mem_opt_init()
     o->max_chain_extend = 1<<30;
     o->mapQ_coef_len = 50; o->mapQ_coef_fac = log(o->mapQ_coef_len);
     o->meth_scoring = MEM_METH_SCORING_COLLAPSED;  /* --meth default: bwameth-compatible */
+    o->meth_seed_prune = 0;                        /* base default off; --meth turns it on
+                                                      (SPEC30), set in fastmap.cpp */
     o->meth_chem    = METH_CHEM_EMSEQ;             /* --meth default chemistry: bisulfite/em-seq */
     o->meth_tags    = MEM_METH_TAGS_ALL;           /* --meth default: emit XR/XG/XM (Bismark set) */
     o->compat       = &COMPAT_TARGET_OFF;          /* --compat off: bwa-mem3's native output */
@@ -2238,6 +2240,141 @@ static inline bool meth_seed_filter_enabled()
     return on;
 }
 
+/* --meth-seed-prune (mem_opt_t.meth_seed_prune, enum mem_meth_seed_prune).
+ * Under --meth the 3-letter alphabet over-seeds with short, high-multiplicity
+ * spurious SMEMs while the true placement keeps a long/unique seed. Pruning
+ * those before SA resolution removes ~2/3 of meth seed volume at ~0 truth-based
+ * accuracy cost (validated on WGS/WES/twist-emseq). ON by default under --meth
+ * (SPEC30; see fastmap.cpp), overridable by BWAMEM3_METH_SEED_PRUNE for A/B:
+ *   OFF      -> no prune (byte-identical to the pre-prune seeding)
+ *   BASELINE -> drop SMEM iff (len < L AND SA-count > Kb)   [L=25,Kb=1]
+ *   SPEC30   -> per read, M = longest SMEM length; regime A (M < T) keeps all;
+ *               regime B (M >= T) keeps iff (len >= L) OR
+ *               (SA-count == 1 AND len >= U).               [T=30,L=25,U=22]
+ * The read's longest SMEM is always kept (never empty a read's rid-group).
+ * Thresholds overridable via BWAMEM3_METH_PRUNE_{T,L,U,KB} (integer 1..4096;
+ * a malformed value warns to stderr and keeps the default). */
+static int meth_prune_env_int(const char *name, int def)
+{
+    const char *e = getenv(name);
+    if (e == NULL || *e == '\0') return def;
+    char *end = NULL;
+    errno = 0;
+    long v = strtol(e, &end, 10);
+    if (end == e || *end != '\0' || errno == ERANGE || v < 1 || v > 4096) {
+        fprintf(stderr, "[W::meth-seed-prune] ignoring malformed %s='%s' "
+                        "(want integer 1..4096); using %d\n", name, e, def);
+        return def;
+    }
+    return (int)v;
+}
+/* Cached BWAMEM3_METH_SEED_PRUNE mode override (for A/B against a shipped
+ * default): -1 = no override, else a MEM_METH_PRUNE_* value. A C++11 magic
+ * static so the getenv/parse/warn runs exactly once and thread-safely -- the
+ * worker threads that call meth_seed_prune_mode concurrently from
+ * mem_chain_seeds neither re-read the environment on the hot path nor race a
+ * warn-once flag. "0" is accepted as off, matching the sibling env knobs
+ * (BWAMEM3_METH_SEED_FILTER=0, BWA3_SA_PER_READ=0). */
+static inline int meth_prune_env_mode_override()
+{
+    static const int ov = []() -> int {
+        const char *m = getenv("BWAMEM3_METH_SEED_PRUNE");
+        if (m == NULL || *m == '\0') return -1;
+        if (strcmp(m, "spec30") == 0)                     return MEM_METH_PRUNE_SPEC30;
+        if (strcmp(m, "baseline") == 0)                   return MEM_METH_PRUNE_BASELINE;
+        if (strcmp(m, "off") == 0 || strcmp(m, "0") == 0) return MEM_METH_PRUNE_OFF;
+        fprintf(stderr, "[W::meth-seed-prune] ignoring BWAMEM3_METH_SEED_PRUNE='%s' "
+                        "(want off|spec30|baseline); using the --meth-seed-prune setting\n", m);
+        return -1;
+    }();
+    return ov;
+}
+static inline int meth_seed_prune_mode(const mem_opt_t *opt, int *T, int *L, int *U, int *Kb)
+{
+    /* Thresholds: compile-time defaults, env-overridable (validated) for A/B.
+     * Each is a C++11 function-local static (a "magic static"): its initializer
+     * runs exactly once and thread-safely, so the worker threads that call this
+     * concurrently from mem_chain_seeds cannot race the cache -- unlike the
+     * hand-rolled `if (!tinit)` flag this replaces, which was a data race on
+     * non-atomic statics (matches meth_seed_filter_enabled's IIFE pattern). */
+    static const int t  = meth_prune_env_int("BWAMEM3_METH_PRUNE_T",  30);
+    static const int l  = meth_prune_env_int("BWAMEM3_METH_PRUNE_L",  25);
+    static const int u  = meth_prune_env_int("BWAMEM3_METH_PRUNE_U",  22);
+    static const int kb = meth_prune_env_int("BWAMEM3_METH_PRUNE_KB",  1);
+    *T = t; *L = l; *U = u; *Kb = kb;
+    const int ov = meth_prune_env_mode_override();   /* cached; env wins over the opt field */
+    if (ov >= 0) return ov;
+    return opt ? opt->meth_seed_prune : MEM_METH_PRUNE_OFF;
+}
+
+/* BWAMEM3_METH_SEED_PRUNE_STATS=1: sum input vs kept SMEMs across all pruned
+ * batches and print the pruned fraction once at exit. Measurement only (a
+ * single cached-bool branch per pruned batch, inert unless armed); mirrors the
+ * BWAMEM3_DEDUP_STATS dumper. Lets a test prove the prune actually removes
+ * seeds -- an identity/placement-invariance check alone passes even if the
+ * prune silently became a no-op. */
+static std::atomic<uint64_t> g_meth_prune_total{0};
+static std::atomic<uint64_t> g_meth_prune_kept{0};
+static inline bool meth_prune_stats_on()
+{
+    static const bool on = []() {
+        const char *e = getenv("BWAMEM3_METH_SEED_PRUNE_STATS");
+        return e && *e && !(e[0] == '0' && e[1] == '\0');
+    }();
+    return on;
+}
+static struct MethPruneStatsDumper {
+    ~MethPruneStatsDumper() {
+        if (!meth_prune_stats_on()) return;
+        uint64_t t = g_meth_prune_total.load(), k = g_meth_prune_kept.load();
+        fprintf(stderr,
+            "[meth-seed-prune-stats] total_smem=%llu kept_smem=%llu pruned_frac=%.4f\n",
+            (unsigned long long)t, (unsigned long long)k,
+            t ? 1.0 - (double)k / (double)t : 0.0);
+    }
+} g_meth_prune_stats_dumper;
+
+/* Compact matchArray in place under the resolved prune mode, returning the new
+ * SMEM count. rid grouping/order is preserved and each read's longest SMEM
+ * (imax, the first on a tie) is always kept, so a read's rid-group is never
+ * emptied. spec30: per read M = longest SMEM length; regime A (M < T) keeps
+ * all, regime B (M >= T) keeps len >= L or (unique and len >= U). baseline:
+ * drop iff len < L and SA-count > Kb. Extracted from mem_chain_seeds so the
+ * rule is a single pure function (unit-checkable over hand-built arrays). */
+static int64_t meth_prune_compact(SMEM *matchArray, int64_t num_smem,
+                                  int mode, int T, int L, int U, int Kb)
+{
+    int64_t w = 0, ri = 0;
+    while (ri < num_smem) {
+        int32_t rid_cur = matchArray[ri].rid;
+        int64_t rj = ri, imax = ri; int32_t M = -1;
+        while (rj < num_smem && matchArray[rj].rid == rid_cur) {
+            int32_t ln = matchArray[rj].n + 1 - matchArray[rj].m;
+            if (ln > M) { M = ln; imax = rj; }
+            rj++;
+        }
+        for (int64_t k = ri; k < rj; k++) {
+            int32_t ln = matchArray[k].n + 1 - matchArray[k].m;
+            int keep;
+            if (k == imax) keep = 1;                 /* never empty a read */
+            else if (mode == MEM_METH_PRUNE_SPEC30) {
+                if (M < T) keep = 1;                 /* regime A: keep all */
+                else keep = (ln >= L) ||             /* regime B */
+                            (matchArray[k].s == 1 && ln >= U);
+            } else {                                 /* baseline */
+                keep = (ln >= L) || (matchArray[k].s <= (int64_t)Kb);
+            }
+            if (keep) { if (w != k) matchArray[w] = matchArray[k]; w++; }
+        }
+        ri = rj;
+    }
+    if (meth_prune_stats_on()) {
+        g_meth_prune_total.fetch_add((uint64_t)num_smem, std::memory_order_relaxed);
+        g_meth_prune_kept.fetch_add((uint64_t)w, std::memory_order_relaxed);
+    }
+    return w;
+}
+
 static inline int meth_seed_to_orig(const bntseq_t *seed_bns,
                                     const bntseq_t *orig_bns,
                                     int64_t seed_rbeg, int32_t seed_len,
@@ -2416,6 +2553,21 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
     for (int l=0; l<nseq; l++)
         kv_init(chain_ar[l]);
 
+    /* --meth-seed-prune: compact matchArray in place BEFORE SA resolution so the
+     * prefetch, resolve loop and chaining all see the pruned set (this is what
+     * captures the SA-lookup saving). Preserves rid grouping/order and always
+     * keeps each read's longest SMEM, so no read's rid-group is emptied (the loop
+     * below maps chains by read-run position). Only active under --meth with a
+     * remap bns; OFF (--meth-seed-prune=off) is byte-identical to the pre-prune
+     * seeding. Default is SPEC30 under --meth (set in fastmap.cpp). */
+    {
+        int mp_T, mp_L, mp_U, mp_Kb;
+        int mp_mode = meth_seed_prune_mode(opt, &mp_T, &mp_L, &mp_U, &mp_Kb);
+        if (meth_remap && mp_mode != MEM_METH_PRUNE_OFF && num_smem > 0)
+            num_smem = meth_prune_compact(matchArray, num_smem,
+                                          mp_mode, mp_T, mp_L, mp_U, mp_Kb);
+    }
+
     // filter seq at early stage than this!, shifted to collect!!!
     // if (len < opt->min_seed_len) return chain; // if the query is shorter than the seed length, no match
 
@@ -2469,7 +2621,17 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
     int64_t sa_cap = (int64_t)opt->max_occ * smem_buf_size;   /* sa_coord elements */
 
     uint64_t tim = __rdtsc();
-    for (int l=0; l<nseq && pos < num_smem - 1; l++)
+    /* Guard on `smem_ptr < num_smem` (unconsumed SMEMs remain), NOT the legacy
+     * `pos < num_smem - 1`. Since `smem_ptr == pos + 1` after any read is
+     * processed, the two are identical for every batch with num_smem >= 2 (the
+     * entire non-meth path and all normal meth batches). They diverge only on the
+     * first iteration when num_smem == 1, where `0 < 0` is false: the legacy form
+     * skipped the whole loop and dropped the sole surviving read as unmapped. The
+     * --meth-seed-prune compaction above makes a single-SMEM batch reachable (a
+     * ragged trailing batch whose one rid-group prunes to its longest seed), so
+     * fix the pre-existing off-by-one here. The inner do-while keeps its
+     * `pos < num_smem - 1` -- that is a real bounds guard for matchArray[pos+1]. */
+    for (int l=0; l<nseq && smem_ptr < num_smem; l++)
     {
         // addition, FIX FIX FIX!!!!! THIS!!!!
         //if (aux_->mem.n == 0) continue;

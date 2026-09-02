@@ -48,6 +48,55 @@ rather than in collapsed space — so it is not byte-for-byte identical to bwame
 output. Stacks on PR #12 (`--bam`). See the
 [Methylation Reference](../methylation/overview.md) for full details.
 
+## `--meth-seed-prune` bisulfite seed prune
+
+*Introduced in [PR #441](https://github.com/fg-labs/bwa-mem3/pull/441).*
+
+Under `--meth`, seeds are found in collapsed 3-letter (C→T / G→A) space, which is
+intrinsically less specific: a short *k*-mer has ~2 orders of magnitude more
+genome-wide hits than in 4-letter space, so seeding over-produces short,
+high-multiplicity **spurious** SMEMs (measured 3–7× the DNA seed volume, ~95%
+spurious on WGS/WES/em-seq) while the read's true placement still keeps a long,
+near-unique SMEM. That spurious volume drives the FM-index SA-lookup and
+mate-rescue work that dominate the `--meth` wall. `spec30` is deliberately
+conservative and removes ~⅔ of total seed volume — not the full ~95% spurious
+fraction — so that genuinely informative short seeds in ambiguous reads are
+retained rather than chasing the last of the spurious tail.
+
+`--meth-seed-prune` drops those short, repetitive SMEMs **before** SA resolution
+(an in-place compaction of the SMEM array in `mem_chain_seeds`, so the SA
+prefetch, resolve loop and chaining all see the pruned set), always keeping each
+read's longest SMEM so a read is never left seedless. Modes:
+
+- `spec30` (**default under `--meth`**, recommended): a per-read two-regime rule.
+  Let `M` be the read's longest SMEM length. If `M < 30` the read is in the
+  3-letter random-match regime (nothing trustworthy) → keep all seeds; otherwise
+  keep seeds with `len ≥ 25`, or unique (`SA-count == 1`) and `len ≥ 22`.
+- `baseline`: drop `len < 25 AND SA-count > 1`.
+- `off`: no prune — byte-identical to the pre-prune seeding.
+
+```
+bwa-mem3 mem --meth ref.fa R1.fq R2.fq              # spec30 on by default
+bwa-mem3 mem --meth --meth-seed-prune=off ref.fa …  # exact pre-prune seeding
+```
+
+Measured (em-seq 5M reads, hg38, 16-vCPU arm64 host, NEON tier, clang-19, `-t 16`
+at the default `-K` batch of chunk_size × `-t`): **~30% whole-aligner wall
+reduction**, truth-based accuracy identical at `mapq ≥ 20`,
+whole-aligner concordance 99.05% identical placement (the residual changes are
+low-MAPQ multimapper reshuffling). Unlike the non-`--meth` speed levers this is **on by
+default**: `--meth` is bwa-mem3-native (bwa/bwa-mem2 never had a bisulfite mode),
+so there is no upstream reference output to stay byte-identical to;
+`--meth-seed-prune=off` is the escape hatch for exact reproducibility. It is
+**not byte-identical vs `off`** (a reviewed seeding semantics change; see
+[equivalence](equivalence.md)). The prune itself is gated on `--meth`, so it has
+no effect on the non-`--meth` path; that path stays byte-identical (the shared
+resolve loop was hardened for the single-SMEM-batch case the prune makes routine,
+a change that is byte-identical for every batch with ≥ 2 SMEMs — i.e. all
+realistic non-`--meth` input; see [equivalence](equivalence.md)). Env
+`BWAMEM3_METH_SEED_PRUNE` / `BWAMEM3_METH_PRUNE_{T,L,U,KB}` override the flag and
+thresholds for A/B testing.
+
 ## Vendored mimalloc allocator (PR #19)
 
 bwa-mem3 vendors [mimalloc v3.3.0](https://github.com/microsoft/mimalloc) as a

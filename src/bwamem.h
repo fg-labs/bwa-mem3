@@ -152,6 +152,11 @@ typedef struct __smem_i smem_i;
 enum mem_meth_scoring { MEM_METH_SCORING_COLLAPSED = 0, MEM_METH_SCORING_GENOMIC = 1,
                         MEM_METH_SCORING_NEUTRAL = 2 };
 
+/* --meth-seed-prune modes (mem_opt_t.meth_seed_prune). Shared here so the CLI
+ * (fastmap.cpp) and the prune (bwamem.cpp) agree on the numeric values. */
+enum mem_meth_seed_prune { MEM_METH_PRUNE_OFF = 0, MEM_METH_PRUNE_SPEC30 = 1,
+                           MEM_METH_PRUNE_BASELINE = 2 };
+
 /* Bismark tag selection under --meth (--meth-tags). XR:Z and XG:Z are two-byte
  * strand labels; XM:Z is a read-length methylation-call string and dominates the
  * BAM's aux payload, so it is the one worth being able to turn off. */
@@ -247,6 +252,13 @@ typedef struct mem_opt_t {
     int    meth_mode;       // 1 = bisulfite mode (--meth)
     int    meth_scoring;    // bisulfite matrix mode (--meth-scoring):
                             // MEM_METH_SCORING_{COLLAPSED,GENOMIC,NEUTRAL}
+    int    meth_seed_prune; // --meth-seed-prune: prune 3-letter over-seeding before
+                            // SA resolution. 0 = off, 1 = spec30 (per-read two-regime),
+                            // 2 = baseline (len<25 & hits>1). mem_opt_init sets 0, but
+                            // the CLI defaults it to spec30 under --meth (bwa-mem3-native
+                            // feature, no upstream reference to preserve); --meth-seed-prune
+                            // =off|baseline (or env BWAMEM3_METH_SEED_PRUNE) overrides.
+                            // ~30% faster --meth at ~0 truth accuracy cost; NOT byte-identical.
     int    meth_chem;       // methylation chemistry (--meth=emseq|taps): meth_chem_t.
                             // Selects XM:Z call polarity ONLY -- seeding, the
                             // converted index and the scoring matrices are shared,
