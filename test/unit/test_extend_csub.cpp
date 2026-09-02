@@ -60,18 +60,25 @@ const int MATCH_A = 1;  // opt->a default
 
 }  // namespace
 
-TEST_CASE("mem_seed_capped_csub: no-op when nothing was dropped") {
-    // capped_w == 0 is the state whenever the cap/gate is off, or is on but
+TEST_CASE("mem_seed_capped_csub: no-op when nothing was dropped"
+          * doctest::test_suite("unit/extend_csub")) {
+    // capped_w <= 0 is the state whenever the cap/gate is off, or is on but
     // dropped nothing. This is what keeps --extend-csub byte-identical on the
     // default path and on --fast with the gate off.
-    for (int capped_w : {0, -1}) {
-        RegV r({reg(0, 100, 80, /*csub=*/7)}, capped_w);
+    SUBCASE("capped_w == 0 (cap/gate off, or dropped nothing)") {
+        RegV r({reg(0, 100, 80, /*csub=*/7)}, /*capped_w=*/0);
+        mem_seed_capped_csub(&r.v, MATCH_A);
+        CHECK(r.v.a[0].csub == 7);
+    }
+    SUBCASE("capped_w < 0 (never-set sentinel)") {
+        RegV r({reg(0, 100, 80, /*csub=*/7)}, /*capped_w=*/-1);
         mem_seed_capped_csub(&r.v, MATCH_A);
         CHECK(r.v.a[0].csub == 7);
     }
 }
 
-TEST_CASE("mem_seed_capped_csub: below the score, the estimate is used as-is") {
+TEST_CASE("mem_seed_capped_csub: below the score, the estimate is used as-is"
+          * doctest::test_suite("unit/extend_csub")) {
     // weight 30 * a 1 = 30 < score 80, so no clamping is needed and csub takes
     // the raw all-match bound.
     RegV r({reg(0, 100, 80)}, /*capped_w=*/30);
@@ -79,20 +86,25 @@ TEST_CASE("mem_seed_capped_csub: below the score, the estimate is used as-is") {
     CHECK(r.v.a[0].csub == 30);
 }
 
-TEST_CASE("mem_seed_capped_csub: clamps strictly below the region score") {
+TEST_CASE("mem_seed_capped_csub: clamps strictly below the region score"
+          * doctest::test_suite("unit/extend_csub")) {
     // The regression guard. For every dropped weight at or above the region's
     // score, csub must land at exactly score-1 -- never >= score, which would
     // trip `sub >= score -> return 0` in mem_approx_mapq_se.
     const int score = 80;
-    for (int w : {80, 81, 200, 10000}) {
-        RegV r({reg(0, 100, score)}, w);
-        mem_seed_capped_csub(&r.v, MATCH_A);
-        CHECK(r.v.a[0].csub == score - 1);
-        CHECK(r.v.a[0].csub < score);
-    }
+    int w = 0;
+    SUBCASE("weight == score")            { w = 80; }
+    SUBCASE("weight one above score")     { w = 81; }
+    SUBCASE("weight well above score")    { w = 200; }
+    SUBCASE("weight enormously above")    { w = 10000; }
+    RegV r({reg(0, 100, score)}, w);
+    mem_seed_capped_csub(&r.v, MATCH_A);
+    CHECK(r.v.a[0].csub == score - 1);
+    CHECK(r.v.a[0].csub < score);
 }
 
-TEST_CASE("mem_seed_capped_csub: clamped csub never forces MAPQ to zero") {
+TEST_CASE("mem_seed_capped_csub: clamped csub never forces MAPQ to zero"
+          * doctest::test_suite("unit/extend_csub")) {
     // The clamp's actual purpose, stated in terms of the consumer. An enormous
     // dropped weight should REDUCE mapq relative to no pruning, not zero it --
     // zeroing is what produced the spurious PE promotions.
@@ -113,7 +125,8 @@ TEST_CASE("mem_seed_capped_csub: clamped csub never forces MAPQ to zero") {
     free(opt);
 }
 
-TEST_CASE("mem_seed_capped_csub: secondary regions are left alone") {
+TEST_CASE("mem_seed_capped_csub: secondary regions are left alone"
+          * doctest::test_suite("unit/extend_csub")) {
     // Only primaries (secondary < 0) carry the pruned-competitor estimate;
     // mem_mark_primary_se runs before this, and secondaries already have a
     // meaningful csub relationship to their primary.
@@ -122,7 +135,8 @@ TEST_CASE("mem_seed_capped_csub: secondary regions are left alone") {
     CHECK(r.v.a[0].csub == 3);
 }
 
-TEST_CASE("mem_seed_capped_csub: takes the max, never lowers an existing csub") {
+TEST_CASE("mem_seed_capped_csub: takes the max, never lowers an existing csub"
+          * doctest::test_suite("unit/extend_csub")) {
     // csub may already hold a real scored competitor (mate rescue sets it from
     // aln.score2). The estimate must not erase that.
     SUBCASE("existing csub is larger -> preserved") {
@@ -137,7 +151,8 @@ TEST_CASE("mem_seed_capped_csub: takes the max, never lowers an existing csub") 
     }
 }
 
-TEST_CASE("mem_seed_capped_csub: skips degenerate regions") {
+TEST_CASE("mem_seed_capped_csub: skips degenerate regions"
+          * doctest::test_suite("unit/extend_csub")) {
     // A zero/negative query span or a non-positive score has no meaningful
     // per-region bound to compare against; both are skipped rather than clamped
     // (score-1 would be nonsense for score <= 0).
@@ -153,7 +168,8 @@ TEST_CASE("mem_seed_capped_csub: skips degenerate regions") {
     }
 }
 
-TEST_CASE("mem_seed_capped_csub: each primary is clamped against its own score") {
+TEST_CASE("mem_seed_capped_csub: each primary is clamped against its own score"
+          * doctest::test_suite("unit/extend_csub")) {
     // capped_w is per-READ, but the clamp is per-REGION, so one dropped weight
     // lands differently on regions of differing score.
     RegV r({reg(0, 100, 80), reg(0, 100, 40), reg(0, 100, 200)}, /*capped_w=*/100);

@@ -927,7 +927,7 @@ void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str, bseq
  * overstate subo roughly twice over. The sum is clamped strictly below o, so q_pe drops
  * proportionally to a near-tie rather than being forced to 0.
  * Returns a floor for subo, or 0 to leave subo unchanged. */
-static int mem_capped_pair_subo(const mem_alnreg_v a[2], const int z[2], int o)
+int mem_capped_pair_subo(const mem_alnreg_v a[2], const int z[2], int o)
 {
     long est = 0;
     for (int i = 0; i < 2; i++) {

@@ -1520,8 +1520,8 @@ void mem_flt_chained_seeds(const mem_opt_t *opt, const bntseq_t *bns, const uint
  * byte-identical (drops candidate secondaries, so XS/secondary/MAPQ can move on
  * multi-mapping reads). Always keeps >= 1 chain. Returns the new chain count. */
 #define MAX_EXTEND_CHAINS_CAP 4096
-static int mem_chain_cap_extend(mem_chain_t *a, int n, int max_n, float tie_frac, int tie_floor,
-                                int *capped_w_out)
+int mem_chain_cap_extend(mem_chain_t *a, int n, int max_n, float tie_frac, int tie_floor,
+                         int *capped_w_out)
 {
     if (capped_w_out) *capped_w_out = 0;  /* max weight among dropped chains, for csub */
     /* The competitiveness gate applies even when the count cap does NOT engage
@@ -1542,8 +1542,8 @@ static int mem_chain_cap_extend(mem_chain_t *a, int n, int max_n, float tie_frac
     /* competitiveness gate (--extend-tie-frac): a chain ranked at/after tie_floor is
      * extended only if its weight is within tie_frac of the best chain's -- i.e. it is
      * a genuine near-tie that could change placement/MAPQ. tie_frac<=0 disables the gate,
-     * reducing this to the pure top-max_n cap (baseline). tie_frac is clamped to [0,1]
-     * upstream, so (int)(tie_frac*w_best) <= w_best and the best chain (rank 0) always
+     * reducing this to the pure top-max_n cap (baseline). tie_frac is validated to [0,1]
+     * upstream (out-of-range is rejected), so (int)(tie_frac*w_best) <= w_best and the best chain (rank 0) always
      * clears the gate -- the "keep >= 1 chain" invariant holds. */
     int gate = tie_frac > 0.0f ? (int)(tie_frac * w_best) : 0;
     /* keep chain i iff fewer than max_n other chains outrank it by
@@ -2837,8 +2837,13 @@ int mem_kernel1_core(FMI_search *fmi,
     // (which walks chain_ar unconditionally and free()s chain_ar[l].a) sees
     // a valid empty state, then let downstream stages emit unmapped records.
     if (tot_len == 0) {
-        for (int l = 0; l < nseq; ++l)
+        for (int l = 0; l < nseq; ++l) {
             kv_init(chain_ar[l]);
+            chain_ar[l].capped_w = 0;  /* Pass 2 (which sets this) is skipped on this
+                                        * early return; kv_init leaves it uninitialized.
+                                        * Harmless for output (no regions) but the
+                                        * --dedup-reads VERIFY instrument compares it. */
+        }
         return 1;
     }
     // enc_qdb is sized in *bytes* (= tot_len). Track its capacity via the

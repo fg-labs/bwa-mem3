@@ -75,6 +75,9 @@ line="$(fast_line --fast)"
     "$line" == *"--max-extend-chains 20"* &&
     "$line" == *"--adaptive-band"* &&
     "$line" == *"--extend-mate-concordant"* &&
+    "$line" == *"--extend-tie-frac 0.95"* &&
+    "$line" == *"--extend-tie-floor 1"* &&
+    "$line" == *"--extend-csub"* &&
     "$line" == *"--rescue-kmer=6"* &&
     "$line" == *"alnreg-sort=fast"* ]] \
     || {
@@ -86,7 +89,20 @@ line="$(fast_line --fast)"
         echo "FAIL: non-meth --fast must not set -s: '$line'" >&2
         exit 1
     }
-echo "OK:   --fast bundle resolves -m 10 -y 0 --min-ext-len 30 --smem-dedup --skip-contained-ext --max-extend-chains 20 --adaptive-band --extend-mate-concordant --rescue-kmer=6 alnreg-sort=fast (no -s)"
+echo "OK:   --fast bundle resolves -m 10 -y 0 --min-ext-len 30 --smem-dedup --skip-contained-ext --max-extend-chains 20 --adaptive-band --extend-mate-concordant --extend-tie-frac 0.95 --extend-tie-floor 1 --extend-csub --rescue-kmer=6 alnreg-sort=fast (no -s)"
+
+# 1b. The gate levers honor an explicit user value: --extend-tie-frac 0 disables the
+#     competitiveness gate even under --fast (opt0 wins), and the audit line reflects it.
+#     --extend-csub has no opt-out and stays on; --extend-tie-floor is untouched.
+line="$(fast_line --fast --extend-tie-frac 0)"
+[[ "$line" == *"--extend-tie-frac 0 "* &&
+    "$line" == *"--extend-tie-floor 1"* &&
+    "$line" == *"--extend-csub"* ]] \
+    || {
+        echo "FAIL: explicit --extend-tie-frac 0 should override the preset in the audit line: '$line'" >&2
+        exit 1
+    }
+echo "OK:   --fast folds in --extend-tie-frac 0.95 / --extend-tie-floor 1 / --extend-csub; explicit --extend-tie-frac 0 overrides the gate"
 
 # 2. Override precedence: an explicit flag wins *only* for its own field; the
 #    rest of the preset (including the unconditional --smem-dedup) must survive.
@@ -202,6 +218,15 @@ if "$bin" index --meth "$mdir/ref.fa" > /dev/null 2>&1; then
             echo "FAIL: --fast --meth must enable --extend-mate-concordant: '$line'" >&2
             exit 1
         }
+    # The score-gated chain-extension cap is folded into --fast under --meth too
+    # (applies on top of the meth --max-extend-chains 10; validated placement-neutral).
+    [[ "$line" == *"--extend-tie-frac 0.95"* &&
+        "$line" == *"--extend-tie-floor 1"* &&
+        "$line" == *"--extend-csub"* ]] \
+        || {
+            echo "FAIL: --fast --meth must fold in --extend-tie-frac 0.95/--extend-tie-floor 1/--extend-csub: '$line'" >&2
+            exit 1
+        }
     # --rescue-kmer applies under --meth as well (the anchor scan collapses to the
     # pair's bisulfite alphabet there), so the meth audit line must report it too.
     [[ "$line" == *"--rescue-kmer=6"* ]] \
@@ -215,7 +240,7 @@ if "$bin" index --meth "$mdir/ref.fa" > /dev/null 2>&1; then
             echo "FAIL: --fast --meth must enable alnreg-sort=fast: '$line'" >&2
             exit 1
         }
-    echo "OK:   --fast --meth additionally sets -s 2, --extend-mate-concordant and alnreg-sort=fast (skip-contained-ext omitted meth-gated, --max-extend-chains raised to 10)"
+    echo "OK:   --fast --meth additionally sets -s 2, --extend-mate-concordant, the extend-tie gate and alnreg-sort=fast (skip-contained-ext omitted meth-gated, --max-extend-chains raised to 10)"
     # Explicit -s wins even under --meth (src/fastmap.cpp: -s 2 is gated on !opt0.split_width).
     "$bin" mem --meth --fast -s 7 -t 1 "$mdir/ref.fa" "$reads" > /dev/null 2> "$err" \
         || {
