@@ -1597,8 +1597,8 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "                  mate rescue -- use --hic or -5SP to skip it too) [off]\n");
     fprintf(stderr, "    --fast        speed preset: -m 10 -y 0 --min-ext-len 30 --smem-dedup --rescue-kmer=6\n");
     fprintf(stderr, "                  --skip-contained-ext --max-extend-chains 20 --adaptive-band\n");
-    fprintf(stderr, "                  --extend-mate-concordant (under --meth: --max-extend-chains 10,\n");
-    fprintf(stderr, "                  -s 2). Opt-in; explicit\n");
+    fprintf(stderr, "                  --extend-mate-concordant --extend-tie-frac 0.95 --extend-tie-floor 1\n");
+    fprintf(stderr, "                  --extend-csub (under --meth: --max-extend-chains 10, -s 2). Opt-in; explicit\n");
     fprintf(stderr, "                  flags override where applicable; --smem-dedup,\n");
     fprintf(stderr, "                  --skip-contained-ext and --adaptive-band are enabled\n");
     fprintf(stderr, "                  (pass --no-adaptive-band to keep exact extension under --fast).\n");
@@ -2611,6 +2611,7 @@ int main_mem(int argc, char *argv[])
     /* --fast: one-flag shorthand for the characterized speed levers
      *   -m 10  -y 0  --min-ext-len 30  --smem-dedup  --skip-contained-ext
      *   --max-extend-chains 20  --adaptive-band  --extend-mate-concordant
+     *   --extend-tie-frac 0.95  --extend-tie-floor 1  --extend-csub
      *   (under --meth: --max-extend-chains 10 and also adds -s 2),
      *   plus the strict-total-order + pdqsort dedup sort (alnreg_sort_fast),
      *   which has no flag of its own -- see the alnreg_sort_fast assignment
@@ -2768,6 +2769,21 @@ int main_mem(int argc, char *argv[])
                                                           * reads (interior-repeat competitors go unfound);
                                                           * -s 2 reseeds the occurrence-1 SMEMs that inflate,
                                                           * recovering MAPQ+placement at ~the same speed. */
+        /* Score-gated chain-extension cap (fg-labs/bwa-mem3#269), applied on top
+         * of --max-extend-chains above (incl. meth's cap of 10): extend a capped
+         * chain only if its weight is >= 0.95x the best chain's weight
+         * (--extend-tie-frac 0.95), always keeping the top-1 chain
+         * (--extend-tie-floor 1), and seed the primary's competitor score with the
+         * best dropped chain so the pruning does not inflate MAPQ (--extend-csub).
+         * Truth-graded placement-neutral on wgs/exome/panel/meth and on a substrate
+         * matched to real low-AS panel reads (net-favorable there: reduces confident
+         * and total mismapping); -11 to -17% wall on the bulk workloads. The two
+         * --extend-tie-* levers honor an explicit user value (opt0); --extend-csub
+         * has no opt-out flag and is forced on like --smem-dedup, since it only
+         * matters when the gate prunes, which --fast now always does. */
+        if (!opt0.extend_tie_frac)  opt->extend_tie_frac  = 0.95;
+        if (!opt0.extend_tie_floor) opt->extend_tie_floor = 1;
+        opt->extend_csub = 1;
     }
 
     /* Meth-mode default tuning. bwameth.py runs bwa as
