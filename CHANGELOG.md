@@ -1,5 +1,50 @@
 # Changelog
 
+## [0.11.0](https://github.com/fg-labs/bwa-mem3/compare/v0.10.0...v0.11.0) (2026-09-01)
+
+
+### Features
+
+* **bsw:** byte-identical extension-DP job dedup with a self-calibrating on/off controller ([#415](https://github.com/fg-labs/bwa-mem3/issues/415)) ([5bfa754](https://github.com/fg-labs/bwa-mem3/commit/5bfa754afef722ee605937fad9e673496e036d5b))
+* **mem:** --dedup-reads whole-read-pair memoization (panel speed lever, byte-identical) ([#433](https://github.com/fg-labs/bwa-mem3/issues/433)) ([a6bf411](https://github.com/fg-labs/bwa-mem3/commit/a6bf411798a44a98d35a444b5040287f8b7870e7))
+* **mem:** add --no-adaptive-band to opt out of adaptive banded-SW under --fast ([#417](https://github.com/fg-labs/bwa-mem3/issues/417)) ([ca4f336](https://github.com/fg-labs/bwa-mem3/commit/ca4f3361a6d5c1aa3e9953e63417cbaccf6485b9))
+
+
+### Bug Fixes
+
+* **bsw:** zero padded idr/idq in the AVX2 8-bit banded-SW wrapper ([#434](https://github.com/fg-labs/bwa-mem3/issues/434)) ([7b7a7eb](https://github.com/fg-labs/bwa-mem3/commit/7b7a7eb4d9de9b421ab25d5781adbf4a6608fa31))
+* **bsw:** zero padded len2 in the AVX-512 8-bit banded-SW wrapper ([#439](https://github.com/fg-labs/bwa-mem3/issues/439)) ([ab9159b](https://github.com/fg-labs/bwa-mem3/commit/ab9159bd28ccc870f6bf5d70760e26756834cfc3))
+* **bsw:** zero padded-lane h0 in the banded-SW wrapper padding loops ([#435](https://github.com/fg-labs/bwa-mem3/issues/435)) ([082cd90](https://github.com/fg-labs/bwa-mem3/commit/082cd9035fb905ac6cc1fe8a18a063ecfeac602f))
+* clamp pwrite_all requests to 1GiB so &gt;2GiB index writes work on macOS ([#419](https://github.com/fg-labs/bwa-mem3/issues/419)) ([7bd35c3](https://github.com/fg-labs/bwa-mem3/commit/7bd35c3fdaf22af298d5870664a07b6b822d4712))
+* **extend:** cap the 8-bit banded-SW envelope at w=124 (int8 offset wrap) ([#422](https://github.com/fg-labs/bwa-mem3/issues/422)) ([6def77e](https://github.com/fg-labs/bwa-mem3/commit/6def77e631d4770772f7dfef074041c5184bfa78))
+* **extend:** compute the 16-bit banded-SW band clamp in wide arithmetic ([#423](https://github.com/fg-labs/bwa-mem3/issues/423)) ([5ffab89](https://github.com/fg-labs/bwa-mem3/commit/5ffab8939aeed31ed38050612598fab4d51dff9c))
+* **extend:** gate the vector banded-SW z-drop on zdrop &gt; 0 ([#424](https://github.com/fg-labs/bwa-mem3/issues/424)) ([90c3e55](https://github.com/fg-labs/bwa-mem3/commit/90c3e5554a750763a8e00dba11a0b7e81ee48b7e))
+* **ksw:** free the int16 wavefront scratch on worker-thread exit (LSan) ([#431](https://github.com/fg-labs/bwa-mem3/issues/431)) ([b44cdf3](https://github.com/fg-labs/bwa-mem3/commit/b44cdf3cbffbfb2e66413577cc62318f75ea6a51))
+* **kswv:** zero padded-lane idr/idq/h0 in the mate-rescue wrapper padding loops ([#436](https://github.com/fg-labs/bwa-mem3/issues/436)) ([81afa59](https://github.com/fg-labs/bwa-mem3/commit/81afa59c1557ba4eb7319687b8e5465bef8cdd42))
+* **rescue:** correct and tighten the u8 mate-rescue admission bound ([#421](https://github.com/fg-labs/bwa-mem3/issues/421)) ([12cb1a5](https://github.com/fg-labs/bwa-mem3/commit/12cb1a5ede80334d2447d437e34610056a95748e))
+
+
+### Performance
+
+* **bsw:** prefetch next batch's ref/query in the NEON 8-bit wrapper ([#190](https://github.com/fg-labs/bwa-mem3/issues/190)) ([7131a2b](https://github.com/fg-labs/bwa-mem3/commit/7131a2b730829ce794e8f51e34a96fcfb00d0992))
+* **bsw:** use SYM 16-bit prepass on NEON, keep byte-LUT on x86 ([#411](https://github.com/fg-labs/bwa-mem3/issues/411)) ([ada4885](https://github.com/fg-labs/bwa-mem3/commit/ada488548bfbcaa2883e5d6fbbea2e0508ea15e5))
+* **chain:** reuse the per-read chaining B-tree instead of re-allocating it ([#416](https://github.com/fg-labs/bwa-mem3/issues/416)) ([4b01ff2](https://github.com/fg-labs/bwa-mem3/commit/4b01ff2fa79fdff171c17b5ccf16554bb6b19492))
+* **extend:** extend the certified probe rung to the 16-bit tier ([#429](https://github.com/fg-labs/bwa-mem3/issues/429)) ([c5e8ef8](https://github.com/fg-labs/bwa-mem3/commit/c5e8ef82cdeb7710c6c0bdde08f4588a3793108a))
+* **extend:** raise ungapped-scan cap to 512 for long-read fast-path (byte-identical) ([#426](https://github.com/fg-labs/bwa-mem3/issues/426)) ([ba7a497](https://github.com/fg-labs/bwa-mem3/commit/ba7a497ee6999d35a1c6653a6af8878ec511b9b2))
+* **extend:** route proven-narrow 8-bit extensions through a certified probe rung ([#427](https://github.com/fg-labs/bwa-mem3/issues/427)) ([9461c0d](https://github.com/fg-labs/bwa-mem3/commit/9461c0ddd46fd4aff19896952b0bc615448230de))
+* **extend:** widen the certified adaptive-band probe past the fixed 20-cell start ([#428](https://github.com/fg-labs/bwa-mem3/issues/428)) ([672d69b](https://github.com/fg-labs/bwa-mem3/commit/672d69bee57d9527bfc085e6502018e2f66785d3))
+* **ksw:** vectorize ksw_global2 with a byte-identical anti-diagonal SIMD kernel ([#418](https://github.com/fg-labs/bwa-mem3/issues/418)) ([d815814](https://github.com/fg-labs/bwa-mem3/commit/d815814233e570db2672c30a0fa873fa9444ad30))
+* **mem:** prefetch the CIGAR-emission reference-window cache line ([#425](https://github.com/fg-labs/bwa-mem3/issues/425)) ([cad4b4c](https://github.com/fg-labs/bwa-mem3/commit/cad4b4c7d2d3d35c4c728bb8c4f2ce5192f57d86))
+* **seed:** K-only backward extension in the SMEM pass, with micro-specializations ([#432](https://github.com/fg-labs/bwa-mem3/issues/432)) ([ef6c324](https://github.com/fg-labs/bwa-mem3/commit/ef6c32425410c955bd7cfe8b09907bda37f38bc5))
+* **seed:** make the phase-2 SMEM lockstep probe opt-in, not default ([#414](https://github.com/fg-labs/bwa-mem3/issues/414)) ([397e1a6](https://github.com/fg-labs/bwa-mem3/commit/397e1a6851dcadcc41d5fa125ea7b7704a160945))
+* sound byte-identical adaptive extension band (default on) ([#420](https://github.com/fg-labs/bwa-mem3/issues/420)) ([7733cf5](https://github.com/fg-labs/bwa-mem3/commit/7733cf569d5e3a9be053022091f6b36f334cd152))
+
+
+### Documentation
+
+* **mem:** document infer_bw as the ungapped-CIGAR fast path; drop stale FIXME ([#430](https://github.com/fg-labs/bwa-mem3/issues/430)) ([fb43e19](https://github.com/fg-labs/bwa-mem3/commit/fb43e19aa2ed855b4fb023e3d107f6247915f9e3))
+* **readme:** add performance section with current-release + full history ([#410](https://github.com/fg-labs/bwa-mem3/issues/410)) ([d1e9b43](https://github.com/fg-labs/bwa-mem3/commit/d1e9b43bc6d80bf017034e4667540cf3ba1ba479))
+
 ## [0.10.0](https://github.com/fg-labs/bwa-mem3/compare/v0.9.0...v0.10.0) (2026-08-21)
 
 
