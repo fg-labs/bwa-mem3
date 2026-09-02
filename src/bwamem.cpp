@@ -1508,8 +1508,8 @@ void mem_flt_chained_seeds(const mem_opt_t *opt, const bntseq_t *bns, const uint
  * byte-identical (drops candidate secondaries, so XS/secondary/MAPQ can move on
  * multi-mapping reads). Always keeps >= 1 chain. Returns the new chain count. */
 #define MAX_EXTEND_CHAINS_CAP 4096
-static int mem_chain_cap_extend(mem_chain_t *a, int n, int max_n, float tie_frac, int tie_floor,
-                                int *capped_w_out)
+int mem_chain_cap_extend(mem_chain_t *a, int n, int max_n, float tie_frac, int tie_floor,
+                         int *capped_w_out)
 {
     if (capped_w_out) *capped_w_out = 0;  /* max weight among dropped chains, for csub */
     /* The competitiveness gate applies even when the count cap does NOT engage
@@ -2825,8 +2825,13 @@ int mem_kernel1_core(FMI_search *fmi,
     // (which walks chain_ar unconditionally and free()s chain_ar[l].a) sees
     // a valid empty state, then let downstream stages emit unmapped records.
     if (tot_len == 0) {
-        for (int l = 0; l < nseq; ++l)
+        for (int l = 0; l < nseq; ++l) {
             kv_init(chain_ar[l]);
+            chain_ar[l].capped_w = 0;  /* Pass 2 (which sets this) is skipped on this
+                                        * early return; kv_init leaves it uninitialized.
+                                        * Harmless for output (no regions) but the
+                                        * --dedup-reads VERIFY instrument compares it. */
+        }
         return 1;
     }
     // enc_qdb is sized in *bytes* (= tot_len). Track its capacity via the

@@ -1574,7 +1574,7 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "    --no-adaptive-band  disable adaptive banded-SW (exact, byte-identical full-width extension; also disables the certified band); overrides --adaptive-band and the --adaptive-band that --fast enables\n");
     fprintf(stderr, "    --no-band-cert  disable the certified adaptive extension band (on by default): run the full-width extension ladder for every pair instead of the narrow-probe-plus-certificate. The certified band is byte-identical to full-width, so on a plain run this only removes the speedup; it has no effect under --fast, --adaptive-band, or --no-adaptive-band (which already disable the certified band). Escape hatch / A-B handle [%s]\n", opt->band_cert? "on":"off");
     fprintf(stderr, "    --extend-mate-concordant[=INT]  when --max-extend-chains caps a PE read, also keep any chain concordant (same contig, FR, within INT bp) with a mate chain; recovers the true pair's low-weight chain the cap would drop (mainly --meth). Bare = auto (window = estimated proper-pair insert high bound); =INT = fixed bp; =0 = off. Opt-in, NOT byte-identical [%s]\n", opt->mate_concordant_window? (opt->mate_concordant_window<0? "auto":"fixed") : "off");
-    fprintf(stderr, "    --extend-tie-frac FLOAT  with --max-extend-chains, extend a capped chain (ranked at/after --extend-tie-floor) only if its weight >= FLOAT * the best chain's weight -- trims non-competitive tail chains from banded-SW while still extending genuine near-ties; clamped to [0,1]; opt-in, NOT byte-identical (0 = off) [%.2f]\n", opt->extend_tie_frac);
+    fprintf(stderr, "    --extend-tie-frac FLOAT  extend a chain (ranked at/after --extend-tie-floor) only if its weight >= FLOAT * the best chain's weight -- trims non-competitive tail chains from banded-SW while still extending genuine near-ties. Complements --max-extend-chains (the count cap) and also gates on its own when that cap is off; clamped to [0,1]; opt-in, NOT byte-identical (0 = off) [%.2f]\n", opt->extend_tie_frac);
     fprintf(stderr, "    --extend-csub  when --extend-tie-frac/--max-extend-chains drops chains, seed the primary's competitor score with a calibrated estimate of the best dropped chain so MAPQ is not inflated by the pruning; opt-in, NOT byte-identical [%s]\n", opt->extend_csub? "on":"off");
     fprintf(stderr, "    --extend-tie-floor INT  always extend at least the top-INT chains regardless of --extend-tie-frac (0 = no floor; the fraction gate governs from rank 0, best chain always kept); only meaningful with --extend-tie-frac > 0 [%d]\n", opt->extend_tie_floor);
     fprintf(stderr, "    -D FLOAT      drop chains shorter than FLOAT fraction of the longest overlapping chain [%.2f]\n", opt->drop_ratio);
@@ -2780,7 +2780,7 @@ int main_mem(int argc, char *argv[])
          * and total mismapping); -11 to -17% wall on the bulk workloads. The two
          * --extend-tie-* levers honor an explicit user value (opt0); --extend-csub
          * has no opt-out flag and is forced on like --smem-dedup, since it only
-         * matters when the gate prunes, which --fast now always does. */
+         * matters when the cap/gate prunes, which --fast now always does. */
         if (!opt0.extend_tie_frac)  opt->extend_tie_frac  = 0.95;
         if (!opt0.extend_tie_floor) opt->extend_tie_floor = 1;
         opt->extend_csub = 1;
@@ -2981,11 +2981,11 @@ int main_mem(int argc, char *argv[])
             /* --skip-contained-ext is set but no-ops under --meth (internal gate), so it is
              * intentionally omitted from the meth audit line to reflect the effective levers.
              * --adaptive-band applies under --meth, so it stays (unless opted out). */
-            fprintf(stderr, "[M::%s] --fast: -m %d -y %ld --min-ext-len %d --smem-dedup --max-extend-chains %d %s -s %d --extend-mate-concordant --rescue-kmer=%d%s alnreg-sort=fast\n",
-                    __func__, opt->max_matesw, (long)opt->max_mem_intv, opt->min_ext_len, opt->max_extend_chains, adaptive_band_label, opt->split_width, opt->rescue_kmer, opt->rescue_skip ? " --rescue-skip" : "");
+            fprintf(stderr, "[M::%s] --fast: -m %d -y %ld --min-ext-len %d --smem-dedup --max-extend-chains %d %s -s %d --extend-mate-concordant --extend-tie-frac %.2f --extend-tie-floor %d%s --rescue-kmer=%d%s alnreg-sort=fast\n",
+                    __func__, opt->max_matesw, (long)opt->max_mem_intv, opt->min_ext_len, opt->max_extend_chains, adaptive_band_label, opt->split_width, opt->extend_tie_frac, opt->extend_tie_floor, opt->extend_csub ? " --extend-csub" : "", opt->rescue_kmer, opt->rescue_skip ? " --rescue-skip" : "");
         else
-            fprintf(stderr, "[M::%s] --fast: -m %d -y %ld --min-ext-len %d --smem-dedup --skip-contained-ext --max-extend-chains %d %s --extend-mate-concordant --rescue-kmer=%d%s alnreg-sort=fast\n",
-                    __func__, opt->max_matesw, (long)opt->max_mem_intv, opt->min_ext_len, opt->max_extend_chains, adaptive_band_label, opt->rescue_kmer, opt->rescue_skip ? " --rescue-skip" : "");
+            fprintf(stderr, "[M::%s] --fast: -m %d -y %ld --min-ext-len %d --smem-dedup --skip-contained-ext --max-extend-chains %d %s --extend-mate-concordant --extend-tie-frac %.2f --extend-tie-floor %d%s --rescue-kmer=%d%s alnreg-sort=fast\n",
+                    __func__, opt->max_matesw, (long)opt->max_mem_intv, opt->min_ext_len, opt->max_extend_chains, adaptive_band_label, opt->extend_tie_frac, opt->extend_tie_floor, opt->extend_csub ? " --extend-csub" : "", opt->rescue_kmer, opt->rescue_skip ? " --rescue-skip" : "");
         /* --fast also caps the batch size, which keeps the read/compute/write
          * pipeline overlapped at high -t. It re-partitions the input and so is not
          * byte-identical -- which --fast already is not -- hence it rides here
