@@ -362,7 +362,34 @@ typedef struct {
     mem_seed_t *seeds;
 } mem_chain_t;
 
-typedef struct { size_t n, m, cc; mem_chain_t *a; int capped_w; } mem_chain_v;
+/* Per-region record of a chain the cap/gate dropped before extension, so
+ * --extend-csub can seed a pruned competitor's score back into MAPQ. Replaces
+ * the former scalar capped_w. Lives on the chain/alnreg
+ * VECTORS below (never the kbtree-keyed mem_chain_t), so struct-size invariants
+ * are unaffected. */
+#define CAPPED_KEEP 4
+typedef struct { int32_t qb, qe, w, est, rid; int8_t is_alt; } capped_chain_t;
+typedef struct { int32_t n; capped_chain_t d[CAPPED_KEEP]; } capped_t;  /* top-KEEP dropped chains, w desc */
+
+void capped_clear(capped_t *c);
+void capped_push(capped_t *c, const capped_chain_t *d);
+int  capped_overlaps(const capped_chain_t *d, int qb, int qe, float mask_level);
+void chain_qspan(const mem_chain_t *c, int *qb, int *qe);
+
+/* Shared chain-cap core. Both --max-extend-chains callers route through this
+ * (mate list optional). Records the dropped chains into capped_out for
+ * --extend-csub. Byte-identical to the pre-unification two-function form when the
+ * tie-frac gate is off (the count cap + mate-concordant rescue are unchanged). */
+typedef struct {
+    int max_n; float tie_frac; int tie_floor;
+    int match_a;     /* opt->a, for est = w*a on the csub path */
+    int record;      /* fill capped_out iff set (extend_csub) */
+} cap_ctx_t;
+int mem_chain_cap_core(const cap_ctx_t *cx, mem_chain_t *a, int n,
+                       const mem_chain_t *mate, int mate_n, const bntseq_t *bns,
+                       int64_t win, capped_t *capped_out);
+
+typedef struct { size_t n, m, cc; mem_chain_t *a; capped_t capped; } mem_chain_v;
 
 typedef struct mem_alnreg_t {
     // mem_alnreg_t() {c=NULL;}
@@ -402,7 +429,7 @@ typedef struct mem_alnreg_t {
     int8_t meth_strand_hyp;
 } mem_alnreg_t;
 
-typedef struct { size_t n, m; mem_alnreg_t *a; int capped_w; } mem_alnreg_v;
+typedef struct { size_t n, m; mem_alnreg_t *a; capped_t capped; } mem_alnreg_v;
 /* capped_w: max WEIGHT among chains the cap/gate dropped before extension, carried
  * to worker_sam so --extend-csub can seed the primary region's competitor score
  * (a calibrated estimate, clamped below the primary's own score) and keep MAPQ from
@@ -643,11 +670,8 @@ void mem_reg2sam(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
 int mem_approx_mapq_se(const mem_opt_t *opt, const mem_alnreg_t *a) ;
 
 int mem_mark_primary_se(const mem_opt_t *opt, int n, mem_alnreg_t *a, int64_t id);
-void mem_seed_capped_csub(mem_alnreg_v *a, int match_a);  /* --extend-csub: seed primary csub from dropped chains */
-/* Exposed for unit tests (test/unit/test_chain_cap.cpp). */
-int  mem_chain_cap_extend(mem_chain_t *a, int n, int max_n, float tie_frac, int tie_floor,
-                          int *capped_w_out);   /* --max-extend-chains count cap + --extend-tie-frac gate */
-int  mem_capped_pair_subo(const mem_alnreg_v a[2], const int z[2], int o);  /* --extend-csub PE competitor floor */
+void mem_seed_capped_csub(mem_alnreg_v *a, const mem_opt_t *opt);  /* --extend-csub: seed csub/sub_n from dropped chains (per-region) */
+int  mem_capped_pair_subo(const mem_alnreg_v a[2], const int z[2], int o);  /* --extend-csub PE competitor floor (exposed for unit tests) */
 
 static void mem_mark_primary_se_core(const mem_opt_t *opt, int n, mem_alnreg_t *a, int_v *z);
 

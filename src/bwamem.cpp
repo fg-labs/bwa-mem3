@@ -1508,107 +1508,96 @@ void mem_flt_chained_seeds(const mem_opt_t *opt, const bntseq_t *bns, const uint
  * byte-identical (drops candidate secondaries, so XS/secondary/MAPQ can move on
  * multi-mapping reads). Always keeps >= 1 chain. Returns the new chain count. */
 #define MAX_EXTEND_CHAINS_CAP 4096
-int mem_chain_cap_extend(mem_chain_t *a, int n, int max_n, float tie_frac, int tie_floor,
-                         int *capped_w_out)
-{
-    if (capped_w_out) *capped_w_out = 0;  /* max weight among dropped chains, for csub */
-    /* The competitiveness gate applies even when the count cap does NOT engage
-     * (n <= max_n): a read with a handful of chains still pays banded-SW for every
-     * non-competitive one, and those reads are the bulk of the workload. Gating only
-     * reads that exceed max_n removes almost nothing (measured: -1% to -6% of
-     * extension work, vs -20% for a plain top-5 cap). With tie_frac <= 0 the original
-     * early-return is preserved exactly, so the gate-off path stays byte-identical. */
-    const int cap_on = max_n > 0;
-    if (n > MAX_EXTEND_CHAINS_CAP) return n;
-    if (tie_frac <= 0.0f && (!cap_on || n <= max_n)) return n;
-    int w[MAX_EXTEND_CHAINS_CAP];
-    int w_best = 0;
-    for (int i = 0; i < n; i++) {
-        w[i] = a[i].w > 0 ? a[i].w : mem_chain_weight(&a[i]);
-        if (w[i] > w_best) w_best = w[i];
+/* capped_t helpers (T1). Used by the cap core (T2) and mem_seed_capped_csub (T3);
+ * defined non-static so test/unit can exercise them directly. */
+void capped_clear(capped_t *c) { c->n = 0; }
+
+void capped_push(capped_t *c, const capped_chain_t *d)
+{   /* keep top-CAPPED_KEEP by w desc, stable on ties (earlier insert wins) */
+    int pos;
+    if (c->n < CAPPED_KEEP) { c->d[c->n++] = *d; pos = c->n - 1; }
+    else {
+        int lo = 0;
+        for (int i = 1; i < c->n; ++i) if (c->d[i].w < c->d[lo].w) lo = i;
+        if (d->w <= c->d[lo].w) return;
+        c->d[lo] = *d; pos = lo;
     }
-    /* competitiveness gate (--extend-tie-frac): a chain ranked at/after tie_floor is
-     * extended only if its weight is within tie_frac of the best chain's -- i.e. it is
-     * a genuine near-tie that could change placement/MAPQ. tie_frac<=0 disables the gate,
-     * reducing this to the pure top-max_n cap (baseline). tie_frac is clamped to [0,1]
-     * upstream, so (int)(tie_frac*w_best) <= w_best and the best chain (rank 0) always
-     * clears the gate -- the "keep >= 1 chain" invariant holds. */
-    int gate = tie_frac > 0.0f ? (int)(tie_frac * w_best) : 0;
-    /* keep chain i iff fewer than max_n other chains outrank it by
-     * (weight desc, then original index asc) -- a stable top-max_n selection --
-     * AND (it is within the always-extend floor OR it clears the competitiveness gate). */
-    int k = 0;
-    for (int i = 0; i < n; i++) {
-        int rank = 0;
-        for (int j = 0; j < n; j++) {
-            if (j == i) continue;
-            if (w[j] > w[i] || (w[j] == w[i] && j < i)) rank++;
-        }
-        if ((!cap_on || rank < max_n) && (rank < tie_floor || w[i] >= gate)) a[k++] = a[i];
-        else {
-            if (capped_w_out && w[i] > *capped_w_out) *capped_w_out = w[i];
-            if (a[i].m > SEEDS_PER_CHAIN) free(a[i].seeds);
-        }
+    while (pos > 0 && c->d[pos].w > c->d[pos-1].w) {
+        capped_chain_t t = c->d[pos]; c->d[pos] = c->d[pos-1]; c->d[pos-1] = t; --pos;
     }
-    return k;
 }
 
-/* --extend-mate-concordant: like mem_chain_cap_extend but additionally RETAINS
- * any chain concordant with a mate chain (same contig, FR orientation, within
- * `win` bp) even if it ranks below max_n. Targets the meth --fast pairing
- * regression: the true chain is often low-weight under bisulfite (collapsed
- * alphabet) and gets capped, yet it anchors the true concordant pair, so PE
- * pairing flips both mates to a wrong concordant locus. chain.pos is in the
- * original 2*l_pac coordinate space, so bns_depos gives the forward coord.
- * `win` is the estimated proper-pair insert high bound (pes[FR].high) when
- * available, else MATE_CONCORDANT_WINDOW_FALLBACK, else a fixed CLI value;
- * matching the aligner's own concordance bound keeps only genuine pair anchors
- * (far/spurious concordant chains stay capped, bounding the extra extension).
- * The mate scan is bounded (MATE_SCAN_MAX) to keep this O(n) in practice; the
- * true anchor is virtually always among a read's higher-ranked chains. */
-#define MATE_CONCORDANT_WINDOW_FALLBACK 1000  /* used only in --auto before the insert size is estimated (e.g. first chunk) */
-#define MATE_SCAN_MAX 256
-static int mem_chain_cap_extend_mate(mem_chain_t *a, int n, int max_n,
-        const mem_chain_t *mate, int mate_n, const bntseq_t *bns, int64_t win,
-        float tie_frac, int tie_floor, int *capped_w_out)
+int capped_overlaps(const capped_chain_t *d, int qb, int qe, float mask_level)
 {
-    if (capped_w_out) *capped_w_out = 0;  /* max weight among dropped chains, for csub */
-    /* See mem_chain_cap_extend: the competitiveness gate also applies when the count
-     * cap does not engage. tie_frac <= 0 preserves the original early-return exactly. */
-    const int cap_on = max_n > 0;
-    if (n > MAX_EXTEND_CHAINS_CAP) return n;
-    if (tie_frac <= 0.0f && (!cap_on || n <= max_n)) return n;
-    const int MSCAN = MATE_SCAN_MAX;
-    int mn = mate_n < MSCAN ? mate_n : MSCAN;
-    int64_t mfp[MSCAN]; int mrid[MSCAN], mrev[MSCAN];
-    for (int j = 0; j < mn; j++) {
-        int is_rev; mfp[j] = bns_depos(bns, mate[j].pos, &is_rev);
-        mrid[j] = mate[j].rid; mrev[j] = is_rev;
+    int b = d->qb > qb ? d->qb : qb, e = d->qe < qe ? d->qe : qe, ov = e - b;
+    int span_d = d->qe - d->qb, span_p = qe - qb;
+    if (ov <= 0 || span_d <= 0 || span_p <= 0) return 0;
+    int minspan = span_d < span_p ? span_d : span_p;
+    return (float)ov >= mask_level * (float)minspan;
+}
+
+void chain_qspan(const mem_chain_t *c, int *qb, int *qe)
+{
+    int lo = c->seeds[0].qbeg, hi = c->seeds[0].qbeg + c->seeds[0].len;
+    for (int i = 1; i < c->n; ++i) {
+        int b = c->seeds[i].qbeg, e = b + c->seeds[i].len;
+        if (b < lo) lo = b;
+        if (e > hi) hi = e;
     }
+    *qb = lo; *qe = hi;
+}
+
+#define MATE_CONCORDANT_WINDOW_FALLBACK 1000  /* --auto, before the insert size is estimated (first chunk) */
+#define MATE_SCAN_MAX 256
+
+/* Shared chain-cap core. Reproduces the pre-unification mem_chain_cap_extend /
+ * mem_chain_cap_extend_mate byte-for-byte. The competitiveness gate
+ * (--extend-tie-frac) applies even when the count cap does not engage; with
+ * tie_frac<=0 the original early-return is preserved exactly so the gate-off path
+ * stays byte-identical. When a mate list is supplied, a gate-failed chain
+ * concordant (same contig, FR, within `win`) with a mate chain is RETAINED (the
+ * #202 meth-pairing fix) and is NOT recorded as dropped. Dropped chains are pushed
+ * into capped_out (top-CAPPED_KEEP by weight) with est = w*match_a. Always keeps
+ * >=1 chain; returns the new chain count. */
+int mem_chain_cap_core(const cap_ctx_t *cx, mem_chain_t *a, int n,
+                       const mem_chain_t *mate, int mate_n, const bntseq_t *bns,
+                       int64_t win, capped_t *capped_out)
+{
+    if (capped_out) capped_clear(capped_out);
+    const int cap_on = cx->max_n > 0;
+    if (n > MAX_EXTEND_CHAINS_CAP) return n;
+    if (cx->tie_frac <= 0.0f && (!cap_on || n <= cx->max_n)) return n;
+
+    /* mate-concordance prep (only when a mate list is supplied) */
+    int mn = 0; int64_t mfp[MATE_SCAN_MAX]; int mrid[MATE_SCAN_MAX], mrev[MATE_SCAN_MAX];
+    if (mate && mate_n > 0 && bns) {
+        mn = mate_n < MATE_SCAN_MAX ? mate_n : MATE_SCAN_MAX;
+        for (int j = 0; j < mn; j++) {
+            int is_rev; mfp[j] = bns_depos(bns, mate[j].pos, &is_rev);
+            mrid[j] = mate[j].rid; mrev[j] = is_rev;
+        }
+    }
+
     int w[MAX_EXTEND_CHAINS_CAP];
     int w_best = 0;
     for (int i = 0; i < n; i++) {
         w[i] = a[i].w > 0 ? a[i].w : mem_chain_weight(&a[i]);
         if (w[i] > w_best) w_best = w[i];
     }
-    /* competitiveness gate (--extend-tie-frac); see mem_chain_cap_extend. The
-     * mate-concordant override below still runs after the gate, so a gate-failed
-     * (low-weight) chain that anchors the true concordant pair is still retained --
-     * exactly the #202 fix -- and the gate cannot drop a mate-concordant true pair. */
-    int gate = tie_frac > 0.0f ? (int)(tie_frac * w_best) : 0;
+    /* tie_frac is clamped to [0,1] upstream, so gate <= w_best and rank-0 always clears it. */
+    int gate = cx->tie_frac > 0.0f ? (int)(cx->tie_frac * w_best) : 0;
+
     int k = 0;
     for (int i = 0; i < n; i++) {
         int rank = 0;
         for (int j = 0; j < n; j++)
             if (j != i && (w[j] > w[i] || (w[j] == w[i] && j < i))) rank++;
-        int keep = (!cap_on || rank < max_n) && (rank < tie_floor || w[i] >= gate);
+        int keep = (!cap_on || rank < cx->max_n) && (rank < cx->tie_floor || w[i] >= gate);
         if (!keep && mn > 0) {
             int is_rev; int64_t fp = bns_depos(bns, a[i].pos, &is_rev);
             for (int j = 0; j < mn; j++)
                 if (mrid[j] == a[i].rid && mrev[j] != is_rev &&
-                    /* true FR ("innie"): the forward-strand chain must sit
-                     * at/upstream of the reverse-strand chain, else an RF
-                     * ("outie") pair within win bp would falsely qualify. */
+                    /* true FR ("innie"): forward chain at/upstream of the reverse chain */
                     ((!is_rev && fp <= mfp[j]) || (is_rev && mfp[j] <= fp))) {
                     int64_t d = fp > mfp[j] ? fp - mfp[j] : mfp[j] - fp;
                     if (d <= win) { keep = 1; break; }
@@ -1616,9 +1605,14 @@ static int mem_chain_cap_extend_mate(mem_chain_t *a, int n, int max_n,
         }
         if (keep) a[k++] = a[i];
         else {
-            /* --extend-csub: remember the heaviest chain we dropped, so the SAM stage
-             * can seed the pruned competitor back into MAPQ (mem_seed_capped_csub). */
-            if (capped_w_out && w[i] > *capped_w_out) *capped_w_out = w[i];
+            if (cx->record && capped_out) {
+                capped_chain_t d; memset(&d, 0, sizeof d);
+                chain_qspan(&a[i], &d.qb, &d.qe);
+                d.w = w[i]; d.rid = a[i].rid; d.is_alt = a[i].is_alt;
+                long e = (long)w[i] * cx->match_a;        /* competitor-score bound for csub */
+                d.est = e > INT32_MAX ? INT32_MAX : (int)e;
+                capped_push(capped_out, &d);
+            }
             if (a[i].m > SEEDS_PER_CHAIN) free(a[i].seeds);
         }
     }
@@ -2827,10 +2821,10 @@ int mem_kernel1_core(FMI_search *fmi,
     if (tot_len == 0) {
         for (int l = 0; l < nseq; ++l) {
             kv_init(chain_ar[l]);
-            chain_ar[l].capped_w = 0;  /* Pass 2 (which sets this) is skipped on this
-                                        * early return; kv_init leaves it uninitialized.
-                                        * Harmless for output (no regions) but the
-                                        * --dedup-reads VERIFY instrument compares it. */
+            capped_clear(&chain_ar[l].capped);  /* Pass 2 (which fills this) is skipped on this
+                                                 * early return; kv_init leaves it uninitialized.
+                                                 * Harmless for output (no regions) but the
+                                                 * --dedup-reads VERIFY instrument compares it. */
         }
         return 1;
     }
@@ -2956,23 +2950,20 @@ int mem_kernel1_core(FMI_search *fmi,
                  : (opt->est_insert_high > 0 ? opt->est_insert_high
                                              : MATE_CONCORDANT_WINDOW_FALLBACK);
     /* Pass 2: cap chains (mate-concordance-aware when --extend-mate-concordant). */
+    cap_ctx_t cx; memset(&cx, 0, sizeof cx);
+    cx.max_n = opt->max_extend_chains; cx.tie_frac = opt->extend_tie_frac;
+    cx.tie_floor = opt->extend_tie_floor;
+    cx.match_a = opt->a; cx.record = opt->extend_csub;
     for (int l=0; l<nseq; l++)
     {
         chn = &chain_ar[l];
-        int capped_w = 0;
         if (cap_mate_concordant && (l ^ 1) < nseq) {
             int ml = l ^ 1;  /* interleaved PE: mate is the sibling index */
-            chn->n = mem_chain_cap_extend_mate(chn->a, chn->n, opt->max_extend_chains,
-                                               chain_ar[ml].a, chain_ar[ml].n,
-                                               chain_bns, mate_win,
-                                               opt->extend_tie_frac, opt->extend_tie_floor,
-                                               &capped_w);
+            chn->n = mem_chain_cap_core(&cx, chn->a, chn->n, chain_ar[ml].a, chain_ar[ml].n,
+                                        chain_bns, mate_win, &chn->capped);
         } else {
-            chn->n = mem_chain_cap_extend(chn->a, chn->n, opt->max_extend_chains,
-                                          opt->extend_tie_frac, opt->extend_tie_floor,
-                                          &capped_w);
+            chn->n = mem_chain_cap_core(&cx, chn->a, chn->n, NULL, 0, chain_bns, 0, &chn->capped);
         }
-        chn->capped_w = opt->extend_csub ? capped_w : 0;  /* carried to worker_sam via regs */
     }
     printf_(VER, "7. Done mem_chain_flt..\n");
     // tprof[MEM_ALN_M1][tid] += __rdtsc() - tim;
@@ -3123,7 +3114,7 @@ int mem_kernel2_core(FMI_search *fmi,
         /* SAM-A18: stamp is_alt in this same pass. Each read's regions are now
          * final (dedup done) and is_alt is not read by any later read's dedup,
          * so folding the former separate full pass in here is byte-identical. */
-        regs[l].capped_w = chain_ar[l].capped_w;  /* ride the dropped-weight to worker_sam */
+        regs[l].capped = chain_ar[l].capped;  /* ride the dropped-chain records to worker_sam */
         for (i = 0; i < regs[l].n; ++i)
         {
             mem_alnreg_t *p = &regs[l].a[i];
@@ -3322,7 +3313,7 @@ static inline void read_memo_copy_regs(mem_alnreg_v *dst, const mem_alnreg_v *sr
     /* --extend-csub side channel: the dropped-chain weight rides the vector, not
      * the regions, so it must be copied too or a DUP loses its csub seed and
      * --dedup-reads on/off stop being byte-identical under --extend-csub. */
-    dst->capped_w = src->capped_w;
+    dst->capped = src->capped;
 }
 
 /* [dedup-reads] VERIFY (BWAMEM3_DEDUP_READS_VERIFY): the first mem_alnreg_t field
@@ -3351,9 +3342,10 @@ static void read_memo_verify_regs(const mem_alnreg_v *dup, const mem_alnreg_v *r
     if (dup->n != rep->n)
         err_fatal(__func__, "dedup-reads VERIFY: read %d has n=%zu but its representative has n=%zu",
                   read_idx, dup->n, rep->n);
-    if (dup->capped_w != rep->capped_w)
-        err_fatal(__func__, "dedup-reads VERIFY: read %d has capped_w=%d but its representative has capped_w=%d",
-                  read_idx, dup->capped_w, rep->capped_w);
+    if (dup->capped.n != rep->capped.n
+        || memcmp(dup->capped.d, rep->capped.d, (size_t)(dup->capped.n < 0 ? 0 : dup->capped.n) * sizeof(capped_chain_t)) != 0)
+        err_fatal(__func__, "dedup-reads VERIFY: read %d capped record diverges (n=%d vs %d)",
+                  read_idx, dup->capped.n, rep->capped.n);
     for (size_t i = 0; i < dup->n; ++i) {
         const char *f = read_memo_alnreg_field_diff(&dup->a[i], &rep->a[i]);
         if (f)
@@ -3491,7 +3483,7 @@ static void worker_sam(void *data, int seqid, int batch_size, int tid)
 #if V17  // Feature from v0.7.17 of orig. bwa-mem
             if (w->opt->flag & MEM_F_PRIMARY5) mem_reorder_primary5(w->opt->T, &w->regs[i]);
 #endif
-            mem_seed_capped_csub(&w->regs[i], w->opt->a);  /* --extend-csub (no-op when off) */
+            mem_seed_capped_csub(&w->regs[i], w->opt);  /* --extend-csub (no-op when off) */
             /* D3 (--meth): emit in ORIGINAL coords/alphabet via mem_aln_bns/pac. */
             mem_reg2sam(w->opt, mem_aln_bns(w), mem_aln_pac(w), &w->seqs[i],
                         &w->regs[i], 0, 0);
@@ -3864,19 +3856,29 @@ int mem_mark_primary_se(const mem_opt_t *opt, int n, mem_alnreg_t *a, int64_t id
  * weight*a version tripped `sub >= score -> return 0`, which the PE MAPQ
  * recombination then turned into spurious promotions). No-op when nothing was
  * dropped (capped_w == 0), so --extend-csub off is byte-identical. */
-void mem_seed_capped_csub(mem_alnreg_v *a, int match_a)
+void mem_seed_capped_csub(mem_alnreg_v *a, const mem_opt_t *opt)
 {
-    if (a->capped_w <= 0) return;
+    if (a->capped.n <= 0) return;
+    /* near-tie band == mem_mark_primary_se_core's tmp = max(a+b, o_del+e_del, o_ins+e_ins) */
+    int tmp = opt->a + opt->b;
+    if (opt->o_del + opt->e_del > tmp) tmp = opt->o_del + opt->e_del;
+    if (opt->o_ins + opt->e_ins > tmp) tmp = opt->o_ins + opt->e_ins;
     for (size_t r = 0; r < a->n; ++r) {
         mem_alnreg_t *p = &a->a[r];
-        if (p->secondary >= 0) continue;            /* primary regions only */
+        if (p->secondary >= 0) continue;            /* primary AND supplementary; never secondaries */
         int span = p->qe - p->qb;
         if (span <= 0 || p->score <= 0) continue;
-        /* TUNING(csub): all-match rate (weight*a). The clamp below is what makes this
-         * safe (the naive unclamped weight*a tripped `sub>=score -> mapq 0`). */
-        long est = (long)a->capped_w * match_a;
-        if (est >= p->score) est = p->score - 1;    /* clamp: never force mapq 0 */
-        if (est > p->csub) p->csub = (int)est;
+        for (int k = 0; k < a->capped.n; ++k) {
+            const capped_chain_t *d = &a->capped.d[k];
+            /* per-region: a dropped chain demotes a region only where it OVERLAPS it on
+             * the query (mask_level rule, as mem_mark_primary_se_core does for real regions) */
+            if (!capped_overlaps(d, p->qb, p->qe, opt->mask_level)) continue;
+            if (!(d->is_alt || !p->is_alt)) continue;   /* a non-ALT competitor never demotes an ALT region */
+            long est = d->est;                          /* the dropped chain's w*a competitor bound */
+            if (est >= p->score) est = p->score - 1;    /* clamp: never force mapq 0 */
+            if (est > p->csub) p->csub = (int)est;
+            if (p->score - est <= tmp) ++p->sub_n;      /* A.3: same near-tie rule as `sub` */
+        }
     }
 }
 
