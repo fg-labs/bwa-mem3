@@ -92,7 +92,7 @@ regenerate the [declared divergence catalog](#declared-divergence-catalog) is pe
 > **This is a compatibility choice, not a correctness claim.** Gap-from-`H` is textbook
 > Gotoh and what ksw2/minimap2 do; gap-from-`M` is a deliberate bwa idiosyncrasy. `#256`
 > chooses bwa-mem2 output compatibility over the convention because bwa-mem3 is a drop-in
-> replacement. `IPNP-BIPN/bwa-mem4` made the same call (`990df3a`) for the same reason.
+> replacement.
 
 ## Byte-identical output (`--compat`)
 
