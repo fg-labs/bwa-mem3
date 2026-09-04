@@ -1557,7 +1557,9 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "    -o STR        Output SAM file name\n");
     fprintf(stderr, "    --bam[=N]     Emit BAM instead of SAM text. N=0 (default) = uncompressed;\n");
     fprintf(stderr, "                  1..9 = BGZF deflate levels. Writes to stdout; redirect with `>`.\n");
-    fprintf(stderr, "    -t INT        number of threads [%d]\n", opt->n_threads);
+    fprintf(stderr, "    -t INT        number of threads, up to %d; values above %d are\n"
+                     "                  clamped to %d [%d]\n",
+            MAX_THREADS, MAX_THREADS, MAX_THREADS, opt->n_threads);
     fprintf(stderr, "    -k INT        minimum seed length [%d]\n", opt->min_seed_len);
     fprintf(stderr, "    -w INT        band width for banded alignment [%d]\n", opt->w);
     fprintf(stderr, "    -d INT        off-diagonal X-dropoff [%d]\n", opt->zdrop);
@@ -2043,8 +2045,24 @@ int main_mem(int argc, char *argv[])
         else if (c == 'T') opt->T = atoi(optarg), opt0.T = 1, assert(opt->T >= INT_MIN && opt->T <= INT_MAX);
         else if (c == 'U')
             opt->pen_unpaired = atoi(optarg), opt0.pen_unpaired = 1, assert(opt->pen_unpaired >= INT_MIN && opt->pen_unpaired <= INT_MAX);
-        else if (c == 't')
-            opt->n_threads = atoi(optarg), opt->n_threads = opt->n_threads > 1? opt->n_threads : 1, assert(opt->n_threads >= INT_MIN && opt->n_threads <= INT_MAX);
+        else if (c == 't') {
+            /* atoi() silently maps unparseable input to 0 and ignores
+             * trailing garbage (e.g. "-t nope" -> 0, "-t 300oops" -> 300), so
+             * a typo would read as a valid-looking thread count with no
+             * diagnostic. Reject anything that is not a complete integer; a
+             * parseable value that is <= 0 still floors to 1 as before (not
+             * an error -- "at least one thread" is the existing contract),
+             * and a value above MAX_THREADS is still clamped, with its own
+             * warning, after getopt below. */
+            int64_t v;
+            if (parse_bounded_i64(optarg, INT_MIN, INT_MAX, &v) != 0) {
+                fprintf(stderr, "ERROR: -t requires an integer thread count, got '%s'\n", optarg);
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+            opt->n_threads = (int)(v > 1 ? v : 1);
+        }
         else if (c == 'o' || c == 'f')
         {
             /* Capture the path; defer opening until after --bam is parsed so
@@ -2493,6 +2511,16 @@ int main_mem(int argc, char *argv[])
     }
 
     if (opt->n_threads < 1) opt->n_threads = 1;
+    if (opt->n_threads > MAX_THREADS) {
+        /* Per-thread profiling arrays (tprof[][tid], sized to LIM_C >= MAX_THREADS
+         * -- see the static_assert in macro.h) are indexed by tid up to
+         * n_threads-1, so n_threads must not exceed MAX_THREADS or the write
+         * corrupts adjacent globals. Clamp rather than abort, matching how the
+         * pipeline already floors n_threads to 1. */
+        fprintf(stderr, "[W::%s] -t %d exceeds the %d-thread maximum; clamping to %d.\n",
+                __func__, opt->n_threads, MAX_THREADS, MAX_THREADS);
+        opt->n_threads = MAX_THREADS;
+    }
     mem_dedup_configure(dedup_mode_arg);   /* --dedup CLI > env BWAMEM3_DEDUP > default 'auto'; fatal on bad value */
     mem_dedup_reads_configure(dedup_reads_mode_arg); /* --dedup-reads CLI > env BWAMEM3_DEDUP_READS > default 'auto'; fatal on bad value */
     /* A stray word on the command line slides silently into a positional slot.

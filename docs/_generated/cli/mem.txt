@@ -4,7 +4,8 @@ Options:
     -o STR        Output SAM file name
     --bam[=N]     Emit BAM instead of SAM text. N=0 (default) = uncompressed;
                   1..9 = BGZF deflate levels. Writes to stdout; redirect with `>`.
-    -t INT        number of threads [1]
+    -t INT        number of threads, up to 256; values above 256 are
+                  clamped to 256 [1]
     -k INT        minimum seed length [19]
     -w INT        band width for banded alignment [100]
     -d INT        off-diagonal X-dropoff [100]

@@ -10,6 +10,10 @@ bwa-mem3 parallelizes alignment by dividing the input into fixed-size batches
 (controlled by `-K`) and processing batches concurrently. Threads share the
 in-memory FM-index; there is no per-thread copy.
 
+`-t` accepts up to 256 threads; a value above 256 is clamped to 256 (with a
+warning printed to stderr) rather than rejected, since the per-thread
+profiling arrays are sized to that maximum.
+
 ## How threads interact with performance
 
 ### Where threads help

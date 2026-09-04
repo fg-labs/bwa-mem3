@@ -858,11 +858,13 @@ when reproducing bwameth.py output bit-for-bit.
 
 #### `-t INT` — number of threads
 
-Number of worker threads. Defaults to 1. Set to the number of physical cores
-available to this job. Scaling is workload- and hardware-dependent: on typical
-machines the curve flattens around 16–32 threads (FM-index bandwidth and I/O
-contention dominate); on high-memory / fast-I/O servers the aligner can keep
-scaling toward ~64 threads on hg38 before saturating. See the threading guide
+Number of worker threads. Defaults to 1, maximum 256 — a representable integer
+value above 256 is clamped to 256 (with a warning) rather than rejected, since
+the per-thread profiling arrays are sized to that maximum. A value outside the
+signed 32-bit `int` range (e.g. `2147483648`) is rejected as a parse error, and
+a value of zero or below floors to 1. Set to the number of physical
+cores available to this job. Scaling is workload-, hardware-, and storage-dependent.
+Measure representative input on the target host to select a thread count. See the threading guide
 for measured guidance and per-machine recommendations.
 
 See [User Guide — Threading and resource use](../user-guide/threading.md) for
