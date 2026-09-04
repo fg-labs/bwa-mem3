@@ -481,7 +481,7 @@ STANDALONE_TESTS = kswv_nrow_zero_test kswv_freed_cell_test \
                    detect_sa_compx_test nst_nt4_decode_test \
                    read_arena_overflow_test packed_text_neg_nbases_test \
                    packed_text_overflow_nbases_test \
-                   mem_gen_alt_zero_calloc_test
+                   mem_gen_alt_zero_calloc_test srtgg_grow_multi_test
 STANDALONE_TEST_OBJS = $(STANDALONE_TESTS:%=test/%.o)
 
 # shm_pack_round_trip_test is excluded from `test:` because it runs via
@@ -912,6 +912,14 @@ shm_lock_destroy_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/shm_lock_destr
 kt_for_pool_test: $(BWA_LIB) $(HTS_LIB) test/kt_for_pool_test.o
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/kt_for_pool_test.o $(BWA_LIB) $(LIBS) -o $@
 
+# mem_chain2aln_across_reads_V2 srtgg growth-loop regression. Meaningful under
+# ASan (`make ASAN=1 srtgg_grow_multi_test`): a single chain with a seed count
+# past a single doubling of srtgg's initial capacity over-writes the buffer
+# under the buggy single-doubling growth; the loop-until-it-fits fix runs
+# clean. See the test's header comment.
+srtgg_grow_multi_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/srtgg_grow_multi_test.o
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/srtgg_grow_multi_test.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
+
 # Standalone on purpose: it defines its own calloc so a zero-size request can
 # return NULL, and that interposition must not reach any other test. See the
 # header comment in the source.
@@ -1150,6 +1158,9 @@ test/shm_lock_destroy_test.o: test/shm_lock_destroy_test.cpp
 	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
 
 test/kt_for_pool_test.o: test/kt_for_pool_test.cpp
+	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
+
+test/srtgg_grow_multi_test.o: test/srtgg_grow_multi_test.cpp
 	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
 
 test/bns_zero_calloc_test.o: test/bns_zero_calloc_test.cpp
