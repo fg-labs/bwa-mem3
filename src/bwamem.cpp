@@ -3928,7 +3928,13 @@ void mem_seed_capped_csub(mem_alnreg_v *a, int match_a)
          * safe (the naive unclamped weight*a tripped `sub>=score -> mapq 0`). */
         long est = (long)a->capped_w * match_a;
         if (est >= p->score) est = p->score - 1;    /* clamp: never force mapq 0 */
-        if (est > p->csub) p->csub = (int)est;
+        /* Seed the pruned competitor into `sub`, NOT `csub`. csub is the tandem-hit slot,
+         * capped mate-BLIND after the +40 PE pair promotion (bwamem_pair.cpp) -- routing a
+         * dropped (mate-non-concordant under the mate-aware --fast cap) chain there over-demotes
+         * correct paired reads in paralog/pseudogene regions. `sub` feeds the promotable q_se, so
+         * pairing can rescue reads the mate resolves. SE MAPQ and XS both read max(sub,csub), so
+         * single-end output is byte-identical. */
+        if (est > p->sub) p->sub = (int)est;
     }
 }
 
