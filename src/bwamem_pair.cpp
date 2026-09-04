@@ -679,6 +679,17 @@ int mem_matesw(const mem_opt_t *opt, const bntseq_t *bns,
         if (re > l_pac<<1) re = l_pac<<1;
         static thread_local u8vec_scratch_t t_ref;
         if (rb < re) {
+            /* Prefetch the rescue window's first pac[] cache line ahead of the fetch (cf. AP6).
+             * Best-effort: the rescue window (a->rb ± pes[r]) is unbounded, so when it straddles a
+             * contig boundary bns_fetch_seq_into clamps the read start up to far_beg and this hint
+             * — computed from the pre-clamp rb — can target a line the fetch never reads. Harmless
+             * (it just misses), never wrong output. bns_depos maps the strand-dependent window
+             * start; the outer is_rev is load-bearing, so discard bns_depos's strand into a
+             * scratch and do NOT reuse that name. Pure hint -> byte-identical. */
+            {
+                int is_rev_pf;  // discarded; do NOT reuse the outer is_rev
+                __builtin_prefetch(&pac[bns_depos(bns, rb, &is_rev_pf) >> 2], 0, 3);
+            }
             size_t want = (size_t)((re - rb) + 64);
             if (t_ref.v.m < want) kv_resize(uint8_t, t_ref.v, want);
             int64_t rlen;

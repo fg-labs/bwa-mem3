@@ -1308,6 +1308,18 @@ int mem_seed_sw(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
     if (qe - qb >= MEM_SHORT_LEN || re - rb >= MEM_SHORT_LEN) return -1; // the seed seems good enough; no need to do SW
 
     {
+        /* Prefetch the reference window's first pac[] cache line a few instructions ahead of the
+         * fetch (cf. AP6 on the CIGAR-emission path): bns_fetch_seq_into makes a random
+         * ~DRAM-latency load. The head start is modest — only the scratch-resize check and
+         * bns_pos2rid sit between the hint and the load — but the window is bounded by
+         * MEM_SHORT_EXT (~13 packed bytes), so the pre-clamp rb used here and the post-clamp start
+         * bns_get_seq_into actually reads almost always land in the same cache line. bns_depos maps
+         * the strand-dependent window start (fwd pac[rb>>2]; rev pac[(2*l_pac-1-rb)>>2]). Pure hint
+         * -> byte-identical. */
+        {
+            int is_rev_pf;  // discarded; bns_depos also reports the strand
+            __builtin_prefetch(&pac[bns_depos(bns, rb, &is_rev_pf) >> 2], 0, 3);
+        }
         static thread_local u8vec_scratch_t t_rseq;
         size_t want = (size_t)((re - rb) + 64);
         if (t_rseq.v.m < want) kv_resize(uint8_t, t_rseq.v, want);
