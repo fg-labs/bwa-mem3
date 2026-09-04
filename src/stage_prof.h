@@ -80,6 +80,12 @@ double sp_run_elapsed(void);   /* sp_wall() - run-start anchor (for chunk_start)
 
 void   sp_chunk_init(prof_chunk_t *c);
 void   sp_add_chunk(const prof_chunk_t *c);
+/* Test-only fault-injection seam: arm the next `n` chunk-buffer growths in
+ * sp_add_chunk to behave as if realloc returned NULL, so the out-of-memory
+ * drop-and-count path (g_n_dropped plus the "report is incomplete" diagnostic)
+ * can be exercised deterministically without depending on host OOM. Present only
+ * in STAGE_PROF builds; the aligner never calls it. */
+void   sp_test_arm_realloc_fail(int n);
 /* Accumulate pipeline-worker idle seconds, attributed to the step it was about
  * to run (0=read 1=process 2=write); also adds to the total. */
 void   sp_add_idle(int next_step, double seconds);

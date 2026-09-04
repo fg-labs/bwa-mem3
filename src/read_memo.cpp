@@ -174,6 +174,13 @@ static void readmemo_state_grow(read_memo_state *st, int npairs)
 read_memo_result read_memo_prepass(const mem_opt_t * /*opt*/, const bseq1_t *seqs,
                                    int n, read_memo_state *st)
 {
+    /* PE-only, even n: the sole caller (bwamem.cpp) gates on
+     * (flag & MEM_F_PE) && n>0 && (n&1)==0. Enforce it fail-closed -- an odd or
+     * zero n would silently drop the tail read and leave role[npairs] stale for
+     * the bwamem consumers (worker_bwt_memo/worker_copy_regs), a silent wrong
+     * regs copy rather than a crash. xassert (not assert) so the guard survives
+     * a -DNDEBUG build. */
+    xassert(n > 0 && (n & 1) == 0, "read_memo_prepass requires n>0 and even n");
     const auto t0 = std::chrono::steady_clock::now();
     const int npairs = n >> 1;
     readmemo_state_grow(st, npairs);

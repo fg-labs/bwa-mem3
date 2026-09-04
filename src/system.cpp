@@ -40,8 +40,9 @@ bool read_small_file(const char* path, std::string& out) {
     char buf[4096];
     size_t n = std::fread(buf, 1, sizeof(buf) - 1, fp);
     bool truncated = (n == sizeof(buf) - 1) && !std::feof(fp);
+    bool ioerr = std::ferror(fp) != 0;   /* a mid-read I/O error must not pass as valid content */
     std::fclose(fp);
-    if (truncated) return false;
+    if (truncated || ioerr) return false;
     buf[n] = '\0';
     out.assign(buf, n);
     return true;
@@ -65,7 +66,11 @@ int64_t parse_u64_or_unlimited(const char* s) {
 
 // Ceil-div for positive inputs. Caller guards period > 0.
 int ceil_div_to_int(int64_t quota, int64_t period) {
-    int64_t c = (quota + period - 1) / period;
+    /* Compute ceil(quota/period) without the (quota + period - 1) addition,
+     * which can overflow int64 on garbage/huge cgroup values. Result clamped
+     * to [1, INT_MAX]. */
+    int64_t c = quota / period;
+    if (quota % period != 0) ++c;
     if (c < 1) c = 1;
     if (c > INT_MAX) c = INT_MAX;
     return (int)c;
