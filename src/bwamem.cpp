@@ -1474,7 +1474,7 @@ void mem_flt_chained_seeds(const mem_opt_t *opt, const bntseq_t *bns, const uint
             const char *os = seq_[c->seqid].meth_orig_seq;
             for (int q = 0; q < l_query; ++q) {
                 unsigned char ch = (unsigned char) os[q];
-                meth_qbuf[q] = (ch < 4) ? ch : nst_nt4_table[ch];
+                meth_qbuf[q] = nst_nt4_decode(ch, 4);
             }
             query = meth_qbuf;
             /* D3 (--meth, fix): strand-adjusted hypothesis — this chain's seeds
@@ -2988,8 +2988,10 @@ int mem_kernel1_core(FMI_search *fmi,
         int len = seq_[l].l_seq;
         tot_len += len;
 
-        for (i = 0; i < len; ++i)
-            seq[i] = seq[i] < 4? seq[i] : nst_nt4_table[(int)seq[i]]; //nst_nt4??
+        for (i = 0; i < len; ++i) {
+            unsigned char ch = (unsigned char) seq[i];
+            seq[i] = nst_nt4_decode(ch, 4); //nst_nt4??
+        }
     }
     // Empty-batch fast path: a 0-base batch (e.g. malformed FASTQ parsed as a
     // single zero-length record) tripped the lazy-init grow block below with
@@ -3282,7 +3284,7 @@ int mem_kernel2_core(FMI_search *fmi,
             const char *os = seq_[l].meth_orig_seq;
             for (int q = 0; q < l_query; ++q) {
                 unsigned char ch = (unsigned char) os[q];
-                dd_qbuf[q] = (ch < 4) ? ch : nst_nt4_table[ch];
+                dd_qbuf[q] = nst_nt4_decode(ch, 4);
             }
             dd_query = dd_qbuf;
             /* per-read STRAND-ADJUSTED hypothesis (see meth_strand_hyp); take the
@@ -3357,8 +3359,10 @@ static void worker_bwt_memo(worker_t *w, int seq_id, int batch_size, int tid)
     for (int l = 0; l < batch_size; ++l) {
         char *s = seqs[l].seq;
         const int len = seqs[l].l_seq;
-        for (int i = 0; i < len; ++i)
-            s[i] = s[i] < 4 ? s[i] : nst_nt4_table[(int) s[i]];
+        for (int i = 0; i < len; ++i) {
+            unsigned char ch = (unsigned char) s[i];
+            s[i] = nst_nt4_decode(ch, 4);
+        }
     }
 
     /* Compact REP pairs into a dense view (struct copies; seq/name/qual pointers
@@ -4535,8 +4539,10 @@ mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *
      * handed &query[qb] with length qe-qb); the encode was over the whole read.
      * Encode only the consumed window — the untouched prefix/suffix are never
      * referenced, so output is byte-identical. */
-    for (i = qb; i < qe; ++i) // convert to the nt4 encoding
-        query[i] = regen_query[i] < 5? regen_query[i] : nst_nt4_table[(int)regen_query[i]];
+    for (i = qb; i < qe; ++i) { // convert to the nt4 encoding
+        unsigned char ch = (unsigned char) regen_query[i];
+        query[i] = nst_nt4_decode(ch, 5);
+    }
     a.mapq = ar->secondary < 0? mem_approx_mapq_se(opt, ar) : 0;
     if (ar->secondary >= 0) a.flag |= 0x100; // secondary alignment
     tmp = infer_bw(qe - qb, re - rb, ar->truesc, opt->a, opt->o_del, opt->e_del);
@@ -6158,7 +6164,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
             const char *os = seq_[l].meth_orig_seq;
             for (int i = 0; i < l_query; ++i) {
                 unsigned char c = (unsigned char) os[i];
-                meth_qbuf[i] = (c < 4) ? c : nst_nt4_table[c];
+                meth_qbuf[i] = nst_nt4_decode(c, 4);
             }
             query = meth_qbuf;
         }

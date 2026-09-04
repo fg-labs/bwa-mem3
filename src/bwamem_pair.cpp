@@ -650,7 +650,7 @@ int mem_matesw(const mem_opt_t *opt, const bntseq_t *bns,
         xassert(ms2 != NULL, "out of memory: ms2");
         for (int k = 0; k < l_ms; ++k) {
             unsigned char c = (unsigned char) ms_orig[k];
-            ms2[k] = (c < 4) ? c : nst_nt4_table[c];
+            ms2[k] = nst_nt4_decode(c, 4);
         }
         ms = ms2; // alias the projected-mate pointer to the original bases
     }
@@ -1886,7 +1886,7 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
         xassert(ms2 != NULL, "out of memory: ms2");
         for (int k = 0; k < l_ms; ++k) {
             unsigned char c = (unsigned char) ms_orig[k];
-            ms2[k] = (c < 4) ? c : nst_nt4_table[c];
+            ms2[k] = nst_nt4_decode(c, 4);
         }
         ms = ms2;
     }
@@ -2212,7 +2212,7 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
         xassert(ms2 != NULL, "out of memory: ms2");
         for (int k = 0; k < l_ms; ++k) {
             unsigned char c = (unsigned char) ms_orig[k];
-            ms2[k] = (c < 4) ? c : nst_nt4_table[c];
+            ms2[k] = nst_nt4_decode(c, 4);
         }
         ms = ms2;
     }
