@@ -477,7 +477,7 @@ STANDALONE_TESTS = kswv_nrow_zero_test kswv_freed_cell_test \
                    bandedswa_high_h0_zdrop_test shm_section_find_test \
                    shm_pack_round_trip_test shm_lock_destroy_test \
                    kt_for_pool_test bns_zero_calloc_test \
-                   kernel_padded_lane_uninit_test
+                   kernel_padded_lane_uninit_test bam_rec_scratch_test
 STANDALONE_TEST_OBJS = $(STANDALONE_TESTS:%=test/%.o)
 
 # shm_pack_round_trip_test is excluded from `test:` because it runs via
@@ -1090,6 +1090,14 @@ test/kt_for_pool_test.o: test/kt_for_pool_test.cpp
 	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
 
 test/bns_zero_calloc_test.o: test/bns_zero_calloc_test.cpp
+	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
+
+# Header-only: exercises BamRecScratch::grow() geometric growth. Uses no lib
+# symbols (POD kstring_t + malloc/free), so it links against libc alone.
+bam_rec_scratch_test: test/bam_rec_scratch_test.o
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/bam_rec_scratch_test.o -o $@
+
+test/bam_rec_scratch_test.o: test/bam_rec_scratch_test.cpp
 	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
 
 # Archive both the baseline (unmangled) kernel objects from $(OBJS) and the

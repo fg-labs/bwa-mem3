@@ -21,6 +21,8 @@
 
 #include <cstdlib>
 
+#include "grow_capacity.h"
+
 namespace bwamem3 {
 
 /* Per-thread scratch for the transient bam_cigar / seq_text / qual_bin buffers
@@ -77,11 +79,16 @@ private:
     static T *grow(T *&buf, size_t &cap, size_t n) {
         if (n <= cap) return buf;
         if (n > SIZE_MAX / sizeof(T)) return nullptr;
-        T *next = static_cast<T *>(malloc(n * sizeof(T)));
+        // Geometric growth (shared policy: grow_capacity in grow_capacity.h) to
+        // amortize repeated grows: double the capacity but never below n. The
+        // n <= SIZE_MAX/sizeof(T) guard above bounds n, and grow_capacity clamps
+        // the doubled value the same way, so want*sizeof(T) cannot overflow.
+        size_t want = grow_capacity(cap, n, sizeof(T));
+        T *next = static_cast<T *>(malloc(want * sizeof(T)));
         if (next == nullptr) return nullptr;
         free(buf);
         buf = next;
-        cap = n;
+        cap = want;
         return buf;
     }
 };

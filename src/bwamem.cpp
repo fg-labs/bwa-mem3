@@ -37,6 +37,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "meth_bam.h"
 #include "u8vec_scratch.h"
 #include "kvec.h"          /* kvec_t/kv_push/kv_resize used directly below */
+#include "grow_capacity.h" /* shared geometric-growth policy for scratch buffers */
 #include "pdqsort_wrap.h"
 #include "robin_hood.h"    /* per-batch DP-job dedup: missidx candidate map */
 #include <inttypes.h>      /* PRId64 for int64_t fprintf format strings */
@@ -796,8 +797,7 @@ PDQSORT_INIT(mem_ars, mem_alnreg_t, alnreg_slt)
 static inline void *scratch_grow(u8vec_scratch_t &s, size_t want)
 {
     if (s.v.m < want) {
-        size_t cap = s.v.m * 2;
-        if (cap < want) cap = want;
+        size_t cap = grow_capacity(s.v.m, want, 1);   /* byte-counted: shared growth policy */
         uint8_t *p = (uint8_t *)realloc(s.v.a, cap);
         if (p == NULL) return NULL;   /* keep the existing buffer intact */
         s.v.a = p;
