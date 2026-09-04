@@ -39,6 +39,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #endif
 #include <sstream>
 #include <getopt.h>
+#include <cmath>      /* std::isfinite: reject non-finite -I insert-size values */
 #include <errno.h>    /* errno/ERANGE: strtoll validation of the INT options */
 #include <unistd.h>   /* access(): --compat's "you passed a file" diagnostic */
 #ifdef BWA_MEM3_DEBUG_RESCUE_STATS
@@ -1628,7 +1629,7 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "   -A INT        score for a sequence match, which scales options -TdBOELU unless overridden [%d]\n", opt->a);
     fprintf(stderr, "   -B INT        penalty for a mismatch [%d]\n", opt->b);
     fprintf(stderr, "   -O INT[,INT]  gap open penalties for deletions and insertions [%d,%d]\n", opt->o_del, opt->o_ins);
-    fprintf(stderr, "   -E INT[,INT]  gap extension penalty; a gap of size k cost '{-O} + {-E}*k' [%d,%d]\n", opt->e_del, opt->e_ins);
+    fprintf(stderr, "   -E INT[,INT]  gap extension penalty (must be positive); a gap of size k cost '{-O} + {-E}*k' [%d,%d]\n", opt->e_del, opt->e_ins);
     fprintf(stderr, "   -L INT[,INT]  penalty for 5'- and 3'-end clipping [%d,%d]\n", opt->pen_clip5, opt->pen_clip3);
     fprintf(stderr, "   -U INT        penalty for an unpaired read pair [%d]\n", opt->pen_unpaired);
 //  fprintf(stderr, "   -x STR        read type. Setting -x changes multiple parameters unless overriden [null]\n");
@@ -1685,8 +1686,8 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "   -Y            use soft clipping for supplementary alignments\n");
     fprintf(stderr, "   -M            mark shorter split hits as secondary\n");
     fprintf(stderr, "   -I FLOAT[,FLOAT[,INT[,INT]]]\n");
-    fprintf(stderr, "                 specify the mean, standard deviation (10%% of the mean if absent), max\n");
-    fprintf(stderr, "                 (4 sigma from the mean if absent) and min of the insert size distribution.\n");
+    fprintf(stderr, "                 specify the mean, standard deviation (10%% of the mean if absent; must be\n");
+    fprintf(stderr, "                 positive), max (4 sigma from the mean if absent) and min of the insert size distribution.\n");
     fprintf(stderr, "                 Sets the FR distribution only and skips inference, so FF/RF/RR get none:\n");
     fprintf(stderr, "                 no proper-pair flag or mate rescue there. As in bwa/bwa-mem2. [inferred]\n");
     fprintf(stderr, "Methylation (--meth) options:\n");
@@ -2180,6 +2181,16 @@ int main_mem(int argc, char *argv[])
             opt->e_del = opt->e_ins = strtol(optarg, &p, 10);
             if (*p != 0 && ispunct(*p) && isdigit(p[1]))
                 opt->e_ins = strtol(p+1, &p, 10);
+            if (opt->e_del < 1 || opt->e_ins < 1) {
+                // A zero/negative gap-extension penalty makes cal_max_gap divide
+                // by zero (arch-divergent UB); reject it rather than align with
+                // a degenerate band.
+                fprintf(stderr, "ERROR: -E gap-extension penalty must be a positive integer (got %d,%d)\n",
+                        opt->e_del, opt->e_ins);
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
         }
         else if (c == 'L')
         {
@@ -2552,13 +2563,49 @@ int main_mem(int argc, char *argv[])
             pes[1].std = pes[1].avg * .1;
             if (*p != 0 && ispunct(*p) && isdigit(p[1]))
                 pes[1].std = strtod(p+1, &p);
+            // A non-finite mean (e.g. -I nan / -I inf) makes the (int) casts
+            // below undefined and arch-divergent; reject it before any cast.
+            if (!std::isfinite(pes[1].avg)) {
+                fprintf(stderr, "ERROR: -I mean insert size must be a finite number (got %g)\n",
+                        pes[1].avg);
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+            // A zero/negative/NaN std makes mem_pair divide by zero -> NaN ->
+            // pairing silently disabled; a non-finite std (e.g. -I 300,1e400)
+            // makes the (int) casts below undefined. Reject either. (The divide
+            // is also guarded defensively for the mem_pestat path.)
+            if (!(pes[1].std > 0.) || !std::isfinite(pes[1].std)) {
+                fprintf(stderr, "ERROR: -I standard deviation must be a positive number (got %g)\n",
+                        pes[1].std);
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
             pes[1].high = (int)(pes[1].avg + 4. * pes[1].std + .499);
             pes[1].low  = (int)(pes[1].avg - 4. * pes[1].std + .499);
             if (pes[1].low < 1) pes[1].low = 1;
-            if (*p != 0 && ispunct(*p) && isdigit(p[1]))
-                pes[1].high = (int)(strtod(p+1, &p) + .499);
-            if (*p != 0 && ispunct(*p) && isdigit(p[1]))
-                pes[1].low  = (int)(strtod(p+1, &p) + .499);
+            if (*p != 0 && ispunct(*p) && isdigit(p[1])) {
+                double hi = strtod(p+1, &p);
+                if (!std::isfinite(hi)) {
+                    fprintf(stderr, "ERROR: -I insert-size max must be a finite number (got %g)\n", hi);
+                    free(opt);
+                    if (out_opened) fclose(aux.fp);
+                    return 1;
+                }
+                pes[1].high = (int)(hi + .499);
+            }
+            if (*p != 0 && ispunct(*p) && isdigit(p[1])) {
+                double lo = strtod(p+1, &p);
+                if (!std::isfinite(lo)) {
+                    fprintf(stderr, "ERROR: -I insert-size min must be a finite number (got %g)\n", lo);
+                    free(opt);
+                    if (out_opened) fclose(aux.fp);
+                    return 1;
+                }
+                pes[1].low = (int)(lo + .499);
+            }
         }
         else {
             free(opt);

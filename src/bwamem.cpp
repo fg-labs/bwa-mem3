@@ -509,8 +509,14 @@ int mem_band_cert_params_safe(const mem_opt_t *opt) {
 
 static inline int cal_max_gap(const mem_opt_t *opt, int qlen)
 {
-    int l_del = (int)((double)(qlen * opt->a - opt->o_del) / opt->e_del + 1.);
-    int l_ins = (int)((double)(qlen * opt->a - opt->o_ins) / opt->e_ins + 1.);
+    // Guard a zero gap-extension penalty: the double/int divide would be
+    // inf/NaN and the (int) cast is UB (arch-divergent: INT_MIN on x86-64,
+    // saturate on aarch64), giving different seed windows for the same command
+    // line. Treat a non-positive penalty as an unbounded gap (opt->w<<1, the
+    // clamp below), matching band_cert_ok / mem_band_cert_params_safe_w. -E is
+    // also rejected at parse (fastmap.cpp); this is defense in depth.
+    int l_del = opt->e_del > 0 ? (int)((double)(qlen * opt->a - opt->o_del) / opt->e_del + 1.) : opt->w<<1;
+    int l_ins = opt->e_ins > 0 ? (int)((double)(qlen * opt->a - opt->o_ins) / opt->e_ins + 1.) : opt->w<<1;
     //int l_del = (int)((double)(qlen * opt->a - opt->o_del) + 1.);
     //int l_ins = (int)((double)(qlen * opt->a - opt->o_ins) + 1.);
 
@@ -6336,17 +6342,26 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
                         *wsize_pair +=  1024;
                         // assert(*wsize_pair > numPairsLeft);
                         *wsize_pair += numPairsLeft + 1024;
-                        seqPairArrayAux = (SeqPair *) realloc(seqPairArrayAux,
+                        // realloc into a temp + xassert so a failed grow does not
+                        // lose the old block (realloc-into-self anti-pattern) and
+                        // fails loudly instead of leaving a NULL slot for writes.
+                        SeqPair *tmp_aux = (SeqPair *) realloc(seqPairArrayAux,
                                                               (*wsize_pair + MAX_LINE_LEN)
                                                               * sizeof(SeqPair));
+                        xassert(tmp_aux != NULL, "out of memory: seqPairArrayAux");
+                        seqPairArrayAux = tmp_aux;
                         mmc->seqPairArrayAux[tid] = seqPairArrayAux;
-                        seqPairArrayLeft128 = (SeqPair *) realloc(seqPairArrayLeft128,
+                        SeqPair *tmp_left = (SeqPair *) realloc(seqPairArrayLeft128,
                                                                   (*wsize_pair + MAX_LINE_LEN)
                                                                   * sizeof(SeqPair));
+                        xassert(tmp_left != NULL, "out of memory: seqPairArrayLeft128");
+                        seqPairArrayLeft128 = tmp_left;
                         mmc->seqPairArrayLeft128[tid] = seqPairArrayLeft128;
-                        seqPairArrayRight128 = (SeqPair *) realloc(seqPairArrayRight128,
+                        SeqPair *tmp_right = (SeqPair *) realloc(seqPairArrayRight128,
                                                                    (*wsize_pair + MAX_LINE_LEN)
                                                                    * sizeof(SeqPair));
+                        xassert(tmp_right != NULL, "out of memory: seqPairArrayRight128");
+                        seqPairArrayRight128 = tmp_right;
                         mmc->seqPairArrayRight128[tid] = seqPairArrayRight128;
                     }
 
@@ -6571,17 +6586,26 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
                         *wsize_pair += 1024;
                         // assert(*wsize_pair > numPairsRight);
                         *wsize_pair += numPairsLeft + 1024;
-                        seqPairArrayAux = (SeqPair *) realloc(seqPairArrayAux,
+                        // realloc into a temp + xassert so a failed grow does not
+                        // lose the old block (realloc-into-self anti-pattern) and
+                        // fails loudly instead of leaving a NULL slot for writes.
+                        SeqPair *tmp_aux = (SeqPair *) realloc(seqPairArrayAux,
                                                               (*wsize_pair + MAX_LINE_LEN)
                                                               * sizeof(SeqPair));
+                        xassert(tmp_aux != NULL, "out of memory: seqPairArrayAux");
+                        seqPairArrayAux = tmp_aux;
                         mmc->seqPairArrayAux[tid] = seqPairArrayAux;
-                        seqPairArrayLeft128 = (SeqPair *) realloc(seqPairArrayLeft128,
+                        SeqPair *tmp_left = (SeqPair *) realloc(seqPairArrayLeft128,
                                                                   (*wsize_pair + MAX_LINE_LEN)
                                                                   * sizeof(SeqPair));
+                        xassert(tmp_left != NULL, "out of memory: seqPairArrayLeft128");
+                        seqPairArrayLeft128 = tmp_left;
                         mmc->seqPairArrayLeft128[tid] = seqPairArrayLeft128;
-                        seqPairArrayRight128 = (SeqPair *) realloc(seqPairArrayRight128,
+                        SeqPair *tmp_right = (SeqPair *) realloc(seqPairArrayRight128,
                                                                    (*wsize_pair + MAX_LINE_LEN)
                                                                    * sizeof(SeqPair));
+                        xassert(tmp_right != NULL, "out of memory: seqPairArrayRight128");
+                        seqPairArrayRight128 = tmp_right;
                         mmc->seqPairArrayRight128[tid] = seqPairArrayRight128;
                     }
 
