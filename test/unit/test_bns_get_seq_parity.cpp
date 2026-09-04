@@ -28,6 +28,17 @@
 
 #include "bntseq.h"
 
+// Mirror of bns_get_seq_into's private BNS_SIMD_UNPACK guard (src/bntseq.cpp:42-47).
+// BNS_SIMD_UNPACK is file-local to bntseq.cpp and not exported, so we cannot #ifdef
+// on it here; this reproduces the same ISA condition so the boundary-sweep case below
+// can report (via MESSAGE) whether it is exercising the SIMD unpack or the scalar-LUT
+// fallback. Kept next to a comment pointing at the source guard so the two don't drift.
+#if defined(__aarch64__) || defined(__ARM_NEON) || defined(__SSSE3__)
+#define TEST_BNS_SIMD_UNPACK_ACTIVE 1
+#else
+#define TEST_BNS_SIMD_UNPACK_ACTIVE 0
+#endif
+
 // _set_pac is published by bntseq.h.
 //
 // Pac layout: byte (k>>2) holds 4 bases at positions 4k..4k+3 (top-first).
@@ -235,4 +246,47 @@ TEST_CASE("bns_get_seq_into vs v2: large random ref, randomized ranges") {
         int64_t b = pos(rng);
         check_range(L, pac.data(), ref_string.data(), a, b);
     }
+}
+
+TEST_CASE("bns_get_seq_into vs v2: SIMD block-boundary and phase sweep") {
+    // The forward/reverse whole-byte unpack loops each process 64 bases (16 packed
+    // bytes) per SIMD step, entered only when a byte-aligned k satisfies k+64<=end
+    // (fwd) / k-64>=beg_f (rev), with scalar leading/trailing partials on either side.
+    // The exhaustive L=64 cases above fire the forward SIMD loop for essentially one
+    // window (beg=0,end=64); this case drives BOTH loops across many 64-base block
+    // boundaries and all four low-byte phases (beg mod 4), comparing the code under
+    // test against the independent ref_string oracle via check_range.
+    MESSAGE("BNS_SIMD_UNPACK exercised (per ISA mirror, else scalar-LUT fallback): "
+            << TEST_BNS_SIMD_UNPACK_ACTIVE);
+
+    std::mt19937 rng(0x51D5EEDu);
+    constexpr int64_t L = 4096;  // several 64-base SIMD blocks per strand
+    std::vector<uint8_t> pac, ref_string;
+    build_synthetic_ref(rng, L, pac, ref_string);
+
+    // Spans that land the SIMD tail at, just before, and just after 64-base block
+    // boundaries, plus multi-block spans.
+    const int64_t spans[] = {1,  3,   15,  16,  17,  31,  63,  64,  65,
+                             66, 127, 128, 129, 200, 256, 511, 512, 1000};
+
+    // Sweep beg across all phases and block-straddling offsets near the strand start
+    // (0..95 covers >64, i.e. every phase in the first two blocks and beyond) plus a
+    // few interior block boundaries, on each strand. No bridging (fwd end<=L; rev
+    // beg>=L) so every window returns a non-empty range.
+    auto sweep = [&](int64_t lo, int64_t hi) {
+        for (int64_t beg = lo; beg < lo + 96; ++beg)
+            for (int64_t span : spans) {
+                int64_t end = beg + span;
+                if (end <= hi) check_range(L, pac.data(), ref_string.data(), beg, end);
+            }
+        for (int64_t center : {lo + 1024, lo + 2048, lo + 3072})
+            for (int64_t off = -3; off <= 3; ++off)
+                for (int64_t span : spans) {
+                    int64_t beg = center + off, end = beg + span;
+                    if (beg >= lo && end <= hi)
+                        check_range(L, pac.data(), ref_string.data(), beg, end);
+                }
+    };
+    sweep(/*forward*/ 0, L);
+    sweep(/*reverse*/ L, 2 * L);
 }
