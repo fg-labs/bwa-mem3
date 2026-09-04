@@ -439,11 +439,49 @@ jobs:
         # loudly rather than silently passing if it is not in effect.
         run: |
           if [ "${{ matrix.arch_flag }}" = "" ]; then
-            make bns_zero_calloc_test CXX=${{ matrix.cxx || 'clang++-19' }}
+            make bns_zero_calloc_test arch=${{ matrix.baseline_arch || 'avx2' }} \
+              CXX=${{ matrix.cxx || 'clang++-19' }}
           else
             make bns_zero_calloc_test arch=${{ matrix.arch_flag }} CXX=${{ matrix.cxx || 'clang++-19' }}
           fi
           ./bns_zero_calloc_test
+
+      - name: Alloc-guard regression tests (overflow / negative-size / OOM)
+        # Standalone binaries pinning the allocation and size-arithmetic guard
+        # paths, which no workflow ran until now (they were reachable only
+        # from `make test`, which no workflow invokes). Each forks a child
+        # that must abort with a specific diagnostic; the parent verifies:
+        #   - read_arena_overflow_test: read_arena_dup(len=SIZE_MAX) must
+        #     abort with "read field length overflows size_t".
+        #   - packed_text_neg_nbases_test: PackedText(n_bases=-1) must abort
+        #     with "negative n_bases".
+        #   - packed_text_overflow_nbases_test: PackedText(n_bases=INT64_MAX)
+        #     must abort with "too large", not the generic "too small"
+        #     message an unguarded (n_bases + 3) >> 2 overflow happens to
+        #     produce.
+        #   - mem_gen_alt_zero_calloc_test: mem_gen_alt with a->n==0 must
+        #     return cleanly even when calloc(0) returns NULL.
+        # All four link libbwa.a, so they need the same arch/CXX propagation
+        # as bns_zero_calloc_test above, plus USE_MIMALLOC: the build-flags
+        # stamp keys on CPPFLAGS (which carries -DUSE_MIMALLOC=1), so omitting
+        # it lets the default USE_MIMALLOC=1 rebuild libbwa.a with mimalloc on
+        # the use_mimalloc="0" row -- the row would then never exercise the
+        # no-mimalloc build. Carry the row's setting so it does.
+        run: |
+          if [ "${{ matrix.arch_flag }}" = "" ]; then
+            make read_arena_overflow_test packed_text_neg_nbases_test \
+              packed_text_overflow_nbases_test mem_gen_alt_zero_calloc_test \
+              arch=${{ matrix.baseline_arch || 'avx2' }} \
+              CXX=${{ matrix.cxx || 'clang++-19' }} USE_MIMALLOC=${{ matrix.use_mimalloc }}
+          else
+            make read_arena_overflow_test packed_text_neg_nbases_test \
+              packed_text_overflow_nbases_test mem_gen_alt_zero_calloc_test \
+              arch=${{ matrix.arch_flag }} CXX=${{ matrix.cxx || 'clang++-19' }} USE_MIMALLOC=${{ matrix.use_mimalloc }}
+          fi
+          ./read_arena_overflow_test
+          ./packed_text_neg_nbases_test
+          ./packed_text_overflow_nbases_test
+          ./mem_gen_alt_zero_calloc_test
 
       - name: Fast-reader batch reader safety and coverage
         # Standalone tests for the bseq_read_fast adapter, which no workflow ran

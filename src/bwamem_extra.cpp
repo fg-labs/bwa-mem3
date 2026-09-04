@@ -144,7 +144,7 @@ char **mem_gen_alt(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac
 	char has_alt_stack[HAS_ALT_STACK_N];
 
 	cnt = (int *) calloc(a->n, sizeof(int));
-    xassert(cnt != NULL, "out of memory: cnt");
+    xassert(cnt != NULL || a->n == 0, "out of memory: cnt");  /* calloc(0) may return NULL; cnt unused when a->n==0 */
 	has_alt = a->n <= HAS_ALT_STACK_N ? has_alt_stack : (char *) malloc(a->n);
     xassert(has_alt != NULL, "out of memory: has_alt");
 	memset(has_alt, 0, a->n);
