@@ -3324,6 +3324,26 @@ static void worker_copy_regs(void *data, int seq_id, int batch_size, int tid)
     (void) tid;
 }
 
+/* Prefetch the first pac[] cache line of the CIGAR-emission reference window
+ * (bwa_gen_cigar3 -> bns_get_seq_into) for an alignment beginning at `rb`. That
+ * fetch is a random ~DRAM-latency load; a hint issued ahead of it hides the miss.
+ * The window-start byte mirrors bns_get_seq_into's strand split: forward
+ * (rb < l_pac) touches pac[rb>>2]; reverse touches pac[((2*l_pac-1-rb)>>2)].
+ * locality=0 (streaming/NTA): bns_get_seq_into reads the window once and never
+ * revisits it, so per simd_compat.h's locality convention this must not evict
+ * L1-resident data (L1-keep, locality 3, is reserved there for genuine reuse
+ * like the FM-index walk). The `rb < 0` skip is defense-in-depth for the emit-loop
+ * look-ahead callers, which pass a raw a[0].rb that mem_reg2aln itself would
+ * reject; mem_reg2aln only reaches here after its own rb>=0 check. A prefetch is
+ * a pure hint -> byte-identical whatever region is ultimately emitted. */
+static inline void mem_prefetch_cigar_ref(const bntseq_t *bns, const uint8_t *pac, int64_t rb)
+{
+    if (rb < 0) return;
+    int64_t l_pac = bns->l_pac;
+    int64_t pf = (rb < l_pac) ? (rb >> 2) : (((l_pac << 1) - 1 - rb) >> 2);
+    __builtin_prefetch(&pac[pf], 0, 0);
+}
+
 static void worker_sam(void *data, int seqid, int batch_size, int tid)
 {
     worker_t *w = (worker_t*) data;
@@ -3397,6 +3417,19 @@ static void worker_sam(void *data, int seqid, int batch_size, int tid)
         kswr_t *myaln = aln;
         for (int i=start; i< end; i+=2)
         {
+            /* Look-ahead: prefetch the next pair's two emit windows (both mates)
+             * while this pair's emit (rescue readback + pairing + 2x CIGAR gen +
+             * SAM formatting) hides the ~DRAM-latency loads on the next pair's
+             * scattered loci. a[0].rb is a best-effort guess of the emitted window:
+             * mem_pair() may emit a non-top region (a[z[i]], z[i]!=0) for multi-
+             * mappers, so the guess holds for concordant unique pairs and degrades
+             * -- harmlessly, still a hint -- for repeats. Pure hint -> byte-identical. */
+            if (i + 3 < end) { // next pair (i+2,i+3); i+3 is the highest index touched
+                const bntseq_t *nbns = mem_aln_bns(w);
+                const uint8_t  *npac = mem_aln_pac(w);
+                if (w->regs[i+2].n > 0) mem_prefetch_cigar_ref(nbns, npac, w->regs[i+2].a[0].rb);
+                if (w->regs[i+3].n > 0) mem_prefetch_cigar_ref(nbns, npac, w->regs[i+3].a[0].rb);
+            }
             mem_sam_pe_batch_post(w->opt, mem_aln_bns(w),
                                   mem_aln_pac(w), w->pes,
                                   (w->n_processed >> 1) + pos++,   // check!
@@ -3418,6 +3451,13 @@ static void worker_sam(void *data, int seqid, int batch_size, int tid)
     {
         for (int i=seqid; i<seqid + batch_size; i++)
         {
+            /* Look-ahead: prefetch the next read's emit window while this read's
+             * emit hides the ~DRAM-latency load on its scattered locus. a[0] is
+             * the score-top region -- the emitted primary in the default case;
+             * mem_reorder_primary5 (--primary5) may promote another, harmlessly.
+             * Pure hint -> byte-identical. */
+            if (i + 1 < seqid + batch_size && w->regs[i+1].n > 0)
+                mem_prefetch_cigar_ref(mem_aln_bns(w), mem_aln_pac(w), w->regs[i+1].a[0].rb);
             mem_mark_primary_se(w->opt, w->regs[i].n,
                                 w->regs[i].a,
                                 w->n_processed + i);
@@ -4195,17 +4235,13 @@ mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *
     a.meth_hypothesis = ar->meth_hypothesis; // carry hypothesis to the output layer
     qb = ar->qb, qe = ar->qe;
     rb = ar->rb, re = ar->re;
-    /* AP6: prefetch the CIGAR-emission reference window's first pac[] cache line.
-     * bwa_gen_cigar3 -> bns_get_seq_into makes a random ~DRAM-latency load on the
-     * first pac[] byte; the ~dozens of setup instructions below (and the CIGAR-gen
-     * entry) hide it. The window-start byte differs by strand: the forward strand
-     * (rb < l_pac) reads pac[rb>>2] ascending, the reverse reads pac[((2*l_pac-1-rb)>>2)]
-     * descending (bns_get_seq_into). A prefetch is a pure hint -> byte-identical. */
-    {
-        int64_t pf_pac = (rb < bns->l_pac) ? (rb >> 2)
-                                           : (((bns->l_pac << 1) - 1 - rb) >> 2);
-        __builtin_prefetch(&pac[pf_pac], 0, 3);
-    }
+    /* Shallow same-call prefetch of this alignment's CIGAR-emission window,
+     * hidden behind the ~dozens of setup instructions below. The emit loops also
+     * issue a deeper look-ahead prefetch of the NEXT read/pair's window (see
+     * mem_prefetch_cigar_ref callers), so on the hot path this call's window is
+     * already resident and this becomes a no-op hit; it still covers callers
+     * that reach mem_reg2aln without a look-ahead. Pure hint -> byte-identical. */
+    mem_prefetch_cigar_ref(bns, pac, rb);
     /* D3 (--meth, PR-5): output CIGAR/NM/MD must reflect the ORIGINAL read vs the
      * ORIGINAL reference in the original alphabet, so placement and gap shape are
      * expressed in real coordinates and a real (non-converting) SNP stays a
