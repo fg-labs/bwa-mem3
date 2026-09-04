@@ -782,7 +782,7 @@ PDQSORT_INIT(mem_ars, mem_alnreg_t, alnreg_slt)
  *--------------------------------------------------------------------------*/
 
 /* Below ~9 elements pdqsort wins nothing: on the alnreg microbench
- * (reports/2026-07-12-dedup-sort-benchmark-arm64.md, 2-8 bucket) klib's introsort
+ * (an arm64 dedup-sort microbenchmark, 2-8 bucket) klib's introsort
  * leads on the `re` sort (127.4 vs 119.0 Mcell/s) and ties it on the by-score
  * sort (130.8 vs 130.1). Short arrays are ~46% of calls, so the save-copy is not
  * worth paying there for either. */
