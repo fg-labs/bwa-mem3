@@ -1629,7 +1629,7 @@ static int mem_chain_cap_extend_mate(mem_chain_t *a, int n, int max_n,
         if (keep) a[k++] = a[i];
         else {
             /* --extend-csub: remember the heaviest chain we dropped, so the SAM stage
-             * can seed the pruned competitor back into MAPQ (mem_seed_capped_csub). */
+             * can seed the pruned competitor back into MAPQ (mem_seed_capped_sub). */
             if (capped_w_out && w[i] > *capped_w_out) *capped_w_out = w[i];
             if (a[i].m > SEEDS_PER_CHAIN) free(a[i].seeds);
         }
@@ -3543,7 +3543,7 @@ static void worker_sam(void *data, int seqid, int batch_size, int tid)
 #if V17  // Feature from v0.7.17 of orig. bwa-mem
             if (w->opt->flag & MEM_F_PRIMARY5) mem_reorder_primary5(w->opt->T, &w->regs[i]);
 #endif
-            mem_seed_capped_csub(&w->regs[i], w->opt->a);  /* --extend-csub (no-op when off) */
+            mem_seed_capped_sub(&w->regs[i], w->opt->a);  /* --extend-csub (no-op when off) */
             /* D3 (--meth): emit in ORIGINAL coords/alphabet via mem_aln_bns/pac. */
             mem_reg2sam(w->opt, mem_aln_bns(w), mem_aln_pac(w), &w->seqs[i],
                         &w->regs[i], 0, 0);
@@ -3916,7 +3916,7 @@ int mem_mark_primary_se(const mem_opt_t *opt, int n, mem_alnreg_t *a, int64_t id
  * weight*a version tripped `sub >= score -> return 0`, which the PE MAPQ
  * recombination then turned into spurious promotions). No-op when nothing was
  * dropped (capped_w == 0), so --extend-csub off is byte-identical. */
-void mem_seed_capped_csub(mem_alnreg_v *a, int match_a)
+void mem_seed_capped_sub(mem_alnreg_v *a, int match_a)
 {
     if (a->capped_w <= 0) return;
     for (size_t r = 0; r < a->n; ++r) {

@@ -642,7 +642,7 @@ void mem_reg2sam(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
 int mem_approx_mapq_se(const mem_opt_t *opt, const mem_alnreg_t *a) ;
 
 int mem_mark_primary_se(const mem_opt_t *opt, int n, mem_alnreg_t *a, int64_t id);
-void mem_seed_capped_csub(mem_alnreg_v *a, int match_a);  /* --extend-csub: seed primary csub from dropped chains */
+void mem_seed_capped_sub(mem_alnreg_v *a, int match_a);  /* --extend-csub: seed primary sub from dropped chains */
 /* Exposed for unit tests (test/unit/test_chain_cap.cpp). */
 int  mem_chain_cap_extend(mem_chain_t *a, int n, int max_n, float tie_frac, int tie_floor,
                           int *capped_w_out);   /* --max-extend-chains count cap + --extend-tie-frac gate */

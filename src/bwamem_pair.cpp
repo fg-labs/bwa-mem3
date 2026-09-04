@@ -922,7 +922,7 @@ void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str, bseq
  * extension, so the pairing MAPQ raw_mapq(o - subo) reflects it. Each mate contributes
  * its pruned-competitor SE score, estimated from the dropped chain weight scaled by that
  * mate's OBSERVED per-base score rate (score/span). Note this is deliberately gentler
- * than the all-match upper bound (weight * a) that mem_seed_capped_csub uses on the SE
+ * than the all-match upper bound (weight * a) that mem_seed_capped_sub uses on the SE
  * side: a pair score is the sum of two such estimates, so the generous bound would
  * overstate subo roughly twice over. The sum is clamped strictly below o, so q_pe drops
  * proportionally to a near-tie rather than being forced to 0.
@@ -949,7 +949,7 @@ int mem_pair_resolve(const mem_opt_t *opt, const bntseq_t *bns,
                      int *extra_flag_out, int *paired_out)
 {
     extern int mem_mark_primary_se(const mem_opt_t *opt, int n, mem_alnreg_t *a, int64_t id);
-    extern void mem_seed_capped_csub(mem_alnreg_v *a, int match_a);
+    extern void mem_seed_capped_sub(mem_alnreg_v *a, int match_a);
     extern int mem_approx_mapq_se(const mem_opt_t *opt, const mem_alnreg_t *a);
 
     #if MATE_SORT
@@ -1030,8 +1030,8 @@ int mem_pair_resolve(const mem_opt_t *opt, const bntseq_t *bns,
 
     /* --extend-csub: seed each end's primary competitor score from the chains the
      * cap/gate dropped, before pairing/MAPQ below reads csub. No-op when off. */
-    mem_seed_capped_csub(&a[0], opt->a);
-    mem_seed_capped_csub(&a[1], opt->a);
+    mem_seed_capped_sub(&a[0], opt->a);
+    mem_seed_capped_sub(&a[1], opt->a);
 
     if (opt->flag & MEM_F_NOPAIRING) {
         *extra_flag_out = extra_flag;
@@ -1548,7 +1548,7 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                           int32_t &gcnt, int tid)
 {
     extern int mem_mark_primary_se(const mem_opt_t *opt, int n, mem_alnreg_t *a, int64_t id);
-    extern void mem_seed_capped_csub(mem_alnreg_v *a, int match_a);
+    extern void mem_seed_capped_sub(mem_alnreg_v *a, int match_a);
     extern int mem_approx_mapq_se(const mem_opt_t *opt, const mem_alnreg_t *a);
     extern void mem_reg2sam(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
                             bseq1_t *s, mem_alnreg_v *a, int extra_flag, const mem_aln_t *m);
@@ -1651,8 +1651,8 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
 
     /* --extend-csub: seed each end's primary competitor score from the chains the
      * cap/gate dropped, before pairing/MAPQ below reads csub. No-op when off. */
-    mem_seed_capped_csub(&a[0], opt->a);
-    mem_seed_capped_csub(&a[1], opt->a);
+    mem_seed_capped_sub(&a[0], opt->a);
+    mem_seed_capped_sub(&a[1], opt->a);
     
     if (opt->flag&MEM_F_NOPAIRING) goto no_pairing;
 
