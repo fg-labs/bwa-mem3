@@ -182,7 +182,23 @@ int index_load_threads(int n_threads)
     int t = n_threads > 0 ? n_threads : 1;
     if (t > 8) t = 8;
     const char *e = getenv("BWA3_LOAD_THREADS");
-    if (e != NULL) { int v = atoi(e); if (v > 0) t = v; }
+    if (e != NULL && *e != '\0') {
+        // Strict parse: atoi silently accepts garbage (abc -> 0, 0x8 -> 0) and
+        // any huge value (100000 -> ~1280 pthread_creates). On malformed input
+        // warn and keep the computed default -- ignore-and-continue like
+        // BWA3_SMEM_LOCKSTEP_N (bwa3_lockstep_width_parse_env), NOT the hard
+        // exit(1) that BWA_INDEX_THREADS's parse_ll takes. Clamp to a 64-thread
+        // ceiling (the load is bandwidth-bound past ~8).
+        char *end = NULL;
+        errno = 0;
+        long v = strtol(e, &end, 10);
+        if (errno != 0 || end == e || *end != '\0' || v <= 0) {
+            fprintf(stderr, "ERROR: BWA3_LOAD_THREADS=\"%s\" is not a positive integer; ignoring it\n", e);
+        } else {
+            if (v > 64) v = 64;   // ceiling; the load is bandwidth-bound past ~8
+            t = (int)v;
+        }
+    }
     return t;
 }
 
@@ -438,8 +454,12 @@ void FMI_search::load_index(bool load_pac, int n_threads)
 #endif
 
     err_fread_noeof(&reference_seq_len, sizeof(int64_t), 1, cpstream);
-    assert(reference_seq_len > 0);
-    assert(reference_seq_len <= 0x7fffffffffL);
+    // Fail closed on a truncated/corrupt index, mirroring load_index_from_shm's
+    // scalar bounds checks (a bad reference_seq_len/count[]/sentinel_index drives
+    // smem.k past cp_occ on the first backwardExt -> wrong seeds, not a crash).
+    // xassert survives a hypothetical -DNDEBUG build where a plain assert would not.
+    xassert(reference_seq_len > 0 && reference_seq_len <= 0x7fffffffffLL,
+            "FMI index: reference_seq_len out of bounds (corrupt .bwt.2bit.64?)");
 
     fprintf(stderr, "* Reference seq len for bi-index = %lld\n", (long long)reference_seq_len);
 
@@ -459,6 +479,17 @@ void FMI_search::load_index(bool load_pac, int n_threads)
     for(ii = 0; ii < 5; ii++)// update read count structure
     {
         count[ii] = count[ii] + 1;
+    }
+    // Validate count[] (post +1-adjustment, range [1, ref_seq_len+1]) as
+    // load_index_from_shm does; a count[a] exceeding the reference length drives
+    // smem.k out of cp_occ on the first backwardExt.
+    for (ii = 0; ii < 5; ii++) {
+        xassert(count[ii] >= 0 && count[ii] <= reference_seq_len + 1,
+                "FMI index: count[] out of bounds (corrupt .bwt.2bit.64?)");
+        // count[] is the cumulative C[] array, so it must be non-decreasing; a
+        // non-monotone pair yields a negative smem.s (interval width) downstream.
+        xassert(ii == 0 || count[ii] >= count[ii - 1],
+                "FMI index: count[] not monotonically non-decreasing (corrupt .bwt.2bit.64?)");
     }
 
     #if SA_COMPRESSION
@@ -497,6 +528,8 @@ void FMI_search::load_index(bool load_pac, int n_threads)
     sentinel_index = -1;
     #if SA_COMPRESSION
     err_fread_noeof(&sentinel_index, sizeof(int64_t), 1, cpstream);
+    xassert(sentinel_index >= 0 && sentinel_index < reference_seq_len,
+            "FMI index: sentinel_index out of bounds (corrupt .bwt.2bit.64?)");
     fprintf(stderr, "* sentinel-index: %lld\n", (long long)sentinel_index);
     #endif
     fclose(cpstream);
@@ -781,6 +814,7 @@ struct LockstepSmemCache {
     SMEM  *prev     = nullptr;
     SMEM  *match    = nullptr;
     size_t per_slot = 0;
+    int32_t n_slots = 0;   // lockstep width the buffers were sized for
     ~LockstepSmemCache() {
         if (prev  != nullptr) _mm_free(prev);
         if (match != nullptr) _mm_free(match);
@@ -1445,15 +1479,21 @@ void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
     BatchSlot slots[SMEM_LOCKSTEP_N_MAX] = {};
     static thread_local LockstepSmemCache cache;
     const size_t per_slot_smems = (size_t)max_readlength;
-    if (per_slot_smems > cache.per_slot) {
+    if (per_slot_smems > cache.per_slot || N > cache.n_slots) {
         if (cache.prev  != nullptr) _mm_free(cache.prev);
         if (cache.match != nullptr) _mm_free(cache.match);
-        const size_t total_slot_bytes = (size_t)N * per_slot_smems * sizeof(SMEM);
+        // Grow on EITHER dimension: g_smem_lockstep_n (N) can rise after first
+        // use (BWA3_SMEM_LOCKSTEP_N / the MLP probe), and sizing only on per_slot
+        // would leave slots[N-1] pointing past the allocation.
+        const size_t alloc_slots = (size_t)(N > cache.n_slots ? N : cache.n_slots);
+        const size_t alloc_per   = per_slot_smems > cache.per_slot ? per_slot_smems : cache.per_slot;
+        const size_t total_slot_bytes = alloc_slots * alloc_per * sizeof(SMEM);
         cache.prev  = (SMEM *)_mm_malloc(total_slot_bytes, 64);
         assert_not_null(cache.prev, total_slot_bytes, total_slot_bytes);
         cache.match = (SMEM *)_mm_malloc(total_slot_bytes, 64);
         assert_not_null(cache.match, total_slot_bytes, (size_t)2 * total_slot_bytes);
-        cache.per_slot = per_slot_smems;
+        cache.per_slot = alloc_per;
+        cache.n_slots  = (int32_t)alloc_slots;
     }
     for (int32_t s = 0; s < N; s++) {
         slots[s].prev      = cache.prev  + (size_t)s * cache.per_slot;
@@ -2080,6 +2120,9 @@ struct SaPrefetchScratch {
         if (n <= cap) return;
         _mm_free(pos);
         pos = (int64_t *) _mm_malloc((size_t)n * sizeof(int64_t), 64);
+        // Fail loudly on OOM: without this, pos==NULL but cap=n reports capacity,
+        // so the next call returns early and the staging loop writes through NULL.
+        xassert(pos != NULL, "out of memory: SA prefetch staging buffer");
         cap = n;
     }
     ~SaPrefetchScratch() { _mm_free(pos); }
