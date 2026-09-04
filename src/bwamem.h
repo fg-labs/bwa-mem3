@@ -671,7 +671,6 @@ int mem_approx_mapq_se(const mem_opt_t *opt, const mem_alnreg_t *a) ;
 
 int mem_mark_primary_se(const mem_opt_t *opt, int n, mem_alnreg_t *a, int64_t id);
 void mem_seed_capped_csub(mem_alnreg_v *a, const mem_opt_t *opt);  /* --extend-csub: seed csub/sub_n from dropped chains (per-region) */
-int  mem_capped_pair_subo(const mem_alnreg_v a[2], const int z[2], int o);  /* --extend-csub PE competitor floor (exposed for unit tests) */
 
 static void mem_mark_primary_se_core(const mem_opt_t *opt, int n, mem_alnreg_t *a, int_v *z);
 

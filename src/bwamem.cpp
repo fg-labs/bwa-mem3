@@ -3849,9 +3849,8 @@ int mem_mark_primary_se(const mem_opt_t *opt, int n, mem_alnreg_t *a, int64_t id
 /* --extend-csub: seed each PRIMARY region's csub with a calibrated estimate of the
  * best chain the cap/gate dropped before extension, so MAPQ (which reads
  * max(sub, csub)) reflects the pruned competitor instead of inflating. The estimate
- * scales the dropped chain's weight by the all-match rate (weight*a; the PE path in
- * mem_capped_pair_subo deliberately uses the observed per-base rate instead, since a
- * pair score sums two estimates), and is clamped strictly below the region's own
+ * scales the dropped chain's weight by the all-match rate (weight*a), and is clamped
+ * strictly below the region's own
  * score, so it lowers MAPQ proportionally rather than forcing it to 0 (the UNCLAMPED
  * weight*a version tripped `sub >= score -> return 0`, which the PE MAPQ
  * recombination then turned into spurious promotions). No-op when nothing was
