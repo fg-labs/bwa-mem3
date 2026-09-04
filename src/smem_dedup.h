@@ -8,8 +8,10 @@
 extern "C" {
 #endif
 
-/* Compact adjacent fully-identical SMEMs in a sorted array; return the new length.
- * An entry is kept only if it differs from the previous kept entry on (rid,m,n,k,l,s).
+/* Compact adjacent key-identical SMEMs in a sorted array; return the new length.
+ * An entry is kept only if it differs from the previous kept entry on
+ * (rid,m,n,k,s).
+ * `l` is deliberately NOT part of the key -- see smem_dedup.cpp for why.
  * Precondition: identical SMEMs are adjacent (true after sortSMEMs + per-read
  * intv_lt1 sort in mem_collect_smem).
  * O(n), no allocation. n <= 1 is handled safely (returns n). */

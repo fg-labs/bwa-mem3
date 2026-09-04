@@ -197,6 +197,7 @@ static const case_t CASES[] = {
     LIT("FASTA multi-line seq",           ">s1 desc\nACGT\nTTGG\nCCAA\n>s2\nGGGG\nTTTT\n"),
     LIT("multi-line FASTQ seq and qual",  "@r1\nACGT\nTTGG\n+\nIIII\nFFFF\n@r2\nCCCC\n+\nHHHH\n"),
     LIT("CRLF line endings",              "@r1\r\nACGT\r\n+\r\nIIII\r\n@r2\r\nTTGG\r\n+\r\nFFFF\r\n"),
+    LIT("multi-line seq and qual with CRLF", "@r1\r\nACGT\r\nTTGG\r\n+\r\nIIII\r\nFFFF\r\n@r2\r\nCCCC\r\n+\r\nHHHH\r\n"),
     LIT("blank lines between records",    "@r1\nACGT\n+\nIIII\n\n@r2\nTTGG\n+\nFFFF\n"),
     LIT("no trailing newline",            "@r1\nACGT\n+\nIIII\n@r2\nTTGG\n+\nFFFF"),
     LIT("leading junk before first header", "; comment line\n# another\n@r1\nACGT\n+\nIIII\n"),

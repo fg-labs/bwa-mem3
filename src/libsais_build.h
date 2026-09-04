@@ -25,7 +25,7 @@ struct LibsaisBuildOpts {
 bool libsais_sa_is_64bit(int64_t N);
 
 // Estimated peak bytes for a libsais build over a doubled text of length `N`
-// (= 2 * l_pac). 6 B/base on the int32 SA path, 12 B/base once `N` forces the
+// (= 2 * l_pac). 8 B/base on the int32 SA path, 12 B/base once `N` forces the
 // int64 SA; both cover measured peaks with margin for libsais aux arrays and
 // OMP/allocator overhead. Exposed so callers can preflight a build they have
 // not started yet.

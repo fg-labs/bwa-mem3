@@ -9,7 +9,9 @@
  *
  * The grammar mirrors kseq exactly for realistic inputs (see the differential
  * test test/fr_fastq_diff_test.c). Pathological shapes that never occur in real
- * FASTQ (e.g. a bare "\r" line inside a sequence) are out of scope; the
+ * FASTQ (e.g. a bare "\r" line inside a multi-line sequence OR quality
+ * field -- both fields strip CRLF per-line via the same line_content_len
+ * path) are out of scope; the
  * --legacy-reader path retains exact kseq behavior for anyone who needs it.
  */
 #include "fr_fastq.h"
