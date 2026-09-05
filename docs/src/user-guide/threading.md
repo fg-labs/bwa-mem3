@@ -36,8 +36,11 @@ curve:
    concurrent reads of the same large index file saturate IO bandwidth before
    the CPU is saturated.
 3. **Output serialization.** SAM output is serialized per-record to stdout.
-   BAM output with `--bam` reduces this bottleneck but does not eliminate it
-   entirely.
+   Compressed BAM (`--bam=1..9`) additionally deflates each BGZF block; that
+   deflate is parallelized by `--bam-threads`, which defaults to `-t/8` so the
+   pool grows with the alignment rate and keeps compression hidden behind
+   alignment. Uncompressed BAM (`--bam=0`, the default when `--bam` is given
+   without a level) has no deflate to parallelize.
 
 ### Recommended thread counts
 
