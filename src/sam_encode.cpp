@@ -3,6 +3,7 @@
 // SIMD-accelerated SEQ/QUAL byte encoders for SAM record building.
 // Moved from bwamem.cpp; symbols renamed to their public sam_encode_* names.
 
+#include "kernel_dispatch.h"
 #include "sam_encode.h"
 #include <stdint.h>
 
