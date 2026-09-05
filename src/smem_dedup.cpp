@@ -1,7 +1,7 @@
 #include "smem_dedup.h"
 #include <string.h>  /* memcpy */
 
-/* Compact adjacent fully-identical SMEMs in a sorted array; return the new length.
+/* Compact adjacent key-identical SMEMs in a sorted array; return the new length.
  *
  * Write-pointer compaction: keep a[0], then for each subsequent entry compare
  * to the last *kept* entry on (rid, m, n, k, s). If different, copy to the write
