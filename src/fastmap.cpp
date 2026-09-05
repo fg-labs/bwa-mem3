@@ -1848,8 +1848,8 @@ int main_mem(int argc, char *argv[])
      * at any setting -- these change slice SIZES, and the cohort boundary is
      * pinned by the slice-target clamp, not by how the cohort is carved up.
      *
-     * A ramp schedule pays exactly three costs, all measured on wgs-5M/hg38
-     * (c8g.16xlarge, warm cache, from --profile):
+     * A ramp schedule pays exactly three costs, all measured on a 5M-read WGS
+     * slice/hg38 (c8g.16xlarge, warm cache, from --profile):
      *
      *   fill      the first slice's read, which by definition overlaps nothing.
      *             Reading is single-threaded and flat at 4.83 ms/Mbase at every -t.
@@ -2790,8 +2790,7 @@ int main_mem(int argc, char *argv[])
          * scalar ksw_align2 only on the freed-less x86 tiers (sse41/sse42/avx),
          * exactly as GENOMIC and COLLAPSED do. An explicit --meth-scoring still wins.
          * Set before mem_opt_apply_meth_defaults so its COLLAPSED -B 2 branch keys
-         * off the resolved scoring mode. See
-         * reports/2026-07-20-taps-alignment-experiment-results.md. */
+         * off the resolved scoring mode. */
         if (opt->meth_chem == METH_CHEM_TAPS && !opt0.meth_scoring)
             opt->meth_scoring = MEM_METH_SCORING_NEUTRAL;
         /* Scored defaults live in mem_opt_apply_meth_defaults so they scale with
@@ -3337,8 +3336,8 @@ int main_mem(int argc, char *argv[])
          * A cap is tempting: at very high -t a single chunk becomes enormous
          * (10M * 192 ~= 1.9G bases), so the input is only ~3-4 chunks and the
          * pipeline starves -- the first chunk's read and the last chunk's write
-         * overlap nothing (fill/drain). Measured on c8g.16xlarge / wgs-5M, that
-         * costs ~1.6s of a 25.8s PROCESS() at -t 64.
+         * overlap nothing (fill/drain). Measured on c8g.16xlarge / a
+         * 5M-read WGS slice, that costs ~1.6s of a 25.8s PROCESS() at -t 64.
          *
          * But capping RE-PARTITIONS THE INPUT, and the partition is not an
          * implementation detail: mem_pestat() infers the insert-size distribution

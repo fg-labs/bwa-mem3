@@ -37,10 +37,11 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 
 /* Column blocking for the u8 kernels' post-row query-end recovery. The row's
  * running max is checkpointed every QE_BLK columns, so the recovery scans only
- * the block(s) holding the max instead of the whole row. Measured on wgs-5M at
- * 64 lanes: 68.1 % of the rows that need a query end resolve inside a single
- * block and 89.6 % within two (mean 1.50), cutting the scan from 160 columns to
- * ~34 -- 4.7x. QE_BLK=16 is the flat part of that curve; 8 is a wash and 32 is
+ * the block(s) holding the max instead of the whole row. Measured on a
+ * 5M-read WGS slice at 64 lanes: 68.1 % of the rows that need a query end
+ * resolve inside a single block and 89.6 % within two (mean 1.50), cutting
+ * the scan from 160 columns to ~34 -- 4.7x. QE_BLK=16 is the flat part of
+ * that curve; 8 is a wash and 32 is
  * worse, because halving the block-index sweep doubles the block being scanned.
  *
  * QE_MAXBLK bounds the checkpoint array. In the 8-bit kernels ncol cannot exceed
@@ -815,11 +816,12 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
      * covers most of the row. The measured phase-0 parity therefore does not
      * carry over to phase 1.
      *
-     * That cost is now MEASURED, not just predicted: bwa-bsw-bench drives phase 1
-     * and times it separately (its rescue mode prints a phase-1 table alongside
-     * phase 0), and on quiet cloud hosts the per-cell range costs phase-1 8-bit
-     * throughput -7.2% at qlen 100 and -4.3% at qlen 150 on avx512bw, and
-     * -2.1% / -1.4% on Graviton4 NEON. Phase 0 is at parity on every tier, as
+     * That cost is now MEASURED, not just predicted: a standalone SW-kernel
+     * benchmark drives phase 1 and times it separately (its rescue mode prints
+     * a phase-1 table alongside phase 0), and on quiet cloud hosts the
+     * per-cell range costs phase-1 8-bit throughput -7.2% at qlen 100 and
+     * -4.3% at qlen 150 on avx512bw, and -2.1% / -1.4% on Graviton4 NEON.
+     * Phase 0 is at parity on every tier, as
      * this fast path intends.
      *
      * Two cross-checks fall out of that, and both hold, which is what makes the
@@ -1602,9 +1604,9 @@ int kswv::kswv_neon_16_impl(int16_t seq1SoA[],
      * + reinterpret to int16 — treating each int16 xor value's low+high
      * bytes as two byte indices, producing sbt[i] = (w_match << 8) |
      * perm[xor_low], inflating match scores by 256. That bug was latent
-     * while smoke-1M never exercised the 16-bit path (l_ms*opt->a < 250
-     * routes to 8-bit), but `-A 2` makes l_ms*2 = 300 >= 250 and
-     * surfaces it.
+     * while a 1M-read smoke slice never exercised the 16-bit path
+     * (l_ms*opt->a < 250 routes to 8-bit), but `-A 2` makes l_ms*2 = 300
+     * >= 250 and surfaces it.
      *
      * The 16-bit kernel's SoA uses wider ambig / tail-padding constants
      * than 8-bit (AMBR16=15, AMBQ16=16, DUMMY3=26 vs AMBR=4, AMBQ=8,

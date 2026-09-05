@@ -243,9 +243,9 @@ static void bwamem3_simd_init_body(void)
      *
      * Earlier versions of bwa-mem3 emitted a [W::] warning here promising
      * "10-15%% slower hot paths, rebuild with BASELINE_ARCH=<host_tier>
-     * to recover". Empirically (c7a / c7i wgs-5M shm-warmed bare-metal,
-     * tricord) the gap is much smaller than that and the recommendation
-     * is not always applicable:
+     * to recover". Empirically (c7a / c7i, a 5M-read WGS slice,
+     * shm-warmed bare-metal) the gap is much smaller than that and the
+     * recommendation is not always applicable:
      *   - avx2 -> avx512bw: c7a -2.2%%, c7i -0.7%% (wash, both cases)
      *   - avx2 -> avx512bw + -mprefer-vector-width=256 (the default for
      *     arch=avx512bw): c7a -4.4%%, c7i -0.7%%

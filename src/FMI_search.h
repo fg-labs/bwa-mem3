@@ -371,7 +371,7 @@ private:
          * function's CPU samples on c7a (Zen 4) with gcc-14, with the
          * matching argument load close behind. always_inline removes the
          * call boundary and recovers the full gcc-11 baseline (and beats
-         * it by ~4% wall-clock on c7a wgs-5M shm-warmed). */
+         * it by ~4% wall-clock on c7a with a 5M-read WGS slice, shm-warmed). */
         __attribute__((always_inline)) inline
         SMEM backwardExt(SMEM smem, uint8_t a) const
         {
