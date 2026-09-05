@@ -569,6 +569,9 @@ mem_opt_t *mem_opt_init()
     o->max_extend_chains = 0;   // off by default; opt-in speed lever (--max-extend-chains / --fast)
     o->mate_concordant_window = 0;   // off by default; opt-in (--extend-mate-concordant / --fast --meth)
     o->est_insert_high = 0;          // runtime state; set from data (mem_pestat) or -I during the run
+    o->extend_csub = 0;          // off by default -> byte-identical; opt-in via --extend-csub
+    o->extend_tie_frac = 0.0f;   // off by default -> byte-identical to baseline; opt-in via --extend-tie-frac / --fast
+    o->extend_tie_floor = 0;     // no unconditional floor; only meaningful when extend_tie_frac > 0
     o->seed_emit_order = SEED_ORDER_OFF;  // byte-identical default
     o->smem_dedup  = 0;   // off by default -> byte-identical to baseline; opt-in via --smem-dedup
     o->alnreg_sort_fast = 0;  // off by default -> bwa-mem2's dedup sort (see mem_sort_dedup_patch); set by --fast
@@ -1517,13 +1520,35 @@ void mem_flt_chained_seeds(const mem_opt_t *opt, const bntseq_t *bns, const uint
  * byte-identical (drops candidate secondaries, so XS/secondary/MAPQ can move on
  * multi-mapping reads). Always keeps >= 1 chain. Returns the new chain count. */
 #define MAX_EXTEND_CHAINS_CAP 4096
-static int mem_chain_cap_extend(mem_chain_t *a, int n, int max_n)
+int mem_chain_cap_extend(mem_chain_t *a, int n, int max_n, float tie_frac, int tie_floor,
+                         int *capped_w_out)
 {
-    if (max_n <= 0 || n <= max_n || n > MAX_EXTEND_CHAINS_CAP) return n;
+    if (capped_w_out) *capped_w_out = 0;  /* max weight among dropped chains, for csub */
+    /* The competitiveness gate applies even when the count cap does NOT engage
+     * (n <= max_n): a read with a handful of chains still pays banded-SW for every
+     * non-competitive one, and those reads are the bulk of the workload. Gating only
+     * reads that exceed max_n removes almost nothing (measured: -1% to -6% of
+     * extension work, vs -20% for a plain top-5 cap). With tie_frac <= 0 the original
+     * early-return is preserved exactly, so the gate-off path stays byte-identical. */
+    const int cap_on = max_n > 0;
+    if (n > MAX_EXTEND_CHAINS_CAP) return n;
+    if (tie_frac <= 0.0f && (!cap_on || n <= max_n)) return n;
     int w[MAX_EXTEND_CHAINS_CAP];
-    for (int i = 0; i < n; i++) w[i] = a[i].w > 0 ? a[i].w : mem_chain_weight(&a[i]);
+    int w_best = 0;
+    for (int i = 0; i < n; i++) {
+        w[i] = a[i].w > 0 ? a[i].w : mem_chain_weight(&a[i]);
+        if (w[i] > w_best) w_best = w[i];
+    }
+    /* competitiveness gate (--extend-tie-frac): a chain ranked at/after tie_floor is
+     * extended only if its weight is within tie_frac of the best chain's -- i.e. it is
+     * a genuine near-tie that could change placement/MAPQ. tie_frac<=0 disables the gate,
+     * reducing this to the pure top-max_n cap (baseline). tie_frac is validated to [0,1]
+     * upstream (out-of-range is rejected), so (int)(tie_frac*w_best) <= w_best and the best chain (rank 0) always
+     * clears the gate -- the "keep >= 1 chain" invariant holds. */
+    int gate = tie_frac > 0.0f ? (int)(tie_frac * w_best) : 0;
     /* keep chain i iff fewer than max_n other chains outrank it by
-     * (weight desc, then original index asc) -- a stable top-max_n selection. */
+     * (weight desc, then original index asc) -- a stable top-max_n selection --
+     * AND (it is within the always-extend floor OR it clears the competitiveness gate). */
     int k = 0;
     for (int i = 0; i < n; i++) {
         int rank = 0;
@@ -1531,8 +1556,11 @@ static int mem_chain_cap_extend(mem_chain_t *a, int n, int max_n)
             if (j == i) continue;
             if (w[j] > w[i] || (w[j] == w[i] && j < i)) rank++;
         }
-        if (rank < max_n) a[k++] = a[i];
-        else if (a[i].m > SEEDS_PER_CHAIN) free(a[i].seeds);
+        if ((!cap_on || rank < max_n) && (rank < tie_floor || w[i] >= gate)) a[k++] = a[i];
+        else {
+            if (capped_w_out && w[i] > *capped_w_out) *capped_w_out = w[i];
+            if (a[i].m > SEEDS_PER_CHAIN) free(a[i].seeds);
+        }
     }
     return k;
 }
@@ -1553,9 +1581,15 @@ static int mem_chain_cap_extend(mem_chain_t *a, int n, int max_n)
 #define MATE_CONCORDANT_WINDOW_FALLBACK 1000  /* used only in --auto before the insert size is estimated (e.g. first chunk) */
 #define MATE_SCAN_MAX 256
 static int mem_chain_cap_extend_mate(mem_chain_t *a, int n, int max_n,
-        const mem_chain_t *mate, int mate_n, const bntseq_t *bns, int64_t win)
+        const mem_chain_t *mate, int mate_n, const bntseq_t *bns, int64_t win,
+        float tie_frac, int tie_floor, int *capped_w_out)
 {
-    if (max_n <= 0 || n <= max_n || n > MAX_EXTEND_CHAINS_CAP) return n;
+    if (capped_w_out) *capped_w_out = 0;  /* max weight among dropped chains, for csub */
+    /* See mem_chain_cap_extend: the competitiveness gate also applies when the count
+     * cap does not engage. tie_frac <= 0 preserves the original early-return exactly. */
+    const int cap_on = max_n > 0;
+    if (n > MAX_EXTEND_CHAINS_CAP) return n;
+    if (tie_frac <= 0.0f && (!cap_on || n <= max_n)) return n;
     const int MSCAN = MATE_SCAN_MAX;
     int mn = mate_n < MSCAN ? mate_n : MSCAN;
     int64_t mfp[MSCAN]; int mrid[MSCAN], mrev[MSCAN];
@@ -1564,13 +1598,22 @@ static int mem_chain_cap_extend_mate(mem_chain_t *a, int n, int max_n,
         mrid[j] = mate[j].rid; mrev[j] = is_rev;
     }
     int w[MAX_EXTEND_CHAINS_CAP];
-    for (int i = 0; i < n; i++) w[i] = a[i].w > 0 ? a[i].w : mem_chain_weight(&a[i]);
+    int w_best = 0;
+    for (int i = 0; i < n; i++) {
+        w[i] = a[i].w > 0 ? a[i].w : mem_chain_weight(&a[i]);
+        if (w[i] > w_best) w_best = w[i];
+    }
+    /* competitiveness gate (--extend-tie-frac); see mem_chain_cap_extend. The
+     * mate-concordant override below still runs after the gate, so a gate-failed
+     * (low-weight) chain that anchors the true concordant pair is still retained --
+     * exactly the #202 fix -- and the gate cannot drop a mate-concordant true pair. */
+    int gate = tie_frac > 0.0f ? (int)(tie_frac * w_best) : 0;
     int k = 0;
     for (int i = 0; i < n; i++) {
         int rank = 0;
         for (int j = 0; j < n; j++)
             if (j != i && (w[j] > w[i] || (w[j] == w[i] && j < i))) rank++;
-        int keep = rank < max_n;
+        int keep = (!cap_on || rank < max_n) && (rank < tie_floor || w[i] >= gate);
         if (!keep && mn > 0) {
             int is_rev; int64_t fp = bns_depos(bns, a[i].pos, &is_rev);
             for (int j = 0; j < mn; j++)
@@ -1584,7 +1627,12 @@ static int mem_chain_cap_extend_mate(mem_chain_t *a, int n, int max_n,
                 }
         }
         if (keep) a[k++] = a[i];
-        else if (a[i].m > SEEDS_PER_CHAIN) free(a[i].seeds);
+        else {
+            /* --extend-csub: remember the heaviest chain we dropped, so the SAM stage
+             * can seed the pruned competitor back into MAPQ (mem_seed_capped_sub). */
+            if (capped_w_out && w[i] > *capped_w_out) *capped_w_out = w[i];
+            if (a[i].m > SEEDS_PER_CHAIN) free(a[i].seeds);
+        }
     }
     return k;
 }
@@ -2789,8 +2837,13 @@ int mem_kernel1_core(FMI_search *fmi,
     // (which walks chain_ar unconditionally and free()s chain_ar[l].a) sees
     // a valid empty state, then let downstream stages emit unmapped records.
     if (tot_len == 0) {
-        for (int l = 0; l < nseq; ++l)
+        for (int l = 0; l < nseq; ++l) {
             kv_init(chain_ar[l]);
+            chain_ar[l].capped_w = 0;  /* Pass 2 (which sets this) is skipped on this
+                                        * early return; kv_init leaves it uninitialized.
+                                        * Harmless for output (no regions) but the
+                                        * --dedup-reads VERIFY instrument compares it. */
+        }
         return 1;
     }
     // enc_qdb is sized in *bytes* (= tot_len). Track its capacity via the
@@ -2918,14 +2971,20 @@ int mem_kernel1_core(FMI_search *fmi,
     for (int l=0; l<nseq; l++)
     {
         chn = &chain_ar[l];
+        int capped_w = 0;
         if (cap_mate_concordant && (l ^ 1) < nseq) {
             int ml = l ^ 1;  /* interleaved PE: mate is the sibling index */
             chn->n = mem_chain_cap_extend_mate(chn->a, chn->n, opt->max_extend_chains,
                                                chain_ar[ml].a, chain_ar[ml].n,
-                                               chain_bns, mate_win);
+                                               chain_bns, mate_win,
+                                               opt->extend_tie_frac, opt->extend_tie_floor,
+                                               &capped_w);
         } else {
-            chn->n = mem_chain_cap_extend(chn->a, chn->n, opt->max_extend_chains);
+            chn->n = mem_chain_cap_extend(chn->a, chn->n, opt->max_extend_chains,
+                                          opt->extend_tie_frac, opt->extend_tie_floor,
+                                          &capped_w);
         }
+        chn->capped_w = opt->extend_csub ? capped_w : 0;  /* carried to worker_sam via regs */
     }
     printf_(VER, "7. Done mem_chain_flt..\n");
     // tprof[MEM_ALN_M1][tid] += __rdtsc() - tim;
@@ -3076,6 +3135,7 @@ int mem_kernel2_core(FMI_search *fmi,
         /* SAM-A18: stamp is_alt in this same pass. Each read's regions are now
          * final (dedup done) and is_alt is not read by any later read's dedup,
          * so folding the former separate full pass in here is byte-identical. */
+        regs[l].capped_w = chain_ar[l].capped_w;  /* ride the dropped-weight to worker_sam */
         for (i = 0; i < regs[l].n; ++i)
         {
             mem_alnreg_t *p = &regs[l].a[i];
@@ -3271,6 +3331,10 @@ static inline void read_memo_copy_regs(mem_alnreg_v *dst, const mem_alnreg_v *sr
         dst->a = NULL;
     }
     dst->n = dst->m = (size_t) n;
+    /* --extend-csub side channel: the dropped-chain weight rides the vector, not
+     * the regions, so it must be copied too or a DUP loses its csub seed and
+     * --dedup-reads on/off stop being byte-identical under --extend-csub. */
+    dst->capped_w = src->capped_w;
 }
 
 /* [dedup-reads] VERIFY (BWAMEM3_DEDUP_READS_VERIFY): the first mem_alnreg_t field
@@ -3299,6 +3363,9 @@ static void read_memo_verify_regs(const mem_alnreg_v *dup, const mem_alnreg_v *r
     if (dup->n != rep->n)
         err_fatal(__func__, "dedup-reads VERIFY: read %d has n=%zu but its representative has n=%zu",
                   read_idx, dup->n, rep->n);
+    if (dup->capped_w != rep->capped_w)
+        err_fatal(__func__, "dedup-reads VERIFY: read %d has capped_w=%d but its representative has capped_w=%d",
+                  read_idx, dup->capped_w, rep->capped_w);
     for (size_t i = 0; i < dup->n; ++i) {
         const char *f = read_memo_alnreg_field_diff(&dup->a[i], &rep->a[i]);
         if (f)
@@ -3476,6 +3543,7 @@ static void worker_sam(void *data, int seqid, int batch_size, int tid)
 #if V17  // Feature from v0.7.17 of orig. bwa-mem
             if (w->opt->flag & MEM_F_PRIMARY5) mem_reorder_primary5(w->opt->T, &w->regs[i]);
 #endif
+            mem_seed_capped_sub(&w->regs[i], w->opt->a);  /* --extend-csub (no-op when off) */
             /* D3 (--meth): emit in ORIGINAL coords/alphabet via mem_aln_bns/pac. */
             mem_reg2sam(w->opt, mem_aln_bns(w), mem_aln_pac(w), &w->seqs[i],
                         &w->regs[i], 0, 0);
@@ -3837,6 +3905,38 @@ int mem_mark_primary_se(const mem_opt_t *opt, int n, mem_alnreg_t *a, int64_t id
 /************************
  * Integrated interface *
  ************************/
+
+/* --extend-csub: seed each PRIMARY region's csub with a calibrated estimate of the
+ * best chain the cap/gate dropped before extension, so MAPQ (which reads
+ * max(sub, csub)) reflects the pruned competitor instead of inflating. The estimate
+ * scales the dropped chain's weight by the all-match rate (weight*a; the PE path in
+ * mem_capped_pair_subo deliberately uses the observed per-base rate instead, since a
+ * pair score sums two estimates), and is clamped strictly below the region's own
+ * score, so it lowers MAPQ proportionally rather than forcing it to 0 (the UNCLAMPED
+ * weight*a version tripped `sub >= score -> return 0`, which the PE MAPQ
+ * recombination then turned into spurious promotions). No-op when nothing was
+ * dropped (capped_w == 0), so --extend-csub off is byte-identical. */
+void mem_seed_capped_sub(mem_alnreg_v *a, int match_a)
+{
+    if (a->capped_w <= 0) return;
+    for (size_t r = 0; r < a->n; ++r) {
+        mem_alnreg_t *p = &a->a[r];
+        if (p->secondary >= 0) continue;            /* primary regions only */
+        int span = p->qe - p->qb;
+        if (span <= 0 || p->score <= 0) continue;
+        /* TUNING(csub): all-match rate (weight*a). The clamp below is what makes this
+         * safe (the naive unclamped weight*a tripped `sub>=score -> mapq 0`). */
+        long est = (long)a->capped_w * match_a;
+        if (est >= p->score) est = p->score - 1;    /* clamp: never force mapq 0 */
+        /* Seed the pruned competitor into `sub`, NOT `csub`. csub is the tandem-hit slot,
+         * capped mate-BLIND after the +40 PE pair promotion (bwamem_pair.cpp) -- routing a
+         * dropped (mate-non-concordant under the mate-aware --fast cap) chain there over-demotes
+         * correct paired reads in paralog/pseudogene regions. `sub` feeds the promotable q_se, so
+         * pairing can rescue reads the mate resolves. SE MAPQ and XS both read max(sub,csub), so
+         * single-end output is byte-identical. */
+        if (est > p->sub) p->sub = (int)est;
+    }
+}
 
 int mem_approx_mapq_se(const mem_opt_t *opt, const mem_alnreg_t *a)
 {

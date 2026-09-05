@@ -21,6 +21,9 @@ Options:
     --no-adaptive-band  disable adaptive banded-SW (exact, byte-identical full-width extension; also disables the certified band); overrides --adaptive-band and the --adaptive-band that --fast enables
     --no-band-cert  disable the certified adaptive extension band (on by default): run the full-width extension ladder for every pair instead of the narrow-probe-plus-certificate. The certified band is byte-identical to full-width, so on a plain run this only removes the speedup; it has no effect under --fast, --adaptive-band, or --no-adaptive-band (which already disable the certified band). Escape hatch / A-B handle [on]
     --extend-mate-concordant[=INT]  when --max-extend-chains caps a PE read, also keep any chain concordant (same contig, FR, within INT bp) with a mate chain; recovers the true pair's low-weight chain the cap would drop (mainly --meth). Bare = auto (window = estimated proper-pair insert high bound); =INT = fixed bp; =0 = off. Opt-in, NOT byte-identical [off]
+    --extend-tie-frac FLOAT  extend a chain (ranked at/after --extend-tie-floor) only if its (integer) weight >= floor(FLOAT * the best chain's weight) -- trims non-competitive tail chains from banded-SW while still extending genuine near-ties. The threshold is truncated to an integer, so e.g. best=19 with FLOAT=0.95 gates at 18, not 18.05. Complements --max-extend-chains (the count cap) and also gates on its own when that cap is off; must be in [0,1]; opt-in, NOT byte-identical (0 = off) [0]
+    --extend-csub  when --extend-tie-frac/--max-extend-chains drops chains, seed the primary's competitor score with a calibrated estimate of the best dropped chain so MAPQ is not inflated by the pruning; opt-in, NOT byte-identical [off]
+    --extend-tie-floor INT  extend at least the top-INT chains regardless of --extend-tie-frac, but only within --max-extend-chains (the count cap runs first, so a floor above --max-extend-chains still keeps at most --max-extend-chains); 0 = no floor (the fraction gate governs from rank 0, best chain always kept); only meaningful with --extend-tie-frac > 0 [0]
     -D FLOAT      drop chains shorter than FLOAT fraction of the longest overlapping chain [0.50]
     -W INT        discard a chain if seeded bases shorter than INT [0]
     -m INT        perform at most INT rounds of mate rescues for each read [50]
@@ -39,8 +42,8 @@ Options:
                   mate rescue -- use --hic or -5SP to skip it too) [off]
     --fast        speed preset: -m 10 -y 0 --min-ext-len 30 --smem-dedup --rescue-kmer=6
                   --skip-contained-ext --max-extend-chains 20 --adaptive-band
-                  --extend-mate-concordant (under --meth: --max-extend-chains 10,
-                  -s 2). Opt-in; explicit
+                  --extend-mate-concordant --extend-tie-frac 0.95 --extend-tie-floor 1
+                  --extend-csub (under --meth: --max-extend-chains 10, -s 2). Opt-in; explicit
                   flags override where applicable; --smem-dedup,
                   --skip-contained-ext and --adaptive-band are enabled
                   (pass --no-adaptive-band to keep exact extension under --fast).

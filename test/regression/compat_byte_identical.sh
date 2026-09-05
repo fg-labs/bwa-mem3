@@ -264,6 +264,35 @@ compat_err "mutually exclusive" --compat=bwa-mem2 --proper-pair-from-emitted
 compat_err "mutually exclusive" --compat=bwa-mem --proper-pair-from-emitted
 compat_ok --proper-pair-from-emitted
 compat_ok --compat=off --proper-pair-from-emitted
+# The chain-extension cap (--extend-tie-frac / --extend-tie-floor / --extend-csub)
+# prunes chains and recalibrates MAPQ, so a setting that can actually prune a
+# chain changes alignments just like --fast. It is folded into --fast (rejected
+# above) but the levers are also settable on their own, so
+# `--compat --extend-tie-frac=0.95 --extend-csub` would otherwise diff clean
+# over non-compatible alignments. Reject only configurations that can actually
+# prune: --extend-tie-frac > 0 gates on its own, regardless of
+# --max-extend-chains; --extend-csub only matters once something was dropped,
+# which --max-extend-chains alone (the plain count cap) can still do even with
+# --extend-tie-frac at 0. --extend-tie-floor is meaningful only when
+# --extend-tie-frac > 0 (mem_chain_cap_extend's gate is 0 otherwise, so the
+# floor never changes a keep decision), so a bare floor is always a no-op and
+# must NOT trip the guard.
+compat_err "mutually exclusive" --compat=bwa-mem2 --extend-tie-frac=0.95
+compat_err "mutually exclusive" --extend-tie-frac=0.95 --compat=bwa-mem2
+compat_err "mutually exclusive" --compat=bwa-mem2 --extend-tie-frac=0.95 --extend-csub
+compat_err "mutually exclusive" --compat=bwa-mem2 --extend-csub --max-extend-chains=5
+# --extend-tie-floor alone (--extend-tie-frac at 0) is always a no-op, with or
+# without --max-extend-chains, so --compat must accept it.
+compat_ok --compat=bwa-mem2 --extend-tie-floor=1
+compat_ok --compat=bwa-mem2 --extend-tie-floor=1 --max-extend-chains=5
+# --extend-csub alone, with no cap active to ever populate capped_w, is also a
+# no-op.
+compat_ok --compat=bwa-mem2 --extend-csub
+# An explicit off-state value resolves to the byte-identical default, so it must
+# NOT trip the guard -- the guard keys off the effective value, not whether the
+# flag was typed.
+compat_ok --compat=bwa-mem2 --extend-tie-frac=0
+compat_ok --compat=off --extend-tie-frac=0.95 --extend-csub
 echo "PASS: --compat enum grammar (=/space, alias, off, both targets, unknown, exactness)"
 
 # --- Source guard: both proper-pair sites share one derivation. --------------

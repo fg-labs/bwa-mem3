@@ -196,6 +196,9 @@ typedef struct mem_opt_t {
     int max_extend_chains;  // cap on chains extended per read: keep only the top-N by weight before banded-SW (0 = off). Opt-in speed lever; NOT byte-identical.
     int mate_concordant_window;  // --extend-mate-concordant: when max_extend_chains caps a PE read, also retain chains concordant with a mate chain within this many bp. 0 = off; -1 = auto (use the estimated proper-pair insert high bound); >0 = fixed window. Recovers the true pair's low-weight chain (mainly --meth). NOT byte-identical.
     int est_insert_high;         // runtime state (NOT a user option): upper proper-pair insert bound (pes[FR].high) estimated from data during the run, or from -I; 0 = not yet estimated. Read by the mate-concordant cap when mate_concordant_window == -1 (auto).
+    float extend_tie_frac;       // --extend-tie-frac: extend a chain (ranked at/after extend_tie_floor) only if its weight >= this fraction of the best chain's weight. Complements max_extend_chains (the count cap) and also gates on its own when that cap is off. 0 = off (byte-identical); clamped to [0,1]. Trims non-competitive tail chains from banded-SW. NOT byte-identical when > 0.
+    int extend_csub;             // --extend-csub: when the cap/gate drops chains, seed the primary region's competitor score (calibrated dropped-chain estimate, clamped < primary score) so MAPQ is not inflated by the pruning. 0 = off (byte-identical). Opt-in.
+    int extend_tie_floor;        // --extend-tie-floor: always extend at least this many top-ranked chains regardless of extend_tie_frac. 0 = no unconditional floor (the fraction gate governs from rank 0 up; the best chain always survives). Only meaningful when extend_tie_frac > 0.
     seed_order_t seed_emit_order;  // --seed-order; SEED_ORDER_OFF = byte-identical
     int min_chain_weight;
     int max_chain_extend;
@@ -358,7 +361,7 @@ typedef struct {
     mem_seed_t *seeds;
 } mem_chain_t;
 
-typedef struct { size_t n, m, cc; mem_chain_t *a;  } mem_chain_v;
+typedef struct { size_t n, m, cc; mem_chain_t *a; int capped_w; } mem_chain_v;
 
 typedef struct mem_alnreg_t {
     // mem_alnreg_t() {c=NULL;}
@@ -398,7 +401,11 @@ typedef struct mem_alnreg_t {
     int8_t meth_strand_hyp;
 } mem_alnreg_t;
 
-typedef struct { size_t n, m; mem_alnreg_t *a; } mem_alnreg_v;
+typedef struct { size_t n, m; mem_alnreg_t *a; int capped_w; } mem_alnreg_v;
+/* capped_w: max WEIGHT among chains the cap/gate dropped before extension, carried
+ * to worker_sam so --extend-csub can seed the primary region's competitor score
+ * (a calibrated estimate, clamped below the primary's own score) and keep MAPQ from
+ * inflating when a real competitor was pruned. 0 = nothing dropped / feature off. */
 
 typedef struct {
     int low, high;   // lower and upper bounds within which a read pair is considered to be properly paired
@@ -635,6 +642,11 @@ void mem_reg2sam(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
 int mem_approx_mapq_se(const mem_opt_t *opt, const mem_alnreg_t *a) ;
 
 int mem_mark_primary_se(const mem_opt_t *opt, int n, mem_alnreg_t *a, int64_t id);
+void mem_seed_capped_sub(mem_alnreg_v *a, int match_a);  /* --extend-csub: seed primary sub from dropped chains */
+/* Exposed for unit tests (test/unit/test_chain_cap.cpp). */
+int  mem_chain_cap_extend(mem_chain_t *a, int n, int max_n, float tie_frac, int tie_floor,
+                          int *capped_w_out);   /* --max-extend-chains count cap + --extend-tie-frac gate */
+int  mem_capped_pair_subo(const mem_alnreg_v a[2], const int z[2], int o);  /* --extend-csub PE competitor floor */
 
 static void mem_mark_primary_se_core(const mem_opt_t *opt, int n, mem_alnreg_t *a, int_v *z);
 
