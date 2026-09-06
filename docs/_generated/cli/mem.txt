@@ -61,9 +61,16 @@ Options:
                   v2.2.1 forked at bwa 0.7.17, before either landed.
                   bwa-mem:  keep both -- bwa 0.7.18+ emits them. Pinned at 0.7.19.
                   Shapes output only; changes no alignment. @PG still differs (it
-                  is run-specific) -- exclude it when comparing. Mutually exclusive
-                  with --fast (which changes alignments) and with --meth (neither
-                  target has a bisulfite mode) -- combining them is an error [off]
+                  is run-specific) -- exclude it when comparing. Rejects any
+                  bwa-mem3-only lever that changes alignments/MAPQ (e.g. --smem-dedup,
+                  --adaptive-band, --max-extend-chains, --min-ext-len, --rescue-kmer,
+                  --seed-order); --fast and --meth are always refused, the rest can
+                  be forced with --compat-allow-divergent [off]
+    --compat-allow-divergent  with --compat, downgrade the divergent-lever refusal
+                  to a warning: keep the target's OUTPUT CONVENTIONS while running a
+                  bwa-mem3-only lever. Output is then NOT byte-identical to the
+                  target. Does not relax --fast/--meth (category errors, not
+                  divergences). No effect without --compat [off]
 Scoring options:
    -A INT        score for a sequence match, which scales options -TdBOELU unless overridden [1]
    -B INT        penalty for a mismatch [4]
