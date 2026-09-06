@@ -46,7 +46,7 @@ struct Out { int score, tle, gtle, qle, gscore, max_off; };
 // under the given matrix. Returns the number of pairs whose SIMD score differs
 // from the scalar oracle.
 int score_mismatches(int width, const int8_t mat[25], int a, int b,
-                     int n, int maxlen, unsigned long seed) {
+                     int n, int maxlen, unsigned long seed, int n_pct = 0) {
     const int ambig = -1, o = 6, e = 1, end_bonus = 5, w = 100, zdrop = 100;
     const int STRIDE = maxlen + 256;
     BandedPairWiseSW bsw(o, e, o, e, zdrop, end_bonus, const_cast<int8_t*>(mat), a, b, 1);
@@ -68,6 +68,15 @@ int score_mismatches(int width, const int8_t mat[25], int a, int b,
             uint8_t base = (rb == 1) ? 3 : rb;                 // C->T conversion in the read
             if ((int)(rng() % 100) < 3) base = (uint8_t)(rng() % 4);  // 3% real mismatch
             s2[i] = base;
+        }
+        // Ambiguous-base (N = nt4 code 4) injection: exercises the query-side
+        // 4->8 remap in neon_soa_pack16 (target N stays 4). The scalar oracle
+        // scores N through the same mat[25] (row/col 4), so both paths must agree.
+        if (n_pct > 0) {
+            for (int i = 0; i < len1; ++i)
+                if ((int)(rng() % 100) < n_pct) s1[i] = 4;     // target N
+            for (int i = 0; i < len2; ++i)
+                if ((int)(rng() % 100) < n_pct) s2[i] = 4;     // query N -> code 8 in the kernel
         }
         SeqPair &sp = pairs[c];
         sp.id = c; sp.len1 = len1; sp.len2 = len2; sp.h0 = 40;
@@ -106,6 +115,23 @@ TEST_CASE("bandedSWA getScores16 honors an asymmetric (OT bisulfite) matrix"
           * doctest::test_suite("unit/bandedswa-asym")) {
     int8_t mat[25]; build_ot_mat(mat, 1, 4, -1);
     CHECK(score_mismatches(16, mat, 1, 4, 4000, 400, 3) == 0);
+}
+
+// Ambiguous-base coverage for the packed 8-bit path. Every other 8-bit
+// extension parity case builds sequences from rng()%4, so the query-side N->8
+// remap in neon_soa_pack16 (and the target-side "N stays 4" fill) went
+// untested. With ~10% N in both target and query, getScores8 must still match
+// the scalar oracle, which scores N through the same mat[25] (row/col 4).
+TEST_CASE("bandedSWA getScores8 matches scalar with ambiguous (N) bases"
+          * doctest::test_suite("unit/bandedswa-asym")) {
+    int8_t mat[25]; build_sym_mat(mat, 1, 4, -1);
+    CHECK(score_mismatches(8, mat, 1, 4, 4000, 200, 4, /*n_pct=*/10) == 0);
+}
+
+TEST_CASE("bandedSWA getScores16 matches scalar with ambiguous (N) bases (control)"
+          * doctest::test_suite("unit/bandedswa-asym")) {
+    int8_t mat[25]; build_sym_mat(mat, 1, 4, -1);
+    CHECK(score_mismatches(16, mat, 1, 4, 4000, 400, 5, /*n_pct=*/10) == 0);
 }
 
 #endif // HAVE_BSW_VECTOR_8_16

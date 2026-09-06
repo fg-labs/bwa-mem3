@@ -29,6 +29,18 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 
 #include "kernel_dispatch.h"
 #include "bandedSWA.h"
+#if defined(__ARM_NEON) || defined(__aarch64__)
+/* neon_soa_pack.h remaps the nt4 ambiguity code to the kernels' query-N code.
+ * These names live in kswv.cpp; this translation unit needs them too, so define
+ * them here before the include. AMBQ matches the query-N=8 the 8-bit prepass uses. */
+#ifndef AMBIG_
+#define AMBIG_ 4
+#endif
+#ifndef AMBQ
+#define AMBQ 8
+#endif
+#include "neon_soa_pack.h"   /* tiled SoA packing for the 128-bit 8-bit wrapper */
+#endif
 #ifdef VTUNE_ANALYSIS
 #include <ittnotify.h> 
 #endif
@@ -4271,6 +4283,15 @@ static inline __m128i blendv_fullmask8(__m128i a, __m128i b, __m128i mask)
 // any lane width, because a full-width lane's bytes agree (a 16-bit lane is
 // 0x0000 or 0xFFFF). x86 keeps the native movemask (== 0xFFFF is "all set" for a
 // full-width mask regardless of lane width, matching the old & dmask16 form).
+//
+// NEON any_lane_set8 note: on ARM the reduce is vmaxvq_u8(v) != 0, which is true
+// iff ANY byte of v is nonzero -- so it answers correctly for a numeric (not
+// 0x00/0xFF) input too. The Apple-only 8-bit z-drop epilogue gate relies on this:
+// it ORs the byte-domain need_z difference (0..255) into the mask before calling
+// any_lane_set8. Do NOT extend that numeric-input use to the x86 branch:
+// _mm_movemask_epi8 tests each byte's high bit only, so a small nonzero byte
+// (e.g. 0x01) reads as unset -- correct only for a true 0x00/0xFF mask. No
+// numeric caller compiles on x86 (the gate is __APPLE__-only, hence NEON).
 static inline bool any_lane_set8(__m128i mask)
 {
 #if defined(__ARM_NEON) || defined(__aarch64__)
@@ -4802,7 +4823,9 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
     int16_t *H_h    = H16_ + tid * SIMD_WIDTH16 * MAX_SEQ_LEN16;
     int16_t *H_v = H16__ + tid * SIMD_WIDTH16 * MAX_SEQ_LEN16;
 
-    int16_t i, j;
+    /* int, not int16_t: int16 loop counters cost a sign-extension per iteration
+     * on arm64 (sxth/sbfiz in the cell loop); values are bounded by nrow/ncol. */
+    int i, j;
 
     uint16_t tlen[SIMD_WIDTH16];
     uint16_t tail[SIMD_WIDTH16] __attribute((aligned(64)));
@@ -4913,8 +4936,10 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
             // __m128i cmp2 = _mm_cmpgt_epi16(pj128, tail128);
             __m128i cmp2 = _mm_cmpgt_epi16(j128, tail128);
             cmp1 = _mm_or_si128(cmp1, cmp2);
-            h128 = _mm_blendv_epi16(h128, zero128, cmp1);
-            f128 = _mm_blendv_epi16(f128, zero128, cmp1);
+            /* cmp1 is a full-width mask (OR of two cmpgt_epi16), so zeroing the
+             * out-of-band lanes is one andnot, not a three-op select. */
+            h128 = _mm_andnot_si128(cmp1, h128);
+            f128 = _mm_andnot_si128(cmp1, f128);
             
             _mm_store_si128((__m128i *)(F + l * SIMD_WIDTH16), f128);
             _mm_store_si128((__m128i *)(H_h + l * SIMD_WIDTH16), h128);
@@ -4990,8 +5015,8 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
             __m128i cmp1 = _mm_cmpgt_epi16(head128, pj128);
             __m128i cmp2 = _mm_cmpgt_epi16(pj128, tail128);
             cmp1 = _mm_or_si128(cmp1, cmp2);
-            h10 = _mm_blendv_epi16(h10, zero128, cmp1);
-            f21 = _mm_blendv_epi16(f21, zero128, cmp1);
+            h10 = _mm_andnot_si128(cmp1, h10);   /* full-width mask: andnot == select-zero */
+            f21 = _mm_andnot_si128(cmp1, f21);
             
             __m128i bmaxRS = maxRS1;
             maxRS1 =_mm_max_epi16(maxRS1, h11);
@@ -5033,7 +5058,7 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
         __m128i cmp1 = _mm_cmpgt_epi16(head128, j128);
         __m128i cmp2 = _mm_cmpgt_epi16(j128, tail128);
         cmp1 = _mm_or_si128(cmp1, cmp2);
-        h10 = _mm_blendv_epi16(h10, zero128, cmp1);
+        h10 = _mm_andnot_si128(cmp1, h10);
             
         _mm_store_si128((__m128i *)(H_h + j * SIMD_WIDTH16), h10);
         _mm_store_si128((__m128i *)(F + j * SIMD_WIDTH16), zero128);
@@ -5612,6 +5637,12 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
             int maxLen2 = 0;
             //bsize = 100;
             bsize = w;
+#if defined(__ARM_NEON) || defined(__aarch64__)
+            /* The lane-count invariant (SIMD_WIDTH8 == 16) is asserted inside
+             * neon_soa_pack16 itself; see neon_soa_pack.h. */
+            const uint8_t *seq1p[SIMD_WIDTH8], *seq2p[SIMD_WIDTH8];
+            int len1a[SIMD_WIDTH8], len2a[SIMD_WIDTH8];
+#endif
             
             for(j = 0; j < SIMD_WIDTH8; j++)
             {
@@ -5640,15 +5671,25 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                     h0[j] = (uint8_t) h0p;
                 }
                 seq1 = seqBufRef + (int64_t)sp.idr;
-
+#if defined(__ARM_NEON) || defined(__aarch64__)
+                seq1p[j] = seq1;
+                len1a[j] = sp.len1;
+#else
                 for(k = 0; k < sp.len1; k++)
                 {
                     mySeq1SoA[k * SIMD_WIDTH8 + j] = seq1[k] /* PR16: N stays 4 */;
                 }
+#endif
                 qlen[j] = sp.len2 * max;
                 if(maxLen1 < sp.len1) maxLen1 = sp.len1;
             }
 
+#if defined(__ARM_NEON) || defined(__aarch64__)
+            /* Tiled 16x16 transpose in place of the strided byte scatter (see
+             * neon_soa_pack.h): bases (N stays 4), then DUMMY1 from len1 through
+             * row maxLen1 inclusive -- byte-for-byte what the scalar loops wrote. */
+            neon_soa_pack16(mySeq1SoA, seq1p, len1a, len1a, maxLen1 + 1, DUMMY1, DUMMY1, false);
+#else
             for(j = 0; j < SIMD_WIDTH8; j++)
             {
                 SeqPair sp = pairArray[i + j];
@@ -5657,6 +5698,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                     mySeq1SoA[k * SIMD_WIDTH8 + j] = DUMMY1;
                 }
             }
+#endif
             /* B5: the h0-prefix deletion seed below fully overwrites H2 rows
              * [0, maxLen1); only the boundary row H2[maxLen1] survives to be read
              * as the column edge. Write just that row (all lanes = DUMMY1) here
@@ -5688,14 +5730,23 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                 SeqPair sp = pairArray[i + j];
                 // seq2 = seqBuf + (2 * (int64_t)sp.id + 1) * MAX_SEQ_LEN;
                 seq2 = seqBufQer + (int64_t)sp.idq;
-                
+#if defined(__ARM_NEON) || defined(__aarch64__)
+                seq2p[j] = seq2;
+                len2a[j] = sp.len2;
+#else
                 for(k = 0; k < sp.len2; k++)
                 {
                     mySeq2SoA[k * SIMD_WIDTH8 + j] = (seq2[k]==AMBIG ? 8 : seq2[k]) /* PR16: query N→8 */;
                 }
+#endif
                 if(maxLen2 < sp.len2) maxLen2 = sp.len2;
             }
 
+#if defined(__ARM_NEON) || defined(__aarch64__)
+            /* Query side: bases with N (4) -> 8, then DUMMY2 from len2 through
+             * column maxLen2 inclusive. */
+            neon_soa_pack16(mySeq2SoA, seq2p, len2a, len2a, maxLen2 + 1, DUMMY2, DUMMY2, true);
+#else
             //maxLen2 = ((maxLen2  + 3) >> 2) * 4;
 
             for(j = 0; j < SIMD_WIDTH8; j++)
@@ -5706,6 +5757,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                     mySeq2SoA[k * SIMD_WIDTH8 + j] = DUMMY2;
                 }
             }
+#endif
             /* B5: the h0-prefix insertion seed below fully overwrites H1 rows
              * [0, maxLen2); only the boundary row H1[maxLen2] survives as the row
              * edge (value 0). Write just that row here instead of the dead
@@ -6290,7 +6342,41 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
         // Per-lane wide updates (O(rows)): best-score row (xrow), best-gscore
         // row (ierow), and the z-drop test — all done in wide scalars so row
         // distances that exceed int8 for long reads are handled exactly.
-        {
+        //
+        // Run the block only on rows where some lane can actually change:
+        //   * xrow / best_abs change only where cmp is set (the global max
+        //     advanced this row; best_abs is always >= maxScore128 otherwise,
+        //     so max(best_abs, ms) is the identity);
+        //   * gbest_abs / ierow change only where qfire128 is set;
+        //   * a lane can z-drop only if drop - dif > zdrop with dif >= 0, so
+        //     drop > zdrop is necessary, and drop = maxScore128 - maxRS1 is
+        //     exact in bytes on alive lanes (both are [0,255] under the routing
+        //     envelope). subs_epu8 twice: nonzero iff drop > zdrop. Dead lanes
+        //     may read as "needed" here; the block masks them with exit0 anyway,
+        //     so that only costs a skipped skip.
+        // With the certified adaptive band defaulting to w = 20, a row is ~41
+        // cells and this block (~140 instructions plus its stack round trips)
+        // was roughly a third of it; most rows set none of the three.
+        // Byte-identical: when the gate is clear every store below is a no-op.
+        //
+        // Apple silicon only, gated on __APPLE__. The gate is a win there (+1 to
+        // +2.5% on the isolated kernel) but a loss on Neoverse V2 (-0.5 to
+        // -1.5%): the per-row reduction and branch cost more than the block they
+        // skip on the minority of post-peak rows. Other targets run the block on
+        // every row, exactly as before. NOTE: do not gate on APPLE_SILICON here
+        // -- simd_compat.h defines it as 1 for EVERY aarch64/NEON build (it is
+        // the codebase-wide NEON synonym), so it is true on Graviton too and
+        // cannot express "Apple only"; __APPLE__ is the real Apple predicate,
+        // and inside this NEON-only kernel it means Apple silicon.
+#if defined(__APPLE__)
+        const __m128i need_z = (zdrop > 0)
+            ? _mm_subs_epu8(_mm_subs_epu8(maxScore128, maxRS1), zdrop128)
+            : zero128;
+        const bool need_wide = any_lane_set8(_mm_or_si128(_mm_or_si128(cmp, qfire128), need_z));
+#else
+        const bool need_wide = true;
+#endif
+        if (need_wide) {
             int8_t  cmp_a[SIMD_WIDTH8]      __attribute((aligned(16)));
             int8_t  y1_a[SIMD_WIDTH8]       __attribute((aligned(16)));
             int8_t  y_a[SIMD_WIDTH8]        __attribute((aligned(16)));
