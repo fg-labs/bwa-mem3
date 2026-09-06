@@ -1524,6 +1524,8 @@ static const char *stray_option_value_flag(const char *s)
         { "XR",        "--meth-tags"    }, { "XG",        "--meth-tags" },
         { "XM",        "--meth-tags"    }, { "all",       "--meth-tags" },
         { "none",      "--meth-tags"    },
+        { "spec30",    "--meth-seed-prune" }, { "baseline",  "--meth-seed-prune" },
+        { "off",       "--meth-seed-prune" },
     };
     if (s == NULL) return NULL;
     /* A `^`-prefixed exclusion can only have come from --meth-tags. Its `-XM`
@@ -1546,6 +1548,9 @@ static const char *stray_option_value_advice(const char *s)
     if (strcmp(flag, "--meth-tags") == 0)
         return "       --meth-tags takes ONE comma-separated list, not a space-separated one:\n"
                "       write --meth-tags XR,XG (or --meth-tags '^XM'), not --meth-tags XR XG.";
+    if (strcmp(flag, "--meth-seed-prune") == 0)
+        return "       --meth-seed-prune takes an OPTIONAL argument, which getopt only binds with '=':\n"
+               "       write --meth-seed-prune=baseline, not --meth-seed-prune baseline.";
     return "       Pass it as the argument to that flag, e.g. --meth-scoring genomic.";
 }
 
@@ -1712,6 +1717,16 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "                 In genomic/neutral a real variant in the conversion direction\n");
     fprintf(stderr, "                 itself (C->T at a reference C) is indistinguishable from a\n");
     fprintf(stderr, "                 conversion and stays hidden in NM/MD.\n");
+    fprintf(stderr, "   --meth-seed-prune[=spec30|baseline|off]\n");
+    fprintf(stderr, "                 prune the 3-letter alphabet's short, repetitive spurious SMEMs\n");
+    fprintf(stderr, "                 before SA resolution: ~30%% faster --meth at ~0 accuracy cost\n");
+    fprintf(stderr, "                 vs truth (measured WGS/WES/em-seq, mapq>=20 accuracy identical).\n");
+    fprintf(stderr, "                 ON by default under --meth (spec30) -- --meth is bwa-mem3-native,\n");
+    fprintf(stderr, "                 so there is no upstream reference output to preserve. spec30:\n");
+    fprintf(stderr, "                 per-read two-regime rule; baseline: drop len<25 & SA-count>1;\n");
+    fprintf(stderr, "                 off: restore the un-pruned seeding (byte-identical). NOT\n");
+    fprintf(stderr, "                 byte-identical vs off. Env BWAMEM3_METH_SEED_PRUNE (off|spec30|\n");
+    fprintf(stderr, "                 baseline) overrides this flag for A/B testing.\n");
     fprintf(stderr, "   --meth-tags SPEC\n");
     fprintf(stderr, "                 which Bismark tags to emit: 'all' (default), 'none', a\n");
     fprintf(stderr, "                 comma-separated list (XR,XG), or ^-prefixed exclusions (^XM).\n");
@@ -1956,6 +1971,7 @@ int main_mem(int argc, char *argv[])
         OPT_BAM = 1000,
         OPT_METH,
         OPT_METH_SCORING,
+        OPT_METH_SEED_PRUNE,
         OPT_METH_TAGS,
         OPT_METH_SET_AS_FAILED,
         OPT_METH_CHIMERA_QC,
@@ -2018,6 +2034,7 @@ int main_mem(int argc, char *argv[])
         {"extend-csub",              no_argument,       0, OPT_EXTEND_CSUB},
         {"meth",                     optional_argument, 0, OPT_METH},
         {"meth-scoring",             required_argument, 0, OPT_METH_SCORING},
+        {"meth-seed-prune",          optional_argument, 0, OPT_METH_SEED_PRUNE},
         {"meth-tags",                required_argument, 0, OPT_METH_TAGS},
         {"set-as-failed",            required_argument, 0, OPT_METH_SET_AS_FAILED},
         {"chimera-qc",               no_argument,       0, OPT_METH_CHIMERA_QC},
@@ -2255,6 +2272,32 @@ int main_mem(int argc, char *argv[])
                 if (out_opened) fclose(aux.fp);
                 return 1;
             }
+        }
+        else if (c == OPT_METH_SEED_PRUNE) {
+            /* --meth-seed-prune[=spec30|baseline|off]: prune the 3-letter
+             * over-seeding before SA resolution (~30% faster --meth at ~0 truth
+             * accuracy cost; NOT byte-identical). ON by default under --meth
+             * (SPEC30, set in the meth-default block below); pass =off to restore
+             * byte-identical seeding. getopt_long's optional_argument only binds
+             * with '=' (a bare word is a positional), so a plain --meth-seed-prune
+             * leaves optarg NULL => spec30 (the recommended rule). */
+            if (optarg == NULL || strcmp(optarg, "spec30") == 0) {
+                opt->meth_seed_prune = MEM_METH_PRUNE_SPEC30;
+            } else if (strcmp(optarg, "baseline") == 0) {
+                opt->meth_seed_prune = MEM_METH_PRUNE_BASELINE;
+            } else if (strcmp(optarg, "off") == 0) {
+                opt->meth_seed_prune = MEM_METH_PRUNE_OFF;
+            } else {
+                /* optarg is non-NULL here (NULL took the spec30 branch), so the
+                 * value was bound with '=' -- the orphaned-space case cannot
+                 * reach this branch, and a "use =, not a space" note would
+                 * misdirect. Just name the accepted vocabulary. */
+                fprintf(stderr, "ERROR: --meth-seed-prune accepts 'spec30' (default), 'baseline', or 'off'\n");
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+            opt0.meth_seed_prune = 1;   /* explicit: wins over the --meth spec30 default below */
         }
         else if (c == OPT_METH_TAGS) {
             const char *tag_err = NULL;
@@ -2887,6 +2930,15 @@ int main_mem(int argc, char *argv[])
          * off the resolved scoring mode. */
         if (opt->meth_chem == METH_CHEM_TAPS && !opt0.meth_scoring)
             opt->meth_scoring = MEM_METH_SCORING_NEUTRAL;
+        /* --meth-seed-prune defaults to spec30 under --meth. Unlike non-meth, --meth
+         * is a bwa-mem3-native feature -- bwa/bwa-mem2 never had a bisulfite mode, so
+         * there is no upstream reference output to stay byte-identical to. spec30 is
+         * ~30% faster on em-seq at ~0 truth-based accuracy cost (mapq>=20 accuracy
+         * identical; 8x fewer newly-unmapped than the `baseline` rule). An explicit
+         * --meth-seed-prune=off|baseline (or the BWAMEM3_METH_SEED_PRUNE env) still
+         * wins; no effect outside --meth (the prune is gated on the meth remap). */
+        if (!opt0.meth_seed_prune)
+            opt->meth_seed_prune = MEM_METH_PRUNE_SPEC30;
         /* Scored defaults live in mem_opt_apply_meth_defaults so they scale with
          * -A (bwameth's constants assume a==1) and can be unit-tested. */
         mem_opt_apply_meth_defaults(opt, &opt0);

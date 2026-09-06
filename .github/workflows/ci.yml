@@ -991,10 +991,15 @@ jobs:
         # rescue being byte-identical to the scalar rescue; the `collapsed`
         # --meth-scoring model; --meth-tags spec resolution (all|none|list|
         # ^exclusion) plus its guarantee that tag selection leaves the alignment
-        # untouched; and the --meth-family flag footguns (a value orphaned by
-        # `--meth taps` / `--meth-tags XR XG` is diagnosed by name instead of
-        # being aligned to as the reference, a reference genuinely named after
-        # one of those values still works, and `-XM` == `^XM`).
+        # untouched; the --meth-family flag footguns (a value orphaned by
+        # `--meth taps` / `--meth-tags XR XG` / `--meth-seed-prune baseline` is
+        # diagnosed by name instead of being aligned to as the reference, a
+        # reference genuinely named after one of those values still works, and
+        # `-XM` == `^XM`); and the --meth-seed-prune seed prune (the num_smem==1
+        # must-fix maps; default==spec30; off/spec30 placement-invariant;
+        # -t1==-t4 determinism; flag/env equivalence; malformed-value handling;
+        # and stats-verified that the prune removes seeds, regime-A keeps all,
+        # and baseline differs from spec30).
         env:
           BWA_MEM3: ${{ github.workspace }}/bwa-mem3
         run: |
@@ -1007,7 +1012,7 @@ jobs:
                    meth_output_integrity meth_reverse_strand_conversion \
                    meth_seed_unpacked_ref_not_loaded \
                    meth_rescue_batched_identical meth_collapsed_scoring \
-                   meth_tags meth_flag_footguns; do
+                   meth_tags meth_flag_footguns meth_seed_prune; do
             echo "::group::$t"; bash "test/regression/$t.sh"; echo "::endgroup::"
           done
 
