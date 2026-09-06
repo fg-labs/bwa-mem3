@@ -130,13 +130,14 @@ extension, pairing, MAPQ or dedup**. So bwa-mem2's claim carries forward to 0.7.
 bwa-mem2 parity restored in 0.7.1 (see above) is bwa parity too. That is what the measured
 three-way agreement below reflects, rather than a coincidence of the cells chosen.
 
-**One structural limit.** `--compat` shapes output and never moves an alignment, so on any
-record where bwa and bwa-mem2 disagree on an *alignment* field, at most one of the two targets
-can be byte-identical. No such record has been observed across the cells measured here, but
-the rare-event tail is not proven empty — see the statistical-power caveat below.
+**Where the upstreams disagree, each target follows its own.** On a record where bwa and
+bwa-mem2 emit different *alignments*, `--compat=bwa-mem` matches bwa and `--compat=bwa-mem2`
+matches bwa-mem2 — the table records per-target behavior, which is why both targets can be
+right at once. Two such records are known (below); neither is reachable on the cells measured
+here, and the rare-event tail is not proven empty — see the statistical-power caveat below.
 
-That limit is the reason both targets exist as a table rather than a boolean, and it is not
-hypothetical in origin: bwa-mem2's own tracker carries reports of exactly this shape. The
+That is the reason both targets exist as a table rather than a boolean, and the shape is not
+hypothetical: bwa-mem2's own tracker carries reports of exactly this kind. The
 best-documented one,
 [bwa-mem2#5](https://github.com/bwa-mem2/bwa-mem2/issues/5), is the only such report with a
 complete reproducer — read `ERR001713.5425457` from NA12878 run ERR001713, which bwa 0.7.17
@@ -166,18 +167,20 @@ orders of magnitude.
 total does not improve the bound: a record on which only one upstream ran cannot exhibit an
 upstream-vs-upstream divergence at any rate.
 
-`--compat` is **output-shaping, with two deliberate exceptions**. Every alignment, score,
-flag, and tag value is untouched except on the paths where the two upstreams themselves
-disagree about the alignment. First, when the chain weight filter drops every chain for a
-read, bwa leaves it unmapped and bwa-mem2 aligns it from the chain it just rejected
-([#310](https://github.com/fg-labs/bwa-mem3/issues/310)). `--compat=bwa-mem` reproduces
-bwa there, `--compat=bwa-mem2` and the default reproduce bwa-mem2, and the drop-in profile
-is unchanged. The path is unreachable without `-W` or an `-x pacbio`/`pbref`/`ont2d`
-preset, since `min_chain_weight` defaults to 0. Second, the suffix-array sentinel offset
+`--compat=<target>` reproduces its target's output, records and header alike. Almost all of
+that is output shaping — the targets differ from each other and from the default only in
+tags and header — except on the records where the two upstreams themselves emit different
+alignments. bwa-mem2 advertises output identical to bwa, and two such records are known,
+both places where its port is not faithful. On each, `--compat=bwa-mem` reproduces bwa,
+`--compat=bwa-mem2` reproduces bwa-mem2, and the default path takes bwa's answer, the
+principled one (without `--compat`, bwa-mem3 is bwa-mem2 plus bug fixes). First, when the
+chain weight filter drops every chain for a read, bwa leaves it unmapped and bwa-mem2 aligns
+it from the chain it just rejected ([#310](https://github.com/fg-labs/bwa-mem3/issues/310);
+default fixed in [#489](https://github.com/fg-labs/bwa-mem3/pull/489)). The path is
+unreachable without `-W` or an `-x pacbio`/`pbref`/`ont2d` preset, since `min_chain_weight`
+defaults to 0. Second, the suffix-array sentinel offset
 ([#469](https://github.com/fg-labs/bwa-mem3/pull/469), below): bwa-mem2 reports a hit whose
 SA walk reaches the sentinel row up to a few bases too far left, bwa does not.
-`--compat=bwa-mem2` reproduces bwa-mem2 there; `--compat=bwa-mem` and the default report
-the correct coordinate.
 
 **Verified** against a real bwa-mem2 v2.2.1 run on hg38: with `@PG` excluded on both sides —
 it still names `bwa-mem3` and is unmatchable by construction, see the caveats below — the
@@ -200,9 +203,9 @@ Caveats:
   construction anyway — `CL:` embeds the invocation and its paths, so even two bwa-mem2 runs
   from different directories differ. Exclude `@PG` on both sides when comparing.
 - **`--compat` and `--fast` are mutually exclusive** — passing both is a hard error.
-  `--fast` deliberately moves alignments; `--compat` only shapes output, so `--fast
-  --compat=bwa-mem2` would produce a diff-clean-looking stream over genuinely different
-  alignments. `--compat` is meaningful only on the drop-in profile.
+  `--compat` asks for parity with a pinned upstream; `--fast` deliberately moves alignments
+  away from both, so `--fast --compat=bwa-mem2` would produce a diff-clean-looking stream over
+  genuinely different alignments. `--compat` is meaningful only on the drop-in profile.
 - **`--compat` and `--proper-pair-from-emitted` are mutually exclusive** — passing both is a
   hard error. That flag derives `FLAG` `0x2` from the emitted alignment, which neither target
   does ([#363](https://github.com/fg-labs/bwa-mem3/pull/363)), so the combination asks for
@@ -452,6 +455,7 @@ The following changes can move alignments, scores, or MAPQ relative to upstream,
 - **Seeding correctness fixes ([#55](https://github.com/fg-labs/bwa-mem3/pull/55), [#73](https://github.com/fg-labs/bwa-mem3/pull/73), [#100](https://github.com/fg-labs/bwa-mem3/pull/100)).** These fix buffer sizing and a prefetch-mask precedence bug. They change alignments only where the old bug actually triggered (e.g. reads longer than 151 bp for [#55](https://github.com/fg-labs/bwa-mem3/pull/55); [#73](https://github.com/fg-labs/bwa-mem3/pull/73) is a prefetch hint with no semantic change).
 - **Opt-in MAPQ rescoring ([#56](https://github.com/fg-labs/bwa-mem3/pull/56), [#101](https://github.com/fg-labs/bwa-mem3/pull/101), [#118](https://github.com/fg-labs/bwa-mem3/pull/118), default-off).** `--supp-rep-hard-cap INT` forces MAPQ=0 on supplementary alignments anchored in repetitive seeds. With no flag the output is unchanged; [#101](https://github.com/fg-labs/bwa-mem3/pull/101) makes the flag actually take effect (it shipped as a silent no-op before), and [#118](https://github.com/fg-labs/bwa-mem3/pull/118) is its regression test. See [Features → `--supp-rep-hard-cap`](features.md).
 - **Tie-break determinism ([#123](https://github.com/fg-labs/bwa-mem3/pull/123), reverted on the default path in 0.7.1).** `#123`'s strict total order + pdqsort at the dedup-patch sort sites reordered equal-scoring ties relative to bwa-mem2's partial-order outcome. As of 0.7.1 the default path restores bwa-mem2's comparator + introsort outcome ([#257](https://github.com/fg-labs/bwa-mem3/pull/257)) and recovers pdqsort's speed only on tie-free inputs ([#261](https://github.com/fg-labs/bwa-mem3/pull/261)); `#123`'s behavior now lives behind `--fast`, where it remains **not** byte-identical.
+- **All chains dropped by the weight filter ([#310](https://github.com/fg-labs/bwa-mem3/issues/310), default fixed in [#489](https://github.com/fg-labs/bwa-mem3/pull/489)).** When `-W` or a long-read preset makes the weight filter drop every chain for a read, bwa-mem2 aligns the read from the chain it just rejected, through a count its seqid-range bookkeeping rebuilds for the emptied array; bwa leaves the read unmapped. The default now follows bwa; `--compat=bwa-mem2` reproduces bwa-mem2. Unreachable at default settings, since `min_chain_weight` defaults to 0.
 - **Suffix-array sentinel offset in the prefetch lookup ([#469](https://github.com/fg-labs/bwa-mem3/pull/469)).** The software-pipelined SA lookup (`get_sa_entries_prefetch` → `call_one_step`) dropped the accumulated LF-walk offset when the walk reached the sentinel (`$`) row: it set the coordinate to `0` instead of `offset`, so any hit whose SA walk reaches the sentinel before a sampled row was reported up to `offset` bases too far left. This affects only hits within the first few bases of the *concatenated* reference. The straight-line sibling `get_sa_entry_compressed` already returns `offset` here, and so does lh3/bwa's `bwt_sa` (it accounts for the walk even at row 0 — `bwt_invPsi` returns 0 at the primary and `bwt->sa[0] = -1` compensates); bwa-mem2 introduced this drop in its SA rewrite and bwa-mem3 inherited it, so the fix **diverges from bwa-mem2** on those hits while converging bwa-mem3's prefetch path onto both its own scalar accessor and lh3/bwa. `--compat=bwa-mem2` keeps bwa-mem2's dropped offset (`compat_target_t::sa_sentinel_drop_offset`), because reproducing bwa-mem2 v2.2.1's records is that target's contract and this is one of its alignments, exactly as the #310 exception above records bwa-mem2's resurrected chain; the default and `--compat=bwa-mem` report the correct coordinate. Latent on every measured cell (chr22 400 k `-t1`/`-t8`, WGS 2 M, `--meth` 92 k all byte-identical, measured on Apple Silicon — arm64, macOS, NEON tier; the SA lookup is a scalar pointer-walk with no SIMD-tier dependence, so the result is tier-independent) because a real read almost never maps to the first bases of the assembly (hg38 opens with long `N` runs); it is reachable on small or custom references — viral, amplicon, bacterial, and test fixtures — where contig 0 is immediately mappable. A fails-before/passes-after regression sweeps every SA row of a phix index, asserting the prefetch pipeline agrees with `get_sa_entry_compressed` (`test/sa_lookup_sentinel_parity_test.cpp`).
 
 (The resolve→order→chain seeding refactor that backs `--seed-order` is byte-identical in its default `off` mode; it is described in the dedicated section below rather than listed here, since only its non-`off` modes are divergent.)
