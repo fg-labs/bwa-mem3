@@ -287,8 +287,33 @@ int bwa_shm_compute(const char *prefix, bwa_shm_layout_t *layout, bool bns_only)
         layout->count[i] += 1;
     }
 
+    /* Peek the trailing sa_compx tag (written by write_fm_index_streaming,
+     * see fm_index_writer.cpp) before sizing the SA sample arrays, via the
+     * shared detect_sa_compx() helper (FMI_search.h/.cpp). Mirrors
+     * FMI_search::load_index's disk-path detection exactly (same helper),
+     * so bwa_shm_compute (which sizes the shm segment) agrees with the
+     * loader it stages for. See detect_sa_compx()'s doc comment for why the
+     * tail-detection heuristic is safe against legacy (no-tail) indexes. */
+    {
+        struct stat st;
+        /* A failed fstat() must not silently fall back to file_size=0: that
+         * would make detect_sa_compx() treat a genuinely non-default-rate
+         * index as legacy (rate 3), sizing this staged segment's SA-sample
+         * sections for the wrong rate. Fail the load instead of guessing,
+         * mirroring FMI_search::load_index's disk-path handling of the same
+         * fstat() call. */
+        if (fstat(fileno(cp), &st) != 0) {
+            fprintf(stderr, "[E::%s] fstat(%s) failed: %s\n",
+                    __func__, cp_path, strerror(errno));
+            err_fclose(cp);
+            bwa_shm_layout_free(layout);
+            return -1;
+        }
+        layout->sa_compx = detect_sa_compx(fileno(cp), (int64_t)st.st_size, layout->reference_seq_len, SA_COMPX);
+    }
+
     int64_t cp_occ_count = (layout->reference_seq_len >> CP_SHIFT) + 1;
-    int64_t sa_count     = (layout->reference_seq_len >> SA_COMPX) + 1;
+    int64_t sa_count     = (layout->reference_seq_len >> layout->sa_compx) + 1;
     int64_t cp_occ_bytes = cp_occ_count * (int64_t)sizeof(CP_OCC);
     int64_t sa_ms_bytes  = sa_count     * (int64_t)sizeof(int8_t);
     int64_t sa_ls_bytes  = sa_count     * (int64_t)sizeof(uint32_t);
@@ -406,6 +431,7 @@ int bwa_shm_pack_into(const bwa_shm_layout_t *layout, uint8_t *dest)
         memcpy(scratch,        &layout->reference_seq_len, sizeof(int64_t));
         memcpy(scratch + 8,    layout->count,              sizeof(int64_t) * 5);
         memcpy(scratch + 48,   &layout->sentinel_index,    sizeof(int64_t));
+        memcpy(scratch + 56,   &layout->sa_compx,          sizeof(int64_t));
         memcpy(dest + sec[0].offset, scratch, sizeof(scratch));
     }
 

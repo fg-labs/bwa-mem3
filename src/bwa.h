@@ -150,11 +150,15 @@ extern "C" {
 	 * and not worth building. Pass 1 only to emit it for an external consumer
 	 * that still requires the unpacked file (e.g. bwa-mem2). `int` (not bool)
 	 * and a C++-only default keep this declaration valid C: bwa.h is inside
-	 * extern "C" and is transitively included by fast_reader_bseq.c. */
+	 * extern "C" and is transitively included by fast_reader_bseq.c.
+	 *
+	 * sa_compx=3 (the default) reproduces the historical SA sample rate
+	 * (1/8) byte-for-byte; `bwa-mem3 index -u INT` overrides it, validated
+	 * to [0,6] by the CLI before it reaches here. */
 #ifdef __cplusplus
-	int bwa_idx_build(const char *fa, const char *prefix, int emit_unpacked_ref = 0);
+	int bwa_idx_build(const char *fa, const char *prefix, int emit_unpacked_ref = 0, int sa_compx = 3);
 #else
-	int bwa_idx_build(const char *fa, const char *prefix, int emit_unpacked_ref);
+	int bwa_idx_build(const char *fa, const char *prefix, int emit_unpacked_ref, int sa_compx);
 #endif
 
 	char *bwa_idx_infer_prefix(const char *hint);

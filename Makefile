@@ -477,7 +477,8 @@ STANDALONE_TESTS = kswv_nrow_zero_test kswv_freed_cell_test \
                    bandedswa_high_h0_zdrop_test shm_section_find_test \
                    shm_pack_round_trip_test shm_lock_destroy_test \
                    kt_for_pool_test bns_zero_calloc_test \
-                   kernel_padded_lane_uninit_test bam_rec_scratch_test
+                   kernel_padded_lane_uninit_test bam_rec_scratch_test \
+                   detect_sa_compx_test
 STANDALONE_TEST_OBJS = $(STANDALONE_TESTS:%=test/%.o)
 
 # shm_pack_round_trip_test is excluded from `test:` because it runs via
@@ -896,6 +897,9 @@ test-binaries: $(BWA_LIB) $(HTS_LIB)
 shm_section_find_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/shm_section_find_test.o
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/shm_section_find_test.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
 
+detect_sa_compx_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/detect_sa_compx_test.o
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/detect_sa_compx_test.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
+
 shm_pack_round_trip_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/shm_pack_round_trip_test.o
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/shm_pack_round_trip_test.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
 
@@ -1081,6 +1085,9 @@ test/kernel_padded_lane_uninit_test.o: test/kernel_padded_lane_uninit_test.cpp
 	$(CXX) -c $(BASE_CXXFLAGS) -march=native $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
 
 test/shm_section_find_test.o: test/shm_section_find_test.cpp
+	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
+
+test/detect_sa_compx_test.o: test/detect_sa_compx_test.cpp
 	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
 
 test/shm_lock_destroy_test.o: test/shm_lock_destroy_test.cpp

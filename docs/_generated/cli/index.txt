@@ -14,4 +14,5 @@ Usage: bwa-mem3 index [-p prefix] [-t N] [--max-memory SIZE] [--tmp-dir PATH] [-
                      default: `mem` pac-fetches bases from `.pac`, so `.0123`
                      is never read. Enable only for an external consumer that
                      still requires it (e.g. bwa-mem2); ~8x the size of `.pac`.
+  -u INT             SA sample rate 1/(1<<INT) [3]
   -h, --help         print this help message and exit

@@ -236,10 +236,12 @@ int main(int argc, char* argv[])
                 bwamem3_simd_tier_name(bwamem3_simd_tier()));
         fprintf(stderr, "-----------------------------\n");
 
-        #if SA_COMPRESSION
-        fprintf(stderr, "* SA compression enabled with xfactor: %d\n", 0x1 << SA_COMPX);
-        #endif
-        
+        // The "SA compression enabled" banner used to print here, but that's
+        // before the index is loaded (main_mem hasn't run yet), so it could
+        // only report the compile-time SA_COMPX default rather than the rate
+        // a `-u`-built index actually loaded at. It now prints from
+        // fastmap.cpp::main_mem right after aux.fmi->load_index().
+
         ksprintf(&pg, "@PG\tID:bwa-mem3\tPN:bwa-mem3\tVN:%s\tCL:%s", PACKAGE_VERSION, argv[0]);
 
         for (int i = 1; i < argc; ++i) append_pg_cl_arg(&pg, argv[i]);

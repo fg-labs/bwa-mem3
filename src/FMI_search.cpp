@@ -38,6 +38,7 @@ Authors: Sanchit Misra <sanchit.misra@intel.com>; Vasimuddin Md <vasimuddin.md@i
 #include <pthread.h>
 #include <unistd.h>       /* pread, _exit */
 #include <sys/mman.h>     /* munmap */
+#include <sys/stat.h>     /* fstat */
 #if defined(__linux__)
 #include <fcntl.h>        /* posix_fadvise */
 #endif
@@ -206,6 +207,88 @@ void fmi_pread_from_stream(FILE *fp, void *dst, size_t nbytes, int nthreads)
     }
 }
 
+/* Declared in FMI_search.h; see there for the contract.
+ *
+ * The on-disk layout is: header(48B: reference_seq_len + count[5], i.e.
+ * 6*sizeof(int64_t)) + cp_occ + SA-sample arrays (sized by sa_compx) +
+ * sentinel_index(8B) [+ sa_compx tag(8B), new format only]. Since the
+ * SA-sample-array size depends on sa_compx, the tag's own file offset can't
+ * be computed without already knowing sa_compx -- so instead we read the
+ * file's last 8 bytes as a `candidate` sa_compx and verify it reproduces the
+ * file's actual size when plugged back into the layout-size formula
+ * (`off_sent_for`). If it doesn't -- including on a legacy, pre-this-feature
+ * index, which carries no tag at all -- we fall back to `default_compx`.
+ *
+ * Why this is safe without a version field: a legacy index (no tag, always
+ * built at the fixed compile-time SA_COMPX rate) has file size
+ *
+ *   legacy_size = off_sent_for(SA_COMPX) + 8            (sentinel only)
+ *
+ * while a false-positive match against some candidate `c` would require
+ *
+ *   legacy_size == off_sent_for(c) + 16                  (sentinel + tag)
+ *
+ * Each unit of SA-sample count changes off_sent_for by exactly 5 bytes
+ * (1-byte int8_t + 4-byte uint32_t per sample), so equating the two reduces
+ * to 5*Delta == 8 for some integer Delta = sa_sample_cnt(SA_COMPX) -
+ * sa_sample_cnt(c). Since 5 does not divide 8, no integer Delta -- and hence
+ * no candidate `c`, including c == SA_COMPX itself (Delta == 0, 0 != 8) --
+ * can satisfy it. A legacy index can therefore never be misdetected as
+ * carrying a valid tail. This is a property of the byte accounting, not of
+ * a chosen constant, so it must not be "shored up" with a magic-number or
+ * version field: doing so would change the on-disk format and break this
+ * branch's byte-identity guarantee against stock indexes for no benefit. */
+int64_t detect_sa_compx(int fd, int64_t file_size, int64_t ref_seq_len, int64_t default_compx)
+{
+    int64_t candidate = -1;
+    if (file_size >= (int64_t)(2 * sizeof(int64_t))) {
+        /* Robustly read the trailing 8-byte candidate tag. A read error or a
+         * short/EOF read here must NOT silently fall back to default_compx: a
+         * genuinely non-default index would then be mis-sized (wrong SA-sample
+         * offsets, no diagnostic) -- the same failure the fstat() guards at
+         * both call sites already prevent. Retry EINTR and treat any other
+         * failure as a fatal load error, mirroring pread_chunk_worker() above.
+         * Only a fully-read candidate that fails the layout test below
+         * legitimately falls back to default_compx. */
+        char   *dst  = (char *)&candidate;
+        off_t   off  = (off_t)(file_size - (int64_t)sizeof(int64_t));
+        size_t  done = 0;
+        while (done < sizeof(int64_t)) {
+            ssize_t r = pread(fd, dst + done, sizeof(int64_t) - done,
+                              off + (off_t)done);
+            if (r < 0) {
+                if (errno == EINTR) continue;
+                fprintf(stderr, "ERROR: pread failed reading SA-rate tag "
+                                "during index load: %s\n", strerror(errno));
+                exit(EXIT_FAILURE);
+            }
+            if (r == 0) {
+                fprintf(stderr, "ERROR: unexpected EOF reading SA-rate tag "
+                                "during index load\n");
+                exit(EXIT_FAILURE);
+            }
+            done += (size_t)r;
+        }
+    }
+
+    auto off_sent_for = [ref_seq_len](int64_t compx) -> int64_t {
+        // Mirrors HDR_BYTES in fm_index_writer.cpp / BWA_BWT_2BIT_HEADER_BYTES
+        // in bwa_shm.cpp: ref_seq_len + count[5].
+        const int64_t hdr_bytes      = 6 * (int64_t)sizeof(int64_t);
+        const int64_t cp_occ_cnt     = (ref_seq_len >> CP_SHIFT) + 1;
+        const int64_t sa_sample_cnt  = (ref_seq_len >> compx) + 1;
+        return hdr_bytes + cp_occ_cnt * (int64_t)sizeof(CP_OCC)
+                         + sa_sample_cnt * (int64_t)sizeof(int8_t)
+                         + sa_sample_cnt * (int64_t)sizeof(uint32_t);
+    };
+
+    if (candidate >= 0 && candidate <= CP_SHIFT &&
+        off_sent_for(candidate) + 2 * (int64_t)sizeof(int64_t) == file_size) {
+        return candidate;
+    }
+    return default_compx;
+}
+
 /* Build "<prefix><suffix>" into `out` (sized `outsz`); aborts on overflow.
  * Replaces the prior strcpy_s/strcat_s pattern for assembling FMI sidecar
  * paths from a user-supplied prefix. */
@@ -225,6 +308,8 @@ FMI_search::FMI_search(const char *fname)
     fmi_build_path(file_name, sizeof(file_name), fname, "");
     reference_seq_len = 0;
     sentinel_index = 0;
+    sa_compx = SA_COMPX;
+    sa_compx_mask = SA_COMPX_MASK;
     sa_ls_word = NULL;
     sa_ms_byte = NULL;
     cp_occ = NULL;
@@ -257,7 +342,7 @@ int64_t FMI_search::cp_occ_size_bytes() const {
 }
 
 int64_t FMI_search::sa_sample_count() const {
-    return (reference_seq_len >> SA_COMPX) + 1;
+    return (reference_seq_len >> sa_compx) + 1;
 }
 
 void FMI_search::load_index_from_shm(uint8_t *base, size_t len)
@@ -276,6 +361,15 @@ void FMI_search::load_index_from_shm(uint8_t *base, size_t len)
     memcpy(&reference_seq_len, base + off,                                    sizeof(int64_t));
     memcpy(count,              base + off + sizeof(int64_t),                  sizeof(int64_t) * 5);
     memcpy(&sentinel_index,    base + off + sizeof(int64_t) * 6,              sizeof(int64_t));
+    /* sa_compx: the SA sample-rate shift the staged index was built with.
+     * IMPORTANT FIX: this used to stay at the constructor's compile-time
+     * default (SA_COMPX) because nothing here overrode it, so a non-default
+     * `-u`-built index attached via shm was mis-sized (sa_sample_count() and
+     * every sa_ms_byte/sa_ls_word index below used the wrong shift). Reading
+     * it from the packed scalars (see BWA_SHM_FMI_SCALARS_BYTES / the PACK
+     * side in bwa_shm.cpp) makes shm-attach agree with the disk loader's
+     * tail-detected rate. */
+    memcpy(&sa_compx,          base + off + sizeof(int64_t) * 7,              sizeof(int64_t));
 
     /* Validate scalars before we use reference_seq_len in cp_occ_size_bytes()
      * and the SA size accessors. Bounds match the disk path's asserts in
@@ -302,6 +396,17 @@ void FMI_search::load_index_from_shm(uint8_t *base, size_t len)
             (long long)sentinel_index, (long long)reference_seq_len);
         exit(EXIT_FAILURE);
     }
+    /* [0,6]: same range the -u CLI validates and write_fm_index_streaming
+     * enforces (the sample period 1<<sa_compx must divide CP_BLOCK_SIZE=64). */
+    if (sa_compx < 0 || sa_compx > 6) {
+        fprintf(stderr,
+            "ERROR! shm FMI_SCALARS: sa_compx=%lld out of bounds\n",
+            (long long)sa_compx);
+        exit(EXIT_FAILURE);
+    }
+    /* Only compute the mask once sa_compx is known to be in [0,6]; shifting by
+     * an out-of-range value (e.g. a corrupt -1 or 64) would be UB. */
+    sa_compx_mask = (1LL << sa_compx) - 1;
 
     if (bwa_shm_section_find(base, BWA_SHM_SEC_FMI_CP_OCC, &off, &sz) != 0
         || (int64_t)sz != cp_occ_size_bytes()) {
@@ -331,7 +436,7 @@ void FMI_search::load_index_from_shm(uint8_t *base, size_t len)
             (long)reference_seq_len, (long)sentinel_index);
 }
 
-int FMI_search::build_index(bool emit_unpacked_ref) {
+int FMI_search::build_index(bool emit_unpacked_ref, int sa_compx) {
 
     char *prefix = file_name;
 
@@ -383,6 +488,7 @@ int FMI_search::build_index(bool emit_unpacked_ref) {
     if (const char* mu = getenv("BWA_INDEX_MAX_MEMORY_USER"))
         opts.max_memory_user_specified = (mu[0] == '1');
     opts.emit_unpacked_ref = emit_unpacked_ref;
+    opts.sa_compx          = sa_compx;
     return libsais_build_fm_index(prefix, pac_len, opts);
 }
 
@@ -443,6 +549,28 @@ void FMI_search::load_index(bool load_pac, int n_threads)
 
     fprintf(stderr, "* Reference seq len for bi-index = %lld\n", (long long)reference_seq_len);
 
+    // Peek the trailing sa_compx field (if present) before sizing the SA
+    // sample arrays below, via the shared detect_sa_compx() helper (see its
+    // doc comment in FMI_search.h and implementation comment above for why
+    // the tail-detection heuristic is safe). pread doesn't disturb
+    // cpstream's buffered read position, so this doesn't affect the
+    // sequential reads that follow.
+    {
+        struct stat st;
+        /* A failed fstat() must not silently fall back to file_size=0: that
+         * would make detect_sa_compx() treat a genuinely non-default-rate
+         * index as legacy (rate 3), mis-sizing the SA-sample arrays below
+         * and producing wrong seed coordinates with no diagnostic. Fail the
+         * load instead -- consistent with the ftello/fseeko error handling
+         * just above in fmi_pread_from_stream(). */
+        if (fstat(fileno(cpstream), &st) != 0) {
+            fprintf(stderr, "ERROR: fstat failed during index load: %s\n", strerror(errno));
+            exit(EXIT_FAILURE);
+        }
+        sa_compx = detect_sa_compx(fileno(cpstream), (int64_t)st.st_size, reference_seq_len, SA_COMPX);
+        sa_compx_mask = (1LL << sa_compx) - 1;
+    }
+
     // create checkpointed occ
     int64_t cp_occ_size = (reference_seq_len >> CP_SHIFT) + 1;
     cp_occ = NULL;
@@ -463,7 +591,7 @@ void FMI_search::load_index(bool load_pac, int n_threads)
 
     #if SA_COMPRESSION
 
-    int64_t reference_seq_len_ = (reference_seq_len >> SA_COMPX) + 1;
+    int64_t reference_seq_len_ = (reference_seq_len >> sa_compx) + 1;
     int64_t sa_ms_bytes = reference_seq_len_ * sizeof(int8_t);
     int64_t sa_ls_bytes = reference_seq_len_ * sizeof(uint32_t);
     sa_ms_byte = (int8_t *)_mm_malloc(sa_ms_bytes, 64);
@@ -1909,10 +2037,10 @@ void FMI_search::get_sa_entries(SMEM *smemArray, int64_t *coordArray, int32_t *c
 // sa_compression
 int64_t FMI_search::get_sa_entry_compressed(int64_t pos, int tid)
 {
-    if ((pos & SA_COMPX_MASK) == 0) {
+    if ((pos & sa_compx_mask) == 0) {
         
         #if  SA_COMPRESSION
-        int64_t sa_entry = sa_ms_byte[pos >> SA_COMPX];
+        int64_t sa_entry = sa_ms_byte[pos >> sa_compx];
         #else
         int64_t sa_entry = sa_ms_byte[pos];     // simulation
         #endif
@@ -1920,7 +2048,7 @@ int64_t FMI_search::get_sa_entry_compressed(int64_t pos, int tid)
         sa_entry = sa_entry << 32;
         
         #if  SA_COMPRESSION
-        sa_entry = sa_entry + sa_ls_word[pos >> SA_COMPX];
+        sa_entry = sa_entry + sa_ls_word[pos >> sa_compx];
         #else
         sa_entry = sa_entry + sa_ls_word[pos];   // simulation
         #endif
@@ -1959,11 +2087,11 @@ int64_t FMI_search::get_sa_entry_compressed(int64_t pos, int tid)
             
             offset ++;
             // tprof[ALIGN1][tid] ++;
-            if ((sp & SA_COMPX_MASK) == 0) break;
+            if ((sp & sa_compx_mask) == 0) break;
         }
-        // assert((reference_seq_len >> SA_COMPX) - 1 >= (sp >> SA_COMPX));
+        // assert((reference_seq_len >> sa_compx) - 1 >= (sp >> sa_compx));
         #if  SA_COMPRESSION
-        int64_t sa_entry = sa_ms_byte[sp >> SA_COMPX];
+        int64_t sa_entry = sa_ms_byte[sp >> sa_compx];
         #else
         int64_t sa_entry = sa_ms_byte[sp];      // simultion
         #endif
@@ -1971,7 +2099,7 @@ int64_t FMI_search::get_sa_entry_compressed(int64_t pos, int tid)
         sa_entry = sa_entry << 32;
 
         #if  SA_COMPRESSION
-        sa_entry = sa_entry + sa_ls_word[sp >> SA_COMPX];
+        sa_entry = sa_entry + sa_ls_word[sp >> sa_compx];
         #else
         sa_entry = sa_entry + sa_ls_word[sp];      // simulation
         #endif
@@ -2008,10 +2136,10 @@ void FMI_search::get_sa_entries(SMEM *smemArray, int64_t *coordArray, int32_t *c
 // SA_COPMRESSION w/ PREFETCH
 int64_t FMI_search::call_one_step(int64_t pos, int64_t &sa_entry, int64_t &offset)
 {
-    if ((pos & SA_COMPX_MASK) == 0) {        
-        sa_entry = sa_ms_byte[pos >> SA_COMPX];        
+    if ((pos & sa_compx_mask) == 0) {        
+        sa_entry = sa_ms_byte[pos >> sa_compx];        
         sa_entry = sa_entry << 32;        
-        sa_entry = sa_entry + sa_ls_word[pos >> SA_COMPX];        
+        sa_entry = sa_entry + sa_ls_word[pos >> sa_compx];        
         // return sa_entry;
         return 1;
     }
@@ -2044,11 +2172,11 @@ int64_t FMI_search::call_one_step(int64_t pos, int64_t &sa_entry, int64_t &offse
         sp = count[b] + occ_sp;
         
         offset ++;
-        if ((sp & SA_COMPX_MASK) == 0) {
+        if ((sp & sa_compx_mask) == 0) {
     
-            sa_entry = sa_ms_byte[sp >> SA_COMPX];        
+            sa_entry = sa_ms_byte[sp >> sa_compx];        
             sa_entry = sa_entry << 32;
-            sa_entry = sa_entry + sa_ls_word[sp >> SA_COMPX];
+            sa_entry = sa_entry + sa_ls_word[sp >> sa_compx];
             
             sa_entry += offset;
             // return sa_entry;
@@ -2153,9 +2281,9 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
         map_pos[j] = i;   // map_ar[i] == i (see staging loop invariant)
         offset[j] = 0;
         
-        if ((pos & SA_COMPX_MASK) == 0) {
-            _mm_prefetch(&sa_ms_byte[pos >> SA_COMPX], _MM_HINT_T0);
-            _mm_prefetch(&sa_ls_word[pos >> SA_COMPX], _MM_HINT_T0);
+        if ((pos & sa_compx_mask) == 0) {
+            _mm_prefetch(&sa_ms_byte[pos >> sa_compx], _MM_HINT_T0);
+            _mm_prefetch(&sa_ls_word[pos >> sa_compx], _MM_HINT_T0);
         }
         else {
             int64_t occ_id_pp_ = pos >> CP_SHIFT;
@@ -2192,9 +2320,9 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
                     map_pos[k] = i++;   // map_ar[i] == i (staging invariant)
                     offset[k] = 0;
                     
-                    if ((pos & SA_COMPX_MASK) == 0) {
-                        _mm_prefetch(&sa_ms_byte[pos >> SA_COMPX], _MM_HINT_T0);
-                        _mm_prefetch(&sa_ls_word[pos >> SA_COMPX], _MM_HINT_T0);
+                    if ((pos & sa_compx_mask) == 0) {
+                        _mm_prefetch(&sa_ms_byte[pos >> sa_compx], _MM_HINT_T0);
+                        _mm_prefetch(&sa_ls_word[pos >> sa_compx], _MM_HINT_T0);
                     }
                     else {
                         int64_t occ_id_pp_ = pos >> CP_SHIFT;
@@ -2206,9 +2334,9 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
             }
             else {
                 working_set[k] = sp;
-                if ((sp & SA_COMPX_MASK) == 0) {
-                    _mm_prefetch(&sa_ms_byte[sp >> SA_COMPX], _MM_HINT_T0);
-                    _mm_prefetch(&sa_ls_word[sp >> SA_COMPX], _MM_HINT_T0);
+                if ((sp & sa_compx_mask) == 0) {
+                    _mm_prefetch(&sa_ms_byte[sp >> sa_compx], _MM_HINT_T0);
+                    _mm_prefetch(&sa_ls_word[sp >> sa_compx], _MM_HINT_T0);
                 }
                 else {
                     int64_t occ_id_pp_ = sp >> CP_SHIFT;

@@ -29,6 +29,11 @@
 //                    Typically from compute_counts() on the same text.
 // `out_sentinel_index` — set by pass 1 to the single BWT row where
 //                    SA[i]=0 (i.e. the full text comes right after $).
+// `sa_compx`       — SA sample-rate shift: one SA row in (1<<sa_compx) is
+//                    stored. Persisted as a trailing int64_t appended after
+//                    sentinel_index so the loader can recover it; existing
+//                    header/cp_occ/SA-sample/sentinel offsets are unchanged
+//                    by its presence.
 // `num_threads`    — 1 keeps the serial path; > 1 partitions work into
 //                    CP_BLOCK_SIZE-aligned stripes. OpenMP-based; reuses
 //                    the existing libomp thread pool (shared with libsais)
@@ -50,6 +55,7 @@ void write_fm_index_streaming(const char* out_path,
                               int64_t pac_len,
                               const int64_t count[5],
                               int64_t* out_sentinel_index,
+                              int sa_compx,
                               int num_threads = 1);
 
 #endif
