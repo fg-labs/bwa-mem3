@@ -446,7 +446,7 @@ LDFLAGS += $(HTSLIB_static_LDFLAGS)
 OBJS=		src/fastmap.o src/bwtindex.o src/utils.o src/kthread.o \
 			src/kstring.o src/bntseq.o src/bwamem.o src/seed_order.o src/profiling.o \
 			src/compat_target.o \
-			src/FMI_search.o src/read_index_ele.o src/bwamem_pair.o src/bwa.o \
+			src/FMI_search.o src/fmi_seed_api.o src/read_index_ele.o src/bwamem_pair.o src/bwa.o \
 			src/bwamem_extra.o src/kopen.o src/bam_writer.o src/meth_bam.o \
 			src/meth_xm.o \
 			src/packed_text.o src/fm_index_writer.o src/index_prelude.o \
@@ -914,6 +914,31 @@ kt_for_pool_test: $(BWA_LIB) $(HTS_LIB) test/kt_for_pool_test.o
 # header comment in the source.
 bns_zero_calloc_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/bns_zero_calloc_test.o
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/bns_zero_calloc_test.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
+
+# Compile+link smoke test for the fmi_seed_api.h facade: proves the header's
+# extern "C" section and every declared symbol actually resolve against
+# libbwa.a, standing in for the external (e.g. minibwa) consumer build. Not
+# part of $(STANDALONE_TESTS)/`test:` -- it is a link-surface check, not a
+# behavioral regression test.
+.PHONY: smoke
+smoke: fmi_seed_api_smoke
+	./fmi_seed_api_smoke
+
+fmi_seed_api_smoke: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) $(if $(filter 1,$(USE_MIMALLOC)),$(MIMALLOC_LIB)) test/fmi_seed_api_smoke.o
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/fmi_seed_api_smoke.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) $(MIMALLOC_LDFLAGS) -o $@
+
+test/fmi_seed_api_smoke.o: test/fmi_seed_api_smoke.cpp
+	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
+
+# Regression test for the fmi_seed_api.h facade's max_occ guard: forwarding
+# max_occ <= 0 into FMI_search::get_sa_entries_prefetch divides by max_occ.
+# Requires a real index prefix argument (see test/run_unit_tests.sh), unlike
+# the link-surface-only fmi_seed_api_smoke target above.
+fmi_seed_api_guards_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) $(if $(filter 1,$(USE_MIMALLOC)),$(MIMALLOC_LIB)) test/fmi_seed_api_guards_test.o
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/fmi_seed_api_guards_test.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) $(MIMALLOC_LDFLAGS) -o $@
+
+test/fmi_seed_api_guards_test.o: test/fmi_seed_api_guards_test.cpp $(FLAGS_STAMP)
+	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
 
 # fast_reader is C (not C++); the implicit .c rule omits $(INCLUDES), so give
 # these objects explicit rules carrying the project include paths (incl.

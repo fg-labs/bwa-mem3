@@ -21,7 +21,7 @@ ok() { echo "OK:   $*"; }
 (cd "$HERE" && make) || fail "test/ make failed"
 
 # Build any test binaries that live outside test/Makefile.
-(cd "$ROOT" && make -j4 shm_section_find_test shm_pack_round_trip_test shm_lock_destroy_test) > /dev/null
+(cd "$ROOT" && make -j4 shm_section_find_test shm_pack_round_trip_test shm_lock_destroy_test fmi_seed_api_guards_test) > /dev/null
 
 # synthetic_1mb.fa is checked in alongside its committed baselines so the
 # byte-diff test stays reproducible across Python versions and platforms.
@@ -335,6 +335,11 @@ echo "OK:   shm_section_find_test"
 echo "==> shm_lock_destroy_test"
 (cd "$ROOT" && ./shm_lock_destroy_test)
 echo "OK:   shm_lock_destroy_test"
+
+# --- fmi_seed_api_guards_test (unit: fmi_seed_sa_prefetch max_occ guard) -----
+echo "==> fmi_seed_api_guards_test"
+(cd "$ROOT" && ./fmi_seed_api_guards_test "$FIXTURES/phix.fa")
+echo "OK:   fmi_seed_api_guards_test"
 
 # --- shm pack round-trip (unit: pack/unpack a phiX segment) ------------------
 (cd "$HERE" && ./shm_pack_round_trip_test.sh) || fail "shm_pack_round_trip_test"
