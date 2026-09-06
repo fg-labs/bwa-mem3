@@ -297,7 +297,7 @@ static uint8_t *add1(const kseq_t *seq, bntseq_t *bns, uint8_t *pac, int64_t *m_
 	p->offset = (bns->n_seqs == 0)? 0 : (p-1)->offset + (p-1)->len;
 	p->n_ambs = 0;
 	for (i = lasts = 0; i < seq->seq.l; ++i) {
-		int c = nst_nt4_table[(int)seq->seq.s[i]];
+		int c = nst_nt4_table[(unsigned char)seq->seq.s[i]];
 		if (c >= 4) { // N
 			if (lasts == seq->seq.s[i]) { // contiguous N
 				++(*q)->len;
