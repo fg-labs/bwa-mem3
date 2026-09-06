@@ -214,6 +214,32 @@ else
     fail "sa_resolve_parity_test: non-zero exit"
 fi
 
+# Same parity gate, but with the resolver's lane count forced to 1 (the
+# non-default extreme of BWA3_SA_LANES). The lane count is a prefetch-depth
+# knob only -- coordinates are stored by position -- so a PASS here against the
+# same scalar oracle pins that "the lane count does not affect results".
+if OUT="$(cd "$HERE" && BWA3_SA_LANES=1 ./sa_resolve_parity_test "$FIXTURES/phix.fa" 2>&1)"; then
+    echo "$OUT" | grep -q "SA resolve PARITY PASS" \
+        || fail "sa_resolve_parity_test (BWA3_SA_LANES=1): no PASS line"
+    ok "sa_resolve_parity_test (BWA3_SA_LANES=1)"
+else
+    echo "$OUT"
+    fail "sa_resolve_parity_test (BWA3_SA_LANES=1): non-zero exit"
+fi
+
+# Same parity gate, but with the resolver's lane count forced to 1 (the
+# non-default extreme of BWA3_SA_LANES). The lane count is a prefetch-depth
+# knob only -- coordinates are stored by position -- so a PASS here against the
+# same scalar oracle pins that "the lane count does not affect results".
+if OUT="$(cd "$HERE" && BWA3_SA_LANES=64 ./sa_resolve_parity_test "$FIXTURES/phix.fa" 2>&1)"; then
+    echo "$OUT" | grep -q "SA resolve PARITY PASS" \
+        || fail "sa_resolve_parity_test (BWA3_SA_LANES=64): no PASS line"
+    ok "sa_resolve_parity_test (BWA3_SA_LANES=64)"
+else
+    echo "$OUT"
+    fail "sa_resolve_parity_test (BWA3_SA_LANES=64): non-zero exit"
+fi
+
 # --- long-read end-to-end (issue 44) --------------------------------------
 # Pre-fix, reads > 151 bp overran the per-thread SMEM buffer (segfault) and
 # reads > 512 bp tripped the MAX_READ_LEN_FOR_LOCKSTEP assert. Post-fix the
