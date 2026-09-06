@@ -1612,10 +1612,12 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "                  bwa-mem2: also suppress MQ:i and the default @HD -- bwa-mem2\n");
     fprintf(stderr, "                  v2.2.1 forked at bwa 0.7.17, before either landed.\n");
     fprintf(stderr, "                  bwa-mem:  keep both -- bwa 0.7.18+ emits them. Pinned at 0.7.19.\n");
-    fprintf(stderr, "                  Shapes output only; changes no alignment. @PG still differs (it\n");
-    fprintf(stderr, "                  is run-specific) -- exclude it when comparing. Mutually exclusive\n");
-    fprintf(stderr, "                  with --fast (which changes alignments) and with --meth (neither\n");
-    fprintf(stderr, "                  target has a bisulfite mode) -- combining them is an error [off]\n");
+    fprintf(stderr, "                  Each target reproduces its upstream's records, including its own\n");
+    fprintf(stderr, "                  alignment on the two known records where bwa and bwa-mem2 differ.\n");
+    fprintf(stderr, "                  @PG still differs (it is run-specific) -- exclude it when comparing.\n");
+    fprintf(stderr, "                  Mutually exclusive with --fast (which changes alignments) and\n");
+    fprintf(stderr, "                  with --meth (neither target has a bisulfite mode) -- combining\n");
+    fprintf(stderr, "                  them is an error [off]\n");
     fprintf(stderr, "Scoring options:\n");
     fprintf(stderr, "   -A INT        score for a sequence match, which scales options -TdBOELU unless overridden [%d]\n", opt->a);
     fprintf(stderr, "   -B INT        penalty for a mismatch [%d]\n", opt->b);

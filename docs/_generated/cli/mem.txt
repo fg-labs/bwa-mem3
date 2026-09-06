@@ -57,10 +57,12 @@ Options:
                   bwa-mem2: also suppress MQ:i and the default @HD -- bwa-mem2
                   v2.2.1 forked at bwa 0.7.17, before either landed.
                   bwa-mem:  keep both -- bwa 0.7.18+ emits them. Pinned at 0.7.19.
-                  Shapes output only; changes no alignment. @PG still differs (it
-                  is run-specific) -- exclude it when comparing. Mutually exclusive
-                  with --fast (which changes alignments) and with --meth (neither
-                  target has a bisulfite mode) -- combining them is an error [off]
+                  Each target reproduces its upstream's records, including its own
+                  alignment on the two known records where bwa and bwa-mem2 differ.
+                  @PG still differs (it is run-specific) -- exclude it when comparing.
+                  Mutually exclusive with --fast (which changes alignments) and
+                  with --meth (neither target has a bisulfite mode) -- combining
+                  them is an error [off]
 Scoring options:
    -A INT        score for a sequence match, which scales options -TdBOELU unless overridden [1]
    -B INT        penalty for a mismatch [4]
