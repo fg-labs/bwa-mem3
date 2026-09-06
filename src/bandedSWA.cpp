@@ -29,6 +29,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 
 #include "kernel_dispatch.h"
 #include "bandedSWA.h"
+#include "utils.h"   /* xassert */
 #ifdef VTUNE_ANALYSIS
 #include <ittnotify.h> 
 #endif
@@ -762,6 +763,8 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                     h0[j] = (uint8_t) h0p;
                 }
                 seq1 = seqBufRef + (int64_t)sp.idr;
+                if (sp.len1 >= MAX_SEQ_LEN8)
+                    err_fatal(__func__, "bandedSWA: ref window length (len1) %d for pair %d exceeds MAX_SEQ_LEN8 (%d)", sp.len1, sp.id, MAX_SEQ_LEN8);
 
                 for(k = 0; k < sp.len1; k++)
                 {
@@ -812,8 +815,8 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                 SeqPair sp = pairArray[i + j];
                 seq2 = seqBufQer + (int64_t)sp.idq;
                 
-                if (sp.len2 > MAX_SEQ_LEN8) fprintf(stderr, "Error !! : %d %d\n", sp.id, sp.len2);
-                assert(sp.len2 < MAX_SEQ_LEN8);
+                if (sp.len2 >= MAX_SEQ_LEN8)
+                    err_fatal(__func__, "bandedSWA: query length (len2) %d for pair %d exceeds MAX_SEQ_LEN8 (%d)", sp.len2, sp.id, MAX_SEQ_LEN8);
                 
                 for(k = 0; k < sp.len2; k++)
                 {
@@ -1741,6 +1744,8 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
                 SeqPair sp = pairArray[i + j];
                 h0[j] = sp.h0;
                 seq1 = seqBufRef + (int64_t)sp.idr;
+                if (sp.len1 >= MAX_SEQ_LEN16)
+                    err_fatal(__func__, "bandedSWA: ref window length (len1) %d for pair %d exceeds MAX_SEQ_LEN16 (%d)", sp.len1, sp.id, MAX_SEQ_LEN16);
                 
                 for(k = 0; k < sp.len1; k++)
                 {
@@ -1783,6 +1788,8 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
                 SeqPair sp = pairArray[i + j];
                 //seq2 = seqBufQer + (int64_t)sp.id * MAX_SEQ_LEN_QER;
                 seq2 = seqBufQer + (int64_t)sp.idq;             
+                if (sp.len2 >= MAX_SEQ_LEN16)
+                    err_fatal(__func__, "bandedSWA: query length (len2) %d for pair %d exceeds MAX_SEQ_LEN16 (%d)", sp.len2, sp.id, MAX_SEQ_LEN16);
                 for(k = 0; k < sp.len2; k++)
                 {
                     mySeq2SoA[k * SIMD_WIDTH16 + j] = (seq2[k]==AMBIG?0xFFFF:seq2[k]);
@@ -2678,6 +2685,8 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                     h0[j] = (uint8_t) h0p;
                 }
                 seq1 = seqBufRef + (int64_t)sp.idr;
+                if (sp.len1 >= MAX_SEQ_LEN8)
+                    err_fatal(__func__, "bandedSWA: ref window length (len1) %d for pair %d exceeds MAX_SEQ_LEN8 (%d)", sp.len1, sp.id, MAX_SEQ_LEN8);
 
                 for(k = 0; k < sp.len1; k++)
                 {
@@ -2719,6 +2728,8 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                 
                 SeqPair sp = pairArray[i + j];
                 seq2 = seqBufQer + (int64_t)sp.idq;
+                if (sp.len2 >= MAX_SEQ_LEN8)
+                    err_fatal(__func__, "bandedSWA: query length (len2) %d for pair %d exceeds MAX_SEQ_LEN8 (%d)", sp.len2, sp.id, MAX_SEQ_LEN8);
                 for(k = 0; k < sp.len2; k++)
                 {
                     mySeq2SoA[k * SIMD_WIDTH8 + j] = (seq2[k]==AMBIG ? 8 : seq2[k]) /* PR16: query N→8 */;
@@ -3632,6 +3643,8 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
                 h0[j] = sp.h0;
 
                 seq1 = seqBufRef + (int64_t)sp.idr;
+                if (sp.len1 >= MAX_SEQ_LEN16)
+                    err_fatal(__func__, "bandedSWA: ref window length (len1) %d for pair %d exceeds MAX_SEQ_LEN16 (%d)", sp.len1, sp.id, MAX_SEQ_LEN16);
 
                 for(k = 0; k < sp.len1; k++)
                 {
@@ -3674,6 +3687,8 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
                 
                 SeqPair sp = pairArray[i + j];
                 seq2 = seqBufQer + (int64_t)sp.idq;
+                if (sp.len2 >= MAX_SEQ_LEN16)
+                    err_fatal(__func__, "bandedSWA: query length (len2) %d for pair %d exceeds MAX_SEQ_LEN16 (%d)", sp.len2, sp.id, MAX_SEQ_LEN16);
                 for(k = 0; k < sp.len2; k++)
                 {
                     mySeq2SoA[k * SIMD_WIDTH16 + j] = (seq2[k]==AMBIG? ambQer : seq2[k]);
@@ -4609,6 +4624,8 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
                 SeqPair sp = pairArray[i + j];
                 h0[j] = sp.h0;
                 seq1 = seqBufRef + (int64_t)sp.idr;
+                if (sp.len1 >= MAX_SEQ_LEN16)
+                    err_fatal(__func__, "bandedSWA: ref window length (len1) %d for pair %d exceeds MAX_SEQ_LEN16 (%d)", sp.len1, sp.id, MAX_SEQ_LEN16);
                 
                 for(k = 0; k < sp.len1; k++)
                 {
@@ -4653,6 +4670,8 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
                 
                 SeqPair sp = pairArray[i + j];
                 seq2 = seqBufQer + (int64_t)sp.idq;             
+                if (sp.len2 >= MAX_SEQ_LEN16)
+                    err_fatal(__func__, "bandedSWA: query length (len2) %d for pair %d exceeds MAX_SEQ_LEN16 (%d)", sp.len2, sp.id, MAX_SEQ_LEN16);
                 for(k = 0; k < sp.len2; k++)
                 {
                     mySeq2SoA[k * SIMD_WIDTH16 + j] = (seq2[k] == AMBIG ? ambQer : seq2[k]);
@@ -5640,6 +5659,8 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                     h0[j] = (uint8_t) h0p;
                 }
                 seq1 = seqBufRef + (int64_t)sp.idr;
+                if (sp.len1 >= MAX_SEQ_LEN8)
+                    err_fatal(__func__, "bandedSWA: ref window length (len1) %d for pair %d exceeds MAX_SEQ_LEN8 (%d)", sp.len1, sp.id, MAX_SEQ_LEN8);
 
                 for(k = 0; k < sp.len1; k++)
                 {
@@ -5688,6 +5709,8 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                 SeqPair sp = pairArray[i + j];
                 // seq2 = seqBuf + (2 * (int64_t)sp.id + 1) * MAX_SEQ_LEN;
                 seq2 = seqBufQer + (int64_t)sp.idq;
+                if (sp.len2 >= MAX_SEQ_LEN8)
+                    err_fatal(__func__, "bandedSWA: query length (len2) %d for pair %d exceeds MAX_SEQ_LEN8 (%d)", sp.len2, sp.id, MAX_SEQ_LEN8);
                 
                 for(k = 0; k < sp.len2; k++)
                 {
