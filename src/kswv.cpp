@@ -1687,6 +1687,70 @@ int kswv::kswv_neon_16_impl(int16_t seq1SoA[],
 
     int16x8_t imax_vec, pimax_vec = zero_vec;
 
+    /* Boundary-skip fast path, ported from kswv_neon_u8_impl's minLen1/jsplit
+     * split (PR #308/#324, golden-proven byte-identical there). The per-cell
+     * boundary test zeroes m11 wherever s1|s2 carries the 0xFFFF padding high
+     * bit, but s1 (the row's reference vector) is loop-invariant across j and
+     * the SoA packing guarantees:
+     *   - below minLen1 (the group's shortest reference window) NO lane pads its
+     *     reference, so s1 carries no high bit;
+     *   - below jsplit = min(query_quantum16(len2)) NO lane pads its query, so
+     *     s2 carries no high bit.
+     * So below both, the mask is provably all-zero (skip the test AND the
+     * blend); below jsplit with i >= minLen1 it reduces to a per-row s1-only
+     * mask; only the ragged tail from jsplit on pays the full per-cell
+     * high_bit(s1|s2). The is_boundary bits are identical in every range -- this
+     * changes which instructions run per cell, never the value they produce.
+     * Dummy tail lanes (len1==len2==0) pin minLen1/jsplit to 0, safely disabling
+     * the fast path on a partial final group. NB: unlike the u8 kernel the
+     * 16-bit kernel needs no jdummy -- DUMMY3 query-tail padding is scored by the
+     * table (temp8 above), not by the boundary blend. */
+    int minLen1 = p[0].len1, jsplit = ncol;
+    for (int l = 0; l < SIMD_WIDTH16; l++) {
+        if (p[l].len1 < minLen1) minLen1 = p[l].len1;
+        const int quanta = query_quantum16(p[l].len2);
+        if (quanta < jsplit) jsplit = quanta;
+    }
+
+    /* One DP cell. APPLY_BND selects whether the boundary blend runs; BND is the
+     * uint16x8_t select mask (evaluated after s2 is loaded, so the full-tail
+     * caller may reference s2). Parameter names match the sibling
+     * KSWV_NEON_U8_CELL (APPLY_BND toggle, BND mask). Body is byte-identical to
+     * the former inline loop: table-lookup score, optional rank-1 freed-cell
+     * override (HasFreed), the variant-C reassociated gap recurrences, and the
+     * imax/iqe argmax. */
+#define KSWV_NEON_16_CELL(APPLY_BND, BND) do {                                 \
+        int16x8_t h00 = vld1q_s16(H0 + j * SIMD_WIDTH16);                      \
+        int16x8_t s2  = vld1q_s16(seq2SoA + j * SIMD_WIDTH16);                 \
+        int16x8_t f11 = vld1q_s16(F + (j + 1) * SIMD_WIDTH16);                 \
+        int16x8_t xor_val = veorq_s16(s1, s2);                                 \
+        uint8x8_t  idx8 = vmovn_u16(vreinterpretq_u16_s16(xor_val));           \
+        int8x8_t   sbt8 = vqtbl2_s8(perm_vec, idx8);                           \
+        int16x8_t  sbt  = vmovl_s8(sbt8);                                      \
+        if (HasFreed) {                                                        \
+            sbt = vbslq_s16(vceqq_s16(s2, active_frread16), freedval_vec16, sbt); \
+        }                                                                     \
+        int16x8_t m11 = vaddq_s16(h00, sbt);                                   \
+        if (APPLY_BND) { m11 = vbslq_s16((BND), zero_vec, m11); }              \
+        int16x8_t h11 = vmaxq_s16(m11, e11);                                   \
+        h11 = vmaxq_s16(h11, f11);                                             \
+        h11 = vmaxq_s16(h11, zero_vec);                                        \
+        uint16x8_t cmp0 = vcgtq_s16(h11, imax_vec);                            \
+        imax_vec = vmaxq_s16(imax_vec, h11);                                   \
+        iqe_vec  = vbslq_s16(cmp0, l_vec, iqe_vec);                            \
+        int16x8_t mf = vmaxq_s16(vmaxq_s16(m11, f11), zero_vec);               \
+        int16x8_t me = vmaxq_s16(vmaxq_s16(m11, e11), zero_vec);               \
+        int16x8_t gapE = vsubq_s16(mf, oe_ins_vec);                            \
+        e11 = vsubq_s16(e11, e_ins_vec);                                       \
+        e11 = vmaxq_s16(gapE, e11);                                            \
+        int16x8_t gapD = vsubq_s16(me, oe_del_vec);                            \
+        int16x8_t f21  = vsubq_s16(f11, e_del_vec);                            \
+        f21 = vmaxq_s16(gapD, f21);                                            \
+        vst1q_s16(H1 + (j + 1) * SIMD_WIDTH16, h11);                           \
+        vst1q_s16(F  + (j + 1) * SIMD_WIDTH16, f21);                           \
+        l_vec = vaddq_s16(l_vec, one_vec);                                     \
+    } while (0)
+
     int i, limit = nrow;
     for (i = 0; i < nrow; i++) {
         int16x8_t e11 = zero_vec;
@@ -1720,63 +1784,25 @@ int kswv::kswv_neon_16_impl(int16_t seq1SoA[],
                                         active_frread16);
         }
 
-        for (int j = 0; j < ncol; j++) {
-            int16x8_t h00 = vld1q_s16(H0 + j * SIMD_WIDTH16);
-            int16x8_t s2  = vld1q_s16(seq2SoA + j * SIMD_WIDTH16);
-            int16x8_t f11 = vld1q_s16(F + (j + 1) * SIMD_WIDTH16);
-
-            int16x8_t xor_val = veorq_s16(s1, s2);
-            /* 8-lane int16 table lookup. Narrow xor (int16x8, values in
-             * [0..31]) to 8 u8 indices (low byte of each int16; high byte
-             * is always 0 for these xor values). Look up in the 32-byte
-             * int8 score table via vqtbl2, sign-extend int8x8 back to
-             * int16x8. */
-            uint8x8_t  idx8 = vmovn_u16(vreinterpretq_u16_s16(xor_val));
-            int8x8_t   sbt8 = vqtbl2_s8(perm_vec, idx8);
-            int16x8_t  sbt  = vmovl_s8(sbt8);
-
-            /* Rank-1 freed-cell override (issue 173 + TAPS neutral): force the
-             * freed score where this column's read base equals the row's active
-             * freed base (built once per row in active_frread16 above). One compare
-             * + one blend; FREED_INACTIVE16 lanes never match a real s2 so they
-             * pass through. */
-            if (HasFreed) {
-                sbt = vbslq_s16(vceqq_s16(s2, active_frread16), freedval_vec16, sbt);
-            }
-
-            /* Boundary: high bit set in (s1 | s2) indicates padding. */
-            int16x8_t or_val = vorrq_s16(s1, s2);
-            uint16x8_t high_bit = vshrq_n_u16(vreinterpretq_u16_s16(or_val), 15);
-            uint16x8_t is_boundary = vceqq_u16(high_bit, vdupq_n_u16(1));
-
-            int16x8_t m11 = vaddq_s16(h00, sbt);
-            m11 = vbslq_s16(is_boundary, zero_vec, m11);
-
-            int16x8_t h11 = vmaxq_s16(m11, e11);
-            h11 = vmaxq_s16(h11, f11);
-            h11 = vmaxq_s16(h11, zero_vec);
-
-            uint16x8_t cmp0 = vcgtq_s16(h11, imax_vec);
-            imax_vec = vmaxq_s16(imax_vec, h11);
-            iqe_vec  = vbslq_s16(cmp0, l_vec, iqe_vec);
-
-            /* Reassociate both gap recurrences off h11 (variant C: h11 is
-             * clamped to 0 above, so fold that 0 into mf/me to preserve the
-             * floor). me reads OLD e11 — compute before the e-update. */
-            int16x8_t mf = vmaxq_s16(vmaxq_s16(m11, f11), zero_vec);
-            int16x8_t me = vmaxq_s16(vmaxq_s16(m11, e11), zero_vec);
-            int16x8_t gapE = vsubq_s16(mf, oe_ins_vec);
-            e11 = vsubq_s16(e11, e_ins_vec);
-            e11 = vmaxq_s16(gapE, e11);
-
-            int16x8_t gapD = vsubq_s16(me, oe_del_vec);
-            int16x8_t f21  = vsubq_s16(f11, e_del_vec);
-            f21 = vmaxq_s16(gapD, f21);
-
-            vst1q_s16(H1 + (j + 1) * SIMD_WIDTH16, h11);
-            vst1q_s16(F  + (j + 1) * SIMD_WIDTH16, f21);
-            l_vec = vaddq_s16(l_vec, one_vec);
+        /* Three-way boundary-skip split (see minLen1/jsplit above). The DP body
+         * is in KSWV_NEON_16_CELL; only the boundary mask differs per range. The
+         * full-tail mask reproduces the former per-cell high_bit(s1|s2) exactly;
+         * the s1-only rowboundary equals it below jsplit (s2 has no high bit
+         * there); below minLen1 both are provably zero so the blend is skipped. */
+        int j = 0;
+        if (i < minLen1) {
+            for (; j < jsplit; j++)
+                KSWV_NEON_16_CELL(false, vdupq_n_u16(0));
+        } else {
+            const uint16x8_t rowboundary =
+                vceqq_u16(vshrq_n_u16(vreinterpretq_u16_s16(s1), 15), vdupq_n_u16(1));
+            for (; j < jsplit; j++)
+                KSWV_NEON_16_CELL(true, rowboundary);
         }
+        for (; j < ncol; j++)
+            KSWV_NEON_16_CELL(true,
+                vceqq_u16(vshrq_n_u16(vreinterpretq_u16_s16(vorrq_s16(s1, s2)), 15),
+                          vdupq_n_u16(1)));
 
         /* Block I: write prior-row's pimax to rowMax. No intermediate
          * masking — frozen lanes' imax after the freeze row is still
@@ -1821,6 +1847,7 @@ int kswv::kswv_neon_16_impl(int16_t seq1SoA[],
 
         int16_t *S = H1; H1 = H0; H0 = S;
     }
+#undef KSWV_NEON_16_CELL
 
     /* Store final row's pimax. Guard on i > 0 for all-padding batches
      * (nrow == 0 → i stays at 0 → underflow). See issue 38 / PR 289. */
