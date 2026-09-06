@@ -140,6 +140,15 @@ assert_pg_well_formed "tab" $'@RG\tID:x\tSM:y\tLB:z'
 assert_pg_well_formed "newline" $'@RG\tID:x\tSM:y\tLB:z\nTRAIL'
 assert_pg_well_formed "carriage-return" $'@RG\tID:x\tSM:y\tLB:z\rTRAIL'
 
+# A long -R value drives the @PG CL: kstring through many grow-and-realloc
+# cycles (append_pg_cl_sanitized calls kputc once per input byte). Regression
+# for the buffer-growth bookkeeping added alongside the CL: kstring's OOM
+# guard: assert_pg_well_formed's checks (single well-formed @PG line, no
+# leaked tab/CR, CL: ends with the reads path) still catch a growth-math bug
+# that corrupts or truncates the value.
+long_sm="$(printf 'x%.0s' $(seq 1 100000))"
+assert_pg_well_formed "long-arg-many-growths" $'@RG\tID:x\tSM:'"$long_sm"$'\tLB:z'
+
 # --- @RG assertions (tab-only case) ----------------------------------------
 # argv is not mutated, so the @RG line the user asked for must still be
 # well-formed and carry ID:x, SM:y, LB:z as distinct tab-separated tags.
