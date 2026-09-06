@@ -7,7 +7,7 @@
  * defeating quicksort variant (used by Rust stdlib, Boost). Branchless
  * partitioning, pre-sorted-run detection, faster than klib's introsort
  * at every N >= 16 on the bwa-mem3 microbench
- * (see test/sort_radix_alnreg_test.cpp --bench).
+ * (measured on a local microbench; the harness is not committed).
  *
  * The CMP argument is the same `__sort_lt(a, b)` macro you pass to
  * KSORT_INIT — they share a strict-weak-order contract, so the existing
@@ -22,7 +22,7 @@
 /* PDQSORT_INIT must be invoked from a .cpp file (not a header) since it
  * emits a non-static function definition. Declare the resulting symbol
  * in a header if it needs to be called from another translation unit
- * (see utils.h for the pdqsort_64 / pdqsort_128 pattern). */
+ * (declare `void pdqsort_<name>(size_t, type_t *)` in the owning header). */
 #define PDQSORT_INIT(name, type_t, CMP) \
     void pdqsort_##name(size_t n, type_t *a) { \
         pdqsort(a, a + n, \

@@ -53,6 +53,7 @@ parity or byte-identity, so nothing here scopes it.)
 | `cohort_ramp_validation.sh`  | `--cohort-ramp-first`/`-ratio` reject malformed values; env warns and falls back | "Cohort ramp values are validated (flag and environment alike)" |
 | `rescue_kmer_options.sh`     | `--rescue-kmer`/`--rescue-band` reject malformed and out-of-range values; the `=` form is required | "--rescue-kmer/--rescue-band reject malformed values" |
 | `rescue_skip_options.sh`     | `--rescue-skip` requires `--rescue-kmer` (order-independent), takes no argument, and is NOT enabled by `--fast` | "--rescue-skip requires --rescue-kmer and composes with --fast" |
+| `thread_count_validation.sh` | `-t` rejects malformed values (non-numeric, trailing garbage, empty, overflow); a value <= 0 still floors to 1; a value above `MAX_THREADS` (256) is clamped to 256 with a warning rather than rejected | "-t rejects malformed values and clamps out-of-range values" |
 | `profile_slice_cpu.sh`       | `--profile` accounts for a partial cohort slice's compute CPU (needs `STAGE_PROF=1`) | "Partial cohort slices report their compute CPU"    |
 | `ndebug_gate_lint.sh`        | no `#if`/`#ifdef`/`#ifndef`/`#elif` NDEBUG gates in `src/` — nothing here defines NDEBUG, so they never compile out | "No NDEBUG preprocessor gates in src/"              |
 | `ndebug_gate_lint_selftest.sh` | the lint above still flags real gates, so its `PASS` means something | "NDEBUG gate lint still detects gates"              |

@@ -825,6 +825,18 @@ jobs:
           FIXTURES="$GITHUB_WORKSPACE/test/fixtures" \
           bash test/regression/rescue_kmer_options.sh
 
+      - name: -t rejects malformed values and clamps out-of-range values
+        if: matrix.canonical == true
+        # -t was parsed with atoi(), which maps unparseable text to 0 and
+        # ignores trailing garbage, so a typo read as a valid-looking thread
+        # count with no diagnostic. Separately, a value above MAX_THREADS must
+        # be clamped (with a warning), not rejected -- it is oversized, not
+        # malformed.
+        run: |
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          FIXTURES="$GITHUB_WORKSPACE/test/fixtures" \
+          bash test/regression/thread_count_validation.sh
+
       # Its own step rather than appended to the one above, matching every other
       # regression check in this job: bundled, a failure in the first script
       # leaves the second unrun and the step name cannot say which one failed.

@@ -30,6 +30,10 @@ struct u8vec_scratch_t {
     u8vec_t v;
     u8vec_scratch_t() { kv_init(v); }
     ~u8vec_scratch_t() { kv_destroy(v); }
+    /* Owns v.a; a by-value copy would double-free. No caller copies (all
+     * users are static thread_local, passed by reference). */
+    u8vec_scratch_t(const u8vec_scratch_t &) = delete;
+    u8vec_scratch_t &operator=(const u8vec_scratch_t &) = delete;
 };
 
 #endif

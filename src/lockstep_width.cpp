@@ -7,6 +7,7 @@
 #include <string.h>
 #include <time.h>
 #include <errno.h>
+#include <mutex>
 
 /* Runtime phase-2 lockstep width. Defaults to the compile-time floor so a
  * binary that never calls the startup probe is identical to the old constant. */
@@ -142,9 +143,13 @@ int32_t bwa3_measure_mlp(const void *base, int64_t n_blocks,
 
 void bwa3_init_smem_lockstep_width(const void *base, int64_t n_blocks,
                                    size_t stride, size_t word_off) {
-    static int done = 0;
-    if (done) return;
-
+    /* One-time resolution. The sole intended caller (fastmap.cpp) runs this
+     * once before the seeding workers spawn, so today it is single-threaded;
+     * std::call_once matches the repo's other once-init sites
+     * (simd_dispatch.cpp, read_memo.cpp) and keeps it correct if that ever
+     * changes. */
+    static std::once_flag once;
+    std::call_once(once, [&]() {
     const char *env = getenv("BWA3_SMEM_LOCKSTEP_N");
     const int32_t pinned = bwa3_lockstep_width_parse_env(env);
     if (pinned > 0) {
@@ -174,5 +179,5 @@ void bwa3_init_smem_lockstep_width(const void *base, int64_t n_blocks,
                 bwa3_measure_mlp(base, n_blocks, stride, word_off));
         /* else: g_smem_lockstep_n keeps its compile-time SMEM_LOCKSTEP_N init. */
     }
-    done = 1;
+    });
 }
