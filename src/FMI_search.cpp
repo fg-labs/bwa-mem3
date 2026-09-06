@@ -2024,6 +2024,28 @@ int64_t FMI_search::call_one_step(int64_t pos, int64_t &sa_entry, int64_t &offse
         uint64_t *one_hot_bwt_str = cp_occ[occ_id_pp_].one_hot_bwt_str;
         uint8_t b;
 
+#if defined(__ARM_NEON) || defined(__aarch64__) || defined(APPLE_SILICON)
+        /* The BWT symbol at sp is one-hot across the four bit-planes, and the
+         * bases are close to uniformly distributed, so testing the planes one
+         * branch at a time mispredicts on most steps. Test all four at once
+         * and select the symbol without a branch; the empty case (no plane
+         * set) is the sentinel row, kept as the one real branch since it is
+         * nearly never taken. The occurrence count then reuses the k-only
+         * backward step's NEON popcount, whose d-register loads keep the
+         * masked word out of the general-purpose file. Symbol priority
+         * (lowest plane wins) matches the plane-at-a-time test exactly. */
+        const unsigned t0 = (unsigned)((one_hot_bwt_str[0] >> y_pp_) & 1);
+        const unsigned t1 = (unsigned)((one_hot_bwt_str[1] >> y_pp_) & 1);
+        const unsigned t2 = (unsigned)((one_hot_bwt_str[2] >> y_pp_) & 1);
+        const unsigned t3 = (unsigned)((one_hot_bwt_str[3] >> y_pp_) & 1);
+        if ((t0 | t1 | t2 | t3) == 0) {
+            sa_entry = 0;
+            return 1;
+        }
+        b = (uint8_t)(t0 ? 0 : t1 ? 1 : t2 ? 2 : 3);
+        const int64_t occ_sp = cp_occ[occ_id_pp_].cp_count[b] +
+            occ_popcount64(&one_hot_bwt_str[b], &one_hot_mask_array[sp & CP_MASK]);
+#else
         if((one_hot_bwt_str[0] >> y_pp_) & 1)
             b = 0;
         else if((one_hot_bwt_str[1] >> y_pp_) & 1)
@@ -2040,6 +2062,7 @@ int64_t FMI_search::call_one_step(int64_t pos, int64_t &sa_entry, int64_t &offse
         }
         
         GET_OCC(sp, b, occ_id_sp, y_sp, occ_sp, one_hot_bwt_str_c_sp, match_mask_sp);
+#endif
         
         sp = count[b] + occ_sp;
         
@@ -2060,6 +2083,19 @@ int64_t FMI_search::call_one_step(int64_t pos, int64_t &sa_entry, int64_t &offse
         }
     } // else
 }
+
+/* Lane count of the pipelined compressed-SA resolver (get_sa_entries_prefetch);
+ * see the BWA3_SA_LANES note there. */
+#define SA_RESOLVE_LANES_DEFAULT 20
+#define SA_RESOLVE_LANES_MAX 64
+/* The resolver's lane arrays (working_set/map_pos/offset) are sized to
+ * SA_RESOLVE_LANES_MAX and indexed by sa_batch_size, which is clamped into
+ * [1, SA_RESOLVE_LANES_MAX] for env overrides but defaults to
+ * SA_RESOLVE_LANES_DEFAULT unclamped -- guard the default against silently
+ * overrunning those stack arrays if it is ever raised past the array size. */
+static_assert(SA_RESOLVE_LANES_DEFAULT >= 1 &&
+              SA_RESOLVE_LANES_DEFAULT <= SA_RESOLVE_LANES_MAX,
+              "SA_RESOLVE_LANES_DEFAULT must be within [1, SA_RESOLVE_LANES_MAX]");
 
 /* Thread-local scratch for the pos_ar/map_ar staging buffers below. These were
  * two _mm_malloc/_mm_free per call, and this function runs once per read — so on
@@ -2141,9 +2177,24 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
     
     id_ += id;
     
-    const int32_t sa_batch_size = 20;
-    int64_t working_set[sa_batch_size], map_pos[sa_batch_size];;
-    int64_t offset[sa_batch_size] = {-1};
+    /* Number of SA rows walked concurrently. Each lane's next checkpoint block
+     * is prefetched when the lane is (re)staged, so the lane count sets how
+     * many block fetches are in flight; it does not affect results, which are
+     * stored by position. BWA3_SA_LANES overrides the default for tuning; out
+     * of range values (below 1 or above SA_RESOLVE_LANES_MAX) are ignored. */
+    static const int32_t sa_batch_size = []() {
+        int32_t lanes = SA_RESOLVE_LANES_DEFAULT;
+        const char *e = getenv("BWA3_SA_LANES");
+        if (e != NULL) {
+            const int v = atoi(e);
+            if (v >= 1 && v <= SA_RESOLVE_LANES_MAX) lanes = v;
+            else fprintf(stderr, "[W::get_sa_entries_prefetch] ignoring BWA3_SA_LANES=%s (expected 1..%d)\n",
+                         e, (int) SA_RESOLVE_LANES_MAX);
+        }
+        return lanes;
+    }();
+    int64_t working_set[SA_RESOLVE_LANES_MAX], map_pos[SA_RESOLVE_LANES_MAX];
+    int64_t offset[SA_RESOLVE_LANES_MAX] = {-1};
     
     int i = 0, j = 0;    
     while(i<id && j<sa_batch_size)
