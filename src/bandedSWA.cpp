@@ -29,6 +29,18 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 
 #include "kernel_dispatch.h"
 #include "bandedSWA.h"
+#if defined(__ARM_NEON) || defined(__aarch64__)
+/* neon_soa_pack.h remaps the nt4 ambiguity code to the kernels' query-N code.
+ * These names live in kswv.cpp; this translation unit needs them too, so define
+ * them here before the include. AMBQ matches the query-N=8 the 8-bit prepass uses. */
+#ifndef AMBIG_
+#define AMBIG_ 4
+#endif
+#ifndef AMBQ
+#define AMBQ 8
+#endif
+#include "neon_soa_pack.h"   /* tiled SoA packing for the 128-bit 8-bit wrapper */
+#endif
 #ifdef VTUNE_ANALYSIS
 #include <ittnotify.h> 
 #endif
@@ -5612,6 +5624,12 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
             int maxLen2 = 0;
             //bsize = 100;
             bsize = w;
+#if defined(__ARM_NEON) || defined(__aarch64__)
+            /* The lane-count invariant (SIMD_WIDTH8 == 16) is asserted inside
+             * neon_soa_pack16 itself; see neon_soa_pack.h. */
+            const uint8_t *seq1p[SIMD_WIDTH8], *seq2p[SIMD_WIDTH8];
+            int len1a[SIMD_WIDTH8], len2a[SIMD_WIDTH8];
+#endif
             
             for(j = 0; j < SIMD_WIDTH8; j++)
             {
@@ -5640,15 +5658,25 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                     h0[j] = (uint8_t) h0p;
                 }
                 seq1 = seqBufRef + (int64_t)sp.idr;
-
+#if defined(__ARM_NEON) || defined(__aarch64__)
+                seq1p[j] = seq1;
+                len1a[j] = sp.len1;
+#else
                 for(k = 0; k < sp.len1; k++)
                 {
                     mySeq1SoA[k * SIMD_WIDTH8 + j] = seq1[k] /* PR16: N stays 4 */;
                 }
+#endif
                 qlen[j] = sp.len2 * max;
                 if(maxLen1 < sp.len1) maxLen1 = sp.len1;
             }
 
+#if defined(__ARM_NEON) || defined(__aarch64__)
+            /* Tiled 16x16 transpose in place of the strided byte scatter (see
+             * neon_soa_pack.h): bases (N stays 4), then DUMMY1 from len1 through
+             * row maxLen1 inclusive -- byte-for-byte what the scalar loops wrote. */
+            neon_soa_pack16(mySeq1SoA, seq1p, len1a, len1a, maxLen1 + 1, DUMMY1, DUMMY1, false);
+#else
             for(j = 0; j < SIMD_WIDTH8; j++)
             {
                 SeqPair sp = pairArray[i + j];
@@ -5657,6 +5685,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                     mySeq1SoA[k * SIMD_WIDTH8 + j] = DUMMY1;
                 }
             }
+#endif
             /* B5: the h0-prefix deletion seed below fully overwrites H2 rows
              * [0, maxLen1); only the boundary row H2[maxLen1] survives to be read
              * as the column edge. Write just that row (all lanes = DUMMY1) here
@@ -5688,14 +5717,23 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                 SeqPair sp = pairArray[i + j];
                 // seq2 = seqBuf + (2 * (int64_t)sp.id + 1) * MAX_SEQ_LEN;
                 seq2 = seqBufQer + (int64_t)sp.idq;
-                
+#if defined(__ARM_NEON) || defined(__aarch64__)
+                seq2p[j] = seq2;
+                len2a[j] = sp.len2;
+#else
                 for(k = 0; k < sp.len2; k++)
                 {
                     mySeq2SoA[k * SIMD_WIDTH8 + j] = (seq2[k]==AMBIG ? 8 : seq2[k]) /* PR16: query N→8 */;
                 }
+#endif
                 if(maxLen2 < sp.len2) maxLen2 = sp.len2;
             }
 
+#if defined(__ARM_NEON) || defined(__aarch64__)
+            /* Query side: bases with N (4) -> 8, then DUMMY2 from len2 through
+             * column maxLen2 inclusive. */
+            neon_soa_pack16(mySeq2SoA, seq2p, len2a, len2a, maxLen2 + 1, DUMMY2, DUMMY2, true);
+#else
             //maxLen2 = ((maxLen2  + 3) >> 2) * 4;
 
             for(j = 0; j < SIMD_WIDTH8; j++)
@@ -5706,6 +5744,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                     mySeq2SoA[k * SIMD_WIDTH8 + j] = DUMMY2;
                 }
             }
+#endif
             /* B5: the h0-prefix insertion seed below fully overwrites H1 rows
              * [0, maxLen2); only the boundary row H1[maxLen2] survives as the row
              * edge (value 0). Write just that row here instead of the dead
