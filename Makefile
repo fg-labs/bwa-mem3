@@ -1177,12 +1177,43 @@ $(BWA_LIB):$(OBJS) $(KERNEL_TIER_OBJS)
 # htslib: minimal configure (no lzma/bz2/curl/S3/GCS/plugins), zlib only.
 # Guard on config.mk (only created by ./configure) rather than Makefile, which
 # is checked into the htslib tree and would make the guard a no-op.
+# Guard: htslib's configure installs htscodecs.mk as a symlink to
+# htscodecs_bundled.mk, and htslib's own `htscodecs.mk:` recipe regenerates
+# the file by writing THROUGH that symlink. GNU make remakes included
+# makefiles even under -n, so a `make -B` (or -B -n) that recurses into
+# ext/htslib overwrites htscodecs_bundled.mk with a 3-line stub; the next
+# libhts.a then silently lacks the htscodecs objects and the final link of
+# bwa-mem3 fails on undefined rans_*/tok3_* symbols, far from the cause.
+# Fail here instead, with the fix.
+# One shell statement, used twice in the $(HTS_LIB) recipe and by the
+# check-htscodecs-fragment target below. Only active once configure has
+# turned htscodecs.mk into a symlink; a fresh checkout has a regular file
+# there and nothing to check.
+HTSCODECS_FRAGMENT_CHECK = if [ -L ext/htslib/htscodecs.mk ] && \
+    ! grep -q '^HTSCODECS_OBJS' ext/htslib/htscodecs_bundled.mk 2>/dev/null; then \
+    echo "ERROR: ext/htslib/htscodecs_bundled.mk has been overwritten (it no longer defines HTSCODECS_OBJS)."; \
+    echo "  htslib's htscodecs.mk recipe wrote through the configure-made symlink, usually after a 'make -B'."; \
+    echo "  Restore it with: git -C ext/htslib checkout -- htscodecs_bundled.mk   (or: git submodule update --force ext/htslib), then re-run make"; \
+    exit 1; \
+fi
+
+# The check runs before the htslib sub-make (a clobber left by an earlier
+# invocation) and again after it (a clobber the sub-make just performed,
+# e.g. under this very `make -B`), so the failure is reported here, next to
+# its cause, rather than as missing rans/tok3 symbols at the final link.
 $(HTS_LIB):
+	@$(HTSCODECS_FRAGMENT_CHECK)
 	cd ext/htslib && \
 	    ([ -f config.mk ] || (autoreconf -i && \
 	        ./configure --disable-lzma --disable-libcurl --disable-gcs \
 	                    --disable-s3 --disable-plugins --disable-bz2)) && \
 	    $(MAKE) libhts.a htslib_static.mk
+	@$(HTSCODECS_FRAGMENT_CHECK)
+
+# Standalone entry point for the same check (test/regression/make_htscodecs_guard.sh).
+.PHONY: check-htscodecs-fragment
+check-htscodecs-fragment:
+	@$(HTSCODECS_FRAGMENT_CHECK)
 
 # Companion to the `-include ext/htslib/htslib_static.mk` near LIBS:
 # declare the include file as a target with a non-empty recipe so GNU
