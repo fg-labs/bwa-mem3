@@ -7,6 +7,7 @@
 #include <math.h>
 #include <time.h>
 #include <pthread.h>
+#include <assert.h>
 
 /* Defined unconditionally so the STAGE_PROF-off (compile-time-dead) instrumentation
  * blocks that reference it still link at any optimization level. */
@@ -22,7 +23,12 @@ static double g_run_start = 0.0;
 static prof_chunk_t *g_rows = NULL;
 static size_t  g_n = 0, g_cap = 0;
 static double  g_idle = 0.0, g_idle_split[3] = {0,0,0};
+static size_t  g_n_dropped = 0;   /* chunks dropped on realloc failure (OOM) */
+static int     g_test_fail_realloc = 0;   /* test-only: pending forced realloc failures */
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
+
+/* See stage_prof.h: arm the next `n` growth reallocs to fail deterministically. */
+void sp_test_arm_realloc_fail(int n) { g_test_fail_realloc = n; }
 
 double sp_wall(void) {
     struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
@@ -43,7 +49,16 @@ void sp_init(const char *path, const char *tool, const char *version,
     snprintf(g_arch,    sizeof g_arch,    "%s", arch ? arch : "");
     snprintf(g_fmt,     sizeof g_fmt,     "%s", fmt ? fmt : "");
     snprintf(g_input,   sizeof g_input,   "%s", input ? input : "");
-    g_cores = cores; g_level = level; g_run_start = sp_wall(); sp_g_on = 1;
+    g_cores = cores; g_level = level; g_run_start = sp_wall();
+    /* The caller (main_mem) can run more than once in a single process (e.g. a
+     * host embedding bwa-mem3 as a library, or repeated invocations in one test
+     * binary); reset every run-scoped accumulator so a fresh run starts clean
+     * instead of inheriting counts/timings left over from a prior run. The
+     * chunk buffer itself (g_rows/g_cap) is intentionally kept allocated and
+     * reused -- only its logical length (g_n) resets. */
+    g_n = 0; g_n_dropped = 0; g_idle = 0.0;
+    g_idle_split[0] = g_idle_split[1] = g_idle_split[2] = 0.0;
+    sp_g_on = 1;
 }
 void sp_set_workers(int n) { g_workers = n; }
 
@@ -59,27 +74,34 @@ void sp_chunk_init(prof_chunk_t *c) {
 
 void sp_add_chunk(const prof_chunk_t *c) {
     if (!sp_g_on) return;
-    pthread_mutex_lock(&g_mu);
+    int lk = pthread_mutex_lock(&g_mu); assert(lk == 0); (void)lk;
     if (g_n == g_cap) {
         size_t new_cap = g_cap ? g_cap * 2 : 64;
-        prof_chunk_t *new_rows = (prof_chunk_t*)realloc(g_rows, new_cap * sizeof *new_rows);
+        prof_chunk_t *new_rows;
+        if (g_test_fail_realloc > 0) {   /* test-only fault injection: mimic realloc == NULL */
+            --g_test_fail_realloc;
+            new_rows = NULL;             /* g_rows left untouched, exactly as on a real failure */
+        } else {
+            new_rows = (prof_chunk_t*)realloc(g_rows, new_cap * sizeof *new_rows);
+        }
         if (!new_rows) {   /* keep old g_rows intact; drop this chunk rather than crash */
-            pthread_mutex_unlock(&g_mu);
+            ++g_n_dropped;   /* count it so sp_finish can report the report is incomplete */
+            int ul = pthread_mutex_unlock(&g_mu); assert(ul == 0); (void)ul;
             return;
         }
         g_rows = new_rows;
         g_cap = new_cap;
     }
     g_rows[g_n++] = *c;
-    pthread_mutex_unlock(&g_mu);
+    int ul = pthread_mutex_unlock(&g_mu); assert(ul == 0); (void)ul;
 }
 
 void sp_add_idle(int next_step, double s) {
     if (!sp_g_on) return;
-    pthread_mutex_lock(&g_mu);
+    int lk = pthread_mutex_lock(&g_mu); assert(lk == 0); (void)lk;
     g_idle += s;
     if (next_step >= 0 && next_step < 3) g_idle_split[next_step] += s;
-    pthread_mutex_unlock(&g_mu);
+    int ul = pthread_mutex_unlock(&g_mu); assert(ul == 0); (void)ul;
 }
 
 void sp_thread_stats(prof_chunk_t *c, const double *b, int n) {
@@ -178,7 +200,10 @@ void sp_finish(double total_wall, double mean_cores_busy, double peak_rss_mb) {
         fprintf(stderr, "[stage_prof] error writing profile output to %s\n", g_path);
         return;
     }
-    fprintf(stderr, "[stage_prof] wrote %zu chunk rows + aggregate to %s\n", g_n, g_path);
+    if (g_n_dropped > 0)
+        fprintf(stderr, "[stage_prof] wrote %zu chunk rows + aggregate to %s (%zu chunk(s) dropped, out of memory: report is incomplete)\n", g_n, g_path, g_n_dropped);
+    else
+        fprintf(stderr, "[stage_prof] wrote %zu chunk rows + aggregate to %s\n", g_n, g_path);
 }
 
 #endif /* STAGE_PROF */

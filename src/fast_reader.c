@@ -33,6 +33,7 @@ struct fast_reader {
     /* gzip */
     zng_stream zs;
     int      zs_active;
+    int      gz_member_open;   /* a gzip member is mid-decode (set on Z_OK, cleared at Z_STREAM_END) */
 
     /* bgzf */
     struct libdeflate_decompressor *ld;
@@ -171,7 +172,10 @@ static int fr_read_gzip(fast_reader_t *fr, unsigned char *buf, int len)
     while (fr->zs.avail_out > 0) {
         if (fr->zs.avail_in == 0) {
             if (fr_fill(fr) < 0) return -1;
-            if (fr->cin_len - fr->cin_pos == 0) break;     /* no more input */
+            if (fr->cin_len - fr->cin_pos == 0) {           /* no more input */
+                if (fr->gz_member_open) return -1;          /* member truncated mid-stream */
+                break;
+            }
             fr->zs.next_in = fr->cin + fr->cin_pos;
             fr->zs.avail_in = (uInt)(fr->cin_len - fr->cin_pos);
         }
@@ -180,15 +184,20 @@ static int fr_read_gzip(fast_reader_t *fr, unsigned char *buf, int len)
         if (sp_enabled()) sp_read_add(1, sp_wall() - _td);
         fr->cin_pos = fr->cin_len - fr->zs.avail_in;       /* track consumed */
         if (ret == Z_STREAM_END) {                          /* member done */
+            fr->gz_member_open = 0;
             if (zng_inflateReset(&fr->zs) != Z_OK) return -1;
             if (fr->zs.avail_in == 0 && fr->eof_in) break;  /* nothing follows */
             continue;                                       /* next member */
         }
         if (ret == Z_BUF_ERROR) {                           /* needs more input */
-            if (fr->eof_in && fr->zs.avail_in == 0) break;
+            if (fr->eof_in && fr->zs.avail_in == 0) {
+                if (fr->gz_member_open) return -1;              /* truncated: EOF mid-member */
+                break;
+            }
             continue;
         }
         if (ret != Z_OK) return -1;                         /* hard error */
+        fr->gz_member_open = 1;                              /* Z_OK: member mid-decode */
     }
     return len - (int)fr->zs.avail_out;
 }

@@ -44,6 +44,12 @@ int main() {
     // (mirrors parse_cgroup_v1_cpu). Whitespace after period is fine.
     CHECK(parse_cgroup_cpu_max("100000 100000xyz") == -1);
     CHECK(parse_cgroup_cpu_max("100000 100000 \n") == 1);
+    // Overflow-safe ceil_div_to_int: a huge period with a small quota has a true
+    // ceil of 1, not INT_MAX (regression: the earlier `quota + period - 1`
+    // additive-overflow guard returned INT_MAX for this input). A huge quota
+    // still clamps to INT_MAX.
+    CHECK(parse_cgroup_cpu_max("5 9223372036854775807\n") == 1);
+    CHECK(parse_cgroup_cpu_max("9223372036854775807 2\n") == 2147483647);
 
     // cgroup v1 memory.limit_in_bytes
     CHECK(parse_cgroup_v1_memory_limit("1000000000") == 1000000000);

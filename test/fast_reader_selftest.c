@@ -138,6 +138,25 @@ static int roundtrip(const char *path, const unsigned char *expect, size_t n,
     return ok;
 }
 
+/* Feed a truncated gzip member: fast_reader must report an error (read < 0)
+ * rather than a silent clean EOF. Returns 1 iff the truncation was detected. */
+static int expect_truncation_error(const char *path)
+{
+    int fd = open(path, O_RDONLY); assert(fd >= 0);
+    const char *err = NULL;
+    fast_reader_t *fr = fast_reader_dopen(fd, &err);
+    if (!fr) return 1;                     /* rejected at open -- also detected */
+    unsigned char buf[65536];
+    int saw_error = 0;
+    for (;;) {
+        int r = fast_reader_read(fr, buf, sizeof buf);
+        if (r < 0) { saw_error = 1; break; }   /* truncation detected */
+        if (r == 0) break;                     /* clean EOF -- undetected */
+    }
+    fast_reader_close(fr);
+    return saw_error;
+}
+
 int main(void)
 {
     /* --- fr_detect --- */
@@ -185,6 +204,19 @@ int main(void)
         write_file("/tmp/fr_multi.fq.gz", cat, la + lb);
         CHECK(roundtrip("/tmp/fr_multi.fq.gz", pay, n, FR_GZIP), "roundtrip: multi-member gzip");
         free(a); free(b); free(cat);
+    }
+
+    /* --- truncated gzip member: must error, not silently short-read --- */
+    {
+        size_t cap = n + (n >> 1) + 8192;
+        unsigned char *gz;
+        XMALLOC(gz, cap);
+        size_t gl = gz_member(pay, n, gz, cap);
+        size_t trunc = gl / 2;                  /* cut mid-member, past the header */
+        write_file("/tmp/fr_trunc.fq.gz", gz, trunc);
+        CHECK(expect_truncation_error("/tmp/fr_trunc.fq.gz"),
+              "truncated gzip member reports an error (not silent EOF)");
+        free(gz);
     }
 
     /* --- BGZF (multiple blocks + EOF marker) --- */

@@ -1,6 +1,7 @@
 #include "fast_reader_bseq.h"
 
 #include <ctype.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -72,6 +73,8 @@ static inline void fr_rec_to_bseq1(const fr_fastq_rec_t *r, bseq1_t *s, read_are
      * back to 0 anyway, so producing 0 here reaches the identical NULL while
      * skipping a malloc+memcpy per read on the serial read thread. */
     s->comment = (copy_comment && r->comment_l) ? fr_dup_field(r->comment, r->comment_l) : 0;
+    if (r->seq_l > (size_t)INT_MAX)
+        err_fatal(__func__, "sequence of %zu bases exceeds the supported read length (%d)", r->seq_l, INT_MAX);
     s->seq     = read_arena_dup(arena, r->seq, r->seq_l);
     s->qual    = r->qual_l ? read_arena_dup(arena, r->qual, r->qual_l) : 0;
     s->l_seq   = (int)r->seq_l;
@@ -112,8 +115,12 @@ bseq1_t *bseq_read_fast(int64_t chunk_size, int *n_, void *ks1_, void *ks2_, int
             double d, c; sp_read_get(&d, &c, NULL);
             sp_read_add(2, (sp_wall() - _tk0) - ((d + c) - _io0));
         }
-        if (g1 != 1) break;                              /* clean EOF or malformed 1st file */
-        if (p2 && g2 != 1) {                             /* 2nd file has fewer */
+        if (g1 == -2)
+            err_fatal(__func__, "malformed FASTQ record or read/decode error in the 1st input (record %ld)", (long)n);
+        if (g1 != 1) break;                              /* clean EOF (g1 == 0) */
+        if (p2 && g2 == -2)
+            err_fatal(__func__, "malformed FASTQ record or read/decode error in the 2nd input (record %ld)", (long)n);
+        if (p2 && g2 != 1) {                             /* 2nd file has fewer (g2 == 0) */
             fprintf(stderr, "[W::%s] the 2nd file has fewer sequences.\n", __func__);
             break;
         }
@@ -164,7 +171,10 @@ bseq1_t *bseq_read_fast(int64_t chunk_size, int *n_, void *ks1_, void *ks2_, int
     }
     if (size == 0) {                                      /* 1st file has fewer */
         fr_fastq_rec_t rr;
-        if (p2 && fr_fastq_next(p2, &rr) == 1)
+        int gp = p2 ? fr_fastq_next(p2, &rr) : 0;
+        if (gp == -2)
+            err_fatal(__func__, "malformed FASTQ record or read/decode error in the 2nd input while draining after the 1st input ended");
+        if (gp == 1)
             fprintf(stderr, "[W::%s] the 1st file has fewer sequences.\n", __func__);
     }
     /* PIPE-F6: hand the arena (backing every read's name/seq/qual) to the caller,
