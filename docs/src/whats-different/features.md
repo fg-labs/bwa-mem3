@@ -217,6 +217,21 @@ occurs when the output is piped to `samtools view -bS`.
 - `--bam=1..9`: BGZF deflate at the specified level.
 - No flag: SAM text on stdout (default, unchanged).
 
+### `--bam-threads INT` — parallel BGZF compression
+
+For compressed output (`--bam=1..9`) the per-block BGZF deflate is parallelized
+across a thread pool (htslib `hts_set_threads`). `--bam-threads` controls the
+pool size and **defaults to `-t/8`** when compressing (0 threads when uncompressed
+or below `-t 8`): the deflate work is fixed per output but alignment gets faster
+with more threads, so the pool scales with `-t` to keep compression hidden behind
+alignment. This is a deliberate default change — compressed `--bam=N` is
+auto-parallelized rather than serial — bounded to ~12.5% of the thread budget and
+measured to remove the write-side bottleneck (2.3× on `--bam=6 -t64`). Output is
+**byte-identical** to serial: htslib's ordered thread pool emits BGZF blocks in
+dispatch order (the same guarantee `samtools -@` relies on). Pass `--bam-threads N`
+to override (capped at `MAX_THREADS`), or `--bam-threads 0` to force the previous
+single-threaded deflate.
+
 The implementation adds `src/bam_writer.{h,cpp}`, a new module that converts
 `mem_aln_t` to `bam1_t` via `mem_aln_to_bam`. htslib v1.21 is pulled in as a
 submodule at `ext/htslib`. On the bwameth.py example fixture (92,961 records),
