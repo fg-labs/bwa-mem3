@@ -1,6 +1,6 @@
 # Apple Silicon / NEON port
 
-bwa-mem3 supports ARM64 (Apple Silicon and Linux aarch64) as a first-class build target. The port uses the [sse2neon](https://github.com/DLTcollab/sse2neon) translation shim as a baseline and replaces the two most performance-critical SSE paths with native NEON intrinsics.
+bwa-mem3 supports ARM64 (Apple Silicon and Linux aarch64) as a first-class build target. The port uses the [sse2neon](https://github.com/DLTcollab/sse2neon) translation shim as a baseline and replaces the most performance-critical SSE path with a native NEON intrinsic.
 
 ## Architecture overview
 
@@ -10,10 +10,9 @@ The ARM build compiles a single binary with a single NEON kernel TU. There is on
 
 `ext/sse2neon/sse2neon.h` is a header-only library that maps Intel SSE intrinsics to their NEON equivalents. When `APPLE_SILICON=1` is defined (set automatically when `uname -m` is `arm64` or `aarch64`), `src/simd_compat.h` includes sse2neon and defines the SSE feature test macros (`__SSE__` through `__SSE4_2__`) so that code guarded by those macros compiles without changes.
 
-The translation is not zero-cost for all operations. Two patterns that sse2neon handles poorly are replaced with native NEON in `src/simd_compat.h`:
+The translation is not zero-cost for all operations. One pattern that sse2neon handles poorly is replaced with native NEON in `src/simd_compat.h`:
 
 - `_mm_movemask_epi16` — used heavily in `bandedSWA.cpp` to extract the sign bit of each 16-bit lane. The native implementation shifts right by 15, narrows to 8-bit with `vmovn_u16`, and reduces with position-weighted `vaddv_u8`.
-- `_mm_blendv_epi16_fast` — a bitwise select on 16-bit lanes using `vbslq_s16`. Replaces the three-operation OR/AND/ANDNOT sequence sse2neon emits for `_mm_blendv_epi8`.
 
 Because the bulk of the ARM SIMD path is compiler-translated rather than hand-written intrinsics, codegen quality is unusually sensitive to the compiler and its version — a recent `clang` or `gcc` closes most of the gap to a hypothetical full native port. See [Best Practices → Build](../best-practices/build.md#arm--aarch64) for measured numbers and the recommendation.
 
@@ -78,7 +77,7 @@ The resulting `bwa-mem3.pgo` binary delivers the full ~10% improvement over the 
 
 - `src/kswv.cpp`, `src/kswv.h` — native NEON batched Smith-Waterman
 - `src/bandedSWA.h` — SIMD width definitions for ARM
-- `src/simd_compat.h` — sse2neon integration, aligned allocation, `_mm_blendv_epi16_fast`, `_mm_movemask_epi16`
+- `src/simd_compat.h` — sse2neon integration, aligned allocation, `_mm_movemask_epi16`
 - `src/fastmap.cpp` — L2 cache detection, `HTStatus()` for non-NUMA (macOS)
 - `src/macro.h` — `BATCH_SIZE` and `CACHE_LINE_BYTES` tuning for Apple Silicon
 - `Makefile` — `arm64` target, sse2neon flags, Accelerate linkage, PGO targets
