@@ -6,6 +6,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <cerrno>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -19,6 +20,13 @@ PackedText::PackedText(const std::string& pac_path, int64_t n_bases)
     if (fstat(fd_, &st) != 0)
         err_fatal(__func__, "failed to fstat '%s': %s", pac_path.c_str(), strerror(errno));
     map_bytes_ = (size_t)st.st_size;
+    if (n_bases < 0)
+        err_fatal(__func__, "negative n_bases (%lld) for pac file '%s'", (long long)n_bases, pac_path.c_str());
+    // n_bases + 3 would overflow int64_t (signed overflow, undefined behavior)
+    // once n_bases exceeds INT64_MAX - 3; reject before the arithmetic runs
+    // rather than relying on whatever the overflow happens to produce.
+    if (n_bases > INT64_MAX - 3)
+        err_fatal(__func__, "n_bases (%lld) too large for pac file '%s'", (long long)n_bases, pac_path.c_str());
     size_t expected_bytes = (size_t)((n_bases + 3) >> 2);
     if (map_bytes_ < expected_bytes)
         err_fatal(__func__, "pac file '%s' is too small: expected at least %zu bytes, got %zu",

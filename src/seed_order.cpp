@@ -81,7 +81,7 @@ int max_of(const seed_rec_t *recs, int n, bool use_qbeg) {
 
 void order_seeds(seed_rec_t *recs, int64_t n, seed_order_t mode) {
     if (mode == SEED_ORDER_OFF || n < 2) return;
-    assert(n <= INT_MAX);
+    xassert(n <= INT_MAX, "seed count exceeds INT_MAX");
     int ni = (int)n;
 
     // perm starts as the identity => recs' current (orig_ix) order, which every

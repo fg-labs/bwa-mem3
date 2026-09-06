@@ -44,6 +44,7 @@
 #define READ_ARENA_H
 
 #include <stddef.h>
+#include <stdint.h> /* SIZE_MAX */
 #include <stdlib.h>
 #include <string.h>
 
@@ -104,7 +105,7 @@ static inline void read_arena_grow(read_arena_t *a, size_t need)
 static inline void *read_arena_alloc(read_arena_t *a, size_t n)
 {
 	read_arena_block_t *b = a->head;
-	if (b == NULL || b->used + n > b->cap) {
+	if (b == NULL || n > b->cap - b->used) {  /* overflow-safe: invariant used <= cap */
 		read_arena_grow(a, n);
 		b = a->head;
 	}
@@ -118,6 +119,7 @@ static inline void *read_arena_alloc(read_arena_t *a, size_t n)
  * explicitly. Produces a byte-identical result to malloc(len+1)+memcpy. */
 static inline char *read_arena_dup(read_arena_t *a, const char *src, size_t len)
 {
+	if (len == SIZE_MAX) err_fatal(__func__, "read field length overflows size_t");
 	char *dst = (char *)read_arena_alloc(a, len + 1);
 	memcpy(dst, src, len);
 	dst[len] = '\0';

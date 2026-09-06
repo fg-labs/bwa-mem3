@@ -9,7 +9,7 @@ extern "C" {
 #endif
 
 // One resolved seed plus the metadata chaining needs. seed is the FULL
-// mem_seed_t (all 7 fields), default-constructed then field-filled exactly as
+// mem_seed_t (all 6 fields), default-constructed then field-filled exactly as
 // mem_chain_seeds does today. orig_ix is the strict resolve-order index and is
 // every comparator's final stable tiebreak (and the OFF identity key).
 typedef struct {

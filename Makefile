@@ -478,7 +478,10 @@ STANDALONE_TESTS = kswv_nrow_zero_test kswv_freed_cell_test \
                    shm_pack_round_trip_test shm_lock_destroy_test \
                    kt_for_pool_test bns_zero_calloc_test \
                    kernel_padded_lane_uninit_test bam_rec_scratch_test \
-                   detect_sa_compx_test nst_nt4_decode_test
+                   detect_sa_compx_test nst_nt4_decode_test \
+                   read_arena_overflow_test packed_text_neg_nbases_test \
+                   packed_text_overflow_nbases_test \
+                   mem_gen_alt_zero_calloc_test
 STANDALONE_TEST_OBJS = $(STANDALONE_TESTS:%=test/%.o)
 
 # shm_pack_round_trip_test is excluded from `test:` because it runs via
@@ -944,6 +947,28 @@ test/fmi_seed_api_guards_test.o: test/fmi_seed_api_guards_test.cpp $(FLAGS_STAMP
 nst_nt4_decode_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/nst_nt4_decode_test.o
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/nst_nt4_decode_test.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
 test/nst_nt4_decode_test.o: test/nst_nt4_decode_test.cpp
+	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
+
+# Alloc-guard regression tests: memory-safety guard paths that do not fire on
+# valid input (see each source header for what old-vs-new behavior it pins).
+read_arena_overflow_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/read_arena_overflow_test.o
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/read_arena_overflow_test.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
+test/read_arena_overflow_test.o: test/read_arena_overflow_test.cpp
+	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
+
+packed_text_neg_nbases_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/packed_text_neg_nbases_test.o
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/packed_text_neg_nbases_test.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
+test/packed_text_neg_nbases_test.o: test/packed_text_neg_nbases_test.cpp
+	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
+
+packed_text_overflow_nbases_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/packed_text_overflow_nbases_test.o
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/packed_text_overflow_nbases_test.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
+test/packed_text_overflow_nbases_test.o: test/packed_text_overflow_nbases_test.cpp
+	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
+
+mem_gen_alt_zero_calloc_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/mem_gen_alt_zero_calloc_test.o
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/mem_gen_alt_zero_calloc_test.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
+test/mem_gen_alt_zero_calloc_test.o: test/mem_gen_alt_zero_calloc_test.cpp
 	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
 
 # fast_reader is C (not C++); the implicit .c rule omits $(INCLUDES), so give
