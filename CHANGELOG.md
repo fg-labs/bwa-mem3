@@ -1,5 +1,39 @@
 # Changelog
 
+## [0.12.0](https://github.com/fg-labs/bwa-mem3/compare/v0.11.0...v0.12.0) (2026-09-07)
+
+
+### Features
+
+* **fast:** fold the score-gated chain-extension cap into --fast (--extend-tie-frac 0.95 + --extend-csub) ([#269](https://github.com/fg-labs/bwa-mem3/issues/269)) ([e5bcb2f](https://github.com/fg-labs/bwa-mem3/commit/e5bcb2f6c277d5910a6319324e4e6aa8434930aa))
+* **index:** bwamem3 index -u for runtime SA sampling ([#445](https://github.com/fg-labs/bwa-mem3/issues/445)) ([c55f3d9](https://github.com/fg-labs/bwa-mem3/commit/c55f3d966254dbeb62b3ea448df649709e4611da))
+* **index:** fmi_seed_api facade for external seeding consumers ([#446](https://github.com/fg-labs/bwa-mem3/issues/446)) ([0e6ed0f](https://github.com/fg-labs/bwa-mem3/commit/0e6ed0fdfca9e91a2aeb0b74401f8790ebb3cf27))
+
+
+### Bug Fixes
+
+* **bwamem:** eliminate srtg realloc-aliasing bug + harden unchecked reallocs ([#457](https://github.com/fg-labs/bwa-mem3/issues/457)) ([6d4a858](https://github.com/fg-labs/bwa-mem3/commit/6d4a8586dbdbbc5dd3b496013df2d9795345b42a))
+* clamp -t to MAX_THREADS; concurrency and API hardening ([#454](https://github.com/fg-labs/bwa-mem3/issues/454)) ([c651aa5](https://github.com/fg-labs/bwa-mem3/commit/c651aa5d02ac33497c24f191cfbce81cd50d73b2))
+* fail-closed guards on reader/parser/IO error paths ([#451](https://github.com/fg-labs/bwa-mem3/issues/451)) ([c5dc86b](https://github.com/fg-labs/bwa-mem3/commit/c5dc86bbca815b9512686c978c563dbfb8769cfe))
+* **nt4:** guard signed-char high-bit bytes; unify the nt4 re-encoding idiom ([#456](https://github.com/fg-labs/bwa-mem3/issues/456)) ([0de026e](https://github.com/fg-labs/bwa-mem3/commit/0de026e8a848444827bfd38d71d112eec63e046b))
+* overflow / negative-size / OOM-false-positive guards ([#453](https://github.com/fg-labs/bwa-mem3/issues/453)) ([167f643](https://github.com/fg-labs/bwa-mem3/commit/167f643c330e72f961fee577ef1cd706cb93ae55))
+
+
+### Performance
+
+* **bam_rec_scratch:** grow scratch buffers geometrically; share the policy ([#455](https://github.com/fg-labs/bwa-mem3/issues/455)) ([de02336](https://github.com/fg-labs/bwa-mem3/commit/de0233633748a4022366c969b775d6ffe103693a))
+* **mem:** look-ahead prefetch of the next read/pair's CIGAR-emission reference window ([#452](https://github.com/fg-labs/bwa-mem3/issues/452)) ([eb0c8c1](https://github.com/fg-labs/bwa-mem3/commit/eb0c8c17d28d2f4fe11178b152a49a279da99c11))
+* **meth:** prune 3-letter over-seeding before SA resolution (~30% faster --meth) ([#441](https://github.com/fg-labs/bwa-mem3/issues/441)) ([f3048f0](https://github.com/fg-labs/bwa-mem3/commit/f3048f0b178f0cf0d63c4f6817fbae4dbcf60556))
+* **ref:** SIMD 2-bit-&gt;byte reference unpack (fwd+rev, all arches) + prefetch short-ext/mate-rescue fetches ([#448](https://github.com/fg-labs/bwa-mem3/issues/448)) ([6955c8e](https://github.com/fg-labs/bwa-mem3/commit/6955c8e86dcae7f2ea9cd1e89abbe73ae539ad72))
+
+
+### Documentation
+
+* correct source-doc comments; add fr_fastq CRLF-in-quality test case ([#450](https://github.com/fg-labs/bwa-mem3/issues/450)) ([8ab82b6](https://github.com/fg-labs/bwa-mem3/commit/8ab82b6c0d41448d4335f35acda308797ea279ae))
+* **equivalence:** drop an out-of-scope external cross-reference from the gap-from-M note ([#442](https://github.com/fg-labs/bwa-mem3/issues/442)) ([1a4a8bd](https://github.com/fg-labs/bwa-mem3/commit/1a4a8bd878ed140874ddb52090f31f6be2b87d4e))
+* neutralize internal tooling names in source comments ([#449](https://github.com/fg-labs/bwa-mem3/issues/449)) ([426ea8d](https://github.com/fg-labs/bwa-mem3/commit/426ea8dcc8a962a75dcd6c473d784889c387e5ed))
+* **readme:** update performance tables for v0.11.0 ([#443](https://github.com/fg-labs/bwa-mem3/issues/443)) ([bd42358](https://github.com/fg-labs/bwa-mem3/commit/bd423584fa114873d6bfa95d3812c19c4a0df649))
+
 ## [0.11.0](https://github.com/fg-labs/bwa-mem3/compare/v0.10.0...v0.11.0) (2026-09-01)
 
 
