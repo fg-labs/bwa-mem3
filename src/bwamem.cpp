@@ -4623,7 +4623,9 @@ mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *
         int clip5, clip3;
         clip5 = is_rev? l_query - qe : qb;
         clip3 = is_rev? qb : l_query - qe;
-        a.cigar = (uint32_t*) realloc(a.cigar, 4 * (a.n_cigar + 2) + l_MD);
+        uint32_t *cigar_new = (uint32_t*) realloc(a.cigar, 4 * (a.n_cigar + 2) + l_MD);
+        xassert(cigar_new != NULL, "out of memory: a.cigar");
+        a.cigar = cigar_new;
         if (clip5) {
             memmove(a.cigar+1, a.cigar, a.n_cigar * 4 + l_MD); // make room for 5'-end clipping
             a.cigar[0] = clip5<<4 | 3;
@@ -6118,7 +6120,17 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
 
     int srt_size = MAX_SEEDS_PER_READ, fac = FAC;
     uint64_t *srt = (uint64_t *) malloc(srt_size * 8);
-    uint32_t *srtgg = (uint32_t*) malloc(nseq * SEEDS_PER_READ * fac * sizeof(uint32_t));
+    xassert(srt != NULL, "out of memory: srt");
+    /* Per-read slot count for the srtgg seed-order buffer. A test-only build may
+     * shrink it (off by default, so production is byte-identical) to force the
+     * realloc-grow path below on ordinary input -- see test/srtgg_grow_test.sh. */
+#ifdef BWA_MEM3_DEBUG_SRTGG_TINY
+    const int seeds_per_read_eff = 1;
+#else
+    const int seeds_per_read_eff = SEEDS_PER_READ;
+#endif
+    uint32_t *srtgg = (uint32_t*) malloc(nseq * seeds_per_read_eff * fac * sizeof(uint32_t));
+    xassert(srtgg != NULL, "out of memory: srtgg");
 
     int spos = 0;
 
@@ -6139,7 +6151,6 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
         int max = 0;
         uint8_t *rseq = 0;
 
-        uint32_t *srtg = srtgg;
         lim_g[l+1] = 0;
 
         const uint8_t *query = (uint8_t *) seq_[l].seq;
@@ -6191,7 +6202,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
             int64_t tmp = 0;
             if (c->n == 0) continue;
 
-            _mm_prefetch((const char*) (srtg + spos + 64), _MM_HINT_NTA);
+            _mm_prefetch((const char*) (srtgg + spos + 64), _MM_HINT_NTA);
             _mm_prefetch((const char*) (lim_g), _MM_HINT_NTA);
 
             // get the max possible span
@@ -6242,7 +6253,9 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
             // assert(c->n < MAX_SEEDS_PER_READ);  // temp
             if (c->n > srt_size) {
                 srt_size = c->n + 10;
-                srt = (uint64_t *) realloc(srt, srt_size * 8);
+                uint64_t *srt_new = (uint64_t *) realloc(srt, srt_size * 8);
+                xassert(srt_new != NULL, "out of memory: srt");
+                srt = srt_new;
             }
 
             for (int i = 0; i < c->n; ++i)
@@ -6252,13 +6265,23 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
                 ks_introsort_64(c->n, srt);
 
             // assert((spos + c->n) < SEEDS_PER_READ * FAC * nseq);
-            if ((spos + c->n) > SEEDS_PER_READ * fac * nseq) {
-                fac <<= 1;
-                srtgg = (uint32_t *) realloc(srtgg, nseq * SEEDS_PER_READ * fac * sizeof(uint32_t));
+            if ((spos + c->n) > seeds_per_read_eff * fac * nseq) {
+                // c->n is not bounded by seeds_per_read_eff, so a single
+                // doubling of fac can still leave (spos + c->n) past the new
+                // capacity -- keep doubling until the requested prefix fits,
+                // then resize once to the final capacity.
+                do {
+                    fac <<= 1;
+                } while ((spos + c->n) > seeds_per_read_eff * fac * nseq);
+                uint32_t *srtgg_new = (uint32_t *) realloc(srtgg, nseq * seeds_per_read_eff * fac * sizeof(uint32_t));
+                // realloc may move the block; use srtgg directly everywhere (no
+                // aliasing local pointer to go stale). Fail closed on OOM.
+                xassert(srtgg_new != NULL, "out of memory: srtgg");
+                srtgg = srtgg_new;
             }
 
             for (int i = 0; i < c->n; ++i)
-                srtg[spos++] = srt[i];
+                srtgg[spos++] = srt[i];
 
             lim_g[l+1] += c->n;
 
@@ -6342,17 +6365,23 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
                         *wsize_pair +=  1024;
                         // assert(*wsize_pair > numPairsLeft);
                         *wsize_pair += numPairsLeft + 1024;
-                        seqPairArrayAux = (SeqPair *) realloc(seqPairArrayAux,
+                        SeqPair *seqPairArrayAux_new = (SeqPair *) realloc(seqPairArrayAux,
                                                               (*wsize_pair + MAX_LINE_LEN)
                                                               * sizeof(SeqPair));
+                        xassert(seqPairArrayAux_new != NULL, "out of memory: seqPairArrayAux");
+                        seqPairArrayAux = seqPairArrayAux_new;
                         mmc->seqPairArrayAux[tid] = seqPairArrayAux;
-                        seqPairArrayLeft128 = (SeqPair *) realloc(seqPairArrayLeft128,
+                        SeqPair *seqPairArrayLeft128_new = (SeqPair *) realloc(seqPairArrayLeft128,
                                                                   (*wsize_pair + MAX_LINE_LEN)
                                                                   * sizeof(SeqPair));
+                        xassert(seqPairArrayLeft128_new != NULL, "out of memory: seqPairArrayLeft128");
+                        seqPairArrayLeft128 = seqPairArrayLeft128_new;
                         mmc->seqPairArrayLeft128[tid] = seqPairArrayLeft128;
-                        seqPairArrayRight128 = (SeqPair *) realloc(seqPairArrayRight128,
+                        SeqPair *seqPairArrayRight128_new = (SeqPair *) realloc(seqPairArrayRight128,
                                                                    (*wsize_pair + MAX_LINE_LEN)
                                                                    * sizeof(SeqPair));
+                        xassert(seqPairArrayRight128_new != NULL, "out of memory: seqPairArrayRight128");
+                        seqPairArrayRight128 = seqPairArrayRight128_new;
                         mmc->seqPairArrayRight128[tid] = seqPairArrayRight128;
                     }
 
@@ -6577,17 +6606,23 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
                         *wsize_pair += 1024;
                         // assert(*wsize_pair > numPairsRight);
                         *wsize_pair += numPairsLeft + 1024;
-                        seqPairArrayAux = (SeqPair *) realloc(seqPairArrayAux,
+                        SeqPair *seqPairArrayAux_new = (SeqPair *) realloc(seqPairArrayAux,
                                                               (*wsize_pair + MAX_LINE_LEN)
                                                               * sizeof(SeqPair));
+                        xassert(seqPairArrayAux_new != NULL, "out of memory: seqPairArrayAux");
+                        seqPairArrayAux = seqPairArrayAux_new;
                         mmc->seqPairArrayAux[tid] = seqPairArrayAux;
-                        seqPairArrayLeft128 = (SeqPair *) realloc(seqPairArrayLeft128,
+                        SeqPair *seqPairArrayLeft128_new = (SeqPair *) realloc(seqPairArrayLeft128,
                                                                   (*wsize_pair + MAX_LINE_LEN)
                                                                   * sizeof(SeqPair));
+                        xassert(seqPairArrayLeft128_new != NULL, "out of memory: seqPairArrayLeft128");
+                        seqPairArrayLeft128 = seqPairArrayLeft128_new;
                         mmc->seqPairArrayLeft128[tid] = seqPairArrayLeft128;
-                        seqPairArrayRight128 = (SeqPair *) realloc(seqPairArrayRight128,
+                        SeqPair *seqPairArrayRight128_new = (SeqPair *) realloc(seqPairArrayRight128,
                                                                    (*wsize_pair + MAX_LINE_LEN)
                                                                    * sizeof(SeqPair));
+                        xassert(seqPairArrayRight128_new != NULL, "out of memory: seqPairArrayRight128");
+                        seqPairArrayRight128 = seqPairArrayRight128_new;
                         mmc->seqPairArrayRight128[tid] = seqPairArrayRight128;
                     }
 
