@@ -2399,7 +2399,7 @@ SMEM *mem_collect_smem(FMI_search *fmi, const mem_opt_t *opt,
 
         query_pos_ar[pos] = (end + start)>>1;
 
-        assert(query_pos_ar[pos] < len);
+        xassert(query_pos_ar[pos] < len, "seeding: re-seed position past the end of the read");
 
         min_intv_ar[pos] = p->s + 1;
         pos ++;
@@ -6742,7 +6742,8 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
                         *wsize_buf_qer = seqbuf_grow_capacity(tmp);
                         if (*wsize_buf_qer == SEQBUF_CAPACITY_OVERFLOW)
                             seqbuf_capacity_fatal("seqBufQer", __func__, tmp);
-                        assert(*wsize_buf_qer > leftQerOffset);
+                        xassert(*wsize_buf_qer >= leftQerOffset,
+                                "extension: left query window exceeds seqBufQer capacity after grow");
 
                         uint8_t *seqBufQer_ = (uint8_t*)
                             _mm_realloc(seqBufLeftQer, tmp, *wsize_buf_qer, sizeof(uint8_t));
@@ -6766,7 +6767,8 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
                         *wsize_buf_ref = seqbuf_grow_capacity(tmp);
                         if (*wsize_buf_ref == SEQBUF_CAPACITY_OVERFLOW)
                             seqbuf_capacity_fatal("seqBufRef", __func__, tmp);
-                        assert(*wsize_buf_ref > leftRefOffset);
+                        xassert(*wsize_buf_ref >= leftRefOffset,
+                                "extension: left reference window exceeds seqBufRef capacity after grow");
                         uint8_t *seqBufRef_ = (uint8_t*)
                             _mm_realloc(seqBufLeftRef, tmp, *wsize_buf_ref, sizeof(uint8_t));
                         mmc->seqBufLeftRef[tid*CACHE_LINE] = seqBufLeftRef = seqBufRef_;
@@ -6985,7 +6987,8 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
                         *wsize_buf_qer = seqbuf_grow_capacity(tmp);
                         if (*wsize_buf_qer == SEQBUF_CAPACITY_OVERFLOW)
                             seqbuf_capacity_fatal("seqBufQer", __func__, tmp);
-                        assert(*wsize_buf_qer > rightQerOffset);
+                        xassert(*wsize_buf_qer >= rightQerOffset,
+                                "extension: right query window exceeds seqBufQer capacity after grow");
 
                         uint8_t *seqBufQer_ = (uint8_t*)
                             _mm_realloc(seqBufLeftQer, tmp, *wsize_buf_qer, sizeof(uint8_t));
@@ -7005,7 +7008,8 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
                         *wsize_buf_ref = seqbuf_grow_capacity(tmp);
                         if (*wsize_buf_ref == SEQBUF_CAPACITY_OVERFLOW)
                             seqbuf_capacity_fatal("seqBufRef", __func__, tmp);
-                        assert(*wsize_buf_ref > rightRefOffset);
+                        xassert(*wsize_buf_ref >= rightRefOffset,
+                                "extension: right reference window exceeds seqBufRef capacity after grow");
                         uint8_t *seqBufRef_ = (uint8_t*)
                             _mm_realloc(seqBufLeftRef, tmp, *wsize_buf_ref, sizeof(uint8_t));
                         mmc->seqBufLeftRef[tid*CACHE_LINE] = seqBufLeftRef = seqBufRef_;
@@ -7859,7 +7863,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
     // allocator round-trip per call to this function. nseq is bounded by
     // kt_for's BATCH_SIZE-chunked work distribution (worker_bwt at the
     // call site) — assert it for future-proofing.
-    assert(nseq <= BATCH_SIZE);
+    xassert(nseq <= BATCH_SIZE, "extension: batch read count exceeds the stack lim[BATCH_SIZE] array");
     int lim[BATCH_SIZE] = {0};
 
     for (int l=0; l<nseq; l++)
