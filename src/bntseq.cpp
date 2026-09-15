@@ -448,6 +448,22 @@ void bns_build_pos2rid(bntseq_t *bns)
 	}
 }
 
+/* Read the [lo, hi] rid bracket the pos2rid table records for bucket `b`:
+ * bucket[b] is the last contig starting at or before this bucket's first
+ * position, bucket[b+1] the last one starting at or before the NEXT bucket's
+ * first position, so any pos_f inside bucket `b` resolves to some rid in
+ * [lo, hi]. lo == hi means no contig start falls inside the bucket window, so
+ * the whole window is rid == lo. This is the single reader of pos2rid_bucket[]
+ * shared by bns_pos2rid (which then narrows a non-empty bracket) and the
+ * bns_intv2rid fast path (which only needs the lo == hi shortcut), so the two
+ * cannot drift apart in how they decode the table. Requires a built table and
+ * 0 <= b <= n_buckets (the trailing bracket entry is filled, so b+1 is valid). */
+static inline void bns_bucket_bracket(const bntseq_t *bns, int64_t b, int *lo, int *hi)
+{
+	*lo = bns->pos2rid_bucket[b];
+	*hi = bns->pos2rid_bucket[b + 1];
+}
+
 int bns_pos2rid(const bntseq_t *bns, int64_t pos_f)
 {
 	if (pos_f >= bns->l_pac) return -1;
@@ -456,15 +472,11 @@ int bns_pos2rid(const bntseq_t *bns, int64_t pos_f)
 		// Negative pos_f clamps to bucket 0, matching the binary-search branch
 		// below (which returns rid 0 for any pos_f < anns[0].offset).
 		int64_t b = pos_f < 0? 0 : (pos_f >> BNS_POS2RID_SHIFT);
-		// bucket[b] is the last contig starting at or before this bucket's
-		// first position, so anns[bucket[b]].offset <= pos_f; bucket[b+1] is
-		// the last one starting at or before the NEXT bucket's first position,
-		// which pos_f is below. So the answer is bracketed by [lo, hi], and
-		// hi - lo is just the number of contig starts inside this bucket
-		// window. The common case (no contig starts inside the window) has
-		// lo == hi and returns without touching anns[] at all.
-		lo = bns->pos2rid_bucket[b];
-		hi = bns->pos2rid_bucket[b + 1];
+		// The answer is bracketed by [lo, hi] (see bns_bucket_bracket): hi - lo
+		// is the number of contig starts inside this bucket window, and the
+		// common case (no contig starts inside the window) has lo == hi and
+		// returns without touching anns[] at all.
+		bns_bucket_bracket(bns, b, &lo, &hi);
 		// Narrow to the largest rid with anns[rid].offset <= pos_f. This is
 		// the exact same predicate the binary search resolves, so the returned
 		// rid is byte-identical (including on-offset boundaries and, since
@@ -499,8 +511,34 @@ int bns_intv2rid(const bntseq_t *bns, int64_t rb, int64_t re)
 	int is_rev, rid_b, rid_e;
 	if (rb < bns->l_pac && re > bns->l_pac) return -2;
 	assert(rb <= re);
-	rid_b = bns_pos2rid(bns, bns_depos(bns, rb, &is_rev));
-	rid_e = rb < re? bns_pos2rid(bns, bns_depos(bns, re - 1, &is_rev)) : rid_b;
+	int64_t dpos_b = bns_depos(bns, rb, &is_rev);
+	if (rb >= re) // degenerate empty interval: single lookup (matches rid_e = rid_b)
+		return bns_pos2rid(bns, dpos_b);
+	int64_t dpos_e = bns_depos(bns, re - 1, &is_rev);
+	/* Single-bucket fast path (byte-identical): the two ends resolve to the same
+	 * rid iff they land in the same contig. When the pos2rid bucket table is
+	 * built and both depos'd ends fall in the SAME bucket whose bracket is empty
+	 * (no contig start inside the 16 kb window -- the overwhelmingly common case
+	 * for a short seed), that bracket's rid covers BOTH ends, so we return it
+	 * once without the second bns_pos2rid call or any anns[] access. bb == be
+	 * means both ends share one bracket, so bns_bucket_bracket(bb) -- the same
+	 * table read bns_pos2rid uses -- yields the answer for both. Every other case
+	 * (different bucket, a contig boundary inside the window, out-of-range, or
+	 * the unbuilt-table fallback) drops to the exact original two-call form, so
+	 * the returned rid is unchanged. */
+	if (bns->pos2rid_bucket != NULL
+	    && dpos_b >= 0 && dpos_b < bns->l_pac
+	    && dpos_e >= 0 && dpos_e < bns->l_pac) {
+		int64_t bb = dpos_b >> BNS_POS2RID_SHIFT;
+		int64_t be = dpos_e >> BNS_POS2RID_SHIFT;
+		if (bb == be) {
+			int lo, hi;
+			bns_bucket_bracket(bns, bb, &lo, &hi);
+			if (lo == hi) return lo; // empty bracket: both ends are rid == lo
+		}
+	}
+	rid_b = bns_pos2rid(bns, dpos_b);
+	rid_e = bns_pos2rid(bns, dpos_e);
 	return rid_b == rid_e? rid_b : -1;
 }
 

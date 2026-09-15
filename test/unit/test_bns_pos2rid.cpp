@@ -20,6 +20,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -194,4 +195,160 @@ TEST_CASE("bns_build_pos2rid: is idempotent") {
     int32_t *first = fake.bns.pos2rid_bucket;
     bns_build_pos2rid(&fake.bns);
     CHECK(fake.bns.pos2rid_bucket == first); // second call must not reallocate
+}
+
+// --- bns_intv2rid --------------------------------------------------------
+//
+// bns_intv2rid maps a packed interval [rb, re) to the single contig covering
+// it, or a sentinel: -2 when the interval straddles the forward/reverse split,
+// -1 when the two ends fall in different contigs. It has a single-bucket fast
+// path that, when both depos'd ends land in one bucket whose bracket is empty,
+// returns that rid without a second bns_pos2rid call. That fast path must be
+// byte-identical to the two-call form; these tests pin it against an INDEPENDENT
+// linear oracle (never the bucket table) and cross-check the table-built path
+// against the table-NULL path on the same bns.
+
+namespace {
+
+/* bns_pos2rid's contract expressed via the linear reference: out-of-range -> -1,
+ * negative clamps to rid 0 (which expected_rid already returns). */
+int oracle_pos2rid(const FakeBns &fake, int64_t pos_f) {
+    if (pos_f >= fake.bns.l_pac) return -1;
+    return fake.expected_rid(pos_f);
+}
+
+/* Independent bns_intv2rid oracle: mirrors the documented contract using only
+ * bns_depos (a pure coordinate flip) and the linear expected_rid, so it shares
+ * no code path -- and hence no bug -- with the bucket fast path under test. */
+int oracle_intv2rid(const FakeBns &fake, int64_t rb, int64_t re) {
+    const int64_t l_pac = fake.bns.l_pac;
+    if (rb < l_pac && re > l_pac) return -2; // straddles the forward/reverse split
+    int is_rev;
+    const int rid_b = oracle_pos2rid(fake, bns_depos(&fake.bns, rb, &is_rev));
+    if (rb >= re) return rid_b;              // degenerate empty interval
+    const int rid_e = oracle_pos2rid(fake, bns_depos(&fake.bns, re - 1, &is_rev));
+    return rid_b == rid_e ? rid_b : -1;
+}
+
+/* rb anchors worth probing: a capped set of contig boundaries and bucket
+ * boundaries (and their neighbours), the genome ends, and the reverse-strand
+ * mirror of each so both the forward and the depos'd reverse path are hit. The
+ * cap keeps the sweep under the ~100 ms unit budget even on the dense layout. */
+std::vector<int64_t> interval_anchors(const FakeBns &fake) {
+    const int64_t l_pac = fake.bns.l_pac;
+    std::vector<int64_t> a;
+    const int n = fake.bns.n_seqs;
+    const int step = n > 64 ? n / 64 : 1; // sample ~64 contigs regardless of density
+    for (int i = 0; i < n; i += step) {
+        const int64_t s = fake.anns[i].offset;
+        for (int64_t p : {s - 1, s, s + 1}) if (p >= 0 && p < l_pac) a.push_back(p);
+    }
+    for (int64_t b = 0; b * kBucketWidth < l_pac && b < 64; ++b) {
+        const int64_t p = b * kBucketWidth;
+        for (int64_t q : {p - 1, p, p + 1}) if (q >= 0 && q < l_pac) a.push_back(q);
+    }
+    a.push_back(0);
+    a.push_back(l_pac - 1);
+    const size_t fwd = a.size();
+    for (size_t i = 0; i < fwd; ++i) a.push_back(2 * l_pac - 1 - a[i]); // reverse mirror
+    return a;
+}
+
+/* For every (rb, re) in the anchor x delta grid, assert the table-NULL fallback
+ * and the table-built fast path both equal the independent oracle AND each
+ * other -- the operative byte-identity bar, checked directly instead of via
+ * end-to-end alignment output. */
+void check_intervals(FakeBns &fake) {
+    const int64_t l_pac = fake.bns.l_pac;
+    const std::vector<int64_t> anchors = interval_anchors(fake);
+    const int64_t deltas[] = {0, 1, 2, 7, kBucketWidth - 1, kBucketWidth,
+                              kBucketWidth + 1, 2 * kBucketWidth, l_pac};
+
+    std::vector<std::pair<int64_t, int64_t>> intervals;
+    std::vector<int> expected;
+    for (int64_t rb : anchors) {
+        for (int64_t d : deltas) {
+            const int64_t re = rb + d;    // d >= 0, so rb <= re (impl asserts this)
+            if (re > 2 * l_pac) continue; // stay within the packed range
+            intervals.emplace_back(rb, re);
+            expected.push_back(oracle_intv2rid(fake, rb, re));
+        }
+    }
+
+    REQUIRE(fake.bns.pos2rid_bucket == NULL); // FakeBns starts with no table
+    std::vector<int> via_fallback;
+    via_fallback.reserve(intervals.size());
+    for (size_t i = 0; i < intervals.size(); ++i) {
+        CAPTURE(intervals[i].first);
+        CAPTURE(intervals[i].second);
+        const int got = bns_intv2rid(&fake.bns, intervals[i].first, intervals[i].second);
+        CHECK(got == expected[i]);
+        via_fallback.push_back(got);
+    }
+
+    bns_build_pos2rid(&fake.bns);
+    REQUIRE(fake.bns.pos2rid_bucket != NULL);
+    for (size_t i = 0; i < intervals.size(); ++i) {
+        CAPTURE(intervals[i].first);
+        CAPTURE(intervals[i].second);
+        const int got = bns_intv2rid(&fake.bns, intervals[i].first, intervals[i].second);
+        CHECK(got == expected[i]);       // fast path == independent oracle
+        CHECK(got == via_fallback[i]);   // fast path == original two-call form
+    }
+}
+
+} // namespace
+
+TEST_CASE("bns_intv2rid: fast path matches the oracle across layouts"
+          * doctest::test_suite("unit/bns_pos2rid")) {
+    // Each layout only changes the FakeBns contig geometry before running the
+    // same anchor x delta sweep in check_intervals(), so they are SUBCASEs of a
+    // single parameterized case rather than separate TEST_CASEs.
+    SUBCASE("sparse layout (empty-bracket fast path fires)") {
+        // Contigs much wider than a bucket: most buckets have an empty bracket,
+        // so the single-bucket short-circuit is the path actually exercised.
+        FakeBns fake(uniform_contigs(64, kBucketWidth * 7 + 123));
+        check_intervals(fake);
+    }
+
+    SUBCASE("dense layout (many contig starts per bucket)") {
+        FakeBns fake(uniform_contigs(4096, 8));
+        check_intervals(fake);
+    }
+
+    SUBCASE("contig starts on bucket boundaries") {
+        FakeBns fake(uniform_contigs(32, kBucketWidth));
+        check_intervals(fake);
+    }
+
+    SUBCASE("ragged contig widths straddling bucket boundaries") {
+        std::vector<int64_t> lengths;
+        for (int i = 0; i < 200; ++i)
+            lengths.push_back(1 + (int64_t)((i * 2654435761u) % (kBucketWidth * 2)));
+        FakeBns fake(lengths);
+        check_intervals(fake);
+    }
+
+    SUBCASE("single contig") {
+        FakeBns fake(uniform_contigs(1, kBucketWidth * 3));
+        check_intervals(fake);
+    }
+}
+
+TEST_CASE("bns_intv2rid: named edge cases on a small multi-contig layout"
+          * doctest::test_suite("unit/bns_pos2rid")) {
+    // rid0 [0,100), rid1 [100,250), rid2 [250,300); l_pac = 300.
+    FakeBns fake(std::vector<int64_t>{100, 150, 50});
+    const int64_t l_pac = fake.bns.l_pac;
+    REQUIRE(l_pac == 300);
+    bns_build_pos2rid(&fake.bns);
+
+    CHECK(bns_intv2rid(&fake.bns, 10, 50) == 0);   // wholly inside one contig
+    CHECK(bns_intv2rid(&fake.bns, 120, 200) == 1);
+    CHECK(bns_intv2rid(&fake.bns, 90, 110) == -1); // spans a contig boundary
+    CHECK(bns_intv2rid(&fake.bns, 120, 120) == 1); // degenerate empty interval
+    CHECK(bns_intv2rid(&fake.bns, 100, 101) == 1); // single base at a contig start
+    CHECK(bns_intv2rid(&fake.bns, 50, l_pac + 10) == -2); // straddles f/r split
+    // Reverse-strand interval inside rid2's forward span [250,300).
+    CHECK(bns_intv2rid(&fake.bns, 2 * l_pac - 300, 2 * l_pac - 250) == 2);
 }
