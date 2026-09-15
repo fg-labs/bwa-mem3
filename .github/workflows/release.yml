@@ -156,7 +156,7 @@ jobs:
           codename="${VERSION_CODENAME:-$(lsb_release -cs)}"
           # LLVM's published apt archive signing key fingerprint.
           expected_fpr="6084F3CF814B57C1CF12EFD515CF4D18AF4F7421"
-          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key -o /tmp/llvm-snapshot.gpg.key
+          curl --retry 3 --retry-delay 2 --retry-all-errors -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key -o /tmp/llvm-snapshot.gpg.key
           got_fpr="$(gpg --show-keys --with-colons --with-fingerprint /tmp/llvm-snapshot.gpg.key \
             | awk -F: '/^fpr:/ {print $10; exit}')"
           if [ "$got_fpr" != "$expected_fpr" ]; then

@@ -107,13 +107,13 @@ jobs:
           set -euo pipefail
           mkdir -p "$HOME/.local/bin"
 
-          curl -fsSL -o /tmp/shellcheck.tar.xz \
+          curl --retry 3 --retry-delay 2 --retry-all-errors -fsSL -o /tmp/shellcheck.tar.xz \
             "https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/shellcheck-v${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
           echo "${SHELLCHECK_SHA256}  /tmp/shellcheck.tar.xz" | sha256sum -c -
           tar -xJf /tmp/shellcheck.tar.xz -C /tmp
           install -m 0755 "/tmp/shellcheck-v${SHELLCHECK_VERSION}/shellcheck" "$HOME/.local/bin/shellcheck"
 
-          curl -fsSL -o /tmp/shfmt \
+          curl --retry 3 --retry-delay 2 --retry-all-errors -fsSL -o /tmp/shfmt \
             "https://github.com/mvdan/sh/releases/download/${SHFMT_VERSION}/shfmt_${SHFMT_VERSION}_linux_amd64"
           echo "${SHFMT_SHA256}  /tmp/shfmt" | sha256sum -c -
           install -m 0755 /tmp/shfmt "$HOME/.local/bin/shfmt"
@@ -328,7 +328,7 @@ jobs:
           codename="${VERSION_CODENAME:-$(lsb_release -cs)}"
           # LLVM's published apt archive signing key fingerprint.
           expected_fpr="6084F3CF814B57C1CF12EFD515CF4D18AF4F7421"
-          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key -o /tmp/llvm-snapshot.gpg.key
+          curl --retry 3 --retry-delay 2 --retry-all-errors -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key -o /tmp/llvm-snapshot.gpg.key
           got_fpr="$(gpg --show-keys --with-colons --with-fingerprint /tmp/llvm-snapshot.gpg.key \
             | awk -F: '/^fpr:/ {print $10; exit}')"
           if [ "$got_fpr" != "$expected_fpr" ]; then
@@ -1485,7 +1485,7 @@ jobs:
           . /etc/os-release
           codename="${VERSION_CODENAME:-$(lsb_release -cs)}"
           expected_fpr="6084F3CF814B57C1CF12EFD515CF4D18AF4F7421"
-          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key -o /tmp/llvm-snapshot.gpg.key
+          curl --retry 3 --retry-delay 2 --retry-all-errors -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key -o /tmp/llvm-snapshot.gpg.key
           got_fpr="$(gpg --show-keys --with-colons --with-fingerprint /tmp/llvm-snapshot.gpg.key \
             | awk -F: '/^fpr:/ {print $10; exit}')"
           if [ "$got_fpr" != "$expected_fpr" ]; then

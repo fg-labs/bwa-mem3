@@ -115,7 +115,7 @@ jobs:
         if: steps.cache-chr17.outputs.cache-hit != 'true'
         run: |
           mkdir -p /tmp/ci-data
-          curl -sL "$CHR17_URL" -o /tmp/ci-data/chr17.fa.gz
+          curl --fail --retry 3 --retry-delay 2 --retry-all-errors -sL "$CHR17_URL" -o /tmp/ci-data/chr17.fa.gz
           got_sha256="$(sha256sum /tmp/ci-data/chr17.fa.gz | awk '{print $1}')"
           if [ "$got_sha256" != "$CHR17_SHA256" ]; then
             echo "chr17.fa.gz sha256 mismatch: expected $CHR17_SHA256, got $got_sha256"
