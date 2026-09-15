@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.12.1](https://github.com/fg-labs/bwa-mem3/compare/v0.12.0...v0.12.1) (2026-09-15)
+
+
+### Performance
+
+* **bns:** single-bucket fast path in bns_intv2rid (byte-identical) ([#508](https://github.com/fg-labs/bwa-mem3/issues/508)) ([c4fcd87](https://github.com/fg-labs/bwa-mem3/commit/c4fcd87f87f3631ad2862d86643d04bbbab48206))
+
+
+### Documentation
+
+* **readme:** update performance tables for v0.12.0 ([#506](https://github.com/fg-labs/bwa-mem3/issues/506)) ([54abbea](https://github.com/fg-labs/bwa-mem3/commit/54abbea98c926d79f961405eb05a416bb7a71ec1))
+
 ## [0.12.0](https://github.com/fg-labs/bwa-mem3/compare/v0.11.0...v0.12.0) (2026-09-13)
 
 
