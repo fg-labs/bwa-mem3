@@ -467,6 +467,85 @@ void FMI_search::load_index_from_shm(uint8_t *base, size_t len)
             (long)reference_seq_len, (long)sentinel_index);
 }
 
+void FMI_search::densify_sa_into(const CP_OCC *cp_occ_src, const int64_t count_src[5],
+                                 int64_t ref_seq_len, int64_t sentinel_idx,
+                                 const int8_t *src_ms, const uint32_t *src_ls,
+                                 int64_t src_compx,
+                                 int8_t *dst_ms, uint32_t *dst_ls, int64_t dst_compx,
+                                 int n_threads)
+{
+    /* Stride validity: the resolver reads a sample at (row >> sa_compx), so a
+     * denser destination (smaller shift) is required for this to add samples,
+     * and both shifts must be in the writer-enforced [0,6] range (the sample
+     * period 1<<compx must divide CP_BLOCK_SIZE=64). */
+    if (!(dst_compx >= 0 && dst_compx < src_compx && src_compx <= 6)) {
+        fprintf(stderr,
+            "ERROR! densify_sa_into: invalid strides (dst=%lld src=%lld)\n",
+            (long long)dst_compx, (long long)src_compx);
+        exit(EXIT_FAILURE);
+    }
+
+    /* This borrows the object's own index-state members (cp_occ/sa_*) and clears
+     * them before return, so it must only be called on a fresh FMI_search that
+     * owns no loaded buffers -- otherwise those buffers would leak. Both current
+     * callers (bwa_shm_pack_into, main_resa) pass a freshly-constructed object;
+     * guard the precondition so a future caller on a loaded index fails loudly. */
+    xassert(cp_occ == NULL && sa_ms_byte == NULL && sa_ls_word == NULL,
+            "densify_sa_into called on an FMI_search with loaded index buffers");
+
+    /* Borrow the source index state so get_sa_entry_compressed() resolves any
+     * BWT row against the SOURCE samples (its walk terminates on the source
+     * mask). These members are cleared before return; nothing here is owned. */
+    reference_seq_len = ref_seq_len;
+    sentinel_index    = sentinel_idx;
+    memcpy(count, count_src, sizeof(int64_t) * 5);
+    cp_occ        = const_cast<CP_OCC *>(cp_occ_src);
+    sa_ms_byte    = const_cast<int8_t *>(src_ms);
+    sa_ls_word    = const_cast<uint32_t *>(src_ls);
+    sa_compx      = src_compx;
+    sa_compx_mask = (1LL << src_compx) - 1;
+
+    const int64_t src_mask = (1LL << src_compx) - 1;
+    const int64_t dst_count = (ref_seq_len >> dst_compx) + 1;
+    const int T = (n_threads > 1) ? n_threads : 1;
+
+    /* For each destination sample slot j, its BWT row is row = j << dst_compx.
+     * If that row is already a SOURCE-sampled row (row & src_mask == 0), copy
+     * the stored value verbatim — the source and destination tables must agree
+     * bit-for-bit on shared rows. Otherwise recover it by the resolver's own
+     * LF-walk against the source stride.
+     *
+     * Parallel-safe: each iteration reads only shared, immutable index state
+     * (cp_occ / count / sa_*_byte / masks via get_sa_entry_compressed) and
+     * writes disjoint dst_ms[j]/dst_ls[j] slots — no shared mutable state, so
+     * no locking. schedule(dynamic) balances the uneven per-row walk lengths
+     * (already-sampled rows are O(1); added rows walk up to 2^src_compx-1
+     * LF steps). Output is independent of thread count and scheduling. */
+#ifdef _OPENMP
+    #pragma omp parallel for num_threads(T) schedule(dynamic, 4096)
+#else
+    (void)T;
+#endif
+    for (int64_t j = 0; j < dst_count; ++j) {
+        const int64_t row = j << dst_compx;
+        int64_t v;
+        if ((row & src_mask) == 0) {
+            const int64_t s = row >> src_compx;
+            v = ((int64_t)src_ms[s] << 32) + (int64_t)src_ls[s];
+        } else {
+            v = get_sa_entry_compressed(row, /*tid=*/0);
+        }
+        dst_ms[j] = (int8_t)((v >> 32) & 0xff);
+        dst_ls[j] = (uint32_t)(v & 0xffffffffULL);
+    }
+
+    /* Drop the borrowed pointers so ~FMI_search() frees nothing (they alias
+     * the caller's shm buffer / heap temporaries). */
+    cp_occ     = NULL;
+    sa_ms_byte = NULL;
+    sa_ls_word = NULL;
+}
+
 int FMI_search::build_index(bool emit_unpacked_ref, int sa_compx) {
 
     char *prefix = file_name;

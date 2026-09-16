@@ -1390,7 +1390,7 @@ clean: pgo-clean profile-clean lto-clean
 #   - the `SIMD floor:` / `SIMD runtime:` lines (vary by build arch and host
 #     CPU: avx2/avx512bw on x86, neon on arm64).
 # Any future host-dependent line must be added here too.
-DOCS_CLI_SUBCMDS := index mem shm version
+DOCS_CLI_SUBCMDS := index mem shm re-sa version
 
 docs:
 	cd docs && mdbook build

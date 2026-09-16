@@ -52,6 +52,7 @@ int usage()
     fprintf(stderr, "  index         create index (add --meth to build a bwameth-style doubled c2t reference)\n");
     fprintf(stderr, "  mem           alignment (add --meth for bisulfite-seq: inline c2t + BAM output)\n");
     fprintf(stderr, "  shm           load/list/drop the index in POSIX shared memory\n");
+    fprintf(stderr, "  re-sa         resample an existing index's on-disk SA table to a new rate\n");
     fprintf(stderr, "  version       print version number\n");
     fprintf(stderr, "Run `bwa-mem3 <command> --help` for command-specific options.\n");
     return 1;
@@ -378,6 +379,10 @@ int main(int argc, char* argv[])
     else if (strcmp(argv[1], "shm") == 0)
     {
         return main_shm(argc - 1, argv + 1);
+    }
+    else if (strcmp(argv[1], "re-sa") == 0)
+    {
+        return main_resa(argc - 1, argv + 1);
     }
     else {
         fprintf(stderr, "ERROR: unknown command '%s'\n", argv[1]);

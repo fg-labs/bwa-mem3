@@ -78,6 +78,25 @@ Scratch directory for intermediate files. Defaults to `$TMPDIR`. The builder
 stages a doubled `.pac` here during construction, so point this at a fast local
 disk (NVMe or ramdisk) with room for ~2 bits per base of doubled text.
 
+### `-u INT` — SA sample rate
+
+Sets the suffix-array (SA) sample rate to `1 / (1 << INT)`, i.e. one stored
+sample per `1 << INT` BWT rows. The default is `3` (one row in 8), which
+reproduces the historical bwa-mem2 rate. `INT` must be in `[0, 6]`.
+
+SA resolution walks back (LF-mapping) to the nearest stored sample and adds the
+step count, so a **denser** table (smaller `INT`) means fewer steps per resolve
+— faster alignment — at the cost of a larger index and more resident memory; a
+**coarser** table (larger `INT`) trades resolve speed for a smaller index. Most
+users should leave this at the default and only change it if profiling shows SA
+resolution is a bottleneck.
+
+You do not have to rebuild from FASTA to change the rate later: the
+[`re-sa`](re-sa.md#-u-int--target-sa-sample-rate-shift) command
+resamples an existing index's SA table in place, producing a result
+byte-identical to `index -u` at the target rate. `--meth` does not accept `-u`
+(the seed index's SA rate is fixed).
+
 ### `--emit-unpacked-ref` — also write `<prefix>.0123`
 
 Off by default. `bwa-mem3 mem` reconstructs reference bases from the packed
@@ -138,5 +157,6 @@ the `.meth` seed index is located automatically when `--meth` is present.
 [User Guide — Indexing the reference](../user-guide/indexing.md) ·
 [CLI Reference — mem](mem.md) ·
 [CLI Reference — shm](shm.md) ·
+[CLI Reference — re-sa](re-sa.md) ·
 [Getting Started — Quick start: methylation alignment](../getting-started/quick-meth.md) ·
 [Methylation Reference — Overview](../methylation/overview.md)

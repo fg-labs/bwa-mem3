@@ -1,11 +1,23 @@
 
-Usage: bwa-mem3 shm [-d|-l|--help] [--meth] [idxbase]
+Usage: bwa-mem3 shm [-d|-l|--help] [--meth] [-u INT] [-t INT] [idxbase]
 
 Options:
   -d        destroy all indices in shared memory (matches bwa v1 behavior)
   -l        list names of indices in shared memory
   --meth    stage a `bwa-mem3 index --meth` index — auto-appends
             `.meth` to <idxbase>, mirroring `mem --meth`
+  -u INT    densify the staged SA sample table to sample-rate shift INT
+            (in [0,6]) when it is denser than the on-disk rate. Trades a
+            one-time staging cost + extra shared memory for faster SA
+            resolution at `mem` time, WITHOUT rebuilding the on-disk
+            index. e.g. `-u 2` stages a stride-4 table from a stock
+            stride-8 (default) index. A value >= the disk rate is a
+            no-op (warns). Output is byte-identical either way.
+  -t, --threads INT
+            worker threads for the -u densify pass (default 1). The
+            per-sample walks are independent, so this scales near-
+            linearly; has no effect unless -u actually densifies (a
+            target denser than the on-disk rate).
   -h --help print this help and exit
 
 Stage with no flags: `bwa-mem3 shm <idxbase>` loads the index into
