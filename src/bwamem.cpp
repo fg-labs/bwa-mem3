@@ -7313,6 +7313,14 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
     // tprof[MEM_ALN2_UP][tid] += __rdtsc() - timUP;
 
 
+    /* C3b-1: the Pass-2 extension scoring block (sort + per-tier band ladders,
+     * LEFT then RIGHT, scattering results into av_v[sp->seqid].a[sp->regid]) is
+     * wrapped in a [&] lambda so it can run a SECOND time on the guarded
+     * two-wave deferred survivors (C3b-2) with zero signature plumbing -- the
+     * capture sees every staging local. Scoring scatters by (seqid,regid), so a
+     * second batch of re-staged pairs lands in the right alnregs. Invoked once
+     * here (the main batch); byte-identical to the prior inline block. */
+    auto run_extension_batch = [&]() {
     int32_t *hist = (int32_t *)_mm_malloc((MAX_SEQ_LEN8 + MAX_SEQ_LEN16 + 32) *
                                           sizeof(int32_t), 64);
 
@@ -8016,6 +8024,9 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
     }
 
     _mm_free(hist);
+    };  /* end run_extension_batch lambda */
+    run_extension_batch();
+
     // tprof[CRIGHT][tid] += __rdtsc() - timR;
 
     if (numPairsLeft >= *wsize_pair || numPairsRight >= *wsize_pair)
