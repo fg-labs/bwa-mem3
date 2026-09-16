@@ -356,6 +356,43 @@ duplicate pairs normally (no work is skipped) and asserts each duplicate's
 alignment regions match its representative's field-by-field, aborting on any
 divergence — the position-invariance guarantee, checked on real data.
 
+## `--ks-dedup` cross-read SA-interval deduplication
+
+`--ks-dedup STR` resolves each **distinct suffix-array interval** `(k, s)` once per
+SA-resolve chunk and copies the resolved coordinates to every read that repeats
+it, instead of re-walking the FM-index (the LF-walks) for each occurrence. SA
+resolution is a pure function of `(k, s, max_occ)` — an interval always expands to
+the same coordinates in the same order — so different reads in one chunk that carry
+the same `(k, s)` (shared repeats and common k-mers) resolve identically. Where
+`--dedup` collapses identical *extension jobs* and `--dedup-reads` collapses
+identical *read-pairs*, this collapses identical *SA-interval walks*, a lower-level
+slice on the seeding side. Like both siblings it preserves **byte-identical
+alignment records in every mode**: a duplicate interval would have produced exactly
+these coordinates in exactly this order, so copying the representative's slot-run is
+a by-construction identity, verified by an in-repo regression
+(`test/regression/ks_dedup_byte_identity.sh`) that asserts `off`==`on`==`auto` on a
+dup-rich and a low-dup fixture, single- and multi-threaded, on the canonical
+`Linux x86_64 AVX2` CI row — not a cross-host or cross-tier measurement. It accepts
+three values:
+
+- `off` — always walk every interval (the pre-feature behavior).
+- `on` — always dedup identical `(k, s)` intervals within each SA-resolve chunk.
+- `auto` — **the default**: measure the net benefit at runtime (the per-chunk
+  bookkeeping and copy versus the LF-walk time removed, at the chunk's measured
+  per-position resolve rate), latch ON or OFF from the measured sign, and
+  periodically re-probe. Because the default is `auto`, dedup can run without any
+  flag; alignment records stay byte-identical either way.
+
+Any value other than `off`/`on`/`auto` — including an empty `--ks-dedup=` — is
+rejected with a non-zero exit; there is no silent fallback. An explicit `--ks-dedup`
+value takes precedence over `BWA3_KS_DEDUP`. Three expert env knobs tune the `auto`
+controller (env-only, full-string parsed, malformed values fatal): `BWA3_KS_DEDUP`
+(override the mode), `BWA3_KS_DEDUP_Z` (z-score latch threshold, a number `> 0`;
+reversing an existing latch needs a higher bar, `BWA3_KS_DEDUP_Z + 1`, so noise near
+break-even cannot flap the decision), and `BWA3_KS_DEDUP_REPROBE` (re-probe cadence
+in resolved positions; `0` disables re-probing). `BWA3_KS_DEDUP_STATS=1` dumps the
+distinct-vs-total resolved-position counts and the saved fraction at exit.
+
 ## `--min-ext-len` short-seed extension filter
 
 `--min-ext-len INT` opts into skipping banded Smith-Waterman extension of short
@@ -582,6 +619,7 @@ and the shared-knob rule live in [Equivalence](equivalence.md) and [Alignment mo
 | `--smem-dedup` SMEM deduplication | [#187](https://github.com/fg-labs/bwa-mem3/pull/187) | — | fork-only (opt-in, not byte-identical) |
 | `--dedup` extension-DP job deduplication | [#415](https://github.com/fg-labs/bwa-mem3/pull/415) | — | fork-only (on by default via `auto`; alignment records byte-identical in every mode; headers excluded) |
 | `--dedup-reads` whole-read-pair memoization | [#433](https://github.com/fg-labs/bwa-mem3/pull/433) | — | fork-only (on by default via `auto`; alignment records byte-identical in every mode; collapses duplicate read-pairs within a `-K` chunk) |
+| `--ks-dedup` cross-read SA-interval deduplication | [#511](https://github.com/fg-labs/bwa-mem3/pull/511) | — | fork-only (on by default via `auto`; alignment records byte-identical in every mode; resolves each distinct `(k,s)` suffix-array interval once per SA-resolve chunk) |
 | `--min-ext-len` short-seed extension filter | _pending_ | — | fork-only (opt-in, off by default) |
 | `--rescue-skip[=true\|false]` drop hopeless mate rescues | [#349](https://github.com/fg-labs/bwa-mem3/pull/349), [#472](https://github.com/fg-labs/bwa-mem3/pull/472) | — | fork-only (opt-in, off by default; not byte-identical when enabled; `=false` opt-out requires no `--rescue-kmer`) |
 | `--seed-order` seed reordering | [#186](https://github.com/fg-labs/bwa-mem3/pull/186) | — | fork-only (opt-in, off by default) |

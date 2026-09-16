@@ -84,7 +84,12 @@ const int64_t *fmi_seed_count(const FmiSeed *h);              /* count_data() */
 int64_t        fmi_seed_sentinel(const FmiSeed *h);           /* sentinel_index */
 /* get_sa_entries_prefetch(). max_occ <= 0 is a safe no-op (resolves nothing,
  * does not forward to FMI_search): the underlying implementation divides by
- * max_occ for any SMEM with s > max_occ. */
+ * max_occ for any SMEM with s > max_occ.
+ * *id is accumulated (+=) with the number of resolved coordinates staged into
+ * coords -- i.e. sum(min(s, max_occ)) over the n SMEMs. This is invariant to
+ * the internal (k,s) dedup mode: cross-read duplicate intervals skip their
+ * LF-walks but still occupy their coordinate slots, so *id never shrinks when
+ * dedup engages. */
 void           fmi_seed_sa_prefetch(FmiSeed *h, SMEM *smems, int64_t *coords,
                     int64_t *coord_counts, int64_t n, int32_t max_occ,
                     int tid, int64_t *id);

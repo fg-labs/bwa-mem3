@@ -34,6 +34,11 @@ Authors: Sanchit Misra <sanchit.misra@intel.com>; Vasimuddin Md <vasimuddin.md@i
 #include <climits>
 #include <cstring>
 #include <vector>
+#include <atomic>         /* BWA3_KS_DEDUP stats counters + auto-controller state */
+#include <algorithm>      /* std::fill for the ks-dedup slot table */
+#include <chrono>         /* ks-dedup auto controller: per-chunk net timing */
+#include <mutex>          /* ks-dedup auto controller: pooled Welford + once_flag */
+#include <cmath>          /* sqrt/fabs/isfinite for the net-cycles z-test + parse */
 #include <cstdarg>
 #include <pthread.h>
 #include <unistd.h>       /* pread, _exit */
@@ -2368,11 +2373,297 @@ struct SaPrefetchScratch {
 };
 } // namespace
 
+/* ---------------------------------------------------------------------------
+ * Cross-read SMEM-interval (k,s) dedup (BWA3_KS_DEDUP).
+ *
+ * SA resolution is a pure function of (k, s, max_occ): an interval always
+ * expands to the same coordinate sub-sequence (positions k, k+step, ... with
+ * step=(s>max_occ)?s/max_occ:1, capped at min(s,max_occ)) and resolves to the
+ * same coordinates. Different reads in the same SA-resolve chunk frequently
+ * carry the SAME (k,s) (shared repeats / common k-mers; measured 17-28% dup).
+ * So within a chunk we resolve each distinct (k,s) once (the "rep") and memcpy
+ * its resolved slot-run to every duplicate's slot-run -- byte-identical, and
+ * skipping the duplicate LF-walks is the whole saving.
+ *
+ * Modes: 'off' (never), 'on' (always, count>1), 'auto' (default). 'auto' is a
+ * net-cycles adaptive controller (mirroring the shipped extension-DP job dedup
+ * in read_memo.cpp): because the SA-resolve share is small, dedup bookkeeping
+ * must cost less than the LF-walks it removes, so 'auto' MEASURES that trade
+ * per chunk and latches ON/OFF from the observed net rather than a dup-rate
+ * threshold. A plain on/off knob and optional stats remain available via
+ * --ks-dedup / BWA3_KS_DEDUP_STATS. Alignment output is byte-identical in every
+ * mode -- the flag only trades duplicate LF-walks for a per-chunk (k,s) dedup.
+ * ------------------------------------------------------------------------- */
+/* ---- mode + config (mirrors mem_dedup_configure / --dedup, bwamem.cpp) ---- */
+enum { KS_DEDUP_OFF = 0, KS_DEDUP_ON = 1, KS_DEDUP_AUTO = 2 };
+
+static int ks_parse_dedup_mode(const char *e)
+{
+    if (!strcmp(e, "0") || !strcmp(e, "off"))                 return KS_DEDUP_OFF;
+    if (!strcmp(e, "1") || !strcmp(e, "on"))                  return KS_DEDUP_ON;
+    if (!strcmp(e, "auto") || !strcmp(e, "2"))                return KS_DEDUP_AUTO;
+    return -1;
+}
+
+/* mode -1 = unresolved (only valid before ks_dedup_configure() has run once);
+ * every reader goes through ks_dedup_cfg(), which lazily resolves from env/
+ * defaults if some entry point (unit binaries, library use) never called it. */
+struct KsDedupCfg { int mode; double z; int64_t reprobe_positions; };
+static KsDedupCfg g_ks_cfg = { -1, 2.0, 200000000 };   /* mode -1 = unresolved */
+
+/* CLI(--ks-dedup) > env BWA3_KS_DEDUP > default 'auto'; fatal on a bad value.
+ * Declared in FMI_search.h and called once from fastmap.cpp after getopt.
+ * Mirrors mem_dedup_configure: a non-empty CLI value wins outright; otherwise
+ * consult the env, distinguishing "unset" (default) from "set but empty" (an
+ * explicit misconfiguration -> fatal). Expert knobs BWA3_KS_DEDUP_{Z,REPROBE}
+ * are env-only, full-string validated. */
+void ks_dedup_configure(const char *mode_arg)
+{
+    if (mode_arg && *mode_arg) {
+        const int v = ks_parse_dedup_mode(mode_arg);
+        if (v < 0) { fprintf(stderr, "ERROR: --ks-dedup: expected off|on|auto, got '%s'\n", mode_arg); exit(1); }
+        g_ks_cfg.mode = v;
+    } else {
+        const char *m = getenv("BWA3_KS_DEDUP");
+        if (m == NULL) g_ks_cfg.mode = KS_DEDUP_AUTO;    /* unset -> default */
+        else {
+            const int v = ks_parse_dedup_mode(m);         /* "" -> -1 -> fatal */
+            if (v < 0) { fprintf(stderr, "ERROR: BWA3_KS_DEDUP: expected off|on|auto, got '%s'\n", m); exit(1); }
+            g_ks_cfg.mode = v;
+        }
+    }
+    const char *z = getenv("BWA3_KS_DEDUP_Z");           /* expert knob, env-only */
+    if (z) {
+        char *end = NULL; errno = 0;
+        const double zv = strtod(z, &end);
+        if (end == z || end == NULL || *end != '\0' || errno == ERANGE || !std::isfinite(zv) || zv <= 0.0) {
+            fprintf(stderr, "ERROR: BWA3_KS_DEDUP_Z: must be a finite number > 0, got '%s'\n", z);
+            exit(1);
+        }
+        g_ks_cfg.z = zv;
+    }
+    const char *r = getenv("BWA3_KS_DEDUP_REPROBE");     /* expert knob, env-only; positions, 0=off */
+    if (r) {
+        char *end = NULL; errno = 0;
+        const long long rv = strtoll(r, &end, 10);
+        if (end == r || end == NULL || *end != '\0' || errno == ERANGE || rv < 0) {
+            fprintf(stderr, "ERROR: BWA3_KS_DEDUP_REPROBE: must be a non-negative integer number of positions (0 = off), got '%s'\n", r);
+            exit(1);
+        }
+        g_ks_cfg.reprobe_positions = rv;
+    }
+}
+
+static inline const KsDedupCfg &ks_dedup_cfg(void)
+{
+    static std::once_flag once;
+    std::call_once(once, []() { if (g_ks_cfg.mode < 0) ks_dedup_configure(NULL); });
+    return g_ks_cfg;
+}
+static inline int    ks_dedup_mode(void)          { return ks_dedup_cfg().mode; }
+static inline double ks_net_z_crit(void)          { return ks_dedup_cfg().z; }
+static inline int64_t ks_dedup_reprobe_positions(void) { return ks_dedup_cfg().reprobe_positions; }
+
+/* ---------------------------------------------------------------------------
+ * Net-cycles adaptive controller (--ks-dedup=auto). Decide ON/OFF from MEASURED
+ * time, not a dup-rate threshold. get_sa_entries_prefetch can time BOTH sides
+ * of the trade in one call, so this uses the single-observation net model (the
+ * shipped extension-DP dedup, "#415"), not read_memo's cross-chunk A/B:
+ *
+ *   overhead_ns = dedup bookkeeping (build the (k,s) table + the scatter memcpy)
+ *   c_pos       = resolve_kernel_ns / distinct_positions  (measured per-position
+ *                 LF-walk cost on THIS host/index/tier)
+ *   benefit_ns  = dup_positions * c_pos   (the walks we skipped)
+ *   net_ns      = overhead_ns - benefit_ns          (< 0  =>  dedup won here)
+ *
+ * c_pos is measured, so the break-even self-calibrates -- no magic dup-rate
+ * constant. While measuring we run dedup ON (real data is dup-rich, so ON is
+ * the productive default and timing a chunk we already run is a few clock
+ * reads), pool per-chunk net/position across threads (Welford), and latch when
+ * a two-sided z-test clears |z| >= z_crit. Below NET_MIN_BATCHES we never latch
+ * (CLT warmup); past NET_MAX_POS with no significance we keep ON (break-even).
+ * ------------------------------------------------------------------------- */
+enum { KS_NET_MEASURING = 0, KS_NET_LATCH_ON = 1, KS_NET_LATCH_OFF = 2 };
+static std::atomic<int>      g_ks_net_state{KS_NET_MEASURING};
+static const uint64_t        KS_NET_MIN_BATCHES = 24;         /* CLT floor before any latch */
+static const uint64_t        KS_NET_MAX_POS     = 300000000;  /* give up measuring past this */
+static const uint64_t        KS_NET_PROBE_MAX_POS = 150000000;/* re-probe cap -> keep incumbent */
+static std::atomic<int>      g_ks_net_incumbent{0};   /* 0 = none (initial phase) */
+static std::atomic<int64_t>  g_ks_net_since_latch{0}; /* positions since last latch */
+static std::mutex   g_ks_net_mtx;
+static uint64_t     g_ks_net_k    = 0;    /* instrumented chunks */
+static uint64_t     g_ks_net_pos  = 0;    /* positions measured */
+static double       g_ks_net_mean = 0.0;  /* Welford mean of net_ns/chunk */
+static double       g_ks_net_m2   = 0.0;  /* Welford sum of squares */
+
+/* Feed one measured chunk into the controller and latch when significant.
+ * Incumbent-aware: the initial decision uses a plain z-test with the MAX-pos
+ * break-even fallback; a re-probe confirms the incumbent at the ordinary z (or
+ * keeps it on a probe-cap timeout), and only flips at a higher bar (z+1) so
+ * noise near break-even cannot flap the decision. */
+static inline void ks_net_observe(double net_ns, int64_t positions)
+{
+    if (positions <= 0) return;
+    std::lock_guard<std::mutex> lk(g_ks_net_mtx);
+    if (g_ks_net_state.load(std::memory_order_relaxed) != KS_NET_MEASURING) return;
+    g_ks_net_pos += (uint64_t)positions;
+    g_ks_net_k   += 1;
+    const double d = net_ns - g_ks_net_mean;
+    g_ks_net_mean += d / (double)g_ks_net_k;
+    g_ks_net_m2   += d * (net_ns - g_ks_net_mean);
+    const int incumbent = g_ks_net_incumbent.load(std::memory_order_relaxed);
+    int decision = 0; const char *why = "";
+    if (g_ks_net_k >= KS_NET_MIN_BATCHES) {
+        const double var = g_ks_net_m2 / (double)(g_ks_net_k - 1);
+        const double sd  = var > 0.0 ? sqrt(var) : 0.0;
+        const double z   = sd > 0.0 ? g_ks_net_mean * sqrt((double)g_ks_net_k) / sd : 0.0;
+        const int    fav = (g_ks_net_mean < 0.0) ? KS_NET_LATCH_ON : KS_NET_LATCH_OFF;
+        const double zc  = ks_net_z_crit();
+        if (incumbent == 0) {
+            if      (fabs(z) >= zc)                 { decision = fav;             why = "measured"; }
+            else if (g_ks_net_pos >= KS_NET_MAX_POS){ decision = KS_NET_LATCH_ON; why = "break-even, keeping default"; }
+        } else if (fav == incumbent) {
+            if      (fabs(z) >= zc)                       { decision = incumbent; why = "re-probe confirmed"; }
+            else if (g_ks_net_pos >= KS_NET_PROBE_MAX_POS){ decision = incumbent; why = "re-probe inconclusive, kept"; }
+        } else {
+            if      (fabs(z) >= zc + 1.0)                 { decision = fav;       why = "re-probe FLIPPED"; }
+            else if (g_ks_net_pos >= KS_NET_PROBE_MAX_POS){ decision = incumbent; why = "below flip margin, kept"; }
+        }
+    }
+    if (decision) {
+        g_ks_net_incumbent.store(decision, std::memory_order_relaxed);
+        g_ks_net_since_latch.store(0, std::memory_order_relaxed);
+        g_ks_net_state.store(decision, std::memory_order_relaxed);
+        if (bwa_verbose >= 3)
+            fprintf(stderr, "[ks-dedup-auto] %s: %llu pos / %llu chunks, mean net=%.1f us/chunk -> ks-dedup %s\n",
+                    why, (unsigned long long)g_ks_net_pos, (unsigned long long)g_ks_net_k,
+                    g_ks_net_mean / 1e3, decision == KS_NET_LATCH_ON ? "ON" : "OFF");
+    }
+}
+
+/* Work-based re-probe: called from both latched paths with this chunk's
+ * position count. When the cadence elapses, reset the accumulator and re-enter
+ * MEASURING. Byte-identity is unaffected: a probe only changes whether the
+ * dedup path or the plain path runs, both of which produce identical coords. */
+static inline void ks_net_maybe_reprobe(int64_t positions)
+{
+    const int64_t period = ks_dedup_reprobe_positions();
+    if (period <= 0) return;
+    if (g_ks_net_since_latch.fetch_add(positions, std::memory_order_relaxed) + positions < period) return;
+    /* Relaxed fast-path: once the counter passes `period` it STAYS past it until
+     * a probe latches and resets it, so every eligible AUTO chunk would otherwise
+     * take the global mutex only to hit the identical measuring-state check
+     * below. Skip the lock while a probe is already running. The locked check is
+     * retained because the state can change between here and the lock. */
+    if (g_ks_net_state.load(std::memory_order_relaxed) == KS_NET_MEASURING) return;
+    std::lock_guard<std::mutex> lk(g_ks_net_mtx);
+    const int st = g_ks_net_state.load(std::memory_order_relaxed);
+    if (st == KS_NET_MEASURING) return;                                   /* probe already running */
+    if (g_ks_net_since_latch.load(std::memory_order_relaxed) < period) return;  /* lost the race */
+    g_ks_net_k = 0; g_ks_net_pos = 0; g_ks_net_mean = 0.0; g_ks_net_m2 = 0.0;
+    g_ks_net_since_latch.store(0, std::memory_order_relaxed);
+    if (bwa_verbose >= 3)
+        fprintf(stderr, "[ks-dedup-auto] re-probe (incumbent %s)\n", st == KS_NET_LATCH_ON ? "ON" : "OFF");
+    g_ks_net_state.store(KS_NET_MEASURING, std::memory_order_relaxed);
+}
+
+static inline bool ks_dedup_stats_on(void)
+{
+    static const bool on = []() {
+        const char *e = getenv("BWA3_KS_DEDUP_STATS");
+        return e != NULL && *e != '\0' && !(e[0] == '0' && e[1] == '\0');
+    }();
+    return on;
+}
+
+/* Chunk-scoped (k,s) dedup table: open-addressing on a 64-bit mix of (k,s),
+ * linear probe, holding a 1-based entry index into parallel key vectors so a
+ * fresh (zeroed) slot reads as empty. Thread-local, grow-only, cleared per
+ * call -- no allocation churn across chunks. */
+namespace {
+struct KsDedupTable {
+    std::vector<int64_t>  k;        /* rep interval k, per entry            */
+    std::vector<int64_t>  s;        /* rep interval s, per entry            */
+    std::vector<int64_t>  base;     /* rep's coordArray slot-run start      */
+    std::vector<uint32_t> slot;     /* hash slot -> 1-based entry idx, 0=empty */
+    uint64_t              mask = 0; /* slot count - 1 (power of two)        */
+
+    static inline uint64_t mix(int64_t kk, int64_t ss) {
+        /* FNV-1a-style fold of the two 64-bit words; the table verifies exact
+         * (k,s) on probe, so this only needs to spread well, not perfectly. */
+        uint64_t h = 1469598103934665603ULL;
+        h ^= (uint64_t)kk; h *= 1099511628211ULL;
+        h ^= (uint64_t)ss; h *= 1099511628211ULL;
+        return h;
+    }
+
+    void reset(int64_t n_hint) {
+        k.clear(); s.clear(); base.clear();
+        /* Load factor ~0.5: slots = next pow2 >= 2*n_hint (min 64). */
+        uint64_t want = 64;
+        while (want < (uint64_t)(n_hint * 2 + 1)) want <<= 1;
+        if (want != mask + 1) { slot.assign(want, 0); mask = want - 1; }
+        else                  { std::fill(slot.begin(), slot.end(), 0u); }
+    }
+
+    /* Return the rep entry index for (kk,ss); if absent, insert with rep_base
+     * and return -1 (caller then stages this interval as the rep). */
+    int64_t find_or_insert(int64_t kk, int64_t ss, int64_t rep_base) {
+        uint64_t h = mix(kk, ss) & mask;
+        for (;;) {
+            uint32_t e = slot[h];
+            if (e == 0) {                       /* empty -> insert new rep */
+                k.push_back(kk); s.push_back(ss); base.push_back(rep_base);
+                slot[h] = (uint32_t)k.size();   /* store 1-based */
+                return -1;
+            }
+            if (k[e - 1] == kk && s[e - 1] == ss) return (int64_t)(e - 1);
+            h = (h + 1) & mask;                 /* linear probe */
+        }
+    }
+};
+} // namespace
+
+/* Stats: distinct-vs-total resolved POSITIONS (weighted by min(s,max_occ), the
+ * actual resolve cost), summed across threads, printed once at exit. */
+static std::atomic<uint64_t> g_ksdedup_total_pos{0};
+static std::atomic<uint64_t> g_ksdedup_distinct_pos{0};
+
+/* Test/observability hook (declared in FMI_search.h): read the process-global
+ * (k,s)-dedup position counters. They only accumulate while BWA3_KS_DEDUP_STATS
+ * is set (the fetch_adds are gated off the hot staging loop otherwise), so a
+ * caller must enable that env before resolving to see nonzero counts. */
+void ks_dedup_position_counts(uint64_t *total, uint64_t *distinct)
+{
+    if (total)    *total    = g_ksdedup_total_pos.load(std::memory_order_relaxed);
+    if (distinct) *distinct = g_ksdedup_distinct_pos.load(std::memory_order_relaxed);
+}
+
+static struct KsDedupStatsDumper {
+    ~KsDedupStatsDumper() {
+        if (!ks_dedup_stats_on()) return;
+        uint64_t t = g_ksdedup_total_pos.load(), d = g_ksdedup_distinct_pos.load();
+        fprintf(stderr,
+            "[ks-dedup-stats] total_pos=%llu distinct_pos=%llu saved=%.4f\n",
+            (unsigned long long)t, (unsigned long long)d,
+            t ? 1.0 - (double)d / (double)t : 0.0);
+    }
+} g_ksdedup_stats_dumper;
+
 void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
                                          int64_t *coordCountArray, int64_t count,
                                          const int32_t max_occ, int tid, int64_t &id_,
                                          int drop_sentinel_offset)
 {
+    // Internal invariant for direct callers. max_occ is a divisor below
+    // (`step = s / max_occ`) and the dedup slot-run width `c = min(s, max_occ)`,
+    // so a non-positive value is a divide-by-zero / meaningless copy length, not
+    // a resolvable no-op. The `-c` option parser now rejects <= 0 fatally and
+    // the public fmi_seed_sa_prefetch facade still no-ops on <= 0 for its own
+    // documented contract (it returns before reaching here), so this guard only
+    // catches a future direct caller passing a bad value -- fail loud rather than
+    // silently produce no seeds. xassert survives a hypothetical -DNDEBUG build.
+    xassert(max_occ > 0, "get_sa_entries_prefetch: max_occ must be > 0");
 
     // uint32_t i;
     // totalCoordCount and id (below) both count entries staged into the int64
@@ -2391,6 +2682,15 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
     for(int i = 0; i < count; i++)
     {
         SMEM smem = smemArray[i];
+        // SMEM.s is a public int64_t. A validated index never yields s < 0
+        // (count[] monotonicity guarantees s = count[a+1] - count[a] >= 0), but
+        // the field is caller-supplied, and a negative s would make this
+        // mem_lim contribution negative (undersizing the scratch), the dedup
+        // slot-run width `c` negative, and the scatter memcpy length wrap huge
+        // as a size_t. Clamp it to 0 -- a negative/empty interval resolves
+        // nothing -- so every downstream use of smem.s (hi, step, c, the (k,s)
+        // key) is consistent. Done here and at each SMEM read below.
+        if (smem.s < 0) smem.s = 0;
         mem_lim += (smem.s > max_occ) ? max_occ : smem.s;
     }
 
@@ -2401,29 +2701,139 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
     t_sa.ensure(mem_lim);
     int64_t *pos_ar = t_sa.pos;
 
-    for(int i = 0; i < count; i++)
-    {
-        int32_t c = 0;
-        SMEM smem = smemArray[i];
-        int64_t hi = smem.k + smem.s;
-        int64_t step = (smem.s > max_occ) ? smem.s / max_occ : 1;
-        int64_t j;
-        for(j = smem.k; (j < hi) && (c < max_occ); j+=step, c++)
+    /* Decide dedup on/off for this chunk from the mode. OFF: never; ON: always
+     * (count>1); AUTO: on while MEASURING or latched ON, off when latched OFF.
+     * count<2 can't have a cross-read duplicate, so skip the machinery. */
+    const int ks_mode = ks_dedup_mode();
+    bool dedup;
+    if (ks_mode == KS_DEDUP_OFF || count < 2) {
+        dedup = false;
+    } else if (ks_mode == KS_DEDUP_ON) {
+        dedup = true;
+    } else { /* AUTO */
+        ks_net_maybe_reprobe(mem_lim);
+        dedup = (g_ks_net_state.load(std::memory_order_relaxed) != KS_NET_LATCH_OFF);
+    }
+    /* While AUTO is measuring we run the dedup path AND time it, so the ON/OFF
+     * decision comes from observed net (see ks_net_observe). Timers below span
+     * only the dedup-specific work; the resolve pipeline is timed separately and
+     * its per-position rate turns skipped duplicate positions into a benefit. */
+    const bool ks_measure = (ks_mode == KS_DEDUP_AUTO && dedup
+                        && g_ks_net_state.load(std::memory_order_relaxed) == KS_NET_MEASURING);
+    std::chrono::steady_clock::time_point ks_t_stage0, ks_t_kern0, ks_t_scat0;
+    double  ks_stage_ns = 0.0, ks_kernel_ns = 0.0, ks_scatter_ns = 0.0;
+    int64_t ks_dup_positions = 0, ks_distinct_positions = 0;
+
+    /* Copy jobs recorded during the dedup staging pass: after the resolve
+     * pipeline fills every REP slot-run, each (dup_base, rep_base, n) is a
+     * memcpy that reproduces the duplicate interval's coordinates byte-for-byte.
+     * Thread-local + grow-only to avoid per-chunk allocation. */
+    static thread_local std::vector<int64_t> ks_dup_base, ks_rep_base, ks_dup_cnt;
+    static thread_local KsDedupTable ks_tab;
+    /* Maps each staged pos_ar entry -> its destination coordArray slot. In the
+     * plain path staging index == coordArray slot (1:1), but the dedup path
+     * skips duplicate intervals, so pos_ar compacts and the two diverge: a
+     * rep's k-th staged position must land in its OWN slot-run base + k, not in
+     * the compacted pos_ar index. The pipeline reads this to place each result.
+     * (Sized to mem_lim like pos_ar; only used when dedup is on.) */
+    static thread_local std::vector<int64_t> ks_dst;
+    /* Grow-only (like the pos_ar scratch): only indices [0, id) are written
+     * before they are read, so a plain resize every call would re-zero the tail
+     * and thrash the allocator for no benefit. Keep the high-water capacity. */
+    if (dedup && ks_dst.size() < (size_t)mem_lim) ks_dst.resize((size_t)mem_lim);
+
+    if (!dedup) {
+        for(int i = 0; i < count; i++)
         {
-            int64_t pos = j;
-             pos_ar[id++]  = pos;
-            // map_ar[k] == k (== id here), so the staging index is stored
-            // implicitly; map_pos below reads the index directly.
-            // int64_t sa_entry = get_sa_entry_compressed(pos, tid);
-            // coordArray[totalCoordCount + c] = sa_entry;
+            int32_t c = 0;
+            SMEM smem = smemArray[i];
+            if (smem.s < 0) smem.s = 0;   // clamp negative/empty interval (see mem_lim loop)
+            int64_t hi = smem.k + smem.s;
+            int64_t step = (smem.s > max_occ) ? smem.s / max_occ : 1;
+            int64_t j;
+            for(j = smem.k; (j < hi) && (c < max_occ); j+=step, c++)
+            {
+                int64_t pos = j;
+                 pos_ar[id++]  = pos;
+                // map_ar[k] == k (== id here), so the staging index is stored
+                // implicitly; map_pos below reads the index directly.
+                // int64_t sa_entry = get_sa_entry_compressed(pos, tid);
+                // coordArray[totalCoordCount + c] = sa_entry;
+            }
+            //coordCountArray[i] = c;
+            *coordCountArray += c;
+            totalCoordCount += c;
         }
-        //coordCountArray[i] = c;
-        *coordCountArray += c;
-        totalCoordCount += c;
+    } else {
+        /* Dedup staging: each SMEM i owns the contiguous coordArray slot-run
+         * [totalCoordCount, totalCoordCount + c). For a FIRST-seen (k,s) (a
+         * "rep") we stage its positions into pos_ar exactly as the plain path
+         * (its slots get resolved). For a DUPLICATE (k,s) we stage nothing --
+         * skipping those LF-walks is the win -- and record a copy job that,
+         * after resolution, replicates the rep's slot-run into this SMEM's. */
+        if (ks_measure) ks_t_stage0 = std::chrono::steady_clock::now();
+        ks_tab.reset(count);
+        ks_dup_base.clear(); ks_rep_base.clear(); ks_dup_cnt.clear();
+        uint64_t stat_total = 0, stat_distinct = 0;
+        for(int i = 0; i < count; i++)
+        {
+            SMEM smem = smemArray[i];
+            if (smem.s < 0) smem.s = 0;   // clamp negative/empty interval (see mem_lim loop)
+            int64_t hi = smem.k + smem.s;
+            int64_t step = (smem.s > max_occ) ? smem.s / max_occ : 1;
+            /* c is min(s, max_occ) -- the slot-run width. Compute it up front
+             * (same rule the resolve/consumer loops use) so the rep bookkeeping
+             * and the dup copy length agree exactly. s is clamped non-negative
+             * above and max_occ > 0 is enforced at entry, so c is in [0, max_occ]
+             * -- the scatter memcpy length can never be negative (the retained
+             * internal defense against a wrapped size_t). */
+            int32_t c = (smem.s > max_occ) ? max_occ : (int32_t)smem.s;
+            const int64_t run_base = totalCoordCount;
+
+            int64_t rep = ks_tab.find_or_insert(smem.k, smem.s, run_base);
+            if (rep < 0) {
+                /* rep: stage its positions, recording each staged entry's true
+                 * coordArray destination (run_base + cc) so the pipeline writes
+                 * results into this rep's own slot-run, not the compacted
+                 * pos_ar index. */
+                int32_t cc = 0;
+                for(int64_t j = smem.k; (j < hi) && (cc < max_occ); j+=step, cc++) {
+                    ks_dst[id] = run_base + cc;
+                    pos_ar[id++] = j;
+                }
+                stat_distinct += (uint64_t)c;
+            } else {
+                /* duplicate: no staging; record the memcpy job. */
+                ks_dup_base.push_back(run_base);
+                ks_rep_base.push_back(ks_tab.base[rep]);
+                ks_dup_cnt.push_back(c);
+            }
+            *coordCountArray += c;
+            totalCoordCount  += c;
+            stat_total       += (uint64_t)c;
+        }
+        if (ks_measure) {
+            ks_stage_ns = std::chrono::duration<double, std::nano>(
+                              std::chrono::steady_clock::now() - ks_t_stage0).count();
+            ks_distinct_positions = (int64_t)stat_distinct;
+            ks_dup_positions      = (int64_t)(stat_total - stat_distinct);
+        }
+        if (ks_dedup_stats_on()) {
+            g_ksdedup_total_pos.fetch_add(stat_total, std::memory_order_relaxed);
+            g_ksdedup_distinct_pos.fetch_add(stat_distinct, std::memory_order_relaxed);
+        }
     }
     
-    id_ += id;
-    
+    /* Out-param is the resolved-COORDINATE count, not the compacted staging
+     * count. In the plain path these are equal (staging index == coordArray
+     * slot, 1:1), but the dedup path stages only reps into pos_ar (local `id`),
+     * so `id` under-counts by the skipped duplicates. totalCoordCount advances
+     * by min(s,max_occ) for every SMEM in both paths, so accumulating it keeps
+     * *id_ mode-invariant -- the fmi_seed_sa_prefetch facade documents *id as
+     * the coordinate count, and external consumers must not see it shrink when
+     * 'auto'/'on' dedup engages. (`id` stays the pipeline's compacted bound.) */
+    id_ += totalCoordCount;
+
     /* Number of SA rows walked concurrently. Each lane's next checkpoint block
      * is prefetched when the lane is (re)staged, so the lane count sets how
      * many block fetches are in flight; it does not affect results, which are
@@ -2454,13 +2864,14 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
     }();
     int64_t working_set[SA_RESOLVE_LANES_MAX], map_pos[SA_RESOLVE_LANES_MAX];
     int64_t offset[SA_RESOLVE_LANES_MAX] = {-1};
-    
+
+    if (ks_measure) ks_t_kern0 = std::chrono::steady_clock::now();
     int i = 0, j = 0;    
     while(i<id && j<sa_batch_size)
     {
         int64_t pos =  pos_ar[i];
         working_set[j] = pos;
-        map_pos[j] = i;   // map_ar[i] == i (see staging loop invariant)
+        map_pos[j] = dedup ? ks_dst[i] : i;   // dedup remaps to the rep's slot-run
         offset[j] = 0;
         
         if ((pos & sa_compx_mask) == 0) {
@@ -2499,7 +2910,8 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
                 {
                     pos = pos_ar[i];
                     working_set[k] = pos;
-                    map_pos[k] = i++;   // map_ar[i] == i (staging invariant)
+                    map_pos[k] = dedup ? ks_dst[i] : i;   // dedup remaps to the rep's slot-run
+                    i++;
                     offset[k] = 0;
                     
                     if ((pos & sa_compx_mask) == 0) {
@@ -2526,6 +2938,42 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
                 }                
             }
         }
+    }
+
+    if (ks_measure)
+        ks_kernel_ns = std::chrono::duration<double, std::nano>(
+                           std::chrono::steady_clock::now() - ks_t_kern0).count();
+
+    /* Dedup scatter pass: every REP slot-run is now fully resolved in
+     * coordArray (reps are always staged, so their slots were written by the
+     * pipeline above). Replicate each rep's coordinates into the duplicate
+     * intervals' slot-runs. Byte-identical: the duplicate interval would have
+     * resolved to exactly these coordinates in exactly this order. */
+    if (dedup) {
+        if (ks_measure) ks_t_scat0 = std::chrono::steady_clock::now();
+        const size_t ndup = ks_dup_base.size();
+        for (size_t d = 0; d < ndup; d++)
+            memcpy(coordArray + ks_dup_base[d],
+                   coordArray + ks_rep_base[d],
+                   (size_t)ks_dup_cnt[d] * sizeof(int64_t));
+        if (ks_measure)
+            ks_scatter_ns = std::chrono::duration<double, std::nano>(
+                                std::chrono::steady_clock::now() - ks_t_scat0).count();
+    }
+
+    /* Net-cycles decision (AUTO, measuring): overhead is the dedup-specific
+     * bookkeeping (building the (k,s) table during staging + the scatter
+     * memcpy); benefit is the LF-walk time the skipped duplicate positions
+     * would have cost, at this chunk's MEASURED per-distinct-position resolve
+     * rate. Feed the signed net (overhead - benefit) to the controller. Guard
+     * on real signal (some distinct work resolved, some dup skipped, timers
+     * nonzero) so a degenerate chunk doesn't feed noise into the z-test. */
+    if (ks_measure && ks_distinct_positions > 0 && ks_dup_positions > 0
+        && ks_kernel_ns > 0.0) {
+        const double c_pos      = ks_kernel_ns / (double)ks_distinct_positions;
+        const double benefit_ns = (double)ks_dup_positions * c_pos;
+        const double overhead_ns = ks_stage_ns + ks_scatter_ns;
+        ks_net_observe(overhead_ns - benefit_ns, ks_distinct_positions + ks_dup_positions);
     }
     /* pos_ar is the reused thread-local scratch — no free here. */
 }

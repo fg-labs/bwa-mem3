@@ -166,6 +166,26 @@ void fmi_pread_from_stream(FILE *fp, void *dst, size_t nbytes, int nthreads);
  * stock indexes for no benefit. */
 int64_t detect_sa_compx(int fd, int64_t file_size, int64_t ref_seq_len, int64_t default_compx);
 
+/* Configure the cross-read SMEM-interval (k,s) SA-dedup: --ks-dedup CLI value
+ * (off|on|auto) > env BWA3_KS_DEDUP > default 'auto'; fatal on a bad value.
+ * Mirrors mem_dedup_configure. Call once from fastmap.cpp after getopt (before
+ * the first alignment batch); an explicitly-empty CLI value is rejected by the
+ * getopt handler, an explicitly-empty env value is fatal here. Alignment output
+ * is byte-identical in every mode -- the flag only trades SA-resolve LF-walks
+ * for a per-chunk (k,s) dedup, and 'auto' latches it on/off by measured net. */
+void ks_dedup_configure(const char *mode_arg);
+
+/* Read the process-global cross-read (k,s) dedup position counters (the same
+ * ones BWA3_KS_DEDUP_STATS prints at exit): *total = coordinate positions staged
+ * across every resolved chunk, *distinct = those actually LF-walked (the reps).
+ * distinct < total iff cross-read duplicates were collapsed. The counters only
+ * accumulate while BWA3_KS_DEDUP_STATS is set (they are gated off the hot
+ * staging loop otherwise), so a reader must enable that env before resolving.
+ * Exposed so a test can assert the dedup staging path actually executed --
+ * the coordinate oracle alone cannot, since the plain path returns the same
+ * coordinates. */
+void ks_dedup_position_counts(uint64_t *total, uint64_t *distinct);
+
 /* Worker count for the index load: the caller's `n_threads` clamped to [1, 8],
  * overridable via the BWA3_LOAD_THREADS environment variable. A malformed
  * override (non-numeric, trailing garbage, non-positive, or unrepresentable as
