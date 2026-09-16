@@ -6307,19 +6307,41 @@ static inline int ungapped_analyze(const uint8_t *qs, const uint8_t *rs, int N,
  * seeds is safe because the longest same-diagonal seed (always extended) is a
  * superset container.
  * ---------------------------------------------------------------------- */
-static inline int mem_seed_ext_redundant(const mem_chain_t *c, int si)
+/* container_si (optional out-param, may be NULL): on a redundant return (1),
+ * receives the seed index of the MAX-length same-diagonal container of s. The
+ * two-wave design (reports/2026-09-16-skip-contained-ext-two-wave-impl-plan.md)
+ * needs the *outermost* container, not merely the first one found: same-diagonal
+ * containment is transitive query-interval containment, so the longest
+ * same-diagonal container is the unique outermost one, is never itself contained,
+ * and is therefore always a fully-extended root (never deferred) by the time the
+ * interleaved Pass-3 extension looks it up. Choosing the max-length (rather than
+ * the first-found) container does NOT change the boolean result -- a container
+ * exists iff the longest one does -- so the existing call site (passing NULL) is
+ * byte-identical to the prior first-match `break` form. */
+static inline int mem_seed_ext_redundant(const mem_chain_t *c, int si,
+                                         int *container_si)
 {
     const mem_seed_t *s = &c->seeds[si];
     long sd = (long)s->rbeg - s->qbeg;
     int has_container = 0, j;
+    int best_j = -1, best_len = -1;
     for (j = 0; j < c->n; ++j) {
         if (j == si) continue;
         const mem_seed_t *t = &c->seeds[j];
         if (t->len <= s->len) continue;                    /* strictly longer */
         if ((long)t->rbeg - t->qbeg != sd) continue;       /* same diagonal */
-        if (s->qbeg >= t->qbeg && s->qbeg + s->len <= t->qbeg + t->len) { has_container = 1; break; }
+        if (s->qbeg >= t->qbeg && s->qbeg + s->len <= t->qbeg + t->len) {
+            has_container = 1;
+            /* Track the max-length container (ties: lowest seed index -- the
+             * scan is ascending in j and we replace only on strictly greater
+             * length). Equal-length same-diagonal containers have identical
+             * query intervals, so any is an equally valid outermost root; the
+             * deterministic lowest-index tiebreak keeps this stable. */
+            if (t->len > best_len) { best_len = t->len; best_j = j; }
+        }
     }
     if (!has_container) return 0;
+    if (container_si != NULL) *container_si = best_j;
     /* interference guard: mirror PE18 (a seed >= .95*len overlapping s on a
      * different diagonal by >= s->len/4 means s could lead to a distinct aln). */
     for (j = 0; j < c->n; ++j) {
@@ -6334,6 +6356,50 @@ static inline int mem_seed_ext_redundant(const mem_chain_t *c, int si)
     return 1;
 }
 
+/* PE18 inner candidate test: is seed `s` contained in the (extended) alnreg `p`?
+ * Extracted VERBATIM from the Pass-3 containment loop below so both Pass 3 and
+ * the two-wave interleaved extension can share the SAME predicate against real
+ * post-extension container coordinates (the whole point: replace the
+ * pre-extension prediction with PE18's actual decision). Deliberately factors
+ * ONLY the per-candidate test; the outer scan, the `lim[l]`/`v` budget, the
+ * purged-candidate skip, and the different-diagonal interference scan stay in
+ * Pass 3 (correctness depends on that being one incremental traversal, so it
+ * must not be re-implemented elsewhere -- see the impl plan §4).
+ *
+ * Returns the two containment outcomes the original inline body produced, so the
+ * caller reproduces the exact control flow:
+ *   PE18_CONTAINED  -> the original `break`  (s is "around" p; stop scanning)
+ *   PE18_NOT        -> the original `v++; continue` (p does not contain s)
+ * The purged-candidate case (`p->qb==-1 && p->qe==-1` -> bare continue, no v++)
+ * stays at the call site, since it is a candidate-liveness check, not a
+ * containment decision. */
+enum pe18_cand_result { PE18_NOT = 0, PE18_CONTAINED = 1 };
+static inline enum pe18_cand_result
+pe18_seed_in_container(const mem_seed_t *s, const mem_alnreg_t *p,
+                       int l_query, const mem_opt_t *opt)
+{
+    int64_t rd;
+    int qd, w, max_gap;
+    if (s->rbeg < p->rb || s->rbeg + s->len > p->re || s->qbeg < p->qb
+        || s->qbeg + s->len > p->qe) {
+        return PE18_NOT; // not fully contained
+    }
+
+    if (s->len - p->seedlen0 > .1 * l_query) return PE18_NOT;
+    // qd: distance ahead of the seed on query; rd: on reference
+    qd = s->qbeg - p->qb; rd = s->rbeg - p->rb;
+    // the maximal gap allowed in regions ahead of the seed
+    max_gap = cal_max_gap(opt, qd < rd? qd : rd);
+    w = max_gap < p->w? max_gap : p->w; // bounded by the band width
+    if (qd - rd < w && rd - qd < w) return PE18_CONTAINED; // the seed is "around" a previous hit
+    // similar to the previous four lines, but this time we look at the region behind
+    qd = p->qe - (s->qbeg + s->len); rd = p->re - (s->rbeg + s->len);
+    max_gap = cal_max_gap(opt, qd < rd? qd : rd);
+    w = max_gap < p->w? max_gap : p->w;
+    if (qd - rd < w && rd - qd < w) return PE18_CONTAINED;
+
+    return PE18_NOT;
+}
 
 void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
                                    const uint8_t *pac, bseq1_t *seq_, int nseq,
@@ -6696,7 +6762,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
                  * extend to a differently-scored aln), so the skip is NOT
                  * byte-identical under --meth (measured ~0.17% of pairs diverge). */
                 if (opt->skip_contained_ext && !opt->meth_mode &&
-                    mem_seed_ext_redundant(c, (uint32_t)srt[k])) {
+                    mem_seed_ext_redundant(c, (uint32_t)srt[k], NULL)) {
                     a->qb = a->qe = -1;   /* pre-purge exactly as PE18 would */
                     continue;
                 }
@@ -7902,29 +7968,15 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
                 {
                     mem_alnreg_t *p = &av->a[i];
                     if (p->qb == -1 && p->qe == -1) {
-                        continue;
+                        continue;   // purged candidate: skip, do NOT increment v
                     }
 
-                    int64_t rd;
-                    int qd, w, max_gap;
-                    if (s->rbeg < p->rb || s->rbeg + s->len > p->re || s->qbeg < p->qb
-                        || s->qbeg + s->len > p->qe) {
-                        v++; continue; // not fully contained
-                    }
-
-                    if (s->len - p->seedlen0 > .1 * l_query) { v++; continue;}
-                    // qd: distance ahead of the seed on query; rd: on reference
-                    qd = s->qbeg - p->qb; rd = s->rbeg - p->rb;
-                    // the maximal gap allowed in regions ahead of the seed
-                    max_gap = cal_max_gap(opt, qd < rd? qd : rd);
-                    w = max_gap < p->w? max_gap : p->w; // bounded by the band width
-                    if (qd - rd < w && rd - qd < w) break; // the seed is "around" a previous hit
-                    // similar to the previous four lines, but this time we look at the region behind
-                    qd = p->qe - (s->qbeg + s->len); rd = p->re - (s->rbeg + s->len);
-                    max_gap = cal_max_gap(opt, qd < rd? qd : rd);
-                    w = max_gap < p->w? max_gap : p->w;
-                    if (qd - rd < w && rd - qd < w) break;
-
+                    /* Shared PE18 containment predicate (see pe18_seed_in_container
+                     * above): CONTAINED -> the seed is "around" p, stop scanning
+                     * (break); NOT -> p does not contain s, count it (v++) and
+                     * keep scanning. Byte-identical to the prior inline body. */
+                    if (pe18_seed_in_container(s, p, l_query, opt) == PE18_CONTAINED)
+                        break;
                     v++;
                 }
 
