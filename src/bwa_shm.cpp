@@ -1070,7 +1070,8 @@ static void print_shm_usage(void)
         "  -t, --threads INT\n"
         "            worker threads for the -u densify pass (default 1). The\n"
         "            per-sample walks are independent, so this scales near-\n"
-        "            linearly; ignored without -u.\n"
+        "            linearly; has no effect unless -u actually densifies (a\n"
+        "            target denser than the on-disk rate).\n"
         "  -h --help print this help and exit\n\n"
         "Stage with no flags: `bwa-mem3 shm <idxbase>` loads the index into\n"
         "POSIX shared memory; subsequent `bwa-mem3 mem <idxbase> ...` runs\n"
@@ -1100,7 +1101,16 @@ int main_shm(int argc, char *argv[])
      * (no short opt declared) and print a generic error, but the top-level
      * usage advertises `bwa-mem3 <command> --help`, so we honor both. */
     for (int i = 1; i < argc; ++i) {
-        if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
+        const char *a = argv[i];
+        /* Skip the value token of an argument-taking option so `-u --help` /
+         * `-t --help` is a bad-value error from getopt below, not a spurious
+         * help request. */
+        if (std::strcmp(a, "-u") == 0 || std::strcmp(a, "-t") == 0 ||
+            std::strcmp(a, "--threads") == 0) {
+            ++i;
+            continue;
+        }
+        if (std::strcmp(a, "--help") == 0 || std::strcmp(a, "-h") == 0) {
             print_shm_usage();
             return 0;
         }

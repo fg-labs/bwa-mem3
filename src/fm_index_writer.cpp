@@ -345,6 +345,20 @@ static void write_fm_index_streaming_typed(int fd,
     *out_sentinel_index = sentinel_index;
 }
 
+Bwt2bitLayout fmi_bwt2bit_layout(int64_t ref_seq_len, int sa_compx)
+{
+    Bwt2bitLayout L;
+    L.cp_occ_count     = (ref_seq_len >> CP_SHIFT) + 1;
+    L.sa_sample_count  = (ref_seq_len >> sa_compx) + 1;
+    L.off_cp_occ       = FMI_BWT2BIT_HDR_BYTES;
+    L.off_ms_byte      = L.off_cp_occ   + L.cp_occ_count    * (int64_t)sizeof(CP_OCC);
+    L.off_ls_word      = L.off_ms_byte  + L.sa_sample_count * (int64_t)sizeof(int8_t);
+    L.off_sentinel     = L.off_ls_word  + L.sa_sample_count * (int64_t)sizeof(uint32_t);
+    L.off_sa_compx_tag = L.off_sentinel + (int64_t)sizeof(int64_t);
+    L.total_bytes      = L.off_sa_compx_tag + (int64_t)sizeof(int64_t);
+    return L;
+}
+
 void write_fm_index_streaming(const char* out_path,
                               const uint8_t* buf,
                               const void* sa,
@@ -375,16 +389,14 @@ void write_fm_index_streaming(const char* out_path,
                   "sa_compx=%d out of supported range [0, %d]",
                   sa_compx, CP_SHIFT);
 
-    const off_t HDR_BYTES       = (off_t)(sizeof(int64_t) + 5 * sizeof(int64_t));
-    const int64_t cp_occ_size   = (ref_seq_len >> CP_SHIFT) + 1;
-    const int64_t sa_sample_cnt = (ref_seq_len >> sa_compx) + 1;
-
-    const off_t off_cp_occ  = HDR_BYTES;
-    const off_t off_ms_byte = off_cp_occ  + (off_t)cp_occ_size   * (off_t)sizeof(CP_OCC);
-    const off_t off_ls_word = off_ms_byte + (off_t)sa_sample_cnt * (off_t)sizeof(int8_t);
-    const off_t off_sent    = off_ls_word + (off_t)sa_sample_cnt * (off_t)sizeof(uint32_t);
-    // +2*sizeof(int64_t): sentinel_index, then the trailing sa_compx field.
-    const off_t total_bytes = off_sent    + 2 * (off_t)sizeof(int64_t);
+    // Single source of truth for the on-disk section offsets (see
+    // fmi_bwt2bit_layout / Bwt2bitLayout in fm_index_writer.h).
+    const Bwt2bitLayout L = fmi_bwt2bit_layout(ref_seq_len, sa_compx);
+    const off_t off_cp_occ  = (off_t)L.off_cp_occ;
+    const off_t off_ms_byte = (off_t)L.off_ms_byte;
+    const off_t off_ls_word = (off_t)L.off_ls_word;
+    const off_t off_sent    = (off_t)L.off_sentinel;
+    const off_t total_bytes = (off_t)L.total_bytes;
 
     // Write to a sibling .tmp file and rename on success so a failed
     // build (err_fatal anywhere downstream) never leaves a partial /
@@ -427,6 +439,64 @@ void write_fm_index_streaming(const char* out_path,
     // Atomic publish: rename(2) is atomic on the same filesystem, so a
     // concurrent reader sees either the previous good index or the new
     // one, never a partial.
+    if (rename(tmp_path.c_str(), out_path) != 0)
+        err_fatal(__func__, "rename('%s' -> '%s'): %s",
+                  tmp_path.c_str(), out_path, strerror(errno));
+}
+
+void rewrite_fm_index_resampled_sa(const char* out_path,
+                                   int64_t ref_seq_len,
+                                   const int64_t count[5],
+                                   const CP_OCC* cp_occ,
+                                   int64_t cp_occ_size,
+                                   const int8_t* sa_ms_byte,
+                                   const uint32_t* sa_ls_word,
+                                   int64_t sa_sample_cnt,
+                                   int64_t sentinel_index,
+                                   int sa_compx)
+{
+    // Same [0, CP_SHIFT] range write_fm_index_streaming enforces: the loader's
+    // per-block sample check is only valid when 1<<sa_compx divides
+    // CP_BLOCK_SIZE (64).
+    if (sa_compx < 0 || sa_compx > CP_SHIFT)
+        err_fatal(__func__, "sa_compx=%d out of supported range [0, %d]",
+                  sa_compx, CP_SHIFT);
+
+    // Byte layout is identical to write_fm_index_streaming; only the SA-sample
+    // section size (and therefore the sentinel/tag offsets) changes with
+    // sa_compx. cp_occ is copied through verbatim -- it does not depend on the
+    // SA sample rate. Offsets come from the shared layout helper so the writer,
+    // resampler, and reader can never disagree on the format.
+    const Bwt2bitLayout L = fmi_bwt2bit_layout(ref_seq_len, sa_compx);
+    const off_t off_cp_occ  = (off_t)L.off_cp_occ;
+    const off_t off_ms_byte = (off_t)L.off_ms_byte;
+    const off_t off_ls_word = (off_t)L.off_ls_word;
+    const off_t off_sent    = (off_t)L.off_sentinel;
+    const off_t total_bytes = (off_t)L.total_bytes;
+
+    // Write to a sibling .tmp and rename on success (see write_fm_index_streaming
+    // for the rationale): a mid-write failure never leaves a partial index at the
+    // canonical path, and readers see an atomic old-or-new switch.
+    const std::string tmp_path = std::string(out_path) + ".tmp";
+    int fd = open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0)
+        err_fatal(__func__, "open('%s'): %s", tmp_path.c_str(), strerror(errno));
+    if (ftruncate(fd, total_bytes) != 0)
+        err_fatal(__func__, "ftruncate('%s', %lld): %s",
+                  tmp_path.c_str(), (long long)total_bytes, strerror(errno));
+
+    pwrite_all(fd, &ref_seq_len, sizeof(int64_t), 0, "ref_seq_len");
+    pwrite_all(fd, count, 5 * sizeof(int64_t), sizeof(int64_t), "count[5]");
+    pwrite_all(fd, cp_occ, (size_t)cp_occ_size * sizeof(CP_OCC), off_cp_occ, "cp_occ");
+    pwrite_all(fd, sa_ms_byte, (size_t)sa_sample_cnt * sizeof(int8_t),  off_ms_byte, "sa_ms_byte");
+    pwrite_all(fd, sa_ls_word, (size_t)sa_sample_cnt * sizeof(uint32_t), off_ls_word, "sa_ls_word");
+    pwrite_all(fd, &sentinel_index, sizeof(int64_t), off_sent, "sentinel_index");
+    int64_t sa_compx_i64 = sa_compx;
+    pwrite_all(fd, &sa_compx_i64, sizeof(int64_t),
+               off_sent + (off_t)sizeof(int64_t), "sa_compx");
+
+    if (close(fd) != 0)
+        err_fatal(__func__, "close('%s'): %s", tmp_path.c_str(), strerror(errno));
     if (rename(tmp_path.c_str(), out_path) != 0)
         err_fatal(__func__, "rename('%s' -> '%s'): %s",
                   tmp_path.c_str(), out_path, strerror(errno));

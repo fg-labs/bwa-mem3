@@ -167,6 +167,20 @@ numbers.
 > shared memory it will attach to it even when the on-disk index has been updated.
 > See [Quick start: shared-memory index](../getting-started/quick-shm.md).
 
+## Suffix-array sample rate (`-u`)
+
+`index -u INT` sets how densely the suffix array is sampled: one row in
+`1 << INT` is stored (default `3`, one in 8). SA resolution walks back to the
+nearest stored sample, so a denser table (smaller `INT`) resolves faster at the
+cost of a larger index and more resident memory. Most users should keep the
+default.
+
+You do not have to rebuild from FASTA to change this later. The
+[`re-sa`](../cli/re-sa.md) command resamples an existing index's SA table in
+place — denser or coarser — producing a file byte-identical to `index -u` at the
+target rate, and [`shm -u`](../cli/shm.md#-u-int--densify-the-staged-sa-sample-table)
+stages a denser table into shared memory without touching disk at all.
+
 ## Arch flags and the index format
 
 The FM-index format is architecture-independent. A single index works
@@ -181,4 +195,5 @@ same on-disk layout.
 [Quick start: methylation alignment](../getting-started/quick-meth.md) ·
 [Quick start: shared-memory index](../getting-started/quick-shm.md) ·
 [Performance improvements](../whats-different/performance.md) ·
-[CLI Reference: index](../cli/index-cmd.md)
+[CLI Reference: index](../cli/index-cmd.md) ·
+[CLI Reference: re-sa](../cli/re-sa.md)

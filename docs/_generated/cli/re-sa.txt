@@ -1,0 +1,27 @@
+Usage: bwa-mem3 re-sa [-u INT] [-t INT] <idxbase>
+
+With -u, resample the on-disk SA sample table of an existing index to a
+new sample rate, rewriting <idxbase>.bwt.2bit.64 in place. This persists
+on disk what `shm -u` synthesises per-stage: a DENSER table (smaller -u)
+means fewer LF-walk steps per SA resolve at `mem` time, trading disk +
+memory for speed; a COARSER table (larger -u) shrinks the index. Only the
+SA-sample layer is touched -- the BWT/cp_occ and the sibling index files
+(.pac/.ann/.amb/.0123) are unchanged. Output is byte-identical to an index
+built at the target rate with `index -u`.
+
+Without -u, report the index's current on-disk SA sample rate and exit.
+
+  -u INT             target SA sample rate 1/(1<<INT), in [0,6]. Omit to
+                     just report the current rate. e.g. `-u 2` rewrites a
+                     stride-8 (default, -u 3) index as a stride-4 table.
+                     A target equal to the current rate is a no-op.
+  -t, --threads INT  worker threads for the densify pass [1]. The
+                     per-sample LF-walks are independent, so this scales
+                     near-linearly; has no effect when coarsening or
+                     inspecting.
+  -h, --help         print this help message and exit
+
+The write is atomic (temp file + rename), so a failed run never leaves a
+partial index. re-sa warns if the index is currently staged in shared
+memory (there is no staleness check): run `bwa-mem3 shm -d` before
+re-aligning, or the stale segment will keep serving the old SA rate.

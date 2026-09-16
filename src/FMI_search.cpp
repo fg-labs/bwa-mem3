@@ -485,6 +485,14 @@ void FMI_search::densify_sa_into(const CP_OCC *cp_occ_src, const int64_t count_s
         exit(EXIT_FAILURE);
     }
 
+    /* This borrows the object's own index-state members (cp_occ/sa_*) and clears
+     * them before return, so it must only be called on a fresh FMI_search that
+     * owns no loaded buffers -- otherwise those buffers would leak. Both current
+     * callers (bwa_shm_pack_into, main_resa) pass a freshly-constructed object;
+     * guard the precondition so a future caller on a loaded index fails loudly. */
+    xassert(cp_occ == NULL && sa_ms_byte == NULL && sa_ls_word == NULL,
+            "densify_sa_into called on an FMI_search with loaded index buffers");
+
     /* Borrow the source index state so get_sa_entry_compressed() resolves any
      * BWT row against the SOURCE samples (its walk terminates on the source
      * mask). These members are cleared before return; nothing here is owned. */
