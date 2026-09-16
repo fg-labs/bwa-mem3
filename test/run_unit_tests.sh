@@ -125,6 +125,13 @@ ok "meth_sidecar_enrich_test"
 "$HERE/index_alt_sidecar_warn_test.sh" "$BWAMEM3" || fail "index_alt_sidecar_warn_test failed"
 ok "index_alt_sidecar_warn_test"
 
+# --- resa_byte_identity_test ----------------------------------------------
+# `re-sa` must resample an index's on-disk SA table to a file byte-identical to
+# `index -u` at the same rate (densify and coarsen), deterministically across
+# thread counts, no-op on the current rate, and leave alignments unchanged.
+"$HERE/resa_byte_identity_test.sh" "$BWAMEM3" "$FIXTURES" || fail "resa_byte_identity_test failed"
+ok "resa_byte_identity_test"
+
 # --- help_prescan_test ----------------------------------------------------
 # `mem --help` pre-scan must not match `--help` when it is the value of
 # an option that takes an argument (-R, -o, --set-as-failed, ...).

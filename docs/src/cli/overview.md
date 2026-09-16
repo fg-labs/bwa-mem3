@@ -1,7 +1,8 @@
 # CLI Reference Overview
 
-bwa-mem3 exposes four subcommands: `index`, `mem`, `shm`, and `version`. Run
-`bwa-mem3 <subcommand> --help` to see the full option list for any command.
+bwa-mem3 exposes five subcommands: `index`, `mem`, `shm`, `re-sa`, and
+`version`. Run `bwa-mem3 <subcommand> --help` to see the full option list for any
+command.
 
 `bwa-mem3 mem` is **command-line compatible with `bwa mem` and `bwa-mem2 mem`**
 — every existing flag is accepted, so an existing invocation runs unchanged. The
@@ -40,7 +41,12 @@ navigate.
 
 **[shm](shm.md)** stages an FM-index into POSIX shared memory so that
 repeated `bwa-mem3 mem` invocations on the same machine skip the per-run disk
-read. It also lists and destroys staged segments.
+read. It also lists and destroys staged segments, and can stage a denser
+suffix-array table on the fly (`-u`).
+
+**[re-sa](re-sa.md)** resamples an existing index's on-disk suffix-array table
+to a new sample rate in place, changing the space/speed trade-off without
+rebuilding from the FASTA. It is the on-disk counterpart of `shm -u`.
 
 **[version](version.md)** prints the bwa-mem3 release version and, when
 mimalloc is compiled in, the mimalloc version.

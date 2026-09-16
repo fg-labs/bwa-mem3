@@ -171,6 +171,42 @@ int main(int argc, char *argv[]) {
     /* Cleanup. */
     std::free(buf);
 
+    /* Densify parity (only when an oracle prefix is given): pack THIS index
+     * densified via the `shm -u` path to the oracle's rate, and confirm the
+     * staged SA sample arrays are byte-identical to the oracle -- an index
+     * physically built at that denser rate (index -u), an INDEPENDENT SA
+     * construction, not a self-consistency check. This is the only automated
+     * coverage of the shm densify path (bwa_shm_compute sizing +
+     * bwa_shm_pack_into's densify branch feeding densify_sa_into). */
+    if (argc >= 3) {
+        const char *oracle_prefix = argv[2];
+        FMI_search oracle(oracle_prefix);
+        oracle.load_index();
+        CHECK(oracle.sa_compx < ref.sa_compx);   /* oracle must be strictly denser */
+
+        bwa_shm_layout_t layout;
+        CHECK_EQ(bwa_shm_compute(prefix, &layout, /*bns_only=*/false,
+                                 (int)oracle.sa_compx, /*n_threads=*/1), 0);
+        CHECK_EQ(layout.sa_compx, oracle.sa_compx);         /* densify actually took */
+        CHECK(layout.sa_compx < layout.disk_sa_compx);
+        uint8_t *dbuf = (uint8_t *)std::malloc(layout.total_size);
+        CHECK(dbuf != NULL);
+        CHECK_EQ(bwa_shm_pack_into(&layout, dbuf), 0);
+        bwa_shm_layout_free(&layout);
+
+        uint64_t doff = 0, dsz = 0;
+        CHECK_EQ(bwa_shm_section_find(dbuf, BWA_SHM_SEC_FMI_SA_MS, &doff, &dsz), 0);
+        CHECK_EQ((int64_t)dsz, oracle.sa_ms_byte_size_bytes());
+        CHECK_EQ(std::memcmp(dbuf + doff, oracle.sa_ms_byte_data(), (size_t)dsz), 0);
+        CHECK_EQ(bwa_shm_section_find(dbuf, BWA_SHM_SEC_FMI_SA_LS, &doff, &dsz), 0);
+        CHECK_EQ((int64_t)dsz, oracle.sa_ls_word_size_bytes());
+        CHECK_EQ(std::memcmp(dbuf + doff, oracle.sa_ls_word_data(), (size_t)dsz), 0);
+        std::free(dbuf);
+        std::printf("shm_pack_round_trip_test: densify parity OK "
+                    "(shm -u staged 1/%d == index -u %lld)\n",
+                    1 << (int)oracle.sa_compx, (long long)oracle.sa_compx);
+    }
+
     std::printf("shm_pack_round_trip_test: OK\n");
     return 0;
 }

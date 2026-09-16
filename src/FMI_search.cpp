@@ -485,6 +485,30 @@ void FMI_search::densify_sa_into(const CP_OCC *cp_occ_src, const int64_t count_s
         exit(EXIT_FAILURE);
     }
 
+    /* This borrows the object's own index-state members (cp_occ/sa_*) and clears
+     * them before return, so it must only be called on a fresh FMI_search that
+     * owns no loaded buffers -- otherwise those buffers would leak. Both current
+     * callers (bwa_shm_pack_into, main_resa) pass a freshly-constructed object;
+     * guard the precondition so a future caller on a loaded index fails loudly. */
+    xassert(cp_occ == NULL && sa_ms_byte == NULL && sa_ls_word == NULL,
+            "densify_sa_into called on an FMI_search with loaded index buffers");
+
+    /* Validate count_src (the +1-adjusted cumulative C[]) before it drives the
+     * LF-walk: get_sa_entry_compressed() computes sp = count[b] + occ and indexes
+     * cp_occ[sp >> CP_SHIFT] with no bound check, so a non-monotonic or
+     * out-of-range C[] would read past cp_occ. The shm and re-sa callers both
+     * range-check on their own, but only re-sa checks monotonicity, so guard it
+     * here at the shared chokepoint. Valid adjusted range is [1, ref_seq_len+1]. */
+    for (int i = 0; i < 5; ++i) {
+        if (count_src[i] < 1 || count_src[i] > ref_seq_len + 1 ||
+            (i > 0 && count_src[i] < count_src[i - 1])) {
+            fprintf(stderr,
+                "ERROR! densify_sa_into: invalid count[] (non-monotonic or out of "
+                "[1, %lld])\n", (long long)(ref_seq_len + 1));
+            exit(EXIT_FAILURE);
+        }
+    }
+
     /* Borrow the source index state so get_sa_entry_compressed() resolves any
      * BWT row against the SOURCE samples (its walk terminates on the source
      * mask). These members are cleared before return; nothing here is owned. */

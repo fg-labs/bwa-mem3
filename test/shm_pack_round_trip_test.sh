@@ -29,5 +29,12 @@ if [[ "$need_index" -eq 1 ]]; then
     "$BIN" index "$PREFIX" > /dev/null 2>&1
 fi
 
-echo "[run] $INNER $PREFIX"
-"$INNER" "$PREFIX"
+# Build a denser oracle (index -u 2) so the inner test can check the `shm -u`
+# densify path against an independent from-scratch SA construction.
+ORACLE_DIR="$(mktemp -d)"
+trap 'rm -rf "$ORACLE_DIR"' EXIT
+cp "$PREFIX" "$ORACLE_DIR/phix.fa"
+"$BIN" index -u 2 "$ORACLE_DIR/phix.fa" > /dev/null 2>&1
+
+echo "[run] $INNER $PREFIX $ORACLE_DIR/phix.fa"
+"$INNER" "$PREFIX" "$ORACLE_DIR/phix.fa"

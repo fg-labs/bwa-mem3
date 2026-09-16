@@ -72,6 +72,68 @@ staged for **any** index — plain or seed — because `mem` pac-fetches referen
 bases from `.pac` on demand; that saves the seed's ~13 GB and the original's
 ~6.4 GB versus staging `.0123`.)
 
+### `-u INT` — densify the staged SA sample table
+
+Stages a **denser** suffix-array (SA) sample table than the one on disk, without
+rebuilding the index. SA resolution walks back (LF-mapping) to the nearest stored
+sample; one row in `1 << u` is sampled (the on-disk default is `u = 3`, one in 8).
+A denser table (smaller `INT`) means fewer LF steps per resolve, so faster
+alignment, in exchange for a larger staged segment. For example, `-u 2` stages a
+stride-4 table from a stock stride-8 index.
+
+The added samples are synthesised at stage time by the same LF-walk the resolver
+uses, so the staged table is **byte-identical** to one built on disk at that rate
+with [`index -u`](index-cmd.md#-u-int--sa-sample-rate) — alignments are unchanged.
+This byte-identity is a deterministic property of the construction (the LF-walk
+recovers exactly the SA value the resolver would compute for each added row), not
+a benchmarked measurement, so it holds independent of host, architecture, or SIMD
+tier; it is enforced by the shm densify-parity test (`test/shm_pack_round_trip_test.sh`),
+which checks the staged table against an independent `index -u` build.
+`INT` must be in `[0, 6]`; a value that is not strictly denser than the on-disk
+rate is ignored with a warning (the disk rate is staged unchanged). The extra
+memory is real: on hg38, `-u 2` adds ~4 GB to the staged segment.
+
+To make the denser table permanent on disk (so every `mem` and every future
+`shm` stage picks it up with no flag, at the cost of a larger index file), use
+[`re-sa`](re-sa.md) instead — it is the on-disk counterpart of this flag.
+
+### `-t, --threads INT` — densify worker threads
+
+Number of worker threads for the `-u` densify pass, default `1`. The per-sample
+LF-walks are independent and write disjoint slots, so densification scales
+near-linearly with thread count (on hg38, Graviton4, arm64/NEON tier, the
+densify pass runs ~11 min at `-t 1` and ~40 s at `-t 16`). Meaningful only with
+`-u`; a value `> 1` without `-u` warns and is ignored.
+
+## Performance
+
+Denser SA sampling lowers alignment CPU by shortening the LF-walk each SA
+resolve performs. Representative figures on hg38, a 5M-read-pair WGS slice
+(Graviton4, arm64/NEON tier, 16 threads), measured same-boot and interleaved —
+these are relative user-CPU deltas versus a plain stride-8 index, not absolute
+times:
+
+| `-u` | stride | user-CPU Δ vs stride-8 | added shared memory (hg38) |
+|---|---|---|---|
+| _(none)_ | 8 | — | — |
+| `-u 2` | 4 | **≈ −2.5 %** | +4 GB |
+| `-u 1` | 2 | **≈ −4.2 %** | +12 GB |
+
+**`-u 2` is the best speed-per-GB operating point and the recommended setting.**
+(Staging without `-u` does not select it — no-flag staging keeps the on-disk
+default rate, `u = 3` / stride 8; `-u 2` is an explicit opt-in.)
+The second halving (`-u 1`) is not sharply diminishing — it buys roughly another
+−1.7 % for +8 GB more — so it is worthwhile where the RAM is available (peak
+staging RSS is ~26 GB on hg38), but `-u 2` is the sweet spot. `-u 0` (stride-1)
+would need a host with well over 32 GB just to stage hg38 and is not recommended.
+The resolved coordinates are byte-identical either way — a deterministic property
+of the construction (denser sampling changes only LF-walk step counts, never the
+resolved coordinate), independent of host, architecture, or SIMD tier and enforced
+by `test/shm_pack_round_trip_test.sh`, not a benchmarked result. The *speed-up*
+above is a measurement (see the scope stated with the table) and scales with how
+resolve-heavy the workload is and how large the reference is, so treat the
+percentages as indicative rather than a guarantee for your data.
+
 ## Notes / Gotchas
 
 > **Warning — No staleness check — always destroy before re-indexing**
@@ -123,6 +185,7 @@ bases from `.pac` on demand; that saves the seed's ~13 GB and the original's
 **See also:**
 [Getting Started — Quick start: shared-memory index](../getting-started/quick-shm.md) ·
 [CLI Reference — index](index-cmd.md) ·
+[CLI Reference — re-sa](re-sa.md) ·
 [CLI Reference — mem](mem.md) ·
 [Best Practices — Multi-sample workflows](../best-practices/multi-sample.md) ·
 [Best Practices — Anti-patterns](../best-practices/anti-patterns.md)

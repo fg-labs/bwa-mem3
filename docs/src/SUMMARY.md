@@ -40,6 +40,7 @@
   - [index](cli/index-cmd.md)
   - [mem](cli/mem.md)
   - [shm](cli/shm.md)
+  - [re-sa](cli/re-sa.md)
   - [version](cli/version.md)
 - [Methylation Reference]()
   - [Overview](methylation/overview.md)

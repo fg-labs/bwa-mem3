@@ -29,6 +29,21 @@ bwa-mem3 shm --meth ref.fa
 A standard and a methylation index for the same reference can be staged simultaneously; they
 occupy separate named segments.
 
+### Optional: stage a denser SA table for faster resolves
+
+`shm -u INT` stages a **denser** suffix-array sample table than the one on disk, so alignment
+does fewer LF-walk steps per SA resolve — trading extra shared memory for speed, without
+rebuilding the index:
+
+```bash
+bwa-mem3 shm -u 2 --threads 16 ref.fa   # stage a stride-4 table from a stock stride-8 index
+```
+
+The synthesised table is byte-identical to one built at that rate, so alignments are unchanged.
+To make the denser rate **permanent on disk** (picked up by every later `mem` and `shm` with no
+flag), resample the index once with [`re-sa`](../cli/re-sa.md) instead. See
+[CLI Reference — shm](../cli/shm.md#-u-int--densify-the-staged-sa-sample-table) for details.
+
 ## Align using the staged index
 
 No extra flag is needed. When `bwa-mem3 mem` starts, it checks whether a matching shared-memory
