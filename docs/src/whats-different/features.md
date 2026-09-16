@@ -187,6 +187,41 @@ bwa-mem3 mem --meth ref.fa ...   # attaches automatically
 bwa-mem3 shm -d --meth ref.fa   # detaches
 ```
 
+## Suffix-array resampling: `shm -u` and `re-sa` (PR #510)
+
+Resolving a seed to a reference coordinate walks the BWT back (LF-mapping) to the
+nearest stored suffix-array (SA) sample; the index stores one sample per
+`1 << u` rows (default `u = 3`, one in 8). A **denser** table means fewer
+LF-walk steps per resolve — faster alignment — at the cost of a larger index and
+more resident memory. PR #510 makes that trade-off tunable on an existing index,
+two ways, both **byte-identical** to an index built at the target rate with
+`index -u` (denser sampling changes only LF-walk step counts, never the resolved
+coordinate):
+
+- **`bwa-mem3 shm -u INT [--threads INT]`** synthesises a denser SA table into
+  the shared-memory segment at stage time, without rebuilding or touching the
+  on-disk index. The added samples are recovered by the same LF-walk the resolver
+  uses; the per-sample walks are independent, so `--threads` scales the pass
+  near-linearly.
+- **`bwa-mem3 re-sa [-u INT] [-t INT] <idxbase>`** persists a resampled SA table
+  to disk (in place, atomically), so every later `mem` and `shm` picks up the new
+  rate with no flag. It densifies (smaller `-u`) via the same LF-walk or coarsens
+  (larger `-u`) by decimating the stored samples; with no `-u` it reports the
+  index's current rate.
+
+```bash
+bwa-mem3 shm -u 2 --threads 16 ref.fa   # stage a stride-4 table (transient)
+bwa-mem3 re-sa -u 2 -t 16 ref.fa        # or make stride-4 permanent on disk
+bwa-mem3 re-sa ref.fa                    # report the current SA rate
+```
+
+On hg38 (5M-read-pair WGS slice, Graviton4, arm64/NEON tier, 16 threads),
+`-u 2` (stride-4, +4 GB) lowers alignment user-CPU by ≈ 2.5 % versus the stock
+stride-8 index and is the recommended speed-per-GB operating point; `-u 1`
+(stride-2, +12 GB) reaches ≈ 4.2 % where the RAM allows. See
+[CLI Reference → re-sa](../cli/re-sa.md) and
+[shm → `-u`](../cli/shm.md#-u-int--densify-the-staged-sa-sample-table).
+
 ## `HN:i` hit count tag (PR #42)
 
 Every primary SAM/BAM record now carries an `HN:i:<n>` tag reporting the

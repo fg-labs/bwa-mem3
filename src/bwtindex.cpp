@@ -37,7 +37,9 @@
 #include <limits.h>
 #include <stdint.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include <zlib.h>
 
 #include "bntseq.h"
@@ -45,6 +47,8 @@
 #include "bwt.h"
 #include "utils.h"
 #include "FMI_search.h"
+#include "fm_index_writer.h"
+#include "bwa_shm.h"
 #include "kseq.h"
 #include "libsais_build.h"
 #include "system.h"
@@ -444,6 +448,318 @@ int bwa_index(int argc, char *argv[]) // the "index" command
 	int rc = bwa_idx_build(argv[optind], prefix, emit_unpacked_ref, user_sa_compx);
 	if (rc == 0) warn_if_sidecar_hides_alt(prefix);
 	return rc;
+}
+
+static void resa_usage(void)
+{
+	fprintf(stderr, "Usage: bwa-mem3 re-sa [-u INT] [-t INT] <idxbase>\n");
+	fprintf(stderr, "\n"
+	        "With -u, resample the on-disk SA sample table of an existing index to a\n"
+	        "new sample rate, rewriting <idxbase>.bwt.2bit.64 in place. This persists\n"
+	        "on disk what `shm -u` synthesises per-stage: a DENSER table (smaller -u)\n"
+	        "means fewer LF-walk steps per SA resolve at `mem` time, trading disk +\n"
+	        "memory for speed; a COARSER table (larger -u) shrinks the index. Only the\n"
+	        "SA-sample layer is touched -- the BWT/cp_occ and the sibling index files\n"
+	        "(.pac/.ann/.amb/.0123) are unchanged. Output is byte-identical to an index\n"
+	        "built at the target rate with `index -u`.\n\n"
+	        "Without -u, report the index's current on-disk SA sample rate and exit.\n\n"
+	        "  -u INT             target SA sample rate 1/(1<<INT), in [0,6]. Omit to\n"
+	        "                     just report the current rate. e.g. `-u 2` rewrites a\n"
+	        "                     stride-8 (default, -u 3) index as a stride-4 table.\n"
+	        "                     A target equal to the current rate is a no-op.\n"
+	        "  -t, --threads INT  worker threads for the densify pass [1]. The\n"
+	        "                     per-sample LF-walks are independent, so this scales\n"
+	        "                     near-linearly; has no effect when coarsening or\n"
+	        "                     inspecting.\n"
+	        "  -h, --help         print this help message and exit\n\n"
+	        "The write is atomic (temp file + rename), so a failed run never leaves a\n"
+	        "partial index. re-sa warns if the index is currently staged in shared\n"
+	        "memory (there is no staleness check): run `bwa-mem3 shm -d` before\n"
+	        "re-aligning, or the stale segment will keep serving the old SA rate.\n");
+}
+
+// Rewrite an existing index's SA sample table at a new rate. See resa_usage()
+// for the user-facing contract. The source .bwt.2bit.64 is mmap'd read-only, so
+// the (large) cp_occ block and disk SA samples are borrowed from the page cache
+// rather than copied onto the heap -- only the resampled destination arrays are
+// allocated. A denser target is filled by FMI_search::densify_sa_into (the same
+// LF-walk the resolver uses, so every synthesised sample is byte-identical to
+// `index -u`); a coarser target is a straight decimation of the disk table
+// (every (target-disk)-th sample), which needs no cp_occ walk.
+int main_resa(int argc, char *argv[]) // the "re-sa" command
+{
+	int c;
+	int target_sa_compx = -1;   // < 0 => inspect (report current rate) only
+	int n_threads       = 1;
+
+	// Honor `--help`/`-h` before getopt (which would flag -h as unknown). Skip the
+	// value token of an argument-taking option so `-u --help` / `-t --help` is a
+	// bad-value error from getopt below, not a spurious help request.
+	for (int i = 1; i < argc; ++i) {
+		const char *a = argv[i];
+		if (strcmp(a, "-u") == 0 || strcmp(a, "-t") == 0 ||
+		    strcmp(a, "--threads") == 0) {
+			++i;   // consume its value
+			continue;
+		}
+		if (strcmp(a, "--help") == 0 || strcmp(a, "-h") == 0) {
+			resa_usage();
+			return 0;
+		}
+	}
+
+	optind = 1;
+	opterr = 1;
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+	extern int optreset;
+	optreset = 1;
+#endif
+	static struct option long_opts[] = {
+		{"threads", required_argument, 0, 't'},
+		{"help",    no_argument,       0, 'h'},
+		{0, 0, 0, 0}
+	};
+	while ((c = getopt_long(argc, argv, "u:t:h", long_opts, NULL)) >= 0) {
+		if (c == 'u') {
+			// Strict strtol, mirroring `index -u`: [0,6] is the writer-supported
+			// range (1<<u must divide CP_BLOCK_SIZE=64).
+			char *end = NULL;
+			errno = 0;
+			long v = strtol(optarg, &end, 10);
+			if (errno || end == optarg || *end != '\0' || v < 0 || v > 6) {
+				fprintf(stderr, "[re-sa] -u must be an integer in [0,6]\n");
+				return 1;
+			}
+			target_sa_compx = (int)v;
+		} else if (c == 't') {
+			char *end = NULL;
+			errno = 0;
+			long v = strtol(optarg, &end, 10);
+			if (errno || end == optarg || *end != '\0' || v < 1 || v > 1024) {
+				fprintf(stderr, "[re-sa] -t must be an integer in [1,1024]\n");
+				return 1;
+			}
+			n_threads = (int)v;
+		} else if (c == 'h') {
+			resa_usage();
+			return 0;
+		} else {
+			return 1;   // getopt printed the error
+		}
+	}
+
+	if (optind + 1 != argc) {
+		fprintf(stderr, "[re-sa] expected exactly one <idxbase>\n");
+		resa_usage();
+		return 1;
+	}
+	const char *prefix = argv[optind];
+
+	char cp_path[PATH_MAX];
+	{
+		int n = snprintf(cp_path, sizeof(cp_path), "%s%s", prefix, CP_FILENAME_SUFFIX);
+		if (n < 0 || (size_t)n >= sizeof(cp_path)) {
+			fprintf(stderr, "[re-sa] index path too long for prefix '%s'\n", prefix);
+			return 1;
+		}
+	}
+
+	int fd = open(cp_path, O_RDONLY);
+	if (fd < 0) {
+		fprintf(stderr, "[re-sa] cannot open '%s': %s\n", cp_path, strerror(errno));
+		return 1;
+	}
+	struct stat st;
+	if (fstat(fd, &st) != 0) {
+		fprintf(stderr, "[re-sa] fstat('%s') failed: %s\n", cp_path, strerror(errno));
+		close(fd);
+		return 1;
+	}
+	const int64_t file_size = (int64_t)st.st_size;
+
+	// Header: ref_seq_len, then the RAW cumulative C[] (written back verbatim).
+	int64_t hdr[6];
+	if (file_size < FMI_BWT2BIT_HDR_BYTES ||
+	    pread(fd, hdr, sizeof(hdr), 0) != (ssize_t)sizeof(hdr)) {
+		fprintf(stderr, "[re-sa] %s: truncated header\n", cp_path);
+		close(fd);
+		return 1;
+	}
+	const int64_t ref_seq_len = hdr[0];
+	int64_t count_raw[5];
+	memcpy(count_raw, &hdr[1], sizeof(count_raw));
+	if (ref_seq_len <= 0 || ref_seq_len > 0x7fffffffffLL) {
+		fprintf(stderr, "[re-sa] %s: reference_seq_len=%lld out of bounds\n",
+		        cp_path, (long long)ref_seq_len);
+		close(fd);
+		return 1;
+	}
+	for (int i = 0; i < 5; ++i) {
+		if (count_raw[i] < 0 || count_raw[i] > ref_seq_len ||
+		    (i > 0 && count_raw[i] < count_raw[i - 1])) {
+			fprintf(stderr, "[re-sa] %s: count[] corrupt (bad/non-monotonic)\n", cp_path);
+			close(fd);
+			return 1;
+		}
+	}
+
+	// Disk SA rate: the trailing tag if present, else the legacy default.
+	const int64_t disk_sa_compx =
+		detect_sa_compx(fd, file_size, ref_seq_len, SA_COMPX);
+
+	// -t only affects densification (a target below the current rate). Warn if it
+	// was set but no densify will happen (inspection, no-op, or coarsen), mirroring
+	// `shm`'s "--threads without -u" warning.
+	if (n_threads > 1 && !(target_sa_compx >= 0 && target_sa_compx < disk_sa_compx)) {
+		fprintf(stderr,
+		        "[re-sa] -t/--threads only affects densification (a -u below the "
+		        "current rate 1/%d); ignoring\n", 1 << (int)disk_sa_compx);
+	}
+
+	// Inspection mode: no -u given -> report the current rate and exit.
+	if (target_sa_compx < 0) {
+		int64_t disk_count = (ref_seq_len >> disk_sa_compx) + 1;
+		fprintf(stderr,
+		        "[re-sa] %s: SA sample rate 1/%d (shift %lld), ref_seq_len %lld, "
+		        "%lld samples\n",
+		        cp_path, 1 << (int)disk_sa_compx, (long long)disk_sa_compx,
+		        (long long)ref_seq_len, (long long)disk_count);
+		close(fd);
+		return 0;
+	}
+
+	if (target_sa_compx == disk_sa_compx) {
+		fprintf(stderr,
+		        "[re-sa] %s already at SA rate 1/%d (shift %d); nothing to do\n",
+		        cp_path, 1 << (int)disk_sa_compx, (int)disk_sa_compx);
+		close(fd);
+		return 0;
+	}
+
+	// From here we will mutate the on-disk index. Shared memory has no staleness
+	// check, so a live segment would keep serving the OLD SA rate. Alignments
+	// stay correct (the rate change is alignment-invariant); the cost is that the
+	// new rate's performance is silently not picked up until the segment is
+	// re-staged. Warn (best-effort) but proceed -- consistent with how the
+	// `index`/`shm` footgun is handled.
+	if (bwa_shm_test(prefix) == 1) {
+		fprintf(stderr,
+		        "[re-sa] WARNING: '%s' is currently staged in shared memory. This "
+		        "rewrite will NOT update the staged segment; run `bwa-mem3 shm -d` "
+		        "(and re-stage if desired) or `mem` will keep serving the old SA "
+		        "rate.\n", prefix);
+	}
+
+	// Section offsets in the DISK layout (disk stride), from the shared layout
+	// helper so the reader agrees bit-for-bit with the writer. The target-rate
+	// layout gives the destination sample count. sentinel_index sits right after
+	// the SA arrays.
+	const Bwt2bitLayout disk_layout = fmi_bwt2bit_layout(ref_seq_len, (int)disk_sa_compx);
+	const int64_t cp_occ_size = disk_layout.cp_occ_count;
+	const int64_t disk_count  = disk_layout.sa_sample_count;
+	const int64_t dst_count   = fmi_bwt2bit_layout(ref_seq_len, target_sa_compx).sa_sample_count;
+	const int64_t off_ms   = disk_layout.off_ms_byte;
+	const int64_t off_ls   = disk_layout.off_ls_word;
+	const int64_t off_sent = disk_layout.off_sentinel;
+	if (file_size < off_sent + (int64_t)sizeof(int64_t)) {
+		fprintf(stderr, "[re-sa] %s: file too small for its declared layout "
+		        "(corrupt?)\n", cp_path);
+		close(fd);
+		return 1;
+	}
+
+	// Borrow cp_occ from the page cache instead of copying it onto the heap: it
+	// is read-only here and dominates the index size (~6.4 GB on hg38). cp_occ
+	// sits at FMI_BWT2BIT_HDR_BYTES (mod 8 == 0) on a page-aligned map, so its
+	// 8-byte-aligned int64 fields are safe to read in place.
+	void *map = mmap(NULL, (size_t)file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+	if (map == MAP_FAILED) {
+		fprintf(stderr, "[re-sa] mmap('%s', %lld bytes) failed: %s\n",
+		        cp_path, (long long)file_size, strerror(errno));
+		close(fd);
+		return 1;
+	}
+	const uint8_t  *base    = (const uint8_t *)map;
+	const CP_OCC   *cp_occ  = (const CP_OCC   *)(base + FMI_BWT2BIT_HDR_BYTES);
+	const int8_t   *disk_ms = (const int8_t   *)(base + off_ms);   // int8: any alignment
+	int64_t sentinel_index;
+	memcpy(&sentinel_index, base + off_sent, sizeof(int64_t));
+	if (sentinel_index < 0 || sentinel_index >= ref_seq_len) {
+		fprintf(stderr, "[re-sa] %s: sentinel_index=%lld out of bounds\n",
+		        cp_path, (long long)sentinel_index);
+		munmap(map, (size_t)file_size);
+		close(fd);
+		return 1;
+	}
+
+	// sa_ls_word is uint32 but its file offset follows the odd-length sa_ms
+	// array, so base+off_ls is not guaranteed 4-byte aligned — reading uint32
+	// through it in place is UB (every other reader freads it into an aligned
+	// buffer). Copy it into an aligned heap buffer; cp_occ stays borrowed.
+	uint32_t *disk_ls = (uint32_t *)malloc((size_t)disk_count * sizeof(uint32_t));
+	int8_t   *dst_ms  = (int8_t   *)malloc((size_t)dst_count  * sizeof(int8_t));
+	uint32_t *dst_ls  = (uint32_t *)malloc((size_t)dst_count  * sizeof(uint32_t));
+	if (!disk_ls || !dst_ms || !dst_ls) {
+		fprintf(stderr, "[re-sa] out of memory sizing SA resample buffers\n");
+		free(disk_ls); free(dst_ms); free(dst_ls);
+		munmap(map, (size_t)file_size);
+		close(fd);
+		return 1;
+	}
+	memcpy(disk_ls, base + off_ls, (size_t)disk_count * sizeof(uint32_t));
+
+	const bool densify = (target_sa_compx < disk_sa_compx);
+	struct timespec t0, t1;
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	if (densify) {
+		// Recover each added sample by the resolver's own LF-walk against the disk
+		// samples. densify_sa_into needs the +1-adjusted C[].
+		fprintf(stderr, "[re-sa] densifying SA samples %lld -> %lld "
+		        "(rate 1/%d -> 1/%d, %d thread%s); this can take a while for large "
+		        "indices...\n",
+		        (long long)disk_count, (long long)dst_count,
+		        1 << (int)disk_sa_compx, 1 << target_sa_compx,
+		        n_threads, n_threads == 1 ? "" : "s");
+		int64_t count_adj[5];
+		for (int i = 0; i < 5; ++i) count_adj[i] = count_raw[i] + 1;
+		FMI_search fmi(prefix);
+		fmi.densify_sa_into(cp_occ, count_adj, ref_seq_len, sentinel_index,
+		                    disk_ms, disk_ls, disk_sa_compx,
+		                    dst_ms, dst_ls, target_sa_compx, n_threads);
+	} else {
+		// Coarsen: every target-sampled row is also a disk-sampled row (both
+		// periods divide 64 and target > disk), so decimate the disk table --
+		// row = j << target, disk index = row >> disk = j << (target - disk).
+		// Serial: this is a memory-bandwidth-bound gather that gains nothing from
+		// threads, so -t is (as documented) ignored here.
+		const int shift = target_sa_compx - (int)disk_sa_compx;
+		for (int64_t j = 0; j < dst_count; ++j) {
+			int64_t s = j << shift;
+			dst_ms[j] = disk_ms[s];
+			dst_ls[j] = disk_ls[s];
+		}
+	}
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	const double fill_secs = (t1.tv_sec - t0.tv_sec)
+	                       + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+	fprintf(stderr, "[re-sa] %s SA samples %lld -> %lld (rate 1/%d -> 1/%d) in %.1fs\n",
+	        densify ? "densified" : "coarsened",
+	        (long long)disk_count, (long long)dst_count,
+	        1 << (int)disk_sa_compx, 1 << target_sa_compx, fill_secs);
+
+	// cp_occ is copied through unchanged (it does not depend on the SA rate); the
+	// writer reads it from the mmap and rewrites the file atomically (tmp+rename)
+	// before we unmap.
+	rewrite_fm_index_resampled_sa(cp_path, ref_seq_len, count_raw,
+	                              cp_occ, cp_occ_size, dst_ms, dst_ls, dst_count,
+	                              sentinel_index, target_sa_compx);
+
+	free(disk_ls); free(dst_ms); free(dst_ls);
+	munmap(map, (size_t)file_size);
+	close(fd);
+	fprintf(stderr, "[re-sa] wrote %s at SA rate 1/%d (shift %d)\n",
+	        cp_path, 1 << target_sa_compx, target_sa_compx);
+	return 0;
 }
 
 int bwa_idx_build(const char *fa, const char *prefix, int emit_unpacked_ref, int sa_compx)

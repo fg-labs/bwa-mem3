@@ -220,6 +220,30 @@ class FMI_search: public indexEle
      * destructor munmaps `base` and leaves the aliased buffers untouched. */
     void load_index_from_shm(uint8_t *base, size_t len);
 
+    /* Densify the SA sample table on the fly: given an existing FM-index's
+     * checkpoint-occ block, C[] array, and SA samples taken at stride
+     * `src_compx` (shift), synthesize the samples for a DENSER stride
+     * `dst_compx` (dst_compx < src_compx). For each destination-sampled BWT row
+     * whose value is not already present in the source table, the value is
+     * recovered by the same LF-walk the resolver uses (get_sa_entry_compressed
+     * evaluated against the SOURCE stride), so every synthesized sample is
+     * byte-identical to what an index physically built at `dst_compx` would
+     * hold. Used by `bwa-mem3 shm -u INT` to stage a denser SA table without
+     * rebuilding the on-disk index. All pointer arguments are BORROWED: they
+     * are cleared before return so this object's destructor frees nothing.
+     * dst_ms/dst_ls must be sized for (ref_seq_len >> dst_compx) + 1 samples;
+     * src_ms/src_ls for (ref_seq_len >> src_compx) + 1. Aborts on invalid
+     * strides (must satisfy 0 <= dst_compx < src_compx <= 6).
+     * n_threads: the per-destination-sample LF-walks are independent and write
+     * disjoint slots, so the fill loop parallelizes with no locking; <=1 runs
+     * serially. get_sa_entry_compressed only reads shared index state. */
+    void densify_sa_into(const CP_OCC *cp_occ_src, const int64_t count_src[5],
+                         int64_t ref_seq_len, int64_t sentinel_idx,
+                         const int8_t *src_ms, const uint32_t *src_ls,
+                         int64_t src_compx,
+                         int8_t *dst_ms, uint32_t *dst_ls, int64_t dst_compx,
+                         int n_threads = 1);
+
     /* matchArray sizing contract (applies to all four SMEM-emitting methods
      * below). The previous internal `max_smem` capacity guard was removed;
      * the caller MUST pre-size matchArray to hold at least:

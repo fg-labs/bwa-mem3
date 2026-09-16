@@ -218,11 +218,13 @@ static int ctl_walk(bwa_shm_ctl_cb_t cb, void *ctx)
 
 extern "C" {
 
-int bwa_shm_compute(const char *prefix, bwa_shm_layout_t *layout, bool bns_only)
+int bwa_shm_compute(const char *prefix, bwa_shm_layout_t *layout, bool bns_only,
+                    int target_sa_compx, int n_threads)
 {
     if (prefix == NULL || layout == NULL) return -1;
 
     memset(layout, 0, sizeof(*layout));
+    layout->densify_threads = (n_threads > 1) ? n_threads : 1;
     size_t plen = strlen(prefix);
     if (plen + 1 > sizeof(layout->prefix)) {
         fprintf(stderr, "[E::%s] prefix too long\n", __func__);
@@ -309,17 +311,45 @@ int bwa_shm_compute(const char *prefix, bwa_shm_layout_t *layout, bool bns_only)
             bwa_shm_layout_free(layout);
             return -1;
         }
-        layout->sa_compx = detect_sa_compx(fileno(cp), (int64_t)st.st_size, layout->reference_seq_len, SA_COMPX);
+        layout->disk_sa_compx = detect_sa_compx(fileno(cp), (int64_t)st.st_size, layout->reference_seq_len, SA_COMPX);
+    }
+
+    /* On-the-fly SA densification (bwa-mem3 shm -u INT). The SA sample table is
+     * staged at layout->sa_compx; by default that equals the disk rate. A
+     * target strictly denser than disk (and within the writer-enforced [0,6])
+     * sizes the SA sections for the denser rate here; bwa_shm_pack_into then
+     * synthesizes the added samples via an LF-walk against the disk samples.
+     * A target that is not strictly denser (>= disk, or out of range) is
+     * ignored with a warning and the disk rate is staged unchanged — a request
+     * to "densify" to an equal/coarser rate is a no-op, not an error. */
+    layout->sa_compx = layout->disk_sa_compx;
+    if (target_sa_compx >= 0) {
+        if (target_sa_compx < layout->disk_sa_compx && target_sa_compx <= 6) {
+            layout->sa_compx = target_sa_compx;
+        } else {
+            fprintf(stderr,
+                "[W::%s] -u %d ignored: not strictly denser than the on-disk SA "
+                "rate (shift %lld) or out of [0,6]; staging the disk rate\n",
+                __func__, target_sa_compx, (long long)layout->disk_sa_compx);
+        }
     }
 
     int64_t cp_occ_count = (layout->reference_seq_len >> CP_SHIFT) + 1;
-    int64_t sa_count     = (layout->reference_seq_len >> layout->sa_compx) + 1;
     int64_t cp_occ_bytes = cp_occ_count * (int64_t)sizeof(CP_OCC);
+
+    /* SA section sizing uses the STAGED stride (layout->sa_compx), which may be
+     * denser than disk when -u densifies. */
+    int64_t sa_count     = (layout->reference_seq_len >> layout->sa_compx) + 1;
     int64_t sa_ms_bytes  = sa_count     * (int64_t)sizeof(int8_t);
     int64_t sa_ls_bytes  = sa_count     * (int64_t)sizeof(uint32_t);
 
-    int64_t sentinel_off = (int64_t)BWA_BWT_2BIT_HEADER_BYTES
-                         + cp_occ_bytes + sa_ms_bytes + sa_ls_bytes;
+    /* The sentinel_index int64 sits AFTER the on-disk SA arrays in
+     * <prefix>.bwt.2bit.64, so its file offset must be computed from the DISK
+     * stride (layout->disk_sa_compx) regardless of what we stage. */
+    int64_t disk_sa_count = (layout->reference_seq_len >> layout->disk_sa_compx) + 1;
+    int64_t sentinel_off  = (int64_t)BWA_BWT_2BIT_HEADER_BYTES + cp_occ_bytes
+                          + disk_sa_count * (int64_t)sizeof(int8_t)
+                          + disk_sa_count * (int64_t)sizeof(uint32_t);
     if (fseek(cp, (long)sentinel_off, SEEK_SET) != 0) {
         fprintf(stderr, "[E::%s] fseek(%lld) failed in %s\n",
                 __func__, (long long)sentinel_off, cp_path);
@@ -435,7 +465,20 @@ int bwa_shm_pack_into(const bwa_shm_layout_t *layout, uint8_t *dest)
         memcpy(dest + sec[0].offset, scratch, sizeof(scratch));
     }
 
-    /* 4. CP_OCC + SA_MS + SA_LS: one fp, three contiguous freads. */
+    /* 4. CP_OCC + SA_MS + SA_LS from <prefix>.bwt.2bit.64.
+     *
+     * No densify (sa_compx == disk_sa_compx): the SA sample arrays on disk are
+     * exactly what we stage, so cp_occ / sa_ms / sa_ls stream contiguously
+     * straight into their sections — one fp, three freads.
+     *
+     * Densify (sa_compx < disk_sa_compx): cp_occ still streams straight in, but
+     * the disk SA arrays are at the coarser disk stride. Read them into heap
+     * temporaries, then synthesize the denser sample table directly into the
+     * (larger) sec[2]/sec[3] via FMI_search::densify_sa_into — an LF-walk over
+     * the just-staged cp_occ + the disk samples. The result is byte-identical
+     * to an index physically built at the denser stride. */
+    const bool densify = (layout->sa_compx != layout->disk_sa_compx);
+
     char cp_path[PATH_MAX];
     path_concat2(cp_path, layout->prefix, CP_FILENAME_SUFFIX);
     FILE *cp = xopen(cp_path, "rb");
@@ -444,10 +487,55 @@ int bwa_shm_pack_into(const bwa_shm_layout_t *layout, uint8_t *dest)
         err_fclose(cp);
         return -1;
     }
+    /* CP_OCC first (identical in both modes). */
     err_fread_noeof(dest + sec[1].offset, 1, (size_t)sec[1].size, cp);
-    err_fread_noeof(dest + sec[2].offset, 1, (size_t)sec[2].size, cp);
-    err_fread_noeof(dest + sec[3].offset, 1, (size_t)sec[3].size, cp);
-    err_fclose(cp);
+
+    if (!densify) {
+        err_fread_noeof(dest + sec[2].offset, 1, (size_t)sec[2].size, cp);
+        err_fread_noeof(dest + sec[3].offset, 1, (size_t)sec[3].size, cp);
+        err_fclose(cp);
+    } else {
+        const int64_t disk_count =
+            (layout->reference_seq_len >> layout->disk_sa_compx) + 1;
+        int8_t   *disk_ms = (int8_t   *)malloc((size_t)disk_count * sizeof(int8_t));
+        uint32_t *disk_ls = (uint32_t *)malloc((size_t)disk_count * sizeof(uint32_t));
+        if (disk_ms == NULL || disk_ls == NULL) {
+            fprintf(stderr,
+                "[E::%s] OOM allocating %lld disk SA samples for densify\n",
+                __func__, (long long)disk_count);
+            free(disk_ms); free(disk_ls);
+            err_fclose(cp);
+            return -1;
+        }
+        err_fread_noeof(disk_ms, sizeof(int8_t),   (size_t)disk_count, cp);
+        err_fread_noeof(disk_ls, sizeof(uint32_t), (size_t)disk_count, cp);
+        err_fclose(cp);
+
+        /* Resolve the denser samples against the staged cp_occ + disk samples.
+         * The FMI_search view borrows all pointers (cleared before its dtor). */
+        FMI_search fmi(layout->prefix);
+        fmi.densify_sa_into(
+            (const CP_OCC *)(dest + sec[1].offset),
+            layout->count,
+            layout->reference_seq_len,
+            layout->sentinel_index,
+            disk_ms, disk_ls, layout->disk_sa_compx,
+            (int8_t   *)(dest + sec[2].offset),
+            (uint32_t *)(dest + sec[3].offset),
+            layout->sa_compx,
+            layout->densify_threads);
+
+        free(disk_ms);
+        free(disk_ls);
+
+        fprintf(stderr,
+            "[M::%s] densified SA samples %lld -> %lld (stride shift %lld -> %lld, %d thread%s)\n",
+            __func__,
+            (long long)disk_count,
+            (long long)((layout->reference_seq_len >> layout->sa_compx) + 1),
+            (long long)layout->disk_sa_compx, (long long)layout->sa_compx,
+            layout->densify_threads, layout->densify_threads == 1 ? "" : "s");
+    }
 
     /* 5. BNS_STRUCT, BNS_AMBS, BNS_ANNS — all small. SAM-A3: pos2rid_bucket is
      * a derived, process-private heap allocation that the attach path rebuilds
@@ -579,7 +667,8 @@ int bwa_shm_destroy(void)
     return 0;
 }
 
-int bwa_shm_stage(const char *prefix, bool bns_only)
+int bwa_shm_stage(const char *prefix, bool bns_only, int target_sa_compx,
+                  int n_threads)
 {
     if (prefix == NULL || prefix[0] == '\0') {
         std::fprintf(stderr, "[E::%s] empty prefix\n", __func__);
@@ -604,7 +693,7 @@ int bwa_shm_stage(const char *prefix, bool bns_only)
 
     /* 1. Compute the layout (loads BNS; peeks scalars from the FMI file). */
     bwa_shm_layout_t layout;
-    if (bwa_shm_compute(prefix, &layout, bns_only) != 0) {
+    if (bwa_shm_compute(prefix, &layout, bns_only, target_sa_compx, n_threads) != 0) {
         std::fprintf(stderr, "[E::%s] failed to compute layout for '%s'\n",
                      __func__, prefix);
         return -1;
@@ -965,12 +1054,24 @@ static int hint_missing_meth_flag(const char *prefix)
 static void print_shm_usage(void)
 {
     std::fprintf(stderr,
-        "\nUsage: bwa-mem3 shm [-d|-l|--help] [--meth] [idxbase]\n\n"
+        "\nUsage: bwa-mem3 shm [-d|-l|--help] [--meth] [-u INT] [-t INT] [idxbase]\n\n"
         "Options:\n"
         "  -d        destroy all indices in shared memory (matches bwa v1 behavior)\n"
         "  -l        list names of indices in shared memory\n"
         "  --meth    stage a `bwa-mem3 index --meth` index — auto-appends\n"
         "            `.meth` to <idxbase>, mirroring `mem --meth`\n"
+        "  -u INT    densify the staged SA sample table to sample-rate shift INT\n"
+        "            (in [0,6]) when it is denser than the on-disk rate. Trades a\n"
+        "            one-time staging cost + extra shared memory for faster SA\n"
+        "            resolution at `mem` time, WITHOUT rebuilding the on-disk\n"
+        "            index. e.g. `-u 2` stages a stride-4 table from a stock\n"
+        "            stride-8 (default) index. A value >= the disk rate is a\n"
+        "            no-op (warns). Output is byte-identical either way.\n"
+        "  -t, --threads INT\n"
+        "            worker threads for the -u densify pass (default 1). The\n"
+        "            per-sample walks are independent, so this scales near-\n"
+        "            linearly; has no effect unless -u actually densifies (a\n"
+        "            target denser than the on-disk rate).\n"
         "  -h --help print this help and exit\n\n"
         "Stage with no flags: `bwa-mem3 shm <idxbase>` loads the index into\n"
         "POSIX shared memory; subsequent `bwa-mem3 mem <idxbase> ...` runs\n"
@@ -993,12 +1094,23 @@ static void print_shm_usage(void)
 int main_shm(int argc, char *argv[])
 {
     int c, to_list = 0, to_drop = 0, meth = 0, ret = 0;
+    int target_sa_compx = -1;   /* -1 = stage the on-disk SA rate unchanged */
+    int n_threads = 1;          /* worker count for the -u densify pass */
 
     /* Pre-scan for --help / -h. getopt_long would treat -h as unknown
      * (no short opt declared) and print a generic error, but the top-level
      * usage advertises `bwa-mem3 <command> --help`, so we honor both. */
     for (int i = 1; i < argc; ++i) {
-        if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
+        const char *a = argv[i];
+        /* Skip the value token of an argument-taking option so `-u --help` /
+         * `-t --help` is a bad-value error from getopt below, not a spurious
+         * help request. */
+        if (std::strcmp(a, "-u") == 0 || std::strcmp(a, "-t") == 0 ||
+            std::strcmp(a, "--threads") == 0) {
+            ++i;
+            continue;
+        }
+        if (std::strcmp(a, "--help") == 0 || std::strcmp(a, "-h") == 0) {
             print_shm_usage();
             return 0;
         }
@@ -1014,13 +1126,46 @@ int main_shm(int argc, char *argv[])
     optreset = 1;
 #endif
     static struct option long_opts[] = {
-        {"meth", no_argument, 0, 1000},
-        {0,      0,           0, 0   }
+        {"meth",    no_argument,       0, 1000},
+        {"threads", required_argument, 0, 't' },
+        {0,         0,                 0, 0   }
     };
-    while ((c = getopt_long(argc, argv, "ld", long_opts, NULL)) >= 0) {
+    while ((c = getopt_long(argc, argv, "ldu:t:", long_opts, NULL)) >= 0) {
         if      (c == 'l')   to_list = 1;
         else if (c == 'd')   to_drop = 1;
         else if (c == 1000)  meth    = 1;
+        else if (c == 't') {
+            /* Worker count for the -u densify pass. Bare positive integer;
+             * clamped to a sane upper bound so a fat-fingered value can't spin
+             * up an absurd team. Meaningful only with -u (warned below). */
+            char *end = NULL;
+            errno = 0;
+            long v = strtol(optarg, &end, 10);
+            if (errno != 0 || end == optarg || *end != '\0' || v < 1 || v > 1024) {
+                std::fprintf(stderr,
+                    "[E::%s] --threads expects an integer in [1,1024], got '%s'\n",
+                    __func__, optarg);
+                return 1;
+            }
+            n_threads = (int)v;
+        }
+        else if (c == 'u') {
+            /* Target SA sample-rate shift to densify to at stage time. Validate
+             * as a bare non-negative integer in [0,6] (the writer-enforced
+             * range; the sample period 1<<u must divide CP_BLOCK_SIZE=64).
+             * Whether it is actually denser than THIS index's disk rate is
+             * checked in bwa_shm_compute, which has read the disk rate. */
+            char *end = NULL;
+            errno = 0;
+            long v = strtol(optarg, &end, 10);
+            if (errno != 0 || end == optarg || *end != '\0' || v < 0 || v > 6) {
+                std::fprintf(stderr,
+                    "[E::%s] -u expects an integer in [0,6], got '%s'\n",
+                    __func__, optarg);
+                return 1;
+            }
+            target_sa_compx = (int)v;
+        }
         else                 return 1;   /* getopt printed the error */
     }
     if (optind == argc && !to_list && !to_drop) {
@@ -1031,6 +1176,21 @@ int main_shm(int argc, char *argv[])
         std::fprintf(stderr,
             "[E::%s] -l or -d cannot be combined with idxbase\n", __func__);
         return 1;
+    }
+    if (target_sa_compx >= 0 && (to_list || to_drop)) {
+        std::fprintf(stderr,
+            "[E::%s] -u cannot be combined with -l or -d\n", __func__);
+        return 1;
+    }
+    if (n_threads > 1 && (to_list || to_drop)) {
+        std::fprintf(stderr,
+            "[E::%s] --threads cannot be combined with -l or -d\n", __func__);
+        return 1;
+    }
+    if (n_threads > 1 && target_sa_compx < 0) {
+        std::fprintf(stderr,
+            "[W::%s] --threads only affects the -u densify pass; ignoring "
+            "without -u\n", __func__);
     }
     if (meth && (to_list || to_drop)) {
         std::fprintf(stderr,
@@ -1056,7 +1216,8 @@ int main_shm(int argc, char *argv[])
         }
         /* --meth stages a SEED-only segment: omit PAC + REF_STRING (.0123),
          * which `mem --meth` never reads. Saves ~14.5 GB of shm on hg38. */
-        if (bwa_shm_stage(user_prefix, /*bns_only=*/meth != 0) < 0) {
+        if (bwa_shm_stage(user_prefix, /*bns_only=*/meth != 0, target_sa_compx,
+                          n_threads) < 0) {
             std::fprintf(stderr,
                 "[E::%s] failed to stage '%s' in shared memory\n",
                 __func__, user_prefix);

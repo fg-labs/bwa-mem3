@@ -96,7 +96,16 @@ extern "C" {
 	 * are packed, but PAC and REF_STRING (.0123) are omitted (zero-length
 	 * sections) because `mem --meth` never reads the seed pac/.0123. The seed
 	 * `.0123` need not even exist on disk. Saves ~14.5 GB of shm on hg38. */
-	int       bwa_shm_stage(const char *prefix, bool bns_only = false); /* loads from disk, packs, stages */
+	/* target_sa_compx: if in [0, disk_sa_compx), the staged SA sample table is
+	 * densified to this shift on the fly (see bwa-mem3 shm -u); -1 (default)
+	 * stages the disk sample rate unchanged. Densifying trades a one-time
+	 * staging cost + extra shm for faster per-query SA resolution, without
+	 * rebuilding the on-disk index.
+	 * n_threads: worker count for the densify pass (the per-sample LF-walks are
+	 * independent); <=0 or 1 runs it serially. Ignored when not densifying. */
+	int       bwa_shm_stage(const char *prefix, bool bns_only = false,
+	                        int target_sa_compx = -1,
+	                        int n_threads = 1); /* loads from disk, packs, stages */
 	int       bwa_shm_destroy(void);                                 /* drops all (matches v1 -d) */
 	int       bwa_shm_list(void);                                    /* prints staged indices to stdout */
 	int       main_shm(int argc, char *argv[]);                      /* CLI entry — see src/main.cpp dispatch */
@@ -116,7 +125,12 @@ extern "C" {
 		int64_t  reference_seq_len;
 		int64_t  count[5];               /* +1-adjusted, ready to write */
 		int64_t  sentinel_index;
-		int64_t  sa_compx;                /* SA sample-rate shift; tail-detected from disk */
+		int64_t  sa_compx;                /* SA sample-rate shift STAGED into shm. Equals
+		                                   * disk_sa_compx unless `shm -u` densified it. */
+		int64_t  disk_sa_compx;           /* SA shift on disk (tail-detected). Source stride
+		                                   * for a densify pass; == sa_compx when not densifying. */
+		int       densify_threads;        /* worker count for the SA densify pass (>=1);
+		                                   * 1 == serial. Ignored when not densifying. */
 		int64_t  ref_string_len;         /* file size of <prefix>.0123 */
 		uint64_t total_size;
 		uint32_t n_sections;
@@ -126,7 +140,9 @@ extern "C" {
 	/* Compute layout and load BNS. Returns 0 on success, -1 on error. When
 	 * bns_only=true, the PAC and REF_STRING sections are sized to zero and the
 	 * `.0123` is not stat'd (the seed `.0123` need not exist) — see bwa_shm_stage. */
-	int  bwa_shm_compute(const char *prefix, bwa_shm_layout_t *layout, bool bns_only = false);
+	int  bwa_shm_compute(const char *prefix, bwa_shm_layout_t *layout,
+	                     bool bns_only = false, int target_sa_compx = -1,
+	                     int n_threads = 1);
 
 	/* Pack the index described by `layout` into `dest`, which must be at least
 	 * layout->total_size bytes. Streams cp_occ / sa_* / pac / ref_string from

@@ -345,6 +345,20 @@ static void write_fm_index_streaming_typed(int fd,
     *out_sentinel_index = sentinel_index;
 }
 
+Bwt2bitLayout fmi_bwt2bit_layout(int64_t ref_seq_len, int sa_compx)
+{
+    Bwt2bitLayout L;
+    L.cp_occ_count     = (ref_seq_len >> CP_SHIFT) + 1;
+    L.sa_sample_count  = (ref_seq_len >> sa_compx) + 1;
+    L.off_cp_occ       = FMI_BWT2BIT_HDR_BYTES;
+    L.off_ms_byte      = L.off_cp_occ   + L.cp_occ_count    * (int64_t)sizeof(CP_OCC);
+    L.off_ls_word      = L.off_ms_byte  + L.sa_sample_count * (int64_t)sizeof(int8_t);
+    L.off_sentinel     = L.off_ls_word  + L.sa_sample_count * (int64_t)sizeof(uint32_t);
+    L.off_sa_compx_tag = L.off_sentinel + (int64_t)sizeof(int64_t);
+    L.total_bytes      = L.off_sa_compx_tag + (int64_t)sizeof(int64_t);
+    return L;
+}
+
 void write_fm_index_streaming(const char* out_path,
                               const uint8_t* buf,
                               const void* sa,
@@ -375,22 +389,24 @@ void write_fm_index_streaming(const char* out_path,
                   "sa_compx=%d out of supported range [0, %d]",
                   sa_compx, CP_SHIFT);
 
-    const off_t HDR_BYTES       = (off_t)(sizeof(int64_t) + 5 * sizeof(int64_t));
-    const int64_t cp_occ_size   = (ref_seq_len >> CP_SHIFT) + 1;
-    const int64_t sa_sample_cnt = (ref_seq_len >> sa_compx) + 1;
-
-    const off_t off_cp_occ  = HDR_BYTES;
-    const off_t off_ms_byte = off_cp_occ  + (off_t)cp_occ_size   * (off_t)sizeof(CP_OCC);
-    const off_t off_ls_word = off_ms_byte + (off_t)sa_sample_cnt * (off_t)sizeof(int8_t);
-    const off_t off_sent    = off_ls_word + (off_t)sa_sample_cnt * (off_t)sizeof(uint32_t);
-    // +2*sizeof(int64_t): sentinel_index, then the trailing sa_compx field.
-    const off_t total_bytes = off_sent    + 2 * (off_t)sizeof(int64_t);
+    // Single source of truth for the on-disk section offsets (see
+    // fmi_bwt2bit_layout / Bwt2bitLayout in fm_index_writer.h).
+    const Bwt2bitLayout L = fmi_bwt2bit_layout(ref_seq_len, sa_compx);
+    const off_t off_cp_occ  = (off_t)L.off_cp_occ;
+    const off_t off_ms_byte = (off_t)L.off_ms_byte;
+    const off_t off_ls_word = (off_t)L.off_ls_word;
+    const off_t off_sent    = (off_t)L.off_sentinel;
+    const off_t total_bytes = (off_t)L.total_bytes;
 
     // Write to a sibling .tmp file and rename on success so a failed
     // build (err_fatal anywhere downstream) never leaves a partial /
     // zero-filled index sitting at the canonical path. A leftover .tmp
     // from a previous failed run is overwritten by O_TRUNC on the next
     // attempt, so it self-heals without explicit cleanup.
+    // A fixed name (not mkstemp, unlike rewrite_fm_index_resampled_sa) is
+    // deliberate here: `index` is a single-writer build of a given prefix, so
+    // the concurrent-writers race that motivates a unique temp does not apply,
+    // and O_TRUNC self-healing is worth keeping.
     const std::string tmp_path = std::string(out_path) + ".tmp";
     int fd = open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0)
@@ -430,4 +446,101 @@ void write_fm_index_streaming(const char* out_path,
     if (rename(tmp_path.c_str(), out_path) != 0)
         err_fatal(__func__, "rename('%s' -> '%s'): %s",
                   tmp_path.c_str(), out_path, strerror(errno));
+}
+
+void rewrite_fm_index_resampled_sa(const char* out_path,
+                                   int64_t ref_seq_len,
+                                   const int64_t count[5],
+                                   const CP_OCC* cp_occ,
+                                   int64_t cp_occ_size,
+                                   const int8_t* sa_ms_byte,
+                                   const uint32_t* sa_ls_word,
+                                   int64_t sa_sample_cnt,
+                                   int64_t sentinel_index,
+                                   int sa_compx)
+{
+    // Same [0, CP_SHIFT] range write_fm_index_streaming enforces: the loader's
+    // per-block sample check is only valid when 1<<sa_compx divides
+    // CP_BLOCK_SIZE (64).
+    if (sa_compx < 0 || sa_compx > CP_SHIFT)
+        err_fatal(__func__, "sa_compx=%d out of supported range [0, %d]",
+                  sa_compx, CP_SHIFT);
+
+    // Byte layout is identical to write_fm_index_streaming; only the SA-sample
+    // section size (and therefore the sentinel/tag offsets) changes with
+    // sa_compx. cp_occ is copied through verbatim -- it does not depend on the
+    // SA sample rate. Offsets come from the shared layout helper so the writer,
+    // resampler, and reader can never disagree on the format.
+    const Bwt2bitLayout L = fmi_bwt2bit_layout(ref_seq_len, sa_compx);
+    const off_t off_cp_occ  = (off_t)L.off_cp_occ;
+    const off_t off_ms_byte = (off_t)L.off_ms_byte;
+    const off_t off_ls_word = (off_t)L.off_ls_word;
+    const off_t off_sent    = (off_t)L.off_sentinel;
+    const off_t total_bytes = (off_t)L.total_bytes;
+
+    // Write to a UNIQUE same-directory temp and rename on success: a mid-write
+    // failure never leaves a partial index at the canonical path, and readers see
+    // an atomic old-or-new switch. Unlike a fixed "<out>.tmp", a unique mkstemp
+    // name means two concurrent re-sa runs on the same index cannot share a temp
+    // inode (one renaming it out from under the other's open fd would publish
+    // mixed section data).
+    std::string tmp_path = std::string(out_path) + ".XXXXXX";
+    std::vector<char> tmpl(tmp_path.c_str(), tmp_path.c_str() + tmp_path.size() + 1);
+    int fd = mkstemp(tmpl.data());
+    if (fd < 0)
+        err_fatal(__func__, "mkstemp('%s'): %s", tmpl.data(), strerror(errno));
+    tmp_path = tmpl.data();
+    // mkstemp creates the file 0600. re-sa rewrites an EXISTING index in place,
+    // so preserve the destination's current permission bits rather than forcing
+    // 0644 -- otherwise resampling a deliberately private index would silently
+    // widen it to world-readable after the rename (CWE-732). Fall back to a
+    // freshly-built index's 0644 only if the destination cannot be stat'd.
+    mode_t publish_mode = 0644;
+    struct stat dst_st;
+    if (stat(out_path, &dst_st) == 0)
+        publish_mode = dst_st.st_mode & 07777;
+    if (fchmod(fd, publish_mode) != 0) {
+        unlink(tmp_path.c_str());
+        err_fatal(__func__, "fchmod('%s'): %s", tmp_path.c_str(), strerror(errno));
+    }
+    if (ftruncate(fd, total_bytes) != 0) {
+        unlink(tmp_path.c_str());
+        err_fatal(__func__, "ftruncate('%s', %lld): %s",
+                  tmp_path.c_str(), (long long)total_bytes, strerror(errno));
+    }
+
+    // The fatal pwrite_all() would err_fatal() on the first failed section write,
+    // leaving the unique mkstemp temp behind -- unlike write_fm_index_streaming's
+    // fixed "<out>.tmp", a mkstemp name never self-heals on the next run. Route
+    // every write through pwrite_all_status() and a single cleanup path that
+    // unlinks the temp before reporting, so a reachable failure (e.g. ENOSPC)
+    // does not orphan a partial temp next to the index. (unlink-then-err_fatal
+    // mirrors the ftruncate/fchmod cleanup above; err_fatal exits, so the fd is
+    // reclaimed by the OS without an explicit close.)
+    auto write_section = [&](const void* src, size_t len, off_t off, const char* what) {
+        int rc = pwrite_all_status(fd, src, len, off);
+        if (rc == 0) return;
+        unlink(tmp_path.c_str());
+        if (rc < 0) err_fatal(__func__, "pwrite(%s) returned 0", what);
+        err_fatal(__func__, "pwrite(%s) failed: %s", what, strerror(rc));
+    };
+    write_section(&ref_seq_len, sizeof(int64_t), 0, "ref_seq_len");
+    write_section(count, 5 * sizeof(int64_t), sizeof(int64_t), "count[5]");
+    write_section(cp_occ, (size_t)cp_occ_size * sizeof(CP_OCC), off_cp_occ, "cp_occ");
+    write_section(sa_ms_byte, (size_t)sa_sample_cnt * sizeof(int8_t),  off_ms_byte, "sa_ms_byte");
+    write_section(sa_ls_word, (size_t)sa_sample_cnt * sizeof(uint32_t), off_ls_word, "sa_ls_word");
+    write_section(&sentinel_index, sizeof(int64_t), off_sent, "sentinel_index");
+    int64_t sa_compx_i64 = sa_compx;
+    write_section(&sa_compx_i64, sizeof(int64_t),
+                  off_sent + (off_t)sizeof(int64_t), "sa_compx");
+
+    if (close(fd) != 0) {
+        unlink(tmp_path.c_str());
+        err_fatal(__func__, "close('%s'): %s", tmp_path.c_str(), strerror(errno));
+    }
+    if (rename(tmp_path.c_str(), out_path) != 0) {
+        unlink(tmp_path.c_str());
+        err_fatal(__func__, "rename('%s' -> '%s'): %s",
+                  tmp_path.c_str(), out_path, strerror(errno));
+    }
 }
