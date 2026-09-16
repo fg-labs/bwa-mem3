@@ -107,6 +107,19 @@ int main(int argc, char *argv[]) {
     printf("SA resolve PARITY SKIP (not an AArch64/NEON target)\n");
     return 0;
 #endif
+    /* Force the cross-read (k,s) dedup path ON for the whole sweep so the
+     * duplicate-interval scatter (memcpy of a rep's resolved slot-run into a
+     * duplicate's) is deterministically exercised and validated against the
+     * scalar oracle below, independent of the 'auto' controller's latch state.
+     * Byte-identity means every batch still matches ref_resolve either way. */
+    setenv("BWA3_KS_DEDUP", "on", 1);
+    /* Enable the (k,s) dedup position counters so section 4 can assert the
+     * dedup staging path actually ran. The coordinate oracle cannot: the plain
+     * and dedup paths return identical coordinates, so a silently-ignored
+     * BWA3_KS_DEDUP=on would still pass. The counters (read via
+     * ks_dedup_position_counts) only accumulate while this env is set. */
+    setenv("BWA3_KS_DEDUP_STATS", "1", 1);
+
     FMI_search *fmi = new FMI_search(argv[1]);
     fmi->load_index();
 
@@ -152,6 +165,44 @@ int main(int argc, char *argv[]) {
         check_batch(fmi, smems, 500, checked, mismatches, sentinel_walks);
         std::vector<SMEM> none;
         check_batch(fmi, none, 500, checked, mismatches, sentinel_walks);
+    }
+
+    /* 4. Cross-read (k,s) duplicates: the same interval appears several times in
+     * one batch, so the dedup path resolves it once (the "rep") and replicates
+     * the resolved slot-run into every duplicate via memcpy. Interleave exact
+     * duplicates with distinct intervals, and include both an s <= max_occ
+     * duplicate (unit-stride, copy length s) and an s > max_occ duplicate
+     * (strided, copy length max_occ), so the scatter's length arithmetic and the
+     * rep/dup destination remap are both exercised. Every copied coordinate is
+     * still validated against the scalar walk, so a wrong rep-base, copy length,
+     * or ks_dst remap surfaces as a mismatch. */
+    if (ref_len > 500) {
+        const int32_t max_occ = 7;
+        const int64_t kA = ref_len / 4, kB = ref_len / 2, kC = ref_len / 3;
+        std::vector<SMEM> smems;
+        auto push = [&](int64_t k, int64_t s) { SMEM m = {}; m.k = k; m.s = s; smems.push_back(m); };
+        push(kA, 3);      /* rep A (s <= max_occ)            */
+        push(kB, 100);    /* rep B (s > max_occ, strided)    */
+        push(kA, 3);      /* dup of A -> memcpy, length 3    */
+        push(kC, 5);      /* rep C (distinct)                */
+        push(kB, 100);    /* dup of B -> memcpy, length 7    */
+        push(kA, 3);      /* 2nd dup of A                    */
+        push(kB, 100);    /* 2nd dup of B                    */
+        check_batch(fmi, smems, max_occ, checked, mismatches, sentinel_walks);
+
+        /* Prove the dedup staging path actually ran and collapsed the duplicates
+         * above -- the coordinate oracle can't, since the plain path returns the
+         * same coordinates. `total` counts every staged position; `distinct`
+         * counts only the reps that were LF-walked. This batch's four duplicate
+         * intervals force distinct < total; if BWA3_KS_DEDUP=on were silently
+         * ignored, the counters would be zero or distinct would equal total. */
+        uint64_t total_pos = 0, distinct_pos = 0;
+        ks_dedup_position_counts(&total_pos, &distinct_pos);
+        if (!(total_pos > 0 && distinct_pos < total_pos)) {
+            fprintf(stderr, "  ks-dedup path not exercised: total_pos=%llu distinct_pos=%llu\n",
+                    (unsigned long long) total_pos, (unsigned long long) distinct_pos);
+            mismatches++;
+        }
     }
 
     fprintf(stderr, "sa_resolve_parity_test: checked=%lld mismatches=%lld sentinel_walks=%lld\n",

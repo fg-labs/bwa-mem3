@@ -76,4 +76,14 @@ check_reject "-I 300,50,junk" "ERROR: -I expects mean" -I 300,50,junk
 check_reject "-I 3000000000" "ERROR: -I mean/std imply an insert-size bound outside" -I 3000000000
 check_reject "-I 300,50,4000000000" "ERROR: -I insert-size max must be in" -I 300,50,4000000000
 
-echo "PASS: arg_range_validation (-E and -I reject non-positive, non-finite, out-of-range, and trailing-garbage values)"
+# -c is the seed max-occurrence cap and a divisor in the SA-resolve step math
+# (`p->s / opt->max_occ`), so max_occ == 0 is a hard divide-by-zero and a
+# negative value silently yields no seeds; atoi() would have accepted both, plus
+# trailing garbage and an out-of-range value that narrows to a valid-looking
+# int. Reject all at parse, before SA resolution.
+check_reject "-c 0" "ERROR: -c max occurrences must be a positive integer" -c 0
+check_reject "-c -1" "ERROR: -c max occurrences must be a positive integer" -c -1
+check_reject "-c 5abc" "ERROR: -c max occurrences must be a positive integer" -c 5abc
+check_reject "-c 4294967297" "ERROR: -c max occurrences must be a positive integer" -c 4294967297
+
+echo "PASS: arg_range_validation (-E, -I, and -c reject non-positive, non-finite, out-of-range, and trailing-garbage values)"

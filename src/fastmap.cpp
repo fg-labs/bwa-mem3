@@ -1535,6 +1535,7 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "    --smem-dedup  dedup identical SMEMs before chaining: fewer SA lookups, ~10%% fewer; opt-in, NOT byte-identical (changes XS/secondary on a small fraction of reads) [off]\n");
     fprintf(stderr, "    --dedup STR   extension-DP job dedup: 'off', 'on' (dedup identical jobs within each batch), or 'auto' (measure net benefit at runtime, latch, and periodically re-probe); alignment records byte-identical in every mode (@PG excluded, it embeds argv) [auto]\n");
     fprintf(stderr, "    --dedup-reads STR  whole-read-pair memoization: 'off', 'on', or 'auto' (measure the duplicate rate and net benefit at runtime, latch, and periodically re-probe); aligns once per distinct pair within a chunk and replays the per-read SAM stage, so alignment records are byte-identical in every mode. Benefits amplicon/UMI panels with PCR duplicates; ~no effect on WGS/exome [auto]\n");
+    fprintf(stderr, "    --ks-dedup STR  cross-read SA-interval dedup: 'off', 'on' (resolve each distinct (k,s) suffix-array interval once per SA-resolve chunk and copy the coordinates to the reads that repeat it), or 'auto' (measure net benefit at runtime, latch, and periodically re-probe); alignment records byte-identical in every mode [auto]\n");
     fprintf(stderr, "    --huge-pages  back the index with 1 GB huge pages via mimalloc when the host has enough free 1 GB pages reserved; cuts dTLB misses in seeding; Linux only, alignment records byte-identical (only @PG CL differs, recording the flag), safe no-op otherwise [off]\n");
     fprintf(stderr, "    --skip-contained-ext  skip banded-SW extension of seeds contained (same diagonal) in a longer in-chain seed; byte-identical on short/medium non-meth reads (NOT on kilobase-scale long reads); no effect under --meth [off]\n");
     fprintf(stderr, "    --max-extend-chains INT  cap chains extended per read to the top-INT by weight; ~23%% less alignment CPU, high-confidence placement unaffected; ignored for reads with >4096 chains; opt-in, NOT byte-identical (0 = off) [%d]\n", opt->max_extend_chains);
@@ -2007,6 +2008,7 @@ int main_mem(int argc, char *argv[])
 #endif
         OPT_DEDUP,
         OPT_DEDUP_READS,
+        OPT_KS_DEDUP,
         OPT_HELP,
     };
     static struct option long_opts[] = {
@@ -2017,6 +2019,7 @@ int main_mem(int argc, char *argv[])
         {"smem-dedup",               no_argument,       0, OPT_SMEM_DEDUP},
         {"dedup",                    required_argument, 0, OPT_DEDUP},
         {"dedup-reads",              required_argument, 0, OPT_DEDUP_READS},
+        {"ks-dedup",                 required_argument, 0, OPT_KS_DEDUP},
         {"fast",                     no_argument,       0, OPT_FAST},
         {"huge-pages",               no_argument,       0, OPT_HUGE_PAGES},
         {"skip-contained-ext",       no_argument,       0, OPT_SKIP_CONTAINED_EXT},
@@ -2058,6 +2061,7 @@ int main_mem(int argc, char *argv[])
 #endif
     const char *dedup_mode_arg = NULL; /* --dedup <off|on|auto>; resolved via mem_dedup_configure after getopt */
     const char *dedup_reads_mode_arg = NULL; /* --dedup-reads <off|on|auto>; resolved via mem_dedup_reads_configure after getopt */
+    const char *ks_dedup_mode_arg = NULL; /* --ks-dedup <off|on|auto>; resolved via ks_dedup_configure after getopt */
     while ((c = getopt_long(argc, argv, "51qpaMCSPVYjuk:c:v:s:r:t:R:A:B:O:E:U:w:L:d:T:Q:D:m:I:N:W:x:G:h:y:K:X:H:o:f:z:",
                             long_opts, NULL)) >= 0)
     {
@@ -2152,7 +2156,26 @@ int main_mem(int argc, char *argv[])
         else if (c == OPT_HIC) opt->flag |= MEM_F_PRIMARY5 | MEM_F_KEEP_SUPP_MAPQ | MEM_F_NO_RESCUE | MEM_F_NOPAIRING;
         else if (c == 'q') opt->flag |= MEM_F_KEEP_SUPP_MAPQ;
         else if (c == 'u') opt->flag |= MEM_F_XB;
-        else if (c == 'c') opt->max_occ = atoi(optarg), opt0.max_occ = 1;
+        else if (c == 'c') {
+            /* -c is the seed max-occurrence cap. atoi() silently maps garbage
+             * and non-positive input to 0/negative, but max_occ is a divisor in
+             * the SA-resolve step math (`p->s / opt->max_occ`, both here in the
+             * consumer loop and in FMI_search::get_sa_entries_prefetch), so a 0
+             * is a hard divide-by-zero and a negative value silently yields no
+             * seeds. Reject anything that is not a complete positive integer at
+             * the parser -- the single choke point that protects every consumer,
+             * shipped SA_COMPRESSION build or not. */
+            int64_t v;
+            if (parse_bounded_i64(optarg, 1, INT_MAX, &v) != 0) {
+                fprintf(stderr, "ERROR: -c max occurrences must be a positive integer in 1..%d (got %s)\n",
+                        INT_MAX, optarg);
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+            opt->max_occ = (int)v;
+            opt0.max_occ = 1;
+        }
         else if (c == 'd') opt->zdrop = atoi(optarg), opt0.zdrop = 1;
         else if (c == 'v') bwa_verbose = atoi(optarg);
         else if (c == 'j') ignore_alt = 1;
@@ -2473,6 +2496,18 @@ int main_mem(int argc, char *argv[])
             }
             dedup_reads_mode_arg = optarg;
         }
+        else if (c == OPT_KS_DEDUP) {
+            /* Reject an explicit-but-empty CLI value, same as --dedup: an empty
+             * mode_arg reads as "no CLI value" in ks_dedup_configure() and would
+             * silently inherit BWA3_KS_DEDUP instead of being fatal. */
+            if (!*optarg) {
+                fprintf(stderr, "ERROR: --ks-dedup: expected off|on|auto, got empty value\n");
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+            ks_dedup_mode_arg = optarg;
+        }
         else if (c == OPT_FAST) fast = 1;
         else if (c == OPT_HUGE_PAGES) want_huge_pages = 1;
         else if (c == OPT_PROPER_PAIR_FROM_EMITTED) opt->proper_pair_from_emitted = 1;
@@ -2735,6 +2770,7 @@ int main_mem(int argc, char *argv[])
     }
     mem_dedup_configure(dedup_mode_arg);   /* --dedup CLI > env BWAMEM3_DEDUP > default 'auto'; fatal on bad value */
     mem_dedup_reads_configure(dedup_reads_mode_arg); /* --dedup-reads CLI > env BWAMEM3_DEDUP_READS > default 'auto'; fatal on bad value */
+    ks_dedup_configure(ks_dedup_mode_arg);           /* --ks-dedup CLI > env BWA3_KS_DEDUP > default 'auto'; fatal on bad value */
     /* A stray word on the command line slides silently into a positional slot.
      * Two spellings invite it:
      *   --meth taps        (optional argument: getopt_long only binds it with '=')
