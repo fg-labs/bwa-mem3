@@ -42,7 +42,6 @@ The resulting binary is `bwa-mem3` in the repo root.
 ```bash
 make single                       # alias of the default `make`
 make BASELINE_ARCH=avx512bw       # raise non-kernel TU compile baseline
-make BASELINE_ARCH=sse41          # lower it for pre-Haswell hosts
 ```
 
 Builds one `bwa-mem3` binary. The four hand-tuned kernel TUs in
@@ -61,12 +60,11 @@ hardware):
 
 | Command | SIMD level | `ARCH_FLAGS` |
 |---|---|---|
-| `make arch=sse41` | SSE4.1 | `-msse … -msse4.1` |
-| `make arch=sse42` | SSE4.2 | `-msse … -msse4.2` |
-| `make arch=avx` | AVX | `-mavx` |
 | `make arch=avx2` | AVX2 | `-mavx2` |
 | `make arch=avx512bw` | AVX-512BW | `-mavx512f -mavx512bw -mprefer-vector-width=256` |
 | `make arch=native` | host CPU features | `-march=native` |
+
+`arch=sse41`, `arch=sse42`, and `arch=avx` are refused at configure time: the batched mate-rescue kernels require AVX2+ and the pre-AVX2 scalar fallback was removed, so AVX2 is the minimum x86 tier.
 
 For Intel compiler (`icpc` / `icpx`) the flags differ slightly; see the
 Makefile for the `ifeq ($(CXX), icpc)` branches. The `avx512bw` target
@@ -143,7 +141,6 @@ make profile-clean
 | `ASAN` | _(unset)_ | Set to any non-empty value to enable AddressSanitizer (forces `USE_MIMALLOC=0`) |
 | `COVERAGE` | _(unset)_ | Set to enable `--coverage` + `-O0` for gcov line-level coverage |
 | `EXTRA_CXXFLAGS` | _(empty)_ | Appended to `CXXFLAGS`; forwarded through PGO / LTO targets |
-| `DISABLE_BATCHED_MATESW` | _(unset)_ | Set to `1` to disable the batched mate-rescue SW path on ARM |
 | `CXX` | `c++` | Compiler. Paired `CC` is auto-derived from `CXX` for libsais. |
 
 ## Incremental builds and header dependencies

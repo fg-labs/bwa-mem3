@@ -372,13 +372,13 @@ echo "PASS: --compat enum grammar (=/space, alias, off, both targets, unknown, e
 # fixture here has, so a consumer that ignored `proper_pair_from_emitted` and
 # hardcoded #17's `which[i]` would pass every other test in this suite and would
 # only surface as 3,013-per-10M FLAG diffs on a real ALT-aware run
-# (fg-labs/bwa-mem3#362). mem_sam_pe's scalar and batched no-pairing blocks are
-# verbatim copies of each other, so a fix applied to one and not the other is the
-# specific mistake to catch. Both now call mem_proper_pair_extra_flag, whose
-# behavior proper_pair_alt.sh checks end to end and whose region selection
-# test/unit/test_proper_pair_source.cpp pins against an independent oracle -- so
-# what is left to assert here is structural: exactly one definition, and no block
-# that quietly grew a private copy of the decision.
+# (fg-labs/bwa-mem3#362). The scalar mate-rescue path was removed, so the batched
+# no-pairing block is now the sole caller; it derives FLAG 0x2 through
+# mem_proper_pair_extra_flag, whose behavior proper_pair_alt.sh checks end to end
+# and whose region selection test/unit/test_proper_pair_source.cpp pins against an
+# independent oracle -- so what is left to assert here is structural: exactly one
+# call site through the helper, and no block that quietly grew a private copy of
+# the decision.
 PAIR_SRC="$(dirname "$0")/../../src/bwamem_pair.cpp"
 [[ -f "$PAIR_SRC" ]] || {
     echo "FAIL: cannot find src/bwamem_pair.cpp at $PAIR_SRC" >&2
@@ -386,10 +386,10 @@ PAIR_SRC="$(dirname "$0")/../../src/bwamem_pair.cpp"
 }
 n_calls=$(grep -c 'extra_flag |= mem_proper_pair_extra_flag(' "$PAIR_SRC" || true)
 n_guard=$(grep -c 'opt->proper_pair_from_emitted ? which\[' "$PAIR_SRC" || true)
-if [[ "$n_calls" -ne 2 ]]; then
-    echo "FAIL: expected 2 mem_proper_pair_extra_flag call sites (scalar + batched)," >&2
-    echo "      found $n_calls in bwamem_pair.cpp -- a no-pairing block either lost" >&2
-    echo "      the call or re-inlined the derivation" >&2
+if [[ "$n_calls" -ne 1 ]]; then
+    echo "FAIL: expected 1 mem_proper_pair_extra_flag call site (the batched no-pairing" >&2
+    echo "      block; the scalar path was removed), found $n_calls in bwamem_pair.cpp --" >&2
+    echo "      a no-pairing block either lost the call or re-inlined the derivation" >&2
     exit 1
 fi
 # Exactly one w0/w1 selection, i.e. inside the helper and nowhere else. A block

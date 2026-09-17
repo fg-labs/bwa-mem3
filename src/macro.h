@@ -67,27 +67,11 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 // scratch (chain_scratch/seed_scratch) is sized from the thread count.
 #define NREADS_ESTIMATE_AVG_BASES 100
 
-/* BWAMEM_BATCHED_MATESW:
- *   1 -> worker_sam takes the batched mate-rescue SW path
- *        (mem_sam_pe_batch_pre / mem_sam_pe_batch / mem_sam_pe_batch_post,
- *        feeding kswv::getScores8 / getScores16).
- *   0 -> worker_sam takes the legacy scalar mem_sam_pe + ksw_align2 path.
- *
- * Historically gated on __AVX512BW__ only, which routed non-AVX-512 builds
- * (ARM, AVX2-only x86) to the scalar path even though batched kernels can
- * be implemented for those architectures. As of the NEON + AVX2 ports this
- * gate accepts any arch with a batched kswv kernel.
- * DISABLE_BATCHED_MATESW is an escape hatch for the A/B test in CI. */
-#ifndef BWAMEM_BATCHED_MATESW
-  #if DISABLE_BATCHED_MATESW
-    #define BWAMEM_BATCHED_MATESW 0
-  #elif __AVX512BW__ || __AVX2__ \
-        || defined(__ARM_NEON) || defined(__aarch64__) || defined(APPLE_SILICON)
-    #define BWAMEM_BATCHED_MATESW 1
-  #else
-    #define BWAMEM_BATCHED_MATESW 0
-  #endif
-#endif
+/* Mate rescue is always the batched SIMD path (mem_sam_pe_batch_pre/run/post ->
+ * kswv::getScores8/16). The legacy scalar mem_sam_pe/mem_matesw path and its
+ * BWAMEM_BATCHED_MATESW / DISABLE_BATCHED_MATESW gate were removed together with
+ * the pre-AVX2 x86 build tiers: every supported target (AVX2+/AVX-512/NEON) has
+ * a batched kswv kernel, so there is nothing to gate. */
 
 /* Apple Silicon has larger L2 caches (4-16MB per cluster) and benefits from
  * larger batch sizes to better utilize cache locality. M1/M2/M3/M4 all have

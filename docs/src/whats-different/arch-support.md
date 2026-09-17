@@ -102,6 +102,13 @@ Note: PR #20 introduced a score2 plateau regression in the AVX2 kernel that
 was identified and fixed in the [correctness series](correctness.md)
 (PRs #27, #28, #29).
 
+> **Later superseded (PR #513).** Once the batched kswv path covered every
+> shipping tier (NEON, AVX2, AVX-512BW), the `BWAMEM_BATCHED_MATESW` /
+> `DISABLE_BATCHED_MATESW` gate and the pre-AVX2 scalar mate-rescue fallback it
+> selected were removed, and AVX2 became the minimum x86 floor. The macros
+> referenced above no longer exist; batched mate rescue is now the only path.
+> See [Host requirements](../getting-started/host-requirements.md).
+
 ---
 
 ## Changes catalog

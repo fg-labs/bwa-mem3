@@ -762,12 +762,12 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
 /* Given two alignment begin positions (rb) on the 2-bit-packed concat-with-
  * reverse-complement index, infer the pair orientation (0=FF, 1=FR, 2=RF,
  * 3=RR) and the distance between 5' ends. Exposed so that external consumers
- * can share the same proper-pair classification used by mem_sam_pe's
- * no_pairing fallback. */
+ * can share the same proper-pair classification the batched pairing path
+ * (mem_sam_pe_batch_post) uses on its no-pairing fallback. */
 int mem_infer_dir(int64_t l_pac, int64_t b1, int64_t b2, int64_t *dist);
 
-/* Proper-pair bit (FLAG 0x2) for a pair emitted on mem_sam_pe's no-pairing
- * path. Returns 2 when properly paired and 0 otherwise, so the result ORs
+/* Proper-pair bit (FLAG 0x2) for a pair emitted on the batched pairing path's
+ * no-pairing fallback. Returns 2 when properly paired and 0 otherwise, so the result ORs
  * straight into extra_flag. `which[i]` is the index of the region mate i
  * actually emits; both entries must be >= 0 and the two EMITTED regions
  * (a[i].a[which[i]]) must already be known to share a reference sequence. That
@@ -775,8 +775,8 @@ int mem_infer_dir(int64_t l_pac, int64_t b1, int64_t b2, int64_t *dist);
  * the two coordinates may sit on different reference sequences and yield a
  * cross-sequence distance. bwa and bwa-mem2 compute it the same way.
  *
- * The single definition of a decision the two no-pairing blocks make
- * identically: derive 0x2 from the top-scoring region a[0] (bwa and bwa-mem2,
+ * The single definition of the decision the batched no-pairing path makes:
+ * derive 0x2 from the top-scoring region a[0] (bwa and bwa-mem2,
  * the default) or from the emitted a[which] (#17, opt-in via
  * --proper-pair-from-emitted). Inert without a `.alt` sidecar, since the two
  * indices coincide unless the read has ALT hits. */
@@ -801,35 +801,8 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                           int32_t *gar, mem_cache *mmc, const char *ms_orig = NULL,
                           const int8_t *mat = NULL, int mate_meth_ot = -1);
 
-int mem_sam_pe(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
-               const mem_pestat_t pes[4], uint64_t id, bseq1_t s[2],
-               mem_alnreg_v a[2]);
-
-// Core pairing decision for a single read pair. Runs mate-rescue SW,
-// mem_mark_primary_se, optional MEM_F_PRIMARY5 reorder, mem_pair, is-multi
-// sanity check, q_pe/q_se computation, and the secondary<->primary
-// secondary_all patch. Does NOT emit SAM/BAM — callers do that.
-//
-// Output contract:
-//   * paired_out: set to 1 iff the paired branch was taken; 0 otherwise.
-//     Callers must always inspect *paired_out before reading z[] / q_se[].
-//   * z[], q_se[]: valid only when *paired_out == 1. On the no-pairing path
-//     they must be treated as undefined — mem_pair() can populate z[]
-//     before the is_multi early return, so their contents do not signal
-//     anything when *paired_out == 0.
-//   * extra_flag_out: on the paired path it is fully assembled (and
-//     includes 0x2 iff the paired alignment was preferred); on the
-//     no-pairing path it is only partial — the caller (or mem_sam_pe's
-//     no_pairing emission block) is responsible for OR-ing in 0x2 itself.
-//   * n_pri[]: always populated.
-//
-// Returns the number of mate-rescue hits produced (same meaning as the
-// historical `n` return of mem_sam_pe).
-int mem_pair_resolve(const mem_opt_t *opt, const bntseq_t *bns,
-                     const uint8_t *pac, const mem_pestat_t pes[4],
-                     uint64_t id, bseq1_t s[2], mem_alnreg_v a[2],
-                     int n_pri[2], int z[2], int q_se[2],
-                     int *extra_flag_out, int *paired_out);
+/* The scalar mem_sam_pe / mem_pair_resolve pairing path was removed; the batched
+ * mem_sam_pe_batch* path above is the only mate-rescue/pairing path. */
 /**
  * Align a batch of sequences and generate the alignments in the SAM format
  *

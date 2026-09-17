@@ -47,7 +47,7 @@ fi
 # tier is enough to cover the branch.
 case "$(uname -m)" in
     arm64 | aarch64) arch_cases=(arm64 native) ;;
-    *) arch_cases=(sse41 avx2 avx512bw native) ;;
+    *) arch_cases=(avx2 avx512bw native) ;;
 esac
 
 fail=0

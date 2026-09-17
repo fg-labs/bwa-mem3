@@ -4,8 +4,7 @@ bwa-mem3 runs on the hosts in the table below. Verify your host with `bwa-mem3 v
 
 | Platform | Default build floor | Earliest supported CPU | Notes |
 |---|---|---|---|
-| Linux x86_64 | AVX2 (`BASELINE_ARCH=avx2`) | Intel Haswell (2013); AMD Zen / Naples (2017) | Auto-selects best of `sse41 / sse42 / avx / avx2 / avx512bw` at runtime |
-| Linux x86_64 (legacy) | SSE4.1 (`BASELINE_ARCH=sse41`) | Intel Nehalem (2008); AMD Bulldozer (2011) | Opt-in rebuild; ~10-15% slower on AVX2 hosts |
+| Linux x86_64 | AVX2 (`BASELINE_ARCH=avx2`) | Intel Haswell (2013); AMD Zen / Naples (2017) | AVX2 is the minimum floor; kernels self-dispatch to the best of `avx2 / avx512bw` at runtime |
 | Linux arm64 | NEON (aarch64 ABI baseline) | Any aarch64 host | Single tier; NEON is mandatory in the aarch64 ABI |
 | macOS arm64 | NEON | Apple M1 (2020) | Apple Silicon only; macOS x86_64 is unsupported |
 
@@ -33,9 +32,11 @@ If you run `bwa-mem3 mem` (or another alignment subcommand) on a host below the 
 instructions in non-kernel translation units. The host CPU does not support
 avx2 (detected: sse42). Running would SIGILL on the first avx2 instruction.
 
-To run on this host, rebuild bwa-mem3 with BASELINE_ARCH=sse42 (or lower),
-or use a binary built for a lower SIMD floor.
+bwa-mem3's lowest supported floor is BASELINE_ARCH=avx2; this host is below
+avx2 and cannot run bwa-mem3.
 ```
+
+AVX2 is the minimum SIMD floor: it cannot be lowered, so a host below AVX2 (Intel pre-Haswell, AMD pre-Zen) is unsupported. On an AVX2 host running an AVX-512 build, rebuilding with `BASELINE_ARCH=avx2` produces a runnable binary.
 
 The `version` subcommand stays exit-0 so introspection still works on the same host.
 

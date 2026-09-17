@@ -14,6 +14,13 @@
 #      stderr regardless of the version banner's stdout stream).
 #   3. 'bwa-mem3 mem -h N ...' must ALSO exit 2: for mem, -h is the XA-hits
 #      option (an INT), not a help alias, so it must not bypass the precheck.
+#   4. On a host that MEETS the floor, a BWAMEM3_FORCE_TIER downgrade to a
+#      sub-AVX2 x86 tier (sse41/sse42/avx) must make 'bwa-mem3 mem' exit 2:
+#      those tiers have no batched mate-rescue kswv kernel (getScores8/16 are
+#      exit() stubs), so the run would otherwise abort mid-alignment.
+#   5. The same forced sub-AVX2 tier must NOT block 'bwa-mem3 version' (it
+#      never invokes the kernels), so introspection stays available: exit 0,
+#      banner reports the forced tier.
 #
 # Inputs:
 #   BWA_MEM3_TESTING — path to a binary built with `make TESTING_BUILD=1`
@@ -110,4 +117,60 @@ if ! grep -q '\[E::bwamem3\]' "$OUT_DIR/memh.stderr"; then
     exit 1
 fi
 
-echo "PASS: bwa-mem3 mem (and 'mem -h N') exits 2 and bwa-mem3 version warns on injected too-old host"
+# Scenarios 4 and 5 exercise the forced-sub-AVX2 guard, which is x86-only (the
+# sse41/sse42/avx tiers and the guard itself are compiled only on x86; on arm64
+# BWAMEM3_FORCE_TIER to an x86 tier is ignored and there is nothing to refuse).
+force_tier_msg=""
+case "$(uname -m)" in
+    x86_64 | i386 | i686 | amd64)
+        # --- Scenario 4: forced sub-AVX2 tier on a floor-meeting host refuses mem ---
+        # Inject the top x86 tier so the host clears any x86 build floor (avx2 or
+        # avx512bw), then force a sub-AVX2 tier. The host-floor precheck passes, but
+        # the forced tier has no batched mate-rescue kernel, so mem must refuse.
+        FORCED_SUB_AVX2="sse41"
+        rc=0
+        BWAMEM3_TESTING_HOST_TIER="avx512bw" BWAMEM3_FORCE_TIER="$FORCED_SUB_AVX2" \
+            "$BWA_MEM3_TESTING" mem "$PARITY_FA" /dev/null /dev/null \
+            > "$OUT_DIR/force.stdout" 2> "$OUT_DIR/force.stderr" || rc=$?
+
+        if [[ $rc -ne 2 ]]; then
+            echo "FAIL: forced $FORCED_SUB_AVX2 on a floor-meeting host: mem exited $rc (expected 2)" >&2
+            cat "$OUT_DIR/force.stderr" >&2
+            exit 1
+        fi
+        # Must be the FORCE_TIER refusal, not the host-floor refusal (both exit 2).
+        if ! grep -q 'no batched mate-rescue kernel' "$OUT_DIR/force.stderr"; then
+            echo "FAIL: mem refusal did not cite the missing batched mate-rescue kernel" >&2
+            cat "$OUT_DIR/force.stderr" >&2
+            exit 1
+        fi
+        if ! grep -qE "BWAMEM3_FORCE_TIER=$FORCED_SUB_AVX2" "$OUT_DIR/force.stderr"; then
+            echo "FAIL: mem refusal did not name the forced tier" >&2
+            cat "$OUT_DIR/force.stderr" >&2
+            exit 1
+        fi
+
+        # --- Scenario 5: forced sub-AVX2 tier does NOT block version ---
+        rc=0
+        BWAMEM3_TESTING_HOST_TIER="avx512bw" BWAMEM3_FORCE_TIER="$FORCED_SUB_AVX2" \
+            "$BWA_MEM3_TESTING" version \
+            > "$OUT_DIR/forceversion.stdout" 2> "$OUT_DIR/forceversion.stderr" || rc=$?
+
+        if [[ $rc -ne 0 ]]; then
+            echo "FAIL: version with forced $FORCED_SUB_AVX2 exited $rc (expected 0 — version must not refuse)" >&2
+            cat "$OUT_DIR/forceversion.stdout" "$OUT_DIR/forceversion.stderr" >&2
+            exit 1
+        fi
+        if ! grep -qE "SIMD runtime: $FORCED_SUB_AVX2 " "$OUT_DIR/forceversion.stdout"; then
+            echo "FAIL: version banner did not report the forced $FORCED_SUB_AVX2 runtime tier" >&2
+            cat "$OUT_DIR/forceversion.stdout" >&2
+            exit 1
+        fi
+        force_tier_msg="; a forced sub-AVX2 tier refuses mem but not version"
+        ;;
+    *)
+        echo "SKIP: forced-sub-AVX2 scenarios are x86-only (arch $(uname -m))"
+        ;;
+esac
+
+echo "PASS: bwa-mem3 mem (and 'mem -h N') exits 2 on an injected too-old host${force_tier_msg}; bwa-mem3 version warns"

@@ -14,16 +14,32 @@ flowchart TD
     A[bwa-mem3 mem starts] --> B{Platform?}
     B -- ARM / aarch64 --> C[NEON kernel TU, no dispatch]
     B -- x86 --> D[bwamem3_simd_init in src/simd_dispatch.cpp]
-    D --> E[__builtin_cpu_supports]
-    E --> F{Host capability?}
-    F -- AVX-512BW --> G1[g_tier = avx512bw]
-    F -- AVX2 --> G2[g_tier = avx2]
-    F -- AVX --> G3[g_tier = avx]
-    F -- SSE4.2 --> G4[g_tier = sse42]
-    F -- SSE4.1 --> G5[g_tier = sse41]
-    F -- below build floor --> H[exit(2): host below SIMD floor]
-    G1 & G2 & G3 & G4 & G5 --> I[Per-kernel factory selects matching tier]
+    D --> E["host capability = __builtin_cpu_supports;<br/>effective g_tier = host, then downgraded<br/>by BWAMEM3_FORCE_TIER if set"]
+    E --> F{"Host capability >=<br/>build floor (g_build_tier,<br/>default avx2)?"}
+    F -- no --> H1["exit(2): host below the build's SIMD floor"]
+    F -- yes --> G{"Effective g_tier >= avx2?"}
+    G -- "no: forced sub-AVX2 tier" --> H2["exit(2): forced tier below the avx2 runtime floor"]
+    G -- yes --> I["Per-kernel factory selects g_tier (avx2 or avx512bw)"]
 ```
+
+The two `exit(2)` gates are `bwamem3_enforce_host_floor()`'s two
+checks: first the host capability against the compile-time build floor
+(`g_build_tier`, default `avx2`; `BASELINE_ARCH=avx512bw` raises it),
+then the effective tier against the absolute `avx2` runtime floor —
+which only a `BWAMEM3_FORCE_TIER` downgrade can trip, since `g_tier`
+otherwise defaults to the host tier.
+
+The default (`BASELINE_ARCH=avx2`) build's floor is AVX2, so on that
+build an unforced host below AVX2 (AVX, SSE4.2, SSE4.1) is rejected by
+`bwamem3_enforce_host_floor()` with `exit(2)` before any kernel
+dispatch — it never reaches the tier factory. The floor is compile-time
+(`g_build_tier`, set by `BASELINE_ARCH`): a `BASELINE_ARCH=avx512bw`
+build raises it to AVX-512BW and rejects an AVX2-only host the same way.
+A forced sub-AVX2 `mem` run
+(`BWAMEM3_FORCE_TIER=sse41|sse42|avx`) is refused the same way;
+`version` / help bypass the floor and may still surface a sub-AVX2 tier
+name for introspection. Automatic alignment dispatch therefore selects
+only `avx2` or `avx512bw`.
 
 Tier detection runs once during `main()`. Subsequent kernel calls pay
 a single indirect-call hop through a factory vtable (or an
@@ -65,6 +81,8 @@ Supported x86 tiers (minimum CPU for each tier's kernel path):
 | `avx2` | `-mavx2` | Haswell (2013) / Excavator (2015) |
 | `avx512bw` | `-mavx512f -mavx512bw -mprefer-vector-width=256` | Skylake-X (2017) / Zen 4 (2022) |
 
+> **AVX2 is the runtime floor.** The `sse41` / `sse42` / `avx` kernel objects are still compiled so the dispatch vtable links on every tier, but a shipping build's non-kernel TUs require AVX2 (the host-floor precheck refuses to start below it) and the batched `kswv` mate-rescue kernel has no sub-AVX2 implementation. Automatic alignment dispatch therefore never selects those three tiers. Diagnostic commands and alignment commands differ in how they treat a forced sub-AVX2 tier: `version` / help bypass `bwamem3_enforce_host_floor()`, so an explicit `BWAMEM3_FORCE_TIER=sse41|sse42|avx` can still surface a sub-AVX2 tier name for introspection. An alignment run (`mem`) cannot: `bwamem3_enforce_host_floor()` refuses any effective tier below AVX2 up front with `exit(2)` — before any kernel dispatch — so a paired-end `mem` run never reaches the sub-AVX2 `kswv` `getScores8`/`getScores16` stubs. `avx2` and `avx512bw` are the reachable x86 alignment tiers.
+
 For arm64 builds:
 
 | Binary | Arch flags | Platform |
@@ -92,7 +110,7 @@ Two environment variables tune dispatch:
 
 | Variable | Effect |
 |---|---|
-| `BWAMEM3_FORCE_TIER=<tier>` | Forces a specific tier (`sse41` / `sse42` / `avx` / `avx2` / `avx512bw`). Downgrade-only: requests above the host's detected tier (which would SIGILL) and unknown names are rejected with a stderr warning. Used by `test/regression/all_tiers_parity.sh` to confirm byte-identical SAM across all tiers on AVX-512 hosts. |
+| `BWAMEM3_FORCE_TIER=<tier>` | Forces a specific tier (`sse41` / `sse42` / `avx` / `avx2` / `avx512bw`). Downgrade-only: requests above the host's detected tier (which would SIGILL) and unknown names are rejected with a stderr warning. Used by `test/regression/all_tiers_parity.sh`, which re-runs the same binary and `mem` command under each reachable tier (`avx2` / `avx512bw`; a forced sub-AVX2 `mem` run is refused before dispatch) — fixed paired-end workload, `-t 1`, pinned `-K`, one AVX-512BW host — and `diff`s the complete SAM. Because only the kernel tier changes between runs, the `@PG` / `@HD` headers are identical too, so byte-identity here covers the whole file, not only the alignment records scoped by the cross-build equivalence contract. |
 | `BWAMEM3_DEBUG_SIMD=1` | Prints a one-line `[I::bwamem3_simd_init_body]` startup banner with the build baseline, the detected host capability, and the resolved tier. Also enables the build-baseline-vs-host gap warning. |
 
 Use `bwa-mem3 version` to read the resolved tier without alignment:
