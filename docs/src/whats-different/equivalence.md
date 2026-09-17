@@ -212,12 +212,17 @@ Caveats:
   byte-identity and for a deliberate deviation from it at once.
 - **Every other bwa-mem3-only alignment lever is likewise rejected** — a hard error naming the
   offending flags. `--smem-dedup`, `--adaptive-band`, `--max-extend-chains`, `--min-ext-len`,
-  `--extend-tie-frac`, `--rescue-kmer`, `--supp-rep-hard-cap`, `--seed-order`, `--skip-contained-ext`
+  `--extend-tie-frac`, `--rescue-kmer`, `--supp-rep-hard-cap`, `--seed-order`
   and `--chunk-cap` each change alignments or MAPQ in a way no upstream can express, so they cannot
   coexist with a byte-identity target. **`--compat-allow-divergent`** downgrades this (and the
   `--proper-pair-from-emitted` case above) to a warning for a user who knowingly wants the target's
   output conventions with a bwa-mem3 lever engaged; the output is then not byte-identical. It does
   not relax `--fast` or `--meth`, which are category errors rather than divergences.
+- **Contained-seed extension skipping is on by default and byte-identical**, so `--compat` does not
+  reject it: `--compat` (like `--keep-contained-ext`) runs the reference extension path, and the
+  deprecated `--skip-contained-ext` is an accepted no-op. The byte-identity claim's measured scope
+  (workload, host, architecture, and SIMD tier) is documented under
+  [`mem` → `--keep-contained-ext`](../cli/mem.md#--keep-contained-ext--opt-out-of-the-contained-seed-extension-skip).
 - **The sidecar `@SQ` is skipped, not rewritten.** Outside `--compat` the
   `<prefix>.hdr` / `<baseprefix>.dict` block remains authoritative and is emitted verbatim.
   On those sidecar-honoring paths — the default profile, `--bam` and `--meth` — an index with

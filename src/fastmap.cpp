@@ -1850,8 +1850,6 @@ int main_mem(int argc, char *argv[])
      * separately so the opt-out beats both an explicit --adaptive-band (either
      * order) and the --adaptive-band that --fast would otherwise turn on. */
     int          no_adaptive_band          = 0;
-    int          keep_contained_ext        = 0;   /* --keep-contained-ext seen: sticky opt-out, wins over
-                                                   * the deprecated --skip-contained-ext in either order */
     /* --cohort-slices: how many geometric slices to read the FIRST batch in, so
      * compute can start before the whole batch has been read. Byte-identical --
      * the batch (pestat cohort) boundary is unchanged, only the physical read
@@ -2646,18 +2644,16 @@ int main_mem(int argc, char *argv[])
         }
         else if (c == OPT_SKIP_CONTAINED_EXT) {
             /* Deprecated, kept so existing command lines still parse. Contained-seed
-             * skipping is the mem_opt_init default now, so this only re-asserts it
-             * (unless --keep-contained-ext was also given, which wins). Always
-             * printed: the notice is the whole point of keeping the option. */
-            if (!keep_contained_ext) opt->skip_contained_ext = 1;
+             * skipping is the mem_opt_init default now, so this is a pure no-op apart
+             * from the notice; --keep-contained-ext is the opt-out. */
             fprintf(stderr, "[W::%s] --skip-contained-ext is deprecated: contained-seed skipping "
                     "is now the default; pass --keep-contained-ext to opt out\n", __func__);
         }
-        else if (c == OPT_KEEP_CONTAINED_EXT) { keep_contained_ext = 1; opt->skip_contained_ext = 0; }  /* reference
-                                                               * extension path (no contained-seed
-                                                               * deferral); byte-identical to the
-                                                               * default, only slower. Escape hatch
-                                                               * + bit-exact A/B vs older binaries. */
+        else if (c == OPT_KEEP_CONTAINED_EXT) opt->skip_contained_ext = 0;   /* reference extension
+                                                               * path (no contained-seed deferral);
+                                                               * byte-identical to the default, only
+                                                               * slower. Escape hatch + bit-exact
+                                                               * A/B vs older binaries. */
         else if (c == OPT_ADAPTIVE_BAND) { if (!no_adaptive_band) opt->band_start = ADAPTIVE_BAND_START; opt->band_cert = 0; }
         else if (c == OPT_NO_ADAPTIVE_BAND) { no_adaptive_band = 1; opt->band_start = 0; opt->band_cert = 0; }  /* disable adaptive
                                                                * banding entirely: aggressive band off

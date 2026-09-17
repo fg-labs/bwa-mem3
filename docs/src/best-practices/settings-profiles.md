@@ -318,9 +318,10 @@ verified (records + header + count) on WGS 5M PE, WES 5M PE, a 5M-pair targeted 
 demonstrably is not identical: it drops supplementary alignments and occasionally degrades a
 primary). That is why it is the default rather than a recommended lever.
 
-**Alignment CPU drops ~1–3% relative to the reference path** (measured −2.9% user-CPU on a 5M-pair
-WGS slice, −1.4% on a 5M-pair WES slice, and −1.6% on a 5M-pair `--meth` slice, all
-byte-identical; the win tracks how many contained seeds a dataset produces).
+**Alignment CPU drops ~1–3% relative to the reference path** (measured on AWS Graviton4
+(`c8g.8xlarge`, arm64, NEON SIMD tier), clang-19: −2.9% user-CPU on a 5M-pair WGS slice, −1.4% on a
+5M-pair WES slice, and −1.6% on a 5M-pair `--meth` slice, all byte-identical; the win tracks how many
+contained seeds a dataset produces).
 
 `--keep-contained-ext` opts out and runs the reference extension path (every seed extended in the
 main batch, no deferral). Output is unchanged; the run is only slower. It exists as an escape hatch

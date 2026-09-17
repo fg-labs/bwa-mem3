@@ -8222,7 +8222,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
                     grseq = bns_fetch_seq_v2(bns, pac, &rmax[0], gc->seeds[0].rbeg,
                                              &rmax[1], &grid, ref_string,
                                              (uint8_t *) seqPairArrayAux);
-                    assert(gc->rid == grid);
+                    xassert(gc->rid == grid, "two-wave: chain rid mismatch on window re-fetch");
                     gchain_band = ks_pending[pi].chain_band;
                     gquery = extension_query(gl, gl_query);
                     gwin = true;

@@ -325,7 +325,9 @@ compat_err "mutually exclusive" --compat=bwa-mem2 --adaptive-band
 compat_err "mutually exclusive" --compat=bwa-mem2 --rescue-kmer
 compat_err "mutually exclusive" --compat=bwa-mem2 --supp-rep-hard-cap=10
 compat_err "mutually exclusive" --compat=bwa-mem2 --seed-order local-longest
-compat_err "mutually exclusive" --compat=bwa-mem2 --skip-contained-ext
+# --skip-contained-ext is now the default (byte-identical) and deprecated to an accepted
+# no-op; --compat runs the reference extension path, so this is accepted, not a hard error.
+compat_ok --compat=bwa-mem2 --skip-contained-ext
 compat_err "mutually exclusive" --compat=bwa-mem2 --chunk-cap 1000
 # The error must NAME the offending flag(s) (the guard builds the list at runtime),
 # so assert on the flag name, not just the boilerplate. A two-lever case pins that

@@ -729,9 +729,10 @@ past the main extension batch rather than predicted away, the same containment t
 purge already applies is run against the container's post-extension coordinates, and a seed
 that test does not confirm is extended in a second batch — so no alignment the reference path
 would have produced is lost, and no seed leaves the chain (seed coverage and MAPQ are
-untouched). It is a pure speed lever (measured −2.9% alignment CPU on a 5M-pair WGS slice,
-−1.4% on a 5M-pair WES slice, −1.6% on a 5M-pair `--meth` slice, all verified bit-for-bit
-identical to the reference path, records + header + count), which is why it is on by default.
+untouched). It is a pure speed lever (measured on AWS Graviton4 (`c8g.8xlarge`, arm64, NEON SIMD
+tier), clang-19: −2.9% user-CPU on a 5M-pair WGS slice, −1.4% on a 5M-pair WES slice, −1.6% on a
+5M-pair `--meth` slice, all verified bit-for-bit identical to the reference path, records + header +
+count), which is why it is on by default.
 
 `--keep-contained-ext` opts out and runs the reference extension path (no deferral, every
 seed extended in the main batch). Output is unchanged; the run is only slower. Use it as an
