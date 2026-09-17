@@ -1537,7 +1537,7 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "    --dedup-reads STR  whole-read-pair memoization: 'off', 'on', or 'auto' (measure the duplicate rate and net benefit at runtime, latch, and periodically re-probe); aligns once per distinct pair within a chunk and replays the per-read SAM stage, so alignment records are byte-identical in every mode. Benefits amplicon/UMI panels with PCR duplicates; ~no effect on WGS/exome [auto]\n");
     fprintf(stderr, "    --ks-dedup STR  cross-read SA-interval dedup: 'off', 'on' (resolve each distinct (k,s) suffix-array interval once per SA-resolve chunk and copy the coordinates to the reads that repeat it), or 'auto' (measure net benefit at runtime, latch, and periodically re-probe); alignment records byte-identical in every mode [auto]\n");
     fprintf(stderr, "    --huge-pages  back the index with 1 GB huge pages via mimalloc when the host has enough free 1 GB pages reserved; cuts dTLB misses in seeding; Linux only, alignment records byte-identical (only @PG CL differs, recording the flag), safe no-op otherwise [off]\n");
-    fprintf(stderr, "    --skip-contained-ext  skip banded-SW extension of seeds contained (same diagonal) in a longer in-chain seed; byte-identical on short/medium non-meth reads (NOT on kilobase-scale long reads); no effect under --meth [off]\n");
+    fprintf(stderr, "    --skip-contained-ext  skip banded-SW extension of seeds contained (same diagonal) in a longer in-chain seed once the post-extension containment purge confirms them; byte-identical on all read lengths, including under --meth [off]\n");
     fprintf(stderr, "    --max-extend-chains INT  cap chains extended per read to the top-INT by weight; ~23%% less alignment CPU, high-confidence placement unaffected; ignored for reads with >4096 chains; opt-in, NOT byte-identical (0 = off) [%d]\n", opt->max_extend_chains);
     fprintf(stderr, "    --adaptive-band  adaptive banded-SW: start tight and expand each pair to its chain-geometry band on long-extension reads; ~1.3x on medium reads (SBX ~240bp), no-op on short reads; kilobase-scale HiFi/ONT do not run at default settings; opt-in, NOT byte-identical [%s]\n", opt->band_start? "on":"off");
     fprintf(stderr, "    --no-adaptive-band  disable adaptive banded-SW (exact, byte-identical full-width extension; also disables the certified band); overrides --adaptive-band and the --adaptive-band that --fast enables\n");
@@ -2893,9 +2893,10 @@ int main_mem(int argc, char *argv[])
      * exceptions are --smem-dedup, --skip-contained-ext and the dedup sort,
      * which are plain on/off booleans forced on unconditionally (no opt-out
      * flag exists; the dedup sort has no flag at all).
-     * --skip-contained-ext is byte-identical on non-meth SE/PE and no-ops under
-     * --meth via its own internal gate (see bwamem.cpp), so forcing it on here is
-     * safe for --fast --meth too.
+     * --skip-contained-ext is byte-identical on all read lengths, under --meth
+     * included (it defers contained seeds past the main extension batch and
+     * skips only those the real post-extension purge confirms; see bwamem.cpp),
+     * so forcing it on here is safe for --fast --meth too.
      * Output is NOT byte-identical to the default; divergence is confined to the
      * low-confidence tail (see docs/best-practices/settings-profiles.md).
      * meth_mode is already resolved here (parsed in the getopt loop above). */
@@ -3102,7 +3103,7 @@ int main_mem(int argc, char *argv[])
                                                           * (~35-55% faster for n>=9; diverges from
                                                           * bwa-mem2 on equal-`re` ties) */
         opt->skip_contained_ext = 1;                     /* --skip-contained-ext (plain on/off;
-                                                          * meth-gated internally) */
+                                                          * byte-identical, --meth included) */
         if (!no_adaptive_band)
             opt->band_start = ADAPTIVE_BAND_START;        /* --adaptive-band: no-op on short reads
                                                           * (8-bit tier untouched), ~25% faster on
@@ -3361,10 +3362,11 @@ int main_mem(int argc, char *argv[])
          * (0.95 -> 0.949999988); %g's 6 significant digits round-trip every
          * realistically-typed fraction cleanly. */
         if (opt->meth_mode)
-            /* --skip-contained-ext is set but no-ops under --meth (internal gate), so it is
-             * intentionally omitted from the meth audit line to reflect the effective levers.
-             * --adaptive-band applies under --meth, so it stays (unless opted out). */
-            fprintf(stderr, "[M::%s] --fast: -m %d -y %ld --min-ext-len %d --smem-dedup --max-extend-chains %d %s -s %d --extend-mate-concordant --extend-tie-frac %g --extend-tie-floor %d%s --rescue-kmer=%d%s alnreg-sort=fast\n",
+            /* --skip-contained-ext is effective under --meth (the two-wave skip is
+             * byte-identical there too), so it is reported on the meth audit line like
+             * every other lever. --adaptive-band applies under --meth as well, so it
+             * stays (unless opted out). */
+            fprintf(stderr, "[M::%s] --fast: -m %d -y %ld --min-ext-len %d --smem-dedup --skip-contained-ext --max-extend-chains %d %s -s %d --extend-mate-concordant --extend-tie-frac %g --extend-tie-floor %d%s --rescue-kmer=%d%s alnreg-sort=fast\n",
                     __func__, opt->max_matesw, (long)opt->max_mem_intv, opt->min_ext_len, opt->max_extend_chains, adaptive_band_label, opt->split_width, opt->extend_tie_frac, opt->extend_tie_floor, opt->extend_csub ? " --extend-csub" : "", opt->rescue_kmer, opt->rescue_skip ? " --rescue-skip" : "");
         else
             fprintf(stderr, "[M::%s] --fast: -m %d -y %ld --min-ext-len %d --smem-dedup --skip-contained-ext --max-extend-chains %d %s --extend-mate-concordant --extend-tie-frac %g --extend-tie-floor %d%s --rescue-kmer=%d%s alnreg-sort=fast\n",

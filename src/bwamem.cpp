@@ -6289,35 +6289,38 @@ static inline int ungapped_analyze(const uint8_t *qs, const uint8_t *rs, int N,
 }
 
 /* ------------------------------------------------------------------------
- * Byte-identical contained-seed extension skip (--skip-contained-ext).
+ * Byte-identical contained-seed extension skip (--skip-contained-ext): the
+ * DEFERRAL filter of the two-wave extension.
  *
  * A seed s strictly contained (same diagonal, query subinterval) in a longer
- * seed of the same chain is dominated by that longer seed's extension: the
- * longest seed on a diagonal is always extended, its alnreg covers s's region,
- * so s's own alnreg is purged post-extension anyway (the PE18 containment purge
- * later in this function). We detect this before extension and skip building s's
- * banded-SW pair, marking its alnreg purged (qb=qe=-1) exactly as PE18 would --
- * but s stays in c->seeds, so seedcov/MAPQ are untouched.
+ * seed of the same chain is usually dominated by that longer seed's extension:
+ * the longest seed on a diagonal is always extended, its alnreg tends to cover
+ * s's region, and s's own alnreg is then purged post-extension by the PE18
+ * containment purge (Pass 3 of the extension driver). This predicate selects
+ * such seeds BEFORE extension so the driver can DEFER them: instead of being
+ * staged in the main extension batch, a flagged seed waits until its container
+ * has real post-extension coordinates, and only then is the real PE18
+ * containment test run against that alnreg. A seed the test confirms is purged
+ * (its banded-SW is skipped -- the whole win); a seed it does not confirm is
+ * extended in a second batch, so no alnreg flag-OFF would have produced is ever
+ * lost. s stays in c->seeds either way, so seedcov/MAPQ are untouched.
  *
- * Byte-identity: the skip set is a proven subset of PE18's purge set. (a) seed
- * containment implies containment in the longer seed's (extension-grown) alnreg,
- * so PE18 would purge it; (b) we replicate PE18's interference guard (a
- * comparably-long seed overlapping s on a *different* diagonal forces
- * extension) using seed coordinates; (c) dropping s as a container for other
- * seeds is safe because the longest same-diagonal seed (always extended) is a
- * superset container.
+ * This is a pure filter: it decides only WHICH seeds are worth deferring, never
+ * whether one is purged. It must be a subset of PE18's purge candidates -- the
+ * interference guard below mirrors Pass 3's (a comparably-long seed overlapping
+ * s on a *different* diagonal forces extension) using seed coordinates -- so
+ * the deferred set carries no seed Pass 3 would keep for that reason. The
+ * predicate is coordinate-only (no scoring), so it is valid under --meth too.
  * ---------------------------------------------------------------------- */
 /* container_si (optional out-param, may be NULL): on a redundant return (1),
  * receives the seed index of the MAX-length same-diagonal container of s. The
- * two-wave design (reports/2026-09-16-skip-contained-ext-two-wave-impl-plan.md)
- * needs the *outermost* container, not merely the first one found: same-diagonal
- * containment is transitive query-interval containment, so the longest
- * same-diagonal container is the unique outermost one, is never itself contained,
- * and is therefore always a fully-extended root (never deferred) by the time the
- * interleaved Pass-3 extension looks it up. Choosing the max-length (rather than
- * the first-found) container does NOT change the boolean result -- a container
- * exists iff the longest one does -- so the existing call site (passing NULL) is
- * byte-identical to the prior first-match `break` form. */
+ * post-extension guard needs the *outermost* container, not merely the first
+ * one found: same-diagonal containment is transitive query-interval
+ * containment, so the longest same-diagonal container is the unique outermost
+ * one, is never itself contained, and is therefore always a fully-extended
+ * root (never deferred) by the time the second wave looks it up. Choosing the
+ * max-length (rather than the first-found) container does NOT change the
+ * boolean result -- a container exists iff the longest one does. */
 static inline int mem_seed_ext_redundant(const mem_chain_t *c, int si,
                                          int *container_si)
 {
@@ -6364,7 +6367,7 @@ static inline int mem_seed_ext_redundant(const mem_chain_t *c, int si,
  * ONLY the per-candidate test; the outer scan, the `lim[l]`/`v` budget, the
  * purged-candidate skip, and the different-diagonal interference scan stay in
  * Pass 3 (correctness depends on that being one incremental traversal, so it
- * must not be re-implemented elsewhere -- see the impl plan §4).
+ * must not be re-implemented elsewhere).
  *
  * Returns the two containment outcomes the original inline body produced, so the
  * caller reproduces the exact control flow:
@@ -6373,6 +6376,37 @@ static inline int mem_seed_ext_redundant(const mem_chain_t *c, int si,
  * The purged-candidate case (`p->qb==-1 && p->qe==-1` -> bare continue, no v++)
  * stays at the call site, since it is a candidate-liveness check, not a
  * containment decision. */
+/* Two-wave --skip-contained-ext. A seed mem_seed_ext_redundant flags is
+ * DEFERRED (not extended, not purged) in Pass 1; after Pass 2 has scored the
+ * roots, this real PE18 containment predicate is run against the container's
+ * now-real alnreg and the seed is purged (skip its SW -- the win) only when the
+ * container sorts to an earlier slot (container.aln < s.aln, so the purge
+ * matches flag-OFF's Pass-3 decision by induction), else it is extended in a
+ * second batch. Byte-identical to flag-OFF on ALL read lengths and under
+ * --meth: the decision is made on real post-extension coordinates, and the
+ * predicate is scoring-independent. */
+
+/* One deferred seed recorded by the two-wave Pass 1, resolved after Pass 2.
+ * (l,j) locate the read+chain so the second wave re-derives the identical
+ * reference window; seed_idx is the seed within the chain (== the srt[k] value);
+ * container_si is the max-length same-diagonal container's seed index (from
+ * mem_seed_ext_redundant's out-param). The alnreg slot is s->aln, already set in
+ * Pass 1.
+ *
+ * rmax0/rmax1/chain_band cache the chain's Pass-1 reference window (the
+ * post-clamp rmax[] and band that derive_chain_window + bns_fetch_seq_v2
+ * produced for this chain). The second wave restores them instead of
+ * re-deriving the window: the derivation is O(seeds in chain) with two
+ * double-division cal_max_gap calls per seed, and it is only needed when a
+ * deferred seed actually survives the guard (a purge needs no window at all).
+ * Re-fetching with the cached post-clamp bounds is exact: bns_fetch_seq_v2's
+ * contig clamp is idempotent, so rmax[] and the window bytes are identical to
+ * Pass 1's. */
+struct PendingSeed {
+    int l; int j; int seed_idx; int container_si;
+    int64_t rmax0; int64_t rmax1; int chain_band;
+};
+
 enum pe18_cand_result { PE18_NOT = 0, PE18_CONTAINED = 1 };
 static inline enum pe18_cand_result
 pe18_seed_in_container(const mem_seed_t *s, const mem_alnreg_t *p,
@@ -6489,7 +6523,15 @@ static inline void stage_seed_extension(
         SeqPair sp;
         sp.h0 = meth_seed_sc;   /* D3: true seed score (== len*a outside --meth) */
         sp.seqid = c->seqid;
-        sp.regid = av->n - 1;
+        /* regid is the slot of THIS alnreg. In the Pass-1 seed loop `a` was just
+         * pushed, so this equals the former `av->n - 1` (default path unchanged);
+         * the two-wave second batch stages a seed whose slot was assigned back
+         * in Pass 1, long after av->n stopped moving, so `av->n - 1` there is
+         * the read's LAST slot and the scores would scatter onto a foreign,
+         * already-extended alnreg (its qb/rb/qe/re/truesc are updated as
+         * deltas). Deriving regid from `a` keeps both waves byte-identical to
+         * flag-OFF. Mirrored on the RIGHT side below. */
+        sp.regid = (int)(a - av->a);
 
         if (numPairsLeft >= *wsize_pair) {
             if (bwa_verbose >= 4) fprintf(stderr, "[0000][%0.4d] Re-allocating seqPairArrays, in Left\n", tid);
@@ -6732,7 +6774,7 @@ static inline void stage_seed_extension(
 
         sp.h0 = H0_; //random number
         sp.seqid = c->seqid;
-        sp.regid = av->n - 1;
+        sp.regid = (int)(a - av->a);   /* see the LEFT-side note: the alnreg's own slot */
 
         if (numPairsRight >= *wsize_pair)
         {
@@ -7061,6 +7103,127 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
     uint8_t *meth_qbuf = NULL;
     int      meth_qbuf_cap = 0;
 
+    /* The extension query for read `l`: the projected read itself outside
+     * --meth, else meth_orig_seq 2-bit-encoded into meth_qbuf (a single
+     * per-thread scratch, so the encode is redone on every call -- Pass 1 calls
+     * it once per read, and the two-wave second pass calls it again for each
+     * read it re-stages a deferred seed for, since the scratch has been
+     * overwritten by later reads by then). If meth_orig_seq is missing (should
+     * not happen under --meth once ingest populates it) we fall back to the
+     * projected read so the path still runs. Shared VERBATIM by both waves so
+     * a deferred seed is extended against exactly the bases Pass 1 would have
+     * used. */
+    auto extension_query = [&](int l, int lq) -> const uint8_t * {
+        if (!(opt->meth_mode && seq_[l].meth_orig_seq != NULL))
+            return (const uint8_t *) seq_[l].seq;
+        if (lq > meth_qbuf_cap) {
+            meth_qbuf_cap = lq;
+            /* Temp pointer so a NULL realloc does not leak meth_qbuf. */
+            uint8_t *meth_qbuf_new = (uint8_t *) realloc(meth_qbuf, (size_t) meth_qbuf_cap);
+            xassert(meth_qbuf_new != NULL, "out of memory: meth_qbuf_new");
+            meth_qbuf = meth_qbuf_new;
+        }
+        const char *os = seq_[l].meth_orig_seq;
+        for (int i = 0; i < lq; ++i) {
+            unsigned char c = (unsigned char) os[i];
+            meth_qbuf[i] = nst_nt4_decode(c, 4);
+        }
+        return meth_qbuf;
+    };
+
+    /* D3 (--meth): the ungapped seed score the extension starts from (h0, and
+     * the alnreg score of a seed with no left extension). The seed matched in
+     * projected 3-letter space, but its 4-letter score against the ORIGINAL
+     * read + ref is not necessarily len*a -- a seed-internal variant (e.g. a
+     * C/T mirror that collapsed in seed space) scores as a mismatch under the
+     * per-strand matrix. Recompute the true ungapped seed score so the alnreg
+     * score (hence AS, MAPQ, and mate rescue) is honest rather than
+     * optimistically len*a. --meth-scoring collapsed frees C/T (and G/A) both
+     * ways, so this reproduces len*a (bwameth-like); genomic penalizes the
+     * variant. `query` is the ORIGINAL read (extension_query above); `rseq` is
+     * the original 4-letter ref window whose origin is the function-scope
+     * rmax[0]. mat[ref*5+read] is target-major (matches mem_opt_fill_meth_mat).
+     * len*a outside --meth. Shared VERBATIM by Pass 1 and the two-wave second
+     * pass so a deferred seed's h0 matches what Pass 1 would have staged. */
+    auto seed_ext_score = [&](const mem_seed_t *sd, const mem_alnreg_t *ar,
+                              const uint8_t *rseq_w, const uint8_t *query_w) -> int {
+        int sc = sd->len * opt->a;
+        if (opt->meth_mode && ar->meth_strand_hyp >= 0) {
+            const int8_t *seed_mat = mem_opt_meth_mat(opt, ar->meth_strand_hyp);
+            const int64_t roff = sd->rbeg - rmax[0];
+            sc = 0;
+            for (int _i = 0; _i < sd->len; ++_i)
+                sc += seed_mat[ rseq_w[roff + _i] * 5 + query_w[sd->qbeg + _i] ];
+        }
+        return sc;
+    };
+
+    /* Two-wave --skip-contained-ext: seeds deferred in Pass 1 pending the
+     * post-Pass-2 guarded purge / second batch. Empty (and the whole two-wave
+     * path inert) unless skip_contained_ext is set. Per-thread, grows as
+     * needed. */
+    static thread_local std::vector<PendingSeed> ks_pending;
+    ks_pending.clear();
+
+    /* C3b-2: per-chain reference-window derivation, shared VERBATIM between Pass 1
+     * and the two-wave second pass so the two can never drift. Sets rmax[0]/rmax[1]
+     * (function-scope) and rseq_out; returns chain_band and writes
+     * chain_max_n_hits_out. Function-scope (captures only function-scope state +
+     * takes lq/rseq_out/counts by param) so the second wave, which runs outside
+     * the per-read loop, can call it. Identical computation to the former inline
+     * block, so with the two-wave path off this is a pure refactor
+     * (byte-identical). The `max` local is a dead write here (never read), kept
+     * verbatim. */
+    auto derive_chain_window = [&](mem_chain_t *cc, int lq,
+                                   uint8_t *&rseq_out, int &chain_max_n_hits_out) -> int {
+        int64_t tmp;
+        int max = 0;
+        // get the max possible span
+        rmax[0] = l_pac<<1; rmax[1] = 0;
+
+        int chain_max_n_hits = 1;
+        int64_t cb_lo=0, cb_hi=0; int cb_f=1, chain_band=0;
+        for (int i = 0; i < cc->n; ++i) {
+            int64_t b, e;
+            const mem_seed_t *t = &cc->seeds[i];
+            b = t->rbeg - (t->qbeg + cal_max_gap(opt, t->qbeg));
+            e = t->rbeg + t->len + ((lq - t->qbeg - t->len) +
+                                    cal_max_gap(opt, lq - t->qbeg - t->len));
+
+            tmp = rmax[0];
+            rmax[0] = tmp < b? rmax[0] : b;
+            rmax[1] = (rmax[1] > e)? rmax[1] : e;
+            if (t->len > max) max = t->len;
+            if (t->n_hits > chain_max_n_hits) chain_max_n_hits = t->n_hits;
+            if (opt->band_start > 0) { int64_t _d = t->rbeg - t->qbeg; if (cb_f){cb_lo=cb_hi=_d; cb_f=0;} else { if(_d<cb_lo)cb_lo=_d; if(_d>cb_hi)cb_hi=_d; } }
+        }
+        int64_t cb_span = cb_hi - cb_lo;
+        if (cb_span > opt->w) cb_span = opt->w;
+        chain_band = (int)cb_span;
+
+        rmax[0] = rmax[0] > 0? rmax[0] : 0;
+        rmax[1] = rmax[1] < l_pac<<1? rmax[1] : l_pac<<1;
+        if (rmax[0] < l_pac && l_pac < rmax[1])
+        {
+            if (cc->seeds[0].rbeg < l_pac) rmax[1] = l_pac;
+            else rmax[0] = l_pac;
+        }
+
+        /* retrieve the reference sequence */
+        {
+            int rid = 0;
+            // free rseq
+            rseq_out = bns_fetch_seq_v2(bns, pac, &rmax[0],
+                                    cc->seeds[0].rbeg,
+                                    &rmax[1], &rid, ref_string,
+                                    (uint8_t*) seqPairArrayAux);
+            assert(cc->rid == rid);
+        }
+        (void)max;
+        chain_max_n_hits_out = chain_max_n_hits;
+        return chain_band;
+    };
+
     // uint64_t timUP = __rdtsc();
     for (int l=0; l<nseq; l++)
     {
@@ -7069,32 +7232,14 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
 
         lim_g[l+1] = 0;
 
-        const uint8_t *query = (uint8_t *) seq_[l].seq;
         int l_query = seq_[l].l_seq;
 
-        /* D3 (--meth, PR-4): swap the extension query to the ORIGINAL read bases.
-         * seq_[l].seq is the projected (already C→T/G→A) read, used only for
-         * seeding; extension must score the original read against the original
-         * ref with the per-hypothesis asymmetric matrix. We 2-bit-encode
-         * meth_orig_seq (ASCII, same orientation as seq) into meth_qbuf and point
-         * `query` at it. If meth_orig_seq is missing (should not happen under
-         * --meth once ingest populates it) we fall back to the projected read so
-         * the path still runs. */
-        if (opt->meth_mode && seq_[l].meth_orig_seq != NULL) {
-            if (l_query > meth_qbuf_cap) {
-                meth_qbuf_cap = l_query;
-                /* CodeRabbit: temp pointer so a NULL realloc doesn't leak. */
-                uint8_t *meth_qbuf_new = (uint8_t *) realloc(meth_qbuf, (size_t) meth_qbuf_cap);
-                xassert(meth_qbuf_new != NULL, "out of memory: meth_qbuf_new");
-                meth_qbuf = meth_qbuf_new;
-            }
-            const char *os = seq_[l].meth_orig_seq;
-            for (int i = 0; i < l_query; ++i) {
-                unsigned char c = (unsigned char) os[i];
-                meth_qbuf[i] = nst_nt4_decode(c, 4);
-            }
-            query = meth_qbuf;
-        }
+        /* D3 (--meth, PR-4): under --meth the extension query is the ORIGINAL
+         * read bases, not seq_[l].seq (the projected C→T/G→A read, used only
+         * for seeding): extension must score the original read against the
+         * original ref with the per-hypothesis asymmetric matrix. See
+         * extension_query. */
+        const uint8_t *query = extension_query(l, l_query);
 
         mem_chain_v *chn = &chain_ar[l];
         mem_alnreg_v *av = &av_v[l];  // alignment
@@ -7129,59 +7274,20 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
         av->a = (mem_alnreg_t*)calloc(av->m, sizeof(mem_alnreg_t));
 
         // aln mem allocation ends
+
         for (int j=0; j<chn->n; j++)
         {
             c = &chn->a[j];
             assert(c->seqid == l);
 
-            int64_t tmp = 0;
             if (c->n == 0) continue;
 
             if (j + 1 < chn->n) CHAIN_PAC_PREFETCH(&chn->a[j + 1]);
             _mm_prefetch((const char*) (srtgg + spos + 64), _MM_HINT_NTA);
             _mm_prefetch((const char*) (lim_g), _MM_HINT_NTA);
 
-            // get the max possible span
-            rmax[0] = l_pac<<1; rmax[1] = 0;
-
             int chain_max_n_hits = 1;
-            int64_t cb_lo=0, cb_hi=0; int cb_f=1, chain_band=0;
-            for (int i = 0; i < c->n; ++i) {
-                int64_t b, e;
-                const mem_seed_t *t = &c->seeds[i];
-                b = t->rbeg - (t->qbeg + cal_max_gap(opt, t->qbeg));
-                e = t->rbeg + t->len + ((l_query - t->qbeg - t->len) +
-                                        cal_max_gap(opt, l_query - t->qbeg - t->len));
-
-                tmp = rmax[0];
-                rmax[0] = tmp < b? rmax[0] : b;
-                rmax[1] = (rmax[1] > e)? rmax[1] : e;
-                if (t->len > max) max = t->len;
-                if (t->n_hits > chain_max_n_hits) chain_max_n_hits = t->n_hits;
-                if (opt->band_start > 0) { int64_t _d = t->rbeg - t->qbeg; if (cb_f){cb_lo=cb_hi=_d; cb_f=0;} else { if(_d<cb_lo)cb_lo=_d; if(_d>cb_hi)cb_hi=_d; } }
-            }
-            int64_t cb_span = cb_hi - cb_lo;
-            if (cb_span > opt->w) cb_span = opt->w;
-            chain_band = (int)cb_span;
-
-            rmax[0] = rmax[0] > 0? rmax[0] : 0;
-            rmax[1] = rmax[1] < l_pac<<1? rmax[1] : l_pac<<1;
-            if (rmax[0] < l_pac && l_pac < rmax[1])
-            {
-                if (c->seeds[0].rbeg < l_pac) rmax[1] = l_pac;
-                else rmax[0] = l_pac;
-            }
-
-            /* retrieve the reference sequence */
-            {
-                int rid = 0;
-                // free rseq
-                rseq = bns_fetch_seq_v2(bns, pac, &rmax[0],
-                                        c->seeds[0].rbeg,
-                                        &rmax[1], &rid, ref_string,
-                                        (uint8_t*) seqPairArrayAux);
-                assert(c->rid == rid);
-            }
+            int chain_band = derive_chain_window(c, l_query, rseq, chain_max_n_hits);
 
             _mm_prefetch((const char*) rseq, _MM_HINT_NTA);
             // _mm_prefetch((const char*) rseq + 64, _MM_HINT_NTA);
@@ -7251,45 +7357,44 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
                  * flips the conversion's freed cell — so flip the hypothesis. */
                 a->meth_strand_hyp = (c->meth_hypothesis < 0) ? -1
                     : (int8_t)((c->meth_hypothesis ^ (s->rbeg >= l_pac ? 1 : 0)) & 1);
-                /* D3 (--meth): the seed matched in projected 3-letter space, but
-                 * its 4-letter score against the ORIGINAL read + ref is not
-                 * necessarily len*a — a seed-internal variant (e.g. a C/T mirror
-                 * that collapsed in seed space) scores as a mismatch under the
-                 * per-strand matrix. Recompute the true ungapped seed score so the
-                 * alnreg score (the h0 the extension starts from, hence AS, MAPQ,
-                 * and mate rescue) is honest rather than optimistically len*a.
-                 * --meth-scoring collapsed frees C/T (and G/A) both ways, so this
-                 * reproduces len*a (bwameth-like); genomic penalizes the variant.
-                 * query is the ORIGINAL read (meth_orig_seq, set above); rseq is
-                 * the original 4-letter ref window. mat[ref*5+read] is target-major
-                 * (matches mem_opt_fill_meth_mat). */
-                int meth_seed_sc = s->len * opt->a;
-                if (opt->meth_mode && a->meth_strand_hyp >= 0) {
-                    const int8_t *seed_mat = mem_opt_meth_mat(opt, a->meth_strand_hyp);
-                    const int64_t roff = s->rbeg - rmax[0];
-                    meth_seed_sc = 0;
-                    for (int _i = 0; _i < s->len; ++_i)
-                        meth_seed_sc += seed_mat[ rseq[roff + _i] * 5 + query[s->qbeg + _i] ];
-                }
                 a->chain_n_hits = chain_max_n_hits;
                 a->rb = a->qb = a->re = a->qe = H0_;
 
                 tprof[PE19][tid] ++;
 
-                /* NB: gated off under --meth. The dominance argument assumes a
-                 * longer same-diagonal seed's extension covers the shorter one;
-                 * meth's asymmetric C->T matrix breaks this (a contained seed can
-                 * extend to a differently-scored aln), so the skip is NOT
-                 * byte-identical under --meth (measured ~0.17% of pairs diverge). */
-                if (opt->skip_contained_ext && !opt->meth_mode &&
-                    mem_seed_ext_redundant(c, (uint32_t)srt[k], NULL)) {
-                    a->qb = a->qe = -1;   /* pre-purge exactly as PE18 would */
-                    continue;
+                /* --skip-contained-ext (two-wave): DEFER a seed strictly
+                 * contained in a longer same-diagonal seed of this chain. It is
+                 * neither staged nor purged here -- a pre-extension purge would
+                 * be a prediction of Pass 3's decision, and that prediction is
+                 * wrong on kilobase-scale reads (a contained seed can extend to
+                 * an alnreg its container's does not cover) and under --meth
+                 * (the asymmetric matrix can score the two extensions
+                 * differently). Instead the seed is recorded for the post-Pass-2
+                 * resolve, where the real PE18 test runs against the container's
+                 * real alnreg and the seed is purged or extended accordingly. The
+                 * alnreg slot stays at H0_ until then; nothing reads av between
+                 * Pass 2 and the second wave. Everything the second wave needs
+                 * that Pass 1 set on `a` (meth_strand_hyp above, seedlen0, c, ...)
+                 * is already in place at this point. */
+                if (opt->skip_contained_ext) {
+                    int _container_si = -1;
+                    if (mem_seed_ext_redundant(c, (uint32_t)srt[k], &_container_si)) {
+                        ks_pending.push_back(
+                            PendingSeed{ l, j, (int)(uint32_t)srt[k], _container_si,
+                                         rmax[0], rmax[1], chain_band });
+                        continue;
+                    }
                 }
 
+                /* D3 (--meth): true ungapped seed score (== len*a outside --meth);
+                 * see seed_ext_score. Computed after the deferral check so a
+                 * deferred seed's score is derived in the second wave, against
+                 * the same window, only if it is actually extended. */
+                const int meth_seed_sc = seed_ext_score(s, a, rseq, query);
+
                 /* Per-seed extension staging (C3a): extracted verbatim into
-                 * stage_seed_extension() so a future two-wave second pass can
-                 * reuse the identical staging. StageCtx binds the mutable
+                 * stage_seed_extension() so the two-wave second pass reuses the
+                 * identical staging. StageCtx binds the mutable
                  * staging locals by reference; grows propagate back through it. */
                 StageCtx _sctx = {
                     seqPairArrayLeft128, seqPairArrayRight128, seqPairArrayAux,
@@ -8027,6 +8132,129 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
     };  /* end run_extension_batch lambda */
     run_extension_batch();
 
+    /* ---- Two-wave second pass, inert unless --skip-contained-ext. Every
+     * root/container alnreg now has real post-Pass-2 coords. For each deferred
+     * seed, run the REAL PE18 containment test against its container's real
+     * alnreg; GUARDED by container.aln < s.aln so the purge matches flag-OFF's
+     * Pass-3 decision by induction (the guard closes the long-read
+     * seed-rescoring slot-order inversion). Guard-passing seeds are purged
+     * (their SW is skipped -- the win); the rest are re-staged and scored by a
+     * second run_extension_batch(). Nothing reads av between here and Pass 3,
+     * so leaving deferred slots at H0_ until now is safe. ---- */
+    if (opt->skip_contained_ext && !ks_pending.empty()) {
+        /* Reuse the (now-consumed) staging arrays for the second batch. */
+        numPairsLeft = numPairsRight = 0;
+        leftRefOffset = rightRefOffset = leftQerOffset = rightQerOffset = 0;
+#if BWAMEM3_UGP_PROFILE
+        numPairsLeft128 = numPairsLeft16 = numPairsLeft1 = 0;
+#endif
+        size_t pi = 0;
+        while (pi < ks_pending.size()) {
+            const int gl = ks_pending[pi].l;
+            const int gj = ks_pending[pi].j;
+            mem_chain_t *gc = &chain_ar[gl].a[gj];
+            mem_alnreg_v *gav = &av_v[gl];
+            const int gl_query = seq_[gl].l_seq;
+
+            /* This chain's reference window AND this read's extension query,
+             * restored LAZILY the first time a seed of this group survives the
+             * guard. On short reads nearly every deferred seed is purged, and a
+             * purge needs neither, so most groups never pay for them. When
+             * needed, rmax[] is reset to the cached post-clamp bounds and the
+             * window re-fetched with them: the fetch clamps idempotently, so
+             * rseq and rmax[] are exactly what Pass 1 staged this chain
+             * against. The query is re-derived by extension_query: outside
+             * --meth it is seq_[gl].seq; under --meth the per-thread encode
+             * scratch has been overwritten by later reads since Pass 1, so
+             * meth_orig_seq is re-encoded (same input, same bytes). */
+            uint8_t *grseq = 0;
+            const uint8_t *gquery = NULL;
+            int gchain_band = 0;
+            bool gwin = false;
+
+            /* Resolve every pending seed of this (l,j) group. */
+            for (; pi < ks_pending.size()
+                   && ks_pending[pi].l == gl && ks_pending[pi].j == gj; ++pi) {
+                const mem_seed_t *ps = &gc->seeds[ks_pending[pi].seed_idx];
+                mem_alnreg_t *pa = &gav->a[ps->aln];
+                const mem_seed_t *pc = &gc->seeds[ks_pending[pi].container_si];
+
+                /* GUARD: only pre-purge when the container sits at an earlier
+                 * slot (so flag-OFF's Pass 3 also purges ps at its own turn) AND
+                 * the real PE18 predicate confirms containment against the
+                 * container's real extended alnreg. Else extend ps.
+                 *
+                 * Why this is exact: flag-OFF extends EVERY seed in the main
+                 * batch and only then lets Pass 3 purge, in slot order, each seed
+                 * that (A) is PE18-contained in an earlier still-live alnreg and
+                 * (B) has no interfering higher-priority same-chain seed. So
+                 * extending a deferred seed here is always output-safe (Pass 3
+                 * then judges it exactly as flag-OFF does, given its alnreg is
+                 * scored into its OWN slot -- see sp.regid in the staging
+                 * helper); only a purge must be certain. This purge is: (B) holds
+                 * because mem_seed_ext_redundant's interference scan covers a
+                 * superset of Pass 3's; (A) holds because the container is
+                 * earlier and either stays live, or is itself purged by an
+                 * alnreg that, containing the longer same-diagonal seed, also
+                 * PE18-contains ps. Testing other earlier alnregs would need
+                 * their Pass-3 liveness (not transitive), so it is not done. */
+                bool purge = false;
+                if (pc->aln < ps->aln) {
+                    const mem_alnreg_t *cp = &gav->a[pc->aln];
+                    /* container must be a live, extended root (C1 guarantees it
+                     * is never itself deferred); guard defensively. */
+                    if (!(cp->qb == -1 && cp->qe == -1) &&
+                        pe18_seed_in_container(ps, cp, gl_query, opt) == PE18_CONTAINED)
+                        purge = true;
+                }
+                if (purge) {
+                    pa->qb = pa->qe = -1;   /* skip its SW: the two-wave win */
+                    continue;
+                }
+                /* Extend ps in the second batch: restore the window + query,
+                 * recompute its seed score exactly as Pass 1 would have (the
+                 * meth-matrix score under --meth, len*a otherwise -- with the
+                 * restored rmax[0] the ref offset is Pass 1's), and stage. */
+                if (!gwin) {
+                    rmax[0] = ks_pending[pi].rmax0;
+                    rmax[1] = ks_pending[pi].rmax1;
+                    int grid = 0;
+                    grseq = bns_fetch_seq_v2(bns, pac, &rmax[0], gc->seeds[0].rbeg,
+                                             &rmax[1], &grid, ref_string,
+                                             (uint8_t *) seqPairArrayAux);
+                    assert(gc->rid == grid);
+                    gchain_band = ks_pending[pi].chain_band;
+                    gquery = extension_query(gl, gl_query);
+                    gwin = true;
+                }
+                const int meth_seed_sc = seed_ext_score(ps, pa, grseq, gquery);
+                StageCtx _sctx2 = {
+                    seqPairArrayLeft128, seqPairArrayRight128, seqPairArrayAux,
+                    seqBufLeftRef, seqBufRightRef, seqBufLeftQer, seqBufRightQer,
+                    leftRefOffset, rightRefOffset, leftQerOffset, rightQerOffset,
+                    numPairsLeft, numPairsRight,
+                    wsize_pair, wsize_buf_ref, wsize_buf_qer, mmc, tid
+#if BWAMEM3_UGP_PROFILE
+                    , numPairsLeft128, numPairsLeft16, numPairsLeft1
+#endif
+                };
+                stage_seed_extension(ps, pa, gc, gav, gquery, grseq, rmax,
+                                     gchain_band, meth_seed_sc, gl_query,
+                                     opt, fp_o_min, fp_e_min, fp_x_threshold,
+                                     _sctx2);
+            }
+        }
+        /* Score the deferred survivors (byte-identical to their being in the
+         * main batch; scatter is by (seqid,regid)). Skipped when the guard
+         * purged every deferred seed: with no pairs staged the batch has no
+         * output effect (the sorts and every tier rung return on an empty
+         * input, and the scatter loops run zero times), so this only avoids
+         * its fixed per-call setup -- two SW-object constructions and the
+         * histogram allocation. */
+        if (numPairsLeft > 0 || numPairsRight > 0)
+            run_extension_batch();
+    }
+
     // tprof[CRIGHT][tid] += __rdtsc() - timR;
 
     if (numPairsLeft >= *wsize_pair || numPairsRight >= *wsize_pair)
@@ -8119,6 +8347,17 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
                         tprof[PE18][tid]++;
                         continue;
                     }
+                }
+                /* Two-wave invariant (belt-and-suspenders): a seed Pass 3 KEEPS
+                 * (lim++) must have a live, extended alnreg. A deferred seed is
+                 * either purged in the second wave (slot == -1, and Pass 3 would
+                 * purge it here too) or extended there; a slot still at H0_ here
+                 * would mean a deferred seed was neither purged nor extended -- a
+                 * two-wave bug. Fires under -DNDEBUG too (xassert). */
+                if (opt->skip_contained_ext) {
+                    const mem_alnreg_t *_kar = &av_v[l].a[s->aln];
+                    xassert(!(_kar->qb == H0_ || _kar->qe == H0_),
+                            "two-wave: Pass 3 kept a seed whose alnreg was never resolved");
                 }
                 lim[l]++;
             }

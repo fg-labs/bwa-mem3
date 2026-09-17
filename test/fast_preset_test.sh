@@ -6,9 +6,9 @@
 # --max-extend-chains 20 --extend-mate-concordant --rescue-kmer=6, plus -s 2 and a
 # lower --max-extend-chains 10 under --meth), that explicit user flags override the
 # preset, and that the default path is untouched when --fast is absent.
-# --skip-contained-ext no-ops under --meth (internal gate), so it is omitted from
-# the meth audit line; --max-extend-chains applies under --meth too but at a
-# lower cap of 10 (non-meth uses 20). --extend-mate-concordant recovers the
+# --skip-contained-ext is effective (and byte-identical) under --meth too, so it
+# must appear on the meth audit line; --max-extend-chains applies under --meth
+# too but at a lower cap of 10 (non-meth uses 20). --extend-mate-concordant recovers the
 # chain-cap pairing regression and is now enabled for both non-meth and --meth
 # --fast (fg-labs/bwa-mem3#202), so it must be present on both audit lines.
 #
@@ -203,9 +203,9 @@ if "$bin" index --meth "$mdir/ref.fa" > /dev/null 2>&1; then
             echo "FAIL: --fast --meth should resolve -s 2: '$line'" >&2
             exit 1
         }
-    [[ "$line" != *"--skip-contained-ext"* ]] \
+    [[ "$line" == *"--skip-contained-ext"* ]] \
         || {
-            echo "FAIL: --skip-contained-ext no-ops under --meth; must be absent from audit line: '$line'" >&2
+            echo "FAIL: --skip-contained-ext applies under --meth; must be on the audit line: '$line'" >&2
             exit 1
         }
     [[ "$line" == *"--max-extend-chains 10"* ]] \
@@ -240,7 +240,7 @@ if "$bin" index --meth "$mdir/ref.fa" > /dev/null 2>&1; then
             echo "FAIL: --fast --meth must enable alnreg-sort=fast: '$line'" >&2
             exit 1
         }
-    echo "OK:   --fast --meth additionally sets -s 2, --extend-mate-concordant, the extend-tie gate and alnreg-sort=fast (skip-contained-ext omitted meth-gated, --max-extend-chains raised to 10)"
+    echo "OK:   --fast --meth additionally sets -s 2, --extend-mate-concordant, the extend-tie gate and alnreg-sort=fast (--skip-contained-ext kept, --max-extend-chains lowered to 10)"
     # Explicit -s wins even under --meth (src/fastmap.cpp: -s 2 is gated on !opt0.split_width).
     "$bin" mem --meth --fast -s 7 -t 1 "$mdir/ref.fa" "$reads" > /dev/null 2> "$err" \
         || {
