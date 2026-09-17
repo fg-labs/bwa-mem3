@@ -79,12 +79,11 @@ bwa-mem3 mem -t <N> -m 10 -y 0 ref.fa R1.fq R2.fq > out.sam
 ```
 
 > **Shorthand:** `bwa-mem3 mem --fast` applies `-m 10 -y 0 --min-ext-len 30
-> --smem-dedup --skip-contained-ext --max-extend-chains 20 --adaptive-band
+> --smem-dedup --max-extend-chains 20 --adaptive-band
 > --extend-mate-concordant` (plus `-s 2` and a lower `--max-extend-chains 10`
 > under `--meth`) in one flag. Explicit flags
 > still override individual levers where applicable;
-> [`--smem-dedup`](https://github.com/fg-labs/bwa-mem3/pull/187) and
-> [`--skip-contained-ext`](https://github.com/fg-labs/bwa-mem3/pull/192) are forced on with no opt-out, and
+> [`--smem-dedup`](https://github.com/fg-labs/bwa-mem3/pull/187) is forced on with no opt-out, and
 > [`--adaptive-band`](https://github.com/fg-labs/bwa-mem3/pull/194) is
 > forced on but can be opted back out with `--no-adaptive-band` (which restores the exact
 > full-width extension step — byte-identical to a run without `--adaptive-band` — while
@@ -92,9 +91,10 @@ bwa-mem3 mem -t <N> -m 10 -y 0 ref.fa R1.fq R2.fq > out.sam
 > (`--adaptive-band` is a no-op on short reads, a ~25% speedup on medium-length runs
 > such as SBX ~240 bp; kilobase-scale HiFi/ONT do not run at default settings — see
 > [Situational: `--adaptive-band`](#situational---adaptive-band-for-medium-length-reads)).
-> `--skip-contained-ext` no-ops under `--meth` (its own internal gate disables it
-> there), so on a `--meth` run the effective levers are
+> On a `--meth` run the effective levers are
 > `-m 10 -y 0 --min-ext-len 30 --smem-dedup --max-extend-chains 10 --adaptive-band -s 2 --extend-mate-concordant`.
+> The [contained-seed extension skip](#contained-seed-extension-skip-on-by-default-opt-out---keep-contained-ext)
+> is not a `--fast` lever: it is the byte-identical default on every run.
 > See [`mem` → `--fast`](../cli/mem.md#--fast--speed-preset-opt-in-not-byte-identical).
 
 Use this for new pipelines, or once a drop-in migration is validated and you want bwa-mem3's best
@@ -106,10 +106,11 @@ speed/accuracy trade-off. Current recommended deviations:
 | `-y` (3rd-round seeding occurrence) | 20 | **0** | ~11–30% less alignment CPU; F1 near-neutral across regimes (within ±0.02; better on divergent/repeat — see below) |
 | `-s` (Pass-2 re-seed width), **`--meth` only** | 10 | **2** | light re-seed: ~same speed as `-s 0` but recovers the MAPQ/placement `-s 0` lost (see below) |
 | `--min-ext-len` (skip short-seed extension), **standard-error reads** | 0 | **30** | ~10–20% less alignment CPU; accuracy change confined to the already-low-confidence tail (see below) |
-| `--skip-contained-ext` (skip contained-seed extension), **short/medium non-meth reads** | off | **on** | ~10% less alignment CPU; **byte-identical** — zero accuracy change (see below) |
 
 This table will grow as we benchmark additional tunings; each entry is gated on the same
-"measurably faster, near-neutral accuracy" bar.
+"measurably faster, near-neutral accuracy" bar. The contained-seed extension skip is no longer
+listed because it is now the **default** (byte-identical, so it costs nothing to leave on); see
+[below](#contained-seed-extension-skip-on-by-default-opt-out---keep-contained-ext) for the opt-out.
 
 For a bisulfite (`--meth`) pipeline the recommended invocation is therefore:
 
@@ -296,38 +297,37 @@ figures and the golden-truth F1 sweep warrant a fresh
 these `--fast` accuracy figures genome-wide. `--min-ext-len` and `--fast` stay opt-in; the drop-in
 defaults are unchanged.
 
-## Contained-seed extension skip: `--skip-contained-ext`
+## Contained-seed extension skip (on by default; opt-out `--keep-contained-ext`)
 
-`--skip-contained-ext` skips banded Smith–Waterman extension of a seed that is **strictly contained**
-(same diagonal, query subinterval) in a longer seed of the same chain. The longest seed on a diagonal
-is always extended, and its alignment covers the contained seed's region, so the contained seed's own
-alignment is purged after extension anyway (the post-extension containment purge). Detecting that
-before extension and skipping the redundant banded-SW pair thins the extension stage without changing
-the seed set (the seed stays in the chain, so seed coverage and MAPQ are untouched). Off by default.
+By default `bwa-mem3 mem` skips banded Smith–Waterman extension of a seed that is **strictly
+contained** (same diagonal, query subinterval) in a longer seed of the same chain. The longest seed
+on a diagonal is always extended, and its alignment usually covers the contained seed's region, in
+which case the contained seed's own alignment is purged after extension anyway (the post-extension
+containment purge). Rather than predicting that outcome before extension, the aligner **defers** the
+contained seed past the main extension batch: once its container has real post-extension
+coordinates, the same containment test the purge uses is run against them, and only a seed it
+confirms has its banded-SW pair skipped. A seed it does not confirm is extended in a second batch.
+The seed set is unchanged either way (the seed stays in the chain, so seed coverage and MAPQ are
+untouched).
 
-**For non-meth short- and medium-length reads, this recommended lever has zero accuracy cost: it is
-byte-identical.** The skip set is a proven subset of the post-extension purge set, so on those inputs
-the output is bit-for-bit identical to the default — verified (records + header + count) on WGS 5M
-PE, HiC 1M PE, and an ALT/HLA-enriched set. It no-ops under `--meth` (its own internal gate disables
-it, since bisulfite's asymmetric scoring breaks the dominance argument), so the flag neither helps
-nor hurts a `--meth` run.
+**Zero accuracy cost: it is byte-identical to the reference extension path on all read lengths,
+`--meth` included.** Because the skip decision is made on real post-extension coordinates and the
+test is scoring-independent, the output is bit-for-bit identical to a run with the skip disabled —
+verified (records + header + count) on WGS 5M PE, WES 5M PE, a 5M-pair targeted panel, a 5M-pair
+`--meth` (EM-seq) slice, and kilobase-scale PacBio HiFi reads (where a pre-extension prediction
+demonstrably is not identical: it drops supplementary alignments and occasionally degrades a
+primary). That is why it is the default rather than a recommended lever.
 
-**In exchange, alignment CPU drops ~10%** (measured −10.6% single-thread CPU on 200k HG002 WGS
-2×150 single-end reads, md5-identical output; consistent with the −9.7% seen on SBX-SE in the
-original characterization). Because the win is pure — no accuracy trade-off to weigh on non-meth
-short- and medium-length reads — this is the safest entry in the recommended table.
+**Alignment CPU drops ~1–3% relative to the reference path** (measured on AWS Graviton4
+(`c8g.8xlarge`, arm64, NEON SIMD tier), clang-19: −2.9% user-CPU on a 5M-pair WGS slice, −1.4% on a
+5M-pair WES slice, and −1.6% on a 5M-pair `--meth` slice, all byte-identical; the win tracks how many
+contained seeds a dataset produces).
 
-> **Not byte-identical on kilobase-scale long reads.** On PacBio HiFi / ONT the "longest contained
-> seed dominates" assumption breaks (extensions terminate early, so the container no longer covers
-> the contained seed), and output diverges — dropped supplementary alignments, occasionally a
-> degraded primary. Kilobase-scale long reads are outside the scope of this recommendation, which
-> covers non-meth short- and medium-length reads only; such reads do not run at default settings
-> today in any case (see
-> [`--adaptive-band`](#situational---adaptive-band-for-medium-length-reads) and
-> [fg-labs/bwa-mem3#238](https://github.com/fg-labs/bwa-mem3/issues/238)).
-
-Already bundled into `--fast`. Recommended value: **on** for standard-error non-meth short- and
-medium-read pipelines.
+`--keep-contained-ext` opts out and runs the reference extension path (every seed extended in the
+main batch, no deferral). Output is unchanged; the run is only slower. It exists as an escape hatch
+and as a bit-exact A/B handle against binaries that predate the default. `--compat` implies it.
+The former opt-in spelling `--skip-contained-ext` is deprecated: it still parses, is a no-op, and
+prints a one-line notice pointing at `--keep-contained-ext`.
 
 ## Chain extension cap: `--max-extend-chains`
 

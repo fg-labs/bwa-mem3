@@ -581,7 +581,7 @@ mem_opt_t *mem_opt_init()
     o->seed_emit_order = SEED_ORDER_OFF;  // byte-identical default
     o->smem_dedup  = 0;   // off by default -> byte-identical to baseline; opt-in via --smem-dedup
     o->alnreg_sort_fast = 0;  // off by default -> bwa-mem2's dedup sort (see mem_sort_dedup_patch); set by --fast
-    o->skip_contained_ext = 0;   // off by default; opt-in via --skip-contained-ext (byte-identical)
+    o->skip_contained_ext = 1;   // on by default: the two-wave contained-seed skip is byte-identical to the reference extension path (all read lengths, --meth included); --keep-contained-ext (and --compat) opt out to that reference path
     o->band_start  = 0;   // off by default (adaptive chain-geometry band); opt-in via --adaptive-band
     o->band_cert   = 1;   // on by default: sound (byte-identical) adaptive band via per-pair tie-break certificate
     o->split_width = 10;
@@ -6289,37 +6289,62 @@ static inline int ungapped_analyze(const uint8_t *qs, const uint8_t *rs, int N,
 }
 
 /* ------------------------------------------------------------------------
- * Byte-identical contained-seed extension skip (--skip-contained-ext).
+ * Byte-identical contained-seed extension skip (--skip-contained-ext): the
+ * DEFERRAL filter of the two-wave extension.
  *
  * A seed s strictly contained (same diagonal, query subinterval) in a longer
- * seed of the same chain is dominated by that longer seed's extension: the
- * longest seed on a diagonal is always extended, its alnreg covers s's region,
- * so s's own alnreg is purged post-extension anyway (the PE18 containment purge
- * later in this function). We detect this before extension and skip building s's
- * banded-SW pair, marking its alnreg purged (qb=qe=-1) exactly as PE18 would --
- * but s stays in c->seeds, so seedcov/MAPQ are untouched.
+ * seed of the same chain is usually dominated by that longer seed's extension:
+ * the longest seed on a diagonal is always extended, its alnreg tends to cover
+ * s's region, and s's own alnreg is then purged post-extension by the PE18
+ * containment purge (Pass 3 of the extension driver). This predicate selects
+ * such seeds BEFORE extension so the driver can DEFER them: instead of being
+ * staged in the main extension batch, a flagged seed waits until its container
+ * has real post-extension coordinates, and only then is the real PE18
+ * containment test run against that alnreg. A seed the test confirms is purged
+ * (its banded-SW is skipped -- the whole win); a seed it does not confirm is
+ * extended in a second batch, so no alnreg flag-OFF would have produced is ever
+ * lost. s stays in c->seeds either way, so seedcov/MAPQ are untouched.
  *
- * Byte-identity: the skip set is a proven subset of PE18's purge set. (a) seed
- * containment implies containment in the longer seed's (extension-grown) alnreg,
- * so PE18 would purge it; (b) we replicate PE18's interference guard (a
- * comparably-long seed overlapping s on a *different* diagonal forces
- * extension) using seed coordinates; (c) dropping s as a container for other
- * seeds is safe because the longest same-diagonal seed (always extended) is a
- * superset container.
+ * This is a pure filter: it decides only WHICH seeds are worth deferring, never
+ * whether one is purged. It must be a subset of PE18's purge candidates -- the
+ * interference guard below mirrors Pass 3's (a comparably-long seed overlapping
+ * s on a *different* diagonal forces extension) using seed coordinates -- so
+ * the deferred set carries no seed Pass 3 would keep for that reason. The
+ * predicate is coordinate-only (no scoring), so it is valid under --meth too.
  * ---------------------------------------------------------------------- */
-static inline int mem_seed_ext_redundant(const mem_chain_t *c, int si)
+/* container_si (optional out-param, may be NULL): on a redundant return (1),
+ * receives the seed index of the MAX-length same-diagonal container of s. The
+ * post-extension guard needs the *outermost* container, not merely the first
+ * one found: same-diagonal containment is transitive query-interval
+ * containment, so the longest same-diagonal container is the unique outermost
+ * one, is never itself contained, and is therefore always a fully-extended
+ * root (never deferred) by the time the second wave looks it up. Choosing the
+ * max-length (rather than the first-found) container does NOT change the
+ * boolean result -- a container exists iff the longest one does. */
+static inline int mem_seed_ext_redundant(const mem_chain_t *c, int si,
+                                         int *container_si)
 {
     const mem_seed_t *s = &c->seeds[si];
     long sd = (long)s->rbeg - s->qbeg;
     int has_container = 0, j;
+    int best_j = -1, best_len = -1;
     for (j = 0; j < c->n; ++j) {
         if (j == si) continue;
         const mem_seed_t *t = &c->seeds[j];
         if (t->len <= s->len) continue;                    /* strictly longer */
         if ((long)t->rbeg - t->qbeg != sd) continue;       /* same diagonal */
-        if (s->qbeg >= t->qbeg && s->qbeg + s->len <= t->qbeg + t->len) { has_container = 1; break; }
+        if (s->qbeg >= t->qbeg && s->qbeg + s->len <= t->qbeg + t->len) {
+            has_container = 1;
+            /* Track the max-length container (ties: lowest seed index -- the
+             * scan is ascending in j and we replace only on strictly greater
+             * length). Equal-length same-diagonal containers have identical
+             * query intervals, so any is an equally valid outermost root; the
+             * deterministic lowest-index tiebreak keeps this stable. */
+            if (t->len > best_len) { best_len = t->len; best_j = j; }
+        }
     }
     if (!has_container) return 0;
+    if (container_si != NULL) *container_si = best_j;
     /* interference guard: mirror PE18 (a seed >= .95*len overlapping s on a
      * different diagonal by >= s->len/4 means s could lead to a distinct aln). */
     for (j = 0; j < c->n; ++j) {
@@ -6334,6 +6359,609 @@ static inline int mem_seed_ext_redundant(const mem_chain_t *c, int si)
     return 1;
 }
 
+/* PE18 inner candidate test: is seed `s` contained in the (extended) alnreg `p`?
+ * Extracted VERBATIM from the Pass-3 containment loop below so both Pass 3 and
+ * the two-wave interleaved extension can share the SAME predicate against real
+ * post-extension container coordinates (the whole point: replace the
+ * pre-extension prediction with PE18's actual decision). Deliberately factors
+ * ONLY the per-candidate test; the outer scan, the `lim[l]`/`v` budget, the
+ * purged-candidate skip, and the different-diagonal interference scan stay in
+ * Pass 3 (correctness depends on that being one incremental traversal, so it
+ * must not be re-implemented elsewhere).
+ *
+ * Returns the two containment outcomes the original inline body produced, so the
+ * caller reproduces the exact control flow:
+ *   PE18_CONTAINED  -> the original `break`  (s is "around" p; stop scanning)
+ *   PE18_NOT        -> the original `v++; continue` (p does not contain s)
+ * The purged-candidate case (`p->qb==-1 && p->qe==-1` -> bare continue, no v++)
+ * stays at the call site, since it is a candidate-liveness check, not a
+ * containment decision. */
+/* Two-wave --skip-contained-ext. A seed mem_seed_ext_redundant flags is
+ * DEFERRED (not extended, not purged) in Pass 1; after Pass 2 has scored the
+ * roots, this real PE18 containment predicate is run against the container's
+ * now-real alnreg and the seed is purged (skip its SW -- the win) only when the
+ * container sorts to an earlier slot (container.aln < s.aln, so the purge
+ * matches flag-OFF's Pass-3 decision by induction), else it is extended in a
+ * second batch. Byte-identical to flag-OFF on ALL read lengths and under
+ * --meth: the decision is made on real post-extension coordinates, and the
+ * predicate is scoring-independent. */
+
+/* One deferred seed recorded by the two-wave Pass 1, resolved after Pass 2.
+ * (l,j) locate the read+chain so the second wave re-derives the identical
+ * reference window; seed_idx is the seed within the chain (== the srt[k] value);
+ * container_si is the max-length same-diagonal container's seed index (from
+ * mem_seed_ext_redundant's out-param). The alnreg slot is s->aln, already set in
+ * Pass 1.
+ *
+ * rmax0/rmax1/chain_band cache the chain's Pass-1 reference window (the
+ * post-clamp rmax[] and band that derive_chain_window + bns_fetch_seq_v2
+ * produced for this chain). The second wave restores them instead of
+ * re-deriving the window: the derivation is O(seeds in chain) with two
+ * double-division cal_max_gap calls per seed, and it is only needed when a
+ * deferred seed actually survives the guard (a purge needs no window at all).
+ * Re-fetching with the cached post-clamp bounds is exact: bns_fetch_seq_v2's
+ * contig clamp is idempotent, so rmax[] and the window bytes are identical to
+ * Pass 1's. */
+struct PendingSeed {
+    int l; int j; int seed_idx; int container_si;
+    int64_t rmax0; int64_t rmax1; int chain_band;
+};
+
+enum pe18_cand_result { PE18_NOT = 0, PE18_CONTAINED = 1 };
+static inline enum pe18_cand_result
+pe18_seed_in_container(const mem_seed_t *s, const mem_alnreg_t *p,
+                       int l_query, const mem_opt_t *opt)
+{
+    int64_t rd;
+    int qd, w, max_gap;
+    if (s->rbeg < p->rb || s->rbeg + s->len > p->re || s->qbeg < p->qb
+        || s->qbeg + s->len > p->qe) {
+        return PE18_NOT; // not fully contained
+    }
+
+    if (s->len - p->seedlen0 > .1 * l_query) return PE18_NOT;
+    // qd: distance ahead of the seed on query; rd: on reference
+    qd = s->qbeg - p->qb; rd = s->rbeg - p->rb;
+    // the maximal gap allowed in regions ahead of the seed
+    max_gap = cal_max_gap(opt, qd < rd? qd : rd);
+    w = max_gap < p->w? max_gap : p->w; // bounded by the band width
+    if (qd - rd < w && rd - qd < w) return PE18_CONTAINED; // the seed is "around" a previous hit
+    // similar to the previous four lines, but this time we look at the region behind
+    qd = p->qe - (s->qbeg + s->len); rd = p->re - (s->rbeg + s->len);
+    max_gap = cal_max_gap(opt, qd < rd? qd : rd);
+    w = max_gap < p->w? max_gap : p->w;
+    if (qd - rd < w && rd - qd < w) return PE18_CONTAINED;
+
+    return PE18_NOT;
+}
+
+/* Mutable per-thread extension-staging state, threaded through
+ * stage_seed_extension() by reference. These pointers/offsets/counters live for
+ * the whole mem_chain2aln_across_reads_V2 call and mutate across every seed and
+ * read; the SeqPair/seqBuf pointers are additionally reassigned on the grow
+ * paths (which also write the moved pointer back into mmc->...[tid]). Bundling
+ * them keeps stage_seed_extension()'s signature manageable and lets a second
+ * staging wave (the two-wave --skip-contained-ext deferral) reuse the identical
+ * staging by passing the same ctx. Every field mirrors a local in the driver;
+ * the driver initializes a StageCtx from those locals and the helper reads/writes
+ * through the references, so behavior is byte-identical to the inline body. */
+struct StageCtx {
+    SeqPair *&seqPairArrayLeft128;
+    SeqPair *&seqPairArrayRight128;
+    SeqPair *&seqPairArrayAux;
+    uint8_t *&seqBufLeftRef;
+    uint8_t *&seqBufRightRef;
+    uint8_t *&seqBufLeftQer;
+    uint8_t *&seqBufRightQer;
+    int64_t &leftRefOffset;
+    int64_t &rightRefOffset;
+    int64_t &leftQerOffset;
+    int64_t &rightQerOffset;
+    int     &numPairsLeft;
+    int     &numPairsRight;
+    int64_t *wsize_pair;      /* = &mmc->wsize[tid]                    */
+    int64_t *wsize_buf_ref;   /* = &mmc->wsize_buf_ref[tid*CACHE_LINE] */
+    int64_t *wsize_buf_qer;   /* = &mmc->wsize_buf_qer[tid*CACHE_LINE] */
+    mem_cache *mmc;
+    int      tid;
+#if BWAMEM3_UGP_PROFILE
+    int     &numPairsLeft128;
+    int     &numPairsLeft16;
+    int     &numPairsLeft1;
+#endif
+};
+
+/* Per-seed extension staging, extracted VERBATIM from the Pass-1 seed loop of
+ * mem_chain2aln_across_reads_V2 (the LEFT block, the flag/meth mid-block, and the
+ * RIGHT block, including the ungapped fast-path HITs and the no-extension else
+ * branches). Called once per (non-skipped) seed. Reads the per-seed/per-read
+ * inputs, writes the alnreg `a`, and stages LEFT/RIGHT SeqPairs into `ctx`
+ * (growing its buffers as needed). No control-flow escape: the LEFT_DONE/
+ * RIGHT_DONE gotos are local labels fully contained here, so this is void.
+ *
+ * fp_o_min/fp_e_min/fp_x_threshold are the per-call ungapped-fast-path constants
+ * (invariant across reads/seeds). This is a pure refactor — moving the body into
+ * a helper the driver calls in place — so it is byte-identical to the prior
+ * inline code (C3a; gated 0-diff before any two-wave logic is added). */
+static inline void stage_seed_extension(
+        const mem_seed_t *s, mem_alnreg_t *a, const mem_chain_t *c,
+        mem_alnreg_v *av, const uint8_t *query, const uint8_t *rseq,
+        const int64_t rmax[], int chain_band, int meth_seed_sc, int l_query,
+        const mem_opt_t *opt, int fp_o_min, int fp_e_min, int fp_x_threshold,
+        StageCtx &ctx)
+{
+    const int tid = ctx.tid;
+    mem_cache *mmc = ctx.mmc;
+    /* Local aliases so the moved body reads/writes the SAME names it used inline;
+     * references bind to the driver's locals through ctx (grows propagate out). */
+    SeqPair *&seqPairArrayLeft128  = ctx.seqPairArrayLeft128;
+    SeqPair *&seqPairArrayRight128 = ctx.seqPairArrayRight128;
+    SeqPair *&seqPairArrayAux      = ctx.seqPairArrayAux;
+    uint8_t *&seqBufLeftRef        = ctx.seqBufLeftRef;
+    uint8_t *&seqBufRightRef       = ctx.seqBufRightRef;
+    uint8_t *&seqBufLeftQer        = ctx.seqBufLeftQer;
+    uint8_t *&seqBufRightQer       = ctx.seqBufRightQer;
+    int64_t &leftRefOffset  = ctx.leftRefOffset;
+    int64_t &rightRefOffset = ctx.rightRefOffset;
+    int64_t &leftQerOffset  = ctx.leftQerOffset;
+    int64_t &rightQerOffset = ctx.rightQerOffset;
+    int &numPairsLeft  = ctx.numPairsLeft;
+    int &numPairsRight = ctx.numPairsRight;
+    int64_t *wsize_pair    = ctx.wsize_pair;
+    int64_t *wsize_buf_ref = ctx.wsize_buf_ref;
+    int64_t *wsize_buf_qer = ctx.wsize_buf_qer;
+#if BWAMEM3_UGP_PROFILE
+    int &numPairsLeft128 = ctx.numPairsLeft128;
+    int &numPairsLeft16  = ctx.numPairsLeft16;
+    int &numPairsLeft1   = ctx.numPairsLeft1;
+#endif
+
+    int flag = 0;
+    std::pair<int, int> pr;
+    if (s->qbeg)  // left extension
+    {
+        SeqPair sp;
+        sp.h0 = meth_seed_sc;   /* D3: true seed score (== len*a outside --meth) */
+        sp.seqid = c->seqid;
+        /* regid is the slot of THIS alnreg. In the Pass-1 seed loop `a` was just
+         * pushed, so this equals the former `av->n - 1` (default path unchanged);
+         * the two-wave second batch stages a seed whose slot was assigned back
+         * in Pass 1, long after av->n stopped moving, so `av->n - 1` there is
+         * the read's LAST slot and the scores would scatter onto a foreign,
+         * already-extended alnreg (its qb/rb/qe/re/truesc are updated as
+         * deltas). Deriving regid from `a` keeps both waves byte-identical to
+         * flag-OFF. Mirrored on the RIGHT side below. */
+        sp.regid = (int)(a - av->a);
+
+        if (numPairsLeft >= *wsize_pair) {
+            if (bwa_verbose >= 4) fprintf(stderr, "[0000][%0.4d] Re-allocating seqPairArrays, in Left\n", tid);
+            *wsize_pair +=  1024;
+            // assert(*wsize_pair > numPairsLeft);
+            *wsize_pair += numPairsLeft + 1024;
+            SeqPair *seqPairArrayAux_new = (SeqPair *) realloc(seqPairArrayAux,
+                                                  (*wsize_pair + MAX_LINE_LEN)
+                                                  * sizeof(SeqPair));
+            xassert(seqPairArrayAux_new != NULL, "out of memory: seqPairArrayAux");
+            seqPairArrayAux = seqPairArrayAux_new;
+            mmc->seqPairArrayAux[tid] = seqPairArrayAux;
+            SeqPair *seqPairArrayLeft128_new = (SeqPair *) realloc(seqPairArrayLeft128,
+                                                      (*wsize_pair + MAX_LINE_LEN)
+                                                      * sizeof(SeqPair));
+            xassert(seqPairArrayLeft128_new != NULL, "out of memory: seqPairArrayLeft128");
+            seqPairArrayLeft128 = seqPairArrayLeft128_new;
+            mmc->seqPairArrayLeft128[tid] = seqPairArrayLeft128;
+            SeqPair *seqPairArrayRight128_new = (SeqPair *) realloc(seqPairArrayRight128,
+                                                       (*wsize_pair + MAX_LINE_LEN)
+                                                       * sizeof(SeqPair));
+            xassert(seqPairArrayRight128_new != NULL, "out of memory: seqPairArrayRight128");
+            seqPairArrayRight128 = seqPairArrayRight128_new;
+            mmc->seqPairArrayRight128[tid] = seqPairArrayRight128;
+        }
+
+
+        sp.idq = leftQerOffset;
+        sp.idr = leftRefOffset;
+
+        int64_t tmp;
+        leftQerOffset += s->qbeg;
+        if (leftQerOffset >= *wsize_buf_qer)
+        {
+            if (bwa_verbose >= 4) fprintf(stderr, "[%0.4d] Re-allocating (doubling) seqBufQers in %s (left)\n",
+                    tid, __func__);
+            int64_t tmp = *wsize_buf_qer;
+            *wsize_buf_qer = seqbuf_grow_capacity(tmp);
+            if (*wsize_buf_qer == SEQBUF_CAPACITY_OVERFLOW)
+                seqbuf_capacity_fatal("seqBufQer", __func__, tmp);
+            xassert(*wsize_buf_qer >= leftQerOffset,
+                    "extension: left query window exceeds seqBufQer capacity after grow");
+
+            uint8_t *seqBufQer_ = (uint8_t*)
+                _mm_realloc(seqBufLeftQer, tmp, *wsize_buf_qer, sizeof(uint8_t));
+            mmc->seqBufLeftQer[tid*CACHE_LINE] = seqBufLeftQer = seqBufQer_;
+
+            seqBufQer_ = (uint8_t*)
+                _mm_realloc(seqBufRightQer, tmp, *wsize_buf_qer, sizeof(uint8_t));
+            mmc->seqBufRightQer[tid*CACHE_LINE] = seqBufRightQer = seqBufQer_;
+        }
+
+        uint8_t *qs = seqBufLeftQer + sp.idq;
+        for (int i = 0; i < s->qbeg; ++i) qs[i] = query[s->qbeg - 1 - i];
+
+        tmp = s->rbeg - rmax[0];
+        leftRefOffset += tmp;
+        if (leftRefOffset >= *wsize_buf_ref)
+        {
+            if (bwa_verbose >= 4) fprintf(stderr, "[%0.4d] Re-allocating (doubling) seqBufRefs in %s (left)\n",
+                    tid, __func__);
+            int64_t tmp = *wsize_buf_ref;
+            *wsize_buf_ref = seqbuf_grow_capacity(tmp);
+            if (*wsize_buf_ref == SEQBUF_CAPACITY_OVERFLOW)
+                seqbuf_capacity_fatal("seqBufRef", __func__, tmp);
+            xassert(*wsize_buf_ref >= leftRefOffset,
+                    "extension: left reference window exceeds seqBufRef capacity after grow");
+            uint8_t *seqBufRef_ = (uint8_t*)
+                _mm_realloc(seqBufLeftRef, tmp, *wsize_buf_ref, sizeof(uint8_t));
+            mmc->seqBufLeftRef[tid*CACHE_LINE] = seqBufLeftRef = seqBufRef_;
+
+            seqBufRef_ = (uint8_t*)
+                _mm_realloc(seqBufRightRef, tmp, *wsize_buf_ref, sizeof(uint8_t));
+            mmc->seqBufRightRef[tid*CACHE_LINE] = seqBufRightRef = seqBufRef_;
+        }
+
+        uint8_t *rs = seqBufLeftRef + sp.idr;
+        for (int64_t i = 0; i < tmp; ++i) rs[i] = rseq[tmp - 1 - i]; //seq1
+
+        sp.len2 = s->qbeg;
+        sp.len1 = tmp;
+        sp.tight_band = 0; sp.chain_band = chain_band;  // 0 sentinel: "no tight bound known"
+
+        // ungapped analysis.
+        //   HIT      → skip SW; fill a->* from ungapped.
+        //   TIGHT    → save sp.tight_band; SW will use it.
+        //   FALLBACK → use opt->w.
+        /* D3 (--meth, PR-4): the ungapped fast path scores with
+         * opt->a/opt->b hardcoded (ungapped_analyze) — it CANNOT
+         * express the asymmetric OT/OB matrix, so a HIT would
+         * mis-penalize every bisulfite conversion (read T at ref C)
+         * as a mismatch and commit a wrong a->score. Disable it under
+         * --meth so all extension flows through the matrix-aware SW
+         * kernel. (Perf-only fast path; correctness-neutral to skip.) */
+        if (!opt->meth_mode && sp.len1 >= sp.len2 && sp.len2 <= FP_N_MAX) {
+            tprof[UGP_L_ATTEMPT][tid]++;
+            int fp_score, fp_qle, fp_gscore, fp_gtle, fp_band;
+            int fp_st = ungapped_analyze(qs, rs, sp.len2,
+                                         sp.h0, opt->a, opt->b,
+                                         fp_o_min, fp_e_min,
+                                         fp_x_threshold, opt->w,
+                                         &fp_score, &fp_qle,
+                                         &fp_gscore, &fp_gtle,
+                                         &fp_band);
+            if (fp_st == FP_STATUS_HIT) {
+#if BWAMEM3_UGP_PROFILE
+                tprof[UGP_L_HIT][tid]++;
+                tprof[UGP_L_UNGAPPED][tid]++;
+                tprof[UGP_SCORE_HIST_BASE + 0 * UGP_SCORE_HIST_NBINS
+                      + ugp_score_bin(fp_score)][tid]++;
+                /* Q3: cat0=ALL, cat1=UNGAP_FINAL, cat3=HIT.
+                 * For HIT, fp_score is both the would-be ungapped
+                 * score and the committed score, so the delta
+                 * (perfect_score - aln_score) is the same for
+                 * both histograms. */
+                {
+                    int _perfect = sp.h0 + opt->a * sp.len2;
+                    int _delta = _perfect - fp_score;
+                    int _bin = ugp_delta_bin(_delta);
+                    tprof[UGP_L_CAT_UNG_BASE + 0 * UGP_CAT_NBINS + _bin][tid]++;
+                    tprof[UGP_L_CAT_UNG_BASE + 1 * UGP_CAT_NBINS + _bin][tid]++;
+                    tprof[UGP_L_CAT_UNG_BASE + 3 * UGP_CAT_NBINS + _bin][tid]++;
+                    tprof[UGP_L_CAT_FIN_BASE + 0 * UGP_CAT_NBINS + _bin][tid]++;
+                    tprof[UGP_L_CAT_FIN_BASE + 1 * UGP_CAT_NBINS + _bin][tid]++;
+                    tprof[UGP_L_CAT_FIN_BASE + 3 * UGP_CAT_NBINS + _bin][tid]++;
+                }
+#endif
+                // Roll back the qs/rs buffer offsets we just
+                // consumed; the batch won't reference them.
+                leftQerOffset -= s->qbeg;
+                leftRefOffset -= tmp;
+                // Mirror post-SW extraction (~line 2560).
+                a->score = fp_score;
+                if (fp_gscore <= 0 || fp_gscore <= a->score - opt->pen_clip5) {
+                    a->qb = s->qbeg - fp_qle;
+                    a->rb = s->rbeg - fp_qle; // tle == qle on diagonal
+                    a->truesc = a->score;
+                } else {
+                    a->qb = 0;
+                    a->rb = s->rbeg - fp_gtle;
+                    a->truesc = fp_gscore;
+                }
+                a->w = max_(a->w, opt->w);
+                if (a->rb != H0_ && a->qb != H0_ && a->qe != H0_ && a->re != H0_) {
+                    int ii;
+                    for (ii = 0, a->seedcov = 0; ii < a->c->n; ++ii) {
+                        const mem_seed_t *t = &(a->c->seeds[ii]);
+                        if (t->qbeg >= a->qb && t->qbeg + t->len <= a->qe &&
+                            t->rbeg >= a->rb && t->rbeg + t->len <= a->re)
+                            a->seedcov += t->len;
+                    }
+                }
+                goto LEFT_DONE;
+            }
+            if (fp_st == FP_STATUS_TIGHT) {
+                // Fast-path failed but tight_band valid. Pipe
+                // to SW via sp.tight_band.
+                sp.tight_band = fp_band;
+                tprof[UGP_L_TIGHT][tid]++;
+                if (fp_band <= 8)        tprof[UGP_L_TB_1_8][tid]++;
+                else if (fp_band <= 32)  tprof[UGP_L_TB_9_32][tid]++;
+                else                     tprof[UGP_L_TB_33_MAX][tid]++;
+
+            }
+            // FALLBACK: sp.tight_band stays 0.
+        }
+
+#if BWAMEM3_UGP_PROFILE
+        /* Per-pair tier routing + tight_band histograms. The
+         * numPairsLeft* increments here are dead (sortPairsLenExt
+         * below resets and recomputes all three counters, and
+         * nothing reads them before that) — only t_tier feeds the
+         * UGP histograms, so the whole block is instrumentation. */
+        {
+            int64_t minval = (int64_t)sp.h0 + (int64_t)min_(sp.len1, sp.len2) * (int64_t)opt->a;
+            int t_tier;
+            /* Mirror the routing decision in sortPairsLenExt: 8-bit
+             * iff the safe envelope holds (initial band opt->w). */
+            if (bsw8_envelope_ok(sp.len1, sp.len2, opt->w, opt->a, opt->zdrop, sp.h0)) {
+                numPairsLeft128++; t_tier = 0;
+            }
+            else if (sp.len1 < MAX_SEQ_LEN16 && sp.len2 < MAX_SEQ_LEN16 && minval >= 0 && minval < MAX_SEQ_LEN16){
+                numPairsLeft16++;  t_tier = 1;
+            }
+            else {
+                numPairsLeft1++;   t_tier = 2;  /* scalar; not bucketed */
+            }
+            /* tight_band histogram bin. */
+            int tb_ = sp.tight_band;
+            int fine_bin;
+            if      (tb_ ==  0) fine_bin = 0;
+            else if (tb_ <=  2) fine_bin = 1;
+            else if (tb_ <=  4) fine_bin = 2;
+            else if (tb_ <=  8) fine_bin = 3;
+            else if (tb_ <= 16) fine_bin = 4;
+            else if (tb_ <= 32) fine_bin = 5;
+            else if (tb_ <= 48) fine_bin = 6;
+            else if (tb_ <= 64) fine_bin = 7;
+            else if (tb_ <= 80) fine_bin = 8;
+            else                fine_bin = 9;
+            tprof[UGP_FINE_BASE + 0 * UGP_FINE_NBINS + fine_bin][tid]++;
+            if (t_tier <= 1) {
+                int band_bin;
+                if      (tb_ ==  0) band_bin = 0;
+                else if (tb_ <=  8) band_bin = 1;
+                else if (tb_ <= 32) band_bin = 2;
+                else                band_bin = 3;
+                tprof[UGP_TIER_TB_BASE + 0 * 8 + t_tier * 4 + band_bin][tid]++;
+            }
+        }
+#endif
+
+#if BWAMEM3_UGP_PROFILE
+        /* Q3: compute would-be ungapped extension score for this
+         * non-HIT LEFT pair. The walk handles arbitrary N
+         * (including the bypass case len2 > FP_N_MAX where
+         * analyze did not run). Cost: O(len2) scalar; instrumentation
+         * only (feeds ugp_record_left_outcome's tprof histograms). */
+        sp.ugp_walk_score = ungapped_walk_score(qs, rs, sp.len2,
+                                                sp.h0, opt->a, opt->b);
+#endif
+
+        seqPairArrayLeft128[numPairsLeft] = sp;
+        numPairsLeft ++;
+        a->qb = s->qbeg; a->rb = s->rbeg;
+        LEFT_DONE: ;
+    }
+    else
+    {
+        flag = 1;
+        a->score = a->truesc = meth_seed_sc, a->qb = 0, a->rb = s->rbeg;  /* D3: true seed score */
+    }
+
+    if (s->qbeg + s->len != l_query)  // right extension
+    {
+        int64_t qe = s->qbeg + s->len;
+        int64_t re = s->rbeg + s->len - rmax[0];
+        assert(re >= 0);
+        SeqPair sp;
+
+        sp.h0 = H0_; //random number
+        sp.seqid = c->seqid;
+        sp.regid = (int)(a - av->a);   /* see the LEFT-side note: the alnreg's own slot */
+
+        if (numPairsRight >= *wsize_pair)
+        {
+            if (bwa_verbose >= 4) fprintf(stderr, "[0000] [%0.4d] Re-allocating seqPairArrays Right\n", tid);
+            *wsize_pair += 1024;
+            // assert(*wsize_pair > numPairsRight);
+            *wsize_pair += numPairsLeft + 1024;
+            SeqPair *seqPairArrayAux_new = (SeqPair *) realloc(seqPairArrayAux,
+                                                  (*wsize_pair + MAX_LINE_LEN)
+                                                  * sizeof(SeqPair));
+            xassert(seqPairArrayAux_new != NULL, "out of memory: seqPairArrayAux");
+            seqPairArrayAux = seqPairArrayAux_new;
+            mmc->seqPairArrayAux[tid] = seqPairArrayAux;
+            SeqPair *seqPairArrayLeft128_new = (SeqPair *) realloc(seqPairArrayLeft128,
+                                                      (*wsize_pair + MAX_LINE_LEN)
+                                                      * sizeof(SeqPair));
+            xassert(seqPairArrayLeft128_new != NULL, "out of memory: seqPairArrayLeft128");
+            seqPairArrayLeft128 = seqPairArrayLeft128_new;
+            mmc->seqPairArrayLeft128[tid] = seqPairArrayLeft128;
+            SeqPair *seqPairArrayRight128_new = (SeqPair *) realloc(seqPairArrayRight128,
+                                                       (*wsize_pair + MAX_LINE_LEN)
+                                                       * sizeof(SeqPair));
+            xassert(seqPairArrayRight128_new != NULL, "out of memory: seqPairArrayRight128");
+            seqPairArrayRight128 = seqPairArrayRight128_new;
+            mmc->seqPairArrayRight128[tid] = seqPairArrayRight128;
+        }
+
+        sp.len2 = l_query - qe;
+        sp.len1 = rmax[1] - rmax[0] - re;
+
+        sp.idq = rightQerOffset;
+        sp.idr = rightRefOffset;
+
+        rightQerOffset += sp.len2;
+        if (rightQerOffset >= *wsize_buf_qer)
+        {
+            if (bwa_verbose >= 4) fprintf(stderr, "[%0.4d] Re-allocating (doubling) seqBufQers in %s (right)\n",
+                    tid, __func__);
+            int64_t tmp = *wsize_buf_qer;
+            *wsize_buf_qer = seqbuf_grow_capacity(tmp);
+            if (*wsize_buf_qer == SEQBUF_CAPACITY_OVERFLOW)
+                seqbuf_capacity_fatal("seqBufQer", __func__, tmp);
+            xassert(*wsize_buf_qer >= rightQerOffset,
+                    "extension: right query window exceeds seqBufQer capacity after grow");
+
+            uint8_t *seqBufQer_ = (uint8_t*)
+                _mm_realloc(seqBufLeftQer, tmp, *wsize_buf_qer, sizeof(uint8_t));
+            mmc->seqBufLeftQer[tid*CACHE_LINE] = seqBufLeftQer = seqBufQer_;
+
+            seqBufQer_ = (uint8_t*)
+                _mm_realloc(seqBufRightQer, tmp, *wsize_buf_qer, sizeof(uint8_t));
+            mmc->seqBufRightQer[tid*CACHE_LINE] = seqBufRightQer = seqBufQer_;
+        }
+
+        rightRefOffset += sp.len1;
+        if (rightRefOffset >= *wsize_buf_ref)
+        {
+            if (bwa_verbose >= 4) fprintf(stderr, "[%0.4d] Re-allocating (doubling) seqBufRefs in %s (right)\n",
+                    tid, __func__);
+            int64_t tmp = *wsize_buf_ref;
+            *wsize_buf_ref = seqbuf_grow_capacity(tmp);
+            if (*wsize_buf_ref == SEQBUF_CAPACITY_OVERFLOW)
+                seqbuf_capacity_fatal("seqBufRef", __func__, tmp);
+            xassert(*wsize_buf_ref >= rightRefOffset,
+                    "extension: right reference window exceeds seqBufRef capacity after grow");
+            uint8_t *seqBufRef_ = (uint8_t*)
+                _mm_realloc(seqBufLeftRef, tmp, *wsize_buf_ref, sizeof(uint8_t));
+            mmc->seqBufLeftRef[tid*CACHE_LINE] = seqBufLeftRef = seqBufRef_;
+
+            seqBufRef_ = (uint8_t*)
+                _mm_realloc(seqBufRightRef, tmp, *wsize_buf_ref, sizeof(uint8_t));
+            mmc->seqBufRightRef[tid*CACHE_LINE] = seqBufRightRef = seqBufRef_;
+        }
+
+        tprof[PE23][tid] += sp.len1 + sp.len2;
+
+        uint8_t *qs = seqBufRightQer + sp.idq;
+        uint8_t *rs = seqBufRightRef + sp.idr;
+
+        for (int i = 0; i < sp.len2; ++i) qs[i] = query[qe + i];
+
+        for (int i = 0; i < sp.len1; ++i) rs[i] = rseq[re + i]; //seq1
+
+        sp.tight_band = 0; sp.chain_band = chain_band;
+        sp.ugp_r_attempted = 0;
+
+        // ungapped analysis on right ext.
+        // Precondition a->score != -1 means left either didn't
+        // need extension or was fast-pathed — in both cases
+        // h0 is known. If left was batched, we skip (can't
+        // know h0 yet); SW will run with default band.
+        /* D3 (--meth, PR-4): disable the ungapped fast path under
+         * --meth — see the LEFT-side rationale above (it can't score
+         * the asymmetric OT/OB matrix). */
+        if (!opt->meth_mode && a->score != -1 && sp.len1 >= sp.len2 && sp.len2 <= FP_N_MAX) {
+            sp.ugp_r_attempted = 1;
+            tprof[UGP_R_ATTEMPT][tid]++;
+            int fp_h0 = a->score;  // the real h0 for right ext
+            int fp_score, fp_qle, fp_gscore, fp_gtle, fp_band;
+            int fp_st = ungapped_analyze(qs, rs, sp.len2,
+                                         fp_h0, opt->a, opt->b,
+                                         fp_o_min, fp_e_min,
+                                         fp_x_threshold, opt->w,
+                                         &fp_score, &fp_qle,
+                                         &fp_gscore, &fp_gtle,
+                                         &fp_band);
+            if (fp_st == FP_STATUS_HIT) {
+                tprof[UGP_R_HIT][tid]++;
+                tprof[UGP_R_UNGAPPED][tid]++;
+                tprof[UGP_SCORE_HIST_BASE + 1 * UGP_SCORE_HIST_NBINS
+                      + ugp_score_bin(fp_score)][tid]++;
+                // Roll back the qs/rs buffer offsets.
+                rightQerOffset -= sp.len2;
+                rightRefOffset -= sp.len1;
+                // Mirror post-SW extraction (~line 2777).
+                a->score = fp_score;
+                if (fp_gscore <= 0 || fp_gscore <= a->score - opt->pen_clip3) {
+                    a->qe = qe + fp_qle;
+                    a->re = rmax[0] + re + fp_qle; // tle == qle on diagonal
+                    a->truesc += a->score - fp_h0;
+                } else {
+                    a->qe = l_query;
+                    a->re = rmax[0] + re + fp_gtle;
+                    a->truesc += fp_gscore - fp_h0;
+                }
+                a->w = max_(a->w, opt->w);
+                if (a->rb != H0_ && a->qb != H0_ && a->qe != H0_ && a->re != H0_) {
+                    int ii;
+                    for (ii = 0, a->seedcov = 0; ii < a->c->n; ++ii) {
+                        const mem_seed_t *t = &a->c->seeds[ii];
+                        if (t->qbeg >= a->qb && t->qbeg + t->len <= a->qe &&
+                            t->rbeg >= a->rb && t->rbeg + t->len <= a->re)
+                            a->seedcov += t->len;
+                    }
+                }
+                goto RIGHT_DONE;
+            }
+            if (fp_st == FP_STATUS_TIGHT) {
+                sp.tight_band = fp_band;
+                tprof[UGP_R_TIGHT][tid]++;
+                if (fp_band <= 8)        tprof[UGP_R_TB_1_8][tid]++;
+                else if (fp_band <= 32)  tprof[UGP_R_TB_9_32][tid]++;
+                else                     tprof[UGP_R_TB_33_MAX][tid]++;
+
+            }
+        }
+
+        /* The RIGHT-side tier counters (numPairsRight128/16/1) are
+         * recomputed from scratch by sortPairsLenExt below (which
+         * resets them to 0 first), and nothing reads them before
+         * that call — so the per-pair envelope check and routing
+         * that used to live here were dead work. Just stage the
+         * pair; the sort assigns its tier. RIGHT histograms (Groups
+         * A & B) are populated post-left-SW once the right pass has
+         * finalised sp->tight_band. */
+        seqPairArrayRight128[numPairsRight] = sp;
+        numPairsRight ++;
+        a->qe = qe; a->re = rmax[0] + re;
+        RIGHT_DONE: ;
+    }
+    else
+    {
+        a->qe = l_query, a->re = s->rbeg + s->len;
+        // Do NOT remove this seedcov recompute: it is load-bearing.
+        // This is the no-right-extension branch (s->qbeg + s->len ==
+        // l_query). When the seed also needs no left extension
+        // (s->qbeg == 0, i.e. it spans the whole read, as perfect-match
+        // reads do) no SW pair is staged on either side, so none of the
+        // other seedcov recompute sites run -- neither the right-HIT
+        // path above, nor the post-SW LEFT-accept loops, nor the
+        // RIGHT-accept loops. In that case this block is the ONLY writer
+        // of a->seedcov. Dropping it would leave seedcov stale and change
+        // mem_approx_mapq_se (log(seedcov)), altering the emitted MAPQ.
+        if (a->rb != H0_ && a->qb != H0_)
+        {
+            int i;
+            for (i = 0, a->seedcov = 0; i < c->n; ++i)
+            {
+                const mem_seed_t *t = &c->seeds[i];
+                if (t->qbeg >= a->qb && t->qbeg + t->len <= a->qe &&
+                    t->rbeg >= a->rb && t->rbeg + t->len <= a->re) // seed fully contained
+                    a->seedcov += t->len;
+            }
+        }
+    }
+    (void)flag; (void)pr;   /* dead scratch retained verbatim from the inline body */
+}
 
 void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
                                    const uint8_t *pac, bseq1_t *seq_, int nseq,
@@ -6475,6 +7103,127 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
     uint8_t *meth_qbuf = NULL;
     int      meth_qbuf_cap = 0;
 
+    /* The extension query for read `l`: the projected read itself outside
+     * --meth, else meth_orig_seq 2-bit-encoded into meth_qbuf (a single
+     * per-thread scratch, so the encode is redone on every call -- Pass 1 calls
+     * it once per read, and the two-wave second pass calls it again for each
+     * read it re-stages a deferred seed for, since the scratch has been
+     * overwritten by later reads by then). If meth_orig_seq is missing (should
+     * not happen under --meth once ingest populates it) we fall back to the
+     * projected read so the path still runs. Shared VERBATIM by both waves so
+     * a deferred seed is extended against exactly the bases Pass 1 would have
+     * used. */
+    auto extension_query = [&](int l, int lq) -> const uint8_t * {
+        if (!(opt->meth_mode && seq_[l].meth_orig_seq != NULL))
+            return (const uint8_t *) seq_[l].seq;
+        if (lq > meth_qbuf_cap) {
+            meth_qbuf_cap = lq;
+            /* Temp pointer so a NULL realloc does not leak meth_qbuf. */
+            uint8_t *meth_qbuf_new = (uint8_t *) realloc(meth_qbuf, (size_t) meth_qbuf_cap);
+            xassert(meth_qbuf_new != NULL, "out of memory: meth_qbuf_new");
+            meth_qbuf = meth_qbuf_new;
+        }
+        const char *os = seq_[l].meth_orig_seq;
+        for (int i = 0; i < lq; ++i) {
+            unsigned char c = (unsigned char) os[i];
+            meth_qbuf[i] = nst_nt4_decode(c, 4);
+        }
+        return meth_qbuf;
+    };
+
+    /* D3 (--meth): the ungapped seed score the extension starts from (h0, and
+     * the alnreg score of a seed with no left extension). The seed matched in
+     * projected 3-letter space, but its 4-letter score against the ORIGINAL
+     * read + ref is not necessarily len*a -- a seed-internal variant (e.g. a
+     * C/T mirror that collapsed in seed space) scores as a mismatch under the
+     * per-strand matrix. Recompute the true ungapped seed score so the alnreg
+     * score (hence AS, MAPQ, and mate rescue) is honest rather than
+     * optimistically len*a. --meth-scoring collapsed frees C/T (and G/A) both
+     * ways, so this reproduces len*a (bwameth-like); genomic penalizes the
+     * variant. `query` is the ORIGINAL read (extension_query above); `rseq` is
+     * the original 4-letter ref window whose origin is the function-scope
+     * rmax[0]. mat[ref*5+read] is target-major (matches mem_opt_fill_meth_mat).
+     * len*a outside --meth. Shared VERBATIM by Pass 1 and the two-wave second
+     * pass so a deferred seed's h0 matches what Pass 1 would have staged. */
+    auto seed_ext_score = [&](const mem_seed_t *sd, const mem_alnreg_t *ar,
+                              const uint8_t *rseq_w, const uint8_t *query_w) -> int {
+        int sc = sd->len * opt->a;
+        if (opt->meth_mode && ar->meth_strand_hyp >= 0) {
+            const int8_t *seed_mat = mem_opt_meth_mat(opt, ar->meth_strand_hyp);
+            const int64_t roff = sd->rbeg - rmax[0];
+            sc = 0;
+            for (int _i = 0; _i < sd->len; ++_i)
+                sc += seed_mat[ rseq_w[roff + _i] * 5 + query_w[sd->qbeg + _i] ];
+        }
+        return sc;
+    };
+
+    /* Two-wave --skip-contained-ext: seeds deferred in Pass 1 pending the
+     * post-Pass-2 guarded purge / second batch. Empty (and the whole two-wave
+     * path inert) unless skip_contained_ext is set. Per-thread, grows as
+     * needed. */
+    static thread_local std::vector<PendingSeed> ks_pending;
+    ks_pending.clear();
+
+    /* C3b-2: per-chain reference-window derivation, shared VERBATIM between Pass 1
+     * and the two-wave second pass so the two can never drift. Sets rmax[0]/rmax[1]
+     * (function-scope) and rseq_out; returns chain_band and writes
+     * chain_max_n_hits_out. Function-scope (captures only function-scope state +
+     * takes lq/rseq_out/counts by param) so the second wave, which runs outside
+     * the per-read loop, can call it. Identical computation to the former inline
+     * block, so with the two-wave path off this is a pure refactor
+     * (byte-identical). The `max` local is a dead write here (never read), kept
+     * verbatim. */
+    auto derive_chain_window = [&](mem_chain_t *cc, int lq,
+                                   uint8_t *&rseq_out, int &chain_max_n_hits_out) -> int {
+        int64_t tmp;
+        int max = 0;
+        // get the max possible span
+        rmax[0] = l_pac<<1; rmax[1] = 0;
+
+        int chain_max_n_hits = 1;
+        int64_t cb_lo=0, cb_hi=0; int cb_f=1, chain_band=0;
+        for (int i = 0; i < cc->n; ++i) {
+            int64_t b, e;
+            const mem_seed_t *t = &cc->seeds[i];
+            b = t->rbeg - (t->qbeg + cal_max_gap(opt, t->qbeg));
+            e = t->rbeg + t->len + ((lq - t->qbeg - t->len) +
+                                    cal_max_gap(opt, lq - t->qbeg - t->len));
+
+            tmp = rmax[0];
+            rmax[0] = tmp < b? rmax[0] : b;
+            rmax[1] = (rmax[1] > e)? rmax[1] : e;
+            if (t->len > max) max = t->len;
+            if (t->n_hits > chain_max_n_hits) chain_max_n_hits = t->n_hits;
+            if (opt->band_start > 0) { int64_t _d = t->rbeg - t->qbeg; if (cb_f){cb_lo=cb_hi=_d; cb_f=0;} else { if(_d<cb_lo)cb_lo=_d; if(_d>cb_hi)cb_hi=_d; } }
+        }
+        int64_t cb_span = cb_hi - cb_lo;
+        if (cb_span > opt->w) cb_span = opt->w;
+        chain_band = (int)cb_span;
+
+        rmax[0] = rmax[0] > 0? rmax[0] : 0;
+        rmax[1] = rmax[1] < l_pac<<1? rmax[1] : l_pac<<1;
+        if (rmax[0] < l_pac && l_pac < rmax[1])
+        {
+            if (cc->seeds[0].rbeg < l_pac) rmax[1] = l_pac;
+            else rmax[0] = l_pac;
+        }
+
+        /* retrieve the reference sequence */
+        {
+            int rid = 0;
+            // free rseq
+            rseq_out = bns_fetch_seq_v2(bns, pac, &rmax[0],
+                                    cc->seeds[0].rbeg,
+                                    &rmax[1], &rid, ref_string,
+                                    (uint8_t*) seqPairArrayAux);
+            assert(cc->rid == rid);
+        }
+        (void)max;
+        chain_max_n_hits_out = chain_max_n_hits;
+        return chain_band;
+    };
+
     // uint64_t timUP = __rdtsc();
     for (int l=0; l<nseq; l++)
     {
@@ -6483,32 +7232,14 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
 
         lim_g[l+1] = 0;
 
-        const uint8_t *query = (uint8_t *) seq_[l].seq;
         int l_query = seq_[l].l_seq;
 
-        /* D3 (--meth, PR-4): swap the extension query to the ORIGINAL read bases.
-         * seq_[l].seq is the projected (already C→T/G→A) read, used only for
-         * seeding; extension must score the original read against the original
-         * ref with the per-hypothesis asymmetric matrix. We 2-bit-encode
-         * meth_orig_seq (ASCII, same orientation as seq) into meth_qbuf and point
-         * `query` at it. If meth_orig_seq is missing (should not happen under
-         * --meth once ingest populates it) we fall back to the projected read so
-         * the path still runs. */
-        if (opt->meth_mode && seq_[l].meth_orig_seq != NULL) {
-            if (l_query > meth_qbuf_cap) {
-                meth_qbuf_cap = l_query;
-                /* CodeRabbit: temp pointer so a NULL realloc doesn't leak. */
-                uint8_t *meth_qbuf_new = (uint8_t *) realloc(meth_qbuf, (size_t) meth_qbuf_cap);
-                xassert(meth_qbuf_new != NULL, "out of memory: meth_qbuf_new");
-                meth_qbuf = meth_qbuf_new;
-            }
-            const char *os = seq_[l].meth_orig_seq;
-            for (int i = 0; i < l_query; ++i) {
-                unsigned char c = (unsigned char) os[i];
-                meth_qbuf[i] = nst_nt4_decode(c, 4);
-            }
-            query = meth_qbuf;
-        }
+        /* D3 (--meth, PR-4): under --meth the extension query is the ORIGINAL
+         * read bases, not seq_[l].seq (the projected C→T/G→A read, used only
+         * for seeding): extension must score the original read against the
+         * original ref with the per-hypothesis asymmetric matrix. See
+         * extension_query. */
+        const uint8_t *query = extension_query(l, l_query);
 
         mem_chain_v *chn = &chain_ar[l];
         mem_alnreg_v *av = &av_v[l];  // alignment
@@ -6543,59 +7274,20 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
         av->a = (mem_alnreg_t*)calloc(av->m, sizeof(mem_alnreg_t));
 
         // aln mem allocation ends
+
         for (int j=0; j<chn->n; j++)
         {
             c = &chn->a[j];
             assert(c->seqid == l);
 
-            int64_t tmp = 0;
             if (c->n == 0) continue;
 
             if (j + 1 < chn->n) CHAIN_PAC_PREFETCH(&chn->a[j + 1]);
             _mm_prefetch((const char*) (srtgg + spos + 64), _MM_HINT_NTA);
             _mm_prefetch((const char*) (lim_g), _MM_HINT_NTA);
 
-            // get the max possible span
-            rmax[0] = l_pac<<1; rmax[1] = 0;
-
             int chain_max_n_hits = 1;
-            int64_t cb_lo=0, cb_hi=0; int cb_f=1, chain_band=0;
-            for (int i = 0; i < c->n; ++i) {
-                int64_t b, e;
-                const mem_seed_t *t = &c->seeds[i];
-                b = t->rbeg - (t->qbeg + cal_max_gap(opt, t->qbeg));
-                e = t->rbeg + t->len + ((l_query - t->qbeg - t->len) +
-                                        cal_max_gap(opt, l_query - t->qbeg - t->len));
-
-                tmp = rmax[0];
-                rmax[0] = tmp < b? rmax[0] : b;
-                rmax[1] = (rmax[1] > e)? rmax[1] : e;
-                if (t->len > max) max = t->len;
-                if (t->n_hits > chain_max_n_hits) chain_max_n_hits = t->n_hits;
-                if (opt->band_start > 0) { int64_t _d = t->rbeg - t->qbeg; if (cb_f){cb_lo=cb_hi=_d; cb_f=0;} else { if(_d<cb_lo)cb_lo=_d; if(_d>cb_hi)cb_hi=_d; } }
-            }
-            int64_t cb_span = cb_hi - cb_lo;
-            if (cb_span > opt->w) cb_span = opt->w;
-            chain_band = (int)cb_span;
-
-            rmax[0] = rmax[0] > 0? rmax[0] : 0;
-            rmax[1] = rmax[1] < l_pac<<1? rmax[1] : l_pac<<1;
-            if (rmax[0] < l_pac && l_pac < rmax[1])
-            {
-                if (c->seeds[0].rbeg < l_pac) rmax[1] = l_pac;
-                else rmax[0] = l_pac;
-            }
-
-            /* retrieve the reference sequence */
-            {
-                int rid = 0;
-                // free rseq
-                rseq = bns_fetch_seq_v2(bns, pac, &rmax[0],
-                                        c->seeds[0].rbeg,
-                                        &rmax[1], &rid, ref_string,
-                                        (uint8_t*) seqPairArrayAux);
-                assert(c->rid == rid);
-            }
+            int chain_band = derive_chain_window(c, l_query, rseq, chain_max_n_hits);
 
             _mm_prefetch((const char*) rseq, _MM_HINT_NTA);
             // _mm_prefetch((const char*) rseq + 64, _MM_HINT_NTA);
@@ -6665,478 +7357,60 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
                  * flips the conversion's freed cell — so flip the hypothesis. */
                 a->meth_strand_hyp = (c->meth_hypothesis < 0) ? -1
                     : (int8_t)((c->meth_hypothesis ^ (s->rbeg >= l_pac ? 1 : 0)) & 1);
-                /* D3 (--meth): the seed matched in projected 3-letter space, but
-                 * its 4-letter score against the ORIGINAL read + ref is not
-                 * necessarily len*a — a seed-internal variant (e.g. a C/T mirror
-                 * that collapsed in seed space) scores as a mismatch under the
-                 * per-strand matrix. Recompute the true ungapped seed score so the
-                 * alnreg score (the h0 the extension starts from, hence AS, MAPQ,
-                 * and mate rescue) is honest rather than optimistically len*a.
-                 * --meth-scoring collapsed frees C/T (and G/A) both ways, so this
-                 * reproduces len*a (bwameth-like); genomic penalizes the variant.
-                 * query is the ORIGINAL read (meth_orig_seq, set above); rseq is
-                 * the original 4-letter ref window. mat[ref*5+read] is target-major
-                 * (matches mem_opt_fill_meth_mat). */
-                int meth_seed_sc = s->len * opt->a;
-                if (opt->meth_mode && a->meth_strand_hyp >= 0) {
-                    const int8_t *seed_mat = mem_opt_meth_mat(opt, a->meth_strand_hyp);
-                    const int64_t roff = s->rbeg - rmax[0];
-                    meth_seed_sc = 0;
-                    for (int _i = 0; _i < s->len; ++_i)
-                        meth_seed_sc += seed_mat[ rseq[roff + _i] * 5 + query[s->qbeg + _i] ];
-                }
                 a->chain_n_hits = chain_max_n_hits;
                 a->rb = a->qb = a->re = a->qe = H0_;
 
                 tprof[PE19][tid] ++;
 
-                /* NB: gated off under --meth. The dominance argument assumes a
-                 * longer same-diagonal seed's extension covers the shorter one;
-                 * meth's asymmetric C->T matrix breaks this (a contained seed can
-                 * extend to a differently-scored aln), so the skip is NOT
-                 * byte-identical under --meth (measured ~0.17% of pairs diverge). */
-                if (opt->skip_contained_ext && !opt->meth_mode &&
-                    mem_seed_ext_redundant(c, (uint32_t)srt[k])) {
-                    a->qb = a->qe = -1;   /* pre-purge exactly as PE18 would */
-                    continue;
+                /* --skip-contained-ext (two-wave): DEFER a seed strictly
+                 * contained in a longer same-diagonal seed of this chain. It is
+                 * neither staged nor purged here -- a pre-extension purge would
+                 * be a prediction of Pass 3's decision, and that prediction is
+                 * wrong on kilobase-scale reads (a contained seed can extend to
+                 * an alnreg its container's does not cover) and under --meth
+                 * (the asymmetric matrix can score the two extensions
+                 * differently). Instead the seed is recorded for the post-Pass-2
+                 * resolve, where the real PE18 test runs against the container's
+                 * real alnreg and the seed is purged or extended accordingly. The
+                 * alnreg slot stays at H0_ until then; nothing reads av between
+                 * Pass 2 and the second wave. Everything the second wave needs
+                 * that Pass 1 set on `a` (meth_strand_hyp above, seedlen0, c, ...)
+                 * is already in place at this point. */
+                if (opt->skip_contained_ext) {
+                    int _container_si = -1;
+                    if (mem_seed_ext_redundant(c, (uint32_t)srt[k], &_container_si)) {
+                        ks_pending.push_back(
+                            PendingSeed{ l, j, (int)(uint32_t)srt[k], _container_si,
+                                         rmax[0], rmax[1], chain_band });
+                        continue;
+                    }
                 }
 
-                int flag = 0;
-                std::pair<int, int> pr;
-                if (s->qbeg)  // left extension
-                {
-                    SeqPair sp;
-                    sp.h0 = meth_seed_sc;   /* D3: true seed score (== len*a outside --meth) */
-                    sp.seqid = c->seqid;
-                    sp.regid = av->n - 1;
+                /* D3 (--meth): true ungapped seed score (== len*a outside --meth);
+                 * see seed_ext_score. Computed after the deferral check so a
+                 * deferred seed's score is derived in the second wave, against
+                 * the same window, only if it is actually extended. */
+                const int meth_seed_sc = seed_ext_score(s, a, rseq, query);
 
-                    if (numPairsLeft >= *wsize_pair) {
-                        if (bwa_verbose >= 4) fprintf(stderr, "[0000][%0.4d] Re-allocating seqPairArrays, in Left\n", tid);
-                        *wsize_pair +=  1024;
-                        // assert(*wsize_pair > numPairsLeft);
-                        *wsize_pair += numPairsLeft + 1024;
-                        SeqPair *seqPairArrayAux_new = (SeqPair *) realloc(seqPairArrayAux,
-                                                              (*wsize_pair + MAX_LINE_LEN)
-                                                              * sizeof(SeqPair));
-                        xassert(seqPairArrayAux_new != NULL, "out of memory: seqPairArrayAux");
-                        seqPairArrayAux = seqPairArrayAux_new;
-                        mmc->seqPairArrayAux[tid] = seqPairArrayAux;
-                        SeqPair *seqPairArrayLeft128_new = (SeqPair *) realloc(seqPairArrayLeft128,
-                                                                  (*wsize_pair + MAX_LINE_LEN)
-                                                                  * sizeof(SeqPair));
-                        xassert(seqPairArrayLeft128_new != NULL, "out of memory: seqPairArrayLeft128");
-                        seqPairArrayLeft128 = seqPairArrayLeft128_new;
-                        mmc->seqPairArrayLeft128[tid] = seqPairArrayLeft128;
-                        SeqPair *seqPairArrayRight128_new = (SeqPair *) realloc(seqPairArrayRight128,
-                                                                   (*wsize_pair + MAX_LINE_LEN)
-                                                                   * sizeof(SeqPair));
-                        xassert(seqPairArrayRight128_new != NULL, "out of memory: seqPairArrayRight128");
-                        seqPairArrayRight128 = seqPairArrayRight128_new;
-                        mmc->seqPairArrayRight128[tid] = seqPairArrayRight128;
-                    }
-
-
-                    sp.idq = leftQerOffset;
-                    sp.idr = leftRefOffset;
-
-                    leftQerOffset += s->qbeg;
-                    if (leftQerOffset >= *wsize_buf_qer)
-                    {
-                        if (bwa_verbose >= 4) fprintf(stderr, "[%0.4d] Re-allocating (doubling) seqBufQers in %s (left)\n",
-                                tid, __func__);
-                        int64_t tmp = *wsize_buf_qer;
-                        *wsize_buf_qer = seqbuf_grow_capacity(tmp);
-                        if (*wsize_buf_qer == SEQBUF_CAPACITY_OVERFLOW)
-                            seqbuf_capacity_fatal("seqBufQer", __func__, tmp);
-                        xassert(*wsize_buf_qer >= leftQerOffset,
-                                "extension: left query window exceeds seqBufQer capacity after grow");
-
-                        uint8_t *seqBufQer_ = (uint8_t*)
-                            _mm_realloc(seqBufLeftQer, tmp, *wsize_buf_qer, sizeof(uint8_t));
-                        mmc->seqBufLeftQer[tid*CACHE_LINE] = seqBufLeftQer = seqBufQer_;
-
-                        seqBufQer_ = (uint8_t*)
-                            _mm_realloc(seqBufRightQer, tmp, *wsize_buf_qer, sizeof(uint8_t));
-                        mmc->seqBufRightQer[tid*CACHE_LINE] = seqBufRightQer = seqBufQer_;
-                    }
-
-                    uint8_t *qs = seqBufLeftQer + sp.idq;
-                    for (int i = 0; i < s->qbeg; ++i) qs[i] = query[s->qbeg - 1 - i];
-
-                    tmp = s->rbeg - rmax[0];
-                    leftRefOffset += tmp;
-                    if (leftRefOffset >= *wsize_buf_ref)
-                    {
-                        if (bwa_verbose >= 4) fprintf(stderr, "[%0.4d] Re-allocating (doubling) seqBufRefs in %s (left)\n",
-                                tid, __func__);
-                        int64_t tmp = *wsize_buf_ref;
-                        *wsize_buf_ref = seqbuf_grow_capacity(tmp);
-                        if (*wsize_buf_ref == SEQBUF_CAPACITY_OVERFLOW)
-                            seqbuf_capacity_fatal("seqBufRef", __func__, tmp);
-                        xassert(*wsize_buf_ref >= leftRefOffset,
-                                "extension: left reference window exceeds seqBufRef capacity after grow");
-                        uint8_t *seqBufRef_ = (uint8_t*)
-                            _mm_realloc(seqBufLeftRef, tmp, *wsize_buf_ref, sizeof(uint8_t));
-                        mmc->seqBufLeftRef[tid*CACHE_LINE] = seqBufLeftRef = seqBufRef_;
-
-                        seqBufRef_ = (uint8_t*)
-                            _mm_realloc(seqBufRightRef, tmp, *wsize_buf_ref, sizeof(uint8_t));
-                        mmc->seqBufRightRef[tid*CACHE_LINE] = seqBufRightRef = seqBufRef_;
-                    }
-
-                    uint8_t *rs = seqBufLeftRef + sp.idr;
-                    for (int64_t i = 0; i < tmp; ++i) rs[i] = rseq[tmp - 1 - i]; //seq1
-
-                    sp.len2 = s->qbeg;
-                    sp.len1 = tmp;
-                    sp.tight_band = 0; sp.chain_band = chain_band;  // 0 sentinel: "no tight bound known"
-
-                    // ungapped analysis.
-                    //   HIT      → skip SW; fill a->* from ungapped.
-                    //   TIGHT    → save sp.tight_band; SW will use it.
-                    //   FALLBACK → use opt->w.
-                    /* D3 (--meth, PR-4): the ungapped fast path scores with
-                     * opt->a/opt->b hardcoded (ungapped_analyze) — it CANNOT
-                     * express the asymmetric OT/OB matrix, so a HIT would
-                     * mis-penalize every bisulfite conversion (read T at ref C)
-                     * as a mismatch and commit a wrong a->score. Disable it under
-                     * --meth so all extension flows through the matrix-aware SW
-                     * kernel. (Perf-only fast path; correctness-neutral to skip.) */
-                    if (!opt->meth_mode && sp.len1 >= sp.len2 && sp.len2 <= FP_N_MAX) {
-                        tprof[UGP_L_ATTEMPT][tid]++;
-                        int fp_score, fp_qle, fp_gscore, fp_gtle, fp_band;
-                        int fp_st = ungapped_analyze(qs, rs, sp.len2,
-                                                     sp.h0, opt->a, opt->b,
-                                                     fp_o_min, fp_e_min,
-                                                     fp_x_threshold, opt->w,
-                                                     &fp_score, &fp_qle,
-                                                     &fp_gscore, &fp_gtle,
-                                                     &fp_band);
-                        if (fp_st == FP_STATUS_HIT) {
+                /* Per-seed extension staging (C3a): extracted verbatim into
+                 * stage_seed_extension() so the two-wave second pass reuses the
+                 * identical staging. StageCtx binds the mutable
+                 * staging locals by reference; grows propagate back through it. */
+                StageCtx _sctx = {
+                    seqPairArrayLeft128, seqPairArrayRight128, seqPairArrayAux,
+                    seqBufLeftRef, seqBufRightRef, seqBufLeftQer, seqBufRightQer,
+                    leftRefOffset, rightRefOffset, leftQerOffset, rightQerOffset,
+                    numPairsLeft, numPairsRight,
+                    wsize_pair, wsize_buf_ref, wsize_buf_qer, mmc, tid
 #if BWAMEM3_UGP_PROFILE
-                            tprof[UGP_L_HIT][tid]++;
-                            tprof[UGP_L_UNGAPPED][tid]++;
-                            tprof[UGP_SCORE_HIST_BASE + 0 * UGP_SCORE_HIST_NBINS
-                                  + ugp_score_bin(fp_score)][tid]++;
-                            /* Q3: cat0=ALL, cat1=UNGAP_FINAL, cat3=HIT.
-                             * For HIT, fp_score is both the would-be ungapped
-                             * score and the committed score, so the delta
-                             * (perfect_score - aln_score) is the same for
-                             * both histograms. */
-                            {
-                                int _perfect = sp.h0 + opt->a * sp.len2;
-                                int _delta = _perfect - fp_score;
-                                int _bin = ugp_delta_bin(_delta);
-                                tprof[UGP_L_CAT_UNG_BASE + 0 * UGP_CAT_NBINS + _bin][tid]++;
-                                tprof[UGP_L_CAT_UNG_BASE + 1 * UGP_CAT_NBINS + _bin][tid]++;
-                                tprof[UGP_L_CAT_UNG_BASE + 3 * UGP_CAT_NBINS + _bin][tid]++;
-                                tprof[UGP_L_CAT_FIN_BASE + 0 * UGP_CAT_NBINS + _bin][tid]++;
-                                tprof[UGP_L_CAT_FIN_BASE + 1 * UGP_CAT_NBINS + _bin][tid]++;
-                                tprof[UGP_L_CAT_FIN_BASE + 3 * UGP_CAT_NBINS + _bin][tid]++;
-                            }
+                    , numPairsLeft128, numPairsLeft16, numPairsLeft1
 #endif
-                            // Roll back the qs/rs buffer offsets we just
-                            // consumed; the batch won't reference them.
-                            leftQerOffset -= s->qbeg;
-                            leftRefOffset -= tmp;
-                            // Mirror post-SW extraction (~line 2560).
-                            a->score = fp_score;
-                            if (fp_gscore <= 0 || fp_gscore <= a->score - opt->pen_clip5) {
-                                a->qb = s->qbeg - fp_qle;
-                                a->rb = s->rbeg - fp_qle; // tle == qle on diagonal
-                                a->truesc = a->score;
-                            } else {
-                                a->qb = 0;
-                                a->rb = s->rbeg - fp_gtle;
-                                a->truesc = fp_gscore;
-                            }
-                            a->w = max_(a->w, opt->w);
-                            if (a->rb != H0_ && a->qb != H0_ && a->qe != H0_ && a->re != H0_) {
-                                int ii;
-                                for (ii = 0, a->seedcov = 0; ii < a->c->n; ++ii) {
-                                    const mem_seed_t *t = &(a->c->seeds[ii]);
-                                    if (t->qbeg >= a->qb && t->qbeg + t->len <= a->qe &&
-                                        t->rbeg >= a->rb && t->rbeg + t->len <= a->re)
-                                        a->seedcov += t->len;
-                                }
-                            }
-                            goto LEFT_DONE;
-                        }
-                        if (fp_st == FP_STATUS_TIGHT) {
-                            // Fast-path failed but tight_band valid. Pipe
-                            // to SW via sp.tight_band.
-                            sp.tight_band = fp_band;
-                            tprof[UGP_L_TIGHT][tid]++;
-                            if (fp_band <= 8)        tprof[UGP_L_TB_1_8][tid]++;
-                            else if (fp_band <= 32)  tprof[UGP_L_TB_9_32][tid]++;
-                            else                     tprof[UGP_L_TB_33_MAX][tid]++;
-
-                        }
-                        // FALLBACK: sp.tight_band stays 0.
-                    }
-
-#if BWAMEM3_UGP_PROFILE
-                    /* Per-pair tier routing + tight_band histograms. The
-                     * numPairsLeft* increments here are dead (sortPairsLenExt
-                     * below resets and recomputes all three counters, and
-                     * nothing reads them before that) — only t_tier feeds the
-                     * UGP histograms, so the whole block is instrumentation. */
-                    {
-                        int64_t minval = (int64_t)sp.h0 + (int64_t)min_(sp.len1, sp.len2) * (int64_t)opt->a;
-                        int t_tier;
-                        /* Mirror the routing decision in sortPairsLenExt: 8-bit
-                         * iff the safe envelope holds (initial band opt->w). */
-                        if (bsw8_envelope_ok(sp.len1, sp.len2, opt->w, opt->a, opt->zdrop, sp.h0)) {
-                            numPairsLeft128++; t_tier = 0;
-                        }
-                        else if (sp.len1 < MAX_SEQ_LEN16 && sp.len2 < MAX_SEQ_LEN16 && minval >= 0 && minval < MAX_SEQ_LEN16){
-                            numPairsLeft16++;  t_tier = 1;
-                        }
-                        else {
-                            numPairsLeft1++;   t_tier = 2;  /* scalar; not bucketed */
-                        }
-                        /* tight_band histogram bin. */
-                        int tb_ = sp.tight_band;
-                        int fine_bin;
-                        if      (tb_ ==  0) fine_bin = 0;
-                        else if (tb_ <=  2) fine_bin = 1;
-                        else if (tb_ <=  4) fine_bin = 2;
-                        else if (tb_ <=  8) fine_bin = 3;
-                        else if (tb_ <= 16) fine_bin = 4;
-                        else if (tb_ <= 32) fine_bin = 5;
-                        else if (tb_ <= 48) fine_bin = 6;
-                        else if (tb_ <= 64) fine_bin = 7;
-                        else if (tb_ <= 80) fine_bin = 8;
-                        else                fine_bin = 9;
-                        tprof[UGP_FINE_BASE + 0 * UGP_FINE_NBINS + fine_bin][tid]++;
-                        if (t_tier <= 1) {
-                            int band_bin;
-                            if      (tb_ ==  0) band_bin = 0;
-                            else if (tb_ <=  8) band_bin = 1;
-                            else if (tb_ <= 32) band_bin = 2;
-                            else                band_bin = 3;
-                            tprof[UGP_TIER_TB_BASE + 0 * 8 + t_tier * 4 + band_bin][tid]++;
-                        }
-                    }
-#endif
-
-#if BWAMEM3_UGP_PROFILE
-                    /* Q3: compute would-be ungapped extension score for this
-                     * non-HIT LEFT pair. The walk handles arbitrary N
-                     * (including the bypass case len2 > FP_N_MAX where
-                     * analyze did not run). Cost: O(len2) scalar; instrumentation
-                     * only (feeds ugp_record_left_outcome's tprof histograms). */
-                    sp.ugp_walk_score = ungapped_walk_score(qs, rs, sp.len2,
-                                                            sp.h0, opt->a, opt->b);
-#endif
-
-                    seqPairArrayLeft128[numPairsLeft] = sp;
-                    numPairsLeft ++;
-                    a->qb = s->qbeg; a->rb = s->rbeg;
-                    LEFT_DONE: ;
-                }
-                else
-                {
-                    flag = 1;
-                    a->score = a->truesc = meth_seed_sc, a->qb = 0, a->rb = s->rbeg;  /* D3: true seed score */
-                }
-
-                if (s->qbeg + s->len != l_query)  // right extension
-                {
-                    int64_t qe = s->qbeg + s->len;
-                    int64_t re = s->rbeg + s->len - rmax[0];
-                    assert(re >= 0);
-                    SeqPair sp;
-
-                    sp.h0 = H0_; //random number
-                    sp.seqid = c->seqid;
-                    sp.regid = av->n - 1;
-
-                    if (numPairsRight >= *wsize_pair)
-                    {
-                        if (bwa_verbose >= 4) fprintf(stderr, "[0000] [%0.4d] Re-allocating seqPairArrays Right\n", tid);
-                        *wsize_pair += 1024;
-                        // assert(*wsize_pair > numPairsRight);
-                        *wsize_pair += numPairsLeft + 1024;
-                        SeqPair *seqPairArrayAux_new = (SeqPair *) realloc(seqPairArrayAux,
-                                                              (*wsize_pair + MAX_LINE_LEN)
-                                                              * sizeof(SeqPair));
-                        xassert(seqPairArrayAux_new != NULL, "out of memory: seqPairArrayAux");
-                        seqPairArrayAux = seqPairArrayAux_new;
-                        mmc->seqPairArrayAux[tid] = seqPairArrayAux;
-                        SeqPair *seqPairArrayLeft128_new = (SeqPair *) realloc(seqPairArrayLeft128,
-                                                                  (*wsize_pair + MAX_LINE_LEN)
-                                                                  * sizeof(SeqPair));
-                        xassert(seqPairArrayLeft128_new != NULL, "out of memory: seqPairArrayLeft128");
-                        seqPairArrayLeft128 = seqPairArrayLeft128_new;
-                        mmc->seqPairArrayLeft128[tid] = seqPairArrayLeft128;
-                        SeqPair *seqPairArrayRight128_new = (SeqPair *) realloc(seqPairArrayRight128,
-                                                                   (*wsize_pair + MAX_LINE_LEN)
-                                                                   * sizeof(SeqPair));
-                        xassert(seqPairArrayRight128_new != NULL, "out of memory: seqPairArrayRight128");
-                        seqPairArrayRight128 = seqPairArrayRight128_new;
-                        mmc->seqPairArrayRight128[tid] = seqPairArrayRight128;
-                    }
-
-                    sp.len2 = l_query - qe;
-                    sp.len1 = rmax[1] - rmax[0] - re;
-
-                    sp.idq = rightQerOffset;
-                    sp.idr = rightRefOffset;
-
-                    rightQerOffset += sp.len2;
-                    if (rightQerOffset >= *wsize_buf_qer)
-                    {
-                        if (bwa_verbose >= 4) fprintf(stderr, "[%0.4d] Re-allocating (doubling) seqBufQers in %s (right)\n",
-                                tid, __func__);
-                        int64_t tmp = *wsize_buf_qer;
-                        *wsize_buf_qer = seqbuf_grow_capacity(tmp);
-                        if (*wsize_buf_qer == SEQBUF_CAPACITY_OVERFLOW)
-                            seqbuf_capacity_fatal("seqBufQer", __func__, tmp);
-                        xassert(*wsize_buf_qer >= rightQerOffset,
-                                "extension: right query window exceeds seqBufQer capacity after grow");
-
-                        uint8_t *seqBufQer_ = (uint8_t*)
-                            _mm_realloc(seqBufLeftQer, tmp, *wsize_buf_qer, sizeof(uint8_t));
-                        mmc->seqBufLeftQer[tid*CACHE_LINE] = seqBufLeftQer = seqBufQer_;
-
-                        seqBufQer_ = (uint8_t*)
-                            _mm_realloc(seqBufRightQer, tmp, *wsize_buf_qer, sizeof(uint8_t));
-                        mmc->seqBufRightQer[tid*CACHE_LINE] = seqBufRightQer = seqBufQer_;
-                    }
-
-                    rightRefOffset += sp.len1;
-                    if (rightRefOffset >= *wsize_buf_ref)
-                    {
-                        if (bwa_verbose >= 4) fprintf(stderr, "[%0.4d] Re-allocating (doubling) seqBufRefs in %s (right)\n",
-                                tid, __func__);
-                        int64_t tmp = *wsize_buf_ref;
-                        *wsize_buf_ref = seqbuf_grow_capacity(tmp);
-                        if (*wsize_buf_ref == SEQBUF_CAPACITY_OVERFLOW)
-                            seqbuf_capacity_fatal("seqBufRef", __func__, tmp);
-                        xassert(*wsize_buf_ref >= rightRefOffset,
-                                "extension: right reference window exceeds seqBufRef capacity after grow");
-                        uint8_t *seqBufRef_ = (uint8_t*)
-                            _mm_realloc(seqBufLeftRef, tmp, *wsize_buf_ref, sizeof(uint8_t));
-                        mmc->seqBufLeftRef[tid*CACHE_LINE] = seqBufLeftRef = seqBufRef_;
-
-                        seqBufRef_ = (uint8_t*)
-                            _mm_realloc(seqBufRightRef, tmp, *wsize_buf_ref, sizeof(uint8_t));
-                        mmc->seqBufRightRef[tid*CACHE_LINE] = seqBufRightRef = seqBufRef_;
-                    }
-
-                    tprof[PE23][tid] += sp.len1 + sp.len2;
-
-                    uint8_t *qs = seqBufRightQer + sp.idq;
-                    uint8_t *rs = seqBufRightRef + sp.idr;
-
-                    for (int i = 0; i < sp.len2; ++i) qs[i] = query[qe + i];
-
-                    for (int i = 0; i < sp.len1; ++i) rs[i] = rseq[re + i]; //seq1
-
-                    sp.tight_band = 0; sp.chain_band = chain_band;
-                    sp.ugp_r_attempted = 0;
-
-                    // ungapped analysis on right ext.
-                    // Precondition a->score != -1 means left either didn't
-                    // need extension or was fast-pathed — in both cases
-                    // h0 is known. If left was batched, we skip (can't
-                    // know h0 yet); SW will run with default band.
-                    /* D3 (--meth, PR-4): disable the ungapped fast path under
-                     * --meth — see the LEFT-side rationale above (it can't score
-                     * the asymmetric OT/OB matrix). */
-                    if (!opt->meth_mode && a->score != -1 && sp.len1 >= sp.len2 && sp.len2 <= FP_N_MAX) {
-                        sp.ugp_r_attempted = 1;
-                        tprof[UGP_R_ATTEMPT][tid]++;
-                        int fp_h0 = a->score;  // the real h0 for right ext
-                        int fp_score, fp_qle, fp_gscore, fp_gtle, fp_band;
-                        int fp_st = ungapped_analyze(qs, rs, sp.len2,
-                                                     fp_h0, opt->a, opt->b,
-                                                     fp_o_min, fp_e_min,
-                                                     fp_x_threshold, opt->w,
-                                                     &fp_score, &fp_qle,
-                                                     &fp_gscore, &fp_gtle,
-                                                     &fp_band);
-                        if (fp_st == FP_STATUS_HIT) {
-                            tprof[UGP_R_HIT][tid]++;
-                            tprof[UGP_R_UNGAPPED][tid]++;
-                            tprof[UGP_SCORE_HIST_BASE + 1 * UGP_SCORE_HIST_NBINS
-                                  + ugp_score_bin(fp_score)][tid]++;
-                            // Roll back the qs/rs buffer offsets.
-                            rightQerOffset -= sp.len2;
-                            rightRefOffset -= sp.len1;
-                            // Mirror post-SW extraction (~line 2777).
-                            a->score = fp_score;
-                            if (fp_gscore <= 0 || fp_gscore <= a->score - opt->pen_clip3) {
-                                a->qe = qe + fp_qle;
-                                a->re = rmax[0] + re + fp_qle; // tle == qle on diagonal
-                                a->truesc += a->score - fp_h0;
-                            } else {
-                                a->qe = l_query;
-                                a->re = rmax[0] + re + fp_gtle;
-                                a->truesc += fp_gscore - fp_h0;
-                            }
-                            a->w = max_(a->w, opt->w);
-                            if (a->rb != H0_ && a->qb != H0_ && a->qe != H0_ && a->re != H0_) {
-                                int ii;
-                                for (ii = 0, a->seedcov = 0; ii < a->c->n; ++ii) {
-                                    const mem_seed_t *t = &a->c->seeds[ii];
-                                    if (t->qbeg >= a->qb && t->qbeg + t->len <= a->qe &&
-                                        t->rbeg >= a->rb && t->rbeg + t->len <= a->re)
-                                        a->seedcov += t->len;
-                                }
-                            }
-                            goto RIGHT_DONE;
-                        }
-                        if (fp_st == FP_STATUS_TIGHT) {
-                            sp.tight_band = fp_band;
-                            tprof[UGP_R_TIGHT][tid]++;
-                            if (fp_band <= 8)        tprof[UGP_R_TB_1_8][tid]++;
-                            else if (fp_band <= 32)  tprof[UGP_R_TB_9_32][tid]++;
-                            else                     tprof[UGP_R_TB_33_MAX][tid]++;
-
-                        }
-                    }
-
-                    /* The RIGHT-side tier counters (numPairsRight128/16/1) are
-                     * recomputed from scratch by sortPairsLenExt below (which
-                     * resets them to 0 first), and nothing reads them before
-                     * that call — so the per-pair envelope check and routing
-                     * that used to live here were dead work. Just stage the
-                     * pair; the sort assigns its tier. RIGHT histograms (Groups
-                     * A & B) are populated post-left-SW once the right pass has
-                     * finalised sp->tight_band. */
-                    seqPairArrayRight128[numPairsRight] = sp;
-                    numPairsRight ++;
-                    a->qe = qe; a->re = rmax[0] + re;
-                    RIGHT_DONE: ;
-                }
-                else
-                {
-                    a->qe = l_query, a->re = s->rbeg + s->len;
-                    // Do NOT remove this seedcov recompute: it is load-bearing.
-                    // This is the no-right-extension branch (s->qbeg + s->len ==
-                    // l_query). When the seed also needs no left extension
-                    // (s->qbeg == 0, i.e. it spans the whole read, as perfect-match
-                    // reads do) no SW pair is staged on either side, so none of the
-                    // other seedcov recompute sites run -- neither the right-HIT
-                    // path above, nor the post-SW LEFT-accept loops, nor the
-                    // RIGHT-accept loops. In that case this block is the ONLY writer
-                    // of a->seedcov. Dropping it would leave seedcov stale and change
-                    // mem_approx_mapq_se (log(seedcov)), altering the emitted MAPQ.
-                    if (a->rb != H0_ && a->qb != H0_)
-                    {
-                        int i;
-                        for (i = 0, a->seedcov = 0; i < c->n; ++i)
-                        {
-                            const mem_seed_t *t = &c->seeds[i];
-                            if (t->qbeg >= a->qb && t->qbeg + t->len <= a->qe &&
-                                t->rbeg >= a->rb && t->rbeg + t->len <= a->re) // seed fully contained
-                                a->seedcov += t->len;
-                        }
-                    }
-                }
-            }
+                };
+                stage_seed_extension(s, a, c, av, query, rseq, rmax,
+                                     chain_band, meth_seed_sc, l_query,
+                                     opt, fp_o_min, fp_e_min, fp_x_threshold,
+                                     _sctx);
+            }  /* end per-seed k-loop body */
             // tprof[MEM_ALN2_DOWN1][tid] += __rdtsc() - tim;
         }
     }
@@ -7144,6 +7418,14 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
     // tprof[MEM_ALN2_UP][tid] += __rdtsc() - timUP;
 
 
+    /* C3b-1: the Pass-2 extension scoring block (sort + per-tier band ladders,
+     * LEFT then RIGHT, scattering results into av_v[sp->seqid].a[sp->regid]) is
+     * wrapped in a [&] lambda so it can run a SECOND time on the guarded
+     * two-wave deferred survivors (C3b-2) with zero signature plumbing -- the
+     * capture sees every staging local. Scoring scatters by (seqid,regid), so a
+     * second batch of re-staged pairs lands in the right alnregs. Invoked once
+     * here (the main batch); byte-identical to the prior inline block. */
+    auto run_extension_batch = [&]() {
     int32_t *hist = (int32_t *)_mm_malloc((MAX_SEQ_LEN8 + MAX_SEQ_LEN16 + 32) *
                                           sizeof(int32_t), 64);
 
@@ -7847,6 +8129,132 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
     }
 
     _mm_free(hist);
+    };  /* end run_extension_batch lambda */
+    run_extension_batch();
+
+    /* ---- Two-wave second pass, inert unless --skip-contained-ext. Every
+     * root/container alnreg now has real post-Pass-2 coords. For each deferred
+     * seed, run the REAL PE18 containment test against its container's real
+     * alnreg; GUARDED by container.aln < s.aln so the purge matches flag-OFF's
+     * Pass-3 decision by induction (the guard closes the long-read
+     * seed-rescoring slot-order inversion). Guard-passing seeds are purged
+     * (their SW is skipped -- the win); the rest are re-staged and scored by a
+     * second run_extension_batch(). Nothing reads av between here and Pass 3,
+     * so leaving deferred slots at H0_ until now is safe. ---- */
+    if (opt->skip_contained_ext && !ks_pending.empty()) {
+        /* Reuse the (now-consumed) staging arrays for the second batch. */
+        numPairsLeft = numPairsRight = 0;
+        leftRefOffset = rightRefOffset = leftQerOffset = rightQerOffset = 0;
+#if BWAMEM3_UGP_PROFILE
+        numPairsLeft128 = numPairsLeft16 = numPairsLeft1 = 0;
+#endif
+        size_t pi = 0;
+        while (pi < ks_pending.size()) {
+            const int gl = ks_pending[pi].l;
+            const int gj = ks_pending[pi].j;
+            mem_chain_t *gc = &chain_ar[gl].a[gj];
+            mem_alnreg_v *gav = &av_v[gl];
+            const int gl_query = seq_[gl].l_seq;
+
+            /* This chain's reference window AND this read's extension query,
+             * restored LAZILY the first time a seed of this group survives the
+             * guard. On short reads nearly every deferred seed is purged, and a
+             * purge needs neither, so most groups never pay for them. When
+             * needed, rmax[] is reset to the cached post-clamp bounds and the
+             * window re-fetched with them: the fetch clamps idempotently, so
+             * rseq and rmax[] are exactly what Pass 1 staged this chain
+             * against. The query is re-derived by extension_query: outside
+             * --meth it is seq_[gl].seq; under --meth the per-thread encode
+             * scratch has been overwritten by later reads since Pass 1, so
+             * meth_orig_seq is re-encoded (same input, same bytes). */
+            uint8_t *grseq = 0;
+            const uint8_t *gquery = NULL;
+            int gchain_band = 0;
+            bool gwin = false;
+
+            /* Resolve every pending seed of this (l,j) group. */
+            for (; pi < ks_pending.size()
+                   && ks_pending[pi].l == gl && ks_pending[pi].j == gj; ++pi) {
+                const mem_seed_t *ps = &gc->seeds[ks_pending[pi].seed_idx];
+                mem_alnreg_t *pa = &gav->a[ps->aln];
+                const mem_seed_t *pc = &gc->seeds[ks_pending[pi].container_si];
+
+                /* GUARD: only pre-purge when the container sits at an earlier
+                 * slot (so flag-OFF's Pass 3 also purges ps at its own turn) AND
+                 * the real PE18 predicate confirms containment against the
+                 * container's real extended alnreg. Else extend ps.
+                 *
+                 * Why this is exact: flag-OFF extends EVERY seed in the main
+                 * batch and only then lets Pass 3 purge, in slot order, each seed
+                 * that (A) is PE18-contained in an earlier still-live alnreg and
+                 * (B) has no interfering higher-priority same-chain seed. So
+                 * extending a deferred seed here is always output-safe (Pass 3
+                 * then judges it exactly as flag-OFF does, given its alnreg is
+                 * scored into its OWN slot -- see sp.regid in the staging
+                 * helper); only a purge must be certain. This purge is: (B) holds
+                 * because mem_seed_ext_redundant's interference scan covers a
+                 * superset of Pass 3's; (A) holds because the container is
+                 * earlier and either stays live, or is itself purged by an
+                 * alnreg that, containing the longer same-diagonal seed, also
+                 * PE18-contains ps. Testing other earlier alnregs would need
+                 * their Pass-3 liveness (not transitive), so it is not done. */
+                bool purge = false;
+                if (pc->aln < ps->aln) {
+                    const mem_alnreg_t *cp = &gav->a[pc->aln];
+                    /* container must be a live, extended root (C1 guarantees it
+                     * is never itself deferred); guard defensively. */
+                    if (!(cp->qb == -1 && cp->qe == -1) &&
+                        pe18_seed_in_container(ps, cp, gl_query, opt) == PE18_CONTAINED)
+                        purge = true;
+                }
+                if (purge) {
+                    pa->qb = pa->qe = -1;   /* skip its SW: the two-wave win */
+                    continue;
+                }
+                /* Extend ps in the second batch: restore the window + query,
+                 * recompute its seed score exactly as Pass 1 would have (the
+                 * meth-matrix score under --meth, len*a otherwise -- with the
+                 * restored rmax[0] the ref offset is Pass 1's), and stage. */
+                if (!gwin) {
+                    rmax[0] = ks_pending[pi].rmax0;
+                    rmax[1] = ks_pending[pi].rmax1;
+                    int grid = 0;
+                    grseq = bns_fetch_seq_v2(bns, pac, &rmax[0], gc->seeds[0].rbeg,
+                                             &rmax[1], &grid, ref_string,
+                                             (uint8_t *) seqPairArrayAux);
+                    xassert(gc->rid == grid, "two-wave: chain rid mismatch on window re-fetch");
+                    gchain_band = ks_pending[pi].chain_band;
+                    gquery = extension_query(gl, gl_query);
+                    gwin = true;
+                }
+                const int meth_seed_sc = seed_ext_score(ps, pa, grseq, gquery);
+                StageCtx _sctx2 = {
+                    seqPairArrayLeft128, seqPairArrayRight128, seqPairArrayAux,
+                    seqBufLeftRef, seqBufRightRef, seqBufLeftQer, seqBufRightQer,
+                    leftRefOffset, rightRefOffset, leftQerOffset, rightQerOffset,
+                    numPairsLeft, numPairsRight,
+                    wsize_pair, wsize_buf_ref, wsize_buf_qer, mmc, tid
+#if BWAMEM3_UGP_PROFILE
+                    , numPairsLeft128, numPairsLeft16, numPairsLeft1
+#endif
+                };
+                stage_seed_extension(ps, pa, gc, gav, gquery, grseq, rmax,
+                                     gchain_band, meth_seed_sc, gl_query,
+                                     opt, fp_o_min, fp_e_min, fp_x_threshold,
+                                     _sctx2);
+            }
+        }
+        /* Score the deferred survivors (byte-identical to their being in the
+         * main batch; scatter is by (seqid,regid)). Skipped when the guard
+         * purged every deferred seed: with no pairs staged the batch has no
+         * output effect (the sorts and every tier rung return on an empty
+         * input, and the scatter loops run zero times), so this only avoids
+         * its fixed per-call setup -- two SW-object constructions and the
+         * histogram allocation. */
+        if (numPairsLeft > 0 || numPairsRight > 0)
+            run_extension_batch();
+    }
+
     // tprof[CRIGHT][tid] += __rdtsc() - timR;
 
     if (numPairsLeft >= *wsize_pair || numPairsRight >= *wsize_pair)
@@ -7902,29 +8310,15 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
                 {
                     mem_alnreg_t *p = &av->a[i];
                     if (p->qb == -1 && p->qe == -1) {
-                        continue;
+                        continue;   // purged candidate: skip, do NOT increment v
                     }
 
-                    int64_t rd;
-                    int qd, w, max_gap;
-                    if (s->rbeg < p->rb || s->rbeg + s->len > p->re || s->qbeg < p->qb
-                        || s->qbeg + s->len > p->qe) {
-                        v++; continue; // not fully contained
-                    }
-
-                    if (s->len - p->seedlen0 > .1 * l_query) { v++; continue;}
-                    // qd: distance ahead of the seed on query; rd: on reference
-                    qd = s->qbeg - p->qb; rd = s->rbeg - p->rb;
-                    // the maximal gap allowed in regions ahead of the seed
-                    max_gap = cal_max_gap(opt, qd < rd? qd : rd);
-                    w = max_gap < p->w? max_gap : p->w; // bounded by the band width
-                    if (qd - rd < w && rd - qd < w) break; // the seed is "around" a previous hit
-                    // similar to the previous four lines, but this time we look at the region behind
-                    qd = p->qe - (s->qbeg + s->len); rd = p->re - (s->rbeg + s->len);
-                    max_gap = cal_max_gap(opt, qd < rd? qd : rd);
-                    w = max_gap < p->w? max_gap : p->w;
-                    if (qd - rd < w && rd - qd < w) break;
-
+                    /* Shared PE18 containment predicate (see pe18_seed_in_container
+                     * above): CONTAINED -> the seed is "around" p, stop scanning
+                     * (break); NOT -> p does not contain s, count it (v++) and
+                     * keep scanning. Byte-identical to the prior inline body. */
+                    if (pe18_seed_in_container(s, p, l_query, opt) == PE18_CONTAINED)
+                        break;
                     v++;
                 }
 
@@ -7953,6 +8347,17 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
                         tprof[PE18][tid]++;
                         continue;
                     }
+                }
+                /* Two-wave invariant (belt-and-suspenders): a seed Pass 3 KEEPS
+                 * (lim++) must have a live, extended alnreg. A deferred seed is
+                 * either purged in the second wave (slot == -1, and Pass 3 would
+                 * purge it here too) or extended there; a slot still at H0_ here
+                 * would mean a deferred seed was neither purged nor extended -- a
+                 * two-wave bug. Fires under -DNDEBUG too (xassert). */
+                if (opt->skip_contained_ext) {
+                    const mem_alnreg_t *_kar = &av_v[l].a[s->aln];
+                    xassert(!(_kar->qb == H0_ || _kar->qe == H0_),
+                            "two-wave: Pass 3 kept a seed whose alnreg was never resolved");
                 }
                 lim[l]++;
             }

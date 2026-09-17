@@ -203,7 +203,7 @@ Notes and caveats:
   `--compat`, because the upstream has no such knob and so cannot reproduce the
   output at any setting: `--smem-dedup`, `--adaptive-band`, `--max-extend-chains`,
   `--min-ext-len`, `--extend-tie-frac`, `--rescue-kmer`, `--supp-rep-hard-cap`,
-  `--seed-order`, `--skip-contained-ext`, `--chunk-cap`, and
+  `--seed-order`, `--chunk-cap`, and
   [`--proper-pair-from-emitted`](#--proper-pair-from-emitted--derive-flag-0x2-from-the-emitted-alignment).
   The error names the offending flags (`--compat and these bwa-mem3-only levers
   are mutually exclusive: ...`). Pass **`--compat-allow-divergent`** to downgrade
@@ -213,6 +213,13 @@ Notes and caveats:
   already documents which flags ran). Shared knobs the upstream also has (scoring
   `-A`/`-B`, `-k`/`-w`/`-r`, `-T`, …) are *not* guarded — changing one just moves
   both sides to the same operating point, so byte-identity still holds.
+- **`--compat` runs the reference contained-seed extension path.** The default
+  [contained-seed extension skip](#--keep-contained-ext--opt-out-of-the-contained-seed-extension-skip)
+  is byte-identical to that path, so this changes no output; it just pins a
+  bit-exact-fidelity mode to the same extension code the targets run rather
+  than to a speed lever. It is not a guarded lever: `--compat --keep-contained-ext`
+  is accepted (both ask for the reference path), and the deprecated
+  `--skip-contained-ext` is accepted and overridden.
 - **The escape hatch does not relax `--fast` or `--meth`.** Those stay hard
   errors even with `--compat-allow-divergent`, because they are category errors,
   not divergences: `--fast` is an opaque multi-flag bundle (not a single knob a
@@ -695,8 +702,7 @@ extension. This makes the **extension step** byte-identical to a run without
 code path, by construction) — it does **not** make a whole `--fast` run
 byte-identical, since `--fast`'s other levers
 ([`--max-extend-chains`](https://github.com/fg-labs/bwa-mem3/pull/193),
-[`--smem-dedup`](https://github.com/fg-labs/bwa-mem3/pull/187),
-[`--skip-contained-ext`](https://github.com/fg-labs/bwa-mem3/pull/192), …) can
+[`--smem-dedup`](https://github.com/fg-labs/bwa-mem3/pull/187), …) can
 still change output. It is the explicit opt-out for `--adaptive-band` and matters mainly under
 `--fast`, which turns `--adaptive-band` on for you: passing `--no-adaptive-band`
 alongside `--fast` keeps that one lever off (exact extension) while retaining the rest
@@ -711,6 +717,33 @@ what `--no-band-cert` toggles on its own.
 The resolved state is recorded on the `--fast` audit line — `[M::main_mem] --fast: …
 --no-adaptive-band …` — so the run record shows exact extension was in force (the off
 state would otherwise be invisible, exactly as for `--rescue-kmer=0`).
+
+#### `--keep-contained-ext` — opt out of the contained-seed extension skip
+
+By default, `bwa-mem3 mem` skips the banded Smith-Waterman extension of a seed that is
+**strictly contained** (same diagonal, query subinterval) in a longer seed of the same chain,
+once the post-extension containment purge confirms that the container's real extended
+alignment covers it. The skip is **byte-identical** to the reference extension path on all
+read lengths, single- and paired-end, `--meth` included: the contained seed is *deferred*
+past the main extension batch rather than predicted away, the same containment test the
+purge already applies is run against the container's post-extension coordinates, and a seed
+that test does not confirm is extended in a second batch — so no alignment the reference path
+would have produced is lost, and no seed leaves the chain (seed coverage and MAPQ are
+untouched). It is a pure speed lever (measured on AWS Graviton4 (`c8g.8xlarge`, arm64, NEON SIMD
+tier), clang-19: −2.9% user-CPU on a 5M-pair WGS slice, −1.4% on a 5M-pair WES slice, −1.6% on a
+5M-pair `--meth` slice, all verified bit-for-bit identical to the reference path, records + header +
+count), which is why it is on by default.
+
+`--keep-contained-ext` opts out and runs the reference extension path (no deferral, every
+seed extended in the main batch). Output is unchanged; the run is only slower. Use it as an
+escape hatch, or as a bit-exact A/B handle when comparing against an older binary that
+predates the default. `--compat` implies it (see
+[`--compat`](#--compattarget--byte-identical-output-for-another-aligner)).
+
+`--skip-contained-ext` (the former opt-in spelling) is **deprecated**: it still parses, is a
+no-op (it re-asserts the default), and prints `[W::main_mem] --skip-contained-ext is
+deprecated: contained-seed skipping is now the default; pass --keep-contained-ext to opt
+out`. `--keep-contained-ext` wins over it in either order.
 
 #### `--extend-mate-concordant` — retain mate-concordant chains under a chain cap
 
@@ -770,17 +803,14 @@ the alignment score and mapping quality for each secondary hit.
 `--fast` is a one-flag shorthand for the characterized speed levers:
 
 ```text
-bwa-mem3 mem --fast  ≡  -m 10 -y 0 --min-ext-len 30 --smem-dedup --skip-contained-ext --max-extend-chains 20 --adaptive-band --extend-mate-concordant --rescue-kmer=6
+bwa-mem3 mem --fast  ≡  -m 10 -y 0 --min-ext-len 30 --smem-dedup --max-extend-chains 20 --adaptive-band --extend-mate-concordant --rescue-kmer=6
 ```
 
-`--skip-contained-ext` is byte-identical to the default on non-meth short- and
-medium-length single- and paired-end reads (validated on WGS/WES/HiC and SBX, and on an
-ALT/HLA-enriched set) and no-ops under `--meth` (via its own internal gate). It is **not**
-byte-identical on kilobase-scale long reads (PacBio HiFi, ONT): the "longest contained seed
-dominates" assumption its skip relies on breaks when extensions terminate early on such
-reads, dropping supplementary alignments and occasionally degrading a primary. Those inputs
-are in any case not currently usable at default settings (see the long-read caveat under
-[`--adaptive-band`](#--adaptive-band--adaptive-banded-smith-waterman-for-medium-length-reads)).
+The contained-seed extension skip is not part of the preset: it is the byte-identical
+default on every run (see
+[`--keep-contained-ext`](#--keep-contained-ext--opt-out-of-the-contained-seed-extension-skip)),
+so `--fast` neither enables nor reports it, and `--fast --keep-contained-ext` keeps the
+opt-out.
 
 `--adaptive-band` (see above) is included because it is a strict no-op on short reads
 (the reads `--fast` primarily targets) and a ~25% alignment-CPU speedup on medium-length
@@ -833,7 +863,7 @@ MAPQ on bisulfite reads; `-s 2` recovers the MAPQ/placement at nearly the same s
 
 Each lever is applied only if you did not set it explicitly, so explicit flags
 win where applicable (`--fast -m 30` keeps `-m 30`; `--fast --max-extend-chains 8`
-keeps `8`); `--smem-dedup` and `--skip-contained-ext` are always enabled and
+keeps `8`); `--smem-dedup` is always enabled and
 cannot be opted back out of once
 `--fast` is set. Output is **not**
 byte-identical to the default; the accuracy cost of each lever is characterized in

@@ -2,15 +2,18 @@
 # test/fast_preset_test.sh
 #
 # Asserts that `bwa-mem3 mem --fast` resolves the characterized speed levers
-# (-m 10 -y 0 --min-ext-len 30 --smem-dedup --skip-contained-ext
+# (-m 10 -y 0 --min-ext-len 30 --smem-dedup
 # --max-extend-chains 20 --extend-mate-concordant --rescue-kmer=6, plus -s 2 and a
 # lower --max-extend-chains 10 under --meth), that explicit user flags override the
 # preset, and that the default path is untouched when --fast is absent.
-# --skip-contained-ext no-ops under --meth (internal gate), so it is omitted from
-# the meth audit line; --max-extend-chains applies under --meth too but at a
-# lower cap of 10 (non-meth uses 20). --extend-mate-concordant recovers the
-# chain-cap pairing regression and is now enabled for both non-meth and --meth
-# --fast (fg-labs/bwa-mem3#202), so it must be present on both audit lines.
+# The contained-seed extension skip is the byte-identical DEFAULT, not a --fast
+# lever, so `--skip-contained-ext` must NOT appear on either audit line (the line
+# records only the output-changing levers --fast turns on); --max-extend-chains
+# applies under --meth too but at a lower cap of 10 (non-meth uses 20).
+# --extend-mate-concordant recovers the chain-cap pairing regression and is now
+# enabled for both non-meth and --meth --fast (fg-labs/bwa-mem3#202), so it must
+# be present on both audit lines. The deprecated `--skip-contained-ext` and its
+# opt-out `--keep-contained-ext` must both still parse (with and without --fast).
 #
 # The assertion surface is the audit line main_mem prints to stderr when
 # --fast is active: it reports the *resolved* mem_opt_t values, so an explicit
@@ -71,7 +74,6 @@ fast_line() {
 line="$(fast_line --fast)"
 [[ "$line" == *"-m 10"* && "$line" == *"-y 0"* &&
     "$line" == *"--min-ext-len 30"* && "$line" == *"--smem-dedup"* &&
-    "$line" == *"--skip-contained-ext"* &&
     "$line" == *"--max-extend-chains 20"* &&
     "$line" == *"--adaptive-band"* &&
     "$line" == *"--extend-mate-concordant"* &&
@@ -89,7 +91,14 @@ line="$(fast_line --fast)"
         echo "FAIL: non-meth --fast must not set -s: '$line'" >&2
         exit 1
     }
-echo "OK:   --fast bundle resolves -m 10 -y 0 --min-ext-len 30 --smem-dedup --skip-contained-ext --max-extend-chains 20 --adaptive-band --extend-mate-concordant --extend-tie-frac 0.95 --extend-tie-floor 1 --extend-csub --rescue-kmer=6 alnreg-sort=fast (no -s)"
+# The contained-seed skip is the default, not a --fast lever: it must not be
+# reported as one (a stale audit line would misdescribe what --fast changes).
+[[ "$line" != *"--skip-contained-ext"* ]] \
+    || {
+        echo "FAIL: --skip-contained-ext is the default, not a --fast lever; must not be on the audit line: '$line'" >&2
+        exit 1
+    }
+echo "OK:   --fast bundle resolves -m 10 -y 0 --min-ext-len 30 --smem-dedup --max-extend-chains 20 --adaptive-band --extend-mate-concordant --extend-tie-frac 0.95 --extend-tie-floor 1 --extend-csub --rescue-kmer=6 alnreg-sort=fast (no -s, no --skip-contained-ext)"
 
 # 1b. The gate levers honor an explicit user value: --extend-tie-frac 0 disables the
 #     competitiveness gate even under --fast (opt0 wins), and the audit line reflects it.
@@ -109,7 +118,6 @@ echo "OK:   --fast folds in --extend-tie-frac 0.95 / --extend-tie-floor 1 / --ex
 line="$(fast_line --fast -m 30)"
 [[ "$line" == *"-m 30"* && "$line" == *"-y 0"* &&
     "$line" == *"--min-ext-len 30"* && "$line" == *"--smem-dedup"* &&
-    "$line" == *"--skip-contained-ext"* &&
     "$line" == *"--max-extend-chains 20"* &&
     "$line" == *"--adaptive-band"* && "$line" == *"--extend-mate-concordant"* &&
     "$line" == *"alnreg-sort=fast"* ]] \
@@ -120,7 +128,6 @@ line="$(fast_line --fast -m 30)"
 line="$(fast_line --fast -y 5)"
 [[ "$line" == *"-m 10"* && "$line" == *"-y 5"* &&
     "$line" == *"--min-ext-len 30"* && "$line" == *"--smem-dedup"* &&
-    "$line" == *"--skip-contained-ext"* &&
     "$line" == *"--max-extend-chains 20"* &&
     "$line" == *"--adaptive-band"* && "$line" == *"--extend-mate-concordant"* &&
     "$line" == *"alnreg-sort=fast"* ]] \
@@ -131,7 +138,6 @@ line="$(fast_line --fast -y 5)"
 line="$(fast_line --fast --min-ext-len 45)"
 [[ "$line" == *"-m 10"* && "$line" == *"-y 0"* &&
     "$line" == *"--min-ext-len 45"* && "$line" == *"--smem-dedup"* &&
-    "$line" == *"--skip-contained-ext"* &&
     "$line" == *"--max-extend-chains 20"* &&
     "$line" == *"--adaptive-band"* && "$line" == *"--extend-mate-concordant"* &&
     "$line" == *"alnreg-sort=fast"* ]] \
@@ -143,7 +149,6 @@ line="$(fast_line --fast --min-ext-len 45)"
 line="$(fast_line --fast --max-extend-chains 8)"
 [[ "$line" == *"-m 10"* && "$line" == *"-y 0"* &&
     "$line" == *"--min-ext-len 30"* && "$line" == *"--smem-dedup"* &&
-    "$line" == *"--skip-contained-ext"* &&
     "$line" == *"--max-extend-chains 8"* &&
     "$line" == *"--adaptive-band"* && "$line" == *"--extend-mate-concordant"* &&
     "$line" == *"alnreg-sort=fast"* ]] \
@@ -187,6 +192,39 @@ echo "OK:   explicit --rescue-kmer=0/=11 overrides the preset K without disturbi
     }
 echo "OK:   no --fast => no audit line (default path untouched)"
 
+# 3b. Contained-seed skip CLI surface. The skip is the byte-identical default;
+#     `--keep-contained-ext` is its opt-out and `--skip-contained-ext` is the
+#     deprecated spelling of the default. Both must still parse (alone and with
+#     --fast), the deprecated one must say so on stderr, and the opt-out must not.
+"$bin" mem --keep-contained-ext "$ref" "$reads" > /dev/null 2> "$err" || {
+    echo "FAIL: mem --keep-contained-ext nonzero" >&2
+    cat "$err" >&2
+    exit 1
+}
+! grep -q 'deprecated' "$err" \
+    || {
+        echo "FAIL: --keep-contained-ext must not print a deprecation notice" >&2
+        exit 1
+    }
+"$bin" mem --skip-contained-ext "$ref" "$reads" > /dev/null 2> "$err" || {
+    echo "FAIL: mem --skip-contained-ext (deprecated) must still parse" >&2
+    cat "$err" >&2
+    exit 1
+}
+grep -qE '^\[W::main_mem\] --skip-contained-ext is deprecated' "$err" \
+    || {
+        echo "FAIL: --skip-contained-ext must print a deprecation notice" >&2
+        cat "$err" >&2
+        exit 1
+    }
+line="$(fast_line --fast --keep-contained-ext)"
+[[ "$line" == *"--smem-dedup"* && "$line" != *"--skip-contained-ext"* ]] \
+    || {
+        echo "FAIL: --fast --keep-contained-ext should keep the preset and not report the skip: '$line'" >&2
+        exit 1
+    }
+echo "OK:   --keep-contained-ext parses silently; --skip-contained-ext parses with a deprecation notice; both coexist with --fast"
+
 # 4. Meth path: --fast --meth additionally sets -s 2. Build a meth index on a
 #    copy of phiX; if meth indexing is unavailable in this build, SKIP.
 cp "$ref" "$mdir/ref.fa"
@@ -205,7 +243,7 @@ if "$bin" index --meth "$mdir/ref.fa" > /dev/null 2>&1; then
         }
     [[ "$line" != *"--skip-contained-ext"* ]] \
         || {
-            echo "FAIL: --skip-contained-ext no-ops under --meth; must be absent from audit line: '$line'" >&2
+            echo "FAIL: --skip-contained-ext is the default, not a --fast lever; must not be on the meth audit line: '$line'" >&2
             exit 1
         }
     [[ "$line" == *"--max-extend-chains 10"* ]] \
@@ -240,7 +278,7 @@ if "$bin" index --meth "$mdir/ref.fa" > /dev/null 2>&1; then
             echo "FAIL: --fast --meth must enable alnreg-sort=fast: '$line'" >&2
             exit 1
         }
-    echo "OK:   --fast --meth additionally sets -s 2, --extend-mate-concordant, the extend-tie gate and alnreg-sort=fast (skip-contained-ext omitted meth-gated, --max-extend-chains raised to 10)"
+    echo "OK:   --fast --meth additionally sets -s 2, --extend-mate-concordant, the extend-tie gate and alnreg-sort=fast (--max-extend-chains lowered to 10, no --skip-contained-ext)"
     # Explicit -s wins even under --meth (src/fastmap.cpp: -s 2 is gated on !opt0.split_width).
     "$bin" mem --meth --fast -s 7 -t 1 "$mdir/ref.fa" "$reads" > /dev/null 2> "$err" \
         || {

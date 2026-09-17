@@ -1061,6 +1061,14 @@ jobs:
           KS_DEDUP_WORK_DIR=/tmp/ks-dedup-bytes \
           bash test/regression/ks_dedup_byte_identity.sh
 
+      - name: byte-identity default==--keep-contained-ext (contained-seed skip)
+        if: matrix.canonical == true
+        run: |
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          SKIP_CONTAINED_PHIX_FA="$GITHUB_WORKSPACE/test/fixtures/phix.fa" \
+          SKIP_CONTAINED_WORK_DIR=/tmp/skip-contained-bytes \
+          bash test/regression/skip_contained_byte_identity.sh
+
       - name: --hic alias regression (byte-identical to -5SP)
         if: matrix.canonical == true
         run: |
