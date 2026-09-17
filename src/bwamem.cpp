@@ -581,7 +581,7 @@ mem_opt_t *mem_opt_init()
     o->seed_emit_order = SEED_ORDER_OFF;  // byte-identical default
     o->smem_dedup  = 0;   // off by default -> byte-identical to baseline; opt-in via --smem-dedup
     o->alnreg_sort_fast = 0;  // off by default -> bwa-mem2's dedup sort (see mem_sort_dedup_patch); set by --fast
-    o->skip_contained_ext = 0;   // off by default; opt-in via --skip-contained-ext (byte-identical)
+    o->skip_contained_ext = 1;   // on by default: the two-wave contained-seed skip is byte-identical to the reference extension path (all read lengths, --meth included); --keep-contained-ext (and --compat) opt out to that reference path
     o->band_start  = 0;   // off by default (adaptive chain-geometry band); opt-in via --adaptive-band
     o->band_cert   = 1;   // on by default: sound (byte-identical) adaptive band via per-pair tie-break certificate
     o->split_width = 10;

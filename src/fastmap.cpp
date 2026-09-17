@@ -1537,7 +1537,8 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "    --dedup-reads STR  whole-read-pair memoization: 'off', 'on', or 'auto' (measure the duplicate rate and net benefit at runtime, latch, and periodically re-probe); aligns once per distinct pair within a chunk and replays the per-read SAM stage, so alignment records are byte-identical in every mode. Benefits amplicon/UMI panels with PCR duplicates; ~no effect on WGS/exome [auto]\n");
     fprintf(stderr, "    --ks-dedup STR  cross-read SA-interval dedup: 'off', 'on' (resolve each distinct (k,s) suffix-array interval once per SA-resolve chunk and copy the coordinates to the reads that repeat it), or 'auto' (measure net benefit at runtime, latch, and periodically re-probe); alignment records byte-identical in every mode [auto]\n");
     fprintf(stderr, "    --huge-pages  back the index with 1 GB huge pages via mimalloc when the host has enough free 1 GB pages reserved; cuts dTLB misses in seeding; Linux only, alignment records byte-identical (only @PG CL differs, recording the flag), safe no-op otherwise [off]\n");
-    fprintf(stderr, "    --skip-contained-ext  skip banded-SW extension of seeds contained (same diagonal) in a longer in-chain seed once the post-extension containment purge confirms them; byte-identical on all read lengths, including under --meth [off]\n");
+    fprintf(stderr, "    --keep-contained-ext  opt out of the default contained-seed extension skip and run the reference extension path instead. By default a seed contained (same diagonal) in a longer in-chain seed has its banded-SW extension skipped once the post-extension containment purge confirms it; the skip is byte-identical to the reference path on all read lengths, including under --meth, so this flag only removes the speedup. Escape hatch / bit-exact A-B handle against older binaries; --compat implies it [%s]\n", opt->skip_contained_ext? "off":"on");
+    fprintf(stderr, "    --skip-contained-ext  DEPRECATED, accepted no-op: contained-seed skipping is now the default; pass --keep-contained-ext to opt out\n");
     fprintf(stderr, "    --max-extend-chains INT  cap chains extended per read to the top-INT by weight; ~23%% less alignment CPU, high-confidence placement unaffected; ignored for reads with >4096 chains; opt-in, NOT byte-identical (0 = off) [%d]\n", opt->max_extend_chains);
     fprintf(stderr, "    --adaptive-band  adaptive banded-SW: start tight and expand each pair to its chain-geometry band on long-extension reads; ~1.3x on medium reads (SBX ~240bp), no-op on short reads; kilobase-scale HiFi/ONT do not run at default settings; opt-in, NOT byte-identical [%s]\n", opt->band_start? "on":"off");
     fprintf(stderr, "    --no-adaptive-band  disable adaptive banded-SW (exact, byte-identical full-width extension; also disables the certified band); overrides --adaptive-band and the --adaptive-band that --fast enables\n");
@@ -1568,11 +1569,11 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "    --hic         map Hi-C reads; equivalent to -5SP (note: -P alone still runs\n");
     fprintf(stderr, "                  mate rescue -- use --hic or -5SP to skip it too) [off]\n");
     fprintf(stderr, "    --fast        speed preset: -m 10 -y 0 --min-ext-len 30 --smem-dedup --rescue-kmer=6\n");
-    fprintf(stderr, "                  --skip-contained-ext --max-extend-chains 20 --adaptive-band\n");
+    fprintf(stderr, "                  --max-extend-chains 20 --adaptive-band\n");
     fprintf(stderr, "                  --extend-mate-concordant --extend-tie-frac 0.95 --extend-tie-floor 1\n");
     fprintf(stderr, "                  --extend-csub (under --meth: --max-extend-chains 10, -s 2). Opt-in; explicit\n");
-    fprintf(stderr, "                  flags override where applicable; --smem-dedup,\n");
-    fprintf(stderr, "                  --skip-contained-ext and --adaptive-band are enabled\n");
+    fprintf(stderr, "                  flags override where applicable; --smem-dedup and\n");
+    fprintf(stderr, "                  --adaptive-band are enabled\n");
     fprintf(stderr, "                  (pass --no-adaptive-band to keep exact extension under --fast).\n");
     fprintf(stderr, "                  Also switches the alignment-region dedup sort to a strict\n");
     fprintf(stderr, "                  total order (faster, but resolves equal-end-position ties\n");
@@ -1596,6 +1597,8 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "                  change alignments/MAPQ (--smem-dedup, --adaptive-band, --max-extend-chains,\n");
     fprintf(stderr, "                  --min-ext-len, --rescue-kmer, --seed-order); --fast and --meth are\n");
     fprintf(stderr, "                  always refused. Override the forceable ones with --compat-allow-divergent.\n");
+    fprintf(stderr, "                  Also runs the reference contained-seed extension path (implies\n");
+    fprintf(stderr, "                  --keep-contained-ext; the default skip is byte-identical to it).\n");
     fprintf(stderr, "                  [off]\n");
     fprintf(stderr, "    --compat-allow-divergent  downgrade that refusal to a warning: keep the target's\n");
     fprintf(stderr, "                  output conventions while still running a bwa-mem3-only lever. Output is\n");
@@ -1847,6 +1850,8 @@ int main_mem(int argc, char *argv[])
      * separately so the opt-out beats both an explicit --adaptive-band (either
      * order) and the --adaptive-band that --fast would otherwise turn on. */
     int          no_adaptive_band          = 0;
+    int          keep_contained_ext        = 0;   /* --keep-contained-ext seen: sticky opt-out, wins over
+                                                   * the deprecated --skip-contained-ext in either order */
     /* --cohort-slices: how many geometric slices to read the FIRST batch in, so
      * compute can start before the whole batch has been read. Byte-identical --
      * the batch (pestat cohort) boundary is unchanged, only the physical read
@@ -1985,7 +1990,8 @@ int main_mem(int argc, char *argv[])
         OPT_SMEM_DEDUP,
         OPT_FAST,
         OPT_HUGE_PAGES,
-        OPT_SKIP_CONTAINED_EXT,
+        OPT_SKIP_CONTAINED_EXT,   /* deprecated no-op (skipping is the default) */
+        OPT_KEEP_CONTAINED_EXT,
         OPT_ADAPTIVE_BAND,
         OPT_NO_ADAPTIVE_BAND,
         OPT_NO_BAND_CERT,
@@ -2023,6 +2029,7 @@ int main_mem(int argc, char *argv[])
         {"fast",                     no_argument,       0, OPT_FAST},
         {"huge-pages",               no_argument,       0, OPT_HUGE_PAGES},
         {"skip-contained-ext",       no_argument,       0, OPT_SKIP_CONTAINED_EXT},
+        {"keep-contained-ext",       no_argument,       0, OPT_KEEP_CONTAINED_EXT},
         {"adaptive-band",            no_argument,       0, OPT_ADAPTIVE_BAND},
         {"no-adaptive-band",         no_argument,       0, OPT_NO_ADAPTIVE_BAND},
         {"no-band-cert",             no_argument,       0, OPT_NO_BAND_CERT},
@@ -2637,7 +2644,20 @@ int main_mem(int argc, char *argv[])
                 return 1;
             }
         }
-        else if (c == OPT_SKIP_CONTAINED_EXT) opt->skip_contained_ext = 1;
+        else if (c == OPT_SKIP_CONTAINED_EXT) {
+            /* Deprecated, kept so existing command lines still parse. Contained-seed
+             * skipping is the mem_opt_init default now, so this only re-asserts it
+             * (unless --keep-contained-ext was also given, which wins). Always
+             * printed: the notice is the whole point of keeping the option. */
+            if (!keep_contained_ext) opt->skip_contained_ext = 1;
+            fprintf(stderr, "[W::%s] --skip-contained-ext is deprecated: contained-seed skipping "
+                    "is now the default; pass --keep-contained-ext to opt out\n", __func__);
+        }
+        else if (c == OPT_KEEP_CONTAINED_EXT) { keep_contained_ext = 1; opt->skip_contained_ext = 0; }  /* reference
+                                                               * extension path (no contained-seed
+                                                               * deferral); byte-identical to the
+                                                               * default, only slower. Escape hatch
+                                                               * + bit-exact A/B vs older binaries. */
         else if (c == OPT_ADAPTIVE_BAND) { if (!no_adaptive_band) opt->band_start = ADAPTIVE_BAND_START; opt->band_cert = 0; }
         else if (c == OPT_NO_ADAPTIVE_BAND) { no_adaptive_band = 1; opt->band_start = 0; opt->band_cert = 0; }  /* disable adaptive
                                                                * banding entirely: aggressive band off
@@ -2881,7 +2901,7 @@ int main_mem(int argc, char *argv[])
     } else update_a(opt, &opt0);
 
     /* --fast: one-flag shorthand for the characterized speed levers
-     *   -m 10  -y 0  --min-ext-len 30  --smem-dedup  --skip-contained-ext
+     *   -m 10  -y 0  --min-ext-len 30  --smem-dedup
      *   --max-extend-chains 20  --adaptive-band  --extend-mate-concordant
      *   --extend-tie-frac 0.95  --extend-tie-floor 1  --extend-csub
      *   (under --meth: --max-extend-chains 10 and also adds -s 2),
@@ -2890,13 +2910,12 @@ int main_mem(int argc, char *argv[])
      *   below and the comparator commentary in src/bwamem.cpp.
      * Mirrors the -x preset: each lever is applied only when the user did not
      * set it explicitly (opt0), so explicit flags win where applicable. The
-     * exceptions are --smem-dedup, --skip-contained-ext and the dedup sort,
-     * which are plain on/off booleans forced on unconditionally (no opt-out
-     * flag exists; the dedup sort has no flag at all).
-     * --skip-contained-ext is byte-identical on all read lengths, under --meth
-     * included (it defers contained seeds past the main extension batch and
-     * skips only those the real post-extension purge confirms; see bwamem.cpp),
-     * so forcing it on here is safe for --fast --meth too.
+     * exceptions are --smem-dedup and the dedup sort, which are plain on/off
+     * booleans forced on unconditionally (no opt-out flag exists; the dedup
+     * sort has no flag at all).
+     * The contained-seed extension skip is NOT a --fast lever: it is the
+     * byte-identical default (see mem_opt_init), so --fast neither sets nor
+     * reports it, and --fast --keep-contained-ext keeps the user's opt-out.
      * Output is NOT byte-identical to the default; divergence is confined to the
      * low-confidence tail (see docs/best-practices/settings-profiles.md).
      * meth_mode is already resolved here (parsed in the getopt loop above). */
@@ -2956,6 +2975,11 @@ int main_mem(int argc, char *argv[])
      * an explicit off-value (e.g. --extend-tie-frac 0) is the byte-identical
      * off-state and must not trip the guard.
      *
+     * The contained-seed extension skip (skip_contained_ext, on by default) is
+     * deliberately NOT a row: it is byte-identical to the reference extension
+     * path, and --compat pins the reference path below regardless, so there is
+     * nothing to refuse and nothing for --compat-allow-divergent to allow.
+     *
      * Riders deliberately NOT listed (each is a no-op unless a lever that IS
      * listed is also engaged, so the listed lever already guards them):
      *  - --extend-csub / --extend-mate-concordant : only bite once a chain is
@@ -2984,7 +3008,6 @@ int main_mem(int argc, char *argv[])
             { opt->rescue_kmer != 0,                  "--rescue-kmer" },
             { opt->supp_rep_hard_cap != 0,            "--supp-rep-hard-cap" },
             { opt->seed_emit_order != SEED_ORDER_OFF, "--seed-order" },
-            { opt->skip_contained_ext != 0,           "--skip-contained-ext" },
             { chunk_cap_set && chunk_cap > 0,         "--chunk-cap" },
             { opt->proper_pair_from_emitted != 0,     "--proper-pair-from-emitted" },
         };
@@ -3042,6 +3065,14 @@ int main_mem(int argc, char *argv[])
         }
         free(joined.s);   /* NULL when nothing was appended -- free(NULL) is a no-op */
     }
+    /* --compat pins the reference extension path (as --keep-contained-ext does).
+     * The default contained-seed skip is byte-identical to it, so this changes no
+     * output; it just keeps a bit-exact-fidelity mode on the same extension code
+     * the targets run rather than on a speed lever. Applied after option parsing
+     * so it overrides the mem_opt_init default, and unconditionally, so
+     * `--compat --keep-contained-ext` (both asking for the reference path) and a
+     * deprecated `--compat --skip-contained-ext` both resolve the same way. */
+    if (compat_on) opt->skip_contained_ext = 0;
     /* --compat with an @HD in -H: WARN, do not reject. Emitted only after every
      * rejection above (--fast, --meth, and the centralized divergence guard), so
      * a run that is about to be refused does not also collect a warning about how its
@@ -3102,8 +3133,6 @@ int main_mem(int argc, char *argv[])
         opt->alnreg_sort_fast = 1;                       /* strict-total-order + pdqsort dedup sort
                                                           * (~35-55% faster for n>=9; diverges from
                                                           * bwa-mem2 on equal-`re` ties) */
-        opt->skip_contained_ext = 1;                     /* --skip-contained-ext (plain on/off;
-                                                          * byte-identical, --meth included) */
         if (!no_adaptive_band)
             opt->band_start = ADAPTIVE_BAND_START;        /* --adaptive-band: no-op on short reads
                                                           * (8-bit tier untouched), ~25% faster on
@@ -3361,15 +3390,15 @@ int main_mem(int argc, char *argv[])
          * the field is a float -- %.9g would surface the double-promotion noise
          * (0.95 -> 0.949999988); %g's 6 significant digits round-trip every
          * realistically-typed fraction cleanly. */
+        /* The contained-seed extension skip is the byte-identical default, not a
+         * --fast lever, so it is not on the audit line (which records only the
+         * output-changing levers --fast turns on). --adaptive-band applies under
+         * --meth as well, so it stays on both branches (unless opted out). */
         if (opt->meth_mode)
-            /* --skip-contained-ext is effective under --meth (the two-wave skip is
-             * byte-identical there too), so it is reported on the meth audit line like
-             * every other lever. --adaptive-band applies under --meth as well, so it
-             * stays (unless opted out). */
-            fprintf(stderr, "[M::%s] --fast: -m %d -y %ld --min-ext-len %d --smem-dedup --skip-contained-ext --max-extend-chains %d %s -s %d --extend-mate-concordant --extend-tie-frac %g --extend-tie-floor %d%s --rescue-kmer=%d%s alnreg-sort=fast\n",
+            fprintf(stderr, "[M::%s] --fast: -m %d -y %ld --min-ext-len %d --smem-dedup --max-extend-chains %d %s -s %d --extend-mate-concordant --extend-tie-frac %g --extend-tie-floor %d%s --rescue-kmer=%d%s alnreg-sort=fast\n",
                     __func__, opt->max_matesw, (long)opt->max_mem_intv, opt->min_ext_len, opt->max_extend_chains, adaptive_band_label, opt->split_width, opt->extend_tie_frac, opt->extend_tie_floor, opt->extend_csub ? " --extend-csub" : "", opt->rescue_kmer, opt->rescue_skip ? " --rescue-skip" : "");
         else
-            fprintf(stderr, "[M::%s] --fast: -m %d -y %ld --min-ext-len %d --smem-dedup --skip-contained-ext --max-extend-chains %d %s --extend-mate-concordant --extend-tie-frac %g --extend-tie-floor %d%s --rescue-kmer=%d%s alnreg-sort=fast\n",
+            fprintf(stderr, "[M::%s] --fast: -m %d -y %ld --min-ext-len %d --smem-dedup --max-extend-chains %d %s --extend-mate-concordant --extend-tie-frac %g --extend-tie-floor %d%s --rescue-kmer=%d%s alnreg-sort=fast\n",
                     __func__, opt->max_matesw, (long)opt->max_mem_intv, opt->min_ext_len, opt->max_extend_chains, adaptive_band_label, opt->extend_tie_frac, opt->extend_tie_floor, opt->extend_csub ? " --extend-csub" : "", opt->rescue_kmer, opt->rescue_skip ? " --rescue-skip" : "");
         /* --fast also caps the batch size, which keeps the read/compute/write
          * pipeline overlapped at high -t. It re-partitions the input and so is not
