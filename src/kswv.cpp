@@ -4562,23 +4562,21 @@ int kswv::kswv512_16_impl(int16_t seq1SoA[],
 /* SSE-only fallback stubs (sse41/sse42/avx tiers).
  *
  * The batched kswv kernel requires AVX2 or AVX-512BW. These methods are
- * unreachable in the shipping single-binary build for two independent reasons:
+ * unreachable in the shipping single-binary build:
  *   - Non-kernel TUs (incl. src/bwamem_pair.cpp, where the only call site
  *     mem_sam_pe_batch() lives) compile at BASELINE_ARCH, which defaults to
  *     avx2 (Makefile). A binary built with -mavx2 cannot run on a sub-AVX2
  *     CPU, so the runtime dispatcher never selects an SSE-tier kswv there.
- *   - If BASELINE_ARCH is overridden to sse41, then __AVX2__ is undefined in
- *     those TUs and BWAMEM_BATCHED_MATESW=0 (see macro.h:79-88), so the entire
- *     batched mate-rescue path is excluded at compile time and mate rescue runs
- *     through the scalar ksw_align2 path instead.
+ *   - A sub-AVX2 BASELINE_ARCH (sse41/sse42/avx) is now REFUSED by the Makefile.
+ *     The pre-AVX2 scalar mate-rescue path (mem_sam_pe/mem_matesw) was removed,
+ *     so such a build would otherwise reach these stubs; AVX2+ is the floor.
  *
- * The stubs exist only so the Ikswv vtable resolves at link time on every
- * x86 tier (sse41/sse42/avx all need getScores8/getScores16 bodies even
- * though the dispatcher never calls them). As a second line of defense the
- * mat-aware ctor (above) reports needsScalar() == true on these freed-cell-less
- * tiers, so make_kswv()'s caller routes any asymmetric (meth) pair to the
- * scalar fallback before it could ever reach these stubs. The exit() here is
- * the last-resort guard if a future change opens a runtime call site anyway.
+ * The stubs exist only so the Ikswv vtable resolves at link time on every x86
+ * kernel tier the avx2 binary still compiles for runtime dispatch (sse41/sse42/
+ * avx all need getScores8/getScores16 bodies even though the dispatcher never
+ * calls them). As a second line of defense the mat-aware ctor (above) reports
+ * needsScalar() == true on these freed-cell-less tiers. The exit() here is the
+ * last-resort guard if a future change opens a runtime call site anyway.
  */
 void kswv::getScores8(SeqPair * /*pairArray*/,
                       uint8_t * /*seqBufRef*/,

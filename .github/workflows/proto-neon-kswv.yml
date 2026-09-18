@@ -6,9 +6,7 @@ name: proto-neon-kswv
 # Job graph (fan-out / fan-in):
 #
 #   prepare ──┬─→ run-mem-arm-port ─┐
-#             ├─→ run-mem-arm-ctrl ─┤
-#             ├─→ run-mem-x86-port ─┼── report
-#             └─→ run-mem-x86-ctrl ─┘
+#             └─→ run-mem-x86-port ─┴── report
 #
 #   kswv-arm     (unit kswv test + ASan zero-rows test, off the critical path)
 #   kswv-x86     (unit kswv test + ASan zero-rows test, off the critical path)
@@ -20,20 +18,24 @@ name: proto-neon-kswv
 #                    need the holodeck binary themselves.
 #   run-mem-*      — build bwa-mem3 (ccache + full-binary cache), restore
 #                    the chr17 FM-index (or build it on miss), run mem
-#                    N_REPS times with BAM-1 output, upload timings + (port
-#                    only) BAM.
-#   report         — fan-in: render port-vs-control perf tables per arch
-#                    and md5 the port BAM body across arches for SAM
-#                    identity.
+#                    N_REPS times with BAM-1 output, upload timings + rep1 BAM.
+#   report         — fan-in: md5 the port BAM body across arches (arm vs
+#                    x86) for cross-arch alignment-record identity.
 #   kswv-*         — independent unit tests (doctest framework, suite
 #                    "unit/kswv") + ASan zero-rows regression; share the
 #                    per-arch ccache so libbwa rebuilds (incl. the ASan
 #                    rebuild) are cheap.
 #
-# Port-vs-control timings come from different runners under this design,
-# so the speedup signal carries some inter-runner variance on top of the
-# usual rep-to-rep noise. Median of N_REPS=3 holds this within a few
-# percent in practice; bump N_REPS if a particular comparison looks flaky.
+# HISTORY (AVX2-floor change): this harness once ran a `-ctrl` A/B leg per arch
+# built with DISABLE_BATCHED_MATESW=1 to select the legacy scalar mate-rescue
+# path. That path — and the BWAMEM_BATCHED_MATESW / DISABLE_BATCHED_MATESW gate —
+# were removed when AVX2 became the x86 floor, which made the flag an unused make
+# variable and the `-ctrl` builds byte-identical to the `-port` builds. The
+# vestigial control legs and their port-vs-control perf table have been dropped.
+# What remains is the harness's OTHER output — the cross-arch md5 of the port BAM
+# body (arm vs x86), the only CI check that asserts alignment-record identity of the
+# MQ:i / HN:i / XS:i tags across arches (chr22_parity.sh strips those three tags
+# before its comparison against upstream bwa).
 
 on:
   push:
@@ -183,24 +185,12 @@ jobs:
             build_flags: ""
             binary_name: bwa-mem3.arm64
             flags_slug: port
-          - label: "run-mem-arm-ctrl"
-            runs-on: ubuntu-24.04-arm
-            arch: arm
-            build_flags: "DISABLE_BATCHED_MATESW=1"
-            binary_name: bwa-mem3.arm64
-            flags_slug: control
           - label: "run-mem-x86-port"
             runs-on: ubuntu-24.04
             arch: x86
             build_flags: ""
             binary_name: bwa-mem3  # x86 multi-arch dispatcher binary
             flags_slug: port
-          - label: "run-mem-x86-ctrl"
-            runs-on: ubuntu-24.04
-            arch: x86
-            build_flags: "DISABLE_BATCHED_MATESW=1"
-            binary_name: bwa-mem3
-            flags_slug: control
     env:
       CCACHE_DIR: /home/runner/.ccache
       CCACHE_MAXSIZE: "500M"
@@ -224,12 +214,13 @@ jobs:
       - name: Detect x86 ISA (avx2 / avx512bw)
         if: matrix.arch == 'x86'
         run: |
-          # AVX-512BW is required for the x86 batched mate-rescue path (gated
-          # by __AVX512BW__ in bwamem.cpp:1255 and bwamem_pair.cpp:657). Free
-          # GH runners typically do not expose it. When it is missing we fall
-          # back to AVX2, which takes the same scalar mem_sam_pe path as ARM
-          # — so the cross-arch SAM identity check is then testing
-          # scalar-vs-scalar, not batched-vs-scalar.
+          # Prefer AVX-512BW so the widest x86 kswv kernel is exercised; free
+          # GH runners typically do not expose it, so fall back to AVX2. Both
+          # are batched mate-rescue builds: the scalar path was removed and the
+          # batched kswv kernel now runs on every AVX2+ tier (there is no
+          # __AVX512BW__ gate any more), just as NEON does on ARM. So the
+          # cross-arch alignment-record identity check compares batched-vs-batched whichever
+          # x86 tier the runner provides.
           if grep -q avx512bw /proc/cpuinfo; then
             echo "MAKE_ARCH=avx512bw" >> "$GITHUB_ENV"
           else
@@ -245,9 +236,10 @@ jobs:
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ${{ env.CCACHE_DIR }}
-          # Per-arch ccache. Build flags don't need to participate because
-          # ccache hashes preprocessor defines (e.g. -DDISABLE_BATCHED_MATESW)
-          # via CXXFLAGS. Restore from any prior arch ccache entry.
+          # Per-arch ccache. All legs build with identical flags now (the
+          # `-ctrl` A/B legs were dropped), so a single per-arch key is exact;
+          # ccache still hashes CXXFLAGS, so any future flag split is safe too.
+          # Restore from any prior arch ccache entry.
           key: ccache-${{ runner.arch }}-${{ github.sha }}
           restore-keys: |
             ccache-${{ runner.arch }}-
@@ -337,10 +329,10 @@ jobs:
           retention-days: 1
 
   report:
-    name: report (perf table + cross-arch SAM identity)
+    name: report (cross-arch SAM identity)
     needs: run-mem
     runs-on: ubuntu-24.04
-    # Downloads artifacts, renders tables, and md5s two sorted BAMs; quick.
+    # Downloads the port BAMs and md5s two sorted BAMs; quick.
     timeout-minutes: 10
     steps:
       - name: Install apt dependencies
@@ -351,60 +343,6 @@ jobs:
         with:
           path: /tmp/results
           pattern: results-*
-
-      - name: Render perf tables
-        run: |
-          extract_elapsed() {
-            awk '/Elapsed \(wall clock\) time/ { split($NF, t, ":"); if (length(t)==3) print t[1]*3600+t[2]*60+t[3]; else print t[1]*60+t[2] }' "$1"
-          }
-          # Generalized median: works for any N_REPS (odd or even). The
-          # header comment encourages bumping N_REPS for noisy comparisons,
-          # so this helper must not assume N=3. Picks the middle element
-          # (index = (N+1)/2, integer-truncated) of the sorted samples,
-          # i.e. the lower middle for even N — same convention as N=3.
-          median() {
-            sort -n "$1" | awk '
-              { a[NR] = $1 }
-              END {
-                if (NR == 0) exit 1
-                print a[int((NR + 1) / 2)]
-              }
-            '
-          }
-
-          report_arch() {
-            arch="$1"
-            port_dir="/tmp/results/results-${arch}-port-time"
-            ctrl_dir="/tmp/results/results-${arch}-control-time"
-            port_elapsed="/tmp/${arch}.port.elapsed"
-            ctrl_elapsed="/tmp/${arch}.ctrl.elapsed"
-            [ -d "$port_dir" ] && [ -d "$ctrl_dir" ] || { echo "missing $arch results"; return 1; }
-            echo "## ${arch} perf A/B (port vs control, DISABLE_BATCHED_MATESW)"
-            echo ""
-            echo "| rep | port (s) | control (s) |"
-            echo "| --- | --------:| -----------:|"
-            : > "$port_elapsed"
-            : > "$ctrl_elapsed"
-            for rep in $(seq 1 "$N_REPS"); do
-              p=$(extract_elapsed "${port_dir}/port.rep${rep}.time")
-              c=$(extract_elapsed "${ctrl_dir}/control.rep${rep}.time")
-              echo "| $rep | $p | $c |"
-              echo "$p" >> "$port_elapsed"
-              echo "$c" >> "$ctrl_elapsed"
-            done
-            pm=$(median "$port_elapsed")
-            cm=$(median "$ctrl_elapsed")
-            echo ""
-            echo "median port: ${pm}s, median control: ${cm}s"
-            if [ -n "$pm" ] && [ -n "$cm" ] && [ "$pm" != "0" ]; then
-              speedup=$(awk -v p="$pm" -v c="$cm" 'BEGIN { printf "%.2f", c/p }')
-              pct=$(awk -v p="$pm" -v c="$cm" 'BEGIN { printf "%+.1f%%", 100*(c-p)/c }')
-              echo "speedup (control / port): ${speedup}x  (${pct})"
-            fi
-            echo ""
-          }
-
-          { report_arch arm; report_arch x86; } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Cross-arch SAM identity (port-arm vs port-x86)
         run: |
@@ -424,7 +362,7 @@ jobs:
             echo "## Cross-arch SAM identity"
             echo ""
             echo "- ARM (port, NEON batched mate-rescue): \`$arm_md5\`"
-            echo "- x86 (port, batched on AVX-512BW / scalar on AVX2): \`$x86_md5\`"
+            echo "- x86 (port, batched mate-rescue on AVX2 / AVX-512BW): \`$x86_md5\`"
             echo ""
             if [ "$arm_md5" = "$x86_md5" ]; then
               echo "PASS: byte-identical sorted SAM body across arches."

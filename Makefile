@@ -493,24 +493,12 @@ STANDALONE_TESTS_IN_TEST_TARGET = $(filter-out shm_pack_round_trip_test,$(STANDA
 
 # Architecture-specific builds (x86 only, ARM uses default from above)
 ifeq ($(IS_ARM),)
-ifeq ($(arch),sse41)
-	ifeq ($(CXX), icpc)
-		ARCH_FLAGS=-msse4.1
-	else
-		ARCH_FLAGS=-msse -msse2 -msse3 -mssse3 -msse4.1
-	endif
-else ifeq ($(arch),sse42)
-	ifeq ($(CXX), icpc)
-		ARCH_FLAGS=-msse4.2
-	else
-		ARCH_FLAGS=-msse -msse2 -msse3 -mssse3 -msse4.1 -msse4.2
-	endif
-else ifeq ($(arch),avx)
-	ifeq ($(CXX), icpc)
-		ARCH_FLAGS=-mavx ##-xAVX
-	else
-		ARCH_FLAGS=-mavx
-	endif
+# Pre-AVX2 x86 tiers (sse41/sse42/avx) were retired: the batched mate-rescue
+# kernels require AVX2+, and the scalar (pre-AVX2) mate-rescue fallback was
+# removed. Building one now would link the SSE kswv exit() stubs and abort at
+# runtime, so refuse it at configure time with a clear message.
+ifneq ($(filter $(arch),sse41 sse42 avx),)
+    $(error arch=$(arch) is no longer supported: batched mate-rescue needs AVX2+ (the pre-AVX2 scalar path was removed); build with arch=avx2 [default], avx512bw, or arm64)
 else ifeq ($(arch),avx2)
 	ifeq ($(CXX), icpc)
 		ARCH_FLAGS=-march=core-avx2 #-xCORE-AVX2
@@ -559,12 +547,27 @@ else ifeq ($(arch),avx512bw)
 	endif
 else ifeq ($(arch),native)
 	ARCH_FLAGS=-march=native
+	ARCH_CHECK_AVX2=1
 else ifneq ($(arch),)
 # To provide a different architecture flag like -march=core-avx2.
 	ARCH_FLAGS=$(arch)
+	ARCH_CHECK_AVX2=1
 else
 myall:single
 DEFAULT_BUILD_GOAL = myall
+endif
+# arch=native and raw custom arch flags bypass the named-tier floor guard above,
+# so a sub-AVX2 selection (arch=-msse4.1, or arch=native on a pre-AVX2 build
+# host) would compile a build whose host-floor precheck accepts a sub-AVX2 host
+# and then dispatch batched mate-rescue into the SSE-only kswv exit() stubs. The
+# named avx2/avx512bw branches are known-good and the default build floors its
+# non-kernel TUs via BASELINE_ARCH, so probe only these two escape hatches:
+# refuse any selected ARCH_FLAGS that does not define __AVX2__.
+ifeq ($(ARCH_CHECK_AVX2),1)
+    ARCH_DEFINES_AVX2 := $(shell $(CXX) $(ARCH_FLAGS) -dM -E -x c++ /dev/null 2>/dev/null | grep -c '__AVX2__')
+    ifneq ($(ARCH_DEFINES_AVX2),1)
+        $(error arch=$(arch) does not enable AVX2: batched mate-rescue needs AVX2+ (the pre-AVX2 scalar path was removed); build with arch=avx2 [default], avx512bw, arm64, or a custom flag that enables AVX2)
+    endif
 endif
 endif
 
@@ -650,15 +653,8 @@ ifneq ($(COVERAGE),)
     LDFLAGS       += --coverage
 endif
 
-# Control build flag for the batched mate-rescue SW port on ARM.
-# When set (e.g. `make arm64 DISABLE_BATCHED_MATESW=1`), the source gate for
-# the new batched path falls through to the legacy scalar mem_sam_pe. Used by
-# the proto-neon-kswv CI to A/B the same commit with the port on vs. off.
-# Pass the caller-supplied value through verbatim so `DISABLE_BATCHED_MATESW=0`
-# still selects the batched path (ifdef would be true even for =0).
-ifneq ($(strip $(DISABLE_BATCHED_MATESW)),)
-    CPPFLAGS += -DDISABLE_BATCHED_MATESW=$(DISABLE_BATCHED_MATESW)
-endif
+# (The DISABLE_BATCHED_MATESW control flag was removed with the scalar
+# mate-rescue path: mate rescue is always the batched SIMD kernel now.)
 
 # $(STANDALONE_TESTS) is deliberately NOT listed here: those names are real
 # linked executables with real prerequisites, and GNU Make treats a .PHONY file
@@ -777,14 +773,14 @@ src/main.o: src/version.h
 src/fastmap.o: src/version.h
 
 # Baseline ISA tier for non-kernel TUs in the x86 single-binary build.
-# Defaults to avx2: every host that runs bwa-mem3 in practice has AVX2
-# (Haswell, 2013+; any host with AVX-512 also has AVX2), and dropping the
-# baseline below avx2 measurably slows hot non-kernel paths (chain
-# extension, FMI BWT walks, mate scoring) because the compiler can no
-# longer auto-vectorize them at 256-bit width. Override to sse41 (or
-# sse42, avx) for vintage hardware; the per-tier kernel objects are still
-# compiled at every tier regardless, so kernel dispatch on lower-tier
-# hosts continues to work.
+# avx2 is the minimum (and default): every host that runs bwa-mem3 in
+# practice has AVX2 (Haswell, 2013+; any host with AVX-512 also has AVX2),
+# and the batched mate-rescue kernels require AVX2+ (the pre-AVX2 scalar
+# fallback was removed), so a sub-AVX2 baseline is refused at configure
+# time (see the arch= guard above). Override to avx512bw to raise the
+# baseline; the per-tier kernel objects are still compiled at every tier
+# regardless, so kernel dispatch across avx2/avx512bw hosts continues to
+# work.
 BASELINE_ARCH ?= avx2
 
 # Single-binary multi-tier build. All kernel TUs are compiled at every
@@ -822,12 +818,12 @@ $(EXE):$(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) $(if $(filter 1,$(USE_MIMALLOC)),$(
 # asan the write is reported directly.
 #
 # On x86 multi-tier builds, libbwa.a's baseline kswv.o is compiled at the
-# BASELINE_ARCH tier (avx2 by default; sse41 if overridden, in which case
-# the SSE-only stub that calls exit() would fire). Compile a separate
-# native-tier copy of kswv.cpp (src/kswv.native.o) and link it ahead of
-# libbwa.a so the linker picks the host's native-ISA concrete kswv class
-# regardless of BASELINE_ARCH. On arm64 -march=native resolves to the NEON
-# path already covered by the baseline objects.
+# BASELINE_ARCH tier (avx2 by default, avx512bw if overridden), so on a
+# host above the baseline it would not exercise the host's widest kswv.
+# Compile a separate native-tier copy of kswv.cpp (src/kswv.native.o) and
+# link it ahead of libbwa.a so the linker picks the host's native-ISA
+# concrete kswv class regardless of BASELINE_ARCH. On arm64 -march=native
+# resolves to the NEON path already covered by the baseline objects.
 src/kswv.native.o: src/kswv.cpp
 	$(CXX) -c $(BASE_CXXFLAGS) -march=native $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
 
@@ -1437,8 +1433,9 @@ docs-install-tools:
 #   make pgo-use PGO_ARCH=avx2 PGO_PROFILE_DIR=/path/to/regimeA
 #
 # PGO_ARCH accepts the same values as the top-level `arch=` knob: arm64,
-# sse41, sse42, avx, avx2, avx512, avx512bw, native, or any custom flag
-# string. Defaults match the host: arm64 on Apple Silicon / aarch64,
+# avx2, avx512, avx512bw, native, or any custom flag string that enables
+# AVX2+ (the pre-AVX2 sse41/sse42/avx tiers are rejected by the arch floor).
+# Defaults match the host: arm64 on Apple Silicon / aarch64,
 # native otherwise. Output binaries are arch-suffixed when PGO_ARCH is
 # non-default, so multiple per-arch builds coexist:
 #   PGO_ARCH=arm64  -> bwa-mem3.pgo-instr,    bwa-mem3.pgo

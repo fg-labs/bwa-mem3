@@ -62,13 +62,7 @@ Grep for `SIMD runtime:` to record the tier each job ran at — useful for post-
 
 ## Pre-Haswell hosts
 
-If your fleet really must include pre-Haswell x86 (c4, m4, pre-Skylake Xeons), rebuild with a lower floor:
-
-```bash
-make BASELINE_ARCH=sse41
-```
-
-Expect roughly 10-15% slower wall time on AVX2 hosts in the same container compared to a default `BASELINE_ARCH=avx2` build. This is the trade-off for broader host coverage; only do it if you actually need pre-Haswell support.
+Pre-Haswell x86 (c3, m3, and pre-Haswell Xeons without AVX2) is **not supported**. AVX2 is the minimum SIMD floor: the batched mate-rescue kernels require AVX2+, the pre-AVX2 scalar fallback was removed, and the Makefile refuses `BASELINE_ARCH` values below `avx2` at configure time. Exclude pre-Haswell instance families from any fleet that runs bwa-mem3.
 
 The default `BASELINE_ARCH=avx2` covers virtually every modern compute environment. AWS, GCP, and Azure all default to Haswell-or-newer instance types in current-generation compute environments.
 
@@ -81,8 +75,8 @@ If a job is scheduled onto a host that doesn't meet the build's floor (e.g. an `
 instructions in non-kernel translation units. The host CPU does not support
 avx2 (detected: sse42). Running would SIGILL on the first avx2 instruction.
 
-To run on this host, rebuild bwa-mem3 with BASELINE_ARCH=sse42 (or lower),
-or use a binary built for a lower SIMD floor.
+bwa-mem3's lowest supported floor is BASELINE_ARCH=avx2; this host is below
+avx2 and cannot run bwa-mem3.
 ```
 
 This is a clean failure: the job exits before any billable alignment work starts. Compare to the alternative without the precheck (SIGILL deep inside an alignment job, opaque process death, wasted compute).

@@ -47,21 +47,27 @@ HOST_TIER="$(printf '%s\n' "$HOST_TIER_RAW" | sed -n 's/.*SIMD tier: \([a-z0-9]*
 # sse41/sse42/avx are DELIBERATELY ABSENT. There is no batched kswv kernel below
 # AVX2: src/kswv.cpp's SSE-only getScores8/getScores16 are stubs that
 # exit(EXIT_FAILURE). On a multi-tier build the main TUs are compiled at
-# BASELINE_ARCH (avx2 by default), so BWAMEM_BATCHED_MATESW is 1 and
-# mem_sam_pe_batch_run calls those stubs the moment a pair needs mate rescue.
+# BASELINE_ARCH (avx2 by default), and the batched mate-rescue path is the only
+# one there (the scalar pre-AVX2 fallback was removed), so mem_sam_pe_batch_run
+# calls those stubs the moment a pair needs mate rescue.
 # Forcing any of those three tiers on paired-end input therefore kills the
 # aligner: exit 1, one [E::getScores8] per thread, header-only SAM. Measured
 # 2026-07-26 on a c7i.4xlarge, all three tiers, hg38 + 32k pairs.
 #
-# This is not a user-facing gap. Those tiers are unreachable in production --
-# a default build refuses to start below its floor (the simd_dispatch.cpp host
-# precheck, covered by host_floor_enforce.sh), and a genuine pre-AVX2 user
-# builds BASELINE_ARCH=sse41, which compiles BWAMEM_BATCHED_MATESW to 0 and
-# takes the correct scalar mem_sam_pe path. That low-baseline build is covered:
-# CI builds it and runs chr22_parity.sh on it, asserting byte-identity against
-# bwa itself -- as it does for the avx2 and arm64 builds, so the three builds
-# agree with each other transitively. That is a stronger oracle than this
-# script's self-comparison, and it is where cross-build parity actually lives.
+# This is not a user-facing gap. Pre-AVX2 x86 (sse41/sse42/avx) is no longer a
+# supported tier: the batched mate-rescue kernels require AVX2+, the scalar
+# (pre-AVX2) mate-rescue fallback was removed, and the Makefile now refuses
+# BASELINE_ARCH<avx2 at configure time (so no crashing binary can be built). A
+# default build also refuses to start below its floor (the simd_dispatch.cpp
+# host precheck, covered by host_floor_enforce.sh). The supported tiers
+# (avx2/avx512bw and arm64) are each run through chr22_parity.sh, asserting
+# byte-identity against bwa itself, so the builds agree transitively -- a
+# stronger oracle than this script's self-comparison, and where cross-build
+# parity actually lives. Caveat on scope: chr22_parity.sh strips MQ:i, HN:i,
+# and XS:i before its diff against bwa (see proto-neon-kswv.yml), so that
+# transitive cross-build claim does NOT cover those three emitted tags. This
+# script compares the FULL, unstripped SAM record, so it is what establishes
+# equality of MQ:i/HN:i/XS:i across a single build's reachable tiers.
 #
 # What remains here is the reachable-tier question: one binary, on one host,
 # must produce the same SAM whichever of its usable kernels it dispatches.

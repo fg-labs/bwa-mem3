@@ -108,15 +108,20 @@ release PR** (merging it is what tags and publishes the release — see
 
 - [ ] `make clean && make` succeeds at the default `BASELINE_ARCH`
       (`avx2`) on a Linux x86_64 host.
-- [ ] `make clean && make BASELINE_ARCH=sse41` succeeds on the same
-      host — confirms the portability floor still compiles.
+- [ ] `make clean && make BASELINE_ARCH=avx512bw` succeeds on the same
+      host — confirms the raised baseline compiles.
+- [ ] `make arch=sse41` is refused at configure time with the AVX2-floor
+      error — confirms the floor guard holds (see `avx2-floor-lint` in CI).
 - [ ] `make clean && make` succeeds on an arm64 host (Apple Silicon
       or aarch64 Linux).
 - [ ] `make test` passes on both x86_64 and arm64.
 - [ ] `test/regression/all_tiers_parity.sh` produces byte-identical
-      SAM across `BWAMEM3_FORCE_TIER=sse41 → sse42 → avx → avx2 → avx512bw`
-      on an AVX-512BW host. Failures here indicate a per-tier kernel
-      or dispatcher-wiring regression — fix before tagging.
+      SAM across `BWAMEM3_FORCE_TIER=avx2 → avx512bw` on an x86_64
+      AVX-512BW host, single-threaded (`-t 1`, so batch composition is
+      fixed), against the script's own reference + read fixture (sub-AVX2
+      tiers have no batched kswv kernel and are excluded).
+      Failures here indicate a per-tier kernel or dispatcher-wiring
+      regression — fix before tagging.
 
 ### Bench
 

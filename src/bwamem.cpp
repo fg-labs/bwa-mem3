@@ -3908,34 +3908,8 @@ static void worker_sam(void *data, int seqid, int batch_size, int tid)
         int end = seqid + batch_size;
         int pos = start >> 1;
 
-#if !BWAMEM_BATCHED_MATESW
-        // Scalar mem_sam_pe path. Selected when no SIMD kswv kernel is
-        // available (e.g. plain SSE2/AVX2 x86 builds, or forced via
-        // DISABLE_BATCHED_MATESW=1 for the proto-neon-kswv CI A/B).
-        for (int i=start; i< end; i+=2)
-        {
-            // orig mem_sam_pe() function
-            /* D3 (--meth, PR-3): pairing + mate rescue run in ORIGINAL coords
-             * (anchors already remapped). mem_aln_bns/pac return the original
-             * bns/pac in --meth; the seed/normal index otherwise. This is where
-             * the mate-rescue coordinate reconciliation (6a) lands: mem_matesw's
-             * window math derives l_pac from bns->l_pac, so passing original
-             * bns/pac fixes the doubled-pac↔real-chrom mismatch.
-             * D3 (--meth, PR-6): mem_pair_resolve now drives mem_matesw with the
-             * ORIGINAL mate bases (s[!i].meth_orig_seq) + the OPPOSITE-strand
-             * asymmetric matrix of the anchor; the rescued mate's meth_hypothesis
-             * is set to !anchor. (This scalar mem_sam_pe path is selected only
-             * when no batched kswv kernel is available.) */
-            mem_sam_pe(w->opt, mem_aln_bns(w),
-                       mem_aln_pac(w), w->pes,
-                       (w->n_processed >> 1) + pos++,   // check!
-                       &w->seqs[i],
-                       &w->regs[i]);
-
-            free(w->regs[i].a);
-            free(w->regs[i+1].a);
-        }
-#else   // re-structured
+        // Batched mate-rescue SW (mem_sam_pe_batch_pre/run/post -> kswv). The
+        // legacy scalar mem_sam_pe path was removed with the pre-AVX2 tiers.
         // pre-processing
         // uint64_t tim = __rdtsc();
         int32_t maxRefLen = 0, maxQerLen = 0;
@@ -3998,7 +3972,6 @@ static void worker_sam(void *data, int seqid, int batch_size, int tid)
         }
         //tprof[SAM3][tid] += __rdtsc() - tim;
         _mm_free(aln);  // kswr_t
-#endif
     }
     else
     {

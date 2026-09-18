@@ -40,13 +40,15 @@ non-kernel TU is compiled once at the `BASELINE_ARCH` tier.
 
 ```bash
 make BASELINE_ARCH=avx512bw       # for an AVX-512BW-only fleet
-make BASELINE_ARCH=sse41          # for pre-Haswell hosts (~10–15% slower on AVX2)
 ```
 
-Lowering `BASELINE_ARCH` reduces the supported host floor and is the
-documented escape hatch for vintage hardware. Raising it locks the
-binary to that host class and disables the host-floor precheck for
-lower tiers. The `bwa-mem3 version` banner prints the resulting
+`avx2` is the minimum baseline: the batched mate-rescue kernels require
+AVX2+ and the pre-AVX2 scalar fallback was removed, so `BASELINE_ARCH`
+values below `avx2` (`sse41` / `sse42` / `avx`) are refused at configure
+time. Raising it to `avx512bw` locks the binary to that host class: the
+host-floor precheck then refuses any host below AVX-512BW with exit code 2
+(only `version` and help invocations bypass the refusal). The `bwa-mem3 version`
+banner prints the resulting
 `SIMD floor:` line so operators can confirm the build matches the
 intended deployment surface — see
 [Host requirements](../getting-started/host-requirements.md) and
@@ -97,7 +99,7 @@ Two environment variables exposed at runtime:
 
 | Variable | Behavior |
 |---|---|
-| `BWAMEM3_FORCE_TIER=<tier>` | Force the dispatcher to use `<tier>` (one of `sse41` `sse42` `avx` `avx2` `avx512bw`). **Downgrade-only:** requests above the detected host tier (which would SIGILL on the first wider instruction) and unrecognized names are rejected with a stderr warning and the dispatcher falls back to the detected tier. Replaces the prior "exec the `bwa-mem3.sse41` binary" pattern for A/B regression testing on AVX-512 hosts. |
+| `BWAMEM3_FORCE_TIER=<tier>` | Force the dispatcher to use `<tier>` (one of `sse41` `sse42` `avx` `avx2` `avx512bw`). **Downgrade-only:** requests above the detected host tier (which would SIGILL on the first wider instruction) and unrecognized names are rejected with a stderr warning and the dispatcher falls back to the detected tier. **Sub-AVX2 (`sse41`/`sse42`/`avx`) is unsupported for real subcommands:** those tiers have no batched mate-rescue kernel, so the host-floor precheck refuses `mem` (and every non-`version`/help subcommand) with exit 2 rather than aborting mid-run in the `kswv` stubs. Forcing a sub-AVX2 tier is only valid for `version`/help introspection. Replaces the prior "exec the `bwa-mem3.sse41` binary" pattern for A/B regression testing on AVX-512 hosts (use `avx2`/`avx512bw` targets). |
 | `BWAMEM3_DEBUG_SIMD=1` | Print a one-line `[I::bwamem3_simd_init_body]` banner at startup naming the build baseline (`g_build_tier`), the detected host capability, and the resolved dispatch tier. Also enables the build-baseline-vs-host gap warning that PR #84 originally emitted unconditionally and PR #86 demoted to debug-only. |
 
 Both are read once during `bwamem3_simd_init()` and ignored after that
@@ -137,12 +139,22 @@ autovectorize, so it stays SIGILL-safe even when `BASELINE_ARCH=avx2`
 ## Per-tier parity validation
 
 `test/regression/all_tiers_parity.sh` runs `bwa-mem3 mem` with
-`BWAMEM3_FORCE_TIER` walking the full ladder
-(`sse41 → sse42 → avx → avx2 → avx512bw`) on the same input and
-diff's the BAM output. The expected result is byte-identical SAM
-across every tier; any divergence is a bug in either a kernel TU or
-the per-kernel factory wiring. CI runs this script on the x86 matrix
-row.
+`BWAMEM3_FORCE_TIER` walking the reachable tiers at or below the host
+(`avx2 → avx512bw` on x86, `neon` on arm64) on the same input and
+diff's the SAM output. The sub-AVX2 tiers (`sse41`, `sse42`, `avx`)
+are deliberately excluded: they have no batched `kswv` mate-rescue
+kernel, and `bwamem3_enforce_host_floor()` refuses a forced sub-AVX2
+`mem` run with `exit(2)` before any alignment, so they are not
+sweepable. For a fixed workload run at a fixed thread count (`-t`)
+and batch size (`-K`) on one x86_64 host, the expected result is
+byte-identical SAM across every swept tier on that host; any
+divergence is a bug in either a kernel TU or the per-kernel factory
+wiring. (This scopes byte identity to the swept tiers on a single
+host — it is not a cross-host or cross-arch guarantee.) On a host with
+only one sweepable tier
+(an AVX2-only x86 runner, or arm64) the script reports `SKIP:`
+rather than claiming a pass it did not earn. CI runs this script on
+the x86 matrix row.
 
 ## Trade-offs vs the prior multi-binary launcher
 

@@ -57,8 +57,9 @@ both:
 
 - `PGO_ARCH` (default: `arm64` on ARM hosts, `native` otherwise) passes
   through to the recursive `make` invocation as `arch=$(PGO_ARCH)`. Accepts
-  the same values as the rest of the Makefile: `arm64`, `sse41`, `avx2`,
-  `avx512bw`, `native`, etc.
+  the same values as the rest of the Makefile: `arm64`, `avx2`, `avx512bw`,
+  `native`, etc. (the pre-AVX2 `sse41`/`sse42`/`avx` tiers are rejected by
+  the arch floor).
 - `PGO_PROFILE_DIR` is now overridable (`?=` instead of `=`). Each
   `(arch × training-regime)` combination can capture into its own directory.
 - When `PGO_ARCH != arm64`, the output binaries are named
