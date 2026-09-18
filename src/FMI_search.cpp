@@ -1451,6 +1451,7 @@ enum BwtSeedPhase : uint8_t {
 struct LockstepBwtSeedCache {
     SMEM  *match    = nullptr;
     size_t per_slot = 0;
+    int32_t n_slots = 0;   // lockstep width the buffer was sized for
     ~LockstepBwtSeedCache() {
         if (match != nullptr) _mm_free(match);
     }
@@ -1975,21 +1976,37 @@ int64_t FMI_search::bwtSeedStrategyAllPosOneThread_lockstep(uint8_t *enc_qdb,
 {
     if (numReads <= 0) return 0;
 
-    const int32_t N = BWTSEED_LOCKSTEP_N;
+    // Runtime lockstep width (g_bwtseed_lockstep_n, resolved once at startup from
+    // the compile-time default or a BWA3_BWTSEED_LOCKSTEP_N pin). Byte-identical
+    // across widths -- batching only. The on-stack slot array is sized to the
+    // compile-time BWTSEED_LOCKSTEP_N_MAX so the runtime width can exceed the default.
+    const int32_t N = g_bwtseed_lockstep_n;
+    // slots[] is a fixed BWTSEED_LOCKSTEP_N_MAX stack array indexed in [0, N);
+    // the env parser clamps to that range, but a direct g_bwtseed_lockstep_n write
+    // (e.g. a test, or a future calibration) could exceed it -- guard the bound.
+    xassert(N >= 1 && N <= BWTSEED_LOCKSTEP_N_MAX,
+            "g_bwtseed_lockstep_n out of range [1, BWTSEED_LOCKSTEP_N_MAX]");
 
     // Per-thread cache for match_buf[] slices. One pointer (no prev[]
     // needed — bwtSeed has only a forward pass). Sized from max_readlength;
     // scalar's worst-case emit is one SMEM per x ∈ [0, readlength) so the
     // bound holds. Grown monotonically across calls.
-    BwtSeedSlot slots[BWTSEED_LOCKSTEP_N] = {};
+    BwtSeedSlot slots[BWTSEED_LOCKSTEP_N_MAX] = {};
     static thread_local LockstepBwtSeedCache cache;
     const size_t per_slot_smems = (size_t)max_readlength;
-    if (per_slot_smems > cache.per_slot) {
+    if (per_slot_smems > cache.per_slot || N > cache.n_slots) {
         if (cache.match != nullptr) _mm_free(cache.match);
-        const size_t total_bytes = (size_t)N * per_slot_smems * sizeof(SMEM);
+        // Grow on EITHER dimension: g_bwtseed_lockstep_n (N) can rise after first
+        // use (a BWA3_BWTSEED_LOCKSTEP_N pin / a future per-host calibration), and
+        // sizing only on per_slot would leave slots[N-1] pointing past the
+        // allocation. Mirrors the phase-2 SMEM cache (LockstepSmemCache) above.
+        const size_t alloc_slots = (size_t)(N > cache.n_slots ? N : cache.n_slots);
+        const size_t alloc_per   = per_slot_smems > cache.per_slot ? per_slot_smems : cache.per_slot;
+        const size_t total_bytes = alloc_slots * alloc_per * sizeof(SMEM);
         cache.match = (SMEM *)_mm_malloc(total_bytes, 64);
         assert_not_null(cache.match, total_bytes, total_bytes);
-        cache.per_slot = per_slot_smems;
+        cache.per_slot = alloc_per;
+        cache.n_slots  = (int32_t)alloc_slots;
     }
     for (int32_t s = 0; s < N; s++) {
         slots[s].match_buf = cache.match + (size_t)s * cache.per_slot;

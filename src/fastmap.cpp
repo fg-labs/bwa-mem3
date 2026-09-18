@@ -3476,9 +3476,13 @@ int main_mem(int argc, char *argv[])
      * workers spawn (policy: lockstep_width.h). Scheduling only, never output. */
     {
         const int32_t phys = bwa3_init_bwtseed_lockstep(opt->n_threads);
+        /* Resolve the lockstep WIDTH too (the compile-time default, or a
+         * BWA3_BWTSEED_LOCKSTEP_N pin): how many reads' cp_occ misses the driver
+         * overlaps. Scheduling only. */
+        bwa3_init_bwtseed_lockstep_width();
         if (bwa_verbose >= 3)
-            fprintf(stderr, "[M::%s] third-pass bwtseed lockstep: %s (threads %d, physical cores %d; 0 = unknown)\n",
-                    __func__, g_bwtseed_lockstep ? "on" : "off", opt->n_threads, phys);
+            fprintf(stderr, "[M::%s] third-pass bwtseed lockstep: %s (threads %d, physical cores %d; 0 = unknown), width %d\n",
+                    __func__, g_bwtseed_lockstep ? "on" : "off", opt->n_threads, phys, g_bwtseed_lockstep_n);
     }
 #endif
 

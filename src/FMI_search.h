@@ -86,19 +86,10 @@ typedef struct smem_sort_scratch
  * included above, alongside the runtime width g_smem_lockstep_n and the startup
  * MLP probe that resolves it. */
 
-/* Lockstep depth for the third-pass (bwtSeedStrategy) re-seeding, tuned
- * separately from the phase-2 SMEM depth above. Whether the lockstep driver
- * runs is a per-run decision (g_bwtseed_lockstep, resolved once at startup:
- * arm64 always on; x86 on iff every worker thread gets its own physical core;
- * BWA3_BWTSEED_LOCKSTEP pins it), because it only wins where nothing else hides
- * the cp_occ latency it overlaps -- see the policy in lockstep_width.h. N=8 is
- * the measured whole-aligner optimum on Graviton4 (-1.7% vs the scalar third
- * pass, -16.7% on the seeding stage). Set to 1 to compile the lockstep driver
- * out entirely (the `#if BWTSEED_LOCKSTEP_N > 1` guard) and always take the
- * scalar third-pass path. */
-#ifndef BWTSEED_LOCKSTEP_N
-#define BWTSEED_LOCKSTEP_N 8
-#endif
+/* Third-pass (bwtSeedStrategy) re-seeding lockstep width + on/off policy now live
+ * in lockstep_width.h (included above): BWTSEED_LOCKSTEP_N (compile default + the
+ * `#if BWTSEED_LOCKSTEP_N > 1` enable guard), the runtime width
+ * g_bwtseed_lockstep_n, and the on/off switch g_bwtseed_lockstep. */
 
 /* Smallest slice of an index array a parallel-load worker is given. The load is
  * memory-bandwidth bound, so below this the per-thread create/join overhead is

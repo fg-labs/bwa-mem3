@@ -207,7 +207,8 @@ int main(int argc, char *argv[]) {
         free(enc_qdb); free(seq_); free(cum_len);
     }
 
-    /* Case 3: numReads == N — steady state, no slot recycle. */
+    /* Case 3: small batch (numReads < N at the default width 24) — every read
+     * seeds its own slot, no recycle. Varied read contents. */
     {
         const char *reads[] = {
             "ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT",
@@ -219,13 +220,15 @@ int main(int argc, char *argv[]) {
         int32_t max_readlength = 64;
         uint8_t *enc_qdb; bseq1_t *seq_; int32_t *cum_len;
         encode_reads(reads, numReads, &enc_qdb, &seq_, &cum_len);
-        run_case(fmi, "Case 3: numReads == N (small)",
+        run_case(fmi, "Case 3: small batch, no recycle (varied contents)",
                  numReads, max_readlength, DEFAULT_MIN_SEED, DEFAULT_MAX_INTV,
                  enc_qdb, seq_, cum_len);
         free(enc_qdb); free(seq_); free(cum_len);
     }
 
-    /* Case 4: numReads > N — exercises the flush-then-pull-next-input recycle. */
+    /* Case 4: a larger small batch (still < N at the default width 24) — distinct
+     * read contents, no recycle here. The recycle path is exercised by Case 11r
+     * (width 8) and the default-width recycle case (Case 11s) below. */
     {
         const char *reads[] = {
             "ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT",
@@ -240,7 +243,7 @@ int main(int argc, char *argv[]) {
         int32_t max_readlength = 64;
         uint8_t *enc_qdb; bseq1_t *seq_; int32_t *cum_len;
         encode_reads(reads, numReads, &enc_qdb, &seq_, &cum_len);
-        run_case(fmi, "Case 4: numReads > N (slot recycle)",
+        run_case(fmi, "Case 4: small batch, distinct contents (no recycle)",
                  numReads, max_readlength, DEFAULT_MIN_SEED, DEFAULT_MAX_INTV,
                  enc_qdb, seq_, cum_len);
         free(enc_qdb); free(seq_); free(cum_len);
@@ -383,8 +386,8 @@ int main(int argc, char *argv[]) {
 
     /* Case 11p: phiX subsequence, many reads, exercises the
      * stepping-pass/flush interleave when emitted matches are non-empty.
-     * Same parameters as 10p, more reads to force multiple slot recycles
-     * while match_buf contents are non-trivial. */
+     * Same parameters as 10p, more reads (still < N at the default width 24, so
+     * no recycle) with non-trivial match_buf contents. */
     {
         /* 8 overlapping windows over the phiX start; each will emit
          * several seeds at min_seed_len=10 max_intv=5. */
@@ -408,10 +411,12 @@ int main(int argc, char *argv[]) {
     }
 
     /* Case 11r: numReads > N forces slot recycle on non-empty match_buf
-     * contents. With BWTSEED_LOCKSTEP_N=8, 20 reads guarantees the first 8
-     * slots retire while there are still 12 pending inputs to pull in. The
-     * recycle path must reset match_count, ready, and phase for each
-     * recycled slot without corrupting in-flight slots' state. */
+     * contents. The width is runtime (g_bwtseed_lockstep_n) and its default (24)
+     * exceeds 20, so pin it to 8 here: 20 reads then guarantees
+     * the first 8 slots retire while 12 inputs are still pending. The recycle path
+     * must reset match_count, ready, and phase for each recycled slot without
+     * corrupting in-flight slots' state. Byte-identity is width-invariant, so the
+     * pin only sharpens coverage, never the pass/fail. */
     {
         /* 20 sliding 44-bp windows over the phiX start. */
         const char *reads[20];
@@ -428,7 +433,37 @@ int main(int argc, char *argv[]) {
         int32_t max_readlength = 44;
         uint8_t *enc_qdb; bseq1_t *seq_; int32_t *cum_len;
         encode_reads(reads, numReads, &enc_qdb, &seq_, &cum_len);
+        const int32_t saved_n = g_bwtseed_lockstep_n;
+        g_bwtseed_lockstep_n = 8;   /* force numReads(20) > N to hit the recycle path */
         run_case(fmi, "Case 11r: numReads > N, slot recycle on non-empty match_buf",
+                 numReads, max_readlength, /*minSeed=*/10, /*max_intv=*/5,
+                 enc_qdb, seq_, cum_len, /*expect_min_seeds=*/20);
+        g_bwtseed_lockstep_n = saved_n;
+        free(enc_qdb); free(seq_); free(cum_len);
+    }
+
+    /* Case 11s: same slot-recycle path as 11r, but at the SHIPPED default width
+     * (no pin), so numReads must exceed the default. 30 reads > 24 forces the
+     * recycle branch at the width the binary actually runs. This is the coverage
+     * 11r's width-8 pin does not give (the recycle path at N = default). */
+    {
+        /* 30 sliding 44-bp windows over the phiX start (src is 122 bp, so a
+         * window at offset i needs i + 44 <= 122, i.e. up to i = 78 > 29). */
+        const char *reads[30];
+        const char *src =
+            "GAGTTTTATCGCTTCCATGACGCAGAAGTTAACACTTTCGGATATTTCTGATGAGTCGAAAA"
+            "ATTATCTTGATAAAGCAGGAATTACTACTGCTTGTTTACGAATTAAATCGAAGTGGACTGCT";
+        char buf[30][45];
+        for (int i = 0; i < 30; i++) {
+            memcpy(buf[i], src + i, 44);
+            buf[i][44] = '\0';
+            reads[i] = buf[i];
+        }
+        int32_t numReads = 30;
+        int32_t max_readlength = 44;
+        uint8_t *enc_qdb; bseq1_t *seq_; int32_t *cum_len;
+        encode_reads(reads, numReads, &enc_qdb, &seq_, &cum_len);
+        run_case(fmi, "Case 11s: numReads > default N, slot recycle at the shipped width",
                  numReads, max_readlength, /*minSeed=*/10, /*max_intv=*/5,
                  enc_qdb, seq_, cum_len, /*expect_min_seeds=*/20);
         free(enc_qdb); free(seq_); free(cum_len);
