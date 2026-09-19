@@ -44,6 +44,32 @@
 #error "require 1 <= SMEM_LOCKSTEP_N <= SMEM_LOCKSTEP_N_MAX <= SMEM_LOCKSTEP_N_MAX_CAP (256; stack-array storage-safe)"
 #endif
 
+/* Third-pass (bwtSeedStrategy) re-seeding lockstep WIDTH -- how many reads'
+ * forward-extension walks the driver overlaps so their cp_occ misses issue
+ * together (distinct from the on/off switch g_bwtseed_lockstep below, and from
+ * the phase-2 SMEM width above). The optimum is the core's usable memory-level
+ * parallelism; measured across five microarchitectures on a WGS slice (at
+ * threads <= physical cores, where the lockstep path runs) it converges on ~24:
+ * x86 Sapphire Rapids (~-1.8% vs 8, flat plateau to 64) and Zen 4 (peak at 24,
+ * rolls off after -- which caps a portable default at 24), ARM Graviton4
+ * (~-0.8%), and Apple M3 Ultra (~-2.2%, still improving) and M2 Max (flat, no
+ * regression). So 24 is a win or neutral everywhere and the portable default;
+ * the prior compile-time 8 was under-tuned on every architecture. Hosts that
+ * want more (SPR, M3 Ultra) are served by BWA3_BWTSEED_LOCKSTEP_N or a per-host
+ * calibration. Byte-identical across widths (batching only; the bwtseed lockstep
+ * parity harness pins the emission order). */
+#ifndef BWTSEED_LOCKSTEP_N
+#define BWTSEED_LOCKSTEP_N 24
+#endif
+/* Upper bound on the runtime width; sizes the driver's on-stack
+ * BwtSeedSlot slots[BWTSEED_LOCKSTEP_N_MAX] array and caps any pin/calibration. */
+#ifndef BWTSEED_LOCKSTEP_N_MAX
+#define BWTSEED_LOCKSTEP_N_MAX 64
+#endif
+#if !(BWTSEED_LOCKSTEP_N >= 1 && BWTSEED_LOCKSTEP_N <= BWTSEED_LOCKSTEP_N_MAX && BWTSEED_LOCKSTEP_N_MAX <= SMEM_LOCKSTEP_N_MAX_CAP)
+#error "require 1 <= BWTSEED_LOCKSTEP_N <= BWTSEED_LOCKSTEP_N_MAX <= 256 (stack-array storage-safe)"
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -144,6 +170,26 @@ void bwa3_init_smem_lockstep_width(const void *base, int64_t n_blocks,
  * arm64, off elsewhere) so a binary that never runs the resolver behaves as
  * before. Read (not written) on the seeding hot path. */
 extern int32_t g_bwtseed_lockstep;
+
+/* Runtime third-pass lockstep WIDTH, resolved once at startup. Initialized to the
+ * compile-time BWTSEED_LOCKSTEP_N so a binary that never runs the resolver behaves
+ * exactly like the constant. Read (not written) on the seeding hot path by
+ * bwtSeedStrategyAllPosOneThread_lockstep. */
+extern int32_t g_bwtseed_lockstep_n;
+
+/* Classify a BWA3_BWTSEED_LOCKSTEP_N override (env may be NULL/empty), WITHOUT
+ * touching global state. Returns > 0 the width to pin (clamped up to
+ * BWTSEED_LOCKSTEP_N_MAX), 0 when unset/empty (keep the default), or -1 when set
+ * but malformed / non-positive / overflowed (caller reports and keeps the default).
+ * Pure and side-effect-free, so it is unit-testable. */
+int32_t bwa3_bwtseed_width_parse_env(const char *env);
+
+/* Resolve and install g_bwtseed_lockstep_n once (idempotent). Resolution order:
+ * BWA3_BWTSEED_LOCKSTEP_N pin -> compile-time default (24). (A per-host calibration
+ * -- a planned `bwa-mem3 tune` sidecar -- hooks in here in a later change.) Call
+ * before the seeding workers spawn; an invalid env value is reported to stderr and
+ * resolved as if unset. */
+void bwa3_init_bwtseed_lockstep_width(void);
 
 /* Count the distinct physical cores the process may actually run on (Linux: one
  * per thread_siblings_list leader under /sys/devices/system/cpu, intersected with

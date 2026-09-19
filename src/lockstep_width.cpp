@@ -205,6 +205,44 @@ void bwa3_init_smem_lockstep_width(const void *base, int64_t n_blocks,
 
 int32_t g_bwtseed_lockstep = BWA3_BWTSEED_LOCKSTEP_DEFAULT;
 
+/* ---- third-pass bwtseed lockstep WIDTH (see lockstep_width.h) -------------- */
+
+/* Runtime third-pass lockstep width. Defaults to the compile-time BWTSEED_LOCKSTEP_N
+ * so a binary that never calls the resolver is identical to the constant. */
+int32_t g_bwtseed_lockstep_n = BWTSEED_LOCKSTEP_N;
+
+int32_t bwa3_bwtseed_width_parse_env(const char *env) {
+    if (env == NULL || env[0] == '\0') return 0;  /* unset/empty: keep the default */
+
+    errno = 0;
+    char *end = NULL;
+    long v = strtol(env, &end, 10);
+    if (end == env || *end != '\0') return -1;              /* not a clean integer */
+    if (errno == ERANGE)            return -1;              /* overflowed the parse */
+    if (v < 1)                      return -1;              /* non-positive */
+    if (v > BWTSEED_LOCKSTEP_N_MAX) return BWTSEED_LOCKSTEP_N_MAX;  /* clamp to ceiling */
+    return (int32_t)v;
+}
+
+void bwa3_init_bwtseed_lockstep_width(void) {
+    /* One-time resolution; the sole caller (fastmap.cpp) runs it once before the
+     * seeding workers spawn. std::call_once matches the other once-init sites. */
+    static std::once_flag once;
+    std::call_once(once, [] {
+        const char *env = getenv("BWA3_BWTSEED_LOCKSTEP_N");
+        const int32_t pinned = bwa3_bwtseed_width_parse_env(env);
+        if (pinned > 0) {
+            g_bwtseed_lockstep_n = pinned;   /* explicit pin (also the gate/CI path) */
+        } else if (pinned < 0) {
+            fprintf(stderr,
+                    "ERROR: BWA3_BWTSEED_LOCKSTEP_N=\"%s\" is not a positive integer "
+                    "(<= %d); ignoring it (resolving as if unset).\n",
+                    env, BWTSEED_LOCKSTEP_N_MAX);
+        }
+        /* else: g_bwtseed_lockstep_n keeps its compile-time default. */
+    });
+}
+
 /* Does the sysfs CPU list `list` ("0,4", "0-1", "0,4,8,12", ...) name any CPU the
  * process may run on? A CPU c is allowed when c < allowed_len and allowed[c] != 0.
  * With allowed == NULL every well-formed list is allowed (the host-wide count).

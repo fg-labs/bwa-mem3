@@ -359,3 +359,48 @@ TEST_CASE("bwtseed lockstep: the sysfs parser counts one core per sibling-list l
 // synthetic inputs. Its parsing logic is fully covered by bwa3_physical_core_count_from
 // against the synthetic sysfs trees above; the live host smoke check belongs in an
 // integration test, not here.
+
+// --- bwa3_bwtseed_width_parse_env: classify the BWA3_BWTSEED_LOCKSTEP_N override ---
+//
+// The third-pass lockstep WIDTH override (distinct from the 0/1 on/off pin above).
+// Values are derived from the configured [1, BWTSEED_LOCKSTEP_N_MAX] range, never the
+// arch-specific default, so the assertions hold under any -D override of either bound
+// (the compile guard in lockstep_width.h enforces 1 <= N <= N_MAX). The idempotent
+// installer bwa3_init_bwtseed_lockstep_width is validated by the whole-run byte-identity
+// gate, not here; this pins the pure policy it consults.
+
+TEST_CASE("bwtseed width: parse_env classifies the override into pin/unset/invalid"
+          * doctest::test_suite("unit/smem")) {
+    SUBCASE("unset or empty is 0 (keep the arch default)") {
+        CHECK(bwa3_bwtseed_width_parse_env(nullptr) == 0);
+        CHECK(bwa3_bwtseed_width_parse_env("")      == 0);
+    }
+    SUBCASE("a positive integer in range is that width; 1 is the floor escape hatch") {
+        CHECK(bwa3_bwtseed_width_parse_env(BWA3_STR(BWTSEED_LOCKSTEP_N))     == BWTSEED_LOCKSTEP_N);
+        CHECK(bwa3_bwtseed_width_parse_env(BWA3_STR(BWTSEED_LOCKSTEP_N_MAX)) == BWTSEED_LOCKSTEP_N_MAX);
+        CHECK(bwa3_bwtseed_width_parse_env("1") == 1);
+    }
+#if BWTSEED_LOCKSTEP_N_MAX > 2
+    SUBCASE("a value strictly inside the range is used verbatim") {
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%d", BWTSEED_LOCKSTEP_N_MAX - 1);
+        CHECK(bwa3_bwtseed_width_parse_env(buf) == BWTSEED_LOCKSTEP_N_MAX - 1);
+    }
+#endif
+    SUBCASE("a value above the ceiling clamps to the max") {
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%d", BWTSEED_LOCKSTEP_N_MAX + 1);
+        CHECK(bwa3_bwtseed_width_parse_env(buf) == BWTSEED_LOCKSTEP_N_MAX);
+    }
+    SUBCASE("a non-integer is invalid (-1)") {
+        CHECK(bwa3_bwtseed_width_parse_env("garbage") == -1);
+        CHECK(bwa3_bwtseed_width_parse_env("12x")     == -1);
+    }
+    SUBCASE("zero or negative is invalid (-1)") {
+        CHECK(bwa3_bwtseed_width_parse_env("0")  == -1);
+        CHECK(bwa3_bwtseed_width_parse_env("-5") == -1);
+    }
+    SUBCASE("an overflowing value is invalid (-1)") {
+        CHECK(bwa3_bwtseed_width_parse_env("99999999999999999999999999") == -1);
+    }
+}

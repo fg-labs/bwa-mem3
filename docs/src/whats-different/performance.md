@@ -43,6 +43,44 @@ SMEM improvement is within noise; parity holds.
 Supersedes PR #15 (cross-read `_mm_prefetch` shape), which regressed on
 Graviton3.
 
+## Third-pass re-seeding lockstep width (PR #514)
+
+The third seeding pass (`bwtSeedStrategy` occurrence-bounded re-seeding) has its
+own lockstep driver, overlapping `BWTSEED_LOCKSTEP_N` reads' forward-extension
+walks so their `cp_occ` cache misses issue together. Whether it runs is a
+per-run decision (`g_bwtseed_lockstep`: on for arm64, and for x86 when every
+worker thread gets its own physical core; `BWA3_BWTSEED_LOCKSTEP=0`/`1` pins it),
+because it only wins where nothing else already hides that latency.
+
+Its depth is a distinct knob from the phase-2 SMEM width above. The default is
+**24**, resolved at startup into a runtime value. Measured whole-aligner wall on a
+5M-read WGS slice (150 bp paired NovaSeq reads, hg38), each host at threads ≤
+physical cores (the regime where this pass's lockstep runs), sweeping the depth via
+`BWA3_BWTSEED_LOCKSTEP_N` on a single binary per host:
+
+| Host | SIMD tier | Threads | Best depth | Δ vs depth 8 |
+|---|---|---|---|---|
+| Intel Sapphire Rapids (c7i.8xlarge, 16 cores) | avx512bw | 16 | ~24 (flat plateau to 64) | −1.8% |
+| AMD Zen 4 (c7a.8xlarge, 16 cores) | avx512bw | 16 | 24 (peak, rolls off after) | −1.7% |
+| AWS Graviton4 (c8g.4xlarge, 16 cores) | neon | 16 | ~16–24 | −0.8% |
+| Apple M3 Ultra (20 perf cores) | neon | 8 | ≥24 | −2.2% |
+| Apple M2 Max (8 perf cores) | neon | 8 | flat | ~0% (no regression) |
+
+24 is a win or neutral on all of them; Zen 4 rolling off past 24 caps a portable
+default there. At a fixed `-t`/`-K` (equal thread count and identical `-K` batch size,
+so batch boundaries and `mem_pestat` are unchanged), the **alignment records** are
+byte-identical across depths — the depth changes only how forward-extension walks are
+batched within a run, not which seeds are emitted; the header block is not part of this
+claim. Verified on the same 5M-read WGS parity workload by parity tests
+(lockstep == scalar at depths 8 / 24 / 64) and a whole-genome alignment-record
+md5 gate matching the prior depth-8 output on x86 (clang-19, avx512bw tier) and arm64
+(NEON). So it is safe to tune per host.
+
+| Variable | Effect |
+|---|---|
+| `BWA3_BWTSEED_LOCKSTEP_N=<n>` | Pin the third-pass lockstep depth to `<n>` (1–64). A value above 64 is clamped; a non-positive or malformed value is reported to stderr and ignored (the default is used). An unset or empty value (`BWA3_BWTSEED_LOCKSTEP_N=`) silently keeps the compiled default, with no message. |
+| `BWA3_BWTSEED_LOCKSTEP=0`\|`1` | Force the third-pass lockstep driver off / on, overriding the per-run thread-vs-core rule. |
+
 ## Batched `-H` header ingestion (PR #49, closes issue #37)
 
 Passing a large header file via `-H <file>` re-ran `strlen` on the growing
