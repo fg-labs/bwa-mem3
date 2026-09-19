@@ -794,6 +794,32 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                           kswr_t **myaln, mem_cache *mmc,
                           int32_t &gcnt, int tid);
 
+/* The resolve half of mem_sam_pe_batch_post (rescue via mem_matesw_batch_post
+ * over the kswv results, mem_mark_primary_se, PRIMARY5, mem_seed_capped_sub,
+ * mem_pair, is_multi, q_pe/q_se, secondary_all switch) with emission left to the
+ * caller. mem_sam_pe_batch_post itself calls this for its resolve half, so this
+ * is the shipped path -- not a separate copy. Byte-identical to the former
+ * scalar mem_pair_resolve in non-meth mode; under --meth the PE MAPQ follows the
+ * current hardened path (folds each end's second-best SE hit into the pair
+ * MAPQ), so it differs from the removed scalar resolver there. Call after
+ * mem_sam_pe_batch_pre for every pair of the batch, sort_classify, and
+ * mem_sam_pe_batch.
+ *
+ * Out-param contract: n_pri[] is ALWAYS set. q_se[] is written ONLY when
+ * *paired_out == 1. z[] is valid ONLY when *paired_out == 1; mem_pair may
+ * modify it before the no-pairing / is_multi early returns (which leave
+ * *paired_out == 0), so callers must gate both arrays on *paired_out. On
+ * *paired_out == 1 *extra_flag_out is fully assembled and carries 0x2 iff the
+ * paired alignment was preferred; on *paired_out == 0 it is partial (0x1 only)
+ * and the caller owns the proper-pair 0x2 FLAG bit itself (emission-side), as
+ * mem_sam_pe does. Returns the mate-rescue hit count. */
+int mem_pair_resolve_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
+                                const uint8_t *pac, const mem_pestat_t pes[4],
+                                uint64_t id, bseq1_t s[2], mem_alnreg_v a[2],
+                                kswr_t **myaln, mem_cache *mmc, int32_t &gcnt, int tid,
+                                int n_pri[2], int z[2], int q_se[2],
+                                int *extra_flag_out, int *paired_out);
+
 int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                           const uint8_t *pac, const mem_pestat_t pes[4],
                           const mem_alnreg_t *a, int l_ms, const uint8_t *ms,
