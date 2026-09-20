@@ -1721,6 +1721,11 @@ void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
     if (numReads == 0) return;
 
     const int32_t N = g_smem_lockstep_n;
+    // slots[] is a fixed SMEM_LOCKSTEP_N_MAX stack array indexed in [0, N);
+    // the env parser clamps to that range, but a direct g_smem_lockstep_n write
+    // (e.g. a test, or a future calibration) could exceed it -- guard the bound.
+    xassert(N >= 1 && N <= SMEM_LOCKSTEP_N_MAX,
+            "g_smem_lockstep_n out of range [1, SMEM_LOCKSTEP_N_MAX]");
     // LISA trick #4: hybrid SoA layout. `slots[]` holds only the small hot
     // state (~80 B per slot, full array fits in 1-2 cache lines for N=8).
     // Bulk per-slot buffers (prev/match_buf) live separately and are reused
