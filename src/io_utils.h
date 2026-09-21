@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <sys/types.h>
 #include <unistd.h>
@@ -98,5 +99,39 @@ static inline void pwrite_all(int fd, const void* buf, size_t len, off_t off,
     if (rc < 0) err_fatal("pwrite_all", "pwrite(%s) returned 0", what);
     if (rc > 0) err_fatal("pwrite_all", "pwrite(%s) failed: %s", what, strerror(rc));
 }
+
+/* ------------------------------------------------------------------------- *
+ * Parallel index-array read (the read-side counterpart of the pwrite family
+ * above). Definitions live in FMI_search.cpp; declared here — the shared
+ * low-level IO header — so index-array and index-element loaders both reach
+ * them without depending on the derived FM-index header. FMI_PREAD_MIN_CHUNK
+ * (the worker-count floor) stays with the definition in FMI_search.h.
+ * ------------------------------------------------------------------------- */
+
+/* Number of workers to split an `nbytes` index-array read across, given the
+ * caller's requested `nthreads`. Never returns more than `nthreads` (when
+ * positive) nor so many that a chunk would fall below FMI_PREAD_MIN_CHUNK,
+ * except the unavoidable single-worker case where `nbytes` is itself below the
+ * floor. Non-positive `nthreads` clamps UP to 1; the result is always >= 1.
+ * Exposed so the chunk arithmetic is unit-testable without a real index. */
+int fmi_pread_worker_count(size_t nbytes, int nthreads);
+
+/* Bytes to request from a single pread() call, given how many remain in this
+ * worker's chunk. macOS fails a pread() whose count exceeds INT_MAX with EINVAL,
+ * so this clamps to IO_MAX_ONCE (delegating to io_request_size above). Exposed
+ * so the clamp is unit-testable without materialising a multi-GB file. */
+size_t fmi_pread_request_size(size_t remaining);
+
+/* Read the next `nbytes` of `fp` into `dst` using up to `nthreads` pread
+ * workers, then leave the stream positioned exactly past them so a following
+ * sequential read still lands correctly. Aborts the process on a read error or
+ * short file. */
+void fmi_pread_from_stream(FILE *fp, void *dst, size_t nbytes, int nthreads);
+
+/* Worker count for the index load: the caller's request clamped to [1, 8]
+ * (bandwidth-bound past ~8), overridable via BWA3_LOAD_THREADS (clamped to 64).
+ * A malformed override is warned about once and ignored. Always returns >= 1.
+ * Exposed so the fail-closed env-parse is unit-testable without an index. */
+int index_load_threads(int n_threads);
 
 #endif

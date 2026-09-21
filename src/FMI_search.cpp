@@ -833,7 +833,10 @@ void FMI_search::load_index(bool load_pac, int n_threads)
             ref_file_name);
     /* D3 --meth: BNS only for the seed index (skip the ~1.6 GB seed pac). The
      * seed bns drives the seed->original remap; extension uses meth_orig_pac. */
-    bwa_idx_load_ele(ref_file_name, load_pac ? BWA_IDX_ALL : BWA_IDX_BNS);
+    /* Pass the worker count already resolved for this load (line above), so the
+     * .pac slurp reuses it rather than re-parsing BWA3_LOAD_THREADS a second
+     * time within the same load. */
+    bwa_idx_load_ele(ref_file_name, load_pac ? BWA_IDX_ALL : BWA_IDX_BNS, load_nt);
 
     fprintf(stderr, "* Done reading Index!!\n");
 }

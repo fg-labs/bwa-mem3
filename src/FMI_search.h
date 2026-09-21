@@ -46,6 +46,7 @@ Authors: Sanchit Misra <sanchit.misra@intel.com>; Vasimuddin Md <vasimuddin.md@i
 
 #include "read_index_ele.h"
 #include "bwa.h"
+#include "io_utils.h"       /* parallel index-array read family (fmi_pread_*, index_load_threads) */
 #include "lockstep_width.h"  /* SMEM_LOCKSTEP_N (+ _MAX), runtime width + probe */
 #include "fmi_seed_api.h"
 
@@ -96,38 +97,13 @@ typedef struct smem_sort_scratch
  * a larger share of the work than the bandwidth it unlocks. */
 #define FMI_PREAD_MIN_CHUNK (8UL << 20)
 
-/* Number of workers to split an `nbytes` index-array read across, given the
- * caller's requested `nthreads`.
- *
- * Never returns more than `nthreads` when `nthreads` is positive, and never so
- * many that a chunk would fall below FMI_PREAD_MIN_CHUNK -- except for the
- * unavoidable single-worker case where `nbytes` is itself below the floor. A
- * non-positive `nthreads` clamps UP to 1: the result is always >= 1, since the
- * caller divides `nbytes` by it. Small references and a large BWA3_LOAD_THREADS
- * are what push against the floor; on a GB-scale index the load's own 8-worker
- * cap binds first.
- *
- * Exposed (rather than kept file-local with the pread machinery) so the chunk
- * arithmetic is unit-testable without a real index on disk. */
-int fmi_pread_worker_count(size_t nbytes, int nthreads);
-
-/* Bytes to request from a single pread() call, given how many remain in this
- * worker's chunk. macOS fails a pread() whose count exceeds INT_MAX with EINVAL,
- * so a chunk larger than 2GiB can never be read in one call -- and with the
- * 8-worker load cap that is every index over ~17.2GB.
- *
- * Exposed (rather than kept file-local with the pread machinery) so the clamp
- * is unit-testable without materialising a multi-GB file. */
-size_t fmi_pread_request_size(size_t remaining);
-
-/* Read the next `nbytes` of `fp` into `dst` using up to `nthreads` pread
- * workers, then leave the stream positioned exactly past them so a following
- * sequential read (the trailing sentinel index) still lands correctly.
- *
- * Aborts the process on a read error or short file. Exposed alongside the
- * worker count so the chunk-splitting and the stream postcondition are
- * unit-testable against a synthetic file. */
-void fmi_pread_from_stream(FILE *fp, void *dst, size_t nbytes, int nthreads);
+/* The parallel index-array read family (fmi_pread_worker_count,
+ * fmi_pread_request_size, fmi_pread_from_stream) and the load-thread policy
+ * (index_load_threads) are declared in io_utils.h (included above), the shared
+ * low-level IO header, so the index-element loader can reach them without
+ * depending on this derived FM-index header. Their definitions live in
+ * FMI_search.cpp. FMI_PREAD_MIN_CHUNK stays here with fmi_pread_worker_count's
+ * definition, which is the only user of it. */
 
 /* Detect the trailing sa_compx tag on a loaded FM-index (.bwt.2bit.64) file,
  * falling back to `default_compx` when no valid tag is present (a legacy
@@ -176,16 +152,6 @@ void ks_dedup_configure(const char *mode_arg);
  * the coordinate oracle alone cannot, since the plain path returns the same
  * coordinates. */
 void ks_dedup_position_counts(uint64_t *total, uint64_t *distinct);
-
-/* Worker count for the index load: the caller's `n_threads` clamped to [1, 8],
- * overridable via the BWA3_LOAD_THREADS environment variable. A malformed
- * override (non-numeric, trailing garbage, non-positive, or unrepresentable as
- * a long) is warned about and ignored, keeping the computed default; a valid
- * override is honored and clamped to a 64-thread ceiling. Always returns >= 1.
- *
- * Exposed (rather than kept file-local with the pread machinery) so the
- * fail-closed env-parse validation is unit-testable without loading an index. */
-int index_load_threads(int n_threads);
 
 class FMI_search: public indexEle
 {
