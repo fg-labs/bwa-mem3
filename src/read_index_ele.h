@@ -59,7 +59,11 @@ public:
 	
 	indexEle();
 	~indexEle();
-	void bwa_idx_load_ele(const char *hint, int which);
+	/* Load BNS (and, when `which` includes BWA_IDX_PAC, the 2-bit packed
+	 * reference) from disk. `pread_workers` is the already-resolved worker count
+	 * for the parallel .pac slurp (as returned by index_load_threads); 1 reads
+	 * serially. The loaded bytes are identical regardless of worker count. */
+	void bwa_idx_load_ele(const char *hint, int which, int pread_workers = 1);
 	char *bwa_idx_infer_prefix(const char *hint);
 
 	/* Attach BNS + PAC from a packed bwa-mem3 index segment produced by
@@ -77,4 +81,14 @@ public:
 	 */
 	void bwa_idx_load_ele_from_shm(uint8_t *base, size_t len, bool load_pac = true);
 };
+
+/* Slurp the whole of an open .pac stream (`*fp_pac`, positioned at its start as
+ * bns_restore leaves it) into the caller-allocated `dst` (`pac_bytes` bytes),
+ * reading in parallel across `pread_workers` pread() workers (a resolved count,
+ * as from index_load_threads; 1 reads serially), then close the stream and NULL
+ * `*fp_pac`. Advises MADV_HUGEPAGE on `dst` first, matching the FM-index arrays.
+ * A read error or short file is fatal (aborts the process). Shared by the
+ * seed-index loader (bwa_idx_load_ele) and the --meth original-reference loader
+ * so the sizing/read/close logic lives in one place. */
+void pac_slurp_and_close(FILE **fp_pac, uint8_t *dst, int64_t pac_bytes, int pread_workers);
 #endif

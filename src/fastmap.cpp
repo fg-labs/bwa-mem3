@@ -33,7 +33,6 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h> /* strcasecmp(): POSIX declares it here, not in string.h */
-#include "bwa_madvise.h"
 #if NUMA_ENABLED
 #include <numa.h>
 #endif
@@ -1758,10 +1757,15 @@ static void usage(const mem_opt_t *opt)
  * chrom names) from `prefix` as resident handles for the future extension/scoring
  * phase, distinct from the seed FM-index. Mirrors indexEle::bwa_idx_load_ele's
  * disk path (bns_restore then slurp the full .pac into memory and close fp_pac).
- * On success writes *bns_out / *pac_out and returns 0; on failure frees any
- * partial allocation, leaves the out-params NULL, and returns -1. */
+ * On a bns_restore or pac-allocation failure, frees any partial allocation,
+ * leaves the out-params NULL, and returns -1. (An I/O error or short read during
+ * the .pac slurp itself is fatal — pac_slurp_and_close aborts the process,
+ * matching the seed-index loader.)
+ * `pread_workers` is the already-resolved worker count for the parallel .pac
+ * slurp (as from index_load_threads); 1 reads serially. */
 static int meth_orig_ref_load_handles(const char *prefix,
-                                      bntseq_t **bns_out, uint8_t **pac_out)
+                                      bntseq_t **bns_out, uint8_t **pac_out,
+                                      int pread_workers)
 {
     *bns_out = NULL;
     *pac_out = NULL;
@@ -1780,11 +1784,9 @@ static int meth_orig_ref_load_handles(const char *prefix,
         bns_destroy(bns);
         return -1;
     }
-    bwamem_madv_hugepage(pac, pac_bytes);
-    /* bns_restore left .pac open in bns->fp_pac; slurp it whole, then close. */
-    err_fread_noeof(pac, 1, pac_bytes, bns->fp_pac);
-    err_fclose(bns->fp_pac);
-    bns->fp_pac = NULL;
+    /* bns_restore left .pac open in bns->fp_pac; slurp it whole (in parallel,
+     * same as the seed index) and close it. Shared with bwa_idx_load_ele. */
+    pac_slurp_and_close(&bns->fp_pac, pac, pac_bytes, pread_workers);
 
     *bns_out = bns;
     *pac_out = pac;
@@ -3495,7 +3497,8 @@ int main_mem(int argc, char *argv[])
      * a load-only building block. Freed on every exit path the seed index is. */
     if (opt->meth_mode && meth_orig_ref_prefix != NULL) {
         if (meth_orig_ref_load_handles(meth_orig_ref_prefix,
-                                       &aux.meth_orig_bns, &aux.meth_orig_pac) != 0) {
+                                       &aux.meth_orig_bns, &aux.meth_orig_pac,
+                                       index_load_threads(opt->n_threads)) != 0) {
             delete aux.fmi;
             free(opt);
             if (out_opened) fclose(aux.fp);
