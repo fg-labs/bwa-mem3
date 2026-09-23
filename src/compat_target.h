@@ -90,6 +90,11 @@ typedef struct compat_target_t {
      * upstreams. */
     int emit_hn;
 
+    /* The ungapped extension shortcut can change the secondary score (XS)
+     * relative to bwa and bwa-mem2. Keep it for native output, but route
+     * compatibility targets through the reference SW extension. */
+    int use_ungapped_extension;
+
     /* When mem_chain_flt's weight filter drops EVERY chain for a read, hand
      * slot 0 -- a chain the filter just rejected -- back to the caller with
      * kept = 3 (1), or report zero survivors (0).

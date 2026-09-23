@@ -34,6 +34,7 @@ TEST_CASE("compat target `off` is bwa-mem3's native output") {
     CHECK(t->read_sidecar == 1);
     CHECK(t->emit_mq      == 1);
     CHECK(t->emit_hn      == 1);
+    CHECK(t->use_ungapped_extension == 1);
     // #310: `off` reports zero survivors when the weight filter drops every
     // chain (bwa's answer); only the bwa-mem2 target resurrects the rejected
     // chain, because reproducing that release is its contract.
@@ -65,6 +66,7 @@ TEST_CASE("compat target `bwa-mem2` matches bwa-mem2 v2.2.1") {
     CHECK(t->emit_mq == 0);
     // HN:i exists in neither upstream.
     CHECK(t->emit_hn == 0);
+    CHECK(t->use_ungapped_extension == 0);
     // #310: bwa-mem2 resurrects the rejected slot-0 chain; that IS the target.
     CHECK(t->chain_flt_resurrect_empty == 1);
     CHECK(t->sa_sentinel_drop_offset == 1);   // #469: bwa-mem2 drops the walk offset
@@ -92,6 +94,7 @@ TEST_CASE("compat target `bwa-mem` matches bwa 0.7.19") {
     // is a target enum rather than a flag bit.
     CHECK(t->emit_mq == 1);
     CHECK(t->emit_hn == 0);
+    CHECK(t->use_ungapped_extension == 0);
     // #310: THE field that is not output shaping. bwa returns 0 survivors and
     // leaves the read unmapped; modelling that is the whole point of the row.
     CHECK(t->chain_flt_resurrect_empty == 0);
@@ -104,6 +107,7 @@ TEST_CASE("bwa and bwa-mem2 rows differ exactly where the upstreams do") {
     // Both drop the bwa-mem3-only sidecar and the bwa-mem3-only HN:i tag...
     CHECK(mem->read_sidecar == mem2->read_sidecar);
     CHECK(mem->emit_hn      == mem2->emit_hn);
+    CHECK(mem->use_ungapped_extension == mem2->use_ungapped_extension);
     // ...and disagree on precisely the two fields the fork point explains:
     // @HD (bwa 0.7.18, 6b18630) and MQ:i (lh3/bwa#330), both post-0.7.17.
     CHECK(mem->emit_hd != mem2->emit_hd);

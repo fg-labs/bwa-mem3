@@ -6599,7 +6599,8 @@ static inline void stage_seed_extension(
          * as a mismatch and commit a wrong a->score. Disable it under
          * --meth so all extension flows through the matrix-aware SW
          * kernel. (Perf-only fast path; correctness-neutral to skip.) */
-        if (!opt->meth_mode && sp.len1 >= sp.len2 && sp.len2 <= FP_N_MAX) {
+        if (opt->compat->use_ungapped_extension && !opt->meth_mode &&
+            sp.len1 >= sp.len2 && sp.len2 <= FP_N_MAX) {
             tprof[UGP_L_ATTEMPT][tid]++;
             int fp_score, fp_qle, fp_gscore, fp_gtle, fp_band;
             int fp_st = ungapped_analyze(qs, rs, sp.len2,
@@ -6842,7 +6843,8 @@ static inline void stage_seed_extension(
         /* D3 (--meth, PR-4): disable the ungapped fast path under
          * --meth — see the LEFT-side rationale above (it can't score
          * the asymmetric OT/OB matrix). */
-        if (!opt->meth_mode && a->score != -1 && sp.len1 >= sp.len2 && sp.len2 <= FP_N_MAX) {
+        if (opt->compat->use_ungapped_extension && !opt->meth_mode &&
+            a->score != -1 && sp.len1 >= sp.len2 && sp.len2 <= FP_N_MAX) {
             sp.ugp_r_attempted = 1;
             tprof[UGP_R_ATTEMPT][tid]++;
             int fp_h0 = a->score;  // the real h0 for right ext
@@ -7769,7 +7771,8 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
             // would fill a->score / qe / re from symmetric scoring and compact
             // the pair out, bypassing the asymmetric banded SW. The two
             // construction-time passes are gated the same way (see ~3397/3618).
-            if (!opt->meth_mode && !sp->ugp_r_attempted &&
+            if (opt->compat->use_ungapped_extension && !opt->meth_mode &&
+                !sp->ugp_r_attempted &&
                 sp->len1 >= sp->len2 && sp->len2 > 0 && sp->len2 <= FP_N_MAX) {
                 tprof[UGP_R_ATTEMPT][tid]++;
                 const uint8_t *qs = seqBufRightQer + sp->idq;
