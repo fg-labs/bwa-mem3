@@ -1,5 +1,37 @@
 # Changelog
 
+## [0.13.0](https://github.com/fg-labs/bwa-mem3/compare/v0.12.0...v0.13.0) (2026-09-21)
+
+
+### Features
+
+* **bwamem_pair:** add mem_pair_resolve_batch_post and route the fused path through it ([#515](https://github.com/fg-labs/bwa-mem3/issues/515)) ([ea58288](https://github.com/fg-labs/bwa-mem3/commit/ea58288832461ffeaa28269d3b8d19a5182d68f6))
+* **ext:** make byte-identical contained-seed extension skip the default (--keep-contained-ext to opt out) ([#512](https://github.com/fg-labs/bwa-mem3/issues/512)) ([5da118c](https://github.com/fg-labs/bwa-mem3/commit/5da118c8ec7d5502422a4c90103ead3b8e660bd6))
+* **sa:** cross-read (k,s) SA-interval dedup with net-cycles auto controller ([#511](https://github.com/fg-labs/bwa-mem3/issues/511)) ([be7a9a2](https://github.com/fg-labs/bwa-mem3/commit/be7a9a2b17a2c91dc14c245b1f6690348faeeef2))
+* **shm:** opt-in on-the-fly SA densification at stage time (-u/--threads) ([#510](https://github.com/fg-labs/bwa-mem3/issues/510)) ([297eefd](https://github.com/fg-labs/bwa-mem3/commit/297eefd744d72bcdfab7adb5c5be0d1b4833b31f))
+
+
+### Bug Fixes
+
+* **seed:** bounds-guard SMEM lockstep width at driver entry ([#516](https://github.com/fg-labs/bwa-mem3/issues/516)) ([35866bc](https://github.com/fg-labs/bwa-mem3/commit/35866bc85b863905eecaa599f9db7f73d45a6b0c))
+
+
+### Performance
+
+* **bns:** single-bucket fast path in bns_intv2rid (byte-identical) ([#508](https://github.com/fg-labs/bwa-mem3/issues/508)) ([c4fcd87](https://github.com/fg-labs/bwa-mem3/commit/c4fcd87f87f3631ad2862d86643d04bbbab48206))
+* **index:** parallelize the .pac reference slurp at startup ([#517](https://github.com/fg-labs/bwa-mem3/issues/517)) ([abd7a88](https://github.com/fg-labs/bwa-mem3/commit/abd7a88a266371010852a5b073eb163876274bd0))
+* **seed:** widen third-pass bwtseed lockstep to 24 (from 8) ([#514](https://github.com/fg-labs/bwa-mem3/issues/514)) ([a54d147](https://github.com/fg-labs/bwa-mem3/commit/a54d1472505086cc4db4ad6e903d3ad5d9dcac48))
+
+
+### Refactoring
+
+* remove scalar mate-rescue path; require AVX2+ on x86 ([#513](https://github.com/fg-labs/bwa-mem3/issues/513)) ([69cb206](https://github.com/fg-labs/bwa-mem3/commit/69cb206e9111ca3d7b8ea16f2939c945ee8310af))
+
+
+### Documentation
+
+* **readme:** update performance tables for v0.12.0 ([#506](https://github.com/fg-labs/bwa-mem3/issues/506)) ([54abbea](https://github.com/fg-labs/bwa-mem3/commit/54abbea98c926d79f961405eb05a416bb7a71ec1))
+
 ## [0.12.0](https://github.com/fg-labs/bwa-mem3/compare/v0.11.0...v0.12.0) (2026-09-13)
 
 
