@@ -848,13 +848,10 @@ uint8_t *bns_get_seq_v2(int64_t l_pac, const uint8_t *pac, int64_t beg, int64_t 
 	return seq;
 }
 
-uint8_t *bns_fetch_seq_v2(const bntseq_t *bns, const uint8_t *pac,
-                          int64_t *beg, int64_t mid, int64_t *end, int *rid,
-                          uint8_t *ref_string, uint8_t *seqb)
+void bns_fetch_bounds(const bntseq_t *bns, int64_t *beg, int64_t mid, int64_t *end, int *rid)
 {
-	int64_t far_beg, far_end, len;
+	int64_t far_beg, far_end;
 	int is_rev;
-	uint8_t *seq;
 
 	if (*end < *beg) *end ^= *beg, *beg ^= *end, *end ^= *beg; // if end is smaller, swap
 	assert(*beg <= mid && mid < *end);
@@ -869,12 +866,23 @@ uint8_t *bns_fetch_seq_v2(const bntseq_t *bns, const uint8_t *pac,
 	}
 	*beg = *beg > far_beg? *beg : far_beg;
 	*end = *end < far_end? *end : far_end;
+}
+
+uint8_t *bns_fetch_seq_v2(const bntseq_t *bns, const uint8_t *pac,
+                          int64_t *beg, int64_t mid, int64_t *end, int *rid,
+                          uint8_t *ref_string, uint8_t *seqb)
+{
+	int64_t len;
+	uint8_t *seq;
+
+	bns_fetch_bounds(bns, beg, mid, end, rid);
 
 	seq = bns_get_seq_v2(bns->l_pac, pac, *beg, *end, &len, ref_string, seqb);
 
 	if (seq == 0 || *end - *beg != len) {
-		fprintf(stderr, "[E::%s] begin=%ld, mid=%ld, end=%ld, len=%ld, seq=%p, rid=%d, far_beg=%ld, far_end=%ld\n",
-				__func__, (long)*beg, (long)mid, (long)*end, (long)len, seq, *rid, (long)far_beg, (long)far_end);
+		fprintf(stderr, "[E::%s] begin=%ld, mid=%ld, end=%ld, len=%ld, seq=%p, rid=%d, contig_offset=%ld, contig_len=%ld\n",
+				__func__, (long)*beg, (long)mid, (long)*end, (long)len, seq, *rid,
+				(long)bns->anns[*rid].offset, (long)bns->anns[*rid].len);
 	}
 	assert(seq && *end - *beg == len); // assertion failure should never happen
 
