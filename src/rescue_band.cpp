@@ -77,6 +77,15 @@ static int rb_p1_cost_pct()
     return v;
 }
 
+/* BWA3_RESCUE_FSCAN (default on, the kswv toggle of the same name): rb_dp_core's G-based cell,
+ * see RB_CELL1. The band path runs only at default scoring, so the insertion and deletion gap
+ * costs always agree, as the cell requires. */
+static bool rb_fscan_on()
+{
+    static const bool on = [] { const char *e = getenv("BWA3_RESCUE_FSCAN"); return !e || e[0] != '0'; }();
+    return on;
+}
+
 static bool rb_stats_on()
 {
     static const bool on = [] { const char *e = getenv("BWA3_RESCUE_PRUNE_STATS"); return e && e[0] == '1'; }();
@@ -510,6 +519,9 @@ static inline void rb_snapshot(rb_work &w, const uint8_t *Hrow, int row, int W, 
  * there gmax can never exceed the target S, so once a lane reaches S no later row improves it, and
  * its te (last strict improvement) and qe snapshot (taken for that row at the latest when the loop
  * ends) are final -- exactly kswv's freeze at KSW_XSTOP. */
+/* FScan selects the G-based cell (see RB_CELL1); both instantiations are byte-identical in every
+ * value the caller reads (gmax, te, SNAP, R). */
+template <bool FScan>
 static long rb_dp_core(rb_work &w, int W, int NR, int omax, int ominq, int omaskq, bool early)
 {
     long computed = 0;
@@ -551,12 +563,39 @@ static long rb_dp_core(rb_work &w, int W, int NR, int omax, int ominq, int omask
             f = vmaxq_u8(vmaxq_u8(h07b, vqsubq_u8(h07a, v1)), vqsubq_u8(f, v2)); /* f_in(k-2) */ \
             vst1q_u8(Hc + k * 16, ha);                                                         \
             vst1q_u8(Hc + (k - 1) * 16, hb);                                                   \
-            if (MASK) rmax = vmaxq_u8(rmax, vmaxq_u8(vandq_u8(ha, vld1q_u8(qp)), vandq_u8(hb, vld1q_u8(qp + 16)))); \
-            else rmax = vmaxq_u8(rmax, vmaxq_u8(ha, hb));                                      \
+            /* FScan: row max over G (h0), E opened from G - 7 (see RB_CELL1). */            \
+            const uint8x16_t ra = FScan ? h0a : ha, rb = FScan ? h0b : hb;                    \
+            if (MASK) rmax = vmaxq_u8(rmax, vmaxq_u8(vandq_u8(ra, vld1q_u8(qp)), vandq_u8(rb, vld1q_u8(qp + 16)))); \
+            else rmax = vmaxq_u8(rmax, vmaxq_u8(ra, rb));                                      \
             /* Cell k writes E slot k+1 and cell k-1 writes slot k, which cell k already read. */ \
-            vst1q_u8(E + (k + 1) * 16, vmaxq_u8(vqsubq_u8(ha, v7), vqsubq_u8(ea, v1)));        \
-            vst1q_u8(E + k * 16, vmaxq_u8(vqsubq_u8(hb, v7), vqsubq_u8(eb, v1)));              \
+            vst1q_u8(E + (k + 1) * 16, vmaxq_u8(FScan ? h07a : vqsubq_u8(ha, v7), vqsubq_u8(ea, v1))); \
+            vst1q_u8(E + k * 16, vmaxq_u8(FScan ? h07b : vqsubq_u8(hb, v7), vqsubq_u8(eb, v1))); \
         }
+/* FScan, the kswv G-based cell in band coordinates. Here the gap carried in a register is F, the
+ * in-row gap (query advances, k - 1, same row), and E is the one carried through memory, the
+ * vertical gap (reference advances: slot k + 1 read by row r + 1 at k + 1, same query column).
+ * h0 = max(diagonal, E) is G, and F already opens from it, so F -> E (vertical opened straight
+ * out of an in-row gap) is the transition E carries and F does not have the mirror of. FScan
+ * opens E from G - 7 as well: one sat(G - 7) serves both gaps and E no longer waits on F.
+ *  - Values: the zero-state DP keeps every alignment path except those with an in-row gap run
+ *    immediately followed by a vertical one. Such a path's twin, the same two runs in the other
+ *    order between the same two cells, scores the same (6 + a + 6 + b either way round) and F
+ *    admits it. In the FULL DP that makes every H equal (kswv's point 1 at
+ *    KSWV_NEON_U8_CELL_PAIR_FS). In a band the twin can leave it -- vertical first climbs to
+ *    band index k + b, possibly past W - 1 -- so the band values need not match the original
+ *    kernel's. What the band path relies on still holds: (i) any restricted DP never exceeds the
+ *    full DP; (ii) the band holds the full-DP value at the end of every alignment scoring >= tau
+ *    (pass 0) or of A* (pass 1) -- rescue_band.h -- because that alignment, if optimal with an
+ *    in-row run next to a vertical one, has an equally scoring twin (swapping runs never merges
+ *    or splits a run of an OPTIMAL alignment, so repeated swaps remove every such adjacency), and
+ *    the twin lies in the band too: pass 0's containment covers EVERY alignment scoring >= tau,
+ *    and pass 1's diagonal range [-Imax, Dmax] bounds every prefix of any alignment with A*'s
+ *    I and D counts. gmax, te, the qe column (cells equal to gmax: exact by (i) + (ii)), the
+ *    early exit and the rows R the merge reads are therefore those of the original kernel.
+ *  - Row max over G, not H: within a row F only carries earlier cells' G decayed (F = 0 at khi,
+ *    sat(x - 7) <= x), and those cells are live or j < 0 (G = 0) -- dead j >= quanta cells lie
+ *    after every live one -- so the row max over H equals the row max over G, masked or not.
+ *    SNAP still copies H (rb_snapshot reads Hc/Hp, which hold H). */
 #define RB_CELL1(MASK)                                                                          \
         {                                                                                      \
             const uint8x16_t q = vld1q_u8(ap);                                                 \
@@ -565,9 +604,11 @@ static long rb_dp_core(rb_work &w, int W, int NR, int omax, int ominq, int omask
             const uint8x16_t h0 = vmaxq_u8(vsqaddq_u8(vld1q_u8(Hp + k * 16), sc), e);          \
             const uint8x16_t h = vmaxq_u8(h0, f);                                              \
             vst1q_u8(Hc + k * 16, h);                                                          \
-            rmax = vmaxq_u8(rmax, (MASK) ? vandq_u8(h, vld1q_u8(qp)) : h);                     \
-            vst1q_u8(E + (k + 1) * 16, vmaxq_u8(vqsubq_u8(h, v7), vqsubq_u8(e, v1)));          \
-            f = vmaxq_u8(vqsubq_u8(h0, v7), vqsubq_u8(f, v1));                                 \
+            const uint8x16_t r_ = FScan ? h0 : h;                                              \
+            rmax = vmaxq_u8(rmax, (MASK) ? vandq_u8(r_, vld1q_u8(qp)) : r_);                   \
+            const uint8x16_t h07 = vqsubq_u8(h0, v7);                                          \
+            vst1q_u8(E + (k + 1) * 16, vmaxq_u8(FScan ? h07 : vqsubq_u8(h, v7), vqsubq_u8(e, v1))); \
+            f = vmaxq_u8(h07, vqsubq_u8(f, v1));                                               \
         }
         for (; k >= kun + 1; k -= 2, ap += 32, qp += 32) RB_CELL2(false)
         if (k == kun) { RB_CELL1(false) k--; ap += 16; qp += 16; }
@@ -767,7 +808,8 @@ void RescueBandBatch::run_jobs(bool pass1)
             omaskq = std::max(omaskq, o - L[l]->quanta + 1);
         }
         for (int l = 0; l < 16; l++) w.target[l] = pass1 && l < nl ? (uint8_t)L[l]->target : 0;
-        const long computed = rb_dp_core(w, W, NR, omax, ominq, omaskq, pass1);
+        const long computed = rb_fscan_on() ? rb_dp_core<true>(w, W, NR, omax, ominq, omaskq, pass1)
+                                            : rb_dp_core<false>(w, W, NR, omax, ominq, omaskq, pass1);
         if (st) stats.cells_pad += (uint64_t)16 * computed;
 #ifdef RB_PROFILE
         g_rb_prof.cells += 16.0 * computed;
