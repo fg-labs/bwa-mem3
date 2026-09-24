@@ -359,15 +359,16 @@ static bool rescue_prune_on()
 struct rescue_prune_stats_t {
     std::atomic<uint64_t> jobs{0}, full{0}, b1{0}, b2{0}, rows_in{0}, rows_kept{0};
     /* Thread-summed wall time of the rescue stages (ns): filter + band planning in _pre, kswv
-     * pass 0 (8-bit + 16-bit), the banded pass 0, and pass 1. Only measured when stats are on. */
-    std::atomic<uint64_t> ns_filter{0}, ns_k0{0}, ns_band{0}, ns_k1{0};
+     * pass 0 (8-bit + 16-bit), the banded pass 0, kswv pass 1 and the banded pass 1. Only measured
+     * when stats are on. */
+    std::atomic<uint64_t> ns_filter{0}, ns_k0{0}, ns_band{0}, ns_k1{0}, ns_b1{0};
     bool on = [] { const char *e = getenv("BWA3_RESCUE_PRUNE_STATS"); return e && e[0] == '1'; }();
     ~rescue_prune_stats_t() {
         if (on) fprintf(stderr, "[RESCUE_PRUNE] jobs=%llu full=%llu b1=%llu b2=%llu rows_in=%llu rows_kept=%llu "
-                        "filter_s=%.3f kswv_pass0_s=%.3f band_pass0_s=%.3f kswv_pass1_s=%.3f\n",
+                        "filter_s=%.3f kswv_pass0_s=%.3f band_pass0_s=%.3f kswv_pass1_s=%.3f band_pass1_s=%.3f\n",
                         (unsigned long long)jobs, (unsigned long long)full, (unsigned long long)b1,
                         (unsigned long long)b2, (unsigned long long)rows_in, (unsigned long long)rows_kept,
-                        ns_filter * 1e-9, ns_k0 * 1e-9, ns_band * 1e-9, ns_k1 * 1e-9);
+                        ns_filter * 1e-9, ns_k0 * 1e-9, ns_band * 1e-9, ns_k1 * 1e-9, ns_b1 * 1e-9);
     }
 };
 static inline uint64_t rescue_now_ns()
@@ -975,7 +976,8 @@ static void mem_sam_pe_batch_run(Ikswv *pwsw, SeqPair *pairs,
 
     /* Exact banded rescue (rescue_band.h): the first n_banded 8-bit pairs are hull parents whose
      * pass 0 runs as banded DP jobs instead of kswv; it fills their aln[regid] exactly as kswv
-     * would, so the post-processing and pass 1 below treat every pair alike. */
+     * would, so the post-processing below treats every pair alike. Their pass 1 is banded too
+     * where that is cheaper (take_pass1), and runs through kswv otherwise. */
     const bool timed = g_rescue_prune_stats.on;
     uint64_t t0 = timed ? rescue_now_ns() : 0;
     pwsw->getScores8(pairs + n_banded, seqBufRef, seqBufQer, aln, slice_pcnt8 - n_banded, nthreads, 0);
@@ -1002,6 +1004,7 @@ static void mem_sam_pe_batch_run(Ikswv *pwsw, SeqPair *pairs,
         uint8_t *qs = seqBufQer + sp.idq;
         uint8_t *rs = seqBufRef + sp.idr;
         revseq(r.qe + 1, qs); revseq(r.te + 1, rs);
+        if (i < n_banded && band->take_pass1(sp, r)) continue;
         pairs[pos++] = sp;
         pos8 ++;
     }
@@ -1031,7 +1034,11 @@ static void mem_sam_pe_batch_run(Ikswv *pwsw, SeqPair *pairs,
     if (timed) t0 = rescue_now_ns();
     pwsw->getScores16(pairs + pos8, seqBufRef, seqBufQer, aln, pos16, nthreads, 1);
     pwsw->getScores8(pairs, seqBufRef, seqBufQer, aln, pos8, nthreads, 1);
-    if (timed) g_rescue_prune_stats.ns_k1 += rescue_now_ns() - t0;
+    if (timed) { uint64_t t1 = rescue_now_ns(); g_rescue_prune_stats.ns_k1 += t1 - t0; t0 = t1; }
+    if (n_banded > 0) {
+        band->run_pass1(seqBufRef, seqBufQer, aln, pwsw);
+        if (timed) g_rescue_prune_stats.ns_b1 += rescue_now_ns() - t0;
+    }
 }
 
 // This function is equivalent to align2() for axv512

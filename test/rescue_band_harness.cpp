@@ -8,14 +8,19 @@
  * the length sort, partition, kswv phase 0 on the non-banded pairs, run_pass0 on the banded ones,
  * then the mem_sam_pe_batch_run post-processing and kswv phase 1 -- is compared against the
  * pre-pruning pipeline (full window, kswv phase 0 + phase 1), field by field: score (pass/fail
- * when the truth fails), te, qe, score2, tb, qb (offsets applied). A scalar full-window DP with
- * kswv's score2 semantics (scalar_dp / scalar_score2 below) cross-checks score/te/qe/score2 of the truth
- * on every --scalar-stride-th job. Generated classes: random windows with mutated mate copies,
- * edge copies around te +- S (score2 parity / zeroing), tiny windows, N bases (must be FULL),
- * tandem repeats (hit-dense, many components), in-zone secondary copies (round-2 triggers),
- * ragged len2, windows past the NEON filter's capacity (scalar view) and more components than the
- * cap. Every B2 job's NEON view is also checked against the scalar filter's view of the same job
- * (same components at several thresholds), and the run fails if nothing was banded. Env knobs are the production ones; the caller sets e.g.
+ * when the truth fails), te, qe, score2, tb, qb (offsets applied). The production pipeline includes
+ * the banded pass 1 of the banded parents (take_pass1 / run_pass1), so tb / qb check it against
+ * kswv phase 1 on the full window; the summary counts how many parents took it (non-vacuity).
+ * A scalar full-window DP with kswv's score2 semantics (scalar_dp / scalar_score2 below) plus a scalar
+ * reversed-prefix DP for (tb, qb) cross-check the truth on every --scalar-stride-th job.
+ * Generated classes: random windows with mutated mate copies, edge copies around te +- S (score2
+ * parity / zeroing), tiny windows, N bases (must be FULL), tandem repeats (hit-dense, many
+ * components), in-zone secondary copies (round-2 triggers), ragged len2, windows past the NEON
+ * filter's capacity (scalar view), more components than the cap, and pass-1 adversaries (class 11:
+ * gaps at the band-edge bound, start ties, qe next to the pad columns, te at the window edges).
+ * Every B2 job's NEON view is also checked against the scalar filter's view of the same job (same
+ * components at several thresholds), and the run fails if nothing was banded. Env knobs are the
+ * production ones; the caller sets e.g.
  * BWA3_RESCUE_BAND_COST=100000000 (band every B2 parent) and BWA3_RESCUE_PRUNE_MAX_HITS. RB_MINSC
  * (default 19) and RB_SCALAR_STRIDE (default 0: no scalar cross-check) are harness-only.
  *
@@ -69,6 +74,33 @@ static void scalar_dp(const Job &jb, int &S, int &te, int &qe, std::vector<int> 
         }
         R[i] = rmax;
         if (rmax > S) { S = rmax; te = i; for (int j = 0; j < quanta; j++) if (Hc[j] == rmax) { qe = j; break; } }
+        std::swap(Hp, Hc);
+    }
+}
+/* kswv phase 1 in scalar form: the DP over ref[te..0] x q[qe..0] plus the pad columns
+ * [qe + 1, quanta); first row whose max reaches S, first column holding S there. */
+static void scalar_pass1(const Job &jb, int S, int te, int qe, int &tb, int &qb)
+{
+    const int len2 = qe + 1, quanta = (len2 + 15) / 16 * 16;
+    std::vector<int> Hp(quanta, 0), Hc(quanta, 0), E(quanta, 0);
+    tb = qb = -1;
+    for (int r = 0; r <= te; r++) {
+        const int rb = jb.ref[te - r];
+        int f = 0, rmax = 0;
+        for (int c = 0; c < quanta; c++) {
+            const int diag = c > 0 ? Hp[c - 1] : 0;
+            const int qc = c < len2 ? jb.q[qe - c] : 0;
+            const int sc = (c >= len2) ? 0 : (rb >= 4 || qc >= 4) ? -1 : (rb == qc ? 1 : -4);
+            int h = std::max(0, diag + sc);
+            h = std::max(h, std::max(E[c], f));
+            Hc[c] = h; rmax = std::max(rmax, h);
+            E[c] = std::max(0, std::max(E[c] - 1, h - 7));
+            f = std::max(0, std::max(f - 1, h - 7));
+        }
+        if (rmax >= S) {
+            for (int c = 0; c < quanta; c++) if (Hc[c] == rmax) { tb = te - r; qb = qe - c; break; }
+            return;
+        }
         std::swap(Hp, Hc);
     }
 }
@@ -269,6 +301,46 @@ static Job gen(int cls)
         if (rnd(2)) plant(r, mutate(q, 0, len2, 0.02, 0.003), rnd(len1 - len2));
         break;
     }
+    case 11: {  // pass-1 adversaries (banded pass 1, rescue_band.h)
+        r.resize(len1); for (auto &b : r) b = (uint8_t)rnd(4);
+        const int mode = rnd(5);
+        if (mode == 0) {   // qe next to the pad columns: len2 on / just past a multiple of 16
+            len2 = 16 * rndr(2, 12) + rnd(2); q.resize(len2); for (auto &b : q) b = (uint8_t)rnd(4);
+            len1 = std::max(len1, len2 + 5); r.resize(len1); for (auto &b : r) b = (uint8_t)rnd(4);
+        }
+        if (mode == 1) {   // start ties: the mate opens with a short tandem unit, so shifted starts tie
+            const int per = rndr(1, 3), rl = rndr(4, 12);
+            for (int j = 0; j < std::min(rl, len2); j++) q[j] = q[j % per];
+        }
+        /* The copy: 1-3 gaps whose total length sits at or near the band-edge bound
+         * (2I + D <= qe - S - 5), a few mismatches, and sometimes a truncated tail (qe < len2 - 1). */
+        std::vector<uint8_t> c;
+        const int ng = rndr(mode == 2 ? 1 : 0, 3);
+        std::vector<int> gpos(ng), glen(ng);
+        for (int t = 0; t < ng; t++) { gpos[t] = rnd(len2); glen[t] = rnd(4) ? rndr(1, 6) : rndr(7, 40); }
+        const int qend = rnd(3) ? len2 : rndr(std::min(len2, 25), len2);
+        for (int j = 0; j < qend; j++) {
+            for (int t = 0; t < ng; t++)
+                if (gpos[t] == j) {
+                    if (rnd(2)) for (int k = 0; k < glen[t]; k++) c.push_back((uint8_t)rnd(4));   // deletion (ref bases)
+                    else { j += glen[t]; break; }                                                  // insertion (query bases)
+                }
+            if (j >= qend) break;
+            uint8_t b = q[j];
+            if (rnd(40) == 0) b = (uint8_t)((b + 1 + rnd(3)) & 3);
+            c.push_back(b);
+        }
+        /* te at the window edges: the copy flush with the window start or end, or anywhere. */
+        const int where = rnd(3);
+        const int pos = where == 0 ? 0 : where == 1 ? len1 - (int)c.size() : rnd(std::max(1, len1 - (int)c.size()));
+        plant(r, c, pos);
+        if (mode == 3) plant(r, c, pos + rndr(-3, 3) + (rnd(2) ? (int)c.size() : 0));   // a tied second copy
+        if (mode == 4) {   // the same copy shifted by a few bases on a nearby diagonal (overlapping ties)
+            const int sh = rndr(1, 4);
+            plant(r, std::vector<uint8_t>(c.begin(), c.begin() + std::min<size_t>(c.size(), 30)), pos - sh);
+        }
+        break;
+    }
     default: {  // two strong copies on nearby diagonals (merged / overlapping components)
         r.resize(len1); for (auto &b : r) b = (uint8_t)rnd(4);
         const int P = rnd(std::max(1, len1 - len2));
@@ -359,9 +431,11 @@ static void run_batch(Ikswv *k, Batch &b, int nb)
         sp.len2 = r.qe + 1;
         revseq(r.qe + 1, b.qer.data() + sp.idq);
         revseq(r.te + 1, b.ref.data() + sp.idr);
+        if (i < nb && rescue_band_batch().take_pass1(sp, r)) continue;
         pairs[pos++] = sp;
     }
     k->getScores8(pairs, b.ref.data(), b.qer.data(), aln, pos, 1, 1);
+    if (nb) rescue_band_batch().run_pass1(b.ref.data(), b.qer.data(), aln, k);
 }
 
 static std::unique_ptr<Ikswv> make_k(int maxr, int maxq)
@@ -376,6 +450,7 @@ static int run_eq(std::vector<Job> &jobs, int minsc, int max_hits, int scalar_st
     long nview = 0, view_mm = 0, r2 = 0, ccap = 0;
     std::unique_ptr<rescue_prune_scratch> sscratch(new rescue_prune_scratch());
     std::vector<rb_comp> cn, cs;
+    long p1_band = 0, p1_guard = 0;
     long cls_n[128] = {0}, cls_mm[128] = {0};
     const int B = 2048;
     for (size_t base = 0; base < jobs.size(); base += B) {
@@ -446,11 +521,14 @@ static int run_eq(std::vector<Job> &jobs, int minsc, int max_hits, int scalar_st
         std::stable_sort(P.sp.begin(), P.sp.begin() + pn, [](const SeqPair &x, const SeqPair &y) { return x.len1 < y.len1; });
         const int nbd = rescue_band_enabled() ? rescue_band_batch().partition(P.sp.data(), pn) : 0;
         nband += nbd;
+        const uint64_t pb0 = rescue_band_batch().stats().p1_band, pg0 = rescue_band_batch().stats().p1_guard;
         run_batch(k.get(), P, nbd);
         std::vector<char> banded(m, 0);
         for (int t = 0; t < m; t++) banded[t] = idx[t] >= 0 && rescue_band_batch().banded(idx[t]);
         r2 += (long)rescue_band_batch().stats().r2_band;
         ccap += (long)rescue_band_batch().stats().comp_cap;
+        p1_band += (long)(rescue_band_batch().stats().p1_band - pb0);
+        p1_guard += (long)(rescue_band_batch().stats().p1_guard - pg0);
         rescue_band_batch().reset();
         // --- compare ---
         for (int t = 0; t < m; t++) {
@@ -485,7 +563,11 @@ static int run_eq(std::vector<Job> &jobs, int minsc, int max_hits, int scalar_st
                 const int s2 = S >= minsc ? scalar_score2(R, S, te, minsc) : -1;
                 bool sok = S == a.score;
                 if (S > 0) sok = sok && te == a.te && qe == a.qe;
-                if (S >= minsc) sok = sok && s2 == a.score2;
+                if (S >= minsc) {
+                    int tb, qb;
+                    scalar_pass1(J, S, te, qe, tb, qb);
+                    sok = sok && s2 == a.score2 && tb == a.tb && qb == a.qb;
+                }
                 if (!sok) {
                     scal_mm++;
                     if (scal_mm < 5) fprintf(stderr, "SCALAR vs kswv job=%zu cls=%d: scalar{%d %d %d %d} kswv{%d %d %d %d}\n",
@@ -494,16 +576,20 @@ static int run_eq(std::vector<Job> &jobs, int minsc, int max_hits, int scalar_st
             }
         }
     }
-    printf("eq: jobs=%ld pass=%ld full=%ld b1=%ld b2=%ld banded_parents=%ld round2=%ld comp_cap=%ld views_checked=%ld "
-           "MISMATCHES=%ld view_mismatch=%ld scalar_vs_kswv_mismatch=%ld (te2 differs, unconsumed: %ld)\n",
-           n, npass, nfull, nb1, nb2, nband, r2, ccap, nview, mism, view_mm, scal_mm, te2_diff);
+    printf("eq: jobs=%ld pass=%ld full=%ld b1=%ld b2=%ld banded_parents=%ld pass1_banded=%ld pass1_guard=%ld "
+           "round2=%ld comp_cap=%ld views_checked=%ld MISMATCHES=%ld view_mismatch=%ld scalar_vs_kswv_mismatch=%ld "
+           "(te2 differs, unconsumed: %ld)\n",
+           n, npass, nfull, nb1, nb2, nband, p1_band, p1_guard, r2, ccap, nview, mism, view_mm, scal_mm, te2_diff);
     for (int c = 0; c < 128; c++)
         if (cls_n[c]) printf("  class %3d: jobs=%ld mismatches=%ld\n", c, cls_n[c], cls_mm[c]);
     /* A pass with nothing banded compares kswv with kswv: fail it where banding runs, so the gate
      * cannot go vacuous (a cost gate or generator change that stops banding). */
-    const bool vacuous = rescue_band_enabled() && nband == 0;
-    if (vacuous) fprintf(stderr, "FAIL: no job was banded (open the cost gate: BWA3_RESCUE_BAND_COST=100000000)\n");
-    return mism || scal_mm || view_mm || vacuous ? 1 : 0;
+    const bool vacuous = rescue_band_enabled() && (nband == 0 || p1_band == 0);
+    if (vacuous) fprintf(stderr, "FAIL: no job was banded in pass 0 or pass 1 (open the cost gate: BWA3_RESCUE_BAND_COST=100000000)\n");
+    /* Production falls back to kswv when a banded pass-1 max is not S (the guard in rescue_band.h),
+     * but that cannot happen, so here any fallback fails the run: it means the band argument broke. */
+    if (p1_guard) fprintf(stderr, "FAIL: %ld pass-1 guard fallbacks (banded max != S)\n", p1_guard);
+    return mism || scal_mm || view_mm || vacuous || p1_guard ? 1 : 0;
 }
 
 /* ---------------------------------------------------------------------------------------- */
@@ -605,7 +691,7 @@ int main(int argc, char **argv)
     if (!strcmp(argv[1], "eq")) {
         const int ngen = atoi(argv[2]);
         rng.seed(strtoull(argv[3], nullptr, 10));
-        for (int t = 0; t < ngen; t++) jobs.push_back(gen(t % 11));
+        for (int t = 0; t < ngen; t++) jobs.push_back(gen(t % 12));
         for (int a = 4; a < argc; a++) load_dump(argv[a], jobs, 1);
         const int ss = rescue_env_int("RB_SCALAR_STRIDE", 0);
         return run_eq(jobs, minsc, max_hits, ss);
