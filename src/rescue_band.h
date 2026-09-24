@@ -61,6 +61,10 @@
  * BWA3_RESCUE_BAND_P1 = 0 (pass 1 all kswv), 1 (banded parents only) or 2 (default: every
  * eligible 8-bit default-scoring job); BWA3_RESCUE_BAND_P1_COST (pass-1 band iff its per-row cells
  * < pct% of kswv's, default 130);
+ * BWA3_RESCUE_FSCAN selects the band kernel, all byte-identical: 0 the original cell, 1 the fused
+ * (G-based) cell, 2 (default) the fused cell on two rows per step with the direct qe scan
+ * (rb_dp_wave2); BWA3_RESCUE_BAND_SHIFT=0 disables the per-lane band shift that aligns the lanes'
+ * query offsets within a 16-lane group (run_jobs);
  * BWA3_RESCUE_PRUNE_STATS=1 prints [RESCUE_BAND] / [RESCUE_PRUNE] counters and stage times. */
 #ifndef BWA_MEM3_RESCUE_BAND_H
 #define BWA_MEM3_RESCUE_BAND_H

@@ -77,12 +77,21 @@ static int rb_p1_cost_pct()
     return v;
 }
 
-/* BWA3_RESCUE_FSCAN (default on, the kswv toggle of the same name): rb_dp_core's G-based cell,
- * see RB_CELL1. The band path runs only at default scoring, so the insertion and deletion gap
- * costs always agree, as the cell requires. */
-static bool rb_fscan_on()
+/* BWA3_RESCUE_FSCAN selects the kernel: 0 = the original cell (rb_dp_core<false>), 1 = the fused
+ * G-based cell of rb_dp_core<true> (see RB_CELL1), 2 (default, or unset) = rb_dp_wave2, the fused
+ * cell on two rows per step with the direct qe scan. All three are byte-identical in every value the
+ * caller reads. The band path runs only at default scoring, so the insertion and deletion gap costs
+ * always agree, as the fused cell requires. */
+static int rb_kernel()
 {
-    static const bool on = [] { const char *e = getenv("BWA3_RESCUE_FSCAN"); return !e || e[0] != '0'; }();
+    static const int v = [] { const char *e = getenv("BWA3_RESCUE_FSCAN"); return e ? atoi(e) : 2; }();
+    return v;
+}
+
+/* BWA3_RESCUE_BAND_SHIFT=0 disables the per-lane band shift of run_jobs (see there); for A/B. */
+static bool rb_shift_on()
+{
+    static const bool on = [] { const char *e = getenv("BWA3_RESCUE_BAND_SHIFT"); return !e || e[0] != '0'; }();
     return on;
 }
 
@@ -451,6 +460,9 @@ struct rb_work {
     alignas(16) uint8_t gmax[16];
     /* Per-lane early-exit target (pass 1: the pass-0 score S; 0 for empty lanes). */
     alignas(16) uint8_t target[16];
+    /* rb_dp_wave2's qe: band index of the lane's qe cell, k = kb_chunk * 255 + kb_off - 1
+     * (rb_qe_scan); the other kernels leave it unset and snapshot the H row instead (SNAP). */
+    alignas(16) uint8_t kb_chunk[16], kb_off[16];
     template <class V> static void fit(V &v, size_t n) { if (v.size() < n) v.resize(n); }
 };
 
@@ -636,6 +648,211 @@ static long rb_dp_core(rb_work &w, int W, int NR, int omax, int ominq, int omask
     return computed;
 }
 
+/* qe of the lanes in msk, read off row `row` (H in Hrow; gmax is those lanes' gmax, which this row
+ * reached): the largest band index k in the row's computed range [klo, khi] whose LIVE cell holds
+ * gmax -- the same cell rb_snapshot + lane_result find, without copying the row. Cells outside the
+ * range are either never written (above khi: zero, and gmax > 0) or stale from earlier rows but dead
+ * for every lane (below klo: j >= quanta, live mask 0), exactly the cells the snapshot masks out.
+ * The index is kept as two bytes, k = chunk * 255 + off - 1: within a chunk of 255 indices the
+ * match position is (match & kv) with kv = 1..255, so a plain max finds the largest matching k and
+ * 0 means no match; the last matching chunk wins. A flushed lane always matches: its row max over
+ * live cells was gmax in this row (FScan: the row max over H equals the row max over G, RB_CELL1).
+ * Lanes outside msk keep their values. Cost: 2 loads + ~4 ops per cell-vector over the row's range,
+ * against 3 loads + 4 ops + 1 store over all W slots for the row copy. */
+static inline void rb_qe_scan(rb_work &w, const uint8_t *Hrow, int row, int W, int omax, int ominq,
+                              uint8x16_t msk, uint8x16_t gmax)
+{
+    const int khi = std::min(W - 1, row + omax), klo = std::max(0, row + ominq);
+    const uint8x16_t v1 = vdupq_n_u8(1), v2 = vdupq_n_u8(2);
+    uint8x16_t chunk = vld1q_u8(w.kb_chunk), off = vld1q_u8(w.kb_off);
+    const uint8_t *QL = w.QL.data();
+    for (int k0 = klo, c = klo / 255; k0 <= khi; k0 = (c + 1) * 255, c++) {
+        const int k1 = std::min(khi, c * 255 + 254);
+        uint8x16_t m0 = vdupq_n_u8(0), m1 = vdupq_n_u8(0);
+        uint8x16_t kv = vdupq_n_u8((uint8_t)(k0 - c * 255 + 1));
+        const uint8_t *hp = Hrow + (size_t)k0 * 16, *qp = QL + (size_t)(row + W - 1 - k0) * 16;   // p = row + W-1-k
+        int k = k0;
+        for (; k + 1 <= k1; k += 2, hp += 32, qp -= 32, kv = vaddq_u8(kv, v2)) {
+            const uint8x16_t e0 = vandq_u8(vceqq_u8(vld1q_u8(hp), gmax), vld1q_u8(qp));
+            const uint8x16_t e1 = vandq_u8(vceqq_u8(vld1q_u8(hp + 16), gmax), vld1q_u8(qp - 16));
+            m0 = vmaxq_u8(m0, vandq_u8(e0, kv));
+            m1 = vmaxq_u8(m1, vandq_u8(e1, vaddq_u8(kv, v1)));
+        }
+        if (k <= k1) m0 = vmaxq_u8(m0, vandq_u8(vandq_u8(vceqq_u8(vld1q_u8(hp), gmax), vld1q_u8(qp)), kv));
+        const uint8x16_t mm = vmaxq_u8(m0, m1);
+        const uint8x16_t any = vtstq_u8(mm, mm);
+        off = vbslq_u8(any, mm, off);
+        chunk = vbslq_u8(any, vdupq_n_u8((uint8_t)c), chunk);
+    }
+    vst1q_u8(w.kb_chunk, vbslq_u8(msk, chunk, vld1q_u8(w.kb_chunk)));
+    vst1q_u8(w.kb_off, vbslq_u8(msk, off, vld1q_u8(w.kb_off)));
+}
+
+/* The default kernel: the fused (FScan) cell of RB_CELL1 on TWO rows per step, (r, k) paired with
+ * (r + 1, k + 1). The pair shares the query slot p = r + W - 1 - k (one A / QL load for both), and
+ * row r + 1's cell takes its E predecessor (E_out of (r, k)) and its diagonal predecessor (H of
+ * (r, k + 1), the previous step's ha) from registers, so per two cells the step loads A, E and Hp
+ * once and stores H twice (row r's, for the qe scan) and E once (row r + 1's, for the next pair):
+ * 22 ops + 3 loads + 3 stores against 24 + 6 + 4 for RB_CELL2, with two independent F chains.
+ * H rotates through three buffers (rows r - 1, r, r + 1) so the qe of a run ending at row r - 1
+ * (flushed at r) and one ending at r (flushed at r + 1) both still have their rows. Row r + 1's
+ * range is row r's shifted by one, clipped to [0, W - 1]: the top cell (r, W - 1) has no partner
+ * when row r already reaches W - 1 (its E_out would feed (r + 1, W), nonexistent), and the bottom
+ * cell (r + 1, 0) has none when both rows start at 0 (its E predecessor is slot 0, which is never
+ * written: 0, as in the one-row kernel). E slot k + 2, written by (r + 1, k + 1), was last read by
+ * (r, k + 2) two steps earlier, so the in-place E buffer is safe. Every value each cell reads is the
+ * one the one-row kernel reads (same buffers or the register copy of the same value), the row maxima
+ * and the imp / te / flush bookkeeping are the same per row, the early exit is tested after each
+ * row (row r + 1's updates are discarded when row r already qualifies), and qe comes from
+ * rb_qe_scan on the same row and mask the snapshot would use. Pass 1 additionally flushes only
+ * lanes whose gmax already equals the target S: gmax never exceeds S (rescue_band.h), so a run
+ * ending below S is superseded by the run that reaches S, and a lane that never reaches it fails
+ * run_pass1's guard and is rerun through kswv, as before. */
+static long rb_dp_wave2(rb_work &w, int W, int NR, int omax, int ominq, int omaskq, bool early)
+{
+    long computed = 0;
+    alignas(16) static const int8_t tblv[16] = {1, -4, -4, -4, -1, -1, -1, -1,
+                                                -1, -1, -1, -1, -1, -1, -1, -1};
+    const uint8x16_t tbl = vld1q_u8((const uint8_t *)tblv);
+    const uint8x16_t v7 = vdupq_n_u8(7), v1 = vdupq_n_u8(1), v80 = vdupq_n_u8(0x80);
+    uint8_t *Hp = w.H.data(), *Ha = Hp + (size_t)W * 16, *Hb = Hp + (size_t)W * 32, *E = w.E.data();
+    const uint8_t *A = w.A.data(), *QL = w.QL.data(), *REF = w.REF.data();
+    uint8_t *Rout = w.R.data();
+    memset(Hp, 0, (size_t)W * 48);
+    memset(E, 0, (size_t)(W + 2) * 16);
+    uint8x16_t gmax = vdupq_n_u8(0), pend = vdupq_n_u8(0);
+    const uint8x16_t tgt = vld1q_u8(w.target);
+    int rlast = NR - 1;
+    uint16x8_t te_lo = vdupq_n_u16(0), te_hi = vdupq_n_u16(0);
+    /* Row-level update for `row` with row max rmax: R, imp, gmax, te, pend; returns the flush mask
+     * (lanes whose improving run ended at row - 1; pass 1: only those already at their target). */
+    auto row_update = [&](int row, uint8x16_t rmax, uint8x16_t rref) -> uint8x16_t {
+        vst1q_u8(Rout + (size_t)row * 16, rmax);
+        const uint8x16_t imp = vandq_u8(vcgtq_u8(rmax, gmax), vcltq_u8(rref, v80));
+        uint8x16_t flush = vbicq_u8(pend, imp);
+        if (early) flush = vandq_u8(flush, vceqq_u8(gmax, tgt));
+        gmax = vbslq_u8(imp, rmax, gmax);
+        const uint16x8_t rv = vdupq_n_u16((uint16_t)row);
+        te_lo = vbslq_u16(vreinterpretq_u16_u8(vzip1q_u8(imp, imp)), rv, te_lo);
+        te_hi = vbslq_u16(vreinterpretq_u16_u8(vzip2q_u8(imp, imp)), rv, te_hi);
+        pend = imp;
+        rlast = row;
+        return flush;
+    };
+    /* One row on its own (the last row of an odd count, or a row whose pair has an empty range):
+     * RB_CELL1 with Hp -> Ha and E in place. */
+    auto single_row = [&](int r) -> bool {
+        const uint8x16_t rref = vld1q_u8(REF + (size_t)r * 16);
+        uint8x16_t f = vdupq_n_u8(0), rmax = vdupq_n_u8(0);
+        const int khi = std::min(W - 1, r + omax), klo = std::max(0, r + ominq);
+        computed += khi >= klo ? khi - klo + 1 : 0;
+        const uint8_t *ap = A + (size_t)(r + (W - 1 - khi)) * 16, *qp = QL + (ap - A);
+        const int kun = std::max(klo, r + omaskq);
+        for (int k = khi; k >= klo; k--, ap += 16, qp += 16) {
+            const uint8x16_t q = vld1q_u8(ap), e = vld1q_u8(E + k * 16);
+            const int8x16_t sc = vreinterpretq_s8_u8(vqtbl1q_u8(tbl, veorq_u8(q, rref)));
+            const uint8x16_t h0 = vmaxq_u8(vsqaddq_u8(vld1q_u8(Hp + k * 16), sc), e);
+            vst1q_u8(Ha + k * 16, vmaxq_u8(h0, f));
+            rmax = vmaxq_u8(rmax, k >= kun ? h0 : vandq_u8(h0, vld1q_u8(qp)));
+            const uint8x16_t h07 = vqsubq_u8(h0, v7);
+            vst1q_u8(E + (k + 1) * 16, vmaxq_u8(h07, vqsubq_u8(e, v1)));
+            f = vmaxq_u8(h07, vqsubq_u8(f, v1));
+        }
+        const uint8x16_t flush = row_update(r, rmax, rref);
+        if (rb_mask16(flush)) rb_qe_scan(w, Hp, r - 1, W, omax, ominq, flush, gmax);
+        std::swap(Hp, Ha);
+        return early && vminvq_u8(vcgeq_u8(gmax, tgt)) == 0xFF;
+    };
+    int r = 0;
+    bool stop = false;
+    for (; !stop && r + 1 < NR; r += 2) {
+        const int khi_a = std::min(W - 1, r + omax), klo_a = std::max(0, r + ominq);
+        const int khi_b = std::min(W - 1, r + 1 + omax), klo_b = std::max(0, r + 1 + ominq);
+        if (khi_a < klo_a || khi_b < klo_b) { stop = single_row(r) || single_row(r + 1); continue; }
+        const uint8x16_t rref_a = vld1q_u8(REF + (size_t)r * 16), rref_b = vld1q_u8(REF + (size_t)(r + 1) * 16);
+        uint8x16_t fa = vdupq_n_u8(0), fb = vdupq_n_u8(0), rmax_a = vdupq_n_u8(0), rmax_b = vdupq_n_u8(0);
+        uint8x16_t diag = vdupq_n_u8(0);   // H of (r, k + 1); zero above row r's range, never written
+        const int kun_a = std::max(klo_a, r + omaskq), kun_b = std::max(klo_b, r + 1 + omaskq);
+        const int kun = std::max(kun_a, kun_b - 1);   // both cells of a step unmasked iff k >= kun
+        const uint8_t *ap = A + (size_t)(r + (W - 1 - khi_a)) * 16, *qp = QL + (ap - A);
+        int k = khi_a;
+        if (khi_a == W - 1) {   // (r, W - 1) alone: its partner (r + 1, W) does not exist
+            const uint8x16_t q = vld1q_u8(ap), e = vld1q_u8(E + k * 16);
+            const int8x16_t sc = vreinterpretq_s8_u8(vqtbl1q_u8(tbl, veorq_u8(q, rref_a)));
+            const uint8x16_t h0 = vmaxq_u8(vsqaddq_u8(vld1q_u8(Hp + k * 16), sc), e);
+            diag = vmaxq_u8(h0, fa);
+            vst1q_u8(Ha + k * 16, diag);
+            rmax_a = k >= kun_a ? h0 : vandq_u8(h0, vld1q_u8(qp));
+            fa = vqsubq_u8(h0, v7);   // max(h07, sat(0 - 1))
+            k--; ap += 16; qp += 16;
+        }
+#define RB_W2_STEP(MASK)                                                                        \
+        {                                                                                      \
+            const uint8x16_t q = vld1q_u8(ap), e = vld1q_u8(E + k * 16);                       \
+            const int8x16_t sca = vreinterpretq_s8_u8(vqtbl1q_u8(tbl, veorq_u8(q, rref_a)));   \
+            const uint8x16_t h0a = vmaxq_u8(vsqaddq_u8(vld1q_u8(Hp + k * 16), sca), e);        \
+            const uint8x16_t h07a = vqsubq_u8(h0a, v7);                                        \
+            const uint8x16_t ha = vmaxq_u8(h0a, fa);                                           \
+            vst1q_u8(Ha + k * 16, ha);                                                         \
+            fa = vmaxq_u8(h07a, vqsubq_u8(fa, v1));                                            \
+            const uint8x16_t ea = vmaxq_u8(h07a, vqsubq_u8(e, v1));   /* E in of (r+1, k+1) */ \
+            const int8x16_t scb = vreinterpretq_s8_u8(vqtbl1q_u8(tbl, veorq_u8(q, rref_b)));   \
+            const uint8x16_t h0b = vmaxq_u8(vsqaddq_u8(diag, scb), ea);                        \
+            const uint8x16_t h07b = vqsubq_u8(h0b, v7);                                        \
+            vst1q_u8(Hb + (k + 1) * 16, vmaxq_u8(h0b, fb));                                    \
+            fb = vmaxq_u8(h07b, vqsubq_u8(fb, v1));                                            \
+            vst1q_u8(E + (k + 2) * 16, vmaxq_u8(h07b, vqsubq_u8(ea, v1)));                     \
+            diag = ha;                                                                         \
+            if (MASK) {                                                                        \
+                const uint8x16_t m = vld1q_u8(qp);                                             \
+                rmax_a = vmaxq_u8(rmax_a, vandq_u8(h0a, m));                                   \
+                rmax_b = vmaxq_u8(rmax_b, vandq_u8(h0b, m));                                   \
+            } else {                                                                           \
+                rmax_a = vmaxq_u8(rmax_a, h0a);                                                \
+                rmax_b = vmaxq_u8(rmax_b, h0b);                                                \
+            }                                                                                  \
+        }
+        for (; k >= kun; k--, ap += 16, qp += 16) RB_W2_STEP(false)
+        for (; k >= klo_a; k--, ap += 16, qp += 16) RB_W2_STEP(true)
+#undef RB_W2_STEP
+        if (klo_b == klo_a) {   // (r + 1, 0) alone: its partner (r, -1) does not exist; E in = slot 0 = 0
+            const uint8x16_t q = vld1q_u8(ap);
+            const int8x16_t scb = vreinterpretq_s8_u8(vqtbl1q_u8(tbl, veorq_u8(q, rref_b)));
+            const uint8x16_t h0b = vsqaddq_u8(diag, scb);
+            vst1q_u8(Hb + klo_a * 16, vmaxq_u8(h0b, fb));
+            vst1q_u8(E + (klo_a + 1) * 16, vqsubq_u8(h0b, v7));
+            rmax_b = vmaxq_u8(rmax_b, vandq_u8(h0b, vld1q_u8(qp)));
+        }
+        computed += khi_a - klo_a + 1;
+        /* Row r, then row r + 1; one cross-domain test covers both flush masks (and, in pass 1, one
+         * the early exit, with row r re-tested only when the pair qualifies). */
+        const uint8x16_t flush_a = row_update(r, rmax_a, rref_a);
+        const uint8x16_t gmax_a = gmax;
+        if (early && vminvq_u8(vcgeq_u8(gmax_a, tgt)) == 0xFF) {
+            if (rb_mask16(flush_a)) rb_qe_scan(w, Hp, r - 1, W, omax, ominq, flush_a, gmax_a);
+            std::swap(Hp, Ha);
+            stop = true;
+            break;
+        }
+        computed += khi_b - klo_b + 1;
+        const uint8x16_t flush_b = row_update(r + 1, rmax_b, rref_b);
+        if (rb_mask16(vorrq_u8(flush_a, flush_b))) {
+            if (rb_mask16(flush_a)) rb_qe_scan(w, Hp, r - 1, W, omax, ominq, flush_a, gmax_a);
+            if (rb_mask16(flush_b)) rb_qe_scan(w, Ha, r, W, omax, ominq, flush_b, gmax);
+        }
+        uint8_t *t = Hp; Hp = Hb; Hb = Ha; Ha = t;
+        stop = early && vminvq_u8(vcgeq_u8(gmax, tgt)) == 0xFF;
+    }
+    if (!stop && r < NR) single_row(r);
+    uint8x16_t fin = pend;
+    if (early) fin = vandq_u8(fin, vceqq_u8(gmax, tgt));
+    if (rb_mask16(fin)) rb_qe_scan(w, Hp, rlast, W, omax, ominq, fin, gmax);
+    vst1q_u16(w.te, te_lo);
+    vst1q_u16(w.te + 8, te_hi);
+    vst1q_u8(w.gmax, gmax);
+    return computed;
+}
+
 }  // namespace
 #endif
 
@@ -756,16 +973,32 @@ void RescueBandBatch::run_jobs(bool pass1)
         const int Pp = (P + 15) & ~15, NRp = (NR + 15) & ~15;
         const int stride = std::max(Pp, NRp);
         rb_work::fit(w.A, (size_t)Pp * 16); rb_work::fit(w.QL, (size_t)Pp * 16);
-        rb_work::fit(w.REF, (size_t)NRp * 16); rb_work::fit(w.H, (size_t)W * 32);
-        rb_work::fit(w.E, (size_t)(W + 1) * 16); rb_work::fit(w.R, (size_t)NRp * 16);
+        rb_work::fit(w.REF, (size_t)NRp * 16); rb_work::fit(w.H, (size_t)W * 48);
+        rb_work::fit(w.E, (size_t)(W + 2) * 16); rb_work::fit(w.R, (size_t)NRp * 16);
         rb_work::fit(w.SNAP, (size_t)W * 16); rb_work::fit(w.ST, (size_t)stride * 16);
+        /* Band shift: a lane narrower than the group is widened to W anyway; put the spare
+         * diagonals BELOW its band (dlo - delta) rather than above whenever that moves its query
+         * offset o = r0 - dlo up toward the group's largest, so the lanes' live column ranges
+         * line up and the per-row union the kernel computes (omax - ominq wide) shrinks: -9.5% of
+         * pass-0 cells on real jobs. Exact: the lane's cells are a superset of its band's, which
+         * rescue_band.h shows keeps every property the merge relies on, and the pass-1 band
+         * [-Imax, Dmax] only gets more insertion diagonals. oe[l] replaces o everywhere below. */
+        int oe[16];
+        {
+            int om = INT_MIN;
+            for (int l = 0; l < nl; l++) om = std::max(om, L[l]->r0 - L[l]->dlo);
+            for (int l = 0; l < nl; l++) {
+                const int o = L[l]->r0 - L[l]->dlo;
+                oe[l] = rb_shift_on() ? o + std::min(om - o, W - L[l]->w) : o;
+            }
+        }
         uint8_t *ST = w.ST.data();
         for (int l = 0; l < 16; l++) {
             uint8_t *row = ST + (size_t)l * stride;
             memset(row, 0xC0, Pp);
             if (l >= nl) continue;
             const job &J = *L[l];
-            const int pq0 = C - (J.r0 - J.dlo);   // p where j = 0
+            const int pq0 = C - oe[l];   // p where j = 0
             const int a = std::max(0, pq0), b = std::min(P, pq0 + J.len2);
             const uint8_t *q = J.qry - pq0;
             for (int p = a; p < b; p++) { const uint8_t c = q[p]; row[p] = c < 4 ? c : 8; }
@@ -802,14 +1035,16 @@ void RescueBandBatch::run_jobs(bool pass1)
         RB_T(tb1);
         int omax = INT_MIN, ominq = INT_MAX, omaskq = INT_MIN;
         for (int l = 0; l < nl; l++) {
-            const int o = L[l]->r0 - L[l]->dlo;
+            const int o = oe[l];
             omax = std::max(omax, o);
             ominq = std::min(ominq, o - L[l]->quanta + 1);
             omaskq = std::max(omaskq, o - L[l]->quanta + 1);
         }
         for (int l = 0; l < 16; l++) w.target[l] = pass1 && l < nl ? (uint8_t)L[l]->target : 0;
-        const long computed = rb_fscan_on() ? rb_dp_core<true>(w, W, NR, omax, ominq, omaskq, pass1)
-                                            : rb_dp_core<false>(w, W, NR, omax, ominq, omaskq, pass1);
+        const int kern = rb_kernel();
+        const long computed = kern >= 2 ? rb_dp_wave2(w, W, NR, omax, ominq, omaskq, pass1)
+                            : kern == 1 ? rb_dp_core<true>(w, W, NR, omax, ominq, omaskq, pass1)
+                                        : rb_dp_core<false>(w, W, NR, omax, ominq, omaskq, pass1);
         if (st) stats.cells_pad += (uint64_t)16 * computed;
 #ifdef RB_PROFILE
         g_rb_prof.cells += 16.0 * computed;
@@ -824,9 +1059,10 @@ void RescueBandBatch::run_jobs(bool pass1)
             if (x.g > 0) {
                 const int rt = w.te[l];
                 x.te = J.r0 + rt;
-                const int o = J.r0 - J.dlo;
-                for (int k = W - 1; k >= 0; k--)   // max k == min j
-                    if (w.SNAP[k * 16 + l] == x.g) { x.qe = rt - k + o; break; }
+                if (kern >= 2) x.qe = rt - ((int)w.kb_chunk[l] * 255 + (int)w.kb_off[l] - 1) + oe[l];
+                else
+                    for (int k = W - 1; k >= 0; k--)   // max k == min j
+                        if (w.SNAP[k * 16 + l] == x.g) { x.qe = rt - k + oe[l]; break; }
             }
             return x;
         };
