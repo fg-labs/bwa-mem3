@@ -108,49 +108,52 @@ static inline Kind lean(const Job &jb, Scratch &s, int &hb, int &he)
 // Design (aarch64):
 //  1. N check (vector OR) while copying ref and query into zero-padded buffers, so the vector
 //     5-mer code passes never read past either sequence.
-//  2. Query table tab[code] = (off - j_last) | MULTI (0x2000 if the code occurs more than once in
-//     the query), or ABSENT (0x4040, 2 KB memset). nxt[j] chains earlier occurrences (as lean).
-//  3. Per ref row, 16 rows at a time: 5-mer codes in NEON, lanes moved to GPRs as 64-bit words,
-//     four scalar table loads merged per word, one vector add/store per 8 rows:
-//     dd[r] = r + tab[code[r]] = diagonal of the row's representative hit (latest query
-//     occurrence); >= 0x4000 when the code is absent, bit 0x2000 when it is multi.
-//  4. Vector pass over dd: normalise (absent -> DUMMY), find starts/ends of runs of equal diagonal
-//     (a run of L consecutive rows on diagonal d = L hits on d) and multi rows; left-pack their row
-//     positions into lists with a TBL shuffle table. No data-dependent branches so far.
-//  5. Per run: cnt[d] += L, minrow[d] = first touch (select). Remaining occurrences of multi codes
-//     in "layers": layer L holds each row whose code occurs >= L times, with its L-th latest query
-//     position; within a layer consecutive rows on one diagonal collapse to runs again (vector
-//     boundary detection + left-pack), minrow by min. There are no per-hit read-modify-write
-//     chains through cnt[] (lean's cost), and no per-row branches (lean's mispredicts).
-//  6. Kadane as scans: P = prefix sum of cnt-1, PM(d) = min(0, P[0..d-1]) (log-step int16 scans,
-//     block-local, plus a carry), fwd = P - PM, max fwd < 14 -> B1; SX(d) = max_{b>=d} P[b]
-//     (backward scan); bnd(d) = 5 + SX(d) - PM(d) (== 5 + fwd + bwd - v). Exact while
-//     |P| < 32768, guaranteed by hits <= 32000; above that we fall back to lean().
-//  7. Components: bitsets of (bnd >= 19) and (bnd >= 19 && cnt > 0); lo = masked vector min of
-//     minrow; per component (few) ub = vector max of bnd, dmax = highest hit bit.
+//  2. Query table, cached per oriented query: tab[code] = (off - j_last) | MULTI (0x2000 if the
+//     code occurs more than once) | occurrences << 16, a 1024-bit presence bitmap pres[], and
+//     nxt[j] chaining earlier occurrences (as lean).
+//  3. Hit rows, 16 at a time: 5-mer codes and a presence-bitmap lookup (two 64-byte TBLs) in NEON;
+//     the rows whose code occurs in the query (~1/3 of a window) and their codes are left-packed
+//     into lists with a TBL shuffle table. No scalar work per window row.
+//  4. Layer 1, 8 hit rows at a time: four scalar table loads per 64-bit word of codes give each
+//     row's representative hit (latest query occurrence), diagonal d = row + off - j_last; runs of
+//     consecutive rows on one diagonal (a run of L rows on d = L hits on d), the multi rows, and
+//     the exact hit total for the gate (sum of occurrences) come out of the same vector pass.
+//  5. Per run: cnt[d] += L, minrow[d] = first touch (layer-1 runs are applied last to first, so a
+//     plain store suffices). Remaining occurrences of multi codes in "layers": layer L holds each
+//     row whose code occurs >= L times, with its L-th latest query position; within a layer
+//     consecutive rows on one diagonal collapse to runs again, minrow by min, and the next layer
+//     is gathered in the same pass. There are no per-hit read-modify-write chains through cnt[]
+//     (lean's cost), and no per-row branches (lean's mispredicts).
+//  6. Kadane as scans: P = prefix sum of cnt-1, PM(d) = min(0, P[0..d-1]), fwd = P - PM, max fwd
+//     < 14 -> B1; SX(d) = max_{b>=d} P[b]; bnd(d) = 5 + SX(d) - PM(d) (== 5 + fwd + bwd - v).
+//     The diagonals are cut into 8 segments (one per lane) and transposed 8x8 in registers, so
+//     each scan step is one vertical op for 8 diagonals; segment carries join them. Exact while
+//     |P| < 32768, guaranteed by hits <= 32000; above that we return SCALAR.
+//  7. Components: bitsets of (bnd >= 19) and (bnd >= 19 && cnt > 0) built in the backward scan;
+//     per component with a hit (few) ub = vector max of bnd, dmax = highest hit bit, and
+//     lo = masked vector min of minrow.
 #if defined(__aarch64__)
 struct NeonScratch {
     static const int CAP = 4096 + 64;
     alignas(16) uint8_t rbuf[CAP + 64];   // 4 zero bytes, ref, zero padding
     alignas(16) uint8_t qbuf[CAP + 64];   // 4 zero bytes, query, zero padding
     alignas(16) uint16_t qcode[CAP];
-    alignas(16) uint16_t RA[CAP], RB[CAP], D[CAP], B[CAP];  // multi-occurrence layers
-    alignas(16) int16_t JA[CAP], JB[CAP], Jn[CAP];
-    alignas(16) int16_t tab[1024];
+    alignas(16) uint16_t RA[CAP], RB[CAP];                  // multi-occurrence layers: rows
+    alignas(16) int16_t JA[CAP], JB[CAP];                   // ... and query positions
+    alignas(16) uint16_t B[CAP], BD[CAP], BR[CAP];          // runs: list index, diagonal, row
+    alignas(16) uint32_t tab[1024];       // per code: (off - j_last) | MULTI, occurrences << 16
+    alignas(16) uint8_t pres[128];        // bitmap of the 5-mer codes present in the query
     alignas(16) int16_t nxt[CAP];
-    alignas(16) uint16_t dd[CAP];
-    alignas(16) uint16_t S[CAP], E[CAP];                    // run starts / ends (rows)
-    alignas(16) uint16_t cnt[CAP];
+    alignas(16) uint16_t PR[CAP], PC[CAP];  // hit rows and their 5-mer codes
+    alignas(16) uint16_t cnt[CAP + 8];
     alignas(16) int16_t minrow[CAP];
-    alignas(16) int16_t P[CAP], PM[CAP], bnd[CAP];
-    alignas(16) uint64_t mw[CAP / 64 + 2], hw[CAP / 64 + 2];  // bitsets (written bytewise)
+    alignas(16) int16_t P[CAP], PM[CAP], TC[CAP], bnd[CAP];  // P, PM, TC (cnt): segment-transposed (step 6)
+    alignas(16) uint64_t mw[CAP / 64 + 3], hw[CAP / 64 + 3];  // bitsets (written bytewise)
     alignas(16) uint8_t shuf[256][16];   // left-pack shuffles for 8 x u16 lanes
     uint8_t pc[256];
-    // Query cache: the query table (qbuf/qcode/tab/nxt/qn_at) depends only on the oriented mate,
+    // Query cache: the query table (qbuf/qcode/tab/pres/nxt) depends only on the oriented mate,
     // which is the same for every anchor rescued with that mate and strand. Rebuilt only when the
     // query bytes differ from the last call's.
-    alignas(16) uint16_t qcnt[1024];
-    alignas(16) uint16_t qn_at[CAP];      // occurrences of code(j) at or before j (total at the last)
     uint8_t qcache[CAP];
     int qlen_c = -1;
     bool q_has_n = false;
@@ -175,13 +178,6 @@ struct NeonScratch {
     }
 };
 
-static inline uint16_t *neon_pack(uint16_t *out, uint16x8_t pos, unsigned m, const NeonScratch &s)
-{
-    const uint8x16_t sh = vld1q_u8(s.shuf[m]);
-    vst1q_u16(out, vreinterpretq_u16_u8(vqtbl1q_u8(vreinterpretq_u8_u16(pos), sh)));
-    return out + s.pc[m];
-}
-
 // First index >= from with bit set (inv=0) / clear (inv=~0) in the bitset w, or n if none.
 static inline int neon_next(const uint64_t *w, int from, int n, uint64_t inv)
 {
@@ -204,6 +200,23 @@ static inline int neon_last(const uint64_t *w, int a, int b)
         if (x) { const int r = (k << 6) + 63 - __builtin_clzll(x); return r >= a ? r : -1; }
         if (--k < (a >> 6)) return -1;
         x = w[k];
+    }
+}
+
+// In-register 8x8 transpose of 16-bit lanes: x[k][s] <-> x[s][k].
+static inline void neon_transpose8(int16x8_t *x)
+{
+    int16x8_t t[8];
+    for (int k = 0; k < 8; k += 2) { t[k] = vtrn1q_s16(x[k], x[k + 1]); t[k + 1] = vtrn2q_s16(x[k], x[k + 1]); }
+    int32x4_t u[8];
+    for (int k = 0; k < 8; k += 4)
+        for (int e = 0; e < 2; e++) {
+            const int32x4_t a = vreinterpretq_s32_s16(t[k + e]), b = vreinterpretq_s32_s16(t[k + e + 2]);
+            u[k + e] = vtrn1q_s32(a, b); u[k + e + 2] = vtrn2q_s32(a, b);
+        }
+    for (int k = 0; k < 4; k++) {
+        const int64x2_t a = vreinterpretq_s64_s32(u[k]), b = vreinterpretq_s64_s32(u[k + 4]);
+        x[k] = vreinterpretq_s16_s64(vtrn1q_s64(a, b)); x[k + 4] = vreinterpretq_s16_s64(vtrn2q_s64(a, b));
     }
 }
 
@@ -241,7 +254,7 @@ static inline Kind lean_neon(const Job &jb, NeonScratch &s, int &hb, int &he, in
     }
     const int quanta = ((len2 + 15) / 16) * 16, off = quanta, nd = len1 + quanta + 1;
     // ---- 2. query table (cached per oriented query): copy + N flag, tab[code] = (off - j_last)
-    //      | MULTI, nxt[] = earlier occurrences, qn_at[j] = occurrences of code(j) up to j ----
+    //      | MULTI | occurrences << 16, pres[] = codes present, nxt[] = earlier occurrences ----
     if (len2 != s.qlen_c || memcmp(q, s.qcache, (size_t)len2) != 0) {
         uint8_t *qb = s.qbuf + 4;
         uint8x16_t qv = vdupq_n_u8(0);
@@ -254,16 +267,15 @@ static inline Kind lean_neon(const Job &jb, NeonScratch &s, int &hb, int &he, in
         memcpy(s.qcache, q, (size_t)len2);
         s.qlen_c = len2;
         if (!s.q_has_n && len2 >= 5) {
-            memset(s.tab, 0x40, sizeof s.tab);           // ABSENT = 0x4040
-            memset(s.qcnt, 0, sizeof s.qcnt);
+            memset(s.tab, 0, sizeof s.tab);
+            memset(s.pres, 0, sizeof s.pres);
             for (int b = 0; b < len2; b += 16) neon_codes16(s.qbuf + b, s.qcode + b);
             for (int jj = 4; jj < len2; jj++) {
                 const int c = s.qcode[jj];
-                const int old = (uint16_t)s.tab[c];
-                const bool absent = old >= 0x4000;
-                s.nxt[jj] = absent ? (int16_t)-1 : (int16_t)(off - (old & 0x1FFF));
-                s.tab[c] = (int16_t)((off - jj) | (absent ? 0 : 0x2000));
-                s.qn_at[jj] = ++s.qcnt[c];
+                const uint32_t old = s.tab[c], occ = (old >> 16) + 1;
+                s.nxt[jj] = occ == 1 ? (int16_t)-1 : (int16_t)(off - (old & 0x1FFF));
+                s.tab[c] = occ << 16 | (uint32_t)(off - jj) | (occ == 1 ? 0 : 0x2000);
+                s.pres[c >> 3] |= (uint8_t)(1u << (c & 7));
             }
         }
     }
@@ -277,213 +289,294 @@ static inline Kind lean_neon(const Job &jb, NeonScratch &s, int &hb, int &he, in
     static const uint16_t io[8] = {0, 1, 2, 3, 4, 5, 6, 7};
     const uint16x8_t WL = vld1q_u16(wl), WH = vld1q_u16(wh), IO = vld1q_u16(io), k8 = vdupq_n_u16(8);
 
-    // ---- 3+4. per ref row: representative diagonal, runs of equal diagonal, multi rows ----
-    // (a) dd[r] = r + tab[code[r]] for 16 rows at a time: 5-mer codes in NEON, lanes moved to
-    //     GPRs as 64-bit words, four table loads merged per word, one vector add/store per 8
-    //     rows (>= 0x4000: code absent from the query; bit 0x2000: code occurs more than once).
+    // ---- 3. rows whose 5-mer occurs in the query (hit rows): 16 rows at a time, 5-mer codes and a
+    //      presence-bitmap lookup (two 64-byte TBLs) in NEON; left-pack the hit rows and their codes.
+    //      Only hit rows (~1/3 of a window) reach the scalar table loads below. ----
+    int np;
     {
-        const uint16_t *__restrict tab = (const uint16_t *)s.tab;
-        static const uint16_t io16[16] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
-        const uint16x8_t io0 = vld1q_u16(io16), io1 = vld1q_u16(io16 + 8);
-        for (int b = 0; b < len1; b += 16) {
+        const uint8x16x4_t plo = vld1q_u8_x4(s.pres), phi = vld1q_u8_x4(s.pres + 64);
+        static const uint8_t p2[16] = {1, 2, 4, 8, 16, 32, 64, 128, 0, 0, 0, 0, 0, 0, 0, 0};
+        static const uint8_t bw[16] = {1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128};
+        const uint8x16_t P2 = vld1q_u8(p2), BW = vld1q_u8(bw), k64 = vdupq_n_u8(64), k7 = vdupq_n_u8(7);
+        uint16_t *rp = s.PR, *cp = s.PC;
+        // rows b..b+15, of which those with bit set in keep are inside the window
+        auto block = [&](int b, unsigned keep) {
             const uint8_t *buf = s.rbuf + b;
             const uint8x16_t a0 = vld1q_u8(buf), a1 = vld1q_u8(buf + 1), a2 = vld1q_u8(buf + 2),
                              a3 = vld1q_u8(buf + 3), a4 = vld1q_u8(buf + 4);
-            uint8x16_t lo = vorrq_u8(vshlq_n_u8(a1, 6), vshlq_n_u8(a2, 4));
-            lo = vorrq_u8(lo, vorrq_u8(vshlq_n_u8(a3, 2), a4));
-            const uint64x2_t c0 = vreinterpretq_u64_u8(vzip1q_u8(lo, a0));
-            const uint64x2_t c1 = vreinterpretq_u64_u8(vzip2q_u8(lo, a0));
-            const uint64_t w[4] = {vgetq_lane_u64(c0, 0), vgetq_lane_u64(c0, 1),
-                                   vgetq_lane_u64(c1, 0), vgetq_lane_u64(c1, 1)};
-            uint64_t o[4];
-            for (int k = 0; k < 4; k++) {
-                const uint64_t x = w[k];
-                o[k] = (uint64_t)tab[x & 1023] | ((uint64_t)tab[(x >> 16) & 1023] << 16) |
-                       ((uint64_t)tab[(x >> 32) & 1023] << 32) | ((uint64_t)tab[x >> 48] << 48);
-            }
-            const uint16x8_t bb = vdupq_n_u16((uint16_t)b);
-            const uint16x8_t v0 = vreinterpretq_u16_u64(vcombine_u64(vcreate_u64(o[0]), vcreate_u64(o[1])));
-            const uint16x8_t v1 = vreinterpretq_u16_u64(vcombine_u64(vcreate_u64(o[2]), vcreate_u64(o[3])));
-            vst1q_u16(s.dd + b, vaddq_u16(v0, vaddq_u16(io0, bb)));
-            vst1q_u16(s.dd + b + 8, vaddq_u16(v1, vaddq_u16(io1, bb)));
+            // code & 255 = a1 a2 a3 a4 (2 bits each; bases are 0..3, so shift-insert is exact);
+            // code >> 8 = a0
+            const uint8x16_t lo = vsliq_n_u8(vsliq_n_u8(vsliq_n_u8(a4, a3, 2), a2, 4), a1, 6);
+            const uint8x16_t idx = vsraq_n_u8(vshlq_n_u8(a0, 5), lo, 3);             // code >> 3
+            // idx < 64 -> plo; idx >= 64 -> phi (idx - 64 wraps to >= 192 below 64: TBX keeps plo's)
+            const uint8x16_t byte = vqtbx4q_u8(vqtbl4q_u8(plo, idx), phi, vsubq_u8(idx, k64));
+            const uint8x16_t hit = vtstq_u8(byte, vqtbl1q_u8(P2, vandq_u8(lo, k7)));
+            uint8x16_t m = vandq_u8(hit, BW);
+            m = vpaddq_u8(m, m); m = vpaddq_u8(m, m); m = vpaddq_u8(m, m);
+            const unsigned m16 = vgetq_lane_u16(vreinterpretq_u16_u8(m), 0) & keep;
+            const uint16x8_t c0 = vreinterpretq_u16_u8(vzip1q_u8(lo, a0));
+            const uint16x8_t c1 = vreinterpretq_u16_u8(vzip2q_u8(lo, a0));
+            const uint16x8_t pos = vaddq_u16(IO, vdupq_n_u16((uint16_t)b));
+            const unsigned ml = m16 & 0xFF, mh = m16 >> 8;
+            const uint8x16_t shl = vld1q_u8(s.shuf[ml]), shh = vld1q_u8(s.shuf[mh]);
+            vst1q_u16(rp, vreinterpretq_u16_u8(vqtbl1q_u8(vreinterpretq_u8_u16(pos), shl)));
+            vst1q_u16(cp, vreinterpretq_u16_u8(vqtbl1q_u8(vreinterpretq_u8_u16(c0), shl)));
+            rp += s.pc[ml]; cp += s.pc[ml];
+            vst1q_u16(rp, vreinterpretq_u16_u8(vqtbl1q_u8(vreinterpretq_u8_u16(vaddq_u16(pos, k8)), shh)));
+            vst1q_u16(cp, vreinterpretq_u16_u8(vqtbl1q_u8(vreinterpretq_u8_u16(c1), shh)));
+            rp += s.pc[mh]; cp += s.pc[mh];
+        };
+        // rows 0..3 have no 5-mer; the last block may extend past the window
+        const int nfull = len1 >> 4;
+        const unsigned tail = (1u << (len1 & 15)) - 1;
+        if (nfull == 0) {
+            block(0, 0xFFF0u & tail);
+        } else {
+            block(0, 0xFFF0u);
+            for (int b = 16; b < nfull * 16; b += 16) block(b, 0xFFFFu);
+            if (tail) block(nfull * 16, tail);
         }
-        uint16_t *dd = s.dd;
-        dd[0] = dd[1] = dd[2] = dd[3] = 0x4000;             // rows 0..3 have no 5-mer
-        vst1q_u16(dd + len1, vdupq_n_u16(0x4000)); vst1q_u16(dd + len1 + 8, vdupq_n_u16(0x4000));
+        np = (int)(rp - s.PR);
     }
-    // (b) normalise (absent -> DUMMY), then left-pack run starts, run ends (one past) and multi
-    //     rows into position lists: a run of L rows on diagonal d is L hits on d.
-    const uint16_t DUMMY = 0x1FFF;
-    uint16_t *sp = s.S, *ep = s.E, *mp = s.RA;
+    if (np == 0) return B1;
+    // ---- 4+5. accumulate hits. The table value of a hit row's code is tab[code] = (off - j_last) |
+    //      MULTI, where j_last is the code's latest query occurrence and MULTI (0x2000) marks a code
+    //      occurring more than once. Layer 1 = every hit row with its latest occurrence: diagonal
+    //      d = row + off - j_last; consecutive rows on one diagonal collapse to runs (a run of L
+    //      rows on d = L hits on d). Layer L >= 2 holds each row whose code occurs >= L times, with
+    //      its L-th latest occurrence, and again collapses to runs. No per-hit read-modify-write
+    //      chains through cnt[] and no per-row branches. ----
+    int hits = np;
+    const uint16x8_t koff = vdupq_n_u16((uint16_t)off), one16 = vdupq_n_u16(1);
+    // Run boundaries of a layer's (row, diagonal) list are left-packed as (list index, diagonal,
+    // row) into B / BD / BR; k = 0 is always a boundary and B[nbd] = n closes the last run.
+    auto pack_runs = [&](uint16_t *&bp, uint16_t *&dp, uint16_t *&rp, uint16x8_t idx, uint16x8_t d,
+                         uint16x8_t r, unsigned m) {
+        const uint8x16_t sh = vld1q_u8(s.shuf[m]);
+        vst1q_u16(bp, vreinterpretq_u16_u8(vqtbl1q_u8(vreinterpretq_u8_u16(idx), sh)));
+        vst1q_u16(dp, vreinterpretq_u16_u8(vqtbl1q_u8(vreinterpretq_u8_u16(d), sh)));
+        vst1q_u16(rp, vreinterpretq_u16_u8(vqtbl1q_u8(vreinterpretq_u8_u16(r), sh)));
+        bp += s.pc[m]; dp += s.pc[m]; rp += s.pc[m];
+    };
+    int n;   // rows in the current layer >= 2 (R = s.RA, J = s.JA)
     {
-        const uint16x8_t k1fff = vdupq_n_u16(0x1FFF), k4000 = vdupq_n_u16(0x4000), k2000 = vdupq_n_u16(0x2000);
-        uint16x8_t pos = IO;
-        uint16x8_t prev = vdupq_n_u16(DUMMY);
-        for (int b = 0; b <= len1; b += 8, pos = vaddq_u16(pos, k8)) {
-            const uint16x8_t x = vld1q_u16(s.dd + b);
-            const uint16x8_t absent = vcgeq_u16(x, k4000);
-            const uint16x8_t multi = vtstq_u16(x, k2000);
-            const uint16x8_t xn = vorrq_u16(vandq_u16(x, k1fff), vandq_u16(absent, k1fff));
-            vst1q_u16(s.dd + b, xn);
-            const uint16x8_t xp = vextq_u16(prev, xn, 7);
-            prev = xn;
-            const uint16x8_t ne = vmvnq_u16(vceqq_u16(xn, xp));
-            const uint16x8_t st = vbicq_u16(ne, absent);                     // new non-dummy run
-            const uint16x8_t en = vbicq_u16(ne, vceqq_u16(xp, k1fff));       // one past a run's end
-            const unsigned se = vaddvq_u16(vorrq_u16(vandq_u16(st, WL), vandq_u16(en, WH)));
-            const unsigned mm = vaddvq_u16(vandq_u16(multi, WL));
-            sp = neon_pack(sp, pos, se & 0xFF, s);
-            ep = neon_pack(ep, pos, se >> 8, s);
-            mp = neon_pack(mp, pos, mm, s);
+        uint16_t *bp = s.B, *bdp = s.BD, *brp = s.BR, *mp = s.RA, *jp = (uint16_t *)s.JA;
+        uint16x8_t pR = vdupq_n_u16(0), pD = vdupq_n_u16(0xFFFF), idx = IO;
+        const uint16x8_t vn = vdupq_n_u16((uint16_t)np), k1fff = vdupq_n_u16(0x1FFF), k2000 = vdupq_n_u16(0x2000);
+        const uint32_t *__restrict tab = s.tab;
+        // table entries of four codes (lanes past np hold stale codes: masked below)
+        auto look4 = [tab](const uint16_t *c) {
+            uint64_t x;
+            memcpy(&x, c, 8);
+            const uint64_t a = tab[x & 1023] | (uint64_t)tab[(x >> 16) & 1023] << 32;
+            const uint64_t b = tab[(x >> 32) & 1023] | (uint64_t)tab[(x >> 48) & 1023] << 32;
+            return vreinterpretq_u16_u64(vcombine_u64(vcreate_u64(a), vcreate_u64(b)));
+        };
+        uint32x4_t extra = vdupq_n_u32(0);   // gate: occurrences - 1 summed over the hit rows
+        for (int k0 = 0; k0 < np; k0 += 8, idx = vaddq_u16(idx, k8)) {
+            const uint16x8_t r = vld1q_u16(s.PR + k0);
+            const uint16x8_t e0 = look4(s.PC + k0), e1 = look4(s.PC + k0 + 4);
+            const uint16x8_t t = vuzp1q_u16(e0, e1), occ = vuzp2q_u16(e0, e1);
+            const uint16x8_t tv = vandq_u16(t, k1fff);                  // off - j_last
+            const uint16x8_t d = vaddq_u16(r, tv);
+            const uint16x8_t rp = vextq_u16(pR, r, 7), dp = vextq_u16(pD, d, 7);
+            pR = r; pD = d;
+            const uint16x8_t valid = vcltq_u16(idx, vn);
+            const uint16x8_t cont = vandq_u16(vceqq_u16(r, vaddq_u16(rp, one16)), vceqq_u16(d, dp));
+            const uint16x8_t bd = vbicq_u16(valid, cont);
+            const uint16x8_t mu = vandq_u16(vtstq_u16(t, k2000), valid);
+            extra = vpadalq_u16(extra, vandq_u16(vsubq_u16(occ, one16), valid));
+            const unsigned m = vaddvq_u16(vorrq_u16(vandq_u16(bd, WL), vandq_u16(mu, WH)));
+            pack_runs(bp, bdp, brp, idx, d, r, m & 0xFF);
+            const uint8x16_t sh = vld1q_u8(s.shuf[m >> 8]);
+            vst1q_u16(mp, vreinterpretq_u16_u8(vqtbl1q_u8(vreinterpretq_u8_u16(r), sh)));
+            vst1q_u16(jp, vreinterpretq_u16_u8(vqtbl1q_u8(vreinterpretq_u8_u16(vsubq_u16(koff, tv)), sh)));
+            mp += s.pc[m >> 8]; jp += s.pc[m >> 8];
         }
-    }
-
-    // ---- 5. accumulate hits: runs of representative hits, then multi-occurrence layers ----
-    const int ndr = (nd + 7) & ~7;
-    memset(s.cnt, 0, (ndr + 8) * sizeof(uint16_t));
-    int hits = 0;
-    {
-        const int nr = (int)(sp - s.S);
-        const uint16_t *__restrict S = s.S, *__restrict E = s.E, *__restrict xn = s.dd;
+        n = (int)(mp - s.RA);
+        // Gate: the total hit count is known now (each hit row adds its code's occurrences),
+        // before anything is accumulated.
+        if ((long)np + vaddvq_u32(extra) > max_hits) return FULL;
+        // cnt is scanned up to the 8-segment round-up of nd (< nd + 64)
+        memset(s.cnt, 0, (((nd + 63) & ~63) + 8) * sizeof(uint16_t));
+        // Layer 1 runs, last to first: rows descend, so the last store to minrow[d] is the first
+        // touch and needs no read.
+        const int nbd = (int)(bp - s.B);
+        s.B[nbd] = (uint16_t)np;
         uint16_t *__restrict cnt = s.cnt;
         int16_t *__restrict minrow = s.minrow;
-        for (int k = 0; k < nr; k++) {
-            const int s0 = S[k], len = E[k] - s0, d = xn[s0];
-            const int c = cnt[d];
-            const int16_t mr = minrow[d];
-            minrow[d] = c ? mr : (int16_t)(s0 - 4);           // runs arrive in row order
-            cnt[d] = (uint16_t)(c + len);
-            hits += len;
+        for (int k = nbd - 1; k >= 0; k--) {
+            const int d = s.BD[k];
+            cnt[d] = (uint16_t)(cnt[d] + s.B[k + 1] - s.B[k]);
+            minrow[d] = (int16_t)(s.BR[k] - 4);
         }
-        // Layer L >= 2 holds, for every row whose code occurs >= L times in the query, the L-th
-        // latest occurrence J. Within a layer, consecutive rows on one diagonal (tandem repeats,
-        // repeated k-mers inside a matching segment) again collapse to runs.
-        int n = (int)(mp - s.RA);
-        // Gate: the total hit count is known now (each repeated-code row adds its code's
-        // remaining occurrences), before the costly layers and scans.
-        if (max_hits < (1 << 30)) {
-            long total = hits;
-            for (int k = 0; k < n; k++) { const int r = s.RA[k]; total += s.qn_at[r + off - xn[r]] - 1; }
-            if (total > max_hits) return FULL;
-        }
+    }
+    // Layers >= 2: diagonals and runs as in layer 1, then minrow by min; the next layer (rows
+    // whose occurrence chain continues, J = nxt[J]) is gathered and left-packed in the same pass.
+    {
         uint16_t *R = s.RA, *R2 = s.RB;
-        int16_t *J = s.JA, *J2 = s.JB, *Jn = s.Jn;
+        int16_t *J = s.JA, *J2 = s.JB;
         const int16_t *__restrict nxt = s.nxt;
-        for (int k = 0; k < n; k++) { const int r = R[k]; J[k] = nxt[r + off - xn[r]]; }
-        const uint16x8_t koff = vdupq_n_u16((uint16_t)off), one16 = vdupq_n_u16(1);
+        for (int k = 0; k < n; k++) J[k] = nxt[J[k]];
+        // J < len2 <= 4095; lanes past n hold stale values, so the index is masked to stay in nxt[]
+        auto nxt4 = [nxt](const int16_t *j) {
+            uint64_t x;
+            memcpy(&x, j, 8);
+            return (uint64_t)(uint16_t)nxt[x & 4095] | ((uint64_t)(uint16_t)nxt[(x >> 16) & 4095] << 16) |
+                   ((uint64_t)(uint16_t)nxt[(x >> 32) & 4095] << 32) | ((uint64_t)(uint16_t)nxt[(x >> 48) & 4095] << 48);
+        };
         while (n > 0) {
             hits += n;
             if (__builtin_expect(hits > 32000, 0)) return SCALAR;
-            // diagonals and run boundaries (as list indices; k = 0 is always a boundary)
-            uint16_t *bp = s.B;
+            uint16_t *bp = s.B, *bdp = s.BD, *brp = s.BR, *rp2 = R2, *jp2 = (uint16_t *)J2;
             uint16x8_t pR = vdupq_n_u16(0), pD = vdupq_n_u16(0xFFFF), idx = IO;
             const uint16x8_t vn = vdupq_n_u16((uint16_t)n);
             for (int k0 = 0; k0 < n; k0 += 8, idx = vaddq_u16(idx, k8)) {
                 const uint16x8_t r = vld1q_u16(R + k0);
                 const uint16x8_t d = vsubq_u16(vaddq_u16(r, koff), vreinterpretq_u16_s16(vld1q_s16(J + k0)));
-                vst1q_u16(s.D + k0, d);
                 const uint16x8_t rp = vextq_u16(pR, r, 7), dp = vextq_u16(pD, d, 7);
                 pR = r; pD = d;
+                const uint16x8_t valid = vcltq_u16(idx, vn);
                 const uint16x8_t cont = vandq_u16(vceqq_u16(r, vaddq_u16(rp, one16)), vceqq_u16(d, dp));
-                const uint16x8_t bd = vandq_u16(vmvnq_u16(cont), vcltq_u16(idx, vn));
-                bp = neon_pack(bp, idx, vaddvq_u16(vandq_u16(bd, WL)), s);
+                const int16x8_t jn = vreinterpretq_s16_u64(vcombine_u64(vcreate_u64(nxt4(J + k0)), vcreate_u64(nxt4(J + k0 + 4))));
+                const uint16x8_t keep = vandq_u16(vcgezq_s16(jn), valid);
+                const unsigned m = vaddvq_u16(vorrq_u16(vandq_u16(vbicq_u16(valid, cont), WL), vandq_u16(keep, WH)));
+                pack_runs(bp, bdp, brp, idx, d, r, m & 0xFF);
+                const uint8x16_t sh = vld1q_u8(s.shuf[m >> 8]);
+                vst1q_u16(rp2, vreinterpretq_u16_u8(vqtbl1q_u8(vreinterpretq_u8_u16(r), sh)));
+                vst1q_u16(jp2, vreinterpretq_u16_u8(vqtbl1q_u8(vreinterpretq_u8_s16(jn), sh)));
+                rp2 += s.pc[m >> 8]; jp2 += s.pc[m >> 8];
             }
             const int nbd = (int)(bp - s.B);
             s.B[nbd] = (uint16_t)n;
-            for (int t = 0; t < nbd; t++) {
-                const int b0 = s.B[t], len = s.B[t + 1] - b0, d = s.D[b0], row = R[b0];
-                const int c = cnt[d], mr = minrow[d];
+            uint16_t *__restrict cnt = s.cnt;
+            int16_t *__restrict minrow = s.minrow;
+            for (int k = 0; k < nbd; k++) {
+                const int d = s.BD[k], row = s.BR[k], c = cnt[d], mr = minrow[d];
                 minrow[d] = (int16_t)(c ? std::min(mr, row - 4) : row - 4);
-                cnt[d] = (uint16_t)(c + len);
-            }
-            // next layer: rows whose occurrence chain continues
-            for (int k = 0; k < n; k++) Jn[k] = nxt[J[k]];
-            uint16_t *rp2 = R2, *jp2 = (uint16_t *)J2;
-            for (int k0 = 0; k0 < n; k0 += 8) {
-                const int16x8_t jn = vld1q_s16(Jn + k0);
-                const uint16x8_t lanes = vcltq_u16(vaddq_u16(IO, vdupq_n_u16((uint16_t)k0)), vn);
-                const unsigned m = vaddvq_u16(vandq_u16(vandq_u16(vcgezq_s16(jn), lanes), WL));
-                const uint8x16_t sh = vld1q_u8(s.shuf[m]);
-                vst1q_u16(rp2, vreinterpretq_u16_u8(vqtbl1q_u8(vreinterpretq_u8_u16(vld1q_u16(R + k0)), sh)));
-                vst1q_u16(jp2, vreinterpretq_u16_u8(vqtbl1q_u8(vreinterpretq_u8_s16(jn), sh)));
-                rp2 += s.pc[m]; jp2 += s.pc[m];
+                cnt[d] = (uint16_t)(c + s.B[k + 1] - s.B[k]);
             }
             n = (int)(rp2 - R2);
             std::swap(R, R2); std::swap(J, J2);
         }
     }
-    if (hits == 0) return B1;
-    if (__builtin_expect(hits > 32000, 0)) return SCALAR;
 
-    // ---- 6a. forward scans: P (inclusive prefix of cnt-1), PM (exclusive running min, with 0) ----
-    const int16x8_t zero = vdupq_n_s16(0), one = vdupq_n_s16(1), big = vdupq_n_s16(32767),
-                    small = vdupq_n_s16(-32768);
+    // ---- 6. Kadane bounds as scans over the diagonals: P = inclusive prefix sum of cnt - 1,
+    //      PM(d) = min(0, P[0..d-1]), SX(d) = max(P[d..]); bnd(d) = 5 + SX(d) - PM(d)
+    //      (== 5 + fwd + bwd - (cnt - 1)), max fwd = max(P - PM). Exact while |P| < 32768,
+    //      guaranteed by hits <= 32000.
+    //      The diagonals are split into 8 segments of L (a multiple of 8), one per lane, and an 8x8
+    //      transpose turns 8 consecutive diagonals of every segment into 8 vectors, so each scan
+    //      step is one vertical op for 8 diagonals (instead of log-step shuffles within a vector).
+    //      Segments are scanned from zero, then combined through per-segment carries. ----
+    const int L = ((nd + 63) >> 6) << 3, NT = 8 * L;
+    const int16x8_t big = vdupq_n_s16(32767), small = vdupq_n_s16(-32768), zero = vdupq_n_s16(0);
+    int16x8_t CP, Mb, Xa;   // per segment: P before it; min(0, P before it); max P after it
     {
-        // Block-local scans are independent of the carries; only one add (P) and one min (PM)
-        // sit on the loop-carried chains.
-        int16x8_t carryP = zero, carryM = zero, bestv = small;
-        for (int d0 = 0; d0 < ndr; d0 += 8) {
-            int16x8_t l = vsubq_s16(vreinterpretq_s16_u16(vld1q_u16(s.cnt + d0)), one);
-            l = vaddq_s16(l, vextq_s16(zero, l, 7));
-            l = vaddq_s16(l, vextq_s16(zero, l, 6));
-            l = vaddq_s16(l, vextq_s16(zero, l, 4));            // local inclusive prefix
-            int16x8_t lm = vminq_s16(l, vextq_s16(big, l, 7));
-            lm = vminq_s16(lm, vextq_s16(big, lm, 6));
-            lm = vminq_s16(lm, vextq_s16(big, lm, 4));          // local running min of l
-            const int16x8_t p = vaddq_s16(l, carryP);
-            const int16x8_t m = vminq_s16(vaddq_s16(lm, carryP), carryM);  // incl. running min
-            const int16x8_t pm = vextq_s16(carryM, m, 7);
-            carryM = vminq_s16(carryM, vaddq_s16(carryP, vdupq_laneq_s16(lm, 7)));
-            carryP = vaddq_s16(carryP, vdupq_laneq_s16(l, 7));
-            bestv = vmaxq_s16(bestv, vsubq_s16(p, pm));
-            vst1q_s16(s.P + d0, p);
-            vst1q_s16(s.PM + d0, pm);
+        const int16x8_t one = vdupq_n_s16(1);
+        int16x8_t p = zero, rm = big, mx = small, bestl = small;
+        int16_t *__restrict TP = s.P, *__restrict TM = s.PM, *__restrict TC = s.TC;
+        for (int t = 0; t < L; t += 8) {
+            int16x8_t c[8];
+            for (int k = 0; k < 8; k++) c[k] = vreinterpretq_s16_u16(vld1q_u16(s.cnt + k * L + t));
+            neon_transpose8(c);
+            for (int k = 0; k < 8; k++) {
+                vst1q_s16(TC + (t + k) * 8, c[k]);
+                p = vaddq_s16(p, vsubq_s16(c[k], one));
+                vst1q_s16(TP + (t + k) * 8, p);
+                vst1q_s16(TM + (t + k) * 8, rm);            // segment-local exclusive running min
+                bestl = vmaxq_s16(bestl, vqsubq_s16(p, rm));
+                rm = vminq_s16(rm, p);
+                mx = vmaxq_s16(mx, p);
+            }
         }
-        if (5 + vmaxvq_s16(bestv) < MINSC) return B1;
+        // carries across lanes (segments): exclusive prefix sum of the totals; exclusive prefix
+        // min (with 0) of the segment minima; exclusive suffix max of the segment maxima
+        int16x8_t x = p;
+        x = vaddq_s16(x, vextq_s16(zero, x, 7));
+        x = vaddq_s16(x, vextq_s16(zero, x, 6));
+        x = vaddq_s16(x, vextq_s16(zero, x, 4));
+        CP = vextq_s16(zero, x, 7);
+        int16x8_t g = vaddq_s16(CP, rm);
+        g = vminq_s16(g, vextq_s16(big, g, 7));
+        g = vminq_s16(g, vextq_s16(big, g, 6));
+        g = vminq_s16(g, vextq_s16(big, g, 4));
+        Mb = vextq_s16(zero, g, 7);                            // lane 0: min(0, nothing) = 0
+        Mb = vminq_s16(Mb, zero);
+        const int16x8_t h = vaddq_s16(CP, mx);
+        int16x8_t hs = vmaxq_s16(h, vextq_s16(h, small, 1));
+        hs = vmaxq_s16(hs, vextq_s16(hs, small, 2));
+        hs = vmaxq_s16(hs, vextq_s16(hs, small, 4));
+        Xa = vextq_s16(hs, small, 1);
+        // max fwd over segment s = max(local best, max P in s - Mb)
+        const int16x8_t best = vmaxq_s16(bestl, vsubq_s16(h, Mb));
+        if (5 + vmaxvq_s16(best) < MINSC) return B1;
     }
-
-    // ---- 6b. backward scan: SX = suffix max of P; bnd = 5 + SX - PM; bitsets; lo ----
-    const int nb = ndr >> 3;
+    // Backward: SX, PM and bnd per segment step, and the bitsets mw = {bnd >= 19} and
+    // hw = {bnd >= 19 and cnt > 0} as one byte per segment and step (bit k = step k); bnd is
+    // transposed back to diagonal order.
     uint8_t *mb = (uint8_t *)s.mw, *hbb = (uint8_t *)s.hw;
-    memset(mb + nb, 0, 16); memset(hbb + nb, 0, 16);
-    int lo;
     {
         const int16x8_t five = vdupq_n_s16(5), minsc = vdupq_n_s16(MINSC);
-        int16x8_t carryS = small, lov = big;
-        for (int d0 = ndr - 8; d0 >= 0; d0 -= 8) {
-            const int16x8_t p = vld1q_s16(s.P + d0);
-            int16x8_t sx = vmaxq_s16(p, vextq_s16(p, small, 1));
-            sx = vmaxq_s16(sx, vextq_s16(sx, small, 2));
-            sx = vmaxq_s16(sx, vextq_s16(sx, small, 4));        // local suffix max
-            const int16x8_t sxl = sx;
-            sx = vmaxq_s16(sx, carryS);
-            carryS = vmaxq_s16(carryS, vdupq_laneq_s16(sxl, 0));
-            const int16x8_t bd = vaddq_s16(five, vsubq_s16(sx, vld1q_s16(s.PM + d0)));
-            vst1q_s16(s.bnd + d0, bd);
-            const uint16x8_t in = vcgeq_s16(bd, minsc);
-            const uint16x8_t c = vld1q_u16(s.cnt + d0);
-            const uint16x8_t ih = vandq_u16(in, vtstq_u16(c, c));
-            lov = vminq_s16(lov, vbslq_s16(ih, vld1q_s16(s.minrow + d0), big));
-            const unsigned bits = vaddvq_u16(vorrq_u16(vandq_u16(in, WL), vandq_u16(ih, WH)));
-            mb[d0 >> 3] = (uint8_t)bits;
-            hbb[d0 >> 3] = (uint8_t)(bits >> 8);
+        const int16_t *__restrict TP = s.P, *__restrict TM = s.PM, *__restrict TC = s.TC;
+        const int sb = L >> 3;   // bitset bytes per segment
+        int16x8_t sx = small;
+        for (int t = L - 8; t >= 0; t -= 8) {
+            int16x8_t bd[8];
+            uint16x8_t am = vdupq_n_u16(0), ah = vdupq_n_u16(0);
+            for (int k = 7; k >= 0; k--) {
+                const int o = (t + k) * 8;
+                sx = vmaxq_s16(sx, vld1q_s16(TP + o));
+                const int16x8_t SX = vmaxq_s16(vaddq_s16(CP, sx), Xa);
+                const int16x8_t PM = vminq_s16(Mb, vqaddq_s16(CP, vld1q_s16(TM + o)));
+                bd[k] = vaddq_s16(five, vsubq_s16(SX, PM));
+                const uint16x8_t in = vcgeq_s16(bd[k], minsc);
+                const int16x8_t c = vld1q_s16(TC + o);
+                am = vsliq_n_u16(in, am, 1);                        // (am << 1) | bit k
+                ah = vsliq_n_u16(vandq_u16(in, vtstq_s16(c, c)), ah, 1);
+            }
+            neon_transpose8(bd);
+            for (int k = 0; k < 8; k++) vst1q_s16(s.bnd + k * L + t, bd[k]);
+            const uint8x8_t m8 = vmovn_u16(am), h8 = vmovn_u16(ah);
+            uint8_t *mp = mb + (t >> 3), *hp = hbb + (t >> 3);
+            vst1_lane_u8(mp, m8, 0); vst1_lane_u8(mp + sb, m8, 1); vst1_lane_u8(mp + 2 * sb, m8, 2);
+            vst1_lane_u8(mp + 3 * sb, m8, 3); vst1_lane_u8(mp + 4 * sb, m8, 4); vst1_lane_u8(mp + 5 * sb, m8, 5);
+            vst1_lane_u8(mp + 6 * sb, m8, 6); vst1_lane_u8(mp + 7 * sb, m8, 7);
+            vst1_lane_u8(hp, h8, 0); vst1_lane_u8(hp + sb, h8, 1); vst1_lane_u8(hp + 2 * sb, h8, 2);
+            vst1_lane_u8(hp + 3 * sb, h8, 3); vst1_lane_u8(hp + 4 * sb, h8, 4); vst1_lane_u8(hp + 5 * sb, h8, 5);
+            vst1_lane_u8(hp + 6 * sb, h8, 6); vst1_lane_u8(hp + 7 * sb, h8, 7);
         }
-        if (nd & 7) mb[nd >> 3] &= (uint8_t)((1u << (nd & 7)) - 1);  // drop pad lanes
-        lo = vminvq_s16(lov);
+        // drop the pad diagonals [nd, NT) from mw (hw has none: cnt = 0 there)
+        if (nd & 7) mb[nd >> 3] &= (uint8_t)((1u << (nd & 7)) - 1);
+        memset(mb + ((nd + 7) >> 3), 0, (NT >> 3) - ((nd + 7) >> 3) + 16);
+        memset(hbb + (NT >> 3), 0, 16);
     }
 
-    // ---- 7. components ----
-    int hi = -1;
+    // ---- 7. components (runs of mw) with a hit: ub = max bnd; dmax = last hw bit; lo = min over
+    //      them of minrow on hit diagonals. 8-wide over [a & ~7, b), lanes outside [a, b) masked. ----
+    int hi = -1, lo = 32767;
     for (int d = neon_next(s.mw, 0, nd, 0); d < nd;) {
         const int a = d, b = neon_next(s.mw, a, nd, ~0ull);
         const int dmax = neon_last(s.hw, a, b);
         if (dmax >= 0) {
-            int ub = -32768, k = a;
-            for (; k < b && (k & 7); k++) ub = std::max(ub, (int)s.bnd[k]);
-            int16x8_t mv = small;
-            for (; k + 8 <= b; k += 8) mv = vmaxq_s16(mv, vld1q_s16(s.bnd + k));
-            ub = std::max(ub, (int)vmaxvq_s16(mv));
-            for (; k < b; k++) ub = std::max(ub, (int)s.bnd[k]);
+            const int16x8_t IOs = vreinterpretq_s16_u16(IO), va = vdupq_n_s16((int16_t)a), vb = vdupq_n_s16((int16_t)b);
+            int16x8_t mx = small, mn = big;
+            // one block of 8 diagonals; in = lanes inside [a, b) (all of them for inner blocks)
+            auto block = [&](int x, uint16x8_t in) {
+                const uint16x8_t c = vld1q_u16(s.cnt + x);
+                mx = vmaxq_s16(mx, vbslq_s16(in, vld1q_s16(s.bnd + x), small));
+                mn = vminq_s16(mn, vbslq_s16(vandq_u16(in, vtstq_u16(c, c)), vld1q_s16(s.minrow + x), big));
+            };
+            auto edge = [&](int x) {
+                const int16x8_t pos = vaddq_s16(IOs, vdupq_n_s16((int16_t)x));
+                block(x, vandq_u16(vcgeq_s16(pos, va), vcltq_s16(pos, vb)));
+            };
+            const int x0 = a & ~7, x1 = b & ~7;
+            edge(x0);
+            for (int x = x0 + 8; x < x1; x += 8) block(x, vdupq_n_u16(0xFFFF));
+            if (x1 > x0 && x1 < b) edge(x1);
+            const int ub = vmaxvq_s16(mx);
+            lo = std::min(lo, (int)vminvq_s16(mn));
             hi = std::max(hi, (dmax - off) + quanta - 1 + std::max(0, ub - 21));
         }
         d = neon_next(s.mw, b, nd, 0);
