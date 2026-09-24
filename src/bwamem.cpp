@@ -522,6 +522,76 @@ static inline int cal_max_gap(const mem_opt_t *opt, int qlen)
     return l < opt->w<<1? l : opt->w<<1;
 }
 
+/* BWA3_CHAIN_STATS=1: count how the chaining / Pass-3 fast paths resolved, and
+ * print the totals once at exit. Measurement only (output is identical armed or
+ * not), inert unless armed: each counter is one predictable branch on a cached
+ * bool. It exists so a regression test can prove a rare path -- the Pass-3 index
+ * falling back to its linear scan, a read falling back to the original scan --
+ * actually ran, instead of passing because the fixture never reached it. */
+static inline bool chain_stats_on(void)
+{
+    static const bool on = []() {
+        const char *e = getenv("BWA3_CHAIN_STATS");
+        return e && *e && !(e[0] == '0' && e[1] == '\0');
+    }();
+    return on;
+}
+enum ChainStat {
+    CHS_P3_READS,          /* reads whose Pass 3 started on the kept-set index */
+    CHS_P3_FALLBACK_READS, /* ... and fell back to the original scan mid-read */
+    CHS_P3_BUCKET_WALKS,   /* index queries answered by walking hash buckets */
+    CHS_P3_LINEAR_SCANS,   /* index queries answered by scanning every member */
+    CHS_P3_HEAD_DUPS,      /* buckets skipped because their head slot was walked */
+    CHS_N
+};
+static std::atomic<uint64_t> g_chain_stats[CHS_N];
+static inline void chain_stat(ChainStat k)
+{
+    if (chain_stats_on()) g_chain_stats[k].fetch_add(1, std::memory_order_relaxed);
+}
+static struct ChainStatsDumper {
+    ~ChainStatsDumper() {
+        if (!chain_stats_on()) return;
+        fprintf(stderr, "[chain-stats] p3_reads=%llu p3_fallback_reads=%llu p3_bucket_walks=%llu "
+                "p3_linear_scans=%llu p3_head_dups=%llu\n",
+                (unsigned long long)g_chain_stats[CHS_P3_READS].load(),
+                (unsigned long long)g_chain_stats[CHS_P3_FALLBACK_READS].load(),
+                (unsigned long long)g_chain_stats[CHS_P3_BUCKET_WALKS].load(),
+                (unsigned long long)g_chain_stats[CHS_P3_LINEAR_SCANS].load(),
+                (unsigned long long)g_chain_stats[CHS_P3_HEAD_DUPS].load());
+    }
+} g_chain_stats_dumper;
+
+/* Per-thread memo of cal_max_gap over query lengths (byte-identical). The window
+ * derivation in mem_chain2aln_across_reads_V2 calls cal_max_gap twice per seed of
+ * every chain, but its argument is always a query length in [0, l_query] and its
+ * result depends only on that and on the opt fields cal_max_gap reads above. So
+ * tabulate it once per thread for every length a batch can ask for; each entry
+ * is the value cal_max_gap itself returned. Kept beside cal_max_gap so that its
+ * key -- exactly the fields cal_max_gap reads -- is edited with it: a new input
+ * to cal_max_gap must be added to key() below. */
+struct CalMaxGapMemo {
+    std::vector<int> tab;
+    int k[6] = {0, 0, 0, 0, 0, -1};   /* -1: no key yet (w is never negative) */
+
+    static void key(const mem_opt_t *opt, int out[6]) {
+        out[0] = opt->a; out[1] = opt->o_del; out[2] = opt->e_del;
+        out[3] = opt->o_ins; out[4] = opt->e_ins; out[5] = opt->w;
+    }
+    /* Make every length in [0, max_qlen] a table hit for opt's scoring. */
+    void prepare(const mem_opt_t *opt, int max_qlen) {
+        int nk[6];
+        key(opt, nk);
+        if (memcmp(nk, k, sizeof(nk)) != 0) { tab.clear(); memcpy(k, nk, sizeof(nk)); }
+        for (int q = (int)tab.size(); q <= max_qlen; ++q) tab.push_back(cal_max_gap(opt, q));
+    }
+    /* cal_max_gap(opt, qlen), where opt is the scoring prepare() last saw. A length
+     * outside the table (not reachable for a seed inside its read) is computed. */
+    inline int operator()(const mem_opt_t *opt, int qlen) const {
+        return ((unsigned)qlen < (unsigned)tab.size()) ? tab[qlen] : cal_max_gap(opt, qlen);
+    }
+};
+
 //------------------------------------------------------------------
 // SMEMs
 static smem_aux_t *smem_aux_init()
@@ -6155,6 +6225,115 @@ static inline int ungapped_walk_score(const uint8_t *qs, const uint8_t *rs,
     return max_sc;
 }
 
+/* Mismatch-run form of the ungapped walk (byte-identical). ungapped_analyze has
+ * already rejected every pair holding an ambiguous base in [0, N) and built the
+ * mismatch bitmask `mis`, so the per-base walk it then runs (the HIT walk
+ * below, and ungapped_walk_score on the TIGHT path) only ever sees match /
+ * mismatch steps. With a > 0, b >= 0 and h0 > 0 those steps have a closed form
+ * between mismatches:
+ *  - cur > 0 on entry to a run of r matches stays > 0 and rises by a per step,
+ *    so the run's per-step `cur >= max_sc` updates reduce to one test of the
+ *    run's last value (strictly increasing: the last step is both the largest
+ *    and the rightmost, which is what the >= tie-break selects); if the last
+ *    value is below max_sc, so is every earlier one.
+ *  - a mismatch step is applied exactly as in the loop (cur -= b, floor at 0,
+ *    then the >= test).
+ *  - once cur reaches 0 the loop's `if (cur == 0) continue` freezes every
+ *    output for the rest of the walk, so the run form stops there.
+ * So the walk costs one step per mismatch (<= x_threshold on a HIT, a handful
+ * on TIGHT) instead of one per base. Outside that envelope (a <= 0, b < 0,
+ * h0 <= 0) the original per-base loop runs. Outputs: max_sc, max_i (the
+ * rightmost position reaching it), and the final cur. */
+/* The per-base walk over the mismatch bitmask: match +a, mismatch -b floored at 0,
+ * and frozen once the score reaches 0; max_sc and max_i (the rightmost position
+ * reaching it, the >= tie-break) as the banded SW sees them. The reference form
+ * the run-length walk below must equal, and its fallback outside that envelope. */
+static inline void ungapped_walk_mis_perbase(const uint64_t *mis, int N, int h0, int a, int b,
+                                             int *out_max_sc, int *out_max_i, int *out_cur)
+{
+    int cur = h0, max_sc = h0, max_i = 0;
+    for (int j = 0; j < N; j++) {
+        int is_mis = (int)((mis[j >> 6] >> (j & 63)) & 1ULL);
+        if (cur == 0) continue;
+        if (!is_mis) cur += a;
+        else {
+            cur -= b;
+            if (cur < 0) cur = 0;
+        }
+        if (cur >= max_sc) { max_sc = cur; max_i = j + 1; }
+    }
+    *out_max_sc = max_sc; *out_max_i = max_i; *out_cur = cur;
+}
+
+/* Mismatch-run form of the ungapped walk (byte-identical to
+ * ungapped_walk_mis_perbase). ungapped_analyze has already rejected every pair
+ * holding an ambiguous base in [0, N) and built the mismatch bitmask `mis`, with
+ * no bit set at or past N, so the per-base walk it then runs (the HIT walk below,
+ * and the TIGHT path's walk score) only ever sees match / mismatch steps. With
+ * a > 0, b >= 0 and h0 > 0 those steps have a closed form between mismatches:
+ *  - cur > 0 on entry to a run of r matches stays > 0 and rises by a per step,
+ *    so the run's per-step `cur >= max_sc` updates reduce to one test of the
+ *    run's last value (strictly increasing: the last step is both the largest
+ *    and the rightmost, which is what the >= tie-break selects); if the last
+ *    value is below max_sc, so is every earlier one.
+ *  - a mismatch step is applied exactly as in the loop (cur -= b, floor at 0,
+ *    then the >= test).
+ *  - once cur reaches 0 the per-base walk's `if (cur == 0) continue` freezes
+ *    every output for the rest of the walk, so the run form stops there.
+ * So the walk costs one step per mismatch (<= x_threshold on a HIT, a handful
+ * on TIGHT) instead of one per base. Outside that envelope (a <= 0, b < 0,
+ * h0 <= 0) the per-base walk runs. */
+static inline void ungapped_walk_mis(const uint64_t *mis, int N, int h0, int a, int b,
+                                     int *out_max_sc, int *out_max_i, int *out_cur)
+{
+    if (!(a > 0 && b >= 0 && h0 > 0)) {
+        ungapped_walk_mis_perbase(mis, N, h0, a, b, out_max_sc, out_max_i, out_cur);
+        return;
+    }
+    int cur = h0, max_sc = h0, max_i = 0;
+    int j = 0;
+    while (j < N) {
+        /* m = first mismatch at or after j, or N if none (no bit is set past N) */
+        int m = N;
+        for (int w = j >> 6; w < FP_MIS_NWORDS && (w << 6) < N; ++w) {
+            uint64_t bits = mis[w];
+            if (w == (j >> 6)) bits &= ~0ULL << (j & 63);
+            if (bits) { m = (w << 6) + __builtin_ctzll(bits); break; }
+        }
+        if (m > j) {
+            cur += (m - j) * a;
+            if (cur >= max_sc) { max_sc = cur; max_i = m; }
+        }
+        if (m >= N) break;
+        cur -= b;
+        if (cur < 0) cur = 0;
+        if (cur >= max_sc) { max_sc = cur; max_i = m + 1; }
+        if (cur == 0) break;
+        j = m + 1;
+    }
+#ifdef BWA_MEM3_DEBUG_UNGAPPED_XCHECK
+    {   /* cross-check the run form against the per-base walk it replaces */
+        int rmax, rmi, rc;
+        ungapped_walk_mis_perbase(mis, N, h0, a, b, &rmax, &rmi, &rc);
+        xassert(rmax == max_sc && rmi == max_i && rc == cur,
+                "ungapped_walk_mis disagrees with the per-base walk");
+    }
+#endif
+    *out_max_sc = max_sc; *out_max_i = max_i; *out_cur = cur;
+}
+
+/* ungapped_walk_score (the byte walk above) over the mismatch bitmask: the same
+ * floored walk score. PRECONDITION: no base in [0, N) is ambiguous -- the byte
+ * walk then never takes its early break, and both walks see the identical
+ * match/mismatch sequence. Named apart from the byte walk because of that
+ * precondition. */
+static inline int ungapped_walk_score_mis(const uint64_t *mis, int N, int h0, int a, int b)
+{
+    int max_sc, max_i, cur;
+    ungapped_walk_mis(mis, N, h0, a, b, &max_sc, &max_i, &cur);
+    return max_sc;
+}
+
 static inline int ungapped_analyze(const uint8_t *qs, const uint8_t *rs, int N,
                                     int h0, int a, int b,
                                     int o_min, int e_min,
@@ -6222,7 +6401,10 @@ static inline int ungapped_analyze(const uint8_t *qs, const uint8_t *rs, int N,
         // min_len = N. Substituting:
         //     numerator = N·a − (max_sc_proof − h0) − o_min
         //               = N·a + h0 − max_sc_proof − o_min
-        int max_sc_proof = ungapped_walk_score(qs, rs, N, h0, a, b);
+        /* Bitmask form of ungapped_walk_score(qs, rs, N, h0, a, b): no base in
+         * [0, N) is ambiguous here (checked above), so the byte walk never
+         * breaks early and both return the same floored score. */
+        int max_sc_proof = ungapped_walk_score_mis(mis, N, h0, a, b);
         int64_t numerator = (int64_t)N * a + h0 - max_sc_proof - o_min;
         int band;
         if (numerator <= 0) {
@@ -6285,17 +6467,8 @@ static inline int ungapped_analyze(const uint8_t *qs, const uint8_t *rs, int N,
     // comparisons — equivalent to "pick the rightmost position where the
     // max was achieved". We must mirror that (use >=) or qle/tle diverge
     // from SW on tied-score walks, breaking byte-identical SAM.
-    int cur = h0, max_sc = h0, max_i = 0;
-    for (int j = 0; j < N; j++) {
-        int is_mis = (int)((mis[j >> 6] >> (j & 63)) & 1ULL);
-        if (cur == 0) continue;
-        if (!is_mis) cur += a;
-        else {
-            cur -= b;
-            if (cur < 0) cur = 0;
-        }
-        if (cur >= max_sc) { max_sc = cur; max_i = j + 1; }
-    }
+    int cur, max_sc, max_i;
+    ungapped_walk_mis(mis, N, h0, a, b, &max_sc, &max_i, &cur);
 
     *out_score      = max_sc;
     *out_qle        = max_i;
@@ -6534,6 +6707,104 @@ static inline void chain_ext_window_bind(ChainExtWindow &win, const mem_chain_t 
     win.rmax0 = rmax[0];
     win.rmax1 = rmax[1];
 }
+
+/* Pass-3 kept-set index. Pass 3 (the post-extension "discard seeds contained in
+ * an earlier alignment" sweep at the end of mem_chain2aln_across_reads_V2) used
+ * to answer, for every seed, "is it PE18-contained in one of the first lim[l]
+ * live alnregs of av?" with a linear scan of av->a -- ~110 alnregs per seed on
+ * average (1.27e9 predicate calls for 500k exome pairs), 99.8% of which fail
+ * the very first bounds test.
+ *
+ * Why an index over the KEPT seeds' alnregs answers the same question:
+ *  - Pass 1 gives every seed of a read a fresh alnreg slot in visit order (chain
+ *    j ascending, seed k descending in srt order; deferred seeds included), and
+ *    Pass 3 visits the seeds in exactly that order. So when Pass 3 is at the seed
+ *    with slot X, slots [0, X) belong to seeds it has already decided, and each
+ *    of those was either purged here (qb = qe = -1, dead) or kept (lim[l]++).
+ *  - A slot a seed is purged INTO is only ever the current seed's own, so a
+ *    kept seed's alnreg stays live for the rest of the sweep -- provided it was
+ *    live when kept. The caller checks that at every keep and drops to the
+ *    original scan for the rest of the read if it ever fails.
+ *  - Hence the live slots in [0, X) are exactly the lim[l] kept ones, so "the
+ *    first lim[l] live alnregs" the scan walks are precisely the kept set.
+ *  - The scan's only consumed result is the boolean `v < lim[l]` (v is reset
+ *    by the interference loop before any other read), i.e. "some member of that
+ *    set satisfies pe18_seed_in_container == CONTAINED". That is order-free, so
+ *    the index may test the members in any order and skip any member whose
+ *    [rb,re) x [qb,qe) box cannot contain the seed: pe18_seed_in_container's
+ *    first test returns PE18_NOT for exactly those. Every member that passes the
+ *    box goes through the unchanged predicate against the unchanged alnreg.
+ *
+ * Structure: members are appended to `recs` and chained into hash buckets of
+ * their rb >> P3_BUCKET_SHIFT. A member containing the seed [S, E) needs
+ * rb <= S and re >= E; since re - rb <= maxspan for every member, re >= E also
+ * forces rb >= E - maxspan, so only the buckets covering [E - maxspan, S] are
+ * walked. Bucket collisions only add candidates (the box test rejects them).
+ * If that range spans many buckets (very long alignments) the compact `recs`
+ * array is scanned instead. Boxes are copied at insertion; the alnreg fields
+ * they mirror are never written again during the sweep (see above). */
+struct P3KeptReg { int64_t rb, re; int32_t qb, qe; int32_t slot, next; };
+
+struct P3KeptIndex {
+    static constexpr int HBITS = 12;                 /* 4096 bucket heads */
+    static constexpr int P3_BUCKET_SHIFT = 10;       /* 1 kb of reference per bucket */
+    static constexpr int64_t MAX_BUCKET_WALK = 32;   /* else scan recs linearly */
+    std::vector<P3KeptReg> recs;
+    std::vector<int32_t> head;
+    int64_t maxspan = 0;
+
+    static inline uint32_t hslot(int64_t bucket) {
+        return (uint32_t)(((uint64_t)bucket * 0x9E3779B97F4A7C15ULL) >> (64 - HBITS));
+    }
+    /* Empty the index for the next read: only the heads this read touched. */
+    inline void clear() {
+        if (head.empty()) head.assign((size_t)1 << HBITS, -1);
+        for (const P3KeptReg &r : recs) head[hslot(r.rb >> P3_BUCKET_SHIFT)] = -1;
+        recs.clear();
+        maxspan = 0;
+    }
+    inline void insert(const mem_alnreg_t *p, int slot) {
+        const uint32_t h = hslot(p->rb >> P3_BUCKET_SHIFT);
+        const P3KeptReg r = { p->rb, p->re, p->qb, p->qe, (int32_t)slot, head[h] };
+        const int64_t span = r.re - r.rb;
+        if (recs.empty() || span > maxspan) maxspan = span;
+        head[h] = (int32_t)recs.size();
+        recs.push_back(r);
+    }
+    /* true iff some member satisfies pe18_seed_in_container(s, member) == CONTAINED */
+    inline bool contains(const mem_seed_t *s, const mem_alnreg_t *av_a,
+                         int l_query, const mem_opt_t *opt) const {
+        if (recs.empty()) return false;
+        const int64_t S = s->rbeg, E = s->rbeg + s->len;
+        const int qS = s->qbeg, qE = s->qbeg + s->len;
+        const int64_t lo = E - maxspan;
+        if (lo > S) return false;                    /* no member can reach E */
+        const P3KeptReg *R = recs.data();
+        auto hit = [&](const P3KeptReg &r) -> bool {
+            return r.rb <= S && r.re >= E && r.qb <= qS && r.qe >= qE &&
+                   pe18_seed_in_container(s, &av_a[r.slot], l_query, opt) == PE18_CONTAINED;
+        };
+        const int64_t b_lo = lo >> P3_BUCKET_SHIFT, b_hi = S >> P3_BUCKET_SHIFT;
+        if (b_hi - b_lo >= MAX_BUCKET_WALK) {
+            chain_stat(CHS_P3_LINEAR_SCANS);
+            for (size_t t = 0, n = recs.size(); t < n; ++t) if (hit(R[t])) return true;
+            return false;
+        }
+        chain_stat(CHS_P3_BUCKET_WALKS);
+        /* Distinct buckets can share a head slot; walk each head once. With
+         * b_hi - b_lo < MAX_BUCKET_WALK the dedup below is a tiny linear check. */
+        uint32_t seen[MAX_BUCKET_WALK]; int n_seen = 0;
+        for (int64_t b = b_lo; b <= b_hi; ++b) {
+            const uint32_t h = hslot(b);
+            bool dup = false;
+            for (int u = 0; u < n_seen; ++u) if (seen[u] == h) { dup = true; break; }
+            if (dup) { chain_stat(CHS_P3_HEAD_DUPS); continue; }
+            seen[n_seen++] = h;
+            for (int32_t t = head[h]; t >= 0; t = R[t].next) if (hit(R[t])) return true;
+        }
+        return false;
+    }
+};
 
 /* Mutable per-thread extension-staging state, threaded through
  * stage_seed_extension() by reference. These pointers/offsets/counters live for
@@ -7392,6 +7663,15 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
      * block, so with the two-wave path off this is a pure refactor
      * (byte-identical). The `max` local is a dead write here (never read), kept
      * verbatim. */
+    /* cal_max_gap memo for derive_chain_window (byte-identical; see CalMaxGapMemo). */
+    static thread_local CalMaxGapMemo mg_memo;
+    {
+        int max_lq = 0;
+        for (int l = 0; l < nseq; ++l) if (seq_[l].l_seq > max_lq) max_lq = seq_[l].l_seq;
+        mg_memo.prepare(opt, max_lq);
+    }
+    auto max_gap_memo = [&](int qlen) -> int { return mg_memo(opt, qlen); };
+
     auto derive_chain_window = [&](mem_chain_t *cc, int lq,
                                    uint8_t *&rseq_out, int &chain_max_n_hits_out) -> int {
         int64_t tmp;
@@ -7404,9 +7684,9 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
         for (int i = 0; i < cc->n; ++i) {
             int64_t b, e;
             const mem_seed_t *t = &cc->seeds[i];
-            b = t->rbeg - (t->qbeg + cal_max_gap(opt, t->qbeg));
+            b = t->rbeg - (t->qbeg + max_gap_memo(t->qbeg));
             e = t->rbeg + t->len + ((lq - t->qbeg - t->len) +
-                                    cal_max_gap(opt, lq - t->qbeg - t->len));
+                                    max_gap_memo(lq - t->qbeg - t->len));
 
             tmp = rmax[0];
             rmax[0] = tmp < b? rmax[0] : b;
@@ -8495,10 +8775,20 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
     xassert(nseq <= BATCH_SIZE, "extension: batch read count exceeds the stack lim[BATCH_SIZE] array");
     int lim[BATCH_SIZE] = {0};
 
+    /* Pass-3 kept-set index (byte-identical; see P3KeptIndex). */
+    static thread_local P3KeptIndex p3_kept;
+
     for (int l=0; l<nseq; l++)
     {
         int s_start = 0, s_end = 0;
         uint32_t *srtg = srtgg + lim_g[l];
+        /* The index answers the scan below exactly while every kept seed's alnreg
+         * is live (see P3KeptIndex). p3_fallback flips -- for the rest of the
+         * read -- the moment a seed is kept whose slot is dead, and the original
+         * lim-bounded scan takes over from there. */
+        p3_kept.clear();
+        bool p3_fallback = false;
+        chain_stat(CHS_P3_READS);
 
         int l_query = seq_[l].l_seq;
         mem_chain_v *chn = &chain_ar[l];
@@ -8521,20 +8811,39 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
                 s = &c->seeds[srt2[k]];
                 int i = 0;
                 int v = 0;
-                for (i = 0; i < av->n && v < lim[l]; ++i)  // test whether extension has been made before
-                {
-                    mem_alnreg_t *p = &av->a[i];
-                    if (p->qb == -1 && p->qe == -1) {
-                        continue;   // purged candidate: skip, do NOT increment v
+                if (!p3_fallback) {
+                    /* Only the boolean `v < lim[l]` of the scan below is consumed
+                     * (v is reassigned before its next read), and the index
+                     * evaluates exactly that. */
+                    v = p3_kept.contains(s, av->a, l_query, opt) ? 0 : lim[l];
+#ifdef BWA_MEM3_DEBUG_P3_XCHECK
+                    {   /* cross-check the index against the original scan */
+                        int xv = 0;
+                        for (int xi = 0; xi < av->n && xv < lim[l]; ++xi) {
+                            const mem_alnreg_t *xp = &av->a[xi];
+                            if (xp->qb == -1 && xp->qe == -1) continue;
+                            if (pe18_seed_in_container(s, xp, l_query, opt) == PE18_CONTAINED) break;
+                            xv++;
+                        }
+                        xassert((xv < lim[l]) == (v < lim[l]), "P3 index disagrees with the scan");
                     }
+#endif
+                } else {
+                    for (i = 0; i < av->n && v < lim[l]; ++i)  // test whether extension has been made before
+                    {
+                        mem_alnreg_t *p = &av->a[i];
+                        if (p->qb == -1 && p->qe == -1) {
+                            continue;   // purged candidate: skip, do NOT increment v
+                        }
 
-                    /* Shared PE18 containment predicate (see pe18_seed_in_container
-                     * above): CONTAINED -> the seed is "around" p, stop scanning
-                     * (break); NOT -> p does not contain s, count it (v++) and
-                     * keep scanning. Byte-identical to the prior inline body. */
-                    if (pe18_seed_in_container(s, p, l_query, opt) == PE18_CONTAINED)
-                        break;
-                    v++;
+                        /* Shared PE18 containment predicate (see pe18_seed_in_container
+                         * above): CONTAINED -> the seed is "around" p, stop scanning
+                         * (break); NOT -> p does not contain s, count it (v++) and
+                         * keep scanning. Byte-identical to the prior inline body. */
+                        if (pe18_seed_in_container(s, p, l_query, opt) == PE18_CONTAINED)
+                            break;
+                        v++;
+                    }
                 }
 
                 // the seed is (almost) contained in an existing alignment;
@@ -8573,6 +8882,11 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
                     const mem_alnreg_t *_kar = &av_v[l].a[s->aln];
                     xassert(!(_kar->qb == H0_ || _kar->qe == H0_),
                             "two-wave: Pass 3 kept a seed whose alnreg was never resolved");
+                }
+                if (!p3_fallback) {
+                    const mem_alnreg_t *_kr = &av_v[l].a[s->aln];
+                    if (_kr->qb == -1 && _kr->qe == -1) { p3_fallback = true; chain_stat(CHS_P3_FALLBACK_READS); }
+                    else p3_kept.insert(_kr, s->aln);
                 }
                 lim[l]++;
             }

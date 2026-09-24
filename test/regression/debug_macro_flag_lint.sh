@@ -89,8 +89,6 @@ fi
 # sees rather than silence. Delete the entry when the check lands.
 # ---------------------------------------------------------------------------
 pending_flags=(
-    # Enabled ahead of the ungapped-CIGAR fast-path change that introduces it.
-    BWA_MEM3_DEBUG_UNGAPPED_XCHECK
 )
 
 # ---------------------------------------------------------------------------
