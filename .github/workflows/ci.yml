@@ -893,8 +893,14 @@ jobs:
       # on the full window. The second run uses a threshold other than the NEON
       # filter's, so plan() reads the scalar filter's view; the third opens the
       # hit gate, the only way a window reaches the component cap (at the
-      # default gate its hits send it to the full window first). ~50 s in all
-      # on Graviton 4. Longer runs and real dumps are manual.
+      # default gate its hits send it to the full window first). The last three
+      # cover what the defaults hide and rescue_band.cpp claims gives the same
+      # outputs: the per-lane band shift off, the band kernel's one-row fused
+      # cell (BWA3_RESCUE_BAND_KERNEL=1) and the original cell
+      # (BWA3_RESCUE_FSCAN=0, which also turns the fused kswv cell off). The
+      # trailing argument is the job generator's seed. The first three take
+      # ~50 s in all on Graviton 4; the last three are 30000-job runs like the
+      # second and third. Longer runs and real dumps are manual.
       - name: Banded rescue == kswv (rescue_band_harness, generated jobs)
         if: runner.arch == 'ARM64'
         run: |
@@ -902,6 +908,9 @@ jobs:
           BWA3_RESCUE_BAND_COST=100000000 RB_SCALAR_STRIDE=7 ./rescue_band_harness eq 100000 1
           BWA3_RESCUE_BAND_COST=100000000 RB_MINSC=30 ./rescue_band_harness eq 30000 2
           BWA3_RESCUE_BAND_COST=100000000 BWA3_RESCUE_PRUNE_MAX_HITS=100000 ./rescue_band_harness eq 30000 3
+          BWA3_RESCUE_BAND_COST=100000000 BWA3_RESCUE_BAND_SHIFT=0 ./rescue_band_harness eq 30000 4
+          BWA3_RESCUE_BAND_COST=100000000 BWA3_RESCUE_BAND_KERNEL=1 ./rescue_band_harness eq 30000 5
+          BWA3_RESCUE_BAND_COST=100000000 BWA3_RESCUE_FSCAN=0 ./rescue_band_harness eq 30000 6
 
       - name: Flat chaining index matches the kbtree replay (chr22)
         if: matrix.canonical == true
