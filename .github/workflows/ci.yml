@@ -879,6 +879,14 @@ jobs:
           CHR22_SIM_DIR=/tmp/chr22-sim \
           bash test/regression/bwtseed_lockstep_driver_identity.sh
 
+      # Every row, not just the canonical one: pruning runs only on aarch64, so
+      # the ARM64 rows are where the identity is non-vacuous (the x86 rows run
+      # both legs down the same path and report the non-vacuity check skipped).
+      - name: Exact rescue pruning == full-window rescue (generated PE fixture)
+        run: |
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          bash test/regression/rescue_prune_identity.sh
+
       - name: Flat chaining index matches the kbtree replay (chr22)
         if: matrix.canonical == true
         run: |

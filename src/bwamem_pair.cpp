@@ -42,6 +42,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "bandedSWA.h"
 #include "kswv.h"
 #include "simd_dispatch.h"
+#include "rescue_prune.h"
 
 #ifdef USE_MALLOC_WRAPPERS
 #  include "malloc_wrap.h"
@@ -55,8 +56,13 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
  * anchor gathers enough votes. Opt-in and NOT byte-identical: the narrowed
  * window yields a different suboptimal score (csub -> MAPQ), so it is off by
  * default and enabled by --fast. The kswv kernel is unchanged -- narrowing just
- * hands it a shorter reference window. */
+ * hands it a shorter reference window. (Exact rescue pruning, below, also
+ * narrows windows and is on by default where it runs, but only to a hull proven
+ * to reproduce every consumed field, so it is byte-identical.) */
 #include <vector>
+#include <atomic>
+#include <cerrno>
+#include <climits>
 #include <cstdint>
 #include <algorithm>
 
@@ -114,8 +120,8 @@ struct matesw_anchor_t {
  * query.
  *
  * Only mem_matesw_batch_pre calls this: it runs the scan once per enqueued pair
- * and stores the resulting offset in g_rescue_narrow_off (keyed by regid) for
- * mem_matesw_batch_post to read back, so _post never re-derives the window.
+ * and stores the resulting offset in mmc->rescue_narrow_off[tid] (keyed by regid)
+ * for mem_matesw_batch_post to read back, so _post never re-derives the window.
  * `collapse` reduces the alphabet for the anchor scan only (1 = C->T / OT,
  * 2 = G->A / OB, 0 = none) so exact k-mers survive the bisulfite conversion
  * under --meth; the SW still sees the real bases. */
@@ -278,17 +284,109 @@ static bool matesw_anchor_declines_rescue(const mem_opt_t *opt, const matesw_anc
  * the exact opposite of skipping, and slower than doing nothing. */
 static const int32_t MATESW_GAR_DECLINED = -2;
 
+/* gar[gcnt+r] sentinel for exact rescue pruning: the filter PROVED this orientation's SW would
+ * score below min_seed_len, so it is not enqueued. Unlike MATESW_GAR_DECLINED this must behave
+ * exactly like a real failing rescue: mem_matesw_batch_post substitutes a zero-score result and
+ * takes the normal gate-fails path (++n and the per-orientation dedup), keeping output identical. */
+static const int32_t MATESW_GAR_PROVEN_FAIL = -3;
+
 /* mem_matesw_batch_pre stores the narrowing offset per enqueued pair (keyed by
- * regid, stable under the batch's sort_classify / length-sort reorder) so
- * mem_matesw_batch_post reads it back instead of re-running the anchor scan. */
-static thread_local std::vector<int> g_rescue_narrow_off;
+ * regid, stable under the batch's sort_classify / length-sort reorder) in
+ * mmc->rescue_narrow_off[tid], so mem_matesw_batch_post reads it back instead of
+ * re-running the anchor scan. Returns the slot for regid, growing the buffer. */
+static int32_t *matesw_narrow_slot(mem_cache *mmc, int32_t tid, int64_t regid)
+{
+    if (regid >= mmc->rescue_narrow_cap[tid]) {
+        const int64_t cap = regid + 1024;
+        int32_t *grown = (int32_t *) realloc(mmc->rescue_narrow_off[tid], (size_t)cap * sizeof(int32_t));
+        xassert(grown != NULL, "out of memory: rescue_narrow_off");
+        mmc->rescue_narrow_off[tid] = grown;
+        mmc->rescue_narrow_cap[tid] = cap;
+    }
+    return &mmc->rescue_narrow_off[tid][regid];
+}
+
+/* Exact rescue pruning (rescue_prune.h). Default ON where it runs (below); BWA3_RESCUE_PRUNE=0
+ * disables it, which is how the byte-identity A/B is run. BWA3_RESCUE_PRUNE_MAX_HITS (default
+ * 400, a non-negative integer) skips the filter on windows sharing more 5-mer hits with the mate
+ * than that, where it would cost more than the DP rows it saves; a malformed value is reported
+ * and the default used. Read once. */
+static bool rescue_prune_enabled()
+{
+    static const bool on = [] { const char *e = getenv("BWA3_RESCUE_PRUNE"); return !e || e[0] != '0'; }();
+    return on;
+}
+static int rescue_prune_max_hits()
+{
+    static const int v = [] {
+        const int dflt = 400;
+        const char *e = getenv("BWA3_RESCUE_PRUNE_MAX_HITS");
+        if (!e || !*e) return dflt;
+        char *end = NULL;
+        errno = 0;
+        const long x = strtol(e, &end, 10);
+        if (errno || *end || x < 0 || x > INT_MAX) {
+            fprintf(stderr, "ERROR: BWA3_RESCUE_PRUNE_MAX_HITS=\"%s\" is not a non-negative integer; "
+                            "using %d.\n", e, dflt);
+            return dflt;
+        }
+        return (int)x;
+    }();
+    return v;
+}
+/* Whether pruning runs for this run at all. It runs only where the NEON filter does (aarch64):
+ * the portable scalar filter costs more than it saves against the x86 kswv kernels, so x86 keeps
+ * the full window until it has a SIMD filter of its own. Keys the length sort and the narrow-offset
+ * record / read too, so a run where it is off takes exactly the pre-pruning path. */
+static bool rescue_prune_on()
+{
+#if defined(__aarch64__)
+    const bool arch_ok = true;
+#else
+    const bool arch_ok = false;
+#endif
+    return arch_ok && rescue_prune_enabled();
+}
+/* BWA3_RESCUE_PRUNE_STATS=1 prints the filter's decisions to stderr at exit as one line,
+ * "[RESCUE_PRUNE] jobs=.. full=.. b1=.. b2=.. rows_in=.. rows_kept=..": jobs filtered, and of
+ * them how many kept the full window, were proven to fail (b1, not enqueued) or were narrowed to
+ * a hull (b2), with the reference rows before and after. It is the non-vacuity check for the
+ * identity A/B: identical output must come with a nonzero number of pruned rows. */
+struct rescue_prune_stats_t {
+    std::atomic<uint64_t> jobs{0}, full{0}, b1{0}, b2{0}, rows_in{0}, rows_kept{0};
+    bool on = [] { const char *e = getenv("BWA3_RESCUE_PRUNE_STATS"); return e && e[0] == '1'; }();
+    ~rescue_prune_stats_t() {
+        if (on) fprintf(stderr, "[RESCUE_PRUNE] jobs=%llu full=%llu b1=%llu b2=%llu rows_in=%llu rows_kept=%llu\n",
+                        (unsigned long long)jobs, (unsigned long long)full, (unsigned long long)b1,
+                        (unsigned long long)b2, (unsigned long long)rows_in, (unsigned long long)rows_kept);
+    }
+};
+static rescue_prune_stats_t g_rescue_prune_stats;
+
+/* The pruning lemma holds for the scorings rescue_prune_scoring_ok admits (rescue_prune.h), on
+ * the 8-bit kernel path (its hull bound assumes that path's query padding, kswv_query_quantum8),
+ * and for non-meth rescue; everything else runs the full window. */
+static bool rescue_prune_applies(const mem_opt_t *opt, int xtra)
+{
+    return rescue_prune_on() && !opt->rescue_kmer && !opt->meth_mode && (xtra & KSW_XBYTE)
+        && rescue_prune_scoring_ok(opt->a, opt->b, opt->o_del, opt->e_del, opt->o_ins, opt->e_ins);
+}
+
+/* The oriented mate as the rescue SW sees it: the read itself, or its reverse complement (N,
+ * code >= 4, stays 4). One definition for the pruning filter's copy, the staging copy and the
+ * scalar fallback. */
+static inline void matesw_orient(const uint8_t *ms, int l_ms, int is_rev, uint8_t *out)
+{
+    if (is_rev) for (int l = 0; l < l_ms; l++) out[l] = ms[l_ms - 1 - l] < 4 ? 3 - ms[l_ms - 1 - l] : 4;
+    else memcpy(out, ms, (size_t)l_ms);
+}
 
 /* --rescue-kmer: length-sort each SIMD-width partition of `sp[0,pcnt)` (8-bit
  * below pcnt8, 16-bit above) so the narrowed short windows group together --
  * getScores8/16 runs each SIMD-lane group out to the group's longest len1, so a
  * full fallback window mixed into a narrowed group wastes the saving. The
  * 8/16-bit split at pcnt8 is preserved by sorting each side independently.
- * Result-safe: aln[] and g_rescue_narrow_off are keyed by regid and seqBuf* by
+ * Result-safe: aln[] and mmc->rescue_narrow_off[tid] are keyed by regid and seqBuf* by
  * idr/idq, so every key travels with the SeqPair it belongs to. */
 static void matesw_sort_partitions_by_len(SeqPair *sp, int64_t pcnt8, int64_t pcnt)
 {
@@ -1026,7 +1124,7 @@ int mem_sam_pe_batch(const mem_opt_t *opt, mem_cache *mmc,
                           opt->a, -1*opt->b, nthreads,
                           maxRefLen, maxQerLen);
 
-    if (opt->rescue_kmer) matesw_sort_partitions_by_len(seqPairArray, pcnt8, pcnt);
+    if (opt->rescue_kmer || rescue_prune_on()) matesw_sort_partitions_by_len(seqPairArray, pcnt8, pcnt);
 
     mem_sam_pe_batch_run(pwsw.get(), seqPairArray, seqBufRef, seqBufQer,
                          aln, pcnt, pcnt8, nthreads);
@@ -1109,7 +1207,7 @@ int mem_pair_resolve_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                     ? mem_opt_meth_mat(opt, !b[i].a[j].meth_hypothesis) : NULL;
                 val = mem_matesw_batch_post(opt, bns, pac, pes, &b[i].a[j],
                                                 s[!i].l_seq, (uint8_t*)s[!i].seq,
-                                                &a[!i], myaln, gcnt, gar, mmc,
+                                                &a[!i], myaln, gcnt, gar, mmc, tid,
                                                 ms_orig, rmat, opt->meth_mode ? i : -1);
                 n += val;
                 swcount += val;
@@ -1132,7 +1230,7 @@ int mem_pair_resolve_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                     ? mem_opt_meth_mat(opt, !b[i].a[j].meth_hypothesis) : NULL;
                 int val = mem_matesw_batch_post(opt, bns, pac, pes, &b[i].a[j],
                                                 s[!i].l_seq, (uint8_t*)s[!i].seq,
-                                                &a[!i], myaln, gcnt, gar, mmc,
+                                                &a[!i], myaln, gcnt, gar, mmc, tid,
                                                 ms_orig, rmat, opt->meth_mode ? i : -1);
                 n += val;
                 gcnt += 4;
@@ -1545,6 +1643,36 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
             int u8_shift = matesw_u8_shift_for(opt, opt->mat);
             int xtra = KSW_XSUBO | KSW_XSTART | (matesw_use_u8(l_ms, opt->a, u8_shift)? KSW_XBYTE : 0) | (opt->min_seed_len * opt->a);
 
+            /* Exact rescue pruning (rescue_prune.h), decided before anything is staged: a proven
+             * failure is not enqueued at all (MATESW_GAR_PROVEN_FAIL), and a narrowed window moves
+             * ref/rb/re exactly like --rescue-kmer's narrowing, so only the sub-window is copied
+             * and _post applies the same offset. The oriented mate is built once here and reused
+             * for the staging copy below. */
+            const bool pruned = rescue_prune_applies(opt, xtra);
+            static thread_local std::vector<uint8_t> oq;   // oriented mate; grows, never shrinks
+            if (pruned) {
+                if ((int)oq.size() < l_ms) oq.resize(l_ms);
+                matesw_orient(ms, l_ms, is_rev, oq.data());
+                int hb, he;
+                const int kind = rescue_prune_window(ref, (int)(re - rb), oq.data(), l_ms,
+                                                     opt->min_seed_len * opt->a,
+                                                     rescue_prune_max_hits(), &hb, &he);
+                if (g_rescue_prune_stats.on) {
+                    g_rescue_prune_stats.jobs++;
+                    g_rescue_prune_stats.rows_in += re - rb;
+                    (kind == RESCUE_PRUNE_B1 ? g_rescue_prune_stats.b1 : kind == RESCUE_PRUNE_B2 ? g_rescue_prune_stats.b2 : g_rescue_prune_stats.full)++;
+                    g_rescue_prune_stats.rows_kept += kind == RESCUE_PRUNE_B1 ? 0 : kind == RESCUE_PRUNE_B2 ? he - hb + 1 : re - rb;
+                }
+                if (kind == RESCUE_PRUNE_B1) {
+                    gar[gcnt + r] = MATESW_GAR_PROVEN_FAIL;
+                    continue;
+                }
+                if (kind == RESCUE_PRUNE_B2) {
+                    ref += hb; rb += hb; re = rb + (he - hb + 1);
+                    narrow_ob += hb;
+                }
+            }
+
             /* D3 (--meth): enqueue ONE SW, scored under the rescued mate's own
              * read-number chemistry (mate_meth_ot: R1=1/OT, R2=0/OB) flipped by
              * the rescue strand (this path RC's the READ, so is_rev toggles the
@@ -1673,9 +1801,10 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                  * byte-identical to the removed two-step (build rev, then
                  * qs[l]=rev[l]) because rev[l] == ms[l_ms-1-l]<4 ? 3-ms[l_ms-1-l]
                  * : 4 and sp.len2 == l_ms. */
-                if (is_rev)
-                    for (int l = 0; l < sp.len2; l++)
-                        qs[l] = ms[sp.len2 - 1 - l] < 4 ? 3 - ms[sp.len2 - 1 - l] : 4;
+                if (pruned)
+                    memcpy(qs, oq.data(), (size_t)sp.len2);   // already oriented above
+                else if (is_rev)
+                    matesw_orient(ms, sp.len2, is_rev, qs);
                 else
                     memcpy(qs, ms, (size_t)sp.len2);
 
@@ -1696,10 +1825,8 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                 /* gar[gcnt+r] points at this rescue's single enqueued regid. */
                 if (hi == 0) gar[gcnt + r] = pcnt;
                 sp.regid = pcnt;
-                if (opt->rescue_kmer) {   /* record narrow offset by regid for _post */
-                    if ((int)g_rescue_narrow_off.size() <= pcnt)
-                        g_rescue_narrow_off.resize(pcnt + 1024, 0);
-                    g_rescue_narrow_off[pcnt] = narrow_ob;
+                if (opt->rescue_kmer || rescue_prune_on()) {   /* record narrow offset by regid for _post */
+                    *matesw_narrow_slot(mmc, tid, pcnt) = narrow_ob;
                 }
                 seqPairArray[pcnt++] = sp;
             }
@@ -1715,7 +1842,7 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                           const uint8_t *pac, const mem_pestat_t pes[4],
                           const mem_alnreg_t *a, int l_ms, const uint8_t *ms,
                           mem_alnreg_v *ma, kswr_t **myaln, int32_t gcnt,
-                          int32_t *gar, mem_cache *mmc, const char *ms_orig,
+                          int32_t *gar, mem_cache *mmc, int32_t tid, const char *ms_orig,
                           const int8_t *mat, int mate_meth_ot)
 {
     extern int mem_sort_dedup_patch_rev(const mem_opt_t *opt, const bntseq_t *bns,
@@ -1837,9 +1964,14 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
             /* --rescue-kmer: apply the same narrowing offset _pre stored for this
              * regid, so aln.tb/te map against the narrowed window start (batched
              * pairs only; index==-1 scalar-fallback pairs were never narrowed). */
-            if (opt->rescue_kmer && index >= 0)
-                rb += g_rescue_narrow_off[index];
-            if (index == -1) {
+            if ((opt->rescue_kmer || rescue_prune_on()) && index >= 0)
+                rb += mmc->rescue_narrow_off[tid][index];
+            if (index == MATESW_GAR_PROVEN_FAIL) {
+                /* Proven score < min_seed_len: the gate below fails exactly as for a real SW. */
+                memset(&aln, 0, sizeof aln);
+                aln.qb = aln.qe = aln.tb = aln.te = aln.score2 = aln.te2 = -1;
+            }
+            else if (index == -1) {
                 // fprintf(stderr, "Re-routing: Encountered -ve index for "
                 // "gcnt: %d, look into pre.\n", gcnt + r);
                 assert(ref != 0);
@@ -1850,7 +1982,7 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                 if (is_rev) {
                     rev = (uint8_t*) malloc(l_ms); // reverse complement of $ms
                     xassert(rev != NULL, "out of memory: rev");
-                    for (i = 0; i < l_ms; ++i) rev[l_ms - 1 - i] = ms[i] < 4? 3 - ms[i] : 4;
+                    matesw_orient(ms, l_ms, is_rev, rev);
                     seq = rev;
                 } else seq = (uint8_t*)ms;
                 // ksw_align2 reverses its target argument in place via

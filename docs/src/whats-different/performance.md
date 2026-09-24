@@ -192,6 +192,36 @@ WGS and WES slices (150 bp paired, hg38) at the default scoring, `-A 2`, `-B 6` 
 | `BWA3_CHAIN_STATS=1` | Print, once at exit, how the chaining and Pass-3 fast paths resolved (`[chain-stats] …`): reads indexed, reads that fell back, queries answered by bucket walks versus full scans, and reads the flat chaining index handed to the B-tree (equal positions, or over the cap). Measurement only; output is unchanged. |
 | `BWA3_CHAIN_FLAT_CAP=<n>` | Largest number of chains a read may have on the flat chaining index before it is replayed through the B-tree (default 512, bounding the index's O(n) sorted insert). `0` sends every read to the B-tree. A malformed or negative value is reported to stderr and the default used. Output is identical at every value. |
 
+## Mate rescue
+
+Byte-identical changes to mate rescue, the batched Smith-Waterman of a read's
+mate against the reference window its insert size allows. Output was verified
+identical (md5 of the non-`@PG` records) to the previous `main` on 5M-pair WGS and
+WES slices (150 bp paired, hg38) at the default scoring on AWS Graviton 4 (NEON).
+
+- **Exact rescue pruning.** Before a rescue job is staged, a filter bounds the
+  best local score from the exact 5-mer matches between the mate and the window.
+  A job proven unable to reach the rescue threshold (`min_seed_len * a`) is not
+  run and takes the ordinary failing-rescue path; otherwise only the rows that
+  can hold an alignment at that threshold are computed, which reproduces every
+  field the rescue consumes (score, positions, suboptimal score). Derived for the
+  default scoring only (`-A 1 -B 4 -O 6 -E 1`); other scorings, `--meth`,
+  `--rescue-kmer`, windows or mates with an N, and the 16-bit path keep the full
+  window. It runs on aarch64 only, where a NEON filter carries it; elsewhere the
+  full window is always computed.
+- **11-op 8-bit rescue cell (NEON).** When the insertion and deletion gap opens
+  agree, the 8-bit rescue kernel builds each cell from the score before the in-row
+  gap and opens both gaps from one saturating subtract: 11 vector operations per
+  cell instead of 13, and row i+1 no longer waits on row i's gap chain. Every
+  score and position it emits is unchanged.
+
+| Variable | Effect |
+|---|---|
+| `BWA3_RESCUE_PRUNE=0` | Compute every rescue window in full (the reference path for identity checks). Default on where pruning runs. |
+| `BWA3_RESCUE_PRUNE_MAX_HITS=<n>` | Keep the full window when the mate and window share more than `n` exact 5-mer hits, where the filter would cost more than it saves (default 400). A malformed or negative value is reported to stderr and the default used. Output is identical at every value. |
+| `BWA3_RESCUE_PRUNE_STATS=1` | Print, once at exit, how the filter decided (`[RESCUE_PRUNE] jobs=… full=… b1=… b2=… rows_in=… rows_kept=…`): jobs filtered, and of them how many kept the full window, were proven to fail (`b1`) or were narrowed (`b2`), with the window rows before and after. Measurement only; output is unchanged. |
+| `BWA3_RESCUE_FSCAN=0` | Use the original 13-op 8-bit rescue cell on NEON. Output is identical either way. |
+
 ---
 
 ## Full change list
