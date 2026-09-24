@@ -180,15 +180,30 @@ static inline void rb_run_ub_i0(const rescue_prune_view &v, int a, int b, int &u
 {
     static const int16_t iota[8] = {0, 1, 2, 3, 4, 5, 6, 7};
     const int16x8_t IO = vld1q_s16(iota);
-    int16x8_t mx = vdupq_n_s16(-32768), mn = vdupq_n_s16(32767);
     const int16x8_t big = vdupq_n_s16(32767), small = vdupq_n_s16(-32768);
-    for (int x = a & ~7; x < b; x += 8) {
+    int16x8_t mx = small, mn = big, mx2 = small, mn2 = big;
+    /* one block of 8 diagonals; in = lanes inside [a, b) */
+    auto edge = [&](int x) {
         const int16x8_t pos = vaddq_s16(IO, vdupq_n_s16((int16_t)x));
         const uint16x8_t in = vandq_u16(vcgeq_s16(pos, vdupq_n_s16((int16_t)a)), vcltq_s16(pos, vdupq_n_s16((int16_t)b)));
         const uint16x8_t c = vld1q_u16(v.cnt + x);
         mx = vmaxq_s16(mx, vbslq_s16(in, vld1q_s16(v.bnd16 + x), small));
         mn = vminq_s16(mn, vbslq_s16(vandq_u16(in, vtstq_u16(c, c)), vld1q_s16(v.minrow + x), big));
-    }
+    };
+    /* inner blocks lie wholly inside [a, b): two independent accumulator pairs */
+    auto inner = [&](int x, int16x8_t &MX, int16x8_t &MN) {
+        const uint16x8_t c = vld1q_u16(v.cnt + x);
+        MX = vmaxq_s16(MX, vld1q_s16(v.bnd16 + x));
+        MN = vminq_s16(MN, vbslq_s16(vtstq_u16(c, c), vld1q_s16(v.minrow + x), big));
+    };
+    const int x0 = a & ~7, x1 = b & ~7;
+    edge(x0);
+    int x = x0 + 8;
+    for (; x + 8 < x1; x += 16) { inner(x, mx, mn); inner(x + 8, mx2, mn2); }
+    if (x < x1) inner(x, mx, mn);
+    if (x1 > x0 && x1 < b) edge(x1);
+    mx = vmaxq_s16(mx, mx2);
+    mn = vminq_s16(mn, mn2);
     ub = vmaxvq_s16(mx);
     i0 = vminvq_s16(mn);
 }
@@ -209,6 +224,19 @@ static bool rb_components_neon(const rescue_prune_view &v, int tau, int xa, int 
         return true;
     };
     if (tau == rescue_prune_neon::MINSC) {
+        /* The whole view at MINSC: the filter already listed these components (same runs of mw,
+         * same ub / i0 / dmaxhit computation, rescue_prune_neon.h step 7). Reproduce emit()'s
+         * result: append until out holds cap, false iff any component did not fit. */
+        if (xa == 0 && xb == v.nd && v.ncomp >= 0 && (v.ncomp == v.ncomp_stored || (int)out.size() + v.ncomp_stored >= cap)) {
+            for (int k = 0; k < v.ncomp; k++) {
+                if ((int)out.size() >= cap) return false;
+                const rescue_prune_neon::Comp &c = v.comps[k];
+                rb_comp K;
+                K.ub = c.ub; K.i0 = c.i0; K.dlo = c.a - v.off; K.dhi = c.b - 1 - v.off; K.dmaxhit = c.dmax - v.off;
+                out.push_back(K);
+            }
+            return true;
+        }
         for (int d = neon_next(v.mw, xa, xb, 0); d < xb;) {
             const int b = neon_next(v.mw, d, xb, ~0ull);
             if (!emit(d, b)) return false;
@@ -216,21 +244,30 @@ static bool rb_components_neon(const rescue_prune_view &v, int tau, int xa, int 
         }
         return true;
     }
-    /* tau > 19: runs of bnd >= tau inside [xa, xb) (a run of mw), found 8 diagonals at a time. */
-    static const uint16_t wl[8] = {1, 2, 4, 8, 16, 32, 64, 128};
-    const uint16x8_t WL = vld1q_u16(wl);
+    /* tau > 19: runs of bnd >= tau inside [xa, xb) (a run of mw), 64 diagonals per bitmask word;
+     * run starts and ends are the bit transitions of the word (branch per run, not per diagonal). */
+    static const uint8_t bw[16] = {1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128};
+    const uint8x16_t BW = vld1q_u8(bw);
     const int16x8_t T = vdupq_n_s16((int16_t)tau);
-    int run = -1;
-    for (int x = xa & ~7; x < xb; x += 8) {
-        unsigned m = vaddvq_u16(vandq_u16(vcgeq_s16(vld1q_s16(v.bnd16 + x), T), WL));
-        if (x < xa) m &= ~0u << (xa - x);
-        if (x + 8 > xb) m &= (1u << (xb - x)) - 1;
-        if (run < 0 && m == 0) continue;
-        if (run >= 0 && m == 0xFF) continue;
-        for (int t = 0; t < 8; t++) {
-            const bool on = m >> t & 1;
-            if (on && run < 0) run = x + t;
-            else if (!on && run >= 0) { if (!emit(run, x + t)) return false; run = -1; }
+    int run = -1;   // start of the open run, or -1
+    for (int x = xa; x < xb; x += 64) {
+        /* bnd16 holds nd + 64 readable entries (rescue_prune_neon.h), so the word's loads stay in
+         * the array; bits at or past xb are masked off below */
+        const int16_t *src = v.bnd16 + x;
+        uint8x16_t g[4];
+        for (int q = 0; q < 4; q++) {
+            const uint16x8_t c0 = vcgeq_s16(vld1q_s16(src + 16 * q), T), c1 = vcgeq_s16(vld1q_s16(src + 16 * q + 8), T);
+            g[q] = vandq_u8(vcombine_u8(vmovn_u16(c0), vmovn_u16(c1)), BW);
+        }
+        const uint8x16_t p = vpaddq_u8(vpaddq_u8(g[0], g[1]), vpaddq_u8(g[2], g[3]));
+        uint64_t m = vgetq_lane_u64(vreinterpretq_u64_u8(vpaddq_u8(p, p)), 0);   // bit k: x + k
+        if (xb - x < 64) m &= (1ull << (xb - x)) - 1;
+        uint64_t t = m ^ ((m << 1) | (run >= 0 ? 1u : 0u));   // bit k: the state changes at x + k
+        while (t) {
+            const int k = __builtin_ctzll(t);
+            t &= t - 1;
+            if (run < 0) run = x + k;
+            else { if (!emit(run, x + k)) return false; run = -1; }
         }
     }
     if (run >= 0 && !emit(run, xb)) return false;
@@ -326,7 +363,9 @@ bool RescueBandBatch::plan(const rescue_prune_view &v, int len1, int len2, int h
     if (ok && T1 > minsc) {
         cT_.clear();
         for (const rb_comp &K : c19_)
-            if (!rescue_band_components(v, T1, K.dlo + v.off, K.dhi + v.off + 1, cT_, RB_COMP_CAP)) {
+            /* K.ub is the max bound over K's diagonals, so K holds no diagonal with bound >= T1
+             * when K.ub < T1: the scan would find nothing. */
+            if (K.ub >= T1 && !rescue_band_components(v, T1, K.dlo + v.off, K.dhi + v.off + 1, cT_, RB_COMP_CAP)) {
                 ok = false; stats.comp_cap++; break;
             }
         cT = &cT_;

@@ -142,6 +142,12 @@ struct rescue_prune_view {
     const int32_t *fwd = nullptr, *bwd = nullptr;
     const uint64_t *mw = nullptr;   // NEON: bitset of diagonals with bnd >= 19
     const uint64_t *hw = nullptr;   // NEON: bitset of diagonals with bnd >= 19 and a hit
+#if defined(__aarch64__)
+    /* NEON: the filter's own components at bnd >= 19 with a hit (all of [0, nd)), in diagonal
+     * order; the first min(ncomp, ncomp_stored) are in comps. ncomp < 0: not available. */
+    const rescue_prune_neon::Comp *comps = nullptr;
+    int ncomp = -1, ncomp_stored = 0;
+#endif
 };
 
 static inline rescue_prune_scratch &rescue_prune_scalar_scratch()
@@ -174,6 +180,8 @@ static inline rescue_prune_view rescue_prune_last_view()
         v.nd = ns.view_nd;
         v.off = ((ns.qlen_c + 15) / 16) * 16;   // off = quanta of the last (cached) query
         v.cnt = ns.cnt; v.minrow = ns.minrow; v.bnd16 = ns.bnd; v.mw = ns.mw; v.hw = ns.hw;
+        v.comps = ns.comps; v.ncomp = ns.ncomp;
+        v.ncomp_stored = std::min(ns.ncomp, (int)rescue_prune_neon::NeonScratch::COMP_CAP);
         return v;
     }
 #endif
