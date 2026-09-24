@@ -36,7 +36,15 @@ Contacts: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@
 #include <time.h>   /* clock_gettime, nanosleep: proc_freq calibration */
 
 #ifdef USE_MIMALLOC
+#include <stdlib.h>  /* strtol: MIMALLOC_PURGE_DELAY check */
+#include <string.h>  /* strlen */
+#include <strings.h> /* strncasecmp */
 #include <mimalloc.h>
+#if defined(__APPLE__)
+#include <crt_externs.h> /* _NSGetEnviron */
+#else
+extern "C" char **environ;
+#endif
 #endif
 
 
@@ -165,6 +173,110 @@ static uint64_t calibrate_proc_freq(void)
     return 1;
 }
 
+#ifdef USE_MIMALLOC
+// The environment entry ("NAME=value") that mimalloc reads for option NAME, or
+// NULL when there is none. On POSIX mimalloc scans `environ` itself rather than
+// calling getenv(): it matches the name case-insensitively and takes the first
+// matching entry, so `mimalloc_purge_delay=1s` is read (and rejected) just like
+// the upper-case spelling. getenv() would miss it, so mirror the scan here.
+static const char *mimalloc_env_entry(const char *name)
+{
+#if defined(__APPLE__)
+    char **env = *_NSGetEnviron();
+#else
+    char **env = environ;
+#endif
+    const size_t len = strlen(name);
+    for (; env != NULL && *env != NULL; env++) {
+        if (strncasecmp(*env, name, len) == 0 && (*env)[len] == '=') return *env;
+    }
+    return NULL;
+}
+
+// Turn off mimalloc's page purging for `mem`, unless the user chose a purge
+// delay themselves.
+//
+// mimalloc v3 returns freed pages to the OS (decommit / MADV_DONTNEED) once
+// they have sat unused for `purge_delay` ms (1000 by default). `mem` frees and
+// reallocates the same large per-batch buffers every batch, so on a
+// multi-second batch cadence those pages are purged and then faulted straight
+// back in: seconds of system time on a human WGS run, for memory the very
+// next batch needs again. Never purging keeps them committed. Output is
+// unaffected (the allocator does not change what is computed); the trade is a
+// few hundred MB more peak RSS on human WGS for about 0.5% less wall time.
+//
+// mi_option_set_default only replaces the value when the option was NOT set
+// from the environment: mimalloc parses MIMALLOC_PURGE_DELAY (and its legacy
+// alias MIMALLOC_RESET_DELAY) at process load, before main(), and marks the
+// option initialized when it does. So an explicit MIMALLOC_PURGE_DELAY=<ms>
+// still wins, and restores the stock behaviour for anyone who needs RSS to
+// shrink back between batches.
+//
+// mimalloc's own parsing has two traps, both silent. It reads boolean words as
+// 0/1 (`off`/`no`/`false` -> 0, purge immediately; `on`/`yes`/`true` or an
+// empty value -> 1 ms). And it drops any other non-integer (`1s`, `250ms`)
+// without a warning, leaving the option defaulted, so this -1 applies instead
+// of what the user asked for. The second case is detectable here without
+// re-implementing mimalloc's grammar: the variable is set, yet the effective
+// value is still our -1 and the variable does not itself spell -1. Warn then.
+// The [M::main] line always reports the effective value.
+//
+// Scoped to `mem`, the one workload measured. `index` allocates and frees
+// very large, differently-sized arrays across its build phases, where keeping
+// every freed page committed could raise the peak rather than just holding it.
+static void mem_set_mimalloc_defaults(int mimalloc_active)
+{
+    if (!mimalloc_active) {
+        // A libmimalloc that exports only the mi_* API: malloc/free still go to
+        // the system allocator, so the purge delay governs nothing we allocate.
+        fprintf(stderr, "[M::main] mimalloc is linked but not overriding malloc; "
+                        "purge delay has no effect\n");
+        return;
+    }
+    mi_option_set_default(mi_option_purge_delay, -1);
+    const long delay = mi_option_get(mi_option_purge_delay);
+
+    // Same lookup order as mimalloc: the current name, then the legacy alias.
+    const char *env_name = "MIMALLOC_PURGE_DELAY";
+    const char *env_entry = mimalloc_env_entry(env_name);
+    if (env_entry == NULL) {
+        env_name = "MIMALLOC_RESET_DELAY";
+        env_entry = mimalloc_env_entry(env_name);
+    }
+    if (env_entry != NULL && delay == -1) {
+        const size_t env_name_len = strlen(env_name);
+        const char *env_value = env_entry + env_name_len + 1;
+        char *end = NULL;
+        long parsed = strtol(env_value, &end, 10);
+        if (end == env_value || *end != '\0' || parsed != -1) {
+            // Name the variable as the user spelled it, which may not be upper case.
+            fprintf(stderr, "[W::main] ignoring %.*s='%s': mimalloc could not parse it; "
+                            "give whole milliseconds, or -1 to never purge\n",
+                    (int)env_name_len, env_entry, env_value);
+        }
+    }
+    fprintf(stderr, "[M::main] mimalloc purge delay: %ld ms (-1 = never purge; "
+                    "set MIMALLOC_PURGE_DELAY to override)\n",
+            delay);
+}
+
+// Whether mimalloc is actually intercepting the standard allocator, not merely
+// linked. mi_version() resolves as long as libmimalloc is on the link line, so
+// linkage alone is a false-positive signal: a build that links a libmimalloc
+// which exports only the mi_* API (e.g. some distro/conda libmimalloc.so built
+// without the malloc override) still sends every real malloc/free to the
+// system allocator. Probe by allocating through the standard malloc and asking
+// mimalloc whether the pointer lives in one of its heap regions -- true only
+// when malloc was routed to mimalloc.
+static int mimalloc_overrides_malloc(void)
+{
+    void *probe = malloc(64);
+    int active = (probe != NULL) && mi_is_in_heap_region(probe);
+    free(probe);
+    return active;
+}
+#endif
+
 int main(int argc, char* argv[])
 {
     bwamem3_simd_init();
@@ -277,6 +389,10 @@ int main(int argc, char* argv[])
         fprintf(stderr, "Executing in %s mode!!\n",
                 bwamem3_simd_tier_name(bwamem3_simd_tier()));
         fprintf(stderr, "-----------------------------\n");
+#ifdef USE_MIMALLOC
+        // Before main_mem, so the index load and every batch run under it.
+        mem_set_mimalloc_defaults(mimalloc_overrides_malloc());
+#endif
 
         // The "SA compression enabled" banner used to print here, but that's
         // before the index is loaded (main_mem hasn't run yet), so it could
@@ -354,18 +470,8 @@ int main(int argc, char* argv[])
         {
             int mv = mi_version();
             // Report whether mimalloc is actually intercepting the standard
-            // allocator, not merely linked. mi_version() resolves as long as
-            // libmimalloc is on the link line, so the version alone is a
-            // false-positive signal: a build that links a libmimalloc which
-            // exports only the mi_* API (e.g. some distro/conda libmimalloc.so
-            // built without the malloc override) prints a version here while
-            // every real malloc/free still goes to the system allocator.
-            // Probe by allocating through the standard malloc and asking
-            // mimalloc whether the pointer lives in one of its heap regions —
-            // true only when malloc was routed to mimalloc.
-            void *probe = malloc(64);
-            int active = (probe != NULL) && mi_is_in_heap_region(probe);
-            free(probe);
+            // allocator, not merely linked (see mimalloc_overrides_malloc).
+            int active = mimalloc_overrides_malloc();
             // Emit on stdout so the whole `version` block stays on one stream
             // (PACKAGE_VERSION and the SIMD lines above also go to stdout);
             // downstream scripts that capture stdout can then parse it.
