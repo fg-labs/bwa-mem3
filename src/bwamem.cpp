@@ -1435,6 +1435,19 @@ int mem_patch_reg(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
 #define MEM_MINSC_COEF 5.5f
 #define MEM_SEEDSW_COEF 0.05f
 
+/* The window pass's redundancy test for q (earlier in `re` order) and p (later),
+ * shared by both window passes (mem_dedup_patch, sort_dedup_patch_impl) and
+ * mem_dedup_only_insert1's check of them, so the copies cannot drift apart. */
+static inline int dedup_redundant(const mem_opt_t *opt, const mem_alnreg_t *q, const mem_alnreg_t *p)
+{
+    int64_t or_, oq, mr, mq;
+    or_ = q->re - p->rb; // overlap length on the reference
+    oq = q->qb < p->qb? q->qe - p->qb : p->qe - q->qb; // overlap length on the query
+    mr = q->re - q->rb < p->re - p->rb? q->re - q->rb : p->re - p->rb; // min ref len in alignment
+    mq = q->qe - q->qb < p->qe - p->qb? q->qe - q->qb : p->qe - p->qb; // min qry len in alignment
+    return or_ > opt->mask_level_redun * mr && oq > opt->mask_level_redun * mq;
+}
+
 #if MATE_SORT
 int mem_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns,
                     const uint8_t *pac, uint8_t *query, int n,
@@ -1452,14 +1465,9 @@ int mem_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns,
 
         for (j = i - 1; j >= 0 && p->rid == a[j].rid && p->rb < a[j].re + opt->max_chain_gap; --j) {
             mem_alnreg_t *q = &a[j];
-            int64_t or_, oq, mr, mq;
             int score, w;
             if (q->qe == q->qb) continue; // a[j] has been excluded
-            or_ = q->re - p->rb; // overlap length on the reference
-            oq = q->qb < p->qb? q->qe - p->qb : p->qe - q->qb; // overlap length on the query
-            mr = q->re - q->rb < p->re - p->rb? q->re - q->rb : p->re - p->rb; // min ref len in alignment
-            mq = q->qe - q->qb < p->qe - p->qb? q->qe - q->qb : p->qe - p->qb; // min qry len in alignment
-            if (or_ > opt->mask_level_redun * mr && oq > opt->mask_level_redun * mq) { // one of the hits is redundant
+            if (dedup_redundant(opt, q, p)) { // one of the hits is redundant
                 if (p->score < q->score)
                 {
                     p->qe = p->qb;
@@ -1489,9 +1497,14 @@ int mem_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns,
 }
 #endif
 
-int mem_sort_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns,
-                         const uint8_t *pac, uint8_t *query, int n,
-                         mem_alnreg_t *a, const int8_t *mat)
+/* The body of mem_sort_dedup_patch and mem_dedup_only_fixpoint. `fixpoint_out`,
+ * if non-NULL, receives 1 when the returned array is provably a fixed point of a
+ * dedup-only call (bns == NULL), i.e. calling mem_sort_dedup_patch(opt, 0, 0, 0,
+ * n_out, a) again on it, unmodified, would leave every byte of a[0, n_out)
+ * unchanged. See mem_dedup_only_fixpoint for the argument. */
+static int sort_dedup_patch_impl(const mem_opt_t *opt, const bntseq_t *bns,
+                                 const uint8_t *pac, uint8_t *query, int n,
+                                 mem_alnreg_t *a, const int8_t *mat, int *fixpoint_out)
 {
     /* D3 (--meth, PR-4): `mat` is the per-read OT/OB matrix and `query` the
      * original read bases (the caller threads both under --meth); outside --meth
@@ -1502,6 +1515,8 @@ int mem_sort_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns,
      * resolves to opt->mat — those callers also pass bns==0 so no patch SW runs. */
     if (mat == NULL) mat = opt->mat;
     int m, i, j;
+    /* n <= 1 returns without touching the array, so a repeat call does too. */
+    if (fixpoint_out) *fixpoint_out = (bns == NULL);
     if (n <= 1) return n;
 
     /* The default path reorders the 112-byte records by sorting a (key,index)
@@ -1538,6 +1553,12 @@ int mem_sort_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns,
     }
     else           dedup_sort_by_re(n, a);
 
+    /* Fixed-point condition 1 of 2: `a` is now sorted by `re`; a tied `re`
+     * means the sorted order is not unique (see mem_dedup_only_fixpoint). */
+    if (fixpoint_out && *fixpoint_out)
+        for (i = 1; i < n; ++i)
+            if (a[i].re == a[i - 1].re) { *fixpoint_out = 0; break; }
+
     for (i = 0; i < n; ++i) a[i].n_comp = 1;
     for (i = 1; i < n; ++i)
     {
@@ -1547,14 +1568,9 @@ int mem_sort_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns,
 
         for (j = i - 1; j >= 0 && p->rid == a[j].rid && p->rb < a[j].re + opt->max_chain_gap; --j) {
             mem_alnreg_t *q = &a[j];
-            int64_t or_, oq, mr, mq;
             int score, w;
             if (q->qe == q->qb) continue; // a[j] has been excluded
-            or_ = q->re - p->rb; // overlap length on the reference
-            oq = q->qb < p->qb? q->qe - p->qb : p->qe - q->qb; // overlap length on the query
-            mr = q->re - q->rb < p->re - p->rb? q->re - q->rb : p->re - p->rb; // min ref len in alignment
-            mq = q->qe - q->qb < p->qe - p->qb? q->qe - q->qb : p->qe - p->qb; // min qry len in alignment
-            if (or_ > opt->mask_level_redun * mr && oq > opt->mask_level_redun * mq) { // one of the hits is redundant
+            if (dedup_redundant(opt, q, p)) { // one of the hits is redundant
                 if (p->score < q->score)
                 {
                     p->qe = p->qb;
@@ -1579,6 +1595,8 @@ int mem_sort_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns,
             if (m != i) { a[m] = a[i]; if (idx) idx[m] = idx[i]; }
             ++m;
         }
+    /* Fixed-point condition 2 of 2: the window pass excluded nothing. */
+    if (fixpoint_out && m != n) *fixpoint_out = 0;
     n = m;
     /* Remember this call's `re` order on the survivors (positions in the
      * compacted, still re-ordered array) so a following dedup-only call can
@@ -1609,6 +1627,119 @@ int mem_sort_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns,
      * across 337M regions on HG002 WGS, and SAM output byte-identical. The by-score
      * sort is retained — its ordering is relied on downstream by mem_mark_primary_se
      * / mem_pair (removing it changes primary selection). */
+    return n;
+}
+
+int mem_sort_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns,
+                         const uint8_t *pac, uint8_t *query, int n,
+                         mem_alnreg_t *a, const int8_t *mat)
+{
+    return sort_dedup_patch_impl(opt, bns, pac, query, n, a, mat, NULL);
+}
+
+/* The dedup-only call mem_sort_dedup_patch(opt, 0, 0, 0, n, a) -- same result,
+ * byte for byte -- that also reports whether its output is a FIXED POINT:
+ * *fixpoint_out = 1 guarantees that repeating the call on the returned
+ * a[0, n_out), unmodified, would return n_out and leave every byte unchanged, so
+ * a caller that has not touched the array since may skip the repeat.
+ *
+ * It is set iff (1) the `re` sort saw no tied `re` and (2) the window pass
+ * excluded nothing (n_out == n_in), or trivially iff n <= 1. Why that suffices:
+ * call 1 sorts its input by `re` into X. With no tied `re` the sorted order is
+ * unique, so every sort path (pdqsort, introsort, the incremental and
+ * permutation forms, --fast's total order) produces X from ANY arrangement of
+ * the same records. Call 1 then sets n_comp = 1 on X, runs the window pass --
+ * which, with bns == NULL (mem_patch_reg returns 0, so nothing is merged),
+ * reads only rid/rb/re/qb/qe/score and writes only qe (on exclusion) -- stamps
+ * dedup_re_rank = i + 1 and sorts by score into Z = the returned array. Call 2's
+ * input is Z: the records of X with only n_comp (now 1) and dedup_re_rank
+ * changed, neither of which the `re` sort reads. So call 2's `re` sort yields X
+ * again with those two fields as call 1 left them; setting n_comp = 1 makes it
+ * byte-identical to call 1's array at the same point; the window pass therefore
+ * makes the same (empty) set of exclusions; the ranks are restamped to the same
+ * values; and the by-score sort receives the byte-identical array call 1's did.
+ * That sort is a deterministic function of its input array (its starting-order
+ * hints only affect time, see dedup_incr_sort_by_score), so call 2 returns Z.
+ * Condition (1) is essential: on a tie the `re` permutation depends on input
+ * order, which differs between the calls. Condition (2) keeps the argument
+ * one of identical arrays rather than of which pairs a shorter array's window
+ * pass evaluates; exclusions are rare in rescue (~1 in 30k records), so it
+ * forfeits almost nothing. Covered by test/unit/test_alnreg_sort_dedup.cpp. */
+int mem_dedup_only_fixpoint(const mem_opt_t *opt, int n, mem_alnreg_t *a, int *fixpoint_out)
+{
+    return sort_dedup_patch_impl(opt, NULL, NULL, NULL, n, a, NULL, fixpoint_out);
+}
+
+/* mem_dedup_only_fixpoint for the one-new-record case, in O(n) when provably
+ * exact. Precondition: a[0, n) minus a[pos] is Z, the unmodified array (n - 1
+ * records, order kept) returned by a mem_dedup_only_fixpoint call that reported
+ * a fixed point, and a[pos] is one new record b. Returns what
+ * mem_dedup_only_fixpoint(opt, n, a, fixpoint_out) would, byte for byte, and
+ * sets *fixpoint_out the same way; when the fast path cannot prove its result it
+ * runs exactly that call. `fast_out`, if non-NULL, gets 1 when the O(n) path
+ * produced the result, 0 when the full call did (stats and tests).
+ *
+ * Why the fast path is exact. |Z| >= 2 (checked), so Z came from a full pass:
+ * it is sorted by (score desc, rb, qb), every n_comp is 1, dedup_re_rank is
+ * each record's 1-based position in the `re` order X of that pass, and that
+ * pass had distinct `re` and excluded nothing. The full call on Z + b:
+ *  - `re` sort: with b.re distinct from every Z.re (checked) all `re` are
+ *    distinct, so the order is unique: X with b inserted after the r records
+ *    with smaller `re`. No tie, so fixed-point condition 1 holds.
+ *  - window pass (bns == NULL: only the redundancy branch can act). With no
+ *    exclusion, p's scan visits the contiguous run before it with p's rid and
+ *    p.rb < a[j].re + max_chain_gap (`re` falls going back, so the gap test
+ *    stays false once false). Inserting b into X can only cut a Z record's run
+ *    short (a rid change), never extend it, so every Z-Z pair it evaluates was
+ *    evaluated by Z's own pass, and found non-redundant (else an exclusion). A
+ *    pair with b is evaluated only if the two share a rid and the later (by
+ *    `re`) has rb < the earlier's re + max_chain_gap; we check every such pair
+ *    with the pass's own predicate (dedup_redundant) and require b.qe > b.qb (the
+ *    compaction drops a record with qe <= qb). So nothing is excluded -- the
+ *    first exclusion would need a redundant evaluated pair -- and condition 2
+ *    holds: the result is a fixed point.
+ *  - the pass leaves n_comp = 1 on every record and ranks = `re` positions:
+ *    b's is r + 1, a Z record's old rank plus 1 if its re > b.re.
+ *  - by-score sort: if no two records share (score, rb, qb) (Z checked by its
+ *    adjacent pairs, b against every record) the sorted order is unique, so
+ *    every sort path returns Z with b inserted at its (score, rb, qb) position.
+ * Any failed check -> the full call. Covered by
+ * test/unit/test_alnreg_sort_dedup.cpp against the full call. */
+int mem_dedup_only_insert1(const mem_opt_t *opt, int n, mem_alnreg_t *a, int pos,
+                           int *fixpoint_out, int *fast_out)
+{
+    xassert(pos >= 0 && pos < n, "mem_dedup_only_insert1: pos out of range");
+    const mem_alnreg_t b = a[pos];
+    int ok = (n - 1 >= 2) && b.qe > b.qb;
+    int r = 0;          /* records of Z with re < b.re */
+    const mem_alnreg_t *prev = NULL;   /* previous Z record in by-score order */
+    for (int i = 0; ok && i < n; ++i) {
+        if (i == pos) continue;
+        const mem_alnreg_t *q = &a[i];
+        if (q->re == b.re) { ok = 0; break; }
+        if (q->re < b.re) ++r;
+        if (q->rid == b.rid) {
+            const mem_alnreg_t *lo = q->re < b.re ? q : &b, *hi = q->re < b.re ? &b : q;
+            if (hi->rb < lo->re + opt->max_chain_gap && dedup_redundant(opt, lo, hi)) { ok = 0; break; }
+        }
+        if (q->score == b.score && q->rb == b.rb && q->qb == b.qb) { ok = 0; break; }
+        if (prev != NULL && prev->score == q->score && prev->rb == q->rb && prev->qb == q->qb) { ok = 0; break; }
+        prev = q;
+    }
+    if (fast_out) *fast_out = ok;
+    if (!ok) return mem_dedup_only_fixpoint(opt, n, a, fixpoint_out);
+
+    /* Remove b, restamp, and reinsert it at its unique by-score position. */
+    memmove(&a[pos], &a[pos + 1], (size_t)(n - 1 - pos) * sizeof(*a));
+    for (int i = 0; i < n - 1; ++i)
+        if (a[i].re > b.re) ++a[i].dedup_re_rank;
+    int k = 0;
+    while (k < n - 1 && !alnreg_slt(b, a[k])) ++k;
+    memmove(&a[k + 1], &a[k], (size_t)(n - 1 - k) * sizeof(*a));
+    a[k] = b;
+    a[k].n_comp = 1;
+    a[k].dedup_re_rank = r + 1;
+    if (fixpoint_out) *fixpoint_out = 1;
     return n;
 }
 
