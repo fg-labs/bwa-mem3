@@ -43,6 +43,8 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "kswv.h"
 #include "simd_dispatch.h"
 #include "rescue_prune.h"
+#include "rescue_band.h"
+#include <chrono>
 
 #ifdef USE_MALLOC_WRAPPERS
 #  include "malloc_wrap.h"
@@ -300,31 +302,76 @@ static bool rescue_prune_enabled()
     static const bool on = [] { const char *e = getenv("BWA3_RESCUE_PRUNE"); return !e || e[0] != '0'; }();
     return on;
 }
-static int rescue_prune_max_hits()
+/* Default 400 for the hull path; 1000 when banding is on and the NEON filter runs (minsc == 19):
+ * banding turns more of the pruned windows into savings, which pays for the filter on the denser
+ * windows (measured locally: best of {400, 1000, 3000, 10^4, 10^9}). The scalar filter (any other
+ * minsc) is too slow on dense windows for that, so it keeps 400. */
+static int rescue_prune_max_hits(int minsc)
 {
-    static const int v = [] { const char *e = getenv("BWA3_RESCUE_PRUNE_MAX_HITS"); return e ? atoi(e) : 400; }();
-    return v;
+    static const int env = [] { const char *e = getenv("BWA3_RESCUE_PRUNE_MAX_HITS"); return e ? atoi(e) : -1; }();
+    if (env >= 0) return env;
+    return rescue_band_enabled() && minsc == 19 ? 1000 : 400;
 }
 /* BWA3_RESCUE_PRUNE_STATS=1 prints the filter's decisions at exit (non-vacuity check for the
  * identity A/B: identical output must come with a nonzero number of pruned rows). */
 struct rescue_prune_stats_t {
     std::atomic<uint64_t> jobs{0}, full{0}, b1{0}, b2{0}, rows_in{0}, rows_kept{0};
+    /* Thread-summed wall time of the rescue stages (ns): filter + band planning in _pre, kswv
+     * pass 0 (8-bit + 16-bit), the banded pass 0, and pass 1. Only measured when stats are on. */
+    std::atomic<uint64_t> ns_filter{0}, ns_k0{0}, ns_band{0}, ns_k1{0};
     bool on = [] { const char *e = getenv("BWA3_RESCUE_PRUNE_STATS"); return e && e[0] == '1'; }();
     ~rescue_prune_stats_t() {
-        if (on) fprintf(stderr, "[RESCUE_PRUNE] jobs=%llu full=%llu b1=%llu b2=%llu rows_in=%llu rows_kept=%llu\n",
+        if (on) fprintf(stderr, "[RESCUE_PRUNE] jobs=%llu full=%llu b1=%llu b2=%llu rows_in=%llu rows_kept=%llu "
+                        "filter_s=%.3f kswv_pass0_s=%.3f band_pass0_s=%.3f kswv_pass1_s=%.3f\n",
                         (unsigned long long)jobs, (unsigned long long)full, (unsigned long long)b1,
-                        (unsigned long long)b2, (unsigned long long)rows_in, (unsigned long long)rows_kept);
+                        (unsigned long long)b2, (unsigned long long)rows_in, (unsigned long long)rows_kept,
+                        ns_filter * 1e-9, ns_k0 * 1e-9, ns_band * 1e-9, ns_k1 * 1e-9);
     }
 };
+/* BWA3_RESCUE_DUMP=<prefix> (debug): append every prune-eligible rescue job (full window + oriented
+ * mate) to <prefix>.<thread-serial>, every BWA3_RESCUE_DUMP_STRIDE-th job (default 1). Record:
+ * int32 len1, int32 len2, len1 ref bytes, len2 query bytes. Feeds the offline exactness/timing
+ * harness for the banded rescue (test/rescue_band_harness.cpp). */
+static void rescue_dump_job(const uint8_t *ref, int len1, const uint8_t *q, int len2)
+{
+    static const char *prefix = getenv("BWA3_RESCUE_DUMP");
+    if (!prefix) return;
+    static const int stride = [] { const char *e = getenv("BWA3_RESCUE_DUMP_STRIDE"); return e ? std::max(1, atoi(e)) : 1; }();
+    static std::atomic<int> serial{0};
+    struct dumper {
+        FILE *fp = nullptr; long n = 0;
+        ~dumper() { if (fp) fclose(fp); }
+    };
+    static thread_local dumper d;
+    if (d.n++ % stride) return;
+    if (!d.fp) {
+        char path[4096];
+        snprintf(path, sizeof path, "%s.%d", prefix, serial++);
+        d.fp = fopen(path, "wb");
+        if (!d.fp) return;
+    }
+    const int32_t h[2] = {len1, len2};
+    fwrite(h, sizeof h, 1, d.fp);
+    fwrite(ref, 1, (size_t)len1, d.fp);
+    fwrite(q, 1, (size_t)len2, d.fp);
+}
+
+static inline uint64_t rescue_now_ns()
+{
+    return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 static rescue_prune_stats_t g_rescue_prune_stats;
 
 /* The pruning lemma is derived for the default scoring only (a=1, b=4, gap open 6 / extend 1),
  * the 8-bit kernel path, and non-meth rescue; everything else runs the full window. */
 static bool rescue_prune_applies(const mem_opt_t *opt, int xtra)
 {
+    /* minsc >= 5: a local alignment without an exact 5-mer match scores <= 4 under this scoring,
+     * so below 5 the "no component -> proven failure" step (B1) would be unsound. */
     return rescue_prune_enabled() && !opt->rescue_kmer && !opt->meth_mode && (xtra & KSW_XBYTE)
         && opt->a == 1 && opt->b == 4 && opt->o_del == 6 && opt->o_ins == 6
-        && opt->e_del == 1 && opt->e_ins == 1;
+        && opt->e_del == 1 && opt->e_ins == 1 && opt->min_seed_len * opt->a >= 5;
 }
 
 /* --rescue-kmer: length-sort each SIMD-width partition of `sp[0,pcnt)` (8-bit
@@ -888,15 +935,26 @@ static inline bool meth_scoring_batched_expressible(const mem_opt_t *opt)
 static void mem_sam_pe_batch_run(Ikswv *pwsw, SeqPair *pairs,
                                  uint8_t *seqBufRef, uint8_t *seqBufQer,
                                  kswr_t *aln, int64_t slice_pcnt,
-                                 int64_t slice_pcnt8, int nthreads)
+                                 int64_t slice_pcnt8, int nthreads,
+                                 int64_t n_banded = 0)
 {
     // Shift 16-bit
     for (int i=0; i<slice_pcnt-slice_pcnt8; i++)
         pairs[slice_pcnt + MAX_LINE_LEN - 1 - i] = pairs[slice_pcnt-i-1];
 
-    pwsw->getScores8(pairs, seqBufRef, seqBufQer, aln, slice_pcnt8, nthreads, 0);
+    /* Exact banded rescue (rescue_band.h): the first n_banded 8-bit pairs are hull parents whose
+     * pass 0 runs as banded DP jobs instead of kswv; it fills their aln[regid] exactly as kswv
+     * would, so the post-processing and pass 1 below treat every pair alike. */
+    const bool timed = g_rescue_prune_stats.on;
+    uint64_t t0 = timed ? rescue_now_ns() : 0;
+    pwsw->getScores8(pairs + n_banded, seqBufRef, seqBufQer, aln, slice_pcnt8 - n_banded, nthreads, 0);
     pwsw->getScores16(pairs + slice_pcnt8 + MAX_LINE_LEN, seqBufRef, seqBufQer,
                       aln, slice_pcnt-slice_pcnt8, nthreads, 0);
+    if (timed) { uint64_t t1 = rescue_now_ns(); g_rescue_prune_stats.ns_k0 += t1 - t0; t0 = t1; }
+    if (n_banded > 0) {
+        rescue_band_batch().run_pass0(pairs, (int)n_banded, seqBufRef, seqBufQer, aln, pwsw);
+        if (timed) { uint64_t t1 = rescue_now_ns(); g_rescue_prune_stats.ns_band += t1 - t0; t0 = t1; }
+    }
 
     // Post-processing
     int pos = 0, pos8 = 0, pos16 = 0;
@@ -939,8 +997,10 @@ static void mem_sam_pe_batch_run(Ikswv *pwsw, SeqPair *pairs,
     assert(pos8 + pos16 == pcnt2);
     (void) pcnt2;
 
+    if (timed) t0 = rescue_now_ns();
     pwsw->getScores16(pairs + pos8, seqBufRef, seqBufQer, aln, pos16, nthreads, 1);
     pwsw->getScores8(pairs, seqBufRef, seqBufQer, aln, pos8, nthreads, 1);
+    if (timed) g_rescue_prune_stats.ns_k1 += rescue_now_ns() - t0;
 }
 
 // This function is equivalent to align2() for axv512
@@ -973,6 +1033,10 @@ int mem_sam_pe_batch(const mem_opt_t *opt, mem_cache *mmc,
         kswr_t *r = &aln[i];
         r->tb = r->qb = -1;
     }
+
+    /* The per-batch band plans recorded by mem_matesw_batch_pre are consumed here; drop them
+     * whichever path returns (the buffers keep their capacity). */
+    struct band_reset_guard { ~band_reset_guard() { rescue_band_batch().reset(); } } band_reset;
 
     int nthreads = 1; // no multi-threading here
 
@@ -1071,9 +1135,11 @@ int mem_sam_pe_batch(const mem_opt_t *opt, mem_cache *mmc,
                           maxRefLen, maxQerLen);
 
     if (opt->rescue_kmer || rescue_prune_enabled()) matesw_sort_partitions_by_len(seqPairArray, pcnt8, pcnt);
+    /* Banded parents first (stable, so the kswv remainder keeps its length sort). */
+    const int64_t n_banded = rescue_band_enabled() ? rescue_band_batch().partition(seqPairArray, (int)pcnt8) : 0;
 
     mem_sam_pe_batch_run(pwsw.get(), seqPairArray, seqBufRef, seqBufQer,
-                         aln, pcnt, pcnt8, nthreads);
+                         aln, pcnt, pcnt8, nthreads, n_banded);
 
 #endif
 
@@ -1601,9 +1667,16 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                 if (is_rev) for (int l = 0; l < l_ms; l++) oq[l] = ms[l_ms - 1 - l] < 4 ? 3 - ms[l_ms - 1 - l] : 4;
                 else memcpy(oq.data(), ms, (size_t)l_ms);
                 int hb, he;
+                rescue_dump_job(ref, (int)(re - rb), oq.data(), l_ms);
+                const uint64_t tf0 = g_rescue_prune_stats.on ? rescue_now_ns() : 0;
                 const int kind = rescue_prune_window(ref, (int)(re - rb), oq.data(), l_ms,
                                                      opt->min_seed_len * opt->a,
-                                                     rescue_prune_max_hits(), &hb, &he);
+                                                     rescue_prune_max_hits(opt->min_seed_len * opt->a), &hb, &he);
+                /* Banding plan (rescue_band.h), bound to this pair's regid at enqueue (commit). */
+                if (kind == RESCUE_PRUNE_B2 && rescue_band_enabled())
+                    rescue_band_batch().plan(rescue_prune_last_view(), (int)(re - rb), l_ms, hb, he,
+                                             opt->min_seed_len * opt->a);
+                if (g_rescue_prune_stats.on) g_rescue_prune_stats.ns_filter += rescue_now_ns() - tf0;
                 if (g_rescue_prune_stats.on) {
                     g_rescue_prune_stats.jobs++;
                     g_rescue_prune_stats.rows_in += re - rb;
@@ -1778,6 +1851,7 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                         g_rescue_narrow_off.resize(pcnt + 1024, 0);
                     g_rescue_narrow_off[pcnt] = narrow_ob;
                 }
+                if (rescue_band_enabled()) rescue_band_batch().commit(pcnt);
                 seqPairArray[pcnt++] = sp;
             }
         }

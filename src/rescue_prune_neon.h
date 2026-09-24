@@ -25,10 +25,10 @@ struct Job {
     const uint8_t *ref, *qry;
 };
 
-// FALLBACK: the job exceeds the NEON path's capacity (window > ~4000 rows) or int16 range
-// (> 32000 hits); the caller must use the int32 scalar filter. (lean() below is int16 and
-// fixed-size, so it must NOT be used as the fallback.)
-enum Kind { FULL = 0, B1 = 1, B2 = 2, FALLBACK = 3 };
+/* SCALAR: lean_neon() cannot decide this input exactly (more than 32000 hits would overflow its
+ * int16 scans, or the window/query exceed its fixed buffers); the caller must run the int32 scalar
+ * filter (rescue_prune_window_scalar). Never returned by lean(). */
+enum Kind { FULL = 0, B1 = 1, B2 = 2, SCALAR = 3 };
 
 struct Scratch {
     int16_t head[1024];
@@ -154,6 +154,10 @@ struct NeonScratch {
     uint8_t qcache[CAP];
     int qlen_c = -1;
     bool q_has_n = false;
+    /* Set to nd when the last lean_neon() call returned B2 from the NEON path, so cnt / minrow /
+     * bnd / mw hold that call's per-diagonal arrays (rescue_band.h reads them to derive diagonal
+     * components at any threshold); -1 otherwise (other kinds, or the scalar lean() fallback). */
+    int view_nd = -1;
     Scratch fallback;
     NeonScratch()
     {
@@ -222,9 +226,10 @@ static inline Kind lean_neon(const Job &jb, NeonScratch &s, int &hb, int &he, in
     const uint8_t *ref = jb.ref, *q = jb.qry;
     const int len1 = jb.len1, len2 = jb.len2;
     hb = he = -1;
+    s.view_nd = -1;
     // ---- 1. N check (+ copy ref and query into zero-padded buffers) ----
     if (__builtin_expect(len1 + 64 > NeonScratch::CAP || len2 + 64 > NeonScratch::CAP, 0))
-        return FALLBACK;
+        return SCALAR;
     uint8x16_t ov = vdupq_n_u8(0);
     uint8_t orv = 0;
     {
@@ -265,7 +270,7 @@ static inline Kind lean_neon(const Job &jb, NeonScratch &s, int &hb, int &he, in
     orv |= vmaxvq_u8(ov);
     if ((orv & 0xFC) || s.q_has_n) return FULL;
     if (len1 < 5 || len2 < 5) return B1;
-    if (__builtin_expect(nd + 32 > NeonScratch::CAP, 0)) return FALLBACK;
+    if (__builtin_expect(nd + 32 > NeonScratch::CAP, 0)) return SCALAR;
 
     static const uint16_t wl[8] = {1, 2, 4, 8, 16, 32, 64, 128};
     static const uint16_t wh[8] = {256, 512, 1024, 2048, 4096, 8192, 16384, 32768};
@@ -368,7 +373,7 @@ static inline Kind lean_neon(const Job &jb, NeonScratch &s, int &hb, int &he, in
         const uint16x8_t koff = vdupq_n_u16((uint16_t)off), one16 = vdupq_n_u16(1);
         while (n > 0) {
             hits += n;
-            if (__builtin_expect(hits > 32000, 0)) return FALLBACK;
+            if (__builtin_expect(hits > 32000, 0)) return SCALAR;
             // diagonals and run boundaries (as list indices; k = 0 is always a boundary)
             uint16_t *bp = s.B;
             uint16x8_t pR = vdupq_n_u16(0), pD = vdupq_n_u16(0xFFFF), idx = IO;
@@ -408,7 +413,7 @@ static inline Kind lean_neon(const Job &jb, NeonScratch &s, int &hb, int &he, in
         }
     }
     if (hits == 0) return B1;
-    if (__builtin_expect(hits > 32000, 0)) return FALLBACK;
+    if (__builtin_expect(hits > 32000, 0)) return SCALAR;
 
     // ---- 6a. forward scans: P (inclusive prefix of cnt-1), PM (exclusive running min, with 0) ----
     const int16x8_t zero = vdupq_n_s16(0), one = vdupq_n_s16(1), big = vdupq_n_s16(32767),
@@ -486,11 +491,12 @@ static inline Kind lean_neon(const Job &jb, NeonScratch &s, int &hb, int &he, in
     if (hi < 0) return B1;
     hb = std::max(0, lo);
     he = std::min(len1 - 1, hi);
+    s.view_nd = nd;
     return B2;
 }
 #else
 struct NeonScratch { Scratch fallback; };
-static inline Kind lean_neon(const Job &, NeonScratch &, int &, int &, int = 0) { return FALLBACK; }
+static inline Kind lean_neon(const Job &jb, NeonScratch &s, int &hb, int &he) { return lean(jb, s.fallback, hb, he); }
 #endif
 
 }  // namespace rescue_prune_neon

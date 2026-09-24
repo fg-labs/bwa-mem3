@@ -50,6 +50,7 @@ struct rescue_prune_scratch {
     uint16_t cnt[DCAP];
     int16_t minrow[DCAP];
     int32_t fwd[DCAP], bwd[DCAP];
+    int view_nd = -1;   // nd of the last call that returned B2 (arrays valid), else -1
 };
 
 /* Scalar implementation (x86, or a non-default threshold). Same decisions as the NEON one. */
@@ -82,6 +83,7 @@ static inline int rescue_prune_window_scalar(const uint8_t *ref, int len1, const
     if (nhits > max_hits) return RESCUE_PRUNE_FULL;
 
     const int quanta = ((len2 + 15) / 16) * 16, off = quanta, nd = len1 + quanta + 1;
+    s.view_nd = -1;
     memset(s.cnt, 0, (size_t)nd * sizeof s.cnt[0]);
     c = (ref[0] << 6) | (ref[1] << 4) | (ref[2] << 2) | ref[3];
     for (int i = 4; i < len1; i++) {
@@ -122,7 +124,67 @@ static inline int rescue_prune_window_scalar(const uint8_t *ref, int len1, const
     if (hi < 0) return RESCUE_PRUNE_B1;
     *hb = std::max(0, lo);
     *he = std::min(len1 - 1, hi);
+    s.view_nd = nd;
     return RESCUE_PRUNE_B2;
+}
+
+/* Per-diagonal arrays of the last rescue_prune_window() call on this thread, for deriving
+ * diagonal components at thresholds above minsc (rescue_band.h). Valid only right after a call
+ * that returned RESCUE_PRUNE_B2, and only when nd >= 0 (the NEON path's rare scalar fallback
+ * leaves nd = -1). Diagonal index x in [0, nd) is the unshifted diagonal d = i - j = x - off.
+ * Exactly one of bnd16 (NEON: bnd precomputed) or fwd/bwd (scalar: bnd = 5 + fwd + bwd -
+ * (cnt - 1)) is set. mw, when set, is the NEON bitset of diagonals with bnd >= 19. */
+struct rescue_prune_view {
+    int nd = -1, off = 0;
+    const uint16_t *cnt = nullptr;
+    const int16_t *minrow = nullptr;
+    const int16_t *bnd16 = nullptr;
+    const int32_t *fwd = nullptr, *bwd = nullptr;
+    const uint64_t *mw = nullptr;   // NEON: bitset of diagonals with bnd >= 19
+    const uint64_t *hw = nullptr;   // NEON: bitset of diagonals with bnd >= 19 and a hit
+};
+
+static inline rescue_prune_scratch &rescue_prune_scalar_scratch()
+{
+    static thread_local rescue_prune_scratch s;
+    return s;
+}
+#if defined(__aarch64__)
+static inline rescue_prune_neon::NeonScratch &rescue_prune_neon_scratch()
+{
+    static thread_local rescue_prune_neon::NeonScratch ns;
+    return ns;
+}
+#endif
+/* 0 = none, 1 = scalar, 2 = NEON: which scratch the last rescue_prune_window() call used. */
+static inline int &rescue_prune_last_path()
+{
+    static thread_local int p = 0;
+    return p;
+}
+
+static inline rescue_prune_view rescue_prune_last_view()
+{
+    rescue_prune_view v;
+    const int path = rescue_prune_last_path();
+#if defined(__aarch64__)
+    if (path == 2) {
+        const rescue_prune_neon::NeonScratch &ns = rescue_prune_neon_scratch();
+        if (ns.view_nd < 0) return v;
+        v.nd = ns.view_nd;
+        v.off = ((ns.qlen_c + 15) / 16) * 16;   // off = quanta of the last (cached) query
+        v.cnt = ns.cnt; v.minrow = ns.minrow; v.bnd16 = ns.bnd; v.mw = ns.mw; v.hw = ns.hw;
+        return v;
+    }
+#endif
+    if (path == 1) {
+        const rescue_prune_scratch &s = rescue_prune_scalar_scratch();
+        if (s.view_nd < 0) return v;
+        v.nd = s.view_nd;
+        v.off = ((s.qlen_c + 15) / 16) * 16;
+        v.cnt = s.cnt; v.minrow = s.minrow; v.fwd = s.fwd; v.bwd = s.bwd;
+    }
+    return v;
 }
 
 /* Decide how much of a rescue window must be computed.
@@ -136,23 +198,27 @@ static inline int rescue_prune_window(const uint8_t *ref, int len1, const uint8_
                                       int minsc, int max_hits, int *hb, int *he)
 {
     *hb = *he = -1;
-    // minsc < 5: the lemma's base term (5) already exceeds the threshold, so nothing is provable.
-    if (minsc < 5 || len1 < 5 || len2 < 5 || len2 > rescue_prune_scratch::QCAP || len1 > 30000)
+    rescue_prune_last_path() = 0;
+    if (len1 < 5 || len2 < 5 || len2 > rescue_prune_scratch::QCAP || len1 > 30000)
         return RESCUE_PRUNE_FULL;
 #if defined(__aarch64__)
     if (minsc == rescue_prune_neon::MINSC) {  // identical decisions, ~2x faster (rescue_prune_neon.h)
-        static thread_local rescue_prune_neon::NeonScratch ns;
+        rescue_prune_neon::NeonScratch &ns = rescue_prune_neon_scratch();
+        rescue_prune_last_path() = 2;
         const rescue_prune_neon::Job jb{len1, len2, 0, 0, -1, -1, ref, q};
         int h, e;
         const rescue_prune_neon::Kind k = rescue_prune_neon::lean_neon(jb, ns, h, e, max_hits);
+        if (k == rescue_prune_neon::SCALAR) goto scalar;   // int32 path: > 32000 hits, long windows
         if (k == rescue_prune_neon::B1) return RESCUE_PRUNE_B1;
         if (k == rescue_prune_neon::FULL) return RESCUE_PRUNE_FULL;
-        if (k == rescue_prune_neon::B2) { *hb = h; *he = e; return RESCUE_PRUNE_B2; }
-        // FALLBACK: beyond the NEON path's capacity or int16 range -> int32 scalar filter below.
+        *hb = h; *he = e;
+        return RESCUE_PRUNE_B2;
     }
+scalar:
 #endif
-    static thread_local rescue_prune_scratch s;
-    return rescue_prune_window_scalar(ref, len1, q, len2, minsc, max_hits, s, hb, he);
+    rescue_prune_last_path() = 1;
+    return rescue_prune_window_scalar(ref, len1, q, len2, minsc, max_hits,
+                                      rescue_prune_scalar_scratch(), hb, he);
 }
 
 #endif
