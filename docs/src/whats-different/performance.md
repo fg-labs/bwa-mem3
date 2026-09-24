@@ -224,12 +224,13 @@ which the insert-size estimate, and so rescue and pairing, depend on).
   first row and column reaching the score are the same as in the full pass.
   Used for every 8-bit job at the default scoring (banded or not in the first
   pass, no `--meth`) when the band is cheaper than the full pass.
-- **11-op 8-bit rescue cell (NEON).** When the cost of opening a gap (open plus
-  extend, `-O` + `-E`) is the same for insertions and deletions and fits a byte,
-  and no gap cost is negative, the 8-bit rescue kernel builds each cell from the
-  score before the in-row gap and opens both gaps from one saturating subtract:
-  11 vector operations per cell instead of 13, and row i+1 no longer waits on row
-  i's gap chain. Every score and position it emits is unchanged.
+- **11-op rescue cell (NEON, AVX2, AVX-512BW; 8- and 16-bit).** When the
+  open-plus-extend sums (`-O` + `-E`) of insertions and deletions are equal and
+  fit the kernel's lane (a byte for the 8-bit kernels), and no gap cost is
+  negative, the rescue kernels build each cell from the score before the in-row
+  gap and open both gaps from one subtract: 11 vector operations per cell instead
+  of 13 in the NEON 8-bit kernel, and row i+1 no longer waits on row i's gap
+  chain. Every score and position it emits is unchanged.
 
 | Variable | Effect |
 |---|---|
