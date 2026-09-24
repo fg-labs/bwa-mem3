@@ -5,7 +5,7 @@
  * Adapted from fgumi's sidebar-brand.js:
  *  - product label "bwa-mem" + "3" (cyan + green) instead of "fg" + "umi"
  *  - tagline "Accelerated short-read alignment"
- *  - related-projects links: bwa-mem3-bench, bwa-mem3-rs, bwa-mem2, fgumi
+ *  - footer links: GitHub, Issues, Benchmarks, bwa-mem3-rs
  *  - breadcrumb section map matches bwa-mem3 SUMMARY top-level sections
  */
 (function () {
@@ -69,7 +69,7 @@
         '<span class="fg-footer-sep">·</span>' +
         '<a href="https://github.com/fg-labs/bwa-mem3/issues" target="_blank" rel="noopener">Issues</a>' +
         '<span class="fg-footer-sep">·</span>' +
-        '<a href="https://github.com/fg-labs/bwa-mem3-bench" target="_blank" rel="noopener">bwa-mem3-bench</a>' +
+        '<a href="__DOCS_ROOT__performance/benchmarks.html">Benchmarks</a>' +
         '<span class="fg-footer-sep">·</span>' +
         '<a href="https://github.com/fg-labs/bwa-mem3-rs" target="_blank" rel="noopener">bwa-mem3-rs</a>' +
         '</div>' +
@@ -131,7 +131,9 @@
         var main = document.querySelector('.content main');
         if (!main) return;
         var wrapper = document.createElement('div');
-        wrapper.innerHTML = FOOTER_HTML;
+        // The Benchmarks link is relative, so it can only be resolved once
+        // docsRoot is known.
+        wrapper.innerHTML = FOOTER_HTML.replace('__DOCS_ROOT__', docsRoot);
         main.appendChild(wrapper.firstChild);
     }
 

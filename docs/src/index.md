@@ -77,8 +77,8 @@ cd bwa-mem3 && make
   full changelog, by category.
 - **[Developer Guide](developer-guide/building.md)** — Build matrix, SIMD
   dispatch, regression tests, contributing.
-- **[Related Projects](related-projects/bwa-mem3-bench.md)** —
-  bwa-mem3-bench, bwa-mem3-rs, fgumi, bwa-mem2 upstream.
+- **[Related Projects](related-projects/bwa-mem3-rs.md)** —
+  bwa-mem3-rs, fgumi, bwa-mem2 upstream, bwameth.py.
 - **[Reference](reference/pr-catalog.md)** — fork-vs-upstream disposition, glossary,
   citation, license, changelog.
 

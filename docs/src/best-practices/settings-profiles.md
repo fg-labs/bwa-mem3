@@ -151,7 +151,7 @@ against golden truth.
 
 One caveat: this golden-truth metric scores a single best placement per read, so it does not capture downstream tools that *aggregate over repeats* — depth-based CNV, SV/mobile-element calling in repetitive regions, or repeat-region methylation. If your pipeline relies on which repeat copy is reported (rather than just the confident, MAPQ-high tier), validate `-m 10` against your own analysis rather than assuming neutrality.
 
-Numbers are from [bwa-mem3-bench](../related-projects/bwa-mem3-bench.md) on 5 M-read real datasets
+Numbers are from the [benchmark suite](../performance/benchmarks.md) on 5 M-read real datasets
 plus a multi-contig holodeck golden-truth ablation; consult the bench for methodology and current
 figures.
 
@@ -293,7 +293,7 @@ exact segments the fast-path handles, so indel-rich data is free.
 `30` remains the recommended value. **Validation status:** the non-emptying filter changes the
 observable output of `--min-ext-len` (and therefore `--fast`), so the cross-architecture speed
 figures and the golden-truth F1 sweep warrant a fresh
-[bwa-mem3-bench](../related-projects/bwa-mem3-bench.md) run (multi-thread, all regimes) to confirm
+[benchmark](../performance/benchmarks.md) run (multi-thread, all regimes) to confirm
 these `--fast` accuracy figures genome-wide. `--min-ext-len` and `--fast` stay opt-in; the drop-in
 defaults are unchanged.
 

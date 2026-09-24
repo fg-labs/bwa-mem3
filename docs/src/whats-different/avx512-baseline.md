@@ -112,7 +112,7 @@ loses only ~2-4% to the host-locked avx512bw build on AVX-512 hosts.
 
 Build the `avx2` and `avx512bw` variants (the latter already includes
 `-mprefer-vector-width=256` by default) and A/B them on your target host with
-[bwa-mem3-bench](https://github.com/fg-labs/bwa-mem3-bench); GCUPS is
+the [benchmark suite](../performance/benchmarks.md); GCUPS is
 within-host only, so compare on the hardware you will deploy on. (An
 earlier bench-infrastructure regression here was traced to a toolchain
 difference, not avx512bw itself, and is resolved.)

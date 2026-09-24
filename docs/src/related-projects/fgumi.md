@@ -47,4 +47,4 @@ suite. The intended integration path for in-process alignment within fgumi is
 [bwa-mem3-rs](bwa-mem3-rs.md) ·
 [Aligning short reads (mem)](../user-guide/aligning.md) ·
 [Best Practices — Multi-sample workflows](../best-practices/multi-sample.md) ·
-[bwa-mem3-bench](bwa-mem3-bench.md)
+[Benchmarks](../performance/benchmarks.md)

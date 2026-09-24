@@ -68,8 +68,7 @@ both:
   compatibility.
 - `pgo-clean` now removes arch-suffixed PGO binaries in addition to bare names.
 
-This enables the benchmarking workflow at
-[bwa-mem3-bench](https://github.com/fg-labs/bwa-mem3-bench), which requires
+This enables the [benchmarking workflow](../performance/benchmarks.md), which requires
 per-arch × per-regime profile capture. See also
 [Performance → PGO build](../performance/pgo.md).
 

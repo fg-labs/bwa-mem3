@@ -125,7 +125,7 @@ release PR** (merging it is what tags and publishes the release — see
 
 ### Bench
 
-- [ ] [bwa-mem3-bench](https://github.com/fg-labs/bwa-mem3-bench) run
+- [ ] [Benchmark](../performance/benchmarks.md) run
       submitted on the candidate SHA via
       `bwa_mem3_bench.cli submit --fg-labs-sha <sha>` (or the local
       smoke path for a fast sanity check).
@@ -138,7 +138,7 @@ release PR** (merging it is what tags and publishes the release — see
       `meth-twist-emseq-5M` concordance vs the bwameth baseline should
       sit at ~98.9% post-PR-#90, with the per-class breakdown matching
       the entry in
-      [`bwa-mem3-bench/docs/expected-divergences.yaml`](https://github.com/fg-labs/bwa-mem3-bench/blob/main/docs/expected-divergences.yaml)
+      [expected-divergence registry](../performance/benchmarks.md#release-validation)
       (or the entry added in this release — the file is in the bench
       repo, not in this repo).
 
@@ -161,7 +161,7 @@ release PR** (merging it is what tags and publishes the release — see
       [Contributing](contributing.md#recording-upstream-submitted-changes)).
 - [ ] `docs/src/reference/changelog.md` and `docs/src/cli/version.md`
       examples reference the new release string.
-- [ ] Spot-check the bwa-mem3-bench reference numbers in
+- [ ] Spot-check the [benchmark](../performance/benchmarks.md) reference numbers in
       `docs/src/performance/overview.md` against the bench's
       `regression.md` for the tagging SHA.
 
