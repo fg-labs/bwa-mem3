@@ -3002,6 +3002,121 @@ static inline void chain_add_one_seed(const mem_opt_t *opt, int64_t l_pac,
     }
 }
 
+/* Flat per-read chaining index (byte-identical to the kbtree path).
+ *
+ * chain_add_one_seed spends most of its time in the B-tree probe: a branchy
+ * binary search over 48-byte mem_chain_t keys, one node per level. With
+ * distinct keys (.pos) the probe's answer is fully determined -- kb_intervalp
+ * returns the chain with the largest pos <= the seed's rbeg, or NULL -- and the
+ * final in-order traversal is ascending pos. A sorted int64 key array with a
+ * branchless upper_bound reproduces both exactly.
+ *
+ * Equal keys are where the two differ: chain_cmp compares .pos only, so which
+ * of two equal-pos chains the B-tree returns depends on its node layout. A
+ * duplicate arises only when a new chain's pos equals its predecessor's
+ * (test_and_merge never changes a chain's pos), so add() refuses exactly that
+ * insert -- before mutating anything -- and the caller replays the read's seeds
+ * through the unchanged kbtree path from a clean start. Reads with more than
+ * `cap` chains do the same, bounding the O(n) sorted insert. Replay rewinds
+ * seedBufCount and frees any seed arrays the flat pass heap-grew, so the tree
+ * path sees exactly the state it would have had from the first seed.
+ *
+ * BWA3_CHAIN_FLAT_CAP (default 512) sets the cap; 0 sends every read with a
+ * second chain to the tree, so a small cap exercises the replay path. */
+struct ChainFlatSeed { mem_seed_t s; int rid; int8_t meth_hyp; };
+
+struct ChainFlat {
+    std::vector<mem_chain_t> chains;   /* insertion order */
+    std::vector<int64_t> keys;         /* ascending pos */
+    std::vector<uint32_t> ord;         /* ord[i] = chains index of keys[i] */
+    std::vector<ChainFlatSeed> log;    /* this read's seeds, for a replay */
+    int64_t seedbuf_start = 0;
+    bool active = false;
+
+    static int cap() {
+        static const int c = [] { const char *e = getenv("BWA3_CHAIN_FLAT_CAP"); return e ? atoi(e) : 512; }();
+        return c;
+    }
+    void begin(int64_t seedBufCount) {
+        chains.clear(); keys.clear(); ord.clear(); log.clear();
+        seedbuf_start = seedBufCount;
+        active = true;
+    }
+    /* number of keys <= pos, i.e. the predecessor's rank + 1 */
+    inline int rank_le(int64_t pos) const {
+        size_t n = keys.size();
+        if (n == 0) return 0;
+        const int64_t *b = keys.data();
+        while (n > 1) { const size_t h = n >> 1; b = (b[h] <= pos) ? b + h : b; n -= h; }
+        return (int)(b - keys.data()) + (*b <= pos);
+    }
+    /* Chain one seed; false = must replay through the tree (nothing mutated). */
+    inline bool add(const mem_opt_t *opt, int64_t l_pac, const bntseq_t *chain_bns,
+                    mem_seed_t *seedBuf, int64_t *seedBufCount, int64_t seedBufSize,
+                    int tid, int seqid, const mem_seed_t *seed_in, int rid, int8_t meth_hyp)
+    {
+        const int64_t pos = seed_in->rbeg;
+        const int r = rank_le(pos);
+        if (r > 0) {
+            mem_chain_t *lower = &chains[ord[r - 1]];
+            if (test_and_merge(opt, l_pac, lower, seed_in, rid, tid)) return true;
+            if (keys[r - 1] == pos) return false;          /* equal key: tree decides */
+        }
+        if ((int)chains.size() >= cap()) return false;
+        /* new chain: the kbtree path's to_add body, verbatim */
+        mem_chain_t tmp;
+        tmp.pos = pos;
+        tmp.n = 1; tmp.m = SEEDS_PER_CHAIN;
+        if ((*seedBufCount + tmp.m) > seedBufSize) {
+            tmp.m += 1;
+            if ((tmp.seeds = (mem_seed_t *)calloc(tmp.m, sizeof(mem_seed_t))) == NULL) { fprintf(stderr, "ERROR: out of memory tmp.seeds\n"); exit(1); }
+        } else {
+            tmp.seeds = seedBuf + *seedBufCount;
+            *seedBufCount += tmp.m;
+        }
+        tmp.seeds[0] = *seed_in;
+        tmp.rid = rid;
+        tmp.seqid = seqid;
+        tmp.is_alt = !!chain_bns->anns[rid].is_alt;
+        tmp.meth_hypothesis = meth_hyp;
+        const uint32_t ci = (uint32_t)chains.size();
+        chains.push_back(tmp);
+        keys.insert(keys.begin() + r, pos);
+        ord.insert(ord.begin() + r, ci);
+        return true;
+    }
+    /* Undo the flat pass: free heap-grown seed arrays, rewind the seed buffer. */
+    void abandon(mem_seed_t *seedBuf, int64_t seedBufSize, int64_t *seedBufCount) {
+        for (mem_chain_t &c : chains)
+            if (c.seeds < seedBuf || c.seeds >= seedBuf + seedBufSize) free(c.seeds);
+        *seedBufCount = seedbuf_start;
+        active = false;
+    }
+};
+
+/* Chain one seed on the flat index, falling back to (and staying on) the
+ * kbtree for the rest of the read once the flat index declines. */
+static inline void chain_add_seed(ChainFlat &cf, const mem_opt_t *opt, int64_t l_pac,
+                                  const bntseq_t *chain_bns, kbtree_t(chn) *tree,
+                                  mem_seed_t *seedBuf, int64_t *seedBufCount,
+                                  int64_t seedBufSize, int tid, int seqid,
+                                  const mem_seed_t *seed_in, int rid, int8_t meth_hyp)
+{
+    if (cf.active) {
+        cf.log.push_back({*seed_in, rid, meth_hyp});
+        if (cf.add(opt, l_pac, chain_bns, seedBuf, seedBufCount, seedBufSize, tid, seqid,
+                   seed_in, rid, meth_hyp))
+            return;
+        cf.abandon(seedBuf, seedBufSize, seedBufCount);
+        for (const ChainFlatSeed &r : cf.log)
+            chain_add_one_seed(opt, l_pac, chain_bns, tree, seedBuf, seedBufCount, seedBufSize,
+                               tid, seqid, &r.s, r.rid, r.meth_hyp);
+        return;
+    }
+    chain_add_one_seed(opt, l_pac, chain_bns, tree, seedBuf, seedBufCount, seedBufSize,
+                       tid, seqid, seed_in, rid, meth_hyp);
+}
+
 /** NEW ONE **/
 void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
                      const bntseq_t *bns,
@@ -3149,6 +3264,8 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
          * single-leaf-root read then does zero allocations. */
         static thread_local ChnTreeScratch chn_scratch;
         kbtree_t(chn) *tree = chn_scratch.t;
+        static thread_local ChainFlat chn_flat;
+        chn_flat.begin(seedBufCount);
         mem_chain_v *chain = &chain_ar[l];
         size = 0;
 
@@ -3345,9 +3462,9 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
                      * order — the single-pass streaming path. No recs[] write,
                      * no order_seeds; byte-identical to buffering with the
                      * identity order but without the double memory traffic. */
-                    chain_add_one_seed(opt, l_pac, chain_bns, tree, seedBuf,
-                                       &seedBufCount, seedBufSize, tid, l,
-                                       &s, rid, meth_hyp);
+                    chain_add_seed(chn_flat, opt, l_pac, chain_bns, tree, seedBuf,
+                                   &seedBufCount, seedBufSize, tid, l,
+                                   &s, rid, meth_hyp);
                 }
                 else
                 {
@@ -3371,12 +3488,19 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
             // chaining helper. S5: equal-pos insertion order into the kbtree is
             // preserved (no dedup/compact beyond order_seeds).
             for (int64_t ri = 0; ri < nrec; ++ri)
-                chain_add_one_seed(opt, l_pac, chain_bns, tree, seedBuf,
-                                   &seedBufCount, seedBufSize, tid, l,
-                                   &recs[ri].seed, recs[ri].rid, recs[ri].meth_hyp);
+                chain_add_seed(chn_flat, opt, l_pac, chain_bns, tree, seedBuf,
+                               &seedBufCount, seedBufSize, tid, l,
+                               &recs[ri].seed, recs[ri].rid, recs[ri].meth_hyp);
         } // reorder
 
         smem_ptr = pos + 1;
+        if (chn_flat.active) {
+            /* ascending pos == the kbtree's in-order traversal (keys distinct) */
+            size = (int)chn_flat.chains.size();
+            kv_resize(mem_chain_t, *chain, size);
+            for (uint32_t oi : chn_flat.ord) chain->a[chain->n++] = chn_flat.chains[oi];
+            chn_flat.active = false;
+        } else {
         size = kb_size(tree);
         // tprof[PE21][0] += kb_size(tree) * sizeof(mem_chain_t);
 
@@ -3385,6 +3509,7 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
 #define traverse_func(p_) (chain->a[chain->n++] = *(p_))
         __kb_traverse(mem_chain_t, tree, traverse_func);
 #undef traverse_func
+        }
 
         for (i = 0; i < chain->n; ++i)
             chain->a[i].frac_rep = (float)l_rep / seq_[l].l_seq;
