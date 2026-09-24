@@ -56,6 +56,14 @@ static int rb_tight_delta()
     return v;
 }
 
+/* Pass 1 of the banded parents banded as well (default) or through kswv (BWA3_RESCUE_BAND_P1=0).
+ * Both are exact; see rescue_band.h. */
+static bool rb_p1_banded()
+{
+    static const bool on = [] { const char *e = getenv("BWA3_RESCUE_BAND_P1"); return !e || e[0] != '0'; }();
+    return on;
+}
+
 static bool rb_stats_on()
 {
     static const bool on = [] { const char *e = getenv("BWA3_RESCUE_PRUNE_STATS"); return e && e[0] == '1'; }();
@@ -67,6 +75,7 @@ namespace {
 struct rb_global_stats {
     std::atomic<uint64_t> parents{0}, bands1{0}, bands2{0}, r2_band{0}, r2_kswv{0}, single{0};
     std::atomic<uint64_t> cells_req{0}, cells_pad{0}, hull_cells{0}, groups{0}, planned_no{0}, comp_cap{0}, tight{0};
+    std::atomic<uint64_t> p1_band{0}, p1_kswv{0}, p1_guard{0};
     std::atomic<uint64_t> t_plan_ns{0}, t_band_ns{0};
     ~rb_global_stats()
     {
@@ -74,12 +83,14 @@ struct rb_global_stats {
         fprintf(stderr, "[RESCUE_BAND] banded_parents=%llu tight_T1_planned=%llu declined_by_cost=%llu comp_cap=%llu "
                         "bands_r1=%llu single_band=%llu round2_banded=%llu round2_kswv=%llu bands_r2=%llu "
                         "groups=%llu cells_req=%llu cells_padded=%llu hull_cells_replaced=%llu "
+                        "pass1_banded=%llu pass1_kswv=%llu pass1_guard_fallback=%llu "
                         "plan_s=%.3f band_s=%.3f\n",
                 (unsigned long long)parents, (unsigned long long)tight, (unsigned long long)planned_no,
                 (unsigned long long)comp_cap, (unsigned long long)bands1, (unsigned long long)single,
                 (unsigned long long)r2_band, (unsigned long long)r2_kswv, (unsigned long long)bands2,
                 (unsigned long long)groups, (unsigned long long)cells_req,
                 (unsigned long long)cells_pad, (unsigned long long)hull_cells,
+                (unsigned long long)p1_band, (unsigned long long)p1_kswv, (unsigned long long)p1_guard,
                 t_plan_ns * 1e-9, t_band_ns * 1e-9);
     }
 };
@@ -371,6 +382,8 @@ void RescueBandBatch::reset()
         g_rb_stats.hull_cells += stats.hull_cells; g_rb_stats.groups += stats.groups;
         g_rb_stats.planned_no += stats.planned_no; g_rb_stats.comp_cap += stats.comp_cap;
         g_rb_stats.tight += stats.tight;
+        g_rb_stats.p1_band += stats.p1_band; g_rb_stats.p1_kswv += stats.p1_kswv;
+        g_rb_stats.p1_guard += stats.p1_guard;
         g_rb_stats.t_plan_ns += (uint64_t)(stats.t_plan * 1e9);
         g_rb_stats.t_band_ns += (uint64_t)(stats.t_band * 1e9);
         stats = rescue_band_stats();
@@ -378,6 +391,7 @@ void RescueBandBatch::reset()
     /* regid2parent_ entries are rewritten by commit() for every regid of the next batch. */
     recs_.clear();
     bands_.clear();
+    p1_.clear();
     pending_ = -1;
 }
 
@@ -634,7 +648,10 @@ static inline int rb_width_bucket(int w)
                                                                                  : 14 + ((w - 128 + 31) >> 5);
 }
 
-void RescueBandBatch::run_jobs()
+/* Run jobs_ in groups of 16 lanes. Pass 0 (pass1 == false) merges each lane into its parent
+ * (ps_[parent]); pass 1 only needs each lane's gmax / first row / first column, stored in
+ * p1res_[parent], and skips the row-max transpose. Stage counters cover pass 0 only. */
+void RescueBandBatch::run_jobs(bool pass1)
 {
 #if defined(__aarch64__)
     static thread_local rb_work w;
@@ -651,7 +668,7 @@ void RescueBandBatch::run_jobs()
     std::sort(order_.begin(), order_.end(), [this](int a, int b) { return jobs_[a].key < jobs_[b].key; });
     RB_T(ts1);
     RB_ACC(sort, ts0, ts1);
-    const bool st = rb_stats_on();
+    const bool st = rb_stats_on() && !pass1;
     for (int g = 0; g < n; g += 16) {
         const int nl = std::min(16, n - g);
         const job *L[16];
@@ -734,6 +751,23 @@ void RescueBandBatch::run_jobs()
         RB_T(tb2);
         RB_ACC(build, tb0, tb1);
         RB_ACC(dp, tb1, tb2);
+        /* Lane l's gmax, the first row reaching it and the first column holding it there. */
+        auto lane_result = [&](int l) {
+            const job &J = *L[l];
+            lane_res x{w.gmax[l], -1, 0};
+            if (x.g > 0) {
+                const int rt = w.te[l];
+                x.te = J.r0 + rt;
+                const int o = J.r0 - J.dlo;
+                for (int k = W - 1; k >= 0; k--)   // max k == min j
+                    if (w.SNAP[k * 16 + l] == x.g) { x.qe = rt - k + o; break; }
+            }
+            return x;
+        };
+        if (pass1) {
+            for (int l = 0; l < nl; l++) p1res_[L[l]->parent] = lane_result(l);
+            continue;
+        }
         /* ---- merge into the parents ---- */
         /* R back to lane-major (16x16 transposes), each lane's rows past its range zeroed, so
          * per-lane work below is contiguous vector code. */
@@ -752,15 +786,8 @@ void RescueBandBatch::run_jobs()
         for (int l = 0; l < nl; l++) {
             const job &J = *L[l];
             pstate &p = ps_[J.parent];
-            const int g8 = w.gmax[l];
-            int te = -1, qe = 0;
-            if (g8 > 0) {
-                const int rt = w.te[l];
-                te = J.r0 + rt;
-                const int o = J.r0 - J.dlo;
-                for (int k = W - 1; k >= 0; k--)   // max k == min j
-                    if (w.SNAP[k * 16 + l] == g8) { qe = rt - k + o; break; }
-            }
+            const lane_res x = lane_result(l);
+            const int g8 = x.g, te = x.te, qe = x.qe;
             const uint8_t *Rl = w.RL.data() + (size_t)l * rls;
             if (p.rbuf < 0) {   // the parent's only band: its outputs are the parent's
                 p.S = g8; p.te = te; p.qe = qe;
@@ -853,7 +880,7 @@ void RescueBandBatch::run_pass0(const SeqPair *pairs, int nb, const uint8_t *seq
             stats.hull_cells += (uint64_t)sp.len1 * (((sp.len2 + 15) / 16) * 16);
         }
     }
-    run_jobs();
+    run_jobs(false);
     /* ---- termination test; round 2 for the rest ---- */
     int n_r2 = 0, n_kswv = 0;
     jobs_.clear();
@@ -894,7 +921,7 @@ void RescueBandBatch::run_pass0(const SeqPair *pairs, int nb, const uint8_t *seq
         if (st) stats.bands2 += keep;
     }
     if (n_r2) {
-        run_jobs();
+        run_jobs(false);
         for (int32_t i : r2buf) {
             pstate &p = ps_[i];
             if (p.round != 2) continue;
@@ -910,4 +937,71 @@ void RescueBandBatch::run_pass0(const SeqPair *pairs, int nb, const uint8_t *seq
         kswv->getScores8(spscratch_.data(), (uint8_t *)seqBufRef, (uint8_t *)seqBufQer, aln, m, 1, 0);
     }
     if (st) stats.t_band += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+}
+
+/* ------------------------------------------------------------------------------------------ */
+/* Pass 1 (start recovery)                                                                     */
+/* ------------------------------------------------------------------------------------------ */
+
+bool RescueBandBatch::take_pass1(const SeqPair &sp, const kswr_t &r)
+{
+#if defined(__aarch64__)
+    if (!rb_p1_banded()) return false;
+    const int S = r.score, te = r.te, qe = r.qe;
+    /* 8-bit and unsaturated (kswv's 255 sentinel is S + shift >= 255, shift 4), and a real end. */
+    if (S <= 0 || S + 4 >= 255 || te < 0 || qe < 0 || sp.len2 != qe + 1) { stats.p1_kswv++; return false; }
+    /* The band of rescue_band.h: A* has D <= dmax deleted and I <= imax inserted bases, and spans at
+     * most qe + 1 + dmax rows of the te + 1 reversed ones. Diagonals past the last row (d > nrows - 1)
+     * or past the query (d < -(quanta - 1)) hold no cell, so the band is clipped to them. */
+    const int quanta = ((qe + 1 + 15) / 16) * 16;
+    const int dall = std::max(0, qe - S - 5);
+    const int nrows = std::min(te + 1, qe + 1 + dall);
+    const int dmax = std::min(dall, nrows - 1), imax = std::min(dall / 2, quanta - 1);
+    /* Same per-row cost model as pass 0's plan(): the rows are about the same for both (kswv stops
+     * at the first row reaching S, which is at most nrows), so compare the per-row cells. */
+    const int w = imax + dmax + 1;
+    if ((long)(std::min(w, quanta) + RB_OVH) * 100 >= (long)quanta * rb_cost_pct()) { stats.p1_kswv++; return false; }
+    p1_.push_back(p1job{sp, nrows, imax, dmax});
+    return true;
+#else
+    (void)sp; (void)r;
+    return false;
+#endif
+}
+
+void RescueBandBatch::run_pass1(const uint8_t *seqBufRef, const uint8_t *seqBufQer, kswr_t *aln, Ikswv *kswv)
+{
+    const int n = (int)p1_.size();
+    if (n == 0) return;
+    jobs_.clear();
+    for (int i = 0; i < n; i++) {
+        const p1job &P = p1_[i];
+        job J;
+        J.ref = seqBufRef + P.sp.idr; J.qry = seqBufQer + P.sp.idq;
+        J.len2 = P.sp.len2; J.quanta = ((P.sp.len2 + 15) / 16) * 16;
+        J.r0 = 0; J.nrows = P.nrows; J.dlo = -P.imax; J.w = P.imax + P.dmax + 1;
+        J.parent = i; J.key = 0;
+        jobs_.push_back(J);
+    }
+    if ((int)p1res_.size() < n) p1res_.resize(n);
+    run_jobs(true);
+    /* kswv writes tb / qb only when its phase-1 score equals the pass-0 score; for the band that
+     * always holds (rescue_band.h), so a lane that misses S is a broken invariant: rerun it
+     * through kswv rather than write anything the kernel did not prove. */
+    if ((int)spscratch_.size() < n + 64) spscratch_.resize(n + 64);   // kswv reads whole lane groups
+    int m = 0;
+    for (int i = 0; i < n; i++) {
+        const lane_res &x = p1res_[i];
+        kswr_t &a = aln[p1_[i].sp.regid];
+        if (x.g == a.score) {
+            a.tb = a.te - x.te;
+            a.qb = a.qe - x.qe;
+            continue;
+        }
+        spscratch_[m++] = p1_[i].sp;
+    }
+    stats.p1_band += n - m;
+    stats.p1_guard += m;
+    if (m) kswv->getScores8(spscratch_.data(), (uint8_t *)seqBufRef, (uint8_t *)seqBufQer, aln, m, 1, 1);
+    p1_.clear();
 }

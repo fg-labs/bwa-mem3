@@ -1,10 +1,11 @@
-/* Exact banded mate-rescue DP (pass 0 of the 8-bit kswv rescue path).
+/* Exact banded mate-rescue DP (passes 0 and 1 of the 8-bit kswv rescue path).
  *
  * rescue_prune.h narrows a rescue window to the hull of the 5-mer diagonal components whose bound
  * reaches minsc. This file goes further: it runs the pass-0 DP only inside the diagonal BANDS of
  * those components, and reassembles exactly the kswv outputs {score, te, qe, score2} of the hull
- * job from the bands' per-row maxima. Pass 1 (start recovery) and mem_matesw_batch_post are
- * unchanged: the parent SeqPair is still the hull window.
+ * job from the bands' per-row maxima; pass 1 (start recovery, tb / qb) then runs in a band derived
+ * from the pass-0 score (below). mem_matesw_batch_post is unchanged: the parent SeqPair is still
+ * the hull window.
  *
  * Why it is exact (design: bwa-mem3-bench ephemeral/2026-09-23-optimal-exact-rescue-design.md,
  * simulated as optsim v4 on 123 K real jobs with 0 mismatches):
@@ -29,12 +30,31 @@
  *    zeroing, kswv.cpp:~932-936, then the b[] scan, kswv.cpp:~1436-1519): Theorem B shows the
  *    result depends only on rows the rule above keeps exact.
  *
+ * Pass 1 (tb, qb) of a banded parent is banded too (take_pass1 / run_pass1). kswv phase 1 runs the
+ * DP on the reversed prefixes ref[te..0] x q[qe..0] and stops at the first row whose max reaches S;
+ * tb = te - that row, qb = qe - the first column holding S in it. Every alignment scoring S inside
+ * that rectangle ends at (te, qe) (an earlier end row would contradict te being the first row of S
+ * in pass 0, an earlier end column in row te the same for qe), so the answer is the start of the
+ * score-S alignment A* ending at (te, qe) with the latest start row, then the latest start column.
+ * At default scoring (a = 1, b = 4, gap 6 + len) A* with I inserted and D deleted bases and M <=
+ * qe + 1 - I matches satisfies S <= qe + 1 - 2I - D - 6 if it has any gap, so D <= Dmax =
+ * max(0, qe - S - 5), I <= Imax = Dmax / 2, and it spans at most qe + 1 + Dmax rows. In reversed
+ * coordinates A* starts at (0, 0) and every cell lies on a diagonal r - c in [-Imax, Dmax]. A
+ * zero-state DP restricted to that band (cells outside nonexistent: H = E = F = 0) never exceeds
+ * kswv's reversed DP and holds S at A*'s end, so it has the same first row reaching S and, in that
+ * row, the same first column holding S: tb / qb are byte-identical, ties included. The pad columns
+ * [qe + 1, quanta) are in both DPs; they cannot hold S on the first row reaching S (a pad cell's
+ * value comes from a row above or, reduced by a gap, from its own row), so they never decide
+ * either argmax. Jobs whose band is not cheaper than kswv, or whose banded max is not S (cannot
+ * happen; kept as a guard), run kswv phase 1.
+ *
  * Scope: aarch64 only (the NEON kernel); default scoring, 8-bit, non-meth, minsc in [19, 255]
  * (rescue_prune_applies). x86 keeps the hull path.
  * Env: BWA3_RESCUE_BAND=0 disables banding (hull path, and the prune gate back to 400 hits), for
  * A/B; BWA3_RESCUE_BAND_COST (band iff cost < pct% of the hull, default 85);
  * BWA3_RESCUE_BAND_R2=0 runs round 2 through kswv on the hull instead of banded;
  * BWA3_RESCUE_BAND_TIGHT (delta of the tight top band, default 8, 0 = off);
+ * BWA3_RESCUE_BAND_P1=0 runs pass 1 of the banded parents through kswv (default: banded);
  * BWA3_RESCUE_PRUNE_STATS=1 prints [RESCUE_BAND] / [RESCUE_PRUNE] counters and stage times. */
 #ifndef BWA_MEM3_RESCUE_BAND_H
 #define BWA_MEM3_RESCUE_BAND_H
@@ -67,6 +87,7 @@ void rescue_band_score2(const uint8_t *R, int stride, int n, int row0, int S, in
 struct rescue_band_stats {
     uint64_t parents = 0, bands1 = 0, bands2 = 0, r2_band = 0, r2_kswv = 0, single = 0;
     uint64_t cells_req = 0, cells_pad = 0, hull_cells = 0, groups = 0, planned_no = 0, comp_cap = 0, tight = 0;
+    uint64_t p1_band = 0, p1_kswv = 0, p1_guard = 0;
     double t_plan = 0, t_band = 0;
 };
 
@@ -92,6 +113,13 @@ public:
      * run through kswv (phase 0) on the hull. */
     void run_pass0(const SeqPair *pairs, int nb, const uint8_t *seqBufRef,
                    const uint8_t *seqBufQer, kswr_t *aln, Ikswv *kswv);
+    /* Pass 1 of a banded parent. sp is the pair as prepared for kswv phase 1 (reversed prefixes
+     * of lengths te + 1 and qe + 1 in the sequence buffers, len2 = qe + 1) and r its pass-0 result.
+     * Queues it for the banded pass 1 and returns true when that is eligible and cheaper than
+     * kswv; false means the caller runs it through kswv phase 1 as before. */
+    bool take_pass1(const SeqPair &sp, const kswr_t &r);
+    /* Run the queued pass-1 jobs: fills aln[regid].{tb, qb} exactly as kswv phase 1 would. */
+    void run_pass1(const uint8_t *seqBufRef, const uint8_t *seqBufQer, kswr_t *aln, Ikswv *kswv);
     void reset();
     rescue_band_stats stats;
 
@@ -104,7 +132,14 @@ private:
     struct pstate {
         int32_t regid, L, S, te, qe, s2, te2, left, rbuf, rec, round;
     };
-    void run_jobs();
+    /* A queued pass-1 job: the prepared pair, its reversed row count and band [-imax, dmax]. */
+    struct p1job {
+        SeqPair sp;
+        int32_t nrows, imax, dmax;
+    };
+    /* Per-lane result of one band job: gmax, its first row (-1 if gmax == 0) and first column. */
+    struct lane_res { int32_t g, te, qe; };
+    void run_jobs(bool pass1);
     void finish_parent(pstate &p);
     std::vector<int32_t> regid2parent_;
     std::vector<parent_rec> recs_;
@@ -115,6 +150,8 @@ private:
     std::vector<pstate> ps_;
     std::vector<uint8_t> rpool_;
     std::vector<SeqPair> spscratch_;
+    std::vector<p1job> p1_;
+    std::vector<lane_res> p1res_;
     int pending_ = -1;
 };
 
