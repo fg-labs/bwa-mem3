@@ -18,6 +18,15 @@ std::vector<kswr_t> run_kswv_batch(const std::vector<TestPair> &pairs,
                                    int gap_extend,
                                    int xtra_flags,
                                    bool use16) {
+    return run_kswv_batch_gaps(pairs, mat, gap_open, gap_extend, gap_open, gap_extend,
+                               xtra_flags, use16);
+}
+
+std::vector<kswr_t> run_kswv_batch_gaps(const std::vector<TestPair> &pairs,
+                                        const ScoringMatrix &mat,
+                                        int o_del, int e_del, int o_ins, int e_ins,
+                                        int xtra_flags,
+                                        bool use16) {
     if (xtra_flags == 0) {
         // Derive the KSW_XSUBO threshold (low 16 bits) from the matrix's
         // match score so the batched runner agrees with run_scalar_ksw
@@ -50,7 +59,7 @@ std::vector<kswr_t> run_kswv_batch(const std::vector<TestPair> &pairs,
     // rather than std::make_unique. RAII guarantees pwsw is destroyed
     // even if a later step (prepare_phase1, vector copy) throws.
     std::unique_ptr<kswv> pwsw(new kswv(
-        gap_open, gap_extend, gap_open, gap_extend,
+        o_del, e_del, o_ins, e_ins,
         mat[0],   // match weight (diagonal entry, +match)
         mat[1],   // mismatch weight (off-diagonal, -mismatch)
         1, maxRefLen, maxQerLen));

@@ -36,6 +36,12 @@ kswr_t run_scalar_ksw(const TestPair &p,
                       int gap_extend = DEFAULT_GAP_EXTEND,
                       int xtra_flags = 0);
 
+// As run_scalar_ksw, with separate deletion and insertion gap costs.
+kswr_t run_scalar_ksw_gaps(const TestPair &p,
+                           const ScoringMatrix &mat,
+                           int o_del, int e_del, int o_ins, int e_ins,
+                           int xtra_flags = 0);
+
 } // namespace bwa_tests
 
 #endif

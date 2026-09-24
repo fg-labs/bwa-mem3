@@ -17,6 +17,13 @@ kswr_t run_scalar_ksw(const TestPair &p,
                       int gap_open,
                       int gap_extend,
                       int xtra_flags) {
+    return run_scalar_ksw_gaps(p, mat, gap_open, gap_extend, gap_open, gap_extend, xtra_flags);
+}
+
+kswr_t run_scalar_ksw_gaps(const TestPair &p,
+                           const ScoringMatrix &mat,
+                           int o_del, int e_del, int o_ins, int e_ins,
+                           int xtra_flags) {
     if (xtra_flags == 0) {
         // Derive the KSW_XSUBO threshold (low 16 bits) from the matrix's
         // match score rather than the default=1, so tests that build a
@@ -35,7 +42,7 @@ kswr_t run_scalar_ksw(const TestPair &p,
                       const_cast<uint8_t *>(p.ref.data()),
                       5,
                       const_cast<int8_t *>(mat.data()),
-                      gap_open, gap_extend, gap_open, gap_extend,
+                      o_del, e_del, o_ins, e_ins,
                       xtra_flags,
                       nullptr);
 }
