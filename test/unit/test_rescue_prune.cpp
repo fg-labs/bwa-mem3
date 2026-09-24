@@ -17,6 +17,10 @@
 //   3. On aarch64, the NEON filter (rescue_prune_window at threshold 19)
 //      against the int32 scalar filter (rescue_prune_window_scalar) and, where
 //      it fits, the int16 reference lean(): identical (kind, hb, he).
+//   4. On aarch64, the NEON filter's repeat memo and its component list: a
+//      repeated job returns the first call's decision and view, and band
+//      planning's components taken from the filter's list equal a rescan of
+//      the view, at every cap.
 //
 // Mates stay at <= 250 bases so every job is in the 8-bit kernel's domain,
 // the only one the filter runs in.
@@ -30,6 +34,7 @@
 
 #include "doctest/doctest.h"
 #include "ksw.h"
+#include "rescue_band.h"
 #include "rescue_prune.h"
 #include "scoring.h"
 
@@ -423,5 +428,79 @@ TEST_CASE("rescue prune: the NEON filter's hit gate and query cache match the sc
         same_as_scalar(jobs[i].ref, q, kNoGate);
     }
     CHECK(cached > 20);
+#endif
+}
+
+// The two shortcuts band planning takes from the NEON filter (src/rescue_prune_neon.h):
+//   - an exact repeat of the previous job returns the previous decision without recomputing it, so
+//     it must return the same (kind, hb, he) and a view with the same components;
+//   - the filter lists its components at MINSC, and rescue_band_components reuses the list for the
+//     whole view instead of rescanning it. With the list hidden (ncomp = -1) it rescans; both must
+//     give the same components and the same success at every cap, including a window with more
+//     components than the filter stores (COMP_CAP) and an output vector that is not empty.
+TEST_CASE("rescue prune: the NEON filter's repeat memo and component list match a rescan"
+          * doctest::test_suite("unit/pair")) {
+#if !defined(__aarch64__)
+    MESSAGE("skipped: the NEON rescue-prune filter is aarch64-only");
+    return;
+#else
+    std::mt19937 rng(314159);
+    auto jobs = build_jobs(rng);
+    {   // one window with more components than COMP_CAP: a 20-base mate segment planted every 23 rows
+        const int len1 = 3700, len2 = 100;
+        auto ref = random_bases(rng, len1);
+        auto q = random_bases(rng, len2);
+        for (int at = 0; at + 20 <= len1; at += 23) std::copy(q.begin() + 40, q.begin() + 60, ref.begin() + at);
+        jobs.push_back({std::move(ref), std::move(q), "many components"});
+    }
+    const int comp_cap = rescue_prune_neon::NeonScratch::COMP_CAP;
+    auto same = [](const std::vector<rb_comp> &x, const std::vector<rb_comp> &y) {
+        if (x.size() != y.size()) return false;
+        for (size_t c = 0; c < x.size(); c++)
+            if (x[c].ub != y[c].ub || x[c].i0 != y[c].i0 || x[c].dlo != y[c].dlo || x[c].dhi != y[c].dhi
+                || x[c].dmaxhit != y[c].dmaxhit)
+                return false;
+        return true;
+    };
+    int n_b2 = 0, n_over_cap = 0;
+    std::vector<rb_comp> listed, rescanned;
+    for (size_t i = 0; i < jobs.size(); i++) {
+        const Job &jb = jobs[i];
+        const int len1 = (int)jb.ref.size(), len2 = (int)jb.q.size();
+        CAPTURE(jb.tag); CAPTURE(i); CAPTURE(len1); CAPTURE(len2);
+        int hb = -2, he = -2, rhb = -2, rhe = -2;
+        rescue_prune_view v, rv;
+        const int kind = rescue_prune_window(jb.ref.data(), len1, jb.q.data(), len2, kNeonMinsc, kNoGate,
+                                             &hb, &he, &v);
+        // The repeat: same bytes from a different buffer, so only the contents can match.
+        const std::vector<uint8_t> ref2(jb.ref), q2(jb.q);
+        const int rkind = rescue_prune_window(ref2.data(), len1, q2.data(), len2, kNeonMinsc, kNoGate,
+                                              &rhb, &rhe, &rv);
+        CHECK(rkind == kind);
+        CHECK(rhb == hb);
+        CHECK(rhe == he);
+        if (kind != RESCUE_PRUNE_B2 || !v.bnd16) continue;
+        ++n_b2;
+        REQUIRE(v.ncomp >= 0);
+        CHECK(rv.ncomp == v.ncomp);
+        n_over_cap += v.ncomp > comp_cap;
+        rescue_prune_view hidden = v;
+        hidden.ncomp = -1;
+        for (const int cap : {1 << 20, 0, 1, 2, comp_cap - 1, comp_cap, comp_cap + 1, v.ncomp - 1, v.ncomp,
+                              v.ncomp + 1}) {
+            for (const int prefill : {0, 3}) {
+                CAPTURE(cap); CAPTURE(prefill);
+                listed.assign((size_t)prefill, rb_comp{0, 0, 0, 0, 0});
+                rescanned = listed;
+                const bool ok_l = rescue_band_components(rv, kNeonMinsc, 0, rv.nd, listed, cap);
+                const bool ok_r = rescue_band_components(hidden, kNeonMinsc, 0, hidden.nd, rescanned, cap);
+                CHECK(ok_l == ok_r);
+                CHECK(same(listed, rescanned));
+            }
+        }
+    }
+    MESSAGE("component list: " << n_b2 << " B2 jobs, " << n_over_cap << " with more than COMP_CAP components");
+    CHECK(n_b2 > 50);
+    CHECK(n_over_cap > 0);
 #endif
 }

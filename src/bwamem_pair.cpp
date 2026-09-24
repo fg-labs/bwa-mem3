@@ -351,15 +351,19 @@ static bool rescue_prune_on()
 #endif
     return arch_ok && rescue_prune_enabled();
 }
-/* BWA3_RESCUE_PRUNE_STATS=1 prints the filter's decisions to stderr at exit as one line,
- * "[RESCUE_PRUNE] jobs=.. full=.. b1=.. b2=.. rows_in=.. rows_kept=.. jobs16=.. <stage times>":
- * jobs filtered, and of them how many kept the full window, were proven to fail (b1, not
- * enqueued) or were narrowed to a hull (b2), with the reference rows before and after. It is the non-vacuity check for the
- * identity A/B: identical output must come with a nonzero number of pruned rows. jobs16 counts
- * the 16-bit rescue jobs, which the filter never sees: the same non-vacuity check for the 16-bit
- * kswv kernels. */
+/* BWA3_RESCUE_PRUNE_STATS=1 prints the rescue shortcuts' counters to stderr at exit as one line,
+ * "[RESCUE_PRUNE] jobs=.. full=.. b1=.. b2=.. rows_in=.. rows_kept=.. jobs16=.. memo_hits=..
+ * <stage times> dedup_run=.. dedup_skip=.. dedup_run_regs=.. dedup_skip_regs=.. dedup_insert1=..
+ * dedup_insert1_fast=.. dedup_s=..". The first fields are the filter's: jobs filtered, and of them
+ * how many kept the full window, were proven to fail (b1, not enqueued) or were narrowed to a hull
+ * (b2), with the reference rows before and after, and the calls the NEON filter answered from its
+ * repeat memo. They are the non-vacuity check for the identity A/B: identical output must come
+ * with a nonzero number of pruned rows. jobs16 counts the 16-bit rescue jobs, which the filter
+ * never sees: the same check for the 16-bit kswv kernels. The dedup_* fields are the post-rescue
+ * dedup's (below), which runs on every architecture, so off aarch64 they and jobs16 are the line's
+ * only nonzero counters. */
 struct rescue_prune_stats_t {
-    std::atomic<uint64_t> jobs{0}, full{0}, b1{0}, b2{0}, rows_in{0}, rows_kept{0}, jobs16{0};
+    std::atomic<uint64_t> jobs{0}, full{0}, b1{0}, b2{0}, rows_in{0}, rows_kept{0}, jobs16{0}, memo_hits{0};
     /* Thread-summed wall time of the rescue stages (ns): filter + band planning in _pre, kswv
      * pass 0 (8-bit + 16-bit), the banded pass 0, kswv pass 1 and the banded pass 1. Only measured
      * when stats are on. */
@@ -371,12 +375,12 @@ struct rescue_prune_stats_t {
     bool on = [] { const char *e = getenv("BWA3_RESCUE_PRUNE_STATS"); return e && e[0] == '1'; }();
     ~rescue_prune_stats_t() {
         if (on) fprintf(stderr, "[RESCUE_PRUNE] jobs=%llu full=%llu b1=%llu b2=%llu rows_in=%llu rows_kept=%llu "
-                        "jobs16=%llu filter_s=%.3f kswv_pass0_s=%.3f band_pass0_s=%.3f kswv_pass1_s=%.3f "
-                        "band_pass1_s=%.3f dedup_run=%llu dedup_skip=%llu dedup_run_regs=%llu "
+                        "jobs16=%llu memo_hits=%llu filter_s=%.3f kswv_pass0_s=%.3f band_pass0_s=%.3f "
+                        "kswv_pass1_s=%.3f band_pass1_s=%.3f dedup_run=%llu dedup_skip=%llu dedup_run_regs=%llu "
                         "dedup_skip_regs=%llu dedup_insert1=%llu dedup_insert1_fast=%llu dedup_s=%.3f\n",
                         (unsigned long long)jobs, (unsigned long long)full, (unsigned long long)b1,
                         (unsigned long long)b2, (unsigned long long)rows_in, (unsigned long long)rows_kept,
-                        (unsigned long long)jobs16, ns_filter * 1e-9, ns_k0 * 1e-9, ns_band * 1e-9,
+                        (unsigned long long)jobs16, (unsigned long long)memo_hits, ns_filter * 1e-9, ns_k0 * 1e-9, ns_band * 1e-9,
                         ns_k1 * 1e-9, ns_b1 * 1e-9, (unsigned long long)dedup_run,
                         (unsigned long long)dedup_skip, (unsigned long long)dedup_run_regs,
                         (unsigned long long)dedup_skip_regs, (unsigned long long)dedup_insert1,
@@ -1745,6 +1749,7 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                 int hb, he;
                 rescue_prune_view view;
                 const uint64_t tf0 = g_rescue_prune_stats.on ? rescue_now_ns() : 0;
+                const uint64_t mh0 = g_rescue_prune_stats.on ? rescue_prune_memo_hits() : 0;
                 const int kind = rescue_prune_window(ref, (int)(re - rb), oq.data(), l_ms,
                                                      opt->min_seed_len * opt->a,
                                                      rescue_prune_max_hits(opt->min_seed_len * opt->a), &hb, &he,
@@ -1756,6 +1761,7 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                 if (g_rescue_prune_stats.on) g_rescue_prune_stats.ns_filter += rescue_now_ns() - tf0;
                 if (g_rescue_prune_stats.on) {
                     g_rescue_prune_stats.jobs++;
+                    g_rescue_prune_stats.memo_hits += rescue_prune_memo_hits() - mh0;
                     g_rescue_prune_stats.rows_in += re - rb;
                     (kind == RESCUE_PRUNE_B1 ? g_rescue_prune_stats.b1 : kind == RESCUE_PRUNE_B2 ? g_rescue_prune_stats.b2 : g_rescue_prune_stats.full)++;
                     g_rescue_prune_stats.rows_kept += kind == RESCUE_PRUNE_B1 ? 0 : kind == RESCUE_PRUNE_B2 ? he - hb + 1 : re - rb;

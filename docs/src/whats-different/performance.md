@@ -249,12 +249,18 @@ which the insert-size estimate, and so rescue and pairing, depend on).
   regions share a score, reference start and query start, and by the full
   dedup otherwise. The output of every dedup is unchanged. Runs on every
   architecture and at every scoring.
+- **Band planning from the filter's own components (NEON).** Band planning
+  takes the diagonal components at the rescue threshold from the NEON filter,
+  which has just found them, instead of rescanning the filter's per-diagonal
+  arrays; it skips components that cannot hold a higher threshold, and the
+  filter returns its previous decision for a job repeating the previous one
+  byte for byte. Plans and decisions are unchanged.
 
 | Variable | Effect |
 |---|---|
 | `BWA3_RESCUE_PRUNE=0` | Turn off exact rescue pruning and the banded passes: every rescue window runs in full through the rescue kernel (the reference path for identity checks). `--rescue-kmer`, which narrows windows on its own, is unaffected. Default on where pruning runs. |
 | `BWA3_RESCUE_PRUNE_MAX_HITS=<n>` | Keep the full window when the mate and window share more than `n` exact 5-mer hits, where the filter would cost more than it saves (default 1000 where the banded DP runs and the rescue threshold `min_seed_len * a` is 19, as at the default `-k 19 -A 1`; 400 otherwise). It only chooses between exact paths, so output does not depend on its value by design. |
-| `BWA3_RESCUE_PRUNE_STATS=1` | Print, once at exit, how the filter decided (`[RESCUE_PRUNE] jobs=… full=… b1=… b2=… rows_in=… rows_kept=… jobs16=… filter_s=… kswv_pass0_s=… band_pass0_s=… kswv_pass1_s=… band_pass1_s=… dedup_run=… dedup_skip=… dedup_run_regs=… dedup_skip_regs=… dedup_insert1=… dedup_insert1_fast=… dedup_s=…`): jobs filtered, and of them how many kept the full window, were proven to fail (`b1`) or were narrowed (`b2`), with the window rows before and after, the number of 16-bit rescue jobs (which the filter never sees) and the thread-summed seconds of each rescue stage; how many post-rescue dedups ran, were skipped, took the one-region insert and of those were done in one pass; and how the banded DP resolved (`[RESCUE_BAND] banded_parents=… …`). Measurement only; output is unchanged. |
+| `BWA3_RESCUE_PRUNE_STATS=1` | Print, once at exit, how the filter decided (`[RESCUE_PRUNE] jobs=… full=… b1=… b2=… rows_in=… rows_kept=… jobs16=… memo_hits=… filter_s=… kswv_pass0_s=… band_pass0_s=… kswv_pass1_s=… band_pass1_s=… dedup_run=… dedup_skip=… dedup_run_regs=… dedup_skip_regs=… dedup_insert1=… dedup_insert1_fast=… dedup_s=…`): jobs filtered, and of them how many kept the full window, were proven to fail (`b1`) or were narrowed (`b2`), with the window rows before and after, the number of 16-bit rescue jobs (which the filter never sees), the jobs the NEON filter answered from its repeat memo, and the thread-summed seconds of each rescue stage; how many post-rescue dedups ran, were skipped, took the one-region insert and of those were done in one pass; and how the banded DP resolved (`[RESCUE_BAND] banded_parents=… …`). Measurement only; output is unchanged. |
 | `BWA3_RESCUE_DEDUP_SKIP=0` | Run every post-rescue dedup in full instead of skipping one proven to be a no-op or adding a single new region in one pass. Default on. It only chooses between exact paths, so output is the same either way by design. |
 | `BWA3_RESCUE_BAND=0` | Run every narrowed job through the rescue kernel on its whole hull instead of banded (and the hit gate back to 400). Default on where banding runs. |
 | `BWA3_RESCUE_BAND_COST=<pct>` | Band a narrowed job only when its band cells cost less than `pct` % of the hull's (default 85). It only chooses between exact paths, so output does not depend on its value by design. |

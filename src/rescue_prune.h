@@ -142,7 +142,10 @@ static inline int rescue_prune_window_scalar(const uint8_t *ref, int len1, const
  * d = i - j = x - off, with nd = len1 + off + 1 and off the query's 8-bit quantum. Exactly one of
  * bnd16 (NEON: the bound precomputed) or fwd / bwd (scalar: bnd = 5 + fwd + bwd - (cnt - 1)) is
  * set; mw / hw are set with bnd16. The pointers alias the filter's per-thread scratch, so a view is
- * valid only until the next filter call on the same thread. */
+ * valid only until the next filter call on the same thread. Readable lengths, which band planning's
+ * vector loads rely on: on NEON (the filter accepts nd + 32 <= NeonScratch::CAP) cnt and minrow at
+ * least nd + 32 entries and bnd16 at least nd + 64 (NeonScratch::VIEW_PAD); on the scalar path nd,
+ * which is all the scalar planner reads. */
 struct rescue_prune_view {
     int nd = -1, off = 0;
     const uint16_t *cnt = nullptr;
@@ -151,6 +154,12 @@ struct rescue_prune_view {
     const int32_t *fwd = nullptr, *bwd = nullptr;
     const uint64_t *mw = nullptr;   // NEON: bitset of diagonals with bnd >= 19
     const uint64_t *hw = nullptr;   // NEON: bitset of diagonals with bnd >= 19 and a hit
+#if defined(__aarch64__)
+    /* NEON: the filter's own components at bnd >= 19 with a hit (all of [0, nd)), in diagonal
+     * order; the first min(ncomp, ncomp_stored) are in comps. ncomp < 0: not available. */
+    const rescue_prune_neon::Comp *comps = nullptr;
+    int ncomp = -1, ncomp_stored = 0;
+#endif
 };
 
 /* The view of a rescue_prune_window_scalar call on (len1, len2) that returned RESCUE_PRUNE_B2. */
@@ -161,6 +170,26 @@ static inline rescue_prune_view rescue_prune_scalar_view(const rescue_prune_scra
     v.nd = len1 + v.off + 1;
     v.cnt = s.cnt; v.minrow = s.minrow; v.fwd = s.fwd; v.bwd = s.bwd;
     return v;
+}
+
+#if defined(__aarch64__)
+/* The calling thread's NEON filter scratch (tables, per-diagonal arrays, query cache, memo). */
+static inline rescue_prune_neon::NeonScratch &rescue_prune_neon_scratch()
+{
+    static thread_local rescue_prune_neon::NeonScratch ns;
+    return ns;
+}
+#endif
+
+/* Calls on this thread that the NEON filter answered from its repeat memo (0 off aarch64), for
+ * BWA3_RESCUE_PRUNE_STATS and the tests. */
+static inline uint64_t rescue_prune_memo_hits()
+{
+#if defined(__aarch64__)
+    return rescue_prune_neon_scratch().memo_hits;
+#else
+    return 0;
+#endif
 }
 
 /* Decide how much of a rescue window must be computed. Valid only under a scoring
@@ -184,7 +213,7 @@ static inline int rescue_prune_window(const uint8_t *ref, int len1, const uint8_
         return RESCUE_PRUNE_FULL;
 #if defined(__aarch64__)
     if (minsc == rescue_prune_neon::MINSC) {  // identical decisions, ~2x faster (rescue_prune_neon.h)
-        static thread_local rescue_prune_neon::NeonScratch ns;
+        rescue_prune_neon::NeonScratch &ns = rescue_prune_neon_scratch();
         const rescue_prune_neon::Job jb{len1, len2, 0, 0, -1, -1, ref, q};
         int h, e;
         const rescue_prune_neon::Kind k = rescue_prune_neon::lean_neon(jb, ns, h, e, max_hits);
@@ -197,6 +226,8 @@ static inline int rescue_prune_window(const uint8_t *ref, int len1, const uint8_
                 view->nd = len1 + view->off + 1;
                 view->cnt = ns.cnt; view->minrow = ns.minrow; view->bnd16 = ns.bnd;
                 view->mw = ns.mw; view->hw = ns.hw;
+                view->comps = ns.comps; view->ncomp = ns.ncomp;
+                view->ncomp_stored = std::min(ns.ncomp, (int)rescue_prune_neon::NeonScratch::COMP_CAP);
             }
             return RESCUE_PRUNE_B2;
         }
