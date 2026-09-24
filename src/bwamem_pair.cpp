@@ -2036,11 +2036,13 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
         }
         if (rb < 0) rb = 0;
         if (re > l_pac<<1) re = l_pac<<1;
-        // Zero-copy ref slice via bns_fetch_seq_v2 (see mem_matesw_batch_pre
-        // for rationale). The scratch arg is unused by v2; pass NULL since
-        // mem_matesw_batch_post has no tid in scope to index seqPairArrayAux.
-        if (rb < re) ref = bns_fetch_seq_v2(bns, pac, &rb, (rb+re)>>1, &re, &rid,
-                                            mmc->ref_string, NULL);
+        // Only the clamped window bounds and rid are needed here: the bases are
+        // read solely by the scalar ksw_align2 fallback (index == -1), which
+        // fetches them itself below. The batched path reads its result from
+        // *myaln, so unpacking the window for every job (as _pre already did)
+        // was pure memory traffic. bns_fetch_bounds is bns_fetch_seq_v2's own
+        // clamp, so rb/re/rid are unchanged.
+        if (rb < re) bns_fetch_bounds(bns, &rb, (rb+re)>>1, &re, &rid);
 
         if (a->rid == rid && re - rb >= opt->min_seed_len) { // no funny things happening
             kswr_t aln;
@@ -2079,7 +2081,15 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
             else if (index == -1) {
                 // fprintf(stderr, "Re-routing: Encountered -ve index for "
                 // "gcnt: %d, look into pre.\n", gcnt + r);
-                assert(ref != 0);
+                // Fetch the window's bases only on this scalar path. [rb, re) is
+                // already clamped to one contig on one strand (rb is not narrowed
+                // for index == -1), so this is the same window bns_fetch_seq_v2
+                // returned before.
+                {
+                    int64_t ref_len_got = 0;
+                    ref = bns_get_seq_v2(l_pac, pac, rb, re, &ref_len_got, mmc->ref_string, NULL);
+                    xassert(ref != 0 && ref_len_got == re - rb, "rescue post: scalar-fallback window fetch failed");
+                }
                 // Build the mate query here (only the scalar path reads it):
                 // reverse-complement `ms` into `rev` for the RC orientations,
                 // else point straight at `ms`. Freed by the `if (rev) free(rev)`
@@ -2240,7 +2250,7 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
         #endif
 
         if (rev) free(rev);
-        // ref aliases ref_string (see bns_fetch_seq_v2 above); no free.
+        // ref (fallback path only) aliases ref_string or the pac-fetch scratch; no free.
     }
     if (ms2) free(ms2); // D3 (--meth): original-mate 2-bit scratch
     return n;

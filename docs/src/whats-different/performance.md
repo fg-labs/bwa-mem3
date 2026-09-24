@@ -255,6 +255,10 @@ which the insert-size estimate, and so rescue and pairing, depend on).
   arrays; it skips components that cannot hold a higher threshold, and the
   filter returns its previous decision for a job repeating the previous one
   byte for byte. Plans and decisions are unchanged.
+- **Window bounds only after the rescue.** The step that reads rescue results
+  back computed each job's reference window again, bases included, though it
+  needs only the clamped bounds and the contig; the bases are now fetched only
+  for the rare job that falls back to the scalar aligner.
 
 | Variable | Effect |
 |---|---|
