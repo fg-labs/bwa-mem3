@@ -41,6 +41,15 @@ std::vector<kswr_t> run_kswv_batch(const std::vector<TestPair> &pairs,
                                    int xtra_flags = 0,
                                    bool use16     = false);
 
+// As run_kswv_batch, with separate deletion and insertion gap costs (o_del,
+// e_del, o_ins, e_ins, the kswv constructor's order), for tests of the paths
+// that key on whether the two agree.
+std::vector<kswr_t> run_kswv_batch_gaps(const std::vector<TestPair> &pairs,
+                                        const ScoringMatrix &mat,
+                                        int o_del, int e_del, int o_ins, int e_ins,
+                                        int xtra_flags = 0,
+                                        bool use16     = false);
+
 } // namespace bwa_tests
 
 #endif

@@ -635,8 +635,64 @@ static bool rescue_rowpair_enabled() { return rescue_env_on("BWA3_RESCUE_ROWPAIR
  * BWA3_RESCUE_LAZYQE=0 restores the inline argmax. */
 static bool rescue_lazyqe_enabled() { return rescue_env_on("BWA3_RESCUE_LAZYQE"); }
 
-/* Thin dispatcher: route to the HasFreed × USQADD × RowPair × LazyQE template
- * instantiation (see the per-flag notes at the dispatch site below). The
+/* FScan (BWA3_RESCUE_FSCAN): the u8 NEON cell rebuilt around G = max(m11, f11),
+ * the cell's score before the in-row gap, with one sat(G - oe) opening both
+ * gaps and the row max taken over G: 11 vector ALU ops per cell instead of 13, a boundary
+ * mask that costs one blend per cell only where a lane pads its query (and
+ * never for reference padding), and pairs that no longer split at minLen1.
+ * See KSWV_NEON_U8_CELL_PAIR_FS and the note below for the byte-identity
+ * arguments. Default ON; BWA3_RESCUE_FSCAN=0 restores the original cell
+ * bodies (a separate monomorphised instantiation), as does a scoring whose
+ * insertion and deletion open-plus-extend sums differ or exceed a byte, or that
+ * has a negative gap cost (see the dispatcher).
+ *
+ * (The knob's name is historical: it is the idea this started from and did
+ * not keep.) With G free of e11, e11 is a prefix-max scan over the row, so two
+ * columns can advance it with
+ * one qsub + one max on the loop-carried chain (e_{j+2} = max(max(T_{j+1},
+ * sat(T_j - e)), sat(e_j - 2e))). But the original body ALREADY computed e11
+ * from max(m11, f11), so its chain was already the minimal qsub + max per
+ * column, and halving it costs an op per cell. This kernel is issue-bound
+ * first. Measured on Apple M2 (isolated kernel benchmark, rescue, 8-bit, qlen
+ * 150, window 1040, phase 0), against a 12-op intermediate of this cell: the
+ * two-column scan gave back half its gain (+2.6% vs +5% over the original in
+ * the Apple unrolled loop, +3.4% vs +8% rolled); breaking the e11 chain
+ * outright at equal op count -- a wrong-answer probe -- bounded all that
+ * latency could still give at +4.5%; sharing sat(H - oe) between the gaps
+ * (11 ops, but H back on the chain) measured -13%. Sharing sat(G - oe)
+ * instead, which point 1 at KSWV_NEON_U8_CELL_PAIR_FS licenses, is the 11-op
+ * cell here: +18.6% phase 0 / +17% phase 1 in the unrolled loop, +20% rolled
+ * (the loop shape non-Apple builds run). */
+static bool rescue_fscan_enabled() { return rescue_env_on("BWA3_RESCUE_FSCAN"); }
+
+/* Why FScan drops the REFERENCE half of the boundary mask (the per-cell
+ * zeroing of m11 on a lane's pad rows, i >= len1) outright, rather than
+ * hoisting it per row as the original bodies do:
+ *
+ * Rows are the outer loop and a lane's pad rows are all at its end, so a
+ * pad-row cell feeds only later pad-row cells of the same lane -- never a real
+ * cell. Pad rows reach the result only through the row max, via three
+ * consumers, each a STRICT comparison against earlier rows:
+ *   - gmax/te/qe update on imax > gmax (and qe's rescan only on those lanes);
+ *   - the lagged rowMax store zeroes row r when imax(r+1) > imax(r); the
+ *     score2 scan reads rows < len1 only, so this is the one pad-row effect
+ *     that reaches it (row len1-1);
+ *   - freeze/done read gmax only.
+ * So it suffices that a pad row's max never EXCEEDS the previous row's. The
+ * wrapper pads the reference with 0xFF, and s1 ^ s2 >= 0xEF for every other
+ * s2 it writes (0-3, AMBQ, NEON_QPAD8), so the table gather returns 0 and the
+ * cell is m11 = h00 (USQADD) or h00 - shift (biased; the NEON_QPAD8 blend
+ * gives h00) <= H(i-1, j-1). The one exception, 0xFF ^ 0xFF = 0 (the MATCH
+ * entry), is the pad-row x pad-column corner, which the query half of the mask
+ * still zeroes. E and F are decayed copies of the same row's G and the
+ * previous row's H, so inductively every pad-row H is <= the max of the last
+ * real row and none of the strict comparisons can fire -- exactly as with the
+ * zeroed m11, whose pad-row H is max(E, F) and equally bounded. No fr_ref
+ * matches 0xFF, so the freed-cell override never fires on a pad row. Dummy
+ * tail lanes (len1 = len2 = 0) are all pad and stay 0 either way. */
+
+/* Thin dispatcher: route to the HasFreed × USQADD × RowPair × LazyQE × FScan
+ * template instantiation (see the per-flag notes at the dispatch site below). The
  * <false> HasFreed path dead-code-eliminates every freed-cell override →
  * byte-identical to the pre-issue-173 kernel for symmetric (non-meth) matrices. */
 int kswv::kswv_neon_u8(uint8_t seq1SoA[],
@@ -653,30 +709,43 @@ int kswv::kswv_neon_u8(uint8_t seq1SoA[],
     const bool usq = rescue_usqadd_enabled();
     const bool pair = rescue_rowpair_enabled();
     const bool lazy = pair && rescue_lazyqe_enabled();
+    /* FScan shares one sat(G - oe) between both gaps, so it needs the two
+     * open-plus-extend sums (o + e; the opens themselves may differ) to agree
+     * as the byte the kernel broadcasts, and its proof
+     * (point 1 at KSWV_NEON_U8_CELL_PAIR_FS) needs oe >= e for both gaps, so
+     * a negative gap open (which -O accepts) or an o + e past a byte also
+     * takes the original bodies (bwa's defaults and presets all qualify). */
+    const int oe_ins = this->o_ins + this->e_ins, oe_del = this->o_del + this->e_del;
+    const bool fscan = rescue_fscan_enabled() && oe_ins == oe_del && oe_ins <= 255 &&
+        this->o_ins >= 0 && this->o_del >= 0 && this->e_ins >= 0 && this->e_del >= 0;
 
-    /* Route to the HasFreed x USQADD x RowPair x LazyQE instantiation. Each flag
-     * folds a per-cell branch out of the monomorphised body; the runtime dispatch
-     * is a once-per-call decision, not a per-cell one. LazyQE only exists for the
-     * two-row sweep, so the one-row instantiations are always <..., false, false>
-     * (12 bodies, not 16). */
-#define KSWV_U8_DISPATCH(HF, UQ, RP, LQ)                                        \
-    kswv_neon_u8_impl<HF, UQ, RP, LQ>(seq1SoA, seq2SoA, nrow, ncol, p, aln,     \
-                                      po_ind, tid, numPairs, phase)
-#define KSWV_U8_DISPATCH_PAIR(HF, UQ)                                           \
-    (pair ? (lazy ? KSWV_U8_DISPATCH(HF, UQ, true, true)                        \
-                  : KSWV_U8_DISPATCH(HF, UQ, true, false))                      \
-          : KSWV_U8_DISPATCH(HF, UQ, false, false))
+    /* Route to the HasFreed x USQADD x RowPair x LazyQE x FScan instantiation.
+     * Each flag folds a per-cell branch out of the monomorphised body; the
+     * runtime dispatch is a once-per-call decision, not a per-cell one. LazyQE
+     * only exists for the two-row sweep, so the one-row instantiations are
+     * always <..., false, false, FS> (24 bodies, not 32). */
+#define KSWV_U8_DISPATCH(HF, UQ, RP, LQ, FS)                                    \
+    kswv_neon_u8_impl<HF, UQ, RP, LQ, FS>(seq1SoA, seq2SoA, nrow, ncol, p, aln, \
+                                          po_ind, tid, numPairs, phase)
+#define KSWV_U8_DISPATCH_PAIR(HF, UQ, FS)                                       \
+    (pair ? (lazy ? KSWV_U8_DISPATCH(HF, UQ, true, true, FS)                    \
+                  : KSWV_U8_DISPATCH(HF, UQ, true, false, FS))                  \
+          : KSWV_U8_DISPATCH(HF, UQ, false, false, FS))
+#define KSWV_U8_DISPATCH_FS(HF, UQ)                                             \
+    (fscan ? KSWV_U8_DISPATCH_PAIR(HF, UQ, true)                                \
+           : KSWV_U8_DISPATCH_PAIR(HF, UQ, false))
     if (has_freed) {
-        if (usq)  return KSWV_U8_DISPATCH_PAIR(true, true);
-        else      return KSWV_U8_DISPATCH_PAIR(true, false);
+        if (usq)  return KSWV_U8_DISPATCH_FS(true, true);
+        else      return KSWV_U8_DISPATCH_FS(true, false);
     }
-    if (usq)  return KSWV_U8_DISPATCH_PAIR(false, true);
-    else      return KSWV_U8_DISPATCH_PAIR(false, false);
+    if (usq)  return KSWV_U8_DISPATCH_FS(false, true);
+    else      return KSWV_U8_DISPATCH_FS(false, false);
+#undef KSWV_U8_DISPATCH_FS
 #undef KSWV_U8_DISPATCH_PAIR
 #undef KSWV_U8_DISPATCH
 }
 
-template<bool HasFreed, bool USQADD, bool RowPair, bool LazyQE>
+template<bool HasFreed, bool USQADD, bool RowPair, bool LazyQE, bool FScan>
 int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
                             uint8_t seq2SoA[],
                             int16_t nrow,
@@ -767,6 +836,10 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
     uint8x16_t oe_del_vec = vdupq_n_u8(this->o_del + this->e_del);
     uint8x16_t e_ins_vec = vdupq_n_u8(this->e_ins);
     uint8x16_t oe_ins_vec = vdupq_n_u8(this->o_ins + this->e_ins);
+    /* FScan's one gap-open constant; the dispatcher routes here only when the
+     * two open costs are the same byte (see kswv_neon_u8). */
+    const uint8x16_t oe_vec = oe_ins_vec;
+    (void) oe_vec;
     /* Query-tail pad code (NEON_QPAD8); only the biased (!USQADD) body compares
      * against it -- see the jdummy note below. */
     uint8x16_t qpad_vec = vdupq_n_u8(NEON_QPAD8);
@@ -1067,6 +1140,113 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
             if (!LazyQE) j_v = vaddq_u8(j_v, one_vec);                           \
         }
 
+    /* ---- FScan: the two-row cell rebuilt around G = max(m11, f11) ----------
+     * Naming: in this kernel e11 is the IN-ROW (horizontal, query-direction)
+     * gap, the only state carried column to column, and F is the vertical gap
+     * carried row to row through memory. oe = o + e, the same byte for both
+     * gaps on this path (the dispatcher's condition).
+     *
+     * The cell, with G = max(m11, f11) and T = sat(G - oe):
+     *      H  = max(G, e11)
+     *      e' = max(T, sat(e11 - e_ins))
+     *      f' = max(T, sat(f11 - e_del))
+     *      row max over G
+     * 11 vector ALU ops per cell against the original's 13 (it built three
+     * maxes, hme = max(m11, e11), H and mf = max(m11, f11), and two opens).
+     *
+     * 1) F opens from G, i.e. never from E. sat(G - oe) = max(sat(m11 - oe),
+     *    sat(f11 - oe)), and the second term is dominated by sat(f11 - e_del)
+     *    (oe >= e_del), so f' is the textbook F with the E -> F transition
+     *    (a vertical gap opened straight out of a horizontal one) removed. The
+     *    original kept that transition through hme; it changes no H. Take any
+     *    path that uses it: a horizontal gap of a columns then a vertical gap
+     *    of b rows, from cell X to cell Y. Its twin runs the vertical gap
+     *    first, then the horizontal one, between the same two cells, at the
+     *    same cost (oe + (b-1)e_del + oe + (a-1)e_ins; with the clamp at 0,
+     *    sat(sat(x - p) - q) == sat(x - p - q) either way round), and the
+     *    recurrence admits it, since e' still opens from G, which contains
+     *    F. Gap moves never read the substitution score or the boundary mask,
+     *    so the twin exists wherever the original does, pad rows and columns
+     *    included. The twin ends in E where the original ended in F; the one
+     *    move F has that E lacks is extending vertically, and that path's twin
+     *    is again the vertical-first one with the longer vertical gap. So every
+     *    H, the only per-cell value the kernel emits or carries between rows
+     *    as a score (F in memory is internal), is unchanged. With the E term
+     *    gone, one T serves both gaps, and row i's F no longer waits on row i's
+     *    e11, so row i+1 no longer does either.
+     *
+     * 2) The row max is taken over G, not H: e11 at column j is at most
+     *    max_{k<j} G_k (induction from e11 = 0 at column 0; sat(x - a) <= x),
+     *    so every PREFIX max of H equals the prefix max of G. The row max, the
+     *    QE_BLK checkpoints (prefix maxima) and the inline strict-greater
+     *    argmax (H_j > M_{j-1} iff G_j > M_{j-1}, since e11_j <= M_{j-1}) are
+     *    therefore unchanged, and the stored H the lazy rescan reads is still
+     *    H, so its min{ j : H_j == rowmax } is untouched. This keeps e11 off
+     *    the imax path at no cost.
+     *
+     * e11's loop-carried chain stays one qsub + one max per column, and H is
+     * now a leaf (store and next diagonal only), so no rolled-loop register
+     * copy is needed for the carried diagonal either.
+     *
+     * Both points hold for any m11, so the boundary blend (which only zeroes
+     * m11) composes unchanged -- the 0xFF sentinel columns still let e11/F
+     * flow. Only its query half survives here, as cb_ = vtst(s2, 0x80)
+     * (COLBND), built once per column for both rows; the reference half is gone
+     * (see the note above kswv_neon_u8). */
+#define KSWV_U8_FS_M11(M, DIAG, S1, AFR, APPLY_BND, BND, NEED_DUMMY)            \
+            {                                                                   \
+                uint8x16_t sbt_ = vqtbl1q_u8(permSft, veorq_u8((S1), s2));       \
+                if (NEED_DUMMY && !USQADD)                                       \
+                    sbt_ = vbslq_u8(cmpq, sft_vec, sbt_);                        \
+                if (HasFreed)                                                    \
+                    sbt_ = vbslq_u8(vceqq_u8(s2, (AFR)), freedval_vec, sbt_);    \
+                if (USQADD) {                                                    \
+                    M = NEON_SQADD_U8((DIAG), sbt_);                             \
+                    if (APPLY_BND) M = vbslq_u8((BND), zero_vec, M);             \
+                } else {                                                        \
+                    M = vqaddq_u8((DIAG), sbt_);                                 \
+                    if (APPLY_BND) M = vbslq_u8((BND), zero_vec, M);             \
+                    M = vqsubq_u8(M, sft_vec);                                   \
+                }                                                               \
+            }
+#define KSWV_NEON_U8_CELL_PAIR_FS(APPLY_BND, BND0, BND1, NEED_DUMMY, COLBND, DIN, DOUT) \
+        {                                                                       \
+            uint8x16_t s2 = vld1q_u8(seq2SoA + j * SIMD_WIDTH8);                 \
+            uint8x16_t f11 = vld1q_u8(F + (j + 1) * SIMD_WIDTH8);                \
+            uint8x16_t h00 = vld1q_u8(H0 + j * SIMD_WIDTH8);                     \
+            uint8x16_t cmpq;                                                     \
+            if (NEED_DUMMY && !USQADD) cmpq = vceqq_u8(s2, qpad_vec);            \
+            (void) cmpq;                                                         \
+            uint8x16_t cb_ = zero_vec;                                           \
+            if (COLBND) cb_ = vtstq_u8(s2, highbit_vec);                         \
+            (void) cb_;                                                          \
+            /* ---- Row i (diagonal H0[j]) ---- */                              \
+            uint8x16_t m0_;                                                      \
+            KSWV_U8_FS_M11(m0_, h00, s1_0, active_frread_0, APPLY_BND, BND0, NEED_DUMMY) \
+            const uint8x16_t g0_ = vmaxq_u8(m0_, f11);                           \
+            const uint8x16_t t0_ = vqsubq_u8(g0_, oe_vec);                       \
+            const uint8x16_t f0_ = vmaxq_u8(t0_, vqsubq_u8(f11, e_del_vec));     \
+            const uint8x16_t h0_ = vmaxq_u8(g0_, e11_0);                         \
+            if (LazyQE) vst1q_u8(H0 + j * SIMD_WIDTH8, h0_);                     \
+            else col0 = vbslq_u8(vcgtq_u8(g0_, imax0), j_v, col0);               \
+            imax0 = vmaxq_u8(imax0, g0_);                                        \
+            e11_0 = vmaxq_u8(t0_, vqsubq_u8(e11_0, e_ins_vec));                  \
+            /* ---- Row i+1 (diagonal DIN, vertical carry f0_) ---- */           \
+            uint8x16_t m1_;                                                      \
+            KSWV_U8_FS_M11(m1_, (DIN), s1_1, active_frread_1, APPLY_BND, BND1, NEED_DUMMY) \
+            const uint8x16_t g1_ = vmaxq_u8(m1_, f0_);                           \
+            const uint8x16_t t1_ = vqsubq_u8(g1_, oe_vec);                       \
+            vst1q_u8(F + (j + 1) * SIMD_WIDTH8,                                  \
+                     vmaxq_u8(t1_, vqsubq_u8(f0_, e_del_vec)));                  \
+            const uint8x16_t h1_ = vmaxq_u8(g1_, e11_1);                         \
+            if (!LazyQE) col1 = vbslq_u8(vcgtq_u8(g1_, imax1), j_v, col1);       \
+            imax1 = vmaxq_u8(imax1, g1_);                                        \
+            e11_1 = vmaxq_u8(t1_, vqsubq_u8(e11_1, e_ins_vec));                  \
+            vst1q_u8(H1 + (j + 1) * SIMD_WIDTH8, h1_);                           \
+            (DOUT) = h0_;                                                        \
+            if (!LazyQE) j_v = vaddq_u8(j_v, one_vec);                           \
+        }
+
     /* Column-range driver: run BODY over [j, hi) in QE_BLK-aligned blocks and
      * run CKPT (the running-row-max checkpoint store) at every block boundary
      * crossed. Replaces a per-cell `j == qeNext` compare-and-branch: the cell
@@ -1100,28 +1280,35 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
      * alias this to the rolled loop with d1 as both diagonal registers, i.e.
      * the original code. */
 #if defined(__APPLE__)
-#define KSWV_U8_BLOCKS2(hi, CKPT, APPLY_BND, BND0, BND1, NEED_DUMMY)            \
+#define KSWV_U8_BLOCKS2_DRIVE(hi, CKPT, CELL, ...)                              \
         for (; j < (hi); ) {                                                    \
             const int jnb_ = ((j / QE_BLK) + 1) * QE_BLK;                       \
             const int jend_ = jnb_ < (hi) ? jnb_ : (hi);                        \
             for (; j + 1 < jend_; ) {                                           \
-                KSWV_NEON_U8_CELL_PAIR(APPLY_BND, BND0, BND1, NEED_DUMMY, d1, d1b) \
+                CELL(__VA_ARGS__, d1, d1b)                                      \
                 j++;                                                            \
-                KSWV_NEON_U8_CELL_PAIR(APPLY_BND, BND0, BND1, NEED_DUMMY, d1b, d1) \
+                CELL(__VA_ARGS__, d1b, d1)                                      \
                 j++;                                                            \
             }                                                                   \
             if (j < jend_) {                                                    \
-                KSWV_NEON_U8_CELL_PAIR(APPLY_BND, BND0, BND1, NEED_DUMMY, d1, d1b) \
+                CELL(__VA_ARGS__, d1, d1b)                                      \
                 j++;                                                            \
                 d1 = d1b;                                                       \
             }                                                                   \
             if ((j % QE_BLK) == 0) { CKPT }                                     \
         }
 #else
-#define KSWV_U8_BLOCKS2(hi, CKPT, APPLY_BND, BND0, BND1, NEED_DUMMY)            \
-        KSWV_U8_BLOCKS(hi, CKPT,                                                \
-            KSWV_NEON_U8_CELL_PAIR(APPLY_BND, BND0, BND1, NEED_DUMMY, d1, d1))
+#define KSWV_U8_BLOCKS2_DRIVE(hi, CKPT, CELL, ...)                              \
+        KSWV_U8_BLOCKS(hi, CKPT, CELL(__VA_ARGS__, d1, d1))
 #endif
+    /* The two-row drivers for the original cell and the FScan cell: one loop
+     * shape (above), the cell macro and its arguments passed through. */
+#define KSWV_U8_BLOCKS2(hi, CKPT, APPLY_BND, BND0, BND1, NEED_DUMMY)            \
+        KSWV_U8_BLOCKS2_DRIVE(hi, CKPT, KSWV_NEON_U8_CELL_PAIR,                 \
+                              APPLY_BND, BND0, BND1, NEED_DUMMY)
+#define KSWV_U8_BLOCKS2_FS(hi, CKPT, APPLY_BND, BND0, BND1, NEED_DUMMY, COLBND) \
+        KSWV_U8_BLOCKS2_DRIVE(hi, CKPT, KSWV_NEON_U8_CELL_PAIR_FS,              \
+                              APPLY_BND, BND0, BND1, NEED_DUMMY, COLBND)
 #define KSWV_U8_CKPT_PAIR                                                       \
         if (LazyQE) {                                                           \
             vst1q_u8(blockMax  + (j / QE_BLK - 1) * SIMD_WIDTH8, imax0);        \
@@ -1139,7 +1326,10 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
          * pair that straddles minLen1 (i < minLen1 <= i+1) fails the guard and
          * drops to the one-row body below, as does the final odd row and every
          * row when RowPair is compiled out. */
-        if (RowPair && i + 1 < nrow && ((i + 1 < minLen1) || (i >= minLen1))) {
+        /* FScan has no reference half of the boundary mask (see the note
+         * above kswv_neon_u8), so any two rows pair up there. */
+        if (RowPair && i + 1 < nrow &&
+            (FScan || (i + 1 < minLen1) || (i >= minLen1))) {
             uint8x16_t s1_0 = vld1q_u8(seq1SoA + (i + 0) * SIMD_WIDTH8);
             uint8x16_t s1_1 = vld1q_u8(seq1SoA + (i + 1) * SIMD_WIDTH8);
             uint8x16_t imax0 = zero_vec, imax1 = zero_vec;
@@ -1169,18 +1359,29 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
             }
 
             int j = 0;
-            if (i + 1 < minLen1) {
-                KSWV_U8_BLOCKS2(jdummy, KSWV_U8_CKPT_PAIR, false, zero_vec, zero_vec, false)
-                KSWV_U8_BLOCKS2(jsplit, KSWV_U8_CKPT_PAIR, false, zero_vec, zero_vec, true)
+            if (FScan) {
+                /* Only the query half of the boundary mask survives (see the
+                 * note above kswv_neon_u8), and only from jsplit on, where its
+                 * column half cb_ = vtst(s2, 0x80) is built once per column
+                 * for both rows: one shared op plus one blend per cell, in
+                 * place of an orr, a tst and a blend per cell. */
+                KSWV_U8_BLOCKS2_FS(jdummy, KSWV_U8_CKPT_PAIR, false, zero_vec, zero_vec, false, false)
+                KSWV_U8_BLOCKS2_FS(jsplit, KSWV_U8_CKPT_PAIR, false, zero_vec, zero_vec, true, false)
+                KSWV_U8_BLOCKS2_FS(ncol, KSWV_U8_CKPT_PAIR, true, cb_, cb_, true, true)
             } else {
-                const uint8x16_t rb0 = vtstq_u8(s1_0, highbit_vec);
-                const uint8x16_t rb1 = vtstq_u8(s1_1, highbit_vec);
-                KSWV_U8_BLOCKS2(jdummy, KSWV_U8_CKPT_PAIR, true, rb0, rb1, false)
-                KSWV_U8_BLOCKS2(jsplit, KSWV_U8_CKPT_PAIR, true, rb0, rb1, true)
+                if (i + 1 < minLen1) {
+                    KSWV_U8_BLOCKS2(jdummy, KSWV_U8_CKPT_PAIR, false, zero_vec, zero_vec, false)
+                    KSWV_U8_BLOCKS2(jsplit, KSWV_U8_CKPT_PAIR, false, zero_vec, zero_vec, true)
+                } else {
+                    const uint8x16_t rb0 = vtstq_u8(s1_0, highbit_vec);
+                    const uint8x16_t rb1 = vtstq_u8(s1_1, highbit_vec);
+                    KSWV_U8_BLOCKS2(jdummy, KSWV_U8_CKPT_PAIR, true, rb0, rb1, false)
+                    KSWV_U8_BLOCKS2(jsplit, KSWV_U8_CKPT_PAIR, true, rb0, rb1, true)
+                }
+                KSWV_U8_BLOCKS2(ncol, KSWV_U8_CKPT_PAIR, true,
+                                vtstq_u8(vorrq_u8(s1_0, s2), highbit_vec),
+                                vtstq_u8(vorrq_u8(s1_1, s2), highbit_vec), true)
             }
-            KSWV_U8_BLOCKS2(ncol, KSWV_U8_CKPT_PAIR, true,
-                            vtstq_u8(vorrq_u8(s1_0, s2), highbit_vec),
-                            vtstq_u8(vorrq_u8(s1_1, s2), highbit_vec), true)
 
             /* Row epilogues in row order: a freeze at row i must suppress row
              * i+1. LazyQE rescans row i from the in-place H0 (column j at index
@@ -1340,20 +1541,51 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
              * the whole row. */                                                \
         }
 
-        j = 0;
-        if (i < minLen1) {
-            /* No lane has begun reference padding and no column below jsplit
-             * carries query padding: the mask is provably all-zero here. */
-            KSWV_U8_BLOCKS(jdummy, KSWV_U8_CKPT_ONE, KSWV_NEON_U8_CELL(false, zero_vec, false))
-            KSWV_U8_BLOCKS(jsplit, KSWV_U8_CKPT_ONE, KSWV_NEON_U8_CELL(false, zero_vec, true))
-        } else {
-            /* Reference half only; loop-invariant across j. */
-            const uint8x16_t rowboundary = vtstq_u8(s1, highbit_vec);
-            KSWV_U8_BLOCKS(jdummy, KSWV_U8_CKPT_ONE, KSWV_NEON_U8_CELL(true, rowboundary, false))
-            KSWV_U8_BLOCKS(jsplit, KSWV_U8_CKPT_ONE, KSWV_NEON_U8_CELL(true, rowboundary, true))
+        /* FScan twin of KSWV_NEON_U8_CELL: G = max(m11, f11), H = max(G, e11),
+         * one T = sat(G - oe) opening both gaps, row max over G --
+         * byte-identical by the argument at KSWV_NEON_U8_CELL_PAIR_FS. */
+#define KSWV_NEON_U8_CELL_FS(APPLY_BND, BND, NEED_DUMMY)                        \
+        {                                                                       \
+            uint8x16_t s2 = vld1q_u8(seq2SoA + j * SIMD_WIDTH8);                \
+            const uint8x16_t cb_ = vtstq_u8(s2, highbit_vec); /* dead unless BND names it */ \
+            (void) cb_;                                                         \
+            uint8x16_t f11 = vld1q_u8(F + (j + 1) * SIMD_WIDTH8);               \
+            h00 = vld1q_u8(H0 + j * SIMD_WIDTH8);                               \
+            uint8x16_t cmpq;                                                    \
+            if (NEED_DUMMY && !USQADD) cmpq = vceqq_u8(s2, qpad_vec);           \
+            (void) cmpq;                                                        \
+            uint8x16_t m11;                                                     \
+            KSWV_U8_FS_M11(m11, h00, s1, active_frread, APPLY_BND, BND, NEED_DUMMY) \
+            const uint8x16_t g = vmaxq_u8(m11, f11);                            \
+            const uint8x16_t t = vqsubq_u8(g, oe_vec);                          \
+            h11 = vmaxq_u8(g, e11);                                             \
+            imax_vec = vmaxq_u8(imax_vec, g);                                   \
+            e11 = vmaxq_u8(t, vqsubq_u8(e11, e_ins_vec));                       \
+            vst1q_u8(H1 + (j + 1) * SIMD_WIDTH8, h11);                          \
+            vst1q_u8(F + (j + 1) * SIMD_WIDTH8, vmaxq_u8(t, vqsubq_u8(f11, e_del_vec))); \
         }
-        KSWV_U8_BLOCKS(ncol, KSWV_U8_CKPT_ONE,
-            KSWV_NEON_U8_CELL(true, vtstq_u8(vorrq_u8(s1, s2), highbit_vec), true))
+        j = 0;
+        if (FScan) {
+            /* Query half of the mask only, from jsplit on; see the pair body. */
+            KSWV_U8_BLOCKS(jdummy, KSWV_U8_CKPT_ONE, KSWV_NEON_U8_CELL_FS(false, zero_vec, false))
+            KSWV_U8_BLOCKS(jsplit, KSWV_U8_CKPT_ONE, KSWV_NEON_U8_CELL_FS(false, zero_vec, true))
+            KSWV_U8_BLOCKS(ncol, KSWV_U8_CKPT_ONE, KSWV_NEON_U8_CELL_FS(true, cb_, true))
+        } else {
+            if (i < minLen1) {
+                /* No lane has begun reference padding and no column below jsplit
+                 * carries query padding: the mask is provably all-zero here. */
+                KSWV_U8_BLOCKS(jdummy, KSWV_U8_CKPT_ONE, KSWV_NEON_U8_CELL(false, zero_vec, false))
+                KSWV_U8_BLOCKS(jsplit, KSWV_U8_CKPT_ONE, KSWV_NEON_U8_CELL(false, zero_vec, true))
+            } else {
+                /* Reference half only; loop-invariant across j. */
+                const uint8x16_t rowboundary = vtstq_u8(s1, highbit_vec);
+                KSWV_U8_BLOCKS(jdummy, KSWV_U8_CKPT_ONE, KSWV_NEON_U8_CELL(true, rowboundary, false))
+                KSWV_U8_BLOCKS(jsplit, KSWV_U8_CKPT_ONE, KSWV_NEON_U8_CELL(true, rowboundary, true))
+            }
+            KSWV_U8_BLOCKS(ncol, KSWV_U8_CKPT_ONE,
+                KSWV_NEON_U8_CELL(true, vtstq_u8(vorrq_u8(s1, s2), highbit_vec), true))
+        }
+#undef KSWV_NEON_U8_CELL_FS
 #undef KSWV_NEON_U8_CELL
 
         /* One-row epilogue: recover qe lazily from the stored H (EPI_INLINE_QE
@@ -1370,7 +1602,11 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
         i += 1;
     }
 #undef KSWV_NEON_U8_CELL_PAIR
+#undef KSWV_NEON_U8_CELL_PAIR_FS
+#undef KSWV_U8_FS_M11
+#undef KSWV_U8_BLOCKS2_FS
 #undef KSWV_U8_BLOCKS2
+#undef KSWV_U8_BLOCKS2_DRIVE
 #undef KSWV_U8_CKPT_ONE
 #undef KSWV_U8_CKPT_PAIR
 #undef KSWV_U8_BLOCKS
