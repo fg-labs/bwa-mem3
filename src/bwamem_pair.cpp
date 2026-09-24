@@ -327,8 +327,6 @@ extern int mem_sort_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns,
 #define MAPPING_BOUND 3.0
 #define MAX_STDDEV    4.0
 
-extern uint64_t tprof[LIM_R][LIM_C];
-
 int mem_infer_dir(int64_t l_pac, int64_t b1, int64_t b2, int64_t *dist)
 {
     int64_t p2;
@@ -1959,7 +1957,7 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                     ma->a[i] = b;
                 }
                 #endif
-                tprof[PE26][0] ++;
+                // CHN-16: dead tprof[PE26] counter removed (every worker bumped column 0)
             }
             ++n;
         }
