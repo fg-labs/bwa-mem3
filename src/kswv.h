@@ -364,8 +364,9 @@ private:
 	/* Templated i16 kernel body; see kswv_neon_u8_impl. */
 	/* Templated 16-bit kernel body. RowPair / LazyQE mirror the u8 kernel's
 	 * two-row sweep and its lazy query-end recovery (LazyQE is meaningless
-	 * when RowPair is false; the one-row body is always lazy). */
-	template<bool HasFreed, bool RowPair, bool LazyQE>
+	 * when RowPair is false; the one-row body is always lazy). FScan selects
+	 * the G-based cell; see rescue_fscan_enabled. */
+	template<bool HasFreed, bool RowPair, bool LazyQE, bool FScan>
 	int kswv_neon_16_impl(int16_t seq1SoA[],
                           int16_t seq2SoA[],
                           int16_t nrow,
@@ -411,7 +412,7 @@ private:
 				   int phase);
 
 	/* Templated u8 kernel body; see kswv_neon_u8_impl. */
-	template<bool HasFreed>
+	template<bool HasFreed, bool FScan>
 	int kswv256_u8_impl(uint8_t seq1SoA[],
 				   uint8_t seq2SoA[],
 				   int16_t nrow,
@@ -444,7 +445,7 @@ private:
 				   int phase);
 
 	/* Templated i16 kernel body; see kswv_neon_u8_impl. */
-	template<bool HasFreed>
+	template<bool HasFreed, bool FScan>
 	int kswv256_16_impl(int16_t seq1SoA[],
 				   int16_t seq2SoA[],
 				   int16_t nrow,
@@ -479,7 +480,7 @@ private:
 				   int phase);
 
 	/* Templated u8 kernel body; see kswv_neon_u8_impl. */
-	template<bool HasFreed>
+	template<bool HasFreed, bool FScan>
 	int kswv512_u8_impl(uint8_t seq1SoA[],
 				   uint8_t seq2SoA[],
 				   int16_t nrow,
@@ -512,7 +513,7 @@ private:
                    int phase);
 
 	/* Templated i16 kernel body; see kswv_neon_u8_impl. */
-	template<bool HasFreed>
+	template<bool HasFreed, bool FScan>
 	int kswv512_16_impl(int16_t seq1SoA[],
                    int16_t seq2SoA[],
                    int16_t nrow,

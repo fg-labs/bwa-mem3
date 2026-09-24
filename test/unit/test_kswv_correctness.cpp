@@ -612,15 +612,17 @@ TEST_CASE("kswv u8 rescue: BWA3_RESCUE_USQADD off == on, and biased body matches
 #endif
 }
 
-// BWA3_RESCUE_FSCAN selects a separate instantiation of every u8 NEON body --
-// the G-based cell (F opens from G only, one sat(G - oe) shared by both gaps,
-// row max over G), the query-only boundary mask, and no reference-pad mask.
-// Each is argued byte-identical in kswv.cpp; this pins it. For each body the
-// flag reaches -- one-row, two-row inline argmax, two-row lazy, and the biased
-// (USQADD=0) two-row body -- one batch runs with FSCAN off then on and must
-// agree on every field. The FSCAN arm of the default configuration is also
-// checked against the independent scalar oracle. build_edge_cases' ragged
-// lengths put pad rows and pad columns in most lane groups.
+// BWA3_RESCUE_FSCAN selects a separate instantiation of every u8 kernel body
+// (NEON, AVX2, AVX-512BW) -- the G-based cell (F opens from G only, one
+// sat(G - oe) shared by both gaps, row max over G), the query-only boundary
+// mask, and no reference-pad mask. Each is argued byte-identical in kswv.cpp;
+// this pins it. For each body the flag reaches -- on NEON one-row, two-row
+// inline argmax, two-row lazy, and the biased (USQADD=0) two-row body; on x86
+// the one body per tier, which the other toggles do not reach -- one batch runs
+// with FSCAN off then on and must agree on every field. The FSCAN arm of the
+// default configuration is also checked against the independent scalar
+// oracle. build_edge_cases' ragged lengths put pad rows and pad columns in most
+// lane groups.
 //
 // Two scoring regimes. The FSCAN cell drops the E->F transition and relies on
 // F->E to cover it (a gap pair's twin in the other order). bwa's default
@@ -630,10 +632,6 @@ TEST_CASE("kswv u8 rescue: BWA3_RESCUE_USQADD off == on, and biased body matches
 // 1+1 makes the adjacent gap pair (4) the cheap move, so it would not.
 TEST_CASE("kswv u8 rescue: BWA3_RESCUE_FSCAN off == on in every u8 body, and FSCAN matches scalar"
           * doctest::test_suite("unit/kswv")) {
-#if !defined(__ARM_NEON) && !defined(__aarch64__)
-    MESSAGE("skipped: BWA3_RESCUE_FSCAN affects the NEON u8 rescue kernel only");
-    return;
-#else
     std::mt19937 rng(97531);
     auto pairs = build_edge_cases(rng);
     auto bulk  = build_bulk_random(rng, 300);
@@ -646,10 +644,14 @@ TEST_CASE("kswv u8 rescue: BWA3_RESCUE_FSCAN off == on in every u8 body, and FSC
     };
     struct Config { std::string name; const char *rowpair, *lazyqe, *usqadd; bool oracle; };
     const Config configs[] = {
+#if defined(__ARM_NEON) || defined(__aarch64__)
         {"one-row",         "0", "1", "1", false},
         {"two-row inline",  "1", "0", "1", false},
         {"two-row lazy",    "1", "1", "1", true},   // the production default
         {"two-row biased",  "1", "1", "0", false},
+#else
+        {"x86",             "1", "1", "1", true},   // toggles other than FSCAN are NEON-only
+#endif
     };
     int oracle_mism = 0;
     for (const Regime &r : regimes) {
@@ -705,7 +707,102 @@ TEST_CASE("kswv u8 rescue: BWA3_RESCUE_FSCAN off == on in every u8 body, and FSC
         }
     }
     CHECK(oracle_mism == 0);
+}
+
+// The 16-bit twin of the case above: BWA3_RESCUE_FSCAN selects the G-based
+// int16 cell in the NEON (one-row, two-row inline, two-row lazy), AVX2 and
+// AVX-512BW 16-bit bodies. Same two scoring regimes and why, plus the regime
+// the 16-bit kernel exists for -- match 14, scores well past 255 -- whose
+// sub-cluster pairs put the gaps next to high-scoring matches.
+TEST_CASE("kswv u16 rescue: BWA3_RESCUE_FSCAN off == on in every u16 body, and FSCAN matches scalar"
+          * doctest::test_suite("unit/kswv")) {
+    std::mt19937 rng(86420);
+    auto pairs = build_edge_cases(rng);
+    auto bulk  = build_bulk_random(rng, 300);
+    pairs.insert(pairs.end(), bulk.begin(), bulk.end());
+    std::vector<bwa_tests::TestPair> high;
+    {
+        std::uniform_int_distribution<int> qlen_d(80, 128);
+        std::uniform_int_distribution<int> rlen_d(150, 250);
+        for (int i = 0; i < 300; i++)
+            high.push_back(bwa_tests::gen_sub_cluster_pair(rng, qlen_d(rng), rlen_d(rng), 40, 2));
+    }
+
+    struct Regime {
+        std::string name; int match, mismatch, gap_open, gap_extend;
+        const std::vector<bwa_tests::TestPair> *pairs;
+    };
+    const Regime regimes[] = {
+        {"default (A1 B4 O6 E1)",       1,  4, 6, 1, &pairs},
+        {"adjacent gaps (A1 B20 O1 E1)", 1, 20, 1, 1, &pairs},
+        {"high score (A14 B8 O6 E1)",   14,  8, 6, 1, &high},
+    };
+    struct Config { std::string name; const char *rowpair, *lazyqe; bool oracle; };
+    const Config configs[] = {
+#if defined(__ARM_NEON) || defined(__aarch64__)
+        {"one-row",         "0", "1", false},
+        {"two-row inline",  "1", "0", false},
+        {"two-row lazy",    "1", "1", true},   // the production default
+#else
+        {"x86",             "1", "1", true},   // toggles other than FSCAN are NEON-only
 #endif
+    };
+    int oracle_mism = 0;
+    for (const Regime &r : regimes) {
+        const auto &ps = *r.pairs;
+        auto mat = bwa_tests::build_scoring_matrix(r.match, r.mismatch, 1);
+        std::vector<kswr_t> scalar_aln;
+        scalar_aln.reserve(ps.size());
+        for (const auto &p : ps)
+            scalar_aln.push_back(bwa_tests::run_scalar_ksw(p, mat, r.gap_open, r.gap_extend));
+        for (const Config &c : configs) {
+            ScopedEnv rp("BWA3_RESCUE_ROWPAIR", c.rowpair);
+            ScopedEnv lq("BWA3_RESCUE_LAZYQE", c.lazyqe);
+            std::vector<kswr_t> off, on;
+            {
+                ScopedEnv fs("BWA3_RESCUE_FSCAN", "0");
+                off = bwa_tests::run_kswv_batch(ps, mat, r.gap_open, r.gap_extend,
+                                                0, /*use16=*/true);
+            }
+            {
+                ScopedEnv fs("BWA3_RESCUE_FSCAN", "1");
+                on = bwa_tests::run_kswv_batch(ps, mat, r.gap_open, r.gap_extend,
+                                               0, /*use16=*/true);
+            }
+            REQUIRE(off.size() == ps.size());
+            REQUIRE(on.size() == ps.size());
+
+            int drift = 0;
+            for (size_t i = 0; i < ps.size(); i++) {
+                const kswr_t &a = off[i];
+                const kswr_t &b = on[i];
+                if (!kswr_all_fields_eq(a, b)) {
+                    ++drift;
+                    CAPTURE(r.name); CAPTURE(c.name); CAPTURE(i); CAPTURE(ps[i].tag);
+                    CAPTURE(a.score); CAPTURE(b.score);
+                    CAPTURE(a.te); CAPTURE(b.te); CAPTURE(a.qe); CAPTURE(b.qe);
+                    CAPTURE(a.score2); CAPTURE(b.score2); CAPTURE(a.te2); CAPTURE(b.te2);
+                    CAPTURE(a.tb); CAPTURE(b.tb); CAPTURE(a.qb); CAPTURE(b.qb);
+                    CHECK(kswr_all_fields_eq(a, b));
+                }
+                if (c.oracle) {
+                    const bool o_score  = bwa_tests::kswr_score_eq(scalar_aln[i], b);
+                    const bool o_coord  = bwa_tests::kswr_coords_eq(scalar_aln[i], b);
+                    const bool o_score2 = bwa_tests::kswr_score2_eq(scalar_aln[i], b);
+                    if (!(o_score && o_coord && o_score2)) {
+                        ++oracle_mism;
+                        CAPTURE(r.name); CAPTURE(i); CAPTURE(ps[i].tag);
+                        CAPTURE(scalar_aln[i].score); CAPTURE(b.score);
+                        CHECK(o_score); CHECK(o_coord); CHECK(o_score2);
+                    }
+                }
+            }
+            MESSAGE("u16 fscan off-vs-on [" << r.name << "] (" << c.name << ") drift=" << drift
+                    << " over " << ps.size() << " pairs");
+            CHECK(drift == 0);
+        }
+    }
+    CHECK(oracle_mism == 0);
 }
 
 #endif // BWA_TESTS_HAVE_KSWV
