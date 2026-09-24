@@ -9,8 +9,9 @@
  * then the mem_sam_pe_batch_run post-processing and kswv phase 1 -- is compared against the
  * pre-pruning pipeline (full window, kswv phase 0 + phase 1), field by field: score (pass/fail
  * when the truth fails), te, qe, score2, tb, qb (offsets applied). The production pipeline includes
- * the banded pass 1 of the banded parents (take_pass1 / run_pass1), so tb / qb check it against
- * kswv phase 1 on the full window; the summary counts how many parents took it (non-vacuity).
+ * the banded pass 1 (take_pass1 / run_pass1) of the banded parents and, under the default
+ * BWA3_RESCUE_BAND_P1=2, of every other pair (hull or full window, kswv pass 0), so tb / qb check
+ * it against kswv phase 1 on the full window; the summary counts how many jobs took it.
  * A scalar full-window DP with kswv's score2 semantics (scalar_dp / scalar_score2 below) plus a scalar
  * reversed-prefix DP for (tb, qb) cross-check the truth on every --scalar-stride-th job.
  * Generated classes: random windows with mutated mate copies, edge copies around te +- S (score2
@@ -413,8 +414,10 @@ struct Batch {
     }
 };
 
-/* mem_sam_pe_batch_run (8-bit only) with the first nb pairs banded. */
-static void run_batch(Ikswv *k, Batch &b, int nb)
+/* mem_sam_pe_batch_run (8-bit only) with the first nb pairs banded; p1_any offers every other pair
+ * to the banded pass 1 too (the harness always uses the default scoring). The truth runs with
+ * nb = 0 and p1_any = false: pure kswv. */
+static void run_batch(Ikswv *k, Batch &b, int nb, bool p1_any)
 {
     SeqPair *pairs = b.sp.data();
     kswr_t *aln = b.aln.data();
@@ -431,11 +434,11 @@ static void run_batch(Ikswv *k, Batch &b, int nb)
         sp.len2 = r.qe + 1;
         revseq(r.qe + 1, b.qer.data() + sp.idq);
         revseq(r.te + 1, b.ref.data() + sp.idr);
-        if (i < nb && rescue_band_batch().take_pass1(sp, r)) continue;
+        if ((i < nb || p1_any) && rescue_band_batch().take_pass1(sp, r, i < nb)) continue;
         pairs[pos++] = sp;
     }
     k->getScores8(pairs, b.ref.data(), b.qer.data(), aln, pos, 1, 1);
-    if (nb) rescue_band_batch().run_pass1(b.ref.data(), b.qer.data(), aln, k);
+    if (nb || p1_any) rescue_band_batch().run_pass1(b.ref.data(), b.qer.data(), aln, k);
 }
 
 static std::unique_ptr<Ikswv> make_k(int maxr, int maxq)
@@ -468,7 +471,7 @@ static int run_eq(std::vector<Job> &jobs, int minsc, int max_hits, int scalar_st
             T.add(J.ref.data(), (int)J.ref.size(), J.q.data(), (int)J.q.size(), minsc);
         }
         T.finalize();
-        run_batch(k.get(), T, 0);
+        run_batch(k.get(), T, 0, false);
         // --- production pruned + banded pipeline ---
         Batch P;
         std::vector<int> kind(m), off(m, 0), idx(m, -1);
@@ -522,7 +525,7 @@ static int run_eq(std::vector<Job> &jobs, int minsc, int max_hits, int scalar_st
         const int nbd = rescue_band_enabled() ? rescue_band_batch().partition(P.sp.data(), pn) : 0;
         nband += nbd;
         const uint64_t pb0 = rescue_band_batch().stats().p1_band, pg0 = rescue_band_batch().stats().p1_guard;
-        run_batch(k.get(), P, nbd);
+        run_batch(k.get(), P, nbd, true);
         std::vector<char> banded(m, 0);
         for (int t = 0; t < m; t++) banded[t] = idx[t] >= 0 && rescue_band_batch().banded(idx[t]);
         r2 += (long)rescue_band_batch().stats().r2_band;

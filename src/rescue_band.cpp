@@ -59,12 +59,26 @@ static int rb_tight_delta()
     return v;
 }
 
-/* Pass 1 of the banded parents banded as well (default) or through kswv (BWA3_RESCUE_BAND_P1=0).
- * Both are exact; see rescue_band.h. */
-static bool rb_p1_banded()
+/* Which pass-1 jobs run banded (BWA3_RESCUE_BAND_P1): 0 none (kswv phase 1 for all), 1 banded
+ * parents only, 2 (default) every eligible 8-bit job. All are exact; see rescue_band.h. Values
+ * above 2 act as 2. */
+static int rb_p1_mode()
 {
-    static const bool on = [] { const char *e = getenv("BWA3_RESCUE_BAND_P1"); return !e || e[0] != '0'; }();
-    return on;
+    static const int v = rescue_env_int("BWA3_RESCUE_BAND_P1", 2);
+    return v;
+}
+
+/* Pass-1 cost model (take_pass1): band iff 100 * (min(width, quanta) + RB_OVH) < pct * quanta.
+ * Separate from pass 0's pct because the two compare different things (a band against kswv on the
+ * same reversed rows, versus bands against the whole hull). The default 130 bands every job with
+ * quanta >= 32 even at full width: with the early exit the band kernel beat kswv phase 1 at every
+ * width measured (pass-1 thread-s 0.28-0.32 at 130 vs 0.35-0.45 at 85 and 0.80-0.93 with kswv
+ * only), presumably because its groups are sorted by width and rows while a kswv group runs to its
+ * slowest lane. BWA3_RESCUE_BAND_P1_COST overrides. */
+static int rb_p1_cost_pct()
+{
+    static const int v = rescue_env_int("BWA3_RESCUE_BAND_P1_COST", 130);
+    return v;
 }
 
 static bool rb_stats_on()
@@ -396,6 +410,8 @@ struct rb_work {
     std::vector<uint8_t> A, QL, REF, H, E, R, SNAP, ST, RL;
     alignas(16) uint16_t te[16];
     alignas(16) uint8_t gmax[16];
+    /* Per-lane early-exit target (pass 1: the pass-0 score S; 0 for empty lanes). */
+    alignas(16) uint8_t target[16];
     template <class V> static void fit(V &v, size_t n) { if (v.size() < n) v.resize(n); }
 };
 
@@ -434,7 +450,11 @@ static inline void rb_snapshot(rb_work &w, const uint8_t *Hrow, int row, int W, 
  * in both H buffers and in E, which is exactly their value. Cells below it are j >= quanta in every
  * lane: dead, and they only ever feed dead cells, so skipping them changes nothing live. Both bounds
  * advance by one per row, so every computed cell's predecessors were computed (or are those zeros). */
-static long rb_dp_core(rb_work &w, int W, int NR, int omax, int ominq, int omaskq)
+/* early: stop after the first row in which every lane's gmax has reached w.target. Pass 1 only:
+ * there gmax can never exceed the target S, so once a lane reaches S no later row improves it, and
+ * its te (last strict improvement) and qe snapshot (taken for that row at the latest when the loop
+ * ends) are final -- exactly kswv's freeze at KSW_XSTOP. */
+static long rb_dp_core(rb_work &w, int W, int NR, int omax, int ominq, int omaskq, bool early)
 {
     long computed = 0;
     alignas(16) static const int8_t tblv[16] = {1, -4, -4, -4, -1, -1, -1, -1,
@@ -447,6 +467,8 @@ static long rb_dp_core(rb_work &w, int W, int NR, int omax, int ominq, int omask
     memset(Hc, 0, (size_t)W * 32);
     memset(E, 0, (size_t)(W + 1) * 16);
     uint8x16_t gmax = vdupq_n_u8(0), pend = vdupq_n_u8(0);
+    const uint8x16_t tgt = vld1q_u8(w.target);
+    int rlast = NR - 1;
     uint16x8_t te_lo = vdupq_n_u16(0), te_hi = vdupq_n_u16(0);
     for (int r = 0; r < NR; r++) {
         const uint8x16_t rref = vld1q_u8(REF + (size_t)r * 16);
@@ -507,8 +529,10 @@ static long rb_dp_core(rb_work &w, int W, int NR, int omax, int ominq, int omask
         te_hi = vbslq_u16(vreinterpretq_u16_u8(vzip2q_u8(imp, imp)), rv, te_hi);
         pend = imp;
         std::swap(Hc, Hp);
+        rlast = r;
+        if (early && vminvq_u8(vcgeq_u8(gmax, tgt)) == 0xFF) break;
     }
-    if (rb_mask16(pend)) rb_snapshot(w, Hp, NR - 1, W, pend);
+    if (rb_mask16(pend)) rb_snapshot(w, Hp, rlast, W, pend);
     vst1q_u16(w.te, te_lo);
     vst1q_u16(w.te + 8, te_hi);
     vst1q_u8(w.gmax, gmax);
@@ -651,7 +675,8 @@ void RescueBandBatch::run_jobs(bool pass1)
             ominq = std::min(ominq, o - L[l]->quanta + 1);
             omaskq = std::max(omaskq, o - L[l]->quanta + 1);
         }
-        const long computed = rb_dp_core(w, W, NR, omax, ominq, omaskq);
+        for (int l = 0; l < 16; l++) w.target[l] = pass1 && l < nl ? (uint8_t)L[l]->target : 0;
+        const long computed = rb_dp_core(w, W, NR, omax, ominq, omaskq, pass1);
         if (st) stats_.cells_pad += (uint64_t)16 * computed;
         /* Lane l's gmax, the first row reaching it and the first column holding it there. */
         auto lane_result = [&](int l) {
@@ -841,10 +866,10 @@ void RescueBandBatch::run_pass0(const SeqPair *pairs, int nb, const uint8_t *seq
 /* Pass 1 (start recovery)                                                                     */
 /* ------------------------------------------------------------------------------------------ */
 
-bool RescueBandBatch::take_pass1(const SeqPair &sp, const kswr_t &r)
+bool RescueBandBatch::take_pass1(const SeqPair &sp, const kswr_t &r, bool banded_parent)
 {
 #if defined(__aarch64__)
-    if (!rb_p1_banded()) return false;
+    if (rb_p1_mode() < (banded_parent ? 1 : 2)) return false;
     const int S = r.score, te = r.te, qe = r.qe;
     /* 8-bit and unsaturated (kswv's 255 sentinel is S + shift >= 255, shift 4), and a real end. */
     if (S <= 0 || S + 4 >= 255 || te < 0 || qe < 0 || sp.len2 != qe + 1) { stats_.p1_kswv++; return false; }
@@ -855,14 +880,14 @@ bool RescueBandBatch::take_pass1(const SeqPair &sp, const kswr_t &r)
     const int dall = std::max(0, qe - S - 5);
     const int nrows = std::min(te + 1, qe + 1 + dall);
     const int dmax = std::min(dall, nrows - 1), imax = std::min(dall / 2, quanta - 1);
-    /* Same per-row cost model as pass 0's plan(): the rows are about the same for both (kswv stops
-     * at the first row reaching S, which is at most nrows), so compare the per-row cells. */
+    /* Both kswv and the band stop at the first row reaching S (the band via rb_dp_core's early
+     * exit), so they run about the same rows: compare the per-row cells. */
     const int w = imax + dmax + 1;
-    if ((long)(std::min(w, quanta) + RB_OVH) * 100 >= (long)quanta * rb_cost_pct()) { stats_.p1_kswv++; return false; }
+    if ((long)(std::min(w, quanta) + RB_OVH) * 100 >= (long)quanta * rb_p1_cost_pct()) { stats_.p1_kswv++; return false; }
     p1_.push_back(p1job{sp, nrows, imax, dmax});
     return true;
 #else
-    (void)sp; (void)r;
+    (void)sp; (void)r; (void)banded_parent;
     return false;
 #endif
 }
@@ -878,7 +903,7 @@ void RescueBandBatch::run_pass1(const uint8_t *seqBufRef, const uint8_t *seqBufQ
         J.ref = seqBufRef + P.sp.idr; J.qry = seqBufQer + P.sp.idq;
         J.len2 = P.sp.len2; J.quanta = ((P.sp.len2 + 15) / 16) * 16;
         J.r0 = 0; J.nrows = P.nrows; J.dlo = -P.imax; J.w = P.imax + P.dmax + 1;
-        J.parent = i; J.key = 0;
+        J.parent = i; J.key = 0; J.target = P.sp.h0 & 0xffff;   // KSW_XSTOP | S
         jobs_.push_back(J);
     }
     if ((int)p1res_.size() < n) p1res_.resize(n);

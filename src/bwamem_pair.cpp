@@ -968,7 +968,8 @@ static void mem_sam_pe_batch_run(Ikswv *pwsw, SeqPair *pairs,
                                  uint8_t *seqBufRef, uint8_t *seqBufQer,
                                  kswr_t *aln, int64_t slice_pcnt,
                                  int64_t slice_pcnt8, int nthreads,
-                                 int64_t n_banded = 0, RescueBandBatch *band = NULL)
+                                 int64_t n_banded = 0, RescueBandBatch *band = NULL,
+                                 bool p1_band_any = false)
 {
     // Shift 16-bit
     for (int i=0; i<slice_pcnt-slice_pcnt8; i++)
@@ -977,7 +978,10 @@ static void mem_sam_pe_batch_run(Ikswv *pwsw, SeqPair *pairs,
     /* Exact banded rescue (rescue_band.h): the first n_banded 8-bit pairs are hull parents whose
      * pass 0 runs as banded DP jobs instead of kswv; it fills their aln[regid] exactly as kswv
      * would, so the post-processing below treats every pair alike. Their pass 1 is banded too
-     * where that is cheaper (take_pass1), and runs through kswv otherwise. */
+     * where that is cheaper (take_pass1), and runs through kswv otherwise. p1_band_any extends the
+     * banded pass 1 to every other 8-bit pair; the caller sets it only for default scoring and
+     * non-meth, which the band's exactness argument needs (a banded parent implies both). band is
+     * this tid's batch; non-NULL whenever n_banded > 0 or p1_band_any. */
     const bool timed = g_rescue_prune_stats.on;
     uint64_t t0 = timed ? rescue_now_ns() : 0;
     pwsw->getScores8(pairs + n_banded, seqBufRef, seqBufQer, aln, slice_pcnt8 - n_banded, nthreads, 0);
@@ -1004,7 +1008,7 @@ static void mem_sam_pe_batch_run(Ikswv *pwsw, SeqPair *pairs,
         uint8_t *qs = seqBufQer + sp.idq;
         uint8_t *rs = seqBufRef + sp.idr;
         revseq(r.qe + 1, qs); revseq(r.te + 1, rs);
-        if (i < n_banded && band->take_pass1(sp, r)) continue;
+        if ((i < n_banded || p1_band_any) && band->take_pass1(sp, r, i < n_banded)) continue;
         pairs[pos++] = sp;
         pos8 ++;
     }
@@ -1035,7 +1039,7 @@ static void mem_sam_pe_batch_run(Ikswv *pwsw, SeqPair *pairs,
     pwsw->getScores16(pairs + pos8, seqBufRef, seqBufQer, aln, pos16, nthreads, 1);
     pwsw->getScores8(pairs, seqBufRef, seqBufQer, aln, pos8, nthreads, 1);
     if (timed) { uint64_t t1 = rescue_now_ns(); g_rescue_prune_stats.ns_k1 += t1 - t0; t0 = t1; }
-    if (n_banded > 0) {
+    if (n_banded > 0 || p1_band_any) {
         band->run_pass1(seqBufRef, seqBufQer, aln, pwsw);
         if (timed) g_rescue_prune_stats.ns_b1 += rescue_now_ns() - t0;
     }
@@ -1179,8 +1183,15 @@ int mem_sam_pe_batch(const mem_opt_t *opt, mem_cache *mmc,
     /* Banded parents first (stable, so the kswv remainder keeps its length sort). */
     const int64_t n_banded = band_reset.b ? band_reset.b->partition(seqPairArray, (int)pcnt8) : 0;
 
+    /* Banded pass 1 beyond the banded parents: needs the default scoring on both gap types (its
+     * band bound is derived for it) and non-meth (the band kernel has no freed-cell matrix; this
+     * point is also reached under --meth when the batched meth rescue is off) -- both part of
+     * rescue_prune_runs, which also keeps BWA3_RESCUE_PRUNE=0 the whole pre-pruning path -- and
+     * the banding path (aarch64; off under BWA3_RESCUE_BAND=0). */
+    const bool p1_band_any = rescue_prune_runs(opt) && rescue_band_enabled();
+    if (p1_band_any) band_reset.b = &matesw_band(mmc, tid);   // pass 1 needs a batch even with no plan
     mem_sam_pe_batch_run(pwsw.get(), seqPairArray, seqBufRef, seqBufQer,
-                         aln, pcnt, pcnt8, nthreads, n_banded, band_reset.b);
+                         aln, pcnt, pcnt8, nthreads, n_banded, band_reset.b, p1_band_any);
 
 #endif
 

@@ -10,7 +10,8 @@
 #                        -> every rescue window computed in full by kswv (reference)
 #   BWA3_RESCUE_BAND=0   -> proven failures dropped (B1), windows narrowed to a
 #                           proven hull (B2), N windows kept whole; kswv on the hull
-#   default              -> as above, plus the banded DP where the cost model picks it
+#   default              -> as above, plus the banded DP where the cost model picks it,
+#                           and the banded start recovery (pass 1) of every eligible job
 #   BWA3_RESCUE_BAND_COST=100000000
 #                        -> the cost gate opened: every B2 hull that can be banded is,
 #                           so the banded kernel runs whatever the cost model says
@@ -163,5 +164,8 @@ bstats="$(grep '^\[RESCUE_BAND\]' band.t1.err || true)"
 bfield() { printf '%s\n' "$bstats" | tr ' ' '\n' | sed -n "s/^$1=//p"; }
 parents=$(bfield banded_parents)
 [ "${parents:-0}" -gt 0 ] || fail "no banded rescue parent with the cost gate opened: $bstats"
+p1stats="$(grep '^\[RESCUE_BAND\]' prune.t1.err || true)"
+p1=$(printf '%s\n' "$p1stats" | tr ' ' '\n' | sed -n 's/^pass1_banded=//p')
+[ "${p1:-0}" -gt 0 ] || fail "no banded pass-1 (start recovery) job at the defaults: $p1stats"
 
 echo "PASS: rescue_prune_identity (hull, pruned and banded == full-window rescue at -t 1 and -t 4; $stats; $bstats)"

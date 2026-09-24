@@ -30,7 +30,9 @@
  *    zeroing, kswv.cpp:~932-936, then the b[] scan, kswv.cpp:~1436-1519); the result
  *    depends only on rows the rule above keeps exact.
  *
- * Pass 1 (tb, qb) of a banded parent is banded too (take_pass1 / run_pass1). kswv phase 1 runs the
+ * Pass 1 (tb, qb) of every 8-bit default-scoring job is banded too (take_pass1 / run_pass1),
+ * whether its pass 0 was banded or ran through kswv: the argument below needs only the exact
+ * pass-0 (S, te, qe) and the scoring, not the pass-0 components. kswv phase 1 runs the
  * DP on the reversed prefixes ref[te..0] x q[qe..0] and stops at the first row whose max reaches S;
  * tb = te - that row, qb = qe - the first column holding S in it. Every alignment scoring S inside
  * that rectangle ends at (te, qe) (an earlier end row would contradict te being the first row of S
@@ -45,8 +47,10 @@
  * row, the same first column holding S: tb / qb are byte-identical, ties included. The pad columns
  * [qe + 1, quanta) are in both DPs; they cannot hold S on the first row reaching S (a pad cell's
  * value comes from a row above or, reduced by a gap, from its own row), so they never decide
- * either argmax. Jobs whose band is not cheaper than kswv, or whose banded max is not S (cannot
- * happen; kept as a guard), run kswv phase 1.
+ * either argmax. The band stops a lane group once every lane has reached its S (gmax cannot exceed
+ * S, so nothing after that row changes te or qe), like kswv's KSW_XSTOP freeze. Jobs whose band
+ * is not cheaper than kswv, or whose banded max is not S (cannot happen; kept as a guard), run
+ * kswv phase 1.
  *
  * Scope: aarch64 only (the NEON kernel); jobs rescue_prune_applies() prunes (default scoring,
  * 8-bit, non-meth) with minsc in [19, 255] (plan()). x86 keeps the hull path.
@@ -54,7 +58,9 @@
  * A/B; BWA3_RESCUE_BAND_COST (band iff cost < pct% of the hull, default 85);
  * BWA3_RESCUE_BAND_R2=0 runs round 2 through kswv on the hull instead of banded;
  * BWA3_RESCUE_BAND_TIGHT (delta of the tight top band, default 8, 0 = off);
- * BWA3_RESCUE_BAND_P1=0 runs pass 1 of the banded parents through kswv (default: banded);
+ * BWA3_RESCUE_BAND_P1 = 0 (pass 1 all kswv), 1 (banded parents only) or 2 (default: every
+ * eligible 8-bit default-scoring job); BWA3_RESCUE_BAND_P1_COST (pass-1 band iff its per-row cells
+ * < pct% of kswv's, default 130);
  * BWA3_RESCUE_PRUNE_STATS=1 prints [RESCUE_BAND] / [RESCUE_PRUNE] counters and stage times. */
 #ifndef BWA_MEM3_RESCUE_BAND_H
 #define BWA_MEM3_RESCUE_BAND_H
@@ -110,11 +116,13 @@ public:
      * run through kswv (phase 0) on the hull. */
     void run_pass0(const SeqPair *pairs, int nb, const uint8_t *seqBufRef,
                    const uint8_t *seqBufQer, kswr_t *aln, Ikswv *kswv);
-    /* Pass 1 of a banded parent. sp is the pair as prepared for kswv phase 1 (reversed prefixes
-     * of lengths te + 1 and qe + 1 in the sequence buffers, len2 = qe + 1) and r its pass-0 result.
-     * Queues it for the banded pass 1 and returns true when that is eligible and cheaper than
-     * kswv; false means the caller runs it through kswv phase 1 as before. */
-    bool take_pass1(const SeqPair &sp, const kswr_t &r);
+    /* Pass 1 of an 8-bit rescue job. sp is the pair as prepared for kswv phase 1 (reversed
+     * prefixes of lengths te + 1 and qe + 1 in the sequence buffers, len2 = qe + 1, h0 =
+     * KSW_XSTOP | S) and r its pass-0 result. The CALLER guarantees default scoring and non-meth
+     * (a banded parent implies both). Queues the job for the banded pass 1 and returns true when
+     * BWA3_RESCUE_BAND_P1 admits it and the band is cheaper than kswv; false means the caller
+     * runs it through kswv phase 1 as before. */
+    bool take_pass1(const SeqPair &sp, const kswr_t &r, bool banded_parent);
     /* Run the queued pass-1 jobs: fills aln[regid].{tb, qb} exactly as kswv phase 1 would. */
     void run_pass1(const uint8_t *seqBufRef, const uint8_t *seqBufQer, kswr_t *aln, Ikswv *kswv);
     void reset();
@@ -127,7 +135,7 @@ private:
     struct parent_rec { int32_t b0, nb, c0, nc, T1, minsc; };
     struct job {
         const uint8_t *ref, *qry;
-        int32_t len2, quanta, r0, nrows, dlo, w, parent, key;
+        int32_t len2, quanta, r0, nrows, dlo, w, parent, key, target;
     };
     struct pstate {
         int32_t regid, L, S, te, qe, s2, te2, rbuf, rec, round;
