@@ -46,6 +46,11 @@
 extern int mem_sort_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns,
                                 const uint8_t *pac, uint8_t *query, int n,
                                 mem_alnreg_t *a, const int8_t *mat);
+// The mate-rescue dedup entry points (src/bwamem.cpp).
+extern int mem_dedup_only_fixpoint(const mem_opt_t *opt, int n, mem_alnreg_t *a,
+                                   int *fixpoint_out);
+extern int mem_dedup_only_insert1(const mem_opt_t *opt, int n, mem_alnreg_t *a, int pos,
+                                  int *fixpoint_out, int *fast_out);
 
 namespace {
 
@@ -907,4 +912,106 @@ TEST_CASE("the incremental `re` sort takes the introsort fallback on equal-`re` 
     unsigned long tie = 0;
     bwamem3_dedup_incr_re_stats(NULL, NULL, &tie, NULL, NULL, 1);
     CHECK(tie > 0);
+}
+
+namespace {
+
+// One mate-rescue-like record: usually a fresh random locus (two rids, a few
+// clusters, so windows hold several records), sometimes a near-copy of an
+// existing record, which makes it redundant with it, or a copy of its `re` or
+// its (score, rb, qb) key -- the three things mem_dedup_only_insert1 must
+// refuse to shortcut.
+mem_alnreg_t rescue_like(Rng &rng, const std::vector<mem_alnreg_t> &have) {
+    const int kind = have.empty() ? 0 : rng.in(0, 9);
+    if (kind >= 7) {
+        mem_alnreg_t b = have[static_cast<size_t>(rng.in(0, static_cast<int>(have.size()) - 1))];
+        b.n_comp = 0;
+        b.dedup_re_rank = 0;
+        if (kind == 7) { b.rb += rng.in(0, 3); b.qb += rng.in(0, 2); b.score = rng.in(1, 12); }  // redundant
+        else if (kind == 8) { b.rb -= rng.in(1, 40); b.qb = 0; b.qe = 150; b.score = rng.in(1, 12); }  // same re
+        else { b.re += rng.in(1, 40); b.qe = b.qb + rng.in(1, 20); }   // same (score, rb, qb)
+        return b;
+    }
+    const int len = rng.in(20, 150);
+    const int qb = rng.in(0, 150 - len);
+    const int64_t end = 1000 + 20000 * rng.in(0, 3) + rng.in(0, 3000);
+    return reg(end - len, end, qb, qb + len, rng.in(1, 12), rng.in(0, 1));
+}
+
+// Where mem_matesw_batch_post's insertion (rescue_insert) puts `b`.
+int rescue_insert_pos(const std::vector<mem_alnreg_t> &a, const mem_alnreg_t &b) {
+    int i = 0;
+    while (i < static_cast<int>(a.size()) && !(a[static_cast<size_t>(i)].score < b.score)) ++i;
+    return i;
+}
+
+}  // namespace
+
+TEST_CASE("the mate-rescue dedup's fixed-point skip and single-insert path are byte-identical to the full dedup"
+          * doctest::test_suite("unit/alnreg_sort_dedup")) {
+    // Emulate mem_matesw_batch_post's use: dedup, remember the fixed-point flag,
+    // insert one record, dedup again. At every step check the two claims the
+    // production shortcuts rest on, against mem_sort_dedup_patch itself:
+    //  (1) mem_dedup_only_fixpoint == mem_sort_dedup_patch, and when it reports
+    //      a fixed point, repeating mem_sort_dedup_patch changes no byte;
+    //  (2) from a fixed point, mem_dedup_only_insert1 == mem_dedup_only_fixpoint
+    //      (records, count and flag), whichever of its paths it takes.
+    Rng rng(0x9e3700d1ULL);
+    unsigned long fixpoints = 0, not_fixpoints = 0, fast = 0, fallback = 0;
+    for (int sort_fast = 0; sort_fast < 2; ++sort_fast) {
+        mem_opt_t *opt = mem_opt_init();
+        opt->alnreg_sort_fast = sort_fast;
+        for (int t = 0; t < 400; ++t) {
+            std::vector<mem_alnreg_t> a;
+            const int n0 = rng.in(0, 40);
+            for (int i = 0; i < n0; ++i) a.push_back(rescue_like(rng, a));
+            int fp = 0;
+            for (int round = 0; round < 12; ++round) {
+                if (round == 0 || !fp) {
+                    std::vector<mem_alnreg_t> full(a), c(a);
+                    const int nf = mem_sort_dedup_patch(opt, NULL, NULL, NULL,
+                                                        static_cast<int>(full.size()), full.data(), NULL);
+                    const int nc = mem_dedup_only_fixpoint(opt, static_cast<int>(c.size()), c.data(), &fp);
+                    full.resize(static_cast<size_t>(nf));
+                    c.resize(static_cast<size_t>(nc));
+                    REQUIRE(same_records(full, c));
+                    a = c;
+                }
+                if (fp) {
+                    ++fixpoints;
+                    std::vector<mem_alnreg_t> rep(a);
+                    const int nr = mem_sort_dedup_patch(opt, NULL, NULL, NULL,
+                                                        static_cast<int>(rep.size()), rep.data(), NULL);
+                    rep.resize(static_cast<size_t>(nr));
+                    CHECK(same_records(rep, a));
+                } else ++not_fixpoints;
+
+                const mem_alnreg_t b = rescue_like(rng, a);
+                const int pos = rescue_insert_pos(a, b);
+                a.insert(a.begin() + pos, b);
+                std::vector<mem_alnreg_t> e(a);
+                int fpe = 0;
+                const int ne = mem_dedup_only_fixpoint(opt, static_cast<int>(e.size()), e.data(), &fpe);
+                e.resize(static_cast<size_t>(ne));
+                if (fp) {
+                    std::vector<mem_alnreg_t> ins(a);
+                    int fpi = -1, took = -1;
+                    const int ni = mem_dedup_only_insert1(opt, static_cast<int>(ins.size()), ins.data(),
+                                                          pos, &fpi, &took);
+                    ins.resize(static_cast<size_t>(ni));
+                    REQUIRE(same_records(ins, e));
+                    CHECK(fpi == fpe);
+                    if (took) ++fast; else ++fallback;
+                }
+                a = e;
+                fp = fpe;
+            }
+        }
+        free(opt);
+    }
+    // Non-vacuity: both flag values, both insert paths.
+    CHECK(fixpoints > 100);
+    CHECK(not_fixpoints > 100);
+    CHECK(fast > 100);
+    CHECK(fallback > 100);
 }

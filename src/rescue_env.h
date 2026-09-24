@@ -35,9 +35,13 @@
  *                                      kswv's
  *     BWA3_RESCUE_BAND_SHIFT     1     shift each narrower lane's spare diagonals below its
  *                                      band so the query offsets of a 16-lane group align
+ *   mate-rescue dedup (src/bwamem_pair.cpp; read once)
+ *     BWA3_RESCUE_DEDUP_SKIP     1     skip a post-rescue dedup that is provably a no-op (nothing
+ *                                      added since a dedup that reported a fixed point)
  *   diagnostics
  *     BWA3_RESCUE_PRUNE_STATS    0     1: print the [RESCUE_PRUNE] and [RESCUE_BAND] counters
- *                                      and stage times at exit (both passes, not only pruning)
+ *                                      and stage times at exit (both passes, not only pruning),
+ *                                      plus the dedup_run / dedup_skip counts
  *
  * test/rescue_band_harness.cpp reads the same variables (plus its own RB_* knobs), so a harness
  * run and a whole-aligner run with one environment take the same paths. */

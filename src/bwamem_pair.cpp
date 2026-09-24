@@ -322,15 +322,23 @@ struct rescue_prune_stats_t {
      * pass 0 (8-bit + 16-bit), the banded pass 0, kswv pass 1 and the banded pass 1. Only measured
      * when stats are on. */
     std::atomic<uint64_t> ns_filter{0}, ns_k0{0}, ns_band{0}, ns_k1{0}, ns_b1{0};
+    /* Mate-rescue dedups (BWA3_RESCUE_DEDUP_SKIP): run (with the records they saw), skipped as
+     * provable no-ops, taken by the one-insert path and of those done in O(n), and their time. */
+    std::atomic<uint64_t> dedup_run{0}, dedup_skip{0}, dedup_run_regs{0}, dedup_skip_regs{0},
+        dedup_insert1{0}, dedup_insert1_fast{0}, ns_dedup{0};
     bool on = rescue_env_opt_in("BWA3_RESCUE_PRUNE_STATS");
     ~rescue_prune_stats_t() {
         if (on) fprintf(stderr, "[RESCUE_PRUNE] jobs=%llu full=%llu b1=%llu b2=%llu rows_in=%llu rows_kept=%llu "
                         "jobs16=%llu filter_s=%.3f kswv_pass0_s=%.3f band_pass0_s=%.3f kswv_pass1_s=%.3f "
-                        "band_pass1_s=%.3f\n",
+                        "band_pass1_s=%.3f dedup_run=%llu dedup_skip=%llu dedup_run_regs=%llu "
+                        "dedup_skip_regs=%llu dedup_insert1=%llu dedup_insert1_fast=%llu dedup_s=%.3f\n",
                         (unsigned long long)jobs, (unsigned long long)full, (unsigned long long)b1,
                         (unsigned long long)b2, (unsigned long long)rows_in, (unsigned long long)rows_kept,
                         (unsigned long long)jobs16, ns_filter * 1e-9, ns_k0 * 1e-9, ns_band * 1e-9,
-                        ns_k1 * 1e-9, ns_b1 * 1e-9);
+                        ns_k1 * 1e-9, ns_b1 * 1e-9, (unsigned long long)dedup_run,
+                        (unsigned long long)dedup_skip, (unsigned long long)dedup_run_regs,
+                        (unsigned long long)dedup_skip_regs, (unsigned long long)dedup_insert1,
+                        (unsigned long long)dedup_insert1_fast, ns_dedup * 1e-9);
     }
 };
 static inline uint64_t rescue_now_ns()
@@ -339,6 +347,13 @@ static inline uint64_t rescue_now_ns()
         std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 static rescue_prune_stats_t g_rescue_prune_stats;
+/* Skip a mate-rescue dedup that is provably a no-op (see mem_matesw_batch_post). Default ON;
+ * BWA3_RESCUE_DEDUP_SKIP=0 runs every dedup, which is how the byte-identity A/B is run. */
+static bool rescue_dedup_skip_enabled()
+{
+    static const bool on = rescue_env_flag("BWA3_RESCUE_DEDUP_SKIP");
+    return on;
+}
 
 /* The pruning lemma is derived for the default scoring only (a=1, b=4, gap open 6 / extend 1),
  * the 8-bit kernel path, and non-meth rescue; everything else runs the full window. */
@@ -386,6 +401,11 @@ struct pair64_scratch {
 extern int mem_sort_dedup_patch(const mem_opt_t *opt, const bntseq_t *bns,
                                 const uint8_t *pac, uint8_t *query, int n,
                                 mem_alnreg_t *a, const int8_t *mat = NULL);
+/* The dedup-only form that also reports a fixed point (src/bwamem.cpp). */
+extern int mem_dedup_only_fixpoint(const mem_opt_t *opt, int n, mem_alnreg_t *a,
+                                   int *fixpoint_out);
+extern int mem_dedup_only_insert1(const mem_opt_t *opt, int n, mem_alnreg_t *a, int pos,
+                                  int *fixpoint_out, int *fast_out);
 
 
 #define MIN_RATIO     0.8
@@ -1226,6 +1246,10 @@ int mem_pair_resolve_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
         }
         #else
         for (i = 0; i < 2; ++i) {
+            /* a[!i] is modified only by the calls below, so one state tracks it
+             * across them (see mem_matesw_batch_post). It starts unknown: the
+             * array as the extension stage left it is not known to be a fixed point. */
+            mem_rescue_dedup_state_t ma_dedup_state = {0, -1};
             for (j = 0; j < b[i].n && j < opt->max_matesw; ++j) {
                 /* D3 (--meth, PR-6, B3): see MATE_SORT branch above. */
                 const char  *ms_orig = opt->meth_mode ? s[!i].meth_orig_seq : NULL;
@@ -1234,7 +1258,8 @@ int mem_pair_resolve_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                 int val = mem_matesw_batch_post(opt, bns, pac, pes, &b[i].a[j],
                                                 s[!i].l_seq, (uint8_t*)s[!i].seq,
                                                 &a[!i], myaln, gcnt, gar, mmc,
-                                                ms_orig, rmat, opt->meth_mode ? i : -1);
+                                                ms_orig, rmat, opt->meth_mode ? i : -1,
+                                                &ma_dedup_state);
                 n += val;
                 gcnt += 4;
             }
@@ -1858,7 +1883,8 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                           const mem_alnreg_t *a, int l_ms, const uint8_t *ms,
                           mem_alnreg_v *ma, kswr_t **myaln, int32_t gcnt,
                           int32_t *gar, mem_cache *mmc, const char *ms_orig,
-                          const int8_t *mat, int mate_meth_ot)
+                          const int8_t *mat, int mate_meth_ot,
+                          mem_rescue_dedup_state_t *dedup_state)
 {
     extern int mem_sort_dedup_patch_rev(const mem_opt_t *opt, const bntseq_t *bns,
                                         const uint8_t *pac, uint8_t *query, int n,
@@ -2073,6 +2099,12 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                 tmp = i;
                 for (i = ma->n - 1; i > tmp; --i) ma->a[i] = ma->a[i-1];
                 ma->a[i] = b;
+                /* Record the one new record for the dedup below; a second push
+                 * before a dedup (not a path this loop takes) forfeits the state. */
+                if (dedup_state) {
+                    if (dedup_state->fixpoint && dedup_state->pushed < 0) dedup_state->pushed = i;
+                    else dedup_state->fixpoint = 0, dedup_state->pushed = -1;
+                }
 
                 #else
                 int resort = 0;
@@ -2111,7 +2143,35 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
             ++n;
         }
         #if !MATE_SORT
-        if (n) ma->n = mem_sort_dedup_patch(opt, 0, 0, 0, ma->n, ma->a);
+        /* `n` counts SW attempts across orientations AND is never reset, so this
+         * dedup also runs for every orientation that added nothing -- a failed or
+         * proven-failed (MATESW_GAR_PROVEN_FAIL) SW, a declined one, or a later
+         * orientation after any earlier attempt -- and, via the caller's state, on
+         * the next anchor's orientations too. With the state (both exact, see
+         * src/bwamem.cpp): nothing pushed since a dedup that reported a fixed
+         * point -> repeating it is a byte-for-byte no-op, skip it
+         * (mem_dedup_only_fixpoint); one record pushed -> mem_dedup_only_insert1,
+         * O(n) when it can prove the result. Without state, dedup as before. */
+        if (n) {
+            const bool st = g_rescue_prune_stats.on;
+            if (dedup_state == NULL)
+                ma->n = mem_sort_dedup_patch(opt, 0, 0, 0, ma->n, ma->a);
+            else if (dedup_state->fixpoint && dedup_state->pushed < 0 && rescue_dedup_skip_enabled()) {
+                if (st) { ++g_rescue_prune_stats.dedup_skip; g_rescue_prune_stats.dedup_skip_regs += ma->n; }
+            } else {
+                const uint64_t t0 = st ? rescue_now_ns() : 0;
+                if (st) { ++g_rescue_prune_stats.dedup_run; g_rescue_prune_stats.dedup_run_regs += ma->n; }
+                if (dedup_state->fixpoint && dedup_state->pushed >= 0 && rescue_dedup_skip_enabled()) {
+                    int fast = 0;
+                    ma->n = mem_dedup_only_insert1(opt, ma->n, ma->a, dedup_state->pushed,
+                                                   &dedup_state->fixpoint, &fast);
+                    if (st) { ++g_rescue_prune_stats.dedup_insert1; g_rescue_prune_stats.dedup_insert1_fast += fast; }
+                } else
+                    ma->n = mem_dedup_only_fixpoint(opt, ma->n, ma->a, &dedup_state->fixpoint);
+                dedup_state->pushed = -1;
+                if (st) g_rescue_prune_stats.ns_dedup += rescue_now_ns() - t0;
+            }
+        }
         #else
         if (n) ma->n = mem_dedup_patch(opt, 0, 0, 0, ma->n, ma->a);
         #endif
