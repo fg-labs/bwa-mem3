@@ -4272,8 +4272,16 @@ static void worker_sam(void *data, int seqid, int batch_size, int tid)
         // uint64_t tim = __rdtsc();
         int32_t maxRefLen = 0, maxQerLen = 0;
         int32_t gcnt = 0;
+        /* Rescue windows of pair i + RESCUE_PF_DIST are hinted while pair i
+         * runs (see mem_prefetch_rescue_pac). */
+        const int RESCUE_PF_DIST = 2;
+        const int rescue_pf = !(w->opt->flag & MEM_F_NO_RESCUE);
         for (int i=start; i< end; i+=2)
         {
+            if (rescue_pf && i + 2 * RESCUE_PF_DIST < end)
+                mem_prefetch_rescue_pac(mem_aln_bns(w), mem_aln_pac(w), w->pes,
+                                        &w->seqs[i + 2 * RESCUE_PF_DIST],
+                                        &w->regs[i + 2 * RESCUE_PF_DIST]);
             mem_sam_pe_batch_pre(w->opt, mem_aln_bns(w),
                                  mem_aln_pac(w), w->pes,
                                  (w->n_processed >> 1) + pos++,   // check!

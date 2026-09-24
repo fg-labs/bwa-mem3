@@ -259,6 +259,10 @@ which the insert-size estimate, and so rescue and pairing, depend on).
   back computed each job's reference window again, bases included, though it
   needs only the clamped bounds and the contig; the bases are now fetched only
   for the rare job that falls back to the scalar aligner.
+- **Rescue window prefetch.** The reference windows mate rescue will fetch for
+  a pair are hinted to the cache two pairs ahead (every window of a read's top
+  anchor lies within the largest usable insert-size bound of it). Pure hints;
+  skipped when the insert-size model is too loose for the span to be small.
 
 | Variable | Effect |
 |---|---|

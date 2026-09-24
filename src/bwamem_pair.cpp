@@ -1558,6 +1558,46 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
 }
 
 
+/* Prefetch the pac[] lines mate rescue will read for one pair (seqs[0..1],
+ * regs[0..1]); worker_sam calls it a couple of pairs ahead. It lives next to
+ * mem_matesw_batch_pre because it mirrors that function's window arithmetic:
+ * change one, check the other (a stale mirror only loses the speedup, since
+ * the hints never change output). mem_matesw_batch_pre fetches, for each
+ * read's anchors, one window per orientation r: [rb + low_r, rb + high_r +
+ * l_mate] or [rb - high_r - l_mate, rb - low_r] in doubled coordinates, all on
+ * the anchor's strand. So every
+ * window of the top anchor lies in [rb - H - l_mate, rb + H + l_mate] with H the
+ * largest high over usable orientations. Those windows are random DRAM misses
+ * (bns_get_seq_into's hottest instructions are its first pac loads), so hint
+ * them a couple of pairs ahead. Only a[0] is covered; secondary anchors within
+ * pen_unpaired are rare. Pure hints: byte-identical. */
+void mem_prefetch_rescue_pac(const bntseq_t *bns, const uint8_t *pac,
+                             const mem_pestat_t pes[4],
+                             const bseq1_t *seqs, const mem_alnreg_v *regs)
+{
+    int64_t H = -1;
+    for (int r = 0; r < 4; ++r)
+        if (!pes[r].failed && pes[r].high > H) H = pes[r].high;
+    if (H < 0) return;
+    const int64_t l_pac = bns->l_pac;
+    for (int k = 0; k < 2; ++k) {
+        if (regs[k].n == 0) continue;
+        const int64_t rb = regs[k].a[0].rb, pad = H + seqs[!k].l_seq;
+        int64_t b = rb - pad, e = rb + pad;
+        /* stay on rb's strand, as the rescue windows do */
+        if (rb < l_pac) { if (b < 0) b = 0; if (e > l_pac) e = l_pac; }
+        else { if (b < l_pac) b = l_pac; if (e > l_pac << 1) e = l_pac << 1; }
+        /* <= 64 lines: a wider span means a loose insert-size model, where
+         * hints would cost more than the misses they hide */
+        if (b >= e || e - b > 64 * 64 * 4) continue;
+        /* reverse strand: [b, e) is [2l - e, 2l - b) on the forward pac, i.e. bns_depos
+         * of both ends (the window is clamped to one strand above) */
+        if (b >= l_pac) { const int64_t fb = (l_pac << 1) - e; e = (l_pac << 1) - b; b = fb; }
+        for (int64_t x = (b >> 2) & ~(int64_t)63, xe = (e - 1) >> 2; x <= xe; x += 64)
+            __builtin_prefetch(pac + x, 0, 1);
+    }
+}
+
 int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                          const uint8_t *pac, const mem_pestat_t pes[4],
                          const mem_alnreg_t *a, int l_ms, const uint8_t *ms,

@@ -779,6 +779,12 @@ int mem_sam_pe_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                          mem_cache *mmc,  int64_t &pcnt, int32_t &gcnt,
                          int32_t&, int32_t&, int tid);
 
+/* Cache hints for the reference windows mem_matesw_batch_pre will fetch for
+ * one pair (seqs[0..1], regs[0..1]); pure hints, output-neutral. */
+void mem_prefetch_rescue_pac(const bntseq_t *bns, const uint8_t *pac,
+                             const mem_pestat_t pes[4],
+                             const bseq1_t *seqs, const mem_alnreg_v *regs);
+
 int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                          const uint8_t *pac, const mem_pestat_t pes[4],
                          const mem_alnreg_t *a, int l_ms, const uint8_t *ms,
