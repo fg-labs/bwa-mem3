@@ -94,6 +94,8 @@ extern uint64_t prof[10][112];
 #include "x86_soa_pack.h"
 #endif
 
+#include "kswv_quantum.h"
+
 /* Query-padding contract, shared by the batch wrappers and the kernels.
  *
  * A lane's query occupies columns [0, len2); the wrapper pads [len2, quantum)
@@ -105,11 +107,12 @@ extern uint64_t prof[10][112];
  * byte has bit 7 set, and can derive the FIRST such column for a whole group
  * as min(query_quantum(len2)) over its lanes.
  *
- * Both halves read the quantum from here so the fill and the mask can never
- * disagree: the lane count is the 8-bit SSE lane width (16) for the 8-bit
- * kernels and the 16-bit one (8) for the 16-bit kernels, matching bwa-mem2. */
-static inline int query_quantum8(int len2)  { return ((len2 + 16 - 1) / 16) * 16; }
-static inline int query_quantum16(int len2) { return ((len2 + 8 - 1) / 8) * 8; }
+ * Both halves read the quantum from kswv_quantum.h so the fill and the mask can
+ * never disagree (and neither can the rescue-pruning filter's hull, which uses
+ * the same quantum): the lane count is the 8-bit SSE lane width (16) for the
+ * 8-bit kernels and the 16-bit one (8) for the 16-bit kernels, matching bwa-mem2. */
+static inline int query_quantum8(int len2)  { return kswv_query_quantum8(len2); }
+static inline int query_quantum16(int len2) { return kswv_query_quantum16(len2); }
 
 /* Why the two query pads differ, since only one of them is inert:
  *   [len2, quantum)      DUMMY5 / NEON_QPAD8 -> sbt = shift (0 in the USQADD
