@@ -1,7 +1,9 @@
 /* Exactness + timing harness for the banded mate rescue (src/rescue_band.{h,cpp}).
+ * Build: `make rescue-band-harness` (aarch64 only).
  *
- *   rescue_band_harness eq   <gen-jobs> <seed> [dump files...]   exactness (exit 1 on any mismatch)
- *   rescue_band_harness time <dump files...>                     single-thread pass-0 timing
+ *   rescue_band_harness eq   <gen-jobs> <seed> [dump files...]   exactness (exit 1 on any mismatch
+ *                                                                or pass-1 guard fallback)
+ *   rescue_band_harness time <reps> <stride> <dump files...>     single-thread pass-0 timing
  *
  * eq: for every job, the PRODUCTION pipeline -- rescue_prune_window, RescueBandBatch::plan/commit,
  * the length sort, partition, kswv phase 0 on the non-banded pairs, run_pass0 on the banded ones,
@@ -10,18 +12,25 @@
  * when the truth fails), te, qe, score2, tb, qb (offsets applied). The production pipeline includes
  * the banded pass 1 (take_pass1 / run_pass1) of the banded parents and, under the default
  * BWA3_RESCUE_BAND_P1=2, of every other pair (hull or full window, kswv pass 0), so tb / qb check
- * it against kswv phase 1 on the full window; the summary counts how many jobs took it.
+ * it against kswv phase 1 on the full window; the summary counts how many jobs took it. A pass-1
+ * job whose banded max is not S falls back to kswv in production (the guard in rescue_band.h), but
+ * that cannot happen, so here any such fallback fails the run: it means the band argument broke.
  * A scalar full-window DP with kswv's score2 semantics (optsim.cpp dp/score2_of) plus a scalar
  * reversed-prefix DP for (tb, qb) cross-check the truth on every --scalar-stride-th job.
  * Generated classes: random windows with mutated mate copies, edge copies around te +- S (score2
  * parity/zeroing), tiny windows, N bases (must be FULL), tandem repeats (hit-dense, many
  * components), in-zone secondary copies (round-2 triggers), ragged len2, and pass-1 adversaries
  * (class 9: gaps at the band-edge bound, start ties, qe next to the pad columns, te at the
- * window edges). Env knobs are the production ones; the caller sets e.g.
- * BWA3_RESCUE_BAND_COST=100000000 (band every B2 parent) and BWA3_RESCUE_PRUNE_MAX_HITS.
+ * window edges). Env knobs are the production ones (src/rescue_env.h); the caller sets e.g.
+ * BWA3_RESCUE_BAND_COST=100000000 (band every B2 parent) and BWA3_RESCUE_PRUNE_MAX_HITS. RB_MINSC
+ * (default 19) and RB_SCALAR_STRIDE (default 0: no scalar cross-check) are harness-only.
  *
- * Dump files: BWA3_RESCUE_DUMP records (int32 len1, int32 len2, ref bytes, query bytes). */
+ * Dump files: one record per prune-eligible rescue job, as the aligner saw it (full window and
+ * oriented mate): int32 len1, int32 len2, len1 reference bytes, len2 query bytes (2-bit codes, 4 = N).
+ * The aligner does not write them; capture new ones by instrumenting mem_matesw_batch_pre where it
+ * calls rescue_prune_window. */
 #include "rescue_band.h"
+#include "rescue_env.h"
 
 #include <algorithm>
 #include <chrono>
@@ -496,7 +505,8 @@ static int run_eq(std::vector<Job> &jobs, int minsc, int max_hits, int scalar_st
            n, npass, nfull, nb1, nb2, nband, p1_band, p1_guard, mism, scal_mm, te2_diff);
     for (int c = 0; c < 128; c++)
         if (cls_n[c]) printf("  class %3d: jobs=%ld mismatches=%ld\n", c, cls_n[c], cls_mm[c]);
-    return mism || scal_mm ? 1 : 0;
+    if (p1_guard) fprintf(stderr, "FAIL: %ld pass-1 guard fallbacks (banded max != S)\n", p1_guard);
+    return mism || scal_mm || p1_guard ? 1 : 0;
 }
 
 /* ---------------------------------------------------------------------------------------- */
@@ -585,15 +595,17 @@ int main(int argc, char **argv)
         fprintf(stderr, "usage: %s eq <ngen> <seed> [dumps...] | time <reps> <stride> <dumps...>\n", argv[0]);
         return 2;
     }
-    const int minsc = getenv("RB_MINSC") ? atoi(getenv("RB_MINSC")) : MINSC_DEFAULT;
-    const int max_hits = getenv("BWA3_RESCUE_PRUNE_MAX_HITS") ? atoi(getenv("BWA3_RESCUE_PRUNE_MAX_HITS")) : 1000;
+    const int minsc = rescue_env_int("RB_MINSC", MINSC_DEFAULT);
+    /* The production default (rescue_prune_max_hits in bwamem_pair.cpp). */
+    const int max_hits = rescue_env_int("BWA3_RESCUE_PRUNE_MAX_HITS",
+                                        rescue_band_enabled() && minsc == 19 ? 1000 : 400);
     std::vector<Job> jobs;
     if (!strcmp(argv[1], "eq")) {
         const int ngen = atoi(argv[2]);
         rng.seed(strtoull(argv[3], nullptr, 10));
         for (int t = 0; t < ngen; t++) jobs.push_back(gen(t % 10));
         for (int a = 4; a < argc; a++) load_dump(argv[a], jobs, 1);
-        const int ss = getenv("RB_SCALAR_STRIDE") ? atoi(getenv("RB_SCALAR_STRIDE")) : 0;
+        const int ss = rescue_env_int("RB_SCALAR_STRIDE", 0);
         return run_eq(jobs, minsc, max_hits, ss);
     }
     if (!strcmp(argv[1], "time")) {

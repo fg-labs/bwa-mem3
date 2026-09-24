@@ -33,6 +33,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "kernel_dispatch.h"
 #include "kswv.h"
 #include "limits.h"
+#include "rescue_env.h"
 #include "utils.h"  /* xassert: release-active invariant guard */
 
 /* Column blocking for the u8 kernels' post-row query-end recovery. The row's
@@ -517,16 +518,11 @@ static inline void kswv_u8_saturation_guard(const SeqPair *p, int8_t w_match, ui
 
 #if defined(__ARM_NEON) || defined(__aarch64__) || defined(APPLE_SILICON) \
     || defined(__AVX2__) || defined(__AVX512BW__)
-/* Read a BWA3_RESCUE_* on/off toggle (default ON; a leading "0" disables). Not
- * cached: the env is read on every call so a unit test can flip the selected
- * path in-process (the parity test relies on this) and a mid-run override takes
+/* The BWA3_RESCUE_* kernel toggles (listed in rescue_env.h) are not cached: the
+ * env is read on every call so a unit test can flip the selected path
+ * in-process (the parity tests rely on this) and a mid-run override takes
  * effect. The cost is one getenv per rescue batch -- never per cell -- so it is
  * negligible; the runtime bool still folds to a monomorphised template. */
-static bool rescue_env_on(const char *var)
-{
-    const char *e = getenv(var);
-    return !e || e[0] != '0';
-}
 
 /* BWA3_RESCUE_FSCAN (default ON) selects the G-based cell, G = max(m11, f11),
  * in every SIMD kswv body: NEON u8 and i16, AVX2 u8 and i16, AVX-512BW u8 and
@@ -535,7 +531,7 @@ static bool rescue_env_on(const char *var)
  * original bodies run otherwise. The cell and its byte-identity argument are
  * at KSWV_NEON_U8_CELL_PAIR_FS, the dropped reference-pad mask is argued in the
  * note above kswv_neon_u8, and the measurements are with the u8 NEON notes. */
-static bool rescue_fscan_enabled() { return rescue_env_on("BWA3_RESCUE_FSCAN"); }
+static bool rescue_fscan_enabled() { return rescue_env_flag("BWA3_RESCUE_FSCAN"); }
 #endif
 
 #if defined(__ARM_NEON) || defined(__aarch64__) || defined(APPLE_SILICON)
@@ -664,7 +660,7 @@ void kswv::kswvBatchWrapper8(SeqPair *pairArray,
  * cancels within the cell), so every downstream H comparison is unchanged.
  * Default ON; BWA3_RESCUE_USQADD=0 restores the biased form. Monomorphised as a
  * template bool (folds like HasFreed), never a per-cell branch. */
-static bool rescue_usqadd_enabled() { return rescue_env_on("BWA3_RESCUE_USQADD"); }
+static bool rescue_usqadd_enabled() { return rescue_env_flag("BWA3_RESCUE_USQADD"); }
 
 /* Two-target-row blocking of the u8 rescue kernel. Processing rows i and i+1 in
  * one column sweep lets the pair share the query-column load, the vertical-carry
@@ -678,7 +674,7 @@ static bool rescue_usqadd_enabled() { return rescue_env_on("BWA3_RESCUE_USQADD")
  *
  * Default ON; BWA3_RESCUE_ROWPAIR=0 restores the one-row-at-a-time sweep.
  * Monomorphised as a template bool, never a per-cell branch. */
-static bool rescue_rowpair_enabled() { return rescue_env_on("BWA3_RESCUE_ROWPAIR"); }
+static bool rescue_rowpair_enabled() { return rescue_env_flag("BWA3_RESCUE_ROWPAIR"); }
 
 /* Query-end recovery in the two-row sweep. Row i+1's H is stored (H1) and can be
  * rescanned after the row exactly as the one-row body does; row i's H only ever
@@ -701,7 +697,7 @@ static bool rescue_rowpair_enabled() { return rescue_env_on("BWA3_RESCUE_ROWPAIR
  * in the one-row body. Byte-identical: both forms compute
  * min{ j : H[j] == rowmax } over the same stored values. Default ON;
  * BWA3_RESCUE_LAZYQE=0 restores the inline argmax. */
-static bool rescue_lazyqe_enabled() { return rescue_env_on("BWA3_RESCUE_LAZYQE"); }
+static bool rescue_lazyqe_enabled() { return rescue_env_flag("BWA3_RESCUE_LAZYQE"); }
 
 /* FScan: the u8 NEON cell rebuilt around G = max(m11, f11), the cell's score
  * before the in-row gap: 11 vector ALU ops per cell instead of 13, a boundary

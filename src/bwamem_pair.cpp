@@ -44,6 +44,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "simd_dispatch.h"
 #include "rescue_prune.h"
 #include "rescue_band.h"
+#include "rescue_env.h"
 #include <chrono>
 
 #ifdef USE_MALLOC_WRAPPERS
@@ -294,12 +295,12 @@ static const int32_t MATESW_GAR_PROVEN_FAIL = -3;
 static thread_local std::vector<int> g_rescue_narrow_off;
 
 /* Exact rescue pruning (rescue_prune.h). Default ON; BWA3_RESCUE_PRUNE=0 disables it, which is
- * how the byte-identity A/B is run. BWA3_RESCUE_PRUNE_MAX_HITS (default 400) skips the filter on
- * windows sharing more 5-mer hits with the mate than that, where it would cost more than the DP
- * rows it saves. Read once. */
+ * how the byte-identity A/B is run. BWA3_RESCUE_PRUNE_MAX_HITS skips the filter on windows sharing
+ * more 5-mer hits with the mate than that, where it would cost more than the DP rows it saves.
+ * Both are read once; the full BWA3_RESCUE_* list is in rescue_env.h. */
 static bool rescue_prune_enabled()
 {
-    static const bool on = [] { const char *e = getenv("BWA3_RESCUE_PRUNE"); return !e || e[0] != '0'; }();
+    static const bool on = rescue_env_flag("BWA3_RESCUE_PRUNE");
     return on;
 }
 /* Default 400 for the hull path; 1000 when banding is on and the NEON filter runs (minsc == 19):
@@ -308,55 +309,30 @@ static bool rescue_prune_enabled()
  * minsc) is too slow on dense windows for that, so it keeps 400. */
 static int rescue_prune_max_hits(int minsc)
 {
-    static const int env = [] { const char *e = getenv("BWA3_RESCUE_PRUNE_MAX_HITS"); return e ? atoi(e) : -1; }();
+    static const int env = rescue_env_int("BWA3_RESCUE_PRUNE_MAX_HITS", -1);
     if (env >= 0) return env;
     return rescue_band_enabled() && minsc == 19 ? 1000 : 400;
 }
 /* BWA3_RESCUE_PRUNE_STATS=1 prints the filter's decisions at exit (non-vacuity check for the
- * identity A/B: identical output must come with a nonzero number of pruned rows). */
+ * identity A/B: identical output must come with a nonzero number of pruned rows), and the number of
+ * 16-bit rescue jobs, which the filter never sees (the same check for the 16-bit kernels). */
 struct rescue_prune_stats_t {
-    std::atomic<uint64_t> jobs{0}, full{0}, b1{0}, b2{0}, rows_in{0}, rows_kept{0};
+    std::atomic<uint64_t> jobs{0}, full{0}, b1{0}, b2{0}, rows_in{0}, rows_kept{0}, jobs16{0};
     /* Thread-summed wall time of the rescue stages (ns): filter + band planning in _pre, kswv
      * pass 0 (8-bit + 16-bit), the banded pass 0, kswv pass 1 and the banded pass 1. Only measured
      * when stats are on. */
     std::atomic<uint64_t> ns_filter{0}, ns_k0{0}, ns_band{0}, ns_k1{0}, ns_b1{0};
-    bool on = [] { const char *e = getenv("BWA3_RESCUE_PRUNE_STATS"); return e && e[0] == '1'; }();
+    bool on = rescue_env_opt_in("BWA3_RESCUE_PRUNE_STATS");
     ~rescue_prune_stats_t() {
         if (on) fprintf(stderr, "[RESCUE_PRUNE] jobs=%llu full=%llu b1=%llu b2=%llu rows_in=%llu rows_kept=%llu "
-                        "filter_s=%.3f kswv_pass0_s=%.3f band_pass0_s=%.3f kswv_pass1_s=%.3f band_pass1_s=%.3f\n",
+                        "jobs16=%llu filter_s=%.3f kswv_pass0_s=%.3f band_pass0_s=%.3f kswv_pass1_s=%.3f "
+                        "band_pass1_s=%.3f\n",
                         (unsigned long long)jobs, (unsigned long long)full, (unsigned long long)b1,
                         (unsigned long long)b2, (unsigned long long)rows_in, (unsigned long long)rows_kept,
-                        ns_filter * 1e-9, ns_k0 * 1e-9, ns_band * 1e-9, ns_k1 * 1e-9, ns_b1 * 1e-9);
+                        (unsigned long long)jobs16, ns_filter * 1e-9, ns_k0 * 1e-9, ns_band * 1e-9,
+                        ns_k1 * 1e-9, ns_b1 * 1e-9);
     }
 };
-/* BWA3_RESCUE_DUMP=<prefix> (debug): append every prune-eligible rescue job (full window + oriented
- * mate) to <prefix>.<thread-serial>, every BWA3_RESCUE_DUMP_STRIDE-th job (default 1). Record:
- * int32 len1, int32 len2, len1 ref bytes, len2 query bytes. Feeds the offline exactness/timing
- * harness for the banded rescue (test/rescue_band_harness.cpp). */
-static void rescue_dump_job(const uint8_t *ref, int len1, const uint8_t *q, int len2)
-{
-    static const char *prefix = getenv("BWA3_RESCUE_DUMP");
-    if (!prefix) return;
-    static const int stride = [] { const char *e = getenv("BWA3_RESCUE_DUMP_STRIDE"); return e ? std::max(1, atoi(e)) : 1; }();
-    static std::atomic<int> serial{0};
-    struct dumper {
-        FILE *fp = nullptr; long n = 0;
-        ~dumper() { if (fp) fclose(fp); }
-    };
-    static thread_local dumper d;
-    if (d.n++ % stride) return;
-    if (!d.fp) {
-        char path[4096];
-        snprintf(path, sizeof path, "%s.%d", prefix, serial++);
-        d.fp = fopen(path, "wb");
-        if (!d.fp) return;
-    }
-    const int32_t h[2] = {len1, len2};
-    fwrite(h, sizeof h, 1, d.fp);
-    fwrite(ref, 1, (size_t)len1, d.fp);
-    fwrite(q, 1, (size_t)len2, d.fp);
-}
-
 static inline uint64_t rescue_now_ns()
 {
     return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1676,13 +1652,13 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
              * and _post applies the same offset. The oriented mate is built once here and reused
              * for the staging copy below. */
             const bool pruned = rescue_prune_applies(opt, xtra);
+            if (g_rescue_prune_stats.on && !(xtra & KSW_XBYTE)) g_rescue_prune_stats.jobs16++;
             static thread_local std::vector<uint8_t> oq;   // oriented mate; grows, never shrinks
             if (pruned) {
                 if ((int)oq.size() < l_ms) oq.resize(l_ms);
                 if (is_rev) for (int l = 0; l < l_ms; l++) oq[l] = ms[l_ms - 1 - l] < 4 ? 3 - ms[l_ms - 1 - l] : 4;
                 else memcpy(oq.data(), ms, (size_t)l_ms);
                 int hb, he;
-                rescue_dump_job(ref, (int)(re - rb), oq.data(), l_ms);
                 const uint64_t tf0 = g_rescue_prune_stats.on ? rescue_now_ns() : 0;
                 const int kind = rescue_prune_window(ref, (int)(re - rb), oq.data(), l_ms,
                                                      opt->min_seed_len * opt->a,

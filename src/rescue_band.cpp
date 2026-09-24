@@ -1,6 +1,7 @@
 /* Exact banded mate-rescue DP: component planning, the 16-lane NEON banded kernel, grouping and
  * the per-parent merge. See rescue_band.h for the design and the exactness argument. */
 #include "rescue_band.h"
+#include "rescue_env.h"
 
 #include <algorithm>
 #include <atomic>
@@ -14,13 +15,13 @@
 #endif
 
 /* ------------------------------------------------------------------------------------------ */
-/* Toggles and tuning (read once).                                                             */
+/* Toggles and tuning (read once; the full BWA3_RESCUE_* list is in rescue_env.h).             */
 /* ------------------------------------------------------------------------------------------ */
 
 bool rescue_band_enabled()
 {
 #if defined(__aarch64__)
-    static const bool on = [] { const char *e = getenv("BWA3_RESCUE_BAND"); return !e || e[0] != '0'; }();
+    static const bool on = rescue_env_flag("BWA3_RESCUE_BAND");
     return on;
 #else
     return false;
@@ -34,7 +35,7 @@ bool rescue_band_enabled()
  * pct; 85 was the best of {40, 55, 70, 85, 100, 130} locally (M-series, wgs-like HG002). */
 static int rb_cost_pct()
 {
-    static const int v = [] { const char *e = getenv("BWA3_RESCUE_BAND_COST"); return e ? atoi(e) : 85; }();
+    static const int v = rescue_env_int("BWA3_RESCUE_BAND_COST", 85);
     return v;
 }
 static const int RB_OVH = 8;          // per-row fixed cost of a band lane, in cell units
@@ -44,7 +45,7 @@ static const int RB_COMP_CAP = 64;    // more components than this: keep the hul
  * or kswv on the hull (BWA3_RESCUE_BAND_R2=0). Both are exact. */
 static bool rb_r2_banded()
 {
-    static const bool on = [] { const char *e = getenv("BWA3_RESCUE_BAND_R2"); return !e || e[0] != '0'; }();
+    static const bool on = rescue_env_flag("BWA3_RESCUE_BAND_R2");
     return on;
 }
 
@@ -52,7 +53,7 @@ static bool rb_r2_banded()
  * zone [te - S, te + S]. BWA3_RESCUE_BAND_TIGHT = delta (default below); 0 disables. */
 static int rb_tight_delta()
 {
-    static const int v = [] { const char *e = getenv("BWA3_RESCUE_BAND_TIGHT"); return e ? atoi(e) : 8; }();
+    static const int v = rescue_env_int("BWA3_RESCUE_BAND_TIGHT", 8);
     return v;
 }
 
@@ -60,7 +61,7 @@ static int rb_tight_delta()
  * parents only, 2 (default) every eligible 8-bit job. All are exact; see rescue_band.h. */
 static int rb_p1_mode()
 {
-    static const int v = [] { const char *e = getenv("BWA3_RESCUE_BAND_P1"); return e ? atoi(e) : 2; }();
+    static const int v = rescue_env_int("BWA3_RESCUE_BAND_P1", 2);
     return v;
 }
 
@@ -73,7 +74,7 @@ static int rb_p1_mode()
  * runs to its slowest lane. Retune on Graviton; BWA3_RESCUE_BAND_P1_COST overrides. */
 static int rb_p1_cost_pct()
 {
-    static const int v = [] { const char *e = getenv("BWA3_RESCUE_BAND_P1_COST"); return e ? atoi(e) : 130; }();
+    static const int v = rescue_env_int("BWA3_RESCUE_BAND_P1_COST", 130);
     return v;
 }
 
@@ -84,20 +85,20 @@ static int rb_p1_cost_pct()
  * always agree, as the fused cell requires. */
 static int rb_kernel()
 {
-    static const int v = [] { const char *e = getenv("BWA3_RESCUE_FSCAN"); return e ? atoi(e) : 2; }();
+    static const int v = rescue_env_int("BWA3_RESCUE_FSCAN", 2);
     return v;
 }
 
 /* BWA3_RESCUE_BAND_SHIFT=0 disables the per-lane band shift of run_jobs (see there); for A/B. */
 static bool rb_shift_on()
 {
-    static const bool on = [] { const char *e = getenv("BWA3_RESCUE_BAND_SHIFT"); return !e || e[0] != '0'; }();
+    static const bool on = rescue_env_flag("BWA3_RESCUE_BAND_SHIFT");
     return on;
 }
 
 static bool rb_stats_on()
 {
-    static const bool on = [] { const char *e = getenv("BWA3_RESCUE_PRUNE_STATS"); return e && e[0] == '1'; }();
+    static const bool on = rescue_env_opt_in("BWA3_RESCUE_PRUNE_STATS");
     return on;
 }
 
