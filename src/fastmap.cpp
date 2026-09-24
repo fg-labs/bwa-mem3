@@ -60,11 +60,6 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "bwa_hugepages.h"
 #include "fast_reader_bseq.h"
 
-
-// --------------
-extern uint64_t tprof[LIM_R][LIM_C];
-// ---------------
-
 /* --cohort-slices / BWA_MEM3_COHORT_SLICES. Named here rather than repeated at
  * each site because the value is needed in four places -- the ramp's shift
  * clamp, the flag's range check, that check's error message, and the `mem

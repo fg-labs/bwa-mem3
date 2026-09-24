@@ -69,9 +69,6 @@ namespace { struct SpEncodeScope {
  * gate it was retired with the f/r output layer). */
 const uint8_t *g_meth_orig_pac = NULL;
 
-//----------------
-extern uint64_t tprof[LIM_R][LIM_C];
-//----------------
 #include "kbtree.h"
 
 #define chain_cmp(a, b) (((b).pos < (a).pos) - ((a).pos < (b).pos))
@@ -6822,7 +6819,7 @@ static inline void stage_seed_extension(
             mmc->seqBufRightRef[tid*CACHE_LINE] = seqBufRightRef = seqBufRef_;
         }
 
-        tprof[PE23][tid] += sp.len1 + sp.len2;
+        // CHN-16: dead tprof[PE23] counter removed (bumped per extension, never reported)
 
         uint8_t *qs = seqBufRightQer + sp.idq;
         uint8_t *rs = seqBufRightRef + sp.idr;
@@ -7333,7 +7330,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
                 a->chain_n_hits = chain_max_n_hits;
                 a->rb = a->qb = a->re = a->qe = H0_;
 
-                tprof[PE19][tid] ++;
+                // CHN-16: dead tprof[PE19] counter removed (bumped per seed, never reported)
 
                 /* --skip-contained-ext (two-wave): DEFER a seed strictly
                  * contained in a longer same-diagonal seed of this chain. It is
@@ -7603,8 +7600,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
                      * track pair_ar_aux (distinct from pair_ar after the retry swap),
                      * not the static seqPairArrayAux which pair_ar can alias. */
 
-        tprof[PE5][0] += nump;
-        tprof[PE6][0] ++;
+        // CHN-16: dead tprof[PE5]/[PE6] counters removed (every worker bumped column 0)
         // tprof[MEM_ALN2_B][tid] += __rdtsc() - tim;
 
         int num = 0;
@@ -7685,8 +7681,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
                      * track pair_ar_aux (distinct from pair_ar after the retry swap),
                      * not the static seqPairArrayAux which pair_ar can alias. */
 
-        tprof[PE1][0] += nump;
-        tprof[PE2][0] ++;
+        // CHN-16: dead tprof[PE1]/[PE2] counters removed (every worker bumped column 0)
         // tprof[MEM_ALN2_D][tid] += __rdtsc() - tim;
 
         int num = 0;
@@ -7973,8 +7968,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
                      * track pair_ar_aux (distinct from pair_ar after the retry swap),
                      * not the static seqPairArrayAux which pair_ar can alias. */
 
-        tprof[PE7][0] += nump;
-        tprof[PE8][0] ++;
+        // CHN-16: dead tprof[PE7]/[PE8] counters removed (every worker bumped column 0)
         // tprof[MEM_ALN2_C][tid] += __rdtsc() - tim;
 
         int num = 0;
@@ -8051,8 +8045,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
                      * track pair_ar_aux (distinct from pair_ar after the retry swap),
                      * not the static seqPairArrayAux which pair_ar can alias. */
 
-        tprof[PE3][0] += nump;
-        tprof[PE4][0] ++;
+        // CHN-16: dead tprof[PE3]/[PE4] counters removed (every worker bumped column 0)
         // tprof[MEM_ALN2_E][tid] += __rdtsc() - tim;
         int num = 0;
 
@@ -8317,7 +8310,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
                         mem_alnreg_t *ar = &(av_v[l].a[s->aln]);
                         ar->qb = ar->qe = -1;         // purge the alingment
                         srt2[k] = UINT_MAX;
-                        tprof[PE18][tid]++;
+                        // CHN-16: dead tprof[PE18] counter removed (never reported)
                         continue;
                     }
                 }

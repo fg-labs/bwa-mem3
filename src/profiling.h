@@ -33,7 +33,19 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include <stdint.h>
 #include "macro.h"
 
+/* One tprof row: a per-thread counter for each tid, indexed exactly like the
+ * old uint64_t[LIM_C] row (tprof[row][tid]). Each tid's counter sits alone on a
+ * 64-byte cache line, so worker threads bumping the same row on a hot path
+ * never write to a shared line (eight adjacent tids used to share one). */
+#define TPROF_SLOT_U64 (64 / sizeof(uint64_t))
+struct tprof_row_t {
+    uint64_t slot[LIM_C][TPROF_SLOT_U64];
+    uint64_t &operator[](int tid) { return slot[tid][0]; }
+    const uint64_t &operator[](int tid) const { return slot[tid][0]; }
+};
+
 int display_stats(int );
-extern uint64_t proc_freq, tprof[LIM_R][LIM_C];
+extern uint64_t proc_freq;
+extern tprof_row_t tprof[LIM_R];
 extern uint64_t prof[LIM_R];
 #endif

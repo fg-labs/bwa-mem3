@@ -48,8 +48,6 @@
 #include "macro.h"
 #include "utils.h"   // xassert — bounds guard for the wavefront direction-byte store
 
-extern uint64_t tprof[LIM_R][LIM_C];
-
 #ifdef USE_MALLOC_WRAPPERS
 #  include "malloc_wrap.h"
 #endif

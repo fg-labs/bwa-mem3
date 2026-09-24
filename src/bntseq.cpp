@@ -60,8 +60,6 @@ KHASH_MAP_INIT_STR(str, int)
 #  include "malloc_wrap.h"
 #endif
 
-extern uint64_t tprof[LIM_R][LIM_C];
-
 /* Build "<prefix><suffix>" into `out` (sized `outsz`), aborting via err_fatal
  * if the result would exceed `outsz`. Used by the bns_* file-path helpers
  * below; replaces the prior strcpy_s/strcat_s calls. */

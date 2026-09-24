@@ -72,8 +72,6 @@ static int get_pcore_count() {
 }
 #endif /* __APPLE__ */
 
-extern uint64_t tprof[LIM_R][LIM_C];
-
 static inline long steal_work(kt_for_t *t)
 {
 	int i, min_i = -1;
