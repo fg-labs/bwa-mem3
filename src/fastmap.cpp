@@ -59,6 +59,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "bwa_shm.h"
 #include "bwa_hugepages.h"
 #include "fast_reader_bseq.h"
+#include "rescue_band.h"
 
 /* --cohort-slices / BWA_MEM3_COHORT_SLICES. Named here rather than repeated at
  * each site because the value is needed in four places -- the ramp's shift
@@ -420,6 +421,7 @@ void worker_alloc(const mem_opt_t *opt, worker_t &w, int32_t nreads, int32_t nth
         w.mmc.wsize[l] = wsize;
         w.mmc.rescue_narrow_off[l] = NULL;   // grown on demand by mem_matesw_batch_pre
         w.mmc.rescue_narrow_cap[l] = 0;
+        w.mmc.rescue_band[l] = NULL;         // created on demand by mem_matesw_batch_pre
 
         xassert(w.mmc.seqPairArrayAux[l] != NULL, "out of memory: w.mmc.seqPairArrayAux[l]");
         xassert(w.mmc.seqPairArrayLeft128[l] != NULL, "out of memory: w.mmc.seqPairArrayLeft128[l]");
@@ -490,6 +492,7 @@ void worker_free(worker_t &w, int32_t nthreads)
     for(int l=0; l<nthreads; l++) {
         free(w.mmc.seqPairArrayAux[l]);
         free(w.mmc.rescue_narrow_off[l]);
+        rescue_band_batch_free(w.mmc.rescue_band[l]);
         free(w.mmc.seqPairArrayLeft128[l]);
         free(w.mmc.seqPairArrayRight128[l]);
     }

@@ -137,6 +137,32 @@ static inline int rescue_prune_window_scalar(const uint8_t *ref, int len1, const
     return RESCUE_PRUNE_B2;
 }
 
+/* The per-diagonal arrays behind a RESCUE_PRUNE_B2 decision, for deriving diagonal components at
+ * thresholds above minsc (rescue_band.h). Diagonal index x in [0, nd) is the unshifted diagonal
+ * d = i - j = x - off, with nd = len1 + off + 1 and off the query's 8-bit quantum. Exactly one of
+ * bnd16 (NEON: the bound precomputed) or fwd / bwd (scalar: bnd = 5 + fwd + bwd - (cnt - 1)) is
+ * set; mw / hw are set with bnd16. The pointers alias the filter's per-thread scratch, so a view is
+ * valid only until the next filter call on the same thread. */
+struct rescue_prune_view {
+    int nd = -1, off = 0;
+    const uint16_t *cnt = nullptr;
+    const int16_t *minrow = nullptr;
+    const int16_t *bnd16 = nullptr;
+    const int32_t *fwd = nullptr, *bwd = nullptr;
+    const uint64_t *mw = nullptr;   // NEON: bitset of diagonals with bnd >= 19
+    const uint64_t *hw = nullptr;   // NEON: bitset of diagonals with bnd >= 19 and a hit
+};
+
+/* The view of a rescue_prune_window_scalar call on (len1, len2) that returned RESCUE_PRUNE_B2. */
+static inline rescue_prune_view rescue_prune_scalar_view(const rescue_prune_scratch &s, int len1, int len2)
+{
+    rescue_prune_view v;
+    v.off = kswv_query_quantum8(len2);
+    v.nd = len1 + v.off + 1;
+    v.cnt = s.cnt; v.minrow = s.minrow; v.fwd = s.fwd; v.bwd = s.bwd;
+    return v;
+}
+
 /* Decide how much of a rescue window must be computed. Valid only under a scoring
  * rescue_prune_scoring_ok() admits and on the 8-bit kernel path; the caller checks both.
  *   ref, len1   reference window, bases 0-3 (>= 4 is N)
@@ -144,10 +170,14 @@ static inline int rescue_prune_window_scalar(const uint8_t *ref, int len1, const
  *   minsc       the rescue score threshold (min_seed_len * a)
  *   max_hits    return FULL when the window and mate share more 5-mer hits than this: the filter
  *               would cost more than the DP rows it can save
- *   hb, he      inclusive sub-window rows, set for RESCUE_PRUNE_B2 */
+ *   hb, he      inclusive sub-window rows, set for RESCUE_PRUNE_B2
+ *   view        optional: for RESCUE_PRUNE_B2, the per-diagonal arrays the decision came from
+ *               (rescue_prune_view); left empty (nd = -1) otherwise */
 static inline int rescue_prune_window(const uint8_t *ref, int len1, const uint8_t *q, int len2,
-                                      int minsc, int max_hits, int *hb, int *he)
+                                      int minsc, int max_hits, int *hb, int *he,
+                                      rescue_prune_view *view = nullptr)
 {
+    if (view) *view = rescue_prune_view();
     *hb = *he = -1;
     // minsc < 5: the lemma's base term (5) already exceeds the threshold, so nothing is provable.
     if (minsc < 5 || len1 < 5 || len2 < 5 || len2 > rescue_prune_scratch::QCAP || len1 > 30000)
@@ -160,12 +190,23 @@ static inline int rescue_prune_window(const uint8_t *ref, int len1, const uint8_
         const rescue_prune_neon::Kind k = rescue_prune_neon::lean_neon(jb, ns, h, e, max_hits);
         if (k == rescue_prune_neon::B1) return RESCUE_PRUNE_B1;
         if (k == rescue_prune_neon::FULL) return RESCUE_PRUNE_FULL;
-        if (k == rescue_prune_neon::B2) { *hb = h; *he = e; return RESCUE_PRUNE_B2; }
+        if (k == rescue_prune_neon::B2) {
+            *hb = h; *he = e;
+            if (view) {
+                view->off = kswv_query_quantum8(len2);
+                view->nd = len1 + view->off + 1;
+                view->cnt = ns.cnt; view->minrow = ns.minrow; view->bnd16 = ns.bnd;
+                view->mw = ns.mw; view->hw = ns.hw;
+            }
+            return RESCUE_PRUNE_B2;
+        }
         // FALLBACK: beyond the NEON path's capacity or int16 range -> int32 scalar filter below.
     }
 #endif
     static thread_local rescue_prune_scratch s;
-    return rescue_prune_window_scalar(ref, len1, q, len2, minsc, max_hits, s, hb, he);
+    const int kind = rescue_prune_window_scalar(ref, len1, q, len2, minsc, max_hits, s, hb, he);
+    if (view && kind == RESCUE_PRUNE_B2) *view = rescue_prune_scalar_view(s, len1, len2);
+    return kind;
 }
 
 #endif

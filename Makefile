@@ -453,7 +453,7 @@ OBJS=		src/fastmap.o src/bwtindex.o src/utils.o src/kthread.o \
 			src/system.o src/libsais_build.o \
 			src/bwa_shm.o src/bwa_hugepages.o src/simd_dispatch.o \
 			src/fast_reader.o src/fast_reader_bseq.o src/fr_fastq.o src/stage_prof.o \
-			src/smem_dedup.o src/lockstep_width.o src/read_memo.o
+			src/smem_dedup.o src/lockstep_width.o src/read_memo.o src/rescue_band.o
 
 # Kernel TUs (bandedSWA, kswv, ksw, sam_encode) are compiled per-tier on x86
 # and linked directly via KERNEL_TIER_OBJS_LINK. The dispatch wrappers in
@@ -960,6 +960,25 @@ fmi_seed_api_smoke: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) $(if $(filter 1,$(USE_
 test/fmi_seed_api_smoke.o: test/fmi_seed_api_smoke.cpp $(FLAGS_STAMP)
 	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
 
+# Exactness + timing harness for the banded mate rescue (src/rescue_band.{h,cpp});
+# its header lists the modes. CI runs a bounded `eq` on generated jobs on the
+# ARM64 rows; longer runs and real-data dumps are manual. aarch64 only -- the
+# banded kernel is NEON, and elsewhere rescue_band_enabled() is false, so the
+# harness would compare the hull path with itself.
+.PHONY: rescue-band-harness
+rescue-band-harness: rescue_band_harness
+
+ifneq ($(IS_ARM),)
+rescue_band_harness: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) $(if $(filter 1,$(USE_MIMALLOC)),$(MIMALLOC_LIB)) test/rescue_band_harness.o
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/rescue_band_harness.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) $(MIMALLOC_LDFLAGS) -o $@
+
+test/rescue_band_harness.o: test/rescue_band_harness.cpp $(FLAGS_STAMP)
+	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
+else
+rescue_band_harness:
+	$(error rescue_band_harness is aarch64-only: the banded rescue kernel is NEON)
+endif
+
 # Regression test for the fmi_seed_api.h facade's max_occ guard: forwarding
 # max_occ <= 0 into FMI_search::get_sa_entries_prefetch divides by max_occ.
 # Requires a real index prefix argument (see test/run_unit_tests.sh), unlike
@@ -1368,7 +1387,7 @@ $(ZLIBNG_LIB):
 	cd $(ZLIBNG_BUILD) && cmake $(ZLIBNG_CMAKE_FLAGS) .. && $(MAKE)
 
 clean: pgo-clean profile-clean lto-clean
-	rm -fr src/*.o src/*.d src/version.h test/*.o test/*.d $(FLAGS_STAMP) $(BWA_LIB) $(EXE) $(STANDALONE_TESTS) kvec_alloc_fail_test klib_alloc_fail_test bwa-mem3.arm64
+	rm -fr src/*.o src/*.d src/version.h test/*.o test/*.d $(FLAGS_STAMP) $(BWA_LIB) $(EXE) $(STANDALONE_TESTS) kvec_alloc_fail_test klib_alloc_fail_test rescue_band_harness bwa-mem3.arm64
 	rm -f $(LIBSAIS_OBJS) $(LIBSAIS_OBJS:.o=.d)
 	rm -f src/*.gcno src/*.gcda
 	$(MAKE) -C test clean

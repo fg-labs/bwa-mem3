@@ -2,13 +2,18 @@
 # test/regression/rescue_prune_identity.sh
 #
 # Exact mate-rescue pruning (src/rescue_prune.h, wired in mem_matesw_batch_pre /
-# _post) must leave the alignment output byte-identical to the full-window
-# rescue. Both legs are the SAME binary; only the BWA3_RESCUE_PRUNE escape hatch
-# differs:
+# _post) and the banded rescue DP built on it (src/rescue_band.h) must leave the
+# alignment output byte-identical to the full-window rescue. Every leg is the
+# SAME binary; only the escape hatches differ:
 #
-#   BWA3_RESCUE_PRUNE=0  -> every rescue window computed in full (reference)
-#   default              -> proven failures dropped (B1), windows narrowed to a
-#                           proven hull (B2), N windows kept whole (candidate)
+#   BWA3_RESCUE_PRUNE=0 BWA3_RESCUE_BAND=0
+#                        -> every rescue window computed in full by kswv (reference)
+#   BWA3_RESCUE_BAND=0   -> proven failures dropped (B1), windows narrowed to a
+#                           proven hull (B2), N windows kept whole; kswv on the hull
+#   default              -> as above, plus the banded DP where the cost model picks it
+#   BWA3_RESCUE_BAND_COST=100000000
+#                        -> the cost gate opened: every B2 hull that can be banded is,
+#                           so the banded kernel runs whatever the cost model says
 #
 # The unit tests pin the filter's decisions against ksw_align2; this pins the
 # plumbing around them, which no unit test reaches: the not-enqueued sentinel
@@ -23,10 +28,11 @@
 # the reference (proven failures), and some with an N (full windows). It runs at
 # -t 1 and -t 4.
 #
-# Pruning runs only on aarch64 (src/bwamem_pair.cpp rescue_prune_on). There,
-# BWA3_RESCUE_PRUNE_STATS=1 must show proven failures, narrowed windows and fewer
-# rows kept than examined, or the identity would be vacuous; elsewhere the two
-# legs take the same path and the non-vacuity check is reported as skipped.
+# Pruning and banding run only on aarch64 (src/bwamem_pair.cpp rescue_prune_on,
+# rescue_band_enabled). There, BWA3_RESCUE_PRUNE_STATS=1 must show proven
+# failures, narrowed windows, fewer rows kept than examined and (with the gate
+# opened) banded parents, or the identity would be vacuous; elsewhere every leg
+# takes the same path and the non-vacuity check is reported as skipped.
 #
 # Inputs:
 #   BWA_MEM3 — path to the bwa-mem3 binary under test
@@ -120,14 +126,19 @@ run_leg() { # $1 = threads, $2 = output stem, rest = env assignments
     [ "$(grep -cv '^@' "$stem.sam" || true)" -gt 0 ] || fail "leg $stem produced no alignment records"
 }
 
+LEGS="hull prune band"
 for t in 1 4; do
-    run_leg "$t" "full.t$t" BWA3_RESCUE_PRUNE=0
+    run_leg "$t" "full.t$t" BWA3_RESCUE_PRUNE=0 BWA3_RESCUE_BAND=0
+    run_leg "$t" "hull.t$t" BWA3_RESCUE_BAND=0
     run_leg "$t" "prune.t$t" BWA3_RESCUE_PRUNE_STATS=1
-    if ! cmp -s "full.t$t.sam" "prune.t$t.sam"; then
-        echo "FAIL: pruned rescue differs from full-window rescue at -t $t:" >&2
-        diff "full.t$t.sam" "prune.t$t.sam" | head -20 >&2
-        exit 1
-    fi
+    run_leg "$t" "band.t$t" BWA3_RESCUE_PRUNE_STATS=1 BWA3_RESCUE_BAND_COST=100000000
+    for leg in $LEGS; do
+        if ! cmp -s "full.t$t.sam" "$leg.t$t.sam"; then
+            echo "FAIL: rescue leg '$leg' differs from the full-window rescue at -t $t:" >&2
+            diff "full.t$t.sam" "$leg.t$t.sam" | head -20 >&2 || true
+            exit 1
+        fi
+    done
 done
 
 stats="$(grep '^\[RESCUE_PRUNE\]' prune.t1.err || true)"
@@ -147,4 +158,10 @@ fi
 [ "$b2" -gt 0 ] || fail "no narrowed (B2) rescue in the fixture: $stats"
 [ "$rows_kept" -lt "$rows_in" ] || fail "pruning kept every row: $stats"
 
-echo "PASS: rescue_prune_identity (pruned == full-window rescue at -t 1 and -t 4; $stats)"
+bstats="$(grep '^\[RESCUE_BAND\]' band.t1.err || true)"
+[ -n "$bstats" ] || fail "BWA3_RESCUE_PRUNE_STATS=1 printed no [RESCUE_BAND] line"
+bfield() { printf '%s\n' "$bstats" | tr ' ' '\n' | sed -n "s/^$1=//p"; }
+parents=$(bfield banded_parents)
+[ "${parents:-0}" -gt 0 ] || fail "no banded rescue parent with the cost gate opened: $bstats"
+
+echo "PASS: rescue_prune_identity (hull, pruned and banded == full-window rescue at -t 1 and -t 4; $stats; $bstats)"

@@ -211,6 +211,12 @@ which the insert-size estimate, and so rescue and pairing, depend on).
   `--rescue-kmer`, windows or mates with an N, and the 16-bit path keep the full
   window. It runs on aarch64 only, where a NEON filter carries it; elsewhere the
   full window is always computed.
+- **Banded rescue DP (NEON).** For a narrowed job, the rescue DP runs only
+  inside the diagonal bands of the 5-mer components that can reach the
+  threshold, 16 bands per vector, and the job's score, end positions and
+  suboptimal score are reassembled from the bands' per-row maxima. A per-job
+  cost model keeps the full hull when banding would not pay. Same scope as the
+  pruning (default scoring, 8-bit, no `--meth`, aarch64 only).
 - **11-op 8-bit rescue cell (NEON).** When the cost of opening a gap (open plus
   extend, `-O` + `-E`) is the same for insertions and deletions and fits a byte,
   and no gap cost is negative, the 8-bit rescue kernel builds each cell from the
@@ -220,10 +226,16 @@ which the insert-size estimate, and so rescue and pairing, depend on).
 
 | Variable | Effect |
 |---|---|
-| `BWA3_RESCUE_PRUNE=0` | Turn off exact rescue pruning (the reference path for identity checks): no window is dropped or narrowed by it. `--rescue-kmer`, which narrows windows on its own, is unaffected. Default on where pruning runs. |
-| `BWA3_RESCUE_PRUNE_MAX_HITS=<n>` | Keep the full window when the mate and window share more than `n` exact 5-mer hits, where the filter would cost more than it saves (default 400). A malformed or negative value, or one above 2147483647, is reported to stderr and the default used. Output is identical at every value. |
-| `BWA3_RESCUE_PRUNE_STATS=1` | Print, once at exit, how the filter decided (`[RESCUE_PRUNE] jobs=… full=… b1=… b2=… rows_in=… rows_kept=…`): jobs filtered, and of them how many kept the full window, were proven to fail (`b1`) or were narrowed (`b2`), with the window rows before and after. Measurement only; output is unchanged. |
+| `BWA3_RESCUE_PRUNE=0` | Turn off exact rescue pruning: no window is dropped, narrowed or banded by it. `--rescue-kmer`, which narrows windows on its own, is unaffected. With `BWA3_RESCUE_BAND=0`, the reference path for identity checks. Default on where pruning runs. |
+| `BWA3_RESCUE_PRUNE_MAX_HITS=<n>` | Keep the full window when the mate and window share more than `n` exact 5-mer hits, where the filter would cost more than it saves (default 1000 where the banded DP runs, 400 otherwise). Output is identical at every value. |
+| `BWA3_RESCUE_PRUNE_STATS=1` | Print, once at exit, how the filter decided (`[RESCUE_PRUNE] jobs=… full=… b1=… b2=… rows_in=… rows_kept=… filter_s=… kswv_pass0_s=… band_pass0_s=… kswv_pass1_s=…`): jobs filtered, and of them how many kept the full window, were proven to fail (`b1`) or were narrowed (`b2`), with the window rows before and after and the thread-summed seconds of each rescue stage; and how the banded DP resolved (`[RESCUE_BAND] banded_parents=… …`). Measurement only; output is unchanged. |
+| `BWA3_RESCUE_BAND=0` | Run every narrowed job through the rescue kernel on its whole hull instead of banded (and the hit gate back to 400). Default on where banding runs. |
+| `BWA3_RESCUE_BAND_COST=<pct>` | Band a narrowed job only when its band cells cost less than `pct` % of the hull's (default 85). Output is identical at every value. |
+| `BWA3_RESCUE_BAND_R2=0` | Run the rare second round (a first round that cannot prove its result final) through the rescue kernel on the hull instead of banded. Output is identical either way. |
+| `BWA3_RESCUE_BAND_TIGHT=<n>` | Threshold offset of the first-round band for a lone near-perfect primary (default 8; 0 disables). Output is identical at every value. |
 | `BWA3_RESCUE_FSCAN=0` | Use the original 13-op 8-bit rescue cell on NEON. Output is identical either way. |
+
+Every integer knob above takes a non-negative decimal integer of at most 2147483647, with no sign or surrounding whitespace; anything else is reported to stderr and the default used.
 
 ---
 
