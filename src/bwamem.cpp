@@ -4030,6 +4030,40 @@ static inline void mem_prefetch_cigar_ref(const bntseq_t *bns, const uint8_t *pa
     __builtin_prefetch(&pac[pf], 0, 0);
 }
 
+/* Prefetch the pac[] lines mate rescue will read for pair `i` (reads i, i+1).
+ * mem_matesw_batch_pre fetches, for each read's anchors, one window per
+ * orientation r: [rb + low_r, rb + high_r + l_mate] or [rb - high_r - l_mate,
+ * rb - low_r] in doubled coordinates, all on the anchor's strand. So every
+ * window of the top anchor lies in [rb - H - l_mate, rb + H + l_mate] with H the
+ * largest high over usable orientations. Those windows are random DRAM misses
+ * (bns_get_seq_into's hottest instructions are its first pac loads), so hint
+ * them a couple of pairs ahead. Only a[0] is covered; secondary anchors within
+ * pen_unpaired are rare. Pure hints: byte-identical. */
+static inline void mem_prefetch_rescue_pac(const bntseq_t *bns, const uint8_t *pac,
+                                           const mem_pestat_t pes[4],
+                                           const bseq1_t *seqs, const mem_alnreg_v *regs)
+{
+    int64_t H = -1;
+    for (int r = 0; r < 4; ++r)
+        if (!pes[r].failed && pes[r].high > H) H = pes[r].high;
+    if (H < 0) return;
+    const int64_t l_pac = bns->l_pac;
+    for (int k = 0; k < 2; ++k) {
+        if (regs[k].n == 0) continue;
+        const int64_t rb = regs[k].a[0].rb, pad = H + seqs[!k].l_seq;
+        int64_t b = rb - pad, e = rb + pad;
+        /* stay on rb's strand, as the rescue windows do */
+        if (rb < l_pac) { if (b < 0) b = 0; if (e > l_pac) e = l_pac; }
+        else { if (b < l_pac) b = l_pac; if (e > l_pac << 1) e = l_pac << 1; }
+        /* <= 64 lines: a wider span means a loose insert-size model, where
+         * hints would cost more than the misses they hide */
+        if (b >= e || e - b > 64 * 64 * 4) continue;
+        if (b >= l_pac) { const int64_t fb = (l_pac << 1) - e; e = (l_pac << 1) - b; b = fb; }
+        for (int64_t x = (b >> 2) & ~(int64_t)63, xe = (e - 1) >> 2; x <= xe; x += 64)
+            __builtin_prefetch(pac + x, 0, 1);
+    }
+}
+
 static void worker_sam(void *data, int seqid, int batch_size, int tid)
 {
     worker_t *w = (worker_t*) data;
@@ -4047,8 +4081,16 @@ static void worker_sam(void *data, int seqid, int batch_size, int tid)
         // uint64_t tim = __rdtsc();
         int32_t maxRefLen = 0, maxQerLen = 0;
         int32_t gcnt = 0;
+        /* Rescue windows of pair i + RESCUE_PF_DIST are hinted while pair i
+         * runs (see mem_prefetch_rescue_pac). */
+        const int RESCUE_PF_DIST = 2;
+        const int rescue_pf = !(w->opt->flag & MEM_F_NO_RESCUE);
         for (int i=start; i< end; i+=2)
         {
+            if (rescue_pf && i + 2 * RESCUE_PF_DIST < end)
+                mem_prefetch_rescue_pac(mem_aln_bns(w), mem_aln_pac(w), w->pes,
+                                        &w->seqs[i + 2 * RESCUE_PF_DIST],
+                                        &w->regs[i + 2 * RESCUE_PF_DIST]);
             mem_sam_pe_batch_pre(w->opt, mem_aln_bns(w),
                                  mem_aln_pac(w), w->pes,
                                  (w->n_processed >> 1) + pos++,   // check!
