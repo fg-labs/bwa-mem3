@@ -303,15 +303,23 @@ static bool rescue_prune_enabled()
     static const bool on = rescue_env_flag("BWA3_RESCUE_PRUNE");
     return on;
 }
-/* Default 400 for the hull path; 1000 when banding is on and the NEON filter runs (minsc == 19):
- * banding turns more of the pruned windows into savings, which pays for the filter on the denser
- * windows (measured locally: best of {400, 1000, 3000, 10^4, 10^9}). The scalar filter (any other
- * minsc) is too slow on dense windows for that, so it keeps 400. */
+/* Default 400 for the hull path. On aarch64, 1000 when banding is on and the NEON filter runs
+ * (minsc == 19): banding turns more of the pruned windows into savings, which pays for the filter
+ * on the denser windows (measured locally: best of {400, 1000, 3000, 10^4, 10^9}). The scalar
+ * filter (any other minsc) is too slow on dense windows for that, so it keeps 400. On x86 400
+ * with banding too: the x86 kswv kernels are cheap enough that the extra filter work on dense
+ * windows does not pay (prune + band, wall vs 1000: Zen 3 AVX2 wgs-5M 73.57 vs 74.52 s, wes-5M
+ * 37.65 vs 38.57 s; Zen 5 AVX-512 26.73 vs 27.53 s wgs). */
 static int rescue_prune_max_hits(int minsc)
 {
     static const int env = rescue_env_int("BWA3_RESCUE_PRUNE_MAX_HITS", -1);
     if (env >= 0) return env;
+#if defined(__aarch64__)
     return rescue_band_enabled() && minsc == 19 ? 1000 : 400;
+#else
+    (void)minsc;
+    return 400;
+#endif
 }
 /* BWA3_RESCUE_PRUNE_STATS=1 prints the filter's decisions at exit (non-vacuity check for the
  * identity A/B: identical output must come with a nonzero number of pruned rows), and the number of
@@ -357,11 +365,28 @@ static bool rescue_dedup_skip_enabled()
 
 /* The pruning lemma is derived for the default scoring only (a=1, b=4, gap open 6 / extend 1),
  * the 8-bit kernel path, and non-meth rescue; everything else runs the full window. */
+/* Pruning is on for this run: the toggle, and on x86 the minsc the SIMD filter covers. x86 prunes
+ * only at minsc == 19: at any other minsc the scalar filter runs without the pass-0 band, and the
+ * x86 kswv kernels are cheap enough that it costs more than it saves (prune on vs off, wall: Zen 5
+ * AVX-512 +3 to +13 % at -k 10 / 15 / 25 / 32 on wgs-5M and wes-5M; Zen 3 AVX2 +1 to +6 % at
+ * -k 25). Everything keyed on pruning (the length sort, the narrow-offset record in _pre and its
+ * read in _post) uses this, so a run it turns off takes exactly the prune-off path. Pass-1 banding
+ * does not depend on pruning. */
+static bool rescue_prune_on(const mem_opt_t *opt)
+{
+#if defined(__aarch64__)
+    (void)opt;
+    return rescue_prune_enabled();
+#else
+    return rescue_prune_enabled() && opt->min_seed_len * opt->a == 19;
+#endif
+}
+
 static bool rescue_prune_applies(const mem_opt_t *opt, int xtra)
 {
     /* minsc >= 5: a local alignment without an exact 5-mer match scores <= 4 under this scoring,
      * so below 5 the "no component -> proven failure" step (B1) would be unsound. */
-    return rescue_prune_enabled() && !opt->rescue_kmer && !opt->meth_mode && (xtra & KSW_XBYTE)
+    return rescue_prune_on(opt) && !opt->rescue_kmer && !opt->meth_mode && (xtra & KSW_XBYTE)
         && opt->a == 1 && opt->b == 4 && opt->o_del == 6 && opt->o_ins == 6
         && opt->e_del == 1 && opt->e_ins == 1 && opt->min_seed_len * opt->a >= 5;
 }
@@ -1139,7 +1164,7 @@ int mem_sam_pe_batch(const mem_opt_t *opt, mem_cache *mmc,
                           opt->a, -1*opt->b, nthreads,
                           maxRefLen, maxQerLen);
 
-    if (opt->rescue_kmer || rescue_prune_enabled()) matesw_sort_partitions_by_len(seqPairArray, pcnt8, pcnt);
+    if (opt->rescue_kmer || rescue_prune_on(opt)) matesw_sort_partitions_by_len(seqPairArray, pcnt8, pcnt);
     /* Banded parents first (stable, so the kswv remainder keeps its length sort). */
     const int64_t n_banded = rescue_band_enabled() ? rescue_band_batch().partition(seqPairArray, (int)pcnt8) : 0;
 
@@ -1862,7 +1887,7 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                 /* gar[gcnt+r] points at this rescue's single enqueued regid. */
                 if (hi == 0) gar[gcnt + r] = pcnt;
                 sp.regid = pcnt;
-                if (opt->rescue_kmer || rescue_prune_enabled()) {   /* record narrow offset by regid for _post */
+                if (opt->rescue_kmer || rescue_prune_on(opt)) {   /* record narrow offset by regid for _post */
                     if ((int)g_rescue_narrow_off.size() <= pcnt)
                         g_rescue_narrow_off.resize(pcnt + 1024, 0);
                     g_rescue_narrow_off[pcnt] = narrow_ob;
@@ -2007,7 +2032,7 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
             /* --rescue-kmer: apply the same narrowing offset _pre stored for this
              * regid, so aln.tb/te map against the narrowed window start (batched
              * pairs only; index==-1 scalar-fallback pairs were never narrowed). */
-            if ((opt->rescue_kmer || rescue_prune_enabled()) && index >= 0)
+            if ((opt->rescue_kmer || rescue_prune_on(opt)) && index >= 0)
                 rb += g_rescue_narrow_off[index];
             if (index == MATESW_GAR_PROVEN_FAIL) {
                 /* Proven score < min_seed_len: the gate below fails exactly as for a real SW. */

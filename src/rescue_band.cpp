@@ -28,11 +28,7 @@ static const uint8_t RB_QPAD = 0x40;   // query pad code (see the NEON kernel se
 
 bool rescue_band_enabled()
 {
-#if RB_X86
-    /* x86: opt in with BWA3_RESCUE_BAND=1 until the x86 cost gates are tuned */
-    static const bool on = rescue_env_opt_in("BWA3_RESCUE_BAND");
-    return on;
-#elif RB_HAVE_SIMD
+#if RB_HAVE_SIMD
     static const bool on = rescue_env_flag("BWA3_RESCUE_BAND");
     return on;
 #else
