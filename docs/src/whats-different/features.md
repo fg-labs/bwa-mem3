@@ -468,7 +468,7 @@ Measured single-thread on hg38 (HG002 1M PE WGS, non-emptying filter):
   flat across `30`–`50`, because all-short chains are now protected.
 - The previously-documented high-error F1 cliff and the cross-architecture speed
   figures were measured under the *emptying* behavior; both need a fresh
-  [bwa-mem3-bench](../related-projects/bwa-mem3-bench.md) run under the
+  [benchmark](../performance/benchmarks.md) run under the
   non-emptying filter. Indels and structural variants were never a
   contraindication (an indel leaves two still-long exact segments the fast-path
   handles).

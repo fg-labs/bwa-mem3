@@ -275,7 +275,7 @@ threads; SIMD tier avx2; built with clang-19; index warm in the page cache;
 compared against the default path (transparent huge pages, 2 MB) on the same host
 and input ([PR #405](https://github.com/fg-labs/bwa-mem3/pull/405); the
 reproducible, multi-architecture throughput methodology this follows is
-[bwa-mem3-bench](../related-projects/bwa-mem3-bench.md)). Both runs used matching
+described under [Benchmarks](../performance/benchmarks.md)). Both runs used matching
 `-t 32` and no explicit `-K`, i.e. the default per-batch size (`chunk_size` =
 10 Mbp per thread), and differed only by `--huge-pages`, so the batch boundaries
 were identical:

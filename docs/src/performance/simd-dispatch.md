@@ -45,7 +45,7 @@ Tier detection runs once during `main()`. Subsequent kernel calls pay
 a single indirect-call hop through a factory vtable (or an
 `extern "C"` wrapper for free-function `ksw_*` kernels) — about
 0.3 ns per call after BTB warm-up, well below run-to-run noise on the
-[bwa-mem3-bench](https://github.com/fg-labs/bwa-mem3-bench) corpus.
+[benchmark](benchmarks.md) corpus.
 
 If the host CPU does not meet the build's compile-time SIMD floor
 (`BASELINE_ARCH`, default `avx2` since PR #84), the binary exits with

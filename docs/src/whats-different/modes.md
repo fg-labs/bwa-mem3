@@ -103,7 +103,7 @@ with the default. It is worth understanding along **two separate axes**:
   high-depth amplicon panel** — and moves `MAPQ`, `XS`, and secondary alignments on more.
 
 All the `--fast` figures on this page come from one auditable scope: the
-[bwa-mem3-bench](../related-projects/bwa-mem3-bench.md) release-validation matrix — five real
+[benchmark](../performance/benchmarks.md) release-validation matrix — five real
 cells (`wgs-5M` for WGS, `panel-twist-5M` for the high-depth amplicon panel, and `wes-5M` at
 5 M reads each, plus `hic-1M` and `sbx-1M` at 1 M reads), run across every SIMD tier bwa-mem3
 ships (AVX2 `c6a`, AVX-512 `c7a`/`c7i`,

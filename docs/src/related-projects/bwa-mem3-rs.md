@@ -33,6 +33,6 @@ or output format are coordinated with bwa-mem3-rs to keep the bindings current.
 
 **See also:**
 [fgumi](fgumi.md) ·
-[bwa-mem3-bench](bwa-mem3-bench.md) ·
+[Benchmarks](../performance/benchmarks.md) ·
 [Aligning short reads (mem)](../user-guide/aligning.md) ·
 [Developer Guide — Contributing](../developer-guide/contributing.md)

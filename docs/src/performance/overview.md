@@ -1,6 +1,6 @@
 # Performance Overview
 
-Performance claims in this section are benchmarked, not asserted. The canonical source of truth for benchmark methodology, hardware configurations, and current numbers is [bwa-mem3-bench](https://github.com/fg-labs/bwa-mem3-bench), a reproducible benchmarking harness that runs across AWS Batch architectures (x86 AVX2, AVX-512, ARM Graviton). Consult that repository before drawing conclusions from isolated anecdotal timings.
+Performance claims in this section are benchmarked, not asserted. The canonical source of truth for benchmark methodology, hardware configurations, and current numbers is the [benchmark suite](benchmarks.md), a reproducible benchmarking harness that runs across AWS architectures (x86 AVX2, AVX-512, ARM Graviton). Consult its published results before drawing conclusions from isolated anecdotal timings.
 
 ## What drives bwa-mem3's performance
 
@@ -14,7 +14,7 @@ run is dominated by seeding and FM-index walks; a long-read or high-error run
 spends most of its cycles in the Smith–Waterman kernels; a many-sample run can be
 bottlenecked on header ingestion or decompression. The drivers below group by
 *what part of the machine or algorithm they fix*. For real, reproducible numbers
-on specific hardware, always defer to [bwa-mem3-bench](https://github.com/fg-labs/bwa-mem3-bench)
+on specific hardware, always defer to the [published benchmarks](benchmarks.md)
 rather than any single anecdote here.
 
 For the full per-change list with PR links and status, see
@@ -133,7 +133,7 @@ PGO is not applied to the default `make` output. See [PGO build](pgo.md).
 
 ## Reference numbers across architectures
 
-Wall-time medians from [bwa-mem3-bench](https://github.com/fg-labs/bwa-mem3-bench) at SHA `a02fcb4` (2026-06-20), 5 reps per cell, t≈16, hg38, paired-end 150 bp:
+Wall-time medians from the [benchmark suite](benchmarks.md) at SHA `a02fcb4` (2026-06-20), 5 reps per cell, t≈16, hg38, paired-end 150 bp:
 
 | sample | c6a (x86-64, AVX2, Zen3) | c7a (x86-64, AVX-512, Zen4) | c7i (x86-64, AVX-512, SPR) | c7g (arm64, NEON, Graviton3) | c8g (arm64, NEON, Graviton4) |
 |---|---:|---:|---:|---:|---:|
@@ -147,7 +147,7 @@ Release-to-release speedups are deliberately uneven across this grid. A workload
 
 ## Benchmarking responsibly
 
-Alignment throughput is sensitive to read length, error rate, reference size, thread count, CPU architecture, NUMA topology, and whether the index is cold (in-kernel page cache) or warm. The [bwa-mem3-bench](https://github.com/fg-labs/bwa-mem3-bench) harness controls for these variables by running standardized workloads on defined instance types. If you need numbers for a procurement or publication decision, run the harness against your target hardware.
+Alignment throughput is sensitive to read length, error rate, reference size, thread count, CPU architecture, NUMA topology, and whether the index is cold (in-kernel page cache) or warm. The [benchmark](benchmarks.md) harness controls for these variables by running standardized workloads on defined instance types. If you need numbers for a procurement or publication decision, run the harness against your target hardware.
 
 ---
 
@@ -156,4 +156,4 @@ Alignment throughput is sensitive to read length, error rate, reference size, th
 [PGO build](pgo.md) ·
 [Optimization checklist](../best-practices/optimization-checklist.md) ·
 [What's Different — Performance improvements](../whats-different/performance.md) ·
-[bwa-mem3-bench](../related-projects/bwa-mem3-bench.md)
+[Benchmarks](benchmarks.md)

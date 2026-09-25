@@ -155,8 +155,7 @@ wall-time gain — ~1.5 % on a 5 M-read WGS slice (HG00096/hg38, AMD Zen3, avx2
 tier, `-t 32` with no explicit `-K`, so the default per-batch size — `chunk_size`
 = 10 Mbp per thread — applied identically to both runs, index warm in the page
 cache; the two runs differed only by `--huge-pages`;
-[PR #405](https://github.com/fg-labs/bwa-mem3/pull/405), reproducible method in
-[bwa-mem3-bench](../related-projects/bwa-mem3-bench.md)). The alignment records
+[PR #405](https://github.com/fg-labs/bwa-mem3/pull/405), reproducible method under [Benchmarks](../performance/benchmarks.md)). The alignment records
 stay byte-identical (page size does not change alignments); only the `@PG`
 `CL:` header field differs, since it records the `--huge-pages` option on the
 command line. Reserve some 1 GB hugepages on the host, then pass `--huge-pages` —

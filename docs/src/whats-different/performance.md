@@ -13,7 +13,7 @@ For a reader-friendly grouping of *what drives the speedup* — by machine
 architecture, hot-path rewrite, indexing, allocation/I/O, and build-time — see
 [Performance → Overview](../performance/overview.md). For current benchmark
 numbers across architectures and workloads, see
-[bwa-mem3-bench](https://github.com/fg-labs/bwa-mem3-bench), the canonical
+[Benchmarks](../performance/benchmarks.md), the canonical
 source of truth for benchmark methodology and results.
 
 ## Lockstep SMEM batching (PR #33)
@@ -137,7 +137,7 @@ rebased onto `main`. It incorporates improvements across five subsystems:
 On the smoke-1M workload (1M PE 150 bp reads, hg38, Graviton3 r7g.4xlarge, 16
 threads, warm page cache), this PR contributed the largest single-step wall
 time reduction in the `main` branch's performance history. Benchmark details
-are maintained at [bwa-mem3-bench](https://github.com/fg-labs/bwa-mem3-bench).
+are maintained under [Benchmarks](../performance/benchmarks.md).
 
 ---
 
@@ -173,4 +173,4 @@ seeds ([#156](https://github.com/fg-labs/bwa-mem3/pull/156), merged).
 [Performance → PGO build](../performance/pgo.md) ·
 [Correctness fixes](correctness.md) ·
 [Build & infrastructure](build-infra.md) ·
-[bwa-mem3-bench](https://github.com/fg-labs/bwa-mem3-bench)
+[Benchmarks](../performance/benchmarks.md)

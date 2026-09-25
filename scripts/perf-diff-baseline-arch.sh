@@ -14,9 +14,9 @@
 #
 # Modes:
 #   time    — wrap each run with `tricorder` (fg-labs/tricord). Same tool
-#             the bwa-mem3-bench Snakemake workflow uses, so the wall /
-#             cpu_time / max_rss / io numbers are directly comparable to
-#             benchmark.db rows. Fast (one invocation per rep). Default.
+#             the benchmark suite uses, so the wall / cpu_time / max_rss /
+#             io numbers are directly comparable to its results. Fast (one
+#             invocation per rep). Default.
 #   record  — `perf record -F 999 -g --call-graph dwarf` × 1 rep per
 #             variant. Used for finding individual hot functions where one
 #             variant beats another. For Phase 3 pragma-target candidate

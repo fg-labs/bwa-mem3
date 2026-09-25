@@ -242,8 +242,8 @@ Caveats:
   too (`@PG` excluded):
 
   - **GATK hg38 — 314,862,612 records, 42 cells, 0 differing**, produced by the benchmark
-    harness in [fg-labs/bwa-mem3-bench#47](https://github.com/fg-labs/bwa-mem3-bench/pull/47),
-    which carries the per-cell breakdown. Seven datasets
+    harness (the per-cell breakdown is linked from
+    [Benchmarks](../performance/benchmarks.md#earlier-one-off-measurements)). Seven datasets
     (`sim-wgs-place` 10,724,652 · `sim-wgs-vars` 10,163,754 · `wes-5M` 10,056,288 · `wgs-5M`
     10,030,558 · `panel-twist-5M` 8,100,270 · `hic-1M` 2,381,418 · `sbx-1M` 1,020,162 records
     per cell) × six hosts, `-K 160000000` pinned on both sides. The hosts cover every SIMD
@@ -354,7 +354,7 @@ slice, and a byte-identical complete alignment-record stream (`MQ:i`/`HN:i` stri
 supersedes the `wes-5M` and `wgs-5M` rows below. `panel-twist-5M` has been re-run only for the
 cross-architecture check, and `smoke-1M` has not been re-run at all, so those two figures still
 stand as written. We ran an empirical concordance check with
-[bwa-mem3-bench](https://github.com/fg-labs/bwa-mem3-bench) at commit `a02fcb4`, comparing
+the [benchmark suite](../performance/benchmarks.md) at commit `a02fcb4`, comparing
 bwa-mem3 against upstream `bwa-mem2` v2.2.1 on x86 hosts across whole-genome, whole-exome,
 and panel workloads. **Primary-alignment concordance** — reference name, position, CIGAR,
 MAPQ, and placement flags compared per read end — was:
@@ -552,7 +552,7 @@ Accuracy on an easy simulated profile (holodeck, ~94.4 % F1) is flat relative to
 
 ## Declared divergence catalog
 
-The divergences described above are tracked as a structured registry in [bwa-mem3-bench](https://github.com/fg-labs/bwa-mem3-bench) (`docs/expected-divergences.yaml`). Each carries a per-sample concordance-drift budget that the benchmark gates against on every run — a new bwa-mem3 build that drifts beyond its budget fails CI rather than silently shipping a regression. The table below is generated from that registry; do not edit it by hand (see [bwa-mem3-bench → Per-release concordance history](../related-projects/bwa-mem3-bench.md) for how it is regenerated).
+The divergences described above are tracked as a structured [registry](../performance/benchmarks.md#release-validation) (`expected-divergences.yaml`). Each carries a per-sample concordance-drift budget that the benchmark gates against on every run — a new bwa-mem3 build that drifts beyond its budget fails CI rather than silently shipping a regression. The table below is generated from that registry; do not edit it by hand (see [Benchmarks → Per-release concordance history](../performance/benchmarks.md#per-release-concordance-history) for how it is regenerated).
 
 > **⚠️ This catalog predates the 0.7.1 parity restoration and is pending regeneration.**
 > Its `FG-PRIMARY-DRIFT` row still attributes primary drift to [#123](https://github.com/fg-labs/bwa-mem3/pull/123)
@@ -574,7 +574,7 @@ The divergences described above are tracked as a structured registry in [bwa-mem
 > un-regenerated registry, where `samples = all` and `budget_% = 0.0000` mean this class
 > contributes nothing to the *primary*-concordance drift budget — they are not a validated
 > zero-tolerance gate across every sample.
-> The registry in `bwa-mem3-bench` (`docs/expected-divergences.yaml`, which still carries
+> The [divergence registry](../performance/benchmarks.md#release-validation) (which still carries
 > `pr: TBD`, `samples: []`, and `expected_drift_pct: 0.0` for this entry) must be updated and
 > re-run against a 0.7.1 build and its budgets tightened. Until that lands, only the
 > `FG-SUPP-ADDITIONS` row's `pr` and `summary` cells reflect current behavior — they are the

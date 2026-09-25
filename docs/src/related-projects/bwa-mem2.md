@@ -58,5 +58,5 @@ minimal and to upstream as many fixes as practical.
 **See also:**
 [What's Different from bwa-mem2](../whats-different/overview.md) ·
 [Fork changes vs. upstream](../reference/pr-catalog.md) ·
-[bwa-mem3-bench](bwa-mem3-bench.md) ·
+[Benchmarks](../performance/benchmarks.md) ·
 [Citation](../reference/citation.md)

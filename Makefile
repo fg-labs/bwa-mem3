@@ -1535,7 +1535,7 @@ lto-build:
 	# EBADF. This is a known GNU make 4.3 limitation;
 	# `--jobserver-style=fifo` (GNU make 4.4+) would survive the chain by
 	# using a named FIFO instead of FDs, but Debian Bookworm — and therefore
-	# the bwa-mem3-bench Dockerfile's base image — ships make 4.3.
+	# the benchmark suite's Docker base image — ships make 4.3.
 	#
 	# Tried and rejected:
 	#   - `-flto=auto`: still attempts jobserver negotiation on GCC 12.
