@@ -1248,8 +1248,6 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                           kswr_t **myaln, mem_cache *mmc,
                           int32_t &gcnt, int tid)
 {
-    extern void mem_reg2sam(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
-                            bseq1_t *s, mem_alnreg_v *a, int extra_flag, const mem_aln_t *m);
     extern char **mem_gen_alt(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
                               const mem_alnreg_v *a, int l_query, const char *query,
                               int **out_hn, const char *meth_orig_query);
@@ -1355,8 +1353,12 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
     if (!(opt->flag & MEM_F_NOPAIRING) && which[0] >= 0 && which[1] >= 0 &&
         h[0].rid == h[1].rid && h[0].rid >= 0)
         extra_flag |= mem_proper_pair_extra_flag(opt, bns->l_pac, a, which, pes);
-    mem_reg2sam(opt, bns, pac, &s[0], &a[0], 0x41|extra_flag, &h[1]);
-    mem_reg2sam(opt, bns, pac, &s[1], &a[1], 0x81|extra_flag, &h[0]);
+    // When which[i] >= 0, h[i] is already a[i].a[which[i]] converted; the emit
+    // reuses it rather than running mem_reg2aln (and its global alignment) on
+    // that region again. When which[i] < 0, h[i] is the unmapped record and
+    // nothing is reused.
+    mem_reg2sam_anchored(opt, bns, pac, &s[0], &a[0], 0x41|extra_flag, &h[1], which[0], &h[0]);
+    mem_reg2sam_anchored(opt, bns, pac, &s[1], &a[1], 0x81|extra_flag, &h[0], which[1], &h[1]);
     if (strcmp(s[0].name, s[1].name) != 0)
         err_fatal(__func__, "paired reads have different names: \"%s\", \"%s\"\n",
                   s[0].name, s[1].name);
