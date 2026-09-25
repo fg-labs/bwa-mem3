@@ -91,6 +91,74 @@ Reasons to opt out:
 > `USE_MIMALLOC=1` is the default. Opt-out is not recommended for production
 > workloads — mimalloc measurably reduces wall time on multi-threaded runs.
 
+## Page purging (`MIMALLOC_PURGE_DELAY`)
+
+mimalloc returns freed memory to the operating system once it has sat unused
+for its *purge delay* (1000 ms by default in mimalloc v3). `bwa-mem3 mem` frees
+and reallocates the same large per-batch buffers on every batch, so with the
+stock delay those pages are handed back and then page-faulted straight back in
+by the next batch.
+
+`bwa-mem3 mem` therefore sets the purge delay to **-1 (never purge)**, and
+reports the value in effect on stderr:
+
+```text
+[M::main] mimalloc purge delay: -1 ms (-1 = never purge; set MIMALLOC_PURGE_DELAY to override)
+```
+
+Setting `MIMALLOC_PURGE_DELAY` yourself always wins, for example to let RSS
+shrink between batches on a memory-constrained host. mimalloc's legacy name for
+the same option, `MIMALLOC_RESET_DELAY`, is honoured too. mimalloc matches both
+names case-insensitively, so `mimalloc_purge_delay` works as well, and gets the
+same warning below.
+
+```bash
+MIMALLOC_PURGE_DELAY=1000 bwa-mem3 mem ref.fa r1.fq r2.fq > out.sam  # mimalloc's stock behaviour
+```
+
+Give the delay as a whole number of milliseconds (or `-1` for never). mimalloc
+reads the value itself, and two kinds of input do not mean what they look like:
+
+- **Boolean words and empty values are accepted as 0 or 1.** `off`, `no` and
+  `false` mean 0 (purge immediately, the opposite of the default); `on`, `yes`,
+  `true` and an empty value mean 1 ms.
+- **Anything else that is not an integer is ignored**, for example `1s` or
+  `250ms`. `mem` then keeps its -1 rather than mimalloc's own 1000 ms, and warns:
+
+  ```text
+  [W::main] ignoring MIMALLOC_PURGE_DELAY='1s': mimalloc could not parse it; give whole milliseconds, or -1 to never purge
+  ```
+
+Only `mem` changes the default; `index` and the other subcommands run with
+mimalloc's own. A `USE_MIMALLOC=0` build has no purge delay and prints no line,
+and a build whose mimalloc is linked but not overriding `malloc` says the delay
+has no effect.
+
+Measured on a 5 M-read-pair short-read paired-end WGS slice (HG00096, hg38);
+host Graviton4, 32 vCPU; SIMD tier neon; built with clang-19; index warm in the
+page cache; 2 reps per arm, alternated, wall-time rep-to-rep spread ≤ 0.14 %.
+Never purging against the stock 1000 ms delay:
+
+| Threads | Wall time | CPU time | System CPU | Peak RSS |
+|--------:|----------:|---------:|-----------:|---------:|
+| 32 | −0.6 % | ≈ flat (−0.2 %) | −28 % | +0.5 GB (15.4 → 15.9 GB) |
+| 8  | −0.5 % | ≈ flat (−0.4 %) | −41 % | +0.3 GB (14.0 → 14.3 GB) |
+
+The CPU-time deltas are too small to resolve with 2 reps; the wall-time and
+system-CPU deltas are well outside the spread.
+
+On the workload above (same slice, Graviton4, neon tier, clang-19 build), the
+SAM output was **byte-identical** between never purging and the stock 1000 ms
+delay, and the CI regression (phix-derived reads, x86-64 Linux, avx2 build)
+checks the same between never purging and purging immediately. Other hosts and
+modes are not measured, but none is expected to differ: the purge delay only
+decides when free memory goes back to the operating system, never what is
+computed. The cost is the higher peak RSS in the table, since freed pages stay
+resident for reuse. That cost has been measured only for the workload above:
+x86 hosts, `--meth`, the long-read presets (`-x pacbio`, `-x ont2d`) and
+`--hic` have not been measured, so set `MIMALLOC_PURGE_DELAY=1000` if peak RSS
+matters more than the wall-time gain there.
+
 ## Large pages for the index (Linux deployment lever)
 
 Seeding is memory-latency-bound: the FM-index and suffix-array lookups are

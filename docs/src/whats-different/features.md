@@ -113,6 +113,14 @@ configuration required.
 `USE_MIMALLOC=0` is a supported best-effort opt-out and is CI-gated on Linux
 x86. `bwa-mem3 version` prints the mimalloc version string when it is active.
 
+`bwa-mem3 mem` also sets mimalloc's purge delay to -1 (never return freed pages
+to the OS) unless `MIMALLOC_PURGE_DELAY` is set, so the per-batch buffers it
+frees and reallocates are not faulted back in on every batch. Alignment output
+is byte-identical; the cost is +0.3–0.5 GB peak RSS on human short-read
+paired-end WGS, for about −0.5 % wall (Graviton4, neon tier). Other modes and
+x86 hosts have not been measured. See
+[Memory allocator → Page purging](../user-guide/allocator.md#page-purging-mimalloc_purge_delay).
+
 ## `--supp-rep-hard-cap` supplementary MAPQ rescoring (PR #56)
 
 Supplementary alignments for a split read inherit MAPQ from the full-read
@@ -644,6 +652,7 @@ and the shared-knob rule live in [Equivalence](equivalence.md) and [Alignment mo
 |------|-------------|-------------------|--------|
 | `--meth` bisulfite alignment mode | [#13](https://github.com/fg-labs/bwa-mem3/pull/13) | — | fork-only |
 | Vendored mimalloc allocator | [#19](https://github.com/fg-labs/bwa-mem3/pull/19) | — | fork-only |
+| mimalloc purge delay off for `mem` | [#523](https://github.com/fg-labs/bwa-mem3/pull/523) | — | fork-only (on by default; `MIMALLOC_PURGE_DELAY` overrides; SAM byte-identical on a 5M-read-pair WGS slice, Graviton4, neon tier, and in the phix-derived CI regression, x86-64 Linux, avx2 build) |
 | `--supp-rep-hard-cap` MAPQ rescoring | [#56](https://github.com/fg-labs/bwa-mem3/pull/56) | [bwa-mem2#260](https://github.com/bwa-mem2/bwa-mem2/issues/260) | fork-only (upstream issue open) |
 | `--proper-pair-from-emitted` `FLAG` `0x2` source | [#363](https://github.com/fg-labs/bwa-mem3/pull/363) | — | fork-only (opt-in, off by default; default matches both upstreams) |
 | `--hic` Hi-C preset | [#372](https://github.com/fg-labs/bwa-mem3/pull/372) | — | fork-only spelling (opt-in, off by default; sets the same flag bits as `-5SP`, which both upstreams also accept, so identical by construction — the regression confirms byte-identity on phix-derived PE reads with `@PG` excluded, not a cross-host/cross-tier claim) |
