@@ -7,7 +7,7 @@ Pruning narrows a rescue window to the hull of the diagonal components that can 
 Two facts carry the argument, both in the header of `src/rescue_band.h`:
 
 - Every alignment scoring at least a threshold tau lies inside one diagonal component at tau, because the 5-mer bound falls by one per diagonal while a gap excursion costs at least two per diagonal. The component also bounds where the alignment can start and end.
-- A zero-state DP restricted to any set of cells never exceeds the full DP, and is exact on every cell of every alignment the set contains. Widening a band, as grouping 16 lanes into one vector does, keeps both properties, and so does skipping cells that do not exist in the full DP. Gate: `Banded rescue == kswv (rescue_band_harness, generated jobs)`.
+- A zero-state DP restricted to any set of cells never exceeds the full DP, and is exact on every cell of every alignment the set contains. Widening a band, as grouping lanes into one vector does (16 on NEON, 32 on AVX2), keeps both properties, and so does skipping cells that do not exist in the full DP. Gate: `Banded rescue == kswv (rescue_band_harness, generated jobs)`.
 
 So the per-row maximum over the bands is at most the true one, and equal on every row where an alignment above the threshold ends: that is enough to recover the score, the end positions and the suboptimal score. Gates: `Banded rescue == kswv (rescue_band_harness, generated jobs)`, `rescue_prune_identity.sh`.
 
@@ -35,6 +35,15 @@ Pass 1 finds where the best alignment starts: kswv runs the DP on the reversed p
 - `2` (default), the fused cell two rows per step with the query end read directly from the scan (`rb_dp_wave2`).
 
 `BWA3_RESCUE_FSCAN=0`, which turns the fused cell off in kswv, selects kernel 0 here as well. Within a 16-lane group, `run_jobs` shifts each narrower lane's spare diagonals below its band so the lanes' query offsets line up (`BWA3_RESCUE_BAND_SHIFT=0` turns that off). Every combination leaves output identical. Gate: `Banded rescue == kswv (rescue_band_harness, generated jobs)`, which runs kernel 1 and the shift off as legs of their own.
+
+## The AVX2 kernel
+
+`src/rescue_band_kernel_x86.h` is the x86 counterpart of the NEON kernel section: the same band coordinates, SoA layout, three kernels, query-end scan and row bookkeeping, at 32 lanes per group (`RB_L`) instead of 16, plugged into the same lane-count-generic `run_jobs`. Every value the driver reads (the lane maxima, ends and row maxima) is the NEON kernel's for the same lanes. Two encodings differ because x86 has no table lookup that zeroes out-of-range indices and no signed-plus-unsigned saturating add, and the header argues both:
+
+- The query pad code is `0x80` (`RB_QPAD`) instead of `0x40`, so a pad or nonexistent column always looks up a zero score.
+- The cell adds the score in the biased form of the x86 kswv 8-bit kernels, a saturating add of the score plus 4 and a saturating subtract of 4 on real columns. That equals the NEON sum while every H is at most 250, which holds because a band H scores only real query columns, so it is at most the mate's length in pass 0, and the 8-bit path admits mates of at most 250 bases at the default scoring (`RescueBandBatch::plan` restates the bound and keeps the hull past it), and at most the pass-0 score in pass 1 (`RescueBandBatch::take_pass1` requires the score plus 4 below 255). The harness's 8-bit ceiling class, mates of 241 to 250 bases with near-perfect copies, holds the top of that range.
+
+Gate: `Banded rescue == kswv (rescue_band_harness, generated jobs)`.
 
 ## State and diagnostics
 

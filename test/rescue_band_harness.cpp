@@ -1,5 +1,5 @@
 /* Exactness + timing harness for the banded mate rescue (src/rescue_band.{h,cpp}).
- * Build: `make rescue-band-harness` (aarch64 only).
+ * Build: `make rescue-band-harness` (arch=arm64 on aarch64, arch=avx2 on x86).
  *
  *   rescue_band_harness eq   <gen-jobs> <seed> [dump files...]   exactness (exit 1 on any mismatch)
  *   rescue_band_harness time <reps> <stride> <dump files...>     single-thread pass-0 timing
@@ -33,12 +33,14 @@
  * where it calls rescue_prune_window. */
 #include "rescue_band.h"
 #include "rescue_env.h"
+#include "simd_dispatch.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <random>
 #include <string>
 #include <vector>
@@ -344,6 +346,18 @@ static Job gen(int cls)
         }
         break;
     }
+    case 12: {  // the 8-bit ceiling: mates of 241-250 bp (the longest the 8-bit path admits at the
+                // default scoring) with a near-perfect copy, so band H reaches 241..250 -- the top of
+                // the range the x86 cell's biased add must hold exactly (rescue_band_kernel_x86.h)
+        len2 = rndr(241, 250); q.resize(len2); for (auto &b : q) b = (uint8_t)rnd(4);
+        len1 = std::max(len1, len2 + rndr(5, 600)); r.resize(len1); for (auto &b : r) b = (uint8_t)rnd(4);
+        const int P = rnd(std::max(1, len1 - len2));
+        std::vector<uint8_t> c = rnd(3) ? q : mutate(q, 0, len2, 0.0, 0.004);   // perfect, or a 1-bp indel or two
+        for (int t = rnd(3); t--;) { const int x = rnd(len2); c[x] = (uint8_t)((c[x] + 1 + rnd(3)) & 3); }
+        plant(r, c, P);
+        if (rnd(2)) plant(r, mutate(q, rnd(len2 / 2), len2, 0.02, 0.0), rnd(std::max(1, len1 - len2)));   // a weaker second copy (score2)
+        break;
+    }
     default: {  // two strong copies on nearby diagonals (merged / overlapping components)
         r.resize(len1); for (auto &b : r) b = (uint8_t)rnd(4);
         const int P = rnd(std::max(1, len1 - len2));
@@ -455,7 +469,7 @@ static int run_eq(std::vector<Job> &jobs, int minsc, int max_hits, int scalar_st
     long nview = 0, view_mm = 0, r2 = 0, ccap = 0;
     std::unique_ptr<rescue_prune_scratch> sscratch(new rescue_prune_scratch());
     std::vector<rb_comp> cn, cs;
-    long p1_band = 0, p1_guard = 0;
+    long p1_band = 0, p1_guard = 0, band_hi = 0;
     long cls_n[128] = {0}, cls_mm[128] = {0};
     const bool negative_control = rescue_env_opt_in("RB_NEGATIVE_CONTROL");
     bool injected = false;
@@ -555,6 +569,7 @@ static int run_eq(std::vector<Job> &jobs, int minsc, int max_hits, int scalar_st
             const Job &J = jobs[base + t];
             const kswr_t &a = T.aln[t];
             n++; cls_n[J.cls]++;
+            band_hi += banded[t] && a.score >= 241;
             bool ok;
             const bool pass = a.score >= minsc;
             npass += pass;
@@ -597,20 +612,25 @@ static int run_eq(std::vector<Job> &jobs, int minsc, int max_hits, int scalar_st
             }
         }
     }
-    printf("eq: jobs=%ld pass=%ld full=%ld b1=%ld b2=%ld banded_parents=%ld pass1_banded=%ld pass1_guard=%ld "
-           "round2=%ld comp_cap=%ld views_checked=%ld MISMATCHES=%ld view_mismatch=%ld scalar_vs_kswv_mismatch=%ld "
-           "(te2 differs, unconsumed: %ld)\n",
-           n, npass, nfull, nb1, nb2, nband, p1_band, p1_guard, r2, ccap, nview, mism, view_mm, scal_mm, te2_diff);
+    printf("eq: jobs=%ld pass=%ld full=%ld b1=%ld b2=%ld banded_parents=%ld banded_s241=%ld pass1_banded=%ld "
+           "pass1_guard=%ld round2=%ld comp_cap=%ld views_checked=%ld MISMATCHES=%ld view_mismatch=%ld "
+           "scalar_vs_kswv_mismatch=%ld (te2 differs, unconsumed: %ld)\n",
+           n, npass, nfull, nb1, nb2, nband, band_hi, p1_band, p1_guard, r2, ccap, nview, mism, view_mm, scal_mm,
+           te2_diff);
     for (int c = 0; c < 128; c++)
         if (cls_n[c]) printf("  class %3d: jobs=%ld mismatches=%ld\n", c, cls_n[c], cls_mm[c]);
     /* A pass with nothing banded compares kswv with kswv: fail it where banding runs, so the gate
      * cannot go vacuous (a cost gate or generator change that stops banding). */
     const bool vacuous = rescue_band_enabled() && (nband == 0 || p1_band == 0);
     if (vacuous) fprintf(stderr, "FAIL: no job was banded in pass 0 or pass 1 (open the cost gate: BWA3_RESCUE_BAND_COST=100000000)\n");
+    /* The 8-bit ceiling class must reach the top of the band's H range, or the check of the x86
+     * cell's biased add there (exact only while H <= 250) went vacuous. */
+    const bool ceiling_vacuous = rescue_band_enabled() && cls_n[12] > 0 && band_hi == 0;
+    if (ceiling_vacuous) fprintf(stderr, "FAIL: no banded job scored 241 or more (the 8-bit ceiling class stopped reaching it)\n");
     /* Production falls back to kswv when a banded pass-1 max is not S (the guard in rescue_band.h),
      * but that cannot happen, so here any fallback fails the run: it means the band argument broke. */
     if (p1_guard) fprintf(stderr, "FAIL: %ld pass-1 guard fallbacks (banded max != S)\n", p1_guard);
-    return mism || scal_mm || view_mm || vacuous || p1_guard ? 1 : 0;
+    return mism || scal_mm || view_mm || vacuous || ceiling_vacuous || p1_guard ? 1 : 0;
 }
 
 /* ---------------------------------------------------------------------------------------- */
@@ -618,9 +638,21 @@ static int run_eq(std::vector<Job> &jobs, int minsc, int max_hits, int scalar_st
 /*   hull  = filter + kswv phase 0 on every non-B1 job (hull or full window) [BAND off]        */
 /*   band  = filter + plan + kswv phase 0 on the non-banded + run_pass0 on the banded         */
 /* ---------------------------------------------------------------------------------------- */
+/* Lanes per 8-bit kswv group at the tier make_kswv dispatched to (its SIMD_WIDTH8). */
+static int kswv_lanes8()
+{
+    bwamem3_simd_init();
+    switch (bwamem3_simd_tier()) {
+    case BWAMEM3_TIER_AVX512BW: return 64;
+    case BWAMEM3_TIER_NEON: return 16;
+    default: return 32;   // AVX2, the x86 floor of the batched kswv kernels
+    }
+}
+
 static void run_time(std::vector<Job> &jobs, int minsc, int max_hits, int reps)
 {
     using clk = std::chrono::steady_clock;
+    const int kl = kswv_lanes8();
     const int B = 2048;
     double best[2][4];   // [mode][filter, plan, kswv, band]
     double kcells[2] = {0, 0};
@@ -665,10 +697,10 @@ static void run_time(std::vector<Job> &jobs, int minsc, int max_hits, int reps)
                 P.finalize();
                 std::stable_sort(P.sp.begin(), P.sp.begin() + pn, [](const SeqPair &x, const SeqPair &y) { return x.len1 < y.len1; });
                 const int nbd = mode == 1 ? rescue_band_batch().partition(P.sp.data(), pn) : 0;
-                for (int g = nbd; g < pn; g += 16) {   // kswv padded cells: 16 x maxLen1 x maxQuanta
+                for (int g = nbd; g < pn; g += kl) {   // kswv padded cells: kl x maxLen1 x maxQuanta
                     int ml = 0, mq = 0;
-                    for (int l = g; l < std::min(pn, g + 16); l++) { ml = std::max(ml, (int)P.sp[l].len1); mq = std::max(mq, kswv_query_quantum8((int)P.sp[l].len2)); }
-                    kcells[mode] += 16.0 * ml * mq;
+                    for (int l = g; l < std::min(pn, g + kl); l++) { ml = std::max(ml, (int)P.sp[l].len1); mq = std::max(mq, kswv_query_quantum8((int)P.sp[l].len2)); }
+                    kcells[mode] += (double)kl * ml * mq;
                 }
                 auto a = clk::now();
                 k->getScores8(P.sp.data() + nbd, P.ref.data(), P.qer.data(), P.aln.data(), pn - nbd, 1, 0);
@@ -700,6 +732,17 @@ int main(int argc, char **argv)
         fprintf(stderr, "usage: %s eq <ngen> <seed> [dumps...] | time <reps> <stride> <dumps...>\n", argv[0]);
         return 2;
     }
+    /* Without banding every mode compares kswv with itself (a build without a SIMD band kernel --
+     * x86 below arch=avx2 -- or banding turned off in the environment). */
+    if (!rescue_band_enabled()) {
+        fprintf(stderr, "FAIL: banded rescue is off (no NEON / AVX2 band kernel in this build, or BWA3_RESCUE_BAND "
+                        "turned it off), so there is nothing to compare\n");
+        return 1;
+    }
+    /* The kswv tier is the oracle here and on x86 follows the host (or BWAMEM3_FORCE_TIER), so name
+     * it: the same run checks the band kernel against a different kswv on another runner. */
+    bwamem3_simd_init();
+    printf("kswv tier: %s\n", bwamem3_simd_tier_name(bwamem3_simd_tier()));
     const int minsc = rescue_env_int("RB_MINSC", MINSC_DEFAULT);
     /* The production default (rescue_prune_max_hits in bwamem_pair.cpp). */
     const int max_hits = rescue_env_int("BWA3_RESCUE_PRUNE_MAX_HITS",
@@ -712,7 +755,7 @@ int main(int argc, char **argv)
     if (!strcmp(argv[1], "eq")) {
         const int ngen = atoi(argv[2]);
         rng.seed(strtoull(argv[3], nullptr, 10));
-        for (int t = 0; t < ngen; t++) jobs.push_back(gen(t % 12));
+        for (int t = 0; t < ngen; t++) jobs.push_back(gen(t % 13));
         for (int a = 4; a < argc; a++) load_dump(argv[a], jobs, 1);
         const int ss = rescue_env_int("RB_SCALAR_STRIDE", 0);
         return run_eq(jobs, minsc, max_hits, ss);

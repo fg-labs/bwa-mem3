@@ -36,7 +36,7 @@
  * BWA3_RESCUE_ROWPAIR         1     NEON kswv (8- and 16-bit): sweep two target rows per pass
  * BWA3_RESCUE_LAZYQE          1     NEON kswv two-row sweep: recover the query end after the row
  *                                   instead of inline
- * BWA3_RESCUE_BAND            1     run pruned rescue jobs as diagonal bands (aarch64)
+ * BWA3_RESCUE_BAND            1     run rescue jobs as diagonal bands (NEON or AVX2 kernel)
  * BWA3_RESCUE_BAND_COST       85    band a pass-0 parent iff its band cells cost less than this %
  *                                   of the hull's
  * BWA3_RESCUE_BAND_R2         1     run round 2 banded (0: kswv on the hull)
@@ -47,8 +47,7 @@
  *                                   of kswv's
  * BWA3_RESCUE_BAND_KERNEL     2     banded-DP kernel while BWA3_RESCUE_FSCAN is on: 0 original
  *                                   cell, 1 fused cell, 2 fused cell on two rows per step
- * BWA3_RESCUE_BAND_SHIFT      1     shift each lane's band so a 16-lane group's query offsets
- *                                   align
+ * BWA3_RESCUE_BAND_SHIFT      1     shift each lane's band so a lane group's query offsets align
  * rescue-knobs:end */
 #ifndef BWA_MEM3_RESCUE_ENV_H
 #define BWA_MEM3_RESCUE_ENV_H

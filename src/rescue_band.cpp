@@ -1,5 +1,6 @@
-/* Exact banded mate-rescue DP: component planning, the NEON banded kernel (RB_L lanes), grouping and
- * the per-parent merge. See rescue_band.h for the design and the exactness argument, and
+/* Exact banded mate-rescue DP: component planning, the NEON banded kernel (and, from
+ * rescue_band_kernel_x86.h, the AVX2 one; RB_L lanes each), grouping and the per-parent merge.
+ * See rescue_band.h for the design and the exactness argument, and
  * docs/src/developer-guide/rescue-banding.md for the overview and its gates. */
 #include "rescue_band.h"
 #include "rescue_env.h"
@@ -12,6 +13,29 @@
 #include <cstdlib>
 #include <cassert>
 #include <cstring>
+/* kswv's score2 / te2 scan over the rows whose (lagged-zeroed) maximum reaches minsc, in row order:
+ * the b[] emulation of kswv.cpp with zone [low, high] = [te - S, te + S] (qmax = 1). Both kernels'
+ * rb_score2_vec feed it the qualifying rows their vector prefilter finds. */
+struct rb_score2_scan {
+    int low, high, s2 = -1, t2 = -1, bs = -1, bp = -2;
+    rb_score2_scan(int lo, int hi) : low(lo), high(hi) {}
+    void row(int i, int val)
+    {
+        if (bp + 1 != i) {
+            if (bp >= 0 && (bp < low || bp > high) && bs > s2) { s2 = bs; t2 = bp; }
+            bs = val; bp = i;
+        } else if (bs < val) {
+            bs = val; bp = i;
+        }
+    }
+    void finish(int *score2, int *te2)
+    {
+        if (bp >= 0 && (bp < low || bp > high) && bs > s2) { s2 = bs; t2 = bp; }
+        *score2 = s2;
+        *te2 = t2;
+    }
+};
+
 #if defined(__aarch64__)
 #include <arm_neon.h>
 #include "neon_transpose.h"
@@ -20,6 +44,10 @@
 #define RB_HAVE_SIMD 1
 static const int RB_L = 16;
 static const int RB_PAD = 16;
+static const uint8_t RB_QPAD = 0x40;   // query pad code (see the NEON kernel section)
+#elif defined(__AVX2__)
+#define RB_KERNEL_X86_FROM_RESCUE_BAND_CPP 1
+#include "rescue_band_kernel_x86.h"   // RB_L = 32, the AVX2 kernel and run_jobs helpers
 #endif
 
 /* ------------------------------------------------------------------------------------------ */
@@ -178,6 +206,28 @@ static bool rb_components_scalar(const rescue_prune_view &v, BND bnd, int tau, i
     return true;
 }
 
+/* The whole view at MINSC from a SIMD filter: the filter already listed these components (the same
+ * runs of mw and the same ub / i0 / dmaxhit a rescan computes; rescue_prune_neon.h step 7, checked
+ * against a rescan by the unit tests and rescue_prune_eq). Reproduces the rescan's result -- append
+ * until out holds cap, false iff any component did not fit -- into *ok and returns true; returns
+ * false, touching nothing, when the list cannot answer (another threshold or a sub-range, no list,
+ * or a stored list shorter than the components the cap would take). */
+static bool rb_components_listed(const rescue_prune_view &v, int tau, int xa, int xb, std::vector<rb_comp> &out,
+                                 int cap, bool *ok)
+{
+    if (!v.comps || tau != rescue_prune_neon::MINSC || xa != 0 || xb != v.nd || v.ncomp < 0) return false;
+    if (v.ncomp != v.ncomp_stored && (int)out.size() + v.ncomp_stored < cap) return false;
+    *ok = true;
+    for (int k = 0; k < v.ncomp; k++) {
+        if ((int)out.size() >= cap) { *ok = false; break; }
+        const rescue_prune_neon::Comp &c = v.comps[k];
+        rb_comp K;
+        K.ub = c.ub; K.i0 = c.i0; K.dlo = c.a - v.off; K.dhi = c.b - 1 - v.off; K.dmaxhit = c.dmax - v.off;
+        out.push_back(K);
+    }
+    return true;
+}
+
 #if defined(__aarch64__)
 /* NEON view (bnd16 + the filter's bitsets). mw = {bnd >= 19}, hw = {bnd >= 19 and cnt > 0}.
  * Every component at tau >= 19 lies inside one run of mw, and inside such a run hw is exactly the
@@ -233,19 +283,8 @@ static bool rb_components_neon(const rescue_prune_view &v, int tau, int xa, int 
         return true;
     };
     if (tau == rescue_prune_neon::MINSC) {
-        /* The whole view at MINSC: the filter already listed these components (same runs of mw,
-         * same ub / i0 / dmaxhit computation, rescue_prune_neon.h step 7). Reproduce emit()'s
-         * result: append until out holds cap, false iff any component did not fit. */
-        if (xa == 0 && xb == v.nd && v.ncomp >= 0 && (v.ncomp == v.ncomp_stored || (int)out.size() + v.ncomp_stored >= cap)) {
-            for (int k = 0; k < v.ncomp; k++) {
-                if ((int)out.size() >= cap) return false;
-                const rescue_prune_neon::Comp &c = v.comps[k];
-                rb_comp K;
-                K.ub = c.ub; K.i0 = c.i0; K.dlo = c.a - v.off; K.dhi = c.b - 1 - v.off; K.dmaxhit = c.dmax - v.off;
-                out.push_back(K);
-            }
-            return true;
-        }
+        bool ok;
+        if (rb_components_listed(v, tau, xa, xb, out, cap, &ok)) return ok;
         for (int d = bitset_next(v.mw, xa, xb, 0); d < xb;) {
             const int b = bitset_next(v.mw, d, xb, ~0ull);
             if (!emit(d, b)) return false;
@@ -290,10 +329,15 @@ bool rescue_band_components(const rescue_prune_view &v, int tau, int xa, int xb,
 {
 #if defined(__aarch64__)
     if (v.bnd16 && v.mw && v.hw && tau >= rescue_prune_neon::MINSC) return rb_components_neon(v, tau, xa, xb, out, cap);
+#else
+    {
+        bool ok;
+        if (rb_components_listed(v, tau, xa, xb, out, cap, &ok)) return ok;   // the x86 filter's list
+    }
 #endif
     /* A NEON view always carries mw / hw, and plan() asks only for tau >= minsc >= 19, so on aarch64
-     * it always takes the branch above. What reaches here is the x86 filter's view (bnd16, the
-     * bound precomputed) or a scalar view (fwd / bwd). */
+     * it always takes the branch above. What reaches here is the rest of an x86 filter's view (bnd16,
+     * the bound precomputed: a sub-range, or a threshold above MINSC) or a scalar view (fwd / bwd). */
     if (v.bnd16) {
         const int16_t *b16 = v.bnd16;
         return rb_components_scalar(v, [b16](int x) { return (int)b16[x]; }, tau, xa, xb, out, cap);
@@ -332,6 +376,14 @@ bool RescueBandBatch::plan(const rescue_prune_view &v, int len1, int len2, int h
             if (K.ub > ub1) { ub2 = ub1; ub1 = K.ub; }
             else if (K.ub > ub2) ub2 = K.ub;
         }
+#if RB_X86
+        /* The x86 cell's biased add is exact only while every H <= 250 (rescue_band_kernel_x86.h).
+         * A band H is a local alignment score, so at most len2 * a = len2 here (a = 1 under
+         * rescue_prune_scoring_ok), and the 8-bit kernel path admits only len2 * a + 4 <= 254
+         * (matesw_use_u8's bias of 4 at this scoring), i.e. len2 <= 250. This check restates that
+         * bound locally, so a change to the 8-bit admission cannot make the cell inexact. */
+        if (len2 > 250) ok = false;
+#endif
         T1 = std::max(minsc, ub2 / 2);
         /* Tight top band. When the whole hull lies inside the zone [te - S, te + S], the true
          * score2 is exactly -1 (every row with R >= minsc is in the hull, so no b[] anchor can be
@@ -904,8 +956,7 @@ static inline void rb_merge_max(uint8_t *buf, const uint8_t *Rl, int n)
  * >= minsc test run 16 rows per vector; only qualifying rows reach the scalar b[] emulation. */
 static void rb_score2_vec(const uint8_t *R, int n, int row0, int S, int te, int minsc, int *score2, int *te2)
 {
-    const int low = te - S, high = te + S;
-    int s2 = -1, t2 = -1, bs = -1, bp = -2;
+    rb_score2_scan sc(te - S, te + S);
     const uint8x16_t ms = vdupq_n_u8((uint8_t)minsc);
     alignas(16) uint8_t vb[16];
     for (int k0 = 0; k0 < n; k0 += 16) {
@@ -917,18 +968,10 @@ static void rb_score2_vec(const uint8_t *R, int n, int row0, int S, int te, int 
         do {
             const int t = __builtin_ctzll(m) >> 2;
             m &= ~(0xFull << (t * 4));
-            const int val = vb[t], i = row0 + k0 + t;
-            if (bp + 1 != i) {
-                if (bp >= 0 && (bp < low || bp > high) && bs > s2) { s2 = bs; t2 = bp; }
-                bs = val; bp = i;
-            } else if (bs < val) {
-                bs = val; bp = i;
-            }
+            sc.row(row0 + k0 + t, vb[t]);
         } while (m);
     }
-    if (bp >= 0 && (bp < low || bp > high) && bs > s2) { s2 = bs; t2 = bp; }
-    *score2 = s2;
-    *te2 = t2;
+    sc.finish(score2, te2);
 }
 #endif
 
@@ -1004,7 +1047,7 @@ void RescueBandBatch::run_jobs(bool pass1)
             const uint8_t *q = J.qry - pq0;
             for (int p = a; p < b; p++) { const uint8_t c = q[p]; row[p] = c < 4 ? c : 8; }
             const int c0 = std::max(0, pq0 + J.len2), c1 = std::min(P, pq0 + J.quanta);
-            if (c1 > c0) memset(row + c0, 0x40, c1 - c0);
+            if (c1 > c0) memset(row + c0, RB_QPAD, c1 - c0);
         }
         rb_transpose_to(ST, stride, P, w.A.data());
         rb_build_ql(w.A.data(), w.QL.data(), P);
@@ -1103,7 +1146,7 @@ void RescueBandBatch::finish_parent(pstate &p)
 #if RB_HAVE_SIMD
             rb_score2_vec(rpool_.data() + p.rbuf, p.L, 0, p.S, p.te, minsc, &p.s2, &p.te2);
 #else
-            assert(!"banded rescue is aarch64-only: rescue_band_enabled() is false elsewhere");
+            assert(!"banded rescue needs a SIMD kernel: rescue_band_enabled() is false without one");
 #endif
         } else
             p.s2 = p.te2 = -1;

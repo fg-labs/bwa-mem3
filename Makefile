@@ -962,9 +962,10 @@ test/fmi_seed_api_smoke.o: test/fmi_seed_api_smoke.cpp $(FLAGS_STAMP)
 
 # Exactness + timing harness for the banded mate rescue (src/rescue_band.{h,cpp});
 # its header lists the modes. CI runs a bounded `eq` on generated jobs on the
-# ARM64 rows; longer runs and real-data dumps are manual. aarch64 only -- the
-# banded kernel is NEON, and elsewhere rescue_band_enabled() is false, so the
-# harness would compare the hull path with itself.
+# ARM64 rows; longer runs and real-data dumps are manual. The banded kernel is
+# NEON on aarch64 and AVX2 on x86, so on x86 build it with arch=avx2 or
+# arch=avx512bw: the default x86 flags stop at SSE4.1, where there is no kernel,
+# rescue_band_enabled() is false and the harness refuses to run.
 .PHONY: rescue-band-harness
 rescue-band-harness: rescue_band_harness
 
@@ -982,16 +983,13 @@ rescue-prune-eq: rescue_prune_eq
 rescue_prune_eq: test/rescue_prune_eq.cpp src/rescue_prune.h src/rescue_prune_neon.h src/rescue_prune_x86.h src/x86_soa_pack.h src/neon_transpose.h src/kswv_quantum.h $(FLAGS_STAMP)
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(DEPFLAGS) -MF test/rescue_prune_eq.d -MT $@ $< -o $@
 
-ifneq ($(IS_ARM),)
+# libbwa.a carries the per-tier kswv objects make_kswv dispatches to, so the harness's kswv
+# reference runs at the host's tier (or BWAMEM3_FORCE_TIER's).
 rescue_band_harness: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) $(if $(filter 1,$(USE_MIMALLOC)),$(MIMALLOC_LIB)) test/rescue_band_harness.o
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/rescue_band_harness.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) $(MIMALLOC_LDFLAGS) -o $@
 
 test/rescue_band_harness.o: test/rescue_band_harness.cpp $(FLAGS_STAMP)
 	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
-else
-rescue_band_harness:
-	$(error rescue_band_harness is aarch64-only: the banded rescue kernel is NEON)
-endif
 
 # Regression test for the fmi_seed_api.h facade's max_occ guard: forwarding
 # max_occ <= 0 into FMI_search::get_sa_entries_prefetch divides by max_occ.
