@@ -35,6 +35,7 @@
 #include <algorithm>
 #include <vector>
 #include "rescue_prune_neon.h"
+#include "rescue_prune_x86.h"
 
 enum { RESCUE_PRUNE_FULL = 0, RESCUE_PRUNE_B1 = 1, RESCUE_PRUNE_B2 = 2 };
 
@@ -53,7 +54,8 @@ struct rescue_prune_scratch {
     int view_nd = -1;   // nd of the last call that returned B2 (arrays valid), else -1
 };
 
-/* Scalar implementation (x86, or a non-default threshold). Same decisions as the NEON one. */
+/* Scalar implementation (a non-default threshold, or the SIMD filters' fallback). Same decisions
+ * as the NEON and x86 ones. */
 static inline int rescue_prune_window_scalar(const uint8_t *ref, int len1, const uint8_t *q, int len2,
                                              int minsc, int max_hits, rescue_prune_scratch &s,
                                              int *hb, int *he)
@@ -130,10 +132,10 @@ static inline int rescue_prune_window_scalar(const uint8_t *ref, int len1, const
 
 /* Per-diagonal arrays of the last rescue_prune_window() call on this thread, for deriving
  * diagonal components at thresholds above minsc (rescue_band.h). Valid only right after a call
- * that returned RESCUE_PRUNE_B2, and only when nd >= 0 (the NEON path's rare scalar fallback
+ * that returned RESCUE_PRUNE_B2, and only when nd >= 0 (the SIMD paths' rare scalar fallback
  * leaves nd = -1). Diagonal index x in [0, nd) is the unshifted diagonal d = i - j = x - off.
- * Exactly one of bnd16 (NEON: bnd precomputed) or fwd/bwd (scalar: bnd = 5 + fwd + bwd -
- * (cnt - 1)) is set. mw, when set, is the NEON bitset of diagonals with bnd >= 19. */
+ * Exactly one of bnd16 (SIMD filter: bnd precomputed) or fwd/bwd (scalar: bnd = 5 + fwd + bwd -
+ * (cnt - 1)) is set. mw, when set, is the SIMD filter's bitset of diagonals with bnd >= 19. */
 struct rescue_prune_view {
     int nd = -1, off = 0;
     const uint16_t *cnt = nullptr;
@@ -159,8 +161,14 @@ static inline rescue_prune_neon::NeonScratch &rescue_prune_neon_scratch()
     static thread_local rescue_prune_neon::NeonScratch ns;
     return ns;
 }
+#elif defined(__AVX2__)
+static inline rescue_prune_x86::X86Scratch &rescue_prune_x86_scratch()
+{
+    static thread_local rescue_prune_x86::X86Scratch xs;
+    return xs;
+}
 #endif
-/* 0 = none, 1 = scalar, 2 = NEON: which scratch the last rescue_prune_window() call used. */
+/* 0 = none, 1 = scalar, 2 = NEON, 3 = x86: which scratch the last rescue_prune_window() call used. */
 static inline int &rescue_prune_last_path()
 {
     static thread_local int p = 0;
@@ -180,6 +188,17 @@ static inline rescue_prune_view rescue_prune_last_view()
         v.cnt = ns.cnt; v.minrow = ns.minrow; v.bnd16 = ns.bnd; v.mw = ns.mw; v.hw = ns.hw;
         v.comps = ns.comps; v.ncomp = ns.ncomp;
         v.ncomp_stored = std::min(ns.ncomp, (int)rescue_prune_neon::NeonScratch::COMP_CAP);
+        return v;
+    }
+#elif defined(__AVX2__)
+    if (path == 3) {
+        const rescue_prune_x86::X86Scratch &xs = rescue_prune_x86_scratch();
+        if (xs.view_nd < 0) return v;
+        v.nd = xs.view_nd;
+        v.off = ((xs.qlen_c + 15) / 16) * 16;   // off = quanta of the last (cached) query
+        v.cnt = xs.cnt; v.minrow = xs.minrow; v.bnd16 = xs.bnd; v.mw = xs.mw; v.hw = xs.hw;
+        v.comps = xs.comps; v.ncomp = xs.ncomp;
+        v.ncomp_stored = std::min(xs.ncomp, (int)rescue_prune_x86::X86Scratch::COMP_CAP);
         return v;
     }
 #endif
@@ -214,6 +233,20 @@ static inline int rescue_prune_window(const uint8_t *ref, int len1, const uint8_
         const rescue_prune_neon::Job jb{len1, len2, 0, 0, -1, -1, ref, q};
         int h, e;
         const rescue_prune_neon::Kind k = rescue_prune_neon::lean_neon(jb, ns, h, e, max_hits);
+        if (k == rescue_prune_neon::SCALAR) goto scalar;   // int32 path: > 32000 hits, long windows
+        if (k == rescue_prune_neon::B1) return RESCUE_PRUNE_B1;
+        if (k == rescue_prune_neon::FULL) return RESCUE_PRUNE_FULL;
+        *hb = h; *he = e;
+        return RESCUE_PRUNE_B2;
+    }
+scalar:
+#elif defined(__AVX2__)
+    if (minsc == rescue_prune_neon::MINSC) {  // identical decisions (rescue_prune_x86.h)
+        rescue_prune_x86::X86Scratch &xs = rescue_prune_x86_scratch();
+        rescue_prune_last_path() = 3;
+        const rescue_prune_neon::Job jb{len1, len2, 0, 0, -1, -1, ref, q};
+        int h, e;
+        const rescue_prune_neon::Kind k = rescue_prune_x86::lean_x86(jb, xs, h, e, max_hits);
         if (k == rescue_prune_neon::SCALAR) goto scalar;   // int32 path: > 32000 hits, long windows
         if (k == rescue_prune_neon::B1) return RESCUE_PRUNE_B1;
         if (k == rescue_prune_neon::FULL) return RESCUE_PRUNE_FULL;

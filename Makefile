@@ -968,6 +968,13 @@ test/fmi_seed_api_smoke.o: test/fmi_seed_api_smoke.cpp $(FLAGS_STAMP)
 .PHONY: rescue-band-harness
 rescue-band-harness: rescue_band_harness
 
+# SIMD rescue-pruning filter (NEON / x86) vs the scalar filter, decisions and view; header-only.
+# Needs arch= so the SIMD path is compiled in (arch=avx2 or arch=arm64).
+.PHONY: rescue-prune-eq
+rescue-prune-eq: rescue_prune_eq
+rescue_prune_eq: test/rescue_prune_eq.cpp src/rescue_prune.h src/rescue_prune_neon.h src/rescue_prune_x86.h
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $< -o $@
+
 ifneq ($(IS_ARM),)
 rescue_band_harness: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) $(if $(filter 1,$(USE_MIMALLOC)),$(MIMALLOC_LIB)) test/rescue_band_harness.o
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/rescue_band_harness.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) $(MIMALLOC_LDFLAGS) -o $@
