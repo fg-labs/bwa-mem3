@@ -1029,6 +1029,17 @@ jobs:
           CHR22_FA=/tmp/chr22/chr22.fa \
           bash test/regression/chain_scratch_per_thread.sh
 
+      - name: Extension staging shares a chain's reference window (homopolymer chain)
+        if: matrix.canonical == true
+        # A read from a long homopolymer chains ~500 max_occ-sampled seeds
+        # across the whole run. Copying the chain's reference window once per
+        # seed grew the extension buffers past their int32 limit within one
+        # batch of ordinary 150 bp reads, and mem aborted. Checked on the
+        # default path and under --meth; the fixture is generated inline.
+        run: |
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          bash test/regression/repeat_chain_extension_window.sh
+
       - name: Cohort slicing does not change output
         if: matrix.canonical == true
         run: |

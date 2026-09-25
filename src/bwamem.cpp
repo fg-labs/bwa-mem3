@@ -6405,6 +6405,89 @@ pe18_seed_in_container(const mem_seed_t *s, const mem_alnreg_t *p,
     return PE18_NOT;
 }
 
+/* Per-chain reference and query windows shared by every seed extension staged
+ * from one chain.
+ *
+ * Each seed's LEFT extension targets the reversed reference prefix
+ * rseq[0, s->rbeg - rmax[0]) and its RIGHT extension the suffix
+ * rseq[re, rmax[1] - rmax[0]), where [rmax[0], rmax[1]) is the chain's window.
+ * The window spans the whole chain, so staging a private copy per seed costs
+ * O(seeds x chain span) bytes. On a chain of many closely-spaced seeds -- the
+ * max_occ-sampled hits of a low-complexity SMEM in a long homopolymer or short
+ * tandem repeat, spaced within the band so they all chain -- that is ~500 seeds x
+ * tens of kb per read, which exhausts the int32-addressable extension buffers
+ * within one batch of ordinary short reads.
+ *
+ * Every left target of a chain is a suffix of ONE reversed prefix, and every
+ * right target is a suffix of ONE forward suffix, so both are staged once per
+ * chain (sized for the chain's farthest-reaching seed) and each SeqPair's idr
+ * points into the shared copy. The bytes each pair reads, [idr, idr + len1), are
+ * exactly those it read from its private copy, so this is byte-identical.
+ *
+ * The query side has the same shape: a seed's LEFT query target is the reversed
+ * read prefix query[0, qbeg) and its RIGHT target the suffix query[qe, l_query),
+ * so a chain's left targets are suffixes of one reversed prefix and its right
+ * targets suffixes of one forward suffix. Those are shared the same way; per
+ * seed they cost O(seeds x read length).
+ *
+ * `c == nullptr` means no window is bound; a negative length / begin means that
+ * window has not been staged for the bound chain. */
+struct ChainExtWindow {
+    const mem_chain_t *c;
+    int64_t rmax0, rmax1;
+    int64_t left_base, left_len;    /* reversed rseq[0, left_len) at seqBufLeftRef[left_base]   */
+    int64_t right_base, right_beg;  /* rseq[right_beg, rmax1 - rmax0) at seqBufRightRef[right_base] */
+    int64_t qleft_base, qleft_len;  /* reversed query[0, qleft_len) at seqBufLeftQer[qleft_base] */
+    int64_t qright_base, qright_beg;/* query[qright_beg, l_query) at seqBufRightQer[qright_base] */
+    int64_t right_len, qright_len;  /* staged bytes of the two right-side windows */
+    /* Whether a staged SeqPair points into each window. A window no pair uses
+     * (every seed took the ungapped fast path) is reclaimed when the next chain
+     * binds, if it is still the last thing in its buffer. */
+    bool left_used, right_used, qleft_used, qright_used;
+};
+
+/* The window records offsets into the staging buffers, so it is valid only as
+ * long as those offsets are: every site that rewinds leftRefOffset,
+ * rightRefOffset, leftQerOffset or rightQerOffset must also reset the window. */
+static inline void chain_ext_window_reset(ChainExtWindow &win) {
+    win.c = nullptr;
+    win.rmax0 = win.rmax1 = 0;
+    win.left_base = win.right_base = win.qleft_base = win.qright_base = 0;
+    win.left_len = win.right_beg = win.qleft_len = win.qright_beg = -1;
+    win.right_len = win.qright_len = 0;
+    win.left_used = win.right_used = win.qleft_used = win.qright_used = false;
+}
+
+/* Give back a staged window no pair points into, when nothing was staged after
+ * it in its buffer. */
+static inline void chain_ext_window_reclaim(int64_t &offset, int64_t base, int64_t len,
+                                            bool staged, bool used) {
+    if (staged && !used && base + len == offset) offset = base;
+}
+
+/* Bind `win` to chain `c` with window rmax. When the chain differs from the one
+ * bound, first reclaim the previous chain's unused windows, then drop them.
+ * rmax is a function of the chain; comparing it too is a cheap cross-check that
+ * the staged reference bytes are still the ones this chain reads. */
+static inline void chain_ext_window_bind(ChainExtWindow &win, const mem_chain_t *c,
+                                         const int64_t rmax[],
+                                         int64_t &leftRefOffset, int64_t &rightRefOffset,
+                                         int64_t &leftQerOffset, int64_t &rightQerOffset) {
+    if (win.c == c && win.rmax0 == rmax[0] && win.rmax1 == rmax[1]) return;
+    chain_ext_window_reclaim(leftRefOffset, win.left_base, win.left_len,
+                             win.left_len >= 0, win.left_used);
+    chain_ext_window_reclaim(rightRefOffset, win.right_base, win.right_len,
+                             win.right_beg >= 0, win.right_used);
+    chain_ext_window_reclaim(leftQerOffset, win.qleft_base, win.qleft_len,
+                             win.qleft_len >= 0, win.qleft_used);
+    chain_ext_window_reclaim(rightQerOffset, win.qright_base, win.qright_len,
+                             win.qright_beg >= 0, win.qright_used);
+    chain_ext_window_reset(win);
+    win.c = c;
+    win.rmax0 = rmax[0];
+    win.rmax1 = rmax[1];
+}
+
 /* Mutable per-thread extension-staging state, threaded through
  * stage_seed_extension() by reference. These pointers/offsets/counters live for
  * the whole mem_chain2aln_across_reads_V2 call and mutate across every seed and
@@ -6434,6 +6517,7 @@ struct StageCtx {
     int64_t *wsize_buf_qer;   /* = &mmc->wsize_buf_qer[tid*CACHE_LINE] */
     mem_cache *mmc;
     int      tid;
+    ChainExtWindow &ext_win;  /* per-chain shared reference and query windows */
 #if BWAMEM3_UGP_PROFILE
     int     &numPairsLeft128;
     int     &numPairsLeft16;
@@ -6450,9 +6534,12 @@ struct StageCtx {
  * RIGHT_DONE gotos are local labels fully contained here, so this is void.
  *
  * fp_o_min/fp_e_min/fp_x_threshold are the per-call ungapped-fast-path constants
- * (invariant across reads/seeds). This is a pure refactor — moving the body into
- * a helper the driver calls in place — so it is byte-identical to the prior
- * inline code (C3a; gated 0-diff before any two-wave logic is added). */
+ * (invariant across reads/seeds).
+ *
+ * Seeds are not staged independently: ctx.ext_win carries the current chain's
+ * shared reference and query windows (see ChainExtWindow) from one seed to the
+ * next, so the caller must stage a chain's seeds consecutively and reset
+ * ext_win wherever it rewinds the staging offsets. */
 static inline void stage_seed_extension(
         const mem_seed_t *s, mem_alnreg_t *a, const mem_chain_t *c,
         mem_alnreg_v *av, const uint8_t *query, const uint8_t *rseq,
@@ -6480,6 +6567,7 @@ static inline void stage_seed_extension(
     int64_t *wsize_pair    = ctx.wsize_pair;
     int64_t *wsize_buf_ref = ctx.wsize_buf_ref;
     int64_t *wsize_buf_qer = ctx.wsize_buf_qer;
+    ChainExtWindow &ext_win = ctx.ext_win;
 #if BWAMEM3_UGP_PROFILE
     int &numPairsLeft128 = ctx.numPairsLeft128;
     int &numPairsLeft16  = ctx.numPairsLeft16;
@@ -6529,12 +6617,25 @@ static inline void stage_seed_extension(
         }
 
 
-        sp.idq = leftQerOffset;
-        sp.idr = leftRefOffset;
+        /* Stage the chain's reversed read prefix once (see ChainExtWindow),
+         * sized for the chain's largest qbeg; this seed's target is its last
+         * qbeg bytes. */
+        chain_ext_window_bind(ext_win, c, rmax, leftRefOffset, rightRefOffset,
+                              leftQerOffset, rightQerOffset);
+        bool qleft_win_staged_here = false;
+        if (ext_win.qleft_len < s->qbeg) {
+            int64_t qleft_len = s->qbeg;
+            for (int k = 0; k < c->n; ++k)
+                if (c->seeds[k].qbeg > qleft_len) qleft_len = c->seeds[k].qbeg;
+            ext_win.qleft_base = leftQerOffset;
+            ext_win.qleft_len = qleft_len;
+            ext_win.qleft_used = false;
+            leftQerOffset += qleft_len;
+            qleft_win_staged_here = true;
+        }
 
         int64_t tmp;
-        leftQerOffset += s->qbeg;
-        if (leftQerOffset >= *wsize_buf_qer)
+        if (qleft_win_staged_here && leftQerOffset >= *wsize_buf_qer)
         {
             if (bwa_verbose >= 4) fprintf(stderr, "[%0.4d] Re-allocating (doubling) seqBufQers in %s (left)\n",
                     tid, __func__);
@@ -6554,12 +6655,35 @@ static inline void stage_seed_extension(
             mmc->seqBufRightQer[tid*CACHE_LINE] = seqBufRightQer = seqBufQer_;
         }
 
+        if (qleft_win_staged_here) {
+            uint8_t *win = seqBufLeftQer + ext_win.qleft_base;
+            for (int64_t i = 0; i < ext_win.qleft_len; ++i)
+                win[i] = query[ext_win.qleft_len - 1 - i];
+        }
+        xassert(s->qbeg <= ext_win.qleft_len,
+                "extension: left query target is longer than the chain's staged read prefix");
+        sp.idq = ext_win.qleft_base + ext_win.qleft_len - s->qbeg;
         uint8_t *qs = seqBufLeftQer + sp.idq;
-        for (int i = 0; i < s->qbeg; ++i) qs[i] = query[s->qbeg - 1 - i];
 
         tmp = s->rbeg - rmax[0];
-        leftRefOffset += tmp;
-        if (leftRefOffset >= *wsize_buf_ref)
+        /* Stage the chain's reversed reference prefix once (see ChainExtWindow),
+         * sized for the chain's farthest left-extending seed; this seed's target
+         * is its last `tmp` bytes. */
+        bool left_win_staged_here = false;
+        if (ext_win.left_len < tmp) {
+            int64_t left_len = tmp;
+            for (int k = 0; k < c->n; ++k) {
+                const mem_seed_t *t = &c->seeds[k];
+                if (t->qbeg > 0 && t->rbeg - rmax[0] > left_len)
+                    left_len = t->rbeg - rmax[0];
+            }
+            ext_win.left_base = leftRefOffset;
+            ext_win.left_len = left_len;
+            ext_win.left_used = false;
+            leftRefOffset += left_len;
+            left_win_staged_here = true;
+        }
+        if (left_win_staged_here && leftRefOffset >= *wsize_buf_ref)
         {
             if (bwa_verbose >= 4) fprintf(stderr, "[%0.4d] Re-allocating (doubling) seqBufRefs in %s (left)\n",
                     tid, __func__);
@@ -6578,8 +6702,15 @@ static inline void stage_seed_extension(
             mmc->seqBufRightRef[tid*CACHE_LINE] = seqBufRightRef = seqBufRef_;
         }
 
+        if (left_win_staged_here) {
+            uint8_t *win = seqBufLeftRef + ext_win.left_base;
+            for (int64_t i = 0; i < ext_win.left_len; ++i)
+                win[i] = rseq[ext_win.left_len - 1 - i]; //seq1
+        }
+        xassert(tmp <= ext_win.left_len,
+                "extension: left target is longer than the chain's staged reference prefix");
+        sp.idr = ext_win.left_base + ext_win.left_len - tmp;
         uint8_t *rs = seqBufLeftRef + sp.idr;
-        for (int64_t i = 0; i < tmp; ++i) rs[i] = rseq[tmp - 1 - i]; //seq1
 
         sp.len2 = s->qbeg;
         sp.len1 = tmp;
@@ -6629,10 +6760,22 @@ static inline void stage_seed_extension(
                     tprof[UGP_L_CAT_FIN_BASE + 3 * UGP_CAT_NBINS + _bin][tid]++;
                 }
 #endif
-                // Roll back the qs/rs buffer offsets we just
-                // consumed; the batch won't reference them.
-                leftQerOffset -= s->qbeg;
-                leftRefOffset -= tmp;
+                // The batch won't reference this seed's targets. A
+                // shared query or reference window is rolled back only
+                // when this seed staged it (so it is the last thing in
+                // its buffer and no staged pair points into it) and it
+                // is the chain's only seed. Otherwise it is kept for the
+                // chain's other seeds: re-staging it per HIT would copy
+                // the whole window per seed, the cost the sharing exists
+                // to avoid.
+                if (qleft_win_staged_here && c->n == 1) {
+                    leftQerOffset -= ext_win.qleft_len;
+                    ext_win.qleft_len = -1;
+                }
+                if (left_win_staged_here && c->n == 1) {
+                    leftRefOffset -= ext_win.left_len;
+                    ext_win.left_len = -1;
+                }
                 // Mirror post-SW extraction (~line 2560).
                 a->score = fp_score;
                 if (fp_gscore <= 0 || fp_gscore <= a->score - opt->pen_clip5) {
@@ -6725,6 +6868,7 @@ static inline void stage_seed_extension(
 #endif
 
         seqPairArrayLeft128[numPairsLeft] = sp;
+        ext_win.left_used = ext_win.qleft_used = true;
         numPairsLeft ++;
         a->qb = s->qbeg; a->rb = s->rbeg;
         LEFT_DONE: ;
@@ -6775,11 +6919,27 @@ static inline void stage_seed_extension(
         sp.len2 = l_query - qe;
         sp.len1 = rmax[1] - rmax[0] - re;
 
-        sp.idq = rightQerOffset;
-        sp.idr = rightRefOffset;
-
-        rightQerOffset += sp.len2;
-        if (rightQerOffset >= *wsize_buf_qer)
+        /* Stage the chain's read suffix once (see ChainExtWindow), starting
+         * at the chain's smallest right-extending seed end; this seed's target
+         * is its suffix from qe. */
+        chain_ext_window_bind(ext_win, c, rmax, leftRefOffset, rightRefOffset,
+                              leftQerOffset, rightQerOffset);
+        bool qright_win_staged_here = false;
+        if (ext_win.qright_beg < 0 || qe < ext_win.qright_beg) {
+            int64_t qright_beg = qe;
+            for (int k = 0; k < c->n; ++k) {
+                const mem_seed_t *t = &c->seeds[k];
+                const int64_t t_qe = t->qbeg + t->len;
+                if (t_qe != l_query && t_qe < qright_beg) qright_beg = t_qe;
+            }
+            ext_win.qright_base = rightQerOffset;
+            ext_win.qright_beg = qright_beg;
+            ext_win.qright_len = l_query - qright_beg;
+            ext_win.qright_used = false;
+            rightQerOffset += ext_win.qright_len;
+            qright_win_staged_here = true;
+        }
+        if (qright_win_staged_here && rightQerOffset >= *wsize_buf_qer)
         {
             if (bwa_verbose >= 4) fprintf(stderr, "[%0.4d] Re-allocating (doubling) seqBufQers in %s (right)\n",
                     tid, __func__);
@@ -6799,8 +6959,35 @@ static inline void stage_seed_extension(
             mmc->seqBufRightQer[tid*CACHE_LINE] = seqBufRightQer = seqBufQer_;
         }
 
-        rightRefOffset += sp.len1;
-        if (rightRefOffset >= *wsize_buf_ref)
+        if (qright_win_staged_here) {
+            uint8_t *win = seqBufRightQer + ext_win.qright_base;
+            memcpy(win, query + ext_win.qright_beg, (size_t)ext_win.qright_len);
+        }
+        xassert(qe >= ext_win.qright_beg,
+                "extension: right query target starts before the chain's staged read suffix");
+        sp.idq = ext_win.qright_base + (qe - ext_win.qright_beg);
+
+        /* Stage the chain's forward reference suffix once (see ChainExtWindow),
+         * starting at the chain's leftmost right-extending seed end; this
+         * seed's target is its suffix from `re`. */
+        const int64_t win_len = rmax[1] - rmax[0];
+        bool right_win_staged_here = false;
+        if (ext_win.right_beg < 0 || re < ext_win.right_beg) {
+            int64_t right_beg = re;
+            for (int k = 0; k < c->n; ++k) {
+                const mem_seed_t *t = &c->seeds[k];
+                const int64_t t_re = t->rbeg + t->len - rmax[0];
+                if (t->qbeg + t->len != l_query && t_re < right_beg && t_re >= 0)
+                    right_beg = t_re;
+            }
+            ext_win.right_base = rightRefOffset;
+            ext_win.right_beg = right_beg;
+            ext_win.right_len = win_len - right_beg;
+            ext_win.right_used = false;
+            rightRefOffset += ext_win.right_len;
+            right_win_staged_here = true;
+        }
+        if (right_win_staged_here && rightRefOffset >= *wsize_buf_ref)
         {
             if (bwa_verbose >= 4) fprintf(stderr, "[%0.4d] Re-allocating (doubling) seqBufRefs in %s (right)\n",
                     tid, __func__);
@@ -6821,12 +7008,16 @@ static inline void stage_seed_extension(
 
         // CHN-16: dead tprof[PE23] counter removed (bumped per extension, never reported)
 
+        if (right_win_staged_here) {
+            uint8_t *win = seqBufRightRef + ext_win.right_base;
+            memcpy(win, rseq + ext_win.right_beg, (size_t)ext_win.right_len); //seq1
+        }
+        xassert(re >= ext_win.right_beg,
+                "extension: right target starts before the chain's staged reference suffix");
+        sp.idr = ext_win.right_base + (re - ext_win.right_beg);
+
         uint8_t *qs = seqBufRightQer + sp.idq;
         uint8_t *rs = seqBufRightRef + sp.idr;
-
-        for (int i = 0; i < sp.len2; ++i) qs[i] = query[qe + i];
-
-        for (int i = 0; i < sp.len1; ++i) rs[i] = rseq[re + i]; //seq1
 
         sp.tight_band = 0; sp.chain_band = chain_band;
         sp.ugp_r_attempted = 0;
@@ -6856,9 +7047,16 @@ static inline void stage_seed_extension(
                 tprof[UGP_R_UNGAPPED][tid]++;
                 tprof[UGP_SCORE_HIST_BASE + 1 * UGP_SCORE_HIST_NBINS
                       + ugp_score_bin(fp_score)][tid]++;
-                // Roll back the qs/rs buffer offsets.
-                rightQerOffset -= sp.len2;
-                rightRefOffset -= sp.len1;
+                // Roll back the shared query and reference windows
+                // under the LEFT-side conditions.
+                if (qright_win_staged_here && c->n == 1) {
+                    rightQerOffset -= l_query - ext_win.qright_beg;
+                    ext_win.qright_beg = -1;
+                }
+                if (right_win_staged_here && c->n == 1) {
+                    rightRefOffset -= win_len - ext_win.right_beg;
+                    ext_win.right_beg = -1;
+                }
                 // Mirror post-SW extraction (~line 2777).
                 a->score = fp_score;
                 if (fp_gscore <= 0 || fp_gscore <= a->score - opt->pen_clip3) {
@@ -6901,6 +7099,7 @@ static inline void stage_seed_extension(
          * A & B) are populated post-left-SW once the right pass has
          * finalised sp->tight_band. */
         seqPairArrayRight128[numPairsRight] = sp;
+        ext_win.right_used = ext_win.qright_used = true;
         numPairsRight ++;
         a->qe = qe; a->re = rmax[0] + re;
         RIGHT_DONE: ;
@@ -6987,6 +7186,8 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
 
     int64_t leftRefOffset = 0, rightRefOffset = 0;
     int64_t leftQerOffset = 0, rightQerOffset = 0;
+    ChainExtWindow ext_win;
+    chain_ext_window_reset(ext_win);
 
     // Ungapped fast-path threshold, computed once per call from the scoring
     // model: the largest mismatch count X for which an ungapped diagonal is
@@ -7371,7 +7572,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
                     seqBufLeftRef, seqBufRightRef, seqBufLeftQer, seqBufRightQer,
                     leftRefOffset, rightRefOffset, leftQerOffset, rightQerOffset,
                     numPairsLeft, numPairsRight,
-                    wsize_pair, wsize_buf_ref, wsize_buf_qer, mmc, tid
+                    wsize_pair, wsize_buf_ref, wsize_buf_qer, mmc, tid, ext_win
 #if BWAMEM3_UGP_PROFILE
                     , numPairsLeft128, numPairsLeft16, numPairsLeft1
 #endif
@@ -8111,6 +8312,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
         /* Reuse the (now-consumed) staging arrays for the second batch. */
         numPairsLeft = numPairsRight = 0;
         leftRefOffset = rightRefOffset = leftQerOffset = rightQerOffset = 0;
+        chain_ext_window_reset(ext_win);  /* its staged windows were in the consumed buffers */
 #if BWAMEM3_UGP_PROFILE
         numPairsLeft128 = numPairsLeft16 = numPairsLeft1 = 0;
 #endif
@@ -8199,7 +8401,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
                     seqBufLeftRef, seqBufRightRef, seqBufLeftQer, seqBufRightQer,
                     leftRefOffset, rightRefOffset, leftQerOffset, rightQerOffset,
                     numPairsLeft, numPairsRight,
-                    wsize_pair, wsize_buf_ref, wsize_buf_qer, mmc, tid
+                    wsize_pair, wsize_buf_ref, wsize_buf_qer, mmc, tid, ext_win
 #if BWAMEM3_UGP_PROFILE
                     , numPairsLeft128, numPairsLeft16, numPairsLeft1
 #endif
