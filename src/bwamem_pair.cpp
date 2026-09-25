@@ -326,43 +326,35 @@ static bool rescue_prune_enabled()
     static const bool on = rescue_env_on("BWA3_RESCUE_PRUNE");
     return on;
 }
-/* Default 400 for the hull path; 1000 when banding is on and minsc is the NEON filter's threshold
- * (19): banding turns more of the pruned windows into savings, which pays for the filter on the
- * denser windows (best of {400, 1000, 3000, 10^4, 10^9} measured on WGS-like data). The scalar
- * filter (any other minsc) is too slow on dense windows for that, so it keeps 400. The gate is keyed
- * on minsc, not on which filter ends up running, so the rare window past the NEON filter's capacity
- * (it falls back to the scalar filter) also gets 1000; output is identical at every value. */
+/* The hit gate: BWA3_RESCUE_PRUNE_MAX_HITS, else rescue_prune_max_hits_default (rescue_prune.h,
+ * which the band harness shares). */
 static int rescue_prune_max_hits(int minsc)
 {
     static const int env = rescue_env_int("BWA3_RESCUE_PRUNE_MAX_HITS", -1);
     if (env >= 0) return env;
-    return rescue_band_enabled() && minsc == rescue_prune_neon::MINSC ? 1000 : 400;
+    return rescue_prune_max_hits_default(rescue_band_enabled(), minsc);
 }
-/* Whether pruning is built and enabled at all. It runs only where the NEON filter does (aarch64):
- * the portable scalar filter costs more than it saves against the x86 kswv kernels, so x86 keeps
- * the full window until it has a SIMD filter of its own. rescue_prune_runs adds the per-run
- * preconditions. */
+/* Whether the exact rescue shortcuts are built and enabled at all: they need a SIMD filter (NEON on
+ * aarch64, its SSE4.1 / SSSE3 port on the AVX2 and AVX-512 builds; RESCUE_PRUNE_HAVE_SIMD), since
+ * the portable scalar filter alone costs more than it saves against the kswv kernels, and
+ * BWA3_RESCUE_PRUNE. rescue_exact_runs adds the per-run preconditions. */
 static bool rescue_prune_on()
 {
-#if defined(__aarch64__)
-    const bool arch_ok = true;
-#else
-    const bool arch_ok = false;
-#endif
-    return arch_ok && rescue_prune_enabled();
+    return RESCUE_PRUNE_HAVE_SIMD && rescue_prune_enabled();
 }
 /* BWA3_RESCUE_PRUNE_STATS=1 prints the rescue shortcuts' counters to stderr at exit as one line,
  * "[RESCUE_PRUNE] jobs=.. full=.. b1=.. b2=.. rows_in=.. rows_kept=.. jobs16=.. memo_hits=..
  * reused=.. <stage times> dedup_run=.. dedup_skip=.. dedup_run_regs=.. dedup_skip_regs=..
  * dedup_insert1=.. dedup_insert1_fast=.. dedup_s=..". The first fields are the filter's: jobs
  * filtered, and of them how many kept the full window, were proven to fail (b1, not enqueued) or
- * were narrowed to a hull (b2), with the reference rows before and after, the calls the NEON
+ * were narrowed to a hull (b2), with the reference rows before and after, the calls the SIMD
  * filter answered from its repeat memo, and of those the jobs answered from an identical earlier
  * job's result instead of being enqueued (reused, BWA3_RESCUE_REPEAT). They are the non-vacuity
  * check for the identity A/B: identical output must come with a nonzero number of pruned rows.
  * jobs16 counts the 16-bit rescue jobs, which the filter never sees: the same check for the 16-bit
  * kswv kernels. The dedup_* fields are the post-rescue dedup's (below), which runs on every
- * architecture, so off aarch64 they and jobs16 are the line's only nonzero counters. */
+ * architecture, so in a run that does not prune (rescue_prune_runs) they and jobs16 are the line's
+ * only nonzero counters. */
 struct rescue_prune_stats_t {
     std::atomic<uint64_t> jobs{0}, full{0}, b1{0}, b2{0}, rows_in{0}, rows_kept{0}, jobs16{0}, memo_hits{0},
         reused{0};
@@ -412,14 +404,23 @@ static bool rescue_repeat_enabled()
     return on;
 }
 
-/* Whether pruning can narrow any rescue window in this run: it is on, the rescue is non-meth, and
- * the scoring is one rescue_prune_scoring_ok admits (rescue_prune.h). Keys the length sort and the
- * narrow-offset record / read (each OR'd with --rescue-kmer, which narrows on its own), so a run
- * that cannot prune takes exactly the pre-pruning path. */
-static bool rescue_prune_runs(const mem_opt_t *opt)
+/* Whether the exact shortcuts can run in this run: they are on, the rescue is non-meth, and the
+ * scoring is one rescue_prune_scoring_ok admits (rescue_prune.h; banded pass 1's band is derived
+ * for it too). Banded pass 1 needs nothing more; pruning adds rescue_prune_runs' cost gate. */
+static bool rescue_exact_runs(const mem_opt_t *opt)
 {
     return rescue_prune_on() && !opt->meth_mode
         && rescue_prune_scoring_ok(opt->a, opt->b, opt->o_del, opt->e_del, opt->o_ins, opt->e_ins);
+}
+
+/* Whether pruning can narrow any rescue window in this run: rescue_exact_runs, and the cost gate
+ * (rescue_prune_cost_ok in rescue_prune.h: on x86, only at the default -k 19). Keys the length sort
+ * and the narrow-offset record / read (each OR'd with --rescue-kmer, which narrows on its own), so a
+ * run that cannot prune runs the pre-pruning rescue path, apart from banded pass 1 where
+ * rescue_exact_runs allows it. */
+static bool rescue_prune_runs(const mem_opt_t *opt)
+{
+    return rescue_prune_cost_ok(opt->min_seed_len * opt->a) && rescue_exact_runs(opt);
 }
 
 /* Whether pruning applies to one rescue job: the run can prune, --rescue-kmer is off, and the job
@@ -1220,9 +1221,10 @@ int mem_sam_pe_batch(const mem_opt_t *opt, mem_cache *mmc,
     /* Banded pass 1 beyond the banded parents: needs the default scoring on both gap types (its
      * band bound is derived for it) and non-meth (the band kernel has no freed-cell matrix; this
      * point is also reached under --meth when the batched meth rescue is off) -- both part of
-     * rescue_prune_runs, which also keeps BWA3_RESCUE_PRUNE=0 the whole pre-pruning path -- and
-     * the banding path (aarch64; off under BWA3_RESCUE_BAND=0). */
-    const bool p1_band_any = rescue_prune_runs(opt) && rescue_band_enabled();
+     * rescue_exact_runs, which also keeps BWA3_RESCUE_PRUNE=0 the whole pre-pruning path -- and
+     * the banding path (a NEON or AVX2 band kernel; off under BWA3_RESCUE_BAND=0). It does not
+     * depend on pruning's x86 cost gate: the pass-1 band comes from the pass-0 result alone. */
+    const bool p1_band_any = rescue_exact_runs(opt) && rescue_band_enabled();
     if (p1_band_any) band_reset.b = &matesw_band(mmc, tid);   // pass 1 needs a batch even with no plan
     mem_sam_pe_batch_run(pwsw.get(), seqPairArray, seqBufRef, seqBufQer,
                          aln, pcnt, pcnt8, nthreads, n_banded, band_reset.b, p1_band_any);

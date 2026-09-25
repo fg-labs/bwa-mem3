@@ -20,10 +20,11 @@ The hit gate, `BWA3_RESCUE_PRUNE_MAX_HITS` (default from `rescue_prune_max_hits`
 
 ## Where it runs
 
-Three predicates in `src/bwamem_pair.cpp` scope the filter, each on top of the last:
+Four predicates in `src/bwamem_pair.cpp` scope the filter, each on top of the last:
 
-- `rescue_prune_on`: the build and `BWA3_RESCUE_PRUNE`. The filter runs only on aarch64, where the NEON filter carries it; the scalar filter alone costs more than it saves against the x86 kswv kernels.
-- `rescue_prune_runs`: the run's options. The lemma is derived for the default scoring only (`rescue_prune_scoring_ok`), and `--meth` rescue is excluded. It also keys the length sort of the rescue jobs (`matesw_sort_partitions_by_len`), which groups narrowed windows so a SIMD lane group is not held to the length of one full window, and the recording and reading of the hull offset. A run where it is false takes the pre-pruning path: no filter, no hull offset and no length-sort change.
+- `rescue_prune_on`: the build and `BWA3_RESCUE_PRUNE`. The filter runs only where a SIMD filter carries it (`RESCUE_PRUNE_HAVE_SIMD`: aarch64, and the x86 AVX2 and AVX-512BW builds); the scalar filter alone costs more than it saves against the kswv kernels.
+- `rescue_exact_runs`: the run's options. The lemma is derived for the default scoring only (`rescue_prune_scoring_ok`), and `--meth` rescue is excluded. Banded pass 1 needs nothing more.
+- `rescue_prune_runs`: the cost gate (`rescue_prune_cost_ok`). On x86 pruning runs only at the SIMD filter's threshold, the default `-k 19`: at any other seed length the scalar filter would decide, and against the x86 kswv kernels it costs more than it saves. It also keys the length sort of the rescue jobs (`matesw_sort_partitions_by_len`), which groups narrowed windows so a SIMD lane group is not held to the length of one full window, and the recording and reading of the hull offset. A run where it is false takes the pre-pruning rescue path, except that banded pass 1 still runs wherever `rescue_exact_runs` holds: on x86 at a seed length other than 19, pass 1 is banded while pass 0 runs every window in full. Gate: `rescue_prune_identity.sh`, whose two legs at -k 25 run that combination.
 - `rescue_prune_applies`: the job. Only 8-bit jobs are filtered, and not under `--rescue-kmer`, which narrows windows its own way.
 
 ## The NEON filter

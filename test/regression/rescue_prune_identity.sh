@@ -51,11 +51,17 @@
 # 16-bit rescue jobs everywhere, and must show that each leg's switches took
 # effect (nothing filtered or deduplicated early in the reference, nothing
 # filtered in the dedup leg, nothing banded in the hull leg). Pruning and
-# banding run only on aarch64 (src/bwamem_pair.cpp rescue_prune_on,
+# banding run wherever the build has a SIMD filter and band kernel: aarch64
+# (NEON) and x86 builds whose SIMD floor is avx2 or avx512bw, at the fixture's
+# default -k 19 (src/bwamem_pair.cpp rescue_prune_on, rescue_prune_runs,
 # rescue_band_enabled). There, the stats must show proven failures, narrowed
 # windows, fewer rows kept than examined and (with the gate opened) banded
-# parents, or the identity would be vacuous; elsewhere the pruning legs take
-# the same path and their non-vacuity check is reported as skipped.
+# parents, or the identity would be vacuous; in a build without them (an x86
+# floor below avx2) the pruning legs take the same path and their non-vacuity
+# check is reported as skipped. A reference and a default leg at -k 25 must
+# match too: there x86 prunes nothing (its cost gate, rescue_prune_cost_ok) but
+# still bands pass 1, so the stats must show banded pass-1 jobs (and filtered
+# jobs on aarch64, none on x86).
 #
 # Inputs:
 #   BWA_MEM3     — path to the bwa-mem3 binary under test
@@ -198,13 +204,24 @@ PY
 
 "$BIN" index ref.fa > /dev/null 2>&1 || fail "index nonzero exit"
 
+MEM_OPTS=() # extra `mem` options for the legs that follow; set per block
 run_leg() { # $1 = threads, $2 = output stem, rest = env assignments
     local t="$1" stem="$2"
     shift 2
-    env "$@" "$BIN" mem -t "$t" ref.fa r1.fq r2.fq 2> "$stem.err" | grep -v '^@PG' > "$stem.sam" \
-        || fail "leg $stem nonzero exit"
+    env "$@" "$BIN" mem ${MEM_OPTS[@]+"${MEM_OPTS[@]}"} -t "$t" ref.fa r1.fq r2.fq 2> "$stem.err" \
+        | grep -v '^@PG' > "$stem.sam" || fail "leg $stem nonzero exit"
     [ "$(grep -cv '^@' "$stem.sam" || true)" -gt 0 ] || fail "leg $stem produced no alignment records"
 }
+
+# The build's SIMD floor decides which shortcuts it carries: the SIMD filter and band kernel on
+# neon, avx2 and avx512bw; neither below avx2 (an unrecognised floor is treated as carrying them,
+# so its checks fail rather than skip).
+floor="$("$BIN" version 2>&1 | sed -n 's/^SIMD floor: \([a-z0-9]*\).*/\1/p' | head -1 || true)"
+[ -n "$floor" ] || fail "could not read the SIMD floor from \`$BIN version\` (no 'SIMD floor: <tier>' line)"
+case "$floor" in
+    sse41 | sse42 | avx | scalar) has_simd=0 ;;
+    *) has_simd=1 ;;
+esac
 
 # The reference: every shortcut and alternative kernel form off. Defined once so
 # the unforced and forced-tier references cannot drift apart.
@@ -226,6 +243,32 @@ for t in 1 4; do
         fi
     done
 done
+
+# A seed length other than the default -k 19: on x86 pruning's cost gate turns pruning off there
+# (rescue_prune_cost_ok) while banded pass 1 still runs (rescue_exact_runs), a combination no
+# default-k leg reaches; on aarch64 both run. Must equal the reference at the same -k.
+MEM_OPTS=(-k 25)
+run_leg 4 "k25full.t4" BWA3_RESCUE_PRUNE_STATS=1 "${REF_ENV[@]}"
+run_leg 4 "k25.t4" BWA3_RESCUE_PRUNE_STATS=1
+MEM_OPTS=()
+if ! cmp -s k25full.t4.sam k25.t4.sam; then
+    echo "FAIL: rescue at -k 25 differs from the reference at -k 25 (-t 4):" >&2
+    diff k25full.t4.sam k25.t4.sam | head -20 >&2 || true
+    exit 1
+fi
+kstats="$(grep '^\[RESCUE_PRUNE\]' k25.t4.err || true)"
+[ -n "$kstats" ] || fail "BWA3_RESCUE_PRUNE_STATS=1 printed no [RESCUE_PRUNE] line (-k 25 leg)"
+kjobs=$(printf '%s\n' "$kstats" | tr ' ' '\n' | sed -n 's/^jobs=//p')
+kbstats="$(grep '^\[RESCUE_BAND\]' k25.t4.err || true)"
+kp1=$(printf '%s\n' "$kbstats" | tr ' ' '\n' | sed -n 's/^pass1_banded=//p')
+k25_note="; -k 25: jobs=${kjobs:-0} pass1_banded=${kp1:-0}"
+if [ "$has_simd" = 1 ]; then
+    [ "${kp1:-0}" -gt 0 ] || fail "no banded pass-1 job at -k 25 (SIMD floor '$floor'): $kstats $kbstats"
+    case "$floor" in
+        neon) [ "${kjobs:-0}" -gt 0 ] || fail "pruning filtered no rescue job at -k 25 on aarch64: $kstats" ;;
+        *) [ "${kjobs:-0}" -eq 0 ] || fail "x86 pruned at -k 25, past its -k 19 cost gate: $kstats" ;;
+    esac
+fi
 
 # Forced tiers: the reference and default legs under each listed tier the host
 # has must equal the unforced reference. Ranked against the dispatcher's own
@@ -293,13 +336,13 @@ stats="$(grep '^\[RESCUE_PRUNE\]' prune.t1.err || true)"
 [ -n "$stats" ] || fail "BWA3_RESCUE_PRUNE_STATS=1 printed no [RESCUE_PRUNE] line"
 jobs=$(field jobs) full=$(field full) b1=$(field b1) b2=$(field b2) rows_in=$(field rows_in) rows_kept=$(field rows_kept)
 if [ "$jobs" -eq 0 ]; then
-    # Pruning is compiled in on aarch64, so no filtered job there means it stopped engaging (a
-    # gate or fixture regression) and the identity above held vacuously.
-    case "$(uname -m)" in
-        aarch64 | arm64) fail "pruning filtered no rescue job on an aarch64 host: $stats" ;;
-    esac
-    echo "PASS: rescue_prune_identity (11-op cell, NEON-form defaults and dedup shortcuts == reference at -t 1 and -t 4; $dstats$tier_note)"
-    echo "SKIP: pruning does not run on this host (aarch64 only); its legs held trivially"
+    # Pruning is compiled in wherever the build's SIMD floor carries the SIMD filter, so no
+    # filtered job there means it stopped engaging (a gate or fixture regression) and the identity
+    # above held vacuously.
+    [ "$has_simd" = 0 ] \
+        || fail "pruning filtered no rescue job, though this build (SIMD floor '$floor') has the SIMD filter: $stats"
+    echo "PASS: rescue_prune_identity (11-op cell, NEON-form defaults and dedup shortcuts == reference at -t 1 and -t 4; $dstats$tier_note$k25_note)"
+    echo "SKIP: pruning does not run in this build (SIMD floor $floor, below the SIMD filter's avx2); its legs held trivially"
     exit 0
 fi
 [ "$full" -gt 0 ] || fail "no filtered job kept its full window (the N mates stopped reaching the filter): $stats"
@@ -326,4 +369,4 @@ p1stats="$(grep '^\[RESCUE_BAND\]' prune.t1.err || true)"
 p1=$(printf '%s\n' "$p1stats" | tr ' ' '\n' | sed -n 's/^pass1_banded=//p')
 [ "${p1:-0}" -gt 0 ] || fail "no banded pass-1 (start recovery) job at the defaults: $p1stats"
 
-echo "PASS: rescue_prune_identity (11-op cell, NEON-form defaults, dedup shortcuts, hull, pruned and banded == reference at -t 1 and -t 4; $dstats$tier_note; $stats; $bstats)"
+echo "PASS: rescue_prune_identity (11-op cell, NEON-form defaults, dedup shortcuts, hull, pruned and banded == reference at -t 1 and -t 4; $dstats$tier_note$k25_note; $stats; $bstats)"

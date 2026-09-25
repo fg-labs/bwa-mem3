@@ -746,7 +746,7 @@ int main(int argc, char **argv)
     const int minsc = rescue_env_int("RB_MINSC", MINSC_DEFAULT);
     /* The production default (rescue_prune_max_hits in bwamem_pair.cpp). */
     const int max_hits = rescue_env_int("BWA3_RESCUE_PRUNE_MAX_HITS",
-                                        rescue_band_enabled() && minsc == rescue_prune_neon::MINSC ? 1000 : 400);
+                                        rescue_prune_max_hits_default(rescue_band_enabled(), minsc));
     std::vector<Job> jobs;
     if (argc < 4) {
         fprintf(stderr, "usage: %s eq <ngen> <seed> [dumps...] | time <reps> <stride> <dumps...>\n", argv[0]);

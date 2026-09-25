@@ -227,6 +227,41 @@ static inline uint64_t rescue_prune_memo_hits()
 #endif
 }
 
+/* The default hit gate (BWA3_RESCUE_PRUNE_MAX_HITS unset), for a run with banding on or off at
+ * rescue threshold minsc: 400 for the hull path. On aarch64, 1000 when banding is on and minsc is
+ * the SIMD filter's threshold (19): banding turns more of the pruned windows into savings, which
+ * pays for the filter on the denser windows (best of {400, 1000, 3000, 10^4, 10^9} measured on
+ * WGS-like data); the scalar filter (any other minsc) is too slow on dense windows for that. The
+ * gate is keyed on minsc, not on which filter ends up running, so the rare window past the SIMD
+ * filter's capacity (it falls back to the scalar filter) also gets 1000. On x86, 400 with banding
+ * too: the x86 kswv kernels are cheap enough that the extra filter work on dense windows does not
+ * pay (prune + band, wall, 1000 vs 400: Zen 3 AVX2 wgs-5M 74.52 vs 73.57 s, wes-5M 38.57 vs
+ * 37.65 s; Zen 5 AVX-512 wgs-5M 27.53 vs 26.73 s). Output is identical at every value. */
+static inline int rescue_prune_max_hits_default(bool banding, int minsc)
+{
+#if defined(__aarch64__)
+    return banding && minsc == rescue_prune_neon::MINSC ? 1000 : 400;
+#else
+    (void)banding; (void)minsc;
+    return 400;
+#endif
+}
+
+/* Whether pruning pays at rescue threshold minsc (the cost gate beside the exactness preconditions,
+ * which the caller checks). Everywhere on aarch64. On x86 only at the SIMD filter's threshold
+ * (rescue_prune_neon::MINSC, the default -k 19): at any other minsc the scalar filter decides, and
+ * against the x86 kswv kernels it costs more than it saves (prune on vs off, wall: Zen 5 AVX-512
+ * +3 to +13 % at -k 10 / 15 / 25 / 32 on wgs-5M and wes-5M; Zen 3 AVX2 +1 to +6 % at -k 25 / 32). */
+static inline bool rescue_prune_cost_ok(int minsc)
+{
+#if defined(__aarch64__)
+    (void)minsc;
+    return true;
+#else
+    return minsc == rescue_prune_neon::MINSC;
+#endif
+}
+
 /* Decide how much of a rescue window must be computed. Valid only under a scoring
  * rescue_prune_scoring_ok() admits and on the 8-bit kernel path; the caller checks both.
  *   ref, len1   reference window, bases 0-3 (>= 4 is N)

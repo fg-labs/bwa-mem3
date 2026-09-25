@@ -1,6 +1,6 @@
 # Banded rescue DP
 
-Pruning narrows a rescue window to the hull of the diagonal components that can reach the threshold. Banding goes further: the DP runs only inside the diagonal bands of those components, 16 bands per NEON vector, and the job's kswv outputs are reassembled from the bands' per-row maxima. The code is `src/rescue_band.h` (the argument, at the top) and `src/rescue_band.cpp` (the planner, the kernels and the merge). It runs on aarch64 only (`rescue_band_enabled`) and only where pruning runs (`rescue_prune_runs`): pass 0 bands jobs the pruning filter narrowed, and pass 1 bands any eligible 8-bit job, narrowed or not.
+Pruning narrows a rescue window to the hull of the diagonal components that can reach the threshold. Banding goes further: the DP runs only inside the diagonal bands of those components, 16 bands per NEON vector (32 per AVX2 vector), and the job's kswv outputs are reassembled from the bands' per-row maxima. The code is `src/rescue_band.h` (the argument, at the top), `src/rescue_band.cpp` (the planner, the NEON kernels and the merge) and `src/rescue_band_kernel_x86.h` (the AVX2 kernels). It runs where a band kernel exists, NEON on aarch64 and AVX2 on x86 (`rescue_band_enabled`): pass 0 bands jobs the pruning filter narrowed, so it runs only where pruning does (`rescue_prune_runs`), and pass 1 bands any eligible 8-bit job, narrowed or not (`rescue_exact_runs`).
 
 ## Why a band is enough
 
@@ -34,7 +34,7 @@ Pass 1 finds where the best alignment starts: kswv runs the DP on the reversed p
 - `1`, the fused cell of [the 11-op rescue cell](rescue-kswv.md) one row at a time (`RB_CELL1`); the note there explains why dropping an in-row gap run followed directly by a vertical one cannot change an output: such an alignment has an equal-scoring twin, with the two runs swapped, inside the same band;
 - `2` (default), the fused cell two rows per step with the query end read directly from the scan (`rb_dp_wave2`).
 
-`BWA3_RESCUE_FSCAN=0`, which turns the fused cell off in kswv, selects kernel 0 here as well. Within a 16-lane group, `run_jobs` shifts each narrower lane's spare diagonals below its band so the lanes' query offsets line up (`BWA3_RESCUE_BAND_SHIFT=0` turns that off). Every combination leaves output identical. Gate: `Banded rescue == kswv (rescue_band_harness, generated jobs)`, which runs kernel 1 and the shift off as legs of their own.
+`BWA3_RESCUE_FSCAN=0`, which turns the fused cell off in kswv, selects kernel 0 here as well. Within a lane group, `run_jobs` shifts each narrower lane's spare diagonals below its band so the lanes' query offsets line up (`BWA3_RESCUE_BAND_SHIFT=0` turns that off). Every combination leaves output identical. Gate: `Banded rescue == kswv (rescue_band_harness, generated jobs)`, which runs kernel 1 and the shift off as legs of their own.
 
 ## The AVX2 kernel
 
