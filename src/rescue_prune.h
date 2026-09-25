@@ -162,14 +162,12 @@ struct rescue_prune_view {
     const int16_t *minrow = nullptr;
     const int16_t *bnd16 = nullptr;
     const int32_t *fwd = nullptr, *bwd = nullptr;
-    const uint64_t *mw = nullptr;   // NEON: bitset of diagonals with bnd >= 19
-    const uint64_t *hw = nullptr;   // NEON: bitset of diagonals with bnd >= 19 and a hit
-#if defined(__aarch64__)
-    /* NEON: the filter's own components at bnd >= 19 with a hit (all of [0, nd)), in diagonal
+    const uint64_t *mw = nullptr;   // SIMD filter: bitset of diagonals with bnd >= 19
+    const uint64_t *hw = nullptr;   // SIMD filter: bitset of diagonals with bnd >= 19 and a hit
+    /* SIMD filter: its own components at bnd >= 19 with a hit (all of [0, nd)), in diagonal
      * order; the first min(ncomp, ncomp_stored) are in comps. ncomp < 0: not available. */
     const rescue_prune_neon::Comp *comps = nullptr;
     int ncomp = -1, ncomp_stored = 0;
-#endif
 };
 
 /* The view of a rescue_prune_window_scalar call on (len1, len2) that returned RESCUE_PRUNE_B2. */

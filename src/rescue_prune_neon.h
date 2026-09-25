@@ -141,11 +141,39 @@ static inline Kind lean(const Job &jb, Scratch &s, int &hb, int &he)
 //  7. Components: bitsets of (bnd >= 19) and (bnd >= 19 && cnt > 0) built in the backward scan;
 //     per component with a hit (few) ub = vector max of bnd, dmax = highest hit bit, and
 //     lo = masked vector min of minrow.
-#if defined(__aarch64__)
 /* A diagonal component at MINSC with a hit, as step 7 finds it (shifted diagonal indices x = d + off):
  * the mw run [a, b), ub = max bnd over it, i0 = min minrow over its hit diagonals, dmax = its
  * highest hit diagonal. rescue_band.cpp reuses the list instead of rescanning the view at MINSC. */
 struct Comp { int32_t a, b, ub, i0, dmax; };
+
+// The component bitset scanners, plain C++ shared with the x86 port (rescue_prune_x86.h) and
+// band planning (rescue_band.cpp).
+// First index >= from with bit set (inv=0) / clear (inv=~0) in the bitset w, or n if none.
+static inline int bitset_next(const uint64_t *w, int from, int n, uint64_t inv)
+{
+    if (from >= n) return n;
+    int k = from >> 6;
+    uint64_t x = (w[k] ^ inv) & (~0ull << (from & 63));
+    const int nw = (n + 63) >> 6;
+    while (!x) { if (++k >= nw) return n; x = w[k] ^ inv; }
+    const int r = (k << 6) + __builtin_ctzll(x);
+    return r < n ? r : n;
+}
+
+// Highest set bit in [a, b) of bitset w, or -1.
+static inline int bitset_last(const uint64_t *w, int a, int b)
+{
+    if (b <= a) return -1;
+    int k = (b - 1) >> 6;
+    uint64_t x = w[k] & (~0ull >> (63 - ((b - 1) & 63)));
+    for (;;) {
+        if (x) { const int r = (k << 6) + 63 - __builtin_clzll(x); return r >= a ? r : -1; }
+        if (--k < (a >> 6)) return -1;
+        x = w[k];
+    }
+}
+
+#if defined(__aarch64__)
 struct NeonScratch {
     static const int CAP = 4096 + 64;
     alignas(16) uint8_t rbuf[CAP + 64];   // 4 zero bytes, ref, zero padding
@@ -210,31 +238,6 @@ struct NeonScratch {
         memset(MH, 0, sizeof MH);
     }
 };
-
-// First index >= from with bit set (inv=0) / clear (inv=~0) in the bitset w, or n if none.
-static inline int neon_next(const uint64_t *w, int from, int n, uint64_t inv)
-{
-    if (from >= n) return n;
-    int k = from >> 6;
-    uint64_t x = (w[k] ^ inv) & (~0ull << (from & 63));
-    const int nw = (n + 63) >> 6;
-    while (!x) { if (++k >= nw) return n; x = w[k] ^ inv; }
-    const int r = (k << 6) + __builtin_ctzll(x);
-    return r < n ? r : n;
-}
-
-// Highest set bit in [a, b) of bitset w, or -1.
-static inline int neon_last(const uint64_t *w, int a, int b)
-{
-    if (b <= a) return -1;
-    int k = (b - 1) >> 6;
-    uint64_t x = w[k] & (~0ull >> (63 - ((b - 1) & 63)));
-    for (;;) {
-        if (x) { const int r = (k << 6) + 63 - __builtin_clzll(x); return r >= a ? r : -1; }
-        if (--k < (a >> 6)) return -1;
-        x = w[k];
-    }
-}
 
 // Left-pack store: the u16 lanes of v selected by the shuffle sh (a row of NeonScratch::shuf),
 // moved to the front and stored at out (all 8 lanes are written; the caller advances by pc[]).
@@ -620,9 +623,9 @@ static inline Kind lean_neon_core(const Job &jb, NeonScratch &s, int &hb, int &h
     // ---- 7. components (runs of mw) with a hit: ub = max bnd; dmax = last hw bit; lo = min over
     //      them of minrow on hit diagonals. 8-wide over [a & ~7, b), lanes outside [a, b) masked. ----
     int hi = -1, lo = 32767, nc = 0;
-    for (int d = neon_next(s.mw, 0, nd, 0); d < nd;) {
-        const int a = d, b = neon_next(s.mw, a, nd, ~0ull);
-        const int dmax = neon_last(s.hw, a, b);
+    for (int d = bitset_next(s.mw, 0, nd, 0); d < nd;) {
+        const int a = d, b = bitset_next(s.mw, a, nd, ~0ull);
+        const int dmax = bitset_last(s.hw, a, b);
         if (dmax >= 0) {
             const int16x8_t IOs = vreinterpretq_s16_u16(IO), va = vdupq_n_s16((int16_t)a), vb = vdupq_n_s16((int16_t)b);
             int16x8_t mx = small, mn = big;
@@ -646,7 +649,7 @@ static inline Kind lean_neon_core(const Job &jb, NeonScratch &s, int &hb, int &h
             if (nc < NeonScratch::COMP_CAP) s.comps[nc] = Comp{a, b, ub, i0, dmax};
             nc++;
         }
-        d = neon_next(s.mw, b, nd, 0);
+        d = bitset_next(s.mw, b, nd, 0);
     }
     if (hi < 0) return B1;
     hb = std::max(0, lo);
