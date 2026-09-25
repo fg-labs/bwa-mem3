@@ -805,6 +805,17 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
                 char from_lo = is_r2 ? 'g' : 'c';
                 char to   = is_r2 ? 'A' : 'T';
                 int l = s->l_seq;
+                /* The fast FASTQ reader keeps a sequence line's full parsed
+                 * length even when it holds a control byte (0, TAB, CR, ...).
+                 * Everything below treats s->seq as l_seq ASCII bases, and the
+                 * YS:Z/YC:Z comment built from it is read as a tab-separated C
+                 * string, so such a byte would end that comment early (losing
+                 * YC:Z, hence XR:Z, and every -C tag) or forge a tag in it; it
+                 * would also be scored as base code 0-3 by extension while SEQ
+                 * printed N. Write each as N before any copy is taken, so
+                 * seeding, extension, SEQ and the carrier all see one base. */
+                for (int j = 0; j < l; ++j)
+                    if ((unsigned char)s->seq[j] < 0x20) s->seq[j] = 'N';
                 /* Build the YS:Z/YC:Z comment. Preserve any prior FASTQ
                  * comment (e.g. -C carries barcode/UMI SAM tags) by appending
                  * it after YC; otherwise --meth silently strips -C metadata. */
@@ -826,10 +837,15 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
                  * Same orientation/order as s->seq (original read order, ASCII);
                  * downstream consumers must RC it wherever they RC s->seq — see
                  * the bseq1_t.meth_orig_seq orientation contract in bwa.h.
-                 * strdup is fine for the draft; freed in the per-batch free
-                 * loop below alongside s->seq. */
-                s->meth_orig_seq = strdup(s->seq);
+                 * Copy exactly l_seq bytes rather than strdup: every consumer
+                 * reads l_seq bytes of this copy, and l_seq, not a terminator,
+                 * is the read's length (a strdup stopped at an embedded 0 byte
+                 * before the normalization above existed). Freed in the
+                 * per-batch free loop below alongside s->seq. */
+                s->meth_orig_seq = (char *)malloc((size_t)l + 1);
                 xassert(s->meth_orig_seq != NULL, "out of memory: s->meth_orig_seq");
+                memcpy(s->meth_orig_seq, s->seq, (size_t)l);
+                s->meth_orig_seq[l] = '\0';
                 /* --meth: read-number chemistry (R1=OT=1, R2=OB=0) for the
                  * seed-chemistry filter in meth_seed_to_orig. */
                 s->meth_base_ot = is_r2 ? 0 : 1;
@@ -1212,7 +1228,7 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
                  * is freed once below — do NOT free them individually here.
                  * comment stays heap-owned (see the reader / --meth notes), and
                  * sam/bams are allocated during processing; those still free
-                 * per-read. meth_orig_seq is a step-0 heap strdup (NULL outside
+                 * per-read. meth_orig_seq is a step-0 heap copy (NULL outside
                  * --meth; free() is NULL-safe). */
                 free(ret->seqs[i+k].comment);
                 free(ret->seqs[i+k].sam);
