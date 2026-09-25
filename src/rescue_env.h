@@ -21,10 +21,11 @@
  *     BWA3_RESCUE_PRUNE          1     prune rescue windows by exact 5-mer bounds
  *     BWA3_RESCUE_PRUNE_MAX_HITS auto  skip the filter on windows with more 5-mer hits than
  *                                      this; auto is 1000 when banding is on and minsc == 19
- *                                      (the NEON filter), else 400
- *   banded rescue (src/rescue_band.{h,cpp}, aarch64 only; read once)
- *     BWA3_RESCUE_BAND           1     run pruned pass-0 jobs in diagonal bands (0: kswv on the
- *                                      hull, and MAX_HITS auto back to 400)
+ *                                      (the SIMD filter), else 400
+ *   banded rescue (src/rescue_band.{h,cpp}, NEON or AVX2 kernel; read once)
+ *     BWA3_RESCUE_BAND           1/0   run pruned pass-0 jobs in diagonal bands (0: kswv on the
+ *                                      hull, and MAX_HITS auto back to 400); default 1 on
+ *                                      aarch64, 0 on x86 (opt in with 1)
  *     BWA3_RESCUE_BAND_COST      85    band a pass-0 parent iff its band cells are < this % of
  *                                      the hull's
  *     BWA3_RESCUE_BAND_R2        1     run round 2 banded (0: kswv on the hull)

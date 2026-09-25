@@ -17,6 +17,9 @@
 #define RB_HAVE_SIMD 1
 static const int RB_L = 16;
 static const int RB_PAD = 16;
+static const uint8_t RB_QPAD = 0x40;   // query pad code (see the NEON kernel section)
+#elif defined(__AVX2__)
+#include "rescue_band_kernel_x86.h"   // RB_L = 32, the AVX2 kernel and run_jobs helpers
 #endif
 
 /* ------------------------------------------------------------------------------------------ */
@@ -25,7 +28,11 @@ static const int RB_PAD = 16;
 
 bool rescue_band_enabled()
 {
-#if RB_HAVE_SIMD
+#if RB_X86
+    /* x86: opt in with BWA3_RESCUE_BAND=1 until the x86 cost gates are tuned */
+    static const bool on = rescue_env_opt_in("BWA3_RESCUE_BAND");
+    return on;
+#elif RB_HAVE_SIMD
     static const bool on = rescue_env_flag("BWA3_RESCUE_BAND");
     return on;
 #else
@@ -285,6 +292,21 @@ bool rescue_band_components(const rescue_prune_view &v, int tau, int xa, int xb,
 {
 #if defined(__aarch64__)
     if (v.bnd16 && v.mw && v.hw && tau >= rescue_prune_neon::MINSC) return rb_components_neon(v, tau, xa, xb, out, cap);
+#else
+    /* The whole view at MINSC: the SIMD filter already listed these components (the same runs and
+     * values as the scan below; test/rescue_prune_eq checks the list). Reproduce the scan's result:
+     * append until out holds cap, false iff any component did not fit. */
+    if (v.comps && tau == rescue_prune_neon::MINSC && xa == 0 && xb == v.nd && v.ncomp >= 0 &&
+        (v.ncomp == v.ncomp_stored || (int)out.size() + v.ncomp_stored >= cap)) {
+        for (int k = 0; k < v.ncomp; k++) {
+            if ((int)out.size() >= cap) return false;
+            const rescue_prune_neon::Comp &c = v.comps[k];
+            rb_comp K;
+            K.ub = c.ub; K.i0 = c.i0; K.dlo = c.a - v.off; K.dhi = c.b - 1 - v.off; K.dmaxhit = c.dmax - v.off;
+            out.push_back(K);
+        }
+        return true;
+    }
 #endif
     if (v.bnd16) {
         const int16_t *b16 = v.bnd16;
@@ -346,6 +368,11 @@ bool RescueBandBatch::plan(const rescue_prune_view &v, int len1, int len2, int h
             if (K.ub > ub1) { ub2 = ub1; ub1 = K.ub; }
             else if (K.ub > ub2) ub2 = K.ub;
         }
+#if RB_X86
+        /* The x86 cell's biased add is exact only while every H <= 250 (rescue_band_kernel_x86.h);
+         * every band H is at most ub1. Above that the parent keeps the hull (kswv). */
+        if (ub1 > 250) ok = false;
+#endif
         T1 = std::max(minsc, ub2 / 2);
         /* Tight top band. When the whole hull lies inside the zone [te - S, te + S], the true
          * score2 is exactly -1 (every row with R >= minsc is in the hull, so no b[] anchor can be
@@ -1075,7 +1102,7 @@ void RescueBandBatch::run_jobs(bool pass1)
             const uint8_t *q = J.qry - pq0;
             for (int p = a; p < b; p++) { const uint8_t c = q[p]; row[p] = c < 4 ? c : 8; }
             const int c0 = std::max(0, pq0 + J.len2), c1 = std::min(P, pq0 + J.quanta);
-            if (c1 > c0) memset(row + c0, 0x40, c1 - c0);
+            if (c1 > c0) memset(row + c0, RB_QPAD, c1 - c0);
         }
         rb_transpose_to(ST, stride, P, w.A.data());
         rb_build_ql(w.A.data(), w.QL.data(), P);

@@ -1,5 +1,5 @@
 /* Exactness + timing harness for the banded mate rescue (src/rescue_band.{h,cpp}).
- * Build: `make rescue-band-harness` (aarch64 only).
+ * Build: `make rescue-band-harness` (arch=arm64 on aarch64, arch=avx2 on x86).
  *
  *   rescue_band_harness eq   <gen-jobs> <seed> [dump files...]   exactness (exit 1 on any mismatch
  *                                                                or pass-1 guard fallback)

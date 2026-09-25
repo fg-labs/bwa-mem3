@@ -975,16 +975,13 @@ rescue-prune-eq: rescue_prune_eq
 rescue_prune_eq: test/rescue_prune_eq.cpp src/rescue_prune.h src/rescue_prune_neon.h src/rescue_prune_x86.h
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $< -o $@
 
-ifneq ($(IS_ARM),)
+# NEON on aarch64, AVX2 on x86 (build with arch=avx2 there; libbwa.a carries the per-tier kswv
+# objects that make_kswv dispatches to).
 rescue_band_harness: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) $(if $(filter 1,$(USE_MIMALLOC)),$(MIMALLOC_LIB)) test/rescue_band_harness.o
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/rescue_band_harness.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) $(MIMALLOC_LDFLAGS) -o $@
 
 test/rescue_band_harness.o: test/rescue_band_harness.cpp $(FLAGS_STAMP)
 	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
-else
-rescue_band_harness:
-	$(error rescue_band_harness is aarch64-only: the banded rescue kernel is NEON)
-endif
 
 # Regression test for the fmi_seed_api.h facade's max_occ guard: forwarding
 # max_occ <= 0 into FMI_search::get_sa_entries_prefetch divides by max_occ.

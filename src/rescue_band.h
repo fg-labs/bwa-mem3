@@ -53,8 +53,9 @@
  * is not cheaper than kswv, or whose banded max is not S (cannot happen; kept as a guard), run
  * kswv phase 1.
  *
- * Scope: aarch64 only (the NEON kernel); default scoring, 8-bit, non-meth, minsc in [19, 255]
- * (rescue_prune_applies). x86 keeps the hull path.
+ * Scope: the NEON kernel (aarch64, 16 lanes) and the AVX2 kernel (x86, 32 lanes,
+ * rescue_band_kernel_x86.h; opt-in there); default scoring, 8-bit, non-meth, minsc in [19, 255]
+ * (rescue_prune_applies). Without a SIMD kernel the hull path runs.
  * Env: the BWA3_RESCUE_BAND* toggles, all listed with their defaults in rescue_env.h. */
 #ifndef BWA_MEM3_RESCUE_BAND_H
 #define BWA_MEM3_RESCUE_BAND_H
