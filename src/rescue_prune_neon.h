@@ -135,11 +135,37 @@ static inline Kind lean(const Job &jb, Scratch &s, int &hb, int &he)
 //  7. Components: bitsets of (bnd >= 19) and (bnd >= 19 && cnt > 0) built in the backward scan;
 //     per component with a hit (few) ub = vector max of bnd, dmax = highest hit bit, and
 //     lo = masked vector min of minrow.
-#if defined(__aarch64__)
 /* A diagonal component at MINSC with a hit, as step 7 finds it (shifted diagonal indices x = d + off):
  * the mw run [a, b), ub = max bnd over it, i0 = min minrow over its hit diagonals, dmax = its
  * highest hit diagonal. rescue_band.cpp reuses the list instead of rescanning the view at MINSC. */
 struct Comp { int32_t a, b, ub, i0, dmax; };
+
+// First index >= from with bit set (inv=0) / clear (inv=~0) in the bitset w, or n if none.
+static inline int neon_next(const uint64_t *w, int from, int n, uint64_t inv)
+{
+    if (from >= n) return n;
+    int k = from >> 6;
+    uint64_t x = (w[k] ^ inv) & (~0ull << (from & 63));
+    const int nw = (n + 63) >> 6;
+    while (!x) { if (++k >= nw) return n; x = w[k] ^ inv; }
+    const int r = (k << 6) + __builtin_ctzll(x);
+    return r < n ? r : n;
+}
+
+// Highest set bit in [a, b) of bitset w, or -1.
+static inline int neon_last(const uint64_t *w, int a, int b)
+{
+    if (b <= a) return -1;
+    int k = (b - 1) >> 6;
+    uint64_t x = w[k] & (~0ull >> (63 - ((b - 1) & 63)));
+    for (;;) {
+        if (x) { const int r = (k << 6) + 63 - __builtin_clzll(x); return r >= a ? r : -1; }
+        if (--k < (a >> 6)) return -1;
+        x = w[k];
+    }
+}
+
+#if defined(__aarch64__)
 struct NeonScratch {
     static const int CAP = 4096 + 64;
     alignas(16) uint8_t rbuf[CAP + 64];   // 4 zero bytes, ref, zero padding
@@ -200,31 +226,6 @@ struct NeonScratch {
         memset(MH, 0, sizeof MH);
     }
 };
-
-// First index >= from with bit set (inv=0) / clear (inv=~0) in the bitset w, or n if none.
-static inline int neon_next(const uint64_t *w, int from, int n, uint64_t inv)
-{
-    if (from >= n) return n;
-    int k = from >> 6;
-    uint64_t x = (w[k] ^ inv) & (~0ull << (from & 63));
-    const int nw = (n + 63) >> 6;
-    while (!x) { if (++k >= nw) return n; x = w[k] ^ inv; }
-    const int r = (k << 6) + __builtin_ctzll(x);
-    return r < n ? r : n;
-}
-
-// Highest set bit in [a, b) of bitset w, or -1.
-static inline int neon_last(const uint64_t *w, int a, int b)
-{
-    if (b <= a) return -1;
-    int k = (b - 1) >> 6;
-    uint64_t x = w[k] & (~0ull >> (63 - ((b - 1) & 63)));
-    for (;;) {
-        if (x) { const int r = (k << 6) + 63 - __builtin_clzll(x); return r >= a ? r : -1; }
-        if (--k < (a >> 6)) return -1;
-        x = w[k];
-    }
-}
 
 // In-register 8x8 transpose of 16-bit lanes: x[k][s] <-> x[s][k].
 static inline void neon_transpose8(int16x8_t *x)
@@ -663,9 +664,6 @@ static inline Kind lean_neon(const Job &jb, NeonScratch &s, int &hb, int &he, in
     s.memo_view_nd = s.view_nd; s.memo_kind = k;
     return k;
 }
-#else
-struct NeonScratch { Scratch fallback; };
-static inline Kind lean_neon(const Job &jb, NeonScratch &s, int &hb, int &he) { return lean(jb, s.fallback, hb, he); }
 #endif
 
 }  // namespace rescue_prune_neon
