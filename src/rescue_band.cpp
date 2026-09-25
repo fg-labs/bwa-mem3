@@ -291,8 +291,13 @@ bool rescue_band_components(const rescue_prune_view &v, int tau, int xa, int xb,
 #if defined(__aarch64__)
     if (v.bnd16 && v.mw && v.hw && tau >= rescue_prune_neon::MINSC) return rb_components_neon(v, tau, xa, xb, out, cap);
 #endif
-    /* A NEON view always carries mw / hw, and plan() asks only for tau >= minsc >= 19, so it always
-     * takes the branch above; what reaches here is a scalar view (fwd / bwd). */
+    /* A NEON view always carries mw / hw, and plan() asks only for tau >= minsc >= 19, so on aarch64
+     * it always takes the branch above. What reaches here is the x86 filter's view (bnd16, the
+     * bound precomputed) or a scalar view (fwd / bwd). */
+    if (v.bnd16) {
+        const int16_t *b16 = v.bnd16;
+        return rb_components_scalar(v, [b16](int x) { return (int)b16[x]; }, tau, xa, xb, out, cap);
+    }
     const int32_t *fw = v.fwd, *bw = v.bwd;
     const uint16_t *cn = v.cnt;
     return rb_components_scalar(v, [fw, bw, cn](int x) { return 5 + fw[x] + bw[x] - ((int)cn[x] - 1); },

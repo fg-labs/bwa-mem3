@@ -1,10 +1,12 @@
-/* Equivalence check for the NEON rescue-pruning filter (src/rescue_prune_neon.h) against the scalar
- * filter, through the public rescue_prune_window() API.
+/* Equivalence check for the SIMD rescue-pruning filter this build compiles in (NEON on aarch64,
+ * src/rescue_prune_neon.h; the SSE4.1 / SSSE3 port on x86 AVX2 builds, src/rescue_prune_x86.h)
+ * against the scalar filter, through the public rescue_prune_window() API.
  *
- * For every job at the NEON filter's threshold (rescue_prune_neon::MINSC): the NEON path must return
- * the scalar path's (kind, hb, he), and on a NEON B2 its view must match the scalar arrays -- cnt and
+ * For every job at the SIMD filter's threshold (rescue_prune_neon::MINSC): the SIMD path must return
+ * the scalar path's (kind, hb, he), and on a SIMD B2 its view must match the scalar arrays -- cnt and
  * minrow (where cnt > 0) on [0, nd), bnd16 == 5 + fwd + bwd - (cnt - 1), the mw / hw bits
- * (bnd >= MINSC, and cnt > 0) on [0, nd) -- and its component list (runs of bnd >= MINSC with a hit:
+ * (bnd >= MINSC, and cnt > 0) on [0, nd) and clear on [nd, nd + 64), which band planning reads as
+ * whole 64-diagonal words -- and its component list (runs of bnd >= MINSC with a hit:
  * a, b, ub, i0, dmax) with its count. Half of the jobs run twice in a row, the second time from a
  * copy of the bytes in other buffers, which exercises the filter's repeat memo: the repeat must
  * return the same decision and view as the first call.
@@ -18,8 +20,9 @@
  *                                     query), each at the hull (400) and banded (1000) gates and
  *                                     with the gate open
  *
- * Exit status 1 on any disagreement, and when no job took the NEON path (a vacuous run). aarch64
- * only: elsewhere rescue_prune_window() is the scalar filter itself. Build: make rescue-prune-eq.
+ * Exit status 1 on any disagreement, and when no job took the SIMD path (a vacuous run). Needs a SIMD
+ * filter: aarch64, or x86 built with arch=avx2 / arch=avx512bw; elsewhere rescue_prune_window() is
+ * the scalar filter itself. Build: make rescue-prune-eq.
  *
  * RPE_NEGATIVE_CONTROL=1 shifts the scalar filter's hb by one on the first B2 job, so a working
  * check must report a MISMATCH and exit 1; CI runs it first to prove the comparison still bites. */
@@ -35,8 +38,8 @@
 #include <string>
 #include <vector>
 
-#if !defined(__aarch64__)
-#error "rescue_prune_eq checks the NEON filter and builds on aarch64 only"
+#if !RESCUE_PRUNE_HAVE_SIMD
+#error "rescue_prune_eq checks the SIMD rescue filter: build on aarch64, or on x86 with arch=avx2 or arch=avx512bw"
 #endif
 
 namespace {
@@ -45,7 +48,7 @@ using rescue_prune_neon::Comp;
 using rescue_prune_neon::MINSC;
 
 struct Stats {
-    long jobs = 0, neon = 0, over_cap = 0, repeats = 0, memo_hits = 0, bad = 0, kind[3] = {0, 0, 0};
+    long jobs = 0, simd = 0, over_cap = 0, repeats = 0, memo_hits = 0, bad = 0, kind[3] = {0, 0, 0};
 };
 
 /* The scalar fields of two views of one job. Their arrays alias the same per-thread scratch, so
@@ -56,13 +59,13 @@ bool same_view(const rescue_prune_view &a, const rescue_prune_view &b)
     return a.nd == b.nd && a.off == b.off && a.ncomp == b.ncomp && a.ncomp_stored == b.ncomp_stored;
 }
 
-/* The NEON view v of a B2 decision against the scalar filter's arrays in r for the same job. */
+/* The SIMD view v of a B2 decision against the scalar filter's arrays in r for the same job. */
 bool check_view(int len1, int len2, const rescue_prune_view &v, const rescue_prune_scratch &r, std::string &why)
 {
     const rescue_prune_view sv = rescue_prune_scalar_view(r, len1, len2);
     const int nd = sv.nd;
     if (v.nd != nd || v.off != sv.off) { why = "nd / off"; return false; }
-    if (!v.mw || !v.hw || !v.comps || v.ncomp < 0) { why = "NEON view incomplete"; return false; }
+    if (!v.mw || !v.hw || !v.comps || v.ncomp < 0) { why = "SIMD view incomplete"; return false; }
     auto bit = [](const uint64_t *w, int x) { return (int)(w[x >> 6] >> (x & 63) & 1); };
     auto bnd = [&](int x) { return 5 + r.fwd[x] + r.bwd[x] - ((int)r.cnt[x] - 1); };
     for (int x = 0; x < nd; x++) {
@@ -72,6 +75,8 @@ bool check_view(int len1, int len2, const rescue_prune_view &v, const rescue_pru
         if (bit(v.mw, x) != (bnd(x) >= MINSC)) { why = "mw at " + std::to_string(x); return false; }
         if (bit(v.hw, x) != (bnd(x) >= MINSC && r.cnt[x] > 0)) { why = "hw at " + std::to_string(x); return false; }
     }
+    for (int x = nd; x < nd + 64; x++)
+        if (bit(v.mw, x) || bit(v.hw, x)) { why = "bitset pad at " + std::to_string(x); return false; }
     std::vector<Comp> want;
     for (int x = 0; x < nd;) {
         if (bnd(x) < MINSC) { x++; continue; }
@@ -87,7 +92,7 @@ bool check_view(int len1, int len2, const rescue_prune_view &v, const rescue_pru
         why = "ncomp " + std::to_string(v.ncomp) + " vs " + std::to_string(want.size());
         return false;
     }
-    if (v.ncomp_stored != std::min(v.ncomp, (int)rescue_prune_neon::NeonScratch::COMP_CAP)) {
+    if (v.ncomp_stored != std::min(v.ncomp, (int)rescue_prune_simd_scratch_t::COMP_CAP)) {
         why = "ncomp_stored";
         return false;
     }
@@ -129,19 +134,19 @@ void run_one(const uint8_t *ref, int len1, const uint8_t *q, int len2, int max_h
         st.memo_hits += hit;
         st.jobs++;
         if (rep == 0) st.kind[kind[0]]++;
-        const bool neon = kind[rep] == RESCUE_PRUNE_B2 && view[rep].bnd16 != nullptr;
-        st.neon += neon;
-        st.over_cap += neon && view[rep].ncomp > rescue_prune_neon::NeonScratch::COMP_CAP;
+        const bool simd = kind[rep] == RESCUE_PRUNE_B2 && view[rep].bnd16 != nullptr;
+        st.simd += simd;
+        st.over_cap += simd && view[rep].ncomp > rescue_prune_simd_scratch_t::COMP_CAP;
         std::string why;
         bool ok = kind[rep] == k0 && (k0 != RESCUE_PRUNE_B2 || (hb[rep] == h0 && he[rep] == e0));
         if (!ok) why = "decision (" + std::to_string(kind[rep]) + "," + std::to_string(hb[rep]) + "," +
                        std::to_string(he[rep]) + ") vs scalar (" + std::to_string(k0) + "," + std::to_string(h0) +
                        "," + std::to_string(e0) + ")";
-        if (ok && neon) ok = check_view(len1, len2, view[rep], r, why);
+        if (ok && simd) ok = check_view(len1, len2, view[rep], r, why);
         if (ok && rep == 1 && !same_view(view[0], view[1])) { ok = false; why = "repeat view differs"; }
         if (ok && view[rep].repeat != hit) { ok = false; why = "view.repeat disagrees with the memo counter"; }
         /* The memo may answer only a byte-for-byte repeat of the previous call that reached the
-         * NEON filter (the wrapper's guards return before it, leaving its memo alone). */
+         * SIMD filter (the wrapper's guards return before it, leaving its memo alone). */
         static std::vector<uint8_t> last_ref, last_q;
         static int last_mh = -1;
         const bool repeat = max_hits == last_mh && last_ref.size() == (size_t)len1 && last_q.size() == (size_t)len2
@@ -214,7 +219,7 @@ void run_fuzz(long n, unsigned seed, Stats &st)
         for (int j = 0; j < len2; j++) q[(size_t)j] = period ? (uint8_t)((j % period) * 7 % 4) : (uint8_t)rnd(0, 3);
         if (mode == 6)
             for (int j = rnd(8, 24); j < len2; j++) q[(size_t)j] = q[(size_t)std::max(0, j - rnd(1, 8))];
-        /* windows: tiny, near the NEON filter's capacity (past it the scalar filter decides), long
+        /* windows: tiny, near the SIMD filter's capacity (past it the scalar filter decides), long
          * enough for many components, or typical */
         const int len1 = mode == 0 ? rnd(1, 40) : mode == 1 ? rnd(3700, 4200) : mode == 5 ? rnd(2800, 3700)
                                                                                            : rnd(5, 2400);
@@ -278,14 +283,14 @@ int main(int argc, char **argv)
         fprintf(stderr, "unknown mode %s\n", argv[1]);
         return 2;
     }
-    printf("eq %s: jobs=%ld repeats=%ld memo_hits=%ld neon_b2=%ld over_comp_cap=%ld full=%ld b1=%ld b2=%ld "
+    printf("eq %s: jobs=%ld repeats=%ld memo_hits=%ld simd_b2=%ld over_comp_cap=%ld full=%ld b1=%ld b2=%ld "
            "MISMATCHES=%ld\n",
-           mode.c_str(), st.jobs, st.repeats, st.memo_hits, st.neon, st.over_cap, st.kind[RESCUE_PRUNE_FULL],
+           mode.c_str(), st.jobs, st.repeats, st.memo_hits, st.simd, st.over_cap, st.kind[RESCUE_PRUNE_FULL],
            st.kind[RESCUE_PRUNE_B1], st.kind[RESCUE_PRUNE_B2], st.bad);
-    if (st.neon == 0) fprintf(stderr, "FAIL: no job took the NEON filter's B2 path; the run compared nothing\n");
+    if (st.simd == 0) fprintf(stderr, "FAIL: no job took the SIMD filter's B2 path; the run compared nothing\n");
     /* Repeats run straight after their job, so a memo that never answers one has stopped working
      * (a correctness no-op, but the repeat checks above would then test nothing). */
     const bool memo_dead = st.repeats > 0 && st.memo_hits == 0;
     if (memo_dead) fprintf(stderr, "FAIL: %ld repeats and no memo hit; the repeat memo never engaged\n", st.repeats);
-    return st.bad || st.neon == 0 || memo_dead ? 1 : 0;
+    return st.bad || st.simd == 0 || memo_dead ? 1 : 0;
 }

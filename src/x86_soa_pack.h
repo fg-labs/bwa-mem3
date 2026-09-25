@@ -17,7 +17,8 @@
  * two independent 16-lane groups at once and one on __m512i four: register j
  * holds lane j in its first 128 bits, lane j+16 in its second, and so on, and
  * after the transpose register k holds SoA row k for all SIMD_WIDTH8 lanes in
- * the order the kernels expect. */
+ * the order the kernels expect. The single-register 8x8 halfword network
+ * (x86_transpose8x8_s16) lives here too, for the x86 rescue filter. */
 #ifndef BWAMEM3_X86_SOA_PACK_H
 #define BWAMEM3_X86_SOA_PACK_H
 
@@ -215,6 +216,28 @@ static inline __m128i x86_soa_piece8_u16(const uint8_t *seq, int len, int padSta
             tmp[t] = (k < padStart) ? padA : padB;
     }
     return _mm_loadu_si128((const __m128i *)tmp);
+}
+
+/* The same 8x8 halfword network on single __m128i registers (x[k][s] <-> x[s][k]), for the x86
+ * rescue filter's segment scans (rescue_prune_x86.h), the counterpart of neon_transpose8x8_s16. */
+static inline void x86_transpose8x8_s16(__m128i r[8])
+{
+    __m128i a[8];
+    for (int p = 0; p < 4; p++) {
+        a[2 * p]     = _mm_unpacklo_epi16(r[2 * p], r[2 * p + 1]);
+        a[2 * p + 1] = _mm_unpackhi_epi16(r[2 * p], r[2 * p + 1]);
+    }
+    __m128i b[8];
+    for (int h = 0; h < 2; h++) {
+        b[4 * h]     = _mm_unpacklo_epi32(a[4 * h],     a[4 * h + 2]);
+        b[4 * h + 1] = _mm_unpackhi_epi32(a[4 * h],     a[4 * h + 2]);
+        b[4 * h + 2] = _mm_unpacklo_epi32(a[4 * h + 1], a[4 * h + 3]);
+        b[4 * h + 3] = _mm_unpackhi_epi32(a[4 * h + 1], a[4 * h + 3]);
+    }
+    for (int m = 0; m < 4; m++) {
+        r[2 * m]     = _mm_unpacklo_epi64(b[m], b[4 + m]);
+        r[2 * m + 1] = _mm_unpackhi_epi64(b[m], b[4 + m]);
+    }
 }
 
 /* 8x8 halfword transpose per 128-bit lane of 8 __m256i: on entry r[j] holds
