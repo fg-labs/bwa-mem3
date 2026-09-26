@@ -70,11 +70,13 @@ struct rescue_prune_params {
     }
     /* The SIMD filters hard-code K = 5, weights cnt - 1, the constant 5 and the tail ub - tau - 2. */
     bool simd_ok() const { return valid && K == 5 && a == 1 && c == 1 && o_del == 6 && e_del == 1; }
-    /* The default scoring without --meth: what the band kernels are derived for. */
     bool default_scoring() const
     {
         return conv_from < 0 && a == 1 && b == 4 && o_del == 6 && e_del == 1 && o_ins == 6 && e_ins == 1;
     }
+    /* The band kernels take any valid scoring with the symmetric score table (no --meth: its freed
+     * cells need an asymmetric table the kernels do not have yet). */
+    bool band_ok() const { return valid && conv_from < 0; }
     /* --meth: the rescued mate is scored with mat_ot (hyp 1: reference C / read T freed) or mat_ob
      * (hyp 0: reference G / read A freed); collapsed scoring also frees the mirror cell. */
     void set_meth(int hyp)
@@ -124,6 +126,7 @@ struct rescue_prune_scratch {
     int16_t minrow[DCAP];
     int32_t fwd[DCAP], bwd[DCAP];
     int view_nd = -1;   // nd of the last call that returned B2 (arrays valid), else -1
+    int view_base = 5, view_a = 1, view_c = 1, view_minsc = 19;   // that call's bound constants
 };
 
 /* Scalar implementation: any valid scoring, and the SIMD filters' fallback. At the parameters the
@@ -206,6 +209,7 @@ static inline int rescue_prune_window_scalar(const uint8_t *ref, int len1, const
     *hb = std::max(0, lo);
     *he = std::min(len1 - 1, hi);
     s.view_nd = nd;
+    s.view_base = base; s.view_a = p.a; s.view_c = p.c; s.view_minsc = minsc;
     return RESCUE_PRUNE_B2;
 }
 
@@ -213,13 +217,13 @@ static inline int rescue_prune_window_scalar(const uint8_t *ref, int len1, const
  * diagonal components at thresholds above minsc (rescue_band.h). Valid only right after a call
  * that returned RESCUE_PRUNE_B2, and only when nd >= 0 (the SIMD paths' rare scalar fallback
  * leaves nd = -1). Diagonal index x in [0, nd) is the unshifted diagonal d = i - j = x - off.
- * Exactly one of bnd16 (SIMD filter: bnd precomputed) or fwd/bwd (scalar: bnd = base + fwd + bwd -
- * weight(cnt), which is 5 + fwd + bwd - (cnt - 1) at the default scoring, the only one banded) is
- * set. mw, when set, is the SIMD filter's bitset of diagonals with bnd >= minsc
+ * Exactly one of bnd16 (SIMD filter: bnd precomputed; base 5, a 1, c 1) or fwd/bwd (scalar:
+ * bnd = base + fwd + bwd - (a cnt - c)) is set. mw, when set, is the SIMD filter's bitset of diagonals with bnd >= minsc
  * (the minsc of the filter call that produced the view). */
 struct rescue_prune_view {
     int nd = -1, off = 0;
-    int minsc = 0;   // SIMD filter: the threshold of mw, hw and comps
+    int minsc = 0;   // the filter call's threshold (SIMD: of mw, hw and comps)
+    int base = 5, a = 1, c = 1;   // bound constants: bnd = base + fwd + bwd - (a cnt - c)
     const uint16_t *cnt = nullptr;
     const int16_t *minrow = nullptr;
     const int16_t *bnd16 = nullptr;
@@ -291,6 +295,7 @@ static inline rescue_prune_view rescue_prune_last_view()
         if (s.view_nd < 0) return v;
         v.nd = s.view_nd;
         v.off = ((s.qlen_c + 15) / 16) * 16;
+        v.minsc = s.view_minsc; v.base = s.view_base; v.a = s.view_a; v.c = s.view_c;
         v.cnt = s.cnt; v.minrow = s.minrow; v.fwd = s.fwd; v.bwd = s.bwd;
     }
     return v;

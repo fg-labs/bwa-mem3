@@ -514,7 +514,12 @@ static int run_eq(std::vector<Job> &all_jobs, int minsc_default, int max_hits, i
             nmeth[meth]++;
         }
         const int minsc = pp.minsc;
-        const bool band = rescue_band_enabled() && pp.valid && pp.default_scoring();   // identity only
+        /* As production: pass-0 banding for any scoring the filter accepts (not --meth), pass-1
+         * banding for any scoring the kernels take (rb_scoring::valid), not --meth. */
+        const rb_scoring bsc = {pp.a, pp.b, pp.o_del, pp.e_del, pp.o_ins, pp.e_ins};
+        const bool band = rescue_band_enabled() && pp.band_ok();
+        const bool p1_any = rescue_band_enabled() && !meth && bsc.valid();
+        if (rescue_band_enabled()) rescue_band_batch().set_scoring(bsc);
         nbatch++; nvalid += pp.valid; if (pp.valid) nk[pp.K]++;
         /* This batch's jobs: mates too long for the 8-bit kernels at this a are cut to a random
          * admissible slice (the planted copies still match it). */
@@ -564,7 +569,7 @@ static int run_eq(std::vector<Job> &all_jobs, int minsc_default, int max_hits, i
             if (kind[t] == RESCUE_PRUNE_B2) {
                 nb2++;
                 if (band)
-                    rescue_band_batch().plan(rescue_prune_last_view(), len1, len2, hb, he, minsc);
+                    rescue_band_batch().plan(rescue_prune_last_view(), pp, len1, len2, hb, he);
                 off[t] = hb;
                 idx[t] = P.add(J.ref.data() + hb, he - hb + 1, J.q.data(), len2, minsc);
             } else {
@@ -579,7 +584,7 @@ static int run_eq(std::vector<Job> &all_jobs, int minsc_default, int max_hits, i
         const int nbd = band ? rescue_band_batch().partition(P.sp.data(), pn) : 0;
         nband += nbd;
         const uint64_t pb0 = rescue_band_batch().stats.p1_band, pg0 = rescue_band_batch().stats.p1_guard;
-        run_batch(k.get(), P, nbd, band);
+        run_batch(k.get(), P, nbd, p1_any);
         p1_band += (long)(rescue_band_batch().stats.p1_band - pb0);
         p1_guard += (long)(rescue_band_batch().stats.p1_guard - pg0);
         rescue_band_batch().reset();
@@ -690,7 +695,8 @@ static void run_time(std::vector<Job> &jobs, int minsc, int max_hits, int reps)
                     if (kd == RESCUE_PRUNE_B1) continue;
                     if (kd == RESCUE_PRUNE_B2 && mode == 1) {
                         a = clk::now();
-                        rescue_band_batch().plan(rescue_prune_last_view(), len1, len2, hb, he, minsc);
+                        rescue_band_batch().plan(rescue_prune_last_view(), rescue_prune_params::defaults(minsc),
+                                                 len1, len2, hb, he);
                         tp += std::chrono::duration<double>(clk::now() - a).count();
                     }
                     int id;

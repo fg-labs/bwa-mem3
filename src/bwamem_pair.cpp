@@ -1187,12 +1187,15 @@ int mem_sam_pe_batch(const mem_opt_t *opt, mem_cache *mmc,
     /* Banded parents first (stable, so the kswv remainder keeps its length sort). */
     const int64_t n_banded = rescue_band_enabled() ? rescue_band_batch().partition(seqPairArray, (int)pcnt8) : 0;
 
-    /* Banded pass 1 beyond the banded parents: needs the default scoring on both gap types (its
-     * band bound is derived for it), non-meth (the band kernel has no freed-cell matrix; this
-     * point is also reached under --meth when the batched meth rescue is off) and the banding
-     * path (aarch64; off under BWA3_RESCUE_BAND=0). */
-    const bool p1_band_any = rescue_band_enabled() && !opt->meth_mode && opt->a == 1 && opt->b == 4
-        && opt->o_del == 6 && opt->o_ins == 6 && opt->e_del == 1 && opt->e_ins == 1;
+    /* Banded pass 1 beyond the banded parents: any scoring the band kernels take (rb_scoring::valid;
+     * the band bound of rescue_band.h holds for any of them), non-meth (the band kernel has no
+     * freed-cell matrix; this point is also reached under --meth when the batched meth rescue is
+     * off) and the banding path (off under BWA3_RESCUE_BAND=0). */
+    rb_scoring band_sc;
+    band_sc.a = opt->a; band_sc.b = opt->b; band_sc.o_del = opt->o_del; band_sc.e_del = opt->e_del;
+    band_sc.o_ins = opt->o_ins; band_sc.e_ins = opt->e_ins;
+    const bool p1_band_any = rescue_band_enabled() && !opt->meth_mode && band_sc.valid();
+    if (rescue_band_enabled()) rescue_band_batch().set_scoring(band_sc);
     mem_sam_pe_batch_run(pwsw.get(), seqPairArray, seqBufRef, seqBufQer,
                          aln, pcnt, pcnt8, nthreads, n_banded, p1_band_any);
 
@@ -1733,10 +1736,11 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                 const int kind = rescue_prune_window(ref, (int)(re - rb), oq.data(), l_ms, pp,
                                                      rescue_prune_max_hits(pp.minsc), &hb, &he);
                 /* Banding plan (rescue_band.h), bound to this pair's regid at enqueue (commit). The
-                 * band kernels are derived for the default scoring only. */
-                if (kind == RESCUE_PRUNE_B2 && rescue_band_enabled() && pp.default_scoring())
-                    rescue_band_batch().plan(rescue_prune_last_view(), (int)(re - rb), l_ms, hb, he,
-                                             opt->min_seed_len * opt->a);
+                 * band kernels take any valid symmetric scoring (not --meth's freed cells). */
+                if (kind == RESCUE_PRUNE_B2 && rescue_band_enabled() && pp.band_ok()) {
+                    rescue_band_batch().set_scoring(rb_scoring::from(pp));
+                    rescue_band_batch().plan(rescue_prune_last_view(), pp, (int)(re - rb), l_ms, hb, he);
+                }
                 if (g_rescue_prune_stats.on) g_rescue_prune_stats.ns_filter += rescue_now_ns() - tf0;
                 if (g_rescue_prune_stats.on) {
                     g_rescue_prune_stats.jobs++;

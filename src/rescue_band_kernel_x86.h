@@ -16,12 +16,13 @@
  *    too (a lane's rows are the prefix [0, nrows)).
  *  - The cell's H + score is the biased form of the x86 kswv u8 kernels:
  *        h = subs_epu8(adds_epu8(Hp, sc), bias),   sc = PSHUFB(tblb, q ^ r),
- *    tblb = the default-scoring table + 4 (match 5, mismatch 0, N 3), bias = 4 on real query
- *    columns and 0 on pad / nonexistent ones (where sc is 0, so h = Hp as NEON's +0 gives). This
- *    equals NEON's sat(Hp + s) iff Hp + s + 4 <= 255, i.e. while every H is <= 250 (an H of 251+
- *    plus a match would saturate at 255 before the subtract). Every band H is a local alignment
- *    score, so H <= ub1 in pass 0 (the 5-mer bound of the parent's best component; plan() refuses
- *    ub1 > 250 on x86) and H <= S in pass 1 (take_pass1 requires S + 4 < 255).
+ *    tblb = the score table + shift (match a + shift, mismatch shift - b, N shift - 1; shift =
+ *    max(1, b), all >= 0), bias = shift on real query columns and 0 on pad / nonexistent ones
+ *    (where sc is 0, so h = Hp as NEON's +0 gives). This equals NEON's sat(Hp + s) iff
+ *    Hp + a + shift <= 255 (an H above that plus a match would saturate at 255 before the
+ *    subtract). Every band H is a local alignment score, so H <= ub1 in pass 0 (the K-mer bound of
+ *    the parent's best component; plan() refuses ub1 + a + shift > 255 on x86) and H <= S in pass 1
+ *    (take_pass1 requires S + a + shift <= 255). At the default scoring: H <= 250.
  * The live-column mask QL (A < 0xC0) is unchanged; the per-position bias BI is built from A at the
  * start of each kernel. */
 #ifndef BWA_MEM3_RESCUE_BAND_KERNEL_X86_H
@@ -48,8 +49,25 @@ struct rb_work {
     alignas(32) uint8_t target[32];
     /* rb_dp_wave2's qe: band index of the lane's qe cell, k = kb_chunk * 255 + kb_off - 1. */
     alignas(32) uint8_t kb_chunk[32], kb_off[32];
+    /* The batch scoring (rb_set_scoring): the biased table (both 128-bit halves), the bias, and the
+     * gap constants (see the NEON rb_work). */
+    alignas(32) uint8_t tblb[32];
+    uint8_t shift, oe_del, e_del, oe_ins, e_ins;
     template <class V> static void fit(V &v, size_t n) { if (v.size() < n) v.resize(n); }
 };
+
+static inline void rb_set_scoring(rb_work &w, const rb_scoring &sc)
+{
+    const int sh = sc.shift();
+    for (int h = 0; h < 32; h += 16) {
+        w.tblb[h] = (uint8_t)(sc.a + sh);
+        for (int i = 1; i < 4; i++) w.tblb[h + i] = (uint8_t)(sh - sc.b);
+        for (int i = 4; i < 16; i++) w.tblb[h + i] = (uint8_t)(sh - 1);
+    }
+    w.shift = (uint8_t)sh;
+    w.oe_del = (uint8_t)std::min(255, sc.o_del + sc.e_del); w.e_del = (uint8_t)std::min(255, sc.e_del);
+    w.oe_ins = (uint8_t)std::min(255, sc.o_ins + sc.e_ins); w.e_ins = (uint8_t)std::min(255, sc.e_ins);
+}
 
 static inline __m256i rb_ld(const uint8_t *p) { return _mm256_loadu_si256((const __m256i *)p); }
 static inline void rb_st(uint8_t *p, __m256i v) { _mm256_storeu_si256((__m256i *)p, v); }
@@ -116,11 +134,11 @@ static inline void rb_transpose_to(const uint8_t *ST, int stride, int n, uint8_t
     }
 }
 
-/* BI[p] = 4 on real query columns (A < 0x80), 0 on pad / nonexistent ones, for p in [0, P). */
+/* BI[p] = shift on real query columns (A < 0x80), 0 on pad / nonexistent ones, for p in [0, P). */
 static inline void rb_build_bias(rb_work &w, int P)
 {
     rb_work::fit(w.BI, (size_t)P * 32);
-    const __m256i four = _mm256_set1_epi8(4), m1 = _mm256_set1_epi8(-1);
+    const __m256i four = _mm256_set1_epi8((char)w.shift), m1 = _mm256_set1_epi8(-1);
     const uint8_t *A = w.A.data();
     uint8_t *BI = w.BI.data();
     for (int p = 0; p < P; p++) rb_st(BI + p * 32, _mm256_and_si256(_mm256_cmpgt_epi8(rb_ld(A + p * 32), m1), four));
@@ -138,12 +156,8 @@ static inline void rb_snapshot(rb_work &w, const uint8_t *Hrow, int row, int W, 
     }
 }
 
-/* The scoring table + 4 (index q ^ r: 0 match, 1-3 mismatch, 4-15 N), both 128-bit halves. */
-static inline __m256i rb_tblb()
-{
-    return _mm256_setr_epi8(5, 0, 0, 0, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
-                            5, 0, 0, 0, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3);
-}
+/* The biased scoring table (index q ^ r: 0 match, 1-3 mismatch, 4-15 N), both 128-bit halves. */
+static inline __m256i rb_tblb(const rb_work &w) { return _mm256_load_si256((const __m256i *)w.tblb); }
 /* sat(Hp + score(q, r)) in the biased form (see the file comment) */
 static inline __m256i rb_hs(__m256i hp, __m256i q, __m256i rref, __m256i bi, __m256i tbl)
 {
@@ -152,13 +166,15 @@ static inline __m256i rb_hs(__m256i hp, __m256i q, __m256i rref, __m256i bi, __m
 
 /* rb_dp_core of the NEON section, 32 lanes (see there for the row range, the live mask and the
  * FScan cell). */
-template <bool FScan>
+template <bool FScan, bool Sym>
 static long rb_dp_core(rb_work &w, int W, int NR, int omax, int ominq, int omaskq, bool early)
 {
     long computed = 0;
     rb_build_bias(w, NR + W - 1);
-    const __m256i tbl = rb_tblb();
-    const __m256i v7 = _mm256_set1_epi8(7), v1 = _mm256_set1_epi8(1), v2 = _mm256_set1_epi8(2), m1 = _mm256_set1_epi8(-1);
+    const __m256i tbl = rb_tblb(w);
+    const __m256i vOI = _mm256_set1_epi8((char)w.oe_ins), vEI = _mm256_set1_epi8((char)w.e_ins);
+    const __m256i vEI2 = _mm256_set1_epi8((char)(uint8_t)std::min(255, 2 * w.e_ins));
+    const __m256i vOD = _mm256_set1_epi8((char)w.oe_del), vED = _mm256_set1_epi8((char)w.e_del), m1 = _mm256_set1_epi8(-1);
     uint8_t *Hc = w.H.data(), *Hp = Hc + (size_t)W * 32, *E = w.E.data();
     const uint8_t *A = w.A.data(), *QL = w.QL.data(), *BI = w.BI.data(), *REF = w.REF.data();
     uint8_t *Rout = w.R.data();
@@ -182,17 +198,19 @@ static long rb_dp_core(rb_work &w, int W, int NR, int omax, int ominq, int omask
             const __m256i ea = rb_ld(E + k * 32), eb = rb_ld(E + (k - 1) * 32);                \
             const __m256i h0a = _mm256_max_epu8(rb_hs(rb_ld(Hp + k * 32), rb_ld(ap), rref, rb_ld(bp), tbl), ea); \
             const __m256i h0b = _mm256_max_epu8(rb_hs(rb_ld(Hp + (k - 1) * 32), rb_ld(ap + 32), rref, rb_ld(bp + 32), tbl), eb); \
-            const __m256i h07a = _mm256_subs_epu8(h0a, v7), h07b = _mm256_subs_epu8(h0b, v7); \
-            const __m256i fb = _mm256_max_epu8(h07a, _mm256_subs_epu8(f, v1));   /* f_in(k-1) */ \
+            const __m256i h07a = _mm256_subs_epu8(h0a, vOI), h07b = _mm256_subs_epu8(h0b, vOI); \
+            const __m256i fb = _mm256_max_epu8(h07a, _mm256_subs_epu8(f, vEI));  /* f_in(k-1) */ \
             const __m256i ha = _mm256_max_epu8(h0a, f), hb = _mm256_max_epu8(h0b, fb);         \
-            f = _mm256_max_epu8(_mm256_max_epu8(h07b, _mm256_subs_epu8(h07a, v1)), _mm256_subs_epu8(f, v2)); \
+            f = _mm256_max_epu8(_mm256_max_epu8(h07b, _mm256_subs_epu8(h07a, vEI)), _mm256_subs_epu8(f, vEI2)); \
             rb_st(Hc + k * 32, ha);                                                            \
             rb_st(Hc + (k - 1) * 32, hb);                                                      \
             const __m256i ra = FScan ? h0a : ha, rb_ = FScan ? h0b : hb;                       \
             if (MASK) rmax = _mm256_max_epu8(rmax, _mm256_max_epu8(_mm256_and_si256(ra, rb_ld(qp)), _mm256_and_si256(rb_, rb_ld(qp + 32)))); \
             else rmax = _mm256_max_epu8(rmax, _mm256_max_epu8(ra, rb_));                       \
-            rb_st(E + (k + 1) * 32, _mm256_max_epu8(FScan ? h07a : _mm256_subs_epu8(ha, v7), _mm256_subs_epu8(ea, v1))); \
-            rb_st(E + k * 32, _mm256_max_epu8(FScan ? h07b : _mm256_subs_epu8(hb, v7), _mm256_subs_epu8(eb, v1))); \
+            const __m256i hda = FScan ? (Sym ? h07a : _mm256_subs_epu8(h0a, vOD)) : _mm256_subs_epu8(ha, vOD); \
+            const __m256i hdb = FScan ? (Sym ? h07b : _mm256_subs_epu8(h0b, vOD)) : _mm256_subs_epu8(hb, vOD); \
+            rb_st(E + (k + 1) * 32, _mm256_max_epu8(hda, _mm256_subs_epu8(ea, vED)));          \
+            rb_st(E + k * 32, _mm256_max_epu8(hdb, _mm256_subs_epu8(eb, vED)));                \
         }
 #define RB_CELL1(MASK)                                                                          \
         {                                                                                      \
@@ -202,9 +220,10 @@ static long rb_dp_core(rb_work &w, int W, int NR, int omax, int ominq, int omask
             rb_st(Hc + k * 32, h);                                                             \
             const __m256i r_ = FScan ? h0 : h;                                                 \
             rmax = _mm256_max_epu8(rmax, (MASK) ? _mm256_and_si256(r_, rb_ld(qp)) : r_);       \
-            const __m256i h07 = _mm256_subs_epu8(h0, v7);                                      \
-            rb_st(E + (k + 1) * 32, _mm256_max_epu8(FScan ? h07 : _mm256_subs_epu8(h, v7), _mm256_subs_epu8(e, v1))); \
-            f = _mm256_max_epu8(h07, _mm256_subs_epu8(f, v1));                                 \
+            const __m256i h07 = _mm256_subs_epu8(h0, vOI);                                     \
+            const __m256i hd = FScan ? (Sym ? h07 : _mm256_subs_epu8(h0, vOD)) : _mm256_subs_epu8(h, vOD); \
+            rb_st(E + (k + 1) * 32, _mm256_max_epu8(hd, _mm256_subs_epu8(e, vED)));            \
+            f = _mm256_max_epu8(h07, _mm256_subs_epu8(f, vEI));                                \
         }
         for (; k >= kun + 1; k -= 2, ap += 64, qp += 64, bp += 64) RB_CELL2(false)
         if (k == kun) { RB_CELL1(false) k--; ap += 32; qp += 32; bp += 32; }
@@ -262,12 +281,14 @@ static inline void rb_qe_scan(rb_work &w, const uint8_t *Hrow, int row, int W, i
 /* rb_dp_wave2 of the NEON section (the default kernel: the fused cell on two rows per step with
  * the direct qe scan), 32 lanes; see there for the pairing argument. The pair (r, k), (r + 1, k + 1)
  * shares the query slot p, so one A / QL / BI load serves both. */
+template <bool Sym>
 static long rb_dp_wave2(rb_work &w, int W, int NR, int omax, int ominq, int omaskq, bool early)
 {
     long computed = 0;
     rb_build_bias(w, NR + W - 1);
-    const __m256i tbl = rb_tblb();
-    const __m256i v7 = _mm256_set1_epi8(7), v1 = _mm256_set1_epi8(1), m1 = _mm256_set1_epi8(-1);
+    const __m256i tbl = rb_tblb(w);
+    const __m256i vOI = _mm256_set1_epi8((char)w.oe_ins), vEI = _mm256_set1_epi8((char)w.e_ins);
+    const __m256i vOD = _mm256_set1_epi8((char)w.oe_del), vED = _mm256_set1_epi8((char)w.e_del), m1 = _mm256_set1_epi8(-1);
     uint8_t *Hp = w.H.data(), *Ha = Hp + (size_t)W * 32, *Hb = Hp + (size_t)W * 64, *E = w.E.data();
     const uint8_t *A = w.A.data(), *QL = w.QL.data(), *BI = w.BI.data(), *REF = w.REF.data();
     uint8_t *Rout = w.R.data();
@@ -301,9 +322,9 @@ static long rb_dp_wave2(rb_work &w, int W, int NR, int omax, int ominq, int omas
             const __m256i h0 = _mm256_max_epu8(rb_hs(rb_ld(Hp + k * 32), rb_ld(ap), rref, rb_ld(bp), tbl), e);
             rb_st(Ha + k * 32, _mm256_max_epu8(h0, f));
             rmax = _mm256_max_epu8(rmax, k >= kun ? h0 : _mm256_and_si256(h0, rb_ld(qp)));
-            const __m256i h07 = _mm256_subs_epu8(h0, v7);
-            rb_st(E + (k + 1) * 32, _mm256_max_epu8(h07, _mm256_subs_epu8(e, v1)));
-            f = _mm256_max_epu8(h07, _mm256_subs_epu8(f, v1));
+            const __m256i h07 = _mm256_subs_epu8(h0, vOI), hd = Sym ? h07 : _mm256_subs_epu8(h0, vOD);
+            rb_st(E + (k + 1) * 32, _mm256_max_epu8(hd, _mm256_subs_epu8(e, vED)));
+            f = _mm256_max_epu8(h07, _mm256_subs_epu8(f, vEI));
         }
         const __m256i flush = row_update(r, rmax, rref);
         if (rb_mask32(flush)) rb_qe_scan(w, Hp, r - 1, W, omax, ominq, flush, gmax);
@@ -331,23 +352,25 @@ static long rb_dp_wave2(rb_work &w, int W, int NR, int omax, int ominq, int omas
             diag = _mm256_max_epu8(h0, fa);
             rb_st(Ha + k * 32, diag);
             rmax_a = k >= kun_a ? h0 : _mm256_and_si256(h0, rb_ld(qp));
-            fa = _mm256_subs_epu8(h0, v7);   // max(h07, sat(0 - 1))
+            fa = _mm256_subs_epu8(h0, vOI);   // max(h0 - oe_ins, sat(0 - e_ins))
             k--; ap += 32; qp += 32; bp += 32;
         }
 #define RB_W2_STEP(MASK)                                                                        \
         {                                                                                      \
             const __m256i q = rb_ld(ap), e = rb_ld(E + k * 32), bi = rb_ld(bp);                \
             const __m256i h0a = _mm256_max_epu8(rb_hs(rb_ld(Hp + k * 32), q, rref_a, bi, tbl), e); \
-            const __m256i h07a = _mm256_subs_epu8(h0a, v7);                                    \
+            const __m256i h07a = _mm256_subs_epu8(h0a, vOI);                                   \
+            const __m256i hda = Sym ? h07a : _mm256_subs_epu8(h0a, vOD);                       \
             const __m256i ha = _mm256_max_epu8(h0a, fa);                                       \
             rb_st(Ha + k * 32, ha);                                                            \
-            fa = _mm256_max_epu8(h07a, _mm256_subs_epu8(fa, v1));                              \
-            const __m256i ea = _mm256_max_epu8(h07a, _mm256_subs_epu8(e, v1));  /* E in of (r+1, k+1) */ \
+            fa = _mm256_max_epu8(h07a, _mm256_subs_epu8(fa, vEI));                             \
+            const __m256i ea = _mm256_max_epu8(hda, _mm256_subs_epu8(e, vED));  /* E in of (r+1, k+1) */ \
             const __m256i h0b = _mm256_max_epu8(rb_hs(diag, q, rref_b, bi, tbl), ea);          \
-            const __m256i h07b = _mm256_subs_epu8(h0b, v7);                                    \
+            const __m256i h07b = _mm256_subs_epu8(h0b, vOI);                                   \
+            const __m256i hdb = Sym ? h07b : _mm256_subs_epu8(h0b, vOD);                       \
             rb_st(Hb + (k + 1) * 32, _mm256_max_epu8(h0b, fb));                                \
-            fb = _mm256_max_epu8(h07b, _mm256_subs_epu8(fb, v1));                              \
-            rb_st(E + (k + 2) * 32, _mm256_max_epu8(h07b, _mm256_subs_epu8(ea, v1)));          \
+            fb = _mm256_max_epu8(h07b, _mm256_subs_epu8(fb, vEI));                             \
+            rb_st(E + (k + 2) * 32, _mm256_max_epu8(hdb, _mm256_subs_epu8(ea, vED)));          \
             diag = ha;                                                                         \
             if (MASK) {                                                                        \
                 const __m256i m = rb_ld(qp);                                                   \
@@ -364,7 +387,7 @@ static long rb_dp_wave2(rb_work &w, int W, int NR, int omax, int ominq, int omas
         if (klo_b == klo_a) {   // (r + 1, 0) alone: its partner (r, -1) does not exist; E in = slot 0 = 0
             const __m256i h0b = rb_hs(diag, rb_ld(ap), rref_b, rb_ld(bp), tbl);
             rb_st(Hb + klo_a * 32, _mm256_max_epu8(h0b, fb));
-            rb_st(E + (klo_a + 1) * 32, _mm256_subs_epu8(h0b, v7));
+            rb_st(E + (klo_a + 1) * 32, _mm256_subs_epu8(h0b, vOD));
             rmax_b = _mm256_max_epu8(rmax_b, _mm256_and_si256(h0b, rb_ld(qp)));
         }
         computed += khi_a - klo_a + 1;
@@ -434,9 +457,9 @@ static inline void rb_merge_max(uint8_t *buf, const uint8_t *Rl, int n)
 
 /* rescue_band_score2 for a CONTIGUOUS row-max array R[0, n) whose slack R[n, n + 16] is zero, 16
  * rows per vector (the NEON section's rb_score2_vec). */
-static void rb_score2_vec(const uint8_t *R, int n, int row0, int S, int te, int minsc, int *score2, int *te2)
+static void rb_score2_vec(const uint8_t *R, int n, int row0, int Z, int te, int minsc, int *score2, int *te2)
 {
-    const int low = te - S, high = te + S;
+    const int low = te - Z, high = te + Z;
     int s2 = -1, t2 = -1, bs = -1, bp = -2;
     const __m128i ms = _mm_set1_epi8((char)(uint8_t)minsc);
     alignas(16) uint8_t vb[16];
