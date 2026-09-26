@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.13.1](https://github.com/fg-labs/bwa-mem3/compare/v0.13.0...v0.13.1) (2026-09-26)
+
+
+### Bug Fixes
+
+* **extension:** stage a chain's windows once, not once per seed ([#524](https://github.com/fg-labs/bwa-mem3/issues/524)) ([8119423](https://github.com/fg-labs/bwa-mem3/commit/81194237bee1700cd7ff78f64b6ed8985458b7d4))
+* **meth:** copy a read's original bases whole instead of with strdup ([#526](https://github.com/fg-labs/bwa-mem3/issues/526)) ([51ceed7](https://github.com/fg-labs/bwa-mem3/commit/51ceed7531e1d843dd2dd743ad95931c385873ca))
+
+
+### Performance
+
+* **mem:** never purge mimalloc pages by default ([#523](https://github.com/fg-labs/bwa-mem3/issues/523)) ([5ce3f1e](https://github.com/fg-labs/bwa-mem3/commit/5ce3f1ec528f4ca7f510444b90b4fe9b8aa31f36))
+* **pair:** convert the no-pairing anchor region once ([#525](https://github.com/fg-labs/bwa-mem3/issues/525)) ([28df96b](https://github.com/fg-labs/bwa-mem3/commit/28df96b36778458bf08ad3aa2ec5a56b4e91bdb1))
+* **profiling:** stop worker threads sharing tprof cache lines ([#522](https://github.com/fg-labs/bwa-mem3/issues/522)) ([71c3814](https://github.com/fg-labs/bwa-mem3/commit/71c3814d5aed5de31cd8028d800cd59cad4ef48d))
+
+
+### Documentation
+
+* **readme:** update performance tables for v0.13.0 ([#518](https://github.com/fg-labs/bwa-mem3/issues/518)) ([c28e989](https://github.com/fg-labs/bwa-mem3/commit/c28e989e0cc340902fcd1fbefcbecdb326c4e40f))
+* route benchmark references through a single Benchmarks page ([#521](https://github.com/fg-labs/bwa-mem3/issues/521)) ([f3a72ac](https://github.com/fg-labs/bwa-mem3/commit/f3a72ac2ff4c5aafece990cf6d463f3c6833d14c))
+
 ## [0.13.0](https://github.com/fg-labs/bwa-mem3/compare/v0.12.0...v0.13.0) (2026-09-21)
 
 
