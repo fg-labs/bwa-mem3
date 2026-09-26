@@ -23,7 +23,10 @@
  * (class 9: gaps at the band-edge bound, start ties, qe next to the pad columns, te at the
  * window edges). Env knobs are the production ones (src/rescue_env.h); the caller sets e.g.
  * BWA3_RESCUE_BAND_COST=100000000 (band every B2 parent) and BWA3_RESCUE_PRUNE_MAX_HITS. RB_MINSC
- * (default 19) and RB_SCALAR_STRIDE (default 0: no scalar cross-check) are harness-only.
+ * (the min seed length, default 19; minsc = RB_MINSC * a), RB_SCALAR_STRIDE (default 0: no scalar
+ * cross-check; default scoring only) and RB_SCORING (unset: the default scoring; "a,b,o_del,e_del,
+ * o_ins,e_ins": fixed; "random": a fresh draw per 2048-job batch, see draw_params) are harness-only.
+ * Banding runs only at the default scoring, as in production.
  *
  * Dump files: one record per prune-eligible rescue job, as the aligner saw it (full window and
  * oriented mate): int32 len1, int32 len2, len1 reference bytes, len2 query bytes (2-bit codes, 4 = N).
@@ -395,30 +398,118 @@ static void run_batch(Ikswv *k, Batch &b, int nb, bool p1_any)
     if (nb || p1_any) rescue_band_batch().run_pass1(b.ref.data(), b.qer.data(), aln, k);
 }
 
-static std::unique_ptr<Ikswv> make_k(int maxr, int maxq)
+static std::unique_ptr<Ikswv> make_k(int maxr, int maxq, const rescue_prune_params &p)
 {
-    return make_kswv(6, 1, 6, 1, 1, -4, 1, maxr + 64, maxq + 64);
+    return make_kswv(p.o_del, p.e_del, p.o_ins, p.e_ins, (int8_t)p.a, (int8_t)-p.b, 1, maxr + 64, maxq + 64);
 }
 
 /* ---------------------------------------------------------------------------------------- */
-static int run_eq(std::vector<Job> &jobs, int minsc, int max_hits, int scalar_stride)
+/* scoring: RB_SCORING unset = the default; "a,b,o_del,e_del,o_ins,e_ins" = fixed; "random" = a  */
+/* fresh draw per batch (general-scoring plan, section 9), including degenerate parameter sets    */
+/* (which must be refused: every job FULL) and the V4 boundary minsc = a (K - 1) + 1 / + 2.        */
+/* ---------------------------------------------------------------------------------------- */
+struct Scoring { int a = 1, b = 4, o_del = 6, e_del = 1, o_ins = 6, e_ins = 1; };
+static bool g_random_scoring = false;
+static Scoring g_fixed_scoring;
+
+static rescue_prune_params draw_params(int minsc_default)
+{
+    Scoring sc = g_fixed_scoring;
+    int k = minsc_default;   // min_seed_len; minsc = k * a
+    bool fixed_minsc = true;
+    if (g_random_scoring) {
+        const int mode = rnd(20);
+        if (mode == 0) {   // the defaults
+            sc = Scoring();
+        } else if (mode == 1) {   // degenerate: must be refused before any division
+            sc = Scoring();
+            switch (rnd(6)) {
+                case 0: sc.e_del = 0; break;
+                case 1: sc.e_ins = 0; break;
+                case 2: sc.e_del = sc.e_ins = 0; break;
+                case 3: sc.b = 0; break;
+                case 4: sc.a = 0; break;
+                default: sc.b = 129; break;
+            }
+        } else if (mode == 2) {   // one gap type cheaper than (K - 1) a (V2), either side
+            sc = Scoring();
+            if (rnd(2)) { sc.o_ins = 2; sc.e_ins = 1; } else { sc.o_del = 2; sc.e_del = 1; }
+        } else if (mode == 3) {   // split and shared fused cells: -O 6 -E 1,2 / -O 6,7 -E 2,1
+            sc = Scoring();
+            if (rnd(2)) { sc.e_ins = 2; } else { sc.o_ins = 7; sc.e_del = 2; }
+        } else {
+            sc.a = 1 + rnd(3);
+            sc.b = rndr(1, 12);
+            sc.o_del = rndr(0, 20); sc.o_ins = rndr(0, 20);
+            sc.e_del = rndr(1, 6); sc.e_ins = rndr(1, 6);
+        }
+        k = rndr(5, 40);
+        fixed_minsc = false;
+    }
+    int minsc = k * sc.a;
+    rescue_prune_params p = rescue_prune_params::from(sc.a, sc.b, sc.o_del, sc.e_del, sc.o_ins, sc.e_ins,
+                                                      minsc, 3);
+    if (!fixed_minsc && p.K >= 3 && rnd(8) == 0) {   // the V4 boundary
+        minsc = sc.a * (p.K - 1) + 1 + rnd(2);
+        p = rescue_prune_params::from(sc.a, sc.b, sc.o_del, sc.e_del, sc.o_ins, sc.e_ins, minsc, 3);
+    }
+    if (sc.a < 1 || sc.b < 1 || sc.b > 128 || sc.e_del < 1 || sc.e_ins < 1) {
+        /* Degenerate: from() must refuse it (checked: every job FULL); the truth runs with the
+         * default scoring, since kswv itself cannot take these values. */
+        rescue_prune_params d = rescue_prune_params::defaults(minsc);
+        d.valid = p.valid;
+        return d;
+    }
+    /* Keep the raw scoring even when refused: the truth still runs with it. */
+    p.a = sc.a; p.b = sc.b; p.o_del = sc.o_del; p.e_del = sc.e_del; p.o_ins = sc.o_ins; p.e_ins = sc.e_ins;
+    p.minsc = minsc;
+    return p;
+}
+
+/* matesw_use_u8 (bwamem_pair.cpp): the job runs in the 8-bit kernels. */
+static bool use_u8(int len2, int a, int shift)
+{
+    const int prod = len2 * a;
+    return prod + shift <= 254 && (prod < 250 || len2 % 16 == 0 || len2 % 16 >= 9);
+}
+
+/* ---------------------------------------------------------------------------------------- */
+static int run_eq(std::vector<Job> &all_jobs, int minsc_default, int max_hits, int scalar_stride)
 {
     long mism = 0, n = 0, npass = 0, nfull = 0, nb1 = 0, nb2 = 0, nband = 0, scal_mm = 0, te2_diff = 0;
-    long p1_band = 0, p1_guard = 0;
+    long p1_band = 0, p1_guard = 0, nbatch = 0, nvalid = 0, ntrunc = 0, nk[6] = {0};
     long cls_n[128] = {0}, cls_mm[128] = {0};
     const int B = 2048;
-    for (size_t base = 0; base < jobs.size(); base += B) {
-        const int m = (int)std::min<size_t>(B, jobs.size() - base);
+    for (size_t base = 0; base < all_jobs.size(); base += B) {
+        const int m = (int)std::min<size_t>(B, all_jobs.size() - base);
+        const rescue_prune_params pp = draw_params(minsc_default);
+        const int minsc = pp.minsc;
+        const bool band = rescue_band_enabled() && pp.valid && pp.default_scoring();
+        nbatch++; nvalid += pp.valid; if (pp.valid) nk[pp.K]++;
+        /* This batch's jobs: mates too long for the 8-bit kernels at this a are cut to a random
+         * admissible slice (the planted copies still match it). */
+        const int shift = std::max(1, pp.b);
+        std::vector<Job> jobs(all_jobs.begin() + base, all_jobs.begin() + base + m);
+        for (Job &J : jobs) {
+            const int len2 = (int)J.q.size();
+            if (use_u8(len2, pp.a, shift)) continue;
+            int nl = std::min(len2, std::min((254 - shift) / pp.a, 249 / pp.a));
+            if (nl < 5) nl = 0;
+            if (nl > 17) nl = rndr(17, nl);
+            const int s0 = rnd(len2 - nl + 1);
+            J.q = std::vector<uint8_t>(J.q.begin() + s0, J.q.begin() + s0 + nl);
+            ntrunc++;
+        }
         int maxr = 0, maxq = 0;
         for (int t = 0; t < m; t++) {
-            maxr = std::max(maxr, (int)jobs[base + t].ref.size());
-            maxq = std::max(maxq, (int)jobs[base + t].q.size() + 16);
+            maxr = std::max(maxr, (int)jobs[t].ref.size());
+            maxq = std::max(maxq, (int)jobs[t].q.size() + 16);
         }
-        auto k = make_k(maxr, maxq);
+        auto k = make_k(maxr, maxq, pp);
         // --- truth: full windows ---
         Batch T;
         for (int t = 0; t < m; t++) {
-            const Job &J = jobs[base + t];
+            const Job &J = jobs[t];
             T.add(J.ref.data(), (int)J.ref.size(), J.q.data(), (int)J.q.size(), minsc);
         }
         T.finalize();
@@ -427,14 +518,14 @@ static int run_eq(std::vector<Job> &jobs, int minsc, int max_hits, int scalar_st
         Batch P;
         std::vector<int> kind(m), off(m, 0), idx(m, -1);
         for (int t = 0; t < m; t++) {
-            const Job &J = jobs[base + t];
+            const Job &J = jobs[t];
             const int len1 = (int)J.ref.size(), len2 = (int)J.q.size();
             int hb, he;
-            kind[t] = rescue_prune_window(J.ref.data(), len1, J.q.data(), len2, minsc, max_hits, &hb, &he);
+            kind[t] = rescue_prune_window(J.ref.data(), len1, J.q.data(), len2, pp, max_hits, &hb, &he);
             if (kind[t] == RESCUE_PRUNE_B1) { nb1++; continue; }
             if (kind[t] == RESCUE_PRUNE_B2) {
                 nb2++;
-                if (rescue_band_enabled())
+                if (band)
                     rescue_band_batch().plan(rescue_prune_last_view(), len1, len2, hb, he, minsc);
                 off[t] = hb;
                 idx[t] = P.add(J.ref.data() + hb, he - hb + 1, J.q.data(), len2, minsc);
@@ -442,21 +533,21 @@ static int run_eq(std::vector<Job> &jobs, int minsc, int max_hits, int scalar_st
                 nfull++;
                 idx[t] = P.add(J.ref.data(), len1, J.q.data(), len2, minsc);
             }
-            if (rescue_band_enabled()) rescue_band_batch().commit(idx[t]);
+            if (band) rescue_band_batch().commit(idx[t]);
         }
         const int pn = P.n;
         P.finalize();
         std::stable_sort(P.sp.begin(), P.sp.begin() + pn, [](const SeqPair &x, const SeqPair &y) { return x.len1 < y.len1; });
-        const int nbd = rescue_band_enabled() ? rescue_band_batch().partition(P.sp.data(), pn) : 0;
+        const int nbd = band ? rescue_band_batch().partition(P.sp.data(), pn) : 0;
         nband += nbd;
         const uint64_t pb0 = rescue_band_batch().stats.p1_band, pg0 = rescue_band_batch().stats.p1_guard;
-        run_batch(k.get(), P, nbd, true);
+        run_batch(k.get(), P, nbd, band);
         p1_band += (long)(rescue_band_batch().stats.p1_band - pb0);
         p1_guard += (long)(rescue_band_batch().stats.p1_guard - pg0);
         rescue_band_batch().reset();
         // --- compare ---
         for (int t = 0; t < m; t++) {
-            const Job &J = jobs[base + t];
+            const Job &J = jobs[t];
             const kswr_t &a = T.aln[t];
             n++; cls_n[J.cls]++;
             bool ok;
@@ -472,16 +563,27 @@ static int run_eq(std::vector<Job> &jobs, int minsc, int max_hits, int scalar_st
                     if (ok && a.score2 >= 0 && a.te2 != b.te2 + off[t]) te2_diff++;
                 }
                 if (!ok && mism < 10) {
+                    fprintf(stderr, "scoring a=%d b=%d o=%d,%d e=%d,%d minsc=%d K=%d c=%d valid=%d\n", pp.a, pp.b,
+                            pp.o_del, pp.o_ins, pp.e_del, pp.e_ins, minsc, pp.K, pp.c, pp.valid);
                     fprintf(stderr, "MISMATCH job=%zu cls=%d kind=%d len1=%zu len2=%zu off=%d truth{s=%d te=%d qe=%d s2=%d tb=%d qb=%d} got{s=%d te=%d qe=%d s2=%d tb=%d qb=%d} banded=%d\n",
                             base + t, J.cls, kind[t], J.ref.size(), J.q.size(), off[t], a.score, a.te, a.qe, a.score2, a.tb, a.qb,
                             b.score, b.te + off[t], b.qe, b.score2, b.tb + off[t], b.qb, 0);
                 }
             }
             if (kind[t] == RESCUE_PRUNE_B1 && !ok && mism < 10)
-                fprintf(stderr, "MISMATCH job=%zu cls=%d B1 but truth score=%d\n", base + t, J.cls, a.score);
-            if (J.cls == 3 && kind[t] != RESCUE_PRUNE_FULL) { ok = false; if (mism < 10) fprintf(stderr, "N job not FULL\n"); }
+                fprintf(stderr, "MISMATCH job=%zu cls=%d B1 but truth score=%d (a=%d b=%d o=%d,%d e=%d,%d minsc=%d K=%d c=%d)\n",
+                        base + t, J.cls, a.score, pp.a, pp.b, pp.o_del, pp.o_ins, pp.e_del, pp.e_ins, minsc, pp.K, pp.c);
+            /* An N in the window or the mate must give FULL (class 3 plants them; a mate cut for
+             * the 8-bit kernels may have lost its N, so test the job itself). */
+            const bool has_n = std::any_of(J.ref.begin(), J.ref.end(), [](uint8_t x) { return x > 3; })
+                               || std::any_of(J.q.begin(), J.q.end(), [](uint8_t x) { return x > 3; });
+            if (has_n && kind[t] != RESCUE_PRUNE_FULL) { ok = false; if (mism < 10) fprintf(stderr, "N job not FULL\n"); }
+            if (!pp.valid && kind[t] != RESCUE_PRUNE_FULL) {
+                ok = false;
+                if (mism < 10) fprintf(stderr, "refused scoring but kind=%d\n", kind[t]);
+            }
             if (!ok) { mism++; cls_mm[J.cls]++; }
-            if (scalar_stride > 0 && (n % scalar_stride) == 0) {
+            if (scalar_stride > 0 && pp.default_scoring() && (n % scalar_stride) == 0) {
                 int S, te, qe; std::vector<int> R;
                 scalar_dp(J, S, te, qe, R);
                 const int s2 = S >= minsc ? scalar_score2(R, S, te, minsc) : -1;
@@ -503,6 +605,8 @@ static int run_eq(std::vector<Job> &jobs, int minsc, int max_hits, int scalar_st
     printf("eq: jobs=%ld pass=%ld full=%ld b1=%ld b2=%ld banded_parents=%ld pass1_banded=%ld pass1_guard=%ld "
            "MISMATCHES=%ld scalar_vs_kswv_mismatch=%ld (te2 differs, unconsumed: %ld)\n",
            n, npass, nfull, nb1, nb2, nband, p1_band, p1_guard, mism, scal_mm, te2_diff);
+    printf("  scoring: batches=%ld valid=%ld K3=%ld K4=%ld K5=%ld mates_cut_to_8bit=%ld\n", nbatch, nvalid, nk[3],
+           nk[4], nk[5], ntrunc);
     for (int c = 0; c < 128; c++)
         if (cls_n[c]) printf("  class %3d: jobs=%ld mismatches=%ld\n", c, cls_n[c], cls_mm[c]);
     if (p1_guard) fprintf(stderr, "FAIL: %ld pass-1 guard fallbacks (banded max != S)\n", p1_guard);
@@ -533,7 +637,7 @@ static void run_time(std::vector<Job> &jobs, int minsc, int max_hits, int reps)
                 }
                 static std::unique_ptr<Ikswv> k;
                 static int kr = 0, kq = 0;
-                if (!k || maxr > kr || maxq > kq) { kr = std::max(kr, maxr); kq = std::max(kq, maxq); k = make_k(kr, kq); }
+                if (!k || maxr > kr || maxq > kq) { kr = std::max(kr, maxr); kq = std::max(kq, maxq); k = make_k(kr, kq, rescue_prune_params::defaults(minsc)); }
                 Batch P;
                 P.ref.reserve(3000000); P.qer.reserve(400000);
                 double tf = 0, tp = 0;
@@ -596,6 +700,16 @@ int main(int argc, char **argv)
         return 2;
     }
     const int minsc = rescue_env_int("RB_MINSC", MINSC_DEFAULT);
+    if (const char *sc = getenv("RB_SCORING")) {
+        if (!strcmp(sc, "random")) g_random_scoring = true;
+        else {
+            Scoring &f = g_fixed_scoring;
+            if (sscanf(sc, "%d,%d,%d,%d,%d,%d", &f.a, &f.b, &f.o_del, &f.e_del, &f.o_ins, &f.e_ins) != 6) {
+                fprintf(stderr, "RB_SCORING: want random or a,b,o_del,e_del,o_ins,e_ins\n");
+                return 2;
+            }
+        }
+    }
     /* The production default (rescue_prune_max_hits in bwamem_pair.cpp). */
     const int max_hits = rescue_env_int("BWA3_RESCUE_PRUNE_MAX_HITS",
                                         rescue_band_enabled() && minsc == 19 ? 1000 : 400);

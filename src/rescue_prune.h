@@ -39,6 +39,63 @@
 
 enum { RESCUE_PRUNE_FULL = 0, RESCUE_PRUNE_B1 = 1, RESCUE_PRUNE_B2 = 2 };
 
+/* Scoring parameters of the bound (general-scoring derivation, section 2): match a, mismatch b,
+ * gap of length L costs o + e*L per type. The lemma generalises with K - 1 <= min(b, o_del,
+ * o_ins + e_ins) / a (a run of r >= K matches holds r - K + 1 K-mer hits, every separator costs at
+ * least (K - 1) a), the per-diagonal charge c = min over gap types of min(e, o + e - (K - 1) a), the
+ * interval bound a (K - 1) + c + sum_d (a cnt_d - c), and the tail budget (Dmax) of
+ * (ub - tau - o_del + (K - 1) a) / e_del deletion columns past the last hit diagonal. At the
+ * defaults (1, 4, 6/1, 6/1) these are K = 5, c = 1, 5 + sum (cnt_d - 1) and ub - tau - 2. */
+struct rescue_prune_params {
+    int K = 5, a = 1, b = 4, c = 1;
+    int o_del = 6, e_del = 1, o_ins = 6, e_ins = 1;
+    int minsc = 19;
+    bool valid = false;
+
+    int base() const { return a * (K - 1) + c; }
+    int weight(int cnt) const { return a * cnt - c; }
+    /* Rows past the last hit diagonal's end that an alignment with interval bound ub can still
+     * reach at score >= tau. */
+    int tail(int ub, int tau) const
+    {
+        const int n = ub - tau - o_del + (K - 1) * a;
+        return n > 0 ? n / e_del : 0;
+    }
+    /* The SIMD filters hard-code K = 5, weights cnt - 1, the constant 5 and the tail ub - tau - 2. */
+    bool simd_ok() const { return valid && K == 5 && a == 1 && c == 1 && o_del == 6 && e_del == 1; }
+    bool default_scoring() const
+    {
+        return a == 1 && b == 4 && o_del == 6 && e_del == 1 && o_ins == 6 && e_ins == 1;
+    }
+
+    /* Validity conditions V0-V5 in order (V0 first: it guards every division). k_min is the smallest
+     * K accepted: K >= 3 is sound, but below 5 hits are so dense (4x per K step on random sequence)
+     * that the bound rarely drops below minsc; production uses 5, the fuzz goes down to 3. */
+    static rescue_prune_params from(int a, int b, int o_del, int e_del, int o_ins, int e_ins, int minsc,
+                                    int k_min = 5)
+    {
+        rescue_prune_params p;
+        p.a = a; p.b = b; p.o_del = o_del; p.e_del = e_del; p.o_ins = o_ins; p.e_ins = e_ins;
+        p.minsc = minsc;
+        // V0: positive match, mismatch and extends; int8 score tables (+a, -b, a + shift <= 255).
+        if (a < 1 || b < 1 || e_del < 1 || e_ins < 1 || o_del < 0 || o_ins < 0 || a > 127 || b > 128
+            || a + std::max(1, b) > 255)
+            return p;
+        // K: a separator (mismatch, deletion, insertion) must cost at least (K - 1) a (V1-V3).
+        const int km1 = std::min(4, std::min(b, std::min(o_del, o_ins + e_ins)) / a);
+        p.K = km1 + 1;
+        if (p.K < std::max(3, k_min)) return p;
+        const int s = p.a * (p.K - 1);
+        if (b < s || o_del < s || o_del + e_del < s || o_ins + e_ins < s) return p;   // V1-V3
+        p.c = std::min(std::min(e_del, e_ins), std::min(o_del + e_del - s, o_ins + e_ins - s));
+        if (p.c <= 0) return p;          // V5: the bound must decay
+        if (minsc <= s) return p;        // V4: a hit-free window cannot reach minsc
+        p.valid = true;
+        return p;
+    }
+    static rescue_prune_params defaults(int minsc) { return from(1, 4, 6, 1, 6, 1, minsc); }
+};
+
 /* Per-thread scratch for the scalar path. Fixed capacity (windows are capped at 30000 rows and
  * queries at 1024 bases), so nothing is allocated per call. The query tables are cached: they
  * depend only on the oriented mate, which repeats across the anchors rescued with it. */
@@ -47,73 +104,80 @@ struct rescue_prune_scratch {
     int16_t head[1024], nxt[QCAP];
     uint16_t qcnt[1024];
     uint8_t qcache[QCAP];
-    int qlen_c = -1;
+    int qlen_c = -1, qk_c = 0;   // the cached query tables are for this length and K
     uint16_t cnt[DCAP];
     int16_t minrow[DCAP];
     int32_t fwd[DCAP], bwd[DCAP];
     int view_nd = -1;   // nd of the last call that returned B2 (arrays valid), else -1
 };
 
-/* Scalar implementation (a non-default threshold, or the SIMD filters' fallback). Same decisions
- * as the NEON and x86 ones. */
+/* Scalar implementation: any valid scoring, and the SIMD filters' fallback. At the parameters the
+ * SIMD filters accept (simd_ok) it makes the same decisions as they do. */
 static inline int rescue_prune_window_scalar(const uint8_t *ref, int len1, const uint8_t *q, int len2,
-                                             int minsc, int max_hits, rescue_prune_scratch &s,
-                                             int *hb, int *he)
+                                             const rescue_prune_params &p, int max_hits,
+                                             rescue_prune_scratch &s, int *hb, int *he)
 {
+    const int K = p.K, mask = (1 << (2 * K)) - 1, minsc = p.minsc, base = p.base();
     uint8_t orv = 0;
     for (int i = 0; i < len1; i++) orv |= ref[i];
     for (int j = 0; j < len2; j++) orv |= q[j];
     if (orv & 0xFC) return RESCUE_PRUNE_FULL;  // N present: its score (-1) breaks the lemma's accounting
 
-    if (len2 != s.qlen_c || memcmp(q, s.qcache, (size_t)len2) != 0) {
+    if (len2 < K || len1 < K) return RESCUE_PRUNE_FULL;
+    if (len2 != s.qlen_c || K != s.qk_c || memcmp(q, s.qcache, (size_t)len2) != 0) {
         memset(s.head, 0xFF, sizeof s.head);
         memset(s.qcnt, 0, sizeof s.qcnt);
-        int c = (q[0] << 6) | (q[1] << 4) | (q[2] << 2) | q[3];
-        for (int j = 4; j < len2; j++) {
-            c = ((c << 2) | q[j]) & 1023;
+        int c = 0;
+        for (int j = 0; j < K - 1; j++) c = (c << 2) | q[j];
+        for (int j = K - 1; j < len2; j++) {
+            c = ((c << 2) | q[j]) & mask;
             s.nxt[j] = s.head[c];
             s.head[c] = (int16_t)j;
             s.qcnt[c]++;
         }
         memcpy(s.qcache, q, (size_t)len2);
         s.qlen_c = len2;
+        s.qk_c = K;
     }
+    int c0 = 0;
+    for (int i = 0; i < K - 1; i++) c0 = (c0 << 2) | ref[i];
     /* Gate: total hits from per-code query counts, without enumerating them. */
-    int c = (ref[0] << 6) | (ref[1] << 4) | (ref[2] << 2) | ref[3];
-    int nhits = 0;
-    for (int i = 4; i < len1; i++) { c = ((c << 2) | ref[i]) & 1023; nhits += s.qcnt[c]; }
+    int c = c0, nhits = 0;
+    for (int i = K - 1; i < len1; i++) { c = ((c << 2) | ref[i]) & mask; nhits += s.qcnt[c]; }
     if (nhits > max_hits) return RESCUE_PRUNE_FULL;
 
     const int quanta = ((len2 + 15) / 16) * 16, off = quanta, nd = len1 + quanta + 1;
     s.view_nd = -1;
     memset(s.cnt, 0, (size_t)nd * sizeof s.cnt[0]);
-    c = (ref[0] << 6) | (ref[1] << 4) | (ref[2] << 2) | ref[3];
-    for (int i = 4; i < len1; i++) {
-        c = ((c << 2) | ref[i]) & 1023;
+    c = c0;
+    for (int i = K - 1; i < len1; i++) {
+        c = ((c << 2) | ref[i]) & mask;
         for (int j = s.head[c]; j >= 0; j = s.nxt[j]) {
             const int d = i - j + off;
-            if (!s.cnt[d]) s.minrow[d] = (int16_t)(i - 4);
+            if (!s.cnt[d]) s.minrow[d] = (int16_t)(i - (K - 1));
             s.cnt[d]++;
         }
     }
-    int best = -1, f = 0;
+    /* Kadane over the diagonal weights a cnt_d - c: fwd[d] / bwd[d] are the best sums of an
+     * interval ending / starting at d. */
+    int best = -p.c, f = 0;
     for (int d = 0; d < nd; d++) {
-        f = (int)s.cnt[d] - 1 + (f > 0 ? f : 0);
+        f = p.weight(s.cnt[d]) + (f > 0 ? f : 0);
         s.fwd[d] = f;
         if (f > best) best = f;
     }
-    if (5 + best < minsc) return RESCUE_PRUNE_B1;
+    if (base + best < minsc) return RESCUE_PRUNE_B1;
     int b = 0;
     for (int d = nd - 1; d >= 0; d--) {
-        b = (int)s.cnt[d] - 1 + (b > 0 ? b : 0);
+        b = p.weight(s.cnt[d]) + (b > 0 ? b : 0);
         s.bwd[d] = b;
     }
     int lo = len1, hi = -1;
     for (int d = 0; d < nd;) {
-        if (5 + s.fwd[d] + s.bwd[d] - ((int)s.cnt[d] - 1) < minsc) { d++; continue; }
+        if (base + s.fwd[d] + s.bwd[d] - p.weight(s.cnt[d]) < minsc) { d++; continue; }
         int ub = 0, i0 = len1, dmax = -1;
         while (d < nd) {
-            const int bnd = 5 + s.fwd[d] + s.bwd[d] - ((int)s.cnt[d] - 1);
+            const int bnd = base + s.fwd[d] + s.bwd[d] - p.weight(s.cnt[d]);
             if (bnd < minsc) break;
             ub = std::max(ub, bnd);
             if (s.cnt[d]) { i0 = std::min(i0, (int)s.minrow[d]); dmax = d; }
@@ -121,7 +185,7 @@ static inline int rescue_prune_window_scalar(const uint8_t *ref, int len1, const
         }
         if (dmax < 0) continue;
         lo = std::min(lo, i0);
-        hi = std::max(hi, (dmax - off) + quanta - 1 + std::max(0, ub - minsc - 2));
+        hi = std::max(hi, (dmax - off) + quanta - 1 + p.tail(ub, minsc));
     }
     if (hi < 0) return RESCUE_PRUNE_B1;
     *hb = std::max(0, lo);
@@ -134,8 +198,9 @@ static inline int rescue_prune_window_scalar(const uint8_t *ref, int len1, const
  * diagonal components at thresholds above minsc (rescue_band.h). Valid only right after a call
  * that returned RESCUE_PRUNE_B2, and only when nd >= 0 (the SIMD paths' rare scalar fallback
  * leaves nd = -1). Diagonal index x in [0, nd) is the unshifted diagonal d = i - j = x - off.
- * Exactly one of bnd16 (SIMD filter: bnd precomputed) or fwd/bwd (scalar: bnd = 5 + fwd + bwd -
- * (cnt - 1)) is set. mw, when set, is the SIMD filter's bitset of diagonals with bnd >= minsc
+ * Exactly one of bnd16 (SIMD filter: bnd precomputed) or fwd/bwd (scalar: bnd = base + fwd + bwd -
+ * weight(cnt), which is 5 + fwd + bwd - (cnt - 1) at the default scoring, the only one banded) is
+ * set. mw, when set, is the SIMD filter's bitset of diagonals with bnd >= minsc
  * (the minsc of the filter call that produced the view). */
 struct rescue_prune_view {
     int nd = -1, off = 0;
@@ -219,17 +284,21 @@ static inline rescue_prune_view rescue_prune_last_view()
 /* Decide how much of a rescue window must be computed.
  *   ref, len1   reference window, bases 0-3 (>= 4 is N)
  *   q, len2     oriented mate, bases 0-3 (>= 4 is N)
- *   minsc       the rescue score threshold (min_seed_len * a)
- *   max_hits    return FULL when the window and mate share more 5-mer hits than this: the filter
+ *   p           the scoring and the rescue score threshold p.minsc (min_seed_len * a); an invalid
+ *               p (rescue_prune_params::from refused it) always gives FULL
+ *   max_hits    return FULL when the window and mate share more K-mer hits than this: the filter
  *               would cost more than the DP rows it can save
  *   hb, he      inclusive sub-window rows, set for RESCUE_PRUNE_B2 */
 static inline int rescue_prune_window(const uint8_t *ref, int len1, const uint8_t *q, int len2,
-                                      int minsc, int max_hits, int *hb, int *he)
+                                      const rescue_prune_params &p, int max_hits, int *hb, int *he)
 {
     *hb = *he = -1;
     rescue_prune_last_path() = 0;
-    if (len1 < 5 || len2 < 5 || len2 > rescue_prune_scratch::QCAP || len1 > 30000)
+    if (!p.valid || len1 < 5 || len2 < 5 || len2 > rescue_prune_scratch::QCAP || len1 > 30000)
         return RESCUE_PRUNE_FULL;
+    const int minsc = p.minsc;
+    (void)minsc;
+    if (!p.simd_ok()) goto scalar;
 #if defined(__aarch64__)
     {   // identical decisions to the scalar filter at any minsc, ~2x faster (rescue_prune_neon.h)
         rescue_prune_neon::NeonScratch &ns = rescue_prune_neon_scratch();
@@ -243,7 +312,6 @@ static inline int rescue_prune_window(const uint8_t *ref, int len1, const uint8_
         *hb = h; *he = e;
         return RESCUE_PRUNE_B2;
     }
-scalar:
 #elif defined(__AVX2__)
     {   // identical decisions to the scalar filter at any minsc (rescue_prune_x86.h)
         rescue_prune_x86::X86Scratch &xs = rescue_prune_x86_scratch();
@@ -257,11 +325,26 @@ scalar:
         *hb = h; *he = e;
         return RESCUE_PRUNE_B2;
     }
-scalar:
 #endif
+scalar:
     rescue_prune_last_path() = 1;
-    return rescue_prune_window_scalar(ref, len1, q, len2, minsc, max_hits,
-                                      rescue_prune_scalar_scratch(), hb, he);
+    return rescue_prune_window_scalar(ref, len1, q, len2, p, max_hits, rescue_prune_scalar_scratch(),
+                                      hb, he);
+}
+
+/* The default scoring at threshold minsc (the SIMD filters' domain). */
+static inline int rescue_prune_window(const uint8_t *ref, int len1, const uint8_t *q, int len2,
+                                      int minsc, int max_hits, int *hb, int *he)
+{
+    return rescue_prune_window(ref, len1, q, len2, rescue_prune_params::defaults(minsc), max_hits,
+                               hb, he);
+}
+static inline int rescue_prune_window_scalar(const uint8_t *ref, int len1, const uint8_t *q, int len2,
+                                             int minsc, int max_hits, rescue_prune_scratch &s,
+                                             int *hb, int *he)
+{
+    return rescue_prune_window_scalar(ref, len1, q, len2, rescue_prune_params::defaults(minsc),
+                                      max_hits, s, hb, he);
 }
 
 #endif

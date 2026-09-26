@@ -363,8 +363,6 @@ static bool rescue_dedup_skip_enabled()
     return on;
 }
 
-/* The pruning lemma is derived for the default scoring only (a=1, b=4, gap open 6 / extend 1),
- * the 8-bit kernel path, and non-meth rescue; everything else runs the full window. */
 /* Pruning is on for this run: the toggle, and on the AVX-512 tier only below minsc 25. There the
  * 64-lane kswv is cheap and few rescues pass at a high minsc, so the filter costs more than it
  * saves (prune on vs off, wall, Zen 5 wgs-5M: +1.0 / +2.4 / +1.2 / +1.3 % at -k 25 / 28 / 32 / 40;
@@ -378,18 +376,26 @@ static bool rescue_prune_on(const mem_opt_t *opt)
     (void)opt;
     return rescue_prune_enabled();
 #else
+    /* x86 also prunes only where the SIMD filter runs: the scalar filter costs more than it saves
+     * against the cheaper x86 kswv (prune on vs off, wall, Zen 5 AVX-512: -O 8 -E 2 +13.3 / +4.7 %,
+     * -x intractg +14.6 / +4.9 % on wes-5M / wgs-5M; the SIMD-filtered -B 6 -3.5 / +0.3 %). */
     static const bool avx512 = bwamem3_simd_tier() == BWAMEM3_TIER_AVX512BW;
-    return rescue_prune_enabled() && !(avx512 && opt->min_seed_len * opt->a >= 25);
+    const int minsc = opt->min_seed_len * opt->a;
+    return rescue_prune_enabled() && !(avx512 && minsc >= 25)
+        && rescue_prune_params::from(opt->a, opt->b, opt->o_del, opt->e_del, opt->o_ins, opt->e_ins,
+                                     minsc).simd_ok();
 #endif
 }
 
-static bool rescue_prune_applies(const mem_opt_t *opt, int xtra)
+/* The pruning parameters for this run's scoring (rescue_prune_params::from checks the lemma's
+ * validity conditions, including minsc > (K - 1) a). --meth keeps the full window: its freed
+ * conversion cells need a relation-aware filter and the per-hypothesis batch hooks. */
+static bool rescue_prune_applies(const mem_opt_t *opt, int xtra, rescue_prune_params *pp)
 {
-    /* minsc >= 5: a local alignment without an exact 5-mer match scores <= 4 under this scoring,
-     * so below 5 the "no component -> proven failure" step (B1) would be unsound. */
-    return rescue_prune_on(opt) && !opt->rescue_kmer && !opt->meth_mode && (xtra & KSW_XBYTE)
-        && opt->a == 1 && opt->b == 4 && opt->o_del == 6 && opt->o_ins == 6
-        && opt->e_del == 1 && opt->e_ins == 1 && opt->min_seed_len * opt->a >= 5;
+    if (!rescue_prune_on(opt) || opt->rescue_kmer || opt->meth_mode || !(xtra & KSW_XBYTE)) return false;
+    *pp = rescue_prune_params::from(opt->a, opt->b, opt->o_del, opt->e_del, opt->o_ins, opt->e_ins,
+                                    opt->min_seed_len * opt->a);
+    return pp->valid;
 }
 
 /* --rescue-kmer: length-sort each SIMD-width partition of `sp[0,pcnt)` (8-bit
@@ -1702,7 +1708,8 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
              * ref/rb/re exactly like --rescue-kmer's narrowing, so only the sub-window is copied
              * and _post applies the same offset. The oriented mate is built once here and reused
              * for the staging copy below. */
-            const bool pruned = rescue_prune_applies(opt, xtra);
+            rescue_prune_params pp;
+            const bool pruned = rescue_prune_applies(opt, xtra, &pp);
             if (g_rescue_prune_stats.on && !(xtra & KSW_XBYTE)) g_rescue_prune_stats.jobs16++;
             static thread_local std::vector<uint8_t> oq;   // oriented mate; grows, never shrinks
             if (pruned) {
@@ -1711,11 +1718,11 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                 else memcpy(oq.data(), ms, (size_t)l_ms);
                 int hb, he;
                 const uint64_t tf0 = g_rescue_prune_stats.on ? rescue_now_ns() : 0;
-                const int kind = rescue_prune_window(ref, (int)(re - rb), oq.data(), l_ms,
-                                                     opt->min_seed_len * opt->a,
-                                                     rescue_prune_max_hits(opt->min_seed_len * opt->a), &hb, &he);
-                /* Banding plan (rescue_band.h), bound to this pair's regid at enqueue (commit). */
-                if (kind == RESCUE_PRUNE_B2 && rescue_band_enabled())
+                const int kind = rescue_prune_window(ref, (int)(re - rb), oq.data(), l_ms, pp,
+                                                     rescue_prune_max_hits(pp.minsc), &hb, &he);
+                /* Banding plan (rescue_band.h), bound to this pair's regid at enqueue (commit). The
+                 * band kernels are derived for the default scoring only. */
+                if (kind == RESCUE_PRUNE_B2 && rescue_band_enabled() && pp.default_scoring())
                     rescue_band_batch().plan(rescue_prune_last_view(), (int)(re - rb), l_ms, hb, he,
                                              opt->min_seed_len * opt->a);
                 if (g_rescue_prune_stats.on) g_rescue_prune_stats.ns_filter += rescue_now_ns() - tf0;
