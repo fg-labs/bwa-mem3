@@ -661,6 +661,15 @@ int mem_chain_weight(const mem_chain_t *c);
 
 void mem_reg2sam(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
                  bseq1_t *s, mem_alnreg_v *a, int extra_flag, const mem_aln_t *m);
+/* mem_reg2sam that reuses `anchor`, the caller's unmodified mem_reg2aln of
+ * a->a[anchor_k], instead of converting that region again (anchor NULL or
+ * anchor_k < 0: none). The caller keeps ownership of `anchor`, whose CIGAR
+ * buffer must stay valid for the call. If region anchor_k is emitted, an anchor
+ * whose contig, position, strand, flag, MAPQ, scores, ALT fields or methylation
+ * hypothesis disagree with that region is a fatal error (err_fatal). */
+void mem_reg2sam_anchored(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
+                          bseq1_t *s, mem_alnreg_v *a, int extra_flag, const mem_aln_t *m,
+                          int anchor_k, const mem_aln_t *anchor);
 
 int mem_approx_mapq_se(const mem_opt_t *opt, const mem_alnreg_t *a) ;
 

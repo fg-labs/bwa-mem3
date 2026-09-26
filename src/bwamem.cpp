@@ -4448,13 +4448,49 @@ void mem_reorder_primary5(int T, mem_alnreg_v *a)
     }
 }
 
-// TODO (future plan): group hits into a uint64_t[] array. This will be cleaner and more flexible
+/* Whether `anchor` can be mem_reg2aln's unmodified conversion of region `p`.
+ * Every field mem_reg2aln copies or derives from the region alone must match,
+ * and the position must fall inside the region's reference span (mem_reg2aln
+ * moves it past a leading deletion, which stays inside that span). Only the
+ * CIGAR, NM and MD, which need the alignment itself, go unchecked. */
+static int mem_aln_is_conversion_of(const mem_opt_t *opt, const bntseq_t *bns,
+                                    const mem_aln_t *anchor, const mem_alnreg_t *p)
+{
+    int is_rev;
+    const int64_t start = bns_depos(bns, p->rb < bns->l_pac ? p->rb : p->re - 1, &is_rev);
+    const int flag = p->secondary >= 0 ? 0x100 : 0;
+    const int mapq = p->secondary < 0 ? mem_approx_mapq_se(opt, p) : 0;
+    if (anchor->rid != p->rid || p->rid < 0) return 0;
+    const int64_t pos = anchor->pos + bns->anns[p->rid].offset;
+    return anchor->is_rev == (uint32_t)is_rev && pos >= start && pos < start + (p->re - p->rb) &&
+           anchor->flag == flag && anchor->mapq == (uint32_t)mapq &&
+           anchor->score == p->score && anchor->sub == (p->sub > p->csub ? p->sub : p->csub) &&
+           anchor->is_alt == (uint32_t)p->is_alt && anchor->alt_sc == p->alt_sc &&
+           anchor->meth_hypothesis == p->meth_hypothesis;
+}
+
 void mem_reg2sam(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
                  bseq1_t *s, mem_alnreg_v *a, int extra_flag, const mem_aln_t *m)
+{
+    mem_reg2sam_anchored(opt, bns, pac, s, a, extra_flag, m, -1, NULL);
+}
+
+// TODO (future plan): group hits into a uint64_t[] array. This will be cleaner and more flexible
+/* mem_reg2sam, reusing `anchor` -- the caller's own, unmodified mem_reg2aln of
+ * region a->a[anchor_k] -- instead of converting that region again if it is
+ * emitted (anchor NULL or anchor_k < 0: none). mem_reg2aln is deterministic,
+ * so the output is unchanged. The record borrows the anchor's CIGAR buffer rather than copying
+ * it: the caller still owns `anchor` (and may keep reading it), so that entry
+ * is not freed here. An anchor that fails mem_aln_is_conversion_of is a fatal
+ * error (err_fatal) rather than emitting another region's alignment. */
+void mem_reg2sam_anchored(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
+                          bseq1_t *s, mem_alnreg_v *a, int extra_flag, const mem_aln_t *m,
+                          int anchor_k, const mem_aln_t *anchor)
 {
     kstring_t str;
     kvec_t(mem_aln_t) aa;
     int k, l;
+    size_t borrowed = SIZE_MAX; // entry of aa whose CIGAR belongs to `anchor`
     char **XA = 0;
     int *HN = 0;
 
@@ -4475,7 +4511,17 @@ void mem_reg2sam(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
         if (p->secondary >= 0 && p->secondary < INT_MAX && p->score < a->a[p->secondary].score * opt->drop_ratio) continue;
         q = kv_pushp(mem_aln_t, aa);
 
-        *q = mem_reg2aln(opt, bns, pac, s->l_seq, s->seq, p, s->meth_orig_seq);
+        if (anchor && k == anchor_k) {
+            if (!mem_aln_is_conversion_of(opt, bns, anchor, p))
+                err_fatal(__func__, "the anchor (rid %d, pos %ld, %s strand, score %d) is not "
+                          "the conversion of region %d (rid %d, rb %ld, re %ld, score %d) of read \"%s\"",
+                          anchor->rid, (long)anchor->pos, anchor->is_rev ? "reverse" : "forward",
+                          anchor->score, k, p->rid, (long)p->rb, (long)p->re, p->score, s->name);
+            *q = *anchor;
+            borrowed = aa.n - 1;
+        } else {
+            *q = mem_reg2aln(opt, bns, pac, s->l_seq, s->seq, p, s->meth_orig_seq);
+        }
         assert(q->rid >= 0); // this should not happen with the new code
         q->XA = XA? XA[k] : 0;
         q->HN = HN? HN[k] : -1;
@@ -4506,7 +4552,8 @@ void mem_reg2sam(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
     } else {
         for (k = 0; k < aa.n; ++k)
             mem_aln2sam(opt, bns, &str, s, aa.n, aa.a, k, m);
-        for (k = 0; k < aa.n; ++k) free(aa.a[k].cigar);
+        for (size_t i = 0; i < aa.n; ++i)
+            if (i != borrowed) free(aa.a[i].cigar);
         free(aa.a);
     }
     s->sam = str.s;
