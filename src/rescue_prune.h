@@ -51,6 +51,13 @@ struct rescue_prune_params {
     int o_del = 6, e_del = 1, o_ins = 6, e_ins = 1;
     int minsc = 19;
     bool valid = false;
+    /* --meth (set_meth): the filter runs on copies of the window and the mate with base conv_from
+     * rewritten to conv_to (C -> T for OT, G -> A for OB). Exact matching of the converted copies
+     * relates every pair the meth matrices score at most +a (the freed cell, its collapsed mirror,
+     * the identity) and nothing that scores -b in all of them except the mirror under genomic /
+     * neutral scoring: a superset of the match-like cells, and over-counting hits only loosens the
+     * bound, so the lemma holds. */
+    int conv_from = -1, conv_to = -1;
 
     int base() const { return a * (K - 1) + c; }
     int weight(int cnt) const { return a * cnt - c; }
@@ -63,9 +70,17 @@ struct rescue_prune_params {
     }
     /* The SIMD filters hard-code K = 5, weights cnt - 1, the constant 5 and the tail ub - tau - 2. */
     bool simd_ok() const { return valid && K == 5 && a == 1 && c == 1 && o_del == 6 && e_del == 1; }
+    /* The default scoring without --meth: what the band kernels are derived for. */
     bool default_scoring() const
     {
-        return a == 1 && b == 4 && o_del == 6 && e_del == 1 && o_ins == 6 && e_ins == 1;
+        return conv_from < 0 && a == 1 && b == 4 && o_del == 6 && e_del == 1 && o_ins == 6 && e_ins == 1;
+    }
+    /* --meth: the rescued mate is scored with mat_ot (hyp 1: reference C / read T freed) or mat_ob
+     * (hyp 0: reference G / read A freed); collapsed scoring also frees the mirror cell. */
+    void set_meth(int hyp)
+    {
+        conv_from = hyp ? 1 : 2;
+        conv_to = hyp ? 3 : 0;
     }
 
     /* Validity conditions V0-V5 in order (V0 first: it guards every division). k_min is the smallest
@@ -296,6 +311,15 @@ static inline int rescue_prune_window(const uint8_t *ref, int len1, const uint8_
     rescue_prune_last_path() = 0;
     if (!p.valid || len1 < 5 || len2 < 5 || len2 > rescue_prune_scratch::QCAP || len1 > 30000)
         return RESCUE_PRUNE_FULL;
+    if (p.conv_from >= 0) {   // --meth: exact matching of converted copies (see conv_from)
+        static thread_local uint8_t cref[30000], cq[rescue_prune_scratch::QCAP];
+        const uint8_t f = (uint8_t)p.conv_from, t = (uint8_t)p.conv_to;
+        for (int i = 0; i < len1; i++) cref[i] = ref[i] == f ? t : ref[i];
+        for (int j = 0; j < len2; j++) cq[j] = q[j] == f ? t : q[j];
+        rescue_prune_params pi = p;
+        pi.conv_from = pi.conv_to = -1;
+        return rescue_prune_window(cref, len1, cq, len2, pi, max_hits, hb, he);
+    }
     const int minsc = p.minsc;
     (void)minsc;
     if (!p.simd_ok()) goto scalar;

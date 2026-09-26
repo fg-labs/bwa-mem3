@@ -45,6 +45,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "rescue_prune.h"
 #include "rescue_band.h"
 #include "rescue_env.h"
+#include "meth_xm.h"   /* meth_chem_t: exact rescue pruning under --meth is EM-seq only */
 #include <chrono>
 
 #ifdef USE_MALLOC_WRAPPERS
@@ -363,7 +364,8 @@ static bool rescue_dedup_skip_enabled()
     return on;
 }
 
-/* Pruning is on for this run: the toggle, and on the AVX-512 tier only below minsc 25. There the
+/* Pruning is on for this run: the toggle, a scoring the lemma holds for (rescue_prune_params), and
+ * on the AVX-512 tier only below minsc 25. There the
  * 64-lane kswv is cheap and few rescues pass at a high minsc, so the filter costs more than it
  * saves (prune on vs off, wall, Zen 5 wgs-5M: +1.0 / +2.4 / +1.2 / +1.3 % at -k 25 / 28 / 32 / 40;
  * wes-5M -1.3 / +0.9 / -0.8 / -1.2 %). AVX2 still wins at -k 32 (Zen 3 wes-5M -3.8 %). Everything
@@ -372,29 +374,39 @@ static bool rescue_dedup_skip_enabled()
  * pruning. */
 static bool rescue_prune_on(const mem_opt_t *opt)
 {
+    const int minsc = opt->min_seed_len * opt->a;
+    const rescue_prune_params p = rescue_prune_params::from(opt->a, opt->b, opt->o_del, opt->e_del,
+                                                            opt->o_ins, opt->e_ins, minsc);
 #if defined(__aarch64__)
-    (void)opt;
-    return rescue_prune_enabled();
+    /* --meth prunes under EM-seq / bisulfite chemistry only. The filter matches converted copies
+     * (rescue_prune_params::set_meth), which fits reads whose unmethylated C's are converted; TAPS
+     * reads are mostly unconverted, so collapsing them to three letters leaves little to prune
+     * (Graviton 4, prune on vs off, wall: EM-seq panel 5 M pairs genomic -9.0 %, collapsed -B 4
+     * -10.1 %; TAPS -0.1 %). */
+    return rescue_prune_enabled() && p.valid && !(opt->meth_mode && opt->meth_chem != METH_CHEM_EMSEQ);
 #else
     /* x86 also prunes only where the SIMD filter runs: the scalar filter costs more than it saves
      * against the cheaper x86 kswv (prune on vs off, wall, Zen 5 AVX-512: -O 8 -E 2 +13.3 / +4.7 %,
      * -x intractg +14.6 / +4.9 % on wes-5M / wgs-5M; the SIMD-filtered -B 6 -3.5 / +0.3 %). */
     static const bool avx512 = bwamem3_simd_tier() == BWAMEM3_TIER_AVX512BW;
-    const int minsc = opt->min_seed_len * opt->a;
-    return rescue_prune_enabled() && !(avx512 && minsc >= 25)
-        && rescue_prune_params::from(opt->a, opt->b, opt->o_del, opt->e_del, opt->o_ins, opt->e_ins,
-                                     minsc).simd_ok();
+    /* No --meth on x86: the cheaper kswv leaves nothing to win (Zen 5, EM-seq genomic +0.1 %,
+     * collapsed -B 4 +1.6 %, TAPS +5.0 %). */
+    return rescue_prune_enabled() && !opt->meth_mode && !(avx512 && minsc >= 25) && p.simd_ok();
 #endif
 }
 
 /* The pruning parameters for this run's scoring (rescue_prune_params::from checks the lemma's
- * validity conditions, including minsc > (K - 1) a). --meth keeps the full window: its freed
- * conversion cells need a relation-aware filter and the per-hypothesis batch hooks. */
-static bool rescue_prune_applies(const mem_opt_t *opt, int xtra, rescue_prune_params *pp)
+ * validity conditions, including minsc > (K - 1) a). Under --meth the pair's hypothesis (hyp, as
+ * tagged at enqueue) selects the conversion the filter applies (set_meth); the default collapsed
+ * scoring (b = 2a) forces K = 3 and is refused, --meth -B 4 and the genomic / neutral scorings
+ * (b = 4a) are not. Only the batched meth rescue reaches here (the scalar escape hatch returns
+ * earlier in _pre). */
+static bool rescue_prune_applies(const mem_opt_t *opt, int xtra, int hyp, rescue_prune_params *pp)
 {
-    if (!rescue_prune_on(opt) || opt->rescue_kmer || opt->meth_mode || !(xtra & KSW_XBYTE)) return false;
+    if (!rescue_prune_on(opt) || opt->rescue_kmer || !(xtra & KSW_XBYTE)) return false;
     *pp = rescue_prune_params::from(opt->a, opt->b, opt->o_del, opt->e_del, opt->o_ins, opt->e_ins,
                                     opt->min_seed_len * opt->a);
+    if (opt->meth_mode) pp->set_meth(hyp);
     return pp->valid;
 }
 
@@ -1142,11 +1154,11 @@ int mem_sam_pe_batch(const mem_opt_t *opt, mem_cache *mmc,
             scored += group_pcnt;
             if (group_pcnt == 0) continue;
 
-            /* --rescue-kmer: same length sort as the non-meth path below, applied
-             * per OT/OB partition -- otherwise --fast --meth would enqueue narrowed
-             * windows but leave them mixed with full ones inside each SIMD group,
-             * paying the scan cost without collecting the saving. */
-            if (opt->rescue_kmer)
+            /* --rescue-kmer and exact pruning: same length sort as the non-meth path
+             * below, applied per OT/OB partition -- otherwise the narrowed windows sit
+             * mixed with full ones inside each SIMD group, paying the scan cost without
+             * collecting the saving. */
+            if (opt->rescue_kmer || rescue_prune_on(opt))
                 matesw_sort_partitions_by_len(scratch, group_pcnt8, group_pcnt);
 
             Ikswv *pwsw = (hyp == 1) ? pwsw_ot.get() : pwsw_ob.get();
@@ -1709,7 +1721,7 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
              * and _post applies the same offset. The oriented mate is built once here and reused
              * for the staging copy below. */
             rescue_prune_params pp;
-            const bool pruned = rescue_prune_applies(opt, xtra, &pp);
+            const bool pruned = rescue_prune_applies(opt, xtra, opt->meth_mode ? (mate_meth_ot ^ is_rev) & 1 : -1, &pp);
             if (g_rescue_prune_stats.on && !(xtra & KSW_XBYTE)) g_rescue_prune_stats.jobs16++;
             static thread_local std::vector<uint8_t> oq;   // oriented mate; grows, never shrinks
             if (pruned) {
