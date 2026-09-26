@@ -474,7 +474,8 @@ HTS_LIB=    ext/htslib/libhts.a
 # generated header dependencies, so there must be exactly one copy of it.
 STANDALONE_TESTS = kswv_nrow_zero_test kswv_freed_cell_test \
                    bandedswa_padding_test bandedswa_highzdrop_seed_test \
-                   bandedswa_high_h0_zdrop_test shm_section_find_test \
+                   bandedswa_high_h0_zdrop_test bandedswa_negative_h0_test \
+                   shm_section_find_test \
                    shm_pack_round_trip_test shm_lock_destroy_test \
                    kt_for_pool_test bns_zero_calloc_test \
                    err_fgets_eof_test \
@@ -868,6 +869,11 @@ kernel_padded_lane_uninit_test: $(BWA_LIB) $(HTS_LIB) src/bandedSWA.native.o tes
 bandedswa_highzdrop_seed_test: $(BWA_LIB) $(HTS_LIB) src/bandedSWA.native.o test/bandedswa_highzdrop_seed_test.o
 	$(CXX) $(BASE_CXXFLAGS) -march=native $(LDFLAGS) test/bandedswa_highzdrop_seed_test.o src/bandedSWA.native.o $(BWA_LIB) $(LIBS) -o $@
 
+# Negative-h0 regression: an 8-bit lane whose seed score is negative (--meth
+# rescores seeds in original space) must score the same alone as in any group.
+bandedswa_negative_h0_test: $(BWA_LIB) $(HTS_LIB) src/bandedSWA.native.o test/bandedswa_negative_h0_test.o
+	$(CXX) $(BASE_CXXFLAGS) -march=native $(LDFLAGS) test/bandedswa_negative_h0_test.o src/bandedSWA.native.o $(BWA_LIB) $(LIBS) -o $@
+
 # High-h0 / small-zdrop z-drop regression: getScores8 vs scalar with the seed
 # score h0 above zdrop+1 at small zdrop (the region a relaxed 8-bit routing
 # envelope would newly admit), where the z-drop drift's unset-best sentinel used
@@ -1181,6 +1187,9 @@ test/bandedswa_padding_test.o: test/bandedswa_padding_test.cpp
 	$(CXX) -c $(BASE_CXXFLAGS) -march=native $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
 
 test/bandedswa_highzdrop_seed_test.o: test/bandedswa_highzdrop_seed_test.cpp
+	$(CXX) -c $(BASE_CXXFLAGS) -march=native $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
+
+test/bandedswa_negative_h0_test.o: test/bandedswa_negative_h0_test.cpp
 	$(CXX) -c $(BASE_CXXFLAGS) -march=native $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
 
 test/bandedswa_high_h0_zdrop_test.o: test/bandedswa_high_h0_zdrop_test.cpp
