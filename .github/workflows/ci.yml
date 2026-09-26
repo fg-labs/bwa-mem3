@@ -330,11 +330,11 @@ jobs:
 
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
-    # Heaviest job here: the canonical row does several full `make clean`
-    # rebuilds (debug-macro build, SIMD-floor build, ASAN build) on top of the
-    # mimalloc build plus reference download/index. Normal rows finish in a few
-    # minutes; the canonical row runs longest. Sized well above that so a hung
-    # runner fails fast instead of at the 6h default, without flaking a slow row.
+    # Heaviest job here: the canonical row runs the full regression suite on
+    # top of the mimalloc build plus reference download/index. Normal rows
+    # finish in a few minutes; the canonical row runs longest. Sized well above
+    # that so a hung runner fails fast instead of at the 6h default, without
+    # flaking a slow row.
     timeout-minutes: 45
 
     # Compiler is set per row: CXX defaults to clang-19 (installed from
@@ -387,39 +387,11 @@ jobs:
         run: brew install bwa autoconf automake libomp libdeflate
 
       - name: Install clang-19 (Linux)
-        # The matrix builds with clang-19 by default — the shipping/benchmarked
-        # compiler and the compiler-floor minimum (see the Makefile's compiler
-        # version floor). Installed from apt.llvm.org via a pinned repo rather
-        # than piping llvm.sh into `sudo bash`: fetch LLVM's archive signing key,
-        # VERIFY its fingerprint against LLVM's published value before trusting
-        # it, store it in a dedicated keyring, and add the repo `signed-by` that
-        # keyring so a tampered mirror or a changed installer script can't run
-        # code as root or slip in unsigned packages. Skipped on the gcc-compat
-        # lane, which deliberately builds with the runner's g++ +
-        # ALLOW_UNSUPPORTED_COMPILER=1.
+        # The matrix builds with clang-19 by default (see the action for why and
+        # how it is installed). Skipped on the gcc-compat lane, which
+        # deliberately builds with the runner's g++ + ALLOW_UNSUPPORTED_COMPILER=1.
         if: runner.os == 'Linux' && matrix.cxx != 'g++'
-        run: |
-          set -euo pipefail
-          . /etc/os-release
-          codename="${VERSION_CODENAME:-$(lsb_release -cs)}"
-          # LLVM's published apt archive signing key fingerprint.
-          expected_fpr="6084F3CF814B57C1CF12EFD515CF4D18AF4F7421"
-          curl --retry 3 --retry-delay 2 --retry-all-errors -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key -o /tmp/llvm-snapshot.gpg.key
-          got_fpr="$(gpg --show-keys --with-colons --with-fingerprint /tmp/llvm-snapshot.gpg.key \
-            | awk -F: '/^fpr:/ {print $10; exit}')"
-          if [ "$got_fpr" != "$expected_fpr" ]; then
-            echo "FATAL: LLVM archive key fingerprint mismatch: got '$got_fpr', expected '$expected_fpr'" >&2
-            exit 1
-          fi
-          sudo install -m 0755 -d /etc/apt/keyrings
-          sudo gpg --dearmor -o /etc/apt/keyrings/llvm-snapshot.gpg /tmp/llvm-snapshot.gpg.key
-          echo "deb [signed-by=/etc/apt/keyrings/llvm-snapshot.gpg] http://apt.llvm.org/${codename}/ llvm-toolchain-${codename}-19 main" \
-            | sudo tee /etc/apt/sources.list.d/llvm-19.list
-          sudo apt-get update
-          # libomp-19-dev provides omp.h in clang-19's search path (libsais.c
-          # uses -fopenmp); ubuntu's libomp-dev matches the distro clang, not 19.
-          sudo apt-get install -y clang-19 libomp-19-dev
-          clang++-19 --version | head -1
+        uses: ./.github/actions/install-clang-19
 
       - name: Verify CMake is available
         run: cmake --version
@@ -759,45 +731,10 @@ jobs:
           fi
           echo "PASS: no-mimalloc build correctly omits mimalloc"
 
-      - name: Cache chr22 reference
-        id: cache-chr22
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: /tmp/chr22/chr22.fa
-          key: chr22-hg38-ucsc-v1
-
-      - name: Download chr22 reference (hg38)
-        if: steps.cache-chr22.outputs.cache-hit != 'true'
-        # --fail makes curl exit non-zero on HTTP 4xx/5xx instead of writing
-        # the error body into the gunzip pipe; --retry/--retry-delay/
-        # --retry-all-errors absorb transient UCSC hiccups so a flaky 5xx
-        # doesn't fail the whole matrix on a cold cache. The SHA-256 pin
-        # is enforced unconditionally by the next step so it catches both
-        # a fresh download and a restored cache entry.
-        run: |
-          mkdir -p /tmp/chr22
-          curl --fail --retry 3 --retry-delay 2 --retry-all-errors -sSL \
-            "https://hgdownload.soe.ucsc.edu/goldenPath/hg38/chromosomes/chr22.fa.gz" \
-            | gunzip > /tmp/chr22/chr22.fa
-          test -s /tmp/chr22/chr22.fa
-          echo "chr22.fa bytes: $(wc -c < /tmp/chr22/chr22.fa)"
-
-      - name: Verify chr22 reference SHA-256
-        # Runs unconditionally — after a cache restore (hit) and after a
-        # fresh download (miss) — so the parity input is always
-        # cryptographically validated against the pin. Without this, a
-        # stale chr22-hg38-ucsc-v1 cache entry (e.g., one populated
-        # before the pin existed, or one carried over from a future pin
-        # bump that forgot to rev the cache key) would silently swap
-        # every regression job to a different chr22 payload.
-        env:
-          CHR22_FASTA_SHA256_PIN: ce3ee1ca39356238f7aee438a40a88b4f1b9d80b316b263e16fb12402212d10f
-        run: |
-          actual_sha=$(shasum -a 256 /tmp/chr22/chr22.fa | awk '{print $1}')
-          if [ "$actual_sha" != "$CHR22_FASTA_SHA256_PIN" ]; then
-            echo "FAIL: chr22.fa sha256 mismatch (expected $CHR22_FASTA_SHA256_PIN, got $actual_sha)" >&2
-            exit 1
-          fi
+      - name: Stage chr22 fixture (reference, bwa index, simulated reads)
+        # Pinned chr22 + .fai, bwa's index, and ~50k simulated PE pairs under
+        # /tmp/chr22 and /tmp/chr22-sim; shared with the rebuild-variants job.
+        uses: ./.github/actions/chr22-fixture
 
       - name: Build chr22 FMI index
         # bwa-mem3 index is rebuilt every run because its sidecar layout is
@@ -806,94 +743,6 @@ jobs:
           cd /tmp/chr22
           "$GITHUB_WORKSPACE/bwa-mem3" index chr22.fa
           ls chr22.fa.*
-
-      - name: Compute chr22 bwa-index cache inputs
-        # Salt the bwa-index cache key with the inputs that actually
-        # produce it: the bwa version (apt on Linux, brew on macOS) and a
-        # digest of chr22.fa. Without this, an apt/brew bwa bump or a
-        # UCSC reference refresh would silently restore stale sidecars
-        # built from different inputs, breaking parity. shasum -a 256 is
-        # available on both ubuntu-latest and macos-latest.
-        run: |
-          bwa_version=$(bwa 2>&1 | sed -n 's/^Version: //p' | head -1)
-          chr22_fasta_sha=$(shasum -a 256 /tmp/chr22/chr22.fa | awk '{print $1}' | cut -c1-16)
-          {
-            echo "BWA_VERSION=${bwa_version}"
-            echo "CHR22_FASTA_SHA=${chr22_fasta_sha}"
-          } >> "$GITHUB_ENV"
-          echo "BWA_VERSION=${bwa_version}"
-          echo "CHR22_FASTA_SHA=${chr22_fasta_sha}"
-
-      - name: Cache chr22 bwa indexes
-        # Sidecars are cached separately from the chr22 FASTA so an
-        # apt/brew bwa bump invalidates this key without re-downloading
-        # the reference. The key is salted by ${BWA_VERSION} and a
-        # ${CHR22_FASTA_SHA} digest of chr22.fa (exported above) plus
-        # ${runner.os} to differentiate apt vs. brew bwa builds.
-        id: cache-chr22-bwa
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: |
-            /tmp/chr22/bwa_chr22.fa
-            /tmp/chr22/bwa_chr22.fa.amb
-            /tmp/chr22/bwa_chr22.fa.ann
-            /tmp/chr22/bwa_chr22.fa.bwt
-            /tmp/chr22/bwa_chr22.fa.pac
-            /tmp/chr22/bwa_chr22.fa.sa
-          key: chr22-hg38-ucsc-bwa-v2-${{ runner.os }}-${{ env.BWA_VERSION }}-${{ env.CHR22_FASTA_SHA }}
-
-      - name: Build chr22 bwa indexes
-        if: steps.cache-chr22-bwa.outputs.cache-hit != 'true'
-        # bwa index writes sidecars next to the FASTA filename, so we use
-        # a dedicated bwa_chr22.fa copy to keep its sidecars from
-        # colliding with the bwa-mem3 index files at /tmp/chr22/chr22.fa.*.
-        run: |
-          cp /tmp/chr22/chr22.fa /tmp/chr22/bwa_chr22.fa
-          bwa index /tmp/chr22/bwa_chr22.fa
-          ls /tmp/chr22/bwa_chr22.fa.*
-
-      - name: Setup holodeck (pixi)
-        # Install holodeck via bioconda; pinned to v0.2.1 in
-        # test/holodeck/pixi.toml. Runs on every matrix row. samtools is
-        # bundled with holodeck in this pixi env so we have a uniform
-        # source of `samtools faidx` across linux-64, linux-aarch64, and
-        # osx-arm64 (the macOS brew step otherwise wouldn't carry it).
-        uses: prefix-dev/setup-pixi@1b2de7f3351f171c8b4dfeb558c639cb58ed4ec0 # v0.9.5
-        with:
-          pixi-version: v0.49.0
-          manifest-path: test/holodeck/pixi.toml
-          cache: true
-
-      - name: Index chr22 with samtools faidx
-        # holodeck requires an indexed FASTA (.fai sidecar). The
-        # bwa-mem3 indexer doesn't produce .fai, so build it here.
-        # --frozen makes pixi error if pixi.lock is out of sync with
-        # pixi.toml rather than silently regenerating the lockfile;
-        # that pins samtools (manifest unbounded at >=1.20) and every
-        # transitive dep to the committed lockfile for deterministic CI.
-        run: |
-          pixi run --frozen --manifest-path test/holodeck/pixi.toml -- \
-            samtools faidx /tmp/chr22/chr22.fa
-
-      - name: Simulate chr22 reads with holodeck
-        # Deterministic ~50k PE pairs by construction: chr22 is ~50 Mbp
-        # and --coverage 0.3 with --read-length 150 (~300 bp inserts)
-        # yields ~50k pairs. --simple-names emits @holodeck::N headers
-        # (aligners ignore name content). Flat 0.001 error rate mimics
-        # dwgsim's -r 0.001 -S 2 to keep the byte-identical parity bar
-        # realistic.
-        run: |
-          mkdir -p /tmp/chr22-sim
-          pixi run --frozen --manifest-path test/holodeck/pixi.toml -- \
-            holodeck simulate \
-              -r /tmp/chr22/chr22.fa \
-              -o /tmp/chr22-sim/reads \
-              --coverage 0.3 \
-              --read-length 150 \
-              --seed 42 \
-              --simple-names \
-              --min-error-rate 0.001 --max-error-rate 0.001
-          ls /tmp/chr22-sim/
 
       - name: Compare chr22 bwa vs bwa-mem3 (parity)
         run: |
@@ -1355,8 +1204,45 @@ jobs:
             echo "::group::$t"; bash "test/regression/$t.sh"; echo "::endgroup::"
           done
 
+  # The canonical row's three alternate-configuration builds, split out so they
+  # run alongside the matrix instead of at the end of its slowest row. Each is a
+  # full rebuild that replaces $GITHUB_WORKSPACE/bwa-mem3, so on the canonical
+  # row they had to run last and in series, adding ~2.5 min to the job that
+  # sets the workflow's wall time. They need nothing the canonical row produces,
+  # only its configuration (Linux x86_64, avx2, clang-19) and the chr22 fixture,
+  # so the arch/compiler/mimalloc values below are that row's, spelled out.
+  rebuild-variants:
+    name: Rebuild variants (debug macros, SIMD floor, ASAN)
+    runs-on: ubuntu-latest
+    # Three builds plus the chr22 fixture and parity, a few minutes normally.
+    # Ceiling catches a hung runner only.
+    timeout-minutes: 30
+    env:
+      CXX: clang++-19
+      CC: clang-19
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Install dependencies (Linux)
+        # The matrix rows' package set (same list and version, so the same apt
+        # cache): bwa for the chr22 parity baseline and samtools for
+        # header_parity.sh, on top of the build dependencies.
+        uses: awalsh128/cache-apt-pkgs-action@acb598e5ddbc6f68a970c5da0688d2f3a9f04d05 # v1.6.0
+        with:
+          packages: zlib1g-dev libdeflate-dev bwa autoconf automake samtools libomp-dev
+          version: 1.1
+
+      - name: Install clang-19 (Linux)
+        uses: ./.github/actions/install-clang-19
+
+      - name: Stage chr22 fixture (reference, bwa index, simulated reads)
+        uses: ./.github/actions/chr22-fixture
+
       - name: Opt-in debug/instrumentation macro build (chr22 parity)
-        if: matrix.canonical == true
         # The expensive debug checks and instrumentation in this tree sit behind
         # opt-in macros rather than `#ifndef NDEBUG`, because nothing here
         # defines NDEBUG (see test/regression/ndebug_gate_lint.sh). That is
@@ -1378,15 +1264,16 @@ jobs:
         # introduce them; until those land the flags are simply unused, which
         # costs nothing and avoids a follow-up CI edit.
         #
-        # Placed immediately before the ASAN step because both replace
-        # $GITHUB_WORKSPACE/bwa-mem3 with a differently-configured binary; the
-        # ASAN step does its own `make clean` and so is unaffected by this one.
+        # First in this job, so the tree is fresh and needs no `make clean`. The
+        # chr22 bwa-mem3 index is built here with this binary: the debug macros
+        # are aligner-side checks and do not touch the index format, and the
+        # ASAN step below reuses the same index.
         run: |
-          make clean
-          make -j"$(nproc)" arch=${{ matrix.arch_flag }} \
-            CXX=${{ matrix.cxx || 'clang++-19' }} \
-            USE_MIMALLOC=${{ matrix.use_mimalloc }} \
+          make -j"$(nproc)" arch=avx2 \
+            CXX=clang++-19 \
+            USE_MIMALLOC=1 \
             EXTRA_CXXFLAGS="-DBWA_MEM3_DEBUG_CHN_FLT_XCHECK -DBWA_MEM3_DEBUG_RID_CHECK -DBWA_MEM3_DEBUG_UNGAPPED_XCHECK -DBSW8_ASSERT_ENVELOPE -DBWA_MEM3_DEBUG_POISON -DBWAMEM3_UGP_PROFILE=1 -DBWA_MEM3_DEBUG_RESCUE_STATS -DBWA_MEM3_DEBUG_SRTGG_TINY"
+          "$GITHUB_WORKSPACE/bwa-mem3" index /tmp/chr22/chr22.fa
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           CHR22_FA=/tmp/chr22/chr22.fa \
           BWA_CHR22_FA=/tmp/chr22/bwa_chr22.fa \
@@ -1394,7 +1281,6 @@ jobs:
           bash test/regression/chr22_parity.sh
 
       - name: SIMD floor enforcement (TESTING_BUILD, injected below-floor tier)
-        if: matrix.canonical == true
         # What happens when the binary lands on a host older than the floor it
         # was built for is a user-facing promise: refuse with exit 2 and a
         # readable [E::bwamem3] message, not a SIGILL. host_floor_enforce.sh
@@ -1404,32 +1290,28 @@ jobs:
         #
         # Invoked through the target rather than by calling the script, so the
         # env contract (injected tier, PARITY_FA) lives in one place and the
-        # target itself stays exercised. The row is avx2, so sse41 is below
+        # target itself stays exercised. This job builds avx2, so sse41 is below
         # floor. The reference is never opened -- the precheck fires first --
         # so /dev/null is a real fixture here, not a shortcut.
         #
-        # Placed here for the same reason as the step above: it replaces
-        # $GITHUB_WORKSPACE/bwa-mem3 with a differently-configured binary, and
-        # the ASAN step that follows does its own `make clean`. The flags are
+        # The `make clean` discards the debug-macro build above. The flags are
         # repeated on the second `make` so it sees the same configuration and
         # treats the build as up to date instead of rebuilding.
         #
-        # USE_MIMALLOC is carried from the row rather than left to the Makefile
-        # default, which is what every other build step here does. TESTING_BUILD
-        # is meant to vary one thing against the row's configuration; the
-        # canonical row happens to be USE_MIMALLOC=1 and so is the default, so
-        # omitting it is a no-op only until that row changes.
+        # USE_MIMALLOC=1 is spelled out rather than left to the Makefile
+        # default: TESTING_BUILD is meant to vary one thing against the canonical
+        # row's configuration (avx2, clang-19, mimalloc), and that default
+        # matching the row today is a coincidence, not a contract.
         run: |
           make clean
-          make -j"$(nproc)" arch=${{ matrix.arch_flag }} \
-            CXX=${{ matrix.cxx || 'clang++-19' }} \
-            USE_MIMALLOC=${{ matrix.use_mimalloc }} TESTING_BUILD=1
-          make test-injection arch=${{ matrix.arch_flag }} \
-            CXX=${{ matrix.cxx || 'clang++-19' }} \
-            USE_MIMALLOC=${{ matrix.use_mimalloc }} TESTING_BUILD=1
+          make -j"$(nproc)" arch=avx2 \
+            CXX=clang++-19 \
+            USE_MIMALLOC=1 TESTING_BUILD=1
+          make test-injection arch=avx2 \
+            CXX=clang++-19 \
+            USE_MIMALLOC=1 TESTING_BUILD=1
 
       - name: Short-read SE smoke (chr22, ASAN, dense+variable-length)
-        if: matrix.canonical == true
         # Guards the wsize_mem byte-vs-entry capacity-tracker class of bug
         # fixed in PR #100. The fixture simulates 25-50 bp variable-length
         # reads from chr22:14M-20M (pericentromeric, repeat-rich) at 5-10%
@@ -1439,15 +1321,14 @@ jobs:
         # Builds with ASAN=1 (forces USE_MIMALLOC=0; mimalloc and asan
         # can't coexist) so the heap-buffer-overflow in mem_collect_smem
         # surfaces as a non-zero exit independent of allocator behavior.
-        # Placed last in the canonical row because `make clean && make
-        # ASAN=1` replaces $GITHUB_WORKSPACE/bwa-mem3; nothing after this
-        # step uses the binary. Canonical-only because PR #100 confirmed
-        # the bug is input-regime-specific, not codegen-/SIMD-specific
-        # (reproduces on AVX2, AVX-512BW, SMEM_LOCKSTEP_N=1).
+        # Uses the chr22 bwa-mem3 index built by the debug-macro step. Runs once,
+        # on this avx2 build, because PR #100 confirmed the bug is
+        # input-regime-specific, not codegen-/SIMD-specific (reproduces on AVX2,
+        # AVX-512BW, SMEM_LOCKSTEP_N=1).
         run: |
           make clean
-          make -j"$(nproc)" arch=${{ matrix.arch_flag }} \
-            CXX=${{ matrix.cxx || 'clang++-19' }} ASAN=1
+          make -j"$(nproc)" arch=avx2 \
+            CXX=clang++-19 ASAN=1
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           CHR22_FA=/tmp/chr22/chr22.fa \
           CHR22_SIM_DIR=/tmp/chr22-sim-dense \
@@ -1456,19 +1337,19 @@ jobs:
           # Re-run the header regression against the SAME asan binary. The
           # header writers size buffers from header text, and a one-byte
           # overrun there changes no output byte, so the non-asan run of this
-          # script earlier in the row cannot see it -- only asan can. Cheap
+          # script on the canonical row cannot see it -- only asan can. Cheap
           # (it builds its own 3-contig ALT fixture) and it needs the samtools
-          # apt package this row already installs for `samtools dict`.
+          # apt package this job installs for `samtools dict`.
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           HEADER_PARITY_WORK_DIR=/tmp/header-parity-asan \
           bash test/regression/header_parity.sh
           # Re-run the CLI-input safety test against the SAME asan binary. Its
           # bwa_escape trailing-backslash cases are a heap over-read inside
-          # libbwa; on the plain (non-asan) build earlier in the row the read
+          # libbwa; on the plain (non-asan) build on the canonical row the read
           # usually lands on allocator padding and the assertions still pass, so
           # only asan reliably turns the OOB into a failure.
-          make ASAN=1 arch=${{ matrix.arch_flag }} \
-            CXX=${{ matrix.cxx || 'clang++-19' }} cli_arg_safety_test
+          make ASAN=1 arch=avx2 \
+            CXX=clang++-19 cli_arg_safety_test
           ./cli_arg_safety_test
 
   coverage:
@@ -1587,30 +1468,8 @@ jobs:
           version: 1.1
 
       - name: Install clang-19 (Linux)
-        # Identical verified-key install to the build-and-test matrix: fetch
-        # LLVM's archive signing key, verify its fingerprint against LLVM's
-        # published value, store it in a dedicated keyring, and add the repo
-        # signed-by that keyring so a tampered mirror can't run code as root or
-        # slip in unsigned packages.
-        run: |
-          set -euo pipefail
-          . /etc/os-release
-          codename="${VERSION_CODENAME:-$(lsb_release -cs)}"
-          expected_fpr="6084F3CF814B57C1CF12EFD515CF4D18AF4F7421"
-          curl --retry 3 --retry-delay 2 --retry-all-errors -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key -o /tmp/llvm-snapshot.gpg.key
-          got_fpr="$(gpg --show-keys --with-colons --with-fingerprint /tmp/llvm-snapshot.gpg.key \
-            | awk -F: '/^fpr:/ {print $10; exit}')"
-          if [ "$got_fpr" != "$expected_fpr" ]; then
-            echo "FATAL: LLVM archive key fingerprint mismatch: got '$got_fpr', expected '$expected_fpr'" >&2
-            exit 1
-          fi
-          sudo install -m 0755 -d /etc/apt/keyrings
-          sudo gpg --dearmor -o /etc/apt/keyrings/llvm-snapshot.gpg /tmp/llvm-snapshot.gpg.key
-          echo "deb [signed-by=/etc/apt/keyrings/llvm-snapshot.gpg] http://apt.llvm.org/${codename}/ llvm-toolchain-${codename}-19 main" \
-            | sudo tee /etc/apt/sources.list.d/llvm-19.list
-          sudo apt-get update
-          sudo apt-get install -y clang-19 libomp-19-dev
-          clang++-19 --version | head -1
+        # Same verified-key install as the build-and-test matrix.
+        uses: ./.github/actions/install-clang-19
 
       - name: Build the padded-lane gate under MemorySanitizer
         # MSAN=1 forces USE_MIMALLOC off (mimalloc's malloc override interposes

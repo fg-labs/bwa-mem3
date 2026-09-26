@@ -1,0 +1,39 @@
+name: Install clang-19 (Linux)
+description: >-
+  Install clang-19 and libomp-19-dev from apt.llvm.org, trusting LLVM's archive
+  signing key only after its fingerprint matches the pinned value.
+# clang-19 is the shipping/benchmarked compiler and the compiler-floor minimum
+# (see the Makefile's compiler version floor). Installed from apt.llvm.org via a
+# pinned repo rather than piping llvm.sh into `sudo bash`: fetch LLVM's archive
+# signing key, VERIFY its fingerprint against LLVM's published value before
+# trusting it, store it in a dedicated keyring, and add the repo `signed-by`
+# that keyring so a tampered mirror or a changed installer script can't run code
+# as root or slip in unsigned packages. Every job that needs clang-19 uses this
+# action, so the fingerprint pin lives in one place. Linux runners only.
+runs:
+  using: composite
+  steps:
+    - name: Install clang-19 from apt.llvm.org (verified key)
+      shell: bash
+      run: |
+        set -euo pipefail
+        . /etc/os-release
+        codename="${VERSION_CODENAME:-$(lsb_release -cs)}"
+        # LLVM's published apt archive signing key fingerprint.
+        expected_fpr="6084F3CF814B57C1CF12EFD515CF4D18AF4F7421"
+        curl --retry 3 --retry-delay 2 --retry-all-errors -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key -o /tmp/llvm-snapshot.gpg.key
+        got_fpr="$(gpg --show-keys --with-colons --with-fingerprint /tmp/llvm-snapshot.gpg.key \
+          | awk -F: '/^fpr:/ {print $10; exit}')"
+        if [ "$got_fpr" != "$expected_fpr" ]; then
+          echo "FATAL: LLVM archive key fingerprint mismatch: got '$got_fpr', expected '$expected_fpr'" >&2
+          exit 1
+        fi
+        sudo install -m 0755 -d /etc/apt/keyrings
+        sudo gpg --dearmor -o /etc/apt/keyrings/llvm-snapshot.gpg /tmp/llvm-snapshot.gpg.key
+        echo "deb [signed-by=/etc/apt/keyrings/llvm-snapshot.gpg] http://apt.llvm.org/${codename}/ llvm-toolchain-${codename}-19 main" \
+          | sudo tee /etc/apt/sources.list.d/llvm-19.list
+        sudo apt-get update
+        # libomp-19-dev provides omp.h in clang-19's search path (libsais.c
+        # uses -fopenmp); ubuntu's libomp-dev matches the distro clang, not 19.
+        sudo apt-get install -y clang-19 libomp-19-dev
+        clang++-19 --version | head -1

@@ -3,8 +3,13 @@
 End-to-end parity and invariant checks. `chr22_parity.sh`,
 `version_banner.sh` and `arg_range_validation.sh` run on every matrix row; the rest run on the canonical
 `Linux x86_64 AVX2 (mimalloc)` row only, except for the ones wired to a job of
-their own: `profile_slice_cpu.sh` runs from `profiling-build` (see below), and
-the `ndebug_gate_lint*`, `debug_macro_flag_lint*`, `shell_lint*`,
+their own: `profile_slice_cpu.sh` runs from `profiling-build` (see below);
+`host_floor_enforce.sh` and `short_read_smoke.sh` run from `rebuild-variants`,
+which builds the canonical row's configuration (Linux x86_64, avx2, clang-19)
+three more ways -- every opt-in debug macro on (rerunning `chr22_parity.sh`
+against it), `TESTING_BUILD=1`, and `ASAN=1` (rerunning `header_parity.sh`
+against it) -- in parallel with the matrix rather than at the end of the
+canonical row; and the `ndebug_gate_lint*`, `debug_macro_flag_lint*`, `shell_lint*`,
 `regression_coverage_lint*` and `readme_contract_lint*` pairs need no binary at
 all and run from `ndebug-gate-lint`, `debug-macro-flag-lint`, `shell-lint`,
 `regression-coverage-lint` and `readme-contract-lint` respectively. Each script:

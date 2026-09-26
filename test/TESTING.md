@@ -70,7 +70,7 @@ The chr22 scripts are the expensive end: they want a chr22 reference indexed for
 
 ## Running tests in CI
 
-- **ci.yml** runs unit tests on every matrix row, integration tests on the four widened canonical rows, and regression tests on the canonical AVX2 row — except `chr22_parity.sh`, which runs on every row, and the source-only lints, which run in their own jobs alongside the build matrix (they need no binary, so they do not wait on it).
+- **ci.yml** runs unit tests on every matrix row, integration tests on the four widened canonical rows, and regression tests on the canonical AVX2 row — except `chr22_parity.sh`, which runs on every row; the checks that need a differently-configured build of that row (debug macros, `TESTING_BUILD`, ASAN), which run in the `rebuild-variants` job alongside the matrix; and the source-only lints, which run in their own jobs alongside the build matrix (they need no binary, so they do not wait on it).
 - JUnit artifacts are uploaded per row (`unit-results-<name>.xml`, `integration-results-<name>.xml`). Download them from a failed run's Actions page to see fine-grained assertion output.
 - **proto-neon-kswv.yml** runs `./test/bwa_mem3_tests_unit --test-suite="unit/kswv"` on proto branches.
 
