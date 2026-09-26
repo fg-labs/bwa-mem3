@@ -1,0 +1,159 @@
+name: chr22 fixture
+description: >-
+  Stage the hg38 chr22 parity fixture: the SHA-256-pinned reference and its
+  .fai, bwa's index of it, and ~50k simulated 150 bp PE pairs.
+# Leaves behind, for the steps that follow:
+#   /tmp/chr22/chr22.fa (+ .fai)      the pinned reference
+#   /tmp/chr22/bwa_chr22.fa (+ bwa sidecars)
+#   /tmp/chr22-sim/reads.r{1,2}.fastq.gz
+#   the test/holodeck pixi env (holodeck + samtools), for `pixi run`
+#
+# It does NOT build the bwa-mem3 index: that sidecar layout is coupled to the
+# bwa-mem3 binary, which changes per commit, so the caller runs
+# `bwa-mem3 index /tmp/chr22/chr22.fa` with the binary it is testing. Needs `bwa`
+# on PATH (apt on Linux, brew on macOS) and `shasum`.
+runs:
+  using: composite
+  steps:
+    - name: Cache chr22 reference
+      id: cache-chr22
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: /tmp/chr22/chr22.fa
+        key: chr22-hg38-ucsc-v1
+
+    - name: Download chr22 reference (hg38)
+      if: steps.cache-chr22.outputs.cache-hit != 'true'
+      # --fail makes curl exit non-zero on HTTP 4xx/5xx instead of writing
+      # the error body into the gunzip pipe; --retry/--retry-delay/
+      # --retry-all-errors absorb transient UCSC hiccups so a flaky 5xx
+      # doesn't fail the whole matrix on a cold cache. The SHA-256 pin
+      # is enforced unconditionally by the next step so it catches both
+      # a fresh download and a restored cache entry.
+      shell: bash
+      run: |
+        mkdir -p /tmp/chr22
+        curl --fail --retry 3 --retry-delay 2 --retry-all-errors -sSL \
+          "https://hgdownload.soe.ucsc.edu/goldenPath/hg38/chromosomes/chr22.fa.gz" \
+          | gunzip > /tmp/chr22/chr22.fa
+        test -s /tmp/chr22/chr22.fa
+        echo "chr22.fa bytes: $(wc -c < /tmp/chr22/chr22.fa)"
+
+    - name: Verify chr22 reference SHA-256
+      # Runs unconditionally — after a cache restore (hit) and after a
+      # fresh download (miss) — so the parity input is always
+      # cryptographically validated against the pin. Without this, a
+      # stale chr22-hg38-ucsc-v1 cache entry (e.g., one populated
+      # before the pin existed, or one carried over from a future pin
+      # bump that forgot to rev the cache key) would silently swap
+      # every regression job to a different chr22 payload.
+      env:
+        CHR22_FASTA_SHA256_PIN: ce3ee1ca39356238f7aee438a40a88b4f1b9d80b316b263e16fb12402212d10f
+      shell: bash
+      run: |
+        actual_sha=$(shasum -a 256 /tmp/chr22/chr22.fa | awk '{print $1}')
+        if [ "$actual_sha" != "$CHR22_FASTA_SHA256_PIN" ]; then
+          echo "FAIL: chr22.fa sha256 mismatch (expected $CHR22_FASTA_SHA256_PIN, got $actual_sha)" >&2
+          exit 1
+        fi
+
+    - name: Compute chr22 bwa-index cache inputs
+      id: bwa-cache-inputs
+      # Salt the bwa-index cache key with the inputs that actually
+      # produce it: the bwa version (apt on Linux, brew on macOS) and a
+      # digest of chr22.fa. Without this, an apt/brew bwa bump or a
+      # UCSC reference refresh would silently restore stale sidecars
+      # built from different inputs, breaking parity. shasum -a 256 is
+      # available on both ubuntu-latest and macos-latest.
+      #
+      # `bwa` with no arguments prints its usage (and version) and exits 1,
+      # which `shell: bash`'s pipefail would turn into a step failure, so its
+      # status is discarded; an empty version fails the check below instead.
+      shell: bash
+      run: |
+        bwa_version=$({ bwa 2>&1 || true; } | sed -n 's/^Version: //p' | head -1)
+        if [ -z "$bwa_version" ]; then
+          echo "FAIL: could not read the bwa version from its usage text" >&2
+          exit 1
+        fi
+        chr22_fasta_sha=$(shasum -a 256 /tmp/chr22/chr22.fa | awk '{print $1}' | cut -c1-16)
+        {
+          echo "bwa_version=${bwa_version}"
+          echo "chr22_fasta_sha=${chr22_fasta_sha}"
+        } >> "$GITHUB_OUTPUT"
+        echo "BWA_VERSION=${bwa_version}"
+        echo "CHR22_FASTA_SHA=${chr22_fasta_sha}"
+
+    - name: Cache chr22 bwa indexes
+      # Sidecars are cached separately from the chr22 FASTA so an
+      # apt/brew bwa bump invalidates this key without re-downloading
+      # the reference. The key is salted by the bwa version and a
+      # digest of chr22.fa (computed above) plus ${runner.os} to
+      # differentiate apt vs. brew bwa builds.
+      id: cache-chr22-bwa
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: |
+          /tmp/chr22/bwa_chr22.fa
+          /tmp/chr22/bwa_chr22.fa.amb
+          /tmp/chr22/bwa_chr22.fa.ann
+          /tmp/chr22/bwa_chr22.fa.bwt
+          /tmp/chr22/bwa_chr22.fa.pac
+          /tmp/chr22/bwa_chr22.fa.sa
+        key: chr22-hg38-ucsc-bwa-v2-${{ runner.os }}-${{ steps.bwa-cache-inputs.outputs.bwa_version }}-${{ steps.bwa-cache-inputs.outputs.chr22_fasta_sha }}
+
+    - name: Build chr22 bwa indexes
+      if: steps.cache-chr22-bwa.outputs.cache-hit != 'true'
+      # bwa index writes sidecars next to the FASTA filename, so we use
+      # a dedicated bwa_chr22.fa copy to keep its sidecars from
+      # colliding with the bwa-mem3 index files at /tmp/chr22/chr22.fa.*.
+      shell: bash
+      run: |
+        cp /tmp/chr22/chr22.fa /tmp/chr22/bwa_chr22.fa
+        bwa index /tmp/chr22/bwa_chr22.fa
+        ls /tmp/chr22/bwa_chr22.fa.*
+
+    - name: Setup holodeck (pixi)
+      # Install holodeck via bioconda; pinned to v0.2.1 in
+      # test/holodeck/pixi.toml. samtools is bundled with holodeck in this
+      # pixi env so we have a uniform source of `samtools faidx` across
+      # linux-64, linux-aarch64, and osx-arm64 (the macOS brew step otherwise
+      # wouldn't carry it).
+      uses: prefix-dev/setup-pixi@1b2de7f3351f171c8b4dfeb558c639cb58ed4ec0 # v0.9.5
+      with:
+        pixi-version: v0.49.0
+        manifest-path: test/holodeck/pixi.toml
+        cache: true
+
+    - name: Index chr22 with samtools faidx
+      # holodeck requires an indexed FASTA (.fai sidecar). The
+      # bwa-mem3 indexer doesn't produce .fai, so build it here.
+      # --frozen makes pixi error if pixi.lock is out of sync with
+      # pixi.toml rather than silently regenerating the lockfile;
+      # that pins samtools (manifest unbounded at >=1.20) and every
+      # transitive dep to the committed lockfile for deterministic CI.
+      shell: bash
+      run: |
+        pixi run --frozen --manifest-path test/holodeck/pixi.toml -- \
+          samtools faidx /tmp/chr22/chr22.fa
+
+    - name: Simulate chr22 reads with holodeck
+      # Deterministic ~50k PE pairs by construction: chr22 is ~50 Mbp
+      # and --coverage 0.3 with --read-length 150 (~300 bp inserts)
+      # yields ~50k pairs. --simple-names emits @holodeck::N headers
+      # (aligners ignore name content). Flat 0.001 error rate mimics
+      # dwgsim's -r 0.001 -S 2 to keep the byte-identical parity bar
+      # realistic.
+      shell: bash
+      run: |
+        mkdir -p /tmp/chr22-sim
+        pixi run --frozen --manifest-path test/holodeck/pixi.toml -- \
+          holodeck simulate \
+            -r /tmp/chr22/chr22.fa \
+            -o /tmp/chr22-sim/reads \
+            --coverage 0.3 \
+            --read-length 150 \
+            --seed 42 \
+            --simple-names \
+            --min-error-rate 0.001 --max-error-rate 0.001
+        ls /tmp/chr22-sim/
