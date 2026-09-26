@@ -179,8 +179,8 @@ static bool rb_components_scalar(const rescue_prune_view &v, BND bnd, int tau, i
 }
 
 #if defined(__aarch64__)
-/* NEON view (bnd16 + the filter's bitsets). mw = {bnd >= 19}, hw = {bnd >= 19 and cnt > 0}.
- * Every component at tau >= 19 lies inside one run of mw, and inside such a run hw is exactly the
+/* NEON view (bnd16 + the filter's bitsets). mw = {bnd >= v.minsc}, hw = {bnd >= v.minsc and cnt > 0}.
+ * Every component at tau >= v.minsc lies inside one run of mw, and inside such a run hw is exactly the
  * "has a hit" set, so dmaxhit is the last hw bit of the component. ub and i0 are vector max / masked
  * min over the component's diagonals (bnd16, cnt and minrow are readable up to the filter's
  * rounded-up diagonal count, so 8-wide loads never leave the arrays; lanes past b are masked). */
@@ -231,8 +231,8 @@ static bool rb_components_neon(const rescue_prune_view &v, int tau, int xa, int 
         out.push_back(k);
         return true;
     };
-    if (tau == rescue_prune_neon::MINSC) {
-        /* The whole view at MINSC: the filter already listed these components (same runs of mw,
+    if (tau == v.minsc) {
+        /* The whole view at the filter's minsc: the filter already listed these components (same runs of mw,
          * same ub / i0 / dmaxhit computation, rescue_prune_neon.h step 7). Reproduce emit()'s
          * result: append until out holds cap, false iff any component did not fit. */
         if (xa == 0 && xb == v.nd && v.ncomp >= 0 && (v.ncomp == v.ncomp_stored || (int)out.size() + v.ncomp_stored >= cap)) {
@@ -252,7 +252,7 @@ static bool rb_components_neon(const rescue_prune_view &v, int tau, int xa, int 
         }
         return true;
     }
-    /* tau > 19: runs of bnd >= tau inside [xa, xb) (a run of mw), 64 diagonals per bitmask word;
+    /* tau > v.minsc: runs of bnd >= tau inside [xa, xb) (a run of mw), 64 diagonals per bitmask word;
      * run starts and ends are the bit transitions of the word (branch per run, not per diagonal). */
     static const uint8_t bw[16] = {1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128};
     const uint8x16_t BW = vld1q_u8(bw);
@@ -287,12 +287,12 @@ bool rescue_band_components(const rescue_prune_view &v, int tau, int xa, int xb,
                             std::vector<rb_comp> &out, int cap)
 {
 #if defined(__aarch64__)
-    if (v.bnd16 && v.mw && v.hw && tau >= rescue_prune_neon::MINSC) return rb_components_neon(v, tau, xa, xb, out, cap);
+    if (v.bnd16 && v.mw && v.hw && tau >= v.minsc) return rb_components_neon(v, tau, xa, xb, out, cap);
 #else
-    /* The whole view at MINSC: the SIMD filter already listed these components (the same runs and
+    /* The whole view at the filter's minsc: the SIMD filter already listed these components (the same runs and
      * values as the scan below; test/rescue_prune_eq checks the list). Reproduce the scan's result:
      * append until out holds cap, false iff any component did not fit. */
-    if (v.comps && tau == rescue_prune_neon::MINSC && xa == 0 && xb == v.nd && v.ncomp >= 0 &&
+    if (v.comps && tau == v.minsc && xa == 0 && xb == v.nd && v.ncomp >= 0 &&
         (v.ncomp == v.ncomp_stored || (int)out.size() + v.ncomp_stored >= cap)) {
         for (int k = 0; k < v.ncomp; k++) {
             if ((int)out.size() >= cap) return false;
@@ -349,7 +349,9 @@ void rescue_band_score2(const uint8_t *R, int stride, int n, int row0, int S, in
 bool RescueBandBatch::plan(const rescue_prune_view &v, int len1, int len2, int hb, int he, int minsc)
 {
     pending_ = -1;
-    if (v.nd < 0 || minsc < 19 || minsc > 255) return false;
+    /* minsc >= 5: the pruning lemma's floor (rescue_prune_applies); the view's components are at the
+     * same minsc (the filter ran with it). */
+    if (v.nd < 0 || minsc < 5 || minsc > 255) return false;
     const auto t0 = rb_stats_on() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
     const int quanta = ((len2 + 15) / 16) * 16;
     const int H = he - hb + 1;

@@ -303,19 +303,19 @@ static bool rescue_prune_enabled()
     static const bool on = rescue_env_flag("BWA3_RESCUE_PRUNE");
     return on;
 }
-/* Default 400 for the hull path. On aarch64, 1000 when banding is on and the NEON filter runs
- * (minsc == 19): banding turns more of the pruned windows into savings, which pays for the filter
- * on the denser windows (measured locally: best of {400, 1000, 3000, 10^4, 10^9}). The scalar
- * filter (any other minsc) is too slow on dense windows for that, so it keeps 400. On x86 400
- * with banding too: the x86 kswv kernels are cheap enough that the extra filter work on dense
- * windows does not pay (prune + band, wall vs 1000: Zen 3 AVX2 wgs-5M 73.57 vs 74.52 s, wes-5M
- * 37.65 vs 38.57 s; Zen 5 AVX-512 26.73 vs 27.53 s wgs). */
+/* Default 400 for the hull path. On aarch64, 1000 when banding is on: banding turns more of the
+ * pruned windows into savings, which pays for the filter on the denser windows (measured locally
+ * at minsc 19: best of {400, 1000, 3000, 10^4, 10^9}). On x86 400 with banding too: the x86 kswv
+ * kernels are cheap enough that the extra filter work on dense windows does not pay (prune + band,
+ * wall vs 1000: Zen 3 AVX2 wgs-5M 73.57 vs 74.52 s, wes-5M 37.65 vs 38.57 s; Zen 5 AVX-512 26.73 vs
+ * 27.53 s wgs). */
 static int rescue_prune_max_hits(int minsc)
 {
     static const int env = rescue_env_int("BWA3_RESCUE_PRUNE_MAX_HITS", -1);
     if (env >= 0) return env;
 #if defined(__aarch64__)
-    return rescue_band_enabled() && minsc == 19 ? 1000 : 400;
+    (void)minsc;
+    return rescue_band_enabled() ? 1000 : 400;
 #else
     (void)minsc;
     return 400;
@@ -365,20 +365,21 @@ static bool rescue_dedup_skip_enabled()
 
 /* The pruning lemma is derived for the default scoring only (a=1, b=4, gap open 6 / extend 1),
  * the 8-bit kernel path, and non-meth rescue; everything else runs the full window. */
-/* Pruning is on for this run: the toggle, and on x86 the minsc the SIMD filter covers. x86 prunes
- * only at minsc == 19: at any other minsc the scalar filter runs without the pass-0 band, and the
- * x86 kswv kernels are cheap enough that it costs more than it saves (prune on vs off, wall: Zen 5
- * AVX-512 +3 to +13 % at -k 10 / 15 / 25 / 32 on wgs-5M and wes-5M; Zen 3 AVX2 +1 to +6 % at
- * -k 25). Everything keyed on pruning (the length sort, the narrow-offset record in _pre and its
- * read in _post) uses this, so a run it turns off takes exactly the prune-off path. Pass-1 banding
- * does not depend on pruning. */
+/* Pruning is on for this run: the toggle, and on the AVX-512 tier only below minsc 25. There the
+ * 64-lane kswv is cheap and few rescues pass at a high minsc, so the filter costs more than it
+ * saves (prune on vs off, wall, Zen 5 wgs-5M: +1.0 / +2.4 / +1.2 / +1.3 % at -k 25 / 28 / 32 / 40;
+ * wes-5M -1.3 / +0.9 / -0.8 / -1.2 %). AVX2 still wins at -k 32 (Zen 3 wes-5M -3.8 %). Everything
+ * keyed on pruning (the length sort, the narrow-offset record in _pre and its read in _post) uses
+ * this, so a run it turns off takes exactly the prune-off path. Pass-1 banding does not depend on
+ * pruning. */
 static bool rescue_prune_on(const mem_opt_t *opt)
 {
 #if defined(__aarch64__)
     (void)opt;
     return rescue_prune_enabled();
 #else
-    return rescue_prune_enabled() && opt->min_seed_len * opt->a == 19;
+    static const bool avx512 = bwamem3_simd_tier() == BWAMEM3_TIER_AVX512BW;
+    return rescue_prune_enabled() && !(avx512 && opt->min_seed_len * opt->a >= 25);
 #endif
 }
 

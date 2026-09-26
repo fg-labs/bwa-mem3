@@ -135,16 +135,18 @@ static inline int rescue_prune_window_scalar(const uint8_t *ref, int len1, const
  * that returned RESCUE_PRUNE_B2, and only when nd >= 0 (the SIMD paths' rare scalar fallback
  * leaves nd = -1). Diagonal index x in [0, nd) is the unshifted diagonal d = i - j = x - off.
  * Exactly one of bnd16 (SIMD filter: bnd precomputed) or fwd/bwd (scalar: bnd = 5 + fwd + bwd -
- * (cnt - 1)) is set. mw, when set, is the SIMD filter's bitset of diagonals with bnd >= 19. */
+ * (cnt - 1)) is set. mw, when set, is the SIMD filter's bitset of diagonals with bnd >= minsc
+ * (the minsc of the filter call that produced the view). */
 struct rescue_prune_view {
     int nd = -1, off = 0;
+    int minsc = 0;   // SIMD filter: the threshold of mw, hw and comps
     const uint16_t *cnt = nullptr;
     const int16_t *minrow = nullptr;
     const int16_t *bnd16 = nullptr;
     const int32_t *fwd = nullptr, *bwd = nullptr;
-    const uint64_t *mw = nullptr;   // SIMD filter: bitset of diagonals with bnd >= 19
-    const uint64_t *hw = nullptr;   // SIMD filter: bitset of diagonals with bnd >= 19 and a hit
-    /* SIMD filter: its own components at bnd >= 19 with a hit (all of [0, nd)), in diagonal
+    const uint64_t *mw = nullptr;   // SIMD filter: bitset of diagonals with bnd >= minsc
+    const uint64_t *hw = nullptr;   // SIMD filter: bitset of diagonals with bnd >= minsc and a hit
+    /* SIMD filter: its own components at bnd >= minsc with a hit (all of [0, nd)), in diagonal
      * order; the first min(ncomp, ncomp_stored) are in comps. ncomp < 0: not available. */
     const rescue_prune_neon::Comp *comps = nullptr;
     int ncomp = -1, ncomp_stored = 0;
@@ -185,6 +187,7 @@ static inline rescue_prune_view rescue_prune_last_view()
         if (ns.view_nd < 0) return v;
         v.nd = ns.view_nd;
         v.off = ((ns.qlen_c + 15) / 16) * 16;   // off = quanta of the last (cached) query
+        v.minsc = ns.view_minsc;
         v.cnt = ns.cnt; v.minrow = ns.minrow; v.bnd16 = ns.bnd; v.mw = ns.mw; v.hw = ns.hw;
         v.comps = ns.comps; v.ncomp = ns.ncomp;
         v.ncomp_stored = std::min(ns.ncomp, (int)rescue_prune_neon::NeonScratch::COMP_CAP);
@@ -196,6 +199,7 @@ static inline rescue_prune_view rescue_prune_last_view()
         if (xs.view_nd < 0) return v;
         v.nd = xs.view_nd;
         v.off = ((xs.qlen_c + 15) / 16) * 16;   // off = quanta of the last (cached) query
+        v.minsc = xs.view_minsc;
         v.cnt = xs.cnt; v.minrow = xs.minrow; v.bnd16 = xs.bnd; v.mw = xs.mw; v.hw = xs.hw;
         v.comps = xs.comps; v.ncomp = xs.ncomp;
         v.ncomp_stored = std::min(xs.ncomp, (int)rescue_prune_x86::X86Scratch::COMP_CAP);
@@ -227,12 +231,12 @@ static inline int rescue_prune_window(const uint8_t *ref, int len1, const uint8_
     if (len1 < 5 || len2 < 5 || len2 > rescue_prune_scratch::QCAP || len1 > 30000)
         return RESCUE_PRUNE_FULL;
 #if defined(__aarch64__)
-    if (minsc == rescue_prune_neon::MINSC) {  // identical decisions, ~2x faster (rescue_prune_neon.h)
+    {   // identical decisions to the scalar filter at any minsc, ~2x faster (rescue_prune_neon.h)
         rescue_prune_neon::NeonScratch &ns = rescue_prune_neon_scratch();
         rescue_prune_last_path() = 2;
         const rescue_prune_neon::Job jb{len1, len2, 0, 0, -1, -1, ref, q};
         int h, e;
-        const rescue_prune_neon::Kind k = rescue_prune_neon::lean_neon(jb, ns, h, e, max_hits);
+        const rescue_prune_neon::Kind k = rescue_prune_neon::lean_neon(jb, ns, h, e, max_hits, minsc);
         if (k == rescue_prune_neon::SCALAR) goto scalar;   // int32 path: > 32000 hits, long windows
         if (k == rescue_prune_neon::B1) return RESCUE_PRUNE_B1;
         if (k == rescue_prune_neon::FULL) return RESCUE_PRUNE_FULL;
@@ -241,12 +245,12 @@ static inline int rescue_prune_window(const uint8_t *ref, int len1, const uint8_
     }
 scalar:
 #elif defined(__AVX2__)
-    if (minsc == rescue_prune_neon::MINSC) {  // identical decisions (rescue_prune_x86.h)
+    {   // identical decisions to the scalar filter at any minsc (rescue_prune_x86.h)
         rescue_prune_x86::X86Scratch &xs = rescue_prune_x86_scratch();
         rescue_prune_last_path() = 3;
         const rescue_prune_neon::Job jb{len1, len2, 0, 0, -1, -1, ref, q};
         int h, e;
-        const rescue_prune_neon::Kind k = rescue_prune_x86::lean_x86(jb, xs, h, e, max_hits);
+        const rescue_prune_neon::Kind k = rescue_prune_x86::lean_x86(jb, xs, h, e, max_hits, minsc);
         if (k == rescue_prune_neon::SCALAR) goto scalar;   // int32 path: > 32000 hits, long windows
         if (k == rescue_prune_neon::B1) return RESCUE_PRUNE_B1;
         if (k == rescue_prune_neon::FULL) return RESCUE_PRUNE_FULL;

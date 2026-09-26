@@ -20,8 +20,8 @@
  *   exact window pruning (src/bwamem_pair.cpp, rescue_prune.h; read once)
  *     BWA3_RESCUE_PRUNE          1     prune rescue windows by exact 5-mer bounds
  *     BWA3_RESCUE_PRUNE_MAX_HITS auto  skip the filter on windows with more 5-mer hits than
- *                                      this; auto is 1000 on aarch64 when banding is on and
- *                                      minsc == 19 (the NEON filter), else 400 (always on x86)
+ *                                      this; auto is 1000 on aarch64 when banding is on, else
+ *                                      400 (always on x86)
  *   banded rescue (src/rescue_band.{h,cpp}, NEON or AVX2 kernel; read once)
  *     BWA3_RESCUE_BAND           1     run pruned pass-0 jobs in diagonal bands (0: kswv on the
  *                                      hull, and MAX_HITS auto back to 400)
