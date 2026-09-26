@@ -660,9 +660,7 @@ see
 #### `--adaptive-band` — adaptive banded Smith-Waterman for medium-length reads
 
 > **Kilobase-scale long reads are not currently supported at default settings.**
-> `bwa-mem3 mem` on PacBio HiFi (~15–20 kb) or ONT reads exhausts the
-> short-read-sized extension buffers and aborts (or, before the guard, OOM'd /
-> segfaulted) — the buffer model cannot represent a kilobase-scale extension.
+> `bwa-mem3 mem` is not practical on PacBio HiFi (~15–20 kb) or ONT reads.
 > This lever helps the **medium-length** end of its range (e.g. SBX at ~240 bp,
 > where it is validated); it does **not** make HiFi/ONT usable. For a true
 > long-read workload use minimap2. Tracking issue: bounding long-read extension
@@ -678,7 +676,7 @@ when the extension's reference window exceeds it (`ref_window > 2·w+1`), which
 happens once reads are roughly ≥ 200 bp. So this is a lever for the
 **medium-length** range — SBX (HG002, ~240 bp), where it cuts alignment CPU by
 **~25 %**. It nominally applies to PacBio HiFi and ONT too, but kilobase-scale
-reads do not run at default settings (see the caveat above), so in practice its
+reads are not practical at default settings (see the caveat above), so in practice its
 usable range today is medium reads, not true long reads. On short-read data (WGS ~150 bp, WES ~76 bp) the extension matrix is
 already smaller than the band, so there is nothing to trim: those reads run on the
 8-bit kernel, which this option deliberately leaves untouched, making it a **no-op
@@ -814,8 +812,8 @@ opt-out.
 
 `--adaptive-band` (see above) is included because it is a strict no-op on short reads
 (the reads `--fast` primarily targets) and a ~25% alignment-CPU speedup on medium-length
-runs (e.g. SBX ~240 bp), so bundling it only helps. Note kilobase-scale HiFi/ONT reads do
-not run at default settings regardless of this flag (see
+runs (e.g. SBX ~240 bp), so bundling it only helps. Note kilobase-scale HiFi/ONT reads are
+not practical at default settings regardless of this flag (see
 [`--adaptive-band`](#--adaptive-band--adaptive-banded-smith-waterman-for-medium-length-reads)).
 Pass [`--no-adaptive-band`](#--no-adaptive-band--force-exact-extension-opt-out-of---adaptive-band)
 to opt back out — restoring the exact full-width extension step (byte-identical to a

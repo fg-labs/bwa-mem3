@@ -89,7 +89,7 @@ bwa-mem3 mem -t <N> -m 10 -y 0 ref.fa R1.fq R2.fq > out.sam
 > full-width extension step — byte-identical to a run without `--adaptive-band` — while
 > keeping the rest of `--fast`, whose other levers can still change output)
 > (`--adaptive-band` is a no-op on short reads, a ~25% speedup on medium-length runs
-> such as SBX ~240 bp; kilobase-scale HiFi/ONT do not run at default settings — see
+> such as SBX ~240 bp; kilobase-scale HiFi/ONT are not practical at default settings — see
 > [Situational: `--adaptive-band`](#situational---adaptive-band-for-medium-length-reads)).
 > On a `--meth` run the effective levers are
 > `-m 10 -y 0 --min-ext-len 30 --smem-dedup --max-extend-chains 10 --adaptive-band -s 2 --extend-mate-concordant`.
@@ -444,9 +444,8 @@ universal recommendation. It has no effect on primary-alignment MAPQ or on non-S
 This is **not** part of the recommended (short-read) profile — it is a
 **medium-length-read** lever, and the default (off) is correct for standard Illumina WGS/WES.
 
-> **Not for kilobase-scale long reads.** `bwa-mem3 mem` does not currently run on PacBio HiFi
-> (~15–20 kb) or ONT reads at default settings — the short-read-sized extension buffers cannot
-> hold a kilobase-scale extension and the run aborts. `--adaptive-band` does not change that.
+> **Not for kilobase-scale long reads.** `bwa-mem3 mem` is not practical on PacBio HiFi (~15–20 kb)
+> or ONT reads at default settings. `--adaptive-band` does not change that.
 > Use minimap2 for true long-read alignment. Tracking issue: fg-labs/bwa-mem3#238.
 
 `--adaptive-band` starts banded Smith-Waterman tight and expands each extension only to the band its
@@ -455,7 +454,7 @@ only constrains the DP matrix when the extension's reference window exceeds it �
 the **~200 bp** mark — so:
 
 - **Use it for medium-length reads:** SBX (HG002, ~240 bp), where it cut alignment CPU by **~25 %**.
-  It nominally covers longer reads, but kilobase-scale HiFi/ONT do not run at default settings (see
+  It nominally covers longer reads, but kilobase-scale HiFi/ONT are not practical at default settings (see
   the note above), so its usable range today is medium reads.
 - **No-op on short reads:** WGS (~150 bp) and WES (~76 bp) extensions are already smaller than the
   band, so there is nothing to trim; those reads run on the 8-bit kernel, which the option leaves

@@ -376,6 +376,43 @@ alters the result solely for the `bi == 5` case — not a measured-fixture gener
 standard fixtures do not exercise the `-` input. The direct-copy forward path (where a
 `-` stays `-`) and the default (non-`--meth`) output are unaffected.
 
+## Extension staging copied a chain's windows once per seed (PR #524)
+
+Before banded extension, `stage_seed_extension` copies each seed's extension targets into
+per-thread staging buffers: the reversed reference prefix and the reference suffix of the
+chain's window, and the reversed read prefix and the read suffix. That per-seed staging is
+inherited from bwa-mem2. Every seed got its own copy, and the reference window spans the whole
+chain, so a chain cost O(seeds x chain span) bytes (O(seeds x read length) on the read side).
+
+A 150 bp read from a long homopolymer or short tandem repeat has an SMEM with tens of thousands
+of hits; seeding keeps a `max_occ` (500) sample of them, and when their spacing is within the
+band they all chain into one ~500-seed chain spanning the repeat. A batch of a few hundred such
+reads grew the reference staging buffer past its `int32` offset range, and `mem` aborted with
+`seqBufRef in stage_seed_extension cannot grow past the int32 offset range`. `--meth` hit it
+most readily (it disables the ungapped fast path), but the default path failed the same way.
+
+Every left target of a chain is a suffix of one reversed prefix and every right target a
+suffix of one forward suffix, so each is now staged once per chain and each extension points
+into the shared copy. Each extension reads exactly the bytes it read before (only their offset
+in the staging buffer changes), so on any input that did not abort the emitted records are
+**byte-identical by construction**. Inputs that aborted because a many-seed repeat chain copied
+its window once per seed, such as the homopolymer reads above, now complete. The `int32` staging
+limit itself is unchanged, so a batch whose once-per-chain windows still exceed it (as
+kilobase-scale reads can) still aborts with the same error.
+
+Measured scope: SAM minus `@PG` compared against `main` and identical on an AWS c8g.8xlarge
+(Graviton4, arm64, NEON kernel tier, Amazon Linux 2023, clang 19.1.7) for hg38 (GRCh38 with
+ALT/decoy) with 200,000 real WGS pairs (HG00096) at `-t 32` and `-t 8`; 20,000 simulated pairs on
+the 1 Mb synthetic reference, paired (`-t 1`/`-t 8`, `-P`, `-5SP`, `-a`, `-M`, `--bam=0`,
+`-P -a`) and single-end; and `--meth` on 3,000 bisulfite-converted pairs, paired with `-C` and
+single-end. An earlier revision (reference-side sharing only) was also identical on an Apple M2
+Max (arm64, NEON, clang 21.1.8) for 200,000 HG002 WGS pairs on hg38 and 20,000 simulated phiX
+pairs. x86 was not compared against `main` for this change; CI's cross-arch check (this branch
+on x86-64, AVX-512BW where the runner has it and otherwise AVX2, and on arm64 NEON; ~415K
+simulated chr17 pairs) found identical alignment records, and
+the staging code is common to every SIMD tier, running before the tier-specific kernels. Pinned by
+`test/regression/repeat_chain_extension_window.sh`.
+
 ---
 
 ## Upstream port divergences: all chains dropped by the weight filter (PR #489) and the SA sentinel offset (PR #469)
@@ -419,6 +456,7 @@ shipped, because parity with that release is its contract (see
 | `--meth` SEQ restore clamps unsupported bytes to `N` | [#463](https://github.com/fg-labs/bwa-mem3/pull/463) | — | fork-only (`--meth` only; changes a `-` byte to `N` on the `nst_nt4_table` lookup paths only — the direct-copy forward path, all other bytes, and the default path are unchanged) |
 | Symmetric ref/query length bounds guards on the SW wrappers | [#467](https://github.com/fg-labs/bwa-mem3/pull/467) | — | fork-only (invalid-input contract; valid-input records byte-identical by construction — see the PR #467 correctness note above for the measured scope) |
 | Banded-SW `qlen` band-clamp reach slot overflow (`int32_t` reach) | [#468](https://github.com/fg-labs/bwa-mem3/pull/468) | — | fork-only (8-bit widening defensive; 16-bit divergence only at non-default `-A >= 3` long-query, `len2 * A > 65535` — default alignment records unchanged for fixed batch composition, see the correctness note above) |
+| Extension staging copied a chain's windows once per seed | [#524](https://github.com/fg-labs/bwa-mem3/pull/524) | — | fork-only (inputs that aborted because a repeat chain staged its window once per seed now complete; the `int32` staging limit itself is unchanged; records of inputs that already ran byte-identical by construction — see the PR #524 correctness note above for the measured scope) |
 | kseq2bseq1 zero-initialization | [#22](https://github.com/fg-labs/bwa-mem3/pull/22) | — | fork-only |
 | Proper-pair flag from emitted alignment | [#17](https://github.com/fg-labs/bwa-mem3/pull/17) | — | fork-only, **opt-in** (`--proper-pair-from-emitted`; default matches both upstreams, [#362](https://github.com/fg-labs/bwa-mem3/issues/362)) |
 | All chains dropped by the weight filter: default follows bwa | [#489](https://github.com/fg-labs/bwa-mem3/pull/489) | — ([#310](https://github.com/fg-labs/bwa-mem3/issues/310)) | fork-only; `--compat=bwa-mem2` reproduces bwa-mem2 |
