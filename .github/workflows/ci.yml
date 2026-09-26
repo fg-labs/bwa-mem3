@@ -1338,7 +1338,9 @@ jobs:
         # must-fix maps; default==spec30; off/spec30 placement-invariant;
         # -t1==-t4 determinism; flag/env equivalence; malformed-value handling;
         # and stats-verified that the prune removes seeds, regime-A keeps all,
-        # and baseline differs from spec30).
+        # and baseline differs from spec30); and a control byte (0, TAB) in a
+        # read's sequence line, which must come out as N in SEQ and in scoring
+        # without truncating the original bases or losing XR:Z and the -C tags.
         env:
           BWA_MEM3: ${{ github.workspace }}/bwa-mem3
         run: |
@@ -1351,7 +1353,7 @@ jobs:
                    meth_output_integrity meth_reverse_strand_conversion \
                    meth_seed_unpacked_ref_not_loaded \
                    meth_rescue_batched_identical meth_collapsed_scoring \
-                   meth_tags meth_flag_footguns meth_seed_prune; do
+                   meth_tags meth_flag_footguns meth_seed_prune meth_nul_base; do
             echo "::group::$t"; bash "test/regression/$t.sh"; echo "::endgroup::"
           done
 
