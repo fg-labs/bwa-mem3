@@ -4,10 +4,13 @@
  *
  * For every job: the SIMD path must return the scalar path's (kind, hb, he), and on B2 its view
  * must match the scalar arrays: cnt and minrow (where cnt > 0) on [0, nd), bnd16 ==
- * 5 + fwd + bwd - (cnt - 1), the mw / hw bits (bnd >= minsc, and cnt > 0) on [0, nd) and zero on
- * [nd, nd + 64), and the component list (runs of bnd >= minsc with a hit: a, b, ub, i0, dmax) with
- * its count, and the view's minsc. Every job is run twice in a row half of the time, which
- * exercises the memo. minsc varies per job (dumps: 19, 5, 10, 15, 25, 32 in turn; fuzz: 5-40).
+ * base + fwd + bwd - (a cnt - c), the mw / hw bits (bnd >= minsc, and cnt > 0) on [0, nd) and zero
+ * on [nd, nd + 64), and the component list (runs of bnd >= minsc with a hit: a, b, ub, i0, dmax)
+ * with its count, and the view's minsc and constants. Every job is run twice in a row half of the
+ * time, which exercises the memo. minsc varies per job (dumps: 19, 5, 10, 15, 25, 32 in turn;
+ * fuzz: 5-40), and so does the scoring (the default half of the time, else one of SCORINGS: c = 2,
+ * a = 2, large gap opens), through rescue_prune_params. At c = 2 a single-hit diagonal has
+ * weight a - c < 0, the case the NEON hw test once got wrong.
  *
  *   rescue_prune_eq dump <files...>     jobs from rescue_band_harness dumps
  *                                       (int32 len1, len2; ref; query)
@@ -32,17 +35,37 @@ struct Stats {
     long jobs = 0, simd = 0, fallback = 0, b2 = 0, bad = 0, kind[3] = {0, 0, 0};
 };
 
-bool check_view(const uint8_t *ref, int len1, const uint8_t *q, int len2, int minsc, const rescue_prune_view &v,
-                rescue_prune_scratch &r, std::string &why)
+/* K = 5 scorings the SIMD filters take (a, b, o_del, e_del, o_ins, e_ins). */
+const int SCORINGS[][6] = {
+    {1, 4, 8, 2, 8, 2},     // -O 8 -E 2: c = 2
+    {1, 4, 6, 2, 6, 2},     // -E 2: c = 2
+    {1, 6, 6, 1, 6, 1},     // -B 6
+    {1, 9, 16, 1, 16, 1},   // -x intractg: tail offset 12
+    {2, 8, 12, 2, 12, 2},   // -A 2 scaled: a = 2, c = 2
+    {1, 4, 6, 1, 7, 2},     // -O 6,7 -E 1,2
+    {3, 12, 18, 3, 18, 3},  // a = 3
+};
+const int NSCORINGS = sizeof SCORINGS / sizeof SCORINGS[0];
+
+rescue_prune_params scoring(int which, int minsc)
 {
-    const int nd = r.view_nd;
+    if (which < 0) return rescue_prune_params::defaults(minsc);
+    const int *x = SCORINGS[which];
+    return rescue_prune_params::from(x[0], x[1], x[2], x[3], x[4], x[5], minsc * x[0]);
+}
+
+bool check_view(const uint8_t *ref, int len1, const uint8_t *q, int len2, const rescue_prune_params &p,
+                const rescue_prune_view &v, rescue_prune_scratch &r, std::string &why)
+{
+    const int nd = r.view_nd, minsc = p.minsc;
     if (v.minsc != minsc) { why = "view minsc " + std::to_string(v.minsc); return false; }
+    if (v.base != p.base() || v.a != p.a || v.c != p.c) { why = "view constants"; return false; }
     if (v.nd != nd) { why = "nd " + std::to_string(v.nd) + " vs " + std::to_string(nd); return false; }
     if (v.off != ((len2 + 15) / 16) * 16) { why = "off"; return false; }
     if (!v.bnd16 || !v.mw || !v.hw || !v.comps || v.ncomp < 0) { why = "SIMD view incomplete"; return false; }
     auto bit = [](const uint64_t *w, int x) { return (int)(w[x >> 6] >> (x & 63) & 1); };
     for (int x = 0; x < nd; x++) {
-        const int bnd = 5 + r.fwd[x] + r.bwd[x] - ((int)r.cnt[x] - 1);
+        const int bnd = p.base() + r.fwd[x] + r.bwd[x] - p.weight(r.cnt[x]);
         if (v.cnt[x] != r.cnt[x]) { why = "cnt at " + std::to_string(x); return false; }
         if (r.cnt[x] && v.minrow[x] != r.minrow[x]) { why = "minrow at " + std::to_string(x); return false; }
         if (v.bnd16[x] != bnd) { why = "bnd at " + std::to_string(x); return false; }
@@ -54,7 +77,7 @@ bool check_view(const uint8_t *ref, int len1, const uint8_t *q, int len2, int mi
     /* components at minsc with a hit, as the filters' step 7 lists them */
     std::vector<rescue_prune_neon::Comp> want;
     for (int x = 0; x < nd;) {
-        auto bnd = [&](int y) { return 5 + r.fwd[y] + r.bwd[y] - ((int)r.cnt[y] - 1); };
+        auto bnd = [&](int y) { return p.base() + r.fwd[y] + r.bwd[y] - p.weight(r.cnt[y]); };
         if (bnd(x) < minsc) { x++; continue; }
         const int a = x;
         int ub = INT16_MIN, i0 = INT16_MAX, dmax = -1;
@@ -76,13 +99,16 @@ bool check_view(const uint8_t *ref, int len1, const uint8_t *q, int len2, int mi
     return true;
 }
 
-void run_one(const uint8_t *ref, int len1, const uint8_t *q, int len2, int minsc, int max_hits, bool twice, Stats &st)
+void run_one(const uint8_t *ref, int len1, const uint8_t *q, int len2, const rescue_prune_params &p, int max_hits,
+             bool twice, Stats &st)
 {
     static rescue_prune_scratch r;
+    if (!p.valid) return;
+    const int minsc = p.minsc;
     int h0 = -1, e0 = -1, h1 = -1, e1 = -1;
-    const int k0 = rescue_prune_window_scalar(ref, len1, q, len2, minsc, max_hits, r, &h0, &e0);
+    const int k0 = rescue_prune_window_scalar(ref, len1, q, len2, p, max_hits, r, &h0, &e0);
     for (int rep = 0; rep < (twice ? 2 : 1); rep++) {
-        const int k1 = rescue_prune_window(ref, len1, q, len2, minsc, max_hits, &h1, &e1);
+        const int k1 = rescue_prune_window(ref, len1, q, len2, p, max_hits, &h1, &e1);
         const int path = rescue_prune_last_path();
         st.jobs++;
         if (path == 2 || path == 3) st.simd++;
@@ -94,13 +120,13 @@ void run_one(const uint8_t *ref, int len1, const uint8_t *q, int len2, int minsc
         if (!ok) why = "decision (" + std::to_string(k1) + "," + std::to_string(h1) + "," + std::to_string(e1) +
                        ") vs scalar (" + std::to_string(k0) + "," + std::to_string(h0) + "," + std::to_string(e0) + ")";
         if (ok && k1 == RESCUE_PRUNE_B2 && (path == 2 || path == 3))
-            ok = check_view(ref, len1, q, len2, minsc, rescue_prune_last_view(), r, why);
+            ok = check_view(ref, len1, q, len2, p, rescue_prune_last_view(), r, why);
         if (rep == 0) st.kind[k1]++;
         if (k1 == RESCUE_PRUNE_B2) st.b2++;
         if (!ok) {
             if (st.bad < 20)
-                fprintf(stderr, "MISMATCH len1=%d len2=%d minsc=%d max_hits=%d rep=%d path=%d: %s\n", len1, len2,
-                        minsc, max_hits, rep, path, why.c_str());
+                fprintf(stderr, "MISMATCH len1=%d len2=%d minsc=%d a=%d c=%d base=%d max_hits=%d rep=%d path=%d: %s\n",
+                        len1, len2, minsc, p.a, p.c, p.base(), max_hits, rep, path, why.c_str());
             st.bad++;
         }
     }
@@ -138,7 +164,8 @@ int run_dumps(int argc, char **argv, bool hdr16, Stats &st)
             /* production gates: 400 (hull path) and 1000 (banded), plus fully open */
             const int mh = k % 3 == 0 ? 400 : k % 3 == 1 ? 1000 : 1 << 30;
             static const int minscs[6] = {19, 5, 10, 15, 25, 32};
-            run_one(ref, h[0], q, h[1], minscs[(k / 3) % 6], mh, (k & 1) == 0, st);
+            const int which = (k / 18) % 2 == 0 ? -1 : (int)((k / 36) % NSCORINGS);
+            run_one(ref, h[0], q, h[1], scoring(which, minscs[(k / 3) % 6]), mh, (k & 1) == 0, st);
         }
     }
     return 0;
@@ -180,7 +207,8 @@ void run_fuzz(long n, unsigned seed, Stats &st)
         if (rnd(0, 49) == 0) q[rnd(0, len2 - 1)] = 4;     // N in the query
         const int mh = rnd(0, 3) == 0 ? rnd(0, 3000) : rnd(0, 1) ? 1000 : 1 << 30;
         const int minsc = rnd(0, 1) ? 19 : rnd(5, 40);
-        run_one(ref.data(), len1, q.data(), len2, minsc, mh, rnd(0, 1) == 0, st);
+        const int which = rnd(0, 1) ? -1 : rnd(0, NSCORINGS - 1);
+        run_one(ref.data(), len1, q.data(), len2, scoring(which, minsc), mh, rnd(0, 1) == 0, st);
     }
 }
 

@@ -68,8 +68,14 @@ struct rescue_prune_params {
         const int n = ub - tau - o_del + (K - 1) * a;
         return n > 0 ? n / e_del : 0;
     }
-    /* The SIMD filters hard-code K = 5, weights cnt - 1, the constant 5 and the tail ub - tau - 2. */
-    bool simd_ok() const { return valid && K == 5 && a == 1 && c == 1 && o_del == 6 && e_del == 1; }
+    /* The SIMD filters take K = 5 and any weights (simd_wt); a <= 16 keeps a cnt within int16. */
+    bool simd_ok() const { return valid && K == 5 && a <= 16; }
+    rescue_prune_neon::Wt simd_wt() const
+    {
+        rescue_prune_neon::Wt w;
+        w.base = base(); w.a = a; w.c = c; w.toff = o_del - (K - 1) * a; w.e = e_del;
+        return w;
+    }
     bool default_scoring() const
     {
         return conv_from < 0 && a == 1 && b == 4 && o_del == 6 && e_del == 1 && o_ins == 6 && e_ins == 1;
@@ -217,8 +223,8 @@ static inline int rescue_prune_window_scalar(const uint8_t *ref, int len1, const
  * diagonal components at thresholds above minsc (rescue_band.h). Valid only right after a call
  * that returned RESCUE_PRUNE_B2, and only when nd >= 0 (the SIMD paths' rare scalar fallback
  * leaves nd = -1). Diagonal index x in [0, nd) is the unshifted diagonal d = i - j = x - off.
- * Exactly one of bnd16 (SIMD filter: bnd precomputed; base 5, a 1, c 1) or fwd/bwd (scalar:
- * bnd = base + fwd + bwd - (a cnt - c)) is set. mw, when set, is the SIMD filter's bitset of diagonals with bnd >= minsc
+ * Exactly one of bnd16 (SIMD filter: bnd precomputed) or fwd/bwd (scalar: bnd = base + fwd + bwd -
+ * (a cnt - c)) is set; base / a / c are the call's constants either way. mw, when set, is the SIMD filter's bitset of diagonals with bnd >= minsc
  * (the minsc of the filter call that produced the view). */
 struct rescue_prune_view {
     int nd = -1, off = 0;
@@ -272,6 +278,7 @@ static inline rescue_prune_view rescue_prune_last_view()
         v.nd = ns.view_nd;
         v.off = ((ns.qlen_c + 15) / 16) * 16;   // off = quanta of the last (cached) query
         v.minsc = ns.view_minsc;
+        v.base = ns.view_wt.base; v.a = ns.view_wt.a; v.c = ns.view_wt.c;
         v.cnt = ns.cnt; v.minrow = ns.minrow; v.bnd16 = ns.bnd; v.mw = ns.mw; v.hw = ns.hw;
         v.comps = ns.comps; v.ncomp = ns.ncomp;
         v.ncomp_stored = std::min(ns.ncomp, (int)rescue_prune_neon::NeonScratch::COMP_CAP);
@@ -284,6 +291,7 @@ static inline rescue_prune_view rescue_prune_last_view()
         v.nd = xs.view_nd;
         v.off = ((xs.qlen_c + 15) / 16) * 16;   // off = quanta of the last (cached) query
         v.minsc = xs.view_minsc;
+        v.base = xs.view_wt.base; v.a = xs.view_wt.a; v.c = xs.view_wt.c;
         v.cnt = xs.cnt; v.minrow = xs.minrow; v.bnd16 = xs.bnd; v.mw = xs.mw; v.hw = xs.hw;
         v.comps = xs.comps; v.ncomp = xs.ncomp;
         v.ncomp_stored = std::min(xs.ncomp, (int)rescue_prune_x86::X86Scratch::COMP_CAP);
@@ -334,7 +342,7 @@ static inline int rescue_prune_window(const uint8_t *ref, int len1, const uint8_
         rescue_prune_last_path() = 2;
         const rescue_prune_neon::Job jb{len1, len2, 0, 0, -1, -1, ref, q};
         int h, e;
-        const rescue_prune_neon::Kind k = rescue_prune_neon::lean_neon(jb, ns, h, e, max_hits, minsc);
+        const rescue_prune_neon::Kind k = rescue_prune_neon::lean_neon(jb, ns, h, e, max_hits, minsc, p.simd_wt());
         if (k == rescue_prune_neon::SCALAR) goto scalar;   // int32 path: > 32000 hits, long windows
         if (k == rescue_prune_neon::B1) return RESCUE_PRUNE_B1;
         if (k == rescue_prune_neon::FULL) return RESCUE_PRUNE_FULL;
@@ -347,7 +355,7 @@ static inline int rescue_prune_window(const uint8_t *ref, int len1, const uint8_
         rescue_prune_last_path() = 3;
         const rescue_prune_neon::Job jb{len1, len2, 0, 0, -1, -1, ref, q};
         int h, e;
-        const rescue_prune_neon::Kind k = rescue_prune_x86::lean_x86(jb, xs, h, e, max_hits, minsc);
+        const rescue_prune_neon::Kind k = rescue_prune_x86::lean_x86(jb, xs, h, e, max_hits, minsc, p.simd_wt());
         if (k == rescue_prune_neon::SCALAR) goto scalar;   // int32 path: > 32000 hits, long windows
         if (k == rescue_prune_neon::B1) return RESCUE_PRUNE_B1;
         if (k == rescue_prune_neon::FULL) return RESCUE_PRUNE_FULL;

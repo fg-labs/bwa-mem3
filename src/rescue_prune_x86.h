@@ -30,6 +30,7 @@ using rescue_prune_neon::FULL;
 using rescue_prune_neon::Job;
 using rescue_prune_neon::Kind;
 using rescue_prune_neon::MINSC;
+using rescue_prune_neon::Wt;
 using rescue_prune_neon::SCALAR;
 using rescue_prune_neon::neon_last;
 using rescue_prune_neon::neon_next;
@@ -65,8 +66,10 @@ struct X86Scratch {
     bool memo_ok = false;
     int memo_len1 = -1, memo_mh = 0, memo_minsc = 0, memo_hb = -1, memo_he = -1, memo_view_nd = -1;
     Kind memo_kind = FULL;
-    /* minsc of the call that produced the view (the threshold of mw, hw and comps). */
+    Wt memo_wt;
+    /* minsc and weights of the call that produced the view (the threshold of mw, hw and comps). */
     int view_minsc = MINSC;
+    Wt view_wt;
     X86Scratch()
     {
         for (int m = 0; m < 256; m++) {
@@ -140,7 +143,10 @@ static inline void x86_codes16(const uint8_t *buf, uint16_t *out)
     x86_st(out + 8, _mm_unpackhi_epi8(lo, a0));
 }
 
-static inline Kind lean_x86_core(const Job &jb, X86Scratch &s, int &hb, int &he, int max_hits, int minsc)
+/* Gen: general weights (rescue_prune_neon::Wt); !Gen is the default scoring's code, unchanged. */
+template <bool Gen>
+static inline Kind lean_x86_core(const Job &jb, X86Scratch &s, int &hb, int &he, int max_hits, int minsc,
+                                 const Wt &wt)
 {
     const uint8_t *ref = jb.ref, *q = jb.qry;
     const int len1 = jb.len1, len2 = jb.len2;
@@ -355,7 +361,9 @@ static inline Kind lean_x86_core(const Job &jb, X86Scratch &s, int &hb, int &he,
         }
     }
 
-    // ---- 6. Kadane bounds as segment-transposed scans, as lean_neon ----
+    // ---- 6. Kadane bounds as segment-transposed scans, as lean_neon (and its int16 headroom) ----
+    if (Gen && ((long)wt.a * hits > 32000 || (long)wt.c * nd > 32000)) return SCALAR;
+    const __m128i vwa = _mm_set1_epi16((short)wt.a), vwc = _mm_set1_epi16((short)wt.c);
     const int L = ((nd + 63) >> 6) << 3, NT = 8 * L;
     const __m128i big = _mm_set1_epi16(32767), small = _mm_set1_epi16(-32768), zero = _mm_setzero_si128();
     __m128i CP, Mb, Xa;   // per segment: P before it; min(0, P before it); max P after it
@@ -367,7 +375,8 @@ static inline Kind lean_x86_core(const Job &jb, X86Scratch &s, int &hb, int &he,
             for (int k = 0; k < 8; k++) c[k] = x86_ld(s.cnt + k * L + t);
             x86_transpose8(c);
             for (int k = 0; k < 8; k++) {
-                p = _mm_add_epi16(p, _mm_sub_epi16(c[k], one16));
+                p = Gen ? _mm_add_epi16(p, _mm_sub_epi16(_mm_mullo_epi16(c[k], vwa), vwc))
+                        : _mm_add_epi16(p, _mm_sub_epi16(c[k], one16));
                 x86_st(TP + (t + k) * 8, p);
                 x86_st(TM + (t + k) * 8, rm);            // segment-local exclusive running min
                 bestl = _mm_max_epi16(bestl, _mm_subs_epi16(p, rm));
@@ -394,14 +403,14 @@ static inline Kind lean_x86_core(const Job &jb, X86Scratch &s, int &hb, int &he,
         Xa = _mm_alignr_epi8(small, hs, 2);
         // max fwd over segment s = max(local best, max P in s - Mb)
         const __m128i best = _mm_max_epi16(bestl, _mm_sub_epi16(h, Mb));
-        if (5 + x86_hmax16(best) < minsc) return B1;
+        if ((Gen ? wt.base : 5) + x86_hmax16(best) < minsc) return B1;
     }
     // Backward: SX, PM and bnd per segment step (see lean_neon for the FAST_HITS form), bnd
     // transposed back to diagonal order.
     {
-        const __m128i five = _mm_set1_epi16(5);
+        const __m128i five = _mm_set1_epi16((short)(Gen ? wt.base : 5));
         const int16_t *__restrict TP = s.P + 8, *__restrict TM = s.PM;
-        const bool fast = hits <= FAST_HITS;
+        const bool fast = Gen ? (long)wt.a * hits <= FAST_HITS && (long)wt.c * nd <= 4200 : hits <= FAST_HITS;
         const __m128i Xl = _mm_subs_epi16(Xa, CP), Ml = _mm_sub_epi16(Mb, CP);
         __m128i sx = fast ? Xl : small;
         for (int t = L - 8; t >= 0; t -= 8) {
@@ -463,7 +472,7 @@ static inline Kind lean_x86_core(const Job &jb, X86Scratch &s, int &hb, int &he,
             if (x1 > x0 && x1 < b) edge(x1);
             const int ub = x86_hmax16(mx), i0 = x86_hmin16(mn);
             lo = std::min(lo, i0);
-            hi = std::max(hi, (dmax - off) + quanta - 1 + std::max(0, ub - minsc - 2));
+            hi = std::max(hi, (dmax - off) + quanta - 1 + (Gen ? wt.tail(ub, minsc) : std::max(0, ub - minsc - 2)));
             if (nc < X86Scratch::COMP_CAP) s.comps[nc] = Comp{a, b, ub, i0, dmax};
             nc++;
         }
@@ -475,20 +484,23 @@ static inline Kind lean_x86_core(const Job &jb, X86Scratch &s, int &hb, int &he,
     s.ncomp = nc;
     s.view_nd = nd;
     s.view_minsc = minsc;
+    s.view_wt = wt;
     return B2;
 }
 
 // Exact repeats of the previous job return the previous result, as lean_neon.
 static inline Kind lean_x86(const Job &jb, X86Scratch &s, int &hb, int &he, int max_hits = 1 << 30,
-                            int minsc = MINSC)
+                            int minsc = MINSC, const Wt &wt = Wt())
 {
     if (s.memo_ok && jb.len1 == s.memo_len1 && jb.len2 == s.qlen_c && max_hits == s.memo_mh && minsc == s.memo_minsc &&
-        memcmp(jb.ref, s.rbuf + 4, (size_t)jb.len1) == 0 && memcmp(jb.qry, s.qcache, (size_t)jb.len2) == 0) {
+        wt == s.memo_wt && memcmp(jb.ref, s.rbuf + 4, (size_t)jb.len1) == 0 && memcmp(jb.qry, s.qcache, (size_t)jb.len2) == 0) {
         hb = s.memo_hb; he = s.memo_he; s.view_nd = s.memo_view_nd;
         return s.memo_kind;
     }
-    const Kind k = lean_x86_core(jb, s, hb, he, max_hits, minsc);
+    const Kind k = wt.dflt() ? lean_x86_core<false>(jb, s, hb, he, max_hits, minsc, wt)
+                             : lean_x86_core<true>(jb, s, hb, he, max_hits, minsc, wt);
     s.memo_ok = k != SCALAR;
+    s.memo_wt = wt;
     s.memo_len1 = jb.len1; s.memo_mh = max_hits; s.memo_minsc = minsc; s.memo_hb = hb; s.memo_he = he;
     s.memo_view_nd = s.view_nd; s.memo_kind = k;
     return k;
