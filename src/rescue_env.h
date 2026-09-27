@@ -23,6 +23,10 @@
  *     BWA3_RESCUE_PRUNE_MAX_HITS auto  skip the filter on windows with more 5-mer hits than
  *                                      this; auto is 1000 on aarch64 when banding is on, else
  *                                      400 (always on x86)
+ *     BWA3_RESCUE_PRUNE_REL      1     --meth genomic / neutral: 1 the relation-expanded filter
+ *                                      for TAPS (EM-seq and collapsed scoring match converted
+ *                                      copies), 0 converted copies only (TAPS not pruned), 2 the
+ *                                      relation for every genomic / neutral run
  *   banded rescue (src/rescue_band.{h,cpp}, NEON or AVX2 kernel; read once)
  *     BWA3_RESCUE_BAND           1     run pruned pass-0 jobs in diagonal bands (0: kswv on the
  *                                      hull, and MAX_HITS auto back to 400)
@@ -36,6 +40,9 @@
  *                                      kswv's
  *     BWA3_RESCUE_BAND_SHIFT     1     shift each narrower lane's spare diagonals below its
  *                                      band so the query offsets of a 16-lane group align
+ *     BWA3_RESCUE_BAND_METH      1     --meth: 1 band except on top of converted-copy pruning
+ *                                      (EM-seq), 0 never, 2 always (both passes, as far as
+ *                                      BAND_* allow)
  *   mate-rescue dedup (src/bwamem_pair.cpp; read once)
  *     BWA3_RESCUE_DEDUP_SKIP     1     skip a post-rescue dedup that is provably a no-op (nothing
  *                                      added since a dedup that reported a fixed point)

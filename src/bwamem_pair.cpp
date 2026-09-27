@@ -45,7 +45,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "rescue_prune.h"
 #include "rescue_band.h"
 #include "rescue_env.h"
-#include "meth_xm.h"   /* meth_chem_t: exact rescue pruning under --meth is EM-seq only */
+#include "meth_xm.h"   /* meth_chem_t: the --meth chemistry picks the rescue filter's relation */
 #include <chrono>
 
 #ifdef USE_MALLOC_WRAPPERS
@@ -373,18 +373,30 @@ static bool rescue_dedup_skip_enabled()
  * keyed on pruning (the length sort, the narrow-offset record in _pre and its read in _post) uses
  * this, so a run it turns off takes exactly the prune-off path. Pass-1 banding does not depend on
  * pruning. */
+/* --meth genomic / neutral scoring under the relation-expanded filter (rescue_prune_params::
+ * set_meth_rel) instead of converted copies: TAPS by default (BWA3_RESCUE_PRUNE_REL). Collapsed
+ * scoring frees the mirror cell too, which only converted copies relate. */
+static bool rescue_meth_rel(const mem_opt_t *opt)
+{
+    static const int mode = rescue_env_int("BWA3_RESCUE_PRUNE_REL", 1);
+    if (!opt->meth_mode || opt->meth_scoring == MEM_METH_SCORING_COLLAPSED) return false;
+    return mode == 2 || (mode == 1 && opt->meth_chem == METH_CHEM_TAPS);
+}
+
 static bool rescue_prune_on(const mem_opt_t *opt)
 {
     const int minsc = opt->min_seed_len * opt->a;
     const rescue_prune_params p = rescue_prune_params::from(opt->a, opt->b, opt->o_del, opt->e_del,
                                                             opt->o_ins, opt->e_ins, minsc);
 #if defined(__aarch64__)
-    /* --meth prunes under EM-seq / bisulfite chemistry only. The filter matches converted copies
-     * (rescue_prune_params::set_meth), which fits reads whose unmethylated C's are converted; TAPS
-     * reads are mostly unconverted, so collapsing them to three letters leaves little to prune
+    /* --meth prunes under EM-seq / bisulfite chemistry with converted copies
+     * (rescue_prune_params::set_meth), which fits reads whose unmethylated C's are converted
      * (Graviton 4, prune on vs off, wall: EM-seq panel 5 M pairs genomic -9.0 %, collapsed -B 4
-     * -10.1 %; TAPS -0.1 %). */
-    return rescue_prune_enabled() && p.valid && !(opt->meth_mode && opt->meth_chem != METH_CHEM_EMSEQ);
+     * -10.1 %). TAPS reads are mostly unconverted, so collapsing them to three letters leaves
+     * little to prune (-0.1 %); TAPS genomic / neutral prune with the exact relation instead
+     * (rescue_meth_rel), TAPS collapsed not at all. */
+    return rescue_prune_enabled() && p.valid
+           && !(opt->meth_mode && opt->meth_chem != METH_CHEM_EMSEQ && !rescue_meth_rel(opt));
 #else
     /* x86 also prunes only where the SIMD filter runs: the scalar filter costs more than it saves
      * against the cheaper x86 kswv (prune on vs off, wall, Zen 5 AVX-512: -O 8 -E 2 +13.3 / +4.7 %,
@@ -399,14 +411,16 @@ static bool rescue_prune_on(const mem_opt_t *opt)
 #endif
 }
 
-/* --meth banding (both passes, the group's matrix) only where --meth pruning is off: there the band
- * replaces full-window kswv rows and pays, while on top of pruning it costs more than it saves.
- * Wall, 5 reps, -t 16, band vs no band: m8g EM-seq 5 M genomic +1.1 %, -B 4 +1.5 % (pass 0 alone and
- * pass 1 alone both lose), collapsed -0.7 %, TAPS 1 M -3.3 %; m8a (x86 meth never prunes) EM-seq
- * genomic -3.5 %, collapsed -2.9 %, -B 4 and TAPS flat. */
+/* --meth banding (both passes, the group's matrix) where --meth pruning is off or uses the relation
+ * (TAPS): there the band pays, while on top of converted-copy pruning (EM-seq) it costs more than it
+ * saves. Wall, 5 reps, -t 16, band vs no band: m8g EM-seq 5 M genomic +1.1 %, -B 4 +1.5 % (pass 0 alone
+ * and pass 1 alone both lose), collapsed -0.7 %, TAPS 1 M unpruned -3.3 %; m8a (x86 meth never prunes)
+ * EM-seq genomic -3.5 %, collapsed -2.9 %, -B 4 and TAPS flat. TAPS 1 M on m8g, relation pruning with
+ * vs without banding: neutral -3.4 % (pass 1 only -3.5 %), genomic -3.8 % (pass 1 only -3.2 %). */
 static bool rescue_band_meth_on(const mem_opt_t *opt)
 {
-    return rescue_band_enabled() && !rescue_prune_on(opt);
+    static const int mode = rescue_env_int("BWA3_RESCUE_BAND_METH", 1);
+    return rescue_band_enabled() && (mode == 2 || (mode == 1 && (!rescue_prune_on(opt) || rescue_meth_rel(opt))));
 }
 
 /* The pruning parameters for this run's scoring (rescue_prune_params::from checks the lemma's
@@ -421,7 +435,8 @@ static bool rescue_prune_applies(const mem_opt_t *opt, int hyp, rescue_prune_par
     if (!rescue_prune_on(opt) || opt->rescue_kmer) return false;
     *pp = rescue_prune_params::from(opt->a, opt->b, opt->o_del, opt->e_del, opt->o_ins, opt->e_ins,
                                     opt->min_seed_len * opt->a);
-    if (opt->meth_mode) pp->set_meth(hyp);
+    if (rescue_meth_rel(opt)) pp->set_meth_rel(hyp);
+    else if (opt->meth_mode) pp->set_meth(hyp);
     return pp->valid;
 }
 
@@ -1768,11 +1783,11 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                 const int kind = rescue_prune_window(ref, (int)(re - rb), oq.data(), l_ms, pp,
                                                      rescue_prune_max_hits(pp.minsc), &hb, &he);
                 /* Banding plan (rescue_band.h), bound to this pair's regid at enqueue (commit). 8-bit
-                 * jobs only (a 16-bit job's hull runs through kswv's 16-bit kernel), and not under
-                 * --meth: a pruned --meth run does not band (rescue_band_meth_on); the band kernels'
-                 * --meth matrices serve the unpruned runs' pass 1. */
-                if (kind == RESCUE_PRUNE_B2 && (xtra & KSW_XBYTE) && rescue_band_enabled() && !opt->meth_mode
-                    && pp.valid) {
+                 * jobs only (a 16-bit job's hull runs through kswv's 16-bit kernel), and under --meth
+                 * only where --meth banding is on (rescue_band_meth_on: by default not on top of
+                 * converted-copy pruning); the band kernels take the group's matrix. */
+                if (kind == RESCUE_PRUNE_B2 && (xtra & KSW_XBYTE) && rescue_band_enabled()
+                    && (!opt->meth_mode || rescue_band_meth_on(opt)) && pp.valid) {
                     rescue_band_batch().set_scoring(rb_scoring::from(pp));
                     rescue_band_batch().plan(rescue_prune_last_view(), pp, (int)(re - rb), l_ms, hb, he);
                 }
