@@ -46,15 +46,20 @@ struct Stats {
     long jobs = 0, simd = 0, fallback = 0, b2 = 0, bad = 0, kind[3] = {0, 0, 0}, rel = 0, rel_b2 = 0;
 };
 
-/* K = 5 scorings the SIMD filters take (a, b, o_del, e_del, o_ins, e_ins). */
-const int SCORINGS[][6] = {
-    {1, 4, 8, 2, 8, 2},     // -O 8 -E 2: c = 2
-    {1, 4, 6, 2, 6, 2},     // -E 2: c = 2
-    {1, 6, 6, 1, 6, 1},     // -B 6
-    {1, 9, 16, 1, 16, 1},   // -x intractg: tail offset 12
-    {2, 8, 12, 2, 12, 2},   // -A 2 scaled: a = 2, c = 2
-    {1, 4, 6, 1, 7, 2},     // -O 6,7 -E 1,2
-    {3, 12, 18, 3, 18, 3},  // a = 3
+/* Scorings (a, b, o_del, e_del, o_ins, e_ins, k_max): K = 5 ones the SIMD filters take, and K > 5
+ * ones only the scalar filter takes (the wrapper's scalar path, checked against a reference scratch
+ * that is reset in full now and then, which checks the tables' touched-code reset). */
+const int SCORINGS[][7] = {
+    {1, 4, 8, 2, 8, 2, 5},     // -O 8 -E 2: c = 2
+    {1, 4, 6, 2, 6, 2, 5},     // -E 2: c = 2
+    {1, 6, 6, 1, 6, 1, 5},     // -B 6
+    {1, 9, 16, 1, 16, 1, 5},   // -x intractg: tail offset 12
+    {2, 8, 12, 2, 12, 2, 5},   // -A 2 scaled: a = 2, c = 2
+    {1, 4, 6, 1, 7, 2, 5},     // -O 6,7 -E 1,2
+    {3, 12, 18, 3, 18, 3, 5},  // a = 3
+    {1, 6, 6, 1, 6, 1, 7},     // -B 6 at K = 7
+    {1, 9, 16, 1, 16, 1, 8},   // -x intractg at K = 8
+    {1, 8, 6, 1, 6, 1, 6},     // -B 8 at K = 6
 };
 const int NSCORINGS = sizeof SCORINGS / sizeof SCORINGS[0];
 
@@ -62,7 +67,7 @@ rescue_prune_params scoring(int which, int minsc)
 {
     if (which < 0) return rescue_prune_params::defaults(minsc);
     const int *x = SCORINGS[which];
-    return rescue_prune_params::from(x[0], x[1], x[2], x[3], x[4], x[5], minsc * x[0]);
+    return rescue_prune_params::from(x[0], x[1], x[2], x[3], x[4], x[5], minsc * x[0], 5, x[6]);
 }
 
 bool check_view(const uint8_t *ref, int len1, const uint8_t *q, int len2, const rescue_prune_params &p,
@@ -117,6 +122,8 @@ void run_one(const uint8_t *ref, int len1, const uint8_t *q, int len2, const res
     if (!p.valid) return;
     const int minsc = p.minsc;
     int h0 = -1, e0 = -1, h1 = -1, e1 = -1;
+    static long nk = 0;
+    if (p.K != 5 && nk++ % 64 == 0) { r.ntouched = -1; r.qlen_c = -1; }   // full reset of the reference
     const int k0 = rescue_prune_window_scalar(ref, len1, q, len2, p, max_hits, r, &h0, &e0);
     for (int rep = 0; rep < (twice ? 2 : 1); rep++) {
         const int k1 = rescue_prune_window(ref, len1, q, len2, p, max_hits, &h1, &e1);

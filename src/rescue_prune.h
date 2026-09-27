@@ -38,6 +38,8 @@
 #include "rescue_prune_x86.h"
 
 enum { RESCUE_PRUNE_FULL = 0, RESCUE_PRUNE_B1 = 1, RESCUE_PRUNE_B2 = 2 };
+/* The largest K the scalar filter takes (its code tables span 4^K codes); the SIMD filters take K = 5. */
+static const int rescue_prune_scratch_kmax = 8;
 
 /* Scoring parameters of the bound (general-scoring derivation, section 2): match a, mismatch b,
  * gap of length L costs o + e*L per type. The lemma generalises with K - 1 <= min(b, o_del,
@@ -76,8 +78,16 @@ struct rescue_prune_params {
         const int n = ub - tau - o_del + (K - 1) * a;
         return n > 0 ? n / e_del : 0;
     }
-    /* The SIMD filters take K = 5 and any weights (simd_wt); a <= 16 keeps a cnt within int16. */
-    bool simd_ok() const { return valid && K == 5 && a <= 16; }
+    /* The SIMD filters take K = 5 and any weights (simd_wt); a <= 16 keeps a cnt within int16. The
+     * NEON filter also takes K = 6..KMAXN with exact matching (no --meth relation). */
+    bool simd_ok() const
+    {
+#if defined(__aarch64__)
+        return valid && a <= 16 && (K == 5 || (K <= rescue_prune_neon::NeonScratch::KMAXN && relx < 0));
+#else
+        return valid && K == 5 && a <= 16;
+#endif
+    }
     rescue_prune_neon::Wt simd_wt() const
     {
         rescue_prune_neon::Wt w;
@@ -107,7 +117,7 @@ struct rescue_prune_params {
      * K accepted: K >= 3 is sound, but below 5 hits are so dense (4x per K step on random sequence)
      * that the bound rarely drops below minsc; production uses 5, the fuzz goes down to 3. */
     static rescue_prune_params from(int a, int b, int o_del, int e_del, int o_ins, int e_ins, int minsc,
-                                    int k_min = 5)
+                                    int k_min = 5, int k_max = 5)
     {
         rescue_prune_params p;
         p.a = a; p.b = b; p.o_del = o_del; p.e_del = e_del; p.o_ins = o_ins; p.e_ins = e_ins;
@@ -117,7 +127,8 @@ struct rescue_prune_params {
             || a + std::max(1, b) > 255)
             return p;
         // K: a separator (mismatch, deletion, insertion) must cost at least (K - 1) a (V1-V3).
-        const int km1 = std::min(4, std::min(b, std::min(o_del, o_ins + e_ins)) / a);
+        const int km1 = std::min(std::min(k_max, (int)rescue_prune_scratch_kmax) - 1,
+                                 std::min(b, std::min(o_del, o_ins + e_ins)) / a);
         p.K = km1 + 1;
         if (p.K < std::max(3, k_min)) return p;
         const int s = p.a * (p.K - 1);
@@ -141,9 +152,14 @@ struct rescue_prune_scratch {
      * of query positions; a mate needing more than ECAP entries is not pruned (FULL). The SIMD filters
      * use the same cap. */
     static const int ECAP = rescue_prune_neon::REL_ECAP;
-    int16_t head[1024], nxt[QCAP];
+    /* K <= KMAX: the code tables span 4^KMAX codes; a new query resets only the codes the previous
+     * one set (touched), so a large table costs nothing per query. */
+    static const int KMAX = rescue_prune_scratch_kmax, HCAP = 1 << (2 * KMAX);
+    int16_t head[HCAP], nxt[QCAP];
     int16_t ent_j[ECAP], ent_nxt[ECAP];
-    uint16_t qcnt[1024];
+    uint16_t qcnt[HCAP];
+    int32_t touched[ECAP];
+    int ntouched = -1;   // -1: the tables were never initialised
     uint8_t qcache[QCAP];
     int qlen_c = -1, qk_c = 0, qrel_c = -1;   // the cached query tables are for this length, K and relx
     bool q_over = false;                        // ... and exceeded ECAP
@@ -169,14 +185,20 @@ static inline int rescue_prune_window_scalar(const uint8_t *ref, int len1, const
     if (len2 < K || len1 < K) return RESCUE_PRUNE_FULL;
     const int relx = p.relx;
     if (len2 != s.qlen_c || K != s.qk_c || relx != s.qrel_c || memcmp(q, s.qcache, (size_t)len2) != 0) {
-        memset(s.head, 0xFF, sizeof s.head);
-        memset(s.qcnt, 0, sizeof s.qcnt);
+        if (s.ntouched < 0) {
+            memset(s.head, 0xFF, sizeof s.head);
+            memset(s.qcnt, 0, sizeof s.qcnt);
+        } else {
+            for (int t = 0; t < s.ntouched; t++) { s.head[s.touched[t]] = -1; s.qcnt[s.touched[t]] = 0; }
+        }
+        s.ntouched = 0;
         s.q_over = false;
         int c = 0;
         for (int j = 0; j < K - 1; j++) c = (c << 2) | q[j];
         if (relx < 0) {
             for (int j = K - 1; j < len2; j++) {
                 c = ((c << 2) | q[j]) & mask;
+                if (!s.qcnt[c]) s.touched[s.ntouched++] = c;
                 s.nxt[j] = s.head[c];
                 s.head[c] = (int16_t)j;
                 s.qcnt[c]++;
@@ -195,6 +217,7 @@ static inline int rescue_prune_window_scalar(const uint8_t *ref, int len1, const
                 for (int sm = M;; sm = (sm - 1) & M) {
                     if (ne == rescue_prune_scratch::ECAP) { s.q_over = true; break; }
                     const int rc = c ^ sm;
+                    if (!s.qcnt[rc]) s.touched[s.ntouched++] = rc;
                     s.ent_j[ne] = (int16_t)j;
                     s.ent_nxt[ne] = s.head[rc];
                     s.head[rc] = (int16_t)ne++;
@@ -396,7 +419,7 @@ static inline int rescue_prune_window(const uint8_t *ref, int len1, const uint8_
         rescue_prune_last_path() = 2;
         const rescue_prune_neon::Job jb{len1, len2, 0, 0, -1, -1, ref, q};
         int h, e;
-        const rescue_prune_neon::Kind k = rescue_prune_neon::lean_neon(jb, ns, h, e, max_hits, minsc, p.simd_wt(), p.relx);
+        const rescue_prune_neon::Kind k = rescue_prune_neon::lean_neon(jb, ns, h, e, max_hits, minsc, p.simd_wt(), p.relx, p.K);
         if (k == rescue_prune_neon::SCALAR) goto scalar;   // int32 path: > 32000 hits, long windows
         if (k == rescue_prune_neon::B1) return RESCUE_PRUNE_B1;
         if (k == rescue_prune_neon::FULL) return RESCUE_PRUNE_FULL;

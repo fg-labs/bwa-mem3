@@ -28,8 +28,9 @@
  * o_ins,e_ins": fixed; "random": a fresh draw per 2048-job batch, see draw_params) and RB_METH
  * (genomic | neutral | collapsed | random: --meth matrices, see meth_matrix) with RB_METH_REL
  * (conv, the default: the filter matches converted copies; expand: genomic and neutral batches use
- * the relation-expanded filter, rescue_prune_params::set_meth_rel, collapsed stays on conv) and RB_16BIT (1: every
- * job runs through kswv's 16-bit kernels, uncut and unbanded, with longer mates) are harness-only.
+ * the relation-expanded filter, rescue_prune_params::set_meth_rel, collapsed stays on conv), RB_16BIT (1: every
+ * job runs through kswv's 16-bit kernels, uncut and unbanded, with longer mates) and RB_KMAX (the
+ * largest filter K, default 5; 0: a draw in [5, rescue_prune_scratch_kmax] per batch) are harness-only.
  * Banding runs only at the default scoring, as in production.
  *
  * Dump files: one record per prune-eligible rescue job, as the aligner saw it (full window and
@@ -456,6 +457,10 @@ static void meth_matrix(const rescue_prune_params &p, int kind, int hyp, int8_t 
 struct Scoring { int a = 1, b = 4, o_del = 6, e_del = 1, o_ins = 6, e_ins = 1; };
 static bool g_random_scoring = false;
 static Scoring g_fixed_scoring;
+/* RB_KMAX: the largest filter K (rescue_prune_params::from's k_max; production BWA3_RESCUE_PRUNE_KMAX):
+ * 5 (default) to rescue_prune_scratch_kmax, or 0 = a fresh draw in [5, kmax] per batch. */
+static int g_kmax = 5;
+static int draw_kmax() { return g_kmax > 0 ? g_kmax : rndr(5, rescue_prune_scratch_kmax); }
 
 static rescue_prune_params draw_params(int minsc_default)
 {
@@ -492,11 +497,12 @@ static rescue_prune_params draw_params(int minsc_default)
         fixed_minsc = false;
     }
     int minsc = k * sc.a;
+    const int kmax = draw_kmax();
     rescue_prune_params p = rescue_prune_params::from(sc.a, sc.b, sc.o_del, sc.e_del, sc.o_ins, sc.e_ins,
-                                                      minsc, 3);
+                                                      minsc, 3, kmax);
     if (!fixed_minsc && p.K >= 3 && rnd(8) == 0) {   // the V4 boundary
         minsc = sc.a * (p.K - 1) + 1 + rnd(2);
-        p = rescue_prune_params::from(sc.a, sc.b, sc.o_del, sc.e_del, sc.o_ins, sc.e_ins, minsc, 3);
+        p = rescue_prune_params::from(sc.a, sc.b, sc.o_del, sc.e_del, sc.o_ins, sc.e_ins, minsc, 3, kmax);
     }
     if (sc.a < 1 || sc.b < 1 || sc.b > 128 || sc.e_del < 1 || sc.e_ins < 1) {
         /* Degenerate: from() must refuse it (checked: every job FULL); the truth runs with the
@@ -522,7 +528,7 @@ static bool use_u8(int len2, int a, int shift)
 static int run_eq(std::vector<Job> &all_jobs, int minsc_default, int max_hits, int scalar_stride)
 {
     long mism = 0, n = 0, npass = 0, nfull = 0, nb1 = 0, nb2 = 0, nband = 0, scal_mm = 0, te2_diff = 0;
-    long p1_band = 0, p1_guard = 0, nbatch = 0, nvalid = 0, ntrunc = 0, nk[6] = {0}, nmeth[4] = {0};
+    long p1_band = 0, p1_guard = 0, nbatch = 0, nvalid = 0, ntrunc = 0, nk[rescue_prune_scratch_kmax + 1] = {0}, nmeth[4] = {0};
     long cls_n[128] = {0}, cls_mm[128] = {0};
     const int B = 2048;
     for (size_t base = 0; base < all_jobs.size(); base += B) {
@@ -679,8 +685,9 @@ static int run_eq(std::vector<Job> &all_jobs, int minsc_default, int max_hits, i
     printf("eq: jobs=%ld pass=%ld full=%ld b1=%ld b2=%ld banded_parents=%ld pass1_banded=%ld pass1_guard=%ld "
            "MISMATCHES=%ld scalar_vs_kswv_mismatch=%ld (te2 differs, unconsumed: %ld)\n",
            n, npass, nfull, nb1, nb2, nband, p1_band, p1_guard, mism, scal_mm, te2_diff);
-    printf("  scoring: batches=%ld valid=%ld K3=%ld K4=%ld K5=%ld mates_cut_to_8bit=%ld meth genomic=%ld neutral=%ld "
-           "collapsed=%ld\n", nbatch, nvalid, nk[3], nk[4], nk[5], ntrunc, nmeth[1], nmeth[2], nmeth[3]);
+    printf("  scoring: batches=%ld valid=%ld K3=%ld K4=%ld K5=%ld K6=%ld K7=%ld K8=%ld mates_cut_to_8bit=%ld meth "
+           "genomic=%ld neutral=%ld collapsed=%ld\n", nbatch, nvalid, nk[3], nk[4], nk[5], nk[6], nk[7], nk[8], ntrunc,
+           nmeth[1], nmeth[2], nmeth[3]);
     for (int c = 0; c < 128; c++)
         if (cls_n[c]) printf("  class %3d: jobs=%ld mismatches=%ld\n", c, cls_n[c], cls_mm[c]);
     if (p1_guard) fprintf(stderr, "FAIL: %ld pass-1 guard fallbacks (banded max != S)\n", p1_guard);
@@ -776,6 +783,7 @@ int main(int argc, char **argv)
     }
     const int minsc = rescue_env_int("RB_MINSC", MINSC_DEFAULT);
     g_16 = rescue_env_int("RB_16BIT", 0) != 0;
+    g_kmax = std::min(rescue_env_int("RB_KMAX", 5), rescue_prune_scratch_kmax);
     if (const char *m = getenv("RB_METH")) {
         g_meth = !strcmp(m, "genomic") ? METH_GENOMIC : !strcmp(m, "neutral") ? METH_NEUTRAL
                : !strcmp(m, "collapsed") ? METH_COLLAPSED : !strcmp(m, "random") ? METH_RANDOM : -1;

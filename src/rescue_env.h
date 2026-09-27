@@ -23,6 +23,8 @@
  *     BWA3_RESCUE_PRUNE_MAX_HITS auto  skip the filter on windows with more 5-mer hits than
  *                                      this; auto is 1000 on aarch64 when banding is on, else
  *                                      400 (always on x86)
+ *     BWA3_RESCUE_PRUNE_KMAX     auto  the largest K-mer length the scoring may use (5-8); auto is
+ *                                      8 on aarch64, 5 on x86; --meth always 5
  *     BWA3_RESCUE_PRUNE_REL      1     --meth genomic / neutral: 1 the relation-expanded filter
  *                                      for TAPS (EM-seq and collapsed scoring match converted
  *                                      copies), 0 converted copies only (TAPS not pruned), 2 the

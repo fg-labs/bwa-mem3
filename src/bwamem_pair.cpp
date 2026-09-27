@@ -383,11 +383,29 @@ static bool rescue_meth_rel(const mem_opt_t *opt)
     return mode == 2 || (mode == 1 && opt->meth_chem == METH_CHEM_TAPS);
 }
 
+/* The largest filter K for this run's scoring (rescue_prune_params::from takes the largest K the
+ * scoring admits up to this; BWA3_RESCUE_PRUNE_KMAX overrides). A scoring whose mismatch and gap
+ * costs admit K > 5 (-B >= 6 with -O >= 6, -x intractg) prunes with longer K-mers: 4x fewer random
+ * hits per step, so fewer rows kept. aarch64: up to 8, which the NEON filter takes (Graviton 4, wall,
+ * K = 5 -> up to 8, wgs-5M / wes-5M: -B 6 -9.2 / -3.1 %, -B 8 -10.1 / -1.5 %, -x intractg
+ * -13.4 / -3.3 %). x86: 5, the only K its SIMD filter takes, and x86 prunes only where that runs.
+ * --meth keeps K = 5 (its matching, converted copies or the relation, was validated at K = 5 only). */
+static int rescue_prune_kmax(const mem_opt_t *opt)
+{
+#if defined(__aarch64__)
+    static const int dflt = rescue_prune_scratch_kmax;
+#else
+    static const int dflt = 5;
+#endif
+    static const int k = std::max(5, std::min(rescue_env_int("BWA3_RESCUE_PRUNE_KMAX", dflt), rescue_prune_scratch_kmax));
+    return opt->meth_mode ? 5 : k;
+}
+
 static bool rescue_prune_on(const mem_opt_t *opt)
 {
     const int minsc = opt->min_seed_len * opt->a;
     const rescue_prune_params p = rescue_prune_params::from(opt->a, opt->b, opt->o_del, opt->e_del,
-                                                            opt->o_ins, opt->e_ins, minsc);
+                                                            opt->o_ins, opt->e_ins, minsc, 5, rescue_prune_kmax(opt));
 #if defined(__aarch64__)
     /* --meth prunes under EM-seq / bisulfite chemistry with converted copies
      * (rescue_prune_params::set_meth), which fits reads whose unmethylated C's are converted
@@ -434,7 +452,7 @@ static bool rescue_prune_applies(const mem_opt_t *opt, int hyp, rescue_prune_par
 {
     if (!rescue_prune_on(opt) || opt->rescue_kmer) return false;
     *pp = rescue_prune_params::from(opt->a, opt->b, opt->o_del, opt->e_del, opt->o_ins, opt->e_ins,
-                                    opt->min_seed_len * opt->a);
+                                    opt->min_seed_len * opt->a, 5, rescue_prune_kmax(opt));
     if (rescue_meth_rel(opt)) pp->set_meth_rel(hyp);
     else if (opt->meth_mode) pp->set_meth(hyp);
     return pp->valid;

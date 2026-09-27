@@ -218,6 +218,16 @@ struct NeonScratch {
     static const int ECAP = REL_ECAP;
     alignas(16) uint32_t ENT[ECAP];
     int16_t hd[1024], sec[1024];
+    /* K > 5 (the general-scoring K, rescue_prune_params::K, up to KMAXN): the K-mer table (tab's
+     * layout) and presence bitmap over 4^K codes, allocated on first use and reset through the codes
+     * the previous query set (touchk). pres then holds the 5-mer suffixes of the query's K-mers: a
+     * window row whose 5-mer is absent cannot hold a K-mer hit, so step 3's vector test prefilters. */
+    static const int KMAXN = 8;
+    std::vector<uint32_t> tabk;
+    std::vector<uint8_t> presk;
+    uint16_t touchk[CAP];
+    int ntouchk = 0;
+    int qk_c = 5;         // K of the cached query tables
     int qrel_c = -1;      // relx of the cached query tables
     bool q_over = false;  // ... which exceeded ECAP (Rel)
     // Query cache: the query table (qbuf/qcode/tab/pres/nxt) depends only on the oriented mate,
@@ -234,7 +244,7 @@ struct NeonScratch {
      * that job exactly -- same window bytes (still in rbuf), query bytes (qcache), lengths and gate
      * -- returns it again; the per-diagonal arrays (the view) were not touched in between. */
     bool memo_ok = false;
-    int memo_len1 = -1, memo_mh = 0, memo_minsc = 0, memo_hb = -1, memo_he = -1, memo_view_nd = -1, memo_relx = -1;
+    int memo_len1 = -1, memo_mh = 0, memo_minsc = 0, memo_hb = -1, memo_he = -1, memo_view_nd = -1, memo_relx = -1, memo_k = 5;
     Kind memo_kind = FULL;
     Wt memo_wt;
     /* minsc and weights of the call that produced the view (the threshold of mw, hw and comps). */
@@ -291,11 +301,14 @@ static inline void neon_codes16(const uint8_t *buf, uint16_t *out)
 // same count as summing per-code query occurrences over the window rows), decided before the
 // repeated-code layers and the Kadane scans.
 /* Gen: general weights (a, c, base, tail); !Gen is the default scoring's code, unchanged. Rel: the
- * --meth relation of relx (see the design notes above); !Rel is the exact-match code, unchanged. */
-template <bool Gen, bool Rel>
+ * --meth relation of relx (see the design notes above); !Rel is the exact-match code, unchanged. KK:
+ * the K-mer length (5, or 6..KMAXN with general weights and exact matching; see NeonScratch::tabk);
+ * KK = 5 is the code above, unchanged. */
+template <bool Gen, bool Rel, int KK = 5>
 static inline Kind lean_neon_core(const Job &jb, NeonScratch &s, int &hb, int &he, int max_hits, int minsc,
                                   const Wt &wt, int relx)
 {
+    static_assert(KK == 5 || (Gen && !Rel && KK <= NeonScratch::KMAXN), "K > 5: general weights, exact matching");
     const uint8_t *ref = jb.ref, *q = jb.qry;
     const int len1 = jb.len1, len2 = jb.len2;
     hb = he = -1;
@@ -315,7 +328,7 @@ static inline Kind lean_neon_core(const Job &jb, NeonScratch &s, int &hb, int &h
     const int quanta = ((len2 + 15) / 16) * 16, off = quanta, nd = len1 + quanta + 1;
     // ---- 2. query table (cached per oriented query): copy + N flag, tab[code] = (off - j_last)
     //      | MULTI | occurrences << 16, pres[] = codes present, nxt[] = earlier occurrences ----
-    if (len2 != s.qlen_c || (Rel ? relx : -1) != s.qrel_c || memcmp(q, s.qcache, (size_t)len2) != 0) {
+    if (len2 != s.qlen_c || (Rel ? relx : -1) != s.qrel_c || KK != s.qk_c || memcmp(q, s.qcache, (size_t)len2) != 0) {
         uint8_t *qb = s.qbuf + 4;
         uint8x16_t qv = vdupq_n_u8(0);
         uint8_t qor = 0;
@@ -327,8 +340,31 @@ static inline Kind lean_neon_core(const Job &jb, NeonScratch &s, int &hb, int &h
         memcpy(s.qcache, q, (size_t)len2);
         s.qlen_c = len2;
         s.qrel_c = Rel ? relx : -1;
+        s.qk_c = KK;
         s.q_over = false;
-        if (!s.q_has_n && len2 >= 5) {
+        if (KK > 5 && !s.q_has_n && len2 >= KK) {
+            if (s.tabk.empty()) {
+                s.tabk.assign((size_t)1 << (2 * NeonScratch::KMAXN), 0);
+                s.presk.assign(((size_t)1 << (2 * NeonScratch::KMAXN)) / 8, 0);
+            }
+            for (int t = 0; t < s.ntouchk; t++) { const int c = s.touchk[t]; s.tabk[c] = 0; s.presk[c >> 3] = 0; }
+            s.ntouchk = 0;
+            memset(s.pres, 0, sizeof s.pres);
+            for (int b = 0; b < len2; b += 16) neon_codes16(s.qbuf + b, s.qcode + b);
+            const int kmask = (1 << (2 * KK)) - 1;
+            int ck = 0;
+            for (int jj = 0; jj < len2; jj++) {
+                ck = ((ck << 2) | qb[jj]) & kmask;
+                if (jj < KK - 1) continue;
+                const uint32_t old = s.tabk[ck], occ = (old >> 16) + 1;
+                if (occ == 1) s.touchk[s.ntouchk++] = (uint16_t)ck;
+                s.nxt[jj] = occ == 1 ? (int16_t)-1 : (int16_t)(off - (old & 0x1FFF));
+                s.tabk[ck] = occ << 16 | (uint32_t)(off - jj) | (occ == 1 ? 0 : 0x2000);
+                s.presk[ck >> 3] |= (uint8_t)(1u << (ck & 7));
+                const int c5 = s.qcode[jj];
+                s.pres[c5 >> 3] |= (uint8_t)(1u << (c5 & 7));
+            }
+        } else if (KK == 5 && !s.q_has_n && len2 >= 5) {
             memset(s.tab, 0, sizeof s.tab);
             memset(s.pres, 0, sizeof s.pres);
             for (int b = 0; b < len2; b += 16) neon_codes16(s.qbuf + b, s.qcode + b);
@@ -366,6 +402,7 @@ static inline Kind lean_neon_core(const Job &jb, NeonScratch &s, int &hb, int &h
     orv |= vmaxvq_u8(ov);
     if ((orv & 0xFC) || s.q_has_n) return FULL;
     if (Rel && s.q_over) return FULL;
+    if (KK > 5 && (len1 < KK || len2 < KK)) return FULL;   // as the scalar filter
     if (len1 < 5 || len2 < 5) return B1;
     if (__builtin_expect(nd + 32 > NeonScratch::CAP, 0)) return SCALAR;
 
@@ -423,6 +460,25 @@ static inline Kind lean_neon_core(const Job &jb, NeonScratch &s, int &hb, int &h
         }
         np = (int)(rp - s.PR);
     }
+    if (KK > 5) {
+        /* The prefiltered rows (their 5-mer suffix occurs in the query): keep those whose K-mer does,
+         * with its K-mer code. Rows below KK - 1 have no K-mer and are dropped; their reads rb[r - t]
+         * (r >= 4, t <= KK - 1) reach at most KMAXN - 5 bytes before the window, inside rbuf's 4
+         * leading zero bytes. */
+        static_assert(NeonScratch::KMAXN - 5 <= 4, "rb[r - t] must stay inside rbuf's 4 leading bytes");
+        const uint8_t *rb = s.rbuf + 4, *__restrict pk = s.presk.data();
+        int m = 0;
+        for (int k = 0; k < np; k++) {
+            const int r = s.PR[k];
+            int hi = 0;
+            for (int t = KK - 1; t >= 5; t--) hi = (hi << 2) | rb[r - t];
+            const int code = hi << 10 | s.PC[k];
+            s.PR[m] = (uint16_t)r;
+            s.PC[m] = (uint16_t)code;
+            m += (int)((pk[code >> 3] >> (code & 7)) & 1u) & (int)(r >= KK - 1);
+        }
+        np = m;
+    }
     if (np == 0) return B1;
     // ---- 4+5. accumulate hits. The table value of a hit row's code is tab[code] = (off - j_last) |
     //      MULTI, where j_last is the code's latest query occurrence and MULTI (0x2000) marks a code
@@ -448,13 +504,14 @@ static inline Kind lean_neon_core(const Job &jb, NeonScratch &s, int &hb, int &h
         uint16_t *bp = s.B, *bdp = s.BD, *brp = s.BR, *mp = s.RA, *jp = (uint16_t *)s.JA;
         uint16x8_t pR = vdupq_n_u16(0), pD = vdupq_n_u16(0xFFFF), idx = IO;
         const uint16x8_t vn = vdupq_n_u16((uint16_t)np), k1fff = vdupq_n_u16(0x1FFF), k2000 = vdupq_n_u16(0x2000);
-        const uint32_t *__restrict tab = s.tab;
+        const uint32_t *__restrict tab = KK > 5 ? s.tabk.data() : s.tab;
+        const uint64_t CM = ((uint64_t)1 << (2 * KK)) - 1;
         // table entries of four codes (lanes past np hold stale codes: masked below)
-        auto look4 = [tab](const uint16_t *c) {
+        auto look4 = [tab, CM](const uint16_t *c) {
             uint64_t x;
             memcpy(&x, c, 8);
-            const uint64_t a = tab[x & 1023] | (uint64_t)tab[(x >> 16) & 1023] << 32;
-            const uint64_t b = tab[(x >> 32) & 1023] | (uint64_t)tab[(x >> 48) & 1023] << 32;
+            const uint64_t a = tab[x & CM] | (uint64_t)tab[(x >> 16) & CM] << 32;
+            const uint64_t b = tab[(x >> 32) & CM] | (uint64_t)tab[(x >> 48) & CM] << 32;
             return vreinterpretq_u16_u64(vcombine_u64(vcreate_u64(a), vcreate_u64(b)));
         };
         uint32x4_t extra = vdupq_n_u32(0);   // gate: occurrences - 1 summed over the hit rows
@@ -494,7 +551,7 @@ static inline Kind lean_neon_core(const Job &jb, NeonScratch &s, int &hb, int &h
         for (int k = nbd - 1; k >= 0; k--) {
             const int d = s.BD[k];
             cnt[d] = (uint16_t)(cnt[d] + s.B[k + 1] - s.B[k]);
-            minrow[d] = (int16_t)(s.BR[k] - 4);
+            minrow[d] = (int16_t)(s.BR[k] - (KK - 1));
         }
     }
     // Layers >= 2: diagonals and runs as in layer 1, then minrow by min; the next layer (rows
@@ -561,7 +618,7 @@ static inline Kind lean_neon_core(const Job &jb, NeonScratch &s, int &hb, int &h
             int16_t *__restrict minrow = s.minrow;
             for (int k = 0; k < nbd; k++) {
                 const int d = s.BD[k], row = s.BR[k], c = cnt[d], mr = minrow[d];
-                minrow[d] = (int16_t)(c ? std::min(mr, row - 4) : row - 4);
+                minrow[d] = (int16_t)(c ? std::min(mr, row - (KK - 1)) : row - (KK - 1));
                 cnt[d] = (uint16_t)(c + s.B[k + 1] - s.B[k]);
             }
             n = (int)(rp2 - R2);
@@ -747,22 +804,29 @@ static inline Kind lean_neon_core(const Job &jb, NeonScratch &s, int &hb, int &h
 // of rescue jobs) return the previous result without recomputing it: the result is a function of
 // the window bytes, the query bytes, the lengths, max_hits and minsc only.
 static inline Kind lean_neon(const Job &jb, NeonScratch &s, int &hb, int &he, int max_hits = 1 << 30,
-                             int minsc = MINSC, const Wt &wt = Wt(), int relx = -1)
+                             int minsc = MINSC, const Wt &wt = Wt(), int relx = -1, int K = 5)
 {
     if (s.memo_ok && jb.len1 == s.memo_len1 && jb.len2 == s.qlen_c && max_hits == s.memo_mh && minsc == s.memo_minsc &&
-        wt == s.memo_wt && relx == s.memo_relx &&
+        wt == s.memo_wt && relx == s.memo_relx && K == s.memo_k &&
         memcmp(jb.ref, s.rbuf + 4, (size_t)jb.len1) == 0 && memcmp(jb.qry, s.qcache, (size_t)jb.len2) == 0) {
         hb = s.memo_hb; he = s.memo_he; s.view_nd = s.memo_view_nd;
         return s.memo_kind;
     }
     Kind k;
-    if (relx < 0) k = wt.dflt() ? lean_neon_core<false, false>(jb, s, hb, he, max_hits, minsc, wt, -1)
+    if (K != 5) {   // general weights only (base = a (K - 1) + c > 5), exact matching only
+        k = relx >= 0 ? SCALAR
+            : K == 6 ? lean_neon_core<true, false, 6>(jb, s, hb, he, max_hits, minsc, wt, -1)
+            : K == 7 ? lean_neon_core<true, false, 7>(jb, s, hb, he, max_hits, minsc, wt, -1)
+            : K == 8 ? lean_neon_core<true, false, 8>(jb, s, hb, he, max_hits, minsc, wt, -1)
+                     : SCALAR;
+    } else if (relx < 0) k = wt.dflt() ? lean_neon_core<false, false>(jb, s, hb, he, max_hits, minsc, wt, -1)
                                 : lean_neon_core<true, false>(jb, s, hb, he, max_hits, minsc, wt, -1);
     else k = wt.dflt() ? lean_neon_core<false, true>(jb, s, hb, he, max_hits, minsc, wt, relx)
                        : lean_neon_core<true, true>(jb, s, hb, he, max_hits, minsc, wt, relx);
     s.memo_ok = k != SCALAR;
     s.memo_wt = wt;
     s.memo_relx = relx;
+    s.memo_k = K;
     s.memo_len1 = jb.len1; s.memo_mh = max_hits; s.memo_minsc = minsc; s.memo_hb = hb; s.memo_he = he;
     s.memo_view_nd = s.view_nd; s.memo_kind = k;
     return k;
