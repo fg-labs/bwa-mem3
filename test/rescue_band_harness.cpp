@@ -6,7 +6,7 @@
  *
  * time runs the default scoring's 8-bit pipeline only (kswv getScores8 plus the band), so it
  * refuses the eq-only knobs that would change the job mix or the scoring (RB_16BIT, RB_METH,
- * RB_SCORING) rather than time something other than what they ask for.
+ * RB_METH_REL, RB_SCORING) rather than time something other than what they ask for.
  *
  * eq: for every job, the PRODUCTION pipeline -- rescue_prune_window, RescueBandBatch::plan/commit,
  * the length sort, partition, kswv phase 0 on the non-banded pairs, run_pass0 on the banded ones,
@@ -33,7 +33,9 @@
  * or RB_METH that changes it) and RB_SCORING (unset: the default scoring;
  * "a,b,o_del,e_del,o_ins,e_ins": that scoring; "random": a fresh draw per 2048-job batch, see
  * draw_params), RB_METH (genomic | neutral | collapsed | random: --meth matrices, see batch_matrix)
- * and RB_16BIT (1: every job runs through kswv's 16-bit kernels for both passes, uncut and unbanded,
+ * with RB_METH_REL (conv, the default: the filter matches converted copies; expand: genomic and
+ * neutral batches use the relation-expanded filter, rescue_prune_params::set_meth_rel, and collapsed
+ * stays on conv) and RB_16BIT (1: every job runs through kswv's 16-bit kernels for both passes, uncut and unbanded,
  * with mates up to 1024 bp, the longest the filter takes (rescue_prune_scratch::QCAP), as
  * production runs a 16-bit job: pruned but never banded).
  * The truth kswv runs with the batch's scoring and matrix; pass 0 is banded at every scoring the
@@ -498,6 +500,7 @@ static std::unique_ptr<Ikswv> make_k(int maxr, int maxq, const rescue_prune_para
 /* ---------------------------------------------------------------------------------------- */
 enum { METH_NONE = 0, METH_GENOMIC, METH_NEUTRAL, METH_COLLAPSED, METH_RANDOM };
 static int g_meth = METH_NONE;
+static bool g_meth_rel = false;   // RB_METH_REL=expand
 
 /* The batch's matrix, as the aligner builds it (bwa_fill_scmat; under --meth, kind != METH_NONE,
  * then mem_opt_fill_meth_mat and the hypothesis's OT / OB matrix), and its 8-bit bias
@@ -642,7 +645,8 @@ static int run_eq(std::vector<Job> &all_jobs, int k_default, int max_hits, int s
         int8_t mat[25];
         const int shift = batch_matrix(pp, meth, hyp, mat);
         if (meth) {
-            pp.set_meth(hyp);
+            if (g_meth_rel && meth != METH_COLLAPSED) pp.set_meth_rel(hyp);
+            else pp.set_meth(hyp);
             nmeth[meth]++;
         }
         const int minsc = pp.minsc;
@@ -671,7 +675,9 @@ static int run_eq(std::vector<Job> &all_jobs, int k_default, int max_hits, int s
             ntrunc++;
         }
         if (meth) {   // convert the mates; the planted copies keep the reference bases
-            const double rate = rnd(3) == 0 ? 0.05 : rnd(2) ? 0.5 : 0.95;
+            /* TAPS-like low rates (mostly unconverted reads) are the relation filter's case */
+            const double rate = g_meth_rel ? (rnd(2) ? (rnd(2) ? 0.02 : 0.05) : rnd(2) ? 0.5 : 0.95)
+                                           : rnd(3) == 0 ? 0.05 : rnd(2) ? 0.5 : 0.95;
             const uint8_t from = hyp ? 1 : 2, to = hyp ? 3 : 0;
             for (Job &J : jobs)
                 for (uint8_t &x : J.q)
@@ -1003,6 +1009,13 @@ int main(int argc, char **argv)
                : !strcmp(m, "collapsed") ? METH_COLLAPSED : !strcmp(m, "random") ? METH_RANDOM : -1;
         if (g_meth < 0) { fprintf(stderr, "RB_METH: want genomic, neutral, collapsed or random\n"); return 2; }
     }
+    if (const char *m = getenv("RB_METH_REL")) {
+        if (strcmp(m, "conv") && strcmp(m, "expand")) {
+            fprintf(stderr, "RB_METH_REL: want conv or expand\n");
+            return 2;
+        }
+        g_meth_rel = !strcmp(m, "expand");
+    }
     if (const char *sc = getenv("RB_SCORING")) {
         if (!strcmp(sc, "random")) g_random_scoring = true;
         else {
@@ -1034,7 +1047,7 @@ int main(int argc, char **argv)
         /* run_time times the default scoring's 8-bit pipeline (getScores8, then the band); it has no
          * 16-bit, --meth or general-scoring dispatch, so those eq knobs are refused here instead of
          * aborting in the 8-bit saturation guard or timing the default path under another name. */
-        for (const char *knob : {"RB_16BIT", "RB_METH", "RB_SCORING"}) {
+        for (const char *knob : {"RB_16BIT", "RB_METH", "RB_METH_REL", "RB_SCORING"}) {
             const char *v = getenv(knob);
             if (v && *v && strcmp(v, "0") != 0) {
                 fprintf(stderr, "%s: eq only; time runs the default scoring's 8-bit kernels and the band\n", knob);

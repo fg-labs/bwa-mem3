@@ -14,7 +14,10 @@
  * test of the form P(d) >= P(d - 1) gets wrong. Half of the jobs run twice in a row, the second time from a
  * copy of the bytes in other buffers, which exercises the filter's repeat memo: the repeat must
  * return the same decision and view as the first call, and must not answer the same job at another
- * threshold or scoring.
+ * threshold or scoring. A share of the jobs runs under the --meth relation (set_meth_rel, relx T or
+ * A), some of them three times in a row with the other hypothesis in between on identical bytes (the
+ * query caches and the memo must key on relx), and the fuzz adds long T- or A-rich mates that exceed
+ * the relation's entry cap (FULL on both sides).
  *
  *   rescue_prune_eq fuzz <n> <seed>   n generated jobs (repeats, low complexity, N, tiny and long
  *                                     windows, windows with more components than the filter stores,
@@ -72,16 +75,17 @@ rescue_prune_params scoring(int which, int k)
     return rescue_prune_params::from(x[0], x[1], x[2], x[3], x[4], x[5], k * x[0]);
 }
 
-/* Whether the SIMD filter decides a and b alike: the same threshold and bound weights. The decision
+/* Whether the SIMD filter decides a and b alike: the same threshold, relation and bound weights. The decision
  * depends on nothing else of the scoring (-B 6 decides as the default does), so the memo may answer
  * across such a change. */
 bool same_filter(const rescue_prune_params &a, const rescue_prune_params &b)
 {
-    return a.minsc == b.minsc && a.simd_wt() == b.simd_wt();
+    return a.minsc == b.minsc && a.relx == b.relx && a.simd_wt() == b.simd_wt();
 }
 
 struct Stats {
-    long jobs = 0, simd = 0, over_cap = 0, repeats = 0, memo_hits = 0, bad = 0, kind[3] = {0, 0, 0};
+    long jobs = 0, simd = 0, over_cap = 0, repeats = 0, memo_hits = 0, bad = 0, kind[3] = {0, 0, 0}, rel = 0,
+         rel_b2 = 0;
 };
 
 /* The scalar fields of two views of one job. Their arrays alias the same per-thread scratch, so
@@ -175,6 +179,7 @@ void run_one(const uint8_t *ref, int len1, const uint8_t *q, int len2, const res
         st.memo_hits += hit;
         st.jobs++;
         if (rep == 0) st.kind[kind[0]]++;
+        if (rep == 0 && p.relx >= 0) { st.rel++; st.rel_b2 += kind[0] == RESCUE_PRUNE_B2; }
         const bool simd = kind[rep] == RESCUE_PRUNE_B2 && view[rep].bnd16 != nullptr;
         st.simd += simd;
         st.over_cap += simd && view[rep].ncomp > rescue_prune_simd_scratch_t::COMP_CAP;
@@ -202,11 +207,25 @@ void run_one(const uint8_t *ref, int len1, const uint8_t *q, int len2, const res
         }
         if (!ok) {
             if (st.bad < 20)
-                fprintf(stderr, "MISMATCH len1=%d len2=%d minsc=%d a=%d c=%d base=%d max_hits=%d rep=%d: %s\n", len1,
-                        len2, minsc, p.a, p.c, p.base(), max_hits, rep, why.c_str());
+                fprintf(stderr, "MISMATCH len1=%d len2=%d minsc=%d a=%d c=%d base=%d relx=%d max_hits=%d rep=%d: %s\n",
+                        len1, len2, minsc, p.a, p.c, p.base(), p.relx, max_hits, rep, why.c_str());
             st.bad++;
         }
     }
+}
+
+/* run_one under the relation of hypothesis hyp (relx T for OT, A for OB); alias: then under the other
+ * hypothesis and this one again, on the identical bytes. */
+void run_rel(const uint8_t *ref, int len1, const uint8_t *q, int len2, rescue_prune_params p, int hyp,
+             int max_hits, bool twice, bool alias, Stats &st)
+{
+    p.set_meth_rel(hyp);
+    run_one(ref, len1, q, len2, p, max_hits, twice, st);
+    if (!alias) return;
+    rescue_prune_params o = p;
+    o.set_meth_rel(!hyp);
+    run_one(ref, len1, q, len2, o, max_hits, false, st);
+    run_one(ref, len1, q, len2, p, max_hits, false, st);
 }
 
 int run_dumps(int argc, char **argv, Stats &st)
@@ -237,7 +256,14 @@ int run_dumps(int argc, char **argv, Stats &st)
             const int mh = k % 3 == 0 ? 400 : k % 3 == 1 ? 1000 : 1 << 30;
             static const int minscs[6] = {19, 5, 10, 15, 25, 32};
             const int which = (k / 18) % 2 == 0 ? -1 : (int)((k / 36) % NSCORINGS);
-            run_one(ref.data(), h[0], q.data(), h[1], scoring(which, minscs[(k / 3) % 6]), mh, (k & 1) == 0, st);
+            const rescue_prune_params sp = scoring(which, minscs[(k / 3) % 6]);
+            /* every 4th group of 5 jobs under the relation, hypotheses alternating; each 2nd of them
+             * also under the other hypothesis */
+            if ((k / 5) % 4 == 3)
+                run_rel(ref.data(), h[0], q.data(), h[1], sp, (int)((k / 20) & 1), mh, (k & 1) == 0, (k / 5) % 8 == 7,
+                        st);
+            else
+                run_one(ref.data(), h[0], q.data(), h[1], sp, mh, (k & 1) == 0, st);
             k++;
         }
         const bool err = ferror(fp) != 0;
@@ -256,12 +282,20 @@ void run_fuzz(long n, unsigned seed, Stats &st)
     auto rnd = [&](int lo, int hi) { return std::uniform_int_distribution<int>(lo, hi)(rng); };
     std::vector<uint8_t> q, ref;
     for (long it = 0; it < n; it++) {
-        const int mode = rnd(0, 9);
-        const int len2 = mode == 0 ? rnd(1, 12) : rnd(5, 320);
+        const int mode = rnd(0, 10);
+        /* relation jobs: relx = T (hyp 1) or A (hyp 0); mode 10 = a long mate rich in relx, up to
+         * poly-relx, which can exceed the relation's entry cap */
+        const bool rel = mode == 10 || rnd(0, 2) == 0;
+        const int hyp = rnd(0, 1), relx = hyp ? 3 : 0;
+        const int len2 = mode == 0 ? rnd(1, 12) : mode == 10 ? rnd(300, 1000) : rnd(5, 320);
         q.resize((size_t)len2);
-        /* query: random, low complexity (period 1-4), or random with repeats of itself */
-        const int period = mode >= 7 ? rnd(1, 4) : 0;
-        for (int j = 0; j < len2; j++) q[(size_t)j] = period ? (uint8_t)((j % period) * 7 % 4) : (uint8_t)rnd(0, 3);
+        /* query: random, low complexity (period 1-4), random with repeats of itself, or relx-rich */
+        const int period = mode >= 7 && mode <= 9 ? rnd(1, 4) : 0;
+        const int richp = mode == 10 ? rnd(30, 100) : 0;   // % relx
+        for (int j = 0; j < len2; j++)
+            q[(size_t)j] = richp    ? (rnd(0, 99) < richp ? (uint8_t)relx : (uint8_t)rnd(0, 3))
+                           : period ? (uint8_t)((j % period) * 7 % 4)
+                                    : (uint8_t)rnd(0, 3);
         if (mode == 6)
             for (int j = rnd(8, 24); j < len2; j++) q[(size_t)j] = q[(size_t)std::max(0, j - rnd(1, 8))];
         /* windows: tiny, near the SIMD filter's capacity (past it the scalar filter decides), long
@@ -299,8 +333,14 @@ void run_fuzz(long n, unsigned seed, Stats &st)
         const int mh = rnd(0, 3) == 0 ? rnd(0, 3000) : rnd(0, 1) ? 1000 : 1 << 30;
         const int k = rnd(0, 1) ? 19 : rnd(5, 40);
         const int which = rnd(0, 1) ? -1 : rnd(0, NSCORINGS - 1);
-        const rescue_prune_params p = scoring(which, k);
-        run_one(ref.data(), len1, q.data(), len2, p, mh, rnd(0, 1) == 0, st);
+        rescue_prune_params p = scoring(which, k);
+        if (rel) {
+            const bool alias = rnd(0, 3) == 0;
+            run_rel(ref.data(), len1, q.data(), len2, p, hyp, mh, rnd(0, 1) == 0, alias, st);
+            p.set_meth_rel(hyp);   // the near-repeats below stay under the relation
+        } else {
+            run_one(ref.data(), len1, q.data(), len2, p, mh, rnd(0, 1) == 0, st);
+        }
         /* near-repeats straight after, which the repeat memo must not mistake for the job above: a
          * prefix of the window (the memo compares only the new job's bytes), and the window with
          * its last base changed */
@@ -311,8 +351,16 @@ void run_fuzz(long n, unsigned seed, Stats &st)
             run_one(ref.data(), len1, q.data(), len2, p, mh, false, st);
         }
         /* the same job at another threshold or scoring straight after: the memo must not answer it */
-        if (rnd(0, 7) == 0) run_one(ref.data(), len1, q.data(), len2, scoring(which, k == 19 ? 25 : 19), mh, false, st);
-        if (rnd(0, 7) == 0) run_one(ref.data(), len1, q.data(), len2, scoring(which < 0 ? 0 : -1, k), mh, false, st);
+        if (rnd(0, 7) == 0) {
+            rescue_prune_params o = scoring(which, k == 19 ? 25 : 19);
+            if (rel) o.set_meth_rel(hyp);
+            run_one(ref.data(), len1, q.data(), len2, o, mh, false, st);
+        }
+        if (rnd(0, 7) == 0) {
+            rescue_prune_params o = scoring(which < 0 ? 0 : -1, k);
+            if (rel) o.set_meth_rel(hyp);
+            run_one(ref.data(), len1, q.data(), len2, o, mh, false, st);
+        }
     }
 }
 
@@ -335,9 +383,9 @@ int main(int argc, char **argv)
         return 2;
     }
     printf("eq %s: jobs=%ld repeats=%ld memo_hits=%ld simd_b2=%ld over_comp_cap=%ld full=%ld b1=%ld b2=%ld "
-           "MISMATCHES=%ld\n",
+           "rel=%ld rel_b2=%ld MISMATCHES=%ld\n",
            mode.c_str(), st.jobs, st.repeats, st.memo_hits, st.simd, st.over_cap, st.kind[RESCUE_PRUNE_FULL],
-           st.kind[RESCUE_PRUNE_B1], st.kind[RESCUE_PRUNE_B2], st.bad);
+           st.kind[RESCUE_PRUNE_B1], st.kind[RESCUE_PRUNE_B2], st.rel, st.rel_b2, st.bad);
     if (st.simd == 0) fprintf(stderr, "FAIL: no job took the SIMD filter's B2 path; the run compared nothing\n");
     /* Repeats run straight after their job, so a memo that never answers one has stopped working
      * (a correctness no-op, but the repeat checks above would then test nothing). */

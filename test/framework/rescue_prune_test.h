@@ -6,10 +6,10 @@
 
 #include "rescue_prune.h"
 
-/* Whether p is the default scoring (-A 1 -B 4 -O 6 -E 1) without a --meth conversion. */
+/* Whether p is the default scoring (-A 1 -B 4 -O 6 -E 1) without a --meth conversion or relation. */
 static inline bool rescue_prune_is_default_scoring(const rescue_prune_params &p)
 {
-    return p.conv_from < 0 && p.a == 1 && p.b == 4 && p.o_del == 6 && p.e_del == 1 && p.o_ins == 6
+    return p.conv_from < 0 && p.relx < 0 && p.a == 1 && p.b == 4 && p.o_del == 6 && p.e_del == 1 && p.o_ins == 6
            && p.e_ins == 1;
 }
 
