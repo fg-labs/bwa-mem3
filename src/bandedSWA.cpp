@@ -1072,7 +1072,7 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
     if (maxStep < 1) maxStep = 1;
     const int BYTE_CEIL = 255 - maxStep;
 #endif
-    int32_t best_abs[SIMD_WIDTH8]; // running best score (absolute == byte here)
+    int32_t best_abs[SIMD_WIDTH8]; // running best score, seeded with the raw h0 (absolute == byte once the lane advances)
     int32_t gbest_abs[SIMD_WIDTH8];// running gscore (query-end), absolute
 
     int32_t minq = 10000000;
@@ -1433,9 +1433,8 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
         // are handled exactly.
         //
         // Run the block only on rows where some lane can actually change:
-        //   * xrow / best_abs change only where cmp is set (the global max
-        //     advanced this row; best_abs is always >= the byte max otherwise,
-        //     so max(best_abs, ms) is the identity);
+        //   * xrow / best_abs change only where cmp is set (the lane's max
+        //     advanced this row; both updates are masked by cmp);
         //   * gbest_abs / ierow change only where qfire is set;
         //   * a lane can z-drop only if drop - dif > zdrop with dif >= 0, so
         //     drop > zdrop is necessary, and drop = maxScore - maxRS1 is exact
@@ -1494,9 +1493,14 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
                 xrg = _mm256_blendv_epi8(xrg, vip1, cmpg);
                 _mm256_storeu_si256((__m256i *)(xrow + base), xrg);
 
-                // best_abs = max(best_abs, (uint8)ms) -- byte is already absolute
+                // best_abs = max(best_abs, (uint8)ms) where the lane's max advanced
+                // this row (cmp). Masked, not over the whole group: best_abs starts at
+                // the raw h0 while the byte max starts at h0 clamped to 0, so for a
+                // negative h0 (--meth seeds rescored in original space) an unmasked max
+                // would lift the lane to 0 whenever any other lane in the group advanced,
+                // making its score depend on which pairs share its group.
                 __m256i bag = _mm256_loadu_si256((const __m256i *)(best_abs + base));
-                bag = _mm256_max_epi32(bag, msg);
+                bag = _mm256_blendv_epi8(bag, _mm256_max_epi32(bag, msg), cmpg);
                 _mm256_storeu_si256((__m256i *)(best_abs + base), bag);
 
                 // gscore: where qfire AND hqe >= gbest_abs, take hqe / i+1
@@ -1658,7 +1662,8 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
 
     // Scores come from the per-lane wide best_abs/gbest_abs side channels, which
     // carry the byte state widened per row (the byte IS the absolute score under
-    // the routing envelope — see the precondition above). Positions are
+    // the routing envelope — see the precondition above — except that best_abs
+    // keeps a negative h0 until the lane's byte max advances). Positions are
     // reconstructed wide from the diagonal-offset lanes plus the per-lane
     // best-row side channels.
     int8_t maxj[SIMD_WIDTH8]  __attribute((aligned(64)));
@@ -2979,7 +2984,7 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
     if (maxStep < 1) maxStep = 1;
     const int BYTE_CEIL = 255 - maxStep;
 #endif
-    int32_t best_abs[SIMD_WIDTH8]; // running best score (absolute == byte here)
+    int32_t best_abs[SIMD_WIDTH8]; // running best score, seeded with the raw h0 (absolute == byte once the lane advances)
     int32_t gbest_abs[SIMD_WIDTH8];// running gscore (query-end), absolute
 
     int32_t minq = 10000000;
@@ -3329,9 +3334,8 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
         // are handled exactly.
         //
         // Run the block only on rows where some lane can actually change:
-        //   * xrow / best_abs change only where cmp is set (the global max
-        //     advanced this row; best_abs is always >= the byte max otherwise,
-        //     so max(best_abs, ms) is the identity);
+        //   * xrow / best_abs change only where cmp is set (the lane's max
+        //     advanced this row; both updates are masked by cmp);
         //   * gbest_abs / ierow change only where qfire is set;
         //   * a lane can z-drop only if drop - dif > zdrop with dif >= 0, so
         //     drop > zdrop is necessary, and drop = maxScore - maxRS1 is exact
@@ -3391,9 +3395,10 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
                 xrg = _mm512_mask_mov_epi32(xrg, cmpm, vip1);
                 _mm512_storeu_si512((void *)(xrow + base), xrg);
 
-                // best_abs = max(best_abs, (uint8)ms) -- byte is already absolute
+                // best_abs = max(best_abs, (uint8)ms) only where the lane's max
+                // advanced this row (cmp); see smithWaterman256_8 for why it is masked.
                 __m512i bag = _mm512_loadu_si512((const void *)(best_abs + base));
-                bag = _mm512_max_epi32(bag, msg);
+                bag = _mm512_mask_max_epi32(bag, cmpm, bag, msg);
                 _mm512_storeu_si512((void *)(best_abs + base), bag);
 
                 // gscore: where qfire AND hqe >= gbest_abs, take hqe / i+1
@@ -3544,7 +3549,8 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
 
     // Scores come from the per-lane wide best_abs/gbest_abs side channels, which
     // carry the byte state widened per row (the byte IS the absolute score under
-    // the routing envelope — see the precondition above). Positions are
+    // the routing envelope — see the precondition above — except that best_abs
+    // keeps a negative h0 until the lane's byte max advances). Positions are
     // reconstructed wide from the diagonal-offset lanes plus the per-lane
     // best-row side channels.
     int8_t maxj[SIMD_WIDTH8]  __attribute((aligned(64)));
@@ -6040,7 +6046,7 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
     if (maxStep < 1) maxStep = 1;
     const int BYTE_CEIL = 255 - maxStep;
 #endif
-    int32_t best_abs[SIMD_WIDTH8]; // running best score (absolute == byte here)
+    int32_t best_abs[SIMD_WIDTH8]; // running best score, seeded with the raw h0 (absolute == byte once the lane advances)
     int32_t gbest_abs[SIMD_WIDTH8];// running gscore (query-end), absolute
 
     int32_t minq = 10000000;
@@ -6404,9 +6410,8 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
         // distances that exceed int8 for long reads are handled exactly.
         //
         // Run the block only on rows where some lane can actually change:
-        //   * xrow / best_abs change only where cmp is set (the global max
-        //     advanced this row; best_abs is always >= maxScore128 otherwise,
-        //     so max(best_abs, ms) is the identity);
+        //   * xrow / best_abs change only where cmp is set (the lane's max
+        //     advanced this row; both updates are masked by cmp);
         //   * gbest_abs / ierow change only where qfire128 is set;
         //   * a lane can z-drop only if drop - dif > zdrop with dif >= 0, so
         //     drop > zdrop is necessary, and drop = maxScore128 - maxRS1 is
@@ -6488,9 +6493,14 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
                 xrg = blendv_fullmask8(xrg, vip1, cmpg);
                 _mm_storeu_si128((__m128i *)(xrow + base), xrg);
 
-                // (2) best_abs = max(best_abs, (uint8)ms)
+                // (2) best_abs = max(best_abs, (uint8)ms) only where the lane's max
+                // advanced this row (cmp). best_abs starts at the raw h0 but the byte
+                // max at h0 clamped to 0, so for a negative h0 (--meth seeds rescored
+                // in original space) an unmasked max would lift the lane to 0 whenever
+                // any other lane in the group advanced: its score would depend on
+                // which pairs share its group.
                 __m128i bag = _mm_loadu_si128((const __m128i *)(best_abs + base));
-                bag = _mm_max_epi32(bag, msg);
+                bag = blendv_fullmask8(bag, _mm_max_epi32(bag, msg), cmpg);
                 _mm_storeu_si128((__m128i *)(best_abs + base), bag);
 
                 // (3) gscore: where qfire AND hqe >= gbest_abs, take hqe / i+1
@@ -6680,7 +6690,8 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
     
     // Scores come from the per-lane wide best_abs/gbest_abs side channels, which
     // carry the byte state widened per row (the byte IS the absolute score under
-    // the routing envelope — see the precondition above). Positions are
+    // the routing envelope — see the precondition above — except that best_abs
+    // keeps a negative h0 until the lane's byte max advances). Positions are
     // reconstructed wide from the diagonal-offset lanes plus the per-lane
     // best-row side channels.
     int8_t maxj[SIMD_WIDTH8]  __attribute((aligned(64)));

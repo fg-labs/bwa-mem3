@@ -413,6 +413,35 @@ simulated chr17 pairs) found identical alignment records, and
 the staging code is common to every SIMD tier, running before the tier-specific kernels. Pinned by
 `test/regression/repeat_chain_extension_window.sh`.
 
+## 8-bit banded-SW score for a negative seed score depended on its SIMD group (PR #528)
+
+The 8-bit banded-SW extension kernels (`smithWaterman128_8`, `smithWaterman256_8`,
+`smithWaterman512_8`) keep each lane's best score in a wide per-lane side channel,
+`best_abs`, seeded with the raw seed score `h0`, while the byte DP state is seeded with `h0`
+clamped to 0. The per-row wide update ran `best_abs = max(best_abs, byte max)` over every
+lane of the group whenever *any* lane's maximum advanced that row, on the assumption that
+`best_abs` is never below the byte max. A negative `h0` breaks that assumption: a lane whose
+cells never score above 0 was lifted from `h0` to 0 exactly when another lane in its group
+advanced, and kept `h0` otherwise, so its `score` depended on which pairs shared its group.
+The fix updates `best_abs` only on lanes whose maximum advanced that row, as `xrow` already
+was, so a negative-`h0` lane now reports what the scalar kernel reports whatever it is
+batched with.
+
+Negative seed scores occur only under **`--meth`**, where a seed found in converted space is
+rescored in original space. There the extension-DP dedup (`--dedup`, default `auto`) latches
+on or off from measured wall time and changes which pairs share a group, so identical
+`--meth` runs could place a few MAPQ-0 multi-mapper pairs differently (`XA`/`HN` changing,
+occasionally the pair moving to another contig). With the fix, `--meth` output no longer
+depends on the dedup state, the thread count, or the SIMD tier (AVX2 matches AVX-512BW).
+Versus the previous release, `--meth` records whose extension had a negative seed score can
+change: on a 5 M-pair EM-seq panel sample, 707 of 10.37 M records under
+`--meth-scoring neutral` and 950 under `genomic`; default (collapsed) `--meth` output was
+unchanged on that sample. For `h0 >= 0` the masked update is the identity, so **non-`--meth`
+output is byte-identical by construction**, corroborated by identical md5s on 5 M-pair WGS
+and WES slices with the dedup at `auto` and forced on. Pinned by
+`test/bandedswa_negative_h0_test.cpp`, which compares every result field against the scalar
+oracle and against the pair scored alone.
+
 ---
 
 ## Upstream port divergences: all chains dropped by the weight filter (PR #489) and the SA sentinel offset (PR #469)
@@ -457,6 +486,7 @@ shipped, because parity with that release is its contract (see
 | Symmetric ref/query length bounds guards on the SW wrappers | [#467](https://github.com/fg-labs/bwa-mem3/pull/467) | — | fork-only (invalid-input contract; valid-input records byte-identical by construction — see the PR #467 correctness note above for the measured scope) |
 | Banded-SW `qlen` band-clamp reach slot overflow (`int32_t` reach) | [#468](https://github.com/fg-labs/bwa-mem3/pull/468) | — | fork-only (8-bit widening defensive; 16-bit divergence only at non-default `-A >= 3` long-query, `len2 * A > 65535` — default alignment records unchanged for fixed batch composition, see the correctness note above) |
 | Extension staging copied a chain's windows once per seed | [#524](https://github.com/fg-labs/bwa-mem3/pull/524) | — | fork-only (inputs that aborted because a repeat chain staged its window once per seed now complete; the `int32` staging limit itself is unchanged; records of inputs that already ran byte-identical by construction — see the PR #524 correctness note above for the measured scope) |
+| 8-bit banded-SW score for a negative seed score depended on its SIMD group | [#528](https://github.com/fg-labs/bwa-mem3/pull/528) | — | fork-only (`--meth` only; records whose extension had a negative seed score can change and are now independent of batching; non-`--meth` output byte-identical by construction — see the PR #528 correctness note above) |
 | kseq2bseq1 zero-initialization | [#22](https://github.com/fg-labs/bwa-mem3/pull/22) | — | fork-only |
 | Proper-pair flag from emitted alignment | [#17](https://github.com/fg-labs/bwa-mem3/pull/17) | — | fork-only, **opt-in** (`--proper-pair-from-emitted`; default matches both upstreams, [#362](https://github.com/fg-labs/bwa-mem3/issues/362)) |
 | All chains dropped by the weight filter: default follows bwa | [#489](https://github.com/fg-labs/bwa-mem3/pull/489) | — ([#310](https://github.com/fg-labs/bwa-mem3/issues/310)) | fork-only; `--compat=bwa-mem2` reproduces bwa-mem2 |
