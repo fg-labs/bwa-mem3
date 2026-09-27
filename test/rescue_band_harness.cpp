@@ -26,7 +26,8 @@
  * (the min seed length, default 19; minsc = RB_MINSC * a), RB_SCALAR_STRIDE (default 0: no scalar
  * cross-check; default scoring only) and RB_SCORING (unset: the default scoring; "a,b,o_del,e_del,
  * o_ins,e_ins": fixed; "random": a fresh draw per 2048-job batch, see draw_params) and RB_METH
- * (genomic | neutral | collapsed | random: --meth matrices, see meth_matrix) are harness-only.
+ * (genomic | neutral | collapsed | random: --meth matrices, see meth_matrix) and RB_16BIT (1: every
+ * job runs through kswv's 16-bit kernels, uncut and unbanded, with longer mates) are harness-only.
  * Banding runs only at the default scoring, as in production.
  *
  * Dump files: one record per prune-eligible rescue job, as the aligner saw it (full window and
@@ -120,6 +121,7 @@ static int scalar_score2(const std::vector<int> &R, int S, int te, int minsc)
 /* generators                                                                                 */
 /* ---------------------------------------------------------------------------------------- */
 static std::mt19937_64 rng;
+static bool g_16 = false;   // RB_16BIT
 static int rnd(int n) { return n <= 1 ? 0 : (int)(rng() % (uint64_t)n); }
 static int rndr(int a, int b) { return a + rnd(b - a + 1); }
 static double unif() { return (rng() >> 11) * (1.0 / 9007199254740992.0); }
@@ -152,6 +154,7 @@ static Job gen(int cls)
     Job J; J.cls = cls;
     int len2 = rnd(4) == 0 ? rndr(17, 240) : rndr(100, 160);
     if (rnd(6) == 0) len2 = 16 * rndr(2, 15);   // exact multiples of 16 (no pad columns)
+    if (g_16 && rnd(2)) len2 = rnd(2) ? 250 : rndr(17, 500);   // 2x250 and long mates
     std::vector<uint8_t> &q = J.q, &r = J.ref;
     q.resize(len2);
     for (auto &b : q) b = (uint8_t)rnd(4);
@@ -356,7 +359,7 @@ struct Batch {
         memset(&p, 0, sizeof p);
         p.idr = (int32_t)ref.size(); p.idq = (int32_t)qer.size();
         p.len1 = len1; p.len2 = len2;
-        p.h0 = KSW_XSUBO | KSW_XSTART | KSW_XBYTE | minsc;
+        p.h0 = KSW_XSUBO | KSW_XSTART | (g_16 ? 0 : KSW_XBYTE) | minsc;
         p.regid = n; p.id = n; p.seqid = n;
         ref.insert(ref.end(), r, r + len1);
         qer.insert(qer.end(), q, q + len2);
@@ -380,6 +383,23 @@ static void run_batch(Ikswv *k, Batch &b, int nb, bool p1_any)
     SeqPair *pairs = b.sp.data();
     kswr_t *aln = b.aln.data();
     for (int i = 0; i < b.n; i++) aln[i].tb = aln[i].qb = -1;
+    if (g_16) {   // RB_16BIT: kswv's 16-bit kernels for both passes, no banding (as production)
+        k->getScores16(pairs, b.ref.data(), b.qer.data(), aln, b.n, 1, 0);
+        int pos = 0;
+        for (int i = 0; i < b.n; i++) {
+            SeqPair sp = pairs[i];
+            const kswr_t r = aln[sp.regid];
+            const int xtra = sp.h0;
+            if ((xtra & KSW_XSTART) == 0 || ((xtra & KSW_XSUBO) && r.score < (xtra & 0xffff))) continue;
+            sp.h0 = KSW_XSTOP | r.score;
+            sp.len2 = r.qe + 1;
+            revseq(r.qe + 1, b.qer.data() + sp.idq);
+            revseq(r.te + 1, b.ref.data() + sp.idr);
+            pairs[pos++] = sp;
+        }
+        k->getScores16(pairs, b.ref.data(), b.qer.data(), aln, pos, 1, 1);
+        return;
+    }
     k->getScores8(pairs + nb, b.ref.data(), b.qer.data(), aln, b.n - nb, 1, 0);
     if (nb) rescue_band_batch().run_pass0(pairs, nb, b.ref.data(), b.qer.data(), aln, k);
     int pos = 0;
@@ -519,8 +539,8 @@ static int run_eq(std::vector<Job> &all_jobs, int minsc_default, int max_hits, i
         rb_scoring bsc;
         bsc.a = pp.a; bsc.b = pp.b; bsc.o_del = pp.o_del; bsc.e_del = pp.e_del; bsc.o_ins = pp.o_ins; bsc.e_ins = pp.e_ins;
         if (meth) bsc.set_matrix(mat);
-        const bool band = rescue_band_enabled() && pp.valid;
-        const bool p1_any = rescue_band_enabled() && bsc.valid();
+        const bool band = !g_16 && rescue_band_enabled() && pp.valid;
+        const bool p1_any = !g_16 && rescue_band_enabled() && bsc.valid();
         if (rescue_band_enabled()) rescue_band_batch().set_scoring(bsc);
         nbatch++; nvalid += pp.valid; if (pp.valid) nk[pp.K]++;
         /* This batch's jobs: mates too long for the 8-bit kernels at this a are cut to a random
@@ -529,7 +549,7 @@ static int run_eq(std::vector<Job> &all_jobs, int minsc_default, int max_hits, i
         std::vector<Job> jobs(all_jobs.begin() + base, all_jobs.begin() + base + m);
         for (Job &J : jobs) {
             const int len2 = (int)J.q.size();
-            if (use_u8(len2, pp.a, shift)) continue;
+            if (g_16 || use_u8(len2, pp.a, shift)) continue;
             int nl = std::min(len2, std::min((254 - shift) / pp.a, 249 / pp.a));
             if (nl < 5) nl = 0;
             if (nl > 17) nl = rndr(17, nl);
@@ -628,7 +648,10 @@ static int run_eq(std::vector<Job> &all_jobs, int minsc_default, int max_hits, i
                 if (mism < 10) fprintf(stderr, "refused scoring but kind=%d\n", kind[t]);
             }
             if (!ok) { mism++; cls_mm[J.cls]++; }
-            if (scalar_stride > 0 && pp.default_scoring() && (n % scalar_stride) == 0) {
+            /* The scalar model is kswv's 8-bit rowMax (scalar_score2's zeroed rising rows); kswv's
+             * 16-bit kernels keep a plain row max, so their score2 can differ from it (both widths
+             * as in v0.13.0). RB_16BIT checks pruned against full-window kswv16 only. */
+            if (!g_16 && scalar_stride > 0 && pp.default_scoring() && (n % scalar_stride) == 0) {
                 int S, te, qe; std::vector<int> R;
                 scalar_dp(J, S, te, qe, R);
                 const int s2 = S >= minsc ? scalar_score2(R, S, te, minsc) : -1;
@@ -746,6 +769,7 @@ int main(int argc, char **argv)
         return 2;
     }
     const int minsc = rescue_env_int("RB_MINSC", MINSC_DEFAULT);
+    g_16 = rescue_env_int("RB_16BIT", 0) != 0;
     if (const char *m = getenv("RB_METH")) {
         g_meth = !strcmp(m, "genomic") ? METH_GENOMIC : !strcmp(m, "neutral") ? METH_NEUTRAL
                : !strcmp(m, "collapsed") ? METH_COLLAPSED : !strcmp(m, "random") ? METH_RANDOM : -1;

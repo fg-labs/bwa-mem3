@@ -324,9 +324,10 @@ static int rescue_prune_max_hits(int minsc)
 }
 /* BWA3_RESCUE_PRUNE_STATS=1 prints the filter's decisions at exit (non-vacuity check for the
  * identity A/B: identical output must come with a nonzero number of pruned rows), and the number of
- * 16-bit rescue jobs, which the filter never sees (the same check for the 16-bit kernels). */
+ * 16-bit rescue jobs with the filter's B1 / B2 decisions on them (b1_16 / b2_16, included in b1 / b2):
+ * the same non-vacuity check for the 16-bit kernels. */
 struct rescue_prune_stats_t {
-    std::atomic<uint64_t> jobs{0}, full{0}, b1{0}, b2{0}, rows_in{0}, rows_kept{0}, jobs16{0};
+    std::atomic<uint64_t> jobs{0}, full{0}, b1{0}, b2{0}, rows_in{0}, rows_kept{0}, jobs16{0}, b1_16{0}, b2_16{0};
     /* Thread-summed wall time of the rescue stages (ns): filter + band planning in _pre, kswv
      * pass 0 (8-bit + 16-bit), the banded pass 0, kswv pass 1 and the banded pass 1. Only measured
      * when stats are on. */
@@ -338,12 +339,12 @@ struct rescue_prune_stats_t {
     bool on = rescue_env_opt_in("BWA3_RESCUE_PRUNE_STATS");
     ~rescue_prune_stats_t() {
         if (on) fprintf(stderr, "[RESCUE_PRUNE] jobs=%llu full=%llu b1=%llu b2=%llu rows_in=%llu rows_kept=%llu "
-                        "jobs16=%llu filter_s=%.3f kswv_pass0_s=%.3f band_pass0_s=%.3f kswv_pass1_s=%.3f "
+                        "jobs16=%llu b1_16=%llu b2_16=%llu filter_s=%.3f kswv_pass0_s=%.3f band_pass0_s=%.3f kswv_pass1_s=%.3f "
                         "band_pass1_s=%.3f dedup_run=%llu dedup_skip=%llu dedup_run_regs=%llu "
                         "dedup_skip_regs=%llu dedup_insert1=%llu dedup_insert1_fast=%llu dedup_s=%.3f\n",
                         (unsigned long long)jobs, (unsigned long long)full, (unsigned long long)b1,
                         (unsigned long long)b2, (unsigned long long)rows_in, (unsigned long long)rows_kept,
-                        (unsigned long long)jobs16, ns_filter * 1e-9, ns_k0 * 1e-9, ns_band * 1e-9,
+                        (unsigned long long)jobs16, (unsigned long long)b1_16, (unsigned long long)b2_16, ns_filter * 1e-9, ns_k0 * 1e-9, ns_band * 1e-9,
                         ns_k1 * 1e-9, ns_b1 * 1e-9, (unsigned long long)dedup_run,
                         (unsigned long long)dedup_skip, (unsigned long long)dedup_run_regs,
                         (unsigned long long)dedup_skip_regs, (unsigned long long)dedup_insert1,
@@ -410,10 +411,11 @@ static bool rescue_band_meth_on(const mem_opt_t *opt)
  * tagged at enqueue) selects the conversion the filter applies (set_meth); the default collapsed
  * scoring (b = 2a) forces K = 3 and is refused, --meth -B 4 and the genomic / neutral scorings
  * (b = 4a) are not. Only the batched meth rescue reaches here (the scalar escape hatch returns
- * earlier in _pre). */
-static bool rescue_prune_applies(const mem_opt_t *opt, int xtra, int hyp, rescue_prune_params *pp)
+ * earlier in _pre). Both kswv widths: a 16-bit job's hull narrows its 16-bit window exactly as an
+ * 8-bit one's does (the filter bounds scores, not lanes); only banding is 8-bit. */
+static bool rescue_prune_applies(const mem_opt_t *opt, int hyp, rescue_prune_params *pp)
 {
-    if (!rescue_prune_on(opt) || opt->rescue_kmer || !(xtra & KSW_XBYTE)) return false;
+    if (!rescue_prune_on(opt) || opt->rescue_kmer) return false;
     *pp = rescue_prune_params::from(opt->a, opt->b, opt->o_del, opt->e_del, opt->o_ins, opt->e_ins,
                                     opt->min_seed_len * opt->a);
     if (opt->meth_mode) pp->set_meth(hyp);
@@ -1751,7 +1753,7 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
              * and _post applies the same offset. The oriented mate is built once here and reused
              * for the staging copy below. */
             rescue_prune_params pp;
-            const bool pruned = rescue_prune_applies(opt, xtra, opt->meth_mode ? (mate_meth_ot ^ is_rev) & 1 : -1, &pp);
+            const bool pruned = rescue_prune_applies(opt, opt->meth_mode ? (mate_meth_ot ^ is_rev) & 1 : -1, &pp);
             if (g_rescue_prune_stats.on && !(xtra & KSW_XBYTE)) g_rescue_prune_stats.jobs16++;
             static thread_local std::vector<uint8_t> oq;   // oriented mate; grows, never shrinks
             if (pruned) {
@@ -1762,10 +1764,12 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                 const uint64_t tf0 = g_rescue_prune_stats.on ? rescue_now_ns() : 0;
                 const int kind = rescue_prune_window(ref, (int)(re - rb), oq.data(), l_ms, pp,
                                                      rescue_prune_max_hits(pp.minsc), &hb, &he);
-                /* Banding plan (rescue_band.h), bound to this pair's regid at enqueue (commit). Not
-                 * under --meth: a pruned --meth run does not band (rescue_band_meth_on); the band
-                 * kernels' --meth matrices serve the unpruned runs' pass 1. */
-                if (kind == RESCUE_PRUNE_B2 && rescue_band_enabled() && !opt->meth_mode && pp.valid) {
+                /* Banding plan (rescue_band.h), bound to this pair's regid at enqueue (commit). 8-bit
+                 * jobs only (a 16-bit job's hull runs through kswv's 16-bit kernel), and not under
+                 * --meth: a pruned --meth run does not band (rescue_band_meth_on); the band kernels'
+                 * --meth matrices serve the unpruned runs' pass 1. */
+                if (kind == RESCUE_PRUNE_B2 && (xtra & KSW_XBYTE) && rescue_band_enabled() && !opt->meth_mode
+                    && pp.valid) {
                     rescue_band_batch().set_scoring(rb_scoring::from(pp));
                     rescue_band_batch().plan(rescue_prune_last_view(), pp, (int)(re - rb), l_ms, hb, he);
                 }
@@ -1775,6 +1779,8 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                     g_rescue_prune_stats.rows_in += re - rb;
                     (kind == RESCUE_PRUNE_B1 ? g_rescue_prune_stats.b1 : kind == RESCUE_PRUNE_B2 ? g_rescue_prune_stats.b2 : g_rescue_prune_stats.full)++;
                     g_rescue_prune_stats.rows_kept += kind == RESCUE_PRUNE_B1 ? 0 : kind == RESCUE_PRUNE_B2 ? he - hb + 1 : re - rb;
+                    if (!(xtra & KSW_XBYTE) && kind != RESCUE_PRUNE_FULL)
+                        (kind == RESCUE_PRUNE_B1 ? g_rescue_prune_stats.b1_16 : g_rescue_prune_stats.b2_16)++;
                 }
                 if (kind == RESCUE_PRUNE_B1) {
                     gar[gcnt + r] = MATESW_GAR_PROVEN_FAIL;
