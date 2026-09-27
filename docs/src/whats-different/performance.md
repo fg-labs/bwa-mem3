@@ -291,12 +291,12 @@ generated jobs.
   and WES slices, at `-t 16 -K 160000000`, at the default scoring (8-bit bodies)
   and at `-A 2` (every rescue job on the 16-bit bodies), on AWS Graviton 4
   (NEON), AMD EPYC 7R13 (Zen 3, AVX2) and AMD EPYC 9R45 (Zen 5, AVX-512BW).
-- **AVX2 rescue kernels: signed-domain 8-bit cell, deferred 16-bit query end.**
-  x86 has no unsigned-plus-signed saturating add, so the AVX2 8-bit FScan body
-  now keeps its scores as H - 128 in signed bytes, where each cell scores with
+- **AVX2 and AVX-512BW rescue kernels: signed-domain 8-bit cell, deferred 16-bit query end.**
+  x86 has no unsigned-plus-signed saturating add, so the AVX2 and AVX-512BW
+  8-bit FScan bodies now keep their scores as H - 128 in signed bytes, where each cell scores with
   one signed saturating add instead of a biased add and a de-biasing subtract
   (as NEON's USQADD body does; `BWA3_RESCUE_USQADD=0` restores the biased form).
-  It is selected only when every gap constant fits a positive signed byte, i.e.
+  Each is selected only when every gap constant fits a positive signed byte, i.e.
   the open-plus-extend sum is at most 127; above that the biased body runs even
   with `BWA3_RESCUE_USQADD` on.
   The AVX2 16-bit body finds each row's query end after the row, from per-block
@@ -308,9 +308,11 @@ generated jobs.
   `BWA3_RESCUE_USQADD=0`), `-B 6`, `-O 8 -E 2`, `-x intractg`, `-k 25`,
   `-A 2` and `-A 3 -B 12 -O 18 -E 3`; the deferred query end at the default
   scoring, `-A 2` (every rescue job on the 16-bit body), `-A 2 -B 6`,
-  `-A 2 -B 8 -O 12 -E 2` and `-A 3 -B 12 -O 18 -E 3`. The NEON, SSE4.1 and
-  AVX-512BW kernels are unchanged.
-  ([#542](https://github.com/fg-labs/bwa-mem3/pull/542))
+  `-A 2 -B 8 -O 12 -E 2` and `-A 3 -B 12 -O 18 -E 3`. The AVX-512BW 8-bit
+  body takes the same signed domain by the same argument; its gate is the kswv
+  unit tests on an AVX-512BW host. The NEON and SSE4.1 kernels are unchanged.
+  ([#542](https://github.com/fg-labs/bwa-mem3/pull/542); AVX-512BW:
+  [#546](https://github.com/fg-labs/bwa-mem3/pull/546))
 - **Fused, two-row banded cell (NEON, AVX2).** The banded rescue DP uses the same
   fused cell (both gaps opened from one saturating subtract), steps two rows at
   a time, and reads the query end directly rather than from a per-row snapshot.
@@ -373,7 +375,7 @@ generated jobs.
 | `BWA3_RESCUE_BAND_TIGHT=<n>` | Threshold offset of the first-round band for a lone near-perfect primary (default 8; 0 disables). It only chooses between exact paths, so output does not depend on its value by design. |
 | `BWA3_RESCUE_FSCAN=0` | Use the original rescue cells instead of the 11-op cell, in the rescue kernels and in the banded DP. A value starting with `0` turns it off and anything else leaves it on; it is not reported. It only chooses between exact paths, so output is the same either way by design. |
 | `BWA3_RESCUE_BAND_KERNEL=<n>` | Which banded-DP kernel runs while `BWA3_RESCUE_FSCAN` is on: `0` the original cell, `1` the fused cell one row at a time, `2` (default) the fused cell two rows at a time; values above 2 act as 2. It only chooses between exact paths, so output does not depend on its value by design. |
-| `BWA3_RESCUE_USQADD=0` | In the NEON 8-bit rescue kernel and the AVX2 8-bit FScan body, use the biased add / subtract pair per cell instead of one saturating add (on AVX2, of the signed H - 128 domain, which runs only when the open-plus-extend sum is at most 127; [#542](https://github.com/fg-labs/bwa-mem3/pull/542)). It only chooses between exact paths, so output is the same either way by design. |
+| `BWA3_RESCUE_USQADD=0` | In the NEON 8-bit rescue kernel and the AVX2 and AVX-512BW 8-bit FScan bodies, use the biased add / subtract pair per cell instead of one saturating add (on x86, of the signed H - 128 domain, which runs only when the open-plus-extend sum is at most 127; AVX2: [#542](https://github.com/fg-labs/bwa-mem3/pull/542), AVX-512BW: [#546](https://github.com/fg-labs/bwa-mem3/pull/546)). It only chooses between exact paths, so output is the same either way by design. |
 | `BWA3_RESCUE_ROWPAIR=0` | In the NEON rescue kernels (8- and 16-bit), sweep one target row at a time instead of two. It only chooses between exact paths, so output is the same either way by design. |
 | `BWA3_RESCUE_LAZYQE=0` | In the NEON two-row sweep, find each row's query end inline instead of after the row. It only chooses between exact paths, so output is the same either way by design. |
 | `BWA3_RESCUE_BAND_SHIFT=0` | Turn off the per-lane band shift that aligns the query offsets of the 16 bands in a vector. It only chooses between exact paths, so output is the same either way by design. |
