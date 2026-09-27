@@ -557,8 +557,8 @@ TEST_CASE("kswv u16 rescue: ROWPAIR/LAZYQE configurations agree, and one-row mat
 // against the independent scalar oracle.
 TEST_CASE("kswv u8 rescue: BWA3_RESCUE_USQADD off == on, and biased body matches scalar"
           * doctest::test_suite("unit/kswv")) {
-#if !defined(__ARM_NEON) && !defined(__aarch64__)
-    MESSAGE("skipped: BWA3_RESCUE_USQADD affects the NEON u8 rescue kernel only");
+#if !defined(__ARM_NEON) && !defined(__aarch64__) && !defined(__AVX2__)
+    MESSAGE("skipped: BWA3_RESCUE_USQADD affects the NEON and AVX2 u8 rescue kernels only");
     return;
 #else
     auto mat = bwa_tests::build_scoring_matrix(1, 4, 1);

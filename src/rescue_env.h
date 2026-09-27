@@ -8,7 +8,8 @@
  *
  *   kswv kernels (src/kswv.cpp; read once per batch, so a unit test can flip them in-process)
  *     BWA3_RESCUE_USQADD         1     u8: one saturating add per cell instead of the biased
- *                                      add / subtract pair
+ *                                      add / subtract pair (NEON; AVX2 FScan body: the same in
+ *                                      the signed H - 128 domain)
  *     BWA3_RESCUE_ROWPAIR        1     NEON: sweep two rows at a time (0: one row)
  *     BWA3_RESCUE_LAZYQE         1     NEON two-row sweep: recover the query end lazily
  *                                      (0: inline argmax)
