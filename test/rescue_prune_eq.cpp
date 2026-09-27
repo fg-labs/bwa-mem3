@@ -75,9 +75,9 @@ rescue_prune_params scoring(int which, int k)
     return rescue_prune_params::from(x[0], x[1], x[2], x[3], x[4], x[5], k * x[0]);
 }
 
-/* Whether the SIMD filter decides a and b alike: the same threshold, relation and bound weights. The decision
- * depends on nothing else of the scoring (-B 6 decides as the default does), so the memo may answer
- * across such a change. */
+/* Whether the SIMD filter decides a and b alike: the same threshold, relation and bound weights.
+ * The decision depends on nothing else of the scoring (-B 6 decides as the default does), so the
+ * memo may answer across such a change. */
 bool same_filter(const rescue_prune_params &a, const rescue_prune_params &b)
 {
     return a.minsc == b.minsc && a.relx == b.relx && a.simd_wt() == b.simd_wt();
@@ -85,7 +85,7 @@ bool same_filter(const rescue_prune_params &a, const rescue_prune_params &b)
 
 struct Stats {
     long jobs = 0, simd = 0, over_cap = 0, repeats = 0, memo_hits = 0, bad = 0, kind[3] = {0, 0, 0}, rel = 0,
-         rel_b2 = 0;
+         rel_b2 = 0, rel_simd = 0;
 };
 
 /* The scalar fields of two views of one job. Their arrays alias the same per-thread scratch, so
@@ -182,6 +182,7 @@ void run_one(const uint8_t *ref, int len1, const uint8_t *q, int len2, const res
         if (rep == 0 && p.relx >= 0) { st.rel++; st.rel_b2 += kind[0] == RESCUE_PRUNE_B2; }
         const bool simd = kind[rep] == RESCUE_PRUNE_B2 && view[rep].bnd16 != nullptr;
         st.simd += simd;
+        st.rel_simd += simd && p.relx >= 0;
         st.over_cap += simd && view[rep].ncomp > rescue_prune_simd_scratch_t::COMP_CAP;
         std::string why;
         bool ok = kind[rep] == k0 && (k0 != RESCUE_PRUNE_B2 || (hb[rep] == h0 && he[rep] == e0));
@@ -383,13 +384,19 @@ int main(int argc, char **argv)
         return 2;
     }
     printf("eq %s: jobs=%ld repeats=%ld memo_hits=%ld simd_b2=%ld over_comp_cap=%ld full=%ld b1=%ld b2=%ld "
-           "rel=%ld rel_b2=%ld MISMATCHES=%ld\n",
+           "rel=%ld rel_b2=%ld rel_simd_b2=%ld MISMATCHES=%ld\n",
            mode.c_str(), st.jobs, st.repeats, st.memo_hits, st.simd, st.over_cap, st.kind[RESCUE_PRUNE_FULL],
-           st.kind[RESCUE_PRUNE_B1], st.kind[RESCUE_PRUNE_B2], st.rel, st.rel_b2, st.bad);
+           st.kind[RESCUE_PRUNE_B1], st.kind[RESCUE_PRUNE_B2], st.rel, st.rel_b2, st.rel_simd, st.bad);
     if (st.simd == 0) fprintf(stderr, "FAIL: no job took the SIMD filter's B2 path; the run compared nothing\n");
     /* Repeats run straight after their job, so a memo that never answers one has stopped working
      * (a correctness no-op, but the repeat checks above would then test nothing). */
     const bool memo_dead = st.repeats > 0 && st.memo_hits == 0;
     if (memo_dead) fprintf(stderr, "FAIL: %ld repeats and no memo hit; the repeat memo never engaged\n", st.repeats);
-    return st.bad || st.simd == 0 || memo_dead ? 1 : 0;
+    /* The fuzz runs a third of its jobs under the relation (and mode 10 always does), so a run
+     * whose relation jobs never reached the SIMD filter's B2 path compared the relation's scalar
+     * filter with itself. Dump runs are exempt: a small dump may hold no relation job that narrows. */
+    const bool rel_dead = mode == "fuzz" && st.rel > 0 && st.rel_simd == 0;
+    if (rel_dead)
+        fprintf(stderr, "FAIL: %ld relation jobs and none took the SIMD filter's B2 path under the relation\n", st.rel);
+    return st.bad || st.simd == 0 || memo_dead || rel_dead ? 1 : 0;
 }
