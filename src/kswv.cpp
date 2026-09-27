@@ -383,7 +383,7 @@ kswv::kswv(const int o_del, const int e_del, const int o_ins,
         for (int k = 0; k < SIMD_WIDTH8; ++k)
             colIdx8[(size_t) j * SIMD_WIDTH8 + k] = (uint8_t) j;
 
-    /* 16-bit twins for the NEON 16-bit kernel (see kswv.h): a column-index
+    /* 16-bit twins for the NEON and AVX2 16-bit kernels (see kswv.h): a column-index
      * broadcast table and two rows of per-QE_BLK running-max checkpoints.
      * ncol never exceeds maxQerLen (the wrapper pads each lane's query to its
      * 8-column quantum, and maxQerLen carries a +16 margin), so one extra
@@ -2778,6 +2778,41 @@ static inline __m256i avx2_blendv_u8(__m256i mask, __m256i src, __m256i dst)
     return _mm256_blendv_epi8(dst, src, mask);
 }
 
+/* Deferred query-end recovery shared by the AVX2 u8 and 16-bit bodies (I16): for each lane of
+ * `active` (a full-lane mask; active_msk its movemask, non-zero), the first column j2 < ncol whose
+ * stored H equals the row max, min{ j2 : H[j2] == imax }. blockMax holds the running row max
+ * checkpointed after each QE_BLK columns (prefix maxima), so only the block(s) where a lane first
+ * reaches imax are scanned; both are in the H domain the body uses (signed under Sgn). Every
+ * operand is one 32-byte vector per column or block: column j2's H is at H1 + (j2 + 1) vectors,
+ * its index at colIdx + j2 vectors. Lanes outside `active` come back all-ones; the caller blends
+ * the result into its qe under `active`. See the rescan in kswv_neon_u8_impl for why this is the
+ * column the inline strict-greater argmax picked. */
+template<bool I16>
+static inline __m256i avx2_lazy_qe(const void *blockMax, const void *H1, const void *colIdx, int ncol,
+                                   __m256i imax, __m256i active, int active_msk)
+{
+    const __m256i *bm = (const __m256i *)blockMax, *h = (const __m256i *)H1, *ci = (const __m256i *)colIdx;
+    auto eqv = [](__m256i a, __m256i b) { return I16 ? _mm256_cmpeq_epi16(a, b) : _mm256_cmpeq_epi8(a, b); };
+    __m256i iqe = _mm256_set1_epi8((char)0xFF), found = _mm256_setzero_si256();
+    const int nblocks = (ncol + QE_BLK - 1) / QE_BLK;
+    for (int b = 0; b < nblocks; b++) {
+        const __m256i reached = eqv(_mm256_load_si256(bm + b), imax);
+        const __m256i newly = _mm256_and_si256(_mm256_andnot_si256(found, reached), active);
+        found = _mm256_or_si256(found, reached);
+        if (_mm256_movemask_epi8(newly)) {
+            const int j0 = b * QE_BLK, j1 = (j0 + QE_BLK < ncol) ? (j0 + QE_BLK) : ncol;
+            __m256i got = _mm256_setzero_si256();
+            for (int j2 = j0; j2 < j1; j2++) {
+                const __m256i eq = _mm256_and_si256(eqv(_mm256_loadu_si256(h + j2 + 1), imax), newly);
+                iqe = avx2_blendv_u8(_mm256_andnot_si256(got, eq), _mm256_loadu_si256(ci + j2), iqe);
+                got = _mm256_or_si256(got, eq);
+            }
+        }
+        if ((_mm256_movemask_epi8(found) & active_msk) == active_msk) break;
+    }
+    return iqe;
+}
+
 /* Widen the low/high 128 bits of a u8x32 into u16x16, zero-extended. */
 static inline __m256i avx2_widen_u8_lo(__m256i v)
 {
@@ -3488,7 +3523,6 @@ int kswv::kswv256_16_impl(int16_t seq1SoA[],
     int16_t endsc[SIMD_WIDTH16] __attribute__((aligned(64))) = {0};
 
     const __m256i zero_vec = _mm256_setzero_si256();
-    const __m256i one_vec  = _mm256_set1_epi16(1);
 
     /* 32-entry int8 score table indexed by (s1 ^ s2) in [0..31]. Built
      * identically to the NEON kernel, including the query-tail DUMMY3
@@ -3563,14 +3597,23 @@ int kswv::kswv256_16_impl(int16_t seq1SoA[],
 
     __m256i pimax_vec = zero_vec;
 
+    /* Lazy query end, as in the u8 kernels and the NEON 16-bit one-row sweep:
+     * the running row max is checkpointed once per QE_BLK columns (prefix
+     * maxima), and after the row the query end is recovered from the stored H
+     * as min{ j : H[j] == rowmax }, scanning only the block(s) the checkpoints
+     * say can hold it. That is the inline strict-greater argmax's column (both
+     * are the first column reaching the row max; under FScan the prefix maxima
+     * of G and H agree, see point 2 above KSWV_NEON_U8_CELL_PAIR_FS), so the
+     * cell loses its compare, blend and column counter. */
+    int16_t *blockMax = this->qeBlk16;
+    const int16_t *colIdx = this->colIdx16;
+
     __m256i imax_vec;
     int i, limit = nrow;
     for (i = 0; i < nrow; i++) {
         __m256i e11 = zero_vec;
         __m256i s1  = _mm256_loadu_si256((const __m256i*)(seq1SoA + i * SIMD_WIDTH16));
         imax_vec    = zero_vec;
-        __m256i iqe_vec = _mm256_set1_epi16(-1);
-        __m256i l_vec   = zero_vec;
         __m256i i_vec   = _mm256_set1_epi16((int16_t)i);
 
         /* Rank-1 freed-cell override (issue 173 + TAPS neutral), folded into ONE
@@ -3621,14 +3664,17 @@ int kswv::kswv256_16_impl(int16_t seq1SoA[],
             const __m256i g = _mm256_max_epi16(_mm256_max_epi16(m11, f11), zero_vec); \
             const __m256i t = _mm256_sub_epi16(g, oe_vec);                       \
             const __m256i h11 = _mm256_max_epi16(g, e11);                        \
-            iqe_vec  = avx2_blendv_u8(avx2_cmpgt_s16(g, imax_vec), l_vec, iqe_vec); \
             imax_vec = _mm256_max_epi16(imax_vec, g);                            \
             e11 = _mm256_max_epi16(t, _mm256_sub_epi16(e11, e_ins_vec));         \
             _mm256_storeu_si256((__m256i*)(H1 + (j + 1) * SIMD_WIDTH16), h11);   \
             _mm256_storeu_si256((__m256i*)(F  + (j + 1) * SIMD_WIDTH16),         \
                                 _mm256_max_epi16(t, _mm256_sub_epi16(f11, e_del_vec))); \
-            l_vec = _mm256_add_epi16(l_vec, one_vec);                            \
+            if (j == qeNext) {                                                   \
+                _mm256_store_si256((__m256i*)(blockMax + qeBlk * SIMD_WIDTH16), imax_vec); \
+                qeBlk++; qeNext += QE_BLK;                                       \
+            }                                                                    \
         }
+        int qeNext = QE_BLK - 1, qeBlk = 0;
         if (FScan) {
             int j = 0;
             for (; j < jsplit; j++) KSWV_AVX2_16_CELL_FS(false)
@@ -3677,9 +3723,7 @@ int kswv::kswv256_16_impl(int16_t seq1SoA[],
                 h11 = _mm256_max_epi16(h11, f11);
                 h11 = _mm256_max_epi16(h11, zero_vec);
 
-                __m256i cmp0 = avx2_cmpgt_s16(h11, imax_vec);
                 imax_vec = _mm256_max_epi16(imax_vec, h11);
-                iqe_vec  = avx2_blendv_u8(cmp0, l_vec, iqe_vec);
 
                 __m256i gapE = _mm256_sub_epi16(h11, oe_ins_vec);
                 e11 = _mm256_sub_epi16(e11, e_ins_vec);
@@ -3691,10 +3735,16 @@ int kswv::kswv256_16_impl(int16_t seq1SoA[],
 
                 _mm256_storeu_si256((__m256i*)(H1 + (j + 1) * SIMD_WIDTH16), h11);
                 _mm256_storeu_si256((__m256i*)(F  + (j + 1) * SIMD_WIDTH16), f21);
-                l_vec = _mm256_add_epi16(l_vec, one_vec);
+                if (j == qeNext) {
+                    _mm256_store_si256((__m256i*)(blockMax + qeBlk * SIMD_WIDTH16), imax_vec);
+                    qeBlk++; qeNext += QE_BLK;
+                }
             }
         }
 #undef KSWV_AVX2_16_CELL_FS
+
+        /* Close the final (possibly partial) block. */
+        _mm256_store_si256((__m256i*)(blockMax + ((ncol - 1) / QE_BLK) * SIMD_WIDTH16), imax_vec);
 
         /* Block I: write prior row's pimax to rowMax (plain store; the
          * score2 scan filters per lane, matching the NEON 16-bit kernel). */
@@ -3711,7 +3761,13 @@ int kswv::kswv256_16_impl(int16_t seq1SoA[],
         gmax_vec = avx2_blendv_u8(frozen_vec, gmax_vec, new_gmax);
 
         te_vec = avx2_blendv_u8(cmp0_active, i_vec, te_vec);
-        qe_vec = avx2_blendv_u8(cmp0_active, iqe_vec, qe_vec);
+
+        /* Deferred query end (see blockMax above; avx2_lazy_qe). */
+        const int active_msk = _mm256_movemask_epi8(cmp0_active);
+        if (active_msk)
+            qe_vec = avx2_blendv_u8(cmp0_active,
+                                    avx2_lazy_qe<true>(blockMax, H1, colIdx, ncol, imax_vec, cmp0_active, active_msk),
+                                    qe_vec);
 
         /* Freeze newly endsc-qualifying lanes (has_endsc gate). */
         __m256i cmp_end  = avx2_cmpge_s16(gmax_vec, endsc_vec);

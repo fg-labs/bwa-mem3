@@ -757,7 +757,7 @@ TEST_CASE("kswv u16 rescue: BWA3_RESCUE_FSCAN off == on in every u16 body, and F
         {"two-row inline",  "1", "0", false},
         {"two-row lazy",    "1", "1", true},   // the production default
 #else
-        {"x86",             "1", "1", true},   // toggles other than FSCAN are NEON-only
+        {"x86",             "1", "1", true},   // toggles other than FSCAN do not reach the x86 16-bit bodies
 #endif
     };
     int oracle_mism = 0;
