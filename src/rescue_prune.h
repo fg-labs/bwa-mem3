@@ -58,6 +58,14 @@ struct rescue_prune_params {
      * neutral scoring: a superset of the match-like cells, and over-counting hits only loosens the
      * bound, so the lemma holds. */
     int conv_from = -1, conv_to = -1;
+    /* --meth, relation-expanded (set_meth_rel): the filter matches the exact relation of the genomic /
+     * neutral matrices instead of converted copies. A query base relx relates to the reference bases
+     * relx and relx ^ 2 (OT: read T to reference T or C; OB: read A to reference A or G); every other
+     * pair is the identity. The freed cell scores +a (genomic) or 0 (neutral) <= a and every
+     * unrelated real cell -b, so the lemma holds; unlike the converted copies it does not relate the
+     * mirror (reference T / read C), which on mostly unconverted reads (TAPS) is what saturates the
+     * windows. Not for collapsed scoring, whose mirror cell scores +a: that needs set_meth. -1: off. */
+    int relx = -1;
 
     int base() const { return a * (K - 1) + c; }
     int weight(int cnt) const { return a * cnt - c; }
@@ -78,7 +86,7 @@ struct rescue_prune_params {
     }
     bool default_scoring() const
     {
-        return conv_from < 0 && a == 1 && b == 4 && o_del == 6 && e_del == 1 && o_ins == 6 && e_ins == 1;
+        return conv_from < 0 && relx < 0 && a == 1 && b == 4 && o_del == 6 && e_del == 1 && o_ins == 6 && e_ins == 1;
     }
     /* --meth: the rescued mate is scored with mat_ot (hyp 1: reference C / read T freed) or mat_ob
      * (hyp 0: reference G / read A freed); collapsed scoring also frees the mirror cell. */
@@ -86,6 +94,13 @@ struct rescue_prune_params {
     {
         conv_from = hyp ? 1 : 2;
         conv_to = hyp ? 3 : 0;
+        relx = -1;
+    }
+    /* The relation-expanded alternative to set_meth (relx above): genomic and neutral scoring only. */
+    void set_meth_rel(int hyp)
+    {
+        conv_from = conv_to = -1;
+        relx = hyp ? 3 : 0;
     }
 
     /* Validity conditions V0-V5 in order (V0 first: it guards every division). k_min is the smallest
@@ -121,10 +136,17 @@ struct rescue_prune_params {
  * depend only on the oriented mate, which repeats across the anchors rescued with it. */
 struct rescue_prune_scratch {
     static const int QCAP = 1024, DCAP = 30000 + 1024 + 2;
+    /* Under a relation (relx >= 0) one query K-mer relates to up to 2^K reference codes, so the
+     * query table holds entries (query position ent_j, next entry of the same code ent_nxt) instead
+     * of query positions; a mate needing more than ECAP entries is not pruned (FULL). The SIMD filters
+     * use the same cap. */
+    static const int ECAP = 16384;
     int16_t head[1024], nxt[QCAP];
+    int16_t ent_j[ECAP], ent_nxt[ECAP];
     uint16_t qcnt[1024];
     uint8_t qcache[QCAP];
-    int qlen_c = -1, qk_c = 0;   // the cached query tables are for this length and K
+    int qlen_c = -1, qk_c = 0, qrel_c = -1;   // the cached query tables are for this length, K and relx
+    bool q_over = false;                        // ... and exceeded ECAP
     uint16_t cnt[DCAP];
     int16_t minrow[DCAP];
     int32_t fwd[DCAP], bwd[DCAP];
@@ -145,21 +167,48 @@ static inline int rescue_prune_window_scalar(const uint8_t *ref, int len1, const
     if (orv & 0xFC) return RESCUE_PRUNE_FULL;  // N present: its score (-1) breaks the lemma's accounting
 
     if (len2 < K || len1 < K) return RESCUE_PRUNE_FULL;
-    if (len2 != s.qlen_c || K != s.qk_c || memcmp(q, s.qcache, (size_t)len2) != 0) {
+    const int relx = p.relx;
+    if (len2 != s.qlen_c || K != s.qk_c || relx != s.qrel_c || memcmp(q, s.qcache, (size_t)len2) != 0) {
         memset(s.head, 0xFF, sizeof s.head);
         memset(s.qcnt, 0, sizeof s.qcnt);
+        s.q_over = false;
         int c = 0;
         for (int j = 0; j < K - 1; j++) c = (c << 2) | q[j];
-        for (int j = K - 1; j < len2; j++) {
-            c = ((c << 2) | q[j]) & mask;
-            s.nxt[j] = s.head[c];
-            s.head[c] = (int16_t)j;
-            s.qcnt[c]++;
+        if (relx < 0) {
+            for (int j = K - 1; j < len2; j++) {
+                c = ((c << 2) | q[j]) & mask;
+                s.nxt[j] = s.head[c];
+                s.head[c] = (int16_t)j;
+                s.qcnt[c]++;
+            }
+        } else {
+            /* The reference codes related to the K-mer ending at j: its code with any subset of the
+             * relx positions flipped by ^ 2 (M = those positions' high bits), one entry each. A
+             * reference K-mer has one code, so every (row, j) hit is counted once. Entries go in with
+             * j ascending, so each code's chain is j-descending, as nxt is. */
+            int ne = 0;
+            for (int j = K - 1; j < len2 && !s.q_over; j++) {
+                c = ((c << 2) | q[j]) & mask;
+                int M = 0;
+                for (int t = 0; t < K; t++)
+                    if (q[j - t] == relx) M |= 2 << (2 * t);
+                for (int sm = M;; sm = (sm - 1) & M) {
+                    if (ne == rescue_prune_scratch::ECAP) { s.q_over = true; break; }
+                    const int rc = c ^ sm;
+                    s.ent_j[ne] = (int16_t)j;
+                    s.ent_nxt[ne] = s.head[rc];
+                    s.head[rc] = (int16_t)ne++;
+                    s.qcnt[rc]++;
+                    if (!sm) break;
+                }
+            }
         }
         memcpy(s.qcache, q, (size_t)len2);
         s.qlen_c = len2;
         s.qk_c = K;
+        s.qrel_c = relx;
     }
+    if (s.q_over) return RESCUE_PRUNE_FULL;
     int c0 = 0;
     for (int i = 0; i < K - 1; i++) c0 = (c0 << 2) | ref[i];
     /* Gate: total hits from per-code query counts, without enumerating them. */
@@ -173,10 +222,18 @@ static inline int rescue_prune_window_scalar(const uint8_t *ref, int len1, const
     c = c0;
     for (int i = K - 1; i < len1; i++) {
         c = ((c << 2) | ref[i]) & mask;
-        for (int j = s.head[c]; j >= 0; j = s.nxt[j]) {
-            const int d = i - j + off;
-            if (!s.cnt[d]) s.minrow[d] = (int16_t)(i - (K - 1));
-            s.cnt[d]++;
+        if (relx < 0) {
+            for (int j = s.head[c]; j >= 0; j = s.nxt[j]) {
+                const int d = i - j + off;
+                if (!s.cnt[d]) s.minrow[d] = (int16_t)(i - (K - 1));
+                s.cnt[d]++;
+            }
+        } else {
+            for (int e = s.head[c]; e >= 0; e = s.ent_nxt[e]) {
+                const int d = i - s.ent_j[e] + off;
+                if (!s.cnt[d]) s.minrow[d] = (int16_t)(i - (K - 1));
+                s.cnt[d]++;
+            }
         }
     }
     /* Kadane over the diagonal weights a cnt_d - c: fwd[d] / bwd[d] are the best sums of an
@@ -332,7 +389,7 @@ static inline int rescue_prune_window(const uint8_t *ref, int len1, const uint8_
     }
     const int minsc = p.minsc;
     (void)minsc;
-    if (!p.simd_ok()) goto scalar;
+    if (!p.simd_ok() || p.relx >= 0) goto scalar;
 #if defined(__aarch64__)
     {   // identical decisions to the scalar filter at any minsc, ~2x faster (rescue_prune_neon.h)
         rescue_prune_neon::NeonScratch &ns = rescue_prune_neon_scratch();

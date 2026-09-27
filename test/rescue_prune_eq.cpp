@@ -10,7 +10,10 @@
  * time, which exercises the memo. minsc varies per job (dumps: 19, 5, 10, 15, 25, 32 in turn;
  * fuzz: 5-40), and so does the scoring (the default half of the time, else one of SCORINGS: c = 2,
  * a = 2, large gap opens), through rescue_prune_params. At c = 2 a single-hit diagonal has
- * weight a - c < 0, the case the NEON hw test once got wrong.
+ * weight a - c < 0, the case the NEON hw test once got wrong. A share of the jobs runs under the
+ * --meth relation (set_meth_rel, relx T or A), some of them three times in a row with the other
+ * hypothesis in between (the query caches and the memo must key on relx), and the fuzz adds long
+ * T- or A-rich mates that exceed the relation's entry cap (FULL on both sides).
  *
  *   rescue_prune_eq dump <files...>     jobs from rescue_band_harness dumps
  *                                       (int32 len1, len2; ref; query)
@@ -32,7 +35,7 @@
 namespace {
 
 struct Stats {
-    long jobs = 0, simd = 0, fallback = 0, b2 = 0, bad = 0, kind[3] = {0, 0, 0};
+    long jobs = 0, simd = 0, fallback = 0, b2 = 0, bad = 0, kind[3] = {0, 0, 0}, rel = 0, rel_b2 = 0;
 };
 
 /* K = 5 scorings the SIMD filters take (a, b, o_del, e_del, o_ins, e_ins). */
@@ -123,13 +126,28 @@ void run_one(const uint8_t *ref, int len1, const uint8_t *q, int len2, const res
             ok = check_view(ref, len1, q, len2, p, rescue_prune_last_view(), r, why);
         if (rep == 0) st.kind[k1]++;
         if (k1 == RESCUE_PRUNE_B2) st.b2++;
+        if (p.relx >= 0) { st.rel++; st.rel_b2 += k1 == RESCUE_PRUNE_B2; }
         if (!ok) {
             if (st.bad < 20)
-                fprintf(stderr, "MISMATCH len1=%d len2=%d minsc=%d a=%d c=%d base=%d max_hits=%d rep=%d path=%d: %s\n",
-                        len1, len2, minsc, p.a, p.c, p.base(), max_hits, rep, path, why.c_str());
+                fprintf(stderr, "MISMATCH len1=%d len2=%d minsc=%d a=%d c=%d base=%d relx=%d max_hits=%d rep=%d path=%d: %s\n",
+                        len1, len2, minsc, p.a, p.c, p.base(), p.relx, max_hits, rep, path, why.c_str());
             st.bad++;
         }
     }
+}
+
+/* run_one under the relation of hypothesis hyp (relx T for OT, A for OB); alias: then under the other
+ * hypothesis and this one again, on the identical bytes. */
+void run_rel(const uint8_t *ref, int len1, const uint8_t *q, int len2, rescue_prune_params p, int hyp,
+             int max_hits, bool twice, bool alias, Stats &st)
+{
+    p.set_meth_rel(hyp);
+    run_one(ref, len1, q, len2, p, max_hits, twice, st);
+    if (!alias) return;
+    rescue_prune_params o = p;
+    o.set_meth_rel(!hyp);
+    run_one(ref, len1, q, len2, o, max_hits, false, st);
+    run_one(ref, len1, q, len2, p, max_hits, false, st);
 }
 
 int run_dumps(int argc, char **argv, bool hdr16, Stats &st)
@@ -165,7 +183,11 @@ int run_dumps(int argc, char **argv, bool hdr16, Stats &st)
             const int mh = k % 3 == 0 ? 400 : k % 3 == 1 ? 1000 : 1 << 30;
             static const int minscs[6] = {19, 5, 10, 15, 25, 32};
             const int which = (k / 18) % 2 == 0 ? -1 : (int)((k / 36) % NSCORINGS);
-            run_one(ref, h[0], q, h[1], scoring(which, minscs[(k / 3) % 6]), mh, (k & 1) == 0, st);
+            const rescue_prune_params sp = scoring(which, minscs[(k / 3) % 6]);
+            /* every 4th group of 5 jobs under the relation, hypotheses alternating; each 2nd of them
+             * also under the other hypothesis */
+            if ((k / 5) % 4 == 3) run_rel(ref, h[0], q, h[1], sp, (int)((k / 20) & 1), mh, (k & 1) == 0, (k / 5) % 8 == 7, st);
+            else run_one(ref, h[0], q, h[1], sp, mh, (k & 1) == 0, st);
         }
     }
     return 0;
@@ -177,12 +199,19 @@ void run_fuzz(long n, unsigned seed, Stats &st)
     auto rnd = [&](int lo, int hi) { return std::uniform_int_distribution<int>(lo, hi)(rng); };
     std::vector<uint8_t> q, ref;
     for (long it = 0; it < n; it++) {
-        const int mode = rnd(0, 9);
-        const int len2 = mode == 0 ? rnd(1, 12) : rnd(5, 320);
+        const int mode = rnd(0, 10);
+        /* relation jobs: relx = T (hyp 1) or A (hyp 0); mode 10 = a long mate rich in relx, up to
+         * poly-relx, which can exceed the relation's entry cap */
+        const bool rel = mode == 10 || rnd(0, 2) == 0;
+        const int hyp = rnd(0, 1), relx = hyp ? 3 : 0;
+        const int len2 = mode == 0 ? rnd(1, 12) : mode == 10 ? rnd(300, 1000) : rnd(5, 320);
         q.resize(len2);
         /* query: random, low complexity (period 1-4), or random with repeats of itself */
-        const int period = mode >= 7 ? rnd(1, 4) : 0;
-        for (int j = 0; j < len2; j++) q[j] = period ? (uint8_t)((j % period) * 7 % 4) : (uint8_t)rnd(0, 3);
+        const int period = mode >= 7 && mode <= 9 ? rnd(1, 4) : 0;
+        const int richp = mode == 10 ? rnd(30, 100) : 0;   // % relx
+        for (int j = 0; j < len2; j++)
+            q[j] = richp ? (rnd(0, 99) < richp ? (uint8_t)relx : (uint8_t)rnd(0, 3))
+                 : period ? (uint8_t)((j % period) * 7 % 4) : (uint8_t)rnd(0, 3);
         if (mode == 6)
             for (int j = rnd(8, 24); j < len2; j++) q[j] = q[j - rnd(1, 8) > 0 ? j - rnd(1, 8) : 0];
         const int len1 = mode == 0 ? rnd(1, 40) : mode == 1 ? rnd(4000, 4100) : rnd(5, 2400);
@@ -208,7 +237,8 @@ void run_fuzz(long n, unsigned seed, Stats &st)
         const int mh = rnd(0, 3) == 0 ? rnd(0, 3000) : rnd(0, 1) ? 1000 : 1 << 30;
         const int minsc = rnd(0, 1) ? 19 : rnd(5, 40);
         const int which = rnd(0, 1) ? -1 : rnd(0, NSCORINGS - 1);
-        run_one(ref.data(), len1, q.data(), len2, scoring(which, minsc), mh, rnd(0, 1) == 0, st);
+        if (rel) run_rel(ref.data(), len1, q.data(), len2, scoring(which, minsc), hyp, mh, rnd(0, 1) == 0, rnd(0, 3) == 0, st);
+        else run_one(ref.data(), len1, q.data(), len2, scoring(which, minsc), mh, rnd(0, 1) == 0, st);
     }
 }
 
@@ -230,7 +260,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "unknown mode %s\n", argv[1]);
         return 2;
     }
-    printf("eq %s: jobs=%ld simd=%ld scalar_fallback=%ld full=%ld b1=%ld b2=%ld MISMATCHES=%ld\n", mode.c_str(), st.jobs,
-           st.simd, st.fallback, st.kind[0], st.kind[1], st.kind[2], st.bad);
+    printf("eq %s: jobs=%ld simd=%ld scalar_fallback=%ld full=%ld b1=%ld b2=%ld rel=%ld rel_b2=%ld MISMATCHES=%ld\n",
+           mode.c_str(), st.jobs, st.simd, st.fallback, st.kind[0], st.kind[1], st.kind[2], st.rel, st.rel_b2, st.bad);
     return st.bad ? 1 : 0;
 }

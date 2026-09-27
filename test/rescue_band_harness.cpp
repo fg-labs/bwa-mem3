@@ -26,7 +26,9 @@
  * (the min seed length, default 19; minsc = RB_MINSC * a), RB_SCALAR_STRIDE (default 0: no scalar
  * cross-check; default scoring only) and RB_SCORING (unset: the default scoring; "a,b,o_del,e_del,
  * o_ins,e_ins": fixed; "random": a fresh draw per 2048-job batch, see draw_params) and RB_METH
- * (genomic | neutral | collapsed | random: --meth matrices, see meth_matrix) and RB_16BIT (1: every
+ * (genomic | neutral | collapsed | random: --meth matrices, see meth_matrix) with RB_METH_REL
+ * (conv, the default: the filter matches converted copies; expand: genomic and neutral batches use
+ * the relation-expanded filter, rescue_prune_params::set_meth_rel, collapsed stays on conv) and RB_16BIT (1: every
  * job runs through kswv's 16-bit kernels, uncut and unbanded, with longer mates) are harness-only.
  * Banding runs only at the default scoring, as in production.
  *
@@ -434,6 +436,7 @@ static std::unique_ptr<Ikswv> make_k(int maxr, int maxq, const rescue_prune_para
 /* ---------------------------------------------------------------------------------------- */
 enum { METH_NONE = 0, METH_GENOMIC, METH_NEUTRAL, METH_COLLAPSED, METH_RANDOM };
 static int g_meth = METH_NONE;
+static bool g_meth_rel = false;   // RB_METH_REL=expand
 
 static void meth_matrix(const rescue_prune_params &p, int kind, int hyp, int8_t mat[25])
 {
@@ -530,7 +533,8 @@ static int run_eq(std::vector<Job> &all_jobs, int minsc_default, int max_hits, i
         int8_t mat[25];
         if (meth) {
             meth_matrix(pp, meth, hyp, mat);
-            pp.set_meth(hyp);
+            if (g_meth_rel && meth != METH_COLLAPSED) pp.set_meth_rel(hyp);
+            else pp.set_meth(hyp);
             nmeth[meth]++;
         }
         const int minsc = pp.minsc;
@@ -558,7 +562,9 @@ static int run_eq(std::vector<Job> &all_jobs, int minsc_default, int max_hits, i
             ntrunc++;
         }
         if (meth) {   // convert the mates: the planted copies keep the reference bases
-            const double rate = rnd(3) == 0 ? 0.05 : rnd(2) ? 0.5 : 0.95;
+            /* TAPS-like low rates (mostly unconverted reads) are the relation filter's case */
+            const double rate = g_meth_rel ? (rnd(2) ? (rnd(2) ? 0.02 : 0.05) : rnd(2) ? 0.5 : 0.95)
+                                           : rnd(3) == 0 ? 0.05 : rnd(2) ? 0.5 : 0.95;
             const uint8_t from = hyp ? 1 : 2, to = hyp ? 3 : 0;
             for (Job &J : jobs)
                 for (uint8_t &x : J.q)
@@ -774,6 +780,10 @@ int main(int argc, char **argv)
         g_meth = !strcmp(m, "genomic") ? METH_GENOMIC : !strcmp(m, "neutral") ? METH_NEUTRAL
                : !strcmp(m, "collapsed") ? METH_COLLAPSED : !strcmp(m, "random") ? METH_RANDOM : -1;
         if (g_meth < 0) { fprintf(stderr, "RB_METH: want genomic, neutral, collapsed or random\n"); return 2; }
+    }
+    if (const char *m = getenv("RB_METH_REL")) {
+        if (strcmp(m, "conv") && strcmp(m, "expand")) { fprintf(stderr, "RB_METH_REL: want conv or expand\n"); return 2; }
+        g_meth_rel = !strcmp(m, "expand");
     }
     if (const char *sc = getenv("RB_SCORING")) {
         if (!strcmp(sc, "random")) g_random_scoring = true;
