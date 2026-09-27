@@ -411,8 +411,8 @@ private:
 				   int32_t numPairs,
 				   int phase);
 
-	/* Templated u8 kernel body; see kswv_neon_u8_impl. */
-	template<bool HasFreed, bool FScan>
+	/* Templated u8 kernel body; see kswv_neon_u8_impl. Sgn: the signed-domain FScan body. */
+	template<bool HasFreed, bool FScan, bool Sgn>
 	int kswv256_u8_impl(uint8_t seq1SoA[],
 				   uint8_t seq2SoA[],
 				   int16_t nrow,

@@ -557,6 +557,19 @@ static inline void kswv_u8_saturation_guard(const SeqPair *p, int8_t w_match, ui
  * at KSWV_NEON_U8_CELL_PAIR_FS, the dropped reference-pad mask is argued in the
  * note above kswv_neon_u8, and the measurements are with the u8 NEON notes. */
 static bool rescue_fscan_enabled() { return rescue_env_on("BWA3_RESCUE_FSCAN"); }
+/* BWA3_RESCUE_USQADD: apply the u8 cell's substitution score with one saturating add instead of
+ * the biased add + de-biasing subtract pair. One op fewer, and it removes the de-bias from the
+ * DIAGONAL loop-carried chain (h00 -> m11 -> h11), shortening the critical path of these
+ * latency-bound kernels. On NEON it is vsqaddq_u8 (AArch64 USQADD, unsigned-saturating accumulate
+ * of a SIGNED addend) on a signed-delta score table: usqadd(h00, delta) == clamp(h00 + delta,
+ * 0, 255), the exact value the biased pair produces in the non-saturating range the assert in the
+ * kernel guarantees, and the H domain is unbiased in BOTH forms (the bias cancels within the
+ * cell), so every downstream H comparison is unchanged. x86 has no such instruction, so the AVX2
+ * FScan body takes the signed H - 128 domain instead (kswv256_u8_impl). Default ON;
+ * BWA3_RESCUE_USQADD=0 restores the biased form. Monomorphised as a template bool (folds like
+ * HasFreed), never a per-cell branch. */
+__attribute__((unused))   // read by the NEON and AVX2 u8 kernels only
+static bool rescue_usqadd_enabled() { return rescue_env_on("BWA3_RESCUE_USQADD"); }
 
 /* The scoring half of the FScan gate, shared by every dispatcher. The cell
  * shares one sat(G - oe) between both gaps, so it needs the insertion and
@@ -688,18 +701,7 @@ void kswv::kswvBatchWrapper8(SeqPair *pairArray,
     return;
 }
 
-/* USQADD: apply the substitution score with a single
- * vsqaddq_u8 (AArch64 USQADD, unsigned-saturating accumulate of a SIGNED addend)
- * on a signed-delta score table, instead of the biased vqaddq_u8 + de-biasing
- * vqsubq_u8 pair. One op fewer, and it removes the de-bias from the DIAGONAL
- * loop-carried chain (h00 -> m11 -> h11), shortening the critical path of this
- * latency-bound kernel. Byte-identical: usqadd(h00, delta) == clamp(h00+delta,
- * 0, 255), the exact value the biased pair produces in the non-saturating range
- * the assert below guarantees; the H domain is unbiased in BOTH forms (the bias
- * cancels within the cell), so every downstream H comparison is unchanged.
- * Default ON; BWA3_RESCUE_USQADD=0 restores the biased form. Monomorphised as a
- * template bool (folds like HasFreed), never a per-cell branch. */
-static bool rescue_usqadd_enabled() { return rescue_env_on("BWA3_RESCUE_USQADD"); }
+/* USQADD: see rescue_usqadd_enabled, with the FSCAN toggle above. */
 
 /* Two-target-row blocking of the u8 rescue kernel. Processing rows i and i+1 in
  * one column sweep lets the pair share the query-column load, the vertical-carry
@@ -2853,16 +2855,22 @@ int kswv::kswv256_u8(uint8_t seq1SoA[],
 {
     const bool fscan = rescue_fscan_enabled() &&
         fscan_scoring_ok(this->o_del, this->e_del, this->o_ins, this->e_ins, 255);
-#define KSWV256_U8_DISPATCH(HF, FS)                                             \
-    kswv256_u8_impl<HF, FS>(seq1SoA, seq2SoA, nrow, ncol, p, aln,               \
-                            po_ind, tid, numPairs, phase)
+    /* The signed-domain FScan body (BWA3_RESCUE_USQADD, see kswv256_u8_impl) needs the gap
+     * constants as positive int8. fscan_scoring_ok makes the two open-plus-extend sums equal and
+     * every o and e non-negative, so the sum at most 127 bounds each extend too. */
+    const bool sgn = fscan && rescue_usqadd_enabled() && this->o_ins + this->e_ins <= 127;
+#define KSWV256_U8_DISPATCH(HF, FS, SG)                                         \
+    kswv256_u8_impl<HF, FS, SG>(seq1SoA, seq2SoA, nrow, ncol, p, aln,           \
+                                po_ind, tid, numPairs, phase)
     if (has_freed)
-        return fscan ? KSWV256_U8_DISPATCH(true, true) : KSWV256_U8_DISPATCH(true, false);
-    return fscan ? KSWV256_U8_DISPATCH(false, true) : KSWV256_U8_DISPATCH(false, false);
+        return sgn ? KSWV256_U8_DISPATCH(true, true, true)
+             : fscan ? KSWV256_U8_DISPATCH(true, true, false) : KSWV256_U8_DISPATCH(true, false, false);
+    return sgn ? KSWV256_U8_DISPATCH(false, true, true)
+         : fscan ? KSWV256_U8_DISPATCH(false, true, false) : KSWV256_U8_DISPATCH(false, false, false);
 #undef KSWV256_U8_DISPATCH
 }
 
-template<bool HasFreed, bool FScan>
+template<bool HasFreed, bool FScan, bool Sgn>
 int kswv::kswv256_u8_impl(uint8_t seq1SoA[],
                      uint8_t seq2SoA[],
                      int16_t nrow,
@@ -2903,6 +2911,22 @@ int kswv::kswv256_u8_impl(uint8_t seq1SoA[],
     __m128i permSft_128 = _mm_loadu_si128((const __m128i*)temp);
     __m256i permSft     = _mm256_broadcastsi128_si256(permSft_128);
     __m256i sft_vec     = _mm256_set1_epi8((char)shift);
+
+    /* Sgn: the x86 twin of the NEON USQADD body (rescue_usqadd_enabled). x86 has no unsigned +
+     * signed saturating add, so the FScan body keeps H, E and F as H - 128 in int8 instead: that
+     * map is an order-preserving bijection of [0, 255] onto [-128, 127] taking unsigned
+     * saturation at 0 to signed saturation at -128, so every adds/subs/max_epu8 of the cell has
+     * an exact signed twin, and the substitution becomes one adds_epi8 of the unbiased delta
+     * (clamp(h00 + delta, 0, 255) shifted, the value the biased add / de-bias pair gives in the
+     * range kswv_u8_saturation_guard admits). The 0 of every boundary and pad becomes -128
+     * (sb_vec). The row max is taken back to the unsigned domain once per row, so the epilogue,
+     * rowMax and score2 are untouched; the lazy query-end rescan compares H and the checkpoints
+     * in the signed domain. */
+    static_assert(!Sgn || FScan, "the signed-domain body is an FScan body");
+    const __m256i sb_vec = _mm256_set1_epi8((char)0x80);
+    /* The unbiased score table: the one above less its bias, entry by entry (exact modulo 256,
+     * and every unbiased score fits a signed byte). Only the Sgn body reads sb_vec and permS. */
+    const __m256i permS  = _mm256_sub_epi8(permSft, sft_vec);
 
     /* u8-tier saturation guard (see kswv_u8_saturation_guard). The u8 admission
      * bound keeps every admitted pair safe; this catches a violating param set
@@ -2985,12 +3009,13 @@ int kswv::kswv256_u8_impl(uint8_t seq1SoA[],
     _mm_prefetch((const char*) seq1SoA, _MM_HINT_NTA);
     _mm_prefetch((const char*) (H1 + SIMD_WIDTH8), _MM_HINT_T0);
 
+    const __m256i h_zero = Sgn ? sb_vec : zero_vec;   // the DP's 0 in its H domain
     for (int i = 0; i <= ncol; i++) {
-        _mm256_storeu_si256((__m256i*)(H0   + i * SIMD_WIDTH8), zero_vec);
-        _mm256_storeu_si256((__m256i*)(F    + i * SIMD_WIDTH8), zero_vec);
+        _mm256_storeu_si256((__m256i*)(H0   + i * SIMD_WIDTH8), h_zero);
+        _mm256_storeu_si256((__m256i*)(F    + i * SIMD_WIDTH8), h_zero);
     }
-    _mm256_storeu_si256((__m256i*)H0, zero_vec);
-    _mm256_storeu_si256((__m256i*)H1, zero_vec);
+    _mm256_storeu_si256((__m256i*)H0, h_zero);
+    _mm256_storeu_si256((__m256i*)H1, h_zero);
 
     __m256i pimax_vec = zero_vec;
     uint32_t mask32   = 0;
@@ -3000,9 +3025,9 @@ int kswv::kswv256_u8_impl(uint8_t seq1SoA[],
 
     int i, limit = nrow;
     for (i = 0; i < nrow; i++) {
-        __m256i e11 = zero_vec;
+        __m256i e11 = h_zero;
         __m256i s1  = _mm256_loadu_si256((const __m256i*)(seq1SoA + i * SIMD_WIDTH8));
-        imax_vec    = zero_vec;
+        imax_vec    = h_zero;
         __m256i i_vec_s16 = _mm256_set1_epi16((int16_t)i);
 
         /* Freed-cell override (issue 173, bisulfite OT/OB + TAPS neutral). The
@@ -3019,7 +3044,7 @@ int kswv::kswv256_u8_impl(uint8_t seq1SoA[],
          * the same fr_val, so one freedval256 covers the folded target below. */
         __m256i freedval256, active_frread;
         if (HasFreed) {
-            freedval256 = _mm256_set1_epi8((char)(fr_val + shift));
+            freedval256 = _mm256_set1_epi8((char)(Sgn ? fr_val : fr_val + shift));
             __m256i rowfreed  = _mm256_cmpeq_epi8(s1, _mm256_set1_epi8((char)fr_ref));
             __m256i rowfreed2 = _mm256_cmpeq_epi8(s1, _mm256_set1_epi8((char)fr_ref2));
             /* One per-lane freed target: fr_read where ref==fr_ref, fr_read2 where
@@ -3115,23 +3140,33 @@ int kswv::kswv256_u8_impl(uint8_t seq1SoA[],
             __m256i h00 = _mm256_loadu_si256((const __m256i*)(H0 + j * SIMD_WIDTH8)); \
             __m256i s2  = _mm256_loadu_si256((const __m256i*)(seq2SoA + j * SIMD_WIDTH8)); \
             __m256i f11 = _mm256_loadu_si256((const __m256i*)(F + (j + 1) * SIMD_WIDTH8)); \
-            __m256i sbt = _mm256_shuffle_epi8(permSft, _mm256_xor_si256(s1, s2)); \
-            if (NEED_DUMMY) \
-                sbt = avx2_blendv_u8(_mm256_cmpeq_epi8(s2, five_vec), sft_vec, sbt); \
+            __m256i sbt = _mm256_shuffle_epi8(Sgn ? permS : permSft, _mm256_xor_si256(s1, s2)); \
+            if (NEED_DUMMY) { \
+                const __m256i q5 = _mm256_cmpeq_epi8(s2, five_vec); \
+                sbt = Sgn ? _mm256_andnot_si256(q5, sbt) : avx2_blendv_u8(q5, sft_vec, sbt); \
+            } \
             if (HasFreed) \
                 sbt = _mm256_blendv_epi8(sbt, freedval256, \
                                          _mm256_cmpeq_epi8(s2, active_frread)); \
-            __m256i m11 = _mm256_adds_epu8(h00, sbt); \
-            if (APPLY_BND) m11 = _mm256_blendv_epi8(m11, zero_vec, s2); \
-            m11 = _mm256_subs_epu8(m11, sft_vec); \
-            const __m256i g = _mm256_max_epu8(m11, f11); \
-            const __m256i t = _mm256_subs_epu8(g, oe_vec); \
-            const __m256i h11 = _mm256_max_epu8(g, e11); \
-            imax_vec = _mm256_max_epu8(imax_vec, g); \
-            e11 = _mm256_max_epu8(t, _mm256_subs_epu8(e11, e_ins_vec)); \
+            __m256i m11; \
+            if (Sgn) { \
+                m11 = _mm256_adds_epi8(h00, sbt); \
+                if (APPLY_BND) m11 = _mm256_blendv_epi8(m11, sb_vec, s2); \
+            } else { \
+                m11 = _mm256_adds_epu8(h00, sbt); \
+                if (APPLY_BND) m11 = _mm256_blendv_epi8(m11, zero_vec, s2); \
+                m11 = _mm256_subs_epu8(m11, sft_vec); \
+            } \
+            const __m256i g = Sgn ? _mm256_max_epi8(m11, f11) : _mm256_max_epu8(m11, f11); \
+            const __m256i t = Sgn ? _mm256_subs_epi8(g, oe_vec) : _mm256_subs_epu8(g, oe_vec); \
+            const __m256i h11 = Sgn ? _mm256_max_epi8(g, e11) : _mm256_max_epu8(g, e11); \
+            imax_vec = Sgn ? _mm256_max_epi8(imax_vec, g) : _mm256_max_epu8(imax_vec, g); \
+            e11 = Sgn ? _mm256_max_epi8(t, _mm256_subs_epi8(e11, e_ins_vec)) \
+                      : _mm256_max_epu8(t, _mm256_subs_epu8(e11, e_ins_vec)); \
             _mm256_storeu_si256((__m256i*)(H1 + (j + 1) * SIMD_WIDTH8), h11); \
-            _mm256_storeu_si256((__m256i*)(F  + (j + 1) * SIMD_WIDTH8), \
-                                _mm256_max_epu8(t, _mm256_subs_epu8(f11, e_del_vec))); \
+            _mm256_storeu_si256((__m256i*)(F  + (j + 1) * SIMD_WIDTH8), Sgn \
+                                ? _mm256_max_epi8(t, _mm256_subs_epi8(f11, e_del_vec)) \
+                                : _mm256_max_epu8(t, _mm256_subs_epu8(f11, e_del_vec))); \
             if (j == qeNext) { \
                 _mm256_store_si256((__m256i*)(blockMax + qeBlk * SIMD_WIDTH8), imax_vec); \
                 qeBlk++; qeNext += QE_BLK; \
@@ -3153,6 +3188,10 @@ int kswv::kswv256_u8_impl(uint8_t seq1SoA[],
         /* Close the final (possibly partial) block; see kswv_neon_u8_impl. */
         _mm256_store_si256((__m256i*)(blockMax + ((ncol - 1) / QE_BLK) * SIMD_WIDTH8),
                            imax_vec);
+        /* Sgn: the row max back to the unsigned domain for the epilogue; the rescan below keeps
+         * comparing H and the checkpoints against the signed one (imax_h). */
+        const __m256i imax_h = imax_vec;
+        if (Sgn) imax_vec = _mm256_xor_si256(imax_vec, sb_vec);
 
         /* Block I - rowMax tracking. Same shape as NEON. */
         if (i > 0) {
@@ -3192,42 +3231,14 @@ int kswv::kswv256_u8_impl(uint8_t seq1SoA[],
         te_vec_lo = avx2_blendv_u8(cmp_lo_16, i_vec_s16, te_vec_lo);
         te_vec_hi = avx2_blendv_u8(cmp_hi_16, i_vec_s16, te_vec_hi);
 
-        /* Deferred query-end recovery; see the rescan in kswv_neon_u8_impl for
-         * the full derivation of why this is identical to the per-cell form. */
+        /* Deferred query-end recovery (avx2_lazy_qe); under Sgn the rescan compares H and the
+         * checkpoints against the signed row max, imax_h. */
         const int active_msk = _mm256_movemask_epi8(cmp0_active);
         if (active_msk)
-        {
-            __m256i iqe_vec = _mm256_set1_epi8((char)0xFF);
-            __m256i foundBlk = zero_vec;
-            const uint8_t *colIdx = this->colIdx8;
-            const int nblocks = (ncol + QE_BLK - 1) / QE_BLK;
-            for (int b = 0; b < nblocks; b++) {
-                __m256i reached = _mm256_cmpeq_epi8(
-                    _mm256_load_si256((const __m256i*)(blockMax + b * SIMD_WIDTH8)), imax_vec);
-                __m256i newly = _mm256_and_si256(
-                    _mm256_andnot_si256(foundBlk, reached), cmp0_active);
-                foundBlk = _mm256_or_si256(foundBlk, reached);
-                if (_mm256_movemask_epi8(newly)) {
-                    const int j0 = b * QE_BLK;
-                    const int j1 = (j0 + QE_BLK < ncol) ? (j0 + QE_BLK) : ncol;
-                    __m256i got = zero_vec;
-                    for (int j2 = j0; j2 < j1; j2++) {
-                        __m256i eq = _mm256_and_si256(
-                            _mm256_cmpeq_epi8(
-                                _mm256_loadu_si256((const __m256i*)(H1 + (j2 + 1) * SIMD_WIDTH8)),
-                                imax_vec),
-                            newly);
-                        iqe_vec = avx2_blendv_u8(
-                            _mm256_andnot_si256(got, eq),
-                            _mm256_loadu_si256((const __m256i*)(colIdx + j2 * SIMD_WIDTH8)),
-                            iqe_vec);
-                        got = _mm256_or_si256(got, eq);
-                    }
-                }
-                if ((_mm256_movemask_epi8(foundBlk) & active_msk) == active_msk) break;
-            }
-            qe_vec = avx2_blendv_u8(cmp0_active, iqe_vec, qe_vec);
-        }
+            qe_vec = avx2_blendv_u8(cmp0_active,
+                                    avx2_lazy_qe<false>(blockMax, H1, this->colIdx8, ncol, imax_h, cmp0_active,
+                                                        active_msk),
+                                    qe_vec);
 
         /* End-score check + freeze update. */
         __m256i cmp_end = avx2_cmpge_u8(gmax_vec, endsc_vec);

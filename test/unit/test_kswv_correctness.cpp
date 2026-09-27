@@ -560,8 +560,9 @@ TEST_CASE("kswv u16 rescue: ROWPAIR/LAZYQE configurations agree, and one-row mat
 // against the independent scalar oracle.
 TEST_CASE("kswv u8 rescue: BWA3_RESCUE_USQADD off == on, and biased body matches scalar"
           * doctest::test_suite("unit/kswv")) {
-#if !defined(__ARM_NEON) && !defined(__aarch64__)
-    MESSAGE("skipped: BWA3_RESCUE_USQADD affects the NEON u8 rescue kernel only");
+#if (!defined(__ARM_NEON) && !defined(__aarch64__) && !defined(__AVX2__)) || defined(__AVX512BW__)
+    MESSAGE("skipped: BWA3_RESCUE_USQADD affects the NEON and AVX2 u8 rescue kernels only, and this "
+            "build binds " << kKswvTier);
     return;
 #else
     auto mat = bwa_tests::build_scoring_matrix(1, 4, 1);
@@ -616,6 +617,34 @@ TEST_CASE("kswv u8 rescue: BWA3_RESCUE_USQADD off == on, and biased body matches
             << oracle_mism << " over " << pairs.size() << " pairs");
     CHECK(drift == 0);
     CHECK(oracle_mism == 0);
+
+    // The AVX2 signed-domain FScan body takes gap constants up to 127 as positive int8 and falls
+    // back to the biased FScan body above that; off must equal on at the boundary (open-plus-extend
+    // 127, reached by a large open and by a large extend) and one past it (128), and the default
+    // (on) arm must match the independent scalar oracle at each.
+    const int gaps[][2] = {{100, 27}, {6, 121}, {121, 7}};
+    for (const auto &g : gaps) {
+        CAPTURE(g[0]); CAPTURE(g[1]);
+        std::vector<kswr_t> off, on;
+        {
+            ScopedEnv uq("BWA3_RESCUE_USQADD", "0");
+            off = bwa_tests::run_kswv_batch(pairs, mat, g[0], g[1]);
+        }
+        {
+            ScopedEnv uq("BWA3_RESCUE_USQADD", "1");
+            on = bwa_tests::run_kswv_batch(pairs, mat, g[0], g[1]);
+        }
+        REQUIRE(off.size() == on.size());
+        int gdrift = 0, gmism = 0;
+        for (size_t i = 0; i < off.size(); i++) {
+            gdrift += !kswr_all_fields_eq(off[i], on[i]);
+            const kswr_t sc = bwa_tests::run_scalar_ksw(pairs[i], mat, g[0], g[1]);
+            gmism += !(bwa_tests::kswr_score_eq(sc, on[i]) && bwa_tests::kswr_coords_eq(sc, on[i])
+                       && bwa_tests::kswr_score2_eq(sc, on[i]));
+        }
+        CHECK(gdrift == 0);
+        CHECK(gmism == 0);
+    }
 #endif
 }
 
@@ -628,7 +657,8 @@ TEST_CASE("kswv u8 rescue: BWA3_RESCUE_USQADD off == on, and biased body matches
 // messages). The CI rows build NEON and AVX2; the AVX-512BW bodies are reached
 // only by an arch=avx512bw build run on AVX-512BW hardware. For each body the flag reaches -- on NEON one-row, two-row
 // inline argmax, two-row lazy, and the biased (USQADD=0) two-row body; on x86
-// the one body per tier, which the other toggles do not reach -- one batch runs
+// the one body per tier (on AVX2 its signed-domain form, which USQADD also
+// selects, is the default) -- one batch runs
 // with FSCAN off then on and must agree on every field. The FSCAN arm of the
 // default configuration is also checked against the independent scalar
 // oracle. build_edge_cases' ragged lengths put pad rows and pad columns in most
@@ -659,8 +689,11 @@ TEST_CASE("kswv u8 rescue: BWA3_RESCUE_FSCAN off == on in every u8 body, and FSC
         {"two-row inline",  "1", "0", "1", false},
         {"two-row lazy",    "1", "1", "1", true},   // the production default
         {"two-row biased",  "1", "1", "0", false},
+#elif defined(__AVX512BW__)
+        {"x86",             "1", "1", "1", true},   // toggles other than FSCAN do not reach AVX-512BW
 #else
-        {"x86",             "1", "1", "1", true},   // toggles other than FSCAN are NEON-only
+        {"x86",             "1", "1", "1", true},   // AVX2: the signed-domain FScan body
+        {"x86 biased",      "1", "1", "0", false},  // AVX2: the biased FScan body (USQADD=0)
 #endif
     };
     int oracle_mism = 0;
@@ -1032,8 +1065,11 @@ void check_fscan_off_on(const std::string &what, const std::vector<bwa_tests::Te
         {"two-row inline", "1", "0", "1", false},
         {"two-row lazy",   "1", "1", "1", true},   // the production default
         {"two-row biased", "1", "1", "0", false},  // u8 only: USQADD has no 16-bit body
+#elif defined(__AVX512BW__)
+        {"x86",            "1", "1", "1", true},   // toggles other than FSCAN do not reach AVX-512BW
 #else
-        {"x86",            "1", "1", "1", true},   // toggles other than FSCAN are NEON-only
+        {"x86",            "1", "1", "1", true},   // AVX2: the signed-domain FScan body
+        {"x86 biased",     "1", "1", "0", false},  // AVX2 u8 only: the biased FScan body (USQADD=0)
 #endif
     };
     auto runs = [use16](const Config &c) { return !(use16 && std::strcmp(c.usqadd, "0") == 0); };

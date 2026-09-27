@@ -251,7 +251,11 @@ esac
 host_tier="$(BWAMEM3_DEBUG_SIMD=1 "$BIN" 2>&1 | sed -n 's/.*SIMD tier: \([a-z0-9]*\).*/\1/p' | head -1 || true)"
 
 # The reference: every shortcut and alternative kernel form off. Defined once so
-# the unforced and forced-tier references cannot drift apart.
+# the unforced and forced-tier references cannot drift apart. Some kernel forms
+# have no switch and so run in both legs: the lazy query end of the x86 bodies
+# (BWA3_RESCUE_LAZYQE reaches only the NEON two-row sweep) and the AVX-512BW u8
+# cell's form (BWA3_RESCUE_USQADD reaches NEON and the AVX2 FScan body); the
+# kswv unit tests check those against the scalar ksw_align2.
 REF_ENV=(BWA3_RESCUE_PRUNE=0 BWA3_RESCUE_BAND=0 BWA3_RESCUE_DEDUP_SKIP=0 BWA3_RESCUE_REPEAT=0
     BWA3_RESCUE_FSCAN=0 BWA3_RESCUE_USQADD=0 BWA3_RESCUE_ROWPAIR=0 BWA3_RESCUE_LAZYQE=0)
 
