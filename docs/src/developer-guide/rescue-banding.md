@@ -6,7 +6,7 @@ Pruning narrows a rescue window to the hull of the diagonal components that can 
 
 Two facts carry the argument, both in the header of `src/rescue_band.h`:
 
-- Every alignment scoring at least a threshold tau lies inside one diagonal component at tau, because the 5-mer bound falls by one per diagonal while a gap excursion costs at least two per diagonal. The component also bounds where the alignment can start and end.
+- Every alignment scoring at least a threshold tau lies inside one diagonal component at tau, because at the default scoring the 5-mer bound falls by one per diagonal while a gap excursion costs at least two per diagonal (at other scorings, K-mers up to 8 and the charge c, `src/rescue_prune.h`). The component also bounds where the alignment can start and end.
 - A zero-state DP restricted to any set of cells never exceeds the full DP, and is exact on every cell of every alignment the set contains. Widening a band, as grouping lanes into one vector does (16 on NEON, 32 on AVX2), keeps both properties, and so does skipping cells that do not exist in the full DP. Gate: `Banded rescue == kswv (rescue_band_harness, generated jobs)`.
 
 So the per-row maximum over the bands is at most the true one, and equal on every row where an alignment above the threshold ends: that is enough to recover the score, the end positions and the suboptimal score. Gates: `Banded rescue == kswv (rescue_band_harness, generated jobs)`, `rescue_prune_identity.sh`.

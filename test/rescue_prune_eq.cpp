@@ -9,8 +9,10 @@
  * (a cnt - c), the mw / hw bits (bnd >= minsc, and cnt > 0) on [0, nd) and clear on [nd, nd + 64),
  * which band planning reads as whole 64-diagonal words -- and its component list (runs of
  * bnd >= minsc with a hit: a, b, ub, i0, dmax) with its count. The scoring varies too: the default
- * half of the time, else one of SCORINGS (c = 2, a = 2 and 3, large gap opens, split gap costs),
- * through rescue_prune_params. At c = 2 a single-hit diagonal has weight a - c < 0, the case a hit
+ * half of the time, else one of SCORINGS (c = 2, a = 2 and 3, large gap opens, split gap costs, and
+ * scorings that admit K-mers of 6 to 8), through rescue_prune_params; the scalar reference's tables
+ * are cleared in full every 64 jobs, so the wrapper's scalar filter, which resets only the codes the
+ * previous query touched, is checked against a clean one. At c = 2 a single-hit diagonal has weight a - c < 0, the case a hit
  * test of the form P(d) >= P(d - 1) gets wrong. Half of the jobs run twice in a row, the second time from a
  * copy of the bytes in other buffers, which exercises the filter's repeat memo: the repeat must
  * return the same decision and view as the first call, and must not answer the same job at another
@@ -54,16 +56,22 @@ namespace {
 
 using rescue_prune_neon::Comp;
 
-/* K = 5 scorings the SIMD filters take (a, b, o_del, e_del, o_ins, e_ins), at minsc = k a. */
-const int SCORINGS[][6] = {
-    {1, 4, 8, 2, 8, 2},     // -O 8 -E 2: c = 2
-    {1, 4, 6, 2, 6, 2},     // -E 2: c = 2
-    {1, 6, 6, 1, 6, 1},     // -B 6
-    {1, 9, 16, 1, 16, 1},   // -x intractg: tail offset 12
-    {2, 8, 12, 2, 12, 2},   // -A 2 scaled: a = 2, c = 2
-    {1, 4, 6, 1, 7, 2},     // -O 6,7 -E 1,2
-    {3, 12, 18, 3, 18, 3},  // a = 3
-    {1, 4, 6, 200, 6, 200}, // -E 200: c = 200, past the int16 headroom on short windows (FALLBACK)
+/* Scorings (a, b, o_del, e_del, o_ins, e_ins, k_max), at minsc = k a: K = 5 ones, and ones admitting
+ * K > 5 at k_max 6-8, which the NEON filter takes with exact matching (under the relation, and on
+ * x86, the scalar filter decides them). */
+const int SCORINGS[][7] = {
+    {1, 4, 8, 2, 8, 2, 5},       // -O 8 -E 2: c = 2
+    {1, 4, 6, 2, 6, 2, 5},       // -E 2: c = 2
+    {1, 6, 6, 1, 6, 1, 5},       // -B 6
+    {1, 9, 16, 1, 16, 1, 5},     // -x intractg: tail offset 12
+    {2, 8, 12, 2, 12, 2, 5},     // -A 2 scaled: a = 2, c = 2
+    {1, 4, 6, 1, 7, 2, 5},       // -O 6,7 -E 1,2
+    {3, 12, 18, 3, 18, 3, 5},    // a = 3
+    {1, 4, 6, 200, 6, 200, 5},   // -E 200: c = 200, past the int16 headroom on short windows (FALLBACK)
+    {1, 6, 6, 1, 6, 1, 8},       // -B 6: K = 7
+    {1, 9, 16, 1, 16, 1, 8},     // -x intractg: K = 8
+    {1, 8, 6, 1, 6, 1, 6},       // -B 8 at k_max 6: K = 6
+    {2, 16, 16, 2, 16, 2, 8},    // -A 2 -B 16 -O 16 -E 2: a = 2, K = 8
 };
 const int NSCORINGS = (int)(sizeof SCORINGS / sizeof SCORINGS[0]);
 
@@ -72,7 +80,7 @@ rescue_prune_params scoring(int which, int k)
 {
     if (which < 0) return rescue_prune_params::defaults(k);
     const int *x = SCORINGS[which];
-    return rescue_prune_params::from(x[0], x[1], x[2], x[3], x[4], x[5], k * x[0]);
+    return rescue_prune_params::from(x[0], x[1], x[2], x[3], x[4], x[5], k * x[0], 5, x[6]);
 }
 
 /* Whether the SIMD filter decides a and b alike: the same threshold, relation and bound weights.
@@ -154,6 +162,10 @@ void run_one(const uint8_t *ref, int len1, const uint8_t *q, int len2, const res
     static rescue_prune_scratch r;
     if (!p.valid) return;   // (a threshold the scoring refuses: rescue_prune_window returns FULL)
     const int minsc = p.minsc;
+    /* Now and then the reference's tables are cleared in full, so the wrapper's scalar scratch, which
+     * resets only the codes the previous query touched, is checked against a clean one. */
+    static long nref = 0;
+    if (nref++ % 64 == 0) r.clear_tables();
     /* rescue_prune_window's own guards return FULL before either filter runs */
     const bool guarded = minsc < 5 || len1 < 5 || len2 < 5 || len2 > rescue_prune_scratch::QCAP || len1 > 30000;
     int h0 = -1, e0 = -1;
@@ -193,14 +205,16 @@ void run_one(const uint8_t *ref, int len1, const uint8_t *q, int len2, const res
         if (ok && rep == 1 && !same_view(view[0], view[1])) { ok = false; why = "repeat view differs"; }
         if (ok && view[rep].repeat != hit) { ok = false; why = "view.repeat disagrees with the memo counter"; }
         /* The memo may answer only a byte-for-byte repeat of the previous call that reached the
-         * SIMD filter (the wrapper's guards return before it, leaving its memo alone). */
+         * SIMD filter (the wrapper's guards return before it, and a scoring the SIMD filter does not
+         * take, such as K > 5 under the relation, goes to the scalar filter: both leave its memo
+         * alone). */
         static std::vector<uint8_t> last_ref, last_q;
         static int last_mh = -1;
         static rescue_prune_params last_p;
         const bool repeat = max_hits == last_mh && same_filter(p, last_p) && last_ref.size() == (size_t)len1 && last_q.size() == (size_t)len2
                             && std::equal(R, R + len1, last_ref.begin()) && std::equal(Q, Q + len2, last_q.begin());
         if (ok && hit && !repeat) { ok = false; why = "memo answered a job that does not repeat the previous one"; }
-        if (!guarded) {
+        if (!guarded && p.simd_ok()) {
             last_ref.assign(R, R + len1);
             last_q.assign(Q, Q + len2);
             last_mh = max_hits;

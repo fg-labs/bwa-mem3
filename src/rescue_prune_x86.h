@@ -450,6 +450,7 @@ static inline Kind lean_x86(const Job &jb, X86Scratch &s, int &hb, int &he, int 
 {
     return lean_memo(jb, s, hb, he, max_hits, minsc, wt, relx,
                      [](const Job &j, X86Scratch &t, int &b, int &e, int mh, int ms, const Wt &w, int rx) {
+                         if (w.K != 5) return FALLBACK;   // K = 5 only (simd_ok): the scalar filter decides
                          if (rx < 0)
                              return w.dflt() ? lean_x86_core<false, false>(j, t, b, e, mh, ms, w, -1)
                                              : lean_x86_core_gen<true, false>(j, t, b, e, mh, ms, w, -1);

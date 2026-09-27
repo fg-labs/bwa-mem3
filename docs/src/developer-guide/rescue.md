@@ -2,7 +2,7 @@
 
 Mate rescue is the batched Smith-Waterman of a read's mate against the reference window its insert-size distribution allows, run when a pair did not place concordantly. It is one of the costliest stages of paired-end alignment, and a stack of shortcuts now runs inside it. Every one of them is exact: it may skip work, never change what the aligner writes (Gate: `rescue_prune_identity.sh`, and the rest under [How exactness is enforced](#how-exactness-is-enforced)). This page is the map; the sub-pages carry the arguments.
 
-- [Exact window pruning](rescue-pruning.md): the 5-mer bound that proves a job cannot reach the rescue threshold, or narrows its window to a hull.
+- [Exact window pruning](rescue-pruning.md): the K-mer bound that proves a job cannot reach the rescue threshold, or narrows its window to a hull.
 - [Banded rescue DP](rescue-banding.md): the DP of a narrowed job run only inside the diagonal bands that can hold an alignment, for both rescue passes.
 - [The 11-op rescue cell](rescue-kswv.md): the kswv cell rebuilt around the score before the in-row gap, on every SIMD tier.
 
@@ -22,7 +22,7 @@ All per-batch rescue state lives in `mem_cache`, one slot per tid (`rescue_narro
 
 | Shortcut | Runs when | Turned off by |
 |---|---|---|
-| Exact pruning | a SIMD filter, so aarch64 or an x86 AVX2 / AVX-512BW build (`rescue_prune_on`), a scoring the lemma holds for (`rescue_prune_params::from`), `--meth` only on aarch64, with EM-seq chemistry on converted copies or with TAPS chemistry under the exact relation (`rescue_meth_rel`), on x86 only where the SIMD filter runs and not at the AVX-512BW tier from `-k 25` (`rescue_prune_runs`), a job on either kswv width, no `--rescue-kmer` (`rescue_prune_applies`) | `BWA3_RESCUE_PRUNE=0`; under `--meth=taps`, `BWA3_RESCUE_PRUNE_REL=0` |
+| Exact pruning | a SIMD filter, so aarch64 or an x86 AVX2 / AVX-512BW build (`rescue_prune_on`), a scoring the lemma holds for (`rescue_prune_params::from`), `--meth` only on aarch64, with EM-seq chemistry on converted copies or with TAPS chemistry under the exact relation (`rescue_meth_rel`), on x86 only where the SIMD filter runs and not at the AVX-512BW tier from `-k 25` (`rescue_prune_runs`), a job on either kswv width, no `--rescue-kmer` (`rescue_prune_applies`); K-mers longer than 5 where the scoring admits them, on aarch64 without `--meth` (`rescue_prune_kmax`) | `BWA3_RESCUE_PRUNE=0`; under `--meth=taps`, `BWA3_RESCUE_PRUNE_REL=0`; K > 5 only, `BWA3_RESCUE_PRUNE_KMAX=5` |
 | Banded pass 0 | a NEON or AVX2 band kernel (`rescue_band_enabled`), a pruned 8-bit job (at any scoring pruning admits; under `--meth` only where `rescue_band_meth_on` holds, by default the relation's runs) whose band plan beats the hull (`RescueBandBatch::plan`) | `BWA3_RESCUE_BAND=0`, `BWA3_RESCUE_PRUNE=0`; under `--meth`, `BWA3_RESCUE_BAND_METH=0` |
 | Banded pass 1 | a NEON or AVX2 band kernel (`rescue_band_enabled`), every 8-bit job whose band is cheaper than kswv, narrowed or not (`RescueBandBatch::take_pass1`): at any scoring the band kernels take and any seed length (`rescue_band_runs`, `rb_scoring`), and under `--meth`, with the OT / OB group's matrix, by default where `--meth` does not prune on converted copies (`rescue_band_meth_on`; `BWA3_RESCUE_BAND_METH=2` bands it in every `--meth` run) | `BWA3_RESCUE_BAND_P1=0`, `BWA3_RESCUE_BAND=0`, `BWA3_RESCUE_PRUNE=0`; under `--meth`, `BWA3_RESCUE_BAND_METH=0` |
 | 11-op kswv cell | every SIMD kswv body, when the gap costs admit it (`fscan_scoring_ok`) | `BWA3_RESCUE_FSCAN=0` |

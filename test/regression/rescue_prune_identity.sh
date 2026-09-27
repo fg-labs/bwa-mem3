@@ -63,9 +63,11 @@
 # match too: the SIMD filters run at any threshold, but at the AVX-512BW kswv
 # tier x86 prunes nothing there (its cost gate, rescue_prune_cost_ok) while it
 # still bands pass 1, so the stats must show banded pass-1 jobs, and filtered
-# jobs on every other tier and none at AVX-512BW. Two scorings other than the
-# default must match the reference at the same scoring too: -B 6 and
-# -O 8 -E 2, which the SIMD filters take, so their stats must show filtered
+# jobs on every other tier and none at AVX-512BW. Three scorings other than the
+# default must match the reference at the same scoring too: -B 6, -x intractg
+# and -O 8 -E 2, which the SIMD filters take (the first two with longer K-mers
+# where the build's K cap admits them: 7- and 8-mers on aarch64), so their
+# stats must show filtered
 # jobs and narrowed windows wherever they run, and a leg with every bandable
 # hull banded must match as well and show banded parents; and -B 3, which the
 # lemma refuses, so no filtered job. The band kernels take all three, so each
@@ -318,8 +320,9 @@ if [ "$has_simd" = 1 ]; then
 fi
 
 # Other scorings (rescue_prune_params) and --meth, each against the reference at the same options.
-# -B 6 (the default's bound weights) and -O 8 -E 2 (the per-diagonal charge c = 2, where a
-# single-hit diagonal weighs a - c < 0) the SIMD filters take, so they prune and narrow wherever
+# -B 6 (K = 7 where the K cap admits it, else the default's bound weights), -x intractg (K = 8, or
+# 5 with the tail offset 12) and -O 8 -E 2 (the per-diagonal charge c = 2, where a single-hit
+# diagonal weighs a - c < 0) the SIMD filters take, so they prune and narrow wherever
 # those run, and bands planned at them must hold (a leg with every bandable hull banded); -B 3 the
 # lemma refuses, so it prunes nowhere. The band kernels take all three, so each must band pass 1
 # (rescue_band_runs). The --meth legs read the same pairs as bisulfite reads (--meth writes SAM,
@@ -401,6 +404,7 @@ check_scoring() { # $1 = label, $2 = expectation, rest = mem options
     sc_note="$sc_note; $label: jobs=${sj:-0} b2=${sb2:-0} pass1_banded=${sp1:-0}"
 }
 check_scoring "-B 6" simd -B 6
+check_scoring "-x intractg" simd -x intractg
 check_scoring "-O 8 -E 2" simd -O 8 -E 2
 check_scoring "-B 3" none -B 3
 # -A 2 scales the other costs with it (-B 8 -O 12 -E 2), so every rescue job is 16-bit (150 bp

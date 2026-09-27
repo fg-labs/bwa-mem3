@@ -1,6 +1,6 @@
 /* Exact banded mate-rescue DP (passes 0 and 1 of the 8-bit kswv rescue path).
  *
- * rescue_prune.h narrows a rescue window to the hull of the 5-mer diagonal components whose bound
+ * rescue_prune.h narrows a rescue window to the hull of the K-mer diagonal components whose bound
  * reaches minsc. This file goes further: it runs the pass-0 DP only inside the diagonal BANDS of
  * those components, and reassembles exactly the kswv outputs {score, te, qe, score2} of the hull
  * job from the bands' per-row maxima; pass 1 (start recovery, tb / qb) then runs in a band derived

@@ -392,6 +392,81 @@ TEST_CASE("rescue prune: decisions at other scorings reproduce every consumed ks
     }
 }
 
+// K > 5: a scoring whose mismatch and gap costs admit longer K-mers filters with them, up to the
+// caller's k_max (-B 6: K = 7; -x intractg: K = 10, capped at 8; -B 8 at k_max 6: K = 6). Each job at
+// one of them in rotation through the ksw_align2 oracle, and the wrapper (on aarch64 the NEON K-mer
+// filter, on x86 the scalar one) against a scalar filter whose tables are cleared in full every few
+// jobs, which checks the touched-code reset of the tables the wrapper keeps across queries.
+TEST_CASE("rescue prune: K-mer decisions up to K = 8 reproduce ksw_align2 and the scalar filter"
+          * doctest::test_suite("unit/pair")) {
+    std::mt19937 rng(9001);
+    const auto jobs = build_jobs(rng);
+    struct Sc { int a, b, o_del, e_del, o_ins, e_ins, kmax, K; const char *name; };
+    const Sc sc[3] = {{1, 6, 6, 1, 6, 1, 8, 7, "-B 6"}, {1, 9, 16, 1, 16, 1, 8, 8, "-x intractg"},
+                      {1, 8, 6, 1, 6, 1, 6, 6, "-B 8 at k_max 6"}};
+    Tally t[3];
+    std::unique_ptr<rescue_prune_scratch> fresh(new rescue_prune_scratch());
+    int n_simd = 0;
+    for (size_t i = 0; i < jobs.size(); i++) {
+        const Sc &s = sc[i % 3];
+        const std::string name(s.name);
+        CAPTURE(name);
+        const rescue_prune_params p = rescue_prune_params::from(s.a, s.b, s.o_del, s.e_del, s.o_ins, s.e_ins,
+                                                                kSimdMinsc * s.a, 5, s.kmax);
+        REQUIRE(p.valid);
+        REQUIRE(p.K == s.K);
+        const auto mat = bwa_tests::build_scoring_matrix(s.a, s.b, 1);
+        Oracle o(jobs[i], p, mat);
+        check_against_oracle(kNoGate, o, t[i % 3]);
+        const Job &jb = jobs[i];
+        const int len1 = (int)jb.ref.size(), len2 = (int)jb.q.size();
+        if (i % 8 == 0) fresh->clear_tables();
+        int hb = -2, he = -2, shb = -2, she = -2;
+        rescue_prune_view v;
+        const int kind = rescue_prune_window(jb.ref.data(), len1, jb.q.data(), len2, p, kDefaultMaxHits, &hb, &he, &v);
+        const int skind = rescue_prune_window_scalar(jb.ref.data(), len1, jb.q.data(), len2, p, kDefaultMaxHits,
+                                                     *fresh, &shb, &she);
+        CAPTURE(jb.tag); CAPTURE(len1); CAPTURE(len2);
+        CHECK(kind == skind);
+        if (kind == RESCUE_PRUNE_B2 && skind == RESCUE_PRUNE_B2) {
+            CHECK(hb == shb);
+            CHECK(he == she);
+        }
+        n_simd += kind == RESCUE_PRUNE_B2 && v.bnd16 != nullptr;
+    }
+    for (int k = 0; k < 3; k++) {
+        const std::string name(sc[k].name);
+        CAPTURE(name);
+        MESSAGE(name << ": B1=" << t[k].b1 << " B2=" << t[k].b2 << " FULL=" << t[k].full);
+        CHECK(t[k].b1 > 0);
+        CHECK(t[k].b2 > 0);
+    }
+#if defined(__aarch64__)
+    CHECK(n_simd > 0);   // the NEON filter decided some of them, not only the scalar fallback
+#endif
+}
+
+// rescue_prune_params::from takes the largest valid K up to its cap: where the costs admit a K that
+// fails the charge (c > 0) or the threshold (minsc > (K - 1) a), a smaller K that passes is taken
+// rather than refusing the scoring, so raising the cap never turns pruning off.
+TEST_CASE("rescue prune: the K cap takes the largest valid K, never refusing a scoring a smaller K admits"
+          * doctest::test_suite("unit/pair")) {
+    // -B 6 -O 6,5 -E 1: the costs admit K = 7, whose insertion charge 5 + 1 - 6 is 0; K = 6 passes.
+    rescue_prune_params p = rescue_prune_params::from(1, 6, 6, 1, 5, 1, kSimdMinsc, 5, 8);
+    CHECK(p.valid);
+    CHECK(p.K == 6);
+    CHECK(p.c == 1);
+    // -B 6 at minsc 6 (-k 6): K = 7 needs minsc > 6; K = 6 passes, as K = 5 did before the cap rose.
+    p = rescue_prune_params::from(1, 6, 6, 1, 6, 1, 6, 5, 8);
+    CHECK(p.valid);
+    CHECK(p.K == 6);
+    // The same scoring at minsc 19 takes K = 7, and a cap of 5 keeps K = 5.
+    CHECK(rescue_prune_params::from(1, 6, 6, 1, 6, 1, kSimdMinsc, 5, 8).K == 7);
+    CHECK(rescue_prune_params::from(1, 6, 6, 1, 6, 1, kSimdMinsc, 5, 5).K == 5);
+    // Every K refused (minsc 4 at -B 6 fails from K = 7 down to k_min 5): not valid.
+    CHECK(!rescue_prune_params::from(1, 6, 6, 1, 6, 1, 4, 5, 8).valid);
+}
+
 // --meth: the filter matches C -> T (OT) or G -> A (OB) converted copies of the window and the mate,
 // which over-counts hits under every meth matrix, so its decisions must reproduce ksw_align2 with the
 // matrix itself (mat[ref * 5 + read], built by mem_opt_fill_meth_mat through
