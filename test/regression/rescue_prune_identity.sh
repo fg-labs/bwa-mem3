@@ -55,7 +55,8 @@
 # (NEON) and x86 builds whose SIMD floor is avx2 or avx512bw, at the fixture's
 # default -k 19 (src/bwamem_pair.cpp rescue_prune_on, rescue_prune_runs,
 # rescue_band_enabled). There, the stats must show proven failures, narrowed
-# windows, fewer rows kept than examined and (with the gate opened) banded
+# windows (among them 16-bit jobs', which are pruned but never banded), fewer
+# rows kept than examined and (with the gate opened) banded
 # parents, or the identity would be vacuous; in a build without them (an x86
 # floor below avx2) the pruning legs take the same path and their non-vacuity
 # check is reported as skipped. A reference and a default leg at -k 25 must
@@ -453,6 +454,9 @@ fi
 [ "$b1" -gt 0 ] || fail "no proven-failure (B1) rescue in the fixture: $stats"
 [ "$b2" -gt 0 ] || fail "no narrowed (B2) rescue in the fixture: $stats"
 [ "$rows_kept" -lt "$rows_in" ] || fail "pruning kept every row: $stats"
+# The 300 bp mates run on the 16-bit kswv kernels, which prune too (never band): some must narrow.
+b2_16=$(field b2_16)
+[ "${b2_16:-0}" -gt 0 ] || fail "no narrowed (B2) 16-bit rescue job (the 300 bp mates stopped being pruned): $stats"
 # The anchors present three times rescue the same mate against identical windows: the repeats
 # after the first must be answered from its result (BWA3_RESCUE_REPEAT), or that path went untested.
 reused=$(field reused)

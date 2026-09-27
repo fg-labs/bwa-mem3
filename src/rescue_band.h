@@ -165,7 +165,9 @@ public:
     /* Plan the bands of a B2 hull [hb, he] of a full window of len1 rows against a query of len2.
      * v must be the view rescue_prune_window returned with that decision under p (the scoring and
      * threshold), which must be the batch's scoring (set_scoring, and under --meth the group's
-     * matrix, set_matrix); the caller guarantees the 8-bit path (rescue_prune_applies).
+     * matrix, set_matrix); the caller guarantees the 8-bit path: rescue_prune_applies admits both
+     * kswv widths, so mem_matesw_batch_pre plans only a job with KSW_XBYTE set, and plan() does
+     * not check the width itself.
      * Returns true when banding is chosen (the cost model says it beats kswv on the hull);
      * commit() then binds it to the pair's regid. */
     bool plan(const rescue_prune_view &v, const rescue_prune_params &p, int len1, int len2, int hb, int he);

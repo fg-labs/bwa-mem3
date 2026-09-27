@@ -8,7 +8,9 @@
  * It is its own header because more than the kernels depend on it: the exact
  * rescue-pruning filter (rescue_prune.h) bounds how far past its last hit an
  * alignment can extend by the pad columns, which score like matches, so its hull
- * must use the same quantum the kernel pads to. Both read it from here. */
+ * must use at least the quantum the kernel pads to. It uses the 8-bit quantum on
+ * jobs of both widths, which is never less than the 16-bit one. Both read it from
+ * here. */
 #ifndef BWA_MEM3_KSWV_QUANTUM_H
 #define BWA_MEM3_KSWV_QUANTUM_H
 

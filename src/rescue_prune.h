@@ -33,7 +33,9 @@
  *                     >= minsc starts at or after the first 5-run of its component (the prefix
  *                     before it nets <= 0), and the tail after its last hit nets <= -(2 + D) per
  *                     gap, which bounds the extent to (last hit diagonal) + quanta - 1 +
- *                     (ub - minsc - 2) at the defaults (rescue_prune_params::tail in general).
+ *                     (ub - minsc - 2) at the defaults (rescue_prune_params::tail in general),
+ *                     quanta being the 8-bit kernels' query padding, which is at least the
+ *                     16-bit kernels' (kswv_quantum.h), so the bound holds on both widths.
  *   RESCUE_PRUNE_FULL no pruning (N present, lengths too short or too long, a scoring or threshold
  *                     the lemma does not hold for -- at the defaults minsc < 5 -- or too many hits
  *                     to be worth it).
@@ -347,12 +349,15 @@ static inline uint64_t rescue_prune_memo_hits()
  * pruned windows can be banded (no --meth): banding turns more of the pruned windows into savings,
  * which pays for the filter on the denser windows (best of {400, 1000, 3000, 10^4, 10^9} measured on
  * WGS-like data at minsc 19). The SIMD filter runs at every minsc, so the gate does not depend on
- * it, and scorings the scalar filter decides (a > 16) take 1000 on aarch64 too. A --meth pruning run
- * never bands its pruned windows (rescue_band_meth_on), so it takes 400 (Graviton 4, EM-seq panel
- * 5 M pairs, wall, 400 vs 1000: genomic -3.3 %, collapsed -B 4 flat). On x86, 400 with banding too:
- * the x86 kswv kernels are cheap enough that the extra filter work on dense windows does not pay
- * (prune + band, wall, 1000 vs 400: Zen 3 AVX2 wgs-5M 74.52 vs 73.57 s, wes-5M 38.57 vs 37.65 s;
- * Zen 5 AVX-512 wgs-5M 27.53 vs 26.73 s). Output is identical at every value. */
+ * it; 16-bit jobs (pruned but never banded) and scorings the scalar filter decides (a > 16) take
+ * 1000 on aarch64 too. The 16-bit pruning figures (Graviton 4, prune on vs off, -t 16, wgs-5M /
+ * wes-5M: -A 2 -10.0 / -14.9 %, -A 3 -B 12 -O 18 -E 3 -9.3 / -13.3 %, every job 16-bit) are whole
+ * runs at that gate; 400 for those jobs has not been measured. A --meth pruning run never bands its
+ * pruned windows (rescue_band_meth_on), so it takes 400 (Graviton 4, EM-seq panel 5 M pairs, wall,
+ * 400 vs 1000: genomic -3.3 %, collapsed -B 4 flat). On x86, 400 with banding too: the x86 kswv
+ * kernels are cheap enough that the extra filter work on dense windows does not pay (prune + band,
+ * wall, 1000 vs 400: Zen 3 AVX2 wgs-5M 74.52 vs 73.57 s, wes-5M 38.57 vs 37.65 s; Zen 5 AVX-512
+ * wgs-5M 27.53 vs 26.73 s). Output is identical at every value. */
 static inline int rescue_prune_max_hits_default(bool banding, bool meth)
 {
 #if defined(__aarch64__)
@@ -392,8 +397,10 @@ static inline bool rescue_prune_cost_ok(const rescue_prune_params &p, bool meth,
 #endif
 }
 
-/* Decide how much of a rescue window must be computed. Valid only on the 8-bit kernel path (the
- * hull bound assumes its query padding); the caller checks it.
+/* Decide how much of a rescue window must be computed, for a job on either kswv width. The hull
+ * bound counts the query-pad columns of the 8-bit kernels (kswv_query_quantum8) as matches; the
+ * 16-bit kernels pad to kswv_query_quantum16, which is never more, and score their pad columns
+ * no higher, so on a 16-bit job the bound only over-counts and both decisions stay exact.
  *   ref, len1   reference window, bases 0-3 (>= 4 is N)
  *   q, len2     oriented mate, bases 0-3 (>= 4 is N)
  *   p           the scoring and the rescue score threshold p.minsc (min_seed_len * a); an invalid

@@ -976,12 +976,17 @@ jobs:
       # kernels where production reaches them: the default collapsed scoring
       # (b = 2a, which --meth bands on aarch64 because pruning refuses it), the
       # non-Sym form under each band kernel, and random costs with random
-      # matrices. The trailing argument is the job generator's seed. Run 1 is
-      # 100000 jobs, runs 2-11 30000 and runs 12-16 10000.
+      # matrices. Runs 17-19 (RB_16BIT) send every job through kswv's 16-bit
+      # kernels, pruned but never banded as in production, with mates up to
+      # 1024 bp: at the default scoring, and with the hit gate opened (x86's
+      # default gate of 400 sends most mates over 250 bp to the full window) at a
+      # random scoring per batch and at random --meth matrices. The trailing
+      # argument is the job generator's seed. Run 1 is 100000 jobs, runs 2-11
+      # 30000, runs 12-16 10000, run 17 30000 and runs 18-19 10000.
       # On x86 the kswv reference runs at the runner's tier,
       # which the harness prints ("kswv tier:"). Longer runs and real dumps are
       # manual. As above, a negative control (one banded job's te shifted) must
-      # fail first.
+      # fail first, and a 16-bit one (one narrowed job's te shifted) too.
       - name: Banded rescue == kswv (rescue_band_harness, generated jobs)
         run: |
           if [ "${{ matrix.arch_flag }}" = "" ]; then arch=${{ matrix.baseline_arch || 'avx2' }}; else arch=${{ matrix.arch_flag }}; fi
@@ -990,6 +995,10 @@ jobs:
             cat rb_nc.log; echo "::error::negative control exited 0: the check missed an injected disagreement"; exit 1
           fi
           grep -q 'MISMATCHES=[1-9]' rb_nc.log || { cat rb_nc.log; echo "::error::negative control failed without reporting a MISMATCH"; exit 1; }
+          if RB_16BIT=1 RB_NEGATIVE_CONTROL=1 ./rescue_band_harness eq 3000 1 > rb_nc16.log 2>&1; then
+            cat rb_nc16.log; echo "::error::16-bit negative control exited 0: the check missed an injected disagreement"; exit 1
+          fi
+          grep -q 'MISMATCHES=[1-9]' rb_nc16.log || { cat rb_nc16.log; echo "::error::16-bit negative control failed without reporting a MISMATCH"; exit 1; }
           BWA3_RESCUE_BAND_COST=100000000 RB_SCALAR_STRIDE=7 ./rescue_band_harness eq 100000 1
           BWA3_RESCUE_BAND_COST=100000000 RB_MINSC=30 ./rescue_band_harness eq 30000 2
           BWA3_RESCUE_BAND_COST=100000000 BWA3_RESCUE_PRUNE_MAX_HITS=100000 ./rescue_band_harness eq 30000 3
@@ -1006,6 +1015,9 @@ jobs:
           BWA3_RESCUE_BAND_COST=100000000 RB_METH=random RB_SCORING=1,4,6,1,8,1 BWA3_RESCUE_BAND_KERNEL=1 ./rescue_band_harness eq 10000 14
           BWA3_RESCUE_BAND_COST=100000000 RB_METH=random RB_SCORING=1,4,6,1,8,1 BWA3_RESCUE_FSCAN=0 ./rescue_band_harness eq 10000 15
           BWA3_RESCUE_BAND_COST=100000000 RB_METH=random RB_SCORING=random ./rescue_band_harness eq 10000 16
+          RB_16BIT=1 ./rescue_band_harness eq 30000 17
+          RB_16BIT=1 BWA3_RESCUE_PRUNE_MAX_HITS=100000 RB_SCORING=random ./rescue_band_harness eq 10000 18
+          RB_16BIT=1 BWA3_RESCUE_PRUNE_MAX_HITS=100000 RB_METH=random ./rescue_band_harness eq 10000 19
 
       - name: Flat chaining index matches the kbtree replay (chr22)
         if: matrix.canonical == true
