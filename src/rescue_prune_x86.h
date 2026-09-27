@@ -11,6 +11,7 @@
  *  - step 6's bitsets are built after the backward scan from the diagonal-major bnd and cnt with
  *    MOVEMASK (mw = {bnd >= minsc}, hw = mw and {cnt > 0}), instead of per-step bytes transposed
  *    and scattered; NEON's hw test P(d) >= P(d - 1) is exactly cnt(d) >= 1.
+ * The --meth relation (Rel, relx >= 0) is lean_neon's, with the same entry tables and cap.
  * The threshold minsc (min_seed_len * a, 19 at defaults) is a runtime argument. */
 #ifndef BWA_MEM3_RESCUE_PRUNE_X86_H
 #define BWA_MEM3_RESCUE_PRUNE_X86_H
@@ -59,12 +60,18 @@ struct X86Scratch {
     Comp comps[COMP_CAP];
     int ncomp = 0;
     uint8_t pc[256];
+    // Rel: entries (j | next << 16), each code's latest entry (hd) and second-latest (sec)
+    static const int ECAP = rescue_prune_neon::REL_ECAP;
+    alignas(16) uint32_t ENT[ECAP];
+    int16_t hd[1024], sec[1024];
+    int qrel_c = -1;
+    bool q_over = false;
     uint8_t qcache[CAP];
     int qlen_c = -1;
     bool q_has_n = false;
     int view_nd = -1;
     bool memo_ok = false;
-    int memo_len1 = -1, memo_mh = 0, memo_minsc = 0, memo_hb = -1, memo_he = -1, memo_view_nd = -1;
+    int memo_len1 = -1, memo_mh = 0, memo_minsc = 0, memo_hb = -1, memo_he = -1, memo_view_nd = -1, memo_relx = -1;
     Kind memo_kind = FULL;
     Wt memo_wt;
     /* minsc and weights of the call that produced the view (the threshold of mw, hw and comps). */
@@ -143,10 +150,11 @@ static inline void x86_codes16(const uint8_t *buf, uint16_t *out)
     x86_st(out + 8, _mm_unpackhi_epi8(lo, a0));
 }
 
-/* Gen: general weights (rescue_prune_neon::Wt); !Gen is the default scoring's code, unchanged. */
-template <bool Gen>
+/* Gen: general weights (rescue_prune_neon::Wt); !Gen is the default scoring's code, unchanged. Rel:
+ * the --meth relation of relx (lean_neon_core); !Rel is the exact-match code, unchanged. */
+template <bool Gen, bool Rel>
 static inline Kind lean_x86_core(const Job &jb, X86Scratch &s, int &hb, int &he, int max_hits, int minsc,
-                                 const Wt &wt)
+                                 const Wt &wt, int relx)
 {
     const uint8_t *ref = jb.ref, *q = jb.qry;
     const int len1 = jb.len1, len2 = jb.len2;
@@ -167,7 +175,7 @@ static inline Kind lean_x86_core(const Job &jb, X86Scratch &s, int &hb, int &he,
     }
     const int quanta = ((len2 + 15) / 16) * 16, off = quanta, nd = len1 + quanta + 1;
     // ---- 2. query table (cached per oriented query), as lean_neon ----
-    if (len2 != s.qlen_c || memcmp(q, s.qcache, (size_t)len2) != 0) {
+    if (len2 != s.qlen_c || (Rel ? relx : -1) != s.qrel_c || memcmp(q, s.qcache, (size_t)len2) != 0) {
         uint8_t *qb = s.qbuf + 4;
         __m128i qv = _mm_setzero_si128();
         uint8_t qor = 0;
@@ -178,20 +186,45 @@ static inline Kind lean_x86_core(const Job &jb, X86Scratch &s, int &hb, int &he,
         s.q_has_n = (qor & 0xFC) != 0 || !_mm_testz_si128(qv, kFC);
         memcpy(s.qcache, q, (size_t)len2);
         s.qlen_c = len2;
+        s.qrel_c = Rel ? relx : -1;
+        s.q_over = false;
         if (!s.q_has_n && len2 >= 5) {
             memset(s.tab, 0, sizeof s.tab);
             memset(s.pres, 0, sizeof s.pres);
             for (int b = 0; b < len2; b += 16) x86_codes16(s.qbuf + b, s.qcode + b);
-            for (int jj = 4; jj < len2; jj++) {
-                const int c = s.qcode[jj];
-                const uint32_t old = s.tab[c], occ = (old >> 16) + 1;
-                s.nxt[jj] = occ == 1 ? (int16_t)-1 : (int16_t)(off - (old & 0x1FFF));
-                s.tab[c] = occ << 16 | (uint32_t)(off - jj) | (occ == 1 ? 0 : 0x2000);
-                s.pres[c >> 3] |= (uint8_t)(1u << (c & 7));
+            if (!Rel) {
+                for (int jj = 4; jj < len2; jj++) {
+                    const int c = s.qcode[jj];
+                    const uint32_t old = s.tab[c], occ = (old >> 16) + 1;
+                    s.nxt[jj] = occ == 1 ? (int16_t)-1 : (int16_t)(off - (old & 0x1FFF));
+                    s.tab[c] = occ << 16 | (uint32_t)(off - jj) | (occ == 1 ? 0 : 0x2000);
+                    s.pres[c >> 3] |= (uint8_t)(1u << (c & 7));
+                }
+            } else {   // as lean_neon_core
+                memset(s.hd, 0xFF, sizeof s.hd);
+                int ne = 0;
+                for (int jj = 4; jj < len2 && !s.q_over; jj++) {
+                    const int c = s.qcode[jj];
+                    int M = 0;
+                    for (int t = 0; t < 5; t++)
+                        if (qb[jj - t] == relx) M |= 2 << (2 * t);
+                    for (int sm = M;; sm = (sm - 1) & M) {
+                        if (ne == X86Scratch::ECAP) { s.q_over = true; break; }
+                        const int rc = c ^ sm;
+                        const uint32_t old = s.tab[rc], occ = (old >> 16) + 1;
+                        s.ENT[ne] = (uint32_t)jj | (uint32_t)(uint16_t)s.hd[rc] << 16;
+                        s.sec[rc] = s.hd[rc];
+                        s.hd[rc] = (int16_t)ne++;
+                        s.tab[rc] = occ << 16 | (uint32_t)(off - jj) | (occ == 1 ? 0 : 0x2000);
+                        s.pres[rc >> 3] |= (uint8_t)(1u << (rc & 7));
+                        if (!sm) break;
+                    }
+                }
             }
         }
     }
     if ((orv & 0xFC) || !_mm_testz_si128(ov, kFC) || s.q_has_n) return FULL;
+    if (Rel && s.q_over) return FULL;
     if (len1 < 5 || len2 < 5) return B1;
     if (__builtin_expect(nd + 32 > X86Scratch::CAP, 0)) return SCALAR;
 
@@ -291,7 +324,7 @@ static inline Kind lean_x86_core(const Job &jb, X86Scratch &s, int &hb, int &he,
             pack_runs(bp, bdp, brp, idx, d, r, m & 0xFF);
             const __m128i sh = x86_ld(s.shuf[m >> 8]);
             x86_st(mp, _mm_shuffle_epi8(r, sh));
-            x86_st(jp, _mm_shuffle_epi8(_mm_sub_epi16(koff, tv), sh));
+            x86_st(jp, _mm_shuffle_epi8(Rel ? x86_ld(s.PC + k0) : _mm_sub_epi16(koff, tv), sh));   // Rel: the code
             mp += s.pc[m >> 8]; jp += s.pc[m >> 8];
         }
         n = (int)(mp - s.RA);
@@ -316,7 +349,17 @@ static inline Kind lean_x86_core(const Job &jb, X86Scratch &s, int &hb, int &he,
         uint16_t *R = s.RA, *R2 = s.RB;
         int16_t *J = s.JA, *J2 = s.JB;
         const int16_t *__restrict nxt = s.nxt;
-        for (int k = 0; k < n; k++) J[k] = nxt[J[k]];
+        const uint32_t *__restrict ent = s.ENT;
+        if (Rel) for (int k = 0; k < n; k++) J[k] = s.sec[J[k]];   // Rel: J is an entry id
+        else for (int k = 0; k < n; k++) J[k] = nxt[J[k]];
+        auto ent4 = [ent](const int16_t *j, uint64_t &jv, uint64_t &nv) {   // as lean_neon_core
+            uint64_t x;
+            memcpy(&x, j, 8);
+            const int m = X86Scratch::ECAP - 1;
+            const uint32_t e0 = ent[x & m], e1 = ent[(x >> 16) & m], e2 = ent[(x >> 32) & m], e3 = ent[(x >> 48) & m];
+            jv = (uint64_t)(e0 & 0xFFFF) | (uint64_t)(e1 & 0xFFFF) << 16 | (uint64_t)(e2 & 0xFFFF) << 32 | (uint64_t)(e3 & 0xFFFF) << 48;
+            nv = (uint64_t)(e0 >> 16) | (uint64_t)(e1 >> 16) << 16 | (uint64_t)(e2 >> 16) << 32 | (uint64_t)(e3 >> 16) << 48;
+        };
         // J < len2 <= 4095; lanes past n hold stale values, so the index is masked to stay in nxt[]
         auto nxt4 = [nxt](const int16_t *j) {
             uint64_t x;
@@ -333,12 +376,21 @@ static inline Kind lean_x86_core(const Job &jb, X86Scratch &s, int &hb, int &he,
             const __m128i vn = _mm_set1_epi16((short)n);
             for (int k0 = 0; k0 < n; k0 += 8, idx = _mm_add_epi16(idx, k8)) {
                 const __m128i r = x86_ld(R + k0);
-                const __m128i d = _mm_sub_epi16(_mm_add_epi16(r, koff), x86_ld(J + k0));
+                __m128i jv, jn;
+                if (Rel) {
+                    uint64_t j0, n0, j1, n1;
+                    ent4(J + k0, j0, n0); ent4(J + k0 + 4, j1, n1);
+                    jv = _mm_set_epi64x((long long)j1, (long long)j0);
+                    jn = _mm_set_epi64x((long long)n1, (long long)n0);
+                } else {
+                    jv = x86_ld(J + k0);
+                    jn = _mm_set_epi64x((long long)nxt4(J + k0 + 4), (long long)nxt4(J + k0));
+                }
+                const __m128i d = _mm_sub_epi16(_mm_add_epi16(r, koff), jv);
                 const __m128i rp = _mm_alignr_epi8(r, pR, 14), dp = _mm_alignr_epi8(d, pD, 14);
                 pR = r; pD = d;
                 const __m128i valid = _mm_cmplt_epi16(idx, vn);
                 const __m128i cont = _mm_and_si128(_mm_cmpeq_epi16(r, _mm_add_epi16(rp, one16)), _mm_cmpeq_epi16(d, dp));
-                const __m128i jn = _mm_set_epi64x((long long)nxt4(J + k0 + 4), (long long)nxt4(J + k0));
                 const __m128i keep = _mm_and_si128(_mm_cmpgt_epi16(jn, m1), valid);
                 const unsigned m = mask2(_mm_andnot_si128(cont, valid), keep);
                 pack_runs(bp, bdp, brp, idx, d, r, m & 0xFF);
@@ -490,17 +542,21 @@ static inline Kind lean_x86_core(const Job &jb, X86Scratch &s, int &hb, int &he,
 
 // Exact repeats of the previous job return the previous result, as lean_neon.
 static inline Kind lean_x86(const Job &jb, X86Scratch &s, int &hb, int &he, int max_hits = 1 << 30,
-                            int minsc = MINSC, const Wt &wt = Wt())
+                            int minsc = MINSC, const Wt &wt = Wt(), int relx = -1)
 {
     if (s.memo_ok && jb.len1 == s.memo_len1 && jb.len2 == s.qlen_c && max_hits == s.memo_mh && minsc == s.memo_minsc &&
-        wt == s.memo_wt && memcmp(jb.ref, s.rbuf + 4, (size_t)jb.len1) == 0 && memcmp(jb.qry, s.qcache, (size_t)jb.len2) == 0) {
+        wt == s.memo_wt && relx == s.memo_relx && memcmp(jb.ref, s.rbuf + 4, (size_t)jb.len1) == 0 && memcmp(jb.qry, s.qcache, (size_t)jb.len2) == 0) {
         hb = s.memo_hb; he = s.memo_he; s.view_nd = s.memo_view_nd;
         return s.memo_kind;
     }
-    const Kind k = wt.dflt() ? lean_x86_core<false>(jb, s, hb, he, max_hits, minsc, wt)
-                             : lean_x86_core<true>(jb, s, hb, he, max_hits, minsc, wt);
+    Kind k;
+    if (relx < 0) k = wt.dflt() ? lean_x86_core<false, false>(jb, s, hb, he, max_hits, minsc, wt, -1)
+                                : lean_x86_core<true, false>(jb, s, hb, he, max_hits, minsc, wt, -1);
+    else k = wt.dflt() ? lean_x86_core<false, true>(jb, s, hb, he, max_hits, minsc, wt, relx)
+                       : lean_x86_core<true, true>(jb, s, hb, he, max_hits, minsc, wt, relx);
     s.memo_ok = k != SCALAR;
     s.memo_wt = wt;
+    s.memo_relx = relx;
     s.memo_len1 = jb.len1; s.memo_mh = max_hits; s.memo_minsc = minsc; s.memo_hb = hb; s.memo_he = he;
     s.memo_view_nd = s.view_nd; s.memo_kind = k;
     return k;

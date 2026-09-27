@@ -404,13 +404,12 @@ static inline int rescue_prune_window(const uint8_t *ref, int len1, const uint8_
         return RESCUE_PRUNE_B2;
     }
 #elif defined(__AVX2__)
-    if (p.relx >= 0) goto scalar;   // the x86 filter has no relation path
     {   // identical decisions to the scalar filter at any minsc (rescue_prune_x86.h)
         rescue_prune_x86::X86Scratch &xs = rescue_prune_x86_scratch();
         rescue_prune_last_path() = 3;
         const rescue_prune_neon::Job jb{len1, len2, 0, 0, -1, -1, ref, q};
         int h, e;
-        const rescue_prune_neon::Kind k = rescue_prune_x86::lean_x86(jb, xs, h, e, max_hits, minsc, p.simd_wt());
+        const rescue_prune_neon::Kind k = rescue_prune_x86::lean_x86(jb, xs, h, e, max_hits, minsc, p.simd_wt(), p.relx);
         if (k == rescue_prune_neon::SCALAR) goto scalar;   // int32 path: > 32000 hits, long windows
         if (k == rescue_prune_neon::B1) return RESCUE_PRUNE_B1;
         if (k == rescue_prune_neon::FULL) return RESCUE_PRUNE_FULL;
