@@ -392,7 +392,7 @@ static void run_batch(Ikswv *k, Batch &b, int nb, bool p1_any)
         sp.len2 = r.qe + 1;
         revseq(r.qe + 1, b.qer.data() + sp.idq);
         revseq(r.te + 1, b.ref.data() + sp.idr);
-        if ((i < nb || p1_any) && rescue_band_batch().take_pass1(sp, r, i < nb)) continue;
+        if ((i < nb || p1_any) && rescue_band_batch().take_pass1(sp, r, i < nb, b.ref.data(), b.qer.data())) continue;
         pairs[pos++] = sp;
     }
     k->getScores8(pairs, b.ref.data(), b.qer.data(), aln, pos, 1, 1);
@@ -514,11 +514,13 @@ static int run_eq(std::vector<Job> &all_jobs, int minsc_default, int max_hits, i
             nmeth[meth]++;
         }
         const int minsc = pp.minsc;
-        /* As production: pass-0 banding for any scoring the filter accepts (not --meth), pass-1
-         * banding for any scoring the kernels take (rb_scoring::valid), not --meth. */
-        const rb_scoring bsc = {pp.a, pp.b, pp.o_del, pp.e_del, pp.o_ins, pp.e_ins};
-        const bool band = rescue_band_enabled() && pp.band_ok();
-        const bool p1_any = rescue_band_enabled() && !meth && bsc.valid();
+        /* As production: pass-0 banding for any scoring the filter accepts, pass-1 banding for any
+         * scoring the kernels take (rb_scoring::valid); --meth with the batch's matrix. */
+        rb_scoring bsc;
+        bsc.a = pp.a; bsc.b = pp.b; bsc.o_del = pp.o_del; bsc.e_del = pp.e_del; bsc.o_ins = pp.o_ins; bsc.e_ins = pp.e_ins;
+        if (meth) bsc.set_matrix(mat);
+        const bool band = rescue_band_enabled() && pp.valid;
+        const bool p1_any = rescue_band_enabled() && bsc.valid();
         if (rescue_band_enabled()) rescue_band_batch().set_scoring(bsc);
         nbatch++; nvalid += pp.valid; if (pp.valid) nk[pp.K]++;
         /* This batch's jobs: mates too long for the 8-bit kernels at this a are cut to a random

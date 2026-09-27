@@ -53,13 +53,19 @@ struct rb_work {
      * gap constants (see the NEON rb_work). */
     alignas(32) uint8_t tblb[32];
     uint8_t shift, oe_del, e_del, oe_ins, e_ins;
+    bool asym;   // tblb is indexed (r << 2) | q (REF holds r << 2), not q ^ r
     template <class V> static void fit(V &v, size_t n) { if (v.size() < n) v.resize(n); }
 };
 
 static inline void rb_set_scoring(rb_work &w, const rb_scoring &sc)
 {
     const int sh = sc.shift();
+    w.asym = sc.asym;
     for (int h = 0; h < 32; h += 16) {
+        if (sc.asym) {
+            for (int i = 0; i < 16; i++) w.tblb[h + i] = (uint8_t)(sc.mat16[i] + sh);
+            continue;
+        }
         w.tblb[h] = (uint8_t)(sc.a + sh);
         for (int i = 1; i < 4; i++) w.tblb[h + i] = (uint8_t)(sh - sc.b);
         for (int i = 4; i < 16; i++) w.tblb[h + i] = (uint8_t)(sh - 1);
@@ -158,15 +164,19 @@ static inline void rb_snapshot(rb_work &w, const uint8_t *Hrow, int row, int W, 
 
 /* The biased scoring table (index q ^ r: 0 match, 1-3 mismatch, 4-15 N), both 128-bit halves. */
 static inline __m256i rb_tblb(const rb_work &w) { return _mm256_load_si256((const __m256i *)w.tblb); }
-/* sat(Hp + score(q, r)) in the biased form (see the file comment) */
+/* sat(Hp + score(q, r)) in the biased form (see the file comment). Asym: the --meth table indexed
+ * r << 2 | q (REF pre-shifted; the pad 0x80 / nonexistent 0xC0 query codes and the inactive-row
+ * code 0x80 still set bit 7, so PSHUFB still gives 0). */
+template <bool Asym>
 static inline __m256i rb_hs(__m256i hp, __m256i q, __m256i rref, __m256i bi, __m256i tbl)
 {
-    return _mm256_subs_epu8(_mm256_adds_epu8(hp, _mm256_shuffle_epi8(tbl, _mm256_xor_si256(q, rref))), bi);
+    const __m256i idx = Asym ? _mm256_or_si256(q, rref) : _mm256_xor_si256(q, rref);
+    return _mm256_subs_epu8(_mm256_adds_epu8(hp, _mm256_shuffle_epi8(tbl, idx)), bi);
 }
 
 /* rb_dp_core of the NEON section, 32 lanes (see there for the row range, the live mask and the
  * FScan cell). */
-template <bool FScan, bool Sym>
+template <bool FScan, bool Sym, bool Asym>
 static long rb_dp_core(rb_work &w, int W, int NR, int omax, int ominq, int omaskq, bool early)
 {
     long computed = 0;
@@ -196,8 +206,8 @@ static long rb_dp_core(rb_work &w, int W, int NR, int omax, int ominq, int omask
 #define RB_CELL2(MASK)                                                                          \
         {                                                                                      \
             const __m256i ea = rb_ld(E + k * 32), eb = rb_ld(E + (k - 1) * 32);                \
-            const __m256i h0a = _mm256_max_epu8(rb_hs(rb_ld(Hp + k * 32), rb_ld(ap), rref, rb_ld(bp), tbl), ea); \
-            const __m256i h0b = _mm256_max_epu8(rb_hs(rb_ld(Hp + (k - 1) * 32), rb_ld(ap + 32), rref, rb_ld(bp + 32), tbl), eb); \
+            const __m256i h0a = _mm256_max_epu8(rb_hs<Asym>(rb_ld(Hp + k * 32), rb_ld(ap), rref, rb_ld(bp), tbl), ea); \
+            const __m256i h0b = _mm256_max_epu8(rb_hs<Asym>(rb_ld(Hp + (k - 1) * 32), rb_ld(ap + 32), rref, rb_ld(bp + 32), tbl), eb); \
             const __m256i h07a = _mm256_subs_epu8(h0a, vOI), h07b = _mm256_subs_epu8(h0b, vOI); \
             const __m256i fb = _mm256_max_epu8(h07a, _mm256_subs_epu8(f, vEI));  /* f_in(k-1) */ \
             const __m256i ha = _mm256_max_epu8(h0a, f), hb = _mm256_max_epu8(h0b, fb);         \
@@ -215,7 +225,7 @@ static long rb_dp_core(rb_work &w, int W, int NR, int omax, int ominq, int omask
 #define RB_CELL1(MASK)                                                                          \
         {                                                                                      \
             const __m256i e = rb_ld(E + k * 32);                                               \
-            const __m256i h0 = _mm256_max_epu8(rb_hs(rb_ld(Hp + k * 32), rb_ld(ap), rref, rb_ld(bp), tbl), e); \
+            const __m256i h0 = _mm256_max_epu8(rb_hs<Asym>(rb_ld(Hp + k * 32), rb_ld(ap), rref, rb_ld(bp), tbl), e); \
             const __m256i h = _mm256_max_epu8(h0, f);                                          \
             rb_st(Hc + k * 32, h);                                                             \
             const __m256i r_ = FScan ? h0 : h;                                                 \
@@ -281,7 +291,7 @@ static inline void rb_qe_scan(rb_work &w, const uint8_t *Hrow, int row, int W, i
 /* rb_dp_wave2 of the NEON section (the default kernel: the fused cell on two rows per step with
  * the direct qe scan), 32 lanes; see there for the pairing argument. The pair (r, k), (r + 1, k + 1)
  * shares the query slot p, so one A / QL / BI load serves both. */
-template <bool Sym>
+template <bool Sym, bool Asym>
 static long rb_dp_wave2(rb_work &w, int W, int NR, int omax, int ominq, int omaskq, bool early)
 {
     long computed = 0;
@@ -319,7 +329,7 @@ static long rb_dp_wave2(rb_work &w, int W, int NR, int omax, int ominq, int omas
         const int kun = std::max(klo, r + omaskq);
         for (int k = khi; k >= klo; k--, ap += 32, qp += 32, bp += 32) {
             const __m256i e = rb_ld(E + k * 32);
-            const __m256i h0 = _mm256_max_epu8(rb_hs(rb_ld(Hp + k * 32), rb_ld(ap), rref, rb_ld(bp), tbl), e);
+            const __m256i h0 = _mm256_max_epu8(rb_hs<Asym>(rb_ld(Hp + k * 32), rb_ld(ap), rref, rb_ld(bp), tbl), e);
             rb_st(Ha + k * 32, _mm256_max_epu8(h0, f));
             rmax = _mm256_max_epu8(rmax, k >= kun ? h0 : _mm256_and_si256(h0, rb_ld(qp)));
             const __m256i h07 = _mm256_subs_epu8(h0, vOI), hd = Sym ? h07 : _mm256_subs_epu8(h0, vOD);
@@ -348,7 +358,7 @@ static long rb_dp_wave2(rb_work &w, int W, int NR, int omax, int ominq, int omas
         int k = khi_a;
         if (khi_a == W - 1) {   // (r, W - 1) alone: its partner (r + 1, W) does not exist
             const __m256i e = rb_ld(E + k * 32);
-            const __m256i h0 = _mm256_max_epu8(rb_hs(rb_ld(Hp + k * 32), rb_ld(ap), rref_a, rb_ld(bp), tbl), e);
+            const __m256i h0 = _mm256_max_epu8(rb_hs<Asym>(rb_ld(Hp + k * 32), rb_ld(ap), rref_a, rb_ld(bp), tbl), e);
             diag = _mm256_max_epu8(h0, fa);
             rb_st(Ha + k * 32, diag);
             rmax_a = k >= kun_a ? h0 : _mm256_and_si256(h0, rb_ld(qp));
@@ -358,14 +368,14 @@ static long rb_dp_wave2(rb_work &w, int W, int NR, int omax, int ominq, int omas
 #define RB_W2_STEP(MASK)                                                                        \
         {                                                                                      \
             const __m256i q = rb_ld(ap), e = rb_ld(E + k * 32), bi = rb_ld(bp);                \
-            const __m256i h0a = _mm256_max_epu8(rb_hs(rb_ld(Hp + k * 32), q, rref_a, bi, tbl), e); \
+            const __m256i h0a = _mm256_max_epu8(rb_hs<Asym>(rb_ld(Hp + k * 32), q, rref_a, bi, tbl), e); \
             const __m256i h07a = _mm256_subs_epu8(h0a, vOI);                                   \
             const __m256i hda = Sym ? h07a : _mm256_subs_epu8(h0a, vOD);                       \
             const __m256i ha = _mm256_max_epu8(h0a, fa);                                       \
             rb_st(Ha + k * 32, ha);                                                            \
             fa = _mm256_max_epu8(h07a, _mm256_subs_epu8(fa, vEI));                             \
             const __m256i ea = _mm256_max_epu8(hda, _mm256_subs_epu8(e, vED));  /* E in of (r+1, k+1) */ \
-            const __m256i h0b = _mm256_max_epu8(rb_hs(diag, q, rref_b, bi, tbl), ea);          \
+            const __m256i h0b = _mm256_max_epu8(rb_hs<Asym>(diag, q, rref_b, bi, tbl), ea);          \
             const __m256i h07b = _mm256_subs_epu8(h0b, vOI);                                   \
             const __m256i hdb = Sym ? h07b : _mm256_subs_epu8(h0b, vOD);                       \
             rb_st(Hb + (k + 1) * 32, _mm256_max_epu8(h0b, fb));                                \
@@ -385,7 +395,7 @@ static long rb_dp_wave2(rb_work &w, int W, int NR, int omax, int ominq, int omas
         for (; k >= klo_a; k--, ap += 32, qp += 32, bp += 32) RB_W2_STEP(true)
 #undef RB_W2_STEP
         if (klo_b == klo_a) {   // (r + 1, 0) alone: its partner (r, -1) does not exist; E in = slot 0 = 0
-            const __m256i h0b = rb_hs(diag, rb_ld(ap), rref_b, rb_ld(bp), tbl);
+            const __m256i h0b = rb_hs<Asym>(diag, rb_ld(ap), rref_b, rb_ld(bp), tbl);
             rb_st(Hb + klo_a * 32, _mm256_max_epu8(h0b, fb));
             rb_st(E + (klo_a + 1) * 32, _mm256_subs_epu8(h0b, vOD));
             rmax_b = _mm256_max_epu8(rmax_b, _mm256_and_si256(h0b, rb_ld(qp)));

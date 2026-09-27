@@ -80,9 +80,6 @@ struct rescue_prune_params {
     {
         return conv_from < 0 && a == 1 && b == 4 && o_del == 6 && e_del == 1 && o_ins == 6 && e_ins == 1;
     }
-    /* The band kernels take any valid scoring with the symmetric score table (no --meth: its freed
-     * cells need an asymmetric table the kernels do not have yet). */
-    bool band_ok() const { return valid && conv_from < 0; }
     /* --meth: the rescued mate is scored with mat_ot (hyp 1: reference C / read T freed) or mat_ob
      * (hyp 0: reference G / read A freed); collapsed scoring also frees the mirror cell. */
     void set_meth(int hyp)

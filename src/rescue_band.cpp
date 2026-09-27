@@ -354,7 +354,7 @@ bool RescueBandBatch::plan(const rescue_prune_view &v, const rescue_prune_params
     /* The view's components are at the filter's minsc (the filter ran with pp); minsc <= 255 is the
      * kernels' u8 range (and kswv's score2 threshold byte). */
     const int minsc = pp.minsc;
-    if (v.nd < 0 || !pp.band_ok() || v.minsc != minsc || minsc > 255 || !(rb_scoring::from(pp) == sc_)) return false;
+    if (v.nd < 0 || !pp.valid || v.minsc != minsc || minsc > 255 || !(rb_scoring::from(pp) == sc_)) return false;
     const auto t0 = rb_stats_on() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
     const int quanta = ((len2 + 15) / 16) * 16;
     const int H = he - hb + 1;
@@ -543,14 +543,20 @@ struct rb_work {
      * extends by e_del, F (in-row, insertion) likewise with the insertion costs. */
     alignas(16) int8_t tbl[16];
     uint8_t oe_del, e_del, oe_ins, e_ins;
+    bool asym;   // tbl is indexed (r << 2) | q (REF holds r << 2), not q ^ r
     template <class V> static void fit(V &v, size_t n) { if (v.size() < n) v.resize(n); }
 };
 
 static inline void rb_set_scoring(rb_work &w, const rb_scoring &sc)
 {
-    w.tbl[0] = (int8_t)sc.a;
-    for (int i = 1; i < 4; i++) w.tbl[i] = (int8_t)-sc.b;
-    for (int i = 4; i < 16; i++) w.tbl[i] = -1;
+    w.asym = sc.asym;
+    if (sc.asym) {
+        for (int i = 0; i < 16; i++) w.tbl[i] = sc.mat16[i];
+    } else {
+        w.tbl[0] = (int8_t)sc.a;
+        for (int i = 1; i < 4; i++) w.tbl[i] = (int8_t)-sc.b;
+        for (int i = 4; i < 16; i++) w.tbl[i] = -1;
+    }
     w.oe_del = (uint8_t)std::min(255, sc.o_del + sc.e_del); w.e_del = (uint8_t)std::min(255, sc.e_del);
     w.oe_ins = (uint8_t)std::min(255, sc.o_ins + sc.e_ins); w.e_ins = (uint8_t)std::min(255, sc.e_ins);
 }
@@ -622,7 +628,10 @@ static inline void rb_snapshot(rb_work &w, const uint8_t *Hrow, int row, int W, 
  * ends) are final -- exactly kswv's freeze at KSW_XSTOP. */
 /* FScan selects the G-based cell (see RB_CELL1); both instantiations are byte-identical in every
  * value the caller reads (gmax, te, SNAP, R). */
-template <bool FScan, bool Sym>
+/* Score-table index of query code q against reference code r (REF): q ^ r for the symmetric
+ * table, r << 2 | q (REF pre-shifted) for --meth's asymmetric one (rb_scoring::asym). */
+#define RB_IDX(q, r) (Asym ? vorrq_u8(q, r) : veorq_u8(q, r))
+template <bool FScan, bool Sym, bool Asym>
 static long rb_dp_core(rb_work &w, int W, int NR, int omax, int ominq, int omaskq, bool early)
 {
     long computed = 0;
@@ -653,8 +662,8 @@ static long rb_dp_core(rb_work &w, int W, int NR, int omax, int ominq, int omask
         {                                                                                      \
             const uint8x16_t qa = vld1q_u8(ap), qb = vld1q_u8(ap + 16);   /* cells k, k-1 */  \
             const uint8x16_t ea = vld1q_u8(E + k * 16), eb = vld1q_u8(E + (k - 1) * 16);      \
-            const int8x16_t sa = vreinterpretq_s8_u8(vqtbl1q_u8(tbl, veorq_u8(qa, rref)));    \
-            const int8x16_t sb = vreinterpretq_s8_u8(vqtbl1q_u8(tbl, veorq_u8(qb, rref)));    \
+            const int8x16_t sa = vreinterpretq_s8_u8(vqtbl1q_u8(tbl, RB_IDX(qa, rref)));    \
+            const int8x16_t sb = vreinterpretq_s8_u8(vqtbl1q_u8(tbl, RB_IDX(qb, rref)));    \
             const uint8x16_t h0a = vmaxq_u8(vsqaddq_u8(vld1q_u8(Hp + k * 16), sa), ea);       \
             const uint8x16_t h0b = vmaxq_u8(vsqaddq_u8(vld1q_u8(Hp + (k - 1) * 16), sb), eb); \
             const uint8x16_t h07a = vqsubq_u8(h0a, vOI), h07b = vqsubq_u8(h0b, vOI);          \
@@ -703,7 +712,7 @@ static long rb_dp_core(rb_work &w, int W, int NR, int omax, int ominq, int omask
         {                                                                                      \
             const uint8x16_t q = vld1q_u8(ap);                                                 \
             const uint8x16_t e = vld1q_u8(E + k * 16);                                         \
-            const int8x16_t sc = vreinterpretq_s8_u8(vqtbl1q_u8(tbl, veorq_u8(q, rref)));     \
+            const int8x16_t sc = vreinterpretq_s8_u8(vqtbl1q_u8(tbl, RB_IDX(q, rref)));     \
             const uint8x16_t h0 = vmaxq_u8(vsqaddq_u8(vld1q_u8(Hp + k * 16), sc), e);          \
             const uint8x16_t h = vmaxq_u8(h0, f);                                              \
             vst1q_u8(Hc + k * 16, h);                                                          \
@@ -800,7 +809,7 @@ static inline void rb_qe_scan(rb_work &w, const uint8_t *Hrow, int row, int W, i
  * lanes whose gmax already equals the target S: gmax never exceeds S (rescue_band.h), so a run
  * ending below S is superseded by the run that reaches S, and a lane that never reaches it fails
  * run_pass1's guard and is rerun through kswv, as before. */
-template <bool Sym>
+template <bool Sym, bool Asym>
 static long rb_dp_wave2(rb_work &w, int W, int NR, int omax, int ominq, int omaskq, bool early)
 {
     long computed = 0;
@@ -842,7 +851,7 @@ static long rb_dp_wave2(rb_work &w, int W, int NR, int omax, int ominq, int omas
         const int kun = std::max(klo, r + omaskq);
         for (int k = khi; k >= klo; k--, ap += 16, qp += 16) {
             const uint8x16_t q = vld1q_u8(ap), e = vld1q_u8(E + k * 16);
-            const int8x16_t sc = vreinterpretq_s8_u8(vqtbl1q_u8(tbl, veorq_u8(q, rref)));
+            const int8x16_t sc = vreinterpretq_s8_u8(vqtbl1q_u8(tbl, RB_IDX(q, rref)));
             const uint8x16_t h0 = vmaxq_u8(vsqaddq_u8(vld1q_u8(Hp + k * 16), sc), e);
             vst1q_u8(Ha + k * 16, vmaxq_u8(h0, f));
             rmax = vmaxq_u8(rmax, k >= kun ? h0 : vandq_u8(h0, vld1q_u8(qp)));
@@ -870,7 +879,7 @@ static long rb_dp_wave2(rb_work &w, int W, int NR, int omax, int ominq, int omas
         int k = khi_a;
         if (khi_a == W - 1) {   // (r, W - 1) alone: its partner (r + 1, W) does not exist
             const uint8x16_t q = vld1q_u8(ap), e = vld1q_u8(E + k * 16);
-            const int8x16_t sc = vreinterpretq_s8_u8(vqtbl1q_u8(tbl, veorq_u8(q, rref_a)));
+            const int8x16_t sc = vreinterpretq_s8_u8(vqtbl1q_u8(tbl, RB_IDX(q, rref_a)));
             const uint8x16_t h0 = vmaxq_u8(vsqaddq_u8(vld1q_u8(Hp + k * 16), sc), e);
             diag = vmaxq_u8(h0, fa);
             vst1q_u8(Ha + k * 16, diag);
@@ -881,7 +890,7 @@ static long rb_dp_wave2(rb_work &w, int W, int NR, int omax, int ominq, int omas
 #define RB_W2_STEP(MASK)                                                                        \
         {                                                                                      \
             const uint8x16_t q = vld1q_u8(ap), e = vld1q_u8(E + k * 16);                       \
-            const int8x16_t sca = vreinterpretq_s8_u8(vqtbl1q_u8(tbl, veorq_u8(q, rref_a)));   \
+            const int8x16_t sca = vreinterpretq_s8_u8(vqtbl1q_u8(tbl, RB_IDX(q, rref_a)));   \
             const uint8x16_t h0a = vmaxq_u8(vsqaddq_u8(vld1q_u8(Hp + k * 16), sca), e);        \
             const uint8x16_t h07a = vqsubq_u8(h0a, vOI);                                       \
             const uint8x16_t hda = Sym ? h07a : vqsubq_u8(h0a, vOD);                           \
@@ -889,7 +898,7 @@ static long rb_dp_wave2(rb_work &w, int W, int NR, int omax, int ominq, int omas
             vst1q_u8(Ha + k * 16, ha);                                                         \
             fa = vmaxq_u8(h07a, vqsubq_u8(fa, vEI));                                           \
             const uint8x16_t ea = vmaxq_u8(hda, vqsubq_u8(e, vED));   /* E in of (r+1, k+1) */ \
-            const int8x16_t scb = vreinterpretq_s8_u8(vqtbl1q_u8(tbl, veorq_u8(q, rref_b)));   \
+            const int8x16_t scb = vreinterpretq_s8_u8(vqtbl1q_u8(tbl, RB_IDX(q, rref_b)));   \
             const uint8x16_t h0b = vmaxq_u8(vsqaddq_u8(diag, scb), ea);                        \
             const uint8x16_t h07b = vqsubq_u8(h0b, vOI);                                       \
             const uint8x16_t hdb = Sym ? h07b : vqsubq_u8(h0b, vOD);                           \
@@ -911,7 +920,7 @@ static long rb_dp_wave2(rb_work &w, int W, int NR, int omax, int ominq, int omas
 #undef RB_W2_STEP
         if (klo_b == klo_a) {   // (r + 1, 0) alone: its partner (r, -1) does not exist; E in = slot 0 = 0
             const uint8x16_t q = vld1q_u8(ap);
-            const int8x16_t scb = vreinterpretq_s8_u8(vqtbl1q_u8(tbl, veorq_u8(q, rref_b)));
+            const int8x16_t scb = vreinterpretq_s8_u8(vqtbl1q_u8(tbl, RB_IDX(q, rref_b)));
             const uint8x16_t h0b = vsqaddq_u8(diag, scb);
             vst1q_u8(Hb + klo_a * 16, vmaxq_u8(h0b, fb));
             vst1q_u8(E + (klo_a + 1) * 16, vqsubq_u8(h0b, vOD));
@@ -946,6 +955,8 @@ static long rb_dp_wave2(rb_work &w, int W, int NR, int omax, int ominq, int omas
     vst1q_u8(w.gmax, gmax);
     return computed;
 }
+
+#undef RB_IDX
 
 }  // namespace
 #endif
@@ -1044,6 +1055,17 @@ static void rb_score2_vec(const uint8_t *R, int n, int row0, int Z, int te, int 
 }
 #endif
 
+#if RB_HAVE_SIMD
+/* The BWA3_RESCUE_FSCAN kernel for one (Sym, Asym) instantiation. */
+template <bool Sym, bool Asym>
+static long rb_kernel_run(int kern, rb_work &w, int W, int NR, int omax, int ominq, int omaskq, bool early)
+{
+    return kern >= 2 ? rb_dp_wave2<Sym, Asym>(w, W, NR, omax, ominq, omaskq, early)
+         : kern == 1 ? rb_dp_core<true, Sym, Asym>(w, W, NR, omax, ominq, omaskq, early)
+                     : rb_dp_core<false, Sym, Asym>(w, W, NR, omax, ominq, omaskq, early);
+}
+#endif
+
 static inline int rb_width_bucket(int w)
 {
     return w <= 16 ? (w + 3) >> 2 : w <= 64 ? 4 + ((w - 16 + 7) >> 3) : w <= 128 ? 10 + ((w - 64 + 15) >> 4)
@@ -1137,7 +1159,9 @@ void RescueBandBatch::run_jobs(bool pass1)
                 const job &J = *L[l];
                 rows = J.nrows;
                 const uint8_t *src = J.ref + J.r0;
-                for (int r = 0; r < rows; r++) row[r] = src[r] < 4 ? src[r] : 4;
+                /* Asymmetric (--meth) table: REF holds r << 2; no N can reach here (rb_scoring). */
+                if (sc_.asym) for (int r = 0; r < rows; r++) row[r] = (uint8_t)(src[r] << 2);
+                else for (int r = 0; r < rows; r++) row[r] = src[r] < 4 ? src[r] : 4;
             }
             if (NRp > rows) memset(row + rows, 0x80, NRp - rows);
         }
@@ -1160,13 +1184,10 @@ void RescueBandBatch::run_jobs(bool pass1)
         }
         for (int l = 0; l < RB_L; l++) w.target[l] = pass1 && l < nl ? (uint8_t)L[l]->target : 0;
         const int kern = rb_kernel();
-        const long computed =
-            kern >= 2 ? (sym ? rb_dp_wave2<true>(w, W, NR, omax, ominq, omaskq, pass1)
-                             : rb_dp_wave2<false>(w, W, NR, omax, ominq, omaskq, pass1))
-            : kern == 1 ? (sym ? rb_dp_core<true, true>(w, W, NR, omax, ominq, omaskq, pass1)
-                               : rb_dp_core<true, false>(w, W, NR, omax, ominq, omaskq, pass1))
-                        : (sym ? rb_dp_core<false, true>(w, W, NR, omax, ominq, omaskq, pass1)
-                               : rb_dp_core<false, false>(w, W, NR, omax, ominq, omaskq, pass1));
+        const long computed = sc_.asym ? (sym ? rb_kernel_run<true, true>(kern, w, W, NR, omax, ominq, omaskq, pass1)
+                                              : rb_kernel_run<false, true>(kern, w, W, NR, omax, ominq, omaskq, pass1))
+                                       : (sym ? rb_kernel_run<true, false>(kern, w, W, NR, omax, ominq, omaskq, pass1)
+                                              : rb_kernel_run<false, false>(kern, w, W, NR, omax, ominq, omaskq, pass1));
         if (st) stats.cells_pad += (uint64_t)RB_L * computed;
 #ifdef RB_PROFILE
         g_rb_prof.cells += (double)RB_L * computed;
@@ -1363,11 +1384,21 @@ void RescueBandBatch::run_pass0(const SeqPair *pairs, int nb, const uint8_t *seq
 /* Pass 1 (start recovery)                                                                     */
 /* ------------------------------------------------------------------------------------------ */
 
-bool RescueBandBatch::take_pass1(const SeqPair &sp, const kswr_t &r, bool banded_parent)
+bool RescueBandBatch::take_pass1(const SeqPair &sp, const kswr_t &r, bool banded_parent,
+                                 const uint8_t *seqBufRef, const uint8_t *seqBufQer)
 {
 #if RB_HAVE_SIMD
     if (rb_p1_mode() < (banded_parent ? 1 : 2)) return false;
     const int S = r.score, te = r.te, qe = r.qe;
+    /* The asymmetric table's index r << 2 | q has no N entry (N would alias a real cell: a query
+     * N, code 8, against r reads entry 8 | r << 2), so both reversed prefixes must be N-free. */
+    if (sc_.asym) {
+        uint8_t orv = 0;
+        const uint8_t *rp = seqBufRef + sp.idr, *qp = seqBufQer + sp.idq;
+        for (int i = 0; i <= te; i++) orv |= rp[i];
+        for (int j = 0; j <= qe; j++) orv |= qp[j];
+        if (orv & 0xFC) { stats.p1_kswv++; return false; }
+    }
     /* 8-bit and unsaturated (kswv's 255 sentinel is S + shift >= 255), and a real end. On x86 the
      * biased cell also needs every H + a + shift <= 255, and H <= S here. */
     const int sh = sc_.shift();
@@ -1390,7 +1421,7 @@ bool RescueBandBatch::take_pass1(const SeqPair &sp, const kswr_t &r, bool banded
     p1_.push_back(p1job{sp, nrows, imax, dmax});
     return true;
 #else
-    (void)sp; (void)r; (void)banded_parent;
+    (void)sp; (void)r; (void)banded_parent; (void)seqBufRef; (void)seqBufQer;
     return false;
 #endif
 }

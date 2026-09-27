@@ -58,7 +58,8 @@
  *
  * Scope: the NEON kernel (aarch64, 16 lanes) and the AVX2 kernel (x86, 32 lanes,
  * rescue_band_kernel_x86.h); any scoring rescue_prune_params accepts (score table {a, -b, -1},
- * separate deletion and insertion gap costs), 8-bit, non-meth, minsc in [5, 255]. Without a SIMD
+ * separate deletion and insertion gap costs; under --meth the pair group's asymmetric matrix,
+ * set_matrix), 8-bit, minsc in [5, 255]. Without a SIMD
  * kernel the hull path runs.
  * Env: the BWA3_RESCUE_BAND* toggles, all listed with their defaults in rescue_env.h. */
 #ifndef BWA_MEM3_RESCUE_BAND_H
@@ -75,10 +76,24 @@
  * 256 - min(a, -b, -1) = max(1, b): a pass-0 score with S + shift >= 255 is kswv's saturated 255. */
 struct rb_scoring {
     int a = 1, b = 4, o_del = 6, e_del = 1, o_ins = 6, e_ins = 1;
+    /* --meth: the kernels index a table of the pair group's matrix (mat_ot / mat_ob, one group at a
+     * time in mem_sam_pe_batch) by (r << 2) | q instead of the symmetric {a, -b, -1} by q ^ r. That
+     * index has no room for N, so no band job of an asymmetric scoring may hold one: pass 0 never
+     * does (the filter returns FULL on N) and take_pass1 declines prefixes with N. */
+    bool asym = false;
+    int8_t mat16[16] = {0};
+    void set_matrix(const int8_t *mat25)
+    {
+        asym = true;
+        for (int r = 0; r < 4; r++)
+            for (int q = 0; q < 4; q++) mat16[r * 4 + q] = mat25[r * 5 + q];
+    }
+    /* kswv's bias 256 - min(matrix, -1); a --meth matrix's minimum is still -b (mem_opt_fill_meth_mat). */
     int shift() const { return b > 1 ? b : 1; }
     bool sym_gaps() const { return o_del + e_del == o_ins + e_ins && e_del == e_ins; }
     /* score2's zone half-width around te: kswv's ceil(S / qmax), qmax = a (kswv.cpp). */
     int zone(int S) const { return (S + a - 1) / a; }
+    /* The gap and symmetric-table terms only, not asym / mat16: plan() depends on nothing else. */
     bool operator==(const rb_scoring &o) const
     {
         return a == o.a && b == o.b && o_del == o.o_del && e_del == o.e_del && o_ins == o.o_ins && e_ins == o.e_ins;
@@ -150,11 +165,13 @@ public:
                    const uint8_t *seqBufQer, kswr_t *aln, Ikswv *kswv);
     /* Pass 1 of an 8-bit rescue job. sp is the pair as prepared for kswv phase 1 (reversed
      * prefixes of lengths te + 1 and qe + 1 in the sequence buffers, len2 = qe + 1, h0 =
-     * KSW_XSTOP | S) and r its pass-0 result, scored with set_scoring()'s scoring (valid, non-meth;
-     * a banded parent implies both). Queues the job for the banded pass 1 and returns true when
+     * KSW_XSTOP | S) and r its pass-0 result, scored with set_scoring()'s scoring (valid, and under
+     * --meth the group's matrix; a banded parent implies both). Queues the job for the banded pass 1 and returns true when
      * BWA3_RESCUE_BAND_P1 admits it and the band is cheaper than kswv; false means the caller
-     * runs it through kswv phase 1 as before. */
-    bool take_pass1(const SeqPair &sp, const kswr_t &r, bool banded_parent);
+     * runs it through kswv phase 1 as before. Under an asymmetric (--meth) scoring a job whose
+     * reversed prefixes (in seqBufRef / seqBufQer at sp.idr / sp.idq) hold an N is declined. */
+    bool take_pass1(const SeqPair &sp, const kswr_t &r, bool banded_parent, const uint8_t *seqBufRef,
+                    const uint8_t *seqBufQer);
     /* Run the queued pass-1 jobs: fills aln[regid].{tb, qb} exactly as kswv phase 1 would. */
     void run_pass1(const uint8_t *seqBufRef, const uint8_t *seqBufQer, kswr_t *aln, Ikswv *kswv);
     void reset();
