@@ -21,10 +21,18 @@
  *                                       (int16 len1, len2, score, te, hb, he; ref; query)
  *   rescue_prune_eq fuzz <n> <seed>     n generated jobs (repeats, low complexity, N, tiny and
  *                                       long windows, gate values)
+ *   rescue_prune_eq dumpm <files...>    jobs from the --meth rescue dumps (int32 len1, len2, hyp,
+ *                                       xbyte; ref; query): the default scoring under the relation of
+ *                                       each job's hypothesis (hyp < 0: none), a quarter of them also
+ *                                       under the other hypothesis
+ *   rescue_prune_eq timem <mh> <files...>  no checks: the filter's single-thread time over the same
+ *                                       jobs at gate mh, relation vs converted copies vs the scalar
+ *                                       relation, with the rows and cells (rows x len2) each keeps
  * Exit status 1 on any disagreement. Build: make arch=avx2 rescue-prune-eq (x86), make arch=arm64
  * rescue-prune-eq (aarch64). */
 #include "../src/rescue_prune.h"
 
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -193,6 +201,82 @@ int run_dumps(int argc, char **argv, bool hdr16, Stats &st)
     return 0;
 }
 
+/* --meth dumps: records of int32 len1, len2, hyp, xbyte, then the window and the oriented mate. */
+struct MJob { const uint8_t *ref, *q; int len1, len2, hyp; };
+bool load_mdumps(int argc, char **argv, std::vector<std::vector<uint8_t>> &bufs, std::vector<MJob> &jobs)
+{
+    for (int a = 0; a < argc; a++) {
+        FILE *fp = fopen(argv[a], "rb");
+        if (!fp) { perror(argv[a]); return false; }
+        fseek(fp, 0, SEEK_END);
+        const long n = ftell(fp);
+        fseek(fp, 0, SEEK_SET);
+        bufs.emplace_back((size_t)n);
+        std::vector<uint8_t> &buf = bufs.back();
+        if (fread(buf.data(), 1, (size_t)n, fp) != (size_t)n) { perror("read"); fclose(fp); return false; }
+        fclose(fp);
+        for (size_t p = 0; p + 16 <= buf.size();) {
+            int32_t h[4];
+            memcpy(h, buf.data() + p, 16);
+            p += 16;
+            if (h[0] < 0 || h[1] < 0 || p + h[0] + h[1] > buf.size()) break;
+            jobs.push_back(MJob{buf.data() + p, buf.data() + p + h[0], h[0], h[1], h[2]});
+            p += (size_t)h[0] + h[1];
+        }
+    }
+    return true;
+}
+
+int run_mdumps(int argc, char **argv, Stats &st)
+{
+    std::vector<std::vector<uint8_t>> bufs;
+    std::vector<MJob> jobs;
+    if (!load_mdumps(argc, argv, bufs, jobs)) return 1;
+    long k = 0;
+    for (const MJob &J : jobs) {
+        const int mh = k % 3 == 0 ? 400 : k % 3 == 1 ? 1000 : 1 << 30;
+        const rescue_prune_params p = rescue_prune_params::defaults(19);
+        if (J.hyp < 0) run_one(J.ref, J.len1, J.q, J.len2, p, mh, (k & 1) == 0, st);
+        else run_rel(J.ref, J.len1, J.q, J.len2, p, J.hyp, mh, (k & 1) == 0, (k / 5) % 4 == 3, st);
+        k++;
+    }
+    return 0;
+}
+
+/* Kill switch for the relation filter: time and yield per variant over the dumped jobs. */
+int run_timem(int mh, int argc, char **argv)
+{
+    std::vector<std::vector<uint8_t>> bufs;
+    std::vector<MJob> jobs;
+    if (!load_mdumps(argc, argv, bufs, jobs)) return 1;
+    static rescue_prune_scratch sr;
+    for (int v = 0; v < 4; v++) {   // 0 SIMD relation, 1 converted copies, 2 scalar relation, 3 none
+        long kind[3] = {0, 0, 0};
+        double rows_in = 0, rows_kept = 0, cells_in = 0, cells_kept = 0;
+        const auto t0 = std::chrono::steady_clock::now();
+        for (const MJob &J : jobs) {
+            rescue_prune_params p = rescue_prune_params::defaults(19);
+            int hb = -1, he = -1, k = RESCUE_PRUNE_FULL;
+            if (J.hyp >= 0 && v != 3) {
+                if (v == 1) p.set_meth(J.hyp);
+                else p.set_meth_rel(J.hyp);
+                k = v == 2 ? (J.len1 >= 5 && J.len2 >= 5 ? rescue_prune_window_scalar(J.ref, J.len1, J.q, J.len2, p, mh, sr, &hb, &he)
+                                                        : RESCUE_PRUNE_FULL)
+                           : rescue_prune_window(J.ref, J.len1, J.q, J.len2, p, mh, &hb, &he);
+            }
+            const int kept = k == RESCUE_PRUNE_B1 ? 0 : k == RESCUE_PRUNE_B2 ? he - hb + 1 : J.len1;
+            kind[k]++;
+            rows_in += J.len1; rows_kept += kept;
+            cells_in += (double)J.len1 * J.len2; cells_kept += (double)kept * J.len2;
+        }
+        const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        static const char *name[4] = {"simd_rel", "conv", "scalar_rel", "none"};
+        printf("timem %-10s mh=%d jobs=%zu full=%ld b1=%ld b2=%ld rows_kept=%.4f cells_kept=%.4f sec=%.3f\n", name[v], mh,
+               jobs.size(), kind[0], kind[1], kind[2], rows_kept / rows_in, cells_kept / cells_in, sec);
+    }
+    return 0;
+}
+
 void run_fuzz(long n, unsigned seed, Stats &st)
 {
     std::mt19937 rng(seed);
@@ -247,13 +331,17 @@ void run_fuzz(long n, unsigned seed, Stats &st)
 int main(int argc, char **argv)
 {
     if (argc < 3) {
-        fprintf(stderr, "usage: %s dump|dump16 <files...> | fuzz <n> <seed>\n", argv[0]);
+        fprintf(stderr, "usage: %s dump|dump16|dumpm <files...> | timem <mh> <files...> | fuzz <n> <seed>\n", argv[0]);
         return 2;
     }
     Stats st;
     const std::string mode = argv[1];
     if (mode == "dump" || mode == "dump16") {
         if (run_dumps(argc - 2, argv + 2, mode == "dump16", st)) return 2;
+    } else if (mode == "dumpm") {
+        if (run_mdumps(argc - 2, argv + 2, st)) return 2;
+    } else if (mode == "timem" && argc >= 4) {
+        return run_timem(atoi(argv[2]), argc - 3, argv + 3) ? 2 : 0;
     } else if (mode == "fuzz" && argc >= 4) {
         run_fuzz(atol(argv[2]), (unsigned)atol(argv[3]), st);
     } else {

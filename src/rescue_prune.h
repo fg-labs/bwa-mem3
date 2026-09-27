@@ -140,7 +140,7 @@ struct rescue_prune_scratch {
      * query table holds entries (query position ent_j, next entry of the same code ent_nxt) instead
      * of query positions; a mate needing more than ECAP entries is not pruned (FULL). The SIMD filters
      * use the same cap. */
-    static const int ECAP = 16384;
+    static const int ECAP = rescue_prune_neon::REL_ECAP;
     int16_t head[1024], nxt[QCAP];
     int16_t ent_j[ECAP], ent_nxt[ECAP];
     uint16_t qcnt[1024];
@@ -389,14 +389,14 @@ static inline int rescue_prune_window(const uint8_t *ref, int len1, const uint8_
     }
     const int minsc = p.minsc;
     (void)minsc;
-    if (!p.simd_ok() || p.relx >= 0) goto scalar;
+    if (!p.simd_ok()) goto scalar;
 #if defined(__aarch64__)
     {   // identical decisions to the scalar filter at any minsc, ~2x faster (rescue_prune_neon.h)
         rescue_prune_neon::NeonScratch &ns = rescue_prune_neon_scratch();
         rescue_prune_last_path() = 2;
         const rescue_prune_neon::Job jb{len1, len2, 0, 0, -1, -1, ref, q};
         int h, e;
-        const rescue_prune_neon::Kind k = rescue_prune_neon::lean_neon(jb, ns, h, e, max_hits, minsc, p.simd_wt());
+        const rescue_prune_neon::Kind k = rescue_prune_neon::lean_neon(jb, ns, h, e, max_hits, minsc, p.simd_wt(), p.relx);
         if (k == rescue_prune_neon::SCALAR) goto scalar;   // int32 path: > 32000 hits, long windows
         if (k == rescue_prune_neon::B1) return RESCUE_PRUNE_B1;
         if (k == rescue_prune_neon::FULL) return RESCUE_PRUNE_FULL;
@@ -404,6 +404,7 @@ static inline int rescue_prune_window(const uint8_t *ref, int len1, const uint8_
         return RESCUE_PRUNE_B2;
     }
 #elif defined(__AVX2__)
+    if (p.relx >= 0) goto scalar;   // the x86 filter has no relation path
     {   // identical decisions to the scalar filter at any minsc (rescue_prune_x86.h)
         rescue_prune_x86::X86Scratch &xs = rescue_prune_x86_scratch();
         rescue_prune_last_path() = 3;
