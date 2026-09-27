@@ -366,8 +366,8 @@ static bool rescue_dedup_skip_enabled()
 }
 
 /* Pruning is on for this run: the toggle, a scoring the lemma holds for (rescue_prune_params), and
- * on the AVX-512 tier only below minsc 25. There the
- * 64-lane kswv is cheap and few rescues pass at a high minsc, so the filter costs more than it
+ * on the AVX-512 tier only below -k 25. There the
+ * 64-lane kswv is cheap and few rescues pass at a long seed length, so the filter costs more than it
  * saves (prune on vs off, wall, Zen 5 wgs-5M: +1.0 / +2.4 / +1.2 / +1.3 % at -k 25 / 28 / 32 / 40;
  * wes-5M -1.3 / +0.9 / -0.8 / -1.2 %). AVX2 still wins at -k 32 (Zen 3 wes-5M -3.8 %). Everything
  * keyed on pruning (the length sort, the narrow-offset record in _pre and its read in _post) uses
@@ -392,7 +392,10 @@ static bool rescue_prune_on(const mem_opt_t *opt)
     static const bool avx512 = bwamem3_simd_tier() == BWAMEM3_TIER_AVX512BW;
     /* No --meth on x86: the cheaper kswv leaves nothing to win (Zen 5, EM-seq genomic +0.1 %,
      * collapsed -B 4 +1.6 %, TAPS +5.0 %). */
-    return rescue_prune_enabled() && !opt->meth_mode && !(avx512 && minsc >= 25) && p.simd_ok();
+    /* The AVX-512 gate is on the seed length, not minsc = k a: scaling a scales every score and the
+     * threshold alike, so -A 2 at the default -k 19 prunes like -A 1 does (Zen 5, prune on vs off, wgs-5M:
+     * -A 2 -2.5 %, -A 2 -B 8 -O 12 -E 2 -2.2 %, -A 3 -B 12 -O 18 -E 3 -1.7 %; wes-5M flat). */
+    return rescue_prune_enabled() && !opt->meth_mode && !(avx512 && opt->min_seed_len >= 25) && p.simd_ok();
 #endif
 }
 
