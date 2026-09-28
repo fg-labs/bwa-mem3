@@ -171,9 +171,11 @@ static inline Kind lean(const Job &jb, Scratch &s, int &hb, int &he, int minsc)
 //  layers >= 2 walk entry ids (J = sec[code], then ENT's next) instead of query positions. A query
 //  needing more than ECAP entries gives FULL, as the scalar filter does.
 //  K > 5 (KK, exact matching; Wt::K): step 2 builds the K-mer table (filter_kmer_table), and step 3's
-//  5-mer test keeps a superset of the K-mer hit rows (a row whose K-mer occurs in the query has its
-//  5-mer suffix there too); those rows then get their K-mer code and are kept only if presk has it
-//  and they end a K-mer (row >= KK - 1). Steps 4-7 run unchanged on the K-mer table, with
+//  5-mer test keeps a superset of the K-mer hit rows: a row whose K-mer occurs in the query has its
+//  own 5-mer there, and so do rows r - 1 .. r - (KK - 5), whose 5-mers lie inside that K-mer, so the
+//  row's presence bit is ANDed with theirs (the chained prefilter; the previous block's bits carry
+//  across blocks). The survivors then get their K-mer code and are kept only if presk has it and
+//  they end a K-mer (row >= KK - 1). Steps 4-7 run unchanged on the K-mer table, with
 //  minrow = row - (KK - 1).
 /* A diagonal component at the filter call's minsc with a hit, as step 7 finds it (shifted diagonal
  * indices x = d + off): the mw run [a, b), ub = max bnd over it, i0 = min minrow over its hit
@@ -384,9 +386,11 @@ static inline void filter_rel_table(S &s, const uint8_t *qb, int len2, int off, 
 // K > 5 (exact matching; Wt::K): step 2's query table over K-mers, shared by the NEON filter and the
 // x86 port. For every query position jj >= KK - 1, the K-mer ending there goes into tabk and nxt as a
 // 5-mer goes into tab and nxt at K = 5 (tabk[code] = (off - j_last) | MULTI | occurrences << 16) and
-// into the presence bitmap presk; its 5-mer suffix (s.qcode[jj], computed by the caller) goes into
-// pres, which step 3's vector test reads as the prefilter. qb is the zero-padded query copy + 4. The
-// tables are reset through the codes the previous K-mer query touched, not cleared in full.
+// into the presence bitmap presk. Every 5-mer of the query (s.qcode[jj], jj >= 4, computed by the
+// caller) goes into pres, which step 3 reads as the prefilter: a K-mer hit's last 5-mer and each
+// 5-mer inside it (ending 1 to KK - 5 rows earlier) must all be there, so the 5-mers before the
+// query's first K-mer end count too. qb is the zero-padded query copy + 4. The tables are reset
+// through the codes the previous K-mer query touched, not cleared in full.
 template <int KK, class S>
 static inline void filter_kmer_table(S &s, const uint8_t *qb, int len2, int off)
 {
@@ -403,14 +407,16 @@ static inline void filter_kmer_table(S &s, const uint8_t *qb, int len2, int off)
     int ck = 0;
     for (int jj = 0; jj < len2; jj++) {
         ck = ((ck << 2) | qb[jj]) & kmask;
+        if (jj >= 4) {
+            const int c5 = s.qcode[jj];
+            s.pres[c5 >> 3] |= (uint8_t)(1u << (c5 & 7));
+        }
         if (jj < KK - 1) continue;
         const uint32_t old = s.tabk[ck], occ = (old >> 16) + 1;
         if (occ == 1) s.touchk[s.ntouchk++] = (uint16_t)ck;
         s.nxt[jj] = occ == 1 ? (int16_t)-1 : (int16_t)(off - (old & 0x1FFF));
         s.tabk[ck] = occ << 16 | (uint32_t)(off - jj) | (occ == 1 ? 0 : 0x2000);
         s.presk[ck >> 3] |= (uint8_t)(1u << (ck & 7));
-        const int c5 = s.qcode[jj];
-        s.pres[c5 >> 3] |= (uint8_t)(1u << (c5 & 7));
     }
 }
 
@@ -538,6 +544,9 @@ static inline Kind lean_neon_core(const Job &jb, NeonScratch &s, int &hb, int &h
         static const uint8_t bw[16] = {1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128};
         const uint8x16_t P2 = vld1q_u8(p2), BW = vld1q_u8(bw), k64 = vdupq_n_u8(64), k7 = vdupq_n_u8(7);
         uint16_t *rp = s.PR, *cp = s.PC;
+        /* K > 5: the raw presence bits of the previous block (rows b - 16 .. b - 1), for the chained
+         * prefilter; zero before block 0, whose rows below KK - 1 are dropped anyway. */
+        unsigned ph = 0;
         // rows b..b+15, of which those with bit set in keep are inside the window
         auto block = [&](int b, unsigned keep) {
             const uint8_t *buf = s.rbuf + b;
@@ -552,7 +561,13 @@ static inline Kind lean_neon_core(const Job &jb, NeonScratch &s, int &hb, int &h
             const uint8x16_t hit = vtstq_u8(byte, vqtbl1q_u8(P2, vandq_u8(lo, k7)));
             uint8x16_t m = vandq_u8(hit, BW);
             m = vpaddq_u8(m, m); m = vpaddq_u8(m, m); m = vpaddq_u8(m, m);
-            const unsigned m16 = vgetq_lane_u16(vreinterpretq_u16_u8(m), 0) & keep;
+            const unsigned hr = vgetq_lane_u16(vreinterpretq_u16_u8(m), 0);
+            unsigned m16 = hr & keep;
+            if (KK > 5) {   // AND in the bits of rows r - 1 .. r - (KK - 5): bit 16 + i - j of h32 is row b + i - j
+                const unsigned h32 = hr << 16 | ph;
+                for (int j = 1; j <= KK - 5; j++) m16 &= h32 >> (16 - j);
+                ph = hr;
+            }
             const uint16x8_t c0 = vreinterpretq_u16_u8(vzip1q_u8(lo, a0));
             const uint16x8_t c1 = vreinterpretq_u16_u8(vzip2q_u8(lo, a0));
             const uint16x8_t pos = vaddq_u16(IO, vdupq_n_u16((uint16_t)b));

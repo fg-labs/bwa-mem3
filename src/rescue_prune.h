@@ -32,6 +32,13 @@
  * step in K cuts random hits 4x, so the bound keeps fewer rows for the same threshold. Production
  * takes K > 5 for exact matching only; --meth keeps K = 5 (rescue_prune_kmax in bwamem_pair.cpp).
  *
+ * Two corollaries let the SIMD filters skip work without changing a decision. Every diagonal
+ * interval is non-empty and sums a cnt_d - c, so its bound is at most a (K - 1) + c + a hits - c:
+ * a job whose total hit count cannot reach minsc is B1 before any diagonal is accumulated (the
+ * early B1). And a K-mer hit's row r has every 5-mer of that K-mer in the query, the ones ending
+ * at rows r - (K - 5) .. r, so at K > 5 a row is a candidate only if all of those 5-mers are (the
+ * chained 5-mer prefilter); the K-mer test itself then decides.
+ *
  * Decisions:
  *   RESCUE_PRUNE_B1   no diagonal interval reaches minsc: score < minsc is proven, so the job's
  *                     outputs are dead. The caller does not enqueue it and takes the ordinary
