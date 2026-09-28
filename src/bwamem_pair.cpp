@@ -439,31 +439,22 @@ static bool rescue_repeat_enabled()
     return on;
 }
 
-/* The largest filter K for this run (rescue_prune_params::from takes the largest K the scoring
- * admits, up to this): BWA3_RESCUE_PRUNE_KMAX (clamped to [5, rescue_prune_scratch_kmax]), else 8
- * where a SIMD filter takes K up to 8 and it pays, 5 elsewhere. A scoring whose mismatch and gap
- * costs admit K > 5 (-B 6 or more with the default gap costs, -x intractg) prunes with longer
- * K-mers: 4x fewer random hits per step, so fewer rows kept. aarch64: 8 (Graviton 4, wall, K = 5 ->
- * up to 8, wgs-5M / wes-5M: -B 6 -9.2 / -3.1 %, -B 8 -10.1 / -1.5 %, -x intractg -13.4 / -3.3 %).
- * x86 with kswv at the AVX2 tier: 8 (Zen 3, same: -B 6 -4.2 / -0.2 %, -B 8 -3.5 / -1.7 %,
- * -x intractg -5.3 / -2.0 %). At the AVX-512BW tier: 5, as its cheaper kswv leaves less to prune
- * (Zen 5, same: -B 6 +0.6 / -1.7 %, -B 8 +0.8 / -2.1 %, -x intractg -1.0 / -1.0 %). --meth keeps K = 5:
- * its matching, on converted copies or under the relation, is validated at K = 5 only, and the
- * relation's entry table is 5-mer only (rescue_prune_params::simd_ok). The default scoring admits
- * K = 5 alone, so it is unchanged. */
+/* The largest filter K for this run (rescue_prune_params::from takes the largest valid K up to
+ * this): BWA3_RESCUE_PRUNE_KMAX (clamped to [5, rescue_prune_scratch_kmax]), else 8 wherever a SIMD
+ * filter runs (RESCUE_PRUNE_HAVE_SIMD; a build without one does not prune, so its 5 is moot). A
+ * scoring whose mismatch and gap costs admit K > 5 (-B 5 or more with the default gap costs,
+ * -x intractg) prunes with longer K-mers: 4x fewer random hits per step, so fewer rows kept.
+ * Wall, K = 5 -> up to 8, -t 16, wgs-5M / wes-5M (5 M read pairs each), interleaved reps:
+ * Graviton 4 (NEON, 3 reps): -B 6 -9.2 / -3.1 %, -B 8 -10.1 / -1.5 %, -x intractg -13.4 / -3.3 %;
+ * Zen 3 (AVX2 tier, 5 reps): -B 6 -4.2 / -0.2 %, -B 8 -3.5 / -1.7 %, -x intractg -5.3 / -2.0 %;
+ * Zen 5 (AVX-512BW tier, 5 reps, with the early B1 and the chained 5-mer prefilter), whose cheaper
+ * kswv leaves less to prune: -B 6 -0.8 / -1.3 %, -B 8 -0.1 / -1.2 %, -x intractg -0.7 / -1.6 %.
+ * --meth keeps K = 5: its matching, on converted copies or under the relation, is validated at
+ * K = 5 only, and the relation's entry table is 5-mer only (rescue_prune_params::simd_ok). The
+ * default scoring admits K = 5 alone, so it is unchanged. */
 static int rescue_prune_kmax(const mem_opt_t *opt)
 {
-#if defined(__aarch64__)
-    static const int dflt = rescue_prune_scratch_kmax;
-#elif defined(__AVX2__)
-    /* The kswv tier, read once; bwamem3_simd_init is idempotent and fixes it, as in rescue_prune_runs. */
-    static const int dflt = [] {
-        bwamem3_simd_init();
-        return bwamem3_simd_tier() == BWAMEM3_TIER_AVX512BW ? 5 : rescue_prune_scratch_kmax;
-    }();
-#else
-    static const int dflt = 5;
-#endif
+    static const int dflt = RESCUE_PRUNE_HAVE_SIMD ? rescue_prune_scratch_kmax : 5;
     static const int env = rescue_env_int("BWA3_RESCUE_PRUNE_KMAX", -1);
     static const int k = env >= 0 ? std::max(5, std::min(env, rescue_prune_scratch_kmax)) : dflt;
     return opt->meth_mode ? 5 : k;

@@ -212,7 +212,7 @@ generated fixture only, not on real data: the x86 rows (AVX2 build) run
 generated jobs.
 
 - **Exact rescue pruning.** Before a rescue job is staged, a filter bounds the
-  best local score from the exact 5-mer matches between the mate and the window.
+  best local score from the exact K-mer matches between the mate and the window.
   A job proven unable to reach the rescue threshold (`min_seed_len * a`) is not
   run and takes the ordinary failing-rescue path; otherwise only the rows that
   can hold an alignment at that threshold are computed, which reproduces every
@@ -221,14 +221,14 @@ generated jobs.
   plus extend each cost at least four matches, the insertion strictly more, with
   a threshold above four matches and each gap type's open plus extend at most
   255 (the byte kswv's 8-bit kernels hold it in): the default
-  `-A 1 -B 4 -O 6 -E 1`, and for example `-B 6` or `-O 8 -E 2`; the bound then
-  counts exact 5-mers (`rescue_prune_params::from` states the conditions). Where
-  every separator costs more, the bound counts longer K-mers, which cuts random
-  hits 4x per step: K - 1 matches may cost at most the mismatch penalty, the
+  `-A 1 -B 4 -O 6 -E 1`, and for example `-O 8 -E 2`, where the bound counts
+  exact 5-mers (`rescue_prune_params::from` states the conditions). Where every
+  separator costs more, the bound counts longer K-mers, which cuts random hits
+  4x per step: K - 1 matches may cost at most the mismatch penalty, the
   deletion open and the insertion open plus extend, so `-B 6` counts 7-mers and
-  `-x intractg` 8-mers, the longest any filter takes. On aarch64 and where
-  kswv runs at the x86 AVX2 tier (`BWA3_RESCUE_PRUNE_KMAX`), and never under
-  `--meth`, which stays at 5-mers. Other
+  `-x intractg` 8-mers, the longest any filter takes, wherever the SIMD filter
+  runs (`BWA3_RESCUE_PRUNE_KMAX`), and never under `--meth`, which stays at
+  5-mers. Other
   scorings, windows or mates with an N, mates over 1024 bases and windows over
   30000 rows keep the full window. Jobs under `--rescue-kmer` bypass exact
   pruning, but its own k-mer anchor path can still narrow the window. Jobs on
@@ -371,7 +371,7 @@ generated jobs.
 |---|---|
 | `BWA3_RESCUE_PRUNE=0` | Turn off exact rescue pruning and the banded passes: every rescue window runs in full through the rescue kernel (the reference path for identity checks). `--rescue-kmer`, which narrows windows on its own, is unaffected. Default on where pruning runs. |
 | `BWA3_RESCUE_PRUNE_MAX_HITS=<n>` | Keep the full window when the mate and window share more than `n` exact K-mer hits, where the filter would cost more than it saves (default 1000 on aarch64 when banding is on, unless a `--meth` run leaves its pruned windows unbanded, as EM-seq does by default; 400 otherwise, and always 400 on x86; [#541](https://github.com/fg-labs/bwa-mem3/pull/541), TAPS: [#546](https://github.com/fg-labs/bwa-mem3/pull/546), K-mers: [#548](https://github.com/fg-labs/bwa-mem3/pull/548)). It only chooses between exact paths, so output does not depend on its value by design. |
-| `BWA3_RESCUE_PRUNE_KMAX=<n>` | The longest K-mer the filter may count where the scoring admits it, from 5 to 8 (values outside act as the nearer end): default 8 on aarch64 and at the x86 AVX2 kswv tier, 5 elsewhere, and always 5 under `--meth`. The default scoring admits only 5. It only chooses between exact paths, so output does not depend on its value by design. ([#548](https://github.com/fg-labs/bwa-mem3/pull/548)) |
+| `BWA3_RESCUE_PRUNE_KMAX=<n>` | The longest K-mer the filter may count where the scoring admits it, from 5 to 8 (values outside act as the nearer end): default 8 on aarch64 and the x86 AVX2 and AVX-512BW builds, 5 elsewhere (where nothing is pruned), and always 5 under `--meth`. The default scoring admits only 5. It only chooses between exact paths, so output does not depend on its value by design. ([#548](https://github.com/fg-labs/bwa-mem3/pull/548)) |
 | `BWA3_RESCUE_PRUNE_REL=<n>` | Under `--meth` at the genomic and neutral scorings, on aarch64 (x86 does not prune `--meth`), how the filter relates bases: `1` (default) the exact relation for TAPS chemistry and converted copies for EM-seq, `0` converted copies only (TAPS is then not pruned), `2` the relation for every such run; values above 2 act as 2. It only chooses between exact paths, so output does not depend on its value by design. ([#546](https://github.com/fg-labs/bwa-mem3/pull/546)) |
 | `BWA3_RESCUE_PRUNE_STATS=1` | Print, once at exit, how the filter decided (`[RESCUE_PRUNE] jobs=… full=… b1=… b2=… rows_in=… rows_kept=… jobs16=… b1_16=… b2_16=… kmer_jobs=… memo_hits=… reused=… filter_s=… kswv_pass0_s=… band_pass0_s=… kswv_pass1_s=… band_pass1_s=… dedup_run=… dedup_skip=… dedup_run_regs=… dedup_skip_regs=… dedup_insert1=… dedup_insert1_fast=… dedup_s=…`): jobs filtered, and of them how many kept the full window, were proven to fail (`b1`) or were narrowed (`b2`), with the window rows before and after, the number of 16-bit rescue jobs and how many of them were proven to fail or narrowed (`b1_16`, `b2_16`, included in `b1` and `b2`), the jobs the SIMD filter decided with K-mers longer than 5 (`kmer_jobs`), the jobs the SIMD filter answered from its repeat memo, the jobs answered from an identical recent job's result instead of being enqueued, and the thread-summed seconds of each rescue stage; how many post-rescue dedups ran, were skipped, took the one-region insert and of those were done in one pass; and how the banded DP resolved (`[RESCUE_BAND] banded_parents=… …`); the 16-bit decisions (`b1_16`, `b2_16`): [#542](https://github.com/fg-labs/bwa-mem3/pull/542), `kmer_jobs`: [#548](https://github.com/fg-labs/bwa-mem3/pull/548). Measurement only; output is unchanged. |
 | `BWA3_RESCUE_DEDUP_SKIP=0` | Run every post-rescue dedup in full instead of skipping one proven to be a no-op or adding a single new region in one pass. Default on. It only chooses between exact paths, so output is the same either way by design. |
@@ -392,7 +392,7 @@ generated jobs.
 
 Every integer knob above (`=<n>` or `=<pct>`) takes a non-negative decimal integer of at most 2147483647, with no sign or surrounding whitespace. An unset or empty knob silently takes the default; any other invalid value is reported to stderr and the default used. The on/off knobs (`=0`) are off for any value starting with `0` and on otherwise.
 
-The byte-identity above was measured at the default knob values. Beyond the defaults, CI tests only these values, on generated inputs. On aarch64 (NEON): `BWA3_RESCUE_BAND=0` and `BWA3_RESCUE_BAND_COST=100000000` (the cost gate forced open) against the full-window reference (`BWA3_RESCUE_PRUNE=0 BWA3_RESCUE_BAND=0`) on a generated paired-end fixture at `-t 1` and `-t 4`, and `BWA3_RESCUE_BAND_COST=100000000` on generated rescue jobs checked field by field, alone and with each of `BWA3_RESCUE_PRUNE_MAX_HITS=100000`, `BWA3_RESCUE_BAND_SHIFT=0`, `BWA3_RESCUE_BAND_KERNEL=1` and `BWA3_RESCUE_FSCAN=0`. On aarch64 and x86 (AVX2): `BWA3_RESCUE_FSCAN=0` against the default in the rescue kernels' unit tests, field by field. Other values are exact by construction but untested.
+The byte-identity above was measured at the default knob values. Beyond the defaults, CI tests only these values, on generated inputs. On aarch64 (NEON): `BWA3_RESCUE_BAND=0` and `BWA3_RESCUE_BAND_COST=100000000` (the cost gate forced open) against the full-window reference (`BWA3_RESCUE_PRUNE=0 BWA3_RESCUE_BAND=0`) on a generated paired-end fixture at `-t 1` and `-t 4`, and `BWA3_RESCUE_BAND_COST=100000000` on generated rescue jobs checked field by field, alone and with each of `BWA3_RESCUE_PRUNE_MAX_HITS=100000`, `BWA3_RESCUE_BAND_SHIFT=0`, `BWA3_RESCUE_BAND_KERNEL=1` and `BWA3_RESCUE_FSCAN=0`. On aarch64 and x86 (AVX2): `BWA3_RESCUE_FSCAN=0` against the default in the rescue kernels' unit tests, field by field, and `BWA3_RESCUE_PRUNE_KMAX` at 3, 5 and 99 against the full-window reference at `-B 6` on the generated fixture. Other values are exact by construction but untested.
 
 ---
 
