@@ -90,6 +90,11 @@ typedef struct compat_target_t {
      * upstreams. */
     int emit_hn;
 
+    /* The ungapped shortcut bypasses the reference SW extension path that
+     * produces scores later used for XS. Keep it for native output, but
+     * route compatibility targets through the reference extension. */
+    int use_ungapped_extension;
+
     /* When mem_chain_flt's weight filter drops EVERY chain for a read, hand
      * slot 0 -- a chain the filter just rejected -- back to the caller with
      * kept = 3 (1), or report zero survivors (0).

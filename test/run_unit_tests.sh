@@ -464,4 +464,7 @@ ok "shm_round_trip_test"
 (cd "$HERE" && ./shm_meth_test.sh) || fail "shm_meth_test"
 ok "shm_meth_test"
 
+"$HERE/compat_xs_score_test.sh" || fail "compat_xs_score_test"
+ok "compat_xs_score_test"
+
 echo "ALL UNIT TESTS PASSED"

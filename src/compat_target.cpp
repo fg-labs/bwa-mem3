@@ -25,6 +25,7 @@ const compat_target_t COMPAT_TARGET_OFF = {
     /* .read_sidecar       */ 1,
     /* .emit_mq            */ 1,
     /* .emit_hn            */ 1,
+    /* .use_ungapped_extension */ 1,
     /* .chain_flt_resurrect_empty */ 0,   /* zero survivors, as bwa: the filter's decision stands */
     /* .sa_sentinel_drop_offset */ 0,     /* correct coordinate (matches bwa) */
 };
@@ -50,6 +51,7 @@ static const compat_target_t COMPAT_TARGET_BWA_MEM2 = {
     /* .read_sidecar       */ 0,
     /* .emit_mq            */ 0,
     /* .emit_hn            */ 0,
+    /* .use_ungapped_extension */ 0,
     /* .chain_flt_resurrect_empty */ 1,   /* seqid-range machinery synthesizes {0,1} */
     /* .sa_sentinel_drop_offset */ 1,     /* bwa-mem2 call_one_step sets sa_entry = 0 */
 };
@@ -102,6 +104,7 @@ static const compat_target_t COMPAT_TARGET_BWA_MEM = {
     /* .read_sidecar       */ 0,
     /* .emit_mq            */ 1,
     /* .emit_hn            */ 0,
+    /* .use_ungapped_extension */ 0,
     /* .chain_flt_resurrect_empty */ 0,   /* bwa returns 0; the read stays unmapped */
     /* .sa_sentinel_drop_offset */ 0,     /* bwt_sa accounts for the walk offset */
 };

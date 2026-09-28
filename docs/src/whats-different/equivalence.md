@@ -223,6 +223,11 @@ Caveats:
   deprecated `--skip-contained-ext` is an accepted no-op. The byte-identity claim's measured scope
   (workload, host, architecture, and SIMD tier) is documented under
   [`mem` → `--keep-contained-ext`](../cli/mem.md#--keep-contained-ext--opt-out-of-the-contained-seed-extension-skip).
+- **Ungapped extension shortcuts are disabled for both compatibility targets.** A shortcut
+  bypasses the banded-SW extension path used by bwa-mem2 and bwa. Both targets now use that
+  reference path; native bwa-mem3 output keeps the shortcut. The path feeds alignment scores
+  that may be reported as `XS`; the current synthetic test verifies routing but does not
+  reproduce an `XS` value difference. This changes no command-line option or SAM field definition.
 - **The sidecar `@SQ` is skipped, not rewritten.** Outside `--compat` the
   `<prefix>.hdr` / `<baseprefix>.dict` block remains authoritative and is emitted verbatim.
   On those sidecar-honoring paths — the default profile, `--bam` and `--meth` — an index with
