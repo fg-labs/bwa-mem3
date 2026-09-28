@@ -46,9 +46,9 @@ struct Stats {
     long jobs = 0, simd = 0, fallback = 0, b2 = 0, bad = 0, kind[3] = {0, 0, 0}, rel = 0, rel_b2 = 0;
 };
 
-/* Scorings (a, b, o_del, e_del, o_ins, e_ins, k_max): K = 5 ones the SIMD filters take, and K > 5
- * ones only the scalar filter takes (the wrapper's scalar path, checked against a reference scratch
- * that is reset in full now and then, which checks the tables' touched-code reset). */
+/* Scorings (a, b, o_del, e_del, o_ins, e_ins, k_max): K = 5 ones, and K > 5 ones, which both SIMD
+ * filters take with exact matching (the scalar reference is reset in full now and then, which checks
+ * the tables' touched-code reset). */
 const int SCORINGS[][7] = {
     {1, 4, 8, 2, 8, 2, 5},     // -O 8 -E 2: c = 2
     {1, 4, 6, 2, 6, 2, 5},     // -E 2: c = 2

@@ -38,8 +38,13 @@
 #include "rescue_prune_x86.h"
 
 enum { RESCUE_PRUNE_FULL = 0, RESCUE_PRUNE_B1 = 1, RESCUE_PRUNE_B2 = 2 };
-/* The largest K the scalar filter takes (its code tables span 4^K codes); the SIMD filters take K = 5. */
+/* The largest K the scalar filter takes (its code tables span 4^K codes); the SIMD filters take the same. */
 static const int rescue_prune_scratch_kmax = 8;
+#if defined(__aarch64__)
+static_assert(rescue_prune_neon::NeonScratch::KMAXN == rescue_prune_scratch_kmax, "the NEON filter takes every K the scalar one does");
+#elif defined(__AVX2__)
+static_assert(rescue_prune_x86::X86Scratch::KMAXN == rescue_prune_scratch_kmax, "the x86 filter takes every K the scalar one does");
+#endif
 
 /* Scoring parameters of the bound (general-scoring derivation, section 2): match a, mismatch b,
  * gap of length L costs o + e*L per type. The lemma generalises with K - 1 <= min(b, o_del,
@@ -79,14 +84,10 @@ struct rescue_prune_params {
         return n > 0 ? n / e_del : 0;
     }
     /* The SIMD filters take K = 5 and any weights (simd_wt); a <= 16 keeps a cnt within int16. The
-     * NEON filter also takes K = 6..KMAXN with exact matching (no --meth relation). */
+     * NEON and x86 filters also take K = 6..KMAXN with exact matching (no --meth relation). */
     bool simd_ok() const
     {
-#if defined(__aarch64__)
-        return valid && a <= 16 && (K == 5 || (K <= rescue_prune_neon::NeonScratch::KMAXN && relx < 0));
-#else
-        return valid && K == 5 && a <= 16;
-#endif
+        return valid && a <= 16 && (K == 5 || (K <= rescue_prune_scratch_kmax && relx < 0));
     }
     rescue_prune_neon::Wt simd_wt() const
     {
@@ -432,7 +433,7 @@ static inline int rescue_prune_window(const uint8_t *ref, int len1, const uint8_
         rescue_prune_last_path() = 3;
         const rescue_prune_neon::Job jb{len1, len2, 0, 0, -1, -1, ref, q};
         int h, e;
-        const rescue_prune_neon::Kind k = rescue_prune_x86::lean_x86(jb, xs, h, e, max_hits, minsc, p.simd_wt(), p.relx);
+        const rescue_prune_neon::Kind k = rescue_prune_x86::lean_x86(jb, xs, h, e, max_hits, minsc, p.simd_wt(), p.relx, p.K);
         if (k == rescue_prune_neon::SCALAR) goto scalar;   // int32 path: > 32000 hits, long windows
         if (k == rescue_prune_neon::B1) return RESCUE_PRUNE_B1;
         if (k == rescue_prune_neon::FULL) return RESCUE_PRUNE_FULL;
