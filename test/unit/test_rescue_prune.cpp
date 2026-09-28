@@ -393,10 +393,11 @@ TEST_CASE("rescue prune: decisions at other scorings reproduce every consumed ks
 }
 
 // K > 5: a scoring whose mismatch and gap costs admit longer K-mers filters with them, up to the
-// caller's k_max (-B 6: K = 7; -x intractg: K = 10, capped at 8; -B 8 at k_max 6: K = 6). Each job at
-// one of them in rotation through the ksw_align2 oracle, and the wrapper (on aarch64 the NEON K-mer
-// filter, on x86 the scalar one) against a scalar filter whose tables are cleared in full every few
-// jobs, which checks the touched-code reset of the tables the wrapper keeps across queries.
+// caller's k_max. Three scorings in rotation: -B 6 (K = 7), -x intractg (its costs admit K = 10, the
+// cap 8 takes K = 8) and -B 8 under a cap of 6 (K = 6). Each job runs through the ksw_align2 oracle,
+// and through the wrapper (the SIMD K-mer filter where the build has one, which must decide some
+// jobs at every K) against a scalar filter whose tables are cleared in full every 8 jobs, which
+// checks the touched-code reset of the tables the wrapper keeps across queries.
 TEST_CASE("rescue prune: K-mer decisions up to K = 8 reproduce ksw_align2 and the scalar filter"
           * doctest::test_suite("unit/pair")) {
     std::mt19937 rng(9001);
@@ -406,7 +407,7 @@ TEST_CASE("rescue prune: K-mer decisions up to K = 8 reproduce ksw_align2 and th
                       {1, 8, 6, 1, 6, 1, 6, 6, "-B 8 at k_max 6"}};
     Tally t[3];
     std::unique_ptr<rescue_prune_scratch> fresh(new rescue_prune_scratch());
-    int n_simd = 0;
+    int n_simd[3] = {0, 0, 0};
     for (size_t i = 0; i < jobs.size(); i++) {
         const Sc &s = sc[i % 3];
         const std::string name(s.name);
@@ -432,7 +433,7 @@ TEST_CASE("rescue prune: K-mer decisions up to K = 8 reproduce ksw_align2 and th
             CHECK(hb == shb);
             CHECK(he == she);
         }
-        n_simd += kind == RESCUE_PRUNE_B2 && v.bnd16 != nullptr;
+        n_simd[i % 3] += kind == RESCUE_PRUNE_B2 && v.bnd16 != nullptr;
     }
     for (int k = 0; k < 3; k++) {
         const std::string name(sc[k].name);
@@ -440,10 +441,10 @@ TEST_CASE("rescue prune: K-mer decisions up to K = 8 reproduce ksw_align2 and th
         MESSAGE(name << ": B1=" << t[k].b1 << " B2=" << t[k].b2 << " FULL=" << t[k].full);
         CHECK(t[k].b1 > 0);
         CHECK(t[k].b2 > 0);
-    }
-#if defined(__aarch64__)
-    CHECK(n_simd > 0);   // the NEON filter decided some of them, not only the scalar fallback
+#if RESCUE_PRUNE_HAVE_SIMD
+        CHECK(n_simd[k] > 0);   // the SIMD filter's K-mer instantiation decided some, not only the scalar fallback
 #endif
+    }
 }
 
 // rescue_prune_params::from takes the largest valid K up to its cap: where the costs admit a K that

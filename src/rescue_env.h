@@ -26,7 +26,8 @@
  *                                   on aarch64 with banding on, unless a --meth run leaves its
  *                                   pruned windows unbanded (EM-seq by default); else 400
  * BWA3_RESCUE_PRUNE_KMAX      auto  the longest K-mer the filter may use where the scoring admits
- *                                   it (5 to 8); auto is 8 on aarch64, else 5; --meth always 5
+ *                                   it (5 to 8); auto is 8 on aarch64 and where kswv runs at the
+ *                                   x86 AVX2 tier, else 5; --meth always 5
  * BWA3_RESCUE_PRUNE_REL       1     --meth genomic / neutral scoring, aarch64 (x86 --meth is not
  *                                   pruned): 1 filter TAPS under the exact relation (EM-seq and
  *                                   collapsed scoring match converted copies), 0 converted copies

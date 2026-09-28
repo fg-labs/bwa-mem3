@@ -30,7 +30,8 @@
  *                                     query), each at the hull (400) and banded (1000) gates and
  *                                     with the gate open
  *
- * Exit status 1 on any disagreement, and when no job took the SIMD path (a vacuous run). Needs a SIMD
+ * Exit status 1 on any disagreement, and when no job took the SIMD path (a vacuous run), or, in a
+ * fuzz run, when the relation's jobs or the jobs at some K from 6 to 8 never did. Needs a SIMD
  * filter: aarch64, or x86 built with arch=avx2 / arch=avx512bw; elsewhere rescue_prune_window() is
  * the scalar filter itself. Build: make rescue-prune-eq.
  *
@@ -57,8 +58,8 @@ namespace {
 using rescue_prune_neon::Comp;
 
 /* Scorings (a, b, o_del, e_del, o_ins, e_ins, k_max), at minsc = k a: K = 5 ones, and ones admitting
- * K > 5 at k_max 6-8, which the NEON filter takes with exact matching (under the relation, and on
- * x86, the scalar filter decides them). */
+ * K > 5 at k_max 6-8, which both SIMD filters take with exact matching (under the relation the
+ * scalar filter decides them). */
 const int SCORINGS[][7] = {
     {1, 4, 8, 2, 8, 2, 5},       // -O 8 -E 2: c = 2
     {1, 4, 6, 2, 6, 2, 5},       // -E 2: c = 2
@@ -94,6 +95,7 @@ bool same_filter(const rescue_prune_params &a, const rescue_prune_params &b)
 struct Stats {
     long jobs = 0, simd = 0, over_cap = 0, repeats = 0, memo_hits = 0, bad = 0, kind[3] = {0, 0, 0}, rel = 0,
          rel_b2 = 0, rel_simd = 0;
+    long kjobs[9] = {0}, ksimd[9] = {0};   // exact-matching jobs and SIMD B2 decisions per K (K > 5)
 };
 
 /* The scalar fields of two views of one job. Their arrays alias the same per-thread scratch, so
@@ -194,6 +196,7 @@ void run_one(const uint8_t *ref, int len1, const uint8_t *q, int len2, const res
         if (rep == 0 && p.relx >= 0) { st.rel++; st.rel_b2 += kind[0] == RESCUE_PRUNE_B2; }
         const bool simd = kind[rep] == RESCUE_PRUNE_B2 && view[rep].bnd16 != nullptr;
         st.simd += simd;
+        if (p.relx < 0 && p.K > 5 && p.K <= 8) { st.kjobs[p.K] += rep == 0; st.ksimd[p.K] += simd; }
         st.rel_simd += simd && p.relx >= 0;
         st.over_cap += simd && view[rep].ncomp > rescue_prune_simd_scratch_t::COMP_CAP;
         std::string why;
@@ -412,5 +415,15 @@ int main(int argc, char **argv)
     const bool rel_dead = mode == "fuzz" && st.rel > 0 && st.rel_simd == 0;
     if (rel_dead)
         fprintf(stderr, "FAIL: %ld relation jobs and none took the SIMD filter's B2 path under the relation\n", st.rel);
-    return st.bad || st.simd == 0 || memo_dead || rel_dead ? 1 : 0;
+    /* Likewise the K-mer instantiations (K = 6 to 8, exact matching): a fuzz run that drew jobs at a
+     * K and never took the SIMD filter's B2 path there compared the scalar filter with itself. */
+    bool k_dead = false;
+    for (int k = 6; k <= 8; k++) {
+        printf("  K=%d: jobs=%ld simd_b2=%ld\n", k, st.kjobs[k], st.ksimd[k]);
+        if (mode == "fuzz" && st.kjobs[k] > 0 && st.ksimd[k] == 0) {
+            fprintf(stderr, "FAIL: %ld jobs at K = %d and none took the SIMD filter's B2 path\n", st.kjobs[k], k);
+            k_dead = true;
+        }
+    }
+    return st.bad || st.simd == 0 || memo_dead || rel_dead || k_dead ? 1 : 0;
 }

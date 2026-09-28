@@ -64,13 +64,10 @@
 #include "rescue_prune_x86.h"
 
 enum { RESCUE_PRUNE_FULL = 0, RESCUE_PRUNE_B1 = 1, RESCUE_PRUNE_B2 = 2 };
-/* The largest K any filter takes: the scalar filter's code tables span 4^K codes, and the NEON
- * filter's K-mer instantiations stop at the same K (NeonScratch::KMAXN). */
-static const int rescue_prune_scratch_kmax = 8;
-#if defined(__aarch64__)
-static_assert(rescue_prune_neon::NeonScratch::KMAXN == rescue_prune_scratch_kmax,
-              "the NEON filter takes every K the scalar one does");
-#endif
+/* The largest K any filter takes, one value for all of them: the SIMD filters' K-mer
+ * instantiations stop at FilterScratch::KMAXN (bounded by their 16-bit code storage), and the
+ * scalar filter's code tables and production's cap (rescue_prune_kmax) follow it. */
+static const int rescue_prune_scratch_kmax = rescue_prune_neon::FilterScratch<true>::KMAXN;
 
 /* kswv's 8-bit bias for the score table {+a, -b, -1}: -min(-b, -1) (a --meth matrix's minimum is
  * still -b, mem_opt_fill_meth_mat). */
@@ -129,16 +126,13 @@ struct rescue_prune_params {
         return n <= 0 ? 0 : e_del == 1 ? n : n / e_del;   // no division at the default -E 1
     }
     /* The SIMD filters take K = 5 and any weights (simd_wt), under the --meth relation too; a <= 16
-     * keeps a cnt in int16 (they fall back to the scalar filter where a sum would leave it). The NEON
-     * filter also takes K = 6..rescue_prune_scratch_kmax with exact matching (relx < 0): the
-     * relation's entry table is 5-mer only, and production never pairs it with K > 5. */
+     * keeps a cnt in int16 (they fall back to the scalar filter where a sum would leave it). Both
+     * also take K = 6..rescue_prune_scratch_kmax with exact matching (relx < 0): the relation's
+     * entry table is 5-mer only, and production never pairs it with K > 5. K = 3 and 4 (the band
+     * harness's k_min 3) have no SIMD instantiation and go to the scalar filter. */
     bool simd_ok() const
     {
-#if defined(__aarch64__)
-        return valid && a <= 16 && (K == 5 || (K <= rescue_prune_scratch_kmax && relx < 0));
-#else
-        return valid && K == 5 && a <= 16;
-#endif
+        return valid && a <= 16 && (K == 5 || (K > 5 && K <= rescue_prune_scratch_kmax && relx < 0));
     }
     rescue_prune_neon::Wt simd_wt() const
     {
@@ -521,8 +515,8 @@ static inline bool rescue_meth_rel_matrix_ok(const int8_t *mat, int hyp, int a, 
  * On x86 no --meth, where the cheaper kswv leaves nothing to win (Zen 5, EM-seq genomic
  * +0.1 %, collapsed -B 4 +1.6 %, TAPS +5.0 %; the relation filter, single thread over 5.57 M TAPS
  * rescue jobs, costs 8.0 s to save about 5 thread-s of kswv), and only where the SIMD filter runs
- * (simd_ok: K = 5, a <= 16): the scalar filter costs more than it saves against the cheaper x86
- * kswv (Zen 5 AVX-512, prune on vs off, scalar-filtered: -O 8 -E 2 +13.3 / +4.7 %, -x intractg
+ * (simd_ok: K = 5, or 6 to 8 with exact matching, a <= 16): the scalar filter costs more than it
+ * saves against the cheaper x86 kswv (Zen 5 AVX-512, prune on vs off, scalar-filtered: -O 8 -E 2 +13.3 / +4.7 %, -x intractg
  * +14.6 / +4.9 %), while the SIMD filter at those scorings wins or breaks even (Zen 3 AVX2: -O 8
  * -E 2 -2.6 / -7.2 %, -x intractg -0.3 / -6.2 %; Zen 5: all within 1 %), and not at the AVX-512BW
  * tier from seed length 25 (-k 25; minsc >= 25 a, since minsc = min_seed_len * a): there

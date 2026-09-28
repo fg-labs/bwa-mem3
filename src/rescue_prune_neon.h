@@ -253,6 +253,8 @@ struct FilterScratch {
      * of the query: a window row whose 5-mer is absent from it cannot end a K-mer hit, so step 3's
      * vector test stays as the prefilter. */
     static const int KMAXN = 8;
+    // K-mer codes live in 16 bits: PC, touchk, and the x86 port's epi16 code lanes.
+    static_assert(2 * KMAXN <= 16, "a K-mer code must fit 16 bits");
     std::vector<uint32_t> tabk;
     std::vector<uint8_t> presk;
     uint16_t touchk[CAP];

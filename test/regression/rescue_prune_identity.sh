@@ -66,9 +66,9 @@
 # jobs on every other tier and none at AVX-512BW. Three scorings other than the
 # default must match the reference at the same scoring too: -B 6, -x intractg
 # and -O 8 -E 2, which the SIMD filters take (the first two with longer K-mers
-# where the build's K cap admits them: 7- and 8-mers on aarch64), so their
-# stats must show filtered
-# jobs and narrowed windows wherever they run, and a leg with every bandable
+# where the K cap admits them: 7- and 8-mers on aarch64 and at the x86 AVX2
+# kswv tier), so their stats must show filtered jobs and narrowed windows
+# wherever they run, and a leg with every bandable
 # hull banded must match as well and show banded parents; and -B 3, which the
 # lemma refuses, so no filtered job. The band kernels take all three, so each
 # must band pass 1. The same pairs as bisulfite reads, under --meth -B 4,
