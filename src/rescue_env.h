@@ -33,7 +33,7 @@
  *     BWA3_RESCUE_BAND           1     run pruned pass-0 jobs in diagonal bands (0: kswv on the
  *                                      hull, and MAX_HITS auto back to 400)
  *     BWA3_RESCUE_BAND_COST      85    band a pass-0 parent iff its band cells are < this % of
- *                                      the hull's
+ *                                      the hull's (100 where kswv runs at the AVX2 tier)
  *     BWA3_RESCUE_BAND_R2        1     run round 2 banded (0: kswv on the hull)
  *     BWA3_RESCUE_BAND_TIGHT     8     delta of the tight top band (0: off)
  *     BWA3_RESCUE_BAND_P1        2     pass-1 banding: 0 none, 1 banded parents only, 2 every

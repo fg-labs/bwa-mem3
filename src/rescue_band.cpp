@@ -2,6 +2,7 @@
  * the per-parent merge. See rescue_band.h for the design and the exactness argument. */
 #include "rescue_band.h"
 #include "rescue_env.h"
+#include "simd_dispatch.h"
 
 #include <algorithm>
 #include <atomic>
@@ -40,10 +41,15 @@ bool rescue_band_enabled()
  * quanta, i.e. when the band cells (per row the kernel computes at most ~quanta of them, see
  * rb_dp_core) undercut the hull. The banded DP and kswv cost about the same per cell, so pct < 100
  * covers the band path's fixed costs (SoA build, merge, score2). BWA3_RESCUE_BAND_COST overrides
- * pct; 85 was the best of {40, 55, 70, 85, 100, 130} locally (M-series, wgs-like HG002). */
+ * pct; 85 was the best of {40, 55, 70, 85, 100, 130} locally (M-series, wgs-like HG002). Where kswv
+ * runs at the AVX2 tier (32 lanes, against the AVX-512 tier's 64) a hull cell costs more, so the
+ * default is 100 there: on Zen 3 (c6a, two runs of 5 rotated reps, identical output) it cut the
+ * band + kswv thread-s 1.0-1.1 % on wes and 1.4-1.5 % on wgs; wgs wall/user fell 0.2-0.3 % and wes
+ * wall was neutral. The AVX-512 tier keeps 85 (its 64-lane kswv makes the hull cheaper). */
 static int rb_cost_pct()
 {
-    static const int v = rescue_env_int("BWA3_RESCUE_BAND_COST", 85);
+    static const int v = rescue_env_int("BWA3_RESCUE_BAND_COST",
+                                        bwamem3_simd_tier() == BWAMEM3_TIER_AVX2 ? 100 : 85);
     return v;
 }
 static const int RB_OVH = 8;          // per-row fixed cost of a band lane, in cell units
