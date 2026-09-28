@@ -405,7 +405,18 @@ static inline Kind lean_x86_core(const Job &jb, X86Scratch &s, int &hb, int &he,
         n = (int)(mp - s.RA);
         extra = _mm_add_epi32(extra, _mm_srli_si128(extra, 8));
         extra = _mm_add_epi32(extra, _mm_srli_si128(extra, 4));
-        if ((long)np + (uint32_t)_mm_cvtsi128_si32(extra) > max_hits) return FULL;
+        const long nh = (long)np + (uint32_t)_mm_cvtsi128_si32(extra);   // hits over all layers
+        if (nh > max_hits) return FULL;
+        /* Every Kadane segment below is non-empty and sums a * cnt - c over its diagonals, so the
+         * best is at most a * hits - c (cnt - 1 summed: hits - 1): when even that misses minsc, the
+         * verdict at the end of step 6 is B1, decided here before the layers and scans. Only where
+         * that verdict is reached (no SCALAR from the hit or int16 headroom guards), exact matching
+         * only (the relation's layers are not counted by extra). */
+        if (!Rel && nh <= 32000 &&
+            (Gen ? wt.a >= 0 && wt.c >= 0 && (long)wt.a * nh <= 32000 && (long)wt.c * nd <= 32000 &&
+                       wt.base + (long)wt.a * nh - wt.c < minsc
+                 : 5 + nh - 1 < minsc))
+            return B1;
         // cnt is scanned up to the 8-segment round-up of nd (< nd + 64)
         memset(s.cnt, 0, (((nd + 63) & ~63) + 8) * sizeof(uint16_t));
         // Layer 1 runs, last to first: rows descend, so the last store to minrow[d] is the first

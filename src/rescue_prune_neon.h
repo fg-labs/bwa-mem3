@@ -539,7 +539,18 @@ static inline Kind lean_neon_core(const Job &jb, NeonScratch &s, int &hb, int &h
         n = (int)(mp - s.RA);
         // Gate: the total hit count is known now (each hit row adds its code's occurrences),
         // before anything is accumulated.
-        if ((long)np + vaddvq_u32(extra) > max_hits) return FULL;
+        const long nh = (long)np + vaddvq_u32(extra);   // hits over all layers
+        if (nh > max_hits) return FULL;
+        /* Every Kadane segment below is non-empty and sums a * cnt - c over its diagonals, so the
+         * best is at most a * hits - c (cnt - 1 summed: hits - 1): when even that misses minsc, the
+         * verdict at the end of step 6 is B1, decided here before the layers and scans. Only where
+         * that verdict is reached (no SCALAR from the hit or int16 headroom guards), exact matching
+         * only (the relation's layers are not counted by extra). */
+        if (!Rel && nh <= 32000 &&
+            (Gen ? wt.a >= 0 && wt.c >= 0 && (long)wt.a * nh <= 32000 && (long)wt.c * nd <= 32000 &&
+                       wt.base + (long)wt.a * nh - wt.c < minsc
+                 : 5 + nh - 1 < minsc))
+            return B1;
         // cnt is scanned up to the 8-segment round-up of nd (< nd + 64)
         memset(s.cnt, 0, (((nd + 63) & ~63) + 8) * sizeof(uint16_t));
         // Layer 1 runs, last to first: rows descend, so the last store to minrow[d] is the first
