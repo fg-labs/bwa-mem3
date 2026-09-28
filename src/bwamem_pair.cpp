@@ -388,17 +388,15 @@ static bool rescue_meth_rel(const mem_opt_t *opt)
  * costs admit K > 5 (-B >= 6 with -O >= 6, -x intractg) prunes with longer K-mers: 4x fewer random
  * hits per step, so fewer rows kept. aarch64: up to 8, which the NEON filter takes (Graviton 4, wall,
  * K = 5 -> up to 8, wgs-5M / wes-5M: -B 6 -9.2 / -3.1 %, -B 8 -10.1 / -1.5 %, -x intractg
- * -13.4 / -3.3 %). x86 AVX2: up to 8, which the x86 filter takes (Zen 3, wall, K = 5 -> up to 8,
- * wgs-5M / wes-5M: -B 6 -4.2 / -0.2 %, -B 8 -3.5 / -1.7 %, -x intractg -5.3 / -2.0 %). x86 AVX-512: 5,
- * as its cheaper kswv leaves less to prune (Zen 5, same: -B 6 +0.6 / -1.7 %, -B 8 +0.8 / -2.1 %,
- * -x intractg -1.0 / -1.0 %). Other x86 builds: 5 (no SIMD filter for K > 5).
+ * -13.4 / -3.3 %). x86 AVX2 and AVX-512: up to 8, which the x86 filter takes (Zen 3, wall, K = 5 ->
+ * up to 8, wgs-5M / wes-5M: -B 6 -4.2 / -0.2 %, -B 8 -3.5 / -1.7 %, -x intractg -5.3 / -2.0 %; Zen 5,
+ * whose cheaper kswv leaves less to prune, same with the chained 5-mer prefilter: -B 6 -0.8 / -1.3 %,
+ * -B 8 -0.1 / -1.2 %, -x intractg -0.7 / -1.6 %). Other x86 builds: 5 (no SIMD filter for K > 5).
  * --meth keeps K = 5 (its matching, converted copies or the relation, was validated at K = 5 only). */
 static int rescue_prune_kmax(const mem_opt_t *opt)
 {
-#if defined(__aarch64__)
+#if defined(__aarch64__) || defined(__AVX2__)
     static const int dflt = rescue_prune_scratch_kmax;
-#elif defined(__AVX2__)
-    static const int dflt = bwamem3_simd_tier() == BWAMEM3_TIER_AVX512BW ? 5 : rescue_prune_scratch_kmax;
 #else
     static const int dflt = 5;
 #endif
