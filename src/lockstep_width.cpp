@@ -191,17 +191,12 @@ void bwa3_init_smem_lockstep_width(const void *base, int64_t n_blocks,
 
 /* ---- third-pass bwtseed lockstep: on/off policy (see lockstep_width.h) ----- */
 
-/* The compile-time platform default for the third-pass bwtseed lockstep, and the
- * single place it is written down: arm64 has no SMT so keep it on, elsewhere the
- * rule decides and this is the fallback (off). Used both to initialize
- * g_bwtseed_lockstep and, in bwa3_init_bwtseed_lockstep, as the default_on fed to
- * the resolver -- so a later unset run always falls back here, never to a leaked
- * prior value. */
-#if defined(__aarch64__)
+/* The compile-time default for the third-pass bwtseed lockstep, and the single
+ * place it is written down: on, on every platform and at every thread count
+ * (measurements in lockstep_width.h). Used both to initialize g_bwtseed_lockstep
+ * and, in bwa3_init_bwtseed_lockstep, as the default_on fed to the resolver -- so
+ * a later unset run always falls back here, never to a leaked prior pin. */
 #define BWA3_BWTSEED_LOCKSTEP_DEFAULT 1
-#else
-#define BWA3_BWTSEED_LOCKSTEP_DEFAULT 0
-#endif
 
 int32_t g_bwtseed_lockstep = BWA3_BWTSEED_LOCKSTEP_DEFAULT;
 
@@ -357,14 +352,10 @@ int32_t bwa3_physical_core_count(void) {
     /* Count only the physical cores the process may actually run on. A cpuset or
      * taskset restriction (containers, batch schedulers) can confine the workers
      * to a subset of the host -- even to the SMT siblings of a single core -- and
-     * the lockstep rule must compare n_threads against that, not the host's full
-     * core count. Build an allowed[] from the effective affinity mask and pass it
-     * to the masked count. Whenever the effective affinity cannot be determined,
-     * return the unknown sentinel (0) rather than the host-wide count: reporting
-     * the host's full core count for a possibly-restricted process could enable
-     * lockstep when n_threads exceeds the process's available cores but not the
-     * host's. The rule already treats physical_cores <= 0 as "no basis to move"
-     * and keeps the platform default. */
+     * the startup log should report that, not the host's full core count. Build
+     * an allowed[] from the effective affinity mask and pass it to the masked
+     * count. Whenever the effective affinity cannot be determined, return the
+     * unknown sentinel (0) rather than a possibly-wrong host-wide count. */
     static const char *const root = "/sys/devices/system/cpu";
     cpu_set_t set;
     CPU_ZERO(&set);
@@ -382,48 +373,33 @@ int32_t bwa3_physical_core_count(void) {
 }
 
 int32_t bwa3_bwtseed_lockstep_parse_env(const char *env) {
-    if (env == NULL || env[0] == '\0') return -1;  /* unset/empty: apply the rule */
+    if (env == NULL || env[0] == '\0') return -1;  /* unset/empty: the compiled default */
     if (strcmp(env, "0") == 0) return 0;
     if (strcmp(env, "1") == 0) return 1;
-    return -2;                                     /* invalid: report, apply the rule */
+    return -2;                                     /* invalid: report, then the default */
 }
 
-int bwa3_bwtseed_lockstep_rule(int32_t n_threads, int32_t physical_cores, int default_on) {
-    if (physical_cores <= 0) return default_on;    /* unknown topology: no basis to move */
-    return n_threads <= physical_cores;
-}
-
-int bwa3_bwtseed_lockstep_resolve(int32_t pinned, int is_arm64, int32_t n_threads,
-                                  int32_t physical_cores, int default_on) {
+int bwa3_bwtseed_lockstep_resolve(int32_t pinned, int default_on) {
     if (pinned == 0 || pinned == 1) return pinned;   /* explicit pin, taken alone */
-    if (is_arm64) return default_on;                 /* no SMT: keep the compiled default, no rule */
-    return bwa3_bwtseed_lockstep_rule(n_threads, physical_cores, default_on);
+    return default_on;                               /* unset or invalid: the compiled default */
 }
 
-int32_t bwa3_init_bwtseed_lockstep(int32_t n_threads) {
-    /* Resolve on every run, not once process-wide. A library caller can invoke
-     * main_mem more than once with different thread counts, and the third-pass
-     * driver dispatched in bwamem.cpp must reflect the current run's policy --
-     * not whichever thread count happened to come first. The sole caller runs
-     * this on the main thread before the seeding workers spawn, so the plain
-     * write to g_bwtseed_lockstep needs no synchronization. The first call still
-     * resolves from the compiled default, so single-run behavior is unchanged. */
-    const int32_t cores_used = bwa3_physical_core_count();  /* for the caller's log, pinned or not */
+int32_t bwa3_init_bwtseed_lockstep(void) {
+    /* Resolve on every run, not once process-wide, so a library caller that
+     * invokes main_mem more than once gets each run's own pin rather than whichever
+     * came first. The sole caller runs this on the main thread before the seeding
+     * workers spawn, so the plain write to g_bwtseed_lockstep needs no
+     * synchronization. */
+    const int32_t cores_used = bwa3_physical_core_count();  /* for the caller's log only */
     const char *env = getenv("BWA3_BWTSEED_LOCKSTEP");
     const int32_t pinned = bwa3_bwtseed_lockstep_parse_env(env);
     if (pinned == -2)
         fprintf(stderr,
                 "ERROR: BWA3_BWTSEED_LOCKSTEP=\"%s\" is not 0 or 1; ignoring it "
                 "(resolving as if unset).\n", env);
-#if defined(__aarch64__)
-    const int is_arm64 = 1;
-#else
-    const int is_arm64 = 0;
-#endif
-    /* Feed the compile-time default -- never the mutable g_bwtseed_lockstep --
-     * so an earlier explicit pin (or unknown-topology resolution) does not leak
-     * into a later run whose environment is unset. */
-    g_bwtseed_lockstep = bwa3_bwtseed_lockstep_resolve(pinned, is_arm64, n_threads,
-                                                      cores_used, BWA3_BWTSEED_LOCKSTEP_DEFAULT);
+    /* Feed the compile-time default -- never the mutable g_bwtseed_lockstep -- so
+     * an earlier explicit pin does not leak into a later run whose environment is
+     * unset. */
+    g_bwtseed_lockstep = bwa3_bwtseed_lockstep_resolve(pinned, BWA3_BWTSEED_LOCKSTEP_DEFAULT);
     return cores_used;
 }

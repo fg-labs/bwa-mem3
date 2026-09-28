@@ -3488,7 +3488,7 @@ int main_mem(int argc, char *argv[])
     /* Resolve the third-pass bwtseed lockstep on/off once, before the seeding
      * workers spawn (policy: lockstep_width.h). Scheduling only, never output. */
     {
-        const int32_t phys = bwa3_init_bwtseed_lockstep(opt->n_threads);
+        const int32_t phys = bwa3_init_bwtseed_lockstep();
         /* Resolve the lockstep WIDTH too (the compile-time default, or a
          * BWA3_BWTSEED_LOCKSTEP_N pin): how many reads' cp_occ misses the driver
          * overlaps. Scheduling only. */

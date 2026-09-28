@@ -2641,8 +2641,8 @@ SMEM *mem_collect_smem(FMI_search *fmi, const mem_opt_t *opt,
             min_intv_ar[l] = opt->max_mem_intv;
 
 // Third-pass re-seeding: the lockstep driver overlaps N reads' cp_occ misses
-// and wins wherever nothing else hides that latency; g_bwtseed_lockstep picks
-// the driver per run (resolved once at startup -- policy and measurements in
+// (on by default; g_bwtseed_lockstep is resolved once per run at startup, where
+// BWA3_BWTSEED_LOCKSTEP can pin it -- policy and measurements in
 // lockstep_width.h). Byte-identical either way: same SMEM emission order (the
 // bwtseed lockstep parity harness pins it).
 #if BWTSEED_LOCKSTEP_N > 1

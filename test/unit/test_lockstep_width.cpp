@@ -138,33 +138,13 @@ TEST_CASE("lockstep width: probe_enabled is a truthy opt-in (unset/empty/\"0\" d
 
 // --- third-pass bwtseed lockstep: on/off policy ---
 //
-// The rule is "one worker thread per physical core": the lockstep overlaps
-// cp_occ misses that an idle SMT sibling would otherwise leave exposed, and
-// stops paying once both siblings are busy. Unknown topology keeps the platform
-// default. The env pin is a strict 0/1 so a typo can never silently flip the
-// driver. The one-shot installer and the arm64 always-on branch are exercised
-// by the whole-run byte-identity gates, not here.
-
-TEST_CASE("bwtseed lockstep: rule enables only when threads <= physical cores"
-          * doctest::test_suite("unit/smem")) {
-    SUBCASE("threads at or below the core count enable it") {
-        CHECK(bwa3_bwtseed_lockstep_rule(1,  16, 0) == 1);
-        CHECK(bwa3_bwtseed_lockstep_rule(16, 16, 0) == 1);
-    }
-    SUBCASE("more threads than cores (SMT siblings busy) disable it") {
-        CHECK(bwa3_bwtseed_lockstep_rule(17, 16, 1) == 0);
-        CHECK(bwa3_bwtseed_lockstep_rule(32, 16, 1) == 0);
-    }
-    SUBCASE("unknown topology keeps the platform default, whichever it is") {
-        CHECK(bwa3_bwtseed_lockstep_rule(8,  0, 0) == 0);
-        CHECK(bwa3_bwtseed_lockstep_rule(8,  0, 1) == 1);
-        CHECK(bwa3_bwtseed_lockstep_rule(8, -1, 1) == 1);
-    }
-}
+// On by default everywhere; the env pin is a strict 0/1 so a typo can never
+// silently flip the driver. The one-shot installer is exercised below and by the
+// whole-run byte-identity gates.
 
 TEST_CASE("bwtseed lockstep: parse_env is a strict 0/1 pin with unset and invalid distinct"
           * doctest::test_suite("unit/smem")) {
-    SUBCASE("unset or empty is -1 (apply the rule)") {
+    SUBCASE("unset or empty is -1 (the compiled default)") {
         CHECK(bwa3_bwtseed_lockstep_parse_env(nullptr) == -1);
         CHECK(bwa3_bwtseed_lockstep_parse_env("")      == -1);
     }
@@ -172,7 +152,7 @@ TEST_CASE("bwtseed lockstep: parse_env is a strict 0/1 pin with unset and invali
         CHECK(bwa3_bwtseed_lockstep_parse_env("0") == 0);
         CHECK(bwa3_bwtseed_lockstep_parse_env("1") == 1);
     }
-    SUBCASE("anything else is -2 (invalid: reported, then the rule applies)") {
+    SUBCASE("anything else is -2 (invalid: reported, then the default)") {
         CHECK(bwa3_bwtseed_lockstep_parse_env("2")    == -2);
         CHECK(bwa3_bwtseed_lockstep_parse_env("yes")  == -2);
         CHECK(bwa3_bwtseed_lockstep_parse_env("01")   == -2);
@@ -180,53 +160,44 @@ TEST_CASE("bwtseed lockstep: parse_env is a strict 0/1 pin with unset and invali
     }
 }
 
-TEST_CASE("bwtseed lockstep: resolve composes pin > arm64 default > rule"
+TEST_CASE("bwtseed lockstep: resolve takes a 0/1 pin alone, else the default"
           * doctest::test_suite("unit/smem")) {
-    SUBCASE("a 0/1 pin wins over everything, on either platform") {
-        CHECK(bwa3_bwtseed_lockstep_resolve(1, /*arm64*/0, 32, 16, 0) == 1);
-        CHECK(bwa3_bwtseed_lockstep_resolve(0, /*arm64*/1, 8,  16, 1) == 0);
+    SUBCASE("a 0/1 pin wins over the default") {
+        CHECK(bwa3_bwtseed_lockstep_resolve(1, 0) == 1);
+        CHECK(bwa3_bwtseed_lockstep_resolve(0, 1) == 0);
     }
-    SUBCASE("arm64 keeps its compiled default without consulting the rule") {
-        CHECK(bwa3_bwtseed_lockstep_resolve(-1, 1, 64, 16, 1) == 1);   // would be off by the rule
-        CHECK(bwa3_bwtseed_lockstep_resolve(-1, 1, 64,  0, 1) == 1);   // unknown topology too
-    }
-    SUBCASE("unset and invalid both fall through to the rule elsewhere") {
-        CHECK(bwa3_bwtseed_lockstep_resolve(-1, 0, 16, 16, 0) == 1);
-        CHECK(bwa3_bwtseed_lockstep_resolve(-2, 0, 16, 16, 0) == 1);
-        CHECK(bwa3_bwtseed_lockstep_resolve(-1, 0, 32, 16, 0) == 0);
-        CHECK(bwa3_bwtseed_lockstep_resolve(-2, 0, 32, 16, 0) == 0);
-        CHECK(bwa3_bwtseed_lockstep_resolve(-1, 0, 32,  0, 0) == 0);   // unknown: default
+    SUBCASE("unset and invalid both return the default") {
+        CHECK(bwa3_bwtseed_lockstep_resolve(-1, 1) == 1);
+        CHECK(bwa3_bwtseed_lockstep_resolve(-2, 1) == 1);
+        CHECK(bwa3_bwtseed_lockstep_resolve(-1, 0) == 0);
+        CHECK(bwa3_bwtseed_lockstep_resolve(-2, 0) == 0);
     }
 }
 
-#if defined(__aarch64__)
-TEST_CASE("bwtseed lockstep: init resolves default from the compile-time platform default, "
+TEST_CASE("bwtseed lockstep: init resolves default from the compile-time default, "
           "not a leaked prior value"
           * doctest::test_suite("unit/smem")) {
-    // Regression: bwa3_init_bwtseed_lockstep must feed the compile-time platform
-    // default (arm64 -> on) as `default_on`, never the mutable g_bwtseed_lockstep.
-    // Otherwise an explicit pin (or an unknown-topology resolution) leaks into a
-    // later run whose environment is unset -- which on arm64 must revert to the
-    // compiled default. Deterministic only on arm64, where resolve returns
-    // default_on directly without consulting the host-dependent core count.
+    // Regression: bwa3_init_bwtseed_lockstep must feed the compile-time default
+    // (on) as `default_on`, never the mutable g_bwtseed_lockstep. Otherwise an
+    // explicit pin leaks into a later run whose environment is unset, which must
+    // revert to the compiled default.
     const int32_t saved_global = g_bwtseed_lockstep;
     const char *saved_env = getenv("BWA3_BWTSEED_LOCKSTEP");
     const bool had_env = saved_env != NULL;
     const std::string saved_env_val = had_env ? saved_env : "";
 
     setenv("BWA3_BWTSEED_LOCKSTEP", "0", 1);
-    bwa3_init_bwtseed_lockstep(8);
+    bwa3_init_bwtseed_lockstep();
     CHECK(g_bwtseed_lockstep == 0);   // explicit pin honored
 
     unsetenv("BWA3_BWTSEED_LOCKSTEP");
-    bwa3_init_bwtseed_lockstep(8);
-    CHECK(g_bwtseed_lockstep == 1);   // reverts to the arm64 compiled default, not the leaked pin
+    bwa3_init_bwtseed_lockstep();
+    CHECK(g_bwtseed_lockstep == 1);   // reverts to the compiled default, not the leaked pin
 
     if (had_env) setenv("BWA3_BWTSEED_LOCKSTEP", saved_env_val.c_str(), 1);
     else unsetenv("BWA3_BWTSEED_LOCKSTEP");
     g_bwtseed_lockstep = saved_global;
 }
-#endif
 
 namespace {
 // A synthetic sysfs cpu tree: `online` plus one thread_siblings_list per CPU.
