@@ -296,7 +296,16 @@ static inline Kind lean_x86_core(const Job &jb, X86Scratch &s, int &hb, int &he,
         n = (int)(mp - s.RA);
         extra = _mm_add_epi32(extra, _mm_srli_si128(extra, 8));
         extra = _mm_add_epi32(extra, _mm_srli_si128(extra, 4));
-        if ((long)np + (uint32_t)_mm_cvtsi128_si32(extra) > max_hits) return FULL;
+        const long nh = (long)np + (uint32_t)_mm_cvtsi128_si32(extra);   // hits over all layers
+        if (nh > max_hits) return FULL;
+        /* Early B1: every Kadane interval of step 6 is non-empty and sums a cnt - c over its
+         * diagonals (c > 0), so the best is at most a hits - c (hits - 1 at the default weights).
+         * When base plus even that misses minsc, B1 is the scalar filter's verdict too (its gate
+         * counts the same hits, and its bound is the same sum), so return it here, before the
+         * layers and scans. The sum is taken in long, so it holds past the int16 guards below that
+         * would otherwise send the job to the scalar filter. Kept to exact matching, where it was
+         * measured (under the relation nh counts entries, which is exact as well). */
+        if (!Rel && (Gen ? wt.base + (long)wt.a * nh - wt.c : 4 + nh) < minsc) return B1;
         // cnt is scanned up to the 8-segment round-up of nd (< nd + 64)
         memset(s.cnt, 0, (((nd + 63) & ~63) + 8) * sizeof(uint16_t));
         // Layer 1 runs, last to first: rows descend, so the last store to minrow[d] is the first
