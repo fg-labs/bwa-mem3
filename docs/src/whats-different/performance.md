@@ -47,15 +47,34 @@ Graviton3.
 
 The third seeding pass (`bwtSeedStrategy` occurrence-bounded re-seeding) has its
 own lockstep driver, overlapping `BWTSEED_LOCKSTEP_N` reads' forward-extension
-walks so their `cp_occ` cache misses issue together. Whether it runs is a
-per-run decision (`g_bwtseed_lockstep`: on for arm64, and for x86 when every
-worker thread gets its own physical core; `BWA3_BWTSEED_LOCKSTEP=0`/`1` pins it),
-because it only wins where nothing else already hides that latency.
+walks so their `cp_occ` cache misses issue together. Since
+[#530](https://github.com/fg-labs/bwa-mem3/pull/530) it is on by default on every
+platform and at every thread count (`BWA3_BWTSEED_LOCKSTEP=0`/`1` pins it). x86
+used to turn it off whenever `-t` exceeded the physical core count, on the theory
+that a busy SMT sibling hides the same latency; at the depth-24 default it does
+not. Turning it on at `-t` = 2× physical cores cut whole-aligner wall on every SMT
+host measured, with byte-identical alignment records at fixed `-t`/`-K` (headers
+excluded). Wall change, lockstep off → on, on 5M-pair WGS and WES slices (150 bp
+paired, hg38; AVX2 build; 5–7 interleaved reps per arm):
+
+| Host | CPU | Threads / physical cores | WGS | WES |
+|---|---|---|---|---|
+| c6a.4xlarge | AMD Zen 3 | 16 / 8 | −8.2% | −7.2% |
+| c7i.4xlarge | Intel Sapphire Rapids | 16 / 8 | −9.6% | −8.2% |
+| c6a.8xlarge | AMD Zen 3 | 32 / 16 | −8.2% | −7.2% |
+| c7i.8xlarge | Intel Sapphire Rapids | 32 / 16 | −8.9% | −8.3% |
+
+Other SMT microarchitectures (for example Zen 4 with
+SMT) and oversubscription beyond `-t` = 2× physical cores were not measured for
+speed; output identity there rests on the driver's SMEM-order parity design, not
+on a measurement. `test/regression/bwtseed_lockstep_driver_identity.sh`
+pins the scalar driver in CI and checks it against the default.
 
 Its depth is a distinct knob from the phase-2 SMEM width above. The default is
 **24**, resolved at startup into a runtime value. Measured whole-aligner wall on a
 5M-read WGS slice (150 bp paired NovaSeq reads, hg38), each host at threads ≤
-physical cores (the regime where this pass's lockstep runs), sweeping the depth via
+physical cores (held fixed so the sweep compares depths, not thread regimes),
+sweeping the depth via
 `BWA3_BWTSEED_LOCKSTEP_N` on a single binary per host:
 
 | Host | SIMD tier | Threads | Best depth | Δ vs depth 8 |
@@ -79,7 +98,7 @@ md5 gate matching the prior depth-8 output on x86 (clang-19, avx512bw tier) and 
 | Variable | Effect |
 |---|---|
 | `BWA3_BWTSEED_LOCKSTEP_N=<n>` | Pin the third-pass lockstep depth to `<n>` (1–64). A value above 64 is clamped; a non-positive or malformed value is reported to stderr and ignored (the default is used). An unset or empty value (`BWA3_BWTSEED_LOCKSTEP_N=`) silently keeps the compiled default, with no message. |
-| `BWA3_BWTSEED_LOCKSTEP=0`\|`1` | Force the third-pass lockstep driver off / on, overriding the per-run thread-vs-core rule. |
+| `BWA3_BWTSEED_LOCKSTEP=0`\|`1` | Force the third-pass lockstep driver off / on (default: on). |
 
 ## Batched `-H` header ingestion (PR #49, closes issue #37)
 

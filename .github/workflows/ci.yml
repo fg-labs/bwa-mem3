@@ -871,6 +871,14 @@ jobs:
           CHR22_SIM_DIR=/tmp/chr22-sim \
           bash test/regression/thread_determinism.sh
 
+      - name: bwtseed lockstep driver identity (chr22, default vs BWA3_BWTSEED_LOCKSTEP=0)
+        if: matrix.canonical == true
+        run: |
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          CHR22_FA=/tmp/chr22/chr22.fa \
+          CHR22_SIM_DIR=/tmp/chr22-sim \
+          bash test/regression/bwtseed_lockstep_driver_identity.sh
+
       - name: Chaining scratch is per-thread, not per-read
         if: matrix.canonical == true
         run: |
