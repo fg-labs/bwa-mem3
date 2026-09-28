@@ -882,8 +882,11 @@ static long rb_dp_wave2(rb_work &w, int W, int NR, int omax, int ominq, int omas
         return flush;
     };
     /* One row on its own (the last row of an odd count, or a row whose pair has an empty range):
-     * RB_CELL1 with Hp -> Ha and E in place. */
-    auto single_row = [&](int r) -> bool {
+     * RB_CELL1 with Hp -> Ha and E in place. The kernel constants are captured by value: captured
+     * by reference they would be address-taken, and every vst1q_u8 below (a uint8_t store, which
+     * may alias anything) would then force the paired-row loop to reload them from the stack on
+     * every step (six vector loads per two cells, measured on Graviton 4). */
+    auto single_row = [&, tbl, vOI, vEI, vOD, vED](int r) -> bool {
         const uint8x16_t rref = vld1q_u8(REF + (size_t)r * 16);
         uint8x16_t f = vdupq_n_u8(0), rmax = vdupq_n_u8(0);
         const int khi = std::min(W - 1, r + omax), klo = std::max(0, r + ominq);
