@@ -213,14 +213,16 @@ static inline Kind lean_x86_core(const Job &jb, X86Scratch &s, int &hb, int &he,
             int ck = 0;
             for (int jj = 0; jj < len2; jj++) {
                 ck = ((ck << 2) | qb[jj]) & kmask;
+                if (jj >= 4) {   // every 5-mer of the query: the scan's chained prefilter reads them all
+                    const int c5 = s.qcode[jj];
+                    s.pres[c5 >> 3] |= (uint8_t)(1u << (c5 & 7));
+                }
                 if (jj < KK - 1) continue;
                 const uint32_t old = s.tabk[ck], occ = (old >> 16) + 1;
                 if (occ == 1) s.touchk[s.ntouchk++] = (uint16_t)ck;
                 s.nxt[jj] = occ == 1 ? (int16_t)-1 : (int16_t)(off - (old & 0x1FFF));
                 s.tabk[ck] = occ << 16 | (uint32_t)(off - jj) | (occ == 1 ? 0 : 0x2000);
                 s.presk[ck >> 3] |= (uint8_t)(1u << (ck & 7));
-                const int c5 = s.qcode[jj];
-                s.pres[c5 >> 3] |= (uint8_t)(1u << (c5 & 7));
             }
         } else if (KK == 5 && !s.q_has_n && len2 >= 5) {
             memset(s.tab, 0, sizeof s.tab);
@@ -273,20 +275,15 @@ static inline Kind lean_x86_core(const Job &jb, X86Scratch &s, int &hb, int &he,
         const __m128i P2 = _mm_setr_epi8(1, 2, 4, 8, 16, 32, 64, (char)128, 0, 0, 0, 0, 0, 0, 0, 0);
         const __m128i k1f = _mm_set1_epi8(0x1F), k7 = _mm_set1_epi8(7);
         uint16_t *rp = s.PR, *cp = s.PC;
-        /* K > 5: a hit row's full K-mer code, code5 | rb[r - t] << 2t for t = 5..KK - 1, from
-         * unaligned loads (a block's rows are contiguous). Block 0 reads through head, which puts
-         * 16 zero bytes before rbuf. */
-        alignas(16) uint8_t head[64];
-        if (KK > 5) { memset(head, 0, 16); memcpy(head + 16, s.rbuf, 48); }
-        auto kcode = [&](int b, __m128i &c0, __m128i &c1) {
-            const uint8_t *base = b ? s.rbuf + b : head + 16;
-            for (int t = 5; t < KK; t++) {
-                const __m128i x = x86_ld(base + 4 - t), z = _mm_setzero_si128();
-                const __m128i sh = _mm_cvtsi32_si128(2 * t);
-                c0 = _mm_or_si128(c0, _mm_sll_epi16(_mm_unpacklo_epi8(x, z), sh));
-                c1 = _mm_or_si128(c1, _mm_sll_epi16(_mm_unpackhi_epi8(x, z), sh));
-            }
-        };
+        /* K > 5: a hit row's full K-mer code, code5(r) | (code5(r - 5) & (4^(KK-5) - 1)) << 10
+         * (code5(r - 5)'s low bases are rb[r - 5], rb[r - 6], ...), with code5(r - 5) of the block's
+         * rows from the previous block's codes (pc1, zero before block 0: those rows are below KK - 1
+         * and dropped). A row's K-mer can occur in the query only if each 5-mer inside it does, i.e.
+         * rows r - 1 .. r - (KK - 5) hit too (their presence bits, raw, in ph: the previous block's
+         * above bit 16); rows r >= KK - 1 have those rows >= 4. */
+        __m128i pc1 = _mm_setzero_si128();
+        unsigned ph = 0;
+        const __m128i kmk = _mm_set1_epi16((short)((1 << (2 * (KK - 5))) - 1));
         auto block = [&](int b, unsigned keep) {
             __m128i a0;
             const __m128i lo = x86_code_lo(s.rbuf + b, a0);
@@ -303,9 +300,18 @@ static inline Kind lean_x86_core(const Job &jb, X86Scratch &s, int &hb, int &he,
             const __m128i byte = _mm_blendv_epi8(_mm_blendv_epi8(l01, l23, s5), _mm_blendv_epi8(l45, l67, s5), s6);
             const __m128i bit = _mm_shuffle_epi8(P2, _mm_and_si128(lo, k7));
             const __m128i hit = _mm_cmpeq_epi8(_mm_and_si128(byte, bit), bit);
-            const unsigned m16 = (unsigned)_mm_movemask_epi8(hit) & keep;
+            const unsigned hr = (unsigned)_mm_movemask_epi8(hit);
+            unsigned m16 = hr & keep;
             __m128i c0 = _mm_unpacklo_epi8(lo, a0), c1 = _mm_unpackhi_epi8(lo, a0);
-            if (KK > 5) kcode(b, c0, c1);
+            if (KK > 5) {
+                const unsigned h32 = hr << 16 | ph;
+                for (int j = 1; j <= KK - 5; j++) m16 &= h32 >> (16 - j);
+                ph = hr;
+                const __m128i p0 = _mm_alignr_epi8(c0, pc1, 6), p1 = _mm_alignr_epi8(c1, c0, 6);   // code5(r - 5)
+                pc1 = c1;
+                c0 = _mm_or_si128(c0, _mm_slli_epi16(_mm_and_si128(p0, kmk), 10));
+                c1 = _mm_or_si128(c1, _mm_slli_epi16(_mm_and_si128(p1, kmk), 10));
+            }
             const __m128i pos = _mm_add_epi16(IO, _mm_set1_epi16((short)b));
             const unsigned ml = m16 & 0xFF, mh = m16 >> 8;
             const __m128i shl = x86_ld(s.shuf[ml]), shh = x86_ld(s.shuf[mh]);

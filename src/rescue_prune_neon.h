@@ -355,14 +355,16 @@ static inline Kind lean_neon_core(const Job &jb, NeonScratch &s, int &hb, int &h
             int ck = 0;
             for (int jj = 0; jj < len2; jj++) {
                 ck = ((ck << 2) | qb[jj]) & kmask;
+                if (jj >= 4) {   // every 5-mer of the query: the scan's chained prefilter reads them all
+                    const int c5 = s.qcode[jj];
+                    s.pres[c5 >> 3] |= (uint8_t)(1u << (c5 & 7));
+                }
                 if (jj < KK - 1) continue;
                 const uint32_t old = s.tabk[ck], occ = (old >> 16) + 1;
                 if (occ == 1) s.touchk[s.ntouchk++] = (uint16_t)ck;
                 s.nxt[jj] = occ == 1 ? (int16_t)-1 : (int16_t)(off - (old & 0x1FFF));
                 s.tabk[ck] = occ << 16 | (uint32_t)(off - jj) | (occ == 1 ? 0 : 0x2000);
                 s.presk[ck >> 3] |= (uint8_t)(1u << (ck & 7));
-                const int c5 = s.qcode[jj];
-                s.pres[c5 >> 3] |= (uint8_t)(1u << (c5 & 7));
             }
         } else if (KK == 5 && !s.q_has_n && len2 >= 5) {
             memset(s.tab, 0, sizeof s.tab);
@@ -421,6 +423,10 @@ static inline Kind lean_neon_core(const Job &jb, NeonScratch &s, int &hb, int &h
         static const uint8_t bw[16] = {1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128};
         const uint8x16_t P2 = vld1q_u8(p2), BW = vld1q_u8(bw), k64 = vdupq_n_u8(64), k7 = vdupq_n_u8(7);
         uint16_t *rp = s.PR, *cp = s.PC;
+        /* K > 5: a row's K-mer can occur in the query only if each 5-mer inside it does, i.e. rows
+         * r - 1 .. r - (KK - 5) hit too (their raw presence bits in ph: the previous block's above
+         * bit 16, zero before block 0, whose rows below KK - 1 are dropped anyway). */
+        unsigned ph = 0;
         // rows b..b+15, of which those with bit set in keep are inside the window
         auto block = [&](int b, unsigned keep) {
             const uint8_t *buf = s.rbuf + b;
@@ -435,7 +441,13 @@ static inline Kind lean_neon_core(const Job &jb, NeonScratch &s, int &hb, int &h
             const uint8x16_t hit = vtstq_u8(byte, vqtbl1q_u8(P2, vandq_u8(lo, k7)));
             uint8x16_t m = vandq_u8(hit, BW);
             m = vpaddq_u8(m, m); m = vpaddq_u8(m, m); m = vpaddq_u8(m, m);
-            const unsigned m16 = vgetq_lane_u16(vreinterpretq_u16_u8(m), 0) & keep;
+            const unsigned hr = vgetq_lane_u16(vreinterpretq_u16_u8(m), 0);
+            unsigned m16 = hr & keep;
+            if (KK > 5) {
+                const unsigned h32 = hr << 16 | ph;
+                for (int j = 1; j <= KK - 5; j++) m16 &= h32 >> (16 - j);
+                ph = hr;
+            }
             const uint16x8_t c0 = vreinterpretq_u16_u8(vzip1q_u8(lo, a0));
             const uint16x8_t c1 = vreinterpretq_u16_u8(vzip2q_u8(lo, a0));
             const uint16x8_t pos = vaddq_u16(IO, vdupq_n_u16((uint16_t)b));
