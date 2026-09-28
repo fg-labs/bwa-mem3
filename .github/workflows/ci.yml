@@ -1293,6 +1293,13 @@ jobs:
           BWA_CHR22_FA=/tmp/chr22/bwa_chr22.fa \
           CHR22_SIM_DIR=/tmp/chr22-sim \
           bash test/regression/chr22_parity.sh
+          # The chr22 reads rarely reach the chaining / Pass-3 fast paths'
+          # fallbacks, so run the fixture built to force them (equal-position
+          # chains, over-cap reads, 36 kb reads, --seed-order, --meth) with
+          # BWA_MEM3_DEBUG_P3_XCHECK and _UNGAPPED_XCHECK cross-checking each
+          # fast path against the code it replaces.
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          bash test/regression/chain_flat_replay_identity.sh
 
       - name: SIMD floor enforcement (TESTING_BUILD, injected below-floor tier)
         # What happens when the binary lands on a host older than the floor it
@@ -1357,6 +1364,12 @@ jobs:
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           HEADER_PARITY_WORK_DIR=/tmp/header-parity-asan \
           bash test/regression/header_parity.sh
+          # The flat chaining index frees any seed arrays it heap-grew and
+          # rewinds the seed buffer when it hands a read to the kbtree. A leak
+          # or use-after-free there changes no output byte, so only asan can
+          # see it; the fixture forces that hand-off on hundreds of reads.
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          bash test/regression/chain_flat_replay_identity.sh
           # Re-run the CLI-input safety test against the SAME asan binary. Its
           # bwa_escape trailing-backslash cases are a heap over-read inside
           # libbwa; on the plain (non-asan) build on the canonical row the read
