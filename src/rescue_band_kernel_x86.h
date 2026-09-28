@@ -319,7 +319,10 @@ static long rb_dp_wave2(rb_work &w, int W, int NR, int omax, int ominq, int omas
         rlast = row;
         return flush;
     };
-    auto single_row = [&](int r) -> bool {
+    /* The kernel constants are captured by value (as in the NEON rb_dp_wave2): captured by reference
+     * they would be address-taken, and every rb_st below (a byte store, which may alias anything)
+     * would then force the paired-row loop to reload them from the stack on every step. */
+    auto single_row = [&, tbl, vOI, vEI, vOD, vED](int r) -> bool {
         const __m256i rref = rb_ld(REF + (size_t)r * 32);
         __m256i f = _mm256_setzero_si256(), rmax = _mm256_setzero_si256();
         const int khi = std::min(W - 1, r + omax), klo = std::max(0, r + ominq);
