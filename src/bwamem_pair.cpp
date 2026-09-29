@@ -352,12 +352,14 @@ static bool rescue_prune_on()
     return arch_ok && rescue_prune_enabled();
 }
 /* BWA3_RESCUE_PRUNE_STATS=1 prints the filter's decisions to stderr at exit as one line,
- * "[RESCUE_PRUNE] jobs=.. full=.. b1=.. b2=.. rows_in=.. rows_kept=..": jobs filtered, and of
- * them how many kept the full window, were proven to fail (b1, not enqueued) or were narrowed to
- * a hull (b2), with the reference rows before and after. It is the non-vacuity check for the
- * identity A/B: identical output must come with a nonzero number of pruned rows. */
+ * "[RESCUE_PRUNE] jobs=.. full=.. b1=.. b2=.. rows_in=.. rows_kept=.. jobs16=.. <stage times>":
+ * jobs filtered, and of them how many kept the full window, were proven to fail (b1, not
+ * enqueued) or were narrowed to a hull (b2), with the reference rows before and after. It is the non-vacuity check for the
+ * identity A/B: identical output must come with a nonzero number of pruned rows. jobs16 counts
+ * the 16-bit rescue jobs, which the filter never sees: the same non-vacuity check for the 16-bit
+ * kswv kernels. */
 struct rescue_prune_stats_t {
-    std::atomic<uint64_t> jobs{0}, full{0}, b1{0}, b2{0}, rows_in{0}, rows_kept{0};
+    std::atomic<uint64_t> jobs{0}, full{0}, b1{0}, b2{0}, rows_in{0}, rows_kept{0}, jobs16{0};
     /* Thread-summed wall time of the rescue stages (ns): filter + band planning in _pre, kswv
      * pass 0 (8-bit + 16-bit), the banded pass 0, kswv pass 1 and the banded pass 1. Only measured
      * when stats are on. */
@@ -365,10 +367,12 @@ struct rescue_prune_stats_t {
     bool on = [] { const char *e = getenv("BWA3_RESCUE_PRUNE_STATS"); return e && e[0] == '1'; }();
     ~rescue_prune_stats_t() {
         if (on) fprintf(stderr, "[RESCUE_PRUNE] jobs=%llu full=%llu b1=%llu b2=%llu rows_in=%llu rows_kept=%llu "
-                        "filter_s=%.3f kswv_pass0_s=%.3f band_pass0_s=%.3f kswv_pass1_s=%.3f band_pass1_s=%.3f\n",
+                        "jobs16=%llu filter_s=%.3f kswv_pass0_s=%.3f band_pass0_s=%.3f kswv_pass1_s=%.3f "
+                        "band_pass1_s=%.3f\n",
                         (unsigned long long)jobs, (unsigned long long)full, (unsigned long long)b1,
                         (unsigned long long)b2, (unsigned long long)rows_in, (unsigned long long)rows_kept,
-                        ns_filter * 1e-9, ns_k0 * 1e-9, ns_band * 1e-9, ns_k1 * 1e-9, ns_b1 * 1e-9);
+                        (unsigned long long)jobs16, ns_filter * 1e-9, ns_k0 * 1e-9, ns_band * 1e-9,
+                        ns_k1 * 1e-9, ns_b1 * 1e-9);
     }
 };
 static inline uint64_t rescue_now_ns()
@@ -1713,6 +1717,7 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
              * and _post applies the same offset. The oriented mate is built once here and reused
              * for the staging copy below. */
             const bool pruned = rescue_prune_applies(opt, xtra);
+            if (g_rescue_prune_stats.on && !(xtra & KSW_XBYTE)) g_rescue_prune_stats.jobs16++;
             static thread_local std::vector<uint8_t> oq;   // oriented mate; grows, never shrinks
             if (pruned) {
                 if ((int)oq.size() < l_ms) oq.resize(l_ms);

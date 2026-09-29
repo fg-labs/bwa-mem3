@@ -42,8 +42,9 @@
  * that rectangle ends at (te, qe) (an earlier end row would contradict te being the first row of S
  * in pass 0, an earlier end column in row te the same for qe), so the answer is the start of the
  * score-S alignment A* ending at (te, qe) with the latest start row, then the latest start column.
- * At default scoring (a = 1, b = 4, gap 6 + len) A* with I inserted and D deleted bases and M <=
- * qe + 1 - I matches satisfies S <= qe + 1 - 2I - D - 6 if it has any gap, so D <= Dmax =
+ * At default scoring (a = 1, b = 4, gap 6 + len) A* with M matches, X mismatches, I inserted and
+ * D deleted bases has M + X + I <= qe + 1 (its query span), so if it has any gap
+ * S <= M - 4X - I - D - 6 <= qe + 1 - 2I - D - 6 (dropping -5X <= 0); hence D <= Dmax =
  * max(0, qe - S - 5), I <= Imax = Dmax / 2, and it spans at most qe + 1 + Dmax rows. In reversed
  * coordinates A* starts at (0, 0) and every cell lies on a diagonal r - c in [-Imax, Dmax]. A
  * zero-state DP restricted to that band (cells outside nonexistent: H = E = F = 0) never exceeds
