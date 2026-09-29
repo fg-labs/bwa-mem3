@@ -63,11 +63,10 @@
 # tier x86 prunes nothing there (its cost gate, rescue_prune_cost_ok) while it
 # still bands pass 1, so the stats must show banded pass-1 jobs, and filtered
 # jobs on every other tier and none at AVX-512BW. Two scorings other than the
-# default must match the reference at the same scoring too: -B 6, which the
-# SIMD filters take, so its stats must show filtered jobs wherever they run;
-# -O 8 -E 2, which only the scalar filter decides, so filtered jobs on aarch64
-# and none on x86 (its cost gate); and -B 3, which the lemma refuses, so no
-# filtered job. The band kernels take all three, so each must band pass 1.
+# default must match the reference at the same scoring too: -B 6 and
+# -O 8 -E 2, which the SIMD filters take, so their stats must show filtered
+# jobs wherever they run; and -B 3, which the lemma refuses, so no filtered
+# job. The band kernels take all three, so each must band pass 1.
 # The same pairs as bisulfite reads,
 # under --meth -B 4, --meth-scoring genomic and the default collapsed scoring,
 # must match their references too (with samtools on PATH, since --meth emits
@@ -296,13 +295,13 @@ if [ "$has_simd" = 1 ]; then
     esac
 fi
 
-# Other scorings (rescue_prune_params), each against the reference at the same scoring: -B 6,
-# which the SIMD filters take (-A 1 with deletion costs -O 6 -E 1), so it prunes wherever they run;
-# -O 8 -E 2, which the scalar filter decides, so it prunes on aarch64 only (x86's cost gate,
-# rescue_prune_cost_ok, keeps the full window there); and -B 3, which the lemma refuses, so it
-# prunes nowhere. The band kernels take all three, so each must band pass 1 (rescue_band_runs).
+# Other scorings (rescue_prune_params), each against the reference at the same scoring: -B 6 (the
+# default's bound weights) and -O 8 -E 2 (the per-diagonal charge c = 2, where a single-hit
+# diagonal weighs a - c < 0), which the SIMD filters take, so they prune wherever those run; and
+# -B 3, which the lemma refuses, so it prunes nowhere. The band kernels take all three, so each
+# must band pass 1 (rescue_band_runs).
 sc_note=""
-check_scoring() { # $1 = label, $2 = where it prunes (simd | aarch64 | none), rest = mem options
+check_scoring() { # $1 = label, $2 = where it prunes (simd | none), rest = mem options
     local label="$1" where="$2" stem st sj bst sp1
     shift 2
     stem="sc_$(printf '%s' "$label" | tr -c 'A-Za-z0-9' '_')"
@@ -322,16 +321,15 @@ check_scoring() { # $1 = label, $2 = where it prunes (simd | aarch64 | none), re
     sp1=$(printf '%s\n' "$bst" | tr ' ' '\n' | sed -n 's/^pass1_banded=//p')
     if [ "$has_simd" = 1 ]; then
         case "$where/$floor" in
-            simd/* | aarch64/neon) [ "${sj:-0}" -gt 0 ] || fail "pruning filtered no rescue job at $label (SIMD floor '$floor'): $st" ;;
-            none/*) [ "${sj:-0}" -eq 0 ] || fail "pruning filtered rescue jobs at $label, which the lemma refuses: $st" ;;
-            *) [ "${sj:-0}" -eq 0 ] || fail "x86 pruned at $label, which only the scalar filter decides: $st" ;;
+            simd/*) [ "${sj:-0}" -gt 0 ] || fail "pruning filtered no rescue job at $label (SIMD floor '$floor'): $st" ;;
+            *) [ "${sj:-0}" -eq 0 ] || fail "pruning filtered rescue jobs at $label, which the lemma refuses: $st" ;;
         esac
         [ "${sp1:-0}" -gt 0 ] || fail "no banded pass-1 job at $label: $bst"
     fi
     sc_note="$sc_note; $label: jobs=${sj:-0} pass1_banded=${sp1:-0}"
 }
 check_scoring "-B 6" simd -B 6
-check_scoring "-O 8 -E 2" aarch64 -O 8 -E 2
+check_scoring "-O 8 -E 2" simd -O 8 -E 2
 check_scoring "-B 3" none -B 3
 
 # --meth (EM-seq chemistry, the default): the filter matches converted copies of the window and the

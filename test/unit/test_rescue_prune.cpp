@@ -22,9 +22,10 @@
 //      query or window beyond the scratch capacity all return FULL.
 //   3. Where a SIMD filter is compiled in (NEON on aarch64, the SSE4.1 / SSSE3
 //      port on x86 AVX2 builds), that filter (rescue_prune_window, at 19 and
-//      at thresholds 5 / 10 / 32 in rotation) against the int32 scalar filter
-//      (rescue_prune_window_scalar) and, where it fits, the int16 reference
-//      lean(): identical (kind, hb, he).
+//      at thresholds 5 / 10 / 32 in rotation, and at scorings with other bound
+//      weights: c = 2, a = 2, -x intractg's tail) against the int32 scalar
+//      filter (rescue_prune_window_scalar) and, where it fits, the int16
+//      reference lean(): identical (kind, hb, he).
 //   4. There too, the SIMD filter's repeat memo and its component list: a
 //      repeated job returns the first call's decision and view, the same job
 //      at another threshold is not answered from the memo, and band
@@ -442,17 +443,27 @@ TEST_CASE("rescue prune: the SIMD filter decides exactly as the scalar filters"
     // The SIMD filters take the threshold at run time: every other job at 19, the rest at 5, 10 and 32
     // in rotation (the tail slack ub - minsc - 2 and the mw threshold move with it).
     const int other_minsc[3] = {5, 10, 32};
+    // And the bound weights, every fourth job: -O 8 -E 2 (c = 2, so a single-hit diagonal weighs
+    // a - c < 0), -A 2 -B 8 -O 12 -E 2 (a = 2) and -x intractg (the tail offset 12), at -k 19.
+    const rescue_prune_params weighted[3] = {rescue_prune_params::from(1, 4, 8, 2, 8, 2, kSimdMinsc),
+                                             rescue_prune_params::from(2, 8, 12, 2, 12, 2, 2 * kSimdMinsc),
+                                             rescue_prune_params::from(1, 9, 16, 1, 16, 1, kSimdMinsc)};
+    for (const rescue_prune_params &w : weighted) REQUIRE(w.simd_ok());
+    int n_weighted = 0;
     for (const int max_hits : {kDefaultMaxHits, kNoGate}) {
         for (size_t i = 0; i < jobs.size(); i++) {
             const Job &jb = jobs[i];
             const int len1 = (int)jb.ref.size(), len2 = (int)jb.q.size();
             const int minsc = i % 2 ? kSimdMinsc : other_minsc[(i / 2) % 3];
-            CAPTURE(jb.tag); CAPTURE(i); CAPTURE(len1); CAPTURE(len2); CAPTURE(max_hits); CAPTURE(minsc);
+            const bool wtd = i % 4 == 3;
+            const rescue_prune_params p = wtd ? weighted[(i / 4) % 3] : rescue_prune_params::defaults(minsc);
+            n_weighted += wtd;
+            CAPTURE(jb.tag); CAPTURE(i); CAPTURE(len1); CAPTURE(len2); CAPTURE(max_hits); CAPTURE(p.minsc);
+            CAPTURE(p.a); CAPTURE(p.c);
             int hb = -2, he = -2, shb = -2, she = -2;
-            const int kind = rescue_prune_window(jb.ref.data(), len1, jb.q.data(), len2, minsc, max_hits,
-                                                 &hb, &he);
-            const int skind = rescue_prune_window_scalar(jb.ref.data(), len1, jb.q.data(), len2, minsc,
-                                                         max_hits, *scalar, &shb, &she);
+            const int kind = rescue_prune_window(jb.ref.data(), len1, jb.q.data(), len2, p, max_hits, &hb, &he);
+            const int skind = rescue_prune_window_scalar(jb.ref.data(), len1, jb.q.data(), len2, p, max_hits,
+                                                         *scalar, &shb, &she);
             CHECK(kind == skind);
             if (kind == RESCUE_PRUNE_B2 && skind == RESCUE_PRUNE_B2) {
                 CHECK(hb == shb);
@@ -462,7 +473,7 @@ TEST_CASE("rescue prune: the SIMD filter decides exactly as the scalar filters"
             // no N guard, a fixed capacity and int16 sums, so compare it only without the gate, on
             // N-free jobs (the filters refuse the rest, checked above), where it fits, and below
             // 32000 hits.
-            if (max_hits == kNoGate && !has_n(jb.ref) && !has_n(jb.q)
+            if (max_hits == kNoGate && !wtd && !has_n(jb.ref) && !has_n(jb.q)
                 && len1 + kswv_query_quantum8(len2) + 1 <= 4096 && len1 >= 5 && len2 >= 5
                 && count_hits(jb) <= 32000) {
                 const rescue_prune_neon::Job lj{len1, len2, 0, 0, -1, -1, jb.ref.data(), jb.q.data()};
@@ -478,6 +489,7 @@ TEST_CASE("rescue prune: the SIMD filter decides exactly as the scalar filters"
         }
     }
     CHECK(compared_lean > 0);
+    CHECK(n_weighted > 50);
 #endif
 }
 

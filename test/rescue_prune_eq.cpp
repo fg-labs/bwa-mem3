@@ -4,14 +4,17 @@
  *
  * For every job, at a threshold minsc that varies per job (dumps: 19, 5, 10, 15, 25, 32 in turn;
  * fuzz: 19 half of the time, else 5-40): the SIMD path must return the scalar path's (kind, hb, he),
- * and on a SIMD B2 its view must carry that minsc and match the scalar arrays -- cnt and minrow
- * (where cnt > 0) on [0, nd), bnd16 == 5 + fwd + bwd - (cnt - 1), the mw / hw bits (bnd >= minsc,
- * and cnt > 0) on [0, nd) and clear on [nd, nd + 64), which band planning reads as whole
- * 64-diagonal words -- and its component list (runs of bnd >= minsc with a hit: a, b, ub, i0, dmax)
- * with its count. Half of the jobs run twice in a row, the second time from a
+ * and on a SIMD B2 its view must carry that minsc and the scoring's bound constants and match the
+ * scalar arrays -- cnt and minrow (where cnt > 0) on [0, nd), bnd16 == base + fwd + bwd -
+ * (a cnt - c), the mw / hw bits (bnd >= minsc, and cnt > 0) on [0, nd) and clear on [nd, nd + 64),
+ * which band planning reads as whole 64-diagonal words -- and its component list (runs of
+ * bnd >= minsc with a hit: a, b, ub, i0, dmax) with its count. The scoring varies too: the default
+ * half of the time, else one of SCORINGS (c = 2, a = 2 and 3, large gap opens, split gap costs),
+ * through rescue_prune_params. At c = 2 a single-hit diagonal has weight a - c < 0, the case a hit
+ * test of the form P(d) >= P(d - 1) gets wrong. Half of the jobs run twice in a row, the second time from a
  * copy of the bytes in other buffers, which exercises the filter's repeat memo: the repeat must
  * return the same decision and view as the first call, and must not answer the same job at another
- * threshold.
+ * threshold or scoring.
  *
  *   rescue_prune_eq fuzz <n> <seed>   n generated jobs (repeats, low complexity, N, tiny and long
  *                                     windows, windows with more components than the filter stores,
@@ -48,6 +51,35 @@ namespace {
 
 using rescue_prune_neon::Comp;
 
+/* K = 5 scorings the SIMD filters take (a, b, o_del, e_del, o_ins, e_ins), at minsc = k a. */
+const int SCORINGS[][6] = {
+    {1, 4, 8, 2, 8, 2},     // -O 8 -E 2: c = 2
+    {1, 4, 6, 2, 6, 2},     // -E 2: c = 2
+    {1, 6, 6, 1, 6, 1},     // -B 6
+    {1, 9, 16, 1, 16, 1},   // -x intractg: tail offset 12
+    {2, 8, 12, 2, 12, 2},   // -A 2 scaled: a = 2, c = 2
+    {1, 4, 6, 1, 7, 2},     // -O 6,7 -E 1,2
+    {3, 12, 18, 3, 18, 3},  // a = 3
+    {1, 4, 6, 200, 6, 200}, // -E 200: c = 200, past the int16 headroom on short windows (FALLBACK)
+};
+const int NSCORINGS = (int)(sizeof SCORINGS / sizeof SCORINGS[0]);
+
+/* The default scoring at threshold k (which < 0), or SCORINGS[which] at minsc = k a. */
+rescue_prune_params scoring(int which, int k)
+{
+    if (which < 0) return rescue_prune_params::defaults(k);
+    const int *x = SCORINGS[which];
+    return rescue_prune_params::from(x[0], x[1], x[2], x[3], x[4], x[5], k * x[0]);
+}
+
+/* Whether the SIMD filter decides a and b alike: the same threshold and bound weights. The decision
+ * depends on nothing else of the scoring (-B 6 decides as the default does), so the memo may answer
+ * across such a change. */
+bool same_filter(const rescue_prune_params &a, const rescue_prune_params &b)
+{
+    return a.minsc == b.minsc && a.simd_wt() == b.simd_wt();
+}
+
 struct Stats {
     long jobs = 0, simd = 0, over_cap = 0, repeats = 0, memo_hits = 0, bad = 0, kind[3] = {0, 0, 0};
 };
@@ -57,21 +89,23 @@ struct Stats {
  * by check_view on every call, the repeat included. */
 bool same_view(const rescue_prune_view &a, const rescue_prune_view &b)
 {
-    return a.nd == b.nd && a.off == b.off && a.minsc == b.minsc && a.ncomp == b.ncomp && a.ncomp_stored == b.ncomp_stored;
+    return a.nd == b.nd && a.off == b.off && a.minsc == b.minsc && a.base == b.base && a.a == b.a && a.c == b.c
+           && a.ncomp == b.ncomp && a.ncomp_stored == b.ncomp_stored;
 }
 
-/* The SIMD view v of a B2 decision at threshold minsc against the scalar filter's arrays in r for the
- * same job. */
-bool check_view(int len1, int len2, int minsc, const rescue_prune_view &v, const rescue_prune_scratch &r,
-                std::string &why)
+/* The SIMD view v of a B2 decision under p against the scalar filter's arrays in r for the same job. */
+bool check_view(int len1, int len2, const rescue_prune_params &p, const rescue_prune_view &v,
+                const rescue_prune_scratch &r, std::string &why)
 {
-    const rescue_prune_view sv = rescue_prune_scalar_view(r, len1, len2, rescue_prune_params::defaults(minsc));
+    const int minsc = p.minsc;
+    const rescue_prune_view sv = rescue_prune_scalar_view(r, len1, len2, p);
     const int nd = sv.nd;
     if (v.nd != nd || v.off != sv.off) { why = "nd / off"; return false; }
     if (v.minsc != minsc) { why = "view minsc " + std::to_string(v.minsc); return false; }
+    if (v.base != p.base() || v.a != p.a || v.c != p.c) { why = "view bound constants"; return false; }
     if (!v.mw || !v.hw || !v.comps || v.ncomp < 0) { why = "SIMD view incomplete"; return false; }
     auto bit = [](const uint64_t *w, int x) { return (int)(w[x >> 6] >> (x & 63) & 1); };
-    auto bnd = [&](int x) { return 5 + r.fwd[x] + r.bwd[x] - ((int)r.cnt[x] - 1); };
+    auto bnd = [&](int x) { return p.base() + r.fwd[x] + r.bwd[x] - p.weight(r.cnt[x]); };
     for (int x = 0; x < nd; x++) {
         if (v.cnt[x] != r.cnt[x]) { why = "cnt at " + std::to_string(x); return false; }
         if (r.cnt[x] && v.minrow[x] != r.minrow[x]) { why = "minrow at " + std::to_string(x); return false; }
@@ -110,15 +144,17 @@ bool check_view(int len1, int len2, int minsc, const rescue_prune_view &v, const
     return true;
 }
 
-void run_one(const uint8_t *ref, int len1, const uint8_t *q, int len2, int minsc, int max_hits, bool twice,
-             Stats &st)
+void run_one(const uint8_t *ref, int len1, const uint8_t *q, int len2, const rescue_prune_params &p, int max_hits,
+             bool twice, Stats &st)
 {
     static rescue_prune_scratch r;
+    if (!p.valid) return;   // (a threshold the scoring refuses: rescue_prune_window returns FULL)
+    const int minsc = p.minsc;
     /* rescue_prune_window's own guards return FULL before either filter runs */
     const bool guarded = minsc < 5 || len1 < 5 || len2 < 5 || len2 > rescue_prune_scratch::QCAP || len1 > 30000;
     int h0 = -1, e0 = -1;
     const int k0 = guarded ? RESCUE_PRUNE_FULL
-                           : rescue_prune_window_scalar(ref, len1, q, len2, minsc, max_hits, r, &h0, &e0);
+                           : rescue_prune_window_scalar(ref, len1, q, len2, p, max_hits, r, &h0, &e0);
     static const bool negative_control = rescue_env_opt_in("RPE_NEGATIVE_CONTROL");
     static bool injected = false;
     if (negative_control && !injected && k0 == RESCUE_PRUNE_B2) { h0++; injected = true; }
@@ -134,7 +170,7 @@ void run_one(const uint8_t *ref, int len1, const uint8_t *q, int len2, int minsc
             st.repeats++;
         }
         const uint64_t hits0 = rescue_prune_memo_hits();
-        kind[rep] = rescue_prune_window(R, len1, Q, len2, minsc, max_hits, &hb[rep], &he[rep], &view[rep]);
+        kind[rep] = rescue_prune_window(R, len1, Q, len2, p, max_hits, &hb[rep], &he[rep], &view[rep]);
         const bool hit = rescue_prune_memo_hits() != hits0;
         st.memo_hits += hit;
         st.jobs++;
@@ -147,26 +183,27 @@ void run_one(const uint8_t *ref, int len1, const uint8_t *q, int len2, int minsc
         if (!ok) why = "decision (" + std::to_string(kind[rep]) + "," + std::to_string(hb[rep]) + "," +
                        std::to_string(he[rep]) + ") vs scalar (" + std::to_string(k0) + "," + std::to_string(h0) +
                        "," + std::to_string(e0) + ")";
-        if (ok && simd) ok = check_view(len1, len2, minsc, view[rep], r, why);
+        if (ok && simd) ok = check_view(len1, len2, p, view[rep], r, why);
         if (ok && rep == 1 && !same_view(view[0], view[1])) { ok = false; why = "repeat view differs"; }
         if (ok && view[rep].repeat != hit) { ok = false; why = "view.repeat disagrees with the memo counter"; }
         /* The memo may answer only a byte-for-byte repeat of the previous call that reached the
          * SIMD filter (the wrapper's guards return before it, leaving its memo alone). */
         static std::vector<uint8_t> last_ref, last_q;
-        static int last_mh = -1, last_minsc = -1;
-        const bool repeat = max_hits == last_mh && minsc == last_minsc && last_ref.size() == (size_t)len1 && last_q.size() == (size_t)len2
+        static int last_mh = -1;
+        static rescue_prune_params last_p;
+        const bool repeat = max_hits == last_mh && same_filter(p, last_p) && last_ref.size() == (size_t)len1 && last_q.size() == (size_t)len2
                             && std::equal(R, R + len1, last_ref.begin()) && std::equal(Q, Q + len2, last_q.begin());
         if (ok && hit && !repeat) { ok = false; why = "memo answered a job that does not repeat the previous one"; }
         if (!guarded) {
             last_ref.assign(R, R + len1);
             last_q.assign(Q, Q + len2);
             last_mh = max_hits;
-            last_minsc = minsc;
+            last_p = p;
         }
         if (!ok) {
             if (st.bad < 20)
-                fprintf(stderr, "MISMATCH len1=%d len2=%d minsc=%d max_hits=%d rep=%d: %s\n", len1, len2, minsc,
-                        max_hits, rep, why.c_str());
+                fprintf(stderr, "MISMATCH len1=%d len2=%d minsc=%d a=%d c=%d base=%d max_hits=%d rep=%d: %s\n", len1,
+                        len2, minsc, p.a, p.c, p.base(), max_hits, rep, why.c_str());
             st.bad++;
         }
     }
@@ -199,7 +236,8 @@ int run_dumps(int argc, char **argv, Stats &st)
             }
             const int mh = k % 3 == 0 ? 400 : k % 3 == 1 ? 1000 : 1 << 30;
             static const int minscs[6] = {19, 5, 10, 15, 25, 32};
-            run_one(ref.data(), h[0], q.data(), h[1], minscs[(k / 3) % 6], mh, (k & 1) == 0, st);
+            const int which = (k / 18) % 2 == 0 ? -1 : (int)((k / 36) % NSCORINGS);
+            run_one(ref.data(), h[0], q.data(), h[1], scoring(which, minscs[(k / 3) % 6]), mh, (k & 1) == 0, st);
             k++;
         }
         const bool err = ferror(fp) != 0;
@@ -259,19 +297,22 @@ void run_fuzz(long n, unsigned seed, Stats &st)
         if (rnd(0, 49) == 0) ref[(size_t)rnd(0, len1 - 1)] = 4;   // N in the window
         if (rnd(0, 49) == 0) q[(size_t)rnd(0, len2 - 1)] = 4;     // N in the query
         const int mh = rnd(0, 3) == 0 ? rnd(0, 3000) : rnd(0, 1) ? 1000 : 1 << 30;
-        const int minsc = rnd(0, 1) ? 19 : rnd(5, 40);
-        run_one(ref.data(), len1, q.data(), len2, minsc, mh, rnd(0, 1) == 0, st);
+        const int k = rnd(0, 1) ? 19 : rnd(5, 40);
+        const int which = rnd(0, 1) ? -1 : rnd(0, NSCORINGS - 1);
+        const rescue_prune_params p = scoring(which, k);
+        run_one(ref.data(), len1, q.data(), len2, p, mh, rnd(0, 1) == 0, st);
         /* near-repeats straight after, which the repeat memo must not mistake for the job above: a
          * prefix of the window (the memo compares only the new job's bytes), and the window with
          * its last base changed */
         if (len1 > 5 && rnd(0, 3) == 0)
-            run_one(ref.data(), len1 - rnd(1, std::min(16, len1 - 5)), q.data(), len2, minsc, mh, false, st);
+            run_one(ref.data(), len1 - rnd(1, std::min(16, len1 - 5)), q.data(), len2, p, mh, false, st);
         if (rnd(0, 3) == 0) {
             ref[(size_t)(len1 - 1)] = (uint8_t)((ref[(size_t)(len1 - 1)] + 1) & 3);
-            run_one(ref.data(), len1, q.data(), len2, minsc, mh, false, st);
+            run_one(ref.data(), len1, q.data(), len2, p, mh, false, st);
         }
-        /* the same job at another threshold straight after: the memo must not answer it */
-        if (rnd(0, 7) == 0) run_one(ref.data(), len1, q.data(), len2, minsc == 19 ? 25 : 19, mh, false, st);
+        /* the same job at another threshold or scoring straight after: the memo must not answer it */
+        if (rnd(0, 7) == 0) run_one(ref.data(), len1, q.data(), len2, scoring(which, k == 19 ? 25 : 19), mh, false, st);
+        if (rnd(0, 7) == 0) run_one(ref.data(), len1, q.data(), len2, scoring(which < 0 ? 0 : -1, k), mh, false, st);
     }
 }
 
