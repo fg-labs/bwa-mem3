@@ -3892,17 +3892,13 @@ static void worker_bwt_memo(worker_t *w, int seq_id, int batch_size, int tid)
     mem_chain_v *cw   = w->chain_scratch + (size_t) tid * BATCH_SIZE;
 
     /* D1: kernel1 converts bases ASCII->2-bit in place, but DUP reads skip
-     * kernel1 -- so convert EVERY read here (idempotent, guarded on seq[i] < 4)
-     * so worker_sam sees 2-bit bases for the DUPs too; REPs re-convert harmlessly
-     * inside kernel1. */
-    for (int l = 0; l < batch_size; ++l) {
-        char *s = seqs[l].seq;
-        const int len = seqs[l].l_seq;
-        for (int i = 0; i < len; ++i) {
-            unsigned char ch = (unsigned char) s[i];
-            s[i] = nst_nt4_decode(ch, 4);
-        }
-    }
+     * kernel1 -- so convert the DUP reads here, so worker_sam sees 2-bit bases
+     * for them too. Leave the REPs to kernel1: the conversion is NOT idempotent
+     * (see read_memo_convert_non_reps), so a REP converted twice would carry N
+     * (4) where off carries '-' (5). Every consumer treats codes >= 4 alike
+     * today, so that is output-neutral, but converting each read exactly once
+     * keeps REP bases equal to off's by construction. */
+    read_memo_convert_non_reps(memo, seqs, seq_id, batch_size);
 
     /* Compact REP pairs into a dense view (struct copies; seq/name/qual pointers
      * shared). REPs preserve their relative order, so the j-th REP read maps to

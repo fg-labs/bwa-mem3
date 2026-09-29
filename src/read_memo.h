@@ -79,6 +79,15 @@ struct read_memo_result {
 read_memo_result read_memo_prepass(const mem_opt_t *opt, const bseq1_t *seqs,
                                    int n, read_memo_state *st);
 
+/* Convert the reads of an armed work item ASCII->2-bit in place, EXCEPT the
+ * representative (REP) reads. `seqs` is the work item's first read and
+ * `seq_id` its global read index (st->role is indexed by global pair). DUP reads
+ * skip kernel1, so they are converted here; REPs are left for kernel1. The
+ * conversion is not idempotent (nst_nt4_decode(c, 4) passes only c < 4 through,
+ * so '-' -> 5 -> 4 on a second pass), so each read must be converted exactly
+ * once for REP bases to equal what --dedup-reads off produces. */
+void read_memo_convert_non_reps(const read_memo_state *st, bseq1_t *seqs, int seq_id, int n);
+
 /* Whether to arm the memo for the NEXT align invocation of `dup_pairs` duplicate
  * pairs. OFF mode / no duplicates -> 0; ON mode -> 1; auto -> the current latch,
  * except while measuring, when it alternates so the A/B controller gathers both

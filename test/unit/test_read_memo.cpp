@@ -1,11 +1,13 @@
 // Unit tests for read_memo (--dedup-reads whole-read-pair memoization).
 //
-// Covers the two pieces of new logic that carry correctness weight in Phase 1:
+// Covers the pieces of logic that carry correctness weight:
 //   (1) the pre-pass fingerprint + full-byte VERIFY grouping -- in particular
 //       that two pairs which collide on the ends-only fingerprint but differ in
 //       the middle are NOT grouped (the verify memcmp must catch them), that
-//       both mates must match, and that mate ORDER matters; and
-//   (2) --dedup-reads / BWAMEM3_DEDUP_READS mode resolution precedence.
+//       both mates must match, and that mate ORDER matters;
+//   (2) --dedup-reads / BWAMEM3_DEDUP_READS mode resolution precedence; and
+//   (3) read_memo_convert_non_reps, the armed path's 2-bit conversion: each
+//       read converted exactly once, so a REP's '-' stays 5 as with off.
 //
 // Phase 1 does not consume role[]/rep_pair[] in the aligner, so these tests pin
 // the pre-pass semantics directly rather than through end-to-end output.
@@ -14,6 +16,7 @@
 
 #include "read_memo.h"      // read_memo_prepass, read_memo_state, mode API
 #include "bwa.h"            // bseq1_t
+#include "bntseq.h"         // nst_nt4_decode
 
 #include <cstdlib>
 #include <cstring>
@@ -32,12 +35,14 @@ struct PairSet {
         bases.push_back(r1);
         bases.push_back(r2);
     }
-    // Finalize: build the bseq1_t array pointing at the owned strings.
+    // Finalize: build the bseq1_t array pointing at the owned strings. The
+    // pointers are mutable (&s[0], not c_str()): read_memo_convert_non_reps
+    // writes through them.
     read_memo_result run(read_memo_state *st) {
         seqs.assign(bases.size(), bseq1_t{});
         for (size_t i = 0; i < bases.size(); ++i) {
             memset(&seqs[i], 0, sizeof(bseq1_t));
-            seqs[i].seq   = const_cast<char *>(bases[i].c_str());
+            seqs[i].seq   = &bases[i][0];
             seqs[i].l_seq = (int)bases[i].size();
         }
         return read_memo_prepass(nullptr, seqs.data(), (int)seqs.size(), st);
@@ -70,6 +75,65 @@ TEST_CASE("identical pairs are grouped; distinct pairs are not"
     CHECK(st.role[1] == 2);            // DUP
     CHECK(st.rep_pair[1] == 0);        // of pair 0
     CHECK(st.role[2] == 1);            // REP (distinct)
+}
+
+// kernel1's in-place conversion of the reads it seeds (mem_kernel1_core).
+static void kernel1_convert(bseq1_t *s)
+{
+    for (int i = 0; i < s->l_seq; ++i)
+        s->seq[i] = (char) nst_nt4_decode((unsigned char) s->seq[i], 4);
+}
+
+static std::string bytes_of(const bseq1_t &s) { return std::string(s.seq, (size_t) s.l_seq); }
+
+TEST_CASE("convert_non_reps converts DUPs once and leaves REPs to kernel1"
+          * doctest::test_suite("unit/read_memo")) {
+    // '-' is the base the conversion is not idempotent on (-> 5, then 5 -> 4).
+    PairSet ps;
+    ps.add("ACGT-Nac", "TTGG-CCA");   // pair 0: REP
+    ps.add("GGGGCCCC", "AAAA-TTT");   // pair 1: REP (distinct)
+    ps.add("ACGT-Nac", "TTGG-CCA");   // pair 2: DUP of pair 0
+    read_memo_state st = fresh_state();
+    ps.run(&st);
+    REQUIRE(st.role[0] == READ_MEMO_ROLE_REP);
+    REQUIRE(st.role[1] == READ_MEMO_ROLE_REP);
+    REQUIRE(st.role[2] == READ_MEMO_ROLE_DUP);
+    const std::vector<std::string> ascii = ps.bases;  // seqs alias ps.bases: snapshot
+
+    read_memo_convert_non_reps(&st, ps.seqs.data(), 0, 6);
+
+    // REPs are untouched (still ASCII): kernel1 converts them.
+    for (int l = 0; l < 4; ++l) CHECK(bytes_of(ps.seqs[l]) == ascii[l]);
+    // DUPs are 2-bit, '-' kept distinct from N.
+    CHECK(bytes_of(ps.seqs[4]) == std::string("\x00\x01\x02\x03\x05\x04\x00\x01", 8));
+    CHECK(bytes_of(ps.seqs[5]) == std::string("\x03\x03\x02\x02\x05\x01\x01\x00", 8));
+
+    // After kernel1 converts the REPs, each REP read equals its DUP read byte
+    // for byte -- exactly what --dedup-reads off gives both. A second
+    // conversion of a REP would have turned its '-' (5) into 4 here.
+    for (int l = 0; l < 4; ++l) kernel1_convert(&ps.seqs[l]);
+    CHECK(bytes_of(ps.seqs[0]) == bytes_of(ps.seqs[4]));
+    CHECK(bytes_of(ps.seqs[1]) == bytes_of(ps.seqs[5]));
+    read_memo_state_free(&st);
+}
+
+TEST_CASE("convert_non_reps indexes roles by the work item's global read index"
+          * doctest::test_suite("unit/read_memo")) {
+    PairSet ps;
+    ps.add("ACGT-Nac", "TTGG-CCA");   // pair 0: REP (outside the work item)
+    ps.add("GGGGCCCC", "AAAA-TTT");   // pair 1: REP
+    ps.add("ACGT-Nac", "TTGG-CCA");   // pair 2: DUP of pair 0
+    read_memo_state st = fresh_state();
+    ps.run(&st);
+    const std::vector<std::string> ascii = ps.bases;  // seqs alias ps.bases: snapshot
+
+    // Work item = reads [2, 6): pairs 1 and 2.
+    read_memo_convert_non_reps(&st, ps.seqs.data() + 2, 2, 4);
+
+    for (int l = 0; l < 4; ++l) CHECK(bytes_of(ps.seqs[l]) == ascii[l]);  // pair 0 outside, pair 1 REP
+    CHECK(bytes_of(ps.seqs[4]) == std::string("\x00\x01\x02\x03\x05\x04\x00\x01", 8));
+    CHECK(bytes_of(ps.seqs[5]) == std::string("\x03\x03\x02\x02\x05\x01\x01\x00", 8));
+    read_memo_state_free(&st);
 }
 
 TEST_CASE("ends-only fingerprint collision is caught by the byte verify"
