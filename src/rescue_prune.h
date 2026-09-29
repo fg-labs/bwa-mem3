@@ -106,7 +106,9 @@ struct rescue_prune_params {
     /* The SIMD filters hard-code K = 5, the weights cnt - 1, the constant 5 and the tail
      * ub - tau - 2, which these parameters give. */
     bool simd_ok() const { return valid && K == 5 && a == 1 && c == 1 && o_del == 6 && e_del == 1; }
-    /* The default scoring without --meth, the only one the band kernels are derived for. */
+    /* The band kernels take any valid scoring with the symmetric score table, so not --meth (its
+     * freed cells need an asymmetric table the kernels do not have). */
+    bool band_ok() const { return valid && conv_from < 0; }
     bool default_scoring() const
     {
         return conv_from < 0 && a == 1 && b == 4 && o_del == 6 && e_del == 1 && o_ins == 6 && e_ins == 1;
@@ -246,8 +248,9 @@ static inline int rescue_prune_window_scalar(const uint8_t *ref, int len1, const
 /* The per-diagonal arrays behind a RESCUE_PRUNE_B2 decision, for deriving diagonal components at
  * thresholds above minsc (rescue_band.h). Diagonal index x in [0, nd) is the unshifted diagonal
  * d = i - j = x - off, with nd = len1 + off + 1 and off the query's 8-bit quantum. Exactly one of
- * bnd16 (SIMD filter: the bound precomputed) or fwd / bwd (scalar: bnd = 5 + fwd + bwd - (cnt - 1) at
- * the default scoring, the only one banded) is set; mw / hw are set with bnd16. minsc is the threshold of the filter call that produced the view
+ * bnd16 (SIMD filter: the bound precomputed) or fwd / bwd (scalar: bnd = base + fwd + bwd -
+ * (a cnt - c), with the call's constants base / a / c, which are 5 / 1 / 1 at the default scoring)
+ * is set; mw / hw are set with bnd16. minsc is the threshold of the filter call that produced the view
  * (on the SIMD filter, the threshold of mw, hw and comps). The pointers alias the filter's per-thread scratch, so a view is
  * valid only until the next filter call on the same thread. Readable lengths, which band planning's
  * vector loads rely on: on the SIMD filter (it accepts nd + 32 <= NeonScratch::CAP / X86Scratch::CAP) cnt and
@@ -264,6 +267,7 @@ struct rescue_prune_view {
     bool keyed = false;
     uint64_t key = 0;
     int minsc = 0;   // the filter call's threshold
+    int base = 5, a = 1, c = 1;   // the call's bound constants: bnd = base + fwd + bwd - (a cnt - c)
     const uint16_t *cnt = nullptr;
     const int16_t *minrow = nullptr;
     const int16_t *bnd16 = nullptr;
@@ -276,13 +280,14 @@ struct rescue_prune_view {
     int ncomp = -1, ncomp_stored = 0;
 };
 
-/* The view of a rescue_prune_window_scalar call on (len1, len2) at threshold minsc that returned
+/* The view of a rescue_prune_window_scalar call on (len1, len2) under p that returned
  * RESCUE_PRUNE_B2. */
 static inline rescue_prune_view rescue_prune_scalar_view(const rescue_prune_scratch &s, int len1, int len2,
-                                                         int minsc)
+                                                         const rescue_prune_params &p)
 {
     rescue_prune_view v;
-    v.minsc = minsc;
+    v.minsc = p.minsc;
+    v.base = p.base(); v.a = p.a; v.c = p.c;
     v.off = kswv_query_quantum8(len2);
     v.nd = len1 + v.off + 1;
     v.cnt = s.cnt; v.minrow = s.minrow; v.fwd = s.fwd; v.bwd = s.bwd;
@@ -452,7 +457,7 @@ static inline int rescue_prune_window(const uint8_t *ref, int len1, const uint8_
 #endif
     static thread_local rescue_prune_scratch s;
     const int kind = rescue_prune_window_scalar(ref, len1, q, len2, p, max_hits, s, hb, he);
-    if (view && kind == RESCUE_PRUNE_B2) *view = rescue_prune_scalar_view(s, len1, len2, minsc);
+    if (view && kind == RESCUE_PRUNE_B2) *view = rescue_prune_scalar_view(s, len1, len2, p);
     return kind;
 }
 

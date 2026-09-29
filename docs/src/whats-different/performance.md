@@ -239,16 +239,18 @@ generated jobs.
   score, end positions and suboptimal score are reassembled from the bands'
   per-row maxima. A per-job
   cost model keeps the full hull when banding would not pay. Same scope as the
-  pruning, at the default scoring only (8-bit, no `--meth`).
+  pruning, at every scoring it admits (8-bit, no `--meth`); the kernels take the
+  run's match, mismatch and both gap types' costs.
   (AVX2: [#538](https://github.com/fg-labs/bwa-mem3/pull/538))
 - **Banded start recovery (NEON, AVX2).** The second rescue pass, which finds where
   the best alignment starts, runs in a diagonal band derived from the first
-  pass's score and end: at the default scoring an alignment of that score can
-  hold only a bounded number of gapped bases, so the band holds it, and the
-  first row and column reaching the score are the same as in the full pass.
-  Used for every 8-bit job at the default scoring (banded or not in the first
-  pass, no `--meth`, at any seed length) when the band is cheaper than the full
-  pass. (AVX2: [#538](https://github.com/fg-labs/bwa-mem3/pull/538))
+  pass's score and end: an alignment of that score can hold only a bounded
+  number of gapped bases, so the band holds it, and the first row and column
+  reaching the score are the same as in the full pass. Used for every 8-bit job
+  (banded or not in the first pass, no `--meth`, at any seed length and any
+  scoring the band kernels take, including ones the pruning refuses, such as
+  `-B 3`) when the band is cheaper than the full pass.
+  (AVX2: [#538](https://github.com/fg-labs/bwa-mem3/pull/538))
 - **11-op rescue cell (NEON, AVX2, AVX-512BW; 8- and 16-bit).** When the
   open-plus-extend sums (`-O` + `-E`) of insertions and deletions are equal and
   fit the kernel's lane (a byte for the 8-bit kernels), and no gap cost is

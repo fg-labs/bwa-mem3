@@ -23,8 +23,8 @@ All per-batch rescue state lives in `mem_cache`, one slot per tid (`rescue_narro
 | Shortcut | Runs when | Turned off by |
 |---|---|---|
 | Exact pruning | a SIMD filter, so aarch64 or an x86 AVX2 / AVX-512BW build (`rescue_prune_on`), a scoring the lemma holds for (`rescue_prune_params::from`), `--meth` only on aarch64 with EM-seq chemistry, on x86 only where the SIMD filter runs and not at the AVX-512BW tier from `-k 25` up (`rescue_prune_runs`), 8-bit job, no `--rescue-kmer` (`rescue_prune_applies`) | `BWA3_RESCUE_PRUNE=0` |
-| Banded pass 0 | a NEON or AVX2 band kernel (`rescue_band_enabled`), a job pruned at the default scoring whose band plan beats the hull (`RescueBandBatch::plan`) | `BWA3_RESCUE_BAND=0`, `BWA3_RESCUE_PRUNE=0` |
-| Banded pass 1 | a NEON or AVX2 band kernel (`rescue_band_enabled`), every 8-bit job at the default scoring without `--meth` (`rescue_band_runs`, at any seed length) whose band is cheaper than kswv, narrowed or not (`RescueBandBatch::take_pass1`) | `BWA3_RESCUE_BAND_P1=0`, `BWA3_RESCUE_BAND=0`, `BWA3_RESCUE_PRUNE=0` |
+| Banded pass 0 | a NEON or AVX2 band kernel (`rescue_band_enabled`), a pruned job (at any scoring pruning admits, no `--meth`) whose band plan beats the hull (`RescueBandBatch::plan`) | `BWA3_RESCUE_BAND=0`, `BWA3_RESCUE_PRUNE=0` |
+| Banded pass 1 | a NEON or AVX2 band kernel (`rescue_band_enabled`), every 8-bit job without `--meth` at any scoring the band kernels take (`rescue_band_runs`, `rb_scoring`; at any seed length) whose band is cheaper than kswv, narrowed or not (`RescueBandBatch::take_pass1`) | `BWA3_RESCUE_BAND_P1=0`, `BWA3_RESCUE_BAND=0`, `BWA3_RESCUE_PRUNE=0` |
 | 11-op kswv cell | every SIMD kswv body, when the gap costs admit it (`fscan_scoring_ok`) | `BWA3_RESCUE_FSCAN=0` |
 | Dedup skip and one-pass insert | every architecture and scoring | `BWA3_RESCUE_DEDUP_SKIP=0` |
 

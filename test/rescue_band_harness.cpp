@@ -27,8 +27,9 @@
  * scalar cross-check; default scoring only) and RB_SCORING (unset: the default scoring;
  * "a,b,o_del,e_del,o_ins,e_ins": that scoring; "random": a fresh draw per 2048-job batch, see
  * draw_params) and RB_METH (genomic | neutral | collapsed | random: --meth matrices, see meth_matrix).
- * The truth kswv runs with the batch's scoring and matrix, and banding runs only at the default
- * scoring without --meth, as in production. RB_NEGATIVE_CONTROL=1 (harness-only) shifts the production te of
+ * The truth kswv runs with the batch's scoring and matrix; as in production, pass 0 is banded at
+ * every scoring the filter admits and pass 1 at every scoring the band kernels take
+ * (rb_scoring::valid), neither under --meth. RB_NEGATIVE_CONTROL=1 (harness-only) shifts the production te of
  * the first banded passing job by one, so a working comparison must report a MISMATCH and exit 1
  * (CI runs it first).
  *
@@ -566,7 +567,7 @@ static bool use_u8(int len2, int a, int shift)
 static int run_eq(std::vector<Job> &all_jobs, int k_default, int max_hits, int scalar_stride)
 {
     long mism = 0, n = 0, npass = 0, nfull = 0, nb1 = 0, nb2 = 0, nband = 0, scal_mm = 0, te2_diff = 0;
-    long nbatch = 0, nvalid = 0, nbandable = 0, ntrunc = 0, nk[6] = {0}, n12_band = 0, nmeth[4] = {0};
+    long nbatch = 0, nvalid = 0, nbandable = 0, np1able = 0, ntrunc = 0, nk[6] = {0}, n12_band = 0, nmeth[4] = {0};
     long nview = 0, view_mm = 0, r2 = 0, ccap = 0;
     std::unique_ptr<rescue_prune_scratch> sscratch(new rescue_prune_scratch());
     std::vector<rb_comp> cn, cs;
@@ -588,8 +589,11 @@ static int run_eq(std::vector<Job> &all_jobs, int k_default, int max_hits, int s
             nmeth[meth]++;
         }
         const int minsc = pp.minsc;
-        const bool band = rescue_band_enabled() && pp.valid && pp.default_scoring();
-        nbatch++; nvalid += pp.valid; nbandable += band;
+        const rb_scoring bsc = rb_scoring::from(pp);
+        const bool band = rescue_band_enabled() && pp.band_ok();
+        const bool p1_any = rescue_band_enabled() && !meth && bsc.valid();
+        if (rescue_band_enabled()) rescue_band_batch().set_scoring(bsc);
+        nbatch++; nvalid += pp.valid; nbandable += band; np1able += p1_any;
         if (pp.valid) nk[pp.K]++;
         /* This batch's jobs: a mate too long for the 8-bit kernels at this a is cut to a random
          * admissible slice (planted copies still match it), since pruning only sees 8-bit jobs. */
@@ -648,7 +652,7 @@ static int run_eq(std::vector<Job> &all_jobs, int k_default, int max_hits, int s
                                                           *sscratch, &shb, &she);
                 bool vok = sk == RESCUE_PRUNE_B2 && shb == hb && she == he;
                 if (vok) {
-                    const rescue_prune_view sv = rescue_prune_scalar_view(*sscratch, len1, len2, minsc);
+                    const rescue_prune_view sv = rescue_prune_scalar_view(*sscratch, len1, len2, pp);
                     /* The whole view, then sub-ranges like the ones plan() passes (one component's
                      * diagonals at a higher threshold): an unaligned start, a start just below a
                      * 64-diagonal word boundary, a range shorter than a word, and a random one. */
@@ -681,7 +685,7 @@ static int run_eq(std::vector<Job> &all_jobs, int k_default, int max_hits, int s
             if (kind[t] == RESCUE_PRUNE_B1) { nb1++; continue; }
             if (kind[t] == RESCUE_PRUNE_B2) {
                 nb2++;
-                if (band) rescue_band_batch().plan(view, len1, len2, hb, he, minsc);
+                if (band) rescue_band_batch().plan(view, pp, len1, len2, hb, he);
                 off[t] = hb;
                 idx[t] = P.add(J.ref.data() + hb, he - hb + 1, J.q.data(), len2, minsc);
             } else {
@@ -696,7 +700,7 @@ static int run_eq(std::vector<Job> &all_jobs, int k_default, int max_hits, int s
         const int nbd = band ? rescue_band_batch().partition(P.sp.data(), pn) : 0;
         nband += nbd;
         const uint64_t pb0 = rescue_band_batch().stats().p1_band, pg0 = rescue_band_batch().stats().p1_guard;
-        run_batch(k.get(), P, nbd, band);
+        run_batch(k.get(), P, nbd, p1_any);
         std::vector<char> banded(m, 0);
         for (int t = 0; t < m; t++) banded[t] = idx[t] >= 0 && rescue_band_batch().banded(idx[t]);
         r2 += (long)rescue_band_batch().stats().r2_band;
@@ -709,7 +713,7 @@ static int run_eq(std::vector<Job> &all_jobs, int k_default, int max_hits, int s
             const Job &J = jobs[t];
             const kswr_t &a = T.aln[t];
             n++; cls_n[J.cls]++;
-            n12_band += band && J.cls == 12;
+            n12_band += band && pp.default_scoring() && J.cls == 12;   // the ceiling at a = 1, b = 4
             band_hi += banded[t] && a.score >= 241;
             bool ok;
             const bool pass = a.score >= minsc;
@@ -769,14 +773,14 @@ static int run_eq(std::vector<Job> &all_jobs, int k_default, int max_hits, int s
            "scalar_vs_kswv_mismatch=%ld (te2 differs, unconsumed: %ld)\n",
            n, npass, nfull, nb1, nb2, nband, band_hi, p1_band, p1_guard, r2, ccap, nview, mism, view_mm, scal_mm,
            te2_diff);
-    printf("  scoring: batches=%ld valid=%ld bandable=%ld K3=%ld K4=%ld K5=%ld mates_cut_to_8bit=%ld meth genomic=%ld "
-           "neutral=%ld collapsed=%ld\n", nbatch, nvalid, nbandable, nk[3], nk[4], nk[5], ntrunc, nmeth[1], nmeth[2],
+    printf("  scoring: batches=%ld valid=%ld pass0_bandable=%ld pass1_bandable=%ld K3=%ld K4=%ld K5=%ld mates_cut_to_8bit=%ld meth genomic=%ld "
+           "neutral=%ld collapsed=%ld\n", nbatch, nvalid, nbandable, np1able, nk[3], nk[4], nk[5], ntrunc, nmeth[1], nmeth[2],
            nmeth[3]);
     for (int c = 0; c < 128; c++)
         if (cls_n[c]) printf("  class %3d: jobs=%ld mismatches=%ld\n", c, cls_n[c], cls_mm[c]);
     /* A pass with nothing banded compares kswv with kswv: fail it where banding runs, so the gate
      * cannot go vacuous (a cost gate or generator change that stops banding). */
-    const bool vacuous = rescue_band_enabled() && nbandable > 0 && (nband == 0 || p1_band == 0);
+    const bool vacuous = rescue_band_enabled() && ((nbandable > 0 && nband == 0) || (np1able > 0 && p1_band == 0));
     if (vacuous) fprintf(stderr, "FAIL: no job was banded in pass 0 or pass 1 (open the cost gate: BWA3_RESCUE_BAND_COST=100000000)\n");
     /* The 8-bit ceiling class must reach the top of the band's H range, or the check of the x86
      * cell's biased add there (exact only while H <= 250) went vacuous. */
@@ -843,7 +847,7 @@ static void run_time(std::vector<Job> &jobs, int minsc, int max_hits, int reps)
                     if (kd == RESCUE_PRUNE_B1) continue;
                     if (kd == RESCUE_PRUNE_B2 && mode == 1) {
                         a = clk::now();
-                        rescue_band_batch().plan(view, len1, len2, hb, he, minsc);
+                        rescue_band_batch().plan(view, rescue_prune_params::defaults(minsc), len1, len2, hb, he);
                         tp += std::chrono::duration<double>(clk::now() - a).count();
                     }
                     int id;

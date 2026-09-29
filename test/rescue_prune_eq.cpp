@@ -65,7 +65,7 @@ bool same_view(const rescue_prune_view &a, const rescue_prune_view &b)
 bool check_view(int len1, int len2, int minsc, const rescue_prune_view &v, const rescue_prune_scratch &r,
                 std::string &why)
 {
-    const rescue_prune_view sv = rescue_prune_scalar_view(r, len1, len2, minsc);
+    const rescue_prune_view sv = rescue_prune_scalar_view(r, len1, len2, rescue_prune_params::defaults(minsc));
     const int nd = sv.nd;
     if (v.nd != nd || v.off != sv.off) { why = "nd / off"; return false; }
     if (v.minsc != minsc) { why = "view minsc " + std::to_string(v.minsc); return false; }

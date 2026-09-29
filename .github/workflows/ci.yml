@@ -965,17 +965,21 @@ jobs:
       # harness runs on every row, built at the main build's arch= (see the
       # step above): every generated job class through the production pipeline,
       # every B2 parent banded (the cost gate opened), each field checked against kswv
-      # on the full window. The second run uses a threshold other than the NEON
-      # filter's, so plan() reads the scalar filter's view; the third opens the
+      # on the full window. The second run uses a threshold other than the
+      # default (the SIMD filters take it at run time); the third opens the
       # hit gate, the only way a window reaches the component cap (at the
-      # default gate its hits send it to the full window first). The last three
+      # default gate its hits send it to the full window first). Runs 4-6
       # cover what the defaults hide and rescue_band.cpp claims gives the same
       # outputs: the per-lane band shift off, the band kernel's one-row fused
       # cell (BWA3_RESCUE_BAND_KERNEL=1) and the original cell
-      # (BWA3_RESCUE_FSCAN=0, which also turns the fused kswv cell off). The
-      # trailing argument is the job generator's seed. The first three take
-      # ~50 s in all on Graviton 4; the last three are 30000-job runs like the
-      # second and third. On x86 the kswv reference runs at the runner's tier,
+      # (BWA3_RESCUE_FSCAN=0, which also turns the fused kswv cell off). Runs
+      # 7-10 take other scorings (RB_SCORING): a fresh random one per batch,
+      # refused ones included, and one whose deletion and insertion
+      # open-plus-extend sums differ (-O 6,8 -E 1, so the kernels' general,
+      # non-Sym form) under each band kernel; run 11 draws --meth matrices
+      # (RB_METH). The trailing argument is the job generator's seed. Run 1 is
+      # 100000 jobs and every later run 30000.
+      # On x86 the kswv reference runs at the runner's tier,
       # which the harness prints ("kswv tier:"). Longer runs and real dumps are
       # manual. As above, a negative control (one banded job's te shifted) must
       # fail first.
@@ -993,6 +997,11 @@ jobs:
           BWA3_RESCUE_BAND_COST=100000000 BWA3_RESCUE_BAND_SHIFT=0 ./rescue_band_harness eq 30000 4
           BWA3_RESCUE_BAND_COST=100000000 BWA3_RESCUE_BAND_KERNEL=1 ./rescue_band_harness eq 30000 5
           BWA3_RESCUE_BAND_COST=100000000 BWA3_RESCUE_FSCAN=0 ./rescue_band_harness eq 30000 6
+          BWA3_RESCUE_BAND_COST=100000000 RB_SCORING=random ./rescue_band_harness eq 30000 7
+          BWA3_RESCUE_BAND_COST=100000000 RB_SCORING=1,4,6,1,8,1 ./rescue_band_harness eq 30000 8
+          BWA3_RESCUE_BAND_COST=100000000 RB_SCORING=1,4,6,1,8,1 BWA3_RESCUE_BAND_KERNEL=1 ./rescue_band_harness eq 30000 9
+          BWA3_RESCUE_BAND_COST=100000000 RB_SCORING=1,4,6,1,8,1 BWA3_RESCUE_FSCAN=0 ./rescue_band_harness eq 30000 10
+          BWA3_RESCUE_BAND_COST=100000000 RB_METH=random ./rescue_band_harness eq 30000 11
 
       - name: Flat chaining index matches the kbtree replay (chr22)
         if: matrix.canonical == true
