@@ -226,8 +226,9 @@ Caveats:
 - **Ungapped extension shortcuts are disabled for both compatibility targets.** A shortcut
   bypasses the banded-SW extension path used by bwa-mem2 and bwa. Both targets now use that
   reference path; native bwa-mem3 output keeps the shortcut. The path feeds alignment scores
-  that may be reported as `XS`; the current synthetic test verifies routing but does not
-  reproduce an `XS` value difference. This changes no command-line option or SAM field definition.
+  that may be reported as `XS`. The synthetic regression reproduces this difference:
+  the shortcut yields `XS:i:91`, while reference extension yields `XS:i:37` for the same
+  primary alignment. This changes no command-line option or SAM field definition.
 - **The sidecar `@SQ` is skipped, not rewritten.** Outside `--compat` the
   `<prefix>.hdr` / `<baseprefix>.dict` block remains authoritative and is emitted verbatim.
   On those sidecar-honoring paths — the default profile, `--bam` and `--meth` — an index with

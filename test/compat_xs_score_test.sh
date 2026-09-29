@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Synthetic compatibility routing and secondary-score check.
+# Synthetic regression for the ungapped-path XS score divergence.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -17,16 +17,25 @@ cp "$ROOT/test/fixtures/compat_xs_ref.fa" "$TMP/ref.fa"
     "$TMP/ref.fa" "$ROOT/test/fixtures/compat_xs_read.fq" \
     > "$TMP/native.sam" 2> "$TMP/native.log"
 
-python3 - "$TMP/compat.sam" "$TMP/compat.log" "$TMP/native.log" << 'PY'
+python3 - "$TMP/compat.sam" "$TMP/native.sam" "$TMP/compat.log" "$TMP/native.log" << 'PY'
 import pathlib
 import sys
 
-sam, compat_log, native_log = map(lambda p: pathlib.Path(p).read_text(), sys.argv[1:])
-records = [line.split('\t') for line in sam.splitlines() if not line.startswith('@')]
-assert len(records) == 1, f"expected one SAM record, got {len(records)}"
-tags = records[0][11:]
-assert 'AS:i:75' in tags, f"unexpected primary score: {tags}"
-assert 'XS:i:70' in tags, f"unexpected secondary score: {tags}"
+compat_sam, native_sam, compat_log, native_log = map(
+    lambda p: pathlib.Path(p).read_text(), sys.argv[1:]
+)
+
+def record(sam):
+    records = [line.split('\t') for line in sam.splitlines() if not line.startswith('@')]
+    assert len(records) == 1, f"expected one SAM record, got {len(records)}"
+    return records[0]
+
+compat = record(compat_sam)
+native = record(native_sam)
+assert compat[:11] == native[:11], 'primary alignment changed'
+assert 'AS:i:193' in compat[11:] and 'AS:i:193' in native[11:]
+assert 'XS:i:37' in compat[11:], f"unexpected compatibility score: {compat[11:]}"
+assert 'XS:i:91' in native[11:], f"unexpected native score: {native[11:]}"
 assert 'Ungapped fast-path' not in compat_log, 'compatibility path took ungapped shortcut'
 assert 'Ungapped fast-path' in native_log, 'fixture did not exercise native shortcut'
 PY
