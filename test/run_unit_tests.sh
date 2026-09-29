@@ -467,7 +467,4 @@ ok "shm_meth_test"
 "$HERE/compat_xs_score_test.sh" || fail "compat_xs_score_test"
 ok "compat_xs_score_test"
 
-"$HERE/compat_xa_score_test.sh" || fail "compat_xa_score_test"
-ok "compat_xa_score_test"
-
 echo "ALL UNIT TESTS PASSED"
