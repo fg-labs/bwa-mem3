@@ -116,6 +116,15 @@ int read_memo_active(void);
  * when the env knob is set; production runs it off. Returns 1 if set. */
 int read_memo_verify(void);
 
+/* Diagnostic: BWAMEM3_DEDUP_READS_CHECK_BASES=1 makes the armed copy pass assert
+ * that each duplicate read's 2-bit bases equal its representative's before it
+ * copies the representative's regs. The two reads were byte-identical ASCII, so
+ * the bases differ only if the armed seed stage (worker_bwt_memo) converted one
+ * of them a different number of times -- a DUP left as ASCII, or a REP converted
+ * twice ('-' -> 5 -> 4), which SAM output cannot show. Unlike VERIFY, it keeps
+ * the compaction, so it checks the path production runs. Returns 1 if set. */
+int read_memo_check_bases(void);
+
 /* Shutdown teardown for the module's grown-in-place scratch (call after worker
  * threads join). read_memo_state_free releases a state's role[]/rep_pair[];
  * read_memo_teardown releases the module-scope chain scratch. Both idempotent. */
