@@ -106,7 +106,7 @@ static bool rb_shift_on()
 
 static bool rb_stats_on()
 {
-    static const bool on = [] { const char *e = getenv("BWA3_RESCUE_PRUNE_STATS"); return e && e[0] == '1'; }();
+    static const bool on = rescue_env_opt_in("BWA3_RESCUE_PRUNE_STATS");
     return on;
 }
 

@@ -8,7 +8,9 @@
  * rescue_env_on: an on/off toggle, default on; a value starting with '0' turns it off and
  * anything else leaves it on. Not reported and not cached: kswv reads its toggles on every call so
  * a unit test can flip them in-process, and a per-call report would repeat once per batch;
- * callers that want the value once wrap it in a function-local static. */
+ * callers that want the value once wrap it in a function-local static.
+ *
+ * rescue_env_opt_in: a diagnostic switch, default off; only a value starting with '1' turns it on. */
 #ifndef BWA_MEM3_RESCUE_ENV_H
 #define BWA_MEM3_RESCUE_ENV_H
 
@@ -36,6 +38,12 @@ static inline bool rescue_env_on(const char *name)
 {
     const char *e = getenv(name);
     return !e || e[0] != '0';
+}
+
+static inline bool rescue_env_opt_in(const char *name)
+{
+    const char *e = getenv(name);
+    return e && e[0] == '1';
 }
 
 #endif

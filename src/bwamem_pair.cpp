@@ -372,7 +372,7 @@ struct rescue_prune_stats_t {
      * provable no-ops, taken by the one-insert path and of those done in O(n), and their time. */
     std::atomic<uint64_t> dedup_run{0}, dedup_skip{0}, dedup_run_regs{0}, dedup_skip_regs{0},
         dedup_insert1{0}, dedup_insert1_fast{0}, ns_dedup{0};
-    bool on = [] { const char *e = getenv("BWA3_RESCUE_PRUNE_STATS"); return e && e[0] == '1'; }();
+    bool on = rescue_env_opt_in("BWA3_RESCUE_PRUNE_STATS");
     ~rescue_prune_stats_t() {
         if (on) fprintf(stderr, "[RESCUE_PRUNE] jobs=%llu full=%llu b1=%llu b2=%llu rows_in=%llu rows_kept=%llu "
                         "jobs16=%llu memo_hits=%llu filter_s=%.3f kswv_pass0_s=%.3f band_pass0_s=%.3f "
