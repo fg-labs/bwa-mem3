@@ -1,0 +1,40 @@
+# Exact window pruning
+
+Before a rescue job is staged, a filter decides from the exact 5-mer matches between the mate and the window how much of the window the DP has to see. The code is `src/rescue_prune.h` (the lemma, the scalar filter and the dispatch) and `src/rescue_prune_neon.h` (the NEON filter); this page is the overview, and the headers hold the full arguments.
+
+## The bound
+
+Take the default scoring, match 1, mismatch -4, gap open 6 and extend 1 on both gap types, and a window and mate without N. A run of r matches holds max(0, r - 4) exact 5-mers and every mismatch costs 4, so a local alignment scores at most 4 plus the number of 5-mer hits on its cells, minus, for each gap, 2 plus the absolute change of diagonal the gap makes. Summing over the diagonals an alignment touches gives the bound the filter uses: an alignment whose diagonals span d1 to d2 scores at most 5 plus the sum, over the diagonals d from d1 to d2, of cnt(d) - 1, where cnt(d) is the number of 5-mer hits on diagonal d = i - j. The kernel's query-pad columns score at most +1, so they count as matches and the bound holds for them too.
+
+A maximum-sum interval over those per-diagonal terms is a Kadane scan, so the whole decision costs a pass over the hits and two scans over the diagonals.
+
+## The decisions
+
+`rescue_prune_window` returns one of three kinds:
+
+- `RESCUE_PRUNE_B1`: no diagonal interval reaches the rescue threshold (`min_seed_len * a`), so the job's score is proven to fall short and none of its outputs can be consumed. `mem_matesw_batch_pre` does not enqueue it; its result slot holds `MATESW_GAR_PROVEN_FAIL`, which `mem_matesw_batch_post` treats as the ordinary failing rescue.
+- `RESCUE_PRUNE_B2`: the rows from hb to he hold every row whose maximum can reach the threshold. The job is staged as that hull only, like the `--rescue-kmer` narrowing, and the post step adds hb back to the result's rows. A zero-state DP started at hb reproduces every field the rescue consumes: score, query and target ends, start positions and the suboptimal score. The header derives the tail slack that keeps the suboptimal score's row inside the hull. Gates: `rescue prune: B1 and B2 decisions reproduce every consumed ksw_align2 field`, `rescue_prune_identity.sh`.
+- `RESCUE_PRUNE_FULL`: nothing is proven, and the full window runs as before. This covers an N in either sequence (it breaks the 2-bit 5-mer code), lengths below 5 or past the scratch capacity, a threshold below 5, and a window sharing more hits with the mate than the hit gate allows. Gate: `rescue prune: N, a threshold below 5 and oversized inputs keep the full window`.
+
+The hit gate, `BWA3_RESCUE_PRUNE_MAX_HITS` (default from `rescue_prune_max_hits`), exists because a dense window costs the filter more than the rows it saves. It changes only whether a job is filtered, never a decision's correctness, so every value of it leaves output identical. Gates: `rescue prune: B1 and B2 decisions reproduce every consumed ksw_align2 field`, `rescue prune: the NEON filter's hit gate and query cache match the scalar filter`, `Banded rescue == kswv (rescue_band_harness, generated jobs)`.
+
+## Where it runs
+
+Three predicates in `src/bwamem_pair.cpp` scope the filter, each on top of the last:
+
+- `rescue_prune_on`: the build and `BWA3_RESCUE_PRUNE`. The filter runs only on aarch64, where the NEON filter carries it; the scalar filter alone costs more than it saves against the x86 kswv kernels.
+- `rescue_prune_runs`: the run's options. The lemma is derived for the default scoring only (`rescue_prune_scoring_ok`), and `--meth` rescue is excluded. It also keys the length sort of the rescue jobs (`matesw_sort_partitions_by_len`), which groups narrowed windows so a SIMD lane group is not held to the length of one full window, and the recording and reading of the hull offset. A run where it is false takes the pre-pruning path: no filter, no hull offset and no length-sort change.
+- `rescue_prune_applies`: the job. Only 8-bit jobs are filtered, and not under `--rescue-kmer`, which narrows windows its own way.
+
+## The NEON filter
+
+`rescue_prune_neon::lean_neon` computes the decisions of the int16 reference `rescue_prune_neon::lean` and of the int32 `rescue_prune_window_scalar`, at the NEON filter's threshold `rescue_prune_neon::MINSC`. The numbered design notes above `lean_neon` in `src/rescue_prune_neon.h` walk through it: the hit rows found 16 at a time with a presence bitmap, repeated query 5-mers collapsed into runs by occurrence layer, the Kadane scans done 8 segments at a time in transposed registers, and the components read off two bitsets built in the backward scan. It works in int16, which is exact up to `rescue_prune_neon::HIT_CAP` hits (with the per-segment constants of the backward scan moved out of its loop); a job past that, which only an opened hit gate lets through, or past the scratch capacity, returns `rescue_prune_neon::FALLBACK` and the scalar filter decides it. Gates: `rescue prune: the NEON filter decides exactly as the scalar filters`, `rescue prune: the NEON filter's hit gate and query cache match the scalar filter`, `NEON rescue filter == scalar filter (rescue_prune_eq, generated jobs)`.
+
+Two caches keep repeated work out of it, and both are exact because the cached result is a function of its key alone (Gates: `rescue prune: the NEON filter's hit gate and query cache match the scalar filter`, `rescue prune: the NEON filter's repeat memo and component list match a rescan`):
+
+- The query table (codes, presence bitmap, occurrence chains) depends only on the oriented mate, which repeats across every anchor rescued with it, so it is rebuilt only when the mate's bytes change.
+- A job repeating the previous one byte for byte (same window, mate, lengths and hit gate) returns the previous decision without recomputing it; the per-diagonal arrays behind it were not touched in between, since only the filter writes them. Gates: `rescue prune: the NEON filter's repeat memo and component list match a rescan`, `NEON rescue filter == scalar filter (rescue_prune_eq, generated jobs)`.
+
+## The view
+
+A B2 decision also returns a `rescue_prune_view`: the per-diagonal arrays it came from (hit counts, first hit rows, and either the bound itself on NEON or the two Kadane scans on the scalar path), plus, on NEON, the two bitsets and the filter's own list of components at `rescue_prune_neon::MINSC` (`rescue_prune_neon::Comp`, the first `NeonScratch::COMP_CAP` of them stored and `ncomp` counting all). Band planning reads the view to find the diagonal components at any threshold, and takes the component list directly when it needs the whole window at `rescue_prune_neon::MINSC`, which is the common case. The view aliases the filter's per-thread scratch, so it is valid only until the next filter call on that thread; `mem_matesw_batch_pre` plans the job's bands straight after the call for that reason. Gates: `rescue prune: the NEON filter's repeat memo and component list match a rescan`, `Banded rescue == kswv (rescue_band_harness, generated jobs)`.

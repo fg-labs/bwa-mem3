@@ -29,7 +29,9 @@
  *                     hits to be worth it).
  *
  * The bound and extents were validated against the kswv kernel's own per-row maxima on
- * 31.6 M wgs/wes rescue jobs (zero violations) and by whole-run output identity. */
+ * 31.6 M wgs/wes rescue jobs (zero violations) and by whole-run output identity.
+ *
+ * Overview and gates: docs/src/developer-guide/rescue-pruning.md. */
 #ifndef BWA_MEM3_RESCUE_PRUNE_H
 #define BWA_MEM3_RESCUE_PRUNE_H
 

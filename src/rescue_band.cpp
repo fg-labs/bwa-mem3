@@ -1,5 +1,6 @@
 /* Exact banded mate-rescue DP: component planning, the 16-lane NEON banded kernel, grouping and
- * the per-parent merge. See rescue_band.h for the design and the exactness argument. */
+ * the per-parent merge. See rescue_band.h for the design and the exactness argument, and
+ * docs/src/developer-guide/rescue-banding.md for the overview and its gates. */
 #include "rescue_band.h"
 #include "rescue_env.h"
 

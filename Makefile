@@ -662,7 +662,7 @@ endif
 # target as permanently out of date, so listing them relinked all nine on every
 # invocation. Their own rules (and the generated .d header deps this Makefile
 # now emits) already decide when a relink is needed.
-.PHONY:all myall arm64 clean single all-single print-mimalloc-config test test-injection FORCE pgo-generate pgo-use pgo-clean profile-build profile-clean lto-build lto-clean docs docs-serve docs-cli docs-clean docs-install-tools
+.PHONY:all myall arm64 clean single all-single print-mimalloc-config test test-injection FORCE pgo-generate pgo-use pgo-clean profile-build profile-clean lto-build lto-clean docs docs-serve docs-cli docs-rescue-knobs docs-clean docs-install-tools
 .SUFFIXES:.cpp .c .o
 
 .cpp.o:
@@ -1454,6 +1454,13 @@ docs-cli: $(EXE)
 			       /^SIMD runtime: / {print "SIMD runtime: <RUNTIME-TIER> (<FORCE-TIER-STATE>)"; next} {print}' \
 			> docs/_generated/cli/$$sub.txt; \
 	done
+
+# The BWA3_RESCUE_* knob table of the rescue developer-guide page, rendered from the knob list in
+# src/rescue_env.h; test/regression/rescue_docs_lint.sh fails when the committed copy is stale.
+docs-rescue-knobs:
+	@mkdir -p docs/_generated/rescue
+	@echo "  RENDER   docs/_generated/rescue/knobs.md"
+	@bash scripts/rescue_knobs.sh > docs/_generated/rescue/knobs.md
 
 docs-clean:
 	rm -rf docs/book

@@ -1,0 +1,43 @@
+# Banded rescue DP
+
+Pruning narrows a rescue window to the hull of the diagonal components that can reach the threshold. Banding goes further: the DP runs only inside the diagonal bands of those components, 16 bands per NEON vector, and the job's kswv outputs are reassembled from the bands' per-row maxima. The code is `src/rescue_band.h` (the argument, at the top) and `src/rescue_band.cpp` (the planner, the kernels and the merge). It runs on aarch64 only (`rescue_band_enabled`) and only where pruning runs (`rescue_prune_runs`): pass 0 bands jobs the pruning filter narrowed, and pass 1 bands any eligible 8-bit job, narrowed or not.
+
+## Why a band is enough
+
+Two facts carry the argument, both in the header of `src/rescue_band.h`:
+
+- Every alignment scoring at least a threshold tau lies inside one diagonal component at tau, because the 5-mer bound falls by one per diagonal while a gap excursion costs at least two per diagonal. The component also bounds where the alignment can start and end.
+- A zero-state DP restricted to any set of cells never exceeds the full DP, and is exact on every cell of every alignment the set contains. Widening a band, as grouping 16 lanes into one vector does, keeps both properties, and so does skipping cells that do not exist in the full DP. Gate: `Banded rescue == kswv (rescue_band_harness, generated jobs)`.
+
+So the per-row maximum over the bands is at most the true one, and equal on every row where an alignment above the threshold ends: that is enough to recover the score, the end positions and the suboptimal score. Gates: `Banded rescue == kswv (rescue_band_harness, generated jobs)`, `rescue_prune_identity.sh`.
+
+## Pass 0
+
+`RescueBandBatch::plan` works from the filter's view (see [the view](rescue-pruning.md#the-view)).
+
+- **Round 1** takes the components at a threshold T1 above the rescue threshold, chosen from the two largest component bounds, or, for a lone near-perfect primary, a tight band just under its bound (`BWA3_RESCUE_BAND_TIGHT`). A higher threshold means fewer and narrower bands. The merged result is final when T1 is the rescue threshold itself, or when the score clears T1 and either the suboptimal score clears it too or the whole hull lies inside the zone around the best end.
+- **Round 2**, for the few parents whose round 1 cannot prove its result final, takes every component at the rescue threshold and is exact unconditionally (`BWA3_RESCUE_BAND_R2=0` runs it through kswv on the hull instead). Gate: `Banded rescue == kswv (rescue_band_harness, generated jobs)`.
+- **The cost model** bands a parent only when its band cells undercut the hull's by the margin `BWA3_RESCUE_BAND_COST` sets, counting a fixed per-row cost per lane (`RB_OVH`); a parent with more components than `RB_COMP_CAP` keeps the hull.
+- **The suboptimal score** is recomputed from the merged row maxima with kswv's own emulation of it (its lagged zeroing of rising rows, then its scan for a second-best end), so it matches kswv exactly, not just approximately. Gate: `Banded rescue == kswv (rescue_band_harness, generated jobs)`.
+
+`RescueBandBatch::partition` moves the banded parents to the front of the 8-bit jobs; `mem_sam_pe_batch_run` scores the rest with kswv and the banded ones with `RescueBandBatch::run_pass0`, which writes their results exactly where kswv would have, so everything after it treats every job alike. Gate: `Banded rescue == kswv (rescue_band_harness, generated jobs)`.
+
+## Pass 1
+
+Pass 1 finds where the best alignment starts: kswv runs the DP on the reversed prefixes and stops at the first row whose maximum reaches the pass-0 score. At the default scoring an alignment of score S ending at the pass-0 end can hold only a bounded number of gapped bases, so it lies inside a band of diagonals derived from S and the query end alone; the header of `src/rescue_band.h` derives the band, counting matches, mismatches and both gap types. A zero-state DP in that band has the same first row reaching S and, in it, the same first column, ties included. This needs only the exact pass-0 result and the scoring, not the pass-0 components, so `RescueBandBatch::take_pass1` accepts every 8-bit job at the default scoring without `--meth`, banded in pass 0 or not, whenever the band is cheaper than kswv (`BWA3_RESCUE_BAND_P1`, `BWA3_RESCUE_BAND_P1_COST`). The band stops a lane group once every lane has reached its score, as kswv's `KSW_XSTOP` does. A job whose banded maximum is not its score would fall back to kswv; that cannot happen, and the harness fails if it ever does. Gates: `Banded rescue == kswv (rescue_band_harness, generated jobs)`, `rescue_prune_identity.sh`.
+
+## The kernels
+
+`BWA3_RESCUE_BAND_KERNEL` picks one of three band kernels, all giving the same score, ends, suboptimal score and starts (Gate: `Banded rescue == kswv (rescue_band_harness, generated jobs)`, which runs each kernel; `rescue_prune_identity.sh` runs kernels 2 and 0 end to end):
+
+- `0`, the original cell (`rb_dp_core` without the fused cell);
+- `1`, the fused cell of [the 11-op rescue cell](rescue-kswv.md) one row at a time (`RB_CELL1`); the note there explains why dropping an in-row gap run followed directly by a vertical one cannot change an output: such an alignment has an equal-scoring twin, with the two runs swapped, inside the same band;
+- `2` (default), the fused cell two rows per step with the query end read directly from the scan (`rb_dp_wave2`).
+
+`BWA3_RESCUE_FSCAN=0`, which turns the fused cell off in kswv, selects kernel 0 here as well. Within a 16-lane group, `run_jobs` shifts each narrower lane's spare diagonals below its band so the lanes' query offsets line up (`BWA3_RESCUE_BAND_SHIFT=0` turns that off). Every combination leaves output identical. Gate: `Banded rescue == kswv (rescue_band_harness, generated jobs)`, which runs kernel 1 and the shift off as legs of their own.
+
+## State and diagnostics
+
+A `RescueBandBatch` per tid lives in `mem_cache`; `mem_matesw_batch_pre` plans into it and `mem_sam_pe_batch` runs and resets it, and every buffer in it is grow-only, so nothing is allocated per job. With `BWA3_RESCUE_PRUNE_STATS=1` the batch's counters (`rescue_band_stats`) are summed and printed as the `[RESCUE_BAND]` line at exit, next to the filter's `[RESCUE_PRUNE]` line.
+
+`test/rescue_band_harness.cpp` (`make rescue-band-harness`) replays generated or dumped rescue jobs through the production planner and kernels and checks every output field against kswv on the full window. CI runs a bounded set of its `eq` runs on the ARM64 rows; longer runs are manual.

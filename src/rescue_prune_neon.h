@@ -5,7 +5,9 @@
  * wgs/wes rescue jobs and ~70 K adversarial fuzz jobs (incl. N, tiny lengths, poly-A,
  * int16-range stress) -- and runs ~2x faster on Graviton4. The threshold is fixed at 19
  * (min_seed_len * a at defaults); the caller dispatches here only in that case. lean() is the
- * int16 reference the NEON rewrite was derived from, kept as a test oracle. */
+ * int16 reference the NEON rewrite was derived from, kept as a test oracle.
+ *
+ * Overview and gates: docs/src/developer-guide/rescue-pruning.md. */
 #ifndef BWA_MEM3_RESCUE_PRUNE_NEON_H
 #define BWA_MEM3_RESCUE_PRUNE_NEON_H
 
