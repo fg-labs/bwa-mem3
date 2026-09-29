@@ -961,19 +961,21 @@ test/fmi_seed_api_smoke.o: test/fmi_seed_api_smoke.cpp $(FLAGS_STAMP)
 	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
 
 # Exactness + timing harness for the banded mate rescue (src/rescue_band.{h,cpp});
-# its header lists the modes. CI runs a bounded `eq` on generated jobs on the
-# ARM64 rows; longer runs and real-data dumps are manual. The banded kernel is
-# NEON on aarch64 and AVX2 on x86, so on x86 build it with arch=avx2 or
-# arch=avx512bw: the default x86 flags stop at SSE4.1, where there is no kernel,
-# rescue_band_enabled() is false and the harness refuses to run.
+# its header lists the modes. CI runs a bounded `eq` on generated jobs on every
+# row, at the row's own arch=; longer runs and real-data dumps are manual. The
+# banded kernel is NEON on aarch64 and AVX2 on x86, so on x86 build it with
+# arch=avx2 or arch=avx512bw: the default x86 flags stop at SSE4.1, where there
+# is no kernel, rescue_band_enabled() is false and the harness fails rather than
+# compare kswv with itself.
 .PHONY: rescue-band-harness
 rescue-band-harness: rescue_band_harness
 
 # The SIMD rescue-pruning filter (NEON on aarch64, the SSE4.1 / SSSE3 port on x86) vs the scalar
 # filter: decisions, the view band planning reads, the component list and the repeat memo
-# (test/rescue_prune_eq.cpp). Header-only. CI runs a bounded `fuzz` on the ARM64 rows; real-data
-# dumps are manual. On x86 build it with arch=avx2 or arch=avx512bw: the default x86 flags stop at
-# SSE4.1, where no SIMD filter is compiled in and the test refuses to run.
+# (test/rescue_prune_eq.cpp). Header-only. CI runs a bounded `fuzz` on every row, at the row's own
+# arch= (and on x86 also an AVX-512BW build, where the runner has it); real-data dumps are manual.
+# On x86 build it with arch=avx2 or arch=avx512bw: the default x86 flags stop at SSE4.1, where no
+# SIMD filter is compiled in and the test's #error stops the build.
 .PHONY: rescue-prune-eq
 rescue-prune-eq: rescue_prune_eq
 

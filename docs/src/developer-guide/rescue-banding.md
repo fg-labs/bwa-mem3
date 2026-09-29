@@ -49,4 +49,4 @@ Gate: `Banded rescue == kswv (rescue_band_harness, generated jobs)`.
 
 A `RescueBandBatch` per tid lives in `mem_cache`; `mem_matesw_batch_pre` plans into it and `mem_sam_pe_batch` runs and resets it, and every buffer in it is grow-only, so nothing is allocated per job. With `BWA3_RESCUE_PRUNE_STATS=1` the batch's counters (`rescue_band_stats`) are summed and printed as the `[RESCUE_BAND]` line at exit, next to the filter's `[RESCUE_PRUNE]` line.
 
-`test/rescue_band_harness.cpp` (`make rescue-band-harness`) replays generated or dumped rescue jobs through the production planner and kernels and checks every output field against kswv on the full window. CI runs a bounded set of its `eq` runs on the ARM64 rows; longer runs are manual.
+`test/rescue_band_harness.cpp` (`make rescue-band-harness`) replays generated or dumped rescue jobs through the production planner and kernels and checks every output field against kswv on the full window. CI runs a bounded set of its `eq` runs on every row, NEON on the ARM64 rows and AVX2 on the x86 rows, and prints the kswv tier it checked against; longer runs are manual.
