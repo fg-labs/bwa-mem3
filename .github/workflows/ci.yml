@@ -879,6 +879,14 @@ jobs:
           CHR22_SIM_DIR=/tmp/chr22-sim \
           bash test/regression/bwtseed_lockstep_driver_identity.sh
 
+      - name: Flat chaining index matches the kbtree replay (chr22)
+        if: matrix.canonical == true
+        run: |
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          CHR22_FA=/tmp/chr22/chr22.fa \
+          CHR22_SIM_DIR=/tmp/chr22-sim \
+          bash test/regression/chain_flat_replay_identity.sh
+
       - name: Chaining scratch is per-thread, not per-read
         if: matrix.canonical == true
         run: |
@@ -1263,16 +1271,12 @@ jobs:
         # One rebuild with every such macro on at once, then the same chr22
         # parity check the row already runs against the normal binary. This
         # asserts two things: the guarded code still compiles, and every check
-        # it enables holds on real data. Five of the six are pure assertions or
-        # scratch poisoning and the sixth (BWAMEM3_UGP_PROFILE) is profiling
-        # counters that never feed the alignment result, so output must be
-        # unchanged -- a failure here is a genuine invariant violation, not a
-        # debug-build artifact.
-        #
-        # BWA_MEM3_DEBUG_CHN_FLT_XCHECK, BWA_MEM3_DEBUG_RID_CHECK and
-        # BWA_MEM3_DEBUG_UNGAPPED_XCHECK are defined ahead of the changes that
-        # introduce them; until those land the flags are simply unused, which
-        # costs nothing and avoids a follow-up CI edit.
+        # it enables holds on real data. Each flag is an assertion or
+        # cross-check, scratch poisoning, a buffer shrunk to force a grow path,
+        # or measurement counters that never feed the alignment result, so
+        # output must be unchanged -- a failure here is a genuine invariant
+        # violation, not a debug-build artifact. test/regression/
+        # debug_macro_flag_lint.sh keeps this list and the macros in src/ in step.
         #
         # First in this job, so the tree is fresh and needs no `make clean`. The
         # chr22 bwa-mem3 index is built here with this binary: the debug macros
@@ -1282,13 +1286,20 @@ jobs:
           make -j"$(nproc)" arch=avx2 \
             CXX=clang++-19 \
             USE_MIMALLOC=1 \
-            EXTRA_CXXFLAGS="-DBWA_MEM3_DEBUG_CHN_FLT_XCHECK -DBWA_MEM3_DEBUG_RID_CHECK -DBWA_MEM3_DEBUG_UNGAPPED_XCHECK -DBSW8_ASSERT_ENVELOPE -DBWA_MEM3_DEBUG_POISON -DBWAMEM3_UGP_PROFILE=1 -DBWA_MEM3_DEBUG_RESCUE_STATS -DBWA_MEM3_DEBUG_SRTGG_TINY"
+            EXTRA_CXXFLAGS="-DBWA_MEM3_DEBUG_CHN_FLT_XCHECK -DBWA_MEM3_DEBUG_RID_CHECK -DBWA_MEM3_DEBUG_UNGAPPED_XCHECK -DBSW8_ASSERT_ENVELOPE -DBWA_MEM3_DEBUG_POISON -DBWAMEM3_UGP_PROFILE=1 -DBWA_MEM3_DEBUG_RESCUE_STATS -DBWA_MEM3_DEBUG_SRTGG_TINY -DBWA_MEM3_DEBUG_P3_XCHECK"
           "$GITHUB_WORKSPACE/bwa-mem3" index /tmp/chr22/chr22.fa
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           CHR22_FA=/tmp/chr22/chr22.fa \
           BWA_CHR22_FA=/tmp/chr22/bwa_chr22.fa \
           CHR22_SIM_DIR=/tmp/chr22-sim \
           bash test/regression/chr22_parity.sh
+          # The chr22 reads rarely reach the chaining / Pass-3 fast paths'
+          # fallbacks, so run the fixture built to force them (equal-position
+          # chains, over-cap reads, 36 kb reads, --seed-order, --meth) with
+          # BWA_MEM3_DEBUG_P3_XCHECK and _UNGAPPED_XCHECK cross-checking each
+          # fast path against the code it replaces.
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          bash test/regression/chain_flat_replay_identity.sh
 
       - name: SIMD floor enforcement (TESTING_BUILD, injected below-floor tier)
         # What happens when the binary lands on a host older than the floor it
@@ -1353,6 +1364,12 @@ jobs:
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           HEADER_PARITY_WORK_DIR=/tmp/header-parity-asan \
           bash test/regression/header_parity.sh
+          # The flat chaining index frees any seed arrays it heap-grew and
+          # rewinds the seed buffer when it hands a read to the kbtree. A leak
+          # or use-after-free there changes no output byte, so only asan can
+          # see it; the fixture forces that hand-off on hundreds of reads.
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          bash test/regression/chain_flat_replay_identity.sh
           # Re-run the CLI-input safety test against the SAME asan binary. Its
           # bwa_escape trailing-backslash cases are a heap over-read inside
           # libbwa; on the plain (non-asan) build on the canonical row the read

@@ -158,6 +158,40 @@ threads, warm page cache), this PR contributed the largest single-step wall
 time reduction in the `main` branch's performance history. Benchmark details
 are maintained under [Benchmarks](../performance/benchmarks.md).
 
+## Chaining and extension setup
+
+Byte-identical changes to the path between seeding and extension. Each keeps the
+code it replaces reachable as a fallback and pins itself against it. Output was
+verified identical (md5 of the non-`@PG` records) to the previous `main` on 5M-pair
+WGS and WES slices (150 bp paired, hg38) at the default scoring, `-A 2`, `-B 6` and
+`-O 8 -E 2`, on AMD Zen 3 (AVX2 build) and AWS Graviton 4 (NEON), and on three
+`--meth` datasets on Graviton 4.
+
+- **Run-length ungapped walk.** The ungapped fast path's score walk steps one
+  mismatch at a time instead of one base at a time: between mismatches the score
+  rises strictly, so a run's maximum is its last value. Outside the scoring
+  envelope where that holds (`a > 0`, `b >= 0`, positive start score) the
+  per-base walk runs. Cross-checked against the per-base walk under the opt-in
+  `BWA_MEM3_DEBUG_UNGAPPED_XCHECK` build.
+- **Pass-3 kept-set index.** The post-extension sweep that drops seeds contained
+  in an earlier alignment answers each seed from an index over the kept seeds'
+  alignments, instead of scanning every alignment of the read. If a kept
+  alignment is ever purged the read falls back to the scan. Cross-checked against
+  the scan under `BWA_MEM3_DEBUG_P3_XCHECK`.
+- **`cal_max_gap` memo.** The per-seed reference-window derivation reads the
+  maximum gap from a per-thread table over query lengths, keyed on the scoring
+  options.
+- **Flat chaining index.** Seed chaining finds each seed's closest chain in a
+  sorted array of chain positions with a branchless binary search instead of the
+  B-tree probe. Where the B-tree's answer depends on its node layout (two chains
+  with the same position) or a read has more than `BWA3_CHAIN_FLAT_CAP` chains,
+  the read is replayed through the unchanged B-tree path.
+
+| Variable | Effect |
+|---|---|
+| `BWA3_CHAIN_STATS=1` | Print, once at exit, how the chaining and Pass-3 fast paths resolved (`[chain-stats] …`): reads indexed, reads that fell back, queries answered by bucket walks versus full scans, and reads the flat chaining index handed to the B-tree (equal positions, or over the cap). Measurement only; output is unchanged. |
+| `BWA3_CHAIN_FLAT_CAP=<n>` | Largest number of chains a read may have on the flat chaining index before it is replayed through the B-tree (default 512, bounding the index's O(n) sorted insert). `0` sends every read to the B-tree. A malformed or negative value is reported to stderr and the default used. Output is identical at every value. |
+
 ---
 
 ## Full change list

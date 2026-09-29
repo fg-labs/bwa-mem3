@@ -390,7 +390,10 @@ echo "PASS: band_cert defaults on; --fast/--adaptive-band/--no-band-cert clear i
 # --- Source guard: the tight_band (tb) bound must be derived from a REALIZABLE
 # ungapped extension score. tb short-circuits the retry ladder (a band >= tb is
 # certified complete), which is sound only if the offset-0 in-band run actually
-# ACHIEVES the score S fed into the bound. ungapped_walk_score is the floored
+# ACHIEVES the score S fed into the bound. ungapped_walk_score (or its bitmask
+# form ungapped_walk_score_mis, the same floored walk over the mismatch mask,
+# cross-checked against the per-base walk under BWA_MEM3_DEBUG_UNGAPPED_XCHECK)
+# is the floored
 # score under ksw_extend local-truncation semantics (once the running score hits
 # 0 it stays 0) -- the value the rung-1 banded DP reaches on the diagonal, i.e. a
 # valid lower bound on the in-band optimum. A NO-FLOOR score (one that lets a
@@ -403,7 +406,7 @@ echo "PASS: band_cert defaults on; --fast/--adaptive-band/--no-band-cert clear i
 # is masked by mem_reg2aln recomputing the final CIGAR at its own band, so it
 # cannot be pinned as a SAM byte-fixture. Guard the realizable-score choice
 # structurally instead, the same way the wiring guards above do.
-if ! grep -qE 'max_sc_proof = ungapped_walk_score\(' "$BWAMEM_SRC"; then
+if ! grep -qE 'max_sc_proof = ungapped_walk_score(_mis)?\(' "$BWAMEM_SRC"; then
     echo "FAIL: tight_band no longer derives max_sc_proof from the realizable" >&2
     echo "      floored ungapped_walk_score -- the band proof requires an" >&2
     echo "      in-band-achievable score; a no-floor bound makes tb unsound" >&2
