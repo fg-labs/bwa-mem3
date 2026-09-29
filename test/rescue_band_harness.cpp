@@ -16,29 +16,35 @@
  * reversed-prefix DP for (tb, qb) cross-check the truth on every --scalar-stride-th job.
  * Generated classes: random windows with mutated mate copies, edge copies around te +- S (score2
  * parity / zeroing), tiny windows, N bases (must be FULL), tandem repeats (hit-dense, many
- * components), in-zone secondary copies (round-2 triggers), ragged len2, windows past the NEON
+ * components), in-zone secondary copies (round-2 triggers), ragged len2, windows past the SIMD
  * filter's capacity (scalar view), more components than the cap, and pass-1 adversaries (class 11:
  * gaps at the band-edge bound, start ties, qe next to the pad columns, te at the window edges).
- * Every B2 job's NEON view is also checked against the scalar filter's view of the same job (same
- * components at several thresholds), and the run fails if nothing was banded. Env knobs are the
+ * Every B2 job's SIMD filter view is also checked against the scalar filter's view of the same job
+ * (same components at several thresholds; not under --meth, whose view is of converted copies),
+ * and the run fails if nothing was banded. Env knobs are the
  * production ones; the caller sets e.g.
  * BWA3_RESCUE_BAND_COST=100000000 (band every B2 parent) and BWA3_RESCUE_PRUNE_MAX_HITS. Harness-only:
  * RB_MINSC (the min seed length, default 19; minsc = RB_MINSC * a), RB_SCALAR_STRIDE (default 0: no
- * scalar cross-check; default scoring only) and RB_SCORING (unset: the default scoring;
+ * scalar cross-check; it runs only for batches at the default scoring, so not under an RB_SCORING
+ * or RB_METH that changes it) and RB_SCORING (unset: the default scoring;
  * "a,b,o_del,e_del,o_ins,e_ins": that scoring; "random": a fresh draw per 2048-job batch, see
- * draw_params) and RB_METH (genomic | neutral | collapsed | random: --meth matrices, see meth_matrix).
- * The truth kswv runs with the batch's scoring and matrix; as in production, pass 0 is banded at
- * every scoring the filter admits and pass 1 at every scoring the band kernels take
- * (rb_scoring::valid), neither under --meth. RB_NEGATIVE_CONTROL=1 (harness-only) shifts the production te of
- * the first banded passing job by one, so a working comparison must report a MISMATCH and exit 1
- * (CI runs it first).
+ * draw_params) and RB_METH (genomic | neutral | collapsed | random: --meth matrices, see batch_matrix).
+ * The truth kswv runs with the batch's scoring and matrix; pass 0 is banded at every scoring the
+ * filter admits and pass 1 at every scoring the band kernels take (rb_scoring::valid), under --meth
+ * with the batch's matrix (rb_scoring::set_matrix). RB_NEGATIVE_CONTROL=1 (harness-only) shifts
+ * the production te of the first banded passing job by one, so a working comparison must report a
+ * MISMATCH and exit 1 (CI runs it first).
  *
  * Dump files: one record per prune-eligible rescue job, as the aligner saw it (full window and
  * oriented mate): int32 len1, int32 len2, len1 reference bytes, len2 query bytes (2-bit codes,
  * 4 = N). The aligner does not write them; capture new ones by instrumenting mem_matesw_batch_pre
  * where it calls rescue_prune_window. */
 #include "rescue_band.h"
+#include "bwa.h"
+#include "bwamem.h"
+#include "matesw_u8.h"
 #include "rescue_env.h"
+#include "framework/rescue_prune_test.h"
 #include "simd_dispatch.h"
 
 #include <algorithm>
@@ -289,7 +295,7 @@ static Job gen(int cls)
         }
         break;
     }
-    case 9: {   // long windows (past the NEON filter's capacity): the scalar filter decides and
+    case 9: {   // long windows (past the SIMD filter's capacity): the scalar filter decides and
                 // plan() derives its components from the scalar (fwd / bwd) view
         len1 = rndr(4100, 12000);
         r.resize(len1); for (auto &b : r) b = (uint8_t)rnd(4);
@@ -456,7 +462,7 @@ static void run_batch(Ikswv *k, Batch &b, int nb, bool p1_any)
         sp.len2 = r.qe + 1;
         revseq(r.qe + 1, b.qer.data() + sp.idq);
         revseq(r.te + 1, b.ref.data() + sp.idr);
-        if ((i < nb || p1_any) && rescue_band_batch().take_pass1(sp, r, i < nb)) continue;
+        if ((i < nb || p1_any) && rescue_band_batch().take_pass1(sp, r, i < nb, b.ref.data(), b.qer.data())) continue;
         pairs[pos++] = sp;
     }
     k->getScores8(pairs, b.ref.data(), b.qer.data(), aln, pos, 1, 1);
@@ -474,30 +480,53 @@ static std::unique_ptr<Ikswv> make_k(int maxr, int maxq, const rescue_prune_para
 /* --meth: RB_METH = genomic | neutral | collapsed | random (per batch). A batch takes one       */
 /* hypothesis (hyp 1 = OT: reference C / read T freed; hyp 0 = OB: reference G / read A), its     */
 /* mates are converted (C -> T or G -> A) at a per-batch rate, and the truth is the mat-aware kswv */
-/* built with the matrix mem_opt_fill_meth_mat builds.                                            */
+/* built with the matrix mem_opt_fill_meth_mat builds (batch_matrix).                             */
 /* ---------------------------------------------------------------------------------------- */
 enum { METH_NONE = 0, METH_GENOMIC, METH_NEUTRAL, METH_COLLAPSED, METH_RANDOM };
 static int g_meth = METH_NONE;
 
-static void meth_matrix(const rescue_prune_params &p, int kind, int hyp, int8_t mat[25])
+/* The batch's matrix, as the aligner builds it (bwa_fill_scmat; under --meth, kind != METH_NONE,
+ * then mem_opt_fill_meth_mat and the hypothesis's OT / OB matrix), and its 8-bit bias
+ * (matesw_u8_shift_for, which under --meth folds in both hypotheses' matrices). */
+static int batch_matrix(const rescue_prune_params &p, int kind, int hyp, int8_t mat[25])
 {
-    for (int i = 0; i < 5; i++)
-        for (int j = 0; j < 5; j++)
-            mat[i * 5 + j] = (int8_t)(i == 4 || j == 4 ? -1 : i == j ? p.a : -p.b);
-    const int fr = hyp ? 1 : 2, fq = hyp ? 3 : 0;
-    mat[fr * 5 + fq] = (int8_t)(kind == METH_NEUTRAL ? 0 : p.a);
-    if (kind == METH_COLLAPSED) mat[fq * 5 + fr] = (int8_t)p.a;
+    mem_opt_t *o = mem_opt_init();
+    o->a = p.a;
+    o->b = p.b;
+    bwa_fill_scmat(o->a, o->b, o->mat);
+    if (kind != METH_NONE) {
+        o->meth_mode = 1;
+        o->meth_scoring = kind == METH_GENOMIC   ? MEM_METH_SCORING_GENOMIC
+                          : kind == METH_NEUTRAL ? MEM_METH_SCORING_NEUTRAL
+                                                 : MEM_METH_SCORING_COLLAPSED;
+        mem_opt_fill_meth_mat(o);
+    }
+    memcpy(mat, kind == METH_NONE ? o->mat : hyp ? o->mat_ot : o->mat_ob, 25);
+    const int shift = matesw_u8_shift_for(o, o->mat);
+    free(o);
+    return shift;
 }
 
 /* ---------------------------------------------------------------------------------------- */
 /* Scoring: RB_SCORING unset = the default; "a,b,o_del,e_del,o_ins,e_ins" = that one; "random" =  */
-/* a fresh draw per batch, including degenerate parameter sets (which must be refused: every job  */
-/* FULL), one-sided cheap gaps, split and shared gap cells, and the minsc = a (K - 1) + 1 / + 2    */
-/* boundary.                                                                                      */
+/* a fresh draw per batch. Every third batch takes the next fixed category in turn (the defaults,  */
+/* a degenerate set, a one-sided cheap gap, split and shared gap cells, a gap sum past a byte), so */
+/* a run of 15 batches draws each; the rest draw at random, with the minsc = a (K - 1) + 1 / + 2   */
+/* boundary. A degenerate set or a gap sum past a byte must be refused (from() and                 */
+/* kswv8_scoring_ok), which the run checks.                                                        */
 /* ---------------------------------------------------------------------------------------- */
 struct Scoring { int a = 1, b = 4, o_del = 6, e_del = 1, o_ins = 6, e_ins = 1; };
 static bool g_random_scoring = false;
 static Scoring g_fixed_scoring;
+enum { MODE_DEFAULTS, MODE_DEGENERATE, MODE_CHEAP_GAP, MODE_SPLIT_CELLS, MODE_BYTE_GAP, MODE_RANDOM, NMODES };
+static long g_draws = 0, g_mode_n[NMODES] = {0};
+static long g_admitted_bad = 0;   // scorings from() or rb_scoring::valid() admitted but must refuse
+/* Whether the last drawn scoring is one kswv's 8-bit kernels run exactly. A gap sum past a byte
+ * they run with wrapped constants, where a group's saturation can move other lanes' score2, so
+ * the truth and the production pipeline (which orders the jobs differently) need not agree even
+ * though both run the same full windows through kswv: for such a batch only the refusal is
+ * checked (every job FULL; the band kernels refuse it too, so nothing is banded in either pass). */
+static bool g_kswv8_ok = true;
 
 /* The batch's scoring and threshold, minsc = k * a with k = RB_MINSC (random: drawn from 5-40).
  * from() is asked with k_min 3, so K 3 and 4 are exercised too; production asks for 5. The returned
@@ -507,12 +536,16 @@ static rescue_prune_params draw_params(int k_default)
     Scoring sc = g_fixed_scoring;
     int k = k_default;
     bool fixed_minsc = true;
+    bool must_refuse = false;   // by construction (the degenerate and byte-gap draws), not by predicate
     if (g_random_scoring) {
-        const int mode = rnd(20);
-        if (mode == 0) {   // the defaults
+        const long i = g_draws++;
+        const int mode = i % 3 == 0 ? (int)((i / 3) % MODE_RANDOM) : MODE_RANDOM;
+        g_mode_n[mode]++;
+        if (mode == MODE_DEFAULTS) {
             sc = Scoring();
-        } else if (mode == 1) {   // degenerate: must be refused before any division
+        } else if (mode == MODE_DEGENERATE) {   // must be refused before any division
             sc = Scoring();
+            must_refuse = true;
             switch (rnd(6)) {
                 case 0: sc.e_del = 0; break;
                 case 1: sc.e_ins = 0; break;
@@ -521,12 +554,17 @@ static rescue_prune_params draw_params(int k_default)
                 case 4: sc.a = 0; break;
                 default: sc.b = 129; break;
             }
-        } else if (mode == 2) {   // one gap type cheaper than (K - 1) a, either side
+        } else if (mode == MODE_CHEAP_GAP) {   // one gap type cheaper than (K - 1) a, either side
             sc = Scoring();
             if (rnd(2)) { sc.o_ins = 2; sc.e_ins = 1; } else { sc.o_del = 2; sc.e_del = 1; }
-        } else if (mode == 3) {   // split and shared fused cells: -O 6 -E 1,2 / -O 6,7 -E 2,1
+        } else if (mode == MODE_SPLIT_CELLS) {   // split and shared fused cells: -O 6 -E 1,2 / -O 6,7 -E 2,1
             sc = Scoring();
             if (rnd(2)) { sc.e_ins = 2; } else { sc.o_ins = 7; sc.e_del = 2; }
+        } else if (mode == MODE_BYTE_GAP) {   // o + e past a byte on one side: kswv wraps it, so refused
+            sc = Scoring();
+            must_refuse = true;
+            if (rnd(2)) { sc.o_del = rndr(250, 270); sc.e_del = rndr(6, 20); }
+            else { sc.o_ins = rndr(250, 270); sc.e_ins = rndr(6, 20); }
         } else {
             sc.a = 1 + rnd(3);
             sc.b = rndr(1, 12);
@@ -543,9 +581,22 @@ static rescue_prune_params draw_params(int k_default)
         minsc = sc.a * (p.K - 1) + 1 + rnd(2);
         p = rescue_prune_params::from(sc.a, sc.b, sc.o_del, sc.e_del, sc.o_ins, sc.e_ins, minsc, 3);
     }
+    /* Neither pruning nor the band kernels may admit a scoring kswv's 8-bit kernels do not run
+     * exactly (a degenerate set, a gap sum past a byte): the drawn ones are known by construction,
+     * independently of kswv8_scoring_ok, which a fixed RB_SCORING falls back on. */
+    const bool kswv8_ok = !must_refuse && kswv8_scoring_ok(sc.a, sc.b, sc.o_del, sc.e_del, sc.o_ins, sc.e_ins);
+    g_kswv8_ok = kswv8_ok;
+    if (!kswv8_ok) {
+        rb_scoring r;
+        r.a = sc.a; r.b = sc.b; r.o_del = sc.o_del; r.e_del = sc.e_del; r.o_ins = sc.o_ins; r.e_ins = sc.e_ins;
+        if (p.valid || r.valid()) g_admitted_bad++;
+    }
+    /* The values kswv cannot run at all (the rest of what kswv8_scoring_ok refuses, gap sums past a
+     * byte, it runs with wrapped constants, which is the truth the refusal must reproduce). */
     if (sc.a < 1 || sc.b < 1 || sc.b > 128 || sc.e_del < 1 || sc.e_ins < 1) {
-        /* Degenerate: from() must refuse it (checked: every job FULL); the truth runs with the
-         * default scoring, since kswv itself cannot take these values. */
+        /* Degenerate: refused above (checked); the truth runs with the default scoring, since kswv
+         * itself cannot take these values, so the batch is compared in full. */
+        g_kswv8_ok = true;
         rescue_prune_params d = rescue_prune_params::defaults(minsc);
         d.valid = p.valid;
         return d;
@@ -553,14 +604,6 @@ static rescue_prune_params draw_params(int k_default)
     p.a = sc.a; p.b = sc.b; p.o_del = sc.o_del; p.e_del = sc.e_del; p.o_ins = sc.o_ins; p.e_ins = sc.e_ins;
     p.minsc = minsc;
     return p;
-}
-
-/* matesw_use_u8 (bwamem_pair.cpp) with its shift for the {a, -b, -1} matrix: the job runs in the
- * 8-bit kernels. */
-static bool use_u8(int len2, int a, int shift)
-{
-    const int prod = len2 * a;
-    return prod + shift <= 254 && (prod < 250 || len2 % 16 == 0 || len2 % 16 >= 9);
 }
 
 /* ---------------------------------------------------------------------------------------- */
@@ -583,25 +626,28 @@ static int run_eq(std::vector<Job> &all_jobs, int k_default, int max_hits, int s
         const int hyp = rnd(2);
         if (meth == METH_RANDOM) meth = METH_GENOMIC + rnd(3);
         int8_t mat[25];
+        const int shift = batch_matrix(pp, meth, hyp, mat);
         if (meth) {
-            meth_matrix(pp, meth, hyp, mat);
             pp.set_meth(hyp);
             nmeth[meth]++;
         }
         const int minsc = pp.minsc;
-        const rb_scoring bsc = rb_scoring::from(pp);
-        const bool band = rescue_band_enabled() && pp.band_ok();
-        const bool p1_any = rescue_band_enabled() && !meth && bsc.valid();
+        /* As production: pass-0 banding for any scoring the filter admits, pass-1 banding for any
+         * scoring the kernels take (rb_scoring::valid); under --meth with the batch's matrix (which
+         * production bands only where --meth pruning is off, rescue_band_meth_on). */
+        rb_scoring bsc = rb_scoring::from(pp);
+        if (meth) bsc.set_matrix(mat);
+        const bool band = rescue_band_enabled() && pp.valid;
+        const bool p1_any = rescue_band_enabled() && bsc.valid();
         if (rescue_band_enabled()) rescue_band_batch().set_scoring(bsc);
         nbatch++; nvalid += pp.valid; nbandable += band; np1able += p1_any;
         if (pp.valid) nk[pp.K]++;
         /* This batch's jobs: a mate too long for the 8-bit kernels at this a is cut to a random
          * admissible slice (planted copies still match it), since pruning only sees 8-bit jobs. */
-        const int shift = std::max(1, pp.b);
         std::vector<Job> jobs(all_jobs.begin() + base, all_jobs.begin() + base + m);
         for (Job &J : jobs) {
             const int len2 = (int)J.q.size();
-            if (use_u8(len2, pp.a, shift)) continue;
+            if (matesw_use_u8(len2, pp.a, shift)) continue;
             int nl = std::min(len2, std::min((254 - shift) / pp.a, 249 / pp.a));
             if (nl < 5) nl = 0;
             if (nl > 17) nl = rndr(17, nl);
@@ -679,7 +725,7 @@ static int run_eq(std::vector<Job> &all_jobs, int k_default, int max_hits, int s
                 nview++;
                 if (!vok) {
                     view_mm++;
-                    if (view_mm < 5) fprintf(stderr, "VIEW MISMATCH job=%zu cls=%d: NEON and scalar views disagree\n", base + t, J.cls);
+                    if (view_mm < 5) fprintf(stderr, "VIEW MISMATCH job=%zu cls=%d: SIMD and scalar filter views disagree\n", base + t, J.cls);
                 }
             }
             if (kind[t] == RESCUE_PRUNE_B1) { nb1++; continue; }
@@ -713,12 +759,15 @@ static int run_eq(std::vector<Job> &all_jobs, int k_default, int max_hits, int s
             const Job &J = jobs[t];
             const kswr_t &a = T.aln[t];
             n++; cls_n[J.cls]++;
-            n12_band += band && pp.default_scoring() && J.cls == 12;   // the ceiling at a = 1, b = 4
+            n12_band += band && rescue_prune_is_default_scoring(pp) && J.cls == 12;   // the ceiling at a = 1, b = 4
             band_hi += banded[t] && a.score >= 241;
             bool ok;
             const bool pass = a.score >= minsc;
             npass += pass;
-            if (kind[t] == RESCUE_PRUNE_B1) ok = !pass;
+            if (!g_kswv8_ok) {   // see g_kswv8_ok: refused, so the full window (and nothing planned)
+                ok = kind[t] == RESCUE_PRUNE_FULL;
+                if (!ok && mism < 10) fprintf(stderr, "scoring past kswv's gap byte but kind=%d\n", kind[t]);
+            } else if (kind[t] == RESCUE_PRUNE_B1) ok = !pass;
             else {
                 kswr_t b = P.aln[idx[t]];
                 if (negative_control && !injected && pass && banded[t]) { b.te++; injected = true; }
@@ -749,7 +798,7 @@ static int run_eq(std::vector<Job> &all_jobs, int k_default, int max_hits, int s
                 if (mism < 10) fprintf(stderr, "refused scoring but kind=%d\n", kind[t]);
             }
             if (!ok) { mism++; cls_mm[J.cls]++; }
-            if (scalar_stride > 0 && pp.default_scoring() && (n % scalar_stride) == 0) {
+            if (scalar_stride > 0 && rescue_prune_is_default_scoring(pp) && (n % scalar_stride) == 0) {
                 int S, te, qe; std::vector<int> R;
                 scalar_dp(J, S, te, qe, R);
                 const int s2 = S >= minsc ? scalar_score2(R, S, te, minsc) : -1;
@@ -776,6 +825,15 @@ static int run_eq(std::vector<Job> &all_jobs, int k_default, int max_hits, int s
     printf("  scoring: batches=%ld valid=%ld pass0_bandable=%ld pass1_bandable=%ld K3=%ld K4=%ld K5=%ld mates_cut_to_8bit=%ld meth genomic=%ld "
            "neutral=%ld collapsed=%ld\n", nbatch, nvalid, nbandable, np1able, nk[3], nk[4], nk[5], ntrunc, nmeth[1], nmeth[2],
            nmeth[3]);
+    /* The fixed categories come round every third batch, so each one reached is guaranteed drawn. */
+    bool modes_missing = false;
+    if (g_random_scoring) {
+        printf("  scoring draws: defaults=%ld degenerate=%ld cheap_gap=%ld split_cells=%ld byte_gap=%ld random=%ld\n",
+               g_mode_n[MODE_DEFAULTS], g_mode_n[MODE_DEGENERATE], g_mode_n[MODE_CHEAP_GAP],
+               g_mode_n[MODE_SPLIT_CELLS], g_mode_n[MODE_BYTE_GAP], g_mode_n[MODE_RANDOM]);
+        const long specials = (nbatch + 2) / 3;
+        for (int c = 0; c < MODE_RANDOM && c < specials; c++) modes_missing |= g_mode_n[c] == 0;
+    }
     for (int c = 0; c < 128; c++)
         if (cls_n[c]) printf("  class %3d: jobs=%ld mismatches=%ld\n", c, cls_n[c], cls_mm[c]);
     /* A pass with nothing banded compares kswv with kswv: fail it where banding runs, so the gate
@@ -789,7 +847,12 @@ static int run_eq(std::vector<Job> &all_jobs, int k_default, int max_hits, int s
     /* Production falls back to kswv when a banded pass-1 max is not S (the guard in rescue_band.h),
      * but that cannot happen, so here any fallback fails the run: it means the band argument broke. */
     if (p1_guard) fprintf(stderr, "FAIL: %ld pass-1 guard fallbacks (banded max != S)\n", p1_guard);
-    return mism || scal_mm || view_mm || vacuous || ceiling_vacuous || p1_guard ? 1 : 0;
+    if (g_admitted_bad)
+        fprintf(stderr, "FAIL: %ld scorings kswv's 8-bit kernels do not run exactly were admitted (from() / rb_scoring::valid)\n",
+                g_admitted_bad);
+    if (modes_missing) fprintf(stderr, "FAIL: a fixed RB_SCORING=random category was never drawn\n");
+    return mism || scal_mm || view_mm || vacuous || ceiling_vacuous || p1_guard || g_admitted_bad || modes_missing
+               ? 1 : 0;
 }
 
 /* ---------------------------------------------------------------------------------------- */

@@ -5,6 +5,7 @@
 #include "rescue_band.h"
 #include "rescue_env.h"
 #include "simd_dispatch.h"
+#include "utils.h"
 
 #include <algorithm>
 #include <atomic>
@@ -390,11 +391,13 @@ bool RescueBandBatch::plan(const rescue_prune_view &v, const rescue_prune_params
 {
     pending_ = -1;
     /* The view's components are at the filter call's minsc, which must be pp's (the filter ran
-     * with pp), and pp's scoring must be the batch's (set_scoring). minsc <= 255 is the kernels' u8
-     * range (and kswv's score2 threshold byte). */
+     * with pp). minsc <= 255 is the kernels' u8 range (and kswv's score2 threshold byte). */
     const int minsc = pp.minsc;
-    if (v.nd < 0 || !pp.band_ok() || v.minsc != minsc || minsc > 255 || !(rb_scoring::from(pp) == sc_))
-        return false;
+    if (v.nd < 0 || !pp.valid || v.minsc != minsc || minsc > 255) return false;
+    /* pp's costs must be the batch's (set_scoring, called by the caller before planning; under
+     * --meth the batch's matrix is the group's, set_matrix): bands planned for one scoring and run
+     * under another would not be exact, so a mismatch is a caller bug, not a decline. */
+    xassert(rb_scoring::from(pp).same_costs(sc_), "band plan: the filter's scoring is not the batch's");
     /* A cost gate of 0 (the default where kswv runs at the AVX-512BW tier, rb_cost_pct) declines
      * every parent, so skip the component work it would decline afterwards; counted as declined by
      * the cost model, which is what the gate below would do. */
@@ -589,11 +592,16 @@ struct rb_work {
 
 static inline void rb_set_scoring(rb_work &w, const rb_scoring &sc)
 {
-    w.tbl[0] = (int8_t)sc.a;
-    for (int i = 1; i < 4; i++) w.tbl[i] = (int8_t)-sc.b;
-    for (int i = 4; i < 16; i++) w.tbl[i] = -1;
-    w.oe_del = (uint8_t)std::min(255, sc.o_del + sc.e_del); w.e_del = (uint8_t)std::min(255, sc.e_del);
-    w.oe_ins = (uint8_t)std::min(255, sc.o_ins + sc.e_ins); w.e_ins = (uint8_t)std::min(255, sc.e_ins);
+    if (sc.asym) {
+        for (int i = 0; i < 16; i++) w.tbl[i] = sc.mat16[i];
+    } else {
+        w.tbl[0] = (int8_t)sc.a;
+        for (int i = 1; i < 4; i++) w.tbl[i] = (int8_t)-sc.b;
+        for (int i = 4; i < 16; i++) w.tbl[i] = -1;
+    }
+    /* Bytes, as kswv loads them; rb_scoring::valid (kswv8_scoring_ok) bounds o + e by 255. */
+    w.oe_del = (uint8_t)(sc.o_del + sc.e_del); w.e_del = (uint8_t)sc.e_del;
+    w.oe_ins = (uint8_t)(sc.o_ins + sc.e_ins); w.e_ins = (uint8_t)sc.e_ins;
 }
 
 static inline uint64_t rb_mask16(uint8x16_t m)
@@ -638,6 +646,10 @@ static inline void rb_snapshot(rb_work &w, const uint8_t *Hrow, int row, int W, 
 /* FScan selects the G-based cell (see RB_CELL1). The two instantiations can differ in band cells
  * off every optimal path, but agree on every value the caller reads -- gmax, te, the SNAP cells
  * equal to gmax, and the rows R the merge uses -- so every output is the same (RB_CELL1). */
+/* Score-table index of query code q against reference code r (REF): q ^ r. Under --meth's
+ * asymmetric table REF holds r << 2 (run_jobs), and q ^ (r << 2) = (r << 2) | q for bases, since
+ * the bits are disjoint (rb_scoring::asym); the pad and inactive codes land outside the table
+ * either way. */
 template <bool FScan, bool Sym>
 static long rb_dp_core(rb_work &w, int W, int NR, int omax, int ominq, int omaskq, bool early)
 {
@@ -1031,6 +1043,17 @@ static void rb_score2_vec(const uint8_t *R, int n, int row0, int Z, int te, int 
 }
 #endif
 
+#if RB_HAVE_SIMD
+/* The band kernel rb_kernel() selects, for one Sym instantiation. */
+template <bool Sym>
+static long rb_kernel_run(int kern, rb_work &w, int W, int NR, int omax, int ominq, int omaskq, bool early)
+{
+    return kern >= 2 ? rb_dp_wave2<Sym>(w, W, NR, omax, ominq, omaskq, early)
+         : kern == 1 ? rb_dp_core<true, Sym>(w, W, NR, omax, ominq, omaskq, early)
+                     : rb_dp_core<false, Sym>(w, W, NR, omax, ominq, omaskq, early);
+}
+#endif
+
 static inline int rb_width_bucket(int w)
 {
     return w <= 16 ? (w + 3) >> 2 : w <= 64 ? 4 + ((w - 16 + 7) >> 3) : w <= 128 ? 10 + ((w - 64 + 15) >> 4)
@@ -1116,7 +1139,10 @@ void RescueBandBatch::run_jobs(bool pass1)
                 const job &J = *L[l];
                 rows = J.nrows;
                 const uint8_t *src = J.ref + J.r0;
-                for (int r = 0; r < rows; r++) row[r] = src[r] < 4 ? src[r] : 4;
+                /* Asymmetric (--meth) table: REF holds r << 2, so the kernels' q ^ REF indexes it
+                 * (rb_scoring::asym); no N can reach here. */
+                if (sc_.asym) for (int r = 0; r < rows; r++) row[r] = (uint8_t)(src[r] << 2);
+                else for (int r = 0; r < rows; r++) row[r] = src[r] < 4 ? src[r] : 4;
             }
             if (NRp > rows) memset(row + rows, 0x80, NRp - rows);
         }
@@ -1138,13 +1164,8 @@ void RescueBandBatch::run_jobs(bool pass1)
         }
         for (int l = 0; l < RB_L; l++) w.target[l] = pass1 && l < nl ? (uint8_t)L[l]->target : 0;
         const int kern = rb_kernel();
-        const long computed =
-            kern >= 2 ? (sym ? rb_dp_wave2<true>(w, W, NR, omax, ominq, omaskq, pass1)
-                             : rb_dp_wave2<false>(w, W, NR, omax, ominq, omaskq, pass1))
-            : kern == 1 ? (sym ? rb_dp_core<true, true>(w, W, NR, omax, ominq, omaskq, pass1)
-                               : rb_dp_core<true, false>(w, W, NR, omax, ominq, omaskq, pass1))
-                        : (sym ? rb_dp_core<false, true>(w, W, NR, omax, ominq, omaskq, pass1)
-                               : rb_dp_core<false, false>(w, W, NR, omax, ominq, omaskq, pass1));
+        const long computed = sym ? rb_kernel_run<true>(kern, w, W, NR, omax, ominq, omaskq, pass1)
+                                  : rb_kernel_run<false>(kern, w, W, NR, omax, ominq, omaskq, pass1);
         if (st) stats_.cells_pad += (uint64_t)RB_L * computed;
         /* Lane l's gmax, the first row reaching it and the first column holding it there. */
         auto lane_result = [&](int l) {
@@ -1330,7 +1351,8 @@ void RescueBandBatch::run_pass0(const SeqPair *pairs, int nb, const uint8_t *seq
 /* Pass 1 (start recovery)                                                                     */
 /* ------------------------------------------------------------------------------------------ */
 
-bool RescueBandBatch::take_pass1(const SeqPair &sp, const kswr_t &r, bool banded_parent)
+bool RescueBandBatch::take_pass1(const SeqPair &sp, const kswr_t &r, bool banded_parent,
+                                 const uint8_t *seqBufRef, const uint8_t *seqBufQer)
 {
 #if RB_HAVE_SIMD
     if (rb_p1_mode() < (banded_parent ? 1 : 2)) return false;
@@ -1342,6 +1364,15 @@ bool RescueBandBatch::take_pass1(const SeqPair &sp, const kswr_t &r, bool banded
 #if RB_X86
     if (S + sc_.a + sh > 255) { stats_.p1_kswv++; return false; }
 #endif
+    /* The asymmetric table's index r << 2 | q has no N entry (N would alias a real cell: a query
+     * N, code 8, against r reads entry 8 | r << 2), so both reversed prefixes must be N-free. */
+    if (sc_.asym) {
+        uint8_t orv = 0;
+        const uint8_t *rp = seqBufRef + sp.idr, *qp = seqBufQer + sp.idq;
+        for (int i = 0; i <= te; i++) orv |= rp[i];
+        for (int j = 0; j <= qe; j++) orv |= qp[j];
+        if (orv & 0xFC) { stats_.p1_kswv++; return false; }
+    }
     /* The band of rescue_band.h: A* has D <= dall deleted and I <= iall inserted bases, and spans at
      * most qe + 1 + dall rows of the te + 1 reversed ones. Diagonals past the last row (d > nrows - 1)
      * or past the query (d < -(quanta - 1)) hold no cell, so the band is clipped to them. */
@@ -1358,7 +1389,7 @@ bool RescueBandBatch::take_pass1(const SeqPair &sp, const kswr_t &r, bool banded
     p1_.push_back(p1job{sp, nrows, imax, dmax});
     return true;
 #else
-    (void)sp; (void)r; (void)banded_parent;
+    (void)sp; (void)r; (void)banded_parent; (void)seqBufRef; (void)seqBufQer;
     return false;
 #endif
 }

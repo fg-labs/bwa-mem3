@@ -112,13 +112,6 @@ struct rescue_prune_params {
         w.base = base(); w.a = a; w.c = c; w.toff = o_del - (K - 1) * a; w.e = e_del;
         return w;
     }
-    /* The band kernels take any valid scoring with the symmetric score table, so not --meth (its
-     * freed cells need an asymmetric table the kernels do not have). */
-    bool band_ok() const { return valid && conv_from < 0; }
-    bool default_scoring() const
-    {
-        return conv_from < 0 && a == 1 && b == 4 && o_del == 6 && e_del == 1 && o_ins == 6 && e_ins == 1;
-    }
     /* --meth: the rescued mate is scored with mat_ot (hyp 1: reference C / read T freed) or mat_ob
      * (hyp 0: reference G / read A freed); collapsed scoring also frees the mirror cell. */
     void set_meth(int hyp)
@@ -476,22 +469,6 @@ static inline int rescue_prune_window(const uint8_t *ref, int len1, const uint8_
     const int kind = rescue_prune_window_scalar(ref, len1, q, len2, p, max_hits, s, hb, he);
     if (view && kind == RESCUE_PRUNE_B2) *view = rescue_prune_scalar_view(s, len1, len2, p);
     return kind;
-}
-
-/* The default scoring at threshold minsc (rescue_prune_params::defaults). */
-static inline int rescue_prune_window(const uint8_t *ref, int len1, const uint8_t *q, int len2,
-                                      int minsc, int max_hits, int *hb, int *he,
-                                      rescue_prune_view *view = nullptr)
-{
-    return rescue_prune_window(ref, len1, q, len2, rescue_prune_params::defaults(minsc), max_hits, hb, he,
-                               view);
-}
-static inline int rescue_prune_window_scalar(const uint8_t *ref, int len1, const uint8_t *q, int len2,
-                                             int minsc, int max_hits, rescue_prune_scratch &s,
-                                             int *hb, int *he)
-{
-    return rescue_prune_window_scalar(ref, len1, q, len2, rescue_prune_params::defaults(minsc), max_hits,
-                                      s, hb, he);
 }
 
 #endif

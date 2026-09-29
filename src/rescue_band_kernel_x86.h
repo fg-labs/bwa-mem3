@@ -72,13 +72,18 @@ static inline void rb_set_scoring(rb_work &w, const rb_scoring &sc)
 {
     const int sh = sc.shift();
     for (int h = 0; h < 32; h += 16) {
+        if (sc.asym) {
+            for (int i = 0; i < 16; i++) w.tblb[h + i] = (uint8_t)(sc.mat16[i] + sh);
+            continue;
+        }
         w.tblb[h] = (uint8_t)(sc.a + sh);
         for (int i = 1; i < 4; i++) w.tblb[h + i] = (uint8_t)(sh - sc.b);
         for (int i = 4; i < 16; i++) w.tblb[h + i] = (uint8_t)(sh - 1);
     }
     w.shift = (uint8_t)sh;
-    w.oe_del = (uint8_t)std::min(255, sc.o_del + sc.e_del); w.e_del = (uint8_t)std::min(255, sc.e_del);
-    w.oe_ins = (uint8_t)std::min(255, sc.o_ins + sc.e_ins); w.e_ins = (uint8_t)std::min(255, sc.e_ins);
+    /* Bytes, as kswv loads them; rb_scoring::valid (kswv8_scoring_ok) bounds o + e by 255. */
+    w.oe_del = (uint8_t)(sc.o_del + sc.e_del); w.e_del = (uint8_t)sc.e_del;
+    w.oe_ins = (uint8_t)(sc.o_ins + sc.e_ins); w.e_ins = (uint8_t)sc.e_ins;
 }
 
 static inline __m256i rb_ld(const uint8_t *p) { return _mm256_loadu_si256((const __m256i *)p); }
@@ -143,7 +148,9 @@ static inline void rb_snapshot(rb_work &w, const uint8_t *Hrow, int row, int W, 
 
 /* The biased scoring table (index q ^ r: 0 match, 1-3 mismatch, 4-15 N), both 128-bit halves. */
 static inline __m256i rb_tblb(const rb_work &w) { return _mm256_load_si256((const __m256i *)w.tblb); }
-/* sat(Hp + score(q, r)) in the biased form (see the file comment) */
+/* sat(Hp + score(q, r)) in the biased form (see the file comment). Under the --meth table REF
+ * holds r << 2, and q ^ (r << 2) = (r << 2) | q for bases (the NEON section's argument); the pad
+ * 0x80 / nonexistent 0xC0 query codes still set bit 7, so PSHUFB still gives 0. */
 static inline __m256i rb_hs(__m256i hp, __m256i q, __m256i rref, __m256i bi, __m256i tbl)
 {
     return _mm256_subs_epu8(_mm256_adds_epu8(hp, _mm256_shuffle_epi8(tbl, _mm256_xor_si256(q, rref))), bi);

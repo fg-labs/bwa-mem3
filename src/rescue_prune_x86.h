@@ -33,7 +33,6 @@ using rescue_prune_neon::FULL;
 using rescue_prune_neon::HIT_CAP;
 using rescue_prune_neon::Job;
 using rescue_prune_neon::Kind;
-using rescue_prune_neon::MINSC;
 using rescue_prune_neon::Wt;
 using rescue_prune_neon::bitset_last;
 using rescue_prune_neon::bitset_next;
@@ -415,8 +414,8 @@ static inline Kind lean_x86_core(const Job &jb, X86Scratch &s, int &hb, int &he,
 }
 
 // lean_x86_core behind the repeat memo, as lean_neon.
-static inline Kind lean_x86(const Job &jb, X86Scratch &s, int &hb, int &he, int max_hits = 1 << 30,
-                            int minsc = MINSC, const Wt &wt = Wt())
+static inline Kind lean_x86(const Job &jb, X86Scratch &s, int &hb, int &he, int max_hits, int minsc,
+                            const Wt &wt)
 {
     return lean_memo(jb, s, hb, he, max_hits, minsc, wt,
                      [](const Job &j, X86Scratch &t, int &b, int &e, int mh, int ms, const Wt &w) {

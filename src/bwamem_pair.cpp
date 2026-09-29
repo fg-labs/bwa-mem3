@@ -421,8 +421,10 @@ static rb_scoring rescue_band_scoring_for(const mem_opt_t *opt)
     return rb_scoring::from(rescue_prune_params_for(opt));
 }
 
-/* Whether banded pass 1 can run in this run: the shortcuts are on (rescue_prune_on), the rescue is
- * non-meth (the band kernels have no freed-cell matrix) and the band kernels take the scoring
+/* Whether banded pass 1 can run in this run's symmetric-scoring batch: the shortcuts are on
+ * (rescue_prune_on), the rescue is non-meth (this batch's kswv and band scoring are the symmetric
+ * ones; --meth bands pass 1 per OT/OB group in mem_sam_pe_batch, rescue_band_meth_on) and the band
+ * kernels take the scoring
  * (rb_scoring::valid; the pass-1 band bound of rescue_band.h holds for every such scoring, whether
  * or not the pruning lemma does, so -B 3 or -O 6,2 -E 1 band pass 1 too). */
 static bool rescue_band_runs(const mem_opt_t *opt)
@@ -452,6 +454,21 @@ static bool rescue_prune_runs(const mem_opt_t *opt, const rescue_prune_params &p
 static bool rescue_prune_runs(const mem_opt_t *opt)
 {
     return rescue_prune_runs(opt, rescue_prune_params_for(opt));
+}
+
+/* --meth banding (the group's matrix) only where --meth pruning is off: there the band replaces
+ * full-window kswv rows and pays, while on top of pruning it costs more than it saves. In production
+ * that is pass 1 only: pass 0 bands pruned parents, which mem_matesw_batch_pre plans for non-meth
+ * jobs alone, and where this holds nothing is pruned. Wall, 5 reps, -t 16, band vs no band: m8g
+ * EM-seq 5 M genomic +1.1 %, -B 4 +1.5 % (a pass-0 band forced on for the measurement and pass 1
+ * alone both lose), collapsed -0.7 %, TAPS 1 M -3.3 %; m8a (x86 --meth never prunes) EM-seq genomic
+ * -3.5 %, collapsed -2.9 %, -B 4 and TAPS flat. Like every shortcut it needs rescue_prune_on (a SIMD
+ * build, BWA3_RESCUE_PRUNE), and banding (BWA3_RESCUE_BAND). */
+static bool rescue_band_meth_on(const mem_opt_t *opt)
+{
+    /* Pruning applies only without --rescue-kmer (rescue_prune_applies), so a --rescue-kmer run
+     * (--fast sets it) prunes nothing and bands pass 1 as an unpruned run does. */
+    return rescue_prune_on() && rescue_band_enabled() && !(rescue_prune_runs(opt) && !opt->rescue_kmer);
 }
 
 /* Whether pruning applies to one rescue job: the run can prune (run_prunes, rescue_prune_runs,
@@ -988,9 +1005,10 @@ static void mem_sam_pe_batch_run(Ikswv *pwsw, SeqPair *pairs,
      * pass 0 runs as banded DP jobs instead of kswv; it fills their aln[regid] exactly as kswv
      * would, so the post-processing below treats every pair alike. Their pass 1 is banded too
      * where that is cheaper (take_pass1), and runs through kswv otherwise. p1_band_any extends the
-     * banded pass 1 to every other 8-bit pair; the caller sets it only for default scoring and
-     * non-meth, which the band's exactness argument needs (a banded parent implies both). band is
-     * this tid's batch; non-NULL whenever n_banded > 0 or p1_band_any. */
+     * banded pass 1 to every other 8-bit pair; the caller sets it only for a scoring the band
+     * kernels take (band's set_scoring, under --meth with the group's matrix), which the band's
+     * exactness argument needs (a banded parent implies it). band is this tid's batch; non-NULL
+     * whenever n_banded > 0 or p1_band_any. */
     const bool timed = g_rescue_prune_stats.on;
     uint64_t t0 = timed ? rescue_now_ns() : 0;
     pwsw->getScores8(pairs + n_banded, seqBufRef, seqBufQer, aln, slice_pcnt8 - n_banded, nthreads, 0);
@@ -1017,7 +1035,7 @@ static void mem_sam_pe_batch_run(Ikswv *pwsw, SeqPair *pairs,
         uint8_t *qs = seqBufQer + sp.idq;
         uint8_t *rs = seqBufRef + sp.idr;
         revseq(r.qe + 1, qs); revseq(r.te + 1, rs);
-        if ((i < n_banded || p1_band_any) && band->take_pass1(sp, r, i < n_banded)) continue;
+        if ((i < n_banded || p1_band_any) && band->take_pass1(sp, r, i < n_banded, seqBufRef, seqBufQer)) continue;
         pairs[pos++] = sp;
         pos8 ++;
     }
@@ -1133,6 +1151,11 @@ int mem_sam_pe_batch(const mem_opt_t *opt, mem_cache *mmc,
                       "meth mate-rescue matrix not expressible by the batched kernel "
                       "(neither a single freed cell nor a collapsed mirror pair)");
 
+        /* Run-constant, once per batch: the length sort (with --rescue-kmer or pruning) and
+         * --meth pass-1 banding (rescue_band_meth_on, at a scoring the band kernels take). */
+        const bool meth_sort = opt->rescue_kmer || rescue_prune_runs(opt);
+        const rb_scoring meth_band_sc = rescue_band_scoring_for(opt);
+        const bool meth_band = rescue_band_meth_on(opt) && meth_band_sc.valid();
         // hyp == 1 -> OT (mat_ot / pwsw_ot); hyp == 0 -> OB (mat_ob / pwsw_ob).
         // -1 (non-meth) cannot occur here: every enqueued pair under meth_mode
         // was tagged with a real hypothesis in mem_matesw_batch_pre. Process
@@ -1162,13 +1185,27 @@ int mem_sam_pe_batch(const mem_opt_t *opt, mem_cache *mmc,
             /* --rescue-kmer and exact pruning: same length sort as the non-meth path
              * below, applied per OT/OB partition -- otherwise the narrowed windows sit
              * mixed with full ones inside each SIMD group, paying the scan cost without
-             * collecting the saving. */
-            if (opt->rescue_kmer || rescue_prune_runs(opt))
+             * collecting the saving. Like the non-meth sort it covers the whole group,
+             * pairs pruning left at full length included (16-bit, over the hit gate, N);
+             * the --meth pruning figures (rescue_prune_cost_ok) are whole runs with it. */
+            if (meth_sort)
                 matesw_sort_partitions_by_len(scratch, group_pcnt8, group_pcnt);
 
+            /* Banded pass 1 for this group (rescue_band_meth_on): the band kernels score with the
+             * group's matrix (rb_scoring::set_matrix), and the guard fallbacks run through this
+             * group's kswv object. Pass 1 only (p1_band_any, no banded parents): _pre plans no
+             * --meth pair for a banded pass 0. */
+            RescueBandBatch *gband = NULL;
+            if (meth_band) {
+                rb_scoring gsc = meth_band_sc;
+                gsc.set_matrix(hyp == 1 ? opt->mat_ot : opt->mat_ob);
+                gband = &matesw_band(mmc, tid);
+                band_reset.b = gband;
+                gband->set_scoring(gsc);
+            }
             Ikswv *pwsw = (hyp == 1) ? pwsw_ot.get() : pwsw_ob.get();
             mem_sam_pe_batch_run(pwsw, scratch, seqBufRef, seqBufQer,
-                                 aln, group_pcnt, group_pcnt8, nthreads);
+                                 aln, group_pcnt, group_pcnt8, nthreads, 0, gband, gband != NULL);
         }
         // Release-safe invariant guard: the OT/OB partition must cover every
         // enqueued pair. A pair tagged with a hypothesis outside {0,1} would be
@@ -1193,8 +1230,9 @@ int mem_sam_pe_batch(const mem_opt_t *opt, mem_cache *mmc,
     const int64_t n_banded = band_reset.b ? band_reset.b->partition(seqPairArray, (int)pcnt8) : 0;
 
     /* Banded pass 1 beyond the banded parents: needs a scoring the band kernels take (its band bound
-     * is derived for any of them) and non-meth (the band kernel has no freed-cell matrix; this
-     * point is also reached under --meth when the batched meth rescue is off, where pruning's
+     * is derived for any of them) and non-meth (this batch's kswv and band scoring are symmetric;
+     * --meth bands pass 1 per OT/OB group above. This point is also reached under --meth when the
+     * batched meth rescue is off, where pruning's
      * length sort above may still run: it changes no result) -- both part of rescue_band_runs,
      * which also keeps BWA3_RESCUE_PRUNE=0 the whole pre-pruning path -- and the banding path (a
      * NEON or AVX2 band kernel; off under BWA3_RESCUE_BAND=0). It does not depend on pruning's
@@ -1831,9 +1869,10 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                     }
                 }
                 /* Banding plan (rescue_band.h), bound to this pair's regid at enqueue (commit), at
-                 * the run's scoring (the batch took it once per call, above). Not under --meth: the
-                 * band kernels have no freed-cell table. */
-                if (kind == RESCUE_PRUNE_B2 && reuse < 0 && rescue_band_enabled() && pp.band_ok())
+                 * the run's scoring. Not under --meth: a pruned --meth run does not band
+                 * (rescue_band_meth_on); the band kernels' --meth matrices serve the unpruned runs'
+                 * pass 1. */
+                if (kind == RESCUE_PRUNE_B2 && reuse < 0 && rescue_band_enabled() && !opt->meth_mode)
                     matesw_band(mmc, tid).plan(view, pp, (int)(re - rb), l_ms, hb, he);
                 if (g_rescue_prune_stats.on) g_rescue_prune_stats.ns_filter += rescue_now_ns() - tf0;
                 if (g_rescue_prune_stats.on) {

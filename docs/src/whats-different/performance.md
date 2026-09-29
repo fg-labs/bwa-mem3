@@ -236,7 +236,8 @@ generated jobs.
   admitted scoring with `-A` of at most 16; the others run a scalar filter,
   which pays on aarch64 but not against x86's kswv, so x86 keeps the full window
   there. Elsewhere the full window is always computed.
-  (x86: [#538](https://github.com/fg-labs/bwa-mem3/pull/538))
+  ([#541](https://github.com/fg-labs/bwa-mem3/pull/541); x86:
+  [#538](https://github.com/fg-labs/bwa-mem3/pull/538))
 - **Banded rescue DP (NEON, AVX2).** For a narrowed job, the rescue DP runs only
   inside the diagonal bands of the K-mer (today 5-mer) components that can reach the
   threshold, 16 bands per NEON vector or 32 per AVX2 vector, and the job's
@@ -245,16 +246,20 @@ generated jobs.
   cost model keeps the full hull when banding would not pay. Same scope as the
   pruning, at every scoring it admits (8-bit, no `--meth`); the kernels take the
   run's match, mismatch and both gap types' costs.
-  (AVX2: [#538](https://github.com/fg-labs/bwa-mem3/pull/538))
+  ([#541](https://github.com/fg-labs/bwa-mem3/pull/541); AVX2:
+  [#538](https://github.com/fg-labs/bwa-mem3/pull/538))
 - **Banded start recovery (NEON, AVX2).** The second rescue pass, which finds where
   the best alignment starts, runs in a diagonal band derived from the first
   pass's score and end: an alignment of that score can hold only a bounded
   number of gapped bases, so the band holds it, and the first row and column
   reaching the score are the same as in the full pass. Used for every 8-bit job
-  (banded or not in the first pass, no `--meth`, at any seed length and any
-  scoring the band kernels take, including ones the pruning refuses, such as
-  `-B 3`) when the band is cheaper than the full pass.
-  (AVX2: [#538](https://github.com/fg-labs/bwa-mem3/pull/538))
+  (banded or not in the first pass, at any seed length and any scoring the band
+  kernels take, including ones the pruning refuses, such as `-B 3`) when the
+  band is cheaper than the full pass; under `--meth`, with the bisulfite
+  matrices, wherever `--meth` does not prune (on x86, with TAPS chemistry, or
+  at the default collapsed scoring).
+  ([#541](https://github.com/fg-labs/bwa-mem3/pull/541); AVX2:
+  [#538](https://github.com/fg-labs/bwa-mem3/pull/538))
 - **11-op rescue cell (NEON, AVX2, AVX-512BW; 8- and 16-bit).** When the
   open-plus-extend sums (`-O` + `-E`) of insertions and deletions are equal and
   fit the kernel's lane (a byte for the 8-bit kernels), and no gap cost is

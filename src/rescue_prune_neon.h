@@ -61,7 +61,7 @@ struct Scratch {
 
 // Production-style filter. Returns FULL (N present: run the full window), B1 (proven score <
 // minsc) or B2 with the inclusive hull [hb, he].
-static inline Kind lean(const Job &jb, Scratch &s, int &hb, int &he, int minsc = MINSC)
+static inline Kind lean(const Job &jb, Scratch &s, int &hb, int &he, int minsc)
 {
     const uint8_t *ref = jb.ref, *q = jb.qry;
     const int len1 = jb.len1, len2 = jb.len2;
@@ -729,8 +729,8 @@ static inline Kind lean_neon_core(const Job &jb, NeonScratch &s, int &hb, int &h
     return B2;
 }
 // lean_neon_core behind the repeat memo (lean_memo).
-static inline Kind lean_neon(const Job &jb, NeonScratch &s, int &hb, int &he, int max_hits = 1 << 30,
-                             int minsc = MINSC, const Wt &wt = Wt())
+static inline Kind lean_neon(const Job &jb, NeonScratch &s, int &hb, int &he, int max_hits, int minsc,
+                             const Wt &wt)
 {
     return lean_memo(jb, s, hb, he, max_hits, minsc, wt,
                      [](const Job &j, NeonScratch &t, int &b, int &e, int mh, int ms, const Wt &w) {

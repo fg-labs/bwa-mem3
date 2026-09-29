@@ -126,6 +126,7 @@ ifneq ($(COVERAGE),)
     LDFLAGS  += --coverage
 endif
 FRAMEWORK_SRCS := $(FRAMEWORK_DIR)/scoring.cpp \
+                  $(FRAMEWORK_DIR)/meth_scoring.cpp \
                   $(FRAMEWORK_DIR)/seqpair_gen.cpp \
                   $(FRAMEWORK_DIR)/seqpair_batch.cpp \
                   $(FRAMEWORK_DIR)/ksw_runner.cpp \

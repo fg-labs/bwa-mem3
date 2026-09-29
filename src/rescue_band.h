@@ -63,9 +63,9 @@
  *
  * Scope: the NEON kernel (aarch64, 16 lanes) and the AVX2 kernel (x86, 32 lanes,
  * rescue_band_kernel_x86.h), for any scoring the kernels take (rb_scoring: the score table
- * {a, -b, -1}, separate deletion and insertion gap costs), 8-bit and non-meth: pass 0 for the jobs
- * rescue_prune_applies() prunes (minsc in [5, 255], plan()), pass 1 for every such job. Without a
- * SIMD kernel the hull path runs.
+ * {a, -b, -1}, or under --meth the pair group's asymmetric matrix, set_matrix; separate deletion
+ * and insertion gap costs), 8-bit: pass 0 for jobs the filter pruned (minsc in [5, 255], plan()),
+ * pass 1 for every such job. Without a SIMD kernel the hull path runs.
  * Env: the BWA3_RESCUE_BAND* knobs and BWA3_RESCUE_PRUNE_STATS, listed with their defaults in
  * rescue_env.h.
  *
@@ -80,26 +80,36 @@
 
 /* The scoring the band kernels run with (per batch: every pair of a batch shares mem_opt_t): match
  * a, mismatch b (N scores -1), gap of length L costs o + e L per type (deletion: reference advances,
- * the kernels' vertical E; insertion: query advances, their in-row F). shift = kswv's 8-bit bias,
- * -min(a, -b, -1) = max(1, b): a pass-0 score with S + shift >= 255 is kswv's saturated 255. */
+ * the kernels' vertical E; insertion: query advances, their in-row F). shift = kswv's 8-bit bias
+ * (kswv8_shift): a pass-0 score with S + shift >= 255 is kswv's saturated 255. */
 struct rb_scoring {
     int a = 1, b = 4, o_del = 6, e_del = 1, o_ins = 6, e_ins = 1;
-    int shift() const { return b > 1 ? b : 1; }
+    /* --meth: the kernels take a table of the pair group's matrix (mat_ot / mat_ob, one group at a
+     * time in mem_sam_pe_batch) with the reference code pre-shifted, index q ^ (r << 2) (which is
+     * (r << 2) | q for bases, the bits being disjoint), instead of the symmetric {a, -b, -1} at
+     * q ^ r. That index has no room for N, so no band job of an asymmetric scoring may hold one:
+     * pass 0 never does (the filter returns FULL on N) and take_pass1 declines prefixes with N. */
+    bool asym = false;
+    int8_t mat16[16] = {0};
+    void set_matrix(const int8_t *mat25)
+    {
+        asym = true;
+        for (int r = 0; r < 4; r++)
+            for (int q = 0; q < 4; q++) mat16[r * 4 + q] = mat25[r * 5 + q];
+    }
+    int shift() const { return kswv8_shift(b); }
     /* Deletion and insertion alike: one gap subtraction serves both (the kernels' Sym form). */
     bool sym_gaps() const { return o_del + e_del == o_ins + e_ins && e_del == e_ins; }
     /* score2's zone half-width around te: kswv's ceil(S / qmax), qmax = a (kswv.cpp). */
     int zone(int S) const { return (S + a - 1) / a; }
-    bool operator==(const rb_scoring &o) const
+    /* Same match, mismatch and gap costs (not the --meth table): what plan() depends on. */
+    bool same_costs(const rb_scoring &o) const
     {
         return a == o.a && b == o.b && o_del == o.o_del && e_del == o.e_del && o_ins == o.o_ins && e_ins == o.e_ins;
     }
-    /* What the kernels need: positive a, b and extends, non-negative opens, and kswv's 8-bit score
-     * table (+a, -b, a + shift <= 255): the first check of rescue_prune_params::from. */
-    bool valid() const
-    {
-        return a >= 1 && b >= 1 && e_del >= 1 && e_ins >= 1 && o_del >= 0 && o_ins >= 0 && a <= 127 && b <= 128
-               && a + shift() <= 255;
-    }
+    /* What the kernels need: a scoring kswv's 8-bit kernels run exactly (kswv8_scoring_ok). Unlike
+     * rescue_prune_params::from, no lemma condition: band pass 1 runs at scorings pruning refuses. */
+    bool valid() const { return kswv8_scoring_ok(a, b, o_del, e_del, o_ins, e_ins); }
     static rb_scoring from(const rescue_prune_params &p)
     {
         rb_scoring s;
@@ -136,8 +146,8 @@ class RescueBandBatch {
 public:
     /* Plan the bands of a B2 hull [hb, he] of a full window of len1 rows against a query of len2.
      * v must be the view rescue_prune_window returned with that decision under p (the scoring and
-     * threshold), which must be the batch's scoring (set_scoring) and without --meth
-     * (rescue_prune_params::band_ok); the caller guarantees the 8-bit path (rescue_prune_applies).
+     * threshold), which must be the batch's scoring (set_scoring, and under --meth the group's
+     * matrix, set_matrix); the caller guarantees the 8-bit path (rescue_prune_applies).
      * Returns true when banding is chosen (the cost model says it beats kswv on the hull);
      * commit() then binds it to the pair's regid. */
     bool plan(const rescue_prune_view &v, const rescue_prune_params &p, int len1, int len2, int hb, int he);
@@ -159,11 +169,14 @@ public:
                    const uint8_t *seqBufQer, kswr_t *aln, Ikswv *kswv);
     /* Pass 1 of an 8-bit rescue job. sp is the pair as prepared for kswv phase 1 (reversed
      * prefixes of lengths te + 1 and qe + 1 in the sequence buffers, len2 = qe + 1, h0 =
-     * KSW_XSTOP | S) and r its pass-0 result, scored with set_scoring()'s scoring. The CALLER
-     * guarantees that scoring and non-meth (a banded parent implies both). Queues the job for the banded pass 1 and returns true when
-     * BWA3_RESCUE_BAND_P1 admits it and the band is cheaper than kswv; false means the caller
-     * runs it through kswv phase 1 as before. */
-    bool take_pass1(const SeqPair &sp, const kswr_t &r, bool banded_parent);
+     * KSW_XSTOP | S) and r its pass-0 result, scored with set_scoring()'s scoring (valid, and under
+     * --meth the group's matrix; a banded parent implies both). Queues the job for the banded pass 1
+     * and returns true when BWA3_RESCUE_BAND_P1 admits it and the band is cheaper than kswv; false
+     * means the caller runs it through kswv phase 1 as before. Under an asymmetric (--meth) scoring a
+     * job whose reversed prefixes (in seqBufRef / seqBufQer at sp.idr / sp.idq) hold an N is
+     * declined. */
+    bool take_pass1(const SeqPair &sp, const kswr_t &r, bool banded_parent, const uint8_t *seqBufRef,
+                    const uint8_t *seqBufQer);
     /* Run the queued pass-1 jobs: fills aln[regid].{tb, qb} exactly as kswv phase 1 would. */
     void run_pass1(const uint8_t *seqBufRef, const uint8_t *seqBufQer, kswr_t *aln, Ikswv *kswv);
     void reset();

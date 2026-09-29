@@ -65,6 +65,7 @@
 #include "ksw_runner.h"
 #include "kswr_cmp.h"
 #include "kswv_runner.h"  // BWA_TESTS_HAVE_KSWV
+#include "meth_scoring.h"
 #include "scoring.h"
 #include "seqpair_batch.h"
 #include "seqpair_gen.h"
@@ -238,22 +239,10 @@ void check_batch_matches_scalar(uint64_t seed, int n_pairs, int len_a, int len_b
 // Bisulfite (--meth) variants: the HasFreed=true kernel instantiations.
 // ---------------------------------------------------------------------------
 
-// Build the production OT/OB matrix for `scoring` at the given match/mismatch
-// via the SAME two calls the CLI makes -- bwa_fill_scmat (fastmap.cpp:1745)
-// then mem_opt_fill_meth_mat. Restating the freed-cell layout here instead
-// would stop testing mem_opt_fill_meth_mat and start testing a copy of it.
+// The production OT/OB matrix for `scoring` (bwa_tests::meth_scoring_matrix: the
+// same two calls the CLI makes, bwa_fill_scmat then mem_opt_fill_meth_mat).
 bwa_tests::ScoringMatrix meth_matrix(int scoring, bool ot, int match, int mismatch) {
-    mem_opt_t *o = mem_opt_init();
-    o->a = match;
-    o->b = mismatch;
-    o->meth_scoring = scoring;
-    bwa_fill_scmat(o->a, o->b, o->mat);
-    mem_opt_fill_meth_mat(o);
-    const int8_t *src = ot ? o->mat_ot : o->mat_ob;
-    bwa_tests::ScoringMatrix mat;
-    for (int i = 0; i < 25; i++) mat[i] = src[i];
-    free(o);
-    return mat;
+    return bwa_tests::meth_scoring_matrix(scoring, ot, match, mismatch);
 }
 
 // Apply the read-side conversion the matrix frees, so the freed cell actually

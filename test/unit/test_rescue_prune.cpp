@@ -44,9 +44,12 @@
 #include <vector>
 
 #include "doctest/doctest.h"
+#include "bwamem.h"
 #include "ksw.h"
+#include "meth_scoring.h"
 #include "rescue_band.h"
 #include "rescue_prune.h"
+#include "rescue_prune_test.h"
 #include "scoring.h"
 #include "simd_dispatch.h"
 
@@ -364,9 +367,9 @@ TEST_CASE("rescue prune: decisions at other scorings reproduce every consumed ks
 
 // --meth: the filter matches C -> T (OT) or G -> A (OB) converted copies of the window and the mate,
 // which over-counts hits under every meth matrix, so its decisions must reproduce ksw_align2 with the
-// matrix itself (mat[ref * 5 + read], as mem_opt_fill_meth_mat builds it: the conversion cell freed
-// to +a, or to 0 under neutral, and under collapsed its mirror too), at -B 4 so the lemma admits
-// collapsed. Each job is checked at one (matrix, hypothesis) pair in rotation, with half of its
+// matrix itself (mat[ref * 5 + read], built by mem_opt_fill_meth_mat through
+// bwa_tests::meth_scoring_matrix: the conversion cell freed to +a, or to 0 under neutral, and under
+// collapsed its mirror too), at -B 4 so the lemma admits collapsed. Each job is checked at one (matrix, hypothesis) pair in rotation, with half of its
 // mate's convertible bases converted.
 TEST_CASE("rescue prune: --meth decisions reproduce ksw_align2 with the meth matrix"
           * doctest::test_suite("unit/pair")) {
@@ -374,14 +377,10 @@ TEST_CASE("rescue prune: --meth decisions reproduce ksw_align2 with the meth mat
     const auto jobs = build_jobs(rng);
     const char *names[3] = {"genomic", "neutral", "collapsed"};
     std::vector<bwa_tests::ScoringMatrix> mats;
+    const int scorings[3] = {MEM_METH_SCORING_GENOMIC, MEM_METH_SCORING_NEUTRAL, MEM_METH_SCORING_COLLAPSED};
     for (int kind = 0; kind < 3; kind++)
-        for (int hyp = 0; hyp < 2; hyp++) {
-            bwa_tests::ScoringMatrix m = bwa_tests::default_scoring_matrix();
-            const int fr = hyp ? 1 : 2, fq = hyp ? 3 : 0;   // OT: ref C / read T; OB: ref G / read A
-            m[(size_t)(fr * 5 + fq)] = (int8_t)(kind == 1 ? 0 : 1);
-            if (kind == 2) m[(size_t)(fq * 5 + fr)] = 1;
-            mats.push_back(m);
-        }
+        for (int hyp = 0; hyp < 2; hyp++)   // hyp 1 = OT: ref C / read T; 0 = OB: ref G / read A
+            mats.push_back(bwa_tests::meth_scoring_matrix(scorings[kind], hyp == 1, 1, 4));
     Tally t[3];
     for (size_t i = 0; i < jobs.size(); i++) {
         const int kind = (int)(i % 3), hyp = (int)((i / 3) % 2);
@@ -655,5 +654,54 @@ TEST_CASE("rescue band: the pass-0 cost gate's default follows the kswv tier"
                            BWAMEM3_TIER_AVX2, BWAMEM3_TIER_NEON}) {
         CAPTURE(tier);
         CHECK(rescue_band_cost_pct_default(tier) == 85);
+    }
+}
+
+// The run-level cost gate (rescue_prune_cost_ok): every outcome gives the same output, so no identity
+// check can see a wrong one; pinned here per architecture. aarch64 prunes everywhere but --meth with
+// chemistry other than EM-seq (TAPS); x86 never under --meth, only where the SIMD filter takes the
+// weights (K = 5, a <= 16), and not at the AVX-512BW tier from minsc 25.
+TEST_CASE("rescue prune: the cost gate per architecture, --meth chemistry and kswv tier"
+          * doctest::test_suite("unit/pair")) {
+    const rescue_prune_params dflt = rescue_prune_params::defaults(19);
+    const rescue_prune_params k25 = rescue_prune_params::defaults(25);
+    const rescue_prune_params a17 = rescue_prune_params::from(17, 68, 102, 17, 102, 17, 19 * 17);
+    REQUIRE(dflt.valid);
+    REQUIRE(k25.valid);
+    REQUIRE(a17.valid);
+    REQUIRE(!a17.simd_ok());
+    for (const bool avx512 : {false, true}) {
+        CAPTURE(avx512);
+#if defined(__aarch64__)
+        CHECK(rescue_prune_cost_ok(dflt, false, false, avx512));
+        CHECK(rescue_prune_cost_ok(dflt, true, true, avx512));    // --meth, EM-seq
+        CHECK(!rescue_prune_cost_ok(dflt, true, false, avx512));  // --meth=taps
+        CHECK(rescue_prune_cost_ok(k25, false, false, avx512));
+        CHECK(rescue_prune_cost_ok(a17, false, false, avx512));   // the scalar filter pays here
+#else
+        CHECK(rescue_prune_cost_ok(dflt, false, false, avx512));
+        CHECK(!rescue_prune_cost_ok(dflt, true, true, avx512));   // no --meth pruning on x86
+        CHECK(!rescue_prune_cost_ok(dflt, true, false, avx512));
+        CHECK(rescue_prune_cost_ok(k25, false, false, avx512) == !avx512);
+        CHECK(rescue_prune_cost_ok(rescue_prune_params::defaults(24), false, false, avx512));
+        CHECK(!rescue_prune_cost_ok(a17, false, false, avx512));  // the scalar filter would decide
+#endif
+    }
+}
+
+// kswv's 8-bit kernels load each gap type's open plus extend as a byte, so a sum past 255 wraps there
+// and neither pruning nor the band kernels may take such a scoring (kswv8_scoring_ok).
+TEST_CASE("rescue prune: scorings past kswv's 8-bit gap byte are refused"
+          * doctest::test_suite("unit/pair")) {
+    CHECK(kswv8_scoring_ok(1, 4, 249, 6, 249, 6));
+    CHECK(rescue_prune_params::from(1, 4, 249, 6, 249, 6, 19).valid);
+    for (const int s : {0, 1}) {
+        CAPTURE(s);
+        const int od = s ? 6 : 250, ed = s ? 1 : 6, oi = s ? 250 : 6, ei = s ? 6 : 1;
+        CHECK(!kswv8_scoring_ok(1, 4, od, ed, oi, ei));
+        CHECK(!rescue_prune_params::from(1, 4, od, ed, oi, ei, 19).valid);
+        rb_scoring r;
+        r.o_del = od; r.e_del = ed; r.o_ins = oi; r.e_ins = ei;
+        CHECK(!r.valid());
     }
 }
