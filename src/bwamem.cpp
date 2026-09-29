@@ -6329,7 +6329,7 @@ static inline int bsw_tb_probe_rung(BswMethTier tier, const mem_opt_t *opt, mem_
          * branch B (query-end: gscore/gtle) by the same threshold the ladder uses. band_cert_ok
          * at S - pen_clip proves every out-of-band cell scores strictly below S - pen_clip, so the
          * wide run's branch decision and both branches' finalized fields are band-invariant
-         * (Fable-verified against the kernel update rules). The direction's pen_clip is REQUIRED:
+         * (checked against the kernel update rules). The direction's pen_clip is REQUIRED:
          * min(pen_clip5,pen_clip3) is unsound for branch A under asymmetric -L. This is a SEPARATE
          * accept from the shared band_cert_accept, so the shipped scalar/16-bit probes are untouched. */
         if (band_cert_ok(a->score - pen_clip, sp->h0, sp->len1, sp->len2, Wb, opt)) {
