@@ -879,6 +879,14 @@ jobs:
           CHR22_SIM_DIR=/tmp/chr22-sim \
           bash test/regression/bwtseed_lockstep_driver_identity.sh
 
+      - name: Flat chaining index matches the kbtree replay (chr22)
+        if: matrix.canonical == true
+        run: |
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          CHR22_FA=/tmp/chr22/chr22.fa \
+          CHR22_SIM_DIR=/tmp/chr22-sim \
+          bash test/regression/chain_flat_replay_identity.sh
+
       - name: Chaining scratch is per-thread, not per-read
         if: matrix.canonical == true
         run: |

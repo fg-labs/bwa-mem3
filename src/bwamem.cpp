@@ -542,6 +542,9 @@ enum ChainStat {
     CHS_P3_BUCKET_WALKS,   /* index queries answered by walking hash buckets */
     CHS_P3_LINEAR_SCANS,   /* index queries answered by scanning every member */
     CHS_P3_HEAD_DUPS,      /* buckets skipped because their head slot was walked */
+    CHS_FLAT_READS,        /* reads chained entirely on the flat index */
+    CHS_FLAT_DECLINED_TIE, /* reads the flat index handed to the kbtree: equal key */
+    CHS_FLAT_DECLINED_CAP, /* ... : more chains than BWA3_CHAIN_FLAT_CAP */
     CHS_N
 };
 static std::atomic<uint64_t> g_chain_stats[CHS_N];
@@ -553,12 +556,16 @@ static struct ChainStatsDumper {
     ~ChainStatsDumper() {
         if (!chain_stats_on()) return;
         fprintf(stderr, "[chain-stats] p3_reads=%llu p3_fallback_reads=%llu p3_bucket_walks=%llu "
-                "p3_linear_scans=%llu p3_head_dups=%llu\n",
+                "p3_linear_scans=%llu p3_head_dups=%llu flat_reads=%llu flat_declined_tie=%llu "
+                "flat_declined_cap=%llu\n",
                 (unsigned long long)g_chain_stats[CHS_P3_READS].load(),
                 (unsigned long long)g_chain_stats[CHS_P3_FALLBACK_READS].load(),
                 (unsigned long long)g_chain_stats[CHS_P3_BUCKET_WALKS].load(),
                 (unsigned long long)g_chain_stats[CHS_P3_LINEAR_SCANS].load(),
-                (unsigned long long)g_chain_stats[CHS_P3_HEAD_DUPS].load());
+                (unsigned long long)g_chain_stats[CHS_P3_HEAD_DUPS].load(),
+                (unsigned long long)g_chain_stats[CHS_FLAT_READS].load(),
+                (unsigned long long)g_chain_stats[CHS_FLAT_DECLINED_TIE].load(),
+                (unsigned long long)g_chain_stats[CHS_FLAT_DECLINED_CAP].load());
     }
 } g_chain_stats_dumper;
 
@@ -2873,6 +2880,45 @@ static inline int meth_seed_to_orig(const bntseq_t *seed_bns,
     return 0;
 }
 
+/* Open a new chain holding one seed: the new-chain body shared by the kbtree
+ * path (chain_add_one_seed) and the flat index (ChainFlat::add), so the two
+ * cannot drift. tmp->pos must already be set; the seed array comes from the
+ * shared seed buffer, or from the heap (m = SEEDS_PER_CHAIN + 1, the ownership
+ * marker every free site tests) once the buffer is full. */
+static inline void chain_init_new(mem_chain_t *tmp_, const bntseq_t *chain_bns,
+                                  mem_seed_t *seedBuf, int64_t *seedBufCount,
+                                  int64_t seedBufSize, int seqid,
+                                  const mem_seed_t *seed_in, int rid, int8_t meth_hyp)
+{
+    mem_chain_t &tmp = *tmp_;
+    tmp.n = 1; tmp.m = SEEDS_PER_CHAIN;
+    if((*seedBufCount + tmp.m) > seedBufSize)
+    {
+        tmp.m += 1;
+        /* CHN-16: dead tprof[PE13] counter removed. The allocation is guarded
+         * the same way test_and_merge guards its seed-buffer growth: an
+         * `assert` alone compiles out under NDEBUG, so a release build would
+         * fall through and dereference NULL at `tmp.seeds[0] = *seed_in`. */
+        if ((tmp.seeds = (mem_seed_t *)calloc(tmp.m, sizeof(mem_seed_t))) == NULL) { fprintf(stderr, "ERROR: out of memory tmp.seeds\n"); exit(1); }
+    }
+    else {
+        tmp.seeds = seedBuf + *seedBufCount;
+        *seedBufCount += tmp.m;
+    }
+    /* CHN-11: the per-new-chain memset(tmp.seeds, 0, ...) was dead. tmp.n == 1,
+     * so only slot 0 is live and it is overwritten immediately below; any
+     * further slots (the +1 overflow buffer, already calloc-zeroed) are never
+     * read while zero -- every seed read is bounded by c->n and each slot is
+     * written before n reaches it (test_and_merge: c->seeds[c->n++] = *p). */
+    tmp.seeds[0] = *seed_in;
+    tmp.rid = rid;
+    tmp.seqid = seqid;
+    /* is_alt indexes the chain-side bns (original in --meth). */
+    tmp.is_alt = !!chain_bns->anns[rid].is_alt;
+    /* D3: carry the OT/OB hypothesis on the chain (-1 non-meth). */
+    tmp.meth_hypothesis = meth_hyp;
+}
+
 /* Chain one fully-resolved seed into the per-read kbtree: find the closest
  * existing chain and test_and_merge, else open a new chain. Extracted verbatim
  * from mem_chain_seeds's per-seed body so the two seed-emit paths share it: the
@@ -2905,35 +2951,141 @@ static inline void chain_add_one_seed(const mem_opt_t *opt, int64_t l_pac,
 
     if (to_add) // add the seed as a new chain
     {
-        tmp.n = 1; tmp.m = SEEDS_PER_CHAIN;
-        if((*seedBufCount + tmp.m) > seedBufSize)
-        {
-            tmp.m += 1;
-            /* CHN-16: dead tprof[PE13] counter removed. The allocation is guarded
-             * the same way test_and_merge guards its seed-buffer growth: an
-             * `assert` alone compiles out under NDEBUG, so a release build would
-             * fall through and dereference NULL at `tmp.seeds[0] = *seed_in`. */
-            if ((tmp.seeds = (mem_seed_t *)calloc(tmp.m, sizeof(mem_seed_t))) == NULL) { fprintf(stderr, "ERROR: out of memory tmp.seeds\n"); exit(1); }
-        }
-        else {
-            tmp.seeds = seedBuf + *seedBufCount;
-            *seedBufCount += tmp.m;
-        }
-        /* CHN-11: the per-new-chain memset(tmp.seeds, 0, ...) was dead. tmp.n == 1,
-         * so only slot 0 is live and it is overwritten immediately below; any
-         * further slots (the +1 overflow buffer, already calloc-zeroed) are never
-         * read while zero -- every seed read is bounded by c->n and each slot is
-         * written before n reaches it (test_and_merge: c->seeds[c->n++] = *p). */
-        tmp.seeds[0] = *seed_in;
-        tmp.rid = rid;
-        tmp.seqid = seqid;
-        /* is_alt indexes the chain-side bns (original in --meth). */
-        tmp.is_alt = !!chain_bns->anns[rid].is_alt;
-        /* D3: carry the OT/OB hypothesis on the chain (-1 non-meth). */
-        tmp.meth_hypothesis = meth_hyp;
+        chain_init_new(&tmp, chain_bns, seedBuf, seedBufCount, seedBufSize, seqid,
+                       seed_in, rid, meth_hyp);
         kb_putp(chn, tree, &tmp);
         // CHN-12: (*num_seqid)++ removed with the dead num[] array (see mem_chain_seeds)
     }
+}
+
+/* Flat per-read chaining index (byte-identical to the kbtree path).
+ *
+ * chain_add_one_seed spends most of its time in the B-tree probe: a branchy
+ * binary search over 48-byte mem_chain_t keys, one node per level. With
+ * distinct keys (.pos) the probe's answer is fully determined -- kb_intervalp
+ * returns the chain with the largest pos <= the seed's rbeg, or NULL -- and the
+ * final in-order traversal is ascending pos. A sorted int64 key array with a
+ * branchless upper_bound reproduces both exactly.
+ *
+ * Equal keys are where the two differ: chain_cmp compares .pos only, so which
+ * of two equal-pos chains the B-tree returns depends on its node layout. A
+ * duplicate arises only when a new chain's pos equals its predecessor's
+ * (test_and_merge never changes a chain's pos), so add() refuses exactly that
+ * insert -- before mutating anything -- and the caller replays the read's seeds
+ * through the unchanged kbtree path from a clean start. Reads with more than
+ * `cap` chains do the same, bounding the O(n) sorted insert. Replay rewinds
+ * seedBufCount and frees any seed arrays the flat pass heap-grew, so the tree
+ * path sees exactly the state it would have had from the first seed.
+ *
+ * BWA3_CHAIN_FLAT_CAP (default 512, a non-negative integer) sets the cap. 0 sends
+ * every read to the tree (the first new chain already meets the cap), and a small
+ * cap exercises the mid-read replay; test/regression/chain_flat_replay_identity.sh
+ * pins both against the default. A malformed or negative value is reported and
+ * the default used. */
+struct ChainFlat {
+    enum Verdict { OK = 0, TIE, CAP };
+    std::vector<mem_chain_t> chains;   /* insertion order */
+    std::vector<int64_t> keys;         /* ascending pos */
+    std::vector<uint32_t> ord;         /* ord[i] = chains index of keys[i] */
+    std::vector<seed_rec_t> log;       /* this read's streamed seeds, for a replay */
+    int64_t seedbuf_start = 0;
+    bool active = false;
+
+    static constexpr int DEFAULT_CAP = 512;
+    static int cap() {
+        static const int c = [] {
+            const char *e = getenv("BWA3_CHAIN_FLAT_CAP");
+            if (e == NULL || e[0] == '\0') return DEFAULT_CAP;
+            char *end = NULL;
+            errno = 0;
+            const long v = strtol(e, &end, 10);
+            if (errno != 0 || end == e || *end != '\0' || v < 0 || v > INT_MAX) {
+                fprintf(stderr, "ERROR: BWA3_CHAIN_FLAT_CAP=\"%s\" is not a non-negative "
+                        "integer; ignoring it (using %d).\n", e, DEFAULT_CAP);
+                return DEFAULT_CAP;
+            }
+            return (int)v;
+        }();
+        return c;
+    }
+    void begin(int64_t seedBufCount) {
+        chains.clear(); keys.clear(); ord.clear(); log.clear();
+        seedbuf_start = seedBufCount;
+        active = true;
+    }
+    /* number of keys <= pos, i.e. the predecessor's rank + 1 */
+    inline int rank_le(int64_t pos) const {
+        size_t n = keys.size();
+        if (n == 0) return 0;
+        const int64_t *b = keys.data();
+        while (n > 1) { const size_t h = n >> 1; b = (b[h] <= pos) ? b + h : b; n -= h; }
+        return (int)(b - keys.data()) + (*b <= pos);
+    }
+    /* Chain one seed. TIE / CAP: the tree must take this read (nothing mutated). */
+    inline Verdict add(const mem_opt_t *opt, int64_t l_pac, const bntseq_t *chain_bns,
+                       mem_seed_t *seedBuf, int64_t *seedBufCount, int64_t seedBufSize,
+                       int tid, int seqid, const mem_seed_t *seed_in, int rid, int8_t meth_hyp)
+    {
+        const int64_t pos = seed_in->rbeg;
+        const int r = rank_le(pos);
+        if (r > 0) {
+            mem_chain_t *lower = &chains[ord[r - 1]];
+            if (test_and_merge(opt, l_pac, lower, seed_in, rid, tid)) return OK;
+            if (keys[r - 1] == pos) return TIE;           /* equal key: tree decides */
+        }
+        if ((int)chains.size() >= cap()) return CAP;
+        mem_chain_t tmp;
+        tmp.pos = pos;
+        chain_init_new(&tmp, chain_bns, seedBuf, seedBufCount, seedBufSize, seqid,
+                       seed_in, rid, meth_hyp);
+        const uint32_t ci = (uint32_t)chains.size();
+        chains.push_back(tmp);
+        keys.insert(keys.begin() + r, pos);
+        ord.insert(ord.begin() + r, ci);
+        return OK;
+    }
+    /* Undo the flat pass: free heap-owned seed arrays (m > SEEDS_PER_CHAIN, the
+     * marker every chain free site tests), rewind the seed buffer. */
+    void abandon(int64_t *seedBufCount) {
+        for (mem_chain_t &c : chains)
+            if (c.m > SEEDS_PER_CHAIN) free(c.seeds);
+        *seedBufCount = seedbuf_start;
+        active = false;
+    }
+};
+
+/* Chain one seed on the flat index, falling back to (and staying on) the kbtree
+ * for the rest of the read once the flat index declines. `prefix` is NULL when
+ * seeds stream in (they are logged for a replay); the reorder path passes its
+ * already-materialized recs[0, prefix_n) -- this seed last -- and is replayed
+ * from them instead of a second copy. */
+static inline void chain_add_seed(ChainFlat &cf, const mem_opt_t *opt, int64_t l_pac,
+                                  const bntseq_t *chain_bns, kbtree_t(chn) *tree,
+                                  mem_seed_t *seedBuf, int64_t *seedBufCount,
+                                  int64_t seedBufSize, int tid, int seqid,
+                                  const mem_seed_t *seed_in, int rid, int8_t meth_hyp,
+                                  const seed_rec_t *prefix = NULL, int64_t prefix_n = 0)
+{
+    if (cf.active) {
+        if (prefix == NULL) {
+            seed_rec_t rec;
+            rec.seed = *seed_in; rec.rid = rid; rec.meth_hyp = meth_hyp; rec.orig_ix = 0;
+            cf.log.push_back(rec);
+        }
+        const ChainFlat::Verdict v = cf.add(opt, l_pac, chain_bns, seedBuf, seedBufCount,
+                                            seedBufSize, tid, seqid, seed_in, rid, meth_hyp);
+        if (v == ChainFlat::OK) return;
+        chain_stat(v == ChainFlat::TIE ? CHS_FLAT_DECLINED_TIE : CHS_FLAT_DECLINED_CAP);
+        cf.abandon(seedBufCount);
+        const seed_rec_t *rs = prefix ? prefix : cf.log.data();
+        const int64_t n = prefix ? prefix_n : (int64_t)cf.log.size();
+        for (int64_t i = 0; i < n; ++i)
+            chain_add_one_seed(opt, l_pac, chain_bns, tree, seedBuf, seedBufCount, seedBufSize,
+                               tid, seqid, &rs[i].seed, rs[i].rid, rs[i].meth_hyp);
+        return;
+    }
+    chain_add_one_seed(opt, l_pac, chain_bns, tree, seedBuf, seedBufCount, seedBufSize,
+                       tid, seqid, seed_in, rid, meth_hyp);
 }
 
 /** NEW ONE **/
@@ -3083,6 +3235,8 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
          * single-leaf-root read then does zero allocations. */
         static thread_local ChnTreeScratch chn_scratch;
         kbtree_t(chn) *tree = chn_scratch.t;
+        static thread_local ChainFlat chn_flat;
+        chn_flat.begin(seedBufCount);
         mem_chain_v *chain = &chain_ar[l];
         size = 0;
 
@@ -3279,9 +3433,9 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
                      * order — the single-pass streaming path. No recs[] write,
                      * no order_seeds; byte-identical to buffering with the
                      * identity order but without the double memory traffic. */
-                    chain_add_one_seed(opt, l_pac, chain_bns, tree, seedBuf,
-                                       &seedBufCount, seedBufSize, tid, l,
-                                       &s, rid, meth_hyp);
+                    chain_add_seed(chn_flat, opt, l_pac, chain_bns, tree, seedBuf,
+                                   &seedBufCount, seedBufSize, tid, l,
+                                   &s, rid, meth_hyp);
                 }
                 else
                 {
@@ -3305,12 +3459,21 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
             // chaining helper. S5: equal-pos insertion order into the kbtree is
             // preserved (no dedup/compact beyond order_seeds).
             for (int64_t ri = 0; ri < nrec; ++ri)
-                chain_add_one_seed(opt, l_pac, chain_bns, tree, seedBuf,
-                                   &seedBufCount, seedBufSize, tid, l,
-                                   &recs[ri].seed, recs[ri].rid, recs[ri].meth_hyp);
+                chain_add_seed(chn_flat, opt, l_pac, chain_bns, tree, seedBuf,
+                               &seedBufCount, seedBufSize, tid, l,
+                               &recs[ri].seed, recs[ri].rid, recs[ri].meth_hyp,
+                               recs, ri + 1);
         } // reorder
 
         smem_ptr = pos + 1;
+        if (chn_flat.active) {
+            chain_stat(CHS_FLAT_READS);
+            /* ascending pos == the kbtree's in-order traversal (keys distinct) */
+            size = (int)chn_flat.chains.size();
+            kv_resize(mem_chain_t, *chain, size);
+            for (uint32_t oi : chn_flat.ord) chain->a[chain->n++] = chn_flat.chains[oi];
+            chn_flat.active = false;
+        } else {
         size = kb_size(tree);
         // tprof[PE21][0] += kb_size(tree) * sizeof(mem_chain_t);
 
@@ -3319,6 +3482,7 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
 #define traverse_func(p_) (chain->a[chain->n++] = *(p_))
         __kb_traverse(mem_chain_t, tree, traverse_func);
 #undef traverse_func
+        }
 
         for (i = 0; i < chain->n; ++i)
             chain->a[i].frac_rep = (float)l_rep / seq_[l].l_seq;

@@ -181,10 +181,16 @@ WGS and WES slices (150 bp paired, hg38) at the default scoring, `-A 2`, `-B 6` 
 - **`cal_max_gap` memo.** The per-seed reference-window derivation reads the
   maximum gap from a per-thread table over query lengths, keyed on the scoring
   options.
+- **Flat chaining index.** Seed chaining finds each seed's closest chain in a
+  sorted array of chain positions with a branchless binary search instead of the
+  B-tree probe. Where the B-tree's answer depends on its node layout (two chains
+  with the same position) or a read has more than `BWA3_CHAIN_FLAT_CAP` chains,
+  the read is replayed through the unchanged B-tree path.
 
 | Variable | Effect |
 |---|---|
-| `BWA3_CHAIN_STATS=1` | Print, once at exit, how the chaining and Pass-3 fast paths resolved (`[chain-stats] …`): reads indexed, reads that fell back, and queries answered by bucket walks versus full scans. Measurement only; output is unchanged. |
+| `BWA3_CHAIN_STATS=1` | Print, once at exit, how the chaining and Pass-3 fast paths resolved (`[chain-stats] …`): reads indexed, reads that fell back, queries answered by bucket walks versus full scans, and reads the flat chaining index handed to the B-tree (equal positions, or over the cap). Measurement only; output is unchanged. |
+| `BWA3_CHAIN_FLAT_CAP=<n>` | Largest number of chains a read may have on the flat chaining index before it is replayed through the B-tree (default 512, bounding the index's O(n) sorted insert). `0` sends every read to the B-tree. A malformed or negative value is reported to stderr and the default used. Output is identical at every value. |
 
 ---
 
