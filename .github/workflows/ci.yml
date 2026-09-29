@@ -919,6 +919,12 @@ jobs:
       # tier, and fails if the pruning legs went vacuous.
       - name: Exact rescue pruning == full-window rescue (generated PE fixture)
         run: |
+          # The --meth legs need samtools and report SKIP: without it; the Linux
+          # rows install it, so there a missing samtools is a failure, not a skip.
+          if [ "$RUNNER_OS" = Linux ]; then
+              command -v samtools > /dev/null 2>&1 \
+                  || { echo "FAIL: samtools not on PATH; the --meth rescue legs would SKIP"; exit 1; }
+          fi
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           bash test/regression/rescue_prune_identity.sh
 

@@ -66,7 +66,11 @@
 # default must match the reference at the same scoring too: -B 6, which the
 # SIMD filters take, so its stats must show filtered jobs wherever they run;
 # and -O 8 -E 2, which only the scalar filter decides, so filtered jobs on
-# aarch64 and none on x86 (its cost gate).
+# aarch64 and none on x86 (its cost gate). The same pairs as bisulfite reads,
+# under --meth -B 4, --meth-scoring genomic and the default collapsed scoring,
+# must match their references too (with samtools on PATH, since --meth emits
+# BAM): filtered jobs on aarch64 at the first two, none at the collapsed one
+# (refused) and none on x86.
 #
 # Inputs:
 #   BWA_MEM3     — path to the bwa-mem3 binary under test
@@ -205,6 +209,17 @@ for k in range(40):
 
 with open('r1.fq', 'w') as f: f.write(''.join(r1))
 with open('r2.fq', 'w') as f: f.write(''.join(r2))
+
+# The same pairs as directional bisulfite reads for the --meth legs: every C of
+# read 1 read as T (the OT strand, nothing methylated), every G of read 2 as A.
+def conv(recs, f, t):
+    out = []
+    for r in recs:
+        name, seq, plus, qual = r.split('\n')[:4]
+        out.append('%s\n%s\n%s\n%s\n' % (name, seq.replace(f, t), plus, qual))
+    return ''.join(out)
+with open('m1.fq', 'w') as f: f.write(conv(r1, 'C', 'T'))
+with open('m2.fq', 'w') as f: f.write(conv(r2, 'G', 'A'))
 PY
 
 "$BIN" index ref.fa > /dev/null 2>&1 || fail "index nonzero exit"
@@ -311,6 +326,52 @@ check_scoring() { # $1 = label, $2 = where it prunes (simd | aarch64), rest = me
 check_scoring "-B 6" simd -B 6
 check_scoring "-O 8 -E 2" aarch64 -O 8 -E 2
 
+# --meth (EM-seq chemistry, the default): the filter matches converted copies of the window and the
+# mate (rescue_prune_params::set_meth). Each leg must equal the reference at the same options; the
+# stats must show filtered jobs on aarch64 at --meth -B 4 and --meth-scoring genomic, and none at
+# the default collapsed scoring (b = 2a, which the lemma refuses) or on x86 (its cost gate). --meth
+# emits BAM, so these legs need samtools; without it they are reported SKIP:.
+meth_note=""
+if command -v samtools > /dev/null 2>&1; then
+    "$BIN" index --meth ref.fa > /dev/null 2>&1 || fail "index --meth nonzero exit"
+    meth_leg() { # $1 = output stem, $2 = options (one word per option), rest = env assignments
+        local stem="$1" opts="$2"
+        shift 2
+        # shellcheck disable=SC2086 # opts is a list of option words
+        env "$@" "$BIN" mem --meth $opts -t 4 ref.fa m1.fq m2.fq 2> "$stem.err" > "$stem.bam" \
+            || fail "leg $stem nonzero exit"
+        samtools view "$stem.bam" > "$stem.sam" || fail "leg $stem: samtools view failed"
+        [ -s "$stem.sam" ] || fail "leg $stem produced no alignment records"
+    }
+    check_meth() { # $1 = label, $2 = prunes on aarch64 (1 | 0), $3 = options
+        local label="$1" prunes="$2" opts="$3" stem st mj
+        stem="meth_$(printf '%s' "$label" | tr -c 'A-Za-z0-9' '_')"
+        meth_leg "$stem.full" "$opts" BWA3_RESCUE_PRUNE_STATS=1 "${REF_ENV[@]}"
+        meth_leg "$stem" "$opts" BWA3_RESCUE_PRUNE_STATS=1
+        if ! cmp -s "$stem.full.sam" "$stem.sam"; then
+            echo "FAIL: rescue at --meth $label differs from the reference at the same options (-t 4):" >&2
+            diff "$stem.full.sam" "$stem.sam" | head -20 >&2 || true
+            exit 1
+        fi
+        st="$(grep '^\[RESCUE_PRUNE\]' "$stem.err" || true)"
+        [ -n "$st" ] || fail "BWA3_RESCUE_PRUNE_STATS=1 printed no [RESCUE_PRUNE] line (--meth $label leg)"
+        mj=$(printf '%s\n' "$st" | tr ' ' '\n' | sed -n 's/^jobs=//p')
+        if [ "$has_simd" = 1 ]; then
+            if [ "$prunes" = 1 ] && [ "$floor" = neon ]; then
+                [ "${mj:-0}" -gt 0 ] || fail "pruning filtered no rescue job at --meth $label on aarch64: $st"
+            else
+                [ "${mj:-0}" -eq 0 ] || fail "pruning filtered rescue jobs at --meth $label (SIMD floor '$floor'), past its gate: $st"
+            fi
+        fi
+        meth_note="$meth_note; --meth $label: jobs=${mj:-0}"
+    }
+    check_meth "-B 4" 1 "-B 4"
+    check_meth "genomic" 1 "--meth-scoring genomic"
+    check_meth "collapsed" 0 ""
+else
+    echo "SKIP: samtools not on PATH; the --meth legs did not run"
+fi
+
 # Forced tiers: the reference and default legs under each listed tier the host
 # has must equal the unforced reference. Ranked against the dispatcher's own
 # tier names (as in all_tiers_parity.sh): BWAMEM3_FORCE_TIER only downgrades.
@@ -381,7 +442,7 @@ if [ "$jobs" -eq 0 ]; then
     # above held vacuously.
     [ "$has_simd" = 0 ] \
         || fail "pruning filtered no rescue job, though this build (SIMD floor '$floor') has the SIMD filter: $stats"
-    echo "PASS: rescue_prune_identity (11-op cell, NEON-form defaults and dedup shortcuts == reference at -t 1 and -t 4; $dstats$tier_note$k25_note$sc_note)"
+    echo "PASS: rescue_prune_identity (11-op cell, NEON-form defaults and dedup shortcuts == reference at -t 1 and -t 4; $dstats$tier_note$k25_note$sc_note$meth_note)"
     echo "SKIP: pruning does not run in this build (SIMD floor $floor, below the SIMD filter's avx2); its legs held trivially"
     exit 0
 fi
@@ -409,4 +470,4 @@ p1stats="$(grep '^\[RESCUE_BAND\]' prune.t1.err || true)"
 p1=$(printf '%s\n' "$p1stats" | tr ' ' '\n' | sed -n 's/^pass1_banded=//p')
 [ "${p1:-0}" -gt 0 ] || fail "no banded pass-1 (start recovery) job at the defaults: $p1stats"
 
-echo "PASS: rescue_prune_identity (11-op cell, NEON-form defaults, dedup shortcuts, hull, pruned and banded == reference at -t 1 and -t 4; $dstats$tier_note$k25_note$sc_note; $stats; $bstats)"
+echo "PASS: rescue_prune_identity (11-op cell, NEON-form defaults, dedup shortcuts, hull, pruned and banded == reference at -t 1 and -t 4; $dstats$tier_note$k25_note$sc_note$meth_note; $stats; $bstats)"

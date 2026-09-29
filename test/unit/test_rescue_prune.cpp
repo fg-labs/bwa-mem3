@@ -15,6 +15,9 @@
 //      The same at other scorings the lemma admits (rescue_prune_params):
 //      -B 6, -O 8 -E 2, split gap costs and -A 2 -B 8 -O 12 -E 2, and the
 //      refused ones (-B 3, a cheap insertion) keep every window in full.
+//      And under --meth (rescue_prune_params::set_meth), against ksw_align2
+//      with the genomic, neutral and collapsed OT / OB matrices, on mates
+//      with converted bases.
 //   2. The guard exits the lemma depends on: any N, a threshold below 5, and a
 //      query or window beyond the scratch capacity all return FULL.
 //   3. Where a SIMD filter is compiled in (NEON on aarch64, the SSE4.1 / SSSE3
@@ -355,6 +358,49 @@ TEST_CASE("rescue prune: decisions at other scorings reproduce every consumed ks
         for (size_t i = 0; i < jobs.size(); i += 7)
             CHECK(rescue_prune_window(jobs[i].ref.data(), (int)jobs[i].ref.size(), jobs[i].q.data(),
                                       (int)jobs[i].q.size(), p, kNoGate, &hb, &he) == RESCUE_PRUNE_FULL);
+    }
+}
+
+// --meth: the filter matches C -> T (OT) or G -> A (OB) converted copies of the window and the mate,
+// which over-counts hits under every meth matrix, so its decisions must reproduce ksw_align2 with the
+// matrix itself (mat[ref * 5 + read], as mem_opt_fill_meth_mat builds it: the conversion cell freed
+// to +a, or to 0 under neutral, and under collapsed its mirror too), at -B 4 so the lemma admits
+// collapsed. Each job is checked at one (matrix, hypothesis) pair in rotation, with half of its
+// mate's convertible bases converted.
+TEST_CASE("rescue prune: --meth decisions reproduce ksw_align2 with the meth matrix"
+          * doctest::test_suite("unit/pair")) {
+    std::mt19937 rng(5150);
+    const auto jobs = build_jobs(rng);
+    const char *names[3] = {"genomic", "neutral", "collapsed"};
+    std::vector<bwa_tests::ScoringMatrix> mats;
+    for (int kind = 0; kind < 3; kind++)
+        for (int hyp = 0; hyp < 2; hyp++) {
+            bwa_tests::ScoringMatrix m = bwa_tests::default_scoring_matrix();
+            const int fr = hyp ? 1 : 2, fq = hyp ? 3 : 0;   // OT: ref C / read T; OB: ref G / read A
+            m[(size_t)(fr * 5 + fq)] = (int8_t)(kind == 1 ? 0 : 1);
+            if (kind == 2) m[(size_t)(fq * 5 + fr)] = 1;
+            mats.push_back(m);
+        }
+    Tally t[3];
+    for (size_t i = 0; i < jobs.size(); i++) {
+        const int kind = (int)(i % 3), hyp = (int)((i / 3) % 2);
+        const std::string name(names[kind]);
+        CAPTURE(name); CAPTURE(hyp);
+        Job jb = jobs[i];
+        const uint8_t from = hyp ? 1 : 2, to = hyp ? 3 : 0;
+        for (uint8_t &b : jb.q)
+            if (b == from && (rng() & 1)) b = to;
+        rescue_prune_params p = rescue_prune_params::defaults(kSimdMinsc);
+        p.set_meth(hyp);
+        Oracle o(jb, p, mats[(size_t)(kind * 2 + hyp)]);
+        check_against_oracle(kNoGate, o, t[kind]);
+    }
+    for (int k = 0; k < 3; k++) {
+        const std::string name(names[k]);
+        CAPTURE(name);
+        MESSAGE("--meth " << name << ": B1=" << t[k].b1 << " B2=" << t[k].b2 << " FULL=" << t[k].full);
+        CHECK(t[k].b1 > 0);
+        CHECK(t[k].b2 > 0);
     }
 }
 

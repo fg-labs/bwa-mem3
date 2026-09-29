@@ -219,8 +219,11 @@ generated jobs.
   field the rescue consumes (score, positions, suboptimal score). Derived for any
   scoring whose mismatch and gaps each cost at least four matches (the default
   `-A 1 -B 4 -O 6 -E 1`, and for example `-B 6` or `-O 8 -E 2`; the bound then
-  counts exact 5-mers); other scorings, `--meth`, `--rescue-kmer`, windows or
-  mates with an N, and the 16-bit path keep the full window. It runs where a
+  counts exact 5-mers); other scorings, `--rescue-kmer`, windows or mates with
+  an N, and the 16-bit path keep the full window. Under `--meth` it matches
+  C-to-T (or G-to-A) converted copies of the window and the mate, on aarch64
+  with EM-seq chemistry only, at `--meth -B 4` and the genomic and neutral
+  scorings (the default collapsed scoring keeps the full window). It runs where a
   SIMD filter carries it: on aarch64 (NEON) and on the x86 AVX2 and AVX-512BW
   builds (an SSE4.1 / SSSE3 port of the filter), at every seed length except at
   the AVX-512BW kswv tier from `-k 25` up, where the 64-lane kswv is cheap

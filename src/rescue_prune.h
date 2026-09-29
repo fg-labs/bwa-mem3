@@ -15,6 +15,10 @@
  *     5 + sum_{d in [d1, d2]} (cnt_d - 1),
  * with cnt_d the number of 5-mer hits on diagonal d = i - j.
  *
+ * --meth (rescue_prune_params::set_meth): the filter matches C -> T (OT) or G -> A (OB) converted
+ * copies of the window and the mate exactly, which counts every cell the meth matrices score +a or
+ * more as a hit (and some more, which only loosens the bound).
+ *
  * Other scorings (rescue_prune_params): the same argument with K-mers, K - 1 <= min(b, o_del,
  * o_ins + e_ins) / a (capped at 5), a per-diagonal charge c and the constant a (K - 1) + c in place
  * of 1 and 5, and the tail below scaled to the deletion costs; rescue_prune_params::from refuses a
@@ -81,6 +85,14 @@ struct rescue_prune_params {
     int o_del = 6, e_del = 1, o_ins = 6, e_ins = 1;
     int minsc = 19;
     bool valid = false;
+    /* --meth (set_meth): the filter runs on copies of the window and the mate with base conv_from
+     * rewritten to conv_to (C -> T for OT, G -> A for OB). Exact matching of the converted copies
+     * relates every pair the meth matrices score at most +a (the freed cell, its collapsed mirror,
+     * the identity) and nothing that scores -b in all of them except the mirror under genomic /
+     * neutral scoring: a superset of the match-like cells, and over-counting hits only loosens the
+     * bound, so the lemma holds. Default collapsed scoring (b = 2a) forces K = 3 and is refused;
+     * --meth -B 4 and the genomic / neutral scorings (b = 4a) are not. */
+    int conv_from = -1, conv_to = -1;
 
     int base() const { return a * (K - 1) + c; }
     int weight(int cnt) const { return a * cnt - c; }
@@ -94,10 +106,17 @@ struct rescue_prune_params {
     /* The SIMD filters hard-code K = 5, the weights cnt - 1, the constant 5 and the tail
      * ub - tau - 2, which these parameters give. */
     bool simd_ok() const { return valid && K == 5 && a == 1 && c == 1 && o_del == 6 && e_del == 1; }
-    /* The default scoring, the only one the band kernels are derived for. */
+    /* The default scoring without --meth, the only one the band kernels are derived for. */
     bool default_scoring() const
     {
-        return a == 1 && b == 4 && o_del == 6 && e_del == 1 && o_ins == 6 && e_ins == 1;
+        return conv_from < 0 && a == 1 && b == 4 && o_del == 6 && e_del == 1 && o_ins == 6 && e_ins == 1;
+    }
+    /* --meth: the rescued mate is scored with mat_ot (hyp 1: reference C / read T freed) or mat_ob
+     * (hyp 0: reference G / read A freed); collapsed scoring also frees the mirror cell. */
+    void set_meth(int hyp)
+    {
+        conv_from = hyp ? 1 : 2;
+        conv_to = hyp ? 3 : 0;
     }
 
     /* The validity conditions in order, kswv8_scoring_ok first so that no division sees a zero.
@@ -319,10 +338,14 @@ static inline uint64_t rescue_prune_memo_hits()
  * for the hull path. On aarch64, 1000 when banding is on: banding turns more of the pruned windows
  * into savings, which pays for the filter on the denser windows (best of {400, 1000, 3000, 10^4,
  * 10^9} measured on WGS-like data at minsc 19). The SIMD filter runs at every minsc, so the gate
- * does not depend on it. On x86, 400 with banding too: the x86 kswv kernels are cheap enough that
- * the extra filter work on dense windows does not pay (prune + band, wall, 1000 vs 400: Zen 3 AVX2
- * wgs-5M 74.52 vs 73.57 s, wes-5M 38.57 vs 37.65 s; Zen 5 AVX-512 wgs-5M 27.53 vs 26.73 s). Output
- * is identical at every value. */
+ * does not depend on it. The gate keys on the banding switch alone, not on whether this run's
+ * pruned windows get banded: --meth pruning runs (whose pruned windows are never banded) and
+ * scorings the scalar filter decides (a > 16) take 1000 on aarch64 too. The --meth figures in
+ * rescue_prune_cost_ok are whole runs at the default gate; 400 for those runs has not been
+ * measured. On x86, 400 with banding too: the x86 kswv kernels are cheap enough that the extra
+ * filter work on dense windows does not pay (prune + band, wall, 1000 vs 400: Zen 3 AVX2 wgs-5M
+ * 74.52 vs 73.57 s, wes-5M 38.57 vs 37.65 s; Zen 5 AVX-512 wgs-5M 27.53 vs 26.73 s). Output is
+ * identical at every value. */
 static inline int rescue_prune_max_hits_default(bool banding)
 {
 #if defined(__aarch64__)
@@ -334,23 +357,29 @@ static inline int rescue_prune_max_hits_default(bool banding)
 }
 
 /* Whether pruning pays for the scoring and threshold p (the cost gate beside the exactness
- * preconditions, p.valid among them, which the caller checks), for a run whose kswv runs at the
- * AVX-512BW tier (avx512) or not. Everywhere on aarch64, the scalar filter included (Graviton 4,
+ * preconditions, p.valid among them, which the caller checks), for a run under --meth (meth, with
+ * EM-seq / bisulfite chemistry: emseq) or not, whose kswv runs at the AVX-512BW tier (avx512) or not.
+ * On aarch64 everywhere but --meth with other chemistry, the scalar filter included (Graviton 4,
  * prune on vs off, wall, wes-5M / wgs-5M: -B 6 -13.9 / -5.7 %, -O 8 -E 2 -6.9 / -2.9 %,
- * -x intractg -6.4 / -1.1 %). On x86 only where the SIMD filter runs (simd_ok): the scalar filter
+ * -x intractg -6.4 / -1.1 %). The --meth filter matches converted copies (set_meth), which fits reads
+ * whose unmethylated C's are converted; TAPS reads are mostly unconverted, so collapsing them to three
+ * letters leaves little to prune (EM-seq panel, 5 M pairs: genomic -9.0 %, collapsed -B 4 -10.1 %;
+ * TAPS -0.1 %). On x86 no --meth, where the cheaper kswv leaves nothing to win (Zen 5, EM-seq genomic
+ * +0.1 %, collapsed -B 4 +1.6 %, TAPS +5.0 %), and only where the SIMD filter runs (simd_ok): the scalar filter
  * costs more than it saves against the cheaper x86 kswv (Zen 5 AVX-512, prune on vs off: -O 8 -E 2
  * +13.3 / +4.7 %, -x intractg +14.6 / +4.9 %; the SIMD-filtered -B 6 -3.5 / +0.3 %), and not at the
  * AVX-512BW tier at minsc >= 25: there the 64-lane kswv is cheap and few rescues pass at a high
  * threshold, so the filter costs more than it saves (Zen 5 wgs-5M: +1.0 / +2.4 / +1.2 / +1.3 % at
  * -k 25 / 28 / 32 / 40; wes-5M -1.3 / +0.9 / -0.8 / -1.2 %). AVX2 still wins at -k 32 (Zen 3 wes-5M
  * -3.8 %). */
-static inline bool rescue_prune_cost_ok(const rescue_prune_params &p, bool avx512)
+static inline bool rescue_prune_cost_ok(const rescue_prune_params &p, bool meth, bool emseq, bool avx512)
 {
 #if defined(__aarch64__)
     (void)p; (void)avx512;
-    return true;
+    return !meth || emseq;
 #else
-    return p.simd_ok() && !(avx512 && p.minsc >= 25);
+    (void)emseq;
+    return !meth && p.simd_ok() && !(avx512 && p.minsc >= 25);
 #endif
 }
 
@@ -376,6 +405,19 @@ static inline int rescue_prune_window(const uint8_t *ref, int len1, const uint8_
     if (!p.valid || len1 < 5 || len2 < 5 || len2 > rescue_prune_scratch::QCAP
         || len1 > rescue_prune_scratch::WCAP)
         return RESCUE_PRUNE_FULL;
+    if (p.conv_from >= 0) {   // --meth: exact matching of converted copies (see conv_from)
+        static thread_local uint8_t cref[rescue_prune_scratch::WCAP], cq[rescue_prune_scratch::QCAP];
+        const uint8_t f = (uint8_t)p.conv_from, t = (uint8_t)p.conv_to;
+        /* The conversion maps a base to a base (f, t < 4), so an N survives it: check for one in
+         * the same pass and skip the filter call that would return FULL for it. */
+        uint8_t orv = 0;
+        for (int i = 0; i < len1; i++) { orv |= ref[i]; cref[i] = ref[i] == f ? t : ref[i]; }
+        for (int j = 0; j < len2; j++) { orv |= q[j]; cq[j] = q[j] == f ? t : q[j]; }
+        if (orv & 0xFC) return RESCUE_PRUNE_FULL;   // N: as the filters decide it
+        rescue_prune_params pi = p;
+        pi.conv_from = pi.conv_to = -1;
+        return rescue_prune_window(cref, len1, cq, len2, pi, max_hits, hb, he, view);
+    }
     const int minsc = p.minsc;
 #if RESCUE_PRUNE_HAVE_SIMD
     if (p.simd_ok()) {   // identical decisions to the scalar filter at any minsc, faster (rescue_prune_neon.h)
