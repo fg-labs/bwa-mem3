@@ -122,7 +122,7 @@ namespace {
     // mmc->ref_string straight to ksw_align2, which writes via revseq.
     (void)mem_matesw_batch_post(opt, &bns, pac.data(), pes,
                                 &a, l_ms, ms.data(),
-                                &ma, myaln, /*gcnt*/0, gar, &mmc);
+                                &ma, myaln, /*gcnt*/0, gar, &mmc, /*tid*/0);
 
     free(opt);
     if (ma.a) free(ma.a);

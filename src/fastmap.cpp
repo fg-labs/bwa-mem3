@@ -418,6 +418,8 @@ void worker_alloc(const mem_opt_t *opt, worker_t &w, int32_t nreads, int32_t nth
         w.mmc.seqPairArrayLeft128[l]  = (SeqPair *) malloc((wsize + MAX_LINE_LEN)* sizeof(SeqPair));
         w.mmc.seqPairArrayRight128[l] = (SeqPair *) malloc((wsize + MAX_LINE_LEN)* sizeof(SeqPair));
         w.mmc.wsize[l] = wsize;
+        w.mmc.rescue_narrow_off[l] = NULL;   // grown on demand by mem_matesw_batch_pre
+        w.mmc.rescue_narrow_cap[l] = 0;
 
         xassert(w.mmc.seqPairArrayAux[l] != NULL, "out of memory: w.mmc.seqPairArrayAux[l]");
         xassert(w.mmc.seqPairArrayLeft128[l] != NULL, "out of memory: w.mmc.seqPairArrayLeft128[l]");
@@ -487,6 +489,7 @@ void worker_free(worker_t &w, int32_t nthreads)
 
     for(int l=0; l<nthreads; l++) {
         free(w.mmc.seqPairArrayAux[l]);
+        free(w.mmc.rescue_narrow_off[l]);
         free(w.mmc.seqPairArrayLeft128[l]);
         free(w.mmc.seqPairArrayRight128[l]);
     }

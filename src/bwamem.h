@@ -514,6 +514,17 @@ typedef struct
     // by construction even though the FMI_search instance itself is shared.
     SmemSortScratch smem_sort_scratch[MAX_THREADS];
 
+    // Per-tid narrowing offsets for batched mate rescue, indexed by regid:
+    // mem_matesw_batch_pre records how far it moved each enqueued window's start
+    // (--rescue-kmer narrowing or an exact-pruning hull) and mem_matesw_batch_post
+    // applies the same offset to the result. Kept with the rest of the batch's
+    // per-tid state (seqPairArrayAux / gar) rather than per OS thread, so _pre and
+    // _post may run on different threads for the same tid. Plain pointer + capacity
+    // (not a std::vector) so a zero-filled mem_cache is a valid empty one. Grown on
+    // demand by _pre; freed with the other per-tid buffers.
+    int32_t *rescue_narrow_off[MAX_THREADS];
+    int64_t  rescue_narrow_cap[MAX_THREADS];
+
     // Pointer into worker_t::ref_string (the unpacked .0123 reference).
     // Set once in the worker_aln/worker_sam entry points; lets helpers like
     // mem_seed_sw and the mem_matesw_* family invoke bns_fetch_seq_v2 without
@@ -833,7 +844,8 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                           const uint8_t *pac, const mem_pestat_t pes[4],
                           const mem_alnreg_t *a, int l_ms, const uint8_t *ms,
                           mem_alnreg_v *ma, kswr_t **myaln, int32_t gcnt,
-                          int32_t *gar, mem_cache *mmc, const char *ms_orig = NULL,
+                          int32_t *gar, mem_cache *mmc, int32_t tid,
+                          const char *ms_orig = NULL,
                           const int8_t *mat = NULL, int mate_meth_ot = -1);
 
 /* The scalar mem_sam_pe / mem_pair_resolve pairing path was removed; the batched
