@@ -329,11 +329,11 @@ static bool rescue_prune_enabled()
 }
 /* The hit gate: BWA3_RESCUE_PRUNE_MAX_HITS, else rescue_prune_max_hits_default (rescue_prune.h,
  * which the band harness shares). */
-static int rescue_prune_max_hits(int minsc)
+static int rescue_prune_max_hits()
 {
     static const int env = rescue_env_int("BWA3_RESCUE_PRUNE_MAX_HITS", -1);
     if (env >= 0) return env;
-    return rescue_prune_max_hits_default(rescue_band_enabled(), minsc);
+    return rescue_prune_max_hits_default(rescue_band_enabled());
 }
 /* Whether the exact rescue shortcuts are built and enabled at all: they need a SIMD filter (NEON on
  * aarch64, its SSE4.1 / SSSE3 port on the AVX2 and AVX-512 builds; RESCUE_PRUNE_HAVE_SIMD), since
@@ -415,13 +415,18 @@ static bool rescue_exact_runs(const mem_opt_t *opt)
 }
 
 /* Whether pruning can narrow any rescue window in this run: rescue_exact_runs, and the cost gate
- * (rescue_prune_cost_ok in rescue_prune.h: on x86, only at the default -k 19). Keys the length sort
- * and the narrow-offset record / read (each OR'd with --rescue-kmer, which narrows on its own), so a
- * run that cannot prune runs the pre-pruning rescue path, apart from banded pass 1 where
- * rescue_exact_runs allows it. */
+ * (rescue_prune_cost_ok in rescue_prune.h: on x86, not at the AVX-512BW tier from -k 25 up). Keys
+ * the length sort and the narrow-offset record / read (each OR'd with --rescue-kmer, which narrows
+ * on its own), so a run that cannot prune runs the pre-pruning rescue path, apart from banded pass 1
+ * where rescue_exact_runs allows it. */
 static bool rescue_prune_runs(const mem_opt_t *opt)
 {
-    return rescue_prune_cost_ok(opt->min_seed_len * opt->a) && rescue_exact_runs(opt);
+    /* The kswv tier, read once; bwamem3_simd_init is idempotent and fixes it, as in rb_cost_pct. */
+    static const bool avx512 = [] {
+        bwamem3_simd_init();
+        return bwamem3_simd_tier() == BWAMEM3_TIER_AVX512BW;
+    }();
+    return rescue_prune_cost_ok(opt->min_seed_len * opt->a, avx512) && rescue_exact_runs(opt);
 }
 
 /* Whether pruning applies to one rescue job: the run can prune, --rescue-kmer is off, and the job
@@ -1756,7 +1761,7 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                 const uint64_t tf0 = g_rescue_prune_stats.on ? rescue_now_ns() : 0;
                 const int kind = rescue_prune_window(ref, (int)(re - rb), oq.data(), l_ms,
                                                      opt->min_seed_len * opt->a,
-                                                     rescue_prune_max_hits(opt->min_seed_len * opt->a), &hb, &he,
+                                                     rescue_prune_max_hits(), &hb, &he,
                                                      &view);
                 /* A job repeating one of the last filtered ones byte for byte (the same mate
                  * against an identical window, which anchors in identical repeat copies produce)

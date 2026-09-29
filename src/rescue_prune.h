@@ -66,9 +66,8 @@ struct rescue_prune_scratch {
     int32_t fwd[DCAP], bwd[DCAP];
 };
 
-/* Scalar implementation (a threshold other than 19, a build without a SIMD filter, or beyond the
- * SIMD filter's capacity or int16 range). Same decisions as the NEON and x86 filters wherever they
- * run. */
+/* Scalar implementation (a build without a SIMD filter, or beyond the SIMD filter's capacity or
+ * int16 range). Same decisions as the NEON and x86 filters wherever they run. */
 static inline int rescue_prune_window_scalar(const uint8_t *ref, int len1, const uint8_t *q, int len2,
                                              int minsc, int max_hits, rescue_prune_scratch &s,
                                              int *hb, int *he)
@@ -145,7 +144,8 @@ static inline int rescue_prune_window_scalar(const uint8_t *ref, int len1, const
  * thresholds above minsc (rescue_band.h). Diagonal index x in [0, nd) is the unshifted diagonal
  * d = i - j = x - off, with nd = len1 + off + 1 and off the query's 8-bit quantum. Exactly one of
  * bnd16 (SIMD filter: the bound precomputed) or fwd / bwd (scalar: bnd = 5 + fwd + bwd - (cnt - 1)) is
- * set; mw / hw are set with bnd16. The pointers alias the filter's per-thread scratch, so a view is
+ * set; mw / hw are set with bnd16. minsc is the threshold of the filter call that produced the view
+ * (on the SIMD filter, the threshold of mw, hw and comps). The pointers alias the filter's per-thread scratch, so a view is
  * valid only until the next filter call on the same thread. Readable lengths, which band planning's
  * vector loads rely on: on the SIMD filter (it accepts nd + 32 <= NeonScratch::CAP / X86Scratch::CAP) cnt and
  * minrow at least nd + 32 entries and bnd16 at least nd + 64 (the scratch's VIEW_PAD); on the scalar path nd,
@@ -153,36 +153,40 @@ static inline int rescue_prune_window_scalar(const uint8_t *ref, int len1, const
 struct rescue_prune_view {
     int nd = -1, off = 0;
     /* The NEON filter answered this call from its repeat memo: the window bytes, the mate bytes,
-     * the lengths and the hit gate equal the previous filter call's on this thread. */
+     * the lengths, the hit gate and the threshold equal the previous filter call's on this thread. */
     bool repeat = false;
     /* keyed: the NEON filter decided, and key summarizes its inputs (window, mate, lengths, hit
-     * gate). Equal inputs have equal keys; a caller finding an earlier job with this key compares
+     * gate, threshold). Equal inputs have equal keys; a caller finding an earlier job with this key compares
      * the bytes before treating it as the same job (rescue_prune_neon.h whash / qhash). */
     bool keyed = false;
     uint64_t key = 0;
+    int minsc = 0;   // the filter call's threshold
     const uint16_t *cnt = nullptr;
     const int16_t *minrow = nullptr;
     const int16_t *bnd16 = nullptr;
     const int32_t *fwd = nullptr, *bwd = nullptr;
-    const uint64_t *mw = nullptr;   // SIMD filter: bitset of diagonals with bnd >= 19
-    const uint64_t *hw = nullptr;   // SIMD filter: bitset of diagonals with bnd >= 19 and a hit
-    /* SIMD filter: its own components at bnd >= 19 with a hit (all of [0, nd)), in diagonal
+    const uint64_t *mw = nullptr;   // SIMD filter: bitset of diagonals with bnd >= minsc
+    const uint64_t *hw = nullptr;   // SIMD filter: bitset of diagonals with bnd >= minsc and a hit
+    /* SIMD filter: its own components at bnd >= minsc with a hit (all of [0, nd)), in diagonal
      * order; the first min(ncomp, ncomp_stored) are in comps. ncomp < 0: not available. */
     const rescue_prune_neon::Comp *comps = nullptr;
     int ncomp = -1, ncomp_stored = 0;
 };
 
-/* The view of a rescue_prune_window_scalar call on (len1, len2) that returned RESCUE_PRUNE_B2. */
-static inline rescue_prune_view rescue_prune_scalar_view(const rescue_prune_scratch &s, int len1, int len2)
+/* The view of a rescue_prune_window_scalar call on (len1, len2) at threshold minsc that returned
+ * RESCUE_PRUNE_B2. */
+static inline rescue_prune_view rescue_prune_scalar_view(const rescue_prune_scratch &s, int len1, int len2,
+                                                         int minsc)
 {
     rescue_prune_view v;
+    v.minsc = minsc;
     v.off = kswv_query_quantum8(len2);
     v.nd = len1 + v.off + 1;
     v.cnt = s.cnt; v.minrow = s.minrow; v.fwd = s.fwd; v.bwd = s.bwd;
     return v;
 }
 
-/* The SIMD filter this build dispatches to at rescue_prune_neon::MINSC: NEON on aarch64
+/* The SIMD filter this build dispatches to, at any threshold: NEON on aarch64
  * (rescue_prune_neon.h), the SSE4.1 / SSSE3 port on the AVX2-floor x86 builds (rescue_prune_x86.h),
  * none elsewhere. Both return the scalar filter's decisions and the same view. */
 #if defined(__aarch64__)
@@ -190,18 +194,18 @@ static inline rescue_prune_view rescue_prune_scalar_view(const rescue_prune_scra
 typedef rescue_prune_neon::NeonScratch rescue_prune_simd_scratch_t;
 static inline rescue_prune_neon::Kind rescue_prune_simd_lean(const rescue_prune_neon::Job &jb,
                                                              rescue_prune_simd_scratch_t &s, int &hb,
-                                                             int &he, int max_hits)
+                                                             int &he, int max_hits, int minsc)
 {
-    return rescue_prune_neon::lean_neon(jb, s, hb, he, max_hits);
+    return rescue_prune_neon::lean_neon(jb, s, hb, he, max_hits, minsc);
 }
 #elif defined(__AVX2__)
 #define RESCUE_PRUNE_HAVE_SIMD 1
 typedef rescue_prune_x86::X86Scratch rescue_prune_simd_scratch_t;
 static inline rescue_prune_neon::Kind rescue_prune_simd_lean(const rescue_prune_neon::Job &jb,
                                                              rescue_prune_simd_scratch_t &s, int &hb,
-                                                             int &he, int max_hits)
+                                                             int &he, int max_hits, int minsc)
 {
-    return rescue_prune_x86::lean_x86(jb, s, hb, he, max_hits);
+    return rescue_prune_x86::lean_x86(jb, s, hb, he, max_hits, minsc);
 }
 #else
 #define RESCUE_PRUNE_HAVE_SIMD 0
@@ -227,38 +231,37 @@ static inline uint64_t rescue_prune_memo_hits()
 #endif
 }
 
-/* The default hit gate (BWA3_RESCUE_PRUNE_MAX_HITS unset), for a run with banding on or off at
- * rescue threshold minsc: 400 for the hull path. On aarch64, 1000 when banding is on and minsc is
- * the SIMD filter's threshold (19): banding turns more of the pruned windows into savings, which
- * pays for the filter on the denser windows (best of {400, 1000, 3000, 10^4, 10^9} measured on
- * WGS-like data); the scalar filter (any other minsc) is too slow on dense windows for that. The
- * gate is keyed on minsc, not on which filter ends up running, so the rare window past the SIMD
- * filter's capacity (it falls back to the scalar filter) also gets 1000. On x86, 400 with banding
- * too: the x86 kswv kernels are cheap enough that the extra filter work on dense windows does not
- * pay (prune + band, wall, 1000 vs 400: Zen 3 AVX2 wgs-5M 74.52 vs 73.57 s, wes-5M 38.57 vs
- * 37.65 s; Zen 5 AVX-512 wgs-5M 27.53 vs 26.73 s). Output is identical at every value. */
-static inline int rescue_prune_max_hits_default(bool banding, int minsc)
+/* The default hit gate (BWA3_RESCUE_PRUNE_MAX_HITS unset), for a run with banding on or off: 400
+ * for the hull path. On aarch64, 1000 when banding is on: banding turns more of the pruned windows
+ * into savings, which pays for the filter on the denser windows (best of {400, 1000, 3000, 10^4,
+ * 10^9} measured on WGS-like data at minsc 19). The SIMD filter runs at every minsc, so the gate
+ * does not depend on it. On x86, 400 with banding too: the x86 kswv kernels are cheap enough that
+ * the extra filter work on dense windows does not pay (prune + band, wall, 1000 vs 400: Zen 3 AVX2
+ * wgs-5M 74.52 vs 73.57 s, wes-5M 38.57 vs 37.65 s; Zen 5 AVX-512 wgs-5M 27.53 vs 26.73 s). Output
+ * is identical at every value. */
+static inline int rescue_prune_max_hits_default(bool banding)
 {
 #if defined(__aarch64__)
-    return banding && minsc == rescue_prune_neon::MINSC ? 1000 : 400;
+    return banding ? 1000 : 400;
 #else
-    (void)banding; (void)minsc;
+    (void)banding;
     return 400;
 #endif
 }
 
 /* Whether pruning pays at rescue threshold minsc (the cost gate beside the exactness preconditions,
- * which the caller checks). Everywhere on aarch64. On x86 only at the SIMD filter's threshold
- * (rescue_prune_neon::MINSC, the default -k 19): at any other minsc the scalar filter decides, and
- * against the x86 kswv kernels it costs more than it saves (prune on vs off, wall: Zen 5 AVX-512
- * +3 to +13 % at -k 10 / 15 / 25 / 32 on wgs-5M and wes-5M; Zen 3 AVX2 +1 to +6 % at -k 25 / 32). */
-static inline bool rescue_prune_cost_ok(int minsc)
+ * which the caller checks), for a run whose kswv runs at the AVX-512BW tier (avx512) or not.
+ * Everywhere on aarch64. On x86 everywhere except the AVX-512BW tier at minsc >= 25: there the
+ * 64-lane kswv is cheap and few rescues pass at a high threshold, so the filter costs more than it
+ * saves (prune on vs off, wall, Zen 5 wgs-5M: +1.0 / +2.4 / +1.2 / +1.3 % at -k 25 / 28 / 32 / 40;
+ * wes-5M -1.3 / +0.9 / -0.8 / -1.2 %). AVX2 still wins at -k 32 (Zen 3 wes-5M -3.8 %). */
+static inline bool rescue_prune_cost_ok(int minsc, bool avx512)
 {
 #if defined(__aarch64__)
-    (void)minsc;
+    (void)minsc; (void)avx512;
     return true;
 #else
-    return minsc == rescue_prune_neon::MINSC;
+    return !(avx512 && minsc >= 25);
 #endif
 }
 
@@ -282,16 +285,17 @@ static inline int rescue_prune_window(const uint8_t *ref, int len1, const uint8_
     if (minsc < 5 || len1 < 5 || len2 < 5 || len2 > rescue_prune_scratch::QCAP || len1 > 30000)
         return RESCUE_PRUNE_FULL;
 #if RESCUE_PRUNE_HAVE_SIMD
-    if (minsc == rescue_prune_neon::MINSC) {  // identical decisions, faster (rescue_prune_neon.h)
+    {   // identical decisions to the scalar filter at any minsc, faster (rescue_prune_neon.h)
         rescue_prune_simd_scratch_t &ss = rescue_prune_simd_scratch();
         const rescue_prune_neon::Job jb{len1, len2, 0, 0, -1, -1, ref, q};
         int h, e;
         const uint64_t hits0 = ss.memo_hits;
-        const rescue_prune_neon::Kind k = rescue_prune_simd_lean(jb, ss, h, e, max_hits);
+        const rescue_prune_neon::Kind k = rescue_prune_simd_lean(jb, ss, h, e, max_hits, minsc);
         if (view) {
             view->repeat = ss.memo_hits != hits0;
             view->keyed = k != rescue_prune_neon::FALLBACK;
-            view->key = (ss.whash ^ (ss.qhash * 0x9E3779B97F4A7C15ULL)) + (uint64_t)max_hits * 0xD6E8FEB86659FD93ULL;
+            view->key = (ss.whash ^ (ss.qhash * 0x9E3779B97F4A7C15ULL)) + (uint64_t)max_hits * 0xD6E8FEB86659FD93ULL
+                        + (uint64_t)minsc * 0xA24BAED4963EE407ULL;
         }
         if (k == rescue_prune_neon::B1) return RESCUE_PRUNE_B1;
         if (k == rescue_prune_neon::FULL) return RESCUE_PRUNE_FULL;
@@ -300,6 +304,7 @@ static inline int rescue_prune_window(const uint8_t *ref, int len1, const uint8_
             if (view) {
                 view->off = kswv_query_quantum8(len2);
                 view->nd = len1 + view->off + 1;
+                view->minsc = minsc;
                 view->cnt = ss.cnt; view->minrow = ss.minrow; view->bnd16 = ss.bnd;
                 view->mw = ss.mw; view->hw = ss.hw;
                 view->comps = ss.comps; view->ncomp = ss.ncomp;
@@ -312,7 +317,7 @@ static inline int rescue_prune_window(const uint8_t *ref, int len1, const uint8_
 #endif
     static thread_local rescue_prune_scratch s;
     const int kind = rescue_prune_window_scalar(ref, len1, q, len2, minsc, max_hits, s, hb, he);
-    if (view && kind == RESCUE_PRUNE_B2) *view = rescue_prune_scalar_view(s, len1, len2);
+    if (view && kind == RESCUE_PRUNE_B2) *view = rescue_prune_scalar_view(s, len1, len2, minsc);
     return kind;
 }
 

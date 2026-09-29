@@ -22,7 +22,7 @@ All per-batch rescue state lives in `mem_cache`, one slot per tid (`rescue_narro
 
 | Shortcut | Runs when | Turned off by |
 |---|---|---|
-| Exact pruning | a SIMD filter, so aarch64 or an x86 AVX2 / AVX-512BW build (`rescue_prune_on`), default scoring (`rescue_prune_scoring_ok`), no `--meth` (`rescue_exact_runs`), on x86 only at the default `-k 19` (`rescue_prune_runs`), 8-bit job, no `--rescue-kmer` (`rescue_prune_applies`) | `BWA3_RESCUE_PRUNE=0` |
+| Exact pruning | a SIMD filter, so aarch64 or an x86 AVX2 / AVX-512BW build (`rescue_prune_on`), default scoring (`rescue_prune_scoring_ok`), no `--meth` (`rescue_exact_runs`), on x86 not at the AVX-512BW tier from `-k 25` up (`rescue_prune_runs`), 8-bit job, no `--rescue-kmer` (`rescue_prune_applies`) | `BWA3_RESCUE_PRUNE=0` |
 | Banded pass 0 | a NEON or AVX2 band kernel (`rescue_band_enabled`), a pruned job whose band plan beats the hull (`RescueBandBatch::plan`) | `BWA3_RESCUE_BAND=0`, `BWA3_RESCUE_PRUNE=0` |
 | Banded pass 1 | a NEON or AVX2 band kernel (`rescue_band_enabled`), every 8-bit job at the default scoring without `--meth` (`rescue_exact_runs`, at any seed length) whose band is cheaper than kswv, narrowed or not (`RescueBandBatch::take_pass1`) | `BWA3_RESCUE_BAND_P1=0`, `BWA3_RESCUE_BAND=0`, `BWA3_RESCUE_PRUNE=0` |
 | 11-op kswv cell | every SIMD kswv body, when the gap costs admit it (`fscan_scoring_ok`) | `BWA3_RESCUE_FSCAN=0` |

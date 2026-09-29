@@ -15,11 +15,13 @@
 //   2. The guard exits the lemma depends on: any N, a threshold below 5, and a
 //      query or window beyond the scratch capacity all return FULL.
 //   3. Where a SIMD filter is compiled in (NEON on aarch64, the SSE4.1 / SSSE3
-//      port on x86 AVX2 builds), that filter (rescue_prune_window at threshold
-//      19) against the int32 scalar filter (rescue_prune_window_scalar) and,
-//      where it fits, the int16 reference lean(): identical (kind, hb, he).
+//      port on x86 AVX2 builds), that filter (rescue_prune_window, at 19 and
+//      at thresholds 5 / 10 / 32 in rotation) against the int32 scalar filter
+//      (rescue_prune_window_scalar) and, where it fits, the int16 reference
+//      lean(): identical (kind, hb, he).
 //   4. There too, the SIMD filter's repeat memo and its component list: a
-//      repeated job returns the first call's decision and view, and band
+//      repeated job returns the first call's decision and view, the same job
+//      at another threshold is not answered from the memo, and band
 //      planning's components taken from the filter's list equal a rescan of
 //      the view, at every cap.
 //
@@ -42,7 +44,7 @@
 
 namespace {
 
-constexpr int kSimdMinsc = 19;       // min_seed_len * a at the defaults; the SIMD filter's threshold
+constexpr int kSimdMinsc = 19;       // min_seed_len * a at the defaults
 constexpr int kDefaultMaxHits = 400; // BWA3_RESCUE_PRUNE_MAX_HITS default
 constexpr int kNoGate = 1 << 30;
 constexpr int kGapOpen = 6, kGapExtend = 1;  // the only gaps the pruning lemma is derived for
@@ -335,15 +337,19 @@ TEST_CASE("rescue prune: the SIMD filter decides exactly as the scalar filters"
     std::unique_ptr<rescue_prune_scratch> scalar(new rescue_prune_scratch());
     std::unique_ptr<rescue_prune_neon::Scratch> ref16(new rescue_prune_neon::Scratch());
     int compared_lean = 0;
+    // The SIMD filters take the threshold at run time: every other job at 19, the rest at 5, 10 and 32
+    // in rotation (the tail slack ub - minsc - 2 and the mw threshold move with it).
+    const int other_minsc[3] = {5, 10, 32};
     for (const int max_hits : {kDefaultMaxHits, kNoGate}) {
         for (size_t i = 0; i < jobs.size(); i++) {
             const Job &jb = jobs[i];
             const int len1 = (int)jb.ref.size(), len2 = (int)jb.q.size();
-            CAPTURE(jb.tag); CAPTURE(i); CAPTURE(len1); CAPTURE(len2); CAPTURE(max_hits);
+            const int minsc = i % 2 ? kSimdMinsc : other_minsc[(i / 2) % 3];
+            CAPTURE(jb.tag); CAPTURE(i); CAPTURE(len1); CAPTURE(len2); CAPTURE(max_hits); CAPTURE(minsc);
             int hb = -2, he = -2, shb = -2, she = -2;
-            const int kind = rescue_prune_window(jb.ref.data(), len1, jb.q.data(), len2, kSimdMinsc, max_hits,
+            const int kind = rescue_prune_window(jb.ref.data(), len1, jb.q.data(), len2, minsc, max_hits,
                                                  &hb, &he);
-            const int skind = rescue_prune_window_scalar(jb.ref.data(), len1, jb.q.data(), len2, kSimdMinsc,
+            const int skind = rescue_prune_window_scalar(jb.ref.data(), len1, jb.q.data(), len2, minsc,
                                                          max_hits, *scalar, &shb, &she);
             CHECK(kind == skind);
             if (kind == RESCUE_PRUNE_B2 && skind == RESCUE_PRUNE_B2) {
@@ -359,7 +365,7 @@ TEST_CASE("rescue prune: the SIMD filter decides exactly as the scalar filters"
                 && count_hits(jb) <= 32000) {
                 const rescue_prune_neon::Job lj{len1, len2, 0, 0, -1, -1, jb.ref.data(), jb.q.data()};
                 int lhb = -2, lhe = -2;
-                const rescue_prune_neon::Kind lk = rescue_prune_neon::lean(lj, *ref16, lhb, lhe);
+                const rescue_prune_neon::Kind lk = rescue_prune_neon::lean(lj, *ref16, lhb, lhe, minsc);
                 ++compared_lean;
                 CHECK((int)lk == skind);
                 if (lk == rescue_prune_neon::B2 && skind == RESCUE_PRUNE_B2) {
@@ -435,8 +441,9 @@ TEST_CASE("rescue prune: the SIMD filter's hit gate and query cache match the sc
 
 // The two shortcuts band planning takes from the SIMD filter (rescue_prune_neon.h / rescue_prune_x86.h):
 //   - an exact repeat of the previous job returns the previous decision without recomputing it, so
-//     it must return the same (kind, hb, he) and a view with the same components;
-//   - the filter lists its components at MINSC, and rescue_band_components reuses the list for the
+//     it must return the same (kind, hb, he) and a view with the same components, and the same job
+//     at another threshold must be decided afresh, as the scalar filter decides it;
+//   - the filter lists its components at the call's threshold, and rescue_band_components reuses the list for the
 //     whole view instead of rescanning it. With the list hidden (ncomp = -1) it rescans; both must
 //     give the same components and the same success at every cap, including a window with more
 //     components than the filter stores (COMP_CAP) and an output vector that is not empty.
@@ -448,6 +455,7 @@ TEST_CASE("rescue prune: the SIMD filter's repeat memo and component list match 
 #else
     std::mt19937 rng(314159);
     auto jobs = build_jobs(rng);
+    std::unique_ptr<rescue_prune_scratch> scalar(new rescue_prune_scratch());
     {   // one window with more components than COMP_CAP: a 20-base mate segment planted every 23 rows
         const int len1 = 3700, len2 = 100;
         auto ref = random_bases(rng, len1);
@@ -485,6 +493,18 @@ TEST_CASE("rescue prune: the SIMD filter's repeat memo and component list match 
         // a job the NEON filter handed to the scalar one (past its int16 range) has no memo.
         if (v.bnd16) CHECK(rv.repeat);
         CHECK(!v.repeat);
+        if (i % 8 == 0) {   // the same bytes at another threshold: not a repeat
+            const uint64_t hits0 = rescue_prune_memo_hits();
+            int ohb = -2, ohe = -2, shb = -2, she = -2;
+            const int okind = rescue_prune_window(ref2.data(), len1, q2.data(), len2, 25, kNoGate, &ohb, &ohe);
+            CHECK(rescue_prune_memo_hits() == hits0);
+            const int skind = rescue_prune_window_scalar(ref2.data(), len1, q2.data(), len2, 25, kNoGate,
+                                                         *scalar, &shb, &she);
+            CHECK(okind == skind);
+            if (okind == RESCUE_PRUNE_B2 && skind == RESCUE_PRUNE_B2) { CHECK(ohb == shb); CHECK(ohe == she); }
+            // restore the view at kSimdMinsc for the component checks below
+            rescue_prune_window(ref2.data(), len1, q2.data(), len2, kSimdMinsc, kNoGate, &rhb, &rhe, &rv);
+        }
         if (kind != RESCUE_PRUNE_B2 || !v.bnd16) continue;
         ++n_b2;
         REQUIRE(v.ncomp >= 0);

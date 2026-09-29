@@ -59,7 +59,8 @@
  *
  * Scope: the NEON kernel (aarch64, 16 lanes) and the AVX2 kernel (x86, 32 lanes,
  * rescue_band_kernel_x86.h); jobs rescue_prune_applies() prunes (default scoring,
- * 8-bit, non-meth, and on x86 the default -k 19) with minsc in [19, 255] (plan()). Without a SIMD kernel the hull path runs.
+ * 8-bit, non-meth, on x86 not at the AVX-512BW tier with -k 25 or above) with minsc in [5, 255]
+ * (plan()). Without a SIMD kernel the hull path runs.
  * Env: the BWA3_RESCUE_BAND* knobs and BWA3_RESCUE_PRUNE_STATS, listed with their defaults in
  * rescue_env.h.
  *

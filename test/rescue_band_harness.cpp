@@ -500,14 +500,14 @@ static int run_eq(std::vector<Job> &jobs, int minsc, int max_hits, int scalar_st
             rescue_prune_view view;
             kind[t] = rescue_prune_window(J.ref.data(), len1, J.q.data(), len2, minsc, max_hits, &hb, &he, &view);
             if (kind[t] == RESCUE_PRUNE_B2 && view.bnd16) {
-                /* The NEON and scalar filter views of one job must give plan() the same components
-                 * (the scalar view otherwise only serves long windows and thresholds other than 19). */
+                /* The SIMD and scalar filter views of one job must give plan() the same components
+                 * (the scalar view otherwise only serves windows past the SIMD filter's capacity). */
                 int shb, she;
                 const int sk = rescue_prune_window_scalar(J.ref.data(), len1, J.q.data(), len2, minsc, max_hits,
                                                           *sscratch, &shb, &she);
                 bool vok = sk == RESCUE_PRUNE_B2 && shb == hb && she == he;
                 if (vok) {
-                    const rescue_prune_view sv = rescue_prune_scalar_view(*sscratch, len1, len2);
+                    const rescue_prune_view sv = rescue_prune_scalar_view(*sscratch, len1, len2, minsc);
                     /* The whole view, then sub-ranges like the ones plan() passes (one component's
                      * diagonals at a higher threshold): an unaligned start, a start just below a
                      * 64-diagonal word boundary, a range shorter than a word, and a random one. */
@@ -746,7 +746,7 @@ int main(int argc, char **argv)
     const int minsc = rescue_env_int("RB_MINSC", MINSC_DEFAULT);
     /* The production default (rescue_prune_max_hits in bwamem_pair.cpp). */
     const int max_hits = rescue_env_int("BWA3_RESCUE_PRUNE_MAX_HITS",
-                                        rescue_prune_max_hits_default(rescue_band_enabled(), minsc));
+                                        rescue_prune_max_hits_default(rescue_band_enabled()));
     std::vector<Job> jobs;
     if (argc < 4) {
         fprintf(stderr, "usage: %s eq <ngen> <seed> [dumps...] | time <reps> <stride> <dumps...>\n", argv[0]);

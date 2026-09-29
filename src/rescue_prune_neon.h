@@ -3,9 +3,9 @@
  * rescue_prune_neon::lean_neon() returns exactly the same (kind, hb, he) as the scalar
  * rescue_prune_neon::lean() on every input -- verified with 0 disagreements on 1.97 M real
  * wgs/wes rescue jobs and ~70 K adversarial fuzz jobs (incl. N, tiny lengths, poly-A,
- * int16-range stress) -- and runs ~2x faster on Graviton4. The threshold is fixed at 19
- * (min_seed_len * a at defaults); the caller dispatches here only in that case. lean() is the
- * int16 reference the NEON rewrite was derived from, kept as a test oracle.
+ * int16-range stress) -- and runs ~2x faster on Graviton4. The threshold minsc (min_seed_len * a,
+ * 19 at defaults) is a runtime argument; MINSC is only its default. lean() is the int16 reference
+ * the NEON rewrite was derived from, kept as a test oracle.
  *
  * Overview and gates: docs/src/developer-guide/rescue-pruning.md. */
 #ifndef BWA_MEM3_RESCUE_PRUNE_NEON_H
@@ -23,7 +23,7 @@
 
 namespace rescue_prune_neon {
 
-static const int MINSC = 19;
+static const int MINSC = 19;   // the default threshold (min_seed_len * a at defaults)
 // The NEON filter's hit capacity: every int16 sum it forms stays in range at or below this many
 // hits (steps 6 and 7); above it (reachable only with the hit gate opened past it) it returns
 // FALLBACK and the int32 scalar filter decides.
@@ -48,9 +48,9 @@ struct Scratch {
     uint8_t qcnt[1024];
 };
 
-// Production-style filter. Returns FULL (N present: run the full window), B1 (proven score < 19)
-// or B2 with the inclusive hull [hb, he].
-static inline Kind lean(const Job &jb, Scratch &s, int &hb, int &he)
+// Production-style filter. Returns FULL (N present: run the full window), B1 (proven score <
+// minsc) or B2 with the inclusive hull [hb, he].
+static inline Kind lean(const Job &jb, Scratch &s, int &hb, int &he, int minsc = MINSC)
 {
     const uint8_t *ref = jb.ref, *q = jb.qry;
     const int len1 = jb.len1, len2 = jb.len2;
@@ -85,7 +85,7 @@ static inline Kind lean(const Job &jb, Scratch &s, int &hb, int &he)
         s.fwd[d] = (int16_t)f;
         if (f > best) best = f;
     }
-    if (5 + best < MINSC) return B1;
+    if (5 + best < minsc) return B1;
     int b = 0;
     for (int d = nd - 1; d >= 0; d--) {
         b = (int)s.cnt[d] - 1 + (b > 0 ? b : 0);
@@ -94,16 +94,16 @@ static inline Kind lean(const Job &jb, Scratch &s, int &hb, int &he)
     int lo = len1, hi = -1;
     for (int d = 0; d < nd;) {
         auto bnd = [&](int x) { return 5 + s.fwd[x] + s.bwd[x] - ((int)s.cnt[x] - 1); };
-        if (bnd(d) < MINSC) { d++; continue; }
+        if (bnd(d) < minsc) { d++; continue; }
         int ub = 0, i0 = len1, dmax = -1;
-        while (d < nd && bnd(d) >= MINSC) {
+        while (d < nd && bnd(d) >= minsc) {
             ub = std::max(ub, bnd(d));
             if (s.cnt[d]) { i0 = std::min(i0, (int)s.minrow[d]); dmax = d; }
             d++;
         }
         if (dmax < 0) continue;
         lo = std::min(lo, i0);
-        hi = std::max(hi, (dmax - off) + quanta - 1 + std::max(0, ub - MINSC - 2));
+        hi = std::max(hi, (dmax - off) + quanta - 1 + std::max(0, ub - minsc - 2));
     }
     if (hi < 0) return B1;
     hb = std::max(0, lo);
@@ -133,17 +133,18 @@ static inline Kind lean(const Job &jb, Scratch &s, int &hb, int &he)
 //     is gathered in the same pass. There are no per-hit read-modify-write chains through cnt[]
 //     (lean's cost), and no per-row branches (lean's mispredicts).
 //  6. Kadane as scans: P = prefix sum of cnt-1, PM(d) = min(0, P[0..d-1]), fwd = P - PM, max fwd
-//     < 14 -> B1; SX(d) = max_{b>=d} P[b]; bnd(d) = 5 + SX(d) - PM(d) (== 5 + fwd + bwd - v).
+//     < minsc - 5 -> B1; SX(d) = max_{b>=d} P[b]; bnd(d) = 5 + SX(d) - PM(d) (== 5 + fwd + bwd - v).
 //     The diagonals are cut into 8 segments (one per lane) and transposed 8x8 in registers, so
 //     each scan step is one vertical op for 8 diagonals; segment carries join them. Exact while
 //     |P| < 32768, guaranteed by hits <= HIT_CAP; above that it returns FALLBACK and the caller
 //     runs the int32 scalar filter (rescue_prune_window_scalar), never the int16 lean().
-//  7. Components: bitsets of (bnd >= 19) and (bnd >= 19 && cnt > 0) built in the backward scan;
+//  7. Components: bitsets of (bnd >= minsc) and (bnd >= minsc && cnt > 0) built in the backward scan;
 //     per component with a hit (few) ub = vector max of bnd, dmax = highest hit bit, and
 //     lo = masked vector min of minrow.
-/* A diagonal component at MINSC with a hit, as step 7 finds it (shifted diagonal indices x = d + off):
- * the mw run [a, b), ub = max bnd over it, i0 = min minrow over its hit diagonals, dmax = its
- * highest hit diagonal. rescue_band.cpp reuses the list instead of rescanning the view at MINSC. */
+/* A diagonal component at the filter call's minsc with a hit, as step 7 finds it (shifted diagonal
+ * indices x = d + off): the mw run [a, b), ub = max bnd over it, i0 = min minrow over its hit
+ * diagonals, dmax = its highest hit diagonal. rescue_band.cpp reuses the list instead of rescanning
+ * the view at that minsc. */
 struct Comp { int32_t a, b, ub, i0, dmax; };
 
 // The component bitset scanners, plain C++ shared with the x86 port (rescue_prune_x86.h) and
@@ -220,10 +221,10 @@ struct FilterScratch {
     uint64_t whash = 0, qhash = 0;
     /* Result of the last filter call (memo_ok: a SIMD decision, not FALLBACK; see lean_memo). A
      * call repeating that job exactly -- same window bytes (still in rbuf), query bytes (qcache),
-     * lengths and gate -- returns it again; the per-diagonal arrays behind a B2 (cnt, minrow, bnd,
+     * lengths, gate and threshold -- returns it again; the per-diagonal arrays behind a B2 (cnt, minrow, bnd,
      * mw, hw, comps) were not touched in between, since only the filter writes them. */
     bool memo_ok = false;
-    int memo_len1 = -1, memo_mh = 0, memo_hb = -1, memo_he = -1;
+    int memo_len1 = -1, memo_mh = 0, memo_minsc = 0, memo_hb = -1, memo_he = -1;
     Kind memo_kind = FULL;
     uint64_t memo_hits = 0;   // calls answered from the memo (BWA3_RESCUE_PRUNE_STATS, tests)
     FilterScratch()
@@ -247,20 +248,22 @@ typedef FilterScratch<true> NeonScratch;
 
 // Exact repeats of the previous job (a mate rescued twice in a row against the same window) return
 // the previous result without recomputing it: the result is a function of the window bytes, the
-// query bytes, the lengths and max_hits only. core is the filter proper (lean_neon_core, or the x86
-// port's lean_x86_core), which writes the per-diagonal arrays.
+// query bytes, the lengths, max_hits and minsc only. core is the filter proper (lean_neon_core, or
+// the x86 port's lean_x86_core), which writes the per-diagonal arrays.
 template <class S, class Core>
-static inline Kind lean_memo(const Job &jb, S &s, int &hb, int &he, int max_hits, Core core)
+static inline Kind lean_memo(const Job &jb, S &s, int &hb, int &he, int max_hits, int minsc, Core core)
 {
     if (s.memo_ok && jb.len1 == s.memo_len1 && jb.len2 == s.qlen_c && max_hits == s.memo_mh &&
+        minsc == s.memo_minsc &&
         memcmp(jb.ref, s.rbuf + 4, (size_t)jb.len1) == 0 && memcmp(jb.qry, s.qcache, (size_t)jb.len2) == 0) {
         hb = s.memo_hb; he = s.memo_he;
         s.memo_hits++;
         return s.memo_kind;
     }
-    const Kind k = core(jb, s, hb, he, max_hits);
+    const Kind k = core(jb, s, hb, he, max_hits, minsc);
     s.memo_ok = k != FALLBACK;
-    s.memo_len1 = jb.len1; s.memo_mh = max_hits; s.memo_hb = hb; s.memo_he = he; s.memo_kind = k;
+    s.memo_len1 = jb.len1; s.memo_mh = max_hits; s.memo_minsc = minsc;
+    s.memo_hb = hb; s.memo_he = he; s.memo_kind = k;
     return k;
 }
 
@@ -314,7 +317,7 @@ static inline void neon_codes16(const uint8_t *buf, uint16_t *out)
 // max_hits: return FULL when the window and query share more 5-mer hits than this (the gate;
 // same count as summing per-code query occurrences over the window rows), decided before the
 // repeated-code layers and the Kadane scans.
-static inline Kind lean_neon_core(const Job &jb, NeonScratch &s, int &hb, int &he, int max_hits)
+static inline Kind lean_neon_core(const Job &jb, NeonScratch &s, int &hb, int &he, int max_hits, int minsc)
 {
     const uint8_t *ref = jb.ref, *q = jb.qry;
     const int len1 = jb.len1, len2 = jb.len2;
@@ -590,10 +593,10 @@ static inline Kind lean_neon_core(const Job &jb, NeonScratch &s, int &hb, int &h
         Xa = vextq_s16(hs, small, 1);
         // max fwd over segment s = max(local best, max P in s - Mb)
         const int16x8_t best = vmaxq_s16(bestl, vsubq_s16(h, Mb));
-        if (5 + vmaxvq_s16(best) < MINSC) return B1;
+        if (5 + vmaxvq_s16(best) < minsc) return B1;
     }
-    // Backward: SX, PM and bnd per segment step, and the bitsets mw = {bnd >= 19} and
-    // hw = {bnd >= 19 and cnt > 0} as one byte per segment and step (bit k = step k); bnd is
+    // Backward: SX, PM and bnd per segment step, and the bitsets mw = {bnd >= minsc} and
+    // hw = {bnd >= minsc and cnt > 0} as one byte per segment and step (bit k = step k); bnd is
     // transposed back to diagonal order. cnt > 0 is P(d) >= P(d - 1) (their difference is
     // cnt - 1; P before a segment's first diagonal is the zero guard in front of TP).
     //   The per-segment constants move out of the loop:
@@ -605,7 +608,7 @@ static inline Kind lean_neon_core(const Job &jb, NeonScratch &s, int &hb, int &h
     //   earlier diagonal in the segment) gives min = Mb - CP as the saturated original gives Mb.
     uint8_t *mb = (uint8_t *)s.mw, *hbb = (uint8_t *)s.hw;
     {
-        const int16x8_t five = vdupq_n_s16(5), minsc = vdupq_n_s16(MINSC);
+        const int16x8_t five = vdupq_n_s16(5), vminsc = vdupq_n_s16((int16_t)minsc);
         const int16_t *__restrict TP = s.P + 8, *__restrict TM = s.PM;
         const int sb = L >> 3;   // bitset bytes per segment
         const int16x8_t Xl = vqsubq_s16(Xa, CP), Ml = vsubq_s16(Mb, CP);
@@ -620,7 +623,7 @@ static inline Kind lean_neon_core(const Job &jb, NeonScratch &s, int &hb, int &h
                 pn = vld1q_s16(TP + o - 8);                          // P at the diagonal before
                 sx = vmaxq_s16(sx, pc);
                 bd[k] = vaddq_s16(five, vsubq_s16(sx, vminq_s16(Ml, vld1q_s16(TM + o))));
-                const uint16x8_t in = vcgeq_s16(bd[k], minsc);
+                const uint16x8_t in = vcgeq_s16(bd[k], vminsc);
                 am = vsliq_n_u16(in, am, 1);                        // (am << 1) | bit k
                 ah = vsliq_n_u16(vandq_u16(in, vcgeq_s16(pc, pn)), ah, 1);
             }
@@ -685,7 +688,7 @@ static inline Kind lean_neon_core(const Job &jb, NeonScratch &s, int &hb, int &h
             if (x1 > x0 && x1 < b) edge(x1);
             const int ub = vmaxvq_s16(mx), i0 = vminvq_s16(mn);
             lo = std::min(lo, i0);
-            hi = std::max(hi, (dmax - off) + quanta - 1 + std::max(0, ub - MINSC - 2));
+            hi = std::max(hi, (dmax - off) + quanta - 1 + std::max(0, ub - minsc - 2));
             if (nc < NeonScratch::COMP_CAP) s.comps[nc] = Comp{a, b, ub, i0, dmax};
             nc++;
         }
@@ -698,11 +701,13 @@ static inline Kind lean_neon_core(const Job &jb, NeonScratch &s, int &hb, int &h
     return B2;
 }
 // lean_neon_core behind the repeat memo (lean_memo).
-static inline Kind lean_neon(const Job &jb, NeonScratch &s, int &hb, int &he, int max_hits = 1 << 30)
+static inline Kind lean_neon(const Job &jb, NeonScratch &s, int &hb, int &he, int max_hits = 1 << 30,
+                             int minsc = MINSC)
 {
-    return lean_memo(jb, s, hb, he, max_hits, [](const Job &j, NeonScratch &t, int &b, int &e, int mh) {
-        return lean_neon_core(j, t, b, e, mh);
-    });
+    return lean_memo(jb, s, hb, he, max_hits, minsc,
+                     [](const Job &j, NeonScratch &t, int &b, int &e, int mh, int ms) {
+                         return lean_neon_core(j, t, b, e, mh, ms);
+                     });
 }
 #endif  // __aarch64__ (rescue_prune.h dispatches here only on aarch64)
 

@@ -59,9 +59,10 @@
 # parents, or the identity would be vacuous; in a build without them (an x86
 # floor below avx2) the pruning legs take the same path and their non-vacuity
 # check is reported as skipped. A reference and a default leg at -k 25 must
-# match too: there x86 prunes nothing (its cost gate, rescue_prune_cost_ok) but
-# still bands pass 1, so the stats must show banded pass-1 jobs (and filtered
-# jobs on aarch64, none on x86).
+# match too: the SIMD filters run at any threshold, but at the AVX-512BW kswv
+# tier x86 prunes nothing there (its cost gate, rescue_prune_cost_ok) while it
+# still bands pass 1, so the stats must show banded pass-1 jobs, and filtered
+# jobs on every other tier and none at AVX-512BW.
 #
 # Inputs:
 #   BWA_MEM3     — path to the bwa-mem3 binary under test
@@ -222,6 +223,8 @@ case "$floor" in
     sse41 | sse42 | avx | scalar) has_simd=0 ;;
     *) has_simd=1 ;;
 esac
+# The tier kswv runs at on this host (the dispatcher's choice, which the x86 cost gate keys on).
+host_tier="$(BWAMEM3_DEBUG_SIMD=1 "$BIN" 2>&1 | sed -n 's/.*SIMD tier: \([a-z0-9]*\).*/\1/p' | head -1 || true)"
 
 # The reference: every shortcut and alternative kernel form off. Defined once so
 # the unforced and forced-tier references cannot drift apart.
@@ -244,9 +247,10 @@ for t in 1 4; do
     done
 done
 
-# A seed length other than the default -k 19: on x86 pruning's cost gate turns pruning off there
-# (rescue_prune_cost_ok) while banded pass 1 still runs (rescue_exact_runs), a combination no
-# default-k leg reaches; on aarch64 both run. Must equal the reference at the same -k.
+# A seed length other than the default -k 19, so the filters run at another threshold: at the
+# AVX-512BW kswv tier pruning's cost gate turns pruning off there (rescue_prune_cost_ok) while
+# banded pass 1 still runs (rescue_exact_runs), a combination no default-k leg reaches; elsewhere
+# both run. Must equal the reference at the same -k.
 MEM_OPTS=(-k 25)
 run_leg 4 "k25full.t4" BWA3_RESCUE_PRUNE_STATS=1 "${REF_ENV[@]}"
 run_leg 4 "k25.t4" BWA3_RESCUE_PRUNE_STATS=1
@@ -264,9 +268,10 @@ kp1=$(printf '%s\n' "$kbstats" | tr ' ' '\n' | sed -n 's/^pass1_banded=//p')
 k25_note="; -k 25: jobs=${kjobs:-0} pass1_banded=${kp1:-0}"
 if [ "$has_simd" = 1 ]; then
     [ "${kp1:-0}" -gt 0 ] || fail "no banded pass-1 job at -k 25 (SIMD floor '$floor'): $kstats $kbstats"
-    case "$floor" in
-        neon) [ "${kjobs:-0}" -gt 0 ] || fail "pruning filtered no rescue job at -k 25 on aarch64: $kstats" ;;
-        *) [ "${kjobs:-0}" -eq 0 ] || fail "x86 pruned at -k 25, past its -k 19 cost gate: $kstats" ;;
+    [ -n "$host_tier" ] || fail "could not detect the kswv SIMD tier from BWAMEM3_DEBUG_SIMD output"
+    case "$host_tier" in
+        avx512bw) [ "${kjobs:-0}" -eq 0 ] || fail "x86 pruned at -k 25 at the AVX-512BW tier, past its cost gate: $kstats" ;;
+        *) [ "${kjobs:-0}" -gt 0 ] || fail "pruning filtered no rescue job at -k 25 (kswv tier '$host_tier'): $kstats" ;;
     esac
 fi
 
@@ -275,7 +280,6 @@ fi
 # tier names (as in all_tiers_parity.sh): BWAMEM3_FORCE_TIER only downgrades.
 tier_note=""
 if [ -n "${RESCUE_TIERS:-}" ]; then
-    host_tier="$(BWAMEM3_DEBUG_SIMD=1 "$BIN" 2>&1 | sed -n 's/.*SIMD tier: \([a-z0-9]*\).*/\1/p' | head -1 || true)"
     [ -n "$host_tier" ] || fail "could not detect the host SIMD tier from BWAMEM3_DEBUG_SIMD output"
     rank() { # tier -> rank among the x86 tiers, or -1
         case "$1" in

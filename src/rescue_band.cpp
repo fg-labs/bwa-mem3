@@ -232,7 +232,7 @@ static bool rb_components_scalar(const rescue_prune_view &v, BND bnd, int tau, i
     return true;
 }
 
-/* The whole view at MINSC from a SIMD filter: the filter already listed these components (the same
+/* The whole view at the filter call's threshold (v.minsc) from a SIMD filter: the filter already listed these components (the same
  * runs of mw and the same ub / i0 / dmaxhit a rescan computes; rescue_prune_neon.h step 7, checked
  * against a rescan by the unit tests and rescue_prune_eq). Reproduces the rescan's result -- append
  * until out holds cap, false iff any component did not fit -- into *ok and returns true; returns
@@ -241,7 +241,7 @@ static bool rb_components_scalar(const rescue_prune_view &v, BND bnd, int tau, i
 static bool rb_components_listed(const rescue_prune_view &v, int tau, int xa, int xb, std::vector<rb_comp> &out,
                                  int cap, bool *ok)
 {
-    if (!v.comps || tau != rescue_prune_neon::MINSC || xa != 0 || xb != v.nd || v.ncomp < 0) return false;
+    if (!v.comps || tau != v.minsc || xa != 0 || xb != v.nd || v.ncomp < 0) return false;
     if (v.ncomp != v.ncomp_stored && (int)out.size() + v.ncomp_stored < cap) return false;
     *ok = true;
     for (int k = 0; k < v.ncomp; k++) {
@@ -255,8 +255,8 @@ static bool rb_components_listed(const rescue_prune_view &v, int tau, int xa, in
 }
 
 #if defined(__aarch64__)
-/* NEON view (bnd16 + the filter's bitsets). mw = {bnd >= 19}, hw = {bnd >= 19 and cnt > 0}.
- * Every component at tau >= 19 lies inside one run of mw, and inside such a run hw is exactly the
+/* NEON view (bnd16 + the filter's bitsets). mw = {bnd >= v.minsc}, hw = {bnd >= v.minsc and cnt > 0}.
+ * Every component at tau >= v.minsc lies inside one run of mw, and inside such a run hw is exactly the
  * "has a hit" set, so dmaxhit is the last hw bit of the component. ub and i0 are vector max / masked
  * min over the component's diagonals (cnt and minrow are readable at least 8 entries past nd and
  * bnd16 at least 64, see rescue_prune_view, so 8-wide loads never leave the arrays; lanes past b
@@ -308,7 +308,7 @@ static bool rb_components_neon(const rescue_prune_view &v, int tau, int xa, int 
         out.push_back(k);
         return true;
     };
-    if (tau == rescue_prune_neon::MINSC) {
+    if (tau == v.minsc) {
         bool ok;
         if (rb_components_listed(v, tau, xa, xb, out, cap, &ok)) return ok;
         for (int d = bitset_next(v.mw, xa, xb, 0); d < xb;) {
@@ -318,7 +318,7 @@ static bool rb_components_neon(const rescue_prune_view &v, int tau, int xa, int 
         }
         return true;
     }
-    /* tau > 19: runs of bnd >= tau inside [xa, xb) (a run of mw), 64 diagonals per bitmask word;
+    /* tau > v.minsc: runs of bnd >= tau inside [xa, xb) (a run of mw), 64 diagonals per bitmask word;
      * run starts and ends are the bit transitions of the word (branch per run, not per diagonal). */
     static const uint8_t bw[16] = {1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128};
     const uint8x16_t BW = vld1q_u8(bw);
@@ -354,16 +354,17 @@ bool rescue_band_components(const rescue_prune_view &v, int tau, int xa, int xb,
                             std::vector<rb_comp> &out, int cap)
 {
 #if defined(__aarch64__)
-    if (v.bnd16 && v.mw && v.hw && tau >= rescue_prune_neon::MINSC) return rb_components_neon(v, tau, xa, xb, out, cap);
+    if (v.bnd16 && v.mw && v.hw && tau >= v.minsc) return rb_components_neon(v, tau, xa, xb, out, cap);
 #else
     {
         bool ok;
         if (rb_components_listed(v, tau, xa, xb, out, cap, &ok)) return ok;   // the x86 filter's list
     }
 #endif
-    /* A NEON view always carries mw / hw, and plan() asks only for tau >= minsc >= 19, so on aarch64
-     * it always takes the branch above. What reaches here is the rest of an x86 filter's view (bnd16,
-     * the bound precomputed: a sub-range, or a threshold above MINSC) or a scalar view (fwd / bwd). */
+    /* A NEON view always carries mw / hw, and plan() asks only for tau >= the filter call's minsc, so
+     * on aarch64 it always takes the branch above. What reaches here is the rest of an x86 filter's
+     * view (bnd16, the bound precomputed: a sub-range, or a threshold above v.minsc) or a scalar view
+     * (fwd / bwd). */
     if (v.bnd16) {
         const int16_t *b16 = v.bnd16;
         return rb_components_scalar(v, [b16](int x) { return (int)b16[x]; }, tau, xa, xb, out, cap);
@@ -386,9 +387,10 @@ bool rescue_band_components(const rescue_prune_view &v, int tau, int xa, int xb,
 bool RescueBandBatch::plan(const rescue_prune_view &v, int len1, int len2, int hb, int he, int minsc)
 {
     pending_ = -1;
-    /* The component views are derived for minsc >= the NEON filter's threshold, and the 8-bit kernel
-     * holds scores up to 255. */
-    if (v.nd < 0 || minsc < rescue_prune_neon::MINSC || minsc > 255) return false;
+    /* minsc >= 5: the pruning lemma's floor (rescue_prune_window refuses below it); the view's
+     * components are at the filter call's minsc, which must be this one. The 8-bit kernel holds
+     * scores up to 255. */
+    if (v.nd < 0 || minsc < 5 || minsc > 255 || v.minsc != minsc) return false;
     /* A cost gate of 0 (the default where kswv runs at the AVX-512BW tier, rb_cost_pct) declines
      * every parent, so skip the component work it would decline afterwards; counted as declined by
      * the cost model, which is what the gate below would do. */

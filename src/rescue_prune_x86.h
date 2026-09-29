@@ -9,10 +9,9 @@
  *    three-level PBLENDVB tree on the table index bits (PSHUFB reads only index bits 0-3 and 7,
  *    and the index is < 128);
  *  - step 6's bitsets are built after the backward scan from the diagonal-major bnd and cnt with
- *    MOVEMASK (mw = {bnd >= 19}, hw = mw and {cnt > 0}), instead of per-step bytes transposed
+ *    MOVEMASK (mw = {bnd >= minsc}, hw = mw and {cnt > 0}), instead of per-step bytes transposed
  *    and scattered; NEON's hw test P(d) >= P(d - 1) is exactly cnt(d) >= 1.
- * The threshold is fixed at 19 (min_seed_len * a at defaults); the caller dispatches here only in
- * that case.
+ * The threshold minsc (min_seed_len * a, 19 at defaults) is a runtime argument.
  *
  * Overview and gates: docs/src/developer-guide/rescue-pruning.md. */
 #ifndef BWA_MEM3_RESCUE_PRUNE_X86_H
@@ -77,7 +76,7 @@ static inline void x86_codes16(const uint8_t *buf, uint16_t *out)
     x86_st(out + 8, _mm_unpackhi_epi8(lo, a0));
 }
 
-static inline Kind lean_x86_core(const Job &jb, X86Scratch &s, int &hb, int &he, int max_hits)
+static inline Kind lean_x86_core(const Job &jb, X86Scratch &s, int &hb, int &he, int max_hits, int minsc)
 {
     const uint8_t *ref = jb.ref, *q = jb.qry;
     const int len1 = jb.len1, len2 = jb.len2;
@@ -332,7 +331,7 @@ static inline Kind lean_x86_core(const Job &jb, X86Scratch &s, int &hb, int &he,
         Xa = _mm_alignr_epi8(small, hs, 2);
         // max fwd over segment s = max(local best, max P in s - Mb)
         const __m128i best = _mm_max_epi16(bestl, _mm_sub_epi16(h, Mb));
-        if (5 + x86_hmax16(best) < MINSC) return B1;
+        if (5 + x86_hmax16(best) < minsc) return B1;
     }
     // Backward: SX, PM and bnd per segment step, with lean_neon's per-segment constants moved out
     // of the loop (exact in int16 while hits <= HIT_CAP, see lean_neon), bnd transposed back to
@@ -352,13 +351,13 @@ static inline Kind lean_x86_core(const Job &jb, X86Scratch &s, int &hb, int &he,
             x86_transpose8x8_s16(bd);
             for (int k = 0; k < 8; k++) x86_st(s.bnd + k * L + t, bd[k]);
         }
-        // Bitsets from the diagonal-major arrays, 16 diagonals per step: mw = {bnd >= 19},
+        // Bitsets from the diagonal-major arrays, 16 diagonals per step: mw = {bnd >= minsc},
         // hw = mw and {cnt > 0} (cnt <= hits <= HIT_CAP here, so the signed compare is exact).
-        const __m128i t18 = _mm_set1_epi16(MINSC - 1);
+        const __m128i tm1 = _mm_set1_epi16((short)(minsc - 1));
         uint8_t *mb = (uint8_t *)s.mw, *hbb = (uint8_t *)s.hw;
         for (int x0 = 0; x0 < NT; x0 += 16) {
             const unsigned m = (unsigned)_mm_movemask_epi8(_mm_packs_epi16(
-                _mm_cmpgt_epi16(x86_ld(s.bnd + x0), t18), _mm_cmpgt_epi16(x86_ld(s.bnd + x0 + 8), t18)));
+                _mm_cmpgt_epi16(x86_ld(s.bnd + x0), tm1), _mm_cmpgt_epi16(x86_ld(s.bnd + x0 + 8), tm1)));
             const unsigned c = (unsigned)_mm_movemask_epi8(_mm_packs_epi16(
                 _mm_cmpgt_epi16(x86_ld(s.cnt + x0), zero), _mm_cmpgt_epi16(x86_ld(s.cnt + x0 + 8), zero)));
             const uint16_t mm = (uint16_t)m, hh = (uint16_t)(m & c);
@@ -395,7 +394,7 @@ static inline Kind lean_x86_core(const Job &jb, X86Scratch &s, int &hb, int &he,
             if (x1 > x0 && x1 < b) edge(x1);
             const int ub = x86_hmax16(mx), i0 = x86_hmin16(mn);
             lo = std::min(lo, i0);
-            hi = std::max(hi, (dmax - off) + quanta - 1 + std::max(0, ub - MINSC - 2));
+            hi = std::max(hi, (dmax - off) + quanta - 1 + std::max(0, ub - minsc - 2));
             if (nc < X86Scratch::COMP_CAP) s.comps[nc] = Comp{a, b, ub, i0, dmax};
             nc++;
         }
@@ -409,11 +408,13 @@ static inline Kind lean_x86_core(const Job &jb, X86Scratch &s, int &hb, int &he,
 }
 
 // lean_x86_core behind the repeat memo, as lean_neon.
-static inline Kind lean_x86(const Job &jb, X86Scratch &s, int &hb, int &he, int max_hits = 1 << 30)
+static inline Kind lean_x86(const Job &jb, X86Scratch &s, int &hb, int &he, int max_hits = 1 << 30,
+                            int minsc = MINSC)
 {
-    return lean_memo(jb, s, hb, he, max_hits, [](const Job &j, X86Scratch &t, int &b, int &e, int mh) {
-        return lean_x86_core(j, t, b, e, mh);
-    });
+    return lean_memo(jb, s, hb, he, max_hits, minsc,
+                     [](const Job &j, X86Scratch &t, int &b, int &e, int mh, int ms) {
+                         return lean_x86_core(j, t, b, e, mh, ms);
+                     });
 }
 
 }  // namespace rescue_prune_x86
