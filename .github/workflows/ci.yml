@@ -900,6 +900,22 @@ jobs:
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           bash test/regression/rescue_prune_identity.sh
 
+      # The NEON rescue-pruning filter against the scalar one on generated jobs:
+      # decisions, the per-diagonal view band planning reads, the component
+      # list and the repeat memo. About 6 s for 100000 jobs on an Apple M-series
+      # core; real-data dumps are manual. The negative control runs first: it
+      # shifts one scalar field on one job, and the check must report it as a
+      # MISMATCH and exit 1, so a comparison that stopped biting fails here.
+      - name: NEON rescue filter == scalar filter (rescue_prune_eq, generated jobs)
+        if: runner.arch == 'ARM64'
+        run: |
+          make rescue-prune-eq CXX=${{ matrix.cxx || 'clang++-19' }} USE_MIMALLOC=${{ matrix.use_mimalloc }}
+          if RPE_NEGATIVE_CONTROL=1 ./rescue_prune_eq fuzz 2000 1 > rpe_nc.log 2>&1; then
+            cat rpe_nc.log; echo "::error::negative control exited 0: the check missed an injected disagreement"; exit 1
+          fi
+          grep -q 'MISMATCHES=[1-9]' rpe_nc.log || { cat rpe_nc.log; echo "::error::negative control failed without reporting a MISMATCH"; exit 1; }
+          ./rescue_prune_eq fuzz 100000 1
+
       # The banded rescue kernel is NEON-only, so the harness runs on the ARM64
       # rows: every generated job class through the production pipeline, every
       # B2 parent banded (the cost gate opened), each field checked against kswv
@@ -913,11 +929,16 @@ jobs:
       # (BWA3_RESCUE_FSCAN=0, which also turns the fused kswv cell off). The
       # trailing argument is the job generator's seed. The first three take
       # ~50 s in all on Graviton 4; the last three are 30000-job runs like the
-      # second and third. Longer runs and real dumps are manual.
+      # second and third. Longer runs and real dumps are manual. As above, a
+      # negative control (one banded job's te shifted) must fail first.
       - name: Banded rescue == kswv (rescue_band_harness, generated jobs)
         if: runner.arch == 'ARM64'
         run: |
           make rescue-band-harness CXX=${{ matrix.cxx || 'clang++-19' }} USE_MIMALLOC=${{ matrix.use_mimalloc }}
+          if BWA3_RESCUE_BAND_COST=100000000 RB_NEGATIVE_CONTROL=1 ./rescue_band_harness eq 3000 1 > rb_nc.log 2>&1; then
+            cat rb_nc.log; echo "::error::negative control exited 0: the check missed an injected disagreement"; exit 1
+          fi
+          grep -q 'MISMATCHES=[1-9]' rb_nc.log || { cat rb_nc.log; echo "::error::negative control failed without reporting a MISMATCH"; exit 1; }
           BWA3_RESCUE_BAND_COST=100000000 RB_SCALAR_STRIDE=7 ./rescue_band_harness eq 100000 1
           BWA3_RESCUE_BAND_COST=100000000 RB_MINSC=30 ./rescue_band_harness eq 30000 2
           BWA3_RESCUE_BAND_COST=100000000 BWA3_RESCUE_PRUNE_MAX_HITS=100000 ./rescue_band_harness eq 30000 3

@@ -23,7 +23,9 @@
  * components at several thresholds), and the run fails if nothing was banded. Env knobs are the
  * production ones; the caller sets e.g.
  * BWA3_RESCUE_BAND_COST=100000000 (band every B2 parent) and BWA3_RESCUE_PRUNE_MAX_HITS. RB_MINSC
- * (default 19) and RB_SCALAR_STRIDE (default 0: no scalar cross-check) are harness-only.
+ * (default 19), RB_SCALAR_STRIDE (default 0: no scalar cross-check) and RB_NEGATIVE_CONTROL are
+ * harness-only; RB_NEGATIVE_CONTROL=1 shifts the production te of the first banded passing job by
+ * one, so a working comparison must report a MISMATCH and exit 1 (CI runs it first).
  *
  * Dump files: one record per prune-eligible rescue job, as the aligner saw it (full window and
  * oriented mate): int32 len1, int32 len2, len1 reference bytes, len2 query bytes (2-bit codes,
@@ -455,6 +457,8 @@ static int run_eq(std::vector<Job> &jobs, int minsc, int max_hits, int scalar_st
     std::vector<rb_comp> cn, cs;
     long p1_band = 0, p1_guard = 0;
     long cls_n[128] = {0}, cls_mm[128] = {0};
+    const bool negative_control = rescue_env_opt_in("RB_NEGATIVE_CONTROL");
+    bool injected = false;
     const int B = 2048;
     for (size_t base = 0; base < jobs.size(); base += B) {
         const int m = (int)std::min<size_t>(B, jobs.size() - base);
@@ -556,7 +560,8 @@ static int run_eq(std::vector<Job> &jobs, int minsc, int max_hits, int scalar_st
             npass += pass;
             if (kind[t] == RESCUE_PRUNE_B1) ok = !pass;
             else {
-                const kswr_t &b = P.aln[idx[t]];
+                kswr_t b = P.aln[idx[t]];
+                if (negative_control && !injected && pass && banded[t]) { b.te++; injected = true; }
                 if (!pass) ok = b.score < minsc;
                 else {
                     ok = a.score == b.score && a.te == b.te + off[t] && a.qe == b.qe && a.score2 == b.score2
