@@ -786,6 +786,18 @@ jobs:
           PARITY_R2=/tmp/chr22-sim/reads.r2.fastq.gz \
           bash test/regression/all_tiers_parity.sh
 
+      - name: Rescue identity under each forced x86 tier (generated PE fixture)
+        if: matrix.canonical == true
+        # The kswv rescue kernels differ per tier, so the 11-op cell (and the
+        # rest of the rescue shortcuts) is checked end to end on each tier this
+        # host has: the reference and default legs under BWAMEM3_FORCE_TIER must
+        # equal the unforced reference. On a runner without AVX-512BW the script
+        # reports that tier SKIP:. Seconds of work: a 60 kb generated fixture.
+        run: |
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          RESCUE_TIERS="avx2 avx512bw" \
+          bash test/regression/rescue_prune_identity.sh
+
       - name: Run unit-test harness
         # The standalone FM-index parity tests in the harness gate the arm64
         # vector occurrence path; on x86 rows that code is compiled out, so
