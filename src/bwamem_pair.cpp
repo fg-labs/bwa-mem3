@@ -43,6 +43,9 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "kswv.h"
 #include "simd_dispatch.h"
 #include "rescue_prune.h"
+#include "rescue_band.h"
+#include "rescue_env.h"
+#include <chrono>
 
 #ifdef USE_MALLOC_WRAPPERS
 #  include "malloc_wrap.h"
@@ -306,33 +309,34 @@ static int32_t *matesw_narrow_slot(mem_cache *mmc, int32_t tid, int64_t regid)
     return &mmc->rescue_narrow_off[tid][regid];
 }
 
+/* This tid's banded-rescue batch (mem_cache::rescue_band), created on first use. */
+static RescueBandBatch &matesw_band(mem_cache *mmc, int32_t tid)
+{
+    if (!mmc->rescue_band[tid]) mmc->rescue_band[tid] = rescue_band_batch_new();
+    return *mmc->rescue_band[tid];
+}
+
 /* Exact rescue pruning (rescue_prune.h). Default ON where it runs (below); BWA3_RESCUE_PRUNE=0
- * disables it, which is how the byte-identity A/B is run. BWA3_RESCUE_PRUNE_MAX_HITS (default
- * 400, a non-negative integer) skips the filter on windows sharing more 5-mer hits with the mate
- * than that, where it would cost more than the DP rows it saves; a malformed value is reported
- * and the default used. Read once. */
+ * disables it (with BWA3_RESCUE_BAND=0, the reference path of the byte-identity A/B).
+ * BWA3_RESCUE_PRUNE_MAX_HITS (default: rescue_prune_max_hits below) skips the filter on windows
+ * sharing more 5-mer hits with the mate than that, where it would cost more than the DP rows it
+ * saves; a malformed value is reported and the default used. Read once. */
 static bool rescue_prune_enabled()
 {
     static const bool on = [] { const char *e = getenv("BWA3_RESCUE_PRUNE"); return !e || e[0] != '0'; }();
     return on;
 }
-static int rescue_prune_max_hits()
+/* Default 400 for the hull path; 1000 when banding is on and minsc is the NEON filter's threshold
+ * (19): banding turns more of the pruned windows into savings, which pays for the filter on the
+ * denser windows (best of {400, 1000, 3000, 10^4, 10^9} measured on WGS-like data). The scalar
+ * filter (any other minsc) is too slow on dense windows for that, so it keeps 400. The gate is keyed
+ * on minsc, not on which filter ends up running, so the rare window past the NEON filter's capacity
+ * (it falls back to the scalar filter) also gets 1000; output is identical at every value. */
+static int rescue_prune_max_hits(int minsc)
 {
-    static const int v = [] {
-        const int dflt = 400;
-        const char *e = getenv("BWA3_RESCUE_PRUNE_MAX_HITS");
-        if (!e || !*e) return dflt;
-        char *end = NULL;
-        errno = 0;
-        const long x = strtol(e, &end, 10);
-        if (errno || *end || x < 0 || x > INT_MAX) {
-            fprintf(stderr, "ERROR: BWA3_RESCUE_PRUNE_MAX_HITS=\"%s\" is not a non-negative integer; "
-                            "using %d.\n", e, dflt);
-            return dflt;
-        }
-        return (int)x;
-    }();
-    return v;
+    static const int env = rescue_env_int("BWA3_RESCUE_PRUNE_MAX_HITS", -1);
+    if (env >= 0) return env;
+    return rescue_band_enabled() && minsc == rescue_prune_neon::MINSC ? 1000 : 400;
 }
 /* Whether pruning is built and enabled at all. It runs only where the NEON filter does (aarch64):
  * the portable scalar filter costs more than it saves against the x86 kswv kernels, so x86 keeps
@@ -354,13 +358,24 @@ static bool rescue_prune_on()
  * identity A/B: identical output must come with a nonzero number of pruned rows. */
 struct rescue_prune_stats_t {
     std::atomic<uint64_t> jobs{0}, full{0}, b1{0}, b2{0}, rows_in{0}, rows_kept{0};
+    /* Thread-summed wall time of the rescue stages (ns): filter + band planning in _pre, kswv
+     * pass 0 (8-bit + 16-bit), the banded pass 0, kswv pass 1 and the banded pass 1. Only measured
+     * when stats are on. */
+    std::atomic<uint64_t> ns_filter{0}, ns_k0{0}, ns_band{0}, ns_k1{0}, ns_b1{0};
     bool on = [] { const char *e = getenv("BWA3_RESCUE_PRUNE_STATS"); return e && e[0] == '1'; }();
     ~rescue_prune_stats_t() {
-        if (on) fprintf(stderr, "[RESCUE_PRUNE] jobs=%llu full=%llu b1=%llu b2=%llu rows_in=%llu rows_kept=%llu\n",
+        if (on) fprintf(stderr, "[RESCUE_PRUNE] jobs=%llu full=%llu b1=%llu b2=%llu rows_in=%llu rows_kept=%llu "
+                        "filter_s=%.3f kswv_pass0_s=%.3f band_pass0_s=%.3f kswv_pass1_s=%.3f band_pass1_s=%.3f\n",
                         (unsigned long long)jobs, (unsigned long long)full, (unsigned long long)b1,
-                        (unsigned long long)b2, (unsigned long long)rows_in, (unsigned long long)rows_kept);
+                        (unsigned long long)b2, (unsigned long long)rows_in, (unsigned long long)rows_kept,
+                        ns_filter * 1e-9, ns_k0 * 1e-9, ns_band * 1e-9, ns_k1 * 1e-9, ns_b1 * 1e-9);
     }
 };
+static inline uint64_t rescue_now_ns()
+{
+    return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 static rescue_prune_stats_t g_rescue_prune_stats;
 
 /* Whether pruning can narrow any rescue window in this run: it is on, the rescue is non-meth, and
@@ -952,15 +967,31 @@ static inline bool meth_scoring_batched_expressible(const mem_opt_t *opt)
 static void mem_sam_pe_batch_run(Ikswv *pwsw, SeqPair *pairs,
                                  uint8_t *seqBufRef, uint8_t *seqBufQer,
                                  kswr_t *aln, int64_t slice_pcnt,
-                                 int64_t slice_pcnt8, int nthreads)
+                                 int64_t slice_pcnt8, int nthreads,
+                                 int64_t n_banded = 0, RescueBandBatch *band = NULL,
+                                 bool p1_band_any = false)
 {
     // Shift 16-bit
     for (int i=0; i<slice_pcnt-slice_pcnt8; i++)
         pairs[slice_pcnt + MAX_LINE_LEN - 1 - i] = pairs[slice_pcnt-i-1];
 
-    pwsw->getScores8(pairs, seqBufRef, seqBufQer, aln, slice_pcnt8, nthreads, 0);
+    /* Exact banded rescue (rescue_band.h): the first n_banded 8-bit pairs are hull parents whose
+     * pass 0 runs as banded DP jobs instead of kswv; it fills their aln[regid] exactly as kswv
+     * would, so the post-processing below treats every pair alike. Their pass 1 is banded too
+     * where that is cheaper (take_pass1), and runs through kswv otherwise. p1_band_any extends the
+     * banded pass 1 to every other 8-bit pair; the caller sets it only for default scoring and
+     * non-meth, which the band's exactness argument needs (a banded parent implies both). band is
+     * this tid's batch; non-NULL whenever n_banded > 0 or p1_band_any. */
+    const bool timed = g_rescue_prune_stats.on;
+    uint64_t t0 = timed ? rescue_now_ns() : 0;
+    pwsw->getScores8(pairs + n_banded, seqBufRef, seqBufQer, aln, slice_pcnt8 - n_banded, nthreads, 0);
     pwsw->getScores16(pairs + slice_pcnt8 + MAX_LINE_LEN, seqBufRef, seqBufQer,
                       aln, slice_pcnt-slice_pcnt8, nthreads, 0);
+    if (timed) { uint64_t t1 = rescue_now_ns(); g_rescue_prune_stats.ns_k0 += t1 - t0; t0 = t1; }
+    if (n_banded > 0) {
+        band->run_pass0(pairs, (int)n_banded, seqBufRef, seqBufQer, aln, pwsw);
+        if (timed) { uint64_t t1 = rescue_now_ns(); g_rescue_prune_stats.ns_band += t1 - t0; t0 = t1; }
+    }
 
     // Post-processing
     int pos = 0, pos8 = 0, pos16 = 0;
@@ -977,6 +1008,7 @@ static void mem_sam_pe_batch_run(Ikswv *pwsw, SeqPair *pairs,
         uint8_t *qs = seqBufQer + sp.idq;
         uint8_t *rs = seqBufRef + sp.idr;
         revseq(r.qe + 1, qs); revseq(r.te + 1, rs);
+        if ((i < n_banded || p1_band_any) && band->take_pass1(sp, r, i < n_banded)) continue;
         pairs[pos++] = sp;
         pos8 ++;
     }
@@ -1003,8 +1035,14 @@ static void mem_sam_pe_batch_run(Ikswv *pwsw, SeqPair *pairs,
     assert(pos8 + pos16 == pcnt2);
     (void) pcnt2;
 
+    if (timed) t0 = rescue_now_ns();
     pwsw->getScores16(pairs + pos8, seqBufRef, seqBufQer, aln, pos16, nthreads, 1);
     pwsw->getScores8(pairs, seqBufRef, seqBufQer, aln, pos8, nthreads, 1);
+    if (timed) { uint64_t t1 = rescue_now_ns(); g_rescue_prune_stats.ns_k1 += t1 - t0; t0 = t1; }
+    if (n_banded > 0 || p1_band_any) {
+        band->run_pass1(seqBufRef, seqBufQer, aln, pwsw);
+        if (timed) g_rescue_prune_stats.ns_b1 += rescue_now_ns() - t0;
+    }
 }
 
 // This function is equivalent to align2() for axv512
@@ -1037,6 +1075,13 @@ int mem_sam_pe_batch(const mem_opt_t *opt, mem_cache *mmc,
         kswr_t *r = &aln[i];
         r->tb = r->qb = -1;
     }
+
+    /* The per-batch band plans recorded by mem_matesw_batch_pre are consumed here; drop them
+     * whichever path returns (the buffers keep their capacity). */
+    struct band_reset_guard {
+        RescueBandBatch *b;
+        ~band_reset_guard() { if (b) b->reset(); }
+    } band_reset{mmc->rescue_band[tid]};
 
     int nthreads = 1; // no multi-threading here
 
@@ -1135,9 +1180,18 @@ int mem_sam_pe_batch(const mem_opt_t *opt, mem_cache *mmc,
                           maxRefLen, maxQerLen);
 
     if (opt->rescue_kmer || rescue_prune_runs(opt)) matesw_sort_partitions_by_len(seqPairArray, pcnt8, pcnt);
+    /* Banded parents first (stable, so the kswv remainder keeps its length sort). */
+    const int64_t n_banded = band_reset.b ? band_reset.b->partition(seqPairArray, (int)pcnt8) : 0;
 
+    /* Banded pass 1 beyond the banded parents: needs the default scoring on both gap types (its
+     * band bound is derived for it) and non-meth (the band kernel has no freed-cell matrix; this
+     * point is also reached under --meth when the batched meth rescue is off) -- both part of
+     * rescue_prune_runs, which also keeps BWA3_RESCUE_PRUNE=0 the whole pre-pruning path -- and
+     * the banding path (aarch64; off under BWA3_RESCUE_BAND=0). */
+    const bool p1_band_any = rescue_prune_runs(opt) && rescue_band_enabled();
+    if (p1_band_any) band_reset.b = &matesw_band(mmc, tid);   // pass 1 needs a batch even with no plan
     mem_sam_pe_batch_run(pwsw.get(), seqPairArray, seqBufRef, seqBufQer,
-                         aln, pcnt, pcnt8, nthreads);
+                         aln, pcnt, pcnt8, nthreads, n_banded, band_reset.b, p1_band_any);
 
 #endif
 
@@ -1664,9 +1718,17 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                 if ((int)oq.size() < l_ms) oq.resize(l_ms);
                 matesw_orient(ms, l_ms, is_rev, oq.data());
                 int hb, he;
+                rescue_prune_view view;
+                const uint64_t tf0 = g_rescue_prune_stats.on ? rescue_now_ns() : 0;
                 const int kind = rescue_prune_window(ref, (int)(re - rb), oq.data(), l_ms,
                                                      opt->min_seed_len * opt->a,
-                                                     rescue_prune_max_hits(), &hb, &he);
+                                                     rescue_prune_max_hits(opt->min_seed_len * opt->a), &hb, &he,
+                                                     &view);
+                /* Banding plan (rescue_band.h), bound to this pair's regid at enqueue (commit).
+                 * rescue_prune_applies() has checked the scoring the band kernel is derived for. */
+                if (kind == RESCUE_PRUNE_B2 && rescue_band_enabled())
+                    matesw_band(mmc, tid).plan(view, (int)(re - rb), l_ms, hb, he, opt->min_seed_len * opt->a);
+                if (g_rescue_prune_stats.on) g_rescue_prune_stats.ns_filter += rescue_now_ns() - tf0;
                 if (g_rescue_prune_stats.on) {
                     g_rescue_prune_stats.jobs++;
                     g_rescue_prune_stats.rows_in += re - rb;
@@ -1838,6 +1900,7 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                 if (opt->rescue_kmer || rescue_prune_runs(opt)) {   /* record narrow offset by regid for _post */
                     *matesw_narrow_slot(mmc, tid, pcnt) = narrow_ob;
                 }
+                if (rescue_band_enabled()) matesw_band(mmc, tid).commit(pcnt);
                 seqPairArray[pcnt++] = sp;
             }
         }

@@ -312,6 +312,7 @@ typedef struct mem_opt_t {
 
 
 struct mem_alnreg_t;
+class RescueBandBatch;   // rescue_band.h
 // * Chaining *
 typedef struct abc {
     abc() {
@@ -524,6 +525,13 @@ typedef struct
     // demand by _pre; freed with the other per-tid buffers.
     int32_t *rescue_narrow_off[MAX_THREADS];
     int64_t  rescue_narrow_cap[MAX_THREADS];
+
+    // Per-tid banded-rescue plans (rescue_band.h): mem_matesw_batch_pre plans the
+    // banded pass 0 of each enqueued pair and mem_sam_pe_batch runs it, so the plan
+    // lives with the batch's other per-tid state for the same reason as
+    // rescue_narrow_off. NULL until the first plan; created by _pre, freed with the
+    // other per-tid buffers (rescue_band_batch_free).
+    RescueBandBatch *rescue_band[MAX_THREADS];
 
     // Pointer into worker_t::ref_string (the unpacked .0123 reference).
     // Set once in the worker_aln/worker_sam entry points; lets helpers like

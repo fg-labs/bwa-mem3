@@ -887,6 +887,22 @@ jobs:
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           bash test/regression/rescue_prune_identity.sh
 
+      # The banded rescue kernel is NEON-only, so the harness runs on the ARM64
+      # rows: every generated job class through the production pipeline, every
+      # B2 parent banded (the cost gate opened), each field checked against kswv
+      # on the full window. The second run uses a threshold other than the NEON
+      # filter's, so plan() reads the scalar filter's view; the third opens the
+      # hit gate, the only way a window reaches the component cap (at the
+      # default gate its hits send it to the full window first). ~50 s in all
+      # on Graviton 4. Longer runs and real dumps are manual.
+      - name: Banded rescue == kswv (rescue_band_harness, generated jobs)
+        if: runner.arch == 'ARM64'
+        run: |
+          make rescue-band-harness CXX=${{ matrix.cxx || 'clang++-19' }} USE_MIMALLOC=${{ matrix.use_mimalloc }}
+          BWA3_RESCUE_BAND_COST=100000000 RB_SCALAR_STRIDE=7 ./rescue_band_harness eq 100000 1
+          BWA3_RESCUE_BAND_COST=100000000 RB_MINSC=30 ./rescue_band_harness eq 30000 2
+          BWA3_RESCUE_BAND_COST=100000000 BWA3_RESCUE_PRUNE_MAX_HITS=100000 ./rescue_band_harness eq 30000 3
+
       - name: Flat chaining index matches the kbtree replay (chr22)
         if: matrix.canonical == true
         run: |
