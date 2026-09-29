@@ -17,6 +17,7 @@
 #include <cstring>
 #include <mutex>
 
+#include "bntseq.h"       /* nst_nt4_decode */
 #include "bwa.h"          /* bseq1_t */
 #include "utils.h"        /* xassert (survives a hypothetical -DNDEBUG build) */
 #include "robin_hood.h"
@@ -237,6 +238,19 @@ read_memo_result read_memo_prepass(const mem_opt_t * /*opt*/, const bseq1_t *seq
     const uint64_t probe_ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                                   std::chrono::steady_clock::now() - t0).count();
     return read_memo_result{ (int64_t)npairs, dup, probe_ns };
+}
+
+void read_memo_convert_non_reps(const read_memo_state *st, bseq1_t *seqs, int seq_id, int n)
+{
+    for (int l = 0; l < n; ++l) {
+        if (st->role[(seq_id + l) >> 1] == READ_MEMO_ROLE_REP) continue;
+        char *s = seqs[l].seq;
+        const int len = seqs[l].l_seq;
+        for (int i = 0; i < len; ++i) {
+            unsigned char ch = (unsigned char) s[i];
+            s[i] = nst_nt4_decode(ch, 4);
+        }
+    }
 }
 
 /* ------------------------------------------------------------------------- *

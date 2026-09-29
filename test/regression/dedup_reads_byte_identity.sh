@@ -11,7 +11,8 @@
 # memoize path -- a PASS there says nothing about it. This test forces the path
 # ON and asserts non-vacuity via BWAMEM3_DEDUP_READS_STATS. Checked on a dup-rich
 # and a low-dup fixture, on an N+lowercase fixture (the DUP-read 2-bit conversion
-# path, which kernel1 would otherwise skip), single- and multi-threaded.
+# path, which kernel1 would otherwise skip), on a '-' fixture (each read is converted
+# to 2-bit exactly once), single- and multi-threaded.
 set -euo pipefail
 : "${BWA_MEM3:?BWA_MEM3 must be set}"
 : "${DEDUP_READS_PHIX_FA:?DEDUP_READS_PHIX_FA must be set}"
@@ -51,6 +52,19 @@ mangle() { # <in.fq> <out.fq> : lowercase bases 10-15, set bases 50 & 52 to N
 mangle "$W/dup_1.fq" "$W/nlow_1.fq" || fail "generate N/lowercase R1"
 mangle "$W/dup_2.fq" "$W/nlow_2.fq" || fail "generate N/lowercase R2"
 
+# '-' fixture: the 2-bit conversion is not idempotent ('-' -> 5, and a second
+# pass maps 5 -> 4, i.e. N), so each read must be converted exactly once: DUPs in
+# worker_bwt_memo, REPs in kernel1. The SAM encoder prints 4 and 5 alike, so
+# this end-to-end check cannot see a second conversion; the encoded bytes are
+# asserted at the conversion boundary in test/unit/test_read_memo.cpp. Same
+# uniform, deterministic mangle as above, so the repeats stay duplicate pairs.
+dash() { # <in.fq> <out.fq> : set base 30 to '-'
+    awk 'NR % 4 == 2 { print substr($0, 1, 29) "-" substr($0, 31); next } { print }' \
+        "$1" > "$2"
+}
+dash "$W/dup_1.fq" "$W/dash_1.fq" || fail "generate '-' R1"
+dash "$W/dup_2.fq" "$W/dash_2.fq" || fail "generate '-' R2"
+
 run() { # run <tag> <mode> <threads> <prefix>
     local tag=$1 mode=$2 t=$3 p=$4
     "$BWA_MEM3" mem --dedup-reads "$mode" -t "$t" "$W/phix.fa" \
@@ -60,7 +74,7 @@ run() { # run <tag> <mode> <threads> <prefix>
 }
 
 for t in 1 4; do
-    for p in dup uniq nlow; do
+    for p in dup uniq nlow dash; do
         run "off_${p}_t${t}" off "$t" "$W/$p"
         run "on_${p}_t${t}" on "$t" "$W/$p"
         run "auto_${p}_t${t}" auto "$t" "$W/$p"
@@ -72,7 +86,7 @@ done
 
 # Thread determinism of the ON path specifically: the compaction and copy pass
 # run under kt_for, so -t1 must equal -t4 with the memoize path live.
-for p in dup nlow; do
+for p in dup nlow dash; do
     cmp "$W/on_${p}_t1.sam" "$W/on_${p}_t4.sam" || fail "on -t1 != -t4 ($p)"
     ok "thread determinism --dedup-reads on ($p, -t1 == -t4)"
 done
