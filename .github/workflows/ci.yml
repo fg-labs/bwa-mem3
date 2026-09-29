@@ -272,6 +272,27 @@ jobs:
       - name: README still describes the regression scripts
         run: bash test/regression/readme_contract_lint.sh
 
+  # Same shape again. Separate so the failure reads as "the rescue developer
+  # docs went stale" rather than as a build or test finding.
+  rescue-docs-lint:
+    name: Rescue developer docs (pages, knob list <-> src/)
+    runs-on: ubuntu-latest
+    # Source-only lint, seconds of work; ceiling catches a hung runner only.
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      # Runs first, for the same reason as the jobs above: an extraction that
+      # has stopped extracting satisfies every check over what it extracted.
+      - name: Rescue docs lint still detects drift
+        run: bash test/regression/rescue_docs_lint_selftest.sh
+
+      - name: Rescue docs match the source (pages, knob list, gates)
+        run: bash test/regression/rescue_docs_lint.sh
+
   build-and-test:
     strategy:
       fail-fast: false

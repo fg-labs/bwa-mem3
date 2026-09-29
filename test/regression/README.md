@@ -11,9 +11,10 @@ three more ways -- every opt-in debug macro on (rerunning `chr22_parity.sh`
 against it), `TESTING_BUILD=1`, and `ASAN=1` (rerunning `header_parity.sh`
 against it) -- in parallel with the matrix rather than at the end of the
 canonical row; and the `ndebug_gate_lint*`, `debug_macro_flag_lint*`, `shell_lint*`,
-`regression_coverage_lint*` and `readme_contract_lint*` pairs need no binary at
-all and run from `ndebug-gate-lint`, `debug-macro-flag-lint`, `shell-lint`,
-`regression-coverage-lint` and `readme-contract-lint` respectively. Each script:
+`regression_coverage_lint*`, `readme_contract_lint*` and `rescue_docs_lint*` pairs
+need no binary at all and run from `ndebug-gate-lint`, `debug-macro-flag-lint`,
+`shell-lint`, `regression-coverage-lint`, `readme-contract-lint` and
+`rescue-docs-lint` respectively. Each script:
 
 - is self-contained (set -euo pipefail; explicit input contract — env vars for
   every script but the source-only lints, which instead take an optional
@@ -82,6 +83,8 @@ parity or byte-identity, so nothing here scopes it.)
 | `arg_range_validation.sh`    | `-E` (`0`, `5,0`, and out-of-range tokens that would narrow to a positive int) and `-I mean,0` are rejected at parse with an `ERROR:` message (cal_max_gap / mem_pair divide-by-zero); also rejects non-finite `-I` mean/std/max (`nan`/`inf`, and overflowing tokens like `1e400` that `strtod` maps to `inf`). Env: `BWA_MEM3`; no staged inputs — validation fires during option parsing, before any reference is opened | "Argument range validation (-E / -I reject non-positive)" |
 | `readme_contract_lint.sh`    | this README names no script that was deleted, its source-only-lint block lists exactly the scripts that read no environment, every row's `Origin in ci.yml` names a step a workflow defines, and every script can emit the `PASS:`/`FAIL:` markers above | "README still describes the regression scripts"     |
 | `readme_contract_lint_selftest.sh` | the lint above still detects a stale README, so its `PASS` means something | "README lint still detects drift"                  |
+| `rescue_docs_lint.sh`        | the mate-rescue developer-guide pages, the `BWA3_RESCUE_*` knob list in `src/rescue_env.h` and the source still agree: the committed `docs/_generated/rescue/knobs.md` is what `make docs-rescue-knobs` renders now, every knob src/ reads is listed with the default its reader uses, the user-facing table in `docs/src/whats-different/performance.md` lists exactly those knobs, every backticked name in a page exists, pages and rescue sources name each other, and every exactness claim in a page names a gate that CI runs | "Rescue docs match the source (pages, knob list, gates)" |
+| `rescue_docs_lint_selftest.sh` | the lint above still detects each drift it checks for, so its `PASS` means something | "Rescue docs lint still detects drift" |
 
 The table is a reading guide, not an inventory — `ls test/regression/*.sh` is
 the authoritative list, and `ci.yml` is where each one is actually wired up.
@@ -104,6 +107,7 @@ at.
 | `debug_macro_flag_lint.sh`    | repository root to check (default: this repository) | `debug_macro_flag_lint_selftest.sh`    |
 | `regression_coverage_lint.sh` | repository root to check (default: this repository) | `regression_coverage_lint_selftest.sh` |
 | `readme_contract_lint.sh`     | repository root to check (default: this repository) | `readme_contract_lint_selftest.sh`     |
+| `rescue_docs_lint.sh`         | repository root to check (default: this repository) | `rescue_docs_lint_selftest.sh`         |
 
 `meth_oracle.sh` is the one env-free script that is not a lint, and it takes no
 argument either. It wraps the `--meth` harness under `test/meth/`, whose inputs
