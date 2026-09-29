@@ -148,7 +148,7 @@ static int rb_p1_cost_pct()
  * way (rescue_env_on: a leading '0' turns it off), selects 0 when off; otherwise
  * BWA3_RESCUE_BAND_KERNEL picks the kernel (default 2; values above 2 act as 2), so 1 stays
  * reachable as the one-row step between the other two for A/B and bisecting. The band path runs
- * only at the scoring rescue_prune_scoring_ok admits (gaps 6 + 1 both ways), so the insertion and
+ * only at the default scoring (rescue_prune_params::default_scoring: gaps 6 + 1 both ways), so the insertion and
  * deletion open-plus-extend sums are equal, as the fused cell requires. Read once, like the other
  * band toggles. */
 static int rb_kernel()
@@ -411,7 +411,7 @@ bool RescueBandBatch::plan(const rescue_prune_view &v, int len1, int len2, int h
 #if RB_X86
         /* The x86 cell's biased add is exact only while every H <= 250 (rescue_band_kernel_x86.h).
          * A band H is a local alignment score, so at most len2 * a = len2 here (a = 1 under
-         * rescue_prune_scoring_ok), and the 8-bit kernel path admits only len2 * a + 4 <= 254
+         * the default scoring), and the 8-bit kernel path admits only len2 * a + 4 <= 254
          * (matesw_use_u8's bias of 4 at this scoring), i.e. len2 <= 250. This check restates that
          * bound locally, so a change to the 8-bit admission cannot make the cell inexact. */
         if (len2 > 250) ok = false;

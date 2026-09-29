@@ -62,7 +62,11 @@
 # match too: the SIMD filters run at any threshold, but at the AVX-512BW kswv
 # tier x86 prunes nothing there (its cost gate, rescue_prune_cost_ok) while it
 # still bands pass 1, so the stats must show banded pass-1 jobs, and filtered
-# jobs on every other tier and none at AVX-512BW.
+# jobs on every other tier and none at AVX-512BW. Two scorings other than the
+# default must match the reference at the same scoring too: -B 6, which the
+# SIMD filters take, so its stats must show filtered jobs wherever they run;
+# and -O 8 -E 2, which only the scalar filter decides, so filtered jobs on
+# aarch64 and none on x86 (its cost gate).
 #
 # Inputs:
 #   BWA_MEM3     — path to the bwa-mem3 binary under test
@@ -249,7 +253,7 @@ done
 
 # A seed length other than the default -k 19, so the filters run at another threshold: at the
 # AVX-512BW kswv tier pruning's cost gate turns pruning off there (rescue_prune_cost_ok) while
-# banded pass 1 still runs (rescue_exact_runs), a combination no default-k leg reaches; elsewhere
+# banded pass 1 still runs (rescue_band_runs), a combination no default-k leg reaches; elsewhere
 # both run. Must equal the reference at the same -k.
 MEM_OPTS=(-k 25)
 run_leg 4 "k25full.t4" BWA3_RESCUE_PRUNE_STATS=1 "${REF_ENV[@]}"
@@ -274,6 +278,38 @@ if [ "$has_simd" = 1 ]; then
         *) [ "${kjobs:-0}" -gt 0 ] || fail "pruning filtered no rescue job at -k 25 (kswv tier '$host_tier'): $kstats" ;;
     esac
 fi
+
+# Other scorings (rescue_prune_params), each against the reference at the same scoring: -B 6,
+# which the SIMD filters take (-A 1 with deletion costs -O 6 -E 1), so it prunes wherever they run;
+# and -O 8 -E 2, which the scalar filter decides, so it prunes on aarch64 only (x86's cost gate,
+# rescue_prune_cost_ok, keeps the full window there). Banding stays at the default scoring.
+sc_note=""
+check_scoring() { # $1 = label, $2 = where it prunes (simd | aarch64), rest = mem options
+    local label="$1" where="$2" stem st sj
+    shift 2
+    stem="sc_$(printf '%s' "$label" | tr -c 'A-Za-z0-9' '_')"
+    MEM_OPTS=("$@")
+    run_leg 4 "$stem.full" BWA3_RESCUE_PRUNE_STATS=1 "${REF_ENV[@]}"
+    run_leg 4 "$stem" BWA3_RESCUE_PRUNE_STATS=1
+    MEM_OPTS=()
+    if ! cmp -s "$stem.full.sam" "$stem.sam"; then
+        echo "FAIL: rescue at $label differs from the reference at $label (-t 4):" >&2
+        diff "$stem.full.sam" "$stem.sam" | head -20 >&2 || true
+        exit 1
+    fi
+    st="$(grep '^\[RESCUE_PRUNE\]' "$stem.err" || true)"
+    [ -n "$st" ] || fail "BWA3_RESCUE_PRUNE_STATS=1 printed no [RESCUE_PRUNE] line ($label leg)"
+    sj=$(printf '%s\n' "$st" | tr ' ' '\n' | sed -n 's/^jobs=//p')
+    if [ "$has_simd" = 1 ]; then
+        case "$where/$floor" in
+            simd/* | aarch64/neon) [ "${sj:-0}" -gt 0 ] || fail "pruning filtered no rescue job at $label (SIMD floor '$floor'): $st" ;;
+            *) [ "${sj:-0}" -eq 0 ] || fail "x86 pruned at $label, which only the scalar filter decides: $st" ;;
+        esac
+    fi
+    sc_note="$sc_note; $label: jobs=${sj:-0}"
+}
+check_scoring "-B 6" simd -B 6
+check_scoring "-O 8 -E 2" aarch64 -O 8 -E 2
 
 # Forced tiers: the reference and default legs under each listed tier the host
 # has must equal the unforced reference. Ranked against the dispatcher's own
@@ -345,7 +381,7 @@ if [ "$jobs" -eq 0 ]; then
     # above held vacuously.
     [ "$has_simd" = 0 ] \
         || fail "pruning filtered no rescue job, though this build (SIMD floor '$floor') has the SIMD filter: $stats"
-    echo "PASS: rescue_prune_identity (11-op cell, NEON-form defaults and dedup shortcuts == reference at -t 1 and -t 4; $dstats$tier_note$k25_note)"
+    echo "PASS: rescue_prune_identity (11-op cell, NEON-form defaults and dedup shortcuts == reference at -t 1 and -t 4; $dstats$tier_note$k25_note$sc_note)"
     echo "SKIP: pruning does not run in this build (SIMD floor $floor, below the SIMD filter's avx2); its legs held trivially"
     exit 0
 fi
@@ -373,4 +409,4 @@ p1stats="$(grep '^\[RESCUE_BAND\]' prune.t1.err || true)"
 p1=$(printf '%s\n' "$p1stats" | tr ' ' '\n' | sed -n 's/^pass1_banded=//p')
 [ "${p1:-0}" -gt 0 ] || fail "no banded pass-1 (start recovery) job at the defaults: $p1stats"
 
-echo "PASS: rescue_prune_identity (11-op cell, NEON-form defaults, dedup shortcuts, hull, pruned and banded == reference at -t 1 and -t 4; $dstats$tier_note$k25_note; $stats; $bstats)"
+echo "PASS: rescue_prune_identity (11-op cell, NEON-form defaults, dedup shortcuts, hull, pruned and banded == reference at -t 1 and -t 4; $dstats$tier_note$k25_note$sc_note; $stats; $bstats)"

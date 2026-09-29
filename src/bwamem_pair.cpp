@@ -405,20 +405,35 @@ static bool rescue_repeat_enabled()
     return on;
 }
 
-/* Whether the exact shortcuts can run in this run: they are on, the rescue is non-meth, and the
- * scoring is one rescue_prune_scoring_ok admits (rescue_prune.h; banded pass 1's band is derived
- * for it too). Banded pass 1 needs nothing more; pruning adds rescue_prune_runs' cost gate. */
+/* Whether the exact shortcuts can run in this run at all: they are on and the rescue is non-meth.
+ * Pruning adds a scoring the lemma holds for and its cost gate (rescue_prune_runs); banded pass 1
+ * adds the scoring the band kernels are derived for (rescue_band_runs). */
 static bool rescue_exact_runs(const mem_opt_t *opt)
 {
-    return rescue_prune_on() && !opt->meth_mode
-        && rescue_prune_scoring_ok(opt->a, opt->b, opt->o_del, opt->e_del, opt->o_ins, opt->e_ins);
+    return rescue_prune_on() && !opt->meth_mode;
 }
 
-/* Whether pruning can narrow any rescue window in this run: rescue_exact_runs, and the cost gate
- * (rescue_prune_cost_ok in rescue_prune.h: on x86, not at the AVX-512BW tier from -k 25 up). Keys
- * the length sort and the narrow-offset record / read (each OR'd with --rescue-kmer, which narrows
- * on its own), so a run that cannot prune runs the pre-pruning rescue path, apart from banded pass 1
- * where rescue_exact_runs allows it. */
+/* The pruning parameters for this run's scoring and threshold (min_seed_len * a).
+ * rescue_prune_params::from checks the lemma's validity conditions, including minsc > (K - 1) a. */
+static rescue_prune_params rescue_prune_params_for(const mem_opt_t *opt)
+{
+    return rescue_prune_params::from(opt->a, opt->b, opt->o_del, opt->e_del, opt->o_ins, opt->e_ins,
+                                     opt->min_seed_len * opt->a);
+}
+
+/* Whether banded pass 1 can run in this run: rescue_exact_runs, at the default scoring, the only one
+ * the band kernels and the pass-1 band bound are derived for. */
+static bool rescue_band_runs(const mem_opt_t *opt)
+{
+    return rescue_exact_runs(opt) && rescue_prune_params_for(opt).default_scoring();
+}
+
+/* Whether pruning can narrow any rescue window in this run: rescue_exact_runs, a scoring the lemma
+ * holds for (rescue_prune_params::valid), and the cost gate (rescue_prune_cost_ok in
+ * rescue_prune.h: on x86, only where the SIMD filter runs and not at the AVX-512BW tier from -k 25
+ * up). Keys the length sort and the narrow-offset record / read (each OR'd with --rescue-kmer, which
+ * narrows on its own), so a run that cannot prune runs the pre-pruning rescue path, apart from
+ * banded pass 1 where rescue_band_runs allows it. */
 static bool rescue_prune_runs(const mem_opt_t *opt)
 {
     /* The kswv tier, read once; bwamem3_simd_init is idempotent and fixes it, as in rb_cost_pct. */
@@ -426,15 +441,18 @@ static bool rescue_prune_runs(const mem_opt_t *opt)
         bwamem3_simd_init();
         return bwamem3_simd_tier() == BWAMEM3_TIER_AVX512BW;
     }();
-    return rescue_prune_cost_ok(opt->min_seed_len * opt->a, avx512) && rescue_exact_runs(opt);
+    const rescue_prune_params p = rescue_prune_params_for(opt);
+    return rescue_exact_runs(opt) && p.valid && rescue_prune_cost_ok(p, avx512);
 }
 
-/* Whether pruning applies to one rescue job: the run can prune, --rescue-kmer is off, and the job
- * is on the 8-bit kernel path (the hull bound assumes that path's query padding,
- * kswv_query_quantum8). Everything else runs the full window. */
-static bool rescue_prune_applies(const mem_opt_t *opt, int xtra)
+/* Whether pruning applies to one rescue job, with its parameters in *pp: the run can prune,
+ * --rescue-kmer is off, and the job is on the 8-bit kernel path (the hull bound assumes that path's
+ * query padding, kswv_query_quantum8). Everything else runs the full window. */
+static bool rescue_prune_applies(const mem_opt_t *opt, int xtra, rescue_prune_params *pp)
 {
-    return rescue_prune_runs(opt) && !opt->rescue_kmer && (xtra & KSW_XBYTE);
+    if (!rescue_prune_runs(opt) || opt->rescue_kmer || !(xtra & KSW_XBYTE)) return false;
+    *pp = rescue_prune_params_for(opt);
+    return true;
 }
 
 /* The oriented mate as the rescue SW sees it: the read itself, or its reverse complement (N,
@@ -1169,10 +1187,10 @@ int mem_sam_pe_batch(const mem_opt_t *opt, mem_cache *mmc,
     /* Banded pass 1 beyond the banded parents: needs the default scoring on both gap types (its
      * band bound is derived for it) and non-meth (the band kernel has no freed-cell matrix; this
      * point is also reached under --meth when the batched meth rescue is off) -- both part of
-     * rescue_exact_runs, which also keeps BWA3_RESCUE_PRUNE=0 the whole pre-pruning path -- and
+     * rescue_band_runs, which also keeps BWA3_RESCUE_PRUNE=0 the whole pre-pruning path -- and
      * the banding path (a NEON or AVX2 band kernel; off under BWA3_RESCUE_BAND=0). It does not
-     * depend on pruning's x86 cost gate: the pass-1 band comes from the pass-0 result alone. */
-    const bool p1_band_any = rescue_exact_runs(opt) && rescue_band_enabled();
+     * depend on pruning's cost gate: the pass-1 band comes from the pass-0 result alone. */
+    const bool p1_band_any = rescue_band_runs(opt) && rescue_band_enabled();
     if (p1_band_any) band_reset.b = &matesw_band(mmc, tid);   // pass 1 needs a batch even with no plan
     mem_sam_pe_batch_run(pwsw.get(), seqPairArray, seqBufRef, seqBufQer,
                          aln, pcnt, pcnt8, nthreads, n_banded, band_reset.b, p1_band_any);
@@ -1741,7 +1759,8 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
              * ref/rb/re exactly like --rescue-kmer's narrowing, so only the sub-window is copied
              * and _post applies the same offset. The oriented mate is built once here and reused
              * for the staging copy below. */
-            const bool pruned = rescue_prune_applies(opt, xtra);
+            rescue_prune_params pp;
+            const bool pruned = rescue_prune_applies(opt, xtra, &pp);
             if (g_rescue_prune_stats.on && !(xtra & KSW_XBYTE)) g_rescue_prune_stats.jobs16++;
             static thread_local std::vector<uint8_t> oq;   // oriented mate; grows, never shrinks
             /* The last filtered jobs this thread enqueued, by the filter's key of their inputs and
@@ -1759,10 +1778,8 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                 int hb, he;
                 rescue_prune_view view;
                 const uint64_t tf0 = g_rescue_prune_stats.on ? rescue_now_ns() : 0;
-                const int kind = rescue_prune_window(ref, (int)(re - rb), oq.data(), l_ms,
-                                                     opt->min_seed_len * opt->a,
-                                                     rescue_prune_max_hits(), &hb, &he,
-                                                     &view);
+                const int kind = rescue_prune_window(ref, (int)(re - rb), oq.data(), l_ms, pp,
+                                                     rescue_prune_max_hits(), &hb, &he, &view);
                 /* A job repeating one of the last filtered ones byte for byte (the same mate
                  * against an identical window, which anchors in identical repeat copies produce)
                  * has that job's kswv result: the kernel is a function of the staged bytes, the
@@ -1789,10 +1806,10 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                             reuse = j;
                     }
                 }
-                /* Banding plan (rescue_band.h), bound to this pair's regid at enqueue (commit).
-                 * rescue_prune_applies() has checked the scoring the band kernel is derived for. */
-                if (kind == RESCUE_PRUNE_B2 && reuse < 0 && rescue_band_enabled())
-                    matesw_band(mmc, tid).plan(view, (int)(re - rb), l_ms, hb, he, opt->min_seed_len * opt->a);
+                /* Banding plan (rescue_band.h), bound to this pair's regid at enqueue (commit). The
+                 * band kernels are derived for the default scoring only. */
+                if (kind == RESCUE_PRUNE_B2 && reuse < 0 && rescue_band_enabled() && pp.default_scoring())
+                    matesw_band(mmc, tid).plan(view, (int)(re - rb), l_ms, hb, he, pp.minsc);
                 if (g_rescue_prune_stats.on) g_rescue_prune_stats.ns_filter += rescue_now_ns() - tf0;
                 if (g_rescue_prune_stats.on) {
                     g_rescue_prune_stats.jobs++;

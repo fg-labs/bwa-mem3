@@ -12,6 +12,9 @@
 //        - B2 (hull [hb, he]): whenever the full window reaches the threshold,
 //          the full window and the hull alone agree on score, qe, te, tb, qb
 //          and score2 (te/tb shifted by hb).
+//      The same at other scorings the lemma admits (rescue_prune_params):
+//      -B 6, -O 8 -E 2, split gap costs and -A 2 -B 8 -O 12 -E 2, and the
+//      refused ones (-B 3, a cheap insertion) keep every window in full.
 //   2. The guard exits the lemma depends on: any N, a threshold below 5, and a
 //      query or window beyond the scratch capacity all return FULL.
 //   3. Where a SIMD filter is compiled in (NEON on aarch64, the SSE4.1 / SSSE3
@@ -33,6 +36,7 @@
 #include <cstring>
 #include <memory>
 #include <random>
+#include <string>
 #include <vector>
 
 #include "doctest/doctest.h"
@@ -47,7 +51,7 @@ namespace {
 constexpr int kSimdMinsc = 19;       // min_seed_len * a at the defaults
 constexpr int kDefaultMaxHits = 400; // BWA3_RESCUE_PRUNE_MAX_HITS default
 constexpr int kNoGate = 1 << 30;
-constexpr int kGapOpen = 6, kGapExtend = 1;  // the only gaps the pruning lemma is derived for
+constexpr int kGapOpen = 6, kGapExtend = 1;  // the default gap costs
 constexpr uint8_t kN = 4;
 
 struct Job {
@@ -153,15 +157,16 @@ std::vector<Job> build_n_jobs(std::mt19937 &rng)
     return jobs;
 }
 
-// ksw_align2 at the rescue settings for threshold `minsc`. It reverses its
-// target in place for the start pass, so both sequences are copied per call.
-kswr_t scalar_sw(const std::vector<uint8_t> &q, const uint8_t *ref, int len1, int minsc,
+// ksw_align2 at the rescue settings for threshold p.minsc and p's gap costs
+// (the matrix carries a and b). It reverses its target in place for the start
+// pass, so both sequences are copied per call.
+kswr_t scalar_sw(const std::vector<uint8_t> &q, const uint8_t *ref, int len1, const rescue_prune_params &p,
                  const bwa_tests::ScoringMatrix &mat)
 {
     std::vector<uint8_t> qq(q), rr(ref, ref + len1);
-    const int xtra = KSW_XSUBO | KSW_XSTART | KSW_XBYTE | minsc;
+    const int xtra = KSW_XSUBO | KSW_XSTART | KSW_XBYTE | p.minsc;
     return ksw_align2((int)qq.size(), qq.data(), len1, rr.data(), 5, mat.data(),
-                      kGapOpen, kGapExtend, kGapOpen, kGapExtend, xtra, nullptr);
+                      p.o_del, p.e_del, p.o_ins, p.e_ins, xtra, nullptr);
 }
 
 bool has_n(const std::vector<uint8_t> &seq)
@@ -199,10 +204,11 @@ long count_hits(const Job &jb)
 struct Tally { int b1 = 0, b2 = 0, full = 0; };
 
 // ksw_align2 over one job's full window, and over its last B2 hull, at one
-// threshold: each computed at most once however many hit gates the job is
-// checked under (the gate changes the decision, never the oracle).
+// scoring and threshold: each computed at most once however many hit gates the
+// job is checked under (the gate changes the decision, never the oracle).
 struct Oracle {
     const Job &jb;
+    const rescue_prune_params p;
     const int minsc;
     const bwa_tests::ScoringMatrix &mat;
     bool have_full = false;
@@ -210,11 +216,14 @@ struct Oracle {
     int sub_hb = -1, sub_he = -1;
     kswr_t sub{};
 
-    Oracle(const Job &j, int m, const bwa_tests::ScoringMatrix &sm) : jb(j), minsc(m), mat(sm) {}
+    Oracle(const Job &j, int m, const bwa_tests::ScoringMatrix &sm)
+        : jb(j), p(rescue_prune_params::defaults(m)), minsc(m), mat(sm) {}
+    Oracle(const Job &j, const rescue_prune_params &sp, const bwa_tests::ScoringMatrix &sm)
+        : jb(j), p(sp), minsc(sp.minsc), mat(sm) {}
     const kswr_t &full_window()
     {
         if (!have_full) {
-            full = scalar_sw(jb.q, jb.ref.data(), (int)jb.ref.size(), minsc, mat);
+            full = scalar_sw(jb.q, jb.ref.data(), (int)jb.ref.size(), p, mat);
             have_full = true;
         }
         return full;
@@ -222,7 +231,7 @@ struct Oracle {
     const kswr_t &hull(int hb, int he)
     {
         if (hb != sub_hb || he != sub_he) {
-            sub = scalar_sw(jb.q, jb.ref.data() + hb, he - hb + 1, minsc, mat);
+            sub = scalar_sw(jb.q, jb.ref.data() + hb, he - hb + 1, p, mat);
             sub_hb = hb;
             sub_he = he;
         }
@@ -237,7 +246,8 @@ void check_against_oracle(int max_hits, Oracle &o, Tally &t)
     const int minsc = o.minsc;
     const int len1 = (int)jb.ref.size(), len2 = (int)jb.q.size();
     int hb = -2, he = -2;
-    const int kind = rescue_prune_window(jb.ref.data(), len1, jb.q.data(), len2, minsc, max_hits, &hb, &he);
+    const int kind = rescue_prune_window(jb.ref.data(), len1, jb.q.data(), len2, o.p, max_hits, &hb, &he);
+    CAPTURE(o.p.a); CAPTURE(o.p.b); CAPTURE(o.p.o_del); CAPTURE(o.p.e_del); CAPTURE(o.p.o_ins); CAPTURE(o.p.e_ins);
     CAPTURE(jb.tag); CAPTURE(len1); CAPTURE(len2); CAPTURE(minsc); CAPTURE(max_hits); CAPTURE(kind);
     if (kind == RESCUE_PRUNE_FULL) { ++t.full; return; }
     const kswr_t &full = o.full_window();
@@ -299,6 +309,52 @@ TEST_CASE("rescue prune: B1 and B2 decisions reproduce every consumed ksw_align2
         MESSAGE("threshold " << other_minsc[k] << ": B1=" << t[k].b1 << " B2=" << t[k].b2
                              << " FULL=" << t[k].full);
         CHECK(t[k].b2 > 0);
+    }
+}
+
+// Other scorings: the lemma with K-mers, the charge c and the tail scaled to the deletion costs
+// (rescue_prune_params). Each job is checked at one scoring in rotation, at the default -k 19
+// (minsc = 19 a), which keeps the case inside the unit-test time budget; mates that leave the 8-bit
+// kernels at a = 2 (len2 * a + b > 254) are skipped, since pruning only sees 8-bit jobs. The
+// scorings the lemma refuses must keep every window in full.
+TEST_CASE("rescue prune: decisions at other scorings reproduce every consumed ksw_align2 field"
+          * doctest::test_suite("unit/pair")) {
+    std::mt19937 rng(4242);
+    const auto jobs = build_jobs(rng);
+    struct Sc { int a, b, o_del, e_del, o_ins, e_ins; const char *name; };
+    const Sc admitted[4] = {{1, 6, 6, 1, 6, 1, "-B 6"}, {1, 4, 8, 2, 8, 2, "-O 8 -E 2"},
+                            {1, 4, 6, 1, 7, 2, "-O 6,7 -E 1,2"}, {2, 8, 12, 2, 12, 2, "-A 2 -B 8 -O 12 -E 2"}};
+    const Sc refused[2] = {{1, 3, 6, 1, 6, 1, "-B 3"}, {1, 4, 6, 1, 2, 1, "-O 6,2 -E 1"}};
+    Tally t[4];
+    for (size_t i = 0; i < jobs.size(); i++) {
+        const Sc &s = admitted[i % 4];
+        const std::string name(s.name);
+        CAPTURE(name);
+        if ((int)jobs[i].q.size() * s.a + s.b > 254) continue;
+        const rescue_prune_params p = rescue_prune_params::from(s.a, s.b, s.o_del, s.e_del, s.o_ins, s.e_ins,
+                                                                kSimdMinsc * s.a);
+        REQUIRE(p.valid);
+        const auto mat = bwa_tests::build_scoring_matrix(s.a, s.b, 1);
+        Oracle o(jobs[i], p, mat);
+        check_against_oracle(kNoGate, o, t[i % 4]);
+    }
+    for (int k = 0; k < 4; k++) {
+        const std::string name(admitted[k].name);
+        CAPTURE(name);
+        MESSAGE(std::string(admitted[k].name) << ": B1=" << t[k].b1 << " B2=" << t[k].b2 << " FULL=" << t[k].full);
+        CHECK(t[k].b1 > 0);
+        CHECK(t[k].b2 > 0);
+    }
+    for (const Sc &s : refused) {
+        const std::string name(s.name);
+        CAPTURE(name);
+        const rescue_prune_params p = rescue_prune_params::from(s.a, s.b, s.o_del, s.e_del, s.o_ins, s.e_ins,
+                                                                kSimdMinsc * s.a);
+        CHECK(!p.valid);
+        int hb = -2, he = -2;
+        for (size_t i = 0; i < jobs.size(); i += 7)
+            CHECK(rescue_prune_window(jobs[i].ref.data(), (int)jobs[i].ref.size(), jobs[i].q.data(),
+                                      (int)jobs[i].q.size(), p, kNoGate, &hb, &he) == RESCUE_PRUNE_FULL);
     }
 }
 

@@ -216,13 +216,18 @@ generated jobs.
   A job proven unable to reach the rescue threshold (`min_seed_len * a`) is not
   run and takes the ordinary failing-rescue path; otherwise only the rows that
   can hold an alignment at that threshold are computed, which reproduces every
-  field the rescue consumes (score, positions, suboptimal score). Derived for the
-  default scoring only (`-A 1 -B 4 -O 6 -E 1`); other scorings, `--meth`,
-  `--rescue-kmer`, windows or mates with an N, and the 16-bit path keep the full
-  window. It runs where a SIMD filter carries it: on aarch64 (NEON) and on the
-  x86 AVX2 and AVX-512BW builds (an SSE4.1 / SSSE3 port of the filter), at every
-  seed length except at the AVX-512BW kswv tier from `-k 25` up, where the
-  64-lane kswv is cheap enough that the filter costs more than it saves.
+  field the rescue consumes (score, positions, suboptimal score). Derived for any
+  scoring whose mismatch and gaps each cost at least four matches (the default
+  `-A 1 -B 4 -O 6 -E 1`, and for example `-B 6` or `-O 8 -E 2`; the bound then
+  counts exact 5-mers); other scorings, `--meth`, `--rescue-kmer`, windows or
+  mates with an N, and the 16-bit path keep the full window. It runs where a
+  SIMD filter carries it: on aarch64 (NEON) and on the x86 AVX2 and AVX-512BW
+  builds (an SSE4.1 / SSSE3 port of the filter), at every seed length except at
+  the AVX-512BW kswv tier from `-k 25` up, where the 64-lane kswv is cheap
+  enough that the filter costs more than it saves. The SIMD filters cover the
+  admitted scorings with `-A 1` and deletion costs `-O 6 -E 1` (for example
+  `-B 6`, or `-O 6,7 -E 1,2`); the others run a scalar filter, which pays on
+  aarch64 but not against x86's kswv, so x86 keeps the full window there.
   Elsewhere the full window is always computed.
   (x86: [#538](https://github.com/fg-labs/bwa-mem3/pull/538))
 - **Banded rescue DP (NEON, AVX2).** For a narrowed job, the rescue DP runs only
@@ -231,7 +236,7 @@ generated jobs.
   score, end positions and suboptimal score are reassembled from the bands'
   per-row maxima. A per-job
   cost model keeps the full hull when banding would not pay. Same scope as the
-  pruning (default scoring, 8-bit, no `--meth`).
+  pruning, at the default scoring only (8-bit, no `--meth`).
   (AVX2: [#538](https://github.com/fg-labs/bwa-mem3/pull/538))
 - **Banded start recovery (NEON, AVX2).** The second rescue pass, which finds where
   the best alignment starts, runs in a diagonal band derived from the first

@@ -58,8 +58,8 @@
  * kswv phase 1.
  *
  * Scope: the NEON kernel (aarch64, 16 lanes) and the AVX2 kernel (x86, 32 lanes,
- * rescue_band_kernel_x86.h); jobs rescue_prune_applies() prunes (default scoring,
- * 8-bit, non-meth, on x86 not at the AVX-512BW tier with -k 25 or above) with minsc in [5, 255]
+ * rescue_band_kernel_x86.h); jobs rescue_prune_applies() prunes at the default scoring (8-bit,
+ * non-meth, on x86 not at the AVX-512BW tier with -k 25 or above) with minsc in [5, 255]
  * (plan()). Without a SIMD kernel the hull path runs.
  * Env: the BWA3_RESCUE_BAND* knobs and BWA3_RESCUE_PRUNE_STATS, listed with their defaults in
  * rescue_env.h.
@@ -101,9 +101,9 @@ class RescueBandBatch {
 public:
     /* Plan the bands of a B2 hull [hb, he] of a full window of len1 rows against a query of len2.
      * v must be the view rescue_prune_window returned with that decision. The caller guarantees
-     * the scoring the band kernel is derived for (rescue_prune_scoring_ok: the kernel hard-codes
-     * match 1, mismatch -4, N -1 and gap 6 + 1, and kswv's bias 4) and the 8-bit path; in the
-     * aligner both come from rescue_prune_applies. Returns true when banding is chosen (the
+     * the scoring the band kernel is derived for (rescue_prune_params::default_scoring: the kernel
+     * hard-codes match 1, mismatch -4, N -1 and gap 6 + 1, and kswv's bias 4) and the 8-bit path; in
+     * the aligner the caller checks the first and rescue_prune_applies the second. Returns true when banding is chosen (the
      * cost model says it beats kswv on the hull); commit() then binds it to the pair's regid. */
     bool plan(const rescue_prune_view &v, int len1, int len2, int hb, int he, int minsc);
     /* Bind the pending plan (or "not banded") to regid. Call for every enqueued pair. */
