@@ -329,12 +329,12 @@ static bool rescue_prune_enabled()
     return on;
 }
 /* The hit gate: BWA3_RESCUE_PRUNE_MAX_HITS, else rescue_prune_max_hits_default (rescue_prune.h,
- * which the band harness shares). */
-static int rescue_prune_max_hits()
+ * which the band harness shares). Run-constant; the caller reads it once per call. */
+static int rescue_prune_max_hits(const mem_opt_t *opt)
 {
     static const int env = rescue_env_int("BWA3_RESCUE_PRUNE_MAX_HITS", -1);
     if (env >= 0) return env;
-    return rescue_prune_max_hits_default(rescue_band_enabled());
+    return rescue_prune_max_hits_default(rescue_band_enabled(), opt->meth_mode != 0);
 }
 /* Whether the exact rescue shortcuts are built and enabled at all: they need a SIMD filter (NEON on
  * aarch64, its SSE4.1 / SSSE3 port on the AVX2 and AVX-512 builds; RESCUE_PRUNE_HAVE_SIMD), since
@@ -1672,6 +1672,7 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
      * scoring, so the batch takes it here. */
     const rescue_prune_params run_pp = rescue_prune_params_for(opt);
     const bool run_prunes = rescue_prune_runs(opt, run_pp);
+    const int run_max_hits = run_prunes ? rescue_prune_max_hits(opt) : 0;
     /* --meth: the pair's hypothesis (as tagged at enqueue: 1 OT, 0 OB) selects the conversion the
      * filter applies (rescue_prune_params::set_meth); both parameter sets are made here, once. */
     rescue_prune_params run_pp_ot = run_pp, run_pp_ob = run_pp;
@@ -1845,7 +1846,7 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                 rescue_prune_view view;
                 const uint64_t tf0 = g_rescue_prune_stats.on ? rescue_now_ns() : 0;
                 const int kind = rescue_prune_window(ref, (int)(re - rb), oq.data(), l_ms, pp,
-                                                     rescue_prune_max_hits(), &hb, &he, &view);
+                                                     run_max_hits, &hb, &he, &view);
                 /* A job repeating one of the last filtered ones byte for byte (the same mate
                  * against an identical window, which anchors in identical repeat copies produce)
                  * has that job's kswv result: the kernel is a function of the staged bytes, the

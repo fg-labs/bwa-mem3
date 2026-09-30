@@ -4,7 +4,7 @@
 | Variable | Default | Read in | Meaning |
 |---|---|---|---|
 | `BWA3_RESCUE_PRUNE` | `1` | `src/bwamem_pair.cpp` | exact K-mer pruning of rescue windows (aarch64 and x86 AVX2 / AVX-512BW builds; scope: rescue-pruning.md); 0 also turns the banded passes off |
-| `BWA3_RESCUE_PRUNE_MAX_HITS` | `auto` | `src/bwamem_pair.cpp` | keep the full window above this many 5-mer hits; auto is 1000 on aarch64 with banding on, else 400 |
+| `BWA3_RESCUE_PRUNE_MAX_HITS` | `auto` | `src/bwamem_pair.cpp` | keep the full window above this many 5-mer hits; auto is 1000 on aarch64 with banding on and no --meth, else 400 |
 | `BWA3_RESCUE_PRUNE_STATS` | `0` | `src/bwamem_pair.cpp`, `src/rescue_band.cpp` | 1 prints the RESCUE_PRUNE and RESCUE_BAND counters and stage times at exit |
 | `BWA3_RESCUE_DEDUP_SKIP` | `1` | `src/bwamem_pair.cpp` | skip a post-rescue dedup proven to be a no-op, and add a single new region in one pass where that is provably exact |
 | `BWA3_RESCUE_REPEAT` | `1` | `src/bwamem_pair.cpp` | a rescue job repeating one of the last eight filtered jobs byte for byte reads that job's result instead of being enqueued again |

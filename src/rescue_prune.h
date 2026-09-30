@@ -342,24 +342,23 @@ static inline uint64_t rescue_prune_memo_hits()
 #endif
 }
 
-/* The default hit gate (BWA3_RESCUE_PRUNE_MAX_HITS unset), for a run with banding on or off: 400
- * for the hull path. On aarch64, 1000 when banding is on: banding turns more of the pruned windows
- * into savings, which pays for the filter on the denser windows (best of {400, 1000, 3000, 10^4,
- * 10^9} measured on WGS-like data at minsc 19). The SIMD filter runs at every minsc, so the gate
- * does not depend on it. The gate keys on the banding switch alone, not on whether this run's
- * pruned windows get banded: --meth pruning runs (whose pruned windows are never banded) and
- * scorings the scalar filter decides (a > 16) take 1000 on aarch64 too. The --meth figures in
- * rescue_prune_cost_ok are whole runs at the default gate; 400 for those runs has not been
- * measured. On x86, 400 with banding too: the x86 kswv kernels are cheap enough that the extra
- * filter work on dense windows does not pay (prune + band, wall, 1000 vs 400: Zen 3 AVX2 wgs-5M
- * 74.52 vs 73.57 s, wes-5M 38.57 vs 37.65 s; Zen 5 AVX-512 wgs-5M 27.53 vs 26.73 s). Output is
- * identical at every value. */
-static inline int rescue_prune_max_hits_default(bool banding)
+/* The default hit gate (BWA3_RESCUE_PRUNE_MAX_HITS unset), for a run with banding on or off, under
+ * --meth (meth) or not: 400 for the hull path. On aarch64, 1000 when banding is on and the run's
+ * pruned windows can be banded (no --meth): banding turns more of the pruned windows into savings,
+ * which pays for the filter on the denser windows (best of {400, 1000, 3000, 10^4, 10^9} measured on
+ * WGS-like data at minsc 19). The SIMD filter runs at every minsc, so the gate does not depend on
+ * it, and scorings the scalar filter decides (a > 16) take 1000 on aarch64 too. A --meth pruning run
+ * never bands its pruned windows (rescue_band_meth_on), so it takes 400 (Graviton 4, EM-seq panel
+ * 5 M pairs, wall, 400 vs 1000: genomic -3.3 %, collapsed -B 4 flat). On x86, 400 with banding too:
+ * the x86 kswv kernels are cheap enough that the extra filter work on dense windows does not pay
+ * (prune + band, wall, 1000 vs 400: Zen 3 AVX2 wgs-5M 74.52 vs 73.57 s, wes-5M 38.57 vs 37.65 s;
+ * Zen 5 AVX-512 wgs-5M 27.53 vs 26.73 s). Output is identical at every value. */
+static inline int rescue_prune_max_hits_default(bool banding, bool meth)
 {
 #if defined(__aarch64__)
-    return banding ? 1000 : 400;
+    return banding && !meth ? 1000 : 400;
 #else
-    (void)banding;
+    (void)banding; (void)meth;
     return 400;
 #endif
 }

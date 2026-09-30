@@ -689,6 +689,23 @@ TEST_CASE("rescue prune: the cost gate per architecture, --meth chemistry and ks
     }
 }
 
+// The default hit gate (rescue_prune_max_hits_default): like the cost gate, every value gives the
+// same output, so it is pinned here. aarch64 takes 1000 only where banding can turn the pruned
+// windows into savings (banding on, no --meth); everything else, and all of x86, takes 400.
+TEST_CASE("rescue prune: the default hit gate per architecture, banding and --meth"
+          * doctest::test_suite("unit/pair")) {
+    for (const bool banding : {false, true})
+        for (const bool meth : {false, true}) {
+            CAPTURE(banding);
+            CAPTURE(meth);
+#if defined(__aarch64__)
+            CHECK(rescue_prune_max_hits_default(banding, meth) == (banding && !meth ? 1000 : kDefaultMaxHits));
+#else
+            CHECK(rescue_prune_max_hits_default(banding, meth) == kDefaultMaxHits);
+#endif
+        }
+}
+
 // kswv's 8-bit kernels load each gap type's open plus extend as a byte, so a sum past 255 wraps there
 // and neither pruning nor the band kernels may take such a scoring (kswv8_scoring_ok).
 TEST_CASE("rescue prune: scorings past kswv's 8-bit gap byte are refused"
