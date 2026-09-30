@@ -19,10 +19,11 @@
  * docs/src/whats-different/performance.md. Design notes: docs/src/developer-guide/rescue.md.
  *
  * rescue-knobs:begin
- * BWA3_RESCUE_PRUNE           1     exact 5-mer pruning of rescue windows (aarch64); 0 also turns
- *                                   the banded passes off
+ * BWA3_RESCUE_PRUNE           1     exact 5-mer pruning of rescue windows (aarch64; x86 at the
+ *                                   default -k 19); 0 also turns the banded passes off
  * BWA3_RESCUE_PRUNE_MAX_HITS  auto  keep the full window above this many 5-mer hits; auto is 1000
- *                                   where banding runs at the NEON filter's threshold, else 400
+ *                                   on aarch64 where banding runs at the SIMD filter's threshold,
+ *                                   else 400
  * BWA3_RESCUE_PRUNE_STATS     0     1 prints the RESCUE_PRUNE and RESCUE_BAND counters and stage
  *                                   times at exit
  * BWA3_RESCUE_DEDUP_SKIP      1     skip a post-rescue dedup proven to be a no-op, and add a
@@ -36,9 +37,11 @@
  * BWA3_RESCUE_ROWPAIR         1     NEON kswv (8- and 16-bit): sweep two target rows per pass
  * BWA3_RESCUE_LAZYQE          1     NEON kswv two-row sweep: recover the query end after the row
  *                                   instead of inline
- * BWA3_RESCUE_BAND            1     run pruned rescue jobs as diagonal bands (aarch64)
- * BWA3_RESCUE_BAND_COST       85    band a pass-0 parent iff its band cells cost less than this %
- *                                   of the hull's
+ * BWA3_RESCUE_BAND            1     run rescue jobs as diagonal bands (NEON or AVX2 kernel)
+ * BWA3_RESCUE_BAND_COST       auto  band a pass-0 parent iff its band cells cost less than this %
+ *                                   of the hull's; auto is 0 (no pass-0 banding) where kswv runs
+ *                                   at the AVX-512BW tier, whose 64-lane hull undercuts the
+ *                                   32-lane band kernel, else 85
  * BWA3_RESCUE_BAND_R2         1     run round 2 banded (0: kswv on the hull)
  * BWA3_RESCUE_BAND_TIGHT      8     threshold offset of the tight top band (0: off)
  * BWA3_RESCUE_BAND_P1         2     pass-1 banding: 0 none, 1 banded parents only, 2 every
@@ -47,8 +50,7 @@
  *                                   of kswv's
  * BWA3_RESCUE_BAND_KERNEL     2     banded-DP kernel while BWA3_RESCUE_FSCAN is on: 0 original
  *                                   cell, 1 fused cell, 2 fused cell on two rows per step
- * BWA3_RESCUE_BAND_SHIFT      1     shift each lane's band so a 16-lane group's query offsets
- *                                   align
+ * BWA3_RESCUE_BAND_SHIFT      1     shift each lane's band so a lane group's query offsets align
  * rescue-knobs:end */
 #ifndef BWA_MEM3_RESCUE_ENV_H
 #define BWA_MEM3_RESCUE_ENV_H

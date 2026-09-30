@@ -3,7 +3,7 @@
 // Exact mate-rescue pruning (src/rescue_prune.h) must never change a consumed
 // rescue result. Checked on generated jobs (random, mutated copies of the
 // window, planted near-threshold matches with a weaker second copy, tandem
-// repeats, poly-A, tiny lengths, windows past the NEON filter's capacity, and
+// repeats, poly-A, tiny lengths, windows past the SIMD filter's capacity, and
 // N bases in both sequences):
 //
 //   1. Against the independent scalar Smith-Waterman, ksw_align2, at bwa's
@@ -14,10 +14,11 @@
 //          and score2 (te/tb shifted by hb).
 //   2. The guard exits the lemma depends on: any N, a threshold below 5, and a
 //      query or window beyond the scratch capacity all return FULL.
-//   3. On aarch64, the NEON filter (rescue_prune_window at threshold 19)
-//      against the int32 scalar filter (rescue_prune_window_scalar) and, where
-//      it fits, the int16 reference lean(): identical (kind, hb, he).
-//   4. On aarch64, the NEON filter's repeat memo and its component list: a
+//   3. Where a SIMD filter is compiled in (NEON on aarch64, the SSE4.1 / SSSE3
+//      port on x86 AVX2 builds), that filter (rescue_prune_window at threshold
+//      19) against the int32 scalar filter (rescue_prune_window_scalar) and,
+//      where it fits, the int16 reference lean(): identical (kind, hb, he).
+//   4. There too, the SIMD filter's repeat memo and its component list: a
 //      repeated job returns the first call's decision and view, and band
 //      planning's components taken from the filter's list equal a rescan of
 //      the view, at every cap.
@@ -37,10 +38,11 @@
 #include "rescue_band.h"
 #include "rescue_prune.h"
 #include "scoring.h"
+#include "simd_dispatch.h"
 
 namespace {
 
-constexpr int kNeonMinsc = 19;       // min_seed_len * a at the defaults; the NEON filter's threshold
+constexpr int kSimdMinsc = 19;       // min_seed_len * a at the defaults; the SIMD filter's threshold
 constexpr int kDefaultMaxHits = 400; // BWA3_RESCUE_PRUNE_MAX_HITS default
 constexpr int kNoGate = 1 << 30;
 constexpr int kGapOpen = 6, kGapExtend = 1;  // the only gaps the pruning lemma is derived for
@@ -128,7 +130,7 @@ std::vector<Job> build_jobs(std::mt19937 &rng)
         auto q = (rng() & 1) ? mutated_copy(rng, ref, 0, std::min(len1, len2), 0, 0) : random_bases(rng, len2);
         jobs.push_back({std::move(ref), std::move(q), "tiny"});
     }
-    for (int k = 0; k < 3; k++)  // past the NEON filter's capacity (~4000 rows): the scalar filter decides
+    for (int k = 0; k < 3; k++)  // past the SIMD filter's capacity (~4000 rows): the scalar filter decides
         jobs.push_back(planted(rng, 4200 + k * 400, 150, 30));
     return jobs;
 }
@@ -271,7 +273,7 @@ TEST_CASE("rescue prune: B1 and B2 decisions reproduce every consumed ksw_align2
     const auto mat = bwa_tests::default_scoring_matrix();
     Tally t19;
     for (const Job &jb : jobs) {
-        Oracle o(jb, kNeonMinsc, mat);
+        Oracle o(jb, kSimdMinsc, mat);
         for (const int max_hits : {kDefaultMaxHits, kNoGate}) check_against_oracle(max_hits, o, t19);
     }
     MESSAGE("threshold 19: B1=" << t19.b1 << " B2=" << t19.b2 << " FULL=" << t19.full);
@@ -305,7 +307,7 @@ TEST_CASE("rescue prune: N, a threshold below 5 and oversized inputs keep the fu
     for (const Job &jb : build_n_jobs(rng)) {
         CAPTURE(jb.ref.size()); CAPTURE(jb.q.size());
         CHECK(rescue_prune_window(jb.ref.data(), (int)jb.ref.size(), jb.q.data(), (int)jb.q.size(),
-                                  kNeonMinsc, kNoGate, &hb, &he) == RESCUE_PRUNE_FULL);
+                                  kSimdMinsc, kNoGate, &hb, &he) == RESCUE_PRUNE_FULL);
         CHECK(rescue_prune_window(jb.ref.data(), (int)jb.ref.size(), jb.q.data(), (int)jb.q.size(),
                                   10, kNoGate, &hb, &he) == RESCUE_PRUNE_FULL);
     }
@@ -313,17 +315,17 @@ TEST_CASE("rescue prune: N, a threshold below 5 and oversized inputs keep the fu
     CHECK(rescue_prune_window(small.ref.data(), 400, small.q.data(), 120, 4, kNoGate, &hb, &he)
           == RESCUE_PRUNE_FULL);
     const auto long_q = random_bases(rng, rescue_prune_scratch::QCAP + 1);
-    CHECK(rescue_prune_window(small.ref.data(), 400, long_q.data(), (int)long_q.size(), kNeonMinsc, kNoGate,
+    CHECK(rescue_prune_window(small.ref.data(), 400, long_q.data(), (int)long_q.size(), kSimdMinsc, kNoGate,
                               &hb, &he) == RESCUE_PRUNE_FULL);
     const auto long_ref = random_bases(rng, 30001);
-    CHECK(rescue_prune_window(long_ref.data(), (int)long_ref.size(), small.q.data(), 120, kNeonMinsc, kNoGate,
+    CHECK(rescue_prune_window(long_ref.data(), (int)long_ref.size(), small.q.data(), 120, kSimdMinsc, kNoGate,
                               &hb, &he) == RESCUE_PRUNE_FULL);
 }
 
-TEST_CASE("rescue prune: the NEON filter decides exactly as the scalar filters"
+TEST_CASE("rescue prune: the SIMD filter decides exactly as the scalar filters"
           * doctest::test_suite("unit/pair")) {
-#if !defined(__aarch64__)
-    MESSAGE("skipped: the NEON rescue-prune filter is aarch64-only");
+#if !RESCUE_PRUNE_HAVE_SIMD
+    MESSAGE("skipped: no SIMD rescue-prune filter in this build (aarch64, or x86 with AVX2)");
     return;
 #else
     std::mt19937 rng(8675309);
@@ -339,16 +341,16 @@ TEST_CASE("rescue prune: the NEON filter decides exactly as the scalar filters"
             const int len1 = (int)jb.ref.size(), len2 = (int)jb.q.size();
             CAPTURE(jb.tag); CAPTURE(i); CAPTURE(len1); CAPTURE(len2); CAPTURE(max_hits);
             int hb = -2, he = -2, shb = -2, she = -2;
-            const int kind = rescue_prune_window(jb.ref.data(), len1, jb.q.data(), len2, kNeonMinsc, max_hits,
+            const int kind = rescue_prune_window(jb.ref.data(), len1, jb.q.data(), len2, kSimdMinsc, max_hits,
                                                  &hb, &he);
-            const int skind = rescue_prune_window_scalar(jb.ref.data(), len1, jb.q.data(), len2, kNeonMinsc,
+            const int skind = rescue_prune_window_scalar(jb.ref.data(), len1, jb.q.data(), len2, kSimdMinsc,
                                                          max_hits, *scalar, &shb, &she);
             CHECK(kind == skind);
             if (kind == RESCUE_PRUNE_B2 && skind == RESCUE_PRUNE_B2) {
                 CHECK(hb == shb);
                 CHECK(he == she);
             }
-            // lean() is the int16 reference the NEON rewrite was derived from; it has no hit gate,
+            // lean() is the int16 reference the SIMD filters were derived from; it has no hit gate,
             // no N guard, a fixed capacity and int16 sums, so compare it only without the gate, on
             // N-free jobs (the filters refuse the rest, checked above), where it fits, and below
             // 32000 hits.
@@ -371,17 +373,17 @@ TEST_CASE("rescue prune: the NEON filter decides exactly as the scalar filters"
 #endif
 }
 
-// The NEON filter's two stateful shortcuts, against the scalar filter:
+// The SIMD filter's two stateful shortcuts, against the scalar filter:
 //   - the hit gate, decided from the per-code occurrence counts before any hit is accumulated:
 //     at max_hits = hits - 1 the job must go to the full window, at max_hits = hits it must be
 //     decided exactly as the scalar filter decides it;
 //   - the per-query cache (query table, presence map, occurrence chains), rebuilt only when the
 //     query bytes change: one query run against several windows in a row, then a different
 //     query of the same length, must be decided exactly as the scalar filter decides each.
-TEST_CASE("rescue prune: the NEON filter's hit gate and query cache match the scalar filter"
+TEST_CASE("rescue prune: the SIMD filter's hit gate and query cache match the scalar filter"
           * doctest::test_suite("unit/pair")) {
-#if !defined(__aarch64__)
-    MESSAGE("skipped: the NEON rescue-prune filter is aarch64-only");
+#if !RESCUE_PRUNE_HAVE_SIMD
+    MESSAGE("skipped: no SIMD rescue-prune filter in this build (aarch64, or x86 with AVX2)");
     return;
 #else
     std::mt19937 rng(24601);
@@ -389,10 +391,10 @@ TEST_CASE("rescue prune: the NEON filter's hit gate and query cache match the sc
     std::unique_ptr<rescue_prune_scratch> scalar(new rescue_prune_scratch());
     auto same_as_scalar = [&](const std::vector<uint8_t> &ref, const std::vector<uint8_t> &q, int max_hits) {
         int hb = -2, he = -2, shb = -2, she = -2;
-        const int kind = rescue_prune_window(ref.data(), (int)ref.size(), q.data(), (int)q.size(), kNeonMinsc,
+        const int kind = rescue_prune_window(ref.data(), (int)ref.size(), q.data(), (int)q.size(), kSimdMinsc,
                                              max_hits, &hb, &he);
         const int skind = rescue_prune_window_scalar(ref.data(), (int)ref.size(), q.data(), (int)q.size(),
-                                                     kNeonMinsc, max_hits, *scalar, &shb, &she);
+                                                     kSimdMinsc, max_hits, *scalar, &shb, &she);
         CHECK(kind == skind);
         if (kind == RESCUE_PRUNE_B2 && skind == RESCUE_PRUNE_B2) {
             CHECK(hb == shb);
@@ -408,7 +410,7 @@ TEST_CASE("rescue prune: the NEON filter's hit gate and query cache match the sc
         if (hits == 0 || hits > 32000) continue;
         CAPTURE(jb.tag); CAPTURE(i); CAPTURE(hits);
         int hb = -2, he = -2;
-        CHECK(rescue_prune_window(jb.ref.data(), (int)jb.ref.size(), jb.q.data(), (int)jb.q.size(), kNeonMinsc,
+        CHECK(rescue_prune_window(jb.ref.data(), (int)jb.ref.size(), jb.q.data(), (int)jb.q.size(), kSimdMinsc,
                                   (int)hits - 1, &hb, &he) == RESCUE_PRUNE_FULL);
         ++gated;
         at_limit += same_as_scalar(jb.ref, jb.q, (int)hits) != RESCUE_PRUNE_FULL;
@@ -431,17 +433,17 @@ TEST_CASE("rescue prune: the NEON filter's hit gate and query cache match the sc
 #endif
 }
 
-// The two shortcuts band planning takes from the NEON filter (src/rescue_prune_neon.h):
+// The two shortcuts band planning takes from the SIMD filter (rescue_prune_neon.h / rescue_prune_x86.h):
 //   - an exact repeat of the previous job returns the previous decision without recomputing it, so
 //     it must return the same (kind, hb, he) and a view with the same components;
 //   - the filter lists its components at MINSC, and rescue_band_components reuses the list for the
 //     whole view instead of rescanning it. With the list hidden (ncomp = -1) it rescans; both must
 //     give the same components and the same success at every cap, including a window with more
 //     components than the filter stores (COMP_CAP) and an output vector that is not empty.
-TEST_CASE("rescue prune: the NEON filter's repeat memo and component list match a rescan"
+TEST_CASE("rescue prune: the SIMD filter's repeat memo and component list match a rescan"
           * doctest::test_suite("unit/pair")) {
-#if !defined(__aarch64__)
-    MESSAGE("skipped: the NEON rescue-prune filter is aarch64-only");
+#if !RESCUE_PRUNE_HAVE_SIMD
+    MESSAGE("skipped: no SIMD rescue-prune filter in this build (aarch64, or x86 with AVX2)");
     return;
 #else
     std::mt19937 rng(314159);
@@ -453,7 +455,7 @@ TEST_CASE("rescue prune: the NEON filter's repeat memo and component list match 
         for (int at = 0; at + 20 <= len1; at += 23) std::copy(q.begin() + 40, q.begin() + 60, ref.begin() + at);
         jobs.push_back({std::move(ref), std::move(q), "many components"});
     }
-    const int comp_cap = rescue_prune_neon::NeonScratch::COMP_CAP;
+    const int comp_cap = rescue_prune_simd_scratch_t::COMP_CAP;
     auto same = [](const std::vector<rb_comp> &x, const std::vector<rb_comp> &y) {
         if (x.size() != y.size()) return false;
         for (size_t c = 0; c < x.size(); c++)
@@ -470,11 +472,11 @@ TEST_CASE("rescue prune: the NEON filter's repeat memo and component list match 
         CAPTURE(jb.tag); CAPTURE(i); CAPTURE(len1); CAPTURE(len2);
         int hb = -2, he = -2, rhb = -2, rhe = -2;
         rescue_prune_view v, rv;
-        const int kind = rescue_prune_window(jb.ref.data(), len1, jb.q.data(), len2, kNeonMinsc, kNoGate,
+        const int kind = rescue_prune_window(jb.ref.data(), len1, jb.q.data(), len2, kSimdMinsc, kNoGate,
                                              &hb, &he, &v);
         // The repeat: same bytes from a different buffer, so only the contents can match.
         const std::vector<uint8_t> ref2(jb.ref), q2(jb.q);
-        const int rkind = rescue_prune_window(ref2.data(), len1, q2.data(), len2, kNeonMinsc, kNoGate,
+        const int rkind = rescue_prune_window(ref2.data(), len1, q2.data(), len2, kSimdMinsc, kNoGate,
                                               &rhb, &rhe, &rv);
         CHECK(rkind == kind);
         CHECK(rhb == hb);
@@ -496,8 +498,8 @@ TEST_CASE("rescue prune: the NEON filter's repeat memo and component list match 
                 CAPTURE(cap); CAPTURE(prefill);
                 listed.assign((size_t)prefill, rb_comp{0, 0, 0, 0, 0});
                 rescanned = listed;
-                const bool ok_l = rescue_band_components(rv, kNeonMinsc, 0, rv.nd, listed, cap);
-                const bool ok_r = rescue_band_components(hidden, kNeonMinsc, 0, hidden.nd, rescanned, cap);
+                const bool ok_l = rescue_band_components(rv, kSimdMinsc, 0, rv.nd, listed, cap);
+                const bool ok_r = rescue_band_components(hidden, kSimdMinsc, 0, hidden.nd, rescanned, cap);
                 CHECK(ok_l == ok_r);
                 CHECK(same(listed, rescanned));
             }
@@ -507,4 +509,17 @@ TEST_CASE("rescue prune: the NEON filter's repeat memo and component list match 
     CHECK(n_b2 > 50);
     CHECK(n_over_cap > 0);
 #endif
+}
+
+TEST_CASE("rescue band: the pass-0 cost gate's default follows the kswv tier"
+          * doctest::test_suite("unit/pair")) {
+    // Where kswv sweeps 64 lanes (the AVX-512BW tier) the 32-lane band kernel cannot undercut the
+    // hull, so the default bands no pass-0 parent there; every other tier keeps the 85 % margin
+    // (rescue_band.cpp, rb_cost_pct). BWA3_RESCUE_BAND_COST overrides either.
+    CHECK(rescue_band_cost_pct_default(BWAMEM3_TIER_AVX512BW) == 0);
+    for (const int tier : {BWAMEM3_TIER_NONE, BWAMEM3_TIER_SSE41, BWAMEM3_TIER_SSE42, BWAMEM3_TIER_AVX,
+                           BWAMEM3_TIER_AVX2, BWAMEM3_TIER_NEON}) {
+        CAPTURE(tier);
+        CHECK(rescue_band_cost_pct_default(tier) == 85);
+    }
 }

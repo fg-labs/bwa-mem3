@@ -22,9 +22,9 @@ All per-batch rescue state lives in `mem_cache`, one slot per tid (`rescue_narro
 
 | Shortcut | Runs when | Turned off by |
 |---|---|---|
-| Exact pruning | aarch64 (`rescue_prune_on`), default scoring (`rescue_prune_scoring_ok`), no `--meth` (`rescue_prune_runs`), 8-bit job, no `--rescue-kmer` (`rescue_prune_applies`) | `BWA3_RESCUE_PRUNE=0` |
-| Banded pass 0 | aarch64 (`rescue_band_enabled`), a pruned job whose band plan beats the hull (`RescueBandBatch::plan`) | `BWA3_RESCUE_BAND=0`, `BWA3_RESCUE_PRUNE=0` |
-| Banded pass 1 | aarch64 (`rescue_band_enabled`), every 8-bit job at the default scoring without `--meth` whose band is cheaper than kswv, narrowed or not (`RescueBandBatch::take_pass1`) | `BWA3_RESCUE_BAND_P1=0`, `BWA3_RESCUE_BAND=0`, `BWA3_RESCUE_PRUNE=0` |
+| Exact pruning | a SIMD filter, so aarch64 or an x86 AVX2 / AVX-512BW build (`rescue_prune_on`), default scoring (`rescue_prune_scoring_ok`), no `--meth` (`rescue_exact_runs`), on x86 only at the default `-k 19` (`rescue_prune_runs`), 8-bit job, no `--rescue-kmer` (`rescue_prune_applies`) | `BWA3_RESCUE_PRUNE=0` |
+| Banded pass 0 | a NEON or AVX2 band kernel (`rescue_band_enabled`), a pruned job whose band plan beats the hull (`RescueBandBatch::plan`) | `BWA3_RESCUE_BAND=0`, `BWA3_RESCUE_PRUNE=0` |
+| Banded pass 1 | a NEON or AVX2 band kernel (`rescue_band_enabled`), every 8-bit job at the default scoring without `--meth` (`rescue_exact_runs`, at any seed length) whose band is cheaper than kswv, narrowed or not (`RescueBandBatch::take_pass1`) | `BWA3_RESCUE_BAND_P1=0`, `BWA3_RESCUE_BAND=0`, `BWA3_RESCUE_PRUNE=0` |
 | 11-op kswv cell | every SIMD kswv body, when the gap costs admit it (`fscan_scoring_ok`) | `BWA3_RESCUE_FSCAN=0` |
 | Dedup skip and one-pass insert | every architecture and scoring | `BWA3_RESCUE_DEDUP_SKIP=0` |
 
@@ -46,8 +46,8 @@ Each shortcut has an argument in its source header and at least one gate that wo
 |---|---|
 | `rescue_prune_identity.sh` | Whole-aligner SAM at `-t 1` and `-t 4` on a generated paired-end fixture, the defaults against a reference with every shortcut and alternative kernel form off (the script's REF_ENV list: `BWA3_RESCUE_PRUNE=0 BWA3_RESCUE_BAND=0 BWA3_RESCUE_DEDUP_SKIP=0 BWA3_RESCUE_REPEAT=0 BWA3_RESCUE_FSCAN=0 BWA3_RESCUE_USQADD=0 BWA3_RESCUE_ROWPAIR=0 BWA3_RESCUE_LAZYQE=0`), on every CI row. Its fixture includes 300 bp mates, so the 16-bit kernels run too, and its stats checks make it fail rather than pass vacuously where a shortcut stops engaging or a leg's switch stops taking effect. Gate: `rescue_prune_identity.sh` |
 | The same script under each forced x86 tier | The kswv rescue kernels differ per tier, so the canonical row reruns the reference and default legs under `BWAMEM3_FORCE_TIER` for every tier the runner has. Gate: `Rescue identity under each forced x86 tier (generated PE fixture)` |
-| `rescue_prune_eq` fuzz | The NEON filter's decisions, view, component list and repeat memo against the scalar filter. Gate: `NEON rescue filter == scalar filter (rescue_prune_eq, generated jobs)` |
-| `rescue_band_harness` eq | Every banded output field against kswv on the full window, under each band knob. Gate: `Banded rescue == kswv (rescue_band_harness, generated jobs)` |
+| `rescue_prune_eq` fuzz | The SIMD filter's decisions, view, component list and repeat memo against the scalar filter: NEON on the ARM64 rows, the x86 port on the x86 rows (built at AVX2 and, where the runner has it, also run at AVX-512BW). Gate: `SIMD rescue filter == scalar filter (rescue_prune_eq, generated jobs)` |
+| `rescue_band_harness` eq | Every banded output field against kswv on the full window, under each band knob: the NEON kernels on the ARM64 rows, the AVX2 kernels on the x86 rows. Gate: `Banded rescue == kswv (rescue_band_harness, generated jobs)` |
 | Unit tests | The filter against `ksw_align2` and the scalar filter, the kswv cells against the scalar reference per tier, and the dedup shortcuts against the full dedup. Gates: `rescue prune: B1 and B2 decisions reproduce every consumed ksw_align2 field`, `kswv u8 rescue: BWA3_RESCUE_FSCAN off == on in every u8 body, and FSCAN matches scalar`, `the mate-rescue dedup's fixed-point skip and single-insert path are byte-identical to the full dedup` |
 
 `rescue_docs_lint.sh` holds these pages to the code: every backticked name here must exist in the source, every exactness claim must name a gate that CI runs, and the rescue sources and these pages must name each other.

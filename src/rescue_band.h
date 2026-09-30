@@ -16,7 +16,7 @@
  *  - A zero-state DP restricted to any cell set (a band) never exceeds the full DP, and is exact
  *    on every cell of every alignment it contains. So per-row max over bands is <= the true row
  *    max, and equal wherever an alignment scoring >= tau ends. Widening a band (more diagonals,
- *    as the 16-lane grouping does) keeps both properties, and so does skipping cells that do not
+ *    as grouping lanes into one vector does) keeps both properties, and so does skipping cells that do not
  *    exist in the full DP (query column j < 0 or j >= quanta: the kernel computes, per row, only
  *    the union of its lanes' live columns). The fused (G-based) cells drop an in-row gap run
  *    followed directly by a vertical one; the band then need not match the original cell's
@@ -57,8 +57,9 @@
  * is not cheaper than kswv, or whose banded max is not S (cannot happen; kept as a guard), run
  * kswv phase 1.
  *
- * Scope: aarch64 only (the NEON kernel); jobs rescue_prune_applies() prunes (default scoring,
- * 8-bit, non-meth) with minsc in [19, 255] (plan()). x86 keeps the hull path.
+ * Scope: the NEON kernel (aarch64, 16 lanes) and the AVX2 kernel (x86, 32 lanes,
+ * rescue_band_kernel_x86.h); jobs rescue_prune_applies() prunes (default scoring,
+ * 8-bit, non-meth, and on x86 the default -k 19) with minsc in [19, 255] (plan()). Without a SIMD kernel the hull path runs.
  * Env: the BWA3_RESCUE_BAND* knobs and BWA3_RESCUE_PRUNE_STATS, listed with their defaults in
  * rescue_env.h.
  *
@@ -171,5 +172,9 @@ private:
 RescueBandBatch *rescue_band_batch_new();
 void rescue_band_batch_free(RescueBandBatch *b);
 bool rescue_band_enabled();
+/* The default of the pass-0 cost gate (BWA3_RESCUE_BAND_COST) when kswv runs at SIMD tier `tier`
+ * (simd_dispatch.h): 0 (no pass-0 banding) at BWAMEM3_TIER_AVX512BW, where kswv sweeps 64 lanes
+ * against the band kernel's 32, and 85 at every other tier. See rb_cost_pct in rescue_band.cpp. */
+int rescue_band_cost_pct_default(int tier);
 
 #endif

@@ -913,33 +913,52 @@ jobs:
           bash test/regression/bwtseed_lockstep_driver_identity.sh
 
       # Every row, not just the canonical one: the post-rescue dedup shortcuts
-      # run on every tier, and pruning runs only on aarch64, so the ARM64 rows
-      # are where the pruning legs are non-vacuous (the x86 rows run them down
-      # the same path and report that non-vacuity check skipped).
+      # run on every tier, and pruning and banding run wherever the build has
+      # the SIMD filter -- NEON on the ARM64 rows, the avx2 floor on every x86
+      # row -- so each row checks its own build's filter, band kernel and kswv
+      # tier, and fails if the pruning legs went vacuous.
       - name: Exact rescue pruning == full-window rescue (generated PE fixture)
         run: |
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           bash test/regression/rescue_prune_identity.sh
 
-      # The NEON rescue-pruning filter against the scalar one on generated jobs:
+      # The SIMD rescue-pruning filter against the scalar one on generated jobs:
       # decisions, the per-diagonal view band planning reads, the component
-      # list and the repeat memo. About 6 s for 100000 jobs on an Apple M-series
-      # core; real-data dumps are manual. The negative control runs first: it
-      # shifts one scalar field on one job, and the check must report it as a
-      # MISMATCH and exit 1, so a comparison that stopped biting fails here.
-      - name: NEON rescue filter == scalar filter (rescue_prune_eq, generated jobs)
-        if: runner.arch == 'ARM64'
+      # list and the repeat memo -- the NEON filter on the ARM64 rows, the x86
+      # port on the x86 rows. On every row: the arch= passed is the one the main
+      # build used (the row's arch_flag, or the single-binary row's
+      # BASELINE_ARCH, as in the pwrite_all_status step), so the build-flags
+      # stamp and the libbwa.a later steps test are unchanged. On x86 the port is
+      # also compiled at AVX-512BW, header-only and outside the Makefile so
+      # nothing already built changes, and run where the runner has AVX-512BW
+      # (reported SKIP: elsewhere). About 6 s for 100000 jobs on an Apple
+      # M-series core; real-data dumps are manual. The negative control runs
+      # first: it shifts one scalar field on one job, and the check must report
+      # it as a MISMATCH and exit 1, so a comparison that stopped biting fails
+      # here.
+      - name: SIMD rescue filter == scalar filter (rescue_prune_eq, generated jobs)
         run: |
-          make rescue-prune-eq CXX=${{ matrix.cxx || 'clang++-19' }} USE_MIMALLOC=${{ matrix.use_mimalloc }}
+          if [ "${{ matrix.arch_flag }}" = "" ]; then arch=${{ matrix.baseline_arch || 'avx2' }}; else arch=${{ matrix.arch_flag }}; fi
+          make rescue-prune-eq arch="$arch" CXX=${{ matrix.cxx || 'clang++-19' }} USE_MIMALLOC=${{ matrix.use_mimalloc }}
           if RPE_NEGATIVE_CONTROL=1 ./rescue_prune_eq fuzz 2000 1 > rpe_nc.log 2>&1; then
             cat rpe_nc.log; echo "::error::negative control exited 0: the check missed an injected disagreement"; exit 1
           fi
           grep -q 'MISMATCHES=[1-9]' rpe_nc.log || { cat rpe_nc.log; echo "::error::negative control failed without reporting a MISMATCH"; exit 1; }
           ./rescue_prune_eq fuzz 100000 1
+          if [ "${{ runner.arch }}" = "X64" ]; then
+            ${{ matrix.cxx || 'clang++-19' }} -O3 -std=gnu++14 -mavx512f -mavx512bw -Isrc \
+              test/rescue_prune_eq.cpp -o rescue_prune_eq_avx512bw
+            if grep -qw avx512bw /proc/cpuinfo; then
+              ./rescue_prune_eq_avx512bw fuzz 100000 2
+            else
+              echo "SKIP: runner has no AVX-512BW; the avx512bw build of rescue_prune_eq compiled but did not run"
+            fi
+          fi
 
-      # The banded rescue kernel is NEON-only, so the harness runs on the ARM64
-      # rows: every generated job class through the production pipeline, every
-      # B2 parent banded (the cost gate opened), each field checked against kswv
+      # The banded rescue kernel is NEON on aarch64 and AVX2 on x86, so the
+      # harness runs on every row, built at the main build's arch= (see the
+      # step above): every generated job class through the production pipeline,
+      # every B2 parent banded (the cost gate opened), each field checked against kswv
       # on the full window. The second run uses a threshold other than the NEON
       # filter's, so plan() reads the scalar filter's view; the third opens the
       # hit gate, the only way a window reaches the component cap (at the
@@ -950,12 +969,14 @@ jobs:
       # (BWA3_RESCUE_FSCAN=0, which also turns the fused kswv cell off). The
       # trailing argument is the job generator's seed. The first three take
       # ~50 s in all on Graviton 4; the last three are 30000-job runs like the
-      # second and third. Longer runs and real dumps are manual. As above, a
-      # negative control (one banded job's te shifted) must fail first.
+      # second and third. On x86 the kswv reference runs at the runner's tier,
+      # which the harness prints ("kswv tier:"). Longer runs and real dumps are
+      # manual. As above, a negative control (one banded job's te shifted) must
+      # fail first.
       - name: Banded rescue == kswv (rescue_band_harness, generated jobs)
-        if: runner.arch == 'ARM64'
         run: |
-          make rescue-band-harness CXX=${{ matrix.cxx || 'clang++-19' }} USE_MIMALLOC=${{ matrix.use_mimalloc }}
+          if [ "${{ matrix.arch_flag }}" = "" ]; then arch=${{ matrix.baseline_arch || 'avx2' }}; else arch=${{ matrix.arch_flag }}; fi
+          make rescue-band-harness arch="$arch" CXX=${{ matrix.cxx || 'clang++-19' }} USE_MIMALLOC=${{ matrix.use_mimalloc }}
           if BWA3_RESCUE_BAND_COST=100000000 RB_NEGATIVE_CONTROL=1 ./rescue_band_harness eq 3000 1 > rb_nc.log 2>&1; then
             cat rb_nc.log; echo "::error::negative control exited 0: the check missed an injected disagreement"; exit 1
           fi

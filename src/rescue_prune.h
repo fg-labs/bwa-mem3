@@ -41,6 +41,7 @@
 #include <vector>
 #include "kswv_quantum.h"
 #include "rescue_prune_neon.h"
+#include "rescue_prune_x86.h"
 
 enum { RESCUE_PRUNE_FULL = 0, RESCUE_PRUNE_B1 = 1, RESCUE_PRUNE_B2 = 2 };
 
@@ -65,8 +66,9 @@ struct rescue_prune_scratch {
     int32_t fwd[DCAP], bwd[DCAP];
 };
 
-/* Scalar implementation (off aarch64, a threshold other than 19, or beyond the NEON filter's
- * capacity or int16 range). Same decisions as the NEON one wherever both run. */
+/* Scalar implementation (a threshold other than 19, a build without a SIMD filter, or beyond the
+ * SIMD filter's capacity or int16 range). Same decisions as the NEON and x86 filters wherever they
+ * run. */
 static inline int rescue_prune_window_scalar(const uint8_t *ref, int len1, const uint8_t *q, int len2,
                                              int minsc, int max_hits, rescue_prune_scratch &s,
                                              int *hb, int *he)
@@ -142,11 +144,11 @@ static inline int rescue_prune_window_scalar(const uint8_t *ref, int len1, const
 /* The per-diagonal arrays behind a RESCUE_PRUNE_B2 decision, for deriving diagonal components at
  * thresholds above minsc (rescue_band.h). Diagonal index x in [0, nd) is the unshifted diagonal
  * d = i - j = x - off, with nd = len1 + off + 1 and off the query's 8-bit quantum. Exactly one of
- * bnd16 (NEON: the bound precomputed) or fwd / bwd (scalar: bnd = 5 + fwd + bwd - (cnt - 1)) is
+ * bnd16 (SIMD filter: the bound precomputed) or fwd / bwd (scalar: bnd = 5 + fwd + bwd - (cnt - 1)) is
  * set; mw / hw are set with bnd16. The pointers alias the filter's per-thread scratch, so a view is
  * valid only until the next filter call on the same thread. Readable lengths, which band planning's
- * vector loads rely on: on NEON (the filter accepts nd + 32 <= NeonScratch::CAP) cnt and minrow at
- * least nd + 32 entries and bnd16 at least nd + 64 (NeonScratch::VIEW_PAD); on the scalar path nd,
+ * vector loads rely on: on the SIMD filter (it accepts nd + 32 <= NeonScratch::CAP / X86Scratch::CAP) cnt and
+ * minrow at least nd + 32 entries and bnd16 at least nd + 64 (the scratch's VIEW_PAD); on the scalar path nd,
  * which is all the scalar planner reads. */
 struct rescue_prune_view {
     int nd = -1, off = 0;
@@ -162,14 +164,12 @@ struct rescue_prune_view {
     const int16_t *minrow = nullptr;
     const int16_t *bnd16 = nullptr;
     const int32_t *fwd = nullptr, *bwd = nullptr;
-    const uint64_t *mw = nullptr;   // NEON: bitset of diagonals with bnd >= 19
-    const uint64_t *hw = nullptr;   // NEON: bitset of diagonals with bnd >= 19 and a hit
-#if defined(__aarch64__)
-    /* NEON: the filter's own components at bnd >= 19 with a hit (all of [0, nd)), in diagonal
+    const uint64_t *mw = nullptr;   // SIMD filter: bitset of diagonals with bnd >= 19
+    const uint64_t *hw = nullptr;   // SIMD filter: bitset of diagonals with bnd >= 19 and a hit
+    /* SIMD filter: its own components at bnd >= 19 with a hit (all of [0, nd)), in diagonal
      * order; the first min(ncomp, ncomp_stored) are in comps. ncomp < 0: not available. */
     const rescue_prune_neon::Comp *comps = nullptr;
     int ncomp = -1, ncomp_stored = 0;
-#endif
 };
 
 /* The view of a rescue_prune_window_scalar call on (len1, len2) that returned RESCUE_PRUNE_B2. */
@@ -182,23 +182,83 @@ static inline rescue_prune_view rescue_prune_scalar_view(const rescue_prune_scra
     return v;
 }
 
+/* The SIMD filter this build dispatches to at rescue_prune_neon::MINSC: NEON on aarch64
+ * (rescue_prune_neon.h), the SSE4.1 / SSSE3 port on the AVX2-floor x86 builds (rescue_prune_x86.h),
+ * none elsewhere. Both return the scalar filter's decisions and the same view. */
 #if defined(__aarch64__)
-/* The calling thread's NEON filter scratch (tables, per-diagonal arrays, query cache, memo). */
-static inline rescue_prune_neon::NeonScratch &rescue_prune_neon_scratch()
+#define RESCUE_PRUNE_HAVE_SIMD 1
+typedef rescue_prune_neon::NeonScratch rescue_prune_simd_scratch_t;
+static inline rescue_prune_neon::Kind rescue_prune_simd_lean(const rescue_prune_neon::Job &jb,
+                                                             rescue_prune_simd_scratch_t &s, int &hb,
+                                                             int &he, int max_hits)
 {
-    static thread_local rescue_prune_neon::NeonScratch ns;
-    return ns;
+    return rescue_prune_neon::lean_neon(jb, s, hb, he, max_hits);
+}
+#elif defined(__AVX2__)
+#define RESCUE_PRUNE_HAVE_SIMD 1
+typedef rescue_prune_x86::X86Scratch rescue_prune_simd_scratch_t;
+static inline rescue_prune_neon::Kind rescue_prune_simd_lean(const rescue_prune_neon::Job &jb,
+                                                             rescue_prune_simd_scratch_t &s, int &hb,
+                                                             int &he, int max_hits)
+{
+    return rescue_prune_x86::lean_x86(jb, s, hb, he, max_hits);
+}
+#else
+#define RESCUE_PRUNE_HAVE_SIMD 0
+#endif
+
+#if RESCUE_PRUNE_HAVE_SIMD
+/* The calling thread's SIMD filter scratch (tables, per-diagonal arrays, query cache, memo). */
+static inline rescue_prune_simd_scratch_t &rescue_prune_simd_scratch()
+{
+    static thread_local rescue_prune_simd_scratch_t ss;
+    return ss;
 }
 #endif
 
-/* Calls on this thread that the NEON filter answered from its repeat memo (0 off aarch64), for
+/* Calls on this thread that the SIMD filter answered from its repeat memo (0 without one), for
  * BWA3_RESCUE_PRUNE_STATS and the tests. */
 static inline uint64_t rescue_prune_memo_hits()
 {
-#if defined(__aarch64__)
-    return rescue_prune_neon_scratch().memo_hits;
+#if RESCUE_PRUNE_HAVE_SIMD
+    return rescue_prune_simd_scratch().memo_hits;
 #else
     return 0;
+#endif
+}
+
+/* The default hit gate (BWA3_RESCUE_PRUNE_MAX_HITS unset), for a run with banding on or off at
+ * rescue threshold minsc: 400 for the hull path. On aarch64, 1000 when banding is on and minsc is
+ * the SIMD filter's threshold (19): banding turns more of the pruned windows into savings, which
+ * pays for the filter on the denser windows (best of {400, 1000, 3000, 10^4, 10^9} measured on
+ * WGS-like data); the scalar filter (any other minsc) is too slow on dense windows for that. The
+ * gate is keyed on minsc, not on which filter ends up running, so the rare window past the SIMD
+ * filter's capacity (it falls back to the scalar filter) also gets 1000. On x86, 400 with banding
+ * too: the x86 kswv kernels are cheap enough that the extra filter work on dense windows does not
+ * pay (prune + band, wall, 1000 vs 400: Zen 3 AVX2 wgs-5M 74.52 vs 73.57 s, wes-5M 38.57 vs
+ * 37.65 s; Zen 5 AVX-512 wgs-5M 27.53 vs 26.73 s). Output is identical at every value. */
+static inline int rescue_prune_max_hits_default(bool banding, int minsc)
+{
+#if defined(__aarch64__)
+    return banding && minsc == rescue_prune_neon::MINSC ? 1000 : 400;
+#else
+    (void)banding; (void)minsc;
+    return 400;
+#endif
+}
+
+/* Whether pruning pays at rescue threshold minsc (the cost gate beside the exactness preconditions,
+ * which the caller checks). Everywhere on aarch64. On x86 only at the SIMD filter's threshold
+ * (rescue_prune_neon::MINSC, the default -k 19): at any other minsc the scalar filter decides, and
+ * against the x86 kswv kernels it costs more than it saves (prune on vs off, wall: Zen 5 AVX-512
+ * +3 to +13 % at -k 10 / 15 / 25 / 32 on wgs-5M and wes-5M; Zen 3 AVX2 +1 to +6 % at -k 25 / 32). */
+static inline bool rescue_prune_cost_ok(int minsc)
+{
+#if defined(__aarch64__)
+    (void)minsc;
+    return true;
+#else
+    return minsc == rescue_prune_neon::MINSC;
 #endif
 }
 
@@ -221,17 +281,17 @@ static inline int rescue_prune_window(const uint8_t *ref, int len1, const uint8_
     // minsc < 5: the lemma's base term (5) already exceeds the threshold, so nothing is provable.
     if (minsc < 5 || len1 < 5 || len2 < 5 || len2 > rescue_prune_scratch::QCAP || len1 > 30000)
         return RESCUE_PRUNE_FULL;
-#if defined(__aarch64__)
-    if (minsc == rescue_prune_neon::MINSC) {  // identical decisions, ~2x faster (rescue_prune_neon.h)
-        rescue_prune_neon::NeonScratch &ns = rescue_prune_neon_scratch();
+#if RESCUE_PRUNE_HAVE_SIMD
+    if (minsc == rescue_prune_neon::MINSC) {  // identical decisions, faster (rescue_prune_neon.h)
+        rescue_prune_simd_scratch_t &ss = rescue_prune_simd_scratch();
         const rescue_prune_neon::Job jb{len1, len2, 0, 0, -1, -1, ref, q};
         int h, e;
-        const uint64_t hits0 = ns.memo_hits;
-        const rescue_prune_neon::Kind k = rescue_prune_neon::lean_neon(jb, ns, h, e, max_hits);
+        const uint64_t hits0 = ss.memo_hits;
+        const rescue_prune_neon::Kind k = rescue_prune_simd_lean(jb, ss, h, e, max_hits);
         if (view) {
-            view->repeat = ns.memo_hits != hits0;
+            view->repeat = ss.memo_hits != hits0;
             view->keyed = k != rescue_prune_neon::FALLBACK;
-            view->key = (ns.whash ^ (ns.qhash * 0x9E3779B97F4A7C15ULL)) + (uint64_t)max_hits * 0xD6E8FEB86659FD93ULL;
+            view->key = (ss.whash ^ (ss.qhash * 0x9E3779B97F4A7C15ULL)) + (uint64_t)max_hits * 0xD6E8FEB86659FD93ULL;
         }
         if (k == rescue_prune_neon::B1) return RESCUE_PRUNE_B1;
         if (k == rescue_prune_neon::FULL) return RESCUE_PRUNE_FULL;
@@ -240,14 +300,14 @@ static inline int rescue_prune_window(const uint8_t *ref, int len1, const uint8_
             if (view) {
                 view->off = kswv_query_quantum8(len2);
                 view->nd = len1 + view->off + 1;
-                view->cnt = ns.cnt; view->minrow = ns.minrow; view->bnd16 = ns.bnd;
-                view->mw = ns.mw; view->hw = ns.hw;
-                view->comps = ns.comps; view->ncomp = ns.ncomp;
-                view->ncomp_stored = std::min(ns.ncomp, (int)rescue_prune_neon::NeonScratch::COMP_CAP);
+                view->cnt = ss.cnt; view->minrow = ss.minrow; view->bnd16 = ss.bnd;
+                view->mw = ss.mw; view->hw = ss.hw;
+                view->comps = ss.comps; view->ncomp = ss.ncomp;
+                view->ncomp_stored = std::min(ss.ncomp, (int)rescue_prune_simd_scratch_t::COMP_CAP);
             }
             return RESCUE_PRUNE_B2;
         }
-        // FALLBACK: beyond the NEON path's capacity or int16 range -> int32 scalar filter below.
+        // FALLBACK: beyond the SIMD filter's capacity or int16 range -> int32 scalar filter below.
     }
 #endif
     static thread_local rescue_prune_scratch s;

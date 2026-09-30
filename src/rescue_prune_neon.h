@@ -141,12 +141,43 @@ static inline Kind lean(const Job &jb, Scratch &s, int &hb, int &he)
 //  7. Components: bitsets of (bnd >= 19) and (bnd >= 19 && cnt > 0) built in the backward scan;
 //     per component with a hit (few) ub = vector max of bnd, dmax = highest hit bit, and
 //     lo = masked vector min of minrow.
-#if defined(__aarch64__)
 /* A diagonal component at MINSC with a hit, as step 7 finds it (shifted diagonal indices x = d + off):
  * the mw run [a, b), ub = max bnd over it, i0 = min minrow over its hit diagonals, dmax = its
  * highest hit diagonal. rescue_band.cpp reuses the list instead of rescanning the view at MINSC. */
 struct Comp { int32_t a, b, ub, i0, dmax; };
-struct NeonScratch {
+
+// The component bitset scanners, plain C++ shared with the x86 port (rescue_prune_x86.h) and
+// band planning (rescue_band.cpp).
+// First index >= from with bit set (inv=0) / clear (inv=~0) in the bitset w, or n if none.
+static inline int bitset_next(const uint64_t *w, int from, int n, uint64_t inv)
+{
+    if (from >= n) return n;
+    int k = from >> 6;
+    uint64_t x = (w[k] ^ inv) & (~0ull << (from & 63));
+    const int nw = (n + 63) >> 6;
+    while (!x) { if (++k >= nw) return n; x = w[k] ^ inv; }
+    const int r = (k << 6) + __builtin_ctzll(x);
+    return r < n ? r : n;
+}
+
+// Highest set bit in [a, b) of bitset w, or -1.
+static inline int bitset_last(const uint64_t *w, int a, int b)
+{
+    if (b <= a) return -1;
+    int k = (b - 1) >> 6;
+    uint64_t x = w[k] & (~0ull >> (63 - ((b - 1) & 63)));
+    for (;;) {
+        if (x) { const int r = (k << 6) + 63 - __builtin_clzll(x); return r >= a ? r : -1; }
+        if (--k < (a >> 6)) return -1;
+        x = w[k];
+    }
+}
+
+/* The SIMD filters' scratch: lean_neon's (NeonScratch, below) and its x86 port's
+ * (rescue_prune_x86::X86Scratch), one layout so rescue_prune.h reads either view the same way.
+ * kNeonStaging sizes MH, the per-step bitset staging only the NEON backward scan uses. */
+template <bool kNeonStaging>
+struct FilterScratch {
     static const int CAP = 4096 + 64;
     alignas(16) uint8_t rbuf[CAP + 64];   // 4 zero bytes, ref, zero padding
     alignas(16) uint8_t qbuf[CAP + 64];   // 4 zero bytes, query, zero padding
@@ -162,12 +193,14 @@ struct NeonScratch {
     alignas(16) int16_t minrow[CAP];
     // P (after 8 zeros: P before each segment's first diagonal), PM: segment-transposed (step 6)
     alignas(16) int16_t P[8 + CAP], PM[CAP];
-    // bnd is readable VIEW_PAD entries past any nd the filter accepts (nd + 32 <= CAP):
-    // rescue_band.cpp reads it in whole 64-diagonal words (static_assert there).
+    // bnd is readable VIEW_PAD entries past any nd the filter accepts (nd + 32 <= CAP): the NEON
+    // band planner reads it in whole 64-diagonal words (static_assert in rescue_band.cpp); the x86
+    // one reads it one entry at a time, within [0, nd).
     static const int VIEW_PAD = 64;
     alignas(16) int16_t bnd[CAP + VIEW_PAD];
     alignas(16) uint64_t mw[CAP / 64 + 3], hw[CAP / 64 + 3];  // bitsets
-    alignas(16) uint8_t MH[(CAP / 64 + 8) * 16];   // per backward step: mw bytes (lane = segment), hw bytes
+    // NEON: per backward step, mw bytes (lane = segment) then hw bytes
+    alignas(16) uint8_t MH[kNeonStaging ? (CAP / 64 + 8) * 16 : 16];
     alignas(16) uint8_t shuf[256][16];   // left-pack shuffles for 8 x u16 lanes
     /* Step 7's components, in diagonal order: the first min(ncomp, COMP_CAP) are stored; ncomp
      * counts all of them. Valid after a B2 return, with the rest of the view. */
@@ -185,15 +218,15 @@ struct NeonScratch {
      * bytes and its length; qhash: every query byte, computed with the query table). A caller
      * looking for an earlier job with the same inputs compares keys first and bytes after. */
     uint64_t whash = 0, qhash = 0;
-    /* Result of the last lean_neon() call (memo_ok: a NEON decision, not FALLBACK). A call
-     * repeating that job exactly -- same window bytes (still in rbuf), query bytes (qcache),
+    /* Result of the last filter call (memo_ok: a SIMD decision, not FALLBACK; see lean_memo). A
+     * call repeating that job exactly -- same window bytes (still in rbuf), query bytes (qcache),
      * lengths and gate -- returns it again; the per-diagonal arrays behind a B2 (cnt, minrow, bnd,
-     * mw, hw, comps) were not touched in between, since only lean_neon writes them. */
+     * mw, hw, comps) were not touched in between, since only the filter writes them. */
     bool memo_ok = false;
     int memo_len1 = -1, memo_mh = 0, memo_hb = -1, memo_he = -1;
     Kind memo_kind = FULL;
     uint64_t memo_hits = 0;   // calls answered from the memo (BWA3_RESCUE_PRUNE_STATS, tests)
-    NeonScratch()
+    FilterScratch()
     {
         for (int m = 0; m < 256; m++) {
             int n = 0;
@@ -210,31 +243,55 @@ struct NeonScratch {
         memset(MH, 0, sizeof MH);
     }
 };
+typedef FilterScratch<true> NeonScratch;
 
-// First index >= from with bit set (inv=0) / clear (inv=~0) in the bitset w, or n if none.
-static inline int neon_next(const uint64_t *w, int from, int n, uint64_t inv)
+// Exact repeats of the previous job (a mate rescued twice in a row against the same window) return
+// the previous result without recomputing it: the result is a function of the window bytes, the
+// query bytes, the lengths and max_hits only. core is the filter proper (lean_neon_core, or the x86
+// port's lean_x86_core), which writes the per-diagonal arrays.
+template <class S, class Core>
+static inline Kind lean_memo(const Job &jb, S &s, int &hb, int &he, int max_hits, Core core)
 {
-    if (from >= n) return n;
-    int k = from >> 6;
-    uint64_t x = (w[k] ^ inv) & (~0ull << (from & 63));
-    const int nw = (n + 63) >> 6;
-    while (!x) { if (++k >= nw) return n; x = w[k] ^ inv; }
-    const int r = (k << 6) + __builtin_ctzll(x);
-    return r < n ? r : n;
-}
-
-// Highest set bit in [a, b) of bitset w, or -1.
-static inline int neon_last(const uint64_t *w, int a, int b)
-{
-    if (b <= a) return -1;
-    int k = (b - 1) >> 6;
-    uint64_t x = w[k] & (~0ull >> (63 - ((b - 1) & 63)));
-    for (;;) {
-        if (x) { const int r = (k << 6) + 63 - __builtin_clzll(x); return r >= a ? r : -1; }
-        if (--k < (a >> 6)) return -1;
-        x = w[k];
+    if (s.memo_ok && jb.len1 == s.memo_len1 && jb.len2 == s.qlen_c && max_hits == s.memo_mh &&
+        memcmp(jb.ref, s.rbuf + 4, (size_t)jb.len1) == 0 && memcmp(jb.qry, s.qcache, (size_t)jb.len2) == 0) {
+        hb = s.memo_hb; he = s.memo_he;
+        s.memo_hits++;
+        return s.memo_kind;
     }
+    const Kind k = core(jb, s, hb, he, max_hits);
+    s.memo_ok = k != FALLBACK;
+    s.memo_len1 = jb.len1; s.memo_mh = max_hits; s.memo_hb = hb; s.memo_he = he; s.memo_kind = k;
+    return k;
 }
+
+// Keys of a job's inputs for the rescue repeat lookup (FilterScratch whash / qhash), shared by the
+// NEON filter and the x86 port so both key identically. window_key reads the zero-padded window
+// copy: bytes 0-31 (zero past len1) and the last 16; query_key reads every byte of the zero-padded
+// query copy, 8 at a time. A key only selects a candidate: the caller compares the bytes after.
+static inline uint64_t filter_window_key(const uint8_t *rb, int len1)
+{
+    uint64_t w[6];
+    memcpy(w, rb, 32);
+    memcpy(w + 4, rb + (len1 > 16 ? len1 - 16 : 0), 16);
+    uint64_t h = ((uint64_t)len1 ^ 0x9E3779B97F4A7C15ULL) * 0xBF58476D1CE4E5B9ULL;
+    for (int k = 0; k < 6; k += 2) {
+        h = (h ^ w[k]) * 0x94D049BB133111EBULL;
+        h = (h ^ w[k + 1]) * 0xBF58476D1CE4E5B9ULL;
+    }
+    return h ^ (h >> 31);
+}
+static inline uint64_t filter_query_key(const uint8_t *qb, int len2)
+{
+    uint64_t h = ((uint64_t)len2 ^ 0xD6E8FEB86659FD93ULL) * 0xBF58476D1CE4E5B9ULL;
+    for (int j = 0; j < len2; j += 8) {
+        uint64_t w;
+        memcpy(&w, qb + j, 8);
+        h = (h ^ w) * 0x94D049BB133111EBULL;
+    }
+    return h ^ (h >> 29);
+}
+
+#if defined(__aarch64__)
 
 // Left-pack store: the u16 lanes of v selected by the shuffle sh (a row of NeonScratch::shuf),
 // moved to the front and stored at out (all 8 lanes are written; the caller advances by pc[]).
@@ -273,14 +330,7 @@ static inline Kind lean_neon_core(const Job &jb, NeonScratch &s, int &hb, int &h
         for (; i + 16 <= len1; i += 16) { const uint8x16_t x = vld1q_u8(ref + i); ov = vorrq_u8(ov, x); vst1q_u8(rb + i, x); }
         for (; i < len1; i++) { orv |= ref[i]; rb[i] = ref[i]; }
         vst1q_u8(rb + len1, vdupq_n_u8(0)); vst1q_u8(rb + len1 + 16, vdupq_n_u8(0));
-        // window key: blocks 0 and 1 (zero-padded past len1) and the last 16 bytes, just written
-        const uint64x2_t k0 = vreinterpretq_u64_u8(vld1q_u8(rb)), k1 = vreinterpretq_u64_u8(vld1q_u8(rb + 16)),
-                         k2 = vreinterpretq_u64_u8(vld1q_u8(rb + (len1 > 16 ? len1 - 16 : 0)));
-        uint64_t h = ((uint64_t)len1 ^ 0x9E3779B97F4A7C15ULL) * 0xBF58476D1CE4E5B9ULL;
-        h = (h ^ vgetq_lane_u64(k0, 0)) * 0x94D049BB133111EBULL; h = (h ^ vgetq_lane_u64(k0, 1)) * 0xBF58476D1CE4E5B9ULL;
-        h = (h ^ vgetq_lane_u64(k1, 0)) * 0x94D049BB133111EBULL; h = (h ^ vgetq_lane_u64(k1, 1)) * 0xBF58476D1CE4E5B9ULL;
-        h = (h ^ vgetq_lane_u64(k2, 0)) * 0x94D049BB133111EBULL; h = (h ^ vgetq_lane_u64(k2, 1)) * 0xBF58476D1CE4E5B9ULL;
-        s.whash = h ^ (h >> 31);
+        s.whash = filter_window_key(rb, len1);  // the bytes just written
     }
     const int quanta = kswv_query_quantum8(len2), off = quanta, nd = len1 + quanta + 1;
     // ---- 2. query table (cached per oriented query): copy + N flag, tab[code] = (off - j_last)
@@ -296,14 +346,7 @@ static inline Kind lean_neon_core(const Job &jb, NeonScratch &s, int &hb, int &h
         s.q_has_n = ((qor | vmaxvq_u8(qv)) & 0xFC) != 0;
         memcpy(s.qcache, q, (size_t)len2);
         s.qlen_c = len2;
-        {   // query key: every byte, 8 at a time from the zero-padded copy
-            uint64_t h = ((uint64_t)len2 ^ 0xD6E8FEB86659FD93ULL) * 0xBF58476D1CE4E5B9ULL;
-            for (int jj = 0; jj < len2; jj += 8) {
-                uint64_t w; memcpy(&w, qb + jj, 8);
-                h = (h ^ w) * 0x94D049BB133111EBULL;
-            }
-            s.qhash = h ^ (h >> 29);
-        }
+        s.qhash = filter_query_key(qb, len2);
         if (!s.q_has_n && len2 >= 5) {
             memset(s.tab, 0, sizeof s.tab);
             memset(s.pres, 0, sizeof s.pres);
@@ -620,9 +663,9 @@ static inline Kind lean_neon_core(const Job &jb, NeonScratch &s, int &hb, int &h
     // ---- 7. components (runs of mw) with a hit: ub = max bnd; dmax = last hw bit; lo = min over
     //      them of minrow on hit diagonals. 8-wide over [a & ~7, b), lanes outside [a, b) masked. ----
     int hi = -1, lo = 32767, nc = 0;
-    for (int d = neon_next(s.mw, 0, nd, 0); d < nd;) {
-        const int a = d, b = neon_next(s.mw, a, nd, ~0ull);
-        const int dmax = neon_last(s.hw, a, b);
+    for (int d = bitset_next(s.mw, 0, nd, 0); d < nd;) {
+        const int a = d, b = bitset_next(s.mw, a, nd, ~0ull);
+        const int dmax = bitset_last(s.hw, a, b);
         if (dmax >= 0) {
             const int16x8_t IOs = vreinterpretq_s16_u16(IO), va = vdupq_n_s16((int16_t)a), vb = vdupq_n_s16((int16_t)b);
             int16x8_t mx = small, mn = big;
@@ -646,7 +689,7 @@ static inline Kind lean_neon_core(const Job &jb, NeonScratch &s, int &hb, int &h
             if (nc < NeonScratch::COMP_CAP) s.comps[nc] = Comp{a, b, ub, i0, dmax};
             nc++;
         }
-        d = neon_next(s.mw, b, nd, 0);
+        d = bitset_next(s.mw, b, nd, 0);
     }
     if (hi < 0) return B1;
     hb = std::max(0, lo);
@@ -654,21 +697,12 @@ static inline Kind lean_neon_core(const Job &jb, NeonScratch &s, int &hb, int &h
     s.ncomp = nc;
     return B2;
 }
-// Exact repeats of the previous job (a mate rescued twice in a row against the same window) return
-// the previous result without recomputing it: the result is a function of the window bytes, the
-// query bytes, the lengths and max_hits only.
+// lean_neon_core behind the repeat memo (lean_memo).
 static inline Kind lean_neon(const Job &jb, NeonScratch &s, int &hb, int &he, int max_hits = 1 << 30)
 {
-    if (s.memo_ok && jb.len1 == s.memo_len1 && jb.len2 == s.qlen_c && max_hits == s.memo_mh &&
-        memcmp(jb.ref, s.rbuf + 4, (size_t)jb.len1) == 0 && memcmp(jb.qry, s.qcache, (size_t)jb.len2) == 0) {
-        hb = s.memo_hb; he = s.memo_he;
-        s.memo_hits++;
-        return s.memo_kind;
-    }
-    const Kind k = lean_neon_core(jb, s, hb, he, max_hits);
-    s.memo_ok = k != FALLBACK;
-    s.memo_len1 = jb.len1; s.memo_mh = max_hits; s.memo_hb = hb; s.memo_he = he; s.memo_kind = k;
-    return k;
+    return lean_memo(jb, s, hb, he, max_hits, [](const Job &j, NeonScratch &t, int &b, int &e, int mh) {
+        return lean_neon_core(j, t, b, e, mh);
+    });
 }
 #endif  // __aarch64__ (rescue_prune.h dispatches here only on aarch64)
 

@@ -1,8 +1,10 @@
-/* Exact banded mate-rescue DP: component planning, the 16-lane NEON banded kernel, grouping and
- * the per-parent merge. See rescue_band.h for the design and the exactness argument, and
+/* Exact banded mate-rescue DP: component planning, the NEON banded kernel (and, from
+ * rescue_band_kernel_x86.h, the AVX2 one; RB_L lanes each), grouping and the per-parent merge.
+ * See rescue_band.h for the design and the exactness argument, and
  * docs/src/developer-guide/rescue-banding.md for the overview and its gates. */
 #include "rescue_band.h"
 #include "rescue_env.h"
+#include "simd_dispatch.h"
 
 #include <algorithm>
 #include <atomic>
@@ -12,9 +14,41 @@
 #include <cstdlib>
 #include <cassert>
 #include <cstring>
+/* kswv's score2 / te2 scan over the rows whose (lagged-zeroed) maximum reaches minsc, in row order:
+ * the b[] emulation of kswv.cpp with zone [low, high] = [te - S, te + S] (qmax = 1). Both kernels'
+ * rb_score2_vec feed it the qualifying rows their vector prefilter finds. */
+struct rb_score2_scan {
+    int low, high, s2 = -1, t2 = -1, bs = -1, bp = -2;
+    rb_score2_scan(int lo, int hi) : low(lo), high(hi) {}
+    void row(int i, int val)
+    {
+        if (bp + 1 != i) {
+            if (bp >= 0 && (bp < low || bp > high) && bs > s2) { s2 = bs; t2 = bp; }
+            bs = val; bp = i;
+        } else if (bs < val) {
+            bs = val; bp = i;
+        }
+    }
+    void finish(int *score2, int *te2)
+    {
+        if (bp >= 0 && (bp < low || bp > high) && bs > s2) { s2 = bs; t2 = bp; }
+        *score2 = s2;
+        *te2 = t2;
+    }
+};
+
 #if defined(__aarch64__)
 #include <arm_neon.h>
 #include "neon_transpose.h"
+/* The banded kernel's lanes per group (one job per lane) and the row / position padding unit of
+ * its SoA buffers and transposes. */
+#define RB_HAVE_SIMD 1
+static const int RB_L = 16;
+static const int RB_PAD = 16;
+static const uint8_t RB_QPAD = 0x40;   // query pad code (see the NEON kernel section)
+#elif defined(__AVX2__)
+#define RB_KERNEL_X86_FROM_RESCUE_BAND_CPP 1
+#include "rescue_band_kernel_x86.h"   // RB_L = 32, the AVX2 kernel and run_jobs helpers
 #endif
 
 /* ------------------------------------------------------------------------------------------ */
@@ -23,7 +57,7 @@
 
 bool rescue_band_enabled()
 {
-#if defined(__aarch64__)
+#if RB_HAVE_SIMD
     static const bool on = rescue_env_on("BWA3_RESCUE_BAND");
     return on;
 #else
@@ -33,12 +67,37 @@ bool rescue_band_enabled()
 
 /* Band a parent only when  100 * sum_bands rows * (min(width, quanta) + RB_OVH)  <  pct * hull_rows *
  * quanta, i.e. when the band cells (per row the kernel computes at most ~quanta of them, see
- * rb_dp_core) undercut the hull. The banded DP and kswv cost about the same per cell, so pct < 100
- * covers the band path's fixed costs (SoA build, merge, score2). BWA3_RESCUE_BAND_COST overrides
- * pct; 85 was the best of {40, 55, 70, 85, 100, 130} on a WGS-like sample. */
+ * rb_dp_core) undercut the hull. Where the band kernel and kswv run the same lane count (NEON: 16
+ * and 16; the AVX2 kswv tier: 32 and 32) a cell costs about the same in both, so pct < 100 covers
+ * the band path's fixed costs (SoA build, merge, score2); 85 was the best of {40, 55, 70, 85, 100,
+ * 130} on a WGS-like sample. Where kswv runs at the AVX-512BW tier it sweeps 64 lanes against the
+ * band kernel's 32, so a hull cell costs about half a band cell and the gate as written no longer
+ * measures what it claims. In whole runs there (Zen 5, -t 16) the band pass cost more thread-s
+ * than the kswv time it removed at every pct measured (kswv pass 0 saved vs band pass 0 spent:
+ * wgs-5M 2.0 vs 2.9 at 85, 0.5 vs 0.7 at 40; wes-5M 3.7 vs 4.5 and 0.9 vs 1.0), and wall was best
+ * with no pass-0 band at all (10 interleaved reps, vs the 85 default: wes-5M -0.9 %, p = 0.015;
+ * wgs-5M level), while forcing the AVX2 kswv tier on the same host restores the band's win (band
+ * harness, per job: -4.4 % at 85, -5.2 % at 100). So the default is 0 exactly where kswv runs 64
+ * lanes; pruning and banded pass 1 (whose cost model compares a band against kswv on the same rows,
+ * take_pass1) are unchanged there. The single-thread band harness over WGS dumps still shows a
+ * small per-job pass-0 win at that tier (3.79 -> 3.71 us at 85), so this is a whole-run finding to
+ * revisit with a 64-lane band kernel. Output is the same at every value: the gate only picks which
+ * of two exact kernels runs. */
+int rescue_band_cost_pct_default(int tier)
+{
+    return tier == BWAMEM3_TIER_AVX512BW ? 0 : 85;
+}
+/* BWA3_RESCUE_BAND_COST, else rescue_band_cost_pct_default for the kswv tier this process runs.
+ * Read once; the tier is fixed once bwamem3_simd_init has run (idempotent, so calling it here
+ * costs nothing when main did). */
 static int rb_cost_pct()
 {
-    static const int v = rescue_env_int("BWA3_RESCUE_BAND_COST", 85);
+    static const int v = [] {
+        const int e = rescue_env_int("BWA3_RESCUE_BAND_COST", -1);
+        if (e >= 0) return e;
+        bwamem3_simd_init();
+        return rescue_band_cost_pct_default(bwamem3_simd_tier());
+    }();
     return v;
 }
 static const int RB_OVH = 8;          // per-row fixed cost of a band lane, in cell units
@@ -173,6 +232,28 @@ static bool rb_components_scalar(const rescue_prune_view &v, BND bnd, int tau, i
     return true;
 }
 
+/* The whole view at MINSC from a SIMD filter: the filter already listed these components (the same
+ * runs of mw and the same ub / i0 / dmaxhit a rescan computes; rescue_prune_neon.h step 7, checked
+ * against a rescan by the unit tests and rescue_prune_eq). Reproduces the rescan's result -- append
+ * until out holds cap, false iff any component did not fit -- into *ok and returns true; returns
+ * false, touching nothing, when the list cannot answer (another threshold or a sub-range, no list,
+ * or a stored list shorter than the components the cap would take). */
+static bool rb_components_listed(const rescue_prune_view &v, int tau, int xa, int xb, std::vector<rb_comp> &out,
+                                 int cap, bool *ok)
+{
+    if (!v.comps || tau != rescue_prune_neon::MINSC || xa != 0 || xb != v.nd || v.ncomp < 0) return false;
+    if (v.ncomp != v.ncomp_stored && (int)out.size() + v.ncomp_stored < cap) return false;
+    *ok = true;
+    for (int k = 0; k < v.ncomp; k++) {
+        if ((int)out.size() >= cap) { *ok = false; break; }
+        const rescue_prune_neon::Comp &c = v.comps[k];
+        rb_comp K;
+        K.ub = c.ub; K.i0 = c.i0; K.dlo = c.a - v.off; K.dhi = c.b - 1 - v.off; K.dmaxhit = c.dmax - v.off;
+        out.push_back(K);
+    }
+    return true;
+}
+
 #if defined(__aarch64__)
 /* NEON view (bnd16 + the filter's bitsets). mw = {bnd >= 19}, hw = {bnd >= 19 and cnt > 0}.
  * Every component at tau >= 19 lies inside one run of mw, and inside such a run hw is exactly the
@@ -215,10 +296,10 @@ static inline void rb_run_ub_i0(const rescue_prune_view &v, int a, int b, int &u
 static bool rb_components_neon(const rescue_prune_view &v, int tau, int xa, int xb,
                                std::vector<rb_comp> &out, int cap)
 {
-    using rescue_prune_neon::neon_next;
-    using rescue_prune_neon::neon_last;
+    using rescue_prune_neon::bitset_next;
+    using rescue_prune_neon::bitset_last;
     auto emit = [&](int a, int b) -> bool {
-        const int dm = neon_last(v.hw, a, b);
+        const int dm = bitset_last(v.hw, a, b);
         if (dm < 0) return true;   // no hit: dropped
         if ((int)out.size() >= cap) return false;
         rb_comp k;
@@ -228,23 +309,12 @@ static bool rb_components_neon(const rescue_prune_view &v, int tau, int xa, int 
         return true;
     };
     if (tau == rescue_prune_neon::MINSC) {
-        /* The whole view at MINSC: the filter already listed these components (same runs of mw,
-         * same ub / i0 / dmaxhit computation, rescue_prune_neon.h step 7). Reproduce emit()'s
-         * result: append until out holds cap, false iff any component did not fit. */
-        if (xa == 0 && xb == v.nd && v.ncomp >= 0 && (v.ncomp == v.ncomp_stored || (int)out.size() + v.ncomp_stored >= cap)) {
-            for (int k = 0; k < v.ncomp; k++) {
-                if ((int)out.size() >= cap) return false;
-                const rescue_prune_neon::Comp &c = v.comps[k];
-                rb_comp K;
-                K.ub = c.ub; K.i0 = c.i0; K.dlo = c.a - v.off; K.dhi = c.b - 1 - v.off; K.dmaxhit = c.dmax - v.off;
-                out.push_back(K);
-            }
-            return true;
-        }
-        for (int d = neon_next(v.mw, xa, xb, 0); d < xb;) {
-            const int b = neon_next(v.mw, d, xb, ~0ull);
+        bool ok;
+        if (rb_components_listed(v, tau, xa, xb, out, cap, &ok)) return ok;
+        for (int d = bitset_next(v.mw, xa, xb, 0); d < xb;) {
+            const int b = bitset_next(v.mw, d, xb, ~0ull);
             if (!emit(d, b)) return false;
-            d = neon_next(v.mw, b, xb, 0);
+            d = bitset_next(v.mw, b, xb, 0);
         }
         return true;
     }
@@ -285,9 +355,19 @@ bool rescue_band_components(const rescue_prune_view &v, int tau, int xa, int xb,
 {
 #if defined(__aarch64__)
     if (v.bnd16 && v.mw && v.hw && tau >= rescue_prune_neon::MINSC) return rb_components_neon(v, tau, xa, xb, out, cap);
+#else
+    {
+        bool ok;
+        if (rb_components_listed(v, tau, xa, xb, out, cap, &ok)) return ok;   // the x86 filter's list
+    }
 #endif
-    /* A NEON view always carries mw / hw, and plan() asks only for tau >= minsc >= 19, so it always
-     * takes the branch above; what reaches here is a scalar view (fwd / bwd). */
+    /* A NEON view always carries mw / hw, and plan() asks only for tau >= minsc >= 19, so on aarch64
+     * it always takes the branch above. What reaches here is the rest of an x86 filter's view (bnd16,
+     * the bound precomputed: a sub-range, or a threshold above MINSC) or a scalar view (fwd / bwd). */
+    if (v.bnd16) {
+        const int16_t *b16 = v.bnd16;
+        return rb_components_scalar(v, [b16](int x) { return (int)b16[x]; }, tau, xa, xb, out, cap);
+    }
     const int32_t *fw = v.fwd, *bw = v.bwd;
     const uint16_t *cn = v.cnt;
     return rb_components_scalar(v, [fw, bw, cn](int x) { return 5 + fw[x] + bw[x] - ((int)cn[x] - 1); },
@@ -309,6 +389,10 @@ bool RescueBandBatch::plan(const rescue_prune_view &v, int len1, int len2, int h
     /* The component views are derived for minsc >= the NEON filter's threshold, and the 8-bit kernel
      * holds scores up to 255. */
     if (v.nd < 0 || minsc < rescue_prune_neon::MINSC || minsc > 255) return false;
+    /* A cost gate of 0 (the default where kswv runs at the AVX-512BW tier, rb_cost_pct) declines
+     * every parent, so skip the component work it would decline afterwards; counted as declined by
+     * the cost model, which is what the gate below would do. */
+    if (rb_cost_pct() == 0) { stats_.planned_no++; return false; }
     const int quanta = kswv_query_quantum8(len2);
     const int H = he - hb + 1;
     bool ok = v.off == quanta && H > 0;
@@ -322,6 +406,14 @@ bool RescueBandBatch::plan(const rescue_prune_view &v, int len1, int len2, int h
             if (K.ub > ub1) { ub2 = ub1; ub1 = K.ub; }
             else if (K.ub > ub2) ub2 = K.ub;
         }
+#if RB_X86
+        /* The x86 cell's biased add is exact only while every H <= 250 (rescue_band_kernel_x86.h).
+         * A band H is a local alignment score, so at most len2 * a = len2 here (a = 1 under
+         * rescue_prune_scoring_ok), and the 8-bit kernel path admits only len2 * a + 4 <= 254
+         * (matesw_use_u8's bias of 4 at this scoring), i.e. len2 <= 250. This check restates that
+         * bound locally, so a change to the 8-bit admission cannot make the cell inexact. */
+        if (len2 > 250) ok = false;
+#endif
         T1 = std::max(minsc, ub2 / 2);
         /* Tight top band. When the whole hull lies inside the zone [te - S, te + S], the true
          * score2 is exactly -1 (every row with R >= minsc is in the hull, so no b[] anchor can be
@@ -860,6 +952,33 @@ static long rb_dp_wave2(rb_work &w, int W, int NR, int omax, int ominq, int omas
 
 
 #if defined(__aarch64__)
+/* QL[p] = live mask of A[p] (0xFF unless the query code is 0xC0, nonexistent) for p in [0, P). */
+static inline void rb_build_ql(const uint8_t *A, uint8_t *QL, int P)
+{
+    const uint8x16_t vc0 = vdupq_n_u8(0xC0);
+    for (int p = 0; p < P; p++) vst1q_u8(QL + p * 16, vcltq_u8(vld1q_u8(A + p * 16), vc0));
+}
+
+/* R (NR rows of RB_L interleaved row maxima) back to lane-major: lane l's rows at RL + l * rls,
+ * then zeroed past its own nrows[l] up to rls, so per-lane work is contiguous vector code. */
+static inline void rb_rows_to_lane_major(const uint8_t *R, int NR, int nl, const int *nrows, uint8_t *RL, int rls)
+{
+    uint8x16_t rr[16];
+    for (int b = 0; b < NR; b += 16) {
+        for (int t = 0; t < 16; t++) rr[t] = vld1q_u8(R + (size_t)(b + t) * 16);
+        neon_transpose16x16_u8(rr);
+        for (int l = 0; l < nl; l++) vst1q_u8(RL + (size_t)l * rls + b, rr[l]);
+    }
+    for (int l = 0; l < nl; l++) memset(RL + (size_t)l * rls + nrows[l], 0, rls - nrows[l]);
+}
+
+/* buf[r] = max(buf[r], Rl[r]) for r in [0, n) in whole 16-byte chunks: both buffers are readable
+ * and writable (buf: zero slack, Rl: zero past n) up to n rounded up to 16. */
+static inline void rb_merge_max(uint8_t *buf, const uint8_t *Rl, int n)
+{
+    for (int r = 0; r < n; r += 16) vst1q_u8(buf + r, vmaxq_u8(vld1q_u8(buf + r), vld1q_u8(Rl + r)));
+}
+
 /* kswv's score2 / te2 for a CONTIGUOUS row-max array R[k] of rows row0 + k, k in [0, n), whose
  * slack R[n, n + 16] is zero (so row n - 1 sees a 0 successor, as it does in the merged hull view):
  * lagged rising-row zeroing (a row followed by a higher one is 0; the last row and every row
@@ -867,8 +986,7 @@ static long rb_dp_wave2(rb_work &w, int W, int NR, int omax, int ominq, int omas
  * >= minsc test run 16 rows per vector; only qualifying rows reach the scalar b[] emulation. */
 static void rb_score2_vec(const uint8_t *R, int n, int row0, int S, int te, int minsc, int *score2, int *te2)
 {
-    const int low = te - S, high = te + S;
-    int s2 = -1, t2 = -1, bs = -1, bp = -2;
+    rb_score2_scan sc(te - S, te + S);
     const uint8x16_t ms = vdupq_n_u8((uint8_t)minsc);
     alignas(16) uint8_t vb[16];
     for (int k0 = 0; k0 < n; k0 += 16) {
@@ -880,18 +998,10 @@ static void rb_score2_vec(const uint8_t *R, int n, int row0, int S, int te, int 
         do {
             const int t = __builtin_ctzll(m) >> 2;
             m &= ~(0xFull << (t * 4));
-            const int val = vb[t], i = row0 + k0 + t;
-            if (bp + 1 != i) {
-                if (bp >= 0 && (bp < low || bp > high) && bs > s2) { s2 = bs; t2 = bp; }
-                bs = val; bp = i;
-            } else if (bs < val) {
-                bs = val; bp = i;
-            }
+            sc.row(row0 + k0 + t, vb[t]);
         } while (m);
     }
-    if (bp >= 0 && (bp < low || bp > high) && bs > s2) { s2 = bs; t2 = bp; }
-    *score2 = s2;
-    *te2 = t2;
+    sc.finish(score2, te2);
 }
 #endif
 
@@ -901,12 +1011,12 @@ static inline int rb_width_bucket(int w)
                                                                                  : 14 + ((w - 128 + 31) >> 5);
 }
 
-/* Run jobs_ in groups of 16 lanes. Pass 0 (pass1 == false) merges each lane into its parent
+/* Run jobs_ in groups of RB_L lanes. Pass 0 (pass1 == false) merges each lane into its parent
  * (ps_[parent]); pass 1 only needs each lane's gmax / first row / first column, stored in
  * p1res_[parent], and skips the row-max transpose. Stage counters cover pass 0 only. */
 void RescueBandBatch::run_jobs(bool pass1)
 {
-#if defined(__aarch64__)
+#if RB_HAVE_SIMD
     static thread_local rb_work w;   // kernel scratch, only live within this call
     const int n = (int)jobs_.size();
     if (n == 0) return;
@@ -919,9 +1029,9 @@ void RescueBandBatch::run_jobs(bool pass1)
     }
     std::sort(order_.begin(), order_.end(), [this](int a, int b) { return jobs_[a].key < jobs_[b].key; });
     const bool st = rb_stats_on() && !pass1;
-    for (int g = 0; g < n; g += 16) {
-        const int nl = std::min(16, n - g);
-        const job *L[16];
+    for (int g = 0; g < n; g += RB_L) {
+        const int nl = std::min(RB_L, n - g);
+        const job *L[RB_L];
         int W = 1, NR = 1;
         for (int l = 0; l < nl; l++) {
             L[l] = &jobs_[order_[g + l]];
@@ -934,12 +1044,12 @@ void RescueBandBatch::run_jobs(bool pass1)
         }
         /* ---- SoA build ---- */
         const int C = W - 1, P = NR + W - 1;
-        const int Pp = (P + 15) & ~15, NRp = (NR + 15) & ~15;
+        const int Pp = (P + RB_PAD - 1) & ~(RB_PAD - 1), NRp = (NR + RB_PAD - 1) & ~(RB_PAD - 1);
         const int stride = std::max(Pp, NRp);
-        rb_work::fit(w.A, (size_t)Pp * 16); rb_work::fit(w.QL, (size_t)Pp * 16);
-        rb_work::fit(w.REF, (size_t)NRp * 16); rb_work::fit(w.H, (size_t)W * 48);
-        rb_work::fit(w.E, (size_t)(W + 2) * 16); rb_work::fit(w.R, (size_t)NRp * 16);
-        rb_work::fit(w.SNAP, (size_t)W * 16); rb_work::fit(w.ST, (size_t)stride * 16);
+        rb_work::fit(w.A, (size_t)Pp * RB_L); rb_work::fit(w.QL, (size_t)Pp * RB_L);
+        rb_work::fit(w.REF, (size_t)NRp * RB_L); rb_work::fit(w.H, (size_t)W * 3 * RB_L);
+        rb_work::fit(w.E, (size_t)(W + 2) * RB_L); rb_work::fit(w.R, (size_t)NRp * RB_L);
+        rb_work::fit(w.SNAP, (size_t)W * RB_L); rb_work::fit(w.ST, (size_t)stride * RB_L);
         /* Band shift: a lane narrower than the group is widened to W anyway; put the spare
          * diagonals BELOW its band (dlo - delta) rather than above whenever that moves its query
          * offset o = r0 - dlo up toward the group's largest, so the lanes' live column ranges
@@ -947,7 +1057,7 @@ void RescueBandBatch::run_jobs(bool pass1)
          * pass-0 cells on real jobs. Exact: the lane's cells are a superset of its band's, which
          * rescue_band.h shows keeps every property the merge relies on, and the pass-1 band
          * [-Imax, Dmax] only gets more insertion diagonals. oe[l] replaces o everywhere below. */
-        int oe[16];
+        int oe[RB_L];
         {
             int om = INT_MIN;
             for (int l = 0; l < nl; l++) om = std::max(om, L[l]->r0 - L[l]->dlo);
@@ -957,7 +1067,7 @@ void RescueBandBatch::run_jobs(bool pass1)
             }
         }
         uint8_t *ST = w.ST.data();
-        for (int l = 0; l < 16; l++) {
+        for (int l = 0; l < RB_L; l++) {
             uint8_t *row = ST + (size_t)l * stride;
             memset(row, 0xC0, Pp);
             if (l >= nl) continue;
@@ -967,16 +1077,11 @@ void RescueBandBatch::run_jobs(bool pass1)
             const uint8_t *q = J.qry - pq0;
             for (int p = a; p < b; p++) { const uint8_t c = q[p]; row[p] = c < 4 ? c : 8; }
             const int c0 = std::max(0, pq0 + J.len2), c1 = std::min(P, pq0 + J.quanta);
-            if (c1 > c0) memset(row + c0, 0x40, c1 - c0);
+            if (c1 > c0) memset(row + c0, RB_QPAD, c1 - c0);
         }
         rb_transpose_to(ST, stride, P, w.A.data());
-        {
-            const uint8x16_t vc0 = vdupq_n_u8(0xC0);
-            const uint8_t *Ap = w.A.data();
-            uint8_t *Qp = w.QL.data();
-            for (int p = 0; p < P; p++) vst1q_u8(Qp + p * 16, vcltq_u8(vld1q_u8(Ap + p * 16), vc0));
-        }
-        for (int l = 0; l < 16; l++) {
+        rb_build_ql(w.A.data(), w.QL.data(), P);
+        for (int l = 0; l < RB_L; l++) {
             uint8_t *row = ST + (size_t)l * stride;
             int rows = 0;
             if (l < nl) {
@@ -989,8 +1094,8 @@ void RescueBandBatch::run_jobs(bool pass1)
         }
         rb_transpose_to(ST, stride, NR, w.REF.data());
         /* Prefetch the next group's reference windows (staged by _pre, possibly out of L1/L2). */
-        for (int l = 0; l < 16 && g + 16 + l < n; l++) {
-            const job &J = jobs_[order_[g + 16 + l]];
+        for (int l = 0; l < RB_L && g + RB_L + l < n; l++) {
+            const job &J = jobs_[order_[g + RB_L + l]];
             for (int r = 0; r < J.nrows; r += 64) __builtin_prefetch(J.ref + J.r0 + r, 0, 1);
             __builtin_prefetch(J.qry, 0, 1);
             __builtin_prefetch(J.qry + 64, 0, 1);
@@ -1003,12 +1108,12 @@ void RescueBandBatch::run_jobs(bool pass1)
             ominq = std::min(ominq, o - L[l]->quanta + 1);
             omaskq = std::max(omaskq, o - L[l]->quanta + 1);
         }
-        for (int l = 0; l < 16; l++) w.target[l] = pass1 && l < nl ? (uint8_t)L[l]->target : 0;
+        for (int l = 0; l < RB_L; l++) w.target[l] = pass1 && l < nl ? (uint8_t)L[l]->target : 0;
         const int kern = rb_kernel();
         const long computed = kern >= 2 ? rb_dp_wave2(w, W, NR, omax, ominq, omaskq, pass1)
                             : kern == 1 ? rb_dp_core<true>(w, W, NR, omax, ominq, omaskq, pass1)
                                         : rb_dp_core<false>(w, W, NR, omax, ominq, omaskq, pass1);
-        if (st) stats_.cells_pad += (uint64_t)16 * computed;
+        if (st) stats_.cells_pad += (uint64_t)RB_L * computed;
         /* Lane l's gmax, the first row reaching it and the first column holding it there. */
         auto lane_result = [&](int l) {
             const job &J = *L[l];
@@ -1019,7 +1124,7 @@ void RescueBandBatch::run_jobs(bool pass1)
                 if (kern >= 2) x.qe = rt - ((int)w.kb_chunk[l] * 255 + (int)w.kb_off[l] - 1) + oe[l];
                 else
                     for (int k = W - 1; k >= 0; k--)   // max k == min j
-                        if (w.SNAP[k * 16 + l] == x.g) { x.qe = rt - k + oe[l]; break; }
+                        if (w.SNAP[k * RB_L + l] == x.g) { x.qe = rt - k + oe[l]; break; }
             }
             return x;
         };
@@ -1028,19 +1133,14 @@ void RescueBandBatch::run_jobs(bool pass1)
             continue;
         }
         /* ---- merge into the parents ---- */
-        /* R back to lane-major (16x16 transposes), each lane's rows past its range zeroed, so
-         * per-lane work below is contiguous vector code. */
+        /* R back to lane-major, each lane's rows past its range zeroed, so per-lane work below is
+         * contiguous vector code. */
         const int rls = NRp + 32;
-        rb_work::fit(w.RL, (size_t)rls * 16);
+        rb_work::fit(w.RL, (size_t)rls * RB_L);
         {
-            uint8x16_t rr[16];
-            uint8_t *RL = w.RL.data();
-            for (int b = 0; b < NR; b += 16) {
-                for (int t = 0; t < 16; t++) rr[t] = vld1q_u8(w.R.data() + (size_t)(b + t) * 16);
-                neon_transpose16x16_u8(rr);
-                for (int l = 0; l < nl; l++) vst1q_u8(RL + (size_t)l * rls + b, rr[l]);
-            }
-            for (int l = 0; l < nl; l++) memset(RL + (size_t)l * rls + L[l]->nrows, 0, rls - L[l]->nrows);
+            int nrows[RB_L];
+            for (int l = 0; l < nl; l++) nrows[l] = L[l]->nrows;
+            rb_rows_to_lane_major(w.R.data(), NR, nl, nrows, w.RL.data(), rls);
         }
         for (int l = 0; l < nl; l++) {
             const job &J = *L[l];
@@ -1055,9 +1155,8 @@ void RescueBandBatch::run_jobs(bool pass1)
                 else p.s2 = p.te2 = -1;
             } else {
                 /* rbuf has >= 32 bytes of zeroed slack past the hull, and Rl is zero past nrows,
-                 * so whole 16-row chunks can be max-merged. */
-                uint8_t *buf = rpool_.data() + p.rbuf + J.r0;
-                for (int r = 0; r < J.nrows; r += 16) vst1q_u8(buf + r, vmaxq_u8(vld1q_u8(buf + r), vld1q_u8(Rl + r)));
+                 * so whole vector chunks can be max-merged. */
+                rb_merge_max(rpool_.data() + p.rbuf + J.r0, Rl, J.nrows);
                 if (g8 > p.S) { p.S = g8; p.te = te; p.qe = qe; }
                 else if (g8 == p.S && g8 > 0) {
                     if (te < p.te) { p.te = te; p.qe = qe; }
@@ -1074,10 +1173,10 @@ void RescueBandBatch::finish_parent(pstate &p)
     if (p.rbuf >= 0) {
         const int minsc = recs_[p.rec].minsc;
         if (p.S >= minsc) {
-#if defined(__aarch64__)
+#if RB_HAVE_SIMD
             rb_score2_vec(rpool_.data() + p.rbuf, p.L, 0, p.S, p.te, minsc, &p.s2, &p.te2);
 #else
-            assert(!"banded rescue is aarch64-only: rescue_band_enabled() is false elsewhere");
+            assert(!"banded rescue needs a SIMD kernel: rescue_band_enabled() is false without one");
 #endif
         } else
             p.s2 = p.te2 = -1;
@@ -1200,7 +1299,7 @@ void RescueBandBatch::run_pass0(const SeqPair *pairs, int nb, const uint8_t *seq
 
 bool RescueBandBatch::take_pass1(const SeqPair &sp, const kswr_t &r, bool banded_parent)
 {
-#if defined(__aarch64__)
+#if RB_HAVE_SIMD
     if (rb_p1_mode() < (banded_parent ? 1 : 2)) return false;
     const int S = r.score, te = r.te, qe = r.qe;
     /* 8-bit and unsaturated (kswv's 255 sentinel is S + shift >= 255, shift 4), and a real end. */
