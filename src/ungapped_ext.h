@@ -42,8 +42,61 @@
 //                        score). The exact ladders do NOT stop on it
 //                        -- see ACCEPT_PAIR.
 //
-//   FP_STATUS_FALLBACK — ambig base or out-of-range length. Caller uses
-//                        opt->w with the full retry loop.
+//   FP_STATUS_FALLBACK — ambig base, out-of-range length, the fast path off
+//                        (x_threshold < 0), or a HIT candidate whose
+//                        b*total_mis exceeds a positive zdrop (E2). Caller
+//                        uses opt->w with the full retry loop.
+//
+// HIT envelope -- why a HIT commits exactly what the full-width retry ladder
+// over the extension kernel (ksw_extend2 semantics: scalarBandedSWA and the
+// vector kernels validated against it) would commit. Notation: N = query
+// length (len2), rows i index the target (len1 >= N rows exist: the caller
+// gates len1 >= len2), X = total_mis <= x_threshold, and D(i) is the
+// diagonal cell H(i,i), which equals this walk's cur after i+1 steps while
+// the walk is alive.
+//
+//   Bound. A path to any cell (i,j) with j != i, or to (i,i) through a gap,
+//   pays >= o_min + e_min and gains <= a per aligned column, so
+//   H(i,j) <= h0 + a*(min(i,j)+1) - o_min - e_min. The diagonal keeps
+//   D(i) >= h0 + a*(i+1) - X*(a+b) (X mismatches at -b, each also forgoing
+//   +a). x_threshold is the largest X with X*(a+b) < o_min + e_min
+//   (ungapped_x_threshold), so every non-diagonal cell in row i is STRICTLY
+//   below D(i), and every cell in rows i >= N (no diagonal cell) is strictly
+//   below D(N-1).
+//   Hence, for every band w >= 0 (the diagonal is always in band, and the
+//   band-edge shrink never drops it because D(i) > 0):
+//   (1) row max m = D(i) at mj = i, so no record moves off the diagonal:
+//       max_off == 0, and qle == tle;
+//   (2) the record sequence is the walk's, under the kernel's STRICT
+//       `m > max` (earliest tied row): see ungapped_walk_mis_perbase;
+//   (3) gscore: the last-column cell of row N-1 is D(N-1) == the walk's final
+//       cur, and every other last-column cell is strictly below it, so
+//       gscore == cur and (with the kernel's `gscore > h1 ? keep : i`, ties
+//       to the later row) gtle == N;
+//   (4) the clip decision `gscore <= 0 || gscore <= score - pen_clip` reads
+//       only (2) and (3), so both branches commit identical qb/rb/qe/re/truesc.
+//   Control flow -- the parts the bound does not pin:
+//   (E1) the ladder's first rung accepts on max_off == 0 iff
+//        (w>>1)+(w>>2) > 0, i.e. opt->w >= 2, so the region records
+//        a->w = opt->w exactly as the HIT commit does. ungapped_x_threshold
+//        returns -1 for opt->w < 2, which turns the whole fast path off there
+//        (the TIGHT band bound too).
+//   (E2) z-drop breaks on max - m > zdrop at zero diagonal distance, and
+//        max - D(i) <= b*X, so b*total_mis <= zdrop (or zdrop <= 0) rules it
+//        out. ungapped_analyze rejects the rest (guard E2 below).
+//   (E3) the all-zero-row break fires exactly where this walk freezes (D(k)
+//        reaches 0 at a mismatch, which the walk floors and then skips).
+//        Any gapped path alive at some row needs the diagonal above o_min +
+//        e_min at its branch row, and the remaining mismatches can lower it by
+//        at most b*X < o_min + e_min, so a diagonal that dies never had a live
+//        gapped cell: the kernel's gscore is then 0 or -1 and the walk's is 0,
+//        both branch A, and (2) already fixes qle/tle. No guard is needed.
+//   The bound uses a as the matrix maximum and -b as the mismatch score:
+//   opt->mat is bwa_fill_scmat(a, b) whenever the fast path is enabled
+//   (--meth turns it off). Ambiguous bases (code >= 4) fall back before any
+//   of this. Pinned differentially against scalarBandedSWA and ksw_extend2
+//   in test/unit/test_ungapped_fastpath.cpp and end to end against bwa in
+//   test/ungapped_hit_parity_test.sh.
 //
 // Derivation of tight_band: for any alignment with band offset B from
 // diagonal, min B gaps are required; cost ≥ B · (o_min + e_min). Max
@@ -71,6 +124,16 @@
 #define FP_STATUS_HIT       1
 #define FP_STATUS_TIGHT     2
 
+/* The per-call fast-path threshold: the largest mismatch count X for which a HIT is
+ * sound (X*(a+b) < o_min + e_min, the HIT envelope's Bound), or -1 -- fast path off
+ * -- when nothing is provable (a+b <= 0 or free gaps) or opt->w < 2 (E1). Computed
+ * once per mem_chain2aln_across_reads_V2 call and passed to ungapped_analyze. */
+static inline int ungapped_x_threshold(int a, int b, int o_min, int e_min, int w)
+{
+    const int gap_min = o_min + e_min, denom = a + b;
+    return (denom > 0 && gap_min > 0 && w >= 2) ? ((gap_min - 1) / denom) : -1;
+}
+
 /* Q3 helper: would-be ungapped extension score for arbitrary N. Mirrors the
  * HIT-path scalar walk in ungapped_analyze (cur with floor at 0; max_sc
  * tracker; ambig terminates the walk to match analyze's FALLBACK semantics).
@@ -89,34 +152,27 @@ static inline int ungapped_walk_score(const uint8_t *qs, const uint8_t *rs,
             cur -= b;
             if (cur < 0) cur = 0;
         }
-        if (cur >= max_sc) max_sc = cur;
+        if (cur > max_sc) max_sc = cur;
     }
     return max_sc;
 }
 
-/* Mismatch-run form of the ungapped walk (byte-identical). ungapped_analyze has
- * already rejected every pair holding an ambiguous base in [0, N) and built the
- * mismatch bitmask `mis`, so the per-base walk it then runs (the HIT walk
- * below, and ungapped_walk_score on the TIGHT path) only ever sees match /
- * mismatch steps. With a > 0, b >= 0 and h0 > 0 those steps have a closed form
- * between mismatches:
- *  - cur > 0 on entry to a run of r matches stays > 0 and rises by a per step,
- *    so the run's per-step `cur >= max_sc` updates reduce to one test of the
- *    run's last value (strictly increasing: the last step is both the largest
- *    and the rightmost, which is what the >= tie-break selects); if the last
- *    value is below max_sc, so is every earlier one.
- *  - a mismatch step is applied exactly as in the loop (cur -= b, floor at 0,
- *    then the >= test).
- *  - once cur reaches 0 the loop's `if (cur == 0) continue` freezes every
- *    output for the rest of the walk, so the run form stops there.
- * So the walk costs one step per mismatch (<= x_threshold on a HIT, a handful
- * on TIGHT) instead of one per base. Outside that envelope (a <= 0, b < 0,
- * h0 <= 0) the original per-base loop runs. Outputs: max_sc, max_i (the
- * rightmost position reaching it), and the final cur. */
 /* The per-base walk over the mismatch bitmask: match +a, mismatch -b floored at 0,
- * and frozen once the score reaches 0; max_sc and max_i (the rightmost position
- * reaching it, the >= tie-break) as the banded SW sees them. The reference form
- * the run-length walk below must equal, and its fallback outside that envelope. */
+ * and frozen once the score reaches 0; max_sc and max_i as the banded SW sees
+ * them. The reference form the run-length walk below must equal, and its
+ * fallback outside that walk's envelope.
+ *
+ * Tie-break: the diagonal cell (j, j) is the row maximum of DP row j (see the
+ * HIT envelope above), so each step of this walk is one kernel ROW, and the
+ * kernel's global record is `if (m > max)` -- strict, the EARLIEST row keeps a
+ * tied maximum (ksw_extend2 and scalarBandedSWA alike; the vector kernels
+ * update their best-row side channel only when the running max strictly
+ * grows). The walk therefore records a new max_i only on a STRICT increase.
+ * The kernel's within-row `mj = m > h ? mj : j` (rightmost tie) never applies
+ * here because the walk visits one cell per row. An earlier `>=` here moved
+ * qle/tle to the LATER tied position and changed the clip decision's qb/rb
+ * whenever the extension ended on a tie (`-L 0`, or a scoring scheme admitting
+ * a second mismatch after the tie) -- test/ungapped_hit_parity_test.sh. */
 static inline void ungapped_walk_mis_perbase(const uint64_t *mis, int N, int h0, int a, int b,
                                              int *out_max_sc, int *out_max_i, int *out_cur)
 {
@@ -129,7 +185,7 @@ static inline void ungapped_walk_mis_perbase(const uint64_t *mis, int N, int h0,
             cur -= b;
             if (cur < 0) cur = 0;
         }
-        if (cur >= max_sc) { max_sc = cur; max_i = j + 1; }
+        if (cur > max_sc) { max_sc = cur; max_i = j + 1; }
     }
     *out_max_sc = max_sc; *out_max_i = max_i; *out_cur = cur;
 }
@@ -141,12 +197,14 @@ static inline void ungapped_walk_mis_perbase(const uint64_t *mis, int N, int h0,
  * and the TIGHT path's walk score) only ever sees match / mismatch steps. With
  * a > 0, b >= 0 and h0 > 0 those steps have a closed form between mismatches:
  *  - cur > 0 on entry to a run of r matches stays > 0 and rises by a per step,
- *    so the run's per-step `cur >= max_sc` updates reduce to one test of the
- *    run's last value (strictly increasing: the last step is both the largest
- *    and the rightmost, which is what the >= tie-break selects); if the last
- *    value is below max_sc, so is every earlier one.
- *  - a mismatch step is applied exactly as in the loop (cur -= b, floor at 0,
- *    then the >= test).
+ *    so the run's per-step `cur > max_sc` updates reduce to one test of the
+ *    run's last value (strictly increasing: the last step is the largest, and
+ *    the only one that can set a new record); if the last value is not above
+ *    max_sc, neither is any earlier one.
+ *  - a mismatch step is applied exactly as in the loop (cur -= b, floor at 0).
+ *    It cannot set a record: cur <= max_sc holds before it and it does not
+ *    increase cur (b >= 0), so the per-base walk's `cur > max_sc` test is
+ *    false there and is omitted.
  *  - once cur reaches 0 the per-base walk's `if (cur == 0) continue` freezes
  *    every output for the rest of the walk, so the run form stops there.
  * So the walk costs one step per mismatch (<= x_threshold on a HIT, a handful
@@ -171,12 +229,11 @@ static inline void ungapped_walk_mis(const uint64_t *mis, int N, int h0, int a, 
         }
         if (m > j) {
             cur += (m - j) * a;
-            if (cur >= max_sc) { max_sc = cur; max_i = m; }
+            if (cur > max_sc) { max_sc = cur; max_i = m; }
         }
         if (m >= N) break;
         cur -= b;
         if (cur < 0) cur = 0;
-        if (cur >= max_sc) { max_sc = cur; max_i = m + 1; }
         if (cur == 0) break;
         j = m + 1;
     }
@@ -206,7 +263,7 @@ static inline int ungapped_walk_score_mis(const uint64_t *mis, int N, int h0, in
 static inline int ungapped_analyze(const uint8_t *qs, const uint8_t *rs, int N,
                                     int h0, int a, int b,
                                     int o_min, int e_min,
-                                    int x_threshold, int default_w,
+                                    int x_threshold, int default_w, int zdrop,
                                     int *out_score, int *out_qle,
                                     int *out_gscore, int *out_gtle,
                                     int *out_tight_band)
@@ -301,13 +358,23 @@ static inline int ungapped_analyze(const uint8_t *qs, const uint8_t *rs, int N,
         return FP_STATUS_TIGHT;
     }
 
+    // HIT candidate: total_mis <= x_threshold. Guard E2 (HIT envelope above):
+    // z-drop cannot fire. On the diagonal the drop below the running record is
+    // at most b*total_mis (the record, then every mismatch), and the kernel
+    // breaks on `max - m > zdrop` with a zero diagonal distance, so
+    // b*total_mis <= zdrop rules the break out; zdrop <= 0 disables it. With
+    // -d 3 at default scoring one mismatch (drop 4) truncated the kernel's
+    // extension where the walk went on to a higher score. A no-op at the
+    // default -d 100 (b*X = 4).
+    if (zdrop > 0 && (int64_t)b * total_mis > zdrop) return FP_STATUS_FALLBACK;
+
     // Closed-form fast path: total_mis == 0 (perfect-match HIT).
     //
     // With no mismatches the scalar walk below is deterministic:
     //   cur starts at h0 and only increases (+a per iter), so it never
     //   touches the `cur == 0` early-skip after the first iteration.
-    //   max_sc rises to h0 + N*a; max_i ends at N (the >= tie-break
-    //   updates max_i on every step).
+    //   max_sc rises to h0 + N*a; max_i ends at N (every step is a strict
+    //   increase, so every step sets a new record).
     //
     // The h0 > 0 guard preserves bit-identicality with the loop: when
     // h0 == 0 the loop's `if (cur == 0) continue` inhibits all updates,
@@ -325,16 +392,14 @@ static inline int ungapped_analyze(const uint8_t *qs, const uint8_t *rs, int N,
         return FP_STATUS_HIT;
     }
 
-    // HIT candidate: run the scalar walk for precise qle / gscore / max_sc.
+    // HIT: run the scalar walk for precise qle / gscore / max_sc.
     //
     // MAIN_CODE* local-SW semantics: once cur==0 in the ungapped path it
-    // stays 0 (no e/f restart).
+    // stays 0 (no e/f restart); the kernel's all-zero-row break fires on the
+    // same row (HIT envelope, E3).
     //
-    // Tie-break: SW's maxRS tracker (bandedSWA.cpp MAIN_CODE) updates the
-    // position on BOTH strictly-greater and tied equal-to-current
-    // comparisons — equivalent to "pick the rightmost position where the
-    // max was achieved". We must mirror that (use >=) or qle/tle diverge
-    // from SW on tied-score walks, breaking byte-identical SAM.
+    // Tie-break: strict, earliest position (see ungapped_walk_mis_perbase):
+    // the kernels' cross-row record test is `m > max`.
     int cur, max_sc, max_i;
     ungapped_walk_mis(mis, N, h0, a, b, &max_sc, &max_i, &cur);
 

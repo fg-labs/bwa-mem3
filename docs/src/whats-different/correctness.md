@@ -528,6 +528,50 @@ last, under `--adaptive-band`. `test/unit/test_extension_ladder.cpp` checks the 
 a model of the ladder over a parameter grid against both `scalarBandedSWA` and upstream's
 `ksw_extend2`, and that past it a third rung changes the committed alignment.
 
+## Ungapped fast path: record tie-break and z-drop (PR #544)
+
+Before banded SW, an extension whose diagonal holds at most `x_threshold` mismatches (one at
+default scoring) is committed from an ungapped walk instead, since no gapped alignment can tie
+it. The walk must then reproduce every field the extension kernel would have reported, and two
+did not match:
+
+- The walk moved its record to the *later* of two tied positions, while the kernels'
+  cross-row record test is strict (`m > max`, the earlier row keeps a tie; the rightmost
+  tie-break the comment cited is the kernels' within-row rule, which a diagonal walk never
+  exercises). A diagonal that returns to its record without exceeding it, a mismatch followed
+  by exactly `b/a` matches, therefore reported a longer `qle`. At the default `-L 5` the
+  difference is invisible: such an extension ends at its record, so the query-end score equals
+  the local score and the clip decision takes the query-end branch on both sides. It shows
+  under `-L 0`, where bwa reports `5S145M` and bwa-mem3 reported `150M` with `NM:i:1`, and
+  under gap costs that admit a second mismatch after the tie (`-O 20`: `7S143M` against
+  `2S148M`).
+- The kernels z-drop when the score falls more than `-d` below the running maximum, and one
+  mismatch drops it by `b`. With `-d` below `b * x_threshold` the kernels stop at the mismatch
+  where the walk went on: under `-d 3` bwa reports `11S139M`, `AS:i:139` and bwa-mem3 reported
+  `150M`, `AS:i:145`.
+
+The walk now records a new maximum only on a strict increase, and `ungapped_analyze` falls
+back to the kernel when `b * mismatches` exceeds a positive `-d`. The fast path is also off
+when `-w` is below 2 (0 or 1): at those widths the ladder cannot accept its first rung, so the
+band it records would differ from the fast path's. That also drops the tight-band bound there.
+The full argument that a HIT commits exactly the ladder's fields, including the case where the
+diagonal falls to zero, is written above `ungapped_analyze` in `src/ungapped_ext.h`. It is
+checked in `test/unit/test_ungapped_fastpath.cpp` against both `scalarBandedSWA` and upstream's
+`ksw_extend2` over a `-A/-B/-O/-E/-L/-d/-w` grid (asymmetric gap costs and queries up to the
+fast path's 512-base limit included) with random and adversarial pairs, and end to end in
+`test/ungapped_hit_parity_test.sh`.
+
+At default parameters the output is unchanged: the z-drop guard is inert at `-d 100`, the
+`-w` gate cannot fire at `-w 100`, and the tie-break is invisible at `-L 5` with one admissible
+mismatch. Measured scope: on an Apple M3 Ultra (arm64, NEON, Apple clang 21.0.0), hg38 (GRCh38
+with ALT/decoy), `-t 16`, SAM minus `@PG` was identical to the previous build on 1 M HG002 WGS
+150 bp pairs (paired and single-end), 1.86 M ~250 bp single-end SBX HG002 reads, and the 1 M
+pairs at `-A 2 -B 8` and `-O 8 -E 2`. On the 1 M pairs, bwa-mem3 under `--compat=bwa-mem` now
+matches bwa 0.7.19 line for line at `-L 0`, `-O 20` and `-d 3`, where 8,158, 485 and 210,601
+reads changed (29,824, 1,588 and 836,494 lines differed from bwa before), as well as at
+defaults. Wall time on 5 M HG00096 pairs was 31.90-32.05 s against 32.07-32.24 s before
+(3 interleaved runs each).
+
 ## Upstream port divergences: all chains dropped by the weight filter (PR #489) and the SA sentinel offset (PR #469)
 
 bwa-mem2 advertises output identical to bwa. Two records are known where its port is not
@@ -573,6 +617,7 @@ shipped, because parity with that release is its contract (see
 | 8-bit banded-SW score for a negative seed score depended on its SIMD group | [#528](https://github.com/fg-labs/bwa-mem3/pull/528) | — | fork-only (`--meth` only; records whose extension had a negative seed score can change and are now independent of batching; non-`--meth` output byte-identical by construction — see the PR #528 correctness note above) |
 | Extension retry ladder stopped early on the ungapped band bound | [#540](https://github.com/fg-labs/bwa-mem3/pull/540) | — | fork-only (a record can change only where the early stop diverged from the full ladder, by recording a narrower band or different extension end fields; none changed on the WGS or SBX sets measured — see the correctness note above) |
 | Extension retry ladder ran four rungs where upstream runs two | [#543](https://github.com/fg-labs/bwa-mem3/pull/543) | — | fork-only (only an extension of more than 156 query bases at the default `-w 100` and scoring can reach a third rung, so under those defaults 150 bp reads are unchanged by construction; a narrower `-w` lowers the bound (`a*L > o_min + e_min*3w/2`, more than 36 query bases at `-w 20`); longer reads can change CIGAR, `AS` and the recorded band where the stop test failed at `2w` — see the correctness note above) |
+| Ungapped fast path: record tie-break and z-drop guard | [#544](https://github.com/fg-labs/bwa-mem3/pull/544) | — | fork-only (non-default parameters only: `-L 0`, gap costs that admit a second mismatch after a tie, `-d` below `b * x_threshold`, or `-w` below 2; the default `-L 5 -d 100` is byte-identical — see the correctness note above) |
 | kseq2bseq1 zero-initialization | [#22](https://github.com/fg-labs/bwa-mem3/pull/22) | — | fork-only |
 | Proper-pair flag from emitted alignment | [#17](https://github.com/fg-labs/bwa-mem3/pull/17) | — | fork-only, **opt-in** (`--proper-pair-from-emitted`; default matches both upstreams, [#362](https://github.com/fg-labs/bwa-mem3/issues/362)) |
 | All chains dropped by the weight filter: default follows bwa | [#489](https://github.com/fg-labs/bwa-mem3/pull/489) | — ([#310](https://github.com/fg-labs/bwa-mem3/issues/310)) | fork-only; `--compat=bwa-mem2` reproduces bwa-mem2 |

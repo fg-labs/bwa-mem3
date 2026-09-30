@@ -416,6 +416,12 @@ on a synthetic 306 bp read (no record changed on the WGS and ~250 bp sets measur
 The ceiling ladder itself also ran up to four rungs where bwa and bwa-mem2 run two, which
 could change the alignment of extensions longer than 156 query bases at the default `-w` and
 scoring; it now runs upstream's two (see [Correctness fixes](correctness.md#extension-retry-ladder-ran-four-rungs-where-upstream-runs-two-pr-543)).
+The ungapped fast path that skips the ladder for near-diagonal extensions also reported a
+different clip or score than the kernel at `-L 0`, at gap costs admitting a second mismatch
+after a tie, at a small `-d`, and at `-w` below 2; it now matches the kernel across the
+`-A/-B/-O/-E/-L/-d/-w` grid its unit test checks and on the datasets measured on arm64 (NEON)
+(see [Correctness fixes](correctness.md#ungapped-fast-path-record-tie-break-and-z-drop-pr-544)
+for that scope).
 
 ## What differs
 

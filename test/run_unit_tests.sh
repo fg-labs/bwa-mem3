@@ -180,6 +180,12 @@ ok "tight_band_xs_test"
 "$HERE/ladder_rungs_test.sh" "$BWAMEM3" "$FIXTURES" || fail "ladder_rungs_test failed"
 ok "ladder_rungs_test"
 
+# --- ungapped_hit_parity_test ---------------------------------------------
+# The ungapped fast path's HIT commit must reproduce the extension kernel:
+# strict record tie-break (-L 0, -O 20) and the z-drop guard (-d 3).
+"$HERE/ungapped_hit_parity_test.sh" "$BWAMEM3" "$FIXTURES" || fail "ungapped_hit_parity_test failed"
+ok "ungapped_hit_parity_test"
+
 # --- smem_lockstep_parity_test --------------------------------------------
 OUT="$(cd "$HERE" && ./smem_lockstep_parity_test "$FIXTURES/phix.fa" 2>&1)"
 CASES_PASSED="$(echo "$OUT" | sed -nE 's/^([0-9]+) \/ ([0-9]+) cases passed$/\1/p')"

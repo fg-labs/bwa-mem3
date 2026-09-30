@@ -1,8 +1,8 @@
 // test/framework/ext_ladder.h
 //
 // Test-side model of bwamem.cpp's seed-extension retry ladder over a scalar
-// extension kernel, for differential tests of the ladder's rung count. Two
-// independent kernels are
+// extension kernel, for differential tests of the paths that skip or shorten
+// it (the ungapped fast path, the rung count). Two independent kernels are
 // wrapped: bwa-mem3's scalarBandedSWA and upstream bwa's ksw_extend2 (src/ksw.cpp,
 // unchanged from bwa), so a claim of "what the full ladder would commit" is
 // checked against both.
@@ -22,6 +22,7 @@
 #include "bandedSWA.h"
 #include "ksw.h"
 #include "scoring.h"
+#include "ungapped_ext.h"
 
 namespace bwa_tests {
 
@@ -32,6 +33,8 @@ struct ExtScoring {
     void fill_mat() { std::memcpy(mat, build_scoring_matrix(a, b, 1).data(), sizeof mat); }
     int o_min() const { return o_del < o_ins ? o_del : o_ins; }
     int e_min() const { return e_del < e_ins ? e_del : e_ins; }
+    // The production fast-path threshold, including the opt->w >= 2 gate (E1).
+    int x_threshold(int w) const { return ungapped_x_threshold(a, b, o_min(), e_min(), w); }
 };
 
 struct ExtResult {
@@ -94,6 +97,30 @@ inline LadderOutcome run_ladder(ExtKernel k, const ExtScoring &sc, const ExtPair
         prev = r.score;
     }
     return out;
+}
+
+// The fields a left extension commits (bwamem.cpp's post-SW extraction), keyed
+// on the clip decision. qb_shift/rb_shift are what is subtracted from the seed
+// start; `clipped` false means branch B (qb = 0, rb -= gtle, truesc = gscore).
+struct LeftCommit {
+    int score, truesc, qb_shift_or_zero, rb_shift;
+    bool clipped;
+    bool operator==(const LeftCommit &o) const {
+        return score == o.score && truesc == o.truesc && qb_shift_or_zero == o.qb_shift_or_zero &&
+               rb_shift == o.rb_shift && clipped == o.clipped;
+    }
+};
+
+inline LeftCommit left_commit(int score, int qle, int tle, int gscore, int gtle, int pen_clip,
+                              int seed_qbeg) {
+    LeftCommit c;
+    c.score = score;
+    if (gscore <= 0 || gscore <= score - pen_clip) {
+        c.clipped = true; c.qb_shift_or_zero = seed_qbeg - qle; c.rb_shift = tle; c.truesc = score;
+    } else {
+        c.clipped = false; c.qb_shift_or_zero = 0; c.rb_shift = gtle; c.truesc = gscore;
+    }
+    return c;
 }
 
 } // namespace bwa_tests

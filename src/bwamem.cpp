@@ -7094,7 +7094,7 @@ static inline void stage_seed_extension(
             int fp_st = ungapped_analyze(qs, rs, sp.len2,
                                          sp.h0, opt->a, opt->b,
                                          fp_o_min, fp_e_min,
-                                         fp_x_threshold, opt->w,
+                                         fp_x_threshold, opt->w, opt->zdrop,
                                          &fp_score, &fp_qle,
                                          &fp_gscore, &fp_gtle,
                                          &fp_band);
@@ -7399,7 +7399,7 @@ static inline void stage_seed_extension(
             int fp_st = ungapped_analyze(qs, rs, sp.len2,
                                          fp_h0, opt->a, opt->b,
                                          fp_o_min, fp_e_min,
-                                         fp_x_threshold, opt->w,
+                                         fp_x_threshold, opt->w, opt->zdrop,
                                          &fp_score, &fp_qle,
                                          &fp_gscore, &fp_gtle,
                                          &fp_band);
@@ -7599,13 +7599,10 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
     // there.
     const int fp_o_min = opt->o_del < opt->o_ins ? opt->o_del : opt->o_ins;
     const int fp_e_min = opt->e_del < opt->e_ins ? opt->e_del : opt->e_ins;
-    // Cheapest single gap the scoring scheme allows; a degenerate scheme that
-    // makes gaps free (or a non-positive a+b) leaves nothing provable, so the
-    // fast path is disabled with -1 rather than guessed at.
-    const int fp_gap_min = fp_o_min + fp_e_min;
-    const int fp_denom   = opt->a + opt->b;
-    const int fp_x_threshold =
-        (fp_denom > 0 && fp_gap_min > 0) ? ((fp_gap_min - 1) / fp_denom) : -1;
+    // -1 (fast path off) when free gaps or a non-positive a+b leave nothing
+    // provable, or at -w below 2, where the ladder cannot accept its first rung
+    // and would record a->w = 2*opt->w (HIT envelope E1, ungapped_ext.h).
+    const int fp_x_threshold = ungapped_x_threshold(opt->a, opt->b, fp_o_min, fp_e_min, opt->w);
     // (fp_o_min, fp_e_min above are reused directly by ungapped_analyze.)
 
     int srt_size = MAX_SEEDS_PER_READ, fac = FAC;
@@ -8345,7 +8342,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
                 int fp_st = ungapped_analyze(qs, rs, sp->len2, sp->h0,
                                               opt->a, opt->b,
                                               fp_o_min, fp_e_min,
-                                              fp_x_threshold, opt->w,
+                                              fp_x_threshold, opt->w, opt->zdrop,
                                               &fp_score, &fp_qle,
                                               &fp_gscore, &fp_gtle,
                                               &fp_band);
