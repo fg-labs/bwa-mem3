@@ -94,6 +94,7 @@ static inline Kind lean_x86_core(const Job &jb, X86Scratch &s, int &hb, int &he,
         for (; i + 16 <= len1; i += 16) { const __m128i x = x86_ld(ref + i); ov = _mm_or_si128(ov, x); x86_st(rb + i, x); }
         for (; i < len1; i++) { orv |= ref[i]; rb[i] = ref[i]; }
         x86_st(rb + len1, _mm_setzero_si128()); x86_st(rb + len1 + 16, _mm_setzero_si128());
+        s.whash = rescue_prune_neon::filter_window_key(rb, len1);  // as lean_neon_core
     }
     const int quanta = kswv_query_quantum8(len2), off = quanta, nd = len1 + quanta + 1;
     // ---- 2. query table (cached per oriented query), as lean_neon ----
@@ -108,6 +109,7 @@ static inline Kind lean_x86_core(const Job &jb, X86Scratch &s, int &hb, int &he,
         s.q_has_n = (qor & 0xFC) != 0 || !_mm_testz_si128(qv, kFC);
         memcpy(s.qcache, q, (size_t)len2);
         s.qlen_c = len2;
+        s.qhash = rescue_prune_neon::filter_query_key(qb, len2);
         if (!s.q_has_n && len2 >= 5) {
             memset(s.tab, 0, sizeof s.tab);
             memset(s.pres, 0, sizeof s.pres);

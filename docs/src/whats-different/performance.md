@@ -203,10 +203,13 @@ which the insert-size estimate, and so rescue and pairing, depend on). The x86
 port of pruning and banding was verified the same way against v0.13.0 on the same
 slices, from multi-tier builds (`BASELINE_ARCH=avx2`, clang 19), on AMD EPYC 7R13
 (Zen 3, kswv at the AVX2 tier) and AMD EPYC 9R45 (Zen 5, kswv at the AVX-512BW
-tier); the filter and band kernel are the SSE4.1 / AVX2 ports on both. CI's x86
-checks run on a generated fixture only, not on real data: the x86 rows (AVX2 build) run `rescue_prune_identity.sh`
-under forced AVX2 and AVX-512BW kswv tiers (AVX-512BW where the runner has it)
-and the filter and band harnesses on generated jobs.
+tier); on both, the filter is the SSE4.1 / SSSE3 port and the band kernel the
+AVX2 one. That real-data check predates the x86 hookup of the repeated-job
+reuse below, whose x86 identity rests on CI only. CI's x86 checks run on a
+generated fixture only, not on real data: the x86 rows (AVX2 build) run
+`rescue_prune_identity.sh` under forced AVX2 and AVX-512BW kswv tiers
+(AVX-512BW where the runner has it) and the filter and band harnesses on
+generated jobs.
 
 - **Exact rescue pruning.** Before a rescue job is staged, a filter bounds the
   best local score from the exact 5-mer matches between the mate and the window.
@@ -220,7 +223,8 @@ and the filter and band harnesses on generated jobs.
   seed length, and on the x86 AVX2 and AVX-512BW builds (an SSE4.1 / SSSE3 port
   of the filter) at the default `-k 19` only, since at any other seed length the
   scalar filter would run and costs more than it saves there. Elsewhere the full
-  window is always computed. (x86: [#538](https://github.com/fg-labs/bwa-mem3/pull/538))
+  window is always computed.
+  (x86: [#538](https://github.com/fg-labs/bwa-mem3/pull/538))
 - **Banded rescue DP (NEON, AVX2).** For a narrowed job, the rescue DP runs only
   inside the diagonal bands of the 5-mer components that can reach the
   threshold, 16 bands per NEON vector or 32 per AVX2 vector, and the job's
@@ -274,7 +278,7 @@ and the filter and band harnesses on generated jobs.
   byte for byte. Plans and decisions are unchanged.
   ([#537](https://github.com/fg-labs/bwa-mem3/pull/537); x86:
   [#538](https://github.com/fg-labs/bwa-mem3/pull/538))
-- **Repeated rescue jobs answered from an earlier result (NEON).** A rescue
+- **Repeated rescue jobs answered from an earlier result (NEON, x86).** A rescue
   job that repeats one of the thread's last eight filtered jobs byte for byte,
   the same mate against an identical window as anchors in identical repeat
   copies produce, reads that job's rescue-kernel result instead of being
@@ -282,7 +286,8 @@ and the filter and band harnesses on generated jobs.
   staged window, mate, lengths, score gate and hull offset are compared byte
   for byte before a result is reused, so every value the rescue reads is
   unchanged. `BWA3_RESCUE_REPEAT=0` turns it off.
-  ([#537](https://github.com/fg-labs/bwa-mem3/pull/537))
+  ([#537](https://github.com/fg-labs/bwa-mem3/pull/537); x86:
+  [#538](https://github.com/fg-labs/bwa-mem3/pull/538))
 - **Window bounds only after the rescue.** The step that reads rescue results
   back computed each job's reference window again, bases included, though it
   needs only the clamped bounds and the contig; the bases are now fetched only

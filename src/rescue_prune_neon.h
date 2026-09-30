@@ -264,6 +264,33 @@ static inline Kind lean_memo(const Job &jb, S &s, int &hb, int &he, int max_hits
     return k;
 }
 
+// Keys of a job's inputs for the rescue repeat lookup (FilterScratch whash / qhash), shared by the
+// NEON filter and the x86 port so both key identically. window_key reads the zero-padded window
+// copy: bytes 0-31 (zero past len1) and the last 16; query_key reads every byte of the zero-padded
+// query copy, 8 at a time. A key only selects a candidate: the caller compares the bytes after.
+static inline uint64_t filter_window_key(const uint8_t *rb, int len1)
+{
+    uint64_t w[6];
+    memcpy(w, rb, 32);
+    memcpy(w + 4, rb + (len1 > 16 ? len1 - 16 : 0), 16);
+    uint64_t h = ((uint64_t)len1 ^ 0x9E3779B97F4A7C15ULL) * 0xBF58476D1CE4E5B9ULL;
+    for (int k = 0; k < 6; k += 2) {
+        h = (h ^ w[k]) * 0x94D049BB133111EBULL;
+        h = (h ^ w[k + 1]) * 0xBF58476D1CE4E5B9ULL;
+    }
+    return h ^ (h >> 31);
+}
+static inline uint64_t filter_query_key(const uint8_t *qb, int len2)
+{
+    uint64_t h = ((uint64_t)len2 ^ 0xD6E8FEB86659FD93ULL) * 0xBF58476D1CE4E5B9ULL;
+    for (int j = 0; j < len2; j += 8) {
+        uint64_t w;
+        memcpy(&w, qb + j, 8);
+        h = (h ^ w) * 0x94D049BB133111EBULL;
+    }
+    return h ^ (h >> 29);
+}
+
 #if defined(__aarch64__)
 
 // Left-pack store: the u16 lanes of v selected by the shuffle sh (a row of NeonScratch::shuf),
@@ -303,14 +330,7 @@ static inline Kind lean_neon_core(const Job &jb, NeonScratch &s, int &hb, int &h
         for (; i + 16 <= len1; i += 16) { const uint8x16_t x = vld1q_u8(ref + i); ov = vorrq_u8(ov, x); vst1q_u8(rb + i, x); }
         for (; i < len1; i++) { orv |= ref[i]; rb[i] = ref[i]; }
         vst1q_u8(rb + len1, vdupq_n_u8(0)); vst1q_u8(rb + len1 + 16, vdupq_n_u8(0));
-        // window key: blocks 0 and 1 (zero-padded past len1) and the last 16 bytes, just written
-        const uint64x2_t k0 = vreinterpretq_u64_u8(vld1q_u8(rb)), k1 = vreinterpretq_u64_u8(vld1q_u8(rb + 16)),
-                         k2 = vreinterpretq_u64_u8(vld1q_u8(rb + (len1 > 16 ? len1 - 16 : 0)));
-        uint64_t h = ((uint64_t)len1 ^ 0x9E3779B97F4A7C15ULL) * 0xBF58476D1CE4E5B9ULL;
-        h = (h ^ vgetq_lane_u64(k0, 0)) * 0x94D049BB133111EBULL; h = (h ^ vgetq_lane_u64(k0, 1)) * 0xBF58476D1CE4E5B9ULL;
-        h = (h ^ vgetq_lane_u64(k1, 0)) * 0x94D049BB133111EBULL; h = (h ^ vgetq_lane_u64(k1, 1)) * 0xBF58476D1CE4E5B9ULL;
-        h = (h ^ vgetq_lane_u64(k2, 0)) * 0x94D049BB133111EBULL; h = (h ^ vgetq_lane_u64(k2, 1)) * 0xBF58476D1CE4E5B9ULL;
-        s.whash = h ^ (h >> 31);
+        s.whash = filter_window_key(rb, len1);  // the bytes just written
     }
     const int quanta = kswv_query_quantum8(len2), off = quanta, nd = len1 + quanta + 1;
     // ---- 2. query table (cached per oriented query): copy + N flag, tab[code] = (off - j_last)
@@ -326,14 +346,7 @@ static inline Kind lean_neon_core(const Job &jb, NeonScratch &s, int &hb, int &h
         s.q_has_n = ((qor | vmaxvq_u8(qv)) & 0xFC) != 0;
         memcpy(s.qcache, q, (size_t)len2);
         s.qlen_c = len2;
-        {   // query key: every byte, 8 at a time from the zero-padded copy
-            uint64_t h = ((uint64_t)len2 ^ 0xD6E8FEB86659FD93ULL) * 0xBF58476D1CE4E5B9ULL;
-            for (int jj = 0; jj < len2; jj += 8) {
-                uint64_t w; memcpy(&w, qb + jj, 8);
-                h = (h ^ w) * 0x94D049BB133111EBULL;
-            }
-            s.qhash = h ^ (h >> 29);
-        }
+        s.qhash = filter_query_key(qb, len2);
         if (!s.q_has_n && len2 >= 5) {
             memset(s.tab, 0, sizeof s.tab);
             memset(s.pres, 0, sizeof s.pres);
