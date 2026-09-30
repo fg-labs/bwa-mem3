@@ -519,6 +519,65 @@ TEST_CASE("rescue prune: the SIMD filter decides exactly as the scalar filters"
 #endif
 }
 
+// The SIMD filter under the --meth relation (the Rel instantiation of lean_neon_core / lean_x86_core)
+// against the scalar filter: mates mostly unconverted (a TAPS-like 5 % conversion), each job under its
+// hypothesis, then the other one and its own again on the same bytes (the query table and the repeat
+// memo are keyed on relx, so the middle call must not be answered from the first), at the default
+// gate and with it open; and relx-rich mates whose entries exceed REL_ECAP, which both filters must
+// send to the full window. A decision counts as the SIMD filter's when its view carries bnd16.
+TEST_CASE("rescue prune: the SIMD filter decides exactly as the scalar filter under the --meth relation"
+          * doctest::test_suite("unit/pair")) {
+#if !RESCUE_PRUNE_HAVE_SIMD
+    MESSAGE("skipped: no SIMD rescue-prune filter in this build (aarch64, or x86 with AVX2)");
+    return;
+#else
+    std::mt19937 rng(424242);
+    auto jobs = build_jobs(rng);
+    std::unique_ptr<rescue_prune_scratch> scalar(new rescue_prune_scratch());
+    int simd_b2 = 0, over = 0;
+    auto check = [&](const Job &jb, int hyp, int max_hits) {
+        const int len1 = (int)jb.ref.size(), len2 = (int)jb.q.size();
+        rescue_prune_params p = rescue_prune_params::defaults(kSimdMinsc);
+        p.set_meth_rel(hyp);
+        CAPTURE(jb.tag); CAPTURE(len1); CAPTURE(len2); CAPTURE(hyp); CAPTURE(max_hits);
+        int hb = -2, he = -2, shb = -2, she = -2;
+        rescue_prune_view v;
+        const int kind = rescue_prune_window(jb.ref.data(), len1, jb.q.data(), len2, p, max_hits, &hb, &he, &v);
+        const int skind = len1 < 5 || len2 < 5 ? RESCUE_PRUNE_FULL
+                                               : rescue_prune_window_scalar(jb.ref.data(), len1, jb.q.data(), len2,
+                                                                            p, max_hits, *scalar, &shb, &she);
+        CHECK(kind == skind);
+        if (kind == RESCUE_PRUNE_B2 && skind == RESCUE_PRUNE_B2) {
+            CHECK(hb == shb);
+            CHECK(he == she);
+            simd_b2 += v.bnd16 != nullptr;
+        }
+        return skind;
+    };
+    for (size_t i = 0; i < jobs.size(); i++) {
+        Job jb = jobs[i];
+        const int hyp = (int)(i & 1);
+        const uint8_t from = hyp ? 1 : 2, to = hyp ? 3 : 0;
+        for (uint8_t &b : jb.q)
+            if (b == from && rng() % 20 == 0) b = to;
+        const int mh = i % 3 ? kDefaultMaxHits : kNoGate;
+        check(jb, hyp, mh);
+        check(jb, !hyp, mh);
+        check(jb, hyp, mh);
+    }
+    // relx-rich mates: every relx position doubles the entries of the 5-mers covering it, so a long
+    // poly-relx stretch passes REL_ECAP.
+    for (const int hyp : {0, 1}) {
+        Job jb = planted(rng, 600, 1000, 30);
+        for (size_t j = 0; j < jb.q.size(); j++)
+            if (rng() % 10) jb.q[j] = (uint8_t)(hyp ? 3 : 0);   // ~90 %: about 25k entries
+        over += check(jb, hyp, kNoGate) == RESCUE_PRUNE_FULL;
+    }
+    CHECK(simd_b2 > 0);
+    CHECK(over == 2);
+#endif
+}
+
 // The SIMD filter's two stateful shortcuts, against the scalar filter:
 //   - the hit gate, decided from the per-code occurrence counts before any hit is accumulated:
 //     at max_hits = hits - 1 the job must go to the full window, at max_hits = hits it must be

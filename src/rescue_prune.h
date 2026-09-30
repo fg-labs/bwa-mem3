@@ -356,11 +356,10 @@ static inline rescue_prune_view rescue_prune_scalar_view(const rescue_prune_scra
 
 /* The SIMD filter this build dispatches to, at any threshold: NEON on aarch64
  * (rescue_prune_neon.h), the SSE4.1 / SSSE3 port on the AVX2-floor x86 builds (rescue_prune_x86.h),
- * none elsewhere. Both return the scalar filter's decisions and the same view. RESCUE_PRUNE_SIMD_REL:
- * whether it takes the --meth relation (relx); where not, the scalar filter decides those jobs. */
+ * none elsewhere. Both return the scalar filter's decisions and the same view, under the --meth
+ * relation (relx) too. */
 #if defined(__aarch64__)
 #define RESCUE_PRUNE_HAVE_SIMD 1
-#define RESCUE_PRUNE_SIMD_REL 1   // the filter takes the --meth relation (relx)
 typedef rescue_prune_neon::NeonScratch rescue_prune_simd_scratch_t;
 static inline rescue_prune_neon::Kind rescue_prune_simd_lean(const rescue_prune_neon::Job &jb,
                                                              rescue_prune_simd_scratch_t &s, int &hb,
@@ -371,19 +370,16 @@ static inline rescue_prune_neon::Kind rescue_prune_simd_lean(const rescue_prune_
 }
 #elif defined(__AVX2__)
 #define RESCUE_PRUNE_HAVE_SIMD 1
-#define RESCUE_PRUNE_SIMD_REL 0
 typedef rescue_prune_x86::X86Scratch rescue_prune_simd_scratch_t;
 static inline rescue_prune_neon::Kind rescue_prune_simd_lean(const rescue_prune_neon::Job &jb,
                                                              rescue_prune_simd_scratch_t &s, int &hb,
                                                              int &he, int max_hits, int minsc,
                                                              const rescue_prune_neon::Wt &wt, int relx)
 {
-    (void)relx;   // RESCUE_PRUNE_SIMD_REL 0: the relation goes to the scalar filter
-    return rescue_prune_x86::lean_x86(jb, s, hb, he, max_hits, minsc, wt);
+    return rescue_prune_x86::lean_x86(jb, s, hb, he, max_hits, minsc, wt, relx);
 }
 #else
 #define RESCUE_PRUNE_HAVE_SIMD 0
-#define RESCUE_PRUNE_SIMD_REL 0
 #endif
 
 #if RESCUE_PRUNE_HAVE_SIMD
@@ -514,7 +510,7 @@ static RESCUE_PRUNE_WINDOW_INLINE int rescue_prune_window(const uint8_t *ref, in
     }
     const int minsc = p.minsc;
 #if RESCUE_PRUNE_HAVE_SIMD
-    if (p.simd_ok() && (p.relx < 0 || RESCUE_PRUNE_SIMD_REL)) {   // the scalar filter's decisions, faster
+    if (p.simd_ok()) {   // the scalar filter's decisions at any minsc, weights and relation, faster
         rescue_prune_simd_scratch_t &ss = rescue_prune_simd_scratch();
         const rescue_prune_neon::Job jb{len1, len2, 0, 0, -1, -1, ref, q};
         int h, e;
