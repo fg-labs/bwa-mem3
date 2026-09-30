@@ -4,6 +4,7 @@
  * docs/src/developer-guide/rescue-banding.md for the overview and its gates. */
 #include "rescue_band.h"
 #include "rescue_env.h"
+#include "simd_dispatch.h"
 
 #include <algorithm>
 #include <atomic>
@@ -66,12 +67,37 @@ bool rescue_band_enabled()
 
 /* Band a parent only when  100 * sum_bands rows * (min(width, quanta) + RB_OVH)  <  pct * hull_rows *
  * quanta, i.e. when the band cells (per row the kernel computes at most ~quanta of them, see
- * rb_dp_core) undercut the hull. The banded DP and kswv cost about the same per cell, so pct < 100
- * covers the band path's fixed costs (SoA build, merge, score2). BWA3_RESCUE_BAND_COST overrides
- * pct; 85 was the best of {40, 55, 70, 85, 100, 130} on a WGS-like sample. */
+ * rb_dp_core) undercut the hull. Where the band kernel and kswv run the same lane count (NEON: 16
+ * and 16; the AVX2 kswv tier: 32 and 32) a cell costs about the same in both, so pct < 100 covers
+ * the band path's fixed costs (SoA build, merge, score2); 85 was the best of {40, 55, 70, 85, 100,
+ * 130} on a WGS-like sample. Where kswv runs at the AVX-512BW tier it sweeps 64 lanes against the
+ * band kernel's 32, so a hull cell costs about half a band cell and the gate as written no longer
+ * measures what it claims. In whole runs there (Zen 5, -t 16) the band pass cost more thread-s
+ * than the kswv time it removed at every pct measured (kswv pass 0 saved vs band pass 0 spent:
+ * wgs-5M 2.0 vs 2.9 at 85, 0.5 vs 0.7 at 40; wes-5M 3.7 vs 4.5 and 0.9 vs 1.0), and wall was best
+ * with no pass-0 band at all (10 interleaved reps, vs the 85 default: wes-5M -0.9 %, p = 0.015;
+ * wgs-5M level), while forcing the AVX2 kswv tier on the same host restores the band's win (band
+ * harness, per job: -4.4 % at 85, -5.2 % at 100). So the default is 0 exactly where kswv runs 64
+ * lanes; pruning and banded pass 1 (whose cost model compares a band against kswv on the same rows,
+ * take_pass1) are unchanged there. The single-thread band harness over WGS dumps still shows a
+ * small per-job pass-0 win at that tier (3.79 -> 3.71 us at 85), so this is a whole-run finding to
+ * revisit with a 64-lane band kernel. Output is the same at every value: the gate only picks which
+ * of two exact kernels runs. */
+int rescue_band_cost_pct_default(int tier)
+{
+    return tier == BWAMEM3_TIER_AVX512BW ? 0 : 85;
+}
+/* BWA3_RESCUE_BAND_COST, else rescue_band_cost_pct_default for the kswv tier this process runs.
+ * Read once; the tier is fixed once bwamem3_simd_init has run (idempotent, so calling it here
+ * costs nothing when main did). */
 static int rb_cost_pct()
 {
-    static const int v = rescue_env_int("BWA3_RESCUE_BAND_COST", 85);
+    static const int v = [] {
+        const int e = rescue_env_int("BWA3_RESCUE_BAND_COST", -1);
+        if (e >= 0) return e;
+        bwamem3_simd_init();
+        return rescue_band_cost_pct_default(bwamem3_simd_tier());
+    }();
     return v;
 }
 static const int RB_OVH = 8;          // per-row fixed cost of a band lane, in cell units
@@ -363,6 +389,10 @@ bool RescueBandBatch::plan(const rescue_prune_view &v, int len1, int len2, int h
     /* The component views are derived for minsc >= the NEON filter's threshold, and the 8-bit kernel
      * holds scores up to 255. */
     if (v.nd < 0 || minsc < rescue_prune_neon::MINSC || minsc > 255) return false;
+    /* A cost gate of 0 (the default where kswv runs at the AVX-512BW tier, rb_cost_pct) declines
+     * every parent, so skip the component work it would decline afterwards; counted as declined by
+     * the cost model, which is what the gate below would do. */
+    if (rb_cost_pct() == 0) { stats_.planned_no++; return false; }
     const int quanta = kswv_query_quantum8(len2);
     const int H = he - hb + 1;
     bool ok = v.off == quanta && H > 0;

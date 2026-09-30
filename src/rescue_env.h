@@ -38,8 +38,10 @@
  * BWA3_RESCUE_LAZYQE          1     NEON kswv two-row sweep: recover the query end after the row
  *                                   instead of inline
  * BWA3_RESCUE_BAND            1     run rescue jobs as diagonal bands (NEON or AVX2 kernel)
- * BWA3_RESCUE_BAND_COST       85    band a pass-0 parent iff its band cells cost less than this %
- *                                   of the hull's
+ * BWA3_RESCUE_BAND_COST       auto  band a pass-0 parent iff its band cells cost less than this %
+ *                                   of the hull's; auto is 0 (no pass-0 banding) where kswv runs
+ *                                   at the AVX-512BW tier, whose 64-lane hull undercuts the
+ *                                   32-lane band kernel, else 85
  * BWA3_RESCUE_BAND_R2         1     run round 2 banded (0: kswv on the hull)
  * BWA3_RESCUE_BAND_TIGHT      8     threshold offset of the tight top band (0: off)
  * BWA3_RESCUE_BAND_P1         2     pass-1 banding: 0 none, 1 banded parents only, 2 every

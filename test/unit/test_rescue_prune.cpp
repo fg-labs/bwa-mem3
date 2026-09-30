@@ -38,6 +38,7 @@
 #include "rescue_band.h"
 #include "rescue_prune.h"
 #include "scoring.h"
+#include "simd_dispatch.h"
 
 namespace {
 
@@ -508,4 +509,17 @@ TEST_CASE("rescue prune: the SIMD filter's repeat memo and component list match 
     CHECK(n_b2 > 50);
     CHECK(n_over_cap > 0);
 #endif
+}
+
+TEST_CASE("rescue band: the pass-0 cost gate's default follows the kswv tier"
+          * doctest::test_suite("unit/pair")) {
+    // Where kswv sweeps 64 lanes (the AVX-512BW tier) the 32-lane band kernel cannot undercut the
+    // hull, so the default bands no pass-0 parent there; every other tier keeps the 85 % margin
+    // (rescue_band.cpp, rb_cost_pct). BWA3_RESCUE_BAND_COST overrides either.
+    CHECK(rescue_band_cost_pct_default(BWAMEM3_TIER_AVX512BW) == 0);
+    for (const int tier : {BWAMEM3_TIER_NONE, BWAMEM3_TIER_SSE41, BWAMEM3_TIER_SSE42, BWAMEM3_TIER_AVX,
+                           BWAMEM3_TIER_AVX2, BWAMEM3_TIER_NEON}) {
+        CAPTURE(tier);
+        CHECK(rescue_band_cost_pct_default(tier) == 85);
+    }
 }
