@@ -14,6 +14,8 @@ All four SMEM/seed tests share `phix.fa` (phiX174, NC_001422.1, 5386 bp) as the 
 
 `synthetic_1mb.fa` is a 1 Mbp ACGT-only FASTA used by the libsais byte-diff, determinism, and memory-budget tests; the matching `.0123` and `.bwt.2bit.64` baselines under `baselines/` are derived from it and only stay reproducible when both source and baselines are committed together.
 
+`ladder_proofs/build_fixture.awk` is a generator (no committed data) used by `test/ladder_rungs_test.sh`. It slices a 2650 bp reference and single-end reads from `phix.fa` with fixed base rotations for the substitutions, so it is byte-identical across awk implementations; see the comments at the top of the script for each read's construction and the bwa 0.7.19 record it is checked against.
+
 `supp_rep/build_fixture.awk` is a generator (no committed data) used by `test/regression/supp_rep_hard_cap.sh`. It emits a deterministic engineered reference + SE reads exercising `--supp-rep-hard-cap` against a chain with a high-SA-count SMEM but a uniquely-disambiguated extension; see comments at the top of the awk script.
 
 ## Regenerating the fixtures

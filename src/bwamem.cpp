@@ -118,17 +118,27 @@ KSORT_INIT(mem_intv1, SMEM, intv_lt1)  // debug
 #define max_(x, y) ((x)>(y)?(x):(y))
 #define min_(x, y) ((x)>(y)?(y):(x))
 
-#define MAX_BAND_TRY  4
-
-/* cap initial band-width at this value. The retry loop
- * doubles w each iteration (up to MAX_BAND_TRY-1 iters), so pairs whose
- * alignment needs a wider band are caught by the retry. Setting this below
- * opt->w forces the kernel to start tight, accept tight-fit pairs early
- * (via the sp->max_off heuristic), and only expand on demand.
- * BUCKET_MAX_INIT_W=8 with MAX_BAND_TRY=4 gives w-sequence 8, 16, 32, 64. */
-#ifndef BUCKET_MAX_INIT_W
-#define BUCKET_MAX_INIT_W 8
-#endif
+/* Extension retry-ladder rung counts.
+ *
+ * MAX_BAND_TRY is the exact ladder's, and is upstream's: bwa and bwa-mem2 both define
+ * MAX_BAND_TRY 2, score an extension at w = opt->w, retry once at 2*opt->w if the stop
+ * test (score unchanged from the previous rung, or max_off < 3w/4) fails there, and then
+ * keep the 2w result whatever the test says at 2w. A longer ladder is not a no-op: a pair
+ * that fails the test at 2w has a record-setting cell at diagonal offset >= 3w/2, and the
+ * wider rungs can then find a different alignment (a gap beyond offset 2w) and always record
+ * a wider a->w, which bounds the contained-seed purge, the mem_reg2aln CIGAR band and the
+ * mem_patch_reg band. Such a cell needs a*L > o_min + e_min*3w/2 aligned columns, so an
+ * extension of >= 157 query bases at the default -w and scoring: 150 bp reads never reach a
+ * third rung, longer reads can. The rung count is pinned end to end by
+ * test/ladder_rungs_test.sh; test/unit/test_extension_ladder.cpp checks the length bound on
+ * a model of the ladder against both scalar kernels.
+ *
+ * ADAPTIVE_BAND_TRY is the --adaptive-band narrowing ladder's (band_start << i on the
+ * 16-bit and scalar tiers). That ladder is not byte-identical by design and needs the extra
+ * rungs to climb from its narrow start; its 8-bit tier starts at opt->w and follows the
+ * exact ladder, so --adaptive-band stays a no-op on short reads. */
+#define MAX_BAND_TRY  2
+#define ADAPTIVE_BAND_TRY 4
 
 /* ------------------------------------------------------------------------
  * 8-bit (16-lane) SW safe-envelope gate.
@@ -153,8 +163,8 @@ KSORT_INIT(mem_intv1, SMEM, intv_lt1)  // debug
  *     `myband+1` and the tail-trim term `index+2`, which reaches w+3). The
  *     positive edge w+3 must fit signed int8, so w <= 124; at w >= 125 it wraps
  *     past +127, the band collapses and lanes die mid-alignment. The default
- *     opt->w = 100 qualifies; wide-band retries (w doubling to 200/400/800) do
- *     NOT and fall back to 16-bit.
+ *     opt->w = 100 qualifies; the wide-band retry (w = 2*opt->w = 200) does
+ *     NOT and falls back to 16-bit.
  *   - zdrop + maxStep <= 253      : zdrop is broadcast into the DP as a byte
  *     (_mm256_set1_epi8), so it must fit one, and the maxStep headroom keeps the
  *     z-drop comparison from wrapping at the top of the range. The DP body AND
@@ -367,12 +377,12 @@ static inline bool band_cert_ok(int S, int h0, int len1, int len2, int w, const 
     return (long)w >= d_max;                   /* band covers all tying offsets */
 }
 /* Rung count: narrowing tiers (init_w < opt->w) get one extra rung so the narrow probe
- * sits ahead of the full ceiling ladder [opt->w, 2w, 4w, 8w]. */
+ * sits ahead of the full ceiling ladder [opt->w, 2w]. */
 static inline int band_cert_nband(int init_w, const mem_opt_t *opt) {
     return (init_w < opt->w) ? MAX_BAND_TRY + 1 : MAX_BAND_TRY;
 }
-/* Width per rung: narrowing tiers -> [init_w, opt->w, 2w, 4w, 8w]; already-wide tiers ->
- * the standard ladder [opt->w, 2w, 4w, 8w]. */
+/* Width per rung: narrowing tiers -> [init_w, opt->w, 2w]; already-wide tiers ->
+ * the standard ladder [opt->w, 2w]. */
 static inline int32_t band_cert_width(int init_w, int i, const mem_opt_t *opt) {
     if (init_w < opt->w) return (i == 0) ? (int32_t)init_w : (int32_t)(opt->w << (i - 1));
     return (int32_t)(opt->w << i);
@@ -490,7 +500,14 @@ static int mem_band_cert_params_safe_w(const mem_opt_t *opt, int w0) {
 int mem_band_cert_params_safe(const mem_opt_t *opt) {
     return mem_band_cert_params_safe_w(opt, ADAPTIVE_BAND_START);
 }
-#define BAND_NBAND(init_w) (opt->band_cert ? band_cert_nband((init_w), opt) : MAX_BAND_TRY)
+/* An --adaptive-band tier that actually starts below opt->w (its 8-bit tier starts at
+ * opt->w and follows the exact ladder). Only this ladder gets ADAPTIVE_BAND_TRY rungs and
+ * the tight-band stop (see ACCEPT_PAIR). */
+#define ADAPTIVE_NARROWING(init_w) (opt->band_start > 0 && (init_w) < opt->w)
+/* Rungs per ladder: the certified ladder's count; ADAPTIVE_BAND_TRY on an --adaptive-band
+ * narrowing tier; upstream's MAX_BAND_TRY everywhere else. */
+#define BAND_NBAND(init_w) (opt->band_cert ? band_cert_nband((init_w), opt) \
+                            : (ADAPTIVE_NARROWING(init_w) ? ADAPTIVE_BAND_TRY : MAX_BAND_TRY))
 #define BAND_WIDTH(init_w,i) (opt->band_cert ? band_cert_width((init_w), (i), opt) : ((int32_t)((init_w) << (i))))
 #define INIT_W(w) (opt->band_cert ? min_(ADAPTIVE_BAND_START, (w)) \
                    : (opt->band_start > 0 ? min_(opt->band_start, (w)) : (w)))
@@ -526,8 +543,8 @@ int mem_band_cert_params_safe(const mem_opt_t *opt) {
 #define ACCEPT_PAIR(sc,pv,mo,w,tb,cb,i) \
     (opt->band_cert \
       ? band_cert_accept((sc),(pv),(mo),(w),(i),band_cert_nband(init_w,opt),sp,opt) \
-      : ((i)+1==MAX_BAND_TRY || \
-         (opt->band_start > 0 && init_w < opt->w && (tb)>0 && (w)>=(tb)) || \
+      : ((i)+1==BAND_NBAND(init_w) || \
+         (ADAPTIVE_NARROWING(init_w) && (tb)>0 && (w)>=(tb)) || \
          (((sc)==(pv) || (mo) < ((w)>>1)+((w)>>2)) && (opt->band_start <= 0 || (w) >= (cb)))))
 //------------------------------------------------------------------
 // Alignment: Construct the alignment from a chain *

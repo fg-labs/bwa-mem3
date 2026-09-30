@@ -172,6 +172,14 @@ ok "min_ext_len_safety_test"
 "$HERE/tight_band_xs_test.sh" "$BWAMEM3" "$FIXTURES" || fail "tight_band_xs_test failed"
 ok "tight_band_xs_test"
 
+# --- ladder_rungs_test ----------------------------------------------------
+# The exact retry ladder has upstream's two rungs (w, 2w); --adaptive-band's
+# narrowing tiers keep four. Checks bwa 0.7.19's record for a 900 bp
+# staircase read (right and left extension) and a read shaped for the
+# adaptive rungs.
+"$HERE/ladder_rungs_test.sh" "$BWAMEM3" "$FIXTURES" || fail "ladder_rungs_test failed"
+ok "ladder_rungs_test"
+
 # --- smem_lockstep_parity_test --------------------------------------------
 OUT="$(cd "$HERE" && ./smem_lockstep_parity_test "$FIXTURES/phix.fa" 2>&1)"
 CASES_PASSED="$(echo "$OUT" | sed -nE 's/^([0-9]+) \/ ([0-9]+) cases passed$/\1/p')"
