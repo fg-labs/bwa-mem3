@@ -449,9 +449,10 @@ alignment reaching a diagonal offset at or beyond it can score above the ungappe
 retry ladder (`w = 100`, then `200`, ...) stopped as soon as the band it had run covered that
 bound. Otherwise it stops on the same per-rung test as bwa and bwa-mem2, which have no ungapped
 fast path: the score is unchanged from the previous rung, or the alignment's maximum diagonal
-offset stayed under three quarters of the band. (bwa-mem3's ladder allows up to four rungs where
-upstream allows two.) The bound keeps the score right, but when it stopped the ladder at
-`w = 100` where the full ladder goes on to `w = 200`, the region recorded a band width of 100
+offset stayed under three quarters of the band. (bwa-mem3's ladder then allowed up to four
+rungs where upstream allows two; see the next entry.) The bound keeps the score right, but when
+it stopped the ladder at `w = 100` where the full ladder goes on to `w = 200`, the region
+recorded a band width of 100
 instead of 200. That width bounds the contained-seed test that decides whether a later seed in
 the same region is extended at all, so a seed that bwa skips was extended, and its region's
 score could become `XS`. On a synthetic 306 bp read the primary alignment was unchanged
@@ -483,6 +484,49 @@ noise. `--adaptive-band` output was identical to the default on the 1 M HG002 pa
 by default, under `--compat=bwa-mem2`, `--no-band-cert`, and `--adaptive-band`.
 
 ---
+
+## Extension retry ladder ran four rungs where upstream runs two (PR #543)
+
+bwa and bwa-mem2 both define `MAX_BAND_TRY 2`: an extension is scored at the band width `-w`
+(100), retried once at twice that if the stop test fails there (the score changed and the
+alignment's maximum diagonal offset reached three quarters of the band), and the 200-wide
+result is then kept whatever the test says. bwa-mem3 had carried `MAX_BAND_TRY 4` since #58,
+where it served an initial-band experiment (start at 8 and double) that the same change
+reverted, leaving the ladder at `[100, 200, 400, 800]`. A pair that failed the stop test at
+200 therefore ran on. That is not a no-op: the wider rungs can find a different alignment when
+a gap lies beyond diagonal offset 200, and they always record a wider band width on the
+region, which bounds the contained-seed purge, the CIGAR band in `mem_reg2aln` and the band
+in `mem_patch_reg`.
+
+When it can happen is bounded exactly. Failing the test at 200 needs a record-setting cell at
+diagonal offset 150 or more, which costs a gap of at least `o_min + e_min * 150` and pays back
+at most `a` per aligned column, so the extension needs more than 156 query bases at the
+default `-w` and scoring (`a*L > o_min + e_min*3w/2` in general). A 150 bp read at the default
+`-w` never has such an extension; longer reads can. A synthetic 900 bp read with insertions at
+diagonal offsets 80, 150 and 250 reports `209M80I141M70I125M275S`, `AS:i:248` in bwa 0.7.19 and
+reported `209M80I141M70I130M100I170M`, `AS:i:267` under the four-rung ladder, in every
+exact-ladder mode (default, `--compat=bwa-mem2`, `--no-band-cert`).
+
+The exact ladders now have upstream's two rungs: the default certified ladder runs its narrow
+probe and then `[100, 200]`, and the full-width ladder (`--no-band-cert`) runs `[100, 200]`.
+`--adaptive-band`'s narrowing tiers keep their four rungs, since that ladder is not
+byte-identical by design and needs them to climb from its narrow start; its 8-bit tier follows
+the exact ladder, so it stays a no-op on short reads. The ladder is shared code, identical on
+every SIMD tier.
+
+Measured scope: on an Apple M3 Ultra (arm64, NEON, Apple clang 21.0.0), hg38 (GRCh38 with
+ALT/decoy), `-t 16`, SAM minus `@PG` was identical to the previous ladder on 1 M HG002 WGS
+150 bp pairs (paired and single-end), 1.86 M ~250 bp single-end SBX HG002 reads (also under
+`--adaptive-band`), and the 1 M pairs at `-A 2 -B 8` and `-O 8 -E 2`: no extension there
+reached a third rung. On 100 HG002 HiFi reads under `-x pacbio` the former ladder accepted
+1,472 extensions at 400 and 153 at 800. The records of 4 reads changed (2 under
+`--compat=bwa-mem`), and under `--compat=bwa-mem` all 109 records now match bwa 0.7.19 exactly
+(4 lines differed before). Pinned by `test/ladder_rungs_test.sh`, which
+checks bwa 0.7.19's record for the 900 bp read, its reverse complement (a left extension) and
+a read shaped for `--adaptive-band`'s narrowing rungs, in the exact-ladder modes and, for the
+last, under `--adaptive-band`. `test/unit/test_extension_ladder.cpp` checks the length bound on
+a model of the ladder over a parameter grid against both `scalarBandedSWA` and upstream's
+`ksw_extend2`, and that past it a third rung changes the committed alignment.
 
 ## Upstream port divergences: all chains dropped by the weight filter (PR #489) and the SA sentinel offset (PR #469)
 
@@ -528,6 +572,7 @@ shipped, because parity with that release is its contract (see
 | Extension staging copied a chain's windows once per seed | [#524](https://github.com/fg-labs/bwa-mem3/pull/524) | — | fork-only (inputs that aborted because a repeat chain staged its window once per seed now complete; the `int32` staging limit itself is unchanged; records of inputs that already ran byte-identical by construction — see the PR #524 correctness note above for the measured scope) |
 | 8-bit banded-SW score for a negative seed score depended on its SIMD group | [#528](https://github.com/fg-labs/bwa-mem3/pull/528) | — | fork-only (`--meth` only; records whose extension had a negative seed score can change and are now independent of batching; non-`--meth` output byte-identical by construction — see the PR #528 correctness note above) |
 | Extension retry ladder stopped early on the ungapped band bound | [#540](https://github.com/fg-labs/bwa-mem3/pull/540) | — | fork-only (a record can change only where the early stop diverged from the full ladder, by recording a narrower band or different extension end fields; none changed on the WGS or SBX sets measured — see the correctness note above) |
+| Extension retry ladder ran four rungs where upstream runs two | [#543](https://github.com/fg-labs/bwa-mem3/pull/543) | — | fork-only (only an extension of more than 156 query bases at the default `-w 100` and scoring can reach a third rung, so under those defaults 150 bp reads are unchanged by construction; a narrower `-w` lowers the bound (`a*L > o_min + e_min*3w/2`, more than 36 query bases at `-w 20`); longer reads can change CIGAR, `AS` and the recorded band where the stop test failed at `2w` — see the correctness note above) |
 | kseq2bseq1 zero-initialization | [#22](https://github.com/fg-labs/bwa-mem3/pull/22) | — | fork-only |
 | Proper-pair flag from emitted alignment | [#17](https://github.com/fg-labs/bwa-mem3/pull/17) | — | fork-only, **opt-in** (`--proper-pair-from-emitted`; default matches both upstreams, [#362](https://github.com/fg-labs/bwa-mem3/issues/362)) |
 | All chains dropped by the weight filter: default follows bwa | [#489](https://github.com/fg-labs/bwa-mem3/pull/489) | — ([#310](https://github.com/fg-labs/bwa-mem3/issues/310)) | fork-only; `--compat=bwa-mem2` reproduces bwa-mem2 |

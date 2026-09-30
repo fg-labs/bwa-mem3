@@ -413,6 +413,9 @@ without the certificate, also stopped as soon as its band covered the ungapped f
 tight-band bound. That could record a narrower band than the full-width ladder and changed `XS`
 on a synthetic 306 bp read (no record changed on the WGS and ~250 bp sets measured); see
 [Correctness fixes](correctness.md#extension-retry-ladder-stopped-early-on-the-ungapped-band-bound-pr-540).
+The ceiling ladder itself also ran up to four rungs where bwa and bwa-mem2 run two, which
+could change the alignment of extensions longer than 156 query bases at the default `-w` and
+scoring; it now runs upstream's two (see [Correctness fixes](correctness.md#extension-retry-ladder-ran-four-rungs-where-upstream-runs-two-pr-543)).
 
 ## What differs
 
