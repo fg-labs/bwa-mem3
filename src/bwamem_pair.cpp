@@ -392,6 +392,32 @@ static inline uint64_t rescue_now_ns()
         std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 static rescue_prune_stats_t g_rescue_prune_stats;
+/* The counters above are the run's totals; the counting sites bump this per-thread copy and its
+ * destructor folds it into them when the thread ends. Every worker is joined before exit, and the
+ * main thread's thread-local objects are destroyed before the static ones, so the totals are
+ * complete when the line prints. Bumping the shared atomics directly from every thread charged
+ * the pruning arm of an instrumented A/B seven contended adds per filtered job, against only the
+ * dedup counters in an arm that does not prune, so an instrumented run read a pruning win as a
+ * regression. What the stats knob still costs is two clock reads per job (rescue_now_ns) and
+ * plain adds. */
+struct rescue_prune_tstats_t {
+    uint64_t jobs = 0, full = 0, b1 = 0, b2 = 0, rows_in = 0, rows_kept = 0, jobs16 = 0, b1_16 = 0,
+        b2_16 = 0, memo_hits = 0, reused = 0;
+    uint64_t ns_filter = 0, ns_k0 = 0, ns_band = 0, ns_k1 = 0, ns_b1 = 0;
+    uint64_t dedup_run = 0, dedup_skip = 0, dedup_run_regs = 0, dedup_skip_regs = 0, dedup_insert1 = 0,
+        dedup_insert1_fast = 0, ns_dedup = 0;
+    ~rescue_prune_tstats_t() {
+        rescue_prune_stats_t &g = g_rescue_prune_stats;
+        g.jobs += jobs; g.full += full; g.b1 += b1; g.b2 += b2; g.rows_in += rows_in;
+        g.rows_kept += rows_kept; g.jobs16 += jobs16; g.b1_16 += b1_16; g.b2_16 += b2_16;
+        g.memo_hits += memo_hits; g.reused += reused;
+        g.ns_filter += ns_filter; g.ns_k0 += ns_k0; g.ns_band += ns_band; g.ns_k1 += ns_k1; g.ns_b1 += ns_b1;
+        g.dedup_run += dedup_run; g.dedup_skip += dedup_skip; g.dedup_run_regs += dedup_run_regs;
+        g.dedup_skip_regs += dedup_skip_regs; g.dedup_insert1 += dedup_insert1;
+        g.dedup_insert1_fast += dedup_insert1_fast; g.ns_dedup += ns_dedup;
+    }
+};
+static thread_local rescue_prune_tstats_t t_rescue_prune_stats;
 /* Skip a mate-rescue dedup that is provably a no-op (see mem_matesw_batch_post). Default ON;
  * BWA3_RESCUE_DEDUP_SKIP=0 runs every dedup, which is how the byte-identity A/B is run. */
 static bool rescue_dedup_skip_enabled()
@@ -1017,10 +1043,10 @@ static void mem_sam_pe_batch_run(Ikswv *pwsw, SeqPair *pairs,
     pwsw->getScores8(pairs + n_banded, seqBufRef, seqBufQer, aln, slice_pcnt8 - n_banded, nthreads, 0);
     pwsw->getScores16(pairs + slice_pcnt8 + MAX_LINE_LEN, seqBufRef, seqBufQer,
                       aln, slice_pcnt-slice_pcnt8, nthreads, 0);
-    if (timed) { uint64_t t1 = rescue_now_ns(); g_rescue_prune_stats.ns_k0 += t1 - t0; t0 = t1; }
+    if (timed) { uint64_t t1 = rescue_now_ns(); t_rescue_prune_stats.ns_k0 += t1 - t0; t0 = t1; }
     if (n_banded > 0) {
         band->run_pass0(pairs, (int)n_banded, seqBufRef, seqBufQer, aln, pwsw);
-        if (timed) { uint64_t t1 = rescue_now_ns(); g_rescue_prune_stats.ns_band += t1 - t0; t0 = t1; }
+        if (timed) { uint64_t t1 = rescue_now_ns(); t_rescue_prune_stats.ns_band += t1 - t0; t0 = t1; }
     }
 
     // Post-processing
@@ -1068,10 +1094,10 @@ static void mem_sam_pe_batch_run(Ikswv *pwsw, SeqPair *pairs,
     if (timed) t0 = rescue_now_ns();
     pwsw->getScores16(pairs + pos8, seqBufRef, seqBufQer, aln, pos16, nthreads, 1);
     pwsw->getScores8(pairs, seqBufRef, seqBufQer, aln, pos8, nthreads, 1);
-    if (timed) { uint64_t t1 = rescue_now_ns(); g_rescue_prune_stats.ns_k1 += t1 - t0; t0 = t1; }
+    if (timed) { uint64_t t1 = rescue_now_ns(); t_rescue_prune_stats.ns_k1 += t1 - t0; t0 = t1; }
     if (n_banded > 0 || p1_band_any) {
         band->run_pass1(seqBufRef, seqBufQer, aln, pwsw);
-        if (timed) g_rescue_prune_stats.ns_b1 += rescue_now_ns() - t0;
+        if (timed) t_rescue_prune_stats.ns_b1 += rescue_now_ns() - t0;
     }
 }
 
@@ -1826,7 +1852,7 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
              * and _post applies the same offset. The oriented mate is built once here and reused
              * for the staging copy below. */
             const bool pruned = rescue_prune_applies(opt, run_prunes);
-            if (g_rescue_prune_stats.on && !(xtra & KSW_XBYTE)) g_rescue_prune_stats.jobs16++;
+            if (g_rescue_prune_stats.on && !(xtra & KSW_XBYTE)) t_rescue_prune_stats.jobs16++;
             static thread_local std::vector<uint8_t> oq;   // oriented mate; grows, never shrinks
             /* The last filtered jobs this thread enqueued, by the filter's key of their inputs and
              * regid (oldest overwritten); see the reuse below. */
@@ -1884,16 +1910,16 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                 if (kind == RESCUE_PRUNE_B2 && (xtra & KSW_XBYTE) && reuse < 0 && rescue_band_enabled()
                     && !opt->meth_mode)
                     matesw_band(mmc, tid).plan(view, pp, (int)(re - rb), l_ms, hb, he);
-                if (g_rescue_prune_stats.on) g_rescue_prune_stats.ns_filter += rescue_now_ns() - tf0;
+                if (g_rescue_prune_stats.on) t_rescue_prune_stats.ns_filter += rescue_now_ns() - tf0;
                 if (g_rescue_prune_stats.on) {
-                    g_rescue_prune_stats.jobs++;
-                    g_rescue_prune_stats.memo_hits += view.repeat;
-                    g_rescue_prune_stats.reused += reuse >= 0;
-                    g_rescue_prune_stats.rows_in += re - rb;
-                    (kind == RESCUE_PRUNE_B1 ? g_rescue_prune_stats.b1 : kind == RESCUE_PRUNE_B2 ? g_rescue_prune_stats.b2 : g_rescue_prune_stats.full)++;
-                    g_rescue_prune_stats.rows_kept += kind == RESCUE_PRUNE_B1 ? 0 : kind == RESCUE_PRUNE_B2 ? he - hb + 1 : re - rb;
+                    t_rescue_prune_stats.jobs++;
+                    t_rescue_prune_stats.memo_hits += view.repeat;
+                    t_rescue_prune_stats.reused += reuse >= 0;
+                    t_rescue_prune_stats.rows_in += re - rb;
+                    (kind == RESCUE_PRUNE_B1 ? t_rescue_prune_stats.b1 : kind == RESCUE_PRUNE_B2 ? t_rescue_prune_stats.b2 : t_rescue_prune_stats.full)++;
+                    t_rescue_prune_stats.rows_kept += kind == RESCUE_PRUNE_B1 ? 0 : kind == RESCUE_PRUNE_B2 ? he - hb + 1 : re - rb;
                     if (!(xtra & KSW_XBYTE) && kind != RESCUE_PRUNE_FULL)
-                        (kind == RESCUE_PRUNE_B1 ? g_rescue_prune_stats.b1_16 : g_rescue_prune_stats.b2_16)++;
+                        (kind == RESCUE_PRUNE_B1 ? t_rescue_prune_stats.b1_16 : t_rescue_prune_stats.b2_16)++;
                 }
                 if (kind == RESCUE_PRUNE_B1) {
                     gar[gcnt + r] = MATESW_GAR_PROVEN_FAIL;
@@ -2369,20 +2395,20 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
             /* BWA3_RESCUE_DEDUP_SKIP=0 ignores the state: every dedup runs in full. */
             mem_rescue_dedup_state_t *ds = rescue_dedup_skip_enabled() ? dedup_state : NULL;
             if (ds && ds->fixpoint && ds->pushed < 0) {
-                if (st) { ++g_rescue_prune_stats.dedup_skip; g_rescue_prune_stats.dedup_skip_regs += ma->n; }
+                if (st) { ++t_rescue_prune_stats.dedup_skip; t_rescue_prune_stats.dedup_skip_regs += ma->n; }
             } else {
                 const uint64_t t0 = st ? rescue_now_ns() : 0;
-                if (st) { ++g_rescue_prune_stats.dedup_run; g_rescue_prune_stats.dedup_run_regs += ma->n; }
+                if (st) { ++t_rescue_prune_stats.dedup_run; t_rescue_prune_stats.dedup_run_regs += ma->n; }
                 if (ds == NULL)
                     ma->n = mem_sort_dedup_patch(opt, 0, 0, 0, ma->n, ma->a);
                 else if (ds->fixpoint) {
                     int fast = 0;
                     ma->n = mem_dedup_only_insert1(opt, ma->n, ma->a, ds->pushed, &ds->fixpoint, &fast);
-                    if (st) { ++g_rescue_prune_stats.dedup_insert1; g_rescue_prune_stats.dedup_insert1_fast += fast; }
+                    if (st) { ++t_rescue_prune_stats.dedup_insert1; t_rescue_prune_stats.dedup_insert1_fast += fast; }
                 } else
                     ma->n = mem_dedup_only_fixpoint(opt, ma->n, ma->a, &ds->fixpoint);
                 if (ds) ds->pushed = -1;
-                if (st) g_rescue_prune_stats.ns_dedup += rescue_now_ns() - t0;
+                if (st) t_rescue_prune_stats.ns_dedup += rescue_now_ns() - t0;
             }
         }
         #else

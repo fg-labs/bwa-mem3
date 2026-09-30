@@ -25,7 +25,8 @@
  * BWA3_RESCUE_PRUNE_MAX_HITS  auto  keep the full window above this many 5-mer hits; auto is 1000
  *                                   on aarch64 with banding on and no --meth, else 400
  * BWA3_RESCUE_PRUNE_STATS     0     1 prints the RESCUE_PRUNE and RESCUE_BAND counters and stage
- *                                   times at exit
+ *                                   times at exit (counted per thread: no shared-counter
+ *                                   contention in an instrumented run)
  * BWA3_RESCUE_DEDUP_SKIP      1     skip a post-rescue dedup proven to be a no-op, and add a
  *                                   single new region in one pass where that is provably exact
  * BWA3_RESCUE_REPEAT          1     a rescue job repeating one of the last eight filtered jobs byte
