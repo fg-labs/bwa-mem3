@@ -4206,6 +4206,22 @@ static void read_memo_verify_regs(const mem_alnreg_v *dup, const mem_alnreg_v *r
     }
 }
 
+/* [dedup-reads] CHECK_BASES: assert a duplicate read's 2-bit bases equal its
+ * representative's. They were byte-identical ASCII (the pre-pass byte-verifies
+ * every group), so a difference means the armed seed stage converted one of
+ * them a different number of times. */
+static void read_memo_check_read_bases(const bseq1_t *dup, const bseq1_t *rep, int read_idx)
+{
+    if (dup->l_seq != rep->l_seq)
+        err_fatal(__func__, "dedup-reads CHECK_BASES: read %d has length %d but its representative has %d",
+                  read_idx, dup->l_seq, rep->l_seq);
+    for (int i = 0; i < dup->l_seq; ++i) {
+        if (dup->seq[i] != rep->seq[i])
+            err_fatal(__func__, "dedup-reads CHECK_BASES: read %d base %d is %d but its representative's is %d",
+                      read_idx, i, (int)(unsigned char) dup->seq[i], (int)(unsigned char) rep->seq[i]);
+    }
+}
+
 /* [dedup-reads] Phase 2 copy pass: for each DUP pair in this work item, replicate
  * its representative pair's post-extension regs (both mates). Runs as its own
  * kt_for after worker_bwt_aln (all REP regs are final) and strictly before either
@@ -4220,10 +4236,15 @@ static void worker_copy_regs(void *data, int seq_id, int batch_size, int tid)
     worker_t *w = (worker_t*) data;
     const read_memo_state *memo = w->memo;
     const int verify = read_memo_verify();
+    const int check_bases = read_memo_check_bases();
     for (int l = 0; l < batch_size; l += 2) {
         const int gr = seq_id + l;                 /* global read index (pair R1) */
         if (memo->role[gr >> 1] != READ_MEMO_ROLE_DUP) continue;
         const int rep_r1 = (int) memo->rep_pair[gr >> 1] << 1;
+        if (check_bases) {
+            read_memo_check_read_bases(&w->seqs[gr],     &w->seqs[rep_r1],     gr);
+            read_memo_check_read_bases(&w->seqs[gr + 1], &w->seqs[rep_r1 + 1], gr + 1);
+        }
         if (verify) {
             read_memo_verify_regs(&w->regs[gr],     &w->regs[rep_r1],     gr);
             read_memo_verify_regs(&w->regs[gr + 1], &w->regs[rep_r1 + 1], gr + 1);

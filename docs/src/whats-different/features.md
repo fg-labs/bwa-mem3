@@ -398,6 +398,10 @@ exit. `BWAMEM3_DEDUP_READS_VERIFY=1` is a correctness diagnostic: it aligns
 duplicate pairs normally (no work is skipped) and asserts each duplicate's
 alignment regions match its representative's field-by-field, aborting on any
 divergence — the position-invariance guarantee, checked on real data.
+`BWAMEM3_DEDUP_READS_CHECK_BASES=1` is a second diagnostic, for the armed path
+itself: before copying a representative's regions to a duplicate, it asserts the
+two reads' 2-bit encoded bases are identical, aborting on any difference — so each
+read is shown to be converted exactly once, which SAM output cannot show.
 
 ## `--ks-dedup` cross-read SA-interval deduplication
 

@@ -56,7 +56,8 @@ mangle "$W/dup_2.fq" "$W/nlow_2.fq" || fail "generate N/lowercase R2"
 # pass maps 5 -> 4, i.e. N), so each read must be converted exactly once: DUPs in
 # worker_bwt_memo, REPs in kernel1. The SAM encoder prints 4 and 5 alike, so
 # this end-to-end check cannot see a second conversion; the encoded bytes are
-# asserted at the conversion boundary in test/unit/test_read_memo.cpp. Same
+# asserted in test/unit/test_read_memo.cpp (the helper) and by the
+# CHECK_BASES run below (the armed seed stage itself). Same
 # uniform, deterministic mangle as above, so the repeats stay duplicate pairs.
 dash() { # <in.fq> <out.fq> : set base 30 to '-'
     awk 'NR % 4 == 2 { print substr($0, 1, 29) "-" substr($0, 31); next } { print }' \
@@ -119,6 +120,22 @@ BWAMEM3_DEDUP_READS_VERIFY=1 "$BWA_MEM3" mem --dedup-reads on -t 4 "$W/phix.fa" 
     || fail "VERIFY run reported a regs-invariance divergence: $(tail -1 "$W/verify.err")"
 cmp "$W/off_dup_t4.sam" "$W/verify.sam" || fail "VERIFY output != off"
 ok "regs-invariance VERIFY holds (duplicate regs == representative regs)"
+
+# Seed-stage instrument: BWAMEM3_DEDUP_READS_CHECK_BASES asserts, in the armed
+# copy pass, that each duplicate read's 2-bit bases equal its representative's
+# (err_fatal on any difference -> nonzero exit). worker_bwt_memo must convert
+# each read exactly once -- DUPs itself, REPs through kernel1 -- and SAM prints
+# codes 4 and 5 alike, so off==on above cannot see a REP converted twice
+# ('-' -> 5 -> 4). Unlike VERIFY it keeps the compaction, so it checks the path
+# production runs. Run on the '-' and N/lowercase fixtures, whose bases are the
+# ones the conversion is sensitive to; output must still equal off.
+for p in dash nlow; do
+    BWAMEM3_DEDUP_READS_CHECK_BASES=1 "$BWA_MEM3" mem --dedup-reads on -t 4 "$W/phix.fa" \
+        "$W/${p}_1.fq" "$W/${p}_2.fq" 2> "$W/check_$p.err" | grep -v '^@PG' > "$W/check_$p.sam" \
+        || fail "CHECK_BASES ($p): $(tail -1 "$W/check_$p.err")"
+    cmp "$W/off_${p}_t4.sam" "$W/check_$p.sam" || fail "CHECK_BASES output != off ($p)"
+    ok "seed-stage conversion CHECK_BASES holds ($p: duplicate bases == representative bases)"
+done
 
 # CLI validation: a bad value and an explicit-but-empty value are both fatal
 # (the empty form must NOT silently inherit the env), and usage advertises the

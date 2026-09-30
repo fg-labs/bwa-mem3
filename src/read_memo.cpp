@@ -308,6 +308,15 @@ int read_memo_verify(void)
     return on;
 }
 
+int read_memo_check_bases(void)
+{
+    static const int on = []() {
+        const char *e = getenv("BWAMEM3_DEDUP_READS_CHECK_BASES");
+        return (e && *e && !(e[0] == '0' && e[1] == '\0')) ? 1 : 0;
+    }();
+    return on;
+}
+
 static void readmemo_reprobe(int64_t pairs)
 {
     const int64_t period = readmemo_cfg().reprobe_pairs;
