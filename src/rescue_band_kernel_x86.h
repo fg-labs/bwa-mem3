@@ -4,7 +4,7 @@
  * that section's names (the RB_* lane constants and feature macros, rb_work and the kernels in an
  * anonymous namespace, the run_jobs helpers as file-scope statics). Same band
  * coordinates, SoA layout (one byte per lane, RB_L = 32 lanes per position / row), kernels
- * (rb_dp_core<FScan, Sym>, rb_dp_wave2<Sym>), qe scan and row bookkeeping; every value the caller reads
+ * (rb_dp_core<FScan, SC>, rb_dp_wave2<SC>), qe scan and row bookkeeping; every value the caller reads
  * (gmax, te, qe, the row maxima R) is the NEON kernel's for the same lanes. Two encodings differ,
  * because x86 has no NEON TBL / SQADD:
  *
@@ -125,10 +125,10 @@ static inline void rb_transpose_to(const uint8_t *ST, int stride, int n, uint8_t
 }
 
 /* BI[p] = shift on real query columns (A < 0x80), 0 on pad / nonexistent ones, for p in [0, P). */
-static inline void rb_build_bias(rb_work &w, int P)
+static inline void rb_build_bias(rb_work &w, int P, int shift)
 {
     rb_work::fit(w.BI, (size_t)P * 32);
-    const __m256i four = _mm256_set1_epi8((char)w.shift), m1 = _mm256_set1_epi8(-1);
+    const __m256i four = _mm256_set1_epi8((char)shift), m1 = _mm256_set1_epi8(-1);
     const uint8_t *A = w.A.data();
     uint8_t *BI = w.BI.data();
     for (int p = 0; p < P; p++) rb_st(BI + p * 32, _mm256_and_si256(_mm256_cmpgt_epi8(rb_ld(A + p * 32), m1), four));
@@ -148,6 +148,30 @@ static inline void rb_snapshot(rb_work &w, const uint8_t *Hrow, int row, int W, 
 
 /* The biased scoring table (index q ^ r: 0 match, 1-3 mismatch, 4-15 N), both 128-bit halves. */
 static inline __m256i rb_tblb(const rb_work &w) { return _mm256_load_si256((const __m256i *)w.tblb); }
+/* The default scoring's table + 4 (match 5, mismatch 0, N 3), as a constant. */
+static inline __m256i rb_tblb_dflt()
+{
+    return _mm256_setr_epi8(5, 0, 0, 0, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
+                            5, 0, 0, 0, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3);
+}
+/* The kernels' scoring constants for form SC (rb_scoring::form), as the NEON section's rb_consts:
+ * RB_SC_DFLT folds the default scoring in as immediates (bias 4), RB_SC_SYM aliases the deletion
+ * vectors to the insertion ones, RB_SC_GEN takes both pairs. */
+template <int SC>
+struct rb_consts {
+    __m256i tbl, vOI, vEI, vEI2, vOD, vED;
+    int shift;
+    explicit rb_consts(const rb_work &w)
+    {
+        tbl = SC == RB_SC_DFLT ? rb_tblb_dflt() : rb_tblb(w);
+        vOI = _mm256_set1_epi8((char)(SC == RB_SC_DFLT ? 7 : w.oe_ins));
+        vEI = _mm256_set1_epi8((char)(SC == RB_SC_DFLT ? 1 : w.e_ins));
+        vEI2 = _mm256_set1_epi8((char)(SC == RB_SC_DFLT ? 2 : (uint8_t)std::min(255, 2 * w.e_ins)));
+        vOD = SC == RB_SC_GEN ? _mm256_set1_epi8((char)w.oe_del) : vOI;
+        vED = SC == RB_SC_GEN ? _mm256_set1_epi8((char)w.e_del) : vEI;
+        shift = SC == RB_SC_DFLT ? 4 : w.shift;
+    }
+};
 /* sat(Hp + score(q, r)) in the biased form (see the file comment). Under the --meth table REF
  * holds r << 2, and q ^ (r << 2) = (r << 2) | q for bases (the NEON section's argument); the pad
  * 0x80 / nonexistent 0xC0 query codes still set bit 7, so PSHUFB still gives 0. */
@@ -158,15 +182,15 @@ static inline __m256i rb_hs(__m256i hp, __m256i q, __m256i rref, __m256i bi, __m
 
 /* rb_dp_core of the NEON section, 32 lanes (see there for the row range, the live mask and the
  * FScan cell: the two instantiations agree on every value the caller reads). */
-template <bool FScan, bool Sym>
+template <bool FScan, int SC>
 static long rb_dp_core(rb_work &w, int W, int NR, int omax, int ominq, int omaskq, bool early)
 {
+    constexpr bool Sym = SC != RB_SC_GEN;
     long computed = 0;
-    rb_build_bias(w, NR + W - 1);
-    const __m256i tbl = rb_tblb(w);
-    const __m256i vOI = _mm256_set1_epi8((char)w.oe_ins), vEI = _mm256_set1_epi8((char)w.e_ins);
-    const __m256i vEI2 = _mm256_set1_epi8((char)(uint8_t)std::min(255, 2 * w.e_ins));
-    const __m256i vOD = _mm256_set1_epi8((char)w.oe_del), vED = _mm256_set1_epi8((char)w.e_del), m1 = _mm256_set1_epi8(-1);
+    const rb_consts<SC> K(w);
+    rb_build_bias(w, NR + W - 1, K.shift);
+    const __m256i tbl = K.tbl, vOI = K.vOI, vEI = K.vEI, vEI2 = K.vEI2, vOD = K.vOD, vED = K.vED;
+    const __m256i m1 = _mm256_set1_epi8(-1);
     uint8_t *Hc = w.H.data(), *Hp = Hc + (size_t)W * 32, *E = w.E.data();
     const uint8_t *A = w.A.data(), *QL = w.QL.data(), *BI = w.BI.data(), *REF = w.REF.data();
     uint8_t *Rout = w.R.data();
@@ -273,14 +297,15 @@ static inline void rb_qe_scan(rb_work &w, const uint8_t *Hrow, int row, int W, i
 /* rb_dp_wave2 of the NEON section (the default kernel: the fused cell on two rows per step with
  * the direct qe scan), 32 lanes; see there for the pairing argument. The pair (r, k), (r + 1, k + 1)
  * shares the query slot p, so one A / QL / BI load serves both. */
-template <bool Sym>
+template <int SC>
 static long rb_dp_wave2(rb_work &w, int W, int NR, int omax, int ominq, int omaskq, bool early)
 {
+    constexpr bool Sym = SC != RB_SC_GEN;
     long computed = 0;
-    rb_build_bias(w, NR + W - 1);
-    const __m256i tbl = rb_tblb(w);
-    const __m256i vOI = _mm256_set1_epi8((char)w.oe_ins), vEI = _mm256_set1_epi8((char)w.e_ins);
-    const __m256i vOD = _mm256_set1_epi8((char)w.oe_del), vED = _mm256_set1_epi8((char)w.e_del), m1 = _mm256_set1_epi8(-1);
+    const rb_consts<SC> K(w);
+    rb_build_bias(w, NR + W - 1, K.shift);
+    const __m256i tbl = K.tbl, vOI = K.vOI, vEI = K.vEI, vOD = K.vOD, vED = K.vED;
+    const __m256i m1 = _mm256_set1_epi8(-1);
     uint8_t *Hp = w.H.data(), *Ha = Hp + (size_t)W * 32, *Hb = Hp + (size_t)W * 64, *E = w.E.data();
     const uint8_t *A = w.A.data(), *QL = w.QL.data(), *BI = w.BI.data(), *REF = w.REF.data();
     uint8_t *Rout = w.R.data();

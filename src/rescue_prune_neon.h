@@ -41,7 +41,7 @@ struct Job {
 struct Wt {
     int base = 5, a = 1, c = 1, toff = 2, e = 1;
     bool dflt() const { return base == 5 && a == 1 && c == 1 && toff == 2 && e == 1; }
-    int tail(int ub, int minsc) const { const int n = ub - minsc - toff; return n > 0 ? n / e : 0; }
+    int tail(int ub, int minsc) const { const int n = ub - minsc - toff; return n <= 0 ? 0 : e == 1 ? n : n / e; }
     bool operator==(const Wt &o) const { return base == o.base && a == o.a && c == o.c && toff == o.toff && e == o.e; }
 };
 
@@ -728,6 +728,14 @@ static inline Kind lean_neon_core(const Job &jb, NeonScratch &s, int &hb, int &h
     s.ncomp = nc;
     return B2;
 }
+// The general-weights core out of line: the default core inlines into the aligner's per-job filter
+// entry as it always has, and the general one, which only other scorings reach, must not double
+// that code (a call per job is nothing next to the filter).
+static Kind __attribute__((noinline)) lean_neon_core_gen(const Job &jb, NeonScratch &s, int &hb, int &he,
+                                                         int max_hits, int minsc, const Wt &wt)
+{
+    return lean_neon_core<true>(jb, s, hb, he, max_hits, minsc, wt);
+}
 // lean_neon_core behind the repeat memo (lean_memo).
 static inline Kind lean_neon(const Job &jb, NeonScratch &s, int &hb, int &he, int max_hits, int minsc,
                              const Wt &wt)
@@ -735,7 +743,7 @@ static inline Kind lean_neon(const Job &jb, NeonScratch &s, int &hb, int &he, in
     return lean_memo(jb, s, hb, he, max_hits, minsc, wt,
                      [](const Job &j, NeonScratch &t, int &b, int &e, int mh, int ms, const Wt &w) {
                          return w.dflt() ? lean_neon_core<false>(j, t, b, e, mh, ms, w)
-                                         : lean_neon_core<true>(j, t, b, e, mh, ms, w);
+                                         : lean_neon_core_gen(j, t, b, e, mh, ms, w);
                      });
 }
 #endif  // __aarch64__ (rescue_prune.h dispatches here only on aarch64)

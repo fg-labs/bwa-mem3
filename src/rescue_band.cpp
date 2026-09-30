@@ -148,10 +148,9 @@ static int rb_p1_cost_pct()
  * arguments are at RB_CELL1 and rb_dp_wave2). BWA3_RESCUE_FSCAN, the kswv toggle read the same
  * way (rescue_env_on: a leading '0' turns it off), selects 0 when off; otherwise
  * BWA3_RESCUE_BAND_KERNEL picks the kernel (default 2; values above 2 act as 2), so 1 stays
- * reachable as the one-row step between the other two for A/B and bisecting. Each kernel has a Sym
- * instantiation (deletion and insertion open-plus-extend sums and extends alike: one gap
- * subtraction serves both) and a general one (run_jobs picks by rb_scoring::sym_gaps). Read once,
- * like the other band toggles. */
+ * reachable as the one-row step between the other two for A/B and bisecting. Each kernel has an
+ * instantiation per scoring form (RB_SC_DFLT, RB_SC_SYM, RB_SC_GEN in rescue_band.h; run_jobs picks
+ * by rb_scoring::form). Read once, like the other band toggles. */
 static int rb_kernel()
 {
     static const int v = rescue_env_on("BWA3_RESCUE_FSCAN") ? rescue_env_int("BWA3_RESCUE_BAND_KERNEL", 2) : 0;
@@ -397,7 +396,7 @@ bool RescueBandBatch::plan(const rescue_prune_view &v, const rescue_prune_params
     /* pp's costs must be the batch's (set_scoring, called by the caller before planning; under
      * --meth the batch's matrix is the group's, set_matrix): bands planned for one scoring and run
      * under another would not be exact, so a mismatch is a caller bug, not a decline. */
-    xassert(rb_scoring::from(pp).same_costs(sc_), "band plan: the filter's scoring is not the batch's");
+    xassert(sc_.same_costs(pp), "band plan: the filter's scoring is not the batch's");
     /* A cost gate of 0 (the default where kswv runs at the AVX-512BW tier, rb_cost_pct) declines
      * every parent, so skip the component work it would decline afterwards; counted as declined by
      * the cost model, which is what the gate below would do. */
@@ -650,13 +649,35 @@ static inline void rb_snapshot(rb_work &w, const uint8_t *Hrow, int row, int W, 
  * asymmetric table REF holds r << 2 (run_jobs), and q ^ (r << 2) = (r << 2) | q for bases, since
  * the bits are disjoint (rb_scoring::asym); the pad and inactive codes land outside the table
  * either way. */
-template <bool FScan, bool Sym>
+/* The kernels' scoring constants for form SC (rb_scoring::form): the table and the gap constants
+ * (oe = open + extend, e = extend; insertion on F, deletion on E) as vectors. RB_SC_DFLT folds the
+ * default scoring's values in as immediates -- the code the kernels were derived and measured in;
+ * RB_SC_SYM takes the batch's table and one constant pair for both gap types (the deletion vectors
+ * alias the insertion ones, so the register set is the default form's); RB_SC_GEN takes both pairs. */
+static const int8_t rb_tbl_dflt[16] __attribute__((aligned(16))) = {1, -4, -4, -4, -1, -1, -1, -1,
+                                                                     -1, -1, -1, -1, -1, -1, -1, -1};
+template <int SC>
+struct rb_consts {
+    uint8x16_t tbl, vOI, vEI, vEI2, vOD, vED;
+    explicit rb_consts(const rb_work &w)
+    {
+        tbl = vld1q_u8((const uint8_t *)(SC == RB_SC_DFLT ? rb_tbl_dflt : w.tbl));
+        vOI = vdupq_n_u8(SC == RB_SC_DFLT ? 7 : w.oe_ins);
+        vEI = vdupq_n_u8(SC == RB_SC_DFLT ? 1 : w.e_ins);
+        vEI2 = vdupq_n_u8(SC == RB_SC_DFLT ? 2 : (uint8_t)std::min(255, 2 * w.e_ins));
+        vOD = SC == RB_SC_GEN ? vdupq_n_u8(w.oe_del) : vOI;
+        vED = SC == RB_SC_GEN ? vdupq_n_u8(w.e_del) : vEI;
+    }
+};
+
+template <bool FScan, int SC>
 static long rb_dp_core(rb_work &w, int W, int NR, int omax, int ominq, int omaskq, bool early)
 {
+    constexpr bool Sym = SC != RB_SC_GEN;
     long computed = 0;
-    const uint8x16_t tbl = vld1q_u8((const uint8_t *)w.tbl);
-    const uint8x16_t vOI = vdupq_n_u8(w.oe_ins), vEI = vdupq_n_u8(w.e_ins), vEI2 = vdupq_n_u8((uint8_t)std::min(255, 2 * w.e_ins));
-    const uint8x16_t vOD = vdupq_n_u8(w.oe_del), vED = vdupq_n_u8(w.e_del), v80 = vdupq_n_u8(0x80);
+    const rb_consts<SC> K(w);
+    const uint8x16_t tbl = K.tbl, vOI = K.vOI, vEI = K.vEI, vEI2 = K.vEI2, vOD = K.vOD, vED = K.vED;
+    const uint8x16_t v80 = vdupq_n_u8(0x80);
     uint8_t *Hc = w.H.data(), *Hp = Hc + (size_t)W * 16, *E = w.E.data();
     const uint8_t *A = w.A.data(), *QL = w.QL.data(), *REF = w.REF.data();
     uint8_t *Rout = w.R.data();
@@ -828,13 +849,14 @@ static inline void rb_qe_scan(rb_work &w, const uint8_t *Hrow, int row, int W, i
  * lanes whose gmax already equals the target S: gmax never exceeds S (rescue_band.h), so a run
  * ending below S is superseded by the run that reaches S, and a lane that never reaches it fails
  * run_pass1's guard and is rerun through kswv, as before. */
-template <bool Sym>
+template <int SC>
 static long rb_dp_wave2(rb_work &w, int W, int NR, int omax, int ominq, int omaskq, bool early)
 {
+    constexpr bool Sym = SC != RB_SC_GEN;
     long computed = 0;
-    const uint8x16_t tbl = vld1q_u8((const uint8_t *)w.tbl);
-    const uint8x16_t vOI = vdupq_n_u8(w.oe_ins), vEI = vdupq_n_u8(w.e_ins);
-    const uint8x16_t vOD = vdupq_n_u8(w.oe_del), vED = vdupq_n_u8(w.e_del), v80 = vdupq_n_u8(0x80);
+    const rb_consts<SC> K(w);
+    const uint8x16_t tbl = K.tbl, vOI = K.vOI, vEI = K.vEI, vOD = K.vOD, vED = K.vED;
+    const uint8x16_t v80 = vdupq_n_u8(0x80);
     uint8_t *Hp = w.H.data(), *Ha = Hp + (size_t)W * 16, *Hb = Hp + (size_t)W * 32, *E = w.E.data();
     const uint8_t *A = w.A.data(), *QL = w.QL.data(), *REF = w.REF.data();
     uint8_t *Rout = w.R.data();
@@ -1044,13 +1066,22 @@ static void rb_score2_vec(const uint8_t *R, int n, int row0, int Z, int te, int 
 #endif
 
 #if RB_HAVE_SIMD
-/* The band kernel rb_kernel() selects, for one Sym instantiation. */
-template <bool Sym>
+/* The band kernel rb_kernel() selects, in one scoring form (rb_scoring::form). */
+template <int SC>
 static long rb_kernel_run(int kern, rb_work &w, int W, int NR, int omax, int ominq, int omaskq, bool early)
 {
-    return kern >= 2 ? rb_dp_wave2<Sym>(w, W, NR, omax, ominq, omaskq, early)
-         : kern == 1 ? rb_dp_core<true, Sym>(w, W, NR, omax, ominq, omaskq, early)
-                     : rb_dp_core<false, Sym>(w, W, NR, omax, ominq, omaskq, early);
+    return kern >= 2 ? rb_dp_wave2<SC>(w, W, NR, omax, ominq, omaskq, early)
+         : kern == 1 ? rb_dp_core<true, SC>(w, W, NR, omax, ominq, omaskq, early)
+                     : rb_dp_core<false, SC>(w, W, NR, omax, ominq, omaskq, early);
+}
+/* The RB_SC_SYM and RB_SC_GEN forms out of line: the default form's kernels inline into run_jobs as
+ * they always have, and the other forms, which only other scorings reach, must not triple its code
+ * (a call per lane group is nothing next to the kernel). */
+static long __attribute__((noinline)) rb_kernel_run_general(int form, int kern, rb_work &w, int W, int NR, int omax,
+                                                            int ominq, int omaskq, bool early)
+{
+    return form == RB_SC_SYM ? rb_kernel_run<RB_SC_SYM>(kern, w, W, NR, omax, ominq, omaskq, early)
+                             : rb_kernel_run<RB_SC_GEN>(kern, w, W, NR, omax, ominq, omaskq, early);
 }
 #endif
 
@@ -1070,7 +1101,7 @@ void RescueBandBatch::run_jobs(bool pass1)
     const int n = (int)jobs_.size();
     if (n == 0) return;
     rb_set_scoring(w, sc_);
-    const bool sym = sc_.sym_gaps();
+    const int form = sc_.form();
     order_.resize(n);
     for (int i = 0; i < n; i++) {
         order_[i] = i;
@@ -1164,8 +1195,8 @@ void RescueBandBatch::run_jobs(bool pass1)
         }
         for (int l = 0; l < RB_L; l++) w.target[l] = pass1 && l < nl ? (uint8_t)L[l]->target : 0;
         const int kern = rb_kernel();
-        const long computed = sym ? rb_kernel_run<true>(kern, w, W, NR, omax, ominq, omaskq, pass1)
-                                  : rb_kernel_run<false>(kern, w, W, NR, omax, ominq, omaskq, pass1);
+        const long computed = form == RB_SC_DFLT ? rb_kernel_run<RB_SC_DFLT>(kern, w, W, NR, omax, ominq, omaskq, pass1)
+                                                 : rb_kernel_run_general(form, kern, w, W, NR, omax, ominq, omaskq, pass1);
         if (st) stats_.cells_pad += (uint64_t)RB_L * computed;
         /* Lane l's gmax, the first row reaching it and the first column holding it there. */
         auto lane_result = [&](int l) {
@@ -1377,9 +1408,15 @@ bool RescueBandBatch::take_pass1(const SeqPair &sp, const kswr_t &r, bool banded
      * most qe + 1 + dall rows of the te + 1 reversed ones. Diagonals past the last row (d > nrows - 1)
      * or past the query (d < -(quanta - 1)) hold no cell, so the band is clipped to them. */
     const int quanta = ((qe + 1 + 15) / 16) * 16;
-    const int top = sc_.a * (qe + 1) - S;
-    const int dall = std::max(0, (top - sc_.o_del) / sc_.e_del);
-    const int iall = std::max(0, (top - sc_.o_ins) / (sc_.a + sc_.e_ins));
+    int dall, iall;
+    if (sc_.dflt()) {   // the general bounds at the default scoring, without their divisions
+        dall = std::max(0, qe - S - 5);
+        iall = dall / 2;
+    } else {
+        const int top = sc_.a * (qe + 1) - S;
+        dall = std::max(0, (top - sc_.o_del) / sc_.e_del);
+        iall = std::max(0, (top - sc_.o_ins) / (sc_.a + sc_.e_ins));
+    }
     const int nrows = std::min(te + 1, qe + 1 + dall);
     const int dmax = std::min(dall, nrows - 1), imax = std::min(iall, quanta - 1);
     /* Both kswv and the band stop at the first row reaching S (the band via rb_dp_core's early

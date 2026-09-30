@@ -82,6 +82,14 @@
  * a, mismatch b (N scores -1), gap of length L costs o + e L per type (deletion: reference advances,
  * the kernels' vertical E; insertion: query advances, their in-row F). shift = kswv's 8-bit bias
  * (kswv8_shift): a pass-0 score with S + shift >= 255 is kswv's saturated 255. */
+/* The band kernels' scoring forms (rb_scoring::form, one instantiation of every kernel each): the
+ * default scoring's constants folded into the code (score table {+1, -4, -1}, gaps 6 + 1 on both
+ * types: the form the kernels were derived and measured in, so the default scoring runs the code it
+ * always ran), symmetric gaps (rb_scoring::sym_gaps: one gap subtraction and one constant pair serve
+ * both types) at a run-time table and constants, or the general form (separate deletion and
+ * insertion constants). Under --meth's asymmetric table (rb_scoring::asym) the form is SYM or GEN. */
+enum { RB_SC_DFLT = 0, RB_SC_SYM = 1, RB_SC_GEN = 2 };
+
 struct rb_scoring {
     int a = 1, b = 4, o_del = 6, e_del = 1, o_ins = 6, e_ins = 1;
     /* --meth: the kernels take a table of the pair group's matrix (mat_ot / mat_ob, one group at a
@@ -98,14 +106,24 @@ struct rb_scoring {
             for (int q = 0; q < 4; q++) mat16[r * 4 + q] = mat25[r * 5 + q];
     }
     int shift() const { return kswv8_shift(b); }
-    /* Deletion and insertion alike: one gap subtraction serves both (the kernels' Sym form). */
+    /* Deletion and insertion alike: one gap subtraction serves both (the kernels' RB_SC_SYM form). */
     bool sym_gaps() const { return o_del + e_del == o_ins + e_ins && e_del == e_ins; }
-    /* score2's zone half-width around te: kswv's ceil(S / qmax), qmax = a (kswv.cpp). */
-    int zone(int S) const { return (S + a - 1) / a; }
+    /* The default scoring with the symmetric table: the kernels' RB_SC_DFLT form, its constants
+     * folded into the code. */
+    bool dflt() const { return !asym && a == 1 && b == 4 && o_del == 6 && e_del == 1 && o_ins == 6 && e_ins == 1; }
+    /* The kernel form this scoring runs in (rb_kernel_run). */
+    int form() const { return dflt() ? RB_SC_DFLT : sym_gaps() ? RB_SC_SYM : RB_SC_GEN; }
+    /* score2's zone half-width around te: kswv's ceil(S / qmax), qmax = a (kswv.cpp); no division
+     * at a = 1. */
+    int zone(int S) const { return a == 1 ? S : (S + a - 1) / a; }
     /* Same match, mismatch and gap costs (not the --meth table): what plan() depends on. */
     bool same_costs(const rb_scoring &o) const
     {
         return a == o.a && b == o.b && o_del == o.o_del && e_del == o.e_del && o_ins == o.o_ins && e_ins == o.e_ins;
+    }
+    bool same_costs(const rescue_prune_params &p) const
+    {
+        return a == p.a && b == p.b && o_del == p.o_del && e_del == p.e_del && o_ins == p.o_ins && e_ins == p.e_ins;
     }
     /* What the kernels need: a scoring kswv's 8-bit kernels run exactly (kswv8_scoring_ok). Unlike
      * rescue_prune_params::from, no lemma condition: band pass 1 runs at scorings pruning refuses. */

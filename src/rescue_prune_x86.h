@@ -413,6 +413,12 @@ static inline Kind lean_x86_core(const Job &jb, X86Scratch &s, int &hb, int &he,
     return B2;
 }
 
+// The general-weights core out of line, as lean_neon_core_gen.
+static Kind __attribute__((noinline)) lean_x86_core_gen(const Job &jb, X86Scratch &s, int &hb, int &he,
+                                                        int max_hits, int minsc, const Wt &wt)
+{
+    return lean_x86_core<true>(jb, s, hb, he, max_hits, minsc, wt);
+}
 // lean_x86_core behind the repeat memo, as lean_neon.
 static inline Kind lean_x86(const Job &jb, X86Scratch &s, int &hb, int &he, int max_hits, int minsc,
                             const Wt &wt)
@@ -420,7 +426,7 @@ static inline Kind lean_x86(const Job &jb, X86Scratch &s, int &hb, int &he, int 
     return lean_memo(jb, s, hb, he, max_hits, minsc, wt,
                      [](const Job &j, X86Scratch &t, int &b, int &e, int mh, int ms, const Wt &w) {
                          return w.dflt() ? lean_x86_core<false>(j, t, b, e, mh, ms, w)
-                                         : lean_x86_core<true>(j, t, b, e, mh, ms, w);
+                                         : lean_x86_core_gen(j, t, b, e, mh, ms, w);
                      });
 }
 

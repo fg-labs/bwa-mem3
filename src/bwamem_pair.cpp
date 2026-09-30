@@ -1672,6 +1672,10 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
      * scoring, so the batch takes it here. */
     const rescue_prune_params run_pp = rescue_prune_params_for(opt);
     const bool run_prunes = rescue_prune_runs(opt, run_pp);
+    /* --meth: the pair's hypothesis (as tagged at enqueue: 1 OT, 0 OB) selects the conversion the
+     * filter applies (rescue_prune_params::set_meth); both parameter sets are made here, once. */
+    rescue_prune_params run_pp_ot = run_pp, run_pp_ob = run_pp;
+    if (opt->meth_mode) { run_pp_ot.set_meth(1); run_pp_ob.set_meth(0); }
     const bool record_narrow = opt->rescue_kmer || run_prunes;
     if (run_prunes && rescue_band_enabled() && !opt->meth_mode)
         matesw_band(mmc, tid).set_scoring(rb_scoring::from(run_pp));
@@ -1832,11 +1836,11 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
             if (pruned) {
                 if ((int)oq.size() < l_ms) oq.resize(l_ms);
                 matesw_orient(ms, l_ms, is_rev, oq.data());
-                /* Under --meth the pair's hypothesis (as tagged at enqueue: 1 OT, 0 OB) selects
-                 * the conversion the filter applies (rescue_prune_params::set_meth); only the
-                 * batched meth rescue reaches here, since the scalar escape hatch returns earlier. */
-                rescue_prune_params pp = run_pp;
-                if (opt->meth_mode) pp.set_meth((mate_meth_ot ^ is_rev) & 1);
+                /* Under --meth the pair's hypothesis picks the converted parameter set (run_pp_ot /
+                 * run_pp_ob); only the batched meth rescue reaches here, since the scalar escape
+                 * hatch returns earlier. */
+                const rescue_prune_params &pp = !opt->meth_mode ? run_pp
+                                              : ((mate_meth_ot ^ is_rev) & 1) ? run_pp_ot : run_pp_ob;
                 int hb, he;
                 rescue_prune_view view;
                 const uint64_t tf0 = g_rescue_prune_stats.on ? rescue_now_ns() : 0;

@@ -34,6 +34,8 @@ Pass 1 finds where the best alignment starts: kswv runs the DP on the reversed p
 - `1`, the fused cell of [the 11-op rescue cell](rescue-kswv.md) one row at a time (`RB_CELL1`); the note there explains why dropping an in-row gap run followed directly by a vertical one cannot change an output: such an alignment has an equal-scoring twin, with the two runs swapped, inside the same band;
 - `2` (default), the fused cell two rows per step with the query end read directly from the scan (`rb_dp_wave2`).
 
+Each kernel comes in three scoring forms, one instantiation each, and `run_jobs` picks the batch's by `rb_scoring::form`: `RB_SC_DFLT` folds the default scoring's table and gap constants in as immediates, so the default scoring runs the code the kernels were derived and measured in; `RB_SC_SYM` takes the batch's table and one gap constant pair for both gap types (`rb_scoring::sym_gaps`, so `-B 6` or a `--meth` matrix at the default gap costs), with the deletion vectors aliasing the insertion ones; `RB_SC_GEN` takes separate deletion and insertion constants. Every form gives the same outputs. Gate: `Banded rescue == kswv (rescue_band_harness, generated jobs)`, whose legs cover the default scoring, symmetric and split gap costs and random scorings and matrices.
+
 `BWA3_RESCUE_FSCAN=0`, which turns the fused cell off in kswv, selects kernel 0 here as well. Within a lane group, `run_jobs` shifts each narrower lane's spare diagonals below its band so the lanes' query offsets line up (`BWA3_RESCUE_BAND_SHIFT=0` turns that off). Every combination leaves output identical. Gate: `Banded rescue == kswv (rescue_band_harness, generated jobs)`, which runs kernel 1 and the shift off as legs of their own.
 
 ## The AVX2 kernel

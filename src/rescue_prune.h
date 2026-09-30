@@ -101,7 +101,7 @@ struct rescue_prune_params {
     int tail(int ub, int tau) const
     {
         const int n = ub - tau - o_del + (K - 1) * a;
-        return n > 0 ? n / e_del : 0;
+        return n <= 0 ? 0 : e_del == 1 ? n : n / e_del;   // no division at the default -E 1
     }
     /* The SIMD filters take K = 5 and any weights (simd_wt); a <= 16 keeps a cnt in int16 (they
      * fall back to the scalar filter where a sum would leave it). */
@@ -404,9 +404,20 @@ static inline bool rescue_prune_cost_ok(const rescue_prune_params &p, bool meth,
  *   hb, he      inclusive sub-window rows, set for RESCUE_PRUNE_B2
  *   view        optional: for RESCUE_PRUNE_B2, the per-diagonal arrays the decision came from
  *               (rescue_prune_view); left empty (nd = -1) otherwise */
-static inline int rescue_prune_window(const uint8_t *ref, int len1, const uint8_t *q, int len2,
-                                      const rescue_prune_params &p, int max_hits, int *hb, int *he,
-                                      rescue_prune_view *view = nullptr)
+/* With the SIMD filter inlined into it this is a few thousand instructions, and whether the aligner's
+ * per-job caller (mem_matesw_batch_pre) should hold it or call it differs by architecture, each way
+ * measured against the other in one interleaved round (-t 16, 12 reps, wgs-5M / wes-5M, output
+ * identical): on aarch64 the call is faster (Graviton 4, inlined vs called: wall +0.12 % / +0.08 %,
+ * user CPU +0.14 % / +0.18 %), on x86 the inlined body is (Zen 5 AVX-512BW, called vs inlined: wall
+ * +0.70 % / +1.21 %, user CPU +0.77 % / +0.82 %). The attribute pins each. */
+#if defined(__aarch64__)
+#define RESCUE_PRUNE_WINDOW_INLINE __attribute__((noinline))
+#else
+#define RESCUE_PRUNE_WINDOW_INLINE inline
+#endif
+static RESCUE_PRUNE_WINDOW_INLINE int rescue_prune_window(const uint8_t *ref, int len1, const uint8_t *q, int len2,
+                                                          const rescue_prune_params &p, int max_hits, int *hb, int *he,
+                                                          rescue_prune_view *view = nullptr)
 {
     if (view) *view = rescue_prune_view();
     *hb = *he = -1;
@@ -419,14 +430,14 @@ static inline int rescue_prune_window(const uint8_t *ref, int len1, const uint8_
         static thread_local uint8_t cref[rescue_prune_scratch::WCAP], cq[rescue_prune_scratch::QCAP];
         const uint8_t f = (uint8_t)p.conv_from, t = (uint8_t)p.conv_to;
         /* The conversion maps a base to a base (f, t < 4), so an N survives it: check for one in
-         * the same pass and skip the filter call that would return FULL for it. */
+         * the same pass and skip the filter call that would return FULL for it. The filters below
+         * then run on the copies; nothing they read of p depends on the conversion. (Not a
+         * recursive call, so the function stays one straight path.) */
         uint8_t orv = 0;
         for (int i = 0; i < len1; i++) { orv |= ref[i]; cref[i] = ref[i] == f ? t : ref[i]; }
         for (int j = 0; j < len2; j++) { orv |= q[j]; cq[j] = q[j] == f ? t : q[j]; }
         if (orv & 0xFC) return RESCUE_PRUNE_FULL;   // N: as the filters decide it
-        rescue_prune_params pi = p;
-        pi.conv_from = pi.conv_to = -1;
-        return rescue_prune_window(cref, len1, cq, len2, pi, max_hits, hb, he, view);
+        ref = cref; q = cq;
     }
     const int minsc = p.minsc;
 #if RESCUE_PRUNE_HAVE_SIMD
