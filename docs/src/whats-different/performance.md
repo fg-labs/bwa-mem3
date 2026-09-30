@@ -233,16 +233,18 @@ generated jobs.
   with EM-seq chemistry only, at `--meth -B 4` and the genomic and neutral
   scorings (the default collapsed scoring keeps the full window). It runs where a
   SIMD filter carries it: on aarch64 (NEON) and on the x86 AVX2 and AVX-512BW
-  builds (an SSE4.1 / SSSE3 port of the filter), at every seed length except at
-  the AVX-512BW kswv tier at a threshold `-k` x `-A` of 25 or more (`-k 25` at
-  `-A 1`, already the default `-k 19` at `-A 2`), where the 64-lane kswv is cheap
-  enough that the filter costs more than it saves. The SIMD filters cover every
+  builds (an SSE4.1 / SSSE3 port of the filter), at every seed length except
+  from `-k 25` at the AVX-512BW kswv tier (at any `-A`), where the 64-lane kswv
+  is cheap enough that the filter costs more than it saves (wgs-5M and wes-5M,
+  prune on vs off at `-k 25` to 40, on an AMD EPYC Zen 5 host at the AVX-512BW
+  tier). The SIMD filters cover every
   admitted scoring with `-A` of at most 16; the others run a scalar filter,
   which pays on aarch64 but not against x86's kswv, so x86 keeps the full window
-  there. Elsewhere the full window is always computed.
+  there (wgs-5M and wes-5M at `-O 8 -E 2` and `-x intractg`: a gain on
+  AWS Graviton 4 at the NEON tier, a loss on the Zen 5 AVX-512BW host). Elsewhere the full window is always computed.
   ([#541](https://github.com/fg-labs/bwa-mem3/pull/541); x86:
-  [#538](https://github.com/fg-labs/bwa-mem3/pull/538); 16-bit jobs:
-  [#542](https://github.com/fg-labs/bwa-mem3/pull/542))
+  [#538](https://github.com/fg-labs/bwa-mem3/pull/538); 16-bit jobs and the
+  AVX-512BW seed-length gate: [#542](https://github.com/fg-labs/bwa-mem3/pull/542))
 - **Banded rescue DP (NEON, AVX2).** For a narrowed job, the rescue DP runs only
   inside the diagonal bands of the K-mer (today 5-mer) components that can reach the
   threshold, 16 bands per NEON vector or 32 per AVX2 vector, and the job's

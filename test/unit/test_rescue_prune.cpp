@@ -690,7 +690,8 @@ TEST_CASE("rescue band: the pass-0 cost gate's default follows the kswv tier"
 // The run-level cost gate (rescue_prune_cost_ok): every outcome gives the same output, so no identity
 // check can see a wrong one; pinned here per architecture. aarch64 prunes everywhere but --meth with
 // chemistry other than EM-seq (TAPS); x86 never under --meth, only where the SIMD filter takes the
-// weights (K = 5, a <= 16), and not at the AVX-512BW tier from minsc 25.
+// weights (K = 5, a <= 16), and not at the AVX-512BW tier from seed length 25 (minsc >= 25 a), so
+// -A 2 at the default -k 19 (minsc 38) still prunes there and -A 2 -k 25 (minsc 50) does not.
 TEST_CASE("rescue prune: the cost gate per architecture, --meth chemistry and kswv tier"
           * doctest::test_suite("unit/pair")) {
     const rescue_prune_params dflt = rescue_prune_params::defaults(19);
@@ -698,8 +699,12 @@ TEST_CASE("rescue prune: the cost gate per architecture, --meth chemistry and ks
     const rescue_prune_params a17 = rescue_prune_params::from(17, 68, 102, 17, 102, 17, 19 * 17);
     REQUIRE(dflt.valid);
     REQUIRE(k25.valid);
+    const rescue_prune_params a2 = rescue_prune_params::from(2, 8, 12, 2, 12, 2, 19 * 2);
+    const rescue_prune_params a2k25 = rescue_prune_params::from(2, 8, 12, 2, 12, 2, 25 * 2);
     REQUIRE(a17.valid);
     REQUIRE(!a17.simd_ok());
+    REQUIRE(a2.simd_ok());
+    REQUIRE(a2k25.simd_ok());
     for (const bool avx512 : {false, true}) {
         CAPTURE(avx512);
 #if defined(__aarch64__)
@@ -708,6 +713,7 @@ TEST_CASE("rescue prune: the cost gate per architecture, --meth chemistry and ks
         CHECK(!rescue_prune_cost_ok(dflt, true, false, avx512));  // --meth=taps
         CHECK(rescue_prune_cost_ok(k25, false, false, avx512));
         CHECK(rescue_prune_cost_ok(a17, false, false, avx512));   // the scalar filter pays here
+        CHECK(rescue_prune_cost_ok(a2k25, false, false, avx512));
 #else
         CHECK(rescue_prune_cost_ok(dflt, false, false, avx512));
         CHECK(!rescue_prune_cost_ok(dflt, true, true, avx512));   // no --meth pruning on x86
@@ -715,6 +721,8 @@ TEST_CASE("rescue prune: the cost gate per architecture, --meth chemistry and ks
         CHECK(rescue_prune_cost_ok(k25, false, false, avx512) == !avx512);
         CHECK(rescue_prune_cost_ok(rescue_prune_params::defaults(24), false, false, avx512));
         CHECK(!rescue_prune_cost_ok(a17, false, false, avx512));  // the scalar filter would decide
+        CHECK(rescue_prune_cost_ok(a2, false, false, avx512));    // -A 2 -k 19: the seed length gates
+        CHECK(rescue_prune_cost_ok(a2k25, false, false, avx512) == !avx512);
 #endif
     }
 }

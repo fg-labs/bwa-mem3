@@ -439,7 +439,7 @@ static bool rescue_band_runs(const mem_opt_t *opt)
  * a scoring the lemma holds for (rescue_prune_params::valid; under --meth the default collapsed
  * scoring is refused there), and the cost gate (rescue_prune_cost_ok in rescue_prune.h: --meth on
  * aarch64 with EM-seq chemistry only, and on x86 no --meth, only where the SIMD filter runs, and not
- * at the AVX-512BW tier at min_seed_len * a >= 25, -k 25 and up at -A 1). Keys the length sort
+ * at the AVX-512BW tier from seed length 25, -k 25 and up at any -A). Keys the length sort
  * (both the non-meth and the per-OT/OB meth batch) and the narrow-offset record / read (each OR'd
  * with --rescue-kmer, which narrows on its own), so a run that cannot prune runs the pre-pruning
  * rescue path, apart from banded pass 1 where rescue_band_runs allows it. */

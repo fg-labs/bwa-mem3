@@ -382,10 +382,15 @@ static inline int rescue_prune_max_hits_default(bool banding, bool meth)
  * prune on vs off, scalar-filtered: -O 8 -E 2 +13.3 / +4.7 %, -x intractg +14.6 / +4.9 %), while the
  * SIMD filter at those scorings wins or breaks even (Zen 3 AVX2: -O 8 -E 2 -2.6 / -7.2 %,
  * -x intractg -0.3 / -6.2 %; Zen 5: all within 1 %), and not at the
- * AVX-512BW tier at minsc >= 25: there the 64-lane kswv is cheap and few rescues pass at a high
- * threshold, so the filter costs more than it saves (Zen 5 wgs-5M: +1.0 / +2.4 / +1.2 / +1.3 % at
- * -k 25 / 28 / 32 / 40; wes-5M -1.3 / +0.9 / -0.8 / -1.2 %). AVX2 still wins at -k 32 (Zen 3 wes-5M
- * -3.8 %). */
+ * AVX-512BW tier from seed length 25 (-k 25; minsc >= 25 a, since minsc = min_seed_len * a): there
+ * the 64-lane kswv is cheap and few rescues pass at a long seed length, so the filter costs more
+ * than it saves (Zen 5 wgs-5M: +1.0 / +2.4 / +1.2 / +1.3 % at -k 25 / 28 / 32 / 40; wes-5M
+ * -1.3 / +0.9 / -0.8 / -1.2 %). AVX2 still wins at -k 32 (Zen 3 wes-5M -3.8 %). The gate is on the
+ * seed length, not on minsc: scaling a scales every score and the threshold alike, so -A 2 at the
+ * default -k 19 prunes like -A 1 does (Zen 5 AVX-512BW, prune on vs off, -t 16, 3 reps, wgs-5M:
+ * -A 2 -2.5 %, -A 2 -B 8 -O 12 -E 2 -2.2 %, -A 3 -B 12 -O 18 -E 3 -1.7 %; wes-5M flat). The gate
+ * covers 16-bit jobs too, which every job at -A 2 with 150 bp mates is: the same filter decides
+ * them, and the kswv they save is the 16-bit kernel, which has half the lanes. */
 static inline bool rescue_prune_cost_ok(const rescue_prune_params &p, bool meth, bool emseq, bool avx512)
 {
 #if defined(__aarch64__)
@@ -393,7 +398,7 @@ static inline bool rescue_prune_cost_ok(const rescue_prune_params &p, bool meth,
     return !meth || emseq;
 #else
     (void)emseq;
-    return !meth && p.simd_ok() && !(avx512 && p.minsc >= 25);
+    return !meth && p.simd_ok() && !(avx512 && p.minsc >= 25 * p.a);
 #endif
 }
 
