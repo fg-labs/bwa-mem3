@@ -165,6 +165,13 @@ ok "fast_preset_test"
 "$HERE/min_ext_len_safety_test.sh" "$BWAMEM3" "$FIXTURES" || fail "min_ext_len_safety_test failed"
 ok "min_ext_len_safety_test"
 
+# --- tight_band_xs_test ---------------------------------------------------
+# The exact retry ladder must not stop early on a tight_band proof: the early
+# stop recorded a narrower a->w than the full ladder, which changed the
+# contained-seed purge and so XS on a 306 bp read.
+"$HERE/tight_band_xs_test.sh" "$BWAMEM3" "$FIXTURES" || fail "tight_band_xs_test failed"
+ok "tight_band_xs_test"
+
 # --- smem_lockstep_parity_test --------------------------------------------
 OUT="$(cd "$HERE" && ./smem_lockstep_parity_test "$FIXTURES/phix.fa" 2>&1)"
 CASES_PASSED="$(echo "$OUT" | sed -nE 's/^([0-9]+) \/ ([0-9]+) cases passed$/\1/p')"

@@ -408,6 +408,11 @@ equal across a byte-identity comparison). See
 [Features → Certified adaptive extension band](features.md#certified-adaptive-extension-band-default-on---no-band-cert-to-disable).
 This is distinct from the aggressive, opt-in, *not* byte-identical `--adaptive-band`
 narrowing catalogued under [opt-in divergences](#divergences-that-are-latent-opt-in-or-per-architecture).
+Until [#540](https://github.com/fg-labs/bwa-mem3/pull/540) the ceiling ladder, with or
+without the certificate, also stopped as soon as its band covered the ungapped fast path's
+tight-band bound. That could record a narrower band than the full-width ladder and changed `XS`
+on a synthetic 306 bp read (no record changed on the WGS and ~250 bp sets measured); see
+[Correctness fixes](correctness.md#extension-retry-ladder-stopped-early-on-the-ungapped-band-bound-pr-540).
 
 ## What differs
 

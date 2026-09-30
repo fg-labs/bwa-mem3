@@ -124,7 +124,7 @@ KSORT_INIT(mem_intv1, SMEM, intv_lt1)  // debug
  * doubles w each iteration (up to MAX_BAND_TRY-1 iters), so pairs whose
  * alignment needs a wider band are caught by the retry. Setting this below
  * opt->w forces the kernel to start tight, accept tight-fit pairs early
- * (via sp->max_off heuristic + sp->tight_band), and only expand on demand.
+ * (via the sp->max_off heuristic), and only expand on demand.
  * BUCKET_MAX_INIT_W=8 with MAX_BAND_TRY=4 gives w-sequence 8, 16, 32, 64. */
 #ifndef BUCKET_MAX_INIT_W
 #define BUCKET_MAX_INIT_W 8
@@ -332,8 +332,10 @@ KSORT_INIT(mem_flt, mem_chain_t, flt_lt)
  * retrying to that band while a diagonal-hugging pair (chain_band=0) accepts in
  * one tight pass. The 8-bit tier stays at opt->w (its int8 diagonal encoding caps
  * at 127, and short extensions are sub-band so gain nothing). tight_band keeps its
- * ungapped-estimate accept-early role. band_start<=0 with band_cert off: INIT_W==opt->w and
- * ACCEPT_PAIR reduces to the original full-width condition -> byte-identical.
+ * ungapped-estimate accept-early role on this ladder's narrowing tiers only (see
+ * ACCEPT_PAIR).
+ * band_start<=0 with band_cert off: INIT_W==opt->w and ACCEPT_PAIR reduces to the original
+ * full-width condition -> byte-identical.
  *
  * NOTE: the DEFAULT is now the sound band_cert path below (band_cert=1), which narrows to
  * ADAPTIVE_BAND_START and is byte-identical via a per-pair certificate. This band_start path is
@@ -388,7 +390,7 @@ static inline int32_t band_cert_width(int init_w, int i, const mem_opt_t *opt) {
  * what the non-adaptive ladder reads -- and the `score == prev` converged-accept fires
  * identically. The narrow rung writes no other a->* field before acceptance, so restoring
  * a->score fully un-pollutes the ladder. */
-static inline bool band_cert_accept(int sc, int pv, int mo, int w, int tb, int i, int nband,
+static inline bool band_cert_accept(int sc, int pv, int mo, int w, int i, int nband,
                                     const SeqPair *sp, const mem_opt_t *opt) {
     if (w < opt->w) {
         /* Left extensions clip on pen_clip5, right on pen_clip3; this accept is shared by both
@@ -407,7 +409,12 @@ static inline bool band_cert_accept(int sc, int pv, int mo, int w, int tb, int i
         if (!band_cert_ok(sc - pen_clip, sp->h0, sp->len1, sp->len2, w, opt)) return false;
         return sp->gscore > 0 && sp->gscore > sc - pen_clip;
     }
-    return (i + 1 == nband) || (tb > 0 && w >= tb) || (sc == pv || mo < ((w >> 1) + (w >> 2)));
+    /* No tight_band early-accept here (see ACCEPT_PAIR). At w >= opt->w this is exactly
+     * the full-width ladder's stop clause, so the certified path is byte-identical to it by
+     * construction: both run the same rungs and stop on the same test. On this path
+     * tight_band is read only by the certified probe rung, which finalizes on band_cert_ok,
+     * not on tb. */
+    return (i + 1 == nband) || (sc == pv || mo < ((w >> 1) + (w >> 2)));
 }
 static inline int band_cert_mat_max(const int8_t *mat) {
     int mx = mat[0];
@@ -496,10 +503,31 @@ int mem_band_cert_params_safe(const mem_opt_t *opt) {
  * Implicit captures (like the sibling INIT_W/BAND_WIDTH macros): ACCEPT_PAIR reads
  * `opt`, `sp`, and `init_w` from the calling scope in addition to its parameters --
  * every retry-loop call site has all three in scope with those exact names. */
+/* Tight-band stop. ungapped_analyze's tight_band (tb) proves that no alignment at a
+ * diagonal offset >= tb scores above the ungapped walk. That is score-sound, but it pins
+ * neither the kernel's early-termination control flow at a wider rung (zdrop, the
+ * all-zero-row break and the band-edge shrink, hence qle/tle/gscore/gtle) nor the band
+ * width the ladder records as a->w, which bounds the contained-seed purge and feeds
+ * mem_patch_reg and mem_reg2aln. Neither is provable at default parameters: the certified
+ * probe's control-flow envelope needs zdrop > o_min + (2w+1)*e_max + w*a, ~307 at
+ * w = opt->w = 100 against the default 100. Stopping at w = 100 where the full ladder
+ * went on to w = 200 recorded a->w = 100 and changed XS on a 306 bp read.
+ *
+ * So the exact ladders -- band_cert (band_cert_accept) and band_cert off with
+ * band_start <= 0 -- never stop on tb. They apply the full-width stop test at every rung
+ * and are byte-identical to the full-width ladder by construction.
+ *
+ * The stop survives only on the --adaptive-band ladder's narrowing tiers (band_start > 0
+ * and init_w < opt->w). That ladder is not byte-identical by design and already stops on
+ * the chain_band-gated score/max_off heuristic, so the tb bound is a better-founded stop
+ * than the one it takes. Its 8-bit tier starts at opt->w and is otherwise the exact
+ * ladder (chain_band <= opt->w), so the stop is dropped there as well, which keeps
+ * --adaptive-band a no-op on short reads. */
 #define ACCEPT_PAIR(sc,pv,mo,w,tb,cb,i) \
     (opt->band_cert \
-      ? band_cert_accept((sc),(pv),(mo),(w),(tb),(i),band_cert_nband(init_w,opt),sp,opt) \
-      : ((i)+1==MAX_BAND_TRY || ((tb)>0 && (w)>=(tb)) || \
+      ? band_cert_accept((sc),(pv),(mo),(w),(i),band_cert_nband(init_w,opt),sp,opt) \
+      : ((i)+1==MAX_BAND_TRY || \
+         (opt->band_start > 0 && init_w < opt->w && (tb)>0 && (w)>=(tb)) || \
          (((sc)==(pv) || (mo) < ((w)>>1)+((w)>>2)) && (opt->band_start <= 0 || (w) >= (cb)))))
 //------------------------------------------------------------------
 // Alignment: Construct the alignment from a chain *
@@ -6416,9 +6444,12 @@ static inline int bsw_tb_probe_rung(BswMethTier tier, const mem_opt_t *opt, mem_
 //                        ungapped score bounds the useful SW band:
 //                          tight_band = ceil((min(len1,len2)·a - ungapped_score)
 //                                            / (o_min + e_min))
-//                        Caller runs SW with this tight band instead of
-//                        opt->w, and skips MAX_BAND_TRY retries (the
-//                        bound is an upper bound on any gapped score).
+//                        The certified probe rung (bsw_tb_probe_rung)
+//                        uses it to pick a narrow probe width; the
+//                        --adaptive-band ladder uses it to stop early
+//                        (the bound is an upper bound on any gapped
+//                        score). The exact ladders do NOT stop on it
+//                        -- see ACCEPT_PAIR.
 //
 //   FP_STATUS_FALLBACK — ambig base or out-of-range length. Caller uses
 //                        opt->w with the full retry loop.
@@ -6433,15 +6464,12 @@ static inline int bsw_tb_probe_rung(BswMethTier tier, const mem_opt_t *opt, mem_
 // when the gapped alternative score is < min_len·a. Starting SW at
 // tight_band is strictly correct and avoids over-banded DP work.
 #define FP_N_MAX 512
-/* TIGHT routing (accepting a narrow banded-SW result early via the retry
- * ladder's tight_band clause) is byte-identity-proven only up to this length.
- * Beyond it, a width-w accepted result and the width-2w result a FALLBACK pair
- * would retry can differ in extent fields (qle/tle/gscore/max_off and a->w)
- * even at an identical optimal score -- the ladder clause is score-sound but
- * not extent-invariant. So a pair longer than this may only HIT (skip SW,
- * whose scalar walk mirrors kernel semantics at any length) or FALLBACK to the
- * exact full-width ladder; it must never emit a tight_band. Keep <= the old
- * scanner cap so behavior at those lengths is unchanged. */
+/* Length cap for emitting a tight_band at all (longer pairs HIT or FALLBACK).
+ * tight_band feeds the certified probe rung (bsw_tb_probe_rung), which finalizes on
+ * band_cert_ok at its probe width -- not on tb -- inside the
+ * mem_band_cert_params_safe_w envelope, and the --adaptive-band ladder's narrowing-tier
+ * stop. The exact ladders never stop on it (see ACCEPT_PAIR). Keep this <= the old
+ * scanner cap so the set of pairs that carry a tight_band is unchanged. */
 #define FP_TIGHT_MAX 128
 /* Words in the per-pair mismatch bitmap. Sized to FP_N_MAX so every scanned
  * position 0..FP_N_MAX-1 has a bit; a shift by the in-word offset (< 64) can
@@ -6693,9 +6721,8 @@ static inline int ungapped_analyze(const uint8_t *qs, const uint8_t *rs, int N,
     }
 
     if (total_mis > x_threshold) {
-        /* TIGHT routing is extent-invariant only up to FP_TIGHT_MAX (see the
-         * define). A longer pair that is not a HIT falls back to the exact
-         * full-width ladder rather than accepting a narrow banded-SW result. */
+        /* Only a pair within FP_TIGHT_MAX carries a tight_band (see the define);
+         * a longer pair that is not a HIT falls back with tight_band = 0. */
         if (N > FP_TIGHT_MAX) return FP_STATUS_FALLBACK;
         // S in the band proof must be REALIZABLE by an actual offset-0 extension.
         // The tight_band derivation shows every out-of-band alignment (band
@@ -6708,10 +6735,10 @@ static inline int ungapped_analyze(const uint8_t *qs, const uint8_t *rs, int N,
         //
         // A no-floor score (which lets a negative prefix recover via later
         // matches) can EXCEED the floor-killed value the DP actually reaches;
-        // feeding that larger S shrinks tb below what is sound, letting the retry
-        // ladder skip the wider rung a gapped alignment in (default_w, wider]
-        // genuinely needs -- a CIGAR/coordinate divergence from the full-width
-        // ladder (breaking byte-identity). The walk is O(N) and runs only on the
+        // feeding that larger S shrinks tb below what is sound, so the certified
+        // probe rung or the --adaptive-band stop could skip the wider band a gapped
+        // alignment in (default_w, wider] genuinely needs -- a CIGAR/coordinate
+        // divergence. The walk is O(N) and runs only on the
         // TIGHT branch after the FP_TIGHT_MAX gate above (N <= 128), so its cost
         // is negligible.
         //
@@ -6737,11 +6764,11 @@ static inline int ungapped_analyze(const uint8_t *qs, const uint8_t *rs, int N,
             band = (int)((numerator + e_min - 1) / e_min);
             // The band proof only excludes diagonal offsets >= band. When the
             // proven band exceeds default_w, clamping to default_w would falsely
-            // certify that a width-default_w run is complete, letting the retry
-            // ladder short-circuit and skip the wider rungs a gapped alignment
-            // in the unproven window (default_w, band) genuinely needs. Emit the
-            // tight_band = 0 fallback sentinel instead, so such a pair runs the
-            // exact full-width ladder (byte-identical to non-adaptive extension).
+            // certify that a width-default_w run is complete, letting the
+            // certified probe rung or the --adaptive-band stop skip the wider band
+            // a gapped alignment in the unproven window (default_w, band)
+            // genuinely needs. Emit the tight_band = 0 fallback sentinel instead,
+            // so no tight_band consumer acts on the unproven band.
             if (band > default_w) band = 0;
         }
         *out_tight_band = band;
@@ -7356,7 +7383,7 @@ static inline void stage_seed_extension(
 
         // ungapped analysis.
         //   HIT      → skip SW; fill a->* from ungapped.
-        //   TIGHT    → save sp.tight_band; SW will use it.
+        //   TIGHT    → save sp.tight_band (probe rung / --adaptive-band stop).
         //   FALLBACK → use opt->w.
         /* D3 (--meth, PR-4): the ungapped fast path scores with
          * opt->a/opt->b hardcoded (ungapped_analyze) — it CANNOT
@@ -8340,9 +8367,10 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
     SeqPair *pair_ar_aux = seqPairArrayAux;
     int nump = numPairsLeft1;
 
-    // per-pair tight_band proofs are still piped in via
-    // sp->tight_band (and short-circuit the retry loop below once w >=
-    // tight_band), but we no longer narrow init_w from opt->w. A batched
+    // per-pair tight_band proofs are still piped in via sp->tight_band
+    // (consumed by the certified probe rung and the --adaptive-band ladder;
+    // the exact ladder does not stop on them, see ACCEPT_PAIR), but we no
+    // longer narrow init_w from opt->w. A batched
     // SW pass shares one band across all pairs in the batch, so narrowing
     // would force FALLBACK pairs (no tight_band proof) to start with a
     // band insufficient for indels their alignment really needs. The
@@ -8520,8 +8548,8 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
          * retry pushes w >= 128 the diagonal-offset int8 encoding can no longer
          * represent the band, so bsw_run_tier (BSW_TIER_8) diverts that
          * iteration to the 16-bit kernel rather than feeding getScores8 an
-         * unrepresentable band. The tight_band early-exit below is unaffected
-         * (it short-circuits the retry regardless of which width ran). */
+         * unrepresentable band. The ladder's stop test is unaffected (it reads
+         * the kernel's outputs, not which kernel ran). */
         bsw_run_tier(BSW_TIER_8, opt, av_v,
                      bswLeft.get(), bswLeftOt.get(), bswLeftOb.get(),
                      pair_ar, seqBufLeftRef, seqBufLeftQer, nump, nthreads, w,
@@ -8596,7 +8624,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
     // SW is done, a->score is final and h0 is set above. Run ungapped
     // analysis on every right pair:
     //   HIT    → fill a->* directly, compact the pair out of the array.
-    //   TIGHT  → set sp->tight_band for the SW dispatch.
+    //   TIGHT  → set sp->tight_band (probe rung / --adaptive-band stop).
     //   FALL   → leave tight_band at construction default (typically 0).
     {
         int compacted = 0;
@@ -8885,7 +8913,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
 
         /* See the LEFT int8 loop: bsw_run_tier (BSW_TIER_8) diverts w >= 128
          * retry iterations to the 16-bit kernel (the diagonal-offset int8 band
-         * can't represent it). tight_band early-exit is preserved. */
+         * can't represent it). The ladder's stop test is unaffected. */
         bsw_run_tier(BSW_TIER_8, opt, av_v,
                      bswRight.get(), bswRightOt.get(), bswRightOb.get(),
                      pair_ar, seqBufRightRef, seqBufRightQer, nump, nthreads, w,

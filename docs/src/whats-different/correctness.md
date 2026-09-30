@@ -442,6 +442,46 @@ and WES slices with the dedup at `auto` and forced on. Pinned by
 `test/bandedswa_negative_h0_test.cpp`, which compares every result field against the scalar
 oracle and against the pair scored alone.
 
+## Extension retry ladder stopped early on the ungapped band bound (PR #540)
+
+Before banded SW, the ungapped fast path can prove a *tight band* for an extension: no
+alignment reaching a diagonal offset at or beyond it can score above the ungapped walk. The
+retry ladder (`w = 100`, then `200`, ...) stopped as soon as the band it had run covered that
+bound. Otherwise it stops on the same per-rung test as bwa and bwa-mem2, which have no ungapped
+fast path: the score is unchanged from the previous rung, or the alignment's maximum diagonal
+offset stayed under three quarters of the band. (bwa-mem3's ladder allows up to four rungs where
+upstream allows two.) The bound keeps the score right, but when it stopped the ladder at
+`w = 100` where the full ladder goes on to `w = 200`, the region recorded a band width of 100
+instead of 200. That width bounds the contained-seed test that decides whether a later seed in
+the same region is extended at all, so a seed that bwa skips was extended, and its region's
+score could become `XS`. On a synthetic 306 bp read the primary alignment was unchanged
+(`143M18I145M`, `AS:i:193`), but `XS` was 91 where bwa 0.7.19 reports 37, as does bwa-mem3
+built with the ungapped fast path compiled out (a local build; no option selects it). The bound
+also does not pin the kernel's early-termination control flow at the wider rung, so the recorded
+extent fields were not provably the full ladder's either.
+
+The ladders that claim byte-identity (the default certified adaptive band, and the full-width
+ladder with it disabled, `--no-band-cert`) no longer stop on the bound. At every rung from
+`w = 100` up they apply exactly the full-width stop test, so they are **byte-identical to the
+full-width ladder by construction**. The bound still feeds the certified narrow probe, which
+finalizes on its own certificate. The non-byte-identical `--adaptive-band` ladder (also selected
+by `--fast` unless `--no-adaptive-band`) keeps stopping on it on the tiers where it narrows the
+starting band; on the 8-bit tier, which starts at `w = 100` and handles the short extensions
+that carry a tight band, it now uses the exact ladder too, so `--adaptive-band` stays a no-op on
+short reads. The removed early stop almost never fired on its own: on 2 x 1 M 150 bp WGS reads
+it never stopped a pair that the ladder's own test would not have stopped, and on 1.86 M
+~250 bp single-end SBX HG002 reads it did so for 12 of 24.5 M ladder accepts, none of which
+changed a record. Because those pairs now run one more rung, the cost is negligible.
+
+Measured scope: SAM minus `@PG` identical to `main` and to `main` with the ungapped fast path
+compiled out, on an Apple M3 Ultra (arm64, NEON, Apple clang 21.0.0), hg38 (GRCh38 with
+ALT/decoy), `-t 16`, for 1 M HG002 WGS pairs (paired, single-end, `-A 2 -B 8`, and
+`-O 8 -E 2`), 5 M HG00096 WGS pairs, and the 1.86 M SBX reads. Wall time on the 5 M pairs was
+32.07-32.12 s against 32.11-32.20 s for `main` (3 interleaved runs each), within run-to-run
+noise. `--adaptive-band` output was identical to the default on the 1 M HG002 pairs and to
+`main --adaptive-band` on the SBX reads (8.92-8.94 s against 8.95-9.05 s wall). Pinned by `test/tight_band_xs_test.sh`, which checks bwa 0.7.19's record for that read
+by default, under `--compat=bwa-mem2`, `--no-band-cert`, and `--adaptive-band`.
+
 ---
 
 ## Upstream port divergences: all chains dropped by the weight filter (PR #489) and the SA sentinel offset (PR #469)
@@ -487,6 +527,7 @@ shipped, because parity with that release is its contract (see
 | Banded-SW `qlen` band-clamp reach slot overflow (`int32_t` reach) | [#468](https://github.com/fg-labs/bwa-mem3/pull/468) | — | fork-only (8-bit widening defensive; 16-bit divergence only at non-default `-A >= 3` long-query, `len2 * A > 65535` — default alignment records unchanged for fixed batch composition, see the correctness note above) |
 | Extension staging copied a chain's windows once per seed | [#524](https://github.com/fg-labs/bwa-mem3/pull/524) | — | fork-only (inputs that aborted because a repeat chain staged its window once per seed now complete; the `int32` staging limit itself is unchanged; records of inputs that already ran byte-identical by construction — see the PR #524 correctness note above for the measured scope) |
 | 8-bit banded-SW score for a negative seed score depended on its SIMD group | [#528](https://github.com/fg-labs/bwa-mem3/pull/528) | — | fork-only (`--meth` only; records whose extension had a negative seed score can change and are now independent of batching; non-`--meth` output byte-identical by construction — see the PR #528 correctness note above) |
+| Extension retry ladder stopped early on the ungapped band bound | [#540](https://github.com/fg-labs/bwa-mem3/pull/540) | — | fork-only (a record can change only where the early stop diverged from the full ladder, by recording a narrower band or different extension end fields; none changed on the WGS or SBX sets measured — see the correctness note above) |
 | kseq2bseq1 zero-initialization | [#22](https://github.com/fg-labs/bwa-mem3/pull/22) | — | fork-only |
 | Proper-pair flag from emitted alignment | [#17](https://github.com/fg-labs/bwa-mem3/pull/17) | — | fork-only, **opt-in** (`--proper-pair-from-emitted`; default matches both upstreams, [#362](https://github.com/fg-labs/bwa-mem3/issues/362)) |
 | All chains dropped by the weight filter: default follows bwa | [#489](https://github.com/fg-labs/bwa-mem3/pull/489) | — ([#310](https://github.com/fg-labs/bwa-mem3/issues/310)) | fork-only; `--compat=bwa-mem2` reproduces bwa-mem2 |
