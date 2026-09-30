@@ -662,7 +662,7 @@ endif
 # target as permanently out of date, so listing them relinked all nine on every
 # invocation. Their own rules (and the generated .d header deps this Makefile
 # now emits) already decide when a relink is needed.
-.PHONY:all myall arm64 clean single all-single print-mimalloc-config test test-injection FORCE pgo-generate pgo-use pgo-clean profile-build profile-clean lto-build lto-clean docs docs-serve docs-cli docs-clean docs-install-tools
+.PHONY:all myall arm64 clean single all-single print-mimalloc-config test test-injection FORCE pgo-generate pgo-use pgo-clean profile-build profile-clean lto-build lto-clean docs docs-serve docs-cli docs-rescue-knobs docs-clean docs-install-tools
 .SUFFIXES:.cpp .c .o
 
 .cpp.o:
@@ -968,7 +968,20 @@ test/fmi_seed_api_smoke.o: test/fmi_seed_api_smoke.cpp $(FLAGS_STAMP)
 .PHONY: rescue-band-harness
 rescue-band-harness: rescue_band_harness
 
+# The NEON rescue-pruning filter vs the scalar filter: decisions, the view band planning reads,
+# the component list and the repeat memo (test/rescue_prune_eq.cpp). Header-only. CI runs a
+# bounded `fuzz` on the ARM64 rows; real-data dumps are manual. aarch64 only -- elsewhere the
+# scalar filter is the only one, so there is nothing to compare it with.
+.PHONY: rescue-prune-eq
+rescue-prune-eq: rescue_prune_eq
+
 ifneq ($(IS_ARM),)
+# Compiled and linked in one step, so the dependency file is named explicitly: it lands in
+# test/, where the `-include test/*.d` below and `clean` already find it, and lists every
+# header the harness reads. The hand list stays as the bootstrap for a tree with no .d yet.
+rescue_prune_eq: test/rescue_prune_eq.cpp src/rescue_prune.h src/rescue_prune_neon.h src/neon_transpose.h src/kswv_quantum.h $(FLAGS_STAMP)
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(DEPFLAGS) -MF test/rescue_prune_eq.d -MT $@ $< -o $@
+
 rescue_band_harness: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) $(if $(filter 1,$(USE_MIMALLOC)),$(MIMALLOC_LIB)) test/rescue_band_harness.o
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/rescue_band_harness.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) $(MIMALLOC_LDFLAGS) -o $@
 
@@ -977,6 +990,8 @@ test/rescue_band_harness.o: test/rescue_band_harness.cpp $(FLAGS_STAMP)
 else
 rescue_band_harness:
 	$(error rescue_band_harness is aarch64-only: the banded rescue kernel is NEON)
+rescue_prune_eq:
+	$(error rescue_prune_eq is aarch64-only: the SIMD rescue-pruning filter is NEON)
 endif
 
 # Regression test for the fmi_seed_api.h facade's max_occ guard: forwarding
@@ -1387,7 +1402,7 @@ $(ZLIBNG_LIB):
 	cd $(ZLIBNG_BUILD) && cmake $(ZLIBNG_CMAKE_FLAGS) .. && $(MAKE)
 
 clean: pgo-clean profile-clean lto-clean
-	rm -fr src/*.o src/*.d src/version.h test/*.o test/*.d $(FLAGS_STAMP) $(BWA_LIB) $(EXE) $(STANDALONE_TESTS) kvec_alloc_fail_test klib_alloc_fail_test rescue_band_harness bwa-mem3.arm64
+	rm -fr src/*.o src/*.d src/version.h test/*.o test/*.d $(FLAGS_STAMP) $(BWA_LIB) $(EXE) $(STANDALONE_TESTS) kvec_alloc_fail_test klib_alloc_fail_test rescue_band_harness rescue_prune_eq bwa-mem3.arm64
 	rm -f $(LIBSAIS_OBJS) $(LIBSAIS_OBJS:.o=.d)
 	rm -f src/*.gcno src/*.gcda
 	$(MAKE) -C test clean
@@ -1439,6 +1454,13 @@ docs-cli: $(EXE)
 			       /^SIMD runtime: / {print "SIMD runtime: <RUNTIME-TIER> (<FORCE-TIER-STATE>)"; next} {print}' \
 			> docs/_generated/cli/$$sub.txt; \
 	done
+
+# The BWA3_RESCUE_* knob table of the rescue developer-guide page, rendered from the knob list in
+# src/rescue_env.h; test/regression/rescue_docs_lint.sh fails when the committed copy is stale.
+docs-rescue-knobs:
+	@mkdir -p docs/_generated/rescue
+	@echo "  RENDER   docs/_generated/rescue/knobs.md"
+	@bash scripts/rescue_knobs.sh > docs/_generated/rescue/knobs.md
 
 docs-clean:
 	rm -rf docs/book

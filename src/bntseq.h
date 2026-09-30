@@ -173,6 +173,11 @@ extern "C" {
 	uint8_t *bns_fetch_seq_v2(const bntseq_t *bns, const uint8_t *pac,
 	                          int64_t *beg, int64_t mid, int64_t *end, int *rid,
 	                          uint8_t *ref_string, uint8_t *seqb);
+	// The window arithmetic of bns_fetch_seq_v2 without the fetch: swaps
+	// [*beg, *end) into order, sets *rid to the contig holding `mid`, and clamps
+	// the window to that contig on mid's strand. For callers that need only the
+	// clamped bounds and rid, not the bases.
+	void bns_fetch_bounds(const bntseq_t *bns, int64_t *beg, int64_t mid, int64_t *end, int *rid);
 	int bns_intv2rid(const bntseq_t *bns, int64_t rb, int64_t re);
 
 #ifdef __cplusplus

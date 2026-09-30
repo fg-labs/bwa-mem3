@@ -2,12 +2,19 @@
 # test/regression/rescue_prune_identity.sh
 #
 # Exact mate-rescue pruning (src/rescue_prune.h, wired in mem_matesw_batch_pre /
-# _post) and the banded rescue DP built on it (src/rescue_band.h) must leave the
-# alignment output byte-identical to the full-window rescue. Every leg is the
-# SAME binary; only the escape hatches differ:
+# _post), the banded rescue DP built on it (src/rescue_band.h) and the skipped
+# or incremental post-rescue dedup (mem_matesw_batch_post) must leave the
+# alignment output byte-identical to the full-window rescue with every dedup
+# run. Every leg is the SAME binary; only the escape hatches differ:
 #
+#   REF_ENV (below): every BWA3_RESCUE_* shortcut off
+#                        -> every rescue window computed in full by kswv with its
+#                           original cell and its original NEON forms (USQADD,
+#                           ROWPAIR, LAZYQE off), and every post-rescue dedup run in
+#                           full (reference; every other leg runs the defaults)
 #   BWA3_RESCUE_PRUNE=0 BWA3_RESCUE_BAND=0
-#                        -> every rescue window computed in full by kswv (reference)
+#                        -> as the reference, but a dedup proven to be a no-op is
+#                           skipped and a one-record insert done in O(n)
 #   BWA3_RESCUE_BAND=0   -> proven failures dropped (B1), windows narrowed to a
 #                           proven hull (B2), N windows kept whole; kswv on the hull
 #   default              -> as above, plus the banded DP where the cost model picks it,
@@ -26,17 +33,33 @@
 # (bwa refuses mate rescue until it can estimate one), and rescue pairs whose
 # mate is made unseedable by spaced mismatches, so it only places via SW mate
 # rescue -- some near the rescue threshold (narrowed windows), some unrelated to
-# the reference (proven failures), and some with an N (full windows). It runs at
-# -t 1 and -t 4.
+# the reference (proven failures), and some with an N (full windows); anchors in a
+# block present three times (one rescue per copy on the same mate, which is what
+# exercises the dedup shortcuts); and 300 bp mates, long enough for the 16-bit
+# kswv kernels (every 150 bp mate takes the 8-bit ones). It runs at -t 1 and -t 4.
 #
-# Pruning and banding run only on aarch64 (src/bwamem_pair.cpp rescue_prune_on,
-# rescue_band_enabled). There, BWA3_RESCUE_PRUNE_STATS=1 must show proven
-# failures, narrowed windows, fewer rows kept than examined and (with the gate
-# opened) banded parents, or the identity would be vacuous; elsewhere every leg
-# takes the same path and the non-vacuity check is reported as skipped.
+# With RESCUE_TIERS set (a list of x86 tiers, e.g. "avx2 avx512bw"), the
+# reference and default legs are also run under BWAMEM3_FORCE_TIER for each
+# listed tier the host has, and must equal the unforced reference: the kswv
+# rescue kernels differ per tier, so this is where each tier's 8- and 16-bit
+# kernels are checked end to end. A listed tier above the host is reported SKIP:,
+# the host's own tier is labelled as such (forcing it changes nothing), a force
+# the dispatcher ignores fails, and a list that leaves nothing to force fails.
+#
+# The dedup shortcuts and the 16-bit kernels run on every architecture, so
+# BWA3_RESCUE_PRUNE_STATS=1 must show skipped dedups, one-record inserts and
+# 16-bit rescue jobs everywhere, and must show that each leg's switches took
+# effect (nothing filtered or deduplicated early in the reference, nothing
+# filtered in the dedup leg, nothing banded in the hull leg). Pruning and
+# banding run only on aarch64 (src/bwamem_pair.cpp rescue_prune_on,
+# rescue_band_enabled). There, the stats must show proven failures, narrowed
+# windows, fewer rows kept than examined and (with the gate opened) banded
+# parents, or the identity would be vacuous; elsewhere the pruning legs take
+# the same path and their non-vacuity check is reported as skipped.
 #
 # Inputs:
-#   BWA_MEM3 — path to the bwa-mem3 binary under test
+#   BWA_MEM3     — path to the bwa-mem3 binary under test
+#   RESCUE_TIERS — optional: x86 tiers to force in addition (see above)
 set -euo pipefail
 : "${BWA_MEM3:?BWA_MEM3 must be set}"
 command -v python3 > /dev/null 2>&1 || {
@@ -66,6 +89,21 @@ import random
 rnd = random.Random(20260928)
 L = 60000
 ref = ''.join(rnd.choice('ACGT') for _ in range(L))
+# A repeat: DUP_LEN bases at DUP_A copied to two more places, each copy with a
+# substitution every 100 bases at its own phase, so an anchor inside it places at
+# all three copies (within pen_unpaired) and mate rescue runs once per copy on the
+# same mate, with a different score at each.
+DUP_A, DUP_LEN = 10000, 600
+for at, phase in ((30000, 50), (45000, 25)):
+    dup = list(ref[DUP_A:DUP_A+DUP_LEN])
+    for i in range(phase, DUP_LEN, 100):
+        dup[i] = {'A': 'C', 'C': 'G', 'G': 'T', 'T': 'A'}[dup[i]]
+    ref = ref[:at] + ''.join(dup) + ref[at+DUP_LEN:]
+# An exact repeat: DUP_LEN bases at DUP_B copied unchanged to two more places, so an
+# anchor inside it rescues the same mate against three byte-identical windows.
+DUP_B = 20000
+for at in (38000, 52000):
+    ref = ref[:at] + ref[DUP_B:DUP_B+DUP_LEN] + ref[at+DUP_LEN:]
 with open('ref.fa', 'w') as f:
     f.write('>chrA\n')
     for i in range(0, L, 80):
@@ -78,11 +116,10 @@ def mism(b):
     return {'A': 'C', 'C': 'G', 'G': 'T', 'T': 'A'}[b]
 
 RL, INS = 150, 400
-q = 'I' * RL
 r1, r2 = [], []
 def pair(name, anchor, mate):
-    r1.append('@%s\n%s\n+\n%s\n' % (name, anchor, q))
-    r2.append('@%s\n%s\n+\n%s\n' % (name, rc(mate), q))
+    r1.append('@%s\n%s\n+\n%s\n' % (name, anchor, 'I' * len(anchor)))
+    r2.append('@%s\n%s\n+\n%s\n' % (name, rc(mate), 'I' * len(mate)))
 
 # Concordant pairs: only there to populate the insert-size distribution.
 for k in range(400):
@@ -113,6 +150,48 @@ for k in range(300):
         mate[rnd.randint(0, RL - 1)] = 'N'
     pair('r%d_%d' % (kind, k), anchor, ''.join(mate))
 
+# Anchors in the repeat, mates made unseedable as for kind 0. With the mate inside
+# the repeat too, every copy rescues it (the later ones are one-record inserts
+# into the deduped list, the third in O(n)); with the mate past the repeat's end,
+# only the first copy does, and the later copies' dedups have nothing new to
+# dedup (skips).
+for k in range(60):
+    p = DUP_A + (rnd.randint(0, DUP_LEN - INS) if k % 2 == 0 else rnd.randint(DUP_LEN - INS + 60, DUP_LEN - RL))
+    anchor = ref[p:p+RL]
+    mate = list(ref[p+INS-RL:p+INS])
+    i = rnd.randint(3, 10)
+    while i < RL:
+        mate[i] = mism(mate[i])
+        i += rnd.randint(14, 17)
+    pair('d%d' % k, anchor, ''.join(mate))
+
+# Anchors in the exact repeat, mates made unseedable as for kind 0 and inside the
+# repeat: the second and third copies' rescues repeat the first byte for byte, so the
+# filter answers them from its memo and _pre from the first copy's result.
+for k in range(30):
+    p = DUP_B + rnd.randint(0, DUP_LEN - INS)
+    anchor = ref[p:p+RL]
+    mate = list(ref[p+INS-RL:p+INS])
+    i = rnd.randint(3, 10)
+    while i < RL:
+        mate[i] = mism(mate[i])
+        i += rnd.randint(14, 17)
+    pair('e%d' % k, anchor, ''.join(mate))
+
+# 300 bp mates, made unseedable as for kind 0: a mate this long (times the match
+# score, plus the kernel's shift) no longer fits a byte, so its rescue runs through
+# the 16-bit kswv kernels.
+ML = 300
+for k in range(40):
+    p = rnd.randint(0, L - INS - 1)
+    anchor = ref[p:p+RL]
+    mate = list(ref[p+INS-ML:p+INS])
+    i = rnd.randint(3, 10)
+    while i < ML:
+        mate[i] = mism(mate[i])
+        i += rnd.randint(14, 17)
+    pair('l%d' % k, anchor, ''.join(mate))
+
 with open('r1.fq', 'w') as f: f.write(''.join(r1))
 with open('r2.fq', 'w') as f: f.write(''.join(r2))
 PY
@@ -127,45 +206,124 @@ run_leg() { # $1 = threads, $2 = output stem, rest = env assignments
     [ "$(grep -cv '^@' "$stem.sam" || true)" -gt 0 ] || fail "leg $stem produced no alignment records"
 }
 
-LEGS="hull prune band"
+# The reference: every shortcut and alternative kernel form off. Defined once so
+# the unforced and forced-tier references cannot drift apart.
+REF_ENV=(BWA3_RESCUE_PRUNE=0 BWA3_RESCUE_BAND=0 BWA3_RESCUE_DEDUP_SKIP=0 BWA3_RESCUE_REPEAT=0
+    BWA3_RESCUE_FSCAN=0 BWA3_RESCUE_USQADD=0 BWA3_RESCUE_ROWPAIR=0 BWA3_RESCUE_LAZYQE=0)
+
+LEGS="dedup hull prune band"
 for t in 1 4; do
-    run_leg "$t" "full.t$t" BWA3_RESCUE_PRUNE=0 BWA3_RESCUE_BAND=0
-    run_leg "$t" "hull.t$t" BWA3_RESCUE_BAND=0
+    run_leg "$t" "full.t$t" BWA3_RESCUE_PRUNE_STATS=1 "${REF_ENV[@]}"
+    run_leg "$t" "dedup.t$t" BWA3_RESCUE_PRUNE_STATS=1 BWA3_RESCUE_PRUNE=0 BWA3_RESCUE_BAND=0
+    run_leg "$t" "hull.t$t" BWA3_RESCUE_PRUNE_STATS=1 BWA3_RESCUE_BAND=0
     run_leg "$t" "prune.t$t" BWA3_RESCUE_PRUNE_STATS=1
     run_leg "$t" "band.t$t" BWA3_RESCUE_PRUNE_STATS=1 BWA3_RESCUE_BAND_COST=100000000
     for leg in $LEGS; do
         if ! cmp -s "full.t$t.sam" "$leg.t$t.sam"; then
-            echo "FAIL: rescue leg '$leg' differs from the full-window rescue at -t $t:" >&2
+            echo "FAIL: rescue leg '$leg' differs from the reference rescue at -t $t:" >&2
             diff "full.t$t.sam" "$leg.t$t.sam" | head -20 >&2 || true
             exit 1
         fi
     done
 done
 
+# Forced tiers: the reference and default legs under each listed tier the host
+# has must equal the unforced reference. Ranked against the dispatcher's own
+# tier names (as in all_tiers_parity.sh): BWAMEM3_FORCE_TIER only downgrades.
+tier_note=""
+if [ -n "${RESCUE_TIERS:-}" ]; then
+    host_tier="$(BWAMEM3_DEBUG_SIMD=1 "$BIN" 2>&1 | sed -n 's/.*SIMD tier: \([a-z0-9]*\).*/\1/p' | head -1 || true)"
+    [ -n "$host_tier" ] || fail "could not detect the host SIMD tier from BWAMEM3_DEBUG_SIMD output"
+    rank() { # tier -> rank among the x86 tiers, or -1
+        case "$1" in
+            sse41) echo 0 ;; sse42) echo 1 ;; avx) echo 2 ;; avx2) echo 3 ;; avx512bw) echo 4 ;; *) echo -1 ;;
+        esac
+    }
+    host_rank="$(rank "$host_tier")"
+    [ "$host_rank" -ge 0 ] || fail "RESCUE_TIERS is set but the host tier '$host_tier' is not an x86 tier"
+    ran=""
+    for tier in $RESCUE_TIERS; do
+        [ "$(rank "$tier")" -ge 0 ] || fail "RESCUE_TIERS names an unknown x86 tier '$tier'"
+        if [ "$(rank "$tier")" -gt "$host_rank" ]; then
+            echo "SKIP: tier $tier is above this host's ($host_tier); not forced"
+            continue
+        fi
+        for t in 1 4; do
+            run_leg "$t" "full.$tier.t$t" BWAMEM3_FORCE_TIER="$tier" "${REF_ENV[@]}"
+            run_leg "$t" "prune.$tier.t$t" BWAMEM3_FORCE_TIER="$tier"
+            for leg in full prune; do
+                # An ignored force would run the host tier and compare equal.
+                if grep -q 'ignoring BWAMEM3_FORCE_TIER' "$leg.$tier.t$t.err"; then
+                    fail "the dispatcher ignored BWAMEM3_FORCE_TIER=$tier: $(grep 'ignoring BWAMEM3_FORCE_TIER' "$leg.$tier.t$t.err" | head -1)"
+                fi
+                if ! cmp -s "full.t$t.sam" "$leg.$tier.t$t.sam"; then
+                    echo "FAIL: rescue leg '$leg' under BWAMEM3_FORCE_TIER=$tier differs from the reference at -t $t:" >&2
+                    diff "full.t$t.sam" "$leg.$tier.t$t.sam" | head -20 >&2 || true
+                    exit 1
+                fi
+            done
+        done
+        if [ "$tier" = "$host_tier" ]; then ran="$ran $tier(host tier)"; else ran="$ran $tier"; fi
+    done
+    [ -n "$ran" ] || fail "RESCUE_TIERS='$RESCUE_TIERS' left no tier to force on this host ($host_tier)"
+    tier_note="; forced tiers:$ran"
+fi
+
+field() { printf '%s\n' "$stats" | tr ' ' '\n' | sed -n "s/^$1=//p"; }
+
+# The reference leg's switches took effect: nothing filtered, no dedup skipped.
+stats="$(grep '^\[RESCUE_PRUNE\]' full.t1.err || true)"
+[ -n "$stats" ] || fail "BWA3_RESCUE_PRUNE_STATS=1 printed no [RESCUE_PRUNE] line (reference leg)"
+[ "$(field jobs)" -eq 0 ] || fail "the reference leg filtered rescue jobs (BWA3_RESCUE_PRUNE=0 ignored): $stats"
+[ "$(field dedup_skip)" -eq 0 ] && [ "$(field dedup_insert1)" -eq 0 ] \
+    || fail "the reference leg took a dedup shortcut (BWA3_RESCUE_DEDUP_SKIP=0 ignored): $stats"
+
+stats="$(grep '^\[RESCUE_PRUNE\]' dedup.t1.err || true)"
+[ -n "$stats" ] || fail "BWA3_RESCUE_PRUNE_STATS=1 printed no [RESCUE_PRUNE] line (dedup leg)"
+[ "$(field jobs)" -eq 0 ] || fail "the dedup leg filtered rescue jobs (BWA3_RESCUE_PRUNE=0 ignored): $stats"
+jobs16=$(field jobs16)
+[ "${jobs16:-0}" -gt 0 ] || fail "no 16-bit rescue job in the fixture (the 300 bp mates stopped reaching it): $stats"
+dedup_skip=$(field dedup_skip) dedup_insert1=$(field dedup_insert1) dedup_fast=$(field dedup_insert1_fast)
+[ "${dedup_skip:-0}" -gt 0 ] || fail "no post-rescue dedup was skipped as a no-op: $stats"
+[ "${dedup_insert1:-0}" -gt 0 ] || fail "no post-rescue dedup took the one-record insert: $stats"
+[ "${dedup_fast:-0}" -gt 0 ] || fail "no one-record insert was done in O(n): $stats"
+dstats="dedup_skip=$dedup_skip dedup_insert1=$dedup_insert1 dedup_insert1_fast=$dedup_fast jobs16=$jobs16"
+
 stats="$(grep '^\[RESCUE_PRUNE\]' prune.t1.err || true)"
 [ -n "$stats" ] || fail "BWA3_RESCUE_PRUNE_STATS=1 printed no [RESCUE_PRUNE] line"
-field() { printf '%s\n' "$stats" | tr ' ' '\n' | sed -n "s/^$1=//p"; }
-jobs=$(field jobs) b1=$(field b1) b2=$(field b2) rows_in=$(field rows_in) rows_kept=$(field rows_kept)
+jobs=$(field jobs) full=$(field full) b1=$(field b1) b2=$(field b2) rows_in=$(field rows_in) rows_kept=$(field rows_kept)
 if [ "$jobs" -eq 0 ]; then
     # Pruning is compiled in on aarch64, so no filtered job there means it stopped engaging (a
     # gate or fixture regression) and the identity above held vacuously.
     case "$(uname -m)" in
         aarch64 | arm64) fail "pruning filtered no rescue job on an aarch64 host: $stats" ;;
     esac
-    echo "SKIP: pruning does not run on this host (aarch64 only); the identity above held trivially"
+    echo "PASS: rescue_prune_identity (11-op cell, NEON-form defaults and dedup shortcuts == reference at -t 1 and -t 4; $dstats$tier_note)"
+    echo "SKIP: pruning does not run on this host (aarch64 only); its legs held trivially"
     exit 0
 fi
+[ "$full" -gt 0 ] || fail "no filtered job kept its full window (the N mates stopped reaching the filter): $stats"
 [ "$b1" -gt 0 ] || fail "no proven-failure (B1) rescue in the fixture: $stats"
 [ "$b2" -gt 0 ] || fail "no narrowed (B2) rescue in the fixture: $stats"
 [ "$rows_kept" -lt "$rows_in" ] || fail "pruning kept every row: $stats"
+# The anchors present three times rescue the same mate against identical windows: the repeats
+# after the first must be answered from its result (BWA3_RESCUE_REPEAT), or that path went untested.
+reused=$(field reused)
+[ "${reused:-0}" -gt 0 ] || fail "no rescue job was answered from an identical earlier job's result: $stats"
 
 bstats="$(grep '^\[RESCUE_BAND\]' band.t1.err || true)"
 [ -n "$bstats" ] || fail "BWA3_RESCUE_PRUNE_STATS=1 printed no [RESCUE_BAND] line"
 bfield() { printf '%s\n' "$bstats" | tr ' ' '\n' | sed -n "s/^$1=//p"; }
 parents=$(bfield banded_parents)
 [ "${parents:-0}" -gt 0 ] || fail "no banded rescue parent with the cost gate opened: $bstats"
+# The hull leg's switch took effect: nothing banded in either pass.
+hstats="$(grep '^\[RESCUE_BAND\]' hull.t1.err || true)"
+for f in banded_parents pass1_banded; do
+    v=$(printf '%s\n' "$hstats" | tr ' ' '\n' | sed -n "s/^$f=//p")
+    [ "${v:-0}" -eq 0 ] || fail "the hull leg banded jobs (BWA3_RESCUE_BAND=0 ignored): $hstats"
+done
 p1stats="$(grep '^\[RESCUE_BAND\]' prune.t1.err || true)"
 p1=$(printf '%s\n' "$p1stats" | tr ' ' '\n' | sed -n 's/^pass1_banded=//p')
 [ "${p1:-0}" -gt 0 ] || fail "no banded pass-1 (start recovery) job at the defaults: $p1stats"
 
-echo "PASS: rescue_prune_identity (hull, pruned and banded == full-window rescue at -t 1 and -t 4; $stats; $bstats)"
+echo "PASS: rescue_prune_identity (11-op cell, NEON-form defaults, dedup shortcuts, hull, pruned and banded == reference at -t 1 and -t 4; $dstats$tier_note; $stats; $bstats)"

@@ -8,7 +8,48 @@
  * rescue_env_on: an on/off toggle, default on; a value starting with '0' turns it off and
  * anything else leaves it on. Not reported and not cached: kswv reads its toggles on every call so
  * a unit test can flip them in-process, and a per-call report would repeat once per batch;
- * callers that want the value once wrap it in a function-local static. */
+ * callers that want the value once wrap it in a function-local static.
+ *
+ * rescue_env_opt_in: a diagnostic switch, default off; only a value starting with '1' turns it on.
+ *
+ * The knobs, one per line between the markers: name, default, meaning (continuation lines are
+ * indented past the name column). scripts/rescue_knobs.sh renders this list as
+ * docs/_generated/rescue/knobs.md, and test/regression/rescue_docs_lint.sh checks it against the
+ * knobs src/ reads, their defaults there, and the user-facing table in
+ * docs/src/whats-different/performance.md. Design notes: docs/src/developer-guide/rescue.md.
+ *
+ * rescue-knobs:begin
+ * BWA3_RESCUE_PRUNE           1     exact 5-mer pruning of rescue windows (aarch64); 0 also turns
+ *                                   the banded passes off
+ * BWA3_RESCUE_PRUNE_MAX_HITS  auto  keep the full window above this many 5-mer hits; auto is 1000
+ *                                   where banding runs at the NEON filter's threshold, else 400
+ * BWA3_RESCUE_PRUNE_STATS     0     1 prints the RESCUE_PRUNE and RESCUE_BAND counters and stage
+ *                                   times at exit
+ * BWA3_RESCUE_DEDUP_SKIP      1     skip a post-rescue dedup proven to be a no-op, and add a
+ *                                   single new region in one pass where that is provably exact
+ * BWA3_RESCUE_REPEAT          1     a rescue job repeating one of the last eight filtered jobs byte
+ *                                   for byte reads that job's result instead of being enqueued again
+ * BWA3_RESCUE_FSCAN           1     the 11-op kswv rescue cell in every SIMD body; 0 also selects
+ *                                   the banded DP's original cell
+ * BWA3_RESCUE_USQADD          1     NEON u8 kswv: one saturating add per cell instead of the
+ *                                   biased add / subtract pair
+ * BWA3_RESCUE_ROWPAIR         1     NEON kswv (8- and 16-bit): sweep two target rows per pass
+ * BWA3_RESCUE_LAZYQE          1     NEON kswv two-row sweep: recover the query end after the row
+ *                                   instead of inline
+ * BWA3_RESCUE_BAND            1     run pruned rescue jobs as diagonal bands (aarch64)
+ * BWA3_RESCUE_BAND_COST       85    band a pass-0 parent iff its band cells cost less than this %
+ *                                   of the hull's
+ * BWA3_RESCUE_BAND_R2         1     run round 2 banded (0: kswv on the hull)
+ * BWA3_RESCUE_BAND_TIGHT      8     threshold offset of the tight top band (0: off)
+ * BWA3_RESCUE_BAND_P1         2     pass-1 banding: 0 none, 1 banded parents only, 2 every
+ *                                   eligible 8-bit job
+ * BWA3_RESCUE_BAND_P1_COST    130   band a pass-1 job iff its per-row cells cost less than this %
+ *                                   of kswv's
+ * BWA3_RESCUE_BAND_KERNEL     2     banded-DP kernel while BWA3_RESCUE_FSCAN is on: 0 original
+ *                                   cell, 1 fused cell, 2 fused cell on two rows per step
+ * BWA3_RESCUE_BAND_SHIFT      1     shift each lane's band so a 16-lane group's query offsets
+ *                                   align
+ * rescue-knobs:end */
 #ifndef BWA_MEM3_RESCUE_ENV_H
 #define BWA_MEM3_RESCUE_ENV_H
 
@@ -36,6 +77,12 @@ static inline bool rescue_env_on(const char *name)
 {
     const char *e = getenv(name);
     return !e || e[0] != '0';
+}
+
+static inline bool rescue_env_opt_in(const char *name)
+{
+    const char *e = getenv(name);
+    return e && e[0] == '1';
 }
 
 #endif

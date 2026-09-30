@@ -240,12 +240,53 @@ which the insert-size estimate, and so rescue and pairing, depend on).
   fused cell (both gaps opened from one saturating subtract), steps two rows at
   a time, and reads the query end directly rather than from a per-row snapshot.
   Same scope as the banded DP; every value the rescue reads is unchanged.
+- **Skipped or incremental post-rescue dedup.** After each rescue, the mate's
+  region list was sorted and deduplicated again, including after rescues that
+  added nothing. A dedup that finds every reference end distinct and drops
+  nothing is a fixed point, so repeating it on the unchanged list is skipped;
+  adding one new region to such a list is done in one linear pass when that
+  region's reference end is distinct, it forms no redundant pair, and no two
+  regions share a score, reference start and query start, and by the full
+  dedup otherwise. The output of every dedup is unchanged. Runs on every
+  architecture and at every scoring; the Graviton 4 check above is the only
+  real-data one, and on x86 the identity rests on the dedup unit tests and
+  `rescue_prune_identity.sh` on a generated fixture in CI (AVX2, and AVX-512BW
+  where the runner has it).
+  ([#537](https://github.com/fg-labs/bwa-mem3/pull/537))
+- **Band planning from the filter's own components (NEON).** Band planning
+  takes the diagonal components at the rescue threshold from the NEON filter,
+  which has just found them, instead of rescanning the filter's per-diagonal
+  arrays; it skips components that cannot hold a higher threshold, and the
+  filter returns its previous decision for a job repeating the previous one
+  byte for byte. Plans and decisions are unchanged.
+  ([#537](https://github.com/fg-labs/bwa-mem3/pull/537))
+- **Repeated rescue jobs answered from an earlier result (NEON).** A rescue
+  job that repeats one of the thread's last eight filtered jobs byte for byte,
+  the same mate against an identical window as anchors in identical repeat
+  copies produce, reads that job's rescue-kernel result instead of being
+  enqueued again. The filter's key of the inputs picks the candidates, and the
+  staged window, mate, lengths, score gate and hull offset are compared byte
+  for byte before a result is reused, so every value the rescue reads is
+  unchanged. `BWA3_RESCUE_REPEAT=0` turns it off.
+  ([#537](https://github.com/fg-labs/bwa-mem3/pull/537))
+- **Window bounds only after the rescue.** The step that reads rescue results
+  back computed each job's reference window again, bases included, though it
+  needs only the clamped bounds and the contig; the bases are now fetched only
+  for the rare job that falls back to the scalar aligner.
+  ([#537](https://github.com/fg-labs/bwa-mem3/pull/537))
+- **Rescue window prefetch.** The reference windows mate rescue will fetch for
+  a pair are hinted to the cache two pairs ahead (every window of a read's top
+  anchor lies within the largest usable insert-size bound of it). Pure hints;
+  skipped when the insert-size model is too loose for the span to be small.
+  ([#537](https://github.com/fg-labs/bwa-mem3/pull/537))
 
 | Variable | Effect |
 |---|---|
 | `BWA3_RESCUE_PRUNE=0` | Turn off exact rescue pruning and the banded passes: every rescue window runs in full through the rescue kernel (the reference path for identity checks). `--rescue-kmer`, which narrows windows on its own, is unaffected. Default on where pruning runs. |
 | `BWA3_RESCUE_PRUNE_MAX_HITS=<n>` | Keep the full window when the mate and window share more than `n` exact 5-mer hits, where the filter would cost more than it saves (default 1000 where the banded DP runs and the rescue threshold `min_seed_len * a` is 19, as at the default `-k 19 -A 1`; 400 otherwise). It only chooses between exact paths, so output does not depend on its value by design. |
-| `BWA3_RESCUE_PRUNE_STATS=1` | Print, once at exit, how the filter decided (`[RESCUE_PRUNE] jobs=… full=… b1=… b2=… rows_in=… rows_kept=… filter_s=… kswv_pass0_s=… band_pass0_s=… kswv_pass1_s=… band_pass1_s=…`): jobs filtered, and of them how many kept the full window, were proven to fail (`b1`) or were narrowed (`b2`), with the window rows before and after and the thread-summed seconds of each rescue stage; and how the banded DP resolved (`[RESCUE_BAND] banded_parents=… …`). Measurement only; output is unchanged. |
+| `BWA3_RESCUE_PRUNE_STATS=1` | Print, once at exit, how the filter decided (`[RESCUE_PRUNE] jobs=… full=… b1=… b2=… rows_in=… rows_kept=… jobs16=… memo_hits=… reused=… filter_s=… kswv_pass0_s=… band_pass0_s=… kswv_pass1_s=… band_pass1_s=… dedup_run=… dedup_skip=… dedup_run_regs=… dedup_skip_regs=… dedup_insert1=… dedup_insert1_fast=… dedup_s=…`): jobs filtered, and of them how many kept the full window, were proven to fail (`b1`) or were narrowed (`b2`), with the window rows before and after, the number of 16-bit rescue jobs (which the filter never sees), the jobs the NEON filter answered from its repeat memo, the jobs answered from an identical recent job's result instead of being enqueued, and the thread-summed seconds of each rescue stage; how many post-rescue dedups ran, were skipped, took the one-region insert and of those were done in one pass; and how the banded DP resolved (`[RESCUE_BAND] banded_parents=… …`). Measurement only; output is unchanged. |
+| `BWA3_RESCUE_DEDUP_SKIP=0` | Run every post-rescue dedup in full instead of skipping one proven to be a no-op or adding a single new region in one pass. Default on. It only chooses between exact paths, so output is the same either way by design. |
+| `BWA3_RESCUE_REPEAT=0` | Enqueue every rescue job instead of answering one that repeats one of the thread's last eight filtered jobs byte for byte (the same mate against an identical window) from that job's result. Default on. It only chooses between exact paths, so output is the same either way by design. |
 | `BWA3_RESCUE_BAND=0` | Run every narrowed job through the rescue kernel on its whole hull instead of banded (and the hit gate back to 400). Default on where banding runs. |
 | `BWA3_RESCUE_BAND_COST=<pct>` | Band a narrowed job only when its band cells cost less than `pct` % of the hull's (default 85). It only chooses between exact paths, so output does not depend on its value by design. |
 | `BWA3_RESCUE_BAND_R2=0` | Run the rare second round (a first round that cannot prove its result final) through the rescue kernel on the hull instead of banded. It only chooses between exact paths, so output is the same either way by design. |
@@ -254,6 +295,9 @@ which the insert-size estimate, and so rescue and pairing, depend on).
 | `BWA3_RESCUE_BAND_TIGHT=<n>` | Threshold offset of the first-round band for a lone near-perfect primary (default 8; 0 disables). It only chooses between exact paths, so output does not depend on its value by design. |
 | `BWA3_RESCUE_FSCAN=0` | Use the original rescue cells instead of the 11-op cell, in the rescue kernels and in the banded DP. A value starting with `0` turns it off and anything else leaves it on; it is not reported. It only chooses between exact paths, so output is the same either way by design. |
 | `BWA3_RESCUE_BAND_KERNEL=<n>` | Which banded-DP kernel runs while `BWA3_RESCUE_FSCAN` is on: `0` the original cell, `1` the fused cell one row at a time, `2` (default) the fused cell two rows at a time; values above 2 act as 2. It only chooses between exact paths, so output does not depend on its value by design. |
+| `BWA3_RESCUE_USQADD=0` | In the NEON 8-bit rescue kernel, use the biased add / subtract pair per cell instead of one saturating add. It only chooses between exact paths, so output is the same either way by design. |
+| `BWA3_RESCUE_ROWPAIR=0` | In the NEON rescue kernels (8- and 16-bit), sweep one target row at a time instead of two. It only chooses between exact paths, so output is the same either way by design. |
+| `BWA3_RESCUE_LAZYQE=0` | In the NEON two-row sweep, find each row's query end inline instead of after the row. It only chooses between exact paths, so output is the same either way by design. |
 | `BWA3_RESCUE_BAND_SHIFT=0` | Turn off the per-lane band shift that aligns the query offsets of the 16 bands in a vector. It only chooses between exact paths, so output is the same either way by design. |
 
 Every integer knob above (`=<n>` or `=<pct>`) takes a non-negative decimal integer of at most 2147483647, with no sign or surrounding whitespace. An unset or empty knob silently takes the default; any other invalid value is reported to stderr and the default used. The on/off knobs (`=0`) are off for any value starting with `0` and on otherwise.

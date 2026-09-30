@@ -779,6 +779,12 @@ int mem_sam_pe_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                          mem_cache *mmc,  int64_t &pcnt, int32_t &gcnt,
                          int32_t&, int32_t&, int tid);
 
+/* Cache hints for the reference windows mem_matesw_batch_pre will fetch for
+ * one pair (seqs[0..1], regs[0..1]); pure hints, output-neutral. */
+void mem_prefetch_rescue_pac(const bntseq_t *bns, const uint8_t *pac,
+                             const mem_pestat_t pes[4],
+                             const bseq1_t *seqs, const mem_alnreg_v *regs);
+
 int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                          const uint8_t *pac, const mem_pestat_t pes[4],
                          const mem_alnreg_t *a, int l_ms, const uint8_t *ms,
@@ -848,13 +854,48 @@ int mem_pair_resolve_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                                 int n_pri[2], int z[2], int q_se[2],
                                 int *extra_flag_out, int *paired_out);
 
+/* Caller-owned state of one mate-rescue alnreg vector across
+ * mem_matesw_batch_post calls: `fixpoint` = 1 when the vector, apart from
+ * `pushed`, is exactly the output of a dedup that reported a fixed point
+ * (mem_dedup_only_fixpoint); `pushed` = index of the one record added since,
+ * or -1 for none. Start at {0, -1}; reset it if the vector is modified
+ * elsewhere. */
+typedef struct {
+    int fixpoint;
+    int pushed;
+} mem_rescue_dedup_state_t;
+
+/* The dedup-only call mem_sort_dedup_patch(opt, 0, 0, 0, n, a), byte for byte,
+ * that also reports whether its output is a fixed point (src/bwamem.cpp has
+ * the argument). */
+int mem_dedup_only_fixpoint(const mem_opt_t *opt, int n, mem_alnreg_t *a, int *fixpoint_out);
+/* mem_dedup_only_fixpoint when a[0, n) is a fixed-point output plus the one new
+ * record a[pos], in O(n) where that is provably exact (src/bwamem.cpp). */
+int mem_dedup_only_insert1(const mem_opt_t *opt, int n, mem_alnreg_t *a, int pos,
+                           int *fixpoint_out, int *fast_out);
+
+/* Where mem_matesw_batch_post inserts a rescued region into the mate's
+ * by-score list a[0, n): before the first record with a strictly lower score,
+ * after any equal-score run. Shared with the tests that replay it. */
+static inline int mem_rescue_insert_pos(const mem_alnreg_t *a, int n, int score)
+{
+    int i = 0;
+    while (i < n && !(a[i].score < score)) ++i;
+    return i;
+}
+
+/* `dedup_state`, if non-NULL, tracks `ma` across calls (see
+ * mem_rescue_dedup_state_t) so the post-rescue dedup can be skipped when it is
+ * provably a no-op, or done in O(n) for a single new record. NULL dedups
+ * unconditionally. Output is byte-identical either way. */
 int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                           const uint8_t *pac, const mem_pestat_t pes[4],
                           const mem_alnreg_t *a, int l_ms, const uint8_t *ms,
                           mem_alnreg_v *ma, kswr_t **myaln, int32_t gcnt,
                           int32_t *gar, mem_cache *mmc, int32_t tid,
                           const char *ms_orig = NULL,
-                          const int8_t *mat = NULL, int mate_meth_ot = -1);
+                          const int8_t *mat = NULL, int mate_meth_ot = -1,
+                          mem_rescue_dedup_state_t *dedup_state = NULL);
 
 /* The scalar mem_sam_pe / mem_pair_resolve pairing path was removed; the batched
  * mem_sam_pe_batch* path above is the only mate-rescue/pairing path. */

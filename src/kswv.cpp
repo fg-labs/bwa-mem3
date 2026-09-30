@@ -546,7 +546,9 @@ static inline void kswv_u8_saturation_guard(const SeqPair *p, int8_t w_match, ui
  * cell -- so it is negligible; the runtime bool still folds to a monomorphised
  * template. */
 
-/* BWA3_RESCUE_FSCAN (default ON) selects the G-based cell, G = max(m11, f11),
+/* Overview of the rescue cell and its gates: docs/src/developer-guide/rescue-kswv.md.
+ *
+ * BWA3_RESCUE_FSCAN (default ON) selects the G-based cell, G = max(m11, f11),
  * in every SIMD kswv body: NEON u8 and i16, AVX2 u8 and i16, AVX-512BW u8 and
  * i16. The cell opens both gaps from one sat(G - oe), so a kernel takes it
  * only when fscan_scoring_ok admits the gap costs (equal insertion and

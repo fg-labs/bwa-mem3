@@ -351,24 +351,43 @@ static bool rescue_prune_on()
 #endif
     return arch_ok && rescue_prune_enabled();
 }
-/* BWA3_RESCUE_PRUNE_STATS=1 prints the filter's decisions to stderr at exit as one line,
- * "[RESCUE_PRUNE] jobs=.. full=.. b1=.. b2=.. rows_in=.. rows_kept=..": jobs filtered, and of
- * them how many kept the full window, were proven to fail (b1, not enqueued) or were narrowed to
- * a hull (b2), with the reference rows before and after. It is the non-vacuity check for the
- * identity A/B: identical output must come with a nonzero number of pruned rows. */
+/* BWA3_RESCUE_PRUNE_STATS=1 prints the rescue shortcuts' counters to stderr at exit as one line,
+ * "[RESCUE_PRUNE] jobs=.. full=.. b1=.. b2=.. rows_in=.. rows_kept=.. jobs16=.. memo_hits=..
+ * reused=.. <stage times> dedup_run=.. dedup_skip=.. dedup_run_regs=.. dedup_skip_regs=..
+ * dedup_insert1=.. dedup_insert1_fast=.. dedup_s=..". The first fields are the filter's: jobs
+ * filtered, and of them how many kept the full window, were proven to fail (b1, not enqueued) or
+ * were narrowed to a hull (b2), with the reference rows before and after, the calls the NEON
+ * filter answered from its repeat memo, and of those the jobs answered from an identical earlier
+ * job's result instead of being enqueued (reused, BWA3_RESCUE_REPEAT). They are the non-vacuity
+ * check for the identity A/B: identical output must come with a nonzero number of pruned rows.
+ * jobs16 counts the 16-bit rescue jobs, which the filter never sees: the same check for the 16-bit
+ * kswv kernels. The dedup_* fields are the post-rescue dedup's (below), which runs on every
+ * architecture, so off aarch64 they and jobs16 are the line's only nonzero counters. */
 struct rescue_prune_stats_t {
-    std::atomic<uint64_t> jobs{0}, full{0}, b1{0}, b2{0}, rows_in{0}, rows_kept{0};
+    std::atomic<uint64_t> jobs{0}, full{0}, b1{0}, b2{0}, rows_in{0}, rows_kept{0}, jobs16{0}, memo_hits{0},
+        reused{0};
     /* Thread-summed wall time of the rescue stages (ns): filter + band planning in _pre, kswv
      * pass 0 (8-bit + 16-bit), the banded pass 0, kswv pass 1 and the banded pass 1. Only measured
      * when stats are on. */
     std::atomic<uint64_t> ns_filter{0}, ns_k0{0}, ns_band{0}, ns_k1{0}, ns_b1{0};
-    bool on = [] { const char *e = getenv("BWA3_RESCUE_PRUNE_STATS"); return e && e[0] == '1'; }();
+    /* Mate-rescue dedups (BWA3_RESCUE_DEDUP_SKIP): run (with the records they saw), skipped as
+     * provable no-ops, taken by the one-insert path and of those done in O(n), and their time. */
+    std::atomic<uint64_t> dedup_run{0}, dedup_skip{0}, dedup_run_regs{0}, dedup_skip_regs{0},
+        dedup_insert1{0}, dedup_insert1_fast{0}, ns_dedup{0};
+    bool on = rescue_env_opt_in("BWA3_RESCUE_PRUNE_STATS");
     ~rescue_prune_stats_t() {
         if (on) fprintf(stderr, "[RESCUE_PRUNE] jobs=%llu full=%llu b1=%llu b2=%llu rows_in=%llu rows_kept=%llu "
-                        "filter_s=%.3f kswv_pass0_s=%.3f band_pass0_s=%.3f kswv_pass1_s=%.3f band_pass1_s=%.3f\n",
+                        "jobs16=%llu memo_hits=%llu reused=%llu filter_s=%.3f kswv_pass0_s=%.3f band_pass0_s=%.3f "
+                        "kswv_pass1_s=%.3f band_pass1_s=%.3f dedup_run=%llu dedup_skip=%llu dedup_run_regs=%llu "
+                        "dedup_skip_regs=%llu dedup_insert1=%llu dedup_insert1_fast=%llu dedup_s=%.3f\n",
                         (unsigned long long)jobs, (unsigned long long)full, (unsigned long long)b1,
                         (unsigned long long)b2, (unsigned long long)rows_in, (unsigned long long)rows_kept,
-                        ns_filter * 1e-9, ns_k0 * 1e-9, ns_band * 1e-9, ns_k1 * 1e-9, ns_b1 * 1e-9);
+                        (unsigned long long)jobs16, (unsigned long long)memo_hits, (unsigned long long)reused,
+                        ns_filter * 1e-9, ns_k0 * 1e-9, ns_band * 1e-9,
+                        ns_k1 * 1e-9, ns_b1 * 1e-9, (unsigned long long)dedup_run,
+                        (unsigned long long)dedup_skip, (unsigned long long)dedup_run_regs,
+                        (unsigned long long)dedup_skip_regs, (unsigned long long)dedup_insert1,
+                        (unsigned long long)dedup_insert1_fast, ns_dedup * 1e-9);
     }
 };
 static inline uint64_t rescue_now_ns()
@@ -377,6 +396,21 @@ static inline uint64_t rescue_now_ns()
         std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 static rescue_prune_stats_t g_rescue_prune_stats;
+/* Skip a mate-rescue dedup that is provably a no-op (see mem_matesw_batch_post). Default ON;
+ * BWA3_RESCUE_DEDUP_SKIP=0 runs every dedup, which is how the byte-identity A/B is run. */
+static bool rescue_dedup_skip_enabled()
+{
+    static const bool on = rescue_env_on("BWA3_RESCUE_DEDUP_SKIP");
+    return on;
+}
+/* Answer a rescue job that repeats one of the last filtered jobs byte for byte from that job's
+ * result instead of enqueueing it (see mem_matesw_batch_pre). Default ON; BWA3_RESCUE_REPEAT=0
+ * enqueues every job, which is how the byte-identity A/B is run. */
+static bool rescue_repeat_enabled()
+{
+    static const bool on = rescue_env_on("BWA3_RESCUE_REPEAT");
+    return on;
+}
 
 /* Whether pruning can narrow any rescue window in this run: it is on, the rescue is non-meth, and
  * the scoring is one rescue_prune_scoring_ok admits (rescue_prune.h). Keys the length sort and the
@@ -1287,6 +1321,10 @@ int mem_pair_resolve_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
         }
         #else
         for (i = 0; i < 2; ++i) {
+            /* a[!i] is modified only by the calls below, so one state tracks it
+             * across them (see mem_matesw_batch_post). It starts unknown: the
+             * array as the extension stage left it is not known to be a fixed point. */
+            mem_rescue_dedup_state_t ma_dedup_state = {0, -1};
             for (j = 0; j < b[i].n && j < opt->max_matesw; ++j) {
                 /* D3 (--meth, PR-6, B3): see MATE_SORT branch above. */
                 const char  *ms_orig = opt->meth_mode ? s[!i].meth_orig_seq : NULL;
@@ -1295,7 +1333,8 @@ int mem_pair_resolve_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                 int val = mem_matesw_batch_post(opt, bns, pac, pes, &b[i].a[j],
                                                 s[!i].l_seq, (uint8_t*)s[!i].seq,
                                                 &a[!i], myaln, gcnt, gar, mmc, tid,
-                                                ms_orig, rmat, opt->meth_mode ? i : -1);
+                                                ms_orig, rmat, opt->meth_mode ? i : -1,
+                                                &ma_dedup_state);
                 n += val;
                 gcnt += 4;
             }
@@ -1530,6 +1569,46 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
 }
 
 
+/* Prefetch the pac[] lines mate rescue will read for one pair (seqs[0..1],
+ * regs[0..1]); worker_sam calls it a couple of pairs ahead. It lives next to
+ * mem_matesw_batch_pre because it mirrors that function's window arithmetic:
+ * change one, check the other (a stale mirror only loses the speedup, since
+ * the hints never change output). mem_matesw_batch_pre fetches, for each
+ * read's anchors, one window per orientation r: [rb + low_r, rb + high_r +
+ * l_mate] or [rb - high_r - l_mate, rb - low_r] in doubled coordinates, all on
+ * the anchor's strand. So every
+ * window of the top anchor lies in [rb - H - l_mate, rb + H + l_mate] with H the
+ * largest high over usable orientations. Those windows are random DRAM misses
+ * (bns_get_seq_into's hottest instructions are its first pac loads), so hint
+ * them a couple of pairs ahead. Only a[0] is covered; secondary anchors within
+ * pen_unpaired are rare. Pure hints: byte-identical. */
+void mem_prefetch_rescue_pac(const bntseq_t *bns, const uint8_t *pac,
+                             const mem_pestat_t pes[4],
+                             const bseq1_t *seqs, const mem_alnreg_v *regs)
+{
+    int64_t H = -1;
+    for (int r = 0; r < 4; ++r)
+        if (!pes[r].failed && pes[r].high > H) H = pes[r].high;
+    if (H < 0) return;
+    const int64_t l_pac = bns->l_pac;
+    for (int k = 0; k < 2; ++k) {
+        if (regs[k].n == 0) continue;
+        const int64_t rb = regs[k].a[0].rb, pad = H + seqs[!k].l_seq;
+        int64_t b = rb - pad, e = rb + pad;
+        /* stay on rb's strand, as the rescue windows do */
+        if (rb < l_pac) { if (b < 0) b = 0; if (e > l_pac) e = l_pac; }
+        else { if (b < l_pac) b = l_pac; if (e > l_pac << 1) e = l_pac << 1; }
+        /* <= 64 lines: a wider span means a loose insert-size model, where
+         * hints would cost more than the misses they hide */
+        if (b >= e || e - b > 64 * 64 * 4) continue;
+        /* reverse strand: [b, e) is [2l - e, 2l - b) on the forward pac, i.e. bns_depos
+         * of both ends (the window is clamped to one strand above) */
+        if (b >= l_pac) { const int64_t fb = (l_pac << 1) - e; e = (l_pac << 1) - b; b = fb; }
+        for (int64_t x = (b >> 2) & ~(int64_t)63, xe = (e - 1) >> 2; x <= xe; x += 64)
+            __builtin_prefetch(pac + x, 0, 1);
+    }
+}
+
 int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                          const uint8_t *pac, const mem_pestat_t pes[4],
                          const mem_alnreg_t *a, int l_ms, const uint8_t *ms,
@@ -1713,7 +1792,17 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
              * and _post applies the same offset. The oriented mate is built once here and reused
              * for the staging copy below. */
             const bool pruned = rescue_prune_applies(opt, xtra);
+            if (g_rescue_prune_stats.on && !(xtra & KSW_XBYTE)) g_rescue_prune_stats.jobs16++;
             static thread_local std::vector<uint8_t> oq;   // oriented mate; grows, never shrinks
+            /* The last filtered jobs this thread enqueued, by the filter's key of their inputs and
+             * regid (oldest overwritten); see the reuse below. */
+            struct recent_job_t { uint64_t key; int32_t regid; };
+            static const int RECENT = 8;
+            static thread_local recent_job_t recent[RECENT] = {
+                {0, -1}, {0, -1}, {0, -1}, {0, -1}, {0, -1}, {0, -1}, {0, -1}, {0, -1}};   // empty slots
+            static thread_local int recent_pos = 0;
+            bool view_keyed = false;
+            uint64_t view_key = 0;
             if (pruned) {
                 if ((int)oq.size() < l_ms) oq.resize(l_ms);
                 matesw_orient(ms, l_ms, is_rev, oq.data());
@@ -1724,13 +1813,41 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                                                      opt->min_seed_len * opt->a,
                                                      rescue_prune_max_hits(opt->min_seed_len * opt->a), &hb, &he,
                                                      &view);
+                /* A job repeating one of the last filtered ones byte for byte (the same mate
+                 * against an identical window, which anchors in identical repeat copies produce)
+                 * has that job's kswv result: the kernel is a function of the staged bytes, the
+                 * lengths and h0 alone. The filter's key of the inputs picks the candidates among
+                 * the recent jobs; a candidate's staged pair is then compared with this job's
+                 * inputs, so the reuse is exact by that comparison whatever the key's history (a
+                 * new batch, a job never enqueued, a key collision). _post reads a result by regid
+                 * and adds the hull offset recorded for it, which equals this job's, so the reused
+                 * regid answers this orientation exactly as its own would have. Decided before the
+                 * banding plan, which commit() binds to the next enqueued pair. */
+                int32_t reuse = -1;
+                if (view.keyed && kind != RESCUE_PRUNE_B1 && rescue_repeat_enabled()) {
+                    const int ob = kind == RESCUE_PRUNE_B2 ? hb : 0;
+                    const int l1 = kind == RESCUE_PRUNE_B2 ? he - hb + 1 : (int)(re - rb);
+                    const int8_t hyp = opt->meth_mode ? (int8_t)((mate_meth_ot ^ is_rev) & 1) : (int8_t)-1;
+                    for (int c = 0; c < RECENT && reuse < 0; c++) {
+                        const int32_t j = recent[c].regid;
+                        if (recent[c].key != view.key || j < 0 || j >= pcnt) continue;
+                        const SeqPair &pj = seqPairArray[j];
+                        if (pj.regid == j && pj.h0 == xtra && pj.len1 == l1 && pj.len2 == l_ms
+                            && pj.meth_hyp == hyp && mmc->rescue_narrow_off[tid][j] == ob
+                            && memcmp(seqBufRef + pj.idr, ref + ob, (size_t)l1) == 0
+                            && memcmp(seqBufQer + pj.idq, oq.data(), (size_t)l_ms) == 0)
+                            reuse = j;
+                    }
+                }
                 /* Banding plan (rescue_band.h), bound to this pair's regid at enqueue (commit).
                  * rescue_prune_applies() has checked the scoring the band kernel is derived for. */
-                if (kind == RESCUE_PRUNE_B2 && rescue_band_enabled())
+                if (kind == RESCUE_PRUNE_B2 && reuse < 0 && rescue_band_enabled())
                     matesw_band(mmc, tid).plan(view, (int)(re - rb), l_ms, hb, he, opt->min_seed_len * opt->a);
                 if (g_rescue_prune_stats.on) g_rescue_prune_stats.ns_filter += rescue_now_ns() - tf0;
                 if (g_rescue_prune_stats.on) {
                     g_rescue_prune_stats.jobs++;
+                    g_rescue_prune_stats.memo_hits += view.repeat;
+                    g_rescue_prune_stats.reused += reuse >= 0;
                     g_rescue_prune_stats.rows_in += re - rb;
                     (kind == RESCUE_PRUNE_B1 ? g_rescue_prune_stats.b1 : kind == RESCUE_PRUNE_B2 ? g_rescue_prune_stats.b2 : g_rescue_prune_stats.full)++;
                     g_rescue_prune_stats.rows_kept += kind == RESCUE_PRUNE_B1 ? 0 : kind == RESCUE_PRUNE_B2 ? he - hb + 1 : re - rb;
@@ -1739,6 +1856,11 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                     gar[gcnt + r] = MATESW_GAR_PROVEN_FAIL;
                     continue;
                 }
+                if (reuse >= 0) {
+                    gar[gcnt + r] = reuse;
+                    continue;
+                }
+                view_keyed = view.keyed; view_key = view.key;
                 if (kind == RESCUE_PRUNE_B2) {
                     ref += hb; rb += hb; re = rb + (he - hb + 1);
                     narrow_ob += hb;
@@ -1896,6 +2018,10 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
 
                 /* gar[gcnt+r] points at this rescue's single enqueued regid. */
                 if (hi == 0) gar[gcnt + r] = pcnt;
+                if (pruned && view_keyed) {
+                    recent[recent_pos] = recent_job_t{view_key, pcnt};
+                    recent_pos = (recent_pos + 1) % RECENT;
+                }
                 sp.regid = pcnt;
                 if (opt->rescue_kmer || rescue_prune_runs(opt)) {   /* record narrow offset by regid for _post */
                     *matesw_narrow_slot(mmc, tid, pcnt) = narrow_ob;
@@ -1916,7 +2042,8 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                           const mem_alnreg_t *a, int l_ms, const uint8_t *ms,
                           mem_alnreg_v *ma, kswr_t **myaln, int32_t gcnt,
                           int32_t *gar, mem_cache *mmc, int32_t tid, const char *ms_orig,
-                          const int8_t *mat, int mate_meth_ot)
+                          const int8_t *mat, int mate_meth_ot,
+                          mem_rescue_dedup_state_t *dedup_state)
 {
     extern int mem_sort_dedup_patch_rev(const mem_opt_t *opt, const bntseq_t *bns,
                                         const uint8_t *pac, uint8_t *query, int n,
@@ -2004,11 +2131,13 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
         }
         if (rb < 0) rb = 0;
         if (re > l_pac<<1) re = l_pac<<1;
-        // Zero-copy ref slice via bns_fetch_seq_v2 (see mem_matesw_batch_pre
-        // for rationale). The scratch arg is unused by v2; pass NULL since
-        // mem_matesw_batch_post has no tid in scope to index seqPairArrayAux.
-        if (rb < re) ref = bns_fetch_seq_v2(bns, pac, &rb, (rb+re)>>1, &re, &rid,
-                                            mmc->ref_string, NULL);
+        // Only the clamped window bounds and rid are needed here: the bases are
+        // read solely by the scalar ksw_align2 fallback (index == -1), which
+        // fetches them itself below. The batched path reads its result from
+        // *myaln, so unpacking the window for every job (as _pre already did)
+        // was pure memory traffic. bns_fetch_bounds is bns_fetch_seq_v2's own
+        // clamp, so rb/re/rid are unchanged.
+        if (rb < re) bns_fetch_bounds(bns, &rb, (rb+re)>>1, &re, &rid);
 
         if (a->rid == rid && re - rb >= opt->min_seed_len) { // no funny things happening
             kswr_t aln;
@@ -2047,7 +2176,15 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
             else if (index == -1) {
                 // fprintf(stderr, "Re-routing: Encountered -ve index for "
                 // "gcnt: %d, look into pre.\n", gcnt + r);
-                assert(ref != 0);
+                // Fetch the window's bases only on this scalar path. [rb, re) is
+                // already clamped to one contig on one strand (rb is not narrowed
+                // for index == -1), so this is the same window bns_fetch_seq_v2
+                // returned before.
+                {
+                    int64_t ref_len_got = 0;
+                    ref = bns_get_seq_v2(l_pac, pac, rb, re, &ref_len_got, mmc->ref_string, NULL);
+                    xassert(ref != 0 && ref_len_got == re - rb, "rescue post: scalar-fallback window fetch failed");
+                }
                 // Build the mate query here (only the scalar path reads it):
                 // reverse-complement `ms` into `rev` for the RC orientations,
                 // else point straight at `ms`. Freed by the `if (rev) free(rev)`
@@ -2126,11 +2263,15 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                 #if !MATE_SORT
 
                 // move b s.t. ma is sorted
-                for (i = 0; i < ma->n - 1; ++i) // find the insertion point
-                    if (ma->a[i].score < b.score) break;
-                tmp = i;
+                tmp = mem_rescue_insert_pos(ma->a, (int)ma->n - 1, b.score);
                 for (i = ma->n - 1; i > tmp; --i) ma->a[i] = ma->a[i-1];
                 ma->a[i] = b;
+                /* Record the one new record for the dedup below; a second push
+                 * before a dedup (not a path this loop takes) forfeits the state. */
+                if (dedup_state) {
+                    if (dedup_state->fixpoint && dedup_state->pushed < 0) dedup_state->pushed = i;
+                    else dedup_state->fixpoint = 0, dedup_state->pushed = -1;
+                }
 
                 #else
                 int resort = 0;
@@ -2169,13 +2310,42 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
             ++n;
         }
         #if !MATE_SORT
-        if (n) ma->n = mem_sort_dedup_patch(opt, 0, 0, 0, ma->n, ma->a);
+        /* `n` counts SW attempts across orientations AND is never reset, so this
+         * dedup also runs for every orientation that added nothing -- a failed or
+         * proven-failed (MATESW_GAR_PROVEN_FAIL) SW, a declined one, or a later
+         * orientation after any earlier attempt -- and, via the caller's state, on
+         * the next anchor's orientations too. With the state (both exact, see
+         * src/bwamem.cpp): nothing pushed since a dedup that reported a fixed
+         * point -> repeating it is a byte-for-byte no-op, skip it
+         * (mem_dedup_only_fixpoint); one record pushed -> mem_dedup_only_insert1,
+         * O(n) when it can prove the result. Without state, dedup as before. */
+        if (n) {
+            const bool st = g_rescue_prune_stats.on;
+            /* BWA3_RESCUE_DEDUP_SKIP=0 ignores the state: every dedup runs in full. */
+            mem_rescue_dedup_state_t *ds = rescue_dedup_skip_enabled() ? dedup_state : NULL;
+            if (ds && ds->fixpoint && ds->pushed < 0) {
+                if (st) { ++g_rescue_prune_stats.dedup_skip; g_rescue_prune_stats.dedup_skip_regs += ma->n; }
+            } else {
+                const uint64_t t0 = st ? rescue_now_ns() : 0;
+                if (st) { ++g_rescue_prune_stats.dedup_run; g_rescue_prune_stats.dedup_run_regs += ma->n; }
+                if (ds == NULL)
+                    ma->n = mem_sort_dedup_patch(opt, 0, 0, 0, ma->n, ma->a);
+                else if (ds->fixpoint) {
+                    int fast = 0;
+                    ma->n = mem_dedup_only_insert1(opt, ma->n, ma->a, ds->pushed, &ds->fixpoint, &fast);
+                    if (st) { ++g_rescue_prune_stats.dedup_insert1; g_rescue_prune_stats.dedup_insert1_fast += fast; }
+                } else
+                    ma->n = mem_dedup_only_fixpoint(opt, ma->n, ma->a, &ds->fixpoint);
+                if (ds) ds->pushed = -1;
+                if (st) g_rescue_prune_stats.ns_dedup += rescue_now_ns() - t0;
+            }
+        }
         #else
         if (n) ma->n = mem_dedup_patch(opt, 0, 0, 0, ma->n, ma->a);
         #endif
 
         if (rev) free(rev);
-        // ref aliases ref_string (see bns_fetch_seq_v2 above); no free.
+        // ref (fallback path only) aliases ref_string or the pac-fetch scratch; no free.
     }
     if (ms2) free(ms2); // D3 (--meth): original-mate 2-bit scratch
     return n;

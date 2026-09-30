@@ -272,6 +272,27 @@ jobs:
       - name: README still describes the regression scripts
         run: bash test/regression/readme_contract_lint.sh
 
+  # Same shape again. Separate so the failure reads as "the rescue developer
+  # docs went stale" rather than as a build or test finding.
+  rescue-docs-lint:
+    name: Rescue developer docs (pages, knob list <-> src/)
+    runs-on: ubuntu-latest
+    # Source-only lint, seconds of work; ceiling catches a hung runner only.
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      # Runs first, for the same reason as the jobs above: an extraction that
+      # has stopped extracting satisfies every check over what it extracted.
+      - name: Rescue docs lint still detects drift
+        run: bash test/regression/rescue_docs_lint_selftest.sh
+
+      - name: Rescue docs match the source (pages, knob list, gates)
+        run: bash test/regression/rescue_docs_lint.sh
+
   build-and-test:
     strategy:
       fail-fast: false
@@ -786,6 +807,18 @@ jobs:
           PARITY_R2=/tmp/chr22-sim/reads.r2.fastq.gz \
           bash test/regression/all_tiers_parity.sh
 
+      - name: Rescue identity under each forced x86 tier (generated PE fixture)
+        if: matrix.canonical == true
+        # The kswv rescue kernels differ per tier, so the 11-op cell (and the
+        # rest of the rescue shortcuts) is checked end to end on each tier this
+        # host has: the reference and default legs under BWAMEM3_FORCE_TIER must
+        # equal the unforced reference. On a runner without AVX-512BW the script
+        # reports that tier SKIP:. Seconds of work: a 60 kb generated fixture.
+        run: |
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          RESCUE_TIERS="avx2 avx512bw" \
+          bash test/regression/rescue_prune_identity.sh
+
       - name: Run unit-test harness
         # The standalone FM-index parity tests in the harness gate the arm64
         # vector occurrence path; on x86 rows that code is compiled out, so
@@ -879,13 +912,30 @@ jobs:
           CHR22_SIM_DIR=/tmp/chr22-sim \
           bash test/regression/bwtseed_lockstep_driver_identity.sh
 
-      # Every row, not just the canonical one: pruning runs only on aarch64, so
-      # the ARM64 rows are where the identity is non-vacuous (the x86 rows run
-      # both legs down the same path and report the non-vacuity check skipped).
+      # Every row, not just the canonical one: the post-rescue dedup shortcuts
+      # run on every tier, and pruning runs only on aarch64, so the ARM64 rows
+      # are where the pruning legs are non-vacuous (the x86 rows run them down
+      # the same path and report that non-vacuity check skipped).
       - name: Exact rescue pruning == full-window rescue (generated PE fixture)
         run: |
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           bash test/regression/rescue_prune_identity.sh
+
+      # The NEON rescue-pruning filter against the scalar one on generated jobs:
+      # decisions, the per-diagonal view band planning reads, the component
+      # list and the repeat memo. About 6 s for 100000 jobs on an Apple M-series
+      # core; real-data dumps are manual. The negative control runs first: it
+      # shifts one scalar field on one job, and the check must report it as a
+      # MISMATCH and exit 1, so a comparison that stopped biting fails here.
+      - name: NEON rescue filter == scalar filter (rescue_prune_eq, generated jobs)
+        if: runner.arch == 'ARM64'
+        run: |
+          make rescue-prune-eq CXX=${{ matrix.cxx || 'clang++-19' }} USE_MIMALLOC=${{ matrix.use_mimalloc }}
+          if RPE_NEGATIVE_CONTROL=1 ./rescue_prune_eq fuzz 2000 1 > rpe_nc.log 2>&1; then
+            cat rpe_nc.log; echo "::error::negative control exited 0: the check missed an injected disagreement"; exit 1
+          fi
+          grep -q 'MISMATCHES=[1-9]' rpe_nc.log || { cat rpe_nc.log; echo "::error::negative control failed without reporting a MISMATCH"; exit 1; }
+          ./rescue_prune_eq fuzz 100000 1
 
       # The banded rescue kernel is NEON-only, so the harness runs on the ARM64
       # rows: every generated job class through the production pipeline, every
@@ -900,11 +950,16 @@ jobs:
       # (BWA3_RESCUE_FSCAN=0, which also turns the fused kswv cell off). The
       # trailing argument is the job generator's seed. The first three take
       # ~50 s in all on Graviton 4; the last three are 30000-job runs like the
-      # second and third. Longer runs and real dumps are manual.
+      # second and third. Longer runs and real dumps are manual. As above, a
+      # negative control (one banded job's te shifted) must fail first.
       - name: Banded rescue == kswv (rescue_band_harness, generated jobs)
         if: runner.arch == 'ARM64'
         run: |
           make rescue-band-harness CXX=${{ matrix.cxx || 'clang++-19' }} USE_MIMALLOC=${{ matrix.use_mimalloc }}
+          if BWA3_RESCUE_BAND_COST=100000000 RB_NEGATIVE_CONTROL=1 ./rescue_band_harness eq 3000 1 > rb_nc.log 2>&1; then
+            cat rb_nc.log; echo "::error::negative control exited 0: the check missed an injected disagreement"; exit 1
+          fi
+          grep -q 'MISMATCHES=[1-9]' rb_nc.log || { cat rb_nc.log; echo "::error::negative control failed without reporting a MISMATCH"; exit 1; }
           BWA3_RESCUE_BAND_COST=100000000 RB_SCALAR_STRIDE=7 ./rescue_band_harness eq 100000 1
           BWA3_RESCUE_BAND_COST=100000000 RB_MINSC=30 ./rescue_band_harness eq 30000 2
           BWA3_RESCUE_BAND_COST=100000000 BWA3_RESCUE_PRUNE_MAX_HITS=100000 ./rescue_band_harness eq 30000 3

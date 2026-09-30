@@ -23,6 +23,7 @@ src/version.h
 /fast_reader_selftest
 /fr_fastq_bench
 /rescue_band_harness
+/rescue_prune_eq
 
 # doctest suites built by test/Makefile
 /test/bwa_mem3_tests_unit

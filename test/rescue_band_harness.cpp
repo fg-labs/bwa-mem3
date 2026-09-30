@@ -23,7 +23,9 @@
  * components at several thresholds), and the run fails if nothing was banded. Env knobs are the
  * production ones; the caller sets e.g.
  * BWA3_RESCUE_BAND_COST=100000000 (band every B2 parent) and BWA3_RESCUE_PRUNE_MAX_HITS. RB_MINSC
- * (default 19) and RB_SCALAR_STRIDE (default 0: no scalar cross-check) are harness-only.
+ * (default 19), RB_SCALAR_STRIDE (default 0: no scalar cross-check) and RB_NEGATIVE_CONTROL are
+ * harness-only; RB_NEGATIVE_CONTROL=1 shifts the production te of the first banded passing job by
+ * one, so a working comparison must report a MISMATCH and exit 1 (CI runs it first).
  *
  * Dump files: one record per prune-eligible rescue job, as the aligner saw it (full window and
  * oriented mate): int32 len1, int32 len2, len1 reference bytes, len2 query bytes (2-bit codes,
@@ -455,6 +457,8 @@ static int run_eq(std::vector<Job> &jobs, int minsc, int max_hits, int scalar_st
     std::vector<rb_comp> cn, cs;
     long p1_band = 0, p1_guard = 0;
     long cls_n[128] = {0}, cls_mm[128] = {0};
+    const bool negative_control = rescue_env_opt_in("RB_NEGATIVE_CONTROL");
+    bool injected = false;
     const int B = 2048;
     for (size_t base = 0; base < jobs.size(); base += B) {
         const int m = (int)std::min<size_t>(B, jobs.size() - base);
@@ -490,15 +494,28 @@ static int run_eq(std::vector<Job> &jobs, int minsc, int max_hits, int scalar_st
                 bool vok = sk == RESCUE_PRUNE_B2 && shb == hb && she == he;
                 if (vok) {
                     const rescue_prune_view sv = rescue_prune_scalar_view(*sscratch, len1, len2);
-                    for (const int tau : {minsc, minsc + 5, 30, 50, 80}) {
-                        cn.clear(); cs.clear();
-                        const bool fn = rescue_band_components(view, tau, 0, view.nd, cn, 1 << 20);
-                        const bool fs = rescue_band_components(sv, tau, 0, sv.nd, cs, 1 << 20);
-                        vok = vok && fn && fs && cn.size() == cs.size();
-                        for (size_t c = 0; vok && c < cn.size(); c++)
-                            vok = cn[c].ub == cs[c].ub && cn[c].i0 == cs[c].i0 && cn[c].dlo == cs[c].dlo
-                                  && cn[c].dhi == cs[c].dhi && cn[c].dmaxhit == cs[c].dmaxhit;
-                    }
+                    /* The whole view, then sub-ranges like the ones plan() passes (one component's
+                     * diagonals at a higher threshold): an unaligned start, a start just below a
+                     * 64-diagonal word boundary, a range shorter than a word, and a random one. */
+                    const int nd = view.nd;
+                    const int w0 = std::max(0, (nd / 2 & ~63) - 1 - rnd(3));
+                    const int ra = rnd(nd), rb = ra + 1 + rnd(nd - ra);
+                    const int ranges[5][2] = {{0, nd},
+                                              {std::min(nd - 1, 1 + rnd(7)), nd},
+                                              {w0, std::min(nd, w0 + 70)},
+                                              {ra, std::min(rb, ra + 1 + rnd(63))},
+                                              {ra, rb}};
+                    for (const int tau : {minsc, minsc + 5, 30, 50, 80})
+                        for (const auto &r : ranges) {
+                            if (!vok || r[0] >= r[1]) continue;
+                            cn.clear(); cs.clear();
+                            const bool fn = rescue_band_components(view, tau, r[0], r[1], cn, 1 << 20);
+                            const bool fs = rescue_band_components(sv, tau, r[0], r[1], cs, 1 << 20);
+                            vok = fn && fs && cn.size() == cs.size();
+                            for (size_t c = 0; vok && c < cn.size(); c++)
+                                vok = cn[c].ub == cs[c].ub && cn[c].i0 == cs[c].i0 && cn[c].dlo == cs[c].dlo
+                                      && cn[c].dhi == cs[c].dhi && cn[c].dmaxhit == cs[c].dmaxhit;
+                        }
                 }
                 nview++;
                 if (!vok) {
@@ -543,7 +560,8 @@ static int run_eq(std::vector<Job> &jobs, int minsc, int max_hits, int scalar_st
             npass += pass;
             if (kind[t] == RESCUE_PRUNE_B1) ok = !pass;
             else {
-                const kswr_t &b = P.aln[idx[t]];
+                kswr_t b = P.aln[idx[t]];
+                if (negative_control && !injected && pass && banded[t]) { b.te++; injected = true; }
                 if (!pass) ok = b.score < minsc;
                 else {
                     ok = a.score == b.score && a.te == b.te + off[t] && a.qe == b.qe && a.score2 == b.score2

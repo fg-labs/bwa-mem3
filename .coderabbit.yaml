@@ -120,6 +120,21 @@ reviews:
         must be reflected in docs/src/whats-different/equivalence.md — a
         "perf-only" change that alters any emitted field is a bug, not an
         optimization.
+    - path: "src/{rescue_*,kswv,bwamem_pair}.{cpp,h}"
+      instructions: >-
+        Mate-rescue code. Every rescue shortcut (exact pruning, banding, the
+        11-op kswv cell, the post-rescue dedup skip) is exact by an argument
+        written in its source header and summarized in the developer-guide pages
+        docs/src/developer-guide/rescue.md and its rescue-*.md sub-pages. For
+        each change, ask whether it invalidates one of those arguments or pages:
+        test/regression/rescue_docs_lint.sh catches a renamed symbol, a knob
+        whose default moved, or an exactness claim with no gate, but not an
+        argument that no longer holds, so flag that explicitly. A new
+        BWA3_RESCUE_* knob belongs in the list in src/rescue_env.h (then
+        `make docs-rescue-knobs`) and in the table in
+        docs/src/whats-different/performance.md, and a new shortcut needs an
+        off switch that test/regression/rescue_prune_identity.sh's reference
+        leg sets.
     - path: "src/{simd_compat.h,neon_utils.h,simd_dispatch.cpp,simd_dispatch.h,kernel_dispatch.h}"
       instructions: >-
         This is the SIMD abstraction and tier-dispatch layer. `simd_compat.h` is

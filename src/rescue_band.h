@@ -42,8 +42,9 @@
  * that rectangle ends at (te, qe) (an earlier end row would contradict te being the first row of S
  * in pass 0, an earlier end column in row te the same for qe), so the answer is the start of the
  * score-S alignment A* ending at (te, qe) with the latest start row, then the latest start column.
- * At default scoring (a = 1, b = 4, gap 6 + len) A* with I inserted and D deleted bases and M <=
- * qe + 1 - I matches satisfies S <= qe + 1 - 2I - D - 6 if it has any gap, so D <= Dmax =
+ * At default scoring (a = 1, b = 4, gap 6 + len) A* with M matches, X mismatches, I inserted and
+ * D deleted bases has M + X + I <= qe + 1 (its query span), so if it has any gap
+ * S <= M - 4X - I - D - 6 <= qe + 1 - 2I - D - 6 (dropping -5X <= 0); hence D <= Dmax =
  * max(0, qe - S - 5), I <= Imax = Dmax / 2, and it spans at most qe + 1 + Dmax rows. In reversed
  * coordinates A* starts at (0, 0) and every cell lies on a diagonal r - c in [-Imax, Dmax]. A
  * zero-state DP restricted to that band (cells outside nonexistent: H = E = F = 0) never exceeds
@@ -58,19 +59,10 @@
  *
  * Scope: aarch64 only (the NEON kernel); jobs rescue_prune_applies() prunes (default scoring,
  * 8-bit, non-meth) with minsc in [19, 255] (plan()). x86 keeps the hull path.
- * Env: BWA3_RESCUE_BAND=0 disables banding (hull path, and the prune gate back to 400 hits), for
- * A/B; BWA3_RESCUE_BAND_COST (band iff cost < pct% of the hull, default 85);
- * BWA3_RESCUE_BAND_R2=0 runs round 2 through kswv on the hull instead of banded;
- * BWA3_RESCUE_BAND_TIGHT (delta of the tight top band, default 8, 0 = off);
- * BWA3_RESCUE_BAND_P1 = 0 (pass 1 all kswv), 1 (banded parents only) or 2 (default: every
- * eligible 8-bit default-scoring job); BWA3_RESCUE_BAND_P1_COST (pass-1 band iff its per-row cells
- * < pct% of kswv's, default 130);
- * BWA3_RESCUE_BAND_KERNEL selects the band kernel, all with the same outputs: 0 the original
- * cell, 1 the fused (G-based) cell, 2 (default) the fused cell on two rows per step with the
- * direct qe scan (rb_dp_wave2); BWA3_RESCUE_FSCAN=0 forces 0, as it turns the fused cell off in
- * kswv; BWA3_RESCUE_BAND_SHIFT=0 disables the per-lane band shift that aligns the lanes' query
- * offsets within a 16-lane group (run_jobs);
- * BWA3_RESCUE_PRUNE_STATS=1 prints [RESCUE_BAND] / [RESCUE_PRUNE] counters and stage times. */
+ * Env: the BWA3_RESCUE_BAND* knobs and BWA3_RESCUE_PRUNE_STATS, listed with their defaults in
+ * rescue_env.h.
+ *
+ * Overview and gates: docs/src/developer-guide/rescue-banding.md. */
 #ifndef BWA_MEM3_RESCUE_BAND_H
 #define BWA_MEM3_RESCUE_BAND_H
 
