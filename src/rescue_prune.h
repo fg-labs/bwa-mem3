@@ -150,6 +150,9 @@ static inline int rescue_prune_window_scalar(const uint8_t *ref, int len1, const
  * which is all the scalar planner reads. */
 struct rescue_prune_view {
     int nd = -1, off = 0;
+    /* The NEON filter answered this call from its repeat memo: the window bytes, the mate bytes,
+     * the lengths and the hit gate equal the previous filter call's on this thread. */
+    bool repeat = false;
     const uint16_t *cnt = nullptr;
     const int16_t *minrow = nullptr;
     const int16_t *bnd16 = nullptr;
@@ -218,7 +221,9 @@ static inline int rescue_prune_window(const uint8_t *ref, int len1, const uint8_
         rescue_prune_neon::NeonScratch &ns = rescue_prune_neon_scratch();
         const rescue_prune_neon::Job jb{len1, len2, 0, 0, -1, -1, ref, q};
         int h, e;
+        const uint64_t hits0 = ns.memo_hits;
         const rescue_prune_neon::Kind k = rescue_prune_neon::lean_neon(jb, ns, h, e, max_hits);
+        if (view) view->repeat = ns.memo_hits != hits0;
         if (k == rescue_prune_neon::B1) return RESCUE_PRUNE_B1;
         if (k == rescue_prune_neon::FULL) return RESCUE_PRUNE_FULL;
         if (k == rescue_prune_neon::B2) {

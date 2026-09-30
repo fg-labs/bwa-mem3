@@ -353,17 +353,19 @@ static bool rescue_prune_on()
 }
 /* BWA3_RESCUE_PRUNE_STATS=1 prints the rescue shortcuts' counters to stderr at exit as one line,
  * "[RESCUE_PRUNE] jobs=.. full=.. b1=.. b2=.. rows_in=.. rows_kept=.. jobs16=.. memo_hits=..
- * <stage times> dedup_run=.. dedup_skip=.. dedup_run_regs=.. dedup_skip_regs=.. dedup_insert1=..
- * dedup_insert1_fast=.. dedup_s=..". The first fields are the filter's: jobs filtered, and of them
- * how many kept the full window, were proven to fail (b1, not enqueued) or were narrowed to a hull
- * (b2), with the reference rows before and after, and the calls the NEON filter answered from its
- * repeat memo. They are the non-vacuity check for the identity A/B: identical output must come
- * with a nonzero number of pruned rows. jobs16 counts the 16-bit rescue jobs, which the filter
- * never sees: the same check for the 16-bit kswv kernels. The dedup_* fields are the post-rescue
- * dedup's (below), which runs on every architecture, so off aarch64 they and jobs16 are the line's
- * only nonzero counters. */
+ * reused=.. <stage times> dedup_run=.. dedup_skip=.. dedup_run_regs=.. dedup_skip_regs=..
+ * dedup_insert1=.. dedup_insert1_fast=.. dedup_s=..". The first fields are the filter's: jobs
+ * filtered, and of them how many kept the full window, were proven to fail (b1, not enqueued) or
+ * were narrowed to a hull (b2), with the reference rows before and after, the calls the NEON
+ * filter answered from its repeat memo, and of those the jobs answered from an identical earlier
+ * job's result instead of being enqueued (reused, BWA3_RESCUE_REPEAT). They are the non-vacuity
+ * check for the identity A/B: identical output must come with a nonzero number of pruned rows.
+ * jobs16 counts the 16-bit rescue jobs, which the filter never sees: the same check for the 16-bit
+ * kswv kernels. The dedup_* fields are the post-rescue dedup's (below), which runs on every
+ * architecture, so off aarch64 they and jobs16 are the line's only nonzero counters. */
 struct rescue_prune_stats_t {
-    std::atomic<uint64_t> jobs{0}, full{0}, b1{0}, b2{0}, rows_in{0}, rows_kept{0}, jobs16{0}, memo_hits{0};
+    std::atomic<uint64_t> jobs{0}, full{0}, b1{0}, b2{0}, rows_in{0}, rows_kept{0}, jobs16{0}, memo_hits{0},
+        reused{0};
     /* Thread-summed wall time of the rescue stages (ns): filter + band planning in _pre, kswv
      * pass 0 (8-bit + 16-bit), the banded pass 0, kswv pass 1 and the banded pass 1. Only measured
      * when stats are on. */
@@ -375,12 +377,13 @@ struct rescue_prune_stats_t {
     bool on = rescue_env_opt_in("BWA3_RESCUE_PRUNE_STATS");
     ~rescue_prune_stats_t() {
         if (on) fprintf(stderr, "[RESCUE_PRUNE] jobs=%llu full=%llu b1=%llu b2=%llu rows_in=%llu rows_kept=%llu "
-                        "jobs16=%llu memo_hits=%llu filter_s=%.3f kswv_pass0_s=%.3f band_pass0_s=%.3f "
+                        "jobs16=%llu memo_hits=%llu reused=%llu filter_s=%.3f kswv_pass0_s=%.3f band_pass0_s=%.3f "
                         "kswv_pass1_s=%.3f band_pass1_s=%.3f dedup_run=%llu dedup_skip=%llu dedup_run_regs=%llu "
                         "dedup_skip_regs=%llu dedup_insert1=%llu dedup_insert1_fast=%llu dedup_s=%.3f\n",
                         (unsigned long long)jobs, (unsigned long long)full, (unsigned long long)b1,
                         (unsigned long long)b2, (unsigned long long)rows_in, (unsigned long long)rows_kept,
-                        (unsigned long long)jobs16, (unsigned long long)memo_hits, ns_filter * 1e-9, ns_k0 * 1e-9, ns_band * 1e-9,
+                        (unsigned long long)jobs16, (unsigned long long)memo_hits, (unsigned long long)reused,
+                        ns_filter * 1e-9, ns_k0 * 1e-9, ns_band * 1e-9,
                         ns_k1 * 1e-9, ns_b1 * 1e-9, (unsigned long long)dedup_run,
                         (unsigned long long)dedup_skip, (unsigned long long)dedup_run_regs,
                         (unsigned long long)dedup_skip_regs, (unsigned long long)dedup_insert1,
@@ -398,6 +401,14 @@ static rescue_prune_stats_t g_rescue_prune_stats;
 static bool rescue_dedup_skip_enabled()
 {
     static const bool on = rescue_env_on("BWA3_RESCUE_DEDUP_SKIP");
+    return on;
+}
+/* Answer a rescue job that repeats the previous filtered job byte for byte from that job's result
+ * instead of enqueueing it (see mem_matesw_batch_pre). Default ON; BWA3_RESCUE_REPEAT=0 enqueues
+ * every job, which is how the byte-identity A/B is run. */
+static bool rescue_repeat_enabled()
+{
+    static const bool on = rescue_env_on("BWA3_RESCUE_REPEAT");
     return on;
 }
 
@@ -1783,31 +1794,62 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
             const bool pruned = rescue_prune_applies(opt, xtra);
             if (g_rescue_prune_stats.on && !(xtra & KSW_XBYTE)) g_rescue_prune_stats.jobs16++;
             static thread_local std::vector<uint8_t> oq;   // oriented mate; grows, never shrinks
+            /* regid of the last filtered job this thread enqueued (-1: none, or it was proven to
+             * fail). The filter's repeat memo remembers that job's inputs; see the reuse below. */
+            static thread_local int32_t repeat_regid = -1;
             if (pruned) {
                 if ((int)oq.size() < l_ms) oq.resize(l_ms);
                 matesw_orient(ms, l_ms, is_rev, oq.data());
                 int hb, he;
                 rescue_prune_view view;
                 const uint64_t tf0 = g_rescue_prune_stats.on ? rescue_now_ns() : 0;
-                const uint64_t mh0 = g_rescue_prune_stats.on ? rescue_prune_memo_hits() : 0;
                 const int kind = rescue_prune_window(ref, (int)(re - rb), oq.data(), l_ms,
                                                      opt->min_seed_len * opt->a,
                                                      rescue_prune_max_hits(opt->min_seed_len * opt->a), &hb, &he,
                                                      &view);
+                /* A job repeating the previous filtered one byte for byte (the same mate against
+                 * an identical window, which anchors in identical repeat copies produce) has that
+                 * job's kswv result: the kernel is a function of the staged bytes, the lengths and
+                 * h0 alone. The filter's memo says the full inputs repeat; the staged pair at
+                 * repeat_regid is then compared with this job's inputs, so the reuse is exact by
+                 * that comparison whatever the memo's history (a new batch, a job never enqueued).
+                 * _post reads a result by regid and adds the hull offset recorded for it, which
+                 * equals this job's, so the reused regid answers this orientation exactly as its
+                 * own would have. Decided before the banding plan, which commit() binds to the
+                 * next enqueued pair. */
+                int32_t reuse = -1;
+                if (view.repeat && kind != RESCUE_PRUNE_B1 && rescue_repeat_enabled()
+                    && repeat_regid >= 0 && repeat_regid < pcnt) {
+                    const SeqPair &pj = seqPairArray[repeat_regid];
+                    const int ob = kind == RESCUE_PRUNE_B2 ? hb : 0;
+                    const int l1 = kind == RESCUE_PRUNE_B2 ? he - hb + 1 : (int)(re - rb);
+                    const int8_t hyp = opt->meth_mode ? (int8_t)((mate_meth_ot ^ is_rev) & 1) : (int8_t)-1;
+                    if (pj.regid == repeat_regid && pj.h0 == xtra && pj.len1 == l1 && pj.len2 == l_ms
+                        && pj.meth_hyp == hyp && mmc->rescue_narrow_off[tid][repeat_regid] == ob
+                        && memcmp(seqBufRef + pj.idr, ref + ob, (size_t)l1) == 0
+                        && memcmp(seqBufQer + pj.idq, oq.data(), (size_t)l_ms) == 0)
+                        reuse = repeat_regid;
+                }
                 /* Banding plan (rescue_band.h), bound to this pair's regid at enqueue (commit).
                  * rescue_prune_applies() has checked the scoring the band kernel is derived for. */
-                if (kind == RESCUE_PRUNE_B2 && rescue_band_enabled())
+                if (kind == RESCUE_PRUNE_B2 && reuse < 0 && rescue_band_enabled())
                     matesw_band(mmc, tid).plan(view, (int)(re - rb), l_ms, hb, he, opt->min_seed_len * opt->a);
                 if (g_rescue_prune_stats.on) g_rescue_prune_stats.ns_filter += rescue_now_ns() - tf0;
                 if (g_rescue_prune_stats.on) {
                     g_rescue_prune_stats.jobs++;
-                    g_rescue_prune_stats.memo_hits += rescue_prune_memo_hits() - mh0;
+                    g_rescue_prune_stats.memo_hits += view.repeat;
+                    g_rescue_prune_stats.reused += reuse >= 0;
                     g_rescue_prune_stats.rows_in += re - rb;
                     (kind == RESCUE_PRUNE_B1 ? g_rescue_prune_stats.b1 : kind == RESCUE_PRUNE_B2 ? g_rescue_prune_stats.b2 : g_rescue_prune_stats.full)++;
                     g_rescue_prune_stats.rows_kept += kind == RESCUE_PRUNE_B1 ? 0 : kind == RESCUE_PRUNE_B2 ? he - hb + 1 : re - rb;
                 }
                 if (kind == RESCUE_PRUNE_B1) {
                     gar[gcnt + r] = MATESW_GAR_PROVEN_FAIL;
+                    repeat_regid = -1;
+                    continue;
+                }
+                if (reuse >= 0) {
+                    gar[gcnt + r] = reuse;
                     continue;
                 }
                 if (kind == RESCUE_PRUNE_B2) {
@@ -1967,6 +2009,7 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
 
                 /* gar[gcnt+r] points at this rescue's single enqueued regid. */
                 if (hi == 0) gar[gcnt + r] = pcnt;
+                if (pruned) repeat_regid = pcnt;
                 sp.regid = pcnt;
                 if (opt->rescue_kmer || rescue_prune_runs(opt)) {   /* record narrow offset by regid for _post */
                     *matesw_narrow_slot(mmc, tid, pcnt) = narrow_ob;

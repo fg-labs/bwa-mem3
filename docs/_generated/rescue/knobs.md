@@ -7,6 +7,7 @@
 | `BWA3_RESCUE_PRUNE_MAX_HITS` | `auto` | `src/bwamem_pair.cpp` | keep the full window above this many 5-mer hits; auto is 1000 where banding runs at the NEON filter's threshold, else 400 |
 | `BWA3_RESCUE_PRUNE_STATS` | `0` | `src/bwamem_pair.cpp`, `src/rescue_band.cpp` | 1 prints the RESCUE_PRUNE and RESCUE_BAND counters and stage times at exit |
 | `BWA3_RESCUE_DEDUP_SKIP` | `1` | `src/bwamem_pair.cpp` | skip a post-rescue dedup proven to be a no-op, and add a single new region in one pass where that is provably exact |
+| `BWA3_RESCUE_REPEAT` | `1` | `src/bwamem_pair.cpp` | a rescue job repeating the previous filtered job byte for byte reads that job's result instead of being enqueued again |
 | `BWA3_RESCUE_FSCAN` | `1` | `src/kswv.cpp`, `src/rescue_band.cpp` | the 11-op kswv rescue cell in every SIMD body; 0 also selects the banded DP's original cell |
 | `BWA3_RESCUE_USQADD` | `1` | `src/kswv.cpp` | NEON u8 kswv: one saturating add per cell instead of the biased add / subtract pair |
 | `BWA3_RESCUE_ROWPAIR` | `1` | `src/kswv.cpp` | NEON kswv (8- and 16-bit): sweep two target rows per pass |

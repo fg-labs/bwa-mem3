@@ -99,6 +99,11 @@ for at, phase in ((30000, 50), (45000, 25)):
     for i in range(phase, DUP_LEN, 100):
         dup[i] = {'A': 'C', 'C': 'G', 'G': 'T', 'T': 'A'}[dup[i]]
     ref = ref[:at] + ''.join(dup) + ref[at+DUP_LEN:]
+# An exact repeat: DUP_LEN bases at DUP_B copied unchanged to two more places, so an
+# anchor inside it rescues the same mate against three byte-identical windows.
+DUP_B = 20000
+for at in (38000, 52000):
+    ref = ref[:at] + ref[DUP_B:DUP_B+DUP_LEN] + ref[at+DUP_LEN:]
 with open('ref.fa', 'w') as f:
     f.write('>chrA\n')
     for i in range(0, L, 80):
@@ -160,6 +165,19 @@ for k in range(60):
         i += rnd.randint(14, 17)
     pair('d%d' % k, anchor, ''.join(mate))
 
+# Anchors in the exact repeat, mates made unseedable as for kind 0 and inside the
+# repeat: the second and third copies' rescues repeat the first byte for byte, so the
+# filter answers them from its memo and _pre from the first copy's result.
+for k in range(30):
+    p = DUP_B + rnd.randint(0, DUP_LEN - INS)
+    anchor = ref[p:p+RL]
+    mate = list(ref[p+INS-RL:p+INS])
+    i = rnd.randint(3, 10)
+    while i < RL:
+        mate[i] = mism(mate[i])
+        i += rnd.randint(14, 17)
+    pair('e%d' % k, anchor, ''.join(mate))
+
 # 300 bp mates, made unseedable as for kind 0: a mate this long (times the match
 # score, plus the kernel's shift) no longer fits a byte, so its rescue runs through
 # the 16-bit kswv kernels.
@@ -190,8 +208,8 @@ run_leg() { # $1 = threads, $2 = output stem, rest = env assignments
 
 # The reference: every shortcut and alternative kernel form off. Defined once so
 # the unforced and forced-tier references cannot drift apart.
-REF_ENV=(BWA3_RESCUE_PRUNE=0 BWA3_RESCUE_BAND=0 BWA3_RESCUE_DEDUP_SKIP=0 BWA3_RESCUE_FSCAN=0
-    BWA3_RESCUE_USQADD=0 BWA3_RESCUE_ROWPAIR=0 BWA3_RESCUE_LAZYQE=0)
+REF_ENV=(BWA3_RESCUE_PRUNE=0 BWA3_RESCUE_BAND=0 BWA3_RESCUE_DEDUP_SKIP=0 BWA3_RESCUE_REPEAT=0
+    BWA3_RESCUE_FSCAN=0 BWA3_RESCUE_USQADD=0 BWA3_RESCUE_ROWPAIR=0 BWA3_RESCUE_LAZYQE=0)
 
 LEGS="dedup hull prune band"
 for t in 1 4; do
@@ -288,6 +306,10 @@ fi
 [ "$b1" -gt 0 ] || fail "no proven-failure (B1) rescue in the fixture: $stats"
 [ "$b2" -gt 0 ] || fail "no narrowed (B2) rescue in the fixture: $stats"
 [ "$rows_kept" -lt "$rows_in" ] || fail "pruning kept every row: $stats"
+# The anchors present three times rescue the same mate against identical windows: the repeats
+# after the first must be answered from its result (BWA3_RESCUE_REPEAT), or that path went untested.
+reused=$(field reused)
+[ "${reused:-0}" -gt 0 ] || fail "no rescue job was answered from an identical earlier job's result: $stats"
 
 bstats="$(grep '^\[RESCUE_BAND\]' band.t1.err || true)"
 [ -n "$bstats" ] || fail "BWA3_RESCUE_PRUNE_STATS=1 printed no [RESCUE_BAND] line"

@@ -139,6 +139,7 @@ void run_one(const uint8_t *ref, int len1, const uint8_t *q, int len2, int max_h
                        "," + std::to_string(e0) + ")";
         if (ok && neon) ok = check_view(len1, len2, view[rep], r, why);
         if (ok && rep == 1 && !same_view(view[0], view[1])) { ok = false; why = "repeat view differs"; }
+        if (ok && view[rep].repeat != hit) { ok = false; why = "view.repeat disagrees with the memo counter"; }
         /* The memo may answer only a byte-for-byte repeat of the previous call that reached the
          * NEON filter (the wrapper's guards return before it, leaving its memo alone). */
         static std::vector<uint8_t> last_ref, last_q;

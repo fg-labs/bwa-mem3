@@ -479,6 +479,10 @@ TEST_CASE("rescue prune: the NEON filter's repeat memo and component list match 
         CHECK(rkind == kind);
         CHECK(rhb == hb);
         CHECK(rhe == he);
+        // The view reports the repeat (a caller reuses the job's result on it) and only the repeat;
+        // a job the NEON filter handed to the scalar one (past its int16 range) has no memo.
+        if (v.bnd16) CHECK(rv.repeat);
+        CHECK(!v.repeat);
         if (kind != RESCUE_PRUNE_B2 || !v.bnd16) continue;
         ++n_b2;
         REQUIRE(v.ncomp >= 0);
