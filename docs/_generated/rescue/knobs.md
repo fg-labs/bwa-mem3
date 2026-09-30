@@ -4,7 +4,8 @@
 | Variable | Default | Read in | Meaning |
 |---|---|---|---|
 | `BWA3_RESCUE_PRUNE` | `1` | `src/bwamem_pair.cpp` | exact K-mer pruning of rescue windows (aarch64 and x86 AVX2 / AVX-512BW builds; scope: rescue-pruning.md); 0 also turns the banded passes off |
-| `BWA3_RESCUE_PRUNE_MAX_HITS` | `auto` | `src/bwamem_pair.cpp` | keep the full window above this many 5-mer hits; auto is 1000 on aarch64 with banding on and no --meth, else 400 |
+| `BWA3_RESCUE_PRUNE_MAX_HITS` | `auto` | `src/bwamem_pair.cpp` | keep the full window above this many 5-mer hits; auto is 1000 on aarch64 with banding on, unless a --meth run leaves its pruned windows unbanded (EM-seq by default); else 400 |
+| `BWA3_RESCUE_PRUNE_REL` | `1` | `src/bwamem_pair.cpp` | --meth genomic / neutral scoring, aarch64 (x86 --meth is not pruned): 1 filter TAPS under the exact relation (EM-seq and collapsed scoring match converted copies), 0 converted copies only (TAPS not pruned), 2 or more the relation for every genomic / neutral run |
 | `BWA3_RESCUE_PRUNE_STATS` | `0` | `src/bwamem_pair.cpp`, `src/rescue_band.cpp` | 1 prints the RESCUE_PRUNE and RESCUE_BAND counters and stage times at exit (counted per thread: no shared-counter contention in an instrumented run) |
 | `BWA3_RESCUE_DEDUP_SKIP` | `1` | `src/bwamem_pair.cpp` | skip a post-rescue dedup proven to be a no-op, and add a single new region in one pass where that is provably exact |
 | `BWA3_RESCUE_REPEAT` | `1` | `src/bwamem_pair.cpp` | a rescue job repeating one of the last eight filtered jobs byte for byte reads that job's result instead of being enqueued again |
@@ -20,3 +21,4 @@
 | `BWA3_RESCUE_BAND_P1_COST` | `130` | `src/rescue_band.cpp` | band a pass-1 job iff its per-row cells cost less than this % of kswv's |
 | `BWA3_RESCUE_BAND_KERNEL` | `2` | `src/rescue_band.cpp` | banded-DP kernel while BWA3_RESCUE_FSCAN is on: 0 original cell, 1 fused cell, 2 fused cell on two rows per step |
 | `BWA3_RESCUE_BAND_SHIFT` | `1` | `src/rescue_band.cpp` | shift each lane's band so a lane group's query offsets align |
+| `BWA3_RESCUE_BAND_METH` | `1` | `src/bwamem_pair.cpp` | --meth banding (both passes, the group's matrix): 1 except on top of converted-copy pruning (EM-seq), 0 never, 2 or more always |

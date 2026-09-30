@@ -414,9 +414,7 @@ TEST_CASE("rescue prune: --meth decisions reproduce ksw_align2 with the meth mat
         const std::string name(names[kind]);
         CAPTURE(name); CAPTURE(hyp);
         Job jb = jobs[i];
-        const uint8_t from = hyp ? 1 : 2, to = hyp ? 3 : 0;
-        for (uint8_t &b : jb.q)
-            if (b == from && (rng() & 1)) b = to;
+        rescue_convert_mate(jb.q, hyp, 2, rng);
         rescue_prune_params p = rescue_prune_params::defaults(kSimdMinsc);
         p.set_meth(hyp);
         Oracle o(jb, p, mats[(size_t)(kind * 2 + hyp)]);
@@ -429,6 +427,70 @@ TEST_CASE("rescue prune: --meth decisions reproduce ksw_align2 with the meth mat
         CHECK(t[k].b1 > 0);
         CHECK(t[k].b2 > 0);
     }
+}
+
+// The --meth relation (set_meth_rel): a read T relates to a reference T or C (OT), a read A to a
+// reference A or G (OB), every other pair only to itself -- the exact match cells of the genomic
+// matrix and a superset of the neutral one's. Mates mostly unconverted (a TAPS-like 5 % conversion),
+// where converted copies would relate nearly everything.
+TEST_CASE("rescue prune: --meth relation decisions reproduce ksw_align2 with the genomic and neutral matrices"
+          * doctest::test_suite("unit/pair")) {
+    std::mt19937 rng(7117);
+    const auto jobs = build_jobs(rng);
+    const char *names[2] = {"genomic", "neutral"};
+    std::vector<bwa_tests::ScoringMatrix> mats;
+    const int scorings[2] = {MEM_METH_SCORING_GENOMIC, MEM_METH_SCORING_NEUTRAL};
+    for (int kind = 0; kind < 2; kind++)
+        for (int hyp = 0; hyp < 2; hyp++)   // hyp 1 = OT: ref C / read T; 0 = OB: ref G / read A
+            mats.push_back(bwa_tests::meth_scoring_matrix(scorings[kind], hyp == 1, 1, 4));
+    Tally t[2];
+    for (size_t i = 0; i < jobs.size(); i++) {
+        const int kind = (int)(i % 2), hyp = (int)((i / 2) % 2);
+        const std::string name(names[kind]);
+        CAPTURE(name); CAPTURE(hyp);
+        Job jb = jobs[i];
+        rescue_convert_mate(jb.q, hyp, 20, rng);
+        rescue_prune_params p = rescue_prune_params::defaults(kSimdMinsc);
+        p.set_meth_rel(hyp);
+        Oracle o(jb, p, mats[(size_t)(kind * 2 + hyp)]);
+        check_against_oracle(kNoGate, o, t[kind]);
+    }
+    for (int k = 0; k < 2; k++) {
+        const std::string name(names[k]);
+        CAPTURE(name);
+        MESSAGE("--meth relation " << name << ": B1=" << t[k].b1 << " B2=" << t[k].b2 << " FULL=" << t[k].full);
+        CHECK(t[k].b1 > 0);
+        CHECK(t[k].b2 > 0);
+    }
+}
+
+// The relation is exact only for a matrix that frees the single conversion cell: rescue_meth_rel
+// checks the run's own matrices (rescue_meth_rel_matrix_ok) rather than --meth-scoring. The
+// production matrices (mem_opt_fill_meth_mat, through meth_scoring_matrix): genomic and neutral pass
+// under both hypotheses, at -B 4 and -B 6; collapsed, which frees the mirror cell too, fails even at
+// -B 4, where the lemma admits it; a matrix checked against the other hypothesis fails; and so does
+// any other cell raised above -b.
+TEST_CASE("rescue prune: the relation admits the genomic and neutral matrices, not collapsed"
+          * doctest::test_suite("unit/pair")) {
+    for (const int b : {4, 6})
+        for (const int hyp : {0, 1}) {
+            CAPTURE(b); CAPTURE(hyp);
+            const auto gen = bwa_tests::meth_scoring_matrix(MEM_METH_SCORING_GENOMIC, hyp == 1, 1, b);
+            const auto neu = bwa_tests::meth_scoring_matrix(MEM_METH_SCORING_NEUTRAL, hyp == 1, 1, b);
+            const auto col = bwa_tests::meth_scoring_matrix(MEM_METH_SCORING_COLLAPSED, hyp == 1, 1, b);
+            CHECK(rescue_meth_rel_matrix_ok(gen.data(), hyp, 1, b));
+            CHECK(rescue_meth_rel_matrix_ok(neu.data(), hyp, 1, b));
+            CHECK(!rescue_meth_rel_matrix_ok(col.data(), hyp, 1, b));
+            CHECK(!rescue_meth_rel_matrix_ok(gen.data(), !hyp, 1, b));
+            for (int r = 0; r < 4; r++)
+                for (int q = 0; q < 4; q++) {
+                    if (r == q || gen[(size_t)(r * 5 + q)] != -b) continue;
+                    auto m = gen;
+                    m[(size_t)(r * 5 + q)] = (int8_t)(-b + 1);
+                    CAPTURE(r); CAPTURE(q);
+                    CHECK(!rescue_meth_rel_matrix_ok(m.data(), hyp, 1, b));
+                }
+        }
 }
 
 TEST_CASE("rescue prune: N, a threshold below 5 and oversized inputs keep the full window"
@@ -557,9 +619,7 @@ TEST_CASE("rescue prune: the SIMD filter decides exactly as the scalar filter un
     for (size_t i = 0; i < jobs.size(); i++) {
         Job jb = jobs[i];
         const int hyp = (int)(i & 1);
-        const uint8_t from = hyp ? 1 : 2, to = hyp ? 3 : 0;
-        for (uint8_t &b : jb.q)
-            if (b == from && rng() % 20 == 0) b = to;
+        rescue_convert_mate(jb.q, hyp, 20, rng);
         const int mh = i % 3 ? kDefaultMaxHits : kNoGate;
         check(jb, hyp, mh);
         check(jb, !hyp, mh);
@@ -748,7 +808,8 @@ TEST_CASE("rescue band: the pass-0 cost gate's default follows the kswv tier"
 
 // The run-level cost gate (rescue_prune_cost_ok): every outcome gives the same output, so no identity
 // check can see a wrong one; pinned here per architecture. aarch64 prunes everywhere but --meth with
-// chemistry other than EM-seq (TAPS); x86 never under --meth, only where the SIMD filter takes the
+// chemistry other than EM-seq (TAPS) on converted copies, which prunes under the relation; x86 never
+// under --meth, relation or not, only where the SIMD filter takes the
 // weights (K = 5, a <= 16), and not at the AVX-512BW tier from seed length 25 (minsc >= 25 a), so
 // -A 2 at the default -k 19 (minsc 38) still prunes there and -A 2 -k 25 (minsc 50) does not.
 TEST_CASE("rescue prune: the cost gate per architecture, --meth chemistry and kswv tier"
@@ -764,18 +825,19 @@ TEST_CASE("rescue prune: the cost gate per architecture, --meth chemistry and ks
     REQUIRE(!a17.simd_ok());
     REQUIRE(a2.simd_ok());
     REQUIRE(a2k25.simd_ok());
+    // meth_fits: the run's --meth filter fits its reads (EM-seq on converted copies, or the relation).
     for (const bool avx512 : {false, true}) {
         CAPTURE(avx512);
 #if defined(__aarch64__)
         CHECK(rescue_prune_cost_ok(dflt, false, false, avx512));
-        CHECK(rescue_prune_cost_ok(dflt, true, true, avx512));    // --meth, EM-seq
-        CHECK(!rescue_prune_cost_ok(dflt, true, false, avx512));  // --meth=taps
+        CHECK(rescue_prune_cost_ok(dflt, true, true, avx512));    // --meth: EM-seq, or TAPS under the relation
+        CHECK(!rescue_prune_cost_ok(dflt, true, false, avx512));  // --meth=taps on converted copies
         CHECK(rescue_prune_cost_ok(k25, false, false, avx512));
         CHECK(rescue_prune_cost_ok(a17, false, false, avx512));   // the scalar filter pays here
         CHECK(rescue_prune_cost_ok(a2k25, false, false, avx512));
 #else
         CHECK(rescue_prune_cost_ok(dflt, false, false, avx512));
-        CHECK(!rescue_prune_cost_ok(dflt, true, true, avx512));   // no --meth pruning on x86
+        CHECK(!rescue_prune_cost_ok(dflt, true, true, avx512));   // no --meth pruning on x86, fitting or not
         CHECK(!rescue_prune_cost_ok(dflt, true, false, avx512));
         CHECK(rescue_prune_cost_ok(k25, false, false, avx512) == !avx512);
         CHECK(rescue_prune_cost_ok(rescue_prune_params::defaults(24), false, false, avx512));
@@ -788,7 +850,8 @@ TEST_CASE("rescue prune: the cost gate per architecture, --meth chemistry and ks
 
 // The default hit gate (rescue_prune_max_hits_default): like the cost gate, every value gives the
 // same output, so it is pinned here. aarch64 takes 1000 only where banding can turn the pruned
-// windows into savings (banding on, no --meth); everything else, and all of x86, takes 400.
+// windows into savings (banding on, and not a --meth run that leaves its pruned windows unbanded);
+// everything else, and all of x86, takes 400.
 TEST_CASE("rescue prune: the default hit gate per architecture, banding and --meth"
           * doctest::test_suite("unit/pair")) {
     for (const bool banding : {false, true})

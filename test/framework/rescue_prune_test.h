@@ -6,11 +6,24 @@
 
 #include "rescue_prune.h"
 
+#include <cstdint>
+#include <vector>
+
 /* Whether p is the default scoring (-A 1 -B 4 -O 6 -E 1) without a --meth conversion or relation. */
 static inline bool rescue_prune_is_default_scoring(const rescue_prune_params &p)
 {
     return p.conv_from < 0 && p.relx < 0 && p.a == 1 && p.b == 4 && p.o_del == 6 && p.e_del == 1 && p.o_ins == 6
            && p.e_ins == 1;
+}
+
+/* Bisulfite-convert a mate for --meth hypothesis hyp (1 OT: C -> T; 0 OB: G -> A, as set_meth /
+ * set_meth_rel pair them), each convertible base with probability 1 / inv_rate. */
+template <class Rng>
+static inline void rescue_convert_mate(std::vector<uint8_t> &q, int hyp, unsigned inv_rate, Rng &rng)
+{
+    const uint8_t from = hyp ? 1 : 2, to = hyp ? 3 : 0;
+    for (uint8_t &b : q)
+        if (b == from && rng() % inv_rate == 0) b = to;
 }
 
 /* rescue_prune_window / rescue_prune_window_scalar at the default scoring and threshold minsc. */

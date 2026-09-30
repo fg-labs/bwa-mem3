@@ -23,7 +23,13 @@
  *                                   AVX-512BW builds; scope: rescue-pruning.md); 0 also turns
  *                                   the banded passes off
  * BWA3_RESCUE_PRUNE_MAX_HITS  auto  keep the full window above this many 5-mer hits; auto is 1000
- *                                   on aarch64 with banding on and no --meth, else 400
+ *                                   on aarch64 with banding on, unless a --meth run leaves its
+ *                                   pruned windows unbanded (EM-seq by default); else 400
+ * BWA3_RESCUE_PRUNE_REL       1     --meth genomic / neutral scoring, aarch64 (x86 --meth is not
+ *                                   pruned): 1 filter TAPS under the exact relation (EM-seq and
+ *                                   collapsed scoring match converted copies), 0 converted copies
+ *                                   only (TAPS not pruned), 2 or more the relation for every
+ *                                   genomic / neutral run
  * BWA3_RESCUE_PRUNE_STATS     0     1 prints the RESCUE_PRUNE and RESCUE_BAND counters and stage
  *                                   times at exit (counted per thread: no shared-counter
  *                                   contention in an instrumented run)
@@ -53,6 +59,8 @@
  * BWA3_RESCUE_BAND_KERNEL     2     banded-DP kernel while BWA3_RESCUE_FSCAN is on: 0 original
  *                                   cell, 1 fused cell, 2 fused cell on two rows per step
  * BWA3_RESCUE_BAND_SHIFT      1     shift each lane's band so a lane group's query offsets align
+ * BWA3_RESCUE_BAND_METH       1     --meth banding (both passes, the group's matrix): 1 except on top
+ *                                   of converted-copy pruning (EM-seq), 0 never, 2 or more always
  * rescue-knobs:end */
 #ifndef BWA_MEM3_RESCUE_ENV_H
 #define BWA_MEM3_RESCUE_ENV_H

@@ -980,9 +980,13 @@ jobs:
       # kernels, pruned but never banded as in production, with mates up to
       # 1024 bp: at the default scoring, and with the hit gate opened (x86's
       # default gate of 400 sends most mates over 250 bp to the full window) at a
-      # random scoring per batch and at random --meth matrices. The trailing
+      # random scoring per batch and at random --meth matrices. Runs 20-21
+      # (RB_METH_REL=expand) filter the genomic and neutral --meth batches under
+      # the exact relation (TAPS, where production bands pass 0 on top of
+      # pruning), with TAPS-like low conversion rates: at random matrices, and
+      # on the 16-bit kernels. The trailing
       # argument is the job generator's seed. Run 1 is 100000 jobs, runs 2-11
-      # 30000, runs 12-16 10000, run 17 30000 and runs 18-19 10000.
+      # 30000, runs 12-16 10000, run 17 30000 and runs 18-21 10000.
       # On x86 the kswv reference runs at the runner's tier,
       # which the harness prints ("kswv tier:"). Longer runs and real dumps are
       # manual. As above, a negative control (one banded job's te shifted) must
@@ -1018,6 +1022,8 @@ jobs:
           RB_16BIT=1 ./rescue_band_harness eq 30000 17
           RB_16BIT=1 BWA3_RESCUE_PRUNE_MAX_HITS=100000 RB_SCORING=random ./rescue_band_harness eq 10000 18
           RB_16BIT=1 BWA3_RESCUE_PRUNE_MAX_HITS=100000 RB_METH=random ./rescue_band_harness eq 10000 19
+          BWA3_RESCUE_BAND_COST=100000000 RB_METH=random RB_METH_REL=expand ./rescue_band_harness eq 10000 20
+          RB_16BIT=1 BWA3_RESCUE_PRUNE_MAX_HITS=100000 RB_METH=random RB_METH_REL=expand ./rescue_band_harness eq 10000 21
 
       - name: Flat chaining index matches the kbtree replay (chr22)
         if: matrix.canonical == true
