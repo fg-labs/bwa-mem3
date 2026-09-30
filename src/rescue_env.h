@@ -27,8 +27,8 @@
  *                                   times at exit
  * BWA3_RESCUE_DEDUP_SKIP      1     skip a post-rescue dedup proven to be a no-op, and add a
  *                                   single new region in one pass where that is provably exact
- * BWA3_RESCUE_REPEAT          1     a rescue job repeating the previous filtered job byte for byte
- *                                   reads that job's result instead of being enqueued again
+ * BWA3_RESCUE_REPEAT          1     a rescue job repeating one of the last eight filtered jobs byte
+ *                                   for byte reads that job's result instead of being enqueued again
  * BWA3_RESCUE_FSCAN           1     the 11-op kswv rescue cell in every SIMD body; 0 also selects
  *                                   the banded DP's original cell
  * BWA3_RESCUE_USQADD          1     NEON u8 kswv: one saturating add per cell instead of the

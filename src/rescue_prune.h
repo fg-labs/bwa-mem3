@@ -153,6 +153,11 @@ struct rescue_prune_view {
     /* The NEON filter answered this call from its repeat memo: the window bytes, the mate bytes,
      * the lengths and the hit gate equal the previous filter call's on this thread. */
     bool repeat = false;
+    /* keyed: the NEON filter decided, and key summarizes its inputs (window, mate, lengths, hit
+     * gate). Equal inputs have equal keys; a caller finding an earlier job with this key compares
+     * the bytes before treating it as the same job (rescue_prune_neon.h whash / qhash). */
+    bool keyed = false;
+    uint64_t key = 0;
     const uint16_t *cnt = nullptr;
     const int16_t *minrow = nullptr;
     const int16_t *bnd16 = nullptr;
@@ -223,7 +228,11 @@ static inline int rescue_prune_window(const uint8_t *ref, int len1, const uint8_
         int h, e;
         const uint64_t hits0 = ns.memo_hits;
         const rescue_prune_neon::Kind k = rescue_prune_neon::lean_neon(jb, ns, h, e, max_hits);
-        if (view) view->repeat = ns.memo_hits != hits0;
+        if (view) {
+            view->repeat = ns.memo_hits != hits0;
+            view->keyed = k != rescue_prune_neon::FALLBACK;
+            view->key = (ns.whash ^ (ns.qhash * 0x9E3779B97F4A7C15ULL)) + (uint64_t)max_hits * 0xD6E8FEB86659FD93ULL;
+        }
         if (k == rescue_prune_neon::B1) return RESCUE_PRUNE_B1;
         if (k == rescue_prune_neon::FULL) return RESCUE_PRUNE_FULL;
         if (k == rescue_prune_neon::B2) {

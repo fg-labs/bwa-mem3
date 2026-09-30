@@ -403,9 +403,9 @@ static bool rescue_dedup_skip_enabled()
     static const bool on = rescue_env_on("BWA3_RESCUE_DEDUP_SKIP");
     return on;
 }
-/* Answer a rescue job that repeats the previous filtered job byte for byte from that job's result
- * instead of enqueueing it (see mem_matesw_batch_pre). Default ON; BWA3_RESCUE_REPEAT=0 enqueues
- * every job, which is how the byte-identity A/B is run. */
+/* Answer a rescue job that repeats one of the last filtered jobs byte for byte from that job's
+ * result instead of enqueueing it (see mem_matesw_batch_pre). Default ON; BWA3_RESCUE_REPEAT=0
+ * enqueues every job, which is how the byte-identity A/B is run. */
 static bool rescue_repeat_enabled()
 {
     static const bool on = rescue_env_on("BWA3_RESCUE_REPEAT");
@@ -1794,9 +1794,15 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
             const bool pruned = rescue_prune_applies(opt, xtra);
             if (g_rescue_prune_stats.on && !(xtra & KSW_XBYTE)) g_rescue_prune_stats.jobs16++;
             static thread_local std::vector<uint8_t> oq;   // oriented mate; grows, never shrinks
-            /* regid of the last filtered job this thread enqueued (-1: none, or it was proven to
-             * fail). The filter's repeat memo remembers that job's inputs; see the reuse below. */
-            static thread_local int32_t repeat_regid = -1;
+            /* The last filtered jobs this thread enqueued, by the filter's key of their inputs and
+             * regid (oldest overwritten); see the reuse below. */
+            struct recent_job_t { uint64_t key; int32_t regid; };
+            static const int RECENT = 8;
+            static thread_local recent_job_t recent[RECENT] = {
+                {0, -1}, {0, -1}, {0, -1}, {0, -1}, {0, -1}, {0, -1}, {0, -1}, {0, -1}};   // empty slots
+            static thread_local int recent_pos = 0;
+            bool view_keyed = false;
+            uint64_t view_key = 0;
             if (pruned) {
                 if ((int)oq.size() < l_ms) oq.resize(l_ms);
                 matesw_orient(ms, l_ms, is_rev, oq.data());
@@ -1807,28 +1813,31 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                                                      opt->min_seed_len * opt->a,
                                                      rescue_prune_max_hits(opt->min_seed_len * opt->a), &hb, &he,
                                                      &view);
-                /* A job repeating the previous filtered one byte for byte (the same mate against
-                 * an identical window, which anchors in identical repeat copies produce) has that
-                 * job's kswv result: the kernel is a function of the staged bytes, the lengths and
-                 * h0 alone. The filter's memo says the full inputs repeat; the staged pair at
-                 * repeat_regid is then compared with this job's inputs, so the reuse is exact by
-                 * that comparison whatever the memo's history (a new batch, a job never enqueued).
-                 * _post reads a result by regid and adds the hull offset recorded for it, which
-                 * equals this job's, so the reused regid answers this orientation exactly as its
-                 * own would have. Decided before the banding plan, which commit() binds to the
-                 * next enqueued pair. */
+                /* A job repeating one of the last filtered ones byte for byte (the same mate
+                 * against an identical window, which anchors in identical repeat copies produce)
+                 * has that job's kswv result: the kernel is a function of the staged bytes, the
+                 * lengths and h0 alone. The filter's key of the inputs picks the candidates among
+                 * the recent jobs; a candidate's staged pair is then compared with this job's
+                 * inputs, so the reuse is exact by that comparison whatever the key's history (a
+                 * new batch, a job never enqueued, a key collision). _post reads a result by regid
+                 * and adds the hull offset recorded for it, which equals this job's, so the reused
+                 * regid answers this orientation exactly as its own would have. Decided before the
+                 * banding plan, which commit() binds to the next enqueued pair. */
                 int32_t reuse = -1;
-                if (view.repeat && kind != RESCUE_PRUNE_B1 && rescue_repeat_enabled()
-                    && repeat_regid >= 0 && repeat_regid < pcnt) {
-                    const SeqPair &pj = seqPairArray[repeat_regid];
+                if (view.keyed && kind != RESCUE_PRUNE_B1 && rescue_repeat_enabled()) {
                     const int ob = kind == RESCUE_PRUNE_B2 ? hb : 0;
                     const int l1 = kind == RESCUE_PRUNE_B2 ? he - hb + 1 : (int)(re - rb);
                     const int8_t hyp = opt->meth_mode ? (int8_t)((mate_meth_ot ^ is_rev) & 1) : (int8_t)-1;
-                    if (pj.regid == repeat_regid && pj.h0 == xtra && pj.len1 == l1 && pj.len2 == l_ms
-                        && pj.meth_hyp == hyp && mmc->rescue_narrow_off[tid][repeat_regid] == ob
-                        && memcmp(seqBufRef + pj.idr, ref + ob, (size_t)l1) == 0
-                        && memcmp(seqBufQer + pj.idq, oq.data(), (size_t)l_ms) == 0)
-                        reuse = repeat_regid;
+                    for (int c = 0; c < RECENT && reuse < 0; c++) {
+                        const int32_t j = recent[c].regid;
+                        if (recent[c].key != view.key || j < 0 || j >= pcnt) continue;
+                        const SeqPair &pj = seqPairArray[j];
+                        if (pj.regid == j && pj.h0 == xtra && pj.len1 == l1 && pj.len2 == l_ms
+                            && pj.meth_hyp == hyp && mmc->rescue_narrow_off[tid][j] == ob
+                            && memcmp(seqBufRef + pj.idr, ref + ob, (size_t)l1) == 0
+                            && memcmp(seqBufQer + pj.idq, oq.data(), (size_t)l_ms) == 0)
+                            reuse = j;
+                    }
                 }
                 /* Banding plan (rescue_band.h), bound to this pair's regid at enqueue (commit).
                  * rescue_prune_applies() has checked the scoring the band kernel is derived for. */
@@ -1845,13 +1854,13 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                 }
                 if (kind == RESCUE_PRUNE_B1) {
                     gar[gcnt + r] = MATESW_GAR_PROVEN_FAIL;
-                    repeat_regid = -1;
                     continue;
                 }
                 if (reuse >= 0) {
                     gar[gcnt + r] = reuse;
                     continue;
                 }
+                view_keyed = view.keyed; view_key = view.key;
                 if (kind == RESCUE_PRUNE_B2) {
                     ref += hb; rb += hb; re = rb + (he - hb + 1);
                     narrow_ob += hb;
@@ -2009,7 +2018,10 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
 
                 /* gar[gcnt+r] points at this rescue's single enqueued regid. */
                 if (hi == 0) gar[gcnt + r] = pcnt;
-                if (pruned) repeat_regid = pcnt;
+                if (pruned && view_keyed) {
+                    recent[recent_pos] = recent_job_t{view_key, pcnt};
+                    recent_pos = (recent_pos + 1) % RECENT;
+                }
                 sp.regid = pcnt;
                 if (opt->rescue_kmer || rescue_prune_runs(opt)) {   /* record narrow offset by regid for _post */
                     *matesw_narrow_slot(mmc, tid, pcnt) = narrow_ob;
