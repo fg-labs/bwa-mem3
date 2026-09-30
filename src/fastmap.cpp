@@ -1553,7 +1553,7 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "    --dedup-reads STR  whole-read-pair memoization: 'off', 'on', or 'auto' (measure the duplicate rate and net benefit at runtime, latch, and periodically re-probe); aligns once per distinct pair within a chunk and replays the per-read SAM stage, so alignment records are byte-identical in every mode. Benefits amplicon/UMI panels with PCR duplicates; ~no effect on WGS/exome [auto]\n");
     fprintf(stderr, "    --ks-dedup STR  cross-read SA-interval dedup: 'off', 'on' (resolve each distinct (k,s) suffix-array interval once per SA-resolve chunk and copy the coordinates to the reads that repeat it), or 'auto' (measure net benefit at runtime, latch, and periodically re-probe); alignment records byte-identical in every mode [auto]\n");
     fprintf(stderr, "    --huge-pages  back the index with 1 GB huge pages via mimalloc when the host has enough free 1 GB pages reserved; cuts dTLB misses in seeding; Linux only, alignment records byte-identical (only @PG CL differs, recording the flag), safe no-op otherwise [off]\n");
-    fprintf(stderr, "    --keep-contained-ext  opt out of the default contained-seed extension skip and run the reference extension path instead. By default a seed contained (same diagonal) in a longer in-chain seed has its banded-SW extension skipped once the post-extension containment purge confirms it; the skip is byte-identical to the reference path on all read lengths, including under --meth, so this flag only removes the speedup. Escape hatch / bit-exact A-B handle against older binaries; --compat implies it [%s]\n", opt->skip_contained_ext? "off":"on");
+    fprintf(stderr, "    --keep-contained-ext  opt out of the default contained-seed extension skip and run the reference extension path instead. By default a seed contained (same diagonal) in a longer in-chain seed has its banded-SW extension skipped once the post-extension containment purge confirms it; the skip is byte-identical to the reference path on all read lengths, including under --meth and --compat, so this flag only removes the speedup. Escape hatch / bit-exact A-B handle against older binaries. The skip stays off on its own under a negative -A, the one scoring outside its proof [%s]\n", opt->skip_contained_ext? "off":"on");
     fprintf(stderr, "    --skip-contained-ext  DEPRECATED, accepted no-op: contained-seed skipping is now the default; pass --keep-contained-ext to opt out\n");
     fprintf(stderr, "    --max-extend-chains INT  cap chains extended per read to the top-INT by weight; ~23%% less alignment CPU, high-confidence placement unaffected; ignored for reads with >4096 chains; opt-in, NOT byte-identical (0 = off) [%d]\n", opt->max_extend_chains);
     fprintf(stderr, "    --adaptive-band  adaptive banded-SW: start tight and expand each pair to its chain-geometry band on long-extension reads; ~1.3x on medium reads (SBX ~240bp), no-op on short reads; kilobase-scale HiFi/ONT are not practical at default settings; opt-in, NOT byte-identical [%s]\n", opt->band_start? "on":"off");
@@ -1613,8 +1613,8 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "                  change alignments/MAPQ (--smem-dedup, --adaptive-band, --max-extend-chains,\n");
     fprintf(stderr, "                  --min-ext-len, --rescue-kmer, --seed-order); --fast and --meth are\n");
     fprintf(stderr, "                  always refused. Override the forceable ones with --compat-allow-divergent.\n");
-    fprintf(stderr, "                  Also runs the reference contained-seed extension path (implies\n");
-    fprintf(stderr, "                  --keep-contained-ext; the default skip is byte-identical to it).\n");
+    fprintf(stderr, "                  Keeps every byte-identical optimization, the default contained-seed\n");
+    fprintf(stderr, "                  extension skip included (--keep-contained-ext still opts out of it).\n");
     fprintf(stderr, "                  [off]\n");
     fprintf(stderr, "    --compat-allow-divergent  downgrade that refusal to a warning: keep the target's\n");
     fprintf(stderr, "                  output conventions while still running a bwa-mem3-only lever. Output is\n");
@@ -2992,8 +2992,11 @@ int main_mem(int argc, char *argv[])
      *
      * The contained-seed extension skip (skip_contained_ext, on by default) is
      * deliberately NOT a row: it is byte-identical to the reference extension
-     * path, and --compat pins the reference path below regardless, so there is
-     * nothing to refuse and nothing for --compat-allow-divergent to allow.
+     * path by proof (mem_skip_contained_ext_sound states the envelope, and the
+     * extension driver enforces it), so --compat keeps it like every other
+     * byte-identical optimization -- there is nothing to refuse and nothing for
+     * --compat-allow-divergent to allow. --keep-contained-ext remains the opt-out
+     * under --compat too.
      *
      * Riders deliberately NOT listed (each is a no-op unless a lever that IS
      * listed is also engaged, so the listed lever already guards them):
@@ -3080,14 +3083,21 @@ int main_mem(int argc, char *argv[])
         }
         free(joined.s);   /* NULL when nothing was appended -- free(NULL) is a no-op */
     }
-    /* --compat pins the reference extension path (as --keep-contained-ext does).
-     * The default contained-seed skip is byte-identical to it, so this changes no
-     * output; it just keeps a bit-exact-fidelity mode on the same extension code
-     * the targets run rather than on a speed lever. Applied after option parsing
-     * so it overrides the mem_opt_init default, and unconditionally, so
-     * `--compat --keep-contained-ext` (both asking for the reference path) and a
-     * deprecated `--compat --skip-contained-ext` both resolve the same way. */
-    if (compat_on) opt->skip_contained_ext = 0;
+    /* The contained-seed extension skip is kept under --compat. It used to be
+     * forced off here ("pin the reference extension path"), but the compat
+     * policy is proof-based: a target keeps every optimization that is
+     * byte-identical by construction or proven inside a code-enforced envelope,
+     * and drops only output shaping. The skip is proven (see
+     * mem_skip_contained_ext_sound in bwamem.cpp), and the extension driver
+     * itself falls back to the reference path outside the envelope, so the flag
+     * is never load-bearing for soundness. Report that fallback once, so a run
+     * record explains why the skip is not in force. The flag is left set: the
+     * driver's own guard (two_wave) is what disables it. Read after every
+     * rejection above and before the --fast preset, like the audit lines. */
+    if (opt->skip_contained_ext && !mem_skip_contained_ext_sound(opt))
+        fprintf(stderr, "[W::%s] contained-seed extension skip disabled: -A %d is negative, "
+                "outside the scoring its byte-identity proof covers; running the "
+                "reference extension path (output is unaffected)\n", __func__, opt->a);
     /* --compat with an @HD in -H: WARN, do not reject. Emitted only after every
      * rejection above (--fast, --meth, and the centralized divergence guard), so
      * a run that is about to be refused does not also collect a warning about how its

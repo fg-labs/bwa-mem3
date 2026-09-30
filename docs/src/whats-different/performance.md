@@ -189,7 +189,7 @@ WGS and WES slices (150 bp paired, hg38) at the default scoring, `-A 2`, `-B 6` 
 
 | Variable | Effect |
 |---|---|
-| `BWA3_CHAIN_STATS=1` | Print, once at exit, how the chaining and Pass-3 fast paths resolved (`[chain-stats] …`): reads indexed, reads that fell back, queries answered by bucket walks versus full scans, and reads the flat chaining index handed to the B-tree (equal positions, or over the cap). Measurement only; output is unchanged. |
+| `BWA3_CHAIN_STATS=1` | Print, once at exit, how the chaining, Pass-3 and contained-seed-skip fast paths resolved (`[chain-stats] …`): reads indexed, reads that fell back, queries answered by bucket walks versus full scans, reads the flat chaining index handed to the B-tree (equal positions, or over the cap), and how the contained-seed extension skip resolved its deferred seeds (`contained_deferred`, of which `contained_purged` had their banded-SW skipped and `contained_extended` ran in the second batch). Measurement only; output is unchanged. |
 | `BWA3_CHAIN_FLAT_CAP=<n>` | Largest number of chains a read may have on the flat chaining index before it is replayed through the B-tree (default 512, bounding the index's O(n) sorted insert). `0` sends every read to the B-tree. A malformed or negative value is reported to stderr and the default used. Output is identical at every value. |
 
 ## Mate rescue

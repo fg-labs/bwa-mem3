@@ -325,7 +325,10 @@ contained seeds a dataset produces).
 
 `--keep-contained-ext` opts out and runs the reference extension path (every seed extended in the
 main batch, no deferral). Output is unchanged; the run is only slower. It exists as an escape hatch
-and as a bit-exact A/B handle against binaries that predate the default. `--compat` implies it.
+and as a bit-exact A/B handle against binaries that predate the default. It also works under
+`--compat`, which otherwise keeps the skip (the byte-identity is proven, and the extension driver
+enforces the proof's envelope, a non-negative `-A`; see the `mem` reference).
+
 The former opt-in spelling `--skip-contained-ext` is deprecated: it still parses, is a no-op, and
 prints a one-line notice pointing at `--keep-contained-ext`.
 

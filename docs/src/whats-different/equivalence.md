@@ -218,10 +218,13 @@ Caveats:
   `--proper-pair-from-emitted` case above) to a warning for a user who knowingly wants the target's
   output conventions with a bwa-mem3 lever engaged; the output is then not byte-identical. It does
   not relax `--fast` or `--meth`, which are category errors rather than divergences.
-- **Contained-seed extension skipping is on by default and byte-identical**, so `--compat` does not
-  reject it: `--compat` (like `--keep-contained-ext`) runs the reference extension path, and the
-  deprecated `--skip-contained-ext` is an accepted no-op. The byte-identity claim's measured scope
-  (workload, host, architecture, and SIMD tier) is documented under
+- **Contained-seed extension skipping is on by default and byte-identical**, so `--compat` keeps
+  it: the compat policy retains every optimization that is byte-identical by construction or
+  proven inside a code-enforced envelope, and this one is proven (the envelope is a monotonicity
+  condition on the maximal-gap bound that every non-negative match score meets; the extension
+  driver enforces it). `--keep-contained-ext` still opts out under `--compat`, and the deprecated
+  `--skip-contained-ext` is an accepted no-op. The proof sketch and the measured scope (workload,
+  host, architecture, and SIMD tier) are documented under
   [`mem` → `--keep-contained-ext`](../cli/mem.md#--keep-contained-ext--opt-out-of-the-contained-seed-extension-skip).
 - **The sidecar `@SQ` is skipped, not rewritten.** Outside `--compat` the
   `<prefix>.hdr` / `<baseprefix>.dict` block remains authoritative and is emitted verbatim.
