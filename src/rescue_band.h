@@ -18,7 +18,11 @@
  *    max, and equal wherever an alignment scoring >= tau ends. Widening a band (more diagonals,
  *    as the 16-lane grouping does) keeps both properties, and so does skipping cells that do not
  *    exist in the full DP (query column j < 0 or j >= quanta: the kernel computes, per row, only
- *    the union of its lanes' live columns).
+ *    the union of its lanes' live columns). The fused (G-based) cells drop an in-row gap run
+ *    followed directly by a vertical one; the band then need not match the original cell's
+ *    values, but it still holds the full-DP value at the end of every alignment above, because
+ *    such an alignment has an equal-scoring twin with the two runs swapped that lies in the same
+ *    band (rescue_band.cpp, the note above RB_CELL1).
  *  - Round 1 computes the components at T1 = max(minsc, ub2 / 2) (ub2 = second-largest component
  *    bound at minsc), or at ub1 - delta for a lone near-perfect primary (plan()). The merged
  *    S / te / qe / score2 are exact iff T1 == minsc, or S >= T1 and either score2 >= T1 -- the
@@ -61,6 +65,11 @@
  * BWA3_RESCUE_BAND_P1 = 0 (pass 1 all kswv), 1 (banded parents only) or 2 (default: every
  * eligible 8-bit default-scoring job); BWA3_RESCUE_BAND_P1_COST (pass-1 band iff its per-row cells
  * < pct% of kswv's, default 130);
+ * BWA3_RESCUE_BAND_KERNEL selects the band kernel, all with the same outputs: 0 the original
+ * cell, 1 the fused (G-based) cell, 2 (default) the fused cell on two rows per step with the
+ * direct qe scan (rb_dp_wave2); BWA3_RESCUE_FSCAN=0 forces 0, as it turns the fused cell off in
+ * kswv; BWA3_RESCUE_BAND_SHIFT=0 disables the per-lane band shift that aligns the lanes' query
+ * offsets within a 16-lane group (run_jobs);
  * BWA3_RESCUE_PRUNE_STATS=1 prints [RESCUE_BAND] / [RESCUE_PRUNE] counters and stage times. */
 #ifndef BWA_MEM3_RESCUE_BAND_H
 #define BWA_MEM3_RESCUE_BAND_H

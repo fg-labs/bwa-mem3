@@ -365,3 +365,63 @@ TEST_CASE("rescue prune: the NEON filter decides exactly as the scalar filters"
     CHECK(compared_lean > 0);
 #endif
 }
+
+// The NEON filter's two stateful shortcuts, against the scalar filter:
+//   - the hit gate, decided from the per-code occurrence counts before any hit is accumulated:
+//     at max_hits = hits - 1 the job must go to the full window, at max_hits = hits it must be
+//     decided exactly as the scalar filter decides it;
+//   - the per-query cache (query table, presence map, occurrence chains), rebuilt only when the
+//     query bytes change: one query run against several windows in a row, then a different
+//     query of the same length, must be decided exactly as the scalar filter decides each.
+TEST_CASE("rescue prune: the NEON filter's hit gate and query cache match the scalar filter"
+          * doctest::test_suite("unit/pair")) {
+#if !defined(__aarch64__)
+    MESSAGE("skipped: the NEON rescue-prune filter is aarch64-only");
+    return;
+#else
+    std::mt19937 rng(24601);
+    const auto jobs = build_jobs(rng);
+    std::unique_ptr<rescue_prune_scratch> scalar(new rescue_prune_scratch());
+    auto same_as_scalar = [&](const std::vector<uint8_t> &ref, const std::vector<uint8_t> &q, int max_hits) {
+        int hb = -2, he = -2, shb = -2, she = -2;
+        const int kind = rescue_prune_window(ref.data(), (int)ref.size(), q.data(), (int)q.size(), kNeonMinsc,
+                                             max_hits, &hb, &he);
+        const int skind = rescue_prune_window_scalar(ref.data(), (int)ref.size(), q.data(), (int)q.size(),
+                                                     kNeonMinsc, max_hits, *scalar, &shb, &she);
+        CHECK(kind == skind);
+        if (kind == RESCUE_PRUNE_B2 && skind == RESCUE_PRUNE_B2) {
+            CHECK(hb == shb);
+            CHECK(he == she);
+        }
+        return kind;
+    };
+    int gated = 0, at_limit = 0;
+    for (size_t i = 0; i < jobs.size(); i++) {
+        const Job &jb = jobs[i];
+        if (has_n(jb.ref) || has_n(jb.q)) continue;
+        const long hits = count_hits(jb);
+        if (hits == 0 || hits > 32000) continue;
+        CAPTURE(jb.tag); CAPTURE(i); CAPTURE(hits);
+        int hb = -2, he = -2;
+        CHECK(rescue_prune_window(jb.ref.data(), (int)jb.ref.size(), jb.q.data(), (int)jb.q.size(), kNeonMinsc,
+                                  (int)hits - 1, &hb, &he) == RESCUE_PRUNE_FULL);
+        ++gated;
+        at_limit += same_as_scalar(jb.ref, jb.q, (int)hits) != RESCUE_PRUNE_FULL;
+    }
+    MESSAGE("hit gate: " << gated << " jobs at hits - 1, " << at_limit << " decided (not FULL) at hits");
+    CHECK(gated > 50);
+    CHECK(at_limit > 20);
+    // Query cache: each job's query against the next few windows, in a row.
+    int cached = 0;
+    for (size_t i = 0; i + 4 < jobs.size(); i += 5) {
+        const auto &q = jobs[i].q;
+        for (size_t k = i; k < i + 4; k++) { same_as_scalar(jobs[k].ref, q, kNoGate); ++cached; }
+        // Same length, one base changed: the cache must notice and rebuild.
+        auto q2 = q;
+        q2[q2.size() / 2] = (uint8_t)((q2[q2.size() / 2] + 1) & 3);
+        same_as_scalar(jobs[i].ref, q2, kNoGate);
+        same_as_scalar(jobs[i].ref, q, kNoGate);
+    }
+    CHECK(cached > 20);
+#endif
+}

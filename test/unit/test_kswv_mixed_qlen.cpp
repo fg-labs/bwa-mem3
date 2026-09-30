@@ -556,7 +556,7 @@ TEST_CASE("kswv --meth freed cell: ROWPAIR/LAZYQE configurations agree"
             // detect a defect shared by all three configurations. compare_batch
             // drives the freed kernel through both phases and compares every
             // field (score/score2/te/qe/te2/tb/qb) against the scalar reference;
-            // the all_eq parity checks below then pin the remaining two configs
+            // the kswr_all_fields_eq parity checks below then pin the remaining two configs
             // to this independently-verified one.
             compare_batch(0, pairs, mat, mat.data(), use16, max_qlen);
             one_row = run_freed_config(pairs, mat, use16, max_qlen);
@@ -575,22 +575,17 @@ TEST_CASE("kswv --meth freed cell: ROWPAIR/LAZYQE configurations agree"
         REQUIRE(one_row.size() == pair_inline.size());
         REQUIRE(one_row.size() == pair_lazy.size());
 
-        auto all_eq = [](const kswr_t &a, const kswr_t &b) {
-            return a.score == b.score && a.te == b.te && a.qe == b.qe
-                && a.score2 == b.score2 && a.te2 == b.te2
-                && a.tb == b.tb && a.qb == b.qb;
-        };
         int drift_inline = 0, drift_lazy = 0;
         for (size_t i = 0; i < one_row.size(); i++) {
-            if (!all_eq(one_row[i], pair_inline[i])) {
+            if (!bwa_tests::kswr_all_fields_eq(one_row[i], pair_inline[i])) {
                 ++drift_inline;
                 CAPTURE(i); CAPTURE(scoring); CAPTURE(ot); CAPTURE(use16);
-                CHECK(all_eq(one_row[i], pair_inline[i]));
+                CHECK(bwa_tests::kswr_all_fields_eq(one_row[i], pair_inline[i]));
             }
-            if (!all_eq(one_row[i], pair_lazy[i])) {
+            if (!bwa_tests::kswr_all_fields_eq(one_row[i], pair_lazy[i])) {
                 ++drift_lazy;
                 CAPTURE(i); CAPTURE(scoring); CAPTURE(ot); CAPTURE(use16);
-                CHECK(all_eq(one_row[i], pair_lazy[i]));
+                CHECK(bwa_tests::kswr_all_fields_eq(one_row[i], pair_lazy[i]));
             }
         }
         MESSAGE("meth freed toggle scoring=" << scoring << " ot=" << ot
@@ -618,6 +613,94 @@ TEST_CASE("kswv --meth freed cell: ROWPAIR/LAZYQE configurations agree"
     SUBCASE("COLLAPSED OB u8")  { run_meth_toggle_parity(MEM_METH_SCORING_COLLAPSED, false, false); }
     SUBCASE("COLLAPSED OB u16") { run_meth_toggle_parity(MEM_METH_SCORING_COLLAPSED, false, true);  }
 #endif
+}
+
+
+// BWA3_RESCUE_FSCAN under --meth. The G-based cell ships in every HasFreed=true
+// body too -- the freed-cell blend only rewrites m11, and both FSCAN arguments
+// hold for any m11 -- but the FSCAN cases in test_kswv_correctness.cpp build
+// symmetric matrices only, and the case above never sets the flag. Drive a
+// bisulfite-converted batch through the freed kernel with FSCAN off and on in
+// every configuration the flag reaches and require strict all-field equality;
+// the FSCAN arm of the production configuration also goes through
+// compare_batch against the scalar oracle. Ragged query lengths (75 / 151) and
+// ragged reference lengths (200-460) put pad columns and pad rows in the
+// groups, the two places the FSCAN cell's boundary handling differs.
+TEST_CASE("kswv --meth freed cell: BWA3_RESCUE_FSCAN off == on, and FSCAN matches scalar"
+          * doctest::test_suite("unit/kswv")) {
+    auto run_meth_fscan_parity = [](int scoring, bool ot, bool use16) {
+        const bwa_tests::ScoringMatrix mat =
+            use16 ? meth_matrix(scoring, ot, 14, 8) : meth_matrix(scoring, ot, 1, 4);
+        // Guard against a vacuous meth leg (see the case above).
+        const int conv_idx = ot ? (1 * 5 + 3) : (2 * 5 + 0);
+        REQUIRE(mat[conv_idx] != mat[0 * 5 + 1]);
+        if (!batched_kswv_available() || !freed_kernel_available(mat)) {
+            MESSAGE("tier has no freed-cell kswv kernel; skipping a leg");
+            return;
+        }
+        std::mt19937 rng(86420u + static_cast<unsigned>(scoring) * 7
+                         + (ot ? 1u : 0u) + (use16 ? 100u : 0u));
+        std::uniform_int_distribution<int> rlen_d(200, kRefLen);
+        std::vector<bwa_tests::TestPair> pairs;
+        for (int i = 0; i < 49; i++) {
+            pairs.push_back(bwa_tests::gen_tandem_repeat_pair(rng, (i % 2 == 0) ? 75 : 151,
+                                                              rlen_d(rng)));
+            convert_query_bisulfite(rng, pairs.back(), ot);
+        }
+        const int max_qlen = 151;
+
+        struct Config { const char *name, *rowpair, *lazyqe; bool oracle; };
+        const Config configs[] = {
+#if defined(__ARM_NEON) || defined(__aarch64__)
+            {"one-row",        "0", "1", false},
+            {"two-row inline", "1", "0", false},
+            {"two-row lazy",   "1", "1", true},   // the production default
+#else
+            {"x86",            "1", "1", true},   // toggles other than FSCAN are NEON-only
+#endif
+        };
+        for (const Config &c : configs) {
+            ScopedEnv rp("BWA3_RESCUE_ROWPAIR", c.rowpair);
+            ScopedEnv lq("BWA3_RESCUE_LAZYQE", c.lazyqe);
+            std::vector<kswr_t> off, on;
+            {
+                ScopedEnv fs("BWA3_RESCUE_FSCAN", "0");
+                off = run_freed_config(pairs, mat, use16, max_qlen);
+            }
+            {
+                ScopedEnv fs("BWA3_RESCUE_FSCAN", "1");
+                on = run_freed_config(pairs, mat, use16, max_qlen);
+                if (c.oracle) compare_batch(0, pairs, mat, mat.data(), use16, max_qlen);
+            }
+            REQUIRE(off.size() == on.size());
+            int drift = 0;
+            for (size_t i = 0; i < off.size(); i++) {
+                if (!bwa_tests::kswr_all_fields_eq(off[i], on[i])) {
+                    ++drift;
+                    CAPTURE(i); CAPTURE(scoring); CAPTURE(ot); CAPTURE(use16);
+                    CAPTURE(std::string(c.name));
+                    CHECK(bwa_tests::kswr_all_fields_eq(off[i], on[i]));
+                }
+            }
+            MESSAGE("meth freed fscan off-vs-on scoring=" << scoring << " ot=" << ot
+                    << " use16=" << use16 << " (" << std::string(c.name) << "): drift=" << drift
+                    << " over " << off.size() << " pairs");
+            CHECK(drift == 0);
+        }
+    };
+
+    SUBCASE("GENOMIC OT u8")    { run_meth_fscan_parity(MEM_METH_SCORING_GENOMIC,   true,  false); }
+    SUBCASE("GENOMIC OT u16")   { run_meth_fscan_parity(MEM_METH_SCORING_GENOMIC,   true,  true);  }
+    SUBCASE("GENOMIC OB u8")    { run_meth_fscan_parity(MEM_METH_SCORING_GENOMIC,   false, false); }
+    SUBCASE("GENOMIC OB u16")   { run_meth_fscan_parity(MEM_METH_SCORING_GENOMIC,   false, true);  }
+    SUBCASE("NEUTRAL OT u8")    { run_meth_fscan_parity(MEM_METH_SCORING_NEUTRAL,   true,  false); }
+    SUBCASE("NEUTRAL OT u16")   { run_meth_fscan_parity(MEM_METH_SCORING_NEUTRAL,   true,  true);  }
+    SUBCASE("NEUTRAL OB u8")    { run_meth_fscan_parity(MEM_METH_SCORING_NEUTRAL,   false, false); }
+    SUBCASE("NEUTRAL OB u16")   { run_meth_fscan_parity(MEM_METH_SCORING_NEUTRAL,   false, true);  }
+    SUBCASE("COLLAPSED OT u8")  { run_meth_fscan_parity(MEM_METH_SCORING_COLLAPSED, true,  false); }
+    SUBCASE("COLLAPSED OT u16") { run_meth_fscan_parity(MEM_METH_SCORING_COLLAPSED, true,  true);  }
+    SUBCASE("COLLAPSED OB u8")  { run_meth_fscan_parity(MEM_METH_SCORING_COLLAPSED, false, false); }
+    SUBCASE("COLLAPSED OB u16") { run_meth_fscan_parity(MEM_METH_SCORING_COLLAPSED, false, true);  }
 }
 
 #endif // BWA_TESTS_HAVE_KSWV

@@ -323,7 +323,7 @@ static RescueBandBatch &matesw_band(mem_cache *mmc, int32_t tid)
  * saves; a malformed value is reported and the default used. Read once. */
 static bool rescue_prune_enabled()
 {
-    static const bool on = [] { const char *e = getenv("BWA3_RESCUE_PRUNE"); return !e || e[0] != '0'; }();
+    static const bool on = rescue_env_on("BWA3_RESCUE_PRUNE");
     return on;
 }
 /* Default 400 for the hull path; 1000 when banding is on and minsc is the NEON filter's threshold

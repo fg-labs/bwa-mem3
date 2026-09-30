@@ -78,33 +78,6 @@ static inline void neon_soa_pack16(uint8_t *soa,
     }
 }
 
-/* In-register 8x8 halfword transpose: on entry r[j] holds 8 consecutive
- * positions of lane j; on return r[k] holds position k of every lane (the
- * 16-bit SoA row k). Three zip stages -- halfwords, words, doublewords. */
-static inline void neon_transpose8x8_u16(uint16x8_t r[8])
-{
-    uint16x8_t a[8];
-    for (int p = 0; p < 4; p++) {                 /* lanes (2p, 2p+1): k 0-3 | 4-7 */
-        a[2 * p]     = vzip1q_u16(r[2 * p], r[2 * p + 1]);
-        a[2 * p + 1] = vzip2q_u16(r[2 * p], r[2 * p + 1]);
-    }
-    uint32x4_t b[8];
-    for (int h = 0; h < 2; h++) {                 /* lanes 4h..4h+3: k pairs (0,1) .. (6,7) */
-        const uint32x4_t lo0 = vreinterpretq_u32_u16(a[4 * h]),     lo1 = vreinterpretq_u32_u16(a[4 * h + 2]);
-        const uint32x4_t hi0 = vreinterpretq_u32_u16(a[4 * h + 1]), hi1 = vreinterpretq_u32_u16(a[4 * h + 3]);
-        b[4 * h]     = vzip1q_u32(lo0, lo1);
-        b[4 * h + 1] = vzip2q_u32(lo0, lo1);
-        b[4 * h + 2] = vzip1q_u32(hi0, hi1);
-        b[4 * h + 3] = vzip2q_u32(hi0, hi1);
-    }
-    for (int m = 0; m < 4; m++) {                 /* lanes 0-3 | 4-7 -> rows 2m, 2m+1 */
-        const uint64x2_t x = vreinterpretq_u64_u32(b[m]);
-        const uint64x2_t y = vreinterpretq_u64_u32(b[4 + m]);
-        r[2 * m]     = vreinterpretq_u16_u64(vzip1q_u64(x, y));
-        r[2 * m + 1] = vreinterpretq_u16_u64(vzip2q_u64(x, y));
-    }
-}
-
 /* 16-bit twin of neon_soa_pack16 for the 8-lane int16 SoA: 8 positions per
  * tile, each lane's 8 bytes loaded and widened to halfwords, the ambiguity
  * code remapped (AMBIG_ -> ambCode) on whole tile vectors (no pad code equals

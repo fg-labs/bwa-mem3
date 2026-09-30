@@ -32,6 +32,21 @@ bool kswr_coords_eq(const kswr_t &scalar, const kswr_t &batched,
 // suboptimal." scalar.score == 0 skips the check.
 bool kswr_score2_eq(const kswr_t &scalar, const kswr_t &batched);
 
+// End-position equality (te/qe). scalar.score <= 0 skips the check (no
+// alignment, so no end to compare).
+inline bool kswr_ends_eq(const kswr_t &scalar, const kswr_t &batched) {
+    return scalar.score <= 0 || (scalar.te == batched.te && scalar.qe == batched.qe);
+}
+
+// Strict all-field kswr_t equality (every observable field). For A/B arms that
+// run the same recurrence and so must agree exactly -- not the tolerant
+// scalar-vs-batched compares above.
+inline bool kswr_all_fields_eq(const kswr_t &a, const kswr_t &b) {
+    return a.score == b.score && a.te == b.te && a.qe == b.qe
+        && a.score2 == b.score2 && a.te2 == b.te2
+        && a.tb == b.tb && a.qb == b.qb;
+}
+
 } // namespace bwa_tests
 
 #endif

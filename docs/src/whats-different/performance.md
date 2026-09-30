@@ -224,17 +224,27 @@ which the insert-size estimate, and so rescue and pairing, depend on).
   first row and column reaching the score are the same as in the full pass.
   Used for every 8-bit job at the default scoring (banded or not in the first
   pass, no `--meth`) when the band is cheaper than the full pass.
-- **11-op 8-bit rescue cell (NEON).** When the cost of opening a gap (open plus
-  extend, `-O` + `-E`) is the same for insertions and deletions and fits a byte,
-  and no gap cost is negative, the 8-bit rescue kernel builds each cell from the
-  score before the in-row gap and opens both gaps from one saturating subtract:
-  11 vector operations per cell instead of 13, and row i+1 no longer waits on row
-  i's gap chain. Every score and position it emits is unchanged.
+- **11-op rescue cell (NEON, AVX2, AVX-512BW; 8- and 16-bit).** When the
+  open-plus-extend sums (`-O` + `-E`) of insertions and deletions are equal and
+  fit the kernel's lane (a byte for the 8-bit kernels), and no gap cost is
+  negative, the rescue kernels build each cell from the score before the in-row
+  gap and open both gaps from one subtract: 11 vector operations per cell instead
+  of 13 in the NEON 8-bit kernel (one max/subtract fewer per cell, and no
+  reference-padding mask, in the others), and row i+1 no longer waits on row
+  i's gap chain. Every score and position it emits is unchanged: output (md5 of
+  the non-`@PG` records) matched `BWA3_RESCUE_FSCAN=0` on the same 5M-pair WGS
+  and WES slices, at `-t 16 -K 160000000`, at the default scoring (8-bit bodies)
+  and at `-A 2` (every rescue job on the 16-bit bodies), on AWS Graviton 4
+  (NEON), AMD EPYC 7R13 (Zen 3, AVX2) and AMD EPYC 9R45 (Zen 5, AVX-512BW).
+- **Fused, two-row banded cell (NEON).** The banded rescue DP uses the same
+  fused cell (both gaps opened from one saturating subtract), steps two rows at
+  a time, and reads the query end directly rather than from a per-row snapshot.
+  Same scope as the banded DP; every value the rescue reads is unchanged.
 
 | Variable | Effect |
 |---|---|
 | `BWA3_RESCUE_PRUNE=0` | Turn off exact rescue pruning and the banded passes: every rescue window runs in full through the rescue kernel (the reference path for identity checks). `--rescue-kmer`, which narrows windows on its own, is unaffected. Default on where pruning runs. |
-| `BWA3_RESCUE_PRUNE_MAX_HITS=<n>` | Keep the full window when the mate and window share more than `n` exact 5-mer hits, where the filter would cost more than it saves (default 1000 where the banded DP runs, 400 otherwise). It only chooses between exact paths, so output does not depend on its value by design. |
+| `BWA3_RESCUE_PRUNE_MAX_HITS=<n>` | Keep the full window when the mate and window share more than `n` exact 5-mer hits, where the filter would cost more than it saves (default 1000 where the banded DP runs and the rescue threshold `min_seed_len * a` is 19, as at the default `-k 19 -A 1`; 400 otherwise). It only chooses between exact paths, so output does not depend on its value by design. |
 | `BWA3_RESCUE_PRUNE_STATS=1` | Print, once at exit, how the filter decided (`[RESCUE_PRUNE] jobs=… full=… b1=… b2=… rows_in=… rows_kept=… filter_s=… kswv_pass0_s=… band_pass0_s=… kswv_pass1_s=… band_pass1_s=…`): jobs filtered, and of them how many kept the full window, were proven to fail (`b1`) or were narrowed (`b2`), with the window rows before and after and the thread-summed seconds of each rescue stage; and how the banded DP resolved (`[RESCUE_BAND] banded_parents=… …`). Measurement only; output is unchanged. |
 | `BWA3_RESCUE_BAND=0` | Run every narrowed job through the rescue kernel on its whole hull instead of banded (and the hit gate back to 400). Default on where banding runs. |
 | `BWA3_RESCUE_BAND_COST=<pct>` | Band a narrowed job only when its band cells cost less than `pct` % of the hull's (default 85). It only chooses between exact paths, so output does not depend on its value by design. |
@@ -242,11 +252,13 @@ which the insert-size estimate, and so rescue and pairing, depend on).
 | `BWA3_RESCUE_BAND_P1=<n>` | Which second-pass (start recovery) jobs run banded: `0` none, `1` only jobs banded in the first pass, `2` (default) every eligible 8-bit job; values above 2 act as 2. It only chooses between exact paths, so output does not depend on its value by design. |
 | `BWA3_RESCUE_BAND_P1_COST=<pct>` | Band a second-pass job only when its band's per-row cells cost less than `pct` % of the full pass's (default 130). It only chooses between exact paths, so output does not depend on its value by design. |
 | `BWA3_RESCUE_BAND_TIGHT=<n>` | Threshold offset of the first-round band for a lone near-perfect primary (default 8; 0 disables). It only chooses between exact paths, so output does not depend on its value by design. |
-| `BWA3_RESCUE_FSCAN=0` | Use the original 13-op 8-bit rescue cell on NEON. It only chooses between exact paths, so output is the same either way by design. |
+| `BWA3_RESCUE_FSCAN=0` | Use the original rescue cells instead of the 11-op cell, in the rescue kernels and in the banded DP. A value starting with `0` turns it off and anything else leaves it on; it is not reported. It only chooses between exact paths, so output is the same either way by design. |
+| `BWA3_RESCUE_BAND_KERNEL=<n>` | Which banded-DP kernel runs while `BWA3_RESCUE_FSCAN` is on: `0` the original cell, `1` the fused cell one row at a time, `2` (default) the fused cell two rows at a time; values above 2 act as 2. It only chooses between exact paths, so output does not depend on its value by design. |
+| `BWA3_RESCUE_BAND_SHIFT=0` | Turn off the per-lane band shift that aligns the query offsets of the 16 bands in a vector. It only chooses between exact paths, so output is the same either way by design. |
 
-Every integer knob above takes a non-negative decimal integer of at most 2147483647, with no sign or surrounding whitespace. An unset or empty knob silently takes the default; any other invalid value is reported to stderr and the default used.
+Every integer knob above (`=<n>` or `=<pct>`) takes a non-negative decimal integer of at most 2147483647, with no sign or surrounding whitespace. An unset or empty knob silently takes the default; any other invalid value is reported to stderr and the default used. The on/off knobs (`=0`) are off for any value starting with `0` and on otherwise.
 
-The byte-identity above was measured at the default knob values. Beyond the defaults, CI tests only these values on aarch64 (NEON), on generated inputs: `BWA3_RESCUE_BAND=0` and `BWA3_RESCUE_BAND_COST=100000000` (the cost gate forced open) against the full-window reference (`BWA3_RESCUE_PRUNE=0 BWA3_RESCUE_BAND=0`) on a generated paired-end fixture at `-t 1` and `-t 4`, and `BWA3_RESCUE_BAND_COST=100000000`, alone and with `BWA3_RESCUE_PRUNE_MAX_HITS=100000`, on generated rescue jobs checked field by field. Other values are exact by construction but untested.
+The byte-identity above was measured at the default knob values. Beyond the defaults, CI tests only these values, on generated inputs. On aarch64 (NEON): `BWA3_RESCUE_BAND=0` and `BWA3_RESCUE_BAND_COST=100000000` (the cost gate forced open) against the full-window reference (`BWA3_RESCUE_PRUNE=0 BWA3_RESCUE_BAND=0`) on a generated paired-end fixture at `-t 1` and `-t 4`, and `BWA3_RESCUE_BAND_COST=100000000` on generated rescue jobs checked field by field, alone and with each of `BWA3_RESCUE_PRUNE_MAX_HITS=100000`, `BWA3_RESCUE_BAND_SHIFT=0`, `BWA3_RESCUE_BAND_KERNEL=1` and `BWA3_RESCUE_FSCAN=0`. On aarch64 and x86 (AVX2): `BWA3_RESCUE_FSCAN=0` against the default in the rescue kernels' unit tests, field by field. Other values are exact by construction but untested.
 
 ---
 
