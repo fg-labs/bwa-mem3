@@ -19,7 +19,18 @@
 #     and prints a deprecation notice to stderr.
 #
 # Ordering is contractually deterministic across thread counts, so every
-# comparison runs at -t 1 and -t 4. Checked on a dup-rich and a low-dup fixture.
+# comparison runs at -t 1 and -t 4. Checked on a dup-rich and a low-dup PE
+# fixture and on 2-3 kb SE reads with scattered errors
+# (test/fixtures/make_long_reads.awk).
+#
+# The fixtures must really exercise both halves of the skip, or the byte-identity
+# checks are vacuous for the half that never ran. With BWA3_CHAIN_STATS=1, every
+# skip run (default and the deprecated flag) must report contained_deferred > 0
+# and deferred == purged + extended, every --keep-contained-ext run must defer
+# nothing, and over the run set both contained_purged (seeds whose SW was
+# skipped) and contained_extended (seeds the guard sent to the second batch)
+# must be > 0. The 150 bp PE fixtures purge every deferred seed; only the long
+# reads, which mem_flt_chained_seeds rescores, reach the second batch.
 # (--meth parity is validated separately on production bisulfite data; a meth CI
 # A/B is tracked as a follow-up.)
 #
@@ -51,29 +62,67 @@ cp "$SKIP_CONTAINED_PHIX_FA" "$W/phix.fa" || fail "copy reference"
     || fail "generate duplicate fixture" # dup-rich (4800 pairs)
 "$HERE/../fixtures/make_dedup_reads.sh" "$W/phix.fa" "$W/uniq" 4800 1 \
     || fail "generate unique fixture" # low-dup  (4800 pairs)
+contig=$(awk '/^>/{print substr($1, 2); exit}' "$W/phix.fa")
+awk -v NAME="$contig" -v SEED=7 -v NREADS=20 -v LMIN=2000 -v LMAX=3000 \
+    -f "$HERE/../fixtures/make_long_reads.awk" "$W/phix.fa" > "$W/long.fq" \
+    || fail "generate long-read fixture" # 20 SE reads, 2-3 kb
 
-run() { # run <tag> <threads> <prefix> [extra flags...]
-    local tag=$1 t=$2 p=$3
+run() { # run <tag> <threads> <input: dup|uniq|long> [extra flags...]
+    local tag=$1 t=$2 in=$3
     shift 3
-    "$BWA_MEM3" mem -t "$t" "$@" "$W/phix.fa" "${p}_1.fq" "${p}_2.fq" \
+    local -a reads
+    if [[ $in == long ]]; then
+        reads=("$W/long.fq")
+    else
+        reads=("$W/${in}_1.fq" "$W/${in}_2.fq")
+    fi
+    BWA3_CHAIN_STATS=1 "$BWA_MEM3" mem -t "$t" "$@" "$W/phix.fa" "${reads[@]}" \
         2> "$W/$tag.err" | grep -v '^@PG' > "$W/$tag.sam" \
         || fail "$tag: mem run failed"
     [[ -s "$W/$tag.sam" ]] || fail "$tag: empty output"
 }
+# counter <err-file> <name>  -> the value of contained_<name> on the [chain-stats] line
+counter() {
+    local v
+    v=$(sed -n 's/.*contained_'"$2"'=\([0-9]*\).*/\1/p' "$1" | tail -n 1)
+    [[ -n $v ]] || fail "$1: no contained_$2 counter on the [chain-stats] line"
+    echo "$v"
+}
+# skip_counters <tag>  -> assert the skip ran on <tag>; sets d, pu, ex
+# (globals, not a subshell, so the caller can accumulate the totals)
+skip_counters() {
+    d=$(counter "$W/$1.err" deferred)
+    pu=$(counter "$W/$1.err" purged)
+    ex=$(counter "$W/$1.err" extended)
+    [[ $d -gt 0 ]] || fail "$1: no seed deferred -- fixture does not exercise the skip"
+    [[ $((pu + ex)) -eq "$d" ]] || fail "$1: deferred=$d != purged=$pu + extended=$ex"
+}
 
+total_purged=0
+total_extended=0
 for t in 1 4; do
-    for p in dup uniq; do
-        run "def_${p}_t${t}" "$t" "$W/$p"                       # default: skip ON
-        run "keep_${p}_t${t}" "$t" "$W/$p" --keep-contained-ext # reference path
-        run "dep_${p}_t${t}" "$t" "$W/$p" --skip-contained-ext  # deprecated no-op
+    for p in dup uniq long; do
+        run "def_${p}_t${t}" "$t" "$p"                       # default: skip ON
+        run "keep_${p}_t${t}" "$t" "$p" --keep-contained-ext # reference path
+        run "dep_${p}_t${t}" "$t" "$p" --skip-contained-ext  # deprecated no-op
 
         cmp "$W/def_${p}_t${t}.sam" "$W/keep_${p}_t${t}.sam" \
             || fail "default(skip) != --keep-contained-ext ($p, -t $t)"
         cmp "$W/def_${p}_t${t}.sam" "$W/dep_${p}_t${t}.sam" \
             || fail "--skip-contained-ext (deprecated) != default ($p, -t $t)"
-        ok "byte-identity default == --keep-contained-ext == --skip-contained-ext ($p, -t $t)"
+        skip_counters "dep_${p}_t${t}"
+        skip_counters "def_${p}_t${t}"
+        total_purged=$((total_purged + pu))
+        total_extended=$((total_extended + ex))
+        kd=$(counter "$W/keep_${p}_t${t}.err" deferred)
+        [[ $kd -eq 0 ]] || fail "keep_${p}_t${t}: --keep-contained-ext deferred $kd seeds (skip not off)"
+        ok "byte-identity default == --keep-contained-ext == --skip-contained-ext ($p, -t $t); deferred=$d purged=$pu extended=$ex"
     done
 done
+
+[[ $total_purged -gt 0 ]] || fail "no deferred seed was ever purged -- the skip saved nothing"
+[[ $total_extended -gt 0 ]] || fail "no deferred seed was ever extended -- the second batch was never run"
+ok "skip exercised by default: purged=$total_purged extended=$total_extended"
 
 # The deprecated flag must announce itself (so users learn to migrate).
 grep -q 'skip-contained-ext is deprecated' "$W/dep_dup_t1.err" \

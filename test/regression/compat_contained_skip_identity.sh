@@ -43,10 +43,10 @@
 # inside the chaining band on a shifted diagonal (the interference guard, at
 # and around its .95 length boundary) or far enough away to chain separately.
 # SE reads are 150 and 250 bp windows, plus 2-3 kb reads from each contig with
-# ~1% substitutions and ~0.2% 1 bp indels from a fixed Park-Miller generator
-# (exact in awk's doubles, so identical across awk implementations). Long
-# reads are rescored by mem_flt_chained_seeds, so container/contained visit
-# order can invert and the guard sends the seed to the second batch. PE reads
+# ~1% substitutions and ~0.2% 1 bp indels (test/fixtures/make_long_reads.awk,
+# deterministic across awk implementations). Long reads are rescored by
+# mem_flt_chained_seeds, so container/contained visit order can invert and the
+# guard sends the seed to the second batch. PE reads
 # pair a window with the reverse complement of a downstream window.
 #
 # Inputs (env vars):
@@ -59,6 +59,7 @@ set -euo pipefail
 : "${COMPAT_CONTAINED_PHIX_FA:?COMPAT_CONTAINED_PHIX_FA must be set}"
 : "${COMPAT_CONTAINED_WORK_DIR:?COMPAT_CONTAINED_WORK_DIR must be set}"
 
+HERE="$(cd "$(dirname "$0")" && pwd)"
 fail() {
     echo "FAIL: $*" >&2
     exit 1
@@ -142,37 +143,10 @@ for off in 0 1 2; do
 done
 
 # 2-3 kb reads with scattered errors, 10 per contig (second-batch extensions).
-cat > "$W/longgen.awk" << 'AWK'
-function rnd() { X = (X * 16807) % 2147483647; return X / 2147483647 }
-function rot(b) { return b == "A" ? "C" : b == "C" ? "G" : b == "G" ? "T" : "A" }
-/^>/ { cur = substr($1, 2); next }
-cur == NAME { seq = seq toupper($0) }
-END {
-    X = SEED + 0
-    for (k = 0; k < NREADS; k++) {
-        L = LMIN + int(rnd() * (LMAX - LMIN + 1))
-        if (L > length(seq)) L = length(seq)
-        off = int(rnd() * (length(seq) - L + 1))
-        s = substr(seq, off + 1, L)
-        o = ""
-        for (i = 1; i <= L; i++) {
-            c = substr(s, i, 1)
-            u = rnd()
-            if (u < 0.010) o = o rot(c)
-            else if (u < 0.011) continue
-            else if (u < 0.012) o = o c rot(c)
-            else o = o c
-        }
-        q = ""
-        for (i = 1; i <= length(o); i++) q = q "I"
-        printf "@%s_long_%d\n%s\n+\n%s\n", NAME, k, o, q
-    }
-}
-AWK
 contig0=$(awk '/^>/{print substr($1, 2); exit}' "$COMPAT_CONTAINED_PHIX_FA")
 for c in "$contig0" rep; do
     awk -v NAME="$c" -v SEED=7 -v NREADS=10 -v LMIN=2000 -v LMAX=3000 \
-        -f "$W/longgen.awk" "$W/ref.fa" >> "$se" || fail "long-read generator"
+        -f "$HERE/../fixtures/make_long_reads.awk" "$W/ref.fa" >> "$se" || fail "long-read generator"
 done
 
 r1="$W/pe_1.fq"

@@ -16,6 +16,8 @@ All four SMEM/seed tests share `phix.fa` (phiX174, NC_001422.1, 5386 bp) as the 
 
 `ladder_proofs/build_fixture.awk` is a generator (no committed data) used by `test/ladder_rungs_test.sh` and `test/ungapped_hit_parity_test.sh`. It slices a 2650 bp reference and four single-end reads from `phix.fa` with fixed base rotations for the substitutions, so it is byte-identical across awk implementations; see the comments at the top of the script for each read's construction and the bwa 0.7.19 record it is checked against.
 
+`make_long_reads.awk` is a generator (no committed data) used by `test/regression/skip_contained_byte_identity.sh` and `test/regression/compat_contained_skip_identity.sh`. It slices 2-3 kb single-end reads from one contig with ~1% substitutions and ~0.2% 1 bp indels drawn from a Park-Miller generator whose arithmetic is exact in awk's doubles, so it is byte-identical across awk implementations. Long reads are rescored by `mem_flt_chained_seeds`, which is what sends a deferred contained seed to the skip's second extension batch; see the comments at the top of the script.
+
 `supp_rep/build_fixture.awk` is a generator (no committed data) used by `test/regression/supp_rep_hard_cap.sh`. It emits a deterministic engineered reference + SE reads exercising `--supp-rep-hard-cap` against a chain with a high-SA-count SMEM but a uniquely-disambiguated extension; see comments at the top of the awk script.
 
 ## Regenerating the fixtures
