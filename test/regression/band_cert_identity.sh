@@ -329,6 +329,8 @@ echo "PASS: --no-band-cert is advertised in usage and composes with --fast"
 # no-op there), so pin the wiring structurally, the same way compat_byte_identical.sh
 # guards its proper-pair derivation.
 BWAMEM_SRC="$(dirname "$0")/../../src/bwamem.cpp"
+# The ungapped fast path (ungapped_analyze and its walks) lives in its own header.
+UNGAPPED_SRC="$(dirname "$0")/../../src/ungapped_ext.h"
 FASTMAP_SRC="$(dirname "$0")/../../src/fastmap.cpp"
 [[ -f "$BWAMEM_SRC" ]] || {
     echo "FAIL: cannot find src/bwamem.cpp at $BWAMEM_SRC" >&2
@@ -405,14 +407,19 @@ echo "PASS: band_cert defaults on; --fast/--adaptive-band/--no-band-cert clear i
 # whose out-of-band gapped optimum sits just past default_w); on single reads it
 # is masked by mem_reg2aln recomputing the final CIGAR at its own band, so it
 # cannot be pinned as a SAM byte-fixture. Guard the realizable-score choice
-# structurally instead, the same way the wiring guards above do.
-if ! grep -qE 'max_sc_proof = ungapped_walk_score(_mis)?\(' "$BWAMEM_SRC"; then
+# structurally instead, the same way the wiring guards above do. The derivation
+# lives in ungapped_analyze (src/ungapped_ext.h).
+[[ -f "$UNGAPPED_SRC" ]] || {
+    echo "FAIL: $UNGAPPED_SRC not found (the tight_band source guards read it)" >&2
+    exit 1
+}
+if ! grep -qE 'max_sc_proof = ungapped_walk_score(_mis)?\(' "$UNGAPPED_SRC"; then
     echo "FAIL: tight_band no longer derives max_sc_proof from the realizable" >&2
     echo "      floored ungapped_walk_score -- the band proof requires an" >&2
     echo "      in-band-achievable score; a no-floor bound makes tb unsound" >&2
     exit 1
 fi
-if grep -qE 'ungapped_max_sc_from_bitmap' "$BWAMEM_SRC"; then
+if grep -qE 'ungapped_max_sc_from_bitmap' "$BWAMEM_SRC" "$UNGAPPED_SRC"; then
     echo "FAIL: the NO-FLOOR ungapped_max_sc_from_bitmap bound was reintroduced --" >&2
     echo "      it over-estimates the realizable extension optimum and makes the" >&2
     echo "      tight_band bound unsound (breaks byte-identity vs the full-width ladder)" >&2
