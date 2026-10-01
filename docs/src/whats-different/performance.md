@@ -216,31 +216,50 @@ generated jobs.
   A job proven unable to reach the rescue threshold (`min_seed_len * a`) is not
   run and takes the ordinary failing-rescue path; otherwise only the rows that
   can hold an alignment at that threshold are computed, which reproduces every
-  field the rescue consumes (score, positions, suboptimal score). Derived for the
-  default scoring only (`-A 1 -B 4 -O 6 -E 1`); other scorings, `--meth`,
-  `--rescue-kmer`, windows or mates with an N, and the 16-bit path keep the full
-  window. It runs where a SIMD filter carries it: on aarch64 (NEON) at every
-  seed length, and on the x86 AVX2 and AVX-512BW builds (an SSE4.1 / SSSE3 port
-  of the filter) at the default `-k 19` only, since at any other seed length the
-  scalar filter would run and costs more than it saves there. Elsewhere the full
-  window is always computed.
-  (x86: [#538](https://github.com/fg-labs/bwa-mem3/pull/538))
+  field the rescue consumes (score, positions, suboptimal score). Derived for any
+  scoring whose mismatch penalty (`-B`), deletion open alone and insertion open
+  plus extend each cost at least four matches, the insertion strictly more, with
+  a threshold above four matches and each gap type's open plus extend at most
+  255 (the byte kswv's 8-bit kernels hold it in): the default
+  `-A 1 -B 4 -O 6 -E 1`, and for example `-B 6` or `-O 8 -E 2`; the bound then
+  counts exact 5-mers (`rescue_prune_params::from` states the conditions). Other
+  scorings, `--rescue-kmer`, windows or mates with an N, and the 16-bit path
+  keep the full window. Under `--meth` it matches
+  C-to-T (or G-to-A) converted copies of the window and the mate, on aarch64
+  with EM-seq chemistry only, at `--meth -B 4` and the genomic and neutral
+  scorings (the default collapsed scoring keeps the full window). It runs where a
+  SIMD filter carries it: on aarch64 (NEON) and on the x86 AVX2 and AVX-512BW
+  builds (an SSE4.1 / SSSE3 port of the filter), at every seed length except at
+  the AVX-512BW kswv tier at a threshold `-k` x `-A` of 25 or more (`-k 25` at
+  `-A 1`, already the default `-k 19` at `-A 2`), where the 64-lane kswv is cheap
+  enough that the filter costs more than it saves. The SIMD filters cover every
+  admitted scoring with `-A` of at most 16; the others run a scalar filter,
+  which pays on aarch64 but not against x86's kswv, so x86 keeps the full window
+  there. Elsewhere the full window is always computed.
+  ([#541](https://github.com/fg-labs/bwa-mem3/pull/541); x86:
+  [#538](https://github.com/fg-labs/bwa-mem3/pull/538))
 - **Banded rescue DP (NEON, AVX2).** For a narrowed job, the rescue DP runs only
-  inside the diagonal bands of the 5-mer components that can reach the
+  inside the diagonal bands of the K-mer (today 5-mer) components that can reach the
   threshold, 16 bands per NEON vector or 32 per AVX2 vector, and the job's
   score, end positions and suboptimal score are reassembled from the bands'
   per-row maxima. A per-job
   cost model keeps the full hull when banding would not pay. Same scope as the
-  pruning (default scoring, 8-bit, no `--meth`, and on x86 `-k 19`).
-  (AVX2: [#538](https://github.com/fg-labs/bwa-mem3/pull/538))
+  pruning, at every scoring it admits (8-bit, no `--meth`); the kernels take the
+  run's match, mismatch and both gap types' costs.
+  ([#541](https://github.com/fg-labs/bwa-mem3/pull/541); AVX2:
+  [#538](https://github.com/fg-labs/bwa-mem3/pull/538))
 - **Banded start recovery (NEON, AVX2).** The second rescue pass, which finds where
   the best alignment starts, runs in a diagonal band derived from the first
-  pass's score and end: at the default scoring an alignment of that score can
-  hold only a bounded number of gapped bases, so the band holds it, and the
-  first row and column reaching the score are the same as in the full pass.
-  Used for every 8-bit job at the default scoring (banded or not in the first
-  pass, no `--meth`, at any seed length) when the band is cheaper than the full
-  pass. (AVX2: [#538](https://github.com/fg-labs/bwa-mem3/pull/538))
+  pass's score and end: an alignment of that score can hold only a bounded
+  number of gapped bases, so the band holds it, and the first row and column
+  reaching the score are the same as in the full pass. Used for every 8-bit job
+  (banded or not in the first pass, at any seed length and any scoring the band
+  kernels take, including ones the pruning refuses, such as `-B 3`) when the
+  band is cheaper than the full pass; under `--meth`, with the bisulfite
+  matrices, wherever `--meth` does not prune (on x86, with TAPS chemistry, or
+  at the default collapsed scoring).
+  ([#541](https://github.com/fg-labs/bwa-mem3/pull/541); AVX2:
+  [#538](https://github.com/fg-labs/bwa-mem3/pull/538))
 - **11-op rescue cell (NEON, AVX2, AVX-512BW; 8- and 16-bit).** When the
   open-plus-extend sums (`-O` + `-E`) of insertions and deletions are equal and
   fit the kernel's lane (a byte for the 8-bit kernels), and no gap cost is
@@ -302,7 +321,7 @@ generated jobs.
 | Variable | Effect |
 |---|---|
 | `BWA3_RESCUE_PRUNE=0` | Turn off exact rescue pruning and the banded passes: every rescue window runs in full through the rescue kernel (the reference path for identity checks). `--rescue-kmer`, which narrows windows on its own, is unaffected. Default on where pruning runs. |
-| `BWA3_RESCUE_PRUNE_MAX_HITS=<n>` | Keep the full window when the mate and window share more than `n` exact 5-mer hits, where the filter would cost more than it saves (default 1000 on aarch64 when banding is on and the rescue threshold `min_seed_len * a` is 19, the NEON filter's threshold, as at the default `-k 19 -A 1`; 400 otherwise, and always 400 on x86). It only chooses between exact paths, so output does not depend on its value by design. |
+| `BWA3_RESCUE_PRUNE_MAX_HITS=<n>` | Keep the full window when the mate and window share more than `n` exact 5-mer hits, where the filter would cost more than it saves (default 1000 on aarch64 when banding is on and the run is not `--meth`; 400 otherwise, and always 400 on x86; [#541](https://github.com/fg-labs/bwa-mem3/pull/541)). It only chooses between exact paths, so output does not depend on its value by design. |
 | `BWA3_RESCUE_PRUNE_STATS=1` | Print, once at exit, how the filter decided (`[RESCUE_PRUNE] jobs=… full=… b1=… b2=… rows_in=… rows_kept=… jobs16=… memo_hits=… reused=… filter_s=… kswv_pass0_s=… band_pass0_s=… kswv_pass1_s=… band_pass1_s=… dedup_run=… dedup_skip=… dedup_run_regs=… dedup_skip_regs=… dedup_insert1=… dedup_insert1_fast=… dedup_s=…`): jobs filtered, and of them how many kept the full window, were proven to fail (`b1`) or were narrowed (`b2`), with the window rows before and after, the number of 16-bit rescue jobs (which the filter never sees), the jobs the SIMD filter answered from its repeat memo, the jobs answered from an identical recent job's result instead of being enqueued, and the thread-summed seconds of each rescue stage; how many post-rescue dedups ran, were skipped, took the one-region insert and of those were done in one pass; and how the banded DP resolved (`[RESCUE_BAND] banded_parents=… …`). Measurement only; output is unchanged. |
 | `BWA3_RESCUE_DEDUP_SKIP=0` | Run every post-rescue dedup in full instead of skipping one proven to be a no-op or adding a single new region in one pass. Default on. It only chooses between exact paths, so output is the same either way by design. |
 | `BWA3_RESCUE_REPEAT=0` | Enqueue every rescue job instead of answering one that repeats one of the thread's last eight filtered jobs byte for byte (the same mate against an identical window) from that job's result. Default on. It only chooses between exact paths, so output is the same either way by design. |

@@ -12,14 +12,23 @@
 //        - B2 (hull [hb, he]): whenever the full window reaches the threshold,
 //          the full window and the hull alone agree on score, qe, te, tb, qb
 //          and score2 (te/tb shifted by hb).
+//      The same at other scorings the lemma admits (rescue_prune_params):
+//      -B 6, -O 8 -E 2, split gap costs and -A 2 -B 8 -O 12 -E 2, and the
+//      refused ones (-B 3, a cheap insertion) keep every window in full.
+//      And under --meth (rescue_prune_params::set_meth), against ksw_align2
+//      with the genomic, neutral and collapsed OT / OB matrices, on mates
+//      with converted bases.
 //   2. The guard exits the lemma depends on: any N, a threshold below 5, and a
 //      query or window beyond the scratch capacity all return FULL.
 //   3. Where a SIMD filter is compiled in (NEON on aarch64, the SSE4.1 / SSSE3
-//      port on x86 AVX2 builds), that filter (rescue_prune_window at threshold
-//      19) against the int32 scalar filter (rescue_prune_window_scalar) and,
-//      where it fits, the int16 reference lean(): identical (kind, hb, he).
+//      port on x86 AVX2 builds), that filter (rescue_prune_window, at 19 and
+//      at thresholds 5 / 10 / 32 in rotation, and at scorings with other bound
+//      weights: c = 2, a = 2, -x intractg's tail) against the int32 scalar
+//      filter (rescue_prune_window_scalar) and, where it fits, the int16
+//      reference lean(): identical (kind, hb, he).
 //   4. There too, the SIMD filter's repeat memo and its component list: a
-//      repeated job returns the first call's decision and view, and band
+//      repeated job returns the first call's decision and view, the same job
+//      at another threshold is not answered from the memo, and band
 //      planning's components taken from the filter's list equal a rescan of
 //      the view, at every cap.
 //
@@ -31,21 +40,25 @@
 #include <cstring>
 #include <memory>
 #include <random>
+#include <string>
 #include <vector>
 
 #include "doctest/doctest.h"
+#include "bwamem.h"
 #include "ksw.h"
+#include "meth_scoring.h"
 #include "rescue_band.h"
 #include "rescue_prune.h"
+#include "rescue_prune_test.h"
 #include "scoring.h"
 #include "simd_dispatch.h"
 
 namespace {
 
-constexpr int kSimdMinsc = 19;       // min_seed_len * a at the defaults; the SIMD filter's threshold
+constexpr int kSimdMinsc = 19;       // min_seed_len * a at the defaults
 constexpr int kDefaultMaxHits = 400; // BWA3_RESCUE_PRUNE_MAX_HITS default
 constexpr int kNoGate = 1 << 30;
-constexpr int kGapOpen = 6, kGapExtend = 1;  // the only gaps the pruning lemma is derived for
+constexpr int kGapOpen = 6, kGapExtend = 1;  // the default gap costs
 constexpr uint8_t kN = 4;
 
 struct Job {
@@ -151,15 +164,16 @@ std::vector<Job> build_n_jobs(std::mt19937 &rng)
     return jobs;
 }
 
-// ksw_align2 at the rescue settings for threshold `minsc`. It reverses its
-// target in place for the start pass, so both sequences are copied per call.
-kswr_t scalar_sw(const std::vector<uint8_t> &q, const uint8_t *ref, int len1, int minsc,
+// ksw_align2 at the rescue settings for threshold p.minsc and p's gap costs
+// (the matrix carries a and b). It reverses its target in place for the start
+// pass, so both sequences are copied per call.
+kswr_t scalar_sw(const std::vector<uint8_t> &q, const uint8_t *ref, int len1, const rescue_prune_params &p,
                  const bwa_tests::ScoringMatrix &mat)
 {
     std::vector<uint8_t> qq(q), rr(ref, ref + len1);
-    const int xtra = KSW_XSUBO | KSW_XSTART | KSW_XBYTE | minsc;
+    const int xtra = KSW_XSUBO | KSW_XSTART | KSW_XBYTE | p.minsc;
     return ksw_align2((int)qq.size(), qq.data(), len1, rr.data(), 5, mat.data(),
-                      kGapOpen, kGapExtend, kGapOpen, kGapExtend, xtra, nullptr);
+                      p.o_del, p.e_del, p.o_ins, p.e_ins, xtra, nullptr);
 }
 
 bool has_n(const std::vector<uint8_t> &seq)
@@ -197,10 +211,11 @@ long count_hits(const Job &jb)
 struct Tally { int b1 = 0, b2 = 0, full = 0; };
 
 // ksw_align2 over one job's full window, and over its last B2 hull, at one
-// threshold: each computed at most once however many hit gates the job is
-// checked under (the gate changes the decision, never the oracle).
+// scoring and threshold: each computed at most once however many hit gates the
+// job is checked under (the gate changes the decision, never the oracle).
 struct Oracle {
     const Job &jb;
+    const rescue_prune_params p;
     const int minsc;
     const bwa_tests::ScoringMatrix &mat;
     bool have_full = false;
@@ -208,11 +223,14 @@ struct Oracle {
     int sub_hb = -1, sub_he = -1;
     kswr_t sub{};
 
-    Oracle(const Job &j, int m, const bwa_tests::ScoringMatrix &sm) : jb(j), minsc(m), mat(sm) {}
+    Oracle(const Job &j, int m, const bwa_tests::ScoringMatrix &sm)
+        : jb(j), p(rescue_prune_params::defaults(m)), minsc(m), mat(sm) {}
+    Oracle(const Job &j, const rescue_prune_params &sp, const bwa_tests::ScoringMatrix &sm)
+        : jb(j), p(sp), minsc(sp.minsc), mat(sm) {}
     const kswr_t &full_window()
     {
         if (!have_full) {
-            full = scalar_sw(jb.q, jb.ref.data(), (int)jb.ref.size(), minsc, mat);
+            full = scalar_sw(jb.q, jb.ref.data(), (int)jb.ref.size(), p, mat);
             have_full = true;
         }
         return full;
@@ -220,7 +238,7 @@ struct Oracle {
     const kswr_t &hull(int hb, int he)
     {
         if (hb != sub_hb || he != sub_he) {
-            sub = scalar_sw(jb.q, jb.ref.data() + hb, he - hb + 1, minsc, mat);
+            sub = scalar_sw(jb.q, jb.ref.data() + hb, he - hb + 1, p, mat);
             sub_hb = hb;
             sub_he = he;
         }
@@ -235,7 +253,8 @@ void check_against_oracle(int max_hits, Oracle &o, Tally &t)
     const int minsc = o.minsc;
     const int len1 = (int)jb.ref.size(), len2 = (int)jb.q.size();
     int hb = -2, he = -2;
-    const int kind = rescue_prune_window(jb.ref.data(), len1, jb.q.data(), len2, minsc, max_hits, &hb, &he);
+    const int kind = rescue_prune_window(jb.ref.data(), len1, jb.q.data(), len2, o.p, max_hits, &hb, &he);
+    CAPTURE(o.p.a); CAPTURE(o.p.b); CAPTURE(o.p.o_del); CAPTURE(o.p.e_del); CAPTURE(o.p.o_ins); CAPTURE(o.p.e_ins);
     CAPTURE(jb.tag); CAPTURE(len1); CAPTURE(len2); CAPTURE(minsc); CAPTURE(max_hits); CAPTURE(kind);
     if (kind == RESCUE_PRUNE_FULL) { ++t.full; return; }
     const kswr_t &full = o.full_window();
@@ -300,6 +319,91 @@ TEST_CASE("rescue prune: B1 and B2 decisions reproduce every consumed ksw_align2
     }
 }
 
+// Other scorings: the lemma with K-mers, the charge c and the tail scaled to the deletion costs
+// (rescue_prune_params). Each job is checked at one scoring in rotation, at the default -k 19
+// (minsc = 19 a), which keeps the case inside the unit-test time budget; mates that leave the 8-bit
+// kernels at a = 2 (len2 * a + b > 254) are skipped, since pruning only sees 8-bit jobs. The
+// scorings the lemma refuses must keep every window in full.
+TEST_CASE("rescue prune: decisions at other scorings reproduce every consumed ksw_align2 field"
+          * doctest::test_suite("unit/pair")) {
+    std::mt19937 rng(4242);
+    const auto jobs = build_jobs(rng);
+    struct Sc { int a, b, o_del, e_del, o_ins, e_ins; const char *name; };
+    const Sc admitted[4] = {{1, 6, 6, 1, 6, 1, "-B 6"}, {1, 4, 8, 2, 8, 2, "-O 8 -E 2"},
+                            {1, 4, 6, 1, 7, 2, "-O 6,7 -E 1,2"}, {2, 8, 12, 2, 12, 2, "-A 2 -B 8 -O 12 -E 2"}};
+    const Sc refused[2] = {{1, 3, 6, 1, 6, 1, "-B 3"}, {1, 4, 6, 1, 2, 1, "-O 6,2 -E 1"}};
+    Tally t[4];
+    for (size_t i = 0; i < jobs.size(); i++) {
+        const Sc &s = admitted[i % 4];
+        const std::string name(s.name);
+        CAPTURE(name);
+        if ((int)jobs[i].q.size() * s.a + s.b > 254) continue;
+        const rescue_prune_params p = rescue_prune_params::from(s.a, s.b, s.o_del, s.e_del, s.o_ins, s.e_ins,
+                                                                kSimdMinsc * s.a);
+        REQUIRE(p.valid);
+        const auto mat = bwa_tests::build_scoring_matrix(s.a, s.b, 1);
+        Oracle o(jobs[i], p, mat);
+        check_against_oracle(kNoGate, o, t[i % 4]);
+    }
+    for (int k = 0; k < 4; k++) {
+        const std::string name(admitted[k].name);
+        CAPTURE(name);
+        MESSAGE(std::string(admitted[k].name) << ": B1=" << t[k].b1 << " B2=" << t[k].b2 << " FULL=" << t[k].full);
+        CHECK(t[k].b1 > 0);
+        CHECK(t[k].b2 > 0);
+    }
+    for (const Sc &s : refused) {
+        const std::string name(s.name);
+        CAPTURE(name);
+        const rescue_prune_params p = rescue_prune_params::from(s.a, s.b, s.o_del, s.e_del, s.o_ins, s.e_ins,
+                                                                kSimdMinsc * s.a);
+        CHECK(!p.valid);
+        int hb = -2, he = -2;
+        for (size_t i = 0; i < jobs.size(); i += 7)
+            CHECK(rescue_prune_window(jobs[i].ref.data(), (int)jobs[i].ref.size(), jobs[i].q.data(),
+                                      (int)jobs[i].q.size(), p, kNoGate, &hb, &he) == RESCUE_PRUNE_FULL);
+    }
+}
+
+// --meth: the filter matches C -> T (OT) or G -> A (OB) converted copies of the window and the mate,
+// which over-counts hits under every meth matrix, so its decisions must reproduce ksw_align2 with the
+// matrix itself (mat[ref * 5 + read], built by mem_opt_fill_meth_mat through
+// bwa_tests::meth_scoring_matrix: the conversion cell freed to +a, or to 0 under neutral, and under
+// collapsed its mirror too), at -B 4 so the lemma admits collapsed. Each job is checked at one (matrix, hypothesis) pair in rotation, with half of its
+// mate's convertible bases converted.
+TEST_CASE("rescue prune: --meth decisions reproduce ksw_align2 with the meth matrix"
+          * doctest::test_suite("unit/pair")) {
+    std::mt19937 rng(5150);
+    const auto jobs = build_jobs(rng);
+    const char *names[3] = {"genomic", "neutral", "collapsed"};
+    std::vector<bwa_tests::ScoringMatrix> mats;
+    const int scorings[3] = {MEM_METH_SCORING_GENOMIC, MEM_METH_SCORING_NEUTRAL, MEM_METH_SCORING_COLLAPSED};
+    for (int kind = 0; kind < 3; kind++)
+        for (int hyp = 0; hyp < 2; hyp++)   // hyp 1 = OT: ref C / read T; 0 = OB: ref G / read A
+            mats.push_back(bwa_tests::meth_scoring_matrix(scorings[kind], hyp == 1, 1, 4));
+    Tally t[3];
+    for (size_t i = 0; i < jobs.size(); i++) {
+        const int kind = (int)(i % 3), hyp = (int)((i / 3) % 2);
+        const std::string name(names[kind]);
+        CAPTURE(name); CAPTURE(hyp);
+        Job jb = jobs[i];
+        const uint8_t from = hyp ? 1 : 2, to = hyp ? 3 : 0;
+        for (uint8_t &b : jb.q)
+            if (b == from && (rng() & 1)) b = to;
+        rescue_prune_params p = rescue_prune_params::defaults(kSimdMinsc);
+        p.set_meth(hyp);
+        Oracle o(jb, p, mats[(size_t)(kind * 2 + hyp)]);
+        check_against_oracle(kNoGate, o, t[kind]);
+    }
+    for (int k = 0; k < 3; k++) {
+        const std::string name(names[k]);
+        CAPTURE(name);
+        MESSAGE("--meth " << name << ": B1=" << t[k].b1 << " B2=" << t[k].b2 << " FULL=" << t[k].full);
+        CHECK(t[k].b1 > 0);
+        CHECK(t[k].b2 > 0);
+    }
+}
+
 TEST_CASE("rescue prune: N, a threshold below 5 and oversized inputs keep the full window"
           * doctest::test_suite("unit/pair")) {
     std::mt19937 rng(31337);
@@ -335,16 +439,30 @@ TEST_CASE("rescue prune: the SIMD filter decides exactly as the scalar filters"
     std::unique_ptr<rescue_prune_scratch> scalar(new rescue_prune_scratch());
     std::unique_ptr<rescue_prune_neon::Scratch> ref16(new rescue_prune_neon::Scratch());
     int compared_lean = 0;
+    // The SIMD filters take the threshold at run time: every other job at 19, the rest at 5, 10 and 32
+    // in rotation (the tail slack ub - minsc - 2 and the mw threshold move with it).
+    const int other_minsc[3] = {5, 10, 32};
+    // And the bound weights, every fourth job: -O 8 -E 2 (c = 2, so a single-hit diagonal weighs
+    // a - c < 0), -A 2 -B 8 -O 12 -E 2 (a = 2) and -x intractg (the tail offset 12), at -k 19.
+    const rescue_prune_params weighted[3] = {rescue_prune_params::from(1, 4, 8, 2, 8, 2, kSimdMinsc),
+                                             rescue_prune_params::from(2, 8, 12, 2, 12, 2, 2 * kSimdMinsc),
+                                             rescue_prune_params::from(1, 9, 16, 1, 16, 1, kSimdMinsc)};
+    for (const rescue_prune_params &w : weighted) REQUIRE(w.simd_ok());
+    int n_weighted = 0;
     for (const int max_hits : {kDefaultMaxHits, kNoGate}) {
         for (size_t i = 0; i < jobs.size(); i++) {
             const Job &jb = jobs[i];
             const int len1 = (int)jb.ref.size(), len2 = (int)jb.q.size();
-            CAPTURE(jb.tag); CAPTURE(i); CAPTURE(len1); CAPTURE(len2); CAPTURE(max_hits);
+            const int minsc = i % 2 ? kSimdMinsc : other_minsc[(i / 2) % 3];
+            const bool wtd = i % 4 == 3;
+            const rescue_prune_params p = wtd ? weighted[(i / 4) % 3] : rescue_prune_params::defaults(minsc);
+            n_weighted += wtd;
+            CAPTURE(jb.tag); CAPTURE(i); CAPTURE(len1); CAPTURE(len2); CAPTURE(max_hits); CAPTURE(p.minsc);
+            CAPTURE(p.a); CAPTURE(p.c);
             int hb = -2, he = -2, shb = -2, she = -2;
-            const int kind = rescue_prune_window(jb.ref.data(), len1, jb.q.data(), len2, kSimdMinsc, max_hits,
-                                                 &hb, &he);
-            const int skind = rescue_prune_window_scalar(jb.ref.data(), len1, jb.q.data(), len2, kSimdMinsc,
-                                                         max_hits, *scalar, &shb, &she);
+            const int kind = rescue_prune_window(jb.ref.data(), len1, jb.q.data(), len2, p, max_hits, &hb, &he);
+            const int skind = rescue_prune_window_scalar(jb.ref.data(), len1, jb.q.data(), len2, p, max_hits,
+                                                         *scalar, &shb, &she);
             CHECK(kind == skind);
             if (kind == RESCUE_PRUNE_B2 && skind == RESCUE_PRUNE_B2) {
                 CHECK(hb == shb);
@@ -354,12 +472,12 @@ TEST_CASE("rescue prune: the SIMD filter decides exactly as the scalar filters"
             // no N guard, a fixed capacity and int16 sums, so compare it only without the gate, on
             // N-free jobs (the filters refuse the rest, checked above), where it fits, and below
             // 32000 hits.
-            if (max_hits == kNoGate && !has_n(jb.ref) && !has_n(jb.q)
+            if (max_hits == kNoGate && !wtd && !has_n(jb.ref) && !has_n(jb.q)
                 && len1 + kswv_query_quantum8(len2) + 1 <= 4096 && len1 >= 5 && len2 >= 5
                 && count_hits(jb) <= 32000) {
                 const rescue_prune_neon::Job lj{len1, len2, 0, 0, -1, -1, jb.ref.data(), jb.q.data()};
                 int lhb = -2, lhe = -2;
-                const rescue_prune_neon::Kind lk = rescue_prune_neon::lean(lj, *ref16, lhb, lhe);
+                const rescue_prune_neon::Kind lk = rescue_prune_neon::lean(lj, *ref16, lhb, lhe, minsc);
                 ++compared_lean;
                 CHECK((int)lk == skind);
                 if (lk == rescue_prune_neon::B2 && skind == RESCUE_PRUNE_B2) {
@@ -370,6 +488,7 @@ TEST_CASE("rescue prune: the SIMD filter decides exactly as the scalar filters"
         }
     }
     CHECK(compared_lean > 0);
+    CHECK(n_weighted > 50);
 #endif
 }
 
@@ -435,8 +554,9 @@ TEST_CASE("rescue prune: the SIMD filter's hit gate and query cache match the sc
 
 // The two shortcuts band planning takes from the SIMD filter (rescue_prune_neon.h / rescue_prune_x86.h):
 //   - an exact repeat of the previous job returns the previous decision without recomputing it, so
-//     it must return the same (kind, hb, he) and a view with the same components;
-//   - the filter lists its components at MINSC, and rescue_band_components reuses the list for the
+//     it must return the same (kind, hb, he) and a view with the same components, and the same job
+//     at another threshold must be decided afresh, as the scalar filter decides it;
+//   - the filter lists its components at the call's threshold, and rescue_band_components reuses the list for the
 //     whole view instead of rescanning it. With the list hidden (ncomp = -1) it rescans; both must
 //     give the same components and the same success at every cap, including a window with more
 //     components than the filter stores (COMP_CAP) and an output vector that is not empty.
@@ -448,6 +568,7 @@ TEST_CASE("rescue prune: the SIMD filter's repeat memo and component list match 
 #else
     std::mt19937 rng(314159);
     auto jobs = build_jobs(rng);
+    std::unique_ptr<rescue_prune_scratch> scalar(new rescue_prune_scratch());
     {   // one window with more components than COMP_CAP: a 20-base mate segment planted every 23 rows
         const int len1 = 3700, len2 = 100;
         auto ref = random_bases(rng, len1);
@@ -485,6 +606,18 @@ TEST_CASE("rescue prune: the SIMD filter's repeat memo and component list match 
         // a job the NEON filter handed to the scalar one (past its int16 range) has no memo.
         if (v.bnd16) CHECK(rv.repeat);
         CHECK(!v.repeat);
+        if (i % 8 == 0) {   // the same bytes at another threshold: not a repeat
+            const uint64_t hits0 = rescue_prune_memo_hits();
+            int ohb = -2, ohe = -2, shb = -2, she = -2;
+            const int okind = rescue_prune_window(ref2.data(), len1, q2.data(), len2, 25, kNoGate, &ohb, &ohe);
+            CHECK(rescue_prune_memo_hits() == hits0);
+            const int skind = rescue_prune_window_scalar(ref2.data(), len1, q2.data(), len2, 25, kNoGate,
+                                                         *scalar, &shb, &she);
+            CHECK(okind == skind);
+            if (okind == RESCUE_PRUNE_B2 && skind == RESCUE_PRUNE_B2) { CHECK(ohb == shb); CHECK(ohe == she); }
+            // restore the view at kSimdMinsc for the component checks below
+            rescue_prune_window(ref2.data(), len1, q2.data(), len2, kSimdMinsc, kNoGate, &rhb, &rhe, &rv);
+        }
         if (kind != RESCUE_PRUNE_B2 || !v.bnd16) continue;
         ++n_b2;
         REQUIRE(v.ncomp >= 0);
@@ -521,5 +654,71 @@ TEST_CASE("rescue band: the pass-0 cost gate's default follows the kswv tier"
                            BWAMEM3_TIER_AVX2, BWAMEM3_TIER_NEON}) {
         CAPTURE(tier);
         CHECK(rescue_band_cost_pct_default(tier) == 85);
+    }
+}
+
+// The run-level cost gate (rescue_prune_cost_ok): every outcome gives the same output, so no identity
+// check can see a wrong one; pinned here per architecture. aarch64 prunes everywhere but --meth with
+// chemistry other than EM-seq (TAPS); x86 never under --meth, only where the SIMD filter takes the
+// weights (K = 5, a <= 16), and not at the AVX-512BW tier from minsc 25.
+TEST_CASE("rescue prune: the cost gate per architecture, --meth chemistry and kswv tier"
+          * doctest::test_suite("unit/pair")) {
+    const rescue_prune_params dflt = rescue_prune_params::defaults(19);
+    const rescue_prune_params k25 = rescue_prune_params::defaults(25);
+    const rescue_prune_params a17 = rescue_prune_params::from(17, 68, 102, 17, 102, 17, 19 * 17);
+    REQUIRE(dflt.valid);
+    REQUIRE(k25.valid);
+    REQUIRE(a17.valid);
+    REQUIRE(!a17.simd_ok());
+    for (const bool avx512 : {false, true}) {
+        CAPTURE(avx512);
+#if defined(__aarch64__)
+        CHECK(rescue_prune_cost_ok(dflt, false, false, avx512));
+        CHECK(rescue_prune_cost_ok(dflt, true, true, avx512));    // --meth, EM-seq
+        CHECK(!rescue_prune_cost_ok(dflt, true, false, avx512));  // --meth=taps
+        CHECK(rescue_prune_cost_ok(k25, false, false, avx512));
+        CHECK(rescue_prune_cost_ok(a17, false, false, avx512));   // the scalar filter pays here
+#else
+        CHECK(rescue_prune_cost_ok(dflt, false, false, avx512));
+        CHECK(!rescue_prune_cost_ok(dflt, true, true, avx512));   // no --meth pruning on x86
+        CHECK(!rescue_prune_cost_ok(dflt, true, false, avx512));
+        CHECK(rescue_prune_cost_ok(k25, false, false, avx512) == !avx512);
+        CHECK(rescue_prune_cost_ok(rescue_prune_params::defaults(24), false, false, avx512));
+        CHECK(!rescue_prune_cost_ok(a17, false, false, avx512));  // the scalar filter would decide
+#endif
+    }
+}
+
+// The default hit gate (rescue_prune_max_hits_default): like the cost gate, every value gives the
+// same output, so it is pinned here. aarch64 takes 1000 only where banding can turn the pruned
+// windows into savings (banding on, no --meth); everything else, and all of x86, takes 400.
+TEST_CASE("rescue prune: the default hit gate per architecture, banding and --meth"
+          * doctest::test_suite("unit/pair")) {
+    for (const bool banding : {false, true})
+        for (const bool meth : {false, true}) {
+            CAPTURE(banding);
+            CAPTURE(meth);
+#if defined(__aarch64__)
+            CHECK(rescue_prune_max_hits_default(banding, meth) == (banding && !meth ? 1000 : kDefaultMaxHits));
+#else
+            CHECK(rescue_prune_max_hits_default(banding, meth) == kDefaultMaxHits);
+#endif
+        }
+}
+
+// kswv's 8-bit kernels load each gap type's open plus extend as a byte, so a sum past 255 wraps there
+// and neither pruning nor the band kernels may take such a scoring (kswv8_scoring_ok).
+TEST_CASE("rescue prune: scorings past kswv's 8-bit gap byte are refused"
+          * doctest::test_suite("unit/pair")) {
+    CHECK(kswv8_scoring_ok(1, 4, 249, 6, 249, 6));
+    CHECK(rescue_prune_params::from(1, 4, 249, 6, 249, 6, 19).valid);
+    for (const int s : {0, 1}) {
+        CAPTURE(s);
+        const int od = s ? 6 : 250, ed = s ? 1 : 6, oi = s ? 250 : 6, ei = s ? 6 : 1;
+        CHECK(!kswv8_scoring_ok(1, 4, od, ed, oi, ei));
+        CHECK(!rescue_prune_params::from(1, 4, od, ed, oi, ei, 19).valid);
+        rb_scoring r;
+        r.o_del = od; r.e_del = ed; r.o_ins = oi; r.e_ins = ei;
+        CHECK(!r.valid());
     }
 }

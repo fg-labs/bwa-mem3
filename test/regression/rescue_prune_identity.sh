@@ -59,9 +59,21 @@
 # parents, or the identity would be vacuous; in a build without them (an x86
 # floor below avx2) the pruning legs take the same path and their non-vacuity
 # check is reported as skipped. A reference and a default leg at -k 25 must
-# match too: there x86 prunes nothing (its cost gate, rescue_prune_cost_ok) but
-# still bands pass 1, so the stats must show banded pass-1 jobs (and filtered
-# jobs on aarch64, none on x86).
+# match too: the SIMD filters run at any threshold, but at the AVX-512BW kswv
+# tier x86 prunes nothing there (its cost gate, rescue_prune_cost_ok) while it
+# still bands pass 1, so the stats must show banded pass-1 jobs, and filtered
+# jobs on every other tier and none at AVX-512BW. Two scorings other than the
+# default must match the reference at the same scoring too: -B 6 and
+# -O 8 -E 2, which the SIMD filters take, so their stats must show filtered
+# jobs and narrowed windows wherever they run, and a leg with every bandable
+# hull banded must match as well and show banded parents; and -B 3, which the
+# lemma refuses, so no filtered job. The band kernels take all three, so each
+# must band pass 1. The same pairs as bisulfite reads, under --meth -B 4,
+# --meth-scoring genomic, the default collapsed scoring and --meth=taps, must
+# match their references too: filtered jobs on aarch64 at the first two, none
+# at the collapsed one (refused), none with TAPS chemistry and none on x86;
+# and banded pass-1 jobs exactly where a leg does not prune (--meth bands with
+# the group's matrix only where it does not prune).
 #
 # Inputs:
 #   BWA_MEM3     — path to the bwa-mem3 binary under test
@@ -200,15 +212,27 @@ for k in range(40):
 
 with open('r1.fq', 'w') as f: f.write(''.join(r1))
 with open('r2.fq', 'w') as f: f.write(''.join(r2))
+
+# The same pairs as directional bisulfite reads for the --meth legs: every C of
+# read 1 read as T (the OT strand, nothing methylated), every G of read 2 as A.
+def conv(recs, f, t):
+    out = []
+    for r in recs:
+        name, seq, plus, qual = r.split('\n')[:4]
+        out.append('%s\n%s\n%s\n%s\n' % (name, seq.replace(f, t), plus, qual))
+    return ''.join(out)
+with open('m1.fq', 'w') as f: f.write(conv(r1, 'C', 'T'))
+with open('m2.fq', 'w') as f: f.write(conv(r2, 'G', 'A'))
 PY
 
 "$BIN" index ref.fa > /dev/null 2>&1 || fail "index nonzero exit"
 
-MEM_OPTS=() # extra `mem` options for the legs that follow; set per block
-run_leg() { # $1 = threads, $2 = output stem, rest = env assignments
+MEM_OPTS=()       # extra `mem` options for the legs that follow; set per block
+FQS=(r1.fq r2.fq) # the leg's read pair; the --meth legs switch to the bisulfite pair
+run_leg() {       # $1 = threads, $2 = output stem, rest = env assignments
     local t="$1" stem="$2"
     shift 2
-    env "$@" "$BIN" mem ${MEM_OPTS[@]+"${MEM_OPTS[@]}"} -t "$t" ref.fa r1.fq r2.fq 2> "$stem.err" \
+    env "$@" "$BIN" mem ${MEM_OPTS[@]+"${MEM_OPTS[@]}"} -t "$t" ref.fa "${FQS[@]}" 2> "$stem.err" \
         | grep -v '^@PG' > "$stem.sam" || fail "leg $stem nonzero exit"
     [ "$(grep -cv '^@' "$stem.sam" || true)" -gt 0 ] || fail "leg $stem produced no alignment records"
 }
@@ -222,6 +246,8 @@ case "$floor" in
     sse41 | sse42 | avx | scalar) has_simd=0 ;;
     *) has_simd=1 ;;
 esac
+# The tier kswv runs at on this host (the dispatcher's choice, which the x86 cost gate keys on).
+host_tier="$(BWAMEM3_DEBUG_SIMD=1 "$BIN" 2>&1 | sed -n 's/.*SIMD tier: \([a-z0-9]*\).*/\1/p' | head -1 || true)"
 
 # The reference: every shortcut and alternative kernel form off. Defined once so
 # the unforced and forced-tier references cannot drift apart.
@@ -244,9 +270,10 @@ for t in 1 4; do
     done
 done
 
-# A seed length other than the default -k 19: on x86 pruning's cost gate turns pruning off there
-# (rescue_prune_cost_ok) while banded pass 1 still runs (rescue_exact_runs), a combination no
-# default-k leg reaches; on aarch64 both run. Must equal the reference at the same -k.
+# A seed length other than the default -k 19, so the filters run at another threshold: at the
+# AVX-512BW kswv tier pruning's cost gate turns pruning off there (rescue_prune_cost_ok) while
+# banded pass 1 still runs (rescue_band_runs), a combination no default-k leg reaches; elsewhere
+# both run. Must equal the reference at the same -k.
 MEM_OPTS=(-k 25)
 run_leg 4 "k25full.t4" BWA3_RESCUE_PRUNE_STATS=1 "${REF_ENV[@]}"
 run_leg 4 "k25.t4" BWA3_RESCUE_PRUNE_STATS=1
@@ -264,18 +291,95 @@ kp1=$(printf '%s\n' "$kbstats" | tr ' ' '\n' | sed -n 's/^pass1_banded=//p')
 k25_note="; -k 25: jobs=${kjobs:-0} pass1_banded=${kp1:-0}"
 if [ "$has_simd" = 1 ]; then
     [ "${kp1:-0}" -gt 0 ] || fail "no banded pass-1 job at -k 25 (SIMD floor '$floor'): $kstats $kbstats"
-    case "$floor" in
-        neon) [ "${kjobs:-0}" -gt 0 ] || fail "pruning filtered no rescue job at -k 25 on aarch64: $kstats" ;;
-        *) [ "${kjobs:-0}" -eq 0 ] || fail "x86 pruned at -k 25, past its -k 19 cost gate: $kstats" ;;
+    [ -n "$host_tier" ] || fail "could not detect the kswv SIMD tier from BWAMEM3_DEBUG_SIMD output"
+    case "$host_tier" in
+        avx512bw) [ "${kjobs:-0}" -eq 0 ] || fail "x86 pruned at -k 25 at the AVX-512BW tier, past its cost gate: $kstats" ;;
+        *) [ "${kjobs:-0}" -gt 0 ] || fail "pruning filtered no rescue job at -k 25 (kswv tier '$host_tier'): $kstats" ;;
     esac
 fi
+
+# Other scorings (rescue_prune_params) and --meth, each against the reference at the same options.
+# -B 6 (the default's bound weights) and -O 8 -E 2 (the per-diagonal charge c = 2, where a
+# single-hit diagonal weighs a - c < 0) the SIMD filters take, so they prune and narrow wherever
+# those run, and bands planned at them must hold (a leg with every bandable hull banded); -B 3 the
+# lemma refuses, so it prunes nowhere. The band kernels take all three, so each must band pass 1
+# (rescue_band_runs). The --meth legs read the same pairs as bisulfite reads (--meth writes SAM,
+# as without it): with EM-seq chemistry (the default) at -B 4 and --meth-scoring genomic the filter
+# matches converted copies, on aarch64 only (x86's cost gate); the default collapsed scoring
+# (b = 2a) the lemma refuses, and TAPS chemistry is gated off everywhere. --meth bands pass 1 with
+# the group's matrix exactly where it does not prune (rescue_band_meth_on).
+"$BIN" index --meth ref.fa > /dev/null 2>&1 || fail "index --meth nonzero exit"
+sc_note=""
+check_scoring() { # $1 = label, $2 = expectation, rest = mem options
+    # Expectation: simd (prunes wherever the SIMD filter runs), none (never prunes), meth (--meth,
+    # prunes on aarch64 only), methnone (--meth, never prunes).
+    local label="$1" where="$2" stem st sj sb2 bst sp1 bp prunes legs leg
+    shift 2
+    stem="sc_$(printf '%s' "$label" | tr -c 'A-Za-z0-9' '_')"
+    MEM_OPTS=("$@")
+    case "$where" in
+        meth | methnone) FQS=(m1.fq m2.fq) ;;
+        *) FQS=(r1.fq r2.fq) ;;
+    esac
+    run_leg 4 "$stem.full" BWA3_RESCUE_PRUNE_STATS=1 "${REF_ENV[@]}"
+    run_leg 4 "$stem" BWA3_RESCUE_PRUNE_STATS=1
+    legs="$stem"
+    if [ "$where" = simd ]; then
+        run_leg 4 "$stem.band" BWA3_RESCUE_PRUNE_STATS=1 BWA3_RESCUE_BAND_COST=100000000
+        legs="$stem $stem.band"
+    fi
+    MEM_OPTS=()
+    FQS=(r1.fq r2.fq)
+    for leg in $legs; do
+        if ! cmp -s "$stem.full.sam" "$leg.sam"; then
+            echo "FAIL: rescue leg $leg at $label differs from the reference at $label (-t 4):" >&2
+            diff "$stem.full.sam" "$leg.sam" | head -20 >&2 || true
+            exit 1
+        fi
+    done
+    st="$(grep '^\[RESCUE_PRUNE\]' "$stem.err" || true)"
+    [ -n "$st" ] || fail "BWA3_RESCUE_PRUNE_STATS=1 printed no [RESCUE_PRUNE] line ($label leg)"
+    sj=$(printf '%s\n' "$st" | tr ' ' '\n' | sed -n 's/^jobs=//p')
+    sb2=$(printf '%s\n' "$st" | tr ' ' '\n' | sed -n 's/^b2=//p')
+    bst="$(grep '^\[RESCUE_BAND\]' "$stem.err" || true)"
+    sp1=$(printf '%s\n' "$bst" | tr ' ' '\n' | sed -n 's/^pass1_banded=//p')
+    if [ "$has_simd" = 1 ]; then
+        case "$where/$floor" in
+            simd/* | meth/neon) prunes=1 ;;
+            *) prunes=0 ;;
+        esac
+        if [ "$prunes" = 1 ]; then
+            [ "${sj:-0}" -gt 0 ] || fail "pruning filtered no rescue job at $label (SIMD floor '$floor'): $st"
+        else
+            [ "${sj:-0}" -eq 0 ] || fail "pruning filtered rescue jobs at $label (SIMD floor '$floor'), past its gate: $st"
+        fi
+        case "$where" in
+            simd)
+                [ "${sb2:-0}" -gt 0 ] || fail "pruning narrowed no rescue window at $label: $st"
+                bp=$(grep '^\[RESCUE_BAND\]' "$stem.band.err" | tr ' ' '\n' | sed -n 's/^banded_parents=//p' || true)
+                [ "${bp:-0}" -gt 0 ] || fail "no banded parent at $label with the band cost gate opened"
+                ;;
+        esac
+        case "$where/$prunes" in
+            meth/1) [ "${sp1:-0}" -eq 0 ] || fail "--meth leg $label banded pass 1 on top of pruning: $bst" ;;
+            *) [ "${sp1:-0}" -gt 0 ] || fail "no banded pass-1 job at $label: $bst" ;;
+        esac
+    fi
+    sc_note="$sc_note; $label: jobs=${sj:-0} b2=${sb2:-0} pass1_banded=${sp1:-0}"
+}
+check_scoring "-B 6" simd -B 6
+check_scoring "-O 8 -E 2" simd -O 8 -E 2
+check_scoring "-B 3" none -B 3
+check_scoring "--meth -B 4" meth --meth -B 4
+check_scoring "--meth genomic" meth --meth --meth-scoring genomic
+check_scoring "--meth collapsed" methnone --meth
+check_scoring "--meth=taps" methnone --meth=taps
 
 # Forced tiers: the reference and default legs under each listed tier the host
 # has must equal the unforced reference. Ranked against the dispatcher's own
 # tier names (as in all_tiers_parity.sh): BWAMEM3_FORCE_TIER only downgrades.
 tier_note=""
 if [ -n "${RESCUE_TIERS:-}" ]; then
-    host_tier="$(BWAMEM3_DEBUG_SIMD=1 "$BIN" 2>&1 | sed -n 's/.*SIMD tier: \([a-z0-9]*\).*/\1/p' | head -1 || true)"
     [ -n "$host_tier" ] || fail "could not detect the host SIMD tier from BWAMEM3_DEBUG_SIMD output"
     rank() { # tier -> rank among the x86 tiers, or -1
         case "$1" in
@@ -341,7 +445,7 @@ if [ "$jobs" -eq 0 ]; then
     # above held vacuously.
     [ "$has_simd" = 0 ] \
         || fail "pruning filtered no rescue job, though this build (SIMD floor '$floor') has the SIMD filter: $stats"
-    echo "PASS: rescue_prune_identity (11-op cell, NEON-form defaults and dedup shortcuts == reference at -t 1 and -t 4; $dstats$tier_note$k25_note)"
+    echo "PASS: rescue_prune_identity (11-op cell, NEON-form defaults and dedup shortcuts == reference at -t 1 and -t 4; $dstats$tier_note$k25_note$sc_note)"
     echo "SKIP: pruning does not run in this build (SIMD floor $floor, below the SIMD filter's avx2); its legs held trivially"
     exit 0
 fi
@@ -369,4 +473,4 @@ p1stats="$(grep '^\[RESCUE_BAND\]' prune.t1.err || true)"
 p1=$(printf '%s\n' "$p1stats" | tr ' ' '\n' | sed -n 's/^pass1_banded=//p')
 [ "${p1:-0}" -gt 0 ] || fail "no banded pass-1 (start recovery) job at the defaults: $p1stats"
 
-echo "PASS: rescue_prune_identity (11-op cell, NEON-form defaults, dedup shortcuts, hull, pruned and banded == reference at -t 1 and -t 4; $dstats$tier_note$k25_note; $stats; $bstats)"
+echo "PASS: rescue_prune_identity (11-op cell, NEON-form defaults, dedup shortcuts, hull, pruned and banded == reference at -t 1 and -t 4; $dstats$tier_note$k25_note$sc_note; $stats; $bstats)"

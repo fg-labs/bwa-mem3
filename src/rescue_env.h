@@ -19,11 +19,11 @@
  * docs/src/whats-different/performance.md. Design notes: docs/src/developer-guide/rescue.md.
  *
  * rescue-knobs:begin
- * BWA3_RESCUE_PRUNE           1     exact 5-mer pruning of rescue windows (aarch64; x86 at the
- *                                   default -k 19); 0 also turns the banded passes off
+ * BWA3_RESCUE_PRUNE           1     exact K-mer pruning of rescue windows (aarch64 and x86 AVX2 /
+ *                                   AVX-512BW builds; scope: rescue-pruning.md); 0 also turns
+ *                                   the banded passes off
  * BWA3_RESCUE_PRUNE_MAX_HITS  auto  keep the full window above this many 5-mer hits; auto is 1000
- *                                   on aarch64 where banding runs at the SIMD filter's threshold,
- *                                   else 400
+ *                                   on aarch64 with banding on and no --meth, else 400
  * BWA3_RESCUE_PRUNE_STATS     0     1 prints the RESCUE_PRUNE and RESCUE_BAND counters and stage
  *                                   times at exit
  * BWA3_RESCUE_DEDUP_SKIP      1     skip a post-rescue dedup proven to be a no-op, and add a
