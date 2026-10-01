@@ -34,15 +34,17 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "io_utils.h"   /* fmi_pread_from_stream */
 
 #include <cstring>     /* memcpy, strcpy */
+#include <string>
 
 /* See declaration in read_index_ele.h. */
-void pac_slurp_and_close(FILE **fp_pac, uint8_t *dst, int64_t pac_bytes, int pread_workers)
+void pac_slurp_and_close(FILE **fp_pac, const char *pac_path, uint8_t *dst, int64_t pac_bytes,
+                         int pread_workers)
 {
     bwamem_madv_hugepage(dst, pac_bytes);
     // Slurp the whole 2-bit packed reference in parallel (same pread machinery
     // as the FM-index arrays); a small/test .pac falls back to one worker
     // inside fmi_pread_from_stream. A short read / EOF is fatal there.
-    fmi_pread_from_stream(*fp_pac, dst, (size_t)pac_bytes, pread_workers);
+    fmi_pread_from_stream(*fp_pac, pac_path, dst, (size_t)pac_bytes, pread_workers);
     err_fclose(*fp_pac);
     *fp_pac = NULL;
 }
@@ -98,7 +100,9 @@ void indexEle::bwa_idx_load_ele(const char *hint, int which, int pread_workers)
             int64_t pac_bytes = idx->bns->l_pac/4+1;
             idx->pac = (uint8_t*) calloc(pac_bytes, 1); // concatenated 2-bit encoded sequence
             xassert(idx->pac != NULL, "out of memory: idx->pac");
-            pac_slurp_and_close(&idx->bns->fp_pac, idx->pac, pac_bytes, pread_workers);
+            const std::string pac_path = std::string(prefix) + ".pac";  // as bns_restore opened it
+            pac_slurp_and_close(&idx->bns->fp_pac, pac_path.c_str(), idx->pac, pac_bytes,
+                                pread_workers);
         }
     }
     free(prefix);

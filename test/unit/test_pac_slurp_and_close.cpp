@@ -70,7 +70,7 @@ void check_slurp(size_t nbytes, int workers)
     REQUIRE(fp != NULL);
 
     std::vector<uint8_t> dst(nbytes ? nbytes : 1, 0xAB);
-    pac_slurp_and_close(&fp, dst.data(), (int64_t)nbytes, workers);
+    pac_slurp_and_close(&fp, file.path().c_str(), dst.data(), (int64_t)nbytes, workers);
 
     CHECK(fp == NULL);   // stream closed and pointer cleared for the caller
     size_t mismatch = nbytes;
