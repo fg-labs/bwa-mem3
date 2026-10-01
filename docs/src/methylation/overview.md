@@ -61,17 +61,23 @@ G→A at a reference `G` on OB — lands on that same freed cell and is therefor
 single read, so no aligner can separate the two. Under `collapsed` the mirror
 cell is freed as well, so C/T and G/A variants are hidden in both directions.
 
-> **This is a deliberate deviation from the SAM specification**, which defines
-> `NM` as the edit distance to the reference and `MD` as the mismatching
-> reference bases. Under `--meth` neither is literal: a converted base is
-> reported as matching a reference base it differs from, so `CIGAR` + `SEQ` +
-> `MD` reconstructs the *converted* reference, not the real one. This is the
-> same convention every mainstream bisulfite aligner uses — bwameth.py and
-> Bismark get it structurally by aligning in collapsed space, and BISCUIT
-> defines `NM` as "non-cytosine-conversion mismatches" — and it exists because a
-> literal `NM` makes an error-free bisulfite library look ~25 % divergent to
-> every downstream `NM` filter and QC metric. The non-`--meth` path is
-> unaffected and remains spec-literal.
+> **This is a deliberate deviation from the SAM specification**
+> ([#332](https://github.com/fg-labs/bwa-mem3/pull/332)), which defines `NM` as
+> the edit distance to the reference and `MD` as the mismatching reference
+> bases. Under `--meth` neither is literal: a converted base is reported as
+> matching a reference base it differs from, so `CIGAR` + `SEQ` + `MD`
+> reconstructs the *converted* reference, not the real one. Other bisulfite
+> aligners differ here. bwameth.py hides conversions in both tags by aligning in
+> collapsed space. BISCUIT hides them in `NM` only, which it defines as
+> "non-cytosine-conversion mismatches" (the literal value is `NM` + `ZC`), and
+> keeps `MD` literal. Bismark hides them in neither: its `NM` is the Hamming
+> distance plus indels between the read and the unconverted reference, and its
+> `MD` lists every converted base (measured with Bismark v0.24.2 and the v3.1.0
+> Rust port on end-to-end alignments of simulated directional reads). `--meth`
+> takes the bwameth.py convention because a literal `NM` makes an error-free
+> bisulfite library look roughly 20 % divergent on a human genome (about one
+> base in five is a converted C) to every downstream `NM` filter and QC metric.
+> The non-`--meth` path is unaffected and remains spec-literal.
 >
 > A single read cannot distinguish a bisulfite C→T from a real C→T SNP; that
 > aliasing is resolved downstream at the pileup. The aligner reports what its

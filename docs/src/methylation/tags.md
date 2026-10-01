@@ -11,6 +11,10 @@ each output record: `XR:Z`, `XG:Z`, and `XM:Z`. These tags are read by
 `processBismarkAln`, methtuple, DMRfinder, epialleleR, MethylDackel, and
 biscuit's per-read methylation tools.
 
+Only these three tags follow Bismark. `NM`/`MD` do not: Bismark counts every
+conversion as a mismatch, while `--meth` does not (see
+[how `NM`/`MD` are computed](overview.md#how-nmmd-are-computed-under---meth)).
+
 ## Tag reference
 
 ### `XR:Z` — read conversion direction
