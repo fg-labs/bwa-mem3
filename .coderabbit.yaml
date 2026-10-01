@@ -235,10 +235,13 @@ reviews:
         This is the bisulfite/EM-seq (`--meth`) path. Its defining invariant is
         that seeds are found in collapsed 3-letter (C→T) space but extension,
         scoring, and reporting all happen against the ORIGINAL 4-letter reference
-        via a per-strand asymmetric substitution matrix, so `NM`/`MD` stay
-        truthful. Flag any change that leaks collapsed-space sequence into a
-        scored or emitted field. The two `--meth-scoring` modes differ in exactly
-        which matrix cells are freed (`collapsed`: C↔T and G↔A both ways, `-B 2`;
+        via a per-strand asymmetric substitution matrix, so the matrix decides
+        which aligned-base mismatches `NM`/`MD` report, while insertions and
+        deletions are counted separately (a conversion is not a mismatch; see
+        docs/src/methylation/overview.md). Flag any change that leaks
+        collapsed-space sequence into a scored or emitted field. The two
+        `--meth-scoring` modes differ in exactly which matrix cells are freed
+        (`collapsed`: C↔T and G↔A both ways, `-B 2`;
         `genomic`: only the conversion direction, `-B 4`) — flag a change that
         alters one mode's matrix or default without saying so. Also flag:
         `XR`/`XG`/`XM` tag semantics drifting from Bismark convention;
