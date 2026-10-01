@@ -1,5 +1,5 @@
 # Deterministically construct the reference and the single-end reads for
-# test/ladder_rungs_test.sh. All bases
+# test/ladder_rungs_test.sh and test/ungapped_hit_parity_test.sh. All bases
 # are sliced from committed phix.fa, and every substitution is a fixed
 # rotation (A>C>G>T>A), so the fixture is byte-identical across awk
 # implementations -- no PRNG.
@@ -42,6 +42,19 @@
 #   strand, so the seed sits at the 3' end of the query and the staircase is
 #   extended to the LEFT of it: the left-extension ladder loops.
 #
+# CASE=L0tie, O20tie, d3zdrop -- the ungapped HIT path vs the extension
+#   kernel. Each read is phix[1000,1150) (150 bp) with substitutions in its
+#   first bases; the exact seed is the rest of the read and the LEFT extension
+#   walks the reversed prefix away from it.
+#   L0tie  : read[4]         -> reversed prefix [X][m m m m]. Under -L 0 the
+#            diagonal returns to h0 without exceeding it; the kernels keep the
+#            earlier record (qle 0), so bwa clips: 5S145M.
+#   O20tie : read[0,1,6]     -> reversed prefix [X][m m m m][X][X] under -O 20
+#            (x_threshold 4): tie at step 5, then -8; branch A at the default
+#            -L 5, kernels' qle 0: 7S143M.
+#   d3zdrop: read[10]        -> reversed prefix [X][m x10] under -d 3: the
+#            kernels z-drop on the mismatch (drop 4 > 3): 11S139M, AS 139.
+
 /^>/ { next }
      { phix = phix $0 }
 
@@ -131,6 +144,16 @@ END {
         emit_fq("adaptive", read)
         exit 0
     }
-    print "ERROR: unknown CASE " CASE > "/dev/stderr"
-    exit 1
+    read = substr(phix, 1001, 150)
+    if (CASE == "L0tie") {
+        read = subst(read, 5)
+    } else if (CASE == "O20tie") {
+        read = subst(read, 1); read = subst(read, 2); read = subst(read, 7)
+    } else if (CASE == "d3zdrop") {
+        read = subst(read, 11)
+    } else {
+        print "ERROR: unknown CASE " CASE > "/dev/stderr"
+        exit 1
+    }
+    emit_fq(CASE, read)
 }
