@@ -162,13 +162,13 @@ Methylation (--meth) options:
                  placement (sets -B 2).
                  genomic: free only the conversion direction, scored as a full
                  match, keep variants as mismatches (variant-aware: variants
-                 outside the conversion direction visible in NM/MD; -B 4).
+                 outside the conversion direction counted in NM; -B 4).
                  neutral: free only the conversion direction but score it 0
                  (tolerated, not rewarded); best for TAPS (variant-aware:
-                 variants visible in NM/MD as in genomic; -B 4).
+                 variants counted in NM as in genomic; -B 4).
                  In genomic/neutral a real variant in the conversion direction
                  itself (C->T at a reference C) is indistinguishable from a
-                 conversion and stays hidden in NM/MD.
+                 conversion and is not counted in NM.
    --meth-seed-prune[=spec30|baseline|off]
                  prune the 3-letter alphabet's short, repetitive spurious SMEMs
                  before SA resolution: ~30% faster --meth at ~0 accuracy cost

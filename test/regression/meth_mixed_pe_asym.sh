@@ -8,8 +8,8 @@
 # matrix for the batched-SIMD placement scorer, so bisulfite conversions were
 # penalized as mismatches (deflated AS/MAPQ). After A1's per-hypothesis partition
 # pass each mate is scored against its OT/OB object, so conversions are FREE in
-# scoring (AS == perfect). Since NM/MD are derived from that same matrix, the
-# conversions are hidden from NM/MD as well (issue #327).
+# scoring (AS == perfect). Since NM is derived from that same matrix, the
+# conversions are hidden from NM as well (issue #327).
 #
 # The decisive assertion per mate: AS == read length (60) AND NM == 0, with the
 # lowercase call count in XM:Z proving the read really carries #conversions > 0
@@ -84,7 +84,7 @@ check_mate() { # $1=label $2=mateflag $3=want_pos $4=want_rev $5=want_as $6=want
     # pass on a read with none, making this test vacuous.
     [ "$nconv" = "$6" ] || fail "$1: XM shows $nconv converted bases, want $6 (fixture must actually exercise conversions)"
     [ "$nconv" -gt 0 ] || fail "$1: converted-base count must be > 0 (test must actually exercise conversions)"
-    [ "$nm" = "0" ] || fail "$1: NM $nm, want 0 ($nconv conversions are matrix-freed, so they are matches for NM/MD)"
+    [ "$nm" = "0" ] || fail "$1: NM $nm, want 0 ($nconv conversions are matrix-freed, so they are not edits for NM)"
 }
 
 # R1 OT forward @101, AS 60 (10 C->T free), 10 conversions in XM, NM 0, XR CT.

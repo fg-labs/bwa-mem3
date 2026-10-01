@@ -316,6 +316,17 @@ the canonical build: a default (non-`--meth`) run of a deterministic phiX paired
 match, byte-for-byte, its `--compat` counterpart with `MQ:i`/`HN:i` stripped — so any perturbation
 of the default path fails CI.
 
+`MD` is literal under `--meth` ([#550](https://github.com/fg-labs/bwa-mem3/pull/550)): it lists every base the read differs from, bisulfite
+conversions included, so it differs from bwameth.py's collapsed-space `MD` on essentially every
+record that carries a conversion. `NM` still excludes conversions, as bwameth.py's does. Only `MD`
+changed: on a 900 kb simulated EM-seq set (60,000 pairs with random SNPs and indels; arm64, macOS,
+NEON tier), every other field of every record was byte-identical to the previous build under all
+three `--meth-scoring` modes, and the non-`--meth` records (`@PG` excluded) were byte-identical on
+that set and on phiX. See
+[how `NM`/`MD` are computed](../methylation/overview.md#how-nmmd-are-computed-under---meth). The
+`FG-METH-DIVERGENCE` row in the catalog below is generated from the divergence registry and does
+not yet carry this change.
+
 ## Degenerate numeric inputs (fail-fast, not silent)
 
 Two degenerate command lines that upstream bwa/bwa-mem2 accept but then mishandle

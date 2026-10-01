@@ -319,15 +319,16 @@ void bwa_fill_scmat(int a, int b, int8_t mat[25])
 
 /* Generate CIGAR when the alignment end points are known.
  *
- * `nm_from_mat` selects how the NM/MD pass classifies an aligned column:
- *   0 (default, non-meth): a column is a mismatch iff the bases differ literally
- *     (`query != rseq`) -- the historical bwa behaviour, byte-for-byte.
- *   1 (--meth): a column is a mismatch iff the SCORING MATRIX penalises it
- *     (`mat[ref*5 + query] < 0`). Under --meth `mat` is the per-hypothesis
- *     asymmetric matrix whose bisulfite-conversion cell is set to the match
- *     score (mem_opt_fill_meth_mat), so a C->T (OT) / G->A (OB) conversion is a
- *     match for NM/MD exactly as it already is for the DP. See the policy note
- *     in mem_reg2aln().
+ * MD always lists every column whose bases differ literally (`query != rseq`),
+ * so CIGAR + SEQ + MD rebuilds the real reference. `nm_from_mat` selects which
+ * of those columns NM counts:
+ *   0 (default, non-meth): every one -- the historical bwa behaviour, byte-for-byte.
+ *   1 (--meth): only those the SCORING MATRIX penalises (`mat[ref*5 + query] < 0`).
+ *     Under --meth `mat` is the per-hypothesis asymmetric matrix whose
+ *     bisulfite-conversion cell is set to the match score (or 0 under
+ *     `neutral`; mem_opt_fill_meth_mat), so a C->T (OT) / G->A (OB) conversion
+ *     is not an edit for NM, exactly as it is not for the DP, but MD still
+ *     lists it. See the policy note in mem_reg2aln().
  *
  * The matrix is safe to reuse here because the NM/MD pass and the DP share BOTH
  * buffers and frame: on the reverse strand (rb >= l_pac) `query`/`rseq` are
@@ -403,14 +404,12 @@ uint32_t *bwa_gen_cigar3(const int8_t mat[25], int o_del, int e_del, int o_ins, 
             op  = cigar[k]&0xf, len = cigar[k]>>4;
             if (op == 0) { // match
                 for (i = 0; i < len; ++i) {
-                    /* loop-invariant select; see the nm_from_mat contract above */
-                    const int is_mm = nm_from_mat
-                        ? (mat[rseq[y + i] * 5 + query[x + i]] < 0)
-                        : (query[x + i] != rseq[y + i]);
-                    if (is_mm) {
+                    if (query[x + i] != rseq[y + i]) {
                         kputw(u, &str);
                         kputc(int2base[rseq[y+i]], &str);
-                        ++n_mm; u = 0;
+                        u = 0;
+                        /* NM increment; see the nm_from_mat contract above */
+                        n_mm += nm_from_mat ? (mat[rseq[y + i] * 5 + query[x + i]] < 0) : 1;
                     } else ++u;
                 }
                 x += len; y += len;

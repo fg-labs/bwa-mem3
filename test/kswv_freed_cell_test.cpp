@@ -320,7 +320,7 @@ TEST_CASE("kswv NEON 8-bit: neutral OB scores the conversion cell 0") {
 
     CHECK(score8(ref, read, a, b, neu) - score8(ref, read, a, b, sym) == b);
 }
-// Neutral leaves the MIRROR cell a real mismatch (that is what keeps NM/MD
+// Neutral leaves the MIRROR cell a real mismatch (that is what keeps NM
 // variant-aware): freeing (C,T) to 0 must not touch (T,C).
 TEST_CASE("kswv NEON 8-bit: neutral leaves the mirror cell a mismatch") {
     if (!tier_supports_freed_cell()) return;   // scalar-only tier: no kernel score

@@ -22,8 +22,8 @@ it then extends, scores, and reports every alignment against the **original
 4-letter reference** using a per-strand asymmetric substitution matrix. The
 output is in the original alphabet with Bismark-compatible `XR`/`XG`/`XM` tags,
 so one BAM serves both methylation calling and — in the variant-aware scoring
-modes — variant calling, because a real variant the matrix penalises stays a
-mismatch in `NM`/`MD` while a bisulfite conversion does not. The exception is a
+modes — variant calling, because a real variant the matrix penalises counts
+toward `NM` while a bisulfite conversion does not. The exception is a
 variant in the conversion direction itself (a genuine C→T at a reference `C`),
 which no single read can tell apart from a conversion — see
 [how `NM`/`MD` are computed](#how-nmmd-are-computed-under---meth).
@@ -37,36 +37,55 @@ small number of records on their own. See
 
 ## How `NM`/`MD` are computed under `--meth`
 
-Under `--meth`, a column counts as a mismatch **iff the scoring matrix penalises
-it** — the same matrix that drives the DP. Because the per-strand asymmetric
-matrix scores the conversion cell (ref `C` × read `T` on OT, ref `G` × read `A`
-on OB) as a match, a bisulfite conversion is a match for `NM`/`MD` exactly as it
-already is for the alignment score. A perfectly converted read is `NM:i:0` with
-a plain `MD:Z:<len>`, and `MD` no longer enumerates every reference C.
+Under `--meth`, an aligned substitution (a read base aligned to a different
+reference base) counts toward `NM` **iff the scoring matrix penalises it**, the
+same matrix that drives the DP. The per-strand asymmetric matrix scores the
+conversion cell (ref `C` × read `T` on OT, ref `G` × read `A` on OB) as a match
+under `collapsed` and `genomic`, and as `0` under `neutral`. In every mode the
+matrix does not penalise a bisulfite conversion, so it is not an edit for `NM`
+and costs nothing in the alignment score; `neutral` also does not reward it. A
+perfectly converted read is `NM:i:0`. Insertions and deletions are not matrix
+cells: every inserted and every deleted base still counts toward `NM`, exactly
+as without `--meth`.
 
-There is no bisulfite special case in the `NM`/`MD` code: one definition —
-"a mismatch is what the scoring model penalises" — produces both the score and
-the tags, so `NM`/`MD` automatically track whatever `--meth-scoring` selects.
+`MD` stays literal. It lists every reference base the read differs from,
+conversions included, so `CIGAR` + `SEQ` + `MD` rebuilds the real reference
+(`samtools calmd` reproduces it exactly) and every converted base can be read
+off the record without the reference. A perfectly converted read's `MD` names
+each converted reference `C` (OT) or `G` (OB).
+
+So under `--meth`, `NM` is smaller than the edit count `MD` and `CIGAR` imply, by
+the number of columns the matrix frees. Tools that recompute `NM` from the
+reference report it as different, and that is expected. On 60,000 simulated
+EM-seq pairs (a 900 kb reference with random SNPs and indels, `--meth-scoring
+genomic`; arm64, macOS, NEON tier), `samtools calmd` (1.23.1) and Picard
+`ValidateSamFile` (3.4.0) both flagged `NM` on the 118,922 of 120,000 records
+whose `NM` excludes at least one conversion, while `calmd` left every `MD`
+unchanged. Both tools already flagged that `NM` before `MD` became literal.
+
+There is no bisulfite special case in the `NM` code: one definition, "an edit
+is what the scoring model penalises", produces both the score and `NM`, so `NM`
+automatically tracks whatever `--meth-scoring` selects.
 
 ### Which real variants stay visible
 
 The same rule decides that too. Under the variant-aware modes (`genomic`,
 `neutral`) the matrix frees *only* the conversion cell, so every penalised
-substitution stays a mismatch in `NM`/`MD` — including a C/T or G/A variant in
+substitution counts toward `NM`, including a C/T or G/A variant in
 the **opposite** direction (ref `T` × read `C` on OT, ref `A` × read `G` on OB),
 which is what makes the BAM usable for variant calling. But a variant in the
 **conversion direction itself** — a genuine C→T SNP at a reference `C` on OT, or
 G→A at a reference `G` on OB — lands on that same freed cell and is therefore
-*absent* from `NM`/`MD`: it is byte-indistinguishable from a conversion in a
+*absent* from `NM`: it is byte-indistinguishable from a conversion in a
 single read, so no aligner can separate the two. Under `collapsed` the mirror
-cell is freed as well, so C/T and G/A variants are hidden in both directions.
+cell is freed as well, so C/T and G/A variants are hidden from `NM` in both
+directions. `MD` lists all of them in every mode.
 
 > **This is a deliberate deviation from the SAM specification**
-> ([#332](https://github.com/fg-labs/bwa-mem3/pull/332)), which defines `NM` as
-> the edit distance to the reference and `MD` as the mismatching reference
-> bases. Under `--meth` neither is literal: a converted base is reported as
-> matching a reference base it differs from, so `CIGAR` + `SEQ` + `MD`
-> reconstructs the *converted* reference, not the real one. Other bisulfite
+> ([#332](https://github.com/fg-labs/bwa-mem3/pull/332), [#550](https://github.com/fg-labs/bwa-mem3/pull/550)), which defines `NM` as
+> the edit distance to the reference. Under `--meth`, `NM` is not literal: a
+> converted base is not counted as an edit against a reference base it differs
+> from. `MD` is literal, as the specification defines it. Other bisulfite
 > aligners differ here. bwameth.py hides conversions in both tags by aligning in
 > collapsed space. BISCUIT hides them in `NM` only, which it defines as
 > "non-cytosine-conversion mismatches" (the literal value is `NM` + `ZC`), and
@@ -74,15 +93,20 @@ cell is freed as well, so C/T and G/A variants are hidden in both directions.
 > distance plus indels between the read and the unconverted reference, and its
 > `MD` lists every converted base (measured with Bismark v0.24.2 and the v3.1.0
 > Rust port on end-to-end alignments of simulated directional reads). `--meth`
-> takes the bwameth.py convention because a literal `NM` makes an error-free
-> bisulfite library look roughly 20 % divergent on a human genome (about one
-> base in five is a converted C) to every downstream `NM` filter and QC metric.
-> The non-`--meth` path is unaffected and remains spec-literal.
+> takes the BISCUIT convention (`NM` excludes conversions, `MD` is literal).
+> Under `collapsed`, `NM` also excludes C/T and G/A variants in the mirror
+> direction, which BISCUIT's `NM` would count. A literal `NM` makes an error-free bisulfite
+> library look roughly 20 % divergent on a human genome (about one base in five
+> is a converted C) to every downstream `NM` filter and QC metric, so `NM`
+> excludes conversions. Hiding them from `MD` as well would buy nothing for
+> filtering and would throw away the only per-base record of the conversions,
+> so `MD` stays literal. The non-`--meth` path is unaffected and remains
+> spec-literal.
 >
 > A single read cannot distinguish a bisulfite C→T from a real C→T SNP; that
-> aliasing is resolved downstream at the pileup. The aligner reports what its
-> scoring model treats as divergence rather than adjudicating chemistry against
-> genotype base by base.
+> aliasing is resolved downstream at the pileup. `NM` reports what the scoring
+> model treats as divergence rather than adjudicating chemistry against genotype
+> base by base.
 
 ## Three scoring modes: `--meth-scoring`
 
@@ -92,8 +116,8 @@ about converted bases. This is controlled by `--meth-scoring`:
 | Mode | Default? | Matrix | `-B` | Behavior |
 |------|----------|--------|------|----------|
 | **`collapsed`** | **`--meth` / `--meth=emseq`** | frees C↔T *and* G↔A both ways (two cells), each scored as a full match | `2` | bwameth-compatible **placement** — C/T and G/A are interchangeable, so it closely tracks bwameth's collapsed-space mapping. A close approximation, **not** exact: ~1% of records differ in `POS`/`CIGAR`/`MAPQ` on typical WGBS/EM-seq ([full caveat](bwameth-mapping.md)), so re-validate if pinned to a bwameth release. |
-| **`genomic`** | no (opt-in) | frees only the conversion direction (one cell), scored as a full match | `4` | **variant-aware** — the mirror cell stays penalised, so a real C/T or G/A variant scores as a mismatch and stays visible in `NM`/`MD`, making the BAM usable for variant calling. A variant in the conversion direction itself is still hidden ([why](#which-real-variants-stay-visible)). |
-| **`neutral`** | **`--meth=taps`** | frees only the conversion direction (one cell), scored `0` | `4` | **variant-aware and conservative** — a conversion is tolerated but not rewarded, so a sparse TAPS conversion no longer over-credits a spurious C→T alignment. Real variants stay visible in `NM`/`MD` on the same terms as `genomic`; +0.24–0.28 pp placement over `genomic`, measured on 4.07 M simulated TAPS reads against full hg38 across three methylation loads ([full arms and method](taps.md#what---methtaps-changes)). |
+| **`genomic`** | no (opt-in) | frees only the conversion direction (one cell), scored as a full match | `4` | **variant-aware** — the mirror cell stays penalised, so a real C/T or G/A variant scores as a mismatch and counts toward `NM`, making the BAM usable for variant calling. A variant in the conversion direction itself is still not counted in `NM`, though `MD` lists it ([why](#which-real-variants-stay-visible)). |
+| **`neutral`** | **`--meth=taps`** | frees only the conversion direction (one cell), scored `0` | `4` | **variant-aware and conservative** — a conversion is tolerated but not rewarded, so a sparse TAPS conversion no longer over-credits a spurious C→T alignment. Real variants count toward `NM` on the same terms as `genomic`; +0.24–0.28 pp placement over `genomic`, measured on 4.07 M simulated TAPS reads against full hg38 across three methylation loads ([full arms and method](taps.md#what---methtaps-changes)). |
 
 The default follows the chemistry: `--meth` and `--meth=emseq` default to
 `collapsed`, so existing methylation pipelines see bwameth-compatible read
@@ -168,7 +192,7 @@ bwa-mem3 mem --meth -t 16 ref.fa R1.fq.gz R2.fq.gz \
 samtools index out.bam
 
 # Opt into variant-aware scoring (variants outside the conversion direction stay
-# visible in NM/MD; BAM usable for variant calling).
+# counted in NM; BAM usable for variant calling).
 bwa-mem3 mem --meth --meth-scoring genomic -t 16 ref.fa R1.fq.gz R2.fq.gz \
   | samtools sort -o out.bam
 

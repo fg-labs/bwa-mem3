@@ -1706,13 +1706,13 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "                 placement (sets -B 2).\n");
     fprintf(stderr, "                 genomic: free only the conversion direction, scored as a full\n");
     fprintf(stderr, "                 match, keep variants as mismatches (variant-aware: variants\n");
-    fprintf(stderr, "                 outside the conversion direction visible in NM/MD; -B 4).\n");
+    fprintf(stderr, "                 outside the conversion direction counted in NM; -B 4).\n");
     fprintf(stderr, "                 neutral: free only the conversion direction but score it 0\n");
     fprintf(stderr, "                 (tolerated, not rewarded); best for TAPS (variant-aware:\n");
-    fprintf(stderr, "                 variants visible in NM/MD as in genomic; -B 4).\n");
+    fprintf(stderr, "                 variants counted in NM as in genomic; -B 4).\n");
     fprintf(stderr, "                 In genomic/neutral a real variant in the conversion direction\n");
     fprintf(stderr, "                 itself (C->T at a reference C) is indistinguishable from a\n");
-    fprintf(stderr, "                 conversion and stays hidden in NM/MD.\n");
+    fprintf(stderr, "                 conversion and is not counted in NM.\n");
     fprintf(stderr, "   --meth-seed-prune[=spec30|baseline|off]\n");
     fprintf(stderr, "                 prune the 3-letter alphabet's short, repetitive spurious SMEMs\n");
     fprintf(stderr, "                 before SA resolution: ~30%% faster --meth at ~0 accuracy cost\n");
@@ -3266,11 +3266,11 @@ int main_mem(int argc, char *argv[])
         opt->band_cert = 0;
     }
 
-    /* Under --meth, NM/MD are derived from the scoring matrix (a column is a
-     * mismatch iff the matrix penalizes it), so a non-positive -B makes every
-     * substitution cell non-negative and silently collapses NM to 0 and MD to
-     * a bare match run -- hiding real variants, not just conversions. Refuse it
-     * rather than emit output that looks clean because scoring is degenerate.
+    /* Under --meth, NM is derived from the scoring matrix (an aligned column
+     * is an edit iff the matrix penalizes it; indels always count), so a
+     * non-positive -B makes every substitution cell non-negative and silently
+     * collapses NM to 0 -- hiding real variants, not just conversions. Refuse
+     * it rather than emit output that looks clean because scoring is degenerate.
      * The bound is `<= 0`, not `== 0`: bwa_fill_scmat stores -b, so a NEGATIVE
      * -B turns every substitution into a positive reward, which hides real
      * variants at least as thoroughly as -B 0 does.
@@ -3281,7 +3281,7 @@ int main_mem(int argc, char *argv[])
     if (opt->meth_mode && opt->b <= 0) {
         fprintf(stderr, "ERROR: --meth requires a positive mismatch penalty, but the "
                         "effective penalty is %d; a non-positive penalty makes every "
-                        "substitution free or rewarded, which collapses NM/MD to zero "
+                        "substitution free or rewarded, which collapses NM to zero "
                         "and hides real variants (check -B and -A)\n", opt->b);
         free(opt);
         if (out_opened) fclose(aux.fp);

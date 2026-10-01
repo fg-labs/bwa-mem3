@@ -13,11 +13,13 @@
 #
 # Directional contract: R1 -> OT (XR:CT), R2 -> OB (XR:GA), regardless of which
 # genomic strand the mate maps to. Conversions are scored free (AS == 60), and
-# because NM/MD are derived from the same matrix they are hidden from NM too
+# because NM is derived from the same matrix they are hidden from NM too
 # (NM == 0; issue #327) -- with XM's lowercase call count proving the read really
 # carries #conversions > 0, so NM == 0 cannot pass vacuously. Together these
 # confirm placement and original-alphabet scoring are jointly correct on every
-# strand/hypothesis.
+# strand/hypothesis. MD stays literal on all four records: each must carry one
+# MD:Z, and samtools calmd must leave it unchanged while reporting the
+# conversion-free NM as different.
 #
 # Inputs:
 #   BWA_MEM3 — path to the bwa-mem3 binary under test
@@ -82,7 +84,28 @@ check() { # $1 bam  $2 mateflag  $3 label  $4 pos  $5 rev  $6 xr  $7 as  $8 ncon
     [ "$as" = "$7" ] || fail "$3: AS $as, want $7 (conversions scored free)"
     [ "$nconv" = "$8" ] || fail "$3: XM shows $nconv converted bases, want $8 (fixture must actually exercise conversions)"
     [ "$nconv" -gt 0 ] || fail "$3: converted-base count must be > 0 (test must actually exercise conversions)"
-    [ "$nm" = "0" ] || fail "$3: NM $nm, want 0 ($nconv conversions are matrix-freed, so they are matches for NM/MD)"
+    [ "$nm" = "0" ] || fail "$3: NM $nm, want 0 ($nconv conversions are matrix-freed, so they are not edits for NM)"
+}
+
+# MD is literal under --meth: samtools calmd, recomputing MD from ref.fa, must
+# leave every record's MD unchanged. calmd adds a missing MD without reporting
+# "different MD", so every record must first carry exactly one MD:Z, or the MD
+# check would pass on a record that has none. NM excludes conversions, so calmd
+# must instead report a different NM on both mates; that also proves calmd
+# compared the records rather than passing vacuously.
+md_matches_calmd() { # $1 = BAM
+    local counts n_rec n_md1
+    counts="$(samtools view "$1" | mawk '
+        { n = 0; for (i = 12; i <= NF; i++) if ($i ~ /^MD:Z:/) n++; rec++; if (n == 1) ok++ }
+        END { print rec + 0, ok + 0 }')" || fail "$1: reading records for the MD:Z count failed"
+    read -r n_rec n_md1 <<< "$counts"
+    [ "$n_rec" = "2" ] || fail "$1: want 2 records, got $n_rec"
+    [ "$n_md1" = "$n_rec" ] || fail "$1: only $n_md1 of $n_rec records carry exactly one MD:Z tag; calmd would add a missing MD silently"
+    samtools calmd "$1" ref.fa > /dev/null 2> "$1.calmd.err" || fail "$1: samtools calmd nonzero exit"
+    ! grep -q 'different MD' "$1.calmd.err" || fail "$1: MD differs from samtools calmd: $(cat "$1.calmd.err")"
+    local n_nm
+    n_nm=$(grep -c 'different NM' "$1.calmd.err" || true)
+    [ "$n_nm" = "2" ] || fail "$1: want samtools calmd to report NM on both mates, got $n_nm: $(cat "$1.calmd.err")"
 }
 
 # --- forward fragment ---
@@ -92,6 +115,7 @@ emit f "$FWD_R2" f2.fq
 samtools quickcheck fwd.bam || fail "fwd produced an invalid BAM"
 check fwd.bam 64 "FWD R1 OT-fwd" 101 0 CT 60 10
 check fwd.bam 128 "FWD R2 OB-rev" 301 1 GA 60 5
+md_matches_calmd fwd.bam
 
 # --- reverse fragment ---
 emit r "$REV_R1" r1.fq
@@ -100,5 +124,6 @@ emit r "$REV_R2" r2.fq
 samtools quickcheck rev.bam || fail "rev produced an invalid BAM"
 check rev.bam 64 "REV R1 OT-rev" 701 1 CT 60 6
 check rev.bam 128 "REV R2 OB-fwd" 501 0 GA 60 9
+md_matches_calmd rev.bam
 
-echo "PASS: meth_pe_placement (OT/OB x forward/reverse remap placement + free-conversion scoring)"
+echo "PASS: meth_pe_placement (OT/OB x forward/reverse remap placement + free-conversion scoring + literal MD)"

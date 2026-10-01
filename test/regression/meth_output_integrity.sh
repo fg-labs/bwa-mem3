@@ -4,13 +4,14 @@
 # Regression (D3 B6): the --meth BAM is original-alphabet and Bismark-compatible.
 # Five invariants downstream methylation + variant callers depend on:
 #
-#  1. Real-SNP vs bisulfite-conversion. Under --meth, NM/MD are derived from the
+#  1. Real-SNP vs bisulfite-conversion. Under --meth, NM is derived from the
 #     per-hypothesis asymmetric matrix rather than from literal base inequality,
-#     so a column is a mismatch iff the matrix penalizes it. An OT read with 10
-#     C->T conversions plus one real A->G SNP must score AS = 60 - (a+b) (only the
-#     SNP penalized, conversions free), NM = 1, and an MD string with exactly one
-#     ref-A mismatch (the real variant) and NO ref-C entries -- the conversions
-#     are matches for NM/MD exactly as they already are for the DP (issue #327).
+#     so an aligned column is an edit iff the matrix penalizes it (indels always
+#     count), while MD stays literal.
+#     An OT read with 10 C->T conversions plus one real A->G SNP must score
+#     AS = 60 - (a+b) (only the SNP penalized, conversions free), NM = 1 (issue
+#     #327), and an MD string listing the ten ref-C conversions and the one ref-A
+#     variant, so CIGAR + SEQ + MD still rebuilds the real reference.
 #
 #     (The complementary case -- that `collapsed` additionally hides a real T->C
 #     variant while `genomic` keeps it -- is covered by meth_collapsed_scoring.sh,
@@ -76,13 +77,13 @@ md=$(tag "$line" MD)
 # --meth keeps the bwa default mismatch penalty b=4 (not bwameth's b=2), so the single real SNP costs -4
 # (conversions free): 59 match/freed columns (+59) - 1 SNP (-4) = 55.
 [ "$as" = "55" ] || fail "SNP/conv: AS $as, want 55 (only the real SNP penalized at b=4; conversions free)"
-[ "$nm" = "1" ] || fail "SNP/conv: NM $nm, want 1 (the real SNP only; conversions are matches for NM/MD)"
-# MD reference-base mismatch letters: exactly one ref-A (the SNP), no ref-C (the
-# conversions must not appear at all).
+[ "$nm" = "1" ] || fail "SNP/conv: NM $nm, want 1 (the real SNP only; conversions are not edits for NM)"
+# MD reference-base mismatch letters: the ten ref-C conversions and one ref-A (the
+# SNP); MD is literal, so the conversions are listed.
 nC=$(printf '%s' "$md" | tr -cd 'C' | wc -c | tr -d ' ')
 nA=$(printf '%s' "$md" | tr -cd 'A' | wc -c | tr -d ' ')
 nG=$(printf '%s' "$md" | tr -cd 'G' | wc -c | tr -d ' ')
-[ "$nC" = "0" ] || fail "SNP/conv: MD has $nC ref-C mismatches, want 0 (conversions must be hidden); MD=$md"
+[ "$nC" = "10" ] || fail "SNP/conv: MD has $nC ref-C mismatches, want 10 (MD lists every conversion); MD=$md"
 [ "$nA" = "1" ] || fail "SNP/conv: MD has $nA ref-A mismatches, want 1 (the real SNP); MD=$md"
 [ "$nG" = "0" ] || fail "SNP/conv: MD has $nG ref-G mismatches, want 0; MD=$md"
 
@@ -219,4 +220,4 @@ done
 [ "$(printf '%s' "$sa2" | cut -d, -f2)" = "$pos1" ] \
     || fail "SA: record 2's SA:Z points at $(printf '%s' "$sa2" | cut -d, -f2), want record 1's POS $pos1"
 
-echo "PASS: meth_output_integrity (real-SNP vs conversion in AS/NM/MD; Bismark four-strand XR/XG; reverse SEQ orientation; MQ:i/HN:i tag parity; SA:Z cross-reference on a split alignment)"
+echo "PASS: meth_output_integrity (real-SNP vs conversion in AS/NM, literal MD; Bismark four-strand XR/XG; reverse SEQ orientation; MQ:i/HN:i tag parity; SA:Z cross-reference on a split alignment)"

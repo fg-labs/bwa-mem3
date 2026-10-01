@@ -231,12 +231,12 @@ typedef struct mem_opt_t {
      *   GENOMIC: that cell alone is freed, to a MATCH (+a); the mirror
      *     (mat[T][C], mat[A][G]) STAYS at −b so genuine variants score as
      *     mismatches → one freed cell at +a ⇒ the SIMD rank-1 fast path.
-     *     Variant-aware: real variants stay visible in NM/MD.
+     *     Variant-aware: real variants still count toward NM.
      *   NEUTRAL: that cell alone is freed, to 0 (tolerated, not rewarded); the
      *     mirror STAYS at −b. One freed cell, but NOT rank-1 (the value is
      *     neither match nor mismatch) → bandedSWA's general path; the kswv
      *     freed-cell blend expresses it directly. Variant-aware: real variants
-     *     stay visible in NM/MD.
+     *     still count toward NM.
      *   COLLAPSED: the mirror cell is ALSO freed (two cells, both to +a) so C/T
      *     and G/A are interchangeable → reproduces bwameth; uses bandedSWA's
      *     general path.

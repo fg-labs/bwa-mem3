@@ -146,9 +146,9 @@ echo "[meth_collapsed] conversion read -> genomic: AS=$AS_Gc NM=$NM_Gc   neutral
 # Degenerate -B under --meth. "Mismatch iff the matrix penalizes it" only says
 # something while SOME cell is penalized: bwa_fill_scmat stores -b, so -B 0
 # makes every substitution free and -B <0 makes it a positive reward. Either
-# way NM collapses to 0 and MD to a bare match run for REAL variants, not just
-# conversions -- output that looks clean because scoring is degenerate. Both
-# must be refused, so the bound is `<= 0` rather than `== 0`.
+# way NM collapses to 0 for REAL variants, not just conversions -- output that
+# looks clean because scoring is degenerate. Both must be refused, so the bound
+# is `<= 0` rather than `== 0`.
 #
 # Assert the guard's own message, not merely a non-zero exit: `mem` exits 1 for
 # plenty of unrelated reasons (missing index, bad path), so an exit-code-only
