@@ -2248,8 +2248,10 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
             kswr_t aln;
             mem_alnreg_t b;
             // Default -1 (non-meth anchor stays -1); under --meth this is always
-            // overwritten below with the mate read#-derived hypothesis
-            // ((mate_meth_ot ^ is_rev) & 1), mirroring the scalar mem_matesw.
+            // overwritten below with the matrix hypothesis the mate is scored
+            // under in the rescue window ((mate_meth_ot ^ is_rev) & 1). It is
+            // relative to the window's strand half, not the genome-strand
+            // hypothesis b.meth_hypothesis records (see where b is filled in below).
             int meth_won_hyp = -1;
             int u8_shift = matesw_u8_shift_for(opt, opt->mat);
             int tmp, xtra = KSW_XSUBO | KSW_XSTART | (matesw_use_u8(l_ms, opt->a, u8_shift)? KSW_XBYTE : 0) | (opt->min_seed_len * opt->a);
@@ -2331,9 +2333,9 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
             else if (opt->meth_mode && mate_meth_ot >= 0) {
                 /* Single-hypothesis batched rescue: mem_matesw_batch_pre enqueued
                  * ONE pair at `index`, scored by the kswv OT/OB partition under the
-                 * mate's read# chemistry (XOR rescue strand). Read it and record the
-                 * genome-strand hypothesis for the XG/XM output layer — identical to
-                 * the scalar single-matrix path (index==-1 branch above). */
+                 * mate's read# chemistry (XOR rescue strand). Read it and note the
+                 * matrix hypothesis it was scored under — identical to the scalar
+                 * single-matrix path (index==-1 branch above). */
                 aln = *(*myaln + index);
                 meth_won_hyp = (mate_meth_ot ^ is_rev) & 1;
             }
@@ -2344,19 +2346,27 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
             if (aln.score >= opt->min_seed_len && aln.qb >= 0 && aln.qe < l_ms) { // something goes wrong if aln.qb < 0, or if aln.qe runs past the read
                 b.rid = a->rid;
                 b.is_alt = a->is_alt;
-                /* D3 (--meth): rescued mate hypothesis = the mate's own read#
-                 * chemistry XOR rescue strand ((mate_meth_ot ^ is_rev) & 1,
-                 * meth_won_hyp above) so the output layer (XG/XM) sources the
-                 * right strand. -1 anchor stays -1. The score came from the batched
-                 * kswv result (or the scalar ksw_align2 index==-1 fallback) under
-                 * that same single matrix — see above.
-                 * Coordinates are already ORIGINAL (l_pac is the original l_pac via
-                 * the original bns), so the 6a coordinate fix holds. */
-                b.meth_hypothesis = meth_won_hyp;
                 b.qb = is_rev? l_ms - (aln.qe + 1) : aln.qb;
                 b.qe = is_rev? l_ms - aln.qb : aln.qe + 1;
                 b.rb = is_rev? (l_pac<<1) - (rb + aln.te + 1) : rb + aln.tb;
                 b.re = is_rev? (l_pac<<1) - (rb + aln.tb) : rb + aln.te + 1;
+                /* D3 (--meth): meth_won_hyp, the matrix the SW scored under, is
+                 * relative to the strand half the window was clamped to, and is_rev
+                 * only says whether the mate is on the opposite strand from that
+                 * half. meth_hypothesis is the GENOME-strand hypothesis (OT=1,
+                 * OB=0), which the extension and mem_reg2aln flip themselves for a
+                 * region in the reverse half, so take it from the region's own
+                 * strand like they do: the mate's read-number chemistry XOR whether
+                 * b lies in the reverse half. Do not use the anchor's half: near the
+                 * end of the last contig the clamp can put the window on the other
+                 * half. Getting this wrong gives the mate the other strand's XG/XM
+                 * and regenerates its CIGAR/NM under the wrong conversion.
+                 * meth_strand_hyp (meth_hypothesis XOR is_rev) is the mate's
+                 * read-number chemistry. -1 (non-meth) stays -1 in both.
+                 * Coordinates are already ORIGINAL (l_pac is the original l_pac via
+                 * the original bns), so the 6a coordinate fix holds. */
+                b.meth_hypothesis = meth_won_hyp < 0 ? -1 : (int8_t)((mate_meth_ot ^ (b.rb >= l_pac)) & 1);
+                b.meth_strand_hyp = meth_won_hyp < 0 ? -1 : (int8_t)(mate_meth_ot & 1);
                 b.score = aln.score;
                 b.csub = aln.score2;
                 b.secondary = -1;

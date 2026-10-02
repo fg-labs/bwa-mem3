@@ -572,6 +572,52 @@ reads changed (29,824, 1,588 and 836,494 lines differed from bwa before), as wel
 defaults. Wall time on 5 M HG00096 pairs was 31.90-32.05 s against 32.07-32.24 s before
 (3 interleaved runs each).
 
+## `--meth` mate rescued off a reverse-strand anchor took the other strand (PR #553)
+
+Mate rescue searches for the missing mate in a window next to its anchor. The window lies on one
+strand half of the doubled reference: normally the anchor's, but `bns_clamp_window` picks the
+half from the window's midpoint, so near the end of the last contig it can be the other one.
+Under `--meth` the rescue scores the mate with the matrix that frees its read's conversion,
+`(mate_meth_ot ^ is_rev) & 1`, where `is_rev` says only whether the mate lies on the opposite
+strand *from the window's half*. That choice is relative to the window's half, and it is the
+right matrix for that window. `mem_matesw_batch_post` stored the same value as the rescued
+region's `meth_hypothesis`, which the rest of the aligner reads as the genome-strand hypothesis
+(OT or OB) and flips itself for regions in the reverse half: chain extension, and `mem_reg2aln`
+when it regenerates the CIGAR. The two agree only when the window is on the forward half.
+
+So a mate rescued off a reverse-strand anchor came out with the other strand: an OT read 1
+mapped forward was written `XG:Z:GA`, an OB read 2 mapped forward `XG:Z:CT`, and its `XM:Z` was
+read off the wrong base. The same happened to a mate rescued off a forward anchor whose window
+was clamped onto the reverse half at the end of the last contig. `mem_reg2aln` regenerated the
+mate's CIGAR and `NM` under the other conversion, so each C→T (or G→A) counted in `NM` as a
+mismatch (`MD`, literal under `--meth`, lists every difference either way and only follows the
+CIGAR);
+the global regeneration could also place an indel differently, which can move `POS` by a few
+bases. The rescued span (`qb`/`qe`, and so any soft clip) and the rescue score were computed with
+the right matrix, so the mate's locus, the pairing, `AS` and `XS` did not change, nor did `MAPQ`
+except where `--chimera-qc` caps it on the regenerated CIGAR (below); the
+anchor's record changes only where it describes the mate (`MC:Z`, and `PNEXT`/`TLEN` when `POS`
+moved). A rescued region kept as an alternative hit carries the same hypothesis, so its CIGAR and
+edit distance in `XA:Z` can change too. With the opt-in QC filters the flags can change as well:
+`--set-as-failed f|r` tests the mate's strand, and `--chimera-qc` its longest match in the
+regenerated CIGAR (also capping `MAPQ` at 1), and either result is propagated to every record of
+the pair (`0x200` set, `0x2` cleared).
+
+The fix takes the stored hypothesis from the rescued region's own strand, as the extension and
+`mem_reg2aln` do: the mate's read-number chemistry XOR whether the region lies in the reverse half.
+
+This is scoped to **`--meth` paired-end mate rescue** (every chemistry and `--meth-scoring` mode,
+TAPS included) **whose window lies on the reverse half**. Other records are byte-identical by
+construction, apart from a rescued alternative hit in `XA:Z`: the stored value is unchanged
+whenever the window is on the forward half, and the hypothesis is `-1` off `--meth`, so mates
+placed from their own seeds, single-end runs, `-S` runs and the default (non-`--meth`) path are
+unaffected. Pinned by `test/regression/meth_rescue_strand.sh`, which builds one rescued mate per
+fragment strand and anchor strand plus one at the end of the contig whose window is clamped onto
+the reverse half. Under collapsed and genomic scoring each must keep its position, strand and
+`XG`, align full length with `NM` equal to its planted errors, and have exactly its converted
+cytosines called in `XM`; under `--meth=taps` its strand and `XG`, with no conversion in `NM`.
+The reverse-anchor and contig-end mates fail it without the fix.
+
 ## Upstream port divergences: all chains dropped by the weight filter (PR #489) and the SA sentinel offset (PR #469)
 
 bwa-mem2 advertises output identical to bwa. Two records are known where its port is not
@@ -618,6 +664,7 @@ shipped, because parity with that release is its contract (see
 | Extension retry ladder stopped early on the ungapped band bound | [#540](https://github.com/fg-labs/bwa-mem3/pull/540) | — | fork-only (a record can change only where the early stop diverged from the full ladder, by recording a narrower band or different extension end fields; none changed on the WGS or SBX sets measured — see the correctness note above) |
 | Extension retry ladder ran four rungs where upstream runs two | [#543](https://github.com/fg-labs/bwa-mem3/pull/543) | — | fork-only (only an extension of more than 156 query bases at the default `-w 100` and scoring can reach a third rung, so under those defaults 150 bp reads are unchanged by construction; a narrower `-w` lowers the bound (`a*L > o_min + e_min*3w/2`, more than 36 query bases at `-w 20`); longer reads can change CIGAR, `AS` and the recorded band where the stop test failed at `2w` — see the correctness note above) |
 | Ungapped fast path: record tie-break and z-drop guard | [#544](https://github.com/fg-labs/bwa-mem3/pull/544) | — | fork-only (non-default parameters only: `-L 0`, gap costs that admit a second mismatch after a tie, `-d` below `b * x_threshold`, or `-w` below 2; the default `-L 5 -d 100` is byte-identical — see the correctness note above) |
+| `--meth` mate rescued off a reverse-strand anchor took the other strand | [#553](https://github.com/fg-labs/bwa-mem3/pull/553) | — | fork-only (`--meth` paired-end only, every chemistry; a mate rescued in a window on the reverse half gets its own `XG`/`XM` and a CIGAR/`NM` that no longer count its conversions (`MD` follows the CIGAR), where an indel can move and shift `POS`; its locus, `AS` and `XS` are unchanged, as is `MAPQ` unless `--chimera-qc` caps it on the regenerated CIGAR, its anchor changes only in `MC`/`PNEXT`/`TLEN`, a rescued alt hit in `XA:Z` can change, and `--set-as-failed`/`--chimera-qc` can flip the pair's `0x200`/`0x2`; every other record is byte-identical by construction — see the correctness note above) |
 | kseq2bseq1 zero-initialization | [#22](https://github.com/fg-labs/bwa-mem3/pull/22) | — | fork-only |
 | Proper-pair flag from emitted alignment | [#17](https://github.com/fg-labs/bwa-mem3/pull/17) | — | fork-only, **opt-in** (`--proper-pair-from-emitted`; default matches both upstreams, [#362](https://github.com/fg-labs/bwa-mem3/issues/362)) |
 | All chains dropped by the weight filter: default follows bwa | [#489](https://github.com/fg-labs/bwa-mem3/pull/489) | — ([#310](https://github.com/fg-labs/bwa-mem3/issues/310)) | fork-only; `--compat=bwa-mem2` reproduces bwa-mem2 |
