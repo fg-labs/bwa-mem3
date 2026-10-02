@@ -168,6 +168,30 @@ jobs:
       - name: Opt-in macro -D list matches the macros in src/
         run: bash test/regression/debug_macro_flag_lint.sh
 
+  # Source-only lint: a test that defines its own calloc must be built with
+  # $(CALLOC_INTERPOSE_CXXFLAGS), or upstream GCC folds the replacement into a
+  # call to itself and the test hangs. No build lane here uses a GCC that folds
+  # (Ubuntu's g++ defaults to _FORTIFY_SOURCE=3, which dodges it), so the
+  # wiring is checked statically instead.
+  calloc-interpose-flag-lint:
+    name: Calloc-interposing tests build with -fno-builtin-malloc
+    runs-on: ubuntu-latest
+    # Source-only lint, seconds of work; ceiling catches a hung runner only.
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      # Runs first: PASS only means something once the matcher has been shown
+      # to still reject a calloc-defining test built without the flag.
+      - name: Calloc flag lint still detects a missing flag
+        run: bash test/regression/calloc_interpose_flag_lint_selftest.sh
+
+      - name: Calloc-defining tests pass CALLOC_INTERPOSE_CXXFLAGS
+        run: bash test/regression/calloc_interpose_flag_lint.sh
+
   # Same shape and rationale as the two jobs above: source-only, no toolchain,
   # its own job so the failure reads as "your shell script is unformatted"
   # rather than being buried in a matrix row. Runs in seconds.
