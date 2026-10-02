@@ -557,14 +557,49 @@ static inline int cal_max_gap(const mem_opt_t *opt, int qlen)
     // line. Treat a non-positive penalty as an unbounded gap (opt->w<<1, the
     // clamp below), matching band_cert_ok / mem_band_cert_params_safe_w. -E is
     // also rejected at parse (fastmap.cpp); this is defense in depth.
-    int l_del = opt->e_del > 0 ? (int)((double)(qlen * opt->a - opt->o_del) / opt->e_del + 1.) : opt->w<<1;
-    int l_ins = opt->e_ins > 0 ? (int)((double)(qlen * opt->a - opt->o_ins) / opt->e_ins + 1.) : opt->w<<1;
-    //int l_del = (int)((double)(qlen * opt->a - opt->o_del) + 1.);
-    //int l_ins = (int)((double)(qlen * opt->a - opt->o_ins) + 1.);
+    //
+    // The product is formed in double, not int: qlen*a overflows int for a large
+    // -A (which has no range check), and each term is clamped to the 2w cap
+    // before the (int) cast so an out-of-range value cannot be UB either. For
+    // every qlen*a that fits an int the result is the same as the int form.
+    const double cap = (double)(opt->w << 1);
+    double t_del = opt->e_del > 0 ? ((double)qlen * opt->a - opt->o_del) / opt->e_del + 1. : cap;
+    double t_ins = opt->e_ins > 0 ? ((double)qlen * opt->a - opt->o_ins) / opt->e_ins + 1. : cap;
+    int l_del = t_del >= cap ? opt->w<<1 : (t_del <= 1. ? 1 : (int)t_del);
+    int l_ins = t_ins >= cap ? opt->w<<1 : (t_ins <= 1. ? 1 : (int)t_ins);
 
     int l = l_del > l_ins? l_del : l_ins;
     l = l > 1? l : 1;
     return l < opt->w<<1? l : opt->w<<1;
+}
+
+/* The proof envelope of the contained-seed extension skip.
+ *
+ * The two-wave skip purges a deferred seed s only when the real post-extension
+ * containment test (pe18_seed_in_container) confirms s against the alnreg of
+ * its longest same-diagonal container c, which always sits at an earlier slot
+ * than s when it is consulted. The reference path (flag off) instead decides s
+ * in Pass 3, against the alnregs Pass 3 has KEPT so far. The two agree when c
+ * is kept. When Pass 3 has PURGED c, it did so because some kept alnreg X
+ * PE18-contains c, and the skip is exact only if X then also PE18-contains s.
+ * The rectangle test and the seedlen0 test carry over trivially (s lies inside
+ * c on the same diagonal and is shorter). The diagonal test does not: it
+ * compares the same diagonal offset against w = min(cal_max_gap(d), X->w),
+ * where d is the distance from X's edge, and that distance is LARGER for s
+ * than for c on both sides. So the purge of s follows from the purge of c
+ * exactly when cal_max_gap is non-decreasing in d -- the whole envelope. It is
+ * scoring-independent otherwise and holds for every read length, -w, -L, -d,
+ * -T, preset, and both --compat targets.
+ *
+ * cal_max_gap's terms are ((d*a - o)/e + 1) clamped to [1, 2w] (e > 0; a
+ * non-positive e gives the constant 2w), so it is non-decreasing whenever the
+ * match score a is non-negative. A negative -A is the only scoring outside the
+ * envelope. There the two-wave path is disabled here (the driver reads this,
+ * not the flag), so the flag can never make the aligner unsound; main_mem only
+ * reports it. */
+int mem_skip_contained_ext_sound(const mem_opt_t *opt)
+{
+    return opt->a >= 0;
 }
 
 /* BWA3_CHAIN_STATS=1: count how the chaining / Pass-3 fast paths resolved, and
@@ -590,6 +625,9 @@ enum ChainStat {
     CHS_FLAT_READS,        /* reads chained entirely on the flat index */
     CHS_FLAT_DECLINED_TIE, /* reads the flat index handed to the kbtree: equal key */
     CHS_FLAT_DECLINED_CAP, /* ... : more chains than BWA3_CHAIN_FLAT_CAP */
+    CHS_CONTAINED_DEFERRED, /* seeds the contained-seed skip deferred past the main batch */
+    CHS_CONTAINED_PURGED,   /* ... of which the containment test purged (SW skipped) */
+    CHS_CONTAINED_EXTENDED, /* ... of which it did not, so they ran in the second batch */
     CHS_N
 };
 static std::atomic<uint64_t> g_chain_stats[CHS_N];
@@ -602,7 +640,8 @@ static struct ChainStatsDumper {
         if (!chain_stats_on()) return;
         fprintf(stderr, "[chain-stats] p3_reads=%llu p3_fallback_reads=%llu p3_bucket_walks=%llu "
                 "p3_linear_scans=%llu p3_head_dups=%llu flat_reads=%llu flat_declined_tie=%llu "
-                "flat_declined_cap=%llu\n",
+                "flat_declined_cap=%llu contained_deferred=%llu contained_purged=%llu "
+                "contained_extended=%llu\n",
                 (unsigned long long)g_chain_stats[CHS_P3_READS].load(),
                 (unsigned long long)g_chain_stats[CHS_P3_FALLBACK_READS].load(),
                 (unsigned long long)g_chain_stats[CHS_P3_BUCKET_WALKS].load(),
@@ -610,7 +649,10 @@ static struct ChainStatsDumper {
                 (unsigned long long)g_chain_stats[CHS_P3_HEAD_DUPS].load(),
                 (unsigned long long)g_chain_stats[CHS_FLAT_READS].load(),
                 (unsigned long long)g_chain_stats[CHS_FLAT_DECLINED_TIE].load(),
-                (unsigned long long)g_chain_stats[CHS_FLAT_DECLINED_CAP].load());
+                (unsigned long long)g_chain_stats[CHS_FLAT_DECLINED_CAP].load(),
+                (unsigned long long)g_chain_stats[CHS_CONTAINED_DEFERRED].load(),
+                (unsigned long long)g_chain_stats[CHS_CONTAINED_PURGED].load(),
+                (unsigned long long)g_chain_stats[CHS_CONTAINED_EXTENDED].load());
     }
 } g_chain_stats_dumper;
 
@@ -700,7 +742,7 @@ mem_opt_t *mem_opt_init()
     o->seed_emit_order = SEED_ORDER_OFF;  // byte-identical default
     o->smem_dedup  = 0;   // off by default -> byte-identical to baseline; opt-in via --smem-dedup
     o->alnreg_sort_fast = 0;  // off by default -> bwa-mem2's dedup sort (see mem_sort_dedup_patch); set by --fast
-    o->skip_contained_ext = 1;   // on by default: the two-wave contained-seed skip is byte-identical to the reference extension path (all read lengths, --meth included); --keep-contained-ext (and --compat) opt out to that reference path
+    o->skip_contained_ext = 1;   // on by default, --compat included: the two-wave contained-seed skip is byte-identical to the reference extension path (all read lengths, --meth included) inside the envelope mem_skip_contained_ext_sound enforces; --keep-contained-ext opts out to that reference path
     o->band_start  = 0;   // off by default (adaptive chain-geometry band); opt-in via --adaptive-band
     o->band_cert   = 1;   // on by default: sound (byte-identical) adaptive band via per-pair tie-break certificate
     o->split_width = 10;
@@ -7692,10 +7734,14 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
         return sc;
     };
 
-    /* Two-wave --skip-contained-ext: seeds deferred in Pass 1 pending the
+    /* Two-wave contained-seed skip: seeds deferred in Pass 1 pending the
      * post-Pass-2 guarded purge / second batch. Empty (and the whole two-wave
-     * path inert) unless skip_contained_ext is set. Per-thread, grows as
-     * needed. */
+     * path inert) unless two_wave is set. Per-thread, grows as needed.
+     *
+     * two_wave is the flag AND the proof envelope (mem_skip_contained_ext_sound):
+     * the driver never runs the deferral on a scoring where its byte-identity
+     * argument does not hold, whatever the flag says. */
+    const int two_wave = opt->skip_contained_ext && mem_skip_contained_ext_sound(opt);
     static thread_local std::vector<PendingSeed> ks_pending;
     ks_pending.clear();
 
@@ -7919,12 +7965,13 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
                  * Pass 2 and the second wave. Everything the second wave needs
                  * that Pass 1 set on `a` (meth_strand_hyp above, seedlen0, c, ...)
                  * is already in place at this point. */
-                if (opt->skip_contained_ext) {
+                if (two_wave) {
                     int _container_si = -1;
                     if (mem_seed_ext_redundant(c, (uint32_t)srt[k], &_container_si)) {
                         ks_pending.push_back(
                             PendingSeed{ l, j, (int)(uint32_t)srt[k], _container_si,
                                          rmax[0], rmax[1], chain_band });
+                        chain_stat(CHS_CONTAINED_DEFERRED);
                         continue;
                     }
                 }
@@ -8681,7 +8728,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
      * (their SW is skipped -- the win); the rest are re-staged and scored by a
      * second run_extension_batch(). Nothing reads av between here and Pass 3,
      * so leaving deferred slots at H0_ until now is safe. ---- */
-    if (opt->skip_contained_ext && !ks_pending.empty()) {
+    if (two_wave && !ks_pending.empty()) {
         /* Reuse the (now-consumed) staging arrays for the second batch. */
         numPairsLeft = numPairsRight = 0;
         leftRefOffset = rightRefOffset = leftQerOffset = rightQerOffset = 0;
@@ -8750,8 +8797,10 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
                 }
                 if (purge) {
                     pa->qb = pa->qe = -1;   /* skip its SW: the two-wave win */
+                    chain_stat(CHS_CONTAINED_PURGED);
                     continue;
                 }
+                chain_stat(CHS_CONTAINED_EXTENDED);
                 /* Extend ps in the second batch: restore the window + query,
                  * recompute its seed score exactly as Pass 1 would have (the
                  * meth-matrix score under --meth, len*a otherwise -- with the
@@ -8924,7 +8973,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
                  * purge it here too) or extended there; a slot still at H0_ here
                  * would mean a deferred seed was neither purged nor extended -- a
                  * two-wave bug. Fires under -DNDEBUG too (xassert). */
-                if (opt->skip_contained_ext) {
+                if (two_wave) {
                     const mem_alnreg_t *_kar = &av_v[l].a[s->aln];
                     xassert(!(_kar->qb == H0_ || _kar->qe == H0_),
                             "two-wave: Pass 3 kept a seed whose alnreg was never resolved");

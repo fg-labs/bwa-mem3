@@ -1161,6 +1161,14 @@ jobs:
           SKIP_CONTAINED_WORK_DIR=/tmp/skip-contained-bytes \
           bash test/regression/skip_contained_byte_identity.sh
 
+      - name: byte-identity --compat with and without --keep-contained-ext (contained-seed skip)
+        if: matrix.canonical == true
+        run: |
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          COMPAT_CONTAINED_PHIX_FA="$GITHUB_WORKSPACE/test/fixtures/phix.fa" \
+          COMPAT_CONTAINED_WORK_DIR=/tmp/compat-contained-bytes \
+          bash test/regression/compat_contained_skip_identity.sh
+
       - name: --hic alias regression (byte-identical to -5SP)
         if: matrix.canonical == true
         run: |

@@ -294,7 +294,7 @@ typedef struct mem_opt_t {
     int    supp_rep_hard_cap; // supp alnregs whose chain's seeds share >=this many genome hits are forced to MAPQ=0; 0 disables
     int    smem_dedup;        // 1 = dedup fully-identical SMEMs before SA expansion (--smem-dedup); 0 = off (default, byte-identical to baseline)
     int    alnreg_sort_fast;  // 1 = strict-total-order comparator + pdqsort at the mem_sort_dedup_patch sort sites (set by --fast); 0 = bwa-mem2's re-only comparator + ks_introsort (default, bwa-mem2-compatible)
-    int    skip_contained_ext; // 1 (default) = skip banded-SW extension of seeds contained (same diagonal) in a longer in-chain seed; 0 = the reference extension path (--keep-contained-ext; --compat forces 0). Byte-identical to the reference path on all read lengths and under --meth: a contained seed is deferred past the main extension batch and skipped only when the real post-extension containment purge (PE18) confirms it against its container's extended alnreg; otherwise it is extended in a second batch. Pure speed lever, so it is on by default; --skip-contained-ext is the deprecated (accepted, no-op) spelling of the default.
+    int    skip_contained_ext; // 1 (default, --compat included) = skip banded-SW extension of seeds contained (same diagonal) in a longer in-chain seed; 0 = the reference extension path (--keep-contained-ext). Byte-identical to the reference path on all read lengths and under --meth: a contained seed is deferred past the main extension batch and skipped only when the real post-extension containment purge (PE18) confirms it against its container's extended alnreg; otherwise it is extended in a second batch. The proof needs a non-negative -A (mem_skip_contained_ext_sound); the extension driver runs the reference path outside that envelope whatever this says. Pure speed lever, so it is on by default; --skip-contained-ext is the deprecated (accepted, no-op) spelling of the default.
     int    band_start;       // >0 = adaptive chain-geometry banding active (start band; set to ADAPTIVE_BAND_START by --adaptive-band); 0 = off (byte-identical). Long-read speed lever; no-op on the 8-bit short-read tier.
     int    band_cert;        // 1 = sound (byte-identical) adaptive band via per-pair tie-break certificate (default); 0 = off, set by --fast/--adaptive-band (which use the aggressive band_start heuristic instead). Skips the wide DP on provably-narrow pairs with bit-for-bit-identical output.
     /* --compat: the selected output-compatibility target. Non-NULL on any
@@ -630,6 +630,13 @@ typedef kvec_t(int) int_v;
 
 mem_opt_t *mem_opt_init(void);
 void mem_fill_scmat(int a, int b, int8_t mat[25]);
+/* True iff the contained-seed extension skip (opt->skip_contained_ext) is
+ * byte-identical to the reference extension path under opt's scoring: the
+ * proof needs cal_max_gap to be non-decreasing in its argument, which holds for
+ * every non-negative match score (-A). The extension driver runs the reference
+ * path when this is false, whatever the flag says; main_mem reads it only to
+ * report that. */
+int mem_skip_contained_ext_sound(const mem_opt_t *opt);
 /* True iff the certified adaptive band (opt->band_cert) is safe to apply under the
  * current scoring/gap/zdrop parameters. The certificate bounds the optimal score but
  * not the extension kernel's early-termination heuristics; outside a conservative

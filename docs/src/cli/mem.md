@@ -213,13 +213,16 @@ Notes and caveats:
   already documents which flags ran). Shared knobs the upstream also has (scoring
   `-A`/`-B`, `-k`/`-w`/`-r`, `-T`, …) are *not* guarded — changing one just moves
   both sides to the same operating point, so byte-identity still holds.
-- **`--compat` runs the reference contained-seed extension path.** The default
+- **`--compat` keeps the default contained-seed extension skip.** The compat
+  policy is proof-based: a target keeps every optimization that is byte-identical
+  by construction or proven inside a code-enforced envelope, and drops only
+  output shaping. The
   [contained-seed extension skip](#--keep-contained-ext--opt-out-of-the-contained-seed-extension-skip)
-  is byte-identical to that path, so this changes no output; it just pins a
-  bit-exact-fidelity mode to the same extension code the targets run rather
-  than to a speed lever. It is not a guarded lever: `--compat --keep-contained-ext`
-  is accepted (both ask for the reference path), and the deprecated
-  `--skip-contained-ext` is accepted and overridden.
+  is proven byte-identical to the reference extension path (the envelope and
+  where the code enforces it are described there), so it stays on under both
+  targets and keeps its speedup. It is not a guarded lever: `--compat
+  --keep-contained-ext` is accepted and runs the reference path, and the
+  deprecated `--skip-contained-ext` is accepted as a no-op.
 - **The escape hatch does not relax `--fast` or `--meth`.** Those stay hard
   errors even with `--compat-allow-divergent`, because they are category errors,
   not divergences: `--fast` is an opaque multi-flag bundle (not a single knob a
@@ -732,11 +735,32 @@ tier), clang-19: −2.9% user-CPU on a 5M-pair WGS slice, −1.4% on a 5M-pair W
 5M-pair `--meth` slice, all verified bit-for-bit identical to the reference path, records + header +
 count), which is why it is on by default.
 
+The byte-identity is a proof, not only a measurement, and it has one envelope. The skip
+purges a deferred seed only when the same containment test the purge uses confirms it against
+its longest same-diagonal container's extended alignment. The reference path decides that
+seed against the alignments the purge has *kept*, and the two can only differ when the
+container itself was purged by some earlier kept alignment `X`; the proof then needs `X` to
+contain the shorter seed too, which follows for the coordinate and seed-length tests
+directly, and for the diagonal test exactly when the maximal-gap bound (`cal_max_gap`) is
+non-decreasing in the distance from the alignment's edge, which holds for every non-negative
+match score (`-A`). A negative `-A` is the one scoring outside it: there the extension driver
+(`mem_skip_contained_ext_sound`) runs the reference path whatever the flag says, in every
+mode, and `mem` prints a `[W::main_mem] contained-seed extension skip disabled` notice. Output
+is the same either way; only the speedup is lost. (Before this, a negative `-A` still ran the
+skip in the default mode.) Nothing else in the argument depends on scoring, read length, `-w`, `-L`, `-d`,
+presets or thread count, so the skip is also in force under
+[`--compat`](#--compattarget--byte-identical-output-for-another-aligner) (both targets), where
+it was previously switched off out of caution. Under `--compat` it was measured byte-identical
+to `--keep-contained-ext` on an Apple M3 Ultra (arm64, NEON, Apple clang 21.0.0), hg38,
+`-t 16`: 1 M HG002 WGS pairs under both targets at `-t 1` and `-t 16`, 1.86 M ~250 bp SBX
+reads, and 100 HiFi (`-x pacbio`) and 100 ONT (`-x ont2d`) reads. On 5 M HG00096 pairs
+`--compat=bwa-mem2` ran 32.10-32.20 s against 33.17-33.35 s (3 interleaved runs each; -3.4% wall
+and user CPU).
+
 `--keep-contained-ext` opts out and runs the reference extension path (no deferral, every
 seed extended in the main batch). Output is unchanged; the run is only slower. Use it as an
 escape hatch, or as a bit-exact A/B handle when comparing against an older binary that
-predates the default. `--compat` implies it (see
-[`--compat`](#--compattarget--byte-identical-output-for-another-aligner)).
+predates the default. It works the same way under `--compat`.
 
 `--skip-contained-ext` (the former opt-in spelling) is **deprecated**: it still parses, is a
 no-op (it re-asserts the default), and prints `[W::main_mem] --skip-contained-ext is
