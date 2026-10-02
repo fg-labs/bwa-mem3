@@ -1367,7 +1367,10 @@ jobs:
         # four-strand XR/XG); and the reverse-strand-conversion matrix flip
         # (meth_strand_hyp) — a reverse read that is unmapped under the unflipped
         # matrix and full-length under the fix; the batched OT/OB-partition mate
-        # rescue being byte-identical to the scalar rescue; the `collapsed`
+        # rescue being byte-identical to the scalar rescue; a mate rescued off a
+        # reverse-strand anchor, or at a contig end where the rescue window is
+        # clamped onto the other strand half, keeping its own XG/XM and an NM
+        # that counts no conversion (collapsed, genomic and TAPS); the `collapsed`
         # --meth-scoring model; --meth-tags spec resolution (all|none|list|
         # ^exclusion) plus its guarantee that tag selection leaves the alignment
         # untouched; the --meth-family flag footguns (a value orphaned by
@@ -1392,7 +1395,8 @@ jobs:
           for t in meth_seed_index meth_mixed_pe_asym meth_pe_placement \
                    meth_output_integrity meth_reverse_strand_conversion \
                    meth_seed_unpacked_ref_not_loaded \
-                   meth_rescue_batched_identical meth_collapsed_scoring \
+                   meth_rescue_batched_identical meth_rescue_strand \
+                   meth_collapsed_scoring \
                    meth_tags meth_flag_footguns meth_seed_prune meth_nul_base; do
             echo "::group::$t"; bash "test/regression/$t.sh"; echo "::endgroup::"
           done
