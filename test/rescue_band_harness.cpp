@@ -6,7 +6,7 @@
  *
  * time runs the default scoring's 8-bit pipeline only (kswv getScores8 plus the band), so it
  * refuses the eq-only knobs that would change the job mix or the scoring (RB_16BIT, RB_METH,
- * RB_METH_REL, RB_SCORING) rather than time something other than what they ask for.
+ * RB_METH_REL, RB_SCORING, RB_KMAX) rather than time something other than what they ask for.
  *
  * eq: for every job, the PRODUCTION pipeline -- rescue_prune_window, RescueBandBatch::plan/commit,
  * the length sort, partition, kswv phase 0 on the non-banded pairs, run_pass0 on the banded ones,
@@ -36,9 +36,14 @@
  * draw_params), RB_METH (genomic | neutral | collapsed | random: --meth matrices, see batch_matrix)
  * with RB_METH_REL (conv, the default: the filter matches converted copies; expand: genomic and
  * neutral batches use the relation-expanded filter, rescue_prune_params::set_meth_rel, and collapsed
- * stays on conv) and RB_16BIT (1: every job runs through kswv's 16-bit kernels for both passes, uncut and unbanded,
+ * stays on conv), RB_16BIT (1: every job runs through kswv's 16-bit kernels for both passes, uncut and unbanded,
  * with mates up to 1024 bp, the longest the filter takes (rescue_prune_scratch::QCAP), as
- * production runs a 16-bit job: pruned but never banded).
+ * production runs a 16-bit job: pruned but never banded) and RB_KMAX (the largest filter K,
+ * rescue_prune_params::from's k_max as production's BWA3_RESCUE_PRUNE_KMAX: 5, the default, to
+ * rescue_prune_scratch_kmax; 0 draws it from [5, rescue_prune_scratch_kmax] per batch; anything else
+ * is refused; under RB_METH always 5, as production keeps --meth at K = 5). With RB_KMAX other than
+ * 5 and RB_SCORING=random, every third batch draws a scoring that admits K > 5 (MODE_KLONG), and a
+ * run with RB_KMAX other than 5 fails if no batch filtered with K > 5.
  * The truth kswv runs with the batch's scoring and matrix; pass 0 is banded at every scoring the
  * filter admits and pass 1 at every scoring the band kernels take (rb_scoring::valid), under --meth
  * with the batch's matrix (rb_scoring::set_matrix). RB_NEGATIVE_CONTROL=1 (harness-only) shifts
@@ -536,7 +541,12 @@ static int batch_matrix(const rescue_prune_params &p, int kind, int hyp, int8_t 
 struct Scoring { int a = 1, b = 4, o_del = 6, e_del = 1, o_ins = 6, e_ins = 1; };
 static bool g_random_scoring = false;
 static Scoring g_fixed_scoring;
-enum { MODE_DEFAULTS, MODE_DEGENERATE, MODE_CHEAP_GAP, MODE_SPLIT_CELLS, MODE_BYTE_GAP, MODE_RANDOM, NMODES };
+static int g_kmax = 5;   // RB_KMAX
+/* The batch's K cap: 5 under RB_METH, RB_KMAX if fixed, else a draw from [lo, kmax]. */
+static int draw_kmax(int lo = 5) { return g_meth != METH_NONE ? 5 : g_kmax > 0 ? g_kmax : rndr(lo, rescue_prune_scratch_kmax); }
+/* Whether the run asks for K > 5 (RB_KMAX 0 or 6-8) where it can have it (not under RB_METH). */
+static bool want_klong() { return g_kmax != 5 && g_meth == METH_NONE; }
+enum { MODE_DEFAULTS, MODE_DEGENERATE, MODE_CHEAP_GAP, MODE_SPLIT_CELLS, MODE_BYTE_GAP, MODE_RANDOM, MODE_KLONG, NMODES };
 static long g_draws = 0, g_mode_n[NMODES] = {0};
 static long g_admitted_bad = 0;   // scorings from() or rb_scoring::valid() admitted but must refuse
 /* Whether the last drawn scoring is one kswv's 8-bit kernels run exactly. A gap sum past a byte
@@ -555,11 +565,18 @@ static rescue_prune_params draw_params(int k_default)
     int k = k_default;
     bool fixed_minsc = true;
     bool must_refuse = false;   // by construction (the degenerate and byte-gap draws), not by predicate
+    bool klong = false;         // a MODE_KLONG draw
     if (g_random_scoring) {
         const long i = g_draws++;
-        const int mode = i % 3 == 0 ? (int)((i / 3) % MODE_RANDOM) : MODE_RANDOM;
+        const int mode = i % 3 == 0 ? (int)((i / 3) % MODE_RANDOM) : i % 3 == 1 && want_klong() ? MODE_KLONG : MODE_RANDOM;
         g_mode_n[mode]++;
-        if (mode == MODE_DEFAULTS) {
+        if (mode == MODE_KLONG) {   // separators of at least 5 matches: K > 5 under a cap above 5
+            klong = true;
+            sc.a = 1;
+            sc.b = rndr(5, 12);
+            sc.o_del = rndr(5, 16); sc.o_ins = rndr(6, 16);
+            sc.e_del = rndr(1, 3); sc.e_ins = rndr(1, 3);
+        } else if (mode == MODE_DEFAULTS) {
             sc = Scoring();
         } else if (mode == MODE_DEGENERATE) {   // must be refused before any division
             sc = Scoring();
@@ -589,15 +606,17 @@ static rescue_prune_params draw_params(int k_default)
             sc.o_del = rndr(0, 20); sc.o_ins = rndr(0, 20);
             sc.e_del = rndr(1, 6); sc.e_ins = rndr(1, 6);
         }
-        k = rndr(5, 40);
-        fixed_minsc = false;
+        /* KLONG keeps its threshold above every K's (K - 1) a, so the K > 5 its costs admit stands. */
+        k = klong ? rndr(9, 40) : rndr(5, 40);
+        fixed_minsc = klong;
     }
     int minsc = k * sc.a;
+    const int kmax = draw_kmax(klong ? 6 : 5);
     rescue_prune_params p = rescue_prune_params::from(sc.a, sc.b, sc.o_del, sc.e_del, sc.o_ins, sc.e_ins,
-                                                      minsc, 3);
+                                                      minsc, 3, kmax);
     if (!fixed_minsc && p.K >= 3 && rnd(8) == 0) {   // just above a hit-free window's reach
         minsc = sc.a * (p.K - 1) + 1 + rnd(2);
-        p = rescue_prune_params::from(sc.a, sc.b, sc.o_del, sc.e_del, sc.o_ins, sc.e_ins, minsc, 3);
+        p = rescue_prune_params::from(sc.a, sc.b, sc.o_del, sc.e_del, sc.o_ins, sc.e_ins, minsc, 3, kmax);
     }
     /* Neither pruning nor the band kernels may admit a scoring kswv's 8-bit kernels do not run
      * exactly (a degenerate set, a gap sum past a byte): the drawn ones are known by construction,
@@ -628,7 +647,7 @@ static rescue_prune_params draw_params(int k_default)
 static int run_eq(std::vector<Job> &all_jobs, int k_default, int max_hits, int scalar_stride)
 {
     long mism = 0, n = 0, npass = 0, nfull = 0, nb1 = 0, nb2 = 0, nb2_long = 0, nband = 0, scal_mm = 0, te2_diff = 0;
-    long nbatch = 0, nvalid = 0, nbandable = 0, np1able = 0, ntrunc = 0, nk[6] = {0}, n12_band = 0, nmeth[4] = {0};
+    long nbatch = 0, nvalid = 0, nbandable = 0, np1able = 0, ntrunc = 0, nk[rescue_prune_scratch_kmax + 1] = {0}, n12_band = 0, nmeth[4] = {0};
     long nview = 0, view_mm = 0, r2 = 0, ccap = 0, nrel_b2 = 0, nrel_view = 0;
     std::unique_ptr<rescue_prune_scratch> sscratch(new rescue_prune_scratch());
     std::vector<rb_comp> cn, cs;
@@ -855,15 +874,16 @@ static int run_eq(std::vector<Job> &all_jobs, int k_default, int max_hits, int s
            "scalar_vs_kswv_mismatch=%ld (te2 differs, unconsumed: %ld)\n",
            n, npass, nfull, nb1, nb2, nband, band_hi, p1_band, p1_guard, r2, ccap, nview, mism, view_mm, scal_mm,
            te2_diff);
-    printf("  scoring: batches=%ld valid=%ld pass0_bandable=%ld pass1_bandable=%ld K3=%ld K4=%ld K5=%ld mates_cut_to_8bit=%ld meth genomic=%ld "
-           "neutral=%ld collapsed=%ld\n", nbatch, nvalid, nbandable, np1able, nk[3], nk[4], nk[5], ntrunc, nmeth[1], nmeth[2],
+    printf("  scoring: batches=%ld valid=%ld pass0_bandable=%ld pass1_bandable=%ld K3=%ld K4=%ld K5=%ld K6=%ld K7=%ld K8=%ld "
+           "mates_cut_to_8bit=%ld meth genomic=%ld neutral=%ld collapsed=%ld\n", nbatch, nvalid, nbandable, np1able, nk[3], nk[4],
+           nk[5], nk[6], nk[7], nk[8], ntrunc, nmeth[1], nmeth[2],
            nmeth[3]);
     /* The fixed categories come round every third batch, so each one reached is guaranteed drawn. */
     bool modes_missing = false;
     if (g_random_scoring) {
-        printf("  scoring draws: defaults=%ld degenerate=%ld cheap_gap=%ld split_cells=%ld byte_gap=%ld random=%ld\n",
-               g_mode_n[MODE_DEFAULTS], g_mode_n[MODE_DEGENERATE], g_mode_n[MODE_CHEAP_GAP],
-               g_mode_n[MODE_SPLIT_CELLS], g_mode_n[MODE_BYTE_GAP], g_mode_n[MODE_RANDOM]);
+        printf("  scoring draws: defaults=%ld degenerate=%ld cheap_gap=%ld split_cells=%ld byte_gap=%ld random=%ld "
+               "klong=%ld\n", g_mode_n[MODE_DEFAULTS], g_mode_n[MODE_DEGENERATE], g_mode_n[MODE_CHEAP_GAP],
+               g_mode_n[MODE_SPLIT_CELLS], g_mode_n[MODE_BYTE_GAP], g_mode_n[MODE_RANDOM], g_mode_n[MODE_KLONG]);
         const long specials = (nbatch + 2) / 3;
         for (int c = 0; c < MODE_RANDOM && c < specials; c++) modes_missing |= g_mode_n[c] == 0;
     }
@@ -895,8 +915,11 @@ static int run_eq(std::vector<Job> &all_jobs, int k_default, int max_hits, int s
         fprintf(stderr, "FAIL: %ld scorings kswv's 8-bit kernels do not run exactly were admitted (from() / rb_scoring::valid)\n",
                 g_admitted_bad);
     if (modes_missing) fprintf(stderr, "FAIL: a fixed RB_SCORING=random category was never drawn\n");
+    /* RB_KMAX asks for K-mers longer than 5: some batch must have filtered with them. */
+    const bool vacuous_k = want_klong() && nk[6] + nk[7] + nk[8] == 0;
+    if (vacuous_k) fprintf(stderr, "FAIL: RB_KMAX=%d and no batch filtered with K > 5\n", g_kmax);
     return mism || scal_mm || view_mm || vacuous || vacuous16 || vacuous_rel || ceiling_vacuous || p1_guard
-                   || g_admitted_bad || modes_missing
+                   || g_admitted_bad || modes_missing || vacuous_k
                ? 1 : 0;
 }
 
@@ -1015,6 +1038,11 @@ int main(int argc, char **argv)
     printf("kswv tier: %s\n", bwamem3_simd_tier_name(bwamem3_simd_tier()));
     const int minsc = rescue_env_int("RB_MINSC", MINSC_DEFAULT);
     g_16 = rescue_env_int("RB_16BIT", 0) != 0;
+    g_kmax = rescue_env_int("RB_KMAX", 5);
+    if (g_kmax != 0 && (g_kmax < 5 || g_kmax > rescue_prune_scratch_kmax)) {
+        fprintf(stderr, "RB_KMAX: want 0 (a draw per batch) or 5 to %d\n", rescue_prune_scratch_kmax);
+        return 2;
+    }
     if (const char *m = getenv("RB_METH")) {
         g_meth = !strcmp(m, "genomic") ? METH_GENOMIC : !strcmp(m, "neutral") ? METH_NEUTRAL
                : !strcmp(m, "collapsed") ? METH_COLLAPSED : !strcmp(m, "random") ? METH_RANDOM : -1;
@@ -1059,7 +1087,7 @@ int main(int argc, char **argv)
         /* run_time times the default scoring's 8-bit pipeline (getScores8, then the band); it has no
          * 16-bit, --meth or general-scoring dispatch, so those eq knobs are refused here instead of
          * aborting in the 8-bit saturation guard or timing the default path under another name. */
-        for (const char *knob : {"RB_16BIT", "RB_METH", "RB_METH_REL", "RB_SCORING"}) {
+        for (const char *knob : {"RB_16BIT", "RB_METH", "RB_METH_REL", "RB_SCORING", "RB_KMAX"}) {
             const char *v = getenv(knob);
             if (v && *v && strcmp(v, "0") != 0) {
                 fprintf(stderr, "%s: eq only; time runs the default scoring's 8-bit kernels and the band\n", knob);

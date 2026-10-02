@@ -10,7 +10,11 @@
  *    and the index is < 128);
  *  - step 6's bitsets are built after the backward scan from the diagonal-major bnd and cnt with
  *    MOVEMASK (mw = {bnd >= minsc}, hw = mw and {cnt > 0}), instead of per-step bytes transposed
- *    and scattered; NEON's hw test P(d) - P(d - 1) > -c is exactly cnt(d) >= 1.
+ *    and scattered; NEON's hw test P(d) - P(d - 1) > -c is exactly cnt(d) >= 1;
+ *  - K > 5 (KK): a hit row's K-mer code is built in step 3's block pass from its 5-mer code and
+ *    that of row r - 5 (PALIGNR over the current and previous blocks' codes), and the rows whose
+ *    K-mer the query holds are selected 8 at a time with an AVX2 gather over the K-mer presence
+ *    bitmap, instead of a scalar loop over the prefiltered rows.
  * The --meth relation (Rel, relx >= 0) is lean_neon's, through the same shared entry-table helpers
  * (filter_rel_table, filter_ent4) and cap. Production does not reach it today (x86 does not prune
  * --meth, rescue_prune_cost_ok); the unit tests, rescue_prune_eq and the band harness do, so the
@@ -81,11 +85,13 @@ static inline void x86_codes16(const uint8_t *buf, uint16_t *out)
 }
 
 // Gen: general weights (rescue_prune_neon::Wt); !Gen is the default scoring's code. Rel: the --meth
-// relation of relx (lean_neon_core); !Rel is the exact-match code.
-template <bool Gen, bool Rel>
+// relation of relx (lean_neon_core); !Rel is the exact-match code. KK: the K-mer length, 5 or
+// 6..KMAXN (general weights and exact matching only), as lean_neon_core.
+template <bool Gen, bool Rel, int KK = 5>
 static inline Kind lean_x86_core(const Job &jb, X86Scratch &s, int &hb, int &he, int max_hits, int minsc,
                                  const Wt &wt, int relx)
 {
+    static_assert(KK == 5 || (Gen && !Rel && KK <= X86Scratch::KMAXN), "K > 5: general weights, exact matching");
     const uint8_t *ref = jb.ref, *q = jb.qry;
     const int len1 = jb.len1, len2 = jb.len2;
     hb = he = -1;
@@ -105,7 +111,8 @@ static inline Kind lean_x86_core(const Job &jb, X86Scratch &s, int &hb, int &he,
     }
     const int quanta = kswv_query_quantum8(len2), off = quanta, nd = len1 + quanta + 1;
     // ---- 2. query table (cached per oriented query), as lean_neon ----
-    if (len2 != s.qlen_c || (Rel ? relx : -1) != s.qrel_c || memcmp(q, s.qcache, (size_t)len2) != 0) {
+    if (len2 != s.qlen_c || (Rel ? relx : -1) != s.qrel_c || KK != s.qk_c
+        || memcmp(q, s.qcache, (size_t)len2) != 0) {
         uint8_t *qb = s.qbuf + 4;
         __m128i qv = _mm_setzero_si128();
         uint8_t qor = 0;
@@ -118,8 +125,14 @@ static inline Kind lean_x86_core(const Job &jb, X86Scratch &s, int &hb, int &he,
         s.qlen_c = len2;
         s.qhash = rescue_prune_neon::filter_query_key(qb, len2);
         s.qrel_c = Rel ? relx : -1;
+        s.qk_c = KK;
         s.q_over = false;
-        if (!s.q_has_n && len2 >= 5) {
+        if (KK > 5) {
+            if (!s.q_has_n && len2 >= KK) {
+                for (int b = 0; b < len2; b += 16) x86_codes16(s.qbuf + b, s.qcode + b);
+                rescue_prune_neon::filter_kmer_table<KK>(s, qb, len2, off);
+            }
+        } else if (!s.q_has_n && len2 >= 5) {
             memset(s.tab, 0, sizeof s.tab);
             memset(s.pres, 0, sizeof s.pres);
             for (int b = 0; b < len2; b += 16) x86_codes16(s.qbuf + b, s.qcode + b);
@@ -138,6 +151,7 @@ static inline Kind lean_x86_core(const Job &jb, X86Scratch &s, int &hb, int &he,
     }
     if ((orv & 0xFC) || !_mm_testz_si128(ov, kFC) || s.q_has_n) return FULL;
     if (Rel && s.q_over) return FULL;
+    if (KK > 5 && (len1 < KK || len2 < KK)) return FULL;   // as the scalar filter
     if (len1 < 5 || len2 < 5) return B1;
     if (__builtin_expect(nd + 32 > X86Scratch::CAP, 0)) return FALLBACK;
 
@@ -151,6 +165,15 @@ static inline Kind lean_x86_core(const Job &jb, X86Scratch &s, int &hb, int &he,
         const __m128i P2 = _mm_setr_epi8(1, 2, 4, 8, 16, 32, 64, (char)128, 0, 0, 0, 0, 0, 0, 0, 0);
         const __m128i k1f = _mm_set1_epi8(0x1F), k7 = _mm_set1_epi8(7);
         uint16_t *rp = s.PR, *cp = s.PC;
+        /* K > 5: a hit row's full K-mer code, code5(r) | (code5(r - 5) & (4^(KK-5) - 1)) << 10
+         * (code5(r - 5)'s low bases are rb[r - 5], rb[r - 6], ...), with code5(r - 5) of the block's
+         * rows from the previous block's codes (pc1, zero before block 0: those rows are below
+         * KK - 1 and dropped). The chained prefilter as lean_neon_core's: a row's K-mer can occur
+         * in the query only if the 5-mers of rows r - 1 .. r - (KK - 5) do, whose raw presence bits
+         * sit in hr and in the previous block's (ph, above bit 16). */
+        __m128i pc1 = _mm_setzero_si128();
+        unsigned ph = 0;
+        const __m128i kmk = _mm_set1_epi16((short)((1 << (2 * (KK - 5))) - 1));
         auto block = [&](int b, unsigned keep) {
             __m128i a0;
             const __m128i lo = x86_code_lo(s.rbuf + b, a0);
@@ -167,8 +190,18 @@ static inline Kind lean_x86_core(const Job &jb, X86Scratch &s, int &hb, int &he,
             const __m128i byte = _mm_blendv_epi8(_mm_blendv_epi8(l01, l23, s5), _mm_blendv_epi8(l45, l67, s5), s6);
             const __m128i bit = _mm_shuffle_epi8(P2, _mm_and_si128(lo, k7));
             const __m128i hit = _mm_cmpeq_epi8(_mm_and_si128(byte, bit), bit);
-            const unsigned m16 = (unsigned)_mm_movemask_epi8(hit) & keep;
-            const __m128i c0 = _mm_unpacklo_epi8(lo, a0), c1 = _mm_unpackhi_epi8(lo, a0);
+            const unsigned hr = (unsigned)_mm_movemask_epi8(hit);
+            unsigned m16 = hr & keep;
+            __m128i c0 = _mm_unpacklo_epi8(lo, a0), c1 = _mm_unpackhi_epi8(lo, a0);
+            if (KK > 5) {
+                const unsigned h32 = hr << 16 | ph;
+                for (int j = 1; j <= KK - 5; j++) m16 &= h32 >> (16 - j);
+                ph = hr;
+                const __m128i p0 = _mm_alignr_epi8(c0, pc1, 6), p1 = _mm_alignr_epi8(c1, c0, 6);   // code5(r - 5)
+                pc1 = c1;
+                c0 = _mm_or_si128(c0, _mm_slli_epi16(_mm_and_si128(p0, kmk), 10));
+                c1 = _mm_or_si128(c1, _mm_slli_epi16(_mm_and_si128(p1, kmk), 10));
+            }
             const __m128i pos = _mm_add_epi16(IO, _mm_set1_epi16((short)b));
             const unsigned ml = m16 & 0xFF, mh = m16 >> 8;
             const __m128i shl = x86_ld(s.shuf[ml]), shh = x86_ld(s.shuf[mh]);
@@ -191,6 +224,30 @@ static inline Kind lean_x86_core(const Job &jb, X86Scratch &s, int &hb, int &he,
         }
         np = (int)(rp - s.PR);
     }
+    if (KK > 5) {
+        /* The prefiltered rows (their 5-mer suffix occurs in the query, PC their K-mer codes): keep
+         * those whose K-mer does and that end one (row >= KK - 1), 8 at a time: the presence bits
+         * through a gather of presk's 32-bit words, then a left-pack in place (the stores stay
+         * below the next group's loads). Lanes past np read stale codes (< 4^KK) and are masked. */
+        const int *__restrict pk = (const int *)s.presk.data();
+        const __m256i k31 = _mm256_set1_epi32(31), one32 = _mm256_set1_epi32(1);
+        const __m128i kmin = _mm_set1_epi16((short)(KK - 2));
+        int m = 0;
+        for (int k = 0; k < np; k += 8) {
+            const __m128i r = x86_ld(s.PR + k), c = x86_ld(s.PC + k);
+            const __m256i c32 = _mm256_cvtepu16_epi32(c);
+            const __m256i w = _mm256_i32gather_epi32(pk, _mm256_srli_epi32(c32, 5), 4);
+            const __m256i bit = _mm256_and_si256(_mm256_srlv_epi32(w, _mm256_and_si256(c32, k31)), one32);
+            unsigned msk = (unsigned)_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(bit, one32)));
+            msk &= (unsigned)_mm_movemask_epi8(_mm_packs_epi16(_mm_cmpgt_epi16(r, kmin), _mm_setzero_si128()));
+            if (np - k < 8) msk &= (1u << (np - k)) - 1;
+            const __m128i sh = x86_ld(s.shuf[msk]);
+            x86_st(s.PR + m, _mm_shuffle_epi8(r, sh));
+            x86_st(s.PC + m, _mm_shuffle_epi8(c, sh));
+            m += s.pc[msk];
+        }
+        np = m;
+    }
     if (np == 0) return B1;
     // ---- 4+5. accumulate hits (layer 1, then layers >= 2), as lean_neon ----
     int hits = np;
@@ -210,13 +267,14 @@ static inline Kind lean_x86_core(const Job &jb, X86Scratch &s, int &hb, int &he,
         __m128i pR = _mm_setzero_si128(), pD = _mm_set1_epi16(-1), idx = IO;
         const __m128i vn = _mm_set1_epi16((short)np), k1fff = _mm_set1_epi16(0x1FFF), k2000 = _mm_set1_epi16(0x2000);
         const __m128i lo16 = _mm_set1_epi32(0xFFFF);
-        const uint32_t *__restrict tab = s.tab;
+        const uint32_t *__restrict tab = KK > 5 ? s.tabk.data() : s.tab;
+        const uint64_t CM = ((uint64_t)1 << (2 * KK)) - 1;   // the table's code mask
         // table entries of four codes (lanes past np hold stale codes: masked below)
-        auto look4 = [tab](const uint16_t *c) {
+        auto look4 = [tab, CM](const uint16_t *c) {
             uint64_t x;
             memcpy(&x, c, 8);
-            const uint64_t a = tab[x & 1023] | (uint64_t)tab[(x >> 16) & 1023] << 32;
-            const uint64_t b = tab[(x >> 32) & 1023] | (uint64_t)tab[(x >> 48) & 1023] << 32;
+            const uint64_t a = tab[x & CM] | (uint64_t)tab[(x >> 16) & CM] << 32;
+            const uint64_t b = tab[(x >> 32) & CM] | (uint64_t)tab[(x >> 48) & CM] << 32;
             return _mm_set_epi64x((long long)b, (long long)a);
         };
         __m128i extra = _mm_setzero_si128();   // gate: occurrences - 1 summed over the hit rows (u32)
@@ -243,7 +301,16 @@ static inline Kind lean_x86_core(const Job &jb, X86Scratch &s, int &hb, int &he,
         n = (int)(mp - s.RA);
         extra = _mm_add_epi32(extra, _mm_srli_si128(extra, 8));
         extra = _mm_add_epi32(extra, _mm_srli_si128(extra, 4));
-        if ((long)np + (uint32_t)_mm_cvtsi128_si32(extra) > max_hits) return FULL;
+        const long nh = (long)np + (uint32_t)_mm_cvtsi128_si32(extra);   // hits over all layers
+        if (nh > max_hits) return FULL;
+        /* Early B1: every Kadane interval of step 6 is non-empty and sums a cnt - c over its
+         * diagonals (c > 0), so the best is at most a hits - c (hits - 1 at the default weights).
+         * When base plus even that misses minsc, B1 is the scalar filter's verdict too (its gate
+         * counts the same hits, and its bound is the same sum), so return it here, before the
+         * layers and scans. The sum is taken in long, so it holds past the int16 guards below that
+         * would otherwise send the job to the scalar filter. Kept to exact matching, where it was
+         * measured (under the relation nh counts entries, which is exact as well). */
+        if (!Rel && (Gen ? wt.base + (long)wt.a * nh - wt.c : 4 + nh) < minsc) return B1;
         // cnt is scanned up to the 8-segment round-up of nd (< nd + 64)
         memset(s.cnt, 0, (((nd + 63) & ~63) + 8) * sizeof(uint16_t));
         // Layer 1 runs, last to first: rows descend, so the last store to minrow[d] is the first
@@ -255,7 +322,7 @@ static inline Kind lean_x86_core(const Job &jb, X86Scratch &s, int &hb, int &he,
         for (int k = nbd - 1; k >= 0; k--) {
             const int d = s.BD[k];
             cnt[d] = (uint16_t)(cnt[d] + s.B[k + 1] - s.B[k]);
-            minrow[d] = (int16_t)(s.BR[k] - 4);
+            minrow[d] = (int16_t)(s.BR[k] - (KK - 1));
         }
     }
     {
@@ -311,7 +378,7 @@ static inline Kind lean_x86_core(const Job &jb, X86Scratch &s, int &hb, int &he,
             int16_t *__restrict minrow = s.minrow;
             for (int k = 0; k < nbd; k++) {
                 const int d = s.BD[k], row = s.BR[k], c = cnt[d], mr = minrow[d];
-                minrow[d] = (int16_t)(c ? std::min(mr, row - 4) : row - 4);
+                minrow[d] = (int16_t)(c ? std::min(mr, row - (KK - 1)) : row - (KK - 1));
                 cnt[d] = (uint16_t)(c + s.B[k + 1] - s.B[k]);
             }
             n = (int)(rp2 - R2);
@@ -437,19 +504,26 @@ static inline Kind lean_x86_core(const Job &jb, X86Scratch &s, int &hb, int &he,
     return B2;
 }
 
-// The general-weights and --meth relation cores out of line, as lean_neon_core_gen.
-template <bool Gen, bool Rel>
+// The general-weights, --meth relation and K > 5 cores out of line, as lean_neon_core_gen.
+template <bool Gen, bool Rel, int KK = 5>
 static Kind __attribute__((noinline)) lean_x86_core_gen(const Job &jb, X86Scratch &s, int &hb, int &he,
                                                         int max_hits, int minsc, const Wt &wt, int relx)
 {
-    return lean_x86_core<Gen, Rel>(jb, s, hb, he, max_hits, minsc, wt, relx);
+    return lean_x86_core<Gen, Rel, KK>(jb, s, hb, he, max_hits, minsc, wt, relx);
 }
-// lean_x86_core behind the repeat memo, as lean_neon; relx >= 0 runs the --meth relation.
+// lean_x86_core behind the repeat memo, as lean_neon; relx >= 0 runs the --meth relation, wt.K > 5
+// the K-mer instantiations (exact matching only).
 static inline Kind lean_x86(const Job &jb, X86Scratch &s, int &hb, int &he, int max_hits, int minsc,
                             const Wt &wt, int relx = -1)
 {
     return lean_memo(jb, s, hb, he, max_hits, minsc, wt, relx,
                      [](const Job &j, X86Scratch &t, int &b, int &e, int mh, int ms, const Wt &w, int rx) {
+                         if (w.K != 5)
+                             return rx >= 0 ? FALLBACK
+                                  : w.K == 6 ? lean_x86_core_gen<true, false, 6>(j, t, b, e, mh, ms, w, -1)
+                                  : w.K == 7 ? lean_x86_core_gen<true, false, 7>(j, t, b, e, mh, ms, w, -1)
+                                  : w.K == 8 ? lean_x86_core_gen<true, false, 8>(j, t, b, e, mh, ms, w, -1)
+                                             : FALLBACK;
                          if (rx < 0)
                              return w.dflt() ? lean_x86_core<false, false>(j, t, b, e, mh, ms, w, -1)
                                              : lean_x86_core_gen<true, false>(j, t, b, e, mh, ms, w, -1);

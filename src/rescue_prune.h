@@ -2,7 +2,7 @@
  *
  * A mate-rescue Smith-Waterman job (mate `q` against reference window `ref`) contributes only
  * score/te/qe (pass 0), tb/qb (pass 1) and score2 (-> csub) to the output, and nothing at all
- * when score < minsc (the post gate fails). This filter proves, from exact 5-mer matches, which
+ * when score < minsc (the post gate fails). This filter proves, from exact K-mer matches, which
  * part of the window can hold any row whose value matters, so the DP can run on a sub-window
  * (or not at all) with byte-identical results.
  *
@@ -24,9 +24,20 @@
  * +a (the neutral one's freed cell scores 0 <= a), and every other cell scores -b as before.
  *
  * Other scorings (rescue_prune_params): the same argument with K-mers, K - 1 <= min(b, o_del,
- * o_ins + e_ins) / a (capped at 5), a per-diagonal charge c and the constant a (K - 1) + c in place
- * of 1 and 5, and the tail below scaled to the deletion costs; rescue_prune_params::from refuses a
- * scoring the argument does not hold for (then every window runs in full).
+ * o_ins + e_ins) / a (capped at the caller's k_max, at most rescue_prune_scratch_kmax = 8), a
+ * per-diagonal charge c and the constant a (K - 1) + c in place of 1 and 5, and the tail below scaled
+ * to the deletion costs; rescue_prune_params::from refuses a scoring the argument does not hold for
+ * (then every window runs in full). A scoring whose mismatch and gap costs admit K > 5 (-B 6 with
+ * the default gaps admits K = 7, -x intractg K = 10, capped at 8) counts longer K-mer hits: every
+ * step in K cuts random hits 4x, so the bound keeps fewer rows for the same threshold. Production
+ * takes K > 5 for exact matching only; --meth keeps K = 5 (rescue_prune_kmax in bwamem_pair.cpp).
+ *
+ * Two corollaries let the SIMD filters skip work without changing a decision. Every diagonal
+ * interval is non-empty and sums a cnt_d - c, so its bound is at most a (K - 1) + c + a hits - c:
+ * a job whose total hit count cannot reach minsc is B1 before any diagonal is accumulated (the
+ * early B1). And a K-mer hit's row r has every 5-mer of that K-mer in the query, the ones ending
+ * at rows r - (K - 5) .. r, so at K > 5 a row is a candidate only if all of those 5-mers are (the
+ * chained 5-mer prefilter); the K-mer test itself then decides.
  *
  * Decisions:
  *   RESCUE_PRUNE_B1   no diagonal interval reaches minsc: score < minsc is proven, so the job's
@@ -60,6 +71,10 @@
 #include "rescue_prune_x86.h"
 
 enum { RESCUE_PRUNE_FULL = 0, RESCUE_PRUNE_B1 = 1, RESCUE_PRUNE_B2 = 2 };
+/* The largest K any filter takes, one value for all of them: the SIMD filters' K-mer
+ * instantiations stop at FilterScratch::KMAXN (bounded by their 16-bit code storage), and the
+ * scalar filter's code tables and production's cap (rescue_prune_kmax) follow it. */
+static const int rescue_prune_scratch_kmax = rescue_prune_neon::FilterScratch<true>::KMAXN;
 
 /* kswv's 8-bit bias for the score table {+a, -b, -1}: -min(-b, -1) (a --meth matrix's minimum is
  * still -b, mem_opt_fill_meth_mat). */
@@ -117,13 +132,19 @@ struct rescue_prune_params {
         const int n = ub - tau - o_del + (K - 1) * a;
         return n <= 0 ? 0 : e_del == 1 ? n : n / e_del;   // no division at the default -E 1
     }
-    /* The SIMD filters take K = 5 and any weights (simd_wt); a <= 16 keeps a cnt in int16 (they
-     * fall back to the scalar filter where a sum would leave it). */
-    bool simd_ok() const { return valid && K == 5 && a <= 16; }
+    /* The SIMD filters take K = 5 and any weights (simd_wt), under the --meth relation too; a <= 16
+     * keeps a cnt in int16 (they fall back to the scalar filter where a sum would leave it). Both
+     * also take K = 6..rescue_prune_scratch_kmax with exact matching (relx < 0): the relation's
+     * entry table is 5-mer only, and production never pairs it with K > 5. K = 3 and 4 (the band
+     * harness's k_min 3) have no SIMD instantiation and go to the scalar filter. */
+    bool simd_ok() const
+    {
+        return valid && a <= 16 && (K == 5 || (K > 5 && K <= rescue_prune_scratch_kmax && relx < 0));
+    }
     rescue_prune_neon::Wt simd_wt() const
     {
         rescue_prune_neon::Wt w;
-        w.base = base(); w.a = a; w.c = c; w.toff = o_del - (K - 1) * a; w.e = e_del;
+        w.base = base(); w.a = a; w.c = c; w.toff = o_del - (K - 1) * a; w.e = e_del; w.K = K;
         return w;
     }
     /* --meth: the rescued mate is scored with mat_ot (hyp 1: reference C / read T freed) or mat_ob
@@ -143,28 +164,36 @@ struct rescue_prune_params {
     }
 
     /* The validity conditions in order, kswv8_scoring_ok first so that no division sees a zero.
+     * K is the largest valid one up to k_max (itself capped at rescue_prune_scratch_kmax): the
+     * separator costs bound it, and a K they admit may still fail the charge (c > 0) or the
+     * threshold (minsc > (K - 1) a) where a smaller K passes, so K steps down until one does. A
+     * smaller K only makes those two easier (s falls, so c rises), so the first K that passes is
+     * the largest valid one, and a scoring is refused only if no K down to max(3, k_min) passes.
      * k_min is the smallest K accepted: K >= 3 is sound, but below 5 hits are so dense (4x per K
-     * step on random sequence) that the bound rarely drops below minsc. Production takes the
-     * default 5, and the SIMD filters take only K = 5 (simd_ok); k_min below 5, and with it the
-     * scalar filter's K = 3 / 4 path, exist for the band harness's random scorings, which check
-     * the lemma's generality against kswv. */
+     * step on random sequence) that the bound rarely drops below minsc. Production takes k_min 5
+     * and k_max from rescue_prune_kmax (bwamem_pair.cpp); k_min below 5, and with it the scalar
+     * filter's K = 3 / 4 path, exist for the band harness's random scorings, which check the
+     * lemma's generality against kswv. */
     static rescue_prune_params from(int a, int b, int o_del, int e_del, int o_ins, int e_ins, int minsc,
-                                    int k_min = 5)
+                                    int k_min = 5, int k_max = 5)
     {
         rescue_prune_params p;
         p.a = a; p.b = b; p.o_del = o_del; p.e_del = e_del; p.o_ins = o_ins; p.e_ins = e_ins;
         p.minsc = minsc;
         if (!kswv8_scoring_ok(a, b, o_del, e_del, o_ins, e_ins)) return p;
         // K: a separator (mismatch, deletion, insertion) must cost at least (K - 1) a.
-        const int km1 = std::min(4, std::min(b, std::min(o_del, o_ins + e_ins)) / a);
-        p.K = km1 + 1;
-        if (p.K < std::max(3, k_min)) return p;
-        const int s = p.a * (p.K - 1);
-        if (b < s || o_del < s || o_del + e_del < s || o_ins + e_ins < s) return p;
-        p.c = std::min(std::min(e_del, e_ins), std::min(o_del + e_del - s, o_ins + e_ins - s));
-        if (p.c <= 0) return p;          // the bound must decay along a hit-free stretch
-        if (minsc <= s) return p;        // a hit-free window must not reach minsc (minsc >= 5 at defaults)
-        p.valid = true;
+        const int km1 = std::min(std::min(k_max, rescue_prune_scratch_kmax) - 1,
+                                 std::min(b, std::min(o_del, o_ins + e_ins)) / a);
+        for (p.K = km1 + 1; p.K >= std::max(3, k_min); p.K--) {
+            const int s = p.a * (p.K - 1);
+            if (b < s || o_del < s || o_del + e_del < s || o_ins + e_ins < s) continue;
+            p.c = std::min(std::min(e_del, e_ins), std::min(o_del + e_del - s, o_ins + e_ins - s));
+            if (p.c <= 0) continue;      // the bound must decay along a hit-free stretch
+            if (minsc <= s) continue;    // a hit-free window must not reach minsc (minsc >= 5 at defaults)
+            p.valid = true;
+            return p;
+        }
+        p.K = std::max(3, k_min);        // refused at every K (valid stays false)
         return p;
     }
     static rescue_prune_params defaults(int minsc) { return from(1, 4, 6, 1, 6, 1, minsc); }
@@ -180,15 +209,27 @@ struct rescue_prune_scratch {
      * of query positions; a mate needing more than ECAP entries is not pruned (FULL). The SIMD filters
      * use the same cap. */
     static const int ECAP = rescue_prune_neon::REL_ECAP;
-    int16_t head[1024], nxt[QCAP];
+    /* The code tables (head, qcnt) span 4^K codes, allocated on first use at the largest K seen so
+     * far (4^5 at the default scoring, 4^8 = 64 K at most), so a thread that never filters at
+     * K > 5 never holds the large ones. A new query resets only the codes the previous one set
+     * (touched: at most one per entry, so at most ECAP >= QCAP), so the size costs nothing per
+     * query; ntouched < 0 means the tables must be cleared in full (clear_tables). */
+    static const int KMAX = rescue_prune_scratch_kmax;
+    std::vector<int16_t> head;
+    std::vector<uint16_t> qcnt;
+    int16_t nxt[QCAP];
     int16_t ent_j[ECAP], ent_nxt[ECAP];
-    uint16_t qcnt[1024];
+    int32_t touched[ECAP];
+    int ntouched = -1;
     uint8_t qcache[QCAP];
     int qlen_c = -1, qk_c = 0, qrel_c = -1;   // the cached query tables are for this length, K and relx
     bool q_over = false;                        // ... and exceeded ECAP
     uint16_t cnt[DCAP];
     int16_t minrow[DCAP];
     int32_t fwd[DCAP], bwd[DCAP];
+    /* Forget the cached query and clear the code tables in full at the next call (the tests use it
+     * to compare the touched-code reset against a clean table). */
+    void clear_tables() { ntouched = -1; qlen_c = -1; }
 };
 
 /* Scalar implementation: any valid scoring (p.valid, which the caller checks), a build without a
@@ -207,14 +248,25 @@ static inline int rescue_prune_window_scalar(const uint8_t *ref, int len1, const
     if (len2 < K || len1 < K) return RESCUE_PRUNE_FULL;
     const int relx = p.relx;
     if (len2 != s.qlen_c || K != s.qk_c || relx != s.qrel_c || memcmp(q, s.qcache, (size_t)len2) != 0) {
-        memset(s.head, 0xFF, sizeof s.head);
-        memset(s.qcnt, 0, sizeof s.qcnt);
+        const size_t ncode = (size_t)1 << (2 * K);
+        if (s.head.size() < ncode) {   // grow (first use, or a larger K): every entry starts clear
+            s.head.assign(ncode, -1);
+            s.qcnt.assign(ncode, 0);
+            s.ntouched = 0;
+        } else if (s.ntouched < 0) {
+            std::fill(s.head.begin(), s.head.end(), (int16_t)-1);
+            std::fill(s.qcnt.begin(), s.qcnt.end(), (uint16_t)0);
+        } else {
+            for (int t = 0; t < s.ntouched; t++) { s.head[s.touched[t]] = -1; s.qcnt[s.touched[t]] = 0; }
+        }
+        s.ntouched = 0;
         s.q_over = false;
         int c = 0;
         for (int j = 0; j < K - 1; j++) c = (c << 2) | q[j];
         if (relx < 0) {
             for (int j = K - 1; j < len2; j++) {
                 c = ((c << 2) | q[j]) & mask;
+                if (!s.qcnt[c]) s.touched[s.ntouched++] = c;
                 s.nxt[j] = s.head[c];
                 s.head[c] = (int16_t)j;
                 s.qcnt[c]++;
@@ -235,6 +287,7 @@ static inline int rescue_prune_window_scalar(const uint8_t *ref, int len1, const
                 for (int sm = M;; sm = (sm - 1) & M) {
                     if (ne == rescue_prune_scratch::ECAP) { s.q_over = true; break; }
                     const int rc = c ^ sm;
+                    if (!s.qcnt[rc]) s.touched[s.ntouched++] = rc;
                     s.ent_j[ne] = (int16_t)j;
                     s.ent_nxt[ne] = s.head[rc];
                     s.head[rc] = (int16_t)ne++;
@@ -469,8 +522,8 @@ static inline bool rescue_meth_rel_matrix_ok(const int8_t *mat, int hyp, int a, 
  * On x86 no --meth, where the cheaper kswv leaves nothing to win (Zen 5, EM-seq genomic
  * +0.1 %, collapsed -B 4 +1.6 %, TAPS +5.0 %; the relation filter, single thread over 5.57 M TAPS
  * rescue jobs, costs 8.0 s to save about 5 thread-s of kswv), and only where the SIMD filter runs
- * (simd_ok: K = 5, a <= 16): the scalar filter costs more than it saves against the cheaper x86
- * kswv (Zen 5 AVX-512, prune on vs off, scalar-filtered: -O 8 -E 2 +13.3 / +4.7 %, -x intractg
+ * (simd_ok: K = 5, or 6 to 8 with exact matching, a <= 16): the scalar filter costs more than it
+ * saves against the cheaper x86 kswv (Zen 5 AVX-512, prune on vs off, scalar-filtered: -O 8 -E 2 +13.3 / +4.7 %, -x intractg
  * +14.6 / +4.9 %), while the SIMD filter at those scorings wins or breaks even (Zen 3 AVX2: -O 8
  * -E 2 -2.6 / -7.2 %, -x intractg -0.3 / -6.2 %; Zen 5: all within 1 %), and not at the AVX-512BW
  * tier from seed length 25 (-k 25; minsc >= 25 a, since minsc = min_seed_len * a): there
@@ -558,7 +611,8 @@ static RESCUE_PRUNE_WINDOW_INLINE int rescue_prune_window(const uint8_t *ref, in
             view->keyed = k != rescue_prune_neon::FALLBACK;
             const uint64_t wkey = (uint64_t)(uint32_t)wt.base ^ (uint64_t)(uint32_t)wt.a << 16
                                   ^ (uint64_t)(uint32_t)wt.c << 32 ^ (uint64_t)(uint32_t)wt.toff << 40
-                                  ^ (uint64_t)(uint32_t)wt.e << 52 ^ (uint64_t)(uint32_t)(p.relx + 1) << 60;
+                                  ^ (uint64_t)(uint32_t)wt.e << 52 ^ (uint64_t)(uint32_t)(p.relx + 1) << 60
+                                  ^ (uint64_t)(uint32_t)wt.K << 56;
             view->key = (ss.whash ^ (ss.qhash * 0x9E3779B97F4A7C15ULL)) + (uint64_t)max_hits * 0xD6E8FEB86659FD93ULL
                         + (uint64_t)minsc * 0xA24BAED4963EE407ULL + wkey * 0xC2B2AE3D27D4EB4FULL;
         }

@@ -321,7 +321,7 @@ static RescueBandBatch &matesw_band(mem_cache *mmc, int32_t tid)
 /* Exact rescue pruning (rescue_prune.h). Default ON where it runs (below); BWA3_RESCUE_PRUNE=0
  * disables it (with BWA3_RESCUE_BAND=0, the reference path of the byte-identity A/B).
  * BWA3_RESCUE_PRUNE_MAX_HITS (default: rescue_prune_max_hits below) skips the filter on windows
- * sharing more 5-mer hits with the mate than that, where it would cost more than the DP rows it
+ * sharing more K-mer hits with the mate than that, where it would cost more than the DP rows it
  * saves; a malformed value is reported and the default used. Read once. */
 static bool rescue_prune_enabled()
 {
@@ -348,7 +348,7 @@ static bool rescue_prune_on()
 }
 /* BWA3_RESCUE_PRUNE_STATS=1 prints the rescue shortcuts' counters to stderr at exit as one line,
  * "[RESCUE_PRUNE] jobs=.. full=.. b1=.. b2=.. rows_in=.. rows_kept=.. jobs16=.. b1_16=.. b2_16=..
- * memo_hits=.. reused=.. <stage times> dedup_run=.. dedup_skip=.. dedup_run_regs=..
+ * kmer_jobs=.. memo_hits=.. reused=.. <stage times> dedup_run=.. dedup_skip=.. dedup_run_regs=..
  * dedup_skip_regs=.. dedup_insert1=.. dedup_insert1_fast=.. dedup_s=..". The first fields are the
  * filter's: jobs filtered, and of them how many kept the full window, were proven to fail (b1, not
  * enqueued) or were narrowed to a hull (b2), with the reference rows before and after, the calls the
@@ -356,12 +356,14 @@ static bool rescue_prune_on()
  * earlier job's result instead of being enqueued (reused, BWA3_RESCUE_REPEAT). They are the
  * non-vacuity check for the identity A/B: identical output must come with a nonzero number of
  * pruned rows. jobs16 counts the 16-bit rescue jobs, and b1_16 / b2_16 (included in b1 / b2) the
- * filter's B1 and B2 decisions on them: the same check for the 16-bit kswv kernels. The dedup_*
+ * filter's B1 and B2 decisions on them: the same check for the 16-bit kswv kernels. kmer_jobs
+ * counts the jobs the SIMD filter decided with K-mers longer than 5 (rescue_prune_kmax; not the
+ * scalar filter's decisions), the same check for a scoring that admits them. The dedup_*
  * fields are the post-rescue dedup's (below), which runs on every architecture, so in a run that
  * does not prune (rescue_prune_runs) they and jobs16 are the line's only nonzero counters. */
 struct rescue_prune_stats_t {
     std::atomic<uint64_t> jobs{0}, full{0}, b1{0}, b2{0}, rows_in{0}, rows_kept{0}, jobs16{0}, b1_16{0},
-        b2_16{0}, memo_hits{0}, reused{0};
+        b2_16{0}, kmer_jobs{0}, memo_hits{0}, reused{0};
     /* Thread-summed wall time of the rescue stages (ns): filter + band planning in _pre, kswv
      * pass 0 (8-bit + 16-bit), the banded pass 0, kswv pass 1 and the banded pass 1. Only measured
      * when stats are on. */
@@ -373,14 +375,15 @@ struct rescue_prune_stats_t {
     bool on = rescue_env_opt_in("BWA3_RESCUE_PRUNE_STATS");
     ~rescue_prune_stats_t() {
         if (on) fprintf(stderr, "[RESCUE_PRUNE] jobs=%llu full=%llu b1=%llu b2=%llu rows_in=%llu rows_kept=%llu "
-                        "jobs16=%llu b1_16=%llu b2_16=%llu memo_hits=%llu reused=%llu filter_s=%.3f "
+                        "jobs16=%llu b1_16=%llu b2_16=%llu kmer_jobs=%llu memo_hits=%llu reused=%llu filter_s=%.3f "
                         "kswv_pass0_s=%.3f band_pass0_s=%.3f kswv_pass1_s=%.3f band_pass1_s=%.3f dedup_run=%llu "
                         "dedup_skip=%llu dedup_run_regs=%llu "
                         "dedup_skip_regs=%llu dedup_insert1=%llu dedup_insert1_fast=%llu dedup_s=%.3f\n",
                         (unsigned long long)jobs, (unsigned long long)full, (unsigned long long)b1,
                         (unsigned long long)b2, (unsigned long long)rows_in, (unsigned long long)rows_kept,
                         (unsigned long long)jobs16, (unsigned long long)b1_16,
-                        (unsigned long long)b2_16, (unsigned long long)memo_hits, (unsigned long long)reused,
+                        (unsigned long long)b2_16, (unsigned long long)kmer_jobs, (unsigned long long)memo_hits,
+                        (unsigned long long)reused,
                         ns_filter * 1e-9, ns_k0 * 1e-9, ns_band * 1e-9,
                         ns_k1 * 1e-9, ns_b1 * 1e-9, (unsigned long long)dedup_run,
                         (unsigned long long)dedup_skip, (unsigned long long)dedup_run_regs,
@@ -404,7 +407,7 @@ static rescue_prune_stats_t g_rescue_prune_stats;
  * plain adds. */
 struct rescue_prune_tstats_t {
     uint64_t jobs = 0, full = 0, b1 = 0, b2 = 0, rows_in = 0, rows_kept = 0, jobs16 = 0, b1_16 = 0,
-        b2_16 = 0, memo_hits = 0, reused = 0;
+        b2_16 = 0, kmer_jobs = 0, memo_hits = 0, reused = 0;
     uint64_t ns_filter = 0, ns_k0 = 0, ns_band = 0, ns_k1 = 0, ns_b1 = 0;
     uint64_t dedup_run = 0, dedup_skip = 0, dedup_run_regs = 0, dedup_skip_regs = 0, dedup_insert1 = 0,
         dedup_insert1_fast = 0, ns_dedup = 0;
@@ -412,7 +415,7 @@ struct rescue_prune_tstats_t {
         rescue_prune_stats_t &g = g_rescue_prune_stats;
         g.jobs += jobs; g.full += full; g.b1 += b1; g.b2 += b2; g.rows_in += rows_in;
         g.rows_kept += rows_kept; g.jobs16 += jobs16; g.b1_16 += b1_16; g.b2_16 += b2_16;
-        g.memo_hits += memo_hits; g.reused += reused;
+        g.kmer_jobs += kmer_jobs; g.memo_hits += memo_hits; g.reused += reused;
         g.ns_filter += ns_filter; g.ns_k0 += ns_k0; g.ns_band += ns_band; g.ns_k1 += ns_k1; g.ns_b1 += ns_b1;
         g.dedup_run += dedup_run; g.dedup_skip += dedup_skip; g.dedup_run_regs += dedup_run_regs;
         g.dedup_skip_regs += dedup_skip_regs; g.dedup_insert1 += dedup_insert1;
@@ -436,12 +439,34 @@ static bool rescue_repeat_enabled()
     return on;
 }
 
-/* The pruning parameters for this run's scoring and threshold (min_seed_len * a).
- * rescue_prune_params::from checks the lemma's validity conditions, including minsc > (K - 1) a. */
+/* The largest filter K for this run (rescue_prune_params::from takes the largest valid K up to
+ * this): BWA3_RESCUE_PRUNE_KMAX (clamped to [5, rescue_prune_scratch_kmax]), else 8 wherever a SIMD
+ * filter runs (RESCUE_PRUNE_HAVE_SIMD; a build without one does not prune, so its 5 is moot). A
+ * scoring whose mismatch and gap costs admit K > 5 (-B 5 or more with the default gap costs,
+ * -x intractg) prunes with longer K-mers: 4x fewer random hits per step, so fewer rows kept.
+ * Wall, K = 5 -> up to 8, -t 16, wgs-5M / wes-5M (5 M read pairs each), interleaved reps:
+ * Graviton 4 (NEON, 3 reps): -B 6 -9.2 / -3.1 %, -B 8 -10.1 / -1.5 %, -x intractg -13.4 / -3.3 %;
+ * Zen 3 (AVX2 tier, 5 reps): -B 6 -4.2 / -0.2 %, -B 8 -3.5 / -1.7 %, -x intractg -5.3 / -2.0 %;
+ * Zen 5 (AVX-512BW tier, 5 reps, with the early B1 and the chained 5-mer prefilter), whose cheaper
+ * kswv leaves less to prune: -B 6 -0.8 / -1.3 %, -B 8 -0.1 / -1.2 %, -x intractg -0.7 / -1.6 %.
+ * --meth keeps K = 5: its matching, on converted copies or under the relation, is validated at
+ * K = 5 only, and the relation's entry table is 5-mer only (rescue_prune_params::simd_ok). The
+ * default scoring admits K = 5 alone, so it is unchanged. */
+static int rescue_prune_kmax(const mem_opt_t *opt)
+{
+    static const int dflt = RESCUE_PRUNE_HAVE_SIMD ? rescue_prune_scratch_kmax : 5;
+    static const int env = rescue_env_int("BWA3_RESCUE_PRUNE_KMAX", -1);
+    static const int k = env >= 0 ? std::max(5, std::min(env, rescue_prune_scratch_kmax)) : dflt;
+    return opt->meth_mode ? 5 : k;
+}
+
+/* The pruning parameters for this run's scoring and threshold (min_seed_len * a), at K up to
+ * rescue_prune_kmax. rescue_prune_params::from checks the lemma's validity conditions, including
+ * minsc > (K - 1) a. */
 static rescue_prune_params rescue_prune_params_for(const mem_opt_t *opt)
 {
     return rescue_prune_params::from(opt->a, opt->b, opt->o_del, opt->e_del, opt->o_ins, opt->e_ins,
-                                     opt->min_seed_len * opt->a);
+                                     opt->min_seed_len * opt->a, 5, rescue_prune_kmax(opt));
 }
 
 /* The run's scoring as the band kernels take it (rescue_band.h; from() copies the costs whether or
@@ -1947,6 +1972,7 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                 if (g_rescue_prune_stats.on) t_rescue_prune_stats.ns_filter += rescue_now_ns() - tf0;
                 if (g_rescue_prune_stats.on) {
                     t_rescue_prune_stats.jobs++;
+                    t_rescue_prune_stats.kmer_jobs += pp.K > 5 && view.keyed;   // the SIMD filter decided
                     t_rescue_prune_stats.memo_hits += view.repeat;
                     t_rescue_prune_stats.reused += reuse >= 0;
                     t_rescue_prune_stats.rows_in += re - rb;
