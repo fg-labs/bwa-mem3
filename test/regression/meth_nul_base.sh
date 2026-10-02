@@ -25,7 +25,7 @@
 #       is not tag-shaped, so p2's TAB alone cannot show a missed TAB).
 # For each affected read: it is mapped, on its expected strand; SEQ equals the
 # input with control bytes (and p3's non-base bytes) read as N; the alignment
-# scores that base as N too (p1's NM/MD record a mismatch against the
+# scores that base as N too (p1's NM and MD record a mismatch against the
 # reference A, where a raw 0 byte would be scored as base A and match); the
 # record carries XR:Z (CT for R1, GA for R2) and BC:Z:ACGT; the internal
 # YS:Z/YC:Z carriers do not leak; no forged ZZ:Z tag appears; and every aux
@@ -102,6 +102,18 @@ with open('expected.tsv', 'w') as f:
     f.write('p1\t64\t0\tCT\t%s\n' % as_n(p1_r1))
     f.write('p2\t128\t16\tGA\t%s\n' % as_n(p2_r2))
     f.write('p3\t64\t0\tCT\t%s\n' % as_n(p3_r1))
+# p1 R1 aligns ungapped to ref[200:300], so its literal MD lists the reference
+# base at every column the read differs from: the C->T conversions and the
+# control byte (read as N) at base 20.
+md, run = '', 0
+for r, b in zip(ref[200:300], as_n(p1_r1)):
+    if r == b:
+        run += 1
+    else:
+        md += '%d%s' % (run, r)
+        run = 0
+with open('p1_md.txt', 'w') as f:
+    f.write('%s%d\n' % (md, run))
 PY
 
 "$BIN" mem --meth -C ref.fa r1.fq r2.fq > out.sam 2> mem.log || {
@@ -150,11 +162,16 @@ while IFS=$'\t' read -r name read_flag strand xr want; do
     check_read "$name" "$read_flag" "$strand" "$xr" "$want"
 done < expected.tsv
 
-# p1 R1 is otherwise an exact match, so the N at base 20 is its only edit.
+# p1 R1 is otherwise an exact match of the converted read, so the N at base 20
+# is its only edit. MD is literal, so it also lists R1's C->T conversions; it
+# must equal the MD computed from the reference and the read.
+want_md=$(cat p1_md.txt)
 while IFS=$'\t' read -r qname flag rest; do
     if [ "$qname" != p1 ] || ! ((flag & 64)); then continue; fi
     tags=$'\t'$(printf '%s\n' "$rest" | cut -f10-)$'\t'
-    [[ $tags == *$'\tNM:i:1\t'* && $tags == *$'\tMD:Z:19A80\t'* ]] \
-        || fail "p1: the control byte was not scored as N (want NM:i:1 MD:Z:19A80); tags:$tags"
+    [[ $tags == *$'\tNM:i:1\t'* ]] \
+        || fail "p1: the control byte was not scored as N (want NM:i:1); tags:$tags"
+    [[ $tags == *$'\tMD:Z:'"$want_md"$'\t'* ]] \
+        || fail "p1: MD is not the literal difference string (want MD:Z:$want_md); tags:$tags"
 done < primary.sam
 echo "PASS: meth_nul_base"

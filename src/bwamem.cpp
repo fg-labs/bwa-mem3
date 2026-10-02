@@ -5246,9 +5246,10 @@ void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str,
  *
  * One predicate, because it selects THREE things at once and they must never
  * disagree: the query bases (original vs projected), the scoring matrix
- * (per-hypothesis asymmetric vs symmetric), and the NM/MD predicate
- * (matrix-derived vs literal). A caller that satisfies two of the three inputs
- * but not the third silently produces a record with the OTHER tag semantics and
+ * (per-hypothesis asymmetric vs symmetric), and the NM predicate
+ * (matrix-derived vs literal; MD is literal either way). A caller that
+ * satisfies two of the three inputs but not the third silently produces a
+ * record with the OTHER tag semantics and
  * no diagnostic — which is exactly how XA:Z sub-entries ended up reporting
  * conversion-counting NM alongside a conversion-hiding primary (fixed by
  * threading meth_orig_query through mem_gen_alt). Keeping the decision in one
@@ -5265,7 +5266,7 @@ void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str,
  *     mate under --meth inherits 0 or 1, never -1.
  * Were it ever false, the fallback is still self-consistent rather than mixed:
  * the symmetric opt->mat has every off-diagonal at -b < 0 (--meth rejects
- * -B 0), so the matrix-derived and literal NM/MD predicates agree on it. */
+ * -B 0), so the matrix-derived and literal NM predicates agree on it. */
 static int mem_use_native_regen(const mem_opt_t *opt, const mem_alnreg_t *ar,
                                 const char *meth_orig_query)
 {
@@ -5302,7 +5303,7 @@ mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *
      * mismatch. When `meth_orig_query` is supplied, regen from the original
      * bases; else fall back to the projected `query_` (non-meth path,
      * byte-for-byte identical to legacy). How conversions themselves are treated
-     * in NM/MD is governed by the policy note below, not here. */
+     * in NM and MD is governed by the policy note below, not here. */
     const int use_meth_orig = mem_use_native_regen(opt, ar, meth_orig_query);
     const char *regen_query = use_meth_orig ? meth_orig_query : query_;
     /* Reuse a per-thread nt4 scratch instead of a malloc/free per region. The
@@ -5336,31 +5337,35 @@ mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *
      *     re-penalize every conversion as a mismatch and can shift gaps); for
      *     non-meth it is the symmetric opt->mat (legacy, unchanged).
      *
-     * NOTE (--meth NM/MD-vs-conversion policy): under --meth, NM/MD are derived
-     * from `regen_mat`, not from literal base inequality — a column is a mismatch
-     * iff the matrix penalises it (`bwa_gen_cigar3(..., nm_from_mat=1)`). Because
-     * the asymmetric matrix scores the conversion cell as a match, a bisulfite
-     * C→T (OT) / G→A (OB) at a ref-C/ref-G is a MATCH for NM/MD exactly as it
-     * already is for the DP. One definition drives both; there is no bisulfite
-     * special case in the NM/MD pass itself.
+     * NOTE (--meth NM/MD-vs-conversion policy): under --meth, NM is derived
+     * from `regen_mat`, not from literal base inequality — an aligned (M) column
+     * is an edit iff the matrix penalises it (`bwa_gen_cigar3(..., nm_from_mat=1)`);
+     * inserted and deleted bases always count, as without --meth. Because
+     * the asymmetric matrix never penalises the conversion cell (it scores it
+     * as a match under collapsed/genomic and as 0 under neutral;
+     * mem_opt_fill_meth_mat), a bisulfite C→T (OT) / G→A (OB) at a
+     * ref-C/ref-G is not an edit for NM exactly as it is not for the DP. MD
+     * stays literal and lists every reference base the read differs from,
+     * conversions included, so CIGAR + SEQ + MD still rebuilds the real
+     * reference.
      *
      * Consequences, by design and by scoring mode:
-     *   - Conversions never reach NM/MD. A perfectly converted read is NM:i:0,
-     *     and MD does not enumerate every ref-C (which otherwise dominates the
-     *     record; see issue #327).
+     *   - Conversions never reach NM. A perfectly converted read is NM:i:0
+     *     (issue #327), while its MD lists every converted ref-C/ref-G.
      *   - `genomic` frees only the conversion direction, so a real variant in the
-     *     opposite direction stays a mismatch and remains visible.
+     *     opposite direction stays an edit and remains visible in NM.
      *   - `collapsed` frees the mirror cell too, so C/T (and G/A) are fully
-     *     interchangeable and real variants in that class are hidden as well —
-     *     the documented cost of bwameth-compatible placement.
+     *     interchangeable and real variants in that class are hidden from NM as
+     *     well — the documented cost of bwameth-compatible placement.
      *
      * A read alone cannot distinguish a bisulfite C→T from a real C→T SNP; that
-     * aliasing is resolved downstream at the pileup, not here. The aligner
-     * therefore reports what its scoring model treats as divergence rather than
-     * adjudicating chemistry-vs-genotype per base. NOTE: this makes NM/MD
+     * aliasing is resolved downstream at the pileup, not here. NM therefore
+     * reports what the scoring model treats as divergence. NOTE: this makes NM
      * deliberately non-conformant with the SAM spec's "edit distance to the
-     * reference" under --meth (the same divergence class as BISCUIT's NM and
-     * bwameth's collapsed-space NM); the non-meth path is unchanged. */
+     * reference" under --meth (the BISCUIT convention: NM excludes conversions,
+     * MD is literal; under `collapsed` NM also excludes mirror-direction C/T and
+     * G/A variants, which BISCUIT's NM would count), so NM is smaller than the
+     * edit count MD + CIGAR imply; the non-meth path is unchanged. */
     /* D3 (--meth, fix): the CIGAR regen must use the SAME strand-adjusted matrix
      * as the extension (see mem_alnreg_t.meth_strand_hyp). ar->rb is final here,
      * so derive is_rev directly (rb in doubled-pac; >= l_pac = reverse) and flip

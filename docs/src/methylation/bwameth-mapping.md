@@ -113,12 +113,13 @@ differ:
 | Chimera QC threshold | Longest M < 44% of read | Same (44%), opt-in via `--chimera-qc` |
 | Chimera QC flags | `0x200`, clear `0x2`, MAPQ ≤ 1 | Same |
 | SEQ field | Pre-conversion bases (RC-flipped when `is_rev`) | Same |
-| `NM`/`MD` | Collapsed (conversions and real variants both hidden) | Conversions hidden; real variants hidden in `collapsed`, **shown in `genomic` and `neutral`**[^nmmd] |
+| `NM` | Collapsed (conversions and real variants both hidden) | Conversions hidden; real variants hidden in `collapsed`, **counted in `genomic` and `neutral`**[^nmmd] |
+| `MD` | Collapsed (conversions and real variants both hidden) | Literal: lists every conversion and every real variant, in all modes |
 
 [^nmmd]: `genomic` and `neutral` both free only the conversion direction — they
     differ solely in what that cell scores (a full match vs. `0`) and both leave
     the *mirror* cell penalised — so both keep a real variant in the *opposite*
-    direction (ref `T` × read `C` on OT) visible. A real variant in the
+    direction (ref `T` × read `C` on OT) in `NM`. A real variant in the
     conversion direction itself (a genuine C→T SNP at a reference C) is
     indistinguishable from a conversion in a single read under any mode — that
     aliasing is resolved downstream at the pileup, not by the aligner. See

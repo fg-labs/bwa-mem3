@@ -900,12 +900,12 @@ Selects how the 4-letter matrix treats converted bases. `collapsed` (the
 `--meth`/`--meth=emseq` default) frees C↔T and G↔A both ways (bwameth-compatible
 placement, sets `-B 2`); `genomic` frees only the conversion direction scored as
 a full match, keeping real variants as mismatches (variant-aware: variants outside
-the conversion direction stay visible in `NM`/`MD`, keeps `-B 4`); `neutral` (the
+the conversion direction count toward `NM`, keeps `-B 4`); `neutral` (the
 `--meth=taps` default) frees only the conversion direction but scores it `0` —
 tolerated, not rewarded — best for the sparse conversions of TAPS (keeps `-B 4`;
-variants stay visible in `NM`/`MD` as in `genomic`). In both, a genuine variant in
+variants count toward `NM` as in `genomic`). In both, a genuine variant in
 the conversion direction itself (a C→T at a reference `C`) shares the freed cell
-with a conversion and stays hidden
+with a conversion and is not counted in `NM`
 ([why](../methylation/overview.md#which-real-variants-stay-visible)). Only meaningful
 with `--meth`.
 See [Flags → --meth-scoring](../methylation/flags.md#--meth-scoring-collapsedgenomicneutral).

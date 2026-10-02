@@ -133,10 +133,11 @@ extern "C" {
 							 int64_t rb, int64_t re, int *score,
 							 int *n_cigar, int *NM);
 
-	/* As bwa_gen_cigar2, plus `nm_from_mat`: 0 derives NM/MD from literal base
-	 * inequality (bwa default); 1 derives them from the scoring matrix, so a
-	 * cell the matrix does not penalise is a match. --meth uses 1 so bisulfite
-	 * conversions are matches for NM/MD as well as for the DP. */
+	/* As bwa_gen_cigar2, plus `nm_from_mat`: 0 counts every literal base
+	 * difference in NM (bwa default); 1 counts only those the scoring matrix
+	 * penalises. MD lists every literal difference either way. --meth uses 1 so
+	 * a bisulfite conversion is not an edit for NM, as for the DP, while MD
+	 * still records it. */
 	uint32_t *bwa_gen_cigar3(const int8_t mat[25], int o_del, int e_del,
 							 int o_ins, int e_ins, int w_, int64_t l_pac,
 							 const uint8_t *pac, int l_query, uint8_t *query,
