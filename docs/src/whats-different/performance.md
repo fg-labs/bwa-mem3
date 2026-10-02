@@ -223,31 +223,39 @@ generated jobs.
   255 (the byte kswv's 8-bit kernels hold it in): the default
   `-A 1 -B 4 -O 6 -E 1`, and for example `-B 6` or `-O 8 -E 2`; the bound then
   counts exact 5-mers (`rescue_prune_params::from` states the conditions). Other
-  scorings, `--rescue-kmer`, windows or mates with an N, and the 16-bit path
-  keep the full window. Under `--meth` it matches
+  scorings, windows or mates with an N, mates over 1024 bases and windows over
+  30000 rows keep the full window. Jobs under `--rescue-kmer` bypass exact
+  pruning, but its own k-mer anchor path can still narrow the window. Jobs on
+  kswv's 16-bit kernels (a mate too long for the 8-bit ones at the run's `-A`)
+  are pruned too: the bound is on scores, not SIMD lanes. Under
+  `--meth` it matches
   C-to-T (or G-to-A) converted copies of the window and the mate, on aarch64
   with EM-seq chemistry only, at `--meth -B 4` and the genomic and neutral
   scorings (the default collapsed scoring keeps the full window). It runs where a
   SIMD filter carries it: on aarch64 (NEON) and on the x86 AVX2 and AVX-512BW
-  builds (an SSE4.1 / SSSE3 port of the filter), at every seed length except at
-  the AVX-512BW kswv tier at a threshold `-k` x `-A` of 25 or more (`-k 25` at
-  `-A 1`, already the default `-k 19` at `-A 2`), where the 64-lane kswv is cheap
-  enough that the filter costs more than it saves. The SIMD filters cover every
+  builds (an SSE4.1 / SSSE3 port of the filter), at every seed length except
+  from `-k 25` at the AVX-512BW kswv tier (at any `-A`), where the 64-lane kswv
+  is cheap enough that the filter costs more than it saves (wgs-5M and wes-5M,
+  prune on vs off at `-k 25` to 40, on an AMD EPYC Zen 5 host at the AVX-512BW
+  tier). The SIMD filters cover every
   admitted scoring with `-A` of at most 16; the others run a scalar filter,
   which pays on aarch64 but not against x86's kswv, so x86 keeps the full window
-  there. Elsewhere the full window is always computed.
+  there (wgs-5M and wes-5M at `-O 8 -E 2` and `-x intractg`: a gain on
+  AWS Graviton 4 at the NEON tier, a loss on the Zen 5 AVX-512BW host). Elsewhere the full window is always computed.
   ([#541](https://github.com/fg-labs/bwa-mem3/pull/541); x86:
-  [#538](https://github.com/fg-labs/bwa-mem3/pull/538))
+  [#538](https://github.com/fg-labs/bwa-mem3/pull/538); 16-bit jobs and the
+  AVX-512BW seed-length gate: [#542](https://github.com/fg-labs/bwa-mem3/pull/542))
 - **Banded rescue DP (NEON, AVX2).** For a narrowed job, the rescue DP runs only
   inside the diagonal bands of the K-mer (today 5-mer) components that can reach the
   threshold, 16 bands per NEON vector or 32 per AVX2 vector, and the job's
   score, end positions and suboptimal score are reassembled from the bands'
   per-row maxima. A per-job
   cost model keeps the full hull when banding would not pay. Same scope as the
-  pruning, at every scoring it admits (8-bit, no `--meth`); the kernels take the
+  pruning on 8-bit jobs, at every scoring it admits (no `--meth`); the kernels take the
   run's match, mismatch and both gap types' costs.
   ([#541](https://github.com/fg-labs/bwa-mem3/pull/541); AVX2:
-  [#538](https://github.com/fg-labs/bwa-mem3/pull/538))
+  [#538](https://github.com/fg-labs/bwa-mem3/pull/538); kept to 8-bit jobs
+  when pruning took in 16-bit ones: [#542](https://github.com/fg-labs/bwa-mem3/pull/542))
 - **Banded start recovery (NEON, AVX2).** The second rescue pass, which finds where
   the best alignment starts, runs in a diagonal band derived from the first
   pass's score and end: an alignment of that score can hold only a bounded
@@ -272,6 +280,26 @@ generated jobs.
   and WES slices, at `-t 16 -K 160000000`, at the default scoring (8-bit bodies)
   and at `-A 2` (every rescue job on the 16-bit bodies), on AWS Graviton 4
   (NEON), AMD EPYC 7R13 (Zen 3, AVX2) and AMD EPYC 9R45 (Zen 5, AVX-512BW).
+- **AVX2 rescue kernels: signed-domain 8-bit cell, deferred 16-bit query end.**
+  x86 has no unsigned-plus-signed saturating add, so the AVX2 8-bit FScan body
+  now keeps its scores as H - 128 in signed bytes, where each cell scores with
+  one signed saturating add instead of a biased add and a de-biasing subtract
+  (as NEON's USQADD body does; `BWA3_RESCUE_USQADD=0` restores the biased form).
+  It is selected only when every gap constant fits a positive signed byte, i.e.
+  the open-plus-extend sum is at most 127; above that the biased body runs even
+  with `BWA3_RESCUE_USQADD` on.
+  The AVX2 16-bit body finds each row's query end after the row, from per-block
+  checkpoints of the row maximum, instead of tracking it in every cell. Every
+  score and position is unchanged: output (md5 of the non-`@PG` records)
+  matched v0.13.0 on the 5M-pair WGS slice at `-t 16 -K 160000000` (the same
+  fixed batch size, and so the same batches, in both runs) on AMD EPYC 7R13
+  (Zen 3, AVX2): the signed-domain cell at the default scoring (also with
+  `BWA3_RESCUE_USQADD=0`), `-B 6`, `-O 8 -E 2`, `-x intractg`, `-k 25`,
+  `-A 2` and `-A 3 -B 12 -O 18 -E 3`; the deferred query end at the default
+  scoring, `-A 2` (every rescue job on the 16-bit body), `-A 2 -B 6`,
+  `-A 2 -B 8 -O 12 -E 2` and `-A 3 -B 12 -O 18 -E 3`. The NEON, SSE4.1 and
+  AVX-512BW kernels are unchanged.
+  ([#542](https://github.com/fg-labs/bwa-mem3/pull/542))
 - **Fused, two-row banded cell (NEON, AVX2).** The banded rescue DP uses the same
   fused cell (both gaps opened from one saturating subtract), steps two rows at
   a time, and reads the query end directly rather than from a per-row snapshot.
@@ -322,7 +350,7 @@ generated jobs.
 |---|---|
 | `BWA3_RESCUE_PRUNE=0` | Turn off exact rescue pruning and the banded passes: every rescue window runs in full through the rescue kernel (the reference path for identity checks). `--rescue-kmer`, which narrows windows on its own, is unaffected. Default on where pruning runs. |
 | `BWA3_RESCUE_PRUNE_MAX_HITS=<n>` | Keep the full window when the mate and window share more than `n` exact 5-mer hits, where the filter would cost more than it saves (default 1000 on aarch64 when banding is on and the run is not `--meth`; 400 otherwise, and always 400 on x86; [#541](https://github.com/fg-labs/bwa-mem3/pull/541)). It only chooses between exact paths, so output does not depend on its value by design. |
-| `BWA3_RESCUE_PRUNE_STATS=1` | Print, once at exit, how the filter decided (`[RESCUE_PRUNE] jobs=… full=… b1=… b2=… rows_in=… rows_kept=… jobs16=… memo_hits=… reused=… filter_s=… kswv_pass0_s=… band_pass0_s=… kswv_pass1_s=… band_pass1_s=… dedup_run=… dedup_skip=… dedup_run_regs=… dedup_skip_regs=… dedup_insert1=… dedup_insert1_fast=… dedup_s=…`): jobs filtered, and of them how many kept the full window, were proven to fail (`b1`) or were narrowed (`b2`), with the window rows before and after, the number of 16-bit rescue jobs (which the filter never sees), the jobs the SIMD filter answered from its repeat memo, the jobs answered from an identical recent job's result instead of being enqueued, and the thread-summed seconds of each rescue stage; how many post-rescue dedups ran, were skipped, took the one-region insert and of those were done in one pass; and how the banded DP resolved (`[RESCUE_BAND] banded_parents=… …`). Measurement only; output is unchanged. |
+| `BWA3_RESCUE_PRUNE_STATS=1` | Print, once at exit, how the filter decided (`[RESCUE_PRUNE] jobs=… full=… b1=… b2=… rows_in=… rows_kept=… jobs16=… b1_16=… b2_16=… memo_hits=… reused=… filter_s=… kswv_pass0_s=… band_pass0_s=… kswv_pass1_s=… band_pass1_s=… dedup_run=… dedup_skip=… dedup_run_regs=… dedup_skip_regs=… dedup_insert1=… dedup_insert1_fast=… dedup_s=…`): jobs filtered, and of them how many kept the full window, were proven to fail (`b1`) or were narrowed (`b2`), with the window rows before and after, the number of 16-bit rescue jobs and how many of them were proven to fail or narrowed (`b1_16`, `b2_16`, included in `b1` and `b2`), the jobs the SIMD filter answered from its repeat memo, the jobs answered from an identical recent job's result instead of being enqueued, and the thread-summed seconds of each rescue stage; how many post-rescue dedups ran, were skipped, took the one-region insert and of those were done in one pass; and how the banded DP resolved (`[RESCUE_BAND] banded_parents=… …`); the 16-bit decisions (`b1_16`, `b2_16`): [#542](https://github.com/fg-labs/bwa-mem3/pull/542). Measurement only; output is unchanged. |
 | `BWA3_RESCUE_DEDUP_SKIP=0` | Run every post-rescue dedup in full instead of skipping one proven to be a no-op or adding a single new region in one pass. Default on. It only chooses between exact paths, so output is the same either way by design. |
 | `BWA3_RESCUE_REPEAT=0` | Enqueue every rescue job instead of answering one that repeats one of the thread's last eight filtered jobs byte for byte (the same mate against an identical window) from that job's result. Default on. It only chooses between exact paths, so output is the same either way by design. |
 | `BWA3_RESCUE_BAND=0` | Run every narrowed job through the rescue kernel on its whole hull instead of banded (and the hit gate back to 400). Default on where banding runs. |
@@ -333,7 +361,7 @@ generated jobs.
 | `BWA3_RESCUE_BAND_TIGHT=<n>` | Threshold offset of the first-round band for a lone near-perfect primary (default 8; 0 disables). It only chooses between exact paths, so output does not depend on its value by design. |
 | `BWA3_RESCUE_FSCAN=0` | Use the original rescue cells instead of the 11-op cell, in the rescue kernels and in the banded DP. A value starting with `0` turns it off and anything else leaves it on; it is not reported. It only chooses between exact paths, so output is the same either way by design. |
 | `BWA3_RESCUE_BAND_KERNEL=<n>` | Which banded-DP kernel runs while `BWA3_RESCUE_FSCAN` is on: `0` the original cell, `1` the fused cell one row at a time, `2` (default) the fused cell two rows at a time; values above 2 act as 2. It only chooses between exact paths, so output does not depend on its value by design. |
-| `BWA3_RESCUE_USQADD=0` | In the NEON 8-bit rescue kernel, use the biased add / subtract pair per cell instead of one saturating add. It only chooses between exact paths, so output is the same either way by design. |
+| `BWA3_RESCUE_USQADD=0` | In the NEON 8-bit rescue kernel and the AVX2 8-bit FScan body, use the biased add / subtract pair per cell instead of one saturating add (on AVX2, of the signed H - 128 domain, which runs only when the open-plus-extend sum is at most 127; [#542](https://github.com/fg-labs/bwa-mem3/pull/542)). It only chooses between exact paths, so output is the same either way by design. |
 | `BWA3_RESCUE_ROWPAIR=0` | In the NEON rescue kernels (8- and 16-bit), sweep one target row at a time instead of two. It only chooses between exact paths, so output is the same either way by design. |
 | `BWA3_RESCUE_LAZYQE=0` | In the NEON two-row sweep, find each row's query end inline instead of after the row. It only chooses between exact paths, so output is the same either way by design. |
 | `BWA3_RESCUE_BAND_SHIFT=0` | Turn off the per-lane band shift that aligns the query offsets of the 16 bands in a vector. It only chooses between exact paths, so output is the same either way by design. |

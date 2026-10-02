@@ -25,15 +25,17 @@
  * BWA3_RESCUE_PRUNE_MAX_HITS  auto  keep the full window above this many 5-mer hits; auto is 1000
  *                                   on aarch64 with banding on and no --meth, else 400
  * BWA3_RESCUE_PRUNE_STATS     0     1 prints the RESCUE_PRUNE and RESCUE_BAND counters and stage
- *                                   times at exit
+ *                                   times at exit (counted per thread: no shared-counter
+ *                                   contention in an instrumented run)
  * BWA3_RESCUE_DEDUP_SKIP      1     skip a post-rescue dedup proven to be a no-op, and add a
  *                                   single new region in one pass where that is provably exact
  * BWA3_RESCUE_REPEAT          1     a rescue job repeating one of the last eight filtered jobs byte
  *                                   for byte reads that job's result instead of being enqueued again
  * BWA3_RESCUE_FSCAN           1     the 11-op kswv rescue cell in every SIMD body; 0 also selects
  *                                   the banded DP's original cell
- * BWA3_RESCUE_USQADD          1     NEON u8 kswv: one saturating add per cell instead of the
- *                                   biased add / subtract pair
+ * BWA3_RESCUE_USQADD          1     u8 kswv: one saturating add per cell instead of the biased
+ *                                   add / subtract pair (NEON; the AVX2 FScan body does it in the
+ *                                   signed H - 128 domain, at open-plus-extend sums up to 127)
  * BWA3_RESCUE_ROWPAIR         1     NEON kswv (8- and 16-bit): sweep two target rows per pass
  * BWA3_RESCUE_LAZYQE          1     NEON kswv two-row sweep: recover the query end after the row
  *                                   instead of inline

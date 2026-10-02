@@ -55,7 +55,8 @@
 # (NEON) and x86 builds whose SIMD floor is avx2 or avx512bw, at the fixture's
 # default -k 19 (src/bwamem_pair.cpp rescue_prune_on, rescue_prune_runs,
 # rescue_band_enabled). There, the stats must show proven failures, narrowed
-# windows, fewer rows kept than examined and (with the gate opened) banded
+# windows (among them 16-bit jobs', which are pruned but never banded), fewer
+# rows kept than examined and (with the gate opened) banded
 # parents, or the identity would be vacuous; in a build without them (an x86
 # floor below avx2) the pruning legs take the same path and their non-vacuity
 # check is reported as skipped. A reference and a default leg at -k 25 must
@@ -250,7 +251,11 @@ esac
 host_tier="$(BWAMEM3_DEBUG_SIMD=1 "$BIN" 2>&1 | sed -n 's/.*SIMD tier: \([a-z0-9]*\).*/\1/p' | head -1 || true)"
 
 # The reference: every shortcut and alternative kernel form off. Defined once so
-# the unforced and forced-tier references cannot drift apart.
+# the unforced and forced-tier references cannot drift apart. Some kernel forms
+# have no switch and so run in both legs: the lazy query end of the x86 bodies
+# (BWA3_RESCUE_LAZYQE reaches only the NEON two-row sweep) and the AVX-512BW u8
+# cell's form (BWA3_RESCUE_USQADD reaches NEON and the AVX2 FScan body); the
+# kswv unit tests check those against the scalar ksw_align2.
 REF_ENV=(BWA3_RESCUE_PRUNE=0 BWA3_RESCUE_BAND=0 BWA3_RESCUE_DEDUP_SKIP=0 BWA3_RESCUE_REPEAT=0
     BWA3_RESCUE_FSCAN=0 BWA3_RESCUE_USQADD=0 BWA3_RESCUE_ROWPAIR=0 BWA3_RESCUE_LAZYQE=0)
 
@@ -311,9 +316,10 @@ fi
 "$BIN" index --meth ref.fa > /dev/null 2>&1 || fail "index --meth nonzero exit"
 sc_note=""
 check_scoring() { # $1 = label, $2 = expectation, rest = mem options
-    # Expectation: simd (prunes wherever the SIMD filter runs), none (never prunes), meth (--meth,
-    # prunes on aarch64 only), methnone (--meth, never prunes).
-    local label="$1" where="$2" stem st sj sb2 bst sp1 bp prunes legs leg
+    # Expectation: simd (prunes wherever the SIMD filter runs), simd16 (the same, with every
+    # rescue job on the 16-bit kernels, which prune but never band), none (never prunes), meth
+    # (--meth, prunes on aarch64 only), methnone (--meth, never prunes).
+    local label="$1" where="$2" stem st sj sb2 sj16 sb1_16 sb2_16 bst sp1 bp prunes legs leg
     shift 2
     stem="sc_$(printf '%s' "$label" | tr -c 'A-Za-z0-9' '_')"
     MEM_OPTS=("$@")
@@ -345,7 +351,7 @@ check_scoring() { # $1 = label, $2 = expectation, rest = mem options
     sp1=$(printf '%s\n' "$bst" | tr ' ' '\n' | sed -n 's/^pass1_banded=//p')
     if [ "$has_simd" = 1 ]; then
         case "$where/$floor" in
-            simd/* | meth/neon) prunes=1 ;;
+            simd/* | simd16/* | meth/neon) prunes=1 ;;
             *) prunes=0 ;;
         esac
         if [ "$prunes" = 1 ]; then
@@ -359,9 +365,18 @@ check_scoring() { # $1 = label, $2 = expectation, rest = mem options
                 bp=$(grep '^\[RESCUE_BAND\]' "$stem.band.err" | tr ' ' '\n' | sed -n 's/^banded_parents=//p' || true)
                 [ "${bp:-0}" -gt 0 ] || fail "no banded parent at $label with the band cost gate opened"
                 ;;
+            simd16)
+                sj16=$(printf '%s\n' "$st" | tr ' ' '\n' | sed -n 's/^jobs16=//p')
+                sb1_16=$(printf '%s\n' "$st" | tr ' ' '\n' | sed -n 's/^b1_16=//p')
+                sb2_16=$(printf '%s\n' "$st" | tr ' ' '\n' | sed -n 's/^b2_16=//p')
+                [ "${sj16:-0}" -gt 0 ] || fail "no 16-bit rescue job at $label: $st"
+                [ "${sb1_16:-0}" -gt 0 ] || fail "no proven-failure (B1) 16-bit rescue job at $label: $st"
+                [ "${sb2_16:-0}" -gt 0 ] || fail "no narrowed (B2) 16-bit rescue job at $label: $st"
+                ;;
         esac
         case "$where/$prunes" in
             meth/1) [ "${sp1:-0}" -eq 0 ] || fail "--meth leg $label banded pass 1 on top of pruning: $bst" ;;
+            simd16/*) [ "${sp1:-0}" -eq 0 ] || fail "16-bit leg $label banded pass 1 (banding is 8-bit only): $bst" ;;
             *) [ "${sp1:-0}" -gt 0 ] || fail "no banded pass-1 job at $label: $bst" ;;
         esac
     fi
@@ -370,6 +385,9 @@ check_scoring() { # $1 = label, $2 = expectation, rest = mem options
 check_scoring "-B 6" simd -B 6
 check_scoring "-O 8 -E 2" simd -O 8 -E 2
 check_scoring "-B 3" none -B 3
+# -A 2 scales the other costs with it (-B 8 -O 12 -E 2), so every rescue job is 16-bit (150 bp
+# mates score up to 300), and the seed-length cost gate lets the AVX-512BW tier prune it too.
+check_scoring "-A 2" simd16 -A 2
 check_scoring "--meth -B 4" meth --meth -B 4
 check_scoring "--meth genomic" meth --meth --meth-scoring genomic
 check_scoring "--meth collapsed" methnone --meth
@@ -453,6 +471,9 @@ fi
 [ "$b1" -gt 0 ] || fail "no proven-failure (B1) rescue in the fixture: $stats"
 [ "$b2" -gt 0 ] || fail "no narrowed (B2) rescue in the fixture: $stats"
 [ "$rows_kept" -lt "$rows_in" ] || fail "pruning kept every row: $stats"
+# The 300 bp mates run on the 16-bit kswv kernels, which prune too (never band): some must narrow.
+b2_16=$(field b2_16)
+[ "${b2_16:-0}" -gt 0 ] || fail "no narrowed (B2) 16-bit rescue job (the 300 bp mates stopped being pruned): $stats"
 # The anchors present three times rescue the same mate against identical windows: the repeats
 # after the first must be answered from its result (BWA3_RESCUE_REPEAT), or that path went untested.
 reused=$(field reused)

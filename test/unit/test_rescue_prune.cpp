@@ -32,8 +32,10 @@
 //      planning's components taken from the filter's list equal a rescan of
 //      the view, at every cap.
 //
-// Mates stay at <= 250 bases so every job is in the 8-bit kernel's domain,
-// the only one the filter runs in.
+// Most mates stay at <= 250 bases, in the 8-bit kernel's domain; a long-mate
+// category (251 to 600 bases) and the a = 2 scoring put jobs on the 16-bit
+// kernels, which the filter runs on too, and the oracle then runs ksw_align2's
+// 16-bit path (scalar_sw).
 
 #include <algorithm>
 #include <cstdint>
@@ -46,6 +48,7 @@
 #include "doctest/doctest.h"
 #include "bwamem.h"
 #include "ksw.h"
+#include "matesw_u8.h"
 #include "meth_scoring.h"
 #include "rescue_band.h"
 #include "rescue_prune.h"
@@ -145,6 +148,18 @@ std::vector<Job> build_jobs(std::mt19937 &rng)
     }
     for (int k = 0; k < 3; k++)  // past the SIMD filter's capacity (~4000 rows): the scalar filter decides
         jobs.push_back(planted(rng, 4200 + k * 400, 150, 30));
+    for (int k = 0; k < 12; k++) {  // long mates, past the 8-bit kernels: the 16-bit path at every a
+        const int len2 = 251 + (int)(rng() % 350), len1 = len2 + 50 + (int)(rng() % 500);
+        if (k & 1) {
+            jobs.push_back(planted(rng, len1, len2, 20 + (int)(rng() % 30)));
+            jobs.back().tag = "long mate, planted";
+        } else {
+            auto ref = random_bases(rng, len1);
+            const int at = (int)(rng() % (unsigned)(len1 - len2));
+            auto q = mutated_copy(rng, ref, at, len2, (int)(rng() % 20), (int)(rng() % 4));
+            jobs.push_back({std::move(ref), std::move(q), "long mate, mutated copy"});
+        }
+    }
     return jobs;
 }
 
@@ -164,14 +179,23 @@ std::vector<Job> build_n_jobs(std::mt19937 &rng)
     return jobs;
 }
 
+// Whether production runs this mate on the 8-bit kernels (matesw_use_u8, with the kernels'
+// bias, the mismatch penalty b, which is the matrices' minimum here). Longer mates take the
+// 16-bit kernels, which pruning covers too.
+bool u8_job(int len2, const rescue_prune_params &p)
+{
+    return matesw_use_u8(len2, p.a, std::max(1, p.b)) != 0;
+}
+
 // ksw_align2 at the rescue settings for threshold p.minsc and p's gap costs
-// (the matrix carries a and b). It reverses its target in place for the start
-// pass, so both sequences are copied per call.
+// (the matrix carries a and b), on its 8-bit path for an 8-bit job and its 16-bit
+// path otherwise, as production routes the job (u8_job). It reverses its target in
+// place for the start pass, so both sequences are copied per call.
 kswr_t scalar_sw(const std::vector<uint8_t> &q, const uint8_t *ref, int len1, const rescue_prune_params &p,
                  const bwa_tests::ScoringMatrix &mat)
 {
     std::vector<uint8_t> qq(q), rr(ref, ref + len1);
-    const int xtra = KSW_XSUBO | KSW_XSTART | KSW_XBYTE | p.minsc;
+    const int xtra = KSW_XSUBO | KSW_XSTART | (u8_job((int)q.size(), p) ? KSW_XBYTE : 0) | p.minsc;
     return ksw_align2((int)qq.size(), qq.data(), len1, rr.data(), 5, mat.data(),
                       p.o_del, p.e_del, p.o_ins, p.e_ins, xtra, nullptr);
 }
@@ -321,9 +345,10 @@ TEST_CASE("rescue prune: B1 and B2 decisions reproduce every consumed ksw_align2
 
 // Other scorings: the lemma with K-mers, the charge c and the tail scaled to the deletion costs
 // (rescue_prune_params). Each job is checked at one scoring in rotation, at the default -k 19
-// (minsc = 19 a), which keeps the case inside the unit-test time budget; mates that leave the 8-bit
-// kernels at a = 2 (len2 * a + b > 254) are skipped, since pruning only sees 8-bit jobs. The
-// scorings the lemma refuses must keep every window in full.
+// (minsc = 19 a), which keeps the case inside the unit-test time budget. Mates that leave the
+// 8-bit kernels (matesw_use_u8 false: at a = 2, mates over about 120 bases) are pruned on the
+// 16-bit kernels, and the oracle takes ksw_align2's 16-bit path for them (scalar_sw); the case
+// requires some of them. The scorings the lemma refuses must keep every window in full.
 TEST_CASE("rescue prune: decisions at other scorings reproduce every consumed ksw_align2 field"
           * doctest::test_suite("unit/pair")) {
     std::mt19937 rng(4242);
@@ -332,19 +357,21 @@ TEST_CASE("rescue prune: decisions at other scorings reproduce every consumed ks
     const Sc admitted[4] = {{1, 6, 6, 1, 6, 1, "-B 6"}, {1, 4, 8, 2, 8, 2, "-O 8 -E 2"},
                             {1, 4, 6, 1, 7, 2, "-O 6,7 -E 1,2"}, {2, 8, 12, 2, 12, 2, "-A 2 -B 8 -O 12 -E 2"}};
     const Sc refused[2] = {{1, 3, 6, 1, 6, 1, "-B 3"}, {1, 4, 6, 1, 2, 1, "-O 6,2 -E 1"}};
-    Tally t[4];
+    Tally t[4], t16;
     for (size_t i = 0; i < jobs.size(); i++) {
         const Sc &s = admitted[i % 4];
         const std::string name(s.name);
         CAPTURE(name);
-        if ((int)jobs[i].q.size() * s.a + s.b > 254) continue;
         const rescue_prune_params p = rescue_prune_params::from(s.a, s.b, s.o_del, s.e_del, s.o_ins, s.e_ins,
                                                                 kSimdMinsc * s.a);
         REQUIRE(p.valid);
         const auto mat = bwa_tests::build_scoring_matrix(s.a, s.b, 1);
         Oracle o(jobs[i], p, mat);
-        check_against_oracle(kNoGate, o, t[i % 4]);
+        check_against_oracle(kNoGate, o, u8_job((int)jobs[i].q.size(), p) ? t[i % 4] : t16);
     }
+    MESSAGE("16-bit jobs: B1=" << t16.b1 << " B2=" << t16.b2 << " FULL=" << t16.full);
+    CHECK(t16.b1 > 0);
+    CHECK(t16.b2 > 0);
     for (int k = 0; k < 4; k++) {
         const std::string name(admitted[k].name);
         CAPTURE(name);
@@ -569,11 +596,14 @@ TEST_CASE("rescue prune: the SIMD filter's repeat memo and component list match 
     std::mt19937 rng(314159);
     auto jobs = build_jobs(rng);
     std::unique_ptr<rescue_prune_scratch> scalar(new rescue_prune_scratch());
-    {   // one window with more components than COMP_CAP: a 20-base mate segment planted every 23 rows
-        const int len1 = 3700, len2 = 100;
-        auto ref = random_bases(rng, len1);
-        auto q = random_bases(rng, len2);
-        for (int at = 0; at + 20 <= len1; at += 23) std::copy(q.begin() + 40, q.begin() + 60, ref.begin() + at);
+    {   // one window with more components than COMP_CAP: a 20-base mate segment planted every 26 rows
+        // over nearly the SIMD filter's capacity (about 150 components), from its own generator so
+        // the job set above can grow without changing this window
+        std::mt19937 crng(271828);
+        const int len1 = 3950, len2 = 100;
+        auto ref = random_bases(crng, len1);
+        auto q = random_bases(crng, len2);
+        for (int at = 0; at + 20 <= len1; at += 26) std::copy(q.begin() + 40, q.begin() + 60, ref.begin() + at);
         jobs.push_back({std::move(ref), std::move(q), "many components"});
     }
     const int comp_cap = rescue_prune_simd_scratch_t::COMP_CAP;
@@ -660,7 +690,8 @@ TEST_CASE("rescue band: the pass-0 cost gate's default follows the kswv tier"
 // The run-level cost gate (rescue_prune_cost_ok): every outcome gives the same output, so no identity
 // check can see a wrong one; pinned here per architecture. aarch64 prunes everywhere but --meth with
 // chemistry other than EM-seq (TAPS); x86 never under --meth, only where the SIMD filter takes the
-// weights (K = 5, a <= 16), and not at the AVX-512BW tier from minsc 25.
+// weights (K = 5, a <= 16), and not at the AVX-512BW tier from seed length 25 (minsc >= 25 a), so
+// -A 2 at the default -k 19 (minsc 38) still prunes there and -A 2 -k 25 (minsc 50) does not.
 TEST_CASE("rescue prune: the cost gate per architecture, --meth chemistry and kswv tier"
           * doctest::test_suite("unit/pair")) {
     const rescue_prune_params dflt = rescue_prune_params::defaults(19);
@@ -668,8 +699,12 @@ TEST_CASE("rescue prune: the cost gate per architecture, --meth chemistry and ks
     const rescue_prune_params a17 = rescue_prune_params::from(17, 68, 102, 17, 102, 17, 19 * 17);
     REQUIRE(dflt.valid);
     REQUIRE(k25.valid);
+    const rescue_prune_params a2 = rescue_prune_params::from(2, 8, 12, 2, 12, 2, 19 * 2);
+    const rescue_prune_params a2k25 = rescue_prune_params::from(2, 8, 12, 2, 12, 2, 25 * 2);
     REQUIRE(a17.valid);
     REQUIRE(!a17.simd_ok());
+    REQUIRE(a2.simd_ok());
+    REQUIRE(a2k25.simd_ok());
     for (const bool avx512 : {false, true}) {
         CAPTURE(avx512);
 #if defined(__aarch64__)
@@ -678,6 +713,7 @@ TEST_CASE("rescue prune: the cost gate per architecture, --meth chemistry and ks
         CHECK(!rescue_prune_cost_ok(dflt, true, false, avx512));  // --meth=taps
         CHECK(rescue_prune_cost_ok(k25, false, false, avx512));
         CHECK(rescue_prune_cost_ok(a17, false, false, avx512));   // the scalar filter pays here
+        CHECK(rescue_prune_cost_ok(a2k25, false, false, avx512));
 #else
         CHECK(rescue_prune_cost_ok(dflt, false, false, avx512));
         CHECK(!rescue_prune_cost_ok(dflt, true, true, avx512));   // no --meth pruning on x86
@@ -685,6 +721,8 @@ TEST_CASE("rescue prune: the cost gate per architecture, --meth chemistry and ks
         CHECK(rescue_prune_cost_ok(k25, false, false, avx512) == !avx512);
         CHECK(rescue_prune_cost_ok(rescue_prune_params::defaults(24), false, false, avx512));
         CHECK(!rescue_prune_cost_ok(a17, false, false, avx512));  // the scalar filter would decide
+        CHECK(rescue_prune_cost_ok(a2, false, false, avx512));    // -A 2 -k 19: the seed length gates
+        CHECK(rescue_prune_cost_ok(a2k25, false, false, avx512) == !avx512);
 #endif
     }
 }

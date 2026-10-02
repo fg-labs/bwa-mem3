@@ -4,6 +4,10 @@
  *   rescue_band_harness eq   <gen-jobs> <seed> [dump files...]   exactness (exit 1 on any mismatch)
  *   rescue_band_harness time <reps> <stride> <dump files...>     single-thread pass-0 timing
  *
+ * time runs the default scoring's 8-bit pipeline only (kswv getScores8 plus the band), so it
+ * refuses the eq-only knobs that would change the job mix or the scoring (RB_16BIT, RB_METH,
+ * RB_SCORING) rather than time something other than what they ask for.
+ *
  * eq: for every job, the PRODUCTION pipeline -- rescue_prune_window, RescueBandBatch::plan/commit,
  * the length sort, partition, kswv phase 0 on the non-banded pairs, run_pass0 on the banded ones,
  * then the mem_sam_pe_batch_run post-processing and kswv phase 1 -- is compared against the
@@ -28,7 +32,10 @@
  * scalar cross-check; it runs only for batches at the default scoring, so not under an RB_SCORING
  * or RB_METH that changes it) and RB_SCORING (unset: the default scoring;
  * "a,b,o_del,e_del,o_ins,e_ins": that scoring; "random": a fresh draw per 2048-job batch, see
- * draw_params) and RB_METH (genomic | neutral | collapsed | random: --meth matrices, see batch_matrix).
+ * draw_params), RB_METH (genomic | neutral | collapsed | random: --meth matrices, see batch_matrix)
+ * and RB_16BIT (1: every job runs through kswv's 16-bit kernels for both passes, uncut and unbanded,
+ * with mates up to 1024 bp, the longest the filter takes (rescue_prune_scratch::QCAP), as
+ * production runs a 16-bit job: pruned but never banded).
  * The truth kswv runs with the batch's scoring and matrix; pass 0 is banded at every scoring the
  * filter admits and pass 1 at every scoring the band kernels take (rb_scoring::valid), under --meth
  * with the batch's matrix (rb_scoring::set_matrix). RB_NEGATIVE_CONTROL=1 (harness-only) shifts
@@ -139,6 +146,7 @@ static int scalar_score2(const std::vector<int> &R, int S, int te, int minsc)
 /* generators                                                                                 */
 /* ---------------------------------------------------------------------------------------- */
 static std::mt19937_64 rng;
+static bool g_16 = false;   // RB_16BIT
 static int rnd(int n) { return n <= 1 ? 0 : (int)(rng() % (uint64_t)n); }
 static int rndr(int a, int b) { return a + rnd(b - a + 1); }
 static double unif() { return (rng() >> 11) * (1.0 / 9007199254740992.0); }
@@ -173,6 +181,7 @@ static Job gen(int cls)
     Job J; J.cls = cls;
     int len2 = rnd(4) == 0 ? rndr(17, 240) : rndr(100, 160);
     if (rnd(6) == 0) len2 = 16 * rndr(2, 15);   // exact multiples of 16 (no pad columns)
+    if (g_16 && rnd(2)) len2 = rnd(2) ? 250 : rndr(17, 1024);   // 2x250, and long mates up to QCAP
     std::vector<uint8_t> &q = J.q, &r = J.ref;
     q.resize(len2);
     for (auto &b : q) b = (uint8_t)rnd(4);
@@ -426,7 +435,7 @@ struct Batch {
         memset(&p, 0, sizeof p);
         p.idr = (int32_t)ref.size(); p.idq = (int32_t)qer.size();
         p.len1 = len1; p.len2 = len2;
-        p.h0 = KSW_XSUBO | KSW_XSTART | KSW_XBYTE | minsc;
+        p.h0 = KSW_XSUBO | KSW_XSTART | (g_16 ? 0 : KSW_XBYTE) | minsc;
         p.regid = n; p.id = n; p.seqid = n;
         ref.insert(ref.end(), r, r + len1);
         qer.insert(qer.end(), q, q + len2);
@@ -442,15 +451,20 @@ struct Batch {
     }
 };
 
-/* mem_sam_pe_batch_run (8-bit only) with the first nb pairs banded; p1_any offers every other pair
- * to the banded pass 1 too (a batch at a scoring the band kernels take). The truth runs with nb = 0
- * and p1_any = false: pure kswv. */
+/* mem_sam_pe_batch_run with the first nb pairs banded; p1_any offers every other pair to the
+ * banded pass 1 too (a batch at a scoring the band kernels take). The truth runs with nb = 0 and
+ * p1_any = false: pure kswv. The 8-bit kernels, or under RB_16BIT the 16-bit ones, where the
+ * caller passes nb = 0 and p1_any = false as production never bands a 16-bit job. */
 static void run_batch(Ikswv *k, Batch &b, int nb, bool p1_any)
 {
     SeqPair *pairs = b.sp.data();
     kswr_t *aln = b.aln.data();
+    auto scores = [&](SeqPair *ps, int n, int phase) {
+        if (g_16) k->getScores16(ps, b.ref.data(), b.qer.data(), aln, n, 1, phase);
+        else k->getScores8(ps, b.ref.data(), b.qer.data(), aln, n, 1, phase);
+    };
     for (int i = 0; i < b.n; i++) aln[i].tb = aln[i].qb = -1;
-    k->getScores8(pairs + nb, b.ref.data(), b.qer.data(), aln, b.n - nb, 1, 0);
+    scores(pairs + nb, b.n - nb, 0);
     if (nb) rescue_band_batch().run_pass0(pairs, nb, b.ref.data(), b.qer.data(), aln, k);
     int pos = 0;
     for (int i = 0; i < b.n; i++) {
@@ -465,7 +479,7 @@ static void run_batch(Ikswv *k, Batch &b, int nb, bool p1_any)
         if ((i < nb || p1_any) && rescue_band_batch().take_pass1(sp, r, i < nb, b.ref.data(), b.qer.data())) continue;
         pairs[pos++] = sp;
     }
-    k->getScores8(pairs, b.ref.data(), b.qer.data(), aln, pos, 1, 1);
+    scores(pairs, pos, 1);
     if (nb || p1_any) rescue_band_batch().run_pass1(b.ref.data(), b.qer.data(), aln, k);
 }
 
@@ -609,7 +623,7 @@ static rescue_prune_params draw_params(int k_default)
 /* ---------------------------------------------------------------------------------------- */
 static int run_eq(std::vector<Job> &all_jobs, int k_default, int max_hits, int scalar_stride)
 {
-    long mism = 0, n = 0, npass = 0, nfull = 0, nb1 = 0, nb2 = 0, nband = 0, scal_mm = 0, te2_diff = 0;
+    long mism = 0, n = 0, npass = 0, nfull = 0, nb1 = 0, nb2 = 0, nb2_long = 0, nband = 0, scal_mm = 0, te2_diff = 0;
     long nbatch = 0, nvalid = 0, nbandable = 0, np1able = 0, ntrunc = 0, nk[6] = {0}, n12_band = 0, nmeth[4] = {0};
     long nview = 0, view_mm = 0, r2 = 0, ccap = 0;
     std::unique_ptr<rescue_prune_scratch> sscratch(new rescue_prune_scratch());
@@ -637,17 +651,18 @@ static int run_eq(std::vector<Job> &all_jobs, int k_default, int max_hits, int s
          * production bands only where --meth pruning is off, rescue_band_meth_on). */
         rb_scoring bsc = rb_scoring::from(pp);
         if (meth) bsc.set_matrix(mat);
-        const bool band = rescue_band_enabled() && pp.valid;
-        const bool p1_any = rescue_band_enabled() && bsc.valid();
+        const bool band = !g_16 && rescue_band_enabled() && pp.valid;
+        const bool p1_any = !g_16 && rescue_band_enabled() && bsc.valid();
         if (rescue_band_enabled()) rescue_band_batch().set_scoring(bsc);
         nbatch++; nvalid += pp.valid; nbandable += band; np1able += p1_any;
         if (pp.valid) nk[pp.K]++;
         /* This batch's jobs: a mate too long for the 8-bit kernels at this a is cut to a random
-         * admissible slice (planted copies still match it), since pruning only sees 8-bit jobs. */
+         * admissible slice (planted copies still match it), since this mode runs every job through
+         * the 8-bit kernels and the band; RB_16BIT keeps the mate whole on the 16-bit ones. */
         std::vector<Job> jobs(all_jobs.begin() + base, all_jobs.begin() + base + m);
         for (Job &J : jobs) {
             const int len2 = (int)J.q.size();
-            if (matesw_use_u8(len2, pp.a, shift)) continue;
+            if (g_16 || matesw_use_u8(len2, pp.a, shift)) continue;
             int nl = std::min(len2, std::min((254 - shift) / pp.a, 249 / pp.a));
             if (nl < 5) nl = 0;
             if (nl > 17) nl = rndr(17, nl);
@@ -731,6 +746,7 @@ static int run_eq(std::vector<Job> &all_jobs, int k_default, int max_hits, int s
             if (kind[t] == RESCUE_PRUNE_B1) { nb1++; continue; }
             if (kind[t] == RESCUE_PRUNE_B2) {
                 nb2++;
+                nb2_long += len2 > 250;
                 if (band) rescue_band_batch().plan(view, pp, len1, len2, hb, he);
                 off[t] = hb;
                 idx[t] = P.add(J.ref.data() + hb, he - hb + 1, J.q.data(), len2, minsc);
@@ -770,7 +786,11 @@ static int run_eq(std::vector<Job> &all_jobs, int k_default, int max_hits, int s
             } else if (kind[t] == RESCUE_PRUNE_B1) ok = !pass;
             else {
                 kswr_t b = P.aln[idx[t]];
-                if (negative_control && !injected && pass && banded[t]) { b.te++; injected = true; }
+                /* Under RB_16BIT nothing is banded, so the control hits the first narrowed passing job. */
+                if (negative_control && !injected && pass && (g_16 ? kind[t] == RESCUE_PRUNE_B2 : banded[t])) {
+                    b.te++;
+                    injected = true;
+                }
                 if (!pass) ok = b.score < minsc;
                 else {
                     ok = a.score == b.score && a.te == b.te + off[t] && a.qe == b.qe && a.score2 == b.score2
@@ -789,7 +809,7 @@ static int run_eq(std::vector<Job> &all_jobs, int k_default, int max_hits, int s
                 fprintf(stderr, "MISMATCH job=%zu cls=%d B1 but truth score=%d (a=%d b=%d o=%d,%d e=%d,%d minsc=%d K=%d c=%d)\n",
                         base + t, J.cls, a.score, pp.a, pp.b, pp.o_del, pp.o_ins, pp.e_del, pp.e_ins, minsc, pp.K, pp.c);
             /* An N in the window or the mate must give FULL (class 3 plants them; a mate cut for the
-             * 8-bit kernels may have lost its N, so test the job itself). */
+             * 8-bit kernels outside RB_16BIT may have lost its N, so test the job itself). */
             const bool has_n = std::any_of(J.ref.begin(), J.ref.end(), [](uint8_t x) { return x > 3; })
                                || std::any_of(J.q.begin(), J.q.end(), [](uint8_t x) { return x > 3; });
             if (has_n && kind[t] != RESCUE_PRUNE_FULL) { ok = false; if (mism < 10) fprintf(stderr, "N job not FULL\n"); }
@@ -798,7 +818,10 @@ static int run_eq(std::vector<Job> &all_jobs, int k_default, int max_hits, int s
                 if (mism < 10) fprintf(stderr, "refused scoring but kind=%d\n", kind[t]);
             }
             if (!ok) { mism++; cls_mm[J.cls]++; }
-            if (scalar_stride > 0 && rescue_prune_is_default_scoring(pp) && (n % scalar_stride) == 0) {
+            /* The scalar model is kswv's 8-bit rowMax (scalar_score2's zeroed rising rows); kswv's
+             * 16-bit kernels keep a plain row max, so their score2 can differ from it (both widths
+             * as in v0.13.0). RB_16BIT checks pruned against full-window kswv16 only. */
+            if (!g_16 && scalar_stride > 0 && rescue_prune_is_default_scoring(pp) && (n % scalar_stride) == 0) {
                 int S, te, qe; std::vector<int> R;
                 scalar_dp(J, S, te, qe, R);
                 const int s2 = S >= minsc ? scalar_score2(R, S, te, minsc) : -1;
@@ -843,6 +866,11 @@ static int run_eq(std::vector<Job> &all_jobs, int k_default, int max_hits, int s
     /* The 8-bit ceiling class must reach the top of the band's H range, or the check of the x86
      * cell's biased add there (exact only while H <= 250) went vacuous. */
     const bool ceiling_vacuous = rescue_band_enabled() && n12_band > 0 && band_hi == 0;
+    /* RB_16BIT bands nothing, so its non-vacuity is pruning itself: some 16-bit job must be narrowed,
+     * and some of them must be a mate too long for the 8-bit kernels at any a (more than 250 bp). */
+    const bool vacuous16 = g_16 && (nb2 == 0 || nb2_long == 0);
+    if (vacuous16) fprintf(stderr, "FAIL: RB_16BIT narrowed no job, or no mate longer than 250 bp (b2=%ld, over 250 bp=%ld)\n",
+                           nb2, nb2_long);
     if (ceiling_vacuous) fprintf(stderr, "FAIL: no banded job scored 241 or more (the 8-bit ceiling class stopped reaching it)\n");
     /* Production falls back to kswv when a banded pass-1 max is not S (the guard in rescue_band.h),
      * but that cannot happen, so here any fallback fails the run: it means the band argument broke. */
@@ -851,7 +879,7 @@ static int run_eq(std::vector<Job> &all_jobs, int k_default, int max_hits, int s
         fprintf(stderr, "FAIL: %ld scorings kswv's 8-bit kernels do not run exactly were admitted (from() / rb_scoring::valid)\n",
                 g_admitted_bad);
     if (modes_missing) fprintf(stderr, "FAIL: a fixed RB_SCORING=random category was never drawn\n");
-    return mism || scal_mm || view_mm || vacuous || ceiling_vacuous || p1_guard || g_admitted_bad || modes_missing
+    return mism || scal_mm || view_mm || vacuous || vacuous16 || ceiling_vacuous || p1_guard || g_admitted_bad || modes_missing
                ? 1 : 0;
 }
 
@@ -969,6 +997,7 @@ int main(int argc, char **argv)
     bwamem3_simd_init();
     printf("kswv tier: %s\n", bwamem3_simd_tier_name(bwamem3_simd_tier()));
     const int minsc = rescue_env_int("RB_MINSC", MINSC_DEFAULT);
+    g_16 = rescue_env_int("RB_16BIT", 0) != 0;
     if (const char *m = getenv("RB_METH")) {
         g_meth = !strcmp(m, "genomic") ? METH_GENOMIC : !strcmp(m, "neutral") ? METH_NEUTRAL
                : !strcmp(m, "collapsed") ? METH_COLLAPSED : !strcmp(m, "random") ? METH_RANDOM : -1;
@@ -1002,6 +1031,16 @@ int main(int argc, char **argv)
         return run_eq(jobs, minsc, max_hits, ss);
     }
     if (!strcmp(argv[1], "time")) {
+        /* run_time times the default scoring's 8-bit pipeline (getScores8, then the band); it has no
+         * 16-bit, --meth or general-scoring dispatch, so those eq knobs are refused here instead of
+         * aborting in the 8-bit saturation guard or timing the default path under another name. */
+        for (const char *knob : {"RB_16BIT", "RB_METH", "RB_SCORING"}) {
+            const char *v = getenv(knob);
+            if (v && *v && strcmp(v, "0") != 0) {
+                fprintf(stderr, "%s: eq only; time runs the default scoring's 8-bit kernels and the band\n", knob);
+                return 2;
+            }
+        }
         const int reps = atoi(argv[2]), stride = atoi(argv[3]);
         for (int a = 4; a < argc; a++) load_dump(argv[a], jobs, stride);
         run_time(jobs, minsc, max_hits, reps);

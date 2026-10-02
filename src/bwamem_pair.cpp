@@ -345,21 +345,21 @@ static bool rescue_prune_on()
     return RESCUE_PRUNE_HAVE_SIMD && rescue_prune_enabled();
 }
 /* BWA3_RESCUE_PRUNE_STATS=1 prints the rescue shortcuts' counters to stderr at exit as one line,
- * "[RESCUE_PRUNE] jobs=.. full=.. b1=.. b2=.. rows_in=.. rows_kept=.. jobs16=.. memo_hits=..
- * reused=.. <stage times> dedup_run=.. dedup_skip=.. dedup_run_regs=.. dedup_skip_regs=..
- * dedup_insert1=.. dedup_insert1_fast=.. dedup_s=..". The first fields are the filter's: jobs
- * filtered, and of them how many kept the full window, were proven to fail (b1, not enqueued) or
- * were narrowed to a hull (b2), with the reference rows before and after, the calls the SIMD
- * filter answered from its repeat memo, and of those the jobs answered from an identical earlier
- * job's result instead of being enqueued (reused, BWA3_RESCUE_REPEAT). They are the non-vacuity
- * check for the identity A/B: identical output must come with a nonzero number of pruned rows.
- * jobs16 counts the 16-bit rescue jobs, which the filter never sees: the same check for the 16-bit
- * kswv kernels. The dedup_* fields are the post-rescue dedup's (below), which runs on every
- * architecture, so in a run that does not prune (rescue_prune_runs) they and jobs16 are the line's
- * only nonzero counters. */
+ * "[RESCUE_PRUNE] jobs=.. full=.. b1=.. b2=.. rows_in=.. rows_kept=.. jobs16=.. b1_16=.. b2_16=..
+ * memo_hits=.. reused=.. <stage times> dedup_run=.. dedup_skip=.. dedup_run_regs=..
+ * dedup_skip_regs=.. dedup_insert1=.. dedup_insert1_fast=.. dedup_s=..". The first fields are the
+ * filter's: jobs filtered, and of them how many kept the full window, were proven to fail (b1, not
+ * enqueued) or were narrowed to a hull (b2), with the reference rows before and after, the calls the
+ * SIMD filter answered from its repeat memo, and of those the jobs answered from an identical
+ * earlier job's result instead of being enqueued (reused, BWA3_RESCUE_REPEAT). They are the
+ * non-vacuity check for the identity A/B: identical output must come with a nonzero number of
+ * pruned rows. jobs16 counts the 16-bit rescue jobs, and b1_16 / b2_16 (included in b1 / b2) the
+ * filter's B1 and B2 decisions on them: the same check for the 16-bit kswv kernels. The dedup_*
+ * fields are the post-rescue dedup's (below), which runs on every architecture, so in a run that
+ * does not prune (rescue_prune_runs) they and jobs16 are the line's only nonzero counters. */
 struct rescue_prune_stats_t {
-    std::atomic<uint64_t> jobs{0}, full{0}, b1{0}, b2{0}, rows_in{0}, rows_kept{0}, jobs16{0}, memo_hits{0},
-        reused{0};
+    std::atomic<uint64_t> jobs{0}, full{0}, b1{0}, b2{0}, rows_in{0}, rows_kept{0}, jobs16{0}, b1_16{0},
+        b2_16{0}, memo_hits{0}, reused{0};
     /* Thread-summed wall time of the rescue stages (ns): filter + band planning in _pre, kswv
      * pass 0 (8-bit + 16-bit), the banded pass 0, kswv pass 1 and the banded pass 1. Only measured
      * when stats are on. */
@@ -371,12 +371,14 @@ struct rescue_prune_stats_t {
     bool on = rescue_env_opt_in("BWA3_RESCUE_PRUNE_STATS");
     ~rescue_prune_stats_t() {
         if (on) fprintf(stderr, "[RESCUE_PRUNE] jobs=%llu full=%llu b1=%llu b2=%llu rows_in=%llu rows_kept=%llu "
-                        "jobs16=%llu memo_hits=%llu reused=%llu filter_s=%.3f kswv_pass0_s=%.3f band_pass0_s=%.3f "
-                        "kswv_pass1_s=%.3f band_pass1_s=%.3f dedup_run=%llu dedup_skip=%llu dedup_run_regs=%llu "
+                        "jobs16=%llu b1_16=%llu b2_16=%llu memo_hits=%llu reused=%llu filter_s=%.3f "
+                        "kswv_pass0_s=%.3f band_pass0_s=%.3f kswv_pass1_s=%.3f band_pass1_s=%.3f dedup_run=%llu "
+                        "dedup_skip=%llu dedup_run_regs=%llu "
                         "dedup_skip_regs=%llu dedup_insert1=%llu dedup_insert1_fast=%llu dedup_s=%.3f\n",
                         (unsigned long long)jobs, (unsigned long long)full, (unsigned long long)b1,
                         (unsigned long long)b2, (unsigned long long)rows_in, (unsigned long long)rows_kept,
-                        (unsigned long long)jobs16, (unsigned long long)memo_hits, (unsigned long long)reused,
+                        (unsigned long long)jobs16, (unsigned long long)b1_16,
+                        (unsigned long long)b2_16, (unsigned long long)memo_hits, (unsigned long long)reused,
                         ns_filter * 1e-9, ns_k0 * 1e-9, ns_band * 1e-9,
                         ns_k1 * 1e-9, ns_b1 * 1e-9, (unsigned long long)dedup_run,
                         (unsigned long long)dedup_skip, (unsigned long long)dedup_run_regs,
@@ -390,6 +392,32 @@ static inline uint64_t rescue_now_ns()
         std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 static rescue_prune_stats_t g_rescue_prune_stats;
+/* The counters above are the run's totals; the counting sites bump this per-thread copy and its
+ * destructor folds it into them when the thread ends. Every worker is joined before exit, and the
+ * main thread's thread-local objects are destroyed before the static ones, so the totals are
+ * complete when the line prints. Bumping the shared atomics directly from every thread charged
+ * the pruning arm of an instrumented A/B seven contended adds per filtered job, against only the
+ * dedup counters in an arm that does not prune, so an instrumented run read a pruning win as a
+ * regression. What the stats knob still costs is two clock reads per job (rescue_now_ns) and
+ * plain adds. */
+struct rescue_prune_tstats_t {
+    uint64_t jobs = 0, full = 0, b1 = 0, b2 = 0, rows_in = 0, rows_kept = 0, jobs16 = 0, b1_16 = 0,
+        b2_16 = 0, memo_hits = 0, reused = 0;
+    uint64_t ns_filter = 0, ns_k0 = 0, ns_band = 0, ns_k1 = 0, ns_b1 = 0;
+    uint64_t dedup_run = 0, dedup_skip = 0, dedup_run_regs = 0, dedup_skip_regs = 0, dedup_insert1 = 0,
+        dedup_insert1_fast = 0, ns_dedup = 0;
+    ~rescue_prune_tstats_t() {
+        rescue_prune_stats_t &g = g_rescue_prune_stats;
+        g.jobs += jobs; g.full += full; g.b1 += b1; g.b2 += b2; g.rows_in += rows_in;
+        g.rows_kept += rows_kept; g.jobs16 += jobs16; g.b1_16 += b1_16; g.b2_16 += b2_16;
+        g.memo_hits += memo_hits; g.reused += reused;
+        g.ns_filter += ns_filter; g.ns_k0 += ns_k0; g.ns_band += ns_band; g.ns_k1 += ns_k1; g.ns_b1 += ns_b1;
+        g.dedup_run += dedup_run; g.dedup_skip += dedup_skip; g.dedup_run_regs += dedup_run_regs;
+        g.dedup_skip_regs += dedup_skip_regs; g.dedup_insert1 += dedup_insert1;
+        g.dedup_insert1_fast += dedup_insert1_fast; g.ns_dedup += ns_dedup;
+    }
+};
+static thread_local rescue_prune_tstats_t t_rescue_prune_stats;
 /* Skip a mate-rescue dedup that is provably a no-op (see mem_matesw_batch_post). Default ON;
  * BWA3_RESCUE_DEDUP_SKIP=0 runs every dedup, which is how the byte-identity A/B is run. */
 static bool rescue_dedup_skip_enabled()
@@ -437,7 +465,7 @@ static bool rescue_band_runs(const mem_opt_t *opt)
  * a scoring the lemma holds for (rescue_prune_params::valid; under --meth the default collapsed
  * scoring is refused there), and the cost gate (rescue_prune_cost_ok in rescue_prune.h: --meth on
  * aarch64 with EM-seq chemistry only, and on x86 no --meth, only where the SIMD filter runs, and not
- * at the AVX-512BW tier at min_seed_len * a >= 25, -k 25 and up at -A 1). Keys the length sort
+ * at the AVX-512BW tier from seed length 25, -k 25 and up at any -A). Keys the length sort
  * (both the non-meth and the per-OT/OB meth batch) and the narrow-offset record / read (each OR'd
  * with --rescue-kmer, which narrows on its own), so a run that cannot prune runs the pre-pruning
  * rescue path, apart from banded pass 1 where rescue_band_runs allows it. */
@@ -472,12 +500,13 @@ static bool rescue_band_meth_on(const mem_opt_t *opt)
 }
 
 /* Whether pruning applies to one rescue job: the run can prune (run_prunes, rescue_prune_runs,
- * which the caller evaluates once), --rescue-kmer is off, and the job is on the 8-bit kernel path
- * (the hull bound assumes that path's query padding, kswv_query_quantum8). Everything else runs the
- * full window. */
-static bool rescue_prune_applies(const mem_opt_t *opt, int xtra, bool run_prunes)
+ * which the caller evaluates once) and --rescue-kmer is off. Both kswv widths: the filter bounds
+ * scores, not lanes, and its hull assumes the 8-bit query padding (kswv_query_quantum8), which is
+ * at least the 16-bit padding (kswv_query_quantum16), so on a 16-bit job it over-counts the pad
+ * columns and its B1 and B2 decisions stay exact. Only banding is 8-bit (the plan() call site). */
+static bool rescue_prune_applies(const mem_opt_t *opt, bool run_prunes)
 {
-    return run_prunes && !opt->rescue_kmer && (xtra & KSW_XBYTE);
+    return run_prunes && !opt->rescue_kmer;
 }
 
 /* The oriented mate as the rescue SW sees it: the read itself, or its reverse complement (N,
@@ -1014,10 +1043,10 @@ static void mem_sam_pe_batch_run(Ikswv *pwsw, SeqPair *pairs,
     pwsw->getScores8(pairs + n_banded, seqBufRef, seqBufQer, aln, slice_pcnt8 - n_banded, nthreads, 0);
     pwsw->getScores16(pairs + slice_pcnt8 + MAX_LINE_LEN, seqBufRef, seqBufQer,
                       aln, slice_pcnt-slice_pcnt8, nthreads, 0);
-    if (timed) { uint64_t t1 = rescue_now_ns(); g_rescue_prune_stats.ns_k0 += t1 - t0; t0 = t1; }
+    if (timed) { uint64_t t1 = rescue_now_ns(); t_rescue_prune_stats.ns_k0 += t1 - t0; t0 = t1; }
     if (n_banded > 0) {
         band->run_pass0(pairs, (int)n_banded, seqBufRef, seqBufQer, aln, pwsw);
-        if (timed) { uint64_t t1 = rescue_now_ns(); g_rescue_prune_stats.ns_band += t1 - t0; t0 = t1; }
+        if (timed) { uint64_t t1 = rescue_now_ns(); t_rescue_prune_stats.ns_band += t1 - t0; t0 = t1; }
     }
 
     // Post-processing
@@ -1065,10 +1094,10 @@ static void mem_sam_pe_batch_run(Ikswv *pwsw, SeqPair *pairs,
     if (timed) t0 = rescue_now_ns();
     pwsw->getScores16(pairs + pos8, seqBufRef, seqBufQer, aln, pos16, nthreads, 1);
     pwsw->getScores8(pairs, seqBufRef, seqBufQer, aln, pos8, nthreads, 1);
-    if (timed) { uint64_t t1 = rescue_now_ns(); g_rescue_prune_stats.ns_k1 += t1 - t0; t0 = t1; }
+    if (timed) { uint64_t t1 = rescue_now_ns(); t_rescue_prune_stats.ns_k1 += t1 - t0; t0 = t1; }
     if (n_banded > 0 || p1_band_any) {
         band->run_pass1(seqBufRef, seqBufQer, aln, pwsw);
-        if (timed) g_rescue_prune_stats.ns_b1 += rescue_now_ns() - t0;
+        if (timed) t_rescue_prune_stats.ns_b1 += rescue_now_ns() - t0;
     }
 }
 
@@ -1186,7 +1215,7 @@ int mem_sam_pe_batch(const mem_opt_t *opt, mem_cache *mmc,
              * below, applied per OT/OB partition -- otherwise the narrowed windows sit
              * mixed with full ones inside each SIMD group, paying the scan cost without
              * collecting the saving. Like the non-meth sort it covers the whole group,
-             * pairs pruning left at full length included (16-bit, over the hit gate, N);
+             * pairs pruning left at full length included (over the hit gate, N);
              * the --meth pruning figures (rescue_prune_cost_ok) are whole runs with it. */
             if (meth_sort)
                 matesw_sort_partitions_by_len(scratch, group_pcnt8, group_pcnt);
@@ -1822,8 +1851,8 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
              * ref/rb/re exactly like --rescue-kmer's narrowing, so only the sub-window is copied
              * and _post applies the same offset. The oriented mate is built once here and reused
              * for the staging copy below. */
-            const bool pruned = rescue_prune_applies(opt, xtra, run_prunes);
-            if (g_rescue_prune_stats.on && !(xtra & KSW_XBYTE)) g_rescue_prune_stats.jobs16++;
+            const bool pruned = rescue_prune_applies(opt, run_prunes);
+            if (g_rescue_prune_stats.on && !(xtra & KSW_XBYTE)) t_rescue_prune_stats.jobs16++;
             static thread_local std::vector<uint8_t> oq;   // oriented mate; grows, never shrinks
             /* The last filtered jobs this thread enqueued, by the filter's key of their inputs and
              * regid (oldest overwritten); see the reuse below. */
@@ -1874,19 +1903,23 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                     }
                 }
                 /* Banding plan (rescue_band.h), bound to this pair's regid at enqueue (commit), at
-                 * the run's scoring. Not under --meth: a pruned --meth run does not band
+                 * the run's scoring. 8-bit jobs only (a 16-bit job's hull runs through kswv's 16-bit
+                 * kernel). Not under --meth: a pruned --meth run does not band
                  * (rescue_band_meth_on); the band kernels' --meth matrices serve the unpruned runs'
                  * pass 1. */
-                if (kind == RESCUE_PRUNE_B2 && reuse < 0 && rescue_band_enabled() && !opt->meth_mode)
+                if (kind == RESCUE_PRUNE_B2 && (xtra & KSW_XBYTE) && reuse < 0 && rescue_band_enabled()
+                    && !opt->meth_mode)
                     matesw_band(mmc, tid).plan(view, pp, (int)(re - rb), l_ms, hb, he);
-                if (g_rescue_prune_stats.on) g_rescue_prune_stats.ns_filter += rescue_now_ns() - tf0;
+                if (g_rescue_prune_stats.on) t_rescue_prune_stats.ns_filter += rescue_now_ns() - tf0;
                 if (g_rescue_prune_stats.on) {
-                    g_rescue_prune_stats.jobs++;
-                    g_rescue_prune_stats.memo_hits += view.repeat;
-                    g_rescue_prune_stats.reused += reuse >= 0;
-                    g_rescue_prune_stats.rows_in += re - rb;
-                    (kind == RESCUE_PRUNE_B1 ? g_rescue_prune_stats.b1 : kind == RESCUE_PRUNE_B2 ? g_rescue_prune_stats.b2 : g_rescue_prune_stats.full)++;
-                    g_rescue_prune_stats.rows_kept += kind == RESCUE_PRUNE_B1 ? 0 : kind == RESCUE_PRUNE_B2 ? he - hb + 1 : re - rb;
+                    t_rescue_prune_stats.jobs++;
+                    t_rescue_prune_stats.memo_hits += view.repeat;
+                    t_rescue_prune_stats.reused += reuse >= 0;
+                    t_rescue_prune_stats.rows_in += re - rb;
+                    (kind == RESCUE_PRUNE_B1 ? t_rescue_prune_stats.b1 : kind == RESCUE_PRUNE_B2 ? t_rescue_prune_stats.b2 : t_rescue_prune_stats.full)++;
+                    t_rescue_prune_stats.rows_kept += kind == RESCUE_PRUNE_B1 ? 0 : kind == RESCUE_PRUNE_B2 ? he - hb + 1 : re - rb;
+                    if (!(xtra & KSW_XBYTE) && kind != RESCUE_PRUNE_FULL)
+                        (kind == RESCUE_PRUNE_B1 ? t_rescue_prune_stats.b1_16 : t_rescue_prune_stats.b2_16)++;
                 }
                 if (kind == RESCUE_PRUNE_B1) {
                     gar[gcnt + r] = MATESW_GAR_PROVEN_FAIL;
@@ -2362,20 +2395,20 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
             /* BWA3_RESCUE_DEDUP_SKIP=0 ignores the state: every dedup runs in full. */
             mem_rescue_dedup_state_t *ds = rescue_dedup_skip_enabled() ? dedup_state : NULL;
             if (ds && ds->fixpoint && ds->pushed < 0) {
-                if (st) { ++g_rescue_prune_stats.dedup_skip; g_rescue_prune_stats.dedup_skip_regs += ma->n; }
+                if (st) { ++t_rescue_prune_stats.dedup_skip; t_rescue_prune_stats.dedup_skip_regs += ma->n; }
             } else {
                 const uint64_t t0 = st ? rescue_now_ns() : 0;
-                if (st) { ++g_rescue_prune_stats.dedup_run; g_rescue_prune_stats.dedup_run_regs += ma->n; }
+                if (st) { ++t_rescue_prune_stats.dedup_run; t_rescue_prune_stats.dedup_run_regs += ma->n; }
                 if (ds == NULL)
                     ma->n = mem_sort_dedup_patch(opt, 0, 0, 0, ma->n, ma->a);
                 else if (ds->fixpoint) {
                     int fast = 0;
                     ma->n = mem_dedup_only_insert1(opt, ma->n, ma->a, ds->pushed, &ds->fixpoint, &fast);
-                    if (st) { ++g_rescue_prune_stats.dedup_insert1; g_rescue_prune_stats.dedup_insert1_fast += fast; }
+                    if (st) { ++t_rescue_prune_stats.dedup_insert1; t_rescue_prune_stats.dedup_insert1_fast += fast; }
                 } else
                     ma->n = mem_dedup_only_fixpoint(opt, ma->n, ma->a, &ds->fixpoint);
                 if (ds) ds->pushed = -1;
-                if (st) g_rescue_prune_stats.ns_dedup += rescue_now_ns() - t0;
+                if (st) t_rescue_prune_stats.ns_dedup += rescue_now_ns() - t0;
             }
         }
         #else
