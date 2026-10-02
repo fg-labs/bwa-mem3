@@ -17,7 +17,11 @@
  *
  * --meth (rescue_prune_params::set_meth): the filter matches C -> T (OT) or G -> A (OB) converted
  * copies of the window and the mate exactly, which counts every cell the meth matrices score +a or
- * more as a hit (and some more, which only loosens the bound).
+ * more as a hit (and some more, which only loosens the bound). Under the relation
+ * (rescue_prune_params::set_meth_rel; genomic and neutral scoring) a query 5-mer hits every
+ * reference 5-mer it relates to base by base -- read T to reference T or C (OT), read A to reference
+ * A or G (OB), any other base to itself -- which counts exactly the cells the genomic matrix scores
+ * +a (the neutral one's freed cell scores 0 <= a), and every other cell scores -b as before.
  *
  * Other scorings (rescue_prune_params): the same argument with K-mers, K - 1 <= min(b, o_del,
  * o_ins + e_ins) / a (capped at 5), a per-diagonal charge c and the constant a (K - 1) + c in place
@@ -95,6 +99,14 @@ struct rescue_prune_params {
      * bound, so the lemma holds. Default collapsed scoring (b = 2a) forces K = 3 and is refused;
      * --meth -B 4 and the genomic / neutral scorings (b = 4a) are not. */
     int conv_from = -1, conv_to = -1;
+    /* --meth, relation-expanded (set_meth_rel): the filter matches the exact relation of the genomic /
+     * neutral matrices instead of converted copies. A query base relx relates to the reference bases
+     * relx and relx ^ 2 (OT: read T to reference T or C; OB: read A to reference A or G); every other
+     * pair is the identity. The freed cell scores +a (genomic) or 0 (neutral) <= a and every
+     * unrelated real cell -b, so the lemma holds; unlike the converted copies it does not relate the
+     * mirror (reference T / read C), which on mostly unconverted reads (TAPS) is what saturates the
+     * windows. Not for collapsed scoring, whose mirror cell scores +a: that needs set_meth. -1: off. */
+    int relx = -1;
 
     int base() const { return a * (K - 1) + c; }
     int weight(int cnt) const { return a * cnt - c; }
@@ -120,6 +132,14 @@ struct rescue_prune_params {
     {
         conv_from = hyp ? 1 : 2;
         conv_to = hyp ? 3 : 0;
+        relx = -1;
+    }
+    /* The relation-expanded alternative to set_meth (relx above): only for a matrix
+     * rescue_meth_rel_matrix_ok admits (the genomic and neutral ones, not collapsed). */
+    void set_meth_rel(int hyp)
+    {
+        conv_from = conv_to = -1;
+        relx = hyp ? 3 : 0;
     }
 
     /* The validity conditions in order, kswv8_scoring_ok first so that no division sees a zero.
@@ -155,10 +175,17 @@ struct rescue_prune_params {
  * depend only on the oriented mate, which repeats across the anchors rescued with it. */
 struct rescue_prune_scratch {
     static const int WCAP = 30000, QCAP = 1024, DCAP = WCAP + QCAP + 2;
+    /* Under a relation (relx >= 0) one query K-mer relates to up to 2^K reference codes, so the
+     * query table holds entries (query position ent_j, next entry of the same code ent_nxt) instead
+     * of query positions; a mate needing more than ECAP entries is not pruned (FULL). The SIMD filters
+     * use the same cap. */
+    static const int ECAP = rescue_prune_neon::REL_ECAP;
     int16_t head[1024], nxt[QCAP];
+    int16_t ent_j[ECAP], ent_nxt[ECAP];
     uint16_t qcnt[1024];
     uint8_t qcache[QCAP];
-    int qlen_c = -1, qk_c = 0;   // the cached query tables are for this length and K
+    int qlen_c = -1, qk_c = 0, qrel_c = -1;   // the cached query tables are for this length, K and relx
+    bool q_over = false;                        // ... and exceeded ECAP
     uint16_t cnt[DCAP];
     int16_t minrow[DCAP];
     int32_t fwd[DCAP], bwd[DCAP];
@@ -178,21 +205,50 @@ static inline int rescue_prune_window_scalar(const uint8_t *ref, int len1, const
     if (orv & 0xFC) return RESCUE_PRUNE_FULL;  // N present: its score (-1) breaks the lemma's accounting
 
     if (len2 < K || len1 < K) return RESCUE_PRUNE_FULL;
-    if (len2 != s.qlen_c || K != s.qk_c || memcmp(q, s.qcache, (size_t)len2) != 0) {
+    const int relx = p.relx;
+    if (len2 != s.qlen_c || K != s.qk_c || relx != s.qrel_c || memcmp(q, s.qcache, (size_t)len2) != 0) {
         memset(s.head, 0xFF, sizeof s.head);
         memset(s.qcnt, 0, sizeof s.qcnt);
+        s.q_over = false;
         int c = 0;
         for (int j = 0; j < K - 1; j++) c = (c << 2) | q[j];
-        for (int j = K - 1; j < len2; j++) {
-            c = ((c << 2) | q[j]) & mask;
-            s.nxt[j] = s.head[c];
-            s.head[c] = (int16_t)j;
-            s.qcnt[c]++;
+        if (relx < 0) {
+            for (int j = K - 1; j < len2; j++) {
+                c = ((c << 2) | q[j]) & mask;
+                s.nxt[j] = s.head[c];
+                s.head[c] = (int16_t)j;
+                s.qcnt[c]++;
+            }
+        } else {
+            /* The reference codes related to the K-mer ending at j: its code with any subset of the
+             * relx positions flipped by ^ 2 (M = those positions' high bits), one entry each. Written
+             * out here rather than shared with the SIMD filters' rescue_prune_neon::filter_rel_table
+             * on purpose: this filter is their oracle. A
+             * reference K-mer has one code, so every (row, j) hit is counted once. Entries go in with
+             * j ascending, so each code's chain is j-descending, as nxt is. */
+            int ne = 0;
+            for (int j = K - 1; j < len2 && !s.q_over; j++) {
+                c = ((c << 2) | q[j]) & mask;
+                int M = 0;
+                for (int t = 0; t < K; t++)
+                    if (q[j - t] == relx) M |= 2 << (2 * t);
+                for (int sm = M;; sm = (sm - 1) & M) {
+                    if (ne == rescue_prune_scratch::ECAP) { s.q_over = true; break; }
+                    const int rc = c ^ sm;
+                    s.ent_j[ne] = (int16_t)j;
+                    s.ent_nxt[ne] = s.head[rc];
+                    s.head[rc] = (int16_t)ne++;
+                    s.qcnt[rc]++;
+                    if (!sm) break;
+                }
+            }
         }
         memcpy(s.qcache, q, (size_t)len2);
         s.qlen_c = len2;
         s.qk_c = K;
+        s.qrel_c = relx;
     }
+    if (s.q_over) return RESCUE_PRUNE_FULL;
     int c0 = 0;
     for (int i = 0; i < K - 1; i++) c0 = (c0 << 2) | ref[i];
     /* Gate: total hits from per-code query counts, without enumerating them. */
@@ -205,10 +261,18 @@ static inline int rescue_prune_window_scalar(const uint8_t *ref, int len1, const
     c = c0;
     for (int i = K - 1; i < len1; i++) {
         c = ((c << 2) | ref[i]) & mask;
-        for (int j = s.head[c]; j >= 0; j = s.nxt[j]) {
-            const int d = i - j + off;
-            if (!s.cnt[d]) s.minrow[d] = (int16_t)(i - (K - 1));
-            s.cnt[d]++;
+        if (relx < 0) {
+            for (int j = s.head[c]; j >= 0; j = s.nxt[j]) {
+                const int d = i - j + off;
+                if (!s.cnt[d]) s.minrow[d] = (int16_t)(i - (K - 1));
+                s.cnt[d]++;
+            }
+        } else {
+            for (int e = s.head[c]; e >= 0; e = s.ent_nxt[e]) {
+                const int d = i - s.ent_j[e] + off;
+                if (!s.cnt[d]) s.minrow[d] = (int16_t)(i - (K - 1));
+                s.cnt[d]++;
+            }
         }
     }
     /* Kadane over the diagonal weights a cnt_d - c: fwd[d] / bwd[d] are the best sums of an
@@ -260,13 +324,13 @@ static inline int rescue_prune_window_scalar(const uint8_t *ref, int len1, const
 struct rescue_prune_view {
     int nd = -1, off = 0;
     /* The SIMD filter answered this call from its repeat memo: the window bytes, the mate bytes,
-     * the lengths, the hit gate, the threshold and the bound weights equal the previous filter
-     * call's on this thread. */
+     * the lengths, the hit gate, the threshold, the bound weights and the relation equal the
+     * previous filter call's on this thread. */
     bool repeat = false;
     /* keyed: the SIMD filter decided, and key summarizes its inputs (window, mate, lengths, hit
-     * gate, threshold, bound weights). Equal inputs have equal keys; a caller finding an earlier job
-     * with this key compares the bytes before treating it as the same job (rescue_prune_neon.h
-     * whash / qhash). */
+     * gate, threshold, bound weights, relation). Equal inputs have equal keys; a caller finding an
+     * earlier job with this key compares the bytes before treating it as the same job
+     * (rescue_prune_neon.h whash / qhash). */
     bool keyed = false;
     uint64_t key = 0;
     int minsc = 0;   // the filter call's threshold
@@ -299,16 +363,17 @@ static inline rescue_prune_view rescue_prune_scalar_view(const rescue_prune_scra
 
 /* The SIMD filter this build dispatches to, at any threshold: NEON on aarch64
  * (rescue_prune_neon.h), the SSE4.1 / SSSE3 port on the AVX2-floor x86 builds (rescue_prune_x86.h),
- * none elsewhere. Both return the scalar filter's decisions and the same view. */
+ * none elsewhere. Both return the scalar filter's decisions and the same view, under the --meth
+ * relation (relx) too. */
 #if defined(__aarch64__)
 #define RESCUE_PRUNE_HAVE_SIMD 1
 typedef rescue_prune_neon::NeonScratch rescue_prune_simd_scratch_t;
 static inline rescue_prune_neon::Kind rescue_prune_simd_lean(const rescue_prune_neon::Job &jb,
                                                              rescue_prune_simd_scratch_t &s, int &hb,
                                                              int &he, int max_hits, int minsc,
-                                                             const rescue_prune_neon::Wt &wt)
+                                                             const rescue_prune_neon::Wt &wt, int relx)
 {
-    return rescue_prune_neon::lean_neon(jb, s, hb, he, max_hits, minsc, wt);
+    return rescue_prune_neon::lean_neon(jb, s, hb, he, max_hits, minsc, wt, relx);
 }
 #elif defined(__AVX2__)
 #define RESCUE_PRUNE_HAVE_SIMD 1
@@ -316,9 +381,9 @@ typedef rescue_prune_x86::X86Scratch rescue_prune_simd_scratch_t;
 static inline rescue_prune_neon::Kind rescue_prune_simd_lean(const rescue_prune_neon::Job &jb,
                                                              rescue_prune_simd_scratch_t &s, int &hb,
                                                              int &he, int max_hits, int minsc,
-                                                             const rescue_prune_neon::Wt &wt)
+                                                             const rescue_prune_neon::Wt &wt, int relx)
 {
-    return rescue_prune_x86::lean_x86(jb, s, hb, he, max_hits, minsc, wt);
+    return rescue_prune_x86::lean_x86(jb, s, hb, he, max_hits, minsc, wt, relx);
 }
 #else
 #define RESCUE_PRUNE_HAVE_SIMD 0
@@ -344,20 +409,23 @@ static inline uint64_t rescue_prune_memo_hits()
 #endif
 }
 
-/* The default hit gate (BWA3_RESCUE_PRUNE_MAX_HITS unset), for a run with banding on or off, under
- * --meth (meth) or not: 400 for the hull path. On aarch64, 1000 when banding is on and the run's
- * pruned windows can be banded (no --meth): banding turns more of the pruned windows into savings,
- * which pays for the filter on the denser windows (best of {400, 1000, 3000, 10^4, 10^9} measured on
- * WGS-like data at minsc 19). The SIMD filter runs at every minsc, so the gate does not depend on
- * it; 16-bit jobs (pruned but never banded) and scorings the scalar filter decides (a > 16) take
- * 1000 on aarch64 too. The 16-bit pruning figures (Graviton 4, prune on vs off, -t 16, wgs-5M /
- * wes-5M: -A 2 -10.0 / -14.9 %, -A 3 -B 12 -O 18 -E 3 -9.3 / -13.3 %, every job 16-bit) are whole
- * runs at that gate; 400 for those jobs has not been measured. A --meth pruning run never bands its
- * pruned windows (rescue_band_meth_on), so it takes 400 (Graviton 4, EM-seq panel 5 M pairs, wall,
- * 400 vs 1000: genomic -3.3 %, collapsed -B 4 flat). On x86, 400 with banding too: the x86 kswv
- * kernels are cheap enough that the extra filter work on dense windows does not pay (prune + band,
- * wall, 1000 vs 400: Zen 3 AVX2 wgs-5M 74.52 vs 73.57 s, wes-5M 38.57 vs 37.65 s; Zen 5 AVX-512
- * wgs-5M 27.53 vs 26.73 s). Output is identical at every value. */
+/* The default hit gate (BWA3_RESCUE_PRUNE_MAX_HITS unset), for a run with banding on or off, and
+ * meth: a --meth pruning run whose pruned windows are not banded. 400 for the hull path. On
+ * aarch64, 1000 when banding is on and the run's pruned windows are banded: banding turns more of
+ * the pruned windows into savings, which pays for the filter on the denser windows (best of {400,
+ * 1000, 3000, 10^4, 10^9} measured on WGS-like data at minsc 19). The SIMD filter runs at every
+ * minsc, so the gate does not depend on it; 16-bit jobs (pruned but never banded) and scorings the
+ * scalar filter decides (a > 16) take 1000 on aarch64 too. The 16-bit pruning figures (Graviton 4,
+ * prune on vs off, -t 16, wgs-5M / wes-5M: -A 2 -10.0 / -14.9 %, -A 3 -B 12 -O 18 -E 3 -9.3 /
+ * -13.3 %, every job 16-bit) are whole runs at that gate; 400 for those jobs has not been measured.
+ * A --meth pruning run on converted copies (EM-seq) does not band its pruned windows by default
+ * (rescue_band_meth_on), so it takes 400 (Graviton 4, EM-seq panel 5 M pairs, wall, 400 vs 1000:
+ * genomic -3.3 %, collapsed -B 4 flat); a relation run (TAPS) bands them and takes 1000, the gate
+ * its figures in rescue_prune_cost_ok were measured at, and 400 loses there (Graviton 4, TAPS 1 M
+ * pairs, wall, 400 vs 1000: neutral +2.6 %, genomic +2.7 %, 10 reps, p < 1e-4). On x86, 400 with banding too: the x86
+ * kswv kernels are cheap enough that the extra filter work on dense windows does not pay (prune +
+ * band, wall, 1000 vs 400: Zen 3 AVX2 wgs-5M 74.52 vs 73.57 s, wes-5M 38.57 vs 37.65 s; Zen 5
+ * AVX-512 wgs-5M 27.53 vs 26.73 s). Output is identical at every value. */
 static inline int rescue_prune_max_hits_default(bool banding, bool meth)
 {
 #if defined(__aarch64__)
@@ -368,21 +436,44 @@ static inline int rescue_prune_max_hits_default(bool banding, bool meth)
 #endif
 }
 
+/* Whether a --meth matrix (mat_ot / mat_ob, mem_opt_fill_meth_mat's 5 x 5 [ref * 5 + read] table)
+ * scores exactly what the relation of hypothesis hyp (set_meth_rel) relates: at most a on the
+ * diagonal and on the freed cell (OT, hyp 1: reference C / read T; OB, hyp 0: reference G / read A),
+ * and at most -b on every other A / C / G / T pair, so no pair the relation does not relate can
+ * score like a match. The genomic and neutral matrices pass; the collapsed one, which also frees the
+ * mirror cell (reference T / read C, reference A / read G), does not. N cells (-1) are outside it: the
+ * filters return FULL on N. */
+static inline bool rescue_meth_rel_matrix_ok(const int8_t *mat, int hyp, int a, int b)
+{
+    const int fr = hyp ? 1 : 2, fq = hyp ? 3 : 0;
+    for (int r = 0; r < 4; r++)
+        for (int q = 0; q < 4; q++) {
+            const int v = mat[r * 5 + q];
+            if (r == q || (r == fr && q == fq) ? v > a : v > -b) return false;
+        }
+    return true;
+}
+
 /* Whether pruning pays for the scoring and threshold p (the cost gate beside the exactness
- * preconditions, p.valid among them, which the caller checks), for a run under --meth (meth, with
- * EM-seq / bisulfite chemistry: emseq) or not, whose kswv runs at the AVX-512BW tier (avx512) or not.
- * On aarch64 everywhere but --meth with other chemistry, the scalar filter included (Graviton 4,
- * prune on vs off, wall, wes-5M / wgs-5M: -B 6 -13.9 / -5.7 %, -O 8 -E 2 -6.9 / -2.9 %,
- * -x intractg -6.4 / -1.1 %). The --meth filter matches converted copies (set_meth), which fits reads
- * whose unmethylated C's are converted; TAPS reads are mostly unconverted, so collapsing them to three
+ * preconditions, p.valid among them, which the caller checks), for a run under --meth (meth) or not,
+ * where meth_fits says the run's --meth filter fits its reads (EM-seq / bisulfite chemistry on
+ * converted copies, or any run filtering under the relation, set_meth_rel), whose kswv runs at the
+ * AVX-512BW tier (avx512) or not.
+ * On aarch64 everywhere but --meth with other chemistry on converted copies, the scalar filter
+ * included (Graviton 4, prune on vs off, wall, wes-5M / wgs-5M: -B 6 -13.9 / -5.7 %, -O 8 -E 2
+ * -6.9 / -2.9 %, -x intractg -6.4 / -1.1 %). The converted-copy filter (set_meth) fits reads whose
+ * unmethylated C's are converted; TAPS reads are mostly unconverted, so collapsing them to three
  * letters leaves little to prune (EM-seq panel, 5 M pairs: genomic -9.0 %, collapsed -B 4 -10.1 %;
- * TAPS -0.1 %). On x86 no --meth, where the cheaper kswv leaves nothing to win (Zen 5, EM-seq genomic
- * +0.1 %, collapsed -B 4 +1.6 %, TAPS +5.0 %), and only where the SIMD filter runs (simd_ok: K = 5,
- * a <= 16): the scalar filter costs more than it saves against the cheaper x86 kswv (Zen 5 AVX-512,
- * prune on vs off, scalar-filtered: -O 8 -E 2 +13.3 / +4.7 %, -x intractg +14.6 / +4.9 %), while the
- * SIMD filter at those scorings wins or breaks even (Zen 3 AVX2: -O 8 -E 2 -2.6 / -7.2 %,
- * -x intractg -0.3 / -6.2 %; Zen 5: all within 1 %), and not at the
- * AVX-512BW tier from seed length 25 (-k 25; minsc >= 25 a, since minsc = min_seed_len * a): there
+ * TAPS -0.1 %), while the relation keeps 72 % of TAPS rescue rows where converted copies keep 96 %
+ * and pays with banding (TAPS, 1 M pairs, prune + band vs neither: neutral -3.8 %, genomic -4.2 %).
+ * On x86 no --meth, where the cheaper kswv leaves nothing to win (Zen 5, EM-seq genomic
+ * +0.1 %, collapsed -B 4 +1.6 %, TAPS +5.0 %; the relation filter, single thread over 5.57 M TAPS
+ * rescue jobs, costs 8.0 s to save about 5 thread-s of kswv), and only where the SIMD filter runs
+ * (simd_ok: K = 5, a <= 16): the scalar filter costs more than it saves against the cheaper x86
+ * kswv (Zen 5 AVX-512, prune on vs off, scalar-filtered: -O 8 -E 2 +13.3 / +4.7 %, -x intractg
+ * +14.6 / +4.9 %), while the SIMD filter at those scorings wins or breaks even (Zen 3 AVX2: -O 8
+ * -E 2 -2.6 / -7.2 %, -x intractg -0.3 / -6.2 %; Zen 5: all within 1 %), and not at the AVX-512BW
+ * tier from seed length 25 (-k 25; minsc >= 25 a, since minsc = min_seed_len * a): there
  * the 64-lane kswv is cheap and few rescues pass at a long seed length, so the filter costs more
  * than it saves (Zen 5 wgs-5M: +1.0 / +2.4 / +1.2 / +1.3 % at -k 25 / 28 / 32 / 40; wes-5M
  * -1.3 / +0.9 / -0.8 / -1.2 %). AVX2 still wins at -k 32 (Zen 3 wes-5M -3.8 %). The gate is on the
@@ -391,13 +482,13 @@ static inline int rescue_prune_max_hits_default(bool banding, bool meth)
  * -A 2 -2.5 %, -A 2 -B 8 -O 12 -E 2 -2.2 %, -A 3 -B 12 -O 18 -E 3 -1.7 %; wes-5M flat). The gate
  * covers 16-bit jobs too, which every job at -A 2 with 150 bp mates is: the same filter decides
  * them, and the kswv they save is the 16-bit kernel, which has half the lanes. */
-static inline bool rescue_prune_cost_ok(const rescue_prune_params &p, bool meth, bool emseq, bool avx512)
+static inline bool rescue_prune_cost_ok(const rescue_prune_params &p, bool meth, bool meth_fits, bool avx512)
 {
 #if defined(__aarch64__)
     (void)p; (void)avx512;
-    return !meth || emseq;
+    return !meth || meth_fits;
 #else
-    (void)emseq;
+    (void)meth_fits;
     return !meth && p.simd_ok() && !(avx512 && p.minsc >= 25 * p.a);
 #endif
 }
@@ -437,6 +528,9 @@ static RESCUE_PRUNE_WINDOW_INLINE int rescue_prune_window(const uint8_t *ref, in
     if (!p.valid || len1 < 5 || len2 < 5 || len2 > rescue_prune_scratch::QCAP
         || len1 > rescue_prune_scratch::WCAP)
         return RESCUE_PRUNE_FULL;
+    /* The two --meth modes are exclusive (set_meth / set_meth_rel each clear the other); a p with
+     * both set would be filtered under neither argument. */
+    if (p.conv_from >= 0 && p.relx >= 0) return RESCUE_PRUNE_FULL;
     if (p.conv_from >= 0) {   // --meth: exact matching of converted copies (see conv_from)
         static thread_local uint8_t cref[rescue_prune_scratch::WCAP], cq[rescue_prune_scratch::QCAP];
         const uint8_t f = (uint8_t)p.conv_from, t = (uint8_t)p.conv_to;
@@ -452,19 +546,19 @@ static RESCUE_PRUNE_WINDOW_INLINE int rescue_prune_window(const uint8_t *ref, in
     }
     const int minsc = p.minsc;
 #if RESCUE_PRUNE_HAVE_SIMD
-    if (p.simd_ok()) {   // the scalar filter's decisions at any minsc and weights, faster
+    if (p.simd_ok()) {   // the scalar filter's decisions at any minsc, weights and relation, faster
         rescue_prune_simd_scratch_t &ss = rescue_prune_simd_scratch();
         const rescue_prune_neon::Job jb{len1, len2, 0, 0, -1, -1, ref, q};
         int h, e;
         const uint64_t hits0 = ss.memo_hits;
         const rescue_prune_neon::Wt wt = p.simd_wt();
-        const rescue_prune_neon::Kind k = rescue_prune_simd_lean(jb, ss, h, e, max_hits, minsc, wt);
+        const rescue_prune_neon::Kind k = rescue_prune_simd_lean(jb, ss, h, e, max_hits, minsc, wt, p.relx);
         if (view) {
             view->repeat = ss.memo_hits != hits0;
             view->keyed = k != rescue_prune_neon::FALLBACK;
             const uint64_t wkey = (uint64_t)(uint32_t)wt.base ^ (uint64_t)(uint32_t)wt.a << 16
                                   ^ (uint64_t)(uint32_t)wt.c << 32 ^ (uint64_t)(uint32_t)wt.toff << 40
-                                  ^ (uint64_t)(uint32_t)wt.e << 52;
+                                  ^ (uint64_t)(uint32_t)wt.e << 52 ^ (uint64_t)(uint32_t)(p.relx + 1) << 60;
             view->key = (ss.whash ^ (ss.qhash * 0x9E3779B97F4A7C15ULL)) + (uint64_t)max_hits * 0xD6E8FEB86659FD93ULL
                         + (uint64_t)minsc * 0xA24BAED4963EE407ULL + wkey * 0xC2B2AE3D27D4EB4FULL;
         }

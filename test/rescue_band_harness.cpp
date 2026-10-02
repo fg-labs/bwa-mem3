@@ -6,7 +6,7 @@
  *
  * time runs the default scoring's 8-bit pipeline only (kswv getScores8 plus the band), so it
  * refuses the eq-only knobs that would change the job mix or the scoring (RB_16BIT, RB_METH,
- * RB_SCORING) rather than time something other than what they ask for.
+ * RB_METH_REL, RB_SCORING) rather than time something other than what they ask for.
  *
  * eq: for every job, the PRODUCTION pipeline -- rescue_prune_window, RescueBandBatch::plan/commit,
  * the length sort, partition, kswv phase 0 on the non-banded pairs, run_pass0 on the banded ones,
@@ -24,8 +24,9 @@
  * filter's capacity (scalar view), more components than the cap, and pass-1 adversaries (class 11:
  * gaps at the band-edge bound, start ties, qe next to the pad columns, te at the window edges).
  * Every B2 job's SIMD filter view is also checked against the scalar filter's view of the same job
- * (same components at several thresholds; not under --meth, whose view is of converted copies),
- * and the run fails if nothing was banded. Env knobs are the
+ * (same components at several thresholds; not on --meth converted copies, whose view is of the
+ * converted bytes; under the relation it is), and the run fails if nothing was banded, or under
+ * RB_METH_REL=expand if no job was narrowed or view checked under the relation. Env knobs are the
  * production ones; the caller sets e.g.
  * BWA3_RESCUE_BAND_COST=100000000 (band every B2 parent) and BWA3_RESCUE_PRUNE_MAX_HITS. Harness-only:
  * RB_MINSC (the min seed length, default 19; minsc = RB_MINSC * a), RB_SCALAR_STRIDE (default 0: no
@@ -33,7 +34,9 @@
  * or RB_METH that changes it) and RB_SCORING (unset: the default scoring;
  * "a,b,o_del,e_del,o_ins,e_ins": that scoring; "random": a fresh draw per 2048-job batch, see
  * draw_params), RB_METH (genomic | neutral | collapsed | random: --meth matrices, see batch_matrix)
- * and RB_16BIT (1: every job runs through kswv's 16-bit kernels for both passes, uncut and unbanded,
+ * with RB_METH_REL (conv, the default: the filter matches converted copies; expand: genomic and
+ * neutral batches use the relation-expanded filter, rescue_prune_params::set_meth_rel, and collapsed
+ * stays on conv) and RB_16BIT (1: every job runs through kswv's 16-bit kernels for both passes, uncut and unbanded,
  * with mates up to 1024 bp, the longest the filter takes (rescue_prune_scratch::QCAP), as
  * production runs a 16-bit job: pruned but never banded).
  * The truth kswv runs with the batch's scoring and matrix; pass 0 is banded at every scoring the
@@ -498,6 +501,7 @@ static std::unique_ptr<Ikswv> make_k(int maxr, int maxq, const rescue_prune_para
 /* ---------------------------------------------------------------------------------------- */
 enum { METH_NONE = 0, METH_GENOMIC, METH_NEUTRAL, METH_COLLAPSED, METH_RANDOM };
 static int g_meth = METH_NONE;
+static bool g_meth_rel = false;   // RB_METH_REL=expand
 
 /* The batch's matrix, as the aligner builds it (bwa_fill_scmat; under --meth, kind != METH_NONE,
  * then mem_opt_fill_meth_mat and the hypothesis's OT / OB matrix), and its 8-bit bias
@@ -625,7 +629,7 @@ static int run_eq(std::vector<Job> &all_jobs, int k_default, int max_hits, int s
 {
     long mism = 0, n = 0, npass = 0, nfull = 0, nb1 = 0, nb2 = 0, nb2_long = 0, nband = 0, scal_mm = 0, te2_diff = 0;
     long nbatch = 0, nvalid = 0, nbandable = 0, np1able = 0, ntrunc = 0, nk[6] = {0}, n12_band = 0, nmeth[4] = {0};
-    long nview = 0, view_mm = 0, r2 = 0, ccap = 0;
+    long nview = 0, view_mm = 0, r2 = 0, ccap = 0, nrel_b2 = 0, nrel_view = 0;
     std::unique_ptr<rescue_prune_scratch> sscratch(new rescue_prune_scratch());
     std::vector<rb_comp> cn, cs;
     long p1_band = 0, p1_guard = 0, band_hi = 0;
@@ -642,7 +646,8 @@ static int run_eq(std::vector<Job> &all_jobs, int k_default, int max_hits, int s
         int8_t mat[25];
         const int shift = batch_matrix(pp, meth, hyp, mat);
         if (meth) {
-            pp.set_meth(hyp);
+            if (g_meth_rel && meth != METH_COLLAPSED) pp.set_meth_rel(hyp);
+            else pp.set_meth(hyp);
             nmeth[meth]++;
         }
         const int minsc = pp.minsc;
@@ -671,7 +676,9 @@ static int run_eq(std::vector<Job> &all_jobs, int k_default, int max_hits, int s
             ntrunc++;
         }
         if (meth) {   // convert the mates; the planted copies keep the reference bases
-            const double rate = rnd(3) == 0 ? 0.05 : rnd(2) ? 0.5 : 0.95;
+            /* TAPS-like low rates (mostly unconverted reads) are the relation filter's case */
+            const double rate = g_meth_rel ? (rnd(2) ? (rnd(2) ? 0.02 : 0.05) : rnd(2) ? 0.5 : 0.95)
+                                           : rnd(3) == 0 ? 0.05 : rnd(2) ? 0.5 : 0.95;
             const uint8_t from = hyp ? 1 : 2, to = hyp ? 3 : 0;
             for (Job &J : jobs)
                 for (uint8_t &x : J.q)
@@ -704,8 +711,9 @@ static int run_eq(std::vector<Job> &all_jobs, int k_default, int max_hits, int s
             int hb, he;
             rescue_prune_view view;
             kind[t] = rescue_prune_window(J.ref.data(), len1, J.q.data(), len2, pp, max_hits, &hb, &he, &view);
-            /* (under --meth the view is of the converted copies, which the scalar call below does not see) */
-            if (kind[t] == RESCUE_PRUNE_B2 && view.bnd16 && !meth) {
+            /* (on converted copies, conv_from, the view is of the converted bytes, which the scalar call
+             * below does not see; under the relation both filters see the original bytes) */
+            if (kind[t] == RESCUE_PRUNE_B2 && view.bnd16 && pp.conv_from < 0) {
                 /* The SIMD and scalar filter views of one job must give plan() the same components
                  * (the scalar view otherwise only serves windows past the SIMD filter's capacity). */
                 int shb, she;
@@ -738,6 +746,7 @@ static int run_eq(std::vector<Job> &all_jobs, int k_default, int max_hits, int s
                         }
                 }
                 nview++;
+                nrel_view += pp.relx >= 0;
                 if (!vok) {
                     view_mm++;
                     if (view_mm < 5) fprintf(stderr, "VIEW MISMATCH job=%zu cls=%d: SIMD and scalar filter views disagree\n", base + t, J.cls);
@@ -747,6 +756,7 @@ static int run_eq(std::vector<Job> &all_jobs, int k_default, int max_hits, int s
             if (kind[t] == RESCUE_PRUNE_B2) {
                 nb2++;
                 nb2_long += len2 > 250;
+                nrel_b2 += pp.relx >= 0;
                 if (band) rescue_band_batch().plan(view, pp, len1, len2, hb, he);
                 off[t] = hb;
                 idx[t] = P.add(J.ref.data() + hb, he - hb + 1, J.q.data(), len2, minsc);
@@ -869,6 +879,12 @@ static int run_eq(std::vector<Job> &all_jobs, int k_default, int max_hits, int s
     /* RB_16BIT bands nothing, so its non-vacuity is pruning itself: some 16-bit job must be narrowed,
      * and some of them must be a mate too long for the 8-bit kernels at any a (more than 250 bp). */
     const bool vacuous16 = g_16 && (nb2 == 0 || nb2_long == 0);
+    /* RB_METH_REL=expand: some job must be narrowed under the relation, and some relation view
+     * checked against the scalar one (the SIMD filter's Rel path ran), or the relation half of the
+     * run compared nothing. */
+    const bool vacuous_rel = g_meth_rel && (nrel_b2 == 0 || nrel_view == 0);
+    if (vacuous_rel) fprintf(stderr, "FAIL: RB_METH_REL=expand narrowed no job under the relation, or checked no "
+                                     "relation view (b2=%ld, views=%ld)\n", nrel_b2, nrel_view);
     if (vacuous16) fprintf(stderr, "FAIL: RB_16BIT narrowed no job, or no mate longer than 250 bp (b2=%ld, over 250 bp=%ld)\n",
                            nb2, nb2_long);
     if (ceiling_vacuous) fprintf(stderr, "FAIL: no banded job scored 241 or more (the 8-bit ceiling class stopped reaching it)\n");
@@ -879,7 +895,8 @@ static int run_eq(std::vector<Job> &all_jobs, int k_default, int max_hits, int s
         fprintf(stderr, "FAIL: %ld scorings kswv's 8-bit kernels do not run exactly were admitted (from() / rb_scoring::valid)\n",
                 g_admitted_bad);
     if (modes_missing) fprintf(stderr, "FAIL: a fixed RB_SCORING=random category was never drawn\n");
-    return mism || scal_mm || view_mm || vacuous || vacuous16 || ceiling_vacuous || p1_guard || g_admitted_bad || modes_missing
+    return mism || scal_mm || view_mm || vacuous || vacuous16 || vacuous_rel || ceiling_vacuous || p1_guard
+                   || g_admitted_bad || modes_missing
                ? 1 : 0;
 }
 
@@ -1003,6 +1020,13 @@ int main(int argc, char **argv)
                : !strcmp(m, "collapsed") ? METH_COLLAPSED : !strcmp(m, "random") ? METH_RANDOM : -1;
         if (g_meth < 0) { fprintf(stderr, "RB_METH: want genomic, neutral, collapsed or random\n"); return 2; }
     }
+    if (const char *m = getenv("RB_METH_REL")) {
+        if (strcmp(m, "conv") && strcmp(m, "expand")) {
+            fprintf(stderr, "RB_METH_REL: want conv or expand\n");
+            return 2;
+        }
+        g_meth_rel = !strcmp(m, "expand");
+    }
     if (const char *sc = getenv("RB_SCORING")) {
         if (!strcmp(sc, "random")) g_random_scoring = true;
         else {
@@ -1016,7 +1040,8 @@ int main(int argc, char **argv)
     }
     /* The production default (rescue_prune_max_hits in bwamem_pair.cpp). */
     const int max_hits = rescue_env_int("BWA3_RESCUE_PRUNE_MAX_HITS",
-                                        rescue_prune_max_hits_default(rescue_band_enabled(), g_meth != METH_NONE));
+                                        rescue_prune_max_hits_default(rescue_band_enabled(),
+                                                                      g_meth != METH_NONE && !g_meth_rel));
     std::vector<Job> jobs;
     if (argc < 4) {
         fprintf(stderr, "usage: %s eq <ngen> <seed> [dumps...] | time <reps> <stride> <dumps...>\n", argv[0]);
@@ -1034,7 +1059,7 @@ int main(int argc, char **argv)
         /* run_time times the default scoring's 8-bit pipeline (getScores8, then the band); it has no
          * 16-bit, --meth or general-scoring dispatch, so those eq knobs are refused here instead of
          * aborting in the 8-bit saturation guard or timing the default path under another name. */
-        for (const char *knob : {"RB_16BIT", "RB_METH", "RB_SCORING"}) {
+        for (const char *knob : {"RB_16BIT", "RB_METH", "RB_METH_REL", "RB_SCORING"}) {
             const char *v = getenv(knob);
             if (v && *v && strcmp(v, "0") != 0) {
                 fprintf(stderr, "%s: eq only; time runs the default scoring's 8-bit kernels and the band\n", knob);

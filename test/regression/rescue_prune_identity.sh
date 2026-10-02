@@ -70,11 +70,24 @@
 # hull banded must match as well and show banded parents; and -B 3, which the
 # lemma refuses, so no filtered job. The band kernels take all three, so each
 # must band pass 1. The same pairs as bisulfite reads, under --meth -B 4,
-# --meth-scoring genomic, the default collapsed scoring and --meth=taps, must
-# match their references too: filtered jobs on aarch64 at the first two, none
-# at the collapsed one (refused), none with TAPS chemistry and none on x86;
-# and banded pass-1 jobs exactly where a leg does not prune (--meth bands with
-# the group's matrix only where it does not prune).
+# --meth-scoring genomic, the default collapsed scoring and --meth=taps at the
+# collapsed scoring, must match their references too: filtered jobs on aarch64
+# at the first two, none at the collapsed ones (refused) and none on x86; and
+# banded pass-1 jobs exactly where a leg does not prune (--meth bands with the
+# group's matrix only where it does not prune on converted copies). The
+# unconverted pairs, as mostly unconverted TAPS reads, under --meth=taps (whose
+# default scoring is neutral) and --meth=taps --meth-scoring genomic must match
+# too: on aarch64 the filter runs under the exact relation there, so filtered
+# jobs, narrowed windows, banded pass-1 jobs and, with every bandable hull
+# banded, banded parents; on x86 no filtered job and banded pass-1 jobs. So
+# must --meth=taps on the converted pairs (the relation's conversion cells), and
+# --meth=taps --meth-scoring collapsed -B 4 with no filtered job: the lemma
+# admits it, and only the relation's matrix guard keeps it off. The --meth
+# levers at their other values must match the same references: on EM-seq
+# BWA3_RESCUE_BAND_METH=2 (banded parents on aarch64) and
+# BWA3_RESCUE_PRUNE_REL=2 (narrowed windows on aarch64), on TAPS
+# BWA3_RESCUE_BAND_METH=0 (filtered but nothing banded) and
+# BWA3_RESCUE_PRUNE_REL=0 (nothing filtered).
 #
 # Inputs:
 #   BWA_MEM3     — path to the bwa-mem3 binary under test
@@ -253,9 +266,10 @@ host_tier="$(BWAMEM3_DEBUG_SIMD=1 "$BIN" 2>&1 | sed -n 's/.*SIMD tier: \([a-z0-9
 # The reference: every shortcut and alternative kernel form off. Defined once so
 # the unforced and forced-tier references cannot drift apart. Some kernel forms
 # have no switch and so run in both legs: the lazy query end of the x86 bodies
-# (BWA3_RESCUE_LAZYQE reaches only the NEON two-row sweep) and the AVX-512BW u8
-# cell's form (BWA3_RESCUE_USQADD reaches NEON and the AVX2 FScan body); the
-# kswv unit tests check those against the scalar ksw_align2.
+# (BWA3_RESCUE_LAZYQE reaches only the NEON two-row sweep); the kswv unit tests
+# check it against the scalar ksw_align2. BWA3_RESCUE_USQADD reaches the NEON u8
+# body and the AVX2 and AVX-512BW FScan bodies, so the reference's USQADD=0
+# checks each tier's signed-domain body end to end.
 REF_ENV=(BWA3_RESCUE_PRUNE=0 BWA3_RESCUE_BAND=0 BWA3_RESCUE_DEDUP_SKIP=0 BWA3_RESCUE_REPEAT=0
     BWA3_RESCUE_FSCAN=0 BWA3_RESCUE_USQADD=0 BWA3_RESCUE_ROWPAIR=0 BWA3_RESCUE_LAZYQE=0)
 
@@ -311,26 +325,30 @@ fi
 # (rescue_band_runs). The --meth legs read the same pairs as bisulfite reads (--meth writes SAM,
 # as without it): with EM-seq chemistry (the default) at -B 4 and --meth-scoring genomic the filter
 # matches converted copies, on aarch64 only (x86's cost gate); the default collapsed scoring
-# (b = 2a) the lemma refuses, and TAPS chemistry is gated off everywhere. --meth bands pass 1 with
-# the group's matrix exactly where it does not prune (rescue_band_meth_on).
+# (b = 2a) the lemma refuses, with either chemistry. --meth bands pass 1 with the group's matrix
+# exactly where it does not prune on converted copies (rescue_band_meth_on). TAPS at the genomic
+# and neutral scorings (neutral is its default) filters under the exact relation on aarch64
+# (rescue_meth_rel), and bands both passes on top of that pruning.
 "$BIN" index --meth ref.fa > /dev/null 2>&1 || fail "index --meth nonzero exit"
 sc_note=""
 check_scoring() { # $1 = label, $2 = expectation, rest = mem options
     # Expectation: simd (prunes wherever the SIMD filter runs), simd16 (the same, with every
     # rescue job on the 16-bit kernels, which prune but never band), none (never prunes), meth
-    # (--meth, prunes on aarch64 only), methnone (--meth, never prunes).
+    # (--meth, prunes on aarch64 only), methnone (--meth, never prunes), methrel (--meth=taps on the
+    # unconverted pairs: prunes under the relation and bands both passes on aarch64 only), methrelc
+    # (the same on the converted pairs, where the relation meets its conversion cells).
     local label="$1" where="$2" stem st sj sb2 sj16 sb1_16 sb2_16 bst sp1 bp prunes legs leg
     shift 2
     stem="sc_$(printf '%s' "$label" | tr -c 'A-Za-z0-9' '_')"
     MEM_OPTS=("$@")
     case "$where" in
-        meth | methnone) FQS=(m1.fq m2.fq) ;;
+        meth | methnone | methrelc) FQS=(m1.fq m2.fq) ;;
         *) FQS=(r1.fq r2.fq) ;;
     esac
     run_leg 4 "$stem.full" BWA3_RESCUE_PRUNE_STATS=1 "${REF_ENV[@]}"
     run_leg 4 "$stem" BWA3_RESCUE_PRUNE_STATS=1
     legs="$stem"
-    if [ "$where" = simd ]; then
+    if [ "$where" = simd ] || [ "$where" = methrel ] || [ "$where" = methrelc ]; then
         run_leg 4 "$stem.band" BWA3_RESCUE_PRUNE_STATS=1 BWA3_RESCUE_BAND_COST=100000000
         legs="$stem $stem.band"
     fi
@@ -351,7 +369,7 @@ check_scoring() { # $1 = label, $2 = expectation, rest = mem options
     sp1=$(printf '%s\n' "$bst" | tr ' ' '\n' | sed -n 's/^pass1_banded=//p')
     if [ "$has_simd" = 1 ]; then
         case "$where/$floor" in
-            simd/* | simd16/* | meth/neon) prunes=1 ;;
+            simd/* | simd16/* | meth/neon | methrel/neon | methrelc/neon) prunes=1 ;;
             *) prunes=0 ;;
         esac
         if [ "$prunes" = 1 ]; then
@@ -359,13 +377,13 @@ check_scoring() { # $1 = label, $2 = expectation, rest = mem options
         else
             [ "${sj:-0}" -eq 0 ] || fail "pruning filtered rescue jobs at $label (SIMD floor '$floor'), past its gate: $st"
         fi
-        case "$where" in
-            simd)
+        case "$where/$prunes" in
+            simd/* | methrel/1 | methrelc/1)
                 [ "${sb2:-0}" -gt 0 ] || fail "pruning narrowed no rescue window at $label: $st"
                 bp=$(grep '^\[RESCUE_BAND\]' "$stem.band.err" | tr ' ' '\n' | sed -n 's/^banded_parents=//p' || true)
                 [ "${bp:-0}" -gt 0 ] || fail "no banded parent at $label with the band cost gate opened"
                 ;;
-            simd16)
+            simd16/*)
                 sj16=$(printf '%s\n' "$st" | tr ' ' '\n' | sed -n 's/^jobs16=//p')
                 sb1_16=$(printf '%s\n' "$st" | tr ' ' '\n' | sed -n 's/^b1_16=//p')
                 sb2_16=$(printf '%s\n' "$st" | tr ' ' '\n' | sed -n 's/^b2_16=//p')
@@ -391,7 +409,68 @@ check_scoring "-A 2" simd16 -A 2
 check_scoring "--meth -B 4" meth --meth -B 4
 check_scoring "--meth genomic" meth --meth --meth-scoring genomic
 check_scoring "--meth collapsed" methnone --meth
-check_scoring "--meth=taps" methnone --meth=taps
+check_scoring "--meth=taps collapsed" methnone --meth=taps --meth-scoring collapsed
+# Collapsed scoring at -B 4 passes the lemma, so only the relation's own guard (the collapsed matrix
+# frees the mirror cell, rescue_meth_rel_matrix_ok) keeps TAPS from filtering under the relation.
+check_scoring "--meth=taps collapsed -B 4" methnone --meth=taps --meth-scoring collapsed -B 4
+check_scoring "--meth=taps" methrel --meth=taps
+check_scoring "--meth=taps genomic" methrel --meth=taps --meth-scoring genomic
+check_scoring "--meth=taps converted" methrelc --meth=taps
+
+# The --meth levers at their other values, each against the reference of its check_scoring block
+# above (same reads and options): BWA3_RESCUE_BAND_METH=2 bands pass 0 on top of EM-seq's
+# converted-copy pruning (every bandable hull banded), BWA3_RESCUE_PRUNE_REL=2 filters EM-seq under
+# the relation, and on TAPS BWA3_RESCUE_BAND_METH=0 prunes without banding and
+# BWA3_RESCUE_PRUNE_REL=0 falls back to converted copies, which TAPS's cost gate then refuses.
+lever_note=""
+check_lever() { # $1 = reference stem, $2 = label, $3 = read set (m or r), $4 = expectation, rest = env
+    local ref="$1" label="$2" rs="$3" want="$4" stem st sj sb2 bst sp1 bp
+    shift 4
+    stem="$ref.lever_$(printf '%s' "$label" | tr -c 'A-Za-z0-9' '_')"
+    case "$ref" in
+        sc___meth_genomic) MEM_OPTS=(--meth --meth-scoring genomic) ;;
+        sc___meth_taps) MEM_OPTS=(--meth=taps) ;;
+        *) fail "check_lever: unknown reference $ref" ;;
+    esac
+    if [ "$rs" = m ]; then FQS=(m1.fq m2.fq); else FQS=(r1.fq r2.fq); fi
+    run_leg 4 "$stem" BWA3_RESCUE_PRUNE_STATS=1 "$@"
+    MEM_OPTS=()
+    FQS=(r1.fq r2.fq)
+    if ! cmp -s "$ref.full.sam" "$stem.sam"; then
+        echo "FAIL: $label differs from the reference at the same options (-t 4):" >&2
+        diff "$ref.full.sam" "$stem.sam" | head -20 >&2 || true
+        exit 1
+    fi
+    st="$(grep '^\[RESCUE_PRUNE\]' "$stem.err" || true)"
+    bst="$(grep '^\[RESCUE_BAND\]' "$stem.err" || true)"
+    sj=$(printf '%s\n' "$st" | tr ' ' '\n' | sed -n 's/^jobs=//p')
+    sb2=$(printf '%s\n' "$st" | tr ' ' '\n' | sed -n 's/^b2=//p')
+    sp1=$(printf '%s\n' "$bst" | tr ' ' '\n' | sed -n 's/^pass1_banded=//p')
+    bp=$(printf '%s\n' "$bst" | tr ' ' '\n' | sed -n 's/^banded_parents=//p')
+    if [ "$has_simd" = 1 ] && [ "$floor" = neon ]; then
+        case "$want" in
+            parents) [ "${bp:-0}" -gt 0 ] || fail "$label banded no parent: $bst" ;;
+            narrowed) [ "${sb2:-0}" -gt 0 ] || fail "$label narrowed no window: $st" ;;
+            unbanded)
+                [ "${sj:-0}" -gt 0 ] || fail "$label filtered no job: $st"
+                if [ "${bp:-0}" -gt 0 ] || [ "${sp1:-0}" -gt 0 ]; then
+                    fail "$label banded with --meth banding off: $bst"
+                fi
+                ;;
+            unpruned)
+                [ "${sj:-0}" -eq 0 ] || fail "$label filtered jobs past TAPS's converted-copy cost gate: $st"
+                [ "${sp1:-0}" -gt 0 ] || fail "$label banded no pass-1 job: $bst"
+                ;;
+        esac
+    fi
+    lever_note="$lever_note; $label: jobs=${sj:-0} b2=${sb2:-0} banded_parents=${bp:-0} pass1_banded=${sp1:-0}"
+}
+check_lever sc___meth_genomic "EM-seq genomic BAND_METH=2" m parents BWA3_RESCUE_BAND_METH=2 \
+    BWA3_RESCUE_BAND_COST=100000000
+check_lever sc___meth_genomic "EM-seq genomic PRUNE_REL=2" m narrowed BWA3_RESCUE_PRUNE_REL=2
+check_lever sc___meth_taps "TAPS BAND_METH=0" r unbanded BWA3_RESCUE_BAND_METH=0
+check_lever sc___meth_taps "TAPS PRUNE_REL=0" r unpruned BWA3_RESCUE_PRUNE_REL=0
+sc_note="$sc_note$lever_note"
 
 # Forced tiers: the reference and default legs under each listed tier the host
 # has must equal the unforced reference. Ranked against the dispatcher's own
