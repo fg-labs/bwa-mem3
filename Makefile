@@ -693,6 +693,17 @@ src/%.avx512bw.o: src/%.cpp
 
 NATIVE_KERNEL_OBJS = src/kswv.native.o src/bandedSWA.native.o
 
+# Extra compile flags for a test TU that defines its own calloc (today
+# test/bns_zero_calloc_test.cpp and test/mem_gen_alt_zero_calloc_test.cpp).
+# Such a calloc is malloc + memset, and GCC at -O2 and above folds that pair
+# back into a call to calloc -- i.e. into itself, so the test hangs. Disabling
+# the malloc builtin stops the fold. Upstream GCC 11 through 15 all do it;
+# toolchains that default to _FORTIFY_SOURCE=3 (e.g. Ubuntu 24.04's) dodge it
+# only by accident, because memset becomes __memset_chk. Clang does not fold
+# inside a function named calloc but accepts the flag. Part of FLAGS_SIG so an
+# object built without it is rebuilt.
+CALLOC_INTERPOSE_CXXFLAGS = -fno-builtin-malloc
+
 # Every object also depends on the compile flags themselves, for two reasons.
 #
 # Flags that change without any source changing must invalidate the objects
@@ -712,7 +723,7 @@ NATIVE_KERNEL_OBJS = src/kswv.native.o src/bandedSWA.native.o
 # cost a full rebuild, while a command-line flag change must. Same
 # write-only-if-changed trick as src/version.h below.
 FLAGS_STAMP = .build-flags
-FLAGS_SIG = CXX=$(CXX)|CC=$(CC)|CXXFLAGS=$(CXXFLAGS)|BASE_CXXFLAGS=$(BASE_CXXFLAGS)|CFLAGS=$(CFLAGS)|CPPFLAGS=$(CPPFLAGS)|INCLUDES=$(INCLUDES)|LIBSAIS_CFLAGS=$(LIBSAIS_CFLAGS)|TIERS=$(KERNEL_FLAGS_sse41),$(KERNEL_FLAGS_sse42),$(KERNEL_FLAGS_avx),$(KERNEL_FLAGS_avx2),$(KERNEL_FLAGS_avx512bw)
+FLAGS_SIG = CXX=$(CXX)|CC=$(CC)|CXXFLAGS=$(CXXFLAGS)|BASE_CXXFLAGS=$(BASE_CXXFLAGS)|CFLAGS=$(CFLAGS)|CPPFLAGS=$(CPPFLAGS)|INCLUDES=$(INCLUDES)|LIBSAIS_CFLAGS=$(LIBSAIS_CFLAGS)|CALLOC_INTERPOSE_CXXFLAGS=$(CALLOC_INTERPOSE_CXXFLAGS)|TIERS=$(KERNEL_FLAGS_sse41),$(KERNEL_FLAGS_sse42),$(KERNEL_FLAGS_avx),$(KERNEL_FLAGS_avx2),$(KERNEL_FLAGS_avx512bw)
 
 # Passed through the ENVIRONMENT and expanded double-quoted in the recipe, not
 # interpolated by make into single quotes. `printf '%s\n' '$(FLAGS_SIG)'` puts the
@@ -1029,7 +1040,7 @@ test/packed_text_overflow_nbases_test.o: test/packed_text_overflow_nbases_test.c
 mem_gen_alt_zero_calloc_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/mem_gen_alt_zero_calloc_test.o
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/mem_gen_alt_zero_calloc_test.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
 test/mem_gen_alt_zero_calloc_test.o: test/mem_gen_alt_zero_calloc_test.cpp
-	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
+	$(CXX) -c $(CXXFLAGS) $(CALLOC_INTERPOSE_CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
 
 # err_fgets must name EOF as EOF, not a stale strerror. Links libbwa for
 # err_fgets / _err_fatal_simple; forked child captures the abort diagnostic.
@@ -1262,7 +1273,7 @@ test/pwrite_all_status_test.o: test/pwrite_all_status_test.cpp
 	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
 
 test/bns_zero_calloc_test.o: test/bns_zero_calloc_test.cpp
-	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
+	$(CXX) -c $(CXXFLAGS) $(CALLOC_INTERPOSE_CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
 
 # Header-only: exercises BamRecScratch::grow() geometric growth. Uses no lib
 # symbols (POD kstring_t + malloc/free), so it links against libc alone.
