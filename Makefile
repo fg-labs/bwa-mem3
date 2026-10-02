@@ -701,7 +701,8 @@ NATIVE_KERNEL_OBJS = src/kswv.native.o src/bandedSWA.native.o
 # toolchains that default to _FORTIFY_SOURCE=3 (e.g. Ubuntu 24.04's) dodge it
 # only by accident, because memset becomes __memset_chk. Clang does not fold
 # inside a function named calloc but accepts the flag. Part of FLAGS_SIG so an
-# object built without it is rebuilt.
+# object built without it is rebuilt. test/regression/calloc_interpose_flag_lint.sh
+# fails if a calloc-defining test's recipe does not pass it.
 CALLOC_INTERPOSE_CXXFLAGS = -fno-builtin-malloc
 
 # Every object also depends on the compile flags themselves, for two reasons.
@@ -1175,6 +1176,8 @@ test: test-binaries $(STANDALONE_TESTS_IN_TEST_TARGET) kvec_alloc_fail_test klib
 	BWA_MEM3=./bwa-mem3 ./test/regression/repeat_chain_extension_window.sh
 	./test/regression/ndebug_gate_lint_selftest.sh
 	./test/regression/ndebug_gate_lint.sh
+	./test/regression/calloc_interpose_flag_lint_selftest.sh
+	./test/regression/calloc_interpose_flag_lint.sh
 	./test/regression/debug_macro_flag_lint_selftest.sh
 	./test/regression/debug_macro_flag_lint.sh
 	./test/regression/shell_lint_selftest.sh

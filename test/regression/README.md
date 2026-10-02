@@ -10,9 +10,10 @@ which builds the canonical row's configuration (Linux x86_64, avx2, clang-19)
 three more ways -- every opt-in debug macro on (rerunning `chr22_parity.sh`
 against it), `TESTING_BUILD=1`, and `ASAN=1` (rerunning `header_parity.sh`
 against it) -- in parallel with the matrix rather than at the end of the
-canonical row; and the `ndebug_gate_lint*`, `debug_macro_flag_lint*`, `shell_lint*`,
-`regression_coverage_lint*`, `readme_contract_lint*` and `rescue_docs_lint*` pairs
-need no binary at all and run from `ndebug-gate-lint`, `debug-macro-flag-lint`,
+canonical row; and the `ndebug_gate_lint*`, `debug_macro_flag_lint*`,
+`calloc_interpose_flag_lint*`, `shell_lint*`, `regression_coverage_lint*`,
+`readme_contract_lint*` and `rescue_docs_lint*` pairs need no binary at all and
+run from `ndebug-gate-lint`, `debug-macro-flag-lint`, `calloc-interpose-flag-lint`,
 `shell-lint`, `regression-coverage-lint`, `readme-contract-lint` and
 `rescue-docs-lint` respectively. Each script:
 
@@ -74,6 +75,8 @@ parity or byte-identity, so nothing here scopes it.)
 | `ndebug_gate_lint_selftest.sh` | the lint above still flags real gates, so its `PASS` means something | "NDEBUG gate lint still detects gates"              |
 | `debug_macro_flag_lint.sh`   | the opt-in macro build's `-D` list and the `BWA_MEM3_DEBUG_*` macros in `src/` still name each other | "Opt-in macro -D list matches the macros in src/"   |
 | `debug_macro_flag_lint_selftest.sh` | the lint above still detects a drifted list, so its `PASS` means something | "Macro list lint still detects drift"               |
+| `calloc_interpose_flag_lint.sh` | every `test/` source that defines its own `calloc` is compiled with `$(CALLOC_INTERPOSE_CXXFLAGS)`, so GCC cannot fold its malloc + memset into a call to itself | "Calloc-defining tests pass CALLOC_INTERPOSE_CXXFLAGS" |
+| `calloc_interpose_flag_lint_selftest.sh` | the lint above still rejects a calloc-defining test built without the flag, so its `PASS` means something | "Calloc flag lint still detects a missing flag" |
 | `shell_lint.sh`              | every tracked `*.sh` is shellcheck-clean and shfmt-formatted           | "Tracked shell scripts are shellcheck-clean and shfmt-formatted" |
 | `shell_lint_selftest.sh`     | the lint above still rejects bad scripts, so its `PASS` means something | "Shell lint still detects bad scripts"             |
 | `regression_coverage_lint.sh` | every script in this directory is named by a CI workflow, or by a Makefile target CI invokes — not just by `make test` | "Every regression script is run by CI"              |
@@ -105,6 +108,7 @@ at.
 |------|---------------------|-----------|
 | `ndebug_gate_lint.sh`         | directory to scan (default `src/`)                  | `ndebug_gate_lint_selftest.sh`         |
 | `debug_macro_flag_lint.sh`    | repository root to check (default: this repository) | `debug_macro_flag_lint_selftest.sh`    |
+| `calloc_interpose_flag_lint.sh` | repository root to check (default: this repository) | `calloc_interpose_flag_lint_selftest.sh` |
 | `regression_coverage_lint.sh` | repository root to check (default: this repository) | `regression_coverage_lint_selftest.sh` |
 | `readme_contract_lint.sh`     | repository root to check (default: this repository) | `readme_contract_lint_selftest.sh`     |
 | `rescue_docs_lint.sh`         | repository root to check (default: this repository) | `rescue_docs_lint_selftest.sh`         |
