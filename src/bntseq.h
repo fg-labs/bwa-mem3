@@ -121,6 +121,9 @@ extern "C" {
 
 	void bns_dump(const bntseq_t *bns, const char *prefix);
 	bntseq_t *bns_restore(const char *prefix);
+	/* Build the .pac path bns_restore opens for `prefix` ("<prefix>.pac") into
+	 * `out` (sized `outsz`, e.g. PATH_MAX); aborts if it would not fit. */
+	void bns_pac_path(char *out, size_t outsz, const char *prefix);
 	bntseq_t *bns_restore_core(const char *ann_filename, const char* amb_filename, const char* pac_filename);
 	void bns_destroy(bntseq_t *bns);
 	int64_t bns_fasta2bntseq(gzFile fp_fa, const char *prefix, int for_only);
