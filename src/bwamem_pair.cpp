@@ -330,8 +330,8 @@ static bool rescue_prune_enabled()
 }
 /* The hit gate: BWA3_RESCUE_PRUNE_MAX_HITS, else rescue_prune_max_hits_default (rescue_prune.h,
  * which the band harness shares). band_parents: this run bands its pruned parents (always without
- * --meth; under --meth where rescue_band_meth_on holds, as for a relation run). Run-constant; the
- * caller reads it once per call. */
+ * --meth; under --meth where rescue_band_meth_on holds, as for a relation run). Run-constant
+ * (rescue_run). */
 static int rescue_prune_max_hits(const mem_opt_t *opt, bool band_parents)
 {
     static const int env = rescue_env_int("BWA3_RESCUE_PRUNE_MAX_HITS", -1);
@@ -522,10 +522,6 @@ static bool rescue_prune_runs(const mem_opt_t *opt, const rescue_prune_params &p
         && rescue_prune_cost_ok(p, opt->meth_mode != 0,
                                 opt->meth_chem == METH_CHEM_EMSEQ || rescue_meth_rel(opt), avx512);
 }
-static bool rescue_prune_runs(const mem_opt_t *opt)
-{
-    return rescue_prune_runs(opt, rescue_prune_params_for(opt));
-}
 
 /* --meth banding (both passes, the group's matrix) where --meth pruning is off or filters under the
  * relation (TAPS): there the band pays, while on top of converted-copy pruning (EM-seq) it costs more
@@ -557,6 +553,72 @@ static bool rescue_band_meth_on(const mem_opt_t *opt, bool run_prunes)
 static bool rescue_prune_applies(const mem_opt_t *opt, bool run_prunes)
 {
     return run_prunes && !opt->rescue_kmer;
+}
+
+/* The run-constant rescue decisions, derived from mem_opt_t once per run (rescue_run below) and
+ * read by every mem_matesw_batch_pre / mem_matesw_batch_post call and by mem_sam_pe_batch: the
+ * pruning parameters (rescue_prune_params_for), whether pruning runs (rescue_prune_runs), with it
+ * whether _pre records a narrowing offset per regid for _post to read (record_narrow, also with
+ * --rescue-kmer), whether --meth filters under the relation (rescue_meth_rel) and the parameter set
+ * each hypothesis takes (pp_ot / pp_ob: the relation, set_meth_rel, or the conversion, set_meth),
+ * whether pruned parents are banded (band_parents: always without --meth; under --meth where
+ * rescue_band_meth_on holds), the scoring the band kernels take (rescue_band_scoring_for; _pre sets
+ * it on its batch before planning), whether banded pass 1 runs (rescue_band_runs) and the hit gate
+ * (rescue_prune_max_hits). Deriving them per _pre call cost 0.18 % of the cycles of a default run
+ * (an aarch64 host at the NEON tier, wes-5M, -t 16, perf: rescue_prune_params::from's divisions
+ * and rescue_prune_runs, once per anchor and before the orientation check that returns most calls
+ * early), the regression #541 left at the default scoring. */
+struct rescue_run_t {
+    /* The inputs the decisions are derived from, so a mem_opt_t rebuilt at the same address or
+     * edited in place is derived anew: the opt, the fields the derivation reads (RESCUE_RUN_KEYS of
+     * them, rescue_run_key) and, under --meth, the two matrices (rescue_meth_rel). */
+    static const int RESCUE_RUN_KEYS = 10;
+    const mem_opt_t *opt = NULL;
+    int key[RESCUE_RUN_KEYS] = {0};
+    int8_t mat_ot[25] = {0}, mat_ob[25] = {0};
+    rescue_prune_params pp, pp_ot, pp_ob;
+    rb_scoring band_sc;
+    bool prunes = false, record_narrow = false, meth_rel = false, band_parents = false, band_runs = false;
+    int max_hits = 0;
+};
+static void rescue_run_key(const mem_opt_t *opt, int key[rescue_run_t::RESCUE_RUN_KEYS])
+{
+    key[0] = opt->a; key[1] = opt->b; key[2] = opt->o_del; key[3] = opt->e_del; key[4] = opt->o_ins;
+    key[5] = opt->e_ins; key[6] = opt->min_seed_len; key[7] = opt->meth_mode; key[8] = opt->meth_chem;
+    key[9] = opt->rescue_kmer;
+}
+static void rescue_run_derive(rescue_run_t &r, const mem_opt_t *opt, const int key[rescue_run_t::RESCUE_RUN_KEYS])
+{
+    r.opt = opt;
+    memcpy(r.key, key, sizeof r.key);
+    memcpy(r.mat_ot, opt->mat_ot, sizeof r.mat_ot);
+    memcpy(r.mat_ob, opt->mat_ob, sizeof r.mat_ob);
+    r.pp = rescue_prune_params_for(opt);
+    r.prunes = rescue_prune_runs(opt, r.pp);
+    r.record_narrow = opt->rescue_kmer || r.prunes;
+    r.meth_rel = rescue_meth_rel(opt);
+    r.band_parents = r.prunes && rescue_band_enabled()
+                     && (!opt->meth_mode || rescue_band_meth_on(opt, r.prunes));
+    r.band_sc = rb_scoring::from(r.pp);
+    r.band_runs = rescue_band_runs(opt);
+    r.max_hits = r.prunes ? rescue_prune_max_hits(opt, r.band_parents) : 0;
+    r.pp_ot = r.pp; r.pp_ob = r.pp;
+    if (r.meth_rel) { r.pp_ot.set_meth_rel(1); r.pp_ob.set_meth_rel(0); }
+    else if (opt->meth_mode) { r.pp_ot.set_meth(1); r.pp_ob.set_meth(0); }
+}
+/* The decisions for opt: this thread's copy, derived when opt or the fields they read change (one
+ * run has one mem_opt_t, so once per thread). _pre and _post may run on different threads for the
+ * same tid; each derives its own. */
+static const rescue_run_t &rescue_run(const mem_opt_t *opt)
+{
+    static thread_local rescue_run_t r;
+    int key[rescue_run_t::RESCUE_RUN_KEYS];
+    rescue_run_key(opt, key);
+    if (r.opt != opt || memcmp(key, r.key, sizeof key) != 0
+        || (opt->meth_mode && (memcmp(r.mat_ot, opt->mat_ot, sizeof r.mat_ot) != 0
+                               || memcmp(r.mat_ob, opt->mat_ob, sizeof r.mat_ob) != 0)))
+        rescue_run_derive(r, opt, key);
+    return r;
 }
 
 /* The oriented mate as the rescue SW sees it: the read itself, or its reverse complement (N,
@@ -1230,12 +1292,12 @@ int mem_sam_pe_batch(const mem_opt_t *opt, mem_cache *mmc,
                       "meth mate-rescue matrix not expressible by the batched kernel "
                       "(neither a single freed cell nor a collapsed mirror pair)");
 
-        /* Run-constant, once per batch: the length sort (with --rescue-kmer or pruning) and
-         * --meth banding, both passes (rescue_band_meth_on, at a scoring the band kernels take). */
-        const bool run_prunes = rescue_prune_runs(opt);
-        const bool meth_sort = opt->rescue_kmer || run_prunes;
-        const rb_scoring meth_band_sc = rescue_band_scoring_for(opt);
-        const bool meth_band = rescue_band_meth_on(opt, run_prunes) && meth_band_sc.valid();
+        /* Run-constant (rescue_run): the length sort (with --rescue-kmer or pruning) and --meth
+         * banding, both passes (rescue_band_meth_on, at a scoring the band kernels take). */
+        const rescue_run_t &run = rescue_run(opt);
+        const bool meth_sort = run.record_narrow;
+        const rb_scoring &meth_band_sc = run.band_sc;
+        const bool meth_band = rescue_band_meth_on(opt, run.prunes) && meth_band_sc.valid();
         // hyp == 1 -> OT (mat_ot / pwsw_ot); hyp == 0 -> OB (mat_ob / pwsw_ob).
         // -1 (non-meth) cannot occur here: every enqueued pair under meth_mode
         // was tagged with a real hypothesis in mem_matesw_batch_pre. Process
@@ -1308,7 +1370,8 @@ int mem_sam_pe_batch(const mem_opt_t *opt, mem_cache *mmc,
                           opt->a, -1*opt->b, nthreads,
                           maxRefLen, maxQerLen);
 
-    if (opt->rescue_kmer || rescue_prune_runs(opt)) matesw_sort_partitions_by_len(seqPairArray, pcnt8, pcnt);
+    const rescue_run_t &run = rescue_run(opt);
+    if (run.record_narrow) matesw_sort_partitions_by_len(seqPairArray, pcnt8, pcnt);
     /* Banded parents first (stable, so the kswv remainder keeps its length sort). */
     const int64_t n_banded = band_reset.b ? band_reset.b->partition(seqPairArray, (int)pcnt8) : 0;
 
@@ -1320,9 +1383,9 @@ int mem_sam_pe_batch(const mem_opt_t *opt, mem_cache *mmc,
      * which also keeps BWA3_RESCUE_PRUNE=0 the whole pre-pruning path -- and the banding path (a
      * NEON or AVX2 band kernel; off under BWA3_RESCUE_BAND=0). It does not depend on pruning's
      * cost gate: the pass-1 band comes from the pass-0 result alone. */
-    const bool p1_band_any = rescue_band_runs(opt) && rescue_band_enabled();
+    const bool p1_band_any = run.band_runs && rescue_band_enabled();
     if (p1_band_any) band_reset.b = &matesw_band(mmc, tid);   // pass 1 needs a batch even with no plan
-    if (band_reset.b) band_reset.b->set_scoring(rescue_band_scoring_for(opt));
+    if (band_reset.b) band_reset.b->set_scoring(run.band_sc);
     mem_sam_pe_batch_run(pwsw.get(), seqPairArray, seqBufRef, seqBufQer,
                          aln, pcnt, pcnt8, nthreads, n_banded, band_reset.b, p1_band_any);
 
@@ -1749,28 +1812,7 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
     for (r = 0; r < 4; ++r)
         skip[r] = pes[r].failed? 1 : 0;
 
-    /* The run-constant rescue decisions, once per call instead of per anchor: the pruning
-     * parameters, whether pruning runs (rescue_prune_runs), and with it whether a narrowing offset
-     * is recorded for _post, whether --meth filters under the relation (rescue_meth_rel) and whether
-     * pruned parents are banded (always without --meth; under --meth where rescue_band_meth_on
-     * holds). Pass-0 band plans are made at the run's scoring (under --meth mem_sam_pe_batch adds
-     * each group's matrix before running them), so the batch takes it here. */
-    const rescue_prune_params run_pp = rescue_prune_params_for(opt);
-    const bool run_prunes = rescue_prune_runs(opt, run_pp);
-    const bool record_narrow = opt->rescue_kmer || run_prunes;
-    const bool meth_rel = rescue_meth_rel(opt);
-    const bool band_parents = run_prunes && rescue_band_enabled()
-                              && (!opt->meth_mode || rescue_band_meth_on(opt, run_prunes));
-    if (band_parents) matesw_band(mmc, tid).set_scoring(rb_scoring::from(run_pp));
-    const int run_max_hits = run_prunes ? rescue_prune_max_hits(opt, band_parents) : 0;
-    /* --meth: the pair's hypothesis (as tagged at enqueue: 1 OT, 0 OB) selects the relation
-     * (rescue_prune_params::set_meth_rel) or the conversion (set_meth) the filter applies; both
-     * parameter sets are made here, once. */
-    rescue_prune_params run_pp_ot = run_pp, run_pp_ob = run_pp;
-    if (meth_rel) { run_pp_ot.set_meth_rel(1); run_pp_ob.set_meth_rel(0); }
-    else if (opt->meth_mode) { run_pp_ot.set_meth(1); run_pp_ob.set_meth(0); }
-
-    for (i = 0; i < ma->n; ++i) { // check which orinentation has been found        
+    for (i = 0; i < ma->n; ++i) { // check which orinentation has been found
         int64_t dist;
         r = mem_infer_dir(l_pac, a->rb, ma->a[i].rb, &dist);
         if (dist >= pes[r].low && dist <= pes[r].high) {
@@ -1778,12 +1820,25 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
         }
     }
 
-    
+
     if (skip[0] + skip[1] + skip[2] + skip[3] == 4) //return pcnt; // consistent pair exist; no need to perform SW
     {
         gar[gcnt + 3] = gar[gcnt + 2] = gar[gcnt + 1] = gar[gcnt + 0] = -1;
         return pcnt;
     }
+
+    /* The run-constant rescue decisions (rescue_run, derived once per run; read after the check
+     * above, which returns most calls): the pruning parameters, whether pruning runs
+     * (rescue_prune_runs), and with it whether a narrowing offset is recorded for _post, and whether
+     * pruned parents are banded (always without --meth; under --meth where rescue_band_meth_on
+     * holds). Pass-0 band plans are made at the run's scoring (under --meth mem_sam_pe_batch adds
+     * each group's matrix before running them), so the batch takes it here. */
+    const rescue_run_t &run = rescue_run(opt);
+    const bool run_prunes = run.prunes;
+    const bool record_narrow = run.record_narrow;
+    const bool band_parents = run.band_parents;
+    if (band_parents) matesw_band(mmc, tid).set_scoring(run.band_sc);
+    const int run_max_hits = run.max_hits;
 
     /* D3 (--meth): score the ORIGINAL (unconverted) mate bases, exactly as
      * mem_matesw_batch_post's scalar path does. Without this the batched kernel
@@ -1926,11 +1981,12 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
             if (pruned) {
                 if ((int)oq.size() < l_ms) oq.resize(l_ms);
                 matesw_orient(ms, l_ms, is_rev, oq.data());
-                /* Under --meth the pair's hypothesis picks the converted parameter set (run_pp_ot /
-                 * run_pp_ob); only the batched meth rescue reaches here, since the scalar escape
-                 * hatch returns earlier. */
-                const rescue_prune_params &pp = !opt->meth_mode ? run_pp
-                                              : ((mate_meth_ot ^ is_rev) & 1) ? run_pp_ot : run_pp_ob;
+                /* Under --meth the pair's hypothesis (as tagged at enqueue: 1 OT, 0 OB) picks the
+                 * parameter set with the relation (rescue_prune_params::set_meth_rel) or the
+                 * conversion (set_meth) the filter applies (run.pp_ot / pp_ob); only the batched meth
+                 * rescue reaches here, since the scalar escape hatch returns earlier. */
+                const rescue_prune_params &pp = !opt->meth_mode ? run.pp
+                                              : ((mate_meth_ot ^ is_rev) & 1) ? run.pp_ot : run.pp_ob;
                 int hb, he;
                 rescue_prune_view view;
                 const uint64_t tf0 = g_rescue_prune_stats.on ? rescue_now_ns() : 0;
@@ -2238,8 +2294,8 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
         ms = ms2;
     }
 
-    /* Whether _pre recorded a narrowing offset per regid (its record_narrow), once per call. */
-    const bool narrowed = opt->rescue_kmer || rescue_prune_runs(opt);
+    /* Whether _pre recorded a narrowing offset per regid (rescue_run's record_narrow). */
+    const bool narrowed = rescue_run(opt).record_narrow;
     for (r = 0; r < 4; ++r) {
         int is_rev, is_larger;
         uint8_t *seq = 0, *rev = 0, *ref = 0;
