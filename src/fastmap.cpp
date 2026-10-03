@@ -1803,7 +1803,9 @@ static int meth_orig_ref_load_handles(const char *prefix,
     }
     /* bns_restore left .pac open in bns->fp_pac; slurp it whole (in parallel,
      * same as the seed index) and close it. Shared with bwa_idx_load_ele. */
-    pac_slurp_and_close(&bns->fp_pac, pac, pac_bytes, pread_workers);
+    char pac_path[PATH_MAX];
+    bns_pac_path(pac_path, sizeof(pac_path), prefix);
+    pac_slurp_and_close(&bns->fp_pac, pac_path, pac, pac_bytes, pread_workers);
 
     *bns_out = bns;
     *pac_out = pac;

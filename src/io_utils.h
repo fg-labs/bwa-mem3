@@ -124,9 +124,12 @@ size_t fmi_pread_request_size(size_t remaining);
 
 /* Read the next `nbytes` of `fp` into `dst` using up to `nthreads` pread
  * workers, then leave the stream positioned exactly past them so a following
- * sequential read still lands correctly. Aborts the process on a read error or
+ * sequential read still lands correctly. `path` is the file `fp` was opened
+ * from: each worker past the first reopens it to read through its own
+ * descriptor, falling back to `fp`'s (with a warning) if the reopen fails or
+ * `path` now names a different file. Aborts the process on a read error or
  * short file. */
-void fmi_pread_from_stream(FILE *fp, void *dst, size_t nbytes, int nthreads);
+void fmi_pread_from_stream(FILE *fp, const char *path, void *dst, size_t nbytes, int nthreads);
 
 /* Worker count for the index load: the caller's request clamped to [1, 8]
  * (bandwidth-bound past ~8), overridable via BWA3_LOAD_THREADS (clamped to 64).

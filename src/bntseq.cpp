@@ -207,6 +207,11 @@ bntseq_t *bns_restore_core(const char *ann_filename, const char* amb_filename, c
 	err_fatal(__func__, "Parse error reading %s\n", fname);
 }
 
+void bns_pac_path(char *out, size_t outsz, const char *prefix)
+{
+	bns_build_path(out, outsz, prefix, ".pac");
+}
+
 bntseq_t *bns_restore(const char *prefix)
 {  
 	char ann_filename[PATH_MAX], amb_filename[PATH_MAX], pac_filename[PATH_MAX], alt_filename[PATH_MAX];
@@ -214,7 +219,7 @@ bntseq_t *bns_restore(const char *prefix)
 	bntseq_t *bns;
 	bns_build_path(ann_filename, sizeof(ann_filename), prefix, ".ann");
 	bns_build_path(amb_filename, sizeof(amb_filename), prefix, ".amb");
-	bns_build_path(pac_filename, sizeof(pac_filename), prefix, ".pac");
+	bns_pac_path(pac_filename, sizeof(pac_filename), prefix);
 	bns = bns_restore_core(ann_filename, amb_filename, pac_filename);
 	if (bns == 0) return 0;
 	bns_build_path(alt_filename, sizeof(alt_filename), prefix, ".alt");

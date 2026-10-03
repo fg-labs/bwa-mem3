@@ -44,9 +44,7 @@ Authors: Sanchit Misra <sanchit.misra@intel.com>; Vasimuddin Md <vasimuddin.md@i
 #include <unistd.h>       /* pread, _exit */
 #include <sys/mman.h>     /* munmap */
 #include <sys/stat.h>     /* fstat */
-#if defined(__linux__)
-#include <fcntl.h>        /* posix_fadvise */
-#endif
+#include <fcntl.h>        /* open (per-worker index fds), posix_fadvise */
 #include "bwa_madvise.h"
 #include "bwa_shm.h"
 #include "utils.h"        /* ATTRIBUTE, err_fread_noeof */
@@ -62,8 +60,9 @@ Authors: Sanchit Misra <sanchit.misra@intel.com>; Vasimuddin Md <vasimuddin.md@i
  * otherwise slurped by a single-threaded fread whose warm-cache cost is one
  * core's page-fault + memcpy bandwidth out of the page cache (~0.8 s on hg38).
  * Splitting each big array across a few workers is memory-bandwidth bound and
- * cuts that ~4x. pread (not read) lets every worker share one fd without
- * touching the shared file offset, so no locking is needed.
+ * cuts that ~4x. pread (not read) means no worker touches a shared file
+ * offset, so no locking is needed; each worker also reads through its own
+ * descriptor (see open_worker_fd).
  *
  * The destination stays the _mm_malloc'd + MADV_HUGEPAGE buffer, so the
  * transparent-hugepage coverage the hot Occ-lookup loop relies on is preserved
@@ -122,6 +121,26 @@ void pread_chunk_fail(const char *fmt, ...)
     _exit(EXIT_FAILURE);
 }
 
+/* Open a private read descriptor on `path` for one pread worker, or return
+ * `shared_fd` if that fails or `path` no longer names the file behind
+ * `shared_fd` (replaced since it was opened -- reading it would splice two
+ * files' bytes into one array). A private descriptor is what keeps the load
+ * fast on S3 Mountpoint: its prefetcher keeps one sequential cursor per open
+ * file and resets on every jump, so workers sharing a descriptor stall at
+ * random-read throughput (awslabs/mountpoint-s3#1886). */
+int open_worker_fd(const char *path, int shared_fd)
+{
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return shared_fd;
+    struct stat mine, shared;
+    if (fstat(fd, &mine) != 0 || fstat(shared_fd, &shared) != 0
+        || mine.st_dev != shared.st_dev || mine.st_ino != shared.st_ino) {
+        close(fd);
+        return shared_fd;
+    }
+    return fd;
+}
+
 void *pread_chunk_worker(void *arg)
 {
     PreadChunk *c = static_cast<PreadChunk *>(arg);
@@ -152,8 +171,11 @@ void *pread_chunk_worker(void *arg)
     return NULL;
 }
 
-// Read `nbytes` at file offset `off` into `dst` using up to `nthreads` workers.
-void parallel_pread(int fd, void *dst, size_t nbytes, off_t off, int nthreads)
+// Read `nbytes` at file offset `off` of `path` into `dst` using up to
+// `nthreads` workers. Chunk 0 reads through `shared_fd` (already open on
+// `path`); every other chunk gets its own descriptor from open_worker_fd.
+void parallel_pread(int shared_fd, const char *path, void *dst, size_t nbytes,
+                    off_t off, int nthreads)
 {
     if (nbytes == 0) return;
     nthreads = fmi_pread_worker_count(nbytes, nthreads);
@@ -162,11 +184,20 @@ void parallel_pread(int fd, void *dst, size_t nbytes, off_t off, int nthreads)
     std::vector<pthread_t>  tids((size_t)nthreads);
     std::vector<bool>       spawned((size_t)nthreads, false);
     size_t base = nbytes / (size_t)nthreads, rem = nbytes % (size_t)nthreads, cum = 0;
+    int n_sharing = 0;
     for (int i = 0; i < nthreads; i++) {
         size_t len = base + ((size_t)i < rem ? 1 : 0);
+        int fd = i == 0 ? shared_fd : open_worker_fd(path, shared_fd);
+        if (i > 0 && fd == shared_fd) n_sharing++;
         chunks[i] = PreadChunk{ fd, (char *)dst + cum, len, off + (off_t)cum };
         cum += len;
     }
+    // Still a correct load, but one that can stall on S3 Mountpoint, so say why.
+    if (n_sharing > 0)
+        fprintf(stderr, "[W::%s] could not reopen %s for %d of %d index-load workers; "
+                "they share one descriptor, which is slow on filesystems with "
+                "per-handle read-ahead (e.g. S3 Mountpoint)\n",
+                __func__, path, n_sharing, nthreads - 1);
     // Main thread takes chunk 0; spawn workers for the rest. If a spawn fails
     // (e.g. thread limit), fall back to reading that chunk inline so the load
     // still completes correctly, just less parallel.
@@ -179,6 +210,8 @@ void parallel_pread(int fd, void *dst, size_t nbytes, off_t off, int nthreads)
     pread_chunk_worker(&chunks[0]);
     for (int i = 1; i < nthreads; i++)
         if (spawned[i]) pthread_join(tids[i], NULL);
+    for (int i = 1; i < nthreads; i++)
+        if (chunks[i].fd != shared_fd) close(chunks[i].fd);
 }
 
 }  // namespace
@@ -216,14 +249,14 @@ int index_load_threads(int n_threads)
  * stream's logical position (buffered bytes included), so it is the right
  * offset to hand pread; the fseeko afterwards drops the now-stale buffer and
  * re-anchors the stream past the array we just read behind its back. */
-void fmi_pread_from_stream(FILE *fp, void *dst, size_t nbytes, int nthreads)
+void fmi_pread_from_stream(FILE *fp, const char *path, void *dst, size_t nbytes, int nthreads)
 {
     off_t off = ftello(fp);
     if (off < 0) {
         fprintf(stderr, "ERROR: ftello failed during index load: %s\n", strerror(errno));
         exit(EXIT_FAILURE);
     }
-    parallel_pread(fileno(fp), dst, nbytes, off, nthreads);
+    parallel_pread(fileno(fp), path, dst, nbytes, off, nthreads);
     if (fseeko(fp, off + (off_t)nbytes, SEEK_SET) != 0) {
         fprintf(stderr, "ERROR: fseeko failed during index load: %s\n", strerror(errno));
         exit(EXIT_FAILURE);
@@ -717,7 +750,7 @@ void FMI_search::load_index(bool load_pac, int n_threads)
     assert_not_null(cp_occ, cp_occ_bytes, index_alloc);
     bwamem_madv_hugepage(cp_occ, cp_occ_bytes);
 
-    fmi_pread_from_stream(cpstream, cp_occ, (size_t)cp_occ_bytes, load_nt);
+    fmi_pread_from_stream(cpstream, cp_file_name, cp_occ, (size_t)cp_occ_bytes, load_nt);
     int64_t ii = 0;
     // Validate the RAW on-disk count[] before the +1 adjustment below. Doing the
     // bounds/monotonicity checks on the raw values (rather than after +1) is what
@@ -773,8 +806,8 @@ void FMI_search::load_index(bool load_pac, int n_threads)
     assert_not_null(sa_ls_word, sa_ls_bytes, index_alloc);
     bwamem_madv_hugepage(sa_ms_byte, sa_ms_bytes);
     bwamem_madv_hugepage(sa_ls_word, sa_ls_bytes);
-    fmi_pread_from_stream(cpstream, sa_ms_byte, (size_t)sa_ms_bytes, load_nt);
-    fmi_pread_from_stream(cpstream, sa_ls_word, (size_t)sa_ls_bytes, load_nt);
+    fmi_pread_from_stream(cpstream, cp_file_name, sa_ms_byte, (size_t)sa_ms_bytes, load_nt);
+    fmi_pread_from_stream(cpstream, cp_file_name, sa_ls_word, (size_t)sa_ls_bytes, load_nt);
 
     #else
 
@@ -788,8 +821,8 @@ void FMI_search::load_index(bool load_pac, int n_threads)
     assert_not_null(sa_ls_word, sa_ls_bytes, index_alloc);
     bwamem_madv_hugepage(sa_ms_byte, sa_ms_bytes);
     bwamem_madv_hugepage(sa_ls_word, sa_ls_bytes);
-    fmi_pread_from_stream(cpstream, sa_ms_byte, (size_t)sa_ms_bytes, load_nt);
-    fmi_pread_from_stream(cpstream, sa_ls_word, (size_t)sa_ls_bytes, load_nt);
+    fmi_pread_from_stream(cpstream, cp_file_name, sa_ms_byte, (size_t)sa_ms_bytes, load_nt);
+    fmi_pread_from_stream(cpstream, cp_file_name, sa_ls_word, (size_t)sa_ls_bytes, load_nt);
 
     #endif
 

@@ -13,6 +13,9 @@
 //      across an interior boundary while both ends still look right.
 //   2. The stream lands exactly past the array, because the trailing
 //      sentinel_index is still read sequentially with err_fread_noeof().
+//   3. Workers that reopen the path for their own descriptor still read the
+//      file the stream has open, even if the path has since been unlinked or
+//      replaced.
 //
 // The reads run against a synthetic temp file so no index build is needed.
 
@@ -99,7 +102,7 @@ TEST_CASE("fmi_pread_from_stream: chunked read reproduces the file bytes") {
         REQUIRE(fp != NULL);
 
         std::vector<uint8_t> dst(nbytes, 0);
-        fmi_pread_from_stream(fp, dst.data(), nbytes, nthreads);
+        fmi_pread_from_stream(fp, file.path(), dst.data(), nbytes, nthreads);
 
         CHECK(first_pattern_mismatch(dst.data(), nbytes, 0) == nbytes);
 
@@ -130,7 +133,7 @@ TEST_CASE("fmi_pread_from_stream: resumes from and restores the stream position"
         CHECK(first_pattern_mismatch(head, header, 0) == header);
 
         std::vector<uint8_t> dst(array, 0);
-        fmi_pread_from_stream(fp, dst.data(), array, nthreads);
+        fmi_pread_from_stream(fp, file.path(), dst.data(), array, nthreads);
         CHECK(first_pattern_mismatch(dst.data(), array, header) == array);
 
         // The stream must sit exactly at header + array, both by report...
@@ -156,12 +159,54 @@ TEST_CASE("fmi_pread_from_stream: zero-length read is a no-op") {
     uint8_t head[4];
     REQUIRE(fread(head, 1, sizeof(head), fp) == sizeof(head));
 
-    fmi_pread_from_stream(fp, NULL, 0, 4);
+    fmi_pread_from_stream(fp, file.path(), NULL, 0, 4);
     CHECK((size_t)ftello(fp) == sizeof(head));
 
     uint8_t next[4];
     REQUIRE(fread(next, 1, sizeof(next), fp) == sizeof(next));
     CHECK(first_pattern_mismatch(next, sizeof(next), sizeof(head)) == sizeof(next));
+
+    REQUIRE(fclose(fp) == 0);
+}
+
+TEST_CASE("fmi_pread_from_stream: reads the open file after its path is unlinked") {
+    // Workers past the first reopen the path; with nothing there any more they
+    // must fall back to the stream's own descriptor rather than fail the load.
+    const size_t nbytes = 4 * FMI_PREAD_MIN_CHUNK + 77;
+    PatternFile file(nbytes);
+
+    FILE *fp = fopen(file.path(), "rb");
+    REQUIRE(fp != NULL);
+    REQUIRE(unlink(file.path()) == 0);
+
+    std::vector<uint8_t> dst(nbytes, 0);
+    fmi_pread_from_stream(fp, file.path(), dst.data(), nbytes, 4);
+    CHECK(first_pattern_mismatch(dst.data(), nbytes, 0) == nbytes);
+
+    REQUIRE(fclose(fp) == 0);
+}
+
+TEST_CASE("fmi_pread_from_stream: reads the open file after its path is replaced") {
+    // An index rebuilt (written then renamed into place) while a load is in
+    // flight: the reopened path now names a different file, and reading from it
+    // would splice its bytes into the middle of the array.
+    const size_t nbytes = 4 * FMI_PREAD_MIN_CHUNK + 77;
+    PatternFile file(nbytes);
+
+    FILE *fp = fopen(file.path(), "rb");
+    REQUIRE(fp != NULL);
+
+    const std::string replacement_path = std::string(file.path()) + ".new";
+    FILE *out = fopen(replacement_path.c_str(), "wb");
+    REQUIRE(out != NULL);
+    std::vector<uint8_t> zeros(nbytes, 0);
+    REQUIRE(fwrite(zeros.data(), 1, nbytes, out) == nbytes);
+    REQUIRE(fclose(out) == 0);
+    REQUIRE(rename(replacement_path.c_str(), file.path()) == 0);
+
+    std::vector<uint8_t> dst(nbytes, 0);
+    fmi_pread_from_stream(fp, file.path(), dst.data(), nbytes, 4);
+    CHECK(first_pattern_mismatch(dst.data(), nbytes, 0) == nbytes);
 
     REQUIRE(fclose(fp) == 0);
 }
