@@ -870,7 +870,13 @@ TEST_CASE("kswv u16 rescue: BWA3_RESCUE_FSCAN off == on in every u16 body, and F
 //     That off == on check is what detects a gate that lets them through:
 //     FScan would open one gap at the other's cost, or rely on oe >= e. The
 //     unequal-sum regimes also match the scalar oracle (the original bodies
-//     are exact there); the negative-open ones are not checked against it.
+//     are exact there). The negative-open ones are not checked against it:
+//     with oe < e neither the kswv bodies nor the striped scalar-oracle kernel
+//     matches the exact affine-gap DP, which is why `mem` rejects a negative
+//     -O at parse (test/regression/arg_range_validation.sh). They stay here to
+//     pin the gate for callers that build a kswv directly;
+//   - a zero open (0+2 vs 1+1), the edge `mem` still accepts: oe == e, which
+//     FScan's proof allows, so it goes through FScan and must match the oracle.
 // The batch is indel-rich (multi-base insertions and deletions between exact
 // runs) so the gap costs decide scores; a non-vacuity check requires that
 // swapping the two sides' costs changes the scalar score on many pairs.
@@ -914,6 +920,7 @@ TEST_CASE("kswv rescue: the FSCAN gate keeps asymmetric gaps exact"
         {"open sums differ, adjacent gaps cheap",    20,  1, 1,  2, 1, false, true},
         {"equal sums, negative del open (-1+8 vs 6+1)", 4, -1, 8, 6, 1, false, false},
         {"equal sums, negative ins open (6+1 vs -1+8)", 4, 6, 1, -1, 8, false, false},
+        {"equal sums, zero del open (0+2 vs 1+1)",    4,  0, 2,  1, 1, true,  true},
     };
     for (const Gaps &g : regimes) {
         auto mat = bwa_tests::build_scoring_matrix(1, g.mismatch, 1);
