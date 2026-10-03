@@ -41,9 +41,10 @@
  * production runs a 16-bit job: pruned but never banded) and RB_KMAX (the largest filter K,
  * rescue_prune_params::from's k_max as production's BWA3_RESCUE_PRUNE_KMAX: 5, the default, to
  * rescue_prune_scratch_kmax; 0 draws it from [5, rescue_prune_scratch_kmax] per batch; anything else
- * is refused; under RB_METH always 5, as production keeps --meth at K = 5). With RB_KMAX other than
+ * is refused; under RB_METH too, as production takes K > 5 under --meth). With RB_KMAX other than
  * 5 and RB_SCORING=random, every third batch draws a scoring that admits K > 5 (MODE_KLONG), and a
- * run with RB_KMAX other than 5 fails if no batch filtered with K > 5.
+ * run with RB_KMAX other than 5 fails if no batch filtered with K > 5 (and, under RB_METH, if no --meth
+ * job was narrowed at K > 5, or under RB_METH_REL=expand no relation view was checked at K > 5).
  * The truth kswv runs with the batch's scoring and matrix; pass 0 is banded at every scoring the
  * filter admits and pass 1 at every scoring the band kernels take (rb_scoring::valid), under --meth
  * with the batch's matrix (rb_scoring::set_matrix). RB_NEGATIVE_CONTROL=1 (harness-only) shifts
@@ -542,10 +543,10 @@ struct Scoring { int a = 1, b = 4, o_del = 6, e_del = 1, o_ins = 6, e_ins = 1; }
 static bool g_random_scoring = false;
 static Scoring g_fixed_scoring;
 static int g_kmax = 5;   // RB_KMAX
-/* The batch's K cap: 5 under RB_METH, RB_KMAX if fixed, else a draw from [lo, kmax]. */
-static int draw_kmax(int lo = 5) { return g_meth != METH_NONE ? 5 : g_kmax > 0 ? g_kmax : rndr(lo, rescue_prune_scratch_kmax); }
-/* Whether the run asks for K > 5 (RB_KMAX 0 or 6-8) where it can have it (not under RB_METH). */
-static bool want_klong() { return g_kmax != 5 && g_meth == METH_NONE; }
+/* The batch's K cap: RB_KMAX if fixed, else a draw from [lo, kmax] (under RB_METH too). */
+static int draw_kmax(int lo = 5) { return g_kmax > 0 ? g_kmax : rndr(lo, rescue_prune_scratch_kmax); }
+/* Whether the run asks for K > 5 (RB_KMAX 0 or 6-8). */
+static bool want_klong() { return g_kmax != 5; }
 enum { MODE_DEFAULTS, MODE_DEGENERATE, MODE_CHEAP_GAP, MODE_SPLIT_CELLS, MODE_BYTE_GAP, MODE_RANDOM, MODE_KLONG, NMODES };
 static long g_draws = 0, g_mode_n[NMODES] = {0};
 static long g_admitted_bad = 0;   // scorings from() or rb_scoring::valid() admitted but must refuse
@@ -648,7 +649,7 @@ static int run_eq(std::vector<Job> &all_jobs, int k_default, int max_hits, int s
 {
     long mism = 0, n = 0, npass = 0, nfull = 0, nb1 = 0, nb2 = 0, nb2_long = 0, nband = 0, scal_mm = 0, te2_diff = 0;
     long nbatch = 0, nvalid = 0, nbandable = 0, np1able = 0, ntrunc = 0, nk[rescue_prune_scratch_kmax + 1] = {0}, n12_band = 0, nmeth[4] = {0};
-    long nview = 0, view_mm = 0, r2 = 0, ccap = 0, nrel_b2 = 0, nrel_view = 0;
+    long nview = 0, view_mm = 0, r2 = 0, ccap = 0, nrel_b2 = 0, nrel_view = 0, nmeth_klong_b2 = 0, nrel_klong_view = 0;
     std::unique_ptr<rescue_prune_scratch> sscratch(new rescue_prune_scratch());
     std::vector<rb_comp> cn, cs;
     long p1_band = 0, p1_guard = 0, band_hi = 0;
@@ -766,6 +767,7 @@ static int run_eq(std::vector<Job> &all_jobs, int k_default, int max_hits, int s
                 }
                 nview++;
                 nrel_view += pp.relx >= 0;
+                nrel_klong_view += pp.relx >= 0 && pp.K > 5;
                 if (!vok) {
                     view_mm++;
                     if (view_mm < 5) fprintf(stderr, "VIEW MISMATCH job=%zu cls=%d: SIMD and scalar filter views disagree\n", base + t, J.cls);
@@ -776,6 +778,7 @@ static int run_eq(std::vector<Job> &all_jobs, int k_default, int max_hits, int s
                 nb2++;
                 nb2_long += len2 > 250;
                 nrel_b2 += pp.relx >= 0;
+                nmeth_klong_b2 += meth && pp.K > 5;
                 if (band) rescue_band_batch().plan(view, pp, len1, len2, hb, he);
                 off[t] = hb;
                 idx[t] = P.add(J.ref.data() + hb, he - hb + 1, J.q.data(), len2, minsc);
@@ -915,11 +918,18 @@ static int run_eq(std::vector<Job> &all_jobs, int k_default, int max_hits, int s
         fprintf(stderr, "FAIL: %ld scorings kswv's 8-bit kernels do not run exactly were admitted (from() / rb_scoring::valid)\n",
                 g_admitted_bad);
     if (modes_missing) fprintf(stderr, "FAIL: a fixed RB_SCORING=random category was never drawn\n");
-    /* RB_KMAX asks for K-mers longer than 5: some batch must have filtered with them. */
+    /* RB_KMAX asks for K-mers longer than 5: some batch must have filtered with them, and under
+     * RB_METH some --meth job must have been narrowed at K > 5 (under RB_METH_REL=expand, with a
+     * relation view checked against the scalar one, so the relation's K-mer tables ran). */
     const bool vacuous_k = want_klong() && nk[6] + nk[7] + nk[8] == 0;
     if (vacuous_k) fprintf(stderr, "FAIL: RB_KMAX=%d and no batch filtered with K > 5\n", g_kmax);
+    const bool vacuous_meth_k = want_klong() && g_meth != METH_NONE
+                                && (nmeth_klong_b2 == 0 || (g_meth_rel && nrel_klong_view == 0));
+    if (vacuous_meth_k)
+        fprintf(stderr, "FAIL: RB_KMAX=%d under RB_METH narrowed no --meth job at K > 5, or checked no relation "
+                        "view at K > 5 (b2=%ld, relation views=%ld)\n", g_kmax, nmeth_klong_b2, nrel_klong_view);
     return mism || scal_mm || view_mm || vacuous || vacuous16 || vacuous_rel || ceiling_vacuous || p1_guard
-                   || g_admitted_bad || modes_missing || vacuous_k
+                   || g_admitted_bad || modes_missing || vacuous_k || vacuous_meth_k
                ? 1 : 0;
 }
 

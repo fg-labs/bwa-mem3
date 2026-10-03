@@ -449,15 +449,18 @@ static bool rescue_repeat_enabled()
  * Zen 3 (AVX2 tier, 5 reps): -B 6 -4.2 / -0.2 %, -B 8 -3.5 / -1.7 %, -x intractg -5.3 / -2.0 %;
  * Zen 5 (AVX-512BW tier, 5 reps, with the early B1 and the chained 5-mer prefilter), whose cheaper
  * kswv leaves less to prune: -B 6 -0.8 / -1.3 %, -B 8 -0.1 / -1.2 %, -x intractg -0.7 / -1.6 %.
- * --meth keeps K = 5: its matching, on converted copies or under the relation, is validated at
- * K = 5 only, and the relation's entry table is 5-mer only (rescue_prune_params::simd_ok). The
- * default scoring admits K = 5 alone, so it is unchanged. */
-static int rescue_prune_kmax(const mem_opt_t *opt)
+ * --meth takes the same cap, on converted copies and under the relation alike (the lemma for both in
+ * rescue_prune.h); its genomic and neutral defaults admit K = 5 only and the collapsed default
+ * (-B 2) none, so --meth -B 5 and up is where it differs. Graviton 4 (NEON), K = 5 -> up to 8, -t 16,
+ * 10 interleaved reps, wall: EM-seq 5 M pairs genomic -B 6 -18.6 %, collapsed -B 6 -18.6 %; TAPS
+ * 1 M pairs neutral -B 6 -12.4 %, genomic -B 6 -12.8 %; at the --meth defaults flat (K = 5 either way).
+ * The default scoring admits K = 5 alone, so it is unchanged. */
+static int rescue_prune_kmax()
 {
     static const int dflt = RESCUE_PRUNE_HAVE_SIMD ? rescue_prune_scratch_kmax : 5;
     static const int env = rescue_env_int("BWA3_RESCUE_PRUNE_KMAX", -1);
     static const int k = env >= 0 ? std::max(5, std::min(env, rescue_prune_scratch_kmax)) : dflt;
-    return opt->meth_mode ? 5 : k;
+    return k;
 }
 
 /* The pruning parameters for this run's scoring and threshold (min_seed_len * a), at K up to
@@ -466,7 +469,7 @@ static int rescue_prune_kmax(const mem_opt_t *opt)
 static rescue_prune_params rescue_prune_params_for(const mem_opt_t *opt)
 {
     return rescue_prune_params::from(opt->a, opt->b, opt->o_del, opt->e_del, opt->o_ins, opt->e_ins,
-                                     opt->min_seed_len * opt->a, 5, rescue_prune_kmax(opt));
+                                     opt->min_seed_len * opt->a, 5, rescue_prune_kmax());
 }
 
 /* The run's scoring as the band kernels take it (rescue_band.h; from() copies the costs whether or

@@ -70,12 +70,13 @@
 # banded must match as well and show banded parents. -B 3 the lemma refuses,
 # so it must filter no job. The band kernels take all four, so each must band
 # pass 1. -B 6 and -x intractg admit 7- and 8-mers, so the SIMD filter must
-# decide jobs with K-mers longer than 5 there (kmer_jobs) and on no other leg,
-# --meth included; and -B 6 under the K cap BWA3_RESCUE_PRUNE_KMAX at 3, 5 and
-# 99 (clamped to 5, 5 and 8) must match its reference too, with longer K-mers
-# only at 99. The same pairs as bisulfite reads, under --meth -B 4,
-# --meth-scoring genomic (also at -B 6, which admits 7-mers that --meth must
-# not use), the default collapsed scoring and --meth=taps at the
+# decide jobs with K-mers longer than 5 there (kmer_jobs), and on no leg whose
+# scoring admits only 5; and -B 6 under the K cap BWA3_RESCUE_PRUNE_KMAX at 3, 5
+# and 99 (clamped to 5, 5 and 8) must match its reference too, with longer
+# K-mers only at 99. The same pairs as bisulfite reads, under --meth -B 4,
+# --meth-scoring genomic and the default scoring at -B 6 (whose 7-mers --meth
+# uses on aarch64, on converted copies), the default collapsed scoring and
+# --meth=taps at the
 # collapsed scoring, must match their references too: filtered jobs on aarch64
 # at the first two, none at the collapsed ones (refused) and none on x86; and
 # banded pass-1 jobs exactly where a leg does not prune (--meth bands with the
@@ -85,7 +86,8 @@
 # too: on aarch64 the filter runs under the exact relation there, so filtered
 # jobs, narrowed windows, banded pass-1 jobs and, with every bandable hull
 # banded, banded parents; on x86 no filtered job and banded pass-1 jobs. So
-# must --meth=taps on the converted pairs (the relation's conversion cells), and
+# must --meth=taps on the converted pairs (the relation's conversion cells),
+# --meth=taps -B 6, whose 7-mers the relation uses on aarch64 (kmer_jobs), and
 # --meth=taps --meth-scoring collapsed -B 4 with no filtered job: the lemma
 # admits it, and only the relation's matrix guard keeps it off. The --meth
 # levers at their other values must match the same references: on EM-seq
@@ -342,23 +344,26 @@ sc_stem() { printf 'sc_%s' "$(printf '%s' "$1" | tr -c 'A-Za-z0-9' '_')"; }
 stat_field() { printf '%s\n' "$1" | tr ' ' '\n' | sed -n "s/^$2=//p"; }
 check_scoring() { # $1 = label, $2 = expectation, rest = mem options
     # Expectation: simd (prunes wherever the SIMD filter runs), simdk (the same, with K-mers longer
-    # than 5, which only these scorings admit and every other leg must not use), simd16 (the same,
+    # than 5, which every leg whose scoring admits only 5 must not use), simd16 (the same,
     # with every rescue job on the 16-bit kernels, which prune but never band), none (never prunes), meth
-    # (--meth, prunes on aarch64 only), methnone (--meth, never prunes), methrel (--meth=taps on the
-    # unconverted pairs: prunes under the relation and bands both passes on aarch64 only), methrelc
-    # (the same on the converted pairs, where the relation meets its conversion cells).
+    # (--meth, prunes on aarch64 only), methk (the same, with K-mers longer than 5 where it prunes),
+    # methnone (--meth, never prunes), methrel (--meth=taps on the unconverted pairs: prunes under
+    # the relation and bands both passes on aarch64 only), methrelk (the same, with K-mers longer
+    # than 5 where it prunes), methrelc (the same on the converted pairs, where the relation meets
+    # its conversion cells).
     local label="$1" where="$2" stem st sj sb2 skm sj16 sb1_16 sb2_16 bst sp1 bp prunes legs leg
     shift 2
     stem="$(sc_stem "$label")"
     MEM_OPTS=("$@")
     case "$where" in
-        meth | methnone | methrelc) FQS=(m1.fq m2.fq) ;;
+        meth | methk | methnone | methrelc) FQS=(m1.fq m2.fq) ;;
         *) FQS=(r1.fq r2.fq) ;;
     esac
     run_leg 4 "$stem.full" BWA3_RESCUE_PRUNE_STATS=1 "${REF_ENV[@]}"
     run_leg 4 "$stem" BWA3_RESCUE_PRUNE_STATS=1
     legs="$stem"
-    if [ "$where" = simd ] || [ "$where" = simdk ] || [ "$where" = methrel ] || [ "$where" = methrelc ]; then
+    if [ "$where" = simd ] || [ "$where" = simdk ] || [ "$where" = methrel ] || [ "$where" = methrelk ] \
+        || [ "$where" = methrelc ]; then
         run_leg 4 "$stem.band" BWA3_RESCUE_PRUNE_STATS=1 BWA3_RESCUE_BAND_COST=100000000
         legs="$stem $stem.band"
     fi
@@ -380,7 +385,8 @@ check_scoring() { # $1 = label, $2 = expectation, rest = mem options
     sp1=$(printf '%s\n' "$bst" | tr ' ' '\n' | sed -n 's/^pass1_banded=//p')
     if [ "$has_simd" = 1 ]; then
         case "$where/$floor" in
-            simd/* | simdk/* | simd16/* | meth/neon | methrel/neon | methrelc/neon) prunes=1 ;;
+            simd/* | simdk/* | simd16/* | meth/neon | methk/neon | methrel/neon | methrelk/neon | \
+                methrelc/neon) prunes=1 ;;
             *) prunes=0 ;;
         esac
         if [ "$prunes" = 1 ]; then
@@ -389,7 +395,7 @@ check_scoring() { # $1 = label, $2 = expectation, rest = mem options
             [ "${sj:-0}" -eq 0 ] || fail "pruning filtered rescue jobs at $label (SIMD floor '$floor'), past its gate: $st"
         fi
         case "$where/$prunes" in
-            simd/* | simdk/* | methrel/1 | methrelc/1)
+            simd/* | simdk/* | methrel/1 | methrelk/1 | methrelc/1)
                 [ "${sb2:-0}" -gt 0 ] || fail "pruning narrowed no rescue window at $label: $st"
                 bp=$(grep '^\[RESCUE_BAND\]' "$stem.band.err" | tr ' ' '\n' | sed -n 's/^banded_parents=//p' || true)
                 [ "${bp:-0}" -gt 0 ] || fail "no banded parent at $label with the band cost gate opened"
@@ -404,17 +410,19 @@ check_scoring() { # $1 = label, $2 = expectation, rest = mem options
                 ;;
         esac
         case "$where/$prunes" in
-            meth/1) [ "${sp1:-0}" -eq 0 ] || fail "--meth leg $label banded pass 1 on top of pruning: $bst" ;;
+            meth/1 | methk/1) [ "${sp1:-0}" -eq 0 ] || fail "--meth leg $label banded pass 1 on top of pruning: $bst" ;;
             simd16/*) [ "${sp1:-0}" -eq 0 ] || fail "16-bit leg $label banded pass 1 (banding is 8-bit only): $bst" ;;
             *) [ "${sp1:-0}" -gt 0 ] || fail "no banded pass-1 job at $label: $bst" ;;
         esac
-        # K-mers longer than 5 exactly where the scoring admits them (rescue_prune_kmax): every
-        # SIMD build takes K up to 8, and --meth and the other scorings stay at 5.
-        if [ "$where" = simdk ]; then
-            [ "${skm:-0}" -gt 0 ] || fail "no job filtered with K-mers longer than 5 at $label: $st"
-        else
-            [ "${skm:-0}" -eq 0 ] || fail "jobs filtered with K-mers longer than 5 at $label: $st"
-        fi
+        # K-mers longer than 5 exactly where the scoring admits them (rescue_prune_kmax) and the leg
+        # prunes: every SIMD build takes K up to 8, --meth included (on aarch64, where it prunes),
+        # and the other scorings stay at 5.
+        case "$where/$prunes" in
+            simdk/* | methk/1 | methrelk/1)
+                [ "${skm:-0}" -gt 0 ] || fail "no job filtered with K-mers longer than 5 at $label: $st"
+                ;;
+            *) [ "${skm:-0}" -eq 0 ] || fail "jobs filtered with K-mers longer than 5 at $label: $st" ;;
+        esac
     fi
     sc_note="$sc_note; $label: jobs=${sj:-0} b2=${sb2:-0} kmer_jobs=${skm:-0} pass1_banded=${sp1:-0}"
 }
@@ -458,9 +466,10 @@ check_scoring "-B 3" none -B 3
 check_scoring "-A 2" simd16 -A 2
 check_scoring "--meth -B 4" meth --meth -B 4
 check_scoring "--meth genomic" meth --meth --meth-scoring genomic
-# -B 6 admits 7-mers, which --meth must not use (rescue_prune_kmax): the else branch of check_scoring's
-# kmer_jobs check fails this leg if it does.
-check_scoring "--meth genomic -B 6" meth --meth --meth-scoring genomic -B 6
+# -B 6 admits 7-mers, which --meth uses where it prunes (aarch64), on converted copies and under the
+# relation alike: check_scoring's kmer_jobs check fails these legs if it does not.
+check_scoring "--meth genomic -B 6" methk --meth --meth-scoring genomic -B 6
+check_scoring "--meth -B 6" methk --meth -B 6
 check_scoring "--meth collapsed" methnone --meth
 check_scoring "--meth=taps collapsed" methnone --meth=taps --meth-scoring collapsed
 # Collapsed scoring at -B 4 passes the lemma, so only the relation's own guard (the collapsed matrix
@@ -469,6 +478,7 @@ check_scoring "--meth=taps collapsed -B 4" methnone --meth=taps --meth-scoring c
 check_scoring "--meth=taps" methrel --meth=taps
 check_scoring "--meth=taps genomic" methrel --meth=taps --meth-scoring genomic
 check_scoring "--meth=taps converted" methrelc --meth=taps
+check_scoring "--meth=taps -B 6" methrelk --meth=taps -B 6
 
 # The --meth levers at their other values, each against the reference of its check_scoring block
 # above (same reads and options): BWA3_RESCUE_BAND_METH=2 bands pass 0 on top of EM-seq's

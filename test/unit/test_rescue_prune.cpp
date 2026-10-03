@@ -17,7 +17,8 @@
 //      refused ones (-B 3, a cheap insertion) keep every window in full.
 //      And under --meth (rescue_prune_params::set_meth), against ksw_align2
 //      with the genomic, neutral and collapsed OT / OB matrices, on mates
-//      with converted bases.
+//      with converted bases, and under its relation (set_meth_rel); both at
+//      K = 5 and at scorings that admit K-mers of 6 to 8.
 //   2. The guard exits the lemma depends on: any N, a threshold below 5, and a
 //      query or window beyond the scratch capacity all return FULL.
 //   3. Where a SIMD filter is compiled in (NEON on aarch64, the SSE4.1 / SSSE3
@@ -710,6 +711,99 @@ TEST_CASE("rescue prune: the SIMD filter decides exactly as the scalar filter un
         over += check(jb, hyp, kNoGate) == RESCUE_PRUNE_FULL;
     }
     CHECK(simd_b2 > 0);
+    CHECK(over == 2);
+#endif
+}
+
+// --meth at a scoring that admits K-mers longer than 5 (-B 5 and up with the default gaps): on
+// converted copies (set_meth: collapsed and genomic matrices) and under the relation (set_meth_rel:
+// genomic and neutral), the K-mer decisions must reproduce ksw_align2 with the run's meth matrix, and
+// under the relation (where both filters read the original bytes) the SIMD filter's K-mer relation
+// tables must decide exactly as the scalar filter. Each job takes one (scoring, matching) pair in
+// rotation, with its mate converted at a rate that suits the matching (EM-seq-like on converted
+// copies, TAPS-like under the relation).
+TEST_CASE("rescue prune: --meth K-mer decisions up to K = 8 reproduce ksw_align2 and the scalar filter"
+          * doctest::test_suite("unit/pair")) {
+    std::mt19937 rng(8128);
+    const auto jobs = build_jobs(rng);
+    struct Sc { int a, b, o_del, e_del, o_ins, e_ins, kmax, K; const char *name; };
+    const Sc sc[3] = {{1, 6, 6, 1, 6, 1, 8, 7, "-B 6"}, {1, 9, 16, 1, 16, 1, 8, 8, "-B 9 -O 16"},
+                      {1, 8, 6, 1, 6, 1, 6, 6, "-B 8 at k_max 6"}};
+    struct Mode { int scoring; bool rel; unsigned inv_rate; const char *name; };
+    const Mode modes[4] = {{MEM_METH_SCORING_COLLAPSED, false, 2, "converted copies, collapsed"},
+                           {MEM_METH_SCORING_GENOMIC, false, 2, "converted copies, genomic"},
+                           {MEM_METH_SCORING_GENOMIC, true, 20, "relation, genomic"},
+                           {MEM_METH_SCORING_NEUTRAL, true, 20, "relation, neutral"}};
+    std::unique_ptr<rescue_prune_scratch> scalar(new rescue_prune_scratch());
+    Tally t[3][4];
+    int n_simd[3][4] = {};
+    for (size_t i = 0; i < jobs.size(); i++) {
+        const int si = (int)(i % 3), mi = (int)((i / 3) % 4), hyp = (int)((i / 12) % 2);
+        const Sc &c = sc[si];
+        const Mode &m = modes[mi];
+        const std::string name = std::string(c.name) + ", " + m.name;
+        CAPTURE(name); CAPTURE(hyp);
+        Job jb = jobs[i];
+        rescue_convert_mate(jb.q, hyp, m.inv_rate, rng);
+        rescue_prune_params p = rescue_prune_params::from(c.a, c.b, c.o_del, c.e_del, c.o_ins, c.e_ins,
+                                                          kSimdMinsc * c.a, 5, c.kmax);
+        REQUIRE(p.valid);
+        REQUIRE(p.K == c.K);
+        if (m.rel) p.set_meth_rel(hyp);
+        else p.set_meth(hyp);
+        const auto mat = bwa_tests::meth_scoring_matrix(m.scoring, hyp == 1, c.a, c.b);
+        if (m.rel) REQUIRE(rescue_meth_rel_matrix_ok(mat.data(), hyp, c.a, c.b));
+        Oracle o(jb, p, mat);
+        check_against_oracle(kNoGate, o, t[si][mi]);
+        const int len1 = (int)jb.ref.size(), len2 = (int)jb.q.size();
+        CAPTURE(jb.tag); CAPTURE(len1); CAPTURE(len2);
+        int hb = -2, he = -2;
+        rescue_prune_view v;
+        const int kind = rescue_prune_window(jb.ref.data(), len1, jb.q.data(), len2, p, kDefaultMaxHits, &hb, &he, &v);
+        n_simd[si][mi] += kind == RESCUE_PRUNE_B2 && v.bnd16 != nullptr;
+        if (m.rel && len1 >= 5 && len2 >= 5) {
+            int shb = -2, she = -2;
+            const int skind = rescue_prune_window_scalar(jb.ref.data(), len1, jb.q.data(), len2, p, kDefaultMaxHits,
+                                                         *scalar, &shb, &she);
+            CHECK(kind == skind);
+            if (kind == RESCUE_PRUNE_B2 && skind == RESCUE_PRUNE_B2) {
+                CHECK(hb == shb);
+                CHECK(he == she);
+            }
+        }
+    }
+    for (int si = 0; si < 3; si++)
+        for (int mi = 0; mi < 4; mi++) {
+            const std::string name = std::string(sc[si].name) + ", " + modes[mi].name;
+            CAPTURE(name);
+            MESSAGE("--meth " << name << ": B1=" << t[si][mi].b1 << " B2=" << t[si][mi].b2
+                              << " FULL=" << t[si][mi].full << " SIMD B2=" << n_simd[si][mi]);
+            CHECK(t[si][mi].b1 > 0);
+            CHECK(t[si][mi].b2 > 0);
+#if RESCUE_PRUNE_HAVE_SIMD
+            CHECK(n_simd[si][mi] > 0);   // the K-mer instantiation decided some, not only the scalar filter
+#endif
+        }
+    // relx-rich mates at K > 5: every relx position doubles the entries of the K-mers covering it, so a
+    // long mostly-relx mate passes REL_ECAP, and both filters must keep the full window.
+#if RESCUE_PRUNE_HAVE_SIMD
+    int over = 0;
+    for (const int hyp : {0, 1}) {
+        Job jb = planted(rng, 600, 1000, 30);
+        for (size_t j = 0; j < jb.q.size(); j++)
+            if (rng() % 10) jb.q[j] = (uint8_t)(hyp ? 3 : 0);
+        rescue_prune_params p = rescue_prune_params::from(1, 6, 6, 1, 6, 1, kSimdMinsc, 5, 8);
+        REQUIRE(p.K == 7);
+        p.set_meth_rel(hyp);
+        const int len1 = (int)jb.ref.size(), len2 = (int)jb.q.size();
+        int hb = -2, he = -2, shb = -2, she = -2;
+        const int kind = rescue_prune_window(jb.ref.data(), len1, jb.q.data(), len2, p, kNoGate, &hb, &he);
+        const int skind = rescue_prune_window_scalar(jb.ref.data(), len1, jb.q.data(), len2, p, kNoGate, *scalar,
+                                                     &shb, &she);
+        CAPTURE(hyp);
+        CHECK(kind == skind);
+        over += kind == RESCUE_PRUNE_FULL && skind == RESCUE_PRUNE_FULL;
+    }
     CHECK(over == 2);
 #endif
 }

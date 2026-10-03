@@ -1035,9 +1035,14 @@ jobs:
       # BWA3_RESCUE_PRUNE_KMAX): a random K cap and scoring per batch (every
       # third batch drawn to admit K > 5), -B 6 at K = 7, -x intractg at K = 8
       # and -B 8 at a cap of 6, banded, and the 16-bit kernels at a random
-      # scoring; each fails if no batch filtered with K > 5. The trailing
-      # argument is the job generator's seed. Run 1 is 100000 jobs, runs 2-11
-      # 30000, runs 12-16 10000, run 17 30000 and runs 18-26 10000.
+      # scoring; each fails if no batch filtered with K > 5. Runs 27-29 take
+      # K > 5 under --meth (RB_METH with RB_KMAX): -B 6 at K = 7 on converted
+      # copies and under the relation (RB_METH_REL=expand), banded, and a random
+      # K cap and scoring per batch under the relation on the 16-bit kernels;
+      # each fails if no --meth job was narrowed at K > 5 (under the relation,
+      # with a relation view checked against the scalar filter at K > 5). The
+      # trailing argument is the job generator's seed. Run 1 is 100000 jobs,
+      # runs 2-11 30000, runs 12-16 10000, run 17 30000 and runs 18-29 10000.
       # On x86 the kswv reference runs at the runner's tier,
       # which the harness prints ("kswv tier:"). Longer runs and real dumps are
       # manual. As above, a negative control (one banded job's te shifted) must
@@ -1080,6 +1085,9 @@ jobs:
           RB_16BIT=1 BWA3_RESCUE_PRUNE_MAX_HITS=100000 RB_KMAX=0 RB_SCORING=random ./rescue_band_harness eq 10000 24
           BWA3_RESCUE_BAND_COST=100000000 RB_KMAX=8 RB_SCORING=1,9,16,1,16,1 ./rescue_band_harness eq 10000 25
           BWA3_RESCUE_BAND_COST=100000000 RB_KMAX=6 RB_SCORING=1,8,6,1,6,1 ./rescue_band_harness eq 10000 26
+          BWA3_RESCUE_BAND_COST=100000000 RB_METH=random RB_KMAX=8 RB_SCORING=1,6,6,1,6,1 ./rescue_band_harness eq 10000 27
+          BWA3_RESCUE_BAND_COST=100000000 RB_METH=random RB_METH_REL=expand RB_KMAX=8 RB_SCORING=1,6,6,1,6,1 ./rescue_band_harness eq 10000 28
+          RB_16BIT=1 BWA3_RESCUE_PRUNE_MAX_HITS=100000 RB_METH=random RB_METH_REL=expand RB_KMAX=0 RB_SCORING=random ./rescue_band_harness eq 10000 29
 
       - name: Flat chaining index matches the kbtree replay (chr22)
         if: matrix.canonical == true
