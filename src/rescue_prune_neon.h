@@ -43,8 +43,8 @@ struct Job {
 
 /* The bound's constants for K-mer hits (rescue_prune_params::simd_wt): interval bound
  * base + sum_d (a cnt_d - c), tail max(0, ub - minsc - toff) / e past the last hit diagonal
- * (toff = o_del - (K - 1) a, e = e_del), and the K-mer length K itself (5, or 6..KMAXN with exact
- * matching). The defaults are the default scoring's: K = 5, 5 + sum (cnt - 1) and ub - minsc - 2. */
+ * (toff = o_del - (K - 1) a, e = e_del), and the K-mer length K itself (5, or 6..KMAXN, with exact
+ * matching or under the relation). The defaults are the default scoring's: K = 5, 5 + sum (cnt - 1) and ub - minsc - 2. */
 struct Wt {
     int base = 5, a = 1, c = 1, toff = 2, e = 1, K = 5;
     bool dflt() const { return base == 5 && a == 1 && c == 1 && toff == 2 && e == 1 && K == 5; }
@@ -170,7 +170,8 @@ static inline Kind lean(const Job &jb, Scratch &s, int &hb, int &he, int minsc)
 //  code's second-latest entry. Layer 1 is unchanged except that multi rows carry their code;
 //  layers >= 2 walk entry ids (J = sec[code], then ENT's next) instead of query positions. A query
 //  needing more than ECAP entries gives FULL, as the scalar filter does.
-//  K > 5 (KK, exact matching; Wt::K): step 2 builds the K-mer table (filter_kmer_table), and step 3's
+//  K > 5 (KK; Wt::K): step 2 builds the K-mer table (filter_kmer_table; under Rel, filter_rel_kmer_table,
+//  whose pres holds the related 5-mers and whose entries chain through hdk / seck), and step 3's
 //  5-mer test keeps a superset of the K-mer hit rows: a row whose K-mer occurs in the query has its
 //  own 5-mer there, and so do rows r - 1 .. r - (KK - 5), whose 5-mers lie inside that K-mer, so the
 //  row's presence bit is ANDed with theirs (the chained prefilter; the previous block's bits carry
@@ -249,17 +250,22 @@ struct FilterScratch {
     static const int ECAP = REL_ECAP;
     alignas(16) uint32_t ENT[ECAP];
     int16_t hd[1024], sec[1024];
-    /* K > 5 (Wt::K, up to KMAXN; exact matching only): the K-mer table (tab's layout) and presence
-     * bitmap over 4^K codes, allocated on first use and reset through the codes the previous K-mer
-     * query set (touchk: one per distinct K-mer, so at most len2 < CAP). pres then holds every 5-mer
-     * of the query: a window row whose 5-mer is absent from it cannot end a K-mer hit, so step 3's
-     * vector test stays as the prefilter. */
+    /* K > 5 (Wt::K, up to KMAXN; exact matching or the relation): the K-mer table (tab's layout)
+     * and presence bitmap over 4^K codes, allocated on first use and reset through the codes the
+     * previous K-mer query set (touchk: one per distinct K-mer, so at most len2 < CAP on exact
+     * matching and at most ECAP under the relation). pres then holds every 5-mer of the query (under
+     * the relation, every 5-mer one relates to): a window row whose 5-mer is absent from it cannot
+     * end a K-mer hit, so step 3's vector test stays as the prefilter. */
     static const int KMAXN = 8;
     // K-mer codes live in 16 bits: PC, touchk, and the x86 port's epi16 code lanes.
     static_assert(2 * KMAXN <= 16, "a K-mer code must fit 16 bits");
     std::vector<uint32_t> tabk;
     std::vector<uint8_t> presk;
-    uint16_t touchk[CAP];
+    /* K > 5 under the relation (Rel): each K-mer code's latest and second-latest entry, as hd / sec
+     * at K = 5, over 4^KMAXN codes (allocated by the first relation query at K > 5, -1 when
+     * untouched). A relation query touches one code per entry, so touchk holds up to ECAP codes. */
+    std::vector<int16_t> hdk, seck;
+    uint16_t touchk[CAP > REL_ECAP ? CAP : REL_ECAP];
     int ntouchk = 0;
     int qk_c = 5;         // K of the cached query tables
     int qrel_c = -1;      // relx of the cached query tables
@@ -353,6 +359,16 @@ static inline uint64_t filter_query_key(const uint8_t *qb, int len2)
     return h ^ (h >> 29);
 }
 
+// Rel: the high bits of the relx positions of the n-mer ending at qb[jj] (position jj - t at bits
+// 2t), whose subsets (enumerated (sm - 1) & M) give the reference codes that n-mer relates to.
+static inline int filter_rel_mask(const uint8_t *qb, int jj, int n, int relx)
+{
+    int M = 0;
+    for (int t = 0; t < n; t++)
+        if (qb[jj - t] == relx) M |= 2 << (2 * t);
+    return M;
+}
+
 // Rel (--meth relation; see the design notes above lean_neon_core): the query-table entries of step 2,
 // shared by the NEON filter and the x86 port. For each query 5-mer (codes in s.qcode, bases in qb =
 // the zero-padded query copy + 4), one entry per reference code it relates to -- its code with any
@@ -365,10 +381,7 @@ static inline void filter_rel_table(S &s, const uint8_t *qb, int len2, int off, 
     memset(s.hd, 0xFF, sizeof s.hd);
     int ne = 0;
     for (int jj = 4; jj < len2 && !s.q_over; jj++) {
-        const int c = s.qcode[jj];
-        int M = 0;   // high bits of the 5-mer's relx positions (position jj - t at bits 2t)
-        for (int t = 0; t < 5; t++)
-            if (qb[jj - t] == relx) M |= 2 << (2 * t);
+        const int c = s.qcode[jj], M = filter_rel_mask(qb, jj, 5, relx);
         for (int sm = M;; sm = (sm - 1) & M) {
             if (ne == S::ECAP) { s.q_over = true; break; }
             const int rc = c ^ sm;
@@ -381,6 +394,27 @@ static inline void filter_rel_table(S &s, const uint8_t *qb, int len2, int off, 
             if (!sm) break;
         }
     }
+}
+
+// The K-mer tables of either kind (filter_kmer_table, filter_rel_kmer_table), allocated on first use
+// and reset through the codes the previous K-mer query touched, whichever kind built it.
+template <class S>
+static inline void filter_kmer_reset(S &s)
+{
+    if (s.tabk.empty()) {
+        const size_t ncode = (size_t)1 << (2 * S::KMAXN);
+        s.tabk.assign(ncode, 0);
+        s.presk.assign(ncode / 8, 0);
+    }
+    /* hdk exists once a relation query has run (filter_rel_kmer_table allocates it); the previous
+     * query's codes are reset in it either way, since an exact query may follow a relation one. */
+    const bool rel_tables = !s.hdk.empty();
+    for (int t = 0; t < s.ntouchk; t++) {
+        const int c = s.touchk[t];
+        s.tabk[c] = 0; s.presk[c >> 3] = 0;
+        if (rel_tables) s.hdk[c] = -1;
+    }
+    s.ntouchk = 0;
 }
 
 // K > 5 (exact matching; Wt::K): step 2's query table over K-mers, shared by the NEON filter and the
@@ -396,12 +430,7 @@ static inline void filter_kmer_table(S &s, const uint8_t *qb, int len2, int off)
 {
     // (also instantiated at KK = 5 by the filters' untaken K > 5 branches; called only for K > 5)
     static_assert(KK >= 5 && KK <= S::KMAXN, "the K-mer table spans at most 4^KMAXN codes");
-    if (s.tabk.empty()) {
-        s.tabk.assign((size_t)1 << (2 * S::KMAXN), 0);
-        s.presk.assign(((size_t)1 << (2 * S::KMAXN)) / 8, 0);
-    }
-    for (int t = 0; t < s.ntouchk; t++) { const int c = s.touchk[t]; s.tabk[c] = 0; s.presk[c >> 3] = 0; }
-    s.ntouchk = 0;
+    filter_kmer_reset(s);
     memset(s.pres, 0, sizeof s.pres);
     const int kmask = (1 << (2 * KK)) - 1;
     int ck = 0;
@@ -417,6 +446,54 @@ static inline void filter_kmer_table(S &s, const uint8_t *qb, int len2, int off)
         s.nxt[jj] = occ == 1 ? (int16_t)-1 : (int16_t)(off - (old & 0x1FFF));
         s.tabk[ck] = occ << 16 | (uint32_t)(off - jj) | (occ == 1 ? 0 : 0x2000);
         s.presk[ck >> 3] |= (uint8_t)(1u << (ck & 7));
+    }
+}
+
+// Rel at K > 5 (--meth relation, Wt::K > 5): step 2's query table over K-mers under the relation,
+// shared by the NEON filter and the x86 port. As filter_rel_table with K-mers for 5-mers: one entry
+// per reference K-mer code a query K-mer relates to (its code with any subset of its relx positions
+// flipped by ^ 2), chained j-descending through ENT, with hdk / seck each code's latest /
+// second-latest entry and tabk / presk per related code, so the gate and the hit count stay exact
+// counts of related (row, query position) pairs. pres gets every 5-mer code a query 5-mer relates
+// to, for step 3's chained prefilter: each 5-mer inside a related K-mer relates to the query 5-mer
+// at the same offset. Sets s.q_over past S::ECAP entries, as filter_rel_table does, so the entry
+// count matches the scalar filter's (rescue_prune_window_scalar) and so does the FULL it implies.
+template <int KK, class S>
+static inline void filter_rel_kmer_table(S &s, const uint8_t *qb, int len2, int off, int relx)
+{
+    static_assert(KK >= 5 && KK <= S::KMAXN, "the K-mer table spans at most 4^KMAXN codes");
+    filter_kmer_reset(s);
+    if (s.hdk.empty()) {   // the relation's chains, only once a relation query runs at K > 5
+        s.hdk.assign((size_t)1 << (2 * S::KMAXN), -1);
+        s.seck.assign((size_t)1 << (2 * S::KMAXN), -1);
+    }
+    memset(s.pres, 0, sizeof s.pres);
+    const int kmask = (1 << (2 * KK)) - 1;
+    int ck = 0, ne = 0;
+    for (int jj = 0; jj < len2; jj++) {
+        ck = ((ck << 2) | qb[jj]) & kmask;
+        if (jj >= 4) {
+            const int c5 = s.qcode[jj], M5 = filter_rel_mask(qb, jj, 5, relx);
+            for (int sm = M5;; sm = (sm - 1) & M5) {
+                const int rc = c5 ^ sm;
+                s.pres[rc >> 3] |= (uint8_t)(1u << (rc & 7));
+                if (!sm) break;
+            }
+        }
+        if (jj < KK - 1) continue;
+        const int M = filter_rel_mask(qb, jj, KK, relx);
+        for (int sm = M;; sm = (sm - 1) & M) {
+            if (ne == S::ECAP) { s.q_over = true; return; }
+            const int rc = ck ^ sm;
+            const uint32_t old = s.tabk[rc], occ = (old >> 16) + 1;
+            if (occ == 1) s.touchk[s.ntouchk++] = (uint16_t)rc;
+            s.ENT[ne] = (uint32_t)jj | (uint32_t)(uint16_t)s.hdk[rc] << 16;
+            s.seck[rc] = s.hdk[rc];
+            s.hdk[rc] = (int16_t)ne++;
+            s.tabk[rc] = occ << 16 | (uint32_t)(off - jj) | (occ == 1 ? 0 : 0x2000);
+            s.presk[rc >> 3] |= (uint8_t)(1u << (rc & 7));
+            if (!sm) break;
+        }
     }
 }
 
@@ -459,12 +536,12 @@ static inline void neon_codes16(const uint8_t *buf, uint16_t *out)
 // repeated-code layers and the Kadane scans.
 // Gen: general weights (wt: a, c, base, tail); !Gen is the default scoring's code. Rel: the --meth
 // relation of relx (see the design notes above); !Rel is the exact-match code. KK: the K-mer length,
-// 5 or 6..KMAXN (general weights and exact matching only; the design notes above).
+// 5 or 6..KMAXN (general weights; exact matching or the relation; the design notes above).
 template <bool Gen, bool Rel, int KK = 5>
 static inline Kind lean_neon_core(const Job &jb, NeonScratch &s, int &hb, int &he, int max_hits, int minsc,
                                   const Wt &wt, int relx)
 {
-    static_assert(KK == 5 || (Gen && !Rel && KK <= NeonScratch::KMAXN), "K > 5: general weights, exact matching");
+    static_assert(KK == 5 || (Gen && KK <= NeonScratch::KMAXN), "K > 5: general weights");
     const uint8_t *ref = jb.ref, *q = jb.qry;
     const int len1 = jb.len1, len2 = jb.len2;
     hb = he = -1;
@@ -503,7 +580,8 @@ static inline Kind lean_neon_core(const Job &jb, NeonScratch &s, int &hb, int &h
         if (KK > 5) {
             if (!s.q_has_n && len2 >= KK) {
                 for (int b = 0; b < len2; b += 16) neon_codes16(s.qbuf + b, s.qcode + b);
-                filter_kmer_table<KK>(s, qb, len2, off);
+                if (Rel) filter_rel_kmer_table<KK>(s, qb, len2, off, relx);
+                else filter_kmer_table<KK>(s, qb, len2, off);
             }
         } else if (!s.q_has_n && len2 >= 5) {
             memset(s.tab, 0, sizeof s.tab);
@@ -702,8 +780,12 @@ static inline Kind lean_neon_core(const Job &jb, NeonScratch &s, int &hb, int &h
         int16_t *J = s.JA, *J2 = s.JB;
         const int16_t *__restrict nxt = s.nxt;
         const uint32_t *__restrict ent = s.ENT;
-        if (Rel) for (int k = 0; k < n; k++) J[k] = s.sec[J[k]];
-        else for (int k = 0; k < n; k++) J[k] = nxt[J[k]];
+        if (Rel) {   // J holds the code (a K-mer code may exceed int16: read it as u16)
+            const int16_t *__restrict sec = KK > 5 ? s.seck.data() : s.sec;
+            for (int k = 0; k < n; k++) J[k] = sec[(uint16_t)J[k]];
+        } else {
+            for (int k = 0; k < n; k++) J[k] = nxt[J[k]];
+        }
         // J < len2 <= 4095; lanes past n hold stale values, so the index is masked to stay in nxt[]
         auto nxt4 = [nxt](const int16_t *j) {
             uint64_t x;
@@ -933,19 +1015,26 @@ static Kind __attribute__((noinline)) lean_neon_core_gen(const Job &jb, NeonScra
 {
     return lean_neon_core<Gen, Rel, KK>(jb, s, hb, he, max_hits, minsc, wt, relx);
 }
+// The K > 5 cores (Wt::K = 6..KMAXN), with exact matching or under the relation (Rel).
+template <bool Rel>
+static inline Kind lean_neon_kmer(const Job &jb, NeonScratch &s, int &hb, int &he, int max_hits, int minsc,
+                                  const Wt &wt, int relx)
+{
+    return wt.K == 6 ? lean_neon_core_gen<true, Rel, 6>(jb, s, hb, he, max_hits, minsc, wt, relx)
+         : wt.K == 7 ? lean_neon_core_gen<true, Rel, 7>(jb, s, hb, he, max_hits, minsc, wt, relx)
+         : wt.K == 8 ? lean_neon_core_gen<true, Rel, 8>(jb, s, hb, he, max_hits, minsc, wt, relx)
+                     : FALLBACK;
+}
 // lean_neon_core behind the repeat memo (lean_memo); relx >= 0 runs the --meth relation, wt.K > 5
-// the K-mer instantiations (exact matching only: under the relation, FALLBACK to the scalar filter).
+// the K-mer instantiations (under the relation too).
 static inline Kind lean_neon(const Job &jb, NeonScratch &s, int &hb, int &he, int max_hits, int minsc,
                              const Wt &wt, int relx = -1)
 {
     return lean_memo(jb, s, hb, he, max_hits, minsc, wt, relx,
                      [](const Job &j, NeonScratch &t, int &b, int &e, int mh, int ms, const Wt &w, int rx) {
                          if (w.K != 5)
-                             return rx >= 0 ? FALLBACK
-                                  : w.K == 6 ? lean_neon_core_gen<true, false, 6>(j, t, b, e, mh, ms, w, -1)
-                                  : w.K == 7 ? lean_neon_core_gen<true, false, 7>(j, t, b, e, mh, ms, w, -1)
-                                  : w.K == 8 ? lean_neon_core_gen<true, false, 8>(j, t, b, e, mh, ms, w, -1)
-                                             : FALLBACK;
+                             return rx >= 0 ? lean_neon_kmer<true>(j, t, b, e, mh, ms, w, rx)
+                                            : lean_neon_kmer<false>(j, t, b, e, mh, ms, w, -1);
                          if (rx < 0)
                              return w.dflt() ? lean_neon_core<false, false>(j, t, b, e, mh, ms, w, -1)
                                              : lean_neon_core_gen<true, false>(j, t, b, e, mh, ms, w, -1);

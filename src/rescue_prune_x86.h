@@ -16,7 +16,7 @@
  *    K-mer the query holds are selected 8 at a time with an AVX2 gather over the K-mer presence
  *    bitmap, instead of a scalar loop over the prefiltered rows.
  * The --meth relation (Rel, relx >= 0) is lean_neon's, through the same shared entry-table helpers
- * (filter_rel_table, filter_ent4) and cap. Production does not reach it today (x86 does not prune
+ * (filter_rel_table, filter_rel_kmer_table at K > 5, filter_ent4) and cap. Production does not reach it today (x86 does not prune
  * --meth, rescue_prune_cost_ok); the unit tests, rescue_prune_eq and the band harness do, so the
  * dispatch stays one SIMD filter for every relx on both architectures. The threshold minsc (min_seed_len * a, 19 at defaults) is
  * a runtime argument.
@@ -86,12 +86,12 @@ static inline void x86_codes16(const uint8_t *buf, uint16_t *out)
 
 // Gen: general weights (rescue_prune_neon::Wt); !Gen is the default scoring's code. Rel: the --meth
 // relation of relx (lean_neon_core); !Rel is the exact-match code. KK: the K-mer length, 5 or
-// 6..KMAXN (general weights and exact matching only), as lean_neon_core.
+// 6..KMAXN (general weights; exact matching or the relation), as lean_neon_core.
 template <bool Gen, bool Rel, int KK = 5>
 static inline Kind lean_x86_core(const Job &jb, X86Scratch &s, int &hb, int &he, int max_hits, int minsc,
                                  const Wt &wt, int relx)
 {
-    static_assert(KK == 5 || (Gen && !Rel && KK <= X86Scratch::KMAXN), "K > 5: general weights, exact matching");
+    static_assert(KK == 5 || (Gen && KK <= X86Scratch::KMAXN), "K > 5: general weights");
     const uint8_t *ref = jb.ref, *q = jb.qry;
     const int len1 = jb.len1, len2 = jb.len2;
     hb = he = -1;
@@ -130,7 +130,8 @@ static inline Kind lean_x86_core(const Job &jb, X86Scratch &s, int &hb, int &he,
         if (KK > 5) {
             if (!s.q_has_n && len2 >= KK) {
                 for (int b = 0; b < len2; b += 16) x86_codes16(s.qbuf + b, s.qcode + b);
-                rescue_prune_neon::filter_kmer_table<KK>(s, qb, len2, off);
+                if (Rel) rescue_prune_neon::filter_rel_kmer_table<KK>(s, qb, len2, off, relx);
+                else rescue_prune_neon::filter_kmer_table<KK>(s, qb, len2, off);
             }
         } else if (!s.q_has_n && len2 >= 5) {
             memset(s.tab, 0, sizeof s.tab);
@@ -330,8 +331,12 @@ static inline Kind lean_x86_core(const Job &jb, X86Scratch &s, int &hb, int &he,
         int16_t *J = s.JA, *J2 = s.JB;
         const int16_t *__restrict nxt = s.nxt;
         const uint32_t *__restrict ent = s.ENT;
-        if (Rel) for (int k = 0; k < n; k++) J[k] = s.sec[J[k]];   // Rel: J is an entry id
-        else for (int k = 0; k < n; k++) J[k] = nxt[J[k]];
+        if (Rel) {   // Rel: J holds the code (read as u16: a K-mer code may exceed int16), then entry ids
+            const int16_t *__restrict sec = KK > 5 ? s.seck.data() : s.sec;
+            for (int k = 0; k < n; k++) J[k] = sec[(uint16_t)J[k]];
+        } else {
+            for (int k = 0; k < n; k++) J[k] = nxt[J[k]];
+        }
         // J < len2 <= 4095; lanes past n hold stale values, so the index is masked to stay in nxt[]
         auto nxt4 = [nxt](const int16_t *j) {
             uint64_t x;
@@ -511,19 +516,26 @@ static Kind __attribute__((noinline)) lean_x86_core_gen(const Job &jb, X86Scratc
 {
     return lean_x86_core<Gen, Rel, KK>(jb, s, hb, he, max_hits, minsc, wt, relx);
 }
+// The K > 5 cores, as lean_neon_kmer.
+template <bool Rel>
+static inline Kind lean_x86_kmer(const Job &jb, X86Scratch &s, int &hb, int &he, int max_hits, int minsc,
+                                 const Wt &wt, int relx)
+{
+    return wt.K == 6 ? lean_x86_core_gen<true, Rel, 6>(jb, s, hb, he, max_hits, minsc, wt, relx)
+         : wt.K == 7 ? lean_x86_core_gen<true, Rel, 7>(jb, s, hb, he, max_hits, minsc, wt, relx)
+         : wt.K == 8 ? lean_x86_core_gen<true, Rel, 8>(jb, s, hb, he, max_hits, minsc, wt, relx)
+                     : FALLBACK;
+}
 // lean_x86_core behind the repeat memo, as lean_neon; relx >= 0 runs the --meth relation, wt.K > 5
-// the K-mer instantiations (exact matching only).
+// the K-mer instantiations (under the relation too).
 static inline Kind lean_x86(const Job &jb, X86Scratch &s, int &hb, int &he, int max_hits, int minsc,
                             const Wt &wt, int relx = -1)
 {
     return lean_memo(jb, s, hb, he, max_hits, minsc, wt, relx,
                      [](const Job &j, X86Scratch &t, int &b, int &e, int mh, int ms, const Wt &w, int rx) {
                          if (w.K != 5)
-                             return rx >= 0 ? FALLBACK
-                                  : w.K == 6 ? lean_x86_core_gen<true, false, 6>(j, t, b, e, mh, ms, w, -1)
-                                  : w.K == 7 ? lean_x86_core_gen<true, false, 7>(j, t, b, e, mh, ms, w, -1)
-                                  : w.K == 8 ? lean_x86_core_gen<true, false, 8>(j, t, b, e, mh, ms, w, -1)
-                                             : FALLBACK;
+                             return rx >= 0 ? lean_x86_kmer<true>(j, t, b, e, mh, ms, w, rx)
+                                            : lean_x86_kmer<false>(j, t, b, e, mh, ms, w, -1);
                          if (rx < 0)
                              return w.dflt() ? lean_x86_core<false, false>(j, t, b, e, mh, ms, w, -1)
                                              : lean_x86_core_gen<true, false>(j, t, b, e, mh, ms, w, -1);

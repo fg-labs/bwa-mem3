@@ -5,7 +5,7 @@
 |---|---|---|---|
 | `BWA3_RESCUE_PRUNE` | `1` | `src/bwamem_pair.cpp` | exact K-mer pruning of rescue windows (aarch64 and x86 AVX2 / AVX-512BW builds; scope: rescue-pruning.md); 0 also turns the banded passes off |
 | `BWA3_RESCUE_PRUNE_MAX_HITS` | `auto` | `src/bwamem_pair.cpp` | keep the full window above this many K-mer hits; auto is 1000 on aarch64 with banding on, unless a --meth run leaves its pruned windows unbanded (EM-seq by default); else 400 |
-| `BWA3_RESCUE_PRUNE_KMAX` | `auto` | `src/bwamem_pair.cpp` | the longest K-mer the filter may use where the scoring admits it (5 to 8); auto is 8 on aarch64 and the x86 AVX2 / AVX-512BW builds, else 5; --meth always 5 |
+| `BWA3_RESCUE_PRUNE_KMAX` | `auto` | `src/bwamem_pair.cpp` | the longest K-mer the filter may use where the scoring admits it (5 to 8); auto is 8 on aarch64 and the x86 AVX2 / AVX-512BW builds, else 5; --meth included |
 | `BWA3_RESCUE_PRUNE_REL` | `1` | `src/bwamem_pair.cpp` | --meth genomic / neutral scoring, aarch64 (x86 --meth is not pruned): 1 filter TAPS under the exact relation (EM-seq and collapsed scoring match converted copies), 0 converted copies only (TAPS not pruned), 2 or more the relation for every genomic / neutral run |
 | `BWA3_RESCUE_PRUNE_STATS` | `0` | `src/bwamem_pair.cpp`, `src/rescue_band.cpp` | 1 prints the RESCUE_PRUNE and RESCUE_BAND counters and stage times at exit (counted per thread: no shared-counter contention in an instrumented run) |
 | `BWA3_RESCUE_DEDUP_SKIP` | `1` | `src/bwamem_pair.cpp` | skip a post-rescue dedup proven to be a no-op, and add a single new region in one pass where that is provably exact |

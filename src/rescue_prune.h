@@ -29,8 +29,13 @@
  * to the deletion costs; rescue_prune_params::from refuses a scoring the argument does not hold for
  * (then every window runs in full). A scoring whose mismatch and gap costs admit K > 5 (-B 6 with
  * the default gaps admits K = 7, -x intractg K = 10, capped at 8) counts longer K-mer hits: every
- * step in K cuts random hits 4x, so the bound keeps fewer rows for the same threshold. Production
- * takes K > 5 for exact matching only; --meth keeps K = 5 (rescue_prune_kmax in bwamem_pair.cpp).
+ * step in K cuts random hits 4x, so the bound keeps fewer rows for the same threshold. --meth takes
+ * K > 5 too, on either matching: a K-mer hit is a run of K cells the filter counts as hits, each of
+ * which the run's meth matrix scores at most +a (above), and every cell it does not count scores -b
+ * (converted copies: a pair unequal after conversion is a real mismatch in every meth matrix; the
+ * relation: rescue_meth_rel_matrix_ok), so the same separator costs bound K. At the --meth default
+ * scorings (b = 4a genomic / neutral, b = 2a collapsed) that is K = 5 or nothing; -B 5 and up with
+ * the default gaps admits more.
  *
  * Two corollaries let the SIMD filters skip work without changing a decision. Every diagonal
  * interval is non-empty and sums a cnt_d - c, so its bound is at most a (K - 1) + c + a hits - c:
@@ -132,14 +137,13 @@ struct rescue_prune_params {
         const int n = ub - tau - o_del + (K - 1) * a;
         return n <= 0 ? 0 : e_del == 1 ? n : n / e_del;   // no division at the default -E 1
     }
-    /* The SIMD filters take K = 5 and any weights (simd_wt), under the --meth relation too; a <= 16
-     * keeps a cnt in int16 (they fall back to the scalar filter where a sum would leave it). Both
-     * also take K = 6..rescue_prune_scratch_kmax with exact matching (relx < 0): the relation's
-     * entry table is 5-mer only, and production never pairs it with K > 5. K = 3 and 4 (the band
-     * harness's k_min 3) have no SIMD instantiation and go to the scalar filter. */
+    /* The SIMD filters take K = 5..rescue_prune_scratch_kmax and any weights (simd_wt), under the
+     * --meth relation too (filter_rel_kmer_table above K = 5); a <= 16 keeps a cnt in int16 (they
+     * fall back to the scalar filter where a sum would leave it). K = 3 and 4 (the band harness's
+     * k_min 3) have no SIMD instantiation and go to the scalar filter. */
     bool simd_ok() const
     {
-        return valid && a <= 16 && (K == 5 || (K > 5 && K <= rescue_prune_scratch_kmax && relx < 0));
+        return valid && a <= 16 && K >= 5 && K <= rescue_prune_scratch_kmax;
     }
     rescue_prune_neon::Wt simd_wt() const
     {
@@ -522,7 +526,7 @@ static inline bool rescue_meth_rel_matrix_ok(const int8_t *mat, int hyp, int a, 
  * On x86 no --meth, where the cheaper kswv leaves nothing to win (Zen 5, EM-seq genomic
  * +0.1 %, collapsed -B 4 +1.6 %, TAPS +5.0 %; the relation filter, single thread over 5.57 M TAPS
  * rescue jobs, costs 8.0 s to save about 5 thread-s of kswv), and only where the SIMD filter runs
- * (simd_ok: K = 5, or 6 to 8 with exact matching, a <= 16): the scalar filter costs more than it
+ * (simd_ok: K = 5 to 8, a <= 16): the scalar filter costs more than it
  * saves against the cheaper x86 kswv (Zen 5 AVX-512, prune on vs off, scalar-filtered: -O 8 -E 2 +13.3 / +4.7 %, -x intractg
  * +14.6 / +4.9 %), while the SIMD filter at those scorings wins or breaks even (Zen 3 AVX2: -O 8
  * -E 2 -2.6 / -7.2 %, -x intractg -0.3 / -6.2 %; Zen 5: all within 1 %), and not at the AVX-512BW
