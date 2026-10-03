@@ -332,10 +332,10 @@ not yet carry this change.
 
 ## Degenerate numeric inputs (fail-fast, not silent)
 
-Two degenerate command lines that upstream bwa/bwa-mem2 accept but then mishandle
-are now rejected at parse, and the underlying divides are guarded defensively
+Three degenerate command lines that upstream bwa/bwa-mem2 accept but then mishandle
+are now rejected at parse; for the first two the underlying divides are also guarded defensively
 ([#460](https://github.com/fg-labs/bwa-mem3/pull/460)).
-Both change behavior **only** on these degenerate inputs; all valid inputs are
+All three change behavior **only** on these degenerate inputs; all valid inputs are
 byte-identical — the full byte-identity suite (the `wgs-5M` / `wes-5M` / `hic-1M`
 alignment-record streams on x86 with the `c6a`/`c8g` cross-architecture check
 described above, plus the CI record-level phiX paired-end regression on the
@@ -353,6 +353,18 @@ non-degenerate input:
   yielding `NaN` that collapses every pair score to 0 and silently disables
   pair-aware placement. `-I` now requires a positive std; `mem_pair` guards the
   divide (treating `std == 0` as `ns == 0`) so the `mem_pestat` path is safe too.
+  It also requires the mean itself: `strtod` reads a missing one (`-I ,50`) as 0,
+  which upstream runs with.
+- **A negative `-O`** (gap open cheaper than an extension, `o + e < e`): the
+  SIMD Smith-Waterman kernels assume a non-negative open: the mate-rescue
+  kernels (`kswv`) return scores, ends and suboptimal scores that differ from
+  the exact affine-gap DP, the striped `ksw_u8`/`ksw_i16` return differing
+  scores on some of the same inputs, and upstream returns those inexact
+  results. `-O` now requires non-negative
+  integers (`0` stays valid), parsed like `-E`: the old parser silently dropped
+  a non-digit second value, so `-O 8,-1` ran with an insertion open of 8, and a
+  first value with no digits (`-O ''`, `-O ,1`), which `strtol` reads as a valid
+  0, is rejected too ([#554](https://github.com/fg-labs/bwa-mem3/pull/554)).
 
 ## What is preserved
 

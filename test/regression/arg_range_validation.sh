@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # test/regression/arg_range_validation.sh
 #
-# Asserts that `mem` rejects a non-positive gap-extension penalty (-E) and a
-# non-positive insert-size standard deviation (-I mean,std) at parse time, with
-# a clear ERROR: message, instead of dividing by zero downstream:
+# Asserts that `mem` rejects, at parse time and with a clear ERROR: message, a
+# non-positive gap-extension penalty (-E), a non-positive insert-size standard
+# deviation (-I mean,std) and a negative gap-open penalty (-O):
 #   - -E 0 divides by zero in cal_max_gap; the (int) cast of the inf/NaN result
 #     is UB that resolves differently per architecture (arch-divergent bands).
 #   - -I mean,0 divides by zero in mem_pair; the NaN collapses every pair score
 #     to 0 and silently disables pair-aware placement.
+#   - -O -1 makes a gap open cheaper than an extension, which the SIMD
+#     Smith-Waterman kernels do not compute exactly (see the -O checks below).
 #
 # Validation fires during option parsing, before the reference is opened, so
 # /dev/null placeholders suffice — no fixture is needed. The message (not just a
@@ -54,6 +56,26 @@ check_reject "-E 4294967297" "ERROR: -E gap-extension penalty must be a positive
 check_reject "-E 5,4294967297" "ERROR: -E gap-extension penalty must be a positive integer" -E 5,4294967297
 check_reject "-I 300,0" "ERROR: -I standard deviation must be a positive number" -I 300,0
 
+# A negative gap-open penalty makes opening a gap cheaper than extending one
+# (o + e < e), which the SIMD Smith-Waterman kernels do not support: the
+# mate-rescue kernels (kswv) return scores, ends and suboptimal scores that
+# differ from the exact affine-gap DP, and the striped ksw_u8/ksw_i16 return
+# differing scores on some of the same inputs. Upstream
+# bwa/bwa-mem2 accept the value and return those inexact results; reject it at
+# parse instead. -O 0 stays valid. The parse is the -E one: a complete token,
+# no sign, no ERANGE, at most INT_MAX, so 8,-1 (whose second value the old
+# parser silently dropped, leaving the insertion open at 8) is rejected too.
+check_reject "-O -1" "ERROR: -O gap-open penalty must be a non-negative integer" -O -1
+check_reject "-O 8,-1" "ERROR: -O gap-open penalty must be a non-negative integer" -O 8,-1
+check_reject "-O -1,6" "ERROR: -O gap-open penalty must be a non-negative integer" -O -1,6
+check_reject "-O 6x" "ERROR: -O gap-open penalty must be a non-negative integer" -O 6x
+check_reject "-O 4294967297" "ERROR: -O gap-open penalty must be a non-negative integer" -O 4294967297
+# strtol() returns 0 for a token with no digits, and 0 is a valid -O, so an
+# empty or missing first value must be rejected on the parse itself: "" would
+# otherwise run with both opens at 0, and ",1" with a deletion open of 0.
+check_reject "-O ''" "ERROR: -O gap-open penalty must be a non-negative integer" -O ''
+check_reject "-O ,1" "ERROR: -O gap-open penalty must be a non-negative integer" -O ,1
+
 # A non-finite -I mean or std (nan/inf, or an overflowing token that strtod maps
 # to inf) reaches an (int) cast whose result is undefined and arch-divergent;
 # reject it at parse rather than casting inf/NaN downstream.
@@ -70,6 +92,9 @@ check_reject "-E 5abc" "ERROR: -E gap-extension penalty must be a positive integ
 check_reject "-E 5,3xyz" "ERROR: -E gap-extension penalty must be a positive integer" -E 5,3xyz
 check_reject "-I 300,50xy" "ERROR: -I expects mean" -I 300,50xy
 check_reject "-I 300,50,junk" "ERROR: -I expects mean" -I 300,50,junk
+# strtod() returns 0 for a token with no digits, so a missing mean (",50") would
+# run with a mean insert size of 0 and the given std; require the mean itself.
+check_reject "-I ,50" "ERROR: -I expects mean" -I ,50
 
 # A mean (or explicit max/min) large enough that the rounded insert-size bound
 # overflows int makes the (int) cast UB; reject on the double before casting.
@@ -86,4 +111,4 @@ check_reject "-c -1" "ERROR: -c max occurrences must be a positive integer" -c -
 check_reject "-c 5abc" "ERROR: -c max occurrences must be a positive integer" -c 5abc
 check_reject "-c 4294967297" "ERROR: -c max occurrences must be a positive integer" -c 4294967297
 
-echo "PASS: arg_range_validation (-E, -I, and -c reject non-positive, non-finite, out-of-range, and trailing-garbage values)"
+echo "PASS: arg_range_validation (-E, -I, and -c reject non-positive, -O rejects negative, -O and -I reject a first value with no digits, and all reject non-finite, out-of-range, and trailing-garbage values)"

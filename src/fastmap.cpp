@@ -2235,10 +2235,40 @@ int main_mem(int argc, char *argv[])
         }
         else if (c == 'O')
         {
+            // A negative gap open makes opening a gap cheaper than extending one
+            // (o + e < e). The SIMD Smith-Waterman kernels assume it is not:
+            // kswv (mate rescue) returns scores, ends and suboptimal scores that
+            // differ from the exact affine-gap DP there, and the striped
+            // ksw_u8/ksw_i16 return differing scores on some of the same inputs.
+            // So reject it rather than align inexactly.
+            // Upstream bwa/bwa-mem2 accept it and return those inexact results.
+            // Parse as -E does: each value as a long, the whole token consumed
+            // (the old parser silently dropped a non-digit second value, so
+            // -O 8,-1 ran with an insertion open of 8), no ERANGE, and at most
+            // INT_MAX before narrowing. Zero stays valid, so a first value with
+            // no digits ("" or ",1"), which strtol() also returns as 0, is
+            // rejected on the parse itself rather than on its value.
             opt0.o_del = opt0.o_ins = 1;
-            opt->o_del = opt->o_ins = strtol(optarg, &p, 10);
-            if (*p != 0 && ispunct(*p) && isdigit(p[1]))
-                opt->o_ins = strtol(p+1, &p, 10);
+            errno = 0;
+            long o_del_val = strtol(optarg, &p, 10);
+            int o_no_digits = (p == optarg);
+            int o_range = (errno == ERANGE);
+            long o_ins_val = o_del_val;
+            if (*p != 0 && ispunct(*p) && (isdigit(p[1]) || p[1] == '-')) {
+                errno = 0;
+                o_ins_val = strtol(p + 1, &p, 10);
+                o_range = o_range || (errno == ERANGE);
+            }
+            if (o_no_digits || o_range || *p != 0 || o_del_val < 0 || o_del_val > INT_MAX ||
+                o_ins_val < 0 || o_ins_val > INT_MAX) {
+                fprintf(stderr, "ERROR: -O gap-open penalty must be a non-negative integer in 0..%d (got %s)\n",
+                        INT_MAX, optarg);
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+            opt->o_del = (int)o_del_val;
+            opt->o_ins = (int)o_ins_val;
         }
         else if (c == 'E')
         {
@@ -2701,6 +2731,14 @@ int main_mem(int argc, char *argv[])
             aux.pes0 = pes;
             pes[1].failed = 0;
             pes[1].avg = strtod(optarg, &p);
+            // strtod() returns 0 for a token with no digits, so a missing mean
+            // (e.g. -I ,50) would run with a mean insert size of 0; require it.
+            if (p == optarg) {
+                fprintf(stderr, "ERROR: -I expects mean[,std[,max[,min]]] numeric values (got %s)\n", optarg);
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
             pes[1].std = pes[1].avg * .1;
             if (*p != 0 && ispunct(*p) && isdigit(p[1]))
                 pes[1].std = strtod(p+1, &p);

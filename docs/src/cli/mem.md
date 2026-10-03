@@ -440,7 +440,7 @@ individual flags are unaffected.
 |------|---------|---------|
 | `-A INT` | 1 | Score for a sequence match. Scales `-T`, `-d`, `-B`, `-O`, `-E`, `-L`, `-U` unless overridden. |
 | `-B INT` | 4 | Mismatch penalty. |
-| `-O INT[,INT]` | 6,6 | Gap open penalty for deletions and insertions respectively. |
+| `-O INT[,INT]` | 6,6 | Gap open penalty for deletions and insertions respectively. Must be non-negative: a negative open is rejected, because the SIMD alignment kernels do not compute it exactly (upstream accepts it). |
 | `-E INT[,INT]` | 1,1 | Gap extension penalty per base. A gap of length k costs `-O + -E * k`. |
 | `-L INT[,INT]` | 5,5 | Clipping penalty for 5' and 3' ends. |
 | `-U INT` | 17 | Penalty for an unpaired read pair (affects mate-rescue scoring). |
