@@ -1,5 +1,63 @@
 # Changelog
 
+## [0.14.0](https://github.com/fg-labs/bwa-mem3/compare/v0.13.0...v0.14.0) (2026-10-03)
+
+
+### ⚠ BREAKING CHANGES
+
+* **meth:** under --meth, MD now lists bisulfite conversions, so it no longer matches bwameth.py's MD. NM is unchanged, so it is now smaller than the edit count MD and CIGAR imply. samtools calmd now leaves MD as is and flags only NM, which it and Picard ValidateSamFile already flagged before.
+
+### Features
+
+* **rescue:** exact rescue pruning and banding at general scoring and under --meth ([#541](https://github.com/fg-labs/bwa-mem3/issues/541)) ([4054988](https://github.com/fg-labs/bwa-mem3/commit/4054988b94186808a8a4883ab8e05021addbe88c))
+
+
+### Bug Fixes
+
+* **extension:** give the exact retry ladder upstream's two rungs ([#543](https://github.com/fg-labs/bwa-mem3/issues/543)) ([c4247b6](https://github.com/fg-labs/bwa-mem3/commit/c4247b6bc08574a42cf7cfa25237e789bf746a0f))
+* **extension:** keep a negative-h0 lane's score independent of its SIMD group ([#528](https://github.com/fg-labs/bwa-mem3/issues/528)) ([77b9e58](https://github.com/fg-labs/bwa-mem3/commit/77b9e58a9b5dd4345b757cd979f8d29750c64381))
+* **extension:** make the ungapped HIT commit match the extension kernel ([#544](https://github.com/fg-labs/bwa-mem3/issues/544)) ([0187563](https://github.com/fg-labs/bwa-mem3/commit/0187563e383a52bf806a4dd6772e058873e6b0f7))
+* **extension:** stage a chain's windows once, not once per seed ([#524](https://github.com/fg-labs/bwa-mem3/issues/524)) ([8119423](https://github.com/fg-labs/bwa-mem3/commit/81194237bee1700cd7ff78f64b6ed8985458b7d4))
+* **extension:** stop the exact retry ladder only on its own test ([#540](https://github.com/fg-labs/bwa-mem3/issues/540)) ([cfc7d66](https://github.com/fg-labs/bwa-mem3/commit/cfc7d66c3cf0d19297b92d674ed763e8b587f01b))
+* **index:** give each parallel index-load worker its own file descriptor ([#552](https://github.com/fg-labs/bwa-mem3/issues/552)) ([f6c8744](https://github.com/fg-labs/bwa-mem3/commit/f6c87448ceb38e68f0b7917bde30720fc658582b))
+* **mem:** reject a negative -O gap-open penalty at parse ([#554](https://github.com/fg-labs/bwa-mem3/issues/554)) ([2445542](https://github.com/fg-labs/bwa-mem3/commit/244554232021a6de6ddcf2d634a674e81f058763))
+* **meth:** copy a read's original bases whole instead of with strdup ([#526](https://github.com/fg-labs/bwa-mem3/issues/526)) ([51ceed7](https://github.com/fg-labs/bwa-mem3/commit/51ceed7531e1d843dd2dd743ad95931c385873ca))
+* **meth:** give a rescued mate its own strand when the anchor is reverse ([#553](https://github.com/fg-labs/bwa-mem3/issues/553)) ([952c211](https://github.com/fg-labs/bwa-mem3/commit/952c2111f546e543d8a30f3d042f57abc62a7866))
+* **meth:** keep MD literal under --meth so it lists conversions ([#550](https://github.com/fg-labs/bwa-mem3/issues/550)) ([f0cb34a](https://github.com/fg-labs/bwa-mem3/commit/f0cb34a2dbf5e79fbc799f7524afd81bdb27e669))
+* prevent self-recursive calloc in allocator tests under GCC -O2+ ([#551](https://github.com/fg-labs/bwa-mem3/issues/551)) ([86a6111](https://github.com/fg-labs/bwa-mem3/commit/86a61118063915d27c11cb6d403bd92e8e6ca131))
+
+
+### Performance
+
+* **chain:** run-length ungapped walk, pass-3 kept-set index, flat chaining index ([#531](https://github.com/fg-labs/bwa-mem3/issues/531)) ([15c44ea](https://github.com/fg-labs/bwa-mem3/commit/15c44eaa52e45a1c51c1a7cf406e139b31fd87a7))
+* **compat:** let --compat use the contained-seed extension skip ([#545](https://github.com/fg-labs/bwa-mem3/issues/545)) ([204acc5](https://github.com/fg-labs/bwa-mem3/commit/204acc5615f938b450f7085908f4c5d94ab08c69))
+* **kswv:** 11-op rescue cell on every kswv tier, faster NEON rescue filter, two-row banded kernel ([#536](https://github.com/fg-labs/bwa-mem3/issues/536)) ([c13c602](https://github.com/fg-labs/bwa-mem3/commit/c13c6023e67ea4139c5a606c645660480cd7abe8))
+* **mem:** never purge mimalloc pages by default ([#523](https://github.com/fg-labs/bwa-mem3/issues/523)) ([5ce3f1e](https://github.com/fg-labs/bwa-mem3/commit/5ce3f1ec528f4ca7f510444b90b4fe9b8aa31f36))
+* **pair:** convert the no-pairing anchor region once ([#525](https://github.com/fg-labs/bwa-mem3/issues/525)) ([28df96b](https://github.com/fg-labs/bwa-mem3/commit/28df96b36778458bf08ad3aa2ec5a56b4e91bdb1))
+* **profiling:** stop worker threads sharing tprof cache lines ([#522](https://github.com/fg-labs/bwa-mem3/issues/522)) ([71c3814](https://github.com/fg-labs/bwa-mem3/commit/71c3814d5aed5de31cd8028d800cd59cad4ef48d))
+* **rescue:** derive the run-constant rescue decisions once per run ([#555](https://github.com/fg-labs/bwa-mem3/issues/555)) ([9cb1a5b](https://github.com/fg-labs/bwa-mem3/commit/9cb1a5bd78a161153591e139eb8f0c2bb699809e))
+* **rescue:** exact 5-mer pruning of mate-rescue windows and an 11-op NEON rescue cell ([#533](https://github.com/fg-labs/bwa-mem3/issues/533)) ([ce9a0b9](https://github.com/fg-labs/bwa-mem3/commit/ce9a0b9c5230605674a21f6c78d635e995537887))
+* **rescue:** exact banded NEON DP for mate-rescue passes 0 and 1 ([#535](https://github.com/fg-labs/bwa-mem3/issues/535)) ([783516c](https://github.com/fg-labs/bwa-mem3/commit/783516c94a9017251aa21bea24bfc5284ca6df86))
+* **rescue:** exact pruning and banding under --meth=taps, and the AVX-512BW signed-domain u8 cell ([#546](https://github.com/fg-labs/bwa-mem3/issues/546)) ([efc06d8](https://github.com/fg-labs/bwa-mem3/commit/efc06d8a55561c8e845312544b2f9d6cdba3cc80))
+* **rescue:** exact pruning for 16-bit rescue jobs, a seed-length AVX-512 prune gate, and faster AVX2 kswv bodies ([#542](https://github.com/fg-labs/bwa-mem3/issues/542)) ([1537562](https://github.com/fg-labs/bwa-mem3/commit/1537562fd6b945f4a2614a75d899531dcbc0896e))
+* **rescue:** exact pruning with K-mers up to 8 under --meth ([#556](https://github.com/fg-labs/bwa-mem3/issues/556)) ([a196487](https://github.com/fg-labs/bwa-mem3/commit/a196487a8c9b82fc06bfebe2ff23289966da0555))
+* **rescue:** exact pruning with K-mers up to 8, an early B1 exit and a chained 5-mer prefilter ([#548](https://github.com/fg-labs/bwa-mem3/issues/548)) ([46156e0](https://github.com/fg-labs/bwa-mem3/commit/46156e055c344ffa1ab6d18e58ae6542f7e973b6))
+* **rescue:** skip or incrementally apply the post-rescue dedup, reuse filter components in band planning, and rescue developer docs with a source lint ([#537](https://github.com/fg-labs/bwa-mem3/issues/537)) ([e4edc74](https://github.com/fg-labs/bwa-mem3/commit/e4edc74177aa904bbecdb8ba6776fbf941665dd6))
+* **rescue:** x86 port of exact rescue pruning and the banded DP, on by default at -k 19 ([#538](https://github.com/fg-labs/bwa-mem3/issues/538)) ([c2812d7](https://github.com/fg-labs/bwa-mem3/commit/c2812d73df02416cd546df2f5a6a0702002f3819))
+* **seed:** run the third-pass bwtseed lockstep at every thread count ([#530](https://github.com/fg-labs/bwa-mem3/issues/530)) ([a476eed](https://github.com/fg-labs/bwa-mem3/commit/a476eed6a03a2fe1fe10ae0dff4ad5a0709e2511))
+
+
+### Refactoring
+
+* **dedup-reads:** convert each read to 2-bit exactly once ([#534](https://github.com/fg-labs/bwa-mem3/issues/534)) ([87cf916](https://github.com/fg-labs/bwa-mem3/commit/87cf916effc84e1670be275c6b9801a78833ed2a))
+
+
+### Documentation
+
+* correct how other bisulfite aligners report NM/MD ([#549](https://github.com/fg-labs/bwa-mem3/issues/549)) ([7f2e407](https://github.com/fg-labs/bwa-mem3/commit/7f2e40767909f5d34e451b37205e5c8e46106035))
+* **readme:** update performance tables for v0.13.0 ([#518](https://github.com/fg-labs/bwa-mem3/issues/518)) ([c28e989](https://github.com/fg-labs/bwa-mem3/commit/c28e989e0cc340902fcd1fbefcbecdb326c4e40f))
+* route benchmark references through a single Benchmarks page ([#521](https://github.com/fg-labs/bwa-mem3/issues/521)) ([f3a72ac](https://github.com/fg-labs/bwa-mem3/commit/f3a72ac2ff4c5aafece990cf6d463f3c6833d14c))
+
 ## [0.13.0](https://github.com/fg-labs/bwa-mem3/compare/v0.12.0...v0.13.0) (2026-09-21)
 
 
