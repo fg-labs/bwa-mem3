@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.1](https://github.com/fg-labs/bwa-mem3/compare/v0.14.0...v0.14.1) (2026-10-04)
+
+
+### Documentation
+
+* **readme:** update performance tables for v0.14.0 ([#557](https://github.com/fg-labs/bwa-mem3/issues/557)) ([9d962a9](https://github.com/fg-labs/bwa-mem3/commit/9d962a9df37aa21f728e1683eaf28767cafe3963))
+
 ## [0.14.0](https://github.com/fg-labs/bwa-mem3/compare/v0.13.0...v0.14.0) (2026-10-03)
 
 
