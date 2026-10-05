@@ -225,6 +225,8 @@ jobs:
       # PASS is indistinguishable from the PASS it would print if it had
       # stopped checking anything, so the step below only means something once
       # the gate has been shown to still reject bad scripts.
+      - name: External timer discovery respects platform and path
+        run: bash test/regression/time_command_selftest.sh
       - name: Shell lint still detects bad scripts
         run: bash test/regression/shell_lint_selftest.sh
 

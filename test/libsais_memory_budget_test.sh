@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Memory-budget-honored test. Builds the 1 Mbp synthetic fixture under
-# several --max-memory settings, measures actual peak RSS via /usr/bin/time,
+# several --max-memory settings, measures actual peak RSS via an external time command,
 # and fails if peak exceeds the budget by more than 10% slack. The preflight
 # should gate any case where the libsais estimate would exceed the budget.
 #
-# Parses /usr/bin/time -l output on macOS and /usr/bin/time -v on Linux.
+# Parses BSD time -l output on macOS and GNU time -v on Linux.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
@@ -16,11 +16,9 @@ FA_SRC="$HERE/fixtures/synthetic_1mb.fa"
 }
 
 UNAME_S="$(uname -s)"
-if [[ "$UNAME_S" == "Darwin" ]]; then
-    TIME_CMD=(/usr/bin/time -l)
-else
-    TIME_CMD=(/usr/bin/time -v)
-fi
+# shellcheck source=scripts/time_command.sh
+source "$ROOT/scripts/time_command.sh"
+bwamem3_resolve_time "$UNAME_S"
 
 parse_peak() {
     # $1: timing output path. echoes peak RSS in bytes.
@@ -51,7 +49,7 @@ for budget_mib in 128 512 2048; do
     trap 'rm -rf "$TD"' EXIT
     cp "$FA_SRC" "$TD/t.fa"
     TIMING="$TD/time.out"
-    "${TIME_CMD[@]}" "$BWAMEM3" index --max-memory "${budget_mib}M" "$TD/t.fa" > "$TD/stdout" 2> "$TIMING" || {
+    LC_ALL=C "${TIME_CMD[@]}" "$BWAMEM3" index --max-memory "${budget_mib}M" "$TD/t.fa" > "$TD/stdout" 2> "$TIMING" || {
         echo "FAIL: build failed at --max-memory ${budget_mib}M"
         cat "$TIMING" | tail -20
         exit 1
