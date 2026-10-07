@@ -30,6 +30,44 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "kernel_dispatch.h"
 #include "bandedSWA.h"
 #include "utils.h"   /* xassert */
+
+/* Lane independence of the banded-extension kernels (8/16-bit, every tier).
+ *
+ * The kernels run one column range [beg, end) per SIMD group (the union of the
+ * lanes' bands) and mask each lane to its own band [head, tail]. The reference is
+ * bwa's scalar ksw_extend2 (scalarBandedSWA), which at row i computes j in
+ * [beg, end), stores eh[end] = {H(i, end-1), 0}, and leaves every cell right of
+ * end alone. Those cells are zero up to the furthest column it has computed (the
+ * trailing-zero scan that moved end left of them saw them zero) and the untouched
+ * h0-prefix seed row beyond it, and scalar re-reads one of them when its band grows
+ * by two columns in one row. A lane run alone usually has a column range equal to
+ * its band and does the same. Two things differed whenever the group's range
+ * reached past a lane's tail -- usually because ANOTHER lane widened it, so a lane's
+ * result depended on its group, and occasionally for a lane alone whose band clamp
+ * is narrower than the group's:
+ *
+ *   - column tail (scalar's end, never computed there) was computed and its gap
+ *     output E stored, where scalar has eh[end].e = 0: the F store now zeroes from
+ *     column tail on, with the row-argmax exclusion mask (j+1 > tail);
+ *   - the zeroing stores cleared the lane's seed-row cells right of its tail: at the
+ *     row start, a live lane whose clamped tail advanced by two past its all-time
+ *     maximum (maxend) gets the seed value written back at column maxend+1, the
+ *     one cell this row reads that scalar still holds as the seed (E = 0 is written
+ *     with it defensively; the F stores already leave that cell 0).
+ *
+ * The H zeroing stores agree with scalar (cells a lane leaves are zero), so they
+ * stay. The F store no longer masks left of head: head only moves right, so the
+ * lane never reads those cells as part of its band again (they can still widen
+ * the group's range, which no lane's result depends on). With these two rules
+ * every lane's result equals its result when scored alone, and the scalar
+ * reference, whatever pairs share its group. */
+/* The h0-prefix insertion seed at query column c >= 1 (H(-1, c-1)): what the wrappers
+ * write to H_h[c] and scalar's eh[c].h holds until first computed. */
+static inline int bsw_seed_row(int h0, int oe_ins, int e_ins, int c)
+{
+    long v = (long) h0 - oe_ins - (long) (c - 1) * e_ins;
+    return v > 0 ? (int) v : 0;
+}
 #if defined(__ARM_NEON) || defined(__aarch64__)
 /* neon_soa_pack.h remaps the nt4 ambiguity code to the kernels' query-N code.
  * These names live in kswv.cpp; this translation unit needs them too, so define
@@ -1160,13 +1198,14 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
     __mmask32 dmask = 0xFFFFFFFF;
 
     __m256i maxScore256 = hval;
-    for(j = 0; j < ncol; j++)
+    for(j = 0; j <= ncol; j++)   /* through column ncol: every F cell the kernel can read is defined */
         _mm256_store_si256((__m256i *)(F + j * SIMD_WIDTH8), zero256);
 
     __m256i y256 = zero256;   // best col as diagonal offset: col - i_at_capture (i_at_capture = xrow[l]-1)
     __m256i max_off256 = zero256;
     __m256i exit0 = _mm256_set1_epi8(0xFF);
     __m256i zdrop256 = _mm256_set1_epi8(zdrop);
+    __m256i maxend256 = _mm256_set1_epi8(-128);
 
     int beg = 0, end = ncol;
     int nbeg = beg, nend = end;
@@ -1238,6 +1277,20 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
         cache256 = _mm256_add_epi8(myband256, one256);                       // 1 + myband
         tail256 = _mm256_min_epi8(tail256, cache256);
         tail256 = _mm256_min_epi8(tail256, qlen_off256);
+        {   __m256i need_ = _mm256_and_si256(_mm256_cmpeq_epi8(_mm256_sub_epi8(tail256, maxend256), two256), exit0);
+            uint32_t nm_ = (uint32_t) _mm256_movemask_epi8(need_);
+            if (nm_) {
+                int8_t me_a[SIMD_WIDTH8] __attribute((aligned(32)));
+                _mm256_store_si256((__m256i *) me_a, maxend256);
+                /* byte penalties, as the 8-bit wrapper's set1_epi8 / subs_epu8 seed uses them */
+                const int oe_ = (uint8_t) (this->o_ins + this->e_ins), e_ = (uint8_t) this->e_ins;
+                while (nm_) { const int l = __builtin_ctz(nm_); nm_ &= nm_ - 1;
+                    const int c = i + me_a[l] + 1;
+                    H_h[c * SIMD_WIDTH8 + l] = (int8_t) (uint8_t) bsw_seed_row(h0[l], oe_, e_, c);
+                    F[c * SIMD_WIDTH8 + l] = 0; }
+            }
+            maxend256 = _mm256_max_epi8(maxend256, tail256);
+        }
 
         // NEW, trimming.
         __m256i cmph = _mm256_cmpeq_epi8(head256, phead256);
@@ -1353,19 +1406,19 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
                 hqe256   = _mm256_blendv_epi8(hqe256, h11, cmp); \
                 qfire256 = _mm256_blendv_epi8(qfire256, ff256, cmp); \
             }
-        // Masked body: verbatim the pre-EXT-13 inline loop.
+        // Masked body: the pre-EXT-13 inline loop, with the F store zeroing from column
+        // tail on (see the lane-independence note at the top of the file).
 #define EXT13_CELL8_256_MASKED { \
             EXT13_CELL8_256_COMMON \
             __m256i cmp1 = _mm256_cmpgt_epi8(head256, pj256); \
             __m256i cmp2 = _mm256_cmpgt_epi8(pj256, tail256); \
             cmp1 = _mm256_or_si256(cmp1, cmp2); \
             h10 = _mm256_andnot_si256(cmp1, h10); \
-            f21 = _mm256_andnot_si256(cmp1, f21); \
             __m256i bmaxRS = maxRS1; \
             maxRS1 =_mm256_max_epu8(maxRS1, h11); \
             __m256i cmpA = _mm256_cmpeq_epi8(maxRS1, h11); \
             cmp1 = _mm256_cmpgt_epi8(j256, tail256); \
-            cmp1 = _mm256_or_si256(cmp1, cmp2); \
+            f21 = _mm256_andnot_si256(cmp1, f21); \
             cmpA = _mm256_blendv_epi8(y1_256, j256, cmpA); \
             y1_256 = _mm256_blendv_epi8(cmpA, y1_256, cmp1); \
             maxRS1 = _mm256_blendv_epi8(maxRS1, bmaxRS, cmp1); \
@@ -1678,6 +1731,7 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
         index256 = _mm256_add_epi8(index256, two256);
         // signed min in the offset frame against qlen-i
         tail256 = _mm256_min_epi8(index256, qlen_off256);
+        maxend256 = _mm256_subs_epi8(maxend256, one256);
 
         // Frame shift for the next row: i advances by 1, so the same absolute
         // band edge has its diagonal offset (col - i) decremented by 1. Keep
@@ -2057,7 +2111,7 @@ void BandedPairWiseSW::smithWaterman256_16(uint16_t seq1SoA[],
     __mmask32 dmask32 = 0xAAAAAAAA;
         
     __m256i maxScore256 = hval;
-    for(j = 0; j < ncol; j++)
+    for(j = 0; j <= ncol; j++)   /* through column ncol: every F cell the kernel can read is defined */
         _mm256_store_si256((__m256i *)(F + j * SIMD_WIDTH16), zero256);
     
     __m256i x256 = zero256;
@@ -2067,6 +2121,7 @@ void BandedPairWiseSW::smithWaterman256_16(uint16_t seq1SoA[],
     __m256i max_off256 = zero256;
     __m256i exit0 = _mm256_set1_epi16(0xFFFF);
     __m256i zdrop256 = _mm256_set1_epi16(zdrop);
+    __m256i maxend256 = _mm256_set1_epi16((int16_t) 0x8000);
     
     int beg = 0, end = ncol;
     int nbeg = beg, nend = end;
@@ -2110,6 +2165,19 @@ void BandedPairWiseSW::smithWaterman256_16(uint16_t seq1SoA[],
         cache256 = _mm256_add_epi16(i1_256, myband256);
         tail256 = _mm256_min_epu16(tail256, cache256);
         tail256 = _mm256_min_epu16(tail256, qlen256);
+        {   __m256i need_ = _mm256_and_si256(_mm256_cmpeq_epi16(_mm256_sub_epi16(tail256, maxend256), two256), exit0);
+            uint32_t nm_ = (uint32_t) _mm256_movemask_epi8(need_) & 0x55555555u;
+            if (nm_) {
+                int16_t me_a[SIMD_WIDTH16] __attribute((aligned(32)));
+                _mm256_store_si256((__m256i *) me_a, maxend256);
+                const int oe_ = this->o_ins + this->e_ins;
+                while (nm_) { const int l = __builtin_ctz(nm_) >> 1; nm_ &= nm_ - 1;
+                    const int c = me_a[l] + 1;
+                    H_h[c * SIMD_WIDTH16 + l] = (int16_t) bsw_seed_row((int16_t) h0[l], oe_, this->e_ins, c);
+                    F[c * SIMD_WIDTH16 + l] = 0; }
+            }
+            maxend256 = _mm256_max_epi16(maxend256, tail256);
+        }
 
         // NEW, trimming.
         __m256i cmph = _mm256_cmpeq_epi16(head256, phead256);
@@ -2208,7 +2276,6 @@ void BandedPairWiseSW::smithWaterman256_16(uint16_t seq1SoA[],
             __m256i cmp1 = _mm256_cmpgt_epi16(pj256, tail256);
             cmp1 = _mm256_or_si256(cmp1, cmp2);
             h10 = _mm256_andnot_si256(cmp1, h10);
-            f21 = _mm256_andnot_si256(cmp1, f21);
             
             __m256i bmaxRS = maxRS1;
             maxRS1 =_mm256_max_epi16(maxRS1, h11);
@@ -2218,7 +2285,8 @@ void BandedPairWiseSW::smithWaterman256_16(uint16_t seq1SoA[],
             // is the exact combined mask — bit-identical, drops a cmpgt+or.
             __m256i cmpA = _mm256_cmpeq_epi16(maxRS1, h11);
             cmp1 = _mm256_cmpgt_epi16(j256, tail256); // change
-            cmp1 = _mm256_or_si256(cmp1, cmp2);         // change
+            f21 = _mm256_andnot_si256(cmp1, f21);
+            cmp1 = _mm256_or_si256(cmp1, cmp2);
             cmpA = _mm256_blendv_epi16(y1_256, j256, cmpA);
             y1_256 = _mm256_blendv_epi16(cmpA, y1_256, cmp1);
             maxRS1 = _mm256_blendv_epi16(maxRS1, bmaxRS, cmp1);                     
@@ -3072,12 +3140,13 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
     __mmask64 dmask = 0xFFFFFFFFFFFFFFFFULL;
 
     __m512i maxScore512 = hval;
-    for(j = 0; j < ncol; j++)
+    for(j = 0; j <= ncol; j++)   /* through column ncol: every F cell the kernel can read is defined */
         _mm512_store_si512((__m512i *)(F + j * SIMD_WIDTH8), zero512);
 
     __m512i y512       = zero512;   // best col as diagonal offset: col - i_at_capture (i_at_capture = xrow[l]-1)
     __m512i max_off512 = zero512;
     __m512i exit0      = _mm512_set1_epi8(0xFF);
+    __m512i maxend512 = _mm512_set1_epi8(-128);
     __m512i zdrop512   = _mm512_set1_epi8(zdrop);
 
     int beg = 0, end = ncol;
@@ -3152,6 +3221,19 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
         cache512 = _mm512_add_epi8(myband512, one512);                       // 1 + myband
         tail512 = _mm512_min_epi8(tail512, cache512);
         tail512 = _mm512_min_epi8(tail512, qlen_off512);
+        {   __mmask64 nm_ = _mm512_cmpeq_epi8_mask(_mm512_sub_epi8(tail512, maxend512), two512) & _mm512_movepi8_mask(exit0);
+            if (nm_) {
+                int8_t me_a[SIMD_WIDTH8] __attribute((aligned(64)));
+                _mm512_store_si512((__m512i *) me_a, maxend512);
+                /* byte penalties, as the 8-bit wrapper's set1_epi8 / subs_epu8 seed uses them */
+                const int oe_ = (uint8_t) (this->o_ins + this->e_ins), e_ = (uint8_t) this->e_ins;
+                while (nm_) { const int l = __builtin_ctzll(nm_); nm_ &= nm_ - 1;
+                    const int c = i + me_a[l] + 1;
+                    H_h[c * SIMD_WIDTH8 + l] = (int8_t) (uint8_t) bsw_seed_row(h0[l], oe_, e_, c);
+                    F[c * SIMD_WIDTH8 + l] = 0; }
+            }
+            maxend512 = _mm512_max_epi8(maxend512, tail512);
+        }
 
         // NEW, trimming.
         __mmask64 cmph = _mm512_cmpeq_epi8_mask(head512, phead512);
@@ -3262,18 +3344,19 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
                 hqe512   = _mm512_mask_blend_epi8(cmp, hqe512, h11); \
                 qfire512 = _mm512_mask_blend_epi8(cmp, qfire512, ff512); \
             }
-        // Masked body: verbatim the pre-EXT-13 inline loop.
+        // Masked body: the pre-EXT-13 inline loop, with the F store zeroing from column
+        // tail on (see the lane-independence note at the top of the file).
 #define EXT13_CELL8_512_MASKED { \
             EXT13_CELL8_512_COMMON \
             __mmask64 cmp2 = _mm512_cmpgt_epi8_mask(head512, pj512); \
             __mmask64 cmp1 = _mm512_cmpgt_epi8_mask(pj512, tail512); \
             cmp1 = cmp1 | cmp2; \
             h10 = _mm512_mask_blend_epi8(cmp1, h10, zero512); \
-            f21 = _mm512_mask_blend_epi8(cmp1, f21, zero512); \
             __m512i bmaxRS = maxRS1, blend512; \
             maxRS1 =_mm512_max_epu8(maxRS1, h11); \
             __mmask64 cmpA = _mm512_cmpeq_epi8_mask(maxRS1, h11); \
             cmp1 = _mm512_cmpgt_epi8_mask(j512, tail512); \
+            f21 = _mm512_mask_blend_epi8(cmp1, f21, zero512); \
             cmp1 = cmp1 | cmp2; \
             blend512 = _mm512_mask_blend_epi8(cmpA, y1_512, j512); \
             y1_512 = _mm512_mask_blend_epi8(cmp1, blend512, y1_512); \
@@ -3567,6 +3650,7 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
         index512 = _mm512_add_epi8(index512, two512);
         // signed min in the offset frame against qlen-i
         tail512 = _mm512_min_epi8(index512, qlen_off512);
+        maxend512 = _mm512_subs_epi8(maxend512, one512);
 
         // Frame shift for the next row: i advances by 1, so the same absolute
         // band edge has its diagonal offset (col - i) decremented by 1. Keep
@@ -3968,7 +4052,7 @@ void BandedPairWiseSW::smithWaterman512_16(uint16_t seq1SoA[],
     
 ///////
     __m512i maxScore512 = hval;
-    for(j = 0; j < ncol; j++)
+    for(j = 0; j <= ncol; j++)   /* through column ncol: every F cell the kernel can read is defined */
         _mm512_store_si512((__m512i *)(F + j * SIMD_WIDTH16), zero512);
     
     __m512i x512       = zero512;
@@ -3977,6 +4061,7 @@ void BandedPairWiseSW::smithWaterman512_16(uint16_t seq1SoA[],
     __m512i gscore     = _mm512_set1_epi16(-1);
     __m512i max_off512 = zero512;
     __m512i exit0      = _mm512_set1_epi16(dmask4);
+    __m512i maxend512 = _mm512_set1_epi16((int16_t) 0x8000);
     __m512i zdrop512   = _mm512_set1_epi16(zdrop);
 
     int beg = 0, end = ncol;
@@ -4022,6 +4107,18 @@ void BandedPairWiseSW::smithWaterman512_16(uint16_t seq1SoA[],
         cache512 = _mm512_add_epi16(i1_512, myband512);
         tail512  = _mm512_min_epu16(tail512, cache512);
         tail512  = _mm512_min_epu16(tail512, qlen512);
+        {   __mmask32 nm_ = _mm512_cmpeq_epi16_mask(_mm512_sub_epi16(tail512, maxend512), two512) & _mm512_movepi16_mask(exit0);
+            if (nm_) {
+                int16_t me_a[SIMD_WIDTH16] __attribute((aligned(64)));
+                _mm512_store_si512((__m512i *) me_a, maxend512);
+                const int oe_ = this->o_ins + this->e_ins;
+                while (nm_) { const int l = __builtin_ctz(nm_); nm_ &= nm_ - 1;
+                    const int c = me_a[l] + 1;
+                    H_h[c * SIMD_WIDTH16 + l] = (int16_t) bsw_seed_row((int16_t) h0[l], oe_, this->e_ins, c);
+                    F[c * SIMD_WIDTH16 + l] = 0; }
+            }
+            maxend512 = _mm512_max_epi16(maxend512, tail512);
+        }
         /* Banding ends */
         
         // NEW, trimming.
@@ -4116,7 +4213,6 @@ void BandedPairWiseSW::smithWaterman512_16(uint16_t seq1SoA[],
             __mmask32 cmp1 = _mm512_cmpgt_epi16_mask(pj512, tail512);
             cmp1 = cmp1 | cmp2;
             h10 = _mm512_mask_blend_epi16(cmp1, h10, zero512);
-            f21 = _mm512_mask_blend_epi16(cmp1, f21, zero512);
             
             /* Part of main code MAIN_CODE */
             __m512i bmaxRS = maxRS1, blend512;                                      
@@ -4126,7 +4222,8 @@ void BandedPairWiseSW::smithWaterman512_16(uint16_t seq1SoA[],
             // twin). Drops a cmpgt + kor per cell.
             __mmask32 cmpA = _mm512_cmpeq_epi16_mask(maxRS1, h11);
             cmp1 = _mm512_cmpgt_epi16_mask(j512, tail512);
-            cmp1 = cmp1 | cmp2;         
+            f21 = _mm512_mask_blend_epi16(cmp1, f21, zero512);
+            cmp1 = cmp1 | cmp2;
             blend512 = _mm512_mask_blend_epi16(cmpA, y1_512, j512);
             y1_512 = _mm512_mask_blend_epi16(cmp1, blend512, y1_512);
             maxRS1 = _mm512_mask_blend_epi16(cmp1, maxRS1, bmaxRS);                     
@@ -4226,8 +4323,10 @@ void BandedPairWiseSW::smithWaterman512_16(uint16_t seq1SoA[],
         tim1 = __rdtsc();
 #endif
         /* Setting of head and tail for each pair */
-        // beg = nbeg; end = l; // keep check on this!!
-        beg = nbeg; end = nend; 
+        /* The next row's range used to be assigned here, before the per-lane head/tail scans
+         * below, so a lane's tail scan started at the GROUP's next end and could pick up its
+         * own virgin seed cells beyond its tail whenever another lane widened nend (the other
+         * five kernels assign it at the row start only). Group-dependent; removed. */
         
         __m512i tail512_ = _mm512_sub_epi16(tail512, one512);
         __m512i exit1 = _mm512_xor_si512(exit0, ff512);
@@ -4976,7 +5075,7 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
     __mmask16 dmask16 = 0xAAAA;
     
     __m128i maxScore128 = hval;
-    for(j = 0; j < ncol; j++)
+    for(j = 0; j <= ncol; j++)   /* through column ncol: every F cell the kernel can read is defined */
         _mm_store_si128((__m128i *)(F + j * SIMD_WIDTH16), zero128);
     
     __m128i x128 = zero128;
@@ -4985,6 +5084,7 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
     __m128i max_off128 = zero128;
     __m128i exit0 = _mm_set1_epi16(0xFFFF);
     __m128i zdrop128 = _mm_set1_epi16(zdrop);
+    __m128i maxend128 = _mm_set1_epi16((int16_t) 0x8000);
     
     int beg = 0, end = ncol;
     int nbeg = beg, nend = end;
@@ -5027,6 +5127,21 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
         cache128 = _mm_add_epi16(i1_128, myband128);
         tail128 = _mm_min_epu16(tail128, cache128);
         tail128 = _mm_min_epu16(tail128, qlen128);
+        {   __m128i need_ = _mm_and_si128(_mm_cmpeq_epi16(_mm_sub_epi16(tail128, maxend128), two128), exit0);
+            if (any_lane_set8(need_)) {
+                int16_t need_a[SIMD_WIDTH16] __attribute((aligned(16)));
+                int16_t me_a[SIMD_WIDTH16]   __attribute((aligned(16)));
+                _mm_store_si128((__m128i *) need_a, need_);
+                _mm_store_si128((__m128i *) me_a, maxend128);
+                const int oe_ = this->o_ins + this->e_ins;
+                for (int l = 0; l < SIMD_WIDTH16; l++) if (need_a[l]) {
+                    const int c = me_a[l] + 1;
+                    H_h[c * SIMD_WIDTH16 + l] = (int16_t) bsw_seed_row((int16_t) h0[l], oe_, this->e_ins, c);
+                    F[c * SIMD_WIDTH16 + l] = 0;
+                }
+            }
+            maxend128 = _mm_max_epi16(maxend128, tail128);
+        }
         
         // NEW, trimming.
         __m128i cmph = _mm_cmpeq_epi16(head128, phead128);
@@ -5129,7 +5244,6 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
             __m128i cmp2 = _mm_cmpgt_epi16(pj128, tail128);
             cmp1 = _mm_or_si128(cmp1, cmp2);
             h10 = _mm_andnot_si128(cmp1, h10);   /* full-width mask: andnot == select-zero */
-            f21 = _mm_andnot_si128(cmp1, f21);
             
             __m128i bmaxRS = maxRS1;
             maxRS1 =_mm_max_epi16(maxRS1, h11);
@@ -5138,7 +5252,7 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
             // AVX2 and 128-bit-8 twins). Runs on NEON and x86 SSE4.1.
             __m128i cmpA = _mm_cmpeq_epi16(maxRS1, h11);
             cmp1 = _mm_cmpgt_epi16(j128, tail128); // change
-            cmp1 = _mm_or_si128(cmp1, cmp2);            // change           
+            f21 = _mm_andnot_si128(cmp1, f21);
             cmpA = _mm_blendv_epi16(y1_128, j128, cmpA);
             y1_128 = _mm_blendv_epi16(cmpA, y1_128, cmp1);
             maxRS1 = _mm_blendv_epi16(maxRS1, bmaxRS, cmp1);                        
@@ -5527,14 +5641,13 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
         __m128i cmp2 = _mm_cmpgt_epi8(pj128, tail128);                  \
         cmp1 = _mm_or_si128(cmp1, cmp2);                                \
         h10 = blendv_fullmask8(h10, zero128, cmp1);                     \
-        f21 = blendv_fullmask8(f21, zero128, cmp1);                     \
                                                                         \
         /* got this block out of MAIN_CODE */                           \
         __m128i bmaxRS = maxRS1;                                        \
         maxRS1 = _mm_max_epu8(maxRS1, h11);                            \
         __m128i cmpA = _mm_cmpeq_epi8(maxRS1, h11);                     \
         cmp1 = _mm_cmpgt_epi8(j128, tail128);                           \
-        cmp1 = _mm_or_si128(cmp1, cmp2);                                \
+        f21 = blendv_fullmask8(f21, zero128, cmp1);                     \
         cmpA = blendv_fullmask8(y1_128, j128, cmpA);                    \
         y1_128 = blendv_fullmask8(cmpA, y1_128, cmp1);                  \
         maxRS1 = blendv_fullmask8(maxRS1, bmaxRS, cmp1);                \
@@ -5557,8 +5670,8 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
 
 // EXT-13: unmasked fast-regime twin of DP_CELL_BODY8_128. For columns where
 // EVERY active lane is strictly in band -- pj in [max(head), min(tail)) over
-// active lanes -- the band mask (head>pj)|(pj>tail) is provably all-zero, so the
-// two store blends AND the argmax's cmp1 exclusion all fold to identity. This
+// active lanes -- the H store's band mask (head>pj)|(pj>tail) and the F store's and
+// argmax's (jpost>tail) mask are provably all-zero, so all three fold to identity. This
 // body drops them: it computes the DP cell, updates the row argmax unconditionally
 // (y1_128 <- j128 where h11 is the new max), and stores h10/f21 unmasked. Every
 // other observable -- h/e/f recurrence, the h10=h11 carry, and the gscore
@@ -6186,13 +6299,14 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
     __mmask16 dmask = 0xFFFF;
 
     __m128i maxScore128 = hval;
-    for(j = 0; j < ncol; j++)
+    for(j = 0; j <= ncol; j++)   /* through column ncol: every F cell the kernel can read is defined */
         _mm_store_si128((__m128i *)(F + j * SIMD_WIDTH8), zero128);
 
     __m128i y128 = zero128;   // best col as diagonal offset: col - i_at_capture (i_at_capture = xrow[l]-1, xrow16 under BSW8_ROW_LEAN)
     __m128i max_off128 = zero128;
     __m128i exit0 = _mm_set1_epi8(0xFF);
     __m128i zdrop128 = _mm_set1_epi8(zdrop);
+    __m128i maxend128 = _mm_set1_epi8(-128);   // all-time max tail (offset frame)
 #if BSW8_ROW_LEAN
     // The lean trim count and narrowing pass hold column offsets in [-w-1, w+1] as
     // int8 (the 127 "none" sentinel included), so they match the original only for
@@ -6279,6 +6393,27 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
         cache128 = _mm_add_epi8(myband128, one128);                       // 1 + myband
         tail128 = _mm_min_epi8(tail128, cache128);
         tail128 = _mm_min_epi8(tail128, qlen_off128);
+        {   /* Band-edge write (see the lane-independence note at the top of the file): the
+             * clamped tail advanced by two past this lane's all-time maximum, so this row
+             * reads column maxend+1, which scalar still holds as the untouched seed row and
+             * the group's zeroing store may have cleared. Tested on the CLAMPED tail: the
+             * unclamped scan result is tail+2 on every full-support row. */
+            __m128i need_ = _mm_and_si128(_mm_cmpeq_epi8(_mm_sub_epi8(tail128, maxend128), two128), exit0);
+            if (any_lane_set8(need_)) {
+                int8_t need_a[SIMD_WIDTH8] __attribute((aligned(16)));
+                int8_t me_a[SIMD_WIDTH8]   __attribute((aligned(16)));
+                _mm_store_si128((__m128i *) need_a, need_);
+                _mm_store_si128((__m128i *) me_a, maxend128);
+                /* byte penalties, as the 8-bit wrapper's set1_epi8 / subs_epu8 seed uses them */
+                const int oe_ = (uint8_t) (this->o_ins + this->e_ins), e_ = (uint8_t) this->e_ins;
+                for (int l = 0; l < SIMD_WIDTH8; l++) if (need_a[l]) {
+                    const int c = i + me_a[l] + 1;
+                    H_h[c * SIMD_WIDTH8 + l] = (int8_t) (uint8_t) bsw_seed_row(h0[l], oe_, e_, c);
+                    F[c * SIMD_WIDTH8 + l] = 0;
+                }
+            }
+            maxend128 = _mm_max_epi8(maxend128, tail128);
+        }
 
         // NEW, trimming.
         __m128i cmph = _mm_cmpeq_epi8(head128, phead128);
@@ -6944,6 +7079,7 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
         tail128 = _mm_min_epi8(index128, qlen_off128);
 #endif
 
+        maxend128 = _mm_subs_epi8(maxend128, one128);   /* frame shift, saturating */
         // Frame shift for the next row: i advances by 1, so the same absolute
         // band edge has its diagonal offset (col - i) decremented by 1. Keep
         // head/tail tracking the same columns as the frame moves.
