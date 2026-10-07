@@ -937,18 +937,51 @@ static long rb_dp_wave2(rb_work &w, int W, int NR, int omax, int ominq, int omas
             fa = vqsubq_u8(h0, vOI);   // max(h0 - oe_ins, sat(0 - e_ins))
             k--; ap += 16; qp += 16;
         }
-#define RB_W2_STEP(MASK)                                                                        \
+        /* The paired-row steps, as a two-deep software pipeline. A step is ~25 vector uops, but
+         * its load -> store dependency chain (the A / E / Hp loads, the score gather, h0a, h07a, ea,
+         * then h0b, h07b and the E store) is ~24 cycles long, so a rolled loop needs about four
+         * steps of uops waiting at once; Neoverse V2's vector issue queues hold fewer, and the
+         * rolled loop ran well above its issue floor. Each iteration therefore does, in program
+         * order:
+         *   RB_W2_S1 for step k - 2: the A, E[k - 2] and Hp[k - 2] loads, t = sat(Hp + score_a)
+         *      and the row r + 1 score gather;
+         *   RB_W2_S2 for step k - 1: h0a = max(t, e), h07a and ea;
+         *   RB_W2_POST for step k: the row r store and F, the rest of row r + 1, the E store, diag
+         *      and the row maxima.
+         * Only independent work moves earlier, so every cell computes the same expressions from
+         * the same inputs: Hp is never written here, and E[k - 2] is next written by step k - 4
+         * (the stores of steps k and k - 1 go to E[k + 2] and E[k + 1]), so S1 reads the value the
+         * rolled loop reads. A prologue fills the two stages and the drain finishes the last two
+         * steps, each masked exactly when k < kun, as in the loops. The loops are unrolled by two so the
+         * stage hand-off needs no vector movs (measured with clang; the GCC unroll pragma asks for
+         * the same shape). Apple M-series cores, whose windows are larger, also run it faster. */
+#if defined(__clang__)
+#define RB_W2_UNROLL2 _Pragma("clang loop unroll_count(2)")
+#elif defined(__GNUC__)
+#define RB_W2_UNROLL2 _Pragma("GCC unroll 2")
+#else
+#define RB_W2_UNROLL2
+#endif
+#define RB_W2_S1(KK, APTR, T, EV, SB)                                                          \
         {                                                                                      \
-            const uint8x16_t q = vld1q_u8(ap), e = vld1q_u8(E + k * 16);                       \
+            const uint8x16_t q = vld1q_u8(APTR);                                               \
+            EV = vld1q_u8(E + (KK) * 16);                                                      \
             const int8x16_t sca = vreinterpretq_s8_u8(vqtbl1q_u8(tbl, veorq_u8(q, rref_a)));   \
-            const uint8x16_t h0a = vmaxq_u8(vsqaddq_u8(vld1q_u8(Hp + k * 16), sca), e);        \
-            const uint8x16_t h07a = vqsubq_u8(h0a, vOI);                                       \
-            const uint8x16_t hda = Sym ? h07a : vqsubq_u8(h0a, vOD);                           \
+            T = vsqaddq_u8(vld1q_u8(Hp + (KK) * 16), sca);                                     \
+            SB = vreinterpretq_s8_u8(vqtbl1q_u8(tbl, veorq_u8(q, rref_b)));                    \
+        }
+#define RB_W2_S2(T, EV, H0A, H07A, EA)                                                         \
+        {                                                                                      \
+            H0A = vmaxq_u8(T, EV);                                                             \
+            H07A = vqsubq_u8(H0A, vOI);                                                        \
+            const uint8x16_t hda = Sym ? H07A : vqsubq_u8(H0A, vOD);                           \
+            EA = vmaxq_u8(hda, vqsubq_u8(EV, vED));                                            \
+        }
+#define RB_W2_POST(MASK)                                                                        \
+        {                                                                                      \
             const uint8x16_t ha = vmaxq_u8(h0a, fa);                                           \
             vst1q_u8(Ha + k * 16, ha);                                                         \
             fa = vmaxq_u8(h07a, vqsubq_u8(fa, vEI));                                           \
-            const uint8x16_t ea = vmaxq_u8(hda, vqsubq_u8(e, vED));   /* E in of (r+1, k+1) */ \
-            const int8x16_t scb = vreinterpretq_s8_u8(vqtbl1q_u8(tbl, veorq_u8(q, rref_b)));   \
             const uint8x16_t h0b = vmaxq_u8(vsqaddq_u8(diag, scb), ea);                        \
             const uint8x16_t h07b = vqsubq_u8(h0b, vOI);                                       \
             const uint8x16_t hdb = Sym ? h07b : vqsubq_u8(h0b, vOD);                           \
@@ -965,9 +998,41 @@ static long rb_dp_wave2(rb_work &w, int W, int NR, int omax, int ominq, int omas
                 rmax_b = vmaxq_u8(rmax_b, h0b);                                                \
             }                                                                                  \
         }
-        for (; k >= kun; k--, ap += 16, qp += 16) RB_W2_STEP(false)
-        for (; k >= klo_a; k--, ap += 16, qp += 16) RB_W2_STEP(true)
-#undef RB_W2_STEP
+#define RB_W2_ITER(MASK)                                                                        \
+        {                                                                                      \
+            uint8x16_t nt, ne, nh0a, nh07a, nea; int8x16_t nsb;                                \
+            RB_W2_S1(k - 2, ap + 32, nt, ne, nsb)                                              \
+            RB_W2_S2(t1, e1, nh0a, nh07a, nea)                                                 \
+            RB_W2_POST(MASK)                                                                   \
+            h0a = nh0a; h07a = nh07a; ea = nea; scb = sb1;                                     \
+            t1 = nt; e1 = ne; sb1 = nsb;                                                       \
+        }
+        if (k >= klo_a) {
+            uint8x16_t h0a, h07a, ea, t1, e1;
+            int8x16_t scb, sb1;
+            RB_W2_S1(k, ap, t1, e1, sb1)
+            RB_W2_S2(t1, e1, h0a, h07a, ea)
+            scb = sb1;
+            if (k > klo_a) RB_W2_S1(k - 1, ap + 16, t1, e1, sb1)
+            RB_W2_UNROLL2
+            for (; k > klo_a + 1 && k >= kun; k--, ap += 16, qp += 16) RB_W2_ITER(false)
+            RB_W2_UNROLL2
+            for (; k > klo_a + 1; k--, ap += 16, qp += 16) RB_W2_ITER(true)
+            if (k > klo_a) {
+                uint8x16_t nh0a, nh07a, nea;
+                RB_W2_S2(t1, e1, nh0a, nh07a, nea)
+                RB_W2_POST(k < kun)
+                h0a = nh0a; h07a = nh07a; ea = nea; scb = sb1;
+                k--; ap += 16; qp += 16;
+            }
+            RB_W2_POST(k < kun)
+            k--; ap += 16; qp += 16;
+        }
+#undef RB_W2_S1
+#undef RB_W2_S2
+#undef RB_W2_POST
+#undef RB_W2_ITER
+#undef RB_W2_UNROLL2
         if (klo_b == klo_a) {   // (r + 1, 0) alone: its partner (r, -1) does not exist; E in = slot 0 = 0
             const uint8x16_t q = vld1q_u8(ap);
             const int8x16_t scb = vreinterpretq_s8_u8(vqtbl1q_u8(tbl, veorq_u8(q, rref_b)));

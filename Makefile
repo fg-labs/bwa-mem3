@@ -1005,6 +1005,17 @@ rescue_band_harness: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) $(if $(filter 1,$(USE
 test/rescue_band_harness.o: test/rescue_band_harness.cpp $(FLAGS_STAMP)
 	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
 
+# Kernel-level differential of the NEON banded rescue kernels (rb_dp_wave2 vs rb_dp_core<true>,
+# every row maximum, gmax and te). It #includes src/rescue_band.cpp to reach the static kernels;
+# libbwa.a supplies everything else. On x86 it builds to a SKIP.
+.PHONY: rescue-band-kernel-eq
+rescue-band-kernel-eq: rescue_band_kernel_eq
+rescue_band_kernel_eq: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) $(if $(filter 1,$(USE_MIMALLOC)),$(MIMALLOC_LIB)) test/rescue_band_kernel_eq.o
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/rescue_band_kernel_eq.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) $(MIMALLOC_LDFLAGS) -o $@
+
+test/rescue_band_kernel_eq.o: test/rescue_band_kernel_eq.cpp src/rescue_band.cpp $(FLAGS_STAMP)
+	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
+
 # Regression test for the fmi_seed_api.h facade's max_occ guard: forwarding
 # max_occ <= 0 into FMI_search::get_sa_entries_prefetch divides by max_occ.
 # Requires a real index prefix argument (see test/run_unit_tests.sh), unlike
@@ -1415,7 +1426,7 @@ $(ZLIBNG_LIB):
 	cd $(ZLIBNG_BUILD) && cmake $(ZLIBNG_CMAKE_FLAGS) .. && $(MAKE)
 
 clean: pgo-clean profile-clean lto-clean
-	rm -fr src/*.o src/*.d src/version.h test/*.o test/*.d $(FLAGS_STAMP) $(BWA_LIB) $(EXE) $(STANDALONE_TESTS) kvec_alloc_fail_test klib_alloc_fail_test rescue_band_harness rescue_prune_eq bwa-mem3.arm64
+	rm -fr src/*.o src/*.d src/version.h test/*.o test/*.d $(FLAGS_STAMP) $(BWA_LIB) $(EXE) $(STANDALONE_TESTS) kvec_alloc_fail_test klib_alloc_fail_test rescue_band_harness rescue_band_kernel_eq rescue_prune_eq bwa-mem3.arm64
 	rm -f $(LIBSAIS_OBJS) $(LIBSAIS_OBJS:.o=.d)
 	rm -f src/*.gcno src/*.gcda
 	$(MAKE) -C test clean
