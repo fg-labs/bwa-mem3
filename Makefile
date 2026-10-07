@@ -858,6 +858,17 @@ kswv_freed_cell_test: $(BWA_LIB) $(HTS_LIB) src/kswv.native.o test/kswv_freed_ce
 src/bandedSWA.native.o: src/bandedSWA.cpp
 	$(CXX) -c $(BASE_CXXFLAGS) -march=native $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
 
+# Test-only second copy of bandedSWA.cpp (aarch64 only), linked into the unit
+# binary next to libbwa.a's copy: BSW8_ROW_LEAN flipped, symbols renamed with a
+# _rowalt suffix. See BSW8_ROW_LEAN in src/bandedSWA.cpp. Built here with the
+# libbwa.a object's compile line plus the two -D flags (test/Makefile's
+# standalone path is the exception, noted there). Never linked into bwa-mem3.
+ifneq ($(IS_ARM),)
+ROWALT_KERNEL_OBJ := src/bandedSWA.rowalt.o
+$(ROWALT_KERNEL_OBJ): src/bandedSWA.cpp $(FLAGS_STAMP)
+	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) -DKERNEL_VARIANT=_rowalt -DBSW8_ROW_LEAN_INVERT=1 $(INCLUDES) $(DEPFLAGS) $< -o $@
+endif
+
 # getScores8/16 padding-lane / prefetch contract regression. Meaningful under
 # ASan (`make ASAN=1 bandedswa_padding_test`): a tight-allocation caller that
 # over-reads the SeqPair array aborts; the bounded prefetch runs clean.
@@ -904,7 +915,7 @@ bandedswa_high_h0_zdrop_test: $(BWA_LIB) $(HTS_LIB) src/bandedSWA.native.o test/
 # recipe references ../ext/htslib/libhts.a directly. Without this prereq,
 # callers that skip the bwa-mem3 binary build (which builds it as a
 # side-effect of $(EXE) deps) link-fail.
-test-binaries: $(BWA_LIB) $(HTS_LIB)
+test-binaries: $(BWA_LIB) $(HTS_LIB) $(ROWALT_KERNEL_OBJ)
 	$(MAKE) -C test framework unit integration \
 	    CXX="$(CXX)" \
 	    COVERAGE=$(COVERAGE) \

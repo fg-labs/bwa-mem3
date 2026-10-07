@@ -52,6 +52,53 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #define __mmask32 uint32_t
 #endif
 
+// BSW8_ROW_LEAN: lean per-row bookkeeping for smithWaterman128_8. On Neoverse about half of
+// this kernel's cycles were per-row work around the DP column loop rather than DP cells
+// (Graviton 4, clang 19, replayed real WGS extension batches: ~387 of ~796 cycles/row). Three
+// exact rewrites remove most of it (every result field is unchanged, for any batch and any
+// grouping of pairs into lanes; each block states its exactness argument):
+//   - the band-trim loop runs a precomputed trip count, i + max(head) - beg, instead of a
+//     reduction and a branch on (head > pj) every column;
+//   - the per-row epilogue keeps xrow / ierow as int16 and gscore as a byte plus a "set" mask,
+//     updated without branches; only the z-drop test stays wide, behind a gate (drop > zdrop
+//     in some lane) that is almost never open on real data;
+//   - the four band-narrowing scans become one counted pass that records each lane's first and
+//     last nonzero column; all four scan results are functions of those two offsets.
+// On by default on aarch64 except Apple silicon, which keeps its own epilogue gate (a measured
+// win there; on Neoverse that gate is open on most rows) and the original scans. Settable
+// either way on aarch64 (-DBSW8_ROW_LEAN=0 / =1). On aarch64 the unit binary links a second
+// copy of this file built with the opposite setting (src/bandedSWA.rowalt.o: KERNEL_VARIANT
+// _rowalt, BSW8_ROW_LEAN_INVERT), and test/unit/test_bandedswa_row_lean.cpp compares the two
+// on every result field, so both settings stay exercised on Linux arm64 and on macOS. x86
+// always uses the original code.
+#if defined(__aarch64__)
+#ifndef BSW8_ROW_LEAN
+#if defined(__APPLE__)
+#define BSW8_ROW_LEAN 0
+#else
+#define BSW8_ROW_LEAN 1
+#endif
+#endif
+// Test-only: BSW8_ROW_LEAN_INVERT=1 builds the opposite of the setting above
+// (the Makefile's src/bandedSWA.rowalt.o), whether that setting is the default
+// or an override, so the unit test always compares lean with original.
+#if defined(BSW8_ROW_LEAN_INVERT) && BSW8_ROW_LEAN_INVERT
+#if BSW8_ROW_LEAN
+#undef BSW8_ROW_LEAN
+#define BSW8_ROW_LEAN 0
+#else
+#undef BSW8_ROW_LEAN
+#define BSW8_ROW_LEAN 1
+#endif
+#endif
+#else
+#if defined(BSW8_ROW_LEAN) && BSW8_ROW_LEAN
+#error "BSW8_ROW_LEAN=1 is aarch64-only (it uses vtstq_u8 and a NEON numeric-input any_lane_set8); drop -DBSW8_ROW_LEAN=1"
+#endif
+#undef BSW8_ROW_LEAN
+#define BSW8_ROW_LEAN 0
+#endif
+
 // ------------------------------------------------------------------------------------
 // Sub-slice overshoot guard.
 //
@@ -4329,12 +4376,13 @@ static inline __m128i blendv_fullmask8(__m128i a, __m128i b, __m128i mask)
 //
 // NEON any_lane_set8 note: on ARM the reduce is vmaxvq_u8(v) != 0, which is true
 // iff ANY byte of v is nonzero -- so it answers correctly for a numeric (not
-// 0x00/0xFF) input too. The Apple-only 8-bit z-drop epilogue gate relies on this:
-// it ORs the byte-domain need_z difference (0..255) into the mask before calling
-// any_lane_set8. Do NOT extend that numeric-input use to the x86 branch:
-// _mm_movemask_epi8 tests each byte's high bit only, so a small nonzero byte
-// (e.g. 0x01) reads as unset -- correct only for a true 0x00/0xFF mask. No
-// numeric caller compiles on x86 (the gate is __APPLE__-only, hence NEON).
+// 0x00/0xFF) input too. Two 8-bit z-drop epilogue gates rely on this: the
+// Apple-only one ORs the byte-domain need_z difference (0..255) into the mask
+// before calling any_lane_set8, and the BSW8_ROW_LEAN one passes need_z alone.
+// Do NOT extend that numeric-input use to the x86 branch: _mm_movemask_epi8
+// tests each byte's high bit only, so a small nonzero byte (e.g. 0x01) reads as
+// unset -- correct only for a true 0x00/0xFF mask. No numeric caller compiles
+// on x86 (one gate is __APPLE__ && ARM, the other aarch64-only).
 static inline bool any_lane_set8(__m128i mask)
 {
 #if defined(__ARM_NEON) || defined(__aarch64__)
@@ -4353,7 +4401,8 @@ static inline bool all_lanes_set8(__m128i mask)
 }
 
 // hmax_epi8 / hmin_epi8: horizontal max / min of the 16 SIGNED bytes of a
-// 128-bit vector, for the EXT-13 per-row max(head)/min(tail) reduce. NEON has a
+// 128-bit vector, for the EXT-13 per-row max(head)/min(tail) reduce (and, under
+// BSW8_ROW_LEAN, the trim count and the narrowing pass's first/last). NEON has a
 // one-op reduce (vmaxvq_s8 / vminvq_s8); x86 has no single-op signed-byte
 // horizontal reduce, so fall back to a store + scalar lane loop -- identical
 // result, run once per row. Same two-way arch guard as the any_lane_set8 /
@@ -5984,17 +6033,20 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
     // Every per-cell COLUMN position is tracked as the diagonal offset
     //   d = col - i  in [-w, +w+1]  (fits signed int8 for w <= ~126).
     // ROW quantities (best row, best-gscore row, qlen, tlen, mlen) exceed
-    // int8 for long reads, so they live in WIDE per-lane int32 side channels
-    // updated O(rows) in the per-row epilogue, not O(cells). Absolute end
-    // coordinates are reconstructed at the result store from the wide row.
+    // int8 for long reads, so they live in WIDE per-lane side channels (int32,
+    // or int16 under BSW8_ROW_LEAN) updated O(rows) in the per-row epilogue,
+    // not O(cells). Absolute end coordinates are reconstructed at the result
+    // store from the wide row.
     // Persistent column-offset state (head128/tail128) is shifted by -1 each
     // row (frame follows i) so the same absolute edge keeps its offset.
     int32_t tlenw[SIMD_WIDTH8];   // raw target length (rows), wide
     int32_t qlenw[SIMD_WIDTH8];   // raw query length (cols), wide
     int32_t mbandw[SIMD_WIDTH8];  // per-lane band width, wide
     int32_t mlenw[SIMD_WIDTH8];   // min(qlen+myband, tlen), wide row bound
+#if !BSW8_ROW_LEAN  // the lean path keeps these narrow (xrow16 / ierow16 below)
     int32_t xrow[SIMD_WIDTH8];    // best row for score (== i+1 at capture)
     int32_t ierow[SIMD_WIDTH8];   // best row for gscore (== i+1 at capture)
+#endif
 
     // --- PLAIN UNSIGNED [0,255] SW (no score re-baselining) ---
     // Scores live in the UNSIGNED byte range [0,255]. The DP recurrence computes
@@ -6047,7 +6099,42 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
     const int BYTE_CEIL = 255 - maxStep;
 #endif
     int32_t best_abs[SIMD_WIDTH8]; // running best score, seeded with the raw h0 (absolute == byte once the lane advances)
+#if !BSW8_ROW_LEAN
     int32_t gbest_abs[SIMD_WIDTH8];// running gscore (query-end), absolute
+#else
+    // Narrow side channels (BSW8_ROW_LEAN). Rows are < MAX_SEQ_LEN8 = 1088, so int16 holds the
+    // best row (xrow) and best-gscore row (ierow) exactly. gscore is a query-end cell byte in
+    // [0,255] or unset (-1): kept as the byte plus a "set" mask, so "hqe >= gbest" is an
+    // unsigned byte compare where set and always true where unset (the -1 sentinel).
+    int16_t xrow16[SIMD_WIDTH8]  __attribute((aligned(16)));
+    int16_t ierow16[SIMD_WIDTH8] __attribute((aligned(16)));
+    uint8_t gbest8[SIMD_WIDTH8]  __attribute((aligned(16)));
+    uint8_t gset8[SIMD_WIDTH8]   __attribute((aligned(16)));
+    _mm_store_si128((__m128i *) xrow16, _mm_setzero_si128());
+    _mm_store_si128((__m128i *) (xrow16 + 8), _mm_setzero_si128());
+    _mm_store_si128((__m128i *) ierow16, _mm_setzero_si128());
+    _mm_store_si128((__m128i *) (ierow16 + 8), _mm_setzero_si128());
+    _mm_store_si128((__m128i *) gbest8, _mm_setzero_si128());
+    _mm_store_si128((__m128i *) gset8, _mm_setzero_si128());
+#define BSW8_GSCORE_NARROW()                                                          \
+    do {                                                                              \
+        __m128i gb_ = _mm_load_si128((const __m128i *) gbest8);                       \
+        __m128i gs_ = _mm_load_si128((const __m128i *) gset8);                        \
+        /* hqe >= gbest (unsigned) where set; always where unset (gbest = -1) */      \
+        __m128i ge_ = _mm_or_si128(_mm_xor_si128(gs_, ff128),                         \
+                          _mm_cmpeq_epi8(_mm_max_epu8(hqe128, gb_), hqe128));         \
+        __m128i gm_ = _mm_and_si128(qfire128, ge_);                                   \
+        _mm_store_si128((__m128i *) gbest8, blendv_fullmask8(gb_, hqe128, gm_));      \
+        _mm_store_si128((__m128i *) gset8, _mm_or_si128(gs_, gm_));                   \
+        const __m128i vip1_16_ = _mm_set1_epi16((int16_t) (i + 1));                   \
+        __m128i il_ = _mm_load_si128((const __m128i *) ierow16);                      \
+        __m128i ih_ = _mm_load_si128((const __m128i *) (ierow16 + 8));                \
+        il_ = blendv_fullmask8(il_, vip1_16_, _mm_unpacklo_epi8(gm_, gm_));           \
+        ih_ = blendv_fullmask8(ih_, vip1_16_, _mm_unpackhi_epi8(gm_, gm_));           \
+        _mm_store_si128((__m128i *) ierow16, il_);                                    \
+        _mm_store_si128((__m128i *) (ierow16 + 8), ih_);                              \
+    } while (0)
+#endif
 
     int32_t minq = 10000000;
     for (int l=0; l<SIMD_WIDTH8; l++) {
@@ -6057,10 +6144,14 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
         int ml = qlenw[l] + mbandw[l];
         if (ml > tlenw[l]) ml = tlenw[l];
         mlenw[l]  = ml;
+#if !BSW8_ROW_LEAN
         xrow[l]   = 0;
         ierow[l]  = 0;
+#endif
         best_abs[l] = p[l].h0; // maxScore128 inits to the h0 seed; record it wide
+#if !BSW8_ROW_LEAN
         gbest_abs[l]= -1;      // unset sentinel (-1): gscore=-1 / gtle=0 when no query end is reached, matching scalar
+#endif
         if (p[l].len2 < minq) minq = p[l].len2;
     }
     minq -= 1; // for gscore
@@ -6078,7 +6169,8 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
     // is lost. Instead, when a lane's band-grown band reaches the query end we
     // capture that lane's query-end cell H (hqe128) and flag it (qfire128) here in
     // the inner loop -- BEFORE this row's re-baseline -- and finalize a per-lane
-    // WIDE running gbest_abs / ierow in the epilogue (value = byte + B). Reset per row.
+    // WIDE running gbest_abs / ierow in the epilogue (value = byte + B; gbest8 /
+    // gset8 / ierow16 under BSW8_ROW_LEAN). Reset per row.
     __m128i hqe128   = zero128;   // query-end cell H (rebaselined byte) this row
     __m128i qfire128 = zero128;   // 0xFF where this lane reached its query end this row
 
@@ -6097,10 +6189,25 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
     for(j = 0; j < ncol; j++)
         _mm_store_si128((__m128i *)(F + j * SIMD_WIDTH8), zero128);
 
-    __m128i y128 = zero128;   // best col as diagonal offset: col - i_at_capture (i_at_capture = xrow[l]-1)
+    __m128i y128 = zero128;   // best col as diagonal offset: col - i_at_capture (i_at_capture = xrow[l]-1, xrow16 under BSW8_ROW_LEAN)
     __m128i max_off128 = zero128;
     __m128i exit0 = _mm_set1_epi8(0xFF);
     __m128i zdrop128 = _mm_set1_epi8(zdrop);
+#if BSW8_ROW_LEAN
+    // The lean trim count and narrowing pass hold column offsets in [-w-1, w+1] as
+    // int8 (the 127 "none" sentinel included), so they match the original only for
+    // w <= 126. The 8-bit route caps w at BSW8_MAX_W = 124 (bwamem.cpp); past that
+    // both codes are wrong (test_bandedswa_longread.cpp pins the w = 127 failure).
+    // Lean z-drop gate (see step (4) of the lean epilogue). In the z-drop step
+    // zdelta reduces to y - y1 (1 - y1 before the lane's first best), two int8
+    // column offsets, so |zdelta| <= 256 and dif = |zdelta| * e stays a
+    // non-negative int32 far from overflow, and so does drop - dif, while each
+    // gap extend e is in [0, INT32_MAX / (4 * MAX_SEQ_LEN8)] (a loose bound).
+    // Only then is drop > zdrop a necessary condition for a lane to die.
+    const bool zgate_exact = this->e_del >= 0 && this->e_del <= INT32_MAX / (4 * MAX_SEQ_LEN8) &&
+                             this->e_ins >= 0 && this->e_ins <= INT32_MAX / (4 * MAX_SEQ_LEN8);
+    const __m128i zgate128 = _mm_set1_epi8((int8_t) (zdrop < 255 ? zdrop : 255));
+#endif
 
     int beg = 0, end = ncol;
     int nbeg = beg, nend = end;
@@ -6182,6 +6289,31 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
         // all-lanes-set test on a full-width mask (was _mm_movemask_epi8 != dmask).
         bool cmp_ht_all = all_lanes_set8(cmph);
 
+#if BSW8_ROW_LEAN
+        // The original trim loop (#else) stops at the first column where no lane has
+        // head > pj. pj = l - i lies in [-w, w] for every l in [beg, end), with no int8
+        // wrap (callers cap w at BSW8_MAX_W = 124), so "some lane has head > l - i" is
+        // exactly l < i + max(head) over all 16 lanes, and it is monotone in l: the trip
+        // count is known up front. A counted loop does the same stores without a
+        // per-column reduction and branch, and its exit resolves on the scalar counter.
+        if (!cmp_ht_all) {
+            int trim_hi = i + hmax_epi8(head128);
+            if (trim_hi > end) trim_hi = end;
+            for (int l = beg; l < trim_hi; l++)
+            {
+                __m128i h128 = _mm_load_si128((__m128i *)(H_h + l * SIMD_WIDTH8));
+                __m128i f128 = _mm_load_si128((__m128i *)(F + l * SIMD_WIDTH8));
+                __m128i pj128 = _mm_set1_epi8(l - i);   // diagonal offset of column l
+                __m128i cmp1 = _mm_cmpgt_epi8(head128, pj128);
+                __m128i cmp2 = _mm_cmpgt_epi8(pj128, tail128);
+                cmp1 = _mm_or_si128(cmp1, cmp2);
+                h128 = blendv_fullmask8(h128, zero128, cmp1);
+                f128 = blendv_fullmask8(f128, zero128, cmp1);
+                _mm_store_si128((__m128i *)(F + l * SIMD_WIDTH8), f128);
+                _mm_store_si128((__m128i *)(H_h + l * SIMD_WIDTH8), h128);
+            }
+        }
+#else
         for (int l=beg; l<end && !cmp_ht_all; l++)
         {
             __m128i h128 = _mm_load_si128((__m128i *)(H_h + l * SIMD_WIDTH8));
@@ -6198,6 +6330,7 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
             _mm_store_si128((__m128i *)(F + l * SIMD_WIDTH8), f128);
             _mm_store_si128((__m128i *)(H_h + l * SIMD_WIDTH8), h128);
         }
+#endif
 
 #if RDT
         prof[DP3][0] += __rdtsc() - tim1;
@@ -6353,14 +6486,18 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
         if (zero_row_) {
             /* Finalize THIS row's query-end (gscore/gtle) capture BEFORE exiting.
              * The capture (hqe128/qfire128) is set in the inner loop above but is
-             * folded into the wide gbest_abs/ierow only in the per-row epilogue,
-             * which this break would otherwise skip. Scalar processes the row's
+             * folded into the wide gbest_abs/ierow (BSW8_ROW_LEAN: gbest8 / gset8 /
+             * ierow16) only in the per-row epilogue, which this break would
+             * otherwise skip. Scalar processes the row's
              * gscore and then hits its own m==0 break, so it records the query-end
              * row; the vector must too. Skipping it drops the gscore==0 query-end
              * tail row -> wrong gtle. Benign for symmetric scoring (gscore==0 gtle
              * unused), but consumed under the asymmetric --meth (OT/OB) matrix,
              * where it caused soft-clip / placement drift. Mirror of the epilogue's
              * gscore block (>= tie-break: latest query-end row wins, as scalar). */
+#if BSW8_ROW_LEAN
+            BSW8_GSCORE_NARROW();
+#else
             int8_t qf_a_[SIMD_WIDTH8] __attribute((aligned(16)));
             int8_t hq_a_[SIMD_WIDTH8] __attribute((aligned(16)));
             _mm_store_si128((__m128i *) qf_a_, qfire128);
@@ -6378,6 +6515,7 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
                 ierg = blendv_fullmask8(ierg, _mm_set1_epi32(i + 1), gmask);
                 _mm_storeu_si128((__m128i *)(ierow + base), ierg);
             }
+#endif
             break;
         }
 
@@ -6392,7 +6530,7 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
         // Signed cmpgt_epi8 mis-read scores >127.
         __m128i cmp = _mm_xor_si128(_mm_cmpeq_epi8(maxScore128, bmaxScore128), ff128);
         // y128 (best col) stays a diagonal offset captured in the best row's
-        // frame; the best row itself moves to the wide xrow[] side channel.
+        // frame; the best row itself moves to the wide xrow[] (or xrow16) side channel.
         y128 = blendv_fullmask8(y128, y1_128, cmp);
 
         // max_off = max running diagonal-distance of the row-max from the main
@@ -6405,11 +6543,93 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
         tmp = _mm_max_epu8(max_off128, tmp);  // modif
         max_off128 = blendv_fullmask8(bmax_off128, tmp, cmp);
 
+#if BSW8_ROW_LEAN
+        // Per-row epilogue, lean form (BSW8_ROW_LEAN): the same xrow / best score /
+        // gscore + ierow / z-drop updates as the wide block in the #else branch,
+        // with the side channels kept narrow and only the z-drop test gated.
+        {
+            // (1) best-score row: xrow = cmp ? i+1 : xrow (int16, exact: rows < 1088).
+            // (2) best_abs is not tracked per row: maxScore128 changes on a lane exactly on the
+            //     rows where cmp is set, so the old masked running max equals
+            //     max(h0, final maxScore) on lanes that advanced at least once (xrow != 0) and
+            //     h0 otherwise. It is reconstructed at the result store.
+            // (3) gscore / ierow: BSW8_GSCORE_NARROW.
+            const __m128i vip1_16 = _mm_set1_epi16((int16_t) (i + 1));
+            __m128i xl = _mm_load_si128((const __m128i *) xrow16);
+            __m128i xh = _mm_load_si128((const __m128i *) (xrow16 + 8));
+            xl = blendv_fullmask8(xl, vip1_16, _mm_unpacklo_epi8(cmp, cmp));
+            xh = blendv_fullmask8(xh, vip1_16, _mm_unpackhi_epi8(cmp, cmp));
+            _mm_store_si128((__m128i *) xrow16, xl);
+            _mm_store_si128((__m128i *) (xrow16 + 8), xh);
+            BSW8_GSCORE_NARROW();
+            // (4) z-drop. A lane dies only if drop - dif > zdrop with dif >= 0, so drop > zdrop
+            //     is necessary; drop = maxScore128 - maxRS1 is exact in bytes on live lanes.
+            //     When no lane has it, no lane can die and the block is skipped. On real data
+            //     this gate is almost never open, so the branch predicts well (unlike the
+            //     Apple gate on cmp | qfire | need_z in the #else branch). The threshold byte
+            //     is min(zdrop, 255): drop <= 255, so for zdrop >= 255 no lane can die and the
+            //     gate stays shut. dif = |zdelta| * e is formed in int32 as in the wide block;
+            //     zgate_exact (above the row loop) holds when that product cannot wrap
+            //     negative, and otherwise the block runs on every row, as the wide block does.
+            //     vmaxvq_u8 != 0 is true for any nonzero byte, so the numeric need_z is fine
+            //     here (this path is aarch64-only).
+            //     The arithmetic is the wide block's step (4), fed by xrow16; see the
+            //     comments there for the xrow == 0 sentinel on yc and the gap-extend
+            //     weighting. Keep the two in step (the unit test compares them).
+            if (zdrop > 0) {
+                const __m128i need_z = _mm_subs_epu8(_mm_subs_epu8(maxScore128, maxRS1), zgate128);
+                if (!zgate_exact || any_lane_set8(need_z)) {
+                    int8_t  y1_a[SIMD_WIDTH8]   __attribute((aligned(16)));
+                    int8_t  y_a[SIMD_WIDTH8]    __attribute((aligned(16)));
+                    int8_t  ms_a[SIMD_WIDTH8]   __attribute((aligned(16)));
+                    int8_t  rs_a[SIMD_WIDTH8]   __attribute((aligned(16)));
+                    int8_t  exit_a[SIMD_WIDTH8] __attribute((aligned(16)));
+                    _mm_store_si128((__m128i *) y1_a, y1_128);
+                    _mm_store_si128((__m128i *) y_a, y128);
+                    _mm_store_si128((__m128i *) ms_a, maxScore128);
+                    _mm_store_si128((__m128i *) rs_a, maxRS1);
+                    _mm_store_si128((__m128i *) exit_a, exit0);
+                    const __m128i vi   = _mm_set1_epi32(i);
+                    const __m128i vip1 = _mm_set1_epi32(i + 1);
+                    const __m128i vone = _mm_set1_epi32(1);
+                    const __m128i vzd  = _mm_set1_epi32(zdrop);
+                    const __m128i vedel = _mm_set1_epi32(this->e_del);
+                    const __m128i veins = _mm_set1_epi32(this->e_ins);
+                    __m128i die_g[SIMD_WIDTH8 / 4];
+                    for (int g = 0; g < SIMD_WIDTH8 / 4; g++) {
+                        const int base = g * 4;
+                        __m128i msg  = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(*(const int32_t *)(ms_a   + base)));
+                        __m128i rsg  = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(*(const int32_t *)(rs_a   + base)));
+                        __m128i exitg= _mm_cvtepi8_epi32(_mm_cvtsi32_si128(*(const int32_t *)(exit_a + base)));
+                        __m128i y1g  = _mm_cvtepi8_epi32(_mm_cvtsi32_si128(*(const int32_t *)(y1_a   + base)));
+                        __m128i yg   = _mm_cvtepi8_epi32(_mm_cvtsi32_si128(*(const int32_t *)(y_a    + base)));
+                        __m128i xrg  = _mm_cvtepi16_epi32(_mm_loadl_epi64((const __m128i *)(xrow16 + base)));
+                        __m128i y1c  = _mm_add_epi32(y1g, vi);
+                        __m128i yc   = _mm_add_epi32(yg, _mm_sub_epi32(xrg, vone));
+                        yc = _mm_andnot_si128(_mm_cmpeq_epi32(xrg, _mm_setzero_si128()), yc);
+                        __m128i tmpi = _mm_sub_epi32(vip1, xrg);
+                        __m128i tmpj = _mm_sub_epi32(y1c, yc);
+                        __m128i zdelta = _mm_sub_epi32(tmpi, tmpj);
+                        __m128i zesel  = blendv_fullmask8(veins, vedel,
+                                             _mm_cmpgt_epi32(zdelta, _mm_setzero_si128()));
+                        __m128i dif  = _mm_mullo_epi32(_mm_abs_epi32(zdelta), zesel);
+                        __m128i drop = _mm_sub_epi32(msg, rsg);
+                        __m128i die  = _mm_cmpgt_epi32(_mm_sub_epi32(drop, dif), vzd);
+                        die_g[g] = _mm_and_si128(die, exitg);
+                    }
+                    __m128i die01 = _mm_packs_epi32(die_g[0], die_g[1]);
+                    __m128i die23 = _mm_packs_epi32(die_g[2], die_g[3]);
+                    exit0 = _mm_andnot_si128(_mm_packs_epi16(die01, die23), exit0);
+                }
+            }
+        }
+#else
         // Per-lane wide updates (O(rows)): best-score row (xrow), best-gscore
         // row (ierow), and the z-drop test — all done in wide scalars so row
         // distances that exceed int8 for long reads are handled exactly.
         //
-        // Run the block only on rows where some lane can actually change:
+        // On Apple silicon, run the block only on rows where some lane can
+        // actually change:
         //   * xrow / best_abs change only where cmp is set (the lane's max
         //     advanced this row; both updates are masked by cmp);
         //   * gbest_abs / ierow change only where qfire128 is set;
@@ -6421,14 +6641,18 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
         //     so that only costs a skipped skip.
         // With the certified adaptive band defaulting to w = 20, a row is ~41
         // cells and this block (~140 instructions plus its stack round trips)
-        // was roughly a third of it; most rows set none of the three.
+        // was roughly a third of it.
         // Byte-identical: when the gate is clear every store below is a no-op.
         //
         // Apple silicon only. The gate is a win there (+1 to +2.5% on the
-        // isolated kernel) but a loss on Neoverse V2 (-0.5 to -1.5%): the per-row
-        // reduction and branch cost more than the block they skip on the minority
-        // of post-peak rows. Other targets run the block on every row, exactly as
-        // before. NOTE: do not gate on APPLE_SILICON here -- simd_compat.h defines
+        // isolated kernel) but a loss on Neoverse V2 (-0.5 to -1.5%): on the
+        // extension batches of 100K real WGS pairs (HG00096, hg38; Graviton 4,
+        // band w = 100) it is open on ~89% of rows,
+        // because among 16 lanes some lane's max almost always advanced or
+        // reached its query end, so it skips little and adds a reduction and a
+        // poorly predicted branch. Other aarch64 targets use the BSW8_ROW_LEAN
+        // epilogue above; x86 runs this block on every row, as before.
+        // NOTE: do not gate on APPLE_SILICON here -- simd_compat.h defines
         // it as 1 for EVERY aarch64/NEON build (it is the codebase-wide NEON
         // synonym), so it is true on Graviton too and cannot express "Apple only".
         // __APPLE__ alone is NOT enough either: Intel macOS also defines __APPLE__
@@ -6515,6 +6739,8 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
 
                 // (4) z-drop (alive lanes): dif = |((i+1)-xr) - (y1c-yc)|,
                 //     drop = (uint8)ms - (uint8)rs; die where drop-dif > zdrop.
+                //     The BSW8_ROW_LEAN epilogue repeats this step; keep the two in
+                //     step (the unit test compares them).
                 __m128i y1c  = _mm_add_epi32(y1g, vi);
                 __m128i yc   = _mm_add_epi32(yg, _mm_sub_epi32(xrg, vone));
                 // z-drop unset-best sentinel: y1c and yc each carry the +1 frame
@@ -6547,12 +6773,69 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
             __m128i die_bytes = _mm_packs_epi16(die01, die23);
             if (zdrop > 0) exit0 = _mm_andnot_si128(die_bytes, exit0);
         }
+#endif
 
 #if RDT
         prof[DP1][0] += __rdtsc() - tim1;
         tim1 = __rdtsc();
 #endif
         
+#if BSW8_ROW_LEAN
+        /* Narrowing of the band, one pass (BSW8_ROW_LEAN). With v[l] = F[l] | H_h[l] and, per
+         * lane, first = offset (l - i) of the first nonzero v[l] in [beg, end) ("none" = end - i)
+         * and last = offset of the last nonzero v[l] in [beg, end] ("none" = beg - 1 - i), the
+         * four former scans are:
+         *   1. nbeg: last l of the leading all-lanes-zero run   -> i + min(first) - 1 if
+         *            min(first) > beg - i, else unchanged
+         *   2. nend: first l from end down with any lane nonzero -> i + max(last) (+2, clamped)
+         *   3. head: per live lane, end of its leading zero run  -> first, unless first == beg - i
+         *            (no leading zeros: unchanged). Scan 3 stopped at the first column where every
+         *            live lane is nonzero, which is never before any live lane's run ends, and
+         *            each lane's update was the end of its own run.
+         *   4. tail: per live lane, start of its trailing zero run -> last, unless last == end - i
+         *            (unchanged); then +2 and min with qlen - i as before.
+         * Dead lanes never update head/tail (the scans OR'ed ~exit0 in); scans 1 and 2 count every
+         * lane. All offsets lie in [-w-1, w+1] (w <= BSW8_MAX_W = 124), so int8 holds them and
+         * 127 is a safe "none" for min.
+         * The pass is a counted loop: no per-column reduction or data-dependent exit. */
+        /* Only rows with beg < end get here: with no band columns maxRS1 stays 0 and the
+         * row takes the zero-row break above, in the original code as well. */
+        xassert(beg < end, "BSW8_ROW_LEAN narrowing: empty band reached the narrowing pass");
+        int l;
+        {
+            const __m128i big128 = _mm_set1_epi8(127);
+            __m128i off128   = _mm_set1_epi8(beg - i);
+            __m128i first128 = _mm_set1_epi8(end - i);
+            __m128i last128  = _mm_set1_epi8(beg - 1 - i);
+            for (l = beg; l < end; l++)
+            {
+                __m128i v = _mm_or_si128(_mm_load_si128((__m128i *)(F + l * SIMD_WIDTH8)),
+                                         _mm_load_si128((__m128i *)(H_h + l * SIMD_WIDTH8)));
+                __m128i nz = vreinterpretq_m128i_u8(vtstq_u8(vreinterpretq_u8_m128i(v),
+                                                             vreinterpretq_u8_m128i(v)));
+                first128 = _mm_min_epi8(first128, blendv_fullmask8(big128, off128, nz));
+                last128  = blendv_fullmask8(last128, off128, nz);
+                off128   = _mm_add_epi8(off128, one128);
+            }
+            {   /* column end: scans 2 and 4 only (off128 == end - i here) */
+                __m128i v = _mm_or_si128(_mm_load_si128((__m128i *)(F + end * SIMD_WIDTH8)),
+                                         _mm_load_si128((__m128i *)(H_h + end * SIMD_WIDTH8)));
+                __m128i nz = vreinterpretq_m128i_u8(vtstq_u8(vreinterpretq_u8_m128i(v),
+                                                             vreinterpretq_u8_m128i(v)));
+                last128 = blendv_fullmask8(last128, off128, nz);
+            }
+            const int minfirst = hmin_epi8(first128);
+            if (minfirst > beg - i) nbeg = i + minfirst - 1;
+            l = i + hmax_epi8(last128);
+            nend = l + 2 < ncol ? l + 2 : ncol;
+            __m128i upd = _mm_andnot_si128(_mm_cmpeq_epi8(first128, _mm_set1_epi8(beg - i)), exit0);
+            head128 = blendv_fullmask8(head128, first128, upd);
+            upd = _mm_andnot_si128(_mm_cmpeq_epi8(last128, _mm_set1_epi8(end - i)), exit0);
+            __m128i index128 = blendv_fullmask8(tail128, last128, upd);
+            index128 = _mm_add_epi8(index128, two128);
+            tail128 = _mm_min_epi8(index128, qlen_off128);
+        }
+#else
         /* Narrowing of the band */
         /* From beg */
         int l;
@@ -6659,6 +6942,7 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
         index128 = _mm_add_epi8(index128, two128);
         // signed min in the offset frame against qlen-i
         tail128 = _mm_min_epi8(index128, qlen_off128);
+#endif
 
         // Frame shift for the next row: i advances by 1, so the same absolute
         // band edge has its diagonal offset (col - i) decremented by 1. Keep
@@ -6693,13 +6977,33 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
     // the routing envelope — see the precondition above — except that best_abs
     // keeps a negative h0 until the lane's byte max advances). Positions are
     // reconstructed wide from the diagonal-offset lanes plus the per-lane
-    // best-row side channels.
+    // best-row side channels. Under BSW8_ROW_LEAN the same values are rebuilt
+    // here from maxScore128, xrow16, gbest8 / gset8 and ierow16.
     int8_t maxj[SIMD_WIDTH8]  __attribute((aligned(64)));
     _mm_store_si128((__m128i *) maxj, y128);   // best col as diagonal offset
 
     int8_t max_off_ar[SIMD_WIDTH8]  __attribute((aligned(64)));
     _mm_store_si128((__m128i *) max_off_ar, max_off128);
 
+#if BSW8_ROW_LEAN
+    {
+        uint8_t ms_f[SIMD_WIDTH8] __attribute((aligned(16)));
+        _mm_store_si128((__m128i *) ms_f, maxScore128);
+        for(i = 0; i < SIMD_WIDTH8; i++)
+        {
+            const int xr = xrow16[i];
+            int sc = best_abs[i];                          // raw h0
+            if (xr != 0 && (int) ms_f[i] > sc) sc = ms_f[i];
+            p[i].score   = sc;
+            p[i].tle     = xr;
+            p[i].qle     = (xr == 0) ? 0 : ((int) maxj[i] + xr - 1);
+            p[i].max_off = (uint8_t) max_off_ar[i];
+            p[i].gscore  = gset8[i] ? (int) gbest8[i] : -1;
+            p[i].gtle    = ierow16[i];
+        }
+    }
+#undef BSW8_GSCORE_NARROW
+#else
     for(i = 0; i < SIMD_WIDTH8; i++)
     {
         p[i].score   = best_abs[i];                               // absolute score
@@ -6711,6 +7015,7 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
         p[i].gscore  = gbest_abs[i];                              // absolute gscore (-1 if unset)
         p[i].gtle    = ierow[i];                                  // best gscore row
     }
+#endif
 
     return;
 }
@@ -6732,4 +7037,14 @@ extern "C" IBandedPairWiseSW *make_bsw_kernel(
 {
     return new BandedPairWiseSW(o_del, e_del, o_ins, e_ins, zdrop, end_bonus,
                                 mat, w_match, w_mismatch, numThreads);
+}
+
+/* Test-only hook: the BSW8_ROW_LEAN setting this copy of the TU was built with,
+ * so test/unit/test_bandedswa_row_lean.cpp can check that the two aarch64
+ * copies it compares really differ. Mangled per KERNEL_VARIANT
+ * (kernel_dispatch.h); declared only in that test. */
+extern "C" int bsw8_row_lean_enabled(void);
+extern "C" int bsw8_row_lean_enabled(void)
+{
+    return BSW8_ROW_LEAN;
 }

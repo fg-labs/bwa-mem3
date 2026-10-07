@@ -185,8 +185,22 @@ endif
 
 unit: $(UNIT_BIN)
 
-$(UNIT_BIN): $(UNIT_OBJS) $(FRAMEWORK_LIB) ../libbwa.a
-	$(CXX) $(LDFLAGS) -o $@ $(UNIT_OBJS) $(FRAMEWORK_LIB) $(LIBS)
+# aarch64: the unit binary also links the parent's src/bandedSWA.rowalt.o (see
+# BSW8_ROW_LEAN in src/bandedSWA.cpp). The parent's test-binaries target builds
+# it first, with libbwa.a's compile line. A standalone `make -C test` asks for it
+# in the libsais-objs sub-make (two concurrent parent makes would race on the
+# parent's .build-flags.tmp), which rebuilds it only when it is missing or a
+# source or header changed, then with that sub-make's flags. The binary relinks
+# only if the object changed.
+ifneq ($(IS_ARM),)
+UNIT_EXTRA_OBJS := ../src/bandedSWA.rowalt.o
+PARENT_EXTRA_OBJS := src/bandedSWA.rowalt.o
+../src/bandedSWA.rowalt.o: libsais-objs
+	@:
+endif
+
+$(UNIT_BIN): $(UNIT_OBJS) $(UNIT_EXTRA_OBJS) $(FRAMEWORK_LIB) ../libbwa.a
+	$(CXX) $(LDFLAGS) -o $@ $(UNIT_OBJS) $(UNIT_EXTRA_OBJS) $(FRAMEWORK_LIB) $(LIBS)
 
 $(UNIT_DIR)/%.o: $(UNIT_DIR)/%.cpp
 	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(FRAMEWORK_INCLUDES) -MMD -MP $< -o $@
@@ -228,8 +242,18 @@ $(INTEGRATION_DIR)/placeholder.o: $(INTEGRATION_DIR)/placeholder.cpp
 # binaries: when libbwa.a is restored from a CI cache without a fresh
 # parent `make` (e.g. proto-neon-kswv.yml's both-caches-hit path), $(BWA_LIB)
 # is already up-to-date so the parent never triggers libsais.o on its own.
+# On aarch64 the same sub-make also builds the unit binary's second bandedSWA
+# copy (PARENT_EXTRA_OBJS, above).
+#
+# `-o .build-flags`: flag variables that came from the environment are passed
+# on to this nested make with the values this Makefile gave them (an environment
+# CPPFLAGS is replaced above), so its flag set can differ from the build that
+# made libbwa.a. Holding the
+# parent's flag stamp old keeps that difference from rewriting the stamp and
+# recompiling these objects; they are still rebuilt when missing or when a
+# source or header changed.
 libsais-objs:
-	$(MAKE) -C .. ext/libsais/src/libsais.o ext/libsais/src/libsais64.o
+	$(MAKE) -C .. -o .build-flags ext/libsais/src/libsais.o ext/libsais/src/libsais64.o $(PARENT_EXTRA_OBJS)
 
 $(EXE) $(UNIT_BIN) $(INTEGRATION_BIN): | libsais-objs
 

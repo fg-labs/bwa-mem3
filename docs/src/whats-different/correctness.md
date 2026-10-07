@@ -425,7 +425,11 @@ cells never score above 0 was lifted from `h0` to 0 exactly when another lane in
 advanced, and kept `h0` otherwise, so its `score` depended on which pairs shared its group.
 The fix updates `best_abs` only on lanes whose maximum advanced that row, as `xrow` already
 was, so a negative-`h0` lane now reports what the scalar kernel reports whatever it is
-batched with.
+batched with. (On aarch64 outside Apple silicon, `smithWaterman128_8` runs a lean per-row
+path, `BSW8_ROW_LEAN` in `src/bandedSWA.cpp`, that does not keep `best_abs` per row. The
+byte maximum only rises, and only on the rows where the masked update above fires, so the
+path rebuilds the same value at the result store: `max(h0, final byte maximum)` for a lane
+whose maximum ever advanced, and `h0` otherwise.)
 
 Negative seed scores occur only under **`--meth`**, where a seed found in converted space is
 rescored in original space. There the extension-DP dedup (`--dedup`, default `auto`) latches

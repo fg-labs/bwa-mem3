@@ -45,9 +45,9 @@ MAKE="${MAKE:-make}"
 MAKE_ARGS="${MAKE_ARGS:-}"
 
 # Object-list variables that must carry generated dependencies. KERNEL_TIER_OBJS
-# is empty on arm64 (single NEON tier) and LIBSAIS_OBJS lives in a submodule;
-# both are covered here rather than special-cased.
-OBJ_VARS=(OBJS KERNEL_TIER_OBJS NATIVE_KERNEL_OBJS STANDALONE_TEST_OBJS LIBSAIS_OBJS)
+# is empty on arm64 (single NEON tier), ROWALT_KERNEL_OBJ is empty on x86, and
+# LIBSAIS_OBJS lives in a submodule; all are covered here rather than special-cased.
+OBJ_VARS=(OBJS KERNEL_TIER_OBJS NATIVE_KERNEL_OBJS ROWALT_KERNEL_OBJ STANDALONE_TEST_OBJS LIBSAIS_OBJS)
 
 # The wiring probe: an object plus a header it includes only indirectly
 # (src/seed_order.cpp reaches bwamem.h via seed_order.h), since indirect
@@ -89,7 +89,9 @@ for var in "${OBJ_VARS[@]}"; do
     # `read -a` rather than mapfile: bash 3.2 (macOS) has no mapfile, and the
     # variable expands to one space-separated line of object paths.
     read -r -a var_objs <<< "$(run_make -s "print-$var")"
-    objects+=("${var_objs[@]}")
+    # The +"..." form: bash 3.2 under set -u rejects expanding an empty array
+    # (KERNEL_TIER_OBJS on arm64, ROWALT_KERNEL_OBJ on x86).
+    objects+=(${var_objs[@]+"${var_objs[@]}"})
 done
 
 if ((${#objects[@]} == 0)); then
