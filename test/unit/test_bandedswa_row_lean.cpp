@@ -16,15 +16,14 @@
 // BSW8_ROW_LEAN, an independent implementation of every per-row step. x86 always
 // runs the original code, so there the file holds a single case that says so.
 //
-// The 8-bit kernel's query-end fields (gscore / gtle) can depend on which other
-// pairs share a 16-lane group; that predates BSW8_ROW_LEAN and is not what this
-// test is about. So grouped batches are not compared with the scalar oracle or
-// across groupings: each batch is scored in several groupings (production's
-// length sort, a random shuffle, reversed, and a random split into sub-batches),
-// and for each grouping the lean kernel must equal the original kernel on that
-// same grouping. A change to how one lane's result depends on its neighbours
-// would show up as a difference here. Pairs scored alone, which that coupling
-// cannot reach, are also checked against the scalar oracle.
+// Each batch is scored in several groupings (production's length sort, a random
+// shuffle, reversed, and a random split into sub-batches), and for each grouping
+// the lean kernel must equal the original kernel on that same grouping. A change
+// to how one lane's result depends on its neighbours would show up as a
+// difference here. Pairs scored alone are also checked against the scalar
+// oracle. That a pair's result does not depend on its group at all (grouped ==
+// alone == scalar) is test_bandedswa_lane_indep.cpp's property; this file
+// compares the two kernel copies.
 //
 // Generated batches (fixed seeds): default and random scoring (match, mismatch,
 // gap open / extend, end bonus), --meth OT / OB matrices under all three
@@ -45,6 +44,7 @@
 #include "bandedSWA.h"
 #include "bwamem.h"
 #include "meth_scoring.h"
+#include "bsw_batch.h"
 #include "ext_ladder.h"
 #include "scoring.h"
 
@@ -53,10 +53,8 @@
 #error "aarch64 builds have the 8-bit vector kernels; this test would otherwise compile to nothing"
 #endif
 
-/* Defined by src/bandedSWA.rowalt.o (bandedSWA.cpp compiled with
- * -DKERNEL_VARIANT=_rowalt -DBSW8_ROW_LEAN_INVERT=1). */
-extern "C" IBandedPairWiseSW *make_bsw_kernel_rowalt(int, int, int, int, int, int,
-                                                     const int8_t *, int8_t, int8_t, int);
+/* Defined by src/bandedSWA.rowalt.o (make_bsw_kernel_rowalt is declared in
+ * bsw_batch.h). */
 extern "C" int bsw8_row_lean_enabled_rowalt(void);
 /* Defined by libbwa.a's bandedSWA.o: the BSW8_ROW_LEAN setting it was built with. */
 extern "C" int bsw8_row_lean_enabled(void);
@@ -92,38 +90,7 @@ private:
 /// One batch of the given pairs through getScores8, results in input order.
 std::vector<ExtResult> score8(IBandedPairWiseSW &bsw, const std::vector<const ExtPair *> &pairs, int w)
 {
-    const int n = (int)pairs.size();
-    std::vector<uint8_t> ref, qer;
-    std::vector<SeqPair> sp(n + 64);   // padding-lane slack (the kernel writes the pads)
-    for (int q = 0; q < n; q++) {
-        SeqPair p;
-        memset(&p, 0, sizeof p);
-        p.id = p.seqid = p.regid = q;
-        p.idr = (int)ref.size();
-        p.idq = (int)qer.size();
-        p.len1 = (int)pairs[q]->target.size();
-        p.len2 = (int)pairs[q]->query.size();
-        p.h0 = pairs[q]->h0;
-        p.score = p.tle = p.gtle = p.qle = p.gscore = p.max_off = -1;
-        ref.insert(ref.end(), pairs[q]->target.begin(), pairs[q]->target.end());
-        qer.insert(qer.end(), pairs[q]->query.begin(), pairs[q]->query.end());
-        sp[q] = p;
-    }
-    ref.resize(ref.size() + 4096, 0);
-    qer.resize(qer.size() + 4096, 0);
-    bsw.getScores8(sp.data(), ref.data(), qer.data(), n, 1, w);
-    std::vector<ExtResult> out(n);
-    std::vector<char> seen(n, 0);
-    for (int q = 0; q < n; q++) {
-        const SeqPair &p = sp[q];
-        if (p.id < 0 || p.id >= n || seen[p.id])   // every pair's result read exactly once
-            FAIL("getScores8 returned pair id " << p.id << " at slot " << q << " of " << n);
-        seen[p.id] = 1;
-        ExtResult &o = out[p.id];
-        o.score = p.score; o.qle = p.qle; o.tle = p.tle; o.gtle = p.gtle;
-        o.gscore = p.gscore; o.max_off = p.max_off;
-    }
-    return out;
+    return bwa_tests::score_bsw_batch(bsw, pairs, 8, w);
 }
 
 /// A query derived from `src` with substitutions, indels and N bases.
@@ -396,9 +363,9 @@ TEST_CASE("BSW8_ROW_LEAN: the two linked kernel copies differ in BSW8_ROW_LEAN"
 
 TEST_CASE("BSW8_ROW_LEAN: both kernels equal the scalar oracle for pairs scored alone"
           * doctest::test_suite("unit/bandedswa")) {
-    // Independent oracle. A pair alone in its group (the other 15 lanes are
-    // padding) does not see the lane coupling described above, so both the lean
-    // and the original kernel must equal scalarBandedSWA on all six fields.
+    // Independent oracle: a pair alone in its group (the other 15 lanes are
+    // padding), with both the lean and the original kernel, must equal
+    // scalarBandedSWA on all six fields.
     Rng r(0x5EB8A17ull);
     long checked = 0, diffs = 0, zdrop_low = 0;
     for (int bi = 0; bi < 24; bi++) {

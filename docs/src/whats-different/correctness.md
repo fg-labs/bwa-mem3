@@ -622,6 +622,67 @@ the reverse half. Under collapsed and genomic scoring each must keep its positio
 cytosines called in `XM`; under `--meth=taps` its strand and `XG`, with no conversion in `NM`.
 The reverse-anchor and contig-end mates fail it without the fix.
 
+## Banded-SW extension results depended on their SIMD lane group (PR #565)
+
+The banded extension kernels (`smithWaterman128_8`/`_16`, `smithWaterman256_8`/`_16`,
+`smithWaterman512_8`/`_16` in `src/bandedSWA.cpp`) score a group of pairs at once, one per
+SIMD lane, over one column range per row: the union of the lanes' bands. Each lane is masked to
+its own band `[head, tail]`. The reference is bwa's scalar `ksw_extend2` (bwa-mem3's
+`scalarBandedSWA`), which at row `i` computes columns `[beg, end)`, stores `eh[end] = {H, 0}`
+and leaves every cell right of `end` alone. Those cells are zero up to the furthest column it
+has computed (the scan that moved `end` left of them saw them zero) and the untouched seed row
+derived from `h0` beyond it, and one of them is read again when the band grows by two columns
+in one row. A lane scored alone usually has a column range equal to its own band, so it does
+the same.
+
+In a group, another lane can widen the range past a lane's tail (rarely a lane's own band clamp
+does it when the pair is alone), and the masked stores then treated the extra columns
+differently from the scalar code. They zeroed the lane's seed-row
+cells right of its tail, so a later regrowth read 0 where the scalar code reads the seed. The
+mask was also inclusive at the tail, so the kernel computed the column the scalar code never
+does and stored its vertical-gap value where the scalar code stores 0. A pair's
+`gscore`/`gtle` (more rarely `score`, `tle`, `qle` or `max_off`) could therefore change with the
+pairs it was batched with, in both kernel widths. `smithWaterman512_16` also assigned the next
+row's column range before the per-lane head and tail scans, so a lane's tail scan could start
+past its own band, at a column another lane had added or, for a lane with a high seed score,
+at its own seed row (possibly even with the pair scored alone).
+
+The fix keeps the `H` zeroing stores, which agree with the scalar code wherever it can read
+them, and adds two writes. The gap store is zeroed from column `tail` on, using the mask the row
+maximum already uses (left of `head` it is no longer masked: `head` only moves right, so a
+lane never reads those cells as part of its band again). At the start of a row, a live lane whose band grows by two columns past
+the furthest column it has reached gets the seed value (and a zero gap) written back at the one
+column that row reads beyond its old band; that test fires on few rows, and a scalar loop over
+the lanes that need it does the write. The `smithWaterman512_16` range assignment moved to the
+row start, as in the other kernels. In the 128-bit (NEON and SSE) kernels and the AVX2 8-bit
+kernel the gap store drops a redundant mask OR per masked cell; in the AVX2 16-bit and AVX-512
+kernels its operation count is unchanged. Every lane now returns what it returns scored alone, which is
+the scalar result, on every tier.
+
+The coupling needs a highly divergent pair, whose band shrinks and then regrows by two columns
+in one row, next to a wider pair. In generated 8-bit batches with 0 to 70 % mismatches, each
+pair also scored next to a full group of perfect-match partners, the previous kernels changed
+the result of about 0.04 % of pairs with their grouping (18 of 41,096 random-scoring pairs, the
+same count on the NEON, SSE4.1, AVX2 and AVX-512BW tiers), and of none of 119 k pairs with at
+most 25 % mismatches. On real
+data no record changed: on a 5 M-pair WGS slice (HG00096, 2×150 bp) and a 5 M-pair WES slice
+(HG00100, 2×76 bp) against hg38, `-t 16 -K 160000000`, built with clang 19, the alignment
+records (header excluded) were md5-identical to the previous build on Graviton 4 (NEON) and on
+AMD EPYC 9R45 (Zen 5, AVX-512BW; the WGS slice also with the AVX2 tier forced), with the default
+options and under `--compat=bwa-mem2` and `--compat=bwa-mem` (about 10.1 M records each).
+bwa-mem2 v2.2.1's kernels have the same store, trim and scan structure. Its 128-bit kernels,
+built unmodified for arm64 and run on generated pairs the same way, returned a
+grouping-dependent result for 29 of 245 k 8-bit pairs and 12 of 49 k 16-bit pairs, so its own
+output on such pairs depends on its batch composition and SIMD tier. bwa-mem3 never reproduced
+bwa-mem2's grouping (its sort key, lane widths, batch sizes and the extension-DP dedup differ),
+so the fix applies under both `--compat` targets as well; see [Equivalence](equivalence.md#divergences-that-are-latent-opt-in-or-per-architecture).
+Pinned by `test/unit/test_bandedswa_lane_indep.cpp`, which scores pairs that were coupled in
+the old kernels (among them a 16-bit pair with `len1=8 len2=28 h0=29 w=20`) next to a full
+group of wide partners, and generated batches in several groupings, on every tier the host
+supports, and requires every pair to equal its scalar result (a negative seed on the 8-bit
+kernel, where the vector and scalar seeding differ as described under PR #528, must equal its
+result scored alone). It fails without the fix.
+
 ## Upstream port divergences: all chains dropped by the weight filter (PR #489) and the SA sentinel offset (PR #469)
 
 bwa-mem2 advertises output identical to bwa. Two records are known where its port is not
@@ -669,6 +730,7 @@ shipped, because parity with that release is its contract (see
 | Extension retry ladder ran four rungs where upstream runs two | [#543](https://github.com/fg-labs/bwa-mem3/pull/543) | — | fork-only (only an extension of more than 156 query bases at the default `-w 100` and scoring can reach a third rung, so under those defaults 150 bp reads are unchanged by construction; a narrower `-w` lowers the bound (`a*L > o_min + e_min*3w/2`, more than 36 query bases at `-w 20`); longer reads can change CIGAR, `AS` and the recorded band where the stop test failed at `2w` — see the correctness note above) |
 | Ungapped fast path: record tie-break and z-drop guard | [#544](https://github.com/fg-labs/bwa-mem3/pull/544) | — | fork-only (non-default parameters only: `-L 0`, gap costs that admit a second mismatch after a tie, `-d` below `b * x_threshold`, or `-w` below 2; the default `-L 5 -d 100` is byte-identical — see the correctness note above) |
 | `--meth` mate rescued off a reverse-strand anchor took the other strand | [#553](https://github.com/fg-labs/bwa-mem3/pull/553) | — | fork-only (`--meth` paired-end only, every chemistry; a mate rescued in a window on the reverse half gets its own `XG`/`XM` and a CIGAR/`NM` that no longer count its conversions (`MD` follows the CIGAR), where an indel can move and shift `POS`; its locus, `AS` and `XS` are unchanged, as is `MAPQ` unless `--chimera-qc` caps it on the regenerated CIGAR, its anchor changes only in `MC`/`PNEXT`/`TLEN`, a rescued alt hit in `XA:Z` can change, and `--set-as-failed`/`--chimera-qc` can flip the pair's `0x200`/`0x2`; every other record is byte-identical by construction — see the correctness note above) |
+| Banded-SW extension results depended on their SIMD lane group | [#565](https://github.com/fg-labs/bwa-mem3/pull/565) | — | fork-only, also under `--compat` (bwa-mem2 v2.2.1 has the same coupling; reachable only on highly divergent pairs, and no record changed on the WGS and WES sets measured — see the correctness note above) |
 | kseq2bseq1 zero-initialization | [#22](https://github.com/fg-labs/bwa-mem3/pull/22) | — | fork-only |
 | Proper-pair flag from emitted alignment | [#17](https://github.com/fg-labs/bwa-mem3/pull/17) | — | fork-only, **opt-in** (`--proper-pair-from-emitted`; default matches both upstreams, [#362](https://github.com/fg-labs/bwa-mem3/issues/362)) |
 | All chains dropped by the weight filter: default follows bwa | [#489](https://github.com/fg-labs/bwa-mem3/pull/489) | — ([#310](https://github.com/fg-labs/bwa-mem3/issues/310)) | fork-only; `--compat=bwa-mem2` reproduces bwa-mem2 |
