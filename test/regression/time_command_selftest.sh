@@ -50,7 +50,10 @@ if PATH="$TD/empty" bwamem3_resolve_time Linux "$TD/missing" 2> "$TD/error"; the
     echo 'FAIL: missing timer accepted' >&2
     exit 1
 fi
-grep -q 'install GNU time' "$TD/error"
+grep -q 'install GNU time' "$TD/error" || {
+    echo 'FAIL: missing timer guidance differs' >&2
+    exit 1
+}
 chmod -x "$TD/path with spaces/time"
 check Linux "$TD/path with spaces" "$TD/fallback/time" "$TD/fallback/time" -v
 check Linux "$TD/empty" "$TD/fallback/time" "$TD/fallback/time" -v
