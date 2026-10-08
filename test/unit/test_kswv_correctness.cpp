@@ -753,6 +753,94 @@ TEST_CASE("kswv u8 rescue: BWA3_RESCUE_FSCAN off == on in every u8 body, and FSC
     CHECK(oracle_mism == 0);
 }
 
+// The u8 FScan two-row sweep runs as a two-deep software pipeline outside
+// Apple builds (KSWV_U8_FS_SKEW): it starts two columns ahead and drains the
+// last two columns of every column range (below jdummy, below jsplit, to ncol),
+// with the QE_BLK checkpoints firing between. Every query length from 1 to 48
+// gets one 16-lane group of its own, and ragged groups mix lengths. With USQADD
+// on, column ranges are whole 16-column quanta; the biased body (USQADD off)
+// stops its jdummy and jsplit ranges at the shortest query, which gives ranges
+// of one, two and three columns and ranges ending just past a block. The
+// pipelined body must agree with the unpipelined 13-op body (FSCAN off) on
+// every field and with the scalar oracle, at the default and an adjacent-gap
+// scoring, with and without USQADD and lazy QE. Apple builds keep the
+// two-column unrolled sweep, which this case then covers the same way.
+TEST_CASE("kswv u8 FScan: the two-row sweep agrees with FSCAN off and scalar at every short query length"
+          * doctest::test_suite("unit/kswv")) {
+    std::mt19937 rng(424242);
+    std::vector<bwa_tests::TestPair> pairs;
+    for (int qlen = 1; qlen <= 48; qlen++) {          // uniform lane groups
+        std::uniform_int_distribution<int> rlen_d(qlen, qlen + 60);
+        for (int k = 0; k < 11; k++) pairs.push_back(bwa_tests::gen_random_pair(rng, qlen, rlen_d(rng)));
+        for (int k = 0; k < 4; k++) pairs.push_back(bwa_tests::gen_tandem_repeat_pair(rng, qlen, qlen + 40));
+        pairs.push_back(bwa_tests::gen_exact_match_pair(qlen));   // 16 pairs: one lane group
+    }
+    std::uniform_int_distribution<int> qlen_d(1, 70);
+    for (int k = 0; k < 600; k++) {                    // ragged lane groups: jdummy < jsplit < ncol
+        const int qlen = qlen_d(rng);
+        std::uniform_int_distribution<int> rlen_d(qlen, qlen + 80);
+        pairs.push_back(k % 5 == 4 ? bwa_tests::gen_with_n_bases_pair(rng, qlen, rlen_d(rng), 10)
+                                   : bwa_tests::gen_random_pair(rng, qlen, rlen_d(rng)));
+    }
+
+    struct Regime { std::string name; int mismatch, gap_open, gap_extend; };
+    const Regime regimes[] = {
+        {"default (B4 O6 E1)",        4, 6, 1},
+        {"adjacent gaps (B20 O1 E1)", 20, 1, 1},
+    };
+    struct Config { std::string name; const char *lazyqe, *usqadd; bool oracle; };
+    const Config configs[] = {
+        {"two-row lazy",   "1", "1", true},   // the production default
+        {"two-row inline", "0", "1", false},
+        {"two-row biased", "1", "0", false},
+    };
+    int oracle_mism = 0;
+    for (const Regime &r : regimes) {
+        auto mat = bwa_tests::build_scoring_matrix(1, r.mismatch, 1);
+        for (const Config &c : configs) {
+            ScopedEnv rp("BWA3_RESCUE_ROWPAIR", "1");
+            ScopedEnv lq("BWA3_RESCUE_LAZYQE", c.lazyqe);
+            ScopedEnv uq("BWA3_RESCUE_USQADD", c.usqadd);
+            std::vector<kswr_t> off, on;
+            {
+                ScopedEnv fs("BWA3_RESCUE_FSCAN", "0");
+                off = bwa_tests::run_kswv_batch(pairs, mat, r.gap_open, r.gap_extend);
+            }
+            {
+                ScopedEnv fs("BWA3_RESCUE_FSCAN", "1");
+                on = bwa_tests::run_kswv_batch(pairs, mat, r.gap_open, r.gap_extend);
+            }
+            REQUIRE(off.size() == pairs.size());
+            REQUIRE(on.size() == pairs.size());
+            int drift = 0;
+            for (size_t i = 0; i < pairs.size(); i++) {
+                if (!kswr_all_fields_eq(off[i], on[i])) {
+                    ++drift;
+                    CAPTURE(r.name); CAPTURE(c.name); CAPTURE(i); CAPTURE(pairs[i].tag);
+                    CAPTURE(pairs[i].qry.size()); CAPTURE(pairs[i].ref.size());
+                    CAPTURE(off[i].score); CAPTURE(on[i].score); CAPTURE(off[i].te); CAPTURE(on[i].te);
+                    CAPTURE(off[i].qe); CAPTURE(on[i].qe); CAPTURE(off[i].score2); CAPTURE(on[i].score2);
+                    CHECK(kswr_all_fields_eq(off[i], on[i]));
+                }
+                if (c.oracle) {
+                    const kswr_t s = bwa_tests::run_scalar_ksw(pairs[i], mat, r.gap_open, r.gap_extend);
+                    if (!(bwa_tests::kswr_score_eq(s, on[i]) && bwa_tests::kswr_ends_eq(s, on[i])
+                          && bwa_tests::kswr_coords_eq(s, on[i]) && bwa_tests::kswr_score2_eq(s, on[i]))) {
+                        ++oracle_mism;
+                        CAPTURE(r.name); CAPTURE(i); CAPTURE(pairs[i].tag);
+                        CAPTURE(s.score); CAPTURE(on[i].score); CAPTURE(s.te); CAPTURE(on[i].te);
+                        CHECK(bwa_tests::kswr_score_eq(s, on[i]));
+                    }
+                }
+            }
+            MESSAGE("short-query fscan off-vs-on [" << r.name << "] (" << std::string(kKswvTier) << " "
+                    << c.name << ") drift=" << drift << " over " << pairs.size() << " pairs");
+            CHECK(drift == 0);
+        }
+    }
+    CHECK(oracle_mism == 0);
+}
+
 // The 16-bit twin of the case above: BWA3_RESCUE_FSCAN selects the G-based
 // int16 cell in the NEON (one-row, two-row inline, two-row lazy), AVX2 and
 // AVX-512BW 16-bit bodies (of which the compile-time tier's run here, as
