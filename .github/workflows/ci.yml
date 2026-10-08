@@ -872,6 +872,14 @@ jobs:
             ./ "$RUNNER_TEMP/avx512bw/"
           make -C "$RUNNER_TEMP/avx512bw" -j"$(nproc)" test-binaries arch=avx512bw CXX=${{ matrix.cxx || 'clang++-19' }} USE_MIMALLOC=${{ matrix.use_mimalloc }}
           "$RUNNER_TEMP/avx512bw/test/bwa_mem3_tests_unit" -ts=unit/kswv
+          # Same reasoning for the lane-compaction equivalence tests: their
+          # compacting tier (avx512bw) exists only on a runner that has it, and
+          # on the AVX2-floor binary built elsewhere they skip (a counted WARN).
+          # Here the tier is present, so require it: BWA_REQUIRE_COMPACTION_TIER
+          # turns a missing compacting tier into a hard failure, so these cannot
+          # pass vacuously where the AVX-512BW driver must be exercised.
+          BWA_REQUIRE_COMPACTION_TIER=1 \
+            "$RUNNER_TEMP/avx512bw/test/bwa_mem3_tests_unit" -tc='lane compaction*'
 
       - name: Makefile header-dependency check
         # Runs after the build because it inspects an already-built tree; on an

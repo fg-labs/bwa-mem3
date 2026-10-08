@@ -108,7 +108,9 @@ static inline int bsw_seed_row(int h0, int oe_ins, int e_ins, int c)
 // copy of this file built with the opposite setting (src/bandedSWA.rowalt.o: KERNEL_VARIANT
 // _rowalt, BSW8_ROW_LEAN_INVERT), and test/unit/test_bandedswa_row_lean.cpp compares the two
 // on every result field, so both settings stay exercised on Linux arm64 and on macOS. x86
-// always uses the original code.
+// always uses the original code. The lane-compaction driver (bandedSWA_compact.inc) runs its
+// own copy of the lean row, so it is on by default only where BSW8_ROW_LEAN is (see
+// BSW8_COMPACT_GROUPS_TIER below).
 #if defined(__aarch64__)
 #ifndef BSW8_ROW_LEAN
 #if defined(__APPLE__)
@@ -135,6 +137,19 @@ static inline int bsw_seed_row(int h0, int oe_ins, int e_ins, int c)
 #endif
 #undef BSW8_ROW_LEAN
 #define BSW8_ROW_LEAN 0
+#endif
+
+// Same-row lane compaction (getScores8; bandedSWA_compact.inc / bandedSWA_compact512.inc,
+// set_lane_compaction): the tier's default group count. The NEON driver always runs the lean
+// row, so it is on by default only where that is the plain kernel's own row (BSW8_ROW_LEAN):
+// Apple silicon, which keeps its own measured epilogue, and -DBSW8_ROW_LEAN=0 builds run the
+// plain wrapper unless a caller turns compaction on. AVX2 and SSE4.1 have no driver.
+#if defined(__aarch64__) && BSW8_ROW_LEAN
+#define BSW8_COMPACT_GROUPS_TIER BSW_COMPACT_GROUPS_NEON
+#elif __AVX512BW__
+#define BSW8_COMPACT_GROUPS_TIER BSW_COMPACT_GROUPS_AVX512
+#else
+#define BSW8_COMPACT_GROUPS_TIER 0
 #endif
 
 // ------------------------------------------------------------------------------------
@@ -280,6 +295,7 @@ BandedPairWiseSW::BandedPairWiseSW(const int o_del, const int e_del, const int o
                                    const int end_bonus, const int8_t *mat_,
                                    const int8_t w_match, const int8_t w_mismatch, int numThreads)
 {
+    compact_groups_ = BSW8_COMPACT_GROUPS_TIER;
     mat = mat_;
     this->m = 5;
     this->end_bonus = end_bonus;
@@ -2717,7 +2733,11 @@ void BandedPairWiseSW::getScores8(SeqPair *pairArray,
 
     {
         BswOvershootGuard _g(pairArray, numPairs, SIMD_WIDTH8, guard_overshoot_);
-        smithWatermanBatchWrapper8(pairArray, seqBufRef, seqBufQer, numPairs, numThreads, w);
+        /* same-row lane compaction (bandedSWA_compact512.inc; see set_lane_compaction) */
+        if (compact_groups_ > 0 && w >= compact_min_w_ && numPairs > SIMD_WIDTH8)
+            smithWatermanBatchWrapper8Compact(pairArray, seqBufRef, seqBufQer, numPairs, w, compact_groups_);
+        else
+            smithWatermanBatchWrapper8(pairArray, seqBufRef, seqBufQer, numPairs, numThreads, w);
     }
 
 #if MAXI
@@ -3395,11 +3415,8 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
         for (j = beg; j < fast_lo; j++)   EXT13_CELL8_512_MASKED
         for (j = fast_lo; j < fast_hi; j++) EXT13_CELL8_512_FAST
         for (j = fast_hi; j < end; j++)   EXT13_CELL8_512_MASKED
-#undef EXT13_CELL8_512_COMMON
-#undef EXT13_CELL8_512_GSCORE
-#undef EXT13_CELL8_512_MASKED
-#undef EXT13_CELL8_512_FAST
-#undef BSW8_ASSERT_FAST8_512
+        /* EXT13_CELL8_512_* and BSW8_ASSERT_FAST8_512 stay defined: the AVX-512 lane-compaction
+         * driver (bandedSWA_compact512.inc, included after this kernel) reuses them. */
         __mmask64 cmp1 = _mm512_cmpgt_epi8_mask(head512, j512);
         __mmask64 cmp2 = _mm512_cmpgt_epi8_mask(j512, tail512);
         cmp1 = cmp1 | cmp2;
@@ -3704,6 +3721,12 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
 
     return;
 }
+#include "bandedSWA_compact512.inc"
+#undef EXT13_CELL8_512_COMMON
+#undef EXT13_CELL8_512_GSCORE
+#undef EXT13_CELL8_512_MASKED
+#undef EXT13_CELL8_512_FAST
+#undef BSW8_ASSERT_FAST8_512
 //----------------------------AVX512 vec 16 bit SIMD lane -------------------------------------
 #define PFD16 2
 void BandedPairWiseSW::getScores16(SeqPair *pairArray,
@@ -5747,7 +5770,13 @@ void BandedPairWiseSW::getScores8(SeqPair *pairArray,
     assert(SIMD_WIDTH8 == 16 && SIMD_WIDTH16 == 8);
     {
         BswOvershootGuard _g(pairArray, numPairs, SIMD_WIDTH8, guard_overshoot_);
-        smithWatermanBatchWrapper8(pairArray, seqBufRef, seqBufQer, numPairs, numThreads, w);
+#if defined(__aarch64__)
+        /* same-row lane compaction (bandedSWA_compact.inc; see set_lane_compaction) */
+        if (compact_groups_ > 0 && w >= compact_min_w_ && numPairs > SIMD_WIDTH8)
+            smithWatermanBatchWrapper8Compact(pairArray, seqBufRef, seqBufQer, numPairs, w, compact_groups_);
+        else
+#endif
+            smithWatermanBatchWrapper8(pairArray, seqBufRef, seqBufQer, numPairs, numThreads, w);
     }
 
 #if MAXI
@@ -6229,6 +6258,11 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
     _mm_store_si128((__m128i *) (ierow16 + 8), _mm_setzero_si128());
     _mm_store_si128((__m128i *) gbest8, _mm_setzero_si128());
     _mm_store_si128((__m128i *) gset8, _mm_setzero_si128());
+#endif
+    // gscore query-end fold for the lean side channels (gbest8 / gset8 / ierow16). Defined on
+    // every build, and left defined past this kernel: the NEON lane-compaction driver
+    // (bandedSWA_compact.inc, included after it) reuses it, as it does EXT13_RUN_SPLIT8_128 and
+    // EXT13_SBT8_*; all are #undef'd after that include.
 #define BSW8_GSCORE_NARROW()                                                          \
     do {                                                                              \
         __m128i gb_ = _mm_load_si128((const __m128i *) gbest8);                       \
@@ -6247,7 +6281,6 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
         _mm_store_si128((__m128i *) ierow16, il_);                                    \
         _mm_store_si128((__m128i *) (ierow16 + 8), ih_);                              \
     } while (0)
-#endif
 
     int32_t minq = 10000000;
     for (int l=0; l<SIMD_WIDTH8; l++) {
@@ -6579,7 +6612,6 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
                 __m128i sbt_pos = shuffle_lut_lowidx8(pmat_pos128, xor_); \
                 __m128i sbt_neg = shuffle_lut_lowidx8(pmat_neg128, xor_);
             EXT13_RUN_SPLIT8_128(EXT13_SBT8_XOR);
-#undef EXT13_SBT8_XOR
         } else if (fc.rank1) {
             __m128i rowfreed = _mm_cmpeq_epi8(s10, frref128);
 #define EXT13_SBT8_RANK1 \
@@ -6589,7 +6621,6 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
                 __m128i sbt_pos, sbt_neg; \
                 SBT_SPLIT8(sbt11, sbt_pos, sbt_neg, zero128);
             EXT13_RUN_SPLIT8_128(EXT13_SBT8_RANK1);
-#undef EXT13_SBT8_RANK1
         } else {
 #define EXT13_SBT8_AMAT \
                 __m128i s2 = _mm_load_si128((__m128i *)(seq2SoA + j * SIMD_WIDTH8)); \
@@ -6598,9 +6629,7 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
                 __m128i sbt_pos, sbt_neg; \
                 SBT_SPLIT8(sbt11, sbt_pos, sbt_neg, zero128);
             EXT13_RUN_SPLIT8_128(EXT13_SBT8_AMAT);
-#undef EXT13_SBT8_AMAT
         }
-#undef EXT13_RUN_SPLIT8_128
         __m128i cmp1 = _mm_cmpgt_epi8(head128, j128);
         __m128i cmp2 = _mm_cmpgt_epi8(j128, tail128);
         cmp1 = _mm_or_si128(cmp1, cmp2);
@@ -7138,7 +7167,6 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
             p[i].gtle    = ierow16[i];
         }
     }
-#undef BSW8_GSCORE_NARROW
 #else
     for(i = 0; i < SIMD_WIDTH8; i++)
     {
@@ -7155,6 +7183,13 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
 
     return;
 }
+
+#include "bandedSWA_compact.inc"
+#undef BSW8_GSCORE_NARROW
+#undef EXT13_RUN_SPLIT8_128
+#undef EXT13_SBT8_XOR
+#undef EXT13_SBT8_RANK1
+#undef EXT13_SBT8_AMAT
 
 #endif
 

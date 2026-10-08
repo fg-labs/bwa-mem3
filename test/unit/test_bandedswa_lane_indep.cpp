@@ -9,7 +9,12 @@
 //
 // Kernel copies checked: on x86 every tier the CPU supports (sse41, sse42, avx,
 // avx2, avx512bw; the ones it lacks are reported); on aarch64 NEON with both
-// BSW8_ROW_LEAN settings (libbwa.a and src/bandedSWA.rowalt.o).
+// BSW8_ROW_LEAN settings (libbwa.a and src/bandedSWA.rowalt.o; the second with
+// lane compaction off, since the compaction driver runs the same lean row in
+// both copies). The tiers with same-row lane compaction in getScores8 (NEON,
+// avx512bw) are checked three ways: as shipped (the tier's default setting),
+// with compaction off, and compacting every band in superblocks of three
+// groups.
 //
 //   1. The regression guard: directed pairs that were coupled to their group in
 //      the old kernels (found by fuzzing them; among them the 16-bit corner
@@ -77,12 +82,21 @@ std::unique_ptr<IBandedPairWiseSW> make_with(const ExtScoring &sc)
                                                       sc.pen_clip, sc.mat, (int8_t)sc.a, (int8_t)sc.b, 1));
 }
 
-#if defined(__aarch64__)
-std::unique_ptr<IBandedPairWiseSW> make_lib(const ExtScoring &sc)
+/// make_with with getScores8's lane compaction set to `groups` / `min_w`.
+template <IBandedPairWiseSW *(*Factory)(int, int, int, int, int, int, const int8_t *, int8_t, int8_t, int),
+          int groups, int min_w>
+std::unique_ptr<IBandedPairWiseSW> make_compact(const ExtScoring &sc)
 {
-    return std::unique_ptr<IBandedPairWiseSW>(new BandedPairWiseSW(sc.o_del, sc.e_del, sc.o_ins, sc.e_ins,
-                                                                   sc.zdrop, sc.pen_clip, sc.mat, (int8_t)sc.a,
-                                                                   (int8_t)sc.b, 1));
+    std::unique_ptr<IBandedPairWiseSW> k = make_with<Factory>(sc);
+    k->set_lane_compaction(groups, min_w);
+    return k;
+}
+
+#if defined(__aarch64__)
+IBandedPairWiseSW *make_lib_raw(int o_del, int e_del, int o_ins, int e_ins, int zdrop, int end_bonus,
+                                const int8_t *mat, int8_t a, int8_t b, int nthreads)
+{
+    return new BandedPairWiseSW(o_del, e_del, o_ins, e_ins, zdrop, end_bonus, mat, a, b, nthreads);
 }
 #endif
 
@@ -91,8 +105,10 @@ std::vector<Kernel> host_kernels()
 {
     std::vector<Kernel> ks;
 #if defined(__aarch64__)
-    ks.push_back({"neon", make_lib});
-    ks.push_back({"neon (other BSW8_ROW_LEAN setting)", make_with<make_bsw_kernel_rowalt>});
+    ks.push_back({"neon", make_with<make_lib_raw>});
+    ks.push_back({"neon (lane compaction off)", make_compact<make_lib_raw, 0, 0>});
+    ks.push_back({"neon (lane compaction, 3 groups, every band)", make_compact<make_lib_raw, 3, 0>});
+    ks.push_back({"neon (other BSW8_ROW_LEAN setting)", make_compact<make_bsw_kernel_rowalt, 0, 0>});
 #elif defined(__x86_64__) || defined(__i386__)
     __builtin_cpu_init();
     std::string skipped;
@@ -105,6 +121,10 @@ std::vector<Kernel> host_kernels()
     add(__builtin_cpu_supports("avx"), "avx", make_with<make_bsw_kernel_avx>);
     add(__builtin_cpu_supports("avx2"), "avx2", make_with<make_bsw_kernel_avx2>);
     add(__builtin_cpu_supports("avx512bw"), "avx512bw", make_with<make_bsw_kernel_avx512bw>);
+    add(__builtin_cpu_supports("avx512bw"), "avx512bw (lane compaction off)",
+        make_compact<make_bsw_kernel_avx512bw, 0, 0>);
+    add(__builtin_cpu_supports("avx512bw"), "avx512bw (lane compaction, 3 groups, every band)",
+        make_compact<make_bsw_kernel_avx512bw, 3, 0>);
     if (!skipped.empty()) MESSAGE("lane independence: this CPU cannot run tier(s)" << skipped << "; not checked here");
 #endif
     return ks;
