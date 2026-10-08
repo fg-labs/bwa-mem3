@@ -184,15 +184,23 @@ std::vector<ExtPair> make_pairs(Rng &r, const ExtScoring &sc, int w, bool meth, 
     return pairs;
 }
 
+/// One kernel copy, with getScores8's lane compaction off: the compaction driver
+/// runs its own (lean) row body, so with it on both copies would run the same
+/// code for most bands. test_bandedswa_compact.cpp compares compaction with
+/// these kernels.
 std::unique_ptr<IBandedPairWiseSW> make_kernel(const ExtScoring &sc, bool rowalt)
 {
+    std::unique_ptr<IBandedPairWiseSW> k;
     if (rowalt)
-        return std::unique_ptr<IBandedPairWiseSW>(make_bsw_kernel_rowalt(
+        k.reset(make_bsw_kernel_rowalt(
             sc.o_del, sc.e_del, sc.o_ins, sc.e_ins, sc.zdrop, sc.pen_clip, sc.mat,
             (int8_t)sc.a, (int8_t)sc.b, 1));
-    return std::unique_ptr<IBandedPairWiseSW>(new BandedPairWiseSW(
-        sc.o_del, sc.e_del, sc.o_ins, sc.e_ins, sc.zdrop, sc.pen_clip, sc.mat,
-        (int8_t)sc.a, (int8_t)sc.b, 1));
+    else
+        k.reset(new BandedPairWiseSW(
+            sc.o_del, sc.e_del, sc.o_ins, sc.e_ins, sc.zdrop, sc.pen_clip, sc.mat,
+            (int8_t)sc.a, (int8_t)sc.b, 1));
+    k->set_lane_compaction(0, 0);
+    return k;
 }
 
 /// The lean and the original kernel for one scoring (whichever copy is which).

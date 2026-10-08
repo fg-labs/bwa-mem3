@@ -426,7 +426,8 @@ advanced, and kept `h0` otherwise, so its `score` depended on which pairs shared
 The fix updates `best_abs` only on lanes whose maximum advanced that row, as `xrow` already
 was, so a negative-`h0` lane now reports what the scalar kernel reports whatever it is
 batched with. (On aarch64 outside Apple silicon, `smithWaterman128_8` runs a lean per-row
-path, `BSW8_ROW_LEAN` in `src/bandedSWA.cpp`, that does not keep `best_abs` per row. The
+path, `BSW8_ROW_LEAN` in `src/bandedSWA.cpp`, that does not keep `best_abs` per row, and so
+does the 8-bit lane-compaction driver, `src/bandedSWA_compact.inc`. The
 byte maximum only rises, and only on the rows where the masked update above fires, so the
 path rebuilds the same value at the result store: `max(h0, final byte maximum)` for a lane
 whose maximum ever advanced, and `h0` otherwise.)
