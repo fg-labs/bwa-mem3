@@ -1089,6 +1089,27 @@ jobs:
           BWA3_RESCUE_BAND_COST=100000000 RB_METH=random RB_METH_REL=expand RB_KMAX=8 RB_SCORING=1,6,6,1,6,1 ./rescue_band_harness eq 10000 28
           RB_16BIT=1 BWA3_RESCUE_PRUNE_MAX_HITS=100000 RB_METH=random RB_METH_REL=expand RB_KMAX=0 RB_SCORING=random ./rescue_band_harness eq 10000 29
 
+      # The NEON banded kernels against each other below the end results: the two-row kernel
+      # (rb_dp_wave2, the default) and the one-row fused kernel (rb_dp_core<true>) must agree on
+      # every row maximum, gmax and te, over random band geometries in all three scoring forms.
+      # On x86 the binary reports SKIP (an error on an arm64 runner). As above, a negative control
+      # (kernel 2's te shifted in one lane) must fail first.
+      - name: Banded rescue kernels agree (rescue_band_kernel_eq)
+        run: |
+          if [ "${{ matrix.arch_flag }}" = "" ]; then arch=${{ matrix.baseline_arch || 'avx2' }}; else arch=${{ matrix.arch_flag }}; fi
+          make rescue-band-kernel-eq arch="$arch" CXX=${{ matrix.cxx || 'clang++-19' }} USE_MIMALLOC=${{ matrix.use_mimalloc }}
+          if RB_NEGATIVE_CONTROL=1 ./rescue_band_kernel_eq 2000 1 > rbk_nc.log 2>&1; then
+            cat rbk_nc.log
+            case "$(uname -m)" in
+              aarch64 | arm64) echo "::error::negative control exited 0 on arm64: the check skipped or missed an injected disagreement"; exit 1 ;;
+            esac
+            grep -q '^SKIP:' rbk_nc.log || { echo "::error::negative control exited 0 without SKIP: the check missed an injected disagreement"; exit 1; }
+            exit 0
+          fi
+          grep -q 'MISMATCHES=[1-9]' rbk_nc.log || { cat rbk_nc.log; echo "::error::negative control failed without reporting a MISMATCH"; exit 1; }
+          ./rescue_band_kernel_eq 20000 1
+          ./rescue_band_kernel_eq 20000 2
+
       - name: Flat chaining index matches the kbtree replay (chr22)
         if: matrix.canonical == true
         run: |
