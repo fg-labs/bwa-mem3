@@ -253,14 +253,41 @@ ifneq ($(IS_ARM),)
     SSE2NEON_INCLUDES = -Iext/sse2neon
     CPPFLAGS += $(SSE2NEON_FLAGS)
     INCLUDES += $(SSE2NEON_INCLUDES)
-    # CPU tuning. Default is generic/portable scheduling — safe for any ARM core
-    # including Apple Silicon, and what portable release binaries should ship.
-    # Set ARM_CPU=<name> for a core-tuned build, e.g. ARM_CPU=neoverse-v2
-    # (Graviton4) or ARM_CPU=native (match the build host). This goes in CPPFLAGS
-    # (not ARCH_FLAGS) because ARCH_FLAGS is reset with `=` in the arch=arm64
-    # branch below; CPPFLAGS uses `+=` and reaches every compile line.
+    # CPU tuning. Unless ARM_CPU says otherwise the ISA is the compiler's default
+    # aarch64 target, so the binary runs on the cores that target covers.
+    # Set ARM_CPU=<name> for a core-targeted build, e.g. ARM_CPU=neoverse-v2
+    # (Graviton4) or ARM_CPU=native (match the build host); -mcpu sets both the
+    # ISA and the scheduling model, so it replaces ARM_TUNE below.
+    # ARM_TUNE=<name> picks only the scheduling model (-mtune), which changes
+    # instruction order and unrolling but never the instructions a CPU must
+    # support. Linux aarch64 defaults to neoverse-v2 (measured on Neoverse V2 and
+    # V1; see docs/src/best-practices/build.md). macOS keeps the compiler's
+    # default tuning. ARM_TUNE= (empty) restores the compiler default on Linux
+    # too. The default is dropped, with a note, if $(CC) or $(CXX) rejects it
+    # (older releases, e.g. clang before 16, do not know neoverse-v2, and the
+    # compiler floor above checks $(CXX) only). An explicit ARM_TUNE is passed
+    # through unchecked.
+    # These go in CPPFLAGS (not ARCH_FLAGS) because ARCH_FLAGS is reset with `=`
+    # in the arch=arm64 branch below; CPPFLAGS uses `+=` and reaches every C and
+    # C++ compile line of this Makefile (not the vendored cmake / configure
+    # sub-builds under ext/, which never took ARM_CPU either). test/Makefile
+    # builds its own CPPFLAGS and gets the same flags from the ARM_CPU and
+    # ARM_TUNE values the test-binaries recipe forwards.
+    ifneq ($(UNAME_S),Darwin)
+        ARM_TUNE ?= neoverse-v2
+        ifeq ($(origin ARM_TUNE),file)
+            ARM_TUNE_OK := $(shell $(CC) -mtune=$(ARM_TUNE) -x c -fsyntax-only /dev/null >/dev/null 2>&1 \
+                                && $(CXX) -mtune=$(ARM_TUNE) -x c++ -fsyntax-only /dev/null >/dev/null 2>&1 && echo ok)
+            ifeq ($(ARM_TUNE_OK),)
+                $(info NOTE: $(CC) or $(CXX) does not accept -mtune=$(ARM_TUNE); building with the compiler's default tuning.)
+                ARM_TUNE :=
+            endif
+        endif
+    endif
     ifneq ($(ARM_CPU),)
         CPPFLAGS += -mcpu=$(ARM_CPU)
+    else ifneq ($(ARM_TUNE),)
+        CPPFLAGS += -mtune=$(ARM_TUNE)
     endif
     # Cache-line size used as the minimum SIMD allocation alignment. Apple
     # Silicon uses 128-byte lines; Neoverse/Graviton use 64. Default 128 —
@@ -910,6 +937,7 @@ test-binaries: $(BWA_LIB) $(HTS_LIB)
 	    COVERAGE=$(COVERAGE) \
 	    ARCH_FLAGS_FROM_PARENT='$(ARCH_FLAGS)' \
 	    ARM_CPU='$(ARM_CPU)' \
+	    ARM_TUNE='$(ARM_TUNE)' \
 	    ARM_CACHE_LINE='$(or $(ARM_CACHE_LINE),128)' \
 	    HTSLIB_static_LIBS='$(HTSLIB_static_LIBS)' \
 	    HTSLIB_static_LDFLAGS='$(HTSLIB_static_LDFLAGS)'

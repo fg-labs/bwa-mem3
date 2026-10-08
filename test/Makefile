@@ -86,11 +86,27 @@ ifneq ($(IS_ARM),)
         $(error ARM_CACHE_LINE must be 64 or 128 (got '$(ARM_CACHE_LINE)'))
     endif
     CPPFLAGS = -DENABLE_PREFETCH -D__SSE__=1 -D__SSE2__=1 -D__SSE3__=1 -D__SSSE3__=1 -D__SSE4_1__=1 -D__SSE4_2__=1 -DAPPLE_SILICON=1 -DCACHE_LINE_BYTES=$(ARM_CACHE_LINE)
-    # Match the top-level Makefile's ARM_CPU tuning so the test binaries are built
-    # with the same -mcpu as the shipped objects (forwarded by the test-binaries
-    # recipe). Unset -> generic scheduling, identical to before.
+    # Match the top-level Makefile's ARM_CPU / ARM_TUNE tuning so the test
+    # binaries are built with the same -mcpu / -mtune as the shipped objects
+    # (forwarded by the test-binaries recipe). The ARM_TUNE default mirrors the
+    # top-level one for a standalone `make -C test`: neoverse-v2 on Linux, the
+    # compiler default on macOS. As there, the default is dropped, with a note,
+    # if $(CXX) rejects it (the only compiler this Makefile invokes); an explicit
+    # or forwarded ARM_TUNE is passed through unchecked.
+    ifneq ($(UNAME_S),Darwin)
+        ARM_TUNE ?= neoverse-v2
+        ifeq ($(origin ARM_TUNE),file)
+            ARM_TUNE_OK := $(shell $(CXX) -mtune=$(ARM_TUNE) -x c++ -fsyntax-only /dev/null >/dev/null 2>&1 && echo ok)
+            ifeq ($(ARM_TUNE_OK),)
+                $(info NOTE: $(CXX) does not accept -mtune=$(ARM_TUNE); building the tests with the compiler's default tuning.)
+                ARM_TUNE :=
+            endif
+        endif
+    endif
     ifneq ($(ARM_CPU),)
         CPPFLAGS += -mcpu=$(ARM_CPU)
+    else ifneq ($(ARM_TUNE),)
+        CPPFLAGS += -mtune=$(ARM_TUNE)
     endif
     INCLUDES = -I../src -I../ext/sse2neon -I../ext -I../ext/htslib
 else

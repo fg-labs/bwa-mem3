@@ -86,6 +86,32 @@ If you build with clang, note the OpenMP runtime changes from `libgomp` to
 compiler a given binary was built with via `bwa-mem3 version`, which now prints
 a `Compiler:` line.
 
+### aarch64 core tuning: `ARM_TUNE` and `ARM_CPU`
+
+On Linux aarch64 a plain `make` tunes for Neoverse V2 (`-mtune=neoverse-v2`).
+Tuning changes only instruction scheduling and unrolling, not the instruction
+set, so the binary still runs on any core the compiler's default target covers.
+Whole-aligner wall time against the compiler's default tuning (NEON, clang
+19.1.7, `-t 16`, 5M read pairs, hg38, median of 3 interleaved runs; each run
+matched the default-tuned build's record count and record MD5, header
+excluded):
+
+| Host | WGS 150 bp | WES 76 bp |
+|---|---:|---:|
+| Graviton4 (Neoverse V2, `m8g.4xlarge`) | -1.4% | -1.0% |
+| Graviton3 (Neoverse V1, `m7g.4xlarge`) | -0.7% | -0.2% |
+
+Other cores (Neoverse N1 / Graviton2, Ampere, Cortex-A) were not measured.
+
+- `ARM_TUNE=<cpu>` picks another scheduling model; `ARM_TUNE=` (empty) restores
+  the compiler's default. If `CC` or `CXX` does not know the default model (older
+  releases, e.g. clang before 16), the build prints a note and uses the compiler's
+  default.
+- `ARM_CPU=<cpu>` (for example `ARM_CPU=neoverse-v2` or `ARM_CPU=native`) sets
+  `-mcpu`, which also targets that core's instruction set. The binary may then
+  not run on older cores. It takes precedence over `ARM_TUNE`.
+- macOS builds keep the compiler's default tuning.
+
 ## Profile-Guided Optimization (PGO)
 
 PGO adds 3–5% throughput on real workloads and is recommended for any
