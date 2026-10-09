@@ -33,7 +33,12 @@ struct BswMove {
  * evacuated: each of its live lanes, in lane order, goes to the first hole of the other active
  * vectors (lowest vector, then lowest lane). The donor always empties: the other active vectors
  * then hold at least as many holes as it has live lanes. live[] and active[] are updated, the
- * moves are appended to mv (capacity nv * L), and the number of moves is returned. */
+ * moves are appended to mv (capacity nv * L), and the number of moves is returned.
+ *
+ * So the moves come donor by donor, and a donor's moves fill one destination vector before the
+ * next. The NEON driver applies each such run (one source and one destination vector) in one
+ * pass (move_run in bandedSWA_compact.inc); it is correct for any order, but emitting moves in
+ * another order would split the runs and cost it speed. */
 static inline int bsw_compact_plan(uint64_t *live, uint8_t *active, int nv, int L, BswMove *mv)
 {
     const uint64_t full = (L >= 64) ? ~(uint64_t) 0 : (((uint64_t) 1 << L) - 1);
