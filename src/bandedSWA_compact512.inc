@@ -10,6 +10,9 @@
  * test/unit/test_bandedswa_compact.cpp compares the two field by field. */
 #if __AVX512BW__
 
+#include <algorithm>
+#include <cstring>
+
 #include "bsw_compact.h"
 
 static_assert(SIMD_WIDTH8 == 64, "bandedSWA_compact512.inc: Bsw8CVec512 holds 64 lanes");
@@ -463,34 +466,111 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8Compact(SeqPair *pairArray,
             return (uint64_t) _mm512_movepi8_mask(exit0);
         };
 
-        auto move_lane = [&](Bsw8CVec512 &Sv, int sl, Bsw8CVec512 &D, int dl, int r) {
-            writeback(D, dl);
-            D.head[dl] = Sv.head[sl]; D.tail[dl] = Sv.tail[sl]; D.maxend[dl] = Sv.maxend[sl];
-            D.exit0[dl] = Sv.exit0[sl]; D.maxScore[dl] = Sv.maxScore[sl]; D.y[dl] = Sv.y[sl];
-            D.max_off[dl] = Sv.max_off[sl]; D.h0[dl] = Sv.h0[sl]; D.myband[dl] = Sv.myband[sl];
-            D.xrow[dl] = Sv.xrow[sl]; D.ierow[dl] = Sv.ierow[sl]; D.best_abs[dl] = Sv.best_abs[sl];
-            D.gbest_abs[dl] = Sv.gbest_abs[sl];
-            D.qlenw[dl] = Sv.qlenw[sl]; D.mlenw[dl] = Sv.mlenw[sl]; D.tlenw[dl] = Sv.tlenw[sl];
-            D.pair[dl] = Sv.pair[sl];
-            int ha = r + (int8_t) Sv.head[sl];
-            if (ha < 0) ha = 0;
-            /* As in bandedSWA_compact.inc: the slot from the head on, target rows r to tlen - 1. */
-            for (int c = ha; c <= ncol; c++) {
-                D.H[c * SIMD_WIDTH8 + dl]    = Sv.H[c * SIMD_WIDTH8 + sl];
-                D.F[c * SIMD_WIDTH8 + dl]    = Sv.F[c * SIMD_WIDTH8 + sl];
-                D.seq2[c * SIMD_WIDTH8 + dl] = Sv.seq2[c * SIMD_WIDTH8 + sl];
+        /* ---- move live lanes of one group into dead slots of another, between rows (next
+         * row r) ----
+         * As in bandedSWA_compact.inc, each moved lane takes its slot with it: the per-lane
+         * trackers, its H, F and query bytes from its head to the superblock's last column, and
+         * its target rows r to tlen - 1; the receiving slot is cleared left of the head, from the
+         * group's lowest future column (the kernel needs zero there). The k moves of a run share
+         * their source and destination groups and touch distinct lanes, so the copies go a
+         * column at a time for all of them, through this tier's cross-lane byte gather: within
+         * a column each lane takes the source's byte, is cleared, or keeps its own, a choice that
+         * only changes at the lanes' heads and at the cleared range's start, so the columns split
+         * into at most k + 1 segments of constant masks; the target rows split at the lanes'
+         * target lengths. */
+        auto move_run = [&](Bsw8CVec512 &Sv, Bsw8CVec512 &D, const BswMove *mv, int k, int r) {
+            /* k < SIMD_WIDTH8 in practice (a destination is an active group, so it has a live
+             * lane); the breakpoint lists hold k + 1 */
+            assert(k >= 1 && k <= SIMD_WIDTH8 && "move_run: a run moves 1 to SIMD_WIDTH8 lanes");
+            uint8_t idx_a[SIMD_WIDTH8] __attribute((aligned(64)));   /* source lane per destination lane */
+            uint8_t dl_a[SIMD_WIDTH8];                                /* the destination lanes */
+            int ha_a[SIMD_WIDTH8], tl_a[SIMD_WIDTH8];
+            memset(idx_a, 0, sizeof idx_a);
+            for (int q = 0; q < k; q++) {
+                const int sl = mv[q].sl, dl = mv[q].dl;
+                writeback(D, dl);
+                D.head[dl] = Sv.head[sl]; D.tail[dl] = Sv.tail[sl]; D.maxend[dl] = Sv.maxend[sl];
+                D.exit0[dl] = Sv.exit0[sl]; D.maxScore[dl] = Sv.maxScore[sl]; D.y[dl] = Sv.y[sl];
+                D.max_off[dl] = Sv.max_off[sl]; D.h0[dl] = Sv.h0[sl]; D.myband[dl] = Sv.myband[sl];
+                D.xrow[dl] = Sv.xrow[sl]; D.ierow[dl] = Sv.ierow[sl]; D.best_abs[dl] = Sv.best_abs[sl];
+                D.gbest_abs[dl] = Sv.gbest_abs[sl];
+                D.qlenw[dl] = Sv.qlenw[sl]; D.mlenw[dl] = Sv.mlenw[sl]; D.tlenw[dl] = Sv.tlenw[sl];
+                D.pair[dl] = Sv.pair[sl];
+                int ha = r + (int8_t) Sv.head[sl];
+                if (ha < 0) ha = 0;
+                idx_a[dl] = (uint8_t) sl; dl_a[q] = (uint8_t) dl;
+                ha_a[q] = ha; tl_a[q] = Sv.tlenw[sl];
+                if (Sv.qlenw[sl] > D.ncol) D.ncol = Sv.qlenw[sl];
+                if (Sv.qlenw[sl] - 1 < D.minq) D.minq = Sv.qlenw[sl] - 1;
             }
-            for (int rr = r; rr < Sv.tlenw[sl]; rr++)
-                D.seq1[rr * SIMD_WIDTH8 + dl] = Sv.seq1[rr * SIMD_WIDTH8 + sl];
             if (Sv.nbeg < D.nbeg) D.nbeg = Sv.nbeg;
             if (Sv.nend > D.nend) D.nend = Sv.nend;
-            for (int c = D.nbeg < 0 ? 0 : D.nbeg; c < ha; c++) {   /* see move_run in bandedSWA_compact.inc */
-                D.H[c * SIMD_WIDTH8 + dl] = 0;
-                D.F[c * SIMD_WIDTH8 + dl] = 0;
+            const int cstart = D.nbeg < 0 ? 0 : D.nbeg;   /* the clear runs from here to each head */
+            int bp[SIMD_WIDTH8 + 1], nb = 0;   /* column breakpoints: cstart and every head */
+            bp[nb++] = cstart;
+            for (int q = 0; q < k; q++) bp[nb++] = ha_a[q];
+            std::sort(bp, bp + nb);
+            nb = (int) (std::unique(bp, bp + nb) - bp);
+            int rp[SIMD_WIDTH8 + 1], nr = 0;   /* row breakpoints: r and every target length past it */
+            rp[nr++] = r;
+            for (int q = 0; q < k; q++) if (tl_a[q] > r) rp[nr++] = tl_a[q];
+            std::sort(rp, rp + nr);
+            nr = (int) (std::unique(rp, rp + nr) - rp);
+            uint8_t *dH = (uint8_t *) D.H, *dF = (uint8_t *) D.F, *dQ = D.seq2, *d1 = D.seq1;
+            const uint8_t *sH = (const uint8_t *) Sv.H, *sF = (const uint8_t *) Sv.F, *sQ = Sv.seq2, *s1 = Sv.seq1;
+            /* gather: dst byte l = src byte idx[l]. AVX-512BW has no full-width byte permute (that
+             * is VBMI), so each 128-bit quarter of the source is broadcast and shuffled in-lane,
+             * and the quarter each destination byte reads selects among the four. */
+            const __m512i idx = _mm512_load_si512((const __m512i *) idx_a);
+            __mmask64 qsel[4] = {0, 0, 0, 0};   /* destination lanes reading each source quarter */
+            for (int q = 0; q < k; q++) qsel[mv[q].sl >> 4] |= (__mmask64) 1 << dl_a[q];
+            /* quarter 0 is shuffled for every lane; the others only when some lane reads them */
+            const bool q1 = qsel[1] != 0, q2 = qsel[2] != 0, q3 = qsel[3] != 0;
+            auto gather = [&](const uint8_t *p) {
+                const __m512i v = _mm512_load_si512((const __m512i *) p);
+                __m512i t = _mm512_shuffle_epi8(_mm512_shuffle_i32x4(v, v, 0x00), idx);
+                if (q1) t = _mm512_mask_shuffle_epi8(t, qsel[1], _mm512_shuffle_i32x4(v, v, 0x55), idx);
+                if (q2) t = _mm512_mask_shuffle_epi8(t, qsel[2], _mm512_shuffle_i32x4(v, v, 0xAA), idx);
+                if (q3) t = _mm512_mask_shuffle_epi8(t, qsel[3], _mm512_shuffle_i32x4(v, v, 0xFF), idx);
+                return t;
+            };
+            /* the lane mask of the destination lanes of the moves q for which pred(q) holds */
+            auto lanes_where = [&](auto pred) {
+                __mmask64 m = 0;
+                for (int q = 0; q < k; q++) if (pred(q)) m |= (__mmask64) 1 << dl_a[q];
+                return m;
+            };
+            const __mmask64 moved = lanes_where([](int) { return true; });
+            /* the columns stop at ncol, as the lane-by-lane copy did; a live lane's head is at
+             * most its query length, so the clear never needs more */
+            for (int j = 0; j < nb; j++) {
+                const int c0 = bp[j], c1 = (j + 1 < nb) ? bp[j + 1] : ncol + 1;
+                if (c0 > ncol) break;
+                const __mmask64 take = lanes_where([&](int q) { return ha_a[q] <= c0; });   /* c >= head */
+                const __mmask64 clear = (c0 >= cstart) ? (moved & ~take) : 0;
+                for (int c = c0; c < c1 && c <= ncol; c++) {
+                    const size_t o = (size_t) c * SIMD_WIDTH8;
+                    const __m512i h = _mm512_maskz_mov_epi8(take, gather(sH + o));
+                    const __m512i f = _mm512_maskz_mov_epi8(take, gather(sF + o));
+                    _mm512_store_si512((__m512i *) (dH + o), _mm512_mask_mov_epi8(
+                                       _mm512_load_si512((const __m512i *) (dH + o)), take | clear, h));
+                    _mm512_store_si512((__m512i *) (dF + o), _mm512_mask_mov_epi8(
+                                       _mm512_load_si512((const __m512i *) (dF + o)), take | clear, f));
+                    if (take)   /* the query row is only copied, never cleared */
+                        _mm512_store_si512((__m512i *) (dQ + o), _mm512_mask_mov_epi8(
+                                           _mm512_load_si512((const __m512i *) (dQ + o)), take, gather(sQ + o)));
+                }
             }
-            if (Sv.qlenw[sl] > D.ncol) D.ncol = Sv.qlenw[sl];
-            if (Sv.qlenw[sl] - 1 < D.minq) D.minq = Sv.qlenw[sl] - 1;
-            Sv.pair[sl] = nullptr; Sv.exit0[sl] = 0;
+            for (int j = 0; j + 1 < nr; j++) {   /* target rows r to tlen - 1 of each lane */
+                const int r0 = rp[j];
+                const __mmask64 take = lanes_where([&](int q) { return tl_a[q] > r0; });
+                for (int rr = rp[j]; rr < rp[j + 1]; rr++) {
+                    const size_t o = (size_t) rr * SIMD_WIDTH8;
+                    _mm512_store_si512((__m512i *) (d1 + o), _mm512_mask_mov_epi8(
+                                       _mm512_load_si512((const __m512i *) (d1 + o)), take, gather(s1 + o)));
+                }
+            }
+            for (int q = 0; q < k; q++) { Sv.pair[mv[q].sl] = nullptr; Sv.exit0[mv[q].sl] = 0; }
         };
 
         int prev_live = -1;
@@ -505,8 +585,14 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8Compact(SeqPair *pairArray,
             if (nact == 0) break;
             if (nv > 1 && total != prev_live && nact > (total + SIMD_WIDTH8 - 1) / SIMD_WIDTH8) {
                 const int nm = bsw_compact_plan(live, active, nv, SIMD_WIDTH8, moves);
-                for (int k = 0; k < nm; k++)
-                    move_lane(Vs[moves[k].sv], moves[k].sl, Vs[moves[k].dv], moves[k].dl, i + 1);
+                /* in plan order, a run of moves with one source and one destination group at a
+                 * time (a later run may move lanes out of an earlier run's destination) */
+                for (int k0 = 0; k0 < nm;) {
+                    int k1 = k0 + 1;
+                    while (k1 < nm && moves[k1].sv == moves[k0].sv && moves[k1].dv == moves[k0].dv) k1++;
+                    move_run(Vs[moves[k0].sv], Vs[moves[k0].dv], moves + k0, k1 - k0, i + 1);
+                    k0 = k1;
+                }
                 int nleft = 0;
                 for (int v = 0; v < nv; v++) nleft += active[v];
                 compact_counts_.moves += (uint64_t) nm;
