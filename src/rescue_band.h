@@ -247,7 +247,8 @@ void rescue_band_batch_free(RescueBandBatch *b);
 bool rescue_band_enabled();
 /* The default of the pass-0 cost gate (BWA3_RESCUE_BAND_COST) when kswv runs at SIMD tier `tier`
  * (simd_dispatch.h): 0 (no pass-0 banding) at BWAMEM3_TIER_AVX512BW, where kswv sweeps 64 lanes
- * against the band kernel's 32, and 85 at every other tier. See rb_cost_pct in rescue_band.cpp. */
+ * against the band kernel's 32, 100 at BWAMEM3_TIER_NEON, and 85 at every other tier. See
+ * rescue_band_cost_pct_default and rb_cost_pct in rescue_band.cpp. */
 int rescue_band_cost_pct_default(int tier);
 
 #endif

@@ -966,11 +966,13 @@ TEST_CASE("rescue prune: the SIMD filter's repeat memo and component list match 
 TEST_CASE("rescue band: the pass-0 cost gate's default follows the kswv tier"
           * doctest::test_suite("unit/pair")) {
     // Where kswv sweeps 64 lanes (the AVX-512BW tier) the 32-lane band kernel cannot undercut the
-    // hull, so the default bands no pass-0 parent there; every other tier keeps the 85 % margin
-    // (rescue_band.cpp, rb_cost_pct). BWA3_RESCUE_BAND_COST overrides either.
+    // hull, so the default bands no pass-0 parent there; NEON bands at a 100 % margin, and every
+    // other tier keeps 85 % (rescue_band.cpp, rescue_band_cost_pct_default). BWA3_RESCUE_BAND_COST
+    // overrides any of them.
     CHECK(rescue_band_cost_pct_default(BWAMEM3_TIER_AVX512BW) == 0);
+    CHECK(rescue_band_cost_pct_default(BWAMEM3_TIER_NEON) == 100);
     for (const int tier : {BWAMEM3_TIER_NONE, BWAMEM3_TIER_SSE41, BWAMEM3_TIER_SSE42, BWAMEM3_TIER_AVX,
-                           BWAMEM3_TIER_AVX2, BWAMEM3_TIER_NEON}) {
+                           BWAMEM3_TIER_AVX2}) {
         CAPTURE(tier);
         CHECK(rescue_band_cost_pct_default(tier) == 85);
     }

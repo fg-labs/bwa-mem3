@@ -15,7 +15,7 @@
 | `BWA3_RESCUE_ROWPAIR` | `1` | `src/kswv.cpp` | NEON kswv (8- and 16-bit): sweep two target rows per pass |
 | `BWA3_RESCUE_LAZYQE` | `1` | `src/kswv.cpp` | NEON kswv two-row sweep: recover the query end after the row instead of inline |
 | `BWA3_RESCUE_BAND` | `1` | `src/rescue_band.cpp` | run rescue jobs as diagonal bands (NEON or AVX2 kernel) |
-| `BWA3_RESCUE_BAND_COST` | `auto` | `src/rescue_band.cpp` | band a pass-0 parent iff its band cells cost less than this % of the hull's; auto is 0 (no pass-0 banding) where kswv runs at the AVX-512BW tier, whose 64-lane hull undercuts the 32-lane band kernel, else 85 |
+| `BWA3_RESCUE_BAND_COST` | `auto` | `src/rescue_band.cpp` | band a pass-0 parent iff its band cells cost less than this % of the hull's; auto is 0 (no pass-0 banding) where kswv runs at the AVX-512BW tier, whose 64-lane hull undercuts the 32-lane band kernel, 100 on aarch64 (NEON), else 85 |
 | `BWA3_RESCUE_BAND_R2` | `1` | `src/rescue_band.cpp` | run round 2 banded (0: kswv on the hull) |
 | `BWA3_RESCUE_BAND_TIGHT` | `8` | `src/rescue_band.cpp` | threshold offset of the tight top band (0: off) |
 | `BWA3_RESCUE_BAND_P1` | `2` | `src/rescue_band.cpp` | pass-1 banding: 0 none, 1 banded parents only, 2 every eligible 8-bit job |
