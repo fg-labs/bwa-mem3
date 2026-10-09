@@ -139,15 +139,18 @@ static inline int bsw_seed_row(int h0, int oe_ins, int e_ins, int c)
 #define BSW8_ROW_LEAN 0
 #endif
 
-// Same-row lane compaction (getScores8; bandedSWA_compact.inc / bandedSWA_compact512.inc,
-// set_lane_compaction): the tier's default group count. The NEON driver always runs the lean
-// row, so it is on by default only where that is the plain kernel's own row (BSW8_ROW_LEAN):
-// Apple silicon, which keeps its own measured epilogue, and -DBSW8_ROW_LEAN=0 builds run the
-// plain wrapper unless a caller turns compaction on. AVX2 and SSE4.1 have no driver.
+// Same-row lane compaction (getScores8; bandedSWA_compact.inc / bandedSWA_compact256.inc /
+// bandedSWA_compact512.inc, set_lane_compaction): the tier's default group count. The NEON
+// driver always runs the lean row, so it is on by default only where that is the plain kernel's
+// own row (BSW8_ROW_LEAN): Apple silicon, which keeps its own measured epilogue, and
+// -DBSW8_ROW_LEAN=0 builds run the plain wrapper unless a caller turns compaction on. The
+// x86 128-bit tiers (SSE4.1 to AVX) have no driver.
 #if defined(__aarch64__) && BSW8_ROW_LEAN
 #define BSW8_COMPACT_GROUPS_TIER BSW_COMPACT_GROUPS_NEON
 #elif __AVX512BW__
 #define BSW8_COMPACT_GROUPS_TIER BSW_COMPACT_GROUPS_AVX512
+#elif __AVX2__
+#define BSW8_COMPACT_GROUPS_TIER BSW_COMPACT_GROUPS_AVX2
 #else
 #define BSW8_COMPACT_GROUPS_TIER 0
 #endif
@@ -772,7 +775,11 @@ void BandedPairWiseSW::getScores8(SeqPair *pairArray,
 
     {
         BswOvershootGuard _g(pairArray, numPairs, SIMD_WIDTH8, guard_overshoot_);
-        smithWatermanBatchWrapper8(pairArray, seqBufRef, seqBufQer, numPairs, numThreads, w);
+        /* same-row lane compaction (bandedSWA_compact256.inc; see set_lane_compaction) */
+        if (compact_groups_ > 0 && w >= compact_min_w_ && numPairs > SIMD_WIDTH8)
+            smithWatermanBatchWrapper8Compact(pairArray, seqBufRef, seqBufQer, numPairs, w, compact_groups_);
+        else
+            smithWatermanBatchWrapper8(pairArray, seqBufRef, seqBufQer, numPairs, numThreads, w);
     }
 
 #if MAXI
@@ -1475,11 +1482,8 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
         for (j = fast_lo; j < fast_hi; j++) EXT13_CELL8_256_FAST
 #pragma unroll(4)
         for (j = fast_hi; j < end; j++)   EXT13_CELL8_256_MASKED
-#undef EXT13_CELL8_256_COMMON
-#undef EXT13_CELL8_256_GSCORE
-#undef EXT13_CELL8_256_MASKED
-#undef EXT13_CELL8_256_FAST
-#undef BSW8_ASSERT_FAST8_256
+        /* EXT13_CELL8_256_* and BSW8_ASSERT_FAST8_256 stay defined: the AVX2 lane-compaction
+         * driver (bandedSWA_compact256.inc, included after this kernel) reuses them. */
         __m256i cmp1 = _mm256_cmpgt_epi8(head256, j256);
         __m256i cmp2 = _mm256_cmpgt_epi8(j256, tail256);
         cmp1 = _mm256_or_si256(cmp1, cmp2);
@@ -1803,6 +1807,12 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
 
     return;
 }
+#include "bandedSWA_compact256.inc"
+#undef EXT13_CELL8_256_COMMON
+#undef EXT13_CELL8_256_GSCORE
+#undef EXT13_CELL8_256_MASKED
+#undef EXT13_CELL8_256_FAST
+#undef BSW8_ASSERT_FAST8_256
 
 // ------------------------- AVX2 - 16 bit SIMD_LANES ---------------------------
 #define PFD 2

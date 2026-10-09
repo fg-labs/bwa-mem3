@@ -1,10 +1,11 @@
 // test/unit/test_bandedswa_compact.cpp
 //
 // Same-row lane compaction in getScores8 (src/bandedSWA_compact.inc on NEON,
-// src/bandedSWA_compact512.inc on AVX-512BW). The driver runs a batch in
-// superblocks of K lane groups in row lockstep and, when the live lanes fit in
-// one group fewer, moves the live lanes of the emptiest group into dead lanes of
-// the others and retires it. It is a pure speed change: every pair must return
+// src/bandedSWA_compact256.inc on AVX2, src/bandedSWA_compact512.inc on
+// AVX-512BW). The driver runs a batch in superblocks of K lane groups in row
+// lockstep and, when the live lanes fit in one group fewer, moves the live lanes
+// of the emptiest group into dead lanes of the others and retires it. It is a
+// pure speed change: every pair must return
 // the same six result fields (score, tle, qle, gscore, gtle, max_off) as the
 // plain wrapper, and as the pair scored alone.
 //
@@ -13,7 +14,7 @@
 // evacuation):
 //   - staggered finishes: perfect-match pairs of mixed lengths with divergent
 //     and z-dropping pairs among them, so groups empty at different rows and are
-//     evacuated in cascades, at 2, 3 and 8 groups per superblock, at the shipped
+//     evacuated in cascades, at 2, 3, 6 and 8 groups per superblock, at the shipped
 //     w >= 31 gate and at every band, with the symmetric, rank-1 (--meth) and
 //     generic scoring matrices;
 //   - stale cells: an incoming lane lands in the slot of a high-scoring lane
@@ -32,7 +33,7 @@
 //
 // The reference is the same kernel copy with compaction off (set_lane_compaction
 // (0, 0)), batch for batch, and each pair scored alone. Tiers without compaction
-// (AVX2 and below) are checked to ignore the setting.
+// (the x86 128-bit tiers, SSE4.1 to AVX) are checked to ignore the setting.
 
 #include <algorithm>
 #include <cstdint>
@@ -83,23 +84,30 @@ std::vector<Tier> compacting_tiers()
     ts.push_back({"neon", make_neon, 16});
 #elif defined(__x86_64__) || defined(__i386__)
     __builtin_cpu_init();
+    if (__builtin_cpu_supports("avx2")) ts.push_back({"avx2", make_bsw_kernel_avx2, 32});
     if (__builtin_cpu_supports("avx512bw")) ts.push_back({"avx512bw", make_bsw_kernel_avx512bw, 64});
 #endif
-    // An empty list would make every equivalence test loop over zero tiers and
-    // pass vacuously, so the skip must be visible in the test outcome rather than
-    // a silent MESSAGE. On a host that cannot run the compacting tier, record a
-    // WARN (counted by doctest); when BWA_REQUIRE_COMPACTION_TIER is set -- the
-    // AVX-512 CI job sets it -- turn the missing tier into a hard failure so the
-    // driver's field-by-field equivalence cannot go unchecked where it must run.
-    if (ts.empty()) {
-        const char *req = std::getenv("BWA_REQUIRE_COMPACTION_TIER");
-        if (req != nullptr && req[0] != '\0' && req[0] != '0')
-            FAIL("lane compaction: no compacting SIMD tier on this host but "
-                 "BWA_REQUIRE_COMPACTION_TIER is set; the equivalence tests cannot run");
-        else
-            WARN_MESSAGE(false, "lane compaction: this host has no compacting SIMD tier (needs "
-                                "avx512bw on x86); the compacting-tier equivalence tests are "
-                                "skipped here");
+    // A tier this host cannot run is skipped, and an empty list would make every
+    // equivalence test loop over zero tiers and pass vacuously, so the skip must be
+    // visible in the test outcome rather than a silent MESSAGE: an empty list records
+    // a WARN (counted by doctest). BWA_REQUIRE_COMPACTION_TIER turns a missing tier
+    // into a hard failure, so a driver's field-by-field equivalence cannot go
+    // unchecked where it must run: set to 1 it requires some compacting tier; set
+    // to a tier name (the AVX-512 CI job sets avx512bw) it requires that tier, so a
+    // misspelled name fails rather than passing. Unset, empty or 0: no requirement.
+    const char *req = std::getenv("BWA_REQUIRE_COMPACTION_TIER");
+    if (req != nullptr && req[0] != '\0' && std::string(req) != "0") {
+        const std::string want(req);
+        const bool named = want != "1";
+        const bool found = named ? std::any_of(ts.begin(), ts.end(), [&](const Tier &t) { return t.name == want; })
+                                 : !ts.empty();
+        if (!found)
+            FAIL("lane compaction: BWA_REQUIRE_COMPACTION_TIER=" << want << " but this host has "
+                 << (named ? "no such compacting SIMD tier" : "no compacting SIMD tier")
+                 << "; the equivalence tests cannot run");
+    } else if (ts.empty()) {
+        WARN_MESSAGE(false, "lane compaction: this host has no compacting SIMD tier (needs avx2 or "
+                            "avx512bw on x86); the compacting-tier equivalence tests are skipped here");
     }
     return ts;
 }
@@ -253,7 +261,7 @@ TEST_CASE("lane compaction: staggered finishes, cascading retirements, every fie
         int bad = 0;
         const ExtScoring scs[] = {scoring(1, 4, 6, 1, 6, 1, 100, 5), scoring(1, 4, 6, 1, 6, 1, 20, 5),
                                   scoring(2, 5, 7, 2, 5, 3, 150, 0), scoring(1, 9, 12, 1, 3, 2, 60, 20)};
-        for (int groups : {2, 3, 8}) {
+        for (int groups : {2, 3, 6, 8}) {   // 6: the AVX2 default
             for (int rep = 0; rep < 6; rep++) {
                 // every scoring with each matrix kind (symmetric, rank-1, generic) across the reps
                 const ExtScoring sc = with_matrix(scs[rep % 4], rep % 3);
@@ -472,11 +480,13 @@ TEST_CASE("lane compaction: the default setting, the band and batch-size gates a
         };
 #if defined(__aarch64__)
         const bool on_by_default = bsw8_row_lean_enabled() != 0;   // off on Apple silicon
-        const uint64_t default_superblocks = on_by_default ? 1 : 0;  // 3 groups <= 8 per superblock
+        const int default_groups = on_by_default ? BSW_COMPACT_GROUPS_NEON : 0;
 #else
         const bool on_by_default = true;
-        const uint64_t default_superblocks = 1;                      // 3 groups <= 4 per superblock
+        const int default_groups = tier.name == "avx2" ? BSW_COMPACT_GROUPS_AVX2 : BSW_COMPACT_GROUPS_AVX512;
 #endif
+        // the batch is 3 groups: one superblock at any default of 3 or more, none when off
+        const uint64_t default_superblocks = default_groups > 0 ? (uint64_t)((3 + default_groups - 1) / default_groups) : 0;
         MESSAGE(tier.name << ": compaction " << std::string(on_by_default ? "on" : "off") << " by default");
         CHECK(superblocks(all, 31, -1000, 0).superblocks == default_superblocks);
         CHECK(superblocks(all, 30, -1000, 0).superblocks == 0);          // w <= 30 keeps the plain wrapper
@@ -493,6 +503,14 @@ TEST_CASE("lane compaction: the default setting, the band and batch-size gates a
         uint64_t moves = 0, retired = 0;
         CHECK(check_batch(tier, sc, batch, 100, 1000, 0, "groups capped", moves, retired) == 0);
         CHECK(check_batch(tier, sc, batch, 100, 1, 0, "one group", moves, retired) == 0);
+        // the default group count itself: a 13-group batch runs ceil(13 / K) superblocks,
+        // which tells apart the shipped defaults (4, 6, 8) and their neighbours
+        const std::vector<ExtPair> big = staggered_batch(rng, tier.lanes, 13);
+        std::vector<const ExtPair *> all13;
+        for (const ExtPair &p : big) all13.push_back(&p);
+        const uint64_t default_superblocks13 =
+            default_groups > 0 ? (uint64_t)((13 + default_groups - 1) / default_groups) : 0;
+        CHECK(superblocks(all13, 31, -1000, 0).superblocks == default_superblocks13);
     }
 }
 
@@ -534,6 +552,16 @@ TEST_CASE("lane compaction: the plan evacuates the emptiest group into the first
         CHECK(bsw_compact_plan(live3, active, 2, 16, mv) == 8);
         CHECK((live3[0] == 0 && live3[1] == 0xFFFF && active[0] == 0));
     }
+    {   // 32 lanes (AVX2): 31 + 1 + 32 = 64 live in 3 groups need 2: group 1 fills group 0's
+        // one hole, lane 31 (group 2 is full: its 32 set bits are the whole 32-lane mask)
+        uint64_t live[3] = {0x7FFFFFFFull, 0x00010000ull, 0xFFFFFFFFull};
+        uint8_t active[3] = {1, 1, 1};
+        const int nm = bsw_compact_plan(live, active, 3, 32, mv);
+        REQUIRE(nm == 1);
+        CHECK((mv[0].sv == 1 && mv[0].sl == 16 && mv[0].dv == 0 && mv[0].dl == 31));
+        CHECK((live[0] == 0xFFFFFFFFull && live[1] == 0 && live[2] == 0xFFFFFFFFull));
+        CHECK((active[0] == 1 && active[1] == 0 && active[2] == 1));
+    }
     {   // 64 lanes, 63 + 1 + 1 + 1 = 66 live in 4 groups need 2: group 1 fills group 0's one
         // hole, then group 2 (group 0 now full) moves into group 3
         uint64_t live[4] = {~(uint64_t)0 >> 1, 1, (uint64_t)1 << 63, 2};
@@ -555,8 +583,7 @@ TEST_CASE("lane compaction: tiers without it ignore the setting"
     struct Plain { const char *name; Factory make; bool ok; };
     const Plain tiers[] = {{"sse41", make_bsw_kernel_sse41, __builtin_cpu_supports("sse4.1") != 0},
                            {"sse42", make_bsw_kernel_sse42, __builtin_cpu_supports("sse4.2") != 0},
-                           {"avx", make_bsw_kernel_avx, __builtin_cpu_supports("avx") != 0},
-                           {"avx2", make_bsw_kernel_avx2, __builtin_cpu_supports("avx2") != 0}};
+                           {"avx", make_bsw_kernel_avx, __builtin_cpu_supports("avx") != 0}};
     std::mt19937_64 rng(0x0FFC0A1Eull);
     const ExtScoring sc = scoring(1, 4, 6, 1, 6, 1, 100, 5);
     for (const Plain &t : tiers) {
