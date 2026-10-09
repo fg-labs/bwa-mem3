@@ -79,6 +79,7 @@ parity or byte-identity, so nothing here scopes it.)
 | `calloc_interpose_flag_lint.sh` | every `test/` source that defines its own `calloc` is compiled with `$(CALLOC_INTERPOSE_CXXFLAGS)`, so GCC cannot fold its malloc + memset into a call to itself | "Calloc-defining tests pass CALLOC_INTERPOSE_CXXFLAGS" |
 | `calloc_interpose_flag_lint_selftest.sh` | the lint above still rejects a calloc-defining test built without the flag, so its `PASS` means something | "Calloc flag lint still detects a missing flag" |
 | `shell_lint.sh`              | every tracked `*.sh` is shellcheck-clean and shfmt-formatted           | "Tracked shell scripts are shellcheck-clean and shfmt-formatted" |
+| `time_command_selftest.sh` | external timer discovery, fallback and platform flags | "External timer discovery respects platform and path" |
 | `shell_lint_selftest.sh`     | the lint above still rejects bad scripts, so its `PASS` means something | "Shell lint still detects bad scripts"             |
 | `regression_coverage_lint.sh` | every script in this directory is named by a CI workflow, or by a Makefile target CI invokes — not just by `make test` | "Every regression script is run by CI"              |
 | `regression_coverage_lint_selftest.sh` | the lint above still detects an unrun script, so its `PASS` means something | "Coverage lint still detects an unrun script"       |
@@ -114,7 +115,11 @@ at.
 | `readme_contract_lint.sh`     | repository root to check (default: this repository) | `readme_contract_lint_selftest.sh`     |
 | `rescue_docs_lint.sh`         | repository root to check (default: this repository) | `rescue_docs_lint_selftest.sh`         |
 
-`meth_oracle.sh` is the one env-free script that is not a lint, and it takes no
+`time_command_selftest.sh` uses stub timers to check PATH precedence, fallback,
+incompatible or missing executables, spaced paths and Linux/macOS flags. It
+takes no arguments and does not build or index a reference.
+
+`meth_oracle.sh` is another env-free script that is not a lint, and it takes no
 argument either. It wraps the `--meth` harness under `test/meth/`, whose inputs
 are the gitignored fixtures CI copies in there, plus an optional `SAMTOOLS`
 naming a samtools off `PATH`; the wrapper's whole job is to invoke that harness

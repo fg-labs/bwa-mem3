@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run the bwa-mem3 index build across a few reference sizes, capture wall
-# time and peak RSS via /usr/bin/time, emit a TSV and a human-readable
+# time and peak RSS via an external time command, emit a TSV and a human-readable
 # summary. Outputs go under BENCH_DIR (default: $TMPDIR/bwa-index-bench;
 # override with BENCH_DIR=... for a larger scratch volume).
 #
@@ -47,6 +47,9 @@ RESULTS_TSV="$BENCH_DIR/results.tsv"
 SUMMARY="$BENCH_DIR/summary.txt"
 
 UNAME_S="$(uname -s)"
+# shellcheck source=scripts/time_command.sh
+source "$ROOT/scripts/time_command.sh"
+bwamem3_resolve_time "$UNAME_S"
 
 parse_peak() {
     # $1: timing file. emits peak RSS in bytes.
@@ -90,19 +93,11 @@ run_one() {
     # ${arr[@]+"${arr[@]}"} is the bash 3.2-safe idiom for "expand array if
     # set, else nothing" under set -u. Plain "${INDEX_ARGS[@]}" trips
     # `unbound variable` on an empty array under macOS's system bash.
-    if [[ "$UNAME_S" == "Darwin" ]]; then
-        /usr/bin/time -l "$BWAMEM3" index ${INDEX_ARGS[@]+"${INDEX_ARGS[@]}"} "$wd/ref.fa" > "$logfile" 2> "$timing" || {
-            echo "FAIL: $label build failed"
-            cat "$timing"
-            return 1
-        }
-    else
-        /usr/bin/time -v "$BWAMEM3" index ${INDEX_ARGS[@]+"${INDEX_ARGS[@]}"} "$wd/ref.fa" > "$logfile" 2> "$timing" || {
-            echo "FAIL: $label build failed"
-            cat "$timing"
-            return 1
-        }
-    fi
+    LC_ALL=C "${TIME_CMD[@]}" "$BWAMEM3" index ${INDEX_ARGS[@]+"${INDEX_ARGS[@]}"} "$wd/ref.fa" > "$logfile" 2> "$timing" || {
+        echo "FAIL: $label build failed"
+        cat "$timing"
+        return 1
+    }
 
     local peak wall size
     peak="$(parse_peak "$timing")"

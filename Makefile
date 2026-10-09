@@ -1230,6 +1230,7 @@ test: test-binaries $(STANDALONE_TESTS_IN_TEST_TARGET) kvec_alloc_fail_test klib
 	./test/regression/calloc_interpose_flag_lint.sh
 	./test/regression/debug_macro_flag_lint_selftest.sh
 	./test/regression/debug_macro_flag_lint.sh
+	./test/regression/time_command_selftest.sh
 	./test/regression/shell_lint_selftest.sh
 	./test/regression/shell_lint.sh
 	./test/regression/regression_coverage_lint_selftest.sh
