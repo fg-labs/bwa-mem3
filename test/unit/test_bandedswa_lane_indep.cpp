@@ -12,7 +12,7 @@
 // BSW8_ROW_LEAN settings (libbwa.a and src/bandedSWA.rowalt.o; the second with
 // lane compaction off, since the compaction driver runs the same lean row in
 // both copies). The tiers with same-row lane compaction in getScores8 (NEON,
-// avx512bw) are checked three ways: as shipped (the tier's default setting),
+// avx2, avx512bw) are checked three ways: as shipped (the tier's default setting),
 // with compaction off, and compacting every band in superblocks of three
 // groups.
 //
@@ -120,6 +120,9 @@ std::vector<Kernel> host_kernels()
     add(__builtin_cpu_supports("sse4.2"), "sse42", make_with<make_bsw_kernel_sse42>);
     add(__builtin_cpu_supports("avx"), "avx", make_with<make_bsw_kernel_avx>);
     add(__builtin_cpu_supports("avx2"), "avx2", make_with<make_bsw_kernel_avx2>);
+    add(__builtin_cpu_supports("avx2"), "avx2 (lane compaction off)", make_compact<make_bsw_kernel_avx2, 0, 0>);
+    add(__builtin_cpu_supports("avx2"), "avx2 (lane compaction, 3 groups, every band)",
+        make_compact<make_bsw_kernel_avx2, 3, 0>);
     add(__builtin_cpu_supports("avx512bw"), "avx512bw", make_with<make_bsw_kernel_avx512bw>);
     add(__builtin_cpu_supports("avx512bw"), "avx512bw (lane compaction off)",
         make_compact<make_bsw_kernel_avx512bw, 0, 0>);

@@ -284,8 +284,11 @@ typedef struct {
 
 
 /* Same-row lane compaction in getScores8 (set_lane_compaction; the drivers are
- * bandedSWA_compact.inc and bandedSWA_compact512.inc, the plan bsw_compact.h). */
+ * bandedSWA_compact.inc, bandedSWA_compact256.inc and bandedSWA_compact512.inc, the plan
+ * bsw_compact.h). */
 #define BSW_COMPACT_GROUPS_NEON    8    /* groups per superblock, NEON (16 lanes) */
+#define BSW_COMPACT_GROUPS_AVX2    6    /* groups per superblock, AVX2 (32 lanes); the 8-bit kernel
+                                           at 4 or 8 measured within 2% of 6, at 2 7-11% slower */
 #define BSW_COMPACT_GROUPS_AVX512  4    /* groups per superblock, AVX-512BW (64 lanes) */
 #define BSW_COMPACT_GROUPS_MAX     32
 /* Bands of w <= 30 (the short probe rungs of the extension ladder) have few early-finishing
@@ -410,18 +413,18 @@ public:
      * before any (possibly multi-threaded) getScores call. */
     virtual void set_guard_overshoot(bool on) = 0;
 
-    /* Same-row lane compaction in getScores8 (NEON and AVX-512BW tiers; a no-op on the
+    /* Same-row lane compaction in getScores8 (NEON, AVX2 and AVX-512BW tiers; a no-op on the
      * others). A batch runs in superblocks of `groups` lane groups in row lockstep, and the
      * live lanes of a group are moved into dead lanes of the others once they fit, so finished
      * pairs stop costing vector rows. Every result field equals the plain wrapper's (exact by
      * lane independence; see bandedSWA_compact.inc). `groups` <= 0 runs the plain wrapper;
      * larger values are capped at BSW_COMPACT_GROUPS_MAX. Only bands w >= `min_w` compact, and
      * only batches of more than one lane group. The defaults are the measured production
-     * setting: on AVX-512BW 4 groups, on NEON 8 groups where the plain kernel's own row is the
-     * lean one (BSW8_ROW_LEAN; the compaction driver always runs that row), off otherwise
-     * (Apple silicon), all at w >= 31. Other values exist for the unit tests, which compare the
-     * two paths on the same build. Set at setup, before getScores; like the rest of this
-     * object's state it is not for concurrent use. */
+     * setting: on AVX-512BW 4 groups, on AVX2 6, on NEON 8 groups where the plain kernel's
+     * own row is the lean one (BSW8_ROW_LEAN; the compaction driver always runs that row), off
+     * otherwise (Apple silicon), all at w >= 31. Other values exist for the unit tests, which
+     * compare the two paths on the same build. Set at setup, before getScores; like the rest
+     * of this object's state it is not for concurrent use. */
     virtual void set_lane_compaction(int groups, int min_w) = 0;
 
     /* This object's compaction totals since construction (all zero on tiers without it). */
@@ -480,7 +483,7 @@ public:
     bool guard_overshoot_ = false;
     void set_guard_overshoot(bool on) override { guard_overshoot_ = on; }
 
-    // Same-row lane compaction settings, read by getScores8 on the NEON and AVX-512BW tiers
+    // Same-row lane compaction settings, read by getScores8 on the NEON, AVX2 and AVX-512BW tiers
     // (unused elsewhere). The constructor sets the tier's default; see set_lane_compaction.
     int compact_groups_ = 0;
     int compact_min_w_  = BSW_COMPACT_MIN_W_DEFAULT;
@@ -607,6 +610,14 @@ public:
                             int zdrop,
                             int32_t w,
                             uint8_t myband[]);
+    // Same-row lane compaction: superblocks of K 32-lane groups in row lockstep; see
+    // bandedSWA_compact256.inc and set_lane_compaction.
+    void smithWatermanBatchWrapper8Compact(SeqPair *pairArray,
+                                           uint8_t *seqBufRef,
+                                           uint8_t *seqBufQer,
+                                           int32_t numPairs,
+                                           int32_t w,
+                                           int K);
     // 16 bit vector code section
     void getScores16(SeqPair *pairArray,
                      uint8_t *seqBufRef,

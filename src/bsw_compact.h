@@ -1,5 +1,6 @@
 /* bsw_compact.h -- the plan for same-row lane compaction in the 8-bit banded extension kernels
- * (bandedSWA_compact.inc on NEON, bandedSWA_compact512.inc on AVX-512BW).
+ * (bandedSWA_compact.inc on NEON, bandedSWA_compact256.inc on AVX2, bandedSWA_compact512.inc
+ * on AVX-512BW).
  *
  * A batch runs in superblocks of K lane groups (vectors) that advance in row lockstep, so every
  * lane of a superblock is at the same target row i. When pairs finish, the superblock may need
@@ -26,7 +27,7 @@ struct BswMove {
 };
 
 /* live[v]: bit l set iff lane l of vector v is live. active[v]: vector v still runs. L is the
- * lane count (16 or 64), nv <= BSW_COMPACT_GROUPS_MAX (bandedSWA.h).
+ * lane count (16, 32 or 64), nv <= BSW_COMPACT_GROUPS_MAX (bandedSWA.h).
  *
  * Vectors with no live lane are retired first. Then, while the number of active vectors exceeds
  * ceil(total_live / L), the active vector with the fewest live lanes (lowest index on ties) is
