@@ -307,6 +307,46 @@ TEST_CASE("lane compaction: a lane moved into a just-finished lane's slot ignore
     }
 }
 
+TEST_CASE("lane compaction: a wide run of moves carries lanes with shared and distinct heads and target ends"
+          * doctest::test_suite("unit/bandedswa")) {
+    // Half a group of incoming lanes and half a group of dead lanes: once the dead lanes
+    // finish, the two groups hold the same number of live lanes, so the first group
+    // (the lower index) is evacuated, its incoming lanes all moving into the second group's
+    // just-finished slots in one run. The incoming lanes come in identical pairs (the same
+    // head and target end) and otherwise differ: diagonals 0 to 9 columns right of the main
+    // one, and targets that end at, just past, or well past the move.
+    for (const Tier &tier : compacting_tiers()) {
+        std::mt19937_64 rng(0x3A1DE5E7ull);
+        const int n_in = tier.lanes / 2;
+        uint64_t moves = 0, retired = 0;
+        int bad = 0;
+        for (int e : {1, 3})
+            for (int r0 : {20, 40})
+                for (int w : {40, 100}) {
+                    const ExtScoring sc = scoring(1, 4, 6, e, 6, e, 100, 5);
+                    std::vector<ExtPair> in, dead;
+                    for (int q = 0; q + 1 < n_in; q += 2) {
+                        const int d = (q / 2) % 10, kind = (q / 2) % 3;
+                        ExtPair p = shifted(rng, d, 90, 6 + e * d + 20);
+                        if (kind == 0) p.target.resize(r0 + 1 + (int)(rng() % 3));      // ends near the move
+                        else if (kind == 1) p.target.resize(r0 + 8 + (int)(rng() % 8));  // just past it
+                        in.push_back(p);
+                        in.push_back(p);   // its twin: the same head and target end
+                    }
+                    while ((int)in.size() < n_in) in.push_back(perfect(rng, 70, 10, 30));
+                    for (int q = 0; q < n_in; q++) dead.push_back(perfect(rng, r0, 0, 40 + (int)(rng() % 60)));
+                    const std::vector<ExtPair> batch = reuse_batch(rng, tier.lanes, in, dead, 20);
+                    const uint64_t m0 = moves;
+                    bad += check_batch(tier, sc, batch, w, 2, 31,
+                                       "wide run e=" + std::to_string(e) + " r0=" + std::to_string(r0), moves,
+                                       retired);
+                    CHECK(moves - m0 >= (uint64_t)(n_in / 2));   // the evacuation moved a wide run
+                }
+        MESSAGE(tier.name << ": " << moves << " moves in wide runs");
+        CHECK(bad == 0);
+    }
+}
+
 TEST_CASE("lane compaction: a lane moved early keeps its own seed, head and band edge"
           * doctest::test_suite("unit/bandedswa")) {
     // Moves at rows 5 to 9, while the incoming lanes still read their h0-prefix

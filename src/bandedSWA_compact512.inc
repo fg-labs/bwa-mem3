@@ -484,7 +484,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8Compact(SeqPair *pairArray,
                 D.seq1[rr * SIMD_WIDTH8 + dl] = Sv.seq1[rr * SIMD_WIDTH8 + sl];
             if (Sv.nbeg < D.nbeg) D.nbeg = Sv.nbeg;
             if (Sv.nend > D.nend) D.nend = Sv.nend;
-            for (int c = D.nbeg < 0 ? 0 : D.nbeg; c < ha; c++) {   /* see move_lane in bandedSWA_compact.inc */
+            for (int c = D.nbeg < 0 ? 0 : D.nbeg; c < ha; c++) {   /* see move_run in bandedSWA_compact.inc */
                 D.H[c * SIMD_WIDTH8 + dl] = 0;
                 D.F[c * SIMD_WIDTH8 + dl] = 0;
             }
