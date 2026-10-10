@@ -684,6 +684,31 @@ supports, and requires every pair to equal its scalar result (a negative seed on
 kernel, where the vector and scalar seeding differ as described under PR #528, must equal its
 result scored alone). It fails without the fix.
 
+## 8-bit banded-SW z-drop gates at huge gap extends (PR #579)
+
+The 8-bit extension kernels test z-drop once per row as `drop - dif > zdrop`, where `dif =
+|drift| * e` (the gap extend on the side the drift points to) is formed in `int32`. Several
+kernels skip that test on rows where no lane has `drop > zdrop`: the Apple-silicon per-row
+epilogue gate, the AVX2 and AVX-512BW epilogue skips (PR #494) and their lane-compaction
+drivers, and the lean NEON row and NEON compaction driver (PR #564). That condition is
+necessary for a lane to die only while `dif >= 0`. `-E` accepts gap extends up to `INT_MAX`,
+and with an extend near that the product wraps, so the ungated test can kill a lane at a drop
+that does not exceed `zdrop`. A gated kernel then kept the lane alive and reported a longer
+extension than the ungated 8-bit kernels (the x86 128-bit tiers, and the NEON kernel on Linux
+arm64 before PR #564), so a record could differ between platforms and tiers. PR #564 made the
+lean NEON row step aside for such extends; this change does the same for the Apple-silicon gate
+and the four x86 skips: when either gap extend is negative or above `INT32_MAX / (4 * 1088)`
+(493447), they run the test on every row.
+
+Reachable only with an explicit `-E` above 493447 (a `-A` large enough to scale the default
+`-E` that far is outside the 8-bit route's score envelope); the default `-E 1` and any
+realistic scoring are inside the bound, where every gate is unchanged, so default output is
+byte-identical by construction. On Linux arm64 the kernel instructions are unchanged (only two
+`assert` line-number constants move). Pinned by `test/unit/test_bandedswa_zdrop_wrap.cpp`
+(directed pairs a gate without the guard changes, checked on every CI tier, AVX-512BW where the
+runner has it) and by the lean-versus-original cases of
+`test/unit/test_bandedswa_row_lean.cpp`, which now also run on macOS against the Apple gate.
+
 ## Upstream port divergences: all chains dropped by the weight filter (PR #489) and the SA sentinel offset (PR #469)
 
 bwa-mem2 advertises output identical to bwa. Two records are known where its port is not
@@ -732,6 +757,7 @@ shipped, because parity with that release is its contract (see
 | Ungapped fast path: record tie-break and z-drop guard | [#544](https://github.com/fg-labs/bwa-mem3/pull/544) | — | fork-only (non-default parameters only: `-L 0`, gap costs that admit a second mismatch after a tie, `-d` below `b * x_threshold`, or `-w` below 2; the default `-L 5 -d 100` is byte-identical — see the correctness note above) |
 | `--meth` mate rescued off a reverse-strand anchor took the other strand | [#553](https://github.com/fg-labs/bwa-mem3/pull/553) | — | fork-only (`--meth` paired-end only, every chemistry; a mate rescued in a window on the reverse half gets its own `XG`/`XM` and a CIGAR/`NM` that no longer count its conversions (`MD` follows the CIGAR), where an indel can move and shift `POS`; its locus, `AS` and `XS` are unchanged, as is `MAPQ` unless `--chimera-qc` caps it on the regenerated CIGAR, its anchor changes only in `MC`/`PNEXT`/`TLEN`, a rescued alt hit in `XA:Z` can change, and `--set-as-failed`/`--chimera-qc` can flip the pair's `0x200`/`0x2`; every other record is byte-identical by construction — see the correctness note above) |
 | Banded-SW extension results depended on their SIMD lane group | [#565](https://github.com/fg-labs/bwa-mem3/pull/565) | — | fork-only, also under `--compat` (bwa-mem2 v2.2.1 has the same coupling; reachable only on highly divergent pairs, and no record changed on the WGS and WES sets measured — see the correctness note above) |
+| 8-bit banded-SW z-drop gates at huge gap extends | [#579](https://github.com/fg-labs/bwa-mem3/pull/579) | — | fork-only (`-E` above 493447 only, where Apple silicon and the AVX2 / AVX-512BW tiers could report a longer extension than the other kernels; default output byte-identical by construction — see the correctness note above) |
 | kseq2bseq1 zero-initialization | [#22](https://github.com/fg-labs/bwa-mem3/pull/22) | — | fork-only |
 | Proper-pair flag from emitted alignment | [#17](https://github.com/fg-labs/bwa-mem3/pull/17) | — | fork-only, **opt-in** (`--proper-pair-from-emitted`; default matches both upstreams, [#362](https://github.com/fg-labs/bwa-mem3/issues/362)) |
 | All chains dropped by the weight filter: default follows bwa | [#489](https://github.com/fg-labs/bwa-mem3/pull/489) | — ([#310](https://github.com/fg-labs/bwa-mem3/issues/310)) | fork-only; `--compat=bwa-mem2` reproduces bwa-mem2 |

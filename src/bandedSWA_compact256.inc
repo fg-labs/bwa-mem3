@@ -97,6 +97,8 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8Compact(SeqPair *pairArray,
     const __m256i two256  = _mm256_set1_epi8(2);
     const __m256i ff256   = _mm256_set1_epi8(0xFF);
     const __m256i zdrop256 = _mm256_set1_epi8(zdrop);
+    /* the epilogue skip below is exact only for gap extends inside this bound */
+    const bool zgate_exact = BSW8_ZDROP_GATE_EXACT(this->e_del, this->e_ins);
     const uint32_t dmask = 0xFFFFFFFFu;
     const int o_del8 = (uint8_t) (int8_t) this->o_del, e_del8 = (uint8_t) (int8_t) this->e_del;
     /* band-edge write: byte penalties, as the seed row's set1_epi8 / subs_epu8 uses them */
@@ -357,7 +359,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8Compact(SeqPair *pairArray,
                 ? _mm256_subs_epu8(_mm256_subs_epu8(maxScore256, maxRS1), zdrop256)
                 : zero256;
             const __m256i need_any = _mm256_or_si256(_mm256_or_si256(cmp, qfire256), need_z);
-            if (!_mm256_testz_si256(need_any, need_any)) {
+            if (!zgate_exact || !_mm256_testz_si256(need_any, need_any)) {
                 int8_t  cmp_a[SIMD_WIDTH8]      __attribute((aligned(32)));
                 int8_t  y1_a[SIMD_WIDTH8]       __attribute((aligned(32)));
                 int8_t  y_a[SIMD_WIDTH8]        __attribute((aligned(32)));

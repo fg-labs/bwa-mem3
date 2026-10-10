@@ -231,6 +231,27 @@ struct BswOvershootGuard {
 }  // namespace
 
 // ------------------------------------------------------------------------------------
+// Exactness of the 8-bit kernels' z-drop gates.
+//
+// Each 8-bit kernel tests z-drop per row as drop - dif > zdrop, with dif = |zdelta| * e formed
+// in int32 (e the gap extend on the side the drift points to). Several of them skip that step
+// on rows where no lane has drop > zdrop (BSW8_ROW_LEAN, the Apple-silicon epilogue gate, the
+// AVX2 / AVX-512BW epilogue skips and their lane-compaction drivers). The skip is exact only
+// while dif >= 0, so that drop > zdrop is necessary for a lane to die. zdelta is a difference
+// of two int8 column offsets, so |zdelta| <= 256, and for a gap extend in
+// [0, INT32_MAX / (4 * MAX_SEQ_LEN8)] (a loose bound) dif cannot wrap and neither can
+// drop - dif. A larger gap extend (an explicit -E, which takes up to INT_MAX) or a negative
+// one (the kernel API does not reject it) can give a negative dif; the ungated step then kills lanes at
+// drop <= zdrop, so the gates must step aside and run the step on every row. The bound is
+// 493447, so the default -E1 (and any -E a scoring scheme would use) is far inside it.
+//
+// A macro, not a function, so that each kernel evaluates it exactly as an inline expression
+// (short-circuit loads of the two fields); a call form changed the NEON kernel's schedule.
+#define BSW8_ZDROP_GATE_EXACT(e_del, e_ins)                                     \
+    ((e_del) >= 0 && (e_del) <= INT32_MAX / (4 * MAX_SEQ_LEN8) &&               \
+     (e_ins) >= 0 && (e_ins) <= INT32_MAX / (4 * MAX_SEQ_LEN8))
+
+// ------------------------------------------------------------------------------------
 // MACROs for vector code
 extern uint64_t prof[10][112];
 #define AMBIG 4
@@ -1259,6 +1280,9 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
     __m256i max_off256 = zero256;
     __m256i exit0 = _mm256_set1_epi8(0xFF);
     __m256i zdrop256 = _mm256_set1_epi8(zdrop);
+    // Whether the per-row epilogue skip may skip a row on drop <= zdrop: see
+    // BSW8_ZDROP_GATE_EXACT.
+    const bool zgate_exact = BSW8_ZDROP_GATE_EXACT(this->e_del, this->e_ins);
     __m256i maxend256 = _mm256_set1_epi8(-128);
 
     int beg = 0, end = ncol;
@@ -1596,12 +1620,15 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
         //     never applied, so the term is dropped from the gate. A zdrop
         //     above 255 truncates in the byte broadcast to a smaller value, so
         //     the gate opens on a superset of rows: still byte-identical.
+        //     dif >= 0 needs the gap extends inside BSW8_ZDROP_GATE_EXACT's
+        //     bound; outside it (a huge or negative -E) the block runs on every
+        //     row (zgate_exact).
         // Byte-identical: when the gate is clear every store below is a no-op.
         const __m256i need_z = (zdrop > 0)
             ? _mm256_subs_epu8(_mm256_subs_epu8(maxScore256, maxRS1), zdrop256)
             : zero256;
         const __m256i need_any = _mm256_or_si256(_mm256_or_si256(cmp, qfire256), need_z);
-        const bool need_wide = !_mm256_testz_si256(need_any, need_any);
+        const bool need_wide = !zgate_exact || !_mm256_testz_si256(need_any, need_any);
         if (need_wide) {
             int8_t  cmp_a[SIMD_WIDTH8]      __attribute((aligned(32)));
             int8_t  y1_a[SIMD_WIDTH8]       __attribute((aligned(32)));
@@ -3209,6 +3236,9 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
     __m512i exit0      = _mm512_set1_epi8(0xFF);
     __m512i maxend512 = _mm512_set1_epi8(-128);
     __m512i zdrop512   = _mm512_set1_epi8(zdrop);
+    // Whether the per-row epilogue skip may skip a row on drop <= zdrop: see
+    // BSW8_ZDROP_GATE_EXACT.
+    const bool zgate_exact = BSW8_ZDROP_GATE_EXACT(this->e_del, this->e_ins);
 
     int beg = 0, end = ncol;
     int nbeg = beg, nend = end;
@@ -3534,13 +3564,16 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
         //     never applied, so the term is dropped from the gate. A zdrop
         //     above 255 truncates in the byte broadcast to a smaller value, so
         //     the gate opens on a superset of rows: still byte-identical.
+        //     dif >= 0 needs the gap extends inside BSW8_ZDROP_GATE_EXACT's
+        //     bound; outside it (a huge or negative -E) the block runs on every
+        //     row (zgate_exact).
         // Byte-identical: when the gate is clear every store below is a no-op.
         const __mmask64 qf64 = _mm512_movepi8_mask(qfire512);
         const __mmask64 need_z = (zdrop > 0)
             ? _mm512_test_epi8_mask(_mm512_subs_epu8(_mm512_subs_epu8(maxScore512, maxRS1), zdrop512),
                                     ff512)
             : 0;
-        const bool need_wide = (cmp | qf64 | need_z) != 0;
+        const bool need_wide = !zgate_exact || (cmp | qf64 | need_z) != 0;
         if (need_wide) {
             // Only the int32 DATA channels need materializing as byte arrays; the
             // cmp/qfire/exit per-lane predicates are read straight from the cmp
@@ -6536,15 +6569,14 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
     // int8 (the 127 "none" sentinel included), so they match the original only for
     // w <= 126. The 8-bit route caps w at BSW8_MAX_W = 124 (bwamem.cpp); past that
     // both codes are wrong (test_bandedswa_longread.cpp pins the w = 127 failure).
-    // Lean z-drop gate (see step (4) of the lean epilogue). In the z-drop step
-    // zdelta reduces to y - y1 (1 - y1 before the lane's first best), two int8
-    // column offsets, so |zdelta| <= 256 and dif = |zdelta| * e stays a
-    // non-negative int32 far from overflow, and so does drop - dif, while each
-    // gap extend e is in [0, INT32_MAX / (4 * MAX_SEQ_LEN8)] (a loose bound).
-    // Only then is drop > zdrop a necessary condition for a lane to die.
-    const bool zgate_exact = this->e_del >= 0 && this->e_del <= INT32_MAX / (4 * MAX_SEQ_LEN8) &&
-                             this->e_ins >= 0 && this->e_ins <= INT32_MAX / (4 * MAX_SEQ_LEN8);
+    // Lean z-drop gate (see step (4) of the lean epilogue): whether it may skip a row on
+    // drop <= zdrop (see BSW8_ZDROP_GATE_EXACT), and its threshold byte.
+    const bool zgate_exact = BSW8_ZDROP_GATE_EXACT(this->e_del, this->e_ins);
     const __m128i zgate128 = _mm_set1_epi8((int8_t) (zdrop < 255 ? zdrop : 255));
+#elif defined(__APPLE__) && (defined(__ARM_NEON) || defined(__aarch64__))
+    // Whether the Apple-silicon epilogue gate may skip a row on drop <= zdrop: see
+    // BSW8_ZDROP_GATE_EXACT.
+    const bool zgate_exact = BSW8_ZDROP_GATE_EXACT(this->e_del, this->e_ins);
 #endif
 
     int beg = 0, end = ncol;
@@ -7018,7 +7050,9 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
         //     exact in bytes on alive lanes (both are [0,255] under the routing
         //     envelope). subs_epu8 twice: nonzero iff drop > zdrop. Dead lanes
         //     may read as "needed" here; the block masks them with exit0 anyway,
-        //     so that only costs a skipped skip.
+        //     so that only costs a skipped skip. dif >= 0 needs the gap extends
+        //     inside BSW8_ZDROP_GATE_EXACT's bound; outside it (a huge or
+        //     negative -E) the gate stays open on every row (zgate_exact).
         // With the certified adaptive band defaulting to w = 20, a row is ~41
         // cells and this block (~140 instructions plus its stack round trips)
         // was roughly a third of it.
@@ -7045,7 +7079,10 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
         const __m128i need_z = (zdrop > 0)
             ? _mm_subs_epu8(_mm_subs_epu8(maxScore128, maxRS1), zdrop128)
             : zero128;
-        const bool need_wide = any_lane_set8(_mm_or_si128(_mm_or_si128(cmp, qfire128), need_z));
+        // A gap extend outside BSW8_ZDROP_GATE_EXACT's bound can make dif negative, so
+        // drop > zdrop is no longer necessary for a lane to die: run the block on every row.
+        const bool need_wide = !zgate_exact ||
+                               any_lane_set8(_mm_or_si128(_mm_or_si128(cmp, qfire128), need_z));
 #else
         const bool need_wide = true;
 #endif
