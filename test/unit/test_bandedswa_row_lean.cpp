@@ -2,10 +2,10 @@
 //
 // Exactness gate for BSW8_ROW_LEAN, the lean per-row bookkeeping in the 128-bit
 // 8-bit banded extension kernel (smithWaterman128_8, bandedSWA.cpp): counted
-// band-trim loop, one-pass band narrowing, and the narrow per-row epilogue with
-// the z-drop test behind a gate. It is a pure speed change, so getScores8 must
-// return every result field (score, tle, gtle, qle, gscore, max_off) unchanged
-// for every pair of every batch.
+// band-trim loop, band narrowing from the first / last offsets the cell loops
+// record, and the narrow per-row epilogue with the z-drop test behind a gate. It
+// is a pure speed change, so getScores8 must return every result field (score,
+// tle, gtle, qle, gscore, max_off) unchanged for every pair of every batch.
 //
 // On aarch64 the unit binary links two copies of bandedSWA.cpp: libbwa.a's, and
 // src/bandedSWA.rowalt.o, built with BSW8_ROW_LEAN set the other way
@@ -40,6 +40,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <random>
@@ -464,6 +465,165 @@ TEST_CASE("BSW8_ROW_LEAN: lean == original on every field, best and query-end ro
           * doctest::test_suite("unit/bandedswa")) {
     check_mode(Mode::LongQuery, 0x5EB8A1Bull, 12);
 }
+
+namespace {
+
+/// Band shape of one pair's rows, from a scalar replay of scalarBandedSWA (bandedSWA.cpp): the
+/// same cells, band clamps, early exits and narrowing, with nothing but counters added, so its
+/// six result fields must equal scalarBandedSWA's. `span` of a row is end - first, the number of
+/// band columns from the first nonzero F | H one to the band end: the count the lean narrowing sums
+/// in int8 (nf_acc128). `width` is end - beg, the band the row computes.
+struct RowSpans {
+    int max_span = 0;    // largest end - first over the rows
+    int wrap_rows = 0;   // rows with span >= kWrapSpan
+    int max_width = 0;   // largest end - beg over the rows
+    ExtResult res{};     // the six result fields, as scalarBandedSWA returns them
+};
+
+/// A count of 128 columns is the last one int8 holds (-128). The kernel's band columns need not line
+/// up with scalarBandedSWA's eh[] index to the column, so a row only counts as wrapping with a
+/// margin of a few columns past that.
+constexpr int kWrapSpan = 131;
+
+RowSpans row_spans(const ExtScoring &sc, const ExtPair &p, int w)
+{
+    struct EH { int h, e; };
+    const int qlen = (int)p.query.size(), tlen = (int)p.target.size();
+    const int oe_del = sc.o_del + sc.e_del, oe_ins = sc.o_ins + sc.e_ins;
+    std::vector<EH> eh(qlen + 1, EH{0, 0});
+    eh[0].h = p.h0;
+    eh[1].h = p.h0 > oe_ins ? p.h0 - oe_ins : 0;
+    for (int j = 2; j <= qlen && eh[j - 1].h > sc.e_ins; ++j) eh[j].h = eh[j - 1].h - sc.e_ins;
+    int maxsc = 0;
+    for (int k = 0; k < 25; ++k) maxsc = std::max(maxsc, (int)sc.mat[k]);
+    const int max_ins = std::max(1, (int)((double)(qlen * maxsc + sc.pen_clip - sc.o_ins) / sc.e_ins + 1.));
+    const int max_del = std::max(1, (int)((double)(qlen * maxsc + sc.pen_clip - sc.o_del) / sc.e_del + 1.));
+    w = std::min(w, std::min(max_ins, max_del));
+    RowSpans s;
+    int max = p.h0, max_i = -1, max_j = -1, max_ie = -1, gscore = -1, max_off = 0;
+    int beg = 0, end = qlen;
+    for (int i = 0; i < tlen; ++i) {
+        const int8_t *row = &sc.mat[p.target[i] * 5];
+        int f = 0, m = 0, mj = -1;
+        if (beg < i - w) beg = i - w;
+        if (end > i + w + 1) end = i + w + 1;
+        if (end > qlen) end = qlen;
+        int h1 = beg == 0 ? std::max(0, p.h0 - (sc.o_del + sc.e_del * (i + 1))) : 0;
+        int j;
+        for (j = beg; j < end; ++j) {
+            EH &c = eh[j];
+            int M = c.h, e = c.e;
+            c.h = h1;
+            M = M ? M + row[p.query[j]] : 0;
+            int h = std::max(std::max(M, e), f);
+            h1 = h;
+            mj = m > h ? mj : j;
+            m = std::max(m, h);
+            e = std::max(e - sc.e_del, std::max(M - oe_del, 0));
+            c.e = e;
+            f = std::max(f - sc.e_ins, std::max(M - oe_ins, 0));
+        }
+        eh[end].h = h1;
+        eh[end].e = 0;
+        if (j == qlen) {
+            max_ie = gscore > h1 ? max_ie : i;
+            gscore = std::max(gscore, h1);
+        }
+        s.max_width = std::max(s.max_width, end - beg);
+        if (m == 0) break;
+        if (m > max) {
+            max = m, max_i = i, max_j = mj;
+            max_off = std::max(max_off, std::abs(mj - i));
+        } else if (sc.zdrop > 0) {
+            const int di = i - max_i, dj = mj - max_j;
+            if (max - m - (di > dj ? (di - dj) * sc.e_del : (dj - di) * sc.e_ins) > sc.zdrop) break;
+        }
+        for (j = beg; j < end && eh[j].h == 0 && eh[j].e == 0; ++j) {}
+        const int span = end - j;
+        s.max_span = std::max(s.max_span, span);
+        s.wrap_rows += span >= kWrapSpan;
+        beg = j;
+        for (j = end; j >= beg && eh[j].h == 0 && eh[j].e == 0; --j) {}
+        end = j + 2 < qlen ? j + 2 : qlen;
+    }
+    s.res.score = max;
+    s.res.qle = max_j + 1;
+    s.res.tle = max_i + 1;
+    s.res.gtle = max_ie + 1;
+    s.res.gscore = gscore;
+    s.res.max_off = max_off;
+    return s;
+}
+
+} // namespace
+
+TEST_CASE("BSW8_ROW_LEAN: lean == original on every field, w = 124 rows whose narrowing count wraps int8"
+          * doctest::test_suite("unit/bandedswa")) {
+    // The narrowing's first offset is (end - i) plus an int8 count of the band columns from the
+    // first nonzero one to the band end, so on the widest band the 8-bit route takes (w = 124)
+    // that count passes -128 and wraps. Free gap opens and a mild mismatch keep long stretches of
+    // a row nonzero; unrelated sequences in some lanes zero theirs out, so the "none" offset
+    // (end - i) is reached as well. Pairs stay inside the 8-bit route's envelope (bwamem.cpp
+    // bsw8_envelope_ok): len2 <= len1 < MAX_SEQ_LEN8, h0 + len2 * a < 255 - a (a = 1), zdrop + a
+    // <= 253, w <= 124.
+    //
+    // A full-width row (2w + 1 = 249 columns, all nonzero) needs len2 >= 249, which the envelope
+    // still admits (h0 + len2 <= 253), but no valid scoring can reach one there: a cell w columns
+    // left of the diagonal at row i scores at most h0 + (i - w) * a - w * e_del, and a full-width
+    // row has i <= len2 - 1 - w <= 128, so that cell is zero for every e_del >= 1 (e = 0 is
+    // rejected by the CLI and divides by zero in the band clamp). What the count needs is a row
+    // whose span from the first nonzero column to the band end passes 128 columns; the scalar
+    // replay below observes such rows directly.
+    Rng r(0x5EB8A1Cull);
+    Totals t;
+    const int w = 124;
+    long pairs_seen = 0, wrap_rows = 0, wrap_pairs = 0, replay_diffs = 0;
+    int max_span = 0, max_width = 0;
+    for (int batch = 0; batch < 12; batch++) {
+        ExtScoring sc{1, 1, 0, 1, 0, 1, 5, 100, {}};
+        sc.zdrop = batch % 3 == 0 ? 20 : 200;
+        sc.fill_mat();
+        std::vector<ExtPair> pairs(r.range(16, 48));
+        for (ExtPair &p : pairs) {
+            const int len2 = r.range(249, 252);
+            p.h0 = r.range(1, 253 - len2);
+            p.query.resize(len2);
+            for (auto &c : p.query) c = (uint8_t)r.below(4);
+            const bool unrelated = r.unif() < 0.2;
+            const int len1 = len2 + r.range(0, 150);
+            for (int k = 0; k < len1; k++)
+                p.target.push_back(unrelated || k >= len2 || r.unif() < 0.05 ? (uint8_t)r.below(4)
+                                                                              : p.query[k]);
+            REQUIRE(p.h0 + len2 * sc.a < 255 - sc.a);   // the 8-bit envelope (a = 1)
+            REQUIRE((int)p.target.size() >= len2);
+            REQUIRE((int)p.target.size() < MAX_SEQ_LEN8);
+            const RowSpans s = row_spans(sc, p, w);
+            replay_diffs += !(s.res == bwa_tests::run_mem3_scalar(sc, p, w));
+            pairs_seen++;
+            wrap_rows += s.wrap_rows;
+            wrap_pairs += s.wrap_rows > 0;
+            max_span = std::max(max_span, s.max_span);
+            max_width = std::max(max_width, s.max_width);
+        }
+        KernelPair k(sc);
+        std::vector<const ExtPair *> order;
+        for (const ExtPair &p : pairs) order.push_back(&p);
+        compare_grouping(k, order, w, t);
+        std::shuffle(order.begin(), order.end(), r.engine());
+        compare_grouping(k, order, w, t);
+        t.batches++;
+    }
+    MESSAGE("batches=" << t.batches << " pairs=" << pairs_seen << " pair-scorings=" << t.pairs
+            << " wrap-rows=" << wrap_rows << " wrap-pairs=" << wrap_pairs << " max-span="
+            << max_span << " max-width=" << max_width << " replay-diffs=" << replay_diffs
+            << " diffs=" << t.diffs);
+    CHECK(replay_diffs == 0);                 // the replay is scalarBandedSWA, all six fields
+    CHECK(wrap_rows > 0);                     // the int8 count wraps on real rows
+    CHECK(wrap_pairs * 4 >= pairs_seen);      // ... in at least a quarter of the pairs
+    CHECK(t.pairs > 0);
+    CHECK(t.diffs == 0);
+}
+
 /// A directed pair: scoring, band, seed and sequences (bases as digits 0-4).
 struct DirectedCase {
     int a, b, o_del, o_ins, e_del, e_ins, pen_clip, zdrop, w, h0;

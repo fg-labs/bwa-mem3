@@ -100,8 +100,9 @@ static inline int bsw_seed_row(int h0, int oe_ins, int e_ins, int c)
 //   - the per-row epilogue keeps xrow / ierow as int16 and gscore as a byte plus a "set" mask,
 //     updated without branches; only the z-drop test stays wide, behind a gate (drop > zdrop
 //     in some lane) that is almost never open on real data;
-//   - the four band-narrowing scans become one counted pass that records each lane's first and
-//     last nonzero column; all four scan results are functions of those two offsets.
+//   - the four band-narrowing scans become each lane's first and last nonzero column, recorded by
+//     the cell loops as they store the row (BSW8_NF_TRACK); all four scan results are functions
+//     of those two offsets.
 // On by default on aarch64 except Apple silicon, which keeps its own epilogue gate (a measured
 // win there; on Neoverse that gate is open on most rows) and the original scans. Settable
 // either way on aarch64 (-DBSW8_ROW_LEAN=0 / =1). On aarch64 the unit binary links a second
@@ -4598,7 +4599,7 @@ static inline bool all_lanes_set8(__m128i mask)
 
 // hmax_epi8 / hmin_epi8: horizontal max / min of the 16 SIGNED bytes of a
 // 128-bit vector, for the EXT-13 per-row max(head)/min(tail) reduce (and, under
-// BSW8_ROW_LEAN, the trim count and the narrowing pass's first/last). NEON has a
+// BSW8_ROW_LEAN, the trim count and the narrowing's first/last). NEON has a
 // one-op reduce (vmaxvq_s8 / vminvq_s8); x86 has no single-op signed-byte
 // horizontal reduce, so fall back to a store + scalar lane loop -- identical
 // result, run once per row. Same two-way arch guard as the any_lane_set8 /
@@ -5721,6 +5722,39 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
 // maxRS1 = max_epu8(bmaxRS, h11) is by construction either bmaxRS or h11,
 // (maxRS1 != bmaxRS) implies (maxRS1 == h11), so the argmax reduces to the single
 // cmpeq(maxRS1, h11) -- byte-identical to the old xor/or form.
+
+// Narrowing fold (BSW8_ROW_LEAN rows: smithWaterman128_8's and the lane-compaction driver's). The
+// lean row's band narrowing needs, per lane, the first and the last column of the band whose
+// stored F | H is nonzero. Every column of [beg, end) stores its F and H exactly once, in the cell
+// bodies below, and nothing writes them between the cell loops and the narrowing, so the cell
+// bodies record the two offsets as they store (BSW8_NF_TRACK) instead of a separate pass reloading
+// the band. hs / fs are the values stored to H_h[j] / F[j] and pj the column's diagonal offset
+// j - i. BSW8_NF_TRACK expands to nothing unless a lean row turns it on (BSW8_NF_TRACK_ON), so the
+// original rows are unchanged. Per-lane int8 state: nf_last128 = offset of the latest nonzero
+// column (beg - 1 - i before any); nf_seen128 = 0xFF from the first nonzero column on; nf_acc128 =
+// the sum of nf_seen128 so far, i.e. minus the number of columns from the first nonzero one on.
+// The first nonzero offset is then (end - i) + nf_acc128, end - i when there is none (as the
+// scan's "none"); the int8 sum wraps, but the result lies in [beg - i, end - i] (|offsets| <=
+// w + 1 <= 125), so it is exact mod 256. (Counting measured faster than a min of a blend, which
+// needs a "none" constant and a copy of the mask.) Columns run in increasing j in every loop form
+// (plain bodies, the EXT-13 sub-loops, the pipelined finishes), which the count relies on.
+#if defined(__aarch64__)
+#define BSW8_NF_TRACK_ON(hs_, fs_, pj_)                                 \
+        {                                                               \
+            const __m128i v_ = _mm_or_si128((hs_), (fs_));              \
+            const __m128i nz_ = vreinterpretq_m128i_u8(vtstq_u8(        \
+                vreinterpretq_u8_m128i(v_), vreinterpretq_u8_m128i(v_))); \
+            nf_seen128 = _mm_or_si128(nf_seen128, nz_);                 \
+            nf_acc128  = _mm_add_epi8(nf_acc128, nf_seen128);           \
+            nf_last128 = blendv_fullmask8(nf_last128, (pj_), nz_);      \
+        }
+// The column end (j == end) stores F = 0 and the masked carry hs: it can set last, never first.
+#define BSW8_NF_END(hs_, pj_)                                           \
+        nf_last128 = blendv_fullmask8(nf_last128, (pj_), vreinterpretq_m128i_u8(vtstq_u8( \
+                         vreinterpretq_u8_m128i(hs_), vreinterpretq_u8_m128i(hs_))));
+#endif
+#define BSW8_NF_TRACK_OFF(hs_, fs_, pj_) { (void) (pj_); }
+#define BSW8_NF_TRACK(hs_, fs_, pj_) BSW8_NF_TRACK_OFF(hs_, fs_, pj_)   /* off outside the lean rows */
 // The query-end (gscore) capture of one column, j128 already advanced past it: shared by
 // DP_CELL_BODY8_128, DP_CELL_BODY8_128_FAST and the BSW8_SKEW finishes.
 #define BSW8_QE_CAPTURE8_128()                                          \
@@ -5763,6 +5797,7 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
         _mm_store_si128((__m128i *)(F + j * SIMD_WIDTH8), f21);         \
         _mm_store_si128((__m128i *)(H_h + j * SIMD_WIDTH8), h10);       \
                                                                         \
+        BSW8_NF_TRACK(h10, f21, pj128)                                  \
         h10 = h11;                                                      \
                                                                         \
         if (j >= minq) BSW8_QE_CAPTURE8_128()                           \
@@ -5807,6 +5842,7 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
         f11 = _mm_load_si128((__m128i *)(F + j * SIMD_WIDTH8));         \
                                                                         \
         BSW8_ASSERT_FAST8_128(j128);                                    \
+        const __m128i pjf_ = j128;                                      \
         j128 = _mm_add_epi8(j128, one128);                             \
                                                                         \
         MAIN_CODE8_CORE_SPLIT(sbt_pos, sbt_neg, h00, h11, e11, f11, f21, zero128, \
@@ -5822,6 +5858,7 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
         _mm_store_si128((__m128i *)(F + j * SIMD_WIDTH8), f21);         \
         _mm_store_si128((__m128i *)(H_h + j * SIMD_WIDTH8), h10);       \
                                                                         \
+        BSW8_NF_TRACK(h10, f21, pjf_)                                   \
         h10 = h11;                                                      \
                                                                         \
         if (j >= minq) BSW8_QE_CAPTURE8_128()                           \
@@ -5906,6 +5943,7 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
         maxRS1 = blendv_fullmask8(maxRS1, bmaxRS, cmp1);                    \
         _mm_store_si128((__m128i *)(F + j * SIMD_WIDTH8), fs_);             \
         _mm_store_si128((__m128i *)(H_h + j * SIMD_WIDTH8), h10);           \
+        BSW8_NF_TRACK(h10, fs_, pj128)                                      \
         h10 = h11;                                                          \
         if (QE) BSW8_QE_CAPTURE8_128()                                      \
     }
@@ -5915,12 +5953,14 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
         h11 = _mm_max_epu8(mf_, e11);                                       \
         e11 = _mm_max_epu8(ti_, _mm_subs_epu8(e11, e_ins128));              \
         BSW8_ASSERT_FAST8_128(j128);                                        \
+        const __m128i pjf_ = j128;                                          \
         j128 = _mm_add_epi8(j128, one128);                                  \
         maxRS1 = _mm_max_epu8(maxRS1, h11);                                 \
         __m128i cmpA = _mm_cmpeq_epi8(maxRS1, h11);                         \
         y1_128 = blendv_fullmask8(y1_128, j128, cmpA);                      \
         _mm_store_si128((__m128i *)(F + j * SIMD_WIDTH8), fo_);             \
         _mm_store_si128((__m128i *)(H_h + j * SIMD_WIDTH8), h10);           \
+        BSW8_NF_TRACK(h10, fo_, pjf_)                                       \
         h10 = h11;                                                          \
         if (QE) BSW8_QE_CAPTURE8_128()                                      \
     }
@@ -6333,6 +6373,12 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
     return;
 }
 
+// The lean row records the narrowing offsets in its cell bodies (see BSW8_NF_TRACK); the
+// lane-compaction driver's row (bandedSWA_compact.inc) turns the tracking on again for itself.
+#if BSW8_ROW_LEAN
+#undef BSW8_NF_TRACK
+#define BSW8_NF_TRACK(hs_, fs_, pj_) BSW8_NF_TRACK_ON(hs_, fs_, pj_)
+#endif
 void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
                                           uint8_t seq2SoA[],
                                           int nrow,
@@ -6565,9 +6611,9 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
     __m128i zdrop128 = _mm_set1_epi8(zdrop);
     __m128i maxend128 = _mm_set1_epi8(-128);   // all-time max tail (offset frame)
 #if BSW8_ROW_LEAN
-    // The lean trim count and narrowing pass hold column offsets in [-w-1, w+1] as
-    // int8 (the 127 "none" sentinel included), so they match the original only for
-    // w <= 126. The 8-bit route caps w at BSW8_MAX_W = 124 (bwamem.cpp); past that
+    // The lean trim count and the narrowing offsets (nf_last128, and the first offset
+    // from nf_acc128) hold column offsets in [-w-1, w+1] as int8, so they match the
+    // original only for w <= 126. The 8-bit route caps w at BSW8_MAX_W = 124 (bwamem.cpp); past that
     // both codes are wrong (test_bandedswa_longread.cpp pins the w = 127 failure).
     // Lean z-drop gate (see step (4) of the lean epilogue): whether it may skip a row on
     // drop <= zdrop (see BSW8_ZDROP_GATE_EXACT), and its threshold byte.
@@ -6789,6 +6835,11 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
         // s10 nor s2 is mutated by the DP body, so the fused score is identical to
         // the pre-pass score.
         j128 = _mm_set1_epi8(beg - i);   // diagonal offset of first band column
+#if BSW8_ROW_LEAN
+        // narrowing offsets, recorded by the cell bodies (BSW8_NF_TRACK)
+        __m128i nf_seen128 = zero128, nf_acc128 = zero128;
+        __m128i nf_last128 = _mm_set1_epi8(beg - 1 - i);
+#endif
 
         // EXT-13: unmasked fast-regime bounds. When EVERY lane is active the
         // band mask (head>pj)|(pj>tail) is empty (all-zero) for columns pj in
@@ -6885,6 +6936,9 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
             
         _mm_store_si128((__m128i *)(H_h + j * SIMD_WIDTH8), h10);
         _mm_store_si128((__m128i *)(F + j * SIMD_WIDTH8), zero128);
+#if BSW8_ROW_LEAN
+        BSW8_NF_END(h10, j128)   // j128 == end - i here
+#endif
         
         
         /* exit due to zero score by a row */
@@ -7198,7 +7252,7 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
 #endif
         
 #if BSW8_ROW_LEAN
-        /* Narrowing of the band, one pass (BSW8_ROW_LEAN). With v[l] = F[l] | H_h[l] and, per
+        /* Narrowing of the band (BSW8_ROW_LEAN). With v[l] = F[l] | H_h[l] and, per
          * lane, first = offset (l - i) of the first nonzero v[l] in [beg, end) ("none" = end - i)
          * and last = offset of the last nonzero v[l] in [beg, end] ("none" = beg - 1 - i), the
          * four former scans are:
@@ -7214,33 +7268,16 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
          * Dead lanes never update head/tail (the scans OR'ed ~exit0 in); scans 1 and 2 count every
          * lane. All offsets lie in [-w-1, w+1] (w <= BSW8_MAX_W = 124), so int8 holds them and
          * 127 is a safe "none" for min.
-         * The pass is a counted loop: no per-column reduction or data-dependent exit. */
+         * first and last come from the cell loops (BSW8_NF_TRACK): no pass over the band, no
+         * per-column reduction or data-dependent exit. */
         /* Only rows with beg < end get here: with no band columns maxRS1 stays 0 and the
          * row takes the zero-row break above, in the original code as well. */
-        xassert(beg < end, "BSW8_ROW_LEAN narrowing: empty band reached the narrowing pass");
+        xassert(beg < end, "BSW8_ROW_LEAN narrowing: empty band reached the narrowing");
         int l;
         {
-            const __m128i big128 = _mm_set1_epi8(127);
-            __m128i off128   = _mm_set1_epi8(beg - i);
-            __m128i first128 = _mm_set1_epi8(end - i);
-            __m128i last128  = _mm_set1_epi8(beg - 1 - i);
-            for (l = beg; l < end; l++)
-            {
-                __m128i v = _mm_or_si128(_mm_load_si128((__m128i *)(F + l * SIMD_WIDTH8)),
-                                         _mm_load_si128((__m128i *)(H_h + l * SIMD_WIDTH8)));
-                __m128i nz = vreinterpretq_m128i_u8(vtstq_u8(vreinterpretq_u8_m128i(v),
-                                                             vreinterpretq_u8_m128i(v)));
-                first128 = _mm_min_epi8(first128, blendv_fullmask8(big128, off128, nz));
-                last128  = blendv_fullmask8(last128, off128, nz);
-                off128   = _mm_add_epi8(off128, one128);
-            }
-            {   /* column end: scans 2 and 4 only (off128 == end - i here) */
-                __m128i v = _mm_or_si128(_mm_load_si128((__m128i *)(F + end * SIMD_WIDTH8)),
-                                         _mm_load_si128((__m128i *)(H_h + end * SIMD_WIDTH8)));
-                __m128i nz = vreinterpretq_m128i_u8(vtstq_u8(vreinterpretq_u8_m128i(v),
-                                                             vreinterpretq_u8_m128i(v)));
-                last128 = blendv_fullmask8(last128, off128, nz);
-            }
+            /* first and last, recorded as the cell loops stored F and H (BSW8_NF_TRACK) */
+            const __m128i first128 = _mm_add_epi8(_mm_set1_epi8(end - i), nf_acc128);
+            const __m128i last128  = nf_last128;
             const int minfirst = hmin_epi8(first128);
             if (minfirst > beg - i) nbeg = i + minfirst - 1;
             l = i + hmax_epi8(last128);
@@ -7436,6 +7473,8 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
 
     return;
 }
+#undef BSW8_NF_TRACK
+#define BSW8_NF_TRACK(hs_, fs_, pj_) BSW8_NF_TRACK_OFF(hs_, fs_, pj_)   /* off again */
 
 #include "bandedSWA_compact.inc"
 #undef BSW8_GSCORE_NARROW
@@ -7446,6 +7485,10 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
 #undef EXT13_SBT8_XOR_AT
 #undef EXT13_SBT8_RANK1_AT
 #undef EXT13_SBT8_AMAT_AT
+#undef BSW8_NF_TRACK
+#undef BSW8_NF_TRACK_ON
+#undef BSW8_NF_TRACK_OFF
+#undef BSW8_NF_END
 
 #endif
 
