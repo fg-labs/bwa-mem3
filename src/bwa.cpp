@@ -317,35 +317,72 @@ void bwa_fill_scmat(int a, int b, int8_t mat[25])
     for (j = 0; j < 5; ++j) mat[k++] = -1;   // DEFAULT AMBIG
 }
 
-/* Certified band for the global alignment of two equal-length sequences. The ungapped
- * alignment is one global alignment, so its score su bounds the optimum from below. A gapped
- * global alignment of equal lengths has as many inserted bases as deleted ones, I >= 1 of
- * each, and len - I aligned columns, so (with a gap of length L costing o + e*L) it scores at
- * most amax*len - (o_ins + o_del) - I*(amax + e_ins + e_del), amax the matrix's largest entry.
- * A path through a cell k off the diagonal has I >= k, so for amax + e_ins + e_del > 0 and
- * non-negative gap opens every alignment through a cell more than kc off the diagonal scores
- * strictly below su (kc = floor((amax*len - o_ins - o_del - su) / (amax + e_ins + e_del)),
- * or 0 when the numerator is negative). So no optimal path at any band w >= kc uses such a
- * cell. The traceback picks the same path at band kc as at w: the values the band-kc DP
- * computes never exceed the band-w ones (it maximises over fewer paths); and every value the
- * traceback compares that ties the winner, or is the winner, is reached by a prefix that the
- * traced suffix completes into an alignment scoring at least the band-w optimum (>= su), so
- * that prefix stays within kc and the value is the same at both bands. Every direction bit
- * the traceback reads is therefore unchanged, and so are the score and the CIGAR. At
- * kc == 0 the result is the ungapped alignment. Returns kc, or -1 when the bound does not
- * apply (amax + e_ins + e_del <= 0, or a negative gap open). */
+/* Certified band for the banded global alignment ksw_global2(query[0,qlen), rseq[0,tlen)):
+ * every band w >= the returned kc gives the same score and CIGAR as any wider band. (For
+ * unequal lengths bwa_gen_cigar3 also keeps w >= |tlen - qlen| + 3, the precondition of the
+ * wavefront kernels' own proof; that floor is about dispatch, not about this bound.) A cell's
+ * offset below is the number of query bases minus reference bases consumed, so a path runs
+ * from offset 0 to offset -d.
+ *
+ * Lower bound. With d = tlen - qlen and L = min(qlen, tlen), one global alignment aligns the
+ * first p columns on the diagonal, has a single gap of |d| bases (a deletion for d > 0, an
+ * insertion for d < 0; none for d == 0), and aligns the rest on the end diagonal. The best p
+ * is found in one pass, so its score s_lb (the ungapped score when d == 0) bounds the optimum
+ * from below. Its path stays between the two diagonals, inside every band >= |d|.
+ *
+ * Upper bound. Any global alignment has D - I = d deleted minus inserted bases, so
+ * I = max(0, -d) + t and D = max(0, d) + t for some t >= 0, and L - t aligned columns. For
+ * t >= 1 it has both an insertion and a deletion (opens >= o_ins + o_del), so with a gap of
+ * length n costing o + e*n and amax the matrix's largest entry it scores at most
+ *   U0 - t*(amax + e_ins + e_del),  U0 = amax*L - o_ins - o_del - e_ins*max(0,-d) - e_del*max(0,d).
+ * A path through a cell x off the corridor between the two diagonals ([min(0,-d), max(0,-d)])
+ * has t >= x. For amax + e_ins + e_del > 0 and non-negative gap opens, every alignment through
+ * a cell more than xc off the corridor therefore scores strictly below s_lb, where
+ * xc = floor((U0 - s_lb) / (amax + e_ins + e_del)), or 0 when the numerator is negative; and
+ * every cell within xc of the corridor is within kc = |d| + xc of the diagonal.
+ *
+ * Band equivalence. Any band w >= |d| reaches the end cell and starts the traceback there, and
+ * contains the lower-bound path. The band-kc DP maximises over a subset of the band-w paths, so
+ * its values never exceed the band-w ones; the band-w optimum scores >= s_lb, so its path lies
+ * within kc and the score is the same. Every value the traceback compares that ties the winner,
+ * or is the winner, is reached by a prefix that the traced suffix completes (one DP step) into an
+ * alignment scoring the band-w optimum, so that prefix lies within kc and the value is the same
+ * at both bands; a strict loser can only drop. Every direction bit the traceback reads is
+ * therefore unchanged, and so are the score and the CIGAR. At d == 0 and kc == 0 the result is
+ * the ungapped alignment.
+ *
+ * Returns kc (at least |d|), or -1 when the bound does not apply (amax + e_ins + e_del <= 0, a
+ * negative gap open, or an empty sequence). */
 int bwa_global_cert_band(const int8_t mat[25], int o_del, int e_del, int o_ins, int e_ins,
-                         int len, const uint8_t *query, const uint8_t *rseq)
+                         int qlen, const uint8_t *query, int tlen, const uint8_t *rseq)
 {
     int amax = mat[0];
     for (int k = 1; k < 25; ++k) amax = mat[k] > amax ? mat[k] : amax;
     const int64_t slope = (int64_t) amax + e_ins + e_del;
-    if (slope <= 0 || o_ins < 0 || o_del < 0) return -1;
-    int64_t su = 0;
-    for (int k = 0; k < len; ++k) su += mat[rseq[k] * 5 + query[k]];
-    const int64_t num = (int64_t) amax * len - o_ins - o_del - su;
-    if (num < 0) return 0;
-    const int64_t kc = num / slope;
+    if (slope <= 0 || o_ins < 0 || o_del < 0 || qlen <= 0 || tlen <= 0) return -1;
+    const int64_t d = (int64_t) tlen - qlen, ad = d < 0 ? -d : d;
+    const int L = qlen < tlen ? qlen : tlen;
+    // column score of the lower-bound alignment
+    int64_t cols = 0;
+    if (d == 0) {   // ungapped
+        for (int k = 0; k < L; ++k) cols += mat[rseq[k] * 5 + query[k]];
+    } else {
+        // diagonal 0 before the gap (s0), the end diagonal after it (s1); the best gap
+        // position maximises the prefix sum of s0 - s1
+        const uint8_t *r1 = d > 0 ? rseq + d : rseq, *q1 = d < 0 ? query - d : query;
+        int64_t run = 0, best = 0;
+        for (int k = 0; k < L; ++k) {
+            const int s0 = mat[rseq[k] * 5 + query[k]], s1 = mat[r1[k] * 5 + q1[k]];
+            cols += s1;
+            run += s0 - s1;
+            best = run > best ? run : best;
+        }
+        cols += best;
+    }
+    // U0 - s_lb: the lower bound's gap open and extensions cancel against U0's
+    const int64_t o_other = d > 0 ? o_ins : d < 0 ? o_del : (int64_t) o_ins + o_del;
+    const int64_t num = (int64_t) amax * L - cols - o_other;
+    const int64_t kc = ad + (num < 0 ? 0 : num / slope);
     return kc > INT32_MAX ? INT32_MAX : (int) kc;
 }
 
@@ -410,10 +447,14 @@ uint32_t *bwa_gen_cigar3(const int8_t mat[25], int o_del, int e_del, int o_ins, 
             w = w < w_? w : w_;
             min_w = abs(rlen - l_query) + 3;
             w = w > min_w? w : min_w;
-            if (rlen == l_query) {   // the certified band, when narrower: same score and CIGAR
-                const int kc = bwa_global_cert_band(mat, o_del, e_del, o_ins, e_ins, l_query, query, rseq);
+            // the certified band, when narrower: same score and CIGAR (bwa_global_cert_band)
+            // Unequal lengths keep the floor min_w (the wavefront kernels' proof needs it), so
+            // there the certificate can only help when w is above it. kc is at least
+            // |rlen - l_query|, so kc == 0 (no DP) only happens at equal lengths.
+            if (rlen == l_query || w > min_w) {
+                const int kc = bwa_global_cert_band(mat, o_del, e_del, o_ins, e_ins, l_query, query, (int)rlen, rseq);
                 if (kc == 0) ungapped = 1;
-                else if (kc > 0 && kc < w) w = kc;
+                else if (kc > 0 && kc < w) w = rlen == l_query || kc > min_w? kc : min_w;
             }
         }
         if (ungapped) {
