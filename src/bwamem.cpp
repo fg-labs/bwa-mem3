@@ -7112,7 +7112,7 @@ static inline void stage_seed_extension(
 
         if (left_win_staged_here) {
             uint8_t *win = seqBufLeftRef + ext_win.left_base;
-            ext_reverse_copy(win, rseq, ext_win.left_len); //seq1
+            ext_reverse_copy(win, rseq, ext_win.left_len);
         }
         xassert(tmp <= ext_win.left_len,
                 "extension: left target is longer than the chain's staged reference prefix");
