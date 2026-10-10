@@ -20,10 +20,11 @@
 #include <random>
 
 #include "bandedSWA.h"
+#include "../framework/ext_result.h"
 
 namespace {
 
-struct Out { int score, tle, gtle, qle, gscore, max_off; };
+using bwa_tests::ExtResult;
 
 // Mirror of bwamem.cpp bsw8_envelope_ok for maxStep = 1 (this test's scoring,
 // a = 1). The gate is independent of the gap penalties, so it is unchanged from
@@ -63,7 +64,7 @@ long run_config(const char *name, int o_del, int e_del, int o_ins, int e_ins,
     std::mt19937_64 rng(0xC0FFEE ^ (uint64_t)zdrop ^ ((uint64_t)e_del << 8) ^ ((uint64_t)e_ins << 16));
     std::vector<uint8_t> ref((size_t)STRIDE * n, 0), qer((size_t)STRIDE * n, 0);
     std::vector<SeqPair> pairs(n);
-    std::vector<Out> oracle(n);
+    std::vector<ExtResult> oracle(n);
     std::uniform_int_distribution<int> lenD(20, maxlen);
     std::uniform_int_distribution<int> hD(h0min, h0max);
     std::uniform_int_distribution<int> unit(3, 12);
@@ -89,7 +90,7 @@ long run_config(const char *name, int o_del, int e_del, int o_ins, int e_ins,
         p.idr = (int)((size_t)c * STRIDE); p.idq = (int)((size_t)c * STRIDE);
         p.seqid = c; p.regid = c;
         p.score = p.tle = p.gtle = p.qle = p.gscore = p.max_off = -1;
-        Out &O = oracle[c];
+        ExtResult &O = oracle[c];
         O.score = bsw.scalarBandedSWA(len2, s2, len1, s1, w, h0,
                                       &O.qle, &O.tle, &O.gtle, &O.gscore, &O.max_off);
     }
@@ -101,7 +102,7 @@ long run_config(const char *name, int o_del, int e_del, int o_ins, int e_ins,
         const SeqPair &q = pairs[c];
         if (!envelope_ok(q.len1, q.len2, w, zdrop, q.h0, maxStep)) continue;
         admitted++;
-        const Out &O = oracle[c];
+        const ExtResult &O = oracle[c];
         if (O.gscore > 0) gpos++;   // pairs in the regime where gtle IS compared
         // gtle (gscore row = max_ie+1) CONTRACT: it is byte-identical to scalar
         // whenever gscore > 0, and may differ only in the gscore == 0 query-end

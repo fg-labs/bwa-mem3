@@ -24,12 +24,13 @@
 
 #include "doctest/doctest.h"
 #include "bandedSWA.h"
+#include "ext_result.h"
 
 #if HAVE_BSW_VECTOR_8_16
 
 namespace {
 
-struct Out { int score, tle, gtle, qle, gscore, max_off; };
+using bwa_tests::ExtResult;
 
 // The batched kernels (getScores8/16) round numPairs up to a multiple of the
 // SIMD width (roundNumPairs in smithWatermanBatchWrapper{8,16}) and initialize
@@ -75,7 +76,7 @@ int run_parity(int width, int n, int maxlen, unsigned long seed, int zdrop,
     std::vector<uint8_t> seqBufRef((size_t)STRIDE * n, 0);
     std::vector<uint8_t> seqBufQer((size_t)STRIDE * n, 0);
     std::vector<SeqPair> pairs(padPairs(n));   // padded for SIMD-width round-up + prefetch
-    std::vector<Out> oracle(n);
+    std::vector<ExtResult> oracle(n);
 
     std::mt19937_64 rng(seed);
     std::uniform_int_distribution<int> lenD(5, maxlen);
@@ -98,7 +99,7 @@ int run_parity(int width, int n, int maxlen, unsigned long seed, int zdrop,
         sp.idr = (int)((size_t)c * STRIDE); sp.idq = (int)((size_t)c * STRIDE);
         sp.seqid = c; sp.regid = c;
         sp.score = sp.tle = sp.gtle = sp.qle = sp.gscore = sp.max_off = -1;
-        Out &O = oracle[c];
+        ExtResult &O = oracle[c];
         O.score = bsw.scalarBandedSWA(len2, s2, len1, s1, w, h0,
                                       &O.qle, &O.tle, &O.gtle, &O.gscore, &O.max_off);
     }
@@ -111,7 +112,7 @@ int run_parity(int width, int n, int maxlen, unsigned long seed, int zdrop,
     int bad = 0;
     bs = bt = bg = bq = bgs = bm = 0;
     for (int c = 0; c < n; ++c) {
-        const Out &O = oracle[c]; const SeqPair &p = pairs[c];
+        const ExtResult &O = oracle[c]; const SeqPair &p = pairs[c];
         bool sd = O.score != p.score, td = O.tle != p.tle, gd = O.gtle != p.gtle,
              qd = O.qle != p.qle, gsd = O.gscore != p.gscore, md = O.max_off != p.max_off;
         if (sd) bs++; if (td) bt++; if (gd) bg++; if (qd) bq++; if (gsd) bgs++; if (md) bm++;
@@ -187,7 +188,7 @@ RepeatStats run_repeat_parity(int n, int maxlen, int maxh0, unsigned long seed) 
 
     std::vector<uint8_t> ref((size_t)STRIDE * n, 0), qer((size_t)STRIDE * n, 0);
     std::vector<SeqPair> p8(padPairs(n)), p16(padPairs(n));   // padded (see padPairs)
-    std::vector<Out> oracle(n);
+    std::vector<ExtResult> oracle(n);
 
     std::mt19937_64 rng(seed);
     std::uniform_int_distribution<int> lenD(50, maxlen);
@@ -216,7 +217,7 @@ RepeatStats run_repeat_parity(int n, int maxlen, int maxh0, unsigned long seed) 
             P->seqid = c; P->regid = c;
             P->score = P->tle = P->gtle = P->qle = P->gscore = P->max_off = -1;
         }
-        Out &O = oracle[c];
+        ExtResult &O = oracle[c];
         O.score = bsw.scalarBandedSWA(len2, s2, len1, s1, w, h0,
                                       &O.qle, &O.tle, &O.gtle, &O.gscore, &O.max_off);
     }
@@ -226,7 +227,7 @@ RepeatStats run_repeat_parity(int n, int maxlen, int maxh0, unsigned long seed) 
 
     RepeatStats st{0, 0, 0, 0, 0};
     for (int c = 0; c < n; ++c) {
-        const Out &O = oracle[c];
+        const ExtResult &O = oracle[c];
         const SeqPair &q8 = p8[c], &q16 = p16[c];
         auto diff = [&](const SeqPair &p) {
             return O.score != p.score || O.tle != p.tle || O.gtle != p.gtle ||
@@ -365,7 +366,7 @@ TEST_CASE("bandedSWA 8-bit query-end gscore/gtle byte-identical to scalar under 
     for (int i = 0; i < len1; ++i) seqRef[i] = ref[i];
     for (int i = 0; i < len2; ++i) seqQer[i] = qer[i];
 
-    Out oracle;
+    ExtResult oracle;
     oracle.score = bsw.scalarBandedSWA(len2, seqQer.data(), len1, seqRef.data(), w, h0,
                                        &oracle.qle, &oracle.tle, &oracle.gtle,
                                        &oracle.gscore, &oracle.max_off);

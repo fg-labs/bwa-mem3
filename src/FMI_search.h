@@ -371,7 +371,7 @@ private:
 
         /* Defined inline so all hot callers (getSMEMs* and ls_advance_*)
          * fully absorb the body and pay no struct-by-value pass / return
-         * cost. backwardExt is called ~10^9 times per 5M-pair WGS run, so
+         * cost. backwardExt is called ~10^10 times per 5M-pair WGS run, so
          * the SysV-ABI hidden-pointer dance for the 24-byte SMEM struct
          * dominates self-time on gcc 12+ (issue #87): a single output store
          * `vmovdqu %ymm0, (%r8)` writing the return SMEM hits 42% of the

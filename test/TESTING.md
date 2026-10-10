@@ -80,7 +80,7 @@ Unit tests are doctest `TEST_CASE`s in `test/unit/test_*.cpp`. They must:
 
 1. Use only synthetic inputs (no files on disk).
 2. Complete in <100 ms each.
-3. Be tagged with `doctest::test_suite("unit/<module>")` where `<module>` is one of `kswv`, `bandedsw`, `ksw`, `fmindex`, `smem`, `bam`, `pair`, `cigar`, `util`. doctest's `test_suite` decorator is overriding (not additive) — chaining `* doctest::test_suite("a") * doctest::test_suite("b")` keeps only the last one — so encode the category and module as a single slash-separated string.
+3. Be tagged with `doctest::test_suite("unit/<module>")` (or wrapped in a `TEST_SUITE("unit/<module>") { ... }` block), where `<module>` names the code under test. Reuse an existing module where one fits; add a new one when none does. The modules in use in `test/unit/` are: `alnreg_sort_dedup`, `bam_aux_append_propagation`, `bam_pa_tag_parity`, `bandedswa`, `bandedswa-asym`, `bandedswa-zdrop`, `bns_pos2rid`, `chain_cap`, `chain_weight_clamp`, `extend_csub`, `extension`, `huge_pages`, `index_load_threads`, `ksort_permutation`, `ksw_global2`, `kswv`, `meth-asym-directed`, `meth_nm_md`, `meth_scoring`, `min_ext_len`, `neon_movemask`, `pac_slurp_and_close`, `pair`, `pair64_sort`, `pwrite_request_size`, `read_memo`, `sam_encode`, `smem`, `smem_dedup`, `util` (regenerate from the repo root with `grep -rhoE '(test_suite|TEST_SUITE)\("unit/[^"]+"' test/unit/*.cpp | sed -E 's/.*unit\///; s/"$//' | LC_ALL=C sort -u`). Some older files in `test/unit/` carry no suite tag; doctest runs them in its default suite, so `--test-suite` filters skip them and they are selected by name (`-tc`) instead. Tag new tests. doctest's `test_suite` decorator is overriding (not additive) — chaining `* doctest::test_suite("a") * doctest::test_suite("b")` keeps only the last one — so encode the category and module as a single slash-separated string.
 
 Template:
 
@@ -185,5 +185,6 @@ For a test using `std::mt19937(seed)`, reproduce locally by editing the seed and
 | `framework/ksw_runner.h`         | Scalar `run_scalar_ksw`, default gap/xtra      |
 | `framework/kswv_runner.h`        | Two-pass `run_kswv_batch`                      |
 | `framework/kswr_cmp.h`           | Score / coord / score2 comparators             |
+| `framework/ext_result.h`         | `ExtResult`: one extension's six result fields |
 | `framework/junit_reporter.h`     | CI matrix-row banner                           |
 | `framework/test_main.cpp`        | Shared `main()` (single doctest IMPL TU)       |

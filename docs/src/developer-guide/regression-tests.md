@@ -80,7 +80,7 @@ TEST_CASE("nrow==0 batch does not store out of bounds"
 }
 ```
 
-The `test_suite` decorator is overriding (not additive). Encode the category (`unit` or `integration`) and module (`kswv`, `bandedsw`, `ksw`, `fmindex`, `smem`, `bam`, `pair`, `cigar`, `util`) as a single slash-separated string.
+The `test_suite` decorator is overriding (not additive). Encode the category and module as a single slash-separated string: `unit/<module>` for unit tests and `integration/<module>` for integration tests, where the module is one of those listed in `test/TESTING.md` (e.g. `kswv`, `bandedswa`, `pair`). The one exception is the temporary `test/integration/placeholder.cpp`, which exists only so the integration binary links while the legacy integration binaries are migrated, and is tagged with the bare `integration` suite.
 
 ### Framework helpers
 

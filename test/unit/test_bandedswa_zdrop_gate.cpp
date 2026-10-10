@@ -33,12 +33,13 @@
 
 #include "doctest/doctest.h"
 #include "bandedSWA.h"
+#include "ext_result.h"
 
 #if HAVE_BSW_VECTOR_8_16
 
 namespace {
 
-struct Out { int score, tle, gtle, qle, gscore, max_off; };
+using bwa_tests::ExtResult;
 
 /// Compare getScores<width> to scalarBandedSWA at zdrop == 0 over n peak-then-drop
 /// pairs. Returns the mismatch count (per the documented query-end contract) and
@@ -59,7 +60,7 @@ long zdrop_trial(int width, int a, int b, int o, int e, int end_bonus, int w,
     std::mt19937_64 rng(width == 8 ? 0x2D809A7Eull : 0x2D8016A7ull);
     std::vector<uint8_t> ref((size_t)STRIDE * n, 0), qer((size_t)STRIDE * n, 0);
     std::vector<SeqPair> pairs(((n + 63) / 64) * 64);   // SIMD-width round-up + slack
-    std::vector<Out> oracle(n);
+    std::vector<ExtResult> oracle(n);
     std::uniform_int_distribution<int> lenD(minlen, maxlen);
 
     for (long c = 0; c < n; ++c) {
@@ -87,7 +88,7 @@ long zdrop_trial(int width, int a, int b, int o, int e, int end_bonus, int w,
         p.idr = (int)((size_t)c * STRIDE); p.idq = (int)((size_t)c * STRIDE);
         p.seqid = c; p.regid = c;
         p.score = p.tle = p.gtle = p.qle = p.gscore = p.max_off = -1;
-        Out &O = oracle[c];
+        ExtResult &O = oracle[c];
         O.score = bsw.scalarBandedSWA(len2, s2, len1, s1, w, h0,
                                       &O.qle, &O.tle, &O.gtle, &O.gscore, &O.max_off);
     }
@@ -99,7 +100,7 @@ long zdrop_trial(int width, int a, int b, int o, int e, int end_bonus, int w,
     long diffs = 0;
     for (long c = 0; c < n; ++c) {
         const SeqPair &g = pairs[c];
-        const Out &O = oracle[c];
+        const ExtResult &O = oracle[c];
         /* Same query-end contract as the other bandedSWA parity tests: local
          * fields unconditional; gscore/gtle only when a to-end alignment is
          * observable on either side. */
@@ -185,7 +186,7 @@ long zdrop_gapdrift_trial16(int a, int b, int o, int e, int end_bonus, int w,
         std::copy(qq, qq + len2, qer.data() + (size_t)c * STRIDE);
     }
 
-    Out oracle;
+    ExtResult oracle;
     oracle.score = bsw.scalarBandedSWA(len2, qq, len1, rr, w, /*h0*/ a,
                                        &oracle.qle, &oracle.tle, &oracle.gtle,
                                        &oracle.gscore, &oracle.max_off);

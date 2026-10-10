@@ -28,10 +28,11 @@
 #include <random>
 
 #include "bandedSWA.h"
+#include "framework/ext_result.h"
 
 namespace {
 
-struct Out { int score, tle, gtle, qle, gscore, max_off; };
+using bwa_tests::ExtResult;
 
 // Mirror of bwamem.cpp bsw8_envelope_ok for a = maxStep = 1 (this test's
 // scoring). Only admitted pairs are required to match scalar.
@@ -71,7 +72,7 @@ int main() {
     std::mt19937_64 rng(12345);  // fixed seed -> deterministic
     std::vector<uint8_t> ref((size_t)STRIDE * n, 0), qer((size_t)STRIDE * n, 0);
     std::vector<SeqPair> pairs(n);
-    std::vector<Out> oracle(n);
+    std::vector<ExtResult> oracle(n);
     std::uniform_int_distribution<int> lenD(20, maxlen);
     std::uniform_int_distribution<int> hD(h0min, h0max);
     std::uniform_int_distribution<int> unit(3, 12);
@@ -97,7 +98,7 @@ int main() {
         p.idr = (int)((size_t)c * STRIDE); p.idq = (int)((size_t)c * STRIDE);
         p.seqid = c; p.regid = c;
         p.score = p.tle = p.gtle = p.qle = p.gscore = p.max_off = -1;
-        Out &O = oracle[c];
+        ExtResult &O = oracle[c];
         O.score = bsw.scalarBandedSWA(len2, s2, len1, s1, w, h0,
                                       &O.qle, &O.tle, &O.gtle, &O.gscore, &O.max_off);
     }
@@ -138,7 +139,7 @@ int main() {
          * inert here; compute it the way the kernel does regardless. */
         int h0p = q.h0 < 0 ? 0 : (q.h0 > 255 ? 255 : q.h0);   // seeded byte
         if (h0p > 127) seed_hi++;
-        const Out &O = oracle[c];
+        const ExtResult &O = oracle[c];
         if (O.score != q.score || O.tle != q.tle || O.gtle != q.gtle ||
             O.qle != q.qle || O.gscore != q.gscore || O.max_off != q.max_off) {
             if (diffs < 10)

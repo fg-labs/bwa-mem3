@@ -381,7 +381,7 @@ FMI_TEST_HEADERS := ../src/FMI_search.h ../src/bntseq.h ../src/read_index_ele.h 
 integration/bwt_seed_strategy_test.o: $(FMI_TEST_HEADERS)
 integration/fmi_test.o: $(FMI_TEST_HEADERS)
 integration/main_banded.o: ../src/bandedSWA.h ../src/macro.h
-integration/bandedswa_zdrop_eweight_test.o: ../src/bandedSWA.h ../src/macro.h
+integration/bandedswa_zdrop_eweight_test.o: ../src/bandedSWA.h ../src/macro.h framework/ext_result.h
 integration/sa2ref_test.o: $(FMI_TEST_HEADERS)
 integration/smem2_test.o: $(FMI_TEST_HEADERS)
 smem_lockstep_parity_test.o: $(FMI_TEST_HEADERS)

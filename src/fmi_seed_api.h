@@ -29,7 +29,7 @@ static inline int _mm_countbits_64(unsigned long x) {
  * for i in 1..63. The FMI-index lifetime constant is identical on every path,
  * so it lives inline here as a file-scope table rather than a heap allocation
  * reached through a per-object pointer: this removes a dependent load in the
- * (~10^9-call) backwardExt/GET_OCC hot path. Values are byte-identical to the
+ * (~10^10-call) backwardExt/GET_OCC hot path. Values are byte-identical to the
  * former runtime-computed array. */
 static const uint64_t one_hot_mask_array[64] = {
     0x0000000000000000ULL, 0x8000000000000000ULL, 0xc000000000000000ULL, 0xe000000000000000ULL,
