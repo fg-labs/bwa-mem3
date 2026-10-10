@@ -106,9 +106,10 @@ static inline int bsw_seed_row(int h0, int oe_ins, int e_ins, int c)
 // win there; on Neoverse that gate is open on most rows) and the original scans. Settable
 // either way on aarch64 (-DBSW8_ROW_LEAN=0 / =1). On aarch64 the unit binary links a second
 // copy of this file built with the opposite setting (src/bandedSWA.rowalt.o: KERNEL_VARIANT
-// _rowalt, BSW8_ROW_LEAN_INVERT), and test/unit/test_bandedswa_row_lean.cpp compares the two
-// on every result field, so both settings stay exercised on Linux arm64 and on macOS. x86
-// always uses the original code. The lane-compaction driver (bandedSWA_compact.inc) runs its
+// _rowalt, BSW8_ROW_LEAN_INVERT, which flips BSW8_SKEW below too), and
+// test/unit/test_bandedswa_row_lean.cpp compares the two on every result field, so both
+// settings stay exercised on Linux arm64 and on macOS. x86 always uses the original code.
+// The lane-compaction driver (bandedSWA_compact.inc) runs its
 // own copy of the lean row, so it is on by default only where BSW8_ROW_LEAN is (see
 // BSW8_COMPACT_GROUPS_TIER below).
 #if defined(__aarch64__)
@@ -121,7 +122,8 @@ static inline int bsw_seed_row(int h0, int oe_ins, int e_ins, int c)
 #endif
 // Test-only: BSW8_ROW_LEAN_INVERT=1 builds the opposite of the setting above
 // (the Makefile's src/bandedSWA.rowalt.o), whether that setting is the default
-// or an override, so the unit test always compares lean with original.
+// or an override, so the unit test always compares lean with original. It flips
+// BSW8_SKEW (below) the same way.
 #if defined(BSW8_ROW_LEAN_INVERT) && BSW8_ROW_LEAN_INVERT
 #if BSW8_ROW_LEAN
 #undef BSW8_ROW_LEAN
@@ -137,6 +139,35 @@ static inline int bsw_seed_row(int h0, int oe_ins, int e_ins, int c)
 #endif
 #undef BSW8_ROW_LEAN
 #define BSW8_ROW_LEAN 0
+#endif
+
+// BSW8_SKEW: software-pipelined 8-bit DP column loops (see BSW8_SK_RANGE, next to
+// DP_CELL_BODY8_128_FAST). On by default on aarch64 except Apple silicon (not measured there);
+// always 0 elsewhere. BSW8_ROW_LEAN_INVERT flips it too, so the unit binary's rowalt copy runs
+// the plain loops wherever libbwa.a runs the pipelined ones, and vice versa.
+#if defined(__aarch64__)
+#ifndef BSW8_SKEW
+#if defined(__APPLE__)
+#define BSW8_SKEW 0
+#else
+#define BSW8_SKEW 1
+#endif
+#endif
+#if defined(BSW8_ROW_LEAN_INVERT) && BSW8_ROW_LEAN_INVERT
+#if BSW8_SKEW
+#undef BSW8_SKEW
+#define BSW8_SKEW 0
+#else
+#undef BSW8_SKEW
+#define BSW8_SKEW 1
+#endif
+#endif
+#else
+#if defined(BSW8_SKEW) && BSW8_SKEW
+#error "BSW8_SKEW=1 is aarch64-only (the pipelined loops are the NEON 128-bit kernel's); drop -DBSW8_SKEW=1"
+#endif
+#undef BSW8_SKEW
+#define BSW8_SKEW 0
 #endif
 
 // Same-row lane compaction (getScores8; bandedSWA_compact.inc / bandedSWA_compact256.inc /
@@ -5657,6 +5688,17 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
 // maxRS1 = max_epu8(bmaxRS, h11) is by construction either bmaxRS or h11,
 // (maxRS1 != bmaxRS) implies (maxRS1 == h11), so the argmax reduces to the single
 // cmpeq(maxRS1, h11) -- byte-identical to the old xor/or form.
+// The query-end (gscore) capture of one column, j128 already advanced past it: shared by
+// DP_CELL_BODY8_128, DP_CELL_BODY8_128_FAST and the BSW8_SKEW finishes.
+#define BSW8_QE_CAPTURE8_128()                                          \
+        {                                                               \
+            __m128i cmp = _mm_cmpeq_epi8(j128, qlen_off128);            \
+            cmp = _mm_and_si128(cmp, _mm_cmpeq_epi8(tail128, qlen_off128)); \
+            cmp = _mm_and_si128(cmp, qlen_valid128);                    \
+            cmp = _mm_and_si128(cmp, exit0);                            \
+            hqe128   = blendv_fullmask8(hqe128, h11, cmp);               \
+            qfire128 = blendv_fullmask8(qfire128, ff128, cmp);          \
+        }
 #define DP_CELL_BODY8_128(sbt_pos, sbt_neg)                             \
     {                                                                   \
         __m128i f11, f21;                                               \
@@ -5690,15 +5732,7 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
                                                                         \
         h10 = h11;                                                      \
                                                                         \
-        if (j >= minq)                                                  \
-        {                                                               \
-            __m128i cmp = _mm_cmpeq_epi8(j128, qlen_off128);            \
-            cmp = _mm_and_si128(cmp, _mm_cmpeq_epi8(tail128, qlen_off128)); \
-            cmp = _mm_and_si128(cmp, qlen_valid128);                    \
-            cmp = _mm_and_si128(cmp, exit0);                            \
-            hqe128   = blendv_fullmask8(hqe128, h11, cmp);               \
-            qfire128 = blendv_fullmask8(qfire128, ff128, cmp);          \
-        }                                                               \
+        if (j >= minq) BSW8_QE_CAPTURE8_128()                           \
     }
 
 // EXT-13: unmasked fast-regime twin of DP_CELL_BODY8_128. For columns where
@@ -5757,16 +5791,163 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
                                                                         \
         h10 = h11;                                                      \
                                                                         \
-        if (j >= minq)                                                  \
-        {                                                               \
-            __m128i cmp = _mm_cmpeq_epi8(j128, qlen_off128);            \
-            cmp = _mm_and_si128(cmp, _mm_cmpeq_epi8(tail128, qlen_off128)); \
-            cmp = _mm_and_si128(cmp, qlen_valid128);                    \
-            cmp = _mm_and_si128(cmp, exit0);                            \
-            hqe128   = blendv_fullmask8(hqe128, h11, cmp);               \
-            qfire128 = blendv_fullmask8(qfire128, ff128, cmp);          \
-        }                                                               \
+        if (j >= minq) BSW8_QE_CAPTURE8_128()                           \
     }
+
+
+// BSW8_SKEW: software pipelining of smithWaterman128_8's DP column loops, two columns deep
+// (EXT13_RUN_SPLIT8_128; also the lane-compaction driver's rows, which run the same macro).
+// A column's work is split in three stages:
+//   S1      the seq2 / H / F loads, the score lookup and m11;
+//   S2      the gap-open terms of m11, f21 and max(m11, f11), which need no carried value;
+//   finish  h11 and e11 (carried across columns), the band masks, the row argmax, the H and F
+//           stores and the query-end capture.
+// An iteration runs S1 of column j+2, S2 of column j+1 and the finish of column j, in that
+// program order. Each column's ~20-cycle load-to-store chain then overlaps the two columns
+// before it in the instruction stream; in the plain loop that chain has to wait in the
+// vector issue queue, which on Neoverse V2 holds too few operations to cover it, so the loop
+// runs well above its issue floor. The mate-rescue kernels (rb_dp_wave2, kswv_neon_u8) are
+// pipelined for the same reason. The loop is not unrolled: unrolling by 2 measured slower on
+// real rows, which are short (tens of columns).
+// Exactness: every cell computes the same expressions from the same inputs. h11 is
+// max(max(m11, f11), e11), the same unsigned maximum as the body's max(max(m11, e11), f11).
+// S1 of column j+2 reads H_h[j+2] and F[j+2]; the finishes of columns j and j+1 store only
+// slots j and j+1, so the loads see the previous row's values, as in the plain loop. Column
+// runs shorter than BSW8_SKEW_MIN keep the plain bodies (the pipeline's fill and drain cost
+// more than it saves there).
+// The switch and its defaults are defined at the top of the file (next to BSW8_ROW_LEAN); the
+// unit binary's rowalt copy is built with the opposite setting, so
+// test/unit/test_bandedswa_row_lean.cpp compares the pipelined loops with the plain ones.
+// Column runs shorter than this keep the plain body. Any value is exact (the pipeline needs
+// two columns and every part below that runs the plain body); 3 to 8 measured the same on
+// real batches.
+#ifndef BSW8_SKEW_MIN
+#define BSW8_SKEW_MIN 4
+#endif
+#if defined(__clang__)
+#define BSW8_SK_NOUNROLL _Pragma("clang loop unroll(disable)")
+#elif defined(__GNUC__)
+#define BSW8_SK_NOUNROLL _Pragma("GCC unroll 1")
+#else
+#define BSW8_SK_NOUNROLL
+#endif
+// Expects in scope what DP_CELL_BODY8_128 does (j, j128, one128, head128, tail128, zero128,
+// ff128, h10, h11, e11, maxRS1, y1_128, minq, qlen_off128, qlen_valid128, exit0, hqe128,
+// qfire128, H_h, F, e_ins128, oe_ins128, e_del128, oe_del128, plus what the SBTAT score needs).
+// Stage registers: m_ = m11, f_ = the loaded F cell (f11), ti_ = m11 - oe_ins, fo_ = f21,
+// mf_ = max(m11, f11). The finishes store column j, so j must be the column being finished.
+// S1 of column jj: score (SBTAT), loads, m11 and f11
+#define BSW8_SK_S1(SBTAT, jj, m_, f_)                                         \
+    {                                                                       \
+        __m128i sp_, sn_;                                                   \
+        SBTAT(jj, sp_, sn_)                                                 \
+        __m128i h_ = _mm_load_si128((__m128i *)(H_h + (jj) * SIMD_WIDTH8)); \
+        f_ = _mm_load_si128((__m128i *)(F + (jj) * SIMD_WIDTH8));          \
+        m_ = _mm_subs_epu8(_mm_adds_epu8(h_, sp_), sn_);                    \
+        m_ = blendv_fullmask8(m_, zero128, _mm_cmpeq_epi8(h_, zero128));    \
+    }
+// S2: the insertion-open term (ti_), f21 (fo_) and max(m11, f11) (mf_)
+#define BSW8_SK_S2(m_, f_, ti_, fo_, mf_)                                     \
+    {                                                                       \
+        ti_ = _mm_subs_epu8(m_, oe_ins128);                                 \
+        fo_ = _mm_max_epu8(_mm_subs_epu8(m_, oe_del128), _mm_subs_epu8(f_, e_del128)); \
+        mf_ = _mm_max_epu8(m_, f_);                                         \
+    }
+// the finish of column j, masked form (the rest of DP_CELL_BODY8_128)
+#define BSW8_SK_FIN_M(QE, ti_, fo_, mf_)                                      \
+    {                                                                       \
+        h11 = _mm_max_epu8(mf_, e11);                                       \
+        e11 = _mm_max_epu8(ti_, _mm_subs_epu8(e11, e_ins128));              \
+        __m128i pj128 = j128;                                               \
+        j128 = _mm_add_epi8(j128, one128);                                  \
+        __m128i cmp1 = _mm_or_si128(_mm_cmpgt_epi8(head128, pj128),         \
+                                    _mm_cmpgt_epi8(pj128, tail128));        \
+        h10 = blendv_fullmask8(h10, zero128, cmp1);                         \
+        __m128i bmaxRS = maxRS1;                                            \
+        maxRS1 = _mm_max_epu8(maxRS1, h11);                                 \
+        __m128i cmpA = _mm_cmpeq_epi8(maxRS1, h11);                         \
+        cmp1 = _mm_cmpgt_epi8(j128, tail128);                               \
+        __m128i fs_ = blendv_fullmask8(fo_, zero128, cmp1);                 \
+        cmpA = blendv_fullmask8(y1_128, j128, cmpA);                        \
+        y1_128 = blendv_fullmask8(cmpA, y1_128, cmp1);                      \
+        maxRS1 = blendv_fullmask8(maxRS1, bmaxRS, cmp1);                    \
+        _mm_store_si128((__m128i *)(F + j * SIMD_WIDTH8), fs_);             \
+        _mm_store_si128((__m128i *)(H_h + j * SIMD_WIDTH8), h10);           \
+        h10 = h11;                                                          \
+        if (QE) BSW8_QE_CAPTURE8_128()                                      \
+    }
+// the finish of column j, unmasked form (the rest of DP_CELL_BODY8_128_FAST)
+#define BSW8_SK_FIN_F(QE, ti_, fo_, mf_)                                      \
+    {                                                                       \
+        h11 = _mm_max_epu8(mf_, e11);                                       \
+        e11 = _mm_max_epu8(ti_, _mm_subs_epu8(e11, e_ins128));              \
+        BSW8_ASSERT_FAST8_128(j128);                                        \
+        j128 = _mm_add_epi8(j128, one128);                                  \
+        maxRS1 = _mm_max_epu8(maxRS1, h11);                                 \
+        __m128i cmpA = _mm_cmpeq_epi8(maxRS1, h11);                         \
+        y1_128 = blendv_fullmask8(y1_128, j128, cmpA);                      \
+        _mm_store_si128((__m128i *)(F + j * SIMD_WIDTH8), fo_);             \
+        _mm_store_si128((__m128i *)(H_h + j * SIMD_WIDTH8), h10);           \
+        h10 = h11;                                                          \
+        if (QE) BSW8_QE_CAPTURE8_128()                                      \
+    }
+// columns [lo_, hi_) through the pipeline, hi_ - lo_ >= 2; leaves j == hi_. QE (0 or 1)
+// stands for the plain body's (j >= minq) test, constant over the range.
+#define BSW8_SK_RANGE(SBTAT, FIN, QE, lo_, hi_)                               \
+    {                                                                       \
+        const int skhi_ = (hi_);                                            \
+        __m128i m1_, f1_, ti0_, fo0_, mf0_;                                 \
+        j = (lo_);                                                          \
+        {                                                                   \
+            __m128i m0_, f0_;                                               \
+            BSW8_SK_S1(SBTAT, j, m0_, f0_)                                  \
+            BSW8_SK_S1(SBTAT, j + 1, m1_, f1_)                              \
+            BSW8_SK_S2(m0_, f0_, ti0_, fo0_, mf0_)                          \
+        }                                                                   \
+        BSW8_SK_NOUNROLL                                                    \
+        for (; j < skhi_ - 2; j++) {                                        \
+            __m128i m2_, f2_, ti1_, fo1_, mf1_;                             \
+            BSW8_SK_S1(SBTAT, j + 2, m2_, f2_)                              \
+            BSW8_SK_S2(m1_, f1_, ti1_, fo1_, mf1_)                          \
+            FIN(QE, ti0_, fo0_, mf0_)                                       \
+            m1_ = m2_; f1_ = f2_; ti0_ = ti1_; fo0_ = fo1_; mf0_ = mf1_;    \
+        }                                                                   \
+        {                                                                   \
+            __m128i ti1_, fo1_, mf1_;                                       \
+            BSW8_SK_S2(m1_, f1_, ti1_, fo1_, mf1_)                          \
+            FIN(QE, ti0_, fo0_, mf0_)                                       \
+            j++;                                                            \
+            FIN(QE, ti1_, fo1_, mf1_)                                       \
+            j++;                                                            \
+        }                                                                   \
+    }
+// columns [lo_, hi_) through the plain body BODY (its own j >= minq test included)
+#define BSW8_SK_PLAIN(SBTAT, BODY, lo_, hi_)                                  \
+    for (j = (lo_); j < (hi_); j++) { __m128i sbt_pos, sbt_neg; SBTAT(j, sbt_pos, sbt_neg) BODY(sbt_pos, sbt_neg); }
+// one sub-loop of the EXT-13 split, columns [lo_, hi_): the plain body BODY for a short run,
+// else the pipeline, split at minq (the plain body captures the query end only on columns
+// j >= minq). A part of one column runs the plain body, which tests j >= minq itself.
+#define BSW8_SK_SUBLOOP(SBTAT, BODY, FIN, lo_, hi_)                           \
+    {                                                                       \
+        const int sklo_ = (lo_), skh_ = (hi_);                              \
+        if (skh_ - sklo_ < BSW8_SKEW_MIN) {                                 \
+            BSW8_SK_PLAIN(SBTAT, BODY, sklo_, skh_)                         \
+        } else {                                                            \
+            const int skq_ = minq < sklo_ ? sklo_ : (minq > skh_ ? skh_ : minq); \
+            if (skq_ - sklo_ >= 2) BSW8_SK_RANGE(SBTAT, FIN, 0, sklo_, skq_)  \
+            else BSW8_SK_PLAIN(SBTAT, BODY, sklo_, skq_)                    \
+            if (skh_ - skq_ >= 2) BSW8_SK_RANGE(SBTAT, FIN, 1, skq_, skh_)    \
+            else BSW8_SK_PLAIN(SBTAT, BODY, skq_, skh_)                     \
+            j = skh_;                                                       \
+        }                                                                   \
+    }
+// the three EXT-13 sub-loops through BSW8_SK_SUBLOOP; SBTAT is an EXT13_SBT8_*_AT score
+#define EXT13_RUN_SKEW8_128(SBTAT)                                            \
+    do {                                                                    \
+        BSW8_SK_SUBLOOP(SBTAT, DP_CELL_BODY8_128, BSW8_SK_FIN_M, beg, fast_lo)          \
+        BSW8_SK_SUBLOOP(SBTAT, DP_CELL_BODY8_128_FAST, BSW8_SK_FIN_F, fast_lo, fast_hi) \
+        BSW8_SK_SUBLOOP(SBTAT, DP_CELL_BODY8_128, BSW8_SK_FIN_M, fast_hi, end)          \
+    } while (0)
 
 
 #define PFD 2 // SSE2
@@ -6609,12 +6790,37 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
         // per-cell score prologue (SBT_PROLOGUE, which declares sbt_pos/sbt_neg)
         // differs. Parameterising it here keeps the beg->fast_lo->fast_hi->end
         // traversal in one place so a future change can't drift between branches.
+        // Under BSW8_SKEW the sub-loops run through the software pipeline instead.
+        // SBT_PROLOGUE##_AT (EXT13_SBT8_*_AT below) computes the same score for an explicit
+        // column; it is pasted, not passed, so the prologue's top-level commas never reach the
+        // pipeline macros' argument lists.
+#if BSW8_SKEW
+#define EXT13_RUN_SPLIT8_128(SBT_PROLOGUE) EXT13_RUN_SKEW8_128(SBT_PROLOGUE##_AT)
+#else
 #define EXT13_RUN_SPLIT8_128(SBT_PROLOGUE) \
         do { \
             for (j = beg; j < fast_lo; j++)     { SBT_PROLOGUE DP_CELL_BODY8_128(sbt_pos, sbt_neg); }      \
             for (j = fast_lo; j < fast_hi; j++) { SBT_PROLOGUE DP_CELL_BODY8_128_FAST(sbt_pos, sbt_neg); } \
             for (j = fast_hi; j < end; j++)     { SBT_PROLOGUE DP_CELL_BODY8_128(sbt_pos, sbt_neg); }      \
         } while (0)
+#endif
+        // EXT13_SBT8_* for column jj into (pos_, neg_): the same loads and operations; keep
+        // each in step with its EXT13_SBT8_* twin above.
+#define EXT13_SBT8_XOR_AT(jj, pos_, neg_) \
+            { __m128i s2_ = _mm_load_si128((__m128i *)(seq2SoA + (jj) * SIMD_WIDTH8)); \
+              __m128i x_ = _mm_xor_si128(s10, s2_); \
+              pos_ = shuffle_lut_lowidx8(pmat_pos128, x_); \
+              neg_ = shuffle_lut_lowidx8(pmat_neg128, x_); }
+#define EXT13_SBT8_RANK1_AT(jj, pos_, neg_) \
+            { __m128i s2_ = _mm_load_si128((__m128i *)(seq2SoA + (jj) * SIMD_WIDTH8)); \
+              __m128i sbt11_; \
+              SBT_PREPASS8_RANK1(s10, s2_, rowfreed, sbt11_, pmat128, match128, frread128); \
+              SBT_SPLIT8(sbt11_, pos_, neg_, zero128); }
+#define EXT13_SBT8_AMAT_AT(jj, pos_, neg_) \
+            { __m128i s2_ = _mm_load_si128((__m128i *)(seq2SoA + (jj) * SIMD_WIDTH8)); \
+              __m128i sbt11_; \
+              SBT_PREPASS8_AMAT(s10, s2_, sbt11_, amat128, w_ambig_128, three128); \
+              SBT_SPLIT8(sbt11_, pos_, neg_, zero128); }
         if (!gen_mat) {
 #define EXT13_SBT8_XOR \
                 __m128i s2 = _mm_load_si128((__m128i *)(seq2SoA + j * SIMD_WIDTH8)); \
@@ -7200,6 +7406,9 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
 #undef EXT13_SBT8_XOR
 #undef EXT13_SBT8_RANK1
 #undef EXT13_SBT8_AMAT
+#undef EXT13_SBT8_XOR_AT
+#undef EXT13_SBT8_RANK1_AT
+#undef EXT13_SBT8_AMAT_AT
 
 #endif
 
@@ -7228,4 +7437,11 @@ extern "C" int bsw8_row_lean_enabled(void);
 extern "C" int bsw8_row_lean_enabled(void)
 {
     return BSW8_ROW_LEAN;
+}
+
+/* Test-only hook, as above: the BSW8_SKEW setting of this copy of the TU. */
+extern "C" int bsw8_skew_enabled(void);
+extern "C" int bsw8_skew_enabled(void)
+{
+    return BSW8_SKEW;
 }

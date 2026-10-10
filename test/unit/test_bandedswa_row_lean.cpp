@@ -10,8 +10,14 @@
 // On aarch64 the unit binary links two copies of bandedSWA.cpp: libbwa.a's, and
 // src/bandedSWA.rowalt.o, built with BSW8_ROW_LEAN set the other way
 // (BSW8_ROW_LEAN_INVERT) and its symbols renamed with a _rowalt suffix
-// (KERNEL_VARIANT). By default the libbwa.a kernel is the lean one on Linux arm64
-// and the original on macOS; the first case checks that the two really differ.
+// (KERNEL_VARIANT). The same flag flips BSW8_SKEW (the software-pipelined DP
+// column loops, also a pure speed change), so the comparisons below cover both.
+// By default the libbwa.a kernel is the lean, pipelined one on Linux arm64 and
+// the original on macOS; the first two cases check that the copies really differ.
+// The lane-compaction driver runs the same DP column loops as its copy: on Linux arm64
+// test_bandedswa_compact.cpp compares it with the same copy's plain wrapper (both
+// pipelined), and test_bandedswa_lane_indep.cpp runs both copies' drivers against
+// the scalar oracle.
 // The original code is the reference: it is the kernel that shipped before
 // BSW8_ROW_LEAN, an independent implementation of every per-row step. x86 always
 // runs the original code, so there the file holds a single case that says so.
@@ -58,6 +64,9 @@
 extern "C" int bsw8_row_lean_enabled_rowalt(void);
 /* Defined by libbwa.a's bandedSWA.o: the BSW8_ROW_LEAN setting it was built with. */
 extern "C" int bsw8_row_lean_enabled(void);
+/* The BSW8_SKEW setting of each copy (the rowalt copy flips it too). */
+extern "C" int bsw8_skew_enabled_rowalt(void);
+extern "C" int bsw8_skew_enabled(void);
 
 namespace {
 
@@ -184,10 +193,9 @@ std::vector<ExtPair> make_pairs(Rng &r, const ExtScoring &sc, int w, bool meth, 
     return pairs;
 }
 
-/// One kernel copy, with getScores8's lane compaction off: the compaction driver
-/// runs its own (lean) row body, so with it on both copies would run the same
-/// code for most bands. test_bandedswa_compact.cpp compares compaction with
-/// these kernels.
+/// One kernel copy, with getScores8's lane compaction off: this file compares the
+/// two copies' plain wrappers (the compaction driver always runs the lean row).
+/// test_bandedswa_compact.cpp compares compaction with these kernels.
 std::unique_ptr<IBandedPairWiseSW> make_kernel(const ExtScoring &sc, bool rowalt)
 {
     std::unique_ptr<IBandedPairWiseSW> k;
@@ -367,6 +375,13 @@ TEST_CASE("BSW8_ROW_LEAN: the two linked kernel copies differ in BSW8_ROW_LEAN"
           * doctest::test_suite("unit/bandedswa")) {
     // Otherwise the cases below would compare a kernel with itself.
     CHECK(bsw8_row_lean_enabled() != bsw8_row_lean_enabled_rowalt());
+}
+
+TEST_CASE("BSW8_SKEW: the two linked kernel copies differ in BSW8_SKEW"
+          * doctest::test_suite("unit/bandedswa")) {
+    // The rowalt copy flips the pipelined DP column loops as well, so every comparison in
+    // this file also checks them against the plain loops.
+    CHECK(bsw8_skew_enabled() != bsw8_skew_enabled_rowalt());
 }
 
 TEST_CASE("BSW8_ROW_LEAN: both kernels equal the scalar oracle for pairs scored alone"
