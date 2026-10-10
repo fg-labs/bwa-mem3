@@ -256,6 +256,9 @@ jobs:
 
       - name: Build bwa-mem3 (ccache wrapping clang-19)
         if: steps.cache-binary.outputs.cache-hit != 'true'
+        env:
+          MATRIX_ARCH: ${{ matrix.arch }}
+          MATRIX_BUILD_FLAGS: ${{ matrix.build_flags }}
         run: |
           # Pair CC with CXX explicitly: the Makefile only auto-pairs bare
           # compiler names (g++, clang++), not wrapped invocations like
@@ -265,15 +268,22 @@ jobs:
           # conditionally in the Makefile based on $(IS_ARM) + empty $(arch)).
           # Makes the produced artifact name (bwa-mem3.arm64) unambiguous.
           ccache --zero-stats >/dev/null
-          if [ "${{ matrix.arch }}" = "arm" ]; then
-            make -j"$(nproc)" CXX="ccache clang++-19" CC="ccache clang-19" ${{ matrix.build_flags }} arm64
+          # MATRIX_BUILD_FLAGS is deliberately unquoted: it holds zero or more
+          # space-separated make arguments (empty on every current row), and
+          # quoting it would pass an empty-string argument to make. Values must
+          # be plain words: quotes inside them are not re-parsed, and globs expand.
+          # shellcheck disable=SC2086
+          if [ "$MATRIX_ARCH" = "arm" ]; then
+            make -j"$(nproc)" CXX="ccache clang++-19" CC="ccache clang-19" $MATRIX_BUILD_FLAGS arm64
           else
-            make -j"$(nproc)" arch="$MAKE_ARCH" CXX="ccache clang++-19" CC="ccache clang-19" ${{ matrix.build_flags }}
+            make -j"$(nproc)" arch="$MAKE_ARCH" CXX="ccache clang++-19" CC="ccache clang-19" $MATRIX_BUILD_FLAGS
           fi
           ccache --show-stats | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Verify binary
-        run: ls -l ./${{ matrix.binary_name }}
+        env:
+          MATRIX_BINARY_NAME: ${{ matrix.binary_name }}
+        run: ls -l ./"$MATRIX_BINARY_NAME"
 
       - name: Download data artifact (ref + reads)
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
@@ -296,15 +306,20 @@ jobs:
 
       - name: Build chr17 index if cache miss
         if: steps.cache-chr17-index.outputs.cache-hit != 'true'
-        run: ./${{ matrix.binary_name }} index /tmp/ci-data/chr17.fa
+        env:
+          MATRIX_BINARY_NAME: ${{ matrix.binary_name }}
+        run: ./"$MATRIX_BINARY_NAME" index /tmp/ci-data/chr17.fa
 
       - name: Run mem (BAM-1 output)
+        env:
+          MATRIX_BINARY_NAME: ${{ matrix.binary_name }}
+          MATRIX_FLAGS_SLUG: ${{ matrix.flags_slug }}
         run: |
           set -o pipefail
           mkdir -p /tmp/ci-out
           for rep in $(seq 1 "$N_REPS"); do
-            base="/tmp/ci-out/${{ matrix.flags_slug }}.rep${rep}"
-            /usr/bin/time -v ./${{ matrix.binary_name }} mem -t "$(nproc)" \
+            base="/tmp/ci-out/${MATRIX_FLAGS_SLUG}.rep${rep}"
+            /usr/bin/time -v ./"$MATRIX_BINARY_NAME" mem -t "$(nproc)" \
               /tmp/ci-data/chr17.fa \
               /tmp/ci-data/reads.r1.fastq.gz /tmp/ci-data/reads.r2.fastq.gz \
               2> "${base}.time" \
@@ -511,6 +526,8 @@ jobs:
         # and which one was decided by whichever runner we landed on. The
         # kernels differ per tier by construction, and avx512bw is one of the
         # two that carried the #290 padding bug.
+        env:
+          MATRIX_ARCH: ${{ matrix.arch }}
         run: |
           mkdir -p /tmp/ci-out
           ccache --zero-stats >/dev/null
@@ -519,7 +536,7 @@ jobs:
           BWA_MEM3=./bwa-mem3 \
           TEST_BIN=./test/bwa_mem3_tests_unit \
           OUT_DIR=/tmp/ci-out \
-          ARCH_LABEL=${{ matrix.arch }} \
+          ARCH_LABEL="$MATRIX_ARCH" \
           SUITE_ARGS="--test-suite=unit/kswv,unit/bandedswa" \
             bash .github/scripts/kswv-tier-sweep.sh
 

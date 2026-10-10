@@ -359,6 +359,10 @@ jobs:
             arch_flag: ""
             use_mimalloc: "1"
             run_integration: true
+            # BASELINE_ARCH for the single-binary build (the steps default an
+            # unset baseline_arch to avx2 too). Spelled out on this row so the
+            # key is declared in the matrix and its use type-checks.
+            baseline_arch: "avx2"
             name: "Linux x86_64 single-binary (mimalloc)"
             artifact_slug: "linux-x86_64-single-mimalloc"
           # gcc build-compatibility lane. The rest of the matrix builds with
@@ -395,6 +399,9 @@ jobs:
       # including nested sub-makes (e.g. the integration step's `make -C ..` to
       # build the reference binary) that don't pass the compiler explicitly.
       # Command-line CXX=/CC= on individual steps still override these.
+      # Steps pass the row's compiler as CXX="$CXX" (this value) and read the
+      # other matrix fields through step-level env (MATRIX_*), so no matrix
+      # value is spliced into a run: script as template text.
       CXX: ${{ matrix.cxx || 'clang++-19' }}
       CC: ${{ matrix.cc || 'clang-19' }}
       ALLOW_UNSUPPORTED_COMPILER: ${{ matrix.allow_unsupported || '0' }}
@@ -450,15 +457,19 @@ jobs:
         # single: recipe short-circuits to the arm64 build before consulting
         # it. On rows that pin arch=… we hit a single-arch build that bypasses
         # single: entirely, so BASELINE_ARCH is not used and is omitted.
+        env:
+          MATRIX_ARCH_FLAG: ${{ matrix.arch_flag }}
+          MATRIX_BASELINE_ARCH: ${{ matrix.baseline_arch || 'avx2' }}
+          MATRIX_USE_MIMALLOC: ${{ matrix.use_mimalloc }}
         run: |
-          if [ "${{ matrix.arch_flag }}" = "" ]; then
+          if [ "$MATRIX_ARCH_FLAG" = "" ]; then
             make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)" \
-              BASELINE_ARCH=${{ matrix.baseline_arch || 'avx2' }} \
-              CXX=${{ matrix.cxx || 'clang++-19' }} USE_MIMALLOC=${{ matrix.use_mimalloc }}
+              BASELINE_ARCH="$MATRIX_BASELINE_ARCH" \
+              CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
           else
             make -j"$(nproc)" \
-              arch=${{ matrix.arch_flag }} \
-              CXX=${{ matrix.cxx || 'clang++-19' }} USE_MIMALLOC=${{ matrix.use_mimalloc }}
+              arch="$MATRIX_ARCH_FLAG" \
+              CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
           fi
 
       - name: Verify binary
@@ -477,7 +488,9 @@ jobs:
       # comparison when EXPECTED_FLOOR is empty, so the arch_flag="" rows (ARM,
       # macOS, single-binary) still run the rest of the checks.
       - name: Version banner regression
-        run: BWA_MEM3=./bwa-mem3 EXPECTED_FLOOR=${{ matrix.arch_flag }} bash test/regression/version_banner.sh
+        env:
+          MATRIX_ARCH_FLAG: ${{ matrix.arch_flag }}
+        run: BWA_MEM3=./bwa-mem3 EXPECTED_FLOOR="$MATRIX_ARCH_FLAG" bash test/regression/version_banner.sh
 
       - name: Argument range validation (-E / -I reject non-positive, -O negative)
         # -E 0 (cal_max_gap divide-by-zero, arch-divergent UB), -I mean,0
@@ -498,11 +511,13 @@ jobs:
         # all tier kernels separately; the test TU compiles at sse41 here
         # regardless of BASELINE_ARCH, so kswv tests gate on BWA_TESTS_HAVE_KSWV
         # and skip when the test TU lacks __AVX2__/__AVX512BW__).
+        env:
+          MATRIX_ARCH_FLAG: ${{ matrix.arch_flag }}
         run: |
-          if [ "${{ matrix.arch_flag }}" = "" ]; then
-            make test-binaries CXX=${{ matrix.cxx || 'clang++-19' }}
+          if [ "$MATRIX_ARCH_FLAG" = "" ]; then
+            make test-binaries CXX="$CXX"
           else
-            make test-binaries arch=${{ matrix.arch_flag }} CXX=${{ matrix.cxx || 'clang++-19' }}
+            make test-binaries arch="$MATRIX_ARCH_FLAG" CXX="$CXX"
           fi
 
       - name: Run unit tests (all rows)
@@ -511,6 +526,7 @@ jobs:
           # Every row's floor tier has a lane-compaction driver (avx2 on x86, neon on
           # arm64); require it, so the compaction equivalence tests cannot skip there.
           BWA_REQUIRE_COMPACTION_TIER: ${{ runner.arch == 'X64' && 'avx2' || 'neon' }}
+          JOB_INDEX: ${{ strategy.job-index }}
         # `--reporters=junit --out=…` writes JUnit XML to the file and
         # nothing to stdout. doctest itself prints the failing-assertion
         # summary to stderr before exiting non-zero, so the per-step log
@@ -519,7 +535,7 @@ jobs:
         run: |
           ./test/bwa_mem3_tests_unit \
             --reporters=junit \
-            --out=unit-results-${{ strategy.job-index }}.xml
+            --out="unit-results-${JOB_INDEX}.xml"
 
       - name: Upload unit-test results
         if: always()
@@ -542,12 +558,16 @@ jobs:
         # through it, hence the separate executable. Run on every row so the
         # interposition itself is exercised on each toolchain; the test fails
         # loudly rather than silently passing if it is not in effect.
+        env:
+          MATRIX_ARCH_FLAG: ${{ matrix.arch_flag }}
+          MATRIX_BASELINE_ARCH: ${{ matrix.baseline_arch || 'avx2' }}
+          MATRIX_USE_MIMALLOC: ${{ matrix.use_mimalloc }}
         run: |
-          if [ "${{ matrix.arch_flag }}" = "" ]; then
-            make bns_zero_calloc_test arch=${{ matrix.baseline_arch || 'avx2' }} \
-              CXX=${{ matrix.cxx || 'clang++-19' }} USE_MIMALLOC=${{ matrix.use_mimalloc }}
+          if [ "$MATRIX_ARCH_FLAG" = "" ]; then
+            make bns_zero_calloc_test arch="$MATRIX_BASELINE_ARCH" \
+              CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
           else
-            make bns_zero_calloc_test arch=${{ matrix.arch_flag }} CXX=${{ matrix.cxx || 'clang++-19' }} USE_MIMALLOC=${{ matrix.use_mimalloc }}
+            make bns_zero_calloc_test arch="$MATRIX_ARCH_FLAG" CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
           fi
           ./bns_zero_calloc_test
 
@@ -572,16 +592,20 @@ jobs:
         # it lets the default USE_MIMALLOC=1 rebuild libbwa.a with mimalloc on
         # the use_mimalloc="0" row -- the row would then never exercise the
         # no-mimalloc build. Carry the row's setting so it does.
+        env:
+          MATRIX_ARCH_FLAG: ${{ matrix.arch_flag }}
+          MATRIX_BASELINE_ARCH: ${{ matrix.baseline_arch || 'avx2' }}
+          MATRIX_USE_MIMALLOC: ${{ matrix.use_mimalloc }}
         run: |
-          if [ "${{ matrix.arch_flag }}" = "" ]; then
+          if [ "$MATRIX_ARCH_FLAG" = "" ]; then
             make read_arena_overflow_test packed_text_neg_nbases_test \
               packed_text_overflow_nbases_test mem_gen_alt_zero_calloc_test \
-              arch=${{ matrix.baseline_arch || 'avx2' }} \
-              CXX=${{ matrix.cxx || 'clang++-19' }} USE_MIMALLOC=${{ matrix.use_mimalloc }}
+              arch="$MATRIX_BASELINE_ARCH" \
+              CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
           else
             make read_arena_overflow_test packed_text_neg_nbases_test \
               packed_text_overflow_nbases_test mem_gen_alt_zero_calloc_test \
-              arch=${{ matrix.arch_flag }} CXX=${{ matrix.cxx || 'clang++-19' }} USE_MIMALLOC=${{ matrix.use_mimalloc }}
+              arch="$MATRIX_ARCH_FLAG" CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
           fi
           ./read_arena_overflow_test
           ./packed_text_neg_nbases_test
@@ -593,11 +617,14 @@ jobs:
         # (errno unset on EOF). The child triggers the EOF abort; the parent
         # asserts the diagnostic names "Unexpected end of file", not a leftover
         # strerror. Reachable only from `make test` otherwise; run on every row.
+        env:
+          MATRIX_ARCH_FLAG: ${{ matrix.arch_flag }}
+          MATRIX_USE_MIMALLOC: ${{ matrix.use_mimalloc }}
         run: |
-          if [ "${{ matrix.arch_flag }}" = "" ]; then
-            make err_fgets_eof_test CXX=${{ matrix.cxx || 'clang++-19' }} USE_MIMALLOC=${{ matrix.use_mimalloc }}
+          if [ "$MATRIX_ARCH_FLAG" = "" ]; then
+            make err_fgets_eof_test CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
           else
-            make err_fgets_eof_test arch=${{ matrix.arch_flag }} CXX=${{ matrix.cxx || 'clang++-19' }} USE_MIMALLOC=${{ matrix.use_mimalloc }}
+            make err_fgets_eof_test arch="$MATRIX_ARCH_FLAG" CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
           fi
           ./err_fgets_eof_test
 
@@ -635,7 +662,7 @@ jobs:
         # Built at -march=native, independent of arch_flag; rows without AVX2
         # (arm64) compile it to a recorded skip.
         run: |
-          make x86_soa_pack_test CXX=${{ matrix.cxx || 'clang++-19' }}
+          make x86_soa_pack_test CXX="$CXX"
           ./x86_soa_pack_test
 
       - name: kvec growth aborts on realloc failure
@@ -685,14 +712,18 @@ jobs:
         # carried from the row for the same reason: the .build-flags stamp keys on
         # CPPFLAGS (which carries -DUSE_MIMALLOC=1), so omitting it lets the default
         # USE_MIMALLOC=1 rebuild libbwa.a with mimalloc on the use_mimalloc="0" row.
+        env:
+          MATRIX_ARCH_FLAG: ${{ matrix.arch_flag }}
+          MATRIX_BASELINE_ARCH: ${{ matrix.baseline_arch || 'avx2' }}
+          MATRIX_USE_MIMALLOC: ${{ matrix.use_mimalloc }}
         run: |
-          if [ "${{ matrix.arch_flag }}" = "" ]; then
-            make kopen_pipe_status_test arch=${{ matrix.baseline_arch || 'avx2' }} \
-              CXX=${{ matrix.cxx || 'clang++-19' }} \
-              USE_MIMALLOC=${{ matrix.use_mimalloc }}
+          if [ "$MATRIX_ARCH_FLAG" = "" ]; then
+            make kopen_pipe_status_test arch="$MATRIX_BASELINE_ARCH" \
+              CXX="$CXX" \
+              USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
           else
-            make kopen_pipe_status_test arch=${{ matrix.arch_flag }} \
-              CXX=${{ matrix.cxx || 'clang++-19' }} USE_MIMALLOC=${{ matrix.use_mimalloc }}
+            make kopen_pipe_status_test arch="$MATRIX_ARCH_FLAG" \
+              CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
           fi
           ./kopen_pipe_status_test
 
@@ -711,12 +742,16 @@ jobs:
         # (the -p interleaved path can hand it an empty batch -> must not deref
         # seqs[0]). Asserts against hardcoded expected strings (independent
         # oracle). Links libbwa.a, so arch/CXX propagate like bns_zero_calloc.
+        env:
+          MATRIX_ARCH_FLAG: ${{ matrix.arch_flag }}
+          MATRIX_BASELINE_ARCH: ${{ matrix.baseline_arch || 'avx2' }}
+          MATRIX_USE_MIMALLOC: ${{ matrix.use_mimalloc }}
         run: |
-          if [ "${{ matrix.arch_flag }}" = "" ]; then
-            make cli_arg_safety_test arch=${{ matrix.baseline_arch || 'avx2' }} \
-              CXX=${{ matrix.cxx || 'clang++-19' }} USE_MIMALLOC=${{ matrix.use_mimalloc }}
+          if [ "$MATRIX_ARCH_FLAG" = "" ]; then
+            make cli_arg_safety_test arch="$MATRIX_BASELINE_ARCH" \
+              CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
           else
-            make cli_arg_safety_test arch=${{ matrix.arch_flag }} CXX=${{ matrix.cxx || 'clang++-19' }} USE_MIMALLOC=${{ matrix.use_mimalloc }}
+            make cli_arg_safety_test arch="$MATRIX_ARCH_FLAG" CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
           fi
           ./cli_arg_safety_test
 
@@ -726,7 +761,7 @@ jobs:
         # silently dropped the whole -H file), and the oversize-line fatal.
         # Built via test/Makefile; no SIMD kernels, so no arch propagation.
         run: |
-          make -C test header_insert_test CXX=${{ matrix.cxx || 'clang++-19' }}
+          make -C test header_insert_test CXX="$CXX"
           ./test/header_insert_test
 
       - name: pwrite_all_status write-the-whole-buffer contract
@@ -743,13 +778,17 @@ jobs:
         # marks the already-linked doctest unit binary stale, so a later bare
         # `make` in test/run_unit_tests.sh relinks it without $(HTSLIB_static_LIBS)
         # and fails on htslib's unresolved libdeflate_* symbols.
+        env:
+          MATRIX_ARCH_FLAG: ${{ matrix.arch_flag }}
+          MATRIX_BASELINE_ARCH: ${{ matrix.baseline_arch || 'avx2' }}
+          MATRIX_USE_MIMALLOC: ${{ matrix.use_mimalloc }}
         run: |
-          if [ "${{ matrix.arch_flag }}" = "" ]; then
-            make pwrite_all_status_test arch=${{ matrix.baseline_arch || 'avx2' }} \
-              CXX=${{ matrix.cxx || 'clang++-19' }} USE_MIMALLOC=${{ matrix.use_mimalloc }}
+          if [ "$MATRIX_ARCH_FLAG" = "" ]; then
+            make pwrite_all_status_test arch="$MATRIX_BASELINE_ARCH" \
+              CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
           else
-            make pwrite_all_status_test arch=${{ matrix.arch_flag }} \
-              CXX=${{ matrix.cxx || 'clang++-19' }} USE_MIMALLOC=${{ matrix.use_mimalloc }}
+            make pwrite_all_status_test arch="$MATRIX_ARCH_FLAG" \
+              CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
           fi
           ./pwrite_all_status_test
 
@@ -757,10 +796,11 @@ jobs:
         if: matrix.run_integration == true
         env:
           BWA_MEM3_TEST_MATRIX_ROW: ${{ matrix.name }}
+          JOB_INDEX: ${{ strategy.job-index }}
         run: |
           ./test/bwa_mem3_tests_integration \
             --reporters=junit \
-            --out=integration-results-${{ strategy.job-index }}.xml
+            --out="integration-results-${JOB_INDEX}.xml"
 
       - name: Upload integration-test results
         if: always() && matrix.run_integration == true
@@ -865,6 +905,8 @@ jobs:
       # the kswv suite; elsewhere report SKIP.
       - name: kswv unit tests at the AVX-512BW tier (where the runner has it)
         if: matrix.canonical == true
+        env:
+          MATRIX_USE_MIMALLOC: ${{ matrix.use_mimalloc }}
         run: |
           if ! grep -qw avx512bw /proc/cpuinfo; then
             echo "SKIP: runner has no AVX-512BW; the kswv unit tests did not run at the avx512bw tier"
@@ -875,7 +917,7 @@ jobs:
           # bundled libraries, whose caches pin the source directory they were configured in.
           rsync -a --exclude .git --exclude '*.o' --exclude '*.a' --exclude 'bwa-mem3*' --exclude '/ext/*/build/' \
             ./ "$RUNNER_TEMP/avx512bw/"
-          make -C "$RUNNER_TEMP/avx512bw" -j"$(nproc)" test-binaries arch=avx512bw CXX=${{ matrix.cxx || 'clang++-19' }} USE_MIMALLOC=${{ matrix.use_mimalloc }}
+          make -C "$RUNNER_TEMP/avx512bw" -j"$(nproc)" test-binaries arch=avx512bw CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
           "$RUNNER_TEMP/avx512bw/test/bwa_mem3_tests_unit" -ts=unit/kswv
           # Same reasoning for the lane-compaction equivalence tests: the AVX2
           # driver runs on every x86 runner, but the AVX-512BW one only where the
@@ -898,12 +940,16 @@ jobs:
         # step keeps working if canonical ever moves to an ARM or single-binary
         # row, where an empty `arch=` would select a different build path.
         if: matrix.canonical == true
+        env:
+          MATRIX_ARCH_FLAG: ${{ matrix.arch_flag }}
+          MATRIX_BASELINE_ARCH: ${{ matrix.baseline_arch || 'avx2' }}
+          MATRIX_USE_MIMALLOC: ${{ matrix.use_mimalloc }}
         run: |
-          if [ "${{ matrix.arch_flag }}" = "" ]; then
-            MAKE_ARGS="BASELINE_ARCH=${{ matrix.baseline_arch || 'avx2' }} CXX=${{ matrix.cxx || 'clang++-19' }} USE_MIMALLOC=${{ matrix.use_mimalloc }}" \
+          if [ "$MATRIX_ARCH_FLAG" = "" ]; then
+            MAKE_ARGS="BASELINE_ARCH=$MATRIX_BASELINE_ARCH CXX=$CXX USE_MIMALLOC=$MATRIX_USE_MIMALLOC" \
               bash test/regression/make_header_deps.sh
           else
-            MAKE_ARGS="arch=${{ matrix.arch_flag }} CXX=${{ matrix.cxx || 'clang++-19' }} USE_MIMALLOC=${{ matrix.use_mimalloc }}" \
+            MAKE_ARGS="arch=$MATRIX_ARCH_FLAG CXX=$CXX USE_MIMALLOC=$MATRIX_USE_MIMALLOC" \
               bash test/regression/make_header_deps.sh
           fi
 
@@ -911,8 +957,10 @@ jobs:
         # Also post-build, for the same reason as the step above. No arch= here:
         # the script sets it per case, since the goal is what it is checking.
         if: matrix.canonical == true
+        env:
+          MATRIX_USE_MIMALLOC: ${{ matrix.use_mimalloc }}
         run: |
-          MAKE_ARGS="CXX=${{ matrix.cxx || 'clang++-19' }} USE_MIMALLOC=${{ matrix.use_mimalloc }}" \
+          MAKE_ARGS="CXX=$CXX USE_MIMALLOC=$MATRIX_USE_MIMALLOC" \
             bash test/regression/make_default_goal.sh
 
       - name: Makefile compiler floor exempts clean goals
@@ -935,8 +983,10 @@ jobs:
         # bundled fragment the way a stray `make -B` does, asserts the guard
         # fires with its restore hint, and puts the fragment back.
         if: matrix.canonical == true
+        env:
+          MATRIX_USE_MIMALLOC: ${{ matrix.use_mimalloc }}
         run: |
-          MAKE_ARGS="CXX=${{ matrix.cxx || 'clang++-19' }} USE_MIMALLOC=${{ matrix.use_mimalloc }}" \
+          MAKE_ARGS="CXX=$CXX USE_MIMALLOC=$MATRIX_USE_MIMALLOC" \
             bash test/regression/make_htscodecs_guard.sh
 
       - name: --bam=6 roundtrip smoke (chr22)
@@ -996,16 +1046,23 @@ jobs:
       # it as a MISMATCH and exit 1, so a comparison that stopped biting fails
       # here.
       - name: SIMD rescue filter == scalar filter (rescue_prune_eq, generated jobs)
+        env:
+          MATRIX_ARCH_FLAG: ${{ matrix.arch_flag }}
+          MATRIX_BASELINE_ARCH: ${{ matrix.baseline_arch || 'avx2' }}
+          MATRIX_USE_MIMALLOC: ${{ matrix.use_mimalloc }}
         run: |
-          if [ "${{ matrix.arch_flag }}" = "" ]; then arch=${{ matrix.baseline_arch || 'avx2' }}; else arch=${{ matrix.arch_flag }}; fi
-          make rescue-prune-eq arch="$arch" CXX=${{ matrix.cxx || 'clang++-19' }} USE_MIMALLOC=${{ matrix.use_mimalloc }}
+          if [ "$MATRIX_ARCH_FLAG" = "" ]; then arch="$MATRIX_BASELINE_ARCH"; else arch="$MATRIX_ARCH_FLAG"; fi
+          make rescue-prune-eq arch="$arch" CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
           if RPE_NEGATIVE_CONTROL=1 ./rescue_prune_eq fuzz 2000 1 > rpe_nc.log 2>&1; then
             cat rpe_nc.log; echo "::error::negative control exited 0: the check missed an injected disagreement"; exit 1
           fi
           grep -q 'MISMATCHES=[1-9]' rpe_nc.log || { cat rpe_nc.log; echo "::error::negative control failed without reporting a MISMATCH"; exit 1; }
           ./rescue_prune_eq fuzz 100000 1
-          if [ "${{ runner.arch }}" = "X64" ]; then
-            ${{ matrix.cxx || 'clang++-19' }} -O3 -std=gnu++14 -mavx512f -mavx512bw -Isrc \
+          if [ "$RUNNER_ARCH" = "X64" ]; then
+            # $CXX unquoted, as the compiler word(s) were before: a wrapped
+            # compiler such as "ccache clang++-19" must still split.
+            # shellcheck disable=SC2086
+            $CXX -O3 -std=gnu++14 -mavx512f -mavx512bw -Isrc \
               test/rescue_prune_eq.cpp -o rescue_prune_eq_avx512bw
             if grep -qw avx512bw /proc/cpuinfo; then
               ./rescue_prune_eq_avx512bw fuzz 100000 2
@@ -1061,9 +1118,13 @@ jobs:
       # manual. As above, a negative control (one banded job's te shifted) must
       # fail first, and a 16-bit one (one narrowed job's te shifted) too.
       - name: Banded rescue == kswv (rescue_band_harness, generated jobs)
+        env:
+          MATRIX_ARCH_FLAG: ${{ matrix.arch_flag }}
+          MATRIX_BASELINE_ARCH: ${{ matrix.baseline_arch || 'avx2' }}
+          MATRIX_USE_MIMALLOC: ${{ matrix.use_mimalloc }}
         run: |
-          if [ "${{ matrix.arch_flag }}" = "" ]; then arch=${{ matrix.baseline_arch || 'avx2' }}; else arch=${{ matrix.arch_flag }}; fi
-          make rescue-band-harness arch="$arch" CXX=${{ matrix.cxx || 'clang++-19' }} USE_MIMALLOC=${{ matrix.use_mimalloc }}
+          if [ "$MATRIX_ARCH_FLAG" = "" ]; then arch="$MATRIX_BASELINE_ARCH"; else arch="$MATRIX_ARCH_FLAG"; fi
+          make rescue-band-harness arch="$arch" CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
           if BWA3_RESCUE_BAND_COST=100000000 RB_NEGATIVE_CONTROL=1 ./rescue_band_harness eq 3000 1 > rb_nc.log 2>&1; then
             cat rb_nc.log; echo "::error::negative control exited 0: the check missed an injected disagreement"; exit 1
           fi
@@ -1108,9 +1169,13 @@ jobs:
       # On x86 the binary reports SKIP (an error on an arm64 runner). As above, a negative control
       # (kernel 2's te shifted in one lane) must fail first.
       - name: Banded rescue kernels agree (rescue_band_kernel_eq)
+        env:
+          MATRIX_ARCH_FLAG: ${{ matrix.arch_flag }}
+          MATRIX_BASELINE_ARCH: ${{ matrix.baseline_arch || 'avx2' }}
+          MATRIX_USE_MIMALLOC: ${{ matrix.use_mimalloc }}
         run: |
-          if [ "${{ matrix.arch_flag }}" = "" ]; then arch=${{ matrix.baseline_arch || 'avx2' }}; else arch=${{ matrix.arch_flag }}; fi
-          make rescue-band-kernel-eq arch="$arch" CXX=${{ matrix.cxx || 'clang++-19' }} USE_MIMALLOC=${{ matrix.use_mimalloc }}
+          if [ "$MATRIX_ARCH_FLAG" = "" ]; then arch="$MATRIX_BASELINE_ARCH"; else arch="$MATRIX_ARCH_FLAG"; fi
+          make rescue-band-kernel-eq arch="$arch" CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
           if RB_NEGATIVE_CONTROL=1 ./rescue_band_kernel_eq 2000 1 > rbk_nc.log 2>&1; then
             cat rbk_nc.log
             case "$(uname -m)" in
