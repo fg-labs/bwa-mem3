@@ -18,6 +18,7 @@
 
 #include "doctest/doctest.h"
 #include "bandedSWA.h"
+#include "ext_result.h"
 #include "simd_dispatch.h"
 
 #if HAVE_BSW_VECTOR_8_16
@@ -41,7 +42,7 @@ void build_ot_mat(int8_t mat[25], int a, int b, int ambig) {
     mat[1 * 5 + 3] = (int8_t)a;   // ref C (1), read T (3) -> match (allowed conversion)
 }
 
-struct Out { int score, tle, gtle, qle, gscore, max_off; };
+using bwa_tests::ExtResult;
 
 // Generate n converted-read pairs (read = C->T projection of the ref prefix,
 // plus sparse real mismatches) and compare getScores<width> to scalarBandedSWA
@@ -57,7 +58,7 @@ int score_mismatches(int width, const int8_t mat[25], int a, int b,
 
     std::vector<uint8_t> ref((size_t)STRIDE * n, 0), qer((size_t)STRIDE * n, 0);
     std::vector<SeqPair> pairs(((n + 63) / 64) * 64);   // SIMD-width round-up + slack
-    std::vector<Out> oracle(n);
+    std::vector<ExtResult> oracle(n);
     std::mt19937_64 rng(seed);
     std::uniform_int_distribution<int> lenD(40, maxlen);
 
@@ -87,7 +88,7 @@ int score_mismatches(int width, const int8_t mat[25], int a, int b,
         sp.idr = (int)((size_t)c * STRIDE); sp.idq = (int)((size_t)c * STRIDE);
         sp.seqid = c; sp.regid = c;
         sp.score = sp.tle = sp.gtle = sp.qle = sp.gscore = sp.max_off = -1;
-        Out &O = oracle[c];
+        ExtResult &O = oracle[c];
         O.score = bsw.scalarBandedSWA(len2, s2, len1, s1, w, sp.h0,
                                       &O.qle, &O.tle, &O.gtle, &O.gscore, &O.max_off);
     }
@@ -97,7 +98,7 @@ int score_mismatches(int width, const int8_t mat[25], int a, int b,
     int diff = 0;
     for (int c = 0; c < n; ++c) {
         const SeqPair &p = pairs[c];
-        const Out &o = oracle[c];
+        const ExtResult &o = oracle[c];
         if (p.score != o.score || p.tle != o.tle || p.gtle != o.gtle ||
             p.qle != o.qle || p.gscore != o.gscore || p.max_off != o.max_off)
             ++diff;

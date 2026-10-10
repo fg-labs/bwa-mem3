@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "bandedSWA.h"
+#include "ext_result.h"
 #include "ksw.h"
 #include "scoring.h"
 #include "ungapped_ext.h"
@@ -35,14 +36,6 @@ struct ExtScoring {
     int e_min() const { return e_del < e_ins ? e_del : e_ins; }
     // The production fast-path threshold, including the opt->w >= 2 gate (E1).
     int x_threshold(int w) const { return ungapped_x_threshold(a, b, o_min(), e_min(), w); }
-};
-
-struct ExtResult {
-    int score, qle, tle, gtle, gscore, max_off;
-    bool operator==(const ExtResult &o) const {
-        return score == o.score && qle == o.qle && tle == o.tle && gtle == o.gtle &&
-               gscore == o.gscore && max_off == o.max_off;
-    }
 };
 
 // One extension pair as the ladder sees it: query (len2 = qlen), target (len1 =

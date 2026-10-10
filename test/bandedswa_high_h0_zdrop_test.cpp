@@ -34,10 +34,11 @@
 #include <random>
 
 #include "bandedSWA.h"
+#include "framework/ext_result.h"
 
 namespace {
 
-struct Out { int score, tle, gtle, qle, gscore, max_off; };
+using bwa_tests::ExtResult;
 
 // Byte-fit precondition of the 8-bit kernel (the only bound the DP needs) plus
 // the length / target>=query / band conditions that remain load-bearing once
@@ -78,7 +79,7 @@ long run_trial(const Params &P, long n, long *admitted_out, long *above_out) {
     std::mt19937_64 rng(0xEC7C0DE4ull);
     std::vector<uint8_t> ref((size_t)STRIDE * n, 0), qer((size_t)STRIDE * n, 0);
     std::vector<SeqPair> pairs(n);
-    std::vector<Out> oracle(n);
+    std::vector<ExtResult> oracle(n);
     std::uniform_int_distribution<int> lenD(10, maxlen);
     std::uniform_int_distribution<int> hD(h0min, h0max);
     std::uniform_int_distribution<int> unit(3, 12);
@@ -104,7 +105,7 @@ long run_trial(const Params &P, long n, long *admitted_out, long *above_out) {
         p.idr = (int)((size_t)c * STRIDE); p.idq = (int)((size_t)c * STRIDE);
         p.seqid = c; p.regid = c;
         p.score = p.tle = p.gtle = p.qle = p.gscore = p.max_off = -1;
-        Out &O = oracle[c];
+        ExtResult &O = oracle[c];
         O.score = bsw.scalarBandedSWA(len2, s2, len1, s1, P.w, h0,
                                       &O.qle, &O.tle, &O.gtle, &O.gscore, &O.max_off);
     }
@@ -131,7 +132,7 @@ long run_trial(const Params &P, long n, long *admitted_out, long *above_out) {
     long diffs = 0;
     for (long k = 0; k < adm; ++k) {
         const SeqPair &g = ap[k];
-        const Out &O = oracle[idx[k]];
+        const ExtResult &O = oracle[idx[k]];
         if (g.score != O.score || g.tle != O.tle || g.gtle != O.gtle ||
             g.qle != O.qle || g.gscore != O.gscore || g.max_off != O.max_off) {
             if (diffs < 4)

@@ -36,12 +36,13 @@
 
 #include "doctest/doctest.h"
 #include "bandedSWA.h"
+#include "ext_result.h"
 
 #if HAVE_BSW_VECTOR_8_16
 
 namespace {
 
-struct Out { int score, tle, gtle, qle, gscore, max_off; };
+using bwa_tests::ExtResult;
 
 /// One (scoring parameters) trial. Returns the number of vector-vs-scalar mismatches over the
 /// pairs the CURRENT 8-bit routing envelope admits, and reports how many were checked so a
@@ -62,7 +63,7 @@ long trial(int a, int b, int o, int e, int zdrop, int w, int end_bonus,
     std::mt19937_64 rng(0xEC7C0DE4ull);
     std::vector<uint8_t> ref((size_t)STRIDE * n, 0), qer((size_t)STRIDE * n, 0);
     std::vector<SeqPair> pairs(n);
-    std::vector<Out> oracle(n);
+    std::vector<ExtResult> oracle(n);
     std::uniform_int_distribution<int> lenD(minq, maxq), hD(1, zdrop + 1), unit(3, 12);
 
     for (long c = 0; c < n; ++c) {
@@ -86,7 +87,7 @@ long trial(int a, int b, int o, int e, int zdrop, int w, int end_bonus,
         p.idr = (int)((size_t)c * STRIDE); p.idq = (int)((size_t)c * STRIDE);
         p.seqid = c; p.regid = c;
         p.score = p.tle = p.gtle = p.qle = p.gscore = p.max_off = -1;
-        Out &O = oracle[c];
+        ExtResult &O = oracle[c];
         O.score = bsw.scalarBandedSWA(len2, s2, len1, s1, w, h0,
                                       &O.qle, &O.tle, &O.gtle, &O.gscore, &O.max_off);
     }
@@ -115,7 +116,7 @@ long trial(int a, int b, int o, int e, int zdrop, int w, int end_bonus,
     long diffs = 0;
     for (long k = 0; k < adm; ++k) {
         const SeqPair &g = ap[k];
-        const Out &O = oracle[idx[k]];
+        const ExtResult &O = oracle[idx[k]];
         /* Comparison follows the kernel's documented query-end contract (see the
          * gtle CONTRACT comment in bandedSWA.cpp, and bandedswa_zdrop_eweight_test):
          * the local-alignment fields must match unconditionally, while gscore/gtle are
@@ -172,7 +173,7 @@ long trial16(int a, int b, int o, int e, int zdrop, int w, int end_bonus,
     std::mt19937_64 rng(0x16B0C0DEull);
     std::vector<uint8_t> ref((size_t)STRIDE * n, 0), qer((size_t)STRIDE * n, 0);
     std::vector<SeqPair> pairs(n);
-    std::vector<Out> oracle(n);
+    std::vector<ExtResult> oracle(n);
     std::uniform_int_distribution<int> lenD(minq, maxq), hD(1, zdrop + 1), unit(3, 12);
 
     for (long c = 0; c < n; ++c) {
@@ -196,7 +197,7 @@ long trial16(int a, int b, int o, int e, int zdrop, int w, int end_bonus,
         p.idr = (int)((size_t)c * STRIDE); p.idq = (int)((size_t)c * STRIDE);
         p.seqid = c; p.regid = c;
         p.score = p.tle = p.gtle = p.qle = p.gscore = p.max_off = -1;
-        Out &O = oracle[c];
+        ExtResult &O = oracle[c];
         O.score = bsw.scalarBandedSWA(len2, s2, len1, s1, w, h0,
                                       &O.qle, &O.tle, &O.gtle, &O.gscore, &O.max_off);
     }
@@ -210,7 +211,7 @@ long trial16(int a, int b, int o, int e, int zdrop, int w, int end_bonus,
     long diffs = 0;
     for (long k = 0; k < n; ++k) {
         const SeqPair &g = ap[k];
-        const Out &O = oracle[k];
+        const ExtResult &O = oracle[k];
         /* Same query-end contract as the 8-bit trial: local fields unconditional,
          * gscore/gtle only when a to-end alignment is observable on either side. */
         const bool local_differs = g.score != O.score || g.tle != O.tle ||
@@ -288,7 +289,7 @@ long trial16_longread_fill_overflow(int a, int b, int o, int e, int zdrop, int w
         std::copy(qq, qq + len2, qer.data() + (size_t)c * STRIDE);
     }
 
-    Out oracle;
+    ExtResult oracle;
     oracle.score = bsw.scalarBandedSWA(len2, qq, len1, rr, w, /*h0*/ 1,
                                        &oracle.qle, &oracle.tle, &oracle.gtle,
                                        &oracle.gscore, &oracle.max_off);

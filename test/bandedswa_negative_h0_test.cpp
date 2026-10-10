@@ -26,20 +26,15 @@
 #include <vector>
 
 #include "bandedSWA.h"
+#include "framework/ext_result.h"
 
 namespace {
 
 struct Pair { int h0; std::vector<uint8_t> ref, qer; };
-struct Out { int score, tle, qle, gscore, gtle, max_off; };
-
-bool same(const Out &a, const Out &b)
-{
-    return a.score == b.score && a.tle == b.tle && a.qle == b.qle && a.gscore == b.gscore
-        && a.gtle == b.gtle && a.max_off == b.max_off;
-}
+using bwa_tests::ExtResult;
 
 // Score `pairs` in one batch (vector or scalar); results in input order.
-std::vector<Out> score(BandedPairWiseSW &bsw, const std::vector<Pair> &pairs, bool scalar, int w)
+std::vector<ExtResult> score(BandedPairWiseSW &bsw, const std::vector<Pair> &pairs, bool scalar, int w)
 {
     std::vector<uint8_t> ref, qer;
     const int n = (int)pairs.size();
@@ -59,10 +54,12 @@ std::vector<Out> score(BandedPairWiseSW &bsw, const std::vector<Pair> &pairs, bo
     qer.resize(qer.size() + 256);
     if (scalar) bsw.scalarBandedSWAWrapper(sp.data(), ref.data(), qer.data(), n, 1, w);
     else        bsw.getScores8(sp.data(), ref.data(), qer.data(), n, 1, w);
-    std::vector<Out> out(n);
+    std::vector<ExtResult> out(n);
     for (int i = 0; i < n; i++) {
         const SeqPair &p = sp[i];
-        out[p.id] = Out{p.score, p.tle, p.qle, p.gscore, p.gtle, p.max_off};
+        ExtResult &o = out[p.id];
+        o.score = p.score; o.tle = p.tle; o.qle = p.qle;
+        o.gscore = p.gscore; o.gtle = p.gtle; o.max_off = p.max_off;
     }
     return out;
 }
@@ -99,7 +96,7 @@ int main()
     dead.h0 = -5;
     dead.ref.assign(30, 0);
     dead.qer.assign(20, 1);
-    const Out want = score(bsw, {dead}, true, w)[0];
+    const ExtResult want = score(bsw, {dead}, true, w)[0];
     if (want.score != dead.h0) {
         fprintf(stderr, "scalar oracle: dead pair scored %d, expected its h0 %d\n", want.score, dead.h0);
         fails++;
@@ -114,10 +111,10 @@ int main()
         batches.push_back(v);
     }
     for (size_t t = 0; t < batches.size(); t++) {
-        const std::vector<Out> got = score(bsw, batches[t], false, w);
+        const std::vector<ExtResult> got = score(bsw, batches[t], false, w);
         for (size_t i = 0; i < batches[t].size(); i++) {
             if (batches[t][i].h0 != dead.h0) continue;
-            if (!same(got[i], want)) {
+            if (!(got[i] == want)) {
                 fprintf(stderr, "batch %zu (n=%zu): dead pair got score=%d tle=%d qle=%d gscore=%d gtle=%d max_off=%d, "
                         "scalar score=%d tle=%d qle=%d gscore=%d gtle=%d max_off=%d\n", t, batches[t].size(),
                         got[i].score, got[i].tle, got[i].qle, got[i].gscore, got[i].gtle, got[i].max_off,
@@ -137,11 +134,11 @@ int main()
             const int h0 = (rng() % 3 == 0) ? -(int)(1 + rng() % 30) : (int)(1 + rng() % 40);
             v.push_back(make_pair(rng, h0, len1, len2, rng() % 2 == 0));
         }
-        const std::vector<Out> got = score(bsw, v, false, w);
-        const std::vector<Out> oracle = score(bsw, v, true, w);
+        const std::vector<ExtResult> got = score(bsw, v, false, w);
+        const std::vector<ExtResult> oracle = score(bsw, v, true, w);
         for (int i = 0; i < n; i++) {
-            const Out alone = score(bsw, {v[i]}, false, w)[0];
-            if (!same(got[i], oracle[i]) || !same(got[i], alone)) {
+            const ExtResult alone = score(bsw, {v[i]}, false, w)[0];
+            if (!(got[i] == oracle[i]) || !(got[i] == alone)) {
                 fprintf(stderr, "round %d pair %d (h0=%d len1=%zu len2=%zu): batch score=%d gscore=%d tle=%d qle=%d, "
                         "alone score=%d gscore=%d tle=%d qle=%d, scalar score=%d gscore=%d tle=%d qle=%d\n",
                         round, i, v[i].h0, v[i].ref.size(), v[i].qer.size(),
