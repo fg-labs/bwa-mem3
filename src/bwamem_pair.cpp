@@ -1774,6 +1774,56 @@ void mem_prefetch_rescue_pac(const bntseq_t *bns, const uint8_t *pac,
     }
 }
 
+/* The rescue orientations a needs no SW for: skip[r] = 1 when pes[r] failed or a region of the
+ * mate already lies at a distance inside pes[r]'s window in orientation r (mem_infer_dir, inlined
+ * below). Returns whether all four are set.
+ *
+ * Off aarch64 the scan is branch-free: a repetitive mate has hundreds of regions, and per region
+ * the orientation and the window test are data-dependent, so the branchy form mispredicts (about
+ * 15 cycles a region on Zen 5). The flags only ever turn on and nothing else is read from the scan,
+ * so stopping once all four are set (checked every 8 regions) leaves them those of the full scan. */
+bool mem_matesw_skip(int64_t l_pac, int64_t rb, const mem_alnreg_v *ma, const mem_pestat_t pes[4],
+                     int skip[4])
+{
+#if defined(__aarch64__)
+    /* aarch64 keeps the per-region loop: it already runs at ~5 cycles a region on Graviton4, and
+     * the branch-free form below measured +0.5 % wall there (WES, 4 reps) against -5.9 % on Zen 5. */
+    for (int r = 0; r < 4; ++r) skip[r] = pes[r].failed ? 1 : 0;
+    for (size_t i = 0; i < ma->n; ++i) {
+        int64_t dist;
+        const int r = mem_infer_dir(l_pac, rb, ma->a[i].rb, &dist);
+        if (dist >= pes[r].low && dist <= pes[r].high) skip[r] = 1;
+    }
+    return skip[0] + skip[1] + skip[2] + skip[3] == 4;
+#else
+    unsigned got = 0;
+    int64_t lo[4], hi[4];
+    for (int r = 0; r < 4; ++r) {
+        got |= (pes[r].failed ? 1u : 0u) << r;
+        lo[r] = pes[r].low;
+        hi[r] = pes[r].high;
+    }
+    const bool r1 = rb >= l_pac;
+    const int64_t mirror = (l_pac << 1) - 1;
+    const mem_alnreg_t *m = ma->a;
+    const size_t n = ma->n;
+    for (size_t i0 = 0; i0 < n && got != 15u; i0 += 8) {
+        const size_t e = n - i0 < 8 ? n : i0 + 8;
+        for (size_t i = i0; i < e; ++i) {
+            const int64_t b2 = m[i].rb;
+            const bool same = (b2 >= l_pac) == r1;
+            const int64_t p2 = same ? b2 : mirror - b2;   // the mate on a's strand
+            const bool gt = p2 > rb;
+            const int64_t dist = gt ? p2 - rb : rb - p2;
+            const int r = (same ? 0 : 1) ^ (gt ? 0 : 3);
+            got |= (unsigned)((dist >= lo[r]) & (dist <= hi[r])) << r;
+        }
+    }
+    for (int r = 0; r < 4; ++r) skip[r] = (int)((got >> r) & 1u);
+    return got == 15u;
+#endif
+}
+
 int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                          const uint8_t *pac, const mem_pestat_t pes[4],
                          const mem_alnreg_t *a, int l_ms, const uint8_t *ms,
@@ -1812,19 +1862,7 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
     
     int64_t l_pac = bns->l_pac;
     int i, r, skip[4], rid = -1;
-    for (r = 0; r < 4; ++r)
-        skip[r] = pes[r].failed? 1 : 0;
-
-    for (i = 0; i < ma->n; ++i) { // check which orinentation has been found
-        int64_t dist;
-        r = mem_infer_dir(l_pac, a->rb, ma->a[i].rb, &dist);
-        if (dist >= pes[r].low && dist <= pes[r].high) {
-            skip[r] = 1;
-        }
-    }
-
-
-    if (skip[0] + skip[1] + skip[2] + skip[3] == 4) //return pcnt; // consistent pair exist; no need to perform SW
+    if (mem_matesw_skip(l_pac, a->rb, ma, pes, skip)) // consistent pair exist; no need to perform SW
     {
         gar[gcnt + 3] = gar[gcnt + 2] = gar[gcnt + 1] = gar[gcnt + 0] = -1;
         return pcnt;
@@ -2271,19 +2309,7 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
      * consistent-pair fast path (the common case) does not leak it. */
     uint8_t *ms2 = NULL;
 
-    for (r = 0; r < 4; ++r) {
-        skip[r] = pes[r].failed? 1 : 0;
-    }
-
-    for (i = 0; i < ma->n; ++i) { // check which orinentation has been found
-        int64_t dist;
-        r = mem_infer_dir(l_pac, a->rb, ma->a[i].rb, &dist);
-        if (dist >= pes[r].low && dist <= pes[r].high)
-            skip[r] = 1;
-    }
-
-
-    if (skip[0] + skip[1] + skip[2] + skip[3] == 4) {
+    if (mem_matesw_skip(l_pac, a->rb, ma, pes, skip)) {
         return 0; // consistent pair exist; no need to perform SW
     }
 

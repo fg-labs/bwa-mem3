@@ -807,6 +807,13 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
  * (mem_sam_pe_batch_post) uses on its no-pairing fallback. */
 int mem_infer_dir(int64_t l_pac, int64_t b1, int64_t b2, int64_t *dist);
 
+/* The mate-rescue orientations a region at `rb` needs no SW for: skip[r] = 1 when pes[r] failed
+ * or a region of the mate `ma` already lies, in orientation r (mem_infer_dir), at a distance
+ * inside [pes[r].low, pes[r].high]. Returns whether all four are set (a consistent pair exists).
+ * Shared by mem_matesw_batch_pre and mem_matesw_batch_post. */
+bool mem_matesw_skip(int64_t l_pac, int64_t rb, const mem_alnreg_v *ma, const mem_pestat_t pes[4],
+                     int skip[4]);
+
 /* Proper-pair bit (FLAG 0x2) for a pair emitted on the batched pairing path's
  * no-pairing fallback. Returns 2 when properly paired and 0 otherwise, so the result ORs
  * straight into extra_flag. `which[i]` is the index of the region mate i
