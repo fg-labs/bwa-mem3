@@ -29,6 +29,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 *****************************************************************************************/
 
 #include "bwamem.h"
+#include "ext_reverse_copy.h"
 #include "read_memo.h"     /* --dedup-reads whole-read-pair memoization (Phase 1: measure-only) */
 #include "meth_xm.h"   /* meth_chem_t for the --meth chemistry default */
 #include "FMI_search.h"
@@ -7065,8 +7066,7 @@ static inline void stage_seed_extension(
 
         if (qleft_win_staged_here) {
             uint8_t *win = seqBufLeftQer + ext_win.qleft_base;
-            for (int64_t i = 0; i < ext_win.qleft_len; ++i)
-                win[i] = query[ext_win.qleft_len - 1 - i];
+            ext_reverse_copy(win, query, ext_win.qleft_len);
         }
         xassert(s->qbeg <= ext_win.qleft_len,
                 "extension: left query target is longer than the chain's staged read prefix");
@@ -7112,8 +7112,7 @@ static inline void stage_seed_extension(
 
         if (left_win_staged_here) {
             uint8_t *win = seqBufLeftRef + ext_win.left_base;
-            for (int64_t i = 0; i < ext_win.left_len; ++i)
-                win[i] = rseq[ext_win.left_len - 1 - i]; //seq1
+            ext_reverse_copy(win, rseq, ext_win.left_len); //seq1
         }
         xassert(tmp <= ext_win.left_len,
                 "extension: left target is longer than the chain's staged reference prefix");
