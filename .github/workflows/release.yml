@@ -66,7 +66,7 @@ jobs:
           AUTO_VERSION: ${{ needs.release-please.outputs.version }}
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
             tag="${INPUT_TAG:-}"
             version="${tag#v}"
           else
@@ -227,10 +227,11 @@ jobs:
         # version.h materialized by the previous step (gitignored
         # upstream) is NOT picked up. We append it explicitly with a
         # deterministic mtime tied to the release tag's commit timestamp.
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          TAG: ${{ steps.target.outputs.tag }}
         run: |
           set -euo pipefail
-          VERSION='${{ steps.ver.outputs.version }}'
-          TAG='${{ steps.target.outputs.tag }}'
           PFX="bwa-mem3-${VERSION}"
           TAR="${GITHUB_WORKSPACE}/Source_code_including_submodules.tar"
 
@@ -276,9 +277,10 @@ jobs:
         # version.txt's content (allowing an optional dev suffix). If
         # Makefile / scripts/version.sh ever drifts from version.txt
         # this catches it before the asset uploads.
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
         run: |
           set -euo pipefail
-          VERSION='${{ steps.ver.outputs.version }}'
           tar -xzf Source_code_including_submodules.tar.gz -C /tmp
           cd "/tmp/bwa-mem3-${VERSION}"
           make -j"$(nproc)" CXX=clang++-19 CC=clang-19
@@ -312,9 +314,10 @@ jobs:
         # no-op. The v0.2.0 guard in the "Resolve target tag" step
         # prevents an accidental dispatch from overwriting the bioconda-
         # pinned asset.
+        env:
+          TAG: ${{ steps.target.outputs.tag }}
         run: |
           set -euo pipefail
-          TAG='${{ steps.target.outputs.tag }}'
           gh release upload "$TAG" \
             Source_code_including_submodules.tar.gz \
             Source_code_including_submodules.tar.gz.sha256 \
@@ -332,10 +335,11 @@ jobs:
         # because release-please-action creates the release via the REST
         # API in the prior job; a freshly-created release isn't always
         # immediately visible on the next API call.
+        env:
+          TAG: ${{ steps.target.outputs.tag }}
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          TAG='${{ steps.target.outputs.tag }}'
-          REPO='${{ github.repository }}'
           SHA256=$(cut -d ' ' -f 1 < Source_code_including_submodules.tar.gz.sha256)
 
           fetched=false
