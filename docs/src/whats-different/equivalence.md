@@ -472,12 +472,30 @@ largest `k` that can still reach the ungapped score is therefore off every optim
 every traceback tie, and `ksw_global2` runs at that certified band when it is narrower than the
 usual one, or the ungapped CIGAR is emitted with no DP when it is 0. This applies in every mode,
 `--compat` included. Score, CIGAR, `NM` and `MD` are unchanged for every input: regions of
-unequal length keep the usual band, and so does any scoring for which the bound does not hold
-(a negative gap open, or `amax + e_ins + e_del <= 0`). Only the `-v 4` debug trace differs: it
-prints the band actually used, and nothing for a region the certificate makes ungapped. On
-5M-pair slices (HG00096 WGS and HG00100 WES, hg38) the band cells of the pass drop from 22.2G
-to 10.8G (WGS) and from 9.4G to 2.5G (WES); these counts are deterministic and do not depend on
-the host or SIMD tier ([#575](https://github.com/fg-labs/bwa-mem3/pull/575)).
+unequal length use the variant below, and any scoring for which the bound does not hold keeps
+the usual band (a negative gap open, or `amax + e_ins + e_del <= 0`). Only the `-v 4` debug
+trace differs: it prints the band actually used, and nothing for a region the certificate makes
+ungapped. On 5M-pair slices (HG00096 WGS and HG00100 WES, hg38) the band cells of the pass
+drop from 22.2G to 10.8G (WGS) and from 9.4G to 2.5G (WES); these counts are deterministic and
+do not depend on the host or SIMD tier ([#575](https://github.com/fg-labs/bwa-mem3/pull/575)).
+
+### Certified CIGAR band for unequal-length regions (default, byte-identical)
+
+The same certificate covers regions whose query and reference spans differ in length by
+`d = tlen - qlen`. The lower bound is the best alignment with a single gap of `|d|` bases (a
+deletion when the reference is longer, an insertion when the query is): the diagonal before the
+gap, the end diagonal after it, the gap position chosen in one pass. Every global alignment has
+`max(0, -d) + t` inserted and `max(0, d) + t` deleted bases for some `t >= 0`, so a path that
+strays `x` beyond the corridor between the two diagonals has `t >= x`, both gap kinds, and scores
+at most `amax*L - (o_ins + o_del) - e_ins*max(0,-d) - e_del*max(0,d) - t*(amax + e_ins + e_del)`
+(`L` the shorter length). The band is therefore certified at `|d|` plus the largest excursion
+that can still reach the lower bound, with the same argument for every traceback tie as above.
+`ksw_global2` runs at that band, but never below the usual `|d| + 3` floor (the wavefront kernels'
+precondition), when it is narrower than the usual one. Score, CIGAR, `NM` and `MD` are unchanged
+for every input; only the `-v 4` debug trace prints the narrower band. On the same 5M-pair slices
+the band cells of the unequal-length regions drop 45 % (WGS) and 47 % (WES), and those of the
+whole pass 26 % and 14 % on top of the equal-length certificate (cells counted exactly per band
+row) ([#580](https://github.com/fg-labs/bwa-mem3/pull/580)).
 
 ## What differs
 

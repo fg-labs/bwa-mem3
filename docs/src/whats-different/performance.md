@@ -203,6 +203,14 @@ WGS and WES slices (150 bp paired, hg38) at the default scoring, `-A 2`, `-B 6` 
   Graviton 3 (arm64, NEON tier) and 1.7 % / 2.1 % on AMD Zen 5 (x86-64, AVX-512BW tier), with
   record md5 identical to the previous `main`, also under both `--compat` targets. The
   timings were taken on an earlier revision of the PR whose generated hot code is unchanged.
+- **Certified band for unequal-length regions (PR #580).** The same certificate, with the best
+  single-gap alignment as the lower bound, narrows the band for regions whose query and
+  reference spans differ in length (never below the usual `|d| + 3` floor). Byte-identical by
+  construction; see [Equivalence](equivalence.md#certified-cigar-band-for-unequal-length-regions-default-byte-identical).
+  On the same slices, against the equal-length certificate, whole-aligner wall at `-t 16`
+  dropped 0.50 % (WGS) / 0.14 % (WES) on AWS Graviton 4 (arm64, NEON tier) and 0.82 % (WGS) on
+  AMD Zen 5 (x86-64, AVX-512BW tier; WES there was within that host's rep-to-rep noise), clang
+  19.1.7, with record md5 identical, also under both `--compat` targets.
 
 ## Mate rescue
 
