@@ -26,13 +26,44 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <random>
 #include <string>
 #include <vector>
 
+#include <sys/mman.h>
+#include <unistd.h>
+
 #if defined(__AVX2__)
 
 namespace {
+
+// A sequence copy placed flush against a PROT_NONE guard page: after its last
+// byte (guardAfter) or before its first byte, so a pack that reads outside
+// [data, data + len) faults instead of passing on stray bytes.
+class GuardedSeq {
+  public:
+    GuardedSeq(const std::vector<uint8_t> &bytes, bool guardAfter) : len_(bytes.size()) {
+        page_ = (size_t)sysconf(_SC_PAGESIZE);
+        const size_t body = ((len_ + page_ - 1) / page_) * page_ + page_;   // at least one page
+        map_size_ = body + 2 * page_;
+        void *m = mmap(nullptr, map_size_, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        REQUIRE(m != MAP_FAILED);
+        map_ = (uint8_t *)m;
+        REQUIRE(mprotect(map_, page_, PROT_NONE) == 0);
+        REQUIRE(mprotect(map_ + page_ + body, page_, PROT_NONE) == 0);
+        data_ = guardAfter ? map_ + page_ + body - len_ : map_ + page_;
+        if (len_) memcpy(data_, bytes.data(), len_);
+    }
+    ~GuardedSeq() { munmap(map_, map_size_); }
+    GuardedSeq(const GuardedSeq &) = delete;
+    GuardedSeq &operator=(const GuardedSeq &) = delete;
+    const uint8_t *data() const { return len_ ? data_ : nullptr; }
+
+  private:
+    size_t len_, page_ = 0, map_size_ = 0;
+    uint8_t *map_ = nullptr, *data_ = nullptr;
+};
 
 // The per-lane contract the wrappers' scalar loops implemented: real bases
 // (remapped when asked) for k < len, padA on [len, padStart), padB from
@@ -104,14 +135,16 @@ void run_trials(const Params &p, int trials, uint32_t seed) {
         std::vector<std::vector<uint8_t>> seq(W);
         std::vector<int> len(W), padStart(W);
         std::vector<const uint8_t *> seqp(W);
+        std::vector<std::unique_ptr<GuardedSeq>> guarded;   // alternate the guard side per trial
         const bool wideBytes = (t % 5 == 4);  // every byte value, not just bases
         for (int j = 0; j < W; j++) {
             len[j] = pick_len(rng, nrows);
             if (p.padStartIsLen) padStart[j] = len[j];
             else if (p.quantum16) padStart[j] = ((len[j] + 15) / 16) * 16;
             else padStart[j] = len[j] + (int)(rng() % 40);  // may exceed nrows
-            // Exactly len bytes so an over-read is out of bounds (visible
-            // under ASan), and a null pointer for an empty lane.
+            // Exactly len bytes, flush against an inaccessible page after
+            // (even trials) or before (odd trials) them, so a read outside the
+            // sequence faults; a null pointer for an empty lane.
             seq[j].resize(len[j]);
             for (int k = 0; k < len[j]; k++) {
                 uint8_t b = wideBytes ? (uint8_t)(rng() % 256) : (uint8_t)(rng() % 5);
@@ -119,7 +152,8 @@ void run_trials(const Params &p, int trials, uint32_t seed) {
                 if (!wideBytes && rng() % 11 == 0) b = p.padA;      // pad values as real bases
                 seq[j][k] = b;
             }
-            seqp[j] = len[j] ? seq[j].data() : nullptr;
+            guarded.emplace_back(new GuardedSeq(seq[j], t % 2 == 0));
+            seqp[j] = guarded.back()->data();
         }
         // Two canary rows past nrows: the pack must write rows [0, nrows) only.
         const size_t bytes = (size_t)(nrows + 2) * W;

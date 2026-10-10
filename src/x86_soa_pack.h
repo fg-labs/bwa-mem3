@@ -2,8 +2,8 @@
 /* x86_soa_pack.h -- tiled SoA packing for the AVX2 / AVX-512BW batch wrappers
  * (kswv mate rescue, bandedSWA extension), 8-bit lanes (x86_soa_pack) and
  * 16-bit lanes (x86_soa_pack_u16): the x86 counterpart of the tiled packing
- * the NEON batch wrappers use (neon_soa_pack.h, which lands with the NEON
- * wrapper changes; the headers share the same contract).
+ * the NEON batch wrappers use (neon_soa_pack.h; the headers share the same
+ * contract).
  *
  * The kernels read their sequences in SoA form: row k holds position k of
  * every lane, SIMD_WIDTH8 bytes (or SIMD_WIDTH16 halfwords) per row. The
@@ -27,6 +27,39 @@
 #include <assert.h>
 #include <immintrin.h>
 #include <stdint.h>
+#include <string.h>
+
+/* The first r = len - kb bytes of a boundary tile (positions [kb, len), 1 <= r <= 15) in bytes
+ * [0, r) of a vector, read without touching memory outside [seq, seq + len); bytes [r, 16) are
+ * unspecified. With len >= 16 the tile's bases are the last r bytes of the 16 that end at
+ * seq + len: one load and one shuffle. A shorter sequence (then kb == 0) is read as its first and
+ * last a bytes, a the largest power of two <= len, which together cover it. */
+static inline __m128i x86_soa_tail16(const uint8_t *seq, int len, int kb)
+{
+    const __m128i iota = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    const int r = len - kb;
+    if (len >= 16)
+        return _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)(seq + len - 16)),
+                                _mm_add_epi8(iota, _mm_set1_epi8((char)(16 - r))));
+    /* len < 16 here, so kb == 0 (the caller's r > 0 means kb < len); no assert: on this hot path
+     * it changes the pack's inlining and measured 3% slower on AVX-512BW */
+    uint64_t lo, hi;
+    int a;
+    if (len >= 8) {
+        a = 8; memcpy(&lo, seq, 8); memcpy(&hi, seq + len - 8, 8);
+    } else if (len >= 4) {
+        uint32_t x, y; a = 4; memcpy(&x, seq, 4); memcpy(&y, seq + len - 4, 4); lo = x; hi = y;
+    } else if (len >= 2) {
+        uint16_t x, y; a = 2; memcpy(&x, seq, 2); memcpy(&y, seq + len - 2, 2); lo = x; hi = y;
+    } else {
+        a = 1; lo = seq[0]; hi = seq[0];
+    }
+    /* byte t < a is byte t of lo; byte a <= t < len is byte t - (len - a) of hi, at 8 + t - len + a */
+    const __m128i v = _mm_set_epi64x((long long)hi, (long long)lo);
+    const __m128i idx = _mm_blendv_epi8(_mm_add_epi8(iota, _mm_set1_epi8((char)(8 - len + a))), iota,
+                                        _mm_cmplt_epi8(iota, _mm_set1_epi8((char)a)));
+    return _mm_shuffle_epi8(v, idx);
+}
 
 /* One 16-byte piece of the SoA input: positions [kb, kb + 16) of one lane,
  * with the pad and ambiguity contract the scalar fill wrote:
@@ -38,13 +71,14 @@
  * tile once kb >= padStart, which is only right when no base lies past
  * padStart. A tile entirely inside the sequence is one load (plus the remap
  * on the whole vector); a tile entirely past padStart is a broadcast; the
- * boundary tile is assembled byte-wise so nothing is read past the sequence.
- * The remap is applied only to real bases, so pad bytes are never rewritten
- * even if padA or padB equal remapFrom. */
+ * boundary tile is one or two loads that stay inside the sequence
+ * (x86_soa_tail16) blended with the pad bytes. The remap is applied only to
+ * real bases (the pad bytes are blended in after it), so pad bytes are never
+ * rewritten even if padA or padB equal remapFrom. fromv / tov / padAv / padBv
+ * are remapFrom / remapTo / padA / padB broadcast. */
 static inline __m128i x86_soa_piece16(const uint8_t *seq, int len, int padStart, int kb,
-                                      uint8_t padA, uint8_t padB,
-                                      bool remap, uint8_t remapFrom, uint8_t remapTo,
-                                      __m128i fromv, __m128i tov, __m128i padBv)
+                                      bool remap, __m128i fromv, __m128i tov,
+                                      __m128i padAv, __m128i padBv)
 {
     if (kb + 16 <= len) {
         __m128i v = _mm_loadu_si128((const __m128i *)(seq + kb));
@@ -52,15 +86,14 @@ static inline __m128i x86_soa_piece16(const uint8_t *seq, int len, int padStart,
         return v;
     }
     if (kb >= padStart) return padBv;
-    uint8_t tmp[16];
-    for (int t = 0; t < 16; t++) {
-        const int k = kb + t;
-        if (k < len)
-            tmp[t] = (remap && seq[k] == remapFrom) ? remapTo : seq[k];
-        else
-            tmp[t] = (k < padStart) ? padA : padB;
-    }
-    return _mm_loadu_si128((const __m128i *)tmp);
+    /* boundary tile: r real bases (0 <= r <= 15), then padA up to padStart, then padB */
+    const __m128i iota = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    const int r = len > kb ? len - kb : 0;
+    const int pa = padStart - kb < 16 ? padStart - kb : 16;   /* > 0 here */
+    __m128i real = r > 0 ? x86_soa_tail16(seq, len, kb) : padBv;
+    if (remap) real = _mm_blendv_epi8(real, tov, _mm_cmpeq_epi8(real, fromv));
+    const __m128i padv = _mm_blendv_epi8(padBv, padAv, _mm_cmplt_epi8(iota, _mm_set1_epi8((char)pa)));
+    return _mm_blendv_epi8(padv, real, _mm_cmplt_epi8(iota, _mm_set1_epi8((char)r)));
 }
 
 /* 16x16 byte transpose per 128-bit lane of 16 __m256i: on entry r[j] holds
@@ -150,6 +183,7 @@ static inline void x86_soa_pack(uint8_t *soa,
     for (int j = 0; j < W; j++) assert(len[j] <= padStart[j]);
     const __m128i fromv = _mm_set1_epi8((char)remapFrom);
     const __m128i tov   = _mm_set1_epi8((char)remapTo);
+    const __m128i padAv = _mm_set1_epi8((char)padA);
     const __m128i padBv = _mm_set1_epi8((char)padB);
     for (int kb = 0; kb < nrows; kb += 16) {
         const int kend = (kb + 16 < nrows) ? kb + 16 : nrows;
@@ -158,10 +192,10 @@ static inline void x86_soa_pack(uint8_t *soa,
             __m512i t[16];
             for (int j = 0; j < 16; j++) {
                 __m512i v = _mm512_castsi128_si512(
-                    x86_soa_piece16(seq[j], len[j], padStart[j], kb, padA, padB, remap, remapFrom, remapTo, fromv, tov, padBv));
-                v = _mm512_inserti32x4(v, x86_soa_piece16(seq[j + 16], len[j + 16], padStart[j + 16], kb, padA, padB, remap, remapFrom, remapTo, fromv, tov, padBv), 1);
-                v = _mm512_inserti32x4(v, x86_soa_piece16(seq[j + 32], len[j + 32], padStart[j + 32], kb, padA, padB, remap, remapFrom, remapTo, fromv, tov, padBv), 2);
-                v = _mm512_inserti32x4(v, x86_soa_piece16(seq[j + 48], len[j + 48], padStart[j + 48], kb, padA, padB, remap, remapFrom, remapTo, fromv, tov, padBv), 3);
+                    x86_soa_piece16(seq[j], len[j], padStart[j], kb, remap, fromv, tov, padAv, padBv));
+                v = _mm512_inserti32x4(v, x86_soa_piece16(seq[j + 16], len[j + 16], padStart[j + 16], kb, remap, fromv, tov, padAv, padBv), 1);
+                v = _mm512_inserti32x4(v, x86_soa_piece16(seq[j + 32], len[j + 32], padStart[j + 32], kb, remap, fromv, tov, padAv, padBv), 2);
+                v = _mm512_inserti32x4(v, x86_soa_piece16(seq[j + 48], len[j + 48], padStart[j + 48], kb, remap, fromv, tov, padAv, padBv), 3);
                 t[j] = v;
             }
             x86_transpose16x16_u8_x4(t);
@@ -173,8 +207,8 @@ static inline void x86_soa_pack(uint8_t *soa,
         {
             __m256i t[16];
             for (int j = 0; j < 16; j++) {
-                const __m128i lo = x86_soa_piece16(seq[j],      len[j],      padStart[j],      kb, padA, padB, remap, remapFrom, remapTo, fromv, tov, padBv);
-                const __m128i hi = x86_soa_piece16(seq[j + 16], len[j + 16], padStart[j + 16], kb, padA, padB, remap, remapFrom, remapTo, fromv, tov, padBv);
+                const __m128i lo = x86_soa_piece16(seq[j],      len[j],      padStart[j],      kb, remap, fromv, tov, padAv, padBv);
+                const __m128i hi = x86_soa_piece16(seq[j + 16], len[j + 16], padStart[j + 16], kb, remap, fromv, tov, padAv, padBv);
                 t[j] = _mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1);
             }
             x86_transpose16x16_u8_x2(t);
