@@ -15,7 +15,10 @@
  * PROOF OF BYTE-IDENTICAL OUTPUT: ksw_g2_wave  ==  ksw_global2_scalar
  *=============================================================================
  * Claim: for every feasible input with qlen>=1 and w >= |tlen-qlen|+3 (the
- * band-width floor guaranteed by every production caller, see bwa.cpp), the
+ * band-width floor bwa.cpp keeps for unequal lengths; for equal lengths it may
+ * also pass certified bands of 1 or 2, which never reach these kernels because
+ * the dispatcher enters them only at w >= their minimum widths, all >= 3, see the
+ * static_asserts in ksw.cpp), the
  * anti-diagonal SIMD kernel ksw_g2_wave (NEON/AVX2/AVX-512 -- same recurrence
  * and boundary logic, differing only in vector width and intrinsic spelling)
  * returns a score, n_cigar and cigar[] byte-identical to ksw_global2_scalar.
@@ -111,10 +114,13 @@
  * and ksw_global2_scalar produce identical (score, n_cigar, cigar[]) on every
  * feasible input, for all three arch variants.
  *
- * OUT OF SCOPE. Infeasible bands (w < |tlen-qlen|+3, where scalar may return
- * MINUS_INF or an incomplete band) are unreachable -- every production caller
- * enforces the w floor -- and are explicitly excluded; the kernels are only
- * asserted to differ, if at all, in that unreachable regime. qlen==0 is
+ * OUT OF SCOPE. Bands below the floor (w < |tlen-qlen|+3, where for unequal
+ * lengths scalar may return MINUS_INF or an incomplete band) never reach these
+ * kernels -- bwa.cpp keeps the floor for unequal lengths, and its equal-length
+ * certified bands below the floor (w of 1 or 2, which scalar handles exactly) are
+ * below every kernel's minimum width -- and are explicitly excluded; the kernels
+ * are only asserted to differ, if at all, in that unreachable regime. Certified
+ * bands of 3 or more meet the floor and are inside the claim. qlen==0 is
  * likewise excluded (no production call site passes an empty query); the
  * wavefront's qlen==0 score default is a formality, not a proven-equal case.
  *===========================================================================*/
@@ -267,7 +273,10 @@ static inline void ksw_wave_backtrack(const uint8_t*z,const int*zoff,const int*z
  *     steps of <=A each; gap steps are <=0; +A covers the trailing mm add).
  *   Most-negative reachable finite H/E/F >= -(L*B) - (o_max + e_max*(2w+2)) - B
  *     (L=min(qlen,tlen) diagonal penalty steps, plus an affine decay tail bounded
- *     by the 2w+1 in-band span of a row/column, plus one mm step of slack).
+ *     by the 2w+1 in-band span of a row/column, plus one mm step of slack). An
+ *     E/F value can carry a second gap open (a gap opened from an M reached
+ *     through an earlier gap); that o_max is absorbed by the + o_max term of
+ *     separation (1) below, so real values still clear the sentinel by SLACK.
  * Two separations then guarantee byte-identity: (1) real values stay clear of
  * the sentinel so it always loses max() exactly as int32 MINUS_INF does, and
  * (2) the sentinel's own decrement never underflows int16. A position guard

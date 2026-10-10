@@ -5501,7 +5501,8 @@ mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *
  * optimal alignment is provably gap-free and a zero band suffices. Emission (mem_reg2aln)
  * feeds that 0 to bwa_gen_cigar3, which then takes bwa.cpp's no-DP equal-length block and
  * emits a single <len>M with no ksw_global2 fill or traceback. This shortcut is what makes the
- * common ungapped case skip the banded DP; keep it. */
+ * common ungapped case skip the banded DP; keep it. (bwa_gen_cigar3 also reaches that block, for
+ * a non-zero band, when bwa_global_cert_band certifies a zero band; see bwa.cpp.) */
 static inline int infer_bw(int l1, int l2, int score, int a, int q, int r)
 {
     int w;

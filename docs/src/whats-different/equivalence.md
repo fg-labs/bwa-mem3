@@ -459,6 +459,26 @@ after a tie, at a small `-d`, and at `-w` below 2; it now matches the kernel acr
 (see [Correctness fixes](correctness.md#ungapped-fast-path-record-tie-break-and-z-drop-pr-544)
 for that scope).
 
+### Certified CIGAR band for equal-length regions (default, byte-identical)
+
+The global re-alignment in `bwa_gen_cigar3` (`ksw_global2` in a band) runs for each final
+region's CIGAR, and also, score only, when two nearby hits are tested for a merge. When the
+query and reference spans have equal length, it now first scores the ungapped alignment, which
+is itself a global alignment and so bounds the optimum from below. A gapped alignment of two
+equal-length sequences has as many inserted as deleted bases, so a path that strays `k` off the
+diagonal scores at most `amax*len - (o_ins + o_del) - k*(amax + e_ins + e_del)` (`amax` the
+largest matrix entry, which also covers the `--meth` matrices). Every band offset beyond the
+largest `k` that can still reach the ungapped score is therefore off every optimal path and
+every traceback tie, and `ksw_global2` runs at that certified band when it is narrower than the
+usual one, or the ungapped CIGAR is emitted with no DP when it is 0. This applies in every mode,
+`--compat` included. Score, CIGAR, `NM` and `MD` are unchanged for every input: regions of
+unequal length keep the usual band, and so does any scoring for which the bound does not hold
+(a negative gap open, or `amax + e_ins + e_del <= 0`). Only the `-v 4` debug trace differs: it
+prints the band actually used, and nothing for a region the certificate makes ungapped. On
+5M-pair slices (HG00096 WGS and HG00100 WES, hg38) the band cells of the pass drop from 22.2G
+to 10.8G (WGS) and from 9.4G to 2.5G (WES); these counts are deterministic and do not depend on
+the host or SIMD tier ([#575](https://github.com/fg-labs/bwa-mem3/pull/575)).
+
 ## What differs
 
 ### Additive SAM tags

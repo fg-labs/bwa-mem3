@@ -78,9 +78,11 @@ G2Result run_g2(Ksw2Fn fn, const TestPair &p, const int8_t *mat, int w,
     return r;
 }
 
-// The feasibility floor every production caller enforces (bwa.cpp): a band
-// narrower than this cannot connect the two ends and is out of scope for the
-// byte-identity claim, so every w we test is clamped up to it.
+// The feasibility floor of the byte-identity claim (src/ksw_global2_wave.h): a
+// band narrower than this cannot connect the two ends and is out of scope, so
+// every w we test is clamped up to it. bwa.cpp keeps it for unequal lengths;
+// for equal lengths its certified bands of 3 or more meet it, and those of 1
+// or 2 are below every kernel's minimum width, so they never reach the kernels.
 int band_floor(const TestPair &p) {
     const int d = std::abs(static_cast<int>(p.ref.size()) - static_cast<int>(p.qry.size()));
     return d + 3;

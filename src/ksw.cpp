@@ -688,6 +688,17 @@ extern "C" int ksw_g2_wave_wmin(void) {
 static thread_local KswWaveScratch g_ksw_wave_scratch;
 extern "C" unsigned long ksw_g2_wave_zr_capacity(void) { return (unsigned long)g_ksw_wave_scratch.zr.capacity(); }
 
+/* The wavefront kernels' proof needs w >= |tlen-qlen|+3. bwa_gen_cigar3 keeps that floor
+ * for unequal lengths; for equal lengths it may pass a narrower certified band
+ * (bwa_global_cert_band), down to 1. Certified bands >= 3 meet the floor; bands of 1 and 2
+ * must stay on the scalar path, which the minimum widths below guarantee. */
+#ifdef KSW_WAVE16_WMIN
+static_assert(KSW_WAVE16_WMIN >= 3, "the int16 wavefront kernel must not see w < 3");
+#endif
+#ifdef KSW_WAVE_WMIN
+static_assert(KSW_WAVE_WMIN >= 3, "the int32 wavefront kernel must not see w < 3");
+#endif
+
 /* Per-tier entry point. Routes to the byte-identical wavefront SIMD kernel when:
  *   - a CIGAR is requested (the only production call shape), and
  *   - the query is non-empty (qlen >= 1 — the proof excludes qlen == 0), and
@@ -695,8 +706,10 @@ extern "C" unsigned long ksw_g2_wave_zr_capacity(void) { return (unsigned long)g
  *   - the direction-byte store area fits int (ksw_g2_wave_area_ok — only a
  *     pathological multi-megabase region fails this), and
  *   - the band is wide enough that SIMD beats scalar on this arch (w >= WMIN).
- * Output is byte-identical for ANY w; the width gate is purely a throughput
- * choice (narrow bands are faster scalar — see the per-arch crossover). Anything
+ * Output is byte-identical for every w the kernels' proof covers (w >= |tlen-qlen|+3);
+ * above that floor the width gate is purely a throughput choice (narrow bands are
+ * faster scalar — see the per-arch crossover), and it also keeps equal-length certified
+ * bands below the floor (1 and 2) on the scalar path (static_asserts above). Anything
  * that misses a precondition (qlen == 0, an over-large region, tiers without a
  * wavefront kernel: sse41/sse42/avx) falls through to the scalar path, which is
  * the reference these kernels are proven identical to. */
