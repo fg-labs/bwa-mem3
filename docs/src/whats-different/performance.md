@@ -192,6 +192,18 @@ WGS and WES slices (150 bp paired, hg38) at the default scoring, `-A 2`, `-B 6` 
 | `BWA3_CHAIN_STATS=1` | Print, once at exit, how the chaining, Pass-3 and contained-seed-skip fast paths resolved (`[chain-stats] …`): reads indexed, reads that fell back, queries answered by bucket walks versus full scans, reads the flat chaining index handed to the B-tree (equal positions, or over the cap), and how the contained-seed extension skip resolved its deferred seeds (`contained_deferred`, of which `contained_purged` had their banded-SW skipped and `contained_extended` ran in the second batch). Measurement only; output is unchanged. |
 | `BWA3_CHAIN_FLAT_CAP=<n>` | Largest number of chains a read may have on the flat chaining index before it is replayed through the B-tree (default 512, bounding the index's O(n) sorted insert). `0` sends every read to the B-tree. A malformed or negative value is reported to stderr and the default used. Output is identical at every value. |
 
+## CIGAR generation
+
+- **Certified band for equal-length regions (PR #575).** The global re-alignment that builds
+  each final CIGAR runs, for regions whose query and reference spans have equal length, in a
+  band certified from the ungapped score, or skips the DP when that band is 0. Byte-identical
+  by construction; see [Equivalence](equivalence.md#certified-cigar-band-for-equal-length-regions-default-byte-identical)
+  for the argument. On 5M-pair WGS and WES slices (150 bp / 76 bp paired, hg38), whole-aligner
+  wall at `-t 16` dropped 2.3 % / 3.9 % on AWS Graviton 4 (arm64, NEON tier), 2.0 % / 3.8 % on
+  Graviton 3 (arm64, NEON tier) and 1.7 % / 2.1 % on AMD Zen 5 (x86-64, AVX-512BW tier), with
+  record md5 identical to the previous `main`, also under both `--compat` targets. The
+  timings were taken on an earlier revision of the PR whose generated hot code is unchanged.
+
 ## Mate rescue
 
 Byte-identical changes to mate rescue, the batched Smith-Waterman of a read's

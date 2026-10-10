@@ -317,6 +317,38 @@ void bwa_fill_scmat(int a, int b, int8_t mat[25])
     for (j = 0; j < 5; ++j) mat[k++] = -1;   // DEFAULT AMBIG
 }
 
+/* Certified band for the global alignment of two equal-length sequences. The ungapped
+ * alignment is one global alignment, so its score su bounds the optimum from below. A gapped
+ * global alignment of equal lengths has as many inserted bases as deleted ones, I >= 1 of
+ * each, and len - I aligned columns, so (with a gap of length L costing o + e*L) it scores at
+ * most amax*len - (o_ins + o_del) - I*(amax + e_ins + e_del), amax the matrix's largest entry.
+ * A path through a cell k off the diagonal has I >= k, so for amax + e_ins + e_del > 0 and
+ * non-negative gap opens every alignment through a cell more than kc off the diagonal scores
+ * strictly below su (kc = floor((amax*len - o_ins - o_del - su) / (amax + e_ins + e_del)),
+ * or 0 when the numerator is negative). So no optimal path at any band w >= kc uses such a
+ * cell. The traceback picks the same path at band kc as at w: the values the band-kc DP
+ * computes never exceed the band-w ones (it maximises over fewer paths); and every value the
+ * traceback compares that ties the winner, or is the winner, is reached by a prefix that the
+ * traced suffix completes into an alignment scoring at least the band-w optimum (>= su), so
+ * that prefix stays within kc and the value is the same at both bands. Every direction bit
+ * the traceback reads is therefore unchanged, and so are the score and the CIGAR. At
+ * kc == 0 the result is the ungapped alignment. Returns kc, or -1 when the bound does not
+ * apply (amax + e_ins + e_del <= 0, or a negative gap open). */
+int bwa_global_cert_band(const int8_t mat[25], int o_del, int e_del, int o_ins, int e_ins,
+                         int len, const uint8_t *query, const uint8_t *rseq)
+{
+    int amax = mat[0];
+    for (int k = 1; k < 25; ++k) amax = mat[k] > amax ? mat[k] : amax;
+    const int64_t slope = (int64_t) amax + e_ins + e_del;
+    if (slope <= 0 || o_ins < 0 || o_del < 0) return -1;
+    int64_t su = 0;
+    for (int k = 0; k < len; ++k) su += mat[rseq[k] * 5 + query[k]];
+    const int64_t num = (int64_t) amax * len - o_ins - o_del - su;
+    if (num < 0) return 0;
+    const int64_t kc = num / slope;
+    return kc > INT32_MAX ? INT32_MAX : (int) kc;
+}
+
 /* Generate CIGAR when the alignment end points are known.
  *
  * MD always lists every column whose bases differ literally (`query != rseq`),
@@ -360,40 +392,56 @@ uint32_t *bwa_gen_cigar3(const int8_t mat[25], int o_del, int e_del, int o_ins, 
         for (i = 0; i < rlen>>1; ++i)
             tmp = rseq[i], rseq[i] = rseq[rlen - 1 - i], rseq[rlen - 1 - i] = tmp;
     }
-    if (l_query == re - rb && w_ == 0) { // no gap; no need to do DP
-        // Reached routinely for provably-ungapped, equal-length alignments. mem_reg2aln()
-        // derives the emission band from infer_bw() (bwamem.cpp), which returns 0 whenever
-        // the score deficit is below the two-gap threshold -- i.e. no balanced indel could
-        // improve the score, so the optimal alignment is gap-free. A zero band lands here
-        // and emits the single <len>M CIGAR directly, with no ksw_global2 fill or traceback.
-        // (An earlier FIXME here claimed this block was unreachable; that was stale.)
-        if (n_cigar) {
-            cigar = (uint32_t*) malloc(4);
-            xassert(cigar != NULL, "out of memory: cigar");
-            cigar[0] = l_query<<4 | 0;
-            *n_cigar = 1;
+    /* No gap, so no DP: an equal-length region whose band is 0 (below), or one whose
+     * certified band is 0 (bwa_global_cert_band: every gapped path scores below the
+     * ungapped one). Braced so that the `goto ret_gen_cigar` above does not jump over the
+     * initialisation of its locals. */
+    {
+        int ungapped = (l_query == re - rb && w_ == 0);
+        int w = 0;
+        if (!ungapped) {
+            int max_gap, max_ins, max_del, min_w;
+            // set the band-width
+            max_ins = (int)((double)(((l_query+1)>>1) * mat[0] - o_ins) / e_ins + 1.);
+            max_del = (int)((double)(((l_query+1)>>1) * mat[0] - o_del) / e_del + 1.);
+            max_gap = max_ins > max_del? max_ins : max_del;
+            max_gap = max_gap > 1? max_gap : 1;
+            w = (max_gap + abs(rlen - l_query) + 1) >> 1;
+            w = w < w_? w : w_;
+            min_w = abs(rlen - l_query) + 3;
+            w = w > min_w? w : min_w;
+            if (rlen == l_query) {   // the certified band, when narrower: same score and CIGAR
+                const int kc = bwa_global_cert_band(mat, o_del, e_del, o_ins, e_ins, l_query, query, rseq);
+                if (kc == 0) ungapped = 1;
+                else if (kc > 0 && kc < w) w = kc;
+            }
         }
-        for (i = 0, *score = 0; i < l_query; ++i)
-            *score += mat[rseq[i]*5 + query[i]];
-    } else {
-        int w, max_gap, max_ins, max_del, min_w;
-        // set the band-width
-        max_ins = (int)((double)(((l_query+1)>>1) * mat[0] - o_ins) / e_ins + 1.);
-        max_del = (int)((double)(((l_query+1)>>1) * mat[0] - o_del) / e_del + 1.);
-        max_gap = max_ins > max_del? max_ins : max_del;
-        max_gap = max_gap > 1? max_gap : 1;
-        w = (max_gap + abs(rlen - l_query) + 1) >> 1;
-        w = w < w_? w : w_;
-        min_w = abs(rlen - l_query) + 3;
-        w = w > min_w? w : min_w;
-        // NW alignment
-        if (bwa_verbose >= 4) {
-            fprintf(stderr, "* Global bandwidth: %d\n", w);
-            fprintf(stderr, "* Global ref:   "); for (i = 0; i < rlen; ++i) fputc("ACGTN"[(int)rseq[i]], stderr); fputc('\n', stderr);
-            fprintf(stderr, "* Global query: "); for (i = 0; i < l_query; ++i) fputc("ACGTN"[(int)query[i]], stderr); fputc('\n', stderr);
+        if (ungapped) {
+            // Reached routinely for provably-ungapped, equal-length alignments. mem_reg2aln()
+            // derives the emission band from infer_bw() (bwamem.cpp), which returns 0 whenever
+            // the score deficit is below the two-gap threshold -- i.e. no balanced indel could
+            // improve the score, so the optimal alignment is gap-free. A zero band lands here
+            // and emits the single <len>M CIGAR directly, with no ksw_global2 fill or traceback.
+            // (An earlier FIXME here claimed this block was unreachable; that was stale.)
+            // bwa_global_cert_band's zero band lands here too, for the same reason.
+            if (n_cigar) {
+                cigar = (uint32_t*) malloc(4);
+                xassert(cigar != NULL, "out of memory: cigar");
+                cigar[0] = l_query<<4 | 0;
+                *n_cigar = 1;
+            }
+            for (i = 0, *score = 0; i < l_query; ++i)
+                *score += mat[rseq[i]*5 + query[i]];
+        } else {
+            // NW alignment
+            if (bwa_verbose >= 4) {
+                fprintf(stderr, "* Global bandwidth: %d\n", w);
+                fprintf(stderr, "* Global ref:   "); for (i = 0; i < rlen; ++i) fputc("ACGTN"[(int)rseq[i]], stderr); fputc('\n', stderr);
+                fprintf(stderr, "* Global query: "); for (i = 0; i < l_query; ++i) fputc("ACGTN"[(int)query[i]], stderr); fputc('\n', stderr);
+            }
+            *score = ksw_global2(l_query, query, rlen, rseq, 5, mat, o_del, e_del, o_ins, e_ins, w, n_cigar, &cigar);
         }
-        *score = ksw_global2(l_query, query, rlen, rseq, 5, mat, o_del, e_del, o_ins, e_ins, w, n_cigar, &cigar);
-    }
+    } // ungapped / NW block
     if (NM && n_cigar) {// compute NM and MD
         int k, x, y, u, n_mm = 0, n_gap = 0;
         str.l = str.m = *n_cigar * 4; str.s = (char*)cigar; // append MD to CIGAR
