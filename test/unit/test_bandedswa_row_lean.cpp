@@ -509,11 +509,10 @@ TEST_CASE("BSW8_ROW_LEAN: lean == original on directed band-edge pairs"
     for (const DirectedCase &c : kCases) check_directed(c);
 }
 
-// The two cases below compare against the original's ungated epilogue, which
-// runs the z-drop step on every row. On Apple silicon the original copy is the
-// Apple-gated epilogue instead, whose need_z gate assumes dif >= 0 just as an
-// ungated lean gate would, so there it is not a reference for these inputs.
-#if !defined(__APPLE__)
+// The two cases below need the original to run the z-drop step on every row for
+// these gap extends: on Linux its epilogue is ungated, and on Apple silicon its
+// epilogue gate steps aside for them (BSW8_ZDROP_GATE_EXACT), so on macOS they
+// also check that gate. test_bandedswa_zdrop_wrap.cpp pins the results.
 TEST_CASE("BSW8_ROW_LEAN: lean == original on pairs whose z-drop drift wraps int32"
           * doctest::test_suite("unit/bandedswa")) {
     // Pairs where |drift| * e wraps to a negative dif in the z-drop step, so the
@@ -547,7 +546,6 @@ TEST_CASE("BSW8_ROW_LEAN: lean == original on every field, random huge or negati
     // this case covers everything else such extends reach.
     check_mode(Mode::HugeExtend, 0x5EB8A19ull, 60);
 }
-#endif
 
 #else
 

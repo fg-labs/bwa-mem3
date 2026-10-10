@@ -909,7 +909,7 @@ jobs:
           MATRIX_USE_MIMALLOC: ${{ matrix.use_mimalloc }}
         run: |
           if ! grep -qw avx512bw /proc/cpuinfo; then
-            echo "SKIP: runner has no AVX-512BW; the kswv unit tests did not run at the avx512bw tier"
+            echo "SKIP: runner has no AVX-512BW; the kswv, lane-compaction and z-drop gate unit tests did not run at the avx512bw tier"
             exit 0
           fi
           rm -rf "$RUNNER_TEMP/avx512bw"
@@ -927,6 +927,9 @@ jobs:
           # unexercised.
           BWA_REQUIRE_COMPACTION_TIER=avx512bw \
             "$RUNNER_TEMP/avx512bw/test/bwa_mem3_tests_unit" -tc='lane compaction*'
+          # The AVX-512BW 8-bit kernel's epilogue skip (and its compaction
+          # driver's) must step aside for gap extends whose z-drop drift wraps.
+          "$RUNNER_TEMP/avx512bw/test/bwa_mem3_tests_unit" -tc='8-bit extension z-drop gates*'
 
       - name: Makefile header-dependency check
         # Runs after the build because it inspects an already-built tree; on an

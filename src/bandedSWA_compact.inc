@@ -133,8 +133,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8Compact(SeqPair *pairArray,
     /* column -1 deletion seed H_v[i+1] = subs_epu8 chain h0 - o_del - (i+1)*e_del, with the
      * byte-cast o_del / e_del the plain wrapper's set1_epi8 uses: closed form of the chain. */
     const int o_del8 = (uint8_t) (int8_t) this->o_del, e_del8 = (uint8_t) (int8_t) this->e_del;
-    const bool zgate_exact = this->e_del >= 0 && this->e_del <= INT32_MAX / (4 * MAX_SEQ_LEN8) &&
-                             this->e_ins >= 0 && this->e_ins <= INT32_MAX / (4 * MAX_SEQ_LEN8);
+    const bool zgate_exact = BSW8_ZDROP_GATE_EXACT(this->e_del, this->e_ins);
     const __m128i zgate128 = _mm_set1_epi8((int8_t) (zdrop < 255 ? zdrop : 255));
     /* band-edge write: byte penalties, as the seed row's set1_epi8 / subs_epu8 uses them */
     const int oe_ins8 = (uint8_t) (this->o_ins + this->e_ins), e_ins8 = (uint8_t) this->e_ins;
