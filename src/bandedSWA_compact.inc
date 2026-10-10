@@ -33,6 +33,12 @@
 
 static_assert(SIMD_WIDTH8 == 16, "bandedSWA_compact.inc: Bsw8CVec and bsw8c_lane_mask hold 16 lanes");
 
+#if BSW8_SKEW
+#define BSW8C_ROW_INLINE __attribute__((always_inline))   /* see the row lambda */
+#else
+#define BSW8C_ROW_INLINE
+#endif
+
 namespace {
 struct alignas(64) Bsw8CVec {
     uint8_t head[16], tail[16], maxend[16], exit0[16], maxScore[16], y[16], max_off[16], h0[16], myband[16];
@@ -210,8 +216,11 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8Compact(SeqPair *pairArray,
             active[v] = 1;
         }
 
-        /* ---- one row of one group: the lean row of smithWaterman128_8 ---- */
-        auto row = [&](Bsw8CVec &V, const int i) -> uint32_t {
+        /* ---- one row of one group: the lean row of smithWaterman128_8 ----
+         * BSW8C_ROW_INLINE: with the pipelined cell loops (BSW8_SKEW) clang 19 otherwise
+         * outlines this lambda, and the pipelined driver then measured 2-3% slower than the
+         * plain one on real batches instead of 6% faster. */
+        auto row = [&](Bsw8CVec &V, const int i) BSW8C_ROW_INLINE -> uint32_t {
             int8_t *H_h = V.H, *F = V.F;
             const uint8_t *seq2SoA = V.seq2;
             const int minq = V.minq, vncol = V.ncol;

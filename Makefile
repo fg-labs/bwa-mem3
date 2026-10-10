@@ -886,9 +886,9 @@ src/bandedSWA.native.o: src/bandedSWA.cpp
 	$(CXX) -c $(BASE_CXXFLAGS) -march=native $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
 
 # Test-only second copy of bandedSWA.cpp (aarch64 only), linked into the unit
-# binary next to libbwa.a's copy: BSW8_ROW_LEAN flipped, symbols renamed with a
-# _rowalt suffix. See BSW8_ROW_LEAN in src/bandedSWA.cpp. Built here with the
-# libbwa.a object's compile line plus the two -D flags (test/Makefile's
+# binary next to libbwa.a's copy: BSW8_ROW_LEAN and BSW8_SKEW flipped, symbols
+# renamed with a _rowalt suffix. See BSW8_ROW_LEAN in src/bandedSWA.cpp. Built
+# here with the libbwa.a object's compile line plus the two -D flags (test/Makefile's
 # standalone path is the exception, noted there). Never linked into bwa-mem3.
 ifneq ($(IS_ARM),)
 ROWALT_KERNEL_OBJ := src/bandedSWA.rowalt.o

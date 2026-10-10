@@ -9,12 +9,12 @@
 //
 // Kernel copies checked: on x86 every tier the CPU supports (sse41, sse42, avx,
 // avx2, avx512bw; the ones it lacks are reported); on aarch64 NEON with both
-// BSW8_ROW_LEAN settings (libbwa.a and src/bandedSWA.rowalt.o; the second with
-// lane compaction off, since the compaction driver runs the same lean row in
-// both copies). The tiers with same-row lane compaction in getScores8 (NEON,
-// avx2, avx512bw) are checked three ways: as shipped (the tier's default setting),
-// with compaction off, and compacting every band in superblocks of three
-// groups.
+// BSW8_ROW_LEAN / BSW8_SKEW settings (libbwa.a and src/bandedSWA.rowalt.o; the
+// second with lane compaction off, and compacting every band, which runs the
+// driver's lean row with that copy's DP column loops). The tiers with same-row
+// lane compaction in getScores8 (NEON, avx2, avx512bw) are checked three ways: as
+// shipped (the tier's default setting), with compaction off, and compacting every
+// band in superblocks of three groups.
 //
 //   1. The regression guard: directed pairs that were coupled to their group in
 //      the old kernels (found by fuzzing them; among them the 16-bit corner
@@ -108,7 +108,9 @@ std::vector<Kernel> host_kernels()
     ks.push_back({"neon", make_with<make_lib_raw>});
     ks.push_back({"neon (lane compaction off)", make_compact<make_lib_raw, 0, 0>});
     ks.push_back({"neon (lane compaction, 3 groups, every band)", make_compact<make_lib_raw, 3, 0>});
-    ks.push_back({"neon (other BSW8_ROW_LEAN setting)", make_compact<make_bsw_kernel_rowalt, 0, 0>});
+    ks.push_back({"neon (other BSW8_ROW_LEAN / BSW8_SKEW setting)", make_compact<make_bsw_kernel_rowalt, 0, 0>});
+    ks.push_back({"neon (other BSW8_SKEW setting, lane compaction, 3 groups, every band)",
+                  make_compact<make_bsw_kernel_rowalt, 3, 0>});
 #elif defined(__x86_64__) || defined(__i386__)
     __builtin_cpu_init();
     std::string skipped;

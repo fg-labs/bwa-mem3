@@ -20,7 +20,7 @@
 #if defined(__aarch64__)
 /* Defined by src/bandedSWA.rowalt.o (bandedSWA.cpp compiled with
  * -DKERNEL_VARIANT=_rowalt -DBSW8_ROW_LEAN_INVERT=1), which the aarch64 unit
- * binary links: the kernel built with the other BSW8_ROW_LEAN setting. */
+ * binary links: the kernel built with the other BSW8_ROW_LEAN and BSW8_SKEW settings. */
 extern "C" IBandedPairWiseSW *make_bsw_kernel_rowalt(int, int, int, int, int, int,
                                                      const int8_t *, int8_t, int8_t, int);
 #endif

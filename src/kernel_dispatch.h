@@ -82,6 +82,8 @@
     * so test/unit/test_bandedswa_row_lean.cpp (which declares it) can tell its
     * two aarch64 copies apart. */
 #  define bsw8_row_lean_enabled BWAMEM3_PASTE(bsw8_row_lean_enabled, KERNEL_VARIANT)
+   /* Test-only, likewise: the BSW8_SKEW setting of a bandedSWA.cpp copy. */
+#  define bsw8_skew_enabled BWAMEM3_PASTE(bsw8_skew_enabled, KERNEL_VARIANT)
 #  define make_kswv_kernel   BWAMEM3_PASTE(make_kswv_kernel,   KERNEL_VARIANT)
    /* Mat-aware 10-arg factory (issue 173): mangles to
     * make_kswv_kernel<VARIANT>_mat (e.g. make_kswv_kernel_avx2_mat) so the
