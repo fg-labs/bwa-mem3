@@ -12,14 +12,14 @@ shared-memory index, mimalloc allocator) maintained by [Fulcrum Genomics](https:
 
 ## Performance
 
-Wall-clock speedup of the current release (v0.14.0\*) against `bwa` 0.7.19, `bwa-mem2` v2.2.1, and `minibwa`, on the `wgs-5M` sample. Cells are `stock / --fast`.
+Wall-clock speedup of the current release (v0.14.1\*) against `bwa` 0.7.19, `bwa-mem2` v2.2.1, and `minibwa`, on the `wgs-5M` sample. Cells are `stock / --fast`.
 
 | arch | wall_s | vs bwa | vs bwa-mem2 | vs minibwa |
 |---|---:|---:|---:|---:|
-| ARM | 42.23 / 18.08 | 5.69x / 13.30x | — | 0.96x / 2.24x |
-| x86 | 24.15 / 13.07 | 8.07x / 14.91x | 3.52x / 6.51x | 1.26x / 2.32x |
+| ARM | 35.86 / 16.59 | 6.78x / 14.65x | — | 1.14x / 2.46x |
+| x86 | 22.63 / 13.07 | 8.66x / 15.00x | 3.77x / 6.53x | 1.34x / 2.32x |
 
-\* v0.14.0, like v0.13.0, is measured with a **denser suffix-array index** — stride 2 instead of the stock stride 8 — built with `bwa-mem3 re-sa -u 1` (or staged with `bwa-mem3 shm -u 1`), both new in v0.13.0. Output is byte-identical by construction (each added suffix-array sample is computed from the on-disk ones), and measured so: a full-content `fgumi compare bams` of `wgs-5M` (10,030,558 records) aligned on the stride-2 index against the stock stride-8 index — v0.13.0 against the output-identical v0.12.0 — found 0 differences on both benchmark hosts, Graviton4 m8g (NEON) and AMD m8a (AVX-512), and the change that added it ([#510](https://github.com/fg-labs/bwa-mem3/pull/510)) found 0 differences on 5M-pair hg38 WGS and WES slices. It costs ~12 GB more memory for the human genome. Both v0.13.0 and v0.14.0 are measured on it in the tables below, so v0.14.0's `vs prev` is a like-for-like comparison. Every older release and every comparator uses the stock index.
+\* v0.14.1, like v0.13.0 and v0.14.0, is measured with a **denser suffix-array index** — stride 2 instead of the stock stride 8 — built with `bwa-mem3 re-sa -u 1` (or staged with `bwa-mem3 shm -u 1`), both new in v0.13.0. Output is byte-identical by construction (each added suffix-array sample is computed from the on-disk ones), and measured so: a full-content `fgumi compare bams` of `wgs-5M` (10,030,558 records) aligned on the stride-2 index against the stock stride-8 index — v0.13.0 against the output-identical v0.12.0 — found 0 differences on both benchmark hosts, Graviton4 m8g (NEON) and AMD m8a (AVX-512), and the change that added it ([#510](https://github.com/fg-labs/bwa-mem3/pull/510)) found 0 differences on 5M-pair hg38 WGS and WES slices. It costs ~12 GB more memory for the human genome. v0.13.0, v0.14.0 and v0.14.1 are all measured on it in the tables below, so v0.14.1's `vs prev` is a like-for-like comparison. Every older release and every comparator uses the stock index.
 
 > [!TIP]
 > **📈 Full release-history table** — every bwa-mem3 release since v0.2.1, full methodology, and version pins.
@@ -31,49 +31,51 @@ Wall-clock speedup of the current release (v0.14.0\*) against `bwa` 0.7.19, `bwa
 >
 > | release | wall_s | vs bwa | vs bwa-mem2 | vs minibwa | vs prev |
 > |---|---:|---:|---:|---:|---:|
-> | bwa | 240.38 | 1.00x | — | 0.17x | — |
+> | bwa | 243.12 | 1.00x | — | 0.17x | — |
 > | bwa-mem2 | — | — | — | — | — |
-> | minibwa | 40.59 | 5.92x | — | 1.00x | — |
-> | v0.2.1 | 120.54 | 1.99x | — | 0.34x | — |
-> | v0.2.2 | 122.73 | 1.96x | — | 0.33x | 0.982x |
-> | v0.3.0 | 102.11 | 2.35x | — | 0.40x | 1.202x |
-> | v0.4.0 | 104.14 | 2.31x | — | 0.39x | 0.980x |
-> | v0.5.0 | 104.47 / 37.23 | 2.30x / 6.46x | — | 0.39x / 1.09x | 0.997x |
-> | v0.6.0 | 97.69 / 36.59 | 2.46x / 6.57x | — | 0.42x / 1.11x | 1.069x / 1.017x |
-> | v0.7.0 | 92.06 / 39.78 | 2.61x / 6.04x | — | 0.44x / 1.02x | 1.061x / 0.920x |
-> | v0.8.0 | 76.34 / 28.33 | 3.15x / 8.48x | — | 0.53x / 1.43x | 1.206x / 1.404x |
-> | v0.9.0 | 76.65 / 28.34 | 3.14x / 8.48x | — | 0.53x / 1.43x | 0.996x / 1.000x |
-> | v0.10.0 | 71.11 / 27.80 | 3.38x / 8.65x | — | 0.57x / 1.46x | 1.078x / 1.020x |
-> | v0.11.0 | 64.32 / 26.30 | 3.74x / 9.14x | — | 0.63x / 1.54x | 1.106x / 1.057x |
-> | v0.12.0 | 58.68 / 19.22 | 4.10x / 12.51x | — | 0.69x / 2.11x | 1.096x / 1.369x |
-> | v0.13.0\* | 55.02 / 18.73 | 4.37x / 12.84x | — | 0.74x / 2.17x | 1.066x / 1.026x |
-> | **v0.14.0**\* | **42.23 / 18.08** | **5.69x / 13.30x** | **—** | **0.96x / 2.24x** | **1.303x / 1.036x** |
+> | minibwa | 40.74 | 5.97x | — | 1.00x | — |
+> | v0.2.1 | 122.77 | 1.98x | — | 0.33x | — |
+> | v0.2.2 | 118.86 | 2.05x | — | 0.34x | 1.033x |
+> | v0.3.0 | 105.48 | 2.30x | — | 0.39x | 1.127x |
+> | v0.4.0 | 104.88 | 2.32x | — | 0.39x | 1.006x |
+> | v0.5.0 | 104.86 / 37.67 | 2.32x / 6.45x | — | 0.39x / 1.08x | 1.000x |
+> | v0.6.0 | 98.10 / 37.13 | 2.48x / 6.55x | — | 0.42x / 1.10x | 1.069x / 1.015x |
+> | v0.7.0 | 92.25 / 40.23 | 2.64x / 6.04x | — | 0.44x / 1.01x | 1.063x / 0.923x |
+> | v0.8.0 | 76.52 / 28.32 | 3.18x / 8.59x | — | 0.53x / 1.44x | 1.206x / 1.421x |
+> | v0.9.0 | 76.80 / 28.36 | 3.17x / 8.57x | — | 0.53x / 1.44x | 0.996x / 0.998x |
+> | v0.10.0 | 71.43 / 27.83 | 3.40x / 8.74x | — | 0.57x / 1.46x | 1.075x / 1.019x |
+> | v0.11.0 | 64.68 / 26.30 | 3.76x / 9.24x | — | 0.63x / 1.55x | 1.104x / 1.058x |
+> | v0.12.0 | 59.01 / 19.74 | 4.12x / 12.31x | — | 0.69x / 2.06x | 1.096x / 1.332x |
+> | v0.13.0\* | 55.17 / 18.70 | 4.41x / 13.00x | — | 0.74x / 2.18x | 1.070x / 1.055x |
+> | v0.14.0\* | 43.46 / 18.10 | 5.59x / 13.43x | — | 0.94x / 2.25x | 1.269x / 1.033x |
+> | **v0.14.1**\* | **35.86 / 16.59** | **6.78x / 14.65x** | **—** | **1.14x / 2.46x** | **1.212x / 1.091x** |
 >
 > **AMD (m8a, x86-64/AVX-512)**
 >
 > | release | wall_s | vs bwa | vs bwa-mem2 | vs minibwa | vs prev |
 > |---|---:|---:|---:|---:|---:|
-> | bwa | 194.94 | 1.00x | 0.44x | 0.16x | — |
-> | bwa-mem2 | 85.04 | 2.29x | 1.00x | 0.36x | — |
-> | minibwa | 30.36 | 6.42x | 2.80x | 1.00x | — |
-> | v0.2.1 | 56.63 | 3.44x | 1.50x | 0.54x | 1.502x |
-> | v0.2.2 | 53.06 | 3.67x | 1.60x | 0.57x | 1.067x |
-> | v0.3.0 | 51.30 | 3.80x | 1.66x | 0.59x | 1.034x |
-> | v0.4.0 | 51.49 | 3.79x | 1.65x | 0.59x | 0.996x |
-> | v0.5.0 | 51.44 / 22.84 | 3.79x / 8.53x | 1.65x / 3.72x | 0.59x / 1.33x | 1.001x |
-> | v0.6.0 | 50.03 / 22.34 | 3.90x / 8.73x | 1.70x / 3.81x | 0.61x / 1.36x | 1.028x / 1.023x |
-> | v0.7.0 | 48.34 / 22.31 | 4.03x / 8.74x | 1.76x / 3.81x | 0.63x / 1.36x | 1.035x / 1.001x |
-> | v0.8.0 | 43.37 / 18.69 | 4.49x / 10.43x | 1.96x / 4.55x | 0.70x / 1.62x | 1.115x / 1.194x |
-> | v0.9.0 | 43.29 / 18.17 | 4.50x / 10.73x | 1.96x / 4.68x | 0.70x / 1.67x | 1.002x / 1.028x |
-> | v0.10.0 | 42.82 / 18.16 | 4.55x / 10.73x | 1.99x / 4.68x | 0.71x / 1.67x | 1.011x / 1.001x |
-> | v0.11.0 | 41.77 / 17.64 | 4.67x / 11.05x | 2.04x / 4.82x | 0.73x / 1.72x | 1.025x / 1.030x |
-> | v0.12.0 | 32.59 / 14.64 | 5.98x / 13.31x | 2.61x / 5.81x | 0.93x / 2.07x | 1.282x / 1.205x |
-> | v0.13.0\* | 29.83 / 13.65 | 6.54x / 14.28x | 2.85x / 6.23x | 1.02x / 2.22x | 1.093x / 1.073x |
-> | **v0.14.0**\* | **24.15 / 13.07** | **8.07x / 14.91x** | **3.52x / 6.51x** | **1.26x / 2.32x** | **1.235x / 1.045x** |
+> | bwa | 196.03 | 1.00x | 0.44x | 0.15x | — |
+> | bwa-mem2 | 85.33 | 2.30x | 1.00x | 0.36x | — |
+> | minibwa | 30.38 | 6.45x | 2.81x | 1.00x | — |
+> | v0.2.1 | 56.35 | 3.48x | 1.51x | 0.54x | 1.514x |
+> | v0.2.2 | 55.53 | 3.53x | 1.54x | 0.55x | 1.015x |
+> | v0.3.0 | 52.92 | 3.70x | 1.61x | 0.57x | 1.049x |
+> | v0.4.0 | 52.01 | 3.77x | 1.64x | 0.58x | 1.018x |
+> | v0.5.0 | 51.74 / 22.33 | 3.79x / 8.78x | 1.65x / 3.82x | 0.59x / 1.36x | 1.005x |
+> | v0.6.0 | 50.20 / 22.33 | 3.91x / 8.78x | 1.70x / 3.82x | 0.61x / 1.36x | 1.031x / 1.000x |
+> | v0.7.0 | 48.73 / 22.32 | 4.02x / 8.78x | 1.75x / 3.82x | 0.62x / 1.36x | 1.030x / 1.000x |
+> | v0.8.0 | 43.40 / 18.67 | 4.52x / 10.50x | 1.97x / 4.57x | 0.70x / 1.63x | 1.123x / 1.196x |
+> | v0.9.0 | 43.37 / 18.18 | 4.52x / 10.78x | 1.97x / 4.69x | 0.70x / 1.67x | 1.001x / 1.027x |
+> | v0.10.0 | 43.33 / 18.17 | 4.52x / 10.79x | 1.97x / 4.69x | 0.70x / 1.67x | 1.001x / 1.000x |
+> | v0.11.0 | 41.82 / 17.66 | 4.69x / 11.10x | 2.04x / 4.83x | 0.73x / 1.72x | 1.036x / 1.029x |
+> | v0.12.0 | 33.09 / 14.64 | 5.92x / 13.39x | 2.58x / 5.83x | 0.92x / 2.08x | 1.264x / 1.207x |
+> | v0.13.0\* | 30.61 / 14.18 | 6.40x / 13.83x | 2.79x / 6.02x | 0.99x / 2.14x | 1.081x / 1.032x |
+> | v0.14.0\* | 26.66 / 13.07 | 7.35x / 15.00x | 3.20x / 6.53x | 1.14x / 2.32x | 1.148x / 1.085x |
+> | **v0.14.1**\* | **22.63 / 13.07** | **8.66x / 15.00x** | **3.77x / 6.53x** | **1.34x / 2.32x** | **1.178x / 1.000x** |
 >
 > `vs prev` is the release-over-release speedup (`prev_wall / this_wall`, `>1` = faster) vs the previous release on this same host, `stock / --fast`. The first release's predecessor is upstream `bwa-mem2` — bwa-mem3 is its successor — so v0.2.1's `vs prev` is its speedup over bwa-mem2 (blank on ARM, where upstream has no build).
 >
-> Version pins: `bwa` 0.7.19 · `bwa-mem2` v2.2.1 · `minibwa` commit [`d6d9f87d`](https://github.com/lh3/minibwa) (`minibwa-0.7`). "ARM" = Graviton4 m8g (arm64/NEON, no SMT); "x86" = AMD m8a (x86-64/AVX-512, no SMT). Both are the general-purpose siblings of the c8g/c8a hosts used through v0.12.0 — same CPU family, same core count, no SMT, but 4 GiB/vCPU instead of 2 so every historical arm fits in memory — so absolute times are not comparable with earlier versions of this table, only ratios within it. (The x86 arm replaced an earlier Intel c7i arm, which ran 16 vCPUs over 8 physical cores under 2-way SMT and so wasn't a real core-for-core match for Graviton's 16 real cores.) No ARM `bwa-mem2` build exists, hence the blank cells there. Every arm for a given arch ran interleaved on one fixed on-demand host — 3 reps each, median wall-clock shown — so these are same-host comparisons, not medians pooled across separate runs. `—` means the release predates the comparator or predates `--fast`. \* v0.13.0 and v0.14.0 rows use the stride-2 suffix-array index described above; all other rows use the stock stride-8 index. Regenerated at each release; see [Benchmarks](https://bwa-mem3.readthedocs.io/en/latest/performance/benchmarks.html).
+> Version pins: `bwa` 0.7.19 · `bwa-mem2` v2.2.1 · `minibwa` commit [`d6d9f87d`](https://github.com/lh3/minibwa) (`minibwa-0.7`). "ARM" = Graviton4 m8g (arm64/NEON, no SMT); "x86" = AMD m8a (x86-64/AVX-512, no SMT). Both are the general-purpose siblings of the c8g/c8a hosts used through v0.12.0 — same CPU family, same core count, no SMT, but 4 GiB/vCPU instead of 2 so every historical arm fits in memory — so absolute times are not comparable with earlier versions of this table, only ratios within it. (The x86 arm replaced an earlier Intel c7i arm, which ran 16 vCPUs over 8 physical cores under 2-way SMT and so wasn't a real core-for-core match for Graviton's 16 real cores.) No ARM `bwa-mem2` build exists, hence the blank cells there. Every arm for a given arch ran interleaved on one fixed on-demand host — 3 reps each, median wall-clock shown — so these are same-host comparisons, not medians pooled across separate runs. `—` means the release predates the comparator or predates `--fast`. \* v0.13.0, v0.14.0 and v0.14.1 rows use the stride-2 suffix-array index described above; all other rows use the stock stride-8 index. Regenerated at each release; see [Benchmarks](https://bwa-mem3.readthedocs.io/en/latest/performance/benchmarks.html).
 >
 > </details>
 
