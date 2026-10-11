@@ -991,8 +991,10 @@ static inline mem_alnreg_t *alnreg_save_buf(int n)
 
 /* Emit `static void fn(int n, mem_alnreg_t *a)` that sorts `a` exactly as
  * ks_introsort(name, n, a) would, but via pdqsort_##name whenever `lt` sees no
- * tie. `lt` must be the comparator KSORT_INIT and PDQSORT_INIT were given.
- * Used for the dedup sorts below and the primary-marking sorts. */
+ * tie. `lt` must be the comparator KSORT_INIT was given, and pdqsort_##name's
+ * comparator must define the same strict order (it may be a branch-free
+ * spelling of it, as for the primary-marking sorts). Used for the dedup sorts
+ * below and the primary-marking sorts. */
 #define DEDUP_TIE_SORT_INIT(fn, name, lt)                                        \
     static void fn(int n, mem_alnreg_t *a)                                       \
     {                                                                            \
@@ -1066,8 +1068,17 @@ typedef struct { int score; int64_t rb; int qb; uint32_t idx; } dedup_pair_sc;
                             ((a).rb < (b).rb || ((a).rb == (b).rb && (a).qb < (b).qb))))
 KSORT_INIT(dedup_pre, dedup_pair_re, dedup_pre_lt)
 KSORT_INIT(dedup_psc, dedup_pair_sc, dedup_psc_lt)
-PDQSORT_INIT(dedup_pre, dedup_pair_re, dedup_pre_lt)
-PDQSORT_INIT(dedup_psc, dedup_pair_sc, dedup_psc_lt)
+/* Every pdqsort of these pairs is followed by the tie scan in
+ * dedup_pre_finish / dedup_psc_finish, which keeps the result only when it is
+ * tie-free (hence unique) and otherwise re-sorts with the introsort, so the
+ * branchless partition is output-identical here. dedup_psc_lt_bf is
+ * dedup_psc_lt without short-circuits; the tie scan uses dedup_psc_lt, so if
+ * the two ever disagreed the scan would see an out-of-order pair as a tie and
+ * fall back to the introsort rather than keep a wrong order. */
+#define dedup_psc_lt_bf(a, b) (((a).score > (b).score) | (((a).score == (b).score) & \
+                               (((a).rb < (b).rb) | (((a).rb == (b).rb) & ((a).qb < (b).qb)))))
+PDQSORT_BRANCHLESS_INIT(dedup_pre, dedup_pair_re, dedup_pre_lt)
+PDQSORT_BRANCHLESS_INIT(dedup_psc, dedup_pair_sc, dedup_psc_lt_bf)
 
 /* Below this the pair indirection costs more than the 112-byte moves it saves,
  * and the in-place path pays no save-copy there anyway (< DEDUP_SORT_PDQ_MIN). */
@@ -1432,8 +1443,19 @@ KSORT_INIT(mem_ars_hash2, mem_alnreg_t, alnreg_hlt2)
  * the dedup sorts, since pdqsort wins nothing there; above it the whole-array
  * ks_introsort of 112-byte records is replaced by pdqsort plus the save-copy
  * and tie scan the scheme pays. */
-PDQSORT_INIT(mem_ars_hash,  mem_alnreg_t, alnreg_hlt)
-PDQSORT_INIT(mem_ars_hash2, mem_alnreg_t, alnreg_hlt2)
+/* These pdqsorts back DEDUP_TIE_SORT_INIT only, which keeps the pdqsort result
+ * only when it has no tied adjacent pair (the order is then unique) and
+ * otherwise restores the input and runs the introsort. So the partition
+ * scheme cannot change the output, and the branchless one is used, with the
+ * same orders written without short-circuits. The tie check uses the original
+ * alnreg_hlt / alnreg_hlt2, so a drifted _bf order would fall back to the
+ * introsort rather than survive. */
+#define alnreg_hlt_bf(a, b)  (((a).score > (b).score) | (((a).score == (b).score) & \
+                              (((a).is_alt < (b).is_alt) | (((a).is_alt == (b).is_alt) & ((a).hash < (b).hash)))))
+#define alnreg_hlt2_bf(a, b) (((a).is_alt < (b).is_alt) | (((a).is_alt == (b).is_alt) & \
+                              (((a).score > (b).score) | (((a).score == (b).score) & ((a).hash < (b).hash)))))
+PDQSORT_BRANCHLESS_INIT(mem_ars_hash,  mem_alnreg_t, alnreg_hlt_bf)
+PDQSORT_BRANCHLESS_INIT(mem_ars_hash2, mem_alnreg_t, alnreg_hlt2_bf)
 DEDUP_TIE_SORT_INIT(primary_sort_by_hash,     mem_ars_hash,  alnreg_hlt)
 DEDUP_TIE_SORT_INIT(primary_sort_by_hash_alt, mem_ars_hash2, alnreg_hlt2)
 
@@ -1442,6 +1464,19 @@ DEDUP_TIE_SORT_INIT(primary_sort_by_hash_alt, mem_ars_hash2, alnreg_hlt2)
 void bwamem3_primary_sort_by_hash(int n, mem_alnreg_t *a)               { primary_sort_by_hash(n, a); }
 void bwamem3_primary_sort_by_hash_exact(int n, mem_alnreg_t *a)         { ks_introsort(mem_ars_hash, n, a); }
 void bwamem3_primary_sort_by_hash_alt(int n, mem_alnreg_t *a)           { primary_sort_by_hash_alt(n, a); }
+/* Exposed for test/unit/test_alnreg_sort_dedup.cpp: 1 if each branch-free
+ * comparator the pdqsorts use agrees with its short-circuit twin on (a, b).
+ * A drifted twin would not change output (the tie scans use the originals and
+ * fall back to the introsort), only silently lose the fast path. */
+int bwamem3_sort_cmp_twins_agree(const mem_alnreg_t *a, const mem_alnreg_t *b)
+{
+    dedup_pair_sc pa, pb;
+    pa.score = a->score; pa.rb = a->rb; pa.qb = a->qb; pa.idx = 0;
+    pb.score = b->score; pb.rb = b->rb; pb.qb = b->qb; pb.idx = 1;
+    return (!!alnreg_hlt(*a, *b) == !!alnreg_hlt_bf(*a, *b)) &&
+           (!!alnreg_hlt2(*a, *b) == !!alnreg_hlt2_bf(*a, *b)) &&
+           (!!dedup_psc_lt(pa, pb) == !!dedup_psc_lt_bf(pa, pb));
+}
 void bwamem3_primary_sort_by_hash_alt_exact(int n, mem_alnreg_t *a)     { ks_introsort(mem_ars_hash2, n, a); }
 
 #if MATE_SORT

@@ -512,6 +512,41 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    /* Case 11w: many more reads than slots, at several widths. The flush pass
+     * finds the slot holding the next read to emit as input mod N, which relies
+     * on slot recycling keeping input i in slot i mod N. 150 windows of mixed
+     * length over the phiX start (so reads retire out of input order, and the
+     * input number wraps past 64) at a small width, the shipped default and
+     * the maximum. */
+    {
+        enum { NR = 150, MAXL = 44 };
+        const char *src =
+            "GAGTTTTATCGCTTCCATGACGCAGAAGTTAACACTTTCGGATATTTCTGATGAGTCGAAAA"
+            "ATTATCTTGATAAAGCAGGAATTACTACTGCTTGTTTACGAATTAAATCGAAGTGGACTGCT";
+        static char buf[NR][MAXL + 1];
+        const char *reads[NR];
+        for (int i = 0; i < NR; i++) {
+            const int len = 24 + (i * 7) % (MAXL - 23);   /* 24..44 */
+            const int off = (i * 13) % (122 - MAXL);       /* window stays in src */
+            memcpy(buf[i], src + off, len);
+            buf[i][len] = '\0';
+            reads[i] = buf[i];
+        }
+        uint8_t *enc_qdb; bseq1_t *seq_; int32_t *cum_len;
+        encode_reads(reads, NR, &enc_qdb, &seq_, &cum_len);
+        const int32_t saved_n = g_bwtseed_lockstep_n;
+        const int32_t widths[] = {3, BWTSEED_LOCKSTEP_N, BWTSEED_LOCKSTEP_N_MAX};
+        for (const int32_t w : widths) {
+            char name[96];
+            snprintf(name, sizeof name, "Case 11w: %d reads > N = %d, slot recycle", (int)NR, (int)w);
+            g_bwtseed_lockstep_n = w;
+            run_case(fmi, name, NR, MAXL, /*minSeed=*/10, /*max_intv=*/5,
+                     enc_qdb, seq_, cum_len, /*expect_min_seeds=*/NR);
+        }
+        g_bwtseed_lockstep_n = saved_n;
+        free(enc_qdb); free(seq_); free(cum_len);
+    }
+
     /* Case 12p: phiX subsequence with mid-read N — combines real matches
      * (so seeds get emitted) with the non-ACGT outer-x advancement path
      * (so the seek-past-N branch in bsd_advance_step gets exercised on

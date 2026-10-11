@@ -120,3 +120,20 @@ TEST_CASE("pdqsort_128 is a no-op on empty and single-element inputs"
     CHECK(one[0].x == 42u);
     CHECK(one[0].y == 7u);
 }
+
+TEST_CASE("pair64_lt_bf agrees with pair64_lt"
+          * doctest::test_suite("unit/pair64_sort")) {
+    // pdqsort_128's branch-free comparator must be the same order as the
+    // short-circuit one the strict-order check uses. Tiny ranges plus extremes
+    // take every equal-x branch.
+    const uint64_t vals[] = {0, 1, 2, 0x7fffffffffffffffULL, 0xffffffffffffffffULL};
+    int n = 0;
+    for (const uint64_t ax : vals) for (const uint64_t ay : vals)
+        for (const uint64_t bx : vals) for (const uint64_t by : vals) {
+            pair64_t a, b;
+            a.x = ax; a.y = ay; b.x = bx; b.y = by;
+            CHECK(!!pair64_lt(a, b) == !!pair64_lt_bf(a, b));
+            ++n;
+        }
+    CHECK(n == 625);
+}

@@ -927,7 +927,7 @@ int mem_pair(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, cons
      * test/unit/test_pair64_sort.cpp. The strict-order check after each sort
      * turns a future key change that breaks distinctness into a hard failure
      * instead of a silently different pairing on ties. */
-    if (v.n > 1) pdqsort_128(v.n, v.a);  // v.a is null when no candidates were pushed; PDQSORT_INIT forms a + n, UB on a null pointer
+    if (v.n > 1) pdqsort_128(v.n, v.a);  // v.a is null when no candidates were pushed; pdqsort_128 forms a + n, UB on a null pointer
     xassert(pair64_strictly_sorted(v.n, v.a), "mem_pair: candidate keys must be pairwise distinct");
     y[0] = y[1] = y[2] = y[3] = -1;
     for (i = 0; i < v.n; ++i) {
