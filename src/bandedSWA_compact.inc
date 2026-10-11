@@ -219,6 +219,9 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8Compact(SeqPair *pairArray,
          * BSW8C_ROW_INLINE: with the pipelined cell loops (BSW8_SKEW) clang 19 otherwise
          * outlines this lambda, and the pipelined driver then measured 2-3% slower than the
          * plain one on real batches instead of 6% faster. */
+        /* the row's cell loops record the narrowing offsets (BSW8_NF_TRACK in bandedSWA.cpp) */
+#undef BSW8_NF_TRACK
+#define BSW8_NF_TRACK(hs_, fs_, pj_) BSW8_NF_TRACK_ON(hs_, fs_, pj_)
         auto row = [&](Bsw8CVec &V, const int i) BSW8C_ROW_INLINE -> uint32_t {
             int8_t *H_h = V.H, *F = V.F;
             const uint8_t *seq2SoA = V.seq2;
@@ -311,6 +314,8 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8Compact(SeqPair *pairArray,
             }
 
             j128 = _mm_set1_epi8(beg - i);
+            __m128i nf_seen128 = zero128, nf_acc128 = zero128;   // see BSW8_NF_TRACK
+            __m128i nf_last128 = _mm_set1_epi8(beg - 1 - i);
             int fast_lo = beg, fast_hi = beg;
             if (all_lanes_set8(exit0)) {
                 fast_lo = i + hmax_epi8(head128);
@@ -334,6 +339,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8Compact(SeqPair *pairArray,
                 h10 = blendv_fullmask8(h10, zero128, cmp1);
                 _mm_store_si128((__m128i *)(H_h + j * SIMD_WIDTH8), h10);
                 _mm_store_si128((__m128i *)(F + j * SIMD_WIDTH8), zero128);
+                BSW8_NF_END(h10, j128)   // j128 == end - i here
             }
 
             /* BSW8_GSCORE_NARROW (smithWaterman128_8) folds into these, by name */
@@ -417,26 +423,11 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8Compact(SeqPair *pairArray,
                 }
             }
             /* as in smithWaterman128_8: with no band columns maxRS1 stays 0 and the row returned above */
-            xassert(beg < end, "lane compaction: empty band reached the narrowing pass");
-            {   /* narrowing, one counted pass (BSW8_ROW_LEAN) */
-                const __m128i big128 = _mm_set1_epi8(127);
-                __m128i off128   = _mm_set1_epi8(beg - i);
-                __m128i first128 = _mm_set1_epi8(end - i);
-                __m128i last128  = _mm_set1_epi8(beg - 1 - i);
-                for (int l = beg; l < end; l++) {
-                    __m128i vv = _mm_or_si128(_mm_load_si128((__m128i *)(F + l * SIMD_WIDTH8)),
-                                              _mm_load_si128((__m128i *)(H_h + l * SIMD_WIDTH8)));
-                    __m128i nz = vreinterpretq_m128i_u8(vtstq_u8(vreinterpretq_u8_m128i(vv), vreinterpretq_u8_m128i(vv)));
-                    first128 = _mm_min_epi8(first128, blendv_fullmask8(big128, off128, nz));
-                    last128  = blendv_fullmask8(last128, off128, nz);
-                    off128   = _mm_add_epi8(off128, one128);
-                }
-                {
-                    __m128i vv = _mm_or_si128(_mm_load_si128((__m128i *)(F + end * SIMD_WIDTH8)),
-                                              _mm_load_si128((__m128i *)(H_h + end * SIMD_WIDTH8)));
-                    __m128i nz = vreinterpretq_m128i_u8(vtstq_u8(vreinterpretq_u8_m128i(vv), vreinterpretq_u8_m128i(vv)));
-                    last128 = blendv_fullmask8(last128, off128, nz);
-                }
+            xassert(beg < end, "lane compaction: empty band reached the narrowing");
+            {   /* narrowing (BSW8_ROW_LEAN): first / last nonzero column per lane, recorded by the
+                 * cell loops (BSW8_NF_TRACK) */
+                const __m128i first128 = _mm_add_epi8(_mm_set1_epi8(end - i), nf_acc128);
+                const __m128i last128  = nf_last128;
                 const int minfirst = hmin_epi8(first128);
                 if (minfirst > beg - i) V.nbeg = i + minfirst - 1;
                 const int l = i + hmax_epi8(last128);
@@ -465,6 +456,8 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8Compact(SeqPair *pairArray,
             _mm_store_si128((__m128i *) V.max_off, max_off128);
             return bsw8c_lane_mask(exit0);
         };
+#undef BSW8_NF_TRACK
+#define BSW8_NF_TRACK(hs_, fs_, pj_) BSW8_NF_TRACK_OFF(hs_, fs_, pj_)   /* off again */
 
         /* ---- move live lanes of one group into dead slots of another, between rows (next
          * row r) ----
