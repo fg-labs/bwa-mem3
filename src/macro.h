@@ -53,6 +53,29 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #  endif
 #endif
 
+/* Keep a data-dependent select branch-free.
+ *
+ * BWA_UNPREDICTABLE(cond) marks a condition as unpredictable, so the compiler
+ * keeps the ?: it guards a conditional move instead of converting it back to a
+ * jump. It expands to __builtin_unpredictable where the compiler has it (clang)
+ * and to the bare expression otherwise; it never changes the result.
+ *
+ * BWA_OPAQUE(v) is an empty asm that makes integer variable v opaque to the
+ * optimizer, for selects written as mask arithmetic that clang still turns back
+ * into a branch even under BWA_UNPREDICTABLE: the compiler can no longer see
+ * that the mask is 0 or ~0, so the AND/OR select stays arithmetic. It emits no
+ * instructions. GNU asm syntax: gcc and clang, the compilers this tree builds
+ * with. */
+#if defined(__has_builtin)
+#  if __has_builtin(__builtin_unpredictable)
+#    define BWA_UNPREDICTABLE(x) __builtin_unpredictable(x)
+#  endif
+#endif
+#ifndef BWA_UNPREDICTABLE
+#  define BWA_UNPREDICTABLE(x) (x)
+#endif
+#define BWA_OPAQUE(v) __asm__("" : "+r"(v))
+
 /* Note: BSW-specific macros are in src/bandedSWA.h file */
 
 #define H0_ -99

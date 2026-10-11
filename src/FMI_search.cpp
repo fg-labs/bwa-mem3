@@ -1182,34 +1182,36 @@ void FMI_search::ls_prefetch_cp_occ(const BatchSlot *s)
  * Target the interval the lookahead slot will actually read next, which
  * differs by phase:
  *
- *   PH_FWD: smem is live and the next forward step consumes it, so warm all
- *           four of its checkpoint blocks (k, l, k+s, l+s).
- *
  *   PH_BWD: ls_advance_backward_step runs entirely out of prev[] and NEVER
  *           rewrites smem, so smem here is the STALE leftover from the end of
- *           the forward phase -- warming it prefetches lines the backward walk
- *           will not touch. The next backward step instead calls backwardExt on
- *           each live prev[p], reading cp_occ[prev[p].k] and cp_occ[prev[p].k +
- *           prev[p].s]. Aim the lookahead at those. This keeps the N/2-ahead L2
- *           memory-level parallelism (the part that was actually hiding DRAM
- *           latency) but points it at blocks that are really read. Pure hint,
- *           so output is unchanged. */
+ *           the forward phase. The next backward step calls backwardExt on
+ *           prev[0] first, reading cp_occ[prev[0].k] and
+ *           cp_occ[prev[0].k + prev[0].s]; warm those two blocks.
+ *   otherwise: warm smem.l and smem.l + smem.s, the blocks the next forward
+ *           step reads for its sp/ep.
+ *
+ * The lookahead slot's phase is effectively random from step to step, so a
+ * phase test (and a loop over prev[]) mispredicts heavily. Instead the two
+ * prefetches are always issued, with the interval chosen by mask selects. Only
+ * the two blocks the next step reads first are warmed; warming more (all of
+ * smem's blocks, or every live prev[p]) needs the branches back and measured
+ * slower.
+ * For PH_DONE / PH_BWD_INIT slots smem holds a stale but in-range interval
+ * (zeros for a never-used slot), so the prefetch is merely wasted. prev[0] is
+ * only dereferenced when phase == PH_BWD, where numPrev >= 1 holds. Pure hint,
+ * so output is unchanged. */
 void FMI_search::ls_prefetch_cp_occ_t1(const BatchSlot *s)
 {
 #ifdef ENABLE_PREFETCH
-    if (s->phase == PH_BWD) {
-        const int32_t np = s->numPrev;
-        for (int32_t p = 0; p < np; p++) {
-            const SMEM m = s->prev[p];
-            _mm_prefetch((const char *)(&cp_occ[(m.k) >> CP_SHIFT]), _MM_HINT_T1);
-            _mm_prefetch((const char *)(&cp_occ[(m.k + m.s) >> CP_SHIFT]), _MM_HINT_T1);
-        }
-    } else {
-        _mm_prefetch((const char *)(&cp_occ[(s->smem.k) >> CP_SHIFT]), _MM_HINT_T1);
-        _mm_prefetch((const char *)(&cp_occ[(s->smem.l) >> CP_SHIFT]), _MM_HINT_T1);
-        _mm_prefetch((const char *)(&cp_occ[(s->smem.k + s->smem.s) >> CP_SHIFT]), _MM_HINT_T1);
-        _mm_prefetch((const char *)(&cp_occ[(s->smem.l + s->smem.s) >> CP_SHIFT]), _MM_HINT_T1);
-    }
+    /* Written as ?: (even with BWA_UNPREDICTABLE) clang still emitted a branch
+     * on the phase test, so the select is mask arithmetic behind BWA_OPAQUE
+     * (macro.h). Checked branch-free with clang 19 on x86-64 and arm64. */
+    uint64_t mask = (uint64_t)0 - (uint64_t)(s->phase == PH_BWD);
+    BWA_OPAQUE(mask);
+    const SMEM *m = (const SMEM *)(((uintptr_t)s->prev & mask) | ((uintptr_t)&s->smem & ~mask));
+    const int64_t lo = (int64_t)(((uint64_t)m->k & mask) | ((uint64_t)m->l & ~mask));
+    _mm_prefetch((const char *)(&cp_occ[(lo) >> CP_SHIFT]), _MM_HINT_T1);
+    _mm_prefetch((const char *)(&cp_occ[(lo + m->s) >> CP_SHIFT]), _MM_HINT_T1);
 #else
     (void)s;
 #endif
@@ -1861,9 +1863,7 @@ void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
             // replaces the division. Byte-identical.
             int32_t s_la = s + (N >> 1);
             if (s_la >= N) s_la -= N;
-            if (slots[s_la].phase == PH_FWD || slots[s_la].phase == PH_BWD) {
-                ls_prefetch_cp_occ_t1(&slots[s_la]);
-            }
+            ls_prefetch_cp_occ_t1(&slots[s_la]);
         }
 
         // --- Flush pass: in-order emit + slot recycle. ---
