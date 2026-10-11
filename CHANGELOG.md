@@ -1,5 +1,43 @@
 # Changelog
 
+## [0.14.1](https://github.com/fg-labs/bwa-mem3/compare/v0.14.0...v0.14.1) (2026-10-11)
+
+
+### Bug Fixes
+
+* discover an external `time` command from the path ([#560](https://github.com/fg-labs/bwa-mem3/issues/560)) ([51cb47d](https://github.com/fg-labs/bwa-mem3/commit/51cb47d12fc0bc54d90edb3d020b3251f162d471))
+* **extension:** keep the 8-bit z-drop gates exact at huge gap extends ([#579](https://github.com/fg-labs/bwa-mem3/issues/579)) ([f34c1a4](https://github.com/fg-labs/bwa-mem3/commit/f34c1a4aa01d00393956ce054a1a623dd8660c41))
+* **extension:** make banded-SW results independent of the SIMD lane group ([#565](https://github.com/fg-labs/bwa-mem3/issues/565)) ([10bd8c2](https://github.com/fg-labs/bwa-mem3/commit/10bd8c2e23811f18e04ba9e1d162c9a7df09e5dd))
+
+
+### Performance
+
+* **cigar:** certify a narrower CIGAR band for unequal-length regions ([#580](https://github.com/fg-labs/bwa-mem3/issues/580)) ([0af2d66](https://github.com/fg-labs/bwa-mem3/commit/0af2d66faed0661b213ab63df1d6d9e11310406c))
+* **cigar:** run equal-length CIGAR alignments in a certified band ([#575](https://github.com/fg-labs/bwa-mem3/issues/575)) ([9e92470](https://github.com/fg-labs/bwa-mem3/commit/9e92470ad3b58a1c3ab819e17708227536bbbda3))
+* **extension:** batch the AVX-512BW lane-compaction moves ([#569](https://github.com/fg-labs/bwa-mem3/issues/569)) ([eb13d46](https://github.com/fg-labs/bwa-mem3/commit/eb13d469e7b803982ab6cadd4c230e5a6ef9a1ca))
+* **extension:** batch the NEON lane-compaction moves a column at a time ([#568](https://github.com/fg-labs/bwa-mem3/issues/568)) ([c4bb950](https://github.com/fg-labs/bwa-mem3/commit/c4bb95059d8f9280a780778b3d80bbfcab05f223))
+* **extension:** build the SoA pack's boundary tile with vector loads ([#581](https://github.com/fg-labs/bwa-mem3/issues/581)) ([68b48ca](https://github.com/fg-labs/bwa-mem3/commit/68b48ca0fb131e96647afbe48cf2e5595cbbd93e))
+* **extension:** compact finished lanes out of the 8-bit extension kernel ([#566](https://github.com/fg-labs/bwa-mem3/issues/566)) ([56cf542](https://github.com/fg-labs/bwa-mem3/commit/56cf5420fc2391778f43545a349dee94ecfaa13c))
+* **extension:** compact finished lanes out of the AVX2 8-bit extension kernel ([#567](https://github.com/fg-labs/bwa-mem3/issues/567)) ([87f02ef](https://github.com/fg-labs/bwa-mem3/commit/87f02efdf19a44b91eaac64bba5ee64a40f86763))
+* **extension:** cut the per-row overhead of the NEON 8-bit extension kernel ([#564](https://github.com/fg-labs/bwa-mem3/issues/564)) ([3e8c512](https://github.com/fg-labs/bwa-mem3/commit/3e8c512d67fb74431d78710e6319450ef4c7127f))
+* **extension:** record the band narrowing in the NEON 8-bit cell loops ([#582](https://github.com/fg-labs/bwa-mem3/issues/582)) ([1edb724](https://github.com/fg-labs/bwa-mem3/commit/1edb724972f1fde0ae64c62f0fec62d08d3d36e2))
+* **extension:** reverse the left extension windows 16 bytes at a time on NEON ([#574](https://github.com/fg-labs/bwa-mem3/issues/574)) ([d66b3a2](https://github.com/fg-labs/bwa-mem3/commit/d66b3a2849b4eb97fd6def12e5828c47dfdea861))
+* **extension:** software-pipeline the NEON 8-bit extension column loops ([#573](https://github.com/fg-labs/bwa-mem3/issues/573)) ([48256a8](https://github.com/fg-labs/bwa-mem3/commit/48256a846dee9059e0b86baaafd8a48ab26b1a7c))
+* **kswv:** software-pipeline the NEON u8 FScan two-row sweep ([#562](https://github.com/fg-labs/bwa-mem3/issues/562)) ([2ef8e00](https://github.com/fg-labs/bwa-mem3/commit/2ef8e004eff3730b7cac84ffbedc134895e162de))
+* **pair:** branch-free mate-rescue orientation check on x86 ([#571](https://github.com/fg-labs/bwa-mem3/issues/571)) ([bd07ed3](https://github.com/fg-labs/bwa-mem3/commit/bd07ed38f343227aa9a74505c5ff1dcdab2334ce))
+* **rescue:** band more pass-0 rescue jobs on NEON (cost gate 85 -&gt; 100) ([#572](https://github.com/fg-labs/bwa-mem3/issues/572)) ([8196707](https://github.com/fg-labs/bwa-mem3/commit/819670707342420a1f81d5adc44afbb919c09a8f))
+* **rescue:** software-pipeline the NEON two-row band kernel ([#561](https://github.com/fg-labs/bwa-mem3/issues/561)) ([bab1352](https://github.com/fg-labs/bwa-mem3/commit/bab1352874d6e311422054a22c8764d428882353))
+
+
+### Refactoring
+
+* **extension:** let the compiler vectorize the reversed left-window copy ([#576](https://github.com/fg-labs/bwa-mem3/issues/576)) ([e9c866b](https://github.com/fg-labs/bwa-mem3/commit/e9c866b1f0df516e1cc341858403c532ea821f79))
+
+
+### Documentation
+
+* **readme:** update performance tables for v0.14.0 ([#557](https://github.com/fg-labs/bwa-mem3/issues/557)) ([9d962a9](https://github.com/fg-labs/bwa-mem3/commit/9d962a9df37aa21f728e1683eaf28767cafe3963))
+
 ## [0.14.0](https://github.com/fg-labs/bwa-mem3/compare/v0.13.0...v0.14.0) (2026-10-03)
 
 
