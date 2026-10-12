@@ -2,8 +2,11 @@
  * Both functions are given identical inputs; outputs (matchArray bytes,
  * numTotalSmem, query_pos_array write-back) must be byte-identical.
  *
- * Usage: smem_lockstep_parity_test <bwa-mem3 index prefix>
+ * Usage: smem_lockstep_parity_test <reference FASTA that is also the index prefix>
  *   e.g. smem_lockstep_parity_test /path/to/hg38.fa
+ * Cases 13 and 14 read the reference sequence from that FASTA; an unreadable
+ * (or, for Case 14, too short) FASTA fails them rather than skipping, so the
+ * real-match and slot-recycle coverage cannot be lost silently.
  */
 
 #include <assert.h>
@@ -654,11 +657,12 @@ int main(int argc, char *argv[]) {
         int32_t ref_len = 0;
         char *ref = read_fasta_seq(argv[1], &ref_len);
         if (!ref) {
-            /* argv[1] was a bare index prefix, not a readable FASTA — skip
-             * rather than fail (CI passes fixtures/phix.fa, so coverage is
-             * real there). Do NOT count it as a passed case. */
-            fprintf(stderr, "[SKIP] Case 13: could not read reference FASTA '%s' "
-                    "(backward-path parity coverage skipped)\n", argv[1]);
+            /* argv[1] must be a readable FASTA (CI passes fixtures/phix.fa).
+             * Count the case as failed rather than skipping it, so the
+             * backward-path coverage cannot drop out unnoticed. */
+            total_cases++;
+            fprintf(stderr, "[FAIL] Case 13: could not read reference FASTA '%s' "
+                    "(backward-path parity coverage needs it)\n", argv[1]);
         } else {
             const int32_t rl = 60;               /* > minSeedLen (19) */
             const int32_t want = 6;
@@ -673,7 +677,8 @@ int main(int argc, char *argv[]) {
                 bufs[numReads++] = b;
             }
             if (numReads == 0) {
-                fprintf(stderr, "[SKIP] Case 13: reference too short for any read\n");
+                total_cases++;
+                fprintf(stderr, "[FAIL] Case 13: reference too short for any read\n");
             } else {
                 const char *reads[6];
                 int32_t qpa[6], mia[6], rid[6];
@@ -713,7 +718,9 @@ int main(int argc, char *argv[]) {
         const int32_t rl = 60;
         const int32_t step = 73;   /* 69 * 73 + 60 = 5097 <= phiX's 5386 bp */
         if (!ref) {
-            fprintf(stderr, "[SKIP] Case 13z: could not read reference FASTA '%s'\n", argv[1]);
+            /* As for Case 13: a missing reference fails the case. */
+            total_cases++;
+            fprintf(stderr, "[FAIL] Case 13z: could not read reference FASTA '%s'\n", argv[1]);
         } else if ((NZ - 1) * step + rl > ref_len || zen5_n >= NZ) {
             fprintf(stderr, "[FAIL] Case 13z: reference too short (%d bp) or width %d "
                     "leaves no recycle with %d reads\n", ref_len, zen5_n, (int)NZ);
@@ -747,6 +754,56 @@ int main(int argc, char *argv[]) {
             for (int32_t i = 0; i < NZ; i++) free(bufs[i]);
             free(ref);
         }
+    }
+
+    /* Case 14: many more reads than slots, with real matches, at several widths.
+     * The flush pass finds the slot holding the next read to emit as input
+     * mod N, which relies on slot recycling keeping input i in slot i mod N.
+     * Cases 1-13 never recycle (numReads <= the width) and Case 13z recycles
+     * only at one width with uniform reads, so this drives 150 reads of mixed
+     * lengths and pivots -- they retire out of input order -- at a small width,
+     * the shipped default and the maximum. */
+    {
+        int32_t ref_len = 0;
+        char *ref = read_fasta_seq(argv[1], &ref_len);
+        if (!ref || ref_len < 200) {
+            /* As for Case 13: a missing or short reference fails the case. */
+            total_cases++;
+            fprintf(stderr, "[FAIL] Case 14: could not read a reference FASTA of at least "
+                    "200 bases from '%s' (slot-recycle parity coverage needs it)\n", argv[1]);
+        } else {
+            enum { NR = 150, MAXL = 90 };
+            char *bufs[NR];
+            const char *reads[NR];
+            int32_t qpa[NR], mia[NR], rid[NR];
+            for (int32_t i = 0; i < NR; i++) {
+                const int32_t len = 30 + (i * 7) % (MAXL - 29);           /* 30..90 */
+                const int32_t off = (int32_t)(((int64_t)i * 977) % (ref_len - MAXL));
+                bufs[i] = (char *)malloc(len + 1);
+                memcpy(bufs[i], ref + off, len);
+                bufs[i][len] = '\0';
+                if (i % 11 == 5) bufs[i][len / 3] = 'N';                   /* early stop */
+                reads[i] = bufs[i];
+                qpa[i] = (i % 3 == 0) ? len - 1 : (i % 3 == 1) ? len / 2 : 0;
+                mia[i] = 1;
+                rid[i] = i;
+            }
+            uint8_t *enc_qdb; bseq1_t *seq_; int32_t *cum_len;
+            encode_reads(reads, NR, &enc_qdb, &seq_, &cum_len);
+            const int32_t saved_n = g_smem_lockstep_n;
+            const int32_t widths[] = {3, SMEM_LOCKSTEP_N, SMEM_LOCKSTEP_N_MAX};
+            for (const int32_t w : widths) {
+                char name[96];
+                snprintf(name, sizeof name, "Case 14: %d reads > N = %d, slot recycle", (int)NR, (int)w);
+                g_smem_lockstep_n = w;
+                run_case(fmi, name, NR, MAXL, 19,
+                         enc_qdb, qpa, mia, rid, seq_, cum_len);
+            }
+            g_smem_lockstep_n = saved_n;
+            free(enc_qdb); free(seq_); free(cum_len);
+            for (int32_t i = 0; i < NR; i++) free(bufs[i]);
+        }
+        free(ref);
     }
 
     fprintf(stderr, "%d / %d cases passed\n", passed_cases, total_cases);

@@ -123,8 +123,11 @@ extern "C" {
 	 * and the two produce the same array (see mem_pair, which guards the
 	 * distinctness with pair64_strictly_sorted after each sort). */
 	void pdqsort_128(size_t n, pair64_t *a);
-	/* The (x, y) order both sorts use. */
+	/* The (x, y) order both sorts use, and the same order without
+	 * short-circuits for pdqsort_128's branchless partition (keep the two in
+	 * step; test/unit/test_pair64_sort.cpp checks they agree). */
 #define pair64_lt(a, b) ((a).x < (b).x || ((a).x == (b).x && (a).y < (b).y))
+#define pair64_lt_bf(a, b) (((a).x < (b).x) | (((a).x == (b).x) & ((a).y < (b).y)))
 	/* 1 if every adjacent pair of a sorted array is strictly ordered, i.e. the
 	 * keys were pairwise distinct and the sorted order is unique. */
 	static inline int pair64_strictly_sorted(size_t n, const pair64_t *a)

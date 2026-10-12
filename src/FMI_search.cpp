@@ -1831,6 +1831,7 @@ void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
 
     int32_t next_input   = initial;
     int32_t flush_cursor = 0;
+    int32_t flush_slot   = 0;   // slot holding input flush_cursor (see the flush pass)
     int64_t numTotalSmem = *__numTotalSmem;
 
     while (flush_cursor < numReads) {
@@ -1869,31 +1870,31 @@ void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
         }
 
         // --- Flush pass: in-order emit + slot recycle. ---
-        bool progress = true;
-        while (progress) {
-            progress = false;
-            for (int32_t s = 0; s < N; s++) {
-                if (slots[s].phase == PH_DONE &&
-                    slots[s].ready &&
-                    slots[s].input_idx == flush_cursor) {
-                    for (int32_t m = 0; m < slots[s].match_count; m++) {
-                        matchArray[numTotalSmem++] = slots[s].match_buf[m];
-                    }
-                    query_pos_array[slots[s].input_idx] = slots[s].next_x;
-                    flush_cursor++;
+        // Input i always lives in slot i mod N: slot s is seeded with input s,
+        // and while inputs remain the live window [flush_cursor, next_input) is
+        // exactly N wide, so the slot freed by input k is refilled with input
+        // k + N. So the slot holding input `flush_cursor` is a counter that
+        // wraps at N, instead of a scan of every slot. The emit order and the
+        // slot each new input lands in match the scan.
+        while (flush_cursor < numReads) {
+            const int32_t s = flush_slot;
+            if (!(slots[s].phase == PH_DONE && slots[s].ready)) break;
+            for (int32_t m = 0; m < slots[s].match_count; m++) {
+                matchArray[numTotalSmem++] = slots[s].match_buf[m];
+            }
+            query_pos_array[slots[s].input_idx] = slots[s].next_x;
+            flush_cursor++;
+            if (++flush_slot == N) flush_slot = 0;
 
-                    if (next_input < numReads) {
-                        ls_init_slot(&slots[s], next_input,
-                                     query_pos_array, min_intv_array,
-                                     rid_array, seq_, query_cum_len_ar, enc_qdb);
-                        if (slots[s].phase == PH_FWD) ls_prefetch_cp_occ(&slots[s]);
-                        next_input++;
-                    } else {
-                        slots[s].input_idx = -1;  // retired
-                        slots[s].ready = false;
-                    }
-                    progress = true;
-                }
+            if (next_input < numReads) {
+                ls_init_slot(&slots[s], next_input,
+                             query_pos_array, min_intv_array,
+                             rid_array, seq_, query_cum_len_ar, enc_qdb);
+                if (slots[s].phase == PH_FWD) ls_prefetch_cp_occ(&slots[s]);
+                next_input++;
+            } else {
+                slots[s].input_idx = -1;  // retired
+                slots[s].ready = false;
             }
         }
     }
@@ -2072,6 +2073,7 @@ int64_t FMI_search::bwtSeedStrategyAllPosOneThread_lockstep(uint8_t *enc_qdb,
 
     int32_t next_input   = initial;
     int32_t flush_cursor = 0;
+    int32_t flush_slot   = 0;   // slot holding input flush_cursor (see the flush pass)
     int64_t numTotalSeed = 0;
 
     while (flush_cursor < numReads) {
@@ -2089,31 +2091,27 @@ int64_t FMI_search::bwtSeedStrategyAllPosOneThread_lockstep(uint8_t *enc_qdb,
         }
 
         // Flush pass: emit retired slots in input order; recycle into the
-        // next pending read. Loop until no progress so a chain of newly
-        // retired slots at the cursor flushes in one pass.
-        bool progress = true;
-        while (progress) {
-            progress = false;
-            for (int32_t s = 0; s < N; s++) {
-                if (slots[s].phase == BSD_DONE &&
-                    slots[s].ready &&
-                    slots[s].input_idx == flush_cursor) {
-                    for (int32_t m = 0; m < slots[s].match_count; m++) {
-                        matchArray[numTotalSeed++] = slots[s].match_buf[m];
-                    }
-                    flush_cursor++;
+        // next pending read. As in the SMEM driver, input i always lives in
+        // slot i mod N (slot s is seeded with input s, and the slot freed by
+        // input k is refilled with input k + N), so the slot holding input
+        // `flush_cursor` is a counter that wraps at N instead of a scan.
+        while (flush_cursor < numReads) {
+            const int32_t s = flush_slot;
+            if (!(slots[s].phase == BSD_DONE && slots[s].ready)) break;
+            for (int32_t m = 0; m < slots[s].match_count; m++) {
+                matchArray[numTotalSeed++] = slots[s].match_buf[m];
+            }
+            flush_cursor++;
+            if (++flush_slot == N) flush_slot = 0;
 
-                    if (next_input < numReads) {
-                        bsd_init_slot(&slots[s], next_input,
-                                      max_intv_array, seq_, query_cum_len_ar, enc_qdb);
-                        if (slots[s].phase == BSD_FWD) bsd_prefetch_cp_occ(&slots[s]);
-                        next_input++;
-                    } else {
-                        slots[s].input_idx = -1;
-                        slots[s].ready     = false;
-                    }
-                    progress = true;
-                }
+            if (next_input < numReads) {
+                bsd_init_slot(&slots[s], next_input,
+                              max_intv_array, seq_, query_cum_len_ar, enc_qdb);
+                if (slots[s].phase == BSD_FWD) bsd_prefetch_cp_occ(&slots[s]);
+                next_input++;
+            } else {
+                slots[s].input_idx = -1;
+                slots[s].ready     = false;
             }
         }
     }

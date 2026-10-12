@@ -273,6 +273,47 @@ Zen 5 (x86-64, AVX-512BW tier) −2.5 ± 0.4% WGS and −4.1 ± 0.5% WES; the sa
 at the AVX2 tier −1.6 ± 0.3% WGS; AWS Graviton 4 (arm64, NEON tier) −0.3 ± 0.1%
 WGS and −0.35 ± 0.13% WES.
 
+## Lockstep flush and unique-result sorts ([PR #586](https://github.com/fg-labs/bwa-mem3/pull/586))
+
+Two byte-identical changes on top of [PR #584](#hot-data-dependent-branches-pr-584):
+
+- **Lockstep flush.** Both lockstep seeding drivers (SMEM and the bwtSeed
+  strategy) emit finished reads in input order. They found the slot holding the
+  next read to emit by scanning every slot until none made progress. Input `i`
+  always lives in slot `i mod N` (slot `s` is seeded with input `s`, and the slot
+  freed by input `k` is refilled with input `k + N`), so that slot is now a
+  counter that wraps at the lockstep width `N`. The emit order and slot reuse are
+  unchanged.
+- **Branchless partition for unique-result sorts.** Five sort functions use
+  pdqsort's branchless (block) partition, which permutes equal elements
+  differently from the default one: the mate-pair key sort (used for both the
+  candidate and the proper-pair keys, which are asserted pairwise distinct), and
+  the two dedup pair sorts and two hash sorts, each of which already keeps its
+  result only when it has no tie and otherwise re-sorts with the klib introsort.
+  So the sorted output cannot depend on the partition.
+
+Output was verified identical (record md5, non-`@PG`) to the previous commit on the
+5M-pair WGS and WES slices, also under both `--compat` targets, on AMD Zen 5
+(x86-64) at the AVX-512BW tier, and on AWS Graviton 4 (arm64, NEON tier; WGS also
+under both `--compat` targets, WES default). On the WGS slice on AMD Zen 5
+(x86-64) it also matched at the AVX-512BW tier with the flat chaining index off
+(`BWA3_CHAIN_FLAT_CAP=0`) and at SMEM and BWT-seed lockstep widths 3 and 64, and
+at the forced AVX2 tier with default settings. Whole-aligner wall at `-t 16`, clang 19.1.7, mean
+paired difference of interleaved reps ± its standard error, against PR #584:
+
+| host | tier | WGS | WES |
+|---|---|---:|---:|
+| AMD Zen 5 (x86-64, 16 pinned cores) | AVX-512BW | −1.10 ± 0.18% (26 reps) | −2.03 ± 0.41% (12 reps) |
+| AWS Graviton 4 (arm64) | NEON | −0.60 ± 0.03% (10 reps) | −0.92 ± 0.07% (8 reps) |
+
+An earlier revision that found the flush slot through an input -> slot table
+instead of the counter measured, all on the WGS slice: −1.48 ± 0.25% on AMD Zen 5
+(x86-64, AVX-512BW tier), within noise of the counter; −0.68 ± 0.25% on the same
+host at the forced AVX2 tier; and, measured separately, −0.58 ± 0.25% (Zen 5,
+AVX-512BW) and −0.43 ± 0.06% (AWS Graviton 4, arm64, NEON tier) for the SMEM-driver
+flush change, and −0.48% (Zen 5, AVX-512BW) and −0.10% (Graviton 4, NEON) for the
+sorts.
+
 ## CIGAR generation
 
 - **Certified band for equal-length regions (PR #575).** The global re-alignment that builds

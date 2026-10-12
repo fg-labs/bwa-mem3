@@ -309,6 +309,8 @@ extern void bwamem3_primary_sort_by_hash(int n, mem_alnreg_t *a);
 extern void bwamem3_primary_sort_by_hash_exact(int n, mem_alnreg_t *a);
 extern void bwamem3_primary_sort_by_hash_alt(int n, mem_alnreg_t *a);
 extern void bwamem3_primary_sort_by_hash_alt_exact(int n, mem_alnreg_t *a);
+// The branch-free comparator spellings the pdqsorts use, against their twins.
+extern int bwamem3_sort_cmp_twins_agree(const mem_alnreg_t *a, const mem_alnreg_t *b);
 
 namespace {
 
@@ -628,9 +630,12 @@ TEST_CASE("the incremental by-score sort stays byte-identical when the rescue in
             CHECK(incr_agrees(random_regs(rng, 9 + t, 0), &saw_tie));
             CHECK(incr_agrees_scattered(rng, random_regs(rng, 9 + t, 0), &saw_tie));
         }
-        unsigned long budget = 0;
-        bwamem3_dedup_incr_stats(NULL, &budget, NULL, NULL, 1);
+        unsigned long budget = 0, tie = 0;
+        bwamem3_dedup_incr_stats(NULL, &budget, &tie, NULL, 1);
         CHECK(budget > 0);   // the budget path ran and still agreed
+        // Tie-free input: a fallback here would mean the pdqsort's branch-free
+        // comparator disagreed with the tie scan's.
+        CHECK(tie == 0);
     }
     SUBCASE("reverse by-score order (worst case for insertion sort)") {
         bwamem3_dedup_incr_stats(NULL, NULL, NULL, NULL, 1);
@@ -640,9 +645,10 @@ TEST_CASE("the incremental by-score sort stays byte-identical when the rescue in
             std::reverse(a.begin(), a.end());
             CHECK(incr_agrees(a, &saw_tie));
         }
-        unsigned long budget = 0;
-        bwamem3_dedup_incr_stats(NULL, &budget, NULL, NULL, 1);
+        unsigned long budget = 0, tie = 0;
+        bwamem3_dedup_incr_stats(NULL, &budget, &tie, NULL, 1);
         CHECK(budget > 0);
+        CHECK(tie == 0);
     }
     CHECK_FALSE(saw_tie);
 }
@@ -1039,4 +1045,26 @@ TEST_CASE("the mate-rescue dedup's fixed-point skip and single-insert path are b
     CHECK(same_records(ins, e));
     CHECK(fpi == fpe);
     free(opt);
+}
+
+TEST_CASE("each branch-free sort comparator agrees with its short-circuit twin"
+          * doctest::test_suite("unit/alnreg_sort_dedup")) {
+    // Fields drawn from tiny ranges so every equal-prefix branch of the orders is
+    // taken, plus extremes.
+    Rng rng(0x9e370040ULL);
+    const int64_t rbs[] = {0, 1, 2, INT64_MAX, INT64_MIN};
+    const uint64_t hashes[] = {0, 1, 2, UINT64_MAX};
+    int n = 0;
+    for (int t = 0; t < 20000; ++t) {
+        mem_alnreg_t a, b;
+        memset(&a, 0, sizeof a); memset(&b, 0, sizeof b);
+        a.score = (int)(rng.next() % 3) - 1;  b.score = (int)(rng.next() % 3) - 1;
+        a.is_alt = (int)(rng.next() % 2);     b.is_alt = (int)(rng.next() % 2);
+        a.hash = hashes[rng.next() % 4];      b.hash = hashes[rng.next() % 4];
+        a.rb = rbs[rng.next() % 5];           b.rb = rbs[rng.next() % 5];
+        a.qb = (int)(rng.next() % 3);         b.qb = (int)(rng.next() % 3);
+        CHECK(bwamem3_sort_cmp_twins_agree(&a, &b));
+        ++n;
+    }
+    CHECK(n == 20000);
 }
