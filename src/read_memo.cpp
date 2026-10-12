@@ -134,18 +134,21 @@ static inline bool readmemo_pair_eq(const bseq1_t *a1, const bseq1_t *a2,
 }
 
 /* ------------------------------------------------------------------------- *
- * Pre-pass. Serial, single-threaded (called from the pipeline's main loop
- *   between chunk load and align). Intrusive-chain + byte-verify: the map keys a
- *   fingerprint to a chain head (a pair index); each pair links to the previous
- *   same-fingerprint pair via chain_next[], so a collision walks the chain and
- *   memcmps rather than splitting a duplicate set.
+ * Pre-pass. Serial over one chunk: run by the pipeline's read step as the
+ *   chunk is loaded, or by mem_process_seqs before align. Intrusive-chain +
+ *   byte-verify: the map keys a fingerprint to a chain head (a pair index);
+ *   each pair links to the previous same-fingerprint pair via chain_next[], so
+ *   a collision walks the chain and memcmps rather than splitting a duplicate
+ *   set.
  * ------------------------------------------------------------------------- */
 
-/* PRECONDITION: read_memo_prepass runs SINGLE-THREADED. These module statics
- * (and the file-static read_memo_state in bwamem.cpp) carry no synchronization;
- * they are safe only because the pre-pass runs on the pipeline's main thread
- * between chunk load and align -- it is NOT under kt_for. A future caller that
- * runs it concurrently must shard this state per thread. */
+/* Module scratch shared by every pre-pass, guarded by g_prepass_mtx. The lock
+ * is defensive: in the pipeline, step 1 runs its own pre-pass only for
+ * smart-pair input, where the read step (step 0) runs none, so the two never
+ * overlap there. It makes read_memo_prepass safe for any caller that does run
+ * two at once. The read_memo_state a pre-pass fills is the caller's, and each
+ * caller passes a distinct one. */
+static std::mutex g_prepass_mtx;
 static robin_hood::unordered_flat_map<uint64_t, int32_t> g_map;
 static int32_t *g_chain_next = NULL;                     /* module scratch, grown in place */
 static int64_t  g_chain_cap  = 0;
@@ -205,6 +208,9 @@ read_memo_result read_memo_prepass(const mem_opt_t * /*opt*/, const bseq1_t *seq
      * regs copy rather than a crash. xassert (not assert) so the guard survives
      * a -DNDEBUG build. */
     xassert(n > 0 && (n & 1) == 0, "read_memo_prepass requires n>0 and even n");
+    /* g_map / g_chain_next are shared (see above). probe_ns is measured after
+     * the lock, so it is the pre-pass's own cost, not time spent waiting. */
+    std::lock_guard<std::mutex> prepass_lock(g_prepass_mtx);
     const auto t0 = std::chrono::steady_clock::now();
     const int npairs = n >> 1;
     readmemo_state_grow(st, npairs);

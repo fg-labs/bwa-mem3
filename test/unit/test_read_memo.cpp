@@ -7,7 +7,10 @@
 //       both mates must match, and that mate ORDER matters;
 //   (2) --dedup-reads / BWAMEM3_DEDUP_READS mode resolution precedence; and
 //   (3) read_memo_convert_non_reps, the armed path's 2-bit conversion: each
-//       read converted exactly once, so a REP's '-' stays 5 as with off.
+//       read converted exactly once, so a REP's '-' stays 5 as with off;
+//   (4) two pre-passes in flight at once each get their own chunk's answer
+//       (the module scratch is locked); and
+//   (5) the one eligibility gate both of those callers share.
 //
 // Phase 1 does not consume role[]/rep_pair[] in the aligner, so these tests pin
 // the pre-pass semantics directly rather than through end-to-end output.
@@ -17,10 +20,13 @@
 #include "read_memo.h"      // read_memo_prepass, read_memo_state, mode API
 #include "bwa.h"            // bseq1_t
 #include "bntseq.h"         // nst_nt4_decode
+#include "bwamem.h"         // mem_read_memo_prepass_eligible, mem_opt_t
 
 #include <cstdlib>
 #include <cstring>
+#include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -275,4 +281,93 @@ TEST_CASE("controller latches auto OFF when the memo overhead exceeds the saving
         read_memo_controller_observe(ro, full_align[i], /*copy_ns*/ 0, /*armed*/ false);
     }
     CHECK(read_memo_active() == READMEMO_OFF);
+}
+
+namespace {
+
+// `pairs` read-pairs drawn from a small pool of distinct pairs, so the chunk has
+// many duplicate sets (and many fingerprint-map hits) for the pre-pass to build.
+PairSet pooled_pairs(int pairs, int pool, unsigned seed)
+{
+    std::mt19937 rng(seed);
+    std::vector<std::pair<std::string, std::string>> distinct;
+    for (int i = 0; i < pool; ++i) {
+        std::string r1(100, 'A'), r2(100, 'A');
+        for (auto &c : r1) c = "ACGT"[rng() % 4];
+        for (auto &c : r2) c = "ACGT"[rng() % 4];
+        distinct.emplace_back(r1, r2);
+    }
+    PairSet ps;
+    for (int i = 0; i < pairs; ++i) {
+        const auto &d = distinct[rng() % pool];
+        ps.add(d.first, d.second);
+    }
+    return ps;
+}
+
+} // namespace
+
+TEST_CASE("concurrent pre-passes on different chunks each get their own answer"
+          * doctest::test_suite("unit/read_memo")) {
+    // read_memo_prepass may be called from two threads at once (the pipeline's
+    // read step and mem_process_seqs both call it; in the pipeline they do not
+    // overlap, but the API allows it). They share the module's fingerprint map
+    // and chain scratch, so this needs the module lock: without it one pass
+    // clears or overwrites the map under the other.
+    PairSet a = pooled_pairs(6000, 700, 1), b = pooled_pairs(9000, 50, 2);
+    read_memo_state ea = fresh_state(), eb = fresh_state();
+    const read_memo_result ra = a.run(&ea), rb = b.run(&eb);
+    REQUIRE(ra.dup_pairs > 0);
+    REQUIRE(rb.dup_pairs > 0);
+
+    int bad_a = 0, bad_b = 0;
+    auto loop = [](PairSet *ps, const read_memo_state *expect, int64_t dups, int *bad) {
+        read_memo_state st = fresh_state();
+        for (int it = 0; it < 25; ++it) {
+            const read_memo_result r = ps->run(&st);
+            if (r.dup_pairs != dups || st.npairs != expect->npairs
+                || memcmp(st.role, expect->role, (size_t)st.npairs) != 0
+                || memcmp(st.rep_pair, expect->rep_pair, (size_t)st.npairs * sizeof(int32_t)) != 0)
+                ++*bad;
+        }
+        read_memo_state_free(&st);
+    };
+    std::thread ta(loop, &a, &ea, ra.dup_pairs, &bad_a);
+    std::thread tb(loop, &b, &eb, rb.dup_pairs, &bad_b);
+    ta.join();
+    tb.join();
+    CHECK(bad_a == 0);
+    CHECK(bad_b == 0);
+    read_memo_state_free(&ea);
+    read_memo_state_free(&eb);
+}
+
+TEST_CASE("pre-pass eligibility: PE, not --meth, even n > 0, dedup not off"
+          * doctest::test_suite("unit/read_memo")) {
+    // The read step runs the pre-pass early only where mem_process_seqs would
+    // use it, through this one gate; a chunk it wrongly admitted would be
+    // handed a pre-pass mem_process_seqs never asked for, and one it wrongly
+    // refused would just fall back to the serial pre-pass.
+    mem_opt_t *opt = mem_opt_init();
+    REQUIRE(opt != NULL);
+    opt->flag |= MEM_F_PE;
+    mem_dedup_reads_configure("on");
+    CHECK(mem_read_memo_prepass_eligible(opt, 2) == 1);
+    CHECK(mem_read_memo_prepass_eligible(opt, 1000000) == 1);
+    CHECK(mem_read_memo_prepass_eligible(opt, 0) == 0);
+    CHECK(mem_read_memo_prepass_eligible(opt, 7) == 0);
+    mem_dedup_reads_configure("auto");
+    CHECK(mem_read_memo_prepass_eligible(opt, 2) == 1);
+    opt->meth_mode = 1;
+    CHECK(mem_read_memo_prepass_eligible(opt, 2) == 0);
+    opt->meth_mode = 0;
+    opt->flag &= ~MEM_F_PE;
+    CHECK(mem_read_memo_prepass_eligible(opt, 2) == 0);
+    opt->flag |= MEM_F_PE;
+    if (!read_memo_verify()) {   // VERIFY forces the pre-pass even when off
+        mem_dedup_reads_configure("off");
+        CHECK(mem_read_memo_prepass_eligible(opt, 2) == 0);
+    }
+    mem_dedup_reads_configure("auto");
+    free(opt);
 }

@@ -541,6 +541,9 @@ typedef struct
     uint8_t *ref_string;
 } mem_cache;
 
+struct read_memo_state;     /* read_memo.h */
+struct read_memo_handoff;   /* read_memo.h */
+
 // chain moved to .h
 typedef struct worker_t {
     const mem_opt_t      *opt;
@@ -934,10 +937,19 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
  * @param seqs   query sequences; $seqs[i].seq/sam to be modified after the call
  * @param pes0   insert-size info; if NULL, infer from data; if not NULL, it should be an array with 4 elements,
  *               corresponding to each FF, FR, RF and RR orientation. See mem_pestat() for more info.
+ * @param pre    [dedup-reads] this chunk's read-memo pre-pass, already run on these same reads (the
+ *               pipeline's read step does), or NULL to run it here. Only read; the caller owns it and
+ *               must keep it alive until this returns.
  */
 void mem_process_seqs(mem_opt_t *opt, int64_t n_processed,
                       int n, bseq1_t *seqs, const mem_pestat_t *pes0,
-                      worker_t &w);
+                      worker_t &w, const struct read_memo_handoff *pre = NULL);
+
+/* [dedup-reads] Whether mem_process_seqs runs the read-memo pre-pass on an n-read
+ * chunk (dedup mode not off or VERIFY set, PE, not --meth, even n > 0). The one
+ * gate both mem_process_seqs and the pipeline's read step use, so the read step
+ * runs the pre-pass early exactly when mem_process_seqs would use it. */
+int mem_read_memo_prepass_eligible(const mem_opt_t *opt, int n);
 
 /* Release the read-memo module scratch at shutdown (after the worker pipeline
  * finishes). Idempotent. */
@@ -1023,6 +1035,11 @@ mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *
  */
 void mem_pestat(const mem_opt_t *opt, int64_t l_pac, int n, const mem_alnreg_v *regs,
                 mem_pestat_t pes[4]);
+/* mem_pestat with the candidate count run on the kt_for pool (n_threads
+ * workers, per-thread integer histograms summed). Same pes[] and stderr output
+ * as mem_pestat. Call only from the thread that drives kt_for. */
+void mem_pestat_par(const mem_opt_t *opt, int64_t l_pac, int n, const mem_alnreg_v *regs,
+                    mem_pestat_t pes[4], int n_threads);
 
 void mem_reorder_primary5(int T, mem_alnreg_v *a);
 

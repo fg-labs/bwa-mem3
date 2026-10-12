@@ -58,6 +58,8 @@ release on the **alignment records**: `--compat=bwa-mem2` for bwa-mem2 v2.2.1, o
 for bwa 0.7.19. Use it to validate a bwa-mem3 rollout against an existing bwa/bwa-mem2 golden with a
 plain `diff` — excluding the `@PG` line, which still names `bwa-mem3` and is unmatchable by
 construction, and passing matching `-t` (or a pinned `-K`) on both sides so batch boundaries line up.
+At a pinned `-K`, bwa-mem3's own records do not depend on `-t` (see
+[Equivalence → Batch size, `-t`, and why comparisons need `-K`](equivalence.md#batch-size--t-and-why-comparisons-need--k)).
 
 Two things to know:
 

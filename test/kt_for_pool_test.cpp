@@ -42,7 +42,7 @@ static void count_work(void *data, int st, int len, int tid) {
 
 // kt_for() invokes this as func(data, st, len, tid). `tid` is the worker slot
 // index; record which OS thread is servicing that slot on this call. The brief
-// sleep keeps all NT workers busy on their own strided batch simultaneously so
+// sleep keeps all NT workers busy on their own strided item simultaneously so
 // none finishes early and steals another slot's work — that keeps the
 // slot->thread mapping stable for this test (work-stealing is irrelevant to the
 // invariant under test: thread persistence across kt_for() calls).
@@ -62,9 +62,11 @@ int main(void) {
     if (w == NULL) { fprintf(stderr, "calloc failed\n"); return 2; }
     w->nthreads = NT;
 
-    // n = NT * BATCH_SIZE gives exactly one strided batch per worker slot, so
+    // A pass of at most NT * BATCH_SIZE reads is all tail (kt_item_layout in
+    // kthread.cpp), cut into BATCH_SIZE / 4-read items, so n = NT * BATCH_SIZE / 4
+    // is exactly NT items: the strided dispatch hands each worker slot one, and
     // every slot's thread runs record_slot_thread() at least once.
-    const int n = NT * BATCH_SIZE;
+    const int n = NT * BATCH_SIZE / 4;
 
     g_call = 0; kt_for(record_slot_thread, w, n);
     g_call = 1; kt_for(record_slot_thread, w, n);

@@ -314,6 +314,70 @@ AVX-512BW) and −0.43 ± 0.06% (AWS Graviton 4, arm64, NEON tier) for the SMEM-
 flush change, and −0.48% (Zen 5, AVX-512BW) and −0.10% (Graviton 4, NEON) for the
 sorts.
 
+## Thread idle tail ([PR #590](https://github.com/fg-labs/bwa-mem3/pull/590))
+
+A timeline trace of each `kt_for` pass and pipeline step, on top of
+[PR #586](#lockstep-flush-and-unique-result-sorts-pr-586), on a 5M-pair WGS slice
+(hg38) at `-t 16 -K 160000000`, clang 19.1.7, showed the 16-thread pool idle for
+2.2% of wall on AWS Graviton 4 (m8g.4xlarge, arm64, NEON tier) and 3.2% on AMD
+Zen 5 (m8a.4xlarge, x86-64, AVX-512BW tier), 16 cores each without SMT. Most of it
+was not load imbalance but serial work on the thread that drives the pool: the
+read-dedup pre-pass (~25 ms per chunk on both hosts) and the insert-size
+estimate's candidate count (~16 ms per chunk on Graviton 4, ~30 ms on Zen 5) both
+ran while every worker waited. The rest was the
+end-of-pass barrier, where workers finishing early wait for the last full-size
+work item. Three byte-identical changes:
+
+- **Read-dedup pre-pass on the read step.** The pre-pass that finds duplicate read
+  pairs now runs on the pipeline's read step, overlapping the previous chunk's
+  alignment, instead of in front of this chunk's alignment. It does so for every
+  chunk the pre-pass applies to (paired-end, non-`--meth` input with `--dedup-reads`
+  not off) that is read in one piece; the first chunk of a run, read in slices, is
+  not memoized. It is a pure function of the chunk's read bases and their order, so
+  the result is the same. Smart-pairing input still runs it on the alignment step,
+  as before.
+- **Parallel insert-size count.** The candidate loop of the insert-size estimate
+  runs as one more `kt_for` pass: each worker counts its pairs into its own
+  histogram and the histograms are summed. The counts are integers, so the sum is
+  exact whatever the split, and the percentile / mean / std.dev step that follows
+  is unchanged.
+- **Smaller final work items.** About the last `n_threads × BATCH_SIZE` reads of
+  each `kt_for` pass (rounded to whole batches) are cut into quarter-size items,
+  so the workers reach the barrier closer together. This makes the item
+  boundaries, and so which reads share a SIMD lane group, depend on `-t`; before
+  it they depended only on the batch (`-K`). By construction output does not
+  change (it was measured identical only on the workloads, hosts and tiers listed
+  below), because items stay whole read pairs, every pass writes per-read results, and the
+  batched kernels return each pair's result whatever it is grouped with: the
+  banded extension since [PR #565](correctness.md#banded-sw-extension-results-depended-on-their-simd-lane-group-pr-565),
+  and the `kswv` mate-rescue kernels, which match the scalar `ksw_align2` on every
+  field for every pair. `test/regression/thread_determinism.sh` compares `-t 1`,
+  `-t 3` and `-t 4` at a fixed `-K`.
+
+Output was verified identical (record md5, non-`@PG`, and record count) to the
+previous `main` on 5M-pair WGS and WES slices (150 bp / 76 bp paired, hg38), also
+under both `--compat` targets and with `BWAMEM3_DEDUP_READS=on`, on AWS Graviton 4
+(arm64, NEON tier) and AMD Zen 5 (x86-64, AVX-512BW tier). `--dedup-reads` applies
+to every batch of those runs but the first, which is read in slices and not
+memoized; `thread_determinism.sh` and `dedup_reads_byte_identity.sh` also compare
+it on and off over several batches with duplicated pairs. Unsorted output at
+`-t 1`, `-t 7` and `-t 16` (same `-K`) was identical on the WES slice, default and
+`--compat=bwa-mem`, on both hosts. Whole-aligner wall at `-t 16`, clang 19.1.7,
+mean paired difference of interleaved reps ± its standard error, against PR #586:
+
+| host | tier | WGS | WES |
+|---|---|---:|---:|
+| AWS Graviton 4 (arm64) | NEON | −1.25 ± 0.02% (10 reps) | −1.93 ± 0.10% (8 reps) |
+| AMD Zen 5 (x86-64, 16 pinned cores) | AVX-512BW | −2.46 ± 0.35% (14 reps) | −3.37 ± 0.44% (12 reps) |
+
+Per-chunk CPU time was unchanged within ±0.5%, so the gain is idle time removed
+rather than less work. With the WES mates fed through single-threaded `gzip -dc`
+pipes, so that reading is slower, Graviton 4 still gained −1.26 ± 0.19% (6 reps).
+The Zen 5 timings were taken before PR #588 raised the Zen 5 lockstep widths to
+32/32, so both arms ran the 16/24 widths. This change does not touch seeding, and
+output identity was re-checked after #588, but the Zen 5 gain was not re-measured
+at 32/32.
+
 ## CIGAR generation
 
 - **Certified band for equal-length regions (PR #575).** The global re-alignment that builds

@@ -70,6 +70,27 @@ typedef struct ktp_t {
 
 struct kt_for_t;
 
+/* How one kt_for() pass over n reads is cut into work items: items of `batch`
+ * reads over [0, full_end), then items of `tail_batch` reads to n. See
+ * kt_item_layout() in kthread.cpp for why the tail is cut finer. */
+typedef struct {
+	long n;           /* reads in the pass */
+	long batch;       /* size of a full item (BATCH_SIZE in kt_for) */
+	long tail_batch;  /* size of an item in the tail */
+	long full_end;    /* reads [0, full_end) are full items; a multiple of batch */
+	long n_full;      /* number of full items */
+	long n_items;     /* total number of items */
+} kt_item_layout_t;
+
+/* Internal to kt_for; exported only for test/unit/test_kt_item_layout.cpp.
+ * Fill L for a pass of n reads on n_threads workers with full items of `batch`
+ * reads. batch must be a positive multiple of 8 (asserted), so full and tail
+ * (batch / 4) items are both even and never split a read pair. */
+void kt_item_layout(long n, int n_threads, long batch, kt_item_layout_t *L);
+/* Internal to kt_for (see above). Item k -> reads [*st, *ed). Returns 0 (and
+ * leaves st/ed untouched) when k is not an item of L. */
+int kt_item_range(const kt_item_layout_t *L, long k, int *st, int *ed);
+
 /* L27: pad each worker to a full cache line so adjacent workers' steal counter
  * `i` (bumped with __sync_fetch_and_add during the end-of-pass steal phase) do
  * not share a line and false-share. Layout-only: no field is added or reordered
@@ -85,14 +106,19 @@ typedef struct {
 
 typedef struct kt_for_t {
 	int n_threads;
-	long n;
+	kt_item_layout_t layout;   /* this pass's work items (kt_item_layout) */
 	ktf_worker_t *w;
 	void (*func)(void*, int, int, int);
 	void *data;
 } kt_for_t;
 
 
+/* Run func over [0, n) on the pool; data must point to a worker_t, whose
+ * nthreads sets the pool size. */
 void kt_for(void (*func)(void*,int,int,int), void *data, int n);
+/* kt_for with the pool size given explicitly, so data can be any caller
+ * context. Same pool and item layout as kt_for. */
+void kt_for_nt(void (*func)(void*,int,int,int), void *data, int n, int n_threads);
 /* Tear down the persistent kt_for() worker pool (joins the worker threads).
  * Call once after the last kt_for()/kt_pipeline() of a run; a no-op if the pool
  * was never created. */
