@@ -257,8 +257,9 @@ knob is treated as absent (2 MB follows the global mode; other sizes are off).
 The fallback warning also needs the `THPeligible` field (Linux ≥ 5.0).
 
 The eligibility accounting is validated for the default build (mimalloc). In a
-`USE_MIMALLOC=0` build the index's `madvise` may not take effect, and under THP
-`always` its glibc heap is eligible, so a fallback warning there does not
+`USE_MIMALLOC=0` build the index arrays are advised over their page-aligned
+interior ([PR #589](https://github.com/fg-labs/bwa-mem3/pull/589)), but under THP
+`always` its glibc heap is eligible too, so a fallback warning there does not
 necessarily mean page-cache pressure.
 
 To check a run by hand, sum `AnonHugePages` and `Anonymous` over the
