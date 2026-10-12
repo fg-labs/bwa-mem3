@@ -31,7 +31,8 @@ Each read slot (`BatchSlot`) carries its own `prev[]` walk buffer and
 the next unprocessed read immediately. The match-emit cursor enforces
 input-index order so output is byte-identical to scalar. `SMEM_LOCKSTEP_N` is
 compile-time tunable; `N=1` dispatches to the unchanged scalar path for
-bisection.
+bisection. The runtime width defaults to `SMEM_LOCKSTEP_N` (16), or 32 on AMD
+Zen 5 (see "Zen 5 lockstep widths" below).
 
 Measured improvement on 150 bp NovaSeq WGS (1M pairs, hg38, Graviton3 r7g.4xlarge,
 8 threads): **−6.1% wall time** (82 s → 77 s). The `backwardExt` hot
@@ -71,7 +72,8 @@ on a measurement. `test/regression/bwtseed_lockstep_driver_identity.sh`
 pins the scalar driver in CI and checks it against the default.
 
 Its depth is a distinct knob from the phase-2 SMEM width above. The default is
-**24**, resolved at startup into a runtime value. Measured whole-aligner wall on a
+**24** (32 on AMD Zen 5; see "Zen 5 lockstep widths" below), resolved at startup
+into a runtime value. Measured whole-aligner wall on a
 5M-read WGS slice (150 bp paired NovaSeq reads, hg38), each host at threads ≤
 physical cores (held fixed so the sweep compares depths, not thread regimes),
 sweeping the depth via
@@ -97,8 +99,53 @@ md5 gate matching the prior depth-8 output on x86 (clang-19, avx512bw tier) and 
 
 | Variable | Effect |
 |---|---|
-| `BWA3_BWTSEED_LOCKSTEP_N=<n>` | Pin the third-pass lockstep depth to `<n>` (1–64). A value above 64 is clamped; a non-positive or malformed value is reported to stderr and ignored (the default is used). An unset or empty value (`BWA3_BWTSEED_LOCKSTEP_N=`) silently keeps the compiled default, with no message. |
+| `BWA3_BWTSEED_LOCKSTEP_N=<n>` | Pin the third-pass lockstep depth to `<n>` (1–64). A value above 64 is clamped; a non-positive or malformed value is reported to stderr and ignored (the host default is used). An unset or empty value (`BWA3_BWTSEED_LOCKSTEP_N=`) silently keeps the host default (24; 32 on AMD Zen 5, see "Zen 5 lockstep widths" below), with no message. |
 | `BWA3_BWTSEED_LOCKSTEP=0`\|`1` | Force the third-pass lockstep driver off / on (default: on). |
+
+## Zen 5 lockstep widths ([PR #588](https://github.com/fg-labs/bwa-mem3/pull/588))
+
+On AMD Zen 5 CPUs, both lockstep seeding widths now default to **32**: the
+phase-2 SMEM width (16 elsewhere) and the third-pass bwtSeed width (24
+elsewhere). The CPU is identified once at startup with CPUID: an `AuthenticAMD`
+vendor, family 1Ah, and a Zen 5 model (00h–2Fh, 40h–4Fh, 60h–7Fh or D0h–D7h,
+the ranges the Linux kernel assigns to Zen 5). Family 1Ah also holds Zen 6
+(models 50h–5Fh, 80h–AFh, C0h–CFh, D8h–EFh); Zen 6, any other family-1Ah model,
+and every other host keep 16 / 24. Precedence, highest first: an explicit
+`BWA3_SMEM_LOCKSTEP_N` / `BWA3_BWTSEED_LOCKSTEP_N` pin, then (SMEM only) the
+opt-in `BWA3_SMEM_LOCKSTEP_PROBE` startup probe, then this host default, then the
+compile-time default. If the opted-in probe cannot measure, the SMEM width falls
+back to the host default. The host default only raises a width and is clamped to
+the build's `SMEM_LOCKSTEP_N_MAX` / `BWTSEED_LOCKSTEP_N_MAX`. At `-v 3` the
+startup log names each width's source (`env pin`, `startup probe`,
+`host default: AMD Zen 5`, or `default`).
+
+The widths only change how reads are batched, so output is unchanged: record md5
+(non-`@PG`) and record count matched the 16 / 24 default on the 5M-pair WGS and
+WES slices on AMD Zen 5 and AWS Graviton 4, also under both `--compat` targets.
+Whole-aligner wall at `-t 16` on 16 cores without SMT, clang 19.1.7, mean paired
+difference of interleaved reps ± its standard error, against the same build with
+the 16 / 24 defaults (negative = faster):
+
+| host | tier | widths | WGS | WES |
+|---|---|---|---:|---:|
+| AMD Zen 5 (x86-64) | AVX-512BW | 32 / 32 | −1.26 ± 0.16% (12 reps) | −1.59 ± 0.48% (12 reps) |
+| AWS Graviton 4 (arm64), control | NEON | 16 / 24 (unchanged) | −0.02 ± 0.01% (8 reps) | — |
+
+The Graviton 4 row is a control: its widths do not change, so it shows the A/B's
+noise floor rather than a width effect. AMD Zen 4 (x86-64, AVX-512BW tier) does not
+gain: SMEM width 24 measured +0.4% and 32 measured +0.7% on WGS (6 reps, ±0.5%,
+within noise), so the default is keyed on the CPU rather than on x86 or the SIMD
+tier. AWS Graviton 4 (arm64, NEON tier) is flat from SMEM width 16 to 32 on WGS
+and best at 16 / 24 on WES. Intel and Zen 5c (which shares the Zen 5 model
+ranges, so it gets 32 / 32) were not measured. The opt-in probe stays opt-in: it
+picks the per-access latency knee (16, 16 and 32 on three Zen 5 startups), not
+the wall optimum of 32.
+
+Memory: each worker thread keeps grow-only lockstep scratch proportional to the
+width times the longest read seen (two SMEM buffers per slot for the phase-2
+driver, one for bwtSeed). On Zen 5 that scratch is 2× (SMEM) and 4/3× (bwtSeed)
+the 16 / 24 default. It is small for short reads; for very long reads, pin
+`BWA3_SMEM_LOCKSTEP_N` / `BWA3_BWTSEED_LOCKSTEP_N` lower to cap it.
 
 ## Batched `-H` header ingestion (PR #49, closes issue #37)
 

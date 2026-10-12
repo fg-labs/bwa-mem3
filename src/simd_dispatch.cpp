@@ -4,6 +4,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <mutex>
+#if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
+#include <cpuid.h>
+#define BWA3_HAVE_CPUID_H 1
+#endif
 
 static int g_tier = BWAMEM3_TIER_NONE;
 static int g_host_capability = BWAMEM3_TIER_NONE;  /* raw detect_x86_tier(),
@@ -692,3 +696,52 @@ extern "C" void sam_encode_qual_rev(char *dst, const char *src, int n) {
 }
 
 #endif  /* x86 sam_encode dispatch wrappers */
+
+/* ---- x86 CPU identity (see simd_dispatch.h) --------------------------------- */
+
+extern "C" int bwa3_x86_vendor_is_amd(uint32_t ebx, uint32_t ecx, uint32_t edx)
+{
+    /* "Auth" "enti" "cAMD" as little-endian 32-bit words in EBX, EDX, ECX. */
+    return ebx == 0x68747541u && edx == 0x69746e65u && ecx == 0x444d4163u;
+}
+
+extern "C" uint32_t bwa3_x86_cpu_family(uint32_t leaf1_eax)
+{
+    const uint32_t base = (leaf1_eax >> 8) & 0xfu;
+    const uint32_t ext  = (leaf1_eax >> 20) & 0xffu;
+    return base == 0xfu ? base + ext : base;
+}
+
+extern "C" uint32_t bwa3_x86_cpu_model(uint32_t leaf1_eax)
+{
+    const uint32_t base_family = (leaf1_eax >> 8) & 0xfu;
+    const uint32_t base  = (leaf1_eax >> 4) & 0xfu;
+    const uint32_t ext   = (leaf1_eax >> 16) & 0xfu;
+    return (base_family == 0x6u || base_family == 0xfu) ? (base | (ext << 4)) : base;
+}
+
+extern "C" void bwa3_host_cpu_identity(int *is_amd, uint32_t *family, uint32_t *model)
+{
+#ifdef BWA3_HAVE_CPUID_H
+    static std::once_flag once;
+    static int      cached_amd = 0;
+    static uint32_t cached_family = 0;
+    static uint32_t cached_model = 0;
+    std::call_once(once, [] {
+        unsigned int a = 0, b = 0, c = 0, d = 0;
+        if (!__get_cpuid(0, &a, &b, &c, &d)) return;
+        cached_amd = bwa3_x86_vendor_is_amd(b, c, d);
+        if (__get_cpuid(1, &a, &b, &c, &d)) {
+            cached_family = bwa3_x86_cpu_family(a);
+            cached_model  = bwa3_x86_cpu_model(a);
+        }
+    });
+    *is_amd = cached_amd;
+    *family = cached_family;
+    *model  = cached_model;
+#else
+    *is_amd = 0;
+    *family = 0;
+    *model  = 0;
+#endif
+}

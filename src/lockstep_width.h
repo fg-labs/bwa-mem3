@@ -56,8 +56,8 @@
  * (~-0.8%), and Apple M3 Ultra (~-2.2%, still improving) and M2 Max (flat, no
  * regression). So 24 is a win or neutral everywhere and the portable default;
  * the prior compile-time 8 was under-tuned on every architecture. Hosts that
- * want more (SPR, M3 Ultra) are served by BWA3_BWTSEED_LOCKSTEP_N or a per-host
- * calibration. Byte-identical across widths (batching only; the bwtseed lockstep
+ * want more (SPR, M3 Ultra) are served by BWA3_BWTSEED_LOCKSTEP_N or a host-tuned
+ * default (AMD Zen 5 gets 32; see "Host-tuned default widths" below). Byte-identical across widths (batching only; the bwtseed lockstep
  * parity harness pins the emission order). */
 #ifndef BWTSEED_LOCKSTEP_N
 #define BWTSEED_LOCKSTEP_N 24
@@ -75,9 +75,11 @@
 extern "C" {
 #endif
 
-/* Runtime phase-2 lockstep width, resolved once at startup. Initialized to
- * SMEM_LOCKSTEP_N so a binary that never runs the probe behaves exactly like
- * the compile-time constant. Read (not written) on the seeding hot path. */
+/* Runtime phase-2 lockstep width, resolved once at startup by
+ * bwa3_init_smem_lockstep_width (env pin, opt-in probe, host-tuned default, or
+ * compile-time default). Initialized to SMEM_LOCKSTEP_N so a binary that never
+ * calls the initializer behaves exactly like the compile-time constant. Read
+ * (not written) on the seeding hot path. */
 extern int32_t g_smem_lockstep_n;
 
 /* Clamp a raw memory-level-parallelism estimate to the usable width range
@@ -91,8 +93,9 @@ int32_t bwa3_lockstep_width_from_probe(int32_t raw_mlp);
  *   > 0  the width to pin, clamped up to SMEM_LOCKSTEP_N_MAX -- a valid positive
  *        integer override (it MAY sit below the floor, an explicit operator/gate
  *        escape hatch); the caller skips the probe and uses this;
- *     0  env is unset or empty -- no override; the caller keeps the compile-time
- *        default (and probes only if BWA3_SMEM_LOCKSTEP_PROBE is set);
+ *     0  env is unset or empty -- no override; the caller probes if
+ *        BWA3_SMEM_LOCKSTEP_PROBE is set, else uses the host default (the
+ *        compile-time default, or the host-tuned value on AMD Zen 5);
  *    -1  env is set but malformed, non-positive, or overflowed -- an invalid
  *        override; the caller reports it and resolves it as if unset.
  * Pure and side-effect-free (emits no diagnostic), so it is unit-testable; the
@@ -115,8 +118,8 @@ int bwa3_lockstep_probe_enabled(const char *env);
  * in and over-picks). `base`/`n_blocks`/`stride` describe cp_occ as an opaque
  * array of `n_blocks` fixed-size blocks; `word_off` is the byte offset of a
  * 64-bit word to read from each block. Returns the knee width (raw, pre-clamp),
- * or 0 if the array is absent or too small to measure (caller floors to the
- * default). Cost is host-dependent: ~10-20 ms on low-latency memory (e.g. Apple
+ * or 0 if the array is absent or too small to measure (the initializer then
+ * falls back to the host default). Cost is host-dependent: ~10-20 ms on low-latency memory (e.g. Apple
  * Silicon), ~0.4 s on server-class DRAM (a ~100 ns dependent-load latency over
  * the sweep). This is the raw measurement primitive: it retains only its input
  * guard (returns 0 when base == NULL or n_blocks < 4096) and has no one-shot or
@@ -127,6 +130,78 @@ int bwa3_lockstep_probe_enabled(const char *env);
 int32_t bwa3_measure_mlp(const void *base, int64_t n_blocks,
                          size_t stride, size_t word_off);
 
+/* ---- Host-tuned default widths ----------------------------------------------
+ *
+ * With no env pin and no opt-in probe, both lockstep widths fall back to a
+ * per-host default. Every host gets the compile-time SMEM_LOCKSTEP_N /
+ * BWTSEED_LOCKSTEP_N except AMD Zen 5, which gets 32 / 32. Zen 5 is matched by
+ * vendor, family AND model: AMD family 1Ah also holds Zen 6, so the family alone
+ * is not enough. The model ranges follow the Linux kernel's Zen generation table
+ * (bsp_init_amd, arch/x86/kernel/cpu/amd.c): family 1Ah models 00h-2Fh, 40h-4Fh,
+ * 60h-7Fh and D0h-D7h are Zen 5; 50h-5Fh, 80h-AFh, C0h-CFh and D8h-EFh are Zen 6.
+ * Zen 6 and every unlisted family-1Ah model keep the compile-time defaults (not
+ * measured). Zen 5c shares the Zen 5 ranges, so it gets 32 / 32 (also not
+ * measured).
+ *
+ * Measured whole-aligner wall, 5M-pair WGS (HG00096) and WES (HG00100) slices,
+ * hg38, -t 16 on 16 cores without SMT, clang 19, paired interleaved reps, the
+ * 32/32 host default vs the 16/24 default build (negative = faster):
+ *   AMD Zen 5   m8a.4xlarge  avx512bw  WGS -1.26 +/- 0.16% (12 reps)  WES -1.59 +/- 0.48% (12 reps)
+ * An earlier sweep pinning the widths through the env vars measured the same
+ * pair at WGS -1.44 +/- 0.29% and WES -1.22 +/- 0.28% (10 reps each), and found
+ * 32/32 the most consistent pair across WGS and WES among SMEM {16, 24, 32} x
+ * bwtSeed {24, 32, 48}. The other hosts measured do not want it:
+ *   AMD Zen 4   m7a.4xlarge  avx512bw  SMEM 24: WGS +0.4%, SMEM 32: WGS +0.7% (6 reps, within noise)
+ *   Graviton4   m8g.4xlarge  neon      WGS flat from SMEM 16 to 32; WES best at 16/24
+ * so the default is keyed on the CPU, not on x86 or the SIMD tier. Intel was not
+ * measured. Width is byte-identical by contract (batching only), so this is
+ * purely a scheduling choice.
+ *
+ * Precedence, highest first: an explicit BWA3_SMEM_LOCKSTEP_N /
+ * BWA3_BWTSEED_LOCKSTEP_N pin, then (SMEM only) the opt-in startup probe, then
+ * this host default, then the compile-time default. The host default only ever
+ * RAISES a width: it is clamped to [compile-time default, *_LOCKSTEP_N_MAX], so
+ * a build that overrides either bound with -D never gets a width outside its
+ * own range (a -DSMEM_LOCKSTEP_N_MAX=24 build gets 24 on Zen 5, a
+ * -DSMEM_LOCKSTEP_N=48 build keeps 48).
+ *
+ * Memory: each worker thread keeps grow-only lockstep scratch proportional to
+ * width x max read length (SMEM: two SMEM buffers per slot; bwtSeed: one), so
+ * on Zen 5 that scratch is 2x (SMEM) and 4/3x (bwtSeed) the 16/24 default. It
+ * is small for short reads; for very long reads, pin BWA3_SMEM_LOCKSTEP_N /
+ * BWA3_BWTSEED_LOCKSTEP_N lower to cap it. */
+#ifndef BWA3_ZEN5_SMEM_LOCKSTEP_N
+#define BWA3_ZEN5_SMEM_LOCKSTEP_N 32
+#endif
+#ifndef BWA3_ZEN5_BWTSEED_LOCKSTEP_N
+#define BWA3_ZEN5_BWTSEED_LOCKSTEP_N 32
+#endif
+
+/* Host-tuned default widths for a given CPU identity (vendor, display family,
+ * display model; see bwa3_host_cpu_identity in simd_dispatch.h), clamped to
+ * [compile-time default, *_LOCKSTEP_N_MAX]. Return the compile-time default for
+ * every host without a tuned value. Pure, so the policy is unit-testable with
+ * an injected identity. */
+int32_t bwa3_smem_host_default_width(int is_amd, uint32_t family, uint32_t model);
+int32_t bwa3_bwtseed_host_default_width(int is_amd, uint32_t family, uint32_t model);
+
+/* Where a resolved lockstep width came from (for the -v 3 startup log). */
+enum {
+    BWA3_LOCKSTEP_WIDTH_SRC_DEFAULT = 0,  /* compile-time default */
+    BWA3_LOCKSTEP_WIDTH_SRC_HOST    = 1,  /* host-tuned default (AMD Zen 5) */
+    BWA3_LOCKSTEP_WIDTH_SRC_PROBE   = 2,  /* opt-in startup MLP probe (SMEM only) */
+    BWA3_LOCKSTEP_WIDTH_SRC_ENV     = 3   /* explicit env pin */
+};
+
+/* Log label of a BWA3_LOCKSTEP_WIDTH_SRC_* value: "default", "host default: AMD
+ * Zen 5", "startup probe", "env pin"; any other value returns "default". */
+const char *bwa3_lockstep_width_source_name(int src);
+
+/* Source of the installed g_smem_lockstep_n / g_bwtseed_lockstep_n, recorded by
+ * the initializers below (BWA3_LOCKSTEP_WIDTH_SRC_DEFAULT until they run). */
+int bwa3_smem_lockstep_n_source(void);
+int bwa3_bwtseed_lockstep_n_source(void);
+
 /* Resolve and install g_smem_lockstep_n once. Idempotent (subsequent calls are
  * no-ops). Resolution order:
  *   1. BWA3_SMEM_LOCKSTEP_N=<n>   -- explicit pin, taken alone.
@@ -135,11 +210,13 @@ int32_t bwa3_measure_mlp(const void *base, int64_t n_blocks,
  *      the width for this host. Truthy opt-in (bwa3_lockstep_probe_enabled): any
  *      value other than unset, empty, or "0" enables it, so unset the variable
  *      (or set it to 0) to disable -- BWA3_SMEM_LOCKSTEP_PROBE=0 does NOT enable.
- *   3. neither set (the default)  -- keep the compile-time SMEM_LOCKSTEP_N.
- * The probe is OPT-IN because the width is a measured ~1% flat knob end-to-end
- * across architectures, core counts, and page sizes, so paying its startup cost
- * on every run buys no throughput; the default constant is what the probe
- * converges to on all benchmarked hardware. An invalid env value is reported
+ *   3. the host default (bwa3_smem_host_default_width): the host-tuned value
+ *      on AMD Zen 5 (32), else the compile-time SMEM_LOCKSTEP_N. Also the
+ *      fallback when the opted-in probe cannot measure (returns 0).
+ * The probe is OPT-IN: it costs a startup pass and picks the per-access latency
+ * knee, which sits at or below the whole-aligner wall optimum (on Zen 5 it picked
+ * 16, 16 and 32 on three startups against a wall optimum of 32), so the measured
+ * host default is the better mechanism. An invalid env value is reported
  * (ERROR to stderr) and ignored, resolving as if unset.
  * Call after the index is loaded and before the seeding workers spawn. */
 void bwa3_init_smem_lockstep_width(const void *base, int64_t n_blocks,
@@ -181,22 +258,24 @@ void bwa3_init_smem_lockstep_width(const void *base, int64_t n_blocks,
  * path. */
 extern int32_t g_bwtseed_lockstep;
 
-/* Runtime third-pass lockstep WIDTH, resolved once at startup. Initialized to the
- * compile-time BWTSEED_LOCKSTEP_N so a binary that never runs the resolver behaves
- * exactly like the constant. Read (not written) on the seeding hot path by
+/* Runtime third-pass lockstep WIDTH, resolved once at startup by
+ * bwa3_init_bwtseed_lockstep_width (env pin, host-tuned default, or compile-time
+ * default). Initialized to the compile-time BWTSEED_LOCKSTEP_N so a binary that
+ * never calls the initializer behaves exactly like the constant. Read (not written) on the seeding hot path by
  * bwtSeedStrategyAllPosOneThread_lockstep. */
 extern int32_t g_bwtseed_lockstep_n;
 
 /* Classify a BWA3_BWTSEED_LOCKSTEP_N override (env may be NULL/empty), WITHOUT
  * touching global state. Returns > 0 the width to pin (clamped up to
- * BWTSEED_LOCKSTEP_N_MAX), 0 when unset/empty (keep the default), or -1 when set
- * but malformed / non-positive / overflowed (caller reports and keeps the default).
+ * BWTSEED_LOCKSTEP_N_MAX), 0 when unset/empty (use the host default), or -1 when
+ * set but malformed / non-positive / overflowed (caller reports it and uses the
+ * host default).
  * Pure and side-effect-free, so it is unit-testable. */
 int32_t bwa3_bwtseed_width_parse_env(const char *env);
 
 /* Resolve and install g_bwtseed_lockstep_n once (idempotent). Resolution order:
- * BWA3_BWTSEED_LOCKSTEP_N pin -> compile-time default (24). (A per-host calibration
- * -- a planned `bwa-mem3 tune` sidecar -- hooks in here in a later change.) Call
+ * BWA3_BWTSEED_LOCKSTEP_N pin -> host default (bwa3_bwtseed_host_default_width:
+ * 32 on AMD Zen 5, else the compile-time BWTSEED_LOCKSTEP_N, 24). Call
  * before the seeding workers spawn; an invalid env value is reported to stderr and
  * resolved as if unset. */
 void bwa3_init_bwtseed_lockstep_width(void);

@@ -4,6 +4,7 @@
 
 #include <stdio.h>          /* for FILE * in bwamem3_print_version_simd */
 #include <stddef.h>         /* for size_t in bwamem3_format_host_floor_error */
+#include <stdint.h>         /* for uint32_t in the x86 CPU identity helpers */
 
 #ifdef __cplusplus
 extern "C" {
@@ -77,6 +78,33 @@ void bwamem3_enforce_host_floor(void);
  * lines unconditionally (floor + runtime); a third warning line iff
  * bwamem3_host_meets_floor() returns 0. Never exits. */
 void bwamem3_print_version_simd(FILE *f);
+
+/* ---- x86 CPU identity ---------------------------------------------------------
+ *
+ * Vendor, display family and display model, read with CPUID for host-tuned
+ * scheduling defaults (lockstep_width.h). The decode helpers are pure so they are
+ * unit-testable with injected register values; bwa3_host_cpu_identity is the
+ * only one that executes CPUID. */
+
+/* Nonzero iff CPUID leaf 0's vendor registers spell "AuthenticAMD". The vendor
+ * string is laid out EBX, EDX, ECX ("Auth" "enti" "cAMD"), so the arguments are
+ * the raw registers in their natural order and a swapped ECX/EDX is rejected. */
+int bwa3_x86_vendor_is_amd(uint32_t ebx, uint32_t ecx, uint32_t edx);
+
+/* Display family from CPUID leaf 1 EAX: the base family (bits 11:8), plus the
+ * extended family (bits 27:20) when the base family is 0xF. */
+uint32_t bwa3_x86_cpu_family(uint32_t leaf1_eax);
+
+/* Display model from CPUID leaf 1 EAX: the base model (bits 7:4), with the
+ * extended model (bits 19:16) as its high nibble when the base family is 0x6 or
+ * 0xF (the rule both the AMD and Intel manuals give; AMD uses only 0xF). */
+uint32_t bwa3_x86_cpu_model(uint32_t leaf1_eax);
+
+/* This host's CPU identity, read once with CPUID and cached (thread-safe).
+ * *is_amd is nonzero for an "AuthenticAMD" vendor; *family / *model are the
+ * display family and model. A non-x86 build (or a compiler without <cpuid.h>)
+ * reports 0 / 0 / 0. */
+void bwa3_host_cpu_identity(int *is_amd, uint32_t *family, uint32_t *model);
 
 #ifdef __cplusplus
 }
