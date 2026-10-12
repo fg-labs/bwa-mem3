@@ -3237,7 +3237,12 @@ struct ChainFlat {
         size_t n = keys.size();
         if (n == 0) return 0;
         const int64_t *b = keys.data();
-        while (n > 1) { const size_t h = n >> 1; b = (b[h] <= pos) ? b + h : b; n -= h; }
+        /* The step must stay a conditional move: the comparison is data-dependent
+         * (a coin flip per level), and as a branch it mispredicted ~37% of the time
+         * on x86 -- clang's cmov-conversion pass had turned the select back into a
+         * jump. BWA_UNPREDICTABLE (__builtin_unpredictable under clang) keeps it a
+         * cmov there; other compilers get the plain select. */
+        while (n > 1) { const size_t h = n >> 1; b = BWA_UNPREDICTABLE(b[h] <= pos) ? b + h : b; n -= h; }
         return (int)(b - keys.data()) + (*b <= pos);
     }
     /* Chain one seed. TIE / CAP: the tree must take this read (nothing mutated). */

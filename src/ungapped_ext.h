@@ -227,10 +227,15 @@ static inline void ungapped_walk_mis(const uint64_t *mis, int N, int h0, int a, 
             if (w == (j >> 6)) bits &= ~0ULL << (j & 63);
             if (bits) { m = (w << 6) + __builtin_ctzll(bits); break; }
         }
-        if (m > j) {
-            cur += (m - j) * a;
-            if (cur > max_sc) { max_sc = cur; max_i = m; }
-        }
+        /* No `m > j` guard: for an empty run (m == j) cur is unchanged and the
+         * record test is false (cur <= max_sc holds on entry: it starts at h0 ==
+         * max_sc and only a mismatch step, which never raises cur, precedes a
+         * run). Dropping the data-dependent guard lets the record update be a
+         * pair of conditional moves. */
+        cur += (m - j) * a;
+        const bool rec = cur > max_sc;
+        max_sc = rec ? cur : max_sc;
+        max_i  = rec ? m : max_i;
         if (m >= N) break;
         cur -= b;
         if (cur < 0) cur = 0;
@@ -289,14 +294,20 @@ static inline int ungapped_analyze(const uint8_t *qs, const uint8_t *rs, int N,
          * never straddles a 64-bit boundary. */
         mis[i >> 6] |= ((uint64_t)mism_mask) << (i & 63);
     }
+    /* Tail (< 16 bases): branch-free. The per-base mismatch test is data
+     * dependent and mispredicted often as a branch; accumulate it, and the
+     * ambiguity test, arithmetically and decide once. Returning FALLBACK after
+     * the tail instead of at the first ambiguous base is equivalent: nothing
+     * observable is written before either return. */
+    unsigned tail_ambig = 0;
     for (; i < N; i++) {
-        uint8_t qi = qs[i], ri = rs[i];
-        if (qi >= 4 || ri >= 4) return FP_STATUS_FALLBACK;
-        if (qi != ri) {
-            total_mis++;
-            mis[i >> 6] |= (1ULL << (i & 63));
-        }
+        const unsigned qi = qs[i], ri = rs[i];
+        tail_ambig |= (qi | ri) & ~3u;            /* nonzero iff a code >= 4 */
+        const unsigned ne = (unsigned)(qi != ri);
+        total_mis += (int)ne;
+        mis[i >> 6] |= ((uint64_t)ne) << (i & 63);
     }
+    if (tail_ambig) return FP_STATUS_FALLBACK;
 
     if (total_mis > x_threshold) {
         /* Only a pair within FP_TIGHT_MAX carries a tight_band (see the define);

@@ -10,7 +10,10 @@
 // adversarial pairs. It pins the two guards (E1: -w below 2, E2: z-drop) and the
 // strict tie-break as load-bearing -- each has a pair on which the walk's fields
 // differ from the kernels', so a HIT there would have changed output -- and checks
-// that a dying diagonal (E3) needs no guard.
+// that a dying diagonal (E3) needs no guard. It also pins that an ambiguous base
+// (code 4, the only one real input carries, or any code up to 127) in the 16-wide
+// blocks or the scalar tail sends the pair to the ladder, that the run-length walk
+// equals the per-base walk, and that a TIGHT result's score is the byte walk's.
 //
 // Adversarial shapes:
 //   * tie at the query end: a mismatch followed by exactly b/a matches, so the
@@ -151,7 +154,8 @@ std::vector<ExtPair> pairs_for(std::mt19937_64 &rng, const ExtScoring &sc, int w
 
 } // namespace
 
-TEST_CASE("unit/ungapped_fastpath: a HIT commits exactly the full ladder's fields, on both kernels") {
+TEST_CASE("unit/ungapped_fastpath: a HIT commits exactly the full ladder's fields, on both kernels"
+          * doctest::test_suite("unit/ungapped_fastpath")) {
     std::mt19937_64 rng(0x5EEDF00Dull);
     long n_hit = 0, n_tie_hit = 0, n_pairs = 0, n_x0 = 0, n_dead_hit = 0;
     const std::vector<GridCell> g = grid();
@@ -212,7 +216,8 @@ TEST_CASE("unit/ungapped_fastpath: a HIT commits exactly the full ladder's field
     REQUIRE(n_dead_hit > 100);
 }
 
-TEST_CASE("unit/ungapped_fastpath: strict tie-break -- the L0 pattern commits the kernels' qle") {
+TEST_CASE("unit/ungapped_fastpath: strict tie-break -- the L0 pattern commits the kernels' qle"
+          * doctest::test_suite("unit/ungapped_fastpath")) {
     // Left extension reversed prefix [X][m m m m] at default scoring, h0 = 145
     // (test/ungapped_hit_parity_test.sh's -L 0 read). The diagonal returns to h0
     // at step 5 without exceeding it: the kernels report qle = tle = 0, gscore =
@@ -247,7 +252,8 @@ TEST_CASE("unit/ungapped_fastpath: strict tie-break -- the L0 pattern commits th
     CHECK(fp2.gscore <= fp2.score - sc2.pen_clip);
 }
 
-TEST_CASE("unit/ungapped_fastpath: guard E2 (z-drop) rejects and is load-bearing; a dying diagonal (E3) needs none") {
+TEST_CASE("unit/ungapped_fastpath: guard E2 (z-drop) rejects and is load-bearing; a dying diagonal (E3) needs none"
+          * doctest::test_suite("unit/ungapped_fastpath")) {
     std::mt19937_64 rng(0xE2E3ull);
     long n_e2 = 0, n_e2_diverge = 0, n_dead = 0;
     const std::vector<GridCell> g = grid();
@@ -309,7 +315,8 @@ TEST_CASE("unit/ungapped_fastpath: guard E2 (z-drop) rejects and is load-bearing
     REQUIRE(n_dead > 100);
 }
 
-TEST_CASE("unit/ungapped_fastpath: guard E1 -- at -w 1 the ladder records a->w = 2, so the fast path is off") {
+TEST_CASE("unit/ungapped_fastpath: guard E1 -- at -w 1 the ladder records a->w = 2, so the fast path is off"
+          * doctest::test_suite("unit/ungapped_fastpath")) {
     ExtScoring sc; sc.a = 1; sc.b = 4; sc.o_del = sc.o_ins = 6; sc.e_del = sc.e_ins = 1;
     sc.pen_clip = 5; sc.zdrop = 100; sc.fill_mat();
     CHECK(sc.x_threshold(1) == -1);
@@ -323,4 +330,104 @@ TEST_CASE("unit/ungapped_fastpath: guard E1 -- at -w 1 the ladder records a->w =
     CHECK(L2.rung == 0);
     CHECK(analyze(sc, p, 1).status == FP_STATUS_FALLBACK);
     CHECK(analyze(sc, p, 2).status == FP_STATUS_HIT);
+}
+
+TEST_CASE("unit/ungapped_fastpath: an ambiguous base anywhere, including the scalar tail, falls back"
+          * doctest::test_suite("unit/ungapped_fastpath")) {
+    // The tail (< 16 bases past the last 16-wide block) folds its ambiguity test into a
+    // mask and decides after the loop, so pin it per tail position, on each side. The
+    // codes cover every bit above the two base bits (4, 8, 16, 64) and values whose low
+    // two bits alias a real base (5, 15), so a mask narrower than ~3 is caught. The
+    // 16-wide blocks test ambiguity with a signed byte compare, so their control stays
+    // below 128 (real input is 0..4).
+    ExtScoring sc; sc.a = 1; sc.b = 4; sc.o_del = sc.o_ins = 6; sc.e_del = sc.e_ins = 1;
+    sc.pen_clip = 5; sc.zdrop = 100; sc.fill_mat();
+    std::mt19937_64 rng(29);
+    const uint8_t codes[] = {4, 5, 8, 15, 16, 64};
+    int n_tail = 0, n_block = 0;
+    for (const int N : {17, 31, 33, 47, 100}) {
+        const ExtPair p = make_pair(rng, N, 10, std::vector<int>(), 30);   // perfect diagonal
+        CAPTURE(N);
+        REQUIRE(analyze(sc, p, 2).status == FP_STATUS_HIT);
+        for (const uint8_t c : codes) {
+            for (int side = 0; side < 2; ++side) {
+                CAPTURE((int)c); CAPTURE(side);
+                for (int i = N - N % 16; i < N; ++i) {
+                    ExtPair q = p;
+                    (side == 0 ? q.query : q.target)[i] = c;
+                    CAPTURE(i);
+                    REQUIRE(analyze(sc, q, 2).status == FP_STATUS_FALLBACK);
+                    ++n_tail;
+                }
+                ExtPair v = p;
+                (side == 0 ? v.query : v.target)[N / 32 * 16] = c;   // inside a 16-wide block
+                REQUIRE(analyze(sc, v, 2).status == FP_STATUS_FALLBACK);
+                ++n_block;
+            }
+        }
+    }
+    REQUIRE(n_tail == 432);   // 36 tail positions over the five lengths, x 6 codes x 2 sides
+    REQUIRE(n_block == 60);
+}
+
+TEST_CASE("unit/ungapped_fastpath: the run-length walk equals the per-base walk on every mask"
+          * doctest::test_suite("unit/ungapped_fastpath")) {
+    // ungapped_walk_mis skips from mismatch to mismatch and has no guard for an empty
+    // run (two adjacent mismatches, or one at j). Compare all three outputs against the
+    // per-base walk over random masks: sparse, dense, adjacent runs, and b = 0 (where a
+    // mismatch leaves the score unchanged and an empty run meets the record exactly).
+    std::mt19937_64 rng(31);
+    int n = 0;
+    for (int rep = 0; rep < 4000; ++rep) {
+        const int N = 1 + (int)(rng() % FP_N_MAX);
+        const int a = 1 + (int)(rng() % 3), b = (int)(rng() % 7), h0 = 1 + (int)(rng() % 60);
+        const unsigned dens = (unsigned)(rng() % 5);   // 0: none .. 4: about every third base
+        uint64_t mis[FP_MIS_NWORDS] = {0};
+        for (int j = 0; j < N; ++j) {
+            const bool m = dens != 0 && rng() % ((64u >> (dens + 1)) | 1u) == 0;
+            if (m) mis[j >> 6] |= 1ULL << (j & 63);
+            if (m && rng() % 4 == 0 && j + 1 < N) { ++j; mis[j >> 6] |= 1ULL << (j & 63); }
+        }
+        int ms, mi, cur, rms, rmi, rcur;
+        ungapped_walk_mis(mis, N, h0, a, b, &ms, &mi, &cur);
+        ungapped_walk_mis_perbase(mis, N, h0, a, b, &rms, &rmi, &rcur);
+        CAPTURE(N); CAPTURE(a); CAPTURE(b); CAPTURE(h0); CAPTURE(dens);
+        REQUIRE(ms == rms);
+        REQUIRE(mi == rmi);
+        REQUIRE(cur == rcur);
+        ++n;
+    }
+    REQUIRE(n == 4000);
+}
+
+TEST_CASE("unit/ungapped_fastpath: a TIGHT result scores the pair like the byte walk"
+          * doctest::test_suite("unit/ungapped_fastpath")) {
+    // Too many mismatches for a HIT on a short pair gives TIGHT, whose band is derived
+    // from the bitmask walk's score. The byte walk (ungapped_walk_score) reads the
+    // sequences directly and never sees the bitmask, so it checks the tail's mismatch
+    // bits and the run walk together. Mismatches are placed in the tail on purpose.
+    ExtScoring sc; sc.a = 1; sc.b = 4; sc.o_del = sc.o_ins = 6; sc.e_del = sc.e_ins = 1;
+    sc.pen_clip = 5; sc.zdrop = 0; sc.fill_mat();
+    const int w = 100;
+    const int X = sc.x_threshold(w);
+    REQUIRE(X >= 0);
+    std::mt19937_64 rng(37);
+    int n_tight = 0;
+    for (int rep = 0; rep < 2000; ++rep) {
+        const int N = 1 + (int)(rng() % FP_TIGHT_MAX);
+        std::vector<int> pos = random_positions(rng, N, X + 1 + (int)(rng() % 8));
+        for (int i = N - N % 16; i < N; ++i)
+            if (rng() % 3 == 0) pos.push_back(i);
+        const int h0 = 1 + (int)(rng() % 80);
+        const ExtPair p = make_pair(rng, N, (int)(rng() % 20), pos, h0);
+        int actual = 0;
+        for (int j = 0; j < N; ++j) actual += (p.query[j] != p.target[j]);
+        if (actual <= X) continue;
+        const FpOut fp = analyze(sc, p, w);
+        CAPTURE(rep); CAPTURE(N); CAPTURE(h0); CAPTURE(actual);
+        REQUIRE(fp.status == FP_STATUS_TIGHT);
+        REQUIRE(fp.score == ungapped_walk_score(p.query.data(), p.target.data(), N, h0, sc.a, sc.b));
+        ++n_tight;
+    }
+    REQUIRE(n_tight > 1000);
 }

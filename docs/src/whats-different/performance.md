@@ -192,6 +192,40 @@ WGS and WES slices (150 bp paired, hg38) at the default scoring, `-A 2`, `-B 6` 
 | `BWA3_CHAIN_STATS=1` | Print, once at exit, how the chaining, Pass-3 and contained-seed-skip fast paths resolved (`[chain-stats] …`): reads indexed, reads that fell back, queries answered by bucket walks versus full scans, reads the flat chaining index handed to the B-tree (equal positions, or over the cap), and how the contained-seed extension skip resolved its deferred seeds (`contained_deferred`, of which `contained_purged` had their banded-SW skipped and `contained_extended` ran in the second batch). Measurement only; output is unchanged. |
 | `BWA3_CHAIN_FLAT_CAP=<n>` | Largest number of chains a read may have on the flat chaining index before it is replayed through the B-tree (default 512, bounding the index's O(n) sorted insert). `0` sends every read to the B-tree. A malformed or negative value is reported to stderr and the default used. Output is identical at every value. |
 
+## Hot data-dependent branches ([PR #584](https://github.com/fg-labs/bwa-mem3/pull/584))
+
+Hardware counters and instruction-based sampling (IBS) on AMD Zen 5 (x86-64,
+AVX-512BW tier, clang 19.1.7, the 5M-pair WGS slice below at `-t 16`) showed
+about a fifth of dispatch slots unfilled by the frontend, most of it the refetch
+after a mispredicted branch. Four of the most frequently mispredicted branches,
+in three places, test data that is close to a coin flip, so they are now
+computed without a branch. Output is byte-identical: record md5 (non-`@PG`)
+matched the previous `main` on 5M-pair WGS and WES slices (150 bp / 76 bp paired,
+hg38), also under both `--compat` targets, at the AVX-512BW tier (x86-64) and on
+AWS Graviton 4 (arm64, NEON tier). The AVX2 tier was checked on the WGS slice
+(default mode) and also matched.
+
+- **Chaining index step.** The flat chaining index's binary-search step is
+  written as a select, but clang's conditional-move conversion had turned it back
+  into a branch, which mispredicted about 37% of the time in that profile. It is
+  marked unpredictable, so it stays a conditional move.
+- **Ungapped fast path (two branches).** The scalar tail of `ungapped_analyze`
+  (the bases past the last 16-wide block) counts mismatches and tests for
+  ambiguous bases arithmetically and decides once, and the run-length walk
+  updates its record with conditional moves instead of guarding each run.
+- **Seeding lookahead prefetch.** The lockstep SMEM driver's cross-slot
+  prefetch, a pure hint, always issues two prefetches with the address chosen by
+  mask selects, instead of branching on the lookahead slot's phase. It now warms
+  only the two blocks the slot reads next (the forward interval's `l` / `l + s`,
+  or the first backward interval's `k` / `k + s`) rather than all four blocks of
+  the forward interval or both blocks of every backward interval.
+
+Whole-aligner wall at `-t 16`, clang 19.1.7, against the previous `main`, mean
+paired difference of 4-8 interleaved reps per arm ± its standard error: AMD
+Zen 5 (x86-64, AVX-512BW tier) −2.5 ± 0.4% WGS and −4.1 ± 0.5% WES; the same host
+at the AVX2 tier −1.6 ± 0.3% WGS; AWS Graviton 4 (arm64, NEON tier) −0.3 ± 0.1%
+WGS and −0.35 ± 0.13% WES.
+
 ## CIGAR generation
 
 - **Certified band for equal-length regions (PR #575).** The global re-alignment that builds
