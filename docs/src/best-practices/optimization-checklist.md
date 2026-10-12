@@ -180,6 +180,93 @@ This is host configuration (privileged, pinned RAM), so the flag is opt-in, not 
 default, and Linux-only. See
 [Memory allocator → Large pages for the index](../user-guide/allocator.md#large-pages-for-the-index-linux-deployment-lever).
 
+## 9. Keep transparent huge pages working (Linux)
+
+bwa-mem3 asks the kernel for transparent huge pages (THP, 2 MB pages) on the
+index arrays and on its allocator's arenas, which hold the per-batch buffers.
+The kernel can only provide them when there is enough free, unfragmented memory
+when those pages are first touched. That is roughly the whole working set, about
+28 GiB for a human hg38 index. On a bare Linux host whose RAM is full of page cache
+(earlier jobs, other indices, a `cat` prewarm of the index on a host smaller than
+about 2.2× the index), part of the working set silently falls back to 4 KB pages.
+
+Measured on a 5 M-pair human WGS slice (HG00096, hg38 stride-2 index, `-t 16`,
+clang 19) on AWS Graviton4 (arm64, NEON tier) and AMD Zen 5 (x86-64, AVX-512BW
+tier) hosts:
+
+| state | cost |
+|---|---|
+| per GiB on 4 KB pages | Graviton4: ~0.38 s of a ~37 s run (~1 % wall per GiB); Zen 5: ~1.6 % wall per GiB of a ~23 s run |
+| page-cache-full host | 1.2–10 GiB of the working set observed on 4 KB pages, costing the per-GiB rate above |
+| THP set to `never` | +27.6 % wall |
+
+To keep THP working:
+
+- Keep `/sys/kernel/mm/transparent_hugepage/enabled` at `madvise` or `always`,
+  never `never`.
+- Start the run with the working set free. If the host has been busy, drop clean
+  page cache first (`sync; echo 1 | sudo tee /proc/sys/vm/drop_caches`), or run the job
+  and its I/O in a memory-limited cgroup (for example
+  `systemd-run --scope -p MemoryMax=…`) so reclaim of its own page cache stays local.
+- `echo 1 > /proc/sys/vm/compact_memory` on its own does **not** help when page
+  cache fills RAM. There are too few free 2 MB blocks to assemble.
+- Do not launch `mem` with THP disabled for the process (`MIMALLOC_ALLOW_THP=0`,
+  or a launcher that calls `prctl(PR_SET_THP_DISABLE)`, which children inherit).
+
+`bwa-mem3 mem` checks this for you on Linux. After output batches 1, 2, 4, 8, …
+it walks `/proc/self/smaps` and compares `AnonHugePages` with `Anonymous` over the
+mappings marked `THPeligible: 1`, which is memory the kernel would back with 2 MB
+pages (THP `always`, or `madvise` and advised). Memory the kernel would not back
+with THP (under `madvise`, memory that was never advised) is not counted. It
+prints a two-line `[W::main_mem]` warning on stderr, at most once per run, when
+the process has ≥ 4 GiB of anonymous memory in total and at least 1 GiB, and at
+least 4 %, of the memory judged is not on huge pages. There are three warnings:
+
+- eligible memory fell back to 4 KB pages (the page-cache case above; judged over
+  the eligible memory);
+- THP is `never` (the global `enabled`, or `hugepages-2048kB/enabled` on Linux ≥
+  6.8; judged over all anonymous memory);
+- THP is disabled for this process (`THP_enabled: 0` in `/proc/self/status`;
+  judged over all anonymous memory).
+
+A walk of `/proc/self/smaps` is not a snapshot, so a sample is up to three walks
+(re-walked while the walk looks incomplete against `RssAnon`), plus at most one
+retry on the next batch. On the hosts above (Linux 6.1) one walk took 2–4 ms
+in-process on a fully-THP ~24 GiB process. Read externally (from another process)
+the same file took ~8 ms on a fragmented host and 50–190 ms with ~26 GiB on 4 KB
+pages, because the kernel visits every page-table entry. A run samples once per
+power-of-two batch and stops at the first warning; on a fully-THP Graviton4 WGS
+run the check cost −0.007 % ± 0.031 % wall against a build without it (12
+interleaved reps per arm). The warning never changes the output. At `-v 4` each
+sample is logged as a `[D::main_mem] THP check batch N:` line, or as
+`check disabled: <reason>` when the check stops.
+
+The check is skipped silently:
+
+- at `-v 1`;
+- on kernels whose base page is not 4 KB (for example 64 KB-page arm64 kernels);
+- when the global `enabled` knob is unreadable, or it or a per-size
+  `hugepages-<N>kB/enabled` knob holds an unrecognised mode;
+- when any multi-size THP (mTHP) size other than 2 MB is enabled (Linux ≥ 6.8;
+  out of scope);
+- when `/proc/self/smaps` is unreadable.
+
+An unreadable `/proc/self/status` does not skip it, but turns off the
+completeness check against `RssAnon`. An unreadable `hugepages-<N>kB/enabled`
+knob is treated as absent (2 MB follows the global mode; other sizes are off).
+The fallback warning also needs the `THPeligible` field (Linux ≥ 5.0).
+
+The eligibility accounting is validated for the default build (mimalloc). In a
+`USE_MIMALLOC=0` build the index's `madvise` may not take effect, and under THP
+`always` its glibc heap is eligible, so a fallback warning there does not
+necessarily mean page-cache pressure.
+
+To check a run by hand, sum `AnonHugePages` and `Anonymous` over the
+`THPeligible: 1` mappings in `/proc/<pid>/smaps`, or diff `thp_fault_fallback` in
+`/proc/vmstat` before and after. A `bwa-mem3 shm` index (shared memory) and a
+`--huge-pages` reservation are not anonymous memory, so the check does not count
+them.
+
 ## Summary table
 
 | Item | Action | Reference |
@@ -194,6 +281,7 @@ default, and Linux-only. See
 | Reproducible output | `-K INT`; pins the batch size so output does not move with `-t` | [Aligning → `-K`](../user-guide/aligning.md) |
 | Pipeline overlap at very high `-t` | `--chunk-cap INT`; off by default, opt-in, not byte-identical | [`mem` → `--chunk-cap`](../cli/mem.md) |
 | 1 GB huge pages for the index (Linux) | reserve `nr_hugepages` (host-wide total), run `mem --huge-pages`; ~1.5 % lower wall on a 32-thread WGS slice (Zen3, avx2, warm page cache); alignment records byte-identical, only the `@PG` `CL:` field differs | [Memory allocator → Large pages](../user-guide/allocator.md#large-pages-for-the-index-linux-deployment-lever) |
+| Transparent huge pages (Linux) | THP `madvise`/`always`; free, unfragmented memory at start (drop page cache or a memory-limited cgroup); heed the two-line `[W::]` THP warning | [Keep transparent huge pages working](#9-keep-transparent-huge-pages-working-linux) |
 
 ---
 

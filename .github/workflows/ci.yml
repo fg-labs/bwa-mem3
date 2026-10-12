@@ -1246,6 +1246,17 @@ jobs:
           FIXTURES="$GITHUB_WORKSPACE/test/fixtures" \
           bash test/regression/chunk_cap_optin.sh
 
+      - name: THP check samples on Linux and never changes output
+        if: matrix.canonical == true
+        # The THP fallback check reads /proc and /sys from the write step; its
+        # unit tests use an injected reader, so this is the run of the real
+        # reads and the -v 4 debug line. Skips the sample check when the
+        # runner's THP config is out of the check's scope.
+        run: |
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          FIXTURES="$GITHUB_WORKSPACE/test/fixtures" \
+          bash test/regression/thp_check_smoke.sh
+
       - name: --rescue-kmer/--rescue-band reject malformed values
         if: matrix.canonical == true
         # Both were parsed with atoi(), which maps unparseable text to 0. For

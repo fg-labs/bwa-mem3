@@ -1269,6 +1269,12 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
         free(ret);
         tprof[SAM_IO][0] += __rdtsc() - tim;
 
+        /* Once per batch, on the write step (one batch at a time, in order):
+         * warn if THP-eligible memory is on 4 KB pages (or THP is off). Samples
+         * batches 1, 2, 4, 8, ... (plus one retry after an incomplete sample);
+         * stderr-only, never touches output. See bwa_thp.h. */
+        bwa_thp_check_batch(&aux->thp);
+
         return 0;
     } // step 2
 
