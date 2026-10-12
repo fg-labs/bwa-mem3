@@ -66,7 +66,8 @@ static bool run_case(FMI_search *fmi,
                      int32_t *min_intv_array_in,
                      int32_t *rid_array_in,
                      const bseq1_t *seq_,
-                     int32_t *query_cum_len_ar)
+                     int32_t *query_cum_len_ar,
+                     int64_t expect_min_smem = 0)
 {
     // Tight upper bound: the scalar path emits at most O(readlength) SMEMs per
     // read (one per backward-step decision plus the final prev[0]), so
@@ -131,6 +132,12 @@ static bool run_case(FMI_search *fmi,
             ok = false;
         } else if (memcmp(qpa_s, qpa_l, numReads * sizeof(int32_t)) != 0) {
             fprintf(stderr, "[FAIL] %s: query_pos_array write-back differs\n", case_name);
+            ok = false;
+        } else if (n_scalar < expect_min_smem) {
+            /* Parity between two empty outputs proves nothing about emission. */
+            fprintf(stderr, "[FAIL] %s: emission path not exercised: got %lld SMEMs, "
+                    "expected >= %lld\n", case_name, (long long)n_scalar,
+                    (long long)expect_min_smem);
             ok = false;
         } else {
             fprintf(stderr, "[PASS] %s  (n_smem=%lld)\n", case_name, (long long)n_scalar);
@@ -687,6 +694,57 @@ int main(int argc, char *argv[]) {
                 free(enc_qdb); free(seq_); free(cum_len);
             }
             for (int32_t i = 0; i < numReads; i++) free(bufs[i]);
+            free(ref);
+        }
+    }
+
+    /* Case 13z: slot recycle at the AMD Zen 5 host-default width (32 unless a -D
+     * override clamps it), the width Zen 5 hosts run by default. Cases 1-13 run
+     * at the compile-time default and never put more reads than slots through
+     * real reference matches; here 70 reference substrings (more than twice the
+     * width) with interior pivots make every slot recycle with non-empty
+     * prev/match state, and the case must emit SMEMs. The width is pinned
+     * through the runtime global and restored afterwards. */
+    {
+        const int32_t zen5_n = bwa3_smem_host_default_width(1, 0x1a, 0x02);
+        int32_t ref_len = 0;
+        char *ref = read_fasta_seq(argv[1], &ref_len);
+        enum { NZ = 70 };
+        const int32_t rl = 60;
+        const int32_t step = 73;   /* 69 * 73 + 60 = 5097 <= phiX's 5386 bp */
+        if (!ref) {
+            fprintf(stderr, "[SKIP] Case 13z: could not read reference FASTA '%s'\n", argv[1]);
+        } else if ((NZ - 1) * step + rl > ref_len || zen5_n >= NZ) {
+            fprintf(stderr, "[FAIL] Case 13z: reference too short (%d bp) or width %d "
+                    "leaves no recycle with %d reads\n", ref_len, zen5_n, (int)NZ);
+            total_cases++;
+            free(ref);
+        } else {
+            char *bufs[NZ];
+            const char *reads[NZ];
+            int32_t qpa[NZ], mia[NZ], rid[NZ];
+            for (int32_t i = 0; i < NZ; i++) {
+                bufs[i] = (char *)malloc(rl + 1);
+                memcpy(bufs[i], ref + i * step, rl);
+                bufs[i][rl] = '\0';
+                reads[i] = bufs[i];
+                qpa[i] = (i & 1) ? (rl / 2) : (rl - 1);
+                mia[i] = 1;
+                rid[i] = i;
+            }
+            uint8_t *enc_qdb; bseq1_t *seq_; int32_t *cum_len;
+            encode_reads(reads, NZ, &enc_qdb, &seq_, &cum_len);
+            const int32_t saved_n = g_smem_lockstep_n;
+            g_smem_lockstep_n = zen5_n;
+            char name[128];
+            snprintf(name, sizeof(name),
+                     "Case 13z: numReads(%d) > N(%d), real reference substrings at the Zen 5 host-default width",
+                     (int)NZ, (int)zen5_n);
+            run_case(fmi, name, NZ, rl, 19, enc_qdb, qpa, mia, rid, seq_, cum_len,
+                     /*expect_min_smem=*/NZ);
+            g_smem_lockstep_n = saved_n;
+            free(enc_qdb); free(seq_); free(cum_len);
+            for (int32_t i = 0; i < NZ; i++) free(bufs[i]);
             free(ref);
         }
     }

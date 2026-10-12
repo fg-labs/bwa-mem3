@@ -442,10 +442,11 @@ int main(int argc, char *argv[]) {
         free(enc_qdb); free(seq_); free(cum_len);
     }
 
-    /* Case 11s: same slot-recycle path as 11r, but at the SHIPPED default width
-     * (no pin), so numReads must exceed the default. 30 reads > 24 forces the
-     * recycle branch at the width the binary actually runs. This is the coverage
-     * 11r's width-8 pin does not give (the recycle path at N = default). */
+    /* Case 11s: same slot-recycle path as 11r, but at the compile-time default
+     * width (no pin), so numReads must exceed the default. 30 reads > 24 forces
+     * the recycle branch at the width non-Zen 5 hosts run. This is the coverage
+     * 11r's width-8 pin does not give (the recycle path at N = default); Case 11z
+     * covers the AMD Zen 5 host default. */
     {
         /* 30 sliding 44-bp windows over the phiX start (src is 122 bp, so a
          * window at offset i needs i + 44 <= 122, i.e. up to i = 78 > 29). */
@@ -463,10 +464,52 @@ int main(int argc, char *argv[]) {
         int32_t max_readlength = 44;
         uint8_t *enc_qdb; bseq1_t *seq_; int32_t *cum_len;
         encode_reads(reads, numReads, &enc_qdb, &seq_, &cum_len);
-        run_case(fmi, "Case 11s: numReads > default N, slot recycle at the shipped width",
+        run_case(fmi, "Case 11s: numReads > default N, slot recycle at the compile-time default width",
                  numReads, max_readlength, /*minSeed=*/10, /*max_intv=*/5,
                  enc_qdb, seq_, cum_len, /*expect_min_seeds=*/20);
         free(enc_qdb); free(seq_); free(cum_len);
+    }
+
+    /* Case 11z: slot recycle at the AMD Zen 5 host-default width (32 unless a -D
+     * override clamps it), the width Zen 5 hosts run by default. 70 sliding
+     * 44-bp windows (offsets 0..69 of the 122-bp src) exceed that width twice
+     * over, so every slot recycles at least once with non-empty match_buf
+     * contents. The width is pinned through the runtime global and restored,
+     * as in Case 11r. */
+    {
+        const int32_t zen5_n = bwa3_bwtseed_host_default_width(1, 0x1a, 0x02);
+        enum { NZ = 70 };
+        const char *reads[NZ];
+        const char *src =
+            "GAGTTTTATCGCTTCCATGACGCAGAAGTTAACACTTTCGGATATTTCTGATGAGTCGAAAA"
+            "ATTATCTTGATAAAGCAGGAATTACTACTGCTTGTTTACGAATTAAATCGAAGTGGACTGCT";
+        char buf[NZ][45];
+        for (int i = 0; i < NZ; i++) {
+            memcpy(buf[i], src + i, 44);
+            buf[i][44] = '\0';
+            reads[i] = buf[i];
+        }
+        if (zen5_n >= NZ) {
+            fprintf(stderr, "[FAIL] Case 11z: host-default width %d leaves no recycle "
+                    "with %d reads\n", zen5_n, (int)NZ);
+            total_cases++;
+        } else {
+            int32_t numReads = NZ;
+            int32_t max_readlength = 44;
+            uint8_t *enc_qdb; bseq1_t *seq_; int32_t *cum_len;
+            encode_reads(reads, numReads, &enc_qdb, &seq_, &cum_len);
+            const int32_t saved_n = g_bwtseed_lockstep_n;
+            g_bwtseed_lockstep_n = zen5_n;
+            char name[128];
+            snprintf(name, sizeof(name),
+                     "Case 11z: numReads(%d) > N(%d), slot recycle at the Zen 5 host-default width",
+                     (int)NZ, (int)zen5_n);
+            run_case(fmi, name,
+                     numReads, max_readlength, /*minSeed=*/10, /*max_intv=*/5,
+                     enc_qdb, seq_, cum_len, /*expect_min_seeds=*/NZ);
+            g_bwtseed_lockstep_n = saved_n;
+            free(enc_qdb); free(seq_); free(cum_len);
+        }
     }
 
     /* Case 12p: phiX subsequence with mid-read N — combines real matches

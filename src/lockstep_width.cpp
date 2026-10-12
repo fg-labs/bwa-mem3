@@ -8,9 +8,103 @@
 #include <time.h>
 #include <errno.h>
 #include <mutex>
+#include "lockstep_width_internal.h"
+#include "simd_dispatch.h"  /* bwa3_host_cpu_identity */
+
+/* ---- host-tuned default widths (policy and measurements: lockstep_width.h) - */
+
+static int s_smem_lockstep_n_source    = BWA3_LOCKSTEP_WIDTH_SRC_DEFAULT;
+static int s_bwtseed_lockstep_n_source = BWA3_LOCKSTEP_WIDTH_SRC_DEFAULT;
+
+int bwa3_smem_lockstep_n_source(void)    { return s_smem_lockstep_n_source; }
+int bwa3_bwtseed_lockstep_n_source(void) { return s_bwtseed_lockstep_n_source; }
+
+int bwa3_amd_family_1ah_model_is_zen5(uint32_t model) {
+    /* Linux bsp_init_amd, family 0x1a: Zen 5 = 0x00-0x2f, 0x40-0x4f, 0x60-0x7f,
+     * 0xd0-0xd7 (Zen 6 = 0x50-0x5f, 0x80-0xaf, 0xc0-0xcf, 0xd8-0xef). */
+    return model <= 0x2fu
+        || (model >= 0x40u && model <= 0x4fu)
+        || (model >= 0x60u && model <= 0x7fu)
+        || (model >= 0xd0u && model <= 0xd7u);
+}
+
+int bwa3_cpu_is_amd_zen5(int is_amd, uint32_t family, uint32_t model) {
+    return is_amd && family == 0x1au && bwa3_amd_family_1ah_model_is_zen5(model);
+}
+
+/* Clamp a width into [lo, hi]. */
+static int32_t bwa3_clamp_width(int32_t w, int32_t lo, int32_t hi) {
+    return w < lo ? lo : (w > hi ? hi : w);
+}
+
+int32_t bwa3_smem_host_default_width(int is_amd, uint32_t family, uint32_t model) {
+    if (bwa3_cpu_is_amd_zen5(is_amd, family, model))
+        return bwa3_clamp_width(BWA3_ZEN5_SMEM_LOCKSTEP_N,
+                                SMEM_LOCKSTEP_N, SMEM_LOCKSTEP_N_MAX);
+    return SMEM_LOCKSTEP_N;
+}
+
+int32_t bwa3_bwtseed_host_default_width(int is_amd, uint32_t family, uint32_t model) {
+    if (bwa3_cpu_is_amd_zen5(is_amd, family, model))
+        return bwa3_clamp_width(BWA3_ZEN5_BWTSEED_LOCKSTEP_N,
+                                BWTSEED_LOCKSTEP_N, BWTSEED_LOCKSTEP_N_MAX);
+    return BWTSEED_LOCKSTEP_N;
+}
+
+/* The host default for a width whose compile-time default is `dflt`: the
+ * clamped host_width, labelled HOST only when it differs from `dflt`. */
+static bwa3_lockstep_width_res_t bwa3_host_res(int32_t host_width, int32_t dflt,
+                                               int32_t cap) {
+    bwa3_lockstep_width_res_t r;
+    r.width = bwa3_clamp_width(host_width, dflt, cap);
+    r.src   = r.width != dflt ? BWA3_LOCKSTEP_WIDTH_SRC_HOST
+                              : BWA3_LOCKSTEP_WIDTH_SRC_DEFAULT;
+    return r;
+}
+
+bwa3_lockstep_width_res_t bwa3_resolve_smem_width(int32_t pinned, int probe_on,
+                                                  int32_t host_width) {
+    if (pinned > 0) {
+        bwa3_lockstep_width_res_t r = {pinned, BWA3_LOCKSTEP_WIDTH_SRC_ENV};
+        return r;
+    }
+    if (probe_on) {
+        bwa3_lockstep_width_res_t r = {0, BWA3_LOCKSTEP_WIDTH_SRC_PROBE};
+        return r;
+    }
+    return bwa3_host_res(host_width, SMEM_LOCKSTEP_N, SMEM_LOCKSTEP_N_MAX);
+}
+
+bwa3_lockstep_width_res_t bwa3_resolve_smem_width_from_probe(int32_t raw_mlp,
+                                                             int32_t host_width) {
+    if (raw_mlp > 0) {
+        bwa3_lockstep_width_res_t r = {bwa3_lockstep_width_from_probe(raw_mlp),
+                                       BWA3_LOCKSTEP_WIDTH_SRC_PROBE};
+        return r;
+    }
+    return bwa3_host_res(host_width, SMEM_LOCKSTEP_N, SMEM_LOCKSTEP_N_MAX);
+}
+
+bwa3_lockstep_width_res_t bwa3_resolve_bwtseed_width(int32_t pinned,
+                                                     int32_t host_width) {
+    if (pinned > 0) {
+        bwa3_lockstep_width_res_t r = {pinned, BWA3_LOCKSTEP_WIDTH_SRC_ENV};
+        return r;
+    }
+    return bwa3_host_res(host_width, BWTSEED_LOCKSTEP_N, BWTSEED_LOCKSTEP_N_MAX);
+}
+
+const char *bwa3_lockstep_width_source_name(int src) {
+    switch (src) {
+    case BWA3_LOCKSTEP_WIDTH_SRC_ENV:   return "env pin";
+    case BWA3_LOCKSTEP_WIDTH_SRC_PROBE: return "startup probe";
+    case BWA3_LOCKSTEP_WIDTH_SRC_HOST:  return "host default: AMD Zen 5";
+    default:                            return "default";
+    }
+}
 
 /* Runtime phase-2 lockstep width. Defaults to the compile-time floor so a
- * binary that never calls the startup probe is identical to the old constant. */
+ * binary that never calls the initializer is identical to the old constant. */
 int32_t g_smem_lockstep_n = SMEM_LOCKSTEP_N;
 
 int32_t bwa3_lockstep_width_from_probe(int32_t raw_mlp) {
@@ -67,7 +161,7 @@ static int64_t bwa3_now_ns(void) {
 int32_t bwa3_measure_mlp(const void *base, int64_t n_blocks,
                          size_t stride, size_t word_off) {
     /* Too small to measure DRAM behaviour (e.g. a tiny test index): let the
-     * caller fall back to the compiled default. */
+     * caller fall back to the host default. */
     if (base == NULL || n_blocks < 4096) return 0;
 
     const char    *bp  = (const char *)base;
@@ -152,33 +246,35 @@ void bwa3_init_smem_lockstep_width(const void *base, int64_t n_blocks,
     std::call_once(once, [&]() {
     const char *env = getenv("BWA3_SMEM_LOCKSTEP_N");
     const int32_t pinned = bwa3_lockstep_width_parse_env(env);
-    if (pinned > 0) {
-        /* A valid override pins the width explicitly, so gated/CI runs pay no
-         * measurement cost and stay deterministic. */
-        g_smem_lockstep_n = pinned;
-    } else {
-        if (pinned < 0)
-            /* Set but invalid: do NOT silently accept it. Diagnose, then fall
-             * through to the same resolution as an unset value below. */
-            fprintf(stderr,
-                    "ERROR: BWA3_SMEM_LOCKSTEP_N=\"%s\" is not a positive integer "
-                    "(<= %d); ignoring it (resolving as if unset).\n",
-                    env, SMEM_LOCKSTEP_N_MAX);
-        /* No explicit pin. The startup MLP probe is OPT-IN, not the default:
-         * measured across architectures (x86/arm), core counts, and page sizes,
-         * the lockstep width is a flat ~1% knob end-to-end, while the probe
-         * itself costs a non-trivial single-threaded startup pass. So by default
-         * we keep the compile-time SMEM_LOCKSTEP_N (the value the probe converges
-         * to on all benchmarked hardware -- output is unchanged, the probe cost
-         * is not paid). BWA3_SMEM_LOCKSTEP_PROBE=1 opts back into the probe to
-         * self-calibrate on new/untested hardware. Truthy opt-in
-         * (bwa3_lockstep_probe_enabled): any value other than unset, empty, or
-         * "0" enables it, so unset it (or set it to 0) to disable. */
-        if (bwa3_lockstep_probe_enabled(getenv("BWA3_SMEM_LOCKSTEP_PROBE")))
-            g_smem_lockstep_n = bwa3_lockstep_width_from_probe(
-                bwa3_measure_mlp(base, n_blocks, stride, word_off));
-        /* else: g_smem_lockstep_n keeps its compile-time SMEM_LOCKSTEP_N init. */
-    }
+    if (pinned < 0)
+        /* Set but invalid: do NOT silently accept it. Diagnose, then resolve
+         * exactly as an unset value. */
+        fprintf(stderr,
+                "ERROR: BWA3_SMEM_LOCKSTEP_N=\"%s\" is not a positive integer "
+                "(<= %d); ignoring it (resolving as if unset).\n",
+                env, SMEM_LOCKSTEP_N_MAX);
+    /* The startup MLP probe is OPT-IN, not the default: it costs a
+     * single-threaded startup pass and picks the per-access latency knee, which
+     * sits below the whole-aligner wall optimum on hosts that keep gaining from
+     * a wider width (Zen 5: knee 16-32 across startups, wall optimum 32). So by
+     * default the width is the host-tuned value where one was measured, else the
+     * compile-time SMEM_LOCKSTEP_N. BWA3_SMEM_LOCKSTEP_PROBE=1 opts back into
+     * the probe to self-calibrate on new/untested hardware. Truthy opt-in
+     * (bwa3_lockstep_probe_enabled): any value other than unset, empty, or "0"
+     * enables it, so unset it (or set it to 0) to disable. */
+    const int probe_on = bwa3_lockstep_probe_enabled(getenv("BWA3_SMEM_LOCKSTEP_PROBE"));
+    int is_amd = 0;
+    uint32_t family = 0, model = 0;
+    bwa3_host_cpu_identity(&is_amd, &family, &model);
+    const int32_t host_width = bwa3_smem_host_default_width(is_amd, family, model);
+    /* A valid pin is taken alone, so gated/CI runs pay no measurement cost and
+     * stay deterministic; the probe runs only when the resolver asks for it. */
+    bwa3_lockstep_width_res_t r = bwa3_resolve_smem_width(pinned, probe_on, host_width);
+    if (r.src == BWA3_LOCKSTEP_WIDTH_SRC_PROBE)
+        r = bwa3_resolve_smem_width_from_probe(
+            bwa3_measure_mlp(base, n_blocks, stride, word_off), host_width);
+    g_smem_lockstep_n = r.width;
+    s_smem_lockstep_n_source = r.src;
     });
 }
 
@@ -196,11 +292,11 @@ int32_t g_bwtseed_lockstep = BWA3_BWTSEED_LOCKSTEP_DEFAULT;
 /* ---- third-pass bwtseed lockstep WIDTH (see lockstep_width.h) -------------- */
 
 /* Runtime third-pass lockstep width. Defaults to the compile-time BWTSEED_LOCKSTEP_N
- * so a binary that never calls the resolver is identical to the constant. */
+ * so a binary that never calls the initializer is identical to the constant. */
 int32_t g_bwtseed_lockstep_n = BWTSEED_LOCKSTEP_N;
 
 int32_t bwa3_bwtseed_width_parse_env(const char *env) {
-    if (env == NULL || env[0] == '\0') return 0;  /* unset/empty: keep the default */
+    if (env == NULL || env[0] == '\0') return 0;  /* unset/empty: use the host default */
 
     errno = 0;
     char *end = NULL;
@@ -219,15 +315,18 @@ void bwa3_init_bwtseed_lockstep_width(void) {
     std::call_once(once, [] {
         const char *env = getenv("BWA3_BWTSEED_LOCKSTEP_N");
         const int32_t pinned = bwa3_bwtseed_width_parse_env(env);
-        if (pinned > 0) {
-            g_bwtseed_lockstep_n = pinned;   /* explicit pin (also the gate/CI path) */
-        } else if (pinned < 0) {
+        if (pinned < 0)
             fprintf(stderr,
                     "ERROR: BWA3_BWTSEED_LOCKSTEP_N=\"%s\" is not a positive integer "
                     "(<= %d); ignoring it (resolving as if unset).\n",
                     env, BWTSEED_LOCKSTEP_N_MAX);
-        }
-        /* else: g_bwtseed_lockstep_n keeps its compile-time default. */
+        int is_amd = 0;
+        uint32_t family = 0, model = 0;
+        bwa3_host_cpu_identity(&is_amd, &family, &model);
+        const bwa3_lockstep_width_res_t r = bwa3_resolve_bwtseed_width(
+            pinned, bwa3_bwtseed_host_default_width(is_amd, family, model));
+        g_bwtseed_lockstep_n = r.width;   /* a pin is also the gate/CI path */
+        s_bwtseed_lockstep_n_source = r.src;
     });
 }
 

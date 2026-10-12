@@ -1760,8 +1760,8 @@ void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
 
     const int32_t N = g_smem_lockstep_n;
     // slots[] is a fixed SMEM_LOCKSTEP_N_MAX stack array indexed in [0, N);
-    // the env parser clamps to that range, but a direct g_smem_lockstep_n write
-    // (e.g. a test, or a future calibration) could exceed it -- guard the bound.
+    // the env parser and the host default clamp to that range, but a direct
+    // g_smem_lockstep_n write (e.g. a test) could exceed it -- guard the bound.
     xassert(N >= 1 && N <= SMEM_LOCKSTEP_N_MAX,
             "g_smem_lockstep_n out of range [1, SMEM_LOCKSTEP_N_MAX]");
     // LISA trick #4: hybrid SoA layout. `slots[]` holds only the small hot
@@ -1787,7 +1787,8 @@ void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
     // bound (e.g. MAX_SMEM_PER_SLOT) or shrink when cache.per_slot greatly
     // exceeds the current batch.
     /* Fixed-size on the stack (compile-time MAX); only the first N are used,
-     * where N = g_smem_lockstep_n is the startup-probed runtime width. */
+     * where N = g_smem_lockstep_n is the runtime width resolved at startup
+     * (env pin, opt-in probe, host-tuned default, or compile-time default). */
     BatchSlot slots[SMEM_LOCKSTEP_N_MAX] = {};
     static thread_local LockstepSmemCache cache;
     const size_t per_slot_smems = (size_t)max_readlength;
@@ -1795,7 +1796,8 @@ void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
         if (cache.prev  != nullptr) _mm_free(cache.prev);
         if (cache.match != nullptr) _mm_free(cache.match);
         // Grow on EITHER dimension: g_smem_lockstep_n (N) can rise after first
-        // use (BWA3_SMEM_LOCKSTEP_N / the MLP probe), and sizing only on per_slot
+        // use (BWA3_SMEM_LOCKSTEP_N / the MLP probe / the host default, or a
+        // direct write in a test), and sizing only on per_slot
         // would leave slots[N-1] pointing past the allocation.
         const size_t alloc_slots = (size_t)(N > cache.n_slots ? N : cache.n_slots);
         const size_t alloc_per   = per_slot_smems > cache.per_slot ? per_slot_smems : cache.per_slot;
@@ -2018,13 +2020,14 @@ int64_t FMI_search::bwtSeedStrategyAllPosOneThread_lockstep(uint8_t *enc_qdb,
     if (numReads <= 0) return 0;
 
     // Runtime lockstep width (g_bwtseed_lockstep_n, resolved once at startup from
-    // the compile-time default or a BWA3_BWTSEED_LOCKSTEP_N pin). Byte-identical
+    // a BWA3_BWTSEED_LOCKSTEP_N pin, else the host default: 32 on AMD Zen 5
+    // (bwa3_bwtseed_host_default_width), the compile-time default elsewhere). Byte-identical
     // across widths -- batching only. The on-stack slot array is sized to the
     // compile-time BWTSEED_LOCKSTEP_N_MAX so the runtime width can exceed the default.
     const int32_t N = g_bwtseed_lockstep_n;
     // slots[] is a fixed BWTSEED_LOCKSTEP_N_MAX stack array indexed in [0, N);
-    // the env parser clamps to that range, but a direct g_bwtseed_lockstep_n write
-    // (e.g. a test, or a future calibration) could exceed it -- guard the bound.
+    // the env parser and the host default clamp to that range, but a direct
+    // g_bwtseed_lockstep_n write (e.g. a test) could exceed it -- guard the bound.
     xassert(N >= 1 && N <= BWTSEED_LOCKSTEP_N_MAX,
             "g_bwtseed_lockstep_n out of range [1, BWTSEED_LOCKSTEP_N_MAX]");
 
@@ -2038,7 +2041,8 @@ int64_t FMI_search::bwtSeedStrategyAllPosOneThread_lockstep(uint8_t *enc_qdb,
     if (per_slot_smems > cache.per_slot || N > cache.n_slots) {
         if (cache.match != nullptr) _mm_free(cache.match);
         // Grow on EITHER dimension: g_bwtseed_lockstep_n (N) can rise after first
-        // use (a BWA3_BWTSEED_LOCKSTEP_N pin / a future per-host calibration), and
+        // use (a BWA3_BWTSEED_LOCKSTEP_N pin / the host default, or a direct
+        // write in a test), and
         // sizing only on per_slot would leave slots[N-1] pointing past the
         // allocation. Mirrors the phase-2 SMEM cache (LockstepSmemCache) above.
         const size_t alloc_slots = (size_t)(N > cache.n_slots ? N : cache.n_slots);
