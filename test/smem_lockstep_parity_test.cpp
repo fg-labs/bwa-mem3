@@ -3,10 +3,12 @@
  * numTotalSmem, query_pos_array write-back) must be byte-identical.
  *
  * Usage: smem_lockstep_parity_test <reference FASTA that is also the index prefix>
- *   e.g. smem_lockstep_parity_test /path/to/hg38.fa
- * Cases 13 and 14 read the reference sequence from that FASTA; an unreadable
- * (or, for Case 14, too short) FASTA fails them rather than skipping, so the
- * real-match and slot-recycle coverage cannot be lost silently.
+ * The checked-in phiX fixture (test/fixtures/phix.fa) is REQUIRED, not just an
+ * example: Cases 13, 13z and 14 read reads from that FASTA and assert emission
+ * floors that assume a single-contig, all-ACGT reference, so a run against a
+ * different index can legitimately fail them. An unreadable (or, for Case 14,
+ * too short) FASTA fails them rather than skipping, so the real-match and
+ * slot-recycle coverage cannot be lost silently.
  */
 
 #include <assert.h>
@@ -59,6 +61,14 @@ static int64_t smem_array_first_mismatch(const SMEM *a, const SMEM *b, int64_t n
 static int32_t total_cases = 0;
 static int32_t passed_cases = 0;
 
+/* A fixed width a case pins, clamped to the build's SMEM_LOCKSTEP_N_MAX so a
+ * -D build with a small cap still runs every case instead of tripping the
+ * driver's width assert. */
+static int32_t clamp_width(int32_t w)
+{
+    return w < SMEM_LOCKSTEP_N_MAX ? w : SMEM_LOCKSTEP_N_MAX;
+}
+
 static bool run_case(FMI_search *fmi,
                      const char *case_name,
                      int32_t numReads,
@@ -70,7 +80,8 @@ static bool run_case(FMI_search *fmi,
                      int32_t *rid_array_in,
                      const bseq1_t *seq_,
                      int32_t *query_cum_len_ar,
-                     int64_t expect_min_smem = 0)
+                     int64_t expect_min_smem = 0,
+                     const bool *expect_smem_for_read = NULL)
 {
     // Tight upper bound: the scalar path emits at most O(readlength) SMEMs per
     // read (one per backward-step decision plus the final prev[0]), so
@@ -142,7 +153,29 @@ static bool run_case(FMI_search *fmi,
                     "expected >= %lld\n", case_name, (long long)n_scalar,
                     (long long)expect_min_smem);
             ok = false;
-        } else {
+        } else if (expect_smem_for_read != NULL) {
+            /* Every flagged read must have emitted at least one SMEM. */
+            bool *seen = (bool *)calloc(numReads, sizeof(bool));
+            int32_t missing = -1;
+            if (seen == NULL) {
+                fprintf(stderr, "[FAIL] %s: allocation failed\n", case_name);
+                ok = false;
+            } else {
+                for (int64_t j = 0; j < n_scalar; j++) {
+                    const int32_t r = scalar_out[j].rid;
+                    if (r >= 0 && r < numReads) seen[r] = true;
+                }
+                for (int32_t r = 0; r < numReads && missing < 0; r++)
+                    if (expect_smem_for_read[r] && !seen[r]) missing = r;
+                free(seen);
+                if (missing >= 0) {
+                    fprintf(stderr, "[FAIL] %s: read %d emitted no SMEM\n",
+                            case_name, missing);
+                    ok = false;
+                }
+            }
+        }
+        if (ok) {
             fprintf(stderr, "[PASS] %s  (n_smem=%lld)\n", case_name, (long long)n_scalar);
             passed_cases++;
         }
@@ -253,7 +286,13 @@ int main(int argc, char *argv[]) {
         free(enc_qdb); free(seq_); free(cum_len);
     }
 
-    /* Case 2: numReads < N (default N=4 → use 2 reads). Exercises the
+    /* Cases 2-4 and 6 pin the width to N=4 (clamped to SMEM_LOCKSTEP_N_MAX), so
+     * their read counts sit below, at, one above and past it as described,
+     * whatever the compile-time default. Cases 2-4 are defined by where their
+     * read count sits relative to N=4, so a build capped below 4 skips them
+     * (reported as SKIP) rather than running them at a width they don't describe.
+     *
+     * Case 2: numReads < N (N=4, 2 reads). Exercises the
      * "unused slots" path where the driver must mark slot indices >= numReads
      * as DONE/invalid at entry so the flush pass skips them. */
     {
@@ -268,9 +307,16 @@ int main(int argc, char *argv[]) {
         int32_t qpa[] = {0, 0};
         int32_t mia[] = {1, 1};
         int32_t rid[] = {0, 1};
-        run_case(fmi, "Case 2: numReads < N",
-                 numReads, max_readlength, 19,
-                 enc_qdb, qpa, mia, rid, seq_, cum_len);
+        const int32_t saved_n = g_smem_lockstep_n;
+        g_smem_lockstep_n = clamp_width(4);
+        if (g_smem_lockstep_n == 4)
+            run_case(fmi, "Case 2: numReads < N",
+                     numReads, max_readlength, 19,
+                     enc_qdb, qpa, mia, rid, seq_, cum_len);
+        else
+            fprintf(stderr, "[SKIP] Case 2: needs N=4, but SMEM_LOCKSTEP_N_MAX is %d\n",
+                    (int)SMEM_LOCKSTEP_N_MAX);
+        g_smem_lockstep_n = saved_n;
         free(enc_qdb); free(seq_); free(cum_len);
     }
 
@@ -291,9 +337,16 @@ int main(int argc, char *argv[]) {
         int32_t qpa[] = {0, 0, 0, 0};
         int32_t mia[] = {1, 1, 1, 1};
         int32_t rid[] = {0, 1, 2, 3};
-        run_case(fmi, "Case 3: numReads == N",
-                 numReads, max_readlength, 19,
-                 enc_qdb, qpa, mia, rid, seq_, cum_len);
+        const int32_t saved_n = g_smem_lockstep_n;
+        g_smem_lockstep_n = clamp_width(4);
+        if (g_smem_lockstep_n == 4)
+            run_case(fmi, "Case 3: numReads == N",
+                     numReads, max_readlength, 19,
+                     enc_qdb, qpa, mia, rid, seq_, cum_len);
+        else
+            fprintf(stderr, "[SKIP] Case 3: needs N=4, but SMEM_LOCKSTEP_N_MAX is %d\n",
+                    (int)SMEM_LOCKSTEP_N_MAX);
+        g_smem_lockstep_n = saved_n;
         free(enc_qdb); free(seq_); free(cum_len);
     }
 
@@ -314,9 +367,16 @@ int main(int argc, char *argv[]) {
         int32_t qpa[] = {0, 0, 0, 0, 0};
         int32_t mia[] = {1, 1, 1, 1, 1};
         int32_t rid[] = {0, 1, 2, 3, 4};
-        run_case(fmi, "Case 4: numReads == N+1",
-                 numReads, max_readlength, 19,
-                 enc_qdb, qpa, mia, rid, seq_, cum_len);
+        const int32_t saved_n = g_smem_lockstep_n;
+        g_smem_lockstep_n = clamp_width(4);
+        if (g_smem_lockstep_n == 4)
+            run_case(fmi, "Case 4: numReads == N+1",
+                     numReads, max_readlength, 19,
+                     enc_qdb, qpa, mia, rid, seq_, cum_len);
+        else
+            fprintf(stderr, "[SKIP] Case 4: needs N=4, but SMEM_LOCKSTEP_N_MAX is %d\n",
+                    (int)SMEM_LOCKSTEP_N_MAX);
+        g_smem_lockstep_n = saved_n;
         free(enc_qdb); free(seq_); free(cum_len);
     }
 
@@ -346,7 +406,9 @@ int main(int argc, char *argv[]) {
     }
 
     /* Case 6: numReads not divisible by N (tail partial batch).
-     * After filling N=4 slots, 3 more reads get pulled in as slots retire.
+     * At N=4, after filling 4 slots, 3 more reads get pulled in as slots retire.
+     * A build capped below 4 runs it at the cap (2 or 3), where 7 reads still
+     * leave a partial tail batch.
      * When only fewer-than-N reads remain and the last ones finish, the
      * driver must correctly mark the slots retired (input_idx = -1) without
      * trying to recycle from an exhausted queue. */
@@ -360,16 +422,19 @@ int main(int argc, char *argv[]) {
             "TTTACCCAGGGCTTTACCCAGGGCTTTACCCA",
             "ATATATATATATATATATATATATATATATAT",
         };
-        int32_t numReads = 7;  /* 4 initial + 3 recycles; not divisible by N=4 */
+        int32_t numReads = 7;  /* not a multiple of N at N=4, 3 or 2 */
         int32_t max_readlength = 32;
         uint8_t *enc_qdb; bseq1_t *seq_; int32_t *cum_len;
         encode_reads(reads, numReads, &enc_qdb, &seq_, &cum_len);
         int32_t qpa[] = {0, 0, 0, 0, 0, 0, 0};
         int32_t mia[] = {1, 1, 1, 1, 1, 1, 1};
         int32_t rid[] = {0, 1, 2, 3, 4, 5, 6};
+        const int32_t saved_n = g_smem_lockstep_n;
+        g_smem_lockstep_n = clamp_width(4);
         run_case(fmi, "Case 6: numReads not divisible by N",
                  numReads, max_readlength, 19,
                  enc_qdb, qpa, mia, rid, seq_, cum_len);
+        g_smem_lockstep_n = saved_n;
         free(enc_qdb); free(seq_); free(cum_len);
     }
 
@@ -721,10 +786,16 @@ int main(int argc, char *argv[]) {
             /* As for Case 13: a missing reference fails the case. */
             total_cases++;
             fprintf(stderr, "[FAIL] Case 13z: could not read reference FASTA '%s'\n", argv[1]);
-        } else if ((NZ - 1) * step + rl > ref_len || zen5_n >= NZ) {
-            fprintf(stderr, "[FAIL] Case 13z: reference too short (%d bp) or width %d "
-                    "leaves no recycle with %d reads\n", ref_len, zen5_n, (int)NZ);
+        } else if ((NZ - 1) * step + rl > ref_len) {
+            fprintf(stderr, "[FAIL] Case 13z: reference too short (%d bp) for %d reads\n",
+                    ref_len, (int)NZ);
             total_cases++;
+            free(ref);
+        } else if (zen5_n >= NZ) {
+            /* Only a -D build raising the widths gets here; Case 14 covers
+             * slot recycle at every width up to SMEM_LOCKSTEP_N_MAX. */
+            fprintf(stderr, "[SKIP] Case 13z: host-default width %d leaves no recycle "
+                    "with %d reads (Case 14 covers it)\n", zen5_n, (int)NZ);
             free(ref);
         } else {
             char *bufs[NZ];
@@ -759,10 +830,12 @@ int main(int argc, char *argv[]) {
     /* Case 14: many more reads than slots, with real matches, at several widths.
      * The flush pass finds the slot holding the next read to emit as input
      * mod N, which relies on slot recycling keeping input i in slot i mod N.
-     * Cases 1-13 never recycle (numReads <= the width) and Case 13z recycles
-     * only at one width with uniform reads, so this drives 150 reads of mixed
-     * lengths and pivots -- they retire out of input order -- at a small width,
-     * the shipped default and the maximum. */
+     * Cases 1-13 never recycle a slot through real reference matches (Cases 4
+     * and 6 recycle, but with synthetic reads), and Case 13z recycles only at
+     * one width with uniform reads, so this drives 2 * N_MAX + 22 reads
+     * (150 at the default N_MAX of 64, so every slot is reused at least once even
+     * at the maximum width) of mixed lengths and pivots -- they retire out of
+     * input order -- at a small width, the shipped default and the maximum. */
     {
         int32_t ref_len = 0;
         char *ref = read_fasta_seq(argv[1], &ref_len);
@@ -772,10 +845,17 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "[FAIL] Case 14: could not read a reference FASTA of at least "
                     "200 bases from '%s' (slot-recycle parity coverage needs it)\n", argv[1]);
         } else {
-            enum { NR = 150, MAXL = 90 };
+            /* EXTRA keeps NR at 150 for the default N_MAX of 64. */
+            enum { EXTRA = 22, NR = 2 * SMEM_LOCKSTEP_N_MAX + EXTRA, MAXL = 90 };
             char *bufs[NR];
             const char *reads[NR];
             int32_t qpa[NR], mia[NR], rid[NR];
+            /* With the single-contig, all-ACGT phiX fixture, each read without
+             * an injected N is an exact reference substring of at least 30
+             * bases, longer than the 19-base minimum, so it must emit at least
+             * one SMEM through its pivot. Reads with an N may emit too, so the
+             * check is per read rather than a total. */
+            bool need_smem[NR];
             for (int32_t i = 0; i < NR; i++) {
                 const int32_t len = 30 + (i * 7) % (MAXL - 29);           /* 30..90 */
                 const int32_t off = (int32_t)(((int64_t)i * 977) % (ref_len - MAXL));
@@ -783,6 +863,7 @@ int main(int argc, char *argv[]) {
                 memcpy(bufs[i], ref + off, len);
                 bufs[i][len] = '\0';
                 if (i % 11 == 5) bufs[i][len / 3] = 'N';                   /* early stop */
+                need_smem[i] = (i % 11 != 5);
                 reads[i] = bufs[i];
                 qpa[i] = (i % 3 == 0) ? len - 1 : (i % 3 == 1) ? len / 2 : 0;
                 mia[i] = 1;
@@ -791,13 +872,14 @@ int main(int argc, char *argv[]) {
             uint8_t *enc_qdb; bseq1_t *seq_; int32_t *cum_len;
             encode_reads(reads, NR, &enc_qdb, &seq_, &cum_len);
             const int32_t saved_n = g_smem_lockstep_n;
-            const int32_t widths[] = {3, SMEM_LOCKSTEP_N, SMEM_LOCKSTEP_N_MAX};
+            const int32_t widths[] = {clamp_width(3), SMEM_LOCKSTEP_N, SMEM_LOCKSTEP_N_MAX};
             for (const int32_t w : widths) {
                 char name[96];
                 snprintf(name, sizeof name, "Case 14: %d reads > N = %d, slot recycle", (int)NR, (int)w);
                 g_smem_lockstep_n = w;
                 run_case(fmi, name, NR, MAXL, 19,
-                         enc_qdb, qpa, mia, rid, seq_, cum_len);
+                         enc_qdb, qpa, mia, rid, seq_, cum_len,
+                         /*expect_min_smem=*/0, need_smem);
             }
             g_smem_lockstep_n = saved_n;
             free(enc_qdb); free(seq_); free(cum_len);
