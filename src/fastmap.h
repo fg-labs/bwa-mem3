@@ -57,6 +57,7 @@ KSEQ_DECLARE(gzFile)
 struct bam_writer_s;
 
 #include "fast_reader.h"
+#include "bwa_thp.h"
 
 typedef struct {
 	kseq_t *ks, *ks2;
@@ -131,6 +132,8 @@ typedef struct {
 	 * via _mm_malloc here (never shm) and _mm_free'd on teardown. NULL outside
 	 * --meth (or when no original prefix resolved). */
 	uint8_t  *meth_orig_ref_string;
+	/* THP-fallback stderr check (bwa_thp.h), driven from the write step. */
+	bwa_thp_monitor_t thp;
 } ktp_aux_t;
 
 typedef struct {

@@ -392,6 +392,8 @@ Precedence, highest first:
 
 Controls stderr diagnostic output: `1` = errors only, `2` = warnings,
 `3` = informational messages (default), `4+` = debugging.
+At `-v 1` the [transparent huge page warning](#transparent-huge-page-fallback-warning-linux)
+is also suppressed; at `-v 4` each of its samples is logged as a `[D::]` line.
 
 #### `-a` — all alignments
 
@@ -997,6 +999,27 @@ claim. See
 [Memory allocator → Large pages for the index](../user-guide/allocator.md#large-pages-for-the-index-linux-deployment-lever)
 for reservation, verification, the measurement conditions, and the manual
 `MIMALLOC_RESERVE_HUGE_OS_PAGES` equivalent.
+
+#### Transparent huge page fallback warning (Linux)
+
+Not a flag: on Linux, `mem` samples `/proc/self/smaps` after output batches 1, 2,
+4, 8, … and prints a two-line `[W::]` warning on stderr, at most once per run,
+when at least 1 GiB (and 4 %) of the memory the kernel would back with
+transparent huge pages (THP, 2 MB) is on 4 KB pages instead, typically because
+host memory was full of page cache or fragmented, in a process with ≥ 4 GiB of
+anonymous memory. Memory the kernel would not back with THP (under `madvise`,
+memory that was never advised) does not trigger it. Two variants report THP set
+to `never` and THP disabled for the process. The check is stderr-only and never
+changes the output.
+
+```text
+[W::main_mem] 3.3 GiB of 22.5 GiB of THP-eligible anonymous memory is on 4 KB pages, not transparent huge pages (typically because host memory was full of page cache or fragmented); on human WGS this costs on the order of 1% wall time per GiB.
+[W::main_mem] start with free memory (e.g. drop the page cache) or run in a memory-limited cgroup; see docs/src/best-practices/optimization-checklist.md, "Keep transparent huge pages working".
+```
+
+What it counts, its costs and timings, when it is skipped and how to fix the
+host are in
+[Optimization checklist → Keep transparent huge pages working](../best-practices/optimization-checklist.md#9-keep-transparent-huge-pages-working-linux).
 
 ### Supplementary MAPQ rescoring
 

@@ -478,7 +478,7 @@ OBJS=		src/fastmap.o src/bwtindex.o src/utils.o src/kthread.o \
 			src/meth_xm.o \
 			src/packed_text.o src/fm_index_writer.o src/index_prelude.o \
 			src/system.o src/libsais_build.o \
-			src/bwa_shm.o src/bwa_hugepages.o src/simd_dispatch.o \
+			src/bwa_shm.o src/bwa_hugepages.o src/bwa_thp.o src/simd_dispatch.o \
 			src/fast_reader.o src/fast_reader_bseq.o src/fr_fastq.o src/stage_prof.o \
 			src/smem_dedup.o src/lockstep_width.o src/read_memo.o src/rescue_band.o
 
@@ -1224,6 +1224,7 @@ test: test-binaries $(STANDALONE_TESTS_IN_TEST_TARGET) kvec_alloc_fail_test klib
 	BWA_MEM3=./bwa-mem3 ./test/regression/version_banner.sh
 	BWA_MEM3=./bwa-mem3 ./test/regression/meth_rescue_batched_identical.sh
 	BWA_MEM3=./bwa-mem3 ./test/regression/repeat_chain_extension_window.sh
+	BWA_MEM3=./bwa-mem3 ./test/regression/thp_check_smoke.sh
 	./test/regression/ndebug_gate_lint_selftest.sh
 	./test/regression/ndebug_gate_lint.sh
 	./test/regression/calloc_interpose_flag_lint_selftest.sh
