@@ -48,6 +48,14 @@ static int64_t smem_array_first_mismatch(const SMEM *a, const SMEM *b, int64_t n
 static int32_t total_cases = 0;
 static int32_t passed_cases = 0;
 
+/* A fixed width a case pins, clamped to the build's BWTSEED_LOCKSTEP_N_MAX so a
+ * -D build with a small cap still runs every case instead of tripping the
+ * driver's width assert. */
+static int32_t clamp_width(int32_t w)
+{
+    return w < BWTSEED_LOCKSTEP_N_MAX ? w : BWTSEED_LOCKSTEP_N_MAX;
+}
+
 static bool run_case(FMI_search *fmi,
                      const char *case_name,
                      int32_t numReads,
@@ -57,7 +65,8 @@ static bool run_case(FMI_search *fmi,
                      uint8_t *enc_qdb,
                      const bseq1_t *seq_,
                      int32_t *query_cum_len_ar,
-                     int32_t expect_min_seeds = 0)
+                     int32_t expect_min_seeds = 0,
+                     bool expect_seed_per_read = false)
 {
     /* Scalar emits at most one SMEM per outer-x ∈ [0, l_seq), so
      * numReads * max_readlength is a tight upper bound for both paths. */
@@ -109,6 +118,29 @@ static bool run_case(FMI_search *fmi,
                 "expected >= %d (is the index the checked-in phiX fixture?)\n",
                 case_name, (long long)n_scalar, expect_min_seeds);
         ok = false;
+    }
+
+    /* A total can be met while some read emits nothing; where every read is an
+     * exact phiX substring well above minSeedLen, require each one to emit. */
+    if (ok && expect_seed_per_read) {
+        bool *seen = (bool *)calloc(numReads, sizeof(bool));
+        if (seen == NULL) {
+            fprintf(stderr, "[FAIL] %s: allocation failed\n", case_name);
+            ok = false;
+        } else {
+            for (int64_t j = 0; j < n_scalar; j++) {
+                const int32_t r = scalar_out[j].rid;
+                if (r >= 0 && r < numReads) seen[r] = true;
+            }
+            for (int32_t r = 0; r < numReads; r++) {
+                if (!seen[r]) {
+                    fprintf(stderr, "[FAIL] %s: read %d emitted no seed\n", case_name, r);
+                    ok = false;
+                    break;
+                }
+            }
+            free(seen);
+        }
     }
 
     if (ok) {
@@ -434,10 +466,11 @@ int main(int argc, char *argv[]) {
         uint8_t *enc_qdb; bseq1_t *seq_; int32_t *cum_len;
         encode_reads(reads, numReads, &enc_qdb, &seq_, &cum_len);
         const int32_t saved_n = g_bwtseed_lockstep_n;
-        g_bwtseed_lockstep_n = 8;   /* force numReads(20) > N to hit the recycle path */
+        g_bwtseed_lockstep_n = clamp_width(8);   /* force numReads(20) > N to hit the recycle path */
         run_case(fmi, "Case 11r: numReads > N, slot recycle on non-empty match_buf",
                  numReads, max_readlength, /*minSeed=*/10, /*max_intv=*/5,
-                 enc_qdb, seq_, cum_len, /*expect_min_seeds=*/20);
+                 enc_qdb, seq_, cum_len, /*expect_min_seeds=*/20,
+                 /*expect_seed_per_read=*/true);
         g_bwtseed_lockstep_n = saved_n;
         free(enc_qdb); free(seq_); free(cum_len);
     }
@@ -464,9 +497,14 @@ int main(int argc, char *argv[]) {
         int32_t max_readlength = 44;
         uint8_t *enc_qdb; bseq1_t *seq_; int32_t *cum_len;
         encode_reads(reads, numReads, &enc_qdb, &seq_, &cum_len);
+        if (g_bwtseed_lockstep_n >= numReads)   /* only a -D build raising the default */
+            fprintf(stderr, "[NOTE] Case 11s: default width %d >= %d reads, so no slot "
+                    "recycles here (Case 11w covers it)\n", (int)g_bwtseed_lockstep_n,
+                    (int)numReads);
         run_case(fmi, "Case 11s: numReads > default N, slot recycle at the compile-time default width",
                  numReads, max_readlength, /*minSeed=*/10, /*max_intv=*/5,
-                 enc_qdb, seq_, cum_len, /*expect_min_seeds=*/20);
+                 enc_qdb, seq_, cum_len, /*expect_min_seeds=*/20,
+                 /*expect_seed_per_read=*/true);
         free(enc_qdb); free(seq_); free(cum_len);
     }
 
@@ -490,9 +528,10 @@ int main(int argc, char *argv[]) {
             reads[i] = buf[i];
         }
         if (zen5_n >= NZ) {
-            fprintf(stderr, "[FAIL] Case 11z: host-default width %d leaves no recycle "
-                    "with %d reads\n", zen5_n, (int)NZ);
-            total_cases++;
+            /* Only a -D build raising the widths gets here; Case 11w covers
+             * slot recycle at every width up to BWTSEED_LOCKSTEP_N_MAX. */
+            fprintf(stderr, "[SKIP] Case 11z: host-default width %d leaves no recycle "
+                    "with %d reads (Case 11w covers it)\n", zen5_n, (int)NZ);
         } else {
             int32_t numReads = NZ;
             int32_t max_readlength = 44;
@@ -506,7 +545,8 @@ int main(int argc, char *argv[]) {
                      (int)NZ, (int)zen5_n);
             run_case(fmi, name,
                      numReads, max_readlength, /*minSeed=*/10, /*max_intv=*/5,
-                     enc_qdb, seq_, cum_len, /*expect_min_seeds=*/NZ);
+                     enc_qdb, seq_, cum_len, /*expect_min_seeds=*/NZ,
+                     /*expect_seed_per_read=*/true);
             g_bwtseed_lockstep_n = saved_n;
             free(enc_qdb); free(seq_); free(cum_len);
         }
@@ -514,20 +554,24 @@ int main(int argc, char *argv[]) {
 
     /* Case 11w: many more reads than slots, at several widths. The flush pass
      * finds the slot holding the next read to emit as input mod N, which relies
-     * on slot recycling keeping input i in slot i mod N. 150 windows of mixed
-     * length over the phiX start (so reads retire out of input order, and the
-     * input number wraps past 64) at a small width, the shipped default and
-     * the maximum. */
+     * on slot recycling keeping input i in slot i mod N. 2 * N_MAX + 22 windows
+     * (150 at the default N_MAX of 64) of every length from 24 to 44 over the
+     * phiX start (so reads retire out of input order, and every slot is reused
+     * at least once even at the maximum width) at a small width, the shipped
+     * default and the maximum. */
     {
-        enum { NR = 150, MAXL = 44 };
+        /* EXTRA keeps NR at 150 for the default N_MAX of 64. */
+        enum { EXTRA = 22, NR = 2 * BWTSEED_LOCKSTEP_N_MAX + EXTRA, MAXL = 44 };
         const char *src =
             "GAGTTTTATCGCTTCCATGACGCAGAAGTTAACACTTTCGGATATTTCTGATGAGTCGAAAA"
             "ATTATCTTGATAAAGCAGGAATTACTACTGCTTGTTTACGAATTAAATCGAAGTGGACTGCT";
         static char buf[NR][MAXL + 1];
         const char *reads[NR];
         for (int i = 0; i < NR; i++) {
-            const int len = 24 + (i * 7) % (MAXL - 23);   /* 24..44 */
-            const int off = (i * 13) % (122 - MAXL);       /* window stays in src */
+            /* Both multipliers are coprime to their moduli, so every length and
+             * offset occurs and the windows do not repeat with a short period. */
+            const int len = 24 + (i * 5) % (MAXL - 23);   /* 24..44 */
+            const int off = (i * 7) % (122 - MAXL);        /* 0..77: window stays in src */
             memcpy(buf[i], src + off, len);
             buf[i][len] = '\0';
             reads[i] = buf[i];
@@ -535,13 +579,14 @@ int main(int argc, char *argv[]) {
         uint8_t *enc_qdb; bseq1_t *seq_; int32_t *cum_len;
         encode_reads(reads, NR, &enc_qdb, &seq_, &cum_len);
         const int32_t saved_n = g_bwtseed_lockstep_n;
-        const int32_t widths[] = {3, BWTSEED_LOCKSTEP_N, BWTSEED_LOCKSTEP_N_MAX};
+        const int32_t widths[] = {clamp_width(3), BWTSEED_LOCKSTEP_N, BWTSEED_LOCKSTEP_N_MAX};
         for (const int32_t w : widths) {
             char name[96];
             snprintf(name, sizeof name, "Case 11w: %d reads > N = %d, slot recycle", (int)NR, (int)w);
             g_bwtseed_lockstep_n = w;
             run_case(fmi, name, NR, MAXL, /*minSeed=*/10, /*max_intv=*/5,
-                     enc_qdb, seq_, cum_len, /*expect_min_seeds=*/NR);
+                     enc_qdb, seq_, cum_len, /*expect_min_seeds=*/NR,
+                     /*expect_seed_per_read=*/true);
         }
         g_bwtseed_lockstep_n = saved_n;
         free(enc_qdb); free(seq_); free(cum_len);
