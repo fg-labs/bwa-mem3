@@ -164,8 +164,14 @@ matters more than the wall-time gain there.
 Seeding is memory-latency-bound: the FM-index and suffix-array lookups are
 effectively random accesses over multi-gigabyte arrays, so the data-TLB and the
 page-table walk sit on the critical path. By default bwa-mem3 already hints these
-arrays for transparent huge pages (`madvise(MADV_HUGEPAGE)` → 2 MB pages), which
-helps but does not fully cover the working set.
+arrays for transparent huge pages (`madvise(MADV_HUGEPAGE)`), which makes them
+eligible for huge pages (2 MB on x86-64 and on arm64 with 4 KB base pages) and
+helps but does not fully cover the working set. The kernel still falls back to
+base pages when it cannot assemble a huge page, for example on fragmented memory.
+The hint covers the page-aligned interior of each array, so it also applies in a
+`USE_MIMALLOC=0` build, whose system-allocator arrays do not start on a page
+boundary. With the kernel's THP mode set to `madvise`, only those advised arrays
+are eligible for huge pages in such a build.
 
 On **Linux** you can back the index arrays with **explicit 1 GB huge pages** for
 a further speedup, with byte-identical alignment output (see
