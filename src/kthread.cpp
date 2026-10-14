@@ -72,6 +72,71 @@ static int get_pcore_count() {
 }
 #endif /* __APPLE__ */
 
+/* Work-item layout of one kt_for() pass.
+ *
+ * A pass ends when its slowest worker finishes its last item, and every other
+ * worker idles at that barrier meanwhile. With every item `batch` reads, a
+ * worker that picks up a full item just before the others run dry holds the
+ * whole pool for up to one item's time (tens of ms on hg38 reads). So about the
+ * last n_threads * batch reads (rounded up to whole batches) -- roughly the
+ * pool's final round -- are cut into items of batch / KT_TAIL_DIV reads, which
+ * lets the workers finish closer together. Items before the tail are exactly
+ * the legacy batch-sized items.
+ *
+ * This makes the item boundaries depend on n_threads (-t). Before it they did
+ * not: every item was [k * batch, (k + 1) * batch) whatever -t, so at a fixed
+ * -K the reads that shared an item were the same at every thread count. Output
+ * stays identical because no callback's per-read result depends on which other
+ * reads share its item:
+ *  - every kt_for callback computes per-read results into per-read slots, and
+ *    the per-tid scratch it borrows is sized for a full batch (tail items are
+ *    smaller);
+ *  - item boundaries stay even (batch and tail_batch are both even), so a read
+ *    pair never straddles two items;
+ *  - the batched SIMD kernels that do group reads within an item return each
+ *    pair's result independently of its lane group: the banded extension
+ *    kernels since PR #565 (test_bandedswa_lane_indep.cpp), and the kswv
+ *    mate-rescue kernels, which match the scalar ksw_align2 on every field for
+ *    every pair of mixed-length and partial batches (test_kswv_correctness.cpp,
+ *    test_kswv_mixed_qlen.cpp) and whose banded rescue path is exact per job
+ *    (rescue_band.h). The 8-bit vs 16-bit choice is made per pair in both.
+ * Measured: unsorted output at -t 1, 7 and 16 with a fixed -K was identical on
+ * 5M-pair WGS and WES slices; test/regression/thread_determinism.sh compares
+ * -t 1, 3 and 4 at a fixed -K.
+ *
+ * Items are numbered in read order and tile [0, n) contiguously; the strided
+ * dispatch and work stealing in ktf_run() are unchanged, they just count items
+ * from the layout instead of dividing by BATCH_SIZE. */
+#define KT_TAIL_DIV 4
+static_assert(BATCH_SIZE % (2 * KT_TAIL_DIV) == 0,
+              "kt_for tail items must be an even number of reads (whole pairs)");
+
+void kt_item_layout(long n, int n_threads, long batch, kt_item_layout_t *L)
+{
+	xassert(batch > 0 && batch % (2 * KT_TAIL_DIV) == 0,
+	        "kt_item_layout: batch must be a positive multiple of 2 * KT_TAIL_DIV");
+	if (n < 0) n = 0;
+	if (n_threads < 1) n_threads = 1;
+	L->n = n;
+	L->batch = batch;
+	L->tail_batch = batch / KT_TAIL_DIV;
+	const long tail = (long)n_threads * batch;
+	L->full_end = n > tail ? ((n - tail) / batch) * batch : 0;
+	L->n_full = L->full_end / batch;
+	L->n_items = L->n_full + (n - L->full_end + L->tail_batch - 1) / L->tail_batch;
+}
+
+int kt_item_range(const kt_item_layout_t *L, long k, int *st, int *ed)
+{
+	if (k < 0 || k >= L->n_items) return 0;
+	long s, e;
+	if (k < L->n_full) { s = k * L->batch; e = s + L->batch; }
+	else { s = L->full_end + (k - L->n_full) * L->tail_batch; e = s + L->tail_batch; }
+	if (e > L->n) e = L->n;
+	*st = (int)s; *ed = (int)e;
+	return 1;
+}
+
 static inline long steal_work(kt_for_t *t)
 {
 	int i, min_i = -1;
@@ -79,14 +144,13 @@ static inline long steal_work(kt_for_t *t)
 	for (i = 0; i < t->n_threads; ++i)
 		if (min > t->w[i].i) min = t->w[i].i, min_i = i;
 	k = __sync_fetch_and_add(&t->w[min_i].i, t->n_threads);
-	// return k >= t->n? -1 : k;
-	return k*BATCH_SIZE >= t->n? -1 : k;
+	return k >= t->layout.n_items? -1 : k;
 }
 
 /* The per-thread work loop: strided dispatch followed by work-stealing.
  * Extracted from the old per-call thread body so it can be driven by a
- * persistent pool worker (see below). Distribution is byte-for-byte the
- * legacy behaviour; tid passed to func() is the worker's slot index
+ * persistent pool worker (see below). Items come from the pass's layout
+ * (kt_item_layout); tid passed to func() is the worker's slot index
  * (w - w->t->w). */
 static void ktf_run(ktf_worker_t *w)
 {
@@ -95,17 +159,15 @@ static void ktf_run(ktf_worker_t *w)
 	if (sp_enabled()) sp_encode_reset();
 
 
+	int st, ed;
 	for (;;) {
 		i = __sync_fetch_and_add(&w->i, w->t->n_threads);
-		int st = i * BATCH_SIZE;
-		if (st >= w->t->n) break;
-		int ed = (i + 1) * BATCH_SIZE < w->t->n? (i + 1) * BATCH_SIZE : w->t->n;
+		if (!kt_item_range(&w->t->layout, i, &st, &ed)) break;
 		w->t->func(w->t->data, st, ed-st, w - w->t->w);
 	}
 
 	while ((i = steal_work(w->t)) >= 0) {
-		int st = i * BATCH_SIZE;
-		int ed = (i + 1) * BATCH_SIZE < w->t->n? (i + 1) * BATCH_SIZE : w->t->n;
+		if (!kt_item_range(&w->t->layout, i, &st, &ed)) break;
 		w->t->func(w->t->data, st, ed-st, w - w->t->w);
 	}
 	if (sp_enabled()) { w->cpu_busy = sp_thread_cpu() - _c0; w->encode = sp_encode_get(); }
@@ -228,8 +290,11 @@ void kt_pool_destroy(void)
 
 void kt_for(void (*func)(void*, int, int, int), void *data, int n)
 {
-	worker_t *w = (worker_t*) data;
-	int n_threads = w->nthreads;
+	kt_for_nt(func, data, n, ((worker_t*) data)->nthreads);
+}
+
+void kt_for_nt(void (*func)(void*, int, int, int), void *data, int n, int n_threads)
+{
 	if (n_threads < 1) n_threads = 1;  /* nthreads is int16_t; never spin up a 0/negative pool */
 
 	/* kt_for() is only ever called from the serialized step-1 of kt_pipeline
@@ -246,9 +311,9 @@ void kt_for(void (*func)(void*, int, int, int), void *data, int n)
 	pthread_mutex_lock(&g_kt_pool.mtx);
 	g_kt_pool.job.func = func;
 	g_kt_pool.job.data = data;
-	g_kt_pool.job.n = n;
 	g_kt_pool.job.n_threads = n_threads;
 	g_kt_pool.job.w = g_kt_pool.w;
+	kt_item_layout(n, n_threads, BATCH_SIZE, &g_kt_pool.job.layout);
 	for (int i = 0; i < n_threads; ++i) {
 		g_kt_pool.w[i].t = &g_kt_pool.job;
 		g_kt_pool.w[i].i = i;

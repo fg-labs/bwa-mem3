@@ -121,6 +121,37 @@ BWAMEM3_DEDUP_READS_VERIFY=1 "$BWA_MEM3" mem --dedup-reads on -t 4 "$W/phix.fa" 
 cmp "$W/off_dup_t4.sam" "$W/verify.sam" || fail "VERIFY output != off"
 ok "regs-invariance VERIFY holds (duplicate regs == representative regs)"
 
+# Multi-batch: a small -K splits the dup fixture into ~9 batches, so the
+# pre-pass the pipeline's read step runs for each batch is handed to that
+# batch's alignment while the previous one is still aligning. A batch given
+# another batch's role[]/rep_pair[] would copy the wrong regs. -t 1 and -t 4
+# (different work-item cuts) and the VERIFY instrument, each against off at the
+# same -K.
+KS=100000
+kb() { # kb <tag> <mode> <threads> [env...]
+    local tag=$1 mode=$2 t=$3
+    shift 3
+    env "$@" "$BWA_MEM3" mem -K "$KS" --dedup-reads "$mode" -t "$t" "$W/phix.fa" "$W/dup_1.fq" "$W/dup_2.fq" 2> "$W/$tag.err" | grep -v '^@PG' > "$W/$tag.sam" || fail "$tag: mem run failed: $(tail -1 "$W/$tag.err")"
+    [[ -s "$W/$tag.sam" ]] || fail "$tag: empty output"
+}
+kb kb_off off 1
+kb kb_on_t1 on 1
+kb kb_on_t4 on 4
+kb kb_verify on 4 BWAMEM3_DEDUP_READS_VERIFY=1
+nb=$(grep -c 'Calling mem_process_seqs' "$W/kb_on_t4.err" || true)
+[[ "$nb" -ge 4 ]] || fail "-K $KS gave $nb batches; expected several"
+for tag in kb_on_t1 kb_on_t4 kb_verify; do
+    cmp "$W/kb_off.sam" "$W/$tag.sam" || fail "multi-batch $tag != off (-K $KS)"
+done
+kstats=""
+if ! kstats=$(BWAMEM3_DEDUP_READS_STATS=1 "$BWA_MEM3" mem -K "$KS" --dedup-reads on -t 4 \
+    "$W/phix.fa" "$W/dup_1.fq" "$W/dup_2.fq" 2>&1 > /dev/null | grep 'dedup-reads-stats'); then
+    fail "multi-batch dedup-reads-stats run failed"
+fi
+kdup=$(awk -F'dup=' '{split($2, a, " "); print a[1]}' <<< "$kstats")
+[[ "${kdup:-0}" -gt 0 ]] || fail "multi-batch run exercised no duplicate pairs"
+ok "multi-batch (-K $KS, $nb batches, $kdup duplicate pairs): on -t1 == on -t4 == VERIFY == off"
+
 # Seed-stage instrument: BWAMEM3_DEDUP_READS_CHECK_BASES asserts, in the armed
 # copy pass, that each duplicate read's 2-bit bases equal its representative's
 # (err_fatal on any difference -> nonzero exit). worker_bwt_memo must convert

@@ -4141,8 +4141,8 @@ static void worker_aln(void *data, int seq_id, int batch_size, int tid)
  * original slot and leave DUP slots empty. Kernel2 (worker_aln) then runs
  * UNMODIFIED over the original view -- a DUP's empty chains yield empty regs,
  * which read_memo_copy_regs later overwrites with the REP's. The work item
- * [seq_id, seq_id+batch_size) is pair-aligned (kt_for splits on the even
- * BATCH_SIZE and the PE tail is even), so whole pairs move as a unit and
+ * [seq_id, seq_id+batch_size) is pair-aligned (kt_for items start and end on
+ * even reads, see kt_item_layout), so whole pairs move as a unit and
  * kernel1's l^1 mate-concordant cap still pairs mates correctly. */
 static void worker_bwt_memo(worker_t *w, int seq_id, int batch_size, int tid)
 {
@@ -4596,7 +4596,7 @@ void mem_pair_and_emit_cohort(mem_opt_t *opt,
             const bntseq_t *pestat_bns = mem_aln_bns(&w);
             fprintf(stderr, "[0000] Inferring insert size distribution of PE reads from data, "
                     "l_pac: %lld, n: %d\n", (long long)pestat_bns->l_pac, n);
-            mem_pestat(opt, pestat_bns->l_pac, n, w.regs, pes);
+            mem_pestat_par(opt, pestat_bns->l_pac, n, w.regs, pes, w.nthreads);
         }
         /* Publish the FR proper-pair insert high bound onto opt so the NEXT
          * cohort's mate-concordant chain cap (which runs before pairing) can use
@@ -4630,12 +4630,19 @@ void mem_readmemo_teardown(void)
     read_memo_teardown();
 }
 
+int mem_read_memo_prepass_eligible(const mem_opt_t *opt, int n)
+{
+    return (read_memo_mode() != READMEMO_OFF || read_memo_verify()) && (opt->flag & MEM_F_PE)
+           && !opt->meth_mode && n > 0 && (n & 1) == 0;
+}
+
 void mem_process_seqs(mem_opt_t *opt,
                       int64_t n_processed,
                       int n,
                       bseq1_t *seqs,
                       const mem_pestat_t *pes0,
-                      worker_t &w)
+                      worker_t &w,
+                      const read_memo_handoff *pre)
 {
     mem_pestat_t pes[4];
     double ctime, rtime;
@@ -4679,9 +4686,19 @@ void mem_process_seqs(mem_opt_t *opt,
      * stays false), so the regs-invariance check actually fires instead of
      * silently doing nothing. */
     const bool rm_verify = read_memo_verify();
-    if ((read_memo_mode() != READMEMO_OFF || rm_verify) && (opt->flag & MEM_F_PE)
-        && !opt->meth_mode && n_ > 0 && (n_ & 1) == 0) {
-        rm_r = read_memo_prepass(opt, seqs, n_, &g_readmemo_state);
+    const read_memo_state *rm_st = &g_readmemo_state;
+    if (mem_read_memo_prepass_eligible(opt, n_)) {
+        /* The pipeline's read step usually ran the pre-pass on these same reads
+         * already (fastmap.cpp step 0). It is a pure function of the reads' bases
+         * and order, so its result is the one computing it here would give. */
+        if (pre != NULL) {
+            xassert(pre->r.pairs == n_ / 2 && pre->st.npairs == n_ / 2,
+                    "read-memo pre-pass from the read step does not match this chunk");
+            rm_r = pre->r;
+            rm_st = &pre->st;
+        } else {
+            rm_r = read_memo_prepass(opt, seqs, n_, &g_readmemo_state);
+        }
         rm_measure = true;
         rm_arm = read_memo_should_arm(rm_r.dup_pairs) != 0;
     }
@@ -4691,7 +4708,7 @@ void mem_process_seqs(mem_opt_t *opt,
      * and their independently-computed regs are compared to the representative's;
      * real memo copying stays gated on rm_arm below. */
     const bool rm_run_pairs = rm_arm || (rm_measure && rm_verify);
-    w.memo = rm_run_pairs ? &g_readmemo_state : NULL;
+    w.memo = rm_run_pairs ? rm_st : NULL;
     const auto rm_t0 = std::chrono::steady_clock::now();
 
     uint64_t tim = __rdtsc();
@@ -4743,8 +4760,8 @@ void mem_process_seqs(mem_opt_t *opt,
             const bntseq_t *pestat_bns = mem_aln_bns(&w);
             fprintf(stderr, "[0000] Inferring insert size distribution of PE reads from data, "
                     "l_pac: %lld, n: %d\n", (long long)pestat_bns->l_pac, n);
-            mem_pestat(opt, pestat_bns->l_pac, n, w.regs, pes); // otherwise, infer the insert size
-                                                         // distribution from data
+            mem_pestat_par(opt, pestat_bns->l_pac, n, w.regs, pes, w.nthreads); // otherwise, infer the
+                                                                                 // insert size distribution from data
         }
         /* Publish the FR proper-pair insert high bound onto opt so the NEXT
          * chunk's mate-concordant chain cap (which runs before pairing) can use
@@ -4761,8 +4778,9 @@ void mem_process_seqs(mem_opt_t *opt,
     kt_for(worker_sam, &w,  n_);   // SAM
     tprof[WORKER20][0] += __rdtsc() - tim;
 
-    /* [dedup-reads] The memo points at g_readmemo_state, whose role[]/rep_pair[]
-     * describe THIS chunk only; clear it so it can never be reused by a later
+    /* [dedup-reads] The memo points at g_readmemo_state or the read step's
+     * pre-pass, whose role[]/rep_pair[] describe THIS chunk only (and the latter
+     * is freed once this returns); clear it so it can never be reused by a later
      * chunk or a different align entry path. */
     w.memo = NULL;
 

@@ -75,9 +75,18 @@ struct read_memo_result {
  * run on RAW (pre-kernel1) bases. Fills st->role / st->rep_pair (grows st as
  * needed) and returns counts + its own measured cost. Byte-verifies every
  * fingerprint hit (a collision costs a memcmp, never splits a duplicate set).
- * Caller must ensure n is even and > 0. */
+ * Caller must ensure n is even and > 0. Two threads may call it at once with
+ * distinct `st` (the module's shared scratch is locked). */
 read_memo_result read_memo_prepass(const mem_opt_t *opt, const bseq1_t *seqs,
                                    int n, read_memo_state *st);
+
+/* A pre-pass already run on a chunk, handed to mem_process_seqs (bwamem.h) so it
+ * need not run it again: the pipeline's read step fills one per eligible chunk
+ * and frees st after mem_process_seqs returns. */
+struct read_memo_handoff {
+    read_memo_state  st;
+    read_memo_result r;
+};
 
 /* Convert the reads of an armed work item ASCII->2-bit in place, EXCEPT the
  * representative (REP) reads. `seqs` is the work item's first read and

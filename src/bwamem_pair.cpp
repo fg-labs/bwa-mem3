@@ -759,46 +759,40 @@ static inline int isize_at_rank(const int64_t *cnt, int max_ins, int64_t k)
     return max_ins;   /* unreachable while k < total; keeps the return total */
 }
 
-void mem_pestat(const mem_opt_t *opt, int64_t l_pac, int n,
-                const mem_alnreg_v *regs, mem_pestat_t pes[4])
+/* Insert-size distribution as counts rather than a collected-then-sorted
+ * array. The candidate filter discards anything above max_ins, so the values are
+ * bounded and a direct-address count array is EXACT -- there is no bucketing
+ * here and nothing is approximated.
+ *
+ * Walking the counts in ascending order visits the same values, the same number
+ * of times, in the same order as walking the sorted array would, and that is
+ * what makes this bit-identical rather than merely equal to within rounding. In
+ * particular the mean and variance loops in mem_pestat_from_counts add each
+ * value `count` times instead of multiplying by count: multiplying is
+ * algebraically the same and numerically different, because floating-point
+ * addition is not associative and the original summed the elements one at a
+ * time.
+ *
+ * Bounded before it sizes an allocation. The old code used max_ins purely as a
+ * filter on collected values, so any value at all was harmless; here it is a
+ * direct-address array bound, and 4*(max_ins+1)*8 bytes with an unbounded
+ * max_ins is a caller-controlled allocation. mem_opt_init() sets 10000 (320 kB)
+ * and no CLI option changes it, but max_ins is read from the caller's mem_opt_t
+ * and this is a library entry point -- an INT_MAX field would ask for 64 GB and
+ * a negative one would convert to a huge size_t. Neither is a value any caller
+ * means, so clamp rather than trust:
+ *
+ *   < 0        -> 0. No insert size satisfies `is <= 0`, so every orientation
+ *                 ends up failed for want of pairs, which is the same outcome
+ *                 as a cohort with no usable pairs.
+ *   > the cap  -> the cap. 1 Mbase is orders of magnitude past any real
+ *                 paired-end library and still only 32 MB of counters.
+ *
+ * The candidate filter uses this bounded value, not opt->max_ins: filtering on
+ * the unclamped field while indexing a clamped array is a heap overflow, not a
+ * fallback. */
+static int mem_pestat_bound(const mem_opt_t *opt)
 {
-    int i, d;
-    int64_t max;
-    /* Insert-size distribution as counts rather than a collected-then-sorted
-     * array. The candidate loop below discards anything above max_ins, so
-     * the values are bounded and a direct-address count array is EXACT -- there
-     * is no bucketing here and nothing is approximated.
-     *
-     * Walking the counts in ascending order visits the same values, the same
-     * number of times, in the same order as walking the sorted array would, and
-     * that is what makes this bit-identical rather than merely equal to within
-     * rounding. In particular the mean and variance loops below add each value
-     * `count` times instead of multiplying by count: multiplying is algebraically
-     * the same and numerically different, because floating-point addition is not
-     * associative and the original summed the elements one at a time.
-     *
-     * This drops an O(m log m) sort and the kvec growth it fed on. mem_pestat is
-     * serial (it needs the whole cohort before pairing can start), so its cost is
-     * a fixed term that thread count cannot reduce -- measured at 30 ns/read,
-     * invariant in both -t and cohort size, i.e. ~0.30 s of every run's wall. */
-    /* Bounded before it sizes an allocation. The old code used max_ins purely as
-     * a filter on collected values, so any value at all was harmless; here it is
-     * a direct-address array bound, and 4*(max_ins+1)*8 bytes with an unbounded
-     * max_ins is a caller-controlled allocation. mem_opt_init() sets 10000 (320
-     * kB) and no CLI option changes it, but max_ins is read from the caller's
-     * mem_opt_t and this is a library entry point -- an INT_MAX field would ask
-     * for 64 GB and a negative one would convert to a huge size_t. Neither is a
-     * value any caller means, so clamp rather than trust:
-     *
-     *   < 0        -> 0. No insert size satisfies `is <= 0`, so every
-     *                 orientation ends up failed for want of pairs, which is
-     *                 the same outcome as a cohort with no usable pairs.
-     *   > the cap  -> the cap. 1 Mbase is orders of magnitude past any real
-     *                 paired-end library and still only 32 MB of counters.
-     *
-     * The candidate filter below uses this bounded value, not opt->max_ins:
-     * filtering on the unclamped field while indexing a clamped array is a
-     * heap overflow, not a fallback. */
     const int kMaxInsCap = 1000000;
     int max_ins = opt->max_ins;
     if (max_ins < 0 || max_ins > kMaxInsCap) {
@@ -807,13 +801,17 @@ void mem_pestat(const mem_opt_t *opt, int64_t l_pac, int n,
                 max_ins, clamped);
         max_ins = clamped;
     }
-    int64_t *cnt_buf = (int64_t *) calloc((size_t)4 * ((size_t)max_ins + 1), sizeof(int64_t));
-    int64_t *cnt[4], total[4];
-    xassert(cnt_buf != NULL, "out of memory allocating insert-size histogram");
-    for (d = 0; d < 4; ++d) { cnt[d] = cnt_buf + (size_t)d * ((size_t)max_ins + 1); total[d] = 0; }
+    return max_ins;
+}
 
-    memset(pes, 0, 4 * sizeof(mem_pestat_t));
-    for (i = 0; i < n>>1; ++i) {
+/* Count the insert-size candidates of pairs [p0, p1) into cnt[dir][is] and
+ * total[dir]. Each pair is judged on its own two regs only, so any partition of
+ * the pairs counted separately and summed gives the same integers. */
+static void mem_pestat_count_pairs(const mem_opt_t *opt, int64_t l_pac, int p0, int p1,
+                                   const mem_alnreg_v *regs, int max_ins,
+                                   int64_t *const cnt[4], int64_t total[4])
+{
+    for (int i = p0; i < p1; ++i) {
         int dir;
         int64_t is;
         mem_alnreg_v *r[2];
@@ -826,12 +824,23 @@ void mem_pestat(const mem_opt_t *opt, int64_t l_pac, int n,
         dir = mem_infer_dir(l_pac, r[0]->a[0].rb, r[1]->a[0].rb, &is);
         if (is && is <= max_ins) { ++cnt[dir][is]; ++total[dir]; }   /* bounded, not opt->max_ins */
     }
+}
+
+/* The percentile / mean / std.dev tail of mem_pestat, from a counted histogram
+ * (cnt[d] has max_ins + 1 entries). Shared by the serial and parallel counts so
+ * both run the identical floating-point sequence. */
+static void mem_pestat_from_counts(int max_ins, int64_t *const cnt[4], const int64_t total[4],
+                                   mem_pestat_t pes[4])
+{
+    int d, x;
+    int64_t max;
+    memset(pes, 0, 4 * sizeof(mem_pestat_t));
     if (bwa_verbose >= 3) fprintf(stderr, "[0000][PE] # candidate unique pairs for (FF, FR, RF, RR): (%lld, %lld, %lld, %lld)\n",
                                   (long long)total[0], (long long)total[1], (long long)total[2], (long long)total[3]);
     for (d = 0; d < 4; ++d) { // TODO: this block is nearly identical to the one in bwtsw2_pair.c. It would be better to merge these two.
         mem_pestat_t *r = &pes[d];
-        int64_t *q = cnt[d], nq = total[d];
-        int p25, p50, p75, x;
+        const int64_t *q = cnt[d], nq = total[d];
+        int p25, p50, p75;
         if (nq < MIN_DIR_CNT) {
             fprintf(stderr, "[0000][PE] skip orientation %c%c as there are not enough pairs\n", "FR"[d>>1&1], "FR"[d&1]);
             r->failed = 1;
@@ -869,7 +878,6 @@ void mem_pestat(const mem_opt_t *opt, int64_t l_pac, int n,
         if (r->low < 1) r->low = 1;
         fprintf(stderr, "[0000][PE] low and high boundaries for proper pairs: (%d, %d)\n", r->low, r->high);
     }
-    free(cnt_buf);
     for (d = 0, max = 0; d < 4; ++d)
         max = max > total[d]? max : total[d];
     for (d = 0; d < 4; ++d)
@@ -877,6 +885,128 @@ void mem_pestat(const mem_opt_t *opt, int64_t l_pac, int n,
             pes[d].failed = 1;
             fprintf(stderr, "[0000][PE] skip orientation %c%c\n", "FR"[d>>1&1], "FR"[d&1]);
         }
+}
+
+/* mem_pestat with max_ins already bounded by mem_pestat_bound: the serial count. */
+static void mem_pestat_bounded(const mem_opt_t *opt, int64_t l_pac, int n,
+                               const mem_alnreg_v *regs, mem_pestat_t pes[4], int max_ins)
+{
+    const size_t span = (size_t)max_ins + 1;
+    int64_t *cnt_buf = (int64_t *) calloc(4 * span, sizeof(int64_t));
+    xassert(cnt_buf != NULL, "out of memory allocating insert-size histogram");
+    int64_t *const cnt[4] = { cnt_buf, cnt_buf + span, cnt_buf + 2 * span, cnt_buf + 3 * span };
+    int64_t total[4] = { 0, 0, 0, 0 };
+    mem_pestat_count_pairs(opt, l_pac, 0, n >> 1, regs, max_ins, cnt, total);
+    mem_pestat_from_counts(max_ins, cnt, total, pes);
+    free(cnt_buf);
+}
+
+void mem_pestat(const mem_opt_t *opt, int64_t l_pac, int n,
+                const mem_alnreg_v *regs, mem_pestat_t pes[4])
+{
+    mem_pestat_bounded(opt, l_pac, n, regs, pes, mem_pestat_bound(opt));
+}
+
+/* ---- mem_pestat_par: the candidate count on the kt_for pool -----------------
+ * mem_pestat needs the whole cohort's regs, so it runs between the align and
+ * SAM passes with the pool idle. Its candidate loop (cal_sub over each pair's
+ * regs) is most of its cost -- ~16-30 ms per 1M-read chunk -- and is per-pair
+ * independent, so it runs here as one more kt_for pass. Each worker counts the
+ * pairs of its items into its own histogram slot; the calling thread then sums
+ * the slots and runs the unchanged mem_pestat_from_counts.
+ *
+ * Exact: the counts are integers, and integer addition is associative and
+ * commutative, so the summed histogram and totals equal the serial ones no
+ * matter how kt_for cut the pairs into items or which thread ran which item.
+ * kt_for items start on even reads (kthread.cpp), so an item never splits a
+ * pair; `n & ~1` drops a trailing unpaired read exactly as the serial
+ * `i < n >> 1` loop does.
+ *
+ * The context lives on the caller's stack and reaches the workers through
+ * kt_for_nt's data pointer. During the pass, worker tid writes only slot tid
+ * (its histogram and its pestat_slot_t) and every worker only reads
+ * regs/opt, which nothing writes during the pass. kt_for returns after every
+ * worker has signalled completion under the pool mutex, which orders their
+ * slot writes before the summing reads. The histograms are allocated per call (once per
+ * chunk; 4 * (max_ins + 1) * 8 bytes = 320 kB per thread at the default
+ * max_ins) and zeroed lazily by the worker that first uses a slot, so a thread
+ * that ran no item costs nothing and is skipped by the sum. */
+
+/* Per-worker totals. A worker counts each item's totals in locals and adds
+ * them here once per item, so neighbouring slots sharing a cache line cost
+ * nothing measurable. */
+typedef struct {
+    int64_t total[4];       /* this slot's candidate count per orientation */
+    int used;               /* the slot's histogram has been zeroed this call */
+} pestat_slot_t;
+
+typedef struct {
+    const mem_opt_t *opt;
+    int64_t l_pac;
+    const mem_alnreg_v *regs;
+    int max_ins;
+    int64_t *hist;          /* [n_threads][4][max_ins + 1] */
+    pestat_slot_t *slot;    /* [n_threads] */
+} pestat_par_ctx_t;
+
+/* Past this many bytes of per-thread histograms count serially instead --
+ * reached only with a raised max_ins on very many threads, where the memory is
+ * not worth ~1% of wall. */
+static const size_t kPestatParMaxBytes = (size_t)64 << 20;
+
+static void worker_pestat(void *data, int seq_id, int batch_size, int tid)
+{
+    const pestat_par_ctx_t *c = (const pestat_par_ctx_t *) data;
+    const size_t span = (size_t)c->max_ins + 1;
+    int64_t *h = c->hist + (size_t)tid * 4 * span;
+    pestat_slot_t *sl = &c->slot[tid];
+    if (!sl->used) {
+        memset(h, 0, 4 * span * sizeof(int64_t));
+        sl->used = 1;
+    }
+    int64_t *const cnt[4] = { h, h + span, h + 2 * span, h + 3 * span };
+    int64_t tot[4] = { 0, 0, 0, 0 };   /* counted locally, added to the slot once */
+    mem_pestat_count_pairs(c->opt, c->l_pac, seq_id >> 1, (seq_id + batch_size) >> 1,
+                           c->regs, c->max_ins, cnt, tot);
+    for (int d = 0; d < 4; ++d) sl->total[d] += tot[d];
+}
+
+void mem_pestat_par(const mem_opt_t *opt, int64_t l_pac, int n,
+                    const mem_alnreg_v *regs, mem_pestat_t pes[4], int n_threads)
+{
+    const int nt = n_threads > 0 ? n_threads : 1;
+    const int max_ins = mem_pestat_bound(opt);
+    const size_t span = (size_t)max_ins + 1;
+    if (nt == 1 || (size_t)nt * 4 * span * sizeof(int64_t) > kPestatParMaxBytes) {
+        mem_pestat_bounded(opt, l_pac, n, regs, pes, max_ins);
+        return;
+    }
+
+    pestat_par_ctx_t c;
+    c.opt = opt;
+    c.l_pac = l_pac;
+    c.regs = regs;
+    c.max_ins = max_ins;
+    c.hist = (int64_t *) malloc((size_t)nt * 4 * span * sizeof(int64_t));
+    c.slot = (pestat_slot_t *) calloc((size_t)nt, sizeof(pestat_slot_t));
+    xassert(c.hist != NULL && c.slot != NULL,
+            "out of memory allocating per-thread insert-size histograms");
+    kt_for_nt(worker_pestat, &c, n & ~1, nt);
+
+    int64_t *cnt_buf = (int64_t *) calloc(4 * span, sizeof(int64_t));
+    xassert(cnt_buf != NULL, "out of memory allocating insert-size histogram");
+    int64_t total[4] = { 0, 0, 0, 0 };
+    for (int t = 0; t < nt; ++t) {
+        if (!c.slot[t].used) continue;   /* ran no item */
+        const int64_t *h = c.hist + (size_t)t * 4 * span;
+        for (size_t k = 0; k < 4 * span; ++k) cnt_buf[k] += h[k];
+        for (int d = 0; d < 4; ++d) total[d] += c.slot[t].total[d];
+    }
+    free(c.hist);
+    free(c.slot);
+    int64_t *const cnt[4] = { cnt_buf, cnt_buf + span, cnt_buf + 2 * span, cnt_buf + 3 * span };
+    mem_pestat_from_counts(max_ins, cnt, total, pes);
+    free(cnt_buf);
 }
 
 /* u8 mate-rescue admission (tier selection): src/matesw_u8.h. */

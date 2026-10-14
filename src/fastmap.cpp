@@ -870,6 +870,33 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
                     __func__, ret->n_seqs, (long)size);
         }
 
+        /* [dedup-reads] Run the read-memo pre-pass here, on the read step, for an
+         * item step 1 will hand to mem_process_seqs whole: a complete,
+         * single-slice, non-smart-pair cohort, under the same eligibility test
+         * mem_process_seqs applies. On the step-1 thread the pre-pass (~25 ms
+         * per 1M-read chunk) ran with the whole kt_for pool idle; here it
+         * overlaps the previous chunk's alignment instead.
+         *
+         * Same result: the pre-pass is a pure function of this item's read bases
+         * and their order (a pair's role is "first pair with these exact bases"
+         * or "duplicate of pair j"), and nothing changes those bases between here
+         * and mem_process_seqs -- the --meth projection above is the only edit,
+         * runs first, and --meth is not eligible anyway.
+         *
+         * Thread safety: this item is owned by step 0 until it is handed to step
+         * 1 through the pipeline's mutex, which orders the writes to ret->memo
+         * before step 1 reads it. The pre-pass's module scratch is shared with
+         * the step-1 fallback and is locked (read_memo.cpp); opt is only read
+         * (flag, meth_mode: fixed for the run). */
+        if (ret->cohort_complete && !mid_cohort && !(aux->opt->flag & MEM_F_SMARTPE)
+            && mem_read_memo_prepass_eligible(aux->opt, ret->n_seqs)) {
+            ret->memo.r = read_memo_prepass(aux->opt, ret->seqs, ret->n_seqs, &ret->memo.st);
+            ret->has_memo = 1;
+            /* read_wall was sampled above; extend it over the pre-pass, which
+             * is now part of the read step's serial time. */
+            if (sp_enabled()) ret->prof.read_wall = sp_wall() - sp_r0;
+        }
+
         return ret;
     } // Step 0
     else if (step == 1)  /* Step 2: Main processing-engine */
@@ -996,12 +1023,14 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
         else if (ret->cohort_complete && aux->cohort_n == 0) {
             /* The common case: this slice IS the whole cohort. Byte-for-byte the
              * pre-slicing code path -- no accumulation, no copy. */
+            /* Hand mem_process_seqs step 0's pre-pass (NULL: it runs its own). */
             mem_process_seqs(opt,
                              aux->n_processed,
                              ret->n_seqs,
                              ret->seqs,
                              aux->pes0,
-                             w);
+                             w,
+                             ret->has_memo ? &ret->memo : NULL);
         }
         else {
             /* Multi-slice cohort. Append this slice to the cohort array, align
@@ -1141,6 +1170,15 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
             aux->cohort_seqs = NULL; aux->cohort_n = 0; aux->cohort_cap = 0;
         }
         tprof[MEM_PROCESS2][0] += __rdtsc() - tim;
+
+        /* Release step 0's pre-pass now that mem_process_seqs has finished with
+         * it (it is read through w.memo until the last kt_for pass returns). The
+         * partial-slice early return above never carries one: step 0 only runs
+         * it for complete cohorts. */
+        if (ret->has_memo) {
+            read_memo_state_free(&ret->memo.st);
+            ret->has_memo = 0;
+        }
 
         if (sp_enabled()) sp_harvest_proc(&ret->prof, sp_p0);
 
