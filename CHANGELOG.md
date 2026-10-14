@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.15.0](https://github.com/fg-labs/bwa-mem3/compare/v0.14.1...v0.15.0) (2026-10-14)
+
+
+### Features
+
+* **mem:** warn when THP-eligible memory falls back to 4 KB pages ([#587](https://github.com/fg-labs/bwa-mem3/issues/587)) ([45b98ea](https://github.com/fg-labs/bwa-mem3/commit/45b98eabf49bbec05b87939472ccc9f5a4d630e2))
+
+
+### Bug Fixes
+
+* **index:** page-align the MADV_HUGEPAGE range for the index arrays ([#589](https://github.com/fg-labs/bwa-mem3/issues/589)) ([33ef595](https://github.com/fg-labs/bwa-mem3/commit/33ef5950f143b12e828199c75339f655730a560b))
+
+
+### Performance
+
+* drop coin-flip branches in chaining, ungapped extension and seeding ([#584](https://github.com/fg-labs/bwa-mem3/issues/584)) ([b83cffd](https://github.com/fg-labs/bwa-mem3/commit/b83cffdaf60b04a62fb0e36f9a671bbb373048eb))
+* find the lockstep flush slot directly; branchless pdqsort for unique-result sorts ([#586](https://github.com/fg-labs/bwa-mem3/issues/586)) ([ce4b196](https://github.com/fg-labs/bwa-mem3/commit/ce4b19631bd825615e39358d31fa125c9f10c049))
+* **mem:** keep the kt_for pool busy through each chunk's serial tail ([#590](https://github.com/fg-labs/bwa-mem3/issues/590)) ([023b1e4](https://github.com/fg-labs/bwa-mem3/commit/023b1e4242f1513048da5702bda1efae5bea1a77))
+* **seeding:** default both lockstep widths to 32 on AMD Zen 5 ([#588](https://github.com/fg-labs/bwa-mem3/issues/588)) ([b19b55e](https://github.com/fg-labs/bwa-mem3/commit/b19b55ea623c65563da8c9fc7feb9547e54a5e34))
+
+
+### Documentation
+
+* **readme:** update performance tables for v0.14.1 ([#583](https://github.com/fg-labs/bwa-mem3/issues/583)) ([a5bf0a3](https://github.com/fg-labs/bwa-mem3/commit/a5bf0a306553134c98bddc8953c0bc6577d01a67))
+
 ## [0.14.1](https://github.com/fg-labs/bwa-mem3/compare/v0.14.0...v0.14.1) (2026-10-11)
 
 
