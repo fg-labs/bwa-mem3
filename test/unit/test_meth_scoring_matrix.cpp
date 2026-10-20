@@ -80,8 +80,8 @@ TEST_CASE("neutral frees the conversion cell to ZERO, not a match"
     // TAPS conversions are sparse (~3% of C), so rewarding the conversion as a
     // full match (genomic) over-credits spurious C->T alignments. NEUTRAL scores
     // the conversion cell as 0 -- tolerated but not rewarded -- which measured
-    // ~+0.25 pp placement over genomic across all methylation loads. See
-    // reports/2026-07-20-taps-alignment-experiment-results.md (question A).
+    // ~+0.25 pp placement over genomic across all methylation loads (4.07M
+    // simulated TAPS reads vs hg38).
     mem_opt_t *o = opt_for(MEM_METH_SCORING_NEUTRAL);
     const int b = o->b;
 
