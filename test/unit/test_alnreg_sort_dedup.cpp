@@ -32,6 +32,7 @@
 // Fixtures are built in-memory; no test data files are read.
 
 #include <algorithm>
+#include <climits>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -309,8 +310,10 @@ extern void bwamem3_primary_sort_by_hash(int n, mem_alnreg_t *a);
 extern void bwamem3_primary_sort_by_hash_exact(int n, mem_alnreg_t *a);
 extern void bwamem3_primary_sort_by_hash_alt(int n, mem_alnreg_t *a);
 extern void bwamem3_primary_sort_by_hash_alt_exact(int n, mem_alnreg_t *a);
-// The branch-free comparator spellings the pdqsorts use, against their twins.
-extern int bwamem3_sort_cmp_twins_agree(const mem_alnreg_t *a, const mem_alnreg_t *b);
+// The orders the fast sorts use (the branch-free by-score spelling, the packed
+// primary-marking keys) against the comparators they stand in for.
+extern int bwamem3_sort_orders_agree(const mem_alnreg_t *a, const mem_alnreg_t *b);
+extern void bwamem3_primary_sort_stats(unsigned long *fast, unsigned long *fallback, int reset);
 
 namespace {
 
@@ -580,12 +583,12 @@ bool tied_by_hash(const mem_alnreg_t &x, const mem_alnreg_t &y) {
 // hash_64(id + i) is distinct per i) or drawn from a small pool so that ties
 // -- which in production need a 64-bit collision -- are common. seedcov is the
 // input index so a wrong permutation among tied records is observable.
-std::vector<mem_alnreg_t> primary_regs(Rng &rng, int n, int hash_pool, bool with_alt) {
+std::vector<mem_alnreg_t> primary_regs(Rng &rng, int n, int hash_pool) {
     std::vector<mem_alnreg_t> v = random_regs(rng, n, 0);
     for (int i = 0; i < n; ++i) {
         mem_alnreg_t &r = v[static_cast<size_t>(i)];
         r.score = rng.in(30, 34);   // few distinct scores: long equal-score runs
-        r.is_alt = with_alt ? rng.in(0, 1) : 0;
+        r.is_alt = rng.in(0, 1);   // both comparators order on is_alt
         r.hash = hash_pool > 0 ? 0x9e3779b97f4a7c15ULL * static_cast<uint64_t>(1 + rng.in(0, hash_pool - 1))
                                : rng.next();
         r.seedcov = i;
@@ -758,32 +761,40 @@ TEST_CASE("the primary-marking sorts are byte-identical to unconditional ks_intr
           * doctest::test_suite("unit/alnreg_sort_dedup")) {
     // Each variant is its own named SUBCASE so doctest reports and
     // --subcase-filters them independently. A shared lambda holds the three
-    // hash regimes; the seed rides on with_alt so each variant keeps the exact
-    // inputs it had as vi=0 (plain) / vi=1 (alt). Two distinctly-named subcases
+    // hash regimes; the seed rides on with_alt so each variant draws its own
+    // inputs (vi=0 plain / vi=1 alt). Two distinctly-named subcases
     // (not a loop of same-named ones) compose correctly with doctest's
     // re-enter-per-subcase model.
     struct Variant { sort_fn fast, exact; bool with_alt; };
     auto check_variant = [](const Variant &v) {
         const uint64_t s = v.with_alt ? 1u : 0u;
+        unsigned long fast = 0, fallback = 0;
         {   // distinct hashes: the production shape (no ties, pdqsort path)
             Rng rng(0x9e370010ULL + s);
             bool saw_tie = false;
+            bwamem3_primary_sort_stats(NULL, NULL, 1);
             for (int t = 0; t < 150; ++t)
-                CHECK(agrees(primary_regs(rng, 1 + t, 0, v.with_alt), v.fast, v.exact, tied_by_hash, &saw_tie));
+                CHECK(agrees(primary_regs(rng, 1 + t, 0), v.fast, v.exact, tied_by_hash, &saw_tie));
             CHECK_FALSE(saw_tie);
+            // Every call from DEDUP_SORT_PDQ_MIN (9) regions up kept the fast path.
+            bwamem3_primary_sort_stats(&fast, &fallback, 1);
+            CHECK(fast == 150UL - 8UL);
+            CHECK(fallback == 0UL);
         }
         {   // colliding hashes: the introsort fallback
             Rng rng(0x9e370020ULL + s);
             bool saw_tie = false;
             for (int t = 0; t < 150; ++t)
-                CHECK(agrees(primary_regs(rng, 1 + t, 3, v.with_alt), v.fast, v.exact, tied_by_hash, &saw_tie));
+                CHECK(agrees(primary_regs(rng, 1 + t, 3), v.fast, v.exact, tied_by_hash, &saw_tie));
             CHECK(saw_tie);
+            bwamem3_primary_sort_stats(&fast, &fallback, 1);
+            CHECK(fallback > 0UL);
         }
         {   // mixed
             Rng rng(0x9e370030ULL + s);
             bool saw_tie = false;
             for (int t = 0; t < 150; ++t)
-                CHECK(agrees(primary_regs(rng, 1 + t, 1 + t, v.with_alt), v.fast, v.exact, tied_by_hash, &saw_tie));
+                CHECK(agrees(primary_regs(rng, 1 + t, 1 + t), v.fast, v.exact, tied_by_hash, &saw_tie));
             CHECK(saw_tie);
         }
     };
@@ -1047,23 +1058,26 @@ TEST_CASE("the mate-rescue dedup's fixed-point skip and single-insert path are b
     free(opt);
 }
 
-TEST_CASE("each branch-free sort comparator agrees with its short-circuit twin"
+TEST_CASE("each fast-sort order agrees with the comparator it stands in for"
           * doctest::test_suite("unit/alnreg_sort_dedup")) {
     // Fields drawn from tiny ranges so every equal-prefix branch of the orders is
-    // taken, plus extremes.
+    // taken, plus extremes: the full int range of score (the primary keys map
+    // it to an unsigned descending key) and every value of the signed 2-bit
+    // is_alt field.
     Rng rng(0x9e370040ULL);
     const int64_t rbs[] = {0, 1, 2, INT64_MAX, INT64_MIN};
     const uint64_t hashes[] = {0, 1, 2, UINT64_MAX};
+    const int scores[] = {INT_MIN, INT_MIN + 1, -2, -1, 0, 1, INT_MAX - 1, INT_MAX};
     int n = 0;
     for (int t = 0; t < 20000; ++t) {
         mem_alnreg_t a, b;
         memset(&a, 0, sizeof a); memset(&b, 0, sizeof b);
-        a.score = (int)(rng.next() % 3) - 1;  b.score = (int)(rng.next() % 3) - 1;
-        a.is_alt = (int)(rng.next() % 2);     b.is_alt = (int)(rng.next() % 2);
+        a.score = scores[rng.next() % 8];     b.score = scores[rng.next() % 8];
+        a.is_alt = (int)(rng.next() % 4) - 2; b.is_alt = (int)(rng.next() % 4) - 2;
         a.hash = hashes[rng.next() % 4];      b.hash = hashes[rng.next() % 4];
         a.rb = rbs[rng.next() % 5];           b.rb = rbs[rng.next() % 5];
         a.qb = (int)(rng.next() % 3);         b.qb = (int)(rng.next() % 3);
-        CHECK(bwamem3_sort_cmp_twins_agree(&a, &b));
+        CHECK(bwamem3_sort_orders_agree(&a, &b));
         ++n;
     }
     CHECK(n == 20000);
