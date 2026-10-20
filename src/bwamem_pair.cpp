@@ -349,7 +349,7 @@ static bool rescue_prune_on()
 /* BWA3_RESCUE_PRUNE_STATS=1 prints the rescue shortcuts' counters to stderr at exit as one line,
  * "[RESCUE_PRUNE] jobs=.. full=.. b1=.. b2=.. rows_in=.. rows_kept=.. jobs16=.. b1_16=.. b2_16=..
  * kmer_jobs=.. memo_hits=.. reused=.. <stage times> dedup_run=.. dedup_skip=.. dedup_run_regs=..
- * dedup_skip_regs=.. dedup_insert1=.. dedup_insert1_fast=.. dedup_s=..". The first fields are the
+ * dedup_skip_regs=.. dedup_insert1=.. dedup_insert1_fast=.. dedup_insert1_tf=.. dedup_s=..". The first fields are the
  * filter's: jobs filtered, and of them how many kept the full window, were proven to fail (b1, not
  * enqueued) or were narrowed to a hull (b2), with the reference rows before and after, the calls the
  * SIMD filter answered from its repeat memo, and of those the jobs answered from an identical
@@ -369,16 +369,18 @@ struct rescue_prune_stats_t {
      * when stats are on. */
     std::atomic<uint64_t> ns_filter{0}, ns_k0{0}, ns_band{0}, ns_k1{0}, ns_b1{0};
     /* Mate-rescue dedups (BWA3_RESCUE_DEDUP_SKIP): run (with the records they saw), skipped as
-     * provable no-ops, taken by the one-insert path and of those done in O(n), and their time. */
+     * provable no-ops, taken by the one-insert path, of those done in O(n), and of those entered
+     * with the list known tie-free (the adjacent-tie check skipped), and their time. */
     std::atomic<uint64_t> dedup_run{0}, dedup_skip{0}, dedup_run_regs{0}, dedup_skip_regs{0},
-        dedup_insert1{0}, dedup_insert1_fast{0}, ns_dedup{0};
+        dedup_insert1{0}, dedup_insert1_fast{0}, dedup_insert1_tf{0}, ns_dedup{0};
     bool on = rescue_env_opt_in("BWA3_RESCUE_PRUNE_STATS");
     ~rescue_prune_stats_t() {
         if (on) fprintf(stderr, "[RESCUE_PRUNE] jobs=%llu full=%llu b1=%llu b2=%llu rows_in=%llu rows_kept=%llu "
                         "jobs16=%llu b1_16=%llu b2_16=%llu kmer_jobs=%llu memo_hits=%llu reused=%llu filter_s=%.3f "
                         "kswv_pass0_s=%.3f band_pass0_s=%.3f kswv_pass1_s=%.3f band_pass1_s=%.3f dedup_run=%llu "
                         "dedup_skip=%llu dedup_run_regs=%llu "
-                        "dedup_skip_regs=%llu dedup_insert1=%llu dedup_insert1_fast=%llu dedup_s=%.3f\n",
+                        "dedup_skip_regs=%llu dedup_insert1=%llu dedup_insert1_fast=%llu dedup_insert1_tf=%llu "
+                        "dedup_s=%.3f\n",
                         (unsigned long long)jobs, (unsigned long long)full, (unsigned long long)b1,
                         (unsigned long long)b2, (unsigned long long)rows_in, (unsigned long long)rows_kept,
                         (unsigned long long)jobs16, (unsigned long long)b1_16,
@@ -388,7 +390,8 @@ struct rescue_prune_stats_t {
                         ns_k1 * 1e-9, ns_b1 * 1e-9, (unsigned long long)dedup_run,
                         (unsigned long long)dedup_skip, (unsigned long long)dedup_run_regs,
                         (unsigned long long)dedup_skip_regs, (unsigned long long)dedup_insert1,
-                        (unsigned long long)dedup_insert1_fast, ns_dedup * 1e-9);
+                        (unsigned long long)dedup_insert1_fast, (unsigned long long)dedup_insert1_tf,
+                        ns_dedup * 1e-9);
     }
 };
 static inline uint64_t rescue_now_ns()
@@ -410,7 +413,7 @@ struct rescue_prune_tstats_t {
         b2_16 = 0, kmer_jobs = 0, memo_hits = 0, reused = 0;
     uint64_t ns_filter = 0, ns_k0 = 0, ns_band = 0, ns_k1 = 0, ns_b1 = 0;
     uint64_t dedup_run = 0, dedup_skip = 0, dedup_run_regs = 0, dedup_skip_regs = 0, dedup_insert1 = 0,
-        dedup_insert1_fast = 0, ns_dedup = 0;
+        dedup_insert1_fast = 0, dedup_insert1_tf = 0, ns_dedup = 0;
     ~rescue_prune_tstats_t() {
         rescue_prune_stats_t &g = g_rescue_prune_stats;
         g.jobs += jobs; g.full += full; g.b1 += b1; g.b2 += b2; g.rows_in += rows_in;
@@ -419,7 +422,8 @@ struct rescue_prune_tstats_t {
         g.ns_filter += ns_filter; g.ns_k0 += ns_k0; g.ns_band += ns_band; g.ns_k1 += ns_k1; g.ns_b1 += ns_b1;
         g.dedup_run += dedup_run; g.dedup_skip += dedup_skip; g.dedup_run_regs += dedup_run_regs;
         g.dedup_skip_regs += dedup_skip_regs; g.dedup_insert1 += dedup_insert1;
-        g.dedup_insert1_fast += dedup_insert1_fast; g.ns_dedup += ns_dedup;
+        g.dedup_insert1_fast += dedup_insert1_fast; g.dedup_insert1_tf += dedup_insert1_tf;
+        g.ns_dedup += ns_dedup;
     }
 };
 static thread_local rescue_prune_tstats_t t_rescue_prune_stats;
@@ -1619,7 +1623,7 @@ int mem_pair_resolve_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
             /* a[!i] is modified only by the calls below, so one state tracks it
              * across them (see mem_matesw_batch_post). It starts unknown: the
              * array as the extension stage left it is not known to be a fixed point. */
-            mem_rescue_dedup_state_t ma_dedup_state = {0, -1};
+            mem_rescue_dedup_state_t ma_dedup_state = {0, -1, 0};
             for (j = 0; j < b[i].n && j < opt->max_matesw; ++j) {
                 /* D3 (--meth, PR-6, B3): see MATE_SORT branch above. */
                 const char  *ms_orig = opt->meth_mode ? s[!i].meth_orig_seq : NULL;
@@ -2626,7 +2630,7 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                  * before a dedup (not a path this loop takes) forfeits the state. */
                 if (dedup_state) {
                     if (dedup_state->fixpoint && dedup_state->pushed < 0) dedup_state->pushed = i;
-                    else dedup_state->fixpoint = 0, dedup_state->pushed = -1;
+                    else dedup_state->fixpoint = 0, dedup_state->pushed = -1, dedup_state->tie_free = 0;
                 }
 
                 #else
@@ -2674,7 +2678,8 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
          * src/bwamem.cpp): nothing pushed since a dedup that reported a fixed
          * point -> repeating it is a byte-for-byte no-op, skip it
          * (mem_dedup_only_fixpoint); one record pushed -> mem_dedup_only_insert1,
-         * O(n) when it can prove the result. Without state, dedup as before. */
+         * O(n) when it can prove the result, and after a fast insert it skips a
+         * check the state's tie_free proves cannot fail. Without state, dedup as before. */
         if (n) {
             const bool st = g_rescue_prune_stats.on;
             /* BWA3_RESCUE_DEDUP_SKIP=0 ignores the state: every dedup runs in full. */
@@ -2688,10 +2693,14 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                     ma->n = mem_sort_dedup_patch(opt, 0, 0, 0, ma->n, ma->a);
                 else if (ds->fixpoint) {
                     int fast = 0;
-                    ma->n = mem_dedup_only_insert1(opt, ma->n, ma->a, ds->pushed, &ds->fixpoint, &fast);
+                    if (st && ds->tie_free) ++t_rescue_prune_stats.dedup_insert1_tf;
+                    ma->n = mem_dedup_only_insert1(opt, ma->n, ma->a, ds->pushed, &ds->tie_free,
+                                                   &ds->fixpoint, &fast);
                     if (st) { ++t_rescue_prune_stats.dedup_insert1; t_rescue_prune_stats.dedup_insert1_fast += fast; }
-                } else
+                } else {
                     ma->n = mem_dedup_only_fixpoint(opt, ma->n, ma->a, &ds->fixpoint);
+                    ds->tie_free = 0;
+                }
                 if (ds) ds->pushed = -1;
                 if (st) t_rescue_prune_stats.ns_dedup += rescue_now_ns() - t0;
             }

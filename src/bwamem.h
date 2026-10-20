@@ -875,11 +875,14 @@ int mem_pair_resolve_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
  * mem_matesw_batch_post calls: `fixpoint` = 1 when the vector, apart from
  * `pushed`, is exactly the output of a dedup that reported a fixed point
  * (mem_dedup_only_fixpoint); `pushed` = index of the one record added since,
- * or -1 for none. Start at {0, -1}; reset it if the vector is modified
- * elsewhere. */
+ * or -1 for none; `tie_free` = 1 when the vector, apart from `pushed`, is the
+ * output of a fast mem_dedup_only_insert1 (so no two records tie on
+ * (score, rb, qb)), which that function maintains itself. Start at {0, -1, 0};
+ * reset it if the vector is modified elsewhere. */
 typedef struct {
     int fixpoint;
     int pushed;
+    int tie_free;
 } mem_rescue_dedup_state_t;
 
 /* The dedup-only call mem_sort_dedup_patch(opt, 0, 0, 0, n, a), byte for byte,
@@ -888,8 +891,12 @@ typedef struct {
 int mem_dedup_only_fixpoint(const mem_opt_t *opt, int n, mem_alnreg_t *a, int *fixpoint_out);
 /* mem_dedup_only_fixpoint when a[0, n) is a fixed-point output plus the one new
  * record a[pos], in O(n) where that is provably exact (src/bwamem.cpp). */
+/* `tie_free` (in/out, may be NULL) carries "the list without a[pos] is this
+ * function's fast-path output" across calls. Precondition: pass *tie_free = 1
+ * only for exactly such a list. It is set to 1 on return iff this call took
+ * the fast path. */
 int mem_dedup_only_insert1(const mem_opt_t *opt, int n, mem_alnreg_t *a, int pos,
-                           int *fixpoint_out, int *fast_out);
+                           int *tie_free, int *fixpoint_out, int *fast_out);
 
 /* Where mem_matesw_batch_post inserts a rescued region into the mate's
  * by-score list a[0, n): before the first record with a strictly lower score,
