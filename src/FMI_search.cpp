@@ -1359,6 +1359,18 @@ void FMI_search::ls_prepare_backward(BatchSlot *s)
         s->phase = PH_BWD;
         return;
     }
+#ifdef ENABLE_PREFETCH
+    // The first backward step extends every prev entry from its k and k + s
+    // checkpoint blocks. The forward step prefetched only the l side, and the
+    // half-batch look-ahead (ls_prefetch_cp_occ_t1) warms only prev[0]'s two
+    // blocks, into L2, once it sees this slot in PH_BWD; prev[1..] get no hint
+    // at all. Hint every entry into L1 now, a full pass of the other slots
+    // ahead of that step. A hint only; nothing reads its result.
+    for (int p = 0; p < s->numPrev; p++) {
+        _mm_prefetch((const char *)(&cp_occ[(s->prev[p].k) >> CP_SHIFT]), _MM_HINT_T0);
+        _mm_prefetch((const char *)(&cp_occ[(s->prev[p].k + s->prev[p].s) >> CP_SHIFT]), _MM_HINT_T0);
+    }
+#endif
     s->phase = PH_BWD;
 }
 
