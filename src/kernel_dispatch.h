@@ -41,11 +41,12 @@
     * at link time. */
 #  define ksw_extend2         BWAMEM3_PASTE(ksw_extend2,         KERNEL_VARIANT)
 #  define ksw_global2         BWAMEM3_PASTE(ksw_global2,         KERNEL_VARIANT)
-   /* Test-only: scalar reference behind ksw_global2 (see ksw.cpp), mangled
-    * per tier like the rest so it links once per tier and is resolved by a
-    * dispatch wrapper in simd_dispatch.cpp. Used only by the wavefront
-    * byte-identity unit test. */
+   /* Test-only: the scalar reference and the tuned scalar behind ksw_global2
+    * (see ksw.cpp), mangled per tier like the rest so they link once per tier
+    * and are resolved by dispatch wrappers in simd_dispatch.cpp. Used only by
+    * the ksw_global2 byte-identity unit tests. */
 #  define ksw_global2_scalar_ref BWAMEM3_PASTE(ksw_global2_scalar_ref, KERNEL_VARIANT)
+#  define ksw_global2_scalar_tuned BWAMEM3_PASTE(ksw_global2_scalar_tuned, KERNEL_VARIANT)
    /* Internal wavefront kernels (ksw_global2_wave.h, included only by ksw.cpp).
     * Static, so linking never needs these renamed — but each per-tier TU emits
     * a copy at a different source line (the AVX-512/AVX2/NEON blocks are

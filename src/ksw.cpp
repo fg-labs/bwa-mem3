@@ -28,6 +28,7 @@
 */
 
 #include <stdlib.h>
+#include <string.h>
 #include <stdint.h>
 #include <assert.h>
 
@@ -518,7 +519,9 @@ static inline uint32_t *push_cigar(int *n_cigar, int *m_cigar, uint32_t *cigar, 
 	if (*n_cigar == 0 || op != (cigar[(*n_cigar) - 1]&0xf)) {
 		if (*n_cigar == *m_cigar) {
 			*m_cigar = *m_cigar? (*m_cigar)<<1 : 4;
-			cigar = (uint32_t *) realloc(cigar, (*m_cigar) << 2);
+			uint32_t *grown = (uint32_t *) realloc(cigar, (*m_cigar) << 2);
+			xassert(grown != NULL, "out of memory: cigar");
+			cigar = grown;
 		}
 		cigar[(*n_cigar)++] = len<<4 | op;
 	} else cigar[(*n_cigar)-1] += len<<4;
@@ -529,7 +532,11 @@ static inline uint32_t *push_cigar(int *n_cigar, int *m_cigar, uint32_t *cigar, 
 
 /* Scalar reference banded Gotoh NW with CIGAR traceback. The per-tier entry
  * point `ksw_global2` (below) routes wide-band CIGAR calls to the byte-identical
- * wavefront SIMD kernel in ksw_global2_wave.h and everything else here. */
+ * wavefront SIMD kernel in ksw_global2_wave.h and everything else to
+ * ksw_global2_scalar_fast, a tuned scalar gated byte-identical to this one by
+ * test/unit/test_ksw_global2_scalar.cpp. This reference is the oracle for both
+ * (ksw_global2_scalar_ref) and still serves the shapes the tuned path leaves to
+ * it (no CIGAR requested, an empty sequence, a negative band). */
 static int ksw_global2_scalar(int qlen, const uint8_t *query, int tlen, const uint8_t *target, int m, const int8_t *mat, int o_del, int e_del, int o_ins, int e_ins, int w, int *n_cigar_, uint32_t **cigar_)
 {
 	eh_t *eh;
@@ -642,6 +649,258 @@ static int ksw_global2_scalar(int qlen, const uint8_t *query, int tlen, const ui
 	return score;
 }
 
+/* Tuned scalar banded Gotoh NW with CIGAR traceback: the same score and CIGAR
+ * as the reference ksw_global2_scalar above on every feasible band (the
+ * w >= |tlen-qlen|+3 floor bwa_gen_cigar3 keeps, or any w for equal lengths),
+ * with less work around the cell loop. Short-read calls are
+ * mostly narrow (w <= 15, a third at w <= 2, qlen ~150), so a row has 3 to 31
+ * cells and the per-call and per-row overhead dominates the cells. Every cell
+ * still runs the reference's statements in the reference's order
+ * (ksw_g2_cell); what changes:
+ *   - qp, eh and z live in per-thread buffers instead of a malloc/calloc/free
+ *     per call; a call needing more than KSW_G2_SCRATCH_MAX bytes for any of
+ *     them allocates per call, as the reference does, so a thread retains at
+ *     most about three times that;
+ *   - each z row is zeroed past its in-band cells when the band is narrower
+ *     than n_col, so a traceback that strays out of the band reads zeros
+ *     rather than a previous call's bytes. That needs an infeasible band,
+ *     which production never passes; the reference reads uninitialized
+ *     malloc memory there, so this is the one shape where the two can differ;
+ *   - rows outside the register window run the reference's plain loop (a 4x
+ *     unroll of it measured slower on both Graviton4 and Zen4);
+ *   - interior rows at w <= KSW_G2_WINDOW_WMAX (every row with w < i and
+ *     i + w + 1 < qlen has exactly 2w + 1 cells) carry the band's eh window in
+ *     registers across rows (KswG2Fill::mid_rows) instead of through eh;
+ *   - the traceback keeps the current CIGAR run in registers and moves the z
+ *     index with each step instead of recomputing it. */
+#define KSW_G2_SCRATCH_MAX (256L << 10)
+/* Widest band whose interior rows run on the register window (KswG2Fill::mid_rows).
+ * From w = 6 (13 cells) the window outgrows the register file and spills. A
+ * build-time knob only for re-measuring the cap (0 disables the window; the
+ * w = 6 and 7 instantiations exist only for it). */
+#ifndef KSW_G2_WINDOW_WMAX
+#define KSW_G2_WINDOW_WMAX 5
+#endif
+static_assert(KSW_G2_WINDOW_WMAX >= 0 && KSW_G2_WINDOW_WMAX <= 7,
+              "KswG2Fill::run instantiates the register window for w <= 7 only");
+
+namespace {
+struct KswG2ScalarScratch {
+	uint8_t *z = nullptr; long z_cap = 0;
+	int8_t *qp = nullptr; long qp_cap = 0;
+	eh_t *eh = nullptr; long eh_cap = 0;
+	~KswG2ScalarScratch() { free(z); free(qp); free(eh); }
+};
+
+/* One cell of the reference's CIGAR-route row loop, statement for statement.
+ * On entry `hd` = H(i-1,j-1), `e` = E(i,j), `f` = F(i,j), `h1` = H(i,j-1); on
+ * exit `e` = E(i+1,j), `f` = F(i,j+1) and `h1` = H(i,j). The reference's new
+ * eh[j].h is the entry h1, which the caller saves before the call. Returns the
+ * direction byte. */
+static inline uint8_t ksw_g2_cell(int32_t hd, int32_t &e, int8_t sc, int32_t &f, int32_t &h1,
+                                  int32_t oe_del, int32_t e_del, int32_t oe_ins, int32_t e_ins)
+{
+	int32_t h, m = hd, t;
+	uint8_t d;
+	m += sc;
+	d = m >= e? 0 : 1;
+	h = m >= e? m : e;
+	d = h >= f? d : 2;
+	h = h >= f? h : f;
+	h1 = h;
+	t = m - oe_del;
+	e -= e_del;
+	d |= e > t? 1<<2 : 0;
+	e  = e > t? e    : t;
+	t = m - oe_ins;
+	f -= e_ins;
+	d |= f > t? 2<<4 : 0;
+	f  = f > t? f    : t;
+	return d;
+}
+
+struct KswG2Fill {
+	eh_t *eh; const int8_t *qp; uint8_t *z; const uint8_t *target;
+	int qlen, w, n_col, o_del, e_del, oe_del, oe_ins, e_ins;
+
+	/* Row i, any shape: the reference's row loop. */
+	inline void row(int i) const
+	{
+		int32_t f = MINUS_INF, h1;
+		const int beg = i > w? i - w : 0;
+		const int end = i + w + 1 < qlen? i + w + 1 : qlen;
+		h1 = beg == 0? -(o_del + e_del * (i + 1)) : MINUS_INF;
+		const int n = end > beg? end - beg : 0;
+		/* An empty row (infeasible band) can have beg past eh's end; base the
+		 * unused pointers at end so they stay in range. */
+		const int b = n? beg : end;
+		const int8_t *q = &qp[target[i] * qlen + b];
+		eh_t *p = &eh[b];
+		uint8_t *zi = &z[(long)i * n_col];
+		if (n < n_col) memset(zi + n, 0, n_col - n);
+		for (int k = 0; k < n; ++k) {
+			int32_t e0 = p[k].e;
+			const int32_t m0 = p[k].h, s0 = h1;
+			zi[k] = ksw_g2_cell(m0, e0, q[k], f, h1, oe_del, e_del, oe_ins, e_ins);
+			p[k].h = s0; p[k].e = e0;
+		}
+		eh[end].h = h1; eh[end].e = MINUS_INF;
+	}
+
+	/* Rows [i0, i1) strictly inside the band (w < i and i + w + 1 < qlen), each
+	 * the full N = 2w + 1 = n_col cells [i - w, i + w] with h1 and f starting at
+	 * MINUS_INF. Row i reads eh[i-w .. i+w] and writes back the same span plus
+	 * eh[i+w+1] = {h1, MINUS_INF}; row i+1 reads eh[i+1-w .. i+1+w], all written
+	 * by row i, and nothing reads eh[i-w] again. So the window is loaded once,
+	 * shifted by one cell per row, and stored back after the last row. */
+	template <int N>
+	inline void mid_rows(int i0, int i1) const
+	{
+		int32_t wh[N], we[N];
+		for (int k = 0; k < N; ++k) wh[k] = eh[i0 - w + k].h, we[k] = eh[i0 - w + k].e;
+		for (int i = i0; i < i1; ++i) {
+			const int8_t *q = &qp[target[i] * qlen + (i - w)];
+			uint8_t *zi = &z[(long)i * N];
+			int32_t f = MINUS_INF, h1 = MINUS_INF;
+			int32_t nh[N], ne[N];
+			for (int k = 0; k < N; ++k) {
+				int32_t e = we[k];
+				const int32_t s = h1;
+				zi[k] = ksw_g2_cell(wh[k], e, q[k], f, h1, oe_del, e_del, oe_ins, e_ins);
+				// eh[beg + k] becomes {s, e}; the next row's window starts one cell
+				// later, so slot 0's new value is dropped.
+				if (k > 0) nh[k - 1] = s, ne[k - 1] = e;
+			}
+			nh[N - 1] = h1; ne[N - 1] = MINUS_INF;
+			for (int k = 0; k < N; ++k) wh[k] = nh[k], we[k] = ne[k];
+		}
+		for (int k = 0; k < N; ++k) eh[i1 - w + k].h = wh[k], eh[i1 - w + k].e = we[k];
+	}
+
+	/* Every row of [0, tlen), interior rows through mid_rows at
+	 * w <= KSW_G2_WINDOW_WMAX. */
+	inline void run(int tlen) const
+	{
+		const int lo = w + 1 < tlen? w + 1 : tlen;
+		int hi = qlen - w - 1;
+		if (hi > tlen) hi = tlen;
+		if (hi < lo) hi = lo;
+		int i = 0;
+		for (; i < lo; ++i) row(i);
+		if (hi > lo && w <= KSW_G2_WINDOW_WMAX) {
+			switch (w) {
+			case 1: mid_rows<3>(lo, hi); i = hi; break;
+			case 2: mid_rows<5>(lo, hi); i = hi; break;
+			case 3: mid_rows<7>(lo, hi); i = hi; break;
+			case 4: mid_rows<9>(lo, hi); i = hi; break;
+			case 5: mid_rows<11>(lo, hi); i = hi; break;
+			case 6: mid_rows<13>(lo, hi); i = hi; break;
+			case 7: mid_rows<15>(lo, hi); i = hi; break;
+			default: break;
+			}
+		}
+		for (; i < tlen; ++i) row(i);
+	}
+};
+
+/* The reference's traceback from the last cell. The current (op, len) run is
+ * kept in registers and handed to push_cigar only when the op changes, which
+ * builds exactly the words the reference's one-step-at-a-time push_cigar calls
+ * build; the trailing D and I pushes then merge into it the same way. The z
+ * index is i * n_col + (k - beg(i)) as in the reference, moved with each step
+ * rather than recomputed: beg drops by one on a step from row i exactly when
+ * i > w, so a diagonal step moves the index by -(n_col + 1) + [i > w], an up
+ * step by -n_col + [i > w] and a left step by -1. qlen, tlen >= 1 and w >= 0,
+ * so the walk starts in range and takes at least one step. */
+static void ksw_g2_backtrack(const uint8_t *z, int qlen, int tlen, int w, int n_col,
+                             int *n_cigar_, uint32_t **cigar_)
+{
+	int n_cigar = 0, m_cigar = 0;
+	uint32_t *cigar = 0, tmp;
+	int i = tlen - 1, k = (i + w + 1 < qlen? i + w + 1 : qlen) - 1;
+	long idx = (long)i * n_col + (k - (i > w? i - w : 0));
+	int which = 0, run_op = -1, run_len = 0;
+	do {
+		which = z[idx] >> (which<<1) & 3;
+		const int op = which == 0? 0 : which == 1? 2 : 1;
+		if (op == run_op) ++run_len;
+		else {
+			if (run_op >= 0) cigar = push_cigar(&n_cigar, &m_cigar, cigar, run_op, run_len);
+			run_op = op, run_len = 1;
+		}
+		const long shift = i > w;
+		if (which == 0)      idx -= n_col + 1 - shift, --i, --k;
+		else if (which == 1) idx -= n_col - shift, --i;
+		else                 idx -= 1, --k;
+	} while (i >= 0 && k >= 0);
+	cigar = push_cigar(&n_cigar, &m_cigar, cigar, run_op, run_len);
+	if (i >= 0) cigar = push_cigar(&n_cigar, &m_cigar, cigar, 2, i + 1);
+	if (k >= 0) cigar = push_cigar(&n_cigar, &m_cigar, cigar, 1, k + 1);
+	for (i = 0; i < n_cigar>>1; ++i) // reverse CIGAR
+		tmp = cigar[i], cigar[i] = cigar[n_cigar-1-i], cigar[n_cigar-1-i] = tmp;
+	*n_cigar_ = n_cigar, *cigar_ = cigar;
+}
+}  // anonymous namespace
+
+static thread_local KswG2ScalarScratch g_ksw_g2_scalar_scratch;
+
+/* Grow-only per-thread buffer of at least `need` elements (need > 0). */
+template <typename T>
+static inline T *ksw_g2_scratch_take(T *&buf, long &cap, long need, const char *what)
+{
+	if (need > cap) {
+		free(buf);
+		buf = (T *) malloc(need * sizeof(T));
+		xassert(buf != NULL, what);
+		cap = need;
+	}
+	return buf;
+}
+
+static int ksw_global2_scalar_fast(int qlen, const uint8_t *query, int tlen, const uint8_t *target, int m, const int8_t *mat, int o_del, int e_del, int o_ins, int e_ins, int w, int *n_cigar_, uint32_t **cigar_)
+{
+	if (!n_cigar_ || !cigar_ || qlen <= 0 || tlen <= 0 || w < 0)
+		return ksw_global2_scalar(qlen, query, tlen, target, m, mat, o_del, e_del, o_ins, e_ins, w, n_cigar_, cigar_);
+	const int n_col = qlen < 2*w+1? qlen : 2*w+1;
+	const long z_len = (long)n_col * tlen;
+	KswG2ScalarScratch &scr = g_ksw_g2_scalar_scratch;
+	const bool own = z_len > KSW_G2_SCRATCH_MAX || (long)qlen * m > KSW_G2_SCRATCH_MAX ||
+	                 (long)(qlen + 1) * (long)sizeof(eh_t) > KSW_G2_SCRATCH_MAX;
+	uint8_t *z;
+	int8_t *qp;
+	eh_t *eh;
+	if (own) {
+		z = (uint8_t *) malloc(z_len);
+		xassert(z != NULL, "out of memory: z");
+		qp = (int8_t *) malloc((long)qlen * m);
+		xassert(qp != NULL, "out of memory: qp");
+		eh = (eh_t *) malloc((long)(qlen + 1) * sizeof(eh_t));
+		xassert(eh != NULL, "out of memory: eh");
+	} else {
+		z = ksw_g2_scratch_take(scr.z, scr.z_cap, z_len, "out of memory: z");
+		qp = ksw_g2_scratch_take(scr.qp, scr.qp_cap, (long)qlen * m, "out of memory: qp");
+		eh = ksw_g2_scratch_take(scr.eh, scr.eh_cap, (long)qlen + 1, "out of memory: eh");
+	}
+	// generate the query profile
+	for (int k = 0, i = 0; k < m; ++k) {
+		const int8_t *p = &mat[k * m];
+		for (int j = 0; j < qlen; ++j) qp[i++] = p[query[j]];
+	}
+	// fill the first row
+	int j;
+	eh[0].h = 0; eh[0].e = MINUS_INF;
+	for (j = 1; j <= qlen && j <= w; ++j)
+		eh[j].h = -(o_ins + e_ins * j), eh[j].e = MINUS_INF;
+	for (; j <= qlen; ++j) eh[j].h = eh[j].e = MINUS_INF; // everything is -inf outside the band
+	const KswG2Fill fill = { eh, qp, z, target, qlen, w, n_col, o_del, e_del,
+	                         o_del + e_del, o_ins + e_ins, e_ins };
+	fill.run(tlen);
+	const int score = eh[qlen].h;
+	ksw_g2_backtrack(z, qlen, tlen, w, n_col, n_cigar_, cigar_);
+	if (own) { free(eh); free(qp); free(z); }
+	return score;
+}
+
 /* Test-only instrumentation: counts wavefront-kernel entries on the calling
  * thread. The differential unit test (test/unit/test_ksw_global2_wave.cpp) reads
  * these to assert that, on a SIMD tier, the wavefront path actually executed — a
@@ -711,8 +970,10 @@ static_assert(KSW_WAVE_WMIN >= 3, "the int32 wavefront kernel must not see w < 3
  * faster scalar — see the per-arch crossover), and it also keeps equal-length certified
  * bands below the floor (1 and 2) on the scalar path (static_asserts above). Anything
  * that misses a precondition (qlen == 0, an over-large region, tiers without a
- * wavefront kernel: sse41/sse42/avx) falls through to the scalar path, which is
- * the reference these kernels are proven identical to. */
+ * wavefront kernel: sse41/sse42/avx) falls through to the tuned scalar path
+ * (ksw_global2_scalar_fast), which test_ksw_global2_scalar.cpp gates
+ * byte-identical to the reference ksw_global2_scalar these kernels are proven
+ * identical to. */
 int ksw_global2(int qlen, const uint8_t *query, int tlen, const uint8_t *target, int m, const int8_t *mat, int o_del, int e_del, int o_ins, int e_ins, int w, int *n_cigar_, uint32_t **cigar_)
 {
 	/* Byte-identical wavefront cascade (every tier produces identical output;
@@ -741,17 +1002,28 @@ int ksw_global2(int qlen, const uint8_t *query, int tlen, const uint8_t *target,
 #  endif
 	}
 #endif
-	return ksw_global2_scalar(qlen, query, tlen, target, m, mat, o_del, e_del, o_ins, e_ins, w, n_cigar_, cigar_);
+	return ksw_global2_scalar_fast(qlen, query, tlen, target, m, mat, o_del, e_del, o_ins, e_ins, w, n_cigar_, cigar_);
 }
 
-/* Test-only hook: exposes the scalar reference implementation so the unit test
- * (test/unit/test_ksw_global2_wave.cpp) can gate the wavefront kernel against it
- * on the same input. The public ksw_global2 above routes a given (input, w) to
- * exactly one path, so a differential test needs a second, unconditional entry
- * to the scalar oracle. Not called on any production path. */
+/* Test-only hook: exposes the scalar reference implementation so the unit tests
+ * (test/unit/test_ksw_global2_wave.cpp, test_ksw_global2_scalar.cpp,
+ * test_global_cert_band.cpp) can gate the wavefront kernels and the tuned scalar
+ * against it on the same input. The public ksw_global2 above routes a given
+ * (input, w) to exactly one path, so a differential test needs a second,
+ * unconditional entry to the scalar oracle. Not called on any production path. */
 int ksw_global2_scalar_ref(int qlen, const uint8_t *query, int tlen, const uint8_t *target, int m, const int8_t *mat, int o_del, int e_del, int o_ins, int e_ins, int w, int *n_cigar_, uint32_t **cigar_)
 {
 	return ksw_global2_scalar(qlen, query, tlen, target, m, mat, o_del, e_del, o_ins, e_ins, w, n_cigar_, cigar_);
+}
+
+/* Test-only hook: the tuned scalar ksw_global2_scalar_fast at any band width
+ * (shapes it leaves to the reference -- no CIGAR, an empty sequence, w < 0 --
+ * still go there), so the unit test (test/unit/test_ksw_global2_scalar.cpp) can
+ * gate it against ksw_global2_scalar_ref at widths the public ksw_global2 sends
+ * to a wavefront kernel on SIMD tiers. Not called on any production path. */
+int ksw_global2_scalar_tuned(int qlen, const uint8_t *query, int tlen, const uint8_t *target, int m, const int8_t *mat, int o_del, int e_del, int o_ins, int e_ins, int w, int *n_cigar_, uint32_t **cigar_)
+{
+	return ksw_global2_scalar_fast(qlen, query, tlen, target, m, mat, o_del, e_del, o_ins, e_ins, w, n_cigar_, cigar_);
 }
 
 int ksw_global(int qlen, const uint8_t *query, int tlen, const uint8_t *target, int m, const int8_t *mat, int gapo, int gape, int w, int *n_cigar_, uint32_t **cigar_)
