@@ -21,6 +21,7 @@
 // src/ksw_global2_wave.h; this test is its empirical gate.
 
 #include <cstdlib>
+#include <iterator>
 #include <random>
 #include <string>
 #include <vector>
@@ -125,15 +126,16 @@ std::vector<TestPair> build_bulk_random(std::mt19937 &rng, int n) {
 }
 
 // Band widths to test per pair, each clamped up to the pair's feasibility floor.
-// Spans below/at/above the per-arch crossovers (int16 10/10/16, int32 16/26/52
+// Spans below/at/above the per-arch crossovers (int16 10/10/5, int32 16/26/52
 // across AVX-512/AVX2/NEON) plus wide bands that force the interior fast-path
 // chunk, so both the boundary-only and the interior code paths are exercised
-// regardless of the compiled tier. 9/10 straddle the AVX2 / AVX-512 int16
-// crossover exactly (KSW_WAVE16_WMIN = 10 on those tiers; NEON's is 16, covered
-// by the 16 entry) and 32/33 the AVX2 tier's former value (33), so byte-identity
-// -- and, via run_parity's routing gate, which kernel ran -- is asserted right
-// at the current boundary and at the old one the crossover was lowered from.
-const int kBandTargets[] = {3, 9, 10, 16, 20, 26, 32, 33, 64, 200};
+// regardless of the compiled tier. 4/5 straddle the NEON int16 crossover
+// (KSW_WAVE16_WMIN = 5; it was 16, covered by the 16 entry), 9/10 the AVX2 /
+// AVX-512 one (10 on those tiers), and 32/33 the AVX2 tier's former value (33),
+// so byte-identity -- and, via run_parity's routing gate, which kernel ran -- is
+// asserted right at the current boundaries and at the old ones the crossovers
+// were lowered from.
+const int kBandTargets[] = {3, 4, 5, 9, 10, 16, 20, 26, 32, 33, 64, 200};
 
 // One (o_del,e_del,o_ins,e_ins) tuple per index; asymmetric gaps included so the
 // del/ins direction bytes are exercised independently.
@@ -170,9 +172,11 @@ bool tier_has_wavefront() {
 // than every pair falling back to the int32 wave; `expect_int16_rejected` by
 // callers whose pairs all fail the int16 range gate, asserting the int16 kernel
 // never ran (the fallback really is the int32 wave or scalar).
+// `gaps` replaces kGapSets when a caller needs its own gap penalties.
 void run_parity(const std::vector<TestPair> &pairs, const int8_t *mat,
-                bool expect_int16 = false, bool expect_int16_rejected = false) {
-    for (const GapSet &g : kGapSets) {
+                bool expect_int16 = false, bool expect_int16_rejected = false,
+                const std::vector<GapSet> &gaps = {std::begin(kGapSets), std::end(kGapSets)}) {
+    for (const GapSet &g : gaps) {
         const std::string gname = "gap[" + std::to_string(g.o_del) + "," +
             std::to_string(g.e_del) + "," + std::to_string(g.o_ins) + "," +
             std::to_string(g.e_ins) + "]";
@@ -298,11 +302,11 @@ TEST_CASE("wavefront ksw_global2 byte-identical on short/low-penalty pairs (int1
 
 // Long queries push H_upper = qlen*A + A past the int16 gate's ceiling
 // (32767 - SLACK = 32703), so ksw_g2_wave16_safe returns false and the
-// dispatcher must fall back to the int32 wave (w >= its WMIN) or scalar. This is
-// the ONLY case in the suite that exercises the int32 wavefront kernel: every
-// wavefront tier now has KSW_WAVE16_WMIN <= KSW_WAVE_WMIN (AVX2 10/26, AVX-512
-// 10/16, NEON 16/52), so the int16 tier otherwise always wins the
-// safe-and-wide-enough race. Confirms the cascade
+// dispatcher must fall back to the int32 wave (w >= its WMIN) or scalar. This and
+// the gap-penalty case below are the only cases in the suite that exercise the
+// int32 wavefront kernel: every wavefront tier now has KSW_WAVE16_WMIN <=
+// KSW_WAVE_WMIN (AVX2 10/26, AVX-512 10/16, NEON 5/52), so the int16 tier
+// otherwise always wins the safe-and-wide-enough race. Confirms the cascade
 // stays byte-identical when the int16 tier is rejected. (The score matrix is
 // int8_t, so |value| <= 127; with the max match score A=127, qlen>256 is what
 // takes H_upper over the ceiling — hence the >256bp query lengths here.)
@@ -326,6 +330,25 @@ TEST_CASE("wavefront ksw_global2 byte-identical when int16 falls back to int32/s
     pairs.push_back(bwa_tests::gen_all_mismatch_pair(300));
     pairs.push_back(bwa_tests::gen_homopolymer_pair(300, 0));
     run_parity(pairs, mat.data(), /*expect_int16=*/false, /*expect_int16_rejected=*/true);
+}
+
+// Short and degenerate pairs on the int32 wavefront. A gap open past the int16
+// sentinel's headroom (o + e >= 2704 fails ksw_g2_wave16_safe's sentinel-underflow
+// separation) rejects the int16 tier for any length, so these pairs run the int32
+// kernel at w >= its crossover. Short pairs make most chunks boundary chunks
+// (whole-chunk direction stores whose overhang lands in later diagonals' slots or
+// the store's slack, and the terminal-column score read), which the long-query
+// case above barely reaches. The second gap set keeps deletions cheap so the
+// CIGARs still carry gaps.
+TEST_CASE("wavefront ksw_global2 byte-identical on short pairs routed to int32 by gap penalties"
+          * doctest::test_suite("unit/ksw_global2")) {
+    const auto mat = bwa_tests::build_scoring_matrix(1, 4, 1);
+    std::mt19937 rng(77);
+    auto pairs = build_edge_cases(rng);
+    std::uniform_int_distribution<int> qd(1, 40), rd(1, 45);
+    for (int i = 0; i < 60; i++) pairs.push_back(bwa_tests::gen_random_pair(rng, qd(rng), rd(rng)));
+    const std::vector<GapSet> gaps = {{3000, 1, 3000, 1}, {5, 2, 3000, 3}};
+    run_parity(pairs, mat.data(), /*expect_int16=*/false, /*expect_int16_rejected=*/true, gaps);
 }
 
 // Windowed high-water decay of the direction-byte store zr (see
