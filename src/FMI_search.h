@@ -339,7 +339,14 @@ class FMI_search: public indexEle
                         uint32_t count,
                         int32_t max_occ,
                         int tid);
-    /* drop_sentinel_offset selects the coordinate reported when the LF walk
+    /* One step of a lane's LF walk in the pipelined resolver. `offset` is the
+     * lane's in/out walk length: 0 when a row is first staged, then passed back
+     * unchanged with each continuation. Returns 1 with sa_entry = the resolved
+     * coordinate (sample(pos) + offset, or the sentinel value below). Returns 0
+     * with sa_entry = the next row to pass back in as `pos`; that row may itself
+     * be sampled (the step does not read the sample, so the caller can prefetch
+     * it), and the next call resolves it.
+     * drop_sentinel_offset selects the coordinate reported when the LF walk
      * reaches the sentinel row: 0 = the accumulated walk offset (correct, bwa's
      * behaviour), 1 = 0 (bwa-mem2 v2.2.1's behaviour, selected by
      * --compat=bwa-mem2; see compat_target_t::sa_sentinel_drop_offset). */

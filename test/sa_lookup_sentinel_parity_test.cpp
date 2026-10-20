@@ -65,7 +65,9 @@ int main(int argc, char *argv[]) {
     // (otherwise call_one_step takes the direct-read fast path and never sees b == 4),
     // so a sampled sentinel is a loud failure -- pick a fixture whose sentinel row is
     // non-sampled -- never a silent skip that would let the whole gate go vacuous.
-    if ((fmi->sentinel_index & SA_COMPX_MASK) == 0) {
+    // Classify with the loaded index's mask (fmi->sa_compx_mask), not the compile-time
+    // default SA_COMPX_MASK: an index built with a non-default -u samples at another rate.
+    if ((fmi->sentinel_index & fmi->sa_compx_mask) == 0) {
         fprintf(stderr, "FAIL: sentinel_index %lld is SA-sampled, so call_one_step's "
                 "b==4 offset branch is unreachable here; use a fixture whose sentinel row "
                 "is non-sampled\n", (long long)fmi->sentinel_index);
@@ -89,6 +91,41 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "FAIL: sentinel-offset branch under drop_sentinel_offset=1 returned "
                     "quit=%lld sa=%lld, want 1/0 (bwa-mem2's dropped walk)\n",
                     (long long)quit2, (long long)sa);
+            return 1;
+        }
+    }
+
+    // Witness 1b (the deferred sample read): an LF step that lands on a sampled row
+    // does not read the sample; it returns the row as a continuation (quit 0, offset
+    // advanced by one), and the next call resolves it as sample + the walked offset.
+    // Pin both halves directly, so a regression in either is caught here and not
+    // only through the whole-pipeline sweep below.
+    {
+        int64_t found = -1;
+        for (int64_t i = 0; i < ref_len && found < 0; i++) {
+            if ((i & fmi->sa_compx_mask) == 0 || i == fmi->sentinel_index) continue;
+            int64_t next = -1, off = 0;
+            if (fmi->call_one_step(i, next, off) == 0 && (next & fmi->sa_compx_mask) == 0) {
+                found = i;
+                if (off != 1) {
+                    fprintf(stderr, "FAIL: deferred step from row %lld advanced offset to %lld, "
+                            "want 1\n", (long long)i, (long long)off);
+                    return 1;
+                }
+                int64_t sa = -1;
+                const int64_t quit = fmi->call_one_step(next, sa, off);
+                const int64_t want = fmi->get_sa_entry_compressed(i);
+                if (quit != 1 || sa != want) {
+                    fprintf(stderr, "FAIL: deferred sampled row %lld (from row %lld) returned "
+                            "quit=%lld sa=%lld, want 1/%lld\n", (long long)next, (long long)i,
+                            (long long)quit, (long long)sa, (long long)want);
+                    return 1;
+                }
+            }
+        }
+        if (found < 0) {
+            fprintf(stderr, "FAIL: no row whose LF step lands on a sampled row; the "
+                    "deferred-read branch is unexercised on this fixture\n");
             return 1;
         }
     }
