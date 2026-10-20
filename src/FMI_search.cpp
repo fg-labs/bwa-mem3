@@ -2388,11 +2388,14 @@ void FMI_search::get_sa_entries(SMEM *smemArray, int64_t *coordArray, int32_t *c
 int64_t FMI_search::call_one_step(int64_t pos, int64_t &sa_entry, int64_t &offset,
                                   int drop_sentinel_offset)
 {
-    if ((pos & sa_compx_mask) == 0) {        
-        sa_entry = sa_ms_byte[pos >> sa_compx];        
-        sa_entry = sa_entry << 32;        
-        sa_entry = sa_entry + sa_ls_word[pos >> sa_compx];        
-        // return sa_entry;
+    if ((pos & sa_compx_mask) == 0) {
+        // A sampled row: either freshly staged (offset 0) or reached by an LF
+        // step on this lane's previous visit (offset = steps walked), whose
+        // sample lines the caller has since prefetched.
+        sa_entry = sa_ms_byte[pos >> sa_compx];
+        sa_entry = sa_entry << 32;
+        sa_entry = sa_entry + sa_ls_word[pos >> sa_compx];
+        sa_entry += offset;
         return 1;
     }
     else {
@@ -2461,20 +2464,12 @@ int64_t FMI_search::call_one_step(int64_t pos, int64_t &sa_entry, int64_t &offse
         sp = count[b] + occ_sp;
         
         offset ++;
-        if ((sp & sa_compx_mask) == 0) {
-    
-            sa_entry = sa_ms_byte[sp >> sa_compx];        
-            sa_entry = sa_entry << 32;
-            sa_entry = sa_entry + sa_ls_word[sp >> sa_compx];
-            
-            sa_entry += offset;
-            // return sa_entry;
-            return 1;
-        }
-        else {
-            sa_entry = sp;
-            return 0;
-        }
+        // Do not read the sample here even when sp is a sampled row: the load
+        // would be an un-prefetched miss into the multi-GB sample arrays. Hand
+        // sp back as a continuation; the caller prefetches its sample lines and
+        // the lane resolves it on its next visit (the sampled-row branch above).
+        sa_entry = sp;
+        return 0;
     } // else
 }
 
@@ -2483,8 +2478,8 @@ int64_t FMI_search::call_one_step(int64_t pos, int64_t &sa_entry, int64_t &offse
  * on a 5M-pair WGS slice (3 interleaved reps, user CPU) measured -0.30% on
  * AMD Zen3 (every rep faster) and no change on Intel Sapphire Rapids, while
  * a 16..40 sweep on Graviton4 was flat. The count only sets how many
- * checkpoint-block fetches are in flight; results are stored by position and
- * are byte-identical at every width. */
+ * checkpoint-block and SA-sample fetches are in flight; results are stored by
+ * position and are byte-identical at every width. */
 #if defined(__x86_64__) || defined(_M_X64)
 #define SA_RESOLVE_LANES_DEFAULT 40
 #else
@@ -3020,6 +3015,18 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
     int64_t working_set[SA_RESOLVE_LANES_MAX], map_pos[SA_RESOLVE_LANES_MAX];
     int64_t offset[SA_RESOLVE_LANES_MAX] = {-1};
 
+    // Prefetch what a lane's next visit to row p reads: the SA sample lines
+    // for a sampled row (including one an LF step just reached; call_one_step
+    // defers that read to the next visit), else the row's checkpoint block.
+    auto prefetch_row = [&](int64_t p) {
+        if ((p & sa_compx_mask) == 0) {
+            _mm_prefetch(&sa_ms_byte[p >> sa_compx], _MM_HINT_T0);
+            _mm_prefetch(&sa_ls_word[p >> sa_compx], _MM_HINT_T0);
+        }
+        else
+            _mm_prefetch(&cp_occ[p >> CP_SHIFT], _MM_HINT_T0);
+    };
+
     if (ks_measure) ks_t_kern0 = std::chrono::steady_clock::now();
     int i = 0, j = 0;    
     while(i<id && j<sa_batch_size)
@@ -3029,14 +3036,7 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
         map_pos[j] = dedup ? ks_dst[i] : i;   // dedup remaps to the rep's slot-run
         offset[j] = 0;
         
-        if ((pos & sa_compx_mask) == 0) {
-            _mm_prefetch(&sa_ms_byte[pos >> sa_compx], _MM_HINT_T0);
-            _mm_prefetch(&sa_ls_word[pos >> sa_compx], _MM_HINT_T0);
-        }
-        else {
-            int64_t occ_id_pp_ = pos >> CP_SHIFT;
-            _mm_prefetch(&cp_occ[occ_id_pp_], _MM_HINT_T0);
-        }
+        prefetch_row(pos);
         i++;
         j++;
     }
@@ -3069,28 +3069,14 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
                     i++;
                     offset[k] = 0;
                     
-                    if ((pos & sa_compx_mask) == 0) {
-                        _mm_prefetch(&sa_ms_byte[pos >> sa_compx], _MM_HINT_T0);
-                        _mm_prefetch(&sa_ls_word[pos >> sa_compx], _MM_HINT_T0);
-                    }
-                    else {
-                        int64_t occ_id_pp_ = pos >> CP_SHIFT;
-                        _mm_prefetch(&cp_occ[occ_id_pp_], _MM_HINT_T0);
-                    }
+                    prefetch_row(pos);
                 }
                 else
                     offset[k] = -1;
             }
             else {
                 working_set[k] = sp;
-                if ((sp & sa_compx_mask) == 0) {
-                    _mm_prefetch(&sa_ms_byte[sp >> sa_compx], _MM_HINT_T0);
-                    _mm_prefetch(&sa_ls_word[sp >> sa_compx], _MM_HINT_T0);
-                }
-                else {
-                    int64_t occ_id_pp_ = sp >> CP_SHIFT;
-                    _mm_prefetch(&cp_occ[occ_id_pp_], _MM_HINT_T0);
-                }                
+                prefetch_row(sp);
             }
         }
     }
