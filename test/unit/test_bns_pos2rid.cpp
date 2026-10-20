@@ -352,3 +352,61 @@ TEST_CASE("bns_intv2rid: named edge cases on a small multi-contig layout"
     // Reverse-strand interval inside rid2's forward span [250,300).
     CHECK(bns_intv2rid(&fake.bns, 2 * l_pac - 300, 2 * l_pac - 250) == 2);
 }
+
+TEST_CASE("bns_rid_bucket: names the bucket bns_intv2rid reads first, on both strands"
+          * doctest::test_suite("unit/bns_pos2rid")) {
+    // About 12 buckets, some holding a contig start and some not (an empty
+    // bracket). Forward positions are [0, l_pac); a reverse-strand coordinate
+    // rb in [l_pac, 2 * l_pac) starts on forward base 2*l_pac-1-rb.
+    FakeBns fake(uniform_contigs(5, kBucketWidth * 5 / 2 + 7));
+    const int64_t l_pac = fake.bns.l_pac;
+    REQUIRE(l_pac > 3 * kBucketWidth);
+
+    // Out-of-range probes go more than a bucket past each end, where an
+    // unchecked negative depos'd position would shift to a bucket below -1.
+    std::vector<int64_t> probes = {-3 * kBucketWidth, -1, 0, 1, l_pac - 1, l_pac, l_pac + 1,
+                                   2 * l_pac - 1, 2 * l_pac, 2 * l_pac + 3 * kBucketWidth};
+    for (int64_t b = 1; b * kBucketWidth < l_pac; ++b) {
+        for (int64_t f : {b * kBucketWidth - 1, b * kBucketWidth}) {
+            probes.push_back(f);                 // forward coordinate
+            probes.push_back(2 * l_pac - 1 - f); // reverse coordinate of the same base
+        }
+    }
+
+    // Unbuilt table: never a bucket, whatever the coordinate.
+    for (int64_t rb : probes) {
+        CAPTURE(rb);
+        CHECK(bns_rid_bucket(&fake.bns, rb) == -1);
+        bns_prefetch_rid_bucket(&fake.bns, rb);   // smoke call: an early return here
+    }
+
+    bns_build_pos2rid(&fake.bns);
+    REQUIRE(fake.bns.pos2rid_bucket != NULL);
+    int n_rev = 0, n_empty = 0;
+    for (int64_t rb : probes) {
+        CAPTURE(rb);
+        int64_t want = -1;
+        if (rb >= 0 && rb < l_pac) want = rb / kBucketWidth;
+        else if (rb >= l_pac && rb < 2 * l_pac) want = (2 * l_pac - 1 - rb) / kBucketWidth, ++n_rev;
+        const int64_t got = bns_rid_bucket(&fake.bns, rb);
+        CHECK(got == want);
+        if (got >= 0) {
+            // Independent of the formula: the bucket's bracket must contain the
+            // linear oracle's rid for the base rb starts on.
+            const int64_t f = rb < l_pac ? rb : 2 * l_pac - 1 - rb;
+            const int rid = fake.expected_rid(f);
+            const int lo = fake.bns.pos2rid_bucket[got], hi = fake.bns.pos2rid_bucket[got + 1];
+            CHECK(lo <= rid);
+            CHECK(rid <= hi);
+            // With an empty bracket bns_intv2rid answers a one-base interval from
+            // this bucket alone, so the prefetch targets the line it reads.
+            if (lo == hi) {
+                CHECK(bns_intv2rid(&fake.bns, rb, rb + 1) == lo);
+                ++n_empty;
+            }
+        }
+        bns_prefetch_rid_bucket(&fake.bns, rb);
+    }
+    CHECK(n_rev >= 6);     // the reverse-strand mapping is actually exercised
+    CHECK(n_empty >= 6);   // and so is the bns_intv2rid comparison
+}
