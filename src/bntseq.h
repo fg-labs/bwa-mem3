@@ -192,4 +192,30 @@ static inline int64_t bns_depos(const bntseq_t *bns, int64_t pos, int *is_rev)
 	return (*is_rev = (pos >= bns->l_pac))? (bns->l_pac<<1) - 1 - pos : pos;
 }
 
+/* The pos2rid bucket whose bracket (entries b and b + 1) bns_intv2rid's
+ * in-range lookup reads first for an interval starting at rb (doubled
+ * coordinates), or -1 when the table is unbuilt or rb is outside
+ * [0, 2 * l_pac), where there is nothing worth prefetching. */
+static inline int64_t bns_rid_bucket(const bntseq_t *bns, int64_t rb)
+{
+	if (bns->pos2rid_bucket == NULL) return -1;
+	int is_rev;
+	int64_t d = bns_depos(bns, rb, &is_rev);
+	if (d < 0) return -1;   // rb < 0 or rb >= 2 * l_pac; depos never reaches l_pac
+	return d >> BNS_POS2RID_SHIFT;
+}
+
+/* Prefetch that bracket, for a caller that knows rb a few seeds ahead. Entry
+ * b + 1 always exists (the table has a trailing entry) and shares b's cache
+ * line except when b's entry ends a line. A hint only: nothing reads its
+ * result, so it never changes an answer. */
+static inline void bns_prefetch_rid_bucket(const bntseq_t *bns, int64_t rb)
+{
+	int64_t b = bns_rid_bucket(bns, rb);
+	if (b >= 0) {
+		__builtin_prefetch(&bns->pos2rid_bucket[b], 0, 3);
+		__builtin_prefetch(&bns->pos2rid_bucket[b + 1], 0, 3);
+	}
+}
+
 #endif

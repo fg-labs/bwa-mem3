@@ -3428,6 +3428,14 @@ static inline void chain_add_seed(ChainFlat &cf, const mem_opt_t *opt, int64_t l
                        tid, seqid, seed_in, rid, meth_hyp);
 }
 
+/* How many decoded hits ahead mem_chain_seeds prefetches the contig test's
+ * pos2rid bucket (bns_prefetch_rid_bucket). */
+#ifndef CHAIN_RID_PREFETCH_AHEAD
+#define CHAIN_RID_PREFETCH_AHEAD 4
+#endif
+static_assert(CHAIN_RID_PREFETCH_AHEAD >= 1,
+              "CHAIN_RID_PREFETCH_AHEAD must look at least one hit ahead");
+
 /** NEW ONE **/
 void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
                      const bntseq_t *bns,
@@ -3543,6 +3551,7 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
      * tuned one. */
     constexpr int64_t sa_chunk_positions = 16384;
     int64_t mypos = 0;          /* cursor into sa_coord, relative to chunk start */
+    int64_t sa_n = 0;           /* decoded entries in sa_coord (prefetch bound) */
     int64_t chunk_end = 0;      /* exclusive SMEM index resolved so far */
     int64_t sa_cap = (int64_t)opt->max_occ * smem_buf_size;   /* sa_coord elements */
 
@@ -3690,6 +3699,7 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
                                              sa_drop_sentinel_offset);
                 tprof[MEM_SA][tid] += __rdtsc() - tim_sa;
                 mypos = 0;
+                sa_n = cnt_;
             }
         }
         else
@@ -3700,6 +3710,7 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
                                          pos - smem_ptr + 1, opt->max_occ, tid, id,
                                          sa_drop_sentinel_offset);  // sa compressed prefetch
             tprof[MEM_SA][tid] += __rdtsc() - tim;
+            sa_n = cnt_;
         }
         #else
         mypos = 0;
@@ -3718,6 +3729,7 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
             uint64_t tim = __rdtsc();
             fmi->get_sa_entries(p, sa_coord, &cnt, 1, opt->max_occ);
             tprof[MEM_SA][tid] += __rdtsc() - tim;
+            sa_n = cnt;
             #endif
 
             cnt = 0;
@@ -3731,10 +3743,21 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
                  * slot. The #if SA_COMPRESSION / #else regimes index different
                  * cursors (global mypos vs per-SMEM cnt); keep both. */
                 #if SA_COMPRESSION
-                s.rbeg = sa_coord[mypos++];
+                const int64_t cur = mypos++;
                 #else
-                s.rbeg = sa_coord[cnt++];
+                const int64_t cur = cnt++;
                 #endif
+                s.rbeg = sa_coord[cur];
+                /* Prefetch the contig test's pos2rid bucket a few hits ahead:
+                 * hits are spread over the genome, so each bns_intv2rid would
+                 * otherwise miss on a random line of the ~0.75 MB table. The
+                 * look-ahead runs across SMEMs (and reads of the same chunk);
+                 * in the !SA_COMPRESSION build sa_coord holds one SMEM, so it
+                 * only fires on SMEMs with more hits than the distance. The
+                 * --meth path remaps coordinates first and was not measured,
+                 * so it is left alone. */
+                if (!meth_remap && cur + CHAIN_RID_PREFETCH_AHEAD < sa_n)
+                    bns_prefetch_rid_bucket(bns, sa_coord[cur + CHAIN_RID_PREFETCH_AHEAD]);
 
                 s.qbeg = p->m;
                 s.score= s.len = slen;
