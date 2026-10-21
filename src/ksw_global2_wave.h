@@ -20,7 +20,9 @@
  * the dispatcher enters them only at w >= their minimum widths, all >= 3, see the
  * static_asserts in ksw.cpp), the
  * anti-diagonal SIMD kernel ksw_g2_wave (NEON/AVX2/AVX-512 -- same recurrence
- * and boundary logic, differing only in vector width and intrinsic spelling)
+ * and boundary seeding, differing in vector width and intrinsic spelling, and
+ * in how a boundary chunk stores its direction bytes and the final score, see
+ * Lemma 9)
  * returns a score, n_cigar and cigar[] byte-identical to ksw_global2_scalar.
  * The proof is empirically gated by test/unit/test_ksw_global2_wave.cpp
  * (differential parity vs the scalar oracle on randomized + edge inputs).
@@ -48,8 +50,11 @@
  * query[j], sign-extended via shift-left-24/shift-right-24) returns exactly
  * mat[target[i]*m+query[j]], the same int8_t scalar's query-profile q[j]
  * yields, sign-extended the same way by C's usual arithmetic conversions.
- * AVX2's reversed-query buffer and NEON's rev4 only change how the byte is
- * *loaded* (for contiguous SIMD access), never its value.
+ * NEON forms the index in byte lanes (vmla_u8) and sign-extends with vmovl_s8:
+ * the byte index is the wide index mod 256, the only byte the wide form's
+ * lookup kept, so the looked-up value is the same. AVX2's reversed-query buffer
+ * and NEON's vrev32_u8/vrev64_u8 only change how the byte is *loaded* (for
+ * contiguous SIMD access), never its value.
  *
  * LEMMA 3 (direction-byte identity). Given identical inputs (Lemma 1), both
  * kernels run the identical 4-comparison chain with identical tie-breaks:
@@ -101,6 +106,16 @@
  * so both capture H(tlen-1,qlen-1) as the final score. Precondition qlen>=1
  * (the sole production call shape) makes this capture reachable; the tlen==0
  * corner reduces identically in both to the closed-form -(o_ins+e_ins*qlen).
+ * The AVX2/AVX-512 kernels find that cell by scanning a boundary chunk's
+ * lanes. The NEON kernels read it after each diagonal instead: iS(s) is never
+ * below row s-(qlen-1), so by Lemma 5 the cell is in band iff that row is
+ * iS(s) (and iS(s)<=iE(s)), and its H is the ring slot of row iS(s). The NEON
+ * kernels also store a boundary chunk's direction bytes whole, where the x86
+ * kernels store only its in-band lanes: every lane of a chunk has i>=iS(s), and
+ * a lane is in band iff i<=iE(s) (Lemma 5), so the in-band bytes are the
+ * scalar's; the bytes of lanes past iE(s) land in later diagonals' slots, which
+ * those diagonals write before the backtrack reads them (zr's +64 slack covers
+ * the last diagonal, and the per-diagonal xassert checks the whole last chunk).
  *
  * LEMMA 10 (backtrack trajectory identity). Both backtrack loops start at the
  * textually identical cell (tlen-1, min(tlen-1+w,qlen-1)) and apply the
@@ -749,7 +764,6 @@ static int ksw_g2_wave16(int qlen,const uint8_t*query,int tlen,const uint8_t*tar
 
 #elif defined(__aarch64__)
 #define KSW_WAVE_WMIN 52
-static inline int32x4_t rev4(int32x4_t v){ int32x4_t r=vrev64q_s32(v); return vextq_s32(r,r,2); }
 
 static int ksw_g2_wave(int qlen,const uint8_t*query,int tlen,const uint8_t*target,int m,const int8_t*mat,int o_del,int e_del,int o_ins,int e_ins,int w,int*n_cigar_,uint32_t**cigar_,KswWaveScratch&S){
 	int oe_del=o_del+e_del,oe_ins=o_ins+e_ins;
@@ -788,6 +802,7 @@ static int ksw_g2_wave(int qlen,const uint8_t*query,int tlen,const uint8_t*targe
 	for(int j=0;j<qlen;++j)qpad[pad+j]=query[j];
 	int8_t tab32[32]; memset(tab32,0,32); memcpy(tab32,mat,m*m<=32?m*m:32);
 	uint8x16x2_t TAB; TAB.val[0]=vld1q_u8((const uint8_t*)tab32); TAB.val[1]=vld1q_u8((const uint8_t*)tab32+16);
+	const uint8x8_t M8=vdup_n_u8((uint8_t)m);
 	int32_t score; if(qlen==0)score=0; else if(qlen<=w)score=-(o_ins+e_ins*qlen); else score=MINUS_INF;
 	const int32x4_t VMINF=vdupq_n_s32(MINUS_INF); const int32x4_t LANEID={0,1,2,3};
 	const int Sdim=(tlen-1)+(qlen-1)+1;
@@ -801,23 +816,19 @@ static int ksw_g2_wave(int qlen,const uint8_t*query,int tlen,const uint8_t*targe
 		int i_lo=s-(qlen-1); { int a=(s-w+1)>>1; if(a>i_lo)i_lo=a; } if(i_lo<0)i_lo=0;
 		int i_hi=s; { int a=(s+w)>>1; if(a<i_hi)i_hi=a; } if(i_hi>tlen-1)i_hi=tlen-1;
 		int zbase_s=(int)roff;                 // diagonal-major offset for this diagonal
-		if(want){ zoff[s]=zbase_s; ziS[s]=i_lo; xassert((long)zbase_s+(i_hi>=i_lo?i_hi-i_lo+1:0)<=(long)S.zr.size(),"ksw wave: direction-store overrun"); if(i_hi>=i_lo) roff += (i_hi-i_lo+1); }
+		if(want){ zoff[s]=zbase_s; ziS[s]=i_lo; xassert((long)zbase_s+(i_hi>=i_lo?((i_hi-i_lo+4)&~3):0)<=(long)S.zr.size(),"ksw wave: direction-store overrun"); if(i_hi>=i_lo) roff += (i_hi-i_lo+1); }
 		for(int i0=i_lo;i0<=i_hi;i0+=4){
 			bool interior = (i0>i_lo && i0+3<i_hi);
-			int32x4_t Hdiag,e,f; uint32x4_t inband; int32x4_t iv,jv,beg;
+			int32x4_t Hdiag,e,f; int32x4_t iv,jv,beg;
 			if (interior) {
 				// interior chunk: whole tight band -> no i==0/j==0/e-invalid/f-reset lanes
 				Hdiag=vld1q_s32(&Hd2[i0]);
 				e=vld1q_s32(&Ep1[i0]);
 				f=vld1q_s32(&Fp1[i0+1]);
-				inband=vdupq_n_u32(0xFFFFFFFFu);
 			} else {
 				iv=vaddq_s32(vdupq_n_s32(i0),LANEID);
 				jv=vsubq_s32(vdupq_n_s32(s),iv);
 				beg=vmaxq_s32(vdupq_n_s32(0),vsubq_s32(iv,vdupq_n_s32(w)));
-				int32x4_t endc=vminq_s32(vdupq_n_s32(qlen),vaddq_s32(iv,vdupq_n_s32(w+1)));
-				inband=vandq_u32(vandq_u32(vcgeq_s32(iv,vdupq_n_s32(0)),vcltq_s32(iv,vdupq_n_s32(tlen))),
-					vandq_u32(vcgeq_s32(jv,beg),vcltq_s32(jv,endc)));
 				Hdiag=vld1q_s32(&Hd2[i0]);
 				uint32x4_t i0m=vceqq_s32(iv,vdupq_n_s32(0)); uint32x4_t j0m=vceqq_s32(jv,vdupq_n_s32(0));
 				int32x4_t Hi0=vbslq_s32(j0m,vdupq_n_s32(0),vsubq_s32(vdupq_n_s32(-o_ins),vmulq_s32(vdupq_n_s32(e_ins),jv)));
@@ -830,12 +841,12 @@ static int ksw_g2_wave(int qlen,const uint8_t*query,int tlen,const uint8_t*targe
 				uint32x4_t freset=vceqq_s32(jv,beg);
 				f=vbslq_s32(freset,VMINF,vld1q_s32(&Fp1[i0+1]));
 			}
+			// Score index t*m+q formed per byte: the low byte of the int32 index, which is all
+			// the table lookup used, so S is unchanged. vrev32_u8 reverses the low four query
+			// bytes (lane k reads q[s-i0-k]); the upper four bytes are not used.
 			uint8x8_t tb=vld1_u8(&tpad[pad+i0]); uint8x8_t qb=vld1_u8(&qpad[pad+(s-i0-3)]);
-			int32x4_t tv=vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(vmovl_u8(tb))));
-			int32x4_t qv=rev4(vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(vmovl_u8(qb)))));
-			int32x4_t idx=vaddq_s32(vmulq_s32(tv,vdupq_n_s32(m)),qv);
-			int8x16_t sres=vreinterpretq_s8_u8(vqtbl2q_u8(TAB,vreinterpretq_u8_s32(idx)));
-			int32x4_t Sv=vshrq_n_s32(vshlq_n_s32(vreinterpretq_s32_s8(sres),24),24);
+			uint8x8_t idx=vmla_u8(vrev32_u8(qb),tb,M8);
+			int32x4_t Sv=vmovl_s16(vget_low_s16(vmovl_s8(vreinterpret_s8_u8(vqtbl2_u8(TAB,idx)))));
 			int32x4_t mm=vaddq_s32(Hdiag,Sv);
 			int32x4_t h_me=vmaxq_s32(mm,e); int32x4_t h=vmaxq_s32(h_me,f);   // h/E'/F' via max: byte-identical on ties
 			int32x4_t t1=vsubq_s32(mm,vdupq_n_s32(oe_del)); int32x4_t em=vsubq_s32(e,vdupq_n_s32(e_del));
@@ -849,19 +860,22 @@ static int ksw_g2_wave(int qlen,const uint8_t*query,int tlen,const uint8_t*targe
 				uint32x4_t hgf=vcgeq_s32(h_me,f); d=vbslq_s32(hgf,d,vdupq_n_s32(2));
 				uint32x4_t emgt=vcgtq_s32(em,t1); d=vorrq_s32(d,vbslq_s32(emgt,vdupq_n_s32(1<<2),vdupq_n_s32(0)));
 				uint32x4_t fmgt=vcgtq_s32(fm,t2); d=vorrq_s32(d,vbslq_s32(fmgt,vdupq_n_s32(2<<4),vdupq_n_s32(0)));
-				if(interior){ int base=zbase_s+(i0-i_lo);
-					uint16x4_t d16=vmovn_u32(vreinterpretq_u32_s32(d));
-					uint8x8_t d8=vmovn_u16(vcombine_u16(d16,d16));
-					uint32_t four=vget_lane_u32(vreinterpret_u32_u8(d8),0);
-					memcpy(&z[base],&four,4);
-				} else {
-					uint32_t ib[4]; vst1q_u32(ib,inband); int32_t dv[4]; vst1q_s32(dv,d); int32_t hv[4]; vst1q_s32(hv,h);
-					for(int k=0;k<4;++k){ int i=i0+k; if(i>i_hi)break; if(!ib[k])continue; int j=s-i;
-						z[zbase_s+(i-i_lo)]=(uint8_t)dv[k];
-						if(j==qlen-1)score=hv[k]; }
-				}
+				// Store all four direction bytes, on boundary chunks too. A lane in band has
+				// i <= i_hi, so the in-band bytes are the ones the scalar writes; a lane past
+				// i_hi writes into a later diagonal's slots, which that diagonal overwrites
+				// before the backtrack reads them (the +64 slack in ksw_wave_zneed covers the
+				// last diagonal's overhang, and the xassert above checks the whole last chunk).
+				// Lanes before i_lo do not occur (i0 starts there).
+				int base=zbase_s+(i0-i_lo);
+				uint16x4_t d16=vmovn_u32(vreinterpretq_u32_s32(d));
+				uint8x8_t d8=vmovn_u16(vcombine_u16(d16,d16));
+				uint32_t four=vget_lane_u32(vreinterpret_u32_u8(d8),0);
+				memcpy(&z[base],&four,4);
 			}
 		}
+		// The terminal column j = qlen-1 is row s-(qlen-1) on this diagonal. i_lo is never
+		// below it, so the cell is in band iff it is row i_lo (Lemma 5); take its H.
+		if(z && s-(qlen-1)==i_lo && i_lo<=i_hi) score=Hc[i_lo+1];
 	}
 	if(z) ksw_wave_backtrack(z,zoff,ziS,tlen,qlen,w,n_cigar_,cigar_);
 	return score;
@@ -876,11 +890,13 @@ static int ksw_g2_wave(int qlen,const uint8_t*query,int tlen,const uint8_t*targe
  * experiment showed the ceiling is the diagonal recurrence, not intra-diagonal
  * ILP). jv is derived from the scalar (s-i0), not from s, because s=i+j can
  * exceed int16 range on long reads even when i and j individually do not.
- * Crossover: the 8-lane int16 kernel becomes a net win over scalar from w~16
- * (measured on Graviton4, clang-19, 150bp/b=4); narrower bands stay scalar, so
- * WMIN=16. */
-#define KSW_WAVE16_WMIN 16
-static inline int16x8_t rev8(int16x8_t v){ int16x8_t r=vrev64q_s16(v); return vextq_s16(r,r,4); }
+ * Crossover: replaying the ksw_global2 calls of a 200k-pair WGS run (Graviton4,
+ * clang-19), routing w >= 5 here is at or within ~4% of the fastest choice for
+ * both the current scalar fill (where 4 is a little faster) and a scalar tuned
+ * for narrow bands (where 4 is slower), so WMIN=5. It was 16 before the byte
+ * score index and whole-chunk boundary store; re-measure if either kernel
+ * changes. */
+#define KSW_WAVE16_WMIN 5
 
 static int ksw_g2_wave16(int qlen,const uint8_t*query,int tlen,const uint8_t*target,int m,const int8_t*mat,int o_del,int e_del,int o_ins,int e_ins,int w,int*n_cigar_,uint32_t**cigar_,KswWaveScratch&S){
 	int oe_del=o_del+e_del,oe_ins=o_ins+e_ins;
@@ -908,6 +924,7 @@ static int ksw_g2_wave16(int qlen,const uint8_t*query,int tlen,const uint8_t*tar
 	for(int j=0;j<qlen;++j)qpad[pad+j]=query[j];
 	int8_t tab32[32]; memset(tab32,0,32); memcpy(tab32,mat,m*m<=32?m*m:32);
 	uint8x16x2_t TAB; TAB.val[0]=vld1q_u8((const uint8_t*)tab32); TAB.val[1]=vld1q_u8((const uint8_t*)tab32+16);
+	const uint8x8_t M8=vdup_n_u8((uint8_t)m);
 	int score; if(qlen==0)score=0; else if(qlen<=w)score=-(o_ins+e_ins*qlen); else score=MINUS_INF;
 	const int16x8_t VMINF=vdupq_n_s16(KSW_VMINF16); const int16x8_t LANEID={0,1,2,3,4,5,6,7};
 	const int Sdim=(tlen-1)+(qlen-1)+1;
@@ -921,22 +938,18 @@ static int ksw_g2_wave16(int qlen,const uint8_t*query,int tlen,const uint8_t*tar
 		int i_lo=s-(qlen-1); { int a=(s-w+1)>>1; if(a>i_lo)i_lo=a; } if(i_lo<0)i_lo=0;
 		int i_hi=s; { int a=(s+w)>>1; if(a<i_hi)i_hi=a; } if(i_hi>tlen-1)i_hi=tlen-1;
 		int zbase_s=(int)roff;
-		if(want){ zoff[s]=zbase_s; ziS[s]=i_lo; xassert((long)zbase_s+(i_hi>=i_lo?i_hi-i_lo+1:0)<=(long)S.zr.size(),"ksw wave: direction-store overrun"); if(i_hi>=i_lo) roff += (i_hi-i_lo+1); }
+		if(want){ zoff[s]=zbase_s; ziS[s]=i_lo; xassert((long)zbase_s+(i_hi>=i_lo?((i_hi-i_lo+8)&~7):0)<=(long)S.zr.size(),"ksw wave: direction-store overrun"); if(i_hi>=i_lo) roff += (i_hi-i_lo+1); }
 		for(int i0=i_lo;i0<=i_hi;i0+=8){
 			bool interior = (i0>i_lo && i0+7<i_hi);
-			int16x8_t Hdiag,e,f; uint16x8_t inband; int16x8_t iv,jv,beg;
+			int16x8_t Hdiag,e,f; int16x8_t iv,jv,beg;
 			if (interior) {
 				Hdiag=vld1q_s16(&Hd2[i0]);
 				e=vld1q_s16(&Ep1[i0]);
 				f=vld1q_s16(&Fp1[i0+1]);
-				inband=vdupq_n_u16(0xFFFFu);
 			} else {
 				iv=vaddq_s16(vdupq_n_s16((int16_t)i0),LANEID);
 				jv=vsubq_s16(vdupq_n_s16((int16_t)(s-i0)),LANEID);   // j = (s-i0) - lane; avoids overflowing s=i+j
 				beg=vmaxq_s16(vdupq_n_s16(0),vsubq_s16(iv,vdupq_n_s16((int16_t)w)));
-				int16x8_t endc=vminq_s16(vdupq_n_s16((int16_t)qlen),vaddq_s16(iv,vdupq_n_s16((int16_t)(w+1))));
-				inband=vandq_u16(vandq_u16(vcgeq_s16(iv,vdupq_n_s16(0)),vcltq_s16(iv,vdupq_n_s16((int16_t)tlen))),
-					vandq_u16(vcgeq_s16(jv,beg),vcltq_s16(jv,endc)));
 				Hdiag=vld1q_s16(&Hd2[i0]);
 				uint16x8_t i0m=vceqq_s16(iv,vdupq_n_s16(0)); uint16x8_t j0m=vceqq_s16(jv,vdupq_n_s16(0));
 				int16x8_t Hi0=vbslq_s16(j0m,vdupq_n_s16(0),vsubq_s16(vdupq_n_s16((int16_t)(-o_ins)),vmulq_s16(vdupq_n_s16((int16_t)e_ins),jv)));
@@ -949,12 +962,11 @@ static int ksw_g2_wave16(int qlen,const uint8_t*query,int tlen,const uint8_t*tar
 				uint16x8_t freset=vceqq_s16(jv,beg);
 				f=vbslq_s16(freset,VMINF,vld1q_s16(&Fp1[i0+1]));
 			}
+			// Score index t*m+q formed per byte (the low byte of the int16 index, which is all
+			// the table lookup used); vrev64_u8 reverses the eight query bytes.
 			uint8x8_t tb=vld1_u8(&tpad[pad+i0]); uint8x8_t qb=vld1_u8(&qpad[pad+(s-i0-7)]);
-			int16x8_t tv=vreinterpretq_s16_u16(vmovl_u8(tb));
-			int16x8_t qv=rev8(vreinterpretq_s16_u16(vmovl_u8(qb)));
-			int16x8_t idx=vaddq_s16(vmulq_s16(tv,vdupq_n_s16((int16_t)m)),qv);
-			int8x16_t sres=vreinterpretq_s8_u8(vqtbl2q_u8(TAB,vreinterpretq_u8_s16(idx)));
-			int16x8_t Sv=vshrq_n_s16(vshlq_n_s16(vreinterpretq_s16_s8(sres),8),8);   // sign-extend low byte (int8 score)
+			uint8x8_t idx=vmla_u8(vrev64_u8(qb),tb,M8);
+			int16x8_t Sv=vmovl_s8(vreinterpret_s8_u8(vqtbl2_u8(TAB,idx)));   // sign-extend the int8 score
 			int16x8_t mm=vaddq_s16(Hdiag,Sv);
 			int16x8_t h_me=vmaxq_s16(mm,e); int16x8_t h=vmaxq_s16(h_me,f);
 			int16x8_t t1=vsubq_s16(mm,vdupq_n_s16((int16_t)oe_del)); int16x8_t em=vsubq_s16(e,vdupq_n_s16((int16_t)e_del));
@@ -967,16 +979,11 @@ static int ksw_g2_wave16(int qlen,const uint8_t*query,int tlen,const uint8_t*tar
 				uint16x8_t hgf=vcgeq_s16(h_me,f); d=vbslq_s16(hgf,d,vdupq_n_s16(2));
 				uint16x8_t emgt=vcgtq_s16(em,t1); d=vorrq_s16(d,vbslq_s16(emgt,vdupq_n_s16(1<<2),vdupq_n_s16(0)));
 				uint16x8_t fmgt=vcgtq_s16(fm,t2); d=vorrq_s16(d,vbslq_s16(fmgt,vdupq_n_s16(2<<4),vdupq_n_s16(0)));
-				if(interior){ int base=zbase_s+(i0-i_lo);
-					vst1_u8(&z[base], vmovn_u16(vreinterpretq_u16_s16(d)));   // 8 contiguous direction bytes
-				} else {
-					uint16_t ib[8]; vst1q_u16(ib,inband); int16_t dv[8]; vst1q_s16(dv,d); int16_t hv[8]; vst1q_s16(hv,h);
-					for(int k=0;k<8;++k){ int i=i0+k; if(i>i_hi)break; if(!ib[k])continue; int j=s-i;
-						z[zbase_s+(i-i_lo)]=(uint8_t)dv[k];
-						if(j==qlen-1)score=hv[k]; }
-				}
+				// All eight direction bytes, on boundary chunks too (see the int32 kernel).
+				vst1_u8(&z[zbase_s+(i0-i_lo)], vmovn_u16(vreinterpretq_u16_s16(d)));
 			}
 		}
+		if(z && s-(qlen-1)==i_lo && i_lo<=i_hi) score=Hc[i_lo+1];   // terminal column (see the int32 kernel)
 	}
 	if(z) ksw_wave_backtrack(z,zoff,ziS,tlen,qlen,w,n_cigar_,cigar_);
 	return score;
