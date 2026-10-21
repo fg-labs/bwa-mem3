@@ -33,7 +33,7 @@
  *    computes every component at minsc (skipping those confined to (te - Z, te) with bound < S) and
  *    is exact unconditionally.
  *  - score2 is reproduced from the merged row maxima with kswv's own emulation (lagged rising-row
- *    zeroing, kswv.cpp:~932-936, then the b[] scan, kswv.cpp:~1436-1519); the result
+ *    zeroing, kswv.cpp:~932-936, then the b[] scan, kswv_score2_scan_bits_u8 in kswv_score2.h); the result
  *    depends only on rows the rule above keeps exact.
  *
  * Pass 1 (tb, qb) of every 8-bit job is banded too (take_pass1 / run_pass1),
