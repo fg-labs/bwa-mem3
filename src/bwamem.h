@@ -526,6 +526,14 @@ typedef struct
     int32_t *rescue_narrow_off[MAX_THREADS];
     int64_t  rescue_narrow_cap[MAX_THREADS];
 
+    // Per-tid rescue skip sets (the orientations an anchor needs no rescue SW for; unrelated to
+    // the --rescue-skip option), indexed by anchor (gcnt / 4): mem_matesw_batch_pre records each
+    // anchor's 4-bit set (scanned, or probed from a sorted copy of the mate list) and
+    // mem_pair_resolve_batch_post hands it back to mem_matesw_batch_post while the mate list is
+    // still the one _pre scanned. Same lifetime and growth as rescue_narrow_off.
+    uint8_t *rescue_skip_set[MAX_THREADS];
+    int64_t  rescue_skip_set_cap[MAX_THREADS];
+
     // Per-tid banded-rescue plans (rescue_band.h): mem_matesw_batch_pre plans the
     // banded pass 0 of each enqueued pair and mem_sam_pe_batch runs it, so the plan
     // lives with the batch's other per-tid state for the same reason as
@@ -801,7 +809,10 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                          const char *ms_orig,
                          mem_alnreg_v *ma, mem_cache *mmc, int pcnt, int32_t gcnt,
                          int32_t &maxRefLen, int32_t &maxQerLen, int32_t tid,
-                         int mate_meth_ot = -1);
+                         int mate_meth_ot = -1, int known_skip = -1);
+/* known_skip (mem_matesw_batch_pre and mem_matesw_batch_post): -1 scans ma for the anchor's skip
+ * set; 0..15 is that set (bit r for orientation r, as mem_matesw_skip computes it) for exactly
+ * this anchor against exactly this ma, which the caller vouches for. */
 
 /* Given two alignment begin positions (rb) on the 2-bit-packed concat-with-
  * reverse-complement index, infer the pair orientation (0=FF, 1=FR, 2=RF,
@@ -813,9 +824,30 @@ int mem_infer_dir(int64_t l_pac, int64_t b1, int64_t b2, int64_t *dist);
 /* The mate-rescue orientations a region at `rb` needs no SW for: skip[r] = 1 when pes[r] failed
  * or a region of the mate `ma` already lies, in orientation r (mem_infer_dir), at a distance
  * inside [pes[r].low, pes[r].high]. Returns whether all four are set (a consistent pair exists).
- * Shared by mem_matesw_batch_pre and mem_matesw_batch_post. */
+ * mem_matesw_skip_query_init + mem_matesw_skip_scan as one call (the form mem_matesw_batch_pre and
+ * mem_matesw_batch_post compute, through a static helper that also takes a known skip set). */
 bool mem_matesw_skip(int64_t l_pac, int64_t rb, const mem_alnreg_v *ma, const mem_pestat_t pes[4],
                      int skip[4]);
+
+/* mem_matesw_skip's test for one region at `rb`, as four intervals of mate rb values, one per
+ * orientation: bit r of the skip set is pes[r].failed, or some mate region's rb lies in
+ * [lo[r], hi[r]] (inclusive; empty when lo[r] > hi[r], and `live` has bit r set exactly when it
+ * is not). A mate on rb's strand has p2 = m and one on the other strand p2 = 2*l_pac - 1 - m;
+ * orientations 0 (same strand) and 1 (other) take p2 > rb at distance p2 - rb, 3 (same) and 2
+ * (other) take p2 <= rb at distance rb - p2, as in mem_infer_dir. So each orientation's window
+ * [pes[r].low, pes[r].high] is one interval of p2, which maps to one interval of m clipped to the
+ * matching strand half. */
+typedef struct {
+    int64_t lo[4], hi[4];
+    unsigned failed, live;   // bit r: pes[r].failed / [lo[r], hi[r]] non-empty
+} mem_matesw_skip_query_t;
+
+void mem_matesw_skip_query_init(int64_t l_pac, int64_t rb, const mem_pestat_t pes[4],
+                                mem_matesw_skip_query_t *q);
+/* The skip set (bit r for orientation r) over the n regions at m: same flags as mem_matesw_skip. */
+unsigned mem_matesw_skip_scan(const mem_matesw_skip_query_t *q, const mem_alnreg_t *m, size_t n);
+/* The same skip set from the mate's rb values sorted ascending (one binary search per orientation). */
+unsigned mem_matesw_skip_probe(const mem_matesw_skip_query_t *q, const int64_t *sorted, size_t n);
 
 /* Proper-pair bit (FLAG 0x2) for a pair emitted on the batched pairing path's
  * no-pairing fallback. Returns 2 when properly paired and 0 otherwise, so the result ORs
@@ -854,7 +886,11 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
  * current hardened path (folds each end's second-best SE hit into the pair
  * MAPQ), so it differs from the removed scalar resolver there. Call after
  * mem_sam_pe_batch_pre for every pair of the batch, sort_classify, and
- * mem_sam_pe_batch.
+ * mem_sam_pe_batch, with the same tid, the same gcnt base, and a[] and pes
+ * unchanged since mem_sam_pe_batch_pre: like the gar slots, the per-anchor
+ * rescue skip sets _pre recorded (mem_cache::rescue_skip_set) are read back
+ * here, and they are those of the mate lists _pre saw. The same holds for
+ * mem_sam_pe_batch_post, which calls this.
  *
  * Out-param contract: n_pri[] is ALWAYS set. q_se[] is written ONLY when
  * *paired_out == 1. z[] is valid ONLY when *paired_out == 1; mem_pair may
@@ -919,7 +955,8 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                           int32_t *gar, mem_cache *mmc, int32_t tid,
                           const char *ms_orig = NULL,
                           const int8_t *mat = NULL, int mate_meth_ot = -1,
-                          mem_rescue_dedup_state_t *dedup_state = NULL);
+                          mem_rescue_dedup_state_t *dedup_state = NULL,
+                          int known_skip = -1);
 
 /* The scalar mem_sam_pe / mem_pair_resolve pairing path was removed; the batched
  * mem_sam_pe_batch* path above is the only mate-rescue/pairing path. */

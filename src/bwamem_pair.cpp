@@ -311,6 +311,21 @@ static int32_t *matesw_narrow_slot(mem_cache *mmc, int32_t tid, int64_t regid)
     return &mmc->rescue_narrow_off[tid][regid];
 }
 
+/* mem_matesw_batch_pre records each anchor's rescue skip set per tid, keyed by gcnt / 4, so
+ * mem_pair_resolve_batch_post can hand it back to mem_matesw_batch_post while the mate list is
+ * unchanged. Returns the slot for anchor, growing the buffer (as matesw_narrow_slot above). */
+static uint8_t *matesw_skip_slot(mem_cache *mmc, int32_t tid, int64_t anchor)
+{
+    if (anchor >= mmc->rescue_skip_set_cap[tid]) {
+        const int64_t cap = anchor + 1024;
+        uint8_t *grown = (uint8_t *) realloc(mmc->rescue_skip_set[tid], (size_t)cap);
+        xassert(grown != NULL, "out of memory: rescue_skip_set");
+        mmc->rescue_skip_set[tid] = grown;
+        mmc->rescue_skip_set_cap[tid] = cap;
+    }
+    return &mmc->rescue_skip_set[tid][anchor];
+}
+
 /* This tid's banded-rescue batch (mem_cache::rescue_band), created on first use. */
 static RescueBandBatch &matesw_band(mem_cache *mmc, int32_t tid)
 {
@@ -432,6 +447,16 @@ static thread_local rescue_prune_tstats_t t_rescue_prune_stats;
 static bool rescue_dedup_skip_enabled()
 {
     static const bool on = rescue_env_on("BWA3_RESCUE_DEDUP_SKIP");
+    return on;
+}
+/* Reuse a mate-rescue skip set instead of scanning the mate list: the set mem_matesw_batch_pre
+ * recorded, in mem_matesw_batch_post while the list is unchanged, and four binary searches over a
+ * sorted copy of a list many anchors rescue into, in mem_sam_pe_batch_pre. Default ON;
+ * BWA3_RESCUE_SKIP_REUSE=0 scans the list for every anchor in both steps, which is how the
+ * byte-identity A/B is run. */
+static bool rescue_skip_reuse_enabled()
+{
+    static const bool on = rescue_env_on("BWA3_RESCUE_SKIP_REUSE");
     return on;
 }
 /* Answer a rescue job that repeats one of the last filtered jobs byte for byte from that job's
@@ -1145,6 +1170,19 @@ int mem_capped_pair_subo(const mem_alnreg_v a[2], const int z[2], int o)
 }
 
 
+/* mem_sam_pe_batch_pre answers the rescue skip sets of a mate list through a sorted copy of its rb
+ * values when at least this many anchors rescue into a list of at least this many regions (below
+ * that a scan per anchor is cheaper than the sort). Either way gives the same skip sets. The
+ * opt-in BWA_MEM3_DEBUG_RESCUE_SKIP_XCHECK (off by default; on in CI's debug-macro build) takes
+ * the sorted path for every list, so its cross-check covers the probe too. */
+#ifdef BWA_MEM3_DEBUG_RESCUE_SKIP_XCHECK
+static const size_t MATESW_SKIP_INDEX_MIN_ANCHORS = 1;
+static const size_t MATESW_SKIP_INDEX_MIN_REGS = 1;
+#else
+static const size_t MATESW_SKIP_INDEX_MIN_ANCHORS = 8;
+static const size_t MATESW_SKIP_INDEX_MIN_REGS = 16;
+#endif
+
 int mem_sam_pe_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                          const uint8_t *pac, const mem_pestat_t pes[4],
                          uint64_t id, bseq1_t s[2], mem_alnreg_v a[2],
@@ -1180,13 +1218,31 @@ int mem_sam_pe_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
 
         // NEW, batching
         for (i = 0; i < 2; ++i) {
+            /* Many anchors against one long mate list (a repeat): sort the list's rb values once
+             * and answer each anchor's skip set with four binary searches instead of a scan. */
+            const size_t n_anchor = std::min((size_t)b[i].n, (size_t)std::max(opt->max_matesw, 0));
+            const bool indexed = n_anchor >= MATESW_SKIP_INDEX_MIN_ANCHORS
+                              && a[!i].n >= MATESW_SKIP_INDEX_MIN_REGS
+                              && rescue_skip_reuse_enabled();
+            static thread_local std::vector<int64_t> mate_rb;
+            if (indexed) {
+                mate_rb.resize(a[!i].n);
+                for (size_t k = 0; k < a[!i].n; ++k) mate_rb[k] = a[!i].a[k].rb;
+                std::sort(mate_rb.begin(), mate_rb.end());
+            }
             for (j = 0; j < b[i].n && j < opt->max_matesw; ++j) {
+                int known_skip = -1;
+                if (indexed) {
+                    mem_matesw_skip_query_t q;
+                    mem_matesw_skip_query_init(bns->l_pac, b[i].a[j].rb, pes, &q);
+                    known_skip = (int)mem_matesw_skip_probe(&q, mate_rb.data(), mate_rb.size());
+                }
                 int64_t val = mem_matesw_batch_pre(opt, bns, pac, pes, &b[i].a[j],
                                                    s[!i].l_seq, (uint8_t*)s[!i].seq,
                                                    opt->meth_mode ? s[!i].meth_orig_seq : NULL,
                                                    &a[!i], mmc, pcnt, gcnt,
                                                    maxRefLen, maxQerLen, tid,
-                                                   opt->meth_mode ? i : -1);
+                                                   opt->meth_mode ? i : -1, known_skip);
 
                 pcnt = val;
                 gcnt += 4;
@@ -1624,16 +1680,25 @@ int mem_pair_resolve_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
              * across them (see mem_matesw_batch_post). It starts unknown: the
              * array as the extension stage left it is not known to be a fixed point. */
             mem_rescue_dedup_state_t ma_dedup_state = {0, -1, 0};
+            /* a[!i] is still the list mem_sam_pe_batch_pre scanned (nothing between the halves
+             * touches a[], and b[] and the loop bounds are the same, so anchor gcnt / 4 is the
+             * same anchor) until a call returns nonzero: only such a call inserts into or dedups
+             * a[!i]. Until then the anchor's skip set is the one _pre recorded
+             * (BWA3_RESCUE_SKIP_REUSE=0 scans instead). */
+            bool ma_unchanged = rescue_skip_reuse_enabled();
             for (j = 0; j < b[i].n && j < opt->max_matesw; ++j) {
                 /* D3 (--meth, PR-6, B3): see MATE_SORT branch above. */
                 const char  *ms_orig = opt->meth_mode ? s[!i].meth_orig_seq : NULL;
                 const int8_t *rmat    = opt->meth_mode
                     ? mem_opt_meth_mat(opt, !b[i].a[j].meth_hypothesis) : NULL;
+                const int known_skip = ma_unchanged && (gcnt >> 2) < mmc->rescue_skip_set_cap[tid]
+                                     ? (int)mmc->rescue_skip_set[tid][gcnt >> 2] : -1;
                 int val = mem_matesw_batch_post(opt, bns, pac, pes, &b[i].a[j],
                                                 s[!i].l_seq, (uint8_t*)s[!i].seq,
                                                 &a[!i], myaln, gcnt, gar, mmc, tid,
                                                 ms_orig, rmat, opt->meth_mode ? i : -1,
-                                                &ma_dedup_state);
+                                                &ma_dedup_state, known_skip);
+                if (val) ma_unchanged = false;
                 n += val;
                 gcnt += 4;
             }
@@ -1913,54 +1978,120 @@ void mem_prefetch_rescue_pac(const bntseq_t *bns, const uint8_t *pac,
     }
 }
 
+/* The rescue orientations a region at rb needs no SW for, as four intervals of mate rb values (see
+ * mem_matesw_skip_query_t in bwamem.h). For orientation r with window [L, H] = [pes[r].low,
+ * pes[r].high] and t = 2*l_pac - 1:
+ *   r = 0 (same strand,  p2 = m,     p2 >  rb): m in [max(rb + 1, rb + L), rb + H]
+ *   r = 1 (other strand, p2 = t - m, p2 >  rb): m in [t - (rb + H), t - max(rb + 1, rb + L)]
+ *   r = 2 (other strand, p2 = t - m, p2 <= rb): m in [t - min(rb, rb - L), t - (rb - H)]
+ *   r = 3 (same strand,  p2 = m,     p2 <= rb): m in [rb - H, min(rb, rb - L)]
+ * each clipped to its strand half, [INT64_MIN, l_pac - 1] or [l_pac, INT64_MAX] (unbounded ends,
+ * so a region outside [0, 2*l_pac) is classified as mem_infer_dir classifies it). rb, L and H are
+ * far from the int64_t limits, so no end overflows. */
+void mem_matesw_skip_query_init(int64_t l_pac, int64_t rb, const mem_pestat_t pes[4],
+                                mem_matesw_skip_query_t *q)
+{
+    const int64_t t = (l_pac << 1) - 1;
+    const bool rev = rb >= l_pac;
+    const int64_t same_b = rev ? l_pac : INT64_MIN, same_e = rev ? INT64_MAX : l_pac - 1;
+    const int64_t oth_b = rev ? INT64_MIN : l_pac, oth_e = rev ? l_pac - 1 : INT64_MAX;
+    int64_t b[4], e[4];
+    b[0] = std::max(rb + 1, rb + pes[0].low);      e[0] = rb + pes[0].high;
+    b[1] = t - (rb + pes[1].high);                 e[1] = t - std::max(rb + 1, rb + pes[1].low);
+    b[2] = t - std::min(rb, rb - pes[2].low);      e[2] = t - (rb - pes[2].high);
+    b[3] = rb - pes[3].high;                       e[3] = std::min(rb, rb - pes[3].low);
+    q->failed = q->live = 0;
+    for (int r = 0; r < 4; ++r) {
+        const bool same = r == 0 || r == 3;
+        q->lo[r] = std::max(b[r], same ? same_b : oth_b);
+        q->hi[r] = std::min(e[r], same ? same_e : oth_e);
+        q->live |= (unsigned)(q->lo[r] <= q->hi[r]) << r;
+        q->failed |= (pes[r].failed ? 1u : 0u) << r;
+    }
+}
+
+/* One pass over the regions, four range tests each with no data-dependent branch or load: for a
+ * non-empty [lo, hi], lo <= x <= hi exactly when x - lo <= hi - lo in uint64_t (mod 2^64); the
+ * empty intervals are masked off with `live`. The flags only turn on, so stopping once all four
+ * are set (checked every 8 regions) leaves them those of the full scan. */
+unsigned mem_matesw_skip_scan(const mem_matesw_skip_query_t *q, const mem_alnreg_t *m, size_t n)
+{
+    uint64_t lo[4], w[4];
+    for (int r = 0; r < 4; ++r) {
+        lo[r] = (uint64_t)q->lo[r];
+        w[r] = (uint64_t)q->hi[r] - (uint64_t)q->lo[r];
+    }
+    unsigned found = 0;
+    for (size_t i0 = 0; i0 < n && (q->failed | (found & q->live)) != 15u; i0 += 8) {
+        const size_t e = n - i0 < 8 ? n : i0 + 8;
+        for (size_t i = i0; i < e; ++i) {
+            const uint64_t x = (uint64_t)m[i].rb;
+            found |= (unsigned)(x - lo[0] <= w[0])
+                   | (unsigned)(x - lo[1] <= w[1]) << 1
+                   | (unsigned)(x - lo[2] <= w[2]) << 2
+                   | (unsigned)(x - lo[3] <= w[3]) << 3;
+        }
+    }
+    return q->failed | (found & q->live);
+}
+
+/* With the values ascending, one lies in [lo, hi] exactly when the first value >= lo exists and is
+ * <= hi; duplicates and the original order do not matter. */
+unsigned mem_matesw_skip_probe(const mem_matesw_skip_query_t *q, const int64_t *sorted, size_t n)
+{
+    unsigned found = 0;
+    for (int r = 0; r < 4; ++r) {
+        const int64_t *p = std::lower_bound(sorted, sorted + n, q->lo[r]);
+        found |= (unsigned)(p != sorted + n && *p <= q->hi[r]) << r;
+    }
+    return q->failed | (found & q->live);
+}
+
 /* The rescue orientations a needs no SW for: skip[r] = 1 when pes[r] failed or a region of the
- * mate already lies at a distance inside pes[r]'s window in orientation r (mem_infer_dir, inlined
- * below). Returns whether all four are set.
- *
- * Off aarch64 the scan is branch-free: a repetitive mate has hundreds of regions, and per region
- * the orientation and the window test are data-dependent, so the branchy form mispredicts (about
- * 15 cycles a region on Zen 5). The flags only ever turn on and nothing else is read from the scan,
- * so stopping once all four are set (checked every 8 regions) leaves them those of the full scan. */
+ * mate already lies at a distance inside pes[r]'s window in orientation r (mem_infer_dir).
+ * Returns whether all four are set. The interval form as one call; _pre and _post go through
+ * matesw_skip_bits, which also takes a known skip set. */
 bool mem_matesw_skip(int64_t l_pac, int64_t rb, const mem_alnreg_v *ma, const mem_pestat_t pes[4],
                      int skip[4])
 {
-#if defined(__aarch64__)
-    /* aarch64 keeps the per-region loop: it already runs at ~5 cycles a region on Graviton4, and
-     * the branch-free form below measured +0.5 % wall there (WES, 4 reps) against -5.9 % on Zen 5. */
-    for (int r = 0; r < 4; ++r) skip[r] = pes[r].failed ? 1 : 0;
-    for (size_t i = 0; i < ma->n; ++i) {
-        int64_t dist;
-        const int r = mem_infer_dir(l_pac, rb, ma->a[i].rb, &dist);
-        if (dist >= pes[r].low && dist <= pes[r].high) skip[r] = 1;
-    }
-    return skip[0] + skip[1] + skip[2] + skip[3] == 4;
-#else
-    unsigned got = 0;
-    int64_t lo[4], hi[4];
-    for (int r = 0; r < 4; ++r) {
-        got |= (pes[r].failed ? 1u : 0u) << r;
-        lo[r] = pes[r].low;
-        hi[r] = pes[r].high;
-    }
-    const bool r1 = rb >= l_pac;
-    const int64_t mirror = (l_pac << 1) - 1;
-    const mem_alnreg_t *m = ma->a;
-    const size_t n = ma->n;
-    for (size_t i0 = 0; i0 < n && got != 15u; i0 += 8) {
-        const size_t e = n - i0 < 8 ? n : i0 + 8;
-        for (size_t i = i0; i < e; ++i) {
-            const int64_t b2 = m[i].rb;
-            const bool same = (b2 >= l_pac) == r1;
-            const int64_t p2 = same ? b2 : mirror - b2;   // the mate on a's strand
-            const bool gt = p2 > rb;
-            const int64_t dist = gt ? p2 - rb : rb - p2;
-            const int r = (same ? 0 : 1) ^ (gt ? 0 : 3);
-            got |= (unsigned)((dist >= lo[r]) & (dist <= hi[r])) << r;
-        }
-    }
+    mem_matesw_skip_query_t q;
+    mem_matesw_skip_query_init(l_pac, rb, pes, &q);
+    const unsigned got = mem_matesw_skip_scan(&q, ma->a, ma->n);
     for (int r = 0; r < 4; ++r) skip[r] = (int)((got >> r) & 1u);
     return got == 15u;
+}
+
+/* The skip set of the region at rb against the mate list ma: known_skip when the caller has it
+ * (0..15: _pre's sorted index, or the set _pre recorded for this anchor and this unchanged ma),
+ * else a scan of ma. */
+static unsigned matesw_skip_bits(int64_t l_pac, int64_t rb, const mem_alnreg_v *ma,
+                                 const mem_pestat_t pes[4], int known_skip)
+{
+    unsigned bits;
+    if (known_skip >= 0) {
+        bits = (unsigned)known_skip;
+    } else {
+        mem_matesw_skip_query_t q;
+        mem_matesw_skip_query_init(l_pac, rb, pes, &q);
+        bits = mem_matesw_skip_scan(&q, ma->a, ma->n);
+    }
+#ifdef BWA_MEM3_DEBUG_RESCUE_SKIP_XCHECK
+    {   /* cross-check every skip set (scanned, probed or recorded) against the per-region
+         * mem_infer_dir test the interval form replaced */
+        unsigned x = 0;
+        for (int r = 0; r < 4; ++r) x |= (pes[r].failed ? 1u : 0u) << r;
+        for (size_t i = 0; i < ma->n; ++i) {
+            int64_t dist;
+            const int r = mem_infer_dir(l_pac, rb, ma->a[i].rb, &dist);
+            if (dist >= pes[r].low && dist <= pes[r].high) x |= 1u << r;
+        }
+        if (x != bits)
+            fprintf(stderr, "ERROR: rescue skip set %u (known_skip %d) != scan %u at rb %lld, %zu mate regions\n",
+                    bits, known_skip, x, (long long)rb, ma->n);
+        xassert(x == bits, "rescue skip set disagrees with the scan");
+    }
 #endif
+    return bits;
 }
 
 int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
@@ -1969,7 +2100,7 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                          const char *ms_orig,
                          mem_alnreg_v *ma, mem_cache *mmc, int pcnt, int32_t gcnt,
                          int32_t &maxRefLen, int32_t &maxQerLen, int32_t tid,
-                         int mate_meth_ot)
+                         int mate_meth_ot, int known_skip)
 {
     /* D3 (--meth, A1/PR-6 → issue 173 Task 5): _pre stages the batched-SIMD
      * mate-rescue query for the kswv getScores8/16 kernel. As of the mat-aware
@@ -2001,7 +2132,12 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
     
     int64_t l_pac = bns->l_pac;
     int i, r, skip[4], rid = -1;
-    if (mem_matesw_skip(l_pac, a->rb, ma, pes, skip)) // consistent pair exist; no need to perform SW
+    /* known_skip, when given, is this skip set from the caller's sorted index of ma's rb values.
+     * Recorded either way for mem_pair_resolve_batch_post (see mem_cache::rescue_skip_set). */
+    const unsigned skip_bits = matesw_skip_bits(l_pac, a->rb, ma, pes, known_skip);
+    *matesw_skip_slot(mmc, tid, gcnt >> 2) = (uint8_t)skip_bits;
+    for (r = 0; r < 4; ++r) skip[r] = (int)((skip_bits >> r) & 1u);
+    if (skip_bits == 15u) // consistent pair exist; no need to perform SW
     {
         gar[gcnt + 3] = gar[gcnt + 2] = gar[gcnt + 1] = gar[gcnt + 0] = -1;
         return pcnt;
@@ -2410,7 +2546,7 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                           mem_alnreg_v *ma, kswr_t **myaln, int32_t gcnt,
                           int32_t *gar, mem_cache *mmc, int32_t tid, const char *ms_orig,
                           const int8_t *mat, int mate_meth_ot,
-                          mem_rescue_dedup_state_t *dedup_state)
+                          mem_rescue_dedup_state_t *dedup_state, int known_skip)
 {
     extern int mem_sort_dedup_patch_rev(const mem_opt_t *opt, const bntseq_t *bns,
                                         const uint8_t *pac, uint8_t *query, int n,
@@ -2450,7 +2586,11 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
      * consistent-pair fast path (the common case) does not leak it. */
     uint8_t *ms2 = NULL;
 
-    if (mem_matesw_skip(l_pac, a->rb, ma, pes, skip)) {
+    /* known_skip, when given, is the skip set mem_matesw_batch_pre recorded for this anchor, valid
+     * while ma is still the list _pre scanned (see mem_pair_resolve_batch_post). */
+    const unsigned skip_bits = matesw_skip_bits(l_pac, a->rb, ma, pes, known_skip);
+    for (r = 0; r < 4; ++r) skip[r] = (int)((skip_bits >> r) & 1u);
+    if (skip_bits == 15u) {
         return 0; // consistent pair exist; no need to perform SW
     }
 
