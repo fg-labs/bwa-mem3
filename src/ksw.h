@@ -127,10 +127,17 @@ extern "C" {
 	int ksw_global(int qlen, const uint8_t *query, int tlen, const uint8_t *target, int m, const int8_t *mat, int gapo, int gape, int w, int *n_cigar, uint32_t **cigar);
 	int ksw_global2(int qlen, const uint8_t *query, int tlen, const uint8_t *target, int m, const int8_t *mat, int o_del, int e_del, int o_ins, int e_ins, int w, int *n_cigar, uint32_t **cigar);
 
-	/* Test-only hook (see ksw.cpp): the scalar reference behind ksw_global2,
-	 * exposed so unit tests can differentially gate the wavefront SIMD kernel
-	 * against it. Not used on any production path. */
+	/* Test-only hook (see ksw.cpp): the scalar reference ksw_global2 is proven
+	 * or gated identical to, exposed so unit tests can differentially gate the
+	 * wavefront SIMD kernels and the tuned scalar against it. Not used on any
+	 * production path. */
 	int ksw_global2_scalar_ref(int qlen, const uint8_t *query, int tlen, const uint8_t *target, int m, const int8_t *mat, int o_del, int e_del, int o_ins, int e_ins, int w, int *n_cigar, uint32_t **cigar);
+
+	/* Test-only hook (see ksw.cpp): the tuned scalar path behind ksw_global2 at
+	 * any band width, so unit tests can gate it against ksw_global2_scalar_ref
+	 * at widths ksw_global2 sends to a wavefront kernel. Not used on any
+	 * production path. */
+	int ksw_global2_scalar_tuned(int qlen, const uint8_t *query, int tlen, const uint8_t *target, int m, const int8_t *mat, int o_del, int e_del, int o_ins, int e_ins, int w, int *n_cigar, uint32_t **cigar);
 
 	/* Test-only hook (see ksw.cpp): number of wavefront-kernel entries on the
 	 * calling thread. Lets the unit test assert that the SIMD path actually ran

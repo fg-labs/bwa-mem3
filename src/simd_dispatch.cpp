@@ -518,6 +518,9 @@ extern "C" int ksw_global2##suffix(int qlen, const uint8_t *query, int tlen,    
 extern "C" int ksw_global2_scalar_ref##suffix(int qlen, const uint8_t *query,         \
     int tlen, const uint8_t *target, int m, const int8_t *mat, int o_del, int e_del,  \
     int o_ins, int e_ins, int w, int *n_cigar, uint32_t **cigar);                     \
+extern "C" int ksw_global2_scalar_tuned##suffix(int qlen, const uint8_t *query,       \
+    int tlen, const uint8_t *target, int m, const int8_t *mat, int o_del, int e_del,  \
+    int o_ins, int e_ins, int w, int *n_cigar, uint32_t **cigar);                     \
 extern "C" unsigned long ksw_g2_wave_exec_count##suffix(void);                        \
 extern "C" unsigned long ksw_g2_wave16_exec_count##suffix(void);                      \
 extern "C" int ksw_g2_wave16_wmin##suffix(void);                                      \
@@ -578,14 +581,26 @@ extern "C" int ksw_global2(int qlen, const uint8_t *query, int tlen,
                       o_ins, e_ins, w, n_cigar, cigar);
 }
 
-/* Test-only: routes to the current tier's scalar reference behind ksw_global2.
- * Lets the wavefront byte-identity unit test call the scalar oracle for the
- * same (input, w) the SIMD path takes. Not used on any production path. */
+/* Test-only: routes to the current tier's scalar reference, the oracle the
+ * wavefront kernels and the tuned scalar behind ksw_global2 are gated against.
+ * Lets the byte-identity unit tests call it for the same (input, w) the
+ * production path takes. Not used on any production path. */
 extern "C" int ksw_global2_scalar_ref(int qlen, const uint8_t *query, int tlen,
     const uint8_t *target, int m, const int8_t *mat, int o_del, int e_del,
     int o_ins, int e_ins, int w, int *n_cigar, uint32_t **cigar) {
     bwamem3_simd_init();
     KSW_DISPATCH_CALL(ksw_global2_scalar_ref, qlen, query, tlen, target, m, mat, o_del, e_del,
+                      o_ins, e_ins, w, n_cigar, cigar);
+}
+
+/* Test-only: routes to the current tier's tuned scalar ksw_global2 path, so the
+ * scalar unit test can gate it at any band width. Not used on any production
+ * path. */
+extern "C" int ksw_global2_scalar_tuned(int qlen, const uint8_t *query, int tlen,
+    const uint8_t *target, int m, const int8_t *mat, int o_del, int e_del,
+    int o_ins, int e_ins, int w, int *n_cigar, uint32_t **cigar) {
+    bwamem3_simd_init();
+    KSW_DISPATCH_CALL(ksw_global2_scalar_tuned, qlen, query, tlen, target, m, mat, o_del, e_del,
                       o_ins, e_ins, w, n_cigar, cigar);
 }
 
