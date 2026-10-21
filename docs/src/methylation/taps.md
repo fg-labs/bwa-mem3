@@ -96,9 +96,6 @@ supported.
   x86 SIMD tiers (results are arm64/NEON), a methylation-rate sweep, and
   undirectional libraries.
 
-Full experiment, including the controls and what was not tested:
-`reports/2026-07-20-taps-alignment-experiment-results.md`.
-
 ---
 
 **See also:**
