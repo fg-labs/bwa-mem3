@@ -29,12 +29,15 @@ runs:
       # --retry-all-errors absorb transient UCSC hiccups so a flaky 5xx
       # doesn't fail the whole matrix on a cold cache. The SHA-256 pin
       # is enforced unconditionally by the next step so it catches both
-      # a fresh download and a restored cache entry.
+      # a fresh download and a restored cache entry. Plain HTTP on
+      # purpose: UCSC's TLS chain ends at an emSign G3 root that
+      # ubuntu-24.04's ca-certificates lacks (curl exit 60); the pin,
+      # not TLS, is what guarantees integrity.
       shell: bash
       run: |
         mkdir -p /tmp/chr22
         curl --fail --retry 3 --retry-delay 2 --retry-all-errors -sSL \
-          "https://hgdownload.soe.ucsc.edu/goldenPath/hg38/chromosomes/chr22.fa.gz" \
+          "http://hgdownload.soe.ucsc.edu/goldenPath/hg38/chromosomes/chr22.fa.gz" \
           | gunzip > /tmp/chr22/chr22.fa
         test -s /tmp/chr22/chr22.fa
         echo "chr22.fa bytes: $(wc -c < /tmp/chr22/chr22.fa)"

@@ -58,7 +58,10 @@ on:
   workflow_dispatch:
 
 env:
-  CHR17_URL: "https://hgdownload.soe.ucsc.edu/goldenpath/hg38/chromosomes/chr17.fa.gz"
+  # Plain HTTP on purpose: UCSC's TLS chain ends at an emSign G3 root that
+  # ubuntu-24.04's ca-certificates lacks (curl exit 60). Integrity comes from
+  # the CHR17_SHA256 pin, which is checked after every download.
+  CHR17_URL: "http://hgdownload.soe.ucsc.edu/goldenpath/hg38/chromosomes/chr17.fa.gz"
   CHR17_SHA256: "9acaede8d9b0a190489b49ebf38063bc69897c0d5f125c7549a6f7ee91a0b3c0"  # UCSC hg38 chr17.fa.gz
   HOLODECK_VERSION: "0.2.0"
   SIM_COVERAGE: "1"           # ~415K PE pairs on chr17 at read-length 100
