@@ -5713,8 +5713,8 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
 // branch is hoisted OUT of the inner loop (loop unswitching), while the body
 // stays byte-identical across all three by construction. Expects in scope:
 //   sbt_pos, sbt_neg  -- this cell's split score (from LUT or SBT_SPLIT8)
-//   j, j128, one128, head128, tail128, zero128, ff128, h00, h11, h10, e11,
-//   maxRS1, y1_128, minq, qlen_off128, qlen_valid128, exit0, hqe128, qfire128,
+//   j, j128, one128, head128, tail128, zero128, h00, h11, h10, e11,
+//   maxRS1, y1_128, minq, qsent128, hqe128, qfire128,
 //   H_h, F, e_ins128, oe_ins128, e_del128, oe_del128
 // The load of sbt from the removed pre-pass scratch (sbt_buf) is gone: the score
 // is now produced in-register in the enclosing loop and consumed here directly.
@@ -5756,16 +5756,29 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
 #define BSW8_NF_TRACK_OFF(hs_, fs_, pj_) { (void) (pj_); }
 #define BSW8_NF_TRACK(hs_, fs_, pj_) BSW8_NF_TRACK_OFF(hs_, fs_, pj_)   /* off outside the lean rows */
 // The query-end (gscore) capture of one column, j128 already advanced past it: shared by
-// DP_CELL_BODY8_128, DP_CELL_BODY8_128_FAST and the BSW8_SKEW finishes.
+// DP_CELL_BODY8_128, DP_CELL_BODY8_128_FAST and the BSW8_SKEW finishes. The capture is the
+// conjunction j128 == qlen_off128 && tail128 == qlen_off128 && qlen_valid128 && exit0, whose
+// last three terms are row-invariant: bsw8_qsent128 folds them into the per-row sentinel
+// qsent128, so the cell loops read one vector for the test instead of three.
 #define BSW8_QE_CAPTURE8_128()                                          \
         {                                                               \
-            __m128i cmp = _mm_cmpeq_epi8(j128, qlen_off128);            \
-            cmp = _mm_and_si128(cmp, _mm_cmpeq_epi8(tail128, qlen_off128)); \
-            cmp = _mm_and_si128(cmp, qlen_valid128);                    \
-            cmp = _mm_and_si128(cmp, exit0);                            \
+            const __m128i cmp = _mm_cmpeq_epi8(j128, qsent128);         \
             hqe128   = blendv_fullmask8(hqe128, h11, cmp);               \
-            qfire128 = blendv_fullmask8(qfire128, ff128, cmp);          \
+            qfire128 = _mm_or_si128(qfire128, cmp);                     \
         }
+// The per-row query-end sentinel: qlen_off where tail == qlen_off, qlen_valid and exit0 all
+// hold, -128 elsewhere. Built once tail and exit0 are final for the row (the cell loops write
+// neither). The offsets the capture compares lie in [-w + 1, w + 1], so they never equal -128:
+// j128 == qsent128 is exactly the four-term conjunction. Exact for w <= 126 (the 8-bit route caps
+// w at BSW8_MAX_W = 124, in bwamem.cpp); at w = 127, w + 1 wraps to -128, a width the int8
+// offset frame already gets wrong elsewhere (test_bandedswa_longread.cpp pins it).
+static inline __m128i bsw8_qsent128(__m128i qlen_off, __m128i qlen_valid, __m128i tail,
+                                    __m128i exit0)
+{
+    const __m128i gate = _mm_and_si128(_mm_and_si128(_mm_cmpeq_epi8(tail, qlen_off), qlen_valid),
+                                       exit0);
+    return blendv_fullmask8(_mm_set1_epi8(-128), qlen_off, gate);
+}
 #define DP_CELL_BODY8_128(sbt_pos, sbt_neg)                             \
     {                                                                   \
         __m128i f11, f21;                                               \
@@ -5902,7 +5915,7 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
 #define BSW8_SK_NOUNROLL
 #endif
 // Expects in scope what DP_CELL_BODY8_128 does (j, j128, one128, head128, tail128, zero128,
-// ff128, h10, h11, e11, maxRS1, y1_128, minq, qlen_off128, qlen_valid128, exit0, hqe128,
+// h10, h11, e11, maxRS1, y1_128, minq, qsent128, hqe128,
 // qfire128, H_h, F, e_ins128, oe_ins128, e_del128, oe_del128, plus what the SBTAT score needs).
 // Stage registers: m_ = m11, f_ = the loaded F cell (f11), ti_ = m11 - oe_ins, fo_ = f21,
 // mf_ = max(m11, f11). The finishes store column j, so j must be the column being finished.
@@ -6783,35 +6796,23 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
         cmpim = _mm_or_si128(cmpim, cmpht);
 
         exit0 = blendv_fullmask8(exit0, zero128, cmpim);
+        const __m128i qsent128 = bsw8_qsent128(qlen_off128, qlen_valid128, tail128, exit0);
 
-        /* Row-invariant part of the gscore query-end gate (see the per-cell block
-         * below). Of its four terms, only cmpeq(j128, qlen_off128) varies with j:
-         * tail128 is finalised by the band-grow above, qlen_valid128 is loaded in
-         * the row prologue, and exit0 was just updated for this row -- none are
-         * touched inside the j loop. Factoring them out turns a 4-op mask into a
-         * 1-op cmpeq + 1 and, and lets a row whose gate is entirely zero skip the
-         * capture (both blends would be identity). AND is associative, so this is
-         * byte-identical. Worth doing because `minq` is min(len2) over all 16
-         * lanes, so ONE short-query lane switches this block on for nearly the
-         * whole band, for every lane, on every row. */
-        /* MEASURED DEAD END -- do not retry without new evidence.
+        /* The query-end capture's three row-invariant terms (tail128 == qlen_off128,
+         * qlen_valid128, exit0) fold into qsent128 above, so the cell loops read one
+         * vector for the test where they read three (qlen_off128 is still read after
+         * the loops, by the narrowing).
          *
-         * The gscore gate below ANDs four terms per DP cell, three of which are
-         * row-invariant (tail128, qlen_valid128, exit0). Hoisting them into a
-         * per-row `gscore_row_gate` is provably byte-identical and strictly fewer
-         * ops per cell, so it looks like free money. It measured:
-         *
-         *   +3.9%  SLOWER  (hoist + an _mm_movemask_epi8 row-skip)
-         *   +4.5%  SLOWER  (hoist alone, no movemask)
-         *
-         * Both regressed, so it is the hoist, not the movemask. The mechanism is
-         * register pressure: keeping the gate vector live across the whole j loop
-         * costs a register in a kernel that is already spilling, and the spill
-         * traffic dwarfs the 2 ALU ops per cell it saves. Recomputing inside the
-         * loop is cheaper than keeping it alive.
-         *
-         * Lesson: in this kernel, op-count reduction does not predict wall time.
-         */
+         * MEASURED DEAD ENDS, for contrast:
+         * - Hoisting the same three terms into a per-row gate vector, ANDed per cell
+         *   with cmpeq(j128, qlen_off128), measured 3.9-4.5% slower: the gate was live
+         *   on top of qlen_off128 in a kernel that already spills.
+         * - Keeping only the column's own offset pj in the cell bodies (F-store mask
+         *   tail > pj, argmax recording pj with a +1 after the loops), and forming pj
+         *   per column as set1(j - i) instead of carrying j128 and one128: both
+         *   byte-identical, both measured slower than the sentinel alone on Graviton4
+         *   (clang 19; set1 per column cost 5% of 8-bit kernel throughput).
+         * In this kernel op counts do not predict wall time. */
 
 #if RDT
         tim1 = __rdtsc();

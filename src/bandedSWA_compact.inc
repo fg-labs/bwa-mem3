@@ -312,6 +312,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8Compact(SeqPair *pairArray,
                 cmpim = _mm_or_si128(cmpim, _mm_cmpgt_epi8(head128, tail128));
                 exit0 = blendv_fullmask8(exit0, zero128, cmpim);
             }
+            const __m128i qsent128 = bsw8_qsent128(qlen_off128, qlen_valid128, tail128, exit0);
 
             j128 = _mm_set1_epi8(beg - i);
             __m128i nf_seen128 = zero128, nf_acc128 = zero128;   // see BSW8_NF_TRACK
