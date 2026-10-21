@@ -2,6 +2,13 @@
 # Local unit-test harness for the standalone C++ test binaries under test/
 # (the $(EXE) list in test/Makefile). Builds, indexes the phiX fixture, runs
 # each binary, asserts exit 0 and non-empty output. No hash pinning — that lives in the CI workflow.
+#
+# Inputs (env):
+#   MAKE_ARGS — extra arguments for the top-level make that builds the binaries
+#               outside test/Makefile, e.g. "arch=avx2 USE_MIMALLOC=1". They link
+#               libbwa.a, so pass the flags it was built with: other flags
+#               rewrite .build-flags and rebuild it. Word-split, so no value may
+#               contain whitespace.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -21,8 +28,10 @@ skip() { echo "SKIP: $*"; }
 # Build the standalone test binaries.
 (cd "$HERE" && make) || fail "test/ make failed"
 
-# Build any test binaries that live outside test/Makefile.
-(cd "$ROOT" && make -j4 shm_section_find_test shm_pack_round_trip_test shm_lock_destroy_test fmi_seed_api_guards_test) > /dev/null
+# Build any test binaries that live outside test/Makefile (MAKE_ARGS: see the header).
+read -r -a make_args <<< "${MAKE_ARGS:-}"
+(cd "$ROOT" && make -j4 ${make_args[@]+"${make_args[@]}"} shm_section_find_test shm_pack_round_trip_test shm_lock_destroy_test fmi_seed_api_guards_test) > /dev/null \
+    || fail "top-level make of the shm/fmi test binaries failed (MAKE_ARGS='${MAKE_ARGS:-}')"
 
 # synthetic_1mb.fa is checked in alongside its committed baselines so the
 # byte-diff test stays reproducible across Python versions and platforms.

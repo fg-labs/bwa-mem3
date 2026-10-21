@@ -511,13 +511,22 @@ jobs:
         # all tier kernels separately; the test TU compiles at sse41 here
         # regardless of BASELINE_ARCH, so kswv tests gate on BWA_TESTS_HAVE_KSWV
         # and skip when the test TU lacks __AVX2__/__AVX512BW__).
+        # USE_MIMALLOC is the row's, as on every later libbwa.a build: left at
+        # the default it rebuilt libbwa.a with mimalloc on the use_mimalloc="0"
+        # row (and linked the unit binary against that build). The arch=-less
+        # build on the x86 single-binary row still rebuilds libbwa.a at the
+        # SSE4.1 floor, and the next step's arch=$BASELINE_ARCH build rebuilds it
+        # back; that is the price of the SSE4.1 unit binary described above.
         env:
           MATRIX_ARCH_FLAG: ${{ matrix.arch_flag }}
+          MATRIX_USE_MIMALLOC: ${{ matrix.use_mimalloc }}
         run: |
           if [ "$MATRIX_ARCH_FLAG" = "" ]; then
-            make test-binaries CXX="$CXX"
+            make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)" test-binaries \
+              CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
           else
-            make test-binaries arch="$MATRIX_ARCH_FLAG" CXX="$CXX"
+            make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)" test-binaries \
+              arch="$MATRIX_ARCH_FLAG" CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
           fi
 
       - name: Run unit tests (all rows)
@@ -564,10 +573,12 @@ jobs:
           MATRIX_USE_MIMALLOC: ${{ matrix.use_mimalloc }}
         run: |
           if [ "$MATRIX_ARCH_FLAG" = "" ]; then
-            make bns_zero_calloc_test arch="$MATRIX_BASELINE_ARCH" \
+            make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)" bns_zero_calloc_test \
+              arch="$MATRIX_BASELINE_ARCH" \
               CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
           else
-            make bns_zero_calloc_test arch="$MATRIX_ARCH_FLAG" CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
+            make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)" bns_zero_calloc_test \
+              arch="$MATRIX_ARCH_FLAG" CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
           fi
           ./bns_zero_calloc_test
 
@@ -598,12 +609,12 @@ jobs:
           MATRIX_USE_MIMALLOC: ${{ matrix.use_mimalloc }}
         run: |
           if [ "$MATRIX_ARCH_FLAG" = "" ]; then
-            make read_arena_overflow_test packed_text_neg_nbases_test \
+            make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)" read_arena_overflow_test packed_text_neg_nbases_test \
               packed_text_overflow_nbases_test mem_gen_alt_zero_calloc_test \
               arch="$MATRIX_BASELINE_ARCH" \
               CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
           else
-            make read_arena_overflow_test packed_text_neg_nbases_test \
+            make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)" read_arena_overflow_test packed_text_neg_nbases_test \
               packed_text_overflow_nbases_test mem_gen_alt_zero_calloc_test \
               arch="$MATRIX_ARCH_FLAG" CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
           fi
@@ -617,14 +628,21 @@ jobs:
         # (errno unset on EOF). The child triggers the EOF abort; the parent
         # asserts the diagnostic names "Unexpected end of file", not a leftover
         # strerror. Reachable only from `make test` otherwise; run on every row.
+        # Built at the row's arch like the sibling libbwa.a links (bns_zero_calloc_test,
+        # kopen_pipe_status_test): with no arch= the x86 flags fall to the SSE4.1
+        # floor, which rewrites .build-flags and rebuilds libbwa.a, here and
+        # again at the next step that passes the row's arch.
         env:
           MATRIX_ARCH_FLAG: ${{ matrix.arch_flag }}
+          MATRIX_BASELINE_ARCH: ${{ matrix.baseline_arch || 'avx2' }}
           MATRIX_USE_MIMALLOC: ${{ matrix.use_mimalloc }}
         run: |
           if [ "$MATRIX_ARCH_FLAG" = "" ]; then
-            make err_fgets_eof_test CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
+            make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)" err_fgets_eof_test \
+              arch="$MATRIX_BASELINE_ARCH" CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
           else
-            make err_fgets_eof_test arch="$MATRIX_ARCH_FLAG" CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
+            make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)" err_fgets_eof_test \
+              arch="$MATRIX_ARCH_FLAG" CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
           fi
           ./err_fgets_eof_test
 
@@ -660,9 +678,18 @@ jobs:
         # input with x86_soa_pack and asserts memcmp equality against the scalar
         # per-base fill it replaced, every pad row and a canary row included.
         # Built at -march=native, independent of arch_flag; rows without AVX2
-        # (arm64) compile it to a recorded skip.
+        # (arm64) compile it to a recorded skip. Its object still depends on
+        # .build-flags, so the row's arch= and USE_MIMALLOC are passed to keep
+        # the stamp at the row's flags (a bare make rewrote it, and the next
+        # libbwa.a link rebuilt the library). arch= does not reach its compile
+        # line; USE_MIMALLOC only sets -DUSE_MIMALLOC, which the test does not read.
+        env:
+          MATRIX_ARCH_FLAG: ${{ matrix.arch_flag }}
+          MATRIX_BASELINE_ARCH: ${{ matrix.baseline_arch || 'avx2' }}
+          MATRIX_USE_MIMALLOC: ${{ matrix.use_mimalloc }}
         run: |
-          make x86_soa_pack_test CXX="$CXX"
+          if [ "$MATRIX_ARCH_FLAG" = "" ]; then arch="$MATRIX_BASELINE_ARCH"; else arch="$MATRIX_ARCH_FLAG"; fi
+          make x86_soa_pack_test arch="$arch" CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
           ./x86_soa_pack_test
 
       - name: kvec growth aborts on realloc failure
@@ -718,11 +745,13 @@ jobs:
           MATRIX_USE_MIMALLOC: ${{ matrix.use_mimalloc }}
         run: |
           if [ "$MATRIX_ARCH_FLAG" = "" ]; then
-            make kopen_pipe_status_test arch="$MATRIX_BASELINE_ARCH" \
+            make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)" kopen_pipe_status_test \
+              arch="$MATRIX_BASELINE_ARCH" \
               CXX="$CXX" \
               USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
           else
-            make kopen_pipe_status_test arch="$MATRIX_ARCH_FLAG" \
+            make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)" kopen_pipe_status_test \
+              arch="$MATRIX_ARCH_FLAG" \
               CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
           fi
           ./kopen_pipe_status_test
@@ -748,10 +777,12 @@ jobs:
           MATRIX_USE_MIMALLOC: ${{ matrix.use_mimalloc }}
         run: |
           if [ "$MATRIX_ARCH_FLAG" = "" ]; then
-            make cli_arg_safety_test arch="$MATRIX_BASELINE_ARCH" \
+            make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)" cli_arg_safety_test \
+              arch="$MATRIX_BASELINE_ARCH" \
               CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
           else
-            make cli_arg_safety_test arch="$MATRIX_ARCH_FLAG" CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
+            make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)" cli_arg_safety_test \
+              arch="$MATRIX_ARCH_FLAG" CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
           fi
           ./cli_arg_safety_test
 
@@ -784,10 +815,12 @@ jobs:
           MATRIX_USE_MIMALLOC: ${{ matrix.use_mimalloc }}
         run: |
           if [ "$MATRIX_ARCH_FLAG" = "" ]; then
-            make pwrite_all_status_test arch="$MATRIX_BASELINE_ARCH" \
+            make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)" pwrite_all_status_test \
+              arch="$MATRIX_BASELINE_ARCH" \
               CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
           else
-            make pwrite_all_status_test arch="$MATRIX_ARCH_FLAG" \
+            make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)" pwrite_all_status_test \
+              arch="$MATRIX_ARCH_FLAG" \
               CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
           fi
           ./pwrite_all_status_test
@@ -894,8 +927,15 @@ jobs:
         # vector occurrence path; on x86 rows that code is compiled out, so
         # the harness must also run on the arm64 rows to test it.
         if: matrix.canonical == true || matrix.os == 'ubuntu-24.04-arm' || matrix.os == 'macos-latest'
+        env:
+          MATRIX_ARCH_FLAG: ${{ matrix.arch_flag }}
+          MATRIX_BASELINE_ARCH: ${{ matrix.baseline_arch || 'avx2' }}
+          MATRIX_USE_MIMALLOC: ${{ matrix.use_mimalloc }}
         run: |
-          bash test/run_unit_tests.sh
+          # The row's flags for the script's top-level make, so its libbwa.a
+          # links keep .build-flags (and so libbwa.a) at the row's build.
+          if [ "$MATRIX_ARCH_FLAG" = "" ]; then arch="$MATRIX_BASELINE_ARCH"; else arch="$MATRIX_ARCH_FLAG"; fi
+          MAKE_ARGS="arch=$arch CXX=$CXX USE_MIMALLOC=$MATRIX_USE_MIMALLOC" bash test/run_unit_tests.sh
 
       # The unit binary above is built at the row's floor (AVX2), so the
       # AVX-512BW kswv bodies (among them the signed-domain u8 FScan body that
@@ -1055,7 +1095,8 @@ jobs:
           MATRIX_USE_MIMALLOC: ${{ matrix.use_mimalloc }}
         run: |
           if [ "$MATRIX_ARCH_FLAG" = "" ]; then arch="$MATRIX_BASELINE_ARCH"; else arch="$MATRIX_ARCH_FLAG"; fi
-          make rescue-prune-eq arch="$arch" CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
+          make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)" rescue-prune-eq \
+            arch="$arch" CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
           if RPE_NEGATIVE_CONTROL=1 ./rescue_prune_eq fuzz 2000 1 > rpe_nc.log 2>&1; then
             cat rpe_nc.log; echo "::error::negative control exited 0: the check missed an injected disagreement"; exit 1
           fi
@@ -1127,7 +1168,8 @@ jobs:
           MATRIX_USE_MIMALLOC: ${{ matrix.use_mimalloc }}
         run: |
           if [ "$MATRIX_ARCH_FLAG" = "" ]; then arch="$MATRIX_BASELINE_ARCH"; else arch="$MATRIX_ARCH_FLAG"; fi
-          make rescue-band-harness arch="$arch" CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
+          make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)" rescue-band-harness \
+            arch="$arch" CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
           if BWA3_RESCUE_BAND_COST=100000000 RB_NEGATIVE_CONTROL=1 ./rescue_band_harness eq 3000 1 > rb_nc.log 2>&1; then
             cat rb_nc.log; echo "::error::negative control exited 0: the check missed an injected disagreement"; exit 1
           fi
@@ -1136,6 +1178,13 @@ jobs:
             cat rb_nc16.log; echo "::error::16-bit negative control exited 0: the check missed an injected disagreement"; exit 1
           fi
           grep -q 'MISMATCHES=[1-9]' rb_nc16.log || { cat rb_nc16.log; echo "::error::16-bit negative control failed without reporting a MISMATCH"; exit 1; }
+          # The runs are independent and single-threaded, so they run side by
+          # side, one per core (largest first). Each run's seed is its last
+          # argument and names its log and exit-code files, so seeds must be
+          # unique (checked below). xargs's own status is not used: every run
+          # records its exit code and prints a line as it finishes, and the
+          # report below fails the step for any non-zero or missing one.
+          cat > rb_runs.txt <<'EOF'
           BWA3_RESCUE_BAND_COST=100000000 RB_SCALAR_STRIDE=7 ./rescue_band_harness eq 100000 1
           BWA3_RESCUE_BAND_COST=100000000 RB_MINSC=30 ./rescue_band_harness eq 30000 2
           BWA3_RESCUE_BAND_COST=100000000 BWA3_RESCUE_PRUNE_MAX_HITS=100000 ./rescue_band_harness eq 30000 3
@@ -1165,6 +1214,29 @@ jobs:
           BWA3_RESCUE_BAND_COST=100000000 RB_METH=random RB_KMAX=8 RB_SCORING=1,6,6,1,6,1 ./rescue_band_harness eq 10000 27
           BWA3_RESCUE_BAND_COST=100000000 RB_METH=random RB_METH_REL=expand RB_KMAX=8 RB_SCORING=1,6,6,1,6,1 ./rescue_band_harness eq 10000 28
           RB_16BIT=1 BWA3_RESCUE_PRUNE_MAX_HITS=100000 RB_METH=random RB_METH_REL=expand RB_KMAX=0 RB_SCORING=random ./rescue_band_harness eq 10000 29
+          EOF
+          dups="$(sed 's/.* //' rb_runs.txt | sort | uniq -d)"
+          [ -z "$dups" ] || { echo "::error::duplicate rescue_band_harness seeds: $dups"; exit 1; }
+          rm -f rb_run_*.log rb_run_*.rc
+          # shellcheck disable=SC2016 # the inner script expands in the child sh
+          xargs -P "$(nproc 2>/dev/null || sysctl -n hw.ncpu)" -L 1 sh -c \
+            'for seed; do :; done; env "$@" > "rb_run_$seed.log" 2>&1; rc=$?; echo $rc > "rb_run_$seed.rc"; echo "run $seed finished (exit $rc)"' sh \
+            < rb_runs.txt || true
+          status=0
+          while read -r line; do
+            seed="${line##* }"
+            rc="$(cat "rb_run_$seed.rc" 2>/dev/null || echo missing)"
+            if [ "$rc" = 0 ]; then
+              echo "::group::run $seed (exit 0): $line"
+              cat "rb_run_$seed.log"
+              echo "::endgroup::"
+            else
+              [ ! -f "rb_run_$seed.log" ] || cat "rb_run_$seed.log"
+              echo "::error::rescue_band_harness run $seed failed (exit $rc): $line"
+              status=1
+            fi
+          done < rb_runs.txt
+          exit "$status"
 
       # The NEON banded kernels against each other below the end results: the two-row kernel
       # (rb_dp_wave2, the default) and the one-row fused kernel (rb_dp_core<true>) must agree on
@@ -1178,7 +1250,8 @@ jobs:
           MATRIX_USE_MIMALLOC: ${{ matrix.use_mimalloc }}
         run: |
           if [ "$MATRIX_ARCH_FLAG" = "" ]; then arch="$MATRIX_BASELINE_ARCH"; else arch="$MATRIX_ARCH_FLAG"; fi
-          make rescue-band-kernel-eq arch="$arch" CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
+          make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)" rescue-band-kernel-eq \
+            arch="$arch" CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
           if RB_NEGATIVE_CONTROL=1 ./rescue_band_kernel_eq 2000 1 > rbk_nc.log 2>&1; then
             cat rbk_nc.log
             case "$(uname -m)" in
