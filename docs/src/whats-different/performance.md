@@ -583,6 +583,18 @@ generated jobs.
   kswv pass-0 time -1.9% on AWS Graviton 4 and about -2% to -4% on AMD Zen 4
   (AVX-512BW), 5M-pair WGS slice at `-t 16`.
   ([#606](https://github.com/fg-labs/bwa-mem3/pull/606))
+- **Rescue skip set as four position intervals.** Before rescuing a mate around
+  an anchor, both rescue steps decide per orientation whether a mate region
+  already lies at a proper-pair distance, which walked the mate's whole region
+  list per anchor, twice, with an orientation-dependent lookup per region. For
+  a fixed anchor each orientation's distance window is one interval of region
+  start positions, so the test is now four range compares per region; the set
+  computed before the rescue kernels is reused after them while the mate's
+  list is unchanged; and a list that many anchors rescue into is sorted once
+  and answered with four binary searches per anchor. The skip sets are
+  unchanged (`BWA_MEM3_DEBUG_RESCUE_SKIP_XCHECK` compares every one against
+  the per-region test). `BWA3_RESCUE_SKIP_REUSE=0` turns off the reuse and the
+  sorted list.
 
 | Variable | Effect |
 |---|---|
@@ -592,6 +604,7 @@ generated jobs.
 | `BWA3_RESCUE_PRUNE_REL=<n>` | Under `--meth` at the genomic and neutral scorings, on aarch64 (x86 does not prune `--meth`), how the filter relates bases: `1` (default) the exact relation for TAPS chemistry and converted copies for EM-seq, `0` converted copies only (TAPS is then not pruned), `2` the relation for every such run; values above 2 act as 2. It only chooses between exact paths, so output does not depend on its value by design. ([#546](https://github.com/fg-labs/bwa-mem3/pull/546)) |
 | `BWA3_RESCUE_PRUNE_STATS=1` | Print, once at exit, how the filter decided (`[RESCUE_PRUNE] jobs=… full=… b1=… b2=… rows_in=… rows_kept=… jobs16=… b1_16=… b2_16=… kmer_jobs=… memo_hits=… reused=… filter_s=… kswv_pass0_s=… band_pass0_s=… kswv_pass1_s=… band_pass1_s=… dedup_run=… dedup_skip=… dedup_run_regs=… dedup_skip_regs=… dedup_insert1=… dedup_insert1_fast=… dedup_insert1_tf=… dedup_s=…`): jobs filtered, and of them how many kept the full window, were proven to fail (`b1`) or were narrowed (`b2`), with the window rows before and after, the number of 16-bit rescue jobs and how many of them were proven to fail or narrowed (`b1_16`, `b2_16`, included in `b1` and `b2`), the jobs the SIMD filter decided with K-mers longer than 5 (`kmer_jobs`), the jobs the SIMD filter answered from its repeat memo, the jobs answered from an identical recent job's result instead of being enqueued, and the thread-summed seconds of each rescue stage; how many post-rescue dedups ran, were skipped, took the one-region insert, of those were done in one pass, and of those were entered with the list already known tie-free; and how the banded DP resolved (`[RESCUE_BAND] banded_parents=… …`); the 16-bit decisions (`b1_16`, `b2_16`): [#542](https://github.com/fg-labs/bwa-mem3/pull/542), `kmer_jobs`: [#548](https://github.com/fg-labs/bwa-mem3/pull/548). Measurement only; output is unchanged. |
 | `BWA3_RESCUE_DEDUP_SKIP=0` | Run every post-rescue dedup in full instead of skipping one proven to be a no-op or adding a single new region in one pass. Default on. It only chooses between exact paths, so output is the same either way by design. |
+| `BWA3_RESCUE_SKIP_REUSE=0` | Scan the mate's region list for every rescue anchor, before and after the rescue kernels, instead of reusing the skip set computed before them or answering a long list from a sorted copy. Default on. It only chooses between exact paths, so output is meant to be the same either way. Verified identical (SAM md5 without `@PG`) on and off on a 1M-pair WGS slice (HG002, hg38) on arm64 macOS (NEON), and on a 5M-pair WGS slice (HG00096, hg38) on Graviton4 (NEON) and Zen4 (AVX-512BW tier); `rescue_prune_identity.sh` runs it off in its reference leg. ([#607](https://github.com/fg-labs/bwa-mem3/pull/607)) |
 | `BWA3_RESCUE_REPEAT=0` | Enqueue every rescue job instead of answering one that repeats one of the thread's last eight filtered jobs byte for byte (the same mate against an identical window) from that job's result. Default on. It only chooses between exact paths, so output is the same either way by design. |
 | `BWA3_RESCUE_BAND=0` | Run every narrowed job through the rescue kernel on its whole hull instead of banded (and the hit gate back to 400). Default on where banding runs. |
 | `BWA3_RESCUE_BAND_COST=<pct>` | Band a narrowed job only when its band cells cost less than `pct` % of the hull's (default 100 on aarch64 and 85 on x86; 0, i.e. no first-pass banding, where the rescue kernel runs at the AVX-512BW tier, whose 64-lane sweep of the hull is cheaper than the 32-lane banded DP). It only chooses between exact paths, so output does not depend on its value by design. |
