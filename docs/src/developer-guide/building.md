@@ -164,7 +164,7 @@ make profile-clean
 | Variable | Default | Effect |
 |---|---|---|
 | `USE_MIMALLOC` | `1` | Include mimalloc; set `0` to use the system allocator |
-| `ASAN` | _(unset)_ | Set to any non-empty value to enable AddressSanitizer (forces `USE_MIMALLOC=0`) |
+| `ASAN` | _(unset)_ | Set to any non-empty value to enable AddressSanitizer (forces `USE_MIMALLOC=0`); `test-binaries` builds the doctest binaries with it too |
 | `COVERAGE` | _(unset)_ | Set to enable `--coverage` at `COVERAGE_OPT` for gcov line-level coverage |
 | `COVERAGE_OPT` | `-O0` | Optimization level of a `COVERAGE=1` build. `-O0` maps gcov lines 1:1 to source; CI's coverage job uses `-O1`, which runs the tests faster but reports some inlined lines and small functions under their caller |
 | `LTO` | `auto` | Link-time optimization: `auto`, `thin`, `full` or `off` (see [Link-Time Optimization](#link-time-optimization-lto)) |

@@ -1127,6 +1127,7 @@ test-binaries: $(BWA_LIB) $(HTS_LIB) $(ROWALT_KERNEL_OBJ)
 	    CXX="$(CXX)" \
 	    COVERAGE=$(COVERAGE) \
 	    COVERAGE_OPT='$(COVERAGE_OPT)' \
+	    ASAN=$(ASAN) \
 	    ARCH_FLAGS_FROM_PARENT='$(ARCH_FLAGS)' \
 	    ARM_CPU='$(ARM_CPU)' \
 	    ARM_TUNE='$(ARM_TUNE)' \

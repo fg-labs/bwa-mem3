@@ -2456,6 +2456,44 @@ static int mem_chain_cap_extend_mate(mem_chain_t *a, int n, int max_n,
  * contain the fast pass alone. */
 typedef kvec_t(int) kvi_t;
 
+namespace {
+/* Grow-only thread_local kvi_t (the x86-64 survivor list below, and the debug
+ * cross-check's reference list on every target). The RAII holder mirrors u8vec_scratch_t:
+ * kv_destroy runs at thread exit, so a sanitizer build sees no leak (a bare
+ * thread_local kvi_t would never be freed). kv_resize reallocs unconditionally,
+ * so callers guard it with a capacity check. */
+struct kvi_scratch_t {
+    kvi_t v;
+    kvi_scratch_t() { kv_init(v); }
+    ~kvi_scratch_t() { kv_destroy(v); }
+    kvi_scratch_t(const kvi_scratch_t &) = delete;
+    kvi_scratch_t &operator=(const kvi_scratch_t &) = delete;
+};
+
+/* x86-64 only: chn_flt_pairwise_fast reads its survivors through contiguous
+ * records, and mem_chain_flt keeps its survivor list in grow-only scratch and
+ * fuses the write-back into the compaction. Measured on Zen4 the chain filter
+ * stage is 4-5% faster; on Graviton4 the same change is 0.2-1.2% slower, so
+ * every other target compiles the original form. Both forms are byte-identical. */
+#if defined(__x86_64__) || defined(_M_X64)
+#define CHN_FLT_SURV_RECORDS 1
+#else
+#define CHN_FLT_SURV_RECORDS 0
+#endif
+
+#if CHN_FLT_SURV_RECORDS
+/* One survivor's inputs to chn_flt_pairwise_fast's tests, stored at its surv
+ * position when the chain is kept (see the pass's comment). */
+struct chn_surv_t {
+    int cb, ce;   /* chn_beg / chn_end */
+    int w;        /* the chain weight, as the tests' int operand */
+    float wdr;    /* w * drop_ratio, the domination test's float operand */
+    int is_alt;
+};
+static_assert(sizeof(chn_surv_t) == 20, "chn_surv_t is the 20-byte record the pass comment describes");
+#endif
+}  // namespace
+
 #ifdef BWA_MEM3_DEBUG_CHN_FLT_XCHECK
 static void chn_flt_pairwise_ref(int n_chn, const mem_chain_t *a,
     const int *cb, const int *ce,
@@ -2515,7 +2553,16 @@ static void chn_flt_pairwise_ref(int n_chn, const mem_chain_t *a,
  *   (A) first[j]=i: only for j with first<0 that i significantly overlaps. Tracked in
  *       an intrusive doubly-linked list of surv positions whose chain still has
  *       first<0 (phase 2); the list only shrinks (a chain leaves once shadowed) and
- *       grows by one per newly kept chain. */
+ *       grows by one per newly kept chain.
+ *
+ * On x86-64 (CHN_FLT_SURV_RECORDS), both phases read survivors through a
+ * contiguous record per surv position (chn_surv_t), appended when the chain is
+ * kept: one 20-byte record per test
+ * instead of the surv index, cb[j], ce[j] and two fields of a 48-byte chain.
+ * Byte-identical: a record holds copies of values nothing in the pass modifies,
+ * position p's record is surv->a[p]'s, and `wdr` is the same float product
+ * `w * drop_ratio` (w promoted to int, then converted) the test computed on
+ * every comparison, so every test sees the same operands in the same order. */
 static void chn_flt_pairwise_fast(int n_chn, const mem_chain_t *a,
     const int *cb, const int *ce,
     float mask_level, float drop_ratio, int max_chain_gap, int min_seed_gap,
@@ -2527,12 +2574,32 @@ static void chn_flt_pairwise_fast(int n_chn, const mem_chain_t *a,
      * visits every still-unshadowed chain exactly once.
      * Grow-only thread_local scratch; only touched entries are initialized. */
     static thread_local std::vector<int> nxt_v, prv_v;
+#if CHN_FLT_SURV_RECORDS
+    static thread_local std::vector<chn_surv_t> rec_v;   // survivor records, by surv position
+    if ((int)nxt_v.size() < n_chn) { nxt_v.resize(n_chn); prv_v.resize(n_chn); rec_v.resize(n_chn); }
+    int *nxt = nxt_v.data(), *prv = prv_v.data();
+    chn_surv_t *rec = rec_v.data();
+    int f0_head, f0_tail;
+    /* Record of sorted chain t, stored at the surv position it is pushed to. */
+    auto rec_set = [&](int p, int t) {
+        const int w = a[t].w;
+        rec[p].cb = cb[t]; rec[p].ce = ce[t];
+        rec[p].w = w; rec[p].wdr = w * drop_ratio;
+        rec[p].is_alt = a[t].is_alt;
+    };
+#else
     if ((int)nxt_v.size() < n_chn) { nxt_v.resize(n_chn); prv_v.resize(n_chn); }
     int *nxt = nxt_v.data(), *prv = prv_v.data();
     int f0_head, f0_tail;
+#endif
 
     kept[0] = 3;
     kv_push(int, *surv, 0);
+#if CHN_FLT_SURV_RECORDS
+    /* Records are read only by the i >= 1 loop. With one chain (the resurrected
+     * empty array) cb/ce are NULL and the loop never runs, so no record is made. */
+    if (n_chn > 1) rec_set(0, 0);
+#endif
     nxt[0] = -1; prv[0] = -1; f0_head = 0; f0_tail = 0;   // f0 = { position 0 }
 
     for (int i = 1; i < n_chn; ++i)
@@ -2542,6 +2609,22 @@ static void chn_flt_pairwise_fast(int n_chn, const mem_chain_t *a,
         const int wi = a[i].w;
         const int ai_alt = a[i].is_alt;
 
+#if CHN_FLT_SURV_RECORDS
+        /* significant overlap of i with the survivor at record r (identical test
+         * to the ref's on chain surv->a[p]). */
+        auto sig = [&](const chn_surv_t &r) -> bool {
+            int b_max = r.cb > cbi? r.cb : cbi;
+            int e_min = r.ce < cei? r.ce : cei;
+            if (!(e_min > b_max && (!r.is_alt || ai_alt))) return false;
+            int lj = r.ce - r.cb;
+            int min_l = li < lj? li : lj;
+            return (e_min - b_max >= min_l * mask_level && min_l < max_chain_gap);
+        };
+        /* r is heavy enough to dominate i (pure weight test; overlap-independent). */
+        auto wdom = [&](const chn_surv_t &r) -> bool {
+            return (wi < r.wdr && r.w - wi >= min_seed_gap);
+        };
+#else
         /* significant overlap of i with chain j (identical test to the ref). */
         auto sig = [&](int j) -> bool {
             int b_max = cb[j] > cbi? cb[j] : cbi;
@@ -2555,6 +2638,7 @@ static void chn_flt_pairwise_fast(int n_chn, const mem_chain_t *a,
         auto wdom = [&](int j) -> bool {
             return (wi < a[j].w * drop_ratio && a[j].w - wi >= min_seed_gap);
         };
+#endif
         auto f0_remove = [&](int p) {
             int pv = prv[p], nx = nxt[p];
             if (pv >= 0) nxt[pv] = nx; else f0_head = nx;
@@ -2572,6 +2656,16 @@ static void chn_flt_pairwise_fast(int n_chn, const mem_chain_t *a,
         /* Phase 1: linear scan to i's first significant overlap (latches large_ovlp).
          * Nothing is skippable before the latch, so this mirrors the ref exactly. */
         for (k = 0; k < nsurv; ++k) {
+#if CHN_FLT_SURV_RECORDS
+            if (sig(rec[k])) {
+                int j = surv->a[k];
+                large_ovlp = 1;
+                if (first[j] < 0) { first[j] = i; f0_remove(k); }
+                if (wdom(rec[k])) dominated = 1;   // first sig overlap is a dominator -> break here
+                k0 = k;
+                break;
+            }
+#else
             int j = surv->a[k];
             if (sig(j)) {
                 large_ovlp = 1;
@@ -2580,11 +2674,15 @@ static void chn_flt_pairwise_fast(int n_chn, const mem_chain_t *a,
                 k0 = k;
                 break;
             }
+#endif
         }
 
         if (large_ovlp == 0) {                // no significant overlap: keep, kept=3
             int p = surv->n;
             kv_push(int, *surv, i);
+#if CHN_FLT_SURV_RECORDS
+            rec_set(p, i);
+#endif
             kept[i] = 3; first[i] = -1;
             f0_append(p);
             continue;
@@ -2598,15 +2696,22 @@ static void chn_flt_pairwise_fast(int n_chn, const mem_chain_t *a,
          * overlap) or were handled in phase 1. */
         for (int p = f0_head; p >= 0; ) {
             int nx = nxt[p];
+#if CHN_FLT_SURV_RECORDS
+            if (p > k0 && sig(rec[p])) { first[surv->a[p]] = i; f0_remove(p); }
+#else
             if (p > k0) {
                 int j = surv->a[p];
                 if (sig(j)) { first[j] = i; f0_remove(p); }
             }
+#endif
             p = nx;
         }
 
         int p = surv->n;                      // survives with a large overlap: kept=2
         kv_push(int, *surv, i);
+#if CHN_FLT_SURV_RECORDS
+        rec_set(p, i);
+#endif
         kept[i] = 2; first[i] = -1;
         f0_append(p);
     }
@@ -2711,16 +2816,28 @@ int mem_chain_flt(const mem_opt_t *opt, int n_chn_, mem_chain_t *a_, int tid)
      * in the weight filter above. */
     mem_chain_t *a = a_;
     int n_chn = n_chn_ ? n_chn_ : 1;
+    /* Survivor list: grow-only thread_local, reserved up front (CHN-19: the kept
+     * count is <= n_chn) so the pass's kv_push never reallocs and no read pays a
+     * malloc/free for it. */
+#if CHN_FLT_SURV_RECORDS
+    static thread_local kvi_scratch_t surv_s;
+    kvi_t &chains = surv_s.v;
+    chains.n = 0;
+    if (chains.m < (size_t)n_chn) {
+        kv_resize(int, chains, n_chn);
+        xassert(chains.a != NULL, "out of memory: chain filter survivor list");
+    }
+#else
     kvi_t chains = {0,0,0};
     kv_resize(int, chains, n_chn);   // CHN-19: reserve up front (kept count <= n_chn)
+#endif
     ks_introsort(mem_flt, n_chn, a);
 
     /* SoA hoist (#265, byte-identical). chn_beg()/chn_end() each chase a[].seeds --
      * a dependent load of the seeds pointer, then a load from the 65k-entry seedBuf
-     * arena -- and the pairwise loop below evaluates them for EVERY (i,j) pair, so
-     * the j-side is re-chased on every inner iteration. Cache them once into two
-     * contiguous int arrays (typical ~25 chains/read, so a couple hundred bytes,
-     * L1-resident). The seed arrays are not modified anywhere in this loop, so
+     * arena. Cache them once into two contiguous int arrays (typical ~25
+     * chains/read, so a couple hundred bytes, L1-resident), which the pairwise
+     * pass reads for each chain's own side and copies into its survivor records. The seed arrays are not modified anywhere in this loop, so
      * these are exactly the values the macros would have recomputed. thread_local
      * + grow-only: no per-read allocation. */
     static thread_local std::vector<int> cb_v, ce_v;
@@ -2744,8 +2861,9 @@ int mem_chain_flt(const mem_opt_t *opt, int n_chn_, mem_chain_t *a_, int tid)
     const int   max_chain_gap = opt->max_chain_gap;
     const int   min_seed_gap  = opt->min_seed_len << 1;
 
-    /* Run the pairwise pass into caller-owned first[]/kept[] scratch, then write
-     * the results back into a[]. Keeping the pass out of a[] lets a debug build
+    /* Run the pairwise pass into caller-owned first[]/kept[] scratch; the results
+     * reach a[] only for the chains that survive, in the compaction at the end.
+     * Keeping the pass out of a[] lets a debug build
      * cross-check the fast skip against the naive reference on identical inputs.
      * Grow-only thread_local scratch: no per-read allocation. */
     static thread_local std::vector<int> first_v, kept_v;
@@ -2774,17 +2892,8 @@ int mem_chain_flt(const mem_opt_t *opt, int n_chn_, mem_chain_t *a_, int tid)
         if ((int)rf_v.size() < n_chn) { rf_v.resize(n_chn); rk_v.resize(n_chn); }
         int *rfirst = rf_v.data(), *rkept = rk_v.data();
         for (int t = 0; t < n_chn; ++t) { rfirst[t] = -1; rkept[t] = 0; }
-        /* Reference survivor list. Grow-only thread_local like rf_v/rk_v above, so
-         * the cross-check adds no per-read malloc/free on top of the one the pass
-         * itself already does. The RAII holder mirrors u8vec_scratch_t: kv_destroy
-         * runs at thread exit, so a sanitizer debug build sees no leak (a bare
-         * thread_local kvi_t would never be freed). kv_resize reallocs
-         * unconditionally, hence the capacity guard. */
-        struct kvi_scratch_t {
-            kvi_t v;
-            kvi_scratch_t() { kv_init(v); }
-            ~kvi_scratch_t() { kv_destroy(v); }
-        };
+        /* Reference survivor list: grow-only thread_local like rf_v/rk_v above
+         * and the pass's own list, so the cross-check adds no per-read malloc. */
         static thread_local kvi_scratch_t rs;
         rs.v.n = 0;
         if (rs.v.m < (size_t)n_chn) kv_resize(int, rs.v, n_chn);
@@ -2807,6 +2916,22 @@ int mem_chain_flt(const mem_opt_t *opt, int n_chn_, mem_chain_t *a_, int tid)
     }
 #endif /* BWA_MEM3_DEBUG_CHN_FLT_XCHECK */
 
+#if CHN_FLT_SURV_RECORDS
+    /* Shadow promotion and the extend-cap count run on the pass's first[]/kept[]
+     * scratch, and the write-back into a[] is fused into the compaction below:
+     * they read and write only first/kept, so a[] ends with the same values for
+     * every chain that survives, and a dropped chain is freed and never read
+     * again (callers use a[0..k) only). */
+    for (i = 0; i < (int)chains.n; ++i)
+    {
+        const int f = first[chains.a[i]];
+        if (f >= 0) kept[f] = 1;
+    }
+    for (i = k = 0; i < n_chn; ++i) { // don't extend more than opt->max_chain_extend .kept=1/2 chains
+        if (kept[i] == 0 || kept[i] == 3) continue;
+        if (++k >= opt->max_chain_extend) break;
+    }
+#else
     for (int t = 0; t < n_chn; ++t) { a[t].first = first[t]; a[t].kept = kept[t]; }
 
     for (i = 0; i < chains.n; ++i)
@@ -2819,6 +2944,7 @@ int mem_chain_flt(const mem_opt_t *opt, int n_chn_, mem_chain_t *a_, int tid)
         if (a[i].kept == 0 || a[i].kept == 3) continue;
         if (++k >= opt->max_chain_extend) break;
     }
+#endif
     /* CL-5: the former standalone demotion loop (demote kept<3 chains from the
      * extend-cap cutoff onward to 0) is fused into the free+compact pass below,
      * one scan instead of two. `cap_cutoff` is the index the cap-count loop above
@@ -2826,6 +2952,24 @@ int mem_chain_flt(const mem_opt_t *opt, int n_chn_, mem_chain_t *a_, int tid)
      * kept<3 are demoted inline as we compact. Byte-identical to the two-loop form. */
     const int cap_cutoff = i;
 
+#if CHN_FLT_SURV_RECORDS
+    for (i = k = 0; i < n_chn; ++i)  // write back + demote-beyond-cap + free discarded + compact
+    {
+        mem_chain_t *c = &a[i];
+        int kp = kept[i];
+        if (i >= cap_cutoff && kp < 3) kp = 0;   // CL-5: former step-10 demotion
+        if (kp == 0)
+        {
+            if (c->m > SEEDS_PER_CHAIN)  // CHN-16: dead tprof[PE11] counter removed
+                free(c->seeds);
+        }
+        else
+        {
+            c->first = first[i]; c->kept = kp;
+            a[k++] = *c;
+        }
+    }
+#else
     for (i = k = 0; i < n_chn; ++i)  // demote-beyond-cap + free discarded + compact
     {
         mem_chain_t *c = &a[i];
@@ -2837,6 +2981,7 @@ int mem_chain_flt(const mem_opt_t *opt, int n_chn_, mem_chain_t *a_, int tid)
         }
         else a[k++] = a[i];
     }
+#endif
 
     return k;
 }
