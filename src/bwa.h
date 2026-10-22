@@ -148,6 +148,15 @@ extern "C" {
 							 int64_t rb, int64_t re, int *score,
 							 int *n_cigar, int *NM, int nm_from_mat);
 
+	/* As bwa_gen_cigar3, plus `want_md`: 0 builds no MD string, so the returned
+	 * buffer holds only the n_cigar ops (no MD, no NUL after them). NM is the same
+	 * value either way. */
+	uint32_t *bwa_gen_cigar4(const int8_t mat[25], int o_del, int e_del,
+							 int o_ins, int e_ins, int w_, int64_t l_pac,
+							 const uint8_t *pac, int l_query, uint8_t *query,
+							 int64_t rb, int64_t re, int *score,
+							 int *n_cigar, int *NM, int nm_from_mat, int want_md);
+
 	/* emit_unpacked_ref=0 (the default) skips writing `<prefix>.0123`. `mem`
 	 * pac-fetches the original reference from `<prefix>.pac` on demand
 	 * (bns_get_seq_v2), so the unpacked `.0123` (~8x the `.pac`) is never read

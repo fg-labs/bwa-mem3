@@ -386,10 +386,19 @@ int bwa_global_cert_band(const int8_t mat[25], int o_del, int e_del, int o_ins, 
     return kc > INT32_MAX ? INT32_MAX : (int) kc;
 }
 
+/* Whether an aligned column (reference base r, query base q) is an edit for NM:
+ * a literal difference, and with `nm_from_mat` only one the matrix penalises (see
+ * bwa_gen_cigar4). The single definition of the rule for both the MD-building
+ * and the MD-free walks, so an XA hit's NM cannot drift from its primary's. */
+static inline int bwa_nm_edit(const int8_t mat[25], uint8_t r, uint8_t q, int nm_from_mat)
+{
+    return r != q && (!nm_from_mat || mat[r * 5 + q] < 0);
+}
+
 /* Generate CIGAR when the alignment end points are known.
  *
- * MD always lists every column whose bases differ literally (`query != rseq`),
- * so CIGAR + SEQ + MD rebuilds the real reference. `nm_from_mat` selects which
+ * MD (built when `want_md`) lists every column whose bases differ literally
+ * (`query != rseq`), so CIGAR + SEQ + MD rebuilds the real reference. `nm_from_mat` selects which
  * of those columns NM counts:
  *   0 (default, non-meth): every one -- the historical bwa behaviour, byte-for-byte.
  *   1 (--meth): only those the SCORING MATRIX penalises (`mat[ref*5 + query] < 0`).
@@ -399,11 +408,16 @@ int bwa_global_cert_band(const int8_t mat[25], int o_del, int e_del, int o_ins, 
  *     is not an edit for NM, exactly as it is not for the DP, but MD still
  *     lists it. See the policy note in mem_reg2aln().
  *
- * The matrix is safe to reuse here because the NM/MD pass and the DP share BOTH
+ * The matrix is safe to reuse here because the NM (and MD) pass and the DP share BOTH
  * buffers and frame: on the reverse strand (rb >= l_pac) `query`/`rseq` are
  * reversed in place above and the caller has already flipped the OT/OB
- * hypothesis to match, so `mat` indexes the same way in both passes. */
-uint32_t *bwa_gen_cigar3(const int8_t mat[25], int o_del, int e_del, int o_ins, int e_ins, int w_, int64_t l_pac, const uint8_t *pac, int l_query, uint8_t *query, int64_t rb, int64_t re, int *score, int *n_cigar, int *NM, int nm_from_mat)
+ * hypothesis to match, so `mat` indexes the same way in both passes.
+ *
+ * `want_md` 0 skips the MD string: NM is counted over the same CIGAR ops with the
+ * same rule (bwa_nm_edit), but nothing is appended to the CIGAR buffer, which then holds just
+ * the n_cigar ops (no trailing NUL). For callers that never read MD (the XA hits
+ * in mem_gen_alt). */
+uint32_t *bwa_gen_cigar4(const int8_t mat[25], int o_del, int e_del, int o_ins, int e_ins, int w_, int64_t l_pac, const uint8_t *pac, int l_query, uint8_t *query, int64_t rb, int64_t re, int *score, int *n_cigar, int *NM, int nm_from_mat, int want_md)
 {
     uint32_t *cigar = 0;
     uint8_t tmp, *rseq;
@@ -471,6 +485,16 @@ uint32_t *bwa_gen_cigar3(const int8_t mat[25], int o_del, int e_del, int o_ins, 
                 cigar[0] = l_query<<4 | 0;
                 *n_cigar = 1;
             }
+            if (!want_md && NM && n_cigar) {
+                // the NM walk below over the one M op, fused into the score loop
+                int n_mm = 0;
+                for (i = 0, *score = 0; i < l_query; ++i) {
+                    *score += mat[rseq[i]*5 + query[i]];
+                    n_mm += bwa_nm_edit(mat, rseq[i], query[i], nm_from_mat);
+                }
+                *NM = n_mm;
+                goto reverse_back;
+            }
             for (i = 0, *score = 0; i < l_query; ++i)
                 *score += mat[rseq[i]*5 + query[i]];
         } else {
@@ -483,7 +507,21 @@ uint32_t *bwa_gen_cigar3(const int8_t mat[25], int o_del, int e_del, int o_ins, 
             *score = ksw_global2(l_query, query, rlen, rseq, 5, mat, o_del, e_del, o_ins, e_ins, w, n_cigar, &cigar);
         }
     } // ungapped / NW block
-    if (NM && n_cigar) {// compute NM and MD
+    if (NM && n_cigar && !want_md) { // compute NM only: the MD walk below without the appends
+        int k, x, y, n_mm = 0, n_gap = 0;
+        for (k = 0, x = y = 0; k < *n_cigar; ++k) {
+            int op = cigar[k]&0xf, len = cigar[k]>>4;
+            if (op == 0) { // match
+                for (i = 0; i < len; ++i)
+                    n_mm += bwa_nm_edit(mat, rseq[y + i], query[x + i], nm_from_mat);
+                x += len; y += len;
+            } else if (op == 2) { // deletion
+                if (k > 0 && k < *n_cigar - 1) n_gap += len; // not if D is the first or the last CIGAR
+                y += len;
+            } else if (op == 1) x += len, n_gap += len; // insertion
+        }
+        *NM = n_mm + n_gap;
+    } else if (NM && n_cigar) {// compute NM and MD
         int k, x, y, u, n_mm = 0, n_gap = 0;
         str.l = str.m = *n_cigar * 4; str.s = (char*)cigar; // append MD to CIGAR
         int2base = rb < l_pac? "ACGTN" : "TGCAN";
@@ -498,7 +536,7 @@ uint32_t *bwa_gen_cigar3(const int8_t mat[25], int o_del, int e_del, int o_ins, 
                         kputc(int2base[rseq[y+i]], &str);
                         u = 0;
                         /* NM increment; see the nm_from_mat contract above */
-                        n_mm += nm_from_mat ? (mat[rseq[y + i] * 5 + query[x + i]] < 0) : 1;
+                        n_mm += bwa_nm_edit(mat, rseq[y + i], query[x + i], nm_from_mat);
                     } else ++u;
                 }
                 x += len; y += len;
@@ -516,6 +554,7 @@ uint32_t *bwa_gen_cigar3(const int8_t mat[25], int o_del, int e_del, int o_ins, 
         *NM = n_mm + n_gap;
         cigar = (uint32_t*)str.s;
     }
+reverse_back:
     if (rb >= l_pac) // reverse back query
         for (i = 0; i < l_query>>1; ++i)
             tmp = query[i], query[i] = query[l_query - 1 - i], query[l_query - 1 - i] = tmp;
@@ -523,6 +562,11 @@ uint32_t *bwa_gen_cigar3(const int8_t mat[25], int o_del, int e_del, int o_ins, 
 ret_gen_cigar:
     /* rseq aliases thread-local kvec scratch in this function; do not free. */
     return cigar;
+}
+
+uint32_t *bwa_gen_cigar3(const int8_t mat[25], int o_del, int e_del, int o_ins, int e_ins, int w_, int64_t l_pac, const uint8_t *pac, int l_query, uint8_t *query, int64_t rb, int64_t re, int *score, int *n_cigar, int *NM, int nm_from_mat)
+{
+    return bwa_gen_cigar4(mat, o_del, e_del, o_ins, e_ins, w_, l_pac, pac, l_query, query, rb, re, score, n_cigar, NM, nm_from_mat, 1);
 }
 
 uint32_t *bwa_gen_cigar2(const int8_t mat[25], int o_del, int e_del, int o_ins, int e_ins, int w_, int64_t l_pac, const uint8_t *pac, int l_query, uint8_t *query, int64_t rb, int64_t re, int *score, int *n_cigar, int *NM)

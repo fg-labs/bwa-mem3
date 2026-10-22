@@ -1022,10 +1022,15 @@ void mem_pair_and_emit_cohort(mem_opt_t *opt, int64_t n_processed,
  * ORIGINAL reference with the per-hypothesis asymmetric matrix
  * (mem_opt_meth_mat(opt, ar->meth_hypothesis)) so output is native-alphabet.
  * NULL (the default) preserves the legacy symmetric `seq`-vs-ref regen exactly
- * for the non-meth path. */
+ * for the non-meth path.
+ *
+ * `want_md` 0 builds no MD string: the returned cigar holds only the n_cigar
+ * ops, so the result must not be passed to anything that reads MD after them
+ * (mem_aln2sam). NM, the CIGAR and everything else are unchanged. Used for the
+ * XA hits in mem_gen_alt, which read only the CIGAR and NM. */
 mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
                       int l_seq, const char *seq, const mem_alnreg_t *ar,
-                      const char *meth_orig_query = NULL);
+                      const char *meth_orig_query = NULL, int want_md = 1);
 
 
 /**
