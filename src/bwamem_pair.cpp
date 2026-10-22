@@ -2069,13 +2069,15 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
 
         if (rb < 0) rb = 0;
         if (re > l_pac<<1) re = l_pac<<1;
-        // bns_fetch_seq_v2 is zero-copy: it returns a pointer into ref_string
+        // bns_fetch_seq_v2_rid (bns_fetch_seq_v2 with a contig hint) is
+        // zero-copy: it returns a pointer into ref_string
         // (the unpacked .0123 reference). The legacy bns_fetch_seq malloc'd a
         // fresh buffer, which the trailing free(ref) below released; v2 has
         // no allocation, so we drop that free. The seqPairArrayAux scratch
         // is unused by v2 but kept for signature parity with the existing v2
-        // caller in bwamem.cpp::mem_chain2aln_across_reads_V2.
-        if (rb < re) ref = bns_fetch_seq_v2(bns, pac, &rb, (rb+re)>>1, &re, &rid,
+        // caller in bwamem.cpp::mem_chain2aln_across_reads_V2. a->rid is the
+        // only contig the guard below accepts, so it is the lookup hint.
+        if (rb < re) ref = bns_fetch_seq_v2_rid(bns, pac, &rb, (rb+re)>>1, &re, a->rid, &rid,
                                             mmc->ref_string,
                                             (uint8_t*) mmc->seqPairArrayAux[tid]);
 
@@ -2490,9 +2492,9 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
         // read solely by the scalar ksw_align2 fallback (index == -1), which
         // fetches them itself below. The batched path reads its result from
         // *myaln, so unpacking the window for every job (as _pre already did)
-        // was pure memory traffic. bns_fetch_bounds is bns_fetch_seq_v2's own
-        // clamp, so rb/re/rid are unchanged.
-        if (rb < re) bns_fetch_bounds(bns, &rb, (rb+re)>>1, &re, &rid);
+        // was pure memory traffic. bns_fetch_bounds_rid is bns_fetch_seq_v2_rid's
+        // own clamp, so rb/re/rid are unchanged. a->rid is the lookup hint, as in _pre.
+        if (rb < re) bns_fetch_bounds_rid(bns, &rb, (rb+re)>>1, &re, a->rid, &rid);
 
         if (a->rid == rid && re - rb >= opt->min_seed_len) { // no funny things happening
             kswr_t aln;
@@ -2535,7 +2537,7 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                 // "gcnt: %d, look into pre.\n", gcnt + r);
                 // Fetch the window's bases only on this scalar path. [rb, re) is
                 // already clamped to one contig on one strand (rb is not narrowed
-                // for index == -1), so this is the same window bns_fetch_seq_v2
+                // for index == -1), so this is the same window bns_fetch_seq_v2_rid
                 // returned before.
                 {
                     int64_t ref_len_got = 0;

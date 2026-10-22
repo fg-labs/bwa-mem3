@@ -7996,10 +7996,11 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
         /* retrieve the reference sequence */
         {
             int rid = 0;
-            // free rseq
-            rseq_out = bns_fetch_seq_v2(bns, pac, &rmax[0],
+            // free rseq. cc->rid is the window's contig (asserted below), so
+            // pass it as the hint and skip bns_pos2rid's bucket-table load.
+            rseq_out = bns_fetch_seq_v2_rid(bns, pac, &rmax[0],
                                     cc->seeds[0].rbeg,
-                                    &rmax[1], &rid, ref_string,
+                                    &rmax[1], cc->rid, &rid, ref_string,
                                     (uint8_t*) seqPairArrayAux);
             assert(cc->rid == rid);
         }
@@ -9004,8 +9005,8 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
                     rmax[0] = ks_pending[pi].rmax0;
                     rmax[1] = ks_pending[pi].rmax1;
                     int grid = 0;
-                    grseq = bns_fetch_seq_v2(bns, pac, &rmax[0], gc->seeds[0].rbeg,
-                                             &rmax[1], &grid, ref_string,
+                    grseq = bns_fetch_seq_v2_rid(bns, pac, &rmax[0], gc->seeds[0].rbeg,
+                                             &rmax[1], gc->rid, &grid, ref_string,
                                              (uint8_t *) seqPairArrayAux);
                     xassert(gc->rid == grid, "two-wave: chain rid mismatch on window re-fetch");
                     gchain_band = ks_pending[pi].chain_band;
