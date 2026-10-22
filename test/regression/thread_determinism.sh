@@ -78,3 +78,80 @@ stats=$(BWAMEM3_DEDUP_READS_STATS=1 "$BWA_MEM3" mem -K "$K" -t 4 --dedup-reads o
 dup=$(awk -F'dup=' '{split($2, a, " "); print a[1]}' <<< "$stats")
 [[ "${dup:-0}" -gt 0 ]] || fail "fixed -K fixture exercised no duplicate pairs"
 echo "PASS: fixed -K $K, $nb batches: -t 1 == -t 3 == -t 4 unsorted, --dedup-reads on == off ($dup duplicate pairs, $(grep -cv '^@' fk.off.t1.sam || true) records)"
+
+# (3) Output streaming. The process step writes each finished work item's SAM
+# records while the worker_sam pass is still running, and the write step writes
+# the rest (stream_emit_prefix in src/fastmap.cpp). On must equal off
+# (BWA_MEM3_STREAM_OUTPUT=0) byte for byte, unsorted, over the same several
+# batches: paired and single-end, at -t 2, 3 and 4, to a file and through a
+# consumer slower than the aligner (about 10k lines/s), so the output stays
+# backed up and a batch's early writes keep having to wait for the previous
+# batch's write step -- dropping that wait interleaves two batches' records,
+# which this catches. Also with every cohort sliced (BWA_MEM3_COHORT_SLICE_ALL),
+# which emits through mem_pair_and_emit_cohort instead of mem_process_seqs.
+# BWA_MEM3_STREAM_STATS=1 reports how many reads each batch wrote early: to a file, at least two
+# batches must have (one would pass even if only the first batch ever got its
+# turn), or the comparison proves nothing; at -t 1, which keeps its single
+# pipeline thread, none may.
+slow_reader() {
+    perl -e 'while (<STDIN>) { print; select(undef, undef, undef, 0.005) unless $. % 50 }'
+}
+so() { # <tag> <sink: file|stall> <env...> -- <mem args...>
+    local tag=$1 sink=$2
+    shift 2
+    local envs=()
+    while [[ $1 != -- ]]; do
+        envs+=("$1")
+        shift
+    done
+    shift
+    if [[ $sink == stall ]]; then
+        env BWA_MEM3_STREAM_STATS=1 "${envs[@]}" "$BWA_MEM3" mem -K "$K" "$@" 2> "so.$tag.err" \
+            | slow_reader | grep -v '^@PG' > "so.$tag.sam" || fail "mem ($tag)"
+    else
+        env BWA_MEM3_STREAM_STATS=1 "${envs[@]}" "$BWA_MEM3" mem -K "$K" -o "so.$tag.out" "$@" 2> "so.$tag.err" \
+            || fail "mem ($tag)"
+        grep -v '^@PG' "so.$tag.out" > "so.$tag.sam" || fail "empty output ($tag)"
+    fi
+    [[ -s "so.$tag.sam" ]] || fail "empty output ($tag)"
+}
+early() { awk '/stream_output:/ { s += $3 } END { print s + 0 }' "so.$1.err"; }
+early_batches() { awk '/stream_output:/ && $3 > 0 { n++ } END { print n + 0 }' "so.$1.err"; }
+for end in pe se; do
+    if [[ $end == pe ]]; then in=(fk.r1.fq fk.r2.fq); else in=(fk.r1.fq); fi
+    so "$end.off" file BWA_MEM3_STREAM_OUTPUT=0 -- -t 4 "$CHR22_FA" "${in[@]}"
+    [[ $(grep -c 'stream_output:' "so.$end.off.err" || true) -eq 0 ]] \
+        || fail "streaming $end: BWA_MEM3_STREAM_OUTPUT=0 still streamed"
+    so "$end.t1" file BWA_MEM3_STREAM_OUTPUT=1 -- -t 1 "$CHR22_FA" "${in[@]}"
+    cmp -s "so.$end.off.sam" "so.$end.t1.sam" || fail "streaming $end: -t 1 differs from off"
+    [[ $(early "$end.t1") -eq 0 ]] || fail "streaming $end: -t 1 wrote early; it has one pipeline thread"
+    for t in 2 3 4; do
+        for sink in file stall; do
+            tag="$end.t$t.$sink"
+            so "$tag" "$sink" BWA_MEM3_STREAM_OUTPUT=1 -- -t "$t" "$CHR22_FA" "${in[@]}"
+            if ! cmp -s "so.$end.off.sam" "so.$tag.sam"; then
+                diff "so.$end.off.sam" "so.$tag.sam" | head -20 || true
+                fail "streaming $tag differs from off"
+            fi
+            [[ $(early "$tag") -gt 0 ]] || fail "streaming $tag wrote nothing early"
+            if [[ $sink == file ]]; then
+                [[ $(early_batches "$tag") -ge 2 ]] \
+                    || fail "streaming $tag: only $(early_batches "$tag") batch(es) wrote early"
+            fi
+        done
+    done
+done
+for sink in file stall; do
+    tag="pe.slice.$sink"
+    so "$tag" "$sink" BWA_MEM3_COHORT_SLICE_ALL=1 -- -t 3 "$CHR22_FA" fk.r1.fq fk.r2.fq
+    grep -q 'slicing every' "so.$tag.err" || fail "streaming $tag: the cohorts were not sliced"
+    cmp -s so.pe.off.sam "so.$tag.sam" || fail "streaming $tag (every cohort sliced) differs from off"
+    [[ $(early "$tag") -gt 0 ]] || fail "streaming $tag wrote nothing early"
+done
+# BAM output is written by the write step alone: its records are bam1_t, not
+# the sam strings the process step would write.
+BWA_MEM3_STREAM_STATS=1 "$BWA_MEM3" mem -K "$K" -t 4 --bam -o so.bam.out "$CHR22_FA" fk.r1.fq fk.r2.fq 2> so.bam.err \
+    || fail "mem (--bam)"
+[[ -s so.bam.out ]] || fail "empty output (--bam)"
+[[ $(grep -c 'stream_output:' so.bam.err || true) -eq 0 ]] || fail "streaming: --bam output was streamed"
+echo "PASS: output streaming on == off (paired and single-end, -t 1..4, file and slow pipe, sliced cohorts, not --bam; $(early pe.t4.stall) paired reads written early at -t 4)"

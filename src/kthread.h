@@ -110,6 +110,9 @@ typedef struct kt_for_t {
 	ktf_worker_t *w;
 	void (*func)(void*, int, int, int);
 	void *data;
+	/* kt_for_prefix only (NULL otherwise): done[k] is set, with release
+	 * ordering, once item k's func has returned. */
+	uint8_t *done;
 } kt_for_t;
 
 
@@ -119,6 +122,18 @@ void kt_for(void (*func)(void*,int,int,int), void *data, int n);
 /* kt_for with the pool size given explicitly, so data can be any caller
  * context. Same pool and item layout as kt_for. */
 void kt_for_nt(void (*func)(void*,int,int,int), void *data, int n, int n_threads);
+/* Called by kt_for_prefix with reads [st, ed): the next work item, in item
+ * order, whose func has returned. Return nonzero once those reads are consumed,
+ * or 0 to decline for now: the same item is offered again after the next item
+ * of the pass finishes. */
+typedef int (*kt_prefix_f)(void *ctx, int st, int ed);
+/* kt_for_nt, except that the calling thread, instead of only waiting for the
+ * pool, hands on_prefix each finished item at the front of the pass, one item
+ * per call and in read order, until the pass ends. It returns once every item
+ * has run, as kt_for_nt does; reads not consumed by then are simply not
+ * offered. Items still run in any order. */
+void kt_for_prefix(void (*func)(void*,int,int,int), void *data, int n, int n_threads,
+                   kt_prefix_f on_prefix, void *ctx);
 /* Tear down the persistent kt_for() worker pool (joins the worker threads).
  * Call once after the last kt_for()/kt_pipeline() of a run; a no-op if the pool
  * was never created. */

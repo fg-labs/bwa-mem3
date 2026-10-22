@@ -4651,6 +4651,18 @@ static void worker_sam(void *data, int seqid, int batch_size, int tid)
     }
 }
 
+/* The worker_sam pass over [0, n). When the pipeline asked to stream (w.emit_prefix),
+ * the calling thread hands finished items' records to it in read order while
+ * the pass runs; worker_sam writes each read's sam only from the item that owns
+ * the read, so a record is final once its item has returned. */
+static void mem_kt_for_sam(worker_t &w, int n)
+{
+    if (w.emit_prefix)
+        kt_for_prefix(worker_sam, &w, n, w.nthreads, w.emit_prefix, w.emit_prefix_ctx);
+    else
+        kt_for(worker_sam, &w, n);
+}
+
 /* Align phase for one slice of a pestat cohort: seeding + BSW only.
  *
  * Split out of mem_process_seqs so the pipeline can align a cohort in several
@@ -4744,7 +4756,7 @@ void mem_pair_and_emit_cohort(mem_opt_t *opt,
 
     uint64_t tim = __rdtsc();
     fprintf(stderr, "[0000] 3. Calling kt_for - worker_sam\n");
-    kt_for(worker_sam, &w, n);
+    mem_kt_for_sam(w, n);
     tprof[WORKER20][0] += __rdtsc() - tim;
 
     fprintf(stderr, "\t[0000][ M::%s] Processed %d reads in %.3f "
@@ -4912,7 +4924,7 @@ void mem_process_seqs(mem_opt_t *opt,
     tim = __rdtsc();
     fprintf(stderr, "[0000] 3. Calling kt_for - worker_sam\n");
 
-    kt_for(worker_sam, &w,  n_);   // SAM
+    mem_kt_for_sam(w, n_);   // SAM
     tprof[WORKER20][0] += __rdtsc() - tim;
 
     /* [dedup-reads] The memo points at g_readmemo_state or the read step's

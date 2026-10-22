@@ -1251,8 +1251,9 @@ shell-lint:
 shell-fix:
 	./test/regression/shell_lint.sh --fix
 
-# Regression test that requires a binary built with TESTING_BUILD=1
-# (enables BWAMEM3_TESTING_HOST_TIER env-var injection). Not invoked by
+# Regression tests that require a binary built with TESTING_BUILD=1
+# (enables the BWAMEM3_TESTING_HOST_TIER, BWAMEM3_TESTING_WRITE_DELAY_MS and
+# BWAMEM3_TESTING_HOLD_LAST_ITEM env-var injection hooks). Not invoked by
 # the default `test` target because it requires a non-production build.
 # CI invokes this target on the canonical row, after rebuilding in-row with
 # TESTING_BUILD=1 (see "SIMD floor enforcement" in .github/workflows/ci.yml).
@@ -1263,6 +1264,7 @@ shell-fix:
 test-injection: bwa-mem3
 	BWA_MEM3_TESTING=./bwa-mem3 INJECTED_TIER=sse41 PARITY_FA=/dev/null \
 		./test/regression/host_floor_enforce.sh
+	BWA_MEM3_TESTING=./bwa-mem3 ./test/regression/stream_output_order.sh
 
 test/kswv_nrow_zero_test.o: test/kswv_nrow_zero_test.cpp
 	$(CXX) -c $(BASE_CXXFLAGS) -march=native $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
