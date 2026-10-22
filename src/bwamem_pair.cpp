@@ -1815,10 +1815,15 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
             s[1].sam = NULL;
             free(str.s); str.s = NULL; str.m = 0;
         } else {
+            /* Hand each mate's kstring buffer straight to s[i].sam (the
+             * writer frees each independently) rather than strdup'ing mate
+             * 1's text and reusing the buffer for mate 2: same bytes, no copy. */
             assert(str.s != 0);
-            s[0].sam = strdup(str.s); str.l = 0;
+            s[0].sam = str.s;
+            str.l = str.m = 0; str.s = 0;
             for (i = 0; i < n_aa[1]; ++i)
                 mem_aln2sam(opt, bns, &str, &s[1], n_aa[1], aa[1], i, &h[0]);
+            assert(str.s != 0);
             s[1].sam = str.s;
         }
         if (strcmp(s[0].name, s[1].name) != 0) err_fatal(__func__, "paired reads have different names: \"%s\", \"%s\"\n", s[0].name, s[1].name);
