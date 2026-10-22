@@ -681,6 +681,21 @@ void mem_dedup_configure(const char *mode_arg);
 // seed count. min_ext_len <= 0 is a no-op. See mem_opt_t::min_ext_len.
 int mem_chain_drop_short_seeds(mem_chain_t *c, int min_ext_len);
 
+// Seed-SW screen over a read's chains (the --min-ext-len filter, then a per-seed
+// rescore that only runs for long reads). mem_flt_chained_seeds_noop returns 1
+// when mem_flt_chained_seeds would leave every chain of a read of length l_query
+// unchanged; it depends only on opt and l_query. Declared here so both are
+// unit-testable.
+int mem_flt_chained_seeds_noop(const mem_opt_t *opt, int l_query);
+// One-entry memo of mem_flt_chained_seeds_noop on the read length, for a loop
+// over reads (libraries are usually fixed-length, so log() runs about once per
+// batch). Start from MEM_FLT_NOOP_MEMO_INIT; no read has length -1.
+typedef struct { int l_query; int noop; } mem_flt_noop_memo_t;
+#define MEM_FLT_NOOP_MEMO_INIT { -1, 0 }
+int mem_flt_chained_seeds_noop_memo(mem_flt_noop_memo_t *m, const mem_opt_t *opt, int l_query);
+void mem_flt_chained_seeds(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
+                           bseq1_t *seq_, int n_chn, mem_chain_t *a);
+
 // Chain weight: the smaller of the chain's query-axis and reference-axis
 // coverage, counting each base once however many seeds span it. Saturates at
 // MEM_CHAIN_W_MAX, the largest value mem_chain_t::w can hold (#309). Declared
