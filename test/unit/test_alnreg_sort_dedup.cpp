@@ -970,6 +970,8 @@ TEST_CASE("the mate-rescue dedup's fixed-point skip and single-insert path are b
     //      (records, count and flag), whichever of its paths it takes.
     Rng rng(0x9e3700d1ULL);
     unsigned long fixpoints = 0, not_fixpoints = 0, fast = 0, fallback = 0, key_tie_refused = 0;
+    unsigned long tie_free_calls = 0;
+    bwamem3_dedup_incr_re_stats(NULL, NULL, NULL, NULL, NULL, 1);
     for (int sort_fast = 0; sort_fast < 2; ++sort_fast) {
         mem_opt_t *opt = mem_opt_init();
         opt->alnreg_sort_fast = sort_fast;
@@ -977,7 +979,7 @@ TEST_CASE("the mate-rescue dedup's fixed-point skip and single-insert path are b
             std::vector<mem_alnreg_t> a;
             const int n0 = rng.in(0, 40);
             for (int i = 0; i < n0; ++i) a.push_back(rescue_like(rng, a));
-            int fp = 0;
+            int fp = 0, tie_free = 0;   // tie_free tracks the state as mem_matesw_batch_post does
             for (int round = 0; round < 12; ++round) {
                 if (round == 0 || !fp) {
                     std::vector<mem_alnreg_t> full(a), c(a);
@@ -988,6 +990,7 @@ TEST_CASE("the mate-rescue dedup's fixed-point skip and single-insert path are b
                     c.resize(static_cast<size_t>(nc));
                     REQUIRE(same_records(full, c));
                     a = c;
+                    tie_free = 0;
                 }
                 if (fp) {
                     ++fixpoints;
@@ -1007,14 +1010,37 @@ TEST_CASE("the mate-rescue dedup's fixed-point skip and single-insert path are b
                 const int ne = mem_dedup_only_fixpoint(opt, static_cast<int>(e.size()), e.data(), &fpe);
                 e.resize(static_cast<size_t>(ne));
                 if (fp) {
+                    // Without the tie-free hint: the check runs in full.
                     std::vector<mem_alnreg_t> ins(a);
-                    int fpi = -1, took = -1;
+                    int fpi = -1, took = -1, tf_out = 0;
                     const int ni = mem_dedup_only_insert1(opt, static_cast<int>(ins.size()), ins.data(),
-                                                          pos, &fpi, &took);
+                                                          pos, &tf_out, &fpi, &took);
                     ins.resize(static_cast<size_t>(ni));
                     REQUIRE(same_records(ins, e));
                     CHECK(fpi == fpe);
+                    CHECK(tf_out == took);
                     if (took) ++fast; else ++fallback;
+                    // With the hint, passed exactly when the state allows it (the previous
+                    // insert into this list was fast): same path, same result.
+                    if (tie_free) {
+                        std::vector<mem_alnreg_t> tf(a);
+                        int fpt = -1, tookt = -1, tf_io = 1;
+                        const int nt = mem_dedup_only_insert1(opt, static_cast<int>(tf.size()), tf.data(),
+                                                              pos, &tf_io, &fpt, &tookt);
+                        tf.resize(static_cast<size_t>(nt));
+                        REQUIRE(same_records(tf, e));
+                        CHECK(fpt == fpe);
+                        CHECK(tookt == took);
+                        CHECK(tf_io == took);
+                        ++tie_free_calls;
+                    }
+                    // A fast insert leaves no two records tied on (score, rb, qb), which is
+                    // what lets the next insert pass tie_free = 1.
+                    if (took)
+                        for (size_t i = 1; i < ins.size(); ++i)
+                            CHECK_FALSE((ins[i - 1].score == ins[i].score && ins[i - 1].rb == ins[i].rb &&
+                                         ins[i - 1].qb == ins[i].qb));
+                    tie_free = took;
                     // A key copy ties an existing record's (score, rb, qb): the by-score order
                     // is then not unique, so the O(n) path must refuse it.
                     if (kind == 9) {
@@ -1022,6 +1048,7 @@ TEST_CASE("the mate-rescue dedup's fixed-point skip and single-insert path are b
                         key_tie_refused += !took;
                     }
                 }
+                if (!fp) tie_free = 0;
                 a = e;
                 fp = fpe;
             }
@@ -1034,6 +1061,15 @@ TEST_CASE("the mate-rescue dedup's fixed-point skip and single-insert path are b
     CHECK(fast > 100);
     CHECK(fallback > 100);
     CHECK(key_tie_refused > 20);
+    CHECK(tie_free_calls > 100);
+    // A fallback undoes the ranks the one pass restamped, so the full call's
+    // incremental `re` sort always gets the previous pass's ranks as its hint.
+    // The output would not change if it did not, but a half-restamped hint can
+    // collide, and the sort would then reject it and take the slow path.
+    unsigned long re_calls = 0, re_rejected = 0;
+    bwamem3_dedup_incr_re_stats(&re_calls, NULL, NULL, &re_rejected, NULL, 1);
+    CHECK(re_calls > 0);
+    CHECK(re_rejected == 0);
 
     // A new record with qe <= qb (dropped by the compaction, so never a fixed-point
     // member) must also go to the full call. No rescue produces one; the guard is
@@ -1051,10 +1087,51 @@ TEST_CASE("the mate-rescue dedup's fixed-point skip and single-insert path are b
     int fpe = 0, fpi = -1, took = -1;
     e.resize(static_cast<size_t>(mem_dedup_only_fixpoint(opt, static_cast<int>(e.size()), e.data(), &fpe)));
     ins.resize(static_cast<size_t>(mem_dedup_only_insert1(opt, static_cast<int>(ins.size()), ins.data(), pos,
-                                                          &fpi, &took)));
+                                                          NULL, &fpi, &took)));
     CHECK(took == 0);
     CHECK(same_records(ins, e));
     CHECK(fpi == fpe);
+    free(opt);
+}
+
+TEST_CASE("the single-insert dedup is exact for the new record at any position"
+          * doctest::test_suite("unit/alnreg_sort_dedup")) {
+    // The rescue push places the new record after every record of its score, so
+    // its by-score slot k is at or before it; the in-place move must also be
+    // right when k lies after it (a caller may pass any pos).
+    Rng rng(0x9e3700d2ULL);
+    mem_opt_t *opt = mem_opt_init();
+    unsigned long k_after = 0, k_before = 0, k_same = 0;   // b's final index k vs its pos
+    for (int t = 0; t < 12000; ++t) {
+        std::vector<mem_alnreg_t> z;
+        const int n0 = rng.in(2, 40);
+        for (int i = 0; i < n0; ++i) z.push_back(rescue_like(rng, z));
+        int fp = 0;
+        z.resize(static_cast<size_t>(mem_dedup_only_fixpoint(opt, static_cast<int>(z.size()), z.data(), &fp)));
+        if (!fp || z.size() < 2) continue;
+        const mem_alnreg_t b = rescue_like(rng, z);
+        const int pos = rng.in(0, static_cast<int>(z.size()));
+        std::vector<mem_alnreg_t> a(z);
+        a.insert(a.begin() + pos, b);
+        std::vector<mem_alnreg_t> e(a), ins(a);
+        int fpe = 0, fpi = -1, took = -1, tf = 0;
+        e.resize(static_cast<size_t>(mem_dedup_only_fixpoint(opt, static_cast<int>(e.size()), e.data(), &fpe)));
+        ins.resize(static_cast<size_t>(mem_dedup_only_insert1(opt, static_cast<int>(ins.size()), ins.data(), pos,
+                                                              &tf, &fpi, &took)));
+        REQUIRE(same_records(ins, e));
+        CHECK(fpi == fpe);
+        if (took) {
+            int k = -1;   // re is unique on the fast path, so it finds b
+            for (size_t i = 0; i < ins.size(); ++i)
+                if (ins[i].re == b.re) { k = static_cast<int>(i); break; }
+            REQUIRE(k >= 0);
+            if (k > pos) ++k_after; else if (k < pos) ++k_before; else ++k_same;
+        }
+    }
+    // Non-vacuity: fast inserts that move the record later, earlier, or not at all.
+    CHECK(k_after > 100);
+    CHECK(k_before > 100);
+    CHECK(k_same > 50);
     free(opt);
 }
 

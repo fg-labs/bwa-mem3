@@ -1905,41 +1905,74 @@ int mem_dedup_only_fixpoint(const mem_opt_t *opt, int n, mem_alnreg_t *a, int *f
  *  - the pass leaves n_comp = 1 on every record and ranks = `re` positions:
  *    b's is r + 1, a Z record's old rank plus 1 if its re > b.re.
  *  - by-score sort: if no two records share (score, rb, qb) (Z checked by its
- *    adjacent pairs, b against every record) the sorted order is unique, so
- *    every sort path returns Z with b inserted at its (score, rb, qb) position.
+ *    adjacent pairs, or known tie-free, see below; b against every record) the
+ *    sorted order is unique, so every sort path returns Z with b inserted at
+ *    its (score, rb, qb) position.
  * Any failed check -> the full call. Covered by
- * test/unit/test_alnreg_sort_dedup.cpp against the full call. */
+ * test/unit/test_alnreg_sort_dedup.cpp against the full call.
+ *
+ *
+ * `tie_free` (in/out, may be NULL): a fast insert's result has no two records
+ * tied on (score, rb, qb) at all (Z had no adjacent tie and b ties no record),
+ * so the next insert into that list cannot fail the adjacent-tie check on Z.
+ * On input, *tie_free = 1 asserts that Z is exactly such a result -- the output
+ * of this function with *tie_free set to 1, unmodified since apart from the one
+ * new record -- and skips that check; the decision and result are the same.
+ * On output, *tie_free is 1 exactly when this call took the fast path. */
 int mem_dedup_only_insert1(const mem_opt_t *opt, int n, mem_alnreg_t *a, int pos,
-                           int *fixpoint_out, int *fast_out)
+                           int *tie_free, int *fixpoint_out, int *fast_out)
 {
+    const int z_tie_free = tie_free != NULL && *tie_free;
+    if (tie_free) *tie_free = 0;
     xassert(pos >= 0 && pos < n, "mem_dedup_only_insert1: pos out of range");
     const mem_alnreg_t b = a[pos];
-    int ok = (n - 1 >= 2) && b.qe > b.qb;
-    int r = 0;          /* records of Z with re < b.re */
-    const mem_alnreg_t *prev = NULL;   /* previous Z record in by-score order */
-    for (int i = 0; ok && i < n; ++i) {
-        if (i == pos) continue;
-        const mem_alnreg_t *q = &a[i];
-        if (q->re == b.re) { ok = 0; break; }
-        if (q->re < b.re) ++r;
-        if (q->rid == b.rid) {
-            const mem_alnreg_t *lo = q->re < b.re ? q : &b, *hi = q->re < b.re ? &b : q;
-            if (hi->rb < lo->re + opt->max_chain_gap && dedup_redundant(opt, lo, hi)) { ok = 0; break; }
-        }
-        if (q->score == b.score && q->rb == b.rb && q->qb == b.qb) { ok = 0; break; }
-        if (prev != NULL && prev->score == q->score && prev->rb == q->rb && prev->qb == q->qb) { ok = 0; break; }
-        prev = q;
+    if (!(n - 1 >= 2 && b.qe > b.qb)) {
+        if (fast_out) *fast_out = 0;
+        return mem_dedup_only_fixpoint(opt, n, a, fixpoint_out);
     }
-    if (fast_out) *fast_out = ok;
-    if (!ok) return mem_dedup_only_fixpoint(opt, n, a, fixpoint_out);
+    /* One pass over Z: the checks, in the order and on the records the proof
+     * above needs, and on a record that passes them, the counting of r, the
+     * rank restamp (re > b.re) and the search for b's by-score position k among
+     * Z (the first q with alnreg_slt(b, q)). With z_tie_free, Z is known to hold
+     * no adjacent (score, rb, qb) tie, so that check cannot fail and is skipped.
+     * A failed check undoes the restamps made so far, so the full call sees
+     * exactly the input it would have. */
+    int r = 0;          /* records of Z with re < b.re */
+    int k = n - 1, k_found = 0, j = 0, stop = -1;
+    const mem_alnreg_t *prev = NULL;   /* previous Z record in by-score order */
+    for (int i = 0; i < n; ++i) {
+        if (i == pos) continue;
+        mem_alnreg_t *q = &a[i];
+        if (q->re == b.re) { stop = i; break; }
+        const int lt = q->re < b.re;
+        if (q->rid == b.rid) {
+            const mem_alnreg_t *lo = lt ? q : &b, *hi = lt ? &b : q;
+            if (hi->rb < lo->re + opt->max_chain_gap && dedup_redundant(opt, lo, hi)) { stop = i; break; }
+        }
+        if (q->score == b.score && q->rb == b.rb && q->qb == b.qb) { stop = i; break; }
+        if (!z_tie_free) {
+            if (prev != NULL && prev->score == q->score && prev->rb == q->rb && prev->qb == q->qb) { stop = i; break; }
+            prev = q;
+        }
+        if (lt) ++r;
+        else ++q->dedup_re_rank;
+        if (!k_found && alnreg_slt(b, *q)) k = j, k_found = 1;
+        ++j;
+    }
+    if (stop >= 0) {
+        for (int i = 0; i < stop; ++i)
+            if (i != pos && a[i].re > b.re) --a[i].dedup_re_rank;
+        if (fast_out) *fast_out = 0;
+        return mem_dedup_only_fixpoint(opt, n, a, fixpoint_out);
+    }
+    if (fast_out) *fast_out = 1;
+    if (tie_free) *tie_free = 1;
 
-    /* Remove b, restamp, and reinsert it at its unique by-score position. */
-    memmove(&a[pos], &a[pos + 1], (size_t)(n - 1 - pos) * sizeof(*a));
-    for (int i = 0; i < n - 1; ++i)
-        if (a[i].re > b.re) ++a[i].dedup_re_rank;
-    int k = 0;
-    while (k < n - 1 && !alnreg_slt(b, a[k])) ++k;
-    memmove(&a[k + 1], &a[k], (size_t)(n - 1 - k) * sizeof(*a));
+    /* Removing b from pos and reinserting it at k among the others is the same
+     * array as moving b from pos to k in place: shift only the records between
+     * the two (the rescue push puts b next to its by-score slot, so few move). */
+    if (k < pos) memmove(&a[k + 1], &a[k], (size_t)(pos - k) * sizeof(*a));
+    else if (k > pos) memmove(&a[pos], &a[pos + 1], (size_t)(k - pos) * sizeof(*a));
     a[k] = b;
     a[k].n_comp = 1;
     a[k].dedup_re_rank = r + 1;

@@ -34,8 +34,9 @@
 # mate is made unseedable by spaced mismatches, so it only places via SW mate
 # rescue -- some near the rescue threshold (narrowed windows), some unrelated to
 # the reference (proven failures), and some with an N (full windows); anchors in a
-# block present three times (one rescue per copy on the same mate, which is what
-# exercises the dedup shortcuts); and 300 bp mates, long enough for the 16-bit
+# block present four times and in an exact block present three times (one rescue
+# per copy on the same mate, which is what exercises the dedup shortcuts); and
+# 300 bp mates, long enough for the 16-bit
 # kswv kernels (every 150 bp mate takes the 8-bit ones). It runs at -t 1 and -t 4.
 #
 # With RESCUE_TIERS set (a list of x86 tiers, e.g. "avx2 avx512bw"), the
@@ -128,12 +129,12 @@ import random
 rnd = random.Random(20260928)
 L = 60000
 ref = ''.join(rnd.choice('ACGT') for _ in range(L))
-# A repeat: DUP_LEN bases at DUP_A copied to two more places, each copy with a
+# A repeat: DUP_LEN bases at DUP_A copied to three more places, each copy with a
 # substitution every 100 bases at its own phase, so an anchor inside it places at
-# all three copies (within pen_unpaired) and mate rescue runs once per copy on the
+# all four copies (within pen_unpaired) and mate rescue runs once per copy on the
 # same mate, with a different score at each.
 DUP_A, DUP_LEN = 10000, 600
-for at, phase in ((30000, 50), (45000, 25)):
+for at, phase in ((30000, 50), (45000, 25), (56000, 75)):
     dup = list(ref[DUP_A:DUP_A+DUP_LEN])
     for i in range(phase, DUP_LEN, 100):
         dup[i] = {'A': 'C', 'C': 'G', 'G': 'T', 'T': 'A'}[dup[i]]
@@ -191,7 +192,8 @@ for k in range(300):
 
 # Anchors in the repeat, mates made unseedable as for kind 0. With the mate inside
 # the repeat too, every copy rescues it (the later ones are one-record inserts
-# into the deduped list, the third in O(n)); with the mate past the repeat's end,
+# into the deduped list, the third and fourth in O(n), the fourth on the tie-free
+# list the third's fast insert left); with the mate past the repeat's end,
 # only the first copy does, and the later copies' dedups have nothing new to
 # dedup (skips).
 for k in range(60):
@@ -591,10 +593,12 @@ stats="$(grep '^\[RESCUE_PRUNE\]' dedup.t1.err || true)"
 jobs16=$(field jobs16)
 [ "${jobs16:-0}" -gt 0 ] || fail "no 16-bit rescue job in the fixture (the 300 bp mates stopped reaching it): $stats"
 dedup_skip=$(field dedup_skip) dedup_insert1=$(field dedup_insert1) dedup_fast=$(field dedup_insert1_fast)
+dedup_tf=$(field dedup_insert1_tf)
 [ "${dedup_skip:-0}" -gt 0 ] || fail "no post-rescue dedup was skipped as a no-op: $stats"
 [ "${dedup_insert1:-0}" -gt 0 ] || fail "no post-rescue dedup took the one-record insert: $stats"
 [ "${dedup_fast:-0}" -gt 0 ] || fail "no one-record insert was done in O(n): $stats"
-dstats="dedup_skip=$dedup_skip dedup_insert1=$dedup_insert1 dedup_insert1_fast=$dedup_fast jobs16=$jobs16"
+[ "${dedup_tf:-0}" -gt 0 ] || fail "no one-record insert was entered with a tie-free list: $stats"
+dstats="dedup_skip=$dedup_skip dedup_insert1=$dedup_insert1 dedup_insert1_fast=$dedup_fast dedup_insert1_tf=$dedup_tf jobs16=$jobs16"
 
 stats="$(grep '^\[RESCUE_PRUNE\]' prune.t1.err || true)"
 [ -n "$stats" ] || fail "BWA3_RESCUE_PRUNE_STATS=1 printed no [RESCUE_PRUNE] line"
