@@ -107,6 +107,9 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #define BATCH_MUL 20
 #endif /* APPLE_SILICON batch size */
 
+/* A drained chain's ownership marker for its seed array (mem_chain_t::m): m ==
+ * SEEDS_PER_CHAIN when the array is in the per-thread seed window, m >
+ * SEEDS_PER_CHAIN when it is a heap array to free. Not a per-chain capacity. */
 #define SEEDS_PER_CHAIN 1
 #define N_SMEM_KERNEL 3
 

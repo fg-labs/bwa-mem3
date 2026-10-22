@@ -8,8 +8,8 @@
 #
 # The flat index hands a read to the unchanged kbtree path when two chains would
 # share a position (the kbtree's answer then depends on its node layout) or when
-# the read has more chains than the cap, rewinding the seed buffer and freeing
-# any seed arrays it heap-grew first. Neither happens often on ordinary reads, so
+# the read has more chains than the cap, clearing the read's chain seed pool
+# first. Neither happens often on ordinary reads, so
 # this builds a fixture that forces each one and proves it did:
 #
 #   tie reads   A + F + A, where A is one 40-mer: A's two seeds hit the same
@@ -18,8 +18,8 @@
 #               existing chain's position. BWA3_CHAIN_STATS must report
 #               flat_declined_tie > 0 on the default run.
 #   many-chain  six 30-mers from distant loci: six chains, so BWA3_CHAIN_FLAT_CAP=3
-#   reads       declines each read mid-way, after the flat pass consumed seed-buffer
-#               slots (flat_declined_cap > 0), exercising the rewind and replay.
+#   reads       declines each read mid-way, after the flat pass put seeds in the
+#               pool (flat_declined_cap > 0), exercising the replay.
 #   long reads  36 kb with a substitution every 400 bases: one alignment spans the
 #               read, so the Pass-3 index answers later seeds by scanning every
 #               member rather than walking hash buckets (p3_linear_scans > 0).
