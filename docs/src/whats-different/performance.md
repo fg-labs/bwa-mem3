@@ -574,6 +574,15 @@ generated jobs.
   anchor lies within the largest usable insert-size bound of it). Pure hints;
   skipped when the insert-size model is too loose for the span to be small.
   ([#537](https://github.com/fg-labs/bwa-mem3/pull/537))
+- **Candidate rows only in the 8-bit `score2` scan (NEON, AVX2, AVX-512BW).**
+  After the forward pass, the 8-bit rescue kernels find each lane's suboptimal
+  score (`score2`, `te2`) by walking that lane's row maxima. Rows below the
+  rescue threshold change nothing there, so the kernels first mark the rows at
+  or above it, eight per byte for every lane at once, and each lane walks only
+  its marked rows. Output unchanged (the same rows run the same updates);
+  kswv pass-0 time -1.9% on AWS Graviton 4 and about -2% to -4% on AMD Zen 4
+  (AVX-512BW), 5M-pair WGS slice at `-t 16`.
+  ([#606](https://github.com/fg-labs/bwa-mem3/pull/606))
 
 | Variable | Effect |
 |---|---|
@@ -595,6 +604,7 @@ generated jobs.
 | `BWA3_RESCUE_USQADD=0` | In the NEON 8-bit rescue kernel and the AVX2 and AVX-512BW 8-bit FScan bodies, use the biased add / subtract pair per cell instead of one saturating add (on x86, of the signed H - 128 domain, which runs only when the open-plus-extend sum is at most 127; AVX2: [#542](https://github.com/fg-labs/bwa-mem3/pull/542), AVX-512BW: [#546](https://github.com/fg-labs/bwa-mem3/pull/546)). It only chooses between exact paths, so output is the same either way by design. |
 | `BWA3_RESCUE_ROWPAIR=0` | In the NEON rescue kernels (8- and 16-bit), sweep one target row at a time instead of two. It only chooses between exact paths, so output is the same either way by design. |
 | `BWA3_RESCUE_LAZYQE=0` | In the NEON two-row sweep, find each row's query end inline instead of after the row. It only chooses between exact paths, so output is the same either way by design. |
+| `BWA3_RESCUE_SCORE2_BITS=0` | In the 8-bit rescue kernels (NEON, AVX2, AVX-512BW), walk every row in the suboptimal-score (`score2`) scan instead of only the rows at or above the rescue threshold ([#606](https://github.com/fg-labs/bwa-mem3/pull/606)). It only chooses between exact paths, so output is the same either way by design. |
 | `BWA3_RESCUE_BAND_SHIFT=0` | Turn off the per-lane band shift that aligns the query offsets of the 16 bands in a vector. It only chooses between exact paths, so output is the same either way by design. |
 | `BWA3_RESCUE_BAND_METH=<n>` | Under `--meth`, where the banded DP runs (both passes, with each hypothesis's matrix): `1` (default) everywhere except on top of converted-copy pruning (EM-seq), `0` never, `2` always; values above 2 act as 2. It only chooses between exact paths, so output does not depend on its value by design. ([#546](https://github.com/fg-labs/bwa-mem3/pull/546)) |
 

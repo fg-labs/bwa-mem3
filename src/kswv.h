@@ -575,6 +575,11 @@ private:
 	uint8_t *H8_0, *H8_1;
 	uint8_t *rowMax8;
 
+	/* Per-lane candidate-row bitmaps of the u8 kernels' score2 scan, eight rows
+	 * per byte (see kswv_score2.h): ceil(maxRefLen / 8) * SIMD_WIDTH8 bytes per
+	 * thread, rebuilt by every batch that reaches the scan. */
+	uint8_t *score2Bits8;
+
 	/* Column index broadcast across all lanes: colIdx8[j*W + k] == (uint8_t) j.
 	 * All three u8 kernels -- NEON, AVX2 and AVX-512BW -- read it when they
 	 * recover the query end after the row: the scan needs the scanned column

@@ -49,6 +49,8 @@
  * BWA3_RESCUE_ROWPAIR         1     NEON kswv (8- and 16-bit): sweep two target rows per pass
  * BWA3_RESCUE_LAZYQE          1     NEON kswv two-row sweep: recover the query end after the row
  *                                   instead of inline
+ * BWA3_RESCUE_SCORE2_BITS     1     u8 kswv score2/te2 scan: visit only each lane's rows at or above
+ *                                   minsc (0: walk every row)
  * BWA3_RESCUE_BAND            1     run rescue jobs as diagonal bands (NEON or AVX2 kernel)
  * BWA3_RESCUE_BAND_COST       auto  band a pass-0 parent iff its band cells cost less than this %
  *                                   of the hull's; auto is 0 (no pass-0 banding) where kswv runs

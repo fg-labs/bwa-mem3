@@ -96,6 +96,7 @@ extern uint64_t prof[10][112];
 #endif
 
 #include "kswv_quantum.h"
+#include "kswv_score2.h"
 
 /* Query-padding contract, shared by the batch wrappers and the kernels.
  *
@@ -382,6 +383,9 @@ kswv::kswv(const int o_del, const int e_del, const int o_ins,
     H8_0 = (uint8_t*) H16_0;
     H8_1 = (uint8_t*) H16_1;
     rowMax8 = (uint8_t*) rowMax16;
+    score2Bits8 = (uint8_t *)_mm_malloc((size_t) kswv_score2_bits_blocks(this->maxRefLen)
+                                        * SIMD_WIDTH8 * numThreads, 64);
+    xassert(score2Bits8 != NULL, "out of memory: score2Bits8");
 
     /* Column-index broadcast table for the u8 kernels' post-row query-end
      * rescan; see kswv.h. Shared by all threads and never written after
@@ -515,6 +519,7 @@ kswv::kswv(const int o_del, const int e_del, const int o_ins,
 kswv::~kswv() {
     _mm_free(F16); _mm_free(H16_0); _mm_free(H16_1);
     _mm_free(rowMax16);
+    _mm_free(score2Bits8);
     _mm_free(colIdx8);
     _mm_free(colIdx16);
     _mm_free(qeBlk16);
@@ -580,6 +585,12 @@ static bool rescue_fscan_enabled() { return rescue_env_on("BWA3_RESCUE_FSCAN"); 
  * HasFreed), never a per-cell branch. */
 __attribute__((unused))   // read by the NEON, AVX2 and AVX-512BW u8 kernels only
 static bool rescue_usqadd_enabled() { return rescue_env_on("BWA3_RESCUE_USQADD"); }
+/* BWA3_RESCUE_SCORE2_BITS (default ON): the u8 kernels' score2/te2 scan visits only each
+ * lane's rows at or above minsc, marked with whole-row compares (kswv_score2.h). 0 marks every
+ * row instead, so each lane walks all of its rows as the dense scan did. Every visited row is
+ * re-tested against minsc, so the result is the same either way. */
+__attribute__((unused))   // read by the NEON, AVX2 and AVX-512BW u8 kernels only
+static bool rescue_score2_bits_enabled() { return rescue_env_on("BWA3_RESCUE_SCORE2_BITS"); }
 /* Whether the x86 u8 dispatchers (kswv256_u8, kswv512_u8) take the signed-domain FScan body
  * (kswv256_u8_impl): the FScan body is on (fscan: BWA3_RESCUE_FSCAN and fscan_scoring_ok),
  * BWA3_RESCUE_USQADD is on, and the gap constants fit a positive int8. fscan_scoring_ok makes the
@@ -1941,8 +1952,8 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
      * treats every row independently and pulls out-of-region rows of a
      * boundary-straddling plateau in as false suboptimals, inflating `sub`.
      * Emulate scalar exactly, per lane, on the precomputed
-     * rowMax. Cost is O(SIMD_WIDTH8 * limit) scalar ops per batch,
-     * negligible next to the SIMD DP that built rowMax. */
+     * rowMax, visiting only the rows a per-lane bitmap marks as at or
+     * above minsc (kswv_score2.h). */
     int qmax = this->g_qmax;
     int16_t low[SIMD_WIDTH8]  __attribute__((aligned(64)));
     int16_t high[SIMD_WIDTH8] __attribute__((aligned(64)));
@@ -1958,6 +1969,17 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
      * includes the terminating row stored at rowMax[limit]. */
     const int processed_rows = i;
 
+    /* Rows at or above each lane's minsc, eight per byte, so each lane's scan
+     * below visits only its candidate rows (see kswv_score2.h). */
+    uint8_t *score2Bits = score2Bits8
+        + (size_t)tid * SIMD_WIDTH8 * kswv_score2_bits_blocks(this->maxRefLen);
+    if (minsc_msk_a) {   /* no lane runs the scan otherwise */
+        if (rescue_score2_bits_enabled())
+            kswv_score2_row_bits_u8<SIMD_WIDTH8>(rowMax, processed_rows, minsc, score2Bits);
+        else
+            kswv_score2_row_bits_all<SIMD_WIDTH8>(processed_rows, score2Bits);
+    }
+
     for (int l = 0; l < SIMD_WIDTH8 && (po_ind + l) < numPairs; l++) {
         int ind = p[l].regid;
         /* Match scalar ksw_u8: when KSW_XSUBO is absent, minsc = 0x10000
@@ -1970,48 +1992,11 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
             continue;
         }
 
-        int len1_l  = (int)p[l].len1;
-        int low_l   = (int)low[l];
-        int high_l  = (int)high[l];
-        int minsc_l = (int)minsc[l];
-        int score2  = -1;
-        int te2     = -1;
-        /* b_pos = -2 sentinel: (-2 + 1) != any real row, forces an
-         * "append" on the first qualifying row. */
-        int b_score = -1;
-        int b_pos   = -2;
-
-        int nrows = processed_rows < len1_l ? processed_rows : len1_l;
-        for (int i2 = 0; i2 < nrows; i2++) {
-            int imax = (int)rowMax[i2 * SIMD_WIDTH8 + l];
-            if (imax < minsc_l) continue;
-
-            if (b_pos + 1 != i2) {
-                /* APPEND: flush the outgoing b[] entry to score2 first. */
-                if (b_pos >= 0 &&
-                    (b_pos < low_l || b_pos > high_l) &&
-                    b_score > score2) {
-                    score2 = b_score;
-                    te2    = b_pos;
-                }
-                b_score = imax;
-                b_pos   = i2;
-            } else if (b_score < imax) {
-                /* UPDATE: strict greater extends the run's anchor. Equal
-                 * imax leaves b_pos in place (matches scalar). */
-                b_score = imax;
-                b_pos   = i2;
-            }
-        }
-
-        /* Flush trailing b[] entry. */
-        if (b_pos >= 0 &&
-            (b_pos < low_l || b_pos > high_l) &&
-            b_score > score2) {
-            score2 = b_score;
-            te2    = b_pos;
-        }
-
+        const int len1_l = (int)p[l].len1;
+        const int nrows  = processed_rows < len1_l ? processed_rows : len1_l;
+        int score2, te2;
+        kswv_score2_scan_bits_u8<SIMD_WIDTH8>(rowMax, score2Bits, nrows, l, (int)minsc[l],
+                                              (int)low[l], (int)high[l], &score2, &te2);
         aln[ind].score2 = score2;
         aln[ind].te2    = te2;
     }
@@ -3469,8 +3454,8 @@ int kswv::kswv256_u8_impl(uint8_t seq1SoA[],
      * region boundary (anchor inside, later rows outside) is excluded
      * entirely. Dense rowMax would otherwise pull partial-plateau rows
      * in and inflate `sub`. Emulate scalar exactly, per lane, on the
-     * precomputed rowMax. Cost is O(SIMD_WIDTH8 * limit) scalar ops per
-     * batch, negligible next to the SIMD DP. */
+     * precomputed rowMax, visiting only the rows a per-lane bitmap marks
+     * as at or above minsc (kswv_score2.h). */
     int qmax = this->g_qmax;
     int16_t low[SIMD_WIDTH8]  __attribute__((aligned(64)));
     int16_t high[SIMD_WIDTH8] __attribute__((aligned(64)));
@@ -3486,6 +3471,17 @@ int kswv::kswv256_u8_impl(uint8_t seq1SoA[],
      * includes the terminating row stored at rowMax[limit]. */
     const int processed_rows = i;
 
+    /* Rows at or above each lane's minsc, eight per byte, so each lane's scan
+     * below visits only its candidate rows (see kswv_score2.h). */
+    uint8_t *score2Bits = score2Bits8
+        + (size_t)tid * SIMD_WIDTH8 * kswv_score2_bits_blocks(this->maxRefLen);
+    if (minsc_msk_a) {   /* no lane runs the scan otherwise */
+        if (rescue_score2_bits_enabled())
+            kswv_score2_row_bits_u8<SIMD_WIDTH8>(rowMax, processed_rows, minsc, score2Bits);
+        else
+            kswv_score2_row_bits_all<SIMD_WIDTH8>(processed_rows, score2Bits);
+    }
+
     for (int l = 0; l < SIMD_WIDTH8 && (po_ind + l) < numPairs; l++) {
         int ind = p[l].regid;
         /* Match scalar ksw_u8: when KSW_XSUBO is absent, minsc = 0x10000
@@ -3498,48 +3494,11 @@ int kswv::kswv256_u8_impl(uint8_t seq1SoA[],
             continue;
         }
 
-        int len1_l  = (int)p[l].len1;
-        int low_l   = (int)low[l];
-        int high_l  = (int)high[l];
-        int minsc_l = (int)minsc[l];
-        int score2  = -1;
-        int te2     = -1;
-        /* b_pos = -2 sentinel: (-2 + 1) != any real row index, forces
-         * an "append" on first qualifying row. */
-        int b_score = -1;
-        int b_pos   = -2;
-
-        int nrows = processed_rows < len1_l ? processed_rows : len1_l;
-        for (int i2 = 0; i2 < nrows; i2++) {
-            int imax = (int)rowMax[i2 * SIMD_WIDTH8 + l];
-            if (imax < minsc_l) continue;
-
-            if (b_pos + 1 != i2) {
-                /* APPEND: flush the outgoing b[] entry to score2 first. */
-                if (b_pos >= 0 &&
-                    (b_pos < low_l || b_pos > high_l) &&
-                    b_score > score2) {
-                    score2 = b_score;
-                    te2    = b_pos;
-                }
-                b_score = imax;
-                b_pos   = i2;
-            } else if (b_score < imax) {
-                /* UPDATE: strict greater extends the run's anchor. Equal
-                 * imax leaves b_pos in place (matches scalar). */
-                b_score = imax;
-                b_pos   = i2;
-            }
-        }
-
-        /* Flush trailing b[] entry. */
-        if (b_pos >= 0 &&
-            (b_pos < low_l || b_pos > high_l) &&
-            b_score > score2) {
-            score2 = b_score;
-            te2    = b_pos;
-        }
-
+        const int len1_l = (int)p[l].len1;
+        const int nrows  = processed_rows < len1_l ? processed_rows : len1_l;
+        int score2, te2;
+        kswv_score2_scan_bits_u8<SIMD_WIDTH8>(rowMax, score2Bits, nrows, l, (int)minsc[l],
+                                              (int)low[l], (int)high[l], &score2, &te2);
         aln[ind].score2 = score2;
         aln[ind].te2    = te2;
     }
@@ -4778,8 +4737,8 @@ int kswv::kswv512_u8_impl(uint8_t seq1SoA[],
      * treats every row independently and pulls out-of-region rows of a
      * boundary-straddling plateau in as false suboptimals, inflating `sub`.
      * Emulate scalar exactly, per lane, on the precomputed
-     * rowMax. Cost is O(SIMD_WIDTH8 * limit) scalar ops per batch,
-     * negligible next to the SIMD DP that built rowMax. */
+     * rowMax, visiting only the rows a per-lane bitmap marks as at or
+     * above minsc (kswv_score2.h). */
     int qmax = this->g_qmax;
     int16_t low[SIMD_WIDTH8]  __attribute__((aligned(64)));
     int16_t high[SIMD_WIDTH8] __attribute__((aligned(64)));
@@ -4795,6 +4754,17 @@ int kswv::kswv512_u8_impl(uint8_t seq1SoA[],
      * includes the terminating row stored at rowMax[limit]. */
     const int processed_rows = i;
 
+    /* Rows at or above each lane's minsc, eight per byte, so each lane's scan
+     * below visits only its candidate rows (see kswv_score2.h). */
+    uint8_t *score2Bits = score2Bits8
+        + (size_t)tid * SIMD_WIDTH8 * kswv_score2_bits_blocks(this->maxRefLen);
+    if (minsc_msk_a) {   /* no lane runs the scan otherwise */
+        if (rescue_score2_bits_enabled())
+            kswv_score2_row_bits_u8<SIMD_WIDTH8>(rowMax, processed_rows, minsc, score2Bits);
+        else
+            kswv_score2_row_bits_all<SIMD_WIDTH8>(processed_rows, score2Bits);
+    }
+
     for (int l = 0; l < SIMD_WIDTH8 && (po_ind + l) < numPairs; l++) {
         int ind = p[l].regid;
         /* Match scalar ksw_u8: when KSW_XSUBO is absent, minsc = 0x10000
@@ -4807,48 +4777,11 @@ int kswv::kswv512_u8_impl(uint8_t seq1SoA[],
             continue;
         }
 
-        int len1_l  = (int)p[l].len1;
-        int low_l   = (int)low[l];
-        int high_l  = (int)high[l];
-        int minsc_l = (int)minsc[l];
-        int score2  = -1;
-        int te2     = -1;
-        /* b_pos = -2 sentinel: (-2 + 1) != any real row, forces an
-         * "append" on the first qualifying row. */
-        int b_score = -1;
-        int b_pos   = -2;
-
-        int nrows = processed_rows < len1_l ? processed_rows : len1_l;
-        for (int i2 = 0; i2 < nrows; i2++) {
-            int imax = (int)rowMax[i2 * SIMD_WIDTH8 + l];
-            if (imax < minsc_l) continue;
-
-            if (b_pos + 1 != i2) {
-                /* APPEND: flush the outgoing b[] entry to score2 first. */
-                if (b_pos >= 0 &&
-                    (b_pos < low_l || b_pos > high_l) &&
-                    b_score > score2) {
-                    score2 = b_score;
-                    te2    = b_pos;
-                }
-                b_score = imax;
-                b_pos   = i2;
-            } else if (b_score < imax) {
-                /* UPDATE: strict greater extends the run's anchor. Equal
-                 * imax leaves b_pos in place (matches scalar). */
-                b_score = imax;
-                b_pos   = i2;
-            }
-        }
-
-        /* Flush trailing b[] entry. */
-        if (b_pos >= 0 &&
-            (b_pos < low_l || b_pos > high_l) &&
-            b_score > score2) {
-            score2 = b_score;
-            te2    = b_pos;
-        }
-
+        const int len1_l = (int)p[l].len1;
+        const int nrows  = processed_rows < len1_l ? processed_rows : len1_l;
+        int score2, te2;
+        kswv_score2_scan_bits_u8<SIMD_WIDTH8>(rowMax, score2Bits, nrows, l, (int)minsc[l],
+                                              (int)low[l], (int)high[l], &score2, &te2);
         aln[ind].score2 = score2;
         aln[ind].te2    = te2;
     }
