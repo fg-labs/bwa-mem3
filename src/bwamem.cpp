@@ -2159,22 +2159,52 @@ int mem_chain_drop_short_seeds(mem_chain_t *c, int min_ext_len)
     return c->n;
 }
 
+/* The seed-SW screen's minimum seed length and length test: functions of
+ * (opt, l_query) only. Shared by mem_flt_chained_seeds (per chain) and
+ * mem_flt_chained_seeds_noop (per read) so both evaluate the same expressions. */
+static inline double mem_seedsw_min_l(const mem_opt_t *opt, int l_query)
+{
+    return opt->min_chain_weight?
+        MEM_HSP_COEF * opt->min_chain_weight : MEM_MINSC_COEF * log(l_query);
+}
+
+static inline int mem_seedsw_screen_skips(double min_l, int l_query)
+{
+    return min_l > MEM_SEEDSW_COEF * l_query;
+}
+
+/* 1 when mem_flt_chained_seeds leaves every chain of a read of length l_query
+ * unchanged, so the caller can skip the call: the --min-ext-len filter is off
+ * and the screen's length test skips every chain. With default options that
+ * is every read of 2 to 724 bp (5.5 * ln(150) = 27.6 > 0.05 * 150; ln(0) and
+ * ln(1) fail the test). */
+int mem_flt_chained_seeds_noop(const mem_opt_t *opt, int l_query)
+{
+    return opt->min_ext_len <= 0
+        && mem_seedsw_screen_skips(mem_seedsw_min_l(opt, l_query), l_query);
+}
+
+int mem_flt_chained_seeds_noop_memo(mem_flt_noop_memo_t *m, const mem_opt_t *opt, int l_query)
+{
+    if (l_query != m->l_query) {
+        m->l_query = l_query;
+        m->noop = mem_flt_chained_seeds_noop(opt, l_query);
+    }
+    return m->noop;
+}
+
 void mem_flt_chained_seeds(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
                            bseq1_t *seq_, int n_chn, mem_chain_t *a)
 {
-    //double min_l = opt->min_chain_weight?
-    // MEM_HSP_COEF * opt->min_chain_weight : MEM_MINSC_COEF * log(l_query);
+    /* Upstream returned here for short reads. The per-read form of that skip is
+     * mem_flt_chained_seeds_noop, which mem_kernel1_core checks before calling. */
+    int i, j, k;
 
-    int i, j, k;// min_HSP_score = (int)(opt->a * min_l + .499);
-    //if (min_l > MEM_SEEDSW_COEF * l_query) return; // don't run the following for short reads
-
-    /* min_l/min_HSP_score depend only on (opt, l_query). Upstream hoisted them out
-     * of the loop because it was called per read; here `a` holds chains for a whole
-     * batch, so l_query = seq_[c->seqid].l_seq varies and a plain hoist is wrong.
-     * But chains arrive grouped by seqid and libraries are usually fixed-length, so
-     * a one-entry memo on l_query collapses ~all of the per-chain libm log() calls
-     * (order 10 chains/read => ~1e8 log() on a 10M-read run). Byte-identical: the
-     * same inputs produce the same IEEE double, we just stop recomputing it. */
+    /* min_l/min_HSP_score depend only on (opt, l_query), and l_query is read per
+     * chain from seq_[c->seqid], so a one-entry memo on l_query computes them (and
+     * the libm log()) once per run of equal-length chains instead of once per
+     * chain. The sole caller, mem_kernel1_core, passes one read's chains per call,
+     * so in practice that is once per call. Byte-identical: the same inputs produce the same IEEE double. */
     int    memo_l_query = -1;
     double memo_min_l = 0.0;
     int    memo_min_HSP_score = 0;
@@ -2203,6 +2233,20 @@ void mem_flt_chained_seeds(const mem_opt_t *opt, const bntseq_t *bns, const uint
                                    * intact), but the meth block below reads
                                    * seeds[0], so guard regardless. */
 
+        double min_l;
+        int min_HSP_score;
+        if (l_query == memo_l_query) {          /* same read length as the previous chain */
+            min_l = memo_min_l;
+            min_HSP_score = memo_min_HSP_score;
+        } else {
+            min_l = mem_seedsw_min_l(opt, l_query);
+            min_HSP_score = (int)(opt->a * min_l + .499);
+            memo_l_query = l_query; memo_min_l = min_l; memo_min_HSP_score = min_HSP_score;
+        }
+        /* Tested before the --meth decode below: a chain that is not screened
+         * never reads `query` or `mat`, so decoding the read for it is dead work. */
+        if (mem_seedsw_screen_skips(min_l, l_query)) continue;
+
         /* D3 (--meth, PR-4): swap to the original read + per-hypothesis matrix. */
         const int8_t *mat = opt->mat;
         if (opt->meth_mode && seq_[c->seqid].meth_orig_seq != NULL) {
@@ -2227,19 +2271,6 @@ void mem_flt_chained_seeds(const mem_opt_t *opt, const bntseq_t *bns, const uint
             if (hyp >= 0 && c->seeds[0].rbeg >= bns->l_pac) hyp ^= 1;
             mat = mem_opt_meth_mat(opt, hyp);
         }
-
-        double min_l;
-        int min_HSP_score;
-        if (l_query == memo_l_query) {          /* same read length as the previous chain */
-            min_l = memo_min_l;
-            min_HSP_score = memo_min_HSP_score;
-        } else {
-            min_l = opt->min_chain_weight?
-                MEM_HSP_COEF * opt->min_chain_weight : MEM_MINSC_COEF * log(l_query);
-            min_HSP_score = (int)(opt->a * min_l + .499);
-            memo_l_query = l_query; memo_min_l = min_l; memo_min_HSP_score = min_HSP_score;
-        }
-        if (min_l > MEM_SEEDSW_COEF * l_query) continue;
 
         for (j = k = 0; j < c->n; ++j)
         {
@@ -4090,8 +4121,15 @@ int mem_kernel1_core(FMI_search *fmi,
 
 
     printf_(VER, "8. Calling mem_flt_chained_seeds..\n");
+    /* Every chain in chain_ar[l] has seqid == l, so the screen's length test has
+     * one answer per read. When it skips and the --min-ext-len filter is off, the
+     * call would only walk the chains to reach that `continue` on each, so skip
+     * the call. The answer is memoized on the read length (libraries are usually
+     * fixed-length, so log() runs about once per batch instead of once per read). */
+    mem_flt_noop_memo_t flt_memo = MEM_FLT_NOOP_MEMO_INIT;
     for (int l=0; l<nseq; l++) {
         chn = &chain_ar[l];
+        if (mem_flt_chained_seeds_noop_memo(&flt_memo, opt, seq_[l].l_seq)) continue;
         /* D3: seeds are now in ORIGINAL coords (remapped in mem_chain_seeds), so
          * the seed-SW filter fetches the ORIGINAL ref window.
          * D3 (--meth, PR-4): mem_flt_chained_seeds now scores the ORIGINAL read
