@@ -726,19 +726,33 @@ void bns_get_seq_into(int64_t l_pac, const uint8_t *pac,
 }
 
 /* The window arithmetic shared by bns_fetch_seq_into, bns_fetch_seq_v2 and
- * bns_fetch_bounds: order [*beg, *end), find the contig holding `mid`, and clamp
- * the window to it on mid's strand. *far_beg / *far_end get that contig's bounds
- * in the same doubled coordinates as the window (for the callers' diagnostics). */
-static void bns_clamp_window(const bntseq_t *bns, int64_t *beg, int64_t mid, int64_t *end, int *rid,
+ * bns_fetch_bounds (and the _rid variants of the last two): order [*beg, *end), find the
+ * contig holding `mid`, and clamp the window to it on mid's strand. *far_beg /
+ * *far_end get that contig's bounds in the same doubled coordinates as the
+ * window (for the callers' diagnostics).
+ *
+ * rid_hint is the contig the caller expects (-1 for none). The extension's
+ * chain window and the mate-rescue windows always know it, and testing it
+ * reads only anns[rid_hint] (which the clamp reads anyway) and its neighbour,
+ * where bns_pos2rid loads a pos2rid_bucket[] entry from a ~0.75 MB table on
+ * hg38 -- often a cache miss. bns_pos_in_rid is exactly bns_pos2rid's
+ * predicate for mid in [0, 2 * l_pac) (every caller's), so *rid is the same
+ * value either way. */
+static void bns_clamp_window(const bntseq_t *bns, int64_t *beg, int64_t mid, int64_t *end,
+                             int rid_hint, int *rid,
                              int64_t *far_beg_out, int64_t *far_end_out)
 {
-	int64_t far_beg, far_end;
+	int64_t far_beg, far_end, pos_f;
 	int is_rev;
 
 	if (*end < *beg) *end ^= *beg, *beg ^= *end, *end ^= *beg; // if end is smaller, swap
 	assert(*beg <= mid && mid < *end);
 
-	*rid = bns_pos2rid(bns, bns_depos(bns, mid, &is_rev));
+	pos_f = bns_depos(bns, mid, &is_rev);
+	if (rid_hint >= 0 && rid_hint < bns->n_seqs && bns_pos_in_rid(bns, pos_f, rid_hint))
+		*rid = rid_hint;
+	else
+		*rid = bns_pos2rid(bns, pos_f);
 	far_beg = bns->anns[*rid].offset;
 	far_end = far_beg + bns->anns[*rid].len;
 	if (is_rev) { // flip to the reverse strand
@@ -758,7 +772,7 @@ void bns_fetch_seq_into(const bntseq_t *bns, const uint8_t *pac,
 {
 	int64_t far_beg, far_end;
 
-	bns_clamp_window(bns, beg, mid, end, rid, &far_beg, &far_end);
+	bns_clamp_window(bns, beg, mid, end, -1, rid, &far_beg, &far_end);
 
 	bns_get_seq_into(bns->l_pac, pac, *beg, *end, dst, len_out);
 
@@ -867,20 +881,33 @@ uint8_t *bns_get_seq_v2(int64_t l_pac, const uint8_t *pac, int64_t beg, int64_t 
 	return seq;
 }
 
-void bns_fetch_bounds(const bntseq_t *bns, int64_t *beg, int64_t mid, int64_t *end, int *rid)
+void bns_fetch_bounds_rid(const bntseq_t *bns, int64_t *beg, int64_t mid, int64_t *end,
+                          int rid_hint, int *rid)
 {
 	int64_t far_beg, far_end;
-	bns_clamp_window(bns, beg, mid, end, rid, &far_beg, &far_end);
+	bns_clamp_window(bns, beg, mid, end, rid_hint, rid, &far_beg, &far_end);
+}
+
+void bns_fetch_bounds(const bntseq_t *bns, int64_t *beg, int64_t mid, int64_t *end, int *rid)
+{
+	bns_fetch_bounds_rid(bns, beg, mid, end, -1, rid);
 }
 
 uint8_t *bns_fetch_seq_v2(const bntseq_t *bns, const uint8_t *pac,
                           int64_t *beg, int64_t mid, int64_t *end, int *rid,
                           uint8_t *ref_string, uint8_t *seqb)
 {
+	return bns_fetch_seq_v2_rid(bns, pac, beg, mid, end, -1, rid, ref_string, seqb);
+}
+
+uint8_t *bns_fetch_seq_v2_rid(const bntseq_t *bns, const uint8_t *pac,
+                              int64_t *beg, int64_t mid, int64_t *end, int rid_hint, int *rid,
+                              uint8_t *ref_string, uint8_t *seqb)
+{
 	int64_t len, far_beg, far_end;
 	uint8_t *seq;
 
-	bns_clamp_window(bns, beg, mid, end, rid, &far_beg, &far_end);
+	bns_clamp_window(bns, beg, mid, end, rid_hint, rid, &far_beg, &far_end);
 
 	seq = bns_get_seq_v2(bns->l_pac, pac, *beg, *end, &len, ref_string, seqb);
 

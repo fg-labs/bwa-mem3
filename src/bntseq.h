@@ -181,6 +181,19 @@ extern "C" {
 	// the window to that contig on mid's strand. For callers that need only the
 	// clamped bounds and rid, not the bases.
 	void bns_fetch_bounds(const bntseq_t *bns, int64_t *beg, int64_t mid, int64_t *end, int *rid);
+	// bns_fetch_seq_v2 / bns_fetch_bounds for a caller that already knows which
+	// contig `mid` should fall in. When bns_pos_in_rid(mid's forward position,
+	// rid_hint) holds, *rid = rid_hint without the bns_pos2rid lookup; otherwise
+	// (including a rid_hint outside [0, n_seqs)) the lookup runs as before. For
+	// 0 <= mid < 2 * l_pac on an index with non-decreasing anns[].offset (which
+	// bns_pos2rid itself assumes), the outputs are identical to the unhinted
+	// functions for every rid_hint. The unhinted functions stay as the plain API
+	// (and are the hinted ones with rid_hint = -1).
+	uint8_t *bns_fetch_seq_v2_rid(const bntseq_t *bns, const uint8_t *pac,
+	                              int64_t *beg, int64_t mid, int64_t *end, int rid_hint, int *rid,
+	                              uint8_t *ref_string, uint8_t *seqb);
+	void bns_fetch_bounds_rid(const bntseq_t *bns, int64_t *beg, int64_t mid, int64_t *end,
+	                          int rid_hint, int *rid);
 	int bns_intv2rid(const bntseq_t *bns, int64_t rb, int64_t re);
 
 #ifdef __cplusplus
@@ -190,6 +203,20 @@ extern "C" {
 static inline int64_t bns_depos(const bntseq_t *bns, int64_t pos, int *is_rev)
 {
 	return (*is_rev = (pos >= bns->l_pac))? (bns->l_pac<<1) - 1 - pos : pos;
+}
+
+/* Whether bns_pos2rid(bns, pos_f) == rid, tested from anns[rid] and
+ * anns[rid + 1] alone. For pos_f < l_pac, bns_pos2rid returns the largest rid
+ * with anns[rid].offset <= pos_f, or 0 when there is none (offsets are
+ * non-decreasing). That is `rid` exactly when rid is 0 or starts at or before
+ * pos_f, and rid is the last contig or the next one starts after pos_f. Uses
+ * anns[rid + 1].offset rather than offset + len so it stays exact whatever the
+ * gap between contigs. Requires 0 <= rid < n_seqs and 0 <= pos_f (bns_depos
+ * of any position in [0, 2 * l_pac) is). */
+static inline int bns_pos_in_rid(const bntseq_t *bns, int64_t pos_f, int rid)
+{
+	return pos_f < bns->l_pac && (rid == 0 || bns->anns[rid].offset <= pos_f) &&
+	       (rid + 1 == bns->n_seqs || pos_f < bns->anns[rid + 1].offset);
 }
 
 /* The pos2rid bucket whose bracket (entries b and b + 1) bns_intv2rid's
