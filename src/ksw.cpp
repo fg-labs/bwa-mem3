@@ -43,6 +43,9 @@
     #include "simd_compat.h"
 #else
     #include <emmintrin.h>
+    #if defined(__SSSE3__)
+        #include <tmmintrin.h>
+    #endif
 #endif
 
 #include "ksw.h"
@@ -666,6 +669,9 @@ static int ksw_global2_scalar(int qlen, const uint8_t *query, int tlen, const ui
  *     rather than a previous call's bytes. That needs an infeasible band,
  *     which production never passes; the reference reads uninitialized
  *     malloc memory there, so this is the one shape where the two can differ;
+ *   - the query profile is built with a 16-entry table lookup per 16 query
+ *     codes (NEON tbl, SSSE3 pshufb) where every code in the block is < m, and
+ *     one entry at a time otherwise (ksw_g2_query_profile);
  *   - rows outside the register window run the reference's plain loop (a 4x
  *     unroll of it measured slower on both Graviton4 and Zen4);
  *   - interior rows at w <= KSW_G2_WINDOW_WMAX (every row with w < i and
@@ -857,6 +863,51 @@ static inline T *ksw_g2_scratch_take(T *&buf, long &cap, long need, const char *
 	return buf;
 }
 
+/* The query profile qp[k*qlen + j] = mat[k*m + query[j]] (k < m), built a
+ * 16-entry table lookup per 16 query codes where the ISA has one (NEON tbl,
+ * SSSE3 pshufb), and one entry at a time otherwise. The table is row k of a
+ * zero-padded copy of mat, so lane c of it is mat[k*m + c] for every c < m; a
+ * block whose largest code is >= m is not looked up (its entries would not come
+ * from mat), and it and the rest of the row take the per-entry loop, which reads
+ * mat exactly as before. So every entry equals the per-entry loop's. */
+static inline void ksw_g2_query_profile(int8_t *qp, const uint8_t *query, int qlen, int m, const int8_t *mat)
+{
+#if defined(__aarch64__) || defined(__SSSE3__)
+	if (m >= 1 && m <= 8) {
+		int8_t tab[80];   // rows start at k*m <= 56; each reads 16 entries
+		memset(tab, 0, sizeof tab);
+		memcpy(tab, mat, (size_t)m * m);
+		for (int k = 0; k < m; ++k) {
+			int8_t *row = &qp[(long)k * qlen];
+			const int8_t *p = &mat[k * m];
+			int j = 0;
+#  if defined(__aarch64__)
+			const uint8x16_t T = vld1q_u8((const uint8_t *)&tab[k * m]);
+			for (; j + 16 <= qlen; j += 16) {
+				const uint8x16_t idx = vld1q_u8(&query[j]);
+				if (vmaxvq_u8(idx) >= (unsigned)m) break;
+				vst1q_u8((uint8_t *)&row[j], vqtbl1q_u8(T, idx));
+			}
+#  else
+			const __m128i T = _mm_loadu_si128((const __m128i *)&tab[k * m]);
+			const __m128i LIM = _mm_set1_epi8((char)(m - 1));
+			for (; j + 16 <= qlen; j += 16) {
+				const __m128i idx = _mm_loadu_si128((const __m128i *)&query[j]);
+				if (_mm_movemask_epi8(_mm_cmpeq_epi8(_mm_min_epu8(idx, LIM), idx)) != 0xFFFF) break;
+				_mm_storeu_si128((__m128i *)&row[j], _mm_shuffle_epi8(T, idx));
+			}
+#  endif
+			for (; j < qlen; ++j) row[j] = p[query[j]];
+		}
+		return;
+	}
+#endif
+	for (int k = 0, i = 0; k < m; ++k) {
+		const int8_t *p = &mat[k * m];
+		for (int j = 0; j < qlen; ++j) qp[i++] = p[query[j]];
+	}
+}
+
 static int ksw_global2_scalar_fast(int qlen, const uint8_t *query, int tlen, const uint8_t *target, int m, const int8_t *mat, int o_del, int e_del, int o_ins, int e_ins, int w, int *n_cigar_, uint32_t **cigar_)
 {
 	if (!n_cigar_ || !cigar_ || qlen <= 0 || tlen <= 0 || w < 0)
@@ -881,11 +932,7 @@ static int ksw_global2_scalar_fast(int qlen, const uint8_t *query, int tlen, con
 		qp = ksw_g2_scratch_take(scr.qp, scr.qp_cap, (long)qlen * m, "out of memory: qp");
 		eh = ksw_g2_scratch_take(scr.eh, scr.eh_cap, (long)qlen + 1, "out of memory: eh");
 	}
-	// generate the query profile
-	for (int k = 0, i = 0; k < m; ++k) {
-		const int8_t *p = &mat[k * m];
-		for (int j = 0; j < qlen; ++j) qp[i++] = p[query[j]];
-	}
+	ksw_g2_query_profile(qp, query, qlen, m, mat);
 	// fill the first row
 	int j;
 	eh[0].h = 0; eh[0].e = MINUS_INF;

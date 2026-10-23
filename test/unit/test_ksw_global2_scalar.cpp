@@ -1,8 +1,9 @@
 // test/unit/test_ksw_global2_scalar.cpp
 //
 // Differential byte-identity test for the tuned scalar ksw_global2 path
-// (ksw_global2_scalar_fast in src/ksw.cpp: per-thread buffers, the row loop,
-// the register-window interior rows at w <= 5, and the run-length traceback)
+// (ksw_global2_scalar_fast in src/ksw.cpp: per-thread buffers, the table-lookup
+// query profile, the row loop, the register-window interior rows at w <= 5, and
+// the run-length traceback)
 // against the verbatim scalar reference it replaces (ksw_global2_scalar_ref).
 //
 // The public ksw_global2 sends a wide band to a wavefront kernel on SIMD tiers,
@@ -188,6 +189,44 @@ TEST_CASE("ksw_global2 tuned scalar matches the reference on other alphabets and
                 if (ql != tl && w < feasible_floor(q, t)) continue;
                 check(q, t, 5, mat, gaps, w, ql * 100 + tl * 10 + w);
             }
+}
+
+// The query profile reads mat[k*m + code] for every query code, as the
+// reference does, including codes >= m (whose reads run past the m x m block).
+// Here mat is a larger buffer with a defined, nonzero tail, so those reads are
+// well defined and the tuned path must reproduce them exactly; the 16-code
+// blocks mix in-alphabet blocks (table lookup) with blocks holding a code >= m,
+// >= 16 or both (per-entry), on the largest alphabet with a table (m = 8) and
+// on one without (m = 9). The table lookup is compiled only for aarch64 and
+// SSSE3-capable x86 tiers; elsewhere every block takes the per-entry loop and the
+// test still checks the rest of the tuned path against the reference.
+TEST_CASE("ksw_global2 tuned scalar reads mat like the reference for codes outside the alphabet"
+          * doctest::test_suite("unit/ksw_global2")) {
+    Rng rnd{0xC0DE5u};
+    const int gaps[4] = {6, 1, 6, 1};
+    for (int m : {5, 8, 9}) {
+        // Largest index read: (m-1)*m + max code (255).
+        std::vector<int8_t> mat(static_cast<size_t>((m - 1) * m + 256));
+        const std::vector<int8_t> core = bwa_mat(m, 1, 4, -1);
+        for (size_t i = 0; i < mat.size(); ++i)
+            mat[i] = i < core.size() ? core[i] : static_cast<int8_t>(1 + rnd(4) - (rnd(2) ? 5 : 0));
+        for (int c = 0; c < 400; ++c) {
+            std::vector<uint8_t> t(40 + rnd(80));
+            for (auto &b : t) b = static_cast<uint8_t>(rnd(m));
+            std::vector<uint8_t> q = t;
+            for (auto &b : q)
+                if (rnd(9) == 0) b = static_cast<uint8_t>(rnd(m));
+            // Poison a few 16-code blocks with an out-of-alphabet code.
+            for (size_t j = 0; j + 16 <= q.size(); j += 16)
+                if (rnd(3) == 0) {
+                    const uint32_t kind = rnd(3);
+                    q[j + rnd(16)] = static_cast<uint8_t>(kind == 0 ? m + rnd(16 - m)
+                                                          : kind == 1 ? 16 + rnd(240) : m);
+                }
+            const int w = static_cast<int>(rnd(5));
+            check(q, t, m, mat, gaps, w > feasible_floor(q, t) ? w : feasible_floor(q, t), c);
+        }
+    }
 }
 
 TEST_CASE("ksw_global2 tuned scalar is unaffected by buffer reuse and size"
