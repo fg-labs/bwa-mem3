@@ -3518,13 +3518,14 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
     /* Cross-read SA resolution (default ON; BWA3_SA_PER_READ=1 restores the
      * per-read call for A/B).
      *
-     * get_sa_entries_prefetch is a 20-lane refill pipeline over independent
+     * get_sa_entries_prefetch is a multi-lane refill pipeline
+     * (SA_RESOLVE_LANES_DEFAULT lanes, FMI_search.cpp) over independent
      * compressed-SA walks. Calling it once per read starves it: the median read
-     * supplies ~13 positions, so mean lane occupancy is only 10.5/20 and ~20% of
-     * all walk rounds run with a SINGLE lane active (fully serialized DRAM
-     * latency). The whole batch's SMEMs are already resident in matchArray,
-     * rid-sorted and rid-grouped, so resolving a run of reads per call keeps the
-     * lanes full. Measured -21..-28% on MEM_SA / -2.0..-2.4% on kernel time,
+     * supplies ~13 positions, so when the pipeline was 20 lanes wide mean lane
+     * occupancy was only 10.5/20 and ~20% of all walk rounds ran with a SINGLE
+     * lane active (fully serialized DRAM latency). The whole batch's SMEMs are
+     * already resident in matchArray, rid-sorted and rid-grouped, so resolving a
+     * run of reads per call keeps the lanes full. Measured -21..-28% on MEM_SA / -2.0..-2.4% on kernel time,
      * byte-identical, across Graviton4 / Sapphire Rapids / Zen3.
      *
      * Order-preserving by construction: the per-read loop below consumes SMEM

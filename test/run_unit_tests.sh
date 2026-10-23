@@ -308,10 +308,10 @@ else
     fail "sa_resolve_parity_test (BWA3_SA_LANES=64): non-zero exit"
 fi
 
-# And at the two compiled-in defaults, 20 (arm64) and 40 (x86_64), so each
+# And at the two compiled-in defaults, 48 (arm64) and 40 (x86_64), so each
 # host's parity run exercises the other architecture's default too: the
 # no-env run above pins only whichever default this build compiled in.
-for lanes in 20 40; do
+for lanes in 48 40; do
     if OUT="$(cd "$HERE" && BWA3_SA_LANES=$lanes ./sa_resolve_parity_test "$FIXTURES/phix.fa" 2>&1)"; then
         if echo "$OUT" | grep -q "SA resolve PARITY PASS"; then
             ok "sa_resolve_parity_test (BWA3_SA_LANES=$lanes)"
