@@ -1154,9 +1154,12 @@ jobs:
       # copies and under the relation (RB_METH_REL=expand), banded, and a random
       # K cap and scoring per batch under the relation on the 16-bit kernels;
       # each fails if no --meth job was narrowed at K > 5 (under the relation,
-      # with a relation view checked against the scalar filter at K > 5). The
+      # with a relation view checked against the scalar filter at K > 5). Run 30
+      # groups pass-1 lanes by width class, as pass 0 does
+      # (BWA3_RESCUE_BAND_P1_EXACT=0), instead of by exact width. The
       # trailing argument is the job generator's seed. Run 1 is 100000 jobs,
-      # runs 2-11 30000, runs 12-16 10000, run 17 30000 and runs 18-29 10000.
+      # runs 2-11 30000, runs 12-16 10000, run 17 30000, runs 18-29 10000 and
+      # run 30 30000.
       # On x86 the kswv reference runs at the runner's tier,
       # which the harness prints ("kswv tier:"). Longer runs and real dumps are
       # manual. As above, a negative control (one banded job's te shifted) must
@@ -1178,6 +1181,28 @@ jobs:
             cat rb_nc16.log; echo "::error::16-bit negative control exited 0: the check missed an injected disagreement"; exit 1
           fi
           grep -q 'MISMATCHES=[1-9]' rb_nc16.log || { cat rb_nc16.log; echo "::error::16-bit negative control failed without reporting a MISMATCH"; exit 1; }
+          # The pass-1 grouping knob leaves every output unchanged, so the eq runs cannot tell
+          # whether run_jobs honours it. The grouping counters can: chunking jobs sorted by exact
+          # width minimises the sum of the groups' widths, so on the same jobs pass 1 must widen its
+          # lanes by strictly fewer diagonals with the knob on (the default) than with
+          # BWA3_RESCUE_BAND_P1_EXACT=0, and pass 0, which the knob must not touch, must compute the
+          # same cells either way.
+          grouping() { # <log> <env...>
+            local log=$1; shift
+            if ! BWA3_RESCUE_PRUNE_STATS=1 BWA3_RESCUE_BAND_COST=100000000 "$@" ./rescue_band_harness eq 3000 31 > "$log" 2>&1; then
+              cat "$log"; echo "::error::rescue_band_harness failed in the pass-1 grouping check ($*)"; exit 1
+            fi
+          }
+          counters() { sed -n 's/.*pass1 grouping: .*width_pad=\([0-9]*\) pass0_cells_padded=\([0-9]*\).*/\1 \2/p' "$1"; }
+          grouping rb_grp_exact.log env
+          grouping rb_grp_class.log env BWA3_RESCUE_BAND_P1_EXACT=0
+          read -r wp_exact p0_exact <<< "$(counters rb_grp_exact.log)"
+          read -r wp_class p0_class <<< "$(counters rb_grp_class.log)"
+          echo "pass-1 lane widening: exact width $wp_exact, width class $wp_class; pass-0 cells: $p0_exact, $p0_class"
+          [ -n "$wp_exact" ] && [ -n "$wp_class" ] && [ "$wp_exact" -lt "$wp_class" ] \
+            || { echo "::error::pass-1 exact-width grouping did not reduce lane widening ($wp_exact vs $wp_class)"; exit 1; }
+          [ -n "$p0_exact" ] && [ "$p0_exact" -gt 0 ] && [ "$p0_exact" = "$p0_class" ] \
+            || { echo "::error::BWA3_RESCUE_BAND_P1_EXACT changed pass 0's grouping ($p0_exact vs $p0_class cells)"; exit 1; }
           # The runs are independent and single-threaded, so they run side by
           # side, one per core (largest first). Each run's seed is its last
           # argument and names its log and exit-code files, so seeds must be
@@ -1189,6 +1214,7 @@ jobs:
           BWA3_RESCUE_BAND_COST=100000000 RB_MINSC=30 ./rescue_band_harness eq 30000 2
           BWA3_RESCUE_BAND_COST=100000000 BWA3_RESCUE_PRUNE_MAX_HITS=100000 ./rescue_band_harness eq 30000 3
           BWA3_RESCUE_BAND_COST=100000000 BWA3_RESCUE_BAND_SHIFT=0 ./rescue_band_harness eq 30000 4
+          BWA3_RESCUE_BAND_COST=100000000 BWA3_RESCUE_BAND_P1_EXACT=0 ./rescue_band_harness eq 30000 30
           BWA3_RESCUE_BAND_COST=100000000 BWA3_RESCUE_BAND_KERNEL=1 ./rescue_band_harness eq 30000 5
           BWA3_RESCUE_BAND_COST=100000000 BWA3_RESCUE_FSCAN=0 ./rescue_band_harness eq 30000 6
           BWA3_RESCUE_BAND_COST=100000000 RB_SCORING=random ./rescue_band_harness eq 30000 7

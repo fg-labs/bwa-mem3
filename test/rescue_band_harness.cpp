@@ -653,6 +653,7 @@ static int run_eq(std::vector<Job> &all_jobs, int k_default, int max_hits, int s
     std::unique_ptr<rescue_prune_scratch> sscratch(new rescue_prune_scratch());
     std::vector<rb_comp> cn, cs;
     long p1_band = 0, p1_guard = 0, band_hi = 0;
+    uint64_t p0_cells = 0, p1_cells = 0, p1_wpad = 0;   // counted only under BWA3_RESCUE_PRUNE_STATS=1
     long cls_n[128] = {0}, cls_mm[128] = {0};
     const bool negative_control = rescue_env_opt_in("RB_NEGATIVE_CONTROL");
     bool injected = false;
@@ -794,6 +795,8 @@ static int run_eq(std::vector<Job> &all_jobs, int k_default, int max_hits, int s
         const int nbd = band ? rescue_band_batch().partition(P.sp.data(), pn) : 0;
         nband += nbd;
         const uint64_t pb0 = rescue_band_batch().stats().p1_band, pg0 = rescue_band_batch().stats().p1_guard;
+        const uint64_t pc0 = rescue_band_batch().stats().p1_cells_pad, pw0 = rescue_band_batch().stats().p1_wpad;
+        const uint64_t c00 = rescue_band_batch().stats().cells_pad;
         run_batch(k.get(), P, nbd, p1_any);
         std::vector<char> banded(m, 0);
         for (int t = 0; t < m; t++) banded[t] = idx[t] >= 0 && rescue_band_batch().banded(idx[t]);
@@ -801,6 +804,9 @@ static int run_eq(std::vector<Job> &all_jobs, int k_default, int max_hits, int s
         ccap += (long)rescue_band_batch().stats().comp_cap;
         p1_band += (long)(rescue_band_batch().stats().p1_band - pb0);
         p1_guard += (long)(rescue_band_batch().stats().p1_guard - pg0);
+        p1_cells += rescue_band_batch().stats().p1_cells_pad - pc0;
+        p1_wpad += rescue_band_batch().stats().p1_wpad - pw0;
+        p0_cells += rescue_band_batch().stats().cells_pad - c00;
         rescue_band_batch().reset();
         // --- compare ---
         for (int t = 0; t < m; t++) {
@@ -877,6 +883,9 @@ static int run_eq(std::vector<Job> &all_jobs, int k_default, int max_hits, int s
            "scalar_vs_kswv_mismatch=%ld (te2 differs, unconsumed: %ld)\n",
            n, npass, nfull, nb1, nb2, nband, band_hi, p1_band, p1_guard, r2, ccap, nview, mism, view_mm, scal_mm,
            te2_diff);
+    if (rescue_band_enabled())
+        printf("  pass1 grouping: cells_padded=%llu width_pad=%llu pass0_cells_padded=%llu (BWA3_RESCUE_PRUNE_STATS=1 "
+               "only)\n", (unsigned long long)p1_cells, (unsigned long long)p1_wpad, (unsigned long long)p0_cells);
     printf("  scoring: batches=%ld valid=%ld pass0_bandable=%ld pass1_bandable=%ld K3=%ld K4=%ld K5=%ld K6=%ld K7=%ld K8=%ld "
            "mates_cut_to_8bit=%ld meth genomic=%ld neutral=%ld collapsed=%ld\n", nbatch, nvalid, nbandable, np1able, nk[3], nk[4],
            nk[5], nk[6], nk[7], nk[8], ntrunc, nmeth[1], nmeth[2],

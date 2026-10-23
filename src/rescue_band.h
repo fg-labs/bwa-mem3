@@ -151,10 +151,39 @@ struct rb_band { int32_t r0, r1, dlo, dhi, ub; };
 bool rescue_band_components(const rescue_prune_view &v, int tau, int xa, int xb,
                             std::vector<rb_comp> &out, int cap);
 
+/* Width class of a band of w diagonals: classes of 4 diagonals up to 16, of 8 up to 64, of 16 up to
+ * 128 and of 32 beyond. This and rb_group_key are RescueBandBatch::run_jobs internals, exported
+ * for test/unit/test_rescue_band_key.cpp. */
+static inline int rb_width_bucket(int w)
+{
+    return w <= 16 ? (w + 3) >> 2 : w <= 64 ? 4 + ((w - 16 + 7) >> 3) : w <= 128 ? 10 + ((w - 64 + 15) >> 4)
+                                                                                 : 14 + ((w - 128 + 31) >> 5);
+}
+
+/* Sort key of a band job in RescueBandBatch::run_jobs, which runs the jobs in key order in groups
+ * of RB_L lanes, each widened to its group's largest width: the width, then the row count.
+ * Pass 0 keys on the width class (exact_w false): lanes of one class then share their live-cell
+ * clipping (rb_dp_core), which measured better than grouping by the clipped width. Pass 1 keys on
+ * the exact width (exact_w true; BWA3_RESCUE_BAND_P1_EXACT=0 gives it the class key too): its
+ * groups are then mostly uniform, and only a group that straddles two widths widens a lane, so
+ * fewer of its cells are padding. Either way the grouping leaves every output unchanged (a lane
+ * only ever gains diagonals, and its result goes to its own parent). The width or class is clamped
+ * to 15 bits and the rows to 16, so the key stays a non-negative int32_t; jobs past a clamp share a
+ * group, as jobs of one class do. */
+static inline int32_t rb_group_key(bool exact_w, int w, int nrows)
+{
+    int k = exact_w ? w : rb_width_bucket(w);
+    if (k > 32767) k = 32767;
+    return (int32_t)(k << 16) | (nrows < 65535 ? nrows : 65535);
+}
+
 struct rescue_band_stats {
     uint64_t parents = 0, bands1 = 0, bands2 = 0, r2_band = 0, r2_kswv = 0, single = 0;
     uint64_t cells_req = 0, cells_pad = 0, hull_cells = 0, groups = 0, planned_no = 0, comp_cap = 0, tight = 0;
     uint64_t p1_band = 0, p1_kswv = 0, p1_guard = 0;
+    /* Pass 1's cells the kernel computed (as cells_pad for pass 0) and its lanes' widening: the sum
+     * over lanes of the group's width minus the lane's own (rb_group_key). */
+    uint64_t p1_cells_pad = 0, p1_wpad = 0;
 };
 
 /* Per-batch banding state, one per tid (mem_cache::rescue_band). mem_matesw_batch_pre plans (plan +
