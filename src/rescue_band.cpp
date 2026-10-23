@@ -794,37 +794,42 @@ static long rb_dp_core(rb_work &w, int W, int NR, int omax, int ominq, int omask
 }
 
 /* qe of the lanes in msk, read off row `row` (H in Hrow; gmax is those lanes' gmax, which this row
- * reached): the largest band index k in the row's computed range [klo, khi] whose LIVE cell holds
+ * reached): the largest band index k in the row's computed range [klo, khi] whose live cell holds
  * gmax -- the same cell rb_snapshot + lane_result find, without copying the row. Cells outside the
- * range are either never written (above khi: zero, and gmax > 0) or stale from earlier rows but dead
- * for every lane (below klo: j >= quanta, live mask 0), exactly the cells the snapshot masks out.
+ * range are never read: above khi they were never written (zero), and below klo they are stale from
+ * earlier rows but dead for every lane (j >= quanta), cells the snapshot masks out.
  * The index is kept as two bytes, k = chunk * 255 + off - 1: within a chunk of 255 indices the
- * match position is (match & kv) with kv = 1..255, so a plain max finds the largest matching k and
- * 0 means no match; the last matching chunk wins. A flushed lane always matches: its row max over
- * live cells was gmax in this row (FScan: the row max over H equals the row max over G, RB_CELL1).
- * Lanes outside msk keep their values. Cost: 2 loads + ~4 ops per cell-vector over the row's range,
- * against 3 loads + 4 ops + 1 store over all W slots for the row copy. */
+ * position kv = 1..255 of the last match is kept by one select per cell, scanning k upward, so 0
+ * means no match; the last matching chunk wins. A flushed lane always matches: its row max over live
+ * cells was gmax in this row (FScan: the row max over H equals the row max over G, RB_CELL1).
+ * Lanes outside msk keep their values.
+ *  - No live mask: every dead cell of a lane (j >= quanta, k <= row + o_l - quanta_l) lies below every
+ *    live one, and a lane in msk has a live cell holding gmax, so the largest matching k is live with
+ *    or without the mask; cells before the query start (j < 0) hold 0, and such a lane's gmax > 0.
+ *  - Two cells share one position vector kv (the even slot's): m1 keeps the odd slot's position less
+ *    one (at most 254), so both selects take the same kv, and since each slot's matches arrive in
+ *    increasing k, its last select holds its largest.
+ * Cost: 1 load + 2 ops per cell-vector over the row's range, against 3 loads + 4 ops + 1 store over
+ * all W slots for the row copy. */
 static inline void rb_qe_scan(rb_work &w, const uint8_t *Hrow, int row, int W, int omax, int ominq,
                               uint8x16_t msk, uint8x16_t gmax)
 {
     const int khi = std::min(W - 1, row + omax), klo = std::max(0, row + ominq);
-    const uint8x16_t v1 = vdupq_n_u8(1), v2 = vdupq_n_u8(2);
+    const uint8x16_t v2 = vdupq_n_u8(2);
     uint8x16_t chunk = vld1q_u8(w.kb_chunk), off = vld1q_u8(w.kb_off);
-    const uint8_t *QL = w.QL.data();
     for (int k0 = klo, c = klo / 255; k0 <= khi; k0 = (c + 1) * 255, c++) {
         const int k1 = std::min(khi, c * 255 + 254);
         uint8x16_t m0 = vdupq_n_u8(0), m1 = vdupq_n_u8(0);
         uint8x16_t kv = vdupq_n_u8((uint8_t)(k0 - c * 255 + 1));
-        const uint8_t *hp = Hrow + (size_t)k0 * 16, *qp = QL + (size_t)(row + W - 1 - k0) * 16;   // p = row + W-1-k
+        const uint8_t *hp = Hrow + (size_t)k0 * 16;
         int k = k0;
-        for (; k + 1 <= k1; k += 2, hp += 32, qp -= 32, kv = vaddq_u8(kv, v2)) {
-            const uint8x16_t e0 = vandq_u8(vceqq_u8(vld1q_u8(hp), gmax), vld1q_u8(qp));
-            const uint8x16_t e1 = vandq_u8(vceqq_u8(vld1q_u8(hp + 16), gmax), vld1q_u8(qp - 16));
-            m0 = vmaxq_u8(m0, vandq_u8(e0, kv));
-            m1 = vmaxq_u8(m1, vandq_u8(e1, vaddq_u8(kv, v1)));
+        for (; k + 1 <= k1; k += 2, hp += 32, kv = vaddq_u8(kv, v2)) {
+            m0 = vbslq_u8(vceqq_u8(vld1q_u8(hp), gmax), kv, m0);
+            m1 = vbslq_u8(vceqq_u8(vld1q_u8(hp + 16), gmax), kv, m1);
         }
-        if (k <= k1) m0 = vmaxq_u8(m0, vandq_u8(vandq_u8(vceqq_u8(vld1q_u8(hp), gmax), vld1q_u8(qp)), kv));
-        const uint8x16_t mm = vmaxq_u8(m0, m1);
+        if (k <= k1) m0 = vbslq_u8(vceqq_u8(vld1q_u8(hp), gmax), kv, m0);
+        // m1 holds an odd-slot position less one (at most 254): add the one back where set
+        const uint8x16_t mm = vmaxq_u8(m0, vsubq_u8(m1, vtstq_u8(m1, m1)));
         const uint8x16_t any = vtstq_u8(mm, mm);
         off = vbslq_u8(any, mm, off);
         chunk = vbslq_u8(any, vdupq_n_u8((uint8_t)c), chunk);
@@ -847,15 +852,18 @@ static inline void rb_qe_scan(rb_work &w, const uint8_t *Hrow, int row, int W, i
  * written: 0, as in the one-row kernel). E slot k + 2, written by (r + 1, k + 1), was last read by
  * (r, k + 2) two steps earlier, so the in-place E buffer is safe. Every value each cell reads is the
  * one the one-row kernel reads (same buffers or the register copy of the same value), the row maxima
- * and the imp / te / flush bookkeeping are the same per row, the early exit is tested after each
- * row (row r + 1's updates are discarded when row r already qualifies), and qe comes from
- * rb_qe_scan on the same row and mask the snapshot would use. Pass 1 additionally flushes only
+ * and the imp / flush bookkeeping are the same per row (te: see set_te), the early exit is tested
+ * after each row (row r + 1's updates are discarded when row r already qualifies), and qe comes from
+ * rb_qe_scan on the same row the snapshot would use. Pass 1 additionally flushes only
  * lanes whose gmax already equals the target S: gmax never exceeds S (rescue_band.h), so a run
  * ending below S is superseded by the run that reaches S, and a lane that never reaches it fails
  * run_pass1's guard and is rerun through kswv, as before. */
-template <int SC>
-static long rb_dp_wave2(rb_work &w, int W, int NR, int omax, int ominq, int omaskq, bool early)
+/* EARLY (pass 1) is a template parameter: each pass gets its own copy, without the other's tests
+ * (rb_dp_wave2 below picks one, with the x86 kernel's signature). */
+template <int SC, bool EARLY>
+static long rb_dp_wave2_pass(rb_work &w, int W, int NR, int omax, int ominq, int omaskq)
 {
+    constexpr bool early = EARLY;
     constexpr bool Sym = SC != RB_SC_GEN;
     long computed = 0;
     const rb_consts<SC> K(w);
@@ -869,7 +877,25 @@ static long rb_dp_wave2(rb_work &w, int W, int NR, int omax, int ominq, int omas
     uint8x16_t gmax = vdupq_n_u8(0), pend = vdupq_n_u8(0);
     const uint8x16_t tgt = vld1q_u8(w.target);
     int rlast = NR - 1;
-    uint16x8_t te_lo = vdupq_n_u16(0), te_hi = vdupq_n_u16(0);
+    /* te, the last row a lane improved on, as its low and high bytes. Pass 0 writes it where each run
+     * of improving rows ends (flush_run): at the row that does not improve (flush, the run's last row
+     * being row - 1) or, for a run still open, at the end (pend, rlast). A lane's writes come in row
+     * order (two flushes of one row pair are disjoint: a lane in row r's did not improve at r, so it is
+     * not in r + 1's), so its last one is its last improvement, the value a write on every improving
+     * row leaves.
+     * Pass 1 filters flush by the target and can stop early, so it keeps the write on every improving
+     * row. Rows only grow, so the high byte stays 0 until the first write at a row >= 256. */
+    uint8x16_t te_lo8 = vdupq_n_u8(0), te_hi8 = vdupq_n_u8(0);
+    auto set_te = [&](uint8x16_t m, int row) {
+        te_lo8 = vbslq_u8(m, vdupq_n_u8((uint8_t)row), te_lo8);
+        if (row >= 256) te_hi8 = vbslq_u8(m, vdupq_n_u8((uint8_t)(row >> 8)), te_hi8);
+    };
+    /* The lanes in m whose improving run ended at `row` (H in Hrow, best g): their te (pass 0) and
+     * qe. Every flush goes through here, so the te write cannot be left out of one. */
+    auto flush_run = [&](uint8x16_t m, int row, const uint8_t *Hrow, uint8x16_t g) {
+        if (!early) set_te(m, row);
+        rb_qe_scan(w, Hrow, row, W, omax, ominq, m, g);
+    };
     /* Row-level update for `row` with row max rmax: R, imp, gmax, te, pend; returns the flush mask
      * (lanes whose improving run ended at row - 1; pass 1: only those already at their target). */
     auto row_update = [&](int row, uint8x16_t rmax, uint8x16_t rref) -> uint8x16_t {
@@ -878,9 +904,7 @@ static long rb_dp_wave2(rb_work &w, int W, int NR, int omax, int ominq, int omas
         uint8x16_t flush = vbicq_u8(pend, imp);
         if (early) flush = vandq_u8(flush, vceqq_u8(gmax, tgt));
         gmax = vbslq_u8(imp, rmax, gmax);
-        const uint16x8_t rv = vdupq_n_u16((uint16_t)row);
-        te_lo = vbslq_u16(vreinterpretq_u16_u8(vzip1q_u8(imp, imp)), rv, te_lo);
-        te_hi = vbslq_u16(vreinterpretq_u16_u8(vzip2q_u8(imp, imp)), rv, te_hi);
+        if (early) set_te(imp, row);
         pend = imp;
         rlast = row;
         return flush;
@@ -908,7 +932,7 @@ static long rb_dp_wave2(rb_work &w, int W, int NR, int omax, int ominq, int omas
             f = vmaxq_u8(h07, vqsubq_u8(f, vEI));
         }
         const uint8x16_t flush = row_update(r, rmax, rref);
-        if (rb_mask16(flush)) rb_qe_scan(w, Hp, r - 1, W, omax, ominq, flush, gmax);
+        if (rb_mask16(flush)) flush_run(flush, r - 1, Hp, gmax);
         std::swap(Hp, Ha);
         return early && vminvq_u8(vcgeq_u8(gmax, tgt)) == 0xFF;
     };
@@ -1051,7 +1075,7 @@ static long rb_dp_wave2(rb_work &w, int W, int NR, int omax, int ominq, int omas
         const uint8x16_t flush_a = row_update(r, rmax_a, rref_a);
         const uint8x16_t gmax_a = gmax;
         if (early && vminvq_u8(vcgeq_u8(gmax_a, tgt)) == 0xFF) {
-            if (rb_mask16(flush_a)) rb_qe_scan(w, Hp, r - 1, W, omax, ominq, flush_a, gmax_a);
+            if (rb_mask16(flush_a)) flush_run(flush_a, r - 1, Hp, gmax_a);
             std::swap(Hp, Ha);
             stop = true;
             break;
@@ -1059,20 +1083,28 @@ static long rb_dp_wave2(rb_work &w, int W, int NR, int omax, int ominq, int omas
         computed += khi_b - klo_b + 1;
         const uint8x16_t flush_b = row_update(r + 1, rmax_b, rref_b);
         if (rb_mask16(vorrq_u8(flush_a, flush_b))) {
-            if (rb_mask16(flush_a)) rb_qe_scan(w, Hp, r - 1, W, omax, ominq, flush_a, gmax_a);
-            if (rb_mask16(flush_b)) rb_qe_scan(w, Ha, r, W, omax, ominq, flush_b, gmax);
+            // disjoint: a lane in flush_a did not improve at row r, so it is not pending at r + 1
+            if (rb_mask16(flush_a)) flush_run(flush_a, r - 1, Hp, gmax_a);
+            if (rb_mask16(flush_b)) flush_run(flush_b, r, Ha, gmax);
         }
         uint8_t *t = Hp; Hp = Hb; Hb = Ha; Ha = t;
         stop = early && vminvq_u8(vcgeq_u8(gmax, tgt)) == 0xFF;
     }
     if (!stop && r < NR) single_row(r);
-    uint8x16_t fin = pend;
+    uint8x16_t fin = pend;   // the runs still open at the last row (pass 0: all of them)
     if (early) fin = vandq_u8(fin, vceqq_u8(gmax, tgt));
-    if (rb_mask16(fin)) rb_qe_scan(w, Hp, rlast, W, omax, ominq, fin, gmax);
-    vst1q_u16(w.te, te_lo);
-    vst1q_u16(w.te + 8, te_hi);
+    if (rb_mask16(fin)) flush_run(fin, rlast, Hp, gmax);
+    vst1q_u16(w.te, vreinterpretq_u16_u8(vzip1q_u8(te_lo8, te_hi8)));
+    vst1q_u16(w.te + 8, vreinterpretq_u16_u8(vzip2q_u8(te_lo8, te_hi8)));
     vst1q_u8(w.gmax, gmax);
     return computed;
+}
+
+template <int SC>
+static long rb_dp_wave2(rb_work &w, int W, int NR, int omax, int ominq, int omaskq, bool early)
+{
+    return early ? rb_dp_wave2_pass<SC, true>(w, W, NR, omax, ominq, omaskq)
+                 : rb_dp_wave2_pass<SC, false>(w, W, NR, omax, ominq, omaskq);
 }
 
 }  // namespace

@@ -595,6 +595,15 @@ generated jobs.
   unchanged (`BWA_MEM3_DEBUG_RESCUE_SKIP_XCHECK` compares every one against
   the per-region test). `BWA3_RESCUE_SKIP_REUSE=0` turns off the reuse and the
   sorted list.
+- **Fewer vector ops around the banded rescue DP and in the filter (NEON).** The
+  band kernel's query-end scan keeps each lane's last match with one select per
+  cell and no live mask (a lane's dead cells all lie below its live ones); pass 0
+  writes te, held as bytes, once per run of improving rows instead of on every
+  row; and each pass runs its own copy of the kernel. The pruning filter runs its
+  whole blocks of hit rows without the last block's lane mask. Output unchanged;
+  on AWS Graviton 4, 5M-pair WGS slice at `-t 16`: band pass 0 -2.7%, pass 1
+  -1.4%, filter -2.1%, user CPU -0.44%.
+  ([#623](https://github.com/fg-labs/bwa-mem3/pull/623))
 
 | Variable | Effect |
 |---|---|

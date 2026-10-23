@@ -2,17 +2,27 @@
  *
  *   rescue_band_kernel_eq <nconfigs> <seed>     exit 1 on any mismatch
  *
- * RB_NEGATIVE_CONTROL=1 shifts kernel 2's te in lane 0 of the first config after it runs, so a
- * working comparison must report MISMATCHES=1 and exit 1 (CI runs this first, as a self-test).
+ * RB_NEGATIVE_CONTROL=1 shifts kernel 2's te in lane 0 of the first config after it runs, and
+ * RB_NEGATIVE_CONTROL_QE=1 shifts kernel 2's query end in the first lane the query-end check compares,
+ * so a working comparison must report MISMATCHES=1 and exit 1 under either (CI runs both first, as
+ * self-tests).
  *
  * Runs the two-row kernel rb_dp_wave2 (kernel 2, the default) and the one-row fused kernel
  * rb_dp_core<true> (kernel 1) on the same synthetic 16-lane groups and compares every per-lane
- * output both produce: the best score (gmax), its first row (te) and every row maximum (R, which
- * feeds the suboptimal score). (Kernel 2 also reads the query end directly, kb_chunk / kb_off,
- * where kernel 1 snapshots rows; rescue_band_harness checks that end result against kswv.) The groups vary
- * the band width (1-96), the row count (1-260), each lane's query offset, quantum and length (so
- * lanes pad from different columns and the masked / unmasked split falls anywhere, including at the
- * last steps of a row pair), N bases, and the early-exit targets, in all three scoring forms
+ * output both produce: the best score (gmax), its first row (te), every row maximum (R, which feeds
+ * the suboptimal score), and the query end's band index. Kernel 2 reads the query end directly
+ * (kb_chunk / kb_off); kernel 1 snapshots the row and takes the largest index holding gmax. The two
+ * must name the same cell for every lane with gmax > 0; in early mode only for the lanes at their
+ * target, since kernel 2 records the query end only for those (the others fail run_pass1's guard and
+ * rerun through kswv). Early targets are, for 7 lanes in 8, the lane's best score without the early
+ * exit (kernel 1 run once more), so most early lanes reach theirs; the rest are random.
+ *
+ * The groups vary the band width (1-96, and one config in 16 at 200-600, so the query end spans
+ * several 255-index chunks), the row count (1-260, and one config in 8 at 256-855, half of them with
+ * the query placed near the last rows, so te reaches its high byte, up to 3), each lane's query
+ * offset, quantum and length (so lanes pad from different columns and the masked / unmasked split
+ * falls anywhere, including at the last steps of a row pair), N bases, and the early-exit targets,
+ * in all three scoring forms
  * (RB_SC_DFLT, RB_SC_SYM, RB_SC_GEN with random tables and gap costs). rescue_band_harness checks
  * end results against kswv; this checks the kernels' intermediate per-row output against each
  * other, which the end results do not always expose. */
@@ -109,12 +119,18 @@ int main(int argc, char **argv)
     const long n = atol(argv[1]);
     std::mt19937 rng((uint32_t)strtoul(argv[2], nullptr, 10));
     const bool negative_control = rescue_env_opt_in("RB_NEGATIVE_CONTROL");
-    long bad = 0, per_form[3] = {0, 0, 0};
+    bool qe_control = rescue_env_opt_in("RB_NEGATIVE_CONTROL_QE");   // cleared once injected
+    long bad = 0, per_form[3] = {0, 0, 0}, qe_lanes = 0;
     for (long t = 0; t < n; t++) {
         group_cfg c;
-        c.W = 1 + rng() % 96;
-        c.NR = 1 + rng() % 260;
-        const int q0 = 16 * (1 + rng() % 12), o0 = (int)(rng() % (c.W + 8)) - 4;
+        c.W = rng() % 16 == 0 ? 200 + rng() % 401 : 1 + rng() % 96;
+        const bool long_rows = rng() % 8 == 0;
+        c.NR = long_rows ? 256 + rng() % 600 : 1 + rng() % 260;
+        const int q0 = 16 * (1 + rng() % 12);
+        /* build() copies query column j to row j + W/2 - o, so the alignment ends near row
+         * len2 + W/2 - o: half of the long configs take o so that it lands in the last rows. */
+        const int o0 = long_rows && (rng() & 1) ? c.W / 2 + q0 - c.NR + (int)(rng() % 16)
+                                                 : (int)(rng() % (c.W + 8)) - 4;
         for (int l = 0; l < 16; l++) {
             c.quanta[l] = std::max(16, q0 - 16 * (int)(rng() % 2));
             c.len2[l] = c.quanta[l] - (int)(rng() % 16);
@@ -132,7 +148,6 @@ int main(int argc, char **argv)
         w1.A = w2.A; w1.QL = w2.QL; w1.REF = w2.REF;
         rb_work::fit(w1.H, w2.H.size()); rb_work::fit(w1.E, w2.E.size());
         rb_work::fit(w1.R, w2.R.size()); rb_work::fit(w1.SNAP, w2.SNAP.size());
-        for (int l = 0; l < 16; l++) w2.target[l] = w1.target[l] = early ? (uint8_t)(rng() % 120) : 0;
         memset(w2.kb_chunk, 0, 16); memset(w2.kb_off, 0, 16);
         if (form != 0) {   // a random table and gap costs; SYM shares one pair for both gap types
             for (int i = 0; i < 16; i++) w2.tbl[i] = (int8_t)((int)(rng() % 13) - 8);
@@ -143,20 +158,49 @@ int main(int argc, char **argv)
             memcpy(w1.tbl, w2.tbl, 16);
             w1.oe_del = w2.oe_del; w1.e_del = w2.e_del; w1.oe_ins = w2.oe_ins; w1.e_ins = w2.e_ins;
         }
+        if (early) {   // 7 lanes in 8: the lane's best score without the early exit
+            rb_work w0;
+            w0.A = w1.A; w0.QL = w1.QL; w0.REF = w1.REF;
+            rb_work::fit(w0.H, w1.H.size()); rb_work::fit(w0.E, w1.E.size());
+            rb_work::fit(w0.R, w1.R.size()); rb_work::fit(w0.SNAP, w1.SNAP.size());
+            memcpy(w0.tbl, w2.tbl, 16);
+            w0.oe_del = w2.oe_del; w0.e_del = w2.e_del; w0.oe_ins = w2.oe_ins; w0.e_ins = w2.e_ins;
+            memset(w0.target, 0, 16);
+            run_form(form, 1, w0, c, false);
+            for (int l = 0; l < 16; l++) w2.target[l] = rng() % 8 ? w0.gmax[l] : (uint8_t)(rng() % 120);
+        } else {
+            memset(w2.target, 0, 16);
+        }
+        memcpy(w1.target, w2.target, 16);
         run_form(form, 2, w2, c, early);
         run_form(form, 1, w1, c, early);
         if (negative_control && t == 0) w2.te[0]++;   // injected disagreement
         const int NRp = (c.NR + 15) & ~15;
-        const bool ok = !memcmp(w2.gmax, w1.gmax, 16) && !memcmp(w2.te, w1.te, sizeof w2.te)
-                        && !memcmp(w2.R.data(), w1.R.data(), (size_t)NRp * 16);
-        if (!ok) {
-            if (bad < 5) fprintf(stderr, "MISMATCH config %ld form %d W=%d NR=%d early=%d\n", t, form, c.W, c.NR, early);
+        int qe_bad = -1, compared = 0;
+        for (int l = 0; l < 16 && qe_bad < 0; l++) {
+            if (w1.gmax[l] == 0 || (early && w1.gmax[l] != w1.target[l])) continue;
+            compared++;
+            if (qe_control) { w2.kb_off[l] ^= 1; qe_control = false; }   // injected disagreement
+            int k1 = -1;
+            for (int k = c.W - 1; k >= 0; k--)
+                if (w1.SNAP[k * 16 + l] == w1.gmax[l]) { k1 = k; break; }
+            // a compared lane always has its gmax in the row (k1 >= 0), and kernel 2 must name that cell
+            if (k1 < 0 || k1 != (int)w2.kb_chunk[l] * 255 + (int)w2.kb_off[l] - 1) qe_bad = l;
+        }
+        qe_lanes += compared;
+        const bool g_ok = !memcmp(w2.gmax, w1.gmax, 16), te_ok = !memcmp(w2.te, w1.te, sizeof w2.te);
+        const bool r_ok = !memcmp(w2.R.data(), w1.R.data(), (size_t)NRp * 16);
+        if (!(g_ok && te_ok && r_ok && qe_bad < 0)) {
+            if (bad < 5)
+                fprintf(stderr, "MISMATCH config %ld form %d W=%d NR=%d early=%d:%s%s%s%s (qe lane %d)\n", t, form,
+                        c.W, c.NR, early, g_ok ? "" : " gmax", te_ok ? "" : " te", r_ok ? "" : " R",
+                        qe_bad < 0 ? "" : " qe", qe_bad);
             bad++;
             per_form[form]++;
         }
     }
-    printf("rescue_band_kernel_eq: %ld configs, MISMATCHES=%ld (DFLT %ld, SYM %ld, GEN %ld)\n", n, bad,
-           per_form[0], per_form[1], per_form[2]);
+    printf("rescue_band_kernel_eq: %ld configs, MISMATCHES=%ld (DFLT %ld, SYM %ld, GEN %ld), query ends compared %ld\n",
+           n, bad, per_form[0], per_form[1], per_form[2], qe_lanes);
     return bad != 0;
 #endif
 }
