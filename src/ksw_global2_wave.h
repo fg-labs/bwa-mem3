@@ -20,9 +20,9 @@
  * the dispatcher enters them only at w >= their minimum widths, all >= 3, see the
  * static_asserts in ksw.cpp), the
  * anti-diagonal SIMD kernel ksw_g2_wave (NEON/AVX2/AVX-512 -- same recurrence
- * and boundary seeding, differing in vector width and intrinsic spelling, and
- * in how a boundary chunk stores its direction bytes and the final score, see
- * Lemma 9)
+ * and boundary seeding, differing in vector width and intrinsic spelling, in
+ * how a boundary chunk stores its direction bytes and the final score (see
+ * Lemma 9), and, on NEON only, in a band-edge chunk's E/F masking (Lemma 8b))
  * returns a score, n_cigar and cigar[] byte-identical to ksw_global2_scalar.
  * The proof is empirically gated by test/unit/test_ksw_global2_wave.cpp
  * (differential parity vs the scalar oracle on randomized + edge inputs).
@@ -99,6 +99,22 @@
  * always false and evalid/inband always true -- exactly the conditions under
  * which the general branch reduces to the interior branch's unconditional
  * loads. The split is a pure throughput optimization with no semantic effect.
+ *
+ * LEMMA 8b (NEON band-edge fast path). A chunk with i0>0 and s-i0>lanes-1 has
+ * no lane with i==0 (i>=i0>=1) or j==0 (j=s-i>=s-i0-(lanes-1)>=1), so i0m and
+ * j0m are all false and the seeding leaves Hdiag unchanged. For a lane in band
+ * (iS(s)<=i<=iE(s), i.e. 2i-s in [-w,w] and j<=qlen-1): evalid reduces to
+ * j<i+w (i>=1 holds, j>=i-w-1 holds since j>=i-w, j<qlen holds), which fails
+ * only at j==i+w, i.e. 2i-s==-w; freset (j==max(0,i-w), with j>=1) holds only
+ * at j==i-w, i.e. 2i-s==w. Each needs s+w even and names at most one lane,
+ * i=(s-w)/2 and i=(s+w)/2, so the branch masks e and f with a compare of those
+ * lane indices against LANEID. Relative to i0 the E index (s-w)/2-i0 lies in
+ * [-w,0] (i0>=iS(s)>=(s-w)/2 and i0<=iE(s)<=(s+w)/2) and the F index
+ * (s+w)/2-i0 in [0,w], and ksw_g2_wave16_safe bounds w (tlen+W <= 32000), so
+ * the int16 kernel's casts are exact. Lanes past
+ * iE(s) may differ from the general branch; their direction bytes and ring
+ * values are never read by an in-band cell (Lemmas 7 and 9), exactly as for
+ * the general branch's own out-of-band lanes.
  *
  * LEMMA 9 (final score, last-write-wins). Column j=qlen-1 is visited at
  * diagonal s=i+(qlen-1), strictly increasing in i in both orderings; the last
@@ -774,29 +790,13 @@ static int ksw_g2_wave(int qlen,const uint8_t*query,int tlen,const uint8_t*targe
 	int*zoff=S.zoff.data(),*ziS=S.ziS.data(); long roff=0;
 	const int stride=S.stride, pad=S.pad;
 	int32_t*Hb=S.Hb.data(),*Eb=S.Eb.data(),*Fb=S.Fb.data();
-#if defined(__APPLE__)
-	// Apple-silicon fast path: carry the H/E/F ring slots as running loop state (advanced
-	// in the for-increment below) instead of recomputing them per diagonal via the #else
-	// path's double-modulo lambdas. Byte-identical -- it yields the same physical slot for
-	// each (s,ring) as ((d%3+3)%3)/((d%2+2)%2); hc/hd2 walk the size-3 H ring, efc/efp the
-	// size-2 E/F rings, initialized to the s=0 slots. Measured ~+1.5-2.7% on the isolated
-	// kernel with Apple clang across two Apple-silicon machines, and a wash with a modern
-	// Linux clang (which already optimizes the modulo form), so the win is gated here. The
-	// gate is really macOS-on-aarch64: __APPLE__ inside this __aarch64__-only kernel means
-	// Apple silicon (do NOT use APPLE_SILICON -- simd_compat.h defines it 1 for every
-	// aarch64 build, so it is true on Graviton too). It stands in for Apple's system clang,
-	// the toolchain macOS ships; a non-Apple clang on macOS still takes this path but gets
-	// the same harmless wash (still byte-identical), not a regression.
-	// KEEP IN SYNC with the #else lambdas below: both encode the SAME ring sizes (H=3,
-	// E/F=2); a ring-size change must update both forms or the two builds silently diverge.
+	// Carry the H/E/F ring slots as running loop state, advanced in the for-increment
+	// below: hc/hd2 walk the size-3 H ring and efc/efp the size-2 E/F rings, from the s=0
+	// slots, so each diagonal gets the same physical slot ((d%3+3)%3 / (d%2+2)%2) as
+	// recomputing it, with no modulo per diagonal. The walk encodes the ring depths
+	// (H=3, E/F=2; the efc/efp ^1 toggle works only for 2) that KswWaveScratch
+	// allocates and the x86 kernels' modulo lambdas use: change them together.
 	int hc=0,hd2=1,efc=0,efp=1;
-#else
-	// Portable form (every non-Apple build): recompute the ring slot per access via modulo.
-	// KEEP IN SYNC with the Apple incremental form above (same H=3, E/F=2 ring sizes).
-	auto Hs=[&](int d){return &Hb[(long)(((d%3)+3)%3)*stride];};
-	auto Es=[&](int d){return &Eb[(long)(((d%2)+2)%2)*stride];};
-	auto Fs=[&](int d){return &Fb[(long)(((d%2)+2)%2)*stride];};
-#endif
 	uint8_t*tpad=S.tpad.data(),*qpad=S.qpad.data();
 	for(int i=0;i<tlen;++i)tpad[pad+i]=target[i];
 	for(int j=0;j<qlen;++j)qpad[pad+j]=query[j];
@@ -806,13 +806,8 @@ static int ksw_g2_wave(int qlen,const uint8_t*query,int tlen,const uint8_t*targe
 	int32_t score; if(qlen==0)score=0; else if(qlen<=w)score=-(o_ins+e_ins*qlen); else score=MINUS_INF;
 	const int32x4_t VMINF=vdupq_n_s32(MINUS_INF); const int32x4_t LANEID={0,1,2,3};
 	const int Sdim=(tlen-1)+(qlen-1)+1;
-#if defined(__APPLE__)
 	for(int s=0;s<Sdim;++s, hc=(hc==2?0:hc+1), hd2=(hd2==2?0:hd2+1), efc^=1, efp^=1){
 		int32_t*Hc=&Hb[(long)hc*stride],*Ec=&Eb[(long)efc*stride],*Fc=&Fb[(long)efc*stride]; int32_t*Hd2=&Hb[(long)hd2*stride],*Ep1=&Eb[(long)efp*stride],*Fp1=&Fb[(long)efp*stride];
-#else
-	for(int s=0;s<Sdim;++s){
-		int32_t*Hc=Hs(s),*Ec=Es(s),*Fc=Fs(s); int32_t*Hd2=Hs(s-2),*Ep1=Es(s-1),*Fp1=Fs(s-1);
-#endif
 		int i_lo=s-(qlen-1); { int a=(s-w+1)>>1; if(a>i_lo)i_lo=a; } if(i_lo<0)i_lo=0;
 		int i_hi=s; { int a=(s+w)>>1; if(a<i_hi)i_hi=a; } if(i_hi>tlen-1)i_hi=tlen-1;
 		int zbase_s=(int)roff;                 // diagonal-major offset for this diagonal
@@ -825,6 +820,17 @@ static int ksw_g2_wave(int qlen,const uint8_t*query,int tlen,const uint8_t*targe
 				Hdiag=vld1q_s32(&Hd2[i0]);
 				e=vld1q_s32(&Ep1[i0]);
 				f=vld1q_s32(&Fp1[i0+1]);
+			} else if (i0>0 && s-i0>3) {
+				// Band-edge chunk clear of row 0 and column 0 (Lemma 8b): no lane has i == 0 or
+				// j == 0, so the seeding is a no-op, and an in-band lane's E is invalid only at
+				// 2i-s == -w and its F resets only at 2i-s == w, both on diagonals with s+w even.
+				Hdiag=vld1q_s32(&Hd2[i0]);
+				e=vld1q_s32(&Ep1[i0]);
+				f=vld1q_s32(&Fp1[i0+1]);
+				if (((s+w)&1)==0) {
+					e=vbslq_s32(vceqq_s32(LANEID,vdupq_n_s32((s-w)/2-i0)),VMINF,e);
+					f=vbslq_s32(vceqq_s32(LANEID,vdupq_n_s32((s+w)/2-i0)),VMINF,f);
+				}
 			} else {
 				iv=vaddq_s32(vdupq_n_s32(i0),LANEID);
 				jv=vsubq_s32(vdupq_n_s32(s),iv);
@@ -895,7 +901,9 @@ static int ksw_g2_wave(int qlen,const uint8_t*query,int tlen,const uint8_t*targe
  * both the current scalar fill (where 4 is a little faster) and a scalar tuned
  * for narrow bands (where 4 is slower), so WMIN=5. It was 16 before the byte
  * score index and whole-chunk boundary store; re-measure if either kernel
- * changes. */
+ * changes. Re-measured after the band-edge fast path (Lemma 8b) and the table
+ * query profile in the scalar fill: routing w = 4 here instead is neutral on
+ * the same replay (within 0.2%), so WMIN stays 5. */
 #define KSW_WAVE16_WMIN 5
 
 static int ksw_g2_wave16(int qlen,const uint8_t*query,int tlen,const uint8_t*target,int m,const int8_t*mat,int o_del,int e_del,int o_ins,int e_ins,int w,int*n_cigar_,uint32_t**cigar_,KswWaveScratch&S){
@@ -907,18 +915,8 @@ static int ksw_g2_wave16(int qlen,const uint8_t*query,int tlen,const uint8_t*tar
 	int*zoff=S.zoff.data(),*ziS=S.ziS.data(); long roff=0;
 	const int stride=S.stride, pad=S.pad;
 	int16_t*Hb=S.Hb16.data(),*Eb=S.Eb16.data(),*Fb=S.Fb16.data();
-#if defined(__APPLE__)
-	// Apple-silicon fast path: incremental ring-slot tracking (full rationale, gating, and
-	// the macOS-on-aarch64 / non-Apple-clang notes are in the int32 NEON kernel above).
-	// Byte-identical; measured ~+1.5-2.7% on Apple clang, a wash on a modern Linux clang.
-	// KEEP IN SYNC with the #else lambdas below (same H=3, E/F=2 ring sizes).
+	// Incremental ring slots, as in the int32 kernel above.
 	int hc=0,hd2=1,efc=0,efp=1;
-#else
-	// Portable form; KEEP IN SYNC with the Apple incremental form above (same H=3, E/F=2).
-	auto Hs=[&](int d){return &Hb[(long)(((d%3)+3)%3)*stride];};
-	auto Es=[&](int d){return &Eb[(long)(((d%2)+2)%2)*stride];};
-	auto Fs=[&](int d){return &Fb[(long)(((d%2)+2)%2)*stride];};
-#endif
 	uint8_t*tpad=S.tpad.data(),*qpad=S.qpad.data();
 	for(int i=0;i<tlen;++i)tpad[pad+i]=target[i];
 	for(int j=0;j<qlen;++j)qpad[pad+j]=query[j];
@@ -928,13 +926,8 @@ static int ksw_g2_wave16(int qlen,const uint8_t*query,int tlen,const uint8_t*tar
 	int score; if(qlen==0)score=0; else if(qlen<=w)score=-(o_ins+e_ins*qlen); else score=MINUS_INF;
 	const int16x8_t VMINF=vdupq_n_s16(KSW_VMINF16); const int16x8_t LANEID={0,1,2,3,4,5,6,7};
 	const int Sdim=(tlen-1)+(qlen-1)+1;
-#if defined(__APPLE__)
 	for(int s=0;s<Sdim;++s, hc=(hc==2?0:hc+1), hd2=(hd2==2?0:hd2+1), efc^=1, efp^=1){
 		int16_t*Hc=&Hb[(long)hc*stride],*Ec=&Eb[(long)efc*stride],*Fc=&Fb[(long)efc*stride]; int16_t*Hd2=&Hb[(long)hd2*stride],*Ep1=&Eb[(long)efp*stride],*Fp1=&Fb[(long)efp*stride];
-#else
-	for(int s=0;s<Sdim;++s){
-		int16_t*Hc=Hs(s),*Ec=Es(s),*Fc=Fs(s); int16_t*Hd2=Hs(s-2),*Ep1=Es(s-1),*Fp1=Fs(s-1);
-#endif
 		int i_lo=s-(qlen-1); { int a=(s-w+1)>>1; if(a>i_lo)i_lo=a; } if(i_lo<0)i_lo=0;
 		int i_hi=s; { int a=(s+w)>>1; if(a<i_hi)i_hi=a; } if(i_hi>tlen-1)i_hi=tlen-1;
 		int zbase_s=(int)roff;
@@ -946,6 +939,16 @@ static int ksw_g2_wave16(int qlen,const uint8_t*query,int tlen,const uint8_t*tar
 				Hdiag=vld1q_s16(&Hd2[i0]);
 				e=vld1q_s16(&Ep1[i0]);
 				f=vld1q_s16(&Fp1[i0+1]);
+			} else if (i0>0 && s-i0>7) {
+				// Band-edge chunk (Lemma 8b, see the int32 kernel). The lane indices lie in
+				// [-w, 0] and [0, w], and ksw_g2_wave16_safe bounds w, so they fit int16.
+				Hdiag=vld1q_s16(&Hd2[i0]);
+				e=vld1q_s16(&Ep1[i0]);
+				f=vld1q_s16(&Fp1[i0+1]);
+				if (((s+w)&1)==0) {
+					e=vbslq_s16(vceqq_s16(LANEID,vdupq_n_s16((int16_t)((s-w)/2-i0))),VMINF,e);
+					f=vbslq_s16(vceqq_s16(LANEID,vdupq_n_s16((int16_t)((s+w)/2-i0))),VMINF,f);
+				}
 			} else {
 				iv=vaddq_s16(vdupq_n_s16((int16_t)i0),LANEID);
 				jv=vsubq_s16(vdupq_n_s16((int16_t)(s-i0)),LANEID);   // j = (s-i0) - lane; avoids overflowing s=i+j
