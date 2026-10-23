@@ -32,6 +32,7 @@ bwa-mem3 vendors several libraries as git submodules. Building from source requi
 | autoconf, automake, autoconf-archive, libtool | `ext/htslib` runs `autoreconf -i && ./configure` during build | any recent |
 | pkg-config | htslib's `configure` uses it to locate zlib | any recent |
 | zlib development headers | htslib links against zlib | any recent |
+| `ld.lld` (optional, Linux + clang) | the default build links `bwa-mem3` with link-time optimization through lld (measured gains and conditions in the linked section); without it the build still succeeds, without LTO. See [Link-Time Optimization](../developer-guide/building.md#link-time-optimization-lto) | lld 18+ (`lld` / `lld-19`) |
 | libdeflate development headers | `src/fast_reader.c` uses libdeflate for BGZF block decode | any recent |
 | OpenMP runtime | `ext/libsais` uses OpenMP for parallel suffix-array construction | see notes below |
 | CMake 3.12+ | building bundled mimalloc (default; skip if you pass `USE_MIMALLOC=0`) | 3.12+ |

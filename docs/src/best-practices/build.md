@@ -112,6 +112,10 @@ Other cores (Neoverse N1 / Graviton2, Ampere, Cortex-A) were not measured.
   not run on older cores. It takes precedence over `ARM_TUNE`.
 - macOS builds keep the compiler's default tuning.
 
+## Install lld for link-time optimization (Linux)
+
+With clang on Linux, the default `make` links `bwa-mem3` with full link-time optimization when `ld.lld` is installed (`lld` or `lld-19` from apt.llvm.org on Debian/Ubuntu, `lld` on RHEL/Fedora). It measured 1.7% faster on AWS Graviton4 (NEON) and 3.1-3.5% faster on AMD Zen 4 (AVX-512BW), on an hg38 WGS slice (5M pairs at `-t 16`, 200k at `-t 1`) built with clang 19.1.7, with byte-identical output. Without lld the build prints a `NOTE` and links without LTO. `make -s print-BWA_LTO_MODE` shows which mode a build will use; see [Link-Time Optimization](../developer-guide/building.md#link-time-optimization-lto) for the modes, the measurements and the build-time cost.
+
 ## Profile-Guided Optimization (PGO)
 
 PGO adds 3–5% throughput on real workloads and is recommended for any

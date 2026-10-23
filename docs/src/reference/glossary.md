@@ -41,7 +41,7 @@ The SIMD-vectorized kernel implementing the inner loop of the Smith-Waterman ext
 A library implementing the suffix-array induced sorting (SAIS) algorithm. bwa-mem3 optionally uses libsais for FM-index construction, reducing indexing time compared to the default suffix-array builder. See [Performance improvements](../whats-different/performance.md).
 
 **LTO**
-Link-Time Optimization — a compiler mode that defers optimization to link time, enabling cross-compilation-unit inlining. Activated via `make lto-build`. See [Building from source](../developer-guide/building.md).
+Link-Time Optimization — a compiler mode that defers optimization to link time, enabling cross-compilation-unit inlining. On Linux, the default build links with full LTO when `CXX` and `CC` are both clang and a test link with `-fuse-ld=lld` succeeds, and without LTO otherwise (`LTO=` selects the mode). See [Building from source](../developer-guide/building.md#link-time-optimization-lto).
 
 **MAPQ**
 Mapping quality — a Phred-scaled probability that a read alignment is incorrectly mapped. Reported in SAM field 5. bwa-mem3 follows bwa-mem2 MAPQ semantics; chimera QC in methylation mode caps MAPQ at 1 for chimeric alignments. See [Output: SAM/BAM, headers, tags](../user-guide/output.md).

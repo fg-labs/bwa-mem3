@@ -1,6 +1,6 @@
 name: Install clang-19 (Linux)
 description: >-
-  Install clang-19 and libomp-19-dev from apt.llvm.org, trusting LLVM's archive
+  Install clang-19, lld-19 and libomp-19-dev from apt.llvm.org, trusting LLVM's archive
   signing key only after its fingerprint matches the pinned value.
 # clang-19 is the shipping/benchmarked compiler and the compiler-floor minimum
 # (see the Makefile's compiler version floor). Installed from apt.llvm.org via a
@@ -35,5 +35,9 @@ runs:
         sudo apt-get update
         # libomp-19-dev provides omp.h in clang-19's search path (libsais.c
         # uses -fopenmp); ubuntu's libomp-dev matches the distro clang, not 19.
-        sudo apt-get install -y clang-19 libomp-19-dev
+        # lld-19 is the linker the default build's LTO link needs (the
+        # Makefile's LTO block); without it the build drops to a non-LTO link
+        # with only a NOTE, so CI would no longer build what ships.
+        sudo apt-get install -y clang-19 lld-19 libomp-19-dev
         clang++-19 --version | head -1
+        ld.lld-19 --version | head -1

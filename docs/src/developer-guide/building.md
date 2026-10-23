@@ -11,6 +11,7 @@ This page documents every build target available in the Makefile and what each p
 - zlib development headers — htslib links against zlib.
 - libdeflate development headers — `src/fast_reader.c` uses libdeflate for BGZF block decode (htslib also links it transitively). Debian/Ubuntu: `libdeflate-dev`; RHEL/Fedora: `libdeflate-devel`; macOS: `brew install libdeflate` (the Makefile auto-detects the Homebrew prefix or honours `LIBDEFLATE_PREFIX`). **Amazon Linux 2023 ships no `libdeflate-devel`** — build *and install* it from source (e.g. libdeflate v1.22): `cmake -B build -DCMAKE_INSTALL_PREFIX=/usr/local -DLIBDEFLATE_BUILD_SHARED_LIB=OFF`, then `cmake --build build && sudo cmake --install build`, and set `LIBRARY_PATH=/usr/local/lib64:/usr/local/lib` (CMake installs to `lib` or `lib64` depending on the distro) before `make`.
 - OpenMP runtime — libsais uses OpenMP for parallel suffix-array construction. Linux + GCC: libgomp ships with the compiler, nothing extra to install. Linux + Clang: `libomp-dev` (Debian) / `libomp-devel` (RHEL). macOS: `brew install libomp`; the Makefile auto-detects the Homebrew prefix or honours `LIBOMP_PREFIX`.
+- `ld.lld` (optional, recommended with clang on Linux) — the default build links `bwa-mem3` with LTO through lld; without it the build still succeeds, without LTO. Debian/Ubuntu: `lld` (or `lld-19` from apt.llvm.org); RHEL/Fedora: `lld`; the LLVM release tarballs include it. See [Link-Time Optimization](#link-time-optimization-lto).
 - Git submodules initialised: `git submodule update --init --recursive`.
 
 See [Getting Started → Installation](../getting-started/installation.md) for the full per-platform install commands.
@@ -110,14 +111,39 @@ make pgo-clean
 
 ### Link-Time Optimization (LTO)
 
+The default build links the `bwa-mem3` binary with clang link-time optimization where the toolchain supports it, so a plain `make CXX=clang++ CC=clang` on Linux with `ld.lld` installed already produces an LTO binary. `LTO=` selects the mode:
+
+| `LTO=` | Effect |
+|---|---|
+| `auto` _(default)_ | Full LTO when `CXX` and `CC` are clang on Linux and a test compile + link with `-flto=full -ffat-lto-objects -fuse-ld=lld` against the system libraries the build links succeeds. Otherwise a non-LTO build, with a `NOTE` on stderr when clang is found but cannot be used (the test link fails, e.g. because `ld.lld` is not installed, or `CC` is not clang). |
+| `full` | Full (monolithic) LTO. Fails at parse time when it cannot be had: the test link fails, `CXX` or `CC` is not clang, or the host is macOS. |
+| `thin` | ThinLTO; same requirements. Measured 0.3-0.9% slower wall time than `full`, with a faster, parallel link. |
+| `off` | No LTO. |
+
+`LTO` resolves only for goals that build (clean-only goals leave it off), and `make -s print-BWA_LTO_MODE` prints the mode a build would use.
+
+What it needs: clang with `-ffat-lto-objects` (clang 18 and later; the build's floor is clang 19) for both `CXX` and `CC`, and `ld.lld` (Debian/Ubuntu `lld` or `lld-19`; it is included in the LLVM release tarballs). GCC builds, macOS builds (Apple clang has no `-ffat-lto-objects` for Mach-O) and `ASAN=1` / `MSAN=1` / `COVERAGE=1` builds link without LTO. Unlike `ld.bfd`, lld has no built-in library search path, so a library installed under `/usr/local` (the Amazon Linux libdeflate route above) needs the `LIBRARY_PATH` setting described there; without it the test link fails and the build falls back to no LTO. A packaged build (for example a conda recipe) gets LTO only if its build environment provides `ld.lld`; otherwise it builds exactly as before.
+
+Only the objects that go into the binary are compiled for LTO, and only the link that produces `bwa-mem3` is an LTO link. The objects are *fat* LTO objects: each `.o` carries native code as well as the bitcode the LTO link reads. `libbwa.a` therefore stays an ordinary static archive for anything else that links it (the standalone tests, the doctest suites in `test/`, out-of-tree harnesses): those links use the native code, GNU `ar` indexes it without an LTO plugin, and no test binary pays for an LTO link. Third-party libraries (`htslib`, `mimalloc`, `zlib-ng`) are linked without LTO; libsais is LTO'd with the rest.
+
+Measured on hg38 with clang 19.1.7 (HG00096 5M-pair WGS slice at `-t 16`, its first 200k pairs at `-t 1`), 6 rotated rounds per build, medians of the per-round change against `LTO=off`. Every LTO build was faster than `LTO=off` in all 6 rounds, and the SAM output (without `@PG`) was byte-identical across `off`, `thin` and `full` in every run, including `--compat=bwa-mem2` and, on x86, with `BWAMEM3_FORCE_TIER=avx2` and `avx512bw`.
+
+| Host | Run | `LTO=off` wall | `thin` wall / CPU | `full` wall / CPU |
+|---|---|---|---|---|
+| AWS Graviton4 `c8g.4xlarge` (NEON) | 5M, `-t 16` | 42.6 s | -1.2% / -1.2% | **-1.7% / -1.7%** |
+| AWS Graviton4 `c8g.4xlarge` (NEON) | 200k, `-t 1` | 29.5 s | -1.0% / -1.1% | **-1.7% / -1.7%** |
+| AMD Zen 4 `c7a.4xlarge` (AVX-512BW) | 5M, `-t 16` | 42.3 s | -2.8% / -3.1% | **-3.1% / -3.1%** |
+| AMD Zen 4 `c7a.4xlarge` (AVX-512BW) | 200k, `-t 1` | 27.4 s | -2.6% / -2.9% | **-3.5% / -3.8%** |
+
+The binary shrinks from 8.7 MB to 7.9 MB on arm64 and from 9.1 MB to 8.1 MB on x86 with full LTO.
+
+The gain comes from cross-file inlining of the glue around the SIMD kernels (seeding, chaining, the extension driver, paired-end post-processing); the kernels themselves are single translation units and do not change. On x86 the per-tier kernel objects keep their own ISA: the inliner does not move a function into a caller compiled for a narrower ISA, and a scan of the linked binaries for AVX-512 instructions finds them in the same functions with and without LTO. The cost is build time: the full-LTO link of `bwa-mem3` is single-threaded and adds about 15-20 s to a clean `-j16` build (ThinLTO: 2.5-6 s). For a faster edit-compile loop, build with `LTO=thin` or `LTO=off`.
+
+The older `lto-build` target is still available for GCC LTO and single-ISA cross-builds; it turns the default LTO off for its own build:
+
 ```bash
 make lto-build                                 # builds bwa-mem3.lto (native arch)
 make lto-build LTO_ARCH=avx2                   # explicit arch
-```
-
-LTO compiles bwa-mem3's own translation units with `-flto` (thin LTO on Clang, full LTO on GCC) plus `-fno-semantic-interposition` on GCC. Third-party libraries (`htslib`, `mimalloc`) are linked without LTO. Clean:
-
-```bash
 make lto-clean
 ```
 
@@ -140,6 +166,7 @@ make profile-clean
 | `USE_MIMALLOC` | `1` | Include mimalloc; set `0` to use the system allocator |
 | `ASAN` | _(unset)_ | Set to any non-empty value to enable AddressSanitizer (forces `USE_MIMALLOC=0`) |
 | `COVERAGE` | _(unset)_ | Set to enable `--coverage` + `-O0` for gcov line-level coverage |
+| `LTO` | `auto` | Link-time optimization: `auto`, `thin`, `full` or `off` (see [Link-Time Optimization](#link-time-optimization-lto)) |
 | `EXTRA_CXXFLAGS` | _(empty)_ | Appended to `CXXFLAGS`; forwarded through PGO / LTO targets |
 | `CXX` | `c++` | Compiler. Paired `CC` is auto-derived from `CXX` for libsais. |
 

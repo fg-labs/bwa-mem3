@@ -475,6 +475,64 @@ jobs:
       - name: Verify binary
         run: ./bwa-mem3 version
 
+      - name: Verify LTO mode
+        # The default build links bwa-mem3 with LTO only when the toolchain can
+        # (Makefile LTO block), and otherwise builds without it after a NOTE --
+        # so a clang row that lost ld.lld would stay green while testing a
+        # binary that does not ship. Assert the resolved mode instead: full LTO
+        # on the Linux clang rows (install-clang-19 installs lld-19), off on the
+        # gcc and macOS rows. `make -s print-BWA_LTO_MODE` re-runs the same
+        # parse-time probe with this row's compiler; it compiles nothing.
+        # The mode alone does not prove the link used it, so the step also
+        # dry-runs this row's build with src/main.o made newer than the binary
+        # (its timestamp is restored afterwards) and checks that the one
+        # bwa-mem3 link line carries that mode's flags. `-W` would not do: make
+        # does not pass it to the recursive makes both build paths go through.
+        env:
+          MATRIX_CXX: ${{ matrix.cxx }}
+          MATRIX_ARCH_FLAG: ${{ matrix.arch_flag }}
+          MATRIX_BASELINE_ARCH: ${{ matrix.baseline_arch || 'avx2' }}
+          MATRIX_USE_MIMALLOC: ${{ matrix.use_mimalloc }}
+        run: |
+          if [ "$RUNNER_OS" = Linux ] && [ "$MATRIX_CXX" != g++ ]; then expected=full; else expected=off; fi
+          got=$(make -s print-BWA_LTO_MODE CXX="$CXX" | tail -n 1)
+          echo "LTO mode: $got (expected $expected)"
+          if [ "$got" != "$expected" ]; then
+            echo "::error::LTO mode is '$got', expected '$expected' for this row"
+            exit 1
+          fi
+          if [ "$MATRIX_ARCH_FLAG" = "" ]; then
+            build_arg="BASELINE_ARCH=$MATRIX_BASELINE_ARCH"
+          else
+            build_arg="arch=$MATRIX_ARCH_FLAG"
+          fi
+          stamp="$RUNNER_TEMP/main.o.stamp"
+          dry="$RUNNER_TEMP/lto-link-dry-run.txt"
+          touch -r src/main.o "$stamp"
+          trap 'touch -r "$stamp" src/main.o' EXIT
+          touch src/main.o
+          make -n "$build_arg" CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC" > "$dry" 2>&1
+          link=$(grep -E -- ' -o bwa-mem3[^ ]*$' "$dry" || true)
+          n=$(printf '%s' "$link" | grep -c . || true)
+          if [ "$n" -ne 1 ]; then
+            echo "::error::expected one bwa-mem3 link line in the dry run, found $n"
+            exit 1
+          fi
+          if [ "$expected" = off ]; then
+            if printf '%s\n' "$link" | grep -q -- -flto; then
+              echo "::error::LTO mode is off but the bwa-mem3 link line has -flto"
+              exit 1
+            fi
+          else
+            for f in "-flto=$expected" -ffat-lto-objects -fuse-ld=lld; do
+              if ! printf '%s\n' "$link" | grep -q -- " $f\( \|$\)"; then
+                echo "::error::the bwa-mem3 link line lacks $f for LTO mode '$expected'"
+                exit 1
+              fi
+            done
+          fi
+          echo "bwa-mem3 link line carries LTO mode '$expected'"
+
       # `./bwa-mem3 version` above only proves the binary runs. The regression
       # script asserts what the banner actually says -- the SIMD floor and
       # runtime tier lines, and that BWAMEM3_FORCE_TIER downgrades the runtime
@@ -1013,6 +1071,16 @@ jobs:
         # no MAKE_ARGS and compiles nothing.
         if: matrix.canonical == true
         run: bash test/regression/make_clean_no_compiler_floor.sh
+
+      - name: Makefile LTO mode resolution
+        # Parse-time behaviour, like the step above: drives `make -s
+        # print-BWA_LTO_MODE`, which compiles nothing. Stubs stand in for gcc and
+        # for a clang without lld; this row's real clang-19 + lld-19 must resolve
+        # the default to full LTO (EXPECT_LTO).
+        if: matrix.canonical == true
+        env:
+          EXPECT_LTO: full
+        run: bash test/regression/make_lto_mode.sh
 
       - name: test/Makefile relink-on-library-change check
         # Post-build: dry-runs test/Makefile against the standalone binaries
