@@ -106,8 +106,9 @@ char **mem_gen_alt(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac
 		/* Pass meth_orig_query so each XA sub-entry regenerates under the SAME
 		 * NM/MD policy as the primary record. Omitting it silently falls back to
 		 * the literal predicate, so one record would report matrix-derived NM:i:
-		 * on the primary and conversion-counting NM inside its own XA:Z. */
-		t = mem_reg2aln(opt, bns, pac, l_query, query, &a->a[i], meth_orig_query);
+		 * on the primary and conversion-counting NM inside its own XA:Z.
+		 * The XA entry takes only the CIGAR and NM, so build no MD (want_md 0). */
+		t = mem_reg2aln(opt, bns, pac, l_query, query, &a->a[i], meth_orig_query, /*want_md=*/0);
 		str.l = 0;
 		kputs(bns->anns[t.rid].name, &str);
 		kputc(',', &str); kputc("+-"[t.is_rev], &str); kputl(t.pos + 1, &str);

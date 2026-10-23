@@ -5549,7 +5549,7 @@ static int mem_use_native_regen(const mem_opt_t *opt, const mem_alnreg_t *ar,
     return opt->meth_mode && meth_orig_query != NULL && ar->meth_hypothesis >= 0;
 }
 
-mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, int l_query, const char *query_, const mem_alnreg_t *ar, const char *meth_orig_query)
+mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, int l_query, const char *query_, const mem_alnreg_t *ar, const char *meth_orig_query, int want_md)
 {
     mem_aln_t a;
     int i, w2, tmp, qb, qe, NM, score, is_rev, last_sc = -(1<<30), l_MD;
@@ -5654,20 +5654,20 @@ mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *
     do {
         free(a.cigar);
         w2 = w2 < opt->w<<2? w2 : opt->w<<2;
-        a.cigar = bwa_gen_cigar3(regen_mat, opt->o_del, opt->e_del, opt->o_ins, opt->e_ins, w2, bns->l_pac, pac, qe - qb, (uint8_t*)&query[qb], rb, re, &score, &a.n_cigar, &NM, use_meth_orig);
+        a.cigar = bwa_gen_cigar4(regen_mat, opt->o_del, opt->e_del, opt->o_ins, opt->e_ins, w2, bns->l_pac, pac, qe - qb, (uint8_t*)&query[qb], rb, re, &score, &a.n_cigar, &NM, use_meth_orig, want_md);
         if (bwa_verbose >= 4) fprintf(stderr, "* Final alignment: w2=%d, global_sc=%d, local_sc=%d\n", w2, score, ar->truesc);
         if (score == last_sc || w2 == opt->w<<2) break; // it is possible that global alignment and local alignment give different scores
         last_sc = score;
         w2 <<= 1;
     } while (++i < 3 && score < ar->truesc - opt->a);
-    /* bwa_gen_cigar3 legitimately returns NULL (with n_cigar = 0) on its
+    /* bwa_gen_cigar4 legitimately returns NULL (with n_cigar = 0) on its
      * geometry rejects -- empty query, rb >= re, or a window bridging the
-     * forward/reverse strands -- and the strlen below would then read through
-     * NULL. A valid alnreg cannot produce any of those, so this is a guard on
+     * forward/reverse strands -- and the CIGAR moves below (and the strlen,
+     * when MD is built) would then read through NULL. A valid alnreg cannot produce any of those, so this is a guard on
      * the callee's contract, not an invariant the local control flow
      * establishes; keep it live in every build. */
-    xassert(a.cigar != NULL, "bwa_gen_cigar3 returned no CIGAR for a valid region");
-    l_MD = strlen((char*)(a.cigar + a.n_cigar)) + 1;
+    xassert(a.cigar != NULL, "bwa_gen_cigar4 returned no CIGAR for a valid region");
+    l_MD = want_md? strlen((char*)(a.cigar + a.n_cigar)) + 1 : 0; // no MD: the moves below carry only the CIGAR
     a.NM = NM;
     pos = bns_depos(bns, rb < bns->l_pac? rb : re - 1, &is_rev);
     a.is_rev = is_rev;
