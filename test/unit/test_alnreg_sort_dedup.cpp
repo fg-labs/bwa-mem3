@@ -1135,6 +1135,126 @@ TEST_CASE("the single-insert dedup is exact for the new record at any position"
     free(opt);
 }
 
+namespace {
+
+// m reference-separated records (distinct re, no pair redundant) at query
+// [qb, qe), scores 100, 90, ..., as the full dedup leaves them (sorted, ranks
+// stamped), so the single-insert precondition holds.
+std::vector<mem_alnreg_t> insert1_z(const mem_opt_t *opt, int m, int qb = 0, int qe = 100)
+{
+    std::vector<mem_alnreg_t> z;
+    for (int i = 0; i < m; ++i)
+        z.push_back(reg(1000 + 40000 * i, 1100 + 40000 * i, qb, qe, 100 - 10 * i, 0));
+    int fp = 0;
+    z.resize(static_cast<size_t>(mem_dedup_only_fixpoint(opt, static_cast<int>(z.size()), z.data(), &fp)));
+    REQUIRE(fp == 1);
+    REQUIRE(static_cast<int>(z.size()) == m);
+    return z;
+}
+
+// Insert b into z at pos and run both the full dedup and the single insert;
+// the records and the fixed-point flag must agree. Returns whether the single
+// insert took its fast path; *out (if given) gets its records.
+int insert1_vs_full(const mem_opt_t *opt, const std::vector<mem_alnreg_t> &z, const mem_alnreg_t &b, int pos,
+                    std::vector<mem_alnreg_t> *out = nullptr)
+{
+    std::vector<mem_alnreg_t> a(z);
+    a.insert(a.begin() + pos, b);
+    std::vector<mem_alnreg_t> e(a), ins(a);
+    int fpe = 0, fpi = -1, took = -1, tf = 0;
+    e.resize(static_cast<size_t>(mem_dedup_only_fixpoint(opt, static_cast<int>(e.size()), e.data(), &fpe)));
+    ins.resize(static_cast<size_t>(mem_dedup_only_insert1(opt, static_cast<int>(ins.size()), ins.data(),
+                                                          pos, &tf, &fpi, &took)));
+    REQUIRE(same_records(ins, e));
+    CHECK(fpi == fpe);
+    if (out) *out = ins;
+    return took;
+}
+
+}  // namespace
+
+TEST_CASE("the single-insert dedup places b at every by-score slot from every position"
+          * doctest::test_suite("unit/alnreg_sort_dedup")) {
+    // b's score puts its slot k at each of 0 .. m (first, middle, last), and b
+    // is inserted at every pos 0 .. m, so the scan's halves a[0, pos) and
+    // a[pos + 1, n) take every size, empty ones included. The fast path must
+    // take each case and land b at k, byte for byte as the full call. Then b
+    // copies one Z record's re, so a check fails in the first half (that record
+    // before pos) or the second (after), and the fallback's output must match
+    // the full call. (That the fallback undoes its rank restamps is checked by
+    // the randomized test's re_rejected count, which sees the rank hint; these
+    // short lists never reach the incremental re sort that reads it.)
+    mem_opt_t *opt = mem_opt_init();
+    unsigned long fast = 0, first_half_fail = 0, second_half_fail = 0;
+    for (int m = 2; m <= 6; ++m) {
+        const std::vector<mem_alnreg_t> z = insert1_z(opt, m);
+        for (int slot = 0; slot <= m; ++slot)
+            for (int pos = 0; pos <= m; ++pos) {
+                CAPTURE(m); CAPTURE(slot); CAPTURE(pos);
+                // re between Z records' on the reference, score between theirs by slot.
+                const mem_alnreg_t b = reg(21000 + 40000 * pos, 21100 + 40000 * pos, 0, 100, 105 - 10 * slot, 0);
+                std::vector<mem_alnreg_t> ins;
+                REQUIRE(insert1_vs_full(opt, z, b, pos, &ins) == 1);
+                CHECK(ins[static_cast<size_t>(slot)].re == b.re);
+                ++fast;
+            }
+        for (int pos = 0; pos <= m; ++pos)
+            for (int f = 0; f < m; ++f) {
+                CAPTURE(m); CAPTURE(pos); CAPTURE(f);
+                // Same re as Z[f] (and a disjoint query span, so only the re check trips).
+                const mem_alnreg_t b = reg(z[static_cast<size_t>(f)].re - 50, z[static_cast<size_t>(f)].re, 120, 140, 85, 1);
+                REQUIRE(insert1_vs_full(opt, z, b, pos) == 0);
+                if (f < pos) ++first_half_fail; else ++second_half_fail;
+            }
+    }
+    CHECK(fast == 135);              // sum of (m + 1)^2 over m = 2 .. 6
+    CHECK(first_half_fail == 55);    // pairs f < pos, f < m, pos <= m
+    CHECK(second_half_fail == 55);
+    free(opt);
+}
+
+TEST_CASE("the single-insert dedup breaks a score tie with b by rb, then qb, when placing it"
+          * doctest::test_suite("unit/alnreg_sort_dedup")) {
+    // b takes exactly the score of Z[s], so alnreg_slt's tie-break decides
+    // whether b lands just before Z[s] (slot s) or just after (slot s + 1).
+    // A slot search on fewer keys would put b on the wrong side of Z[s].
+    mem_opt_t *opt = mem_opt_init();
+    unsigned long by_rb = 0, by_qb = 0;
+    for (int m = 2; m <= 6; ++m) {
+        // rb decides: Z[i].rb = 1000 + 40000 i, b.rb = 21000 + 40000 pos, so
+        // b.rb < Z[s].rb exactly when pos < s.
+        const std::vector<mem_alnreg_t> z = insert1_z(opt, m);
+        for (int s = 0; s < m; ++s)
+            for (int pos = 0; pos <= m; ++pos) {
+                CAPTURE(m); CAPTURE(s); CAPTURE(pos);
+                const mem_alnreg_t b = reg(21000 + 40000 * pos, 21100 + 40000 * pos, 0, 100, 100 - 10 * s, 0);
+                std::vector<mem_alnreg_t> ins;
+                REQUIRE(insert1_vs_full(opt, z, b, pos, &ins) == 1);
+                CHECK(ins[static_cast<size_t>(pos < s ? s : s + 1)].re == b.re);
+                ++by_rb;
+            }
+        // qb decides: b has Z[s]'s score and rb, a distinct re and a disjoint
+        // query span ([0, 100) or [300, 400) against Z's [150, 250)), so it is
+        // not redundant with Z[s] and lands before it exactly when its qb is lower.
+        const std::vector<mem_alnreg_t> zq = insert1_z(opt, m, 150, 250);
+        for (int s = 0; s < m; ++s)
+            for (int lower = 0; lower <= 1; ++lower)
+                for (int pos = 0; pos <= m; ++pos) {
+                    CAPTURE(m); CAPTURE(s); CAPTURE(lower); CAPTURE(pos);
+                    const int qb = lower ? 0 : 300;
+                    const mem_alnreg_t b = reg(zq[static_cast<size_t>(s)].rb, zq[static_cast<size_t>(s)].re + 7,
+                                               qb, qb + 100, 100 - 10 * s, 0);
+                    std::vector<mem_alnreg_t> ins;
+                    REQUIRE(insert1_vs_full(opt, zq, b, pos, &ins) == 1);
+                    CHECK(ins[static_cast<size_t>(lower ? s : s + 1)].re == b.re);
+                    ++by_qb;
+                }
+    }
+    CHECK(by_rb == 110);   // sum of m * (m + 1) over m = 2 .. 6
+    CHECK(by_qb == 220);
+    free(opt);
+}
+
 TEST_CASE("each fast-sort order agrees with the comparator it stands in for"
           * doctest::test_suite("unit/alnreg_sort_dedup")) {
     // Fields drawn from tiny ranges so every equal-prefix branch of the orders is
