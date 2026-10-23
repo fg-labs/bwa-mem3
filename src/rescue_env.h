@@ -55,6 +55,10 @@
  *                                   instead of inline
  * BWA3_RESCUE_SCORE2_BITS     1     u8 kswv score2/te2 scan: visit only each lane's rows at or above
  *                                   minsc (0: walk every row)
+ * BWA3_RESCUE_PADCOLS         1     NEON u8 kswv: take the diagonal as is in a lane group's all-pad
+ *                                   query columns, where the score is provably 0 (0: gather it)
+ * BWA3_RESCUE_QE_REVSCAN      1     NEON kswv (8- and 16-bit): rescan a query-end block last to first
+ *                                   (0: first to last with a found mask)
  * BWA3_RESCUE_BAND            1     run rescue jobs as diagonal bands (NEON or AVX2 kernel)
  * BWA3_RESCUE_BAND_COST       auto  band a pass-0 parent iff its band cells cost less than this %
  *                                   of the hull's; auto is 0 (no pass-0 banding) where kswv runs
