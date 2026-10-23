@@ -168,6 +168,13 @@ static bool rb_shift_on()
     return on;
 }
 
+/* BWA3_RESCUE_BAND_P1_EXACT=0 gives pass 1 pass 0's width-class grouping (rb_group_key); for A/B. */
+static bool rb_p1_exact_on()
+{
+    static const bool on = rescue_env_on("BWA3_RESCUE_BAND_P1_EXACT");
+    return on;
+}
+
 static bool rb_stats_on()
 {
     static const bool on = rescue_env_opt_in("BWA3_RESCUE_PRUNE_STATS");
@@ -179,20 +186,22 @@ namespace {
 struct rb_global_stats {
     std::atomic<uint64_t> parents{0}, bands1{0}, bands2{0}, r2_band{0}, r2_kswv{0}, single{0};
     std::atomic<uint64_t> cells_req{0}, cells_pad{0}, hull_cells{0}, groups{0}, planned_no{0}, comp_cap{0}, tight{0};
-    std::atomic<uint64_t> p1_band{0}, p1_kswv{0}, p1_guard{0};
+    std::atomic<uint64_t> p1_band{0}, p1_kswv{0}, p1_guard{0}, p1_cells_pad{0}, p1_wpad{0};
     ~rb_global_stats()
     {
         if (!rb_stats_on()) return;
         fprintf(stderr, "[RESCUE_BAND] banded_parents=%llu tight_T1_planned=%llu declined_by_cost=%llu comp_cap=%llu "
                         "bands_r1=%llu single_band=%llu round2_banded=%llu round2_kswv=%llu bands_r2=%llu "
                         "groups=%llu cells_req=%llu cells_padded=%llu hull_cells_replaced=%llu "
-                        "pass1_banded=%llu pass1_kswv=%llu pass1_guard_fallback=%llu\n",
+                        "pass1_banded=%llu pass1_kswv=%llu pass1_guard_fallback=%llu pass1_cells_padded=%llu "
+                        "pass1_width_pad=%llu\n",
                 (unsigned long long)parents, (unsigned long long)tight, (unsigned long long)planned_no,
                 (unsigned long long)comp_cap, (unsigned long long)bands1, (unsigned long long)single,
                 (unsigned long long)r2_band, (unsigned long long)r2_kswv, (unsigned long long)bands2,
                 (unsigned long long)groups, (unsigned long long)cells_req,
                 (unsigned long long)cells_pad, (unsigned long long)hull_cells,
-                (unsigned long long)p1_band, (unsigned long long)p1_kswv, (unsigned long long)p1_guard);
+                (unsigned long long)p1_band, (unsigned long long)p1_kswv, (unsigned long long)p1_guard,
+                (unsigned long long)p1_cells_pad, (unsigned long long)p1_wpad);
     }
 };
 rb_global_stats g_rb_stats;
@@ -538,6 +547,7 @@ void RescueBandBatch::reset()
         g_rb_stats.tight += stats_.tight;
         g_rb_stats.p1_band += stats_.p1_band; g_rb_stats.p1_kswv += stats_.p1_kswv;
         g_rb_stats.p1_guard += stats_.p1_guard;
+        g_rb_stats.p1_cells_pad += stats_.p1_cells_pad; g_rb_stats.p1_wpad += stats_.p1_wpad;
         stats_ = rescue_band_stats();
     }
     /* regid2parent_ entries are rewritten by commit() for every regid of the next batch. */
@@ -1157,15 +1167,10 @@ static long __attribute__((noinline)) rb_kernel_run_general(int form, int kern, 
 }
 #endif
 
-static inline int rb_width_bucket(int w)
-{
-    return w <= 16 ? (w + 3) >> 2 : w <= 64 ? 4 + ((w - 16 + 7) >> 3) : w <= 128 ? 10 + ((w - 64 + 15) >> 4)
-                                                                                 : 14 + ((w - 128 + 31) >> 5);
-}
-
 /* Run jobs_ in groups of RB_L lanes. Pass 0 (pass1 == false) merges each lane into its parent
  * (ps_[parent]); pass 1 only needs each lane's gmax / first row / first column, stored in
- * p1res_[parent], and skips the row-max transpose. Stage counters cover pass 0 only. */
+ * p1res_[parent], and skips the row-max transpose. Stage counters cover pass 0, except pass 1's
+ * computed cells and lane widening (p1_cells_pad, p1_wpad). */
 void RescueBandBatch::run_jobs(bool pass1)
 {
 #if RB_HAVE_SIMD
@@ -1175,14 +1180,14 @@ void RescueBandBatch::run_jobs(bool pass1)
     rb_set_scoring(w, sc_);
     const int form = sc_.form();
     order_.resize(n);
+    /* Pass 0 groups by width class, pass 1 by exact width (rb_group_key has the why). */
+    const bool exact_w = pass1 && rb_p1_exact_on();
     for (int i = 0; i < n; i++) {
         order_[i] = i;
-        /* Group by width class, then rows: lanes of one group then share their live-cell clipping
-         * (rb_dp_core), which measured better than grouping by the clipped width. */
-        jobs_[i].key = (rb_width_bucket(jobs_[i].w) << 16) | std::min(jobs_[i].nrows, 65535);
+        jobs_[i].key = rb_group_key(exact_w, jobs_[i].w, jobs_[i].nrows);
     }
     std::sort(order_.begin(), order_.end(), [this](int a, int b) { return jobs_[a].key < jobs_[b].key; });
-    const bool st = rb_stats_on() && !pass1;
+    const bool st = rb_stats_on() && !pass1, st1 = rb_stats_on() && pass1;
     for (int g = 0; g < n; g += RB_L) {
         const int nl = std::min(RB_L, n - g);
         const job *L[RB_L];
@@ -1192,6 +1197,8 @@ void RescueBandBatch::run_jobs(bool pass1)
             W = std::max(W, L[l]->w);
             NR = std::max(NR, L[l]->nrows);
         }
+        if (st1)
+            for (int l = 0; l < nl; l++) stats_.p1_wpad += (uint64_t)(W - L[l]->w);
         if (st) {
             stats_.groups++;
             for (int l = 0; l < nl; l++) stats_.cells_req += (uint64_t)std::min(L[l]->w, L[l]->quanta) * L[l]->nrows;
@@ -1270,6 +1277,7 @@ void RescueBandBatch::run_jobs(bool pass1)
         const long computed = form == RB_SC_DFLT ? rb_kernel_run<RB_SC_DFLT>(kern, w, W, NR, omax, ominq, omaskq, pass1)
                                                  : rb_kernel_run_general(form, kern, w, W, NR, omax, ominq, omaskq, pass1);
         if (st) stats_.cells_pad += (uint64_t)RB_L * computed;
+        if (st1) stats_.p1_cells_pad += (uint64_t)RB_L * computed;
         /* Lane l's gmax, the first row reaching it and the first column holding it there. */
         auto lane_result = [&](int l) {
             const job &J = *L[l];

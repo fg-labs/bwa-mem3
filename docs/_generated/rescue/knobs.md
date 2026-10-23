@@ -24,4 +24,5 @@
 | `BWA3_RESCUE_BAND_P1_COST` | `130` | `src/rescue_band.cpp` | band a pass-1 job iff its per-row cells cost less than this % of kswv's |
 | `BWA3_RESCUE_BAND_KERNEL` | `2` | `src/rescue_band.cpp` | banded-DP kernel while BWA3_RESCUE_FSCAN is on: 0 original cell, 1 fused cell, 2 fused cell on two rows per step |
 | `BWA3_RESCUE_BAND_SHIFT` | `1` | `src/rescue_band.cpp` | shift each lane's band so a lane group's query offsets align |
+| `BWA3_RESCUE_BAND_P1_EXACT` | `1` | `src/rescue_band.cpp` | group pass-1 band lanes by exact band width (0: by width class, as pass 0) |
 | `BWA3_RESCUE_BAND_METH` | `1` | `src/bwamem_pair.cpp` | --meth banding (both passes, the group's matrix): 1 except on top of converted-copy pruning (EM-seq), 0 never, 2 or more always |
