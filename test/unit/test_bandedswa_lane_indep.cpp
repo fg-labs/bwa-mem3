@@ -374,6 +374,37 @@ void check_generated(int width, uint64_t seed, int nbatch)
     }
 }
 
+/// Pairs that drift to opposite diagonals: a query with a long insertion (its path runs right of
+/// the main diagonal, at offset +gap) or a long deletion (left of it, at -gap), with gaps cheap
+/// enough to follow for the lanes that can afford them. Mixed in one group, the surviving lanes
+/// narrow their bands to disjoint offset ranges, so the masked cell bodies (and their H-band
+/// test) run on lanes whose bands do not overlap -- disjoint-diagonal coverage on top of the
+/// generated batches above. 8-bit pairs stay inside the routing envelope.
+std::vector<ExtPair> make_staggered(std::mt19937_64 &rng, int n)
+{
+    std::vector<ExtPair> v(n);
+    for (int k = 0; k < n; k++) {
+        ExtPair &p = v[k];
+        const int gap = 25 + (int)(rng() % 30), at = 10 + (int)(rng() % 20);
+        const int len2 = 120 + (int)(rng() % 60);
+        p.h0 = 1 + (int)(rng() % 40);
+        p.target.resize(len2 + gap + 40);
+        for (auto &c : p.target) c = (uint8_t)(rng() % 4);
+        p.query.clear();
+        if (k & 1) {   // insertion: `gap` extra query bases at `at`
+            p.query.assign(p.target.begin(), p.target.begin() + at);
+            for (int q = 0; q < gap; q++) p.query.push_back((uint8_t)(rng() % 4));
+            p.query.insert(p.query.end(), p.target.begin() + at, p.target.begin() + (len2 - gap));
+        } else {       // deletion: the query skips `gap` target bases at `at`
+            p.query.assign(p.target.begin(), p.target.begin() + at);
+            p.query.insert(p.query.end(), p.target.begin() + at + gap, p.target.begin() + at + gap + (len2 - at));
+        }
+        for (auto &c : p.query)
+            if (rng() % 100 < 2) c = (uint8_t)(rng() % 4);
+    }
+    return v;
+}
+
 } // namespace
 
 TEST_CASE("bandedSWA lane independence: formerly coupled pairs score their scalar result in any group"
@@ -408,6 +439,37 @@ TEST_CASE("bandedSWA lane independence: formerly coupled pairs score their scala
 TEST_CASE("bandedSWA lane independence: generated 8-bit batches in any grouping"
           * doctest::test_suite("unit/bandedswa")) {
     check_generated(8, 0x1A9E0008ull, 16);
+}
+
+TEST_CASE("bandedSWA lane independence: 8-bit lanes on opposite diagonals score their scalar result"
+          * doctest::test_suite("unit/bandedswa")) {
+    // -A1 -B4, gap open 1 / extend 1, z-drop off in practice: every lane follows its indel and
+    // stays live, so the group's bands end up staggered.
+    const ExtScoring sc = scoring(1, 4, 1, 1, 1, 1, 250, 5, false);
+    const std::vector<Kernel> kernels = host_kernels();
+    REQUIRE(!kernels.empty());
+    for (const Kernel &k : kernels) {
+        std::mt19937_64 rng(0x57A66E2Dull);
+        const std::unique_ptr<IBandedPairWiseSW> bsw = k.make(sc);
+        long pairs = 0, bad = 0;
+        for (int bi = 0; bi < 24; bi++) {
+            const int w = bi % 3 == 0 ? 124 : 60 + (int)(rng() % 60);
+            const std::vector<ExtPair> batch = make_staggered(rng, 16 * (1 + (int)(rng() % 4)));
+            std::vector<const ExtPair *> ptrs;
+            for (const ExtPair &p : batch) ptrs.push_back(&p);
+            const std::vector<ExtResult> got = bwa_tests::score_bsw_batch(*bsw, ptrs, 8, w);
+            for (size_t q = 0; q < batch.size(); q++) {
+                const ExtResult want = bwa_tests::run_mem3_scalar(sc, batch[q], w);
+                pairs++;
+                if (got[q] == want) continue;
+                if (bad++ < 5)
+                    MESSAGE(k.name << " batch " << bi << " pair " << q << ": " << show(got[q])
+                                   << " vs scalar " << show(want) << " (w=" << w << ")");
+            }
+        }
+        INFO("kernel " << k.name << ", " << pairs << " pairs");
+        CHECK(bad == 0);
+    }
 }
 
 TEST_CASE("bandedSWA lane independence: generated 16-bit batches in any grouping"
