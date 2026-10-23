@@ -49,16 +49,23 @@ using bwa_tests::ExtResult;
 // under the given matrix. Returns the number of pairs whose SIMD result record
 // differs from the scalar oracle on ANY field (score, tle, gtle, qle, gscore,
 // max_off) -- an ambiguous-base regression can perturb a secondary field while
-// leaving score intact, so score alone is not a sufficient parity gate.
+// leaving score intact, so score alone is not a sufficient parity gate. When
+// `out` is given it receives the kernel's result records (pairs [0, n)); a
+// `compact_groups` >= 0 sets the 8-bit lane compaction (0 = off) instead of the
+// tier's default. With `compare_scalar` false the scalar oracle is skipped and 0 is
+// returned (for an output-only call whose records are compared elsewhere).
 int score_mismatches(int width, const int8_t mat[25], int a, int b,
-                     int n, int maxlen, unsigned long seed, int n_pct = 0) {
+                     int n, int maxlen, unsigned long seed, int n_pct = 0,
+                     std::vector<SeqPair> *out = nullptr, int compact_groups = -1,
+                     bool compare_scalar = true) {
     const int ambig = -1, o = 6, e = 1, end_bonus = 5, w = 100, zdrop = 100;
     const int STRIDE = maxlen + 256;
     BandedPairWiseSW bsw(o, e, o, e, zdrop, end_bonus, const_cast<int8_t*>(mat), a, b, 1);
+    if (compact_groups >= 0) bsw.set_lane_compaction(compact_groups, BSW_COMPACT_MIN_W_DEFAULT);
 
     std::vector<uint8_t> ref((size_t)STRIDE * n, 0), qer((size_t)STRIDE * n, 0);
     std::vector<SeqPair> pairs(((n + 63) / 64) * 64);   // SIMD-width round-up + slack
-    std::vector<ExtResult> oracle(n);
+    std::vector<ExtResult> oracle(compare_scalar ? n : 0);
     std::mt19937_64 rng(seed);
     std::uniform_int_distribution<int> lenD(40, maxlen);
 
@@ -88,13 +95,17 @@ int score_mismatches(int width, const int8_t mat[25], int a, int b,
         sp.idr = (int)((size_t)c * STRIDE); sp.idq = (int)((size_t)c * STRIDE);
         sp.seqid = c; sp.regid = c;
         sp.score = sp.tle = sp.gtle = sp.qle = sp.gscore = sp.max_off = -1;
-        ExtResult &O = oracle[c];
-        O.score = bsw.scalarBandedSWA(len2, s2, len1, s1, w, sp.h0,
-                                      &O.qle, &O.tle, &O.gtle, &O.gscore, &O.max_off);
+        if (compare_scalar) {
+            ExtResult &O = oracle[c];
+            O.score = bsw.scalarBandedSWA(len2, s2, len1, s1, w, sp.h0,
+                                          &O.qle, &O.tle, &O.gtle, &O.gscore, &O.max_off);
+        }
     }
     if (width == 8) bsw.getScores8(pairs.data(), ref.data(), qer.data(), (int32_t)n, 1, w);
     else            bsw.getScores16(pairs.data(), ref.data(), qer.data(), (int32_t)n, 1, w);
 
+    if (out) out->assign(pairs.begin(), pairs.begin() + n);
+    if (!compare_scalar) return 0;
     int diff = 0;
     for (int c = 0; c < n; ++c) {
         const SeqPair &p = pairs[c];
@@ -165,5 +176,53 @@ TEST_CASE("bandedSWA getScores16 matches scalar with ambiguous (N) bases (contro
     int8_t mat[25]; build_sym_mat(mat, 1, 4, -1);
     CHECK(score_mismatches(16, mat, 1, 4, 512, 400, 5, /*n_pct=*/10) == 0);
 }
+
+#if defined(__aarch64__)
+// Byte-identity guard for the aarch64 diagonal, not a statement of the intended score. The
+// 128-bit 8-bit kernel (SSE4.1 and NEON) has always added a cell's substitution score s as the
+// SBT_SPLIT8 halves (max(s, 0), max(-s, 0)), which split s = -128 into (0, 0): a -128 score adds
+// nothing. On aarch64 it now adds s with one USQADD instead, and maps -128 to 0 up front to keep
+// that pre-existing result (BSW8_SCORES_NOMIN8 in bandedSWA.cpp, used by both 8-bit drivers).
+// Pin it in each matrix arm, with lane compaction off and on: a matrix whose mismatch cells are
+// -128 (-B 128) scores every pair as the one whose mismatch cells are 0.
+// (The scalar oracle, the 16-bit kernel and the AVX2 / AVX-512 8-bit kernels subtract the full
+// 128. That pre-existing divergence of the 128-bit 8-bit kernel at -B 128 is out of scope here;
+// changing it is a deliberate output change that must update this test.)
+TEST_CASE("bandedSWA getScores8 (NEON) keeps the pre-existing -128 substitution result (0) in every matrix arm"
+          * doctest::test_suite("unit/bandedswa-asym")) {
+    // the arms: symmetric (XOR LUT), one freed cell (RANK1), two freed cells (AMAT)
+    for (int compact = 0; compact < 2; ++compact)
+    for (int arm = 0; arm < 3; ++arm) {
+        int8_t m128[25], m0[25];
+        for (int k = 0; k < 2; ++k) {
+            int8_t *mat = k ? m0 : m128;
+            const int b = k ? 0 : 128;
+            if (arm == 0) build_sym_mat(mat, 1, b, -1);
+            else build_ot_mat(mat, 1, b, -1);
+            if (arm == 2) mat[2 * 5 + 0] = 1;   // ref G (2), read A (0) freed as well (OB)
+        }
+        CAPTURE(arm);
+        CAPTURE(compact);
+        const int groups = compact ? BSW_COMPACT_GROUPS_NEON : 0;
+        REQUIRE(m128[0 * 5 + 1] == -128);
+        std::vector<SeqPair> r128, r0;
+        // The -128 run is compared to the zero-penalty run, not to the scalar oracle (which
+        // subtracts the full 128); the zero-penalty run is itself checked against the oracle,
+        // so two identically wrong kernel runs cannot pass.
+        (void) score_mismatches(8, m128, 1, 128, 256, 200, 6 + arm, /*n_pct=*/5, &r128, groups,
+                                /*compare_scalar=*/false);
+        CHECK(score_mismatches(8, m0, 1, 0, 256, 200, 6 + arm, /*n_pct=*/5, &r0, groups) == 0);
+        int diff = 0, scored = 0;
+        for (size_t c = 0; c < r0.size(); ++c) {
+            const SeqPair &x = r128[c], &y = r0[c];
+            scored += y.score > 0;
+            diff += x.score != y.score || x.tle != y.tle || x.gtle != y.gtle ||
+                    x.qle != y.qle || x.gscore != y.gscore || x.max_off != y.max_off;
+        }
+        CHECK(scored > 0);
+        CHECK(diff == 0);
+    }
+}
+#endif
 
 #endif // HAVE_BSW_VECTOR_8_16
