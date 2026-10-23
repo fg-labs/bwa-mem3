@@ -29,6 +29,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 *****************************************************************************************/
 
 #include "bwamem.h"
+#include "chain_seed_pool.h"
 #include "ext_reverse_copy.h"
 #include "read_memo.h"     /* --dedup-reads whole-read-pair memoization (Phase 1: measure-only) */
 #include "meth_xm.h"   /* meth_chem_t for the --meth chemistry default */
@@ -1983,19 +1984,20 @@ int mem_dedup_only_insert1(const mem_opt_t *opt, int n, mem_alnreg_t *a, int pos
 
 // return 1 if the seed is merged into the chain
 static int test_and_merge(const mem_opt_t *opt, int64_t l_pac, mem_chain_t *c,
-                          const mem_seed_t *p, int seed_rid, int tid)
+                          ChainSeedPool &pool, const mem_seed_t *p, int seed_rid)
 {
     int64_t qend, rend, x, y;
-    const mem_seed_t *last = &c->seeds[c->n-1];
+    const mem_seed_t *first = &pool.seed[c->link.head];
+    const mem_seed_t *last = &pool.seed[c->link.tail];
     qend = last->qbeg + last->len;
     rend = last->rbeg + last->len;
 
     if (seed_rid != c->rid) return 0; // different chr; request a new chain
-    if (p->qbeg >= c->seeds[0].qbeg && p->qbeg + p->len <= qend &&
-        p->rbeg >= c->seeds[0].rbeg && p->rbeg + p->len <= rend)
+    if (p->qbeg >= first->qbeg && p->qbeg + p->len <= qend &&
+        p->rbeg >= first->rbeg && p->rbeg + p->len <= rend)
         return 1; // contained seed; do nothing
 
-    if ((last->rbeg < l_pac || c->seeds[0].rbeg < l_pac) &&
+    if ((last->rbeg < l_pac || first->rbeg < l_pac) &&
         p->rbeg >= l_pac) return 0; // don't chain if on different strand
 
     x = p->qbeg - last->qbeg; // always non-negtive
@@ -2003,27 +2005,7 @@ static int test_and_merge(const mem_opt_t *opt, int64_t l_pac, mem_chain_t *c,
     if (y >= 0 && x - y <= opt->w && y - x <= opt->w &&
         x - last->len < opt->max_chain_gap &&
         y - last->len < opt->max_chain_gap) { // grow the chain
-        if (c->n == c->m)
-        {
-            mem_seed_t *auxSeedBuf = NULL;
-            int pm = c->m;
-            c->m <<= 1;
-            if (pm == SEEDS_PER_CHAIN) {  // re-new memory
-                /* CHN-11: was calloc; the zero-fill it did over [0, m) was pure
-                 * waste -- [0, n) is immediately overwritten by the memcpy below
-                 * and [n, m) by the shared memset that follows (identical to the
-                 * realloc branch). malloc leaves exactly the same final bytes. */
-                if ((auxSeedBuf = (mem_seed_t *) malloc(c->m * sizeof(mem_seed_t))) == NULL) { fprintf(stderr, "ERROR: out of memory auxSeedBuf\n"); exit(1); }
-                memcpy((char*) (auxSeedBuf), c->seeds, c->n * sizeof(mem_seed_t));
-                c->seeds = auxSeedBuf;
-            } else {  // new memory
-                // fprintf(stderr, "[%0.4d] re-allocing old seed, m: %d\n", tid, c->m);
-                if ((auxSeedBuf = (mem_seed_t *) realloc(c->seeds, c->m * sizeof(mem_seed_t))) == NULL) { fprintf(stderr, "ERROR: out of memory auxSeedBuf\n"); exit(1); }
-                c->seeds = auxSeedBuf;
-            }
-            memset((char*) (c->seeds + c->n), 0, (c->m - c->n) * sizeof(mem_seed_t));
-        }
-        c->seeds[c->n++] = *p;
+        pool.append(c, p);   /* may move the pool: first/last are dead here */
         return 1;
     }
     return 0; // request to add a new chain
@@ -3281,35 +3263,14 @@ static inline int meth_seed_to_orig(const bntseq_t *seed_bns,
 
 /* Open a new chain holding one seed: the new-chain body shared by the kbtree
  * path (chain_add_one_seed) and the flat index (ChainFlat::add), so the two
- * cannot drift. tmp->pos must already be set; the seed array comes from the
- * shared seed buffer, or from the heap (m = SEEDS_PER_CHAIN + 1, the ownership
- * marker every free site tests) once the buffer is full. */
+ * cannot drift. tmp->pos must already be set; the seed goes to the read's pool
+ * (chain_pool_drain gives the chain its seed array). */
 static inline void chain_init_new(mem_chain_t *tmp_, const bntseq_t *chain_bns,
-                                  mem_seed_t *seedBuf, int64_t *seedBufCount,
-                                  int64_t seedBufSize, int seqid,
+                                  ChainSeedPool &pool, int seqid,
                                   const mem_seed_t *seed_in, int rid, int8_t meth_hyp)
 {
     mem_chain_t &tmp = *tmp_;
-    tmp.n = 1; tmp.m = SEEDS_PER_CHAIN;
-    if((*seedBufCount + tmp.m) > seedBufSize)
-    {
-        tmp.m += 1;
-        /* CHN-16: dead tprof[PE13] counter removed. The allocation is guarded
-         * the same way test_and_merge guards its seed-buffer growth: an
-         * `assert` alone compiles out under NDEBUG, so a release build would
-         * fall through and dereference NULL at `tmp.seeds[0] = *seed_in`. */
-        if ((tmp.seeds = (mem_seed_t *)calloc(tmp.m, sizeof(mem_seed_t))) == NULL) { fprintf(stderr, "ERROR: out of memory tmp.seeds\n"); exit(1); }
-    }
-    else {
-        tmp.seeds = seedBuf + *seedBufCount;
-        *seedBufCount += tmp.m;
-    }
-    /* CHN-11: the per-new-chain memset(tmp.seeds, 0, ...) was dead. tmp.n == 1,
-     * so only slot 0 is live and it is overwritten immediately below; any
-     * further slots (the +1 overflow buffer, already calloc-zeroed) are never
-     * read while zero -- every seed read is bounded by c->n and each slot is
-     * written before n reaches it (test_and_merge: c->seeds[c->n++] = *p). */
-    tmp.seeds[0] = *seed_in;
+    pool.start(&tmp, seed_in);
     tmp.rid = rid;
     tmp.seqid = seqid;
     /* is_alt indexes the chain-side bns (original in --meth). */
@@ -3327,8 +3288,7 @@ static inline void chain_init_new(mem_chain_t *tmp_, const bntseq_t *chain_bns,
  * the previous inline body; only the call site differs. */
 static inline void chain_add_one_seed(const mem_opt_t *opt, int64_t l_pac,
                                       const bntseq_t *chain_bns, kbtree_t(chn) *tree,
-                                      mem_seed_t *seedBuf, int64_t *seedBufCount,
-                                      int64_t seedBufSize, int tid, int seqid,
+                                      ChainSeedPool &pool, int seqid,
                                       const mem_seed_t *seed_in,
                                       int rid, int8_t meth_hyp)
 {
@@ -3343,15 +3303,14 @@ static inline void chain_add_one_seed(const mem_opt_t *opt, int64_t l_pac,
     {
         kb_intervalp(chn, tree, &tmp, &lower, NULL); // find the closest chain
 
-        if (!lower || !test_and_merge(opt, l_pac, lower, seed_in, rid, tid))
+        if (!lower || !test_and_merge(opt, l_pac, lower, pool, seed_in, rid))
             to_add = 1;
     }
     else to_add = 1;
 
     if (to_add) // add the seed as a new chain
     {
-        chain_init_new(&tmp, chain_bns, seedBuf, seedBufCount, seedBufSize, seqid,
-                       seed_in, rid, meth_hyp);
+        chain_init_new(&tmp, chain_bns, pool, seqid, seed_in, rid, meth_hyp);
         kb_putp(chn, tree, &tmp);
         // CHN-12: (*num_seqid)++ removed with the dead num[] array (see mem_chain_seeds)
     }
@@ -3372,9 +3331,9 @@ static inline void chain_add_one_seed(const mem_opt_t *opt, int64_t l_pac,
  * (test_and_merge never changes a chain's pos), so add() refuses exactly that
  * insert -- before mutating anything -- and the caller replays the read's seeds
  * through the unchanged kbtree path from a clean start. Reads with more than
- * `cap` chains do the same, bounding the O(n) sorted insert. Replay rewinds
- * seedBufCount and frees any seed arrays the flat pass heap-grew, so the tree
- * path sees exactly the state it would have had from the first seed.
+ * `cap` chains do the same, bounding the O(n) sorted insert. Replay clears the
+ * read's seed pool, so the tree path sees exactly the state it would have had
+ * from the first seed.
  *
  * BWA3_CHAIN_FLAT_CAP (default 512, a non-negative integer) sets the cap. 0 sends
  * every read to the tree (the first new chain already meets the cap), and a small
@@ -3387,7 +3346,6 @@ struct ChainFlat {
     std::vector<int64_t> keys;         /* ascending pos */
     std::vector<uint32_t> ord;         /* ord[i] = chains index of keys[i] */
     std::vector<seed_rec_t> log;       /* this read's streamed seeds, for a replay */
-    int64_t seedbuf_start = 0;
     bool active = false;
 
     static constexpr int DEFAULT_CAP = 512;
@@ -3407,9 +3365,8 @@ struct ChainFlat {
         }();
         return c;
     }
-    void begin(int64_t seedBufCount) {
+    void begin() {
         chains.clear(); keys.clear(); ord.clear(); log.clear();
-        seedbuf_start = seedBufCount;
         active = true;
     }
     /* number of keys <= pos, i.e. the predecessor's rank + 1 */
@@ -3427,33 +3384,30 @@ struct ChainFlat {
     }
     /* Chain one seed. TIE / CAP: the tree must take this read (nothing mutated). */
     inline Verdict add(const mem_opt_t *opt, int64_t l_pac, const bntseq_t *chain_bns,
-                       mem_seed_t *seedBuf, int64_t *seedBufCount, int64_t seedBufSize,
-                       int tid, int seqid, const mem_seed_t *seed_in, int rid, int8_t meth_hyp)
+                       ChainSeedPool &pool, int seqid, const mem_seed_t *seed_in, int rid,
+                       int8_t meth_hyp)
     {
         const int64_t pos = seed_in->rbeg;
         const int r = rank_le(pos);
         if (r > 0) {
             mem_chain_t *lower = &chains[ord[r - 1]];
-            if (test_and_merge(opt, l_pac, lower, seed_in, rid, tid)) return OK;
+            if (test_and_merge(opt, l_pac, lower, pool, seed_in, rid)) return OK;
             if (keys[r - 1] == pos) return TIE;           /* equal key: tree decides */
         }
         if ((int)chains.size() >= cap()) return CAP;
         mem_chain_t tmp;
         tmp.pos = pos;
-        chain_init_new(&tmp, chain_bns, seedBuf, seedBufCount, seedBufSize, seqid,
-                       seed_in, rid, meth_hyp);
+        chain_init_new(&tmp, chain_bns, pool, seqid, seed_in, rid, meth_hyp);
         const uint32_t ci = (uint32_t)chains.size();
         chains.push_back(tmp);
         keys.insert(keys.begin() + r, pos);
         ord.insert(ord.begin() + r, ci);
         return OK;
     }
-    /* Undo the flat pass: free heap-owned seed arrays (m > SEEDS_PER_CHAIN, the
-     * marker every chain free site tests), rewind the seed buffer. */
-    void abandon(int64_t *seedBufCount) {
-        for (mem_chain_t &c : chains)
-            if (c.m > SEEDS_PER_CHAIN) free(c.seeds);
-        *seedBufCount = seedbuf_start;
+    /* Undo the flat pass: its chains own nothing, so dropping the read's seeds
+     * from the pool is the whole undo. */
+    void abandon(ChainSeedPool &pool) {
+        pool.clear();
         active = false;
     }
 };
@@ -3465,8 +3419,7 @@ struct ChainFlat {
  * from them instead of a second copy. */
 static inline void chain_add_seed(ChainFlat &cf, const mem_opt_t *opt, int64_t l_pac,
                                   const bntseq_t *chain_bns, kbtree_t(chn) *tree,
-                                  mem_seed_t *seedBuf, int64_t *seedBufCount,
-                                  int64_t seedBufSize, int tid, int seqid,
+                                  ChainSeedPool &pool, int seqid,
                                   const mem_seed_t *seed_in, int rid, int8_t meth_hyp,
                                   const seed_rec_t *prefix = NULL, int64_t prefix_n = 0)
 {
@@ -3476,20 +3429,19 @@ static inline void chain_add_seed(ChainFlat &cf, const mem_opt_t *opt, int64_t l
             rec.seed = *seed_in; rec.rid = rid; rec.meth_hyp = meth_hyp; rec.orig_ix = 0;
             cf.log.push_back(rec);
         }
-        const ChainFlat::Verdict v = cf.add(opt, l_pac, chain_bns, seedBuf, seedBufCount,
-                                            seedBufSize, tid, seqid, seed_in, rid, meth_hyp);
+        const ChainFlat::Verdict v = cf.add(opt, l_pac, chain_bns, pool, seqid, seed_in, rid,
+                                            meth_hyp);
         if (v == ChainFlat::OK) return;
         chain_stat(v == ChainFlat::TIE ? CHS_FLAT_DECLINED_TIE : CHS_FLAT_DECLINED_CAP);
-        cf.abandon(seedBufCount);
+        cf.abandon(pool);
         const seed_rec_t *rs = prefix ? prefix : cf.log.data();
         const int64_t n = prefix ? prefix_n : (int64_t)cf.log.size();
         for (int64_t i = 0; i < n; ++i)
-            chain_add_one_seed(opt, l_pac, chain_bns, tree, seedBuf, seedBufCount, seedBufSize,
-                               tid, seqid, &rs[i].seed, rs[i].rid, rs[i].meth_hyp);
+            chain_add_one_seed(opt, l_pac, chain_bns, tree, pool, seqid, &rs[i].seed,
+                               rs[i].rid, rs[i].meth_hyp);
         return;
     }
-    chain_add_one_seed(opt, l_pac, chain_bns, tree, seedBuf, seedBufCount, seedBufSize,
-                       tid, seqid, seed_in, rid, meth_hyp);
+    chain_add_one_seed(opt, l_pac, chain_bns, tree, pool, seqid, seed_in, rid, meth_hyp);
 }
 
 /* How many decoded hits ahead mem_chain_seeds prefetches the contig test's
@@ -3649,7 +3601,9 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
         static thread_local ChnTreeScratch chn_scratch;
         kbtree_t(chn) *tree = chn_scratch.t;
         static thread_local ChainFlat chn_flat;
-        chn_flat.begin(seedBufCount);
+        chn_flat.begin();
+        static thread_local ChainSeedPool chn_pool;
+        chn_pool.clear();
         mem_chain_v *chain = &chain_ar[l];
         size = 0;
 
@@ -3860,8 +3814,7 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
                      * order — the single-pass streaming path. No recs[] write,
                      * no order_seeds; byte-identical to buffering with the
                      * identity order but without the double memory traffic. */
-                    chain_add_seed(chn_flat, opt, l_pac, chain_bns, tree, seedBuf,
-                                   &seedBufCount, seedBufSize, tid, l,
+                    chain_add_seed(chn_flat, opt, l_pac, chain_bns, tree, chn_pool, l,
                                    &s, rid, meth_hyp);
                 }
                 else
@@ -3886,8 +3839,7 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
             // chaining helper. S5: equal-pos insertion order into the kbtree is
             // preserved (no dedup/compact beyond order_seeds).
             for (int64_t ri = 0; ri < nrec; ++ri)
-                chain_add_seed(chn_flat, opt, l_pac, chain_bns, tree, seedBuf,
-                               &seedBufCount, seedBufSize, tid, l,
+                chain_add_seed(chn_flat, opt, l_pac, chain_bns, tree, chn_pool, l,
                                &recs[ri].seed, recs[ri].rid, recs[ri].meth_hyp,
                                recs, ri + 1);
         } // reorder
@@ -3898,7 +3850,9 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
             /* ascending pos == the kbtree's in-order traversal (keys distinct) */
             size = (int)chn_flat.chains.size();
             kv_resize(mem_chain_t, *chain, size);
-            for (uint32_t oi : chn_flat.ord) chain->a[chain->n++] = chn_flat.chains[oi];
+            for (uint32_t oi : chn_flat.ord)
+                chain->a[chain->n++] = chain_pool_drain(chn_flat.chains[oi], chn_pool, seedBuf,
+                                                        &seedBufCount, seedBufSize);
             chn_flat.active = false;
         } else {
         size = kb_size(tree);
@@ -3906,7 +3860,8 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
 
         kv_resize(mem_chain_t, *chain, size);
 
-#define traverse_func(p_) (chain->a[chain->n++] = *(p_))
+#define traverse_func(p_) (chain->a[chain->n++] = chain_pool_drain(*(p_), chn_pool, seedBuf, \
+                                                                  &seedBufCount, seedBufSize))
         __kb_traverse(mem_chain_t, tree, traverse_func);
 #undef traverse_func
         }
@@ -4387,11 +4342,10 @@ static void worker_bwt(void *data, int seq_id, int batch_size, int tid)
      * grant, so that adjustment is gone.
      *
      * Dropping it only moves where a chain's seeds are allocated: on overflow
-     * chain_add_one_seed falls back to calloc and marks the chain with
-     * m == SEEDS_PER_CHAIN + 1. That flag is output-dead -- it is read only by
-     * the capacity-growth ladder in test_and_merge (which preserves
-     * seeds[0..n-1] either way) and by the `m > SEEDS_PER_CHAIN` free sites --
-     * so a chain's contents, and therefore every alignment, are unchanged. */
+     * chain_pool_drain (chain_seed_pool.h) gives the chain a heap array and
+     * marks it with m == SEEDS_PER_CHAIN + 1. That flag is output-dead -- it is
+     * read only by the `m > SEEDS_PER_CHAIN` free sites -- so a chain's
+     * contents, and therefore every alignment, are unchanged. */
     int seedBufSz = w->seed_scratch_size;
 
     mem_kernel1_core(w->fmi, w->opt,

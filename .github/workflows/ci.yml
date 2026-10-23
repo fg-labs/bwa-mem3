@@ -1772,10 +1772,12 @@ jobs:
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           HEADER_PARITY_WORK_DIR=/tmp/header-parity-asan \
           bash test/regression/header_parity.sh
-          # The flat chaining index frees any seed arrays it heap-grew and
-          # rewinds the seed buffer when it hands a read to the kbtree. A leak
-          # or use-after-free there changes no output byte, so only asan can
-          # see it; the fixture forces that hand-off on hundreds of reads.
+          # The flat chaining index clears the read's chain seed pool when it
+          # hands a read to the kbtree, which then rebuilds the read's chains
+          # in the pool and drains them into the seed window. A stale pool
+          # index or an overrun in that drain may change no output byte, so
+          # asan checks it; the fixture forces that hand-off on hundreds of
+          # reads.
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           bash test/regression/chain_flat_replay_identity.sh
           # Re-run the CLI-input safety test against the SAME asan binary. Its

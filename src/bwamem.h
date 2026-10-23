@@ -346,6 +346,10 @@ typedef struct abc {
 
 typedef struct {
     int32_t seqid, cseed;
+    /* n: the seed count. m: after chain_pool_drain (chain_seed_pool.h), only who
+     * owns `seeds` -- SEEDS_PER_CHAIN for the per-thread seed window,
+     * SEEDS_PER_CHAIN + 1 for a heap array, which the free sites test; it is not
+     * a capacity, and n may exceed it. */
     int32_t n, m, first, rid;
     /* meth_hypothesis lives in this bitfield word — NOT as a trailing byte — so
      * sizeof(mem_chain_t) is unchanged from upstream bwa-mem2 (48 B). This struct
@@ -372,8 +376,21 @@ typedef struct {
     int32_t  meth_hypothesis:2;        /* signed: needs -1; packs into the same 4-byte word (static_assert below) */
     float frac_rep;
     int64_t pos;
-    mem_seed_t *seeds;
+    /* While mem_chain_seeds chains a read, a chain's seeds live in the per-thread
+     * seed pool as a list linked by index (`link`: the pool indices of its first
+     * and last seed), so a merge appends without allocating, and `seeds` is not
+     * valid yet. When the read's chains are drained, each chain's seeds are
+     * copied, contiguous and in merge order, into the seed window (or a heap
+     * array of its own once the window is full) and `seeds` points at them;
+     * every reader after that sees only `seeds`. Same size as the pointer, so
+     * sizeof stays 48 (static_assert below and in bwamem.cpp). */
+    union {
+        mem_seed_t *seeds;
+        struct { int32_t head, tail; } link;
+    };
 } mem_chain_t;
+static_assert(sizeof(((mem_chain_t *) 0)->link) <= sizeof(mem_seed_t *),
+              "mem_chain_t::link must fit in the seeds pointer it shares storage with");
 
 typedef struct { size_t n, m, cc; mem_chain_t *a; int capped_w; } mem_chain_v;
 
