@@ -168,6 +168,7 @@ make profile-clean
 | `COVERAGE` | _(unset)_ | Set to enable `--coverage` + `-O0` for gcov line-level coverage |
 | `LTO` | `auto` | Link-time optimization: `auto`, `thin`, `full` or `off` (see [Link-Time Optimization](#link-time-optimization-lto)) |
 | `EXTRA_CXXFLAGS` | _(empty)_ | Appended to `CXXFLAGS`; forwarded through PGO / LTO targets |
+| `EXTRA_CFLAGS` | _(empty)_ | Appended last to the FASTQ reader's C flags (`-g -O3` plus the arch flags), e.g. `EXTRA_CFLAGS=-O0` to debug it; forwarded through the PGO targets, but not to `lto-build`'s inner build, which clears the command-line variables (an `EXTRA_CFLAGS` exported in the environment still reaches it) |
 | `CXX` | `c++` | Compiler. Paired `CC` is auto-derived from `CXX` for libsais. |
 
 ## Incremental builds and header dependencies

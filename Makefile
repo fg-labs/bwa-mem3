@@ -34,9 +34,10 @@ endif
 
 EXE=		bwa-mem3
 #CXX=		icpc
-# Pair CC with CXX for the toolchains we know about so libsais.c (the only
-# C TU in this build) doesn't silently fall back to make's default `cc`,
-# which can drift from CXX (e.g. CXX=icpx + CC=gcc would mix toolchains).
+# Pair CC with CXX for the toolchains we know about so the C TUs (libsais.c
+# and the FASTQ reader, src/fast_reader*.c and src/fr_fastq.c) don't silently
+# fall back to make's default `cc`, which can drift from CXX (e.g. CXX=icpx +
+# CC=gcc would mix toolchains). The compiler floor below checks $(CXX) only.
 ifeq ($(CXX), icpc)
 	CC= icc
 else ifeq ($(CXX), icpx)
@@ -622,6 +623,21 @@ DEFAULT_BUILD_GOAL ?= all
 
 CXXFLAGS+=	-g -O3 -std=gnu++14 -fpermissive $(ARCH_FLAGS) $(ASAN_FLAGS) $(LIBSAIS_OPENMP_CFLAGS) $(EXTRA_CXXFLAGS) #-Wall ##-xSSE2
 
+# The C TUs in $(OBJS) (src/fast_reader*.c, src/fr_fastq.c: the FASTQ reader)
+# get the C++ TUs' -g -O3 and $(ARCH_FLAGS). Outside sanitizer builds nothing
+# else gives CFLAGS an -O level, so without this they built at the compiler
+# default -O0. SRC_CFLAGS follows $(CFLAGS) on the .c.o line, so this -O3 wins
+# over an -O level in CFLAGS, from the environment or the command line (a
+# command-line CXXFLAGS, by contrast, replaces the C++ -O3). $(ASAN_FLAGS)
+# keeps sanitizer builds at their -O1. To change the reader's flags, e.g. to
+# debug it at -O0, use EXTRA_CFLAGS, which comes last.
+#
+# Not every C++ build mode reaches these TUs: COVERAGE=1 leaves them
+# uninstrumented (as it always has), and EXTRA_CXXFLAGS, which carries the PGO
+# and legacy lto-build flags, is C++ only. libsais is not compiled by .c.o and
+# keeps LIBSAIS_CFLAGS.
+SRC_CFLAGS = -g -O3 $(ARCH_FLAGS) $(ASAN_FLAGS) $(EXTRA_CFLAGS)
+
 # CXXFLAGS used for per-tier kernel TU compilation. Must NOT contain any
 # -m... ISA flag — each per-tier rule appends the right one.
 BASE_CXXFLAGS = -g -O3 -std=gnu++14 -fpermissive $(ASAN_FLAGS) $(LIBSAIS_OPENMP_CFLAGS) $(EXTRA_CXXFLAGS)
@@ -816,7 +832,7 @@ endif
 # silently fall through to make's built-in .c.o rule, which carries neither
 # $(INCLUDES) (libdeflate, zlib-ng, project headers) nor $(DEPFLAGS).
 .c.o:
-	$(CC) -c $(CFLAGS) $(LTO_CFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
+	$(CC) -c $(CFLAGS) $(LTO_CFLAGS) $(SRC_CFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
 
 # Per-tier kernel compile rules. Active only on x86_64 multi-tier builds.
 src/%.sse41.o: src/%.cpp
@@ -867,7 +883,7 @@ CALLOC_INTERPOSE_CXXFLAGS = -fno-builtin-malloc
 # cost a full rebuild, while a command-line flag change must. Same
 # write-only-if-changed trick as src/version.h below.
 FLAGS_STAMP = .build-flags
-FLAGS_SIG = CXX=$(CXX)|CC=$(CC)|CXXFLAGS=$(CXXFLAGS)|BASE_CXXFLAGS=$(BASE_CXXFLAGS)|CFLAGS=$(CFLAGS)|CPPFLAGS=$(CPPFLAGS)|INCLUDES=$(INCLUDES)|LIBSAIS_CFLAGS=$(LIBSAIS_CFLAGS)|LTO_CFLAGS=$(LTO_CFLAGS)|CALLOC_INTERPOSE_CXXFLAGS=$(CALLOC_INTERPOSE_CXXFLAGS)|TIERS=$(KERNEL_FLAGS_sse41),$(KERNEL_FLAGS_sse42),$(KERNEL_FLAGS_avx),$(KERNEL_FLAGS_avx2),$(KERNEL_FLAGS_avx512bw)
+FLAGS_SIG = CXX=$(CXX)|CC=$(CC)|CXXFLAGS=$(CXXFLAGS)|BASE_CXXFLAGS=$(BASE_CXXFLAGS)|CFLAGS=$(CFLAGS)|SRC_CFLAGS=$(SRC_CFLAGS)|CPPFLAGS=$(CPPFLAGS)|INCLUDES=$(INCLUDES)|LIBSAIS_CFLAGS=$(LIBSAIS_CFLAGS)|LTO_CFLAGS=$(LTO_CFLAGS)|CALLOC_INTERPOSE_CXXFLAGS=$(CALLOC_INTERPOSE_CXXFLAGS)|TIERS=$(KERNEL_FLAGS_sse41),$(KERNEL_FLAGS_sse42),$(KERNEL_FLAGS_avx),$(KERNEL_FLAGS_avx2),$(KERNEL_FLAGS_avx512bw)
 
 # Passed through the ENVIRONMENT and expanded double-quoted in the recipe, not
 # interpolated by make into single quotes. `printf '%s\n' '$(FLAGS_SIG)'` puts the
@@ -1268,8 +1284,10 @@ fast_reader_selftest: src/fast_reader.c test/fast_reader_selftest.c test/gz_test
 
 # Differential test: fr_fastq vs kseq, byte-identical record parsing. Links only
 # zlib + zlib-ng + libdeflate (kseq.h is header-only), so it needs no bwa-mem3 build.
-fr_fastq_diff_test: src/fr_fastq.c src/fast_reader.c test/fr_fastq_diff_test.c $(FAST_READER_TEST_DEP)
-	$(CC) -O2 -Wall -Wextra $(FAST_READER_TEST_INC) test/fr_fastq_diff_test.c src/fr_fastq.c src/fast_reader.c $(FAST_READER_TEST_LIB) -lz $(FAST_READER_TEST_ZLIBNG) -ldeflate -o $@
+# Built with $(SRC_CFLAGS), the flags the aligner's reader TUs get, so it checks
+# the parser at the shipped optimization level and ISA flags.
+fr_fastq_diff_test: src/fr_fastq.c src/fast_reader.c test/fr_fastq_diff_test.c $(FAST_READER_TEST_DEP) $(FLAGS_STAMP)
+	$(CC) $(SRC_CFLAGS) -Wall -Wextra $(FAST_READER_TEST_INC) test/fr_fastq_diff_test.c src/fr_fastq.c src/fast_reader.c $(FAST_READER_TEST_LIB) -lz $(FAST_READER_TEST_ZLIBNG) -ldeflate -o $@
 
 # Read+parse microbenchmark: kseq vs fr_fastq on a real FASTQ (no index/align).
 # Usage: ./fr_fastq_bench {kseq|frfastq} reads.fq[.gz] [reps]

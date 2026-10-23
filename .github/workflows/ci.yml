@@ -722,14 +722,26 @@ jobs:
         #     a mid-member-truncated .fq.gz must abort (err_fatal) through the full
         #     fast_reader -> fr_fastq -> bseq_read_fast chain, not swallow the
         #     corruption as clean EOF. Forked: the child must die by SIGABRT.
-        # Reader TUs only (no libbwa link), so no arch/CXX propagation is needed;
-        # run on every row for toolchain coverage.
+        #   - fr_fastq_diff_test: fr_fastq vs kseq, byte-identical record parsing,
+        #     built with the reader's shipped flags (-O3 plus the arch flags).
+        # Reader TUs only (no libbwa link); run on every row for toolchain
+        # coverage. fr_fastq_diff_test compiles with the row's arch flags and
+        # depends on .build-flags, so the row's arch= and USE_MIMALLOC are passed:
+        # it then checks the reader at the row's shipped ISA, and the stamp stays
+        # at the row's flags instead of a bare make's defaults.
+        env:
+          MATRIX_ARCH_FLAG: ${{ matrix.arch_flag }}
+          MATRIX_BASELINE_ARCH: ${{ matrix.baseline_arch || 'avx2' }}
+          MATRIX_USE_MIMALLOC: ${{ matrix.use_mimalloc }}
         run: |
-          make fast_reader_selftest bseq_read_pe_oob_test bseq_read_comment_copy_test bseq_read_truncated_gzip_test
+          if [ "$MATRIX_ARCH_FLAG" = "" ]; then row_arch="$MATRIX_BASELINE_ARCH"; else row_arch="$MATRIX_ARCH_FLAG"; fi
+          make fast_reader_selftest bseq_read_pe_oob_test bseq_read_comment_copy_test bseq_read_truncated_gzip_test fr_fastq_diff_test \
+            arch="$row_arch" CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
           ./fast_reader_selftest
           ./bseq_read_pe_oob_test
           ./bseq_read_comment_copy_test
           ./bseq_read_truncated_gzip_test
+          ./fr_fastq_diff_test
       - name: SoA pack matches the scalar fill (x86 8-bit batch wrappers)
         # Header-only standalone doctest binary: for randomized lane groups it
         # builds the AVX2 (and, on an AVX-512BW host, the AVX-512BW) 8-bit SoA
@@ -1063,6 +1075,18 @@ jobs:
         run: |
           MAKE_ARGS="CXX=$CXX USE_MIMALLOC=$MATRIX_USE_MIMALLOC" \
             bash test/regression/make_default_goal.sh
+
+      - name: Makefile reader C TUs build at -O3
+        # Parse-time check (make -n -B on one reader object), so it needs no
+        # built tree. Pins the reader's -O level: default -O3 with -g, not
+        # lowered by an environment CFLAGS, -O1 under ASAN, and EXTRA_CFLAGS last.
+        if: matrix.canonical == true
+        env:
+          MATRIX_ARCH_FLAG: ${{ matrix.arch_flag }}
+          MATRIX_USE_MIMALLOC: ${{ matrix.use_mimalloc }}
+        run: |
+          MAKE_ARGS="arch=$MATRIX_ARCH_FLAG CXX=$CXX USE_MIMALLOC=$MATRIX_USE_MIMALLOC" \
+            bash test/regression/make_c_opt_level.sh
 
       - name: Makefile compiler floor exempts clean goals
         # Parse-time behaviour, so it needs no built tree, but the canonical row
