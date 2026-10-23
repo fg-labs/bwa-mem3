@@ -4040,6 +4040,19 @@ int mem_kernel1_core(FMI_search *fmi,
     /* Pass 1: filter every read first, so the mate's filtered chains are
      * available to the mate-concordance-aware cap (--extend-mate-concordant) below. */
     for (int l=0; l<nseq; l++) {
+        /* Each read's chains are a separate heap buffer written by the chaining
+         * pass above, so the filter's first load from it is usually a miss the
+         * stream prefetcher cannot predict. Hint the next read's first two lines
+         * (its first 48-byte mem_chain_t can straddle both) while this read is
+         * filtered. Both addresses stay inside the list: p + 64 lies in the
+         * second chain when there is one, and a one-chain list hints its chain's
+         * last byte instead. A hint only: no value, control flow or allocation
+         * changes. */
+        if (l + 1 < nseq && chain_ar[l + 1].n > 0) {
+            const char *p = (const char *) chain_ar[l + 1].a;
+            __builtin_prefetch(p, 0, 3);
+            __builtin_prefetch(chain_ar[l + 1].n > 1 ? p + 64 : p + sizeof(mem_chain_t) - 1, 0, 3);
+        }
         chn = &chain_ar[l];
         chn->n = mem_chain_flt(opt, chn->n, chn->a, tid);
     }
