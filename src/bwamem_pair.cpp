@@ -662,19 +662,75 @@ static inline void matesw_orient(const uint8_t *ms, int l_ms, int is_rev, uint8_
     else memcpy(out, ms, (size_t)l_ms);
 }
 
-/* --rescue-kmer and pruning (rescue_prune_runs): length-sort each SIMD-width
- * partition of `sp[0,pcnt)` (8-bit below pcnt8, 16-bit above) so the narrowed
- * short windows group together --
- * getScores8/16 runs each SIMD-lane group out to the group's longest len1, so a
- * full fallback window mixed into a narrowed group wastes the saving. The
- * 8/16-bit split at pcnt8 is preserved by sorting each side independently.
- * Result-safe: aln[] and mmc->rescue_narrow_off[tid] are keyed by regid and seqBuf* by
- * idr/idq, so every key travels with the SeqPair it belongs to. */
-static void matesw_sort_partitions_by_len(SeqPair *sp, int64_t pcnt8, int64_t pcnt)
+/* A rescue job's sort key: its len1 and its index in the batch. */
+struct matesw_key { int32_t len1, idx; };
+
+/* This thread's key scratch, grown to at least n (capacity kept across batches; every batch
+ * rewrites the keys it reads). */
+static matesw_key *matesw_keys(int64_t n)
 {
-    auto by_len1 = [](const SeqPair &x, const SeqPair &y) { return x.len1 < y.len1; };
-    std::sort(sp, sp + pcnt8, by_len1);
-    if (pcnt > pcnt8) std::sort(sp + pcnt8, sp + pcnt, by_len1);
+    static thread_local std::vector<matesw_key> keys;
+    if ((int64_t)keys.size() < n) keys.resize((size_t)n);
+    return keys.data();
+}
+
+/* matesw_order's hyp for "every pair" (the non-meth batch, whatever the pairs' meth_hyp). */
+static const int MATESW_ANY_HYP = INT_MIN;
+
+/* The order mem_sam_pe_batch scores a rescue batch in, gathered into dst. Of sp[0, n) it takes
+ * the pairs whose meth_hyp is hyp (every pair for MATESW_ANY_HYP), 8-bit (KSW_XBYTE) pairs first
+ * and then 16-bit, each in array order, as sort_classify lays the batch out; returns how many it
+ * took and sets *n8_out to the 8-bit count. Then:
+ *
+ * - by_len (--rescue-kmer and pruning, rescue_prune_runs): length-sort each SIMD-width partition
+ *   so the narrowed short windows group together -- getScores8/16 runs each SIMD-lane group out to
+ *   the group's longest len1, so a full fallback window mixed into a narrowed group wastes the
+ *   saving. Each side of the 8/16-bit split is sorted independently, so the split is preserved.
+ * - part: the 8-bit pairs whose regid is_banded() (the banded parents) move to the front, stably,
+ *   so the kswv remainder keeps its length sort; *nb_out is their count.
+ *
+ * Result-safe: aln[] and mmc->rescue_narrow_off[tid] are keyed by regid and seqBuf* by idr/idq,
+ * so every key travels with the SeqPair it belongs to.
+ *
+ * The sort and the partition order an 8-byte (len1, idx) key per pair rather than the 72-byte
+ * SeqPairs, and the pairs are gathered once, in the final order. std::sort's control flow depends
+ * only on the outcomes of comp(a, b), and comp reads only len1, so sorting the keys makes the same
+ * comparisons as sorting the records did and yields the same permutation, ties included (they
+ * decide which pairs share a kswv lane group). The partition is RescueBandBatch::partition's
+ * stable partition. test_matesw_order.cpp checks both against the record-moving code. */
+template <class IsBanded>
+static int64_t matesw_order(const SeqPair *sp, int64_t n, int hyp, bool by_len, bool part,
+                            IsBanded is_banded, SeqPair *dst, int64_t *n8_out, int64_t *nb_out)
+{
+    xassert(n <= INT32_MAX, "matesw_order: batch index does not fit the key's int32_t");
+    matesw_key *keys = matesw_keys(n);
+    int64_t n8 = 0, nb = 0;
+    for (int64_t i = 0; i < n; i++) {
+        const SeqPair &s = sp[i];
+        if ((hyp != MATESW_ANY_HYP && s.meth_hyp != hyp) || !(s.h0 & KSW_XBYTE)) continue;
+        keys[n8++] = {s.len1, (int32_t)i};
+        if (part && is_banded(s.regid)) ++nb;
+    }
+    int64_t m = n8;
+    for (int64_t i = 0; i < n; i++) {
+        const SeqPair &s = sp[i];
+        if ((hyp != MATESW_ANY_HYP && s.meth_hyp != hyp) || (s.h0 & KSW_XBYTE)) continue;
+        keys[m++] = {s.len1, (int32_t)i};
+    }
+    if (by_len) {
+        auto by_len1 = [](const matesw_key &x, const matesw_key &y) { return x.len1 < y.len1; };
+        std::sort(keys, keys + n8, by_len1);
+        if (m > n8) std::sort(keys + n8, keys + m, by_len1);
+    }
+    int64_t a = 0, o = nb;
+    for (int64_t i = 0; i < n8; i++) {
+        const SeqPair &p = sp[keys[i].idx];
+        dst[nb > 0 && is_banded(p.regid) ? a++ : o++] = p;
+    }
+    for (int64_t i = n8; i < m; i++) dst[i] = sp[keys[i].idx];
+    *n8_out = n8;
+    *nb_out = nb;
+    return m;
 }
 
 /* T5/L3: RAII holder for mem_pair's per-thread scratch vectors. Retaining a
@@ -689,6 +745,19 @@ struct pair64_scratch {
     ~pair64_scratch() { free(v.a); }
 };
 } // namespace
+
+/* Test hook: matesw_order over sp[0, n) for every pair (any_hyp) or the pairs whose meth_hyp is
+ * hyp, with banded[regid] != 0 marking a banded parent (regid < n_regid; part when n_regid > 0).
+ * Returns the number of pairs gathered into dst; *n8_out is the 8-bit count and *nb_out the
+ * banded-parent count (the n_banded mem_sam_pe_batch_run gets). */
+int64_t bwamem3_matesw_order_by_index(const SeqPair *sp, int64_t n, bool any_hyp, int hyp, bool by_len,
+                                      const uint8_t *banded, int n_regid, SeqPair *dst, int64_t *n8_out,
+                                      int64_t *nb_out)
+{
+    auto is_banded = [&](int regid) { return regid >= 0 && regid < n_regid && banded[regid] != 0; };
+    return matesw_order(sp, n, any_hyp ? MATESW_ANY_HYP : hyp, by_len, n_regid > 0, is_banded, dst,
+                        n8_out, nb_out);
+}
 
 /* File-scope forward declaration of the dedup/patch entry point defined in
  * src/bwamem.cpp (kept default-free there). The `mat = NULL` default lives
@@ -1499,47 +1568,33 @@ int mem_sam_pe_batch(const mem_opt_t *opt, mem_cache *mmc,
         // regardless of grouping.
         int64_t scored = 0;
         for (int hyp = 1; hyp >= 0; --hyp) {
-            int64_t n8 = 0, n16 = 0;
-            // 8-bit pairs of this hyp first, then 16-bit, mirroring
-            // sort_classify's layout so mem_sam_pe_batch_run's split is valid.
-            for (int64_t i = 0; i < pcnt; ++i) {
-                SeqPair *s = &seqPairArray[i];
-                if (s->meth_hyp != hyp) continue;
-                if (s->h0 & KSW_XBYTE) scratch[n8++] = *s;
-            }
-            int64_t group_pcnt8 = n8;
-            for (int64_t i = 0; i < pcnt; ++i) {
-                SeqPair *s = &seqPairArray[i];
-                if (s->meth_hyp != hyp) continue;
-                if (!(s->h0 & KSW_XBYTE)) scratch[group_pcnt8 + (n16++)] = *s;
-            }
-            int64_t group_pcnt = n8 + n16;
+            /* This group's pairs, 8-bit first, length-sorted (--rescue-kmer and exact pruning, as
+             * in the non-meth path below: otherwise the narrowed windows sit mixed with full ones
+             * inside each SIMD group, paying the scan cost without collecting the saving; like the
+             * non-meth sort it covers the whole group, pairs pruning left at full length included
+             * (over the hit gate, N); the --meth pruning figures (rescue_prune_cost_ok) are whole
+             * runs with it), then the group's banded parents first (keyed by regid, which _pre bound
+             * across both groups; _pre plans --meth parents only where rescue_band_meth_on holds, as
+             * here). The batch is not created here: one that does not exist yet has no plans. */
+            const RescueBandBatch *pb = meth_band ? mmc->rescue_band[tid] : NULL;
+            int64_t group_pcnt8 = 0, group_banded = 0;
+            const int64_t group_pcnt =
+                matesw_order(seqPairArray, pcnt, hyp, meth_sort, pb != NULL && pb->has_plans(),
+                             [pb](int regid) { return pb->banded(regid); }, scratch,
+                             &group_pcnt8, &group_banded);
             scored += group_pcnt;
             if (group_pcnt == 0) continue;
 
-            /* --rescue-kmer and exact pruning: same length sort as the non-meth path
-             * below, applied per OT/OB partition -- otherwise the narrowed windows sit
-             * mixed with full ones inside each SIMD group, paying the scan cost without
-             * collecting the saving. Like the non-meth sort it covers the whole group,
-             * pairs pruning left at full length included (over the hit gate, N);
-             * the --meth pruning figures (rescue_prune_cost_ok) are whole runs with it. */
-            if (meth_sort)
-                matesw_sort_partitions_by_len(scratch, group_pcnt8, group_pcnt);
-
             /* Banding for this group (rescue_band_meth_on): the band kernels score with the group's
-             * matrix (rb_scoring::set_matrix), its banded parents come first (partition is keyed by
-             * regid, which _pre bound across both groups; _pre plans --meth parents only where
-             * rescue_band_meth_on holds, as here), pass 1 follows, and the round-2 / guard fallbacks
-             * run through this group's kswv object. */
+             * matrix (rb_scoring::set_matrix), its banded parents come first (above), pass 1
+             * follows, and the round-2 / guard fallbacks run through this group's kswv object. */
             RescueBandBatch *gband = NULL;
-            int64_t group_banded = 0;
             if (meth_band) {
                 rb_scoring gsc = meth_band_sc;
                 gsc.set_matrix(hyp == 1 ? opt->mat_ot : opt->mat_ob);
                 gband = &matesw_band(mmc, tid);
                 band_reset.b = gband;
                 gband->set_scoring(gsc);
-                group_banded = gband->partition(scratch, (int)group_pcnt8);
             }
             Ikswv *pwsw = (hyp == 1) ? pwsw_ot.get() : pwsw_ob.get();
             mem_sam_pe_batch_run(pwsw, scratch, seqBufRef, seqBufQer,
@@ -1564,9 +1619,22 @@ int mem_sam_pe_batch(const mem_opt_t *opt, mem_cache *mmc,
                           maxRefLen, maxQerLen);
 
     const rescue_run_t &run = rescue_run(opt);
-    if (run.record_narrow) matesw_sort_partitions_by_len(seqPairArray, pcnt8, pcnt);
-    /* Banded parents first (stable, so the kswv remainder keeps its length sort). */
-    const int64_t n_banded = band_reset.b ? band_reset.b->partition(seqPairArray, (int)pcnt8) : 0;
+    /* The length sort, then the banded parents first (matesw_order), gathered into Right128
+     * (free here, sized like Left128). sort_classify has laid the batch out 8-bit first, so the
+     * gather keeps the 8/16-bit split at pcnt8. Left128 keeps the enqueue order: nothing after this
+     * reads it in scoring order (results are keyed by regid). */
+    RescueBandBatch *pband = band_reset.b;
+    const bool part = pband != NULL && pband->has_plans();
+    int64_t n_banded = 0;
+    SeqPair *pairs = seqPairArray;
+    if (run.record_narrow || part) {
+        pairs = mmc->seqPairArrayRight128[tid];
+        int64_t n8 = 0;
+        const int64_t m = matesw_order(seqPairArray, pcnt, MATESW_ANY_HYP, run.record_narrow, part,
+                                       [pband](int regid) { return pband->banded(regid); }, pairs,
+                                       &n8, &n_banded);
+        xassert(m == pcnt && n8 == pcnt8, "mem_sam_pe_batch: pcnt8 disagrees with the batch's 8-bit pair count");
+    }
 
     /* Banded pass 1 beyond the banded parents: needs a scoring the band kernels take (its band bound
      * is derived for any of them) and non-meth (this batch's kswv and band scoring are symmetric;
@@ -1579,7 +1647,7 @@ int mem_sam_pe_batch(const mem_opt_t *opt, mem_cache *mmc,
     const bool p1_band_any = run.band_runs && rescue_band_enabled();
     if (p1_band_any) band_reset.b = &matesw_band(mmc, tid);   // pass 1 needs a batch even with no plan
     if (band_reset.b) band_reset.b->set_scoring(run.band_sc);
-    mem_sam_pe_batch_run(pwsw.get(), seqPairArray, seqBufRef, seqBufQer,
+    mem_sam_pe_batch_run(pwsw.get(), pairs, seqBufRef, seqBufQer,
                          aln, pcnt, pcnt8, nthreads, n_banded, band_reset.b, p1_band_any);
 
 #endif

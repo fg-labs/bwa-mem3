@@ -180,7 +180,15 @@ public:
     {
         return regid >= 0 && regid < (int)regid2parent_.size() && regid2parent_[regid] >= 0;
     }
-    /* Stable-partition pairs[0, n) so the banded pairs come first; returns their count. */
+    /* Whether any parent has been planned since the last reset(): the same test partition() returns
+     * early on. When none has, banded() is false for every regid committed since then (an older
+     * regid may still read the previous batch's entry), so mem_sam_pe_batch checks this to skip
+     * the partition and its banded() lookups. */
+    bool has_plans() const { return !recs_.empty(); }
+    /* Stable-partition pairs[0, n) so the banded pairs come first; returns their count. The band
+     * harness orders its jobs with this; mem_sam_pe_batch applies the same stable partition to its
+     * job keys instead (matesw_order in bwamem_pair.cpp, checked against this loop's logic by
+     * test_matesw_order.cpp). */
     int partition(SeqPair *pairs, int n);
     /* Pass 0 for the banded parents pairs[0, nb): fills aln[regid].{score, te, qe, score2, te2}
      * exactly as kswv phase 0 on the hull would. Parents that need a round 2 which is not banded

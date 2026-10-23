@@ -4376,7 +4376,8 @@ int64_t sort_classify(mem_cache *mmc, int64_t pcnt, int tid)
         int size = (xtra & KSW_XBYTE)? 1 : 2;
         if (size == 1) // 8
         {
-            seqPairArray[pos8++] = seqPairArray[i];
+            if (pos8 != i) seqPairArray[pos8] = seqPairArray[i];   // in place until the first 16-bit pair
+            pos8++;
         } else { // 16
             seqPairArrayAux[pos16++] = seqPairArray[i];
         }
