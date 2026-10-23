@@ -2486,16 +2486,31 @@ int64_t FMI_search::call_one_step(int64_t pos, int64_t &sa_entry, int64_t &offse
 }
 
 /* Lane count of the pipelined compressed-SA resolver (get_sa_entries_prefetch);
- * see the BWA3_SA_LANES note there. 40 on x86_64, 20 elsewhere: a 20-vs-40 A/B
- * on a 5M-pair WGS slice (3 interleaved reps, user CPU) measured -0.30% on
- * AMD Zen3 (every rep faster) and no change on Intel Sapphire Rapids, while
- * a 16..40 sweep on Graviton4 was flat. The count only sets how many
+ * see the BWA3_SA_LANES note there. The count only sets how many
  * checkpoint-block and SA-sample fetches are in flight; results are stored by
- * position and are byte-identical at every width. */
+ * position and are byte-identical at every width.
+ *
+ * x86_64: 40. A 20-vs-40 A/B on a 5M-pair WGS slice (3 interleaved reps, user
+ * CPU) measured -0.30% on AMD Zen3 (every rep faster) and no change on Intel
+ * Sapphire Rapids. x86_64 has not been re-swept since call_one_step began
+ * deferring the sampled-row read (below).
+ *
+ * Elsewhere: 48. Since call_one_step defers a sampled row's SA read to the
+ * lane's next visit (prefetched), each visit keeps one more fetch in flight
+ * and the walk gains from more lanes; the earlier 16..40 sweep, flat on
+ * Graviton4, predates that. Re-swept on Graviton4 (clang 19, hg38, 3 rotated
+ * reps per count, median MEM_SA vs 20 lanes): 5M-pair WGS slice at -t 16,
+ * 12 lanes +35.0%, 28 -8.3%, 32 -9.4%, 40 -12.2%, 48 -12.8%, 64 -12.8%;
+ * 200k pairs at -t 1, 40 -10.3%, 48 -11.2%, 64 -11.2%. The curve is flat from
+ * 40 to 64 (48 was the lowest median at both thread counts, within the
+ * rep-to-rep spread of 40 and 64). An A/B of 48 against 20 on the same slice,
+ * 6 rotated pairs at -t 16: MEM_SA -13.3%, user CPU -0.59% and wall -0.84%
+ * (user lower in 6/6). Only Graviton4 was measured; the value also applies to
+ * every other non-x86 build, Apple Silicon included. */
 #if defined(__x86_64__) || defined(_M_X64)
 #define SA_RESOLVE_LANES_DEFAULT 40
 #else
-#define SA_RESOLVE_LANES_DEFAULT 20
+#define SA_RESOLVE_LANES_DEFAULT 48
 #endif
 #define SA_RESOLVE_LANES_MAX 64
 /* The resolver's lane arrays (working_set/map_pos/offset) are sized to
