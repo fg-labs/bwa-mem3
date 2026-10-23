@@ -609,6 +609,12 @@ typedef struct worker_t {
     /* [dedup-reads] per-chunk memoization state (Phase 2 consumer). NULL = no
      * memoization; Phase 1 always leaves it NULL (measure-only). */
     const struct read_memo_state *memo;
+    /* Output streaming (see stream_emit_prefix in fastmap.cpp). When non-NULL,
+     * the worker_sam pass runs through kt_for_prefix with this callback and
+     * context, so finished records can be written while the pass runs. NULL =
+     * a plain kt_for. Set and cleared by the pipeline's process step. */
+    int             (*emit_prefix)(void *ctx, int st, int ed);
+    void             *emit_prefix_ctx;
 } worker_t;
 
 /* D3 (--meth, PR-3) helpers. In --meth, this returns the ORIGINAL bns/pac/

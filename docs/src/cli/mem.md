@@ -976,6 +976,19 @@ for measured guidance and per-machine recommendations.
 See [User Guide — Threading and resource use](../user-guide/threading.md) for
 guidance on thread counts at various machine sizes.
 
+With more than one pipeline thread (`-t 2` and up, unless `-1` asks for
+single-threaded I/O), SAM text output is streamed: while a batch's last compute pass is still running, the records of
+the reads it has finished are written in order, so most of a batch's output has
+left by the time the batch is done. The output is byte-identical either way.
+Without streaming, the last batch's whole output is written after the compute
+has ended, which is all of the output for a one-batch input and is paced by
+whatever reads the output (a pipe into another tool, for example). BAM output
+(`--bam`), `--meth` and `-p` are not streamed. `BWA_MEM3_STREAM_OUTPUT=0` turns
+streaming off, for A/B timing; `1` or an empty value keeps the default, and any
+other value is reported on stderr and ignored. `BWA_MEM3_STREAM_STATS=1` prints,
+per batch, how many of its reads were written early (`[0000] stream_output: N
+of M reads written early`); measurement only, the output is unchanged.
+
 ### Memory
 
 #### `--huge-pages` — back the index with 1 GB huge pages (Linux, opt-in)

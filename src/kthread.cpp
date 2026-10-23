@@ -35,6 +35,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#ifdef BWAMEM3_TESTING
+#include <time.h>
+#endif
 
 
 /* Apple Silicon QoS (Quality of Service) support
@@ -147,6 +150,12 @@ static inline long steal_work(kt_for_t *t)
 	return k >= t->layout.n_items? -1 : k;
 }
 
+static void kt_item_finished(kt_for_t *t, long k);
+#ifdef BWAMEM3_TESTING
+static int kt_testing_hold_last_item(void);
+static void kt_testing_wait_for_release(void);
+#endif
+
 /* The per-thread work loop: strided dispatch followed by work-stealing.
  * Extracted from the old per-call thread body so it can be driven by a
  * persistent pool worker (see below). Items come from the pass's layout
@@ -164,11 +173,25 @@ static void ktf_run(ktf_worker_t *w)
 		i = __sync_fetch_and_add(&w->i, w->t->n_threads);
 		if (!kt_item_range(&w->t->layout, i, &st, &ed)) break;
 		w->t->func(w->t->data, st, ed-st, w - w->t->w);
+		if (w->t->done) {
+			kt_item_finished(w->t, i);
+#ifdef BWAMEM3_TESTING
+			if (i == w->t->layout.n_items - 1 && w->t->layout.n_items >= 2 && kt_testing_hold_last_item())
+				kt_testing_wait_for_release();
+#endif
+		}
 	}
 
 	while ((i = steal_work(w->t)) >= 0) {
 		if (!kt_item_range(&w->t->layout, i, &st, &ed)) break;
 		w->t->func(w->t->data, st, ed-st, w - w->t->w);
+		if (w->t->done) {
+			kt_item_finished(w->t, i);
+#ifdef BWAMEM3_TESTING
+			if (i == w->t->layout.n_items - 1 && w->t->layout.n_items >= 2 && kt_testing_hold_last_item())
+				kt_testing_wait_for_release();
+#endif
+		}
 	}
 	if (sp_enabled()) { w->cpu_busy = sp_thread_cpu() - _c0; w->encode = sp_encode_get(); }
 }
@@ -203,9 +226,61 @@ typedef struct {
 	long generation;          /* bumped once per kt_for() call              */
 	int n_left;               /* workers not yet done with `generation`     */
 	int shutdown;
+	long n_finished;          /* kt_for_prefix items finished, all passes   */
+#ifdef BWAMEM3_TESTING
+	int hold_released;        /* test hold (kt_testing_hold_last_item)      */
+	pthread_cond_t cv_hold;   /* signalled when hold_released is set        */
+#endif
 } kt_pool_t;
 
 static kt_pool_t g_kt_pool = {0};
+
+#ifdef BWAMEM3_TESTING
+/* Test-only (TESTING_BUILD=1): BWAMEM3_TESTING_HOLD_LAST_ITEM=1 keeps the worker
+ * that finished a kt_for_prefix pass's last item from leaving the pass until the
+ * caller has consumed a prefix, and has a declined caller re-offer on a 1 ms
+ * timed wait. Every pass of two or more items then streams at least one, so a
+ * test can assert streaming engages without depending on whether the caller
+ * runs before every item has finished (test/regression/stream_output_order.sh).
+ * A pass whose prefixes are never consumed is released after 30 s with a
+ * warning instead of hanging. Read once. */
+static int kt_testing_hold_last_item(void)
+{
+	static int hold = -1;
+	if (hold < 0) {
+		const char *e = getenv("BWAMEM3_TESTING_HOLD_LAST_ITEM");
+		hold = (e && e[0] == '1' && e[1] == '\0');
+	}
+	return hold;
+}
+
+static void kt_testing_wait_for_release(void)
+{
+	struct timespec dl;
+	clock_gettime(CLOCK_REALTIME, &dl);
+	dl.tv_sec += 30;
+	pthread_mutex_lock(&g_kt_pool.mtx);
+	while (!g_kt_pool.hold_released)
+		if (pthread_cond_timedwait(&g_kt_pool.cv_hold, &g_kt_pool.mtx, &dl) != 0) {
+			fprintf(stderr, "WARNING: BWAMEM3_TESTING_HOLD_LAST_ITEM: no prefix consumed in 30 s; releasing\n");
+			g_kt_pool.hold_released = 1;
+		}
+	pthread_mutex_unlock(&g_kt_pool.mtx);
+}
+#endif
+
+/* kt_for_prefix: item k of the current pass has returned from func. The store
+ * releases everything func wrote for the item's reads to the caller, which
+ * reads done[k] with acquire before handing those reads to on_prefix. cv_done
+ * has one waiter (the kt_for_prefix caller), so a signal wakes it. */
+static void kt_item_finished(kt_for_t *t, long k)
+{
+	__atomic_store_n(&t->done[k], 1, __ATOMIC_RELEASE);
+	pthread_mutex_lock(&g_kt_pool.mtx);
+	++g_kt_pool.n_finished;
+	pthread_cond_signal(&g_kt_pool.cv_done);
+	pthread_mutex_unlock(&g_kt_pool.mtx);
+}
 
 static void *kt_pool_worker(void *arg)
 {
@@ -243,6 +318,9 @@ static void kt_pool_init(int n_threads)
 	pthread_mutex_init(&g_kt_pool.mtx, NULL);
 	pthread_cond_init(&g_kt_pool.cv_go, NULL);
 	pthread_cond_init(&g_kt_pool.cv_done, NULL);
+#ifdef BWAMEM3_TESTING
+	pthread_cond_init(&g_kt_pool.cv_hold, NULL);
+#endif
 	g_kt_pool.generation = 0;
 	g_kt_pool.n_left = 0;
 	g_kt_pool.shutdown = 0;
@@ -285,6 +363,9 @@ void kt_pool_destroy(void)
 	pthread_mutex_destroy(&g_kt_pool.mtx);
 	pthread_cond_destroy(&g_kt_pool.cv_go);
 	pthread_cond_destroy(&g_kt_pool.cv_done);
+#ifdef BWAMEM3_TESTING
+	pthread_cond_destroy(&g_kt_pool.cv_hold);
+#endif
 	memset(&g_kt_pool, 0, sizeof(g_kt_pool));
 }
 
@@ -293,27 +374,32 @@ void kt_for(void (*func)(void*, int, int, int), void *data, int n)
 	kt_for_nt(func, data, n, ((worker_t*) data)->nthreads);
 }
 
-void kt_for_nt(void (*func)(void*, int, int, int), void *data, int n, int n_threads)
+/* Create the pool on first use, or rebuild it for a new size. kt_for() is only
+ * ever called from the serialized step-1 of kt_pipeline (one chunk in flight at
+ * a time), so lazy init here is race-free, and n_threads (= opt->n_threads) is
+ * constant for the whole run. Rebuild the pool defensively if that invariant
+ * ever changes. */
+static void kt_pool_ensure(int n_threads)
 {
-	if (n_threads < 1) n_threads = 1;  /* nthreads is int16_t; never spin up a 0/negative pool */
-
-	/* kt_for() is only ever called from the serialized step-1 of kt_pipeline
-	 * (one chunk in flight at a time), so lazy init here is race-free, and
-	 * n_threads (= opt->n_threads) is constant for the whole run. Rebuild the
-	 * pool defensively if that invariant ever changes. */
 	if (!g_kt_pool.started)
 		kt_pool_init(n_threads);
 	else if (g_kt_pool.n_threads != n_threads) {
 		kt_pool_destroy();
 		kt_pool_init(n_threads);
 	}
+}
 
-	pthread_mutex_lock(&g_kt_pool.mtx);
+/* Post one pass, cut into items by L (kt_item_layout), to the pool. Caller
+ * holds g_kt_pool.mtx and then waits on cv_done until n_left reaches 0. */
+static void kt_pool_post(void (*func)(void*, int, int, int), void *data, const kt_item_layout_t *L,
+                         int n_threads, uint8_t *done)
+{
 	g_kt_pool.job.func = func;
 	g_kt_pool.job.data = data;
 	g_kt_pool.job.n_threads = n_threads;
 	g_kt_pool.job.w = g_kt_pool.w;
-	kt_item_layout(n, n_threads, BATCH_SIZE, &g_kt_pool.job.layout);
+	g_kt_pool.job.done = done;
+	g_kt_pool.job.layout = *L;
 	for (int i = 0; i < n_threads; ++i) {
 		g_kt_pool.w[i].t = &g_kt_pool.job;
 		g_kt_pool.w[i].i = i;
@@ -321,13 +407,13 @@ void kt_for_nt(void (*func)(void*, int, int, int), void *data, int n, int n_thre
 	g_kt_pool.n_left = n_threads;
 	++g_kt_pool.generation;
 	pthread_cond_broadcast(&g_kt_pool.cv_go);
-	while (g_kt_pool.n_left > 0)
-		pthread_cond_wait(&g_kt_pool.cv_done, &g_kt_pool.mtx);
-	pthread_mutex_unlock(&g_kt_pool.mtx);
+}
 
-	/* All workers are done with this generation (n_left == 0) and will not
-	 * touch their per-slot stats again until the next kt_for() call, so the
-	 * pool's worker slots can be read without the lock here. */
+/* After a pass: all workers are done with this generation (n_left == 0) and
+ * will not touch their per-slot stats again until the next kt_for() call, so
+ * the pool's worker slots can be read without the lock here. */
+static void kt_pool_harvest(int n_threads)
+{
 	if (sp_enabled()) {
 		double *busy = (double*) malloc(n_threads * sizeof(double));
 		xassert(busy != NULL, "out of memory: busy");
@@ -338,4 +424,87 @@ void kt_for_nt(void (*func)(void*, int, int, int), void *data, int n, int n_thre
 		sp_thread_stats(&g_ktfor, busy, n_threads);     /* balance stats from the most recent call */
 		free(busy);
 	}
+}
+
+void kt_for_nt(void (*func)(void*, int, int, int), void *data, int n, int n_threads)
+{
+	if (n_threads < 1) n_threads = 1;  /* nthreads is int16_t; never spin up a 0/negative pool */
+	kt_pool_ensure(n_threads);
+
+	kt_item_layout_t L;
+	kt_item_layout(n, n_threads, BATCH_SIZE, &L);
+	pthread_mutex_lock(&g_kt_pool.mtx);
+	kt_pool_post(func, data, &L, n_threads, NULL);
+	while (g_kt_pool.n_left > 0)
+		pthread_cond_wait(&g_kt_pool.cv_done, &g_kt_pool.mtx);
+	pthread_mutex_unlock(&g_kt_pool.mtx);
+
+	kt_pool_harvest(n_threads);
+}
+
+void kt_for_prefix(void (*func)(void*, int, int, int), void *data, int n, int n_threads,
+                   kt_prefix_f on_prefix, void *ctx)
+{
+	if (n_threads < 1) n_threads = 1;
+	kt_pool_ensure(n_threads);
+
+	kt_item_layout_t L;
+	kt_item_layout(n, n_threads, BATCH_SIZE, &L);
+	uint8_t *done = (uint8_t*) calloc(L.n_items > 0 ? L.n_items : 1, 1);
+	xassert(done != NULL, "out of memory: kt_for_prefix done flags");
+
+	pthread_mutex_lock(&g_kt_pool.mtx);
+#ifdef BWAMEM3_TESTING
+	const int hold = kt_testing_hold_last_item();
+	g_kt_pool.hold_released = 0;
+#endif
+	kt_pool_post(func, data, &L, n_threads, done);
+	/* next: the first item not yet consumed. One item per on_prefix call, so
+	 * once the pass ends the caller is held up by at most the item it is
+	 * handling. A declined item is offered again after the next item
+	 * completion (or not at all, if none is left); one that lands while
+	 * on_prefix runs counts, so the decline does not wait for another. */
+	long next = 0;
+	int declined = 0;
+	while (g_kt_pool.n_left > 0) {
+		if (!declined && next < L.n_items && __atomic_load_n(&done[next], __ATOMIC_ACQUIRE)) {
+			const long finished = g_kt_pool.n_finished;
+			int st, ed;
+			kt_item_range(&L, next, &st, &ed);
+			pthread_mutex_unlock(&g_kt_pool.mtx);
+			const int consumed = on_prefix(ctx, st, ed);
+			pthread_mutex_lock(&g_kt_pool.mtx);
+			if (consumed) {
+				++next;
+#ifdef BWAMEM3_TESTING
+				if (hold && !g_kt_pool.hold_released) {
+					g_kt_pool.hold_released = 1;
+					pthread_cond_broadcast(&g_kt_pool.cv_hold);
+				}
+#endif
+			}
+			else if (g_kt_pool.n_finished == finished) declined = 1;
+			continue;
+		}
+#ifdef BWAMEM3_TESTING
+		if (hold && declined) {
+			/* No item completion may come while the last item is held, so
+			 * re-offer on a timer: the decline ends when its turn comes. */
+			struct timespec dl;
+			clock_gettime(CLOCK_REALTIME, &dl);
+			dl.tv_nsec += 1000000;
+			if (dl.tv_nsec >= 1000000000) { dl.tv_sec += 1; dl.tv_nsec -= 1000000000; }
+			pthread_cond_timedwait(&g_kt_pool.cv_done, &g_kt_pool.mtx, &dl);
+			declined = 0;
+			continue;
+		}
+#endif
+		pthread_cond_wait(&g_kt_pool.cv_done, &g_kt_pool.mtx);
+		declined = 0;
+	}
+	g_kt_pool.job.done = NULL;
+	pthread_mutex_unlock(&g_kt_pool.mtx);
+	free(done);
+
+	kt_pool_harvest(n_threads);
 }

@@ -1727,6 +1727,10 @@ jobs:
         # repeated on the second `make` so it sees the same configuration and
         # treats the build as up to date instead of rebuilding.
         #
+        # The same target also runs stream_output_order.sh, which uses the
+        # BWAMEM3_TESTING_WRITE_DELAY_MS hook to hold every write step back and
+        # checks that output streaming still writes the batches in order.
+        #
         # USE_MIMALLOC=1 is spelled out rather than left to the Makefile
         # default: TESTING_BUILD is meant to vary one thing against the canonical
         # row's configuration (avx2, clang-19, mimalloc), and that default

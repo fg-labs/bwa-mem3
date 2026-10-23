@@ -135,6 +135,16 @@ typedef struct {
 	uint8_t  *meth_orig_ref_string;
 	/* THP-fallback stderr check (bwa_thp.h), driven from the write step. */
 	bwa_thp_monitor_t thp;
+	/* Output streaming (stream_emit_prefix in fastmap.cpp): the process step
+	 * writes an item's finished SAM records while its last pass still runs.
+	 * Set once before the pipeline starts; see process() for when it is on. */
+	int     stream_output;
+	int     stream_stats;      /* BWA_MEM3_STREAM_STATS: per-batch stderr line */
+	int64_t items_processed;   /* pipeline order of the next process step; step 1 only */
+	/* Write steps finished, in pipeline order. Item k may write early only once
+	 * this equals k. Stored by the write step (release), loaded by the process
+	 * step's streaming callback (acquire). */
+	int64_t items_written;
 } ktp_aux_t;
 
 typedef struct {
@@ -156,6 +166,11 @@ typedef struct {
 	 * item step 0 did not run it for has has_memo 0 and an empty state. */
 	int has_memo;
 	struct read_memo_handoff memo;
+	/* Output streaming. seq is this item's pipeline order (set by step 1);
+	 * n_streamed is how many leading reads of seqs step 1 already wrote and
+	 * released, so step 2 starts there. */
+	int64_t  seq;
+	int      n_streamed;
 } ktp_data_t;
 
     

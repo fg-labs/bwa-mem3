@@ -305,6 +305,8 @@ void worker_alloc(const mem_opt_t *opt, worker_t &w, int32_t nreads, int32_t nth
     w.regs = NULL; w.chain_scratch = NULL; w.seed_scratch = NULL;
     w.memo = NULL;   /* [dedup-reads] armed per-chunk by mem_process_seqs when the
                       * controller latches ON; NULL elsewhere (unarmed = no memo) */
+    w.emit_prefix = NULL; w.emit_prefix_ctx = NULL;   /* no output streaming
+                      * unless the pipeline's process step arms it per item */
 
     /* regs is genuinely chunk-lifetime, and the only nreads-sized allocation
      * left here: it is filled by the align pass, read by mem_pestat, and
@@ -550,6 +552,107 @@ static void sp_harvest_proc(prof_chunk_t *p, double sp_p0)
     p->encode  = g_ktfor.encode;
     p->compute = (g_ktfor.proc_cpu > g_ktfor.encode)
                  ? g_ktfor.proc_cpu - g_ktfor.encode : NAN;
+}
+
+/* The write step's per-record calls for SAM text output (its non-BAM,
+ * non---meth branch), shared with stream_emit_prefix so an early-written record
+ * goes through exactly the same calls. */
+static void write_sam_text(FILE *fp, bseq1_t *s)
+{
+    if (s->sam) {
+#ifndef DISABLE_OUTPUT
+        fputs(s->sam, fp);
+#else
+        (void) fp;
+#endif
+    }
+    /* meth_mode populates bams[] regardless of writer state; under
+     * DISABLE_OUTPUT both writers are forced NULL and we land here, so the
+     * per-record bam1_t allocations would otherwise leak (only the pointer
+     * array is freed, by release_read_record). Profile-build only, but it
+     * skews the very Maximum RSS that bench/run.sh records. */
+    for (int j = 0; j < s->n_bams; ++j)
+        bam_writer_free((struct bam1_t *)s->bams[j]);
+}
+
+/* Free one written record's per-read allocations. PIPE-F6: name/seq/qual are
+ * carved from the item's read_arena, which the write step frees once -- do NOT
+ * free them here. comment stays heap-owned (see the reader / --meth notes), and
+ * sam/bams are allocated during processing. meth_orig_seq is a step-0 heap copy
+ * (NULL outside --meth; free() is NULL-safe). */
+static void release_read_record(bseq1_t *s)
+{
+    free(s->comment);
+    free(s->sam);
+    free(s->bams);
+    free(s->meth_orig_seq);
+}
+
+/* Output streaming. Without it an item's records are all written by its write
+ * step, after the process step's last kt_for pass (worker_sam) has finished
+ * every read. Earlier items' writes overlap the next item's compute, but the
+ * last item's write overlaps nothing, so every run ends with one item's worth
+ * of single-threaded fputs, paced by whatever reads the output (all of the
+ * output, for a one-batch input). With it, the process-step thread -- which
+ * otherwise only waits while the pool runs worker_sam -- writes each finished
+ * work item's records as soon as that item and every earlier one are done
+ * (kt_for_prefix), and the write step writes the rest.
+ *
+ * Output is byte-identical: the same strings go to the same FILE in the same
+ * order. Records leave in read order (kt_for_prefix offers items in order and
+ * items tile the reads in order); none is written before the previous
+ * pipeline item's write step has returned (items_written == seq, an
+ * acquire-load of the write step's release-store); the write step resumes at
+ * n_streamed. A record is final once its item has returned: worker_sam writes
+ * a read's sam only from the item that owns the read, and nothing in the
+ * process step after that pass reads or changes sam.
+ *
+ * When it is not the item's turn yet the callback declines and is asked again
+ * after the next work item finishes. One item per call, so once the pass ends
+ * the process step is held up by at most one item's write, never by the rest of
+ * a slow consumer's backlog: the next item's compute waits on this step.
+ *
+ * --profile: streamed records are written inside the process step, so their
+ * time is part of its wall time (it is time that step spent waiting on the pool
+ * before), and the write step's time and bytes cover only what it wrote. */
+typedef struct {
+    ktp_aux_t  *aux;
+    ktp_data_t *ret;
+    bseq1_t    *seqs;      /* the array the worker_sam pass runs over */
+    int         turn;      /* the previous item's write step has finished */
+} stream_ctx_t;
+
+static int stream_emit_prefix(void *ctx_, int st, int ed)
+{
+    stream_ctx_t *c = (stream_ctx_t *) ctx_;
+    if (!c->turn) {
+        if (__atomic_load_n(&c->aux->items_written, __ATOMIC_ACQUIRE) != c->ret->seq)
+            return 0;
+        c->turn = 1;
+    }
+    xassert(st == c->ret->n_streamed, "stream_emit_prefix: reads offered out of order");
+    for (int i = st; i < ed; ++i) {
+        write_sam_text(c->aux->fp, &c->seqs[i]);
+        release_read_record(&c->seqs[i]);
+    }
+    c->ret->n_streamed = ed;
+    return 1;
+}
+
+/* Arm streaming on w for a worker_sam pass over `seqs` (the process step's
+ * cohort array, which becomes ret->seqs), or leave it off. */
+static void stream_arm(worker_t &w, stream_ctx_t *c, ktp_aux_t *aux, ktp_data_t *ret, bseq1_t *seqs)
+{
+    if (!aux->stream_output) return;
+    c->aux = aux; c->ret = ret; c->seqs = seqs; c->turn = 0;
+    w.emit_prefix = stream_emit_prefix;
+    w.emit_prefix_ctx = c;
+}
+
+static void stream_disarm(worker_t &w)
+{
+    w.emit_prefix = NULL;
+    w.emit_prefix_ctx = NULL;
 }
 
 ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, worker_t &w)
@@ -905,6 +1008,8 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
     else if (step == 1)  /* Step 2: Main processing-engine */
     {
         static int task = 0;
+        ret->seq = aux->items_processed++;   /* step 1 runs items in pipeline order */
+        stream_ctx_t stream_ctx;
         /* regs must hold the whole COHORT, not just the reads this item carries.
          * A sliced cohort aligns each slice as it arrives and keeps the results
          * until mem_pair_and_emit_cohort consumes them, so growing this array
@@ -1027,6 +1132,7 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
             /* The common case: this slice IS the whole cohort. Byte-for-byte the
              * pre-slicing code path -- no accumulation, no copy. */
             /* Hand mem_process_seqs step 0's pre-pass (NULL: it runs its own). */
+            stream_arm(w, &stream_ctx, aux, ret, ret->seqs);
             mem_process_seqs(opt,
                              aux->n_processed,
                              ret->n_seqs,
@@ -1034,6 +1140,7 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
                              aux->pes0,
                              w,
                              ret->has_memo ? &ret->memo : NULL);
+            stream_disarm(w);
         }
         else {
             /* Multi-slice cohort. Append this slice to the cohort array, align
@@ -1160,12 +1267,14 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
                 return ret;
             }
 
+            stream_arm(w, &stream_ctx, aux, ret, aux->cohort_seqs);
             mem_pair_and_emit_cohort(opt,
                                      aux->cohort_first_id,
                                      aux->cohort_n,
                                      aux->cohort_seqs,
                                      aux->pes0,
                                      w);
+            stream_disarm(w);
 
             /* Hand the cohort to the write step, which frees the array. */
             ret->seqs   = aux->cohort_seqs;
@@ -1191,6 +1300,20 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
     /* Step 3: Write output */
     else if (step == 2)
     {
+#ifdef BWAMEM3_TESTING
+        /* Test-only (TESTING_BUILD=1): BWAMEM3_TESTING_WRITE_DELAY_MS holds every
+         * write step back before it writes, so the next batch's worker_sam pass
+         * usually ends before this batch's records are out; a batch that wrote
+         * early without its turn would then reorder the output
+         * (test/regression/stream_output_order.sh). Read once; write steps run
+         * one at a time. */
+        static long write_delay_ms = -1;
+        if (write_delay_ms < 0) {
+            const char *e = getenv("BWAMEM3_TESTING_WRITE_DELAY_MS");
+            write_delay_ms = (e && *e) ? atol(e) : 0;
+        }
+        if (write_delay_ms > 0) usleep((useconds_t) write_delay_ms * 1000);
+#endif
         uint64_t tim = __rdtsc();
         double sp_w0 = sp_enabled() ? sp_wall() : 0.0;
         long sp_wbytes = 0;
@@ -1207,7 +1330,9 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
         meth_bam_writer_t *const out_meth_bw = g_meth_bam_writer;
         struct bam_writer_s *const out_bam_bw = aux->bam_writer;
 
-        for (int i = 0; i < ret->n_seqs; )
+        /* Reads before n_streamed were written and released by the process
+         * step (stream_emit_prefix); 0 when it did not stream. */
+        for (int i = ret->n_streamed; i < ret->n_seqs; )
         {
             int group_size = 1;
             if (out_meth_mode && out_flag_pe
@@ -1251,39 +1376,23 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
                     }
                 }
             } else {
-                for (int k = 0; k < group_size; ++k) {
-                    if (ret->seqs[i+k].sam) {
-#ifndef DISABLE_OUTPUT
-                        fputs(ret->seqs[i+k].sam, aux->fp);
-#endif
-                    }
-                    /* meth_mode populates bams[] regardless of writer state;
-                     * under DISABLE_OUTPUT both writers are forced NULL and
-                     * we land here, so the per-record bam1_t allocations
-                     * would otherwise leak (only the pointer array below is
-                     * freed). Profile-build only, but it skews the very
-                     * Maximum RSS that bench/run.sh records. */
-                    for (int j = 0; j < ret->seqs[i+k].n_bams; ++j) {
-                        bam_writer_free((struct bam1_t *)ret->seqs[i+k].bams[j]);
-                    }
-                }
+                for (int k = 0; k < group_size; ++k)
+                    write_sam_text(aux->fp, &ret->seqs[i+k]);
             }
 
             for (int k = 0; k < group_size; ++k) {
                 if (sp_enabled() && ret->seqs[i+k].sam) sp_wbytes += (long)strlen(ret->seqs[i+k].sam);
-                /* PIPE-F6: name/seq/qual are carved from ret->read_arena, which
-                 * is freed once below — do NOT free them individually here.
-                 * comment stays heap-owned (see the reader / --meth notes), and
-                 * sam/bams are allocated during processing; those still free
-                 * per-read. meth_orig_seq is a step-0 heap copy (NULL outside
-                 * --meth; free() is NULL-safe). */
-                free(ret->seqs[i+k].comment);
-                free(ret->seqs[i+k].sam);
-                free(ret->seqs[i+k].bams);
-                free(ret->seqs[i+k].meth_orig_seq);
+                release_read_record(&ret->seqs[i+k]);
             }
             i += group_size;
         }
+        /* BWA_MEM3_STREAM_STATS=1 only, so a test can tell that streaming
+         * engaged; measurement only, stderr only. */
+        if (aux->stream_stats && aux->stream_output && ret->n_seqs > 0)
+            fprintf(stderr, "[0000] stream_output: %d of %d reads written early\n",
+                    ret->n_streamed, ret->n_seqs);
+        /* Every record of this item is out: let the next item write early. */
+        __atomic_store_n(&aux->items_written, ret->seq + 1, __ATOMIC_RELEASE);
         if (sp_enabled()) {
             ret->prof.write_wall = sp_wall() - sp_w0;
             ret->prof.write_bytes = sp_wbytes;
@@ -1423,6 +1532,35 @@ static int process(void *shared, gzFile gfp, gzFile gfp2, int pipe_threads)
     ktp_t aux_;
     int p_nt = pipe_threads; // 2;
     int n_steps = 3;
+
+    /* Output streaming (stream_emit_prefix). SAM text only: the BAM and --meth
+     * writers and -p (whose two passes move the records afterwards) keep
+     * writing in step 2 alone. Needs a second pipeline thread, so -t 1 and
+     * single-threaded I/O keep their thread use. BWA_MEM3_STREAM_OUTPUT=0
+     * turns it off (A/B runs); the output is the same either way. Only 0 and
+     * 1 are accepted: anything else would read as "on" and silently not do
+     * what was asked, so it is reported and the default (on) kept. */
+    {
+        const char *so_env = getenv("BWA_MEM3_STREAM_OUTPUT");
+        int so_off = 0;
+        if (so_env && *so_env) {
+            if (strcmp(so_env, "0") == 0) so_off = 1;
+            else if (strcmp(so_env, "1") != 0)
+                fprintf(stderr, "WARNING: BWA_MEM3_STREAM_OUTPUT='%s' is not 0 or 1; "
+                                "ignoring it and streaming output\n", so_env);
+        }
+#ifdef DISABLE_OUTPUT
+        aux->stream_output = 0;
+#else
+        aux->stream_output = !so_off && p_nt > 1 && aux->bam_writer == NULL
+                             && !opt->meth_mode && !(opt->flag & MEM_F_SMARTPE);
+#endif
+        (void) so_off;
+        const char *ss_env = getenv("BWA_MEM3_STREAM_STATS");
+        aux->stream_stats = ss_env && *ss_env && strcmp(ss_env, "0") != 0;
+        aux->items_processed = 0;
+        aux->items_written = 0;
+    }
 
     w.ref_string = aux->ref_string;
     // Mirror into mem_cache so helpers that take only `mmc` (e.g.
