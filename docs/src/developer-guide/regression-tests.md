@@ -8,7 +8,7 @@ bwa-mem3 has three categories of tests — **unit**, **integration**, and **regr
 |---|---|---|---|
 | unit | `test/bwa_mem3_tests_unit` | None; all inputs synthetic | Every matrix row |
 | integration | `test/bwa_mem3_tests_integration` | Small committed FASTAs / FMI in `test/fixtures/` | SSE4.1, AVX2, ARM64 Linux, macOS ARM |
-| regression | `test/regression/*.sh` | Committed phiX in `test/fixtures/`; chr22 downloaded by CI, with reads simulated by holodeck; bwa for the parity diffs | Mostly the canonical AVX2 row; a few run on every row, and the source-only lints run in jobs of their own. `test/regression/README.md` has the per-script breakdown |
+| regression | `test/regression/*.sh` | Committed phiX in `test/fixtures/`; chr22 downloaded by CI, with reads simulated by holodeck; bwa for the parity diffs | Mostly the canonical AVX2 configuration (the canonical row, and the `canonical-regressions` job that builds the same binary alongside it); a few run on every row, and the source-only lints run in jobs of their own. `test/regression/README.md` has the per-script breakdown |
 
 **Unit tests** must use only synthetic inputs generated programmatically and complete in under 100 ms each. They exercise individual kernels in isolation: kswv scoring, banded Smith-Waterman, KSW, FM-index operations, SMEM extraction, BAM encoding, and pair handling.
 
@@ -111,7 +111,7 @@ BWA_TESTS_DEBUG_PHASE0=1 BWA_TESTS_DEBUG_PHASE1=1 \
   ./test/bwa_mem3_tests_unit --test-suite="unit/kswv"
 ```
 
-JUnit artifacts are uploaded per CI matrix row (`unit-results-<name>.xml`, `integration-results-<name>.xml`) and available on the Actions run page.
+JUnit artifacts are uploaded per CI matrix row (`unit-results-<name>-shard<k>.xml`, one per unit-test shard, and `integration-results-<name>.xml`) and available on the Actions run page.
 
 > **Tip — Use ASAN for memory bugs**
 >
