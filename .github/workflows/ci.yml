@@ -628,15 +628,18 @@ jobs:
           # arm64); require it, so the compaction equivalence tests cannot skip there.
           BWA_REQUIRE_COMPACTION_TIER: ${{ runner.arch == 'X64' && 'avx2' || 'neon' }}
           JOB_INDEX: ${{ strategy.job-index }}
-        # `--reporters=junit --out=…` writes JUnit XML to the file and
-        # nothing to stdout. doctest itself prints the failing-assertion
-        # summary to stderr before exiting non-zero, so the per-step log
-        # already surfaces the diagnosis; the JUnit XML is only consumed
-        # via the upload-artifact step below.
+        # test/run_unit_shards.sh runs the binary as contiguous slices of its
+        # cases, one concurrent job per CPU: the cases are many and no one of
+        # them dominates, so this cuts the step's wall time by about the core
+        # count at the same CPU cost. Each slice writes its own JUnit XML,
+        # unit-results-<job>-shard<k>.xml, which the upload step's glob still
+        # matches. With the JUnit reporter doctest prints nothing about a
+        # failure to the console, so the runner prints a failing slice's JUnit
+        # XML (the failed assertions) into the log itself, and fails the step
+        # if any slice fails or crashes or the run selects no test cases.
         run: |
-          ./test/bwa_mem3_tests_unit \
-            --reporters=junit \
-            --out="unit-results-${JOB_INDEX}.xml"
+          UNIT_JUNIT_PREFIX="unit-results-${JOB_INDEX}" \
+            bash test/run_unit_shards.sh ./test/bwa_mem3_tests_unit
 
       - name: Upload unit-test results
         if: always()
@@ -2030,7 +2033,13 @@ jobs:
         run: make test-binaries arch=avx2 CXX=g++ COVERAGE=1
 
       - name: Run unit tests
-        run: ./test/bwa_mem3_tests_unit
+        # Sharded across the runner's CPUs, as on the matrix rows: at -O0 with
+        # gcov instrumentation the serial run is over two minutes. The shards
+        # are separate processes writing the same .gcda files; libgcov takes a
+        # lock on each file and merges its counters into what is already there
+        # rather than overwriting it, so the collected coverage is the same as
+        # a serial run's.
+        run: bash test/run_unit_shards.sh ./test/bwa_mem3_tests_unit
 
       - name: Run integration tests
         run: ./test/bwa_mem3_tests_integration

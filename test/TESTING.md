@@ -32,6 +32,7 @@ make -C test -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)   # builds framework + 
 ./test/bwa_mem3_tests_unit --success      # also print passing assertions
 ./test/bwa_mem3_tests_unit --reporters=junit --out=unit-results.xml
 ./test/bwa_mem3_tests_unit --help         # full doctest flag list
+bash test/run_unit_shards.sh ./test/bwa_mem3_tests_unit   # run as one concurrent shard per CPU (what CI does)
 ```
 
 ### Run integration tests
@@ -71,7 +72,7 @@ The chr22 scripts are the expensive end: they want a chr22 reference indexed for
 ## Running tests in CI
 
 - **ci.yml** runs unit tests on every matrix row, integration tests on the four widened canonical rows, and regression tests on the canonical AVX2 row — except `chr22_parity.sh`, which runs on every row; the checks that need a differently-configured build of that row (debug macros, `TESTING_BUILD`, ASAN), which run in the `rebuild-variants` job alongside the matrix; and the source-only lints, which run in their own jobs alongside the build matrix (they need no binary, so they do not wait on it).
-- JUnit artifacts are uploaded per row (`unit-results-<name>.xml`, `integration-results-<name>.xml`). Download them from a failed run's Actions page to see fine-grained assertion output.
+- JUnit artifacts are uploaded per row (artifacts `unit-results-<row>` and `integration-results-<row>`; the unit artifact holds one `unit-results-<job-index>-shard<k>.xml` per unit-test shard). Download them from a failed run's Actions page to see fine-grained assertion output.
 - **proto-neon-kswv.yml** runs `./test/bwa_mem3_tests_unit --test-suite="unit/kswv"` on proto branches.
 
 ## Adding a unit test
@@ -81,6 +82,7 @@ Unit tests are doctest `TEST_CASE`s in `test/unit/test_*.cpp`. They must:
 1. Use only synthetic inputs (no files on disk).
 2. Complete in <100 ms each.
 3. Be tagged with `doctest::test_suite("unit/<module>")` (or wrapped in a `TEST_SUITE("unit/<module>") { ... }` block), where `<module>` names the code under test. Reuse an existing module where one fits; add a new one when none does. The modules in use in `test/unit/` are: `alnreg_sort_dedup`, `bam_aux_append_propagation`, `bam_pa_tag_parity`, `bandedswa`, `bandedswa-asym`, `bandedswa-zdrop`, `bns_pos2rid`, `bwa_thp`, `chain_cap`, `chain_weight_clamp`, `cigar`, `extend_csub`, `extension`, `huge_pages`, `index_load_threads`, `ksort_permutation`, `ksw_global2`, `kswv`, `kt_for`, `madvise`, `meth-asym-directed`, `meth_nm_md`, `meth_scoring`, `min_ext_len`, `neon_movemask`, `neon_soa_pack`, `pac_slurp_and_close`, `pair`, `pair64_sort`, `pwrite_request_size`, `read_memo`, `sam_encode`, `smem`, `smem_dedup`, `ungapped_fastpath`, `util` (regenerate from the repo root with `grep -rhoE '(test_suite|TEST_SUITE)\("unit/[^"]+"' test/unit/*.cpp | sed -E 's/.*unit\///; s/"$//' | LC_ALL=C sort -u`). Some older files in `test/unit/` carry no suite tag; doctest runs them in its default suite, so `--test-suite` filters skip them and they are selected by name (`-tc`) instead. Tag new tests. doctest's `test_suite` decorator is overriding (not additive) — chaining `* doctest::test_suite("a") * doctest::test_suite("b")` keeps only the last one — so encode the category and module as a single slash-separated string.
+4. Stand alone. CI runs the binary as concurrent shards (`test/run_unit_shards.sh`), each a separate process running a contiguous slice of the cases, so a case cannot rely on an earlier case having run in the same process, and any scratch file must get a unique name (`mkstemp(3)`, or the pid in the name) rather than a fixed path.
 
 Template:
 
