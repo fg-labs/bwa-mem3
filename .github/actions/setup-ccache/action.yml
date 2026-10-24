@@ -77,6 +77,7 @@ runs:
           # xcrun shim whose mtime does not change when the image's Xcode does.
           echo "CCACHE_COMPILERCHECK=%compiler% -v"
           echo "CCACHE_CACHE_KEY=${KEY_PREFIX}${GITHUB_SHA}"
+          echo "CCACHE_KEY_PREFIX=${KEY_PREFIX}"
         } >> "$GITHUB_ENV"
         echo "key_prefix=$KEY_PREFIX" >> "$GITHUB_OUTPUT"
 
