@@ -15,8 +15,9 @@ on:
 # Least-privilege GITHUB_TOKEN. Without this block the token inherits the
 # repository default, which -- depending on the org/repo setting -- can be
 # read/write across contents, issues, pull requests and more, far beyond what
-# any job here needs. Nothing in this workflow uses the token except
-# actions/checkout, so `contents: read` is the whole requirement:
+# any job here needs. Apart from warm-caches (below), nothing in this workflow
+# uses the token except actions/checkout, so `contents: read` is the whole
+# requirement:
 #
 #   - actions/upload-artifact and actions/cache authenticate with
 #     ACTIONS_RUNTIME_TOKEN, which the runner injects independently of
@@ -26,8 +27,10 @@ on:
 #
 # release.yml is the counterexample worth keeping in view: it starts from
 # `permissions: {}` and grants `contents`/`pull-requests` write per job,
-# because its jobs genuinely differ. Here all three jobs need exactly
-# `contents: read`, so it is declared once at the workflow level.
+# because its jobs genuinely differ. Here every job needs `contents: read`, so
+# it is declared once at the workflow level; the one exception, warm-caches,
+# adds `actions: write` at job level to delete superseded cache entries, and
+# runs only on push to main, never on PR code.
 permissions:
   contents: read
 
@@ -347,13 +350,16 @@ jobs:
       # Each row carries `artifact_slug` (a-z0-9-) alongside the human-
       # friendly `name`. Artifact uploads use the slug to keep names URL-
       # safe and free of spaces / parens; job titles still use `name`.
-      # `kernel_sweep: "full"` marks the one row per SIMD family that runs the
-      # rescue kernel-equivalence sweeps (rescue_prune_eq, rescue_band_harness)
-      # at their full job counts: the canonical row for AVX2 (every x86 row
-      # builds the same AVX2 kernels; mimalloc, single-binary packaging and the
-      # compiler do not change what those harnesses check) and Linux ARM64 for
-      # NEON. Every other row runs the same configurations at about a fifth of
-      # the jobs (see those steps).
+      # `kernel_sweep: "full"` marks the rows that run the rescue
+      # kernel-equivalence sweeps (rescue_prune_eq, rescue_band_harness) at
+      # their full job counts: one per SIMD family and compiler family -- the
+      # canonical row (AVX2, clang-19), Linux ARM64 (NEON, clang-19) and gcc
+      # compat (AVX2, g++, whose codegen of the same kernels differs). The
+      # no-mimalloc and single-binary rows build the same AVX2 kernels with the
+      # same clang-19, and macOS the same NEON kernels with Apple clang; they
+      # run every configuration at about a fifth of the jobs (see those steps),
+      # which keeps each configuration's per-batch draws and vacuity checks but
+      # reaches fewer of RB_SCORING=random's scoring categories.
       matrix:
         include:
           - os: ubuntu-latest
@@ -410,6 +416,7 @@ jobs:
             cxx: "g++"
             cc: "gcc"
             allow_unsupported: "1"
+            kernel_sweep: "full"
             name: "Linux x86_64 AVX2 (gcc compat)"
             artifact_slug: "linux-x86_64-avx2-gcc-compat"
 
@@ -2347,6 +2354,11 @@ jobs:
     name: Warm compiler cache (${{ matrix.config }})
     if: github.event_name == 'push'
     runs-on: ${{ matrix.os }}
+    # `actions: write` only for the step that deletes superseded cache entries.
+    # This job runs only on push to main, so it never runs PR code.
+    permissions:
+      contents: read
+      actions: write
     # A rebuild from a warm cache is a minute or two; a cold one (first run,
     # or after a toolchain change) is the jobs' full compile time. Ceiling
     # catches a hung runner only.
@@ -2492,6 +2504,8 @@ jobs:
             rescue-prune-eq rescue-band-harness rescue-band-kernel-eq \
             arch="$row_arch" CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
           make -C test header_insert_test CXX="$CXX"
+          make kvec_alloc_fail_test
+          make klib_alloc_fail_test
           if [ "$MATRIX_HARNESS" = true ]; then
             # test/run_unit_tests.sh's two builds.
             make -C test
@@ -2547,6 +2561,24 @@ jobs:
         with:
           path: ${{ runner.temp }}/ccache
           key: ${{ env.CCACHE_CACHE_KEY }}
+
+      # PRs restore only main's newest entry per configuration, so the ones it
+      # supersedes would just hold quota until LRU eviction pushed out caches
+      # still in use. Drop them (best effort; see the script). The canonical
+      # entry also prunes the coverage job's entries: coverage saves its own
+      # cache on push but, running PR code too, gets no `actions: write`.
+      - name: Prune superseded ccache entries
+        if: '!cancelled()'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          MATRIX_CANONICAL: ${{ matrix.canonical || false }}
+        run: |
+          prune=.github/actions/setup-ccache/prune-main-caches.sh
+          bash "$prune" "$CCACHE_KEY_PREFIX" "$CCACHE_CACHE_KEY"
+          if [ "$MATRIX_CANONICAL" = true ]; then
+            bash "$prune" "ccache-coverage-$RUNNER_OS-$RUNNER_ARCH-"
+          fi
 
       # The chr22 fixture's caches (reference, bwa index, upstream bwa's parity
       # result) are keyed on their inputs, not the commit, but a cache saved in
