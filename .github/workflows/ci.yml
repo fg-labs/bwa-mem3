@@ -715,6 +715,31 @@ jobs:
         # ERROR: message rather than silently mis-aligning.
         run: BWA_MEM3=./bwa-mem3 bash test/regression/arg_range_validation.sh
 
+      # The `mem` CLI suite: records whose every field is worked out by hand from
+      # a generated reference (test/fixtures/mem_synth_ref.awk) or the committed
+      # phiX, so it needs no download, no third-party tool and no cached index,
+      # and finishes in seconds. Every row rather than the canonical one: its
+      # expected values may not depend on the platform, compiler, allocator or
+      # SIMD tier, and each script runs every check under each tier this runner
+      # has (BWAMEM3_FORCE_TIER: avx2 and avx512bw on x86, neon on arm64), so a
+      # row is where a platform- or tier-specific divergence shows up. Scripts
+      # share test/framework/mem_cli.sh; checks that need samtools report SKIP:
+      # where it is absent (the macOS row).
+      - name: mem CLI basics (hand-derived records, each SIMD tier)
+        run: BWA_MEM3=./bwa-mem3 bash test/regression/mem_cli_basics.sh
+
+      - name: mem CLI input and output (hand-derived records, each SIMD tier)
+        run: BWA_MEM3=./bwa-mem3 bash test/regression/mem_io_cli.sh
+
+      - name: mem CLI seeding (hand-derived records, each SIMD tier)
+        run: BWA_MEM3=./bwa-mem3 bash test/regression/mem_seed_cli.sh
+
+      - name: mem CLI chaining and extension (hand-derived records, each SIMD tier)
+        run: BWA_MEM3=./bwa-mem3 bash test/regression/mem_extend_cli.sh
+
+      - name: mem CLI pairing, rescue, MAPQ and modes (hand-derived records, each SIMD tier)
+        run: BWA_MEM3=./bwa-mem3 bash test/regression/mem_pair_cli.sh
+
       - name: Build doctest framework and unit binary
         # Invoke via the parent `test-binaries` target so ARCH_FLAGS
         # propagate from libbwa.a's build into the test CXXFLAGS. Ensures

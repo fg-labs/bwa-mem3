@@ -22,6 +22,8 @@ All four SMEM/seed tests share `phix.fa` (phiX174, NC_001422.1, 5386 bp) as the 
 
 `supp_rep/build_fixture.awk` is a generator (no committed data) used by `test/regression/supp_rep_hard_cap.sh`. It emits a deterministic engineered reference + SE reads exercising `--supp-rep-hard-cap` against a chain with a high-SA-count SMEM but a uniquely-disambiguated extension; see comments at the top of the awk script.
 
+`mem_synth_ref.awk` is a generator (no committed data) for the 12.6 kb synthetic reference the `mem` CLI scripts (`test/regression/mem_cli_basics.sh` and the `mem_*_cli.sh` scripts beside it) align against, and that `test/framework/mem_fixture.h` reproduces in memory for the unit tests. Four contigs drawn from one Park-Miller stream (exact in awk's doubles, so byte-identical across awk implementations), with planted features at fixed coordinates: a 300 bp block present three times (twice forward, once reverse-complemented), a 500 bp block with a 5%-diverged second copy, an `(AC)` repeat, a 40 bp `N` run and a poly-A run; every other 19-mer is unique. The header of the script lists the coordinates. Its output's POSIX `cksum` is pinned in both consumers, so changing the generator fails them until the pin, and every expected value derived from the old reference, is updated.
+
 ## Regenerating the fixtures
 
 Fixtures are derived from `phix.fa` (committed). To regenerate after a format change:

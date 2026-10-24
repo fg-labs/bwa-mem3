@@ -142,6 +142,16 @@ Write a standalone bash script in `test/regression/<name>.sh`:
 - Add a row to `test/regression/README.md`.
 - Wire it into `.github/workflows/ci.yml`: a script that needs only the built `bwa-mem3` and fixtures goes in the `canonical-regressions` job; one that needs the canonical row's built tree goes in `build-and-test` with the `if: matrix.canonical == true` gate.
 
+Scripts that check `bwa-mem3 mem` output field by field can source the shared
+helpers in `test/framework/mem_cli.sh` (see `test/regression/mem_cli_basics.sh`
+for a complete example): `mem_cli_setup_synth` generates and indexes the
+synthetic reference of `test/fixtures/mem_synth_ref.awk` (its header lists the
+contigs and planted repeats, so expected coordinates can be worked out by hand),
+`mem_cli_tiers` lists the SIMD tiers the runner can run and `mem_cli_mem` runs
+`mem` under one of them (`BWAMEM3_FORCE_TIER`), and `mem_cli_primary`,
+`mem_cli_col` and `mem_cli_tag` read records back. The helpers keep to bash 3.2
+and POSIX awk, so these scripts run on every matrix row, macOS included.
+
 Choose regression over integration when:
 - The test shells out to bwa-mem3 (or any other binary) as a process.
 - The test diffs against a third-party tool's output (bwa, bwa-meth, samtools).
@@ -191,3 +201,5 @@ For a test using `std::mt19937(seed)`, reproduce locally by editing the seed and
 | `framework/ext_result.h`         | `ExtResult`: one extension's six result fields |
 | `framework/junit_reporter.h`     | CI matrix-row banner                           |
 | `framework/test_main.cpp`        | Shared `main()` (single doctest IMPL TU)       |
+| `framework/mem_fixture.h`        | Synthetic reference (same bases as `fixtures/mem_synth_ref.awk`), `nt4`/`revcomp`, `TempDir`, `TempIndex` (a real index built and loaded in a temp directory) |
+| `framework/mem_cli.sh`           | Source-only shell helpers for the `mem` CLI regression scripts |
