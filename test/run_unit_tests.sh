@@ -25,8 +25,18 @@ skip() { echo "SKIP: $*"; }
 
 [[ -x "$BWAMEM3" ]] || fail "bwa-mem3 not built at $BWAMEM3 (run 'make' or 'make arm64' first)"
 
-# Build the standalone test binaries.
-(cd "$HERE" && make) || fail "test/ make failed"
+# Build the standalone test binaries, one make job per CPU: about thirty
+# compiles and links that depend on nothing but their own sources, libbwa.a and
+# the libsais-objs sub-make (an order-only prerequisite, so it runs once, first).
+# Built one at a time they were most of this script's time on a CI runner.
+# Under -j make's output interleaves, so a failed parallel build is re-run
+# serially, which rebuilds only what failed and prints its error last, unmixed.
+njobs="$(nproc 2> /dev/null || sysctl -n hw.ncpu 2> /dev/null || echo 1)"
+if ! (cd "$HERE" && make -j"$njobs"); then
+    echo "test/ make -j$njobs failed; re-running it serially for a readable error" >&2
+    (cd "$HERE" && make) || fail "test/ make failed"
+    fail "test/ make failed under -j$njobs but not serially (a missing prerequisite in test/Makefile?)"
+fi
 
 # Build any test binaries that live outside test/Makefile (MAKE_ARGS: see the header).
 read -r -a make_args <<< "${MAKE_ARGS:-}"
