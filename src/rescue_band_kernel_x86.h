@@ -5,8 +5,10 @@
  * anonymous namespace, the run_jobs helpers as file-scope statics). Same band
  * coordinates, SoA layout (one byte per lane, RB_L = 32 lanes per position / row), kernels
  * (rb_dp_core<FScan, SC>, rb_dp_wave2<SC>), qe scan and row bookkeeping; every value the caller reads
- * (gmax, te, qe, the row maxima R) is the NEON kernel's for the same lanes. Two encodings differ,
- * because x86 has no NEON TBL / SQADD:
+ * (gmax, te, qe, the row maxima R) is the NEON kernel's for the same lanes. The NEON section has
+ * since trimmed its qe scan (a select per cell, no live mask), its te (bytes, written at run ends in
+ * pass 0) and its pass dispatch (rb_dp_wave2_pass<SC, EARLY>); this file keeps the earlier forms,
+ * which compute the same values. Two encodings differ, because x86 has no NEON TBL / SQADD:
  *
  *  - Query pad code 0x80 (RB_QPAD) instead of 0x40. PSHUFB returns 0 only when bit 7 of the index
  *    is set (and otherwise reads its low nibble), so the pad and the nonexistent code 0xC0 must both
@@ -264,7 +266,8 @@ static long rb_dp_core(rb_work &w, int W, int NR, int omax, int ominq, int omask
     return computed;
 }
 
-/* rb_qe_scan of the NEON section, 32 lanes. */
+/* rb_qe_scan as the NEON section first had it (match & kv under the live mask, a max per slot), 32
+ * lanes; the NEON scan now keeps the last match with a select and no mask, for the same result. */
 static inline void rb_qe_scan(rb_work &w, const uint8_t *Hrow, int row, int W, int omax, int ominq,
                               __m256i msk, __m256i gmax)
 {
@@ -295,8 +298,9 @@ static inline void rb_qe_scan(rb_work &w, const uint8_t *Hrow, int row, int W, i
 }
 
 /* rb_dp_wave2 of the NEON section (the default kernel: the fused cell on two rows per step with
- * the direct qe scan), 32 lanes; see there for the pairing argument. The pair (r, k), (r + 1, k + 1)
- * shares the query slot p, so one A / QL / BI load serves both. */
+ * the direct qe scan), 32 lanes; see there for the pairing argument. te is written on every
+ * improving row here, and the pass is a runtime argument (the NEON kernel's earlier form). The
+ * pair (r, k), (r + 1, k + 1) shares the query slot p, so one A / QL / BI load serves both. */
 template <int SC>
 static long rb_dp_wave2(rb_work &w, int W, int NR, int omax, int ominq, int omaskq, bool early)
 {

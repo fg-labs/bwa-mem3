@@ -1334,9 +1334,9 @@ jobs:
 
       # The NEON banded kernels against each other below the end results: the two-row kernel
       # (rb_dp_wave2, the default) and the one-row fused kernel (rb_dp_core<true>) must agree on
-      # every row maximum, gmax and te, over random band geometries in all three scoring forms.
-      # On x86 the binary reports SKIP (an error on an arm64 runner). As above, a negative control
-      # (kernel 2's te shifted in one lane) must fail first.
+      # every row maximum, gmax, te and query end, over random band geometries in all three
+      # scoring forms. On x86 the binary reports SKIP (an error on an arm64 runner). As above,
+      # negative controls (kernel 2's te, then its query end, shifted in one lane) must fail first.
       - name: Banded rescue kernels agree (rescue_band_kernel_eq)
         env:
           MATRIX_ARCH_FLAG: ${{ matrix.arch_flag }}
@@ -1355,6 +1355,11 @@ jobs:
             exit 0
           fi
           grep -q 'MISMATCHES=[1-9]' rbk_nc.log || { cat rbk_nc.log; echo "::error::negative control failed without reporting a MISMATCH"; exit 1; }
+          # The same for the query-end check (only reached on arm64: the step exits above on a SKIP).
+          if RB_NEGATIVE_CONTROL_QE=1 ./rescue_band_kernel_eq 2000 1 > rbk_ncqe.log 2>&1; then
+            cat rbk_ncqe.log; echo "::error::query-end negative control exited 0: the check missed an injected disagreement"; exit 1
+          fi
+          grep -q 'MISMATCHES=[1-9]' rbk_ncqe.log || { cat rbk_ncqe.log; echo "::error::query-end negative control failed without reporting a MISMATCH"; exit 1; }
           ./rescue_band_kernel_eq 20000 1
           ./rescue_band_kernel_eq 20000 2
 

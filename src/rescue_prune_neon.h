@@ -625,6 +625,10 @@ static inline Kind lean_neon_core(const Job &jb, NeonScratch &s, int &hb, int &h
         /* K > 5: the raw presence bits of the previous block (rows b - 16 .. b - 1), for the chained
          * prefilter; zero before block 0, whose rows below KK - 1 are dropped anyway. */
         unsigned ph = 0;
+        // the row numbers of the next block's two halves, carried (blocks run b = 0, 16, 32, ...;
+        // b + 15 < 65536, so they equal IO + b and IO + b + 8)
+        uint16x8_t posA = IO, posB = vaddq_u16(IO, k8);
+        const uint16x8_t k16 = vdupq_n_u16(16);
         // rows b..b+15, of which those with bit set in keep are inside the window
         auto block = [&](int b, unsigned keep) {
             const uint8_t *buf = s.rbuf + b;
@@ -648,13 +652,14 @@ static inline Kind lean_neon_core(const Job &jb, NeonScratch &s, int &hb, int &h
             }
             const uint16x8_t c0 = vreinterpretq_u16_u8(vzip1q_u8(lo, a0));
             const uint16x8_t c1 = vreinterpretq_u16_u8(vzip2q_u8(lo, a0));
-            const uint16x8_t pos = vaddq_u16(IO, vdupq_n_u16((uint16_t)b));
+            const uint16x8_t pos = posA, pos8 = posB;
+            posA = vaddq_u16(posA, k16); posB = vaddq_u16(posB, k16);
             const unsigned ml = m16 & 0xFF, mh = m16 >> 8;
             const uint8x16_t shl = vld1q_u8(s.shuf[ml]), shh = vld1q_u8(s.shuf[mh]);
             neon_pack_store(rp, pos, shl);
             neon_pack_store(cp, c0, shl);
             rp += s.pc[ml]; cp += s.pc[ml];
-            neon_pack_store(rp, vaddq_u16(pos, k8), shh);
+            neon_pack_store(rp, pos8, shh);
             neon_pack_store(cp, c1, shh);
             rp += s.pc[mh]; cp += s.pc[mh];
         };
@@ -725,26 +730,40 @@ static inline Kind lean_neon_core(const Job &jb, NeonScratch &s, int &hb, int &h
             return vreinterpretq_u16_u64(vcombine_u64(vcreate_u64(a), vcreate_u64(b)));
         };
         uint32x4_t extra = vdupq_n_u32(0);   // gate: occurrences - 1 summed over the hit rows
-        for (int k0 = 0; k0 < np; k0 += 8, idx = vaddq_u16(idx, k8)) {
-            const uint16x8_t r = vld1q_u16(s.PR + k0);
-            const uint16x8_t e0 = look4(s.PC + k0), e1 = look4(s.PC + k0 + 4);
-            const uint16x8_t t = vuzp1q_u16(e0, e1), occ = vuzp2q_u16(e0, e1);
-            const uint16x8_t tv = vandq_u16(t, k1fff);                  // off - j_last
-            const uint16x8_t d = vaddq_u16(r, tv);
-            const uint16x8_t rp = vextq_u16(pR, r, 7), dp = vextq_u16(pD, d, 7);
-            pR = r; pD = d;
-            const uint16x8_t valid = vcltq_u16(idx, vn);
-            const uint16x8_t cont = vandq_u16(vceqq_u16(r, vaddq_u16(rp, one16)), vceqq_u16(d, dp));
-            const uint16x8_t bd = vbicq_u16(valid, cont);
-            const uint16x8_t mu = vandq_u16(vtstq_u16(t, k2000), valid);
-            extra = vpadalq_u16(extra, vandq_u16(vsubq_u16(occ, one16), valid));
-            const unsigned m = vaddvq_u16(vorrq_u16(vandq_u16(bd, WL), vandq_u16(mu, WH)));
-            pack_runs(bp, bdp, brp, idx, d, r, m & 0xFF);
-            const uint8x16_t sh = vld1q_u8(s.shuf[m >> 8]);
-            neon_pack_store(mp, r, sh);
-            neon_pack_store(jp, Rel ? vld1q_u16(s.PC + k0) : vsubq_u16(koff, tv), sh);   // Rel: the code
-            mp += s.pc[m >> 8]; jp += s.pc[m >> 8];
+        /* One block of 8 hit rows at K0. WHOLE: the block lies wholly below np, so valid is all ones and
+         * its ANDs fold away; only the last block can hold lanes at or past np. A macro, not a lambda:
+         * WHOLE must be a compile-time constant, and this header is also built as C++11, which has no
+         * generic lambdas to pass one through. */
+#define RPN_L1(K0, WHOLE)                                                                                   \
+        {                                                                                                   \
+            const int k0 = (K0);                                                                            \
+            const uint16x8_t r = vld1q_u16(s.PR + k0);                                                      \
+            const uint16x8_t e0 = look4(s.PC + k0), e1 = look4(s.PC + k0 + 4);                              \
+            const uint16x8_t t = vuzp1q_u16(e0, e1), occ = vuzp2q_u16(e0, e1);                              \
+            const uint16x8_t tv = vandq_u16(t, k1fff);  /* off - j_last */                                  \
+            const uint16x8_t d = vaddq_u16(r, tv);                                                          \
+            const uint16x8_t rp = vextq_u16(pR, r, 7), dp = vextq_u16(pD, d, 7);                            \
+            pR = r; pD = d;                                                                                 \
+            const uint16x8_t valid = WHOLE ? vdupq_n_u16(0xFFFF) : vcltq_u16(idx, vn);                      \
+            const uint16x8_t cont = vandq_u16(vceqq_u16(r, vaddq_u16(rp, one16)), vceqq_u16(d, dp));        \
+            const uint16x8_t bd = vbicq_u16(valid, cont);                                                   \
+            const uint16x8_t mu = vandq_u16(vtstq_u16(t, k2000), valid);                                    \
+            extra = vpadalq_u16(extra, vandq_u16(vsubq_u16(occ, one16), valid));                            \
+            const unsigned m = vaddvq_u16(vorrq_u16(vandq_u16(bd, WL), vandq_u16(mu, WH)));                 \
+            pack_runs(bp, bdp, brp, idx, d, r, m & 0xFF);                                                   \
+            const uint8x16_t sh = vld1q_u8(s.shuf[m >> 8]);                                                 \
+            neon_pack_store(mp, r, sh);                                                                     \
+            neon_pack_store(jp, Rel ? vld1q_u16(s.PC + k0) : vsubq_u16(koff, tv), sh);  /* Rel: the code */ \
+            mp += s.pc[m >> 8]; jp += s.pc[m >> 8];                                                         \
+            idx = vaddq_u16(idx, k8);                                                                       \
         }
+        {
+            int kb = 0;
+            for (; kb + 16 <= np; kb += 16) { RPN_L1(kb, true) RPN_L1(kb + 8, true) }   // two per trip
+            if (kb + 8 <= np) { RPN_L1(kb, true) kb += 8; }
+            if (kb < np) RPN_L1(kb, false)
+        }
+#undef RPN_L1
         n = (int)(mp - s.RA);
         // Gate: the total hit count is known now (each hit row adds its code's occurrences),
         // before anything is accumulated.
@@ -799,32 +818,42 @@ static inline Kind lean_neon_core(const Job &jb, NeonScratch &s, int &hb, int &h
             uint16_t *bp = s.B, *bdp = s.BD, *brp = s.BR, *rp2 = R2, *jp2 = (uint16_t *)J2;
             uint16x8_t pR = vdupq_n_u16(0), pD = vdupq_n_u16(0xFFFF), idx = IO;
             const uint16x8_t vn = vdupq_n_u16((uint16_t)n);
-            for (int k0 = 0; k0 < n; k0 += 8, idx = vaddq_u16(idx, k8)) {
-                const uint16x8_t r = vld1q_u16(R + k0);
-                uint16x8_t jv;
-                int16x8_t jn;
-                if (Rel) {
-                    uint64_t j0, n0, j1, n1;
-                    filter_ent4(ent, J + k0, j0, n0); filter_ent4(ent, J + k0 + 4, j1, n1);
-                    jv = vreinterpretq_u16_u64(vcombine_u64(vcreate_u64(j0), vcreate_u64(j1)));
-                    jn = vreinterpretq_s16_u64(vcombine_u64(vcreate_u64(n0), vcreate_u64(n1)));
-                } else {
-                    jv = vreinterpretq_u16_s16(vld1q_s16(J + k0));
-                    jn = vreinterpretq_s16_u64(vcombine_u64(vcreate_u64(nxt4(J + k0)), vcreate_u64(nxt4(J + k0 + 4))));
-                }
-                const uint16x8_t d = vsubq_u16(vaddq_u16(r, koff), jv);
-                const uint16x8_t rp = vextq_u16(pR, r, 7), dp = vextq_u16(pD, d, 7);
-                pR = r; pD = d;
-                const uint16x8_t valid = vcltq_u16(idx, vn);
-                const uint16x8_t cont = vandq_u16(vceqq_u16(r, vaddq_u16(rp, one16)), vceqq_u16(d, dp));
-                const uint16x8_t keep = vandq_u16(vcgezq_s16(jn), valid);
-                const unsigned m = vaddvq_u16(vorrq_u16(vandq_u16(vbicq_u16(valid, cont), WL), vandq_u16(keep, WH)));
-                pack_runs(bp, bdp, brp, idx, d, r, m & 0xFF);
-                const uint8x16_t sh = vld1q_u8(s.shuf[m >> 8]);
-                neon_pack_store(rp2, r, sh);
-                neon_pack_store(jp2, vreinterpretq_u16_s16(jn), sh);
-                rp2 += s.pc[m >> 8]; jp2 += s.pc[m >> 8];
+            // as layer 1 (RPN_L1): whole blocks without the valid mask, the partial last one with it
+#define RPN_LK(K0, WHOLE)                                                                                   \
+            {                                                                                               \
+                const int k0 = (K0);                                                                        \
+                const uint16x8_t r = vld1q_u16(R + k0);                                                     \
+                uint16x8_t jv;                                                                              \
+                int16x8_t jn;                                                                               \
+                if (Rel) {                                                                                  \
+                    uint64_t j0, n0, j1, n1;                                                                \
+                    filter_ent4(ent, J + k0, j0, n0); filter_ent4(ent, J + k0 + 4, j1, n1);                 \
+                    jv = vreinterpretq_u16_u64(vcombine_u64(vcreate_u64(j0), vcreate_u64(j1)));             \
+                    jn = vreinterpretq_s16_u64(vcombine_u64(vcreate_u64(n0), vcreate_u64(n1)));             \
+                } else {                                                                                    \
+                    jv = vreinterpretq_u16_s16(vld1q_s16(J + k0));                                          \
+                    jn = vreinterpretq_s16_u64(vcombine_u64(vcreate_u64(nxt4(J + k0)), vcreate_u64(nxt4(J + k0 + 4)))); \
+                }                                                                                           \
+                const uint16x8_t d = vsubq_u16(vaddq_u16(r, koff), jv);                                     \
+                const uint16x8_t rp = vextq_u16(pR, r, 7), dp = vextq_u16(pD, d, 7);                        \
+                pR = r; pD = d;                                                                             \
+                const uint16x8_t valid = WHOLE ? vdupq_n_u16(0xFFFF) : vcltq_u16(idx, vn);                  \
+                const uint16x8_t cont = vandq_u16(vceqq_u16(r, vaddq_u16(rp, one16)), vceqq_u16(d, dp));    \
+                const uint16x8_t keep = vandq_u16(vcgezq_s16(jn), valid);                                   \
+                const unsigned m = vaddvq_u16(vorrq_u16(vandq_u16(vbicq_u16(valid, cont), WL), vandq_u16(keep, WH))); \
+                pack_runs(bp, bdp, brp, idx, d, r, m & 0xFF);                                               \
+                const uint8x16_t sh = vld1q_u8(s.shuf[m >> 8]);                                             \
+                neon_pack_store(rp2, r, sh);                                                                \
+                neon_pack_store(jp2, vreinterpretq_u16_s16(jn), sh);                                        \
+                rp2 += s.pc[m >> 8]; jp2 += s.pc[m >> 8];                                                   \
+                idx = vaddq_u16(idx, k8);                                                                   \
             }
+            {
+                int kb = 0;
+                for (; kb + 8 <= n; kb += 8) RPN_LK(kb, true)
+                if (kb < n) RPN_LK(kb, false)
+            }
+#undef RPN_LK
             const int nbd = (int)(bp - s.B);
             s.B[nbd] = (uint16_t)n;
             uint16_t *__restrict cnt = s.cnt;
