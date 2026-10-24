@@ -95,7 +95,7 @@
 #           count); records come out in input order, and every renamed copy of a
 #           read or pair gets its original's records. The same for 3300 short
 #           reads in 1200-read batches at -t 4 (where the process step streams
-#           finished 512-read work items to the output), with streaming off
+#           finished work items to the output), with streaming off
 #           (BWA_MEM3_STREAM_OUTPUT=0), and at -t 1.
 #   tiers   every SAM above is byte-identical across tiers (@PG aside).
 #
@@ -409,9 +409,9 @@ done
 
 # Many short reads, for output streaming: 300 renamed copies of the eleven
 # 100 bp fmt reads (all but "long"). At -K 120000 a batch holds 1200 reads,
-# more than one of the 512-read work items whose records the process step may
-# write as soon as they and every earlier item are done (SAM text, single-end,
-# -t > 1).
+# more than one of the work items (512 reads; 1024 on Apple silicon) whose
+# records the process step may write as soon as they and every earlier item
+# are done (SAM text, single-end, -t > 1).
 awk 'NR % 4 == 1 { keep = ($1 != "@long") } keep' "$work/fmt.fq" > "$work/short.fq"
 awk -v n=300 '{ line[NR] = $0 }
     END {
