@@ -29,6 +29,10 @@
 #   zd3    ctg1:2701-2800, mm at 51, 52, 53    100M, AS 97 - 12 = 85
 #   w10    ctg1:1301-1360 + ctg1:1371-1410     60M10D40M, AS 100 - (6 + 10) = 84
 #          (bases 1360/1370 and 1361/1371 differ: one placement)
+#   r2     ctg1:4001-4050 + ctg1:4059-4088 + ctg1:4097-4136: two 8-base
+#          deletions, 50M8D28M8D42M, AS 120 - 2*(6 + 8) = 92 (the second
+#          deletion moves 2 bases left: 4087-4088 equal 4095-4096, 4086 does
+#          not equal 4094; the first cannot: 4050 differs from 4058)
 #   inR    ctg1:2101-2200, inside block R (three exact copies)
 #   inS    ctg1:3101-3200, inside block S (ctg2 copy with 5 mismatches here:
 #          AS 95 - 20 = 75 at ctg2:2101)
@@ -64,9 +68,18 @@
 #             of the band: primary 60M40S AS 60 + supplementary 60H40M AS 40;
 #             -w 10: 60M10D40M AS 84. With -W 70, -w 10 still gives 60M10D40M
 #             (one chain, weight 100) and -w 9 leaves two chains of 60 and 40,
-#             both dropped: unmapped.
-#   -N        -N 1 extends only the best chain: inR MAPQ 60 XS 0 no XA (its hit
-#             one of the three copies), inS XS 0; -N 2: inR XS 100, one XA hit.
+#             both dropped: unmapped. r2 at -w 8: one chain (diagonals 0, 8,
+#             16, each step 8), but the second deletion is 16 off the first
+#             seed's diagonal, outside band 8: only the band-doubling retry
+#             reaches it, giving the full 50M8D28M8D42M AS 92 with MD
+#             50^<4051-4058>28^<4087-4094>42 and NM 16; at -w 7 the three
+#             seeds are three chains, so the primary is the first seed's
+#             51M69S (read base 51 matches 4051 by chance) AS 51, with two
+#             supplementary records.
+#   -N        -N 1 drops every chain marked kept 1 or 2 (one that overlaps a
+#             heavier chain), so each of these reads keeps one: inR MAPQ 60
+#             XS 0 no XA (its hit one of the three equal copies), inS XS 0;
+#             -N 2 keeps the first such chain: inR XS 100, one XA hit.
 #   -h -z -a  inR's two other copies are in XA at -h 2, not at -h 1 (HN 2
 #             both); inS's ctg2 hit (75) is in XA at -z 0.75, not at -z 0.76;
 #             -a writes it as a secondary record, ctg2:2101 100M NM 5 AS 75,
@@ -80,6 +93,10 @@
 #             pairs reach both kernels (BWAMEM3_DUMP_PAIRS lists widths 8 and 16).
 #   threads   -t 1 and -t 4 at -K 10000 give the same SAM on the generated
 #             reads.
+#   identity  on the generated reads, each path documented as byte-identical
+#             gives the default SAM: --keep-contained-ext, --skip-contained-ext,
+#             --no-band-cert, --no-adaptive-band, --dedup off, --dedup on,
+#             BWA3_CHAIN_FLAT_CAP=0 and =1, BWAMEM3_FORCE_GENMAT=1.
 #   tiers     every SAM above is byte-identical across tiers (@PG aside).
 #
 # Inputs (env vars):
@@ -138,6 +155,19 @@ fields() {
         "$(mem_cli_col "$1" 6)" "$(mem_cli_tag "$1" AS)"
 }
 
+# xa_hits <record>: the number of hits in its XA tag.
+xa_hits() {
+    mem_cli_tag "$1" XA | tr ';' '\n' | awk 'NF' | wc -l | tr -d ' '
+}
+
+# widths_used <pair-dump>: "8 16" when BWAMEM3_DUMP_PAIRS rows name both
+# banded-SW kernel widths ("-" for one that does not occur).
+widths_used() {
+    awk -F '\t' '
+        NR > 1 && ($5 == 8 || $5 == 16) { seen[$5] = 1 }
+        END { printf "%s %s", (8 in seen ? "8" : "-"), (16 in seen ? "16" : "-") }' "$1"
+}
+
 # expect_primary <label> <sam> <qname> <"FLAG RNAME POS CIGAR AS">
 expect_primary() {
     mem_cli_expect "$1: $3 FLAG RNAME POS CIGAR AS" "$4" "$(fields "$(mem_cli_primary "$2" "$3")")"
@@ -162,6 +192,18 @@ l150="$(mutate "$(seq_at ctg2 101 150)" 3 6 145 148)"
 l250="$(mutate "$(seq_at ctg1 3901 250)" 2 5 246 249)"
 l300="$(mutate "$(seq_at ctg1 1501 300)" 3 6 295 298)"
 
+r2="$(seq_at ctg1 4001 50)$(seq_at ctg1 4059 30)$(seq_at ctg1 4097 40)"
+r2_md="50^$(seq_at ctg1 4051 8)28^$(seq_at ctg1 4087 8)42"
+placed=yes
+[[ "$(seq_at ctg1 4050 1)" != "$(seq_at ctg1 4058 1)" ]] || placed=no
+[[ "$(seq_at ctg1 4087 2)" == "$(seq_at ctg1 4095 2)" ]] || placed=no
+[[ "$(seq_at ctg1 4086 1)" != "$(seq_at ctg1 4094 1)" ]] || placed=no
+[[ "$(seq_at ctg1 4051 1)" == "$(seq_at ctg1 4059 1)" ]] || placed=no
+if [[ $placed != yes ]]; then
+    echo "FAIL: mem_extend_cli: r2's deletions are not placed as the header says on this reference" >&2
+    exit 1
+fi
+
 # The 10-base deletion has one placement only if it cannot shift by one.
 if [[ "$(seq_at ctg1 1360 1)" == "$(seq_at ctg1 1370 1)" || "$(seq_at ctg1 1361 1)" == "$(seq_at ctg1 1371 1)" ]]; then
     echo "FAIL: mem_extend_cli: the w10 deletion is not uniquely placed on this reference" >&2
@@ -178,6 +220,7 @@ fi
     mem_cli_fq zd "$zd"
     mem_cli_fq zd3 "$zd3"
     mem_cli_fq w10 "$w10"
+    mem_cli_fq r2 "$r2"
     mem_cli_fq inR "$(seq_at ctg1 2101 100)"
     mem_cli_fq inS "$(seq_at ctg1 3101 100)"
     mem_cli_fq l150 "$l150"
@@ -187,7 +230,9 @@ fi
 
 # 300 generated reads: 60-400 bases from any contig, either strand, with up to
 # four substitutions and, in one read of three, a 1-6 base insertion or
-# deletion; positions from the Park-Miller generator (exact in awk doubles).
+# deletion; every tenth is written twice (g<n> and g<n>d), so identical
+# extension jobs occur within a batch. Positions from the Park-Miller generator
+# (exact in awk doubles).
 awk -v n=300 '
     function rnd(k) { x = (x * 48271) % 2147483647; return x % k }
     function rc(s,   i, o, c) {
@@ -224,6 +269,7 @@ awk -v n=300 '
             q = s
             gsub(/./, "I", q)
             printf "@g%d\n%s\n+\n%s\n", r, s, q
+            if (r % 10 == 0) printf "@g%dd\n%s\n+\n%s\n", r, s, q
         }
     }' "$ref" > "$work/generated.fq"
 cat "$work/reads.fq" "$work/generated.fq" > "$work/all.fq"
@@ -240,6 +286,8 @@ runs=(
     "t96|-T 96"
     "d3|-d 3"
     "d4|-d 4"
+    "w7|-w 7"
+    "w8|-w 8"
     "w9|-w 9"
     "w10|-w 10"
     "w9W70|-w 9 -W 70"
@@ -276,8 +324,9 @@ for tier in $(mem_cli_tiers); do
     expect_primary "$tier: default" "$(s default)" l150 "0 ctg2 101 150M 138"
     expect_primary "$tier: default" "$(s default)" l250 "0 ctg1 3906 5S240M5S 240"
     expect_primary "$tier: default" "$(s default)" l300 "0 ctg1 1501 300M 288"
-    mem_cli_expect "$tier: default l150 l300 NM" "4 4" \
-        "$(mem_cli_tag "$(mem_cli_primary "$(s default)" l150)" NM) $(mem_cli_tag "$(mem_cli_primary "$(s default)" l300)" NM)"
+    nm150="$(mem_cli_tag "$(mem_cli_primary "$(s default)" l150)" NM)"
+    nm300="$(mem_cli_tag "$(mem_cli_primary "$(s default)" l300)" NM)"
+    mem_cli_expect "$tier: default l150 l300 NM" "4 4" "$nm150 $nm300"
     expect_primary "$tier: default" "$(s default)" zd "0 ctg1 2501 100M 90"
     expect_primary "$tier: default" "$(s default)" zd3 "0 ctg1 2701 100M 85"
     expect_primary "$tier: default" "$(s default)" w10 "0 ctg1 1301 60M10D40M 84"
@@ -318,6 +367,15 @@ for tier in $(mem_cli_tiers); do
     mem_cli_expect "$tier: -w 9 -W 70 w10 FLAG RNAME" "4 *" \
         "$(mem_cli_col "$(mem_cli_primary "$(s w9W70)" w10)" 2) $(mem_cli_col "$(mem_cli_primary "$(s w9W70)" w10)" 3)"
 
+    expect_primary "$tier: default" "$(s default)" r2 "0 ctg1 4001 50M8D28M8D42M 92"
+    expect_primary "$tier: -w 8 (band retry)" "$(s w8)" r2 "0 ctg1 4001 50M8D28M8D42M 92"
+    rec="$(mem_cli_primary "$(s w8)" r2)"
+    mem_cli_expect "$tier: -w 8 r2 MD NM" "$r2_md 16" "$(mem_cli_tag "$rec" MD) $(mem_cli_tag "$rec" NM)"
+    expect_primary "$tier: -w 7" "$(s w7)" r2 "0 ctg1 4001 51M69S 51"
+    # shellcheck disable=SC2016 # an awk condition: its $n are awk fields
+    mem_cli_expect "$tier: -w 7 r2 supplementary records" 2 \
+        "$(mem_cli_count "$(s w7)" '$1 == "r2" && int($2 / 2048) % 2 == 1')"
+
     # -N: chains extended.
     rec="$(mem_cli_primary "$(s n1)" inR)"
     hit="$(mem_cli_col "$rec" 3):$(mem_cli_col "$rec" 4):$(mem_cli_col "$rec" 2)"
@@ -329,13 +387,13 @@ for tier in $(mem_cli_tiers); do
     mem_cli_expect "$tier: -N 1 inS XS" 0 "$(mem_cli_tag "$(mem_cli_primary "$(s n1)" inS)" XS)"
     rec="$(mem_cli_primary "$(s n2)" inR)"
     mem_cli_expect "$tier: -N 2 inR MAPQ XS XA-hits" "0 100 1" \
-        "$(mem_cli_col "$rec" 5) $(mem_cli_tag "$rec" XS) $(mem_cli_tag "$rec" XA | tr ';' '\n' | awk 'NF' | wc -l | tr -d ' ')"
+        "$(mem_cli_col "$rec" 5) $(mem_cli_tag "$rec" XS) $(xa_hits "$rec")"
     mem_cli_expect "$tier: default inS XS" 75 "$(mem_cli_tag "$(mem_cli_primary "$(s default)" inS)" XS)"
 
     # -h, -z, -a.
     rec="$(mem_cli_primary "$(s h2)" inR)"
     mem_cli_expect "$tier: -h 2 inR XA-hits HN" "2 2" \
-        "$(mem_cli_tag "$rec" XA | tr ';' '\n' | awk 'NF' | wc -l | tr -d ' ') $(mem_cli_tag "$rec" HN)"
+        "$(xa_hits "$rec") $(mem_cli_tag "$rec" HN)"
     rec="$(mem_cli_primary "$(s h1)" inR)"
     mem_cli_expect "$tier: -h 1 inR XA HN" " 2" "$(mem_cli_tag "$rec" XA) $(mem_cli_tag "$rec" HN)"
     mem_cli_expect "$tier: -z 0.75 inS XA" "ctg2,+2101,100M,5;" "$(mem_cli_tag "$(mem_cli_primary "$(s z75)" inS)" XA)"
@@ -345,7 +403,8 @@ for tier in $(mem_cli_tiers); do
     # shellcheck disable=SC2016 # an awk condition: its $n are awk fields
     mem_cli_expect "$tier: -a inR secondaries" 2 "$(mem_cli_count "$(s all)" '$1 == "inR" && int($2 / 256) % 2 == 1')"
     # shellcheck disable=SC2016 # an awk condition: its $n are awk fields
-    mem_cli_expect "$tier: default inS secondaries" 0 "$(mem_cli_count "$(s default)" '$1 == "inS" && int($2 / 256) % 2 == 1')"
+    mem_cli_expect "$tier: default inS secondaries" 0 \
+        "$(mem_cli_count "$(s default)" '$1 == "inS" && int($2 / 256) % 2 == 1')"
 
     # -x presets.
     expect_primary "$tier: -x intractg" "$(s intractg)" mm "0 ctg1 1001 100M 90"
@@ -365,28 +424,51 @@ for tier in $(mem_cli_tiers); do
         exit 1
     fi
     mem_cli_expect "$tier: generated reads reach the 8-bit and the 16-bit banded SW" "8 16" \
-        "$(awk -F '\t' 'NR > 1 && ($5 == 8 || $5 == 16) { seen[$5] = 1 } END { printf "%s", (8 in seen ? "8" : "-") " " (16 in seen ? "16" : "-") }' \
-            "$work/pairs.$tier.tsv")"
+        "$(widths_used "$work/pairs.$tier.tsv")"
     if ! BWAMEM3_DISABLE_BSW8=1 BWAMEM3_FORCE_TIER="$tier" "$BWA_MEM3" mem "$ref" "$work/all.fq" \
         > "$work/nobsw8.$tier.sam" 2> "$work/nobsw8.$tier.sam.err"; then
         echo "FAIL: mem_extend_cli: BWAMEM3_DISABLE_BSW8=1 run failed (tier $tier)" >&2
         exit 1
     fi
-    mem_cli_same_file "$tier: BWAMEM3_DISABLE_BSW8=1 SAM identical to default" "$work/all.$tier.sam" "$work/nobsw8.$tier.sam"
+    mem_cli_same_file "$tier: BWAMEM3_DISABLE_BSW8=1 SAM identical to default" \
+        "$work/all.$tier.sam" "$work/nobsw8.$tier.sam"
     mem_cli_mem "$tier" "$work/t1.$tier.sam" -t 1 -K 10000 "$ref" "$work/all.fq"
     mem_cli_mem "$tier" "$work/t4.$tier.sam" -t 4 -K 10000 "$ref" "$work/all.fq"
     mem_cli_same_file "$tier: -t 1 and -t 4 at -K 10000 identical" "$work/t1.$tier.sam" "$work/t4.$tier.sam"
+    # The paths the code documents as byte-identical to the default, each run
+    # with the default's fast path turned off or forced: the contained-seed
+    # extension skip, the certified band, extension-job dedup, the flat
+    # chaining index (0: every read through the B-tree; 1: a replay mid-read),
+    # and the generic-matrix prepass of the banded SW.
+    for alt in "keep|--keep-contained-ext" "skipdep|--skip-contained-ext" "nocert|--no-band-cert" \
+        "noadapt|--no-adaptive-band" "dedupoff|--dedup off" "dedupon|--dedup on"; do
+        # shellcheck disable=SC2086 # the options are word-split on purpose
+        mem_cli_mem "$tier" "$work/${alt%%|*}.$tier.sam" ${alt#*|} "$ref" "$work/all.fq"
+        mem_cli_same_file "$tier: ${alt#*|} SAM identical to default" "$work/all.$tier.sam" "$work/${alt%%|*}.$tier.sam"
+    done
+    for env in BWA3_CHAIN_FLAT_CAP=0 BWA3_CHAIN_FLAT_CAP=1 BWAMEM3_FORCE_GENMAT=1; do
+        if ! env "$env" BWAMEM3_FORCE_TIER="$tier" "$BWA_MEM3" mem "$ref" "$work/all.fq" \
+            > "$work/env.$tier.sam" 2> "$work/env.$tier.sam.err"; then
+            echo "FAIL: mem_extend_cli: $env run failed (tier $tier)" >&2
+            exit 1
+        fi
+        mem_cli_same_file "$tier: $env SAM identical to default" "$work/all.$tier.sam" "$work/env.$tier.sam"
+    done
+
     # Most generated reads map, so the comparisons above are not of empty output.
     # shellcheck disable=SC2016 # an awk condition: its $n are awk fields
-    mapped="$(mem_cli_count "$work/t1.$tier.sam" '$1 ~ /^g/ && int($2 / 4) % 2 == 0 && int($2 / 256) % 2 == 0 && int($2 / 2048) % 2 == 0')"
-    mem_cli_expect "$tier: at least 270 of the 300 generated reads mapped" yes "$( ((mapped >= 270)) && echo yes || echo "no ($mapped)")"
+    mapped="$(mem_cli_count "$work/t1.$tier.sam" \
+        '$1 ~ /^g/ && int($2 / 4) % 2 == 0 && int($2 / 256) % 2 == 0 && int($2 / 2048) % 2 == 0')"
+    mem_cli_expect "$tier: at least 300 of the 330 generated reads mapped" yes \
+        "$( ((mapped >= 300)) && echo yes || echo "no ($mapped)")"
 
     if [[ -z $first_tier ]]; then
         first_tier="$tier"
     else
         for run in "${runs[@]}" "all|" "t4|"; do
             name="${run%%|*}"
-            mem_cli_same_file "$name SAM identical, $first_tier vs $tier" "$work/$name.$first_tier.sam" "$work/$name.$tier.sam"
+            mem_cli_same_file "$name SAM identical, $first_tier vs $tier" \
+                "$work/$name.$first_tier.sam" "$work/$name.$tier.sam"
         done
     fi
 done

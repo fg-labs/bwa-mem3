@@ -60,7 +60,9 @@ struct Fixture {
     ~Fixture() { free(opt); }
     Fixture(const Fixture &) = delete;
     Fixture &operator=(const Fixture &) = delete;
-    std::vector<uint8_t> ref(size_t b, size_t e) const { return std::vector<uint8_t>(fwd.begin() + (long)b, fwd.begin() + (long)e); }
+    std::vector<uint8_t> ref(size_t b, size_t e) const {
+        return std::vector<uint8_t>(fwd.begin() + (long)b, fwd.begin() + (long)e);
+    }
 };
 
 mem_alnreg_t region(int qb, int qe, int64_t rb, int64_t re, int score, int w) {

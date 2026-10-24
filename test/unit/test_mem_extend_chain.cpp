@@ -16,7 +16,8 @@
 //     minimum seed length, is dropped; a chain kept with a significant overlap
 //     is marked kept=2, one without kept=3. The first chain found overlapping
 //     each kept chain is kept as well, with kept=1, so its score can inform the
-//     mapping quality. At most -N kept=1/2 chains are extended; later ones are
+//     mapping quality. Counting kept=1/2 chains heaviest first (kept=3 chains
+//     are not counted), the -N-th one and every kept=1/2 chain after it are
 //     dropped. Survivors stay heaviest first;
 //   - mem_flt_chained_seeds / mem_seed_sw: on a read long enough for the
 //     screen (min_l at most 0.05 * read length, where min_l is 1.1 * -W, or
@@ -190,7 +191,8 @@ std::vector<Kept> run_filter(std::vector<std::vector<mem_seed_t> > &seeds, const
 
 std::string show(const std::vector<Kept> &v) {
     std::string s;
-    for (const Kept &k : v) s += "(" + std::to_string(k.pos) + " kept " + std::to_string(k.kept) + " w " + std::to_string(k.w) + ")";
+    for (const Kept &k : v)
+        s += "(" + std::to_string(k.pos) + " kept " + std::to_string(k.kept) + " w " + std::to_string(k.w) + ")";
     return s;
 }
 
@@ -325,7 +327,7 @@ TEST_CASE("mem_chain_flt: hand-worked drops, shadows and caps"
         CHECK(same(run_filter(s, {1, 0}, defaults()), {{0, 3, 100}, {1, 3, 40}}));
         CHECK(same(run_filter(s, {0, 1}, defaults()), {{0, 3, 100}, {1, 1, 40}}));
     }
-    SUBCASE("-N: at most N kept=1/2 chains are extended; kept=3 chains are not counted") {
+    SUBCASE("-N: the N-th kept=1/2 chain and later ones are dropped; kept=3 chains are not counted") {
         // B and C overlap A and survive (-D 0.1); D is alone on the read (kept=3).
         FltParams f = defaults();
         f.drop_ratio = 0.1f;
@@ -430,7 +432,8 @@ TEST_CASE("mem_flt_chained_seeds: the seed SW screen keeps a seed scoring exactl
         const int64_t rb = std::max(lo, sd.rbeg - 50), re = std::min(hi, sd.rbeg + sd.len + 50);
         std::string t;
         for (int64_t x = rb; x < re; ++x) t += base(x);
-        const std::vector<uint8_t> qv = bwa_tests::nt4(read.substr((size_t)qb, (size_t)(qe - qb))), tv = bwa_tests::nt4(t);
+        const std::vector<uint8_t> qv = bwa_tests::nt4(read.substr((size_t)qb, (size_t)(qe - qb)));
+        const std::vector<uint8_t> tv = bwa_tests::nt4(t);
         int best = 0;
         const size_t W = qv.size() + 1;
         std::vector<int> H(W * (tv.size() + 1), 0), E(H), F(H);

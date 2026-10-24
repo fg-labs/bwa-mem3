@@ -77,7 +77,8 @@ Packed pack(const std::vector<uint8_t> &fwd) {
 std::vector<uint8_t> region(const Packed &p, int64_t rb, int64_t re) {
     std::vector<uint8_t> out;
     const int64_t L = p.l_pac();
-    for (int64_t x = rb; x < re; ++x) out.push_back(x < L ? p.fwd[(size_t)x] : (uint8_t)(3 - p.fwd[(size_t)(2 * L - 1 - x)]));
+    for (int64_t x = rb; x < re; ++x)
+        out.push_back(x < L ? p.fwd[(size_t)x] : (uint8_t)(3 - p.fwd[(size_t)(2 * L - 1 - x)]));
     return out;
 }
 
@@ -343,6 +344,68 @@ TEST_CASE("bwa_gen_cigar2: random regions give an optimal CIGAR and the MD and N
     CHECK(gapped >= 60);  // the indel paths were exercised, not just ungapped regions
 }
 
+TEST_CASE("bwa_gen_cigar2: short reads in long regions keep the band floor of |tlen - qlen| + 3"
+          * doctest::test_suite("unit/cigar")) {
+    // A 10-24 base read placed in a region 3-12 bases longer (one or two
+    // deletions from the read's point of view, sometimes also a 1-2 base
+    // insertion and substitutions). For reads this short, the band bwa_gen_cigar4
+    // derives from the gap penalties is below |tlen - qlen| + 3, so that floor
+    // is the band, and the optimal path may stray up to two diagonals past the
+    // end diagonal (an insertion before a deletion). Where the floor band holds
+    // the unbanded optimum the score must be that optimum; the test also
+    // requires cases where a band one or two narrower would not hold it, so the
+    // floor itself is exercised.
+    const Scoring def = scoring(1, 4, 6, 1, 6, 1);
+    std::mt19937 rng(1919u);
+    const Packed p = pack(random_seq(rng, 2000));
+    const int64_t L = p.l_pac();
+    int optimal = 0, floor_needed = 0;
+    for (int n = 0; n < 600; ++n) {
+        const int qlen = 10 + (int)(rng() % 15);
+        std::vector<uint8_t> fq = random_seq(rng, (size_t)qlen);
+        std::vector<uint8_t> fref;
+        // The region: the read with extra bases at one or two places.
+        const int cut1 = 1 + (int)(rng() % (uint32_t)(qlen - 1)), extra1 = 2 + (int)(rng() % 8);
+        const int cut2 = rng() % 2 ? 1 + (int)(rng() % (uint32_t)(qlen - 1)) : -1, extra2 = 1 + (int)(rng() % 4);
+        for (int k = 0; k < qlen; ++k) {
+            if (k == cut1)
+                for (int m = 0; m < extra1; ++m) fref.push_back((uint8_t)(rng() % 4));
+            if (k == cut2)
+                for (int m = 0; m < extra2; ++m) fref.push_back((uint8_t)(rng() % 4));
+            fref.push_back(fq[(size_t)k]);
+        }
+        // Sometimes a short insertion into the read and a substitution.
+        if (rng() % 2) {
+            const size_t at = 1 + rng() % (fq.size() - 1);
+            for (int m = 1 + (int)(rng() % 2); m > 0; --m) fq.insert(fq.begin() + (long)at, (uint8_t)(rng() % 4));
+        }
+        if (rng() % 2) fq[rng() % fq.size()] = (uint8_t)(rng() % 4);
+        if (fref.size() <= fq.size()) continue;
+        // Write the region into the packed reference at a fresh place.
+        const int64_t fb = 20 + (int64_t)(rng() % (uint32_t)(L - 100));
+        Packed q = p;
+        for (size_t k = 0; k < fref.size(); ++k) q.fwd[(size_t)fb + k] = fref[k];
+        q = pack(q.fwd);
+        const int64_t rb = fb, re = fb + (int64_t)fref.size();
+        CAPTURE(n);
+        const Generated g = gen(q, def, 100, fq, rb, re);
+        const Derived d = derive(g.cigar.data(), g.n_cigar, fq, fref, def);
+        CHECK(d.valid);
+        CHECK(g.score == d.score);
+        CHECK(g.md == d.md);
+        CHECK(g.nm == d.nm);
+        const int dlen = (int)fref.size() - (int)fq.size();
+        const int opt = global_optimum(fq, fref, def);
+        if (global_optimum(fq, fref, def, dlen + 3) == opt) {
+            CHECK(g.score == opt);
+            ++optimal;
+            if (global_optimum(fq, fref, def, dlen + 1) < opt) ++floor_needed;
+        }
+    }
+    CHECK(optimal >= 400);
+    CHECK(floor_needed >= 5);
+}
+
 TEST_CASE("bwa_gen_cigar2: an indel in a repeat is placed leftmost on the forward reference, both strands"
           * doctest::test_suite("unit/cigar")) {
     const Scoring def = scoring(1, 4, 6, 1, 6, 1);
@@ -369,13 +432,16 @@ TEST_CASE("bwa_gen_cigar2: an indel in a repeat is placed leftmost on the forwar
     {
         std::vector<uint8_t> q = fwd;
         q.erase(q.begin() + (long)homo + 5);  // any A of the run
-        edits.push_back({"one A deleted from the run", q, std::to_string(homo) + "M1D" + std::to_string(len - homo - 1) + "M"});
+        edits.push_back({"one A deleted from the run", q,
+                         std::to_string(homo) + "M1D" + std::to_string(len - homo - 1) + "M"});
         q = fwd;
         q.insert(q.begin() + (long)homo + 3, 0);
-        edits.push_back({"one A inserted into the run", q, std::to_string(homo) + "M1I" + std::to_string(len - homo) + "M"});
+        edits.push_back({"one A inserted into the run", q,
+                         std::to_string(homo) + "M1I" + std::to_string(len - homo) + "M"});
         q = fwd;
         q.erase(q.begin() + (long)dinuc + 4, q.begin() + (long)dinuc + 6);  // one AC
-        edits.push_back({"one AC deleted from the repeat", q, std::to_string(dinuc) + "M2D" + std::to_string(len - dinuc - 2) + "M"});
+        edits.push_back({"one AC deleted from the repeat", q,
+                         std::to_string(dinuc) + "M2D" + std::to_string(len - dinuc - 2) + "M"});
     }
     for (const Edit &e : edits) {
         CAPTURE(e.what);

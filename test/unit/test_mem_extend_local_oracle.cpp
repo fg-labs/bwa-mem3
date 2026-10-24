@@ -424,6 +424,74 @@ TEST_CASE("local SW oracle: hand-worked ksw_align2 and kswv results on every run
     }
 }
 
+TEST_CASE("local SW oracle: the second-best score's exclusion window, at both edges"
+          * doctest::test_suite("unit/kswv")) {
+    // ksw.h's KSW_XSUBO second-best ignores candidates within ceil(score /
+    // max(mat)) target rows of the best's end te. A 48-base query (a whole
+    // segment at both widths, so no padding columns) is placed twice: once
+    // exact (48) and once with base 5 changed (43, a candidate whose run of
+    // rows at or above minsc 19 starts after the change, so the candidate sits
+    // at its copy's last row). With the copies adjacent, the two ends are 48
+    // rows apart: exactly ceil(48 / 1), the window's edge, so score2 is -1;
+    // with one base between them they are 49 apart and score2 is 43 at the
+    // weaker copy's end. Before the best (low edge) the target continues
+    // after the best; after it (high edge) the target stops at the weaker
+    // copy, so no decaying rows follow it.
+    const std::vector<Tier> tiers = runnable_tiers();
+    REQUIRE(!tiers.empty());
+    const Scoring def = scoring(1, 4, 6, 1, 6, 1);
+    std::mt19937 rng(4848u);
+    const std::vector<uint8_t> q = random_seq(rng, 48), flank = random_seq(rng, 10);
+    std::vector<uint8_t> weak = q;
+    weak[5] = (uint8_t)((weak[5] + 1) % 4);
+    struct Case {
+        const char *what;
+        std::vector<uint8_t> ref;
+        int score2, te2;
+    };
+    std::vector<Case> cases;
+    {
+        std::vector<uint8_t> t = flank;  // weak copy ends at 57, the best at 105
+        t.insert(t.end(), weak.begin(), weak.end());
+        t.insert(t.end(), q.begin(), q.end());
+        t.insert(t.end(), flank.begin(), flank.end());
+        cases.push_back({"weaker copy ends 48 rows before the best: excluded", t, -1, -1});
+        std::vector<uint8_t> t1 = flank;  // weak copy ends at 57, the best at 106
+        t1.insert(t1.end(), weak.begin(), weak.end());
+        t1.push_back(0);
+        t1.insert(t1.end(), q.begin(), q.end());
+        t1.insert(t1.end(), flank.begin(), flank.end());
+        cases.push_back({"weaker copy ends 49 rows before the best: counted", t1, 43, 57});
+        std::vector<uint8_t> t2 = flank;  // the best ends at 57, the weak copy at 105
+        t2.insert(t2.end(), q.begin(), q.end());
+        t2.insert(t2.end(), weak.begin(), weak.end());
+        cases.push_back({"weaker copy ends 48 rows after the best: excluded", t2, -1, -1});
+        std::vector<uint8_t> t3 = flank;  // the best ends at 57, the weak copy at 106
+        t3.insert(t3.end(), q.begin(), q.end());
+        t3.push_back(0);
+        t3.insert(t3.end(), weak.begin(), weak.end());
+        cases.push_back({"weaker copy ends 49 rows after the best: counted", t3, 43, 106});
+    }
+    const int xtra16 = KSW_XSUBO | KSW_XSTART | 19, xtra8 = xtra16 | KSW_XBYTE;
+    for (const Case &c : cases) {
+        CAPTURE(c.what);
+        for (int xtra : {xtra16, xtra8}) {
+            CAPTURE(xtra);
+            const Expected want = expected(q, c.ref, def, xtra);
+            REQUIRE(want.all());
+            CHECK(want.r.score == 48);
+            CHECK(want.r.score2 == c.score2);
+            CHECK(want.r.te2 == c.te2);
+            for (const Tier &tier : tiers) {
+                CAPTURE(tier.name);
+                check_fields(run_align2(tier.align2, q, c.ref, def, xtra), want);
+                const std::vector<bwa_tests::TestPair> one = {{c.ref, q, ""}};
+                check_fields(run_kswv(tier.kswv, one, def, xtra, xtra == xtra16)[0], want);
+            }
+        }
+    }
+}
+
 TEST_CASE("local SW oracle: the 8-bit pass reports 255 once the score reaches 255 - shift"
           * doctest::test_suite("unit/kswv")) {
     // ksw.h: "KSW_XBYTE: use an unsigned byte to store a score. If overflow
@@ -456,6 +524,21 @@ TEST_CASE("local SW oracle: the 8-bit pass reports 255 once the score reaches 25
             const kswr_t o8 = local_pass(qry, base, def, KSW_XBYTE, true);
             CHECK(memcmp(&o8, &r8, sizeof o8) == 0);
         }
+    }
+    // The batched 8-bit kernel takes a mate of length l when l*a + shift <=
+    // 254 (matesw_u8.h): the 250-base match is its largest, and must score 250
+    // there too, ends and starts included (no second-best: minsc 19 rows all
+    // lie within te +- 250).
+    const std::vector<uint8_t> qry(base.begin() + 20, base.begin() + 270);
+    const int xtra = KSW_XSUBO | KSW_XSTART | 19 | KSW_XBYTE;
+    Expected want;
+    want.r = g_defr;
+    want.r.score = 250, want.r.te = 269, want.r.qe = 249, want.r.tb = 20, want.r.qb = 0;
+    std::fill(want.known, want.known + 7, true);
+    for (const Tier &tier : tiers) {
+        CAPTURE(tier.name);
+        const std::vector<bwa_tests::TestPair> one = {{base, qry, ""}};
+        check_fields(run_kswv(tier.kswv, one, def, xtra, false)[0], want);
     }
 }
 

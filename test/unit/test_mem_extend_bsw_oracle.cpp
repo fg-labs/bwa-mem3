@@ -283,6 +283,9 @@ enum Family {
     kLongDeletion,  // the target carries 8-40 extra bases mid-way
     kLongInsertion, // the query carries 8-30 extra bases mid-way
     kWithN,         // N bases in both
+    kDivergent,     // 0-70 % substitutions, up to 8 % N and 5 % indels, a long
+                    // target tail, now and then a seed score of 0 or below (the
+                    // --meth rescored seeds)
     kUnrelated,     // independent sequences
     kNumFamilies
 };
@@ -335,6 +338,22 @@ ExtPair make_pair(std::mt19937 &rng, Family fam, int max_len) {
             for (auto &c : t)
                 if (rng() % 15 == 0) c = rng() % 3 == 0 ? (uint8_t)4 : (uint8_t)((c + 1) % 4);
             break;
+        case kDivergent: {
+            const uint32_t sub = rng() % 70, npct = rng() % 9, indel = rng() % 6;
+            for (size_t k = 0; k < q.size(); ++k) {
+                if (rng() % 100 < indel) {
+                    if (rng() % 2) t.push_back((uint8_t)(rng() % 4));
+                    else continue;
+                }
+                uint8_t c = q[k];
+                if (rng() % 100 < sub) c = (uint8_t)(rng() % 4);
+                if (rng() % 100 < npct) c = 4;
+                t.push_back(c);
+            }
+            const std::vector<uint8_t> tail = random_seq(rng, rng() % 120);
+            t.insert(t.end(), tail.begin(), tail.end());
+            break;
+        }
         default:
             t = random_seq(rng, 8 + rng() % (uint32_t)(max_len - 8));
             break;
@@ -347,6 +366,7 @@ ExtPair make_pair(std::mt19937 &rng, Family fam, int max_len) {
     p.query = q;
     p.target = t;
     p.h0 = 1 + (int)(rng() % 60);
+    if (fam == kDivergent) p.h0 = rng() % 8 == 0 ? -(int)(rng() % 30) : 1 + (int)(rng() % 120);
     return p;
 }
 
@@ -539,7 +559,7 @@ TEST_CASE("banded SW oracle: z-drop stops at the documented threshold on every r
 
 namespace {
 
-// For each scoring, 50 pairs (every family six times, four seeds at the 8-bit
+// For each scoring, 56 pairs (every family six times, four seeds at the 8-bit
 // ceiling, four short queries at the band clamp), scored at bands 1, 33, 124
 // and 200 (the wide-band retry; 16-bit only) through every tier's kernels and
 // the scalar kernel, against the oracle.
@@ -596,6 +616,78 @@ TEST_CASE("banded SW oracle: random pairs under -A 2 and the --meth OT matrix eq
         scoring(1, 2, 6, 1, 6, 1, 100, 5, true),  // --meth OT matrix (-B 2), asymmetric
     };
     check_random(scorings, 2, 515151u);
+}
+
+TEST_CASE("banded SW oracle: the lane-coupling regression pairs equal the model, alone and in a batch"
+          * doctest::test_suite("unit/bandedswa")) {
+    // Inputs from test_bandedswa_lane_indep.cpp's directed list (pairs whose
+    // result once depended on their SIMD group; they reach the seed-row
+    // write-back and the band trim that a narrow band and a high seed
+    // exercise). The expected results here come from the oracle, not from that
+    // test's recorded values. Each runs alone and at three slots of a batch of
+    // 70 generated pairs.
+    struct Directed {
+        int a, b, o_del, e_del, o_ins, e_ins, zdrop, end_bonus;
+        bool ot;
+        int w, width, h0;
+        const char *ref, *qry;
+    };
+    const Directed directed[] = {
+        {1, 4, 6, 1, 8, 1, 50, 20, true, 5, 8, 22, "013022211210002112", "23122313233300030"},
+        {1, 4, 6, 1, 6, 1, 100, 5, false, 4, 8, 49, "03121020332203343331233433010310220322031131",
+         "0332400202422133431324332200212213231300"},
+        {1, 4, 6, 1, 6, 1, 100, 5, false, 16, 8, 85,
+         "11102232113210012021231022340101212222231323112324130201303021042122110230301041333002032213331210202302"
+         "132201023",
+         "31102231033241002013212022130000002023222333100312130203302210142123103"},
+        {2, 9, 10, 3, 11, 1, 200, 0, false, 20, 8, 51, "21130133311133100132224132202102231321102310102203",
+         "03100332311333202013"},
+        {1, 4, 6, 1, 6, 1, 100, 5, false, 20, 16, 29, "30003001", "0002300142323301230012003002"},
+        {2, 7, 12, 2, 12, 1, 200, 5, false, 2, 16, 95,
+         "322231001302201212111003211113112303132022130232223211021320320233231230133011332100013113122102133212232"
+         "120122313130122220023001323010320120020000110302103330303203302001032001123223300330132113320323211331312"
+         "102203030013323133122212010110300223312112320222331001211122323003332132031312130303011331110221331001321"
+         "3022001312111013333133301013301001333310023320222111311110110303121",
+         "3021331111220020130011032010131023031333020"},
+    };
+    const std::vector<Kernel> kernels = runnable_kernels();
+    REQUIRE(!kernels.empty());
+    std::mt19937 rng(31415u);
+    int checked = 0;
+    for (const Directed &d : directed) {
+        const Scoring s = scoring(d.a, d.b, d.o_del, d.e_del, d.o_ins, d.e_ins, d.zdrop, d.end_bonus, d.ot);
+        ExtPair p{digits(d.qry), digits(d.ref), d.h0};
+        CAPTURE(d.h0);
+        CAPTURE(d.w);
+        REQUIRE((d.width == 16 || in_bsw8_envelope(p, s, d.w)));
+        const ExtResult want = oracle(p.query, p.target, s, d.w, p.h0);
+        std::vector<ExtPair> batch;
+        for (int n = 0; n < 70; ++n) {
+            ExtPair x = make_pair(rng, (Family)(n % kNumFamilies), 90);
+            if (d.width == 8 && !in_bsw8_envelope(x, s, d.w)) x = p;  // keep the batch 8-bit
+            batch.push_back(x);
+        }
+        for (const Kernel &k : kernels) {
+            CAPTURE(k.name);
+            std::unique_ptr<IBandedPairWiseSW> bsw = build(k, s);
+            INFO("want " << show(want));
+            const ExtResult alone = bwa_tests::score_bsw_batch(*bsw, {&p}, d.width, d.w)[0];
+            INFO("alone " << show(alone));
+            CHECK(alone == want);
+            CHECK(scalar_result(*bsw, p, d.w) == want);
+            for (int slot : {0, 35, 69}) {
+                std::vector<const ExtPair *> ptrs;
+                for (const ExtPair &x : batch) ptrs.push_back(&x);
+                ptrs[(size_t)slot] = &p;
+                const ExtResult got = bwa_tests::score_bsw_batch(*bsw, ptrs, d.width, d.w)[(size_t)slot];
+                CAPTURE(slot);
+                INFO("in a batch " << show(got));
+                CHECK(got == want);
+            }
+            ++checked;
+        }
+    }
+    CHECK(checked == 6 * (int)kernels.size());
 }
 
 TEST_CASE("banded SW oracle: large batches through lane compaction equal the model"
