@@ -64,8 +64,10 @@ fk() { # <tag> <threads> <dedup mode>
     [[ -s "fk.$1.sam" ]] || fail "empty output ($1)"
 }
 fk off.t1 1 off
+# BWAMEM3_DEDUP_READS_STATS only counts (stderr, at exit), so the -t 4 run below
+# also yields the duplicate-pair count instead of a run of its own.
 for t in 1 3 4; do
-    fk "on.t$t" "$t" on
+    BWAMEM3_DEDUP_READS_STATS=1 fk "on.t$t" "$t" on
     if ! cmp -s fk.off.t1.sam "fk.on.t$t.sam"; then
         diff fk.off.t1.sam "fk.on.t$t.sam" | head -20 || true
         fail "fixed -K $K: --dedup-reads on -t $t differs from off -t 1 (unsorted)"
@@ -73,8 +75,7 @@ for t in 1 3 4; do
 done
 nb=$(grep -c 'Calling mem_process_seqs' fk.on.t4.err || true)
 [[ "$nb" -ge 4 ]] || fail "fixed -K run had $nb batches; expected several"
-stats=$(BWAMEM3_DEDUP_READS_STATS=1 "$BWA_MEM3" mem -K "$K" -t 4 --dedup-reads on "$CHR22_FA" \
-    fk.r1.fq fk.r2.fq 2>&1 > /dev/null | grep 'dedup-reads-stats' || true)
+stats=$(grep 'dedup-reads-stats' fk.on.t4.err || true)
 dup=$(awk -F'dup=' '{split($2, a, " "); print a[1]}' <<< "$stats")
 [[ "${dup:-0}" -gt 0 ]] || fail "fixed -K fixture exercised no duplicate pairs"
 echo "PASS: fixed -K $K, $nb batches: -t 1 == -t 3 == -t 4 unsorted, --dedup-reads on == off ($dup duplicate pairs, $(grep -cv '^@' fk.off.t1.sam || true) records)"
@@ -93,6 +94,15 @@ echo "PASS: fixed -K $K, $nb batches: -t 1 == -t 3 == -t 4 unsorted, --dedup-rea
 # batches must have (one would pass even if only the first batch ever got its
 # turn), or the comparison proves nothing; at -t 1, which keeps its single
 # pipeline thread, none may.
+#
+# Two inputs, each with its own off run. The file runs read all of fk (8 paired,
+# 4 single-end batches at -K), which the at-least-two-batches check needs. The
+# slow pipe runs at the consumer's pace, not the aligner's -- about 5 s per
+# paired pass over fk -- so it, -t 1 and --bam read sk, the first 10000 pairs of
+# fk: the same -K and so the same batches, 3 paired and 2 single-end, and every
+# backed-up batch after the first still has to wait for the one before it.
+head -n 40000 fk.r1.fq > sk.r1.fq
+head -n 40000 fk.r2.fq > sk.r2.fq
 slow_reader() {
     perl -e 'while (<STDIN>) { print; select(undef, undef, undef, 0.005) unless $. % 50 }'
 }
@@ -117,20 +127,29 @@ so() { # <tag> <sink: file|stall> <env...> -- <mem args...>
 }
 early() { awk '/stream_output:/ { s += $3 } END { print s + 0 }' "so.$1.err"; }
 early_batches() { awk '/stream_output:/ && $3 > 0 { n++ } END { print n + 0 }' "so.$1.err"; }
+set_in() { # <input: fk|sk> <end: pe|se>; sets in=(the fastqs)
+    in=("$1.r1.fq")
+    [[ $2 == se ]] || in+=("$1.r2.fq")
+}
 for end in pe se; do
-    if [[ $end == pe ]]; then in=(fk.r1.fq fk.r2.fq); else in=(fk.r1.fq); fi
-    so "$end.off" file BWA_MEM3_STREAM_OUTPUT=0 -- -t 4 "$CHR22_FA" "${in[@]}"
-    [[ $(grep -c 'stream_output:' "so.$end.off.err" || true) -eq 0 ]] \
-        || fail "streaming $end: BWA_MEM3_STREAM_OUTPUT=0 still streamed"
+    for fx in fk sk; do
+        set_in "$fx" "$end"
+        so "$end.$fx.off" file BWA_MEM3_STREAM_OUTPUT=0 -- -t 4 "$CHR22_FA" "${in[@]}"
+        [[ $(grep -c 'stream_output:' "so.$end.$fx.off.err" || true) -eq 0 ]] \
+            || fail "streaming $end: BWA_MEM3_STREAM_OUTPUT=0 still streamed"
+    done
+    set_in sk "$end"
     so "$end.t1" file BWA_MEM3_STREAM_OUTPUT=1 -- -t 1 "$CHR22_FA" "${in[@]}"
-    cmp -s "so.$end.off.sam" "so.$end.t1.sam" || fail "streaming $end: -t 1 differs from off"
+    cmp -s "so.$end.sk.off.sam" "so.$end.t1.sam" || fail "streaming $end: -t 1 differs from off"
     [[ $(early "$end.t1") -eq 0 ]] || fail "streaming $end: -t 1 wrote early; it has one pipeline thread"
     for t in 2 3 4; do
         for sink in file stall; do
+            if [[ $sink == file ]]; then fx=fk; else fx=sk; fi
+            set_in "$fx" "$end"
             tag="$end.t$t.$sink"
             so "$tag" "$sink" BWA_MEM3_STREAM_OUTPUT=1 -- -t "$t" "$CHR22_FA" "${in[@]}"
-            if ! cmp -s "so.$end.off.sam" "so.$tag.sam"; then
-                diff "so.$end.off.sam" "so.$tag.sam" | head -20 || true
+            if ! cmp -s "so.$end.$fx.off.sam" "so.$tag.sam"; then
+                diff "so.$end.$fx.off.sam" "so.$tag.sam" | head -20 || true
                 fail "streaming $tag differs from off"
             fi
             [[ $(early "$tag") -gt 0 ]] || fail "streaming $tag wrote nothing early"
@@ -142,15 +161,16 @@ for end in pe se; do
     done
 done
 for sink in file stall; do
+    if [[ $sink == file ]]; then fx=fk; else fx=sk; fi
     tag="pe.slice.$sink"
-    so "$tag" "$sink" BWA_MEM3_COHORT_SLICE_ALL=1 -- -t 3 "$CHR22_FA" fk.r1.fq fk.r2.fq
+    so "$tag" "$sink" BWA_MEM3_COHORT_SLICE_ALL=1 -- -t 3 "$CHR22_FA" "$fx.r1.fq" "$fx.r2.fq"
     grep -q 'slicing every' "so.$tag.err" || fail "streaming $tag: the cohorts were not sliced"
-    cmp -s so.pe.off.sam "so.$tag.sam" || fail "streaming $tag (every cohort sliced) differs from off"
+    cmp -s "so.pe.$fx.off.sam" "so.$tag.sam" || fail "streaming $tag (every cohort sliced) differs from off"
     [[ $(early "$tag") -gt 0 ]] || fail "streaming $tag wrote nothing early"
 done
 # BAM output is written by the write step alone: its records are bam1_t, not
 # the sam strings the process step would write.
-BWA_MEM3_STREAM_STATS=1 "$BWA_MEM3" mem -K "$K" -t 4 --bam -o so.bam.out "$CHR22_FA" fk.r1.fq fk.r2.fq 2> so.bam.err \
+BWA_MEM3_STREAM_STATS=1 "$BWA_MEM3" mem -K "$K" -t 4 --bam -o so.bam.out "$CHR22_FA" sk.r1.fq sk.r2.fq 2> so.bam.err \
     || fail "mem (--bam)"
 [[ -s so.bam.out ]] || fail "empty output (--bam)"
 [[ $(grep -c 'stream_output:' so.bam.err || true) -eq 0 ]] || fail "streaming: --bam output was streamed"
