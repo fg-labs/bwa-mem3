@@ -283,7 +283,8 @@ Two byte-identical changes on top of [PR #584](#hot-data-dependent-branches-pr-5
   always lives in slot `i mod N` (slot `s` is seeded with input `s`, and the slot
   freed by input `k` is refilled with input `k + N`), so that slot is now a
   counter that wraps at the lockstep width `N`. The emit order and slot reuse are
-  unchanged.
+  unchanged. (The SMEM driver has since dropped this pass: see
+  [Lockstep SMEM slot refill](#lockstep-smem-slot-refill-pr-626).)
 - **Branchless partition for unique-result sorts.** Five sort functions use
   pdqsort's branchless (block) partition, which permutes equal elements
   differently from the default one: the mate-pair key sort (used for both the
@@ -313,6 +314,44 @@ host at the forced AVX2 tier; and, measured separately, −0.58 ± 0.25% (Zen 5,
 AVX-512BW) and −0.43 ± 0.06% (AWS Graviton 4, arm64, NEON tier) for the SMEM-driver
 flush change, and −0.48% (Zen 5, AVX-512BW) and −0.10% (Graviton 4, NEON) for the
 sorts.
+
+## Lockstep SMEM slot refill ([PR #626](https://github.com/fg-labs/bwa-mem3/pull/626))
+
+The SMEM lockstep driver refilled a slot only when its read was emitted, and reads
+are emitted in input order, so a read that finished behind a slower, earlier read
+held its slot idle until that read was out. Counted with an instrumented build on
+the first 200k pairs of a 1M-pair WGS slice (HG002, hg38) at `-t 1`, on an Apple M2
+Max (arm64, NEON, Apple clang 21.0.0), 28.8% of the driver's slot visits (40.0M of
+138.7M) were such idle visits; an early version of this change, with a window of 4
+reads per slot, cut slot visits by 28% with the same forward and backward steps. The
+driver now retires a finished read and refills its slot in the same stepping pass. A
+per-thread parked list (`src/smem_parked.h`) holds the matches of reads that finish
+early and emits every read in input order, so `matchArray` is written exactly as
+before; only which reads share a stepping pass changes, and a read's walk depends on
+nothing but its own slot. Reads may start at most 8 reads per slot, rounded up to a
+power of two, ahead of the oldest unemitted one, which bounds how many reads are
+parked; the window lets the parked list be a fixed-size ring and caps how far one
+slow read lets the others run ahead. The re-seeding (bwtSeed) lockstep driver is
+unchanged: it has almost no such idle visits.
+
+Output was identical (record md5, non-`@PG`) to the code before this change on a 5M-pair
+WGS slice (HG00096, hg38) at `-t 16` and on its first 200k pairs at `-t 1` and
+under `--compat=bwa-mem2`, on AWS Graviton 4 (c8g.4xlarge, arm64, NEON tier) and
+AMD Zen 4 (c7a.4xlarge, x86-64, AVX-512BW tier), with windows of 2, 4 and 8 reads
+per slot. clang 19.1.7, 5 rotated rounds, median of the per-round change against
+the code before this change:
+
+| host | run | SMEM stage | user CPU |
+|---|---|---:|---:|
+| AWS Graviton 4 (arm64, NEON) | 5M pairs `-t 16` | −1.2% (5/5 faster) | −0.42% |
+| AWS Graviton 4 (arm64, NEON) | 200k pairs `-t 1` | −1.0% (5/5 faster) | −0.15% |
+| AMD Zen 4 (x86-64, AVX-512BW) | 5M pairs `-t 16` | −3.0% (5/5 faster) | −0.71% |
+| AMD Zen 4 (x86-64, AVX-512BW) | 200k pairs `-t 1` | −2.5% (4/5 faster) | −0.27% |
+
+On Graviton 4 at `-t 16` the user CPU before this change varied by 0.07% across
+rounds, and every round of this one was 0.3-0.5% lower. A window of 4 reads per
+slot measured the same as 8 on Graviton 4 and less on Zen 4 (SMEM stage −1.6% / −1.8%);
+2 reads per slot measured less on both.
 
 ## Thread idle tail ([PR #590](https://github.com/fg-labs/bwa-mem3/pull/590))
 
