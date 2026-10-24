@@ -1,0 +1,95 @@
+name: Set up ccache
+description: >-
+  Route the job's compilers through ccache via compiler-named shims first on
+  PATH, and restore this configuration's compiler cache from the latest main
+  build. Restore only: the job that builds on main saves.
+# Why shims rather than CXX="ccache clang++-19": the jobs pass the compiler by
+# name everywhere (CXX="$CXX" on every make line, CXX=clang++-19 / CXX=g++
+# literals, MAKE_ARGS="... CXX=$CXX ..." word-split by the regression scripts),
+# and the Makefile matches on it (`ifeq ($(CXX), clang++)` CC pairing, the
+# .build-flags stamp, the LTO and compiler-floor probes). A shim directory keeps
+# every one of those values unchanged, and also catches the compilers nobody
+# names: htslib's configure (CC from the environment, else cc/gcc) and the
+# mimalloc / zlib-ng cmake builds, which find their compiler on PATH.
+#
+# What the shims change: compile invocations (-c) are served from the cache;
+# everything else (--version, -dumpversion, links, -E probes) passes straight
+# through ccache to the real compiler. The LTO link of bwa-mem3 is a link, so
+# it is never cached. -march=native compiles are keyed on the host's resolved
+# CPU features as well; see compiler-shim.sh.
+#
+# Run this AFTER the compilers are installed (it only shims names that exist)
+# and after ccache itself is installed (apt list on Linux, brew on macOS).
+#
+# Cache policy. Caches saved by a pull_request or merge_group run are scoped to
+# that ref and unreadable from any other, so saving there would only churn the
+# repository's cache quota. Every PR and merge-queue run therefore restores the
+# newest entry main saved for its configuration (restore-keys prefix match) and
+# never saves; the push-to-main jobs (warm-caches, coverage) save a fresh entry
+# with actions/cache/save under the key this action exports as CCACHE_CACHE_KEY.
+inputs:
+  config:
+    description: >-
+      Cache slug for this compile configuration (a-z0-9_-). Jobs that compile the
+      same configuration share it; the warm-caches job must use the same slug.
+    required: true
+  max-size:
+    description: ccache size cap (CCACHE_MAXSIZE), e.g. 400M.
+    required: false
+    default: 400M
+runs:
+  using: composite
+  steps:
+    - name: Install compiler shims and ccache settings
+      id: shims
+      shell: bash
+      env:
+        CONFIG: ${{ inputs.config }}
+        MAX_SIZE: ${{ inputs.max-size }}
+        KEY_PREFIX: ccache-${{ inputs.config }}-${{ runner.os }}-${{ runner.arch }}-
+      run: |
+        set -euo pipefail
+        case "$CONFIG" in
+          '' | *[!a-z0-9_-]*) echo "::error::setup-ccache: config '$CONFIG' must match [a-z0-9_-]+"; exit 1 ;;
+        esac
+        if ! command -v ccache >/dev/null 2>&1; then
+          echo "::error::setup-ccache: ccache is not installed (add it to the job's apt package list, or brew install it on macOS)"
+          exit 1
+        fi
+        shim_dir="$RUNNER_TEMP/ccache-shims"
+        mkdir -p "$shim_dir"
+        install -m 0755 "$GITHUB_ACTION_PATH/compiler-shim.sh" "$shim_dir/compiler-shim.sh"
+        # Every compiler name a job, the Makefile, htslib's configure or cmake
+        # can reach for. Only names that resolve now get a shim, so a missing
+        # compiler still fails as "not found" rather than inside the shim.
+        for c in clang++-19 clang-19 clang++ clang g++ gcc c++ cc; do
+          if command -v "$c" >/dev/null 2>&1; then
+            ln -sf compiler-shim.sh "$shim_dir/$c"
+            echo "shim: $c -> ccache $(command -v "$c")"
+          fi
+        done
+        echo "$shim_dir" >> "$GITHUB_PATH"
+        {
+          echo "CCACHE_DIR=$RUNNER_TEMP/ccache"
+          echo "CCACHE_MAXSIZE=$MAX_SIZE"
+          # Identify the compiler by its own version banner rather than the
+          # default mtime/size of the binary: on macOS /usr/bin/clang++ is an
+          # xcrun shim whose mtime does not change when the image's Xcode does.
+          echo "CCACHE_COMPILERCHECK=%compiler% -v"
+          echo "CCACHE_CACHE_KEY=${KEY_PREFIX}${GITHUB_SHA}"
+        } >> "$GITHUB_ENV"
+        echo "key_prefix=$KEY_PREFIX" >> "$GITHUB_OUTPUT"
+
+    - name: Restore ccache
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: ${{ runner.temp }}/ccache
+        key: ${{ steps.shims.outputs.key_prefix }}${{ github.sha }}
+        restore-keys: ${{ steps.shims.outputs.key_prefix }}
+
+    - name: Zero ccache statistics
+      shell: bash
+      run: |
+        ccache --zero-stats >/dev/null
+        ccache --version | sed -n 1p
+        ccache --show-config | grep -E '^\([a-z]+\) (cache_dir|max_size|compiler_check|hash_dir) ' || true

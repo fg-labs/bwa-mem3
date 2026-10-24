@@ -3,9 +3,10 @@ name: CI
 on:
   # Every change reaches main through the merge queue, whose merge_group run
   # tests the exact commit that then lands, so a full run on the push to main
-  # would test the same commit twice. On push only the coverage job runs (it
-  # gives Codecov the main baseline PR diffs compare against); every other job
-  # carries `if: github.event_name != 'push'`.
+  # would test the same commit twice. On push only two jobs run: coverage (it
+  # gives Codecov the main baseline PR diffs compare against) and warm-caches
+  # (it saves the compiler caches PR and merge-queue runs restore); every other
+  # job carries `if: github.event_name != 'push'`.
   push:
     branches: [main]
   pull_request:
@@ -29,6 +30,14 @@ on:
 # `contents: read`, so it is declared once at the workflow level.
 permissions:
   contents: read
+
+env:
+  # Every opt-in debug/instrumentation macro, enabled at once by the
+  # rebuild-variants debug-macro build (see that step for why). Here rather than
+  # inline in the step so warm-caches compiles the identical configuration for
+  # the compiler cache; test/regression/debug_macro_flag_lint.sh keeps this one
+  # list and the macros in src/ in step.
+  DEBUG_MACRO_EXTRA_CXXFLAGS: "-DBWA_MEM3_DEBUG_CHN_FLT_XCHECK -DBWA_MEM3_DEBUG_RID_CHECK -DBWA_MEM3_DEBUG_UNGAPPED_XCHECK -DBSW8_ASSERT_ENVELOPE -DBWA_MEM3_DEBUG_POISON -DBWAMEM3_UGP_PROFILE=1 -DBWA_MEM3_DEBUG_RESCUE_STATS -DBWA_MEM3_DEBUG_SRTGG_TINY -DBWA_MEM3_DEBUG_P3_XCHECK -DBWA_MEM3_DEBUG_RESCUE_SKIP_XCHECK -DBWA_MEM3_DEBUG_RIGHT_H0_XCHECK"
 
 jobs:
   # Source-only lint; no toolchain, no build. Kept as its own job so the
@@ -353,6 +362,7 @@ jobs:
             canonical: true
             run_integration: true
             kernel_sweep: "full"
+            ccache_size: "300M"
             name: "Linux x86_64 AVX2 (mimalloc)"
             artifact_slug: "linux-x86_64-avx2-mimalloc"
           - os: ubuntu-latest
@@ -375,6 +385,7 @@ jobs:
             # is above the Apple-clang floor — no llvm.sh install needed here.
             cxx: "clang++"
             cc: "clang"
+            ccache_size: "100M"
             name: "macOS ARM64 (mimalloc)"
             artifact_slug: "macos-arm64-mimalloc"
           - os: ubuntu-latest
@@ -385,6 +396,7 @@ jobs:
             # unset baseline_arch to avx2 too). Spelled out on this row so the
             # key is declared in the matrix and its use type-checks.
             baseline_arch: "avx2"
+            ccache_size: "300M"
             name: "Linux x86_64 single-binary (mimalloc)"
             artifact_slug: "linux-x86_64-single-mimalloc"
           # gcc build-compatibility lane. The rest of the matrix builds with
@@ -456,12 +468,17 @@ jobs:
         # libdeflate-enabled link path is invisible to CI.
         uses: awalsh128/cache-apt-pkgs-action@acb598e5ddbc6f68a970c5da0688d2f3a9f04d05 # v1.6.0
         with:
-          packages: zlib1g-dev libdeflate-dev bwa autoconf automake samtools libomp-dev
+          packages: zlib1g-dev libdeflate-dev bwa autoconf automake samtools libomp-dev ccache
           version: 1.1
 
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
-        run: brew install bwa autoconf automake libomp libdeflate
+        # No auto-update or post-install cleanup: together they were most of
+        # this step's time, and the image's formulae are new enough.
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+        run: brew install bwa autoconf automake libomp libdeflate ccache
 
       - name: Install clang-19 (Linux)
         # The matrix builds with clang-19 by default (see the action for why and
@@ -469,6 +486,16 @@ jobs:
         # deliberately builds with the runner's g++ + ALLOW_UNSUPPORTED_COMPILER=1.
         if: runner.os == 'Linux' && matrix.cxx != 'g++'
         uses: ./.github/actions/install-clang-19
+
+      # After the compiler install: the action shims only compilers that exist.
+      # Restore-only; warm-caches saves this row's cache (same config slug) on
+      # every push to main. The cap allows a couple of main builds' objects; the
+      # x86 single-binary and canonical rows compile the most configurations.
+      - name: Set up ccache
+        uses: ./.github/actions/setup-ccache
+        with:
+          config: ${{ matrix.artifact_slug }}
+          max-size: ${{ matrix.ccache_size || '200M' }}
 
       - name: Verify CMake is available
         run: cmake --version
@@ -1821,6 +1848,10 @@ jobs:
             echo "::group::$t"; bash "test/regression/$t.sh"; echo "::endgroup::"
           done
 
+      - name: ccache statistics
+        if: always()
+        run: ccache --show-stats || true
+
   # The canonical row's three alternate-configuration builds, split out so they
   # run alongside the matrix instead of at the end of its slowest row. Each is a
   # full rebuild that replaces $GITHUB_WORKSPACE/bwa-mem3, so on the canonical
@@ -1851,11 +1882,20 @@ jobs:
         # header_parity.sh, on top of the build dependencies.
         uses: awalsh128/cache-apt-pkgs-action@acb598e5ddbc6f68a970c5da0688d2f3a9f04d05 # v1.6.0
         with:
-          packages: zlib1g-dev libdeflate-dev bwa autoconf automake samtools libomp-dev
+          packages: zlib1g-dev libdeflate-dev bwa autoconf automake samtools libomp-dev ccache
           version: 1.1
 
       - name: Install clang-19 (Linux)
         uses: ./.github/actions/install-clang-19
+
+      # One cache for all three builds below (debug macros, TESTING_BUILD,
+      # ASAN): ccache keys each compile on its flags, so they coexist, and
+      # warm-caches rebuilds the same three under this slug on main.
+      - name: Set up ccache
+        uses: ./.github/actions/setup-ccache
+        with:
+          config: rebuild-variants
+          max-size: 300M
 
       - name: Stage chr22 fixture (reference, bwa index, simulated reads)
         uses: ./.github/actions/chr22-fixture
@@ -1875,8 +1915,9 @@ jobs:
         # cross-check, scratch poisoning, a buffer shrunk to force a grow path,
         # or measurement counters that never feed the alignment result, so
         # output must be unchanged -- a failure here is a genuine invariant
-        # violation, not a debug-build artifact. test/regression/
-        # debug_macro_flag_lint.sh keeps this list and the macros in src/ in step.
+        # violation, not a debug-build artifact. The list is the workflow-level
+        # DEBUG_MACRO_EXTRA_CXXFLAGS; test/regression/debug_macro_flag_lint.sh
+        # keeps it and the macros in src/ in step.
         #
         # First in this job, so the tree is fresh and needs no `make clean`. The
         # chr22 bwa-mem3 index is built here with this binary: the debug macros
@@ -1886,7 +1927,7 @@ jobs:
           make -j"$(nproc)" arch=avx2 \
             CXX=clang++-19 \
             USE_MIMALLOC=1 \
-            EXTRA_CXXFLAGS="-DBWA_MEM3_DEBUG_CHN_FLT_XCHECK -DBWA_MEM3_DEBUG_RID_CHECK -DBWA_MEM3_DEBUG_UNGAPPED_XCHECK -DBSW8_ASSERT_ENVELOPE -DBWA_MEM3_DEBUG_POISON -DBWAMEM3_UGP_PROFILE=1 -DBWA_MEM3_DEBUG_RESCUE_STATS -DBWA_MEM3_DEBUG_SRTGG_TINY -DBWA_MEM3_DEBUG_P3_XCHECK -DBWA_MEM3_DEBUG_RESCUE_SKIP_XCHECK -DBWA_MEM3_DEBUG_RIGHT_H0_XCHECK"
+            EXTRA_CXXFLAGS="$DEBUG_MACRO_EXTRA_CXXFLAGS"
           "$GITHUB_WORKSPACE/bwa-mem3" index /tmp/chr22/chr22.fa
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           CHR22_FA=/tmp/chr22/chr22.fa \
@@ -1985,6 +2026,10 @@ jobs:
             CXX=clang++-19 cli_arg_safety_test
           ./cli_arg_safety_test
 
+      - name: ccache statistics
+        if: always()
+        run: ccache --show-stats || true
+
   coverage:
     name: Coverage (Linux AVX2, gcov → Codecov)
     runs-on: ubuntu-latest
@@ -2008,8 +2053,18 @@ jobs:
       - name: Install dependencies
         uses: awalsh128/cache-apt-pkgs-action@acb598e5ddbc6f68a970c5da0688d2f3a9f04d05 # v1.6.0
         with:
-          packages: zlib1g-dev libdeflate-dev autoconf automake gcovr
+          packages: zlib1g-dev libdeflate-dev autoconf automake gcovr ccache
           version: 1.0
+
+      # Coverage builds through ccache too: it caches the .gcno notes file with
+      # the object, and the checkout path (which gcov records) is the same on
+      # every run. This job runs on push, so it saves its own cache below
+      # instead of relying on warm-caches; PR and merge-queue runs restore it.
+      - name: Set up ccache
+        uses: ./.github/actions/setup-ccache
+        with:
+          config: coverage
+          max-size: 200M
 
       - name: Build libbwa.a with coverage
         run: make -j"$(nproc)" arch=avx2 CXX=g++ USE_MIMALLOC=0 COVERAGE=1
@@ -2055,6 +2110,20 @@ jobs:
           files: coverage.xml
           fail_ci_if_error: false
           verbose: true
+
+      - name: ccache statistics
+        if: always()
+        run: ccache --show-stats || true
+
+      # Push to main only (see setup-ccache for why PR and merge-queue runs never
+      # save). Saved even when a test failed: ccache never stores a failed
+      # compile, so whatever is in the cache is valid.
+      - name: Save ccache
+        if: github.event_name == 'push' && !cancelled()
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: ${{ env.CCACHE_CACHE_KEY }}
 
   # MemorySanitizer gate for the batched banded-SW kernels' padded-lane
   # initialization. The kernels round each batch up to a whole SIMD width and
@@ -2104,12 +2173,22 @@ jobs:
         # (matching clang-19) is added by the clang-19 install step below.
         uses: awalsh128/cache-apt-pkgs-action@acb598e5ddbc6f68a970c5da0688d2f3a9f04d05 # v1.6.0
         with:
-          packages: zlib1g-dev libdeflate-dev autoconf automake libomp-dev
+          packages: zlib1g-dev libdeflate-dev autoconf automake libomp-dev ccache
           version: 1.1
 
       - name: Install clang-19 (Linux)
         # Same verified-key install as the build-and-test matrix.
         uses: ./.github/actions/install-clang-19
+
+      # The -march=native objects this gate builds are keyed on the host's CPU
+      # features as well (see the action's compiler shim), so they are reused
+      # only on a runner that resolves -march=native the same way; the rest of
+      # the MSan libbwa.a build is shared across runners.
+      - name: Set up ccache
+        uses: ./.github/actions/setup-ccache
+        with:
+          config: msan-padded-lane-gate
+          max-size: 200M
 
       - name: Build the padded-lane gate under MemorySanitizer
         # MSAN=1 forces USE_MIMALLOC off (mimalloc's malloc override interposes
@@ -2129,6 +2208,10 @@ jobs:
         run: |
           MSAN_OPTIONS=exitcode=77:halt_on_error=1 \
             ./kernel_padded_lane_uninit_test
+
+      - name: ccache statistics
+        if: always()
+        run: ccache --show-stats || true
 
   # Profiling (--profile) is compiled out of the default build, so the matrix
   # rows above never exercise the STAGE_PROF=1 code path. Build it here (and run
@@ -2158,8 +2241,14 @@ jobs:
       - name: Install dependencies (Linux)
         uses: awalsh128/cache-apt-pkgs-action@acb598e5ddbc6f68a970c5da0688d2f3a9f04d05 # v1.6.0
         with:
-          packages: zlib1g-dev libdeflate-dev autoconf automake libomp-dev
+          packages: zlib1g-dev libdeflate-dev autoconf automake libomp-dev ccache
           version: 1.1
+
+      - name: Set up ccache
+        uses: ./.github/actions/setup-ccache
+        with:
+          config: profiling-build
+          max-size: 200M
 
       - name: Build with profiling compiled in
         run: make -j"$(nproc)" STAGE_PROF=1 BASELINE_ARCH=avx2 CXX=g++ USE_MIMALLOC=1
@@ -2182,3 +2271,241 @@ jobs:
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           FIXTURES="$GITHUB_WORKSPACE/test/fixtures" \
           bash test/regression/profile_slice_cpu.sh
+
+      - name: ccache statistics
+        if: always()
+        run: ccache --show-stats || true
+
+  # Saves the compiler caches the jobs above restore. Caches saved by a
+  # pull_request or merge_group run are scoped to that ref and unreadable from
+  # any other, so those runs only restore (see .github/actions/setup-ccache);
+  # this job is the one writer, running on every push to main. It restores the
+  # previous main entry, so only what the push changed is compiled, and saves a
+  # fresh entry keyed on the commit (setup-ccache's CCACHE_CACHE_KEY), which PR
+  # and merge-queue runs then pick up through the key prefix. Coverage, which
+  # also runs on push, saves its own cache and is not repeated here.
+  #
+  # Build only, no tests. Each row reproduces the compile configurations of one
+  # job (and uses its cache slug): the same make invocations with the same
+  # arguments, in the same order, because the build-flags stamp makes an
+  # argument change rebuild libbwa.a and ccache keys every compile on its
+  # flags. A configuration the jobs above gain or change and this job does not
+  # copy is not a correctness problem -- its compiles just miss the cache on PRs
+  # -- so keep the two in step when editing a job's build commands. The apt
+  # package lists match the jobs' lists, so this also keeps main's copy of each
+  # apt cache current, and install-clang-19 saves its .deb cache from here.
+  warm-caches:
+    name: Warm compiler cache (${{ matrix.config }})
+    if: github.event_name == 'push'
+    runs-on: ${{ matrix.os }}
+    # A rebuild from a warm cache is a minute or two; a cold one (first run,
+    # or after a toolchain change) is the jobs' full compile time. Ceiling
+    # catches a hung runner only.
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # build-and-test rows: config is the row's artifact_slug, and the
+          # arch/mimalloc/compiler fields are the row's. `harness` marks the rows
+          # that run the unit-test harness, `canonical` the row that also builds
+          # the second avx512bw tree. `chr22_fixture` marks one row per runner
+          # type the chr22 fixture runs on (see the last step).
+          - config: linux-x86_64-avx2-mimalloc
+            os: ubuntu-latest
+            kind: row
+            arch_flag: "avx2"
+            use_mimalloc: "1"
+            canonical: true
+            harness: true
+            chr22_fixture: true
+            ccache_size: "300M"
+          - config: linux-x86_64-avx2-no-mimalloc
+            os: ubuntu-latest
+            kind: row
+            arch_flag: "avx2"
+            use_mimalloc: "0"
+          - config: linux-arm64-mimalloc
+            os: ubuntu-24.04-arm
+            kind: row
+            arch_flag: ""
+            use_mimalloc: "1"
+            harness: true
+            chr22_fixture: true
+          - config: macos-arm64-mimalloc
+            os: macos-latest
+            kind: row
+            arch_flag: ""
+            use_mimalloc: "1"
+            harness: true
+            chr22_fixture: true
+            cxx: "clang++"
+            cc: "clang"
+            ccache_size: "100M"
+          - config: linux-x86_64-single-mimalloc
+            os: ubuntu-latest
+            kind: row
+            arch_flag: ""
+            use_mimalloc: "1"
+            baseline_arch: "avx2"
+            ccache_size: "300M"
+          - config: linux-x86_64-avx2-gcc-compat
+            os: ubuntu-latest
+            kind: row
+            arch_flag: "avx2"
+            use_mimalloc: "1"
+            cxx: "g++"
+            cc: "gcc"
+            allow_unsupported: "1"
+          - config: rebuild-variants
+            os: ubuntu-latest
+            kind: rebuild-variants
+            ccache_size: "300M"
+          - config: msan-padded-lane-gate
+            os: ubuntu-latest
+            kind: msan
+            apt_packages: "zlib1g-dev libdeflate-dev autoconf automake libomp-dev ccache"
+          - config: profiling-build
+            os: ubuntu-latest
+            kind: profiling
+            cxx: "g++"
+            cc: "gcc"
+            allow_unsupported: "1"
+            apt_packages: "zlib1g-dev libdeflate-dev autoconf automake libomp-dev ccache"
+    env:
+      CXX: ${{ matrix.cxx || 'clang++-19' }}
+      CC: ${{ matrix.cc || 'clang-19' }}
+      ALLOW_UNSUPPORTED_COMPILER: ${{ matrix.allow_unsupported || '0' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        uses: awalsh128/cache-apt-pkgs-action@acb598e5ddbc6f68a970c5da0688d2f3a9f04d05 # v1.6.0
+        with:
+          packages: ${{ matrix.apt_packages || 'zlib1g-dev libdeflate-dev bwa autoconf automake samtools libomp-dev ccache' }}
+          version: 1.1
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+        # bwa for the chr22 fixture step, as in build-and-test's macOS row.
+        run: brew install bwa autoconf automake libomp libdeflate ccache
+
+      - name: Install clang-19 (Linux)
+        if: runner.os == 'Linux' && matrix.cxx != 'g++'
+        uses: ./.github/actions/install-clang-19
+
+      - name: Set up ccache
+        uses: ./.github/actions/setup-ccache
+        with:
+          config: ${{ matrix.config }}
+          max-size: ${{ matrix.ccache_size || '200M' }}
+
+      - name: Build (build-and-test row configurations)
+        if: matrix.kind == 'row'
+        env:
+          MATRIX_ARCH_FLAG: ${{ matrix.arch_flag }}
+          MATRIX_BASELINE_ARCH: ${{ matrix.baseline_arch || 'avx2' }}
+          MATRIX_USE_MIMALLOC: ${{ matrix.use_mimalloc }}
+          MATRIX_CANONICAL: ${{ matrix.canonical || false }}
+          MATRIX_HARNESS: ${{ matrix.harness || false }}
+        run: |
+          set -euo pipefail
+          jobs="$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
+          # As build-and-test: arch_flag="" rows build the main binary through
+          # BASELINE_ARCH and the test binaries with no arch at all; every
+          # standalone test after that builds at the row's arch.
+          if [ "$MATRIX_ARCH_FLAG" = "" ]; then
+            main_args=(BASELINE_ARCH="$MATRIX_BASELINE_ARCH")
+            test_args=()
+            row_arch="$MATRIX_BASELINE_ARCH"
+          else
+            main_args=(arch="$MATRIX_ARCH_FLAG")
+            test_args=(arch="$MATRIX_ARCH_FLAG")
+            row_arch="$MATRIX_ARCH_FLAG"
+          fi
+          make -j"$jobs" "${main_args[@]}" CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
+          make -j"$jobs" test-binaries ${test_args[@]+"${test_args[@]}"} CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
+          make -j"$jobs" bns_zero_calloc_test read_arena_overflow_test packed_text_neg_nbases_test \
+            packed_text_overflow_nbases_test mem_gen_alt_zero_calloc_test err_fgets_eof_test \
+            fast_reader_selftest bseq_read_pe_oob_test bseq_read_comment_copy_test \
+            bseq_read_truncated_gzip_test fr_fastq_diff_test x86_soa_pack_test \
+            kopen_pipe_status_test cli_arg_safety_test pwrite_all_status_test \
+            rescue-prune-eq rescue-band-harness rescue-band-kernel-eq \
+            arch="$row_arch" CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
+          make -C test header_insert_test CXX="$CXX"
+          if [ "$MATRIX_HARNESS" = true ]; then
+            # test/run_unit_tests.sh's two builds.
+            make -C test
+            make -j4 arch="$row_arch" CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC" \
+              shm_section_find_test shm_pack_round_trip_test shm_lock_destroy_test fmi_seed_api_guards_test
+          fi
+          if [ "$MATRIX_CANONICAL" = true ]; then
+            # The second tree of the "kswv unit tests at the AVX-512BW tier"
+            # step: same path and copy, so its compiles hash the same. Built
+            # whether or not this runner has AVX-512BW; compiling needs only the
+            # compiler.
+            rm -rf "$RUNNER_TEMP/avx512bw"
+            rsync -a --exclude .git --exclude '*.o' --exclude '*.a' --exclude 'bwa-mem3*' --exclude '/ext/*/build/' \
+              ./ "$RUNNER_TEMP/avx512bw/"
+            make -C "$RUNNER_TEMP/avx512bw" -j"$jobs" test-binaries arch=avx512bw CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
+          fi
+
+      - name: Build (rebuild-variants configurations)
+        if: matrix.kind == 'rebuild-variants'
+        run: |
+          set -euo pipefail
+          make -j"$(nproc)" arch=avx2 CXX=clang++-19 USE_MIMALLOC=1 \
+            EXTRA_CXXFLAGS="$DEBUG_MACRO_EXTRA_CXXFLAGS"
+          make clean
+          make -j"$(nproc)" arch=avx2 CXX=clang++-19 USE_MIMALLOC=1 TESTING_BUILD=1
+          make clean
+          make -j"$(nproc)" arch=avx2 CXX=clang++-19 ASAN=1
+          make ASAN=1 arch=avx2 CXX=clang++-19 cli_arg_safety_test
+
+      - name: Build (MSan padded-lane gate)
+        if: matrix.kind == 'msan'
+        run: |
+          make -j"$(nproc)" MSAN=1 CXX=clang++-19 CC=clang-19 \
+            kernel_padded_lane_uninit_test
+
+      - name: Build (profiling build)
+        if: matrix.kind == 'profiling'
+        run: |
+          set -euo pipefail
+          make -j"$(nproc)" STAGE_PROF=1 BASELINE_ARCH=avx2 CXX=g++ USE_MIMALLOC=1
+          make stage_prof_test
+
+      - name: ccache statistics
+        if: always()
+        run: ccache --show-stats || true
+
+      # Saved even when a build failed: ccache never stores a failed compile,
+      # so whatever is in the cache is valid, and the next PR still gets the
+      # objects that did build.
+      - name: Save ccache
+        if: '!cancelled()'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: ${{ env.CCACHE_CACHE_KEY }}
+
+      # The chr22 fixture's caches (reference, bwa index, upstream bwa's parity
+      # result) are keyed on their inputs, not the commit, but a cache saved in
+      # a PR or merge-queue scope is not shared, so without a main copy every
+      # new PR would rebuild them. Run the action once per runner type that
+      # uses it (ubuntu-latest, ubuntu-24.04-arm, macos-latest), on the warm
+      # entry that already runs there. Its bwa comes from the same apt step and
+      # package list (Linux) or brew formula (macOS) as build-and-test's, so
+      # the bwa version in the cache keys matches. After the ccache save, so a
+      # fixture failure cannot cost the compiler cache.
+      - name: Stage chr22 fixture (warms its caches on main)
+        if: matrix.chr22_fixture == true
+        uses: ./.github/actions/chr22-fixture
