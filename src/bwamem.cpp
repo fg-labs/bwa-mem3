@@ -31,6 +31,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "bwamem.h"
 #include "chain_seed_pool.h"
 #include "ext_reverse_copy.h"
+#include "chain_window_prefetch.h"
 #include "read_memo.h"     /* --dedup-reads whole-read-pair memoization (Phase 1: measure-only) */
 #include "meth_xm.h"   /* meth_chem_t for the --meth chemistry default */
 #include "FMI_search.h"
@@ -45,6 +46,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include <inttypes.h>      /* PRId64 for int64_t fprintf format strings */
 #include <errno.h>         /* errno/ERANGE: full-string parse of the dedup env knobs */
 #include <strings.h>       /* strcasecmp in mem_opt_parse_meth_tags */
+#include <algorithm>       /* std::sort / std::adjacent_find: BWA_MEM3_DEBUG_RIGHT_H0_XCHECK */
 #include <atomic>          /* net-cycles auto-dedup controller state */
 #include <chrono>          /* net-cycles auto-dedup controller timing */
 #include <cmath>           /* std::isfinite: reject nan/inf BWAMEM3_DEDUP_Z */
@@ -6307,6 +6309,65 @@ static inline uint64_t bsw_job_hash(const uint8_t *s1, int len1,
     return h;
 }
 
+/* How many pairs (or jobs) ahead the extension driver's per-pair loops hint the
+ * lines they are about to touch. */
+static constexpr int EXT_PF_AHEAD = 8;
+
+/* How many packed-reference lines of a chain's window the extension driver
+ * hints (plus the window's last line); see chain_window_pac_lines. */
+static constexpr int CHAIN_PAC_PF_LINES = 8;
+
+/* Hint the region (`mem_alnreg_t`, 112 bytes: up to three lines) that the loop
+ * over `pa[0, n)` will read at pair l + EXT_PF_AHEAD. By the time a batch's
+ * rungs run, the batch's regions have left the near caches, and the pairs are in
+ * tier and length order, not read order. A pure hint: byte-identical. */
+static inline void ext_prefetch_region_ahead(const mem_alnreg_v *av_v, const SeqPair *pa,
+                                             int l, int n)
+{
+    if (l + EXT_PF_AHEAD < n) {
+        const SeqPair *q = &pa[l + EXT_PF_AHEAD];
+        const char *r = (const char *)&av_v[q->seqid].a[q->regid];
+        __builtin_prefetch(r, 0, 3);
+        __builtin_prefetch(r + 64, 0, 3);
+        __builtin_prefetch(r + sizeof(mem_alnreg_t) - 1, 0, 3);
+    }
+}
+
+/* Hint the lines the dedup fingerprint (bsw_job_hash) of job i + EXT_PF_AHEAD
+ * folds: the first and last bytes of its target and query, four spots far apart
+ * in the batch's staged windows. A pure hint: byte-identical. */
+static inline void ext_prefetch_job_ahead(const SeqPair *pa, int i, int n,
+                                          const uint8_t *ref, const uint8_t *qer)
+{
+    if (i + EXT_PF_AHEAD < n) {
+        const SeqPair &q = pa[i + EXT_PF_AHEAD];
+        if (q.len1 > 0) {
+            __builtin_prefetch(ref + q.idr, 0, 3);
+            __builtin_prefetch(ref + q.idr + q.len1 - 1, 0, 3);
+        }
+        if (q.len2 > 0) {
+            __builtin_prefetch(qer + q.idq, 0, 3);
+            __builtin_prefetch(qer + q.idq + q.len2 - 1, 0, 3);
+        }
+    }
+}
+
+/* A two-stage look-ahead over the reads' chain lists (each read's list is its
+ * own heap block): hint the first chain d reads on, and the first seeds of the
+ * first chain d - 1 reads on (that chain's line was hinted a read earlier, so
+ * reading its seed pointer does not wait). Pure hints: byte-identical. */
+static inline void ext_prefetch_chain_lists_ahead(const mem_chain_v *chain_ar, int l,
+                                                  int nseq, int d)
+{
+    if (l + d < nseq && chain_ar[l + d].n > 0)
+        __builtin_prefetch(chain_ar[l + d].a, 0, 3);
+    if (l + d - 1 < nseq && chain_ar[l + d - 1].n > 0 && chain_ar[l + d - 1].a[0].n > 0) {
+        const char *ps = (const char *)chain_ar[l + d - 1].a[0].seeds;
+        __builtin_prefetch(ps, 0, 3);
+        __builtin_prefetch(ps + 64, 0, 3);
+    }
+}
+
 /* BWAMEM3_DEDUP_STATS=1: count distinct-within-batch (m) vs total (n) extension
  * DP jobs and print the batch dup rate once at exit. Measurement only; a single
  * cached-bool branch per batch, inert unless armed. */
@@ -6418,6 +6479,7 @@ static inline void bsw_tier_kernel(BswMethTier tier, IBandedPairWiseSW *bsw,
     missidx.clear();
 
     for (int i = 0; i < n; i++) {
+        ext_prefetch_job_ahead(pa, i, n, ref, qer);
         const uint8_t *s1 = ref + pa[i].idr; const int len1 = pa[i].len1;
         const uint8_t *s2 = qer + pa[i].idq; const int len2 = pa[i].len2;
         const int      h0 = pa[i].h0;
@@ -6677,6 +6739,7 @@ static inline int bsw_tb_probe_rung(BswMethTier tier, const mem_opt_t *opt, mem_
                    bkt, ref, qer, cnt[b], nthreads, Wb, scratch, scratch, hist);
       sym->set_guard_overshoot(false);
       for (int l = 0; l < cnt[b]; l++) {
+        ext_prefetch_region_ahead(av_v, bkt, l, cnt[b]);
         SeqPair *sp = &bkt[l];
         mem_alnreg_t *a = &(av_v[sp->seqid].a[sp->regid]);
         int prev = a->score;
@@ -8005,6 +8068,15 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
     }
     auto max_gap_memo = [&](int qlen) -> int { return mg_memo(opt, qlen); };
 
+    /* A seed's own term of its chain's reference window: [rbeg - before,
+     * rbeg + after). derive_chain_window takes the union of these over the
+     * chain's seeds; prefetch_chain_window hints the first seed's. */
+    auto seed_window_extent = [&](const mem_seed_t *t, int lq, int64_t &before, int64_t &after) {
+        const int tail = lq - t->qbeg - t->len;
+        before = t->qbeg + max_gap_memo(t->qbeg);
+        after = t->len + (tail + max_gap_memo(tail));
+    };
+
     auto derive_chain_window = [&](mem_chain_t *cc, int lq,
                                    uint8_t *&rseq_out, int &chain_max_n_hits_out) -> int {
         int64_t tmp;
@@ -8017,9 +8089,10 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
         for (int i = 0; i < cc->n; ++i) {
             int64_t b, e;
             const mem_seed_t *t = &cc->seeds[i];
-            b = t->rbeg - (t->qbeg + max_gap_memo(t->qbeg));
-            e = t->rbeg + t->len + ((lq - t->qbeg - t->len) +
-                                    max_gap_memo(lq - t->qbeg - t->len));
+            int64_t before, after;
+            seed_window_extent(t, lq, before, after);
+            b = t->rbeg - before;
+            e = t->rbeg + after;
 
             tmp = rmax[0];
             rmax[0] = tmp < b? rmax[0] : b;
@@ -8056,6 +8129,24 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
         return chain_band;
     };
 
+    /* Each chain's reference window (bns_fetch_seq_v2 in derive_chain_window)
+     * starts with a ~DRAM-latency miss on pac[] at a position nothing earlier
+     * has touched, and the fetch's first touches are the window's two ends.
+     * Hint every packed line of the window the chain's first seed implies (its
+     * own term of the window, clamped to the seed's strand, at most
+     * CHAIN_PAC_PF_LINES lines plus the last) into L2. Pure hints:
+     * byte-identical. */
+    auto prefetch_chain_window = [&](const mem_chain_t *cc, int lq) {
+        if (cc->n == 0) return;
+        const mem_seed_t *s0 = &cc->seeds[0];
+        int64_t before, after;
+        seed_window_extent(s0, lq, before, after);
+        uintptr_t ln[CHAIN_PAC_PF_LINES + 1];
+        const int nl = chain_window_pac_lines(pac, l_pac, s0->rbeg, before, after,
+                                              CHAIN_PAC_PF_LINES, ln);
+        for (int k = 0; k < nl; k++) __builtin_prefetch((const void *)ln[k], 0, 2);
+    };
+
     // uint64_t timUP = __rdtsc();
     for (int l=0; l<nseq; l++)
     {
@@ -8079,24 +8170,16 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
 
         _mm_prefetch((const char*) query, _MM_HINT_NTA);
 
-        /* Each chain's reference window (bns_fetch_seq_v2 below) starts with a
-         * ~DRAM-latency miss on pac[] at a position nothing earlier has touched.
-         * Hint the packed bytes around the NEXT chain's first seed while this
-         * one is being built (the window is a few cache lines around that
-         * seed on either strand), and the next read's first chain here, at the
-         * start of this read, so that hint has this read's whole chain loop to
-         * land before the next read's first fetch. Pure hints: byte-identical. */
-#define CHAIN_PAC_PREFETCH(chain_p) do {                                          \
-            const mem_chain_t *_pc = (chain_p);                                   \
-            if (_pc->n > 0) {                                                     \
-                int _is_rev;  /* discarded; bns_depos also reports the strand */    \
-                const int64_t _pb = bns_depos(bns, _pc->seeds[0].rbeg, &_is_rev) >> 2; \
-                __builtin_prefetch(pac + _pb, 0, 1);                              \
-                if (_pb >= 64) __builtin_prefetch(pac + _pb - 64, 0, 1);          \
-                if (_pb + 64 <= (l_pac >> 2)) __builtin_prefetch(pac + _pb + 64, 0, 1); \
-            }                                                                     \
-        } while (0)
-        if (l + 1 < nseq && chain_ar[l + 1].n > 0) CHAIN_PAC_PREFETCH(&chain_ar[l + 1].a[0]);
+        /* The chain lists three reads on and their first seeds two on, so the
+         * window hint below (one read on) and the read's own chain loop find
+         * both cached. */
+        ext_prefetch_chain_lists_ahead(chain_ar, l, nseq, 3);
+
+        /* Hint the next read's first chain's window here, at the start of this
+         * read, so the hint has this read's whole chain loop to land before the
+         * next read's first fetch (prefetch_chain_window). */
+        if (l + 1 < nseq && chain_ar[l + 1].n > 0)
+            prefetch_chain_window(&chain_ar[l + 1].a[0], seq_[l + 1].l_seq);
 
         // aln mem allocation
         av->m = 0;
@@ -8114,7 +8197,8 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
 
             if (c->n == 0) continue;
 
-            if (j + 1 < chn->n) CHAIN_PAC_PREFETCH(&chn->a[j + 1]);
+            /* The next chain's window, while this one is built. */
+            if (j + 1 < chn->n) prefetch_chain_window(&chn->a[j + 1], l_query);
             _mm_prefetch((const char*) (srtgg + spos + 64), _MM_HINT_NTA);
             _mm_prefetch((const char*) (lim_g), _MM_HINT_NTA);
 
@@ -8247,7 +8331,6 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
             // tprof[MEM_ALN2_DOWN1][tid] += __rdtsc() - tim;
         }
     }
-#undef CHAIN_PAC_PREFETCH
     // tprof[MEM_ALN2_UP][tid] += __rdtsc() - timUP;
 
 
@@ -8385,6 +8468,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
         int num = 0;
         for (int l=0; l<nump; l++)
         {
+            ext_prefetch_region_ahead(av_v, pair_ar, l, nump);
             mem_alnreg_t *a;
             SeqPair *sp = &pair_ar[l];
             a = &(av_v[sp->seqid].a[sp->regid]); // prev
@@ -8470,6 +8554,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
         int num = 0;
         for (int l=0; l<nump; l++)
         {
+            ext_prefetch_region_ahead(av_v, pair_ar, l, nump);
             mem_alnreg_t *a;
             SeqPair *sp = &pair_ar[l];
             a = &(av_v[sp->seqid].a[sp->regid]); // prev
@@ -8551,6 +8636,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
         int num = 0;
         for (int l=0; l<nump; l++)
         {
+            ext_prefetch_region_ahead(av_v, pair_ar, l, nump);
             mem_alnreg_t *a;
             SeqPair *sp = &pair_ar[l];
             a = &(av_v[sp->seqid].a[sp->regid]); // prev
@@ -8598,27 +8684,39 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
 
     // uint64_t timR = __rdtsc();
     // **********************************************************
-    // h0 fixup: right-extension h0 is the left-extension alnreg score.
-    for (int l=0; l<numPairsRight; l++) {
-        mem_alnreg_t *a;
-        SeqPair *sp = &seqPairArrayRight128[l];
-        a = &(av_v[sp->seqid].a[sp->regid]); // prev
-        sp->h0 = a->score;
-    }
-
     // post-left-SW right-side ungapped pass. The per-seed fast-
     // path skipped right ext for 93% of pairs because a->score was still
     // -1 at construction time (left SW hadn't run yet). Now that left
-    // SW is done, a->score is final and h0 is set above. Run ungapped
-    // analysis on every right pair:
+    // SW is done, a->score is final. Fill each pair's h0 (the right
+    // extension's h0 is the left-extension alnreg score) and run ungapped
+    // analysis on every right pair, in one pass over the regions. Filling
+    // h0 here rather than in a pass of its own reads the same scores: a
+    // seed stages at most one right pair and each seed has its own region,
+    // so no pair's HIT below writes a region whose score another pair's h0
+    // reads.
     //   HIT    → fill a->* directly, compact the pair out of the array.
     //   TIGHT  → set sp->tight_band (probe rung / --adaptive-band stop).
     //   FALL   → leave tight_band at construction default (typically 0).
+#ifdef BWA_MEM3_DEBUG_RIGHT_H0_XCHECK
+    /* The one-pass h0 fill below relies on no two right pairs sharing a region.
+     * Opt-in check: make EXTRA_CXXFLAGS=-DBWA_MEM3_DEBUG_RIGHT_H0_XCHECK */
+    {
+        std::vector<uint64_t> keys((size_t)numPairsRight);
+        for (int l = 0; l < numPairsRight; l++)
+            keys[l] = ((uint64_t)(uint32_t)seqPairArrayRight128[l].seqid << 32)
+                    | (uint32_t)seqPairArrayRight128[l].regid;
+        std::sort(keys.begin(), keys.end());
+        xassert(std::adjacent_find(keys.begin(), keys.end()) == keys.end(),
+                "two right-extension pairs share a region; the one-pass h0 fill is not exact");
+    }
+#endif
     {
         int compacted = 0;
         for (int l = 0; l < numPairsRight; l++) {
+            ext_prefetch_region_ahead(av_v, seqPairArrayRight128, l, numPairsRight);
             SeqPair *sp = &seqPairArrayRight128[l];
             mem_alnreg_t *a = &(av_v[sp->seqid].a[sp->regid]);
+            sp->h0 = a->score;
             int keep = 1;
             // Skip pairs already analyzed at construction time (a->score
             // was non-(-1) then; UGP_R_ATTEMPT and outcome counters fired
@@ -8766,6 +8864,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
 
         for (int l=0; l<nump; l++)
         {
+            ext_prefetch_region_ahead(av_v, pair_ar, l, nump);
             mem_alnreg_t *a;
             SeqPair *sp = &pair_ar[l];
             a = &(av_v[sp->seqid].a[sp->regid]); // prev
@@ -8839,6 +8938,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
 
         for (int l=0; l<nump; l++)
         {
+            ext_prefetch_region_ahead(av_v, pair_ar, l, nump);
             mem_alnreg_t *a;
             SeqPair *sp = &pair_ar[l];
             a = &(av_v[sp->seqid].a[sp->regid]); // prev
@@ -8915,6 +9015,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
 
         for (int l=0; l<nump; l++)
         {
+            ext_prefetch_region_ahead(av_v, pair_ar, l, nump);
             mem_alnreg_t *a;
             SeqPair *sp = &pair_ar[l];
             a = &(av_v[sp->seqid].a[sp->regid]); // prev
@@ -9118,6 +9219,10 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
 
     for (int l=0; l<nseq; l++)
     {
+        /* The enqueue's chain-list look-ahead, one read nearer: the chain lists
+         * two reads on and their first seeds one on. */
+        ext_prefetch_chain_lists_ahead(chain_ar, l, nseq, 2);
+
         int s_start = 0, s_end = 0;
         uint32_t *srtg = srtgg + lim_g[l];
         /* The index answers the scan below exactly while every kept seed's alnreg
