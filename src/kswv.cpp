@@ -771,6 +771,26 @@ static bool rescue_rowpair_enabled() { return rescue_env_on("BWA3_RESCUE_ROWPAIR
  * BWA3_RESCUE_LAZYQE=0 restores the inline argmax. */
 static bool rescue_lazyqe_enabled() { return rescue_env_on("BWA3_RESCUE_LAZYQE"); }
 
+/* Lazy query-end rescan order (BWA3_RESCUE_QE_REVSCAN, NEON 8- and 16-bit). The
+ * rescan wants, per improved lane, the first column of the row whose H equals the
+ * row max, and it only scans the QE_BLK block where that lane's running max first
+ * reaches it (the checkpoints are prefix maxima). The forward scan keeps a found
+ * mask and a first-hit mask per column: five ops. Scanning the block's columns
+ * last to first with an unconditional select needs two (compare, select): the
+ * last write is each lane's first column holding the max, and the lanes that
+ * newly reached it in this block take it with one select. The block loop carries
+ * one `pending` mask (improved lanes not yet found) in place of the found mask
+ * and the recomputed improvement mask. Both forms compute
+ * min{ j : H[j] == imax } over the same stored values for the same lanes, so the
+ * result is identical. Default ON; 0 restores the forward scan. */
+static bool rescue_qe_revscan_enabled() { return rescue_env_on("BWA3_RESCUE_QE_REVSCAN"); }
+
+/* BWA3_RESCUE_PADCOLS (default ON): the u8 NEON FScan bodies run the group's
+ * all-pad query columns, [jzero, jsplit), with a cell that takes the diagonal as
+ * m11 instead of gathering a score that is provably 0 there. See jzero in
+ * kswv_neon_u8_impl; 0 leaves that range empty. */
+static bool rescue_padcols_enabled() { return rescue_env_on("BWA3_RESCUE_PADCOLS"); }
+
 /* FScan (BWA3_RESCUE_FSCAN): the u8 NEON cell rebuilt around G = max(m11, f11),
  * the cell's score before the in-row gap, with one sat(G - oe) opening both
  * gaps and the row max taken over G: 11 vector ALU ops per cell instead of 13, a boundary
@@ -1096,8 +1116,9 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
      * in the USQADD body: s1 is 0-3, AMBR (4), or the 0xFF reference pad, so
      * s1 ^ 16 is 16..20 (or 0xEF), and vqtbl1q_u8 returns 0 for any index >= 16
      * -- exactly the zero delta the pad must contribute (m11 = h00, ksw's
-     * profile-0 semantics). No compare, no blend, and no column split: jdummy is
-     * pinned to jsplit so the [jdummy, jsplit) loops are empty.
+     * profile-0 semantics). No compare and no blend: jdummy is pinned to jsplit,
+     * so there is no [jdummy, jsplit) pad-blend range. Where every lane holds the
+     * pad, the FScan bodies skip the gather too (see jzero below).
      *
      * The biased (!USQADD) body needs the pad to score `shift`, not 0, and a
      * 16-entry table cannot say that for an index >= 16, so it keeps the
@@ -1107,6 +1128,30 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
      * legacy toggle path. The AVX2/AVX-512 kernels keep DUMMY5 = 5: pshufb masks
      * its index to four bits, so an index of 16 would read entry 0 there. */
     const int jdummy = USQADD ? jsplit : compute_jdummy(p, SIMD_WIDTH8, ncol, jsplit);
+
+    /* All-pad columns (BWA3_RESCUE_PADCOLS, USQADD FScan bodies only). From the
+     * group's longest query up to jsplit, every lane's query byte is NEON_QPAD8:
+     * each lane is past its len2 and short of its quantum. As above, every
+     * reference byte XORs with it to a table index of 16 or more, where the gather
+     * returns 0, and NEON_SQADD_U8(h, 0) == h, so the cell's m11 is its diagonal as
+     * is. [jzero, jsplit) therefore runs a cell with no query load, XOR, TBL or
+     * USQADD: 8 vector ALU ops per cell instead of 11 (the last 10 of 160 columns
+     * for 150 bp mates). The freed-cell override never fires there either: it
+     * compares s2 with a base code or FREED_INACTIVE8, never 16. The FScan bodies
+     * apply no boundary mask below jsplit, so nothing else differs. A dummy tail
+     * lane (len2 = 0) pins jsplit to 0, and a lane whose len2 is a multiple of 16
+     * pins it to at most that len2, so the range is empty in both cases. The
+     * biased (!USQADD) body is excluded: its pad cell is vqsubq(vqaddq(h, shift),
+     * shift), which is not h when h + shift saturates. Default ON; 0 leaves the
+     * range empty. */
+    int jzero = jdummy;
+    if (USQADD && FScan && rescue_padcols_enabled()) {
+        int maxLen2 = 0;
+        for (int l = 0; l < SIMD_WIDTH8; l++)
+            if (p[l].len2 > maxLen2) maxLen2 = p[l].len2;
+        jzero = maxLen2 < jsplit ? maxLen2 : jsplit;
+    }
+    const bool qe_revscan = rescue_qe_revscan_enabled();
 
     /* Per-row epilogue, shared by the one-row and two-row sweeps. Threads the
      * cross-row state (pimax_vec lagged row-max store, gmax/te/qe, the frozen
@@ -1151,7 +1196,29 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
         te_vec_lo = vbslq_s16(cmp_lo_16, i_vec, te_vec_lo);                      \
         te_vec_hi = vbslq_s16(cmp_hi_16, i_vec, te_vec_hi);                      \
         if (!(EPI_INLINE_QE)) {                                                  \
-            if (vmaxvq_u8(cmp0_active)) {                                        \
+            if (vmaxvq_u8(cmp0_active) && qe_revscan) {                          \
+                /* Backward block rescan; see rescue_qe_revscan_enabled. */      \
+                uint8x16_t iqe_vec = vdupq_n_u8(0xFF);                           \
+                uint8x16_t pending = cmp0_active;                                \
+                const uint8_t *colIdx = this->colIdx8;                           \
+                const int nblocks = (ncol + QE_BLK - 1) / QE_BLK;                \
+                for (int b = 0; b < nblocks; b++) {                             \
+                    uint8x16_t reached = vceqq_u8(vld1q_u8(__bmax + b * SIMD_WIDTH8), __imax); \
+                    uint8x16_t newly = vandq_u8(reached, pending);               \
+                    pending = vbicq_u8(pending, reached);                        \
+                    if (vmaxvq_u8(newly)) {                                      \
+                        const int j0 = b * QE_BLK;                               \
+                        const int j1 = (j0 + QE_BLK < ncol) ? (j0 + QE_BLK) : ncol; \
+                        uint8x16_t bqe = iqe_vec;                                \
+                        for (int j2 = j1 - 1; j2 >= j0; j2--)                    \
+                            bqe = vbslq_u8(vceqq_u8(vld1q_u8(__hbase + j2 * SIMD_WIDTH8), __imax), \
+                                           vld1q_u8(colIdx + j2 * SIMD_WIDTH8), bqe); \
+                        iqe_vec = vbslq_u8(newly, bqe, iqe_vec);                 \
+                    }                                                           \
+                    if (!vmaxvq_u8(pending)) break;                              \
+                }                                                               \
+                qe_vec = vbslq_u8(cmp0_active, iqe_vec, qe_vec);                 \
+            } else if (vmaxvq_u8(cmp0_active)) {                                 \
                 uint8x16_t iqe_vec = vdupq_n_u8(0xFF);                           \
                 uint8x16_t foundBlk = zero_vec;                                  \
                 const uint8_t *colIdx = this->colIdx8;                           \
@@ -1324,8 +1391,11 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
     /* KSWV_U8_SK_S1 / KSWV_U8_SK_FIN below split this macro for row i + 1 of
      * the pipelined FScan sweep (the score gather and its blends in S1, the add
      * and the boundary blend in FIN); a change here must be made there too. */
-#define KSWV_U8_FS_M11(M, DIAG, S1, AFR, APPLY_BND, BND, NEED_DUMMY)            \
-            {                                                                   \
+#define KSWV_U8_FS_M11(M, DIAG, S1, AFR, APPLY_BND, BND, NEED_DUMMY, ZERO)      \
+            if (ZERO) {                                                         \
+                /* [jzero, jsplit): the score is 0 in every lane (see jzero). */ \
+                M = (DIAG);                                                     \
+            } else {                                                            \
                 uint8x16_t sbt_ = vqtbl1q_u8(permSft, veorq_u8((S1), s2));       \
                 if (NEED_DUMMY && !USQADD)                                       \
                     sbt_ = vbslq_u8(cmpq, sft_vec, sbt_);                        \
@@ -1343,7 +1413,7 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
     /* The pipelined sweep (KSWV_U8_SKEW below, the default outside Apple
      * builds) computes this cell split across its stages; a change here must
      * be made there too. */
-#define KSWV_NEON_U8_CELL_PAIR_FS(APPLY_BND, BND0, BND1, NEED_DUMMY, COLBND, DIN, DOUT) \
+#define KSWV_NEON_U8_CELL_PAIR_FS(APPLY_BND, BND0, BND1, NEED_DUMMY, COLBND, ZERO, DIN, DOUT) \
         {                                                                       \
             uint8x16_t s2 = vld1q_u8(seq2SoA + j * SIMD_WIDTH8);                 \
             uint8x16_t f11 = vld1q_u8(F + (j + 1) * SIMD_WIDTH8);                \
@@ -1356,7 +1426,7 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
             (void) cb_;                                                          \
             /* ---- Row i (diagonal H0[j]) ---- */                              \
             uint8x16_t m0_;                                                      \
-            KSWV_U8_FS_M11(m0_, h00, s1_0, active_frread_0, APPLY_BND, BND0, NEED_DUMMY) \
+            KSWV_U8_FS_M11(m0_, h00, s1_0, active_frread_0, APPLY_BND, BND0, NEED_DUMMY, ZERO) \
             const uint8x16_t g0_ = vmaxq_u8(m0_, f11);                           \
             const uint8x16_t t0_ = vqsubq_u8(g0_, oe_vec);                       \
             const uint8x16_t f0_ = vmaxq_u8(t0_, vqsubq_u8(f11, e_del_vec));     \
@@ -1367,7 +1437,7 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
             e11_0 = vmaxq_u8(t0_, vqsubq_u8(e11_0, e_ins_vec));                  \
             /* ---- Row i+1 (diagonal DIN, vertical carry f0_) ---- */           \
             uint8x16_t m1_;                                                      \
-            KSWV_U8_FS_M11(m1_, (DIN), s1_1, active_frread_1, APPLY_BND, BND1, NEED_DUMMY) \
+            KSWV_U8_FS_M11(m1_, (DIN), s1_1, active_frread_1, APPLY_BND, BND1, NEED_DUMMY, ZERO) \
             const uint8x16_t g1_ = vmaxq_u8(m1_, f0_);                           \
             const uint8x16_t t1_ = vqsubq_u8(g1_, oe_vec);                       \
             vst1q_u8(F + (j + 1) * SIMD_WIDTH8,                                  \
@@ -1440,9 +1510,9 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
 #define KSWV_U8_BLOCKS2(hi, CKPT, APPLY_BND, BND0, BND1, NEED_DUMMY)            \
         KSWV_U8_BLOCKS2_DRIVE(hi, CKPT, KSWV_NEON_U8_CELL_PAIR,                 \
                               APPLY_BND, BND0, BND1, NEED_DUMMY)
-#define KSWV_U8_BLOCKS2_FS(hi, CKPT, APPLY_BND, BND0, BND1, NEED_DUMMY, COLBND) \
+#define KSWV_U8_BLOCKS2_FS(hi, CKPT, APPLY_BND, BND0, BND1, NEED_DUMMY, COLBND, ZERO) \
         KSWV_U8_BLOCKS2_DRIVE(hi, CKPT, KSWV_NEON_U8_CELL_PAIR_FS,              \
-                              APPLY_BND, BND0, BND1, NEED_DUMMY, COLBND)
+                              APPLY_BND, BND0, BND1, NEED_DUMMY, COLBND, ZERO)
     /* KSWV_U8_FS_SKEW selects the pipelined sweep below: on by default outside
      * Apple builds (which keep the two-column unrolled driver above), and
      * settable either way (-DKSWV_U8_FS_SKEW=0 / =1), e.g. to run it on a Mac. */
@@ -1481,7 +1551,7 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
 #else
 #define KSWV_U8_SK_UNROLL2
 #endif
-#define KSWV_U8_SK_S1(C, M0, F11, FD, SB1, CB, APPLY_BND, NEED_DUMMY, COLBND)               \
+#define KSWV_U8_SK_S1(C, M0, F11, FD, SB1, CB, APPLY_BND, NEED_DUMMY, COLBND, ZERO)         \
         {                                                                                   \
             const uint8x16_t s2 = vld1q_u8(seq2SoA + (C) * SIMD_WIDTH8);                    \
             F11 = vld1q_u8(F + ((C) + 1) * SIMD_WIDTH8);                                    \
@@ -1491,11 +1561,15 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
             (void) cmpq;                                                                    \
             CB = zero_vec;                                                                  \
             if (COLBND) CB = vtstq_u8(s2, highbit_vec);                                     \
-            KSWV_U8_FS_M11(M0, h00, s1_0, active_frread_0, APPLY_BND, CB, NEED_DUMMY)       \
+            KSWV_U8_FS_M11(M0, h00, s1_0, active_frread_0, APPLY_BND, CB, NEED_DUMMY, ZERO) \
             FD = vqsubq_u8(F11, e_del_vec);                                                 \
-            SB1 = vqtbl1q_u8(permSft, veorq_u8(s1_1, s2));                                  \
-            if (NEED_DUMMY && !USQADD) SB1 = vbslq_u8(cmpq, sft_vec, SB1);                  \
-            if (HasFreed) SB1 = vbslq_u8(vceqq_u8(s2, active_frread_1), freedval_vec, SB1); \
+            if (ZERO) {                                                                     \
+                SB1 = zero_vec;   /* unread: SK_FIN takes row i+1's diagonal as is */       \
+            } else {                                                                        \
+                SB1 = vqtbl1q_u8(permSft, veorq_u8(s1_1, s2));                              \
+                if (NEED_DUMMY && !USQADD) SB1 = vbslq_u8(cmpq, sft_vec, SB1);              \
+                if (HasFreed) SB1 = vbslq_u8(vceqq_u8(s2, active_frread_1), freedval_vec, SB1); \
+            }                                                                               \
         }
 #define KSWV_U8_SK_S2(M0, F11, FD, G0, T0, F0) \
         {                                      \
@@ -1503,7 +1577,7 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
             T0 = vqsubq_u8(G0, oe_vec);        \
             F0 = vmaxq_u8(T0, (FD));           \
         }
-#define KSWV_U8_SK_FIN(G0, T0, F0, SB1, CB, APPLY_BND)                                      \
+#define KSWV_U8_SK_FIN(G0, T0, F0, SB1, CB, APPLY_BND, ZERO)                                \
         {                                                                                   \
             const uint8x16_t h0_ = vmaxq_u8((G0), e11_0);                                   \
             if (LazyQE) vst1q_u8(H0 + j * SIMD_WIDTH8, h0_);                                \
@@ -1511,7 +1585,9 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
             imax0 = vmaxq_u8(imax0, (G0));                                                  \
             e11_0 = vmaxq_u8((T0), vqsubq_u8(e11_0, e_ins_vec));                            \
             uint8x16_t m1_;                                                                 \
-            if (USQADD) {                                                                   \
+            if (ZERO) {                                                                     \
+                m1_ = d1;                                                                   \
+            } else if (USQADD) {                                                            \
                 m1_ = NEON_SQADD_U8(d1, (SB1));                                             \
                 if (APPLY_BND) m1_ = vbslq_u8((CB), zero_vec, m1_);                         \
             } else {                                                                        \
@@ -1530,27 +1606,27 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
             d1 = h0_;                                                                       \
             if (!LazyQE) j_v = vaddq_u8(j_v, one_vec);                                      \
         }
-#define KSWV_U8_SKEW(hi, CKPT, APPLY_BND, NEED_DUMMY, COLBND)                                    \
+#define KSWV_U8_SKEW(hi, CKPT, APPLY_BND, NEED_DUMMY, COLBND, ZERO)                              \
         if (j < (hi)) {                                                                          \
             /* a*: column j after S2 (next to finish); b*: column j+1 after S1 */                \
             uint8x16_t aG, aT, aF, aSB, aCB, bM, bF11, bFD, bSB, bCB;                            \
             {                                                                                    \
                 uint8x16_t m_, f_, fd_;                                                          \
-                KSWV_U8_SK_S1(j, m_, f_, fd_, aSB, aCB, APPLY_BND, NEED_DUMMY, COLBND)           \
+                KSWV_U8_SK_S1(j, m_, f_, fd_, aSB, aCB, APPLY_BND, NEED_DUMMY, COLBND, ZERO)     \
                 KSWV_U8_SK_S2(m_, f_, fd_, aG, aT, aF)                                           \
             }                                                                                    \
             bM = bF11 = bFD = bSB = bCB = zero_vec;                                              \
             if (j + 1 < (hi))                                                                    \
-                KSWV_U8_SK_S1(j + 1, bM, bF11, bFD, bSB, bCB, APPLY_BND, NEED_DUMMY, COLBND)     \
+                KSWV_U8_SK_S1(j + 1, bM, bF11, bFD, bSB, bCB, APPLY_BND, NEED_DUMMY, COLBND, ZERO) \
             for (; j + 2 < (hi); ) {                                                             \
                 const int jnb_ = ((j / QE_BLK) + 1) * QE_BLK;                                    \
                 const int jend_ = jnb_ < (hi) - 2 ? jnb_ : (hi) - 2;                             \
                 KSWV_U8_SK_UNROLL2                                                               \
                 for (; j < jend_; j++) {                                                         \
                     uint8x16_t nM, nF11, nFD, nSB, nCB, nG, nT, nF;                              \
-                    KSWV_U8_SK_S1(j + 2, nM, nF11, nFD, nSB, nCB, APPLY_BND, NEED_DUMMY, COLBND) \
+                    KSWV_U8_SK_S1(j + 2, nM, nF11, nFD, nSB, nCB, APPLY_BND, NEED_DUMMY, COLBND, ZERO) \
                     KSWV_U8_SK_S2(bM, bF11, bFD, nG, nT, nF)                                     \
-                    KSWV_U8_SK_FIN(aG, aT, aF, aSB, aCB, APPLY_BND)                              \
+                    KSWV_U8_SK_FIN(aG, aT, aF, aSB, aCB, APPLY_BND, ZERO)                        \
                     aG = nG; aT = nT; aF = nF; aSB = bSB; aCB = bCB;                             \
                     bM = nM; bF11 = nF11; bFD = nFD; bSB = nSB; bCB = nCB;                       \
                 }                                                                                \
@@ -1559,12 +1635,12 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
             if (j + 1 < (hi)) {                                                                  \
                 uint8x16_t nG, nT, nF;                                                           \
                 KSWV_U8_SK_S2(bM, bF11, bFD, nG, nT, nF)                                         \
-                KSWV_U8_SK_FIN(aG, aT, aF, aSB, aCB, APPLY_BND)                                  \
+                KSWV_U8_SK_FIN(aG, aT, aF, aSB, aCB, APPLY_BND, ZERO)                            \
                 j++;                                                                             \
                 if ((j % QE_BLK) == 0) { CKPT }                                                  \
                 aG = nG; aT = nT; aF = nF; aSB = bSB; aCB = bCB;                                 \
             }                                                                                    \
-            KSWV_U8_SK_FIN(aG, aT, aF, aSB, aCB, APPLY_BND)                                      \
+            KSWV_U8_SK_FIN(aG, aT, aF, aSB, aCB, APPLY_BND, ZERO)                                \
             j++;                                                                                 \
             if ((j % QE_BLK) == 0) { CKPT }                                                      \
         }
@@ -1625,14 +1701,20 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
                  * column half cb_ = vtst(s2, 0x80) is built once per column
                  * for both rows: one shared op plus one blend per cell, in
                  * place of an orr, a tst and a blend per cell. */
+                /* Under USQADD jdummy == jsplit, so jzero splits the one
+                 * range below jsplit: the gathered cells, then the all-pad
+                 * columns (see jzero). Otherwise jzero == jdummy and the
+                 * second range is the biased body's pad-blend columns. */
 #if !KSWV_U8_FS_SKEW
-                KSWV_U8_BLOCKS2_FS(jdummy, KSWV_U8_CKPT_PAIR, false, zero_vec, zero_vec, false, false)
-                KSWV_U8_BLOCKS2_FS(jsplit, KSWV_U8_CKPT_PAIR, false, zero_vec, zero_vec, true, false)
-                KSWV_U8_BLOCKS2_FS(ncol, KSWV_U8_CKPT_PAIR, true, cb_, cb_, true, true)
+                KSWV_U8_BLOCKS2_FS(jzero, KSWV_U8_CKPT_PAIR, false, zero_vec, zero_vec, false, false, false)
+                if (USQADD) { KSWV_U8_BLOCKS2_FS(jsplit, KSWV_U8_CKPT_PAIR, false, zero_vec, zero_vec, false, false, true) }
+                else { KSWV_U8_BLOCKS2_FS(jsplit, KSWV_U8_CKPT_PAIR, false, zero_vec, zero_vec, true, false, false) }
+                KSWV_U8_BLOCKS2_FS(ncol, KSWV_U8_CKPT_PAIR, true, cb_, cb_, true, true, false)
 #else
-                KSWV_U8_SKEW(jdummy, KSWV_U8_CKPT_PAIR, false, false, false)
-                KSWV_U8_SKEW(jsplit, KSWV_U8_CKPT_PAIR, false, true, false)
-                KSWV_U8_SKEW(ncol, KSWV_U8_CKPT_PAIR, true, true, true)
+                KSWV_U8_SKEW(jzero, KSWV_U8_CKPT_PAIR, false, false, false, false)
+                if (USQADD) { KSWV_U8_SKEW(jsplit, KSWV_U8_CKPT_PAIR, false, false, false, true) }
+                else { KSWV_U8_SKEW(jsplit, KSWV_U8_CKPT_PAIR, false, true, false, false) }
+                KSWV_U8_SKEW(ncol, KSWV_U8_CKPT_PAIR, true, true, true, false)
 #endif
             } else {
                 if (i + 1 < minLen1) {
@@ -1810,7 +1892,7 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
         /* FScan twin of KSWV_NEON_U8_CELL: G = max(m11, f11), H = max(G, e11),
          * one T = sat(G - oe) opening both gaps, row max over G --
          * byte-identical by the argument at KSWV_NEON_U8_CELL_PAIR_FS. */
-#define KSWV_NEON_U8_CELL_FS(APPLY_BND, BND, NEED_DUMMY)                        \
+#define KSWV_NEON_U8_CELL_FS(APPLY_BND, BND, NEED_DUMMY, ZERO)                  \
         {                                                                       \
             uint8x16_t s2 = vld1q_u8(seq2SoA + j * SIMD_WIDTH8);                \
             const uint8x16_t cb_ = vtstq_u8(s2, highbit_vec); /* dead unless BND names it */ \
@@ -1821,7 +1903,7 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
             if (NEED_DUMMY && !USQADD) cmpq = vceqq_u8(s2, qpad_vec);           \
             (void) cmpq;                                                        \
             uint8x16_t m11;                                                     \
-            KSWV_U8_FS_M11(m11, h00, s1, active_frread, APPLY_BND, BND, NEED_DUMMY) \
+            KSWV_U8_FS_M11(m11, h00, s1, active_frread, APPLY_BND, BND, NEED_DUMMY, ZERO) \
             const uint8x16_t g = vmaxq_u8(m11, f11);                            \
             const uint8x16_t t = vqsubq_u8(g, oe_vec);                          \
             h11 = vmaxq_u8(g, e11);                                             \
@@ -1833,9 +1915,10 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
         j = 0;
         if (FScan) {
             /* Query half of the mask only, from jsplit on; see the pair body. */
-            KSWV_U8_BLOCKS(jdummy, KSWV_U8_CKPT_ONE, KSWV_NEON_U8_CELL_FS(false, zero_vec, false))
-            KSWV_U8_BLOCKS(jsplit, KSWV_U8_CKPT_ONE, KSWV_NEON_U8_CELL_FS(false, zero_vec, true))
-            KSWV_U8_BLOCKS(ncol, KSWV_U8_CKPT_ONE, KSWV_NEON_U8_CELL_FS(true, cb_, true))
+            KSWV_U8_BLOCKS(jzero, KSWV_U8_CKPT_ONE, KSWV_NEON_U8_CELL_FS(false, zero_vec, false, false))
+            if (USQADD) { KSWV_U8_BLOCKS(jsplit, KSWV_U8_CKPT_ONE, KSWV_NEON_U8_CELL_FS(false, zero_vec, false, true)) }
+            else { KSWV_U8_BLOCKS(jsplit, KSWV_U8_CKPT_ONE, KSWV_NEON_U8_CELL_FS(false, zero_vec, true, false)) }
+            KSWV_U8_BLOCKS(ncol, KSWV_U8_CKPT_ONE, KSWV_NEON_U8_CELL_FS(true, cb_, true, false))
         } else {
             if (i < minLen1) {
                 /* No lane has begun reference padding and no column below jsplit
@@ -2281,6 +2364,7 @@ int kswv::kswv_neon_16_impl(int16_t seq1SoA[],
      * i+1). Sized from maxQerLen in the constructor because the 16-bit tier
      * has no 256-column admission bound. */
     const int16_t *colIdx = this->colIdx16;
+    const bool qe_revscan = rescue_qe_revscan_enabled();   /* the lazy rescan's order */
     int16_t *blockMax  = this->qeBlk16;
     int16_t *blockMax1 = this->qeBlk16 + this->qeBlk16Stride;
     (void) blockMax1;
@@ -2368,7 +2452,28 @@ int kswv::kswv_neon_16_impl(int16_t seq1SoA[],
         gmax_vec = vbslq_s16(frozen_u16, gmax_vec, new_gmax);                   \
         te_vec = vbslq_s16(cmp0_active, i_vec, te_vec);                         \
         if (!(EPI_INLINE_QE)) {                                                 \
-            if (vmaxvq_u16(cmp0_active)) {                                      \
+            if (vmaxvq_u16(cmp0_active) && qe_revscan) {                        \
+                /* Backward block rescan; see rescue_qe_revscan_enabled. */     \
+                int16x8_t iqe_vec = vdupq_n_s16(-1);                            \
+                uint16x8_t pending = cmp0_active;                               \
+                const int nblocks = (ncol + QE_BLK - 1) / QE_BLK;               \
+                for (int b = 0; b < nblocks; b++) {                             \
+                    uint16x8_t reached = vceqq_s16(vld1q_s16(__bmax + b * SIMD_WIDTH16), __imax); \
+                    uint16x8_t newly = vandq_u16(reached, pending);             \
+                    pending = vbicq_u16(pending, reached);                      \
+                    if (vmaxvq_u16(newly)) {                                    \
+                        const int j0 = b * QE_BLK;                              \
+                        const int j1 = (j0 + QE_BLK < ncol) ? (j0 + QE_BLK) : ncol; \
+                        int16x8_t bqe = iqe_vec;                                \
+                        for (int j2 = j1 - 1; j2 >= j0; j2--)                   \
+                            bqe = vbslq_s16(vceqq_s16(vld1q_s16(__hbase + j2 * SIMD_WIDTH16), __imax), \
+                                            vld1q_s16(colIdx + j2 * SIMD_WIDTH16), bqe); \
+                        iqe_vec = vbslq_s16(newly, bqe, iqe_vec);               \
+                    }                                                           \
+                    if (!vmaxvq_u16(pending)) break;                            \
+                }                                                               \
+                qe_vec = vbslq_s16(cmp0_active, iqe_vec, qe_vec);               \
+            } else if (vmaxvq_u16(cmp0_active)) {                               \
                 int16x8_t iqe_vec = vdupq_n_s16(-1);                            \
                 uint16x8_t foundBlk = vdupq_n_u16(0);                           \
                 const int nblocks = (ncol + QE_BLK - 1) / QE_BLK;               \
