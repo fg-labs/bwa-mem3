@@ -7,13 +7,14 @@
 # -Y, -M, -V, -5, clipping and unmapped records. Each check runs under every
 # SIMD tier this host can run (test/framework/mem_cli.sh: mem_cli_tiers), on
 # the synthetic reference (test/fixtures/mem_synth_ref.awk, whose header lists
-# its contigs and planted repeats) or the committed phiX, with every expected
-# value worked out from the reference by hand.
+# its contigs and planted repeats), with every expected value worked out from
+# the reference by hand.
 #
 # The reads are slices of the synthetic reference, so each field follows from
 # the slice and the default scoring (-A 1 -B 4 -O 6 -E 1 -L 5). A unique exact
-# 100 bp hit has MAPQ 60 (bwa's 6.02 * (score - 19) * ... is far above the 60
-# cap), NM 0, MD 100, AS 100 and XS 0. Read set "fmt" (one record each):
+# 100 bp hit has MAPQ 60 (bwa's mem_approx_mapq_se: 6.02 * (100 - 19) *
+# (ln 50 / ln 100)^2 = 352, capped at 60), NM 0, MD 100, AS 100 and XS 0. Read
+# set "fmt" (one record each):
 #
 #   exact   ctg1:1001-1100, name "exact/1", comment "BC:Z:ACGT<TAB>RX:Z:AAC".
 #   rev     reverse complement of ctg1:1201-1300: FLAG 16, SEQ the reference
@@ -21,7 +22,10 @@
 #   lower   ctg1:1401-1500 in lower case, name "lower/2": SEQ upper case.
 #   iupac   ctg1:1601-1700 with read base 50 an R: SEQ shows N there, NM 1,
 #           MD 49<ref>50, AS 99 - 1 = 98 (N scores -1).
-#   slash   ctg1:1801-1900, name "name/12" (not a /<digit> suffix: kept).
+#   revn    reverse complement of ctg1:2601-2700 with read base 30 an N:
+#           FLAG 16, SEQ the reference with N at base 71 (100 - 30 + 1), NM 1,
+#           MD 70<ref>29, AS 98.
+#   name/12 ctg1:1801-1900; "/12" is not a /<digit> suffix, so the name is kept.
 #   crlf    ctg1:2401-2500.
 #   multi   ctg1:3601-3700.
 #   qat     ctg1:3801-3900 with a quality string that starts with '@'.
@@ -39,7 +43,8 @@
 #   reader  the same reads written as messy FASTQ (text before the first
 #           record, blank lines, CRLF, multi-line sequence and quality, a '+'
 #           line repeating the name), as gzip, as gzip of several members, as
-#           BGZF (when bgzip is installed), from a pipe (/dev/stdin and "-"),
+#           BGZF (when bgzip is installed), from a pipe (/dev/stdin, "-" and a
+#           "<command" input; a command that exits nonzero fails the run),
 #           with the reader's buffer forced down to 1, 7 and 61 bytes
 #           (FR_FASTQ_TEST_BUFSZ, so every record straddles refills), and read
 #           by --legacy-reader: the SAM is byte-identical to the clean FASTQ's.
@@ -56,8 +61,8 @@
 #   -v      -v 1 and -v 4 change only stderr: the SAM is the default one.
 #   --bam   --bam, --bam=0, --bam=6 and --bam=6 --bam-threads 2 are
 #           BGZF-wrapped BAM ("BAM\1" after gunzip); decoded with samtools
-#           (when installed) they equal the SAM text. A malformed --bam-threads
-#           value exits nonzero.
+#           (when installed) they equal the SAM text, and carry bwa-mem3's
+#           @PG. A malformed --bam-threads value exits nonzero.
 #   split   a read made of ctg1:101-160 and ctg3:2601-2640 (forward, and with
 #           the second part reverse-complemented): primary 60M40S on ctg1:101,
 #           supplementary FLAG 2048 (2064 reverse) on ctg3:2601 as 60H40M
@@ -67,21 +72,31 @@
 #   -Y      the supplementary keeps S clips and the whole SEQ/QUAL.
 #   -M      the SAM equals the default one with FLAG 2048 -> 256 (2064 -> 272).
 #   -5      a read made of ctg3:2601-2640 then ctg1:4101-4160: by default the
-#           longer ctg1 hit is primary; with -5 the ctg3 hit (the read's 5' end).
+#           longer ctg1 hit is primary; with -5 the ctg3 hit (the read's 5'
+#           end).
 #   -V      against a copy of the reference whose ctg1 header carries the
 #           description "first contig<TAB>desc": XR:Z:first contig desc on the
 #           ctg1 hit, none on a ctg2 hit, and none without -V.
-#   XA HN   the three-copy read inside block R has HN:i:2; -u appends the score
+#   XA HN   a read inside block R (ctg1:2101-2200), and its reverse complement:
+#           the primary hit plus the XA entries are exactly the three copies
+#           (ctg1 +2101, ctg2 +1101, ctg4 -201, strands flipped for the reverse
+#           complement), each 100M NM 0, and HN:i:2; -u appends the score
 #           (100) and MAPQ (0) to each XA entry. (Only the entries are checked:
 #           whether -u should rename the tag XB is filed separately.)
-#   -p      interleaved pairs (with a single-end read between them) at -I 300,30:
-#           a FR pair FLAG 99/147, TLEN +-300, MC 100M, MQ 60; a RF-oriented
-#           FR pair 83/163; a pair whose second end is unmappable 73/133 with
-#           the unmapped end placed at its mate (POS 1001, CIGAR *); the single
-#           read FLAG 0 in its input position. Without the single read, -p on
-#           one interleaved file equals the two-file run byte for byte.
+#   -p      interleaved pairs (with a single-end read between them) at
+#           -I 300,30: a FR pair FLAG 99/147, TLEN +-300, MC 100M, MQ 60; a FR
+#           pair whose read 1 is the reverse one, 83/163; a pair whose second
+#           end is unmappable, 73/133, with the unmapped end placed at its mate
+#           (POS 1001, CIGAR *); the single read FLAG 0 in its input position.
+#           Without the single read, -p on one interleaved file equals the
+#           two-file run byte for byte.
 #   threads -t 1 and -t 4 at a fixed -K give byte-identical SAM, single-end and
-#           -p, over several batches; records come out in input order.
+#           -p, over several batches (one of which reaches -K at an odd record
+#           count); records come out in input order, and every renamed copy of a
+#           read or pair gets its original's records. The same for 3300 short
+#           reads in 1200-read batches at -t 4 (where the process step streams
+#           finished 512-read work items to the output), with streaming off
+#           (BWA_MEM3_STREAM_OUTPUT=0), and at -t 1.
 #   tiers   every SAM above is byte-identical across tiers (@PG aside).
 #
 # Inputs (env vars):
@@ -92,8 +107,9 @@
 # Optional tools: samtools (the --bam decode check) and bgzip (the BGZF input
 # check); each check is reported as SKIP when its tool is missing.
 
-# Many arguments are awk programs or awk conditions (mem_cli_count, same_after),
-# so `$1`, `$NF` and the like in single quotes are awk's fields, never the shell's.
+# Many arguments are awk programs or awk conditions (mem_cli_count,
+# same_after), so `$1`, `$NF` and the like in single quotes are awk's fields,
+# never the shell's.
 # shellcheck disable=SC2016
 set -euo pipefail
 
@@ -145,7 +161,8 @@ split_lines() {
     }'
 }
 
-# check_fields <label> <sam> <qname> <FLAG RNAME POS MAPQ CIGAR> <SEQ> <QUAL> <tags>
+# check_fields <label> <sam> <qname> <FLAG RNAME POS MAPQ CIGAR> <SEQ> <QUAL>
+#              <tags>
 #   The one primary record of <qname>: columns 2-6, SEQ, QUAL and the optional
 #   fields (TAB-joined) as expected.
 check_fields() {
@@ -195,6 +212,10 @@ s_iupac_ref="$(mem_cli_seq "$ref" ctg1 1601 100)"
 s_iupac="$(mem_cli_subst "$s_iupac_ref" 50 R)"
 s_iupac_sam="$(mem_cli_subst "$s_iupac_ref" 50 N)"
 iupac_ref_base="${s_iupac_ref:49:1}"
+s_revn_ref="$(mem_cli_seq "$ref" ctg1 2601 100)"
+s_revn="$(mem_cli_subst "$(mem_cli_revcomp "$s_revn_ref")" 30 N)"
+s_revn_sam="$(mem_cli_subst "$s_revn_ref" 71 N)"
+revn_ref_base="${s_revn_ref:70:1}"
 s_slash="$(mem_cli_seq "$ref" ctg1 1801 100)"
 s_crlf="$(mem_cli_seq "$ref" ctg1 2401 100)"
 s_multi="$(mem_cli_seq "$ref" ctg1 3601 100)"
@@ -214,6 +235,7 @@ q_long="$(qual_string 1000 9)"
 q_unm="$(qual_string 100 10)"
 s_lname="$(mem_cli_seq "$ref" ctg2 101 100)"
 q_lname="$(qual_string 100 13)"
+q_revn="$(qual_string 100 15)"
 lname="rd:1#ACGT+_=|$(printf '%188s' '' | tr ' ' 'x')"
 c_exact="BC:Z:ACGT${tab}RX:Z:AAC"
 
@@ -223,6 +245,7 @@ c_exact="BC:Z:ACGT${tab}RX:Z:AAC"
     fq_rec rev "" "$s_rev" "$q_rev"
     fq_rec lower/2 "" "$s_lower" "$q_lower"
     fq_rec iupac "" "$s_iupac" "$q_iupac"
+    fq_rec revn "" "$s_revn" "$q_revn"
     fq_rec name/12 "" "$s_slash" "$q_slash"
     fq_rec crlf "" "$s_crlf" "$q_crlf"
     fq_rec multi "" "$s_multi" "$q_multi"
@@ -231,7 +254,7 @@ c_exact="BC:Z:ACGT${tab}RX:Z:AAC"
     fq_rec unmapped "" "$s_unm" "$q_unm"
     fq_rec "$lname" "" "$s_lname" "$q_lname"
 } > "$work/fmt.fq"
-n_fmt=11
+n_fmt=12
 
 # The same records, written messily: text before the first record, blank
 # lines, CRLF line ends, multi-line sequence and quality, a '+' line that
@@ -247,6 +270,7 @@ cr="$(printf '\r')"
     fq_rec lower/2 "" "$s_lower" "$q_lower"
     printf '\n\n'
     fq_rec iupac "" "$s_iupac" "$q_iupac"
+    fq_rec revn "" "$s_revn" "$q_revn"
     fq_rec name/12 "" "$s_slash" "$q_slash"
     printf '@crlf%s\n%s%s\n+%s\n%s%s\n' "$cr" "$s_crlf" "$cr" "$cr" "$q_crlf" "$cr"
     printf '@multi\n'
@@ -315,10 +339,25 @@ done
 } > "$work/split.fq"
 
 # Reads for the XA/HN checks: inside block R (three copies), and unique.
+s_inR="$(mem_cli_seq "$ref" ctg1 2101 100)"
 {
-    fq_rec inR "" "$(mem_cli_seq "$ref" ctg1 2101 100)" "$(qual_string 100 12)"
+    fq_rec inR "" "$s_inR" "$(qual_string 100 12)"
+    fq_rec inRrc "" "$(mem_cli_revcomp "$s_inR")" "$(qual_string 100 14)"
     fq_rec uniq "" "$s_exact" "$q_exact"
 } > "$work/xa.fq"
+
+# hits <sam> <qname>: the primary hit and its XA entries as
+# "contig,strand+POS,CIGAR,NM", sorted, space-separated.
+hits() {
+    local rec strand=+
+    rec="$(mem_cli_primary "$1" "$2")"
+    if (($(mem_cli_col "$rec" 2) / 16 % 2 == 1)); then strand=-; fi
+    {
+        printf '%s,%s%s,%s,%s;' "$(mem_cli_col "$rec" 3)" "$strand" \
+            "$(mem_cli_col "$rec" 4)" "$(mem_cli_col "$rec" 6)" "$(mem_cli_tag "$rec" NM)"
+        mem_cli_tag "$rec" XA
+    } | tr ';' '\n' | awk 'NF' | LC_ALL=C sort | tr '\n' ' '
+}
 
 # -V: a copy of the reference with descriptions in two contig headers.
 vref="$work/vref/vref.fa"
@@ -368,6 +407,24 @@ while ((i < 30)); do
     i=$((i + 1))
 done
 
+# Many short reads, for output streaming: 300 renamed copies of the eleven
+# 100 bp fmt reads (all but "long"). At -K 120000 a batch holds 1200 reads,
+# more than one of the 512-read work items whose records the process step may
+# write as soon as they and every earlier item are done (SAM text, single-end,
+# -t > 1).
+awk 'NR % 4 == 1 { keep = ($1 != "@long") } keep' "$work/fmt.fq" > "$work/short.fq"
+awk -v n=300 '{ line[NR] = $0 }
+    END {
+        for (k = 0; k < n; k++)
+            for (i = 1; i <= NR; i++) {
+                if (i % 4 != 1) { print line[i]; continue }
+                nm = line[i]
+                sub(/[ \t].*/, "", nm)
+                sub(/\/[0-9]+$/, "", nm)
+                print nm "_" k
+            }
+    }' "$work/short.fq" > "$work/stream.fq"
+
 # ---------------------------------------------------------------------------
 # Checks, under each tier
 # ---------------------------------------------------------------------------
@@ -376,9 +433,9 @@ have_samtools=0
 if command -v samtools > /dev/null 2>&1; then have_samtools=1; fi
 
 # Every SAM named here is compared across tiers at the end.
-sams="default messy fasta gz messy_gz legacy legacy_gz stdin dash c_opt rh o_opt f_opt v1 v4 split
+sams="default messy fasta gz messy_gz legacy legacy_gz stdin dash kpipe c_opt rh o_opt f_opt v1 v4 split
       y_opt m_opt p5 v_opt nov xa u_opt pairs pairs_nosingle pairs_2file many_t1 many_t4 manyp_t1
-      manyp_t4"
+      manyp_t4 stream_t4"
 if ((have_bgzip)); then sams="$sams messy_bgz"; fi
 
 # out <name>: the SAM path of run <name> under the current tier.
@@ -410,6 +467,8 @@ for tier in $(mem_cli_tiers); do
     check_fields "$tier" "$sam" lower "0 ctg1 1401 60 100M" "$s_lower_ref" "$q_lower" "$t100"
     check_fields "$tier" "$sam" iupac "0 ctg1 1601 60 100M" "$s_iupac_sam" "$q_iupac" \
         "NM:i:1${tab}MD:Z:49${iupac_ref_base}50${tab}AS:i:98${tab}XS:i:0${tab}HN:i:0"
+    check_fields "$tier" "$sam" revn "16 ctg1 2601 60 100M" "$s_revn_sam" "$(reverse_string "$q_revn")" \
+        "NM:i:1${tab}MD:Z:70${revn_ref_base}29${tab}AS:i:98${tab}XS:i:0${tab}HN:i:0"
     check_fields "$tier" "$sam" name/12 "0 ctg1 1801 60 100M" "$s_slash" "$q_slash" "$t100"
     check_fields "$tier" "$sam" crlf "0 ctg1 2401 60 100M" "$s_crlf" "$q_crlf" "$t100"
     check_fields "$tier" "$sam" multi "0 ctg1 3601 60 100M" "$s_multi" "$q_multi" "$t100"
@@ -419,7 +478,7 @@ for tier in $(mem_cli_tiers); do
     check_fields "$tier" "$sam" unmapped "4 * 0 0 *" "$s_unm" "$q_unm" "AS:i:0${tab}XS:i:0"
     check_fields "$tier" "$sam" "$lname" "0 ctg2 101 60 100M" "$s_lname" "$q_lname" "$t100"
     mem_cli_expect "$tier: one record per read, in input order" \
-        "exact rev lower iupac name/12 crlf multi qat long unmapped $lname " \
+        "exact rev lower iupac revn name/12 crlf multi qat long unmapped $lname " \
         "$(mem_cli_records "$sam" | awk -F '\t' '{ printf "%s ", $1 }')"
     mem_cli_expect "$tier: RNEXT PNEXT TLEN of single-end records" "$n_fmt" \
         "$(mem_cli_count "$sam" '$7 == "*" && $8 == 0 && $9 == 0')"
@@ -449,9 +508,18 @@ for tier in $(mem_cli_tiers); do
     mem_cli_same_file "$tier: gzip from a pipe (/dev/stdin)" "$sam" "$(out stdin)"
     mem_cli_mem "$tier" "$(out dash)" "$ref" - < "$work/messy.fq"
     mem_cli_same_file "$tier: FASTQ from a pipe (-)" "$sam" "$(out dash)"
+    mem_cli_mem "$tier" "$(out kpipe)" "$ref" "<gzip -dc '$work/messy.fq.gz'"
+    mem_cli_same_file "$tier: FASTQ from a '<command' input" "$sam" "$(out kpipe)"
+    mem_cli_mem_status "$tier" "$work/kpipe_fail.$tier.sam" "$ref" "<cat '$work/fmt.fq'; exit 3"
+    mem_cli_expect "$tier: a '<command' input that exits nonzero fails the run" nonzero \
+        "$(if ((MEM_CLI_STATUS != 0)); then echo nonzero; else echo zero; fi)"
     for bufsz in 1 7 61; do
         for f in messy.fq messy.fq.gz; do
-            FR_FASTQ_TEST_BUFSZ="$bufsz" mem_cli_mem "$tier" "$work/bufsz.$tier.sam" "$ref" "$work/$f"
+            # Exported and unset around the call rather than prefixed to it:
+            # some shells keep a prefix assignment after a function call.
+            export FR_FASTQ_TEST_BUFSZ="$bufsz"
+            mem_cli_mem "$tier" "$work/bufsz.$tier.sam" "$ref" "$work/$f"
+            unset FR_FASTQ_TEST_BUFSZ
             mem_cli_same_file "$tier: $f with a $bufsz-byte reader buffer" "$sam" "$work/bufsz.$tier.sam"
         done
     done
@@ -517,6 +585,10 @@ for tier in $(mem_cli_tiers); do
         if ((have_samtools)); then
             samtools view -h "$bam" > "$work/bam.$tier.sam"
             mem_cli_same_file "$tier: $bam_opt decodes to the SAM text" "$work/rhc.$tier.sam" "$work/bam.$tier.sam"
+            # same_file sets @PG aside (its CL: is the argv); the BAM header
+            # must still carry bwa-mem3's one @PG (samtools adds its own).
+            mem_cli_expect "$tier: $bam_opt header has bwa-mem3's @PG" "1" \
+                "$(awk -F '\t' '$1 == "@PG" && $2 == "ID:bwa-mem3" && $3 == "PN:bwa-mem3" { n++ } END { print n + 0 }' "$work/bam.$tier.sam")"
         else
             mem_cli_skip "$tier: $bam_opt decodes to the SAM text" "samtools not installed"
         fi
@@ -585,6 +657,12 @@ for tier in $(mem_cli_tiers); do
 
     # --- XA, HN, -u ------------------------------------------------------------
     mem_cli_mem "$tier" "$(out xa)" "$ref" "$work/xa.fq"
+    # R is at ctg1:2001 and ctg2:1001 (+) and reverse-complemented at ctg4:101;
+    # the read's R offsets 100-199 sit at ctg4:201-300 on the reverse strand.
+    mem_cli_expect "$tier: inR primary + XA hits" \
+        "ctg1,+2101,100M,0 ctg2,+1101,100M,0 ctg4,-201,100M,0 " "$(hits "$(out xa)" inR)"
+    mem_cli_expect "$tier: inRrc primary + XA hits (strands flipped)" \
+        "ctg1,-2101,100M,0 ctg2,-1101,100M,0 ctg4,+201,100M,0 " "$(hits "$(out xa)" inRrc)"
     mem_cli_expect "$tier: HN counts the inR read's two other hits" 2 \
         "$(mem_cli_tag "$(mem_cli_primary "$(out xa)" inR)" HN)"
     mem_cli_expect "$tier: a unique read has HN 0 and no XA" "0|" \
@@ -630,9 +708,9 @@ for tier in $(mem_cli_tiers); do
         "$pr" '$1 != "single"' "$(out pairs_nosingle)" '{ print }'
 
     # --- Threads and batches -------------------------------------------------------
-    mem_cli_mem "$tier" "$(out many_t1)" -t 1 -K 10000 "$ref" "$work/many.fq"
-    mem_cli_mem "$tier" "$(out many_t4)" -t 4 -K 10000 "$ref" "$work/many.fq"
-    mem_cli_same_file "$tier: -t 1 and -t 4 at -K 10000 (single-end)" "$(out many_t1)" "$(out many_t4)"
+    mem_cli_mem "$tier" "$(out many_t1)" -t 1 -K 10050 "$ref" "$work/many.fq"
+    mem_cli_mem "$tier" "$(out many_t4)" -t 4 -K 10050 "$ref" "$work/many.fq"
+    mem_cli_same_file "$tier: -t 1 and -t 4 at -K 10050 (single-end)" "$(out many_t1)" "$(out many_t4)"
     awk 'NR % 4 == 1 { sub(/^@/, "", $1); print $1 }' "$work/many.fq" > "$work/many.names"
     mem_cli_records "$(out many_t4)" | awk -F '\t' '{ print $1 }' > "$work/many_t4.names"
     mem_cli_same_file "$tier: many reads come out in input order" "$work/many.names" "$work/many_t4.names"
@@ -646,13 +724,45 @@ for tier in $(mem_cli_tiers); do
     done
     mem_cli_records "$(out many_t4)" > "$work/many_t4.records"
     mem_cli_same_file "$tier: every copy maps as its original" "$work/many.expected" "$work/many_t4.records"
-    mem_cli_mem "$tier" "$(out manyp_t1)" -t 1 -K 10000 -p -I 300,30 "$ref" "$work/many_pairs.fq"
-    mem_cli_mem "$tier" "$(out manyp_t4)" -t 4 -K 10000 -p -I 300,30 "$ref" "$work/many_pairs.fq"
-    mem_cli_same_file "$tier: -t 1 and -t 4 at -K 10000 (-p)" "$(out manyp_t1)" "$(out manyp_t4)"
+    mem_cli_mem "$tier" "$(out manyp_t1)" -t 1 -K 10050 -p -I 300,30 "$ref" "$work/many_pairs.fq"
+    mem_cli_mem "$tier" "$(out manyp_t4)" -t 4 -K 10050 -p -I 300,30 "$ref" "$work/many_pairs.fq"
+    mem_cli_same_file "$tier: -t 1 and -t 4 at -K 10050 (-p)" "$(out manyp_t1)" "$(out manyp_t4)"
     awk 'NR % 4 == 1 { sub(/^@/, "", $1); sub(/\/[12]$/, "", $1); print $1 }' "$work/many_pairs.fq" \
         > "$work/manyp.names"
     mem_cli_records "$(out manyp_t4)" | awk -F '\t' '{ print $1 }' > "$work/manyp_t4.names"
     mem_cli_same_file "$tier: -p many pairs in input order" "$work/manyp.names" "$work/manyp_t4.names"
+    # 100 bp reads and -K 10050: the first batch reaches the chunk size at an
+    # odd record count, so it must take one more record to keep pair 51 whole.
+    i=0
+    : > "$work/manyp.expected"
+    while ((i < 30)); do
+        mem_cli_records "$(out pairs_nosingle)" | awk -F '\t' -v OFS='\t' -v k="$i" '{ $1 = $1 "_" k; print }' >> "$work/manyp.expected"
+        i=$((i + 1))
+    done
+    mem_cli_records "$(out manyp_t4)" > "$work/manyp_t4.records"
+    mem_cli_same_file "$tier: every pair copy maps as its original" "$work/manyp.expected" "$work/manyp_t4.records"
+
+    # Streaming: -t 4 (records may be written while the batch is still being
+    # processed), the same with streaming turned off, and -t 1 all give each
+    # copy its original's records, in input order.
+    mem_cli_records "$sam" | awk -F '\t' -v n=300 '$1 != "long" {
+            nm = $1
+            sub(/\/[0-9]+$/, "", nm)
+            name[++m] = nm
+            rest[m] = substr($0, index($0, "\t"))
+        }
+        END { for (k = 0; k < n; k++) for (i = 1; i <= m; i++) print name[i] "_" k rest[i] }' \
+        > "$work/stream.expected"
+    mem_cli_mem "$tier" "$(out stream_t4)" -t 4 -K 120000 "$ref" "$work/stream.fq"
+    export BWA_MEM3_STREAM_OUTPUT=0
+    mem_cli_mem "$tier" "$(out stream_off)" -t 4 -K 120000 "$ref" "$work/stream.fq"
+    unset BWA_MEM3_STREAM_OUTPUT
+    mem_cli_mem "$tier" "$(out stream_t1)" -t 1 -K 120000 "$ref" "$work/stream.fq"
+    for s in stream_t4 stream_off stream_t1; do
+        mem_cli_records "$(out "$s")" > "$work/$s.records"
+        mem_cli_same_file "$tier: $s: 3300 reads each get their original's records, in order" \
+            "$work/stream.expected" "$work/$s.records"
+    done
 
     # --- Across tiers ----------------------------------------------------------------
     if [[ -z $first_tier ]]; then

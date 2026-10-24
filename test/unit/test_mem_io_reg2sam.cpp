@@ -13,13 +13,15 @@
 //   c2  400 bp random, with c1[100, 160) copied to c2[200, 260) and a
 //       substitution at copy offset 30 (the base becomes the next in ACGT).
 //   c3  300 bp random, with the reverse complement of c1[100, 160) at
-//       c3[50, 110), and c1[300, 345) never copied (so c3[200, 235) is unique).
+//       c3[50, 110).
 //
-// Coordinates in comments are 0-based half-open unless written as SAM POS.
-// MAPQ comes from mem_approx_mapq_se (bwa's formula, default -A 1 -B 4,
-// mapQ_coef_len 50): for a hit no longer than 50 bp with identity 1 it is
-// 6.02 * (score - max(sub, csub, 19)), rounded, capped at 60, and 0 when that
-// competitor score reaches the hit's own.
+// The regions are given, not found, so only the bases inside each region's
+// windows matter. Coordinates in comments are 0-based half-open unless written
+// as SAM POS. MAPQ comes from mem_approx_mapq_se (bwa's formula, default -A 1
+// -B 4, mapQ_coef_len 50): for an exact hit shorter than 50 bp it is
+// 6.02 * (score - s) rounded, capped at 60, where s is the larger of csub and
+// sub (19, the minimum seed length, when sub is 0), and 0 when s reaches the
+// hit's own score.
 
 #include "doctest/doctest.h"
 #include "mem_fixture.h"
