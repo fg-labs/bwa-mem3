@@ -6355,16 +6355,20 @@ static inline void ext_prefetch_job_ahead(const SeqPair *pa, int i, int n,
 /* A two-stage look-ahead over the reads' chain lists (each read's list is its
  * own heap block): hint the first chain d reads on, and the first seeds of the
  * first chain d - 1 reads on (that chain's line was hinted a read earlier, so
- * reading its seed pointer does not wait). Pure hints: byte-identical. */
+ * reading its seed pointer does not wait). Both seed addresses stay inside the
+ * chain's seed array: ps + 64 when the array is longer than 64 bytes (more than
+ * two seeds), and the array's last byte otherwise. Pure hints: byte-identical. */
 static inline void ext_prefetch_chain_lists_ahead(const mem_chain_v *chain_ar, int l,
                                                   int nseq, int d)
 {
     if (l + d < nseq && chain_ar[l + d].n > 0)
         __builtin_prefetch(chain_ar[l + d].a, 0, 3);
     if (l + d - 1 < nseq && chain_ar[l + d - 1].n > 0 && chain_ar[l + d - 1].a[0].n > 0) {
-        const char *ps = (const char *)chain_ar[l + d - 1].a[0].seeds;
+        const mem_chain_t *c0 = &chain_ar[l + d - 1].a[0];
+        const char *ps = (const char *)c0->seeds;
+        const size_t bytes = (size_t)c0->n * sizeof(mem_seed_t);
         __builtin_prefetch(ps, 0, 3);
-        __builtin_prefetch(ps + 64, 0, 3);
+        __builtin_prefetch(bytes > 64 ? ps + 64 : ps + bytes - 1, 0, 3);
     }
 }
 
