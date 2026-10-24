@@ -22,15 +22,39 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+    env:
+      # A step `if:` cannot read secrets, so the credentials' presence is passed in.
+      HAS_FG_LABS_BOT: ${{ secrets.FG_LABS_BOT_APP_ID != '' && secrets.FG_LABS_BOT_PRIVATE_KEY != '' }}
     outputs:
       release_created: ${{ steps.release.outputs.release_created }}
       tag_name: ${{ steps.release.outputs.tag_name }}
       version: ${{ steps.release.outputs.version }}
     steps:
+      # A release PR pushed with the default GITHUB_TOKEN gets its CI runs held at
+      # `action_required`, and the merge queue refuses a PR whose required checks
+      # have not run, so every release needed someone to approve the held run by
+      # hand. Pushing as a GitHub App runs CI on the release PR like any other.
+      # The app is the org's fg-labs-bot, read from the org secrets
+      # FG_LABS_BOT_APP_ID and FG_LABS_BOT_PRIVATE_KEY. Its installation grants
+      # more than release-please needs, so the token is scoped down to Contents,
+      # Pull requests and Issues (labels) write on this repo. If the secrets are
+      # not visible, this falls back to GITHUB_TOKEN and the old behavior.
+      - name: Mint a release-please app token
+        id: app-token
+        if: env.HAS_FG_LABS_BOT == 'true'
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.FG_LABS_BOT_APP_ID }}
+          private-key: ${{ secrets.FG_LABS_BOT_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
+
       - name: Run release-please
         id: release
         uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         with:
+          token: ${{ steps.app-token.outputs.token || github.token }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
 
