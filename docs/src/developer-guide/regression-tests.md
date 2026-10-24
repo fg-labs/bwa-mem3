@@ -111,7 +111,7 @@ BWA_TESTS_DEBUG_PHASE0=1 BWA_TESTS_DEBUG_PHASE1=1 \
   ./test/bwa_mem3_tests_unit --test-suite="unit/kswv"
 ```
 
-JUnit artifacts are uploaded per CI matrix row (`unit-results-<name>.xml`, `integration-results-<name>.xml`) and available on the Actions run page.
+JUnit artifacts are uploaded per CI matrix row (`unit-results-<name>-shard<k>.xml`, one per unit-test shard, and `integration-results-<name>.xml`) and available on the Actions run page.
 
 > **Tip — Use ASAN for memory bugs**
 >

@@ -127,7 +127,12 @@ TEST_CASE("kt_for_prefix: offers are the finished items, one at a time, in read 
             reset(n, nt, /*slow_item=*/-2, /*early_sleep=*/0);
             const long last = (long) g_items.size() - 1;
             g_slow_item = last;
-            g_slow_us = 8000;
+            // Long enough that the caller, woken by the earlier items'
+            // completions, gets scheduled to consume them while this item
+            // still runs. 8 ms was not when every core was busy (the unit
+            // binary runs as concurrent shards in CI): the pass could end
+            // before the caller ran at all, failing the two checks below.
+            g_slow_us = 100000;
             g_early_sleep_items = (int) g_items.size() / 2;
             Ctx c;
             kt_for_prefix(run_item, &c, n, nt, on_prefix, &c);
