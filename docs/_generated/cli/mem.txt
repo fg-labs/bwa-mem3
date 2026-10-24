@@ -9,7 +9,7 @@ Options:
     -t INT        number of threads, up to 256; values above 256 are
                   clamped to 256 [1]
     -k INT        minimum seed length [19]
-    -w INT        band width for banded alignment [100]
+    -w INT        band width for banded alignment, 0..536870911 [100]
     -d INT        off-diagonal X-dropoff [100]
     -r FLOAT      look for internal seeds inside a seed longer than {-k} * FLOAT [1.5]
     -y INT        seed occurrence for the 3rd round seeding [20]

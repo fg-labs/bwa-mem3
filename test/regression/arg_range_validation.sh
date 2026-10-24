@@ -3,13 +3,16 @@
 #
 # Asserts that `mem` rejects, at parse time and with a clear ERROR: message, a
 # non-positive gap-extension penalty (-E), a non-positive insert-size standard
-# deviation (-I mean,std) and a negative gap-open penalty (-O):
+# deviation (-I mean,std), a negative gap-open penalty (-O) and a band width
+# (-w) outside 0..536870911:
 #   - -E 0 divides by zero in cal_max_gap; the (int) cast of the inf/NaN result
 #     is UB that resolves differently per architecture (arch-divergent bands).
 #   - -I mean,0 divides by zero in mem_pair; the NaN collapses every pair score
 #     to 0 and silently disables pair-aware placement.
 #   - -O -1 makes a gap open cheaper than an extension, which the SIMD
 #     Smith-Waterman kernels do not compute exactly (see the -O checks below).
+#   - -w -1 inverts the reference window and aborts; -w -50 lets the banded
+#     kernels store past their rows (see the -w checks below).
 #
 # Validation fires during option parsing, before the reference is opened, so
 # /dev/null placeholders suffice — no fixture is needed. The message (not just a
@@ -76,6 +79,35 @@ check_reject "-O 4294967297" "ERROR: -O gap-open penalty must be a non-negative 
 check_reject "-O ''" "ERROR: -O gap-open penalty must be a non-negative integer" -O ''
 check_reject "-O ,1" "ERROR: -O gap-open penalty must be a non-negative integer" -O ,1
 
+# A negative band width turns cal_max_gap's `w << 1` cap negative: -w -1 inverts
+# the reference window and aborts, -w -50 lets the banded kernels store past
+# their rows and still exits 0, and -w -2147483648 segfaults. The widest
+# w-scaled int is `w << 2`, so the top of the range is INT_MAX >> 2 = 536870911.
+check_reject "-w -1" "ERROR: -w band width must be an integer in 0..536870911" -w -1
+check_reject "-w -50" "ERROR: -w band width must be an integer in 0..536870911" -w -50
+check_reject "-w -2147483648" "ERROR: -w band width must be an integer in 0..536870911" -w -2147483648
+check_reject "-w 536870912" "ERROR: -w band width must be an integer in 0..536870911" -w 536870912
+check_reject "-w 100x" "ERROR: -w band width must be an integer in 0..536870911" -w 100x
+check_reject "-w ''" "ERROR: -w band width must be an integer in 0..536870911" -w ''
+# The ends of the range still parse: the run then fails on the /dev/null
+# reference, but not on -w. Require that index-load error too, so a run that
+# failed on something else before reaching the index proves nothing.
+for w in 0 536870911; do
+    rc=0
+    "$BWA_MEM3" mem -w "$w" /dev/null /dev/null /dev/null \
+        > "$OUT_DIR/out" 2> "$OUT_DIR/err" || rc=$?
+    if grep -qF "ERROR: -w band width" "$OUT_DIR/err"; then
+        echo "FAIL: -w $w: rejected a band width inside 0..536870911 (exit $rc)" >&2
+        cat "$OUT_DIR/err" >&2
+        exit 1
+    fi
+    if ! grep -qF "Unable to open the file: /dev/null" "$OUT_DIR/err"; then
+        echo "FAIL: -w $w: the run never reached loading the /dev/null index, so the parse is unproven (exit $rc)" >&2
+        cat "$OUT_DIR/err" >&2
+        exit 1
+    fi
+done
+
 # A non-finite -I mean or std (nan/inf, or an overflowing token that strtod maps
 # to inf) reaches an (int) cast whose result is undefined and arch-divergent;
 # reject it at parse rather than casting inf/NaN downstream.
@@ -111,4 +143,4 @@ check_reject "-c -1" "ERROR: -c max occurrences must be a positive integer" -c -
 check_reject "-c 5abc" "ERROR: -c max occurrences must be a positive integer" -c 5abc
 check_reject "-c 4294967297" "ERROR: -c max occurrences must be a positive integer" -c 4294967297
 
-echo "PASS: arg_range_validation (-E, -I, and -c reject non-positive, -O rejects negative, -O and -I reject a first value with no digits, and all reject non-finite, out-of-range, and trailing-garbage values)"
+echo "PASS: arg_range_validation (-E, -I, and -c reject non-positive, -O rejects negative, -w rejects values outside 0..536870911, -O and -I reject a first value with no digits, and all reject non-finite, out-of-range, and trailing-garbage values)"

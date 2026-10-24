@@ -1080,7 +1080,10 @@ runtime. The default (19) is calibrated for 100–150 bp Illumina reads.
 #### `-w INT` — band width
 
 Band width for the banded Smith-Waterman extension. Wider bands can recover
-alignments with long indels at greater CPU cost.
+alignments with long indels at greater CPU cost. Accepts an integer in
+`0..536870911`; a negative band, a value above that bound (where the widened
+band `4 * w` would overflow `int`), or a token that is not a complete integer is
+rejected at parse.
 
 #### `-d INT` — X-dropoff
 
