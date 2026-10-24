@@ -3,6 +3,7 @@
 *.d
 *.dSYM
 .build-flags
+.test-build-flags
 .*.swp
 a.out
 bwa-mem2

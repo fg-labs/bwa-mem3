@@ -2206,6 +2206,14 @@ jobs:
       CXX: g++
       CC: gcc
       ALLOW_UNSUPPORTED_COMPILER: "1"
+      # Instrumented build at -O1 rather than the Makefile's COVERAGE=1 default
+      # of -O0: the instrumented tests run faster. Job-level so every make
+      # (libbwa.a, test-binaries and its test/Makefile sub-make) compiles with
+      # the same flags and the build-flags stamp does not rebuild libbwa.a
+      # between steps. -O1 inlines static functions called once and merges some
+      # lines, so a few lines and small functions report under their caller;
+      # see COVERAGE_OPT in the Makefile.
+      COVERAGE_OPT: "-O1"
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -2240,8 +2248,8 @@ jobs:
         run: make test-binaries arch=avx2 CXX=g++ COVERAGE=1
 
       - name: Run unit tests
-        # Sharded across the runner's CPUs, as on the matrix rows: at -O0 with
-        # gcov instrumentation the serial run is over two minutes. The shards
+        # Sharded across the runner's CPUs, as on the matrix rows: with gcov
+        # instrumentation the serial run was over two minutes at -O0. The shards
         # are separate processes writing the same .gcda files; libgcov takes a
         # lock on each file and merges its counters into what is already there
         # rather than overwriting it, so the collected coverage is the same as

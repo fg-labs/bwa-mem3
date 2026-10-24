@@ -135,10 +135,12 @@ ifneq ($(ARCH_FLAGS_FROM_PARENT),)
 endif
 
 # COVERAGE=1 augments CXXFLAGS/LDFLAGS with --coverage and overrides -O2 with
-# -O0 so gcov line numbers correspond 1:1 with source. Consumed by the CI
-# `coverage` job. Matches the parent Makefile's coverage plumbing.
+# $(COVERAGE_OPT): -O0 by default, so gcov line numbers correspond 1:1 with
+# source; the CI `coverage` job sets -O1. Matches the parent Makefile's coverage
+# plumbing (see COVERAGE_OPT there for the -O1 trade-off).
+COVERAGE_OPT ?= -O0
 ifneq ($(COVERAGE),)
-    CXXFLAGS += -O0 --coverage
+    CXXFLAGS += $(COVERAGE_OPT) --coverage
     LDFLAGS  += --coverage
 endif
 FRAMEWORK_SRCS := $(FRAMEWORK_DIR)/scoring.cpp \
@@ -358,8 +360,34 @@ print-%:
 	@echo '$($*)'
 
 
+# Coverage stamp for this directory's objects, rewritten only when its text
+# changes (the parent's .build-flags trick): switching COVERAGE or COVERAGE_OPT
+# on an incremental build recompiles every test object instead of linking
+# objects instrumented at the old level (or not at all) against a libbwa.a
+# built at the new one. It is keyed on the coverage knobs only, not on the
+# whole flag text, because this directory is built both by the parent's
+# test-binaries (with its arch flags) and standalone by test/run_unit_tests.sh
+# (without them); a full-text key would rebuild every object between the two.
+#
+# Written at parse time rather than by a FORCE recipe, so the stamp is a plain
+# file to make: a dry run (`make -n`, which test/regression/make_test_relink.sh
+# relies on) would otherwise assume a FORCE'd stamp was remade and report every
+# object and binary out of date. The value is two make flags (no quotes), and
+# the write goes through a per-process temp file and mv, so concurrent makes
+# cannot leave a torn stamp.
+TEST_FLAGS_STAMP := .test-build-flags
+TEST_FLAGS_SIG := COVERAGE=$(COVERAGE)|COVERAGE_OPT=$(if $(COVERAGE),$(COVERAGE_OPT))
+ifneq ($(shell cat $(TEST_FLAGS_STAMP) 2>/dev/null),$(TEST_FLAGS_SIG))
+    $(shell printf '%s\n' '$(TEST_FLAGS_SIG)' > $(TEST_FLAGS_STAMP).$$$$ && mv $(TEST_FLAGS_STAMP).$$$$ $(TEST_FLAGS_STAMP))
+endif
+$(TEST_FLAGS_STAMP): ;
+
+$(FRAMEWORK_OBJS) $(UNIT_OBJS) $(INTEGRATION_TEST_OBJS) \
+    $(patsubst %.cpp,%.o,$(wildcard $(INTEGRATION_DIR)/*.cpp) $(wildcard *.cpp)) \
+    packed_text_lib.o system_lib.o: $(TEST_FLAGS_STAMP)
+
 clean:
-	rm -f *.o *.d $(INTEGRATION_DIR)/*.o $(INTEGRATION_DIR)/*.d \
+	rm -f $(TEST_FLAGS_STAMP) *.o *.d $(INTEGRATION_DIR)/*.o $(INTEGRATION_DIR)/*.d \
 	      $(UNIT_DIR)/*.o $(UNIT_DIR)/*.d \
 	      $(FRAMEWORK_OBJS) $(FRAMEWORK_DIR)/*.d $(FRAMEWORK_LIB) $(EXE) $(DOCTEST_BINS)
 	rm -f *.gcno *.gcda $(INTEGRATION_DIR)/*.gcno $(INTEGRATION_DIR)/*.gcda \

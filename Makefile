@@ -681,16 +681,25 @@ else
 endif
 
 # COVERAGE=1 augments CXXFLAGS/BASE_CXXFLAGS/LDFLAGS with --coverage and
-# overrides -O3 with -O0 so gcov line numbers correspond 1:1 with source.
-# Consumed by the CI `coverage` job; not part of any shipped binary.
+# overrides -O3 with $(COVERAGE_OPT). Not part of any shipped binary.
+#
+# COVERAGE_OPT defaults to -O0, so gcov line numbers correspond 1:1 with source
+# (the usual choice when reading a local report line by line). The CI `coverage`
+# job sets COVERAGE_OPT=-O1, which runs the instrumented tests faster; gcc
+# supports --coverage at any -O level. The cost is attribution detail, not
+# correctness: -O1 inlines static functions called once
+# (-finline-functions-called-once) and merges or drops some lines, so a few
+# lines and small functions are reported under their caller or not at all.
+# test/Makefile reads the same knob.
 #
 # BASE_CXXFLAGS has to be augmented too, not just CXXFLAGS: the per-tier kernel
 # objects ($(KERNEL_TIER_OBJS) — bandedSWA/kswv/ksw/sam_encode at every tier),
 # the native kernel objects and the standalone test objects all compile with
 # BASE_CXXFLAGS, so with CXXFLAGS alone the SW kernels report no coverage at
-# all. -O0/--coverage are not -m... ISA flags, so the per-tier rules can still
-# append their own.
-COVERAGE_FLAGS = -O0 --coverage
+# all. $(COVERAGE_OPT)/--coverage are not -m... ISA flags, so the per-tier
+# rules can still append their own.
+COVERAGE_OPT ?= -O0
+COVERAGE_FLAGS = $(COVERAGE_OPT) --coverage
 ifneq ($(COVERAGE),)
     CXXFLAGS      += $(COVERAGE_FLAGS)
     BASE_CXXFLAGS += $(COVERAGE_FLAGS)
@@ -1080,6 +1089,7 @@ test-binaries: $(BWA_LIB) $(HTS_LIB) $(ROWALT_KERNEL_OBJ)
 	$(MAKE) -C test framework unit integration \
 	    CXX="$(CXX)" \
 	    COVERAGE=$(COVERAGE) \
+	    COVERAGE_OPT='$(COVERAGE_OPT)' \
 	    ARCH_FLAGS_FROM_PARENT='$(ARCH_FLAGS)' \
 	    ARM_CPU='$(ARM_CPU)' \
 	    ARM_TUNE='$(ARM_TUNE)' \
