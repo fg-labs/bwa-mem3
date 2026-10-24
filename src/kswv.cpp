@@ -357,6 +357,31 @@ static inline int compute_jsplit(const SeqPair *p, int width, int ncol, bool i16
 
 #endif
 
+/* Report "no second-best" (score2 = te2 = -1) for every pair of the batch, as
+ * the score2 scan does for a lane it skips. Used where the scan cannot run:
+ *
+ *   - qmax <= 0. The scan's window is score / qmax around the best row, where
+ *     qmax is the largest substitution score. The scores are stored as int8_t,
+ *     so a match score of 128 or more wraps, and qmax can come out 0 (for
+ *     example -A 128 or -A 256 with the default mismatch scaling). Dividing by
+ *     it raises SIGFPE on x86 and is undefined behaviour on every tier; with no
+ *     positive substitution score there is no window to exclude either.
+ *   - a batch with no live lane: in the 16-bit kernels no lane scored above
+ *     0, so every lane's te stays -1 and the scan would write -1 for each of
+ *     them; in the 8-bit kernels every lane saturated, which the u8 admission
+ *     (matesw_use_u8, kswv_u8_saturation_guard) rules out for an accepted
+ *     scoring. Returning without the write would leave score2 and te2 as
+ *     whatever the batch's result buffer held, and the rescue reads score2 as
+ *     the hit's csub. */
+static inline void kswv_score2_none(const SeqPair *p, kswr_t *aln, int po_ind,
+                                    int32_t numPairs, int width)
+{
+    for (int l = 0; l < width && (po_ind + l) < numPairs; l++) {
+        aln[p[l].regid].score2 = -1;
+        aln[p[l].regid].te2    = -1;
+    }
+}
+
 // constructor
 kswv::kswv(const int o_del, const int e_del, const int o_ins,
            const int e_ins, const int8_t w_match, const int8_t w_mismatch,
@@ -552,13 +577,16 @@ kswv::~kswv() {
  * over-conservative guard aborted lightly-trimmed 2x250 mates on release builds.
  *
  * The routing contract (see matesw_use_u8) admits a pair only when
- * len2*w_match + shift <= 254, which also implies no biased saturation. A
+ * len2*qmax + shift <= 254, which also implies no biased saturation. qmax is
+ * the largest entry of the substitution matrix (g_qmax), which is the match
+ * score w_match for every scoring with a non-negative mismatch penalty; a
+ * negative one makes the mismatch the largest score per column. A
  * violation here is silent score/XS/MAPQ corruption, not a crash, so it is an
  * xassert (release-active). */
-static inline void kswv_u8_saturation_guard(const SeqPair *p, int8_t w_match, uint8_t shift) {
+static inline void kswv_u8_saturation_guard(const SeqPair *p, int qmax, uint8_t shift) {
     int maxq = 0;
     for (int i = 0; i < SIMD_WIDTH8; ++i) if (p[i].len2 > maxq) maxq = p[i].len2;
-    xassert((int64_t)maxq * (int64_t)w_match + (int64_t)shift <= 254,
+    xassert((int64_t)maxq * (int64_t)qmax + (int64_t)shift <= 254,
             "u8 rescue tier: max score + bias can saturate; USQADD and biased "
             "forms would diverge -- the 16-bit tier must handle this score range");
 }
@@ -971,7 +999,7 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
     /* u8-tier saturation guard. Bounds on the group's REAL max query length,
      * not the padded `ncol` (which rounds 241..249 up to 256 and false-trips on
      * safe, admitted mates). See kswv_u8_saturation_guard. */
-    kswv_u8_saturation_guard(p, this->w_match, shift);
+    kswv_u8_saturation_guard(p, this->g_qmax, shift);
 
     uint8x16_t permSft = vld1q_u8((const uint8_t*)temp);
     uint8x16_t sft_vec = vdupq_n_u8(shift);
@@ -2036,7 +2064,10 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
     if (phase) return 1;
 #endif
 
-    if (live == 0) return 1;
+    if (live == 0) {   /* see kswv_score2_none */
+        kswv_score2_none(p, aln, po_ind, numPairs, SIMD_WIDTH8);
+        return 1;
+    }
 
     /* Score2 and te2 computation.
      *
@@ -2051,6 +2082,10 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
      * rowMax, visiting only the rows a per-lane bitmap marks as at or
      * above minsc (kswv_score2.h). */
     int qmax = this->g_qmax;
+    if (qmax <= 0) {   /* see kswv_score2_none */
+        kswv_score2_none(p, aln, po_ind, numPairs, SIMD_WIDTH8);
+        return 1;
+    }
     int16_t low[SIMD_WIDTH8]  __attribute__((aligned(64)));
     int16_t high[SIMD_WIDTH8] __attribute__((aligned(64)));
     for (int j = 0; j < SIMD_WIDTH8; j++) {
@@ -2925,12 +2960,19 @@ int kswv::kswv_neon_16_impl(int16_t seq1SoA[],
 #if !MAINY
     if (phase) return 1;
 #endif
-    if (live == 0) return 1;
+    if (live == 0) {   /* see kswv_score2_none */
+        kswv_score2_none(p, aln, po_ind, numPairs, SIMD_WIDTH16);
+        return 1;
+    }
 
     /* Score2 / te2 via per-lane scalar b[]-emulation over the now-
      * populated rowMax. Identical semantics to the 8-bit kernel's
      * score2 scan; differs only in int16_t types and SIMD_WIDTH16 stride. */
     int qmax = this->g_qmax;
+    if (qmax <= 0) {   /* see kswv_score2_none */
+        kswv_score2_none(p, aln, po_ind, numPairs, SIMD_WIDTH16);
+        return 1;
+    }
     int16_t low[SIMD_WIDTH16]  __attribute((aligned(128)));
     int16_t high[SIMD_WIDTH16] __attribute((aligned(128)));
     for (int j = 0; j < SIMD_WIDTH16; j++) {
@@ -3197,7 +3239,7 @@ int kswv::kswv256_u8_impl(uint8_t seq1SoA[],
     /* u8-tier saturation guard (see kswv_u8_saturation_guard). The u8 admission
      * bound keeps every admitted pair safe; this catches a violating param set
      * before it silently corrupts scores. */
-    kswv_u8_saturation_guard(p, this->w_match, shift);
+    kswv_u8_saturation_guard(p, this->g_qmax, shift);
 
     uint32_t minsc_msk_a = 0, endsc_msk_a = 0;
     for (int i = 0; i < SIMD_WIDTH8; i++) {
@@ -3561,7 +3603,10 @@ int kswv::kswv256_u8_impl(uint8_t seq1SoA[],
     }
 
     if (phase) return 1;
-    if (live == 0) return 1;
+    if (live == 0) {   /* see kswv_score2_none */
+        kswv_score2_none(p, aln, po_ind, numPairs, SIMD_WIDTH8);
+        return 1;
+    }
 
     /* Score2 and te2 computation.
      *
@@ -3575,6 +3620,10 @@ int kswv::kswv256_u8_impl(uint8_t seq1SoA[],
      * precomputed rowMax, visiting only the rows a per-lane bitmap marks
      * as at or above minsc (kswv_score2.h). */
     int qmax = this->g_qmax;
+    if (qmax <= 0) {   /* see kswv_score2_none */
+        kswv_score2_none(p, aln, po_ind, numPairs, SIMD_WIDTH8);
+        return 1;
+    }
     int16_t low[SIMD_WIDTH8]  __attribute__((aligned(64)));
     int16_t high[SIMD_WIDTH8] __attribute__((aligned(64)));
     for (int j = 0; j < SIMD_WIDTH8; j++) {
@@ -4075,11 +4124,18 @@ int kswv::kswv256_16_impl(int16_t seq1SoA[],
     }
 
     if (phase) return 1;
-    if (live == 0) return 1;
+    if (live == 0) {   /* see kswv_score2_none */
+        kswv_score2_none(p, aln, po_ind, numPairs, SIMD_WIDTH16);
+        return 1;
+    }
 
     /* Score2 / te2 via per-lane scalar b[]-emulation over rowMax. Identical
      * semantics to the NEON 16-bit kernel; pure scalar, SIMD_WIDTH16 stride. */
     int qmax = this->g_qmax;
+    if (qmax <= 0) {   /* see kswv_score2_none */
+        kswv_score2_none(p, aln, po_ind, numPairs, SIMD_WIDTH16);
+        return 1;
+    }
     int16_t low[SIMD_WIDTH16]  __attribute__((aligned(64)));
     int16_t high[SIMD_WIDTH16] __attribute__((aligned(64)));
     for (int j = 0; j < SIMD_WIDTH16; j++) {
@@ -4505,7 +4561,7 @@ int kswv::kswv512_u8_impl(uint8_t seq1SoA[],
     /* u8-tier saturation guard (see kswv_u8_saturation_guard). The u8 admission
      * bound keeps every admitted pair safe; this catches a violating param set
      * before it silently corrupts scores. */
-    kswv_u8_saturation_guard(p, this->w_match, shift);
+    kswv_u8_saturation_guard(p, this->g_qmax, shift);
     __m512i cmax512 = _mm512_set1_epi8(255);
     
     // __m512i minsc512, endsc512;
@@ -4843,7 +4899,10 @@ int kswv::kswv512_u8_impl(uint8_t seq1SoA[],
     if (phase) return 1;
 #endif
 
-    if (live == 0) return 1;
+    if (live == 0) {   /* see kswv_score2_none */
+        kswv_score2_none(p, aln, po_ind, numPairs, SIMD_WIDTH8);
+        return 1;
+    }
 
     /* Score2 and te2 computation.
      *
@@ -4858,6 +4917,10 @@ int kswv::kswv512_u8_impl(uint8_t seq1SoA[],
      * rowMax, visiting only the rows a per-lane bitmap marks as at or
      * above minsc (kswv_score2.h). */
     int qmax = this->g_qmax;
+    if (qmax <= 0) {   /* see kswv_score2_none */
+        kswv_score2_none(p, aln, po_ind, numPairs, SIMD_WIDTH8);
+        return 1;
+    }
     int16_t low[SIMD_WIDTH8]  __attribute__((aligned(64)));
     int16_t high[SIMD_WIDTH8] __attribute__((aligned(64)));
     for (int j = 0; j < SIMD_WIDTH8; j++) {
@@ -5374,6 +5437,7 @@ int kswv::kswv512_16_impl(int16_t seq1SoA[],
     _mm512_store_si512((__m512i *) te, te512);
     _mm512_store_si512((__m512i *) qe, qe512);
 
+    int live = 0;
     for (int l=0; l<SIMD_WIDTH16 && (po_ind + l) < numPairs; l++) {
         int ind = po_ind + l;
 #if !MAINY
@@ -5387,17 +5451,27 @@ int kswv::kswv512_16_impl(int16_t seq1SoA[],
             aln[ind].score = score[l];
             aln[ind].te = te[l];
             aln[ind].qe = qe[l];
+            if (score[l] > 0) live++;
         }
 #else
         aln[ind].score = score[l];
         aln[ind].te = te[l];
         aln[ind].qe = qe[l];
+        if (score[l] > 0) live++;
 #endif
     }
     
 #if !MAINY
     if (phase) return 1;
 #endif
+
+    /* No lane scored: every te is still -1, so the scan below would write
+     * score2 = te2 = -1 for each lane. Write that directly and skip the scan,
+     * as the other five kernels do. */
+    if (live == 0) {
+        kswv_score2_none(p, aln, po_ind, numPairs, SIMD_WIDTH16);
+        return 1;
+    }
 
     /*************** Score2 and te2 — per-lane scalar emulation *******************
      *
@@ -5420,6 +5494,10 @@ int kswv::kswv512_16_impl(int16_t seq1SoA[],
      *
      * All three fall out of the per-lane scalar loop naturally. */
     int qmax = this->g_qmax;
+    if (qmax <= 0) {   /* see kswv_score2_none */
+        kswv_score2_none(p, aln, po_ind, numPairs, SIMD_WIDTH16);
+        return 1;
+    }
     for (int j = 0; j < SIMD_WIDTH16; j++) {
         int val = (score[j] + qmax - 1) / qmax;
         low[j]  = te[j] - val;

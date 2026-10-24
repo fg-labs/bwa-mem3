@@ -56,9 +56,33 @@ static inline int matesw_u8_shift_for(const mem_opt_t *opt, const int8_t *base_m
     return s;
 }
 
+/* Largest substitution score across every matrix the SW at a site could use:
+ * the most one column can add. It is the match reward opt->a for every scoring
+ * with a non-negative mismatch penalty (the --meth matrices top out at it too);
+ * a negative mismatch penalty makes the mismatch the larger. Folding the --meth
+ * matrices in, as matesw_u8_shift_for does, can only route MORE pairs to the
+ * 16-bit tier. */
+static inline int matesw_u8_qmax(const int8_t *mat) {
+    int mx = mat[0];
+    for (int i = 1; i < 25; ++i) if (mat[i] > mx) mx = mat[i];
+    return mx;
+}
+
+static inline int matesw_u8_qmax_for(const mem_opt_t *opt, const int8_t *base_mat) {
+    int q = matesw_u8_qmax(base_mat);
+    if (opt->meth_mode) {
+        int qo = matesw_u8_qmax(opt->mat_ot);
+        int qb = matesw_u8_qmax(opt->mat_ob);
+        if (qo > q) q = qo;
+        if (qb > q) q = qb;
+    }
+    return q;
+}
+
 /* True iff a mate of query length l_ms may be scored on the u8 tier
- * byte-identically. `a` is the match reward (opt->a); `shift` the kernel bias
- * from matesw_u8_shift_for(). */
+ * byte-identically. `a` is the largest per-column score
+ * (matesw_u8_qmax_for(), opt->a for every scoring with a non-negative mismatch
+ * penalty); `shift` the kernel bias from matesw_u8_shift_for(). */
 static inline int matesw_use_u8(int l_ms, int a, int shift) {
     int prod = l_ms * a;                              /* max attainable SW score */
     return (prod + shift <= 254)                      /* no u8 saturation / early break */

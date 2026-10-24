@@ -2364,7 +2364,8 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
             //kswr_t aln;
             //mem_alnreg_t b;
             int u8_shift = matesw_u8_shift_for(opt, opt->mat);
-            int xtra = KSW_XSUBO | KSW_XSTART | (matesw_use_u8(l_ms, opt->a, u8_shift)? KSW_XBYTE : 0) | (opt->min_seed_len * opt->a);
+            int u8_qmax = matesw_u8_qmax_for(opt, opt->mat);
+            int xtra = KSW_XSUBO | KSW_XSTART | (matesw_use_u8(l_ms, u8_qmax, u8_shift)? KSW_XBYTE : 0) | (opt->min_seed_len * opt->a);
 
             /* Exact rescue pruning (rescue_prune.h), decided before anything is staged: a proven
              * failure is not enqueued at all (MATESW_GAR_PROVEN_FAIL), and a narrowed window moves
@@ -2733,7 +2734,8 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
             // hypothesis b.meth_hypothesis records (see where b is filled in below).
             int meth_won_hyp = -1;
             int u8_shift = matesw_u8_shift_for(opt, opt->mat);
-            int tmp, xtra = KSW_XSUBO | KSW_XSTART | (matesw_use_u8(l_ms, opt->a, u8_shift)? KSW_XBYTE : 0) | (opt->min_seed_len * opt->a);
+            int u8_qmax = matesw_u8_qmax_for(opt, opt->mat);
+            int tmp, xtra = KSW_XSUBO | KSW_XSTART | (matesw_use_u8(l_ms, u8_qmax, u8_shift)? KSW_XBYTE : 0) | (opt->min_seed_len * opt->a);
 
             //aln = **myaln;
             //(*myaln)++;
