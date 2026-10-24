@@ -50,6 +50,7 @@ Authors: Sanchit Misra <sanchit.misra@intel.com>; Vasimuddin Md <vasimuddin.md@i
 #include "utils.h"        /* ATTRIBUTE, err_fread_noeof */
 #include "io_utils.h"     /* io_request_size, IO_MAX_ONCE */
 #include "FMI_search.h"
+#include "smem_parked.h"
 #include "profiling.h"
 #include "libsais_build.h"
 
@@ -1105,7 +1106,7 @@ enum LockstepPhase : uint8_t {
     PH_FWD      = 0,  // forward extension inner loop active
     PH_BWD_INIT = 1,  // between-phases housekeeping pending
     PH_BWD      = 2,  // backward search outer loop active
-    PH_DONE     = 3   // slot finished; match_buf ready for flush
+    PH_DONE     = 3   // slot finished (ready: match_buf not yet retired) or idle
 };
 
 // Per-thread cache for the lockstep SMEM driver's prev[]/match_buf[]
@@ -1141,7 +1142,7 @@ struct FMI_search::BatchSlot {
     int32_t readlength;          // seq_[rid].l_seq
     int32_t offset;              // query_cum_len_ar[rid]
 
-    // Output for query_pos_array[input_idx] write-back at flush time.
+    // Output for query_pos_array[input_idx] write-back when the read is retired.
     int32_t next_x;
 
     // Walk state (mirrors scalar locals).
@@ -1221,7 +1222,7 @@ void FMI_search::ls_prefetch_cp_occ_t1(const BatchSlot *s)
 // After this call either:
 //   phase == PH_FWD  — slot is ready to step the forward-extension inner loop
 //   phase == PH_DONE — the first base is non-ACGT; scalar skips this read, so
-//                      we match that (zero matches emitted, ready to flush).
+//                      we match that (zero matches emitted, ready to retire).
 void FMI_search::ls_init_slot(BatchSlot *s,
                               int32_t input_idx,
                               const int32_t *query_pos_array,
@@ -1833,40 +1834,68 @@ void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
                      rid_array, seq_, query_cum_len_ar, enc_qdb);
         if (slots[s].phase == PH_FWD) ls_prefetch_cp_occ(&slots[s]);
     }
-    // Any unused slots (numReads < N) are marked DONE with invalid input_idx
-    // so the stepping pass skips them and the flush pass ignores them.
+    // Any unused slots (numReads < N) start idle: DONE with no input, so the
+    // stepping pass does nothing for them.
     for (int32_t s = initial; s < N; s++) {
         slots[s].phase = PH_DONE;
         slots[s].ready = false;
         slots[s].input_idx = -1;
     }
 
-    int32_t next_input   = initial;
-    int32_t flush_cursor = 0;
-    int32_t flush_slot   = 0;   // slot holding input flush_cursor (see the flush pass)
+    /* A slot is refilled as soon as its read finishes, not when the read is
+     * emitted: a read that finishes behind a slower, earlier one would otherwise
+     * hold its slot idle until that read is out. Finished reads go through
+     * `parked`, which emits them in input order (smem_parked.h), so matchArray is
+     * unchanged; only which reads share a stepping pass changes, and a read's walk
+     * depends on nothing but its own slot. Inputs start at most `window` reads
+     * ahead of the oldest unemitted one, which bounds how many reads are parked. */
+    static thread_local LockstepParked parked;
+    parked.reset(LockstepParked::window_for(N));
+    int32_t next_input = initial;
+    int32_t idle       = N - initial;   // slots with no input
     int64_t numTotalSmem = *__numTotalSmem;
 
-    while (flush_cursor < numReads) {
-        // --- Stepping pass: advance each non-DONE slot by one phase-step. ---
+    while (parked.cursor < numReads) {
+        // --- Stepping pass: advance each slot by one phase-step. ---
         for (int32_t s = 0; s < N; s++) {
-            switch (slots[s].phase) {
+            BatchSlot *sl = &slots[s];
+            switch (sl->phase) {
                 case PH_FWD:
-                    ls_advance_forward_step(&slots[s], enc_qdb);
+                    ls_advance_forward_step(sl, enc_qdb);
                     // If forward just transitioned to PH_BWD_INIT, run the
                     // between-phases housekeeping immediately. prepare_backward
                     // may transition straight to PH_DONE (e.g. empty prev[]).
-                    if (slots[s].phase == PH_BWD_INIT) {
-                        ls_prepare_backward(&slots[s]);
+                    if (sl->phase == PH_BWD_INIT) {
+                        ls_prepare_backward(sl);
                     }
                     break;
                 case PH_BWD_INIT:
-                    ls_prepare_backward(&slots[s]);
+                    ls_prepare_backward(sl);
                     break;
                 case PH_BWD:
-                    ls_advance_backward_step(&slots[s], enc_qdb, minSeedLen);
+                    ls_advance_backward_step(sl, enc_qdb, minSeedLen);
                     break;
                 case PH_DONE:
                     break;
+            }
+            // Retire a finished read and refill the slot here, at the slot that
+            // just finished (a separate pass over every slot costs more than the
+            // idle steps it saves). A fresh read can be done at once (first base
+            // non-ACGT), so loop.
+            while (sl->phase == PH_DONE && sl->ready) {
+                query_pos_array[sl->input_idx] = sl->next_x;
+                parked.finish(sl->input_idx, sl->match_buf, sl->match_count,
+                              matchArray, &numTotalSmem);
+                if (next_input < numReads && parked.admits(next_input)) {
+                    ls_init_slot(sl, next_input, query_pos_array, min_intv_array,
+                                 rid_array, seq_, query_cum_len_ar, enc_qdb);
+                    if (sl->phase == PH_FWD) ls_prefetch_cp_occ(sl);
+                    next_input++;
+                } else {
+                    sl->input_idx = -1;
+                    sl->ready = false;
+                    idle++;
+                }
             }
             // LISA trick #5: cross-slot T1 (L2) prefetch with N/2-step lookahead.
             // The same-slot T0 prefetch issued inside ls_advance_*_step covers
@@ -1881,32 +1910,17 @@ void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
             ls_prefetch_cp_occ_t1(&slots[s_la]);
         }
 
-        // --- Flush pass: in-order emit + slot recycle. ---
-        // Input i always lives in slot i mod N: slot s is seeded with input s,
-        // and while inputs remain the live window [flush_cursor, next_input) is
-        // exactly N wide, so the slot freed by input k is refilled with input
-        // k + N. So the slot holding input `flush_cursor` is a counter that
-        // wraps at N, instead of a scan of every slot. The emit order and the
-        // slot each new input lands in match the scan.
-        while (flush_cursor < numReads) {
-            const int32_t s = flush_slot;
-            if (!(slots[s].phase == PH_DONE && slots[s].ready)) break;
-            for (int32_t m = 0; m < slots[s].match_count; m++) {
-                matchArray[numTotalSmem++] = slots[s].match_buf[m];
-            }
-            query_pos_array[slots[s].input_idx] = slots[s].next_x;
-            flush_cursor++;
-            if (++flush_slot == N) flush_slot = 0;
-
-            if (next_input < numReads) {
-                ls_init_slot(&slots[s], next_input,
-                             query_pos_array, min_intv_array,
+        // --- Refill the slots the window turned away, now that it may admit
+        // them. A fill that is done at once is retired on its slot's next visit.
+        if (idle != 0) {
+            for (int32_t s = 0; s < N && next_input < numReads && parked.admits(next_input); s++) {
+                BatchSlot *sl = &slots[s];
+                if (sl->input_idx >= 0) continue;
+                ls_init_slot(sl, next_input, query_pos_array, min_intv_array,
                              rid_array, seq_, query_cum_len_ar, enc_qdb);
-                if (slots[s].phase == PH_FWD) ls_prefetch_cp_occ(&slots[s]);
+                if (sl->phase == PH_FWD) ls_prefetch_cp_occ(sl);
                 next_input++;
-            } else {
-                slots[s].input_idx = -1;  // retired
-                slots[s].ready = false;
+                idle--;
             }
         }
     }

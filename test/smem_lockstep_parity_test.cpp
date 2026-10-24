@@ -17,7 +17,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <string>
+#include <vector>
 #include "FMI_search.h"
+#include "smem_parked.h"
 #include "bwa.h"
 
 /* A degenerate N=1 build would invoke getSMEMsOnePosOneThread_lockstep as a
@@ -294,7 +297,7 @@ int main(int argc, char *argv[]) {
      *
      * Case 2: numReads < N (N=4, 2 reads). Exercises the
      * "unused slots" path where the driver must mark slot indices >= numReads
-     * as DONE/invalid at entry so the flush pass skips them. */
+     * as DONE/invalid at entry so the stepping pass leaves them idle. */
     {
         const char *reads[] = {
             "ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT",
@@ -322,7 +325,7 @@ int main(int argc, char *argv[]) {
 
     /* Case 3: numReads == N (single full batch, no slot recycle).
      * Exercises the steady state where every slot is occupied and no
-     * retirement of slots happens before flush. */
+     * slot is refilled. */
     {
         const char *reads[] = {
             "ACGTACGTACGTACGTACGTACGTACGTACGT",
@@ -351,7 +354,7 @@ int main(int argc, char *argv[]) {
     }
 
     /* Case 4: numReads == N+1 (exactly one slot recycle).
-     * Exercises the flush-then-pull-next-input path. */
+     * Exercises the retire-then-refill path. */
     {
         const char *reads[] = {
             "ACGTACGTACGTACGTACGTACGTACGTACGT",
@@ -384,7 +387,7 @@ int main(int argc, char *argv[]) {
      * whole read when enc_qdb[offset + x] >= 4; lockstep must match by
      * going straight to PH_DONE with zero matches, without writing anything
      * to matchArray for this read. Mixed with valid reads to ensure the
-     * zero-match case doesn't corrupt the flush cursor. */
+     * zero-match case doesn't corrupt the emit cursor. */
     {
         const char *reads[] = {
             "NACGTACGTACGTACGTACGTACGTACGTACG",
@@ -828,8 +831,8 @@ int main(int argc, char *argv[]) {
     }
 
     /* Case 14: many more reads than slots, with real matches, at several widths.
-     * The flush pass finds the slot holding the next read to emit as input
-     * mod N, which relies on slot recycling keeping input i in slot i mod N.
+     * A finished read's slot is refilled at once, so a read can land in any
+     * slot and finished reads are emitted in input order from the parked list.
      * Cases 1-13 never recycle a slot through real reference matches (Cases 4
      * and 6 recycle, but with synthetic reads), and Case 13z recycles only at
      * one width with uniform reads, so this drives 2 * N_MAX + 22 reads
@@ -884,6 +887,67 @@ int main(int argc, char *argv[]) {
             g_smem_lockstep_n = saved_n;
             free(enc_qdb); free(seq_); free(cum_len);
             for (int32_t i = 0; i < NR; i++) free(bufs[i]);
+        }
+        free(ref);
+    }
+
+    /* Case 15: reads that finish far out of input order, so the driver parks
+     * finished reads and emits them later. A slot is refilled as soon as its read
+     * finishes, and finished reads are emitted in input order from a parked list;
+     * the window admits a read only while it is fewer than 8 reads per slot,
+     * rounded up to a power of two, ahead of the oldest unemitted one. A pair of
+     * long reads (up to 1500 bases) every 40th input sits among short ones (25-29
+     * bases), so short reads finish behind every long read still walking and the
+     * window fills, leaving slots idle until the long read is out. About a third
+     * of the short reads start with N, which is done the moment its slot is
+     * filled, so a fill can finish at once (sometimes several in a row), including
+     * the read the cursor is waiting for. There are two windows' worth of reads at
+     * the maximum width, so the window can fill there too. Run at widths 1, 2, 3,
+     * the default and the maximum. A model of the scheduler on these inputs (each
+     * read costing about its length in steps) fills the window at every width but
+     * 1, where the read the cursor waits for is the only one in flight. */
+    {
+        int32_t ref_len = 0;
+        char *ref = read_fasta_seq(argv[1], &ref_len);
+        enum { NR = 2 * LockstepParked::window_for(SMEM_LOCKSTEP_N_MAX) + 37, LONGL = 1500, SHORTL = 25 };
+        if (!ref || ref_len < LONGL + 100) {
+            total_cases++;
+            fprintf(stderr, "[FAIL] Case 15: could not read a reference FASTA of at least "
+                    "%d bases from '%s' (out-of-order parity coverage needs it)\n",
+                    LONGL + 100, argv[1]);
+        } else {
+            std::vector<std::string> bufs(NR);
+            const char *reads[NR];
+            int32_t qpa[NR], mia[NR], rid[NR];
+            bool need_smem[NR];
+            for (int32_t i = 0; i < NR; i++) {
+                /* Two adjacent long reads every 40th input. */
+                const bool is_long = (i % 40 == 0) || (i % 40 == 1);
+                const int32_t len = is_long ? LONGL - (i % 7) * 100 : SHORTL + (i % 5);
+                const int32_t off = (int32_t)(((int64_t)i * 613) % (ref_len - LONGL));
+                bufs[i].assign(ref + off, len);
+                const bool first_n = !is_long && (i % 4 == 3 || i % 13 == 6);
+                if (first_n) bufs[i][0] = 'N';
+                need_smem[i] = !first_n;
+                reads[i] = bufs[i].c_str();
+                qpa[i] = 0;
+                mia[i] = 1;
+                rid[i] = i;
+            }
+            uint8_t *enc_qdb; bseq1_t *seq_; int32_t *cum_len;
+            encode_reads(reads, NR, &enc_qdb, &seq_, &cum_len);
+            const int32_t saved_n = g_smem_lockstep_n;
+            const int32_t widths[] = {1, clamp_width(2), clamp_width(3), SMEM_LOCKSTEP_N, SMEM_LOCKSTEP_N_MAX};
+            for (const int32_t w : widths) {
+                char name[112];
+                snprintf(name, sizeof name, "Case 15: %d reads finishing out of order, N = %d", (int)NR, (int)w);
+                g_smem_lockstep_n = w;
+                run_case(fmi, name, NR, LONGL, 19,
+                         enc_qdb, qpa, mia, rid, seq_, cum_len,
+                         /*expect_min_smem=*/0, need_smem);
+            }
+            g_smem_lockstep_n = saved_n;
+            free(enc_qdb); free(seq_); free(cum_len);
         }
         free(ref);
     }

@@ -254,9 +254,10 @@ class FMI_search: public indexEle
      * SMEM_LOCKSTEP_N reads' SMEM walks in slot-interleaved order to expose
      * N independent backwardExt dependency chains to the CPU's out-of-order
      * engine. Per-read algorithm is byte-identical to the scalar path; only
-     * the cross-read interleaving is new. Output in matchArray is written
-     * in the same (read, smem) order as the scalar path via per-slot match
-     * buffers flushed by input-index cursor.
+     * the cross-read interleaving is new. A slot is refilled as soon as its
+     * read finishes; finished reads are emitted in input order through a
+     * per-thread parked list (smem_parked.h), so matchArray is written in the
+     * same (read, smem) order as the scalar path.
      * matchArray must hold at least numReads * max_readlength SMEMs (caller-sized). */
     void getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
                                           int32_t *query_pos_array,
