@@ -1895,7 +1895,7 @@ jobs:
           bash test/regression/chr22_parity.sh
           # The chr22 reads rarely reach the chaining / Pass-3 fast paths'
           # fallbacks, so run the fixture built to force them (equal-position
-          # chains, over-cap reads, 36 kb reads, --seed-order, --meth) with
+          # chains, over-cap reads, a 36 kb read, --seed-order, --meth) with
           # BWA_MEM3_DEBUG_P3_XCHECK and _UNGAPPED_XCHECK cross-checking each
           # fast path against the code it replaces.
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
