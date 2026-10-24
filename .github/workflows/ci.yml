@@ -427,11 +427,13 @@ jobs:
     name: ${{ matrix.name }}
     if: github.event_name != 'push'
     runs-on: ${{ matrix.os }}
-    # Heaviest job here: the canonical row runs the full regression suite on
-    # top of the mimalloc build plus reference download/index. Normal rows
-    # finish in a few minutes; the canonical row runs longest. Sized well above
-    # that so a hung runner fails fast instead of at the 6h default, without
-    # flaking a slow row.
+    # Heaviest job here: on top of the mimalloc build plus reference
+    # download/index, the canonical row runs the unit-test harness, the
+    # AVX-512BW kswv unit tests, the Makefile checks and the full rescue kernel
+    # sweeps (its binary-only regression scripts run in canonical-regressions).
+    # Normal rows finish in a few minutes; the canonical row runs longest. Sized
+    # well above that so a hung runner fails fast instead of at the 6h default,
+    # without flaking a slow row.
     timeout-minutes: 45
 
     # Compiler is set per row: CXX defaults to clang-19 (installed from
@@ -991,7 +993,8 @@ jobs:
 
       - name: Stage chr22 fixture (reference, bwa index, simulated reads)
         # Pinned chr22 + .fai, bwa's index, and ~50k simulated PE pairs under
-        # /tmp/chr22 and /tmp/chr22-sim; shared with the rebuild-variants job.
+        # /tmp/chr22 and /tmp/chr22-sim; shared with the canonical-regressions
+        # and rebuild-variants jobs.
         uses: ./.github/actions/chr22-fixture
 
       - name: Build chr22 FMI index
@@ -1009,52 +1012,6 @@ jobs:
           BWA_CHR22_FA=/tmp/chr22/bwa_chr22.fa \
           CHR22_SIM_DIR=/tmp/chr22-sim \
           bash test/regression/chr22_parity.sh
-
-      - name: Long-read PE 8-bit/16-bit parity (chr22, 400bp)
-        if: matrix.canonical == true
-        # Exercises the recovered >=128bp 8-bit banded-SW path end-to-end: the
-        # script self-simulates 400bp PE reads and diffs `bwa-mem3 mem` with the
-        # 8-bit path enabled (default) vs BWAMEM3_DISABLE_BSW8=1 (forced 16-bit).
-        # The two must be byte-identical -- guards the unsigned [0,255] recurrence
-        # + routing gate against regression. Self-contained A/B (one binary).
-        run: |
-          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
-          CHR22_FA=/tmp/chr22/chr22.fa \
-          CHR22_SIM_DIR=/tmp/chr22-sim-longread \
-          PIXI_MANIFEST="$GITHUB_WORKSPACE/test/holodeck/pixi.toml" \
-          bash test/regression/longread_pe_parity.sh
-
-      - name: SIMD tier parity (avx2 vs avx512bw, chr22)
-        if: matrix.canonical == true
-        # One binary must emit byte-identical SAM whichever usable kernel tier it
-        # dispatches. Scope is avx2/avx512bw: there is no batched kswv kernel
-        # below AVX2 and forcing those tiers aborts the aligner (see the script
-        # header). Cross-build parity is a different property, already covered by
-        # chr22_parity.sh running on the avx2 and arm64 build jobs.
-        #
-        # On a runner without AVX-512BW there is only one sweepable tier and the
-        # script reports SKIP:, not PASS: — so this step is a no-op there rather
-        # than a false green. It still earns its place: the script had rotted
-        # unrun to the point of aborting on its first tier, and this keeps that
-        # from recurring silently.
-        run: |
-          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
-          PARITY_FA=/tmp/chr22/chr22.fa \
-          PARITY_R1=/tmp/chr22-sim/reads.r1.fastq.gz \
-          PARITY_R2=/tmp/chr22-sim/reads.r2.fastq.gz \
-          bash test/regression/all_tiers_parity.sh
-
-      - name: Rescue identity under each forced x86 tier (generated PE fixture)
-        if: matrix.canonical == true
-        # The kswv rescue kernels differ per tier, so the 11-op cell (and the
-        # rest of the rescue shortcuts) is checked end to end on each tier this
-        # host has: the reference and default legs under BWAMEM3_FORCE_TIER must
-        # equal the unforced reference. On a runner without AVX-512BW the script
-        # reports that tier SKIP:. Seconds of work: a 60 kb generated fixture.
-        run: |
-          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
-          RESCUE_TIERS="avx2 avx512bw" \
-          bash test/regression/rescue_prune_identity.sh
 
       - name: Run unit-test harness
         # The standalone FM-index parity tests in the harness gate the arm64
@@ -1188,6 +1145,9 @@ jobs:
           MAKE_ARGS="CXX=$CXX USE_MIMALLOC=$MATRIX_USE_MIMALLOC" \
             bash test/regression/make_htscodecs_guard.sh
 
+      # Stays here, not in canonical-regressions with the other chr22 scripts:
+      # it compares against the bwamem3.sam the parity step above writes, and a
+      # few seconds of work does not justify a second parity run there.
       - name: --bam=6 roundtrip smoke (chr22)
         if: matrix.canonical == true
         run: |
@@ -1195,30 +1155,6 @@ jobs:
           CHR22_FA=/tmp/chr22/chr22.fa \
           CHR22_SIM_DIR=/tmp/chr22-sim \
           bash test/regression/bam_roundtrip.sh
-
-      - name: --bam-threads byte-identity (chr22, serial vs threaded BGZF)
-        if: matrix.canonical == true
-        run: |
-          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
-          CHR22_FA=/tmp/chr22/chr22.fa \
-          CHR22_SIM_DIR=/tmp/chr22-sim \
-          bash test/regression/bam_threads_byte_identity.sh
-
-      - name: Thread-determinism smoke (chr22, -t 1 vs -t 4)
-        if: matrix.canonical == true
-        run: |
-          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
-          CHR22_FA=/tmp/chr22/chr22.fa \
-          CHR22_SIM_DIR=/tmp/chr22-sim \
-          bash test/regression/thread_determinism.sh
-
-      - name: bwtseed lockstep driver identity (chr22, default vs BWA3_BWTSEED_LOCKSTEP=0)
-        if: matrix.canonical == true
-        run: |
-          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
-          CHR22_FA=/tmp/chr22/chr22.fa \
-          CHR22_SIM_DIR=/tmp/chr22-sim \
-          bash test/regression/bwtseed_lockstep_driver_identity.sh
 
       # Every row, not just the canonical one: the post-rescue dedup shortcuts
       # run on every tier, and pruning and banding run wherever the build has
@@ -1493,8 +1429,154 @@ jobs:
           ./rescue_band_kernel_eq 20000 1
           ./rescue_band_kernel_eq 20000 2
 
+      - name: ccache statistics
+        if: always()
+        run: ccache --show-stats || true
+
+  # The canonical row's regression scripts that need only the built bwa-mem3
+  # binary and the fixtures, split out so they run alongside the matrix instead
+  # of in series at the end of the canonical row, the job that sets the
+  # workflow's wall time. What stays on that row is what needs its built tree:
+  # the unit-test harness and the AVX-512BW kswv unit tests, the Makefile
+  # checks, the rescue kernel-equivalence harnesses every row runs, and
+  # bam_roundtrip.sh, which reads the SAM chr22_parity.sh leaves behind there.
+  #
+  # The binary is the canonical row's: the same runner, packages, compiler and
+  # job environment, and the same make command (arch=avx2, clang-19,
+  # USE_MIMALLOC=1), so a claim test/regression/README.md scopes to the
+  # canonical row holds here unchanged. The ccache slug is the canonical row's
+  # too, so this restores the cache warm-caches saves for that row and the
+  # compile is served from it.
+  canonical-regressions:
+    name: Linux x86_64 AVX2 (mimalloc) — regressions
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    # One build from a warm compiler cache, the chr22 fixture and index, and a
+    # few minutes of regression scripts. Ceiling catches a hung runner only.
+    timeout-minutes: 30
+    # The canonical row's values of build-and-test's job env (no cxx, cc or
+    # allow_unsupported on that row), spelled out.
+    env:
+      CXX: clang++-19
+      CC: clang-19
+      ALLOW_UNSUPPORTED_COMPILER: "0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Install dependencies (Linux)
+        # The matrix rows' package set (same list and version, so the same apt
+        # cache): bwa for the chr22 fixture and samtools for the regression
+        # scripts, on top of the build dependencies.
+        uses: awalsh128/cache-apt-pkgs-action@acb598e5ddbc6f68a970c5da0688d2f3a9f04d05 # v1.6.0
+        with:
+          packages: zlib1g-dev libdeflate-dev bwa autoconf automake samtools libomp-dev ccache
+          version: 1.1
+
+      - name: Install clang-19 (Linux)
+        uses: ./.github/actions/install-clang-19
+
+      # The canonical row's slug and cap (see the comment above the job).
+      - name: Set up ccache
+        uses: ./.github/actions/setup-ccache
+        with:
+          config: linux-x86_64-avx2-mimalloc
+          max-size: 300M
+
+      - name: Build bwa-mem3
+        # The canonical row's `Build bwa-mem3` command with its matrix values
+        # (arch_flag avx2, use_mimalloc 1) substituted. Keep the two identical:
+        # a different argument would rebuild with different flags, test a
+        # binary the canonical row does not, and miss the shared cache.
+        run: |
+          make -j"$(nproc)" \
+            arch=avx2 \
+            CXX="$CXX" USE_MIMALLOC=1
+
+      - name: Verify binary
+        run: ./bwa-mem3 version
+
+      - name: Stage chr22 fixture (reference, bwa index, simulated reads)
+        # Also sets up the test/holodeck pixi env (and pixi on PATH), which the
+        # long-read parity script and the bwa-meth pixi step below use.
+        uses: ./.github/actions/chr22-fixture
+
+      - name: Build chr22 FMI index
+        # bwa-mem3 index is rebuilt every run because its sidecar layout is
+        # coupled to the bwa-mem3 binary, which changes per commit.
+        run: |
+          cd /tmp/chr22
+          "$GITHUB_WORKSPACE/bwa-mem3" index chr22.fa
+          ls chr22.fa.*
+
+      - name: Long-read PE 8-bit/16-bit parity (chr22, 400bp)
+        # Exercises the recovered >=128bp 8-bit banded-SW path end-to-end: the
+        # script self-simulates 400bp PE reads and diffs `bwa-mem3 mem` with the
+        # 8-bit path enabled (default) vs BWAMEM3_DISABLE_BSW8=1 (forced 16-bit).
+        # The two must be byte-identical -- guards the unsigned [0,255] recurrence
+        # + routing gate against regression. Self-contained A/B (one binary).
+        run: |
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          CHR22_FA=/tmp/chr22/chr22.fa \
+          CHR22_SIM_DIR=/tmp/chr22-sim-longread \
+          PIXI_MANIFEST="$GITHUB_WORKSPACE/test/holodeck/pixi.toml" \
+          bash test/regression/longread_pe_parity.sh
+
+      - name: SIMD tier parity (avx2 vs avx512bw, chr22)
+        # One binary must emit byte-identical SAM whichever usable kernel tier it
+        # dispatches. Scope is avx2/avx512bw: there is no batched kswv kernel
+        # below AVX2 and forcing those tiers aborts the aligner (see the script
+        # header). Cross-build parity is a different property, already covered by
+        # chr22_parity.sh running on the avx2 and arm64 build jobs.
+        #
+        # On a runner without AVX-512BW there is only one sweepable tier and the
+        # script reports SKIP:, not PASS: — so this step is a no-op there rather
+        # than a false green. It still earns its place: the script had rotted
+        # unrun to the point of aborting on its first tier, and this keeps that
+        # from recurring silently.
+        run: |
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          PARITY_FA=/tmp/chr22/chr22.fa \
+          PARITY_R1=/tmp/chr22-sim/reads.r1.fastq.gz \
+          PARITY_R2=/tmp/chr22-sim/reads.r2.fastq.gz \
+          bash test/regression/all_tiers_parity.sh
+
+      - name: Rescue identity under each forced x86 tier (generated PE fixture)
+        # The kswv rescue kernels differ per tier, so the 11-op cell (and the
+        # rest of the rescue shortcuts) is checked end to end on each tier this
+        # host has: the reference and default legs under BWAMEM3_FORCE_TIER must
+        # equal the unforced reference. On a runner without AVX-512BW the script
+        # reports that tier SKIP:. Seconds of work: a 60 kb generated fixture.
+        run: |
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          RESCUE_TIERS="avx2 avx512bw" \
+          bash test/regression/rescue_prune_identity.sh
+
+      - name: --bam-threads byte-identity (chr22, serial vs threaded BGZF)
+        run: |
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          CHR22_FA=/tmp/chr22/chr22.fa \
+          CHR22_SIM_DIR=/tmp/chr22-sim \
+          bash test/regression/bam_threads_byte_identity.sh
+
+      - name: Thread-determinism smoke (chr22, -t 1 vs -t 4)
+        run: |
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          CHR22_FA=/tmp/chr22/chr22.fa \
+          CHR22_SIM_DIR=/tmp/chr22-sim \
+          bash test/regression/thread_determinism.sh
+
+      - name: bwtseed lockstep driver identity (chr22, default vs BWA3_BWTSEED_LOCKSTEP=0)
+        run: |
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          CHR22_FA=/tmp/chr22/chr22.fa \
+          CHR22_SIM_DIR=/tmp/chr22-sim \
+          bash test/regression/bwtseed_lockstep_driver_identity.sh
+
       - name: Flat chaining index matches the kbtree replay (chr22)
-        if: matrix.canonical == true
         run: |
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           CHR22_FA=/tmp/chr22/chr22.fa \
@@ -1502,14 +1584,12 @@ jobs:
           bash test/regression/chain_flat_replay_identity.sh
 
       - name: Chaining scratch is per-thread, not per-read
-        if: matrix.canonical == true
         run: |
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           CHR22_FA=/tmp/chr22/chr22.fa \
           bash test/regression/chain_scratch_per_thread.sh
 
       - name: Extension staging shares a chain's reference window (homopolymer chain)
-        if: matrix.canonical == true
         # A read from a long homopolymer chains ~500 max_occ-sampled seeds
         # across the whole run. Copying the chain's reference window once per
         # seed grew the extension buffers past their int32 limit within one
@@ -1520,7 +1600,6 @@ jobs:
           bash test/regression/repeat_chain_extension_window.sh
 
       - name: Cohort slicing does not change output
-        if: matrix.canonical == true
         run: |
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           CHR22_FA=/tmp/chr22/chr22.fa \
@@ -1528,7 +1607,6 @@ jobs:
           bash test/regression/cohort_slice_identity.sh
 
       - name: Cohort ramp values are validated (flag and environment alike)
-        if: matrix.canonical == true
         # --cohort-ramp-first takes plain bases, and atoll("16M") is 16 -- a
         # positive value, so an unvalidated parse configures a 16-BYTE first
         # slice for a user who asked for 16 Mbases, silently. The flag must
@@ -1539,7 +1617,6 @@ jobs:
           bash test/regression/cohort_ramp_validation.sh
 
       - name: Chunk cap stays opt-in (batching matches bwa-mem2 at every -t)
-        if: matrix.canonical == true
         # bwa and bwa-mem2 both use an uncapped `chunk_size * n_threads` batch.
         # A default cap re-partitions the input, which changes each batch's
         # mem_pestat cohort and therefore the output, for every -t >= 26.
@@ -1549,7 +1626,6 @@ jobs:
           bash test/regression/chunk_cap_optin.sh
 
       - name: THP check samples on Linux and never changes output
-        if: matrix.canonical == true
         # The THP fallback check reads /proc and /sys from the write step; its
         # unit tests use an injected reader, so this is the run of the real
         # reads and the -v 4 debug line. Skips the sample check when the
@@ -1560,7 +1636,6 @@ jobs:
           bash test/regression/thp_check_smoke.sh
 
       - name: --rescue-kmer/--rescue-band reject malformed values
-        if: matrix.canonical == true
         # Both were parsed with atoi(), which maps unparseable text to 0. For
         # --rescue-kmer 0 means "off" and counts as explicitly set, so a typo
         # would silently disable the largest lever in --fast; for --rescue-band
@@ -1572,7 +1647,6 @@ jobs:
           bash test/regression/rescue_kmer_options.sh
 
       - name: -t rejects malformed values and clamps out-of-range values
-        if: matrix.canonical == true
         # -t was parsed with atoi(), which maps unparseable text to 0 and
         # ignores trailing garbage, so a typo read as a valid-looking thread
         # count with no diagnostic. Separately, a value above MAX_THREADS must
@@ -1587,7 +1661,6 @@ jobs:
       # regression check in this job: bundled, a failure in the first script
       # leaves the second unrun and the step name cannot say which one failed.
       - name: --rescue-skip requires --rescue-kmer and composes with --fast
-        if: matrix.canonical == true
         # --rescue-skip keys on the --rescue-kmer anchor scan, so with the scan
         # off it would be silently inert -- a flag that changes which reads get
         # rescued going quietly nowhere. It must hard-error instead, in either
@@ -1599,7 +1672,6 @@ jobs:
           bash test/regression/rescue_skip_options.sh
 
       - name: --supp-rep-hard-cap repetitive-seed regression
-        if: matrix.canonical == true
         run: |
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           SUPP_REP_FIXTURE_AWK="$GITHUB_WORKSPACE/test/fixtures/supp_rep/build_fixture.awk" \
@@ -1607,7 +1679,6 @@ jobs:
           bash test/regression/supp_rep_hard_cap.sh
 
       - name: --compat byte-identical regression (phix)
-        if: matrix.canonical == true
         run: |
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           COMPAT_PHIX_FA="$GITHUB_WORKSPACE/test/fixtures/phix.fa" \
@@ -1615,7 +1686,6 @@ jobs:
           bash test/regression/compat_byte_identical.sh
 
       - name: byte-identity off==on==auto (extension-DP job dedup)
-        if: matrix.canonical == true
         run: |
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           DEDUP_PHIX_FA="$GITHUB_WORKSPACE/test/fixtures/phix.fa" \
@@ -1623,7 +1693,6 @@ jobs:
           bash test/regression/dedup_byte_identity.sh
 
       - name: byte-identity off==on==auto (whole-read-pair memoization)
-        if: matrix.canonical == true
         run: |
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           DEDUP_READS_PHIX_FA="$GITHUB_WORKSPACE/test/fixtures/phix.fa" \
@@ -1631,7 +1700,6 @@ jobs:
           bash test/regression/dedup_reads_byte_identity.sh
 
       - name: byte-identity off==on==auto (cross-read SA-interval dedup)
-        if: matrix.canonical == true
         run: |
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           KS_DEDUP_PHIX_FA="$GITHUB_WORKSPACE/test/fixtures/phix.fa" \
@@ -1639,7 +1707,6 @@ jobs:
           bash test/regression/ks_dedup_byte_identity.sh
 
       - name: byte-identity default==--keep-contained-ext (contained-seed skip)
-        if: matrix.canonical == true
         run: |
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           SKIP_CONTAINED_PHIX_FA="$GITHUB_WORKSPACE/test/fixtures/phix.fa" \
@@ -1647,7 +1714,6 @@ jobs:
           bash test/regression/skip_contained_byte_identity.sh
 
       - name: byte-identity --compat with and without --keep-contained-ext (contained-seed skip)
-        if: matrix.canonical == true
         run: |
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           COMPAT_CONTAINED_PHIX_FA="$GITHUB_WORKSPACE/test/fixtures/phix.fa" \
@@ -1655,7 +1721,6 @@ jobs:
           bash test/regression/compat_contained_skip_identity.sh
 
       - name: --hic alias regression (byte-identical to -5SP)
-        if: matrix.canonical == true
         run: |
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           HIC_PHIX_FA="$GITHUB_WORKSPACE/test/fixtures/phix.fa" \
@@ -1663,7 +1728,6 @@ jobs:
           bash test/regression/hic_alias_identical.sh
 
       - name: band_cert byte-identical regression (--no-band-cert A/B, phix)
-        if: matrix.canonical == true
         run: |
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           BAND_CERT_PHIX_FA="$GITHUB_WORKSPACE/test/fixtures/phix.fa" \
@@ -1671,7 +1735,6 @@ jobs:
           bash test/regression/band_cert_identity.sh
 
       - name: chain-flt empty-array compat regression (#310)
-        if: matrix.canonical == true
         run: |
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           CHAIN_FLT_PHIX_FA="$GITHUB_WORKSPACE/test/fixtures/phix.fa" \
@@ -1679,7 +1742,6 @@ jobs:
           bash test/regression/chain_flt_empty_compat.sh
 
       - name: SA sentinel-offset compat regression (#469)
-        if: matrix.canonical == true
         run: |
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           SA_SENTINEL_PHIX_FA="$GITHUB_WORKSPACE/test/fixtures/phix.fa" \
@@ -1687,7 +1749,6 @@ jobs:
           bash test/regression/compat_sa_sentinel.sh
 
       - name: mimalloc purge delay regression (mem default, env override, byte-identity)
-        if: matrix.canonical == true
         run: |
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           PURGE_PHIX_FA="$GITHUB_WORKSPACE/test/fixtures/phix.fa" \
@@ -1696,21 +1757,18 @@ jobs:
           bash test/regression/mimalloc_purge_delay.sh
 
       - name: header parity regression (AH:*, --compat @HD/@SQ)
-        if: matrix.canonical == true
         run: |
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           HEADER_PARITY_WORK_DIR=/tmp/header-parity \
           bash test/regression/header_parity.sh
 
       - name: proper-pair ALT derivation regression (--proper-pair-from-emitted)
-        if: matrix.canonical == true
         run: |
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           PROPER_PAIR_ALT_WORK_DIR=/tmp/proper-pair-alt \
           bash test/regression/proper_pair_alt.sh
 
       - name: default @HD parity across output paths
-        if: matrix.canonical == true
         run: |
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           HD_PARITY_PHIX_FA="$GITHUB_WORKSPACE/test/fixtures/phix.fa" \
@@ -1718,21 +1776,18 @@ jobs:
           bash test/regression/default_hd_parity.sh
 
       - name: "pa:f: SAM vs --bam parity (ALT-aware fixture)"
-        if: matrix.canonical == true
         run: |
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           ALT_PA_WORK_DIR=/tmp/alt-pa-parity \
           bash test/regression/alt_pa_parity.sh
 
       - name: "pa:f: --meth parity (ALT-aware bisulfite fixture)"
-        if: matrix.canonical == true
         run: |
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           METH_ALT_PA_WORK_DIR=/tmp/meth-alt-pa-parity \
           bash test/regression/meth_alt_pa_parity.sh
 
       - name: --meth output container follows --bam
-        if: matrix.canonical == true
         run: |
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           METH_SAM_PHIX_FA="$GITHUB_WORKSPACE/test/fixtures/phix.fa" \
@@ -1740,7 +1795,6 @@ jobs:
           bash test/regression/meth_sam_output.sh
 
       - name: SE alignment smoke (chr22)
-        if: matrix.canonical == true
         run: |
           "$GITHUB_WORKSPACE/bwa-mem3" mem -t 4 /tmp/chr22/chr22.fa \
             /tmp/chr22-sim/reads.r1.fastq.gz > /tmp/chr22-sim/se.sam 2>/dev/null
@@ -1750,7 +1804,6 @@ jobs:
           echo "PASS: SE smoke ($records records)"
 
       - name: Interleaved alignment smoke (chr22)
-        if: matrix.canonical == true
         run: |
           # Interleave R1 and R2 into a single FASTQ at FASTQ-record (4-line)
           # granularity. The naive `paste R1 R2 | tr '\t' '\n'` interleaves at
@@ -1775,7 +1828,6 @@ jobs:
           echo "PASS: interleaved smoke ($records records)"
 
       - name: Install bwa-meth pixi env
-        if: matrix.canonical == true
         # The holodeck setup-pixi step already installed the pixi binary
         # to /home/runner/.pixi/bin and added it to PATH. Calling
         # setup-pixi a second time would collide on the binary download
@@ -1786,7 +1838,6 @@ jobs:
           pixi install --manifest-path test/meth/pyproject.toml
 
       - name: Checkout bwa-meth oracle
-        if: matrix.canonical == true
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           # Most important of the four: this is a THIRD-PARTY tree, and the
@@ -1798,7 +1849,6 @@ jobs:
           path: bwa-meth-oracle
 
       - name: Copy bwa-meth fixtures into test/meth/
-        if: matrix.canonical == true
         run: |
           cp bwa-meth-oracle/example/ref.fa test/meth/
           cp bwa-meth-oracle/example/t_R1.fastq.gz test/meth/
@@ -1814,11 +1864,9 @@ jobs:
       # longer being run. Renamed alongside the row in test/regression/README.md
       # that quotes this step name.
       - name: Run --meth Layer 1
-        if: matrix.canonical == true
         run: bash test/regression/meth_oracle.sh
 
       - name: --meth whole-aligner regressions (D3)
-        if: matrix.canonical == true
         # Self-contained --meth regressions (each generates its fixtures inline):
         # dual index + seed->original remap; mixed OT/OB PE per-hypothesis scoring;
         # OT/OB x strand placement; original-alphabet output integrity (Bismark
@@ -1870,6 +1918,7 @@ jobs:
   # sets the workflow's wall time. They need nothing the canonical row produces,
   # only its configuration (Linux x86_64, avx2, clang-19) and the chr22 fixture,
   # so the arch/compiler/mimalloc values below are that row's, spelled out.
+  # canonical-regressions above does the same for that row's own build.
   rebuild-variants:
     name: Rebuild variants (debug macros, SIMD floor, ASAN)
     if: github.event_name != 'push'
@@ -2321,7 +2370,9 @@ jobs:
           # arch/mimalloc/compiler fields are the row's. `harness` marks the rows
           # that run the unit-test harness, `canonical` the row that also builds
           # the second avx512bw tree. `chr22_fixture` marks one row per runner
-          # type the chr22 fixture runs on (see the last step).
+          # type the chr22 fixture runs on (see the last step). This row also
+          # warms canonical-regressions, which shares its slug and its main
+          # build command, so that job needs no row of its own.
           - config: linux-x86_64-avx2-mimalloc
             os: ubuntu-latest
             kind: row
