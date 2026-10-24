@@ -90,7 +90,7 @@ The PGO targets produce one optimized binary for a single `arch=` target. They d
 
 ## Relationship to LTO
 
-`make lto-build` produces a Link-Time Optimization binary; `make pgo-use` produces a PGO-optimized binary. Both are independent opt-in targets. You can combine them by passing `-flto` (or `-flto=thin` for clang) as part of `EXTRA_CXXFLAGS` during the `pgo-use` step, but the combination has not been systematically benchmarked. In practice, LTO and PGO each provide modest single-digit gains; their interaction is compiler-specific.
+The default build already links with LTO where the toolchain supports it (see [Link-Time Optimization](../developer-guide/building.md#link-time-optimization-lto)), and `pgo-generate` / `pgo-use` inherit that default, so a clang `pgo-use` binary on Linux is PGO plus LTO. For a PGO-only binary, pass `LTO=off` to `make pgo-use`, which rebuilds every object and links the final binary; passing it only to `make pgo-generate` changes the instrumented binary, not the final one. The combination has not been systematically benchmarked.
 
 ---
 

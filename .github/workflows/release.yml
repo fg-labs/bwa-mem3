@@ -149,7 +149,10 @@ jobs:
         # repo `signed-by` that keyring so a tampered mirror or a changed
         # installer script can't run code as root or slip in unsigned packages.
         # libomp-19-dev provides -lomp for clang's -fopenmp (libsais). clang-19
-        # is also the Makefile's compiler-floor minimum.
+        # is also the Makefile's compiler-floor minimum. lld-19 is what the
+        # default build's LTO link uses; without it the tarball still
+        # builds, without LTO, so installing it keeps the smoke test on the
+        # LTO path.
         run: |
           set -euo pipefail
           . /etc/os-release
@@ -168,7 +171,7 @@ jobs:
           echo "deb [signed-by=/etc/apt/keyrings/llvm-snapshot.gpg] http://apt.llvm.org/${codename}/ llvm-toolchain-${codename}-19 main" \
             | sudo tee /etc/apt/sources.list.d/llvm-19.list
           sudo apt-get update
-          sudo apt-get install -y clang-19 libomp-19-dev
+          sudo apt-get install -y clang-19 lld-19 libomp-19-dev
           clang++-19 --version | head -1
 
       - name: Install git-archive-all
@@ -284,6 +287,31 @@ jobs:
           tar -xzf Source_code_including_submodules.tar.gz -C /tmp
           cd "/tmp/bwa-mem3-${VERSION}"
           make -j"$(nproc)" CXX=clang++-19 CC=clang-19
+          # The tarball must build what ships: full LTO with clang-19 + lld-19
+          # (the build drops to non-LTO with only a NOTE when lld is missing).
+          lto=$(make -s print-BWA_LTO_MODE CXX=clang++-19 CC=clang-19 | tail -n 1)
+          if [ "$lto" != full ]; then
+            echo "::error::tarball build resolved LTO mode '$lto', expected 'full'"
+            exit 1
+          fi
+          # ...and that the binary's link used it: dry-run the build with
+          # src/main.o newer than the binary (make's -W is not passed to the
+          # recursive makes the build goes through) and check the one bwa-mem3
+          # link line for the full-LTO flags.
+          touch src/main.o
+          make -n CXX=clang++-19 CC=clang-19 > /tmp/lto-link-dry-run.txt 2>&1
+          link=$(grep -E -- ' -o bwa-mem3[^ ]*$' /tmp/lto-link-dry-run.txt || true)
+          n=$(printf '%s' "$link" | grep -c . || true)
+          if [ "$n" -ne 1 ]; then
+            echo "::error::expected one bwa-mem3 link line in the tarball's dry run, found $n"
+            exit 1
+          fi
+          for f in -flto=full -ffat-lto-objects -fuse-ld=lld; do
+            if ! printf '%s\n' "$link" | grep -q -- " $f\( \|$\)"; then
+              echo "::error::the tarball's bwa-mem3 link line lacks $f"
+              exit 1
+            fi
+          done
           # Read stdout only -- bwa-mem3 prints its version string to
           # stdout, while mimalloc emits a startup banner ("mimalloc
           # 3.3.x") to stderr. With `2>&1` the banner can flush first
