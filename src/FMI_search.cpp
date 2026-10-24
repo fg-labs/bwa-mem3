@@ -1855,7 +1855,7 @@ void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
     int32_t idle       = N - initial;   // slots with no input
     int64_t numTotalSmem = *__numTotalSmem;
 
-    while (parked.cursor < numReads) {
+    while (parked.cursor() < numReads) {
         // --- Stepping pass: advance each slot by one phase-step. ---
         for (int32_t s = 0; s < N; s++) {
             BatchSlot *sl = &slots[s];

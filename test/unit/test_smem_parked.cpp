@@ -80,11 +80,11 @@ TEST_CASE("LockstepParked: reads finishing out of order leave in input order"
     e.finish(1, 0);
     e.finish(3, 2);
     CHECK(e.n_out == 0);
-    CHECK(e.parked.pending == 3);
-    CHECK(e.parked.cursor == 0);
+    CHECK(e.parked.pending() == 3);
+    CHECK(e.parked.cursor() == 0);
     e.finish(0, 4);
-    CHECK(e.parked.pending == 0);
-    CHECK(e.parked.cursor == 4);
+    CHECK(e.parked.pending() == 0);
+    CHECK(e.parked.cursor() == 4);
     check_in_order(e, {4, 0, 3, 2});
 }
 
@@ -96,12 +96,12 @@ TEST_CASE("LockstepParked: a read that is due drains only the consecutive parked
     e.finish(1, 2);
     e.finish(3, 1);   // read 2 not done: 3 must wait behind it
     e.finish(0, 1);
-    CHECK(e.parked.cursor == 2);
-    CHECK(e.parked.pending == 1);
+    CHECK(e.parked.cursor() == 2);
+    CHECK(e.parked.pending() == 1);
     check_in_order(e, {1, 2});
     e.finish(2, 0);
-    CHECK(e.parked.cursor == 4);
-    CHECK(e.parked.pending == 0);
+    CHECK(e.parked.cursor() == 4);
+    CHECK(e.parked.pending() == 0);
     check_in_order(e, {1, 2, 0, 1});
 }
 
@@ -113,7 +113,7 @@ TEST_CASE("LockstepParked: in-order reads go straight out, empty ones included"
     const std::vector<int32_t> counts = {0, 3, 0, 0, 1, 2};
     for (size_t r = 0; r < counts.size(); r++) {
         e.finish((int32_t)r, counts[r]);
-        CHECK(e.parked.pending == 0);
+        CHECK(e.parked.pending() == 0);
     }
     check_in_order(e, counts);
 }
@@ -134,8 +134,8 @@ TEST_CASE("LockstepParked: ring entries are reused for later windows"
             REQUIRE(e.parked.admits(r));
             e.finish(r, counts[(size_t)r]);
         }
-        CHECK(e.parked.cursor == base + 4);
-        CHECK(e.parked.pending == 0);
+        CHECK(e.parked.cursor() == base + 4);
+        CHECK(e.parked.pending() == 0);
     }
     check_in_order(e, counts);
 }
@@ -164,10 +164,11 @@ TEST_CASE("LockstepParked: reset() starts a fresh call after parked reads"
     e.finish(1, 2);
     e.finish(2, 1);
     e.finish(0, 1);
-    REQUIRE(e.parked.pending == 0);
+    REQUIRE(e.parked.pending() == 0);
     e.parked.reset(8);
     e.n_out = 0;
-    CHECK(e.parked.cursor == 0);
+    CHECK(e.parked.cursor() == 0);
+    CHECK(e.parked.window() == 8);
     e.finish(1, 3);
     CHECK(e.n_out == 0);
     e.finish(0, 2);
@@ -184,16 +185,16 @@ TEST_CASE("LockstepParked: reset() drops reads still parked"
     e.parked.reset(8);
     e.finish(1, 2);
     e.finish(3, 1);
-    REQUIRE(e.parked.pending == 2);
+    REQUIRE(e.parked.pending() == 2);
     e.parked.reset(8);
     e.n_out = 0;
-    CHECK(e.parked.pending == 0);
+    CHECK(e.parked.pending() == 0);
     e.finish(2, 2);   // parked, so the next emit walks the ring
     e.finish(0, 1);   // read 1's old entry must read as empty: the cursor stops at 1
-    CHECK(e.parked.cursor == 1);
+    CHECK(e.parked.cursor() == 1);
     CHECK(e.n_out == 1);
     e.finish(1, 3);
-    CHECK(e.parked.cursor == 3);
+    CHECK(e.parked.cursor() == 3);
     e.finish(3, 1);
     check_in_order(e, {1, 3, 2, 1});
 }
@@ -207,7 +208,7 @@ TEST_CASE("LockstepParked: the parked buffer grows past its first allocation"
     std::vector<int32_t> counts(64, 40);
     counts[0] = 5;
     for (int32_t r = 63; r >= 1; r--) e.finish(r, counts[(size_t)r]);
-    CHECK(e.parked.pending == 63);
+    CHECK(e.parked.pending() == 63);
     e.finish(0, counts[0]);
     check_in_order(e, counts);
 }
