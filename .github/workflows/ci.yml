@@ -425,6 +425,8 @@ jobs:
           - os: ubuntu-latest
             arch_flag: "avx2"
             use_mimalloc: "0"
+            # Built without LTO (see `lto` under the job's env).
+            lto: "off"
             name: "Linux x86_64 AVX2 (no-mimalloc)"
             artifact_slug: "linux-x86_64-avx2-no-mimalloc"
           - os: ubuntu-24.04-arm
@@ -453,6 +455,8 @@ jobs:
             # unset baseline_arch to avx2 too). Spelled out on this row so the
             # key is declared in the matrix and its use type-checks.
             baseline_arch: "avx2"
+            # Built without LTO (see `lto` under the job's env).
+            lto: "off"
             ccache_size: "300M"
             name: "Linux x86_64 single-binary (mimalloc)"
             artifact_slug: "linux-x86_64-single-mimalloc"
@@ -500,6 +504,24 @@ jobs:
       CXX: ${{ matrix.cxx || 'clang++-19' }}
       CC: ${{ matrix.cc || 'clang-19' }}
       ALLOW_UNSUPPORTED_COMPILER: ${{ matrix.allow_unsupported || '0' }}
+      # The Makefile's LTO= knob (auto | full | thin | off; `LTO ?= auto`), set
+      # at the job level for the same reason as CXX/CC: every make in the job,
+      # recursive and test/Makefile ones included, must see the same value.
+      # LTO_CFLAGS (-flto=... -ffat-lto-objects on every libbwa.a compile) is
+      # part of the build-flags stamp, so a single make call without it would
+      # rebuild libbwa.a mid-job. The rows that set `lto: "off"` (no-mimalloc
+      # and single-binary) are there for the allocator and for the bare-`make`
+      # multi-tier build path, not for the LTO link: the full-LTO link of
+      # bwa-mem3 is single-threaded, adds about 15-20 s and ccache cannot cache
+      # it, so they skip it. Full LTO stays covered where it matters: the
+      # canonical row (whose arch=avx2 build compiles the same AVX2-floor
+      # objects and links the same per-tier kernel objects as the single-binary
+      # build), canonical-regressions and Linux ARM64, and the release
+      # workflow's tarball check, which asserts the bare `make` links with full
+      # LTO. `auto` is the Makefile default, so the other rows build exactly as
+      # a bare make would (an empty value would instead trip the Makefile's
+      # invalid-LTO warning).
+      LTO: ${{ matrix.lto || 'auto' }}
 
     steps:
       - name: Checkout
@@ -609,7 +631,8 @@ jobs:
         # so a clang row that lost ld.lld would stay green while testing a
         # binary that does not ship. Assert the resolved mode instead: full LTO
         # on the Linux clang rows (install-clang-19 installs lld-19), off on the
-        # gcc and macOS rows. `make -s print-BWA_LTO_MODE` re-runs the same
+        # gcc and macOS rows, and on the rows that set `lto: "off"` (job env
+        # LTO). `make -s print-BWA_LTO_MODE` re-runs the same
         # parse-time probe with this row's compiler; it compiles nothing.
         # The mode alone does not prove the link used it, so the step also
         # dry-runs this row's build with src/main.o made newer than the binary
@@ -621,8 +644,15 @@ jobs:
           MATRIX_ARCH_FLAG: ${{ matrix.arch_flag }}
           MATRIX_BASELINE_ARCH: ${{ matrix.baseline_arch || 'avx2' }}
           MATRIX_USE_MIMALLOC: ${{ matrix.use_mimalloc }}
+          MATRIX_LTO: ${{ matrix.lto }}
         run: |
-          if [ "$RUNNER_OS" = Linux ] && [ "$MATRIX_CXX" != g++ ]; then expected=full; else expected=off; fi
+          if [ "$MATRIX_LTO" = off ]; then
+            expected=off
+          elif [ "$RUNNER_OS" = Linux ] && [ "$MATRIX_CXX" != g++ ]; then
+            expected=full
+          else
+            expected=off
+          fi
           got=$(make -s print-BWA_LTO_MODE CXX="$CXX" | tail -n 1)
           echo "LTO mode: $got (expected $expected)"
           if [ "$got" != "$expected" ]; then
@@ -2472,6 +2502,8 @@ jobs:
             kind: row
             arch_flag: "avx2"
             use_mimalloc: "0"
+            # As the build-and-test row: built without LTO.
+            lto: "off"
           - config: linux-arm64-mimalloc
             os: ubuntu-24.04-arm
             kind: row
@@ -2495,6 +2527,8 @@ jobs:
             arch_flag: ""
             use_mimalloc: "1"
             baseline_arch: "avx2"
+            # As the build-and-test row: built without LTO.
+            lto: "off"
             ccache_size: "300M"
           - config: linux-x86_64-avx2-gcc-compat
             os: ubuntu-latest
@@ -2523,6 +2557,9 @@ jobs:
       CXX: ${{ matrix.cxx || 'clang++-19' }}
       CC: ${{ matrix.cc || 'clang-19' }}
       ALLOW_UNSUPPORTED_COMPILER: ${{ matrix.allow_unsupported || '0' }}
+      # As build-and-test: the row's LTO mode for every make, so the compiles
+      # (LTO_CFLAGS) hash the same as that row's.
+      LTO: ${{ matrix.lto || 'auto' }}
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
