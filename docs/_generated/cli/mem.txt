@@ -10,7 +10,7 @@ Options:
                   clamped to 256 [1]
     -k INT        minimum seed length [19]
     -w INT        band width for banded alignment, 0..536870911 [100]
-    -d INT        off-diagonal X-dropoff [100]
+    -d INT        off-diagonal X-dropoff, non-negative [100]
     -r FLOAT      look for internal seeds inside a seed longer than {-k} * FLOAT [1.5]
     -y INT        seed occurrence for the 3rd round seeding [20]
     -c INT        skip seeds with more than INT occurrences [500]
@@ -19,7 +19,7 @@ Options:
     --dedup-reads STR  whole-read-pair memoization: 'off', 'on', or 'auto' (measure the duplicate rate and net benefit at runtime, latch, and periodically re-probe); aligns once per distinct pair within a chunk and replays the per-read SAM stage, so alignment records are byte-identical in every mode. Benefits amplicon/UMI panels with PCR duplicates; ~no effect on WGS/exome [auto]
     --ks-dedup STR  cross-read SA-interval dedup: 'off', 'on' (resolve each distinct (k,s) suffix-array interval once per SA-resolve chunk and copy the coordinates to the reads that repeat it), or 'auto' (measure net benefit at runtime, latch, and periodically re-probe); alignment records byte-identical in every mode [auto]
     --huge-pages  back the index with 1 GB huge pages via mimalloc when the host has enough free 1 GB pages reserved; cuts dTLB misses in seeding; Linux only, alignment records byte-identical (only @PG CL differs, recording the flag), safe no-op otherwise [off]
-    --keep-contained-ext  opt out of the default contained-seed extension skip and run the reference extension path instead. By default a seed contained (same diagonal) in a longer in-chain seed has its banded-SW extension skipped once the post-extension containment purge confirms it; the skip is byte-identical to the reference path on all read lengths, including under --meth and --compat, so this flag only removes the speedup. Escape hatch / bit-exact A-B handle against older binaries. The skip stays off on its own under a negative -A, the one scoring outside its proof [off]
+    --keep-contained-ext  opt out of the default contained-seed extension skip and run the reference extension path instead. By default a seed contained (same diagonal) in a longer in-chain seed has its banded-SW extension skipped once the post-extension containment purge confirms it; the skip is byte-identical to the reference path on all read lengths, including under --meth and --compat, so this flag only removes the speedup. Escape hatch / bit-exact A-B handle against older binaries [off]
     --skip-contained-ext  DEPRECATED, accepted no-op: contained-seed skipping is now the default; pass --keep-contained-ext to opt out
     --max-extend-chains INT  cap chains extended per read to the top-INT by weight; ~23% less alignment CPU, high-confidence placement unaffected; ignored for reads with >4096 chains; opt-in, NOT byte-identical (0 = off) [0]
     --adaptive-band  adaptive banded-SW: start tight and expand each pair to its chain-geometry band on long-extension reads; ~1.3x on medium reads (SBX ~240bp), no-op on short reads; kilobase-scale HiFi/ONT are not practical at default settings; opt-in, NOT byte-identical [off]
@@ -85,12 +85,12 @@ Options:
                   then NOT byte-identical to the target. Does not relax --fast/--meth
                   (category errors, not divergences). No effect without --compat. [off]
 Scoring options:
-   -A INT        score for a sequence match, which scales options -TdBOELU unless overridden [1]
-   -B INT        penalty for a mismatch [4]
+   -A INT        score for a sequence match, 1..127, which scales options -TdBOELU unless overridden [1]
+   -B INT        penalty for a mismatch, 0..128 after -A scaling [4]
    -O INT[,INT]  gap open penalties for deletions and insertions [6,6]
    -E INT[,INT]  gap extension penalty (must be positive); a gap of size k cost '{-O} + {-E}*k' [1,1]
    -L INT[,INT]  penalty for 5'- and 3'-end clipping [5,5]
-   -U INT        penalty for an unpaired read pair [17]
+   -U INT        penalty for an unpaired read pair, non-negative [17]
 Input/output options:
    -p            smart pairing (ignoring in2.fq)
    -R STR        read group header line such as '@RG\tID:foo\tSM:bar' [null]

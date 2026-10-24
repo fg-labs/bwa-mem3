@@ -440,12 +440,12 @@ individual flags are unaffected.
 
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `-A INT` | 1 | Score for a sequence match. Scales `-T`, `-d`, `-B`, `-O`, `-E`, `-L`, `-U` unless overridden. |
-| `-B INT` | 4 | Mismatch penalty. |
+| `-A INT` | 1 | Score for a sequence match. Scales `-T`, `-d`, `-B`, `-O`, `-E`, `-L`, `-U` unless overridden. Must be in 1..127: the alignment kernels store it in 8 bits, and a score of 0 or less leaves nothing to align. |
+| `-B INT` | 4 | Mismatch penalty. The effective value (after `-A` scaling, so `-A 33` alone gives 132) must be in 0..128: the kernels store its negation in 8 bits, and a negative penalty would score a mismatch above zero. |
 | `-O INT[,INT]` | 6,6 | Gap open penalty for deletions and insertions respectively. Must be non-negative: a negative open is rejected, because the SIMD alignment kernels do not compute it exactly (upstream accepts it). |
-| `-E INT[,INT]` | 1,1 | Gap extension penalty per base. A gap of length k costs `-O + -E * k`. |
+| `-E INT[,INT]` | 1,1 | Gap extension penalty per base. A gap of length k costs `-O + -E * k`. Must be positive, and each effective `-O + -E` sum at most 536870911 (2^29 - 1). |
 | `-L INT[,INT]` | 5,5 | Clipping penalty for 5' and 3' ends. |
-| `-U INT` | 17 | Penalty for an unpaired read pair (affects mate-rescue scoring). |
+| `-U INT` | 17 | Penalty for an unpaired read pair (affects mate-rescue scoring). Must be non-negative. |
 | `-T INT` | 30 | Minimum alignment score to output. Alignments below this threshold are not reported. |
 
 > **Note — --meth overrides scoring defaults**
@@ -745,11 +745,10 @@ container itself was purged by some earlier kept alignment `X`; the proof then n
 contain the shorter seed too, which follows for the coordinate and seed-length tests
 directly, and for the diagonal test exactly when the maximal-gap bound (`cal_max_gap`) is
 non-decreasing in the distance from the alignment's edge, which holds for every non-negative
-match score (`-A`). A negative `-A` is the one scoring outside it: there the extension driver
-(`mem_skip_contained_ext_sound`) runs the reference path whatever the flag says, in every
-mode, and `mem` prints a `[W::main_mem] contained-seed extension skip disabled` notice. Output
-is the same either way; only the speedup is lost. (Before this, a negative `-A` still ran the
-skip in the default mode.) Nothing else in the argument depends on scoring, read length, `-w`, `-L`, `-d`,
+match score (`-A`). A negative `-A` is the one scoring outside it, and `mem` now refuses any
+`-A` below 1, so the command line cannot reach it; the extension driver
+(`mem_skip_contained_ext_sound`) still runs the reference path there whatever the flag says,
+as a guard of its own. Nothing else in the argument depends on scoring, read length, `-w`, `-L`, `-d`,
 presets or thread count, so the skip is also in force under
 [`--compat`](#--compattarget--byte-identical-output-for-another-aligner) (both targets), where
 it was previously switched off out of caution. Under `--compat` it was measured byte-identical
@@ -1088,7 +1087,7 @@ rejected at parse.
 #### `-d INT` — X-dropoff
 
 Off-diagonal X-dropoff for the Z-drop heuristic. Controls how far an alignment
-extension continues after a score drop.
+extension continues after a score drop. Must be non-negative.
 
 #### `-r FLOAT` — re-seeding factor
 

@@ -1634,6 +1634,14 @@ static int process(void *shared, gzFile gfp, gzFile gfp2, int pipe_threads)
     return 0;
 }
 
+/* -A scales every score-derived option the command line leaves unset. The
+ * products cannot overflow int: -A is held to 1..127 at parse, and only the
+ * small built-in defaults are scaled (a user-set value is never multiplied), so
+ * the largest product is 127 * 100 (the default -d). Because -A is positive, the
+ * scaling cannot change a sign either: gap penalties, z-drop and the unpaired
+ * penalty keep the ranges their own parse checks give them. What it can do is
+ * push the mismatch penalty above 128, which check_effective_scoring() below
+ * rejects. */
 static void update_a(mem_opt_t *opt, const mem_opt_t *opt0)
 {
     if (opt0->a) { // matching score is changed
@@ -1648,6 +1656,49 @@ static void update_a(mem_opt_t *opt, const mem_opt_t *opt0)
         if (!opt0->pen_clip3) opt->pen_clip3 *= opt->a;
         if (!opt0->pen_unpaired) opt->pen_unpaired *= opt->a;
     }
+}
+
+/* Reject a scoring the aligner cannot carry, after -A scaling and the -x
+ * presets, so that a scaled default is checked exactly like a value the user typed.
+ * Run after update_a() and again after the --meth defaults, which scale -B
+ * and -U by -A as well.
+ * Each message reports the EFFECTIVE value (as the --meth -B check does), since
+ * -A can produce it without the user passing the option it names. Returns 0 if
+ * the scoring is usable, else prints one ERROR: line and returns -1.
+ *   - b: must lie in 0..128. bwa_fill_scmat and the kswv constructor store -b in
+ *     int8_t (mat[], w_mismatch), so a larger b wraps. A negative b scores a
+ *     mismatch above the match score's floor of zero: the 8-bit admission tests
+ *     (bsw8_envelope_ok, matesw_use_u8, the kswv saturation guard) take -A as the
+ *     largest per-base score and stop holding, and mem_approx_mapq_se's identity
+ *     term divides by a + b and leaves [0, 1]. With a >= 1 (parse) and b >= 0,
+ *     that divisor is at least 1.
+ *   - o + e: cells outside ksw_global2's band hold MINUS_INF (-2^30), and a gap
+ *     state derived from one subtracts o + e twice more before it is discarded,
+ *     so -2^30 - 2 * (o + e) must stay in int: o + e <= 2^29 - 1.
+ * The sign constraints need no check here: -O >= 0, -E >= 1, -d >= 0 and
+ * -U >= 0 hold at parse, the -x presets and --meth defaults set positive
+ * values, and update_a() only multiplies by a positive -A. */
+static int check_effective_scoring(const mem_opt_t *opt)
+{
+    const int64_t oe_max = (INT64_C(1) << 29) - 1;
+    if (opt->b < 0 || opt->b > -INT8_MIN) {
+        fprintf(stderr, "ERROR: the effective mismatch penalty is %d, outside 0..%d: a negative "
+                        "penalty scores a mismatch above zero, which the 8-bit alignment kernels "
+                        "and the mapping-quality model do not allow, and the kernels store its "
+                        "negation in 8 bits (check -B and -A; -A scales the default -B unless -B "
+                        "is given)\n",
+                opt->b, -INT8_MIN);
+        return -1;
+    }
+    if ((int64_t)opt->o_del + opt->e_del > oe_max || (int64_t)opt->o_ins + opt->e_ins > oe_max) {
+        fprintf(stderr, "ERROR: the effective gap open plus extension penalty is %lld for "
+                        "deletions and %lld for insertions; each must be at most %lld so the "
+                        "alignment kernels' gap scores stay in range (check -O, -E and -A)\n",
+                (long long)opt->o_del + opt->e_del, (long long)opt->o_ins + opt->e_ins,
+                (long long)oe_max);
+        return -1;
+    }
+    return 0;
 }
 
 /* True if `p` names something on disk, or is the base of a bwa index (the
@@ -1729,7 +1780,7 @@ static void usage(const mem_opt_t *opt)
             MAX_THREADS, MAX_THREADS, MAX_THREADS, opt->n_threads);
     fprintf(stderr, "    -k INT        minimum seed length [%d]\n", opt->min_seed_len);
     fprintf(stderr, "    -w INT        band width for banded alignment, 0..%d [%d]\n", INT_MAX >> 2, opt->w);
-    fprintf(stderr, "    -d INT        off-diagonal X-dropoff [%d]\n", opt->zdrop);
+    fprintf(stderr, "    -d INT        off-diagonal X-dropoff, non-negative [%d]\n", opt->zdrop);
     fprintf(stderr, "    -r FLOAT      look for internal seeds inside a seed longer than {-k} * FLOAT [%g]\n", opt->split_factor);
     fprintf(stderr, "    -y INT        seed occurrence for the 3rd round seeding [%ld]\n", (long)opt->max_mem_intv);
     fprintf(stderr, "    -c INT        skip seeds with more than INT occurrences [%d]\n", opt->max_occ);
@@ -1738,7 +1789,7 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "    --dedup-reads STR  whole-read-pair memoization: 'off', 'on', or 'auto' (measure the duplicate rate and net benefit at runtime, latch, and periodically re-probe); aligns once per distinct pair within a chunk and replays the per-read SAM stage, so alignment records are byte-identical in every mode. Benefits amplicon/UMI panels with PCR duplicates; ~no effect on WGS/exome [auto]\n");
     fprintf(stderr, "    --ks-dedup STR  cross-read SA-interval dedup: 'off', 'on' (resolve each distinct (k,s) suffix-array interval once per SA-resolve chunk and copy the coordinates to the reads that repeat it), or 'auto' (measure net benefit at runtime, latch, and periodically re-probe); alignment records byte-identical in every mode [auto]\n");
     fprintf(stderr, "    --huge-pages  back the index with 1 GB huge pages via mimalloc when the host has enough free 1 GB pages reserved; cuts dTLB misses in seeding; Linux only, alignment records byte-identical (only @PG CL differs, recording the flag), safe no-op otherwise [off]\n");
-    fprintf(stderr, "    --keep-contained-ext  opt out of the default contained-seed extension skip and run the reference extension path instead. By default a seed contained (same diagonal) in a longer in-chain seed has its banded-SW extension skipped once the post-extension containment purge confirms it; the skip is byte-identical to the reference path on all read lengths, including under --meth and --compat, so this flag only removes the speedup. Escape hatch / bit-exact A-B handle against older binaries. The skip stays off on its own under a negative -A, the one scoring outside its proof [%s]\n", opt->skip_contained_ext? "off":"on");
+    fprintf(stderr, "    --keep-contained-ext  opt out of the default contained-seed extension skip and run the reference extension path instead. By default a seed contained (same diagonal) in a longer in-chain seed has its banded-SW extension skipped once the post-extension containment purge confirms it; the skip is byte-identical to the reference path on all read lengths, including under --meth and --compat, so this flag only removes the speedup. Escape hatch / bit-exact A-B handle against older binaries [%s]\n", opt->skip_contained_ext? "off":"on");
     fprintf(stderr, "    --skip-contained-ext  DEPRECATED, accepted no-op: contained-seed skipping is now the default; pass --keep-contained-ext to opt out\n");
     fprintf(stderr, "    --max-extend-chains INT  cap chains extended per read to the top-INT by weight; ~23%% less alignment CPU, high-confidence placement unaffected; ignored for reads with >4096 chains; opt-in, NOT byte-identical (0 = off) [%d]\n", opt->max_extend_chains);
     fprintf(stderr, "    --adaptive-band  adaptive banded-SW: start tight and expand each pair to its chain-geometry band on long-extension reads; ~1.3x on medium reads (SBX ~240bp), no-op on short reads; kilobase-scale HiFi/ONT are not practical at default settings; opt-in, NOT byte-identical [%s]\n", opt->band_start? "on":"off");
@@ -1806,12 +1857,12 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "                  then NOT byte-identical to the target. Does not relax --fast/--meth\n");
     fprintf(stderr, "                  (category errors, not divergences). No effect without --compat. [off]\n");
     fprintf(stderr, "Scoring options:\n");
-    fprintf(stderr, "   -A INT        score for a sequence match, which scales options -TdBOELU unless overridden [%d]\n", opt->a);
-    fprintf(stderr, "   -B INT        penalty for a mismatch [%d]\n", opt->b);
+    fprintf(stderr, "   -A INT        score for a sequence match, 1..127, which scales options -TdBOELU unless overridden [%d]\n", opt->a);
+    fprintf(stderr, "   -B INT        penalty for a mismatch, 0..128 after -A scaling [%d]\n", opt->b);
     fprintf(stderr, "   -O INT[,INT]  gap open penalties for deletions and insertions [%d,%d]\n", opt->o_del, opt->o_ins);
     fprintf(stderr, "   -E INT[,INT]  gap extension penalty (must be positive); a gap of size k cost '{-O} + {-E}*k' [%d,%d]\n", opt->e_del, opt->e_ins);
     fprintf(stderr, "   -L INT[,INT]  penalty for 5'- and 3'-end clipping [%d,%d]\n", opt->pen_clip5, opt->pen_clip3);
-    fprintf(stderr, "   -U INT        penalty for an unpaired read pair [%d]\n", opt->pen_unpaired);
+    fprintf(stderr, "   -U INT        penalty for an unpaired read pair, non-negative [%d]\n", opt->pen_unpaired);
 //  fprintf(stderr, "   -x STR        read type. Setting -x changes multiple parameters unless overriden [null]\n");
 //  fprintf(stderr, "                 pacbio: -k17 -W40 -r10 -A1 -B1 -O1 -E1 -L0  (PacBio reads to ref)\n");
 //  fprintf(stderr, "                 ont2d: -k14 -W20 -r10 -A1 -B1 -O1 -E1 -L0  (Oxford Nanopore 2D-reads to ref)\n");
@@ -2332,11 +2383,60 @@ int main_mem(int argc, char *argv[])
             opt->w = (int)v;
             opt0.w = 1;
         }
-        else if (c == 'A') opt->a = atoi(optarg), opt0.a = 1, assert(opt->a >= INT_MIN && opt->a <= INT_MAX);
-        else if (c == 'B') opt->b = atoi(optarg), opt0.b = 1, assert(opt->b >= INT_MIN && opt->b <= INT_MAX);
+        else if (c == 'A') {
+            /* The match score is stored in int8_t by bwa_fill_scmat, the kswv
+             * constructor and the --meth matrices, so a larger value wraps: -A 128
+             * becomes -128, and -A 256 becomes 0, which zeroes kswv's maximum
+             * substitution score and its score2 window divides by it. A zero or
+             * negative -A is refused too: no alignment can score above zero, so
+             * kswv's score2 window divides by a zero maximum (SIGFPE on x86), and
+             * the pairing and mapping-quality formulas (mem_pair's packed score,
+             * raw_mapq) overflow on negative scores, with results that differ by
+             * SIMD tier. The bound also keeps update_a()'s scaled defaults inside
+             * int and their signs unchanged. */
+            int64_t v;
+            if (parse_bounded_i64(optarg, 1, INT8_MAX, &v) != 0) {
+                fprintf(stderr, "ERROR: -A match score must be an integer in 1..%d (got %s): "
+                                "a score of 0 or less leaves nothing to align, and the alignment "
+                                "kernels store it in 8 bits\n",
+                        INT8_MAX, optarg);
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+            opt->a = (int)v;
+            opt0.a = 1;
+        }
+        else if (c == 'B') {
+            /* atoi() maps garbage to 0 and wraps out-of-range tokens; take a
+             * complete int here. The 8-bit range is checked on the effective
+             * value (check_effective_scoring), because -A scales the default. */
+            int64_t v;
+            if (parse_bounded_i64(optarg, INT_MIN, INT_MAX, &v) != 0) {
+                fprintf(stderr, "ERROR: -B mismatch penalty must be an integer (got %s)\n", optarg);
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+            opt->b = (int)v;
+            opt0.b = 1;
+        }
         else if (c == 'T') opt->T = atoi(optarg), opt0.T = 1, assert(opt->T >= INT_MIN && opt->T <= INT_MAX);
-        else if (c == 'U')
-            opt->pen_unpaired = atoi(optarg), opt0.pen_unpaired = 1, assert(opt->pen_unpaired >= INT_MIN && opt->pen_unpaired <= INT_MAX);
+        else if (c == 'U') {
+            /* Paired-end scoring computes `score - pen_unpaired`
+             * (bwamem_pair.cpp), which overflows for a penalty near INT_MIN, and a
+             * negative penalty rewards leaving a pair unpaired. */
+            int64_t v;
+            if (parse_bounded_i64(optarg, 0, INT_MAX, &v) != 0) {
+                fprintf(stderr, "ERROR: -U unpaired penalty must be a non-negative integer in 0..%d (got %s)\n",
+                        INT_MAX, optarg);
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+            opt->pen_unpaired = (int)v;
+            opt0.pen_unpaired = 1;
+        }
         else if (c == 't') {
             /* atoi() silently maps unparseable input to 0 and ignores
              * trailing garbage (e.g. "-t nope" -> 0, "-t 300oops" -> 300), so
@@ -2406,7 +2506,20 @@ int main_mem(int argc, char *argv[])
             opt->max_occ = (int)v;
             opt0.max_occ = 1;
         }
-        else if (c == 'd') opt->zdrop = atoi(optarg), opt0.zdrop = 1;
+        else if (c == 'd') {
+            /* The 8-bit banded extension asserts zdrop >= 0 (bandedSWA.cpp), live
+             * in every build, so a negative -d aborts the run. */
+            int64_t v;
+            if (parse_bounded_i64(optarg, 0, INT_MAX, &v) != 0) {
+                fprintf(stderr, "ERROR: -d z-drop must be a non-negative integer in 0..%d (got %s)\n",
+                        INT_MAX, optarg);
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+            opt->zdrop = (int)v;
+            opt0.zdrop = 1;
+        }
         else if (c == 'v') bwa_verbose = atoi(optarg);
         else if (c == 'j') ignore_alt = 1;
         else if (c == 'r')
@@ -3159,6 +3272,14 @@ int main_mem(int argc, char *argv[])
         }
     } else update_a(opt, &opt0);
 
+    /* Checked here, before the warnings below, which are meant to follow every
+     * rejection; --meth re-checks after its own defaults (see there). */
+    if (check_effective_scoring(opt) != 0) {
+        free(opt);
+        if (out_opened) fclose(aux.fp);
+        return 1;
+    }
+
     /* --fast: one-flag shorthand for the characterized speed levers
      *   -m 10  -y 0  --min-ext-len 30  --smem-dedup
      *   --max-extend-chains 20  --adaptive-band  --extend-mate-concordant
@@ -3337,7 +3458,9 @@ int main_mem(int argc, char *argv[])
      * is never load-bearing for soundness. Report that fallback once, so a run
      * record explains why the skip is not in force. The flag is left set: the
      * driver's own guard (two_wave) is what disables it. Read after every
-     * rejection above and before the --fast preset, like the audit lines. */
+     * rejection above and before the --fast preset, like the audit lines.
+     * -A is now held to 1..127 at parse, so this cannot fire from the command
+     * line; it stays as a cheap report should that bound ever loosen. */
     if (opt->skip_contained_ext && !mem_skip_contained_ext_sound(opt))
         fprintf(stderr, "[W::%s] contained-seed extension skip disabled: -A %d is negative, "
                 "outside the scoring its byte-identity proof covers; running the "
@@ -3520,17 +3643,25 @@ int main_mem(int argc, char *argv[])
         opt->band_cert = 0;
     }
 
+    /* The --meth defaults just applied scale -B (collapsed: 2 * -A, so -A 65
+     * gives 130) and -U by -A as well, so check the effective scoring again
+     * now that every score-derived default is final. */
+    if (opt->meth_mode && check_effective_scoring(opt) != 0) {
+        free(opt);
+        if (out_opened) fclose(aux.fp);
+        return 1;
+    }
+
     /* Under --meth, NM is derived from the scoring matrix (an aligned column
      * is an edit iff the matrix penalizes it; indels always count), so a
      * non-positive -B makes every substitution cell non-negative and silently
      * collapses NM to 0 -- hiding real variants, not just conversions. Refuse
      * it rather than emit output that looks clean because scoring is degenerate.
-     * The bound is `<= 0`, not `== 0`: bwa_fill_scmat stores -b, so a NEGATIVE
-     * -B turns every substitution into a positive reward, which hides real
-     * variants at least as thoroughly as -B 0 does.
-     * The message reports the EFFECTIVE penalty rather than echoing "-B":
-     * update_a() scales b by -A when -B was not given, so `-A 0` reaches b == 0
-     * without the user ever passing -B, and naming -B there would misdirect.
+     * check_effective_scoring() has already refused a negative penalty on every
+     * path, so only -B 0 reaches this; the bound stays `<= 0` so the guard does
+     * not depend on that order (a NEGATIVE -B would reward every substitution,
+     * which hides real variants at least as thoroughly as -B 0 does).
+     * The message reports the EFFECTIVE penalty, like the other scoring checks.
      * The non-meth path keeps the literal comparison and is unaffected. */
     if (opt->meth_mode && opt->b <= 0) {
         fprintf(stderr, "ERROR: --meth requires a positive mismatch penalty, but the "

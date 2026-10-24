@@ -162,15 +162,18 @@ reject_meth() { # $1 = human label, $2... = args before the positional operands
     grep -q 'requires a positive mismatch penalty' badB.err \
         || fail "$label must be rejected by the mismatch-penalty guard, but stderr was: $(cat badB.err)"
 }
-# Explicit -B: bwa_fill_scmat stores -b, so 0 frees every substitution and a
-# negative -B rewards it.
-for badB in 0 -1; do
-    reject_meth "--meth -B $badB" -B "$badB"
-done
-# ...and the -A route, which is why the message reports the EFFECTIVE penalty
-# rather than echoing "-B": update_a() scales b by -A when -B was not given, so
-# -A 0 drives b to 0 without the user ever passing -B.
-reject_meth "--meth -A 0 (b scaled to 0 by update_a)" -A 0
+# Explicit -B 0 frees every substitution: the --meth guard refuses it.
+reject_meth "--meth -B 0" -B 0
+# A negative -B (which would reward every substitution) is refused for every
+# run, --meth or not, by the scoring check that runs before this guard; assert
+# that it is still refused under --meth, by that check.
+rc=0
+"$BWA_MEM3" mem --meth -B -1 -t 1 ref.fa r.fq > /dev/null 2> badB.err || rc=$?
+[ "$rc" -eq 1 ] || fail "--meth -B -1 must be rejected with exit 1, got exit $rc"
+grep -q 'the effective mismatch penalty is -1, outside 0..128' badB.err \
+    || fail "--meth -B -1 must be rejected by the scoring check, but stderr was: $(cat badB.err)"
+# The -A route to b == 0 (update_a scaling the default -B by -A 0) is gone:
+# -A must be at least 1, so a scaled default -B is at least 4.
 
 # ...and the rejection is scoped to --meth: the non-meth path keeps the literal
 # base comparison, where -B 0 only affects placement, never NM/MD truthfulness.

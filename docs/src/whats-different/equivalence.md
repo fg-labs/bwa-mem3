@@ -342,10 +342,10 @@ not yet carry this change.
 
 ## Degenerate numeric inputs (fail-fast, not silent)
 
-Four degenerate command lines that upstream bwa/bwa-mem2 accept but then mishandle
+Five kinds of degenerate command line that upstream bwa/bwa-mem2 accept but then mishandle
 are now rejected at parse; for the first two the underlying divides are also guarded defensively
 ([#460](https://github.com/fg-labs/bwa-mem3/pull/460)).
-All four change behavior **only** on these degenerate inputs; all valid inputs are
+All five change behavior **only** on these degenerate inputs (one exception in the last item, noted there); all valid inputs are
 byte-identical — the full byte-identity suite (the `wgs-5M` / `wes-5M` / `hic-1M`
 alignment-record streams on x86 with the `c6a`/`c8g` cross-architecture check
 described above, plus the CI record-level phiX paired-end regression on the
@@ -383,6 +383,31 @@ non-degenerate input:
   `-w` now requires an integer in `0..536870911` (`-w 0` stays valid), the
   bound being where the widest band arithmetic, `w << 2`, would overflow `int`
   ([#630](https://github.com/fg-labs/bwa-mem3/pull/630)).
+- **A scoring the kernels cannot carry** ([#634](https://github.com/fg-labs/bwa-mem3/pull/634)): upstream parses `-A`,
+  `-B`, `-d` and `-U` with `atoi` and never range-checks them. The match score
+  and the negated mismatch penalty are stored in `int8_t` (the scoring matrix,
+  the mate-rescue kernels), so `-A 128` wraps to -128, and `-A 256` (or any
+  scoring that wraps the maximum substitution score to 0) makes the AVX-512BW
+  mate-rescue kernel divide by zero (SIGFPE); `-A 127` alone scales the default
+  `-B` to 508, which wraps to a positive mismatch score. A negative `-d`, or a
+  negative `-A` that scales the default z-drop below zero, aborts on the 8-bit
+  extension kernel's `zdrop >= 0` assertion. An `-O` + `-E` sum of 2^29 or more
+  overflows `int` in the global alignment that builds CIGARs, and a `-U` near
+  `INT_MIN` overflows the pairing score. A match score of 0 or less, or a
+  negative mismatch penalty, is not computed consistently either: measured on
+  200k WGS pairs on AMD Zen 4 (AVX2 and AVX-512BW) and AWS Graviton 4 (NEON),
+  `-A 0` with its penalties given died with SIGFPE on both x86 tiers (the
+  mate-rescue kernel divides by the maximum substitution score), and `-A -1`,
+  `-B -4` and `-B -127` each gave a different set of records on at least one
+  tier, with undefined-behaviour overflows in the pairing score and the
+  mapping-quality computation. `-A` must now be an integer in 1..127; the
+  effective (post-`-A`-scaling) mismatch penalty must be in 0..128; `-d` and
+  `-U` must be non-negative; the effective gap open + extension sum must be at
+  most 2^29 - 1. Each refusal reports the effective value and the options
+  behind it. Every newly refused scoring crashed, wrapped, overflowed or gave
+  tier-dependent output before, with one exception that ran consistently: a
+  negative `-U` (a bonus for leaving a pair unpaired, which the pairing code
+  does not expect).
 
 ## What is preserved
 

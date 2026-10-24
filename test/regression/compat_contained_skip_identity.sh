@@ -28,11 +28,10 @@
 #      sent to the second batch) must be > 0; every --keep-contained-ext run
 #      must defer nothing. A fixture that never defers, or never extends, a
 #      seed would make (1) vacuous for that half.
-#   3. The proof envelope is enforced by the extension driver and reported: a
-#      negative match score (-A -1, the one scoring where cal_max_gap is not
-#      non-decreasing) prints the `contained-seed extension skip disabled`
-#      notice and defers nothing although the flag stays set; -A 0 is inside
-#      the envelope, defers seeds and prints no notice.
+#   3. The proof envelope (a >= 0) cannot be left from the CLI: main_mem
+#      refuses -A outside 1..127, so the old -A -1 (outside) and -A 0 (inside)
+#      legs are now parse refusals. The predicate itself is unit-tested in
+#      test/unit/test_skip_contained_envelope.cpp.
 #
 # Fixture (deterministic, no PRNG): a two-contig reference -- the committed
 # phix.fa as contig 0, and a contig assembled from phix slices in which short
@@ -226,29 +225,25 @@ done
 [[ $total_extended -gt 0 ]] || fail "no deferred seed was ever extended -- the second batch was never run"
 ok "skip exercised under --compat: purged=$total_purged extended=$total_extended"
 
-# --- Proof envelope: outside it the driver disables the skip and says so. -----
-# A negative -A scales every penalty the command line leaves unset (-B, -E, -d,
-# -L, -U ...) by -A, which makes the z-drop negative and aborts the extension
-# kernel on both paths, so the penalties are pinned explicitly here. -A -1 is
-# outside the envelope; -A 0 is inside it. main_mem only reports: the flag
-# stays set, so "deferred nothing" is the driver's own guard at work.
+# --- Proof envelope: unreachable from the CLI. --------------------------------
+# The envelope (mem_skip_contained_ext_sound: a >= 0) used to be exercised here
+# with -A -1 (outside) and -A 0 (inside). main_mem now refuses -A outside
+# 1..127, so every scoring the CLI accepts is inside the envelope: the -A 2
+# legs above already show the skip deferring seeds and matching the reference
+# path at a non-default match score. The predicate's boundary is pinned by
+# test/unit/test_skip_contained_envelope.cpp, and the refusals by
+# arg_range_validation.sh. Check here only that the old legs are refused before
+# any alignment runs.
 envelope=(-B 4 -O 6 -E 1 -d 100 -L 5 -U 17)
-run "env_out" se 1 --compat=bwa-mem2 -A -1 "${envelope[@]}"
-grep -q 'contained-seed extension skip disabled' "$W/env_out.err" \
-    || fail "-A -1: expected the skip-disabled notice"
-od=$(counter "$W/env_out.err" deferred)
-[[ $od -eq 0 ]] || fail "-A -1: $od seeds were deferred outside the proof envelope"
-run "env_out_keep" se 1 --compat=bwa-mem2 -A -1 "${envelope[@]}" --keep-contained-ext
-cmp -s "$W/env_out.sam" "$W/env_out_keep.sam" \
-    || fail "-A -1: disabled skip != --keep-contained-ext"
-run "env_in" se 1 --compat=bwa-mem2 -A 0 "${envelope[@]}"
-grep -q 'contained-seed extension skip disabled' "$W/env_in.err" \
-    && fail "-A 0 (inside the envelope) must not disable the skip"
-id=$(counter "$W/env_in.err" deferred)
-[[ $id -gt 0 ]] || fail "-A 0: inside the envelope, yet no seed was deferred"
-run "env_in_keep" se 1 --compat=bwa-mem2 -A 0 "${envelope[@]}" --keep-contained-ext
-cmp -s "$W/env_in.sam" "$W/env_in_keep.sam" || fail "-A 0: skip != --keep-contained-ext"
-ok "proof envelope enforced by the driver and reported (-A -1 disabled, -A 0 kept)"
+for badA in -1 0; do
+    rc=0
+    "$BWA_MEM3" mem --compat=bwa-mem2 -A "$badA" "${envelope[@]}" -t 1 "$W/ref.fa" "$se" \
+        > "$W/env_$badA.sam" 2> "$W/env_$badA.err" || rc=$?
+    [[ $rc -eq 1 ]] || fail "-A $badA: expected exit 1 (refused at parse), got $rc"
+    grep -q 'ERROR: -A match score must be an integer in 1..127' "$W/env_$badA.err" \
+        || fail "-A $badA: expected the -A range refusal, got: $(cat "$W/env_$badA.err")"
+done
+ok "scorings outside the proof envelope are refused at parse (-A -1, -A 0)"
 
 # --- Record-count sanity. -----------------------------------------------------
 rc=0
