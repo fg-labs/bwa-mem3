@@ -1,10 +1,26 @@
 name: CI
 
 on:
+  # Every change reaches main through the merge queue, whose merge_group run
+  # tests the exact commit that then lands, so a full run on the push to main
+  # would test the same commit twice. On push only the coverage job runs (it
+  # gives Codecov the main baseline PR diffs compare against); every other job
+  # carries `if: github.event_name != 'push'`.
   push:
     branches: [main]
   pull_request:
   merge_group:
+
+# A new push to a pull request's branch cancels that PR's run still in
+# progress: the older commit's results are moot, and its remaining jobs are
+# compute spent for nothing. Only pull_request runs share a group. Every
+# merge_group and push run gets its own (keyed on run_id), so none is ever
+# cancelled or held back: each merge-queue entry must report on its own
+# commit, and each push to main saves that commit's coverage baseline and
+# caches.
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('ci-pr-{0}', github.event.pull_request.number) || format('ci-run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Least-privilege GITHUB_TOKEN. Without this block the token inherits the
 # repository default, which -- depending on the org/repo setting -- can be
@@ -31,6 +47,7 @@ jobs:
   # matrix row, and so it reports in seconds instead of after a full build.
   ndebug-gate-lint:
     name: NDEBUG gate lint (src/)
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     # Source-only lint that reports in seconds; a generous ceiling so only a
     # genuinely hung runner trips it, never a slow-but-normal one.
@@ -52,6 +69,7 @@ jobs:
 
   avx2-floor-lint:
     name: AVX2 floor (pre-AVX2 x86 refused)
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     # The pre-AVX2 x86 tiers (sse41/sse42/avx) were retired with the scalar
     # mate-rescue path: batched kswv requires AVX2+, and a sub-AVX2 build would
@@ -150,6 +168,7 @@ jobs:
   # reads as "the opt-in macro list drifted" rather than as an NDEBUG finding.
   debug-macro-flag-lint:
     name: Opt-in debug macro list (ci.yml <-> src/)
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     # Source-only lint, seconds of work; ceiling catches a hung runner only.
     timeout-minutes: 10
@@ -175,6 +194,7 @@ jobs:
   # wiring is checked statically instead.
   calloc-interpose-flag-lint:
     name: Calloc-interposing tests build with -fno-builtin-malloc
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     # Source-only lint, seconds of work; ceiling catches a hung runner only.
     timeout-minutes: 10
@@ -197,6 +217,7 @@ jobs:
   # rather than being buried in a matrix row. Runs in seconds.
   shell-lint:
     name: Shell lint (shellcheck + shfmt)
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     # Downloads two small pinned tools then lints; well under a minute normally.
     timeout-minutes: 10
@@ -261,6 +282,7 @@ jobs:
   # failure reads as "a regression script runs nowhere" on its own line.
   regression-coverage-lint:
     name: Regression scripts are run by CI
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     # Source-only lint, seconds of work; ceiling catches a hung runner only.
     timeout-minutes: 10
@@ -280,6 +302,7 @@ jobs:
   # went stale" rather than as a finding about src/.
   readme-contract-lint:
     name: Regression README contract (README <-> test/regression/)
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     # Source-only lint, seconds of work; ceiling catches a hung runner only.
     timeout-minutes: 10
@@ -302,6 +325,7 @@ jobs:
   # docs went stale" rather than as a build or test finding.
   rescue-docs-lint:
     name: Rescue developer docs (pages, knob list <-> src/)
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     # Source-only lint, seconds of work; ceiling catches a hung runner only.
     timeout-minutes: 10
@@ -389,6 +413,7 @@ jobs:
             artifact_slug: "linux-x86_64-avx2-gcc-compat"
 
     name: ${{ matrix.name }}
+    if: github.event_name != 'push'
     runs-on: ${{ matrix.os }}
     # Heaviest job here: the canonical row runs the full regression suite on
     # top of the mimalloc build plus reference download/index. Normal rows
@@ -1813,6 +1838,7 @@ jobs:
   # so the arch/compiler/mimalloc values below are that row's, spelled out.
   rebuild-variants:
     name: Rebuild variants (debug macros, SIMD floor, ASAN)
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     # Three builds plus the chr22 fixture and parity, a few minutes normally.
     # Ceiling catches a hung runner only.
@@ -2054,6 +2080,7 @@ jobs:
   # IN main.
   msan-padded-lane-gate:
     name: MSan padded-lane gate (banded-SW)
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     # One instrumented build of the kernel + a single fast run. Ceiling catches
     # a hung runner only.
@@ -2110,6 +2137,7 @@ jobs:
   # the stage_prof unit test) so the opt-in path cannot silently bit-rot.
   profiling-build:
     name: Profiling build (STAGE_PROF=1)
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     # Single instrumented build plus a small unit test and one regression.
     timeout-minutes: 20
