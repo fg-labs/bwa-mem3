@@ -7,6 +7,19 @@ on:
   # gives Codecov the main baseline PR diffs compare against) and warm-caches
   # (it saves the compiler caches PR and merge-queue runs restore); every other
   # job carries `if: github.event_name != 'push'`.
+  #
+  # Two depths, decided once by .github/scripts/ci-depth.sh and read by the
+  # steps as CI_DEPTH. The merge_group run is always full: what lands is
+  # checked at full depth. A pull_request run, repeated on every push to the
+  # branch, is light unless its diff touches the SIMD kernels, their harnesses
+  # or tests, the build files, the compiler install or this workflow, in which
+  # case it is full too, since that is the PR the deep checks exist for. Light
+  # trims only the kernels' deep safety nets: the rescue kernel sweeps run at
+  # their reduced job counts on every row, the canonical row skips the
+  # AVX-512BW kswv unit tree, and the MSan padded-lane gate (not a required
+  # check) does not run. Every other job and step runs at both depths, so the
+  # required checks report as before; the script falls back to full whenever it
+  # cannot tell.
   push:
     branches: [main]
   pull_request:
@@ -355,6 +368,30 @@ jobs:
       - name: Rescue docs match the source (pages, knob list, gates)
         run: bash test/regression/rescue_docs_lint.sh
 
+  # The run's CI depth (see the top of the file) as a job output, for the jobs
+  # that skip whole on a light PR run and so must know before they start (the
+  # MSan gate). build-and-test runs the same script as its own first step
+  # instead of waiting on this job, which would delay every row. Seconds of
+  # work: a depth-1 checkout and, on a PR, a depth-1 fetch of the base commit.
+  ci-depth:
+    name: CI depth (full in the merge queue, light on most PRs)
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      depth: ${{ steps.depth.outputs.depth }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Decide the CI depth
+        id: depth
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: bash .github/scripts/ci-depth.sh
+
   build-and-test:
     strategy:
       fail-fast: false
@@ -363,14 +400,17 @@ jobs:
       # safe and free of spaces / parens; job titles still use `name`.
       # `kernel_sweep: "full"` marks the rows that run the rescue
       # kernel-equivalence sweeps (rescue_prune_eq, rescue_band_harness) at
-      # their full job counts: one per SIMD family and compiler family -- the
-      # canonical row (AVX2, clang-19), Linux ARM64 (NEON, clang-19) and gcc
-      # compat (AVX2, g++, whose codegen of the same kernels differs). The
-      # no-mimalloc and single-binary rows build the same AVX2 kernels with the
-      # same clang-19, and macOS the same NEON kernels with Apple clang; they
-      # run every configuration at about a fifth of the jobs (see those steps),
-      # which keeps each configuration's per-batch draws and vacuity checks but
-      # reaches fewer of RB_SCORING=random's scoring categories.
+      # their full job counts on a full-depth run (CI_DEPTH, see the top of the
+      # file): one per SIMD family and compiler family -- the canonical row
+      # (AVX2, clang-19), Linux ARM64 (NEON, clang-19) and gcc compat (AVX2,
+      # g++, whose codegen of the same kernels differs). The no-mimalloc and
+      # single-binary rows build the same AVX2 kernels with the same clang-19,
+      # and macOS the same NEON kernels with Apple clang; they, and every row
+      # on a light PR run, run every configuration at about a fifth of the jobs
+      # (see those steps), which keeps each configuration's per-batch draws and
+      # vacuity checks but reaches fewer of RB_SCORING=random's scoring
+      # categories. The "Kernel sweep depth" step resolves the two into
+      # KERNEL_SWEEP for the sweep steps.
       matrix:
         include:
           - os: ubuntu-latest
@@ -474,6 +514,24 @@ jobs:
           # below already set this; all four checkouts now agree.
           persist-credentials: false
           submodules: recursive
+
+      # Sets CI_DEPTH for the rest of the job (see the top of the file).
+      - name: CI depth
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: bash .github/scripts/ci-depth.sh
+
+      # The rescue kernel sweeps' depth, resolved once for both sweep steps:
+      # full only on a full-depth run of a kernel_sweep "full" row, reduced
+      # otherwise. Those steps treat an unset KERNEL_SWEEP as full, so losing
+      # this step (or the one above) costs time, never depth.
+      - name: Kernel sweep depth
+        env:
+          MATRIX_KERNEL_SWEEP: ${{ matrix.kernel_sweep || 'reduced' }}
+        run: |
+          if [ "$MATRIX_KERNEL_SWEEP" = full ] && [ "${CI_DEPTH:-full}" != light ]; then sweep=full; else sweep=reduced; fi
+          echo "kernel sweep: $sweep (row: $MATRIX_KERNEL_SWEEP, CI depth: ${CI_DEPTH:-unset})"
+          echo "KERNEL_SWEEP=$sweep" >> "$GITHUB_ENV"
 
       - name: Install dependencies (Linux)
         if: runner.os == 'Linux'
@@ -1040,12 +1098,20 @@ jobs:
       # BWA3_RESCUE_USQADD selects) run in no unit test there. Where the runner
       # has AVX-512BW, build the unit binary at that tier in a copy of the tree
       # (its objects must not replace the AVX2 ones the later steps use) and run
-      # the kswv suite; elsewhere report SKIP.
+      # the kswv suite; elsewhere report SKIP. A light PR run (CI_DEPTH, see the
+      # top of the file) reports SKIP too: the second tree is a minute of
+      # compile on the row that sets the workflow's wall time, and these bodies
+      # change only on the kernel paths that make a PR run full. The merge
+      # queue always runs it.
       - name: kswv unit tests at the AVX-512BW tier (where the runner has it)
         if: matrix.canonical == true
         env:
           MATRIX_USE_MIMALLOC: ${{ matrix.use_mimalloc }}
         run: |
+          if [ "${CI_DEPTH:-full}" = light ]; then
+            echo "SKIP: light PR run (no kernel path changed); the merge queue runs the kswv, lane-compaction and z-drop gate unit tests at the avx512bw tier"
+            exit 0
+          fi
           if ! grep -qw avx512bw /proc/cpuinfo; then
             echo "SKIP: runner has no AVX-512BW; the kswv, lane-compaction and z-drop gate unit tests did not run at the avx512bw tier"
             exit 0
@@ -1183,19 +1249,19 @@ jobs:
       # also compiled at AVX-512BW, header-only and outside the Makefile so
       # nothing already built changes, and run where the runner has AVX-512BW
       # (reported SKIP: elsewhere). About 6 s for 100000 jobs on an Apple
-      # M-series core; real-data dumps are manual. The rows with the full kernel
-      # sweep (matrix.kernel_sweep) fuzz 100000 jobs, the others 20000, the
-      # fewest at which the check still requires jobs at every K from 6 to 8. On
-      # x86 the avx2 and avx512bw fuzz runs go side by side, each to its own
-      # log, printed once both finish. The negative control runs first: it
-      # shifts one scalar field on one job, and the check must report it as a
-      # MISMATCH and exit 1, so a comparison that stopped biting fails here.
+      # M-series core; real-data dumps are manual. With the full kernel sweep
+      # (KERNEL_SWEEP: a kernel_sweep "full" row on a full-depth run) it fuzzes
+      # 100000 jobs, otherwise 20000, the fewest at which the check still
+      # requires jobs at every K from 6 to 8. On x86 the avx2 and avx512bw fuzz
+      # runs go side by side, each to its own log, printed once both finish.
+      # The negative control runs first: it shifts one scalar field on one job,
+      # and the check must report it as a MISMATCH and exit 1, so a comparison
+      # that stopped biting fails here.
       - name: SIMD rescue filter == scalar filter (rescue_prune_eq, generated jobs)
         env:
           MATRIX_ARCH_FLAG: ${{ matrix.arch_flag }}
           MATRIX_BASELINE_ARCH: ${{ matrix.baseline_arch || 'avx2' }}
           MATRIX_USE_MIMALLOC: ${{ matrix.use_mimalloc }}
-          MATRIX_KERNEL_SWEEP: ${{ matrix.kernel_sweep || 'reduced' }}
         run: |
           if [ "$MATRIX_ARCH_FLAG" = "" ]; then arch="$MATRIX_BASELINE_ARCH"; else arch="$MATRIX_ARCH_FLAG"; fi
           make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)" rescue-prune-eq \
@@ -1204,7 +1270,7 @@ jobs:
             cat rpe_nc.log; echo "::error::negative control exited 0: the check missed an injected disagreement"; exit 1
           fi
           grep -q 'MISMATCHES=[1-9]' rpe_nc.log || { cat rpe_nc.log; echo "::error::negative control failed without reporting a MISMATCH"; exit 1; }
-          if [ "$MATRIX_KERNEL_SWEEP" = full ]; then njobs=100000; else njobs=20000; fi
+          if [ "${KERNEL_SWEEP:-full}" = full ]; then njobs=100000; else njobs=20000; fi
           ./rescue_prune_eq fuzz "$njobs" 1 > rpe_fuzz.log 2>&1 &
           fuzz_pid=$!
           rc512=skip
@@ -1279,9 +1345,10 @@ jobs:
       # (BWA3_RESCUE_BAND_P1_EXACT=0), instead of by exact width. The
       # trailing argument is the job generator's seed. Run 1 is 100000 jobs,
       # runs 2-11 30000, runs 12-16 10000, run 17 30000, runs 18-29 10000 and
-      # run 30 30000 on the rows with the full kernel sweep
-      # (matrix.kernel_sweep); every other row runs the same thirty at a fifth
-      # of those counts, but at least two of the harness's 2048-job batches
+      # run 30 30000 with the full kernel sweep (KERNEL_SWEEP: a kernel_sweep
+      # "full" row on a full-depth run); every other row, and every row on a
+      # light PR run, runs the same thirty at a fifth of those counts, but at
+      # least two of the harness's 2048-job batches
       # (4096 jobs), so a run that draws its scoring, matrix or K cap per batch
       # draws more than once and a random scoring under RB_KMAX reaches its
       # first K > 5 draw (the second batch), and at least three (6144) under
@@ -1296,7 +1363,6 @@ jobs:
           MATRIX_ARCH_FLAG: ${{ matrix.arch_flag }}
           MATRIX_BASELINE_ARCH: ${{ matrix.baseline_arch || 'avx2' }}
           MATRIX_USE_MIMALLOC: ${{ matrix.use_mimalloc }}
-          MATRIX_KERNEL_SWEEP: ${{ matrix.kernel_sweep || 'reduced' }}
         run: |
           if [ "$MATRIX_ARCH_FLAG" = "" ]; then arch="$MATRIX_BASELINE_ARCH"; else arch="$MATRIX_ARCH_FLAG"; fi
           make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)" rescue-band-harness \
@@ -1373,7 +1439,7 @@ jobs:
           # Without the full kernel sweep, each run keeps its configuration and
           # seed and takes a fifth of its jobs, at least two batches, or three
           # under RB_METH=random (see above).
-          if [ "$MATRIX_KERNEL_SWEEP" != full ]; then
+          if [ "${KERNEL_SWEEP:-full}" != full ]; then
             while read -r line; do
               seed="${line##* }"; rest="${line% *}"; n="${rest##* }"
               case "$line" in *RB_METH=random*) floor=6144 ;; *) floor=4096 ;; esac
@@ -2212,9 +2278,16 @@ jobs:
   # it and the fixes merge, then it flips to a hard gate. FLIP TO A HARD GATE
   # (delete `continue-on-error`) ONCE THE PADDED-LANE INITIALIZATION FIXES ARE
   # IN main.
+  #
+  # Full-depth runs only (ci-depth, see the top of the file): the merge queue,
+  # and PRs that touch the kernels or this test. A light PR skips the job,
+  # which is not a required check. `!cancelled()` keeps it running when
+  # ci-depth itself fails (its output is then empty, which is not 'light'), so
+  # a broken depth job costs time, never the gate.
   msan-padded-lane-gate:
     name: MSan padded-lane gate (banded-SW)
-    if: github.event_name != 'push'
+    needs: ci-depth
+    if: ${{ !cancelled() && github.event_name != 'push' && needs.ci-depth.outputs.depth != 'light' }}
     runs-on: ubuntu-latest
     # One instrumented build of the kernel + a single fast run. Ceiling catches
     # a hung runner only.
