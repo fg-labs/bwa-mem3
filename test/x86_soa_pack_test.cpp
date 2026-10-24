@@ -99,7 +99,7 @@ struct Params {
 // remapped) and remapFrom equal to remapTo with a distinct padA/padB pair.
 const Params kParams[] = {
     {"rescue reference (0xFF pad, no remap)", 0xFF, 0xFF, false, 4, 4, true, false},
-    {"rescue query (DUMMY5 to quantum, 0xFF after, N -> 8)", 5, 0xFF, true, 4, 8, false, true},
+    {"rescue query (X86_QPAD8 to quantum, 0xFF after, N -> 8)", 6, 0xFF, true, 4, 8, false, true},
     {"extension reference (DUMMY1 pad, N stays 4)", 99, 99, false, 4, 8, true, false},
     {"extension query (DUMMY2 pad, N -> 8)", 100, 100, true, 4, 8, true, false},
     {"pad byte equal to remapFrom", 4, 4, true, 4, 8, false, false},

@@ -709,6 +709,46 @@ byte-identical by construction. On Linux arm64 the kernel instructions are uncha
 runner has it) and by the lean-versus-original cases of
 `test/unit/test_bandedswa_row_lean.cpp`, which now also run on macOS against the Apple gate.
 
+## x86 `kswv` scored a `-` query base by its SIMD lane group (PR #636)
+
+`nst_nt4_table` encodes a FASTQ `-` as 5, and `matesw_orient` passes a forward-oriented mate's
+codes to the mate-rescue kernels unchanged (a reverse-oriented mate maps every code of 4 or more
+to `N`), so a `-` reaches `kswv` as query code 5. The AVX2 and AVX-512BW 8-bit kernels padded
+each lane's query tail, `[len2, quantum)`, with `DUMMY5 = 5` too, and since [PR #324](https://github.com/fg-labs/bwa-mem3/pull/324) they run
+the "is this the pad?" compare and blend only from the group's `jdummy` column on: the first column at which any lane of the group pads, which depends on the other
+lanes' query lengths. A `-` left of `jdummy` was scored from the substitution table (`w_ambig`
+against A/C/G/T), and one at or right of it as pad (a zero delta). Which of the two a given `-`
+got depended on which rescue jobs shared its group, and so on the input order, the batch
+boundaries, without `-K` the thread count, and the x86 tier. The NEON kernel pads with
+`NEON_QPAD8 = 16`, which no query byte can take, and always table-scored the `-`. Separately,
+the AVX-512BW 16-bit kernel's score table held 0 at the entries only a `-` query base reaches,
+where the AVX2 and NEON 16-bit tables hold `w_ambig`.
+
+The x86 8-bit kernels now pad with `X86_QPAD8 = 6`, which no query byte can take, so the pad
+test still cannot fire left of `jdummy` and a `-` is table-scored at every column, as on NEON.
+The AVX-512BW 16-bit table is built like the AVX2 and NEON ones. A `-` in a forward-oriented
+rescued mate now scores the same in every lane group, and the AVX2, AVX-512BW and NEON
+`kswv` kernels, 8- and 16-bit, all score it `w_ambig` against a reference A/C/G/T. Against a reference `N` the 8- and
+16-bit kernels still disagree: the 8-bit codes give `5 ^ 4 = 1`, which reads `w_mismatch` on
+every architecture, before this fix as after it, and the 16-bit codes give `5 ^ 15 = 10`, which
+read `w_ambig` on AVX2 and NEON before this fix and on every tier after it (the AVX-512BW 16-bit
+table held 0 at entry 10, which this fix changes to `w_ambig`). The 8-bit case is left to
+[#639](https://github.com/fg-labs/bwa-mem3/pull/639), which reads a `-` as `N` everywhere. With #639 in place no query byte reaches `kswv` as 5, so this fix changes no output there; it
+stays as hardening that keeps the `jdummy` elision's precondition true for every query byte. Without
+#639, the fix can change the rescue score, and through it whether the rescue succeeds, the rescued
+record's `AS`, the pairing and `MAPQ`, on x86 only. For every other input the `kswv` results are byte-identical by construction: the pad
+occupies the same columns as before and only the value marking it changed, and the 16-bit table
+entries that changed are reached only by a `-` query base or on a reference pad row, where any
+value at or below 0 gives the same bytes. bwa-mem2 v2.2.1 runs the pad test on every column, so
+it always scores a `-` as pad on x86; bwa-mem3 did not reproduce that before either (only in
+groups whose `jdummy` was left of the `-`), and the fix applies under both `--compat` targets.
+Pinned by `test/unit/test_kswv_dash_query.cpp`, which runs `getScores8` and `getScores16` on a
+mate with a `-` at column 50, in whole groups with and without a lane that pads from column 20,
+and compares each lane's `kswr_t` score fields (`score`, `te`, `qe`, `score2`, `te2`) with
+scalar `ksw_align2` over a matrix whose `-` column is `w_ambig`. It checks only those `kswv`
+score fields, not mate orientation, rescue selection or the resulting records; the 8-bit case fails on the AVX2 and
+AVX-512BW tiers without the fix, and the 16-bit case on AVX-512BW.
+
 ## Upstream port divergences: all chains dropped by the weight filter (PR #489) and the SA sentinel offset (PR #469)
 
 bwa-mem2 advertises output identical to bwa. Two records are known where its port is not
@@ -758,6 +798,7 @@ shipped, because parity with that release is its contract (see
 | `--meth` mate rescued off a reverse-strand anchor took the other strand | [#553](https://github.com/fg-labs/bwa-mem3/pull/553) | — | fork-only (`--meth` paired-end only, every chemistry; a mate rescued in a window on the reverse half gets its own `XG`/`XM` and a CIGAR/`NM` that no longer count its conversions (`MD` follows the CIGAR), where an indel can move and shift `POS`; its locus, `AS` and `XS` are unchanged, as is `MAPQ` unless `--chimera-qc` caps it on the regenerated CIGAR, its anchor changes only in `MC`/`PNEXT`/`TLEN`, a rescued alt hit in `XA:Z` can change, and `--set-as-failed`/`--chimera-qc` can flip the pair's `0x200`/`0x2`; every other record is byte-identical by construction — see the correctness note above) |
 | Banded-SW extension results depended on their SIMD lane group | [#565](https://github.com/fg-labs/bwa-mem3/pull/565) | — | fork-only, also under `--compat` (bwa-mem2 v2.2.1 has the same coupling; reachable only on highly divergent pairs, and no record changed on the WGS and WES sets measured — see the correctness note above) |
 | 8-bit banded-SW z-drop gates at huge gap extends | [#579](https://github.com/fg-labs/bwa-mem3/pull/579) | — | fork-only (`-E` above 493447 only, where Apple silicon and the AVX2 / AVX-512BW tiers could report a longer extension than the other kernels; default output byte-identical by construction — see the correctness note above) |
+| x86 `kswv` scored a `-` query base by its SIMD lane group | [#636](https://github.com/fg-labs/bwa-mem3/pull/636) | — | fork-only, also under `--compat` (x86 only, forward-oriented rescued mates containing `-`; now scored as on NEON and independent of batching; every other input's `kswv` results byte-identical by construction) |
 | kseq2bseq1 zero-initialization | [#22](https://github.com/fg-labs/bwa-mem3/pull/22) | — | fork-only |
 | Proper-pair flag from emitted alignment | [#17](https://github.com/fg-labs/bwa-mem3/pull/17) | — | fork-only, **opt-in** (`--proper-pair-from-emitted`; default matches both upstreams, [#362](https://github.com/fg-labs/bwa-mem3/issues/362)) |
 | All chains dropped by the weight filter: default follows bwa | [#489](https://github.com/fg-labs/bwa-mem3/pull/489) | — ([#310](https://github.com/fg-labs/bwa-mem3/issues/310)) | fork-only; `--compat=bwa-mem2` reproduces bwa-mem2 |

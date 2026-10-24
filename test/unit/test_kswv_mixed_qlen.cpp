@@ -2,7 +2,7 @@
 //
 // kswv::getScores8 vs scalar ksw_align2 on MIXED-QUERY-LENGTH batches.
 //
-// kswvBatchWrapper8 pads each lane's query with DUMMY5 up to that lane's own
+// kswvBatchWrapper8 pads each lane's query with the query pad code up to that lane's own
 // 16-base quantum, then fills every column from there to the group's widest
 // quantum with 0xFF -- the same high-bit sentinel used for reference rows past
 // len1. The kernel must therefore zero the DP diagonal term wherever bit 7 is
