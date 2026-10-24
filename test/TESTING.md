@@ -71,7 +71,7 @@ The chr22 scripts are the expensive end: they want a chr22 reference indexed for
 
 ## Running tests in CI
 
-- **ci.yml** runs unit tests on every matrix row, integration tests on the four widened canonical rows, and regression tests on the canonical AVX2 row — except `chr22_parity.sh`, which runs on every row; the checks that need a differently-configured build of that row (debug macros, `TESTING_BUILD`, ASAN), which run in the `rebuild-variants` job alongside the matrix; and the source-only lints, which run in their own jobs alongside the build matrix (they need no binary, so they do not wait on it).
+- **ci.yml** runs unit tests on every matrix row, integration tests on the four widened canonical rows, and regression tests on the canonical AVX2 configuration — split between the canonical matrix row (the scripts that need its built tree, such as the Makefile checks) and the `canonical-regressions` job, which builds the same binary alongside the matrix and runs the ones that need only the binary and fixtures — except `chr22_parity.sh`, which runs on every row; the checks that need a differently-configured build of that row (debug macros, `TESTING_BUILD`, ASAN), which run in the `rebuild-variants` job alongside the matrix; and the source-only lints, which run in their own jobs alongside the build matrix (they need no binary, so they do not wait on it).
 - JUnit artifacts are uploaded per row (`unit-results-<name>-shard<k>.xml`, one per unit-test shard, and `integration-results-<name>.xml`). Download them from a failed run's Actions page to see fine-grained assertion output.
 - **proto-neon-kswv.yml** runs `./test/bwa_mem3_tests_unit --test-suite="unit/kswv"` on proto branches.
 
@@ -139,7 +139,7 @@ Write a standalone bash script in `test/regression/<name>.sh`:
 - Document required env-var inputs in the comment block.
 - Emit `PASS:` / `FAIL:` lines; exit nonzero on failure.
 - Add a row to `test/regression/README.md`.
-- Wire it into `.github/workflows/ci.yml` with the appropriate `if: matrix.canonical == true` gate.
+- Wire it into `.github/workflows/ci.yml`: a script that needs only the built `bwa-mem3` and fixtures goes in the `canonical-regressions` job; one that needs the canonical row's built tree goes in `build-and-test` with the `if: matrix.canonical == true` gate.
 
 Choose regression over integration when:
 - The test shells out to bwa-mem3 (or any other binary) as a process.

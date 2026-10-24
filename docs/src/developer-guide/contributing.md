@@ -121,7 +121,7 @@ CI runs on every PR and on push to `main`. The matrix covers:
 | `arm64-linux` | aarch64 | NEON | Ubuntu ARM |
 | `arm64-macos` | arm64 | NEON | macOS |
 
-The canonical row (`avx2`) is the only one that runs regression tests (shell scripts in `test/regression/`). Unit tests run on every row. Integration tests run on the four widened canonical rows (SSE4.1, AVX2, ARM64 Linux, macOS ARM).
+Regression tests (shell scripts in `test/regression/`) run on the canonical `avx2` configuration only: the canonical row runs the ones that need its built tree, and the `canonical-regressions` job, which builds the same binary alongside the matrix, runs the rest. Unit tests run on every row. Integration tests run on the four widened canonical rows (SSE4.1, AVX2, ARM64 Linux, macOS ARM).
 
 Alongside the matrix, three source-only lint jobs run without a toolchain and report in seconds: the NDEBUG gate lint, the opt-in debug macro list, and [shell lint](#shell-scripts).
 
