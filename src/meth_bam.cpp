@@ -462,10 +462,9 @@ int meth_mem_aln_to_bam(bam1_t *b,
             } else {
                 for (size_t i = 0; i < l_emit; ++i) {
                     unsigned char c = (unsigned char)orig_seq[qe - 1 - (int)i];
-                    /* nst_nt4_table maps '-' to 5, which indexes the literal's
-                     * NUL terminator (in bounds, but emits '\0' into SEQ --
-                     * corrupt output, not an OOB read); clamp anything >=4 to N.
-                     * Byte-identical for A/C/G/T/N. */
+                    /* nst_nt4_table maps every non-ACGT byte to 4 ('-' once
+                     * mapped to 5 and emitted the literal's NUL terminator into
+                     * SEQ); the clamp keeps any code >= 4 on N regardless. */
                     int bi = nst_nt4_table[c];
                     seq_text[i] = "TGCAN"[bi < 4 ? bi : 4];
                 }

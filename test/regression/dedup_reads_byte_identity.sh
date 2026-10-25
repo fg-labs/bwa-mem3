@@ -52,13 +52,11 @@ mangle() { # <in.fq> <out.fq> : lowercase bases 10-15, set bases 50 & 52 to N
 mangle "$W/dup_1.fq" "$W/nlow_1.fq" || fail "generate N/lowercase R1"
 mangle "$W/dup_2.fq" "$W/nlow_2.fq" || fail "generate N/lowercase R2"
 
-# '-' fixture: the 2-bit conversion is not idempotent ('-' -> 5, and a second
-# pass maps 5 -> 4, i.e. N), so each read must be converted exactly once: DUPs in
-# worker_bwt_memo, REPs in kernel1. The SAM encoder prints 4 and 5 alike, so
-# this end-to-end check cannot see a second conversion; the encoded bytes are
-# asserted in test/unit/test_read_memo.cpp (the helper) and by the
-# CHECK_BASES run below (the armed seed stage itself). Same
-# uniform, deterministic mangle as above, so the repeats stay duplicate pairs.
+# '-' fixture: a non-ACGT byte that encodes as N (4). Each read must be
+# converted exactly once (DUPs in worker_bwt_memo, REPs in kernel1); the encoded
+# bytes are asserted in test/unit/test_read_memo.cpp (the helper) and by the
+# CHECK_BASES run below (the armed seed stage itself). Same uniform,
+# deterministic mangle as above, so the repeats stay duplicate pairs.
 dash() { # <in.fq> <out.fq> : set base 30 to '-'
     awk 'NR % 4 == 2 { print substr($0, 1, 29) "-" substr($0, 31); next } { print }' \
         "$1" > "$2"
@@ -155,11 +153,10 @@ ok "multi-batch (-K $KS, $nb batches, $kdup duplicate pairs): on -t1 == on -t4 =
 # Seed-stage instrument: BWAMEM3_DEDUP_READS_CHECK_BASES asserts, in the armed
 # copy pass, that each duplicate read's 2-bit bases equal its representative's
 # (err_fatal on any difference -> nonzero exit). worker_bwt_memo must convert
-# each read exactly once -- DUPs itself, REPs through kernel1 -- and SAM prints
-# codes 4 and 5 alike, so off==on above cannot see a REP converted twice
-# ('-' -> 5 -> 4). Unlike VERIFY it keeps the compaction, so it checks the path
-# production runs. Run on the '-' and N/lowercase fixtures, whose bases are the
-# ones the conversion is sensitive to; output must still equal off.
+# each read -- DUPs itself, REPs through kernel1 -- and a DUP left in ASCII
+# would differ from its representative. Unlike VERIFY it keeps the compaction,
+# so it checks the path production runs. Run on the '-' and N/lowercase
+# fixtures, whose bases are the ones the table maps; output must still equal off.
 for p in dash nlow; do
     BWAMEM3_DEDUP_READS_CHECK_BASES=1 "$BWA_MEM3" mem --dedup-reads on -t 4 "$W/phix.fa" \
         "$W/${p}_1.fq" "$W/${p}_2.fq" 2> "$W/check_$p.err" | grep -v '^@PG' > "$W/check_$p.sam" \

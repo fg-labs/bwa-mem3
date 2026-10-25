@@ -76,9 +76,8 @@ extern uint64_t prof[10][112];
 #define AMBQ16 16
 // for 8-bit
 #define DUMMY8 8
-/* Query-tail pad codes for the 8-bit kernels. A query byte is 0-3, '-' (5:
- * nst_nt4_table maps it to 5, and matesw_orient passes a forward-oriented mate's
- * codes through unchanged), AMBQ (8, the remapped N) or the 0xFF pad, so the pad
+/* Query-tail pad codes for the 8-bit kernels. A query byte is 0-3, AMBQ (8, the
+ * remapped N, which a read '-' is too) or the 0xFF pad, so the pad
  * on [len2, quantum) must be a value none of those can take, with bit 7 clear
  * (the boundary mask must not zero it) and distinct from FREED_INACTIVE8. The
  * kernels elide the pad test below the group's jdummy on the grounds that no
@@ -92,7 +91,8 @@ extern uint64_t prof[10][112];
  * no blend. X86_QPAD8 cannot do that, because pshufb masks its index to four
  * bits (16 would read entry 0), so the AVX2/AVX-512BW kernels always blend the
  * pad to `shift`; which table entry its xor reads does not matter. (The 5 the
- * x86 kernels used before collided with '-'.) */
+ * x86 kernels used before collided with '-', which nst_nt4_table encoded as 5
+ * before it mapped '-' to N.) */
 #define NEON_QPAD8 16
 #define X86_QPAD8  6
 #define AMBRQ 0xFF
@@ -202,7 +202,7 @@ static inline int compute_jsplit(const SeqPair *p, int width, int ncol, bool i16
 /* "No freed cell active on this lane" markers for the freed-cell (--meth)
  * blend, one per kernel width. Each must be a value a query byte can never
  * take, so the blend provably never fires on a lane with no active freed cell:
- *   8-bit   s2 holds 0-3, '-'(5), X86_QPAD8(6) or NEON_QPAD8(16), AMBQ(8), or the 0xFF pad -> 0xFE
+ *   8-bit   s2 holds 0-3, X86_QPAD8(6) or NEON_QPAD8(16), AMBQ(8), or the 0xFF pad -> 0xFE
  *   16-bit  s2 holds 0-3, AMBQ16(16), DUMMY3(26), or the 0xFFFF pad -> 0x7FFF
  * Both deliberately avoid the pad value itself. Aliasing it would make the
  * blend fire on every padded column, leaving correctness dependent on the
@@ -302,7 +302,7 @@ static inline int compute_jsplit(const SeqPair *p, int width, int ncol, bool i16
  * kswv_neon_u8. On a pad row the u8 pshufb returns 0 (bit 7 of the xor index
  * is set), so m11 = sat(h00 - shift) <= h00 (h00 under the X86_QPAD8 blend); the
  * i16 permutexvar reads the xor's low five bits, entries 5 (DUMMY3), 15
- * (AMBQ16), 26 ('-') and 28-31 (bases) of the table, all 0 or w_ambig = -1, so
+ * (AMBQ16) and 28-31 (bases) of the table, all 0 or w_ambig = -1, so
  * m11 <= h00. The pad corner (xor 0, the match entry) is a pad column, still
  * masked. The mask folds into the diagonal add as a zero-masking add over the
  * lanes whose s2 is not the pad, in place of a compare-to-mask and a blend. */
@@ -5223,11 +5223,12 @@ int kswv::kswv512_16_impl(int16_t seq1SoA[],
      * w_mismatch at 1-3, 0 for the query-tail DUMMY3 (=26) entries
      * (s1 in {0..3, AMBR16} xor 26 = {21, 24..27}), and w_ambig everywhere else.
      * The old table had 0 rather than w_ambig at 4-11, 20, 22-23 and 28-30. Of
-     * those, valid input reaches 4-7 and 10 only through a '-' query base (5,
-     * passed through from a forward-oriented mate), which this kernel therefore
-     * scored as 0 against every reference base where the other tiers score
-     * w_ambig; and 28-30 only on a reference pad row, where any value <= 0
-     * gives the same bytes (see the note above kswv_neon_u8). */
+     * those, valid input reached 4-7 and 10 only through a '-' query base (5,
+     * as nst_nt4_table encoded it before it mapped '-' to N, passed through from
+     * a forward-oriented mate), which this kernel therefore scored as 0
+     * against every reference base where the other tiers score w_ambig; and
+     * 28-30 only on a reference pad row, where any value <= 0 gives the same
+     * bytes (see the note above kswv_neon_u8). */
     for (int k = 0; k < SIMD_WIDTH16; k++) temp[k] = this->w_ambig;
     temp[0] = this->w_match;
     temp[1] = temp[2] = temp[3] = this->w_mismatch;

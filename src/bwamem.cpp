@@ -4326,11 +4326,9 @@ static void worker_bwt_memo(worker_t *w, int seq_id, int batch_size, int tid)
 
     /* D1: kernel1 converts bases ASCII->2-bit in place, but DUP reads skip
      * kernel1 -- so convert the DUP reads here, so worker_sam sees 2-bit bases
-     * for them too. Leave the REPs to kernel1: the conversion is NOT idempotent
-     * (see read_memo_convert_non_reps), so a REP converted twice would carry N
-     * (4) where off carries '-' (5). Every consumer treats codes >= 4 alike
-     * today, so that is output-neutral, but converting each read exactly once
-     * keeps REP bases equal to off's by construction. */
+     * for them too. Leave the REPs to kernel1: converting each read exactly once
+     * keeps REP bases equal to off's by construction (see
+     * read_memo_convert_non_reps). */
     read_memo_convert_non_reps(memo, seqs, seq_id, batch_size);
 
     /* Compact REP pairs into a dense view (struct copies; seq/name/qual pointers

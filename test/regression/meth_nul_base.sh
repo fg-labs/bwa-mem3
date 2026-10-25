@@ -13,7 +13,7 @@
 # now writes each control byte as N before copying anything.
 #
 # The fixture is built programmatically: a constructed bisulfite reference and
-# three PE pairs aligned with -C, every read carrying a BC:Z FASTQ comment.
+# four PE pairs aligned with -C, every read carrying a BC:Z FASTQ comment.
 #   p1: R1 (forward, OT) has a 0 byte at base 20, where the reference has A.
 #       It keeps its methylated CpGs as C, so its original bases differ from
 #       the converted ones and SEQ restoration is tested, not just length.
@@ -23,13 +23,16 @@
 #       ZZ:Z:ACGT, so a TAB left in the carrier would split off a well-formed
 #       ZZ:Z tag and emit it (the writer silently drops a split-off token that
 #       is not tag-shaped, so p2's TAB alone cannot show a missed TAB).
+#   p4: R1 (forward, OT) has a '-' at base 41. The forward SEQ writer copies
+#       the original bases as text, so the '-' reaches the record builder,
+#       whose 4-bit packing stores it as N, as on every other path.
 # For each affected read: it is mapped, on its expected strand; SEQ equals the
-# input with control bytes (and p3's non-base bytes) read as N; the alignment
-# scores that base as N too (p1's NM and MD record a mismatch against the
-# reference A, where a raw 0 byte would be scored as base A and match); the
-# record carries XR:Z (CT for R1, GA for R2) and BC:Z:ACGT; the internal
-# YS:Z/YC:Z carriers do not leak; no forged ZZ:Z tag appears; and every aux
-# field is a well-formed tag.
+# input with control bytes (and p3's non-base bytes and p4's '-') read as N;
+# the alignment scores that base as N too (p1's NM and MD record a mismatch
+# against the reference A, where a raw 0 byte would be scored as base A and
+# match); the record carries XR:Z (CT for R1, GA for R2) and BC:Z:ACGT; the
+# internal YS:Z/YC:Z carriers do not leak; no forged ZZ:Z tag appears; and
+# every aux field is a well-formed tag.
 #
 # Inputs:
 #   BWA_MEM3 — path to the bwa-mem3 binary under test
@@ -63,7 +66,7 @@ REF=TCATTGGCTATCCTAACCCGACCCTAGGAGCGGTTGGCGTGTATGCCGTGAATTTTCTCATTTCCGCTAGACATAA
 printf '>chrA\n%s\n' "$REF" > ref.fa
 "$BIN" index --meth ref.fa > /dev/null 2>&1 || fail "index --meth nonzero exit"
 
-# Three FR pairs from the reference, each R1 = ref[a:a+100] and
+# Four FR pairs from the reference, each R1 = ref[a:a+100] and
 # R2 = revcomp(ref[b:b+100]), bisulfite-converted (R1 C->T except CpG, R2 G->A)
 # so they map under --meth. Written with python so the control bytes land in
 # the files; expected.tsv holds each affected read's SEQ in read order with
@@ -90,10 +93,13 @@ forged = '\tZZ:Z:ACGT'
 p3_r1 = convert_ot(ref[1150:1250])
 p3_r1 = p3_r1[:85] + forged + p3_r1[85 + len(forged):]
 p3_r2 = rc(ref[1380:1480]).replace('G', 'A')
+p4_r1 = put(convert_ot(ref[20:120]), 40, '-')
+p4_r2 = rc(ref[300:400]).replace('G', 'A')
 assert len(p3_r1) == 100
 assert 'C' in p1_r1  # restoration must be observable
 with open('r1.fq', 'wb') as f1, open('r2.fq', 'wb') as f2:
-    for name, r1, r2 in (('p1', p1_r1, p1_r2), ('p2', p2_r1, p2_r2), ('p3', p3_r1, p3_r2)):
+    for name, r1, r2 in (('p1', p1_r1, p1_r2), ('p2', p2_r1, p2_r2), ('p3', p3_r1, p3_r2),
+                         ('p4', p4_r1, p4_r2)):
         f1.write(('@%s/1\tBC:Z:ACGT\n%s\n+\n%s\n' % (name, r1, q)).encode('latin-1'))
         f2.write(('@%s/2\tBC:Z:ACGT\n%s\n+\n%s\n' % (name, r2, q)).encode('latin-1'))
 def as_n(s):
@@ -102,6 +108,7 @@ with open('expected.tsv', 'w') as f:
     f.write('p1\t64\t0\tCT\t%s\n' % as_n(p1_r1))
     f.write('p2\t128\t16\tGA\t%s\n' % as_n(p2_r2))
     f.write('p3\t64\t0\tCT\t%s\n' % as_n(p3_r1))
+    f.write('p4\t64\t0\tCT\t%s\n' % as_n(p4_r1))
 # p1 R1 aligns ungapped to ref[200:300], so its literal MD lists the reference
 # base at every column the read differs from: the C->T conversions and the
 # control byte (read as N) at base 20.
