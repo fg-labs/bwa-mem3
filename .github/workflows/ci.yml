@@ -716,9 +716,9 @@ jobs:
         run: BWA_MEM3=./bwa-mem3 bash test/regression/arg_range_validation.sh
 
       # The `mem` CLI suite: records whose every field is worked out by hand from
-      # a generated reference (test/fixtures/mem_synth_ref.awk) or the committed
-      # phiX, so it needs no download, no third-party tool and no cached index,
-      # and finishes in seconds. Every row rather than the canonical one: its
+      # a reference generated at run time (test/fixtures/mem_synth_ref.awk), so
+      # it needs no download, no third-party tool and no cached index, and
+      # finishes in seconds. Every row rather than the canonical one: its
       # expected values may not depend on the platform, compiler, allocator or
       # SIMD tier, and each script runs every check under each tier this runner
       # has (BWAMEM3_FORCE_TIER: avx2 and avx512bw on x86, neon on arm64), so a

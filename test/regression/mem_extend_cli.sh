@@ -22,7 +22,7 @@
 #   c3f    ctg1:601-700, mm at 98              the same at the 3' end
 #   c5r    reverse complement of ctg1:801-900 with mm at forward base 98: the
 #          read's 5' end, at the right of the forward-strand CIGAR
-#   del2   ctg1:1401-1450 + ctg1:1453-1502     50M2D50M (the pilot's read)
+#   del2   ctg1:1401-1450 + ctg1:1453-1502     50M2D50M (mem_cli_basics.sh's read)
 #   ins2   ctg1:1601-1650 + 2 bases + ctg1:1651-1700, the bases differing from
 #          the reference on either side        50M2I50M
 #   zd     ctg1:2501-2600, mm at 51 and 52     100M, AS 98 - 8 = 90
