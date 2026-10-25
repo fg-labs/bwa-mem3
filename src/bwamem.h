@@ -867,6 +867,14 @@ int mem_infer_dir(int64_t l_pac, int64_t b1, int64_t b2, int64_t *dist);
 bool mem_matesw_skip(int64_t l_pac, int64_t rb, const mem_alnreg_v *ma, const mem_pestat_t pes[4],
                      int skip[4]);
 
+/* The --rescue-kmer anchor scan of the oriented mate `ms` in the window ref[0..M), as the unit
+ * tests call it: the votes on the winning diagonal and the distinct query k-mers indexed, or -1 for
+ * both when the scan did not run (window or mate shorter than k, or no k-mer indexed). Same
+ * arguments as the static matesw_kmer_anchor that mem_matesw_batch_pre calls; k is
+ * opt->rescue_kmer. */
+void mem_matesw_kmer_anchor_counts(const mem_opt_t *opt, const uint8_t *ref, int M, const uint8_t *ms,
+                                   int l_ms, int is_rev, int collapse, int *best_v, int *n_kmer);
+
 /* mem_matesw_skip's test for one region at `rb`, as four intervals of mate rb values, one per
  * orientation: bit r of the skip set is pes[r].failed, or some mate region's rb lies in
  * [lo[r], hi[r]] (inclusive; empty when lo[r] > hi[r], and `live` has bit r set exactly when it

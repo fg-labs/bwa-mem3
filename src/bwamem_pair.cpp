@@ -171,10 +171,21 @@ static matesw_anchor_t matesw_kmer_anchor(const mem_opt_t *opt, const uint8_t *r
     constexpr int HS = 1024, HMASK = HS - 1;
     constexpr int HMAX = HS - (HS >> 2);                   /* stop inserting at 75% load */
     static_assert(HMAX < HS, "the table must retain empty slots or linear probing cannot terminate");
-    static thread_local std::vector<uint32_t> slot_code;   /* 0xFFFFFFFF = empty */
+    /* The empty marker must be a value no k-mer code can take. Codes are 2k bits,
+     * so at k = 16 every uint32 is a code: the all-T k-mer is 0xFFFFFFFF. With a
+     * uint32 table and that as the marker, an all-T query k-mer claimed a slot
+     * that still read as empty (so later codes overwrote it, and each repeat
+     * pushed the slot onto `touched` again), and an all-T window k-mer "matched"
+     * the first empty slot on its probe and voted with that slot's slot_pos,
+     * which the reset never clears: a position from an earlier read on the same
+     * thread. Storing codes in 64 bits puts the marker outside the code space at
+     * every k; for k < 16, and for every code but the all-T one at k = 16, the
+     * probes and votes are unchanged. */
+    constexpr uint64_t EMPTY = UINT64_MAX;
+    static thread_local std::vector<uint64_t> slot_code;   /* EMPTY = empty */
     static thread_local std::vector<int>      slot_pos;     /* newest query pos per code */
     static thread_local std::vector<int>      touched;
-    if ((int)slot_code.size() < HS) { slot_code.assign(HS, 0xFFFFFFFFu); slot_pos.assign(HS, -1); }
+    if ((int)slot_code.size() < HS) { slot_code.assign(HS, EMPTY); slot_pos.assign(HS, -1); }
     touched.clear();
 
     uint32_t mask = (k >= 16) ? 0xffffffffu : ((1u << (2*k)) - 1);
@@ -186,8 +197,8 @@ static matesw_anchor_t matesw_kmer_anchor(const mem_opt_t *opt, const uint8_t *r
           if (++valid >= k) {
               int pos = i - k + 1;
               uint32_t h = (code * 2654435761u) >> (32 - 10);   /* HS = 1<<10 */
-              while (slot_code[h] != 0xFFFFFFFFu && slot_code[h] != code) h = (h + 1) & HMASK;
-              if (slot_code[h] == 0xFFFFFFFFu) {
+              while (slot_code[h] != EMPTY && slot_code[h] != code) h = (h + 1) & HMASK;
+              if (slot_code[h] == EMPTY) {
                   if ((int)touched.size() >= HMAX) break;   /* table full enough: stop indexing */
                   slot_code[h] = code; touched.push_back((int)h);
               }
@@ -216,7 +227,7 @@ static matesw_anchor_t matesw_kmer_anchor(const mem_opt_t *opt, const uint8_t *r
           if (++valid >= k) {
               int opos = o - k + 1;
               uint32_t h = (code * 2654435761u) >> (32 - 10);
-              while (slot_code[h] != 0xFFFFFFFFu && slot_code[h] != code) h = (h + 1) & HMASK;
+              while (slot_code[h] != EMPTY && slot_code[h] != code) h = (h + 1) & HMASK;
               if (slot_code[h] == code) {
                   int p = slot_pos[h];
                   int idx = (opos - p) + l_ms;
@@ -235,7 +246,7 @@ static matesw_anchor_t matesw_kmer_anchor(const mem_opt_t *opt, const uint8_t *r
      * crash and is invisible to the byte-identity gate, because --rescue-kmer
      * output is not covered by it. Keep the single exit below: do not add an
      * early return past this point. */
-    for (int h : touched) slot_code[h] = 0xFFFFFFFFu;
+    for (int h : touched) slot_code[h] = EMPTY;
 
     res.scanned = true;
     res.best_v  = best_v;
@@ -2119,6 +2130,14 @@ unsigned mem_matesw_skip_probe(const mem_matesw_skip_query_t *q, const int64_t *
  * mate already lies at a distance inside pes[r]'s window in orientation r (mem_infer_dir).
  * Returns whether all four are set. The interval form as one call; _pre and _post go through
  * matesw_skip_bits, which also takes a known skip set. */
+void mem_matesw_kmer_anchor_counts(const mem_opt_t *opt, const uint8_t *ref, int M, const uint8_t *ms,
+                                   int l_ms, int is_rev, int collapse, int *best_v, int *n_kmer)
+{
+    const matesw_anchor_t anc = matesw_kmer_anchor(opt, ref, M, ms, l_ms, is_rev, collapse);
+    *best_v = anc.scanned ? anc.best_v : -1;
+    *n_kmer = anc.scanned ? anc.n_kmer : -1;
+}
+
 bool mem_matesw_skip(int64_t l_pac, int64_t rb, const mem_alnreg_v *ma, const mem_pestat_t pes[4],
                      int skip[4])
 {
