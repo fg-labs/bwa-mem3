@@ -342,10 +342,10 @@ not yet carry this change.
 
 ## Degenerate numeric inputs (fail-fast, not silent)
 
-Three degenerate command lines that upstream bwa/bwa-mem2 accept but then mishandle
+Four degenerate command lines that upstream bwa/bwa-mem2 accept but then mishandle
 are now rejected at parse; for the first two the underlying divides are also guarded defensively
 ([#460](https://github.com/fg-labs/bwa-mem3/pull/460)).
-All three change behavior **only** on these degenerate inputs; all valid inputs are
+All four change behavior **only** on these degenerate inputs; all valid inputs are
 byte-identical — the full byte-identity suite (the `wgs-5M` / `wes-5M` / `hic-1M`
 alignment-record streams on x86 with the `c6a`/`c8g` cross-architecture check
 described above, plus the CI record-level phiX paired-end regression on the
@@ -375,6 +375,14 @@ non-degenerate input:
   a non-digit second value, so `-O 8,-1` ran with an insertion open of 8, and a
   first value with no digits (`-O ''`, `-O ,1`), which `strtol` reads as a valid
   0, is rejected too ([#554](https://github.com/fg-labs/bwa-mem3/pull/554)).
+- **A negative or oversized `-w`** (band width): upstream parses it with
+  `atoi` and never checks it, so a negative band turns `cal_max_gap`'s
+  `w << 1` cap negative. `-w -1` inverts the reference window and aborts in
+  the fetch's range assert; `-w -50` on 100 bp reads lets the banded kernels
+  store past the rows they own and still exits 0; `-w -2147483648` segfaults.
+  `-w` now requires an integer in `0..536870911` (`-w 0` stays valid), the
+  bound being where the widest band arithmetic, `w << 2`, would overflow `int`
+  ([#630](https://github.com/fg-labs/bwa-mem3/pull/630)).
 
 ## What is preserved
 

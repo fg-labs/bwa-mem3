@@ -1728,7 +1728,7 @@ static void usage(const mem_opt_t *opt)
                      "                  clamped to %d [%d]\n",
             MAX_THREADS, MAX_THREADS, MAX_THREADS, opt->n_threads);
     fprintf(stderr, "    -k INT        minimum seed length [%d]\n", opt->min_seed_len);
-    fprintf(stderr, "    -w INT        band width for banded alignment [%d]\n", opt->w);
+    fprintf(stderr, "    -w INT        band width for banded alignment, 0..%d [%d]\n", INT_MAX >> 2, opt->w);
     fprintf(stderr, "    -d INT        off-diagonal X-dropoff [%d]\n", opt->zdrop);
     fprintf(stderr, "    -r FLOAT      look for internal seeds inside a seed longer than {-k} * FLOAT [%g]\n", opt->split_factor);
     fprintf(stderr, "    -y INT        seed occurrence for the 3rd round seeding [%ld]\n", (long)opt->max_mem_intv);
@@ -2312,7 +2312,26 @@ int main_mem(int argc, char *argv[])
         }
         else if (c == '1') no_mt_io = 1;
         else if (c == 'x') mode = optarg;
-        else if (c == 'w') opt->w = atoi(optarg), opt0.w = 1;
+        else if (c == 'w') {
+            /* -w is the extension band width. atoi() accepted a negative band,
+             * which turns cal_max_gap's `opt->w << 1` cap negative: -w -1
+             * inverts the reference window and aborts in the fetch's range
+             * assert, and -w -50 on 100 bp reads lets the banded kernels store
+             * past the rows they own (a silent heap overrun that still exits
+             * 0). The widest w-scaled int is `opt->w << 2` (mem_patch_reg and
+             * the global-alignment widening loop), defined up to INT_MAX >> 2,
+             * so that is the top of the range. -w 0 is a valid zero band. */
+            int64_t v;
+            if (parse_bounded_i64(optarg, 0, INT_MAX >> 2, &v) != 0) {
+                fprintf(stderr, "ERROR: -w band width must be an integer in 0..%d (got %s)\n",
+                        INT_MAX >> 2, optarg);
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+            opt->w = (int)v;
+            opt0.w = 1;
+        }
         else if (c == 'A') opt->a = atoi(optarg), opt0.a = 1, assert(opt->a >= INT_MIN && opt->a <= INT_MAX);
         else if (c == 'B') opt->b = atoi(optarg), opt0.b = 1, assert(opt->b >= INT_MIN && opt->b <= INT_MAX);
         else if (c == 'T') opt->T = atoi(optarg), opt0.T = 1, assert(opt->T >= INT_MIN && opt->T <= INT_MAX);
