@@ -107,7 +107,11 @@ std::vector<int> lengths() {
 TEST_CASE("mem_io sam_encode: every runnable tier encodes SEQ and QUAL byte for byte"
           * doctest::test_suite("unit/sam_encode")) {
     const std::vector<Tier> tiers = runnable_tiers();
-    REQUIRE(!tiers.empty());
+    if (tiers.empty()) {
+        // An x86 host without AVX2 runs no tier `mem` accepts: skip, never fail.
+        MESSAGE("no tier `mem` runs is available on this host; nothing to check");
+        return;
+    }
     std::mt19937 rng(424242u);
 
     SUBCASE("A C G T N codes") {

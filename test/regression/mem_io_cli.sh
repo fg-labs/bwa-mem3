@@ -13,7 +13,8 @@
 # The reads are slices of the synthetic reference, so each field follows from
 # the slice and the default scoring (-A 1 -B 4 -O 6 -E 1 -L 5). A unique exact
 # 100 bp hit has MAPQ 60 (bwa's mem_approx_mapq_se: 6.02 * (100 - 19) *
-# (ln 50 / ln 100)^2 = 352, capped at 60), NM 0, MD 100, AS 100 and XS 0. Read
+# (3 / ln 100)^2 = 207, with bwa's integer coefficient (int)ln 50 = 3, capped
+# at 60), NM 0, MD 100, AS 100 and XS 0. Read
 # set "fmt" (one record each):
 #
 #   exact   ctg1:1001-1100, name "exact/1", comment "BC:Z:ACGT<TAB>RX:Z:AAC".
@@ -32,8 +33,9 @@
 #   long    ctg2:2601-3600 (1000 bp): 1000M, AS 1000.
 #   longname ctg2:101-200, with a 200-character name of SAM-legal punctuation.
 #   unmapped ctg1:3701-3800 reversed (not complemented), which shares no 19-mer
-#           with the reference: FLAG 4, RNAME *, POS 0, MAPQ 0, CIGAR *, SEQ and
-#           QUAL as given, AS:i:0 XS:i:0 and nothing else.
+#           with the reference (its longest exact match is 11 bp), comment
+#           "CO:Z:nohit": FLAG 4, RNAME *, POS 0, MAPQ 0, CIGAR *, SEQ and QUAL
+#           as given, AS:i:0 XS:i:0 and nothing else.
 #
 # Checks:
 #   @SQ     one line per contig, in reference order, with the generator's
@@ -51,8 +53,8 @@
 #           As multi-line FASTA: the same records with QUAL *.
 #   bad input  a quality string shorter than its sequence, and a gzip file cut
 #           short: mem exits nonzero.
-#   -C      appends the comment verbatim to the exact record; every other byte
-#           is unchanged.
+#   -C      appends the comment verbatim to the exact record and to the unmapped
+#           record (after AS and XS); every other byte is unchanged.
 #   -R -H   header: @HD, the four @SQ, the -H string, the @-lines of the -H file
 #           (others dropped), the @RG line, @PG, in that order; RG:Z:grp1 on
 #           every record. A -R line not starting with @RG, or without ID, exits
@@ -95,8 +97,9 @@
 #           count); records come out in input order, and every renamed copy of a
 #           read or pair gets its original's records. The same for 3300 short
 #           reads in 1200-read batches at -t 4 (where the process step streams
-#           finished work items to the output), with streaming off
-#           (BWA_MEM3_STREAM_OUTPUT=0), and at -t 1.
+#           finished work items to the output; a "note:" line reports how many
+#           reads went out early, a timing-dependent count that is not
+#           checked), with streaming off (BWA_MEM3_STREAM_OUTPUT=0), and at -t 1.
 #   tiers   every SAM above is byte-identical across tiers (@PG aside).
 #
 # Inputs (env vars):
@@ -238,6 +241,7 @@ q_lname="$(qual_string 100 13)"
 q_revn="$(qual_string 100 15)"
 lname="rd:1#ACGT+_=|$(printf '%188s' '' | tr ' ' 'x')"
 c_exact="BC:Z:ACGT${tab}RX:Z:AAC"
+c_unm="CO:Z:nohit"
 
 # The canonical single-line FASTQ.
 {
@@ -251,7 +255,7 @@ c_exact="BC:Z:ACGT${tab}RX:Z:AAC"
     fq_rec multi "" "$s_multi" "$q_multi"
     fq_rec qat "" "$s_qat" "$q_qat"
     fq_rec long "" "$s_long" "$q_long"
-    fq_rec unmapped "" "$s_unm" "$q_unm"
+    fq_rec unmapped "$c_unm" "$s_unm" "$q_unm"
     fq_rec "$lname" "" "$s_lname" "$q_lname"
 } > "$work/fmt.fq"
 n_fmt=12
@@ -282,7 +286,7 @@ cr="$(printf '\r')"
     split_lines "$s_long" 80
     printf '+long\n'
     split_lines "$q_long" 333
-    fq_rec unmapped "" "$s_unm" "$q_unm"
+    fq_rec unmapped "$c_unm" "$s_unm" "$q_unm"
     fq_rec "$lname" "" "$s_lname" "$q_lname"
 } > "$work/messy.fq"
 
@@ -535,8 +539,11 @@ for tier in $(mem_cli_tiers); do
     mem_cli_expect "$tier: -C appends the comment to the exact record" \
         "${t100}${tab}${c_exact}" \
         "$(mem_cli_primary "$(out c_opt)" exact | awk -F '\t' '{ s = $12; for (i = 13; i <= NF; i++) s = s "\t" $i; print s }')"
+    mem_cli_expect "$tier: -C appends the comment to the unmapped record" \
+        "AS:i:0${tab}XS:i:0${tab}${c_unm}" \
+        "$(mem_cli_primary "$(out c_opt)" unmapped | awk -F '\t' '{ s = $12; for (i = 13; i <= NF; i++) s = s "\t" $i; print s }')"
     same_after "$tier: -C changes nothing else" "$sam" '{ print }' "$(out c_opt)" \
-        '$1 == "exact" { s = $1; for (i = 2; i <= NF - 2; i++) s = s OFS $i; print s; next } { print }'
+        '$1 == "exact" || $1 == "unmapped" { n = ($1 == "exact") ? 2 : 1; s = $1; for (i = 2; i <= NF - n; i++) s = s OFS $i; print s; next } { print }'
 
     # --- -R, -H and the header -------------------------------------------------
     mem_cli_mem "$tier" "$(out rh)" -R '@RG\tID:grp1\tSM:s1' -H '@CO\tfrom string' -H "$work/hdr.txt" \
@@ -753,7 +760,14 @@ for tier in $(mem_cli_tiers); do
         }
         END { for (k = 0; k < n; k++) for (i = 1; i <= m; i++) print name[i] "_" k rest[i] }' \
         > "$work/stream.expected"
+    # BWA_MEM3_STREAM_STATS=1 reports on stderr how many reads of each batch
+    # were written before the batch finished. That count depends on thread
+    # timing, so it is printed as a note (it shows the run took the streaming
+    # path), never checked.
+    export BWA_MEM3_STREAM_STATS=1
     mem_cli_mem "$tier" "$(out stream_t4)" -t 4 -K 120000 "$ref" "$work/stream.fq"
+    unset BWA_MEM3_STREAM_STATS
+    echo "note: $tier: stream_t4 wrote $(awk '/stream_output:/ { n += $3; t += $5 } END { print n + 0 " of " t + 0 }' "$(out stream_t4).err") reads before their batch finished"
     export BWA_MEM3_STREAM_OUTPUT=0
     mem_cli_mem "$tier" "$(out stream_off)" -t 4 -K 120000 "$ref" "$work/stream.fq"
     unset BWA_MEM3_STREAM_OUTPUT

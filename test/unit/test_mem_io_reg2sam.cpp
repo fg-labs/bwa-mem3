@@ -21,7 +21,8 @@
 // -B 4, mapQ_coef_len 50): for an exact hit shorter than 50 bp it is
 // 6.02 * (score - s) rounded, capped at 60, where s is the larger of csub and
 // sub (19, the minimum seed length, when sub is 0), and 0 when s reaches the
-// hit's own score.
+// hit's own score; a hit of l >= 50 bp is scaled by (3 / ln l)^2, where 3 is
+// bwa's integer-typed coefficient (int)ln 50.
 
 #include "doctest/doctest.h"
 #include "mem_fixture.h"
@@ -51,6 +52,7 @@ struct Fixture {
     std::string read1;  // c1[100, 160)
     std::string read2;  // c1[300, 345) + c3[200, 235): a split read
     std::string read3;  // c3[200, 235) + c1[300, 345): the same, other way round
+    std::string read4;  // c3[200, 230) + c1[100, 160): a split read whose longer part has copies
     std::unique_ptr<bwa_tests::TempIndex> idx;
     int64_t l_pac = 0;
 
@@ -66,6 +68,7 @@ struct Fixture {
         read1 = c1.substr(100, 60);
         read2 = c1.substr(300, 45) + c3.substr(200, 35);
         read3 = c3.substr(200, 35) + c1.substr(300, 45);
+        read4 = c3.substr(200, 30) + c1.substr(100, 60);
         idx.reset(new bwa_tests::TempIndex(contigs));
         l_pac = idx->bns()->l_pac;
     }
@@ -191,6 +194,15 @@ TEST_CASE("mem_io reg2sam: shadowed hits become the primary's XA list and HN cou
         g.opt->max_XA_hits = 2;
         CHECK(emit(g.opt, r, read1_regions(g.opt))
               == head + "\tXA:Z:c2,+201,60M,1;c3,-51,60M,0;\tHN:i:2\n");
+    }
+    SUBCASE("a clipped shadowed hit keeps its clip in its XA entry") {
+        // The c2 copy aligned from read base 5 only: c2[205, 260), 55 bases
+        // with the one mismatch, score 54 - 4 = 50 (>= 0.8 * 60, so listed).
+        // Its entry is c2,+206 with the 5 unaligned read bases as 5S: 5S55M.
+        std::vector<mem_alnreg_t> regs = read1_regions(g.opt);
+        regs[1] = region(g.opt, 1, 205, false, 5, 60, 50, 0);
+        regs[1].secondary = regs[1].secondary_all = 0;
+        CHECK(emit(g.opt, r, regs) == head + "\tXA:Z:c2,+206,5S55M,1;c3,-51,60M,0;\tHN:i:2\n");
     }
     SUBCASE("-z: a hit below the fraction of the primary's score is not counted") {
         // 55 < 0.95 * 60 = 57: the c2 copy drops out of XA and HN.
@@ -320,6 +332,38 @@ TEST_CASE("mem_io reg2sam: -5 makes the hit nearest the read's 5' end primary"
              + r.qual.substr(35)
              + "\tNM:i:0\tMD:Z:45\tAS:i:45\tXS:i:40\tSA:Z:c3,201,+,35M45S,60,0;\tHN:i:0\n");
 
+    SUBCASE("the XA list and HN stay with the hit they shadow") {
+        // read4 is c3[200, 230) + c1[100, 160). Regions in marking order: the
+        // c1 hit (read bases 30-89, score 60, sub 55), the c3 hit (bases 0-29,
+        // score 30) and the c2 copy of the c1 part (score 55, one mismatch),
+        // shadowed by the c1 hit (secondary = secondary_all = 0). -5 moves the
+        // c3 hit to the front; the c2 copy must still be listed under the c1
+        // hit, now the supplementary record: XA:Z:c2,+201,30S60M,1; (read bases
+        // 0-29 unaligned there) and HN 1, with HN 0 and no XA on the c3 primary.
+        // MAPQ: c3 hit 6.02 * (30 - 19) = 66.2 -> 60. c1 hit: 60 bases >= 50,
+        // so the length factor applies, with bwa's integer coefficient
+        // (int)ln 50 = 3: 6.02 * (60 - 55) * (3 / ln 60)^2 = 30.1 * 0.537
+        // = 16.2 -> 16, kept under -5 (which implies -q).
+        const Fixture &fx = fixture();
+        Read r4("r4", fx.read4);
+        std::vector<mem_alnreg_t> regs{region(g.opt, 0, 100, false, 30, 90, 60, 55),
+                                       region(g.opt, 2, 200, false, 0, 30, 30, 0),
+                                       region(g.opt, 1, 200, false, 30, 90, 55, 0)};
+        regs[2].secondary = regs[2].secondary_all = 0;
+        mem_alnreg_v v;
+        v.n = v.m = regs.size();
+        v.a = regs.data();
+        v.capped_w = 0;
+        mem_reorder_primary5(g.opt->T, &v);
+        REQUIRE(regs[0].rid == 2);
+        CHECK(emit(g.opt, r4, regs)
+              == "r4\t0\tc3\t201\t60\t30M60S\t*\t0\t0\t" + r4.bases + "\t" + r4.qual
+                 + "\tNM:i:0\tMD:Z:30\tAS:i:30\tXS:i:0\tSA:Z:c1,101,+,30S60M,16,0;\tHN:i:0\n"
+                 + "r4\t2048\tc1\t101\t16\t30H60M\t*\t0\t0\t" + r4.bases.substr(30) + "\t"
+                 + r4.qual.substr(30)
+                 + "\tNM:i:0\tMD:Z:60\tAS:i:60\tXS:i:55\tSA:Z:c3,201,+,30M60S,60,0;"
+                   "\tXA:Z:c2,+201,30S60M,1;\tHN:i:1\n");
+    }
     SUBCASE("a single primary is left alone") {
         std::vector<mem_alnreg_t> one{region(g.opt, 0, 300, false, 35, 80, 45, 40)};
         mem_alnreg_v b;

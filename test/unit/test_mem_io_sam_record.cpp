@@ -282,6 +282,13 @@ TEST_CASE("mem_io record: unmapped and secondary records"
         check_both(g.opt, ref, r, l, 0, NULL,
                    "r1\t4\t*\t0\t0\t*\t*\t0\t0\tACGTNACGTT\tABCDEFGHIJ\tAS:i:0\tXS:i:0\n");
     }
+    SUBCASE("unmapped with -C: the comment follows AS and XS, as on a mapped record") {
+        Read rc("r1", kBases, kQual, "BC:Z:ACGT\tXN:i:7");
+        std::vector<mem_aln_t> l{unmapped(g.opt, ref, rc)};
+        check_both(g.opt, ref, rc, l, 0, NULL,
+                   "r1\t4\t*\t0\t0\t*\t*\t0\t0\tACGTNACGTT\tABCDEFGHIJ\tAS:i:0\tXS:i:0\t"
+                   "BC:Z:ACGT\tXN:i:7\n");
+    }
     SUBCASE("secondary: SEQ and QUAL are *, no SA even beside a primary") {
         // A reverse-strand secondary: 0x100 | 0x10 = 272.
         std::vector<mem_aln_t> l{alns.make(0, 99, false, "10M", "10", 0, 60, 10, 9),
