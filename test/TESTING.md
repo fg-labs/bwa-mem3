@@ -6,7 +6,7 @@ bwa-mem3 tests are organized into three categories — **unit**, **integration**
 |----------------|------------------------------------|----------------------------------------------|--------------------------------------|
 | **unit**       | `test/bwa_mem3_tests_unit`         | None. All inputs synthetic.                  | Every matrix row                     |
 | **integration**| `test/bwa_mem3_tests_integration`  | Small committed FASTAs / FMI under `test/fixtures/` | SSE4.1, AVX2, ARM64 Linux, macOS ARM |
-| **regression** | `test/regression/*.sh`             | Committed phiX in `test/fixtures/`; chr22 downloaded by CI, reads simulated by holodeck; bwa for the parity diffs | Canonical AVX2 row, except `chr22_parity.sh` (every row) and the source-only lints (own jobs) |
+| **regression** | `test/regression/*.sh`             | Committed phiX in `test/fixtures/`, or references generated at run time by the generators there; chr22 downloaded by CI, reads simulated by holodeck; bwa for the parity diffs | Canonical AVX2 row, except `chr22_parity.sh` and the five `mem` CLI scripts (`mem_cli_basics.sh`, `mem_*_cli.sh`), which run on every row, and the source-only lints (own jobs) |
 
 Design rationale: see the internal test framework design spec (not committed).
 
@@ -21,6 +21,8 @@ make                                      # builds bwa-mem3 binary
 make -C test -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)   # builds framework + both doctest binaries + legacy integration binaries
 ```
 
+The doctest binaries link `libbwa.a` with the libraries the aligner links: htslib's static dependencies, zlib-ng (the vendored `ext/zlib-ng/build/libz-ng.a`, or the host's `-lz-ng` with `ZLIBNG_USE_VENDORED=0`) and libdeflate, which the default FASTQ reader (`src/fast_reader.c`) uses for gzip and BGZF input. A unit test can therefore call the reader directly (`bseq_read_fast`, `fr_fastq_next`).
+
 ### Run unit tests
 
 ```bash
@@ -34,6 +36,17 @@ make -C test -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)   # builds framework + 
 ./test/bwa_mem3_tests_unit --help         # full doctest flag list
 bash test/run_unit_shards.sh ./test/bwa_mem3_tests_unit   # run as one concurrent shard per CPU (what CI does)
 ```
+
+### Run unit tests under AddressSanitizer
+
+`ASAN=1` builds `libbwa.a` with AddressSanitizer, and the doctest binaries are then compiled and linked with `-fsanitize=address` too:
+
+```bash
+make ASAN=1 test-binaries                 # add the row's arch= (e.g. arch=avx2) to match a CI build
+ASAN_OPTIONS=allocator_may_return_null=1:detect_leaks=0 ./test/bwa_mem3_tests_unit
+```
+
+A run of the whole unit binary needs both options for now, because of two existing tests: `test_bam_rec_scratch.cpp` requests a `SIZE_MAX` allocation on purpose to check the overflow guard, which AddressSanitizer aborts on unless `allocator_may_return_null=1`; and LeakSanitizer reports 25 KB that `read_memo_prepass` (`src/read_memo.cpp`) allocates for the `read_memo_state` buffers in `test_read_memo.cpp`, whose cases do not release them with `read_memo_state_free`. A run filtered to other files (`-sf`, `-ts`) needs neither option.
 
 ### Run integration tests
 
@@ -71,7 +84,7 @@ The chr22 scripts are the expensive end: they want a chr22 reference indexed for
 
 ## Running tests in CI
 
-- **ci.yml** runs unit tests on every matrix row, integration tests on the four widened canonical rows, and regression tests on the canonical AVX2 configuration — split between the canonical matrix row (the scripts that need its built tree, such as the Makefile checks) and the `canonical-regressions` job, which builds the same binary alongside the matrix and runs the ones that need only the binary and fixtures — except `chr22_parity.sh`, which runs on every row; the checks that need a differently-configured build of that row (debug macros, `TESTING_BUILD`, ASAN), which run in the `rebuild-variants` job alongside the matrix; and the source-only lints, which run in their own jobs alongside the build matrix (they need no binary, so they do not wait on it).
+- **ci.yml** runs unit tests on every matrix row, integration tests on the four widened canonical rows, and regression tests on the canonical AVX2 configuration — split between the canonical matrix row (the scripts that need its built tree, such as the Makefile checks) and the `canonical-regressions` job, which builds the same binary alongside the matrix and runs the ones that need only the binary and fixtures — except `chr22_parity.sh` and the five `mem` CLI scripts, which run on every row; the checks that need a differently-configured build of that row (debug macros, `TESTING_BUILD`, ASAN), which run in the `rebuild-variants` job alongside the matrix; and the source-only lints, which run in their own jobs alongside the build matrix (they need no binary, so they do not wait on it).
 - **CI depth.** Every change lands through the merge queue, and its `merge_group` run checks the exact commit that lands at full depth. A `pull_request` run, repeated on every push to the branch, is light unless the PR's diff touches a kernel, harness or build path: the SIMD kernels and the headers they include, the rescue harnesses and the kernels' unit tests, `Makefile`, `test/Makefile`, the clang-19 install action, `ci.yml` or the script itself. The list and the diff live in `.github/scripts/ci-depth.sh`, which exports `CI_DEPTH=full|light` to the steps and falls back to `full` whenever it cannot compute the diff. A light run still runs every job and every check except three deep safety nets for the kernels: the rescue kernel sweeps (`rescue_prune_eq`, `rescue_band_harness`) run at about a fifth of their jobs on every row instead of full counts on the canonical, ARM64 and gcc rows; the canonical row reports `SKIP` for the AVX-512BW kswv unit tests; and the MSan padded-lane gate (not a required check) does not run. A light PR that goes green can therefore still fail one of those in the queue, though only through a change outside the paths that guard them.
 - JUnit artifacts are uploaded per row (artifacts `unit-results-<row>` and `integration-results-<row>`; the unit artifact holds one `unit-results-<job-index>-shard<k>.xml` per unit-test shard). Download them from a failed run's Actions page to see fine-grained assertion output.
 - **proto-neon-kswv.yml** runs `./test/bwa_mem3_tests_unit --test-suite="unit/kswv"` on proto branches.
