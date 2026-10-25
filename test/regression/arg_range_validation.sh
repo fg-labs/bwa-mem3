@@ -13,6 +13,9 @@
 #     Smith-Waterman kernels do not compute exactly (see the -O checks below).
 #   - -w -1 inverts the reference window and aborts; -w -50 lets the banded
 #     kernels store past their rows (see the -w checks below).
+#   - a scoring the aligner cannot carry (see the scoring checks below): an -A
+#     outside 1..127, an effective -B outside 0..128, a negative -d or -U, or
+#     an effective gap open plus extension sum out of range.
 #
 # Validation fires during option parsing, before the reference is opened, so
 # /dev/null placeholders suffice — no fixture is needed. The message (not just a
@@ -143,4 +146,91 @@ check_reject "-c -1" "ERROR: -c max occurrences must be a positive integer" -c -
 check_reject "-c 5abc" "ERROR: -c max occurrences must be a positive integer" -c 5abc
 check_reject "-c 4294967297" "ERROR: -c max occurrences must be a positive integer" -c 4294967297
 
-echo "PASS: arg_range_validation (-E, -I, and -c reject non-positive, -O rejects negative, -w rejects values outside 0..536870911, -O and -I reject a first value with no digits, and all reject non-finite, out-of-range, and trailing-garbage values)"
+# check_accept <description> <mem-args...>: the options pass validation. The
+# run still fails (the /dev/null index does not exist), so require evidence it
+# got as far as loading the index -- an error naming one of the index files
+# (or, under --meth, the seed-index probe) -- and that no scoring rejection
+# fired on the way.
+check_accept() {
+    local desc=$1
+    shift
+    local rc=0
+    "$BWA_MEM3" mem "$@" /dev/null /dev/null /dev/null \
+        > "$OUT_DIR/out" 2> "$OUT_DIR/err" || rc=$?
+    if grep -qE "ERROR: (-[ABdU] |the effective )" "$OUT_DIR/err"; then
+        echo "FAIL: $desc: a valid scoring was rejected" >&2
+        cat "$OUT_DIR/err" >&2
+        exit 1
+    fi
+    if ! grep -qE "/dev/null\.[a-z0-9]|seed index '/dev/null" "$OUT_DIR/err"; then
+        echo "FAIL: $desc: the run never reached index loading (exit $rc)" >&2
+        cat "$OUT_DIR/err" >&2
+        exit 1
+    fi
+}
+
+# Scoring. The kernels store the match score and the negated mismatch penalty
+# in int8_t (bwa_fill_scmat, kswv, the --meth matrices), so a wider value
+# wraps: -A 128 becomes -128, and -A 256 zeroes kswv's maximum substitution
+# score, which its score2 window divides by (SIGFPE at the AVX-512BW tier). A
+# match score of 0 or less is refused too: nothing can score above zero, so
+# the same divide traps on x86, and the pairing and mapping-quality formulas
+# overflow on negative scores, differently per SIMD tier. -A is held to 1..127
+# at parse, which also keeps update_a()'s scaled defaults inside int and their
+# signs unchanged.
+A_RANGE="ERROR: -A match score must be an integer in 1..127"
+check_reject "-A 128" "$A_RANGE" -A 128
+check_reject "-A 256" "$A_RANGE" -A 256
+check_reject "-A 20000000" "$A_RANGE" -A 20000000
+check_reject "-A 2x" "$A_RANGE" -A 2x
+check_reject "-A 0" "$A_RANGE" -A 0
+check_reject "-A -1" "$A_RANGE" -A -1
+check_reject "-A 0 (all pinned)" "$A_RANGE" -A 0 -B 4 -O 6 -E 1 -d 100 -L 5 -U 17
+check_reject "-A -1 (all pinned)" "$A_RANGE" -A -1 -B 4 -O 6 -E 1 -d 100 -L 5 -U 17
+check_reject "-A -128" "$A_RANGE" -A -128
+# The mismatch penalty is checked after -A scales it, so the message reports
+# the effective value: -A 33 scales the default -B 4 to 132. A negative
+# penalty scores a mismatch above zero, which the 8-bit kernels' admission
+# tests and the mapping-quality model do not allow.
+B_RANGE="outside 0..128"
+check_reject "-B 129" "ERROR: the effective mismatch penalty is 129, $B_RANGE" -B 129
+check_reject "-B -1" "ERROR: the effective mismatch penalty is -1, $B_RANGE" -B -1
+check_reject "-B -4" "ERROR: the effective mismatch penalty is -4, $B_RANGE" -B -4
+check_reject "-B -127" "ERROR: the effective mismatch penalty is -127, $B_RANGE" -B -127
+check_reject "-A 4 -B -4" "ERROR: the effective mismatch penalty is -4, $B_RANGE" -A 4 -B -4
+check_reject "-A 33" "ERROR: the effective mismatch penalty is 132, $B_RANGE" -A 33
+check_reject "-A 127" "ERROR: the effective mismatch penalty is 508, $B_RANGE" -A 127
+check_reject "-B 4x" "ERROR: -B mismatch penalty must be an integer" -B 4x
+# The 8-bit banded extension asserts zdrop >= 0 and aborts.
+check_reject "-d -1" "ERROR: -d z-drop must be a non-negative integer" -d -1
+check_reject "-d 5x" "ERROR: -d z-drop must be a non-negative integer" -d 5x
+# Paired-end scoring subtracts -U from alignment scores; near INT_MIN that
+# overflows, and any negative value rewards leaving a pair unpaired.
+check_reject "-U -1" "ERROR: -U unpaired penalty must be a non-negative integer" -U -1
+check_reject "-U -2147483647" "ERROR: -U unpaired penalty must be a non-negative integer" -U -2147483647
+check_reject "-U 5x" "ERROR: -U unpaired penalty must be a non-negative integer" -U 5x
+# Cells outside ksw_global2's band hold -2^30, and a gap state derived from one
+# subtracts o + e twice more, so each open + extension sum must be <= 2^29 - 1.
+check_reject "-O 536870911" "ERROR: the effective gap open plus extension penalty is 536870912 for deletions" -O 536870911
+check_reject "-O 6,536870911" "and 536870912 for insertions" -O 6,536870911
+check_reject "-E 536870906" "ERROR: the effective gap open plus extension penalty is 536870912 for deletions" -E 536870906
+
+# The last accepted values, the shipped presets and --meth's scaled defaults
+# pass validation.
+check_accept "defaults"
+check_accept "-A 1" -A 1
+check_accept "-A 2" -A 2
+check_accept "-A 32" -A 32
+check_accept "-A 127 -B 4" -A 127 -B 4
+check_accept "-B 0" -B 0
+check_accept "-B 128" -B 128
+check_accept "-d 0 -U 0" -d 0 -U 0
+check_accept "-O 536870910" -O 536870910
+check_accept "-x pacbio" -x pacbio
+check_accept "-x ont2d" -x ont2d
+check_accept "-x intractg" -x intractg
+check_accept "--meth" --meth
+check_accept "--meth -A 2" --meth -A 2
+check_accept "--meth-scoring genomic -A 32" --meth --meth-scoring genomic -A 32
+
+echo "PASS: arg_range_validation (-E, -I, and -c reject non-positive, -O rejects negative, -w rejects values outside 0..536870911, -A, -B, -d, -U and the effective gap penalties are range-checked, -O and -I reject a first value with no digits, and all reject non-finite, out-of-range, and trailing-garbage values)"
