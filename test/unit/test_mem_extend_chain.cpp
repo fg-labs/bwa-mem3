@@ -18,14 +18,18 @@
 //     each kept chain is kept as well, with kept=1, so its score can inform the
 //     mapping quality. Counting kept=1/2 chains heaviest first (kept=3 chains
 //     are not counted), the -N-th one and every kept=1/2 chain after it are
-//     dropped. Survivors stay heaviest first;
+//     dropped. Survivors stay heaviest first. What leaves the filter, and what
+//     is compared, is which chains survive and in what order (the order they
+//     are extended in); the kept marks and the stored weight decide that inside
+//     the filter, and nothing after it reads them, so they are not compared;
 //   - mem_flt_chained_seeds / mem_seed_sw: on a read long enough for the
 //     screen (min_l at most 0.05 * read length, where min_l is 1.1 * -W, or
 //     5.5 * ln(read length) without -W), each seed under 200 bases is rescored
 //     by a local SW (ksw_align2) of the read and the reference within 50 bases
 //     around it, the reference window clamped to the contig and strand of the
 //     seed's middle; it is dropped when that score is under round(a * min_l),
-//     and a kept seed's score becomes the SW score.
+//     and a kept seed's score becomes the SW score (a seed of 200 bases or
+//     more, or whose window is, is kept with score a * length).
 //
 // The filter's order on equal weights is that of an unstable sort, so the
 // generated chains here have distinct weights. Seeds are given in query and
@@ -50,8 +54,6 @@
 
 // Non-static in bwamem.cpp but not declared in bwamem.h.
 int mem_chain_flt(const mem_opt_t *opt, int n_chn_, mem_chain_t *a_, int tid);
-int mem_seed_sw(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, int l_query, const uint8_t *query,
-                const mem_seed_t *s, const int8_t *mat);
 
 namespace {
 
@@ -196,10 +198,13 @@ std::string show(const std::vector<Kept> &v) {
     return s;
 }
 
+// The filter's output contract: the same chains survive, in the same order.
+// kept and w are listed by show() for a failing case but not compared (see the
+// header).
 bool same(const std::vector<Kept> &a, const std::vector<Kept> &b) {
     if (a.size() != b.size()) return false;
     for (size_t i = 0; i < a.size(); ++i)
-        if (a[i].pos != b[i].pos || a[i].kept != b[i].kept || a[i].w != b[i].w) return false;
+        if (a[i].pos != b[i].pos) return false;
     return true;
 }
 
@@ -266,13 +271,17 @@ TEST_CASE("mem_chain_flt: hand-worked drops, shadows and caps"
         CHECK(same(filter_oracle(s, {0, 0, 0}, defaults()), want));
     }
     SUBCASE("-D: at exactly half the weight a chain survives (the test is strict)") {
-        // B w 50 is not < 100 * 0.5: kept=2, then kept=1 as A's first shadow;
-        // C [0, 49) overlaps A (dropped by it? 49 < 50 and 51 >= 38: yes).
-        std::vector<std::vector<mem_seed_t> > s = {span(0, 0, 100), span(1, 0, 50), span(2, 0, 49)};
-        const std::vector<Kept> got = run_filter(s, {0, 0, 0}, defaults());
-        const std::vector<Kept> want = {{0, 3, 100}, {1, 1, 50}};
+        // B0 [0, 90) w 90 survives and is A's first shadow. B [0, 50) w 50 is not
+        // < 100 * 0.5, so it survives (kept=2); a non-strict test would drop it,
+        // and it would not come back, A's first shadow being B0. C [0, 49) is
+        // dropped by A (49 < 50 and 51 >= 38) and is nobody's first shadow.
+        std::vector<std::vector<mem_seed_t> > s = {span(0, 0, 100), span(1, 0, 90), span(2, 0, 50),
+                                                   span(3, 0, 49)};
+        const std::vector<Kept> got = run_filter(s, {0, 0, 0, 0}, defaults());
+        const std::vector<Kept> want = {{0, 3, 100}, {1, 1, 90}, {2, 1, 50}};
         INFO(show(got));
         CHECK(same(got, want));
+        CHECK(same(filter_oracle(s, {0, 0, 0, 0}, defaults()), want));
     }
     SUBCASE("-D 0.3 keeps the lighter chains; each is the first shadow of the one before") {
         // -D is a float: 100 * 0.3f is 30.0000012, so a weight of 30 would
@@ -301,10 +310,14 @@ TEST_CASE("mem_chain_flt: hand-worked drops, shadows and caps"
     }
     SUBCASE("-X: an overlap under mask_level of the shorter span is not significant") {
         // B [70, 110) overlaps A [0, 100) by 30 of its 40 bases: 30 >= 40*0.5,
-        // significant; with -X 0.8 (needs 32) it is not, and B is kept=3.
+        // significant, so B is dropped and comes back as A's first shadow
+        // (kept=1); with -X 0.8 (needs 32) it is not, and B is kept=3. -N 1 makes
+        // the difference visible: it cuts the first kept=1/2 chain but not a
+        // kept=3 one.
         std::vector<std::vector<mem_seed_t> > s = {span(0, 0, 100), span(1, 70, 110)};
-        CHECK(same(run_filter(s, {0, 0}, defaults()), {{0, 3, 100}, {1, 1, 40}}));
         FltParams f = defaults();
+        f.max_chain_extend = 1;
+        CHECK(same(run_filter(s, {0, 0}, f), {{0, 3, 100}}));
         f.mask_level = 0.8f;
         CHECK(same(run_filter(s, {0, 0}, f), {{0, 3, 100}, {1, 3, 40}}));
     }
@@ -323,9 +336,15 @@ TEST_CASE("mem_chain_flt: hand-worked drops, shadows and caps"
         CHECK(run_filter(s, {0, 0, 0}, f).empty());
     }
     SUBCASE("a kept ALT chain does not shadow a primary chain") {
+        // A primary B under an ALT A is not overlapped as far as the filter is
+        // concerned (kept=3); an ALT B under a primary A is dropped and comes
+        // back as A's first shadow (kept=1). Under -N 1 only the kept=3 one stays.
         std::vector<std::vector<mem_seed_t> > s = {span(0, 0, 100), span(1, 0, 40)};
-        CHECK(same(run_filter(s, {1, 0}, defaults()), {{0, 3, 100}, {1, 3, 40}}));
-        CHECK(same(run_filter(s, {0, 1}, defaults()), {{0, 3, 100}, {1, 1, 40}}));
+        FltParams f = defaults();
+        f.max_chain_extend = 1;
+        CHECK(same(run_filter(s, {1, 0}, f), {{0, 3, 100}, {1, 3, 40}}));
+        CHECK(same(run_filter(s, {0, 1}, f), {{0, 3, 100}}));
+        CHECK(same(filter_oracle(s, {0, 1}, f), {{0, 3, 100}}));
     }
     SUBCASE("-N: the N-th kept=1/2 chain and later ones are dropped; kept=3 chains are not counted") {
         // B and C overlap A and survive (-D 0.1); D is alone on the read (kept=3).
@@ -455,15 +474,6 @@ TEST_CASE("mem_flt_chained_seeds: the seed SW screen keeps a seed scoring exactl
     CHECK((scB >= 45 && scB < 60));      // the window stops at ctgB's first base
     CHECK((scR >= 50 && scR < 65));
     OptGuard g;
-    // mem_seed_sw scores each seed as the window model does.
-    for (const mem_seed_t &sd : {sL, sS, sB, sR}) {
-        CAPTURE(sd.qbeg);
-        CHECK(mem_seed_sw(g.opt, idx.bns(), idx.pac(), (int)read.size(), enc.data(), &sd, g.opt->mat) ==
-              window_score(sd));
-    }
-    // A seed of 200 bases or more is not rescored.
-    const mem_seed_t longseed = seed(400, 0, 200);
-    CHECK(mem_seed_sw(g.opt, idx.bns(), idx.pac(), (int)read.size(), enc.data(), &longseed, g.opt->mat) == -1);
 
     // -W values whose threshold round(1.1 * W) brackets seed S's score; both
     // leave the screen on (1.1 * W <= 0.05 * 1000).
@@ -478,7 +488,8 @@ TEST_CASE("mem_flt_chained_seeds: the seed SW screen keeps a seed scoring exactl
         std::vector<mem_seed_t> seeds = {sL, sS, sB, sR};
         mem_chain_t c = chain(seeds, 0);
         mem_flt_chained_seeds(g.opt, idx.bns(), idx.pac(), &rec, 1, &c);
-        // The survivors keep their order and carry their SW score.
+        // The survivors keep their order and carry their SW score, as the
+        // window model computes it.
         std::vector<int> qbeg, score;
         for (int k = 0; k < c.n; ++k) qbeg.push_back(c.seeds[k].qbeg), score.push_back(c.seeds[k].score);
         if (w == w_keep) {
@@ -497,6 +508,18 @@ TEST_CASE("mem_flt_chained_seeds: the seed SW screen keeps a seed scoring exactl
         mem_flt_chained_seeds(g.opt, idx.bns(), idx.pac(), &rec, 1, &c);
         REQUIRE(c.n == 3);
         CHECK(c.seeds[1].qbeg == 800);
+    }
+    // A seed of 200 bases is not rescored: it is kept with score a * 200
+    // (its window would score 250: read [0, 250) lies inside ctgA 400-649).
+    {
+        mem_seed_t longseed = seed(400, 0, 200);
+        longseed.score = 1;  // so that a kept, unchanged score shows
+        std::vector<mem_seed_t> seeds = {longseed, sS};
+        mem_chain_t c = chain(seeds, 0);
+        mem_flt_chained_seeds(g.opt, idx.bns(), idx.pac(), &rec, 1, &c);
+        REQUIRE(c.n == 1);
+        CHECK(c.seeds[0].qbeg == 0);
+        CHECK(c.seeds[0].score == 200);
     }
     // On a 150-base read the screen is off (5.5 * ln 150 = 27.6 > 0.05 * 150):
     // nothing is rescored or dropped.

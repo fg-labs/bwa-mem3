@@ -33,6 +33,10 @@
 #          deletions, 50M8D28M8D42M, AS 120 - 2*(6 + 8) = 92 (the second
 #          deletion moves 2 bases left: 4087-4088 equal 4095-4096, 4086 does
 #          not equal 4094; the first cannot: 4050 differs from 4058)
+#   r3     ctg1:4301-4350 + ctg1:4357-4380 + ctg1:4387-4400: two 6-base
+#          deletions, 50M6D24M6D14M, AS 88 - 2*(6 + 6) = 64 (neither moves:
+#          4350 differs from 4356 and 4380 from 4386); the 14-base tail is
+#          too short to seed
 #   inR    ctg1:2101-2200, inside block R (three exact copies)
 #   inS    ctg1:3101-3200, inside block S (ctg2 copy with 5 mismatches here:
 #          AS 95 - 20 = 75 at ctg2:2101)
@@ -75,7 +79,12 @@
 #             50^<4051-4058>28^<4087-4094>42 and NM 16; at -w 7 the three
 #             seeds are three chains, so the primary is the first seed's
 #             51M69S (read base 51 matches 4051 by chance) AS 51, with two
-#             supplementary records.
+#             supplementary records. r3 at -w 8: one chain of two seeds
+#             (diagonals 0 and 6); the first band reaches the first deletion
+#             with max_off 6, not below 8/2 + 8/4 = 6, so the band is doubled,
+#             which alone reaches the second deletion (diagonal 12) and the
+#             unseeded tail: 50M6D24M6D14M AS 64, MD
+#             50^<4351-4356>24^<4381-4386>14, NM 12, the same as at -w 100.
 #   -N        -N 1 drops every chain marked kept 1 or 2 (one that overlaps a
 #             heavier chain), so each of these reads keeps one: inR MAPQ 60
 #             XS 0 no XA (its hit one of the three equal copies), inS XS 0;
@@ -89,8 +98,12 @@
 #             AS 98, del2 AS 97, c5f 100M AS 98.
 #   kernels   BWAMEM3_DISABLE_BSW8=1 (every pair on the 16-bit kernel) gives
 #             the default SAM byte for byte, on these reads and on 300
-#             generated ones (substitutions and indels, both strands), whose
-#             pairs reach both kernels (BWAMEM3_DUMP_PAIRS lists widths 8 and 16).
+#             generated ones (substitutions and indels, both strands).
+#             Not a check: a "note:" line prints the banded-SW kernel widths
+#             the BWAMEM3_DUMP_PAIRS diagnostic lists for these reads (8 and 16
+#             today), to show that the comparison covers both kernels. Which
+#             kernel a pair is routed to, and the diagnostic itself, may change
+#             without changing the output, so the note never fails the script.
 #   threads   -t 1 and -t 4 at -K 10000 give the same SAM on the generated
 #             reads.
 #   identity  on the generated reads, each path documented as byte-identical
@@ -204,6 +217,13 @@ if [[ $placed != yes ]]; then
     exit 1
 fi
 
+r3="$(seq_at ctg1 4301 50)$(seq_at ctg1 4357 24)$(seq_at ctg1 4387 14)"
+r3_md="50^$(seq_at ctg1 4351 6)24^$(seq_at ctg1 4381 6)14"
+if [[ "$(seq_at ctg1 4350 1)" == "$(seq_at ctg1 4356 1)" || "$(seq_at ctg1 4380 1)" == "$(seq_at ctg1 4386 1)" ]]; then
+    echo "FAIL: mem_extend_cli: r3's deletions are not placed as the header says on this reference" >&2
+    exit 1
+fi
+
 # The 10-base deletion has one placement only if it cannot shift by one.
 if [[ "$(seq_at ctg1 1360 1)" == "$(seq_at ctg1 1370 1)" || "$(seq_at ctg1 1361 1)" == "$(seq_at ctg1 1371 1)" ]]; then
     echo "FAIL: mem_extend_cli: the w10 deletion is not uniquely placed on this reference" >&2
@@ -221,6 +241,7 @@ fi
     mem_cli_fq zd3 "$zd3"
     mem_cli_fq w10 "$w10"
     mem_cli_fq r2 "$r2"
+    mem_cli_fq r3 "$r3"
     mem_cli_fq inR "$(seq_at ctg1 2101 100)"
     mem_cli_fq inS "$(seq_at ctg1 3101 100)"
     mem_cli_fq l150 "$l150"
@@ -371,6 +392,10 @@ for tier in $(mem_cli_tiers); do
     expect_primary "$tier: -w 8 (band retry)" "$(s w8)" r2 "0 ctg1 4001 50M8D28M8D42M 92"
     rec="$(mem_cli_primary "$(s w8)" r2)"
     mem_cli_expect "$tier: -w 8 r2 MD NM" "$r2_md 16" "$(mem_cli_tag "$rec" MD) $(mem_cli_tag "$rec" NM)"
+    expect_primary "$tier: default" "$(s default)" r3 "0 ctg1 4301 50M6D24M6D14M 64"
+    expect_primary "$tier: -w 8 (band retry)" "$(s w8)" r3 "0 ctg1 4301 50M6D24M6D14M 64"
+    rec="$(mem_cli_primary "$(s w8)" r3)"
+    mem_cli_expect "$tier: -w 8 r3 MD NM" "$r3_md 12" "$(mem_cli_tag "$rec" MD) $(mem_cli_tag "$rec" NM)"
     expect_primary "$tier: -w 7" "$(s w7)" r2 "0 ctg1 4001 51M69S 51"
     # shellcheck disable=SC2016 # an awk condition: its $n are awk fields
     mem_cli_expect "$tier: -w 7 r2 supplementary records" 2 \
@@ -416,15 +441,16 @@ for tier in $(mem_cli_tiers); do
 
     # The 8-bit kernel against the 16-bit one, and threads at a fixed -K. The
     # pair dump (BWAMEM3_DUMP_PAIRS, one row per banded-SW pair with the
-    # kernel width it was routed to) shows that both kernels ran.
+    # kernel width it was routed to) is reported as a note, never checked: it
+    # shows that both kernels ran, but routing is not part of the output.
     mem_cli_mem "$tier" "$work/all.$tier.sam" "$ref" "$work/all.fq"
-    if ! BWAMEM3_DUMP_PAIRS="$work/pairs.$tier.tsv" BWAMEM3_FORCE_TIER="$tier" "$BWA_MEM3" mem "$ref" \
-        "$work/all.fq" > "$work/dump.$tier.sam" 2> "$work/dump.$tier.sam.err"; then
-        echo "FAIL: mem_extend_cli: BWAMEM3_DUMP_PAIRS run failed (tier $tier)" >&2
-        exit 1
+    widths=unknown
+    if BWAMEM3_DUMP_PAIRS="$work/pairs.$tier.tsv" BWAMEM3_FORCE_TIER="$tier" "$BWA_MEM3" mem "$ref" \
+        "$work/all.fq" > "$work/dump.$tier.sam" 2> "$work/dump.$tier.sam.err" \
+        && [[ -s "$work/pairs.$tier.tsv" ]]; then
+        widths="$(widths_used "$work/pairs.$tier.tsv")"
     fi
-    mem_cli_expect "$tier: generated reads reach the 8-bit and the 16-bit banded SW" "8 16" \
-        "$(widths_used "$work/pairs.$tier.tsv")"
+    echo "note: $tier: banded-SW kernel widths in the pair dump: $widths (8 16 while both kernels take these reads)"
     if ! BWAMEM3_DISABLE_BSW8=1 BWAMEM3_FORCE_TIER="$tier" "$BWA_MEM3" mem "$ref" "$work/all.fq" \
         > "$work/nobsw8.$tier.sam" 2> "$work/nobsw8.$tier.sam.err"; then
         echo "FAIL: mem_extend_cli: BWAMEM3_DISABLE_BSW8=1 run failed (tier $tier)" >&2

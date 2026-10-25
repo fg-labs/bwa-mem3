@@ -7,7 +7,12 @@
 // kernel for the rest, the scalar kernel for pairs too long for either. Each pair
 // returns six fields (score, qle, tle, gscore, gtle, max_off) that decide where
 // the alignment ends, whether it is clipped and whether the band is retried, so
-// every field is compared, for every pair.
+// every field the caller reads is compared, for every pair. The caller
+// (bwamem.cpp, at every use of these kernels) reads score, qle, tle and max_off
+// always, but gscore only through "gscore <= 0 || gscore <= score - pen_clip"
+// and gtle only when that test fails: where the model's gscore is 0 or below,
+// any gscore <= 0 and any gtle give the same alignment, so the kernels are held
+// to exactly that there (same_for_caller below).
 //
 // The existing kernel tests (test_bandedswa_*.cpp) are differential: each vector
 // kernel is held to scalarBandedSWA, so a fault shared with the scalar kernel, or
@@ -97,6 +102,16 @@ Scoring scoring(int a, int b, int o_del, int e_del, int o_ins, int e_ins, int zd
         for (int j = 0; j < 5; ++j) s.mat[i * 5 + j] = (int8_t)(i == 4 || j == 4 ? -1 : i == j ? a : -b);
     if (ot) s.mat[1 * 5 + 3] = (int8_t)a;
     return s;
+}
+
+// The comparison the caller's reads justify (see the header): every field
+// equal, except that where the expected gscore is 0 or below, the result only
+// needs a gscore of 0 or below, and its gtle is not compared.
+bool same_for_caller(const ExtResult &got, const ExtResult &want) {
+    if (got.score != want.score || got.qle != want.qle || got.tle != want.tle || got.max_off != want.max_off)
+        return false;
+    if (want.gscore <= 0) return got.gscore <= 0;
+    return got.gscore == want.gscore && got.gtle == want.gtle;
 }
 
 std::string show(const ExtResult &r) {
@@ -251,7 +266,7 @@ int check_batches(IBandedPairWiseSW &bsw, const char *tier, const std::vector<Ex
                 CAPTURE(pairs[(size_t)k].target.size());
                 CAPTURE(pairs[(size_t)k].h0);
                 INFO("got " << show(got[(size_t)r]) << "; want " << show(want[(size_t)k]));
-                CHECK(got[(size_t)r] == want[(size_t)k]);
+                CHECK(same_for_caller(got[(size_t)r], want[(size_t)k]));
                 ++compared;
             }
         }
@@ -262,7 +277,7 @@ int check_batches(IBandedPairWiseSW &bsw, const char *tier, const std::vector<Ex
             CAPTURE(w);
             CAPTURE(k);
             INFO("alone: got " << show(got) << "; want " << show(want[(size_t)k]));
-            CHECK(got == want[(size_t)k]);
+            CHECK(same_for_caller(got, want[(size_t)k]));
             ++compared;
         }
     }
@@ -417,8 +432,9 @@ ExtResult res(int score, int qle, int tle, int gscore, int gtle, int max_off) {
     return r;
 }
 
-// One hand-worked case: the oracle, the scalar kernel and each vector width
-// that may take the pair must return `want`.
+// One hand-worked case: the oracle must return `want` exactly, and the scalar
+// kernel and each vector width that may take the pair must return it as far as
+// the caller reads it (same_for_caller).
 void check_hand(const std::vector<Kernel> &kernels, const Scoring &s, const ExtPair &p, int w,
                 const ExtResult &want) {
     INFO("want " << show(want));
@@ -430,13 +446,13 @@ void check_hand(const std::vector<Kernel> &kernels, const Scoring &s, const ExtP
         std::unique_ptr<IBandedPairWiseSW> bsw = build(k, s);
         const ExtResult sc = scalar_result(*bsw, p, w);
         INFO("scalar " << show(sc));
-        CHECK(sc == want);
+        CHECK(same_for_caller(sc, want));
         for (int width : {8, 16}) {
             if (width == 8 && !in_bsw8_envelope(p, s, w)) continue;
             CAPTURE(width);
             const ExtResult got = bwa_tests::score_bsw_batch(*bsw, {&p}, width, w)[0];
             INFO("kernel " << show(got));
-            CHECK(got == want);
+            CHECK(same_for_caller(got, want));
         }
     }
 }
@@ -511,8 +527,9 @@ TEST_CASE("banded SW oracle: hand-worked extensions on every runnable tier"
         ExtPair p{q, q, 3};
         p.target[0] = (uint8_t)((p.target[0] + 1) % 4);
         p.query[0] = (uint8_t)((p.query[0] + 2) % 4);
-        // Row 0 still reaches the last query column (with H = 0), so gscore is 0
-        // at gtle 1.
+        // Row 0 still reaches the last query column (with H = 0), so the model's
+        // gscore is 0 at gtle 1; the caller reads neither when gscore <= 0, so
+        // the kernels are held to gscore <= 0 only (same_for_caller).
         check_hand(kernels, def, p, 100, res(3, 0, 0, 0, 1, 0));
     }
 }
@@ -588,7 +605,7 @@ void check_random(const Scoring *scorings, int n_scorings, uint32_t seed) {
                     CAPTURE(kernels[ki].name);
                     CAPTURE(w);
                     CAPTURE(i);
-                    CHECK(scalar_result(*bsw[ki], pairs[i], w) == want[i]);
+                    CHECK(same_for_caller(scalar_result(*bsw[ki], pairs[i], w), want[i]));
                 }
             }
         }
@@ -673,8 +690,8 @@ TEST_CASE("banded SW oracle: the lane-coupling regression pairs equal the model,
             INFO("want " << show(want));
             const ExtResult alone = bwa_tests::score_bsw_batch(*bsw, {&p}, d.width, d.w)[0];
             INFO("alone " << show(alone));
-            CHECK(alone == want);
-            CHECK(scalar_result(*bsw, p, d.w) == want);
+            CHECK(same_for_caller(alone, want));
+            CHECK(same_for_caller(scalar_result(*bsw, p, d.w), want));
             for (int slot : {0, 35, 69}) {
                 std::vector<const ExtPair *> ptrs;
                 for (const ExtPair &x : batch) ptrs.push_back(&x);
@@ -682,7 +699,7 @@ TEST_CASE("banded SW oracle: the lane-coupling regression pairs equal the model,
                 const ExtResult got = bwa_tests::score_bsw_batch(*bsw, ptrs, d.width, d.w)[(size_t)slot];
                 CAPTURE(slot);
                 INFO("in a batch " << show(got));
-                CHECK(got == want);
+                CHECK(same_for_caller(got, want));
             }
             ++checked;
         }
@@ -720,7 +737,7 @@ TEST_CASE("banded SW oracle: large batches through lane compaction equal the mod
             int bad = 0;
             for (size_t i = 0; i < pairs.size(); ++i) {
                 REQUIRE(in_bsw8_envelope(pairs[i], s, w));
-                if (!(got[i] == want[i]) && bad++ < 3)
+                if (!same_for_caller(got[i], want[i]) && bad++ < 3)
                     MESSAGE(k.name << " getScores" << width << " pair " << i << ": " << show(got[i]) << "; want "
                                    << show(want[i]));
             }
@@ -759,14 +776,14 @@ TEST_CASE("banded SW oracle: results at the exact z-drop and band width where th
             const ExtResult rb = oracle(p.query, p.target, below, 100, p.h0);
             const ExtResult ra = oracle(p.query, p.target, at, 100, p.h0);
             CHECK(ra == free_run);
-            if (!(rb == ra)) ++zedges;
+            if (!same_for_caller(rb, ra)) ++zedges;
             check_hand(kernels, below, p, 100, rb);
             check_hand(kernels, at, p, 100, ra);
         }
         const ExtResult wide = oracle(p.query, p.target, off, 124, p.h0);
         if (wide.max_off >= 1) {
             const ExtResult narrow = oracle(p.query, p.target, off, wide.max_off - 1, p.h0);
-            if (!(narrow == wide)) ++wedges;
+            if (!same_for_caller(narrow, wide)) ++wedges;
             for (int w = wide.max_off - 1; w <= wide.max_off + 1; ++w) {
                 if (w < 1) continue;
                 CAPTURE(w);

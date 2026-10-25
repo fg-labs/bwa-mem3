@@ -8,8 +8,11 @@
 //   - the CIGAR is a global alignment of the whole query to the whole region:
 //     it consumes exactly l_query query bases and re - rb reference bases, uses
 //     only M, I and D, never puts I next to D (ksw_global2's model), and
-//     rescored under the scoring it equals the returned score, which equals the
-//     optimum of a full-matrix three-state DP written here;
+//     rescored under the scoring it equals the returned score. That score is
+//     the optimum of a full-matrix three-state DP written here wherever the
+//     band bwa documents for this step holds that optimum: half of the longest
+//     gap the read could pay for plus the length difference, at most the
+//     caller's band and at least |tlen - qlen| + 3 (bwa's bwa_gen_cigar2);
 //   - MD follows the SAM specification over that CIGAR: the run of matching
 //     bases, then each mismatching reference base, and "^" plus the deleted
 //     reference bases for a deletion; bwa leaves a deletion at either end of
@@ -92,6 +95,21 @@ std::string cigar_string(const uint32_t *cigar, int n) {
     std::string out;
     for (int k = 0; k < n; ++k) out += std::to_string(cigar[k] >> 4) + "MIDNSHP=X"[cigar[k] & 0xf];
     return out;
+}
+
+// The band bwa_gen_cigar2 documents for a query of qlen bases against a region
+// of rlen under band cap w_ (bwa 0.7.x bwa.c): half of the longest insertion or
+// deletion that half the read's matches could pay for, plus |rlen - qlen|, at
+// most w_ and at least |rlen - qlen| + 3. A narrower band computed by the code
+// is allowed only where it gives the same alignment, so where this band holds
+// the unbanded optimum the result must be that optimum.
+int documented_band(const Scoring &s, int qlen, int rlen, int w_) {
+    const int half = (qlen + 1) >> 1;
+    const int max_ins = (int)((double)(half * s.a - s.o_ins) / s.e_ins + 1.);
+    const int max_del = (int)((double)(half * s.a - s.o_del) / s.e_del + 1.);
+    const int max_gap = std::max(1, std::max(max_ins, max_del));
+    const int dlen = std::abs(rlen - qlen);
+    return std::max(std::min((max_gap + dlen + 1) >> 1, w_), dlen + 3);
 }
 
 // Full-matrix global three-state DP; gaps open only from M (ksw_global2).
@@ -324,12 +342,10 @@ TEST_CASE("bwa_gen_cigar2: random regions give an optimal CIGAR and the MD and N
             const Derived d = derive(g.cigar.data(), g.n_cigar, fq, fref, s);
             CHECK(d.valid);
             CHECK(g.score == d.score);
-            // bwa_gen_cigar4 never bands narrower than |tlen - qlen| + 3; where
-            // that band already holds the unbanded optimum, every band it may
-            // choose does, so the score must be that optimum.
+            // Where the documented band holds the unbanded optimum, the score
+            // must be that optimum.
             const int opt = global_optimum(fq, fref, s);
-            const int floor_band = std::abs((int)fref.size() - (int)fq.size()) + 3;
-            if (global_optimum(fq, fref, s, floor_band) == opt) {
+            if (global_optimum(fq, fref, s, documented_band(s, (int)fq.size(), (int)fref.size(), 100)) == opt) {
                 CHECK(g.score == opt);
                 ++optimal;
             }
@@ -404,6 +420,52 @@ TEST_CASE("bwa_gen_cigar2: short reads in long regions keep the band floor of |t
     }
     CHECK(optimal >= 400);
     CHECK(floor_needed >= 5);
+}
+
+TEST_CASE("bwa_gen_cigar2: an insertion and a deletion far apart on the diagonal are aligned in the documented band"
+          * doctest::test_suite("unit/cigar")) {
+    // The read is the region with a k-base insertion and, further on, a k-base
+    // deletion (k = 8-20), so read and region have the same length and the
+    // floor band (3) cannot hold the alignment: the band derived from the gap
+    // penalties (half the payable gap; 23 for a 100-base read at the defaults)
+    // must. Both strands; the score must be the unbanded optimum, which the
+    // test also requires to need more than the floor band.
+    const Scoring def = scoring(1, 4, 6, 1, 6, 1);
+    std::mt19937 rng(2323u);
+    const Packed p = pack(random_seq(rng, 3000));
+    const int64_t L = p.l_pac();
+    int beyond_floor = 0;
+    for (int n = 0; n < 40; ++n) {
+        const int len = 80 + (int)(rng() % 70), k = 8 + (int)(rng() % 13);
+        const int64_t fb = (int64_t)(rng() % (uint32_t)(L - len));
+        const std::vector<uint8_t> fref(p.fwd.begin() + fb, p.fwd.begin() + fb + len);
+        // insertion after base i0, deletion of [d0, d0 + k), d0 >= i0 + 10
+        const int i0 = 10 + (int)(rng() % (uint32_t)(len / 3)), d0 = i0 + 10 + (int)(rng() % 15);
+        if (d0 + k + 10 > len) continue;
+        std::vector<uint8_t> fq(fref.begin(), fref.begin() + i0);
+        const std::vector<uint8_t> ins = random_seq(rng, (size_t)k);
+        fq.insert(fq.end(), ins.begin(), ins.end());
+        fq.insert(fq.end(), fref.begin() + i0, fref.begin() + d0);
+        fq.insert(fq.end(), fref.begin() + d0 + k, fref.end());
+        REQUIRE(fq.size() == fref.size());
+        const bool rev = n % 2 == 1;
+        const int64_t rb = rev ? 2 * L - (fb + len) : fb, re = rb + len;
+        CAPTURE(n);
+        CAPTURE(k);
+        CAPTURE(rev);
+        const Generated g = gen(p, def, 100, rev ? revcomp(fq) : fq, rb, re);
+        const Derived d = derive(g.cigar.data(), g.n_cigar, fq, fref, def);
+        CHECK(d.valid);
+        CHECK(g.score == d.score);
+        CHECK(g.md == d.md);
+        CHECK(g.nm == d.nm);
+        const int opt = global_optimum(fq, fref, def);
+        const int band = documented_band(def, len, len, 100);
+        REQUIRE(global_optimum(fq, fref, def, band) == opt);
+        CHECK(g.score == opt);
+        if (global_optimum(fq, fref, def, 3) < opt) ++beyond_floor;
+    }
+    CHECK(beyond_floor >= 25);
 }
 
 TEST_CASE("bwa_gen_cigar2: an indel in a repeat is placed leftmost on the forward reference, both strands"

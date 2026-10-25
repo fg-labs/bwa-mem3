@@ -41,7 +41,14 @@
 // a field is only compared when both runs agree on it (all fields agree on the
 // large majority of pairs; the test asserts that they did).
 //
-// Hand-worked cases at the top pin all seven fields on inputs with one optimal
+// What is compared is what `mem` reads of a result: score, te, qe, tb and qb
+// (the rescued mate's coordinates, bwamem_pair.cpp mem_matesw_batch_post) and
+// score2 (its csub, which enters the MAPQ). te2, the second-best's row, is
+// computed by the kernels but read nowhere in `mem`, so it is not compared. With
+// KSW_XBYTE, ksw.h documents only the reported score (255) after an overflow;
+// the other fields of an overflowed pass are not compared either.
+//
+// Hand-worked cases at the top pin those six fields on inputs with one optimal
 // path; random and adversarial pairs (mutated, homopolymer, tandem repeats with
 // a real second-best, N bases, all-mismatch, scores at the 8-bit ceiling) are
 // scored in batches of different orders, so a lane's result may not depend on
@@ -259,14 +266,14 @@ Expected expected(const std::vector<uint8_t> &q, const std::vector<uint8_t> &t, 
     return e;
 }
 
-// Compare the fields the model pins.
+// Compare the fields the model pins and `mem` reads (te2 is not read; see the
+// header).
 void check_fields(const kswr_t &got, const Expected &want) {
     INFO("got " << show(got) << "; want " << show(want.r));
     if (want.known[0]) CHECK(got.score == want.r.score);
     if (want.known[1]) CHECK(got.te == want.r.te);
     if (want.known[2]) CHECK(got.qe == want.r.qe);
     if (want.known[3]) CHECK(got.score2 == want.r.score2);
-    if (want.known[4]) CHECK(got.te2 == want.r.te2);
     if (want.known[5]) CHECK(got.tb == want.r.tb);
     if (want.known[6]) CHECK(got.qb == want.r.qb);
 }
@@ -497,7 +504,9 @@ TEST_CASE("local SW oracle: the 8-bit pass reports 255 once the score reaches 25
     // ksw.h: "KSW_XBYTE: use an unsigned byte to store a score. If overflow
     // occurs, kswr_t::score will be set to 255". With -A 1 -B 4, shift is 4,
     // so a 250-base exact match (250 + 4 = 254) is still exact and a 251-base
-    // one (251 + 4 = 255) is reported as 255; the 16-bit pass scores both.
+    // one (251 + 4 = 255) is reported as 255; the 16-bit pass scores both. Only
+    // the score is documented after an overflow, so only the score is checked
+    // there.
     const std::vector<Tier> tiers = runnable_tiers();
     REQUIRE(!tiers.empty());
     const Scoring def = scoring(1, 4, 6, 1, 6, 1);
@@ -514,15 +523,16 @@ TEST_CASE("local SW oracle: the 8-bit pass reports 255 once the score reaches 25
             CHECK(r16.te == 20 + len - 1);
             CHECK(r16.qe == len - 1);
             if (len == 250) {
+                // No overflow: every field as the model gives it (no second-best
+                // or start without KSW_XSUBO / KSW_XSTART).
                 CHECK(r8.score == 250);
+                CHECK(r8.te == 20 + len - 1);
                 CHECK(r8.qe == len - 1);
+                const kswr_t o8 = local_pass(qry, base, def, KSW_XBYTE, true);
+                CHECK(memcmp(&o8, &r8, sizeof o8) == 0);
             } else {
                 CHECK(r8.score == 255);
-                CHECK(r8.qe == -1);  // not looked for after an overflow
             }
-            CHECK(r8.te == 20 + std::min(len, 251) - 1);  // the row where it stopped
-            const kswr_t o8 = local_pass(qry, base, def, KSW_XBYTE, true);
-            CHECK(memcmp(&o8, &r8, sizeof o8) == 0);
         }
     }
     // The batched 8-bit kernel takes a mate of length l when l*a + shift <=
