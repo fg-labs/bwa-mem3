@@ -64,6 +64,31 @@ endif
 LIBS    += $(HTSLIB_static_LIBS)
 LDFLAGS += $(HTSLIB_static_LDFLAGS)
 
+# The default FASTQ reader in libbwa.a (src/fast_reader.c, reached through
+# bseq_read_fast and fr_fastq_next) inflates plain gzip with zlib-ng's native
+# zng_* API and decodes BGZF blocks with libdeflate. Link both, resolved as the
+# parent Makefile resolves them, so a test can call the reader: the vendored
+# static zlib-ng archive by default (built before libbwa.a, whose
+# src/fast_reader.o depends on it), a host zlib-ng with ZLIBNG_USE_VENDORED=0,
+# and libdeflate from Homebrew on macOS. On Linux htslib's static deps usually
+# carry -ldeflate already; naming it again is harmless. Each library comes
+# after -lbwa in $(LIBS), as a static link needs.
+ZLIBNG_USE_VENDORED ?= 1
+ifeq ($(ZLIBNG_USE_VENDORED),1)
+    LIBS += ../ext/zlib-ng/build/libz-ng.a
+else ifeq ($(UNAME_S),Darwin)
+    ZLIBNG_PREFIX ?= $(shell brew --prefix zlib-ng 2>/dev/null)
+    LIBS += -L$(ZLIBNG_PREFIX)/lib -lz-ng
+else
+    LIBS += -lz-ng
+endif
+ifeq ($(UNAME_S),Darwin)
+    LIBDEFLATE_PREFIX ?= $(shell brew --prefix libdeflate 2>/dev/null)
+    LIBS += -L$(LIBDEFLATE_PREFIX)/lib -ldeflate
+else
+    LIBS += -ldeflate
+endif
+
 ifneq ($(IS_ARM),)
     # Keep the ARM cache-line alignment in lock-step with the top-level Makefile:
     # CACHE_LINE_BYTES feeds _mm_malloc, so a build overriding
@@ -142,6 +167,16 @@ COVERAGE_OPT ?= -O0
 ifneq ($(COVERAGE),)
     CXXFLAGS += $(COVERAGE_OPT) --coverage
     LDFLAGS  += --coverage
+endif
+
+# ASAN=1 (`make ASAN=1 test-binaries`; the parent's command-line ASAN reaches
+# this sub-make through MAKEFLAGS) builds libbwa.a with AddressSanitizer, so
+# every test binary must link the sanitizer runtime too or the instrumented
+# objects leave __asan_* symbols unresolved. The test sources are instrumented
+# as well, so their own buffers are checked.
+ifneq ($(strip $(ASAN)),)
+    CXXFLAGS += -fsanitize=address -fno-omit-frame-pointer
+    LDFLAGS  += -fsanitize=address
 endif
 FRAMEWORK_SRCS := $(FRAMEWORK_DIR)/scoring.cpp \
                   $(FRAMEWORK_DIR)/meth_scoring.cpp \
