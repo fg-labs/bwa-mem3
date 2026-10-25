@@ -1,16 +1,47 @@
 name: CI
 
 on:
+  # Every change reaches main through the merge queue, whose merge_group run
+  # tests the exact commit that then lands, so a full run on the push to main
+  # would test the same commit twice. On push only two jobs run: coverage (it
+  # gives Codecov the main baseline PR diffs compare against) and warm-caches
+  # (it saves the compiler caches PR and merge-queue runs restore); every other
+  # job carries `if: github.event_name != 'push'`.
+  #
+  # Two depths, decided once by .github/scripts/ci-depth.sh and read by the
+  # steps as CI_DEPTH. The merge_group run is always full: what lands is
+  # checked at full depth. A pull_request run, repeated on every push to the
+  # branch, is light unless its diff touches the SIMD kernels, their harnesses
+  # or tests, the build files, the compiler install or this workflow, in which
+  # case it is full too, since that is the PR the deep checks exist for. Light
+  # trims only the kernels' deep safety nets: the rescue kernel sweeps run at
+  # their reduced job counts on every row, the canonical row skips the
+  # AVX-512BW kswv unit tree, and the MSan padded-lane gate (not a required
+  # check) does not run. Every other job and step runs at both depths, so the
+  # required checks report as before; the script falls back to full whenever it
+  # cannot tell.
   push:
     branches: [main]
   pull_request:
   merge_group:
 
+# A new push to a pull request's branch cancels that PR's run still in
+# progress: the older commit's results are moot, and its remaining jobs are
+# compute spent for nothing. Only pull_request runs share a group. Every
+# merge_group and push run gets its own (keyed on run_id), so none is ever
+# cancelled or held back: each merge-queue entry must report on its own
+# commit, and each push to main saves that commit's coverage baseline and
+# caches.
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('ci-pr-{0}', github.event.pull_request.number) || format('ci-run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 # Least-privilege GITHUB_TOKEN. Without this block the token inherits the
 # repository default, which -- depending on the org/repo setting -- can be
 # read/write across contents, issues, pull requests and more, far beyond what
-# any job here needs. Nothing in this workflow uses the token except
-# actions/checkout, so `contents: read` is the whole requirement:
+# any job here needs. Apart from warm-caches (below), nothing in this workflow
+# uses the token except actions/checkout, so `contents: read` is the whole
+# requirement:
 #
 #   - actions/upload-artifact and actions/cache authenticate with
 #     ACTIONS_RUNTIME_TOKEN, which the runner injects independently of
@@ -20,10 +51,20 @@ on:
 #
 # release.yml is the counterexample worth keeping in view: it starts from
 # `permissions: {}` and grants `contents`/`pull-requests` write per job,
-# because its jobs genuinely differ. Here all three jobs need exactly
-# `contents: read`, so it is declared once at the workflow level.
+# because its jobs genuinely differ. Here every job needs `contents: read`, so
+# it is declared once at the workflow level; the one exception, warm-caches,
+# adds `actions: write` at job level to delete superseded cache entries, and
+# runs only on push to main, never on PR code.
 permissions:
   contents: read
+
+env:
+  # Every opt-in debug/instrumentation macro, enabled at once by the
+  # rebuild-variants debug-macro build (see that step for why). Here rather than
+  # inline in the step so warm-caches compiles the identical configuration for
+  # the compiler cache; test/regression/debug_macro_flag_lint.sh keeps this one
+  # list and the macros in src/ in step.
+  DEBUG_MACRO_EXTRA_CXXFLAGS: "-DBWA_MEM3_DEBUG_CHN_FLT_XCHECK -DBWA_MEM3_DEBUG_RID_CHECK -DBWA_MEM3_DEBUG_UNGAPPED_XCHECK -DBSW8_ASSERT_ENVELOPE -DBWA_MEM3_DEBUG_POISON -DBWAMEM3_UGP_PROFILE=1 -DBWA_MEM3_DEBUG_RESCUE_STATS -DBWA_MEM3_DEBUG_SRTGG_TINY -DBWA_MEM3_DEBUG_P3_XCHECK -DBWA_MEM3_DEBUG_RESCUE_SKIP_XCHECK -DBWA_MEM3_DEBUG_RIGHT_H0_XCHECK"
 
 jobs:
   # Source-only lint; no toolchain, no build. Kept as its own job so the
@@ -31,6 +72,7 @@ jobs:
   # matrix row, and so it reports in seconds instead of after a full build.
   ndebug-gate-lint:
     name: NDEBUG gate lint (src/)
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     # Source-only lint that reports in seconds; a generous ceiling so only a
     # genuinely hung runner trips it, never a slow-but-normal one.
@@ -52,6 +94,7 @@ jobs:
 
   avx2-floor-lint:
     name: AVX2 floor (pre-AVX2 x86 refused)
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     # The pre-AVX2 x86 tiers (sse41/sse42/avx) were retired with the scalar
     # mate-rescue path: batched kswv requires AVX2+, and a sub-AVX2 build would
@@ -150,6 +193,7 @@ jobs:
   # reads as "the opt-in macro list drifted" rather than as an NDEBUG finding.
   debug-macro-flag-lint:
     name: Opt-in debug macro list (ci.yml <-> src/)
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     # Source-only lint, seconds of work; ceiling catches a hung runner only.
     timeout-minutes: 10
@@ -175,6 +219,7 @@ jobs:
   # wiring is checked statically instead.
   calloc-interpose-flag-lint:
     name: Calloc-interposing tests build with -fno-builtin-malloc
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     # Source-only lint, seconds of work; ceiling catches a hung runner only.
     timeout-minutes: 10
@@ -197,6 +242,7 @@ jobs:
   # rather than being buried in a matrix row. Runs in seconds.
   shell-lint:
     name: Shell lint (shellcheck + shfmt)
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     # Downloads two small pinned tools then lints; well under a minute normally.
     timeout-minutes: 10
@@ -261,6 +307,7 @@ jobs:
   # failure reads as "a regression script runs nowhere" on its own line.
   regression-coverage-lint:
     name: Regression scripts are run by CI
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     # Source-only lint, seconds of work; ceiling catches a hung runner only.
     timeout-minutes: 10
@@ -280,6 +327,7 @@ jobs:
   # went stale" rather than as a finding about src/.
   readme-contract-lint:
     name: Regression README contract (README <-> test/regression/)
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     # Source-only lint, seconds of work; ceiling catches a hung runner only.
     timeout-minutes: 10
@@ -302,6 +350,7 @@ jobs:
   # docs went stale" rather than as a build or test finding.
   rescue-docs-lint:
     name: Rescue developer docs (pages, knob list <-> src/)
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     # Source-only lint, seconds of work; ceiling catches a hung runner only.
     timeout-minutes: 10
@@ -319,12 +368,49 @@ jobs:
       - name: Rescue docs match the source (pages, knob list, gates)
         run: bash test/regression/rescue_docs_lint.sh
 
+  # The run's CI depth (see the top of the file) as a job output, for the jobs
+  # that skip whole on a light PR run and so must know before they start (the
+  # MSan gate). build-and-test runs the same script as its own first step
+  # instead of waiting on this job, which would delay every row. Seconds of
+  # work: a depth-1 checkout and, on a PR, a depth-1 fetch of the base commit.
+  ci-depth:
+    name: CI depth (full in the merge queue, light on most PRs)
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      depth: ${{ steps.depth.outputs.depth }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Decide the CI depth
+        id: depth
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: bash .github/scripts/ci-depth.sh
+
   build-and-test:
     strategy:
       fail-fast: false
       # Each row carries `artifact_slug` (a-z0-9-) alongside the human-
       # friendly `name`. Artifact uploads use the slug to keep names URL-
       # safe and free of spaces / parens; job titles still use `name`.
+      # `kernel_sweep: "full"` marks the rows that run the rescue
+      # kernel-equivalence sweeps (rescue_prune_eq, rescue_band_harness) at
+      # their full job counts on a full-depth run (CI_DEPTH, see the top of the
+      # file): one per SIMD family and compiler family -- the canonical row
+      # (AVX2, clang-19), Linux ARM64 (NEON, clang-19) and gcc compat (AVX2,
+      # g++, whose codegen of the same kernels differs). The no-mimalloc and
+      # single-binary rows build the same AVX2 kernels with the same clang-19,
+      # and macOS the same NEON kernels with Apple clang; they, and every row
+      # on a light PR run, run every configuration at about a fifth of the jobs
+      # (see those steps), which keeps each configuration's per-batch draws and
+      # vacuity checks but reaches fewer of RB_SCORING=random's scoring
+      # categories. The "Kernel sweep depth" step resolves the two into
+      # KERNEL_SWEEP for the sweep steps.
       matrix:
         include:
           - os: ubuntu-latest
@@ -332,17 +418,22 @@ jobs:
             use_mimalloc: "1"
             canonical: true
             run_integration: true
+            kernel_sweep: "full"
+            ccache_size: "300M"
             name: "Linux x86_64 AVX2 (mimalloc)"
             artifact_slug: "linux-x86_64-avx2-mimalloc"
           - os: ubuntu-latest
             arch_flag: "avx2"
             use_mimalloc: "0"
+            # Built without LTO (see `lto` under the job's env).
+            lto: "off"
             name: "Linux x86_64 AVX2 (no-mimalloc)"
             artifact_slug: "linux-x86_64-avx2-no-mimalloc"
           - os: ubuntu-24.04-arm
             arch_flag: ""
             use_mimalloc: "1"
             run_integration: true
+            kernel_sweep: "full"
             name: "Linux ARM64 (mimalloc)"
             artifact_slug: "linux-arm64-mimalloc"
           - os: macos-latest
@@ -353,6 +444,7 @@ jobs:
             # is above the Apple-clang floor — no llvm.sh install needed here.
             cxx: "clang++"
             cc: "clang"
+            ccache_size: "100M"
             name: "macOS ARM64 (mimalloc)"
             artifact_slug: "macos-arm64-mimalloc"
           - os: ubuntu-latest
@@ -363,6 +455,9 @@ jobs:
             # unset baseline_arch to avx2 too). Spelled out on this row so the
             # key is declared in the matrix and its use type-checks.
             baseline_arch: "avx2"
+            # Built without LTO (see `lto` under the job's env).
+            lto: "off"
+            ccache_size: "300M"
             name: "Linux x86_64 single-binary (mimalloc)"
             artifact_slug: "linux-x86_64-single-mimalloc"
           # gcc build-compatibility lane. The rest of the matrix builds with
@@ -376,16 +471,20 @@ jobs:
             cxx: "g++"
             cc: "gcc"
             allow_unsupported: "1"
+            kernel_sweep: "full"
             name: "Linux x86_64 AVX2 (gcc compat)"
             artifact_slug: "linux-x86_64-avx2-gcc-compat"
 
     name: ${{ matrix.name }}
+    if: github.event_name != 'push'
     runs-on: ${{ matrix.os }}
-    # Heaviest job here: the canonical row runs the full regression suite on
-    # top of the mimalloc build plus reference download/index. Normal rows
-    # finish in a few minutes; the canonical row runs longest. Sized well above
-    # that so a hung runner fails fast instead of at the 6h default, without
-    # flaking a slow row.
+    # Heaviest job here: on top of the mimalloc build plus reference
+    # download/index, the canonical row runs the unit-test harness, the
+    # AVX-512BW kswv unit tests, the Makefile checks and the full rescue kernel
+    # sweeps (its binary-only regression scripts run in canonical-regressions).
+    # Normal rows finish in a few minutes; the canonical row runs longest. Sized
+    # well above that so a hung runner fails fast instead of at the 6h default,
+    # without flaking a slow row.
     timeout-minutes: 45
 
     # Compiler is set per row: CXX defaults to clang-19 (installed from
@@ -405,6 +504,24 @@ jobs:
       CXX: ${{ matrix.cxx || 'clang++-19' }}
       CC: ${{ matrix.cc || 'clang-19' }}
       ALLOW_UNSUPPORTED_COMPILER: ${{ matrix.allow_unsupported || '0' }}
+      # The Makefile's LTO= knob (auto | full | thin | off; `LTO ?= auto`), set
+      # at the job level for the same reason as CXX/CC: every make in the job,
+      # recursive and test/Makefile ones included, must see the same value.
+      # LTO_CFLAGS (-flto=... -ffat-lto-objects on every libbwa.a compile) is
+      # part of the build-flags stamp, so a single make call without it would
+      # rebuild libbwa.a mid-job. The rows that set `lto: "off"` (no-mimalloc
+      # and single-binary) are there for the allocator and for the bare-`make`
+      # multi-tier build path, not for the LTO link: the full-LTO link of
+      # bwa-mem3 is single-threaded, adds about 15-20 s and ccache cannot cache
+      # it, so they skip it. Full LTO stays covered where it matters: the
+      # canonical row (whose arch=avx2 build compiles the same AVX2-floor
+      # objects and links the same per-tier kernel objects as the single-binary
+      # build), canonical-regressions and Linux ARM64, and the release
+      # workflow's tarball check, which asserts the bare `make` links with full
+      # LTO. `auto` is the Makefile default, so the other rows build exactly as
+      # a bare make would (an empty value would instead trip the Makefile's
+      # invalid-LTO warning).
+      LTO: ${{ matrix.lto || 'auto' }}
 
     steps:
       - name: Checkout
@@ -420,6 +537,24 @@ jobs:
           persist-credentials: false
           submodules: recursive
 
+      # Sets CI_DEPTH for the rest of the job (see the top of the file).
+      - name: CI depth
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: bash .github/scripts/ci-depth.sh
+
+      # The rescue kernel sweeps' depth, resolved once for both sweep steps:
+      # full only on a full-depth run of a kernel_sweep "full" row, reduced
+      # otherwise. Those steps treat an unset KERNEL_SWEEP as full, so losing
+      # this step (or the one above) costs time, never depth.
+      - name: Kernel sweep depth
+        env:
+          MATRIX_KERNEL_SWEEP: ${{ matrix.kernel_sweep || 'reduced' }}
+        run: |
+          if [ "$MATRIX_KERNEL_SWEEP" = full ] && [ "${CI_DEPTH:-full}" != light ]; then sweep=full; else sweep=reduced; fi
+          echo "kernel sweep: $sweep (row: $MATRIX_KERNEL_SWEEP, CI depth: ${CI_DEPTH:-unset})"
+          echo "KERNEL_SWEEP=$sweep" >> "$GITHUB_ENV"
+
       - name: Install dependencies (Linux)
         if: runner.os == 'Linux'
         # libomp-dev is required so `clang++ -fopenmp` can find -lomp when
@@ -433,12 +568,17 @@ jobs:
         # libdeflate-enabled link path is invisible to CI.
         uses: awalsh128/cache-apt-pkgs-action@acb598e5ddbc6f68a970c5da0688d2f3a9f04d05 # v1.6.0
         with:
-          packages: zlib1g-dev libdeflate-dev bwa autoconf automake samtools libomp-dev
+          packages: zlib1g-dev libdeflate-dev bwa autoconf automake samtools libomp-dev ccache
           version: 1.1
 
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
-        run: brew install bwa autoconf automake libomp libdeflate
+        # No auto-update or post-install cleanup: together they were most of
+        # this step's time, and the image's formulae are new enough.
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+        run: brew install bwa autoconf automake libomp libdeflate ccache
 
       - name: Install clang-19 (Linux)
         # The matrix builds with clang-19 by default (see the action for why and
@@ -446,6 +586,16 @@ jobs:
         # deliberately builds with the runner's g++ + ALLOW_UNSUPPORTED_COMPILER=1.
         if: runner.os == 'Linux' && matrix.cxx != 'g++'
         uses: ./.github/actions/install-clang-19
+
+      # After the compiler install: the action shims only compilers that exist.
+      # Restore-only; warm-caches saves this row's cache (same config slug) on
+      # every push to main. The cap allows a couple of main builds' objects; the
+      # x86 single-binary and canonical rows compile the most configurations.
+      - name: Set up ccache
+        uses: ./.github/actions/setup-ccache
+        with:
+          config: ${{ matrix.artifact_slug }}
+          max-size: ${{ matrix.ccache_size || '200M' }}
 
       - name: Verify CMake is available
         run: cmake --version
@@ -481,7 +631,8 @@ jobs:
         # so a clang row that lost ld.lld would stay green while testing a
         # binary that does not ship. Assert the resolved mode instead: full LTO
         # on the Linux clang rows (install-clang-19 installs lld-19), off on the
-        # gcc and macOS rows. `make -s print-BWA_LTO_MODE` re-runs the same
+        # gcc and macOS rows, and on the rows that set `lto: "off"` (job env
+        # LTO). `make -s print-BWA_LTO_MODE` re-runs the same
         # parse-time probe with this row's compiler; it compiles nothing.
         # The mode alone does not prove the link used it, so the step also
         # dry-runs this row's build with src/main.o made newer than the binary
@@ -493,8 +644,15 @@ jobs:
           MATRIX_ARCH_FLAG: ${{ matrix.arch_flag }}
           MATRIX_BASELINE_ARCH: ${{ matrix.baseline_arch || 'avx2' }}
           MATRIX_USE_MIMALLOC: ${{ matrix.use_mimalloc }}
+          MATRIX_LTO: ${{ matrix.lto }}
         run: |
-          if [ "$RUNNER_OS" = Linux ] && [ "$MATRIX_CXX" != g++ ]; then expected=full; else expected=off; fi
+          if [ "$MATRIX_LTO" = off ]; then
+            expected=off
+          elif [ "$RUNNER_OS" = Linux ] && [ "$MATRIX_CXX" != g++ ]; then
+            expected=full
+          else
+            expected=off
+          fi
           got=$(make -s print-BWA_LTO_MODE CXX="$CXX" | tail -n 1)
           echo "LTO mode: $got (expected $expected)"
           if [ "$got" != "$expected" ]; then
@@ -594,15 +752,18 @@ jobs:
           # arm64); require it, so the compaction equivalence tests cannot skip there.
           BWA_REQUIRE_COMPACTION_TIER: ${{ runner.arch == 'X64' && 'avx2' || 'neon' }}
           JOB_INDEX: ${{ strategy.job-index }}
-        # `--reporters=junit --out=…` writes JUnit XML to the file and
-        # nothing to stdout. doctest itself prints the failing-assertion
-        # summary to stderr before exiting non-zero, so the per-step log
-        # already surfaces the diagnosis; the JUnit XML is only consumed
-        # via the upload-artifact step below.
+        # test/run_unit_shards.sh runs the binary as contiguous slices of its
+        # cases, one concurrent job per CPU: the cases are many and no one of
+        # them dominates, so this cuts the step's wall time by about the core
+        # count at the same CPU cost. Each slice writes its own JUnit XML,
+        # unit-results-<job>-shard<k>.xml, which the upload step's glob still
+        # matches. With the JUnit reporter doctest prints nothing about a
+        # failure to the console, so the runner prints a failing slice's JUnit
+        # XML (the failed assertions) into the log itself, and fails the step
+        # if any slice fails or crashes or the run selects no test cases.
         run: |
-          ./test/bwa_mem3_tests_unit \
-            --reporters=junit \
-            --out="unit-results-${JOB_INDEX}.xml"
+          UNIT_JUNIT_PREFIX="unit-results-${JOB_INDEX}" \
+            bash test/run_unit_shards.sh ./test/bwa_mem3_tests_unit
 
       - name: Upload unit-test results
         if: always()
@@ -927,7 +1088,8 @@ jobs:
 
       - name: Stage chr22 fixture (reference, bwa index, simulated reads)
         # Pinned chr22 + .fai, bwa's index, and ~50k simulated PE pairs under
-        # /tmp/chr22 and /tmp/chr22-sim; shared with the rebuild-variants job.
+        # /tmp/chr22 and /tmp/chr22-sim; shared with the canonical-regressions
+        # and rebuild-variants jobs.
         uses: ./.github/actions/chr22-fixture
 
       - name: Build chr22 FMI index
@@ -945,52 +1107,6 @@ jobs:
           BWA_CHR22_FA=/tmp/chr22/bwa_chr22.fa \
           CHR22_SIM_DIR=/tmp/chr22-sim \
           bash test/regression/chr22_parity.sh
-
-      - name: Long-read PE 8-bit/16-bit parity (chr22, 400bp)
-        if: matrix.canonical == true
-        # Exercises the recovered >=128bp 8-bit banded-SW path end-to-end: the
-        # script self-simulates 400bp PE reads and diffs `bwa-mem3 mem` with the
-        # 8-bit path enabled (default) vs BWAMEM3_DISABLE_BSW8=1 (forced 16-bit).
-        # The two must be byte-identical -- guards the unsigned [0,255] recurrence
-        # + routing gate against regression. Self-contained A/B (one binary).
-        run: |
-          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
-          CHR22_FA=/tmp/chr22/chr22.fa \
-          CHR22_SIM_DIR=/tmp/chr22-sim-longread \
-          PIXI_MANIFEST="$GITHUB_WORKSPACE/test/holodeck/pixi.toml" \
-          bash test/regression/longread_pe_parity.sh
-
-      - name: SIMD tier parity (avx2 vs avx512bw, chr22)
-        if: matrix.canonical == true
-        # One binary must emit byte-identical SAM whichever usable kernel tier it
-        # dispatches. Scope is avx2/avx512bw: there is no batched kswv kernel
-        # below AVX2 and forcing those tiers aborts the aligner (see the script
-        # header). Cross-build parity is a different property, already covered by
-        # chr22_parity.sh running on the avx2 and arm64 build jobs.
-        #
-        # On a runner without AVX-512BW there is only one sweepable tier and the
-        # script reports SKIP:, not PASS: — so this step is a no-op there rather
-        # than a false green. It still earns its place: the script had rotted
-        # unrun to the point of aborting on its first tier, and this keeps that
-        # from recurring silently.
-        run: |
-          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
-          PARITY_FA=/tmp/chr22/chr22.fa \
-          PARITY_R1=/tmp/chr22-sim/reads.r1.fastq.gz \
-          PARITY_R2=/tmp/chr22-sim/reads.r2.fastq.gz \
-          bash test/regression/all_tiers_parity.sh
-
-      - name: Rescue identity under each forced x86 tier (generated PE fixture)
-        if: matrix.canonical == true
-        # The kswv rescue kernels differ per tier, so the 11-op cell (and the
-        # rest of the rescue shortcuts) is checked end to end on each tier this
-        # host has: the reference and default legs under BWAMEM3_FORCE_TIER must
-        # equal the unforced reference. On a runner without AVX-512BW the script
-        # reports that tier SKIP:. Seconds of work: a 60 kb generated fixture.
-        run: |
-          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
-          RESCUE_TIERS="avx2 avx512bw" \
-          bash test/regression/rescue_prune_identity.sh
 
       - name: Run unit-test harness
         # The standalone FM-index parity tests in the harness gate the arm64
@@ -1012,12 +1128,20 @@ jobs:
       # BWA3_RESCUE_USQADD selects) run in no unit test there. Where the runner
       # has AVX-512BW, build the unit binary at that tier in a copy of the tree
       # (its objects must not replace the AVX2 ones the later steps use) and run
-      # the kswv suite; elsewhere report SKIP.
+      # the kswv suite; elsewhere report SKIP. A light PR run (CI_DEPTH, see the
+      # top of the file) reports SKIP too: the second tree is a minute of
+      # compile on the row that sets the workflow's wall time, and these bodies
+      # change only on the kernel paths that make a PR run full. The merge
+      # queue always runs it.
       - name: kswv unit tests at the AVX-512BW tier (where the runner has it)
         if: matrix.canonical == true
         env:
           MATRIX_USE_MIMALLOC: ${{ matrix.use_mimalloc }}
         run: |
+          if [ "${CI_DEPTH:-full}" = light ]; then
+            echo "SKIP: light PR run (no kernel path changed); the merge queue runs the kswv, lane-compaction and z-drop gate unit tests at the avx512bw tier"
+            exit 0
+          fi
           if ! grep -qw avx512bw /proc/cpuinfo; then
             echo "SKIP: runner has no AVX-512BW; the kswv, lane-compaction and z-drop gate unit tests did not run at the avx512bw tier"
             exit 0
@@ -1124,6 +1248,9 @@ jobs:
           MAKE_ARGS="CXX=$CXX USE_MIMALLOC=$MATRIX_USE_MIMALLOC" \
             bash test/regression/make_htscodecs_guard.sh
 
+      # Stays here, not in canonical-regressions with the other chr22 scripts:
+      # it compares against the bwamem3.sam the parity step above writes, and a
+      # few seconds of work does not justify a second parity run there.
       - name: --bam=6 roundtrip smoke (chr22)
         if: matrix.canonical == true
         run: |
@@ -1131,30 +1258,6 @@ jobs:
           CHR22_FA=/tmp/chr22/chr22.fa \
           CHR22_SIM_DIR=/tmp/chr22-sim \
           bash test/regression/bam_roundtrip.sh
-
-      - name: --bam-threads byte-identity (chr22, serial vs threaded BGZF)
-        if: matrix.canonical == true
-        run: |
-          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
-          CHR22_FA=/tmp/chr22/chr22.fa \
-          CHR22_SIM_DIR=/tmp/chr22-sim \
-          bash test/regression/bam_threads_byte_identity.sh
-
-      - name: Thread-determinism smoke (chr22, -t 1 vs -t 4)
-        if: matrix.canonical == true
-        run: |
-          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
-          CHR22_FA=/tmp/chr22/chr22.fa \
-          CHR22_SIM_DIR=/tmp/chr22-sim \
-          bash test/regression/thread_determinism.sh
-
-      - name: bwtseed lockstep driver identity (chr22, default vs BWA3_BWTSEED_LOCKSTEP=0)
-        if: matrix.canonical == true
-        run: |
-          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
-          CHR22_FA=/tmp/chr22/chr22.fa \
-          CHR22_SIM_DIR=/tmp/chr22-sim \
-          bash test/regression/bwtseed_lockstep_driver_identity.sh
 
       # Every row, not just the canonical one: the post-rescue dedup shortcuts
       # run on every tier, and pruning and banding run wherever the build has
@@ -1176,10 +1279,14 @@ jobs:
       # also compiled at AVX-512BW, header-only and outside the Makefile so
       # nothing already built changes, and run where the runner has AVX-512BW
       # (reported SKIP: elsewhere). About 6 s for 100000 jobs on an Apple
-      # M-series core; real-data dumps are manual. The negative control runs
-      # first: it shifts one scalar field on one job, and the check must report
-      # it as a MISMATCH and exit 1, so a comparison that stopped biting fails
-      # here.
+      # M-series core; real-data dumps are manual. With the full kernel sweep
+      # (KERNEL_SWEEP: a kernel_sweep "full" row on a full-depth run) it fuzzes
+      # 100000 jobs, otherwise 20000, the fewest at which the check still
+      # requires jobs at every K from 6 to 8. On x86 the avx2 and avx512bw fuzz
+      # runs go side by side, each to its own log, printed once both finish.
+      # The negative control runs first: it shifts one scalar field on one job,
+      # and the check must report it as a MISMATCH and exit 1, so a comparison
+      # that stopped biting fails here.
       - name: SIMD rescue filter == scalar filter (rescue_prune_eq, generated jobs)
         env:
           MATRIX_ARCH_FLAG: ${{ matrix.arch_flag }}
@@ -1193,7 +1300,10 @@ jobs:
             cat rpe_nc.log; echo "::error::negative control exited 0: the check missed an injected disagreement"; exit 1
           fi
           grep -q 'MISMATCHES=[1-9]' rpe_nc.log || { cat rpe_nc.log; echo "::error::negative control failed without reporting a MISMATCH"; exit 1; }
-          ./rescue_prune_eq fuzz 100000 1
+          if [ "${KERNEL_SWEEP:-full}" = full ]; then njobs=100000; else njobs=20000; fi
+          ./rescue_prune_eq fuzz "$njobs" 1 > rpe_fuzz.log 2>&1 &
+          fuzz_pid=$!
+          rc512=skip
           if [ "$RUNNER_ARCH" = "X64" ]; then
             # $CXX unquoted, as the compiler word(s) were before: a wrapped
             # compiler such as "ccache clang++-19" must still split.
@@ -1201,11 +1311,25 @@ jobs:
             $CXX -O3 -std=gnu++14 -mavx512f -mavx512bw -Isrc \
               test/rescue_prune_eq.cpp -o rescue_prune_eq_avx512bw
             if grep -qw avx512bw /proc/cpuinfo; then
-              ./rescue_prune_eq_avx512bw fuzz 100000 2
-            else
-              echo "SKIP: runner has no AVX-512BW; the avx512bw build of rescue_prune_eq compiled but did not run"
+              if ./rescue_prune_eq_avx512bw fuzz "$njobs" 2 > rpe_fuzz512.log 2>&1; then rc512=0; else rc512=$?; fi
             fi
           fi
+          if wait "$fuzz_pid"; then rc=0; else rc=$?; fi
+          status=0
+          report() { # <run> <log> <exit code>
+            if [ "$3" = 0 ]; then
+              echo "::group::$1 (exit 0)"; cat "$2"; echo "::endgroup::"
+            else
+              cat "$2"; echo "::error::$1 failed (exit $3)"; status=1
+            fi
+          }
+          report "rescue_prune_eq fuzz $njobs 1" rpe_fuzz.log "$rc"
+          if [ "$rc512" != skip ]; then
+            report "rescue_prune_eq_avx512bw fuzz $njobs 2" rpe_fuzz512.log "$rc512"
+          elif [ "$RUNNER_ARCH" = "X64" ]; then
+            echo "SKIP: runner has no AVX-512BW; the avx512bw build of rescue_prune_eq compiled but did not run"
+          fi
+          exit "$status"
 
       # The banded rescue kernel is NEON on aarch64 and AVX2 on x86, so the
       # harness runs on every row, built at the main build's arch= (see the
@@ -1251,7 +1375,15 @@ jobs:
       # (BWA3_RESCUE_BAND_P1_EXACT=0), instead of by exact width. The
       # trailing argument is the job generator's seed. Run 1 is 100000 jobs,
       # runs 2-11 30000, runs 12-16 10000, run 17 30000, runs 18-29 10000 and
-      # run 30 30000.
+      # run 30 30000 with the full kernel sweep (KERNEL_SWEEP: a kernel_sweep
+      # "full" row on a full-depth run); every other row, and every row on a
+      # light PR run, runs the same thirty at a fifth of those counts, but at
+      # least two of the harness's 2048-job batches
+      # (4096 jobs), so a run that draws its scoring, matrix or K cap per batch
+      # draws more than once and a random scoring under RB_KMAX reaches its
+      # first K > 5 draw (the second batch), and at least three (6144) under
+      # RB_METH=random, where each batch draws one of three matrices and the
+      # relation runs need one that is not the collapsed one.
       # On x86 the kswv reference runs at the runner's tier,
       # which the harness prints ("kswv tier:"). Longer runs and real dumps are
       # manual. As above, a negative control (one banded job's te shifted) must
@@ -1296,43 +1428,56 @@ jobs:
           [ -n "$p0_exact" ] && [ "$p0_exact" -gt 0 ] && [ "$p0_exact" = "$p0_class" ] \
             || { echo "::error::BWA3_RESCUE_BAND_P1_EXACT changed pass 0's grouping ($p0_exact vs $p0_class cells)"; exit 1; }
           # The runs are independent and single-threaded, so they run side by
-          # side, one per core (largest first). Each run's seed is its last
+          # side, one per core, longest first (the 16-bit runs and run 1) so
+          # the slowest do not start last. Each run's seed is its last
           # argument and names its log and exit-code files, so seeds must be
           # unique (checked below). xargs's own status is not used: every run
           # records its exit code and prints a line as it finishes, and the
           # report below fails the step for any non-zero or missing one.
           cat > rb_runs.txt <<'EOF'
+          RB_16BIT=1 ./rescue_band_harness eq 30000 17
           BWA3_RESCUE_BAND_COST=100000000 RB_SCALAR_STRIDE=7 ./rescue_band_harness eq 100000 1
-          BWA3_RESCUE_BAND_COST=100000000 RB_MINSC=30 ./rescue_band_harness eq 30000 2
-          BWA3_RESCUE_BAND_COST=100000000 BWA3_RESCUE_PRUNE_MAX_HITS=100000 ./rescue_band_harness eq 30000 3
-          BWA3_RESCUE_BAND_COST=100000000 BWA3_RESCUE_BAND_SHIFT=0 ./rescue_band_harness eq 30000 4
-          BWA3_RESCUE_BAND_COST=100000000 BWA3_RESCUE_BAND_P1_EXACT=0 ./rescue_band_harness eq 30000 30
-          BWA3_RESCUE_BAND_COST=100000000 BWA3_RESCUE_BAND_KERNEL=1 ./rescue_band_harness eq 30000 5
+          RB_16BIT=1 BWA3_RESCUE_PRUNE_MAX_HITS=100000 RB_METH=random RB_METH_REL=expand ./rescue_band_harness eq 10000 21
+          RB_16BIT=1 BWA3_RESCUE_PRUNE_MAX_HITS=100000 RB_SCORING=random ./rescue_band_harness eq 10000 18
+          RB_16BIT=1 BWA3_RESCUE_PRUNE_MAX_HITS=100000 RB_METH=random ./rescue_band_harness eq 10000 19
+          RB_16BIT=1 BWA3_RESCUE_PRUNE_MAX_HITS=100000 RB_METH=random RB_METH_REL=expand RB_KMAX=0 RB_SCORING=random ./rescue_band_harness eq 10000 29
+          RB_16BIT=1 BWA3_RESCUE_PRUNE_MAX_HITS=100000 RB_KMAX=0 RB_SCORING=random ./rescue_band_harness eq 10000 24
           BWA3_RESCUE_BAND_COST=100000000 BWA3_RESCUE_FSCAN=0 ./rescue_band_harness eq 30000 6
-          BWA3_RESCUE_BAND_COST=100000000 RB_SCORING=random ./rescue_band_harness eq 30000 7
           BWA3_RESCUE_BAND_COST=100000000 RB_SCORING=1,4,6,1,8,1 ./rescue_band_harness eq 30000 8
           BWA3_RESCUE_BAND_COST=100000000 RB_SCORING=1,4,6,1,8,1 BWA3_RESCUE_BAND_KERNEL=1 ./rescue_band_harness eq 30000 9
-          BWA3_RESCUE_BAND_COST=100000000 RB_SCORING=1,4,6,1,8,1 BWA3_RESCUE_FSCAN=0 ./rescue_band_harness eq 30000 10
+          BWA3_RESCUE_BAND_COST=100000000 BWA3_RESCUE_BAND_KERNEL=1 ./rescue_band_harness eq 30000 5
           BWA3_RESCUE_BAND_COST=100000000 RB_METH=random ./rescue_band_harness eq 30000 11
+          BWA3_RESCUE_BAND_COST=100000000 BWA3_RESCUE_PRUNE_MAX_HITS=100000 ./rescue_band_harness eq 30000 3
+          BWA3_RESCUE_BAND_COST=100000000 RB_MINSC=30 ./rescue_band_harness eq 30000 2
+          BWA3_RESCUE_BAND_COST=100000000 BWA3_RESCUE_BAND_SHIFT=0 ./rescue_band_harness eq 30000 4
+          BWA3_RESCUE_BAND_COST=100000000 RB_SCORING=1,4,6,1,8,1 BWA3_RESCUE_FSCAN=0 ./rescue_band_harness eq 30000 10
+          BWA3_RESCUE_BAND_COST=100000000 BWA3_RESCUE_BAND_P1_EXACT=0 ./rescue_band_harness eq 30000 30
+          BWA3_RESCUE_BAND_COST=100000000 RB_SCORING=random ./rescue_band_harness eq 30000 7
+          BWA3_RESCUE_BAND_COST=100000000 RB_METH=random RB_METH_REL=expand RB_KMAX=8 RB_SCORING=1,6,6,1,6,1 ./rescue_band_harness eq 10000 28
+          BWA3_RESCUE_BAND_COST=100000000 RB_KMAX=0 RB_SCORING=random ./rescue_band_harness eq 10000 22
+          BWA3_RESCUE_BAND_COST=100000000 RB_METH=random RB_METH_REL=expand ./rescue_band_harness eq 10000 20
           BWA3_RESCUE_BAND_COST=100000000 RB_METH=collapsed RB_SCORING=1,2,6,1,6,1 ./rescue_band_harness eq 10000 12
           BWA3_RESCUE_BAND_COST=100000000 RB_METH=random RB_SCORING=1,4,6,1,8,1 ./rescue_band_harness eq 10000 13
           BWA3_RESCUE_BAND_COST=100000000 RB_METH=random RB_SCORING=1,4,6,1,8,1 BWA3_RESCUE_BAND_KERNEL=1 ./rescue_band_harness eq 10000 14
           BWA3_RESCUE_BAND_COST=100000000 RB_METH=random RB_SCORING=1,4,6,1,8,1 BWA3_RESCUE_FSCAN=0 ./rescue_band_harness eq 10000 15
           BWA3_RESCUE_BAND_COST=100000000 RB_METH=random RB_SCORING=random ./rescue_band_harness eq 10000 16
-          RB_16BIT=1 ./rescue_band_harness eq 30000 17
-          RB_16BIT=1 BWA3_RESCUE_PRUNE_MAX_HITS=100000 RB_SCORING=random ./rescue_band_harness eq 10000 18
-          RB_16BIT=1 BWA3_RESCUE_PRUNE_MAX_HITS=100000 RB_METH=random ./rescue_band_harness eq 10000 19
-          BWA3_RESCUE_BAND_COST=100000000 RB_METH=random RB_METH_REL=expand ./rescue_band_harness eq 10000 20
-          RB_16BIT=1 BWA3_RESCUE_PRUNE_MAX_HITS=100000 RB_METH=random RB_METH_REL=expand ./rescue_band_harness eq 10000 21
-          BWA3_RESCUE_BAND_COST=100000000 RB_KMAX=0 RB_SCORING=random ./rescue_band_harness eq 10000 22
-          BWA3_RESCUE_BAND_COST=100000000 RB_KMAX=8 RB_SCORING=1,6,6,1,6,1 ./rescue_band_harness eq 10000 23
-          RB_16BIT=1 BWA3_RESCUE_PRUNE_MAX_HITS=100000 RB_KMAX=0 RB_SCORING=random ./rescue_band_harness eq 10000 24
           BWA3_RESCUE_BAND_COST=100000000 RB_KMAX=8 RB_SCORING=1,9,16,1,16,1 ./rescue_band_harness eq 10000 25
+          BWA3_RESCUE_BAND_COST=100000000 RB_KMAX=8 RB_SCORING=1,6,6,1,6,1 ./rescue_band_harness eq 10000 23
           BWA3_RESCUE_BAND_COST=100000000 RB_KMAX=6 RB_SCORING=1,8,6,1,6,1 ./rescue_band_harness eq 10000 26
           BWA3_RESCUE_BAND_COST=100000000 RB_METH=random RB_KMAX=8 RB_SCORING=1,6,6,1,6,1 ./rescue_band_harness eq 10000 27
-          BWA3_RESCUE_BAND_COST=100000000 RB_METH=random RB_METH_REL=expand RB_KMAX=8 RB_SCORING=1,6,6,1,6,1 ./rescue_band_harness eq 10000 28
-          RB_16BIT=1 BWA3_RESCUE_PRUNE_MAX_HITS=100000 RB_METH=random RB_METH_REL=expand RB_KMAX=0 RB_SCORING=random ./rescue_band_harness eq 10000 29
           EOF
+          # Without the full kernel sweep, each run keeps its configuration and
+          # seed and takes a fifth of its jobs, at least two batches, or three
+          # under RB_METH=random (see above).
+          if [ "${KERNEL_SWEEP:-full}" != full ]; then
+            while read -r line; do
+              seed="${line##* }"; rest="${line% *}"; n="${rest##* }"
+              case "$line" in *RB_METH=random*) floor=6144 ;; *) floor=4096 ;; esac
+              m=$((n / 5)); [ "$floor" -le "$n" ] || floor=$n; [ "$m" -ge "$floor" ] || m=$floor
+              echo "${rest% *} $m $seed"
+            done < rb_runs.txt > rb_runs_reduced.txt
+            mv rb_runs_reduced.txt rb_runs.txt
+          fi
           dups="$(sed 's/.* //' rb_runs.txt | sort | uniq -d)"
           [ -z "$dups" ] || { echo "::error::duplicate rescue_band_harness seeds: $dups"; exit 1; }
           rm -f rb_run_*.log rb_run_*.rc
@@ -1387,8 +1532,154 @@ jobs:
           ./rescue_band_kernel_eq 20000 1
           ./rescue_band_kernel_eq 20000 2
 
+      - name: ccache statistics
+        if: always()
+        run: ccache --show-stats || true
+
+  # The canonical row's regression scripts that need only the built bwa-mem3
+  # binary and the fixtures, split out so they run alongside the matrix instead
+  # of in series at the end of the canonical row, the job that sets the
+  # workflow's wall time. What stays on that row is what needs its built tree:
+  # the unit-test harness and the AVX-512BW kswv unit tests, the Makefile
+  # checks, the rescue kernel-equivalence harnesses every row runs, and
+  # bam_roundtrip.sh, which reads the SAM chr22_parity.sh leaves behind there.
+  #
+  # The binary is the canonical row's: the same runner, packages, compiler and
+  # job environment, and the same make command (arch=avx2, clang-19,
+  # USE_MIMALLOC=1), so a claim test/regression/README.md scopes to the
+  # canonical row holds here unchanged. The ccache slug is the canonical row's
+  # too, so this restores the cache warm-caches saves for that row and the
+  # compile is served from it.
+  canonical-regressions:
+    name: Linux x86_64 AVX2 (mimalloc) — regressions
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    # One build from a warm compiler cache, the chr22 fixture and index, and a
+    # few minutes of regression scripts. Ceiling catches a hung runner only.
+    timeout-minutes: 30
+    # The canonical row's values of build-and-test's job env (no cxx, cc or
+    # allow_unsupported on that row), spelled out.
+    env:
+      CXX: clang++-19
+      CC: clang-19
+      ALLOW_UNSUPPORTED_COMPILER: "0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Install dependencies (Linux)
+        # The matrix rows' package set (same list and version, so the same apt
+        # cache): bwa for the chr22 fixture and samtools for the regression
+        # scripts, on top of the build dependencies.
+        uses: awalsh128/cache-apt-pkgs-action@acb598e5ddbc6f68a970c5da0688d2f3a9f04d05 # v1.6.0
+        with:
+          packages: zlib1g-dev libdeflate-dev bwa autoconf automake samtools libomp-dev ccache
+          version: 1.1
+
+      - name: Install clang-19 (Linux)
+        uses: ./.github/actions/install-clang-19
+
+      # The canonical row's slug and cap (see the comment above the job).
+      - name: Set up ccache
+        uses: ./.github/actions/setup-ccache
+        with:
+          config: linux-x86_64-avx2-mimalloc
+          max-size: 300M
+
+      - name: Build bwa-mem3
+        # The canonical row's `Build bwa-mem3` command with its matrix values
+        # (arch_flag avx2, use_mimalloc 1) substituted. Keep the two identical:
+        # a different argument would rebuild with different flags, test a
+        # binary the canonical row does not, and miss the shared cache.
+        run: |
+          make -j"$(nproc)" \
+            arch=avx2 \
+            CXX="$CXX" USE_MIMALLOC=1
+
+      - name: Verify binary
+        run: ./bwa-mem3 version
+
+      - name: Stage chr22 fixture (reference, bwa index, simulated reads)
+        # Also sets up the test/holodeck pixi env (and pixi on PATH), which the
+        # long-read parity script and the bwa-meth pixi step below use.
+        uses: ./.github/actions/chr22-fixture
+
+      - name: Build chr22 FMI index
+        # bwa-mem3 index is rebuilt every run because its sidecar layout is
+        # coupled to the bwa-mem3 binary, which changes per commit.
+        run: |
+          cd /tmp/chr22
+          "$GITHUB_WORKSPACE/bwa-mem3" index chr22.fa
+          ls chr22.fa.*
+
+      - name: Long-read PE 8-bit/16-bit parity (chr22, 400bp)
+        # Exercises the recovered >=128bp 8-bit banded-SW path end-to-end: the
+        # script self-simulates 400bp PE reads and diffs `bwa-mem3 mem` with the
+        # 8-bit path enabled (default) vs BWAMEM3_DISABLE_BSW8=1 (forced 16-bit).
+        # The two must be byte-identical -- guards the unsigned [0,255] recurrence
+        # + routing gate against regression. Self-contained A/B (one binary).
+        run: |
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          CHR22_FA=/tmp/chr22/chr22.fa \
+          CHR22_SIM_DIR=/tmp/chr22-sim-longread \
+          PIXI_MANIFEST="$GITHUB_WORKSPACE/test/holodeck/pixi.toml" \
+          bash test/regression/longread_pe_parity.sh
+
+      - name: SIMD tier parity (avx2 vs avx512bw, chr22)
+        # One binary must emit byte-identical SAM whichever usable kernel tier it
+        # dispatches. Scope is avx2/avx512bw: there is no batched kswv kernel
+        # below AVX2 and forcing those tiers aborts the aligner (see the script
+        # header). Cross-build parity is a different property, already covered by
+        # chr22_parity.sh running on the avx2 and arm64 build jobs.
+        #
+        # On a runner without AVX-512BW there is only one sweepable tier and the
+        # script reports SKIP:, not PASS: — so this step is a no-op there rather
+        # than a false green. It still earns its place: the script had rotted
+        # unrun to the point of aborting on its first tier, and this keeps that
+        # from recurring silently.
+        run: |
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          PARITY_FA=/tmp/chr22/chr22.fa \
+          PARITY_R1=/tmp/chr22-sim/reads.r1.fastq.gz \
+          PARITY_R2=/tmp/chr22-sim/reads.r2.fastq.gz \
+          bash test/regression/all_tiers_parity.sh
+
+      - name: Rescue identity under each forced x86 tier (generated PE fixture)
+        # The kswv rescue kernels differ per tier, so the 11-op cell (and the
+        # rest of the rescue shortcuts) is checked end to end on each tier this
+        # host has: the reference and default legs under BWAMEM3_FORCE_TIER must
+        # equal the unforced reference. On a runner without AVX-512BW the script
+        # reports that tier SKIP:. Seconds of work: a 60 kb generated fixture.
+        run: |
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          RESCUE_TIERS="avx2 avx512bw" \
+          bash test/regression/rescue_prune_identity.sh
+
+      - name: --bam-threads byte-identity (chr22, serial vs threaded BGZF)
+        run: |
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          CHR22_FA=/tmp/chr22/chr22.fa \
+          CHR22_SIM_DIR=/tmp/chr22-sim \
+          bash test/regression/bam_threads_byte_identity.sh
+
+      - name: Thread-determinism smoke (chr22, -t 1 vs -t 4)
+        run: |
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          CHR22_FA=/tmp/chr22/chr22.fa \
+          CHR22_SIM_DIR=/tmp/chr22-sim \
+          bash test/regression/thread_determinism.sh
+
+      - name: bwtseed lockstep driver identity (chr22, default vs BWA3_BWTSEED_LOCKSTEP=0)
+        run: |
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          CHR22_FA=/tmp/chr22/chr22.fa \
+          CHR22_SIM_DIR=/tmp/chr22-sim \
+          bash test/regression/bwtseed_lockstep_driver_identity.sh
+
       - name: Flat chaining index matches the kbtree replay (chr22)
-        if: matrix.canonical == true
         run: |
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           CHR22_FA=/tmp/chr22/chr22.fa \
@@ -1396,14 +1687,12 @@ jobs:
           bash test/regression/chain_flat_replay_identity.sh
 
       - name: Chaining scratch is per-thread, not per-read
-        if: matrix.canonical == true
         run: |
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           CHR22_FA=/tmp/chr22/chr22.fa \
           bash test/regression/chain_scratch_per_thread.sh
 
       - name: Extension staging shares a chain's reference window (homopolymer chain)
-        if: matrix.canonical == true
         # A read from a long homopolymer chains ~500 max_occ-sampled seeds
         # across the whole run. Copying the chain's reference window once per
         # seed grew the extension buffers past their int32 limit within one
@@ -1414,7 +1703,6 @@ jobs:
           bash test/regression/repeat_chain_extension_window.sh
 
       - name: Cohort slicing does not change output
-        if: matrix.canonical == true
         run: |
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           CHR22_FA=/tmp/chr22/chr22.fa \
@@ -1422,7 +1710,6 @@ jobs:
           bash test/regression/cohort_slice_identity.sh
 
       - name: Cohort ramp values are validated (flag and environment alike)
-        if: matrix.canonical == true
         # --cohort-ramp-first takes plain bases, and atoll("16M") is 16 -- a
         # positive value, so an unvalidated parse configures a 16-BYTE first
         # slice for a user who asked for 16 Mbases, silently. The flag must
@@ -1433,7 +1720,6 @@ jobs:
           bash test/regression/cohort_ramp_validation.sh
 
       - name: Chunk cap stays opt-in (batching matches bwa-mem2 at every -t)
-        if: matrix.canonical == true
         # bwa and bwa-mem2 both use an uncapped `chunk_size * n_threads` batch.
         # A default cap re-partitions the input, which changes each batch's
         # mem_pestat cohort and therefore the output, for every -t >= 26.
@@ -1443,7 +1729,6 @@ jobs:
           bash test/regression/chunk_cap_optin.sh
 
       - name: THP check samples on Linux and never changes output
-        if: matrix.canonical == true
         # The THP fallback check reads /proc and /sys from the write step; its
         # unit tests use an injected reader, so this is the run of the real
         # reads and the -v 4 debug line. Skips the sample check when the
@@ -1454,7 +1739,6 @@ jobs:
           bash test/regression/thp_check_smoke.sh
 
       - name: --rescue-kmer/--rescue-band reject malformed values
-        if: matrix.canonical == true
         # Both were parsed with atoi(), which maps unparseable text to 0. For
         # --rescue-kmer 0 means "off" and counts as explicitly set, so a typo
         # would silently disable the largest lever in --fast; for --rescue-band
@@ -1466,7 +1750,6 @@ jobs:
           bash test/regression/rescue_kmer_options.sh
 
       - name: -t rejects malformed values and clamps out-of-range values
-        if: matrix.canonical == true
         # -t was parsed with atoi(), which maps unparseable text to 0 and
         # ignores trailing garbage, so a typo read as a valid-looking thread
         # count with no diagnostic. Separately, a value above MAX_THREADS must
@@ -1481,7 +1764,6 @@ jobs:
       # regression check in this job: bundled, a failure in the first script
       # leaves the second unrun and the step name cannot say which one failed.
       - name: --rescue-skip requires --rescue-kmer and composes with --fast
-        if: matrix.canonical == true
         # --rescue-skip keys on the --rescue-kmer anchor scan, so with the scan
         # off it would be silently inert -- a flag that changes which reads get
         # rescued going quietly nowhere. It must hard-error instead, in either
@@ -1493,7 +1775,6 @@ jobs:
           bash test/regression/rescue_skip_options.sh
 
       - name: --supp-rep-hard-cap repetitive-seed regression
-        if: matrix.canonical == true
         run: |
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           SUPP_REP_FIXTURE_AWK="$GITHUB_WORKSPACE/test/fixtures/supp_rep/build_fixture.awk" \
@@ -1501,7 +1782,6 @@ jobs:
           bash test/regression/supp_rep_hard_cap.sh
 
       - name: --compat byte-identical regression (phix)
-        if: matrix.canonical == true
         run: |
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           COMPAT_PHIX_FA="$GITHUB_WORKSPACE/test/fixtures/phix.fa" \
@@ -1509,7 +1789,6 @@ jobs:
           bash test/regression/compat_byte_identical.sh
 
       - name: byte-identity off==on==auto (extension-DP job dedup)
-        if: matrix.canonical == true
         run: |
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           DEDUP_PHIX_FA="$GITHUB_WORKSPACE/test/fixtures/phix.fa" \
@@ -1517,7 +1796,6 @@ jobs:
           bash test/regression/dedup_byte_identity.sh
 
       - name: byte-identity off==on==auto (whole-read-pair memoization)
-        if: matrix.canonical == true
         run: |
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           DEDUP_READS_PHIX_FA="$GITHUB_WORKSPACE/test/fixtures/phix.fa" \
@@ -1525,7 +1803,6 @@ jobs:
           bash test/regression/dedup_reads_byte_identity.sh
 
       - name: byte-identity off==on==auto (cross-read SA-interval dedup)
-        if: matrix.canonical == true
         run: |
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           KS_DEDUP_PHIX_FA="$GITHUB_WORKSPACE/test/fixtures/phix.fa" \
@@ -1533,7 +1810,6 @@ jobs:
           bash test/regression/ks_dedup_byte_identity.sh
 
       - name: byte-identity default==--keep-contained-ext (contained-seed skip)
-        if: matrix.canonical == true
         run: |
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           SKIP_CONTAINED_PHIX_FA="$GITHUB_WORKSPACE/test/fixtures/phix.fa" \
@@ -1541,7 +1817,6 @@ jobs:
           bash test/regression/skip_contained_byte_identity.sh
 
       - name: byte-identity --compat with and without --keep-contained-ext (contained-seed skip)
-        if: matrix.canonical == true
         run: |
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           COMPAT_CONTAINED_PHIX_FA="$GITHUB_WORKSPACE/test/fixtures/phix.fa" \
@@ -1549,7 +1824,6 @@ jobs:
           bash test/regression/compat_contained_skip_identity.sh
 
       - name: --hic alias regression (byte-identical to -5SP)
-        if: matrix.canonical == true
         run: |
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           HIC_PHIX_FA="$GITHUB_WORKSPACE/test/fixtures/phix.fa" \
@@ -1557,7 +1831,6 @@ jobs:
           bash test/regression/hic_alias_identical.sh
 
       - name: band_cert byte-identical regression (--no-band-cert A/B, phix)
-        if: matrix.canonical == true
         run: |
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           BAND_CERT_PHIX_FA="$GITHUB_WORKSPACE/test/fixtures/phix.fa" \
@@ -1565,7 +1838,6 @@ jobs:
           bash test/regression/band_cert_identity.sh
 
       - name: chain-flt empty-array compat regression (#310)
-        if: matrix.canonical == true
         run: |
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           CHAIN_FLT_PHIX_FA="$GITHUB_WORKSPACE/test/fixtures/phix.fa" \
@@ -1573,7 +1845,6 @@ jobs:
           bash test/regression/chain_flt_empty_compat.sh
 
       - name: SA sentinel-offset compat regression (#469)
-        if: matrix.canonical == true
         run: |
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           SA_SENTINEL_PHIX_FA="$GITHUB_WORKSPACE/test/fixtures/phix.fa" \
@@ -1581,7 +1852,6 @@ jobs:
           bash test/regression/compat_sa_sentinel.sh
 
       - name: mimalloc purge delay regression (mem default, env override, byte-identity)
-        if: matrix.canonical == true
         run: |
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           PURGE_PHIX_FA="$GITHUB_WORKSPACE/test/fixtures/phix.fa" \
@@ -1590,21 +1860,18 @@ jobs:
           bash test/regression/mimalloc_purge_delay.sh
 
       - name: header parity regression (AH:*, --compat @HD/@SQ)
-        if: matrix.canonical == true
         run: |
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           HEADER_PARITY_WORK_DIR=/tmp/header-parity \
           bash test/regression/header_parity.sh
 
       - name: proper-pair ALT derivation regression (--proper-pair-from-emitted)
-        if: matrix.canonical == true
         run: |
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           PROPER_PAIR_ALT_WORK_DIR=/tmp/proper-pair-alt \
           bash test/regression/proper_pair_alt.sh
 
       - name: default @HD parity across output paths
-        if: matrix.canonical == true
         run: |
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           HD_PARITY_PHIX_FA="$GITHUB_WORKSPACE/test/fixtures/phix.fa" \
@@ -1612,21 +1879,18 @@ jobs:
           bash test/regression/default_hd_parity.sh
 
       - name: "pa:f: SAM vs --bam parity (ALT-aware fixture)"
-        if: matrix.canonical == true
         run: |
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           ALT_PA_WORK_DIR=/tmp/alt-pa-parity \
           bash test/regression/alt_pa_parity.sh
 
       - name: "pa:f: --meth parity (ALT-aware bisulfite fixture)"
-        if: matrix.canonical == true
         run: |
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           METH_ALT_PA_WORK_DIR=/tmp/meth-alt-pa-parity \
           bash test/regression/meth_alt_pa_parity.sh
 
       - name: --meth output container follows --bam
-        if: matrix.canonical == true
         run: |
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           METH_SAM_PHIX_FA="$GITHUB_WORKSPACE/test/fixtures/phix.fa" \
@@ -1634,7 +1898,6 @@ jobs:
           bash test/regression/meth_sam_output.sh
 
       - name: SE alignment smoke (chr22)
-        if: matrix.canonical == true
         run: |
           "$GITHUB_WORKSPACE/bwa-mem3" mem -t 4 /tmp/chr22/chr22.fa \
             /tmp/chr22-sim/reads.r1.fastq.gz > /tmp/chr22-sim/se.sam 2>/dev/null
@@ -1644,7 +1907,6 @@ jobs:
           echo "PASS: SE smoke ($records records)"
 
       - name: Interleaved alignment smoke (chr22)
-        if: matrix.canonical == true
         run: |
           # Interleave R1 and R2 into a single FASTQ at FASTQ-record (4-line)
           # granularity. The naive `paste R1 R2 | tr '\t' '\n'` interleaves at
@@ -1669,7 +1931,6 @@ jobs:
           echo "PASS: interleaved smoke ($records records)"
 
       - name: Install bwa-meth pixi env
-        if: matrix.canonical == true
         # The holodeck setup-pixi step already installed the pixi binary
         # to /home/runner/.pixi/bin and added it to PATH. Calling
         # setup-pixi a second time would collide on the binary download
@@ -1680,7 +1941,6 @@ jobs:
           pixi install --manifest-path test/meth/pyproject.toml
 
       - name: Checkout bwa-meth oracle
-        if: matrix.canonical == true
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           # Most important of the four: this is a THIRD-PARTY tree, and the
@@ -1692,7 +1952,6 @@ jobs:
           path: bwa-meth-oracle
 
       - name: Copy bwa-meth fixtures into test/meth/
-        if: matrix.canonical == true
         run: |
           cp bwa-meth-oracle/example/ref.fa test/meth/
           cp bwa-meth-oracle/example/t_R1.fastq.gz test/meth/
@@ -1708,11 +1967,9 @@ jobs:
       # longer being run. Renamed alongside the row in test/regression/README.md
       # that quotes this step name.
       - name: Run --meth Layer 1
-        if: matrix.canonical == true
         run: bash test/regression/meth_oracle.sh
 
       - name: --meth whole-aligner regressions (D3)
-        if: matrix.canonical == true
         # Self-contained --meth regressions (each generates its fixtures inline):
         # dual index + seed->original remap; mixed OT/OB PE per-hypothesis scoring;
         # OT/OB x strand placement; original-alphabet output integrity (Bismark
@@ -1753,6 +2010,10 @@ jobs:
             echo "::group::$t"; bash "test/regression/$t.sh"; echo "::endgroup::"
           done
 
+      - name: ccache statistics
+        if: always()
+        run: ccache --show-stats || true
+
   # The canonical row's three alternate-configuration builds, split out so they
   # run alongside the matrix instead of at the end of its slowest row. Each is a
   # full rebuild that replaces $GITHUB_WORKSPACE/bwa-mem3, so on the canonical
@@ -1760,8 +2021,10 @@ jobs:
   # sets the workflow's wall time. They need nothing the canonical row produces,
   # only its configuration (Linux x86_64, avx2, clang-19) and the chr22 fixture,
   # so the arch/compiler/mimalloc values below are that row's, spelled out.
+  # canonical-regressions above does the same for that row's own build.
   rebuild-variants:
     name: Rebuild variants (debug macros, SIMD floor, ASAN)
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     # Three builds plus the chr22 fixture and parity, a few minutes normally.
     # Ceiling catches a hung runner only.
@@ -1782,11 +2045,20 @@ jobs:
         # header_parity.sh, on top of the build dependencies.
         uses: awalsh128/cache-apt-pkgs-action@acb598e5ddbc6f68a970c5da0688d2f3a9f04d05 # v1.6.0
         with:
-          packages: zlib1g-dev libdeflate-dev bwa autoconf automake samtools libomp-dev
+          packages: zlib1g-dev libdeflate-dev bwa autoconf automake samtools libomp-dev ccache
           version: 1.1
 
       - name: Install clang-19 (Linux)
         uses: ./.github/actions/install-clang-19
+
+      # One cache for all three builds below (debug macros, TESTING_BUILD,
+      # ASAN): ccache keys each compile on its flags, so they coexist, and
+      # warm-caches rebuilds the same three under this slug on main.
+      - name: Set up ccache
+        uses: ./.github/actions/setup-ccache
+        with:
+          config: rebuild-variants
+          max-size: 300M
 
       - name: Stage chr22 fixture (reference, bwa index, simulated reads)
         uses: ./.github/actions/chr22-fixture
@@ -1806,8 +2078,9 @@ jobs:
         # cross-check, scratch poisoning, a buffer shrunk to force a grow path,
         # or measurement counters that never feed the alignment result, so
         # output must be unchanged -- a failure here is a genuine invariant
-        # violation, not a debug-build artifact. test/regression/
-        # debug_macro_flag_lint.sh keeps this list and the macros in src/ in step.
+        # violation, not a debug-build artifact. The list is the workflow-level
+        # DEBUG_MACRO_EXTRA_CXXFLAGS; test/regression/debug_macro_flag_lint.sh
+        # keeps it and the macros in src/ in step.
         #
         # First in this job, so the tree is fresh and needs no `make clean`. The
         # chr22 bwa-mem3 index is built here with this binary: the debug macros
@@ -1817,7 +2090,7 @@ jobs:
           make -j"$(nproc)" arch=avx2 \
             CXX=clang++-19 \
             USE_MIMALLOC=1 \
-            EXTRA_CXXFLAGS="-DBWA_MEM3_DEBUG_CHN_FLT_XCHECK -DBWA_MEM3_DEBUG_RID_CHECK -DBWA_MEM3_DEBUG_UNGAPPED_XCHECK -DBSW8_ASSERT_ENVELOPE -DBWA_MEM3_DEBUG_POISON -DBWAMEM3_UGP_PROFILE=1 -DBWA_MEM3_DEBUG_RESCUE_STATS -DBWA_MEM3_DEBUG_SRTGG_TINY -DBWA_MEM3_DEBUG_P3_XCHECK -DBWA_MEM3_DEBUG_RESCUE_SKIP_XCHECK -DBWA_MEM3_DEBUG_RIGHT_H0_XCHECK"
+            EXTRA_CXXFLAGS="$DEBUG_MACRO_EXTRA_CXXFLAGS"
           "$GITHUB_WORKSPACE/bwa-mem3" index /tmp/chr22/chr22.fa
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           CHR22_FA=/tmp/chr22/chr22.fa \
@@ -1826,7 +2099,7 @@ jobs:
           bash test/regression/chr22_parity.sh
           # The chr22 reads rarely reach the chaining / Pass-3 fast paths'
           # fallbacks, so run the fixture built to force them (equal-position
-          # chains, over-cap reads, 36 kb reads, --seed-order, --meth) with
+          # chains, over-cap reads, a 36 kb read, --seed-order, --meth) with
           # BWA_MEM3_DEBUG_P3_XCHECK and _UNGAPPED_XCHECK cross-checking each
           # fast path against the code it replaces.
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
@@ -1916,6 +2189,10 @@ jobs:
             CXX=clang++-19 cli_arg_safety_test
           ./cli_arg_safety_test
 
+      - name: ccache statistics
+        if: always()
+        run: ccache --show-stats || true
+
   coverage:
     name: Coverage (Linux AVX2, gcov → Codecov)
     runs-on: ubuntu-latest
@@ -1929,6 +2206,14 @@ jobs:
       CXX: g++
       CC: gcc
       ALLOW_UNSUPPORTED_COMPILER: "1"
+      # Instrumented build at -O1 rather than the Makefile's COVERAGE=1 default
+      # of -O0: the instrumented tests run faster. Job-level so every make
+      # (libbwa.a, test-binaries and its test/Makefile sub-make) compiles with
+      # the same flags and the build-flags stamp does not rebuild libbwa.a
+      # between steps. -O1 inlines static functions called once and merges some
+      # lines, so a few lines and small functions report under their caller;
+      # see COVERAGE_OPT in the Makefile.
+      COVERAGE_OPT: "-O1"
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -1939,8 +2224,18 @@ jobs:
       - name: Install dependencies
         uses: awalsh128/cache-apt-pkgs-action@acb598e5ddbc6f68a970c5da0688d2f3a9f04d05 # v1.6.0
         with:
-          packages: zlib1g-dev libdeflate-dev autoconf automake gcovr
+          packages: zlib1g-dev libdeflate-dev autoconf automake gcovr ccache
           version: 1.0
+
+      # Coverage builds through ccache too: it caches the .gcno notes file with
+      # the object, and the checkout path (which gcov records) is the same on
+      # every run. This job runs on push, so it saves its own cache below
+      # instead of relying on warm-caches; PR and merge-queue runs restore it.
+      - name: Set up ccache
+        uses: ./.github/actions/setup-ccache
+        with:
+          config: coverage
+          max-size: 200M
 
       - name: Build libbwa.a with coverage
         run: make -j"$(nproc)" arch=avx2 CXX=g++ USE_MIMALLOC=0 COVERAGE=1
@@ -1953,7 +2248,13 @@ jobs:
         run: make test-binaries arch=avx2 CXX=g++ COVERAGE=1
 
       - name: Run unit tests
-        run: ./test/bwa_mem3_tests_unit
+        # Sharded across the runner's CPUs, as on the matrix rows: with gcov
+        # instrumentation the serial run was over two minutes at -O0. The shards
+        # are separate processes writing the same .gcda files; libgcov takes a
+        # lock on each file and merges its counters into what is already there
+        # rather than overwriting it, so the collected coverage is the same as
+        # a serial run's.
+        run: bash test/run_unit_shards.sh ./test/bwa_mem3_tests_unit
 
       - name: Run integration tests
         run: ./test/bwa_mem3_tests_integration
@@ -1981,6 +2282,20 @@ jobs:
           fail_ci_if_error: false
           verbose: true
 
+      - name: ccache statistics
+        if: always()
+        run: ccache --show-stats || true
+
+      # Push to main only (see setup-ccache for why PR and merge-queue runs never
+      # save). Saved even when a test failed: ccache never stores a failed
+      # compile, so whatever is in the cache is valid.
+      - name: Save ccache
+        if: github.event_name == 'push' && !cancelled()
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: ${{ env.CCACHE_CACHE_KEY }}
+
   # MemorySanitizer gate for the batched banded-SW kernels' padded-lane
   # initialization. The kernels round each batch up to a whole SIMD width and
   # process the trailing padding lanes, reading their input fields back
@@ -2001,8 +2316,16 @@ jobs:
   # it and the fixes merge, then it flips to a hard gate. FLIP TO A HARD GATE
   # (delete `continue-on-error`) ONCE THE PADDED-LANE INITIALIZATION FIXES ARE
   # IN main.
+  #
+  # Full-depth runs only (ci-depth, see the top of the file): the merge queue,
+  # and PRs that touch the kernels or this test. A light PR skips the job,
+  # which is not a required check. `!cancelled()` keeps it running when
+  # ci-depth itself fails (its output is then empty, which is not 'light'), so
+  # a broken depth job costs time, never the gate.
   msan-padded-lane-gate:
     name: MSan padded-lane gate (banded-SW)
+    needs: ci-depth
+    if: ${{ !cancelled() && github.event_name != 'push' && needs.ci-depth.outputs.depth != 'light' }}
     runs-on: ubuntu-latest
     # One instrumented build of the kernel + a single fast run. Ceiling catches
     # a hung runner only.
@@ -2028,12 +2351,22 @@ jobs:
         # (matching clang-19) is added by the clang-19 install step below.
         uses: awalsh128/cache-apt-pkgs-action@acb598e5ddbc6f68a970c5da0688d2f3a9f04d05 # v1.6.0
         with:
-          packages: zlib1g-dev libdeflate-dev autoconf automake libomp-dev
+          packages: zlib1g-dev libdeflate-dev autoconf automake libomp-dev ccache
           version: 1.1
 
       - name: Install clang-19 (Linux)
         # Same verified-key install as the build-and-test matrix.
         uses: ./.github/actions/install-clang-19
+
+      # The -march=native objects this gate builds are keyed on the host's CPU
+      # features as well (see the action's compiler shim), so they are reused
+      # only on a runner that resolves -march=native the same way; the rest of
+      # the MSan libbwa.a build is shared across runners.
+      - name: Set up ccache
+        uses: ./.github/actions/setup-ccache
+        with:
+          config: msan-padded-lane-gate
+          max-size: 200M
 
       - name: Build the padded-lane gate under MemorySanitizer
         # MSAN=1 forces USE_MIMALLOC off (mimalloc's malloc override interposes
@@ -2054,11 +2387,16 @@ jobs:
           MSAN_OPTIONS=exitcode=77:halt_on_error=1 \
             ./kernel_padded_lane_uninit_test
 
+      - name: ccache statistics
+        if: always()
+        run: ccache --show-stats || true
+
   # Profiling (--profile) is compiled out of the default build, so the matrix
   # rows above never exercise the STAGE_PROF=1 code path. Build it here (and run
   # the stage_prof unit test) so the opt-in path cannot silently bit-rot.
   profiling-build:
     name: Profiling build (STAGE_PROF=1)
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     # Single instrumented build plus a small unit test and one regression.
     timeout-minutes: 20
@@ -2081,8 +2419,14 @@ jobs:
       - name: Install dependencies (Linux)
         uses: awalsh128/cache-apt-pkgs-action@acb598e5ddbc6f68a970c5da0688d2f3a9f04d05 # v1.6.0
         with:
-          packages: zlib1g-dev libdeflate-dev autoconf automake libomp-dev
+          packages: zlib1g-dev libdeflate-dev autoconf automake libomp-dev ccache
           version: 1.1
+
+      - name: Set up ccache
+        uses: ./.github/actions/setup-ccache
+        with:
+          config: profiling-build
+          max-size: 200M
 
       - name: Build with profiling compiled in
         run: make -j"$(nproc)" STAGE_PROF=1 BASELINE_ARCH=avx2 CXX=g++ USE_MIMALLOC=1
@@ -2105,3 +2449,276 @@ jobs:
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           FIXTURES="$GITHUB_WORKSPACE/test/fixtures" \
           bash test/regression/profile_slice_cpu.sh
+
+      - name: ccache statistics
+        if: always()
+        run: ccache --show-stats || true
+
+  # Saves the compiler caches the jobs above restore. Caches saved by a
+  # pull_request or merge_group run are scoped to that ref and unreadable from
+  # any other, so those runs only restore (see .github/actions/setup-ccache);
+  # this job is the one writer, running on every push to main. It restores the
+  # previous main entry, so only what the push changed is compiled, and saves a
+  # fresh entry keyed on the commit (setup-ccache's CCACHE_CACHE_KEY), which PR
+  # and merge-queue runs then pick up through the key prefix. Coverage, which
+  # also runs on push, saves its own cache and is not repeated here.
+  #
+  # Build only, no tests. Each row reproduces the compile configurations of one
+  # job (and uses its cache slug): the same make invocations with the same
+  # arguments, in the same order, because the build-flags stamp makes an
+  # argument change rebuild libbwa.a and ccache keys every compile on its
+  # flags. A configuration the jobs above gain or change and this job does not
+  # copy is not a correctness problem -- its compiles just miss the cache on PRs
+  # -- so keep the two in step when editing a job's build commands. The apt
+  # package lists match the jobs' lists, so this also keeps main's copy of each
+  # apt cache current, and install-clang-19 saves its .deb cache from here.
+  warm-caches:
+    name: Warm compiler cache (${{ matrix.config }})
+    if: github.event_name == 'push'
+    runs-on: ${{ matrix.os }}
+    # `actions: write` only for the step that deletes superseded cache entries.
+    # This job runs only on push to main, so it never runs PR code.
+    permissions:
+      contents: read
+      actions: write
+    # A rebuild from a warm cache is a minute or two; a cold one (first run,
+    # or after a toolchain change) is the jobs' full compile time. Ceiling
+    # catches a hung runner only.
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # build-and-test rows: config is the row's artifact_slug, and the
+          # arch/mimalloc/compiler fields are the row's. `harness` marks the rows
+          # that run the unit-test harness, `canonical` the row that also builds
+          # the second avx512bw tree. `chr22_fixture` marks one row per runner
+          # type the chr22 fixture runs on (see the last step). This row also
+          # warms canonical-regressions, which shares its slug and its main
+          # build command, so that job needs no row of its own.
+          - config: linux-x86_64-avx2-mimalloc
+            os: ubuntu-latest
+            kind: row
+            arch_flag: "avx2"
+            use_mimalloc: "1"
+            canonical: true
+            harness: true
+            chr22_fixture: true
+            ccache_size: "300M"
+          - config: linux-x86_64-avx2-no-mimalloc
+            os: ubuntu-latest
+            kind: row
+            arch_flag: "avx2"
+            use_mimalloc: "0"
+            # As the build-and-test row: built without LTO.
+            lto: "off"
+          - config: linux-arm64-mimalloc
+            os: ubuntu-24.04-arm
+            kind: row
+            arch_flag: ""
+            use_mimalloc: "1"
+            harness: true
+            chr22_fixture: true
+          - config: macos-arm64-mimalloc
+            os: macos-latest
+            kind: row
+            arch_flag: ""
+            use_mimalloc: "1"
+            harness: true
+            chr22_fixture: true
+            cxx: "clang++"
+            cc: "clang"
+            ccache_size: "100M"
+          - config: linux-x86_64-single-mimalloc
+            os: ubuntu-latest
+            kind: row
+            arch_flag: ""
+            use_mimalloc: "1"
+            baseline_arch: "avx2"
+            # As the build-and-test row: built without LTO.
+            lto: "off"
+            ccache_size: "300M"
+          - config: linux-x86_64-avx2-gcc-compat
+            os: ubuntu-latest
+            kind: row
+            arch_flag: "avx2"
+            use_mimalloc: "1"
+            cxx: "g++"
+            cc: "gcc"
+            allow_unsupported: "1"
+          - config: rebuild-variants
+            os: ubuntu-latest
+            kind: rebuild-variants
+            ccache_size: "300M"
+          - config: msan-padded-lane-gate
+            os: ubuntu-latest
+            kind: msan
+            apt_packages: "zlib1g-dev libdeflate-dev autoconf automake libomp-dev ccache"
+          - config: profiling-build
+            os: ubuntu-latest
+            kind: profiling
+            cxx: "g++"
+            cc: "gcc"
+            allow_unsupported: "1"
+            apt_packages: "zlib1g-dev libdeflate-dev autoconf automake libomp-dev ccache"
+    env:
+      CXX: ${{ matrix.cxx || 'clang++-19' }}
+      CC: ${{ matrix.cc || 'clang-19' }}
+      ALLOW_UNSUPPORTED_COMPILER: ${{ matrix.allow_unsupported || '0' }}
+      # As build-and-test: the row's LTO mode for every make, so the compiles
+      # (LTO_CFLAGS) hash the same as that row's.
+      LTO: ${{ matrix.lto || 'auto' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        uses: awalsh128/cache-apt-pkgs-action@acb598e5ddbc6f68a970c5da0688d2f3a9f04d05 # v1.6.0
+        with:
+          packages: ${{ matrix.apt_packages || 'zlib1g-dev libdeflate-dev bwa autoconf automake samtools libomp-dev ccache' }}
+          version: 1.1
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+        # bwa for the chr22 fixture step, as in build-and-test's macOS row.
+        run: brew install bwa autoconf automake libomp libdeflate ccache
+
+      - name: Install clang-19 (Linux)
+        if: runner.os == 'Linux' && matrix.cxx != 'g++'
+        uses: ./.github/actions/install-clang-19
+
+      - name: Set up ccache
+        uses: ./.github/actions/setup-ccache
+        with:
+          config: ${{ matrix.config }}
+          max-size: ${{ matrix.ccache_size || '200M' }}
+
+      - name: Build (build-and-test row configurations)
+        if: matrix.kind == 'row'
+        env:
+          MATRIX_ARCH_FLAG: ${{ matrix.arch_flag }}
+          MATRIX_BASELINE_ARCH: ${{ matrix.baseline_arch || 'avx2' }}
+          MATRIX_USE_MIMALLOC: ${{ matrix.use_mimalloc }}
+          MATRIX_CANONICAL: ${{ matrix.canonical || false }}
+          MATRIX_HARNESS: ${{ matrix.harness || false }}
+        run: |
+          set -euo pipefail
+          jobs="$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
+          # As build-and-test: arch_flag="" rows build the main binary through
+          # BASELINE_ARCH and the test binaries with no arch at all; every
+          # standalone test after that builds at the row's arch.
+          if [ "$MATRIX_ARCH_FLAG" = "" ]; then
+            main_args=(BASELINE_ARCH="$MATRIX_BASELINE_ARCH")
+            test_args=()
+            row_arch="$MATRIX_BASELINE_ARCH"
+          else
+            main_args=(arch="$MATRIX_ARCH_FLAG")
+            test_args=(arch="$MATRIX_ARCH_FLAG")
+            row_arch="$MATRIX_ARCH_FLAG"
+          fi
+          make -j"$jobs" "${main_args[@]}" CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
+          make -j"$jobs" test-binaries ${test_args[@]+"${test_args[@]}"} CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
+          make -j"$jobs" bns_zero_calloc_test read_arena_overflow_test packed_text_neg_nbases_test \
+            packed_text_overflow_nbases_test mem_gen_alt_zero_calloc_test err_fgets_eof_test \
+            fast_reader_selftest bseq_read_pe_oob_test bseq_read_comment_copy_test \
+            bseq_read_truncated_gzip_test fr_fastq_diff_test x86_soa_pack_test \
+            kopen_pipe_status_test cli_arg_safety_test pwrite_all_status_test \
+            rescue-prune-eq rescue-band-harness rescue-band-kernel-eq \
+            arch="$row_arch" CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
+          make -C test header_insert_test CXX="$CXX"
+          make kvec_alloc_fail_test
+          make klib_alloc_fail_test
+          if [ "$MATRIX_HARNESS" = true ]; then
+            # test/run_unit_tests.sh's two builds, at its job counts (a job
+            # count changes no compile line, so the hashes match either way).
+            make -C test -j"$jobs"
+            make -j4 arch="$row_arch" CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC" \
+              shm_section_find_test shm_pack_round_trip_test shm_lock_destroy_test fmi_seed_api_guards_test
+          fi
+          if [ "$MATRIX_CANONICAL" = true ]; then
+            # The second tree of the "kswv unit tests at the AVX-512BW tier"
+            # step: same path and copy, so its compiles hash the same. Built
+            # whether or not this runner has AVX-512BW; compiling needs only the
+            # compiler.
+            rm -rf "$RUNNER_TEMP/avx512bw"
+            rsync -a --exclude .git --exclude '*.o' --exclude '*.a' --exclude 'bwa-mem3*' --exclude '/ext/*/build/' \
+              ./ "$RUNNER_TEMP/avx512bw/"
+            make -C "$RUNNER_TEMP/avx512bw" -j"$jobs" test-binaries arch=avx512bw CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
+          fi
+
+      - name: Build (rebuild-variants configurations)
+        if: matrix.kind == 'rebuild-variants'
+        run: |
+          set -euo pipefail
+          make -j"$(nproc)" arch=avx2 CXX=clang++-19 USE_MIMALLOC=1 \
+            EXTRA_CXXFLAGS="$DEBUG_MACRO_EXTRA_CXXFLAGS"
+          make clean
+          make -j"$(nproc)" arch=avx2 CXX=clang++-19 USE_MIMALLOC=1 TESTING_BUILD=1
+          make clean
+          make -j"$(nproc)" arch=avx2 CXX=clang++-19 ASAN=1
+          make ASAN=1 arch=avx2 CXX=clang++-19 cli_arg_safety_test
+
+      - name: Build (MSan padded-lane gate)
+        if: matrix.kind == 'msan'
+        run: |
+          make -j"$(nproc)" MSAN=1 CXX=clang++-19 CC=clang-19 \
+            kernel_padded_lane_uninit_test
+
+      - name: Build (profiling build)
+        if: matrix.kind == 'profiling'
+        run: |
+          set -euo pipefail
+          make -j"$(nproc)" STAGE_PROF=1 BASELINE_ARCH=avx2 CXX=g++ USE_MIMALLOC=1
+          make stage_prof_test
+
+      - name: ccache statistics
+        if: always()
+        run: ccache --show-stats || true
+
+      # Saved even when a build failed: ccache never stores a failed compile,
+      # so whatever is in the cache is valid, and the next PR still gets the
+      # objects that did build.
+      - name: Save ccache
+        if: '!cancelled()'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: ${{ env.CCACHE_CACHE_KEY }}
+
+      # PRs restore only main's newest entry per configuration, so the ones it
+      # supersedes would just hold quota until LRU eviction pushed out caches
+      # still in use. Drop them (best effort; see the script). The canonical
+      # entry also prunes the coverage job's entries: coverage saves its own
+      # cache on push but, running PR code too, gets no `actions: write`.
+      - name: Prune superseded ccache entries
+        if: '!cancelled()'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          MATRIX_CANONICAL: ${{ matrix.canonical || false }}
+        run: |
+          prune=.github/actions/setup-ccache/prune-main-caches.sh
+          bash "$prune" "$CCACHE_KEY_PREFIX" "$CCACHE_CACHE_KEY"
+          if [ "$MATRIX_CANONICAL" = true ]; then
+            bash "$prune" "ccache-coverage-$RUNNER_OS-$RUNNER_ARCH-"
+          fi
+
+      # The chr22 fixture's caches (reference, bwa index, upstream bwa's parity
+      # result) are keyed on their inputs, not the commit, but a cache saved in
+      # a PR or merge-queue scope is not shared, so without a main copy every
+      # new PR would rebuild them. Run the action once per runner type that
+      # uses it (ubuntu-latest, ubuntu-24.04-arm, macos-latest), on the warm
+      # entry that already runs there. Its bwa comes from the same apt step and
+      # package list (Linux) or brew formula (macOS) as build-and-test's, so
+      # the bwa version in the cache keys matches. After the ccache save, so a
+      # fixture failure cannot cost the compiler cache.
+      - name: Stage chr22 fixture (warms its caches on main)
+        if: matrix.chr22_fixture == true
+        uses: ./.github/actions/chr22-fixture

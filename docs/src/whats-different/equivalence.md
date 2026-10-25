@@ -554,7 +554,7 @@ that read `pa` from a pre-0.8.1 `--bam` file sees a different (correctly rounded
 value, no `pa` on secondary records, and `pa` after `SA:Z` instead of before it.
 SAM-text output is unchanged.
 
-Verification scope: `test/regression/alt_pa_parity.sh` (canonical CI row — Linux
+Verification scope: `test/regression/alt_pa_parity.sh` (canonical CI configuration — Linux
 x86_64, AVX2, mimalloc) generates an ALT-aware fixture whose reads come from the
 ALT contig and asserts the decoded float32 is equal record-for-record across the
 two containers, at 3,904 records of which 1,904 carry the tag. It fails on the

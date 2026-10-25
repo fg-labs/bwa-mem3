@@ -20,9 +20,16 @@
 #   many-chain  six 30-mers from distant loci: six chains, so BWA3_CHAIN_FLAT_CAP=3
 #   reads       declines each read mid-way, after the flat pass put seeds in the
 #               pool (flat_declined_cap > 0), exercising the replay.
-#   long reads  36 kb with a substitution every 400 bases: one alignment spans the
-#               read, so the Pass-3 index answers later seeds by scanning every
+#   long read   36 kb with a substitution every 1000 bases: one alignment spans
+#               the read, so the Pass-3 index answers later seeds by scanning every
 #               member rather than walking hash buckets (p3_linear_scans > 0).
+#               The scan is taken only when a member could start anywhere in 32
+#               or more 1 kb buckets (MAX_BUCKET_WALK, P3_BUCKET_SHIFT), i.e.
+#               the alignment outspans the seed by about 32 kb: 36 kb with ~1 kb
+#               seeds clears that by ~2 kb, where 34 kb already falls back to
+#               bucket walks. Its cost grows with seeds x read length and is
+#               nearly all of the fixture's alignment time, so there is one such
+#               read, with ~35 full scans per run.
 #
 # Each fixture run is repeated with BWA3_CHAIN_FLAT_CAP=0 (every read on the
 # kbtree from its first seed) and =3, on the default seed order, on the opt-in
@@ -103,9 +110,12 @@ stat_of() { # stat_of <key> <stderr file>: the value, or empty when absent
 cd "$WORK"
 mawk 'BEGIN {
     srand(7); b = "ACGT"; L = 300000; s = ""
-    for (i = 0; i < L; i++) s = s substr(b, int(rand() * 4) + 1, 1)
     print ">g"
-    for (i = 1; i <= L; i += 80) print substr(s, i, 80)
+    for (i = 0; i < L; i += 80) {          # one 80 bp line at a time: appending
+        l = ""                             # each base to s would copy it 300k times
+        for (j = i; j < i + 80 && j < L; j++) l = l substr(b, int(rand() * 4) + 1, 1)
+        print l; s = s l
+    }
     q = "IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII"
     n = 0
     for (k = 0; k < 200; k++) {            # tie reads: A + F + A
@@ -118,15 +128,14 @@ mawk 'BEGIN {
         for (j = 0; j < 6; j++) r = r substr(s, int(rand() * (L - 100)) + 1, 30)
         printf "@many%d\n%s\n+\n%s\n", k, r, substr(q q q, 1, length(r)) > "reads.fq"
     }
-    for (k = 0; k < 4; k++) {              # long reads: 36 kb, a substitution every 400 bp
-        p = int(rand() * (L - 40000)) + 1; r = substr(s, p, 36000); t = ""
-        for (i = 1; i <= 36000; i += 400) {
-            c = substr(r, i, 1); m = (c == "A") ? "C" : "A"
-            t = t m substr(r, i + 1, 399)
-        }
-        qq = ""; while (length(qq) < 36000) qq = qq q
-        printf "@long%d\n%s\n+\n%s\n", k, t, substr(qq, 1, 36000) > "reads.fq"
+    p = int(rand() * (L - 40000)) + 1      # long read: 36 kb, a substitution every 1000 bp
+    r = substr(s, p, 36000); t = ""
+    for (i = 1; i <= 36000; i += 1000) {
+        c = substr(r, i, 1); m = (c == "A") ? "C" : "A"
+        t = t m substr(r, i + 1, 999)
     }
+    qq = ""; while (length(qq) < 36000) qq = qq q
+    printf "@long0\n%s\n+\n%s\n", t, substr(qq, 1, 36000) > "reads.fq"
 }' > ref.fa 2> /dev/null
 "$BWA_MEM3" index ref.fa > index.log 2>&1 || fail "bwa-mem3 index exited nonzero"
 "$BWA_MEM3" index --meth ref.fa > index-meth.log 2>&1 || fail "bwa-mem3 index --meth exited nonzero"

@@ -419,7 +419,7 @@ these coordinates in exactly this order, so copying the representative's slot-ru
 a by-construction identity, verified by an in-repo regression
 (`test/regression/ks_dedup_byte_identity.sh`) that asserts `off`==`on`==`auto` on a
 dup-rich and a low-dup fixture, single- and multi-threaded, on the canonical
-`Linux x86_64 AVX2` CI row — not a cross-host or cross-tier measurement. It accepts
+`Linux x86_64 AVX2` CI configuration — not a cross-host or cross-tier measurement. It accepts
 three values:
 
 - `off` — always walk every interval (the pre-feature behavior).

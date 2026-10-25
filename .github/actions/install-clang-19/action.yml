@@ -1,7 +1,8 @@
 name: Install clang-19 (Linux)
 description: >-
-  Install clang-19, lld-19 and libomp-19-dev from apt.llvm.org, trusting LLVM's archive
-  signing key only after its fingerprint matches the pinned value.
+  Install clang-19, lld-19, libomp-19-dev and libclang-rt-19-dev from apt.llvm.org,
+  trusting LLVM's archive signing key only after its fingerprint matches the pinned
+  value, and caching the downloaded .debs between runs.
 # clang-19 is the shipping/benchmarked compiler and the compiler-floor minimum
 # (see the Makefile's compiler version floor). Installed from apt.llvm.org via a
 # pinned repo rather than piping llvm.sh into `sudo bash`: fetch LLVM's archive
@@ -9,11 +10,36 @@ description: >-
 # trusting it, store it in a dedicated keyring, and add the repo `signed-by`
 # that keyring so a tampered mirror or a changed installer script can't run code
 # as root or slip in unsigned packages. Every job that needs clang-19 uses this
-# action, so the fingerprint pin lives in one place. Linux runners only.
+# action, so the fingerprint pin lives in one place. Linux runners only (x86_64
+# and arm64).
+#
+# Speed: this runs in every Linux clang job, so the slow parts are trimmed:
+#   - `apt-get update` refreshes only the llvm source list. The runner image
+#     already ships the Ubuntu lists; refreshing them too was most of the update
+#     time. If the image's Ubuntu lists are absent or too stale to resolve a
+#     dependency, the install falls back to a full `apt-get update` and retries.
+#   - `--no-install-recommends` drops llvm-19, llvm-19-dev, llvm-19-tools,
+#     llvm-19-runtime and clang-tools-19 (~75 MB of the ~136 MB download), none
+#     of which the build uses. The one recommend the build does need is
+#     libclang-rt-19-dev (compiler-rt: the ASan/MSan runtimes, recommended by
+#     libclang-common-19-dev), so it is named explicitly.
+#   - The downloaded .debs are cached with actions/cache, keyed on the resolved
+#     clang-19 version, so a new apt.llvm.org build misses the cache and is
+#     fetched fresh. A cache hit only saves the download: apt still checks every
+#     cached .deb against the hashes in the signed (fingerprint-verified) index
+#     and re-downloads any that do not match, so the cache cannot inject a
+#     package the repo did not sign.
+#     The cache is restored everywhere but saved only from a push to main (the
+#     warm-caches job in ci.yml runs this action there): a cache saved by a
+#     pull_request or merge_group run is scoped to that ref, unreadable from any
+#     other, and would only churn the repository's cache quota. Restore-only on
+#     those events changes nothing about trust -- the same apt hash check runs
+#     on whatever was restored.
 runs:
   using: composite
   steps:
-    - name: Install clang-19 from apt.llvm.org (verified key)
+    - name: Add apt.llvm.org (verified key) and resolve the clang-19 version
+      id: prep
       shell: bash
       run: |
         set -euo pipefail
@@ -29,15 +55,89 @@ runs:
           exit 1
         fi
         sudo install -m 0755 -d /etc/apt/keyrings
-        sudo gpg --dearmor -o /etc/apt/keyrings/llvm-snapshot.gpg /tmp/llvm-snapshot.gpg.key
+        sudo gpg --batch --yes --dearmor -o /etc/apt/keyrings/llvm-snapshot.gpg /tmp/llvm-snapshot.gpg.key
+        llvm_list=/etc/apt/sources.list.d/llvm-19.list
         echo "deb [signed-by=/etc/apt/keyrings/llvm-snapshot.gpg] http://apt.llvm.org/${codename}/ llvm-toolchain-${codename}-19 main" \
-          | sudo tee /etc/apt/sources.list.d/llvm-19.list
-        sudo apt-get update
+          | sudo tee "$llvm_list"
+        # Refresh only the llvm list; List-Cleanup=0 keeps apt from deleting the
+        # Ubuntu lists it was told not to look at. With no Ubuntu lists at all on
+        # the image, do the full update now rather than fail at install time.
+        if compgen -G '/var/lib/apt/lists/*ubuntu*_Packages*' >/dev/null; then
+          sudo apt-get update -o Dir::Etc::sourcelist="$llvm_list" \
+            -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0
+        else
+          sudo apt-get update
+        fi
+        version="$(apt-cache policy clang-19 | awk '/Candidate:/ {print $2}')"
+        if [ -z "$version" ] || [ "$version" = "(none)" ]; then
+          echo "FATAL: no clang-19 candidate from apt.llvm.org" >&2
+          exit 1
+        fi
+        # The key changes when apt.llvm.org publishes a new build, when this
+        # action's package set changes (its hash), or across OS codename/arch.
+        action_hash="$(sha256sum "$GITHUB_ACTION_PATH/action.yml" | cut -c1-16)"
+        prefix="install-clang-19-${codename}-$(dpkg --print-architecture)-${action_hash}-"
+        # Outside $HOME so apt's unprivileged download user (_apt) can reach it.
+        debdir=/tmp/install-clang-19-debs
+        mkdir -p "$debdir"
+        {
+          echo "debdir=$debdir"
+          echo "prefix=$prefix"
+          echo "key=${prefix}${version//[^A-Za-z0-9.+~_-]/_}"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Restore cached clang-19 .debs
+      id: debs
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: ${{ steps.prep.outputs.debdir }}
+        key: ${{ steps.prep.outputs.key }}
+        # An older build's cache still supplies the .debs that did not change
+        # (apt keeps the ones whose hashes match and fetches the rest).
+        restore-keys: ${{ steps.prep.outputs.prefix }}
+
+    - name: Install clang-19
+      shell: bash
+      env:
+        DEBDIR: ${{ steps.prep.outputs.debdir }}
+      run: |
+        set -euo pipefail
         # libomp-19-dev provides omp.h in clang-19's search path (libsais.c
         # uses -fopenmp); ubuntu's libomp-dev matches the distro clang, not 19.
         # lld-19 is the linker the default build's LTO link needs (the
         # Makefile's LTO block); without it the build drops to a non-LTO link
         # with only a NOTE, so CI would no longer build what ships.
-        sudo apt-get install -y clang-19 lld-19 libomp-19-dev
+        # libclang-rt-19-dev carries the sanitizer runtimes for the ASAN=1 and
+        # MSAN=1 builds (a Recommends, so it must be named with
+        # --no-install-recommends).
+        # Dir::Cache::Archives points apt's download cache at the cached dir, so
+        # matching .debs are used in place and new ones land there for saving.
+        install_clang() {
+          sudo apt-get install -y --no-install-recommends \
+            -o Dir::Cache::Archives="$DEBDIR" \
+            clang-19 lld-19 libomp-19-dev libclang-rt-19-dev
+        }
+        sudo mkdir -p "$DEBDIR/partial"
+        if ! install_clang; then
+          echo "::notice::clang-19 install failed against the image's apt lists; running a full apt-get update and retrying"
+          sudo apt-get update
+          install_clang
+        fi
+        # Drop .debs no longer in the index (superseded builds from a
+        # restore-keys hit) and apt's root-owned lock/partial entries, and hand
+        # the dir back to the runner user so the cache save below can read it.
+        sudo apt-get -o Dir::Cache::Archives="$DEBDIR" autoclean
+        sudo rm -rf "$DEBDIR/lock" "$DEBDIR/partial"
+        sudo chown -R "$(id -u):$(id -g)" "$DEBDIR"
         clang++-19 --version | head -1
         ld.lld-19 --version | head -1
+
+    - name: Save clang-19 .debs (push to main only)
+      # Exact-key hit: the cache already holds this build's .debs, nothing to
+      # save. Saved right after the install rather than at job end, so a later
+      # failing step in the job does not lose it.
+      if: github.event_name == 'push' && steps.debs.outputs.cache-hit != 'true'
+      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: ${{ steps.prep.outputs.debdir }}
+        key: ${{ steps.prep.outputs.key }}

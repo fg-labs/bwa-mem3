@@ -165,7 +165,8 @@ make profile-clean
 |---|---|---|
 | `USE_MIMALLOC` | `1` | Include mimalloc; set `0` to use the system allocator |
 | `ASAN` | _(unset)_ | Set to any non-empty value to enable AddressSanitizer (forces `USE_MIMALLOC=0`) |
-| `COVERAGE` | _(unset)_ | Set to enable `--coverage` + `-O0` for gcov line-level coverage |
+| `COVERAGE` | _(unset)_ | Set to enable `--coverage` at `COVERAGE_OPT` for gcov line-level coverage |
+| `COVERAGE_OPT` | `-O0` | Optimization level of a `COVERAGE=1` build. `-O0` maps gcov lines 1:1 to source; CI's coverage job uses `-O1`, which runs the tests faster but reports some inlined lines and small functions under their caller |
 | `LTO` | `auto` | Link-time optimization: `auto`, `thin`, `full` or `off` (see [Link-Time Optimization](#link-time-optimization-lto)) |
 | `EXTRA_CXXFLAGS` | _(empty)_ | Appended to `CXXFLAGS`; forwarded through PGO / LTO targets |
 | `EXTRA_CFLAGS` | _(empty)_ | Appended last to the FASTQ reader's C flags (`-g -O3` plus the arch flags), e.g. `EXTRA_CFLAGS=-O0` to debug it; forwarded through the PGO targets, but not to `lto-build`'s inner build, which clears the command-line variables (an `EXTRA_CFLAGS` exported in the environment still reaches it) |

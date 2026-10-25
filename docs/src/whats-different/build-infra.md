@@ -28,7 +28,8 @@ PR #34 establishes the long-term test infrastructure for bwa-mem3:
   checks from dwgsim/phiX174 to holodeck/chr22 and folded it into
   `chr22_parity.sh`.
 - A `coverage` CI job builds `libbwa.a` and both test binaries with
-  `COVERAGE=1` (`-O0 --coverage`), runs both test binaries, collects Cobertura
+  `COVERAGE=1` (`--coverage`, at `-O1` in CI via `COVERAGE_OPT`; `-O0` by
+  default), runs both test binaries, collects Cobertura
   XML via `gcovr`, and uploads to Codecov via `codecov/codecov-action`.
 
 ## `PACKAGE_VERSION` from `git describe` (PR #52)

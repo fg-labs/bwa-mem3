@@ -6,12 +6,15 @@ description: >-
 #   /tmp/chr22/chr22.fa (+ .fai)      the pinned reference
 #   /tmp/chr22/bwa_chr22.fa (+ bwa sidecars)
 #   /tmp/chr22-sim/reads.r{1,2}.fastq.gz
+#   /tmp/chr22-upstream/bwa.normalized.sam   upstream bwa's parity result,
+#                                     exported as $BWA_CHR22_NORMALIZED_SAM
 #   the test/holodeck pixi env (holodeck + samtools), for `pixi run`
 #
 # It does NOT build the bwa-mem3 index: that sidecar layout is coupled to the
 # bwa-mem3 binary, which changes per commit, so the caller runs
 # `bwa-mem3 index /tmp/chr22/chr22.fa` with the binary it is testing. Needs `bwa`
-# on PATH (apt on Linux, brew on macOS) and `shasum`.
+# on PATH (apt on Linux, brew on macOS) and `shasum`, and the repository
+# checked out (it runs test/regression/chr22_parity.sh on a cache miss).
 runs:
   using: composite
   steps:
@@ -160,3 +163,60 @@ runs:
             --simple-names \
             --min-error-rate 0.001 --max-error-rate 0.001
         ls /tmp/chr22-sim/
+
+    - name: Compute chr22 upstream-bwa cache inputs
+      id: upstream-cache-inputs
+      # Digest of the simulated reads, taken after simulation so any change to
+      # the holodeck version, its parameters or the seed changes the key
+      # without having to be listed in it. The decompressed stream is hashed,
+      # not the .gz bytes, so gzip header/level differences can't cause
+      # spurious misses.
+      shell: bash
+      run: |
+        reads_sha=$({ gzip -dc /tmp/chr22-sim/reads.r1.fastq.gz; gzip -dc /tmp/chr22-sim/reads.r2.fastq.gz; } \
+          | shasum -a 256 | awk '{print $1}' | cut -c1-16)
+        echo "reads_sha=${reads_sha}" >> "$GITHUB_OUTPUT"
+        echo "CHR22_READS_SHA=${reads_sha}"
+
+    - name: Cache chr22 upstream-bwa result
+      # Upstream bwa's alignment of the fixture is a pure function of the bwa
+      # build, its chr22 index, the reads, and the command line plus
+      # normalization in chr22_parity.sh -- none of which depend on the
+      # bwa-mem3 commit -- yet every chr22_parity.sh run used to recompute it.
+      # The cached file is the script's own normalized, sorted form, so the
+      # comparison is unchanged. Key inputs: the bwa version and chr22 digest
+      # (as for the index), the reads digest above, and a hash of
+      # chr22_parity.sh (bwa command line and normalization). ${runner.os}
+      # and ${runner.arch} are included because apt and brew bwa are separate
+      # builds and the normalization relies on sed and sort, which differ between
+      # GNU and BSD userlands, so the normalized bytes need not match across
+      # runners.
+      #
+      # The key does not depend on the commit, so within one cache scope (a
+      # PR, the merge queue, main) the first row to miss saves it and every
+      # later run restores it.
+      id: cache-chr22-upstream
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: /tmp/chr22-upstream/bwa.normalized.sam
+        key: chr22-bwa-upstream-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.bwa-cache-inputs.outputs.bwa_version }}-${{ steps.bwa-cache-inputs.outputs.chr22_fasta_sha }}-${{ steps.upstream-cache-inputs.outputs.reads_sha }}-${{ hashFiles('test/regression/chr22_parity.sh') }}
+
+    - name: Align chr22 with upstream bwa
+      if: steps.cache-chr22-upstream.outputs.cache-hit != 'true'
+      # Producer mode of the parity script: runs only the bwa side, with the
+      # same command line and normalization as the comparison, and refuses
+      # to write a result that fails its sanity check.
+      shell: bash
+      run: |
+        mkdir -p /tmp/chr22-upstream
+        CHR22_UPSTREAM_OUT=/tmp/chr22-upstream/bwa.normalized.sam \
+        BWA_CHR22_FA=/tmp/chr22/bwa_chr22.fa \
+        CHR22_SIM_DIR=/tmp/chr22-sim \
+          bash "$GITHUB_WORKSPACE/test/regression/chr22_parity.sh"
+
+    - name: Export chr22 upstream-bwa result
+      # chr22_parity.sh picks this up from the environment, so callers need no
+      # change. It re-validates the file before use and falls back to running
+      # bwa itself if it is missing or truncated.
+      shell: bash
+      run: echo "BWA_CHR22_NORMALIZED_SAM=/tmp/chr22-upstream/bwa.normalized.sam" >> "$GITHUB_ENV"
