@@ -83,8 +83,10 @@
 #           the primary hit plus the XA entries are exactly the three copies
 #           (ctg1 +2101, ctg2 +1101, ctg4 -201, strands flipped for the reverse
 #           complement), each 100M NM 0, and HN:i:2; -u appends the score
-#           (100) and MAPQ (0) to each XA entry. (Only the entries are checked:
-#           whether -u should rename the tag XB is filed separately.)
+#           (100) and MAPQ (0) to each XA entry. Only the entries are checked,
+#           read from XA or XB: the -u help text and docs/src/cli/mem.md name
+#           the tag XB, docs/src/user-guide/output.md says it stays XA, and
+#           the tag name is left to that documentation to settle.
 #   -p      interleaved pairs (with a single-end read between them) at
 #           -I 300,30: a FR pair FLAG 99/147, TLEN +-300, MC 100M, MQ 60; a FR
 #           pair whose read 1 is the reverse one, 83/163; a pair whose second
@@ -677,6 +679,7 @@ for tier in $(mem_cli_tiers); do
     mem_cli_mem "$tier" "$(out u_opt)" -u "$ref" "$work/xa.fq"
     xa_default="$(mem_cli_tag "$(mem_cli_primary "$(out xa)" inR)" XA)"
     u_rec="$(mem_cli_primary "$(out u_opt)" inR)"
+    # The entries under whichever of XA or XB the record carries (see the header).
     xa_u="$(mem_cli_tag "$u_rec" XA)$(mem_cli_tag "$u_rec" XB)"
     mem_cli_expect "$tier: -u entries are the XA entries plus score 100 and MAPQ 0" \
         "$(printf '%s\n' "$xa_default" | sed 's/;/,100,0;/g')" "$xa_u"

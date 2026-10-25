@@ -34,8 +34,8 @@
 #
 # and the SAM text (@PG aside) must be byte-identical across tiers.
 #
-# This is the harness pilot for the mem_*_cli.sh scripts beside it; see
-# test/framework/mem_cli.sh for the helpers.
+# The helpers it uses, shared with the other mem_*_cli.sh scripts beside it,
+# are in test/framework/mem_cli.sh.
 #
 # Inputs (env vars):
 #   BWA_MEM3       path to the bwa-mem3 binary under test
