@@ -32,6 +32,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "chain_seed_pool.h"
 #include "ext_reverse_copy.h"
 #include "chain_window_prefetch.h"
+#include "chain_flat_key.h" /* ChainFlat's packed (pos, chain index) sort key */
 #include "read_memo.h"     /* --dedup-reads whole-read-pair memoization (Phase 1: measure-only) */
 #include "meth_xm.h"   /* meth_chem_t for the --meth chemistry default */
 #include "FMI_search.h"
@@ -632,13 +633,17 @@ enum ChainStat {
     CHS_P3_HEAD_DUPS,      /* buckets skipped because their head slot was walked */
     CHS_FLAT_READS,        /* reads chained entirely on the flat index */
     CHS_FLAT_DECLINED_TIE, /* reads the flat index handed to the kbtree: equal key */
-    CHS_FLAT_DECLINED_CAP, /* ... : more chains than BWA3_CHAIN_FLAT_CAP */
+    CHS_FLAT_DECLINED_CAP, /* ... : more chains than BWA3_CHAIN_FLAT_CAP, or a seed
+                            * position outside [0, 2^43) (unreachable on real genomes) */
     CHS_CONTAINED_DEFERRED, /* seeds the contained-seed skip deferred past the main batch */
     CHS_CONTAINED_PURGED,   /* ... of which the containment test purged (SW skipped) */
     CHS_CONTAINED_EXTENDED, /* ... of which it did not, so they ran in the second batch */
     CHS_N
 };
 static std::atomic<uint64_t> g_chain_stats[CHS_N];
+/* The chain-count cap ChainFlat::cap() resolved (after any clamp), printed as
+ * flat_cap; -1 until the first read is chained. */
+static std::atomic<int> g_chain_flat_cap{-1};
 static inline void chain_stat(ChainStat k)
 {
     if (chain_stats_on()) g_chain_stats[k].fetch_add(1, std::memory_order_relaxed);
@@ -649,7 +654,7 @@ static struct ChainStatsDumper {
         fprintf(stderr, "[chain-stats] p3_reads=%llu p3_fallback_reads=%llu p3_bucket_walks=%llu "
                 "p3_linear_scans=%llu p3_head_dups=%llu flat_reads=%llu flat_declined_tie=%llu "
                 "flat_declined_cap=%llu contained_deferred=%llu contained_purged=%llu "
-                "contained_extended=%llu\n",
+                "contained_extended=%llu flat_cap=%d\n",
                 (unsigned long long)g_chain_stats[CHS_P3_READS].load(),
                 (unsigned long long)g_chain_stats[CHS_P3_FALLBACK_READS].load(),
                 (unsigned long long)g_chain_stats[CHS_P3_BUCKET_WALKS].load(),
@@ -660,7 +665,8 @@ static struct ChainStatsDumper {
                 (unsigned long long)g_chain_stats[CHS_FLAT_DECLINED_CAP].load(),
                 (unsigned long long)g_chain_stats[CHS_CONTAINED_DEFERRED].load(),
                 (unsigned long long)g_chain_stats[CHS_CONTAINED_PURGED].load(),
-                (unsigned long long)g_chain_stats[CHS_CONTAINED_EXTENDED].load());
+                (unsigned long long)g_chain_stats[CHS_CONTAINED_EXTENDED].load(),
+                g_chain_flat_cap.load());
     }
 } g_chain_stats_dumper;
 
@@ -3344,8 +3350,9 @@ static inline void chain_add_one_seed(const mem_opt_t *opt, int64_t l_pac,
  * binary search over 48-byte mem_chain_t keys, one node per level. With
  * distinct keys (.pos) the probe's answer is fully determined -- kb_intervalp
  * returns the chain with the largest pos <= the seed's rbeg, or NULL -- and the
- * final in-order traversal is ascending pos. A sorted int64 key array with a
- * branchless upper_bound reproduces both exactly.
+ * final in-order traversal is ascending pos. A sorted array of packed
+ * (pos, chain index) keys (chain_flat_key.h) with a branchless upper_bound
+ * reproduces both exactly.
  *
  * Equal keys are where the two differ: chain_cmp compares .pos only, so which
  * of two equal-pos chains the B-tree returns depends on its node layout. A
@@ -3355,9 +3362,13 @@ static inline void chain_add_one_seed(const mem_opt_t *opt, int64_t l_pac,
  * through the unchanged kbtree path from a clean start. Reads with more than
  * `cap` chains do the same, bounding the O(n) sorted insert. Replay clears the
  * read's seed pool, so the tree path sees exactly the state it would have had
- * from the first seed.
+ * from the first seed. A position outside the packed key's range
+ * [0, CHAIN_FLAT_POS_LIMIT = 2^43), far beyond any genome, declines the same way
+ * and is counted with the cap declines.
  *
- * BWA3_CHAIN_FLAT_CAP (default 512, a non-negative integer) sets the cap. 0 sends
+ * BWA3_CHAIN_FLAT_CAP (default 512, a non-negative integer) sets the cap; the
+ * packed key's chain-index field bounds it at 2^CHAIN_FLAT_CI_BITS (1048576),
+ * and a larger value is clamped to that with a warning. 0 sends
  * every read to the tree (the first new chain already meets the cap), and a small
  * cap exercises the mid-read replay; test/regression/chain_flat_replay_identity.sh
  * pins both against the default. A malformed or negative value is reported and
@@ -3365,44 +3376,33 @@ static inline void chain_add_one_seed(const mem_opt_t *opt, int64_t l_pac,
 struct ChainFlat {
     enum Verdict { OK = 0, TIE, CAP };
     std::vector<mem_chain_t> chains;   /* insertion order */
-    std::vector<int64_t> keys;         /* ascending pos */
-    std::vector<uint32_t> ord;         /* ord[i] = chains index of keys[i] */
+    std::vector<uint64_t> keys;        /* ascending chain_flat_pack(pos, chains index) */
     std::vector<seed_rec_t> log;       /* this read's streamed seeds, for a replay */
     bool active = false;
 
     static constexpr int DEFAULT_CAP = 512;
+    static_assert(DEFAULT_CAP >= 0 && (uint64_t)DEFAULT_CAP <= CHAIN_FLAT_CI_LIMIT,
+                  "the default cap must keep every packed chain index below 2^CHAIN_FLAT_CI_BITS");
     static int cap() {
         static const int c = [] {
             const char *e = getenv("BWA3_CHAIN_FLAT_CAP");
-            if (e == NULL || e[0] == '\0') return DEFAULT_CAP;
-            char *end = NULL;
-            errno = 0;
-            const long v = strtol(e, &end, 10);
-            if (errno != 0 || end == e || *end != '\0' || v < 0 || v > INT_MAX) {
+            const chain_flat_cap_t r = chain_flat_parse_cap(e, DEFAULT_CAP);
+            if (r.status == CHAIN_FLAT_CAP_MALFORMED)
                 fprintf(stderr, "ERROR: BWA3_CHAIN_FLAT_CAP=\"%s\" is not a non-negative "
                         "integer; ignoring it (using %d).\n", e, DEFAULT_CAP);
-                return DEFAULT_CAP;
-            }
-            return (int)v;
+            else if (r.status == CHAIN_FLAT_CAP_CLAMPED)
+                fprintf(stderr, "[W::chain-flat] BWA3_CHAIN_FLAT_CAP=\"%s\" exceeds the flat "
+                        "chaining index's %d-chain ceiling; clamping to %d.\n", e, r.cap, r.cap);
+            xassert(r.cap >= 0 && (uint64_t)r.cap <= CHAIN_FLAT_CI_LIMIT,
+                    "BWA3_CHAIN_FLAT_CAP: effective cap exceeds the packed chain-index field");
+            g_chain_flat_cap.store(r.cap, std::memory_order_relaxed);
+            return r.cap;
         }();
         return c;
     }
     void begin() {
-        chains.clear(); keys.clear(); ord.clear(); log.clear();
+        chains.clear(); keys.clear(); log.clear();
         active = true;
-    }
-    /* number of keys <= pos, i.e. the predecessor's rank + 1 */
-    inline int rank_le(int64_t pos) const {
-        size_t n = keys.size();
-        if (n == 0) return 0;
-        const int64_t *b = keys.data();
-        /* The step must stay a conditional move: the comparison is data-dependent
-         * (a coin flip per level), and as a branch it mispredicted ~37% of the time
-         * on x86 -- clang's cmov-conversion pass had turned the select back into a
-         * jump. BWA_UNPREDICTABLE (__builtin_unpredictable under clang) keeps it a
-         * cmov there; other compilers get the plain select. */
-        while (n > 1) { const size_t h = n >> 1; b = BWA_UNPREDICTABLE(b[h] <= pos) ? b + h : b; n -= h; }
-        return (int)(b - keys.data()) + (*b <= pos);
     }
     /* Chain one seed. TIE / CAP: the tree must take this read (nothing mutated). */
     inline Verdict add(const mem_opt_t *opt, int64_t l_pac, const bntseq_t *chain_bns,
@@ -3410,11 +3410,15 @@ struct ChainFlat {
                        int8_t meth_hyp)
     {
         const int64_t pos = seed_in->rbeg;
-        const int r = rank_le(pos);
+        /* Unpackable position (outside [0, 2^43); no real genome reaches it): the tree
+         * decides, and the decline is counted with the cap declines. */
+        if (!chain_flat_pos_ok(pos)) return CAP;
+        const size_t r = chain_flat_rank_le(keys.data(), keys.size(), pos);
         if (r > 0) {
-            mem_chain_t *lower = &chains[ord[r - 1]];
+            const uint64_t lk = keys[r - 1];
+            mem_chain_t *lower = &chains[chain_flat_ci(lk)];
             if (test_and_merge(opt, l_pac, lower, pool, seed_in, rid)) return OK;
-            if (keys[r - 1] == pos) return TIE;           /* equal key: tree decides */
+            if (chain_flat_pos(lk) == pos) return TIE;    /* equal key: tree decides */
         }
         if ((int)chains.size() >= cap()) return CAP;
         mem_chain_t tmp;
@@ -3422,8 +3426,7 @@ struct ChainFlat {
         chain_init_new(&tmp, chain_bns, pool, seqid, seed_in, rid, meth_hyp);
         const uint32_t ci = (uint32_t)chains.size();
         chains.push_back(tmp);
-        keys.insert(keys.begin() + r, pos);
-        ord.insert(ord.begin() + r, ci);
+        keys.insert(keys.begin() + r, chain_flat_pack(pos, ci));
         return OK;
     }
     /* Undo the flat pass: its chains own nothing, so dropping the read's seeds
@@ -3873,8 +3876,8 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
             /* ascending pos == the kbtree's in-order traversal (keys distinct) */
             size = (int)chn_flat.chains.size();
             kv_resize(mem_chain_t, *chain, size);
-            for (uint32_t oi : chn_flat.ord)
-                chain->a[chain->n++] = chain_pool_drain(chn_flat.chains[oi], chn_pool, seedBuf,
+            for (uint64_t k : chn_flat.keys)
+                chain->a[chain->n++] = chain_pool_drain(chn_flat.chains[chain_flat_ci(k)], chn_pool, seedBuf,
                                                         &seedBufCount, seedBufSize);
             chn_flat.active = false;
         } else {

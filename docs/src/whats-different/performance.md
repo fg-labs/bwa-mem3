@@ -229,15 +229,16 @@ WGS and WES slices (150 bp paired, hg38) at the default scoring, `-A 2`, `-B 6` 
   maximum gap from a per-thread table over query lengths, keyed on the scoring
   options.
 - **Flat chaining index.** Seed chaining finds each seed's closest chain in a
-  sorted array of chain positions with a branchless binary search instead of the
-  B-tree probe. Where the B-tree's answer depends on its node layout (two chains
-  with the same position) or a read has more than `BWA3_CHAIN_FLAT_CAP` chains,
-  the read is replayed through the unchanged B-tree path.
+  sorted array of chain keys, each packing a chain's position and its index
+  into one 64-bit word, with a branchless binary search instead of the B-tree
+  probe. Where the B-tree's answer depends on its node layout (two chains with
+  the same position) or a read has more than `BWA3_CHAIN_FLAT_CAP` chains, the
+  read is replayed through the unchanged B-tree path.
 
 | Variable | Effect |
 |---|---|
-| `BWA3_CHAIN_STATS=1` | Print, once at exit, how the chaining, Pass-3 and contained-seed-skip fast paths resolved (`[chain-stats] …`): reads indexed, reads that fell back, queries answered by bucket walks versus full scans, reads the flat chaining index handed to the B-tree (equal positions, or over the cap), and how the contained-seed extension skip resolved its deferred seeds (`contained_deferred`, of which `contained_purged` had their banded-SW skipped and `contained_extended` ran in the second batch). Measurement only; output is unchanged. |
-| `BWA3_CHAIN_FLAT_CAP=<n>` | Largest number of chains a read may have on the flat chaining index before it is replayed through the B-tree (default 512, bounding the index's O(n) sorted insert). `0` sends every read to the B-tree. A malformed or negative value is reported to stderr and the default used. Output is identical at every value. |
+| `BWA3_CHAIN_STATS=1` | Print, once at exit, how the chaining, Pass-3 and contained-seed-skip fast paths resolved (`[chain-stats] …`): reads indexed, reads that fell back, queries answered by bucket walks versus full scans, reads the flat chaining index handed to the B-tree (equal positions, or over the cap; the cap count also includes a seed position outside [0, 2^43), which no real genome reaches), and how the contained-seed extension skip resolved its deferred seeds (`contained_deferred`, of which `contained_purged` had their banded-SW skipped and `contained_extended` ran in the second batch), and the chain-count cap the flat index applied after any clamp (`flat_cap`, `BWA3_CHAIN_FLAT_CAP` or its default). Measurement only; output is unchanged. |
+| `BWA3_CHAIN_FLAT_CAP=<n>` | Largest number of chains a read may have on the flat chaining index before it is replayed through the B-tree (default 512, bounding the index's O(n) sorted insert). `0` sends every read to the B-tree. The ceiling is 2^20 (1048576), the most chains the index's packed key can number; a larger value, including one too large to parse, is clamped to it with a warning to stderr. A malformed or negative value is reported to stderr and the default used. Output is identical at every value. |
 
 ## Hot data-dependent branches ([PR #584](https://github.com/fg-labs/bwa-mem3/pull/584))
 

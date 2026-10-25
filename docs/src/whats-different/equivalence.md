@@ -530,6 +530,27 @@ the band cells of the unequal-length regions drop 45 % (WGS) and 47 % (WES), and
 whole pass 26 % and 14 % on top of the equal-length certificate (cells counted exactly per band
 row) ([#580](https://github.com/fg-labs/bwa-mem3/pull/580)).
 
+### Flat chaining index and `BWA3_CHAIN_FLAT_CAP` (default, byte-identical)
+
+Seed chaining finds each seed's closest chain in a per-read sorted array of packed
+`(position << 20) | chain index` keys instead of the klib B-tree. The key orders exactly as the
+position does. When the flat index cannot reproduce the B-tree's answer, the declining seed
+changes nothing and the read is re-chained from its seed log through the unchanged B-tree path:
+two chains at the same position (the B-tree's tie order depends on its node layout), a seed
+position outside `[0, 2^43)`, or a read that would exceed `BWA3_CHAIN_FLAT_CAP` chains (default
+512; `0` sends every read to the B-tree). The packed chain index has 20 bits, so a cap above 2^20
+(1048576), including one too large for `strtol`, is clamped to 1048576 with a one-time
+`[W::chain-flat]` warning on stderr; a malformed or negative value is reported on stderr and the
+default used (`chain_flat_parse_cap`).
+
+The output is the same at every cap by construction, clamped or not, because a read that reaches
+the cap takes the B-tree replay. `test/regression/chain_flat_replay_identity.sh` checks this on
+its generated 300 kb fixture at caps 0, 3 and 2000000 (clamped, with the warning). At the default
+cap, SAM output was md5-identical to the base on a 5M-pair WGS slice (HG00096, hg38) on
+Graviton4 (NEON) and Zen 4 (AVX-512BW, and AVX2 forced), clang 19.1.7, in the default mode and
+with `--compat=bwa-mem2` and `--compat=bwa-mem`
+([#642](https://github.com/fg-labs/bwa-mem3/pull/642)).
+
 ## What differs
 
 ### Additive SAM tags
