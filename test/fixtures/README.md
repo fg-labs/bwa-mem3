@@ -18,6 +18,8 @@ All four SMEM/seed tests share `phix.fa` (phiX174, NC_001422.1, 5386 bp) as the 
 
 `make_long_reads.awk` is a generator (no committed data) used by `test/regression/skip_contained_byte_identity.sh` and `test/regression/compat_contained_skip_identity.sh`. It slices 2-3 kb single-end reads from one contig with ~1% substitutions and ~0.2% 1 bp indels drawn from a Park-Miller generator whose arithmetic is exact in awk's doubles, so it is byte-identical across awk implementations. Long reads are rescored by `mem_flt_chained_seeds`, which is what sends a deferred contained seed to the skip's second extension batch; see the comments at the top of the script.
 
+`seedcov_mapq/build_fixture.awk` is a generator (no committed data) used by `test/regression/seedcov_mapq_legacy.sh`. It slices a reference (phix plus a `dup` contig: phix[1000,2700) with every 41st base rotated) and 26 SE reads plus 26 concordant FR pairs with a 1000 bp insert from `phix.fa`, with fixed base rotations and 2 bp indels, so it is byte-identical across awk implementations. Every read has a near-equal second hit on `dup`, which keeps the `-Q 0` MAPQ below its cap and therefore dependent on `seedcov`; see the comments at the top of the script.
+
 `supp_rep/build_fixture.awk` is a generator (no committed data) used by `test/regression/supp_rep_hard_cap.sh`. It emits a deterministic engineered reference + SE reads exercising `--supp-rep-hard-cap` against a chain with a high-SA-count SMEM but a uniquely-disambiguated extension; see comments at the top of the awk script.
 
 ## Regenerating the fixtures

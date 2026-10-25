@@ -4216,7 +4216,9 @@ int mem_kernel2_core(FMI_search *fmi,
          * points at has just been freed, and its seeds lived in this thread's
          * seed_scratch window -- which the very next work item on this thread
          * will overwrite. Clear the pointer so a future reader gets a null
-         * dereference instead of silently-recycled seeds. */
+         * dereference instead of silently-recycled seeds. The seedcov walk itself
+         * runs only when mem_want_seedcov(opt) holds (the legacy MAPQ model,
+         * -Q 0 or negative). */
         for (int i2 = 0; i2 < (int) regs[l].n; ++i2)
             regs[l].a[i2].c = NULL;
     }
@@ -5120,6 +5122,29 @@ void mem_seed_capped_sub(mem_alnreg_v *a, int match_a)
     }
 }
 
+/* a->seedcov (the summed length of chain seeds fully contained in the region)
+ * has exactly one consumer: the legacy MAPQ branch of mem_approx_mapq_se below,
+ * which branches on this same predicate, so it is taken exactly when
+ * opt->mapQ_coef_len <= 0 (-Q 0 or negative; the default is 50 and no preset
+ * changes it). Every seedcov recount site in the extension paths is gated on it,
+ * so the default run skips the a->c -> c->seeds walk.
+ *
+ * When the gate is off, extension-path regions keep the 0 their slot was
+ * calloc'd with. Mate-rescue regions (mem_matesw_batch_post, bwamem_pair.cpp)
+ * set seedcov directly, without the gate. The other places that touch seedcov do not read
+ * it into output: the redundant-region merge (mem_sort_dedup_patch) takes the
+ * max of the two regions' seedcov and only writes it back -- every
+ * extension-path input to it is gated (0 when off, recounted when on), and a
+ * mate-rescue input carries its directly set value either way -- and the
+ * dedup-reads VERIFY field compare sees a duplicate and its representative
+ * computed under the same gate. Output is byte-identical at every -Q.
+ * test/regression/seedcov_mapq_legacy.sh pins the -Q 0 and default-Q MAPQs and
+ * checks that every recount here sits under a want_seedcov guard. */
+static inline bool mem_want_seedcov(const mem_opt_t *opt)
+{
+    return opt->mapQ_coef_len <= 0;
+}
+
 int mem_approx_mapq_se(const mem_opt_t *opt, const mem_alnreg_t *a)
 {
     int mapq, l, sub = a->sub? a->sub : opt->min_seed_len * opt->a;
@@ -5130,14 +5155,14 @@ int mem_approx_mapq_se(const mem_opt_t *opt, const mem_alnreg_t *a)
     identity = 1. - (double)(l * opt->a - a->score) / (opt->a + opt->b) / l;
     if (a->score == 0) {
         mapq = 0;
-    } else if (opt->mapQ_coef_len > 0) {
+    } else if (mem_want_seedcov(opt)) {  /* legacy model: the only seedcov reader */
+        mapq = (int)(MEM_MAPQ_COEF * (1. - (double)sub / a->score) * log(a->seedcov) + .499);
+        mapq = identity < 0.95? (int)(mapq * identity * identity + .499) : mapq;
+    } else {
         double tmp;
         tmp = l < opt->mapQ_coef_len? 1. : opt->mapQ_coef_fac / log(l);
         tmp *= identity * identity;
         mapq = (int)(6.02 * (a->score - sub) / opt->a * tmp * tmp + .499);
-    } else {
-        mapq = (int)(MEM_MAPQ_COEF * (1. - (double)sub / a->score) * log(a->seedcov) + .499);
-        mapq = identity < 0.95? (int)(mapq * identity * identity + .499) : mapq;
     }
     if (a->sub_n > 0) mapq -= (int)(4.343 * log(a->sub_n+1) + .499);
     if (mapq > 60) mapq = 60;
@@ -6672,6 +6697,7 @@ static inline int bsw_tb_probe_rung(BswMethTier tier, const mem_opt_t *opt, mem_
         const bseq1_t *seq_, int pen_clip, int is_left, int tid)
 {
     if (nump <= 0 || !opt->band_cert) return nump;
+    const bool want_seedcov = mem_want_seedcov(opt);
 
     /* Quantized bucket ceilings. A pair runs at the smallest ceiling >= its w_need, so a
      * proven-narrow pair does its DP at a band near its tb rather than the uniform probe
@@ -6784,7 +6810,7 @@ static inline int bsw_tb_probe_rung(BswMethTier tier, const mem_opt_t *opt, mem_
                 }
             }
             a->w = max_(a->w, Wb);
-            if (a->rb != H0_ && a->qb != H0_ && a->qe != H0_ && a->re != H0_) {
+            if (want_seedcov && a->rb != H0_ && a->qb != H0_ && a->qe != H0_ && a->re != H0_) {
                 int ii = 0;
                 for (ii = 0, a->seedcov = 0; ii < a->c->n; ++ii) {
                     const mem_seed_t *t = &(a->c->seeds[ii]);
@@ -7267,6 +7293,7 @@ static inline void stage_seed_extension(
         StageCtx &ctx)
 {
     const int tid = ctx.tid;
+    const bool want_seedcov = mem_want_seedcov(opt);
     mem_cache *mmc = ctx.mmc;
     /* Local aliases so the moved body reads/writes the SAME names it used inline;
      * references bind to the driver's locals through ctx (grows propagate out). */
@@ -7505,7 +7532,7 @@ static inline void stage_seed_extension(
                     a->truesc = fp_gscore;
                 }
                 a->w = max_(a->w, opt->w);
-                if (a->rb != H0_ && a->qb != H0_ && a->qe != H0_ && a->re != H0_) {
+                if (want_seedcov && a->rb != H0_ && a->qb != H0_ && a->qe != H0_ && a->re != H0_) {
                     int ii;
                     for (ii = 0, a->seedcov = 0; ii < a->c->n; ++ii) {
                         const mem_seed_t *t = &(a->c->seeds[ii]);
@@ -7786,7 +7813,7 @@ static inline void stage_seed_extension(
                     a->truesc += fp_gscore - fp_h0;
                 }
                 a->w = max_(a->w, opt->w);
-                if (a->rb != H0_ && a->qb != H0_ && a->qe != H0_ && a->re != H0_) {
+                if (want_seedcov && a->rb != H0_ && a->qb != H0_ && a->qe != H0_ && a->re != H0_) {
                     int ii;
                     for (ii = 0, a->seedcov = 0; ii < a->c->n; ++ii) {
                         const mem_seed_t *t = &a->c->seeds[ii];
@@ -7833,8 +7860,12 @@ static inline void stage_seed_extension(
         // path above, nor the post-SW LEFT-accept loops, nor the
         // RIGHT-accept loops. In that case this block is the ONLY writer
         // of a->seedcov. Dropping it would leave seedcov stale and change
-        // mem_approx_mapq_se (log(seedcov)), altering the emitted MAPQ.
-        if (a->rb != H0_ && a->qb != H0_)
+        // mem_approx_mapq_se (log(seedcov)), altering the emitted MAPQ under
+        // -Q 0. Like every recount site it is gated on want_seedcov
+        // (mem_want_seedcov): at the default -Q the legacy MAPQ branch never
+        // reads seedcov, so the walk is skipped there; the gate must stay the
+        // same at every site so -Q 0 keeps all of them live.
+        if (want_seedcov && a->rb != H0_ && a->qb != H0_)
         {
             int i;
             for (i = 0, a->seedcov = 0; i < c->n; ++i)
@@ -7876,6 +7907,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
         opt_sanitized.band_cert = 0;
         opt = &opt_sanitized;
     }
+    const bool want_seedcov = mem_want_seedcov(opt);
 
     SeqPair *seqPairArrayAux      = mmc->seqPairArrayAux[tid];
     SeqPair *seqPairArrayLeft128  = mmc->seqPairArrayLeft128[tid];
@@ -8493,7 +8525,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
                 }
 
                 a->w = max_(a->w, w);
-                if (a->rb != H0_ && a->qb != H0_ && a->qe != H0_ && a->re != H0_)
+                if (want_seedcov && a->rb != H0_ && a->qb != H0_ && a->qe != H0_ && a->re != H0_)
                 {
                     int i = 0;
                     for (i = 0, a->seedcov = 0; i < a->c->n; ++i){
@@ -8581,7 +8613,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
                 }
 
                 a->w = max_(a->w, w);
-                if (a->rb != H0_ && a->qb != H0_ && a->qe != H0_ && a->re != H0_)
+                if (want_seedcov && a->rb != H0_ && a->qb != H0_ && a->qe != H0_ && a->re != H0_)
                 {
                     int i = 0;
                     for (i = 0, a->seedcov = 0; i < a->c->n; ++i){
@@ -8662,7 +8694,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
                 }
 
                 a->w = max_(a->w, w);
-                if (a->rb != H0_ && a->qb != H0_ && a->qe != H0_ && a->re != H0_)
+                if (want_seedcov && a->rb != H0_ && a->qb != H0_ && a->qe != H0_ && a->re != H0_)
                 {
                     int i = 0;
                     for (i = 0, a->seedcov = 0; i < a->c->n; ++i){
@@ -8763,7 +8795,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
                         a->truesc += fp_gscore - sp->h0;
                     }
                     a->w = max_(a->w, opt->w);
-                    if (a->rb != H0_ && a->qb != H0_ && a->qe != H0_ && a->re != H0_) {
+                    if (want_seedcov && a->rb != H0_ && a->qb != H0_ && a->qe != H0_ && a->re != H0_) {
                         int ii;
                         for (ii = 0, a->seedcov = 0; ii < a->c->n; ++ii) {
                             const mem_seed_t *t = &a->c->seeds[ii];
@@ -8890,7 +8922,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
                     a->truesc += sp->gscore - sp->h0;
                 }
                 a->w = max_(a->w, w);
-                if (a->rb != H0_ && a->qb != H0_ && a->qe != H0_ && a->re != H0_)
+                if (want_seedcov && a->rb != H0_ && a->qb != H0_ && a->qe != H0_ && a->re != H0_)
                 {
                     int i = 0;
                     for (i = 0, a->seedcov = 0; i < a->c->n; ++i) {
@@ -8965,7 +8997,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
                     a->truesc += sp->gscore - sp->h0;
                 }
                 a->w = max_(a->w, w);
-                if (a->rb != H0_ && a->qb != H0_ && a->qe != H0_ && a->re != H0_)
+                if (want_seedcov && a->rb != H0_ && a->qb != H0_ && a->qe != H0_ && a->re != H0_)
                 {
                     int i = 0;
                     for (i = 0, a->seedcov = 0; i < a->c->n; ++i) {
@@ -9041,7 +9073,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
                     a->truesc += sp->gscore - sp->h0;
                 }
                 a->w = max_(a->w, w);
-                if (a->rb != H0_ && a->qb != H0_ && a->qe != H0_ && a->re != H0_)
+                if (want_seedcov && a->rb != H0_ && a->qb != H0_ && a->qe != H0_ && a->re != H0_)
                 {
                     int i = 0;
                     for (i = 0, a->seedcov = 0; i < a->c->n; ++i) {

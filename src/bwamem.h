@@ -418,7 +418,9 @@ typedef struct mem_alnreg_t {
     int csub;       // SW score of a tandem hit
     int sub_n;      // approximate number of suboptimal hits
     int w;          // actual band width used in extension
-    int seedcov;    // length of regions coverged by seeds
+    int seedcov;    // length of seeds fully inside the region; read only by the legacy MAPQ (-Q <= 0).
+                    // Extension paths recount it only under mem_want_seedcov (else it stays 0);
+                    // mate rescue sets it directly
     int secondary;  // index of the parent hit shadowing the current hit; <0 if primary
     int secondary_all;
     int seedlen0;   // length of the starting seed
