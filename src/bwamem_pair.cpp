@@ -46,6 +46,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "rescue_prune.h"
 #include "rescue_band.h"
 #include "rescue_env.h"
+#include "rescue_rb_index.h"
 #include "meth_xm.h"   /* meth_chem_t: exact rescue pruning under --meth is EM-seq only */
 #include <chrono>
 
@@ -375,7 +376,8 @@ static bool rescue_prune_on()
 /* BWA3_RESCUE_PRUNE_STATS=1 prints the rescue shortcuts' counters to stderr at exit as one line,
  * "[RESCUE_PRUNE] jobs=.. full=.. b1=.. b2=.. rows_in=.. rows_kept=.. jobs16=.. b1_16=.. b2_16=..
  * kmer_jobs=.. memo_hits=.. reused=.. <stage times> dedup_run=.. dedup_skip=.. dedup_run_regs=..
- * dedup_skip_regs=.. dedup_insert1=.. dedup_insert1_fast=.. dedup_insert1_tf=.. dedup_s=..". The first fields are the
+ * dedup_skip_regs=.. dedup_insert1=.. dedup_insert1_fast=.. dedup_insert1_tf=.. dedup_s=..
+ * post_rb_builds=.. post_rb_probes=.. post_rb_drops=..". The first fields are the
  * filter's: jobs filtered, and of them how many kept the full window, were proven to fail (b1, not
  * enqueued) or were narrowed to a hull (b2), with the reference rows before and after, the calls the
  * SIMD filter answered from its repeat memo, and of those the jobs answered from an identical
@@ -386,7 +388,11 @@ static bool rescue_prune_on()
  * counts the jobs the SIMD filter decided with K-mers longer than 5 (rescue_prune_kmax; not the
  * scalar filter's decisions), the same check for a scoring that admits them. The dedup_*
  * fields are the post-rescue dedup's (below), which runs on every architecture, so in a run that
- * does not prune (rescue_prune_runs) they and jobs16 are the line's only nonzero counters. */
+ * does not prune (rescue_prune_runs) they, jobs16 and the post_rb_* fields are the line's only
+ * nonzero counters. post_rb_* count the sorted mate-rb copies mem_pair_resolve_batch_post built
+ * once a rescue had changed the list, the skip sets answered from them and the copies discarded
+ * after a dedup dropped a region (BWA3_RESCUE_POST_RB_INDEX): the non-vacuity check for that
+ * shortcut. */
 struct rescue_prune_stats_t {
     std::atomic<uint64_t> jobs{0}, full{0}, b1{0}, b2{0}, rows_in{0}, rows_kept{0}, jobs16{0}, b1_16{0},
         b2_16{0}, kmer_jobs{0}, memo_hits{0}, reused{0};
@@ -399,6 +405,10 @@ struct rescue_prune_stats_t {
      * with the list known tie-free (the adjacent-tie check skipped), and their time. */
     std::atomic<uint64_t> dedup_run{0}, dedup_skip{0}, dedup_run_regs{0}, dedup_skip_regs{0},
         dedup_insert1{0}, dedup_insert1_fast{0}, dedup_insert1_tf{0}, ns_dedup{0};
+    /* The sorted mate-rb copy mem_pair_resolve_batch_post keeps once a rescue has changed the list
+     * (BWA3_RESCUE_POST_RB_INDEX): copies built, skip sets answered from one, copies discarded
+     * after a dedup dropped a region. */
+    std::atomic<uint64_t> post_rb_builds{0}, post_rb_probes{0}, post_rb_drops{0};
     bool on = rescue_env_opt_in("BWA3_RESCUE_PRUNE_STATS");
     ~rescue_prune_stats_t() {
         if (on) fprintf(stderr, "[RESCUE_PRUNE] jobs=%llu full=%llu b1=%llu b2=%llu rows_in=%llu rows_kept=%llu "
@@ -406,7 +416,7 @@ struct rescue_prune_stats_t {
                         "kswv_pass0_s=%.3f band_pass0_s=%.3f kswv_pass1_s=%.3f band_pass1_s=%.3f dedup_run=%llu "
                         "dedup_skip=%llu dedup_run_regs=%llu "
                         "dedup_skip_regs=%llu dedup_insert1=%llu dedup_insert1_fast=%llu dedup_insert1_tf=%llu "
-                        "dedup_s=%.3f\n",
+                        "dedup_s=%.3f post_rb_builds=%llu post_rb_probes=%llu post_rb_drops=%llu\n",
                         (unsigned long long)jobs, (unsigned long long)full, (unsigned long long)b1,
                         (unsigned long long)b2, (unsigned long long)rows_in, (unsigned long long)rows_kept,
                         (unsigned long long)jobs16, (unsigned long long)b1_16,
@@ -417,7 +427,8 @@ struct rescue_prune_stats_t {
                         (unsigned long long)dedup_skip, (unsigned long long)dedup_run_regs,
                         (unsigned long long)dedup_skip_regs, (unsigned long long)dedup_insert1,
                         (unsigned long long)dedup_insert1_fast, (unsigned long long)dedup_insert1_tf,
-                        ns_dedup * 1e-9);
+                        ns_dedup * 1e-9, (unsigned long long)post_rb_builds,
+                        (unsigned long long)post_rb_probes, (unsigned long long)post_rb_drops);
     }
 };
 static inline uint64_t rescue_now_ns()
@@ -440,6 +451,7 @@ struct rescue_prune_tstats_t {
     uint64_t ns_filter = 0, ns_k0 = 0, ns_band = 0, ns_k1 = 0, ns_b1 = 0;
     uint64_t dedup_run = 0, dedup_skip = 0, dedup_run_regs = 0, dedup_skip_regs = 0, dedup_insert1 = 0,
         dedup_insert1_fast = 0, dedup_insert1_tf = 0, ns_dedup = 0;
+    uint64_t post_rb_builds = 0, post_rb_probes = 0, post_rb_drops = 0;
     ~rescue_prune_tstats_t() {
         rescue_prune_stats_t &g = g_rescue_prune_stats;
         g.jobs += jobs; g.full += full; g.b1 += b1; g.b2 += b2; g.rows_in += rows_in;
@@ -450,6 +462,8 @@ struct rescue_prune_tstats_t {
         g.dedup_skip_regs += dedup_skip_regs; g.dedup_insert1 += dedup_insert1;
         g.dedup_insert1_fast += dedup_insert1_fast; g.dedup_insert1_tf += dedup_insert1_tf;
         g.ns_dedup += ns_dedup;
+        g.post_rb_builds += post_rb_builds; g.post_rb_probes += post_rb_probes;
+        g.post_rb_drops += post_rb_drops;
     }
 };
 static thread_local rescue_prune_tstats_t t_rescue_prune_stats;
@@ -468,6 +482,15 @@ static bool rescue_dedup_skip_enabled()
 static bool rescue_skip_reuse_enabled()
 {
     static const bool on = rescue_env_on("BWA3_RESCUE_SKIP_REUSE");
+    return on;
+}
+/* Answer the mate-rescue skip sets in mem_matesw_batch_post, once the mate list has changed, from
+ * a sorted copy of its rb values kept across the calls (rescue_rb_index.h, see
+ * mem_pair_resolve_batch_post). Default ON; BWA3_RESCUE_POST_RB_INDEX=0 scans the list for every
+ * such anchor, which is how the byte-identity A/B is run. */
+static bool post_rb_index_enabled()
+{
+    static const bool on = rescue_env_on("BWA3_RESCUE_POST_RB_INDEX");
     return on;
 }
 /* Answer a rescue job that repeats one of the last filtered jobs byte for byte from that job's
@@ -1263,6 +1286,20 @@ static const size_t MATESW_SKIP_INDEX_MIN_ANCHORS = 8;
 static const size_t MATESW_SKIP_INDEX_MIN_REGS = 16;
 #endif
 
+/* mem_pair_resolve_batch_post keeps a sorted copy of a mate list's rb values once the list has
+ * changed when at least this many anchors are left against a list of at least this many regions.
+ * Higher than the _pre gate, since the copy is sorted anew per changed list and then kept up to
+ * date. Thread-summed skip-set time, 5 M WGS read pairs -t16, Graviton 4: 2.99 s with the scan,
+ * 2.47 s gated at 8 / 16, 2.22 s at 16 / 64. The XCHECK build indexes every list with an anchor
+ * left, so its cross-checks cover the copy and every skip set probed from it. */
+#ifdef BWA_MEM3_DEBUG_RESCUE_SKIP_XCHECK
+static const size_t POST_RB_INDEX_MIN_ANCHORS = 1;
+static const size_t POST_RB_INDEX_MIN_REGS = 1;
+#else
+static const size_t POST_RB_INDEX_MIN_ANCHORS = 16;
+static const size_t POST_RB_INDEX_MIN_REGS = 64;
+#endif
+
 int mem_sam_pe_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                          const uint8_t *pac, const mem_pestat_t pes[4],
                          uint64_t id, bseq1_t s[2], mem_alnreg_v a[2],
@@ -1304,18 +1341,14 @@ int mem_sam_pe_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
             const bool indexed = n_anchor >= MATESW_SKIP_INDEX_MIN_ANCHORS
                               && a[!i].n >= MATESW_SKIP_INDEX_MIN_REGS
                               && rescue_skip_reuse_enabled();
-            static thread_local std::vector<int64_t> mate_rb;
-            if (indexed) {
-                mate_rb.resize(a[!i].n);
-                for (size_t k = 0; k < a[!i].n; ++k) mate_rb[k] = a[!i].a[k].rb;
-                std::sort(mate_rb.begin(), mate_rb.end());
-            }
+            static thread_local rescue_rb_index mate_rb;
+            if (indexed) mate_rb.build(a[!i].a, a[!i].n);
             for (j = 0; j < b[i].n && j < opt->max_matesw; ++j) {
                 int known_skip = -1;
                 if (indexed) {
                     mem_matesw_skip_query_t q;
                     mem_matesw_skip_query_init(bns->l_pac, b[i].a[j].rb, pes, &q);
-                    known_skip = (int)mem_matesw_skip_probe(&q, mate_rb.data(), mate_rb.size());
+                    known_skip = (int)mate_rb.probe(&q);
                 }
                 int64_t val = mem_matesw_batch_pre(opt, bns, pac, pes, &b[i].a[j],
                                                    s[!i].l_seq, (uint8_t*)s[!i].seq,
@@ -1765,19 +1798,51 @@ int mem_pair_resolve_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
              * a[!i]. Until then the anchor's skip set is the one _pre recorded
              * (BWA3_RESCUE_SKIP_REUSE=0 scans instead). */
             bool ma_unchanged = rescue_skip_reuse_enabled();
+            /* Once a call has changed a[!i], the later anchors' skip sets come from a sorted copy
+             * of a[!i]'s rb values (rescue_rb_index.h) instead of a scan, when enough anchors are
+             * left against a long enough list (POST_RB_INDEX_MIN_*). The copy is built after the
+             * first nonzero return and brought up to date after every later call: the rb values the
+             * call pushed are added, and when the call's dedup also dropped a region the copy is
+             * discarded and the remaining anchors scan. BWA3_RESCUE_POST_RB_INDEX=0 always scans. */
+            const size_t n_anchor = std::min((size_t)b[i].n, (size_t)std::max(opt->max_matesw, 0));
+            static thread_local rescue_rb_index post_rb;
+            post_rb.drop();
+            const bool st = g_rescue_prune_stats.on;
+            mem_rescue_pushed_rb_t pushed_rb;
             for (j = 0; j < b[i].n && j < opt->max_matesw; ++j) {
                 /* D3 (--meth, PR-6, B3): see MATE_SORT branch above. */
                 const char  *ms_orig = opt->meth_mode ? s[!i].meth_orig_seq : NULL;
                 const int8_t *rmat    = opt->meth_mode
                     ? mem_opt_meth_mat(opt, !b[i].a[j].meth_hypothesis) : NULL;
-                const int known_skip = ma_unchanged && (gcnt >> 2) < mmc->rescue_skip_set_cap[tid]
-                                     ? (int)mmc->rescue_skip_set[tid][gcnt >> 2] : -1;
+                int known_skip = ma_unchanged && (gcnt >> 2) < mmc->rescue_skip_set_cap[tid]
+                               ? (int)mmc->rescue_skip_set[tid][gcnt >> 2] : -1;
+                if (post_rb.live) {
+                    mem_matesw_skip_query_t q;
+                    mem_matesw_skip_query_init(bns->l_pac, b[i].a[j].rb, pes, &q);
+                    known_skip = (int)post_rb.probe(&q);
+                    if (st) ++t_rescue_prune_stats.post_rb_probes;
+                }
+                const size_t n_before = a[!i].n;
                 int val = mem_matesw_batch_post(opt, bns, pac, pes, &b[i].a[j],
                                                 s[!i].l_seq, (uint8_t*)s[!i].seq,
                                                 &a[!i], myaln, gcnt, gar, mmc, tid,
                                                 ms_orig, rmat, opt->meth_mode ? i : -1,
-                                                &ma_dedup_state, known_skip);
-                if (val) ma_unchanged = false;
+                                                &ma_dedup_state, known_skip, &pushed_rb);
+                if (post_rb.live) {
+                    if (!post_rb.update(n_before, a[!i].n, pushed_rb) && st)
+                        ++t_rescue_prune_stats.post_rb_drops;
+                } else if (val && ma_unchanged) {
+                    ma_unchanged = false;
+                    if (n_anchor - (size_t)j - 1 >= POST_RB_INDEX_MIN_ANCHORS
+                        && a[!i].n >= POST_RB_INDEX_MIN_REGS && post_rb_index_enabled()) {
+                        post_rb.build(a[!i].a, a[!i].n);
+                        if (st) ++t_rescue_prune_stats.post_rb_builds;
+                    }
+                }
+#ifdef BWA_MEM3_DEBUG_RESCUE_SKIP_XCHECK
+                xassert(!post_rb.live || post_rb.matches(a[!i].a, a[!i].n),
+                        "rescue _post rb index disagrees with the mate list");
+#endif
                 n += val;
                 gcnt += 4;
             }
@@ -2149,7 +2214,8 @@ bool mem_matesw_skip(int64_t l_pac, int64_t rb, const mem_alnreg_v *ma, const me
 }
 
 /* The skip set of the region at rb against the mate list ma: known_skip when the caller has it
- * (0..15: _pre's sorted index, or the set _pre recorded for this anchor and this unchanged ma),
+ * (0..15: _pre's sorted copy of ma's rb values, the set _pre recorded for this anchor and this
+ * unchanged ma, or _post's sorted copy kept up to date once ma has changed; rescue_rb_index.h),
  * else a scan of ma. */
 static unsigned matesw_skip_bits(int64_t l_pac, int64_t rb, const mem_alnreg_v *ma,
                                  const mem_pestat_t pes[4], int known_skip)
@@ -2634,7 +2700,8 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                           mem_alnreg_v *ma, kswr_t **myaln, int32_t gcnt,
                           int32_t *gar, mem_cache *mmc, int32_t tid, const char *ms_orig,
                           const int8_t *mat, int mate_meth_ot,
-                          mem_rescue_dedup_state_t *dedup_state, int known_skip)
+                          mem_rescue_dedup_state_t *dedup_state, int known_skip,
+                          mem_rescue_pushed_rb_t *pushed_rb)
 {
     extern int mem_sort_dedup_patch_rev(const mem_opt_t *opt, const bntseq_t *bns,
                                         const uint8_t *pac, uint8_t *query, int n,
@@ -2662,6 +2729,7 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
     
     int64_t l_pac = bns->l_pac;
     int i, r, skip[4], n = 0, rid = -1;
+    if (pushed_rb) pushed_rb->n = 0;
 
     /* D3 (--meth): point the mate query at the ORIGINAL bases (ASCII
      * meth_orig_seq, same orientation as `ms`/seq); the per-orientation RC below
@@ -2675,7 +2743,9 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
     uint8_t *ms2 = NULL;
 
     /* known_skip, when given, is the skip set mem_matesw_batch_pre recorded for this anchor, valid
-     * while ma is still the list _pre scanned (see mem_pair_resolve_batch_post). */
+     * while ma is still the list _pre scanned, or, once ma has changed, the set probed from the
+     * sorted copy of ma's rb values the caller keeps up to date (see mem_pair_resolve_batch_post,
+     * rescue_rb_index.h). */
     const unsigned skip_bits = matesw_skip_bits(l_pac, a->rb, ma, pes, known_skip);
     for (r = 0; r < 4; ++r) skip[r] = (int)((skip_bits >> r) & 1u);
     if (skip_bits == 15u) {
@@ -2855,6 +2925,10 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                 b.chain_n_hits = 1; // mate-rescue has no SMEM evidence; treat as unique anchor
 
                 kv_push(mem_alnreg_t, *ma, b); // make room for a new element
+                if (pushed_rb) {
+                    xassert(pushed_rb->n < 4, "mate rescue pushed more than one region per orientation");
+                    pushed_rb->rb[pushed_rb->n++] = b.rb;
+                }
 
                 #if !MATE_SORT
 

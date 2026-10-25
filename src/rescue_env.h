@@ -42,6 +42,11 @@
  *                                   set the pre step recorded, after the kernels while the list is
  *                                   unchanged, and binary searches of a sorted list many anchors
  *                                   rescue into
+ * BWA3_RESCUE_POST_RB_INDEX   1     once a rescue has changed the mate list, answer the later
+ *                                   anchors' skip sets from a sorted copy of its rb values kept
+ *                                   up to date across the calls (16 or more anchors left, 64 or
+ *                                   more mate regions) instead of scanning the list; needs
+ *                                   BWA3_RESCUE_SKIP_REUSE=1
  * BWA3_RESCUE_REPEAT          1     a rescue job repeating one of the last eight filtered jobs byte
  *                                   for byte reads that job's result instead of being enqueued again
  * BWA3_RESCUE_FSCAN           1     the 11-op kswv rescue cell in every SIMD body; 0 also selects

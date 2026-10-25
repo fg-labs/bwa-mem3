@@ -100,6 +100,16 @@
 # Inputs:
 #   BWA_MEM3     — path to the bwa-mem3 binary under test
 #   RESCUE_TIERS — optional: x86 tiers to force in addition (see above)
+#   RESCUE_EXPECT_POST_RB_INDEX — optional: 1 requires the default leg to build and probe the
+#                  sorted mate-rb copy _post keeps once a rescue has changed the list
+#                  (post_rb_builds and post_rb_probes > 0). The fixture's lists are below the
+#                  release gate (16 anchors, 64 regions), so set it only for a build with
+#                  BWA_MEM3_DEBUG_RESCUE_SKIP_XCHECK, which indexes every list with an anchor
+#                  left and cross-checks the copy and every probe (CI's debug-macro step).
+#                  It also runs a -t 1 leg with only BWA3_RESCUE_POST_RB_INDEX=0, which must
+#                  equal the reference and build no copy (the reference leg's REF_ENV turns the
+#                  skip-set reuse off too, which alone keeps the copy from being built).
+#                  The reference leg must build no copy either way.
 set -euo pipefail
 : "${BWA_MEM3:?BWA_MEM3 must be set}"
 command -v python3 > /dev/null 2>&1 || {
@@ -284,7 +294,7 @@ host_tier="$(BWAMEM3_DEBUG_SIMD=1 "$BIN" 2>&1 | sed -n 's/.*SIMD tier: \([a-z0-9
 # columns the fixture's lane groups have against the original body's gathered
 # score; test_kswv_pad_columns.cpp checks those columns directly.
 REF_ENV=(BWA3_RESCUE_PRUNE=0 BWA3_RESCUE_BAND=0 BWA3_RESCUE_DEDUP_SKIP=0 BWA3_RESCUE_SKIP_REUSE=0
-    BWA3_RESCUE_REPEAT=0 BWA3_RESCUE_FSCAN=0 BWA3_RESCUE_USQADD=0 BWA3_RESCUE_ROWPAIR=0
+    BWA3_RESCUE_POST_RB_INDEX=0 BWA3_RESCUE_REPEAT=0 BWA3_RESCUE_FSCAN=0 BWA3_RESCUE_USQADD=0 BWA3_RESCUE_ROWPAIR=0
     BWA3_RESCUE_LAZYQE=0 BWA3_RESCUE_SCORE2_BITS=0 BWA3_RESCUE_PADCOLS=0
     BWA3_RESCUE_QE_REVSCAN=0)
 
@@ -592,6 +602,8 @@ stats="$(grep '^\[RESCUE_PRUNE\]' full.t1.err || true)"
 [ "$(field jobs)" -eq 0 ] || fail "the reference leg filtered rescue jobs (BWA3_RESCUE_PRUNE=0 ignored): $stats"
 [ "$(field dedup_skip)" -eq 0 ] && [ "$(field dedup_insert1)" -eq 0 ] \
     || fail "the reference leg took a dedup shortcut (BWA3_RESCUE_DEDUP_SKIP=0 ignored): $stats"
+[ "$(field post_rb_builds)" -eq 0 ] \
+    || fail "the reference leg built a _post mate-rb copy, though REF_ENV turns the skip-set reuse and the copy off: $stats"
 
 stats="$(grep '^\[RESCUE_PRUNE\]' dedup.t1.err || true)"
 [ -n "$stats" ] || fail "BWA3_RESCUE_PRUNE_STATS=1 printed no [RESCUE_PRUNE] line (dedup leg)"
@@ -609,6 +621,27 @@ dstats="dedup_skip=$dedup_skip dedup_insert1=$dedup_insert1 dedup_insert1_fast=$
 stats="$(grep '^\[RESCUE_PRUNE\]' prune.t1.err || true)"
 [ -n "$stats" ] || fail "BWA3_RESCUE_PRUNE_STATS=1 printed no [RESCUE_PRUNE] line"
 jobs=$(field jobs) full=$(field full) b1=$(field b1) b2=$(field b2) rows_in=$(field rows_in) rows_kept=$(field rows_kept)
+post_rb_builds=$(field post_rb_builds) post_rb_probes=$(field post_rb_probes)
+if [ "${RESCUE_EXPECT_POST_RB_INDEX:-0}" = 1 ]; then
+    [ "${post_rb_builds:-0}" -gt 0 ] && [ "${post_rb_probes:-0}" -gt 0 ] \
+        || fail "RESCUE_EXPECT_POST_RB_INDEX=1 but the default leg built or probed no _post mate-rb copy: $stats"
+    dstats="$dstats post_rb_builds=$post_rb_builds post_rb_probes=$post_rb_probes"
+    # The reference leg's REF_ENV also turns the skip-set reuse off, which on its own keeps the
+    # copy from being built, so it cannot tell whether BWA3_RESCUE_POST_RB_INDEX=0 is honoured.
+    # This leg runs the defaults with only that knob off: it must equal the reference and build
+    # no copy.
+    run_leg 1 "postrb_off.t1" BWA3_RESCUE_PRUNE_STATS=1 BWA3_RESCUE_POST_RB_INDEX=0
+    if ! cmp -s full.t1.sam postrb_off.t1.sam; then
+        echo "FAIL: the leg with only BWA3_RESCUE_POST_RB_INDEX=0 differs from the reference at -t 1:" >&2
+        diff full.t1.sam postrb_off.t1.sam | head -20 >&2 || true
+        exit 1
+    fi
+    ostats="$(grep '^\[RESCUE_PRUNE\]' postrb_off.t1.err || true)"
+    [ -n "$ostats" ] || fail "BWA3_RESCUE_PRUNE_STATS=1 printed no [RESCUE_PRUNE] line (BWA3_RESCUE_POST_RB_INDEX=0 leg)"
+    obuilds=$(printf '%s\n' "$ostats" | tr ' ' '\n' | sed -n 's/^post_rb_builds=//p')
+    [ "${obuilds:-1}" -eq 0 ] \
+        || fail "BWA3_RESCUE_POST_RB_INDEX=0 was ignored: the leg with only it off built a _post mate-rb copy: $ostats"
+fi
 if [ "$jobs" -eq 0 ]; then
     # Pruning is compiled in wherever the build's SIMD floor carries the SIMD filter, so no
     # filtered job there means it stopped engaging (a gate or fixture regression) and the identity

@@ -850,7 +850,8 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                          int mate_meth_ot = -1, int known_skip = -1);
 /* known_skip (mem_matesw_batch_pre and mem_matesw_batch_post): -1 scans ma for the anchor's skip
  * set; 0..15 is that set (bit r for orientation r, as mem_matesw_skip computes it) for exactly
- * this anchor against exactly this ma, which the caller vouches for. */
+ * this anchor against exactly this ma, which the caller vouches for (from a sorted copy of ma's
+ * rb values, rescue_rb_index.h, or the set _pre recorded while ma is unchanged). */
 
 /* Given two alignment begin positions (rb) on the 2-bit-packed concat-with-
  * reverse-complement index, infer the pair orientation (0=FF, 1=FR, 2=RF,
@@ -967,6 +968,16 @@ typedef struct {
     int tie_free;
 } mem_rescue_dedup_state_t;
 
+/* The rb values of the regions one mem_matesw_batch_post call pushed into `ma` (at most one per
+ * orientation), for a caller that keeps a sorted copy of ma's rb values across calls
+ * (rescue_rb_index.h). The call never rewrites the rb of a region already in ma: its dedups pass
+ * bns == NULL, so they only drop regions and reorder them. So ma->n == n_before + n means nothing
+ * was dropped and ma's rb values are the old ones plus rb[0, n). */
+typedef struct {
+    int n;
+    int64_t rb[4];
+} mem_rescue_pushed_rb_t;
+
 /* The dedup-only call mem_sort_dedup_patch(opt, 0, 0, 0, n, a), byte for byte,
  * that also reports whether its output is a fixed point (src/bwamem.cpp has
  * the argument). */
@@ -1002,7 +1013,7 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                           const char *ms_orig = NULL,
                           const int8_t *mat = NULL, int mate_meth_ot = -1,
                           mem_rescue_dedup_state_t *dedup_state = NULL,
-                          int known_skip = -1);
+                          int known_skip = -1, mem_rescue_pushed_rb_t *pushed_rb = NULL);
 
 /* The scalar mem_sam_pe / mem_pair_resolve pairing path was removed; the batched
  * mem_sam_pe_batch* path above is the only mate-rescue/pairing path. */
