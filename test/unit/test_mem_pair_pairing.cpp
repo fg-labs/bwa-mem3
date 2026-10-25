@@ -16,8 +16,11 @@
 // s1 + s2 + .721 * log(2 * erfc(|z| / sqrt 2)) * a + .499, truncated and floored
 // at 0, with z = (distance - mean) / std; ties go to the larger
 // hash_64((k << 32 | i) ^ id << 8), k < i the two hits' ranks in that position
-// order. The oracle enumerates all pairs instead of sweeping, so a sweep that
-// stops early or skips a hit disagrees with it.
+// order. hash_64 is bwa's 64-bit integer hash (Thomas Wang's mix, bwa utils.h);
+// the oracle carries its own copy, written out below, so that a change to the
+// library's hash, which would move every tie-break in the output, is caught
+// rather than followed. The oracle enumerates all pairs instead of sweeping, so
+// a sweep that stops early or skips a hit disagrees with it.
 //
 // The MAPQ cases are worked by hand from the same model (bwa's mem_sam_pe):
 // q_pe = 6.02 * (o - max(sub, s1 + s2 - U)) / a, less 4.343 * ln(n_sub + 1),
@@ -35,7 +38,6 @@
 #include "doctest/doctest.h"
 #include "bwamem.h"
 #include "bntseq.h"
-#include "utils.h"
 
 #include <algorithm>
 #include <cmath>
@@ -112,6 +114,20 @@ void pes_i300(mem_pestat_t pes[4]) {
 
 // ---- mem_pair oracle ---------------------------------------------------------
 
+// bwa's hash_64 (Thomas Wang's 64-bit integer mix), the tie-break hash of the
+// pair model, written out here rather than taken from the library.
+uint64_t wang_hash64(uint64_t key) {
+    key += ~(key << 32);
+    key ^= (key >> 22);
+    key += ~(key << 13);
+    key ^= (key >> 8);
+    key += (key << 3);
+    key ^= (key >> 15);
+    key += ~(key << 27);
+    key ^= (key >> 31);
+    return key;
+}
+
 struct Hit {
     uint64_t x;    // rid << 32 | contig-relative forward position (reverse: last base)
     uint64_t y;    // score << 32 | index << 2 | strand << 1 | end
@@ -158,7 +174,7 @@ PairResult oracle_pair(const mem_opt_t *opt, const Bns &B, const mem_pestat_t pe
             if (q < 0) q = 0;
             const uint64_t y = (uint64_t)k << 32 | i;
             Cand c;
-            c.key = (uint64_t)q << 32 | (hash_64(y ^ (uint64_t)(int64_t)(id << 8)) & 0xffffffffu);
+            c.key = (uint64_t)q << 32 | (wang_hash64(y ^ (uint64_t)(int64_t)(id << 8)) & 0xffffffffu);
             c.k = k;
             c.i = i;
             u.push_back(c);
@@ -170,7 +186,11 @@ PairResult oracle_pair(const mem_opt_t *opt, const Bns &B, const mem_pestat_t pe
         res.ret = res.sub = res.n_sub = 0;
         return res;
     }
-    std::sort(u.begin(), u.end(), [](const Cand &p, const Cand &q) { return p.key < q.key; });
+    // Equal keys (a 32-bit hash collision) are ordered by (k, i), as the model's
+    // (key, k << 32 | i) pairs are, so the order is total.
+    std::sort(u.begin(), u.end(), [](const Cand &p, const Cand &q) {
+        return p.key < q.key || (p.key == q.key && (p.k < q.k || (p.k == q.k && p.i < q.i)));
+    });
     const Cand &best = u.back();
     res.ret = (int)(best.key >> 32);
     res.sub = u.size() > 1 ? (int)(u[u.size() - 2].key >> 32) : 0;
@@ -543,11 +563,14 @@ TEST_CASE("mem_pair_resolve_batch_post: a pair no better than its ends apart is 
           * doctest::test_suite("unit/pair")) {
     // The mate's last base is 420 bp past end 0's first (z = 4): o = 194 (see
     // the pair-score case). At U 17 the ends apart score 183 < 194, so the pair
-    // is proper and q_pe = (int)(6.02 * 11 + .499) = 66 -> 60. At U 3 they score
-    // 197 >= 194: no 0x2, and both ends keep their own MAPQ (60) at index 0.
+    // is proper and q_pe = (int)(6.02 * 11 + .499) = 66 -> 60; at U 7, 193 < 194,
+    // still proper (q_pe (int)(6.02 + .499) = 6, below each end's own 60). At U
+    // 6 the ends apart score 194, equal to o, and at U 3 197 > 194: the pair is
+    // preferred only when strictly better, so no 0x2, and both ends keep their
+    // own MAPQ (60) at index 0.
     const struct {
         int U, flag;
-    } cases[] = {{17, 3}, {3, 1}};
+    } cases[] = {{17, 3}, {7, 3}, {6, 1}, {3, 1}};
     for (const auto &c : cases) {
         CAPTURE(c.U);
         OptGuard g;

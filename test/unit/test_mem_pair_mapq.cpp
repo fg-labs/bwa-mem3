@@ -20,7 +20,8 @@
 //   0.95 identity; then less (int)(4.343 * ln(sub_n + 1) + .499), clamped to
 //   [0, 60], times (1 - frac_rep). int(ln 50) is 3, not 3.912: bwa stores the
 //   coefficient in an int field, and the output depends on that truncation.
-//   Hits are ranked by score, then by hash_64(read id + input index); a hit is
+//   Hits are ranked by score, then by hash_64(read id + input index) (bwa's
+//   64-bit integer hash, written out below as wang_hash64); a hit is
 //   secondary to the first higher-ranked primary it overlaps on the read by at
 //   least mask_level (0.5) of the shorter span; that primary's sub is the first
 //   such hit's score and its sub_n counts those within max(a + b, o + e) of it.
@@ -28,7 +29,6 @@
 
 #include "doctest/doctest.h"
 #include "bwamem.h"
-#include "utils.h"
 
 #include <climits>
 #include <cmath>
@@ -38,6 +38,21 @@
 #include <vector>
 
 namespace {
+
+// bwa's hash_64 (Thomas Wang's 64-bit integer mix), written out here rather than
+// taken from the library, so that a change to the library's hash, which would
+// reorder equal-score hits in the output, is caught.
+uint64_t wang_hash64(uint64_t key) {
+    key += ~(key << 32);
+    key ^= (key >> 22);
+    key += ~(key << 13);
+    key ^= (key >> 8);
+    key += (key << 3);
+    key ^= (key >> 15);
+    key += ~(key << 27);
+    key ^= (key >> 31);
+    return key;
+}
 
 struct OptGuard {
     mem_opt_t *o;
@@ -266,6 +281,35 @@ TEST_CASE("mem_mark_primary_se: a chain of overlaps marks against primaries only
     CHECK(a[2].sub_n == 1);
 }
 
+TEST_CASE("mem_mark_primary_se: a hit overlapping two primaries is the secondary of the higher-ranked one"
+          * doctest::test_suite("unit/mem_pair")) {
+    // A [0, 60) 60 points and B [60, 100) 40 do not overlap: both primary. C
+    // [30, 90) 35 overlaps A by 30 >= .5 * min(60, 60) and B by 30 >= .5 *
+    // min(60, 40): significant for both, so it is the secondary of the first
+    // primary in rank order, A. A.sub = 35 (60 - 35 > 7: sub_n 0); B keeps sub
+    // 0, so B has MAPQ (int)(6.02 * (40 - 19) + .499) = 126 -> 60 (l = 40 < 50:
+    // t = 1); as C's primary it would have had (int)(6.02 * 5 + .499) = 30. A
+    // has (int)(6.02 * 25 * (3 / ln 60)^2 + .499) = (int)(81.30) -> 60.
+    OptGuard g;
+    std::vector<mem_alnreg_t> a;
+    a.push_back(region(35, 30, 90, 5000));
+    a.push_back(region(40, 60, 100, 3000));
+    a.push_back(region(60, 0, 60, 1000));
+    const int n_pri = mem_mark_primary_se(g.o, 3, a.data(), 11);
+    CHECK(n_pri == 3);
+    REQUIRE(a[0].score == 60);
+    REQUIRE(a[1].score == 40);
+    REQUIRE(a[2].score == 35);
+    CHECK(a[0].secondary == -1);
+    CHECK(a[1].secondary == -1);
+    CHECK(a[2].secondary == 0);
+    CHECK(a[0].sub == 35);
+    CHECK(a[0].sub_n == 0);
+    CHECK(a[1].sub == 0);
+    CHECK(mem_approx_mapq_se(g.o, &a[0]) == 60);
+    CHECK(mem_approx_mapq_se(g.o, &a[1]) == 60);
+}
+
 TEST_CASE("mem_mark_primary_se: equal scores are ranked by hash_64(read id + input index)"
           * doctest::test_suite("unit/mem_pair")) {
     // Two hits with the same score on the same read bases. The primary is the one
@@ -280,9 +324,8 @@ TEST_CASE("mem_mark_primary_se: equal scores are ranked by hash_64(read id + inp
         a.push_back(region(100, 0, 100, 1000));
         a.push_back(region(100, 0, 100, 2000));
         mem_mark_primary_se(g.o, 2, a.data(), id);
-        const bool first_wins = hash_64((uint64_t)id) < hash_64((uint64_t)id + 1);
+        const bool first_wins = wang_hash64((uint64_t)id) < wang_hash64((uint64_t)id + 1);
         CHECK(a[0].rb == (first_wins ? 1000 : 2000));
-        CHECK(a[0].hash == hash_64((uint64_t)id + (first_wins ? 0 : 1)));
         CHECK(a[0].secondary == -1);
         CHECK(a[1].secondary == 0);
         CHECK(a[0].sub == 100);

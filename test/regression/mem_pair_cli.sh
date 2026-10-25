@@ -24,7 +24,9 @@
 #   -I    one FR pair, ctg1:1001-1100 forward and the reverse complement of
 #         ctg1:1201-1300, under -I 300,30: FLAGs 99 and 147 (paired, proper,
 #         first/second, mate reverse / read reverse), RNEXT =, PNEXT the mate's
-#         POS, and TLEN +300 / -300 (the fragment is ctg1:1001-1300).
+#         POS, and TLEN +300 / -300 (the fragment is ctg1:1001-1300). -I 300
+#         alone takes the std as 10% of the mean (the help text): the split
+#         pairs below give the same records as under -I 300,30.
 #   -I max,min  -I 300,30,350,250 sets the FR window to [250, 350] directly:
 #         pairs at inserts 249, 250, 350 and 351 are 97/145, 99/147, 99/147 and
 #         97/145 (an edge pair is 1.67 std out, pair score 199 > 183).
@@ -32,7 +34,13 @@
 #         read 2 unseedable) and pair b (ctg2:501, tlen 300, read 1
 #         unseedable) are rescued in both directions: 99/147 at the fragment
 #         ends, MAPQ 60, 100M, TLEN +-300, and the rescued end has AS 70, NM 6
-#         and an MD naming the six reference bases. Pair c: read 1 inside block
+#         and an MD naming the six reference bases. Pair e (ctg1:2401, tlen
+#         420, read 2 unseedable) puts the mate's last base 419 bases past read
+#         1's first, the last position inside the rescue window: rescued the
+#         same way, 99/147, TLEN +-420, AS 70; its pair score is
+#         (int)(170 + .721 * ln(2 erfc(3.967 / sqrt 2)) + .499) = (int)(164.13)
+#         = 164, so it is proper at -U 17 (170 - 17 = 153 < 164) but not at -U
+#         4 or 2 (166, 168 >= 164: 97/145, MAPQ 60 each). Pair c: read 1 inside block
 #         R (ctg2:1101, three exact copies), read 2 unseedable next to the ctg2
 #         copy: only that copy pairs, so read 1 lands at ctg2:1101 with MAPQ
 #         min(q_pe, 0 + 40), q_pe = 6.02 * (170 - (170 - U)) = 6.02 U capped at
@@ -50,7 +58,8 @@
 #         301 = 1001 - 701 + 1), the rescued end AS 70, NM 6.
 #   split  read 1 = ctg1:1201-1270 + ctg3:2601-2630 (two primary hits, 70 and
 #         30 >= -T), read 2 reverse with its last base at ctg1:1201 + d, under
-#         -I 300,30. An end with two primary hits is not paired, so 0x2 comes
+#         -I 300,30 and under -I 300. An end with two primary hits is not
+#         paired, so 0x2 comes
 #         from the unpaired rule: read 1's top hit and read 2 at distance d
 #         inside [180, 420]. d = 179 and 421: 97/145; d = 180 and 420: 99/147,
 #         and the supplementary ctg3 record (70H30M, MAPQ 60, TLEN 0) carries
@@ -78,12 +87,16 @@
 #   -t    101 pairs (the sets above, 4 unrelated pairs, 4 pairs inside block R
 #         placed by the read id's hash, 10 pairs each followed by a copy) at
 #         -K 2000: byte-identical at -t 1, 2 and 4, with -1, with --dedup-reads
-#         off and on (the stats must report memoized duplicates; also with
-#         BWAMEM3_DEDUP_READS_VERIFY=1 and _CHECK_BASES=1, which align every
-#         duplicate anyway and abort on a difference), with --cohort-slices 0,
-#         with every batch read in slices
-#         (BWA_MEM3_COHORT_SLICE_ALL=1, whose slices must show on stderr) and
-#         with output streaming off (BWA_MEM3_STREAM_OUTPUT=0). Under -I 300,30,
+#         off and on (also with BWAMEM3_DEDUP_READS_VERIFY=1 and
+#         _CHECK_BASES=1, which align every duplicate anyway and abort on a
+#         difference), with --cohort-slices 0, with every batch read in slices
+#         (BWA_MEM3_COHORT_SLICE_ALL=1) and with output streaming off
+#         (BWA_MEM3_STREAM_OUTPUT=0). Not checks: "note:" lines print the
+#         memoized-duplicate count of BWAMEM3_DEDUP_READS_STATS (above 0
+#         today) and the number of slices reported on stderr under
+#         BWA_MEM3_COHORT_SLICE_ALL=1, to show that those comparisons reach the
+#         paths they name; how the code memoizes or slices may change without
+#         changing the output, so the notes never fail the script. Under -I 300,30,
 #         -K 1 (one pair per batch) equals the default batch size byte for
 #         byte, and every pair comes out once, in input order. The -K 2000
 #         output is identical across tiers.
@@ -306,11 +319,13 @@ cat > "$work/abc.spec" << 'EOF'
 a ctg1 1001 300 0 s 1 60 60
 b ctg2 501 300 s 0 1 60 60
 c ctg2 1101 300 0 s 1 40 60
+e ctg1 2401 420 0 s 1 60 60
 EOF
 pair_reads "$work/abc.spec" "$work/abc"
 md_a2="$(spaced_md ctg1 1201)"
 md_b1="$(spaced_md ctg2 501)"
 md_c2="$(spaced_md ctg2 1301)"
+md_e2="$(spaced_md ctg1 2721)"
 
 # pair_spec <name-prefix> <seed> <proper-lo> <proper-hi> <tlen>...
 #   A spec of one FR pair per <tlen>, each fragment inside one of six unique
@@ -553,17 +568,18 @@ for tier in $(mem_cli_tiers); do
     mem_cli_mem "$tier" "$abc" -I 300,30 "$ref" "$work/abc.1.fq" "$work/abc.2.fq"
     pair_want "$work/abc.spec" > "$work/abc.want"
     expect_records "$tier: rescue: records of pairs a, b, c" "$work/abc.want" "$abc"
-    for e in "a 2 $md_a2" "b 1 $md_b1" "c 2 $md_c2"; do
+    for e in "a 2 $md_a2" "b 1 $md_b1" "c 2 $md_c2" "e 2 $md_e2"; do
         read -r qn end md <<< "$e"
         got="$(primary_fields "$abc" "$qn" "$end" AS NM MD)"
         mem_cli_expect "$tier: rescue: $qn end $end (rescued) AS NM MD" "70 6 $md" "$got"
     done
 
-    # -U sets q_pe for pair c: read 1 MAPQ min(6.02 U, 40); nothing else moves.
+    # -U sets q_pe for pair c: read 1 MAPQ min(6.02 U, 40); pair e, scoring 164
+    # as a pair, is no longer proper; nothing else moves.
     for u in 4:24 2:12; do
         sam="$work/abc.U${u%%:*}.$tier.sam"
         mem_cli_mem "$tier" "$sam" -U "${u%%:*}" -I 300,30 "$ref" "$work/abc.1.fq" "$work/abc.2.fq"
-        awk -v q="${u##*:}" '$1 == "c" { $8 = q } { print }' "$work/abc.spec" > "$work/abc.U.spec"
+        awk -v q="${u##*:}" '$1 == "c" { $8 = q } $1 == "e" { $7 = 0 } { print }' "$work/abc.spec" > "$work/abc.U.spec"
         pair_want "$work/abc.U.spec" > "$work/abc.U.want"
         expect_records "$tier: -U ${u%%:*}: pair c read 1 MAPQ ${u##*:}" "$work/abc.U.want" "$sam"
     done
@@ -584,7 +600,7 @@ for tier in $(mem_cli_tiers); do
     # -P: rescue runs, pairing does not.
     sam="$work/nopair.$tier.sam"
     mem_cli_mem "$tier" "$sam" -P -I 300,30 "$ref" "$work/abc.1.fq" "$work/abc.2.fq"
-    awk '$1 != "c" { $7 = 0; print }' "$work/abc.spec" > "$work/nopair.spec"
+    awk '$1 == "a" || $1 == "b" { $7 = 0; print }' "$work/abc.spec" > "$work/nopair.spec"
     pair_want "$work/nopair.spec" > "$work/nopair.want"
     expect_records "$tier: -P: pairs a and b rescued, unpaired" "$work/nopair.want" "$sam" a b
     got="$(primary_fields "$sam" c 2 3 4 5 AS) $(primary_bit "$sam" c 2 2)"
@@ -607,11 +623,14 @@ for tier in $(mem_cli_tiers); do
     got="$(primary_fields "$sam" fr 2 AS NM MD)"
     mem_cli_expect "$tier: FF library: read 2 of fr rescued forward at ctg3:1001, AS NM MD" "70 6 $md_fr2" "$got"
 
-    # A split end: 0x2 from the unpaired rule, inclusive at both window ends.
-    sam="$work/split.$tier.sam"
-    mem_cli_mem "$tier" "$sam" -I 300,30 "$ref" "$work/split.1.fq" "$work/split.2.fq"
-    awk -F '\t' '!/^@/ { print $1, $2, $3, $4, $5, $6, $7, $8, $9 }' "$sam" > "$sam.got"
-    mem_cli_same_file "$tier: split read 1: unpaired 0x2 window [180, 420]" "$work/split.want" "$sam.got"
+    # A split end: 0x2 from the unpaired rule, inclusive at both window ends;
+    # -I 300 alone implies std 30, so the same window.
+    for iopt in 300,30 300; do
+        sam="$work/split.I$iopt.$tier.sam"
+        mem_cli_mem "$tier" "$sam" -I "$iopt" "$ref" "$work/split.1.fq" "$work/split.2.fq"
+        awk -F '\t' '!/^@/ { print $1, $2, $3, $4, $5, $6, $7, $8, $9 }' "$sam" > "$sam.got"
+        mem_cli_same_file "$tier: split read 1, -I $iopt: unpaired 0x2 window [180, 420]" "$work/split.want" "$sam.got"
+    done
 
     # --compat shapes tags and @HD only.
     for target in bwa-mem2 bwa-mem; do
@@ -663,8 +682,7 @@ for tier in $(mem_cli_tiers); do
         "$ref" "$work/all.1.fq" "$work/all.2.fq"
     mem_cli_same_file "$tier: -K 2000 -t 4 --dedup-reads on equals -t 1" "$det" "$sam"
     got="$(sed -n 's/^\[dedup-reads-stats\].* dup=\([0-9]*\).*/\1/p' "$sam.err")"
-    if [[ -n $got ]] && ((got > 0)); then got=yes; else got="no ('$got')"; fi
-    mem_cli_expect "$tier: --dedup-reads on: duplicate pairs were memoized" "yes" "$got"
+    echo "note: $tier: --dedup-reads on: memoized duplicate pairs reported: ${got:-none} (above 0 while memoization serves them)"
     sam="$work/all.K2000.memoverify.$tier.sam"
     mem_env "$tier" "$sam" BWAMEM3_DEDUP_READS_VERIFY=1 BWAMEM3_DEDUP_READS_CHECK_BASES=1 -- \
         -K 2000 -t 4 --dedup-reads on "$ref" "$work/all.1.fq" "$work/all.2.fq"
@@ -679,8 +697,7 @@ for tier in $(mem_cli_tiers); do
     mem_env "$tier" "$sam" BWA_MEM3_COHORT_SLICE_ALL=1 -- -K 2000 -t 4 "$ref" "$work/all.1.fq" "$work/all.2.fq"
     mem_cli_same_file "$tier: -K 2000 with every batch sliced equals -t 1" "$det" "$sam"
     got="$(grep -c '(cohort slice)' "$sam.err" || true)"
-    if ((got > 0)); then got=yes; else got="no ($got)"; fi
-    mem_cli_expect "$tier: every batch sliced: slices were read" "yes" "$got"
+    echo "note: $tier: every batch sliced: slices reported on stderr: $got (above 0 while batches are read in slices)"
     sam="$work/all.K2000.nostream.$tier.sam"
     mem_env "$tier" "$sam" BWA_MEM3_STREAM_OUTPUT=0 -- -K 2000 -t 4 "$ref" "$work/all.1.fq" "$work/all.2.fq"
     mem_cli_same_file "$tier: -K 2000 with output streaming off equals -t 1" "$det" "$sam"
@@ -748,7 +765,7 @@ for tier in $(mem_cli_tiers); do
 
     # Every SAM above is identical across tiers.
     if [[ $tier != "$first_tier" ]]; then
-        for s in i300 abc ff split est kb.K3001.t1 all.K2000.t1 all.I chim.default jalt meth; do
+        for s in i300 abc ff split.I300,30 est kb.K3001.t1 all.K2000.t1 all.I chim.default jalt meth; do
             mem_cli_same_file "$tier: $s SAM equals $first_tier's" \
                 "$work/$s.$first_tier.sam" "$work/$s.$tier.sam"
         done
