@@ -286,9 +286,9 @@ void worker_alloc(const mem_opt_t *opt, worker_t &w, int32_t nreads, int32_t nth
     xassert(opt != NULL, "opt must not be NULL");
     assert(nreads >= 0);
     assert(nthreads > 0);
-    /* The assert above compiles out under NDEBUG, and the chaining scratch is
-     * now sized FROM nthreads rather than from nreads -- so a release build
-     * given nthreads <= 0 would allocate a zero-entry scratch that kt_for then
+    /* The assert above compiles out of an EXTRA_CXXFLAGS=-DNDEBUG opt-out
+     * build, and the chaining scratch is sized FROM nthreads, not nreads -- so
+     * such a build given nthreads <= 0 would allocate a zero-entry scratch that kt_for then
      * writes into, because kt_for makes the same input safe by clamping
      * (`if (n_threads < 1) n_threads = 1`, kthread.cpp) instead of refusing.
      * Clamp identically so the two agree on how many windows exist. */
@@ -1032,9 +1032,9 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
         {
             fprintf(stderr, "[0000] Reallocating initial memory allocations!!\n");
             /* Into a temporary, and err_fatal rather than assert, for the same
-             * reason as the seed-scratch check below: assert compiles out under
-             * NDEBUG, so in a release build a failed realloc would null the live
-             * pointer, drop the previous allocation, and let the align phase
+             * reason as the seed-scratch check below: assert compiles out of an
+             * EXTRA_CXXFLAGS=-DNDEBUG opt-out build, where a failed realloc would
+             * null the live pointer, drop the previous allocation, and let the align phase
              * dereference NULL a few lines later. */
             mem_alnreg_v *regs_tmp = (mem_alnreg_v *) realloc(w.regs,
                                               (size_t) regs_want * sizeof(mem_alnreg_v));

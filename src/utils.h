@@ -47,8 +47,8 @@
 #define xzopen(fn, mode) err_xzopen_core(__func__, fn, mode)
 
 /* Unconditional fatal check -- unlike assert(), it is NOT compiled out under
- * NDEBUG, so it is the right guard for a condition that must be enforced in a
- * release build (allocation failure, corrupt index, inconsistent sidecar).
+ * NDEBUG, so it is the right guard for a condition that must be enforced even
+ * in an EXTRA_CXXFLAGS=-DNDEBUG build (allocation, corrupt index, sidecar).
  *
  * Wrapped in do/while(0): the bare `if` this expanded to before would bind a
  * trailing `else` to the macro's own `if` rather than to the caller's, so

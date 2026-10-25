@@ -7,7 +7,7 @@
 // quantum >= maxQerLen) would write past that buffer, so every rescue wrapper
 // guards the gather loop with xassert(sp.len1 < maxRefLen) /
 // xassert(sp.len2 < maxQerLen) / xassert(quant[j] < maxQerLen). xassert stays
-// live under a hypothetical -DNDEBUG build, unlike the plain assert() these
+// live under an EXTRA_CXXFLAGS=-DNDEBUG opt-out build, unlike the plain assert() these
 // replaced/joined -- so the guard must ABORT, not silently overrun, when a
 // pair exceeds capacity.
 //

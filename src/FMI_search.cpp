@@ -712,7 +712,7 @@ void FMI_search::load_index(bool load_pac, int n_threads)
     // Fail closed on a truncated/corrupt index, mirroring load_index_from_shm's
     // scalar bounds checks (a bad reference_seq_len/count[]/sentinel_index drives
     // smem.k past cp_occ on the first backwardExt -> wrong seeds, not a crash).
-    // xassert survives a hypothetical -DNDEBUG build where a plain assert would not.
+    // xassert survives an EXTRA_CXXFLAGS=-DNDEBUG opt-out build; a plain assert would not.
     xassert(reference_seq_len > 0 && reference_seq_len <= 0x7fffffffffLL,
             "FMI index: reference_seq_len out of bounds (corrupt .bwt.2bit.64?)");
 
@@ -2853,7 +2853,7 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
     // the public fmi_seed_sa_prefetch facade still no-ops on <= 0 for its own
     // documented contract (it returns before reaching here), so this guard only
     // catches a future direct caller passing a bad value -- fail loud rather than
-    // silently produce no seeds. xassert survives a hypothetical -DNDEBUG build.
+    // silently produce no seeds. xassert survives an EXTRA_CXXFLAGS=-DNDEBUG opt-out build.
     xassert(max_occ > 0, "get_sa_entries_prefetch: max_occ must be > 0");
 
     // uint32_t i;

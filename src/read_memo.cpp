@@ -19,7 +19,7 @@
 
 #include "bntseq.h"       /* nst_nt4_decode */
 #include "bwa.h"          /* bseq1_t */
-#include "utils.h"        /* xassert (survives a hypothetical -DNDEBUG build) */
+#include "utils.h"        /* xassert (survives an EXTRA_CXXFLAGS=-DNDEBUG opt-out build) */
 #include "robin_hood.h"
 
 extern int bwa_verbose;   /* from utils */

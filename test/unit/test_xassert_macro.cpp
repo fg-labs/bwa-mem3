@@ -5,7 +5,7 @@
 // call site — a future edit to the macro can silently lose either one:
 //
 //   * It still fires under NDEBUG. That is the whole reason allocation checks
-//     use xassert instead of assert(): a release build has to enforce them.
+//     use xassert instead of assert(): a -DNDEBUG build must enforce them.
 //   * It is a single statement, so a trailing `else` binds to the caller's
 //     `if`, not to an `if` hidden inside the macro. The macro used to expand
 //     to a bare `if`, which stole the caller's `else` branch.

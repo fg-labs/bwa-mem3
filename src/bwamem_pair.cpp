@@ -1615,8 +1615,8 @@ int mem_sam_pe_batch(const mem_opt_t *opt, mem_cache *mmc,
         // enqueued pair. A pair tagged with a hypothesis outside {0,1} would be
         // skipped by both groups, leaving its aln[] entry uninitialized for
         // mem_matesw_batch_post to read. The assert in mem_matesw_batch_pre
-        // catches this in debug; fail loud under NDEBUG too rather than emit a
-        // silently mis-scored rescue.
+        // catches this in normal builds; fail loud under an -DNDEBUG opt-out
+        // too rather than emit a silently mis-scored rescue.
         if (scored != pcnt)
             err_fatal(__func__,
                       "batched meth rescue partition missed %ld of %ld pairs "
