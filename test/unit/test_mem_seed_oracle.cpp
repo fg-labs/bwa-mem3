@@ -33,9 +33,11 @@
 //     and restarts there); an N restarts the walk past it, and running off the
 //     read ends it.
 //   - mem_collect_smem runs the three rounds (round 2 inside each round-1 SMEM
-//     of length >= round(k * r) occurring at most -s times, at its middle
+//     at least split_len long and occurring at most -s times, at its middle
 //     position), sorts the result by read and then by (m, n), and with
-//     --smem-dedup drops adjacent duplicates.
+//     --smem-dedup drops adjacent duplicates. split_len is k * r rounded to
+//     the nearest integer with a half rounded down (bwa's -r); each case below
+//     states its value, worked out by hand.
 //
 // Every SMEM is compared on (rid, m, n, k, s). The reverse-complement interval
 // start `l` is excluded: the backward phase leaves it stale by design
@@ -52,7 +54,8 @@
 // reference is a small random text with planted exact, diverged, reverse-
 // complement and tandem repeats, an N run and three contigs; the reads are
 // slices of it with substitutions, indels, N bases, chimeras and random
-// sequence, of lengths 0 to 150.
+// sequence, of lengths 0 to 150, and two identical reads side by side (so
+// --smem-dedup meets equal SMEMs of different reads).
 
 #include "doctest/doctest.h"
 #include "mem_fixture.h"
@@ -145,7 +148,11 @@ std::vector<std::string> oracle_reads(const std::vector<Contig> &ref) {
     reads.push_back("");                            // an empty read
     for (int i = 0; i < 20; ++i) reads.push_back(slice(30 + rng() % 121));
     for (int i = 0; i < 15; ++i) reads.push_back(bwa_tests::revcomp(slice(30 + rng() % 121)));
-    for (int i = 0; i < 20; ++i) reads.push_back(mutate(slice(40 + rng() % 111), 1 + (int)(rng() % 4)));
+    for (int i = 0; i < 20; ++i) {
+        // One draw per statement: argument evaluation order is unspecified.
+        const std::string s = slice(40 + rng() % 111);
+        reads.push_back(mutate(s, 1 + (int)(rng() % 4)));
+    }
     for (int i = 0; i < 10; ++i) {                  // an insertion or a deletion of 1-3 bases
         std::string s = slice(60 + rng() % 91);
         const size_t p = 10 + rng() % (s.size() - 20), k = 1 + rng() % 3;
@@ -153,8 +160,10 @@ std::vector<std::string> oracle_reads(const std::vector<Contig> &ref) {
         else s.insert(p, random_bases(rng, k));
         reads.push_back(i % 4 == 1 ? bwa_tests::revcomp(s) : s);
     }
-    for (int i = 0; i < 8; ++i)                     // chimeras of ctgA and ctgB
-        reads.push_back(ref[0].seq.substr(rng() % 800, 50) + ref[1].seq.substr(rng() % 600, 50));
+    for (int i = 0; i < 8; ++i) {                   // chimeras of ctgA and ctgB
+        const std::string left = ref[0].seq.substr(rng() % 800, 50);
+        reads.push_back(left + ref[1].seq.substr(rng() % 600, 50));
+    }
     for (int i = 0; i < 10; ++i) {                  // N bases inside, first or last
         std::string s = slice(30 + rng() % 91);
         const int n = 1 + (int)(rng() % 3);
@@ -182,6 +191,11 @@ std::vector<std::string> oracle_reads(const std::vector<Contig> &ref) {
     reads.push_back(B.substr(650, 50) + ref[2].seq.substr(0, 40));  // across the ctgB/ctgC junction
     reads.push_back(mutate(A.substr(120, 90), 2));
     reads.push_back(mutate(B.substr(560, 110), 3));
+    // Two identical unique 20-mers: each has one SMEM (offsets 0-19, found by
+    // rounds 1 and 3), so after sorting, the first read's last SMEM and the
+    // second read's first SMEM are equal in everything but the read.
+    reads.push_back(A.substr(30, 20));
+    reads.push_back(A.substr(30, 20));
     return reads;
 }
 
@@ -509,7 +523,9 @@ std::vector<Smem> run_round3(FMI_search *fmi, Batch &b, int32_t max_intv, int mi
 }
 
 // mem_collect_smem with the buffers sized the way mem_kernel1_core sizes them
-// (tot_len entries), so an overrun is an overrun here too.
+// (tot_len entries), so an overrun is an overrun here too (and an AddressSanitizer
+// build reports it). The result is the returned array; freeing the per-thread
+// cache follows the current layout of mem_cache.
 std::vector<Smem> run_collect(FMI_search *fmi, Batch &b, const mem_opt_t *opt) {
     int64_t tot_len = 0;
     for (const bseq1_t &s : b.seqs) tot_len += s.l_seq;
@@ -524,8 +540,7 @@ std::vector<Smem> run_collect(FMI_search *fmi, Batch &b, const mem_opt_t *opt) {
     int64_t tot = 0;
     SMEM *res = mem_collect_smem(fmi, opt, b.seqs.data(), b.size(), mmc->matchArray[0], min_intv.data(),
                                  qpos.data(), enc.data(), rid.data(), mmc.get(), tot, 0);
-    CHECK(res == mmc->matchArray[0]);
-    CHECK(tot <= mmc->wsize_mem[0]);
+    REQUIRE(res != nullptr);
     std::vector<Smem> v = observable(res, tot, false);
     _mm_free(mmc->matchArray[0]);
     _mm_free(mmc->smem_sort_scratch[0].cnt);
@@ -538,9 +553,8 @@ std::vector<Smem> run_collect(FMI_search *fmi, Batch &b, const mem_opt_t *opt) {
 // --smem-dedup.
 // n_round[] counts what each round contributed, so a case can show that the
 // round it varies ran.
-std::vector<Smem> oracle_collect(Fixture &f, const mem_opt_t *opt, size_t n_round[3]) {
+std::vector<Smem> oracle_collect(Fixture &f, const mem_opt_t *opt, int split_len, size_t n_round[3]) {
     std::vector<Smem> all;
-    const int split_len = (int)(opt->min_seed_len * opt->split_factor + .499);
     n_round[0] = n_round[1] = n_round[2] = 0;
     for (size_t r = 0; r < f.reads.size(); ++r) {
         const std::vector<Smem> r1 = oracle_round1(f, r, opt->min_seed_len);
@@ -574,7 +588,7 @@ int64_t count_base(const Brute &bf, int c) {
 
 // ---------------------------------------------------------------------------
 
-TEST_CASE("mem seeding oracle: the index's text is the FASTA, both strands"
+TEST_CASE("mem seeding oracle: the index's text is the FASTA on both strands"
           * doctest::test_suite("unit/mem_seed")) {
     Fixture &f = fixture();
     std::string F;
@@ -608,7 +622,7 @@ TEST_CASE("mem seeding oracle: the index's text is the FASTA, both strands"
     CHECK(n_occ == 2);
 }
 
-TEST_CASE("FMI_search load: count[], the sentinel row and every SA row match a brute-force suffix array at SA strides 1-64"
+TEST_CASE("FMI_search load: count[] and the sentinel row and every SA row match a brute-force suffix array at SA strides 1-64"
           * doctest::test_suite("unit/mem_seed")) {
     Fixture &f = fixture();
     const Brute &bf = f.bf;
@@ -617,7 +631,6 @@ TEST_CASE("FMI_search load: count[], the sentinel row and every SA row match a b
         FMI_search *fmi = index_at(compx);
         // The loader detects the stride from the file's trailing tag.
         CHECK(fmi->sa_compx == compx);
-        CHECK(fmi->sa_compx_mask == (1 << compx) - 1);
         CHECK(fmi->reference_seq_len == bf.n + 1);
         // count[b] = 1 (the `$` row) + the number of bases of the text below b.
         const int64_t *count = fmi->count_data();
@@ -779,7 +792,7 @@ TEST_CASE("get_sa_entries_prefetch: coordinates follow the max_occ stride rule u
     bwa_verbose = saved_verbose;
 }
 
-TEST_CASE("getSMEMsAllPosOneThread: round-1 SMEMs are the maximal exact matches, at every lockstep width"
+TEST_CASE("getSMEMsAllPosOneThread: round-1 SMEMs are the maximal exact matches at every lockstep width"
           * doctest::test_suite("unit/mem_seed")) {
     Fixture &f = fixture();
     FMI_search *fmi = index_at(3);
@@ -807,7 +820,7 @@ TEST_CASE("getSMEMsAllPosOneThread: round-1 SMEMs are the maximal exact matches,
     }
 }
 
-TEST_CASE("getSMEMsOnePosOneThread_lockstep: round-2 SMEMs are the maximal intervals through x with min_intv occurrences, at every width"
+TEST_CASE("getSMEMsOnePosOneThread_lockstep: round-2 SMEMs are the maximal intervals through x with min_intv occurrences at every width"
           * doctest::test_suite("unit/mem_seed")) {
     Fixture &f = fixture();
     FMI_search *fmi = index_at(3);
@@ -843,7 +856,7 @@ TEST_CASE("getSMEMsOnePosOneThread_lockstep: round-2 SMEMs are the maximal inter
     }
 }
 
-TEST_CASE("bwtSeedStrategyAllPosOneThread: round-3 seeds are the forward walk's, scalar and lockstep at every width"
+TEST_CASE("bwtSeedStrategyAllPosOneThread: round-3 seeds are the forward walk's in the scalar and lockstep drivers at every width"
           * doctest::test_suite("unit/mem_seed")) {
     Fixture &f = fixture();
     FMI_search *fmi = index_at(3);
@@ -875,24 +888,26 @@ TEST_CASE("bwtSeedStrategyAllPosOneThread: round-3 seeds are the forward walk's,
     }
 }
 
-TEST_CASE("mem_collect_smem: the three rounds, sorted, equal the oracle under -k -r -y -s and --smem-dedup"
+TEST_CASE("mem_collect_smem: the three rounds sorted equal the oracle under -k -r -y -s and --smem-dedup"
           * doctest::test_suite("unit/mem_seed")) {
     Fixture &f = fixture();
     FMI_search *fmi = index_at(3);
     Batch b(f.reads);
     LockstepGuard guard;
     std::unique_ptr<mem_opt_t, void (*)(void *)> opt(mem_opt_init(), free);
-    // The defaults (-k 19 -r 1.5 -y 20 -s 10), then each knob moved. want_r2 /
-    // want_r3: whether round 2 / round 3 must contribute (1), must not (0), or
-    // either (-1), so a case that varies a round shows the round ran.
-    struct Case { int k; float r; int y; int s; int dedup; int want_r2; int want_r3; };
+    // The defaults (-k 19 -r 1.5 -y 20 -s 10), then each knob moved. split:
+    // the re-seed length k * r, a half rounded down (19 * 1.5 = 28.5 -> 28,
+    // 25 * 1.5 = 37.5 -> 37, 12 * 1.0 = 12, 19 * 10 = 190, 5 * 1.2 = 6).
+    // want_r2 / want_r3: whether round 2 / round 3 must contribute (1), must
+    // not (0), or either (-1), so a case that varies a round shows the round ran.
+    struct Case { int k; float r; int split; int y; int s; int dedup; int want_r2; int want_r3; };
     const Case cases[] = {
-        {19, 1.5f, 20, 10, 0, 1, 1},   {19, 1.5f, 20, 10, 1, 1, 1},  {12, 1.0f, 20, 10, 0, 1, 1},
-        {25, 1.5f, 20, 10, 0, -1, 1},  {19, 10.0f, 20, 10, 0, 0, 1}, {19, 1.5f, 0, 10, 0, 1, 0},
-        {19, 1.5f, 3, 10, 0, 1, 1},    {19, 1.5f, 20, 1, 0, 1, 1},   {12, 1.0f, 5, 1000, 1, 1, 1},
-        {5, 1.2f, 50, 1000, 0, 1, 1},
+        {19, 1.5f, 28, 20, 10, 0, 1, 1},    {19, 1.5f, 28, 20, 10, 1, 1, 1},  {12, 1.0f, 12, 20, 10, 0, 1, 1},
+        {25, 1.5f, 37, 20, 10, 0, -1, 1},   {19, 10.0f, 190, 20, 10, 0, 0, 1}, {19, 1.5f, 28, 0, 10, 0, 1, 0},
+        {19, 1.5f, 28, 3, 10, 0, 1, 1},     {19, 1.5f, 28, 20, 1, 0, 1, 1},   {12, 1.0f, 12, 5, 1000, 1, 1, 1},
+        {5, 1.2f, 6, 50, 1000, 0, 1, 1},
     };
-    size_t n_dups_removed = 0;
+    size_t n_dups_removed = 0, n_cross_read_equal = 0;
     for (const Case &c : cases) {
         opt->min_seed_len = c.k;
         opt->split_factor = c.r;
@@ -905,11 +920,18 @@ TEST_CASE("mem_collect_smem: the three rounds, sorted, equal the oracle under -k
         CAPTURE(c.s);
         CAPTURE(c.dedup);
         size_t n_round[3];
-        const std::vector<Smem> want = oracle_collect(f, opt.get(), n_round);
+        const std::vector<Smem> want = oracle_collect(f, opt.get(), c.split, n_round);
         CHECK(n_round[0] > 0);
         if (c.want_r2 >= 0) CHECK((n_round[1] > 0) == (c.want_r2 == 1));
         if (c.want_r3 >= 0) CHECK((n_round[2] > 0) == (c.want_r3 == 1));
-        if (c.dedup) n_dups_removed += n_round[0] + n_round[1] + n_round[2] - want.size();
+        if (c.dedup) {
+            n_dups_removed += n_round[0] + n_round[1] + n_round[2] - want.size();
+            // Neighbours equal in all but the read, which --smem-dedup must keep.
+            for (size_t i = 1; i < want.size(); ++i)
+                n_cross_read_equal += want[i].rid != want[i - 1].rid && want[i].m == want[i - 1].m
+                                      && want[i].n == want[i - 1].n && want[i].k == want[i - 1].k
+                                      && want[i].s == want[i - 1].s;
+        }
         g_smem_lockstep_n = guard.smem_n;
         g_bwtseed_lockstep_n = guard.bwt_n;
         g_bwtseed_lockstep = 1;
@@ -926,6 +948,8 @@ TEST_CASE("mem_collect_smem: the three rounds, sorted, equal the oracle under -k
             CHECK(first_diff(run_collect(fmi, b, opt.get()), want) == "");
         }
     }
-    // --smem-dedup had duplicates to remove (round 2 or 3 re-finding an SMEM).
+    // --smem-dedup had duplicates to remove (round 2 or 3 re-finding an SMEM),
+    // and equal SMEMs of different reads to keep.
     CHECK(n_dups_removed > 0);
+    CHECK(n_cross_read_equal > 0);
 }

@@ -144,7 +144,7 @@ int stop_after_first(int64_t st, int64_t en, void *ctx) {
 
 }  // namespace
 
-TEST_CASE("bns_restore: a built index's contig table, holes and pac match its FASTA"
+TEST_CASE("bns_restore: a built index's contig table and holes and pac match its FASTA"
           * doctest::test_suite("unit/mem_seed")) {
     BnsFixture &f = bns_fixture();
     const bntseq_t *bns = f.ix->bns();
@@ -286,7 +286,7 @@ TEST_CASE("bns_fetch_seq_into and bns_fetch_seq_v2_rid: windows clamp to mid's c
     CHECK(len == 0);
 }
 
-TEST_CASE("bns_iter_ambi: visits exactly the holes overlapping a window, clipped, in order"
+TEST_CASE("bns_iter_ambi: visits exactly the holes overlapping a window in order and clipped to it"
           * doctest::test_suite("unit/mem_seed")) {
     BnsFixture &f = bns_fixture();
     const bntseq_t *bns = f.ix->bns();
