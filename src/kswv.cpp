@@ -76,15 +76,25 @@ extern uint64_t prof[10][112];
 #define AMBQ16 16
 // for 8-bit
 #define DUMMY8 8
-#define DUMMY5 5
-/* NEON-only query-tail pad code for the 8-bit kernels, in place of DUMMY5. Any
- * value with bit 7 clear that no real base, ambiguity code (AMBQ = 8), or freed-
- * cell sentinel (FREED_INACTIVE8) can take, and that XORs every reference code
- * (0-3, AMBR = 4) to an index >= 16: vqtbl1q_u8 returns 0 for such indices, so
- * the USQADD kernel body scores the pad as a zero delta straight out of the score
- * gather, with no compare and no blend. The AVX2/AVX-512 wrappers keep DUMMY5
- * because pshufb masks its index to four bits (16 would read entry 0). */
+/* Query-tail pad codes for the 8-bit kernels. A query byte is 0-3, '-' (5:
+ * nst_nt4_table maps it to 5, and matesw_orient passes a forward-oriented mate's
+ * codes through unchanged), AMBQ (8, the remapped N) or the 0xFF pad, so the pad
+ * on [len2, quantum) must be a value none of those can take, with bit 7 clear
+ * (the boundary mask must not zero it) and distinct from FREED_INACTIVE8. The
+ * kernels elide the pad test below the group's jdummy on the grounds that no
+ * lane can hold the pad there (compute_jdummy); a query byte that equalled the
+ * pad would be table-scored below jdummy and pad-scored from it, and jdummy
+ * depends on the other lanes' len2, so the score would depend on the group.
+ *
+ * NEON_QPAD8 additionally XORs every reference code (0-3, AMBR = 4) to an index
+ * >= 16: vqtbl1q_u8 returns 0 for such indices, so the USQADD kernel body scores
+ * the pad as a zero delta straight out of the score gather, with no compare and
+ * no blend. X86_QPAD8 cannot do that, because pshufb masks its index to four
+ * bits (16 would read entry 0), so the AVX2/AVX-512BW kernels always blend the
+ * pad to `shift`; which table entry its xor reads does not matter. (The 5 the
+ * x86 kernels used before collided with '-'.) */
 #define NEON_QPAD8 16
+#define X86_QPAD8  6
 #define AMBRQ 0xFF
 #define AMBR 4
 #define AMBQ 8
@@ -101,7 +111,7 @@ extern uint64_t prof[10][112];
 /* Query-padding contract, shared by the batch wrappers and the kernels.
  *
  * A lane's query occupies columns [0, len2); the wrapper pads [len2, quantum)
- * with the ambiguous-query code (DUMMY5 in the x86 8-bit kernels, NEON_QPAD8 in
+ * with the ambiguous-query code (X86_QPAD8 in the x86 8-bit kernels, NEON_QPAD8 in
  * the NEON 8-bit kernel, DUMMY3 in the 16-bit ones) and every column from the
  * lane's quantum out to the group's
  * widest quantum with the high-bit sentinel (0xFF / 0xFFFF). The
@@ -117,7 +127,7 @@ static inline int query_quantum8(int len2)  { return kswv_query_quantum8(len2); 
 static inline int query_quantum16(int len2) { return kswv_query_quantum16(len2); }
 
 /* Why the two query pads differ, since only one of them is inert:
- *   [len2, quantum)      DUMMY5 / NEON_QPAD8 -> sbt = shift (0 in the USQADD
+ *   [len2, quantum)      X86_QPAD8 / NEON_QPAD8 -> sbt = shift (0 in the USQADD
  *                        form), i.e. m11 = h00. This
  *                        reproduces ksw_qinit's profile-0 padding out to
  *                        slen*p (ksw.cpp:103) -- scalar ksw computes these
@@ -126,7 +136,7 @@ static inline int query_quantum16(int len2) { return kswv_query_quantum16(len2);
  *                        query_quantum8/16 IS ksw's slen*p.
  *   [quantum, maxLen2]   0xFF/0xFFFF. Pure SoA batching slack with no scalar
  *                        counterpart, so it must contribute NOTHING. Padding
- *                        it with DUMMY5 instead would carry the diagonal
+ *                        it with the query pad instead would carry the diagonal
  *                        undamped down-right across rows and can become a
  *                        later row's maximum -- clearing minsc and inventing a
  *                        second-best score. The high bit is what lets the
@@ -135,7 +145,7 @@ static inline int query_quantum16(int len2) { return kswv_query_quantum16(len2);
  * group's starts at the min over its lanes. */
 
 /* First column of a group at which ANY lane can hold the query pad byte
- * (DUMMY5 in the x86 8-bit kernels, NEON_QPAD8 in the NEON 8-bit kernel):
+ * (X86_QPAD8 in the x86 8-bit kernels, NEON_QPAD8 in the NEON 8-bit kernel):
  *
  *     min{ len2 : query_quantum8(len2) > len2 }   over the group's lanes
  *
@@ -143,10 +153,13 @@ static inline int query_quantum16(int len2) { return kswv_query_quantum16(len2);
  * this derivation is tier-shared. A lane writes that pad only on [len2, quantum),
  * so a lane whose len2 is already
  * a multiple of 16 contributes no such column at all and is skipped. Below the
- * minimum, the per-cell "is this the query's DUMMY5 tail padding?" test cannot
- * fire on any lane, so the 8-bit kernels elide it there. This is not a claim
- * about what that test COMPUTES -- it is that no input below the returned
- * column can select it, so the bytes written are identical either way.
+ * minimum, the per-cell "is this the query's tail padding?" test cannot
+ * fire on any lane, so the 8-bit kernels elide it there. That holds only because
+ * no query byte can equal the pad code (see X86_QPAD8 / NEON_QPAD8): a base that
+ * did would be scored differently on either side of a column that depends on
+ * the other lanes. This is not a claim about what that test COMPUTES -- it is
+ * that no input below the returned column can select it, so the bytes written
+ * are identical either way.
  *
  * `cap` clamps the result to the range the caller actually subdivides: the NEON
  * and AVX-512BW kernels pass jsplit, because a group can have a jdummy above
@@ -157,7 +170,7 @@ static inline int query_quantum16(int len2) { return kswv_query_quantum16(len2);
  * FScan body passes jsplit, like the others.
  *
  * `width` is the caller's lane count rather than SIMD_WIDTH8 directly so the
- * three kernels share one definition of a derivation the DUMMY5 elision's
+ * three kernels share one definition of a derivation the pad-test elision's
  * correctness rests on -- three hand-maintained copies is how one tier comes to
  * drift from the others. */
 static inline int compute_jdummy(const SeqPair *p, int width, int ncol, int cap)
@@ -189,12 +202,12 @@ static inline int compute_jsplit(const SeqPair *p, int width, int ncol, bool i16
 /* "No freed cell active on this lane" markers for the freed-cell (--meth)
  * blend, one per kernel width. Each must be a value a query byte can never
  * take, so the blend provably never fires on a lane with no active freed cell:
- *   8-bit   s2 holds 0-3, DUMMY5(5) or NEON_QPAD8(16), AMBQ(8), or the 0xFF pad -> 0xFE
+ *   8-bit   s2 holds 0-3, '-'(5), X86_QPAD8(6) or NEON_QPAD8(16), AMBQ(8), or the 0xFF pad -> 0xFE
  *   16-bit  s2 holds 0-3, AMBQ16(16), DUMMY3(26), or the 0xFFFF pad -> 0x7FFF
  * Both deliberately avoid the pad value itself. Aliasing it would make the
  * blend fire on every padded column, leaving correctness dependent on the
  * boundary mask zeroing m11 there -- two mechanisms propping each other up.
- * Spelled as #define to match the sentinel block above (DUMMY5/AMBQ/...). */
+ * Spelled as #define to match the sentinel block above (X86_QPAD8/AMBQ/...). */
 #define FREED_INACTIVE8  0xFE
 #define FREED_INACTIVE16 0x7FFF
 
@@ -213,11 +226,11 @@ static inline int compute_jsplit(const SeqPair *p, int width, int ncol, bool i16
         __m512i sbt11, xor11;                                           \
         xor11 = _mm512_xor_si512(s1, s2);                               \
         sbt11 = _mm512_shuffle_epi8(permSft512, xor11);                 \
-        /* DUMMY5 tail test; provably unselectable below jdummy, so the \
+        /* Query-pad test; provably unselectable below jdummy, so the   \
          * cmp+blend pair is elided there. See the jdummy derivation in \
          * the u8 kernel. */                                            \
         if (NEED_DUMMY) {                                               \
-            __mmask64 cmpq = _mm512_cmpeq_epu8_mask(s2, five512);       \
+            __mmask64 cmpq = _mm512_cmpeq_epu8_mask(s2, qpad512);       \
             sbt11 = _mm512_mask_blend_epi8(cmpq, sbt11, sft512);        \
         }                                                               \
         if (HasFreed) {                                                 \
@@ -287,9 +300,9 @@ static inline int compute_jsplit(const SeqPair *p, int width, int ncol, bool i16
  * Only the query half of the boundary mask survives, and only from jsplit on
  * (APPLY_BND); the reference half is dropped as argued in the note above
  * kswv_neon_u8. On a pad row the u8 pshufb returns 0 (bit 7 of the xor index
- * is set), so m11 = sat(h00 - shift) <= h00 (h00 under the DUMMY5 blend); the
+ * is set), so m11 = sat(h00 - shift) <= h00 (h00 under the X86_QPAD8 blend); the
  * i16 permutexvar reads the xor's low five bits, entries 5 (DUMMY3), 15
- * (AMBQ16) and 28-31 (bases) of the table, all 0 or w_ambig = -1, so
+ * (AMBQ16), 26 ('-') and 28-31 (bases) of the table, all 0 or w_ambig = -1, so
  * m11 <= h00. The pad corner (xor 0, the match entry) is a pad column, still
  * masked. The mask folds into the diagonal add as a zero-masking add over the
  * lanes whose s2 is not the pad, in place of a compare-to-mask and a blend. */
@@ -297,7 +310,7 @@ static inline int compute_jsplit(const SeqPair *p, int width, int ncol, bool i16
     {                                                                   \
         __m512i sbt11 = _mm512_shuffle_epi8(Sgn ? permS512 : permSft512, _mm512_xor_si512(s1, s2)); \
         if (NEED_DUMMY)                                                 \
-            sbt11 = _mm512_mask_blend_epi8(_mm512_cmpeq_epu8_mask(s2, five512), \
+            sbt11 = _mm512_mask_blend_epi8(_mm512_cmpeq_epu8_mask(s2, qpad512), \
                                            sbt11, Sgn ? zero512 : sft512); \
         if (HasFreed)                                                   \
             sbt11 = _mm512_mask_blend_epi8(                             \
@@ -1125,8 +1138,8 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
      * per-cell vceqq(s2, qpad_vec) + vbslq(.., sft_vec) on [jdummy, jsplit),
      * elided below compute_jdummy's column exactly as before (no lane can hold
      * the pad there; see compute_jdummy). Production pays that only on the
-     * legacy toggle path. The AVX2/AVX-512 kernels keep DUMMY5 = 5: pshufb masks
-     * its index to four bits, so an index of 16 would read entry 0 there. */
+     * legacy toggle path. The AVX2/AVX-512 kernels pad with X86_QPAD8 = 6: pshufb
+     * masks its index to four bits, so an index of 16 would read entry 0 there. */
     const int jdummy = USQADD ? jsplit : compute_jdummy(p, SIMD_WIDTH8, ncol, jsplit);
 
     /* All-pad columns (BWA3_RESCUE_PADCOLS, USQADD FScan bodies only). From the
@@ -2291,8 +2304,8 @@ int kswv::kswv_neon_16_impl(int16_t seq1SoA[],
      * >= 250 and surfaces it.
      *
      * The 16-bit kernel's SoA uses wider ambig / tail-padding constants
-     * than 8-bit (AMBR16=15, AMBQ16=16, DUMMY3=26 vs AMBR=4, AMBQ=8,
-     * DUMMY5=5), so xor values can reach 31. A 32-byte table built via
+     * than 8-bit (AMBR16=15, AMBQ16=16, DUMMY3=26 vs AMBR=4, AMBQ=8),
+     * so xor values can reach 31. A 32-byte table built via
      * vqtbl2_s8 handles all of them:
      *   [0]     -> w_match       (base == base; also AMBR^AMBR, AMBQ^AMBQ,
      *                             but those pairings don't occur)
@@ -3205,13 +3218,13 @@ int kswv::kswv256_u8_impl(uint8_t seq1SoA[],
      * when the two sums are equal (see fscan_scoring_ok). */
     const __m256i oe_vec     = oe_ins_vec;
     (void) oe_vec;
-    const __m256i five_vec   = _mm256_set1_epi8((char)DUMMY5);
+    const __m256i qpad_vec   = _mm256_set1_epi8((char)X86_QPAD8);
 
-    /* First column any lane can hold the DUMMY5 query pad. Below it the
+    /* First column any lane can hold the X86_QPAD8 query pad. Below it the
      * cmpeq+blendv pair that tests for it cannot fire, so it is elided --
      * same derivation and byte-identity argument as the NEON kernel.
      * Unlike the boundary-mask hoist noted in the loop below, this REMOVES a
-     * live vector (five_vec is dead in the cheap body) rather than pinning
+     * live vector (qpad_vec is dead in the cheap body) rather than pinning
      * one, so it does not provoke the AVX2 register-file spill that made the
      * boundary hoist a regression on this tier.
      *
@@ -3224,7 +3237,7 @@ int kswv::kswv256_u8_impl(uint8_t seq1SoA[],
      * first column any lane pads with the 0xFF query sentinel, i.e.
      * min(query_quantum8(len2)), so below it the query half of the boundary
      * mask -- the only half FScan keeps -- is dead, and jdummy_fs subdivides
-     * [0, jsplit) for the DUMMY5 test exactly as jdummy_a2 does [0, ncol).
+     * [0, jsplit) for the X86_QPAD8 test exactly as jdummy_a2 does [0, ncol).
      * Splitting the column range pins no vector, unlike the hoisted mask the
      * register-pressure note in the cell below rules out. */
     const int jsplit = compute_jsplit(p, SIMD_WIDTH8, ncol, false);
@@ -3321,7 +3334,7 @@ int kswv::kswv256_u8_impl(uint8_t seq1SoA[],
             __m256i sbt     = _mm256_shuffle_epi8(permSft, xor_val); \
  \
             if (NEED_DUMMY) { \
-                __m256i cmpq = _mm256_cmpeq_epi8(s2, five_vec); \
+                __m256i cmpq = _mm256_cmpeq_epi8(s2, qpad_vec); \
                 sbt = avx2_blendv_u8(cmpq, sft_vec, sbt); \
             } \
  \
@@ -3329,7 +3342,7 @@ int kswv::kswv256_u8_impl(uint8_t seq1SoA[],
              * (fr_val + shift) where this column's read base equals the row's \
              * active freed base (active_frread, built once per row above). One \
              * cmpeq + one blendv; FREED_INACTIVE8 lanes never match any s2 value \
-             * (0-3/5/8 or the 0xFF pad) so they pass through. */ \
+             * (0-3/5/6/8 or the 0xFF pad) so they pass through. */ \
             if (HasFreed) { \
                 sbt = _mm256_blendv_epi8(sbt, freedval256, \
                                          _mm256_cmpeq_epi8(s2, active_frread)); \
@@ -3386,7 +3399,7 @@ int kswv::kswv256_u8_impl(uint8_t seq1SoA[],
          * The reference half is dropped as argued in the note above
          * kswv_neon_u8: here pshufb returns 0 for the pad row's xor index
          * (bit 7 set), so m11 = sat(h00 - shift) <= h00, or h00 under the
-         * DUMMY5 blend. The query half needs no compare: blendv keys on bit 7
+         * X86_QPAD8 blend. The query half needs no compare: blendv keys on bit 7
          * of each mask byte, and bit 7 of s2 is set exactly on the 0xFF pad. */
 #define KSWV_AVX2_U8_CELL_FS(NEED_DUMMY, APPLY_BND) \
 { \
@@ -3395,8 +3408,8 @@ int kswv::kswv256_u8_impl(uint8_t seq1SoA[],
             __m256i f11 = _mm256_loadu_si256((const __m256i*)(F + (j + 1) * SIMD_WIDTH8)); \
             __m256i sbt = _mm256_shuffle_epi8(Sgn ? permS : permSft, _mm256_xor_si256(s1, s2)); \
             if (NEED_DUMMY) { \
-                const __m256i q5 = _mm256_cmpeq_epi8(s2, five_vec); \
-                sbt = Sgn ? _mm256_andnot_si256(q5, sbt) : avx2_blendv_u8(q5, sft_vec, sbt); \
+                const __m256i qp = _mm256_cmpeq_epi8(s2, qpad_vec); \
+                sbt = Sgn ? _mm256_andnot_si256(qp, sbt) : avx2_blendv_u8(qp, sft_vec, sbt); \
             } \
             if (HasFreed) \
                 sbt = _mm256_blendv_epi8(sbt, freedval256, \
@@ -3653,7 +3666,7 @@ void kswv::kswvBatchWrapper8_avx2(SeqPair *pairArray,
          * buffers with the tiled transpose (x86_soa_pack). Reference: bases,
          * then 0xFF from len1 through row maxLen1 inclusive; the old
          * (seq1[k] == AMBIG_ ? AMBR : seq1[k]) remap was the identity
-         * (AMBIG_ == AMBR == 4). Query: bases (AMBIG_ -> AMBQ), DUMMY5 on
+         * (AMBIG_ == AMBR == 4). Query: bases (AMBIG_ -> AMBQ), X86_QPAD8 on
          * [len2, quantum), 0xFF from the quantum through column maxLen2
          * inclusive -- byte-for-byte what the per-lane loops wrote. */
         const uint8_t *seq1p[SIMD_WIDTH8], *seq2p[SIMD_WIDTH8];
@@ -3672,7 +3685,7 @@ void kswv::kswvBatchWrapper8_avx2(SeqPair *pairArray,
             if (maxLen2 < quant[j]) maxLen2 = quant[j];
         }
         x86_soa_pack<SIMD_WIDTH8>(mySeq1SoA, seq1p, len1a, len1a, maxLen1 + 1, 0xFF, 0xFF, false, AMBIG_, AMBR);
-        x86_soa_pack<SIMD_WIDTH8>(mySeq2SoA, seq2p, len2a, quant, maxLen2 + 1, DUMMY5, 0xFF, true, AMBIG_, AMBQ);
+        x86_soa_pack<SIMD_WIDTH8>(mySeq2SoA, seq2p, len2a, quant, maxLen2 + 1, X86_QPAD8, 0xFF, true, AMBIG_, AMBQ);
 
         kswv256_u8(mySeq1SoA, mySeq2SoA,
                    (int16_t)maxLen1, (int16_t)maxLen2,
@@ -4349,7 +4362,7 @@ void kswv::kswvBatchWrapper8(SeqPair *pairArray,
                 if(maxLen2 < quant[j]) maxLen2 = quant[j];
             }
             x86_soa_pack<SIMD_WIDTH8>(mySeq1SoA, seq1p, len1a, len1a, maxLen1 + 1, 0xFF, 0xFF, false, AMBIG_, AMBR);
-            x86_soa_pack<SIMD_WIDTH8>(mySeq2SoA, seq2p, len2a, quant, maxLen2 + 1, DUMMY5, 0xFF, true, AMBIG_, AMBQ);
+            x86_soa_pack<SIMD_WIDTH8>(mySeq2SoA, seq2p, len2a, quant, maxLen2 + 1, X86_QPAD8, 0xFF, true, AMBIG_, AMBQ);
 
             kswv512_u8(mySeq1SoA, mySeq2SoA,
                        maxLen1, maxLen2,
@@ -4526,7 +4539,7 @@ int kswv::kswv512_u8_impl(uint8_t seq1SoA[],
     const __m512i oe512       = oe_ins512;
     const __m512i highbit512  = _mm512_set1_epi8((char)0x80);
     (void) oe512; (void) highbit512;
-    __m512i five512     = _mm512_set1_epi8(DUMMY5); // ambig mapping element
+    __m512i qpad512     = _mm512_set1_epi8(X86_QPAD8); // query-tail pad code
     __m512i gmax512     = zero512; // exit1 = zero512;
     __m512i te512       = _mm512_set1_epi16(-1);  // changed to -1
     __m512i te512_      = _mm512_set1_epi16(-1);  // changed to -1
@@ -4577,7 +4590,7 @@ int kswv::kswv512_u8_impl(uint8_t seq1SoA[],
      * nothing.) */
     const int jsplit = compute_jsplit(p, SIMD_WIDTH8, ncol, false);
 
-    /* First column any lane can hold the DUMMY5 query pad, so the cmp+blend
+    /* First column any lane can hold the X86_QPAD8 query pad, so the cmp+blend
      * for it can be elided below this. Same derivation and same byte-identity
      * argument as the NEON kernel above; clamped to jsplit because it only
      * subdivides the [0, jsplit) range. */
@@ -5142,20 +5155,21 @@ int kswv::kswv512_16_impl(int16_t seq1SoA[],
     int16_t temp1[SIMD_WIDTH16] __attribute((aligned(64)));
     int16_t temp2[SIMD_WIDTH16] __attribute((aligned(64)));
 
-    // query profile, we use xor operations on the strings
-    // temp[0] = this->w_match;
-    // temp[1] = temp[2] = temp[3] =  this->w_mismatch;
-    // temp[4] = temp[5] = temp[6] = temp[7] =  this->w_mismatch;
-    // temp[16] = temp[17] = temp[18] = temp[19] = this->w_ambig;
-    // temp[31] =  this->w_ambig;
-    // temp[12] = temp[13] = temp[14] = temp[15] =  this->w_ambig;
-    // temp[10] = temp[20] = temp[30] = this->w_mismatch;
-    
-    temp[0] = this->w_match;    // matching
-    temp[1]  = temp[2]  = temp[3]  =  this->w_mismatch;  // mis-matching    
-    temp[12] = temp[13] = temp[14] = temp[15] =  this->w_ambig;
-    temp[16] = temp[17] = temp[18] = temp[19] = this->w_ambig;
-    temp[31] = this->w_ambig;
+    /* 32-entry score table indexed by the low five bits of (s1 ^ s2), built
+     * exactly as the AVX2 and NEON 16-bit kernels build theirs: w_match at 0,
+     * w_mismatch at 1-3, 0 for the query-tail DUMMY3 (=26) entries
+     * (s1 in {0..3, AMBR16} xor 26 = {21, 24..27}), and w_ambig everywhere else.
+     * The old table had 0 rather than w_ambig at 4-11, 20, 22-23 and 28-30. Of
+     * those, valid input reaches 4-7 and 10 only through a '-' query base (5,
+     * passed through from a forward-oriented mate), which this kernel therefore
+     * scored as 0 against every reference base where the other tiers score
+     * w_ambig; and 28-30 only on a reference pad row, where any value <= 0
+     * gives the same bytes (see the note above kswv_neon_u8). */
+    for (int k = 0; k < SIMD_WIDTH16; k++) temp[k] = this->w_ambig;
+    temp[0] = this->w_match;
+    temp[1] = temp[2] = temp[3] = this->w_mismatch;
+    temp[21] = 0;
+    temp[24] = temp[25] = temp[26] = temp[27] = 0;
        
     __m512i perm512 = _mm512_load_si512(temp);
         
