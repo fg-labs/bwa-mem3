@@ -70,10 +70,18 @@ static void bns_build_path(char *out, size_t outsz, const char *prefix, const ch
 		err_fatal(__func__, "path too long for prefix '%s' (suffix '%s')", prefix, suffix);
 }
 
+/* ASCII -> 2-bit base code: A/C/G/T (either case) -> 0..3, everything else -> 4 (N).
+ * '-' is N too. Upstream bwa/bwa-mem2 map it to a separate code 5 that no scoring
+ * matrix row defines, so each alignment kernel scored it however its N test happened
+ * to work (a read past the 5x5 matrix row in the scalar paths, w_ambig or w_mismatch
+ * by SIMD tier and width in the vector ones), and SEQ printed a NUL for it. Mapping it
+ * to 4 scores and prints a read '-' as N on every path and tier. The reference parser
+ * (bns_fasta2bntseq) treats every code >= 4 as a hole keyed on the raw character, so
+ * index construction is unchanged. */
 unsigned char nst_nt4_table[256] = {
 	4, 4, 4, 4,  4, 4, 4, 4,  4, 4, 4, 4,  4, 4, 4, 4, 
 	4, 4, 4, 4,  4, 4, 4, 4,  4, 4, 4, 4,  4, 4, 4, 4, 
-	4, 4, 4, 4,  4, 4, 4, 4,  4, 4, 4, 4,  4, 5 /*'-'*/, 4, 4,
+	4, 4, 4, 4,  4, 4, 4, 4,  4, 4, 4, 4,  4, 4 /*'-'*/, 4, 4,
 	4, 4, 4, 4,  4, 4, 4, 4,  4, 4, 4, 4,  4, 4, 4, 4, 
 	4, 0, 4, 1,  4, 4, 4, 2,  4, 4, 4, 4,  4, 4, 4, 4, 
 	4, 4, 4, 4,  3, 4, 4, 4,  4, 4, 4, 4,  4, 4, 4, 4, 

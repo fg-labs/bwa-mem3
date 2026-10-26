@@ -355,26 +355,71 @@ field along one of four branches, chosen by whether the pre-c2t original sequenc
 
 - **Forward, original sequence available** — the bytes are copied directly from the
   original sequence (only lowercase folded to uppercase); they do **not** pass through
-  `nst_nt4_table`, so a `-` on this path is emitted verbatim as `-`.
+  `nst_nt4_table`, so a `-` reaches the record builder as `-`, and `bam_set1`'s 4-bit
+  packing stores it, like any byte outside the IUPAC codes, as `N`.
 - **Reverse, original sequence available**, plus both **fallback paths** (original
   sequence missing, restoring from `s->seq`, forward and reverse) — each ASCII base is
   mapped through `nst_nt4_table` and used to index a five-character string literal
   (`"ACGTN"` / `"TGCAN"`, indices 0–4).
 
-`nst_nt4_table` maps `A/C/G/T/N` (and their lowercase forms) to `0..4` and every
-unrecognized byte to `4` — with one exception: `-` maps to `5`. Index `5` selects the
-literal's terminating NUL, so on the three lookup-based paths a `-` emitted a `'\0'`
-into `SEQ`: an in-bounds read of the string terminator, but corrupt output rather than an
-out-of-bounds access. The fix clamps any index `>= 4` to `4`, so on those paths a `-`
-now emits `N`.
+When PR #463 landed, `nst_nt4_table` mapped `A/C/G/T/N` (and their lowercase forms) to
+`0..4` and every unrecognized byte to `4` — with one exception: `-` mapped to `5`. Index
+`5` selected the literal's terminating NUL, so on the three lookup-based paths a `-`
+emitted a `'\0'` into `SEQ`: an in-bounds read of the string terminator, but corrupt
+output rather than an out-of-bounds access. PR #463 clamps any index `>= 4` to `4`, so on
+those paths a `-` emitted `N`.
 
-This is scoped to **`--meth` mode only**. On the lookup-based paths the clamp changes
-output **only for a `-` byte** — the single input that maps to `5` — which now renders
-as `N` instead of a corrupt NUL; every other byte already resolved to an index in
-`0..4`, so its output is unchanged. That equivalence is **by construction** — the clamp
-alters the result solely for the `bi == 5` case — not a measured-fixture generalization;
-standard fixtures do not exercise the `-` input. The direct-copy forward path (where a
-`-` stays `-`) and the default (non-`--meth`) output are unaffected.
+This is scoped to **`--meth` mode only**. On the lookup-based paths the clamp changed
+output **only for a `-` byte** — then the single input that mapped to `5` — which rendered
+as `N` instead of a corrupt NUL; every other byte already resolved to an index in `0..4`,
+so its output was unchanged. That equivalence is **by construction** — the clamp alters
+the result solely for the `bi == 5` case — not a measured-fixture generalization. The
+direct-copy forward path (whose `-` was already packed as `N`) and the default
+(non-`--meth`) output were unaffected.
+
+Since PR #639, `nst_nt4_table` maps `-` to `4` (see [A read base `-` is scored as
+`N`](#a-read-base---is-scored-as-n-pr-639)), so no byte reaches index `5` any more and the
+clamp stays only as a guard. A `-` is `N` in `SEQ` on all four paths;
+`test/regression/meth_nul_base.sh` checks the forward direct-copy path.
+
+## A read base `-` is scored as `N` (PR #639)
+
+`nst_nt4_table` (`src/bntseq.cpp`) maps a read's bases to 2-bit codes: `A/C/G/T` (either case)
+to `0..3` and every other byte to `4`, the `N` code, except `-`, which bwa and bwa-mem2 map to
+`5`. No scoring matrix has a row or column for `5`, so every alignment kernel scored a `-`
+however its `N` test happened to work. At the default scoring, a `-` against a reference
+`A/C/G/T` scored `w_ambig` (`-1`) in the 8-bit extension kernels and in the 16-bit SSE4.1 and
+AVX-512BW kernels, but `w_mismatch` (`-4`) in the 16-bit AVX2 and NEON kernels, and the scalar
+paths (`scalarBandedSWA`, `ksw_extend2`) built their query profile from `mat[k*5 + 5]`, reading
+the next matrix row (`-B` against `A/C/G`, `-1` against `T`) and, against a reference `N`, one
+byte past the matrix. So a record for a read with a `-` could depend on the SIMD tier and on
+whether its extension took the 8-bit or 16-bit kernel: on 200k WGS pairs (HG00096, hg38) with
+a few `-` bases in about 5% of reads, the AVX-512BW tier differed from AVX2 and NEON on 14
+pairs, every one with a `-` in a mate (x86_64 on AMD Zen 4 at forced AVX2 and AVX-512BW,
+arm64 on AWS Graviton 4 at NEON, clang 19.1.7). The CIGAR, `NM` and `MD` pass
+(`mem_reg2aln`) already re-encoded `5` as `4`, and SEQ already printed `N` for it.
+
+`-` now maps to `4`, so a read `-` is an `N` on every path: seeding, extension and mate rescue
+at every tier and width, the scalar paths, `--meth`, the rescue filters, CIGAR/`NM`/`MD` and
+SEQ. The reference parser treats every code `>= 4` as a hole keyed on the raw character, so
+index construction is unchanged. Reads that contain a `-` change directly: their extension and
+rescue scores now equal those of the same read with `N` in place of each `-`. No other table
+entry moves, so every other read is encoded and scored as before; input with no `-` is
+byte-identical by construction. In paired-end input with `-` reads, another pair in the same
+batch can still change indirectly, because a `-` pair whose alignment moves can shift the
+insert-size estimate (`mem_pestat`) that pairing, mate rescue and MAPQ use for the whole
+batch, and that an auto `--extend-mate-concordant` window carries into the next batch's chain
+cap (not with `-I`, which fixes the estimate). This
+holds under both `--compat` targets too: bwa and bwa-mem2 score a `-` by the out-of-row
+matrix read above (and bwa-mem2's x86 8-bit mate rescue as query padding), and both print a NUL
+byte in SEQ for it, so no record with a `-` was byte-identical to either upstream before this
+change, and emulating them would mean a sixth query class in every kernel to reproduce output
+that is not valid SAM.
+
+Pinned by `test/regression/dash_read_as_n.sh` (a `-` fixture equals its `N` twin and is
+identical across the host's tiers, at the default scoring, on the 16-bit kernels, at a scaled
+scoring and under both `--compat` targets) and `test/nst_nt4_decode_test.cpp` (no table entry
+above `4`, so the conversion is idempotent).
 
 ## Extension staging copied a chain's windows once per seed (PR #524)
 
@@ -803,6 +848,7 @@ shipped, because parity with that release is its contract (see
 | Proper-pair flag from emitted alignment | [#17](https://github.com/fg-labs/bwa-mem3/pull/17) | — | fork-only, **opt-in** (`--proper-pair-from-emitted`; default matches both upstreams, [#362](https://github.com/fg-labs/bwa-mem3/issues/362)) |
 | All chains dropped by the weight filter: default follows bwa | [#489](https://github.com/fg-labs/bwa-mem3/pull/489) | — ([#310](https://github.com/fg-labs/bwa-mem3/issues/310)) | fork-only; `--compat=bwa-mem2` reproduces bwa-mem2 |
 | Suffix-array sentinel offset in the prefetch lookup | [#469](https://github.com/fg-labs/bwa-mem3/pull/469) | — | fork-only; `--compat=bwa-mem2` reproduces bwa-mem2 |
+| A read base `-` is scored as `N` | [#639](https://github.com/fg-labs/bwa-mem3/pull/639) | — | fork-only, also under `--compat` (reads containing `-` only; upstream scores it by an out-of-row matrix read and prints a NUL in SEQ; input with no `-` byte-identical by construction; other pairs in a batch with `-` reads can change only through the insert-size estimate) |
 
 ---
 

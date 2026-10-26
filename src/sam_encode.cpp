@@ -37,9 +37,10 @@ static const uint8_t enc_rev_lut[16] = {
 
 /* Scalar tail clamp — mirrors the SIMD path's vminq_u8/_mm_min_epu8 against 4
  * so any code >= 5 in src[] decodes to 'N' instead of indexing OOB into the
- * 5-byte "ACGTN"/"TGCAN" literals. Today s->seq is always 2-bit ACGTN before
- * mem_aln2sam, so this is latent — but it keeps SIMD and scalar paths in
- * lockstep if that invariant ever drifts. */
+ * 5-byte "ACGTN"/"TGCAN" literals. s->seq is always 2-bit ACGTN before
+ * mem_aln2sam (nst_nt4_table maps every non-ACGT byte, '-' included, to 4), so
+ * this is latent — but it keeps SIMD and scalar paths in lockstep if that
+ * invariant ever drifts. */
 #define SAM_NT_CLAMP4(c) ((unsigned)(c) <= 4u ? (unsigned)(c) : 4u)
 
 extern "C" {

@@ -6,8 +6,8 @@
 //       the middle are NOT grouped (the verify memcmp must catch them), that
 //       both mates must match, and that mate ORDER matters;
 //   (2) --dedup-reads / BWAMEM3_DEDUP_READS mode resolution precedence; and
-//   (3) read_memo_convert_non_reps, the armed path's 2-bit conversion: each
-//       read converted exactly once, so a REP's '-' stays 5 as with off;
+//   (3) read_memo_convert_non_reps, the armed path's 2-bit conversion: DUPs
+//       converted, REPs left to kernel1, each read exactly once;
 //   (4) two pre-passes in flight at once each get their own chunk's answer
 //       (the module scratch is locked); and
 //   (5) the one eligibility gate both of those callers share.
@@ -94,7 +94,7 @@ static std::string bytes_of(const bseq1_t &s) { return std::string(s.seq, (size_
 
 TEST_CASE("convert_non_reps converts DUPs once and leaves REPs to kernel1"
           * doctest::test_suite("unit/read_memo")) {
-    // '-' is the base the conversion is not idempotent on (-> 5, then 5 -> 4).
+    // '-' and lowercase exercise the table; '-' encodes as N (4) like any non-ACGT byte.
     PairSet ps;
     ps.add("ACGT-Nac", "TTGG-CCA");   // pair 0: REP
     ps.add("GGGGCCCC", "AAAA-TTT");   // pair 1: REP (distinct)
@@ -110,13 +110,12 @@ TEST_CASE("convert_non_reps converts DUPs once and leaves REPs to kernel1"
 
     // REPs are untouched (still ASCII): kernel1 converts them.
     for (int l = 0; l < 4; ++l) CHECK(bytes_of(ps.seqs[l]) == ascii[l]);
-    // DUPs are 2-bit, '-' kept distinct from N.
-    CHECK(bytes_of(ps.seqs[4]) == std::string("\x00\x01\x02\x03\x05\x04\x00\x01", 8));
-    CHECK(bytes_of(ps.seqs[5]) == std::string("\x03\x03\x02\x02\x05\x01\x01\x00", 8));
+    // DUPs are 2-bit, '-' encoded as N.
+    CHECK(bytes_of(ps.seqs[4]) == std::string("\x00\x01\x02\x03\x04\x04\x00\x01", 8));
+    CHECK(bytes_of(ps.seqs[5]) == std::string("\x03\x03\x02\x02\x04\x01\x01\x00", 8));
 
     // After kernel1 converts the REPs, each REP read equals its DUP read byte
-    // for byte -- exactly what --dedup-reads off gives both. A second
-    // conversion of a REP would have turned its '-' (5) into 4 here.
+    // for byte -- exactly what --dedup-reads off gives both.
     for (int l = 0; l < 4; ++l) kernel1_convert(&ps.seqs[l]);
     CHECK(bytes_of(ps.seqs[0]) == bytes_of(ps.seqs[4]));
     CHECK(bytes_of(ps.seqs[1]) == bytes_of(ps.seqs[5]));
@@ -137,8 +136,8 @@ TEST_CASE("convert_non_reps indexes roles by the work item's global read index"
     read_memo_convert_non_reps(&st, ps.seqs.data() + 2, 2, 4);
 
     for (int l = 0; l < 4; ++l) CHECK(bytes_of(ps.seqs[l]) == ascii[l]);  // pair 0 outside, pair 1 REP
-    CHECK(bytes_of(ps.seqs[4]) == std::string("\x00\x01\x02\x03\x05\x04\x00\x01", 8));
-    CHECK(bytes_of(ps.seqs[5]) == std::string("\x03\x03\x02\x02\x05\x01\x01\x00", 8));
+    CHECK(bytes_of(ps.seqs[4]) == std::string("\x00\x01\x02\x03\x04\x04\x00\x01", 8));
+    CHECK(bytes_of(ps.seqs[5]) == std::string("\x03\x03\x02\x02\x04\x01\x01\x00", 8));
     read_memo_state_free(&st);
 }
 

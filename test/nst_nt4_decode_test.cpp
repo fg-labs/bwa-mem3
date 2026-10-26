@@ -34,6 +34,18 @@ int main() {
     CHECK(nst_nt4_decode((unsigned char)'A', 4) == nst_nt4_table[(unsigned char)'A']);
     CHECK(nst_nt4_decode((unsigned char)'N', 4) == nst_nt4_table[(unsigned char)'N']);
 
+    // Every byte that is not A/C/G/T (either case) is N, '-' included: no code
+    // above 4 exists, so the plain-path conversion is idempotent (a second pass
+    // maps each code to itself) and no kernel ever sees a query code it has no
+    // matrix row for.
+    for (int c = 0; c < 256; ++c) {
+        const unsigned char e = nst_nt4_table[c];
+        CHECK(e <= 4);
+        CHECK(nst_nt4_decode(nst_nt4_decode((unsigned char)c, 4), 4) == nst_nt4_decode((unsigned char)c, 4));
+    }
+    CHECK(nst_nt4_table[(unsigned char)'-'] == 4);
+    CHECK(nst_nt4_decode((unsigned char)'-', 4) == 4);
+
     std::fprintf(stderr, "nst_nt4_decode_test OK\n");
     return 0;
 }
